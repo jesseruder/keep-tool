@@ -92,8 +92,8 @@ Rebuild it when the desktop shell changes. See [desktop details](desktop/README.
     "KEEP_NO_PUSH": "1",
     "KEEP_SYNC": "0",
     "KEEP_HOST": "127.0.0.1",
-    "KEEP_REVIEWER_MODEL": "sonnet",
-    "KEEP_IDEAS_MODEL": "sonnet",
+    "KEEP_REVIEWER_MODEL": "fable",
+    "KEEP_IDEAS_MODEL": "fable",
     "KEEP_OPEN_CLAUDE_FLAGS": "",
     "KEEP_OPEN_CODEX_FLAGS": ""
   }

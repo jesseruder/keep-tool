@@ -74,7 +74,7 @@ function init(args) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   fs.writeFileSync(file, JSON.stringify({ version: 1, dataDir: root, env: {
     KEEP_NO_PUSH: '1', KEEP_SYNC: '0', KEEP_HOST: '127.0.0.1',
-    KEEP_REVIEWER_MODEL: 'sonnet', KEEP_IDEAS_MODEL: 'sonnet',
+    KEEP_REVIEWER_MODEL: 'fable', KEEP_IDEAS_MODEL: 'fable',
     KEEP_OPEN_CLAUDE_FLAGS: '', KEEP_OPEN_CODEX_FLAGS: '',
   } }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
   console.log(`Created private registry: ${root}\nConfiguration: ${file}\nNext: keep setup hooks, then keep doctor. No remote was configured.`);

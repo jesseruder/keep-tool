@@ -4,7 +4,7 @@ const crypto = require('node:crypto');
 const { quote } = require('./setup');
 
 async function launch(args, root, deps = {}) {
-  const model = args[0] || process.env.KEEP_REVIEWER_MODEL || 'sonnet';
+  const model = args[0] || process.env.KEEP_REVIEWER_MODEL || 'fable';
   const family = ['fable', 'opus', 'sonnet', 'haiku'].find((name) => model.includes(name)) || model;
   const sessionId = (deps.randomUUID || crypto.randomUUID)();
   const argv = ['claude', '--model', model, '--session-id', sessionId,
