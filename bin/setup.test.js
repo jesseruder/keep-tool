@@ -81,6 +81,7 @@ test('service definitions escape user paths and pin Node and registry independen
 
 test('public guard rejects forced-in cards and credential-shaped content without printing secrets', () => {
   assert.deepEqual(inspect('tasks/private.md', Buffer.from('private')), ['excluded path']);
+  assert.deepEqual(inspect('docs/copied-card.md', Buffer.from('---\ntitle: Private task\nstatus: active\n---\n')), ['task card frontmatter']);
   assert.deepEqual(inspect('watch/slack.json', Buffer.from('{}')), ['excluded path']);
   assert.deepEqual(inspect('bin/credential.js', Buffer.from('ghp_' + 'a'.repeat(36))), ['credential-shaped content']);
   assert.deepEqual(inspect('bin/example.test.js', Buffer.from('const token = "synthetic";')), []);

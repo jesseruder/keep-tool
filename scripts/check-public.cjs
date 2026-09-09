@@ -23,6 +23,10 @@ function inspect(name, bytes) {
   const issues = [];
   if (forbidden.test(name) || !allowed.test(name) || /(?:^|\/)(?:node_modules|target|\.git)(?:\/|$)/.test(name)) issues.push('excluded path');
   const text = bytes.toString('utf8');
+  if (/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/.test(text)) {
+    const frontmatter = text.split(/\r?\n---(?:\r?\n|$)/)[0];
+    if (/^title:/m.test(frontmatter) && /^status:/m.test(frontmatter)) issues.push('task card frontmatter');
+  }
   if (!bytes.includes(0) && secrets.some((pattern) => pattern.test(text))) issues.push('credential-shaped content');
   return issues;
 }
