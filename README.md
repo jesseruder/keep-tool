@@ -11,6 +11,19 @@ The first distribution targets macOS. The browser console and terminal host ship
 with the CLI; the optional desktop shell is in `desktop/`. The mobile app is not
 part of this initial source distribution.
 
+## Screenshots
+
+The console shared by Keep Desktop and the browser, shown with synthetic demo
+projects and terminal output. No private cards or sessions are pictured.
+
+**Triage:** see which sessions need your input and respond beside their terminal.
+
+![Keep Triage view with an agent question and its terminal](docs/images/triage.png)
+
+**Watch:** pin sessions side by side to follow work across projects.
+
+![Keep Watch view with two pinned agent terminals](docs/images/watch.png)
+
 ## Install
 
 Prerequisites: Node 22+, Git with a configured name/email, and an authenticated
@@ -38,6 +51,34 @@ See [agent integration](docs/agent-hooks.md) for Codex event adapters.
 `keep init` creates an empty registry at `~/keep`; use `--dir /path/to/private-data`
 to choose another location. It refuses nonempty directories. It does not configure
 a remote, upload anything, launch an agent, or start background services.
+
+## Desktop app (macOS)
+
+Keep Desktop adds a native window, Dock badge, and desktop notifications to the
+console. Complete the CLI setup above first: the app connects to
+`http://localhost:7777/app` and requires the Keep daemon to be running.
+
+To build it, install Rust with Cargo and the Xcode Command Line Tools (or Xcode),
+as described in the [Tauri macOS prerequisites](https://v2.tauri.app/start/prerequisites/#macos).
+Then run these commands from the `keep-tool` checkout:
+
+```sh
+npm ci --prefix desktop
+npm run desktop:build
+open desktop/src-tauri/target/release/bundle/macos/Keep.app
+```
+
+To install the built app for everyday use, copy `Keep.app` from that folder into
+Applications using Finder. The build also produces a DMG under
+`desktop/src-tauri/target/release/bundle/dmg/`.
+
+For development, use `npm run desktop:dev` instead of the build command. Closing
+the window hides the app; Quit exits it. Enable notifications from the bell inbox
+when prompted. If the launcher stays on its waiting screen, check
+`keep service status` and confirm the daemon is listening on port 7777.
+
+The app uses the local console, so most CLI and web changes need no native rebuild.
+Rebuild it when the desktop shell changes. See [desktop details](desktop/README.md).
 
 ## Configuration
 
