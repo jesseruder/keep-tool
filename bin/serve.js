@@ -4077,8 +4077,11 @@ function start(deps = {}) {
     } // offline or lock contention — next tick will catch up
   };
   if (process.env.KEEP_SYNC === '1') {
+    health.record('git-pull', { skipped: true });
     setInterval(pull, 30 * 60e3).unref();
     setTimeout(pull, 60e3).unref();
+  } else {
+    health.record('git-pull', { disabled: true, detail: 'registry synchronization is off' });
   }
 
   const json = (res, code, obj) => {

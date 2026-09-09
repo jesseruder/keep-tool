@@ -186,3 +186,21 @@ test('keep health --json reads a temporary registry without the daemon', () => {
   assert.equal(table.status, 0, table.stderr);
   assert.match(table.stdout, /^daemon: down/m);
 });
+
+
+test('disabled integrations stay out of health attention and resume health tracking when enabled', () => {
+  const { health } = fixture();
+  health.record('daemon', { at: 1000, pid: process.pid });
+  for (const name of ['slack', 'git-pull']) {
+    health.record(name, { ok: false, error: 'old failure', at: 2000 });
+    health.record(name, { disabled: true, detail: 'not configured' });
+  }
+  const later = 1000 + 2 * 86400e3;
+  const snapshot = health.snapshot(later);
+  for (const name of ['slack', 'git-pull']) {
+    assert.equal(snapshot.schedulers.find((row) => row.name === name).state, 'disabled');
+    assert.equal(health.attentionItems(snapshot, later).some((row) => row.id === `health:${name}`), false);
+    health.record(name, { skipped: true, at: later });
+    assert.equal(health.snapshot(later).schedulers.find((row) => row.name === name).disabled, false);
+  }
+});

@@ -1175,7 +1175,11 @@ function setMode(mode) {
 }
 
 function startScheduler(options = {}) {
-  if (!config().channels.length) return null;
+  if (!config().channels.length) {
+    health.record('slack', { disabled: true, detail: 'no channels configured' });
+    return null;
+  }
+  health.record('slack', { skipped: true });
   let running = false;
   const tick = async () => {
     if (running) return;

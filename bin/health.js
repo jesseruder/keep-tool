@@ -95,18 +95,25 @@ function record(name, options = {}) {
     return store.daemon;
   }
 
+  if (options.disabled === true) {
+    const entry = { ...(store[name] || {}), disabled: true, detail: clipError(options.detail || 'not configured') };
+    store[name] = entry;
+    persist(store);
+    return entry;
+  }
   const cadence = CADENCES[name] || {};
   const prior = store[name] && typeof store[name] === 'object' ? store[name] : {};
   const ok = options.ok !== false;
   const skipped = options.skipped === true || (ok && options.detail === 'nothing due');
   if (skipped) {
-    const entry = { ...prior, lastRunAt: at };
+    const entry = { ...prior, disabled: false, lastRunAt: at };
     store[name] = entry;
     persist(store);
     return entry;
   }
   const entry = {
     ...prior,
+    disabled: false,
     lastRunAt: at,
     runs: Number(prior.runs || 0) + 1,
     cadenceMs: Number(options.cadenceMs || cadence.cadenceMs || prior.cadenceMs || 0),
@@ -135,6 +142,7 @@ function nextExpectedAfter(value, config) {
 }
 
 function stateOf(entry, now = Date.now()) {
+  if (entry?.disabled === true) return 'disabled';
   const at = atMs(now, Date.now());
   const config = CADENCES[entry && entry.name] || {};
   const cadenceMs = Number(entry && entry.cadenceMs || config.cadenceMs || 0);
@@ -185,6 +193,7 @@ function snapshot(now = Date.now()) {
     const entry = store[name] && typeof store[name] === 'object' ? store[name] : {};
     const row = {
       name,
+      disabled: entry.disabled === true,
       lastRunAt: entry.lastRunAt || null,
       lastOkAt: entry.lastOkAt || null,
       lastErrorAt: entry.lastErrorAt || null,
