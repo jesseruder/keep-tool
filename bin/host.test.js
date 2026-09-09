@@ -217,7 +217,7 @@ test('screen waits for writes appended while the current terminal write is pendi
   await withHost({}, async ({ host, client }) => {
     const { pane } = await client.request('spawn', {
       cmd: '/bin/sh',
-      args: ['-c', "stty -echo; printf ready; IFS= read -r line; printf first; sleep 0.05; printf second; sleep 1"],
+      args: ['-c', "stty -echo; printf ready; IFS= read -r line; printf first; IFS= read -r line; printf second; sleep 1"],
     });
     await waitFor(async () => (await client.request('screen', { pane: pane.id })).text.includes('ready'), 'ready marker');
     const internal = host.panes.get(pane.id);
@@ -236,9 +236,19 @@ test('screen waits for writes appended while the current terminal write is pendi
 
     await client.request('input', { pane: pane.id, data: Buffer.from('go\n').toString('base64') });
     await firstPending;
+    const firstWriteChain = internal.writeChain;
+    let screenWaiting;
+    const screenIsWaiting = new Promise((resolve) => { screenWaiting = resolve; });
+    // Observe the screen's await explicitly, before appending another PTY write.
+    // A thenable also works for the host's writeChain.then append operation.
+    const observedChain = { then(resolve, reject) { screenWaiting(); return firstWriteChain.then(resolve, reject); } };
+    internal.writeChain = observedChain;
     const screenPromise = client.request('screen', { pane: pane.id });
-    await delay(100);
-    releaseFirst();
+    try {
+      await screenIsWaiting;
+      internal.pty.write('second\n');
+      await waitFor(() => internal.writeChain !== observedChain, 'second PTY write queued');
+    } finally { releaseFirst(); }
     const screen = await screenPromise;
     assert.match(screen.text, /readyfirstsecond/);
   });
