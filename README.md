@@ -29,7 +29,8 @@ keep service start
 ```
 
 Open `http://localhost:7777/app`. Launch `keep-reviewer` in an interactive terminal
-and leave it open for review ticks. Both agent skills are bundled; the reviewer
+to create a host-owned reviewer pane for review ticks. The terminal attaches to that
+pane; the reviewer also appears in the console. Both agent skills are bundled; the reviewer
 registers through its Claude SessionStart hook. Existing hook settings and skills
 are preserved: setup backs up settings and refuses to replace another skill.
 See [agent integration](docs/agent-hooks.md) for Codex event adapters.

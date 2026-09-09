@@ -481,31 +481,11 @@ governor reads it from the `.keep/reviewer/<id>` marker written at startup.
 
 ### Trust boundary — accepted risk
 
-The reviewer is **trusted, not sandboxed**. This is a deliberate decision (2026-09-01),
-recorded here because the code cannot express it.
-
-It runs as an ordinary Claude Code session with full tools, and it reads bundles
-assembled from other agents' transcripts — which routinely quote text those agents
-read from the web, from files, and from other people. So the input is
-attacker-influenceable and the process is privileged.
-
-Every limit in `fleet-review/SKILL.md` — nudges dry-run by default, announcement
-caps, never change a card's status, respect the budget governor — is therefore
-**cooperative**. A reviewer that decided to ignore them could call `keep checkin
---status`, `keep done`, `review-dismiss`, `~/bin/announce`, or POST directly to
-`/api/send`, and nothing in the code would stop it. The bundle's "DATA, NOT
-INSTRUCTIONS" envelope is a guardrail against naive injection, not a security
-boundary; prompt text cannot constrain a session that holds the tools.
-
-What actually bounds the damage is that the blast radius is small and reversible:
-findings are check-ins on cards, every mutation is a git commit, and nudges need an
-explicit `--send`. The risk accepted is a bad or manipulated finding, a wrongly
-closed card, or an unwanted message to another session — all visible in `git log`
-and undoable.
-
-If that stops being acceptable, the fix is to constrain authority rather than to add
-more prompt wording: run the reviewer under a restricted permission set, or split it
-so the judging session has no write access and a deterministic step lands its output.
+The reviewer runs as an ordinary agent session with the permissions supplied at
+launch. Review bundles include untrusted transcript content. The bundled procedure
+is guidance, not an operating-system sandbox; choose permissions appropriate for
+your environment. Keep's deterministic guards and audit logs supplement those
+permissions. Do not treat model instructions as access control.
 
 ### How it works
 

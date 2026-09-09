@@ -5753,15 +5753,11 @@ module.exports = {
   resolveHostPane, renderHostPanes, parseHostSpawn,
 };
 
-commands.reviewer = (args) => {
-  const model = args[0] || process.env.KEEP_REVIEWER_MODEL || 'sonnet';
-  const family = ['fable', 'opus', 'sonnet', 'haiku'].find((name) => model.includes(name)) || model;
-  const child = spawn('claude', ['--model', model,
-    '--settings', JSON.stringify({ promptSuggestionEnabled: false, preferredNotifChannel: 'notifications_disabled' }),
-    ...args.slice(1)], { cwd: ROOT, stdio: 'inherit', env: { ...process.env,
-      KEEP_REVIEWER: '1', KEEP_REVIEWER_NAME: family, KEEP_REVIEWER_MODEL: family } });
-  child.on('error', (error) => { process.stderr.write(`keep reviewer: ${error.message}\n`); process.exitCode = 1; });
-  child.on('exit', (code, signal) => { process.exitCode = code == null ? (signal ? 1 : 0) : code; });
+commands.reviewer = async (args) => {
+  const result = await require('./reviewer-launch').launch(args, ROOT);
+  console.log(`Reviewer ${result.model}: pane ${result.pane}, session ${result.sessionId}`);
+  if (process.stdin.isTTY && process.stdout.isTTY) await commands.attach([result.pane]);
+  else console.log('Open the reviewer in the Keep console.');
 };
 
 commands.init = (args) => require('./setup').init(args);
