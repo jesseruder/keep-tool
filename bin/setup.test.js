@@ -117,3 +117,26 @@ test('configuration paths embedded in hooks and services are absolute', () => {
     else process.env.KEEP_CONFIG = prior;
   }
 });
+
+
+test('local-only Git identity cannot leave a partially initialized registry', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-init-identity-'));
+  const caller = path.join(tmp, 'caller');
+  const registry = path.join(tmp, 'registry');
+  const file = path.join(tmp, 'config.json');
+  const env = { ...process.env, KEEP_CONFIG: file, GIT_CONFIG_GLOBAL: path.join(tmp, 'no-global'), GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: '0' };
+  delete env.KEEP_DIR;
+  const run = (args) => spawnSync('git', ['-C', caller, ...args], { env, encoding: 'utf8' });
+  try {
+    fs.mkdirSync(caller);
+    assert.equal(run(['init', '-q']).status, 0);
+    assert.equal(run(['config', 'user.name', 'Caller Only']).status, 0);
+    assert.equal(run(['config', 'user.email', 'caller@example.test']).status, 0);
+    const result = spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'init', '--dir', registry], { cwd: caller, env, encoding: 'utf8' });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /configure git user.name/);
+    assert.equal(fs.existsSync(registry), false);
+    assert.equal(fs.existsSync(file), false);
+    assert.equal(fs.readdirSync(tmp).some((name) => name.startsWith('.keep-init-')), false);
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});

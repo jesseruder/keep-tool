@@ -28,7 +28,8 @@
   "bin": {
     "keep": "bin/keep",
     "keep-wt": "bin/wt",
-    "keep-reviewer": "bin/keep-reviewer"
+    "keep-reviewer": "bin/keep-reviewer",
+    "wt": "bin/wt"
   },
   "files": [
     "bin/",

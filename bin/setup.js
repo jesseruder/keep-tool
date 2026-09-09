@@ -48,19 +48,29 @@ function init(args) {
   if (fs.existsSync(file)) throw new Error(`configuration already exists at ${file}; inspect it before initializing another registry`);
   if (insideSource(root)) throw new Error('the registry must be outside the application checkout');
   if (fs.existsSync(root) && fs.readdirSync(root).length) throw new Error(`directory is not empty: ${root}; existing registries can be selected with KEEP_DIR`);
-  // Check identity before creating anything; mutations are real local Git commits.
-  for (const key of ['user.name', 'user.email']) {
-    if (!spawnSync('git', ['config', '--get', key], { encoding: 'utf8' }).stdout?.trim()) throw new Error(`configure git ${key} before running keep init`);
+  if (insideSource(file)) throw new Error('the configuration must be outside the application checkout');
+  // Build a sibling repository first. Missing identity, signing failures, or Git
+  // hook errors must not leave a half-initialized target that init then refuses.
+  fs.mkdirSync(path.dirname(root), { recursive: true, mode: 0o700 });
+  const staging = fs.mkdtempSync(path.join(path.dirname(root), '.keep-init-'));
+  try {
+    git(staging, ['init', '-q']);
+    for (const key of ['user.name', 'user.email']) {
+      try { if (!git(staging, ['config', '--get', key])) throw new Error(); }
+      catch { throw new Error(`configure git ${key} globally or for the new registry before running keep init`); }
+    }
+    for (const dir of ['tasks', 'archive', 'digests', 'reviews', 'watch', 'steps']) {
+      fs.mkdirSync(path.join(staging, dir));
+      fs.writeFileSync(path.join(staging, dir, '.gitkeep'), '');
+    }
+    fs.writeFileSync(path.join(staging, '.gitignore'), '.keep/\n.env\n.env.*\n*.pem\n*.key\n');
+    git(staging, ['add', '.']);
+    git(staging, ['commit', '-qm', 'Initialize private Keep registry']);
+    // rename refuses a nonempty destination, including one populated meanwhile.
+    fs.renameSync(staging, root);
+  } finally {
+    fs.rmSync(staging, { recursive: true, force: true });
   }
-  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-  git(root, ['init', '-q']);
-  for (const dir of ['tasks', 'archive', 'digests', 'reviews', 'watch', 'steps']) {
-    fs.mkdirSync(path.join(root, dir));
-    fs.writeFileSync(path.join(root, dir, '.gitkeep'), '');
-  }
-  fs.writeFileSync(path.join(root, '.gitignore'), '.keep/\n.env\n.env.*\n*.pem\n*.key\n');
-  git(root, ['add', '.']);
-  git(root, ['commit', '-qm', 'Initialize private Keep registry']);
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   fs.writeFileSync(file, JSON.stringify({ version: 1, dataDir: root, env: {
     KEEP_NO_PUSH: '1', KEEP_SYNC: '0', KEEP_HOST: '127.0.0.1',
