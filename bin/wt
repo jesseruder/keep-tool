@@ -1,0 +1,9 @@
+#!/usr/bin/env node
+'use strict';
+
+try {
+  require('./wt.js').main(process.argv.slice(2));
+} catch (error) {
+  process.stderr.write(`wt: ${error.message}\n`);
+  process.exitCode = 1;
+}

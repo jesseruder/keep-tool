@@ -1,0 +1,22 @@
+# This repository contains application source only.
+.keep/
+tasks/
+archive/
+digests/
+reviews/
+watch/
+steps/
+standup.md
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*.json
+.DS_Store
+node_modules/
+desktop/node_modules/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+*.tgz

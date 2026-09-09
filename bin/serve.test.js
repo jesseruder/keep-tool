@@ -1,0 +1,2895 @@
+'use strict';
+
+// The reviewer launcher exports KEEP_REVIEWER* into its shell; tests spawn the CLI
+// from process.env, so reviewer-only refusals fired inside them when run from that
+// session (17 spurious failures on 2026-09-02). Tests that need reviewer identity set
+// it explicitly in their own env object.
+for (const k of ['KEEP_REVIEWER', 'KEEP_REVIEWER_NAME', 'KEEP_REVIEWER_MODEL']) delete process.env[k];
+
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const test = require('node:test');
+const { spawnSync } = require('node:child_process');
+const codex = require('./codex.js');
+const {
+  scanTranscript,
+  stallAliveIds,
+  transcriptActivityMs,
+  sessionNeedsInput,
+  sessionTaskOwners,
+  sessionAttentionItem,
+  shouldCompactFirst,
+  lastTurnUsage,
+  lastContextTokens,
+  autoCompactIdleMs,
+  autoCompactCandidates,
+  autoCompactOutcome,
+  compactSession,
+  compactSwapPlan,
+  ensureCompactionRestored,
+  afterCompactAction,
+  linesAfterLastEcho,
+  modelSwitchConfirmed,
+  modelSwitchDialogVisible,
+  pendingCompactSwaps,
+  readPendingCompactSwap,
+  sweepPendingCompactSwaps,
+  shutdownSettingsRepair,
+  liveSessionPids,
+  liveSessionTick,
+  restorePlan,
+  sessionProjectFromTranscript,
+  readClaudeSettingsModel,
+  repairClaudeSettingsModel,
+  pickDeliveryCandidates,
+  checkDeliveryIds,
+  deliverCheckToThread,
+  compactRefusal,
+  compactCommand,
+  chunkForTyping,
+  deliveredMatches,
+  briefDue,
+  attentionAckKey,
+  attentionItemKey,
+  readSetAside,
+  setAsideCandidates,
+  applySetAside,
+  parseSetAsideRequest,
+  updateSetAside,
+  classifyPromptLine,
+  probeSuggestion,
+  isHostTarget,
+  hostClient,
+  hostRequest,
+  apiRequestAuthError,
+  readScreen,
+  writeTarget,
+  pressTargetKey,
+  typeAndSubmit,
+  resolveSessionTarget,
+  screenSession,
+  sendSessionKeys,
+  shellPaneTarget,
+  writeToShellPane,
+  stripTerminalAnsi,
+  openSession,
+  addHostSessionState,
+  applySessionLiveness,
+  resumeAfterLimit,
+  agentPromptVisible,
+  isInjectionBusy,
+  InjectionError,
+} = require('./serve.js');
+
+function record(type, content) {
+  return JSON.stringify({ type, message: { content } });
+}
+
+function writeCompactSwapFixture(dir, sessionId, overrides = {}) {
+  fs.mkdirSync(dir, { recursive: true });
+  const value = {
+    sessionId,
+    originalModel: 'claude-fable-5-1',
+    restoreCommand: '/model claude-fable-5-1[1m]',
+    switchModel: 'opus',
+    settingsModelBefore: 'claude-fable-5-1[1m]',
+    settingsModelPresent: true,
+    at: Date.parse('2026-09-04T12:00:00Z'),
+    ...overrides,
+  };
+  const file = path.join(dir, `${sessionId}.swap.json`);
+  fs.writeFileSync(file, `${JSON.stringify(value)}\n`);
+  return file;
+}
+
+function compactRestoreDeps(dir, session, calls = [], settingsFile) {
+  return {
+    dir,
+    now: () => Date.parse('2026-09-04T12:05:00Z'),
+    scanSessions: () => session ? [session] : [],
+    sessionLastTurn: (value) => ({ model: value.model }),
+    resolveSessionTarget: async () => ({ pane: 'pane:test' }),
+    precheckSessionTarget: async () => {},
+    readScreen: async () => '❯',
+    typeAndSubmit: async (_target, command) => {
+      calls.push(command);
+      if (settingsFile && command.startsWith('/model ')) {
+        const settings = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+        settings.model = command.slice('/model '.length);
+        fs.writeFileSync(settingsFile, JSON.stringify(settings));
+      }
+    },
+    waitForModelSwitch: async () => true,
+    withInjectionLock: async (fn) => fn(),
+    readClaudeSettingsModel: () => ({ ok: true, present: true, value: 'claude-sonnet-5' }),
+    repairClaudeSettingsModel: () => ({ changed: false }),
+  };
+}
+
+test('classifyPromptLine distinguishes empty, suggestion, and draft prompts', () => {
+  assert.equal(classifyPromptLine('header\n❯ ', 'header\n❯ '), 'empty');
+  assert.equal(classifyPromptLine('header\n❯ suggested next prompt', 'header\n❯  '), 'suggestion');
+  assert.equal(classifyPromptLine('header\n❯ my draft', 'header\n❯ my draft '), 'draft');
+});
+
+test('classifyPromptLine uses the last prompt in the bottom ten lines', () => {
+  const before = ['assistant quoted this:', '❯ old quoted prompt', 'answer', '❯ actual suggestion'].join('\n');
+  const after = ['assistant quoted this:', '❯ old quoted prompt', 'answer', '❯  '].join('\n');
+  assert.equal(classifyPromptLine(before, after), 'suggestion');
+});
+
+test('probeSuggestion treats a bare ❯ below an echoed prompt as an empty input box', async () => {
+  // The live reviewer pane after `/model`: the echoed prompt is still within the
+  // bottom ten lines, and the empty input box renders as `❯` with no trailing space.
+  const screen = [
+    '  ⎿  Skills restored (fleet-review)', '', '❯ /model claude-fable-5-1',
+    '  ⎿  Set model to Fable 5.1 and saved as your', '     default for new sessions', '',
+    '────────', '❯', '────────', '  keep  (main)  ctx:0%  Fable 5.1  effort:high',
+    '  ⏵⏵ bypass permissions on (shift+tab to  · ←…',
+  ].join('\n');
+  const host = recordingHost();
+  await probeSuggestion({ pane: 'pane-echo' }, screen, { host, wait: async () => {}, readScreen: async () => screen });
+  assert.deepEqual(host.calls, [], 'an empty box needs no probe keystrokes');
+});
+
+test('probeSuggestion distinguishes generated suggestions from drafts through host input', async () => {
+  const inputs = [];
+  const host = recordingHost((type, params) => {
+    if (type === 'input') inputs.push(Buffer.from(params.data, 'base64').toString('utf8'));
+    return {};
+  });
+  const target = { pane: 'pane-probe' };
+  await probeSuggestion(target, 'header\n❯ suggested next prompt', {
+    host, wait: async () => {}, readScreen: async () => 'header\n❯ ',
+  });
+  assert.deepEqual(inputs, [' ', '\x7f']);
+
+  inputs.length = 0;
+  await assert.rejects(probeSuggestion(target, 'header\n❯ real draft', {
+    host, wait: async () => {}, readScreen: async () => 'header\n❯ real draft ',
+  }), /contains a draft/);
+  assert.deepEqual(inputs, [' ', '\x7f']);
+});
+
+test('health acknowledgements follow scheduler and error text, not failure time', () => {
+  const first = attentionAckKey({ kind: 'health', id: 'health:review', errorText: 'connection refused', since: 1000 });
+  const later = attentionAckKey({ kind: 'health', id: 'health:review', errorText: 'connection refused', since: 9000 });
+  const changed = attentionAckKey({ kind: 'health', id: 'health:review', errorText: 'permission denied', since: 9000 });
+  assert.equal(first, later);
+  assert.notEqual(first, changed);
+  assert.notEqual(first, attentionAckKey({ kind: 'health', id: 'health:runs', errorText: 'connection refused', since: 1000 }));
+});
+
+test('set-aside store sets and clears dismissals atomically', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-setaside-test-'));
+  try {
+    const attention = [{ kind: 'question', sessionId: 'session-one', since: 1000, title: 'Question' }];
+    const key = attentionItemKey(attention[0]);
+    assert.deepEqual(updateSetAside({ key, kind: 'dismiss' }, attention, { root, now: 2000 }), {
+      kind: 'dismiss', until: null, at: 2000, since: 1000,
+    });
+    assert.deepEqual(readSetAside(root), { version: 1, items: {
+      [key]: { kind: 'dismiss', until: null, at: 2000, since: 1000 },
+    } });
+    assert.deepEqual(fs.readdirSync(path.join(root, '.keep')).filter((name) => name.endsWith('.tmp')), []);
+    assert.equal(updateSetAside({ key, kind: 'clear' }, attention, { root, now: 3000 }), null);
+    assert.deepEqual(readSetAside(root), { version: 1, items: {} });
+    assert.deepEqual(updateSetAside({ key, kind: 'snooze', minutes: 15 }, attention, { root, now: 4000 }), {
+      kind: 'snooze', until: 904000, at: 4000, since: 1000,
+    });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('rate-limit sessions are valid set-aside candidates while rate-limited', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-setaside-rate-limit-'));
+  try {
+    const session = { id: 'rate-limited', mtime: 900, rateLimit: { at: 1000 } };
+    const candidates = setAsideCandidates([], [session]);
+    assert.deepEqual(candidates, [{
+      kind: 'rateLimit', sessionId: 'rate-limited', since: 1000, synthetic: true,
+    }]);
+    assert.deepEqual(updateSetAside({ key: session.id, kind: 'dismiss' }, candidates, { root, now: 2000 }), {
+      kind: 'dismiss', until: null, at: 2000, since: 1000,
+    });
+
+    const active = applySetAside(setAsideCandidates([], [session]), { root, now: 3000 });
+    assert.deepEqual(active.value.items, {
+      'rate-limited': { kind: 'dismiss', until: null, at: 2000, since: 1000 },
+    });
+    assert.equal(active.changed, false);
+
+    const gone = applySetAside(setAsideCandidates([], [{ ...session, mtime: 1100, rateLimit: null }]), { root, now: 4000 });
+    assert.deepEqual(gone.value.items, {});
+    assert.equal(gone.changed, true);
+
+    assert.deepEqual(updateSetAside({ key: session.id, kind: 'snooze', minutes: 15 }, candidates, { root, now: 5000 }), {
+      kind: 'snooze', until: 905000, at: 5000, since: 1000,
+    });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('set-aside pruning expires snoozes and preserves active ones', () => {
+  const attention = [
+    { kind: 'question', sessionId: 'expired', since: 1000, title: 'Expired' },
+    { kind: 'question', sessionId: 'active', since: 1000, title: 'Active' },
+  ];
+  const store = { version: 1, items: {
+    expired: { kind: 'snooze', until: 1999, at: 1000, since: 1000 },
+    active: { kind: 'snooze', until: 3000, at: 1000, since: 1000 },
+  } };
+  const result = applySetAside(attention, { store, now: 2000, write: false });
+  assert.deepEqual(result.value.items, { active: store.items.active });
+  assert.deepEqual(attention.map((item) => [item.key, item.setAside]), [['expired', null], ['active', 'snooze']]);
+  assert.equal(result.changed, true);
+});
+
+test('set-aside pruning drops gone dismissals and resurfaces a newer event', () => {
+  const attention = [
+    { kind: 'question', sessionId: 'new-question', since: 2000, title: 'New question' },
+    { kind: 'input', sessionId: 'same-event', since: 1000, title: 'Same event' },
+  ];
+  const same = { kind: 'dismiss', until: null, at: 1100, since: 1000 };
+  const result = applySetAside(attention, { now: 3000, write: false, store: { version: 1, items: {
+    gone: { kind: 'dismiss', until: null, at: 1100, since: 1000 },
+    'new-question': { kind: 'dismiss', until: null, at: 1100, since: 1000 },
+    'same-event': same,
+  } } });
+  assert.deepEqual(result.value.items, { 'same-event': same });
+  assert.deepEqual(attention.map((item) => item.setAside), [null, 'dismiss']);
+});
+
+test('set-aside requests validate kinds, keys, minutes, fields, and current attention', () => {
+  assert.deepEqual(parseSetAsideRequest({ key: 'one', kind: 'snooze' }), { key: 'one', kind: 'snooze', minutes: 60 });
+  assert.deepEqual(parseSetAsideRequest({ key: 'one', kind: 'snooze', minutes: 1440 }), { key: 'one', kind: 'snooze', minutes: 1440 });
+  for (const body of [
+    null,
+    { key: '', kind: 'dismiss' },
+    { key: 'one', kind: 'unknown' },
+    { key: 'one', kind: 'dismiss', minutes: 60 },
+    { key: 'one', kind: 'clear', extra: true },
+    { key: 'one', kind: 'snooze', minutes: 0 },
+    { key: 'one', kind: 'snooze', minutes: 1441 },
+    { key: 'one', kind: 'snooze', minutes: 1.5 },
+  ]) assert.throws(() => parseSetAsideRequest(body), (error) => error.status === 400);
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-setaside-validation-'));
+  try {
+    assert.throws(() => updateSetAside({ key: 'missing', kind: 'dismiss' }, [], { root }),
+      (error) => error.status === 400 && error.message === 'unknown attention key');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('/api/setaside requires write authentication', () => {
+  const remote = { method: 'POST', url: '/api/setaside', socket: { remoteAddress: '192.0.2.10' }, headers: { host: 'keep.example', 'x-keep': '1' } };
+  assert.deepEqual(apiRequestAuthError(remote, { isLocal: () => false, token: 'secret' }), { status: 403, error: 'unauthorized' });
+  const local = { method: 'POST', url: '/api/setaside', socket: { remoteAddress: '127.0.0.1' }, headers: { host: 'localhost:7777' } };
+  assert.deepEqual(apiRequestAuthError(local, { isLocal: () => true, token: 'secret' }), { status: 403, error: 'missing x-keep header' });
+  local.headers['x-keep'] = '1';
+  assert.equal(apiRequestAuthError(local, { isLocal: () => true, token: 'secret' }), null);
+});
+
+test('typing chunks preserve spaced, unspaced, emoji, and empty text exactly', () => {
+  const spaced = 'word '.repeat(200);
+  assert.equal(spaced.length, 1000);
+  const spacedChunks = chunkForTyping(spaced, 200);
+  assert.equal(spacedChunks.join(''), spaced);
+  assert.ok(spacedChunks.every((chunk) => Array.from(chunk).length <= 200));
+  assert.ok(spacedChunks.slice(0, -1).every((chunk) => chunk.endsWith(' ')), 'spaced chunks break at a space');
+
+  const unspaced = 'x'.repeat(1000);
+  const unspacedChunks = chunkForTyping(unspaced, 200);
+  assert.equal(unspacedChunks.join(''), unspaced);
+  assert.ok(unspacedChunks.every((chunk) => chunk.length <= 200));
+
+  const emoji = `${'a'.repeat(199)}🚀${'b'.repeat(205)}🌊`;
+  const emojiChunks = chunkForTyping(emoji, 200);
+  assert.equal(emojiChunks.join(''), emoji);
+  assert.ok(emojiChunks.every((chunk) => Array.from(chunk).length <= 200));
+  for (const chunk of emojiChunks) {
+    for (let index = 0; index < chunk.length; index += 1) {
+      const code = chunk.charCodeAt(index);
+      if (code >= 0xD800 && code <= 0xDBFF) {
+        assert.ok(index + 1 < chunk.length && chunk.charCodeAt(index + 1) >= 0xDC00 && chunk.charCodeAt(index + 1) <= 0xDFFF);
+        index += 1;
+      } else {
+        assert.ok(code < 0xDC00 || code > 0xDFFF, 'chunk contains a lone low surrogate');
+      }
+    }
+  }
+  assert.deepEqual(chunkForTyping('', 200), []);
+});
+
+test('deliveredMatches compares the complete message after whitespace normalization', () => {
+  assert.equal(deliveredMatches('hello\n  fleet\tworld', ' hello fleet world '), true);
+  assert.equal(deliveredMatches('hello world', 'hello missing middle world'), false);
+});
+
+test('briefDue handles send time, success, retry window, and noon cutoff', () => {
+  const before = new Date(2026, 8, 2, 7, 59).getTime();
+  const morning = new Date(2026, 8, 2, 8, 0).getTime();
+  const retry = new Date(2026, 8, 2, 9, 0).getTime();
+  const noon = new Date(2026, 8, 2, 12, 0).getTime();
+  assert.equal(briefDue({}, before), false, 'not yet time');
+  assert.equal(briefDue({ lastBriefDay: '2026-09-02' }, morning), false, 'sent today');
+  assert.equal(briefDue({ lastBriefAttemptAt: retry - 31 * 60e3 }, retry), true, 'failed and retry window elapsed');
+  assert.equal(briefDue({ lastBriefAttemptAt: retry - 29 * 60e3 }, retry), false, 'failed but retry window remains');
+  assert.equal(briefDue({}, noon), false, 'past noon');
+});
+
+test('background completions absorbed as attachments or queued records clear waits', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-background-'));
+  const file = path.join(dir, 'session.jsonl');
+  const completion = '<task-notification><task-id>job-1</task-id><status>completed</status></task-notification>';
+  try {
+    for (const launched of ['Command running in background with ID: job-1.', 'Async agent launched. agentId: job-1']) {
+      const start = [
+        record('assistant', [{ type: 'tool_use', id: 't', name: 'Bash', input: { command: 'sleep 60; echo done', run_in_background: true } }]),
+        record('user', [{ type: 'tool_result', tool_use_id: 't', content: launched }]),
+        record('assistant', 'Waiting.'),
+      ];
+      for (const end of [
+        { type: 'queue-operation', operation: 'enqueue', content: completion },
+        { type: 'attachment', attachment: { type: 'queued_command', prompt: completion } },
+        { type: 'user', message: { content: [{ type: 'text', text: completion }] } },
+      ]) {
+        fs.writeFileSync(file, start.join('\n'));
+        assert.equal(scanTranscript(file).pendingBackground, true);
+        fs.appendFileSync(file, '\n' + JSON.stringify(end));
+        assert.equal(scanTranscript(file).pendingBackground, false);
+        assert.equal(scanTranscript(file).endedTurn, true);
+      }
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('monitor events keep a wait live until an explicit completion or successful stop', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-monitor-'));
+  const file = path.join(dir, 'session.jsonl');
+  const start = [
+    record('assistant', [{ type: 'tool_use', id: 'm', name: 'Monitor', input: { command: 'watch-hosts', persistent: true } }]),
+    record('user', [{ type: 'tool_result', tool_use_id: 'm', content: 'Monitor started (task monitor-1, persistent — runs until TaskStop or session end).' }]),
+    record('user', '<task-notification><task-id>monitor-1</task-id><summary>Monitor event: host drain</summary><event>Still occupied</event></task-notification>'),
+    record('assistant', 'Still waiting.'),
+  ];
+  try {
+    fs.writeFileSync(file, start.join('\n'));
+    assert.equal(scanTranscript(file).pendingBackground, true);
+    fs.appendFileSync(file, '\n' + record('user', '<task-notification><task-id>monitor-1</task-id><status>completed</status></task-notification>'));
+    assert.equal(scanTranscript(file).pendingBackground, false);
+    fs.writeFileSync(file, start.join('\n'));
+    fs.appendFileSync(file, '\n' + JSON.stringify({ type: 'queue-operation', operation: 'enqueue', content: '<task-notification><task-id>monitor-1</task-id><summary>Monitor event: host drain</summary><event>[Monitor timed out — re-arm if needed.]</event></task-notification>' }));
+    assert.equal(scanTranscript(file).pendingBackground, false, 'timeout is terminal even without a status tag');
+    fs.writeFileSync(file, start.concat([
+      record('assistant', [{ type: 'tool_use', id: 's', name: 'TaskStop', input: { task_id: 'monitor-1' } }]),
+      record('user', [{ type: 'tool_result', tool_use_id: 's', content: 'Task successfully stopped' }]),
+    ]).join('\n'));
+    assert.equal(scanTranscript(file).pendingBackground, false);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('finite background timer suppresses input attention until it completes', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-serve-test-'));
+  const file = path.join(dir, 'session.jsonl');
+  const launch = [
+    record('assistant', [{
+      type: 'tool_use',
+      id: 'tool-1',
+      name: 'Bash',
+      input: { command: 'sleep 1500; echo done', run_in_background: true },
+    }]),
+    record('user', [{
+      type: 'tool_result',
+      tool_use_id: 'tool-1',
+      content: 'Command running in background with ID: timer-1.',
+    }]),
+    record('assistant', [{ type: 'text', text: 'Now waiting on the deploy timer to rerun the staging exit test.' }]),
+  ];
+
+  try {
+    fs.writeFileSync(file, `${launch.join('\n')}\n`);
+    const waiting = scanTranscript(file);
+    assert.equal(waiting.pendingBackground, true);
+    assert.equal(waiting.endedTurn, true);
+    assert.equal(sessionNeedsInput({
+      ...waiting,
+      notify: { type: 'waiting' },
+      taskId: 'cauldron',
+      mtime: 0,
+    }, 4 * 60e3), false);
+
+    fs.appendFileSync(file, `${record('user', '<task-notification><task-id>timer-1</task-id></task-notification>')}\n`);
+    assert.equal(scanTranscript(file).pendingBackground, false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('bounded background watchdog suppresses input attention until it completes', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-serve-test-'));
+  const file = path.join(dir, 'session.jsonl');
+  const launch = [
+    record('assistant', [{
+      type: 'tool_use',
+      id: 'tool-watchdog',
+      name: 'Bash',
+      input: {
+        command: 'while true; do S=$(check-status); if [ "$S" != running ]; then break; fi; sleep 30; done',
+        run_in_background: true,
+      },
+    }]),
+    record('user', [{
+      type: 'tool_result',
+      tool_use_id: 'tool-watchdog',
+      content: 'Command running in background with ID: watchdog-1.',
+    }]),
+    record('assistant', [{ type: 'text', text: 'The watchdog will wake me when the run finishes.' }]),
+  ];
+
+  try {
+    fs.writeFileSync(file, `${launch.join('\n')}\n`);
+    const waiting = scanTranscript(file);
+    assert.equal(waiting.pendingBackground, true);
+    assert.equal(sessionNeedsInput({
+      ...waiting, notify: { type: 'waiting' }, taskId: 'watchdog', mtime: 0,
+    }, 4 * 60e3), false);
+
+    fs.appendFileSync(file, `${record('user', '<task-notification><task-id>watchdog-1</task-id></task-notification>')}\n`);
+    assert.equal(scanTranscript(file).pendingBackground, false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('bounded background watchers require a finite tail after the polling loop', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-serve-test-'));
+  const file = path.join(dir, 'session.jsonl');
+  const pendingBackground = (command) => {
+    fs.writeFileSync(file, `${[
+      record('assistant', [{
+        type: 'tool_use', id: 'tool-watcher', name: 'Bash',
+        input: { command, run_in_background: true },
+      }]),
+      record('user', [{
+        type: 'tool_result', tool_use_id: 'tool-watcher',
+        content: 'Command running in background with ID: watcher-1.',
+      }]),
+      record('assistant', [{ type: 'text', text: 'The watcher is running.' }]),
+    ].join('\n')}\n`);
+    return scanTranscript(file).pendingBackground;
+  };
+  try {
+    assert.equal(pendingBackground('until curl -sf localhost:3000; do sleep 1; done; npm run dev'), false);
+    assert.equal(pendingBackground('while check; do sleep 30; done; node ~/x/codex-companion.mjs result job'), true);
+    assert.equal(pendingBackground('until check; do sleep 1; done; tail -f app.log'), false);
+    assert.equal(pendingBackground('for i in $(seq 1 30); do if [ -z "$(git status --short -- a b)" ]; then echo landed; exit 0; fi; sleep 60; done; echo "still dirty"'), true);
+    assert.equal(pendingBackground('for f in *.log; do tail -f $f; done'), false);
+    assert.equal(pendingBackground('for ((;;)); do sleep 60; done'), false);
+    assert.equal(pendingBackground('for (( ; ; )); do sleep 60; done'), false);
+    assert.equal(pendingBackground('for ((i=0;i<30;i++)); do sleep 10; done'), true);
+    assert.equal(pendingBackground('for ((;;)); do sleep 60; if check; then break; fi; done'), true);
+    assert.equal(pendingBackground('for i in 1 2 3; do sleep 5; done; npm run dev'), false);
+    for (const command of ['npm test -- --watch', './gradlew test --continuous', 'npm run build && node server.js', 'for ((i=0;;i++)); do adb install app.apk; done', '# Run npm test separately\nnode server.js']) assert.equal(pendingBackground(command), false, command);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('stall alive ids require a fresh ledger with recently alive sessions', () => {
+  const now = 2_000_000;
+  assert.deepEqual(stallAliveIds({
+    updatedAt: now,
+    sessions: {
+      live: { lastSeenAlive: now - 1000 },
+      stale: { lastSeenAlive: now - 11 * 60e3 },
+    },
+  }, now), new Set(['live']));
+  assert.equal(stallAliveIds({
+    updatedAt: now,
+    sessions: { stale: { lastSeenAlive: now - 11 * 60e3 } },
+  }, now), null);
+  assert.equal(stallAliveIds({
+    updatedAt: now - 11 * 60e3,
+    sessions: { live: { lastSeenAlive: now - 1000 } },
+  }, now), null);
+  assert.equal(stallAliveIds({ updatedAt: now, sessions: {} }, now), null);
+});
+
+test('dead mid-turn sessions become recent when absent from a fresh live ledger', () => {
+  const now = Date.parse('2026-09-04T00:30:00Z');
+  const sessions = [{
+    id: 'gone', kind: 'claude', title: 'Parser work', lastAssistant: 'Earlier reply', state: 'running', mtime: now - 31 * 60e3,
+  }];
+  applySessionLiveness(sessions, {
+    updatedAt: now,
+    sessions: { other: { lastSeenAlive: now } },
+  }, [], now);
+  assert.deepEqual(sessions, [{
+    id: 'gone', kind: 'claude', title: 'Parser work', lastAssistant: 'Earlier reply',
+    state: 'recent', alive: false, deadMidTurn: true, mtime: now - 31 * 60e3,
+  }]);
+});
+
+test('dead zero-answer untitled sessions are omitted', () => {
+  const now = Date.parse('2026-09-04T00:30:00Z');
+  const sessions = [{ id: 'gone', kind: 'claude', title: '', lastAssistant: '', state: 'running', mtime: now - 31 * 60e3 }];
+  applySessionLiveness(sessions, {
+    updatedAt: now,
+    sessions: { other: { lastSeenAlive: now } },
+  }, [], now);
+  assert.deepEqual(sessions, []);
+});
+
+test('a stale live ledger does not reclassify running sessions', () => {
+  const now = Date.parse('2026-09-04T00:30:00Z');
+  const sessions = [{ id: 'gone', kind: 'claude', title: 'Parser work', lastAssistant: '', state: 'running' }];
+  applySessionLiveness(sessions, {
+    updatedAt: now - 11 * 60e3,
+    sessions: { other: { lastSeenAlive: now - 11 * 60e3 } },
+  }, [], now);
+  assert.deepEqual(sessions, [{
+    id: 'gone', kind: 'claude', title: 'Parser work', lastAssistant: '', state: 'running', alive: null,
+  }]);
+});
+
+test('inconclusive session liveness preserves running and untitled sessions', () => {
+  const now = Date.parse('2026-09-04T00:30:00Z');
+  const ledger = {
+    updatedAt: now,
+    sessions: { other: { lastSeenAlive: now }, seen: { lastSeenAlive: now - 11 * 60e3 } },
+  };
+  for (const extra of [
+    { id: 'seen' },
+    { kind: 'codex' },
+    { mtime: now - 10 * 60e3 },
+    { mtime: now - 30 * 60e3 },
+    { mtime: undefined },
+  ]) {
+    const session = { id: 'absent', kind: 'claude', title: '', lastAssistant: '', state: 'running', mtime: now - 31 * 60e3, ...extra };
+    const sessions = [{ ...session }];
+    applySessionLiveness(sessions, ledger, [], now);
+    assert.deepEqual(sessions, [{ ...session, alive: null }]);
+  }
+});
+
+test('live ledger sightings and host panes keep Claude sessions alive; Codex stays unknown', () => {
+  const now = Date.parse('2026-09-04T00:30:00Z');
+  const sessions = ['ledger', 'pane', 'codex'].map((id) => ({
+    id, kind: id === 'codex' ? 'codex' : 'claude', state: 'running', mtime: now - 31 * 60e3,
+  }));
+  applySessionLiveness(sessions, {
+    updatedAt: now, sessions: { ledger: { lastSeenAlive: now }, codex: { lastSeenAlive: now } },
+  }, [{ alive: true, meta: { sessionId: 'pane' } }, { alive: true, meta: { sessionId: 'codex' } }], now);
+  assert.deepEqual(sessions.map((s) => [s.state, s.alive]), [['running', true], ['running', true], ['running', null]]);
+});
+
+test('background install jobs remain pending until their completion notification', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-install-status-'));
+  const file = path.join(dir, 'session.jsonl');
+  try {
+    fs.writeFileSync(file, [
+      record('assistant', [{ type: 'tool_use', id: 'install', name: 'Bash', input: { command: 'adb -s device install -r app.apk && adb -s device shell screencap /sdcard/test.png', run_in_background: true } }]),
+      record('user', [{ type: 'tool_result', tool_use_id: 'install', content: 'Command running in background with ID: install-1.' }]),
+      record('assistant', [{ type: 'text', text: 'Installing and capturing screenshots in the background.' }]),
+    ].join('\n') + '\n');
+    assert.equal(scanTranscript(file).pendingBackground, true);
+    assert.equal(require('./serve').sessionBackgroundPending(scanTranscript(file)), true);
+    fs.appendFileSync(file, JSON.stringify({ type: 'queue-operation', content: '<task-notification><task-id>install-1</task-id><status>completed</status></task-notification>' }) + '\n');
+    assert.equal(scanTranscript(file).pendingBackground, false);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('background dev servers do not suppress input attention', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-serve-test-'));
+  const file = path.join(dir, 'session.jsonl');
+  try {
+    fs.writeFileSync(file, `${[
+      record('assistant', [{
+        type: 'tool_use', id: 'tool-dev', name: 'Bash',
+        input: { command: 'npm run dev', run_in_background: true },
+      }]),
+      record('user', [{
+        type: 'tool_result', tool_use_id: 'tool-dev',
+        content: 'Command running in background with ID: dev-1.',
+      }]),
+      record('assistant', [{ type: 'text', text: 'The development server is running.' }]),
+    ].join('\n')}\n`);
+    assert.equal(scanTranscript(file).pendingBackground, false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('open-ended background loops do not suppress input attention', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-serve-test-'));
+  const file = path.join(dir, 'session.jsonl');
+  try {
+    fs.writeFileSync(file, `${[
+      record('assistant', [{
+        type: 'tool_use', id: 'tool-loop', name: 'Bash',
+        input: { command: 'while true; do sleep 5; done', run_in_background: true },
+      }]),
+      record('user', [{
+        type: 'tool_result', tool_use_id: 'tool-loop',
+        content: 'Command running in background with ID: loop-1.',
+      }]),
+      record('assistant', [{ type: 'text', text: 'The loop is running.' }]),
+    ].join('\n')}\n`);
+    assert.equal(scanTranscript(file).pendingBackground, false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('lastUserAt and lastHuman track the newest human turn instead of injected or tool-result users', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-serve-test-'));
+  const file = path.join(dir, 'session.jsonl');
+  const humanAt = '2026-09-08T18:12:00.000Z';
+  try {
+    fs.writeFileSync(file, [
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-09-08T18:11:00.000Z',
+        message: { content: [{ type: 'text', text: 'Show me the pinned sessions.' }] },
+      }),
+      JSON.stringify({
+        type: 'user',
+        timestamp: humanAt,
+        message: { content: [{ type: 'text', text: 'Open the latest genuine prompt.' }] },
+      }),
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-09-08T18:13:00.000Z',
+        message: { content: [{ type: 'text', text: '[keep] injected status update' }] },
+      }),
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-09-08T18:14:00.000Z',
+        message: { content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'done' }] },
+      }),
+    ].join('\n'));
+    const scanned = scanTranscript(file);
+    assert.equal(scanned.lastUserAt, Date.parse(humanAt));
+    assert.equal(scanned.lastHuman, 'Open the latest genuine prompt.');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an idle prompt after starting a dev server is not a human request', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-serve-test-'));
+  const file = path.join(dir, 'session.jsonl');
+  try {
+    fs.writeFileSync(file, [
+      record('assistant', [{
+        type: 'tool_use',
+        id: 'tool-1',
+        name: 'Bash',
+        input: { command: 'sleep 1; npm run dev', run_in_background: true },
+      }]),
+      record('user', [{
+        type: 'tool_result',
+        tool_use_id: 'tool-1',
+        content: 'Command running in background with ID: server-1.',
+      }]),
+      record('assistant', [{ type: 'text', text: 'Server is ready.' }]),
+    ].join('\n'));
+    const scanned = scanTranscript(file);
+    assert.equal(scanned.pendingBackground, false);
+    assert.equal(sessionNeedsInput({
+      ...scanned,
+      notify: { type: 'waiting' },
+      taskId: 'task-1',
+      mtime: 0,
+    }, 4 * 60e3), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('explicit prose question still surfaces while background work runs', () => {
+  const session = {
+    notify: { type: 'waiting' },
+    pendingBackground: true,
+    endedTurn: true,
+    askedProse: true,
+    taskId: 'task-1',
+    mtime: 0,
+  };
+  assert.equal(sessionNeedsInput(session, 60e3), true);
+});
+
+test('untimestamped metadata appends do not refresh session activity', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-serve-test-'));
+  const file = path.join(dir, 'session.jsonl');
+  const eventAt = '2026-08-26T23:58:41.718Z';
+  const laterFileMtime = Date.parse('2026-08-27T23:08:47.000Z');
+  try {
+    fs.writeFileSync(file, [
+      JSON.stringify({
+        timestamp: eventAt,
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: 'Checked in; status kept active.' }] },
+      }),
+      JSON.stringify({ type: 'ai-title', aiTitle: 'Old brainstorm title' }),
+      JSON.stringify({ type: 'mode', mode: 'default' }),
+      JSON.stringify({ type: 'bridge-session' }),
+    ].join('\n'));
+    const info = scanTranscript(file);
+    assert.equal(info.lastTs, eventAt);
+    assert.equal(transcriptActivityMs(info, laterFileMtime), Date.parse(eventAt));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('file mtime remains the fallback for legacy transcripts without timestamps', () => {
+  assert.equal(transcriptActivityMs({ lastTs: '' }, 12345), 12345);
+});
+
+test('duplicate historical session links resolve to the newest explicit owner', () => {
+  const tasks = [
+    { id: 'alphabetically-later', fm: { sessions: [{ id: 'thread-1', at: '2026-08-27T13:00' }] } },
+    { id: 'actual-owner', fm: { sessions: [{ id: 'thread-1', at: '2026-08-27T14:00' }] } },
+  ];
+  assert.deepEqual(sessionTaskOwners(tasks), { 'thread-1': 'actual-owner' });
+  assert.deepEqual(sessionTaskOwners([...tasks].reverse()), { 'thread-1': 'actual-owner' });
+});
+
+test('dashboard keeps Needs you visible when attention is empty', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'web', 'index.html'), 'utf8');
+  const render = html.match(/function renderAttention\(\) \{([\s\S]*?)\n\}/);
+  assert.ok(render, 'renderAttention function should exist');
+  assert.match(render[1], /\$\('attention'\)\.style\.display = '';/);
+  assert.doesNotMatch(render[1], /hasItems \? '' : 'none'/);
+  assert.match(html, /Nothing needs you right now/);
+  assert.match(html, /You’re caught up\./);
+});
+
+test('Codex completion marker does not ask for input', () => {
+  const item = sessionAttentionItem({
+    id: 'codex-thread',
+    kind: 'codex',
+    project: '/work/castle-client',
+    title: '',
+    taskId: 'mobile-smoke',
+    mtime: 12345,
+    lastAssistant: 'Implemented and pushed.',
+    lastAssistantFull: 'Implemented and pushed.\n\nValidation passed.',
+    notify: { type: 'complete', message: '' },
+  }, 12346);
+  assert.equal(item, null);
+});
+
+test('Claude completion marker does not ask for input', () => {
+  const item = sessionAttentionItem({
+    id: 'claude-session',
+    kind: 'claude',
+    project: '/work/castle-client',
+    title: 'Finish mobile smoke test',
+    taskId: 'mobile-smoke',
+    mtime: 12345,
+    lastAssistant: 'Implemented and pushed.',
+    lastAssistantFull: 'Implemented and pushed.\n\nValidation passed.',
+    notify: { type: 'complete', message: 'Implemented and pushed.' },
+  }, 12346);
+  assert.equal(item, null);
+});
+
+test('linked card status suppresses only idle session attention', () => {
+  const now = 4 * 60e3;
+  const idle = {
+    id: 'claude-session',
+    kind: 'claude',
+    project: '/work/keep',
+    title: 'Wait for dependency',
+    taskId: 'waiting-task',
+    mtime: 0,
+    endedTurn: true,
+    pendingBackground: false,
+  };
+
+  assert.equal(sessionAttentionItem({ ...idle, taskStatus: 'waiting' }, now), null);
+  assert.equal(sessionAttentionItem({ ...idle, taskStatus: 'blocked' }, now), null);
+  for (const extra of [
+    { taskStatus: 'waiting', askedProse: true },
+    { taskStatus: 'blocked', askedProse: true },
+  ]) {
+    assert.equal(sessionNeedsInput({ ...idle, ...extra }, now), true);
+    assert.equal(sessionAttentionItem({ ...idle, ...extra }, now)?.kind, 'input');
+  }
+  assert.equal(sessionAttentionItem({ ...idle, taskStatus: 'active' }, now), null);
+  assert.deepEqual(sessionAttentionItem({
+    ...idle,
+    taskStatus: 'blocked',
+    pendingQuestion: { question: 'Which target?', options: ['staging', 'production'] },
+  }, now), {
+    pri: 0,
+    kind: 'question',
+    sessionId: 'claude-session',
+    project: '/work/keep',
+    title: 'Wait for dependency',
+    taskId: 'waiting-task',
+    since: 0,
+    question: 'Which target?',
+    options: ['staging', 'production'],
+  });
+});
+
+test('an exited Claude session never occupies a Needs-you slot', () => {
+  const now = Date.now();
+  const session = { kind: 'claude', exited: true, endedTurn: true, taskId: 'x', mtime: now - 10 * 60e3, askedProse: true };
+  assert.equal(sessionAttentionItem(session, now), null);
+  assert.equal(sessionAttentionItem({ ...session, exited: false }, now)?.kind, 'input');
+  assert.equal(sessionAttentionItem({ ...session, activity: { needsInput: true, request: { kind: 'input' } } }, now), null,
+    'exit overrides cached input activity');
+});
+
+test('a reviewer session never occupies a Needs-you slot', () => {
+  const now = Date.now();
+  const base = { id: 's1', kind: 'claude', project: '/p', title: 't', mtime: now, endedTurn: true };
+  // every attention kind funnels through sessionAttentionItem, so one guard covers all
+  const cases = [
+    { pendingQuestion: { question: 'which?', options: ['a'] } },
+    { pendingPlan: { ts: now } },
+    { notify: { type: 'permission', message: 'allow?' } },
+  ];
+  for (const extra of cases) {
+    assert.notEqual(sessionAttentionItem({ ...base, ...extra }, now), null, 'a normal session still asks for attention');
+    assert.equal(sessionAttentionItem({ ...base, ...extra, reviewer: true }, now), null);
+  }
+});
+
+test('a finished run notifies the card thread, and only a safe one', () => {
+  const { pickNotifyTarget } = require('./serve.js');
+  const S = (id, extra) => ({ id, state: 'idle', mtime: 1, endedTurn: true, ...extra });
+
+  assert.equal(pickNotifyTarget([], [S('a')], []), null, 'a card with no linked session has nobody to tell');
+  assert.equal(pickNotifyTarget(['a'], [], []), null, 'a linked session that is gone is not an error');
+  assert.equal(pickNotifyTarget(['a'], [S('a', { state: 'recent' })], []), null, 'nobody is watching a stale session');
+  assert.equal(pickNotifyTarget(['a'], [S('a', { endedTurn: false })], []), null, 'never interrupt a thread mid-turn');
+  assert.equal(pickNotifyTarget(['a'], [S('a')], ['a']), null, 'the run\'s own spawned session is never the recipient');
+
+  assert.equal(pickNotifyTarget(['a'], [S('a')], []).id, 'a');
+  assert.equal(
+    pickNotifyTarget(['a', 'b'], [S('a', { mtime: 10 }), S('b', { mtime: 99 })], []).id,
+    'b',
+    'the thread that most recently touched the card gets it',
+  );
+  assert.equal(
+    pickNotifyTarget(['a', 'b'], [S('a', { mtime: 10 }), S('b', { mtime: 99 })], ['b']).id,
+    'a',
+    'excluding the newest falls back rather than giving up',
+  );
+});
+
+test('delivery candidates include old open threads and count unsafe linked threads as busy', () => {
+  const now = Date.now();
+  const S = (id, extra) => ({ id, state: 'recent', mtime: now - 7 * 3600e3, endedTurn: true, ...extra });
+  const { candidates, busy } = pickDeliveryCandidates(
+    ['old', 'new', 'turning', 'asking', 'excluded', 'exited'],
+    [
+      S('old'),
+      S('exited', { exited: true }),
+      S('new', { state: 'idle', mtime: now - 10e3 }),
+      S('turning', { state: 'running', endedTurn: false }),
+      S('asking', { pendingQuestion: { question: 'which?', options: ['a'] } }),
+      S('excluded', { pendingPlan: { ts: 1 } }),
+      S('unlinked', { mtime: now }),
+    ],
+    ['excluded'],
+  );
+  assert.deepEqual(candidates.map((session) => session.id), ['new', 'old']);
+  assert.equal(candidates[1].state, 'recent', 'seven-hour-old scanned threads remain eligible');
+  assert.equal(busy, 2, 'mid-turn and pending-question threads defer delivery');
+});
+
+test('Codex delivery candidates treat an untracked running turn as busy', () => {
+  const base = { kind: 'codex', mtime: 1 };
+  const { candidates, busy } = pickDeliveryCandidates(
+    ['running', 'idle', 'recent'],
+    [
+      { ...base, id: 'running', state: 'running' },
+      { ...base, id: 'idle', state: 'idle' },
+      { ...base, id: 'recent', state: 'recent' },
+    ],
+    [],
+  );
+  assert.deepEqual(candidates.map((session) => session.id), ['idle', 'recent']);
+  assert.equal(busy, 1);
+});
+
+test('delivery candidates accept idle waiting markers but reject permission prompts', () => {
+  const base = { state: 'idle', mtime: 1, endedTurn: true };
+  const { candidates, busy } = pickDeliveryCandidates(
+    ['waiting', 'permission'],
+    [
+      { ...base, id: 'waiting', notify: { type: 'waiting' } },
+      { ...base, id: 'permission', notify: { type: 'permission' } },
+    ],
+    [],
+  );
+  assert.deepEqual(candidates.map((session) => session.id), ['waiting']);
+  assert.equal(busy, 1);
+});
+
+test('delivery candidates reject an idle waiting marker when the turn ended with a prose question', () => {
+  const { candidates, busy } = pickDeliveryCandidates(
+    ['asking'],
+    [{ id: 'asking', state: 'idle', mtime: 1, endedTurn: true, notify: { type: 'waiting' }, askedProse: true }],
+    [],
+  );
+  assert.deepEqual(candidates, []);
+  assert.equal(busy, 1);
+});
+
+test('transcript project fallback ignores relative cwd values', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-transcript-project-'));
+  const transcript = path.join(root, 'session.jsonl');
+  fs.writeFileSync(transcript, `${JSON.stringify({ cwd: '.' })}\n${JSON.stringify({ cwd: `  ${root}  ` })}\n`);
+  try {
+    assert.deepEqual(sessionProjectFromTranscript('claude-session', {
+      findSessionFile: () => transcript,
+      codexSessionMeta: () => assert.fail('absolute Claude cwd should resolve first'),
+    }), { project: root, agent: 'claude' });
+    assert.deepEqual(sessionProjectFromTranscript('codex-session', {
+      findSessionFile: () => null,
+      codexSessionMeta: () => ({ cwd: '.' }),
+    }), { project: '', agent: null });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('transcript project fallback skips Codex metadata for Claude sessions', () => {
+  let codexCalls = 0;
+  assert.deepEqual(sessionProjectFromTranscript('claude-session', {
+    findSessionFile: () => null,
+    codexSessionMeta: () => { codexCalls++; return { cwd: '/codex' }; },
+  }, 'claude'), { project: '', agent: null });
+  assert.equal(codexCalls, 0);
+});
+
+test('compact-first requires both a cold thread and a large context', () => {
+  const thresholds = { ttlMs: 60e3, minTokens: 80000 };
+  assert.equal(shouldCompactFirst({ idleMs: 61e3, contextTokens: 80000 }, thresholds), true);
+  assert.equal(shouldCompactFirst({ idleMs: 60e3, contextTokens: 120000 }, thresholds), false);
+  assert.equal(shouldCompactFirst({ idleMs: 61e3, contextTokens: 79999 }, thresholds), false);
+  assert.equal(shouldCompactFirst({ idleMs: NaN, contextTokens: 120000 }, thresholds), false);
+});
+
+test('last context size comes from the newest usage-bearing transcript record', () => {
+  const claude = [
+    JSON.stringify({ type: 'assistant', message: { usage: {
+      input_tokens: 100, cache_creation_input_tokens: 20, cache_read_input_tokens: 30,
+    } } }),
+    JSON.stringify({ type: 'user', message: { content: 'between turns' } }),
+    JSON.stringify({ type: 'assistant', message: { usage: {
+      input_tokens: 400, cache_creation_input_tokens: 50, cache_read_input_tokens: 60,
+    } } }),
+  ];
+  const codex = [JSON.stringify({
+    type: 'event_msg',
+    payload: {
+      type: 'token_count',
+      info: { last_token_usage: { input_tokens: 18293, cached_input_tokens: 11008 } },
+    },
+  })];
+  assert.equal(lastContextTokens(claude, 'claude'), 510);
+  assert.equal(lastContextTokens(codex, 'codex'), 29301);
+  assert.equal(lastContextTokens([], 'claude'), 0);
+});
+
+test('last turn usage takes the last non-sidechain Claude model and context', () => {
+  const records = [
+    { type: 'assistant', message: { model: 'claude-haiku-4-5-20251001', usage: {
+      input_tokens: 10, cache_creation_input_tokens: 20, cache_read_input_tokens: 30,
+    } } },
+    { type: 'assistant', message: { model: 'claude-fable-5-1', usage: {
+      input_tokens: 400, cache_creation_input_tokens: 50, cache_read_input_tokens: 60,
+    } } },
+    { type: 'assistant', isSidechain: true, message: { model: 'claude-opus-5', usage: {
+      input_tokens: 900, cache_creation_input_tokens: 90, cache_read_input_tokens: 9,
+    } } },
+  ];
+  assert.deepEqual(lastTurnUsage(records, 'claude'), {
+    contextTokens: 510,
+    model: 'claude-fable-5-1',
+  });
+});
+
+test('Claude compact boundaries replace stale assistant context until the next assistant turn', () => {
+  const assistant = (contextTokens) => ({
+    type: 'assistant',
+    message: { model: 'claude-fable-5-1', usage: { input_tokens: contextTokens } },
+  });
+  const boundary = {
+    type: 'system',
+    subtype: 'compact_boundary',
+    content: 'Conversation compacted',
+    compactMetadata: { trigger: 'manual', preTokens: 300000, postTokens: 17000 },
+  };
+
+  assert.deepEqual(lastTurnUsage([assistant(300000), boundary], 'claude'), {
+    contextTokens: 17000,
+    model: 'claude-fable-5-1',
+  });
+  assert.deepEqual(lastTurnUsage([assistant(300000), { ...boundary, compactMetadata: undefined }], 'claude'), {
+    contextTokens: 0,
+    model: 'claude-fable-5-1',
+  });
+  assert.deepEqual(lastTurnUsage([assistant(340000), boundary, assistant(50000)], 'claude'), {
+    contextTokens: 50000,
+    model: 'claude-fable-5-1',
+  });
+});
+
+test('auto-compact candidates are cold, large, safe Claude sessions ordered by context size', () => {
+  const now = Date.parse('2026-09-01T12:00:00Z');
+  const opts = { ttlMs: 60 * 60e3, maxIdleMs: 1440 * 60e3, minTokens: 100000, models: ['fable'] };
+  const session = (id, idleMin, contextTokens, extra = {}) => ({
+    id,
+    kind: 'claude',
+    mtime: now - idleMin * 60e3,
+    endedTurn: true,
+    contextTokens,
+    model: 'claude-fable-5-1',
+    ...extra,
+  });
+  const large = session('large', 60, 140000);
+  const larger = session('larger', 61, 220000);
+  const oldStamp = { mtime: large.mtime - 1 };
+  const candidates = autoCompactCandidates([
+    large,
+    larger,
+    session('still-warm', 59, 300000),
+    session('too-old', 1441, 300000),
+    session('small', 120, 99999),
+    session('question', 120, 300000, { pendingQuestion: { question: 'Which?' } }),
+    session('background', 120, 300000, { pendingBackground: true }),
+    session('turning', 120, 300000, { endedTurn: false }),
+    session('exited', 120, 300000, { exited: true }),
+    session('codex', 120, 300000, { kind: 'codex' }),
+    session('opus', 120, 300000, { model: 'claude-opus-5' }),
+    session('no-model', 120, 300000, { model: '' }),
+  ], { large: oldStamp }, now, opts);
+
+  assert.deepEqual(candidates.map((candidate) => candidate.session.id), ['larger', 'large']);
+  assert.equal(candidates[1].idleMs, 60 * 60e3);
+  assert.equal(candidates[1].contextTokens, 140000);
+  assert.deepEqual(autoCompactCandidates([large], { large: { mtime: large.mtime } }, now, opts), []);
+  assert.deepEqual(autoCompactCandidates([large], { large: oldStamp }, now, opts).map((candidate) => candidate.session.id), ['large']);
+  const opus = session('opus', 120, 300000, { model: 'claude-opus-5' });
+  assert.deepEqual(autoCompactCandidates([opus], {}, now, opts), []);
+  assert.deepEqual(
+    autoCompactCandidates([opus], {}, now, { ...opts, models: ['fable', 'opus'] }).map((candidate) => candidate.session.id),
+    ['opus'],
+  );
+});
+
+test('auto-compact idle eligibility treats waiting as idle but real prompts as blocking', () => {
+  const now = Date.parse('2026-09-01T12:00:00Z');
+  const opts = { ttlMs: 60 * 60e3, maxIdleMs: 1440 * 60e3 };
+  const session = {
+    id: 'cold-fable',
+    kind: 'claude',
+    mtime: now - 2 * 60 * 60e3,
+    endedTurn: true,
+    model: 'claude-fable-5-1',
+  };
+
+  assert.equal(autoCompactIdleMs({ ...session, notify: { type: 'waiting' } }, {}, now, opts), 2 * 60 * 60e3);
+  assert.equal(autoCompactIdleMs({ ...session, notify: { type: 'permission' } }, {}, now, opts), null);
+  assert.equal(autoCompactIdleMs({ ...session, notify: { type: 'question' } }, {}, now, opts), null);
+});
+
+test('compact swap plan targets eligible Claude model families and preserves the 1M default', () => {
+  const session = { kind: 'claude', model: 'claude-fable-5-1' };
+  const opts = { via: 'opus', families: ['fable'], settingsModel: 'claude-fable-5-1[1m]' };
+
+  assert.equal(compactSwapPlan(session, { ...opts, via: 'off' }), null);
+  assert.equal(compactSwapPlan({ ...session, kind: 'codex' }, opts), null);
+  assert.equal(compactSwapPlan({ ...session, model: '' }, opts), null);
+  assert.equal(compactSwapPlan({ ...session, model: 'claude-opus-5' }, opts), null);
+  const configuredDefault = compactSwapPlan(session, opts);
+  assert.deepEqual(configuredDefault, {
+    switchCommand: '/model opus',
+    restoreCommand: '/model claude-fable-5-1[1m]',
+    originalModel: 'claude-fable-5-1',
+    settingsModelBefore: 'claude-fable-5-1[1m]',
+    settingsModelPresent: true,
+  });
+  const nonDefault = compactSwapPlan(session, { ...opts, settingsModel: 'claude-opus-5' });
+  assert.deepEqual(nonDefault, {
+    switchCommand: '/model opus',
+    restoreCommand: '/model claude-fable-5-1',
+    originalModel: 'claude-fable-5-1',
+    settingsModelBefore: 'claude-opus-5',
+    settingsModelPresent: true,
+  });
+  const emptySettings = compactSwapPlan(session, { ...opts, settingsModel: '' });
+  assert.deepEqual(emptySettings, {
+    switchCommand: '/model opus',
+    restoreCommand: '/model claude-fable-5-1',
+    originalModel: 'claude-fable-5-1',
+    settingsModelBefore: '',
+    settingsModelPresent: false,
+  });
+  assert.doesNotMatch(JSON.stringify([configuredDefault, nonDefault, emptySettings]), /\/model default/);
+  assert.equal(compactSwapPlan({ ...session, model: 'claude-sonnet-5' }, opts), null);
+});
+
+test('model switch confirmation matches the requested family and ignores stale lines', () => {
+  const opus = 'Set model to Opus 5 and saved as your default for new sessions';
+  const fable = 'Set model to Fable 5.1 and saved as your default for new sessions';
+  assert.equal(modelSwitchConfirmed(`❯ /model opus\n⎿ ${opus}`, '/model opus'), true);
+  assert.equal(modelSwitchConfirmed(`❯ /model claude-fable-5-1[1m]\n⎿ ${opus}`, '/model claude-fable-5-1[1m]'), false);
+  assert.equal(modelSwitchConfirmed(`❯ /model claude-fable-5-1[1m]\n⎿ ${fable}`, '/model claude-fable-5-1[1m]'), true);
+  assert.equal(modelSwitchConfirmed('❯ /model claude-opus-5\n⎿ Switched to Opus 5', '/model claude-opus-5'), true);
+  assert.equal(modelSwitchConfirmed('Claude is ready for another prompt', '/model opus'), false);
+
+  const staleScreen = `❯ /model opus\n⎿ ${opus}\n❯ /model claude-fable-5-1[1m]\n⎿ ${fable}`;
+  assert.equal(modelSwitchConfirmed(staleScreen, '/model opus'), true);
+  assert.equal(modelSwitchConfirmed(staleScreen, '/model claude-fable-5-1[1m]'), true);
+});
+
+test('model switch confirmation accepts exact success lines and rejects failure text', () => {
+  const sonnetEcho = '❯ /model sonnet';
+  const sonnetSuccess = '  ⎿  Set model to Sonnet 5 and saved as your default for new sessions';
+  const sonnetFailure = '  ⎿  Failed to set model to Sonnet 5';
+  const haikuEcho = '❯ /model claude-haiku-4-5-20251001';
+  const haikuSuccess = '  ⎿  Set model to Haiku 4.5 and saved as your default for new sessions';
+
+  assert.equal(modelSwitchConfirmed(`${sonnetEcho}\n${sonnetSuccess}`, '/model sonnet'), true);
+  assert.equal(modelSwitchConfirmed(`${sonnetEcho}\n${sonnetFailure}`, '/model sonnet'), false);
+  assert.equal(modelSwitchConfirmed(`${haikuEcho}\n${haikuSuccess}`, '/model claude-haiku-4-5-20251001'), true);
+});
+
+test('model switch state is anchored after the last echo of the full command', () => {
+  const oldResult = '⎿ Set model to Sonnet 5 and saved as your default for new sessions';
+  const pending = [
+    '❯ /model sonnet',
+    oldResult,
+    '❯ /model claude-haiku-4-5-20251001',
+    '⎿ Set model to Haiku 4.5 and saved as your default for new sessions',
+    '❯ /model sonnet',
+    'Switch model?',
+    '❯ 1. Yes, switch to Sonnet 5',
+    '  2. No, go back',
+  ].join('\n');
+
+  assert.equal(modelSwitchConfirmed(pending, '/model sonnet'), false);
+  assert.equal(modelSwitchDialogVisible(pending, '/model sonnet'), true);
+  assert.equal(modelSwitchConfirmed(`${pending}\n${oldResult}`, '/model sonnet'), true);
+  assert.equal(modelSwitchConfirmed('⎿ Set model to Sonnet 5', '/model sonnet'), false);
+  assert.equal(modelSwitchDialogVisible('Switch model?\n❯ 1. Yes, switch to Sonnet 5', '/model sonnet'), false);
+});
+
+test('lines after last echo excludes results belonging to earlier identical commands', () => {
+  const screen = [
+    '❯ /model sonnet',
+    '⎿ Set model to Sonnet 5',
+    '❯ /model sonnet',
+    '  Switch model?  ',
+    '❯ 1. Yes, switch to Sonnet 5',
+  ].join('\n');
+  assert.deepEqual(linesAfterLastEcho(screen, '/model sonnet'), [
+    'Switch model?',
+    '❯ 1. Yes, switch to Sonnet 5',
+  ]);
+  assert.deepEqual(linesAfterLastEcho(screen, '/model fable'), []);
+});
+
+test('model switch dialog detection recognises Claude Code cache warnings only', () => {
+  const dialog = `
+  Switch model?
+  Your next response will be slower and use more tokens
+
+  This conversation is cached for the current model. Switching to Sonnet 5 means the full history gets re-read on your next message.
+
+  ❯ 1. Yes, switch to Sonnet 5
+    2. No, go back
+  `;
+  assert.equal(modelSwitchDialogVisible(dialog), true);
+  assert.equal(modelSwitchDialogVisible('❯ 1. Yes, switch to Sonnet 5\n  2. No, go back'), true);
+  assert.equal(modelSwitchDialogVisible('❯'), false);
+  assert.equal(modelSwitchDialogVisible('Set model to Sonnet 5 and saved as your default for new sessions'), false);
+});
+
+test('settings model repair preserves exact values and removes an originally absent key', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-settings-test-'));
+  const file = path.join(dir, 'settings.json');
+  const priorPath = process.env.KEEP_CLAUDE_SETTINGS_PATH;
+  process.env.KEEP_CLAUDE_SETTINGS_PATH = file;
+  try {
+    fs.writeFileSync(file, `${JSON.stringify({ theme: 'dark', model: 'claude-opus-5' }, null, 2)}\n`);
+    assert.deepEqual(repairClaudeSettingsModel('claude-fable-5-1[1m]'), { changed: true });
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), {
+      theme: 'dark',
+      model: 'claude-fable-5-1[1m]',
+    });
+    assert.match(fs.readFileSync(file, 'utf8'), /\n  "model": "claude-fable-5-1\[1m\]"\n/);
+    assert.deepEqual(repairClaudeSettingsModel('claude-fable-5-1[1m]'), { changed: false });
+
+    assert.deepEqual(repairClaudeSettingsModel(''), { changed: true });
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { theme: 'dark' });
+    assert.deepEqual(repairClaudeSettingsModel(''), { changed: false });
+
+    fs.writeFileSync(file, `${JSON.stringify({ theme: 'dark', model: 'claude-opus-5' }, null, 2)}\n`);
+    assert.deepEqual(repairClaudeSettingsModel('', true), { changed: true });
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { theme: 'dark', model: '' });
+
+    fs.writeFileSync(file, '{not json\n');
+    const failed = repairClaudeSettingsModel('claude-fable-5-1[1m]');
+    assert.equal(failed.changed, false);
+    assert.match(failed.error, /JSON/);
+  } finally {
+    if (priorPath === undefined) delete process.env.KEEP_CLAUDE_SETTINGS_PATH;
+    else process.env.KEEP_CLAUDE_SETTINGS_PATH = priorPath;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('settings model snapshots distinguish unreadable, absent, empty, and non-string values', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-settings-snapshot-test-'));
+  const file = path.join(dir, 'settings.json');
+  const priorPath = process.env.KEEP_CLAUDE_SETTINGS_PATH;
+  process.env.KEEP_CLAUDE_SETTINGS_PATH = file;
+  const session = { kind: 'claude', model: 'claude-fable-5-1' };
+  const opts = { via: 'opus', families: ['fable'] };
+  try {
+    const unreadable = readClaudeSettingsModel();
+    assert.equal(unreadable.ok, false);
+    assert.match(unreadable.error, /ENOENT/);
+    assert.equal(unreadable.ok ? compactSwapPlan(session, {
+      ...opts,
+      settingsModel: unreadable.present ? unreadable.value : '',
+      settingsPresent: unreadable.present,
+    }) : null, null);
+
+    fs.writeFileSync(file, '{"theme":"dark"}\n');
+    assert.deepEqual(readClaudeSettingsModel(), { ok: true, present: false, value: '' });
+    fs.writeFileSync(file, '{"model":""}\n');
+    assert.deepEqual(readClaudeSettingsModel(), { ok: true, present: true, value: '' });
+    fs.writeFileSync(file, '{"model":42}\n');
+    assert.deepEqual(readClaudeSettingsModel(), { ok: true, present: true, value: 42 });
+    fs.writeFileSync(file, '[]\n');
+    const nonObject = readClaudeSettingsModel();
+    assert.equal(nonObject.ok, false);
+    assert.match(nonObject.error, /JSON object/);
+  } finally {
+    if (priorPath === undefined) delete process.env.KEEP_CLAUDE_SETTINGS_PATH;
+    else process.env.KEEP_CLAUDE_SETTINGS_PATH = priorPath;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pending compact swaps return parsed records with their source files', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-pending-swaps-test-'));
+  const swapFile = path.join(dir, 'claude-session.swap.json');
+  try {
+    fs.writeFileSync(swapFile, `${JSON.stringify({
+      sessionId: 'claude-session',
+      restoreCommand: '/model claude-fable-5-1[1m]',
+      settingsModelBefore: 'claude-fable-5-1[1m]',
+    })}\n`);
+    fs.writeFileSync(path.join(dir, 'claude-session.json'), '{}\n');
+    assert.deepEqual(pendingCompactSwaps(dir), [{
+      sessionId: 'claude-session',
+      restoreCommand: '/model claude-fable-5-1[1m]',
+      settingsModelBefore: 'claude-fable-5-1[1m]',
+      file: swapFile,
+    }]);
+    assert.deepEqual(readPendingCompactSwap('claude-session', dir), {
+      sessionId: 'claude-session',
+      restoreCommand: '/model claude-fable-5-1[1m]',
+      settingsModelBefore: 'claude-fable-5-1[1m]',
+      file: swapFile,
+    });
+    assert.equal(readPendingCompactSwap('absent-session', dir), null);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pending swap sweep restores an idle Claude session and its settings model', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-restore-test-'));
+  const dir = path.join(root, 'compact');
+  const settingsFile = path.join(root, 'settings.json');
+  const priorPath = process.env.KEEP_CLAUDE_SETTINGS_PATH;
+  process.env.KEEP_CLAUDE_SETTINGS_PATH = settingsFile;
+  const session = { id: 'idle-opus', kind: 'claude', model: 'claude-opus-5', endedTurn: true };
+  const calls = [];
+  const swapFile = writeCompactSwapFixture(dir, session.id, { settingsModelBefore: 'claude-fable-5-1' });
+  try {
+    fs.writeFileSync(settingsFile, '{"theme":"dark","model":"opus"}\n');
+    const deps = compactRestoreDeps(dir, session, calls, settingsFile);
+    delete deps.readClaudeSettingsModel;
+    delete deps.repairClaudeSettingsModel;
+    const summary = await sweepPendingCompactSwaps(deps);
+    assert.deepEqual(summary, { checked: 1, restored: 1, dropped: 0, skipped: 0, repairedSettings: 1 });
+    assert.deepEqual(calls, ['/model claude-fable-5-1[1m]']);
+    assert.equal(fs.existsSync(swapFile), false);
+    assert.deepEqual(JSON.parse(fs.readFileSync(settingsFile, 'utf8')), {
+      theme: 'dark',
+      model: 'claude-fable-5-1', // the record's pre-swap value, not what /model just wrote
+    });
+  } finally {
+    if (priorPath === undefined) delete process.env.KEEP_CLAUDE_SETTINGS_PATH;
+    else process.env.KEEP_CLAUDE_SETTINGS_PATH = priorPath;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('pending swap sweep preserves hand-set restore and Sonnet models', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-hand-model-test-'));
+  const dir = path.join(root, 'compact');
+  const settingsFile = path.join(root, 'settings.json');
+  const priorPath = process.env.KEEP_CLAUDE_SETTINGS_PATH;
+  process.env.KEEP_CLAUDE_SETTINGS_PATH = settingsFile;
+  const session = { id: 'hand-model', kind: 'claude', model: 'claude-opus-5', endedTurn: true };
+  try {
+    for (const value of ['claude-fable-5-1[1m]', 'claude-sonnet-5']) {
+      fs.writeFileSync(settingsFile, JSON.stringify({ model: value }));
+      writeCompactSwapFixture(dir, session.id, { settingsModelBefore: 'claude-fable-5-1' });
+      const deps = compactRestoreDeps(dir, session, [], settingsFile);
+      delete deps.readClaudeSettingsModel;
+      delete deps.repairClaudeSettingsModel;
+      const summary = await sweepPendingCompactSwaps(deps);
+      assert.equal(summary.restored, 1);
+      assert.deepEqual(JSON.parse(fs.readFileSync(settingsFile, 'utf8')), { model: value });
+    }
+  } finally {
+    if (priorPath === undefined) delete process.env.KEEP_CLAUDE_SETTINGS_PATH;
+    else process.env.KEEP_CLAUDE_SETTINGS_PATH = priorPath;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('pending swap sweep repairs settings without typing exited, absent, or unsafe sessions', async () => {
+  for (const scenario of ['exited', 'absent', 'precheck']) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), `keep-compact-settings-${scenario}-`));
+    const settingsFile = path.join(dir, 'settings.json');
+    const session = scenario === 'absent'
+      ? null
+      : { id: scenario, kind: 'claude', exited: scenario === 'exited', endedTurn: true };
+    const sessionId = session ? session.id : scenario;
+    const calls = [];
+    const file = writeCompactSwapFixture(dir, sessionId, { settingsModelBefore: 'claude-fable-5-1' });
+    const deps = compactRestoreDeps(dir, session, calls, settingsFile);
+    let locked = false;
+    fs.writeFileSync(settingsFile, '{"model":"opus"}');
+    deps.readClaudeSettingsModel = () => ({
+      ok: true,
+      present: true,
+      value: JSON.parse(fs.readFileSync(settingsFile, 'utf8')).model,
+    });
+    deps.repairClaudeSettingsModel = (value) => {
+      assert.equal(locked, true);
+      fs.writeFileSync(settingsFile, JSON.stringify({ model: value }));
+      return { changed: true };
+    };
+    deps.withInjectionLock = async (fn) => {
+      locked = true;
+      try { return await fn(); } finally { locked = false; }
+    };
+    if (scenario === 'precheck') deps.precheckSessionTarget = async () => { throw new Error('unsafe target'); };
+    try {
+      const summary = await sweepPendingCompactSwaps(deps);
+      assert.deepEqual(summary, { checked: 1, restored: 0, dropped: 0, skipped: 1, repairedSettings: 1 });
+      assert.equal(JSON.parse(fs.readFileSync(settingsFile, 'utf8')).model, 'claude-fable-5-1');
+      assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).lastAttemptAt, undefined);
+      assert.deepEqual(calls, []);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test('pending swap sweep leaves a mid-turn session for a later tick', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-busy-test-'));
+  const session = { id: 'busy-opus', kind: 'claude', model: 'claude-opus-5', endedTurn: false };
+  const calls = [];
+  const swapFile = writeCompactSwapFixture(dir, session.id);
+  try {
+    const summary = await sweepPendingCompactSwaps(compactRestoreDeps(dir, session, calls));
+    assert.deepEqual(summary, { checked: 1, restored: 0, dropped: 0, skipped: 1, repairedSettings: 0 });
+    assert.deepEqual(calls, []);
+    assert.equal(fs.existsSync(swapFile), true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pending swap sweep restores even when the last assistant model is already Fable', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-restored-test-'));
+  const session = { id: 'restored', kind: 'claude', model: 'claude-fable-5-1', endedTurn: true };
+  const calls = [];
+  const swapFile = writeCompactSwapFixture(dir, session.id);
+  try {
+    const summary = await sweepPendingCompactSwaps(compactRestoreDeps(dir, session, calls));
+    assert.deepEqual(summary, { checked: 1, restored: 1, dropped: 0, skipped: 0, repairedSettings: 0 });
+    assert.deepEqual(calls, ['/model claude-fable-5-1[1m]']);
+    assert.equal(fs.existsSync(swapFile), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pending swap sweep keeps absent sessions and drops only expired records', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-stale-test-'));
+  const absentFile = writeCompactSwapFixture(dir, 'absent');
+  const oldFile = writeCompactSwapFixture(dir, 'expired', {
+    at: Date.parse('2026-09-03T11:59:00Z'),
+  });
+  const expired = { id: 'expired', kind: 'claude', model: 'claude-opus-5', endedTurn: true };
+  const deps = compactRestoreDeps(dir, expired);
+  try {
+    const summary = await sweepPendingCompactSwaps(deps);
+    assert.deepEqual(summary, { checked: 2, restored: 0, dropped: 1, skipped: 1, repairedSettings: 0 });
+    assert.equal(fs.existsSync(absentFile), true);
+    assert.equal(fs.existsSync(oldFile), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pending swap sweep throttles a recently attempted restore', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-retry-test-'));
+  const session = { id: 'recent-attempt', kind: 'claude', model: 'claude-opus-5', endedTurn: true };
+  const calls = [];
+  const swapFile = writeCompactSwapFixture(dir, session.id, {
+    lastAttemptAt: Date.parse('2026-09-04T12:03:00Z'),
+  });
+  try {
+    const summary = await sweepPendingCompactSwaps(compactRestoreDeps(dir, session, calls));
+    assert.deepEqual(summary, { checked: 1, restored: 0, dropped: 0, skipped: 1, repairedSettings: 0 });
+    assert.deepEqual(calls, []);
+    assert.equal(fs.existsSync(swapFile), true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pending swap sweep keeps a record when the injection lock is busy', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-lock-test-'));
+  const session = { id: 'locked-opus', kind: 'claude', model: 'claude-opus-5', endedTurn: true };
+  const calls = [];
+  const swapFile = writeCompactSwapFixture(dir, session.id);
+  const deps = compactRestoreDeps(dir, session, calls);
+  deps.withInjectionLock = async () => { throw new InjectionError(429, 'busy'); };
+  try {
+    const summary = await sweepPendingCompactSwaps(deps);
+    assert.deepEqual(summary, { checked: 1, restored: 0, dropped: 0, skipped: 1, repairedSettings: 0 });
+    assert.deepEqual(calls, []);
+    assert.equal(fs.existsSync(swapFile), true);
+    assert.equal(JSON.parse(fs.readFileSync(swapFile, 'utf8')).lastAttemptAt, undefined);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pending swap sweep keeps exited sessions without typing or stamping an attempt', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-exited-'));
+  const session = { id: 'exited', kind: 'claude', exited: true, endedTurn: true };
+  const calls = [];
+  const file = writeCompactSwapFixture(dir, session.id);
+  try {
+    const summary = await sweepPendingCompactSwaps(compactRestoreDeps(dir, session, calls));
+    assert.deepEqual(summary, { checked: 1, restored: 0, dropped: 0, skipped: 1, repairedSettings: 0 });
+    assert.deepEqual(calls, []);
+    assert.equal(fs.existsSync(file), true);
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).lastAttemptAt, undefined);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('pending swap sweep rechecks all busy conditions under the injection lock', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-recheck-'));
+  const session = { id: 'recheck', kind: 'claude', endedTurn: true };
+  try {
+    for (const change of [
+      { endedTurn: false }, { state: 'running', endedTurn: undefined },
+      { pendingQuestion: {} }, { pendingPlan: {} },
+      { notify: { type: 'permission' } }, { notify: { type: 'question' } },
+      { exited: true }, null,
+    ]) {
+      const calls = [];
+      const file = writeCompactSwapFixture(dir, session.id);
+      const deps = compactRestoreDeps(dir, session, calls);
+      let lockCalls = 0;
+      deps.withInjectionLock = async (fn) => { lockCalls++; return fn(); };
+      deps.scanSessions = () => lockCalls > 1 ? (change ? [{ ...session, ...change }] : []) : [session];
+      deps.resolveSessionTarget = async () => assert.fail('busy session must not resolve a target');
+      deps.repairClaudeSettingsModel = () => assert.fail('busy session must not repair settings');
+      const summary = await sweepPendingCompactSwaps(deps);
+      assert.equal(summary.skipped, 1);
+      assert.deepEqual(calls, []);
+      assert.equal(fs.existsSync(file), true);
+      assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).lastAttemptAt, undefined);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('pending swap sweep rejects drafts and modals before typing', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-precheck-'));
+  const session = { id: 'precheck', kind: 'claude', endedTurn: true };
+  try {
+    for (const screen of ['❯ my unsent draft', 'Switch model?\nEnter to confirm · Esc to cancel']) {
+      writeCompactSwapFixture(dir, session.id);
+      const calls = [];
+      const deps = compactRestoreDeps(dir, session, calls);
+      deps.readScreen = async () => screen;
+      const summary = await sweepPendingCompactSwaps(deps);
+      assert.equal(summary.skipped, 1);
+      assert.deepEqual(calls, []);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('pending swap sweep repairs settings after failed confirmation and retains the retry record', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-unconfirmed-'));
+  const session = { id: 'unconfirmed', kind: 'claude', endedTurn: true };
+  const calls = [];
+  const file = writeCompactSwapFixture(dir, session.id);
+  const settingsFile = path.join(dir, 'settings.json');
+  const deps = compactRestoreDeps(dir, session, calls, settingsFile);
+  let locked = false;
+  fs.writeFileSync(settingsFile, '{"model":"opus"}');
+  deps.readClaudeSettingsModel = () => ({ ok: true, present: true, value: JSON.parse(fs.readFileSync(settingsFile)).model });
+  deps.repairClaudeSettingsModel = (value) => {
+    assert.equal(locked, true);
+    fs.writeFileSync(settingsFile, JSON.stringify({ model: value }));
+    return { changed: true };
+  };
+  deps.withInjectionLock = async (fn) => {
+    locked = true;
+    try { return await fn(); } finally { locked = false; }
+  };
+  deps.waitForModelSwitch = async () => false;
+  try {
+    const summary = await sweepPendingCompactSwaps(deps);
+    assert.equal(summary.skipped, 1);
+    assert.equal(summary.repairedSettings, 1);
+    assert.deepEqual(calls, ['/model claude-fable-5-1[1m]']);
+    assert.equal(JSON.parse(fs.readFileSync(file)).lastAttemptAt, deps.now());
+    assert.equal(JSON.parse(fs.readFileSync(settingsFile)).model, 'claude-fable-5-1[1m]');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('two concurrent pending swap sweeps perform only one restore', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-concurrent-'));
+  const session = { id: 'concurrent', kind: 'claude', endedTurn: true };
+  const calls = [];
+  writeCompactSwapFixture(dir, session.id);
+  const deps = compactRestoreDeps(dir, session, calls);
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  deps.withInjectionLock = async (fn) => { await gate; return fn(); };
+  const first = sweepPendingCompactSwaps(deps);
+  try {
+    const second = await sweepPendingCompactSwaps(deps);
+    assert.equal(second.checked, 0);
+    release();
+    assert.equal((await first).restored, 1);
+    assert.deepEqual(calls, ['/model claude-fable-5-1[1m]']);
+  } finally {
+    release();
+    await first;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pending swap sweep expires unreadable and invalid-at records using file mtime', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-mtime-'));
+  const old = new Date('2026-09-03T11:59:00Z');
+  const sessions = [];
+  try {
+    for (const [id, at] of [['missing', undefined], ['invalid', 'not-a-date'], ['null', null]]) {
+      const file = writeCompactSwapFixture(dir, id, { at });
+      fs.utimesSync(file, old, old);
+      sessions.push({ id, kind: 'claude', endedTurn: true });
+    }
+    const unreadable = path.join(dir, 'unreadable.swap.json');
+    fs.writeFileSync(unreadable, '{broken');
+    fs.utimesSync(unreadable, old, old);
+    const fresh = path.join(dir, 'fresh.swap.json');
+    fs.writeFileSync(fresh, '{broken');
+    const calls = [];
+    const deps = compactRestoreDeps(dir, null, calls);
+    deps.scanSessions = () => sessions;
+    const summary = await sweepPendingCompactSwaps(deps);
+    assert.equal(summary.dropped, 4);
+    assert.equal(summary.skipped, 1);
+    assert.deepEqual(fs.readdirSync(dir), ['fresh.swap.json']);
+    assert.deepEqual(calls, []);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('pending swap sweep uses the newest settings snapshot and counts repaired records', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-newest-'));
+  const settingsFile = path.join(dir, 'settings.json');
+  const sessions = ['a-older', 'z-newer'].map((id) => ({ id, kind: 'claude', endedTurn: true }));
+  const deps = compactRestoreDeps(dir, null, [], settingsFile);
+  const repairs = [];
+  let locked = false;
+  deps.scanSessions = () => sessions;
+  deps.readClaudeSettingsModel = () => ({ ok: true, present: true, value: JSON.parse(fs.readFileSync(settingsFile)).model });
+  deps.repairClaudeSettingsModel = (value) => {
+    assert.equal(locked, true);
+    repairs.push(value);
+    fs.writeFileSync(settingsFile, JSON.stringify({ model: value }));
+    return { changed: true };
+  };
+  deps.withInjectionLock = async (fn) => {
+    locked = true;
+    try { return await fn(); } finally { locked = false; }
+  };
+  try {
+    fs.writeFileSync(settingsFile, '{"model":"opus"}');
+    writeCompactSwapFixture(dir, 'a-older', { at: deps.now() - 2000, settingsModelBefore: 'claude-sonnet-5' });
+    writeCompactSwapFixture(dir, 'z-newer', { at: deps.now() - 1000, settingsModelBefore: 'claude-fable-5-1' });
+    assert.equal((await sweepPendingCompactSwaps(deps)).restored, 2);
+    assert.deepEqual(repairs, Array(3).fill('claude-fable-5-1'));
+    assert.equal(JSON.parse(fs.readFileSync(settingsFile)).model, 'claude-fable-5-1');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('shutdown settings repair only restores the in-flight via family', () => {
+  const swap = { switchModel: 'opus', settingsModelBefore: 'claude-fable-5-1', settingsModelPresent: true };
+  const current = (value) => ({ ok: true, present: true, value });
+  assert.deepEqual(shutdownSettingsRepair(swap, current('claude-opus-5[1m]')),
+    { repair: true, value: 'claude-fable-5-1', present: true });
+  assert.equal(shutdownSettingsRepair(swap, current('claude-sonnet-5')).repair, false);
+  assert.equal(shutdownSettingsRepair(swap, current('claude-fable-5-1')).repair, false);
+  assert.equal(shutdownSettingsRepair(swap, { ok: false }).repair, false);
+  assert.equal(shutdownSettingsRepair(null, current('opus')).repair, false);
+  assert.equal(shutdownSettingsRepair({ ...swap, switchModel: 'sonnet' }, current('claude-sonnet-5')).repair, true);
+});
+
+test('compact session resumes an interrupted swap without switching to Opus again', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-session-resume-test-'));
+  const dir = path.join(root, 'compact');
+  const transcript = path.join(root, 'transcript.jsonl');
+  const session = { id: 'interrupted', kind: 'claude' };
+  const calls = [];
+  const priorTimeout = process.env.KEEP_COMPACT_TIMEOUT_MS;
+  process.env.KEEP_COMPACT_TIMEOUT_MS = '0';
+  const swapFile = writeCompactSwapFixture(dir, session.id);
+  fs.writeFileSync(transcript, '{}\n');
+  try {
+    const result = await compactSession(session, { pane: 'pane:test' }, null, {
+      dir,
+      sessionLastTurn: () => ({ model: 'claude-opus-5' }),
+      readClaudeSettingsModel: () => ({ ok: true, present: true, value: 'opus' }),
+      transcriptFileForSession: () => transcript,
+      readScreen: async () => '❯',
+      typeAndSubmit: async (_target, command) => { calls.push(command); },
+      waitForModelSwitch: async () => true,
+      repairClaudeSettingsModel: () => ({ changed: true }),
+    });
+    assert.equal(result.reason, 'timeout');
+    assert.deepEqual(calls, ['/compact', '/model claude-fable-5-1[1m]']);
+    assert.equal(fs.existsSync(swapFile), false);
+  } finally {
+    if (priorTimeout === undefined) delete process.env.KEEP_COMPACT_TIMEOUT_MS;
+    else process.env.KEEP_COMPACT_TIMEOUT_MS = priorTimeout;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('compact session uses the newest pending pre-swap settings when settings say Opus', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-settings-chain-test-'));
+  const dir = path.join(root, 'compact');
+  const transcript = path.join(root, 'transcript.jsonl');
+  const session = { id: 'fresh-fable', kind: 'claude' };
+  const calls = [];
+  const repairs = [];
+  const clock = Date.parse('2026-09-04T12:05:00Z');
+  const priorTimeout = process.env.KEEP_COMPACT_TIMEOUT_MS;
+  process.env.KEEP_COMPACT_TIMEOUT_MS = '0';
+  writeCompactSwapFixture(dir, 'older-swap', {
+    settingsModelBefore: 'claude-sonnet-5',
+    at: clock - 2000,
+  });
+  writeCompactSwapFixture(dir, 'newer-swap', {
+    settingsModelBefore: 'claude-fable-5-1[1m]',
+    at: clock - 1000,
+  });
+  fs.writeFileSync(transcript, '{}\n');
+  try {
+    const result = await compactSession(session, { pane: 'pane:test' }, null, {
+      dir,
+      sessionLastTurn: () => ({ model: 'claude-fable-5-1' }),
+      readClaudeSettingsModel: () => ({ ok: true, present: true, value: 'opus' }),
+      transcriptFileForSession: () => transcript,
+      readScreen: async () => '❯',
+      typeAndSubmit: async (_target, command) => { calls.push(command); },
+      waitForModelSwitch: async () => true,
+      repairClaudeSettingsModel: (model, present) => {
+        repairs.push({ model, present });
+        return { changed: true };
+      },
+    });
+    assert.equal(result.reason, 'timeout');
+    assert.deepEqual(calls, ['/model opus', '/compact', '/model claude-fable-5-1[1m]']);
+    assert.deepEqual(repairs, [{ model: 'claude-fable-5-1[1m]', present: true }]);
+  } finally {
+    if (priorTimeout === undefined) delete process.env.KEEP_COMPACT_TIMEOUT_MS;
+    else process.env.KEEP_COMPACT_TIMEOUT_MS = priorTimeout;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('restore failures abort delivery and dominate auto-compact outcomes', () => {
+  assert.throws(
+    () => ensureCompactionRestored({ compacted: true, restoreUnconfirmed: true }),
+    (error) => error.status === 409
+      && error.message === 'model restore unconfirmed after compaction; not delivering',
+  );
+  assert.doesNotThrow(() => ensureCompactionRestored({ compacted: true }));
+  assert.equal(autoCompactOutcome({ compacted: true, restoreUnconfirmed: true }), 'restore-unconfirmed');
+  assert.equal(autoCompactOutcome({ compacted: false, restoreUnconfirmed: true }), 'restore-unconfirmed');
+});
+
+test('compact-first defers only while compaction is still in progress', () => {
+  assert.equal(afterCompactAction('timeout'), 'defer');
+  assert.equal(afterCompactAction('refused'), 'proceed');
+  assert.equal(afterCompactAction('unmatched'), 'proceed');
+  assert.equal(afterCompactAction('error'), 'proceed');
+  assert.equal(afterCompactAction('compacted'), 'proceed');
+  assert.equal(afterCompactAction({ compacted: false, reason: 'timeout' }), 'defer');
+  assert.equal(afterCompactAction({ compacted: false, reason: 'Not enough messages to compact.' }), 'proceed');
+  assert.equal(afterCompactAction({ compacted: false, reason: 'session transcript is unavailable' }), 'proceed');
+  assert.equal(afterCompactAction({ compacted: true }), 'proceed');
+});
+
+test('a refused compaction is recognised from the screen instead of waiting out the timeout', () => {
+  assert.equal(compactRefusal('❯ /compact\n  ⎿  Not enough messages to compact.\n\n❯ '), 'Not enough messages to compact.');
+  assert.equal(compactRefusal('❯ /compact\n  ⎿  Compacted (ctrl+o to see full summary)'), '');
+  assert.equal(compactRefusal(''), '');
+});
+
+test('compactCommand appends an optional compaction instruction', () => {
+  assert.equal(compactCommand(), '/compact');
+  assert.equal(compactCommand('  Keep standing instructions.\nDrop bundle text.  '),
+    '/compact Keep standing instructions. Drop bundle text.');
+});
+
+test('a compaction summary does not leave the session looking mid-turn', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-serve-test-'));
+  const file = path.join(dir, 'session.jsonl');
+  const lines = [
+    record('user', 'Give me two fruits.'),
+    record('assistant', [{ type: 'text', text: 'Apple, Banana' }]),
+    // exactly what a manual /compact leaves behind, in order
+    record('user', '/compact'),
+    JSON.stringify({ type: 'system', subtype: 'compact_boundary', content: 'Conversation compacted' }),
+    JSON.stringify({ type: 'user', isCompactSummary: true, message: { role: 'user', content: 'This session is being continued from a previous conversation...' } }),
+    record('user', '<local-command-caveat>Caveat: generated by local commands</local-command-caveat>'),
+    record('user', '<command-name>/compact</command-name>\n<command-message>compact</command-message>'),
+    record('user', '<local-command-stdout>Compacted (ctrl+o to see full summary)</local-command-stdout>'),
+  ];
+  try {
+    fs.writeFileSync(file, `${lines.join('\n')}\n`);
+    const scanned = scanTranscript(file);
+    assert.equal(scanned.endedTurn, true);
+    assert.equal(scanned.lastUser, '/compact'); // the typed command is a real prompt; its wrapper ends the turn
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('Claude exit wrappers mark the session exited until a real turn resumes it', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-transcript-exited-'));
+  const file = path.join(dir, 'session.jsonl');
+  const goodbye = record('user', '<local-command-stdout>Goodbye!</local-command-stdout>');
+  const ended = [record('user', 'List cards'), record('assistant', 'Shared card names'), goodbye];
+  try {
+    for (const farewell of ['Goodbye!', 'Bye!', 'Catch you later!', 'See ya!', 'Later, alligator!']) {
+      for (const command of ['exit', 'quit']) {
+        fs.writeFileSync(file, [...ended.slice(0, 2), record('user', `<command-name>/${command}</command-name>`),
+          record('user', `<local-command-stdout>${farewell}</local-command-stdout>`)].join('\n'));
+        assert.equal(scanTranscript(file).exited, true, `${command}: ${farewell}`);
+      }
+      if (farewell !== 'Later, alligator!') {
+        fs.writeFileSync(file, [...ended.slice(0, 2), record('user', `  <local-command-stdout>${farewell}</local-command-stdout>  `)].join('\n'));
+        assert.equal(scanTranscript(file).exited, true, `legacy farewell: ${farewell}`);
+      }
+    }
+    for (const prefix of [[], [record('user', '<command-name>/exit</command-name>')]]) {
+      fs.writeFileSync(file, [...ended.slice(0, 2), ...prefix,
+        record('user', '<command-name>/model</command-name>'),
+        record('user', '<local-command-stdout>Set model to opus</local-command-stdout>')].join('\n'));
+      assert.equal(scanTranscript(file).exited, false, 'another local command clears the exit flag');
+    }
+    fs.writeFileSync(file, ended.join('\n'));
+    const info = scanTranscript(file);
+    assert.equal(info.exited, true);
+    assert.equal(info.endedTurn, true);
+    assert.equal(info.lastAssistant, 'Shared card names');
+    fs.appendFileSync(file, '\n' + JSON.stringify({ type: 'assistant', isSidechain: true, message: { content: 'background output' } }));
+    assert.equal(scanTranscript(file).exited, true);
+    fs.appendFileSync(file, '\n' + record('user', '<task-notification>background complete</task-notification>'));
+    assert.equal(scanTranscript(file).exited, false);
+    fs.writeFileSync(file, [...ended, JSON.stringify({ type: 'file-history-snapshot' })].join('\n'));
+    assert.equal(scanTranscript(file).exited, true);
+    for (const resumed of [
+      record('user', 'Resume work'),
+      record('assistant', 'Resuming work'),
+      JSON.stringify({ type: 'mode', mode: 'default' }),
+      JSON.stringify({ type: 'last-prompt', lastPrompt: 'Resume work' }),
+      JSON.stringify({ type: 'attachment', attachment: {} }),
+    ]) {
+      fs.writeFileSync(file, [...ended, resumed].join('\n'));
+      assert.equal(scanTranscript(file).exited, false);
+    }
+    fs.writeFileSync(file, [record('user', 'The output merely contains Goodbye!'), record('assistant', 'Still here')].join('\n'));
+    assert.equal(scanTranscript(file).exited, false, 'ordinary prompt text is not an exit wrapper');
+    fs.writeFileSync(file, [record('assistant', 'Goodbye!'),
+      JSON.stringify({ ...JSON.parse(goodbye), isSidechain: true })].join('\n'));
+    assert.equal(scanTranscript(file).exited, false, 'assistant and sidechain goodbyes are not exits');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a hit usage limit is recorded as rateLimit until the session moves past it', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-transcript-limit-'));
+  const file = path.join(dir, 'session.jsonl');
+  // Shape taken from a real transcript: the limit arrives as a synthetic
+  // assistant record, not as a turn the model produced.
+  const limitError = (text, quotaLimits) => JSON.stringify({
+    type: 'assistant',
+    timestamp: '2026-09-05T22:14:03.921Z',
+    isApiErrorMessage: true,
+    error: 'rate_limit',
+    apiErrorStatus: 429,
+    quotaLimits,
+    message: { model: '<synthetic>', content: [{ type: 'text', text }] },
+  });
+  const fiveHour = limitError("You've hit your session limit · resets 3pm (Pacific/Honolulu)", {
+    status: 'rejected',
+    resetsAt: 1788570000,
+    rateLimitType: 'five_hour',
+  });
+  const fableWeekly = limitError(
+    "You've reached your Fable 5.1 limit. Run /usage-credits to continue or switch models with /model.",
+    null,
+  );
+  const opening = [record('user', 'Keep going on the fleet card'), record('assistant', 'Working on it')];
+  try {
+    fs.writeFileSync(file, [...opening, fiveHour].join('\n'));
+    const hit = scanTranscript(file);
+    assert.deepEqual(hit.rateLimit, {
+      at: '2026-09-05T22:14:03.921Z',
+      text: "You've hit your session limit · resets 3pm (Pacific/Honolulu)",
+      type: 'five_hour',
+      resetsAt: 1788570000000,
+    });
+    // The stalled session must still read as an ended turn: that is what makes it
+    // safe to type into once the window resets.
+    assert.equal(hit.endedTurn, true);
+    assert.equal(hit.exited, false);
+    assert.equal(hit.pendingQuestion, undefined);
+
+    fs.writeFileSync(file, [...opening, fableWeekly].join('\n'));
+    const weekly = scanTranscript(file);
+    assert.equal(weekly.rateLimit.type, 'fable_weekly', 'the Fable limit names itself only in prose');
+    assert.equal(weekly.rateLimit.resetsAt, null);
+    assert.equal(weekly.endedTurn, true);
+
+    fs.writeFileSync(file, [...opening, fiveHour, record('user', 'continue')].join('\n'));
+    assert.equal(scanTranscript(file).rateLimit, null, 'a later prompt means the session resumed');
+
+    fs.writeFileSync(file, [...opening, fiveHour, record('assistant', 'Back on the card')].join('\n'));
+    assert.equal(scanTranscript(file).rateLimit, null, 'a later reply means the session resumed');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a limit record with no window, and one Owner typed past, are not resumable', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-transcript-limit-null-'));
+  const file = path.join(dir, 'session.jsonl');
+  const limitError = (text, quotaLimits) => JSON.stringify({
+    type: 'assistant',
+    timestamp: '2026-09-05T22:14:03.921Z',
+    isApiErrorMessage: true,
+    error: 'rate_limit',
+    apiErrorStatus: 429,
+    quotaLimits,
+    message: { model: '<synthetic>', content: [{ type: 'text', text }] },
+  });
+  const opening = [record('user', 'Keep going on the fleet card'), record('assistant', 'Working on it')];
+  const wrapper = (text) => JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text }] } });
+  try {
+    // resetsAt: null must stay null. Number(null) is 0, and an epoch reset time
+    // would make the resume fire the moment the limit was recorded.
+    fs.writeFileSync(file, [...opening, limitError('Limit reached', {
+      status: 'rejected', resetsAt: null, rateLimitType: 'five_hour',
+    })].join('\n'));
+    assert.equal(scanTranscript(file).rateLimit.resetsAt, null, 'a missing window is not the epoch');
+
+    // Milliseconds seconds apart in magnitude: too large to be seconds, so taken as-is.
+    fs.writeFileSync(file, [...opening, limitError('Limit reached', {
+      status: 'rejected', resetsAt: 1788570000000, rateLimitType: 'five_hour',
+    })].join('\n'));
+    assert.equal(scanTranscript(file).rateLimit.resetsAt, 1788570000000);
+    fs.writeFileSync(file, [...opening, limitError('Limit reached', {
+      status: 'rejected', resetsAt: 42, rateLimitType: 'five_hour',
+    })].join('\n'));
+    assert.equal(scanTranscript(file).rateLimit.resetsAt, null, '42 is not a plausible reset');
+
+    // An unrecognised window type is a transient 429, not a usage limit to wait out.
+    fs.writeFileSync(file, [...opening, limitError('Overloaded, please retry', {
+      status: 'rejected', resetsAt: 1788570000, rateLimitType: 'per_request',
+    })].join('\n'));
+    assert.equal(scanTranscript(file).rateLimit.type, 'unknown');
+    fs.writeFileSync(file, [...opening, limitError('Something about Fable went wrong', null)].join('\n'));
+    assert.equal(scanTranscript(file).rateLimit.type, 'unknown', 'a bare "Fable" is not the weekly limit');
+
+    // /model after the error: no prompt and no reply, but a person is at the
+    // keyboard, so the session is no longer parked on the limit.
+    const fiveHour = limitError("You've hit your session limit", {
+      status: 'rejected', resetsAt: 1788570000, rateLimitType: 'five_hour',
+    });
+    fs.writeFileSync(file, [
+      ...opening,
+      fiveHour,
+      JSON.stringify({ type: 'system', content: 'model changed' }),
+      wrapper('<local-command-caveat>Caveat: the messages below were generated…</local-command-caveat>'),
+      wrapper('<command-name>/model</command-name>\n<command-message>model</command-message>'),
+      wrapper('<local-command-stdout>Set model to opus</local-command-stdout>'),
+    ].join('\n'));
+    assert.equal(scanTranscript(file).rateLimit, null, 'a typed slash command ends the stall');
+
+    // A compaction summary is a person pressing /compact too.
+    fs.writeFileSync(file, [...opening, fiveHour,
+      JSON.stringify({ type: 'user', isCompactSummary: true, message: { content: 'Summary of the session so far' } }),
+    ].join('\n'));
+    assert.equal(scanTranscript(file).rateLimit, null, 'a compact summary ends the stall');
+
+    // A tool result carries no text and is not a person: the stall stands.
+    fs.writeFileSync(file, [...opening, fiveHour, JSON.stringify({
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'ok' }] },
+    })].join('\n'));
+    assert.equal(scanTranscript(file).rateLimit.type, 'five_hour', 'a tool result does not clear the limit');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('resumeAfterLimit rechecks the session and the screen inside the lock', async () => {
+  const HIT_AT = '2026-09-06T18:00:00.000Z';
+  const parked = {
+    id: 'session-one',
+    kind: 'claude',
+    endedTurn: true,
+    rateLimit: { at: HIT_AT, type: 'five_hour', resetsAt: 1788570000000 },
+  };
+  const promptScreen = ['some output', '─'.repeat(40), '❯', ''].join('\n');
+  const makeDeps = (session, screen) => {
+    const calls = { sent: [], screens: 0, locked: 0 };
+    return [calls, {
+      loadCurrentSession: () => session,
+      resolveSessionTarget: async () => ({ pane: 'pane-one' }),
+      readScreen: async (target, lines, scrollback) => {
+        calls.screens += 1;
+        assert.deepEqual([lines, scrollback], [30, false]);
+        return screen;
+      },
+      sendToResolvedTarget: async (s, target, text) => { calls.sent.push([s.id, target.pane, text]); return { ok: true }; },
+      withInjectionLock: async (fn) => { calls.locked += 1; return fn(); },
+    }];
+  };
+
+  const [ok, okDeps] = makeDeps(parked, promptScreen);
+  assert.deepEqual(await resumeAfterLimit('session-one', 'continue', { hitAt: HIT_AT }, okDeps), { ok: true });
+  assert.deepEqual(ok.sent, [['session-one', 'pane-one', 'continue']]);
+  assert.equal(ok.locked, 1);
+
+  // A different limit event means the session already hit the limit again after
+  // the scheduler decided; the decision it is holding is stale.
+  const [moved, movedDeps] = makeDeps({ ...parked, rateLimit: { ...parked.rateLimit, at: '2026-09-06T19:00:00.000Z' } }, promptScreen);
+  await assert.rejects(
+    () => resumeAfterLimit('session-one', 'continue', { hitAt: HIT_AT }, movedDeps),
+    (e) => e.status === 409 && e.message.startsWith('session moved on') && moved.sent.length === 0,
+  );
+
+  for (const session of [
+    { ...parked, rateLimit: null },
+    { ...parked, kind: 'codex' },
+    { ...parked, endedTurn: false },
+    { ...parked, toolRunning: true },
+    { ...parked, pendingQuestion: { question: 'which?' } },
+    { ...parked, pendingPlan: { ts: HIT_AT } },
+    { ...parked, notify: { type: 'permission', message: 'allow?' } },
+    { ...parked, notify: { type: 'question', message: 'which?' } },
+  ]) {
+    const [calls, deps] = makeDeps(session, promptScreen);
+    await assert.rejects(
+      () => resumeAfterLimit('session-one', 'continue', { hitAt: HIT_AT }, deps),
+      (e) => e.status === 409 && e.message.startsWith('session moved on'),
+    );
+    assert.deepEqual([calls.sent, calls.screens], [[], 0], 'a session that moved on is never read or typed into');
+  }
+
+  // The transcript can say "parked" while the pane shows a shell or a restarted
+  // Claude. This one is a retryable failure, not a moved-on skip.
+  const [blind, blindDeps] = makeDeps(parked, 'owner@mac ~/keep %\n');
+  await assert.rejects(
+    () => resumeAfterLimit('session-one', 'continue', { hitAt: HIT_AT }, blindDeps),
+    (e) => e.status === 409 && e.message === 'no Claude prompt visible',
+  );
+  assert.deepEqual(blind.sent, []);
+});
+
+test('exited reviewers cannot be picked or bootstrapped even with a recent pane marker', () => {
+  const { pickReviewer, shouldSendTick } = require('./review.js');
+  const now = Date.now();
+  const exited = { id: 'old-reviewer', state: 'recent', exited: true, endedTurn: true, mtime: now };
+  const marker = { at: now };
+  assert.equal(pickReviewer([exited], { [exited.id]: marker }, now), null);
+  const live = { id: 'new-reviewer', state: 'idle', mtime: now - 1 };
+  assert.equal(pickReviewer([exited, live], { [exited.id]: marker, [live.id]: marker }, now).id, live.id);
+  assert.deepEqual(shouldSendTick({ reviewer: exited, budget: { code: 0 }, queue: { ranked: [{}] }, now }),
+    { send: false, why: 'reviewer session has exited' });
+});
+
+test('/api/state payload includes reviewer events and compact reviewer stats', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-serve-review-state-'));
+  try {
+    for (const dir of ['tasks', 'archive', 'digests', path.join('.keep', 'review')]) {
+      fs.mkdirSync(path.join(root, dir), { recursive: true });
+    }
+    fs.writeFileSync(path.join(root, '.keep', 'review', '_events.jsonl'), `${JSON.stringify({ at: 1234, kind: 'ack', card: 'alpha', title: 'acked', detail: 'clean' })}\n`);
+    fs.writeFileSync(path.join(root, '.keep', 'review', '_meta.json'), JSON.stringify({
+      lastTickAt: 1200,
+      lastCompactAt: 1100,
+      lastSkip: { at: 1000, why: 'quiet' },
+      days: { '2026-09-06': { ticks: 1 }, '2026-09-07': { ticks: 2 }, '2026-09-08': { ticks: 3, acks: 1 } },
+    }));
+    const child = spawnSync(process.execPath, ['-e', "process.stdout.write(JSON.stringify(require('./bin/serve.js').buildState().review))"], {
+      cwd: path.join(__dirname, '..'), env: { ...process.env, KEEP_DIR: root }, encoding: 'utf8',
+    });
+    assert.equal(child.status, 0, child.stderr);
+    const review = JSON.parse(child.stdout);
+    assert.deepEqual(review.events, [{ at: 1234, kind: 'ack', card: 'alpha', title: 'acked', detail: 'clean' }]);
+    assert.equal(review.stats.lastTickAt, 1200);
+    assert.equal(review.stats.lastCompactAt, 1100);
+    assert.deepEqual(Object.keys(review.stats.days), ['2026-09-07', '2026-09-08']);
+    assert.equal(review.stats.days['2026-09-08'].acks, 1);
+    assert.equal(review.stats.reviewer, null);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+const CLAUDE_IDLE_SCREEN = 'Welcome to Claude Code\n\n──────────────────────────────\n❯ \n──────────────────────────────\n  keep  (main)  ctx:4%\n';
+
+test('agent prompt detection needs Claude\'s ruled input box or the Codex placeholder', () => {
+  assert.equal(agentPromptVisible('claude', CLAUDE_IDLE_SCREEN), true);
+  assert.equal(agentPromptVisible('claude', 'user ~ \n❯ \n❯ claude\nLoading Claude Code'), false, 'stale shell prompts are not Claude');
+  assert.equal(agentPromptVisible('claude', 'Welcome to Claude Code\n\n❯ \n\n? for shortcuts'), false, 'a bare prompt without the rule is not enough');
+  assert.equal(agentPromptVisible('claude', CLAUDE_IDLE_SCREEN.replace('❯ \n', '❯ draft text\n')), false);
+  assert.equal(agentPromptVisible('claude', '\x1b[2m──────────────────────────────\x1b[0m\n\x1b[1m❯\x1b[0m \n'), true, 'ANSI is stripped first');
+  assert.equal(agentPromptVisible('claude', '──────────────────── model output ─────────\n❯ \n'), false,
+    'a decorative dash line in model output is not a named prompt rule');
+  assert.equal(agentPromptVisible('claude', '──────────────────── fable-fleet-reviewer ─\n❯ \n'), true);
+  assert.equal(agentPromptVisible('codex', '› Ask Codex to do anything'), true);
+  assert.equal(agentPromptVisible('codex', CLAUDE_IDLE_SCREEN), false);
+});
+
+function checkDeliveryFixture(fm, sessions, closed = []) {
+  const resolved = [];
+  const sent = [];
+  const task = { id: 'due-card', fm: { title: 'Due card', check: 'run the probe', check_after: '2026-09-06T09:00', ...fm }, body: '' };
+  const deps = {
+    scanSessions: () => sessions,
+    excluded: new Set(),
+    loadCurrentSession: (id) => sessions.find((session) => session.id === id),
+    resolveSessionTarget: async (session) => {
+      resolved.push(session.id);
+      if (closed.includes(session.id)) throw new Error('no pane for that session');
+      return { pane: 'pane-one' };
+    },
+    sendToResolvedTarget: async (session, target, text) => { sent.push({ id: session.id, text }); return {}; },
+  };
+  return { task, deps, resolved, sent };
+}
+
+// The linked session is always the more recent one, so recency alone would win it.
+const deliverySessions = [
+  { id: 'linked', state: 'idle', mtime: 2000, endedTurn: true },
+  { id: 'sched', state: 'idle', mtime: 1000, endedTurn: true },
+];
+
+test('a due check goes to the session that scheduled it, not the card\'s current owner', async () => {
+  const f = checkDeliveryFixture({ scheduled_by: 'sched', sessions: [{ id: 'linked', agent: 'claude' }] }, deliverySessions);
+  const result = await deliverCheckToThread(f.task, f.deps);
+  assert.equal(result.sessionId, 'sched');
+  assert.deepEqual(f.sent.map((entry) => entry.id), ['sched']);
+  assert.match(f.sent[0].text, /scheduled check due for due-card/);
+});
+
+test('a closed scheduling session falls back to the linked thread', async () => {
+  const f = checkDeliveryFixture({ scheduled_by: 'sched', sessions: [{ id: 'linked', agent: 'claude' }] }, deliverySessions, ['sched']);
+  const result = await deliverCheckToThread(f.task, f.deps);
+  assert.equal(result.sessionId, 'linked');
+  assert.deepEqual(f.resolved, ['sched', 'linked'], 'the scheduler is tried first, then the card owner');
+});
+
+test('a check with no scheduler still goes to the linked thread', async () => {
+  const f = checkDeliveryFixture({ sessions: [{ id: 'linked', agent: 'claude' }] }, deliverySessions);
+  const result = await deliverCheckToThread(f.task, f.deps);
+  assert.equal(result.sessionId, 'linked');
+  assert.deepEqual(f.resolved, ['linked'], 'unlinked live sessions are not delivery candidates');
+});
+
+test('a scheduler that still owns the card is not tried twice', async () => {
+  assert.deepEqual(checkDeliveryIds({ fm: { scheduled_by: 'linked', sessions: [{ id: 'linked' }] } }), ['linked']);
+  assert.deepEqual(checkDeliveryIds({ fm: { scheduled_by: 'bad id', sessions: [{ id: 'linked' }, null] } }), ['linked']);
+  const f = checkDeliveryFixture({ scheduled_by: 'linked', sessions: [{ id: 'linked', agent: 'claude' }] }, deliverySessions);
+  const result = await deliverCheckToThread(f.task, f.deps);
+  assert.equal(result.sessionId, 'linked');
+  assert.deepEqual(f.resolved, ['linked']);
+});
+
+function recordingHost(handler) {
+  const calls = [];
+  return {
+    calls,
+    request: async (type, params) => {
+      calls.push({ type, params });
+      return handler ? handler(type, params, calls) : {};
+    },
+  };
+}
+
+test('host targets dispatch screen, typed text, and named keys through host input', async () => {
+  let typed = '';
+  const host = recordingHost(async (type, params) => {
+    if (type === 'screen') return { text: typed || 'screen text' };
+    if (type === 'input') typed += Buffer.from(params.data, 'base64').toString('utf8');
+    return {};
+  });
+  const target = { pane: 'pane-one' };
+  assert.equal(isHostTarget(target), true);
+  assert.equal(await readScreen(target, 24, true, { host }), 'screen text');
+  await writeTarget(target, 'hé', { host });
+  await pressTargetKey(target, 'Escape', { host });
+  await pressTargetKey(target, 'Backspace', { host });
+  await typeAndSubmit(target, 'hello', (screen, text) => screen.includes(text), {
+    host,
+    sleep: async () => {},
+  });
+  assert.deepEqual(host.calls[0], {
+    type: 'screen', params: { pane: 'pane-one', lines: 24, scrollback: 24 },
+  });
+  const input = host.calls.filter((call) => call.type === 'input')
+    .map((call) => Buffer.from(call.params.data, 'base64').toString('utf8')).join('');
+  assert.equal(input, 'hé\x1b\x7fhello\r');
+});
+
+test('typing exit confirms the prompt above a tall Claude slash-command menu', async () => {
+  let typed = '';
+  const screen = ['Old assistant advice: Esc to cancel', '────────────────', '❯ /exit', '────────────────', ...Array.from({ length: 40 }, (_, i) => `  /command${i}  Command description`)].join('\n');
+  const host = recordingHost(async (type, params) => {
+    if (type === 'input') typed += Buffer.from(params.data, 'base64').toString();
+    if (type === 'screen') {
+      assert.equal(params.scrollback, 0);
+      return { text: params.lines == null ? screen : screen.split('\n').slice(-params.lines).join('\n') };
+    }
+    return {};
+  });
+  const check = (s, text) => require('./serve').closeDraftVisible(s, text, 'claude');
+  assert.equal(check('❯ /exit\nstatus', '/exit'), false, 'unruled echo is not an input');
+  assert.equal(check('────\n❯ /exit extra draft\n────', '/exit'), false);
+  assert.equal(check('────\n❯ /exit\n────\nEnter to confirm', '/exit'), false);
+  assert.equal(check('──────────────────── my-debug-session ─\n❯ /exit\n──────────────────────────────\n? for shortcuts', '/exit'), true);
+  await typeAndSubmit({ pane: 'p' }, '/exit', check, { host, confirmationLines: null, sleep: async () => {} });
+  assert.equal(typed, '/exit\r');
+});
+
+test('screen session returns plain pane lines and terminal metadata', async () => {
+  const id = 'abcdef12-0000-4000-8000-000000000001';
+  const host = recordingHost((type, params) => {
+    if (type === 'list') return { panes: [{ id: 'pane-screen', alive: true, meta: { sessionId: id } }] };
+    if (type === 'screen') {
+      assert.deepEqual(params, { pane: 'pane-screen', lines: 400, scrollback: 0 });
+      return {
+        text: '\x1b[31mred\x1b[0m\nplain',
+        lines: ['\x1b[31mred\x1b[0m', 'plain'],
+        cols: 120,
+        rows: 40,
+        cursor: { x: 7, y: 3 },
+        alt: true,
+        title: 'editor',
+      };
+    }
+    return {};
+  });
+  const result = await screenSession({ session: 'abcdef12', lines: '999' }, {
+    scanSessions: () => [{ id, kind: 'claude' }], host,
+  });
+  assert.deepEqual(result, {
+    ok: true,
+    sessionId: id,
+    pane: 'pane-screen',
+    cols: 120,
+    rows: 40,
+    lines: ['red', 'plain'],
+    title: 'editor',
+    cursor: { x: 7, y: 3 },
+    alt: true,
+  });
+});
+
+test('screen session returns no-host-pane for a session without a pane', async () => {
+  const id = 'abcdef12-0000-4000-8000-000000000001';
+  const host = recordingHost((type) => type === 'list' ? { panes: [] } : {});
+  await assert.rejects(
+    screenSession({ session: id }, { scanSessions: () => [{ id, kind: 'claude' }], host }),
+    (error) => error.status === 404 && error.message === 'no host pane',
+  );
+  assert.deepEqual(host.calls.map((call) => call.type), ['list']);
+});
+
+test('session keys map every supported name to exact pane input bytes under the lock', async () => {
+  const id = 'abcdef12-0000-4000-8000-000000000001';
+  const keys = ['Escape', 'Tab', 'Up', 'Down', 'Left', 'Right', 'Enter', 'CtrlC', 'CtrlD',
+    'CtrlL', 'CtrlU', 'Backspace', 'Home', 'End', 'PageUp', 'PageDown'];
+  let locked = 0;
+  const host = recordingHost((type) => type === 'list' ? {
+    panes: [{ id: 'pane-keys', alive: true, meta: { sessionId: id } }],
+  } : {});
+  const result = await sendSessionKeys({ sessionId: 'abcdef12', keys }, {
+    scanSessions: () => [{ id, kind: 'claude' }],
+    host,
+    withInjectionLock: async (fn) => { locked += 1; return fn(); },
+  });
+  assert.deepEqual(result, { ok: true, sessionId: id, pane: 'pane-keys', sent: 16 });
+  assert.equal(locked, 1);
+  const input = host.calls.find((call) => call.type === 'input');
+  assert.equal(Buffer.from(input.params.data, 'base64').toString('utf8'),
+    '\x1b\t\x1b[A\x1b[B\x1b[D\x1b[C\r\x03\x04\x0c\x15\x7f\x1b[H\x1b[F\x1b[5~\x1b[6~');
+  assert.equal(input.params.pane, 'pane-keys');
+});
+
+test('session keys reject unknown and oversized lists before touching a pane', async () => {
+  const deps = { scanSessions: () => assert.fail('invalid keys must fail before session resolution') };
+  await assert.rejects(sendSessionKeys({ sessionId: 'abcdef12', keys: ['Space'] }, deps),
+    (error) => error.status === 400 && error.message === 'unknown key Space');
+  await assert.rejects(sendSessionKeys({ sessionId: 'abcdef12', keys: Array(17).fill('Enter') }, deps),
+    (error) => error.status === 400 && error.message === 'bad keys');
+});
+
+test('session keys return no-host-pane for a session without a pane', async () => {
+  const id = 'abcdef12-0000-4000-8000-000000000001';
+  const host = recordingHost((type) => type === 'list' ? { panes: [] } : {});
+  await assert.rejects(sendSessionKeys({ sessionId: id, keys: ['Escape'] }, {
+    scanSessions: () => [{ id, kind: 'claude' }], host,
+  }), (error) => error.status === 404 && error.message === 'no host pane');
+  assert.deepEqual(host.calls.map((call) => call.type), ['list']);
+});
+
+test('screen, keys and send address a live shell pane with no session at all', async () => {
+  const panes = [{ id: 'pane-shell', alive: true, meta: { agent: 'shell', project: '/Users/j/keep' } }];
+  const host = recordingHost((type) => {
+    if (type === 'list') return { panes };
+    if (type === 'screen') return { lines: ['~/keep %'], cols: 120, rows: 40, title: 'keep' };
+    return {};
+  });
+  const scanSessions = () => assert.fail('a shell pane must never be resolved as a session');
+
+  const screen = await screenSession({ pane: 'pane-shell', lines: '40' }, { host, scanSessions });
+  assert.equal(screen.sessionId, null);
+  assert.equal(screen.pane, 'pane-shell');
+  assert.deepEqual(screen.lines, ['~/keep %']);
+
+  const keys = await sendSessionKeys({ pane: 'pane-shell', keys: ['CtrlC'] },
+    { host, scanSessions, withInjectionLock: async (fn) => fn() });
+  assert.deepEqual(keys, { ok: true, sessionId: null, pane: 'pane-shell', sent: 1 });
+
+  const sent = await writeToShellPane({ pane: 'pane-shell', text: 'ls' }, { host, scanSessions });
+  assert.deepEqual(sent, { ok: true, pane: 'pane-shell', sent: 2 });
+  const input = host.calls.filter((call) => call.type === 'input').at(-1);
+  assert.equal(Buffer.from(input.params.data, 'base64').toString('utf8'), 'ls\r');
+});
+
+test('only a live shell pane is reachable by pane id', async () => {
+  const target = (panes) => shellPaneTarget('pane-x', { host: recordingHost(() => ({ panes })) });
+  await assert.rejects(target([]), (error) => error.status === 404 && error.message === 'no such pane');
+  await assert.rejects(target([{ id: 'pane-x', alive: true, meta: { agent: 'claude', sessionId: 'abcdef12' } }]),
+    (error) => error.status === 409 && error.message === 'not a shell pane');
+  await assert.rejects(target([{ id: 'pane-x', alive: false, meta: { agent: 'shell' } }]),
+    (error) => error.status === 409 && error.message === 'pane has exited');
+  await assert.rejects(shellPaneTarget('../etc', {}), (error) => error.status === 400 && error.message === 'bad pane id');
+});
+
+test('a session id still wins over a pane hint on the terminal endpoints', async () => {
+  const id = 'abcdef12-0000-4000-8000-000000000001';
+  const host = recordingHost((type) => {
+    if (type === 'list') return { panes: [{ id: 'pane-agent', alive: true, meta: { sessionId: id } }] };
+    if (type === 'screen') return { lines: ['agent'], cols: 80, rows: 24 };
+    return {};
+  });
+  const screen = await screenSession({ session: 'abcdef12', pane: 'pane-shell' },
+    { scanSessions: () => [{ id, kind: 'claude' }], host });
+  assert.equal(screen.sessionId, id);
+  assert.equal(screen.pane, 'pane-agent');
+});
+
+test('screen text strips OSC pairs, 8-bit controls, and unterminated strings without eating text', () => {
+  assert.equal(stripTerminalAnsi('\x1b]0;one\x07keep\x1b]0;two\x07 this'), 'keep this');
+  assert.equal(stripTerminalAnsi('before \x1b]0;unterminated title'), 'before ');
+  assert.equal(stripTerminalAnsi('\x9b31mred\x9b0m ok'), 'red ok');
+  assert.equal(stripTerminalAnsi('\x1bPq..\x1b\\after'), 'after');
+  assert.equal(stripTerminalAnsi('\x1b[1;32mgreen\x1b[0m'), 'green');
+});
+
+test('screen and keys requests reject their missing read and write authentication', () => {
+  const remoteScreen = {
+    method: 'GET', socket: { remoteAddress: '192.0.2.10' }, headers: { host: 'keep.example' },
+  };
+  assert.deepEqual(apiRequestAuthError(remoteScreen, { isLocal: () => false, token: 'secret' }),
+    { status: 403, error: 'unauthorized' });
+
+  const localKeys = {
+    method: 'POST', socket: { remoteAddress: '127.0.0.1' }, headers: { host: 'localhost:7777' },
+  };
+  assert.deepEqual(apiRequestAuthError(localKeys, { isLocal: () => true, token: 'secret' }),
+    { status: 403, error: 'missing x-keep header' });
+});
+
+test('session resolution accepts only an alive host pane bound to the session id', async () => {
+  const host = recordingHost((type) => type === 'list' ? { panes: [
+    { id: 'pane-dead', alive: false, createdAt: '2026-09-08T10:00:00Z', meta: { sessionId: 'session-one' } },
+    { id: 'pane-alive', alive: true, createdAt: '2026-09-08T09:00:00Z', meta: { sessionId: 'session-one' } },
+  ] } : {});
+  assert.deepEqual(await resolveSessionTarget({ id: 'session-one' }, null, { host }), { pane: 'pane-alive' });
+  await assert.rejects(resolveSessionTarget({ id: 'missing' }, null, { host }),
+    (error) => error.status === 404 && error.extra.notLive === true && /no live host pane/.test(error.message));
+});
+
+test('live process discovery keeps argv, Claude child environment, and Codex rollout identities', async () => {
+  const oldRollout = '/tmp/rollout-old-11111111-1111-4111-8111-111111111111.jsonl';
+  const newRollout = '/tmp/rollout-new-22222222-2222-4222-8222-222222222222.jsonl';
+  const rows = [
+    { pid: 10, ppid: 1, tty: 'ttys001', pidStart: 'now', args: 'claude --resume resumed-claude', agent: 'claude', interactive: true },
+    { pid: 11, ppid: 10, tty: '??', pidStart: 'now', args: 'hook child', agent: null, interactive: false },
+    { pid: 20, ppid: 1, tty: 'ttys002', pidStart: 'now', args: 'codex', agent: 'codex', interactive: true },
+    { pid: 30, ppid: 1, tty: 'ttys003', pidStart: 'now', args: '/Users/x/.local/bin/codex --dangerously-bypass-approvals-and-sandbox resume flagged-codex', agent: 'codex', interactive: true },
+  ];
+  const live = await liveSessionPids({
+    agentProcessRows: async () => rows,
+    psEnv: async () => '11 hook child CLAUDE_CODE_SESSION_ID=fresh-claude',
+    lsof: async () => `p20\nn${oldRollout}\nn${newRollout}\n`,
+    statMtime: async (file) => file === newRollout ? 200 : 100,
+  });
+  assert.deepEqual({ pid: live.get('resumed-claude').pid, source: live.get('resumed-claude').source }, { pid: 10, source: 'argv' });
+  assert.deepEqual({ pid: live.get('fresh-claude').pid, source: live.get('fresh-claude').source }, { pid: 10, source: 'child-env' });
+  assert.deepEqual({ pid: live.get('flagged-codex').pid, source: live.get('flagged-codex').source }, { pid: 30, source: 'argv' });
+  assert.equal(live.get('22222222-2222-4222-8222-222222222222').primary, true);
+  assert.equal(live.get('11111111-1111-4111-8111-111111111111').primary, false);
+});
+
+test('live session tick merges direct host bindings without pane-record backfill', async () => {
+  let written;
+  const processLive = new Map([['process-session', {
+    pid: 41, agent: 'claude', source: 'argv', primary: true,
+  }]]);
+  const host = recordingHost((type) => type === 'list' ? { panes: [{
+    id: 'pane-host', alive: true, pid: 42,
+    meta: { sessionId: 'host-session', agent: 'codex', project: '/host-project' },
+  }] } : {});
+  const result = await liveSessionTick({
+    now: () => 9000,
+    ledger: { sessions: {} },
+    liveSessionPids: async () => processLive,
+    paneRecords: new Map([['process-session', { pane: 'pane-process', cwd: '/process-project', agent: 'claude', at: 1 }]]),
+    scanSessions: () => [],
+    host,
+    writeLedger: (ledger) => { written = ledger; },
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(written.sessions['process-session'], {
+    pid: 41, agent: 'claude', project: '/process-project', source: 'argv', primary: true, lastSeenAlive: 9000,
+  });
+  assert.deepEqual(written.sessions['host-session'], {
+    pid: 42, agent: 'codex', project: '/host-project', source: 'host', primary: true, lastSeenAlive: 9000,
+  });
+  assert.deepEqual(host.calls.map((call) => call.type), ['list']);
+});
+
+test('restore plan reopens recent sessions only when their process and host pane are gone', async () => {
+  const now = Date.parse('2026-09-08T12:00:00Z');
+  const recent = now - 5 * 60e3;
+  const ledger = { sessions: {
+    gone: { pid: 1, agent: 'claude', project: '/project', source: 'argv', primary: true, lastSeenAlive: recent },
+    running: { pid: 2, agent: 'claude', project: '/project', source: 'argv', primary: true, lastSeenAlive: recent },
+    hosted: { pid: 3, agent: 'claude', project: '/project', source: 'host', primary: true, lastSeenAlive: recent },
+    exited: { pid: 4, agent: 'claude', project: '/project', source: 'argv', primary: true, lastSeenAlive: recent },
+  } };
+  const host = recordingHost((type) => type === 'list' ? { panes: [
+    { id: 'pane-hosted', alive: true, pid: 3, meta: { sessionId: 'hosted', agent: 'claude', project: '/project' } },
+  ] } : {});
+  const plan = await restorePlan({ since: 30 * 60e3, project: '/project' }, {
+    now: () => now,
+    ledger,
+    liveSessionPids: async () => new Map([['running', { pid: 2 }]]),
+    scanSessions: () => [{ id: 'gone', kind: 'claude' }, { id: 'running', kind: 'claude' },
+      { id: 'hosted', kind: 'claude' }, { id: 'exited', kind: 'claude', exited: true }],
+    transcriptExists: () => true,
+    host,
+  });
+  const byId = new Map(plan.sessions.map((row) => [row.id, row]));
+  assert.deepEqual([byId.get('gone').action, byId.get('gone').reason], ['restore', 'agent process is gone']);
+  assert.equal(byId.get('running').action, 'skip');
+  assert.equal(byId.get('hosted').action, 'skip');
+  assert.deepEqual([byId.get('hosted').pane, byId.get('hosted').state], ['pane-hosted', 'alive']);
+  assert.match(byId.get('exited').reason, /session exited/);
+});
+
+test('open resolves a unique session prefix and refuses a session running outside the host', async () => {
+  const project = os.tmpdir();
+  const ids = ['abcdef12-0000-4000-8000-000000000001', 'abcdef99-0000-4000-8000-000000000002'];
+  const scanSessions = () => ids.map((id) => ({ id, project, kind: 'claude' }));
+  const notLive = async () => { const error = new InjectionError(404, 'not live'); error.extra = { notLive: true }; throw error; };
+
+  const opened = await openSession({ sessionId: 'abcdef12' }, { scanSessions, resolveSessionTarget: async () => ({ pane: 'pane-1' }) });
+  assert.equal(opened.sessionId, ids[0], 'an 8+ character prefix resolves to the full id');
+  assert.equal(opened.pane, 'pane-1');
+
+  await assert.rejects(openSession({ sessionId: 'abcdef1' }, { scanSessions, readPaneRecord: () => null }), /no project for session abcdef1/,
+    'a prefix shorter than 8 characters never matches');
+  const twins = () => ['abcdef12-a000-4000-8000-000000000001', 'abcdef12-b000-4000-8000-000000000002'].map((id) => ({ id, project, kind: 'claude' }));
+  await assert.rejects(openSession({ sessionId: 'abcdef12' }, { scanSessions: twins }), /ambiguous/);
+
+  await assert.rejects(openSession({ sessionId: 'abcdef12' }, {
+    scanSessions, resolveSessionTarget: notLive,
+    liveSessionPids: async () => new Map([[ids[0], { pid: 4242 }]]),
+  }), /running outside the host \(pid 4242\)/);
+});
+
+test('open uses host panes for both existing sessions and new Claude and Codex launches', async () => {
+  const project = os.tmpdir();
+  const task = { fm: { project, sessions: [{ id: 'existing-session', agent: 'claude' }] } };
+  const existingMessages = [];
+  const existing = await openSession({ taskId: 'card', message: 'continue' }, {
+    loadTask: () => task,
+    resolveSessionTarget: async () => ({ pane: 'pane-existing' }),
+    sendToResolvedTarget: async (_session, target, text) => existingMessages.push({ target, text }),
+  });
+  assert.deepEqual(existing, {
+    ok: true, existing: true, focus: 'console', sessionId: 'existing-session', pane: 'pane-existing', sent: true,
+  });
+  assert.deepEqual(existingMessages, [{ target: { pane: 'pane-existing' }, text: 'continue' }]);
+
+  const claudeHost = recordingHost((type) => type === 'spawn' ? { pane: { id: 'pane-claude' } } : {});
+  const claude = await openSession({ taskId: 'card', fresh: true, agent: 'claude', requester: 'creator', message: 'begin' }, {
+    host: claudeHost,
+    randomUUID: () => '33333333-3333-4333-8333-333333333333',
+    loadTask: () => ({ fm: { project, sessions: [] } }),
+    waitForHostAgent: async () => true,
+    typeOpeningMessage: async () => {},
+    releaseCardSession: () => true,
+    linkLaunchedSession: () => true,
+  });
+  assert.deepEqual(claude, {
+    ok: true, created: 'pane', command: 'claude --dangerously-skip-permissions --session-id 33333333-3333-4333-8333-333333333333',
+    pane: 'pane-claude', sessionId: '33333333-3333-4333-8333-333333333333', unlinked: 'creator',
+    settled: true, sent: true, linked: true,
+  });
+  assert.equal(claudeHost.calls[0].params.meta.sessionId, '33333333-3333-4333-8333-333333333333');
+  assert.equal('viewer' in claudeHost.calls[0].params.meta, false);
+
+  const codexHost = recordingHost((type) => type === 'spawn' ? { pane: { id: 'pane-codex' } } : {});
+  const codex = await openSession({ taskId: 'card', fresh: true, agent: 'codex' }, {
+    host: codexHost,
+    loadTask: () => ({ fm: { project, sessions: [] } }),
+    waitForHostAgent: async () => true,
+    waitForHostSessionId: async () => 'codex-session',
+    linkLaunchedSession: () => true,
+  });
+  assert.deepEqual({ command: codex.command, pane: codex.pane, sessionId: codex.sessionId, linked: codex.linked }, {
+    command: 'codex --dangerously-bypass-approvals-and-sandbox', pane: 'pane-codex', sessionId: 'codex-session', linked: true,
+  });
+
+  await assert.rejects(openSession({ taskId: 'card', fresh: true, agent: 'codex' }, {
+    host: recordingHost((type) => type === 'spawn' ? { pane: { id: 'pane-unbound' } } : {}),
+    loadTask: () => ({ fm: { project, sessions: [] } }),
+    waitForHostAgent: async () => true,
+    waitForHostSessionId: async () => null,
+  }), (error) => error.status === 504 && /never registered its session id/.test(error.message));
+});
+
+test('API state exposes pane ids without copying obsolete viewer metadata', async () => {
+  const state = { sessions: [{ id: 'hosted' }, { id: 'missing' }], attention: [{ sessionId: 'hosted' }] };
+  const host = recordingHost((type) => type === 'list' ? { panes: [{
+    id: 'pane-hosted', alive: true, meta: { sessionId: 'hosted', viewer: { stale: true } },
+  }] } : {});
+  await addHostSessionState(state, { host });
+  assert.equal(state.sessions[0].pane, 'pane-hosted');
+  assert.equal(state.sessions[0].viewer, undefined);
+  assert.equal(state.sessions[1].pane, null);
+  assert.equal(state.attention[0].pane, 'pane-hosted');
+});
+
+test('API state adds an alive Codex host session omitted by the transcript window', async () => {
+  const id = 'codex-old';
+  const state = {
+    sessions: [],
+    tasks: [{ id: 'owned-card', fm: { sessions: [{ id, agent: 'codex', at: '2026-09-01T00:00:00Z' }] } }],
+    attention: [{ sessionId: id }],
+  };
+  const host = recordingHost((type) => type === 'list' ? { panes: [{
+    id: 'pane-codex-old', alive: true, cwd: '/pane/cwd',
+    meta: { sessionId: id, agent: 'codex', project: '/from/meta', title: 'Old Codex session' },
+  }] } : {});
+  const lookedUp = [];
+  await addHostSessionState(state, {
+    host,
+    codexSessionFor: (sessionId) => {
+      lookedUp.push(sessionId);
+      return {
+        id: sessionId, kind: 'codex', project: '/from/meta', title: 'Old Codex session',
+        lastUser: 'work', lastAssistant: 'done', lastAssistantFull: 'done',
+        mtime: Date.parse('2026-09-01T00:00:00Z'), size: 10, endedTurn: true, state: 'recent',
+      };
+    },
+  });
+  assert.deepEqual(lookedUp, [id]);
+  assert.equal(state.sessions.length, 1);
+  assert.deepEqual({
+    kind: state.sessions[0].kind,
+    project: state.sessions[0].project,
+    pane: state.sessions[0].pane,
+    hostOnly: state.sessions[0].hostOnly,
+    stalled: state.sessions[0].stalled,
+    taskId: state.sessions[0].taskId,
+  }, {
+    kind: 'codex', project: '/from/meta', pane: 'pane-codex-old',
+    hostOnly: true, stalled: undefined, taskId: 'owned-card',
+  });
+  assert.equal(state.attention[0].pane, 'pane-codex-old');
+});
+
+test('API state synthesizes a minimal session when a host transcript lookup finds nothing', async () => {
+  const createdAt = '2026-09-02T03:04:05Z';
+  const state = { sessions: [], attention: [] };
+  const host = recordingHost((type) => type === 'list' ? { panes: [{
+    id: 'pane-missing', alive: true, cwd: '/pane/fallback', createdAt,
+    meta: { sessionId: 'missing-rollout', agent: 'codex', title: 'Pane title' },
+  }] } : {});
+  await addHostSessionState(state, { host, codexSessionFor: () => null });
+  assert.deepEqual(state.sessions[0], {
+    id: 'missing-rollout', kind: 'codex', project: '/pane/fallback', title: 'Pane title',
+    lastUser: '', lastAssistant: '', lastAssistantFull: '', mtime: Date.parse(createdAt),
+    size: 0, endedTurn: true, state: 'recent', pane: 'pane-missing', hostOnly: true,
+    taskId: null,
+  });
+});
+
+function buildStateWithHostSession(root, ack = false, needsQuestion = true) {
+  for (const dir of ['tasks', 'archive', 'digests', path.join('.keep', 'acks')]) {
+    fs.mkdirSync(path.join(root, dir), { recursive: true });
+  }
+  const now = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  const today = `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}`;
+  fs.writeFileSync(path.join(root, 'digests', `${today}.md`), '# Test digest\n');
+  const id = 'claude-host-only';
+  const mtime = 123456;
+  if (ack) {
+    const key = `question:${id}:${mtime}`;
+    const name = require('node:crypto').createHash('sha1').update(key).digest('hex');
+    fs.writeFileSync(path.join(root, '.keep', 'acks', name), JSON.stringify({ key }));
+  }
+  const script = `
+    const { buildState } = require('./bin/serve.js');
+    const id = ${JSON.stringify(id)};
+    const state = buildState({
+      hostPanes: [{
+        id: 'pane-host-only', alive: true,
+        meta: { sessionId: id, agent: 'claude', project: '/host/project' },
+      }],
+      claudeSessionFor: (sessionId) => ({
+        id: sessionId, kind: 'claude', project: '/host/project', title: 'Needs an answer',
+        lastUser: 'please decide', lastAssistant: '', lastAssistantFull: '',
+        mtime: ${mtime}, size: 10, endedTurn: true, state: 'recent',
+        pendingQuestion: ${needsQuestion ? JSON.stringify({ question: 'Which one?', options: ['A', 'B'] }) : 'null'},
+      }),
+    });
+    process.stdout.write(JSON.stringify({
+      session: state.sessions.find((session) => session.id === id),
+      attention: state.attention.filter((item) => item.sessionId === id),
+    }));
+  `;
+  const child = spawnSync(process.execPath, ['-e', script], {
+    cwd: path.join(__dirname, '..'), env: { ...process.env, KEEP_DIR: root, HOME: root }, encoding: 'utf8',
+  });
+  assert.equal(child.status, 0, child.stderr);
+  return JSON.parse(child.stdout);
+}
+
+test('archived completed cards do not become next-instruction requests, while current links win', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-archived-attention-'));
+  try {
+    fs.mkdirSync(path.join(root, 'archive'), { recursive: true });
+    const card = (status, at) => `---\ntitle: Work\nstatus: ${status}\nkind: task\ntags: [personal]\nsessions:\n  - id: claude-host-only\n    agent: claude\n    at: ${at}\n---\n`;
+    fs.writeFileSync(path.join(root, 'archive', 'finished.md'), card('done', '2026-09-08T23:00'));
+    let state = buildStateWithHostSession(root, false, false);
+    assert.equal(state.session.taskStatus, 'done');
+    assert.equal(state.session.state, 'done');
+    assert.equal(state.attention.length, 0);
+    fs.writeFileSync(path.join(root, 'tasks', 'current.md'), card('active', '2026-09-08T22:00'));
+    state = buildStateWithHostSession(root, false, false);
+    assert.equal(state.session.taskId, 'current');
+    assert.equal(state.session.state, 'needs-input');
+    assert.equal(state.attention[0].detail, 'Ready for your next instruction.');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('buildState puts a host-only Claude question in attention before stalled and ack processing', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-attention-test-'));
+  try {
+    const result = buildStateWithHostSession(root);
+    assert.equal(result.session.hostOnly, true);
+    assert.equal(result.session.pane, 'pane-host-only');
+    assert.equal(result.session.stalled, false);
+    assert.deepEqual(result.attention.map(({ kind, sessionId }) => ({ kind, sessionId })), [
+      { kind: 'question', sessionId: 'claude-host-only' },
+    ]);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('buildState applies an attention ack to a host-only Claude question', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-attention-ack-test-'));
+  try {
+    const result = buildStateWithHostSession(root, true);
+    assert.equal(result.session.hostOnly, true);
+    assert.deepEqual(result.attention, []);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('Codex recentText extracts user and assistant messages from a rollout tail', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-recent-text-'));
+  try {
+    const file = path.join(dir, 'rollout.jsonl');
+    fs.writeFileSync(file, [
+      { type: 'session_meta', payload: { session_id: 'recent-text', cwd: '/project' } },
+      { type: 'event_msg', payload: { type: 'user_message', message: 'Fix the parser' } },
+      { type: 'event_msg', payload: { type: 'agent_message', message: 'Parser tests pass' } },
+      { type: 'event_msg', payload: { type: 'agent_message', message: '   ' } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Check the CSS' }] } },
+      { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Updated the queue header' }] } },
+      { type: 'event_msg', payload: { type: 'task_complete' } },
+    ].map(JSON.stringify).join('\n') + '\n');
+    assert.equal(codex.recentText(file), [
+      'User: Fix the parser',
+      'Assistant: Parser tests pass',
+      'User: Check the CSS',
+      'Assistant: Updated the queue header',
+    ].join('\n\n'));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('codex sessionFor reuses the path and parsed rollout while mtime and size are unchanged', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-cache-test-'));
+  try {
+    const id = 'cached-session';
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const p = (n) => String(n).padStart(2, '0');
+    const dir = path.join(home, '.codex', 'sessions', String(tomorrow.getFullYear()),
+      p(tomorrow.getMonth() + 1), p(tomorrow.getDate()));
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `rollout-test-${id}.jsonl`);
+    fs.writeFileSync(file, [
+      { type: 'session_meta', payload: { session_id: id, cwd: '/cached/project' } },
+      { type: 'event_msg', payload: { type: 'user_message', message: 'work' } },
+      { type: 'event_msg', payload: { type: 'agent_message', message: 'done' } },
+      { type: 'event_msg', payload: { type: 'task_complete' } },
+    ].map(JSON.stringify).join('\n') + '\n');
+    const script = `
+      const fs = require('node:fs');
+      const codex = require('./bin/codex.js');
+      const realOpen = fs.openSync;
+      const realReaddir = fs.readdirSync;
+      let opens = 0;
+      let readdirs = 0;
+      fs.openSync = (...args) => { opens += 1; return realOpen(...args); };
+      fs.readdirSync = (...args) => { readdirs += 1; return realReaddir(...args); };
+      const first = codex.sessionFor(${JSON.stringify(id)});
+      const firstReaddirs = readdirs;
+      const second = codex.sessionFor(${JSON.stringify(id)});
+      process.stdout.write(JSON.stringify({ first, second, opens, readdirs, firstReaddirs }));
+    `;
+    const child = spawnSync(process.execPath, ['-e', script], {
+      cwd: path.join(__dirname, '..'), env: { ...process.env, HOME: home }, encoding: 'utf8',
+    });
+    assert.equal(child.status, 0, child.stderr);
+    const result = JSON.parse(child.stdout);
+    assert.equal(result.first.id, id);
+    assert.deepEqual(result.second, result.first);
+    assert.equal(result.opens, 3, 'metadata, text tail and durable question lifecycle are each read once');
+    assert.ok(result.firstReaddirs > 0);
+    assert.equal(result.readdirs, result.firstReaddirs, 'the cached path avoids a second date-directory walk');
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test('API state still lists an alive host pane when its transcript lookup throws', async () => {
+  const state = { sessions: [], attention: [] };
+  const host = recordingHost((type) => type === 'list' ? { panes: [{
+    id: 'pane-throwing', alive: true, cwd: '/pane/cwd', createdAt: '2026-09-02T03:04:05Z',
+    meta: { sessionId: 'throwing-rollout', agent: 'codex', title: 'Unreadable' },
+  }] } : {});
+  await addHostSessionState(state, { host, codexSessionFor: () => { throw new Error('unreadable'); } });
+  assert.equal(state.sessions.length, 1);
+  assert.deepEqual({ id: state.sessions[0].id, pane: state.sessions[0].pane, title: state.sessions[0].title, hostOnly: state.sessions[0].hostOnly },
+    { id: 'throwing-rollout', pane: 'pane-throwing', title: 'Unreadable', hostOnly: true });
+});
+
+test('API state lists an exited agent pane as an exited session and skips shell and already-listed panes', async () => {
+  const state = { sessions: [{ id: 'already-listed', mtime: 1 }], attention: [] };
+  const host = recordingHost((type) => type === 'list' ? { panes: [
+    null,
+    { id: 'pane-dead', alive: false, createdAt: '2026-09-02T00:00:00Z', meta: { sessionId: 'dead-session', agent: 'codex', title: 'Dead' } },
+    { id: 'pane-shell', alive: true, meta: { sessionId: 'shell-session', agent: 'shell' } },
+    { id: 'pane-existing', alive: true, meta: { sessionId: 'already-listed', agent: 'claude' } },
+  ] } : {});
+  const lookups = [];
+  await addHostSessionState(state, {
+    host,
+    codexSessionFor: (id) => {
+      lookups.push(id);
+      return { id, kind: 'codex', title: 'Dead', mtime: 2, state: 'running', pendingQuestion: { question: 'stale?', options: [] }, rateLimit: { at: 1 } };
+    },
+    claudeSessionFor: (id) => { lookups.push(id); return null; },
+  });
+  assert.deepEqual(lookups, ['dead-session']);
+  assert.deepEqual(state.sessions.map((session) => [session.id, session.pane, session.state, session.exited]), [
+    ['dead-session', 'pane-dead', 'exited', true],
+    ['already-listed', 'pane-existing', undefined, undefined],
+  ]);
+  // An exited agent keeps its title but none of the prompts that feed "Needs you".
+  assert.deepEqual([state.sessions[0].title, state.sessions[0].pendingQuestion, state.sessions[0].rateLimit], ['Dead', null, null]);
+});
+
+test('API state attaches a session to its live pane, else its newest exited pane', async () => {
+  const state = { sessions: [{ id: 'listed', mtime: 5 }], attention: [] };
+  const host = recordingHost((type) => type === 'list' ? { panes: [
+    { id: 'old-exit', alive: false, createdAt: '2026-09-01T00:00:00Z', meta: { sessionId: 'relaunched', agent: 'codex' } },
+    { id: 'new-exit', alive: false, createdAt: '2026-09-03T00:00:00Z', meta: { sessionId: 'relaunched', agent: 'codex' } },
+    { id: 'listed-exit', alive: false, createdAt: '2026-09-03T00:00:00Z', meta: { sessionId: 'listed', agent: 'claude' } },
+    { id: 'listed-live', alive: true, createdAt: '2026-09-01T00:00:00Z', meta: { sessionId: 'listed', agent: 'claude' } },
+  ] } : {});
+  await addHostSessionState(state, { host, codexSessionFor: () => null, claudeSessionFor: () => null });
+  const byId = new Map(state.sessions.map((session) => [session.id, session]));
+  assert.equal(byId.get('relaunched').pane, 'new-exit');
+  assert.equal(byId.get('relaunched').state, 'exited');
+  assert.equal(byId.get('listed').pane, 'listed-live');
+  assert.equal(state.sessions.length, 2);
+});
+
+test('API state uses the Claude lookup for an alive Claude host session', async () => {
+  const state = { sessions: [], attention: [] };
+  const host = recordingHost((type) => type === 'list' ? { panes: [{
+    id: 'pane-claude-old', alive: true,
+    meta: { sessionId: 'claude-old', agent: 'claude', project: '/claude/project' },
+  }] } : {});
+  const lookedUp = [];
+  await addHostSessionState(state, {
+    host,
+    claudeSessionFor: (id) => {
+      lookedUp.push(id);
+      return {
+        id, kind: 'claude', project: '/claude/project', title: 'Claude session',
+        lastUser: '', lastAssistant: '', lastAssistantFull: '', mtime: 2,
+        size: 1, endedTurn: true, state: 'recent',
+      };
+    },
+    codexSessionFor: () => assert.fail('Codex lookup should not be used for a Claude pane'),
+  });
+  assert.deepEqual(lookedUp, ['claude-old']);
+  assert.equal(state.sessions[0].kind, 'claude');
+  assert.equal(state.sessions[0].pane, 'pane-claude-old');
+  assert.equal(state.sessions[0].hostOnly, true);
+});
+
+test('a host request timeout releases the injection lock', async () => {
+  const host = { request: async () => new Promise(() => {}) };
+  await assert.rejects(hostRequest('get', { pane: 'p' }, { host, hostRequestTimeoutMs: 5 }),
+    /host request timed out \(get\)/);
+  await assert.rejects(openSession({ taskId: 'card', fresh: true }, {
+    host,
+    hostRequestTimeoutMs: 5,
+    loadTask: () => ({ fm: { project: os.tmpdir(), sessions: [] } }),
+  }), /host request timed out \(spawn\)/);
+  assert.equal(isInjectionBusy(), false);
+});
+
+test('hostRequest reconnects through a transient core reload window', async () => {
+  let connects = 0;
+  let disconnectSecond;
+  const first = {
+    socket: { destroyed: true },
+    request: async () => {
+      const error = new Error('host connection closed');
+      error.code = 'ECONNRESET';
+      throw error;
+    },
+    close() {},
+  };
+  const second = {
+    socket: { destroyed: false },
+    request: async (type) => ({ type, reconnected: true }),
+    onDisconnect(listener) { disconnectSecond = listener; return { dispose() {} }; },
+    close() {},
+  };
+  try {
+    const result = await hostRequest('hello', {}, {
+      connectHost: async () => (++connects === 1 ? first : second),
+      hostConnectTimeoutMs: 10,
+      hostRequestTimeoutMs: 50,
+      hostReloadRetryMs: 500,
+    });
+    assert.deepEqual(result, { type: 'hello', reconnected: true });
+    assert.equal(connects, 2);
+  } finally {
+    second.socket.destroyed = true;
+    if (disconnectSecond) disconnectSecond({ disconnected: true });
+  }
+});
+
+test('hostRequest retries reloading reads but never retries a possibly-executed spawn', async () => {
+  let reads = 0;
+  const readHost = {
+    request: async () => {
+      reads += 1;
+      if (reads === 1) {
+        const error = new Error('host reloading');
+        error.code = 'reloading';
+        throw error;
+      }
+      return { ready: true };
+    },
+  };
+  assert.deepEqual(await hostRequest('get', { pane: 'p' }, {
+    host: readHost, hostReloadRetryMs: 100, sleep: async () => {},
+  }), { ready: true });
+  assert.equal(reads, 2);
+
+  let spawns = 0;
+  const spawnHost = {
+    request: async () => {
+      spawns += 1;
+      const error = new Error('host reloading');
+      error.code = 'reloading';
+      throw error;
+    },
+  };
+  await assert.rejects(hostRequest('spawn', { cmd: '/bin/sh' }, {
+    host: spawnHost, hostReloadRetryMs: 100,
+  }), /non-idempotent spawn; request was not retried/);
+  assert.equal(spawns, 1, 'spawn must not be duplicated across a reload');
+});
+
+test('hostRequest derives each attempt timeout from the remaining reload deadline', async () => {
+  const host = { request: async () => new Promise(() => {}) };
+  const started = Date.now();
+  await assert.rejects(hostRequest('hello', {}, {
+    host, hostReloadRetryMs: 25, hostRequestTimeoutMs: 1000,
+  }), /host request timed out \(hello\)/);
+  assert.ok(Date.now() - started < 250, 'the 25 ms reload deadline is a hard wall-clock bound');
+});

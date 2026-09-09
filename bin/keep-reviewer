@@ -1,0 +1,11 @@
+#!/bin/sh
+# Launch a persistent reviewer; Keep's SessionStart hook registers it for ticks.
+set -e
+SELF="$0"
+while [ -h "$SELF" ]; do
+  D="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$D/$SELF" ;; esac
+done
+DIR="$(cd "$(dirname "$SELF")" && pwd)"
+exec "$DIR/keep" reviewer "$@"

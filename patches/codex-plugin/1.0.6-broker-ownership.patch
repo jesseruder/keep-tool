@@ -1,0 +1,224 @@
+--- a/scripts/lib/broker-lifecycle.mjs
++++ b/scripts/lib/broker-lifecycle.mjs
+@@ -3,7 +3,7 @@
+ import os from "node:os";
+ import path from "node:path";
+ import process from "node:process";
+-import { spawn } from "node:child_process";
++import { spawn, execFileSync } from "node:child_process";
+ import { fileURLToPath } from "node:url";
+ import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+ import { resolveStateDir } from "./state.mjs";
+@@ -40,19 +40,22 @@
+   return false;
+ }
+ 
+-export async function sendBrokerShutdown(endpoint) {
++export async function sendBrokerShutdown(endpoint, timeoutMs = 2000) {
+   await new Promise((resolve) => {
+     const socket = connectToEndpoint(endpoint);
++    const finish = () => {
++      clearTimeout(timer);
++      socket.destroy();
++      resolve();
++    };
++    const timer = setTimeout(finish, timeoutMs);
+     socket.setEncoding("utf8");
+     socket.on("connect", () => {
+       socket.write(`${JSON.stringify({ id: 1, method: "broker/shutdown", params: {} })}\n`);
+     });
+-    socket.on("data", () => {
+-      socket.end();
+-      resolve();
+-    });
+-    socket.on("error", resolve);
+-    socket.on("close", resolve);
++    socket.on("data", finish);
++    socket.on("error", finish);
++    socket.on("close", finish);
+   });
+ }
+ 
+@@ -110,6 +113,26 @@
+   }
+ }
+ 
++// Refuse to signal a recycled pid, even when a caller supplies killProcess.
++export function brokerPidMatches(record) {
++  if (!record || !Number.isInteger(record.pid) || record.pid <= 0 || !record.endpoint) return false;
++  let command;
++  try {
++    command = execFileSync("ps", ["-o", "command=", "-p", String(record.pid)], {
++      encoding: "utf8", timeout: 500
++    }).trim();
++  } catch { return false; }
++  const endpoint = command.match(/(?:^|\s)--endpoint(?:=|\s+)(?:"([^"]*)"|'([^']*)'|(\S+))/);
++  if (!/(?:^|\s)\S*app-server-broker\.mjs["']?\s+serve(?:\s|$)/.test(command) ||
++      (endpoint?.[1] ?? endpoint?.[2] ?? endpoint?.[3]) !== record.endpoint) return false;
++  return true;
++}
++
++function killRecordedBroker(record, killProcess) {
++  if (!brokerPidMatches(record)) return;
++  (killProcess ?? ((pid) => process.kill(pid, "SIGTERM")))(record.pid);
++}
++
+ export async function ensureBrokerSession(cwd, options = {}) {
+   const existing = loadBrokerSession(cwd);
+   if (existing && (await isBrokerEndpointReady(existing.endpoint))) {
+@@ -123,7 +146,7 @@
+       logFile: existing.logFile ?? null,
+       sessionDir: existing.sessionDir ?? null,
+       pid: existing.pid ?? null,
+-      killProcess: options.killProcess ?? null
++      killProcess: () => killRecordedBroker(existing, options.killProcess)
+     });
+     clearBrokerSession(cwd);
+   }
+@@ -154,12 +177,15 @@
+       logFile,
+       sessionDir,
+       pid: child.pid ?? null,
+-      killProcess: options.killProcess ?? null
++      killProcess: () => killRecordedBroker({ pid: child.pid, endpoint }, options.killProcess)
+     });
+     return null;
+   }
+ 
+   const session = {
++    sessionId: process.env.CODEX_COMPANION_SESSION_ID ?? null,
++    cwd,
++    createdAt: new Date().toISOString(),
+     endpoint,
+     pidFile,
+     logFile,
+--- a/scripts/lib/state.mjs
++++ b/scripts/lib/state.mjs
+@@ -26,6 +26,11 @@
+   };
+ }
+ 
++export function resolveStateRoot() {
++  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
++  return pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
++}
++
+ export function resolveStateDir(cwd) {
+   const workspaceRoot = resolveWorkspaceRoot(cwd);
+   let canonicalWorkspaceRoot = workspaceRoot;
+@@ -38,9 +43,7 @@
+   const slugSource = path.basename(workspaceRoot) || "workspace";
+   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
+   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
+-  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
+-  const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
+-  return path.join(stateRoot, `${slug}-${hash}`);
++  return path.join(resolveStateRoot(), `${slug}-${hash}`);
+ }
+ 
+ export function resolveStateFile(cwd) {
+--- a/scripts/session-lifecycle-hook.mjs
++++ b/scripts/session-lifecycle-hook.mjs
+@@ -2,10 +2,12 @@
+ 
+ import fs from "node:fs";
+ import process from "node:process";
++import path from "node:path";
+ 
+ import { terminateProcessTree } from "./lib/process.mjs";
+ import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
+ import {
++  brokerPidMatches,
+   clearBrokerSession,
+   LOG_FILE_ENV,
+   loadBrokerSession,
+@@ -13,7 +15,7 @@
+   sendBrokerShutdown,
+   teardownBrokerSession
+ } from "./lib/broker-lifecycle.mjs";
+-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
++import { loadState, resolveStateFile, resolveStateRoot, saveState } from "./lib/state.mjs";
+ import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
+ import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
+ 
+@@ -80,7 +82,7 @@
+   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
+ }
+ 
+-async function handleSessionEnd(input) {
++async function handleWorkspaceSessionEnd(input) {
+   const cwd = input.cwd || process.cwd();
+   const brokerSession =
+     loadBrokerSession(cwd) ??
+@@ -110,11 +112,11 @@
+     const __foreign = (__state.jobs || []).filter((job) => (job.status === "running" || job.status === "queued") && job.sessionId && job.sessionId !== __endingSession && Number(job.pid) > 0 && __alive(job.pid));
+     if (__foreign.length > 0) {
+       cleanupSessionJobs(cwd, __endingSession);
+-      return;
++      return brokerEndpoint;
+     }
+   } catch {}
+   if (brokerEndpoint) {
+-    await sendBrokerShutdown(brokerEndpoint);
++    await sendBrokerShutdown(brokerEndpoint, 700);
+   }
+ 
+   cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
+@@ -124,9 +126,56 @@
+     logFile,
+     sessionDir,
+     pid,
+-    killProcess: terminateProcessTree
++    killProcess: (pid) => { if (brokerPidMatches(brokerSession)) terminateProcessTree(pid); }
+   });
+   clearBrokerSession(cwd);
++  return brokerEndpoint;
++}
++
++function ownedBroker(file, sessionId, handledEndpoint) {
++  try {
++    const broker = JSON.parse(fs.readFileSync(file, "utf8"));
++    if (broker.sessionId !== sessionId || !broker.endpoint || broker.endpoint === handledEndpoint) return null;
++    let jobs = [];
++    try {
++      jobs = JSON.parse(fs.readFileSync(path.join(path.dirname(file), "state.json"), "utf8")).jobs;
++      if (!Array.isArray(jobs)) return null;
++    } catch (error) {
++      if (error.code !== "ENOENT") return null;
++    }
++    const alive = (pid) => { try { process.kill(Number(pid), 0); return true; } catch (e) { return e && e.code === "EPERM"; } };
++    if (jobs.some((job) => (job.status === "running" || job.status === "queued") &&
++      job.sessionId && job.sessionId !== sessionId && Number(job.pid) > 0 && alive(job.pid))) return null;
++    return broker;
++  } catch { return null; }
++}
++
++async function handleSessionEnd(input) {
++  // Bound the aggregate synchronous ps checks as well as the socket waits.
++  const deadline = Date.now() + 2500;
++  const handledEndpoint = await handleWorkspaceSessionEnd(input);
++  const sessionId = input.session_id || process.env[SESSION_ID_ENV];
++  if (!sessionId) return;
++  const stateRoot = resolveStateRoot();
++  let entries;
++  try { entries = fs.readdirSync(stateRoot, { withFileTypes: true }); } catch { return; }
++  // All sockets share one 700 ms window, rather than spending 700 ms per workspace.
++  await Promise.all(entries.filter((entry) => entry.isDirectory()).map(async (entry) => {
++    const file = path.join(stateRoot, entry.name, "broker.json");
++    const broker = ownedBroker(file, sessionId, handledEndpoint);
++    if (!broker) return;
++    try {
++      await sendBrokerShutdown(broker.endpoint, 700);
++      // A new owner or foreign live job may have appeared while the socket was pending.
++      const current = ownedBroker(file, sessionId, handledEndpoint);
++      if (!current || current.endpoint !== broker.endpoint || Date.now() >= deadline) return;
++      teardownBrokerSession({ ...broker, killProcess: (pid) => { if (brokerPidMatches(broker)) terminateProcessTree(pid); } });
++      const latest = JSON.parse(fs.readFileSync(file, "utf8"));
++      if (latest.endpoint === broker.endpoint && latest.sessionId === sessionId) fs.unlinkSync(file);
++    } catch {
++      // One workspace must not prevent the other owned brokers from being cleaned up.
++    }
++  }));
+ }
+ 
+ async function main() {

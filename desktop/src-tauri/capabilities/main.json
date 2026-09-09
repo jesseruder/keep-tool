@@ -1,0 +1,25 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Keep console window: the loopback web app may set the dock badge, send notifications, and use events; nothing else",
+  "windows": [
+    "main"
+  ],
+  "remote": {
+    "urls": [
+      "http://localhost:7777/*",
+      "http://127.0.0.1:7777/*"
+    ]
+  },
+  "permissions": [
+    "core:event:default",
+    "core:window:allow-set-badge-count",
+    "notification:default",
+    "allow-set-badge",
+    "allow-send-notification",
+    "allow-get-notification-click",
+    "allow-acknowledge-notification-click",
+    "core:window:allow-start-dragging",
+    "core:window:allow-internal-toggle-maximize"
+  ]
+}

@@ -1,0 +1,25 @@
+#!/bin/sh
+# keep — launcher. Finds node even in contexts without nvm on PATH (hooks, launchd).
+SELF="$0"
+while [ -h "$SELF" ]; do
+  D="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$D/$SELF" ;; esac
+done
+DIR="$(cd "$(dirname "$SELF")" && pwd)"
+if [ -n "$KEEP_NODE" ] && [ -x "$KEEP_NODE" ]; then
+  NODE="$KEEP_NODE"
+elif command -v node >/dev/null 2>&1; then
+  NODE="$(command -v node)"
+else
+  NODE="$(ls -d "$HOME"/.nvm/versions/node/*/bin/node 2>/dev/null | sort -V | tail -1)"
+fi
+if [ -z "$NODE" ]; then
+  echo "keep: node not found (set KEEP_NODE)" >&2
+  exit 1
+fi
+# Children (headless claude runs, plugin hooks) inherit PATH; make sure the node we
+# found is on it, launchd's default PATH has no node at all.
+NODE_DIR="$(dirname "$NODE")"
+case ":$PATH:" in *":$NODE_DIR:"*) ;; *) PATH="$NODE_DIR:$PATH"; export PATH ;; esac
+exec "$NODE" "$DIR/keep.js" "$@"

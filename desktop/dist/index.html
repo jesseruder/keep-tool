@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Keep</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+        background: #15171c;
+        color: #d8dbe0;
+      }
+
+      body {
+        min-height: 100vh;
+        margin: 0;
+        display: grid;
+        place-items: center;
+      }
+
+      main {
+        max-width: 48rem;
+        padding: 2rem;
+        text-align: center;
+      }
+
+      #hint {
+        display: none;
+        margin-top: 1rem;
+        color: #aeb3bd;
+        line-height: 1.6;
+      }
+
+      code {
+        color: #d8dbe0;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div>Keep — connecting to keep serve…</div>
+      <div id="hint">
+        keep serve is not running. Start it with:
+        <code>launchctl kickstart -k gui/$(id -u)/games.castle.keep.serve</code>
+      </div>
+    </main>
+    <script>
+      const stateUrl = "http://localhost:7777/api/state";
+      const appUrl = "http://localhost:7777/app";
+      const hint = document.querySelector("#hint");
+
+      setTimeout(() => {
+        hint.style.display = "block";
+      }, 10_000);
+
+      async function connect() {
+        try {
+          await fetch(stateUrl, { mode: "no-cors", cache: "no-store" });
+          location.replace(appUrl);
+        } catch {
+          setTimeout(connect, 1_500);
+        }
+      }
+
+      connect();
+    </script>
+  </body>
+</html>

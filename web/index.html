@@ -1,0 +1,1559 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>keep</title>
+<link rel="icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiI+PHJlY3Qgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIiByeD0iNyIgZmlsbD0iI0EyNjkxRSIvPjxnIGZpbGw9IiNGQUY5RjUiPjxyZWN0IHg9IjkiIHk9IjEzIiB3aWR0aD0iMTQiIGhlaWdodD0iMTMiLz48cmVjdCB4PSI5IiB5PSI5IiB3aWR0aD0iMyIgaGVpZ2h0PSI0LjUiLz48cmVjdCB4PSIxNC41IiB5PSI5IiB3aWR0aD0iMyIgaGVpZ2h0PSI0LjUiLz48cmVjdCB4PSIyMCIgeT0iOSIgd2lkdGg9IjMiIGhlaWdodD0iNC41Ii8+PC9nPjxyZWN0IHg9IjE0LjUiIHk9IjE4IiB3aWR0aD0iMyIgaGVpZ2h0PSI4IiBmaWxsPSIjQTI2OTFFIi8+PC9zdmc+">
+<style>
+  :root {
+    --paper: #FAF9F5; --ink: #23252B; --muted: #5C6472; --accent: #A2691E;
+    --accent-soft: #F3EADB; --line: #E4E1D8; --card: #FFFFFF; --code: #F1EFE8;
+    --green: #3D7A46; --red: #B3402E;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #1B1D23; --ink: #E7E5DE; --muted: #9BA3B0; --accent: #D9A24A;
+      --accent-soft: #2A2620; --line: #33363F; --card: #22242B; --code: #23262E;
+      --green: #7DBB86; --red: #E07B6A;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--paper); color: var(--ink);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap;
+    padding: 1.2rem 1.5rem .8rem; border-bottom: 1px solid var(--line);
+  }
+  header h1 {
+    margin: 0; font-family: "Iowan Old Style", Palatino, Georgia, serif;
+    font-size: 1.5rem; font-weight: 600;
+  }
+  header h1 span { color: var(--accent); }
+  header .date { color: var(--muted); }
+  header .spacer { flex: 1; }
+  header .stale { color: var(--red); font-size: .8rem; display: none; }
+  .usage-strip {
+    flex: 1 0 100%; min-height: 1.35rem; display: flex; align-items: center; gap: 1.1rem;
+    overflow-x: auto; scrollbar-width: none; white-space: nowrap; color: var(--muted); font-size: .74rem;
+  }
+  .usage-strip::-webkit-scrollbar { display: none; }
+  .usage-source { display: inline-flex; align-items: center; gap: .32rem; }
+  .usage-name { color: var(--ink); font-weight: 650; }
+  .usage-pill {
+    border: 1px solid var(--line); border-radius: 999px; padding: .02rem .38rem;
+    background: var(--code); color: var(--muted); line-height: 1.45;
+  }
+  .usage-pill.warm { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+  .usage-pill.hot { border-color: var(--red); color: var(--red); background: transparent; }
+  .usage-asof { opacity: .68; margin-left: .08rem; }
+  main { padding: 1rem 1.5rem 4rem; max-width: 1600px; margin: 0 auto; }
+  h2 {
+    font-size: .72rem; letter-spacing: .12em; text-transform: uppercase;
+    color: var(--muted); font-weight: 600; margin: 1.6rem 0 .6rem;
+  }
+  h2 .n { color: var(--accent); }
+
+  /* digest */
+  details.digest { border: 1px solid var(--line); border-radius: 10px; background: var(--card); margin-top: 1rem; }
+  details.digest summary {
+    cursor: pointer; padding: .7rem 1rem; font-weight: 600; list-style: none;
+    display: flex; gap: .6rem; align-items: baseline;
+  }
+  details.digest summary::before { content: "▸"; color: var(--accent); }
+  details.digest[open] summary::before { content: "▾"; }
+  details.digest .md { padding: 0 1.2rem 1rem; }
+
+  /* attention */
+  #attention { border: 1px solid var(--line); border-radius: 10px; background: var(--card); margin-top: 1rem; overflow: hidden; }
+  .attention-hdr { padding: .65rem .9rem; font-weight: 650; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: .6rem; }
+  .attention-hdr .n { color: var(--accent); margin-left: .3rem; }
+  .attention-toggle { display: flex; gap: .25rem; margin-left: auto; }
+  .attention-toggle .chip { padding: .05rem .55rem; }
+  .attention-row {
+    border-left: 4px solid var(--muted); padding: .55rem .8rem; cursor: pointer;
+    display: grid; grid-template-columns: minmax(7rem, .25fr) minmax(0, 1fr) auto; gap: .7rem; align-items: baseline;
+  }
+  .attention-row + .attention-row, .attention-more { border-top: 1px solid var(--line); }
+  .attention-row:hover { background: var(--accent-soft); }
+  .attention-row.pri-0 { border-left-color: var(--red); }
+  .attention-row.pri-1 { border-left-color: var(--accent); }
+  .attention-proj { font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .attention-proj.has-experiment { white-space: normal; text-overflow: clip; overflow-wrap: anywhere; }
+  .attention-detail { color: var(--muted); min-width: 0; }
+  .attention-time { color: var(--muted); font-size: .72rem; white-space: nowrap; }
+  .attention-tail { display: flex; align-items: center; gap: .4rem; }
+  .attention-ack {
+    border: 1px solid var(--line); border-radius: 5px; padding: 0 .3rem;
+    font: inherit; font-size: .72rem; line-height: 1.35; color: var(--muted); background: transparent; cursor: pointer;
+  }
+  .attention-ack:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+  .attention-ack:disabled { opacity: .5; cursor: default; }
+  .attention-options { display: flex; flex-wrap: wrap; gap: .3rem; margin-top: .3rem; }
+  .attention-option {
+    border: 1px solid var(--line); border-radius: 999px; padding: .05rem .45rem;
+    font: inherit; font-size: .72rem; color: var(--muted); background: var(--card); cursor: pointer;
+  }
+  .attention-option:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+  .attention-option:disabled { opacity: .5; cursor: default; }
+  .attention-option-text {
+    border: 1px solid var(--line); border-radius: 999px; padding: .05rem .45rem;
+    font-size: .72rem; color: var(--muted); background: var(--code);
+  }
+  .source-chip {
+    display: inline-block; border: 1px solid var(--line); border-radius: 999px;
+    padding: 0 .38rem; color: var(--muted); background: var(--code);
+    font: 600 .64rem/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    letter-spacing: .04em; vertical-align: .08em; flex: none;
+  }
+  .source-chip.stalled-chip { border-color: var(--red); color: var(--red); background: transparent; }
+  .attention-more { color: var(--muted); font-size: .76rem; padding: .35rem .8rem .35rem calc(.8rem + 4px); }
+  .focus-wrap { padding: .8rem; }
+  .focus-progress { color: var(--muted); font-size: .72rem; margin: 0 0 .45rem .25rem; }
+  .focus-card {
+    border: 1px solid var(--line); border-left: 5px solid var(--muted); border-radius: 9px;
+    padding: .9rem 1rem; background: var(--card); min-width: 0; overflow-wrap: anywhere;
+  }
+  .focus-card.pri-0 { border-left-color: var(--red); }
+  .focus-card.pri-1 { border-left-color: var(--accent); }
+  .focus-top { display: flex; align-items: baseline; gap: .7rem; }
+  .focus-kind { color: var(--accent); font-size: .68rem; letter-spacing: .12em; font-weight: 700; }
+  .focus-proj { color: var(--muted); font-size: .72rem; font-weight: 600; }
+  .focus-time { color: var(--muted); font-size: .72rem; margin-left: auto; white-space: nowrap; }
+  .focus-name { font-family: "Iowan Old Style", Palatino, Georgia, serif; font-size: 1.18rem; font-weight: 650; margin-top: .2rem; }
+  .focus-body { color: var(--muted); margin-top: .55rem; white-space: pre-wrap; }
+  .focus-snippet { color: var(--muted); margin-top: .45rem; white-space: pre-wrap; }
+  .focus-conversation {
+    color: var(--text); background: var(--code); border: 1px solid var(--line); border-radius: 6px;
+    padding: .65rem; margin-top: .75rem; max-height: 20rem; overflow: auto; white-space: pre-wrap;
+  }
+  .focus-actions { display: flex; align-items: center; gap: .45rem; flex-wrap: wrap; margin-top: .75rem; }
+  .focus-reply { display: flex; gap: .45rem; flex: 1 1 22rem; min-width: min(100%, 18rem); }
+  .focus-reply input { flex: 1; min-width: 0; }
+  .focus-error { color: var(--red); font-size: .78rem; margin-top: .55rem; }
+  .focus-error pre {
+    color: var(--muted); background: var(--code); border: 1px solid var(--line); border-radius: 6px;
+    padding: .5rem; margin: .35rem 0 0; white-space: pre-wrap; max-height: 12rem; overflow: auto;
+  }
+  .focus-caught { padding: 1.2rem 1rem; text-align: center; }
+  .focus-caught .focus-name { margin: 0; }
+  .focus-caught .focus-body { margin-top: .25rem; }
+  .attention-unsnooze { border: 0; background: none; color: var(--accent); font: inherit; font-size: .78rem; cursor: pointer; padding: .45rem; }
+  #unblockedBox { margin-top: .65rem; font-size: .78rem; }
+  .unblocked-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto auto; gap: .55rem; padding-top: .35rem; }
+  .unblocked-row.delivered { opacity: .55; }
+  .unblocked-row span:first-child, .unblocked-row span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  body.attn-max { min-height: 100vh; display: flex; flex-direction: column; }
+  body.attn-max main { flex: 1; width: 100%; max-width: none; display: flex; flex-direction: column; padding-bottom: 1rem; }
+  body.attn-max main > :not(#attention) { display: none !important; }
+  body.attn-max #attention { flex: 1; min-height: calc(100vh - 7rem); margin-top: 0; display: flex; flex-direction: column; }
+  body.attn-max .focus-wrap { flex: 1; padding: clamp(1rem, 3vw, 2.5rem); }
+  body.attn-max .focus-progress, body.attn-max .focus-card { width: 100%; max-width: 900px; margin-left: auto; margin-right: auto; }
+  body.attn-max .focus-card { padding: clamp(1.1rem, 2.5vw, 2rem); }
+  @media (max-width: 650px) {
+    .attention-row { grid-template-columns: 1fr auto; gap: .15rem .6rem; }
+    .attention-detail { grid-column: 1 / -1; }
+    .focus-top { flex-wrap: wrap; gap: .25rem .7rem; }
+    .focus-time { margin-left: 0; }
+    .focus-reply { flex-basis: 100%; min-width: 100%; }
+  }
+
+  /* now strip */
+  .now { display: flex; gap: .8rem; overflow-x: auto; padding-bottom: .4rem; }
+  .sess {
+    flex: 0 0 300px; border: 1px solid var(--line); border-radius: 10px;
+    background: var(--card); padding: .7rem .9rem; min-width: 0; cursor: pointer;
+  }
+  .sess:hover { border-color: var(--accent); }
+  .sess .top { display: flex; align-items: center; gap: .5rem; margin-bottom: .3rem; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  .running .dot { background: var(--green); animation: pulse 1.6s ease-in-out infinite; }
+  .idle .dot { background: var(--accent); }
+  @keyframes pulse { 50% { opacity: .35; } }
+  @media (prefers-reduced-motion: reduce) { .running .dot { animation: none; } }
+  .sess .proj { font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sess .title { color: var(--muted); font-size: .8rem; display: flex; align-items: center; gap: .35rem; min-width: 0; }
+  .sess .title-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sess .msg {
+    color: var(--muted); font-size: .78rem; margin-top: .35rem;
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .sess .meta { font-size: .72rem; color: var(--muted); margin-top: .35rem; display: flex; gap: .6rem; }
+  .sess .task { color: var(--accent); }
+
+  /* board */
+  .board { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: .9rem; align-items: start; }
+  .col .colh { display: flex; gap: .4rem; align-items: baseline; margin-bottom: .5rem; }
+  .col .colh .name { font-size: .72rem; letter-spacing: .1em; text-transform: uppercase; font-weight: 650; }
+  .col .colh .count { color: var(--muted); font-size: .72rem; }
+  .card {
+    border: 1px solid var(--line); border-left: 3px solid var(--sc, var(--line));
+    border-radius: 8px; background: var(--card); padding: .6rem .8rem;
+    margin-bottom: .6rem; cursor: pointer; min-width: 0; overflow-wrap: anywhere;
+  }
+  .card:hover { border-color: var(--accent); }
+  .card .t { font-weight: 600; }
+  .card .meta { display: flex; flex-wrap: wrap; gap: .5rem; font-size: .72rem; color: var(--muted); margin-top: .25rem; }
+  .card .tag { color: var(--accent); }
+  .card .landed-badge {
+    display: inline-block; padding: .02rem .38rem; background: var(--code);
+    border: 1px solid var(--line); border-radius: 999px; color: var(--green); font-weight: 600;
+  }
+  .experiment-chip {
+    display: inline-block; max-width: 100%; padding: .04rem .38rem; background: var(--code);
+    border: 1px solid var(--line); border-radius: 999px; color: var(--muted);
+    font-family: ui-monospace, Menlo, monospace; font-size: .68rem; line-height: 1.35;
+    overflow-wrap: anywhere;
+  }
+  .card .overdue { color: var(--red); font-weight: 600; }
+  .card .stale { color: var(--muted); font-weight: 600; }
+  details.recipe { margin: .3rem 0 .2rem; }
+  details.recipe summary { cursor: pointer; font-size: .72rem; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); font-weight: 650; }
+  details.recipe pre { white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; font-size: .76rem; color: var(--muted); background: var(--code); border: 1px solid var(--line); border-radius: 6px; padding: .5rem .7rem; margin: .4rem 0 0; overflow-x: auto; }
+  .card .live { color: var(--green); font-weight: 600; }
+  .card .last { color: var(--muted); font-size: .78rem; margin-top: .3rem;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .col-active { --sc: #3D7A46; } .col-review { --sc: #8A4FA3; } .col-blocked { --sc: #B3402E; }
+  .col-landing { --sc: #2F6690; }
+  .col-waiting { --sc: #C9962B; } .col-inbox { --sc: #4A7DA6; }
+
+  /* filters */
+  .filters { display: flex; gap: .4rem; flex-wrap: wrap; margin-top: .8rem; }
+  .chip {
+    border: 1px solid var(--line); border-radius: 999px; padding: .1rem .7rem;
+    font-size: .78rem; cursor: pointer; color: var(--muted); background: none; font-family: inherit;
+  }
+  .chip.scope { color: var(--ink); background: var(--code); font-weight: 600; }
+  .chip.on { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+
+  /* detail modal */
+  dialog {
+    border: 1px solid var(--line); border-radius: 12px; background: var(--card); color: var(--ink);
+    max-width: 42rem; width: calc(100vw - 3rem); padding: 1.2rem 1.4rem;
+  }
+  dialog::backdrop { background: rgba(0,0,0,.35); }
+  dialog h3 { margin: 0 0 .2rem; font-family: "Iowan Old Style", Palatino, Georgia, serif; }
+  dialog .sub { color: var(--muted); font-size: .8rem; margin-bottom: .8rem; }
+  dialog .resume {
+    font-family: ui-monospace, Menlo, monospace; font-size: .78rem; background: var(--code);
+    border: 1px solid var(--line); border-radius: 6px; padding: .5rem .7rem; margin: .6rem 0;
+    overflow-x: auto; white-space: nowrap; cursor: pointer;
+  }
+  dialog .close { float: right; background: none; border: none; color: var(--muted); font-size: 1.1rem; cursor: pointer; }
+
+  /* actions & forms */
+  .btn {
+    border: 1px solid var(--accent); border-radius: 6px; background: none; color: var(--accent);
+    padding: .3rem .8rem; font: inherit; font-size: .8rem; cursor: pointer;
+  }
+  .btn:hover { background: var(--accent-soft); }
+  .btn.quiet { border-color: var(--line); color: var(--muted); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .actions { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin: .6rem 0; }
+  textarea, input[type=text], select {
+    font: inherit; font-size: .85rem; color: var(--ink); background: var(--paper);
+    border: 1px solid var(--line); border-radius: 6px; padding: .4rem .6rem;
+  }
+  textarea { width: 100%; min-height: 3.2rem; resize: vertical; }
+  .field { display: flex; flex-direction: column; gap: .2rem; margin-bottom: .6rem; }
+  .field label { font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  .session-send { flex-wrap: nowrap; }
+  .session-send input { flex: 1; min-width: 0; }
+  .session-error { color: var(--red); font-size: .78rem; }
+  .session-error pre {
+    color: var(--muted); background: var(--code); border: 1px solid var(--line); border-radius: 6px;
+    padding: .5rem; margin: .35rem 0 0; white-space: pre-wrap; max-height: 12rem; overflow: auto;
+  }
+
+  /* runs */
+  .runline { display: flex; gap: .45rem; align-items: baseline; font-size: .78rem; margin-top: .3rem; color: var(--muted); }
+  .spin {
+    width: 9px; height: 9px; border-radius: 50%; flex: none; align-self: center;
+    border: 2px solid var(--accent); border-top-color: transparent; animation: rot 1s linear infinite;
+  }
+  @keyframes rot { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+  #runArea { border-top: 1px solid var(--line); margin-top: .8rem; padding-top: .6rem; }
+  .runmsg { font-size: .82rem; color: var(--muted); white-space: pre-wrap; margin: .4rem 0; }
+  .diffpre {
+    font-family: ui-monospace, Menlo, monospace; font-size: .72rem; background: var(--code);
+    border: 1px solid var(--line); border-radius: 6px; padding: .6rem; overflow-x: auto;
+    max-height: 40vh; overflow-y: auto; white-space: pre;
+  }
+  #toast {
+    position: fixed; bottom: 1rem; left: 50%; transform: translateX(-50%);
+    background: var(--ink); color: var(--paper); border-radius: 8px; padding: .5rem 1rem;
+    font-size: .82rem; display: none; z-index: 10;
+  }
+  .restore-item { display: flex; gap: .8rem; align-items: baseline; padding: .3rem 0; flex-wrap: wrap; }
+  .restore-item .cmd {
+    font-family: ui-monospace, Menlo, monospace; font-size: .74rem; background: var(--code);
+    padding: .15rem .5rem; border-radius: 5px; cursor: pointer;
+  }
+  .summary-card { border: 1px solid var(--line); border-radius: 8px; background: var(--card); padding: .55rem .8rem; color: var(--muted); }
+  .summary-card .md p:first-child { margin-top: 0; }
+  .summary-card .md p:last-child { margin-bottom: 0; }
+  #reviewStrip { margin: 1.4rem 0 -.8rem; }
+  #reviewStrip .review-hdr { font-size: .72rem; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); font-weight: 650; margin-bottom: .45rem; }
+  #tagSummary { margin-top: .8rem; font-size: .82rem; }
+  #alertsBox { margin-top: 1rem; font-size: .78rem; }
+  .alerts-hdr { font-size: .72rem; letter-spacing: .12em; text-transform: uppercase; color: var(--accent); font-weight: 650; }
+  .alert-brief { white-space: pre-wrap; margin-top: .45rem; }
+  .alert-row { display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto; gap: .55rem; padding-top: .35rem; color: var(--muted); }
+  .alert-row .level { color: var(--ink); font-weight: 650; }
+  .alert-row .text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #standupBox { margin-top: 1rem; }
+  .standup-text { color: var(--ink); margin-top: .45rem; line-height: 1.45; }
+  .standup-meta { font-size: .72rem; margin-top: .4rem; }
+  .standup-links { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .4rem; }
+  .standup-link { border: 0; background: none; color: var(--accent); padding: 0; font: inherit; font-size: .74rem; cursor: pointer; }
+  .standup-link:hover { text-decoration: underline; }
+  #slackBox { margin-top: 1rem; font-size: .78rem; }
+  .slack-row { display: grid; grid-template-columns: auto auto auto auto minmax(0, 1fr) auto; gap: .55rem; padding-top: .35rem; color: var(--muted); }
+  .slack-row .kind { color: var(--ink); font-weight: 650; }
+  .slack-row .summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #daemonBox { margin-top: 1rem; font-size: .78rem; }
+  .daemon-summary { margin-top: .35rem; color: var(--muted); }
+  .daemon-row { display: grid; grid-template-columns: minmax(7rem, 1fr) auto minmax(5rem, auto) minmax(5rem, auto); gap: .55rem; padding-top: .35rem; align-items: baseline; }
+  .daemon-row.bad { color: var(--red); }
+  .daemon-name { color: var(--ink); font-weight: 650; }
+  .daemon-state { display: inline-block; border: 1px solid var(--line); border-radius: 999px; padding: 0 .4rem; font-size: .7rem; color: var(--muted); }
+  .daemon-row.bad .daemon-state { border-color: var(--red); color: var(--red); }
+  .daemon-time { color: var(--muted); white-space: nowrap; }
+  @media (max-width: 650px) {
+    .daemon-row { grid-template-columns: minmax(0, 1fr) auto; }
+    .daemon-row .daemon-time { grid-column: auto; }
+  }
+  #digestMd details { border-top: 1px solid var(--line); margin-top: .7rem; padding-top: .3rem; }
+  #digestMd details summary { padding: .25rem 0; color: var(--muted); font-size: .78rem; }
+  #digestMd details summary::before { content: none; }
+
+  .md h1, .md h2, .md h3 { all: unset; display: block; font-weight: 700; margin: .7rem 0 .3rem; }
+  .md h1 { font-size: 1.1rem; } .md h2 { font-size: .95rem; color: var(--accent); }
+  .md h3 { font-size: .85rem; color: var(--accent); }
+  .md ul, .md ol { margin: .2rem 0 .6rem; padding-left: 1.2rem; }
+  .md code { background: var(--code); padding: .05em .3em; border-radius: 4px; font-size: .85em; }
+  .md .mdcode { white-space: pre; font-family: ui-monospace, Menlo, monospace; font-size: .76rem; color: var(--muted); background: var(--code); border: 1px solid var(--line); border-radius: 6px; padding: .5rem .7rem; margin: .4rem 0; overflow-x: auto; }
+  .md blockquote { border-left: 3px solid var(--line); color: var(--muted); margin: .4rem 0; padding-left: .7rem; }
+  .md a { color: var(--accent); }
+  .empty { color: var(--muted); padding: .6rem 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>⌂</span> keep</h1>
+  <span class="date" id="date"></span>
+  <span class="spacer"></span>
+  <span class="stale" id="stale">disconnected — retrying</span>
+  <button class="btn quiet" id="notifBtn" title="browser notifications for finished runs, overdue checks, and new review items">🔔</button>
+  <button class="btn" id="addBtn" title="Create a new task on the board">+ add</button>
+  <div class="usage-strip" id="usage" aria-label="Usage limits"></div>
+</header>
+<main>
+  <div id="attention" style="display:none"></div>
+
+  <div id="daemonBox" class="summary-card" style="display:none">
+    <div class="alerts-hdr">Daemon</div>
+    <div id="daemonList"></div>
+  </div>
+
+  <div id="unblockedBox" class="summary-card" style="display:none">
+    <div class="alerts-hdr">Dependency notices</div>
+    <div id="unblockedList"></div>
+  </div>
+
+  <div id="alertsBox" class="summary-card" style="display:none">
+    <div class="alerts-hdr">Alerts</div>
+    <div id="alertBrief" class="alert-brief"></div>
+    <div id="alertList"></div>
+  </div>
+
+  <div id="standupBox" class="summary-card" style="display:none">
+    <div class="alerts-hdr">Standup</div>
+    <div id="standupText" class="standup-text"></div>
+    <div id="standupMeta" class="standup-meta"></div>
+    <div id="standupLinks" class="standup-links"></div>
+  </div>
+
+  <div id="slackBox" class="summary-card" style="display:none">
+    <div class="alerts-hdr">Slack watch <span id="slackMeta"></span></div>
+    <div id="slackList"></div>
+  </div>
+
+  <details class="digest" id="digestBox" style="display:none">
+    <summary>Today's digest</summary>
+    <div class="md" id="digestMd"></div>
+  </details>
+
+  <details class="digest" id="restoreBox" style="display:none">
+    <summary>Restore — pick up where you left off</summary>
+    <div id="restoreList" style="padding:0 1.2rem 1rem"></div>
+  </details>
+
+  <details class="digest" id="weeklyBox" style="display:none">
+    <summary>This week</summary>
+    <div class="md" id="weeklyMd"></div>
+  </details>
+
+  <h2>Now <span class="n" id="nowCount"></span></h2>
+  <div class="now" id="now"></div>
+
+  <div id="reviewStrip" class="summary-card" style="display:none"></div>
+  <h2>Board</h2>
+  <div class="filters" id="filters"></div>
+  <div id="tagSummary" class="summary-card" style="display:none"></div>
+  <div class="board" id="board" style="margin-top:.8rem"></div>
+</main>
+<dialog id="detail"></dialog>
+<dialog id="addDlg">
+  <button class="close" onclick="addDlg.close()">✕</button>
+  <h3>New task</h3>
+  <div class="field"><label>Title</label><input type="text" id="afTitle"></div>
+  <div class="field"><label>Kind</label>
+    <select id="afKind"><option>task</option><option>experiment</option><option>idea</option><option>chore</option><option>bug</option></select></div>
+  <div class="field"><label>Status</label>
+    <select id="afStatus"><option>inbox</option><option>active</option><option>waiting</option><option>blocked</option><option>landing</option><option>review</option></select></div>
+  <div class="field"><label>Tags (space-separated)</label><input type="text" id="afTags"></div>
+  <div class="field"><label>Project path</label><input type="text" id="afProject" placeholder="~/castle/…"></div>
+  <div class="field"><label>Check after (for experiments: YYYY-MM-DD, +3d, tomorrow)</label><input type="text" id="afCheckAfter"></div>
+  <div class="field"><label>Check recipe</label><textarea id="afCheck" placeholder="What an agent should do to check on this, cold."></textarea></div>
+  <div class="field"><label>Note</label><textarea id="afNote"></textarea></div>
+  <div class="actions"><button class="btn" id="afSubmit">Add task</button></div>
+</dialog>
+<div id="toast"></div>
+
+<script>
+'use strict';
+const COLS = ['active', 'review', 'landing', 'blocked', 'waiting', 'inbox'];
+const STALE_DAYS = 7;
+let state = { tasks: [], sessions: [], attention: [], stalled: [], unblocked: [], alerts: [], brief: null, standup: null, landed: {}, slack: null, health: null, digest: null, runs: [], usage: {}, reviewUsage: null };
+let tagFilter = null;
+let scopeFilter = ['castle', 'personal'].includes(localStorage.keepScope) ? localStorage.keepScope : null;
+let kindFilter = localStorage.keepKind === 'experiment' ? 'experiment' : null;
+let attentionView = ['focus', 'list'].includes(localStorage.keepAttnView) ? localStorage.keepAttnView : 'focus';
+let attentionMax = localStorage.keepAttnMax === '1';
+let focusPinned = null;
+let tagSummary = null;
+
+const $ = (id) => document.getElementById(id);
+let openTaskId = null;
+
+const sessionOpenStates = new Map();
+function sessionOpenButton(payload) {
+  const key = JSON.stringify(payload);
+  const status = sessionOpenStates.get(key) || {};
+  return `<button type="button" class="chip" data-session-open="${esc(key)}" ${status.busy ? 'disabled' : ''}>Open session</button><span class="session-open-result" role="status">${esc(status.text || '')}</span>`;
+}
+
+function updateSessionOpenState(key, status) {
+  sessionOpenStates.set(key, status);
+  for (const button of document.querySelectorAll('[data-session-open]')) {
+    if (button.dataset.sessionOpen !== key) continue;
+    button.disabled = status.busy;
+    button.nextElementSibling.textContent = status.text;
+  }
+}
+
+document.addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-session-open]');
+  if (!button) return;
+  event.stopPropagation();
+  const key = button.dataset.sessionOpen;
+  if (button.disabled || sessionOpenStates.get(key)?.busy) return;
+  updateSessionOpenState(key, { busy: true, text: 'Opening…' });
+  try {
+    const result = await post('/api/open', JSON.parse(key));
+    updateSessionOpenState(key, { busy: false, text: result.existing ? `Running in ${result.pane}` : `Opened ${result.pane || 'session'}` });
+  } catch (e) { updateSessionOpenState(key, { busy: false, text: e.message }); }
+}, true);
+
+async function post(pathname, body) {
+  const r = await fetch(pathname, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-keep': '1' },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || !j.ok) {
+    const error = new Error(String(j.error || `request failed (${r.status})`).slice(0, 300));
+    error.data = j;
+    throw error;
+  }
+  return j;
+}
+
+let toastTimer;
+function toast(msg) {
+  $('toast').textContent = msg;
+  $('toast').style.display = 'block';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { $('toast').style.display = 'none'; }, 3500);
+}
+
+function runFor(taskId) {
+  return (state.runs || []).find((r) => r.taskId === taskId);
+}
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const experimentChip = (id) => id ? `<span class="experiment-chip">🧪 ${esc(id)}</span>` : '';
+
+function md(src) {
+  // tiny renderer for digests, assistant messages, and logs
+  const lines = String(src).split('\n');
+  let out = '', listType = '';
+  const closeList = () => {
+    if (listType) out += `</${listType}>`;
+    listType = '';
+  };
+  const openList = (type) => {
+    if (listType === type) return;
+    closeList();
+    out += `<${type}>`;
+    listType = type;
+  };
+  const inline = (text) => esc(text).replace(
+    /`([^`]+)`|\[([^\]]+)\]\(([^)\s]+)\)|\*\*([^*]+?)\*\*|(^|[^*])\*([^*]+?)\*(?!\*)/g,
+    (match, code, linkText, url, bold, lead, italic) => {
+      if (code !== undefined) return `<code>${code}</code>`;
+      if (linkText !== undefined) {
+        return /^https?:\/\//i.test(url)
+          ? `<a href="${url}" target="_blank" rel="noopener">${linkText}</a>`
+          : match;
+      }
+      if (bold !== undefined) return `<b>${bold}</b>`;
+      return `${lead}<i>${italic}</i>`;
+    },
+  );
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (/^\s*```/.test(l)) {
+      closeList();
+      const code = [];
+      for (i += 1; i < lines.length && !/^\s*```\s*$/.test(lines[i]); i++) code.push(lines[i]);
+      out += `<pre class="mdcode">${esc(code.join('\n'))}</pre>`;
+      continue;
+    }
+    // degrade markdown tables (which we don't render) into bullets
+    if (/^\s*\|/.test(l)) {
+      if (/^\s*[|:\s-]+$/.test(l)) continue; // separator row
+      if (i + 1 < lines.length && /^\s*\|[|:\s-]+$/.test(lines[i + 1])) continue; // header row
+      const cells = l.split('|').map((c) => c.trim()).filter(Boolean);
+      if (cells.length) {
+        openList('ul');
+        out += `<li>${esc(cells.join(' — '))}</li>`;
+      }
+      continue;
+    }
+    if (/^### /.test(l)) { closeList(); out += `<h3>${inline(l.slice(4))}</h3>`; }
+    else if (/^## /.test(l)) { closeList(); out += `<h2>${inline(l.slice(3))}</h2>`; }
+    else if (/^# /.test(l)) { closeList(); out += `<h1>${inline(l.slice(2))}</h1>`; }
+    else if (/^- /.test(l)) { openList('ul'); out += `<li>${inline(l.slice(2))}</li>`; }
+    else if (/^\d+\. /.test(l)) { openList('ol'); out += `<li>${inline(l.replace(/^\d+\. /, ''))}</li>`; }
+    else if (/^> /.test(l)) { closeList(); out += `<blockquote>${inline(l.slice(2))}</blockquote>`; }
+    else { closeList(); if (l.trim()) out += `<p>${inline(l)}</p>`; }
+  }
+  closeList();
+  return out;
+}
+
+function ago(ms) {
+  const s = Math.round((Date.now() - ms) / 1000);
+  if (s < 90) return `${s}s ago`;
+  if (s < 5400) return `${Math.round(s / 60)}m ago`;
+  return `${Math.round(s / 3600)}h ago`;
+}
+
+function projName(p) { return p ? p.split('/').filter(Boolean).pop() : ''; }
+
+function attentionTime(since) {
+  const ms = typeof since === 'number' ? since : new Date(since).getTime();
+  return Number.isFinite(ms) ? ago(ms) : '';
+}
+
+function pacificTime(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return 'unknown';
+  return new Intl.DateTimeFormat(undefined, {
+    timeZone: 'America/Los_Angeles', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+  }).format(date) + ' PT';
+}
+
+function usageResetTitle(resetsAt) {
+  const date = new Date(resetsAt);
+  if (!Number.isFinite(date.getTime())) return '';
+  return `resets ${date.toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' })}`;
+}
+
+function usagePill(limit, useSeverity) {
+  const percent = Number(limit && limit.percent);
+  if (!Number.isFinite(percent)) return '';
+  const elevated = useSeverity && limit.severity && limit.severity !== 'normal';
+  const level = percent >= 90 ? ' hot' : percent >= 70 || elevated ? ' warm' : '';
+  const reset = usageResetTitle(limit.resetsAt);
+  const title = `${Math.round(percent)}% of limit used${reset ? ` — ${reset}` : ''}`;
+  return `<span class="usage-pill${level}" title="${esc(title)}">${esc(limit.label)} ${Math.round(percent)}%</span>`;
+}
+
+function renderUsage() {
+  const usage = state.usage || {};
+  const groups = [];
+  const claudeLimits = usage.claude && Array.isArray(usage.claude.limits) ? usage.claude.limits : [];
+  const claudePills = claudeLimits.map((limit) => usagePill(limit, true)).filter(Boolean);
+  if (claudePills.length) {
+    const fetchedAt = Number(usage.claude.fetchedAt);
+    const age = Number.isFinite(fetchedAt) ? Math.max(0, Date.now() - fetchedAt) : 0;
+    const suffix = age >= 10 * 60e3
+      ? `<span class="usage-asof" title="${esc(usage.claude.error || '')}">(as of ${esc(ago(fetchedAt))})</span>` : '';
+    groups.push(`<span class="usage-source"><span class="usage-name">Claude</span><span>·</span>${claudePills.join('<span>·</span>')}${suffix}</span>`);
+  } else if (usage.claude && usage.claude.error) {
+    groups.push(`<span class="usage-source"><span class="usage-name">Claude</span><span>·</span><span class="usage-pill" title="${esc(usage.claude.error)}">unavailable</span></span>`);
+  }
+  const ru = state.reviewUsage;
+  if (ru && ru.today && (ru.today.msgs || ru.week.msgs)) {
+    const fmt = (n) => n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? Math.round(n / 1e3) + 'k' : String(n);
+    const spent = (d) => (d.in || 0) + (d.cc || 0); // fresh input tokens; cache reads are cheap and shown separately
+    const w = ru.weekly;
+    let weeklyText = '';
+    let weeklyTitle = '';
+    if (w && w.pointsOfModelWeek !== undefined) {
+      // same units as the "Fable wk N%" pill: percent of that weekly window consumed
+      weeklyText = `${w.pointsOfModelWeek.toFixed(1)}%`;
+      weeklyTitle = `\n~${w.pointsOfModelWeek.toFixed(1)}% of the ${w.modelLabel.replace(/ wk$/, '')} weekly window (of ${w.modelPercent}% used in total)`;
+    } else if (w && w.pointsOfWeek !== undefined) {
+      weeklyText = `${w.pointsOfWeek.toFixed(1)}%`;
+      weeklyTitle = `\n~${w.pointsOfWeek.toFixed(1)}% of the weekly window (of ${w.weekPercent}% used in total)`;
+    }
+    if (w && w.warming) weeklyTitle += `\n(still folding ${Math.round((w.backlogBytes || 0) / 1e6)}MB of history - the estimate will settle)`;
+    if (w) weeklyTitle += `\nusage from other devices/cloud is not visible locally, so this reads slightly high`;
+    const title = `Fleet reviewer, estimated from its session transcripts.\n`
+      + `today: ${fmt(spent(ru.today))} input + ${fmt(ru.today.out || 0)} out (+${fmt(ru.today.cr || 0)} cache reads, ${ru.today.msgs || 0} msgs)\n`
+      + `7 days: ${fmt(spent(ru.week))} input + ${fmt(ru.week.out || 0)} out (+${fmt(ru.week.cr || 0)} cache reads, ${ru.week.msgs || 0} msgs)`
+      + (ru.models && ru.models.length ? `\nmodel: ${ru.models.join(', ')}` : '')
+      + weeklyTitle;
+    const label = weeklyText ? `${esc(weeklyText)}${w && w.warming ? '…' : ''}` : `today ${esc(fmt(spent(ru.today)))}+${esc(fmt(ru.today.out || 0))}`;
+    const pill = `<span class="usage-pill" title="${esc(title)}">${label}</span>`;
+    groups.push(`<span class="usage-source"><span class="usage-name">Reviewer</span><span>·</span>${pill}</span>`);
+  }
+  const codexWindows = usage.codex && Array.isArray(usage.codex.windows) ? usage.codex.windows : [];
+  const codexPills = codexWindows.map((limit) => usagePill(limit, false)).filter(Boolean);
+  if (codexPills.length) {
+    const asOf = Number(usage.codex.asOf);
+    const age = Number.isFinite(asOf) ? Math.max(0, Date.now() - asOf) : 0;
+    const suffix = age >= 10 * 60e3 ? `<span class="usage-asof">(as of ${esc(ago(asOf))})</span>` : '';
+    groups.push(`<span class="usage-source"><span class="usage-name">Codex</span><span>·</span>${codexPills.join('<span>·</span>')}${suffix}</span>`);
+  }
+  $('usage').innerHTML = groups.join('');
+}
+
+function renderDaemon() {
+  const health = state.health;
+  const rows = health && Array.isArray(health.schedulers) ? [...health.schedulers] : [];
+  $('daemonBox').style.display = health ? '' : 'none';
+  if (!health) return;
+  const badStates = new Set(['failing', 'silent', 'never']);
+  const bad = rows.filter((row) => badStates.has(row.state));
+  const uptime = health.daemon && health.daemon.startedAt ? ago(health.daemon.startedAt).replace(/ ago$/, '') : 'unknown';
+  if (!bad.length) {
+    $('daemonList').innerHTML = `<div class="daemon-summary">all ok · uptime ${esc(uptime)}</div>`;
+    return;
+  }
+  const rank = { failing: 0, silent: 1, never: 2, skipped: 3, ok: 4 };
+  rows.sort((a, b) => (rank[a.state] ?? 9) - (rank[b.state] ?? 9) || a.name.localeCompare(b.name));
+  $('daemonList').innerHTML = rows.map((row) => {
+    const isBad = badStates.has(row.state);
+    const lastOk = row.lastOkAt ? ago(row.lastOkAt) : 'never';
+    const lastError = row.lastErrorAt ? ago(row.lastErrorAt) : '—';
+    return `<div class="daemon-row${isBad ? ' bad' : ''}" title="${esc(row.lastError || '')}">
+      <span class="daemon-name">${esc(row.name)}</span><span class="daemon-state">${esc(row.state)}</span>
+      <span class="daemon-time">ok ${esc(lastOk)}</span><span class="daemon-time">error ${esc(lastError)}</span>
+    </div>`;
+  }).join('');
+}
+
+function attentionItemKey(item) {
+  return item.id ? `${item.id}:${item.since || item.at}` : `${item.kind}:${item.sessionId || item.taskId || ''}:${item.since}`;
+}
+
+function attentionSnoozes() {
+  const now = Date.now();
+  let parsed = {};
+  try { parsed = JSON.parse(localStorage.keepAttnSnooze || '{}'); } catch {}
+  const snoozes = Object.create(null);
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    for (const [key, expiry] of Object.entries(parsed)) {
+      if (Number.isFinite(expiry) && expiry > now) snoozes[key] = expiry;
+    }
+  }
+  try {
+    if (Object.keys(snoozes).length) localStorage.keepAttnSnooze = JSON.stringify(snoozes);
+    else localStorage.removeItem('keepAttnSnooze');
+  } catch {}
+  return snoozes;
+}
+
+function snoozeAttentionItem(item) {
+  const snoozes = attentionSnoozes();
+  snoozes[attentionItemKey(item)] = Date.now() + 30 * 60e3;
+  localStorage.keepAttnSnooze = JSON.stringify(snoozes);
+}
+
+function attentionHeader(count) {
+  return `<div class="attention-hdr"><span>Needs you <span class="n">${count}</span></span>
+    <span class="attention-toggle" aria-label="Attention controls">
+      <button type="button" class="chip ${attentionView === 'focus' ? 'on' : ''}" data-attn-view="focus">Focus</button>
+      <button type="button" class="chip ${attentionView === 'list' ? 'on' : ''}" data-attn-view="list">List</button>
+      <button type="button" class="chip ${attentionMax ? 'on' : ''}" data-attn-max aria-label="Toggle fullscreen Needs you" aria-pressed="${attentionMax}" title="Fill the page with Needs you">⛶</button>
+    </span>
+  </div>`;
+}
+
+function syncAttentionMax(hasItems = (state.attention || []).length > 0) {
+  const active = attentionMax && hasItems;
+  document.body.classList.toggle('attn-max', active);
+  const button = $('attention').querySelector('[data-attn-max]');
+  if (button) {
+    button.classList.toggle('on', active);
+    button.setAttribute('aria-pressed', String(active));
+  }
+}
+
+function setAttentionMax(maximized) {
+  attentionMax = maximized;
+  if (attentionMax) localStorage.keepAttnMax = '1';
+  else localStorage.removeItem('keepAttnMax');
+  syncAttentionMax();
+}
+
+function renderAttentionList(items) {
+  const rows = [];
+  for (const pri of [...new Set(items.map((i) => i.pri))]) {
+    const tier = items.filter((i) => i.pri === pri);
+    const shown = pri >= 1 ? tier.slice(0, 4) : tier;
+    for (const i of shown) {
+      const safePri = [0, 1, 2, 3].includes(i.pri) ? i.pri : 3;
+      const s = i.sessionId ? (state.sessions || []).find((x) => x.id === i.sessionId) : null;
+      const task = i.taskId ? (state.tasks || []).find((t) => t.id === i.taskId) : null;
+      const rowSession = i.sessionId ? (state.sessions || []).find((x) => x.id === i.sessionId) : null;
+      let name = i.sessionId
+        ? ((rowSession && rowSession.title) ? `${rowSession.title} · ${projName(i.project)}` : ((task && task.fm && task.fm.title) || projName(i.project)))
+        : i.title;
+      let detail = i.detail || '';
+      let extra = '';
+      let title = '';
+      if (i.kind === 'question') {
+        detail = i.question || '';
+        extra = Array.isArray(i.options) && i.options.length
+          ? `<div class="attention-options">${i.options.map((o, idx) => i.codex
+            ? `<span class="attention-option-text">${esc(o)}</span>`
+            : `<button type="button" class="attention-option" data-opt="${idx + 1}" title="Answer the question in that session">${esc(o)}</button>`).join('')}</div>`
+          : '';
+        if (!i.codex) title = ' title="Answer in the session\'s terminal"';
+      } else if (i.kind === 'permission' && i.codex) {
+        extra = `<div class="attention-options">
+          <button type="button" class="attention-option" data-approval="yes">Approve</button>
+          <button type="button" class="attention-option" data-approval="always">Always allow</button>
+          <button type="button" class="attention-option" data-approval="no">Deny</button>
+        </div><div class="focus-error attention-action-error" style="display:none"></div>`;
+      } else if (i.kind === 'plan') detail = 'Plan ready for approval';
+      else if (i.kind === 'input') detail = s && s.lastAssistant || 'Waiting for input';
+      rows.push(`<div class="attention-row pri-${safePri}" data-key="${esc(attentionItemKey(i))}"${i.sessionId ? ` data-sid="${esc(i.sessionId)}"` : i.taskId ? ` data-id="${esc(i.taskId)}"` : ''}${title}>
+        <div class="attention-proj">${i.codex ? '<span class="source-chip">codex</span> ' : ''}${esc(name)}</div>
+        <div class="attention-detail">${esc(detail)}${extra}</div>
+        <div class="attention-tail"><span class="attention-time">${esc(attentionTime(i.since))}</span><button type="button" class="attention-ack" data-action="ack" title="Hide this until it has new activity" aria-label="Done for now">✓</button></div>
+      </div>`);
+    }
+    if (shown.length < tier.length) rows.push(`<div class="attention-more">+${tier.length - shown.length} more</div>`);
+  }
+  $('attention').innerHTML = `${attentionHeader(items.length)}${rows.join('')}`;
+}
+
+function renderAttentionFocus(items) {
+  const snoozes = attentionSnoozes();
+  const available = items.filter((item) => !snoozes[attentionItemKey(item)]);
+  const renderedCard = $('attention').querySelector('.focus-card');
+  if (focusPinned && renderedCard && renderedCard.dataset.key === focusPinned.key) {
+    const pinnedItem = focusPinned.item;
+    const stillNeedsAttention = available.some((item) => attentionItemKey(item) === attentionItemKey(pinnedItem));
+    if (stillNeedsAttention) {
+      const count = $('attention').querySelector('.attention-hdr .n');
+      const progress = $('attention').querySelector('.focus-progress');
+      if (count) count.textContent = String(items.length);
+      if (progress) progress.textContent = `1 of ${available.length}`;
+      return;
+    }
+    focusPinned = null;
+  }
+  if (!available.length) {
+    focusPinned = null;
+    const snoozedCount = items.filter((item) => snoozes[attentionItemKey(item)]).length;
+    const caughtUpDetail = snoozedCount
+      ? `<div class="focus-body">${snoozedCount} snoozed</div><button type="button" class="attention-unsnooze" data-action="unsnooze">Unsnooze all</button>`
+      : '<div class="focus-body">You’re caught up.</div>';
+    $('attention').innerHTML = `${attentionHeader(items.length)}<div class="focus-wrap"><div class="focus-caught">
+      <div class="focus-name">Nothing needs you right now</div>
+      ${caughtUpDetail}
+    </div></div>`;
+    return;
+  }
+
+  const item = available[0];
+  const key = attentionItemKey(item);
+  focusPinned = { item, key };
+  const safePri = [0, 1, 2, 3].includes(item.pri) ? item.pri : 3;
+  const session = item.sessionId ? (state.sessions || []).find((s) => s.id === item.sessionId) : null;
+  const task = item.taskId ? (state.tasks || []).find((t) => t.id === item.taskId) : null;
+  const labels = { question: 'QUESTION', permission: 'PERMISSION', complete: 'COMPLETED', plan: 'PLAN', input: 'WAITING', review: 'REVIEW', blocked: 'BLOCKED', overdue: 'OVERDUE', unblocked: 'UNBLOCKED', health: 'DAEMON HEALTH', stalled: 'STALLED' };
+  const name = item.sessionId
+    ? ((session && session.title) || (task && task.fm && task.fm.title) || projName(item.project) || (session && session.lastUser) || 'Coding session')
+    : (item.title || (task && task.fm && task.fm.title) || 'Keep task');
+  let body = '';
+  let actions = '';
+  const snippet = (text) => {
+    const value = String(text || '');
+    if (!value) return '';
+    return `<div class="focus-snippet md">${md(value)}</div>`;
+  };
+
+  if (item.kind === 'question') {
+    body = `<div class="focus-body md">${md(item.question || '')}</div>`;
+    if (Array.isArray(item.options) && item.codex && item.options.length) {
+      body += `<div class="attention-options">${item.options.map((option) => `<span class="attention-option-text">${esc(option)}</span>`).join('')}</div>`;
+    } else if (Array.isArray(item.options)) {
+      actions += item.options.map((option, idx) =>
+        `<button type="button" class="btn focus-action focus-answer" data-action="answer" data-opt="${idx + 1}">${esc(option)}</button>`).join('');
+    }
+  } else if (item.kind === 'input') {
+    body = snippet(session && (session.lastAssistantFull || session.lastAssistant) || 'Waiting for input');
+    actions += `<span class="focus-reply"><input type="text" class="focus-reply-input" maxlength="2000" placeholder="Reply to this session"><button type="button" class="btn focus-action" data-action="send">Send</button></span>`;
+  } else if (item.kind === 'complete') {
+    body = snippet(item.detail || (session && (session.lastAssistantFull || session.lastAssistant)) || 'Codex finished.');
+    if (item.taskId) actions += `<button type="button" class="btn focus-action" data-action="open-task">Open task</button>`;
+  } else if (item.kind === 'permission') {
+    body = `<div class="focus-body">${esc(item.detail || '')}</div>`;
+    if (item.codex) {
+      actions += `<button type="button" class="btn focus-action" data-action="codex-approval" data-approval="yes">Approve</button>
+        <button type="button" class="btn quiet focus-action" data-action="codex-approval" data-approval="always">Always allow</button>
+        <button type="button" class="btn quiet focus-action" data-action="codex-approval" data-approval="no">Deny</button>`;
+    }
+  } else if (item.kind === 'plan') {
+    const planText = session && (session.lastAssistantFull || session.lastAssistant);
+    body = `<div class="focus-body">Plan ready for approval</div>${snippet(planText)}`;
+  } else {
+    body = `<div class="focus-body">${esc(item.detail || (task && task.lastLog) || '')}</div>`;
+    if (item.taskId) actions += `<button type="button" class="btn focus-action" data-action="open-task">Open task</button>`;
+    if (item.kind === 'review' && item.taskId) actions += `<button type="button" class="btn quiet focus-action" data-action="mark-done">Mark done in Keep</button>`;
+  }
+
+  if (item.sessionId) {
+    const primary = item.kind === 'permission' || item.kind === 'plan';
+    actions += `<button type="button" class="btn ${primary ? '' : 'quiet '}focus-action" data-action="open-session">Open session</button>`;
+    if (!item.codex && ['input', 'plan', 'question', 'permission'].includes(item.kind)) {
+      actions += `<button type="button" class="btn quiet focus-action" data-action="tail">Recent conversation</button>`;
+    }
+  }
+  // task-backed cards: "Done for now" reads like a task-state change (it isn't) — say what it does
+  actions += `<button type="button" class="btn quiet focus-action" data-action="ack" title="Hide this until it has new activity">${item.taskId && !item.sessionId ? 'Hide until update' : 'Done for now'}</button>`;
+  actions += `<button type="button" class="btn quiet focus-action" data-action="skip">Skip</button>`;
+
+  $('attention').innerHTML = `${attentionHeader(items.length)}<div class="focus-wrap">
+    <div class="focus-progress">1 of ${available.length}</div>
+    <div class="focus-card pri-${safePri}" data-key="${esc(key)}">
+      <div class="focus-top"><span class="focus-kind">${esc(labels[item.kind] || String(item.kind || '').toUpperCase())}</span>${item.codex ? '<span class="source-chip">codex</span>' : ''}${item.sessionId && session && session.title ? `<span class="focus-proj">${esc(projName(item.project))}</span>` : ''}<span class="focus-time">${esc(attentionTime(item.since))}</span></div>
+      <div class="focus-name">${esc(name)}</div>
+      ${body}
+      <div class="focus-actions">${actions}</div>
+      <div class="focus-error" style="display:none"></div>
+    </div>
+  </div>`;
+}
+
+function renderAttention() {
+  const items = state.attention || [];
+  const hasItems = items.length > 0;
+  $('attention').style.display = '';
+  syncAttentionMax(hasItems);
+  const reply = $('attention').querySelector('.focus-reply-input');
+  if (attentionView === 'focus' && reply && (document.activeElement === reply || reply.value)) return;
+  if (!hasItems) {
+    focusPinned = null;
+    renderAttentionFocus(items);
+  } else if (attentionView === 'focus') renderAttentionFocus(items);
+  else renderAttentionList(items);
+}
+
+function sessionInNow(session, now = Date.now()) {
+  if (session.exited || session.deadMidTurn || ['exited', 'inactive', 'recent'].includes(session.state)) return false;
+  return ['running', 'waiting', 'needs-input'].includes(session.state) || now - session.mtime < 3600e3;
+}
+
+function render() {
+  $('date').textContent = new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
+  renderUsage();
+  renderAttention();
+  renderDaemon();
+
+  const unblockEntries = state.unblocked || [];
+  $('unblockedBox').style.display = unblockEntries.length ? '' : 'none';
+  $('unblockedList').innerHTML = unblockEntries.map((record) => {
+    const status = record.state === 'gaveUp' ? 'gave up' : record.state;
+    const muted = record.state === 'delivered' ? ' delivered' : '';
+    return `<div class="unblocked-row${muted}"><span>${esc(record.dependent)}</span><span>${esc(record.upstream)}</span><span>${esc(status)}</span><span>${esc(record.attempts)} attempts</span></div>`;
+  }).join('');
+
+  const alertEntries = [...(state.alerts || [])].reverse();
+  $('alertsBox').style.display = alertEntries.length || state.brief ? '' : 'none';
+  $('alertBrief').textContent = state.brief && state.brief.text ? state.brief.text : '';
+  $('alertList').innerHTML = alertEntries.map((entry) => {
+    const outcome = entry.deferred ? `deferred${entry.why ? ` · ${entry.why}` : ''}` : (entry.channels || []).join(', ') || 'no channel';
+    return `<div class="alert-row"><span class="level">${esc(entry.level)}</span><span>${esc(ago(entry.at))}</span><span class="text" title="${esc(entry.text)}">${esc(entry.text)}</span><span>${esc(outcome)}</span></div>`;
+  }).join('');
+
+  const standup = state.standup;
+  $('standupBox').style.display = standup ? '' : 'none';
+  $('standupText').textContent = standup && standup.text || '';
+  $('standupMeta').textContent = standup
+    ? `generated ${pacificTime(standup.generatedAt)} · since ${pacificTime(standup.since)}` : '';
+  $('standupLinks').innerHTML = standup ? (standup.cards || []).map((id) => {
+    const task = state.tasks.find((item) => item.id === id);
+    return `<button type="button" class="standup-link" data-id="${esc(id)}">▸ ${esc(task && task.fm.title || id)}</button>`;
+  }).join('') : '';
+
+  const slackEntries = [...(state.slack && state.slack.recent || [])].reverse();
+  $('slackBox').style.display = slackEntries.length || (state.slack && state.slack.lastPollAt) ? '' : 'none';
+  $('slackMeta').textContent = state.slack ? `· ${state.slack.mode} · ${state.slack.lastPollAt ? ago(state.slack.lastPollAt) : 'not polled'}` : '';
+  $('slackList').innerHTML = slackEntries.map((entry) => {
+    const related = `${(entry.related || []).length} related${entry.cardId ? ` · ${entry.cardId}` : ''}`;
+    return `<div class="slack-row"><span>${esc(ago(entry.at))}</span><span>${esc(entry.channel)}</span><span>${esc(entry.from)}</span><span class="kind">${esc(entry.kind)} · ${esc(entry.severity)}</span><span class="summary" title="${esc(entry.summary)}">${esc(entry.summary)}</span><span>${esc(related)}</span></div>`;
+  }).join('');
+
+  if (state.digest) {
+    $('digestBox').style.display = '';
+    const raw = md(state.digest.md || '');
+    $('digestMd').innerHTML = state.digest.summary
+      ? md(state.digest.summary) + `<details><summary style="cursor:pointer">Full digest</summary>${raw}</details>`
+      : raw + (state.digest.summary === null ? '<div class="empty">summarizing…</div>' : '');
+  } else $('digestBox').style.display = 'none';
+
+  const live = (state.sessions || []).filter((session) => sessionInNow(session));
+  $('nowCount').textContent = live.length ? `· ${live.filter((s) => s.state === 'running').length} running, ${live.filter((s) => s.state === 'idle').length} idle` : '';
+  $('now').innerHTML = live.length ? live.map((s) => `
+    <div class="sess ${s.state}" data-sid="${esc(s.id)}">
+      <div class="top"><span class="dot"></span><span class="proj">${esc(projName(s.project))}</span></div>
+      <div class="title"><span class="title-text">${esc(s.title || s.lastUser || '')}</span>${s.kind === 'codex' ? '<span class="source-chip">codex</span>' : ''}${s.stalled ? '<span class="source-chip stalled-chip">stalled</span>' : ''}</div>
+      <div class="msg">${esc(s.lastAssistant || '')}</div>
+      <div class="meta"><span>${esc(s.stateLabel || s.state)}</span><span>${ago(s.mtime)}</span>${s.gitBranch ? `<span>${esc(s.gitBranch)}</span>` : ''}${s.taskId ? `<span class="task">▸ ${esc(s.taskId)}</span>` : ''}</div>
+    </div>`).join('') : '<div class="empty">no sessions active in the last hour</div>';
+
+  const restore = state.tasks.filter((t) => ['active', 'review', 'landing'].includes(t.fm.status) && (t.fm.sessions || []).length);
+  $('restoreBox').style.display = restore.length ? '' : 'none';
+  const restoreSummary = state.resumeSummary ? `<div class="md summary-card" style="margin:.2rem 0 .7rem">${md(state.resumeSummary)}</div>` : '';
+  $('restoreList').innerHTML = restoreSummary + restore.map((t) => {
+    const s = t.fm.sessions[t.fm.sessions.length - 1];
+    const cmd = `${t.fm.project ? `cd ${t.fm.project} && ` : ''}${s.agent === 'codex' ? 'codex resume' : 'claude --resume'} ${s.id}`;
+    return `<div class="restore-item"><b>${esc(t.fm.title)}</b><span class="cmd" data-cmd="${esc(cmd)}" title="click to copy">${esc(cmd)}</span>${sessionOpenButton({ sessionId: s.id })}</div>`;
+  }).join('');
+
+  $('weeklyBox').style.display = state.weeklySummary ? '' : 'none';
+  $('weeklyMd').innerHTML = state.weeklySummary ? md(state.weeklySummary) : '';
+
+  const hasReview = state.tasks.some((t) => t.fm.status === 'review');
+  $('reviewStrip').style.display = hasReview && state.reviewSummary ? '' : 'none';
+  $('reviewStrip').innerHTML = hasReview && state.reviewSummary ? `<div class="review-hdr">Needs your review</div><div class="md">${md(state.reviewSummary)}</div>` : '';
+
+  const scopes = ['castle', 'personal'].map((s) =>
+    `<button class="chip scope ${scopeFilter === s ? 'on' : ''}" data-scope="${s}">${s}</button>`).join('');
+  const kindChip = `<button class="chip ${kindFilter === 'experiment' ? 'on' : ''}" data-kind="experiment" title="Only show experiment tasks">🧪 experiments</button>`;
+  const tags = [...new Set(state.tasks.flatMap((t) => t.fm.tags || []))]
+    .filter((t) => !['castle', 'personal'].includes(t)).sort();
+  $('filters').innerHTML = scopes + kindChip + tags.map((t) =>
+    `<button class="chip ${tagFilter === t ? 'on' : ''}" data-tag="${esc(t)}">#${esc(t)}</button>`).join('');
+
+  $('tagSummary').style.display = tagFilter && tagSummary ? '' : 'none';
+  $('tagSummary').innerHTML = tagFilter && tagSummary ? `<div class="md">${md(tagSummary)}</div>` : '';
+
+  const liveTaskIds = new Set(live.filter((s) => s.taskId).map((s) => s.taskId));
+  const visible = state.tasks.filter((t) =>
+    (!tagFilter || (t.fm.tags || []).includes(tagFilter)) &&
+    (!scopeFilter || (t.fm.tags || []).includes(scopeFilter)) &&
+    (!kindFilter || t.fm.kind === kindFilter));
+  $('board').innerHTML = COLS.map((col) => {
+    const items = visible.filter((t) => t.fm.status === col);
+    return `<div class="col col-${col}">
+      <div class="colh"><span class="name">${col}</span><span class="count">${items.length}</span></div>
+      ${items.map((t) => {
+        const updated = typeof t.fm.updated === 'string' ? new Date(t.fm.updated) : null;
+        const ageMs = updated && Number.isFinite(updated.getTime()) ? Date.now() - updated.getTime() : NaN;
+        const days = Number.isFinite(ageMs) && ageMs >= 0 ? Math.floor(ageMs / 864e5) : null;
+        const stale = ['active', 'waiting', 'review', 'landing', 'blocked'].includes(t.fm.status) && days > STALE_DAYS;
+        const landedShas = state.landed && Array.isArray(state.landed[t.id]) ? state.landed[t.id] : [];
+        const closeDecision = state.landed && state.landed.decisions && state.landed.decisions[t.id];
+        const landedTitle = [
+          ...landedShas.map((item) => `${item.sha} → origin/${item.branch}`),
+          ...(closeDecision ? [`would close: ${closeDecision.reason}`] : []),
+        ].join('\n');
+        return `
+        <div class="card col-${col}" data-id="${esc(t.id)}">
+          <div class="t">${esc(t.fm.title)}</div>
+          <div class="meta">
+            ${t.fm.kind && t.fm.kind !== 'task' ? `<span>[${esc(t.fm.kind)}]</span>` : ''}
+            ${(t.fm.tags || []).map((x) => `<span class="tag">#${esc(x)}</span>`).join('')}
+            ${(t.fm.depends_on || []).length ? `<span>waits on: ${esc(t.fm.depends_on.join(', '))}</span>` : ''}
+            ${landedShas.length || closeDecision ? `<span class="landed-badge" title="${esc(landedTitle)}">landed${closeDecision ? ' · would close' : ''}</span>` : ''}
+            ${t.fm.project ? `<span>${esc(projName(t.fm.project))}</span>` : ''}
+            ${t.overdue ? `<span class="overdue">⏰ ${esc(t.fm.check_after.replace('T', ' '))}</span>` : ''}
+            ${stale ? `<span class="stale">⏳ ${days}d</span>` : ''}
+            ${liveTaskIds.has(t.id) ? '<span class="live">● live</span>' : ''}
+          </div>
+          ${t.lastLog ? `<div class="last">${esc(t.lastLog)}</div>` : ''}
+          ${(() => { const r = runFor(t.id); return r && r.status === 'running'
+            ? `<div class="runline"><span class="spin"></span><span>${esc(r.lastText || 'agent starting…')}</span></div>` : ''; })()}
+        </div>`;
+      }).join('') || '<div class="empty">—</div>'}
+    </div>`;
+  }).join('');
+}
+
+function loadTagSummary(tag) {
+  fetch(`/api/tagsummary?tag=${encodeURIComponent(tag)}`).then((r) => {
+    if (!r.ok) throw new Error(`request failed (${r.status})`);
+    return r.json();
+  }).then((j) => {
+    if (tagFilter !== tag) return;
+    tagSummary = j && j.text ? j.text : null;
+    render();
+  }).catch(() => {
+    if (tagFilter !== tag) return;
+    tagSummary = null;
+    render();
+  });
+}
+
+function toggleTag(t) {
+  tagFilter = tagFilter === t ? null : t;
+  tagSummary = null;
+  render();
+  if (tagFilter) loadTagSummary(tagFilter);
+}
+
+function toggleKind(kind) {
+  kindFilter = kindFilter === kind ? null : kind;
+  if (kindFilter) localStorage.keepKind = kindFilter;
+  else localStorage.removeItem('keepKind');
+  render();
+}
+
+function toggleScope(scope) {
+  scopeFilter = scopeFilter === scope ? null : scope;
+  if (scopeFilter) localStorage.keepScope = scopeFilter;
+  else localStorage.removeItem('keepScope');
+  render();
+}
+
+// delegated listeners: values live in data attributes, never in generated JS
+$('filters').addEventListener('click', (e) => {
+  const chip = e.target.closest('.chip');
+  if (!chip) return;
+  if (chip.dataset.scope) toggleScope(chip.dataset.scope);
+  else if (chip.dataset.kind) toggleKind(chip.dataset.kind);
+  else if (chip.dataset.tag) toggleTag(chip.dataset.tag);
+});
+$('board').addEventListener('click', (e) => {
+  const card = e.target.closest('.card');
+  if (card) openTask(card.dataset.id);
+});
+$('now').addEventListener('click', (e) => {
+  const card = e.target.closest('.sess');
+  if (card) openSession(card.dataset.sid);
+});
+$('attention').addEventListener('click', async (e) => {
+  const maxButton = e.target.closest('[data-attn-max]');
+  if (maxButton) {
+    setAttentionMax(!attentionMax);
+    return;
+  }
+
+  const viewButton = e.target.closest('[data-attn-view]');
+  if (viewButton) {
+    focusPinned = null;
+    attentionView = viewButton.dataset.attnView === 'list' ? 'list' : 'focus';
+    localStorage.keepAttnView = attentionView;
+    renderAttention();
+    return;
+  }
+
+  const focusAction = e.target.closest('[data-action]');
+  if (focusAction) {
+    const action = focusAction.dataset.action;
+    if (action === 'tail') {
+      const card = focusAction.closest('.focus-card');
+      const item = card && focusPinned && focusPinned.key === card.dataset.key ? focusPinned.item : null;
+      if (!card || !item || !item.sessionId) { toast('item is no longer available'); return; }
+      const existing = card.querySelector('.focus-conversation');
+      if (existing) {
+        existing.remove();
+        focusAction.textContent = 'Recent conversation';
+        return;
+      }
+      focusAction.disabled = true;
+      focusAction.textContent = 'Loading…';
+      try {
+        const response = await fetch(`/api/sessiontail?id=${encodeURIComponent(item.sessionId)}`);
+        let result;
+        try { result = await response.json(); } catch { result = {}; }
+        if (!response.ok) throw new Error(result.error || `request failed (${response.status})`);
+        card.insertAdjacentHTML('beforeend', `<div class="focus-conversation">${esc(result.text || '')}</div>`);
+        focusAction.textContent = 'Hide conversation';
+      } catch (err) {
+        focusAction.textContent = 'Recent conversation';
+        toast(String(err.message || 'request failed').slice(0, 300));
+      } finally {
+        if (focusAction.isConnected) focusAction.disabled = false;
+      }
+      return;
+    }
+    e.stopPropagation();
+    if (focusAction.dataset.action === 'unsnooze') {
+      focusPinned = null;
+      localStorage.removeItem('keepAttnSnooze');
+      renderAttention();
+      return;
+    }
+    const card = focusAction.closest('.focus-card');
+    const row = focusAction.closest('.attention-row');
+    const container = card || row;
+    const item = card
+      ? (focusPinned && focusPinned.key === card.dataset.key ? focusPinned.item : null)
+      : container && (state.attention || []).find((candidate) => attentionItemKey(candidate) === container.dataset.key);
+    if (!item) { toast('item is no longer available'); return; }
+    if (action === 'ack') {
+      const actionButtons = card ? [...card.querySelectorAll('.focus-action')] : [focusAction];
+      for (const button of actionButtons) button.disabled = true;
+      try {
+        const body = { kind: item.kind, since: item.since };
+        if (item.id) body.id = item.id;
+        else if (item.sessionId) body.sessionId = item.sessionId;
+        else body.taskId = item.taskId;
+        await post('/api/ack', body);
+        focusPinned = null;
+        toast('done for now');
+        refresh();
+      } catch (err) {
+        toast(err.message);
+      } finally {
+        for (const button of actionButtons) {
+          if (button.isConnected) button.disabled = false;
+        }
+      }
+      return;
+    }
+    if (action === 'skip') {
+      snoozeAttentionItem(item);
+      focusPinned = null;
+      renderAttention();
+      return;
+    }
+    if (action === 'open-task') {
+      if (item.taskId) openTask(item.taskId);
+      return;
+    }
+
+    if (!card) return;
+    const errorBox = card.querySelector('.focus-error');
+    errorBox.style.display = 'none';
+    const actionButtons = [...card.querySelectorAll('.focus-action')];
+    for (const button of actionButtons) button.disabled = true;
+    try {
+      if (action === 'codex-approval') {
+        const approval = focusAction.dataset.approval;
+        if (!['yes', 'always', 'no'].includes(approval)) throw new Error('approval is no longer available');
+        await post('/api/answer', { sessionId: item.sessionId, approval });
+        focusPinned = null;
+        toast(approval === 'no' ? 'denied' : 'approved');
+        refresh();
+      } else if (action === 'answer') {
+        const option = Number(focusAction.dataset.opt);
+        const label = Array.isArray(item.options) ? item.options[option - 1] : null;
+        if (!label) throw new Error('question is no longer available');
+        await post('/api/answer', { sessionId: item.sessionId, option, label });
+        focusPinned = null;
+        toast('answered');
+        refresh();
+      } else if (action === 'send') {
+        const input = card.querySelector('.focus-reply-input');
+        if (!input || !input.value.trim()) return;
+        await post('/api/send', { sessionId: item.sessionId, text: input.value });
+        input.value = '';
+        input.blur();
+        focusPinned = null;
+        toast('sent');
+        refresh();
+      } else if (action === 'open-session') {
+        const opened = await post('/api/open', { sessionId: item.sessionId });
+        toast(opened.pane ? `session is in ${opened.pane}` : 'session opened');
+      } else if (action === 'mark-done') {
+        await post('/api/checkin', { id: item.taskId, message: 'Marked done from the focus card', status: 'done' });
+        focusPinned = null;
+        toast('marked done');
+        refresh();
+      }
+    } catch (err) {
+      const reason = String(err.message || 'request failed').slice(0, 300);
+      const tail = String(err.data && err.data.screenTail || '').slice(-600);
+      errorBox.innerHTML = `<div>${esc(reason)}</div>${tail ? `<pre>${esc(tail)}</pre>` : ''}`;
+      errorBox.style.display = '';
+      toast(reason);
+    } finally {
+      for (const button of actionButtons) {
+        if (button.isConnected) button.disabled = false;
+      }
+    }
+    return;
+  }
+
+  const approvalButton = e.target.closest('[data-approval]');
+  if (approvalButton) {
+    e.stopPropagation();
+    const row = approvalButton.closest('.attention-row');
+    const approval = approvalButton.dataset.approval;
+    const item = row && (state.attention || []).find((candidate) =>
+      candidate.kind === 'permission' && candidate.codex && attentionItemKey(candidate) === row.dataset.key);
+    if (!item || !['yes', 'always', 'no'].includes(approval)) {
+      toast('approval is no longer available');
+      return;
+    }
+    const buttons = [...row.querySelectorAll('[data-approval]')];
+    const errorBox = row.querySelector('.attention-action-error');
+    for (const button of buttons) button.disabled = true;
+    if (errorBox) errorBox.style.display = 'none';
+    try {
+      await post('/api/answer', { sessionId: item.sessionId, approval });
+      toast(approval === 'no' ? 'denied' : 'approved');
+      refresh();
+    } catch (err) {
+      const reason = String(err.message || 'request failed').slice(0, 300);
+      const tail = String(err.data && err.data.screenTail || '').slice(-600);
+      if (errorBox) {
+        errorBox.innerHTML = `<div>${esc(reason)}</div>${tail ? `<pre>${esc(tail)}</pre>` : ''}`;
+        errorBox.style.display = '';
+      }
+      toast(reason);
+    } finally {
+      for (const button of buttons) {
+        if (button.isConnected) button.disabled = false;
+      }
+    }
+    return;
+  }
+
+  const option = e.target.closest('.attention-option');
+  if (option) {
+    e.stopPropagation();
+    const row = option.closest('.attention-row');
+    if (!row || !row.dataset.sid) return;
+    const index = Number(option.dataset.opt);
+    const item = (state.attention || []).find((i) => i.kind === 'question' && i.sessionId === row.dataset.sid);
+    const label = item && Array.isArray(item.options) ? item.options[index - 1] : null;
+    if (!label) { toast('question is no longer available'); return; }
+    option.disabled = true;
+    try {
+      await post('/api/answer', {
+        sessionId: row.dataset.sid,
+        option: index,
+        label,
+      });
+      toast('answered');
+      refresh();
+    } catch (err) {
+      toast(err.message);
+      option.disabled = false;
+    }
+    return;
+  }
+  const row = e.target.closest('.attention-row');
+  if (!row) return;
+  if (row.dataset.sid) openSession(row.dataset.sid);
+  else if (row.dataset.id) openTask(row.dataset.id);
+});
+$('attention').addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' || !e.target.matches('.focus-reply-input')) return;
+  e.preventDefault();
+  const card = e.target.closest('.focus-card');
+  const send = card && card.querySelector('[data-action="send"]');
+  if (send && !send.disabled) send.click();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && document.body.classList.contains('attn-max')) {
+    e.preventDefault();
+    setAttentionMax(false);
+    return;
+  }
+  if (attentionView !== 'focus' || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (document.activeElement && document.activeElement.matches('input, textarea')) return;
+  const card = $('attention').querySelector('.focus-card');
+  if (!card) return;
+  let button = null;
+  if (/^[1-9]$/.test(e.key)) button = card.querySelector(`[data-action="answer"][data-opt="${e.key}"]`);
+  else if (e.key.toLowerCase() === 'n' || e.key.toLowerCase() === 'j') button = card.querySelector('[data-action="skip"]');
+  else if (e.key.toLowerCase() === 'd') button = card.querySelector('[data-action="ack"]');
+  if (button && !button.disabled) { e.preventDefault(); button.click(); }
+});
+$('restoreList').addEventListener('click', (e) => {
+  const cmd = e.target.closest('.cmd');
+  if (cmd) { navigator.clipboard.writeText(cmd.dataset.cmd); toast('copied'); }
+});
+$('standupLinks').addEventListener('click', (e) => {
+  const link = e.target.closest('.standup-link');
+  if (link) openTask(link.dataset.id);
+});
+
+// web notifications: fire when the tab is hidden and something changed state
+let notifPrev = null;
+const notifOn = () => localStorage.keepNotif === '1';
+function renderNotifBtn() {
+  $('notifBtn').style.opacity = notifOn() && Notification.permission === 'granted' ? '1' : '.45';
+}
+function maybeNotify() {
+  const cur = {
+    runs: new Map((state.runs || []).map((r) => [r.id, r.status])),
+    overdue: new Set(state.tasks.filter((t) => t.overdue).map((t) => t.id)),
+    review: new Set(state.tasks.filter((t) => t.fm.status === 'review').map((t) => t.id)),
+  };
+  if (notifPrev && notifOn() && document.hidden && Notification.permission === 'granted') {
+    for (const [id, st] of cur.runs) {
+      const old = notifPrev.runs.get(id);
+      if (old === 'running' && st !== 'running') new Notification(`keep — run ${st}`, { body: id });
+    }
+    for (const id of cur.overdue) if (!notifPrev.overdue.has(id)) new Notification('keep — check overdue', { body: id });
+    for (const id of cur.review) if (!notifPrev.review.has(id)) new Notification('keep — needs your review', { body: id });
+  }
+  notifPrev = cur;
+}
+$('notifBtn').addEventListener('click', async () => {
+  if (notifOn()) {
+    localStorage.keepNotif = '0';
+    toast('notifications off');
+  } else {
+    const p = await Notification.requestPermission();
+    if (p === 'granted') { localStorage.keepNotif = '1'; toast('notifications on'); }
+    else toast('notification permission denied');
+  }
+  renderNotifBtn();
+});
+renderNotifBtn();
+
+$('addBtn').addEventListener('click', () => $('addDlg').showModal());
+$('afSubmit').addEventListener('click', async () => {
+  try {
+    const tags = $('afTags').value.split(/\s+/).map((s) => s.replace(/^#/, '')).filter(Boolean);
+    await post('/api/add', {
+      title: $('afTitle').value, kind: $('afKind').value, status: $('afStatus').value,
+      tags, project: $('afProject').value || undefined,
+      checkAfter: $('afCheckAfter').value || undefined, check: $('afCheck').value || undefined,
+      note: $('afNote').value || undefined,
+    });
+    $('addDlg').close();
+    for (const f of ['afTitle', 'afTags', 'afProject', 'afCheckAfter', 'afCheck', 'afNote']) $(f).value = '';
+    toast('task added');
+    refresh();
+  } catch (e) { toast(e.message); }
+});
+
+function openTask(id) {
+  const t = state.tasks.find((x) => x.id === id);
+  if (!t) return;
+  openTaskId = id;
+  $('detail').dataset.sessionId = '';
+  const s = (t.fm.sessions || []).slice(-1)[0];
+  const resume = s ? `${t.fm.project ? `cd ${t.fm.project} && ` : ''}${s.agent === 'codex' ? 'codex resume' : 'claude --resume'} ${s.id}` : '';
+  $('detail').innerHTML = `
+    <button class="close" onclick="detail.close()">✕</button>
+    <h3>${esc(t.fm.title)}</h3>
+    <div class="sub">${esc(t.id)} · ${esc(t.fm.status)}${t.fm.kind !== 'task' ? ` · ${esc(t.fm.kind)}` : ''}${t.fm.project ? ` · ${esc(t.fm.project)}` : ''}${t.fm.check_after ? ` · check after ${esc(t.fm.check_after.replace('T', ' '))}` : ''}${(t.fm.depends_on || []).length ? ` · waits on ${esc(t.fm.depends_on.join(', '))}` : ''}</div>
+    ${experimentChip(t.fm.experiment_id)}
+    <div class="actions">${resume ? `<div class="resume" title="click to copy" onclick="navigator.clipboard.writeText(this.textContent)">${esc(resume)}</div>` : ''}${sessionOpenButton(s ? { sessionId: s.id } : { taskId: t.id, fresh: true })}</div>
+    <div id="taskSummary" class="md summary-card"><span class="empty">summarizing…</span></div>
+    ${t.fm.check ? `<details class="recipe"><summary>Check recipe</summary><pre>${esc(t.fm.check)}</pre></details>` : ''}
+    <div class="actions">
+      <textarea id="ciMsg" placeholder="Check in: state + next step"></textarea>
+    </div>
+    <div class="actions">
+      <select id="ciStatus">
+        <option value="">keep status: ${esc(t.fm.status)}</option>
+        ${COLS.concat('done').map((c) => `<option value="${c}">${c}</option>`).join('')}
+      </select>
+      <button class="btn" id="ciSend" title="Save your note above as a check-in on this task (and change status if you picked one). You are writing this — no agent runs.">Check in</button>
+      <span class="spacer" style="flex:1"></span>
+      ${t.fm.check ? '<button class="btn" id="runCheck" title="Spawn an agent to run this task&apos;s check recipe now — read-only verification (e.g. is it shipped?). The verdict lands as a check-in.">Run check now</button>' : ''}
+      ${t.fm.project ? '<button class="btn" id="runTask" title="Spawn an agent to actually do this task in its project. It makes changes; the diff lands in review for you to inspect.">Run agent</button>' : ''}
+    </div>
+    ${t.fm.project ? '<div class="actions"><input type="text" id="runExtra" style="flex:1" placeholder="Optional instructions for the agent run (default: work from the task log)"></div>' : ''}
+    <div id="runArea"></div>
+    <div class="md">${md(t.body || '')}</div>`;
+
+  $('ciSend').addEventListener('click', async () => {
+    try {
+      await post('/api/checkin', { id, message: $('ciMsg').value, status: $('ciStatus').value || undefined });
+      $('detail').close();
+      toast('checked in');
+      refresh();
+    } catch (e) { toast(e.message); }
+  });
+  if ($('runCheck')) $('runCheck').addEventListener('click', async () => {
+    try { await post('/api/run', { id, kind: 'check' }); toast('check run started'); refresh(); }
+    catch (e) { toast(e.message); }
+  });
+  if ($('runTask')) $('runTask').addEventListener('click', async () => {
+    try { await post('/api/run', { id, kind: 'task', prompt: $('runExtra').value || undefined }); toast('agent run started'); refresh(); }
+    catch (e) { toast(e.message); }
+  });
+
+  renderRunArea(id);
+  $('detail').showModal();
+  fetch(`/api/tasksummary?id=${encodeURIComponent(id)}`).then((r) => {
+    if (!r.ok) throw new Error(`request failed (${r.status})`);
+    return r.json();
+  }).then((j) => {
+    const box = $('taskSummary');
+    if (!box || openTaskId !== id) return;
+    if (j.tooShort) box.style.display = 'none';
+    else if (j.text) box.innerHTML = `<h2>Where this stands</h2>${md(j.text)}`;
+    else box.innerHTML = '<span class="empty">summarizing…</span>';
+  }).catch(() => {
+    const box = $('taskSummary');
+    if (box && openTaskId === id) box.style.display = 'none';
+  });
+}
+
+function openSession(id) {
+  const s = (state.sessions || []).find((x) => x.id === id);
+  if (!s) return;
+  openTaskId = null;
+  $('detail').dataset.sessionId = id;
+  const isCodex = s.kind === 'codex';
+  const cmd = `${s.project ? `cd ${s.project} && ` : ''}${isCodex ? 'codex resume' : 'claude --resume'} ${s.id}`;
+  $('detail').innerHTML = `
+    <button class="close" onclick="detail.close()">✕</button>
+    <h3>${esc(s.title || s.lastUser || 'Coding session')}</h3>
+    <div class="sub">${esc(s.project || 'unknown project')}</div>
+    ${isCodex ? '' : '<div id="sessionSummary" class="md summary-card"><span class="empty">summarizing…</span></div>'}
+    ${s.lastAssistant ? `<div class="md"><h2>Last assistant update</h2><div class="runmsg">${esc(s.lastAssistant)}</div></div>` : ''}
+    <div class="actions session-send">
+      <input type="text" id="sessionMessage" maxlength="2000" placeholder="Message this session">
+      <button type="button" class="btn" id="sessionSend" title="Types this into the running host pane, as if you typed it in the terminal, and presses Enter.">Send to session</button>
+      <button type="button" class="btn quiet" id="sessionFocus">Focus session</button>
+    </div>
+    <div id="sessionSendError" class="session-error" style="display:none"></div>
+    <div class="actions"><div class="resume" title="click to copy" onclick="navigator.clipboard.writeText(this.textContent)">${esc(cmd)}</div>${sessionOpenButton({ sessionId: s.id })}</div>`;
+  const send = async () => {
+    const input = $('sessionMessage');
+    const button = $('sessionSend');
+    const errorBox = $('sessionSendError');
+    if (!input || !button || button.disabled || !input.value.trim()) return;
+    button.disabled = true;
+    errorBox.style.display = 'none';
+    try {
+      await post('/api/send', { sessionId: id, text: input.value });
+      input.value = '';
+      toast('sent');
+    } catch (e) {
+      const reason = String(e.message || 'request failed').slice(0, 300);
+      const tail = String(e.data && e.data.screenTail || '').slice(-600);
+      errorBox.innerHTML = `<div>${esc(reason)}</div>${tail ? `<pre>${esc(tail)}</pre>` : ''}`;
+      errorBox.style.display = '';
+      toast(reason);
+    } finally {
+      button.disabled = false;
+    }
+  };
+  $('sessionSend').addEventListener('click', send);
+  $('sessionMessage').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); send(); }
+  });
+  $('sessionFocus').addEventListener('click', async () => {
+    const button = $('sessionFocus');
+    if (!button || button.disabled) return;
+    button.disabled = true;
+    try {
+      const opened = await post('/api/open', { sessionId: id });
+      toast(opened.pane ? `session is in ${opened.pane}` : 'session opened');
+    } catch (e) {
+      const errorBox = $('sessionSendError');
+      const reason = String(e.message || 'request failed').slice(0, 300);
+      const tail = String(e.data && e.data.screenTail || '').slice(-600);
+      errorBox.innerHTML = `<div>${esc(reason)}</div>${tail ? `<pre>${esc(tail)}</pre>` : ''}`;
+      errorBox.style.display = '';
+      toast(reason);
+    } finally {
+      button.disabled = false;
+    }
+  });
+  $('detail').showModal();
+  if (isCodex) return;
+  fetch(`/api/sessionsummary?id=${encodeURIComponent(id)}`).then((r) => {
+    if (!r.ok) throw new Error(`request failed (${r.status})`);
+    return r.json();
+  }).then((j) => {
+    const box = $('sessionSummary');
+    if (!box || $('detail').dataset.sessionId !== id) return;
+    box.innerHTML = j.text ? md(j.text) : '<span class="empty">summarizing…</span>';
+  }).catch(() => {
+    const box = $('sessionSummary');
+    if (box && $('detail').dataset.sessionId === id) box.style.display = 'none';
+  });
+}
+
+async function renderRunArea(taskId) {
+  const area = $('runArea');
+  if (!area) return;
+  const r = runFor(taskId);
+  if (!r) { area.innerHTML = ''; return; }
+  const dur = Math.round(((r.endedAt || Date.now()) - r.startedAt) / 60e3);
+  area.innerHTML = `
+    <div class="runline">
+      ${r.status === 'running' ? '<span class="spin"></span>' : ''}
+      <b>${esc(r.kind)} run — ${esc(r.status)}</b>
+      <span>${dur}m${r.costUsd != null ? ` · $${r.costUsd.toFixed(2)}` : ''}</span>
+      ${r.status === 'running' ? `<button class="btn quiet" id="stopRun" title="Stop this running agent (kills the process; the task is marked blocked)">Stop</button>` : ''}
+      ${r.diffStat ? `<button class="btn quiet" id="viewDiff" title="Show the file changes this agent run made">View diff</button>` : ''}
+    </div>
+    <div class="runmsg">${esc(r.status === 'running' ? (r.lastText || 'starting…') : (r.resultText || r.lastText || ''))}</div>
+    <div id="diffHolder"></div>`;
+  if ($('stopRun')) $('stopRun').addEventListener('click', async () => {
+    try { await post('/api/stop', { id: taskId }); toast('stopping run'); } catch (e) { toast(e.message); }
+  });
+  if ($('viewDiff')) $('viewDiff').addEventListener('click', async () => {
+    try {
+      const resp = await fetch(`/api/rundiff?id=${encodeURIComponent(r.id)}`);
+      const j = await resp.json();
+      $('diffHolder').innerHTML = `<div class="diffpre">${esc(j.diff || j.error || '')}</div>`;
+    } catch (e) { toast(e.message); }
+  });
+}
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/state');
+    state = await r.json();
+    $('stale').style.display = 'none';
+    render();
+    maybeNotify();
+    // keep the run area of an open modal live without clobbering the check-in form
+    if ($('detail').open && openTaskId) renderRunArea(openTaskId);
+  } catch {
+    $('stale').style.display = '';
+  }
+}
+
+function connect() {
+  const es = new EventSource('/api/events');
+  es.onmessage = refresh;
+  es.onerror = () => { $('stale').style.display = ''; };
+}
+
+refresh();
+connect();
+setInterval(refresh, 30000);
+</script>
+</body>
+</html>
