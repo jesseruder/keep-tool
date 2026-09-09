@@ -23,12 +23,30 @@ function git(root, args) {
   return execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 }
 
+function canonicalPath(value) {
+  let ancestor = path.resolve(value);
+  const missing = [];
+  while (!fs.existsSync(ancestor)) {
+    const parent = path.dirname(ancestor);
+    if (parent === ancestor) throw new Error(`cannot resolve path: ${value}`);
+    missing.unshift(path.basename(ancestor));
+    ancestor = parent;
+  }
+  return path.join(fs.realpathSync(ancestor), ...missing);
+}
+
+function insideSource(value) {
+  const real = canonicalPath(value);
+  const source = fs.realpathSync(SOURCE);
+  return real === source || real.startsWith(source + path.sep);
+}
+
 function init(args) {
   const opts = options(args, ['--dir']);
-  const root = path.resolve((opts.dir || process.env.KEEP_DIR || path.join(os.homedir(), 'keep')).replace(/^~(?=\/|$)/, os.homedir()));
+  const root = canonicalPath((opts.dir || process.env.KEEP_DIR || path.join(os.homedir(), 'keep')).replace(/^~(?=\/|$)/, os.homedir()));
   const file = config.configFile();
   if (fs.existsSync(file)) throw new Error(`configuration already exists at ${file}; inspect it before initializing another registry`);
-  if (root === SOURCE || root.startsWith(SOURCE + path.sep)) throw new Error('the registry must be outside the application checkout');
+  if (insideSource(root)) throw new Error('the registry must be outside the application checkout');
   if (fs.existsSync(root) && fs.readdirSync(root).length) throw new Error(`directory is not empty: ${root}; existing registries can be selected with KEEP_DIR`);
   // Check identity before creating anything; mutations are real local Git commits.
   for (const key of ['user.name', 'user.email']) {
@@ -141,7 +159,7 @@ function doctor(root) {
     if (!ok && required) failed = true;
   };
   check('Node 22+', () => Number(process.versions.node.split('.')[0]) >= 22);
-  check('Git registry outside application source', () => root !== SOURCE && !root.startsWith(SOURCE + path.sep) && git(root, ['rev-parse', '--show-toplevel']) === fs.realpathSync(root));
+  check('Git registry outside application source', () => !insideSource(root) && git(root, ['rev-parse', '--show-toplevel']) === fs.realpathSync(root));
   check('registry directories', () => ['tasks', 'archive', 'digests'].every((dir) => fs.statSync(path.join(root, dir)).isDirectory()));
   check('Git commit identity', () => git(root, ['config', 'user.name']) && git(root, ['config', 'user.email']));
   check('Claude CLI (reviewer and scheduled checks)', () => spawnSync('claude', ['--version'], { timeout: 10000 }).status === 0);
@@ -153,4 +171,4 @@ function doctor(root) {
   if (failed) process.exitCode = 1;
 }
 
-module.exports = { init, installHooks, service, doctor, mergeHooks, servicePlist, quote };
+module.exports = { init, installHooks, service, doctor, mergeHooks, servicePlist, quote, canonicalPath, insideSource };

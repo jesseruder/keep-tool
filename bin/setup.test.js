@@ -86,3 +86,34 @@ test('public guard rejects forced-in cards and credential-shaped content without
   assert.deepEqual(inspect('bin/credential.js', Buffer.from('ghp_' + 'a'.repeat(36))), ['credential-shaped content']);
   assert.deepEqual(inspect('bin/example.test.js', Buffer.from('const token = "synthetic";')), []);
 });
+
+
+test('source containment resolves symlink ancestors before creating a registry', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-init-symlink-'));
+  const alias = path.join(tmp, 'source-alias');
+  try {
+    fs.symlinkSync(path.resolve(__dirname, '..'), alias);
+    assert.equal(setup.insideSource(path.join(alias, 'web', 'private-registry')), true);
+    const result = spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'init', '--dir', path.join(alias, 'web', 'private-registry')], {
+      env: { ...process.env, KEEP_CONFIG: path.join(tmp, 'config.json') }, encoding: 'utf8',
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /outside the application checkout/);
+    assert.equal(fs.existsSync(path.join(alias, 'web', 'private-registry')), false);
+    for (const name of ['web/private/.keep/token', 'docs/backup/tasks/a.md', 'web/nested/reviews/day.md', 'bin/nested/watch/slack.json']) {
+      assert.deepEqual(inspect(name, Buffer.from('synthetic')), ['excluded path']);
+    }
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+test('configuration paths embedded in hooks and services are absolute', () => {
+  assert.equal(config.configFile({ KEEP_CONFIG: './settings.json' }), path.resolve('settings.json'));
+  const prior = process.env.KEEP_CONFIG;
+  try {
+    process.env.KEEP_CONFIG = './settings.json';
+    assert.ok(setup.servicePlist('serve', '/tmp/registry').includes(path.resolve('settings.json')));
+  } finally {
+    if (prior === undefined) delete process.env.KEEP_CONFIG;
+    else process.env.KEEP_CONFIG = prior;
+  }
+});

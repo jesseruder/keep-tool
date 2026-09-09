@@ -5,7 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 
 function configFile(env = process.env) {
-  return env.KEEP_CONFIG || path.join(os.homedir(), '.config', 'keep', 'config.json');
+  return path.resolve((env.KEEP_CONFIG || path.join(os.homedir(), '.config', 'keep', 'config.json')).replace(/^~(?=\/|$)/, os.homedir()));
 }
 
 function load(env = process.env) {
