@@ -103,7 +103,11 @@ async function main() {
     await capture('watch.png');
   } finally {
     ws?.close();
-    if (chrome && chrome.exitCode === null) { chrome.kill(); await new Promise((resolve) => chrome.once('exit', resolve)); }
+    if (chrome && chrome.pid && chrome.exitCode === null && chrome.signalCode === null) {
+      const exited = new Promise((resolve) => chrome.once('exit', resolve));
+      chrome.kill();
+      await exited;
+    }
     for (const socket of wss.clients) socket.terminate();
     for (const client of eventClients) client.end();
     await new Promise((resolve) => server.close(resolve));
