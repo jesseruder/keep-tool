@@ -17,7 +17,7 @@ test('waiting-session nudges use guarded delivery and retain refusal gates', asy
   fs.mkdirSync(reviewDir, { recursive: true });
   fs.mkdirSync(path.join(root, 'watch'));
   fs.writeFileSync(path.join(root, 'watch/nudge.json'), JSON.stringify({ live: true }));
-  const key = '0123456789abcdef';
+  const key = '0123456789abcdef'; // gitleaks:allow — synthetic finding ID, not a credential
   fs.writeFileSync(path.join(reviewDir, 'fixture.json'), JSON.stringify({
     version: 1, findings: { [key]: { kind: 'stale-checkin' } },
   }));

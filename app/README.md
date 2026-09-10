@@ -38,7 +38,14 @@ Build identity is local. Create `~/.config/keep/mobile.json` (outside this repo)
 `KEEP_MOBILE_CONFIG` selects another file. `KEEP_EXPO_OWNER`, `KEEP_EXPO_PROJECT_ID`,
 `KEEP_ANDROID_PACKAGE`, and `KEEP_IOS_BUNDLE_IDENTIFIER` override individual values.
 Without overrides the Android identifier is `dev.keeptool.mobile`, with no linked
-Expo account or EAS project. Configure your own EAS project before cloud builds.
+Expo account or EAS project. Configure your own EAS project before cloud builds. EAS runs native prebuild remotely,
+where your local config file is unavailable. Add the same identity values as EAS
+project environment variables in the `preview` environment (the included profile
+selects it): `KEEP_EXPO_OWNER`, `KEEP_EXPO_PROJECT_ID`, `KEEP_ANDROID_PACKAGE`, and,
+for iOS, `KEEP_IOS_BUNDLE_IDENTIFIER`. Set them through the EAS dashboard or
+`eas env:create`; see [EAS environment variables](https://docs.expo.dev/eas/environment-variables/).
+Remote builds refuse to proceed without the platform's explicit native identifier,
+so they cannot silently produce an app with the generic default identity.
 Signing keys, Expo state, generated native projects, and dependencies are excluded
 from the public source. The app takes scope rules from your daemon.
 

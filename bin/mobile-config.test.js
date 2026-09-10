@@ -28,3 +28,15 @@ test('mobile identity stays outside source and environment overrides private con
 test('mobile and console use the same scope implementation', () => {
   assert.equal(fs.readFileSync(path.join(__dirname, '../app/src/scope-rules.js'), 'utf8'), fs.readFileSync(path.join(__dirname, '../web/app/shared/scope-rules.js'), 'utf8'));
 });
+test('cloud builds refuse implicit platform identity', () => {
+  const keys = ['EAS_BUILD', 'EAS_BUILD_PLATFORM', 'KEEP_MOBILE_CONFIG', 'KEEP_ANDROID_PACKAGE'];
+  const prior = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+  try {
+    process.env.EAS_BUILD = 'true'; process.env.EAS_BUILD_PLATFORM = 'android';
+    process.env.KEEP_MOBILE_CONFIG = path.join(os.tmpdir(), 'nonexistent-mobile-' + process.pid);
+    delete process.env.KEEP_ANDROID_PACKAGE;
+    assert.throws(() => configure({ config: require('../app/app.json').expo }), /EAS build environment/);
+    process.env.KEEP_ANDROID_PACKAGE = 'test.explicit.keep';
+    assert.equal(configure({ config: require('../app/app.json').expo }).android.package, 'test.explicit.keep');
+  } finally { for (const key of keys) { if (prior[key] === undefined) delete process.env[key]; else process.env[key] = prior[key]; } }
+});

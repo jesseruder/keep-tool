@@ -48,13 +48,13 @@ function projectOf(projectPath = '') {
   const choice = projectChoices[clean];
   const canonical = choice?.path || clean;
   const relative = canonical.replace(/^\/Users\/[^/]+\/|^\/home\/[^/]+\/|^~\//, '');
-  const worktree = relative.match(/^wt\/([^/]+)\/([^/]+)/);
+  const worktree = clean.replace(/^\/Users\/[^/]+\/|^\/home\/[^/]+\/|^~\//, '').match(/^wt\/([^/]+)\/([^/]+)/);
   let key = relative;
-  if (worktree && !choice) key = Object.keys(PROJECTS).find((candidate) => candidate.split('/').pop() === worktree[1]) || worktree[1];
-  const known = Object.hasOwn(PROJECTS, key) ? PROJECTS[key] : null;
+  if (worktree && !choice) key = Object.keys({ ...PROJECTS, ...data.projectCatalog }).find((candidate) => candidate.split('/').pop() === worktree[1]) || worktree[1];
+  const known = data.projectCatalog?.[key] || (Object.hasOwn(PROJECTS, key) ? PROJECTS[key] : null);
   const name = known?.name || relative.split('/').filter(Boolean).pop() || 'Unknown';
   const settings = data.scopes || globalThis.KeepScopeRules.defaults;
-  const scope = globalThis.KeepScopeRules.scopeForProject(clean, settings, settings.home) || settings.default;
+  const scope = globalThis.KeepScopeRules.scopeForProject(choice ? canonical : (worktree && known ? '~/' + key : clean), settings, settings.home) || settings.default;
   return { key, path: clean, name, scope, h: known?.h ?? choice?.h ?? hashHue(canonical), icon: known?.icon || choice?.icon, wt: worktree?.[2] || null };
 }
 

@@ -55,3 +55,20 @@ test('owner and legacy questions are excluded from reviewer timeouts', () => {
   assert.deepEqual(jesseQuestions(entries).map((q) => q.id).sort(), ['jesse', 'owner']);
   assert.deepEqual(questionsDue(entries, Date.now()).expire, ['reviewer']);
 });
+
+test('console preserves custom project names and worktree scope after canonicalization', () => {
+  const fs = require('node:fs'), path = require('node:path'), vm = require('node:vm');
+  const source = fs.readFileSync(path.join(__dirname, '../web/app/app.js'), 'utf8');
+  const fn = source.slice(source.indexOf('function projectOf('), source.indexOf('\nlet restoredRunning'));
+  const context = vm.createContext({
+    KeepScopeRules: rules, PROJECTS: {}, hashHue: () => 50,
+    data: { scopes: { ...rules.defaults, home: '/home/demo' }, projectCatalog: { 'work/repo': { name: 'Custom display', h: 20 } } },
+    projectChoices: { '/home/demo/wt/repo/fix': { path: '/home/demo/work/repo', icon: 'folder' } },
+  });
+  vm.runInContext(fn, context);
+  const result = context.projectOf('/home/demo/wt/repo/fix');
+  assert.equal(result.name, 'Custom display');
+  assert.equal(result.scope, 'work');
+  assert.equal(result.wt, 'fix');
+  assert.equal(result.key, 'work/repo');
+});

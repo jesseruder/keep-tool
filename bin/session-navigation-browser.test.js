@@ -318,12 +318,15 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     }
     await wait("!document.querySelector('.wpane[data-pane=shell2]')");
     assert.ok(!layouts[0].ids.includes('shell2'), 'ordinary shell exit still removes its pin');
-    await evaluate("document.querySelector('[data-mode=triage]').click(); document.querySelector('#qlist [data-key=\"pinned:a\"]').click(); document.querySelector('#stage [data-restart=idle]').click()");
+    await evaluate("document.querySelector('[data-mode=triage]').click(); document.querySelector('#qlist [data-key=\"pinned:a\"]').click(); true");
+    assert.equal(await evaluate("document.querySelector('#stage [data-restart=idle]') === null"), true);
+    state.restarts = [{ sessionId: 'a', pane: 'pa', status: 'queued', reason: 'Wait until no longer being viewed' }];
+    for (const client of eventClients) client.write('data: changed\n\n');
     await wait("document.querySelector('#stage [data-restart=cancel]')");
     assert.ok(await evaluate("document.querySelector('#stage .restart-reason').textContent.includes('no longer being viewed')"), 'queued blocker is visible without a tooltip');
-    assert.ok(posts.includes('/api/restart-session'));
     await evaluate("document.querySelector('#stage [data-restart=cancel]').click()");
-    await wait("document.querySelector('#stage [data-restart=idle]')");
+    await wait("!document.querySelector('#stage [data-restart=cancel]')");
+    assert.ok(posts.includes('/api/restart-session'));
     await evaluate("document.querySelector('#stage .xterm-helper-textarea').focus(); window.preRestartTerminal = window.keepConsole.terminals.get('pa').terminal; true");
     const agentMeta = panes[0].meta;
     const agentTitle = sessions[0].title;

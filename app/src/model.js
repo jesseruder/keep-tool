@@ -48,13 +48,13 @@ export function projectFor(projectPath = '') {
   const relative = clean.replace(/^\/Users\/[^/]+\/|^\/home\/[^/]+\/|^~\//, '');
   const worktree = relative.match(/^wt\/([^/]+)\/([^/]+)/);
   let key = relative;
-  if (worktree) key = Object.keys(PROJECTS).find((candidate) => candidate.split('/').pop() === worktree[1]) || worktree[1];
+  if (worktree) key = Object.keys({ ...PROJECTS, ...projectCatalog }).find((candidate) => candidate.split('/').pop() === worktree[1]) || worktree[1];
   const known = projectCatalog[key] || PROJECTS[key];
   return {
     key,
     path: clean,
     name: known?.name || relative.split('/').filter(Boolean).pop() || 'Unknown',
-    scope: scopeRules.scopeForProject(clean, scopeSettings, scopeSettings.home) || scopeSettings.default,
+    scope: scopeRules.scopeForProject(worktree && known ? '~/' + key : clean, scopeSettings, scopeSettings.home) || scopeSettings.default,
     h: known?.h ?? hashHue(clean),
     wt: worktree?.[2] || null,
   };

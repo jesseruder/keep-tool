@@ -2303,8 +2303,10 @@ test('wrong-status findings apply only safe done/deferred transitions through no
       await refuse('daemon-down', 'live session registry unavailable');
       sessions = [];
       const questions = path.join(keep.ROOT, '.keep/review/_questions.json');
-      fs.writeFileSync(questions, JSON.stringify([{ task: 'question', to: 'jesse', status: 'open' }]));
-      await refuse('question', 'open question for Jesse');
+      for (const to of ['owner', 'jesse']) {
+        fs.writeFileSync(questions, JSON.stringify([{ task: 'question-' + to, to, status: 'open' }]));
+        await refuse('question-' + to, 'open question for Owner');
+      }
       await refuse('needs', 'open keep needs block', { needs: [{ text: 'Decision', at: '2020-01-01 00:00' }] });
       await refuse('scheduled', 'pending scheduled check', { status: 'waiting', check_after: '2099-01-01', check: 'check it' });
       make('upstream');

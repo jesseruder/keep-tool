@@ -2244,8 +2244,8 @@ function reviewerStatusRefusal(task, opts, prior, finding, sessions, evidence) {
       || entries.some((entry) => Date.parse(entry.heading.slice(0, 16).replace(' ', 'T')) > since)) {
     return 'newer check-in than finding evidence';
   }
-  if (loadQuestions().some((question) => question.to === 'jesse' && question.status === 'open' && question.task === task.id)) {
-    return 'open question for Jesse';
+  if (loadQuestions().some((question) => ['owner', 'jesse'].includes(question.to) && question.status === 'open' && question.task === task.id)) {
+    return 'open question for Owner';
   }
   if ((task.fm.needs || []).some((need) => need?.text)) return 'open keep needs block';
   if (task.fm.status === 'waiting' && task.fm.check_after) return 'pending scheduled check';
