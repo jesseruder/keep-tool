@@ -353,8 +353,9 @@ function renderStage(ctx, active, focusItem, running, pinned) {
   }
   const pinLabel = ctx.isPanePinned(item.pane) ? 'Unpin from Watch' : 'Pin to Watch';
   const closable = hasLivePane && item.sessionId && ['claude', 'codex'].includes(pane.meta?.agent);
+  const dependencyAcknowledged = ctx.setAsideFor(item)?.kind === 'dependency';
   const dependencyWait = session?.activity?.background?.dependencies?.length
-    ? '<button class="btn" data-wait-dependency>Wait for dependency</button>' : '';
+    ? `<button class="btn" data-wait-dependency ${dependencyAcknowledged ? 'disabled' : ''}>${dependencyAcknowledged ? 'Waiting for dependency' : 'Wait for dependency'}</button>` : '';
   const reopen = hasLivePane ? '' : '<button class="btn" data-reopen>Reopen</button>';
   ctx.patchHTML(stage.querySelector('.shead'), `<div class="session-heading"><h2>${ctx.esc(title)}</h2><div class="meta mono">${ctx.projectHTML(item.project || session?.project || '', true)}${item.taskId ? `<span>${ctx.esc(item.taskId)}</span>${ctx.tagsHTML(task)}` : ''}</div>${task ? modelUsageHTML(task.modelUsage) : ''}</div><div class="acts"><button class="btn" data-pin ${item.pane ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}${dependencyWait}${item.sessionId || waitingItem ? '<button class="btn" data-snooze>Snooze 1h</button><button class="btn" data-dismiss><kbd>x</kbd> Dismiss</button>' : ''}${closable ? '<button class="btn" data-close-session>Close</button>' : ''}</div>`);
   const brief = stage.querySelector('.brief');

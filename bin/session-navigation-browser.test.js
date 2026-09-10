@@ -153,10 +153,14 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     await evaluate("document.querySelector('[data-wait-dependency]').click()");
     await wait("document.querySelector('[data-dismiss-toggle]')");
     assert.equal(state.setAside.a.kind, 'dependency');
+    await evaluate("document.querySelector('#qlist [data-key=\"pinned:a\"]').click()");
+    await wait("document.querySelector('[data-wait-dependency]')?.disabled && document.querySelector('[data-wait-dependency]').textContent === 'Waiting for dependency'");
     await evaluate("document.querySelector('[data-dismiss-toggle]').click()");
     await wait("document.querySelector('.qdis')?.textContent.includes('waiting for dependency')");
     await evaluate("document.querySelector('[data-restore=\"a\"]').click()");
     await wait("!document.querySelector('[data-dismiss-toggle]')");
+    await evaluate("document.querySelector('#qlist [data-key=\"running:a\"]').click()");
+    await wait("document.querySelector('[data-wait-dependency]')?.disabled === false && document.querySelector('[data-wait-dependency]').textContent === 'Wait for dependency'");
     delete sessions[0].activity;
     for (const client of eventClients) client.write('data: changed\n\n');
     await wait("!document.querySelector('[data-wait-dependency]')");
