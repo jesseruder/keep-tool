@@ -573,6 +573,7 @@ function commitState(taskId, { status, bundle } = {}) {
   delete state.git.pendingClearsSkipped;
   if (Number.isFinite(state.pendingRunAt)) { state.lastRunAt = state.pendingRunAt; delete state.pendingRunAt; }
   delete state.pendingBundle;
+  delete state.pendingStatusEvidence;
   state.lastReviewedAt = Date.now();
   state.lastReviewedStamp = keep.nowStamp();
   if (status) state.lastStatus = status;
@@ -1276,6 +1277,7 @@ function buildBundle(taskId, opts = {}) {
   const separators = Math.max(0, sections.length - 1) * 2;
   const md = applyBudget(sections, Math.max(0, budgetChars - separators)).join('\n\n');
   state.pendingBundle = bundleId;
+  state.pendingStatusEvidence = { since: state.lastReviewedAt || Date.now(), logHash: statusLogHash(task.body) };
   state.pendingLog = advanceLogWatermark(state.logSeen, logEntriesForReview);
   keep.withLock(() => saveState(state));
   return { md, bundleId, taskId, newBytes, gitMoved, statusChanged, sessions: perSession.length };
@@ -1535,16 +1537,16 @@ function reviewerUsage(opts) {
 // cache-write 1.25x input, cache-read 0.1x, output 5x) and by model-family input
 // price so Haiku digests don't count like Fable judgment. Absolute dollars are
 // approximate; the ratios are what matter for attribution.
-const FAMILY_INPUT_PRICE = { fable: 15, opus: 15, sonnet: 3, haiku: 1 }; // $/Mtok
+const modelBudgets = require('./preferences').modelBudgets;
 
 function modelFamily(model) {
   const m = String(model || '').toLowerCase();
-  for (const family of Object.keys(FAMILY_INPUT_PRICE)) if (m.includes(family)) return family;
+  for (const family of Object.keys(modelBudgets())) if (m.includes(family)) return family;
   return 'other';
 }
 
 function weightedCost(u, family) {
-  const price = FAMILY_INPUT_PRICE[family] || 3;
+  const price = modelBudgets()[family]?.inputPrice || 3;
   return ((u.in || 0) + 1.25 * (u.cc || 0) + 0.1 * (u.cr || 0) + 5 * (u.out || 0)) * price / 1e6;
 }
 
@@ -1954,17 +1956,21 @@ async function nudge(taskId, opts) {
   }
   if (!session) throw new keep.KeepError('session ' + sessionId + ' is not in the live session list');
   if (session.reviewer) throw new keep.KeepError('refusing to nudge the reviewer itself');
-  if (session.state !== 'running' && session.state !== 'idle') {
-    throw new keep.KeepError('session is ' + session.state + ' - only running or idle sessions get nudged (nobody is watching a stale one)');
+  // Activity describes what the session is doing, not whether it can receive
+  // feedback. Scheduled checks and background waits remain live nudge targets;
+  // /api/send still resolves the live pane and checks its prompt before typing.
+  if (!['running', 'idle', 'waiting'].includes(session.state) || session.exited || session.deadMidTurn) {
+    throw new keep.KeepError('session is ' + session.state + ' - only live running, idle, or waiting sessions get nudged');
   }
+  if (session.rateLimit) throw new keep.KeepError('session is waiting on a rate limit - deliver after it resumes');
   if (session.pendingQuestion || session.pendingPlan) {
     throw new keep.KeepError('session is already waiting on Owner (question/plan) - do not pile on');
   }
   if (session.askedProse) {
     throw new keep.KeepError('session ended its turn with a question for Owner - do not pile on');
   }
-  // `waiting` is Claude Code's idle_prompt: the turn ended and Owner has not typed, so a nudge is not piling onto a prompt.
-  if (session.notify && session.notify.type === 'permission') {
+  // A waiting/idle notification is not a human request; real prompts still block.
+  if (session.notify && ['permission', 'question'].includes(session.notify.type)) {
     throw new keep.KeepError('session has a pending ' + session.notify.type + ' prompt - do not pile on');
   }
 
@@ -2195,7 +2201,66 @@ function reviewIdea(title, opts) {
   return options.withinLock ? land() : keep.withLock(land);
 }
 
-function reviewNote(taskId, opts) {
+// Use the daemon's process-backed registry, exactly as keep who does. Transcript
+// recency cannot prove a session is closed. An unavailable registry fails closed.
+async function reviewerSessions() {
+  try {
+    const response = await keep.getKeepApi('/api/state', 3000);
+    if (response.status !== 200) return null;
+    const state = JSON.parse(response.data);
+    return Array.isArray(state.sessions) ? state.sessions : null;
+  } catch { return null; }
+}
+
+function statusLogHash(body) {
+  return crypto.createHash('sha256').update(JSON.stringify(logEntries(body))).digest('hex');
+}
+
+function statusEvidence(taskId) {
+  const state = loadState(taskId);
+  return state.pendingStatusEvidence || {
+    since: state.lastReviewedAt || 0,
+    logHash: statusLogHash(keep.loadTask(taskId).body),
+  };
+}
+
+function reviewerStatusRefusal(task, opts, prior, finding, sessions, evidence) {
+  if (opts.kind !== 'wrong-status') return 'kind is not wrong-status';
+  if (!['done', 'deferred'].includes(opts.suggestStatus)) return 'target is not done or deferred';
+  if (prior?.dismissed) return 'dismissed by Jesse';
+  if (!sessions) return 'live session registry unavailable';
+  const linked = new Set((task.fm.sessions || []).map((session) => session.id));
+  for (const session of sessions) {
+    if (!linked.has(session.id) && session.taskId !== task.id) continue;
+    // runtime is populated by the daemon's shared process/host liveness checks.
+    if (['live', 'external'].includes(session.runtime?.state) || session.alive === true) return 'live linked session';
+    if (!['exited', 'missing'].includes(session.runtime?.state) && !session.exited && session.alive !== false) {
+      return 'linked session liveness unknown';
+    }
+  }
+  const entries = logEntries(task.body);
+  const since = evidence.since || prior?.firstAt || finding.firstAt;
+  if (statusLogHash(task.body) !== evidence.logHash
+      || entries.some((entry) => Date.parse(entry.heading.slice(0, 16).replace(' ', 'T')) > since)) {
+    return 'newer check-in than finding evidence';
+  }
+  if (loadQuestions().some((question) => question.to === 'jesse' && question.status === 'open' && question.task === task.id)) {
+    return 'open question for Jesse';
+  }
+  if ((task.fm.needs || []).some((need) => need?.text)) return 'open keep needs block';
+  if (task.fm.status === 'waiting' && task.fm.check_after) return 'pending scheduled check';
+  if (keep.unresolvedDependencyIds(task).length) return 'unresolved wait-on dependency';
+  return null;
+}
+
+async function reviewNote(taskId, opts) {
+  const evidence = statusEvidence(taskId);
+  const sessions = opts.kind === 'wrong-status' && ['done', 'deferred'].includes(opts.suggestStatus)
+    ? await reviewerSessions() : null;
+  return keep.withLock(() => recordReviewNote(taskId, { ...opts, withinLock: true }, sessions, evidence));
+}
+
+function recordReviewNote(taskId, opts, sessions, evidence) {
   const kind = String(opts.kind || '');
   if (!FINDING_KINDS.includes(kind)) {
     throw new keep.KeepError('--kind must be one of: ' + FINDING_KINDS.join(', '));
@@ -2241,7 +2306,13 @@ function reviewNote(taskId, opts) {
     throw err;
   }
 
-  const reason = opts.force ? null : suppressionReason(prior, task, headSha);
+  // Dismissal is permanent, even with --force. A status suggestion returns a
+  // successful refusal so a batch can continue, without re-posting the finding.
+  if (prior?.dismissed && opts.suggestStatus) {
+    commitState(taskId, { status: task.fm.status, bundle: opts.bundle });
+    return { key, count: prior.count || 1, notApplied: 'dismissed by Jesse', suppressed: true };
+  }
+  const reason = opts.force && !prior?.dismissed ? null : suppressionReason(prior, task, headSha);
   if (reason) {
     // Silence is not the same as unread. Promote the offsets anyway, or every later
     // tick re-reads these same bytes until the 24h suppression expires.
@@ -2272,15 +2343,18 @@ function reviewNote(taskId, opts) {
   const repeat = count > 1 ? '**(' + ordinal(count) + ' time)** ' : '';
   const head = repeat + '**' + kind + '** - ' + tick + clip(subject, 120) + tick + ' - severity ' + severity;
   const body = [head, '', message];
-  // Status belongs to Owner and to the working agent. The reviewer only proposes.
-  if (opts.suggestStatus) body.push('', 'Suggested status: ' + opts.suggestStatus + ' (not applied; the reviewer never changes status)');
+  // Only evidence-backed wrong-status findings can close or defer an unowned card.
+  const refusal = opts.suggestStatus ? reviewerStatusRefusal(task, opts, prior, finding, sessions, evidence) : null;
+  const appliedStatus = opts.suggestStatus && !refusal ? opts.suggestStatus : undefined;
+  if (opts.suggestStatus) body.push('', 'Suggested status: ' + opts.suggestStatus + (appliedStatus ? ' — applied' : ' — not applied: ' + refusal));
+  if (appliedStatus) body.push('', `status ${appliedStatus} applied by reviewer from finding ${key} (wrong-status · ${subject})`);
   body.push('', '-- reviewer ' + reviewerName() + ', finding ' + key);
 
   // The fleet-wide check, the urgency decision, and their bookkeeping are one
   // atomic read-modify-write: two concurrent notes must not both pass the check,
   // and a concurrent tick's meta save must not clobber the reserved announce slot.
-  // withLock is not reentrant, so this must fully complete before checkinTask
-  // (which locks internally). If the check-in then fails, the reservation stands -
+  // The finding caller holds the lock through eligibility and checkinTask.
+  // If the check-in then fails, the reservation stands -
   // a retry under-announces rather than double-announcing.
   // The same anchor already flagged on a DIFFERENT card is one fleet-level problem;
   // raising it once per card is the noise that gets the reviewer ignored.
@@ -2336,6 +2410,8 @@ function reviewNote(taskId, opts) {
   fs.mkdirSync(path.join(keep.ROOT, 'reviews'), { recursive: true });
   keep.checkinTask(taskId, {
     message: body.join('\n'),
+    status: appliedStatus,
+    force: Boolean(appliedStatus), // internal finding only; no CLI guard exemption
     heading: 'review (' + reviewerName() + ')',
     linkSession: false, // must never steal the card's resume slot
     commitLabel: 'review',
@@ -2345,7 +2421,7 @@ function reviewNote(taskId, opts) {
 
   // Re-read and write back only this one finding. Assigning the whole findings map
   // from the copy loaded before the check-in would drop anything written meanwhile.
-  commitState(taskId, { status: task.fm.status, bundle: opts.bundle });
+  commitState(taskId, { status: appliedStatus || task.fm.status, bundle: opts.bundle });
   const after = loadState(taskId);
   after.findings[key] = finding;
   saveState(after);
@@ -2503,7 +2579,7 @@ function validateReviewLand(document) {
   return problems;
 }
 
-function reviewLand(document) {
+async function reviewLand(document) {
   const problems = validateReviewLand(document);
   if (problems.length) {
     const error = new keep.KeepError('review-land validation failed:\n' + problems.map((problem) => '- ' + problem).join('\n'));
@@ -2516,6 +2592,9 @@ function reviewLand(document) {
     ...(document.ideas || []).map((item, index) => ({ type: 'idea', index, item })),
     ...(document.dismiss || []).map((item, index) => ({ type: 'dismiss', index, item })),
   ];
+  const evidence = new Map((document.notes || []).map((item) => [item.id, statusEvidence(item.id)]));
+  const sessions = (document.notes || []).some((item) => item.kind === 'wrong-status' && ['done', 'deferred'].includes(item.suggestStatus))
+    ? await reviewerSessions() : null;
   const results = [];
   const digestLines = [];
   // Acks are collapsed into one line at the end. On 2026-09-04 a tick landed 80
@@ -2538,14 +2617,14 @@ function reviewLand(document) {
           counts.clean += 1;
           detail = 'reviewed with no findings';
         } else if (entry.type === 'note') {
-          const out = reviewNote(item.id, {
+          const out = recordReviewNote(item.id, {
             kind: item.kind, subject: item.subject, severity: item.severity, bundle: item.bundle,
             message: item.message, suggestStatus: item.suggestStatus,
             withinLock: true, commit: false, digestLines,
-          });
+          }, sessions, evidence.get(item.id));
           counts.reviewed += 1;
-          counts.findings += 1;
-          detail = 'finding ' + out.key;
+          if (!out.suppressed) counts.findings += 1;
+          detail = out.notApplied ? 'finding ' + out.key + ' — not applied: ' + out.notApplied : 'finding ' + out.key;
         } else if (entry.type === 'idea') {
           const out = reviewIdea(item.title, {
             message: item.message, project: item.project, cards: item.cards,
@@ -2981,7 +3060,8 @@ function reviewerModel() {
 }
 
 function classifyBudget(snapshot, model, minHeadroom) {
-  const min = Number.isFinite(minHeadroom) ? minHeadroom : MIN_HEADROOM;
+  const budget = modelBudgets()[modelFamily(model)] || {};
+  const min = Number.isFinite(minHeadroom) ? minHeadroom : (budget.minHeadroom ?? MIN_HEADROOM);
   const claude = (snapshot && snapshot.claude) || {};
   const limits = Array.isArray(claude.limits) ? claude.limits : [];
   if (!limits.length) return { code: 8, reason: 'no usage snapshot available' };
@@ -3002,8 +3082,10 @@ function classifyBudget(snapshot, model, minHeadroom) {
   // the shared weekly window is the only ceiling that applies.
   const scoped = find((l) => {
     const label = String(l.label || '').toLowerCase();
-    return label.endsWith(' wk') && name && label.startsWith(name);
+    return budget.weeklyLabel ? label === budget.weeklyLabel.toLowerCase()
+      : label.endsWith(' wk') && name && label.startsWith(modelFamily(model) === 'other' ? name : modelFamily(model));
   });
+  if (budget.weeklyLabel && !scoped) return { code: 8, reason: 'usage snapshot has no configured bucket ' + budget.weeklyLabel };
   if (scoped && headroom(scoped) < min) {
     return { code: 6, reason: scoped.label + ' at ' + scoped.percent + '% (headroom ' + headroom(scoped) + '% < ' + min + '%)', resetsAt: scoped.resetsAt };
   }
@@ -3159,7 +3241,7 @@ function questionsDue(questions, now, conditions) {
     // A question addressed to Owner has no reviewer to type it into and no
     // deadline worth enforcing: it waits in `keep questions` and the brief until
     // he answers it, which is the whole point of taking it out of the terminal.
-    if (question.to === 'jesse') continue;
+    if (['owner', 'jesse'].includes(question.to)) continue;
     if (Number(question.at) + Number(question.timeoutMs) < now) {
       expire.push(question.id);
     } else if (!question.deliveredAt && state.reviewerLive && state.reviewerIdle && state.budgetOk && !deliver.length) {
@@ -3173,8 +3255,16 @@ function questionsDue(questions, now, conditions) {
 // `keep questions` all render the same list.
 function jesseQuestions(questions) {
   return (questions || [])
-    .filter((question) => question && question.status === 'open' && question.to === 'jesse')
+    .filter((question) => question && question.status === 'open' && ['owner', 'jesse'].includes(question.to))
     .sort((a, b) => Number(a.at || 0) - Number(b.at || 0));
+}
+
+function questionHealth(result, questions) {
+  if (result.errors.length) return { ok: false, error: result.errors.map(deliveryError).join('; ') };
+  const pending = questions.some(q => [q.answerDelivery, q.timeoutDelivery].some(d => d
+    && !d.deliveredAt && !d.acknowledgedAt && !d.cancelledAt && (d.pending || d.gaveUp)));
+  if (pending) return { ok: true, skipped: true, detail: 'delivery remains unresolved' };
+  return { ok: true, detail: 'question queue checked' };
 }
 
 async function questionTick(deps) {
@@ -3517,15 +3607,7 @@ function startScheduler(deps) {
     if (questionsInFlight) return;
     questionsInFlight = true;
     questionTick(deps)
-      .then((result) => health.record('review-questions', result.errors.length
-        ? { ok: false, error: result.errors.map(deliveryError).join('; ') }
-        : {
-          ok: true,
-          skipped: !result.delivered.length && !result.expired.length,
-          detail: result.delivered.length || result.expired.length
-            ? `${result.delivered.length} delivered, ${result.expired.length} expired`
-            : 'nothing due',
-        }))
+      .then((result) => health.record('review-questions', questionHealth(result, loadQuestions())))
       .catch((error) => {
         health.record('review-questions', { ok: false, error });
         process.stderr.write('keep review: question tick failed: ' + error.message + '\n');
@@ -3570,6 +3652,7 @@ module.exports = {
   appendReviewEvent,
   readReviewEvents,
   loadQuestions,
+  questionHealth,
   saveQuestions,
   updateQuestion,
   clip,

@@ -261,7 +261,7 @@ test('wait-on refuses missing, self, and cyclic upstream cards', () => {
     assert.match(cycle.stderr, /dependent -> upstream -> dependent/);
     const reviewer = cli(fixture, ['wait-on', 'dependent', 'upstream'], { KEEP_REVIEWER: '1' });
     assert.equal(reviewer.status, 4);
-    assert.match(reviewer.stderr, /fleet reviewer never changes status/);
+    assert.match(reviewer.stderr, /fleet reviewer applies done\/deferred only through a wrong-status finding/);
   } finally { fs.rmSync(fixture.root, { recursive: true, force: true }); }
 });
 

@@ -32,6 +32,11 @@ function apply(env = process.env) {
     if (!['string', 'number', 'boolean'].includes(typeof entry)) throw new Error(`invalid value for ${key}`);
     if (env[key] === undefined) env[key] = String(entry);
   }
+  for (const [key, envKey] of [['scopes', 'KEEP_SCOPES'], ['projectCatalog', 'KEEP_PROJECT_CATALOG'], ['modelBudgets', 'KEEP_MODEL_BUDGETS']]) {
+    if (value[key] !== undefined && env[envKey] === undefined) env[envKey] = JSON.stringify(value[key]);
+  }
+  require('../web/app/shared/scope-rules').validate(env.KEEP_SCOPES ? JSON.parse(env.KEEP_SCOPES) : undefined);
+  require('./preferences').modelBudgets(env);
   return value;
 }
 

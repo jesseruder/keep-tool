@@ -8,8 +8,8 @@ const path = require('node:path');
 const fs = require('node:fs');
 const root = path.resolve(__dirname, '..');
 const git = (args) => execFileSync('git', ['-C', root, ...args]);
-const forbidden = /(?:^|\/)(?:tasks|archive|digests|reviews|watch|steps|\.keep|launchd)(?:\/|$)|(?:^|\/)(?:\.env(?:\..*)?|standup\.md|[^/]*credentials[^/]*|[^/]*\.(?:pem|key|p12|pfx))$/i;
-const allowed = /^(?:bin|web|desktop|scripts|skills|docs|patches|\.github)\/|^(?:README\.md|AGENTS\.md|CLAUDE\.md|LICENSE|\.gitignore|\.gitattributes|\.gitleaks\.toml|package(?:-lock)?\.json)$/;
+const forbidden = /(?:^|\/)(?:tasks|archive|digests|reviews|watch|steps|\.keep|launchd)(?:\/|$)|(?:^|\/)(?:\.env(?:\..*)?|standup\.md|[^/]*credentials[^/]*|[^/]*\.(?:pem|key|p12|pfx|jks|keystore|mobileprovision))$/i;
+const allowed = /^(?:bin|web|desktop|app|scripts|skills|docs|patches|\.github)\/|^(?:README\.md|AGENTS\.md|CLAUDE\.md|LICENSE|\.gitignore|\.gitattributes|\.gitleaks\.toml|package(?:-lock)?\.json)$/;
 const secrets = [
   /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/,
   /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/,
@@ -21,7 +21,7 @@ const secrets = [
 
 function inspect(name, bytes) {
   const issues = [];
-  if (forbidden.test(name) || !allowed.test(name) || /(?:^|\/)(?:node_modules|target|\.git)(?:\/|$)/.test(name)) issues.push('excluded path');
+  if (forbidden.test(name) || !allowed.test(name) || /(?:^|\/)(?:node_modules|target|\.git|\.expo|\.claude|android|ios)(?:\/|$)/.test(name)) issues.push('excluded path');
   const text = bytes.toString('utf8');
   if (/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/.test(text)) {
     const frontmatter = text.split(/\r?\n---(?:\r?\n|$)/)[0];

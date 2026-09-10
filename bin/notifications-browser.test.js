@@ -10,15 +10,17 @@ const { spawn } = require('node:child_process');
 const WebSocket = require('ws');
 const notifications = require('./notifications');
 const { appendAlert } = require('./alerts');
+const { compactState } = require('./dashboard-state');
 
 test('isolated browser: alert inbox, read persistence, card links and desktop click-through', { skip: process.env.KEEP_BROWSER_TEST !== '1', timeout: 45000 }, async () => {
   const root = path.resolve(__dirname, '..');
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-nav-browser-'));
   const posts = [];
+  const eventClients = new Set();
   let summaryFresh = false;
   const sessions = ['a', 'b'].map((id) => ({ id, kind: 'claude', title: `Session ${id}`, project: '/tmp/history-fixture', taskId: `card-${id}`, pane: `p${id}`, mtime: Date.now(), state: 'running', endedTurn: false }));
   const panes = sessions.map((s) => ({ id: s.pane, alive: true, meta: { agent: 'claude', sessionId: s.id } }));
-  const state = { sessions, panes, tasks: sessions.map((s) => ({ id: s.taskId, fm: { tags: ['personal'] } })), attention: [], setAside: {}, health: {}, usage: {}, review: { events: [], stats: {} }, limitResume: {} };
+  const state = { sessions, panes, tasks: sessions.map((s) => ({ id: s.taskId, fm: { tags: ['personal'] } })), attention: [], setAside: {}, health: {}, usage: {}, review: { events: [], stats: { weekly: { pointsOfModelWeek: 1.2, modelLabel: 'Fable wk', modelPercent: 40 } } }, limitResume: {} };
   const inboxRoot = path.join(profile, 'inbox');
   state.tasks[0].body = 'Card notes';
   state.tasks[0].fm.title = 'Investigate reviewer finding';
@@ -36,10 +38,10 @@ test('isolated browser: alert inbox, read persistence, card links and desktop cl
       return;
     }
     state.notifications = notifications.snapshot(inboxRoot);
-    if (url.pathname === '/api/events') { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(': ready\n\n'); return; }
+    if (url.pathname === '/api/events') { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(': ready\n\n'); eventClients.add(res); req.on('close', () => eventClients.delete(res)); return; }
     if (url.pathname.startsWith('/api/')) {
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify(url.pathname === '/api/state' ? state : url.pathname === '/api/layouts' ? { layouts: [{ name: 'Pinned', role: 'pinned', ids: ['pa', 'pb'], cols: 2 }] } : { text: 'Fixture summary', fresh: summaryFresh, ok: true })); return;
+      res.end(JSON.stringify(url.pathname === '/api/state' ? (url.searchParams.get('compact') === '1' ? compactState(state) : state) : url.pathname === '/api/layouts' ? { layouts: [{ name: 'Pinned', role: 'pinned', ids: ['pa', 'pb'], cols: 2 }] } : { text: 'Fixture summary', fresh: summaryFresh, ok: true })); return;
     }
     const vendors = { '/vendor/xterm.js': 'node_modules/@xterm/xterm/lib/xterm.js', '/vendor/xterm.css': 'node_modules/@xterm/xterm/css/xterm.css', '/vendor/addon-webgl.js': 'node_modules/@xterm/addon-webgl/lib/addon-webgl.js', '/vendor/addon-fit.js': 'node_modules/@xterm/addon-fit/lib/addon-fit.js', '/vendor/addon-search.js': 'node_modules/@xterm/addon-search/lib/addon-search.js' };
     const file = path.resolve(root, vendors[url.pathname] || `web${url.pathname === '/' ? '/app/index.html' : url.pathname}`);
@@ -68,12 +70,13 @@ test('isolated browser: alert inbox, read persistence, card links and desktop cl
     const wait = (condition) => evaluate(`new Promise((resolve,reject)=>{const deadline=Date.now()+5000;const tick=()=>{if(${condition})resolve(true);else if(Date.now()>deadline)reject(new Error('condition timed out'));else setTimeout(tick,30)};tick()})`);
     await call('Page.enable');
     await call('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
-    await call('Page.addScriptToEvaluateOnNewDocument', { source: `
-      window.bannerCalls = []; window.pendingClick = null;
+    const desktopScript = await call('Page.addScriptToEvaluateOnNewDocument', { source: `
+      window.bannerCalls = []; window.soundCalls = 0; window.pendingClick = null;
       window.__TAURI__ = {
         notification: { isPermissionGranted: async () => true },
         event: { listen: async (_event, callback) => { window.nativeClick = callback; } },
         core: { invoke: async (command, payload) => {
+          if (command === 'play_attention_sound') window.soundCalls++;
           if (command === 'send_notification') window.bannerCalls.push(payload);
           if (command === 'get_notification_click') return window.pendingClick;
           if (command === 'acknowledge_notification_click' && window.pendingClick === payload.key) window.pendingClick = null;
@@ -84,6 +87,8 @@ test('isolated browser: alert inbox, read persistence, card links and desktop cl
     await wait("document.querySelector('.notification-count')?.textContent === '3'");
     await wait('window.bannerCalls?.length === 1');
     assert.ok(await evaluate("document.querySelector('#notificationsButton').getBoundingClientRect().right > innerWidth - 24"), 'bell is at the far right');
+    assert.ok(await evaluate("!document.querySelector('.notification-preview').hidden && document.querySelector('#notificationsButton').classList.contains('has-unread')"));
+    assert.equal(await evaluate("document.querySelectorAll('.notification-preview img').length"), 0);
     assert.equal(await evaluate("document.querySelector('#qcount').textContent"), '0', 'alerts do not enter Waiting on you');
     await evaluate("document.querySelector('#qlist [data-key=\"running:b\"]').click()");
     await wait("document.querySelector('#stage').dataset.itemKey === 'b'");
@@ -111,6 +116,7 @@ test('isolated browser: alert inbox, read persistence, card links and desktop cl
     await evaluate("document.querySelector('[data-mark-all]').click()");
     await wait("document.querySelector('.notification-count')?.textContent === ''");
     assert.ok(await evaluate("document.querySelector('.notification-list').textContent.includes('caught up')"));
+    assert.ok(await evaluate("document.querySelector('.notification-preview').hidden && !document.querySelector('#notificationsButton').classList.contains('has-unread')"));
     await call('Page.reload');
     await wait("document.querySelector('#connection')?.dataset.status === 'live'");
     await evaluate("document.querySelector('#notificationsButton').click()");
@@ -123,9 +129,61 @@ test('isolated browser: alert inbox, read persistence, card links and desktop cl
     await evaluate("document.querySelector('[data-close]').click(); window.pendingClick = 'alert:a-one'; window.nativeClick()");
     await wait("document.querySelector('#notificationsPanel').open && document.querySelector('.notification-item.selected')?.dataset.id === 'a-one' && window.pendingClick === null");
     await wait("document.querySelector('.notification-count')?.textContent === ''");
+    await evaluate("document.querySelector('[data-close]').click(); document.querySelector('.modes [data-mode=reviewer]').click()");
+    await wait("document.querySelector('#reviewStats').textContent.includes('~1.2%')");
+    assert.ok(await evaluate("document.querySelector('#reviewStats').textContent.includes('of Fable weekly limit')"));
+    await evaluate("document.querySelector('#notificationsButton').click(); document.querySelector('[data-read=\"a-one\"]').click()");
+    await wait("document.querySelector('.notification-count').textContent === '1'");
+    await evaluate("document.querySelector('[data-close]').click()");
+    await wait("!document.querySelector('.notification-preview').hidden");
+    const previewShot = await call('Page.captureScreenshot', { format: 'png' });
+    fs.writeFileSync('/tmp/keep-notification-preview-qa.png', Buffer.from(previewShot.data, 'base64'));
+    await evaluate("document.querySelector('.modes [data-mode=triage]').click()");
+    await call('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+    await call('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+    await evaluate("document.querySelector('.notification-preview').focus()");
+    await call('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' });
+    await call('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    await wait("document.querySelector('#notificationsPanel').open && document.querySelector('.notification-item.selected')?.dataset.id === 'a-one' && document.querySelector('.notification-count').textContent === ''");
     // Save a visual artifact of the panel in the isolated desktop fixture.
     const screenshot = await call('Page.captureScreenshot', { format: 'png' });
     fs.writeFileSync('/tmp/keep-notifications-qa.png', Buffer.from(screenshot.data, 'base64'));
+    await evaluate("document.querySelector('#notificationsPanel').close()");
+    assert.equal(await evaluate('window.soundCalls'), 0, 'boot and inbox changes are silent');
+    assert.ok(await evaluate("document.querySelector('#soundButton').nextElementSibling.id === 'notificationsButton' && !document.querySelector('#soundButton').hidden"));
+    const updateWaiting = async (count) => {
+      state.attention = sessions.slice(0, count).map((session) => ({ kind: 'input', sessionId: session.id, title: session.title, project: session.project, pri: 0, since: Date.now() }));
+      for (const client of eventClients) client.write('data: changed\n\n');
+      await wait(`document.querySelector('#qcount').textContent === '${count}'`);
+    };
+    await updateWaiting(1);
+    await wait('window.soundCalls === 1');
+    await updateWaiting(2);
+    assert.equal(await evaluate('window.soundCalls'), 1, 'additional waiting items are silent');
+    await evaluate("document.querySelector('#soundButton').focus()");
+    await call('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' });
+    await call('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
+    assert.equal(await evaluate("document.querySelector('#soundButton').getAttribute('aria-pressed')"), 'true');
+    await updateWaiting(0);
+    await updateWaiting(1);
+    assert.equal(await evaluate('window.soundCalls'), 1, 'muted transition is silent');
+    await call('Page.reload');
+    await wait("document.querySelector('#qcount')?.textContent === '1'");
+    assert.equal(await evaluate("document.querySelector('#soundButton').getAttribute('aria-pressed')"), 'true', 'mute survives reload');
+    await evaluate("document.querySelector('#soundButton').click()");
+    assert.equal(await evaluate('window.soundCalls'), 0, 'unmuting a waiting queue is silent');
+    await call('Page.reload');
+    await wait("document.querySelector('#qcount')?.textContent === '1'");
+    assert.equal(await evaluate('window.soundCalls'), 0, 'startup with a waiting item is silent');
+    await updateWaiting(0);
+    await updateWaiting(2);
+    await wait('window.soundCalls === 1');
+    const soundShot = await call('Page.captureScreenshot', { format: 'png' });
+    fs.writeFileSync('/tmp/keep-attention-sound-qa.png', Buffer.from(soundShot.data, 'base64'));
+    await call('Page.removeScriptToEvaluateOnNewDocument', { identifier: desktopScript.identifier });
+    await call('Page.reload');
+    await wait("document.querySelector('#qcount')?.textContent === '2'");
+    assert.equal(await evaluate("getComputedStyle(document.querySelector('#soundButton')).display"), 'none', 'sound control is hidden in regular browsers');
     assert.ok(!posts.includes('/api/ack') && !posts.includes('/api/checkin') && !posts.includes('/api/open'));
   } finally {
     ws?.close(); chrome.kill();

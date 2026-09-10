@@ -1,4 +1,5 @@
 'use strict';
+process.env.KEEP_SCOPES = JSON.stringify({ names: ['castle', 'personal'], default: 'personal', rules: [{ path: '~/castle', scope: 'castle', excludeSegmentPrefix: 'jesse-' }] });
 
 // Tests spawned from a reviewer session must not inherit reviewer identity.
 for (const key of ['KEEP_REVIEWER', 'KEEP_REVIEWER_NAME', 'KEEP_REVIEWER_MODEL']) delete process.env[key];

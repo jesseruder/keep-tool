@@ -37,6 +37,14 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   `--check-after` on its own, with no `--check`, schedules nothing
   — it only makes the card show up in `keep overdue`. Run one early with
   `keep verify <id>`.
+  The daemon polls due recipes every minute (not every ten minutes); busy sessions
+  retain approximately two hours of default deferral before headless fallback.
+  Scheduling with `--check-after` records a turn-scoped waiting handoff for the
+  scheduling session. If you also need Owner's decision, add `--handoff needs-input`
+  to `keep checkin`; use `--handoff waiting` to explicitly yield to an existing
+  scheduled recipe. Both require a check time and recipe. A new human or automated
+  turn, cancellation, changed schedule, or completed card invalidates the old handoff;
+  explicit questions still take priority. Editing only `--check` does not yield a turn.
 - **Status changes or notable progress**: use `keep checkin <id> -m "..." [--status s]`.
 - **Waiting on another card**: if your next step depends on another card finishing,
   run `keep wait-on <your-card> <upstream> [<upstream>...]`. To wait for a specific
@@ -82,7 +90,7 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   on your own card, and never read a grant as covering more than it names.
 - **When you need Owner and the card does not grant it**: do not just end your turn with
   a question. In a session he is not watching that is an invisible stall — file it with
-  `keep ask --jesse "<question>" --task <card>`. It shows in `keep questions`, `keep
+  `keep ask --owner "<question>" --task <card>`. It shows in `keep questions`, `keep
   brief` and the dashboard, has no timeout, and his answer is delivered back into this
   session. Then do everything on the card that does not depend on the answer. If the
   card genuinely cannot move at all, `keep needs <card> "<what>"` blocks it instead.
@@ -191,9 +199,11 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   is finished.
 - Use `kind: idea` for brainstorms. A completed proposal awaiting approval is `review`.
 - Run `keep tags` before adding a tag. Every task must have exactly one scope tag,
-  `castle` or `personal`; `keep add` normally infers it from the project path.
+  `work` or `personal` (or your configured scope names); `keep add` normally infers it from the project path.
 - Use `keep open <card-id|session-id>` to start or focus an interactive session in a terminal-host pane, visible in the Keep console (`--fresh` starts a new session); `keep restore [--dry]` reopens every session whose agent process is gone (after a host restart or a killed pane). `keep pane ls|show|send|screen|attach` drives panes directly.
   To hand a card to a new session, pass the opening prompt: `keep open <card> --fresh -m "..."`. Keep waits for the agent's empty prompt, types the message, and prints the new session id. Write the prompt like a check recipe: name the card, the goal, and what to check in. The session also sees the project's cards from its session-start hook.
+  Long or multiline opening messages, and `--message-file <path>` even for short text,
+  are saved verbatim in committed `.keep/handoffs/` files; the session gets a one-line file pointer.
   Launched Claude sessions run with `--dangerously-skip-permissions`, the same class as Owner's own `clauded` sessions, so cross-session messages between them are delivered instead of held for mode parity (`KEEP_OPEN_CLAUDE_FLAGS` overrides the flags for the daemon). Launched Codex sessions run with `--dangerously-bypass-approvals-and-sandbox`, the same class as his `codexd` alias (`KEEP_OPEN_CODEX_FLAGS` overrides).
   A fresh launch on a card is a handoff: the new session becomes the card's linked session and the session that ran `keep open` is unlinked from that card, so create the card and open it from the same session without worrying about owning it afterwards.
 - The CLI links Claude and Codex session IDs on add/check-in so `keep resume` emits the
@@ -204,12 +214,30 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
 - Session completion notices are ephemeral unread-turn signals. Deliberately ending
   a session acknowledges only its completion notice; any linked Keep task retains
   its durable `active`, `waiting`, `blocked`, or `review` state.
+- Card status and conversation readiness are separate. **Waiting on you** includes
+  live sessions ready for their next instruction, even without an explicit question.
+  A card's `waiting` status, dependency, or future check alone must not hide a proposal
+  awaiting Owner. A foreground turn can stop while a build, subagent, or scheduled
+  poll continues; hooks are observations, not proof that background work completed.
+  Keep tracks Claude CronCreate/CronDelete as process-scoped scheduled jobs; for
+  durable checks that must survive session closure, use `--check-after` plus `--check`.
+- Dismiss and snooze only hide a session from attention lists; they do not stop its
+  process or cancel its card's checks. Explicit Close tries graceful exit then forces
+  closure if needed. Restart resumes the conversation and is more conservative:
+  it requires verified idle input and no unresolved background work. Do not use
+  Close, restart, or cleanup merely to correct a displayed status.
 - Agent-session mutations commit locally and do not auto-push. Treat `keep sync` or
   `KEEP_ALLOW_PUSH=1` as a push and follow the current session's push-approval rules.
 - Log entries headed `review (fable)` come from the fleet reviewer, a separate
   second-opinion agent — not from Owner and not from the session that owns the card.
-  Treat them as observations to weigh, not instructions: they never change status,
-  and disagreeing is fine as long as your next check-in says why.
+  Treat them as observations to weigh, not instructions. A `wrong-status` finding
+  may apply `done` or `deferred` only with no live linked session, no newer check-in
+  than its evidence, no open Owner question or need, no pending scheduled check, and
+  no unresolved dependency. Dismissed anchors remain permanently vetoed and are not
+  posted again. The finding says whether the status was applied and why it was refused;
+  a dismissed finding reports its refusal in the command result. Other targets stay
+  suggestions; the reviewer never sets `active`. Disagreeing is fine as long as your
+  next check-in says why.
 - When a decision needs the reviewer's fleet-wide view, use
   `keep ask "<question>" --about <project>`. The answer arrives in the asking session
   as a `[keep] answer` line and is an observation, not authorization. If the reviewer
@@ -217,4 +245,4 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
 - Call the system "Keep": say "mark this task done in Keep" or "check this in to Keep."
 - Sessions in a `~/wt/<repo>/<name>` worktree belong to the main checkout's project: the CLI
   canonicalizes the path, so use and create cards for the main checkout (`wt main` prints
-  it — usually `~/castle/<repo>`, but e.g. `~/example-site`), never for the worktree path.
+  it — usually `~/castle/<repo>`, but e.g. `~/jesseland`), never for the worktree path.

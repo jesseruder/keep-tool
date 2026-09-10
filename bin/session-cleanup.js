@@ -4,6 +4,10 @@
 function refusal(session, pane, pinned, now = Date.now(), options = {}) {
   if (!session || !pane || !pane.alive || pane.meta?.sessionId !== session.id || pane.meta?.agent !== session.kind) return 'No matching live agent pane';
   if (session.reviewer) return 'Fleet reviewer is protected';
+  if (options.restart) {
+    const reason = require('./session-restart').refusal(session, pane);
+    return reason || (!Number.isFinite(session.mtime) ? 'Session activity time is unknown' : null);
+  }
   if (!options.manual && pinned.has(pane.id)) return 'Pinned session is protected; unpin it first';
   const nextInstruction = session.state === 'needs-input' && session.activity?.reason === 'next instruction';
   const manualScheduled = options.manual && session.state === 'waiting' && session.activity?.label === 'Waiting: scheduled check';

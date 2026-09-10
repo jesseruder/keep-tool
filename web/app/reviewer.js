@@ -94,13 +94,16 @@ function tickPhrase(ctx) {
   return `${suffix} · next in ${next} min`;
 }
 
-function weeklyText(value) {
-  if (!value || !Number.isFinite(Number(value.reviewerCost))) return { cost: '—', share: '—' };
-  const cost = Number(value.reviewerCost);
-  const share = Number(value.shareOfLocal);
+export function weeklyText(value) {
+  const model = Number.isFinite(value?.pointsOfModelWeek);
+  const points = model ? value.pointsOfModelWeek : value?.pointsOfWeek;
+  const label = model ? String(value.modelLabel || 'Claude').replace(/ wk$/, '') : 'Claude';
+  if (!Number.isFinite(points)) return { usage: '—', label: 'weekly usage unavailable', title: 'Weekly usage estimate is not available yet.' };
+  const total = model ? value.modelPercent : value.weekPercent;
   return {
-    cost: `$${cost < 10 ? cost.toFixed(2) : Math.round(cost)}`,
-    share: Number.isFinite(share) ? `${(share * 100).toFixed(1)}% of fleet` : '—',
+    usage: `~${points.toFixed(1)}%${value.warming ? '…' : ''}`,
+    label: `of ${label} weekly limit`,
+    title: `Estimated reviewer usage: ${points.toFixed(1)}% of the ${label} weekly limit (${total}% used in total). Usage on other devices is not visible locally, so the estimate may read high.${value.warming ? ' Still processing history; the estimate will settle.' : ''}`,
   };
 }
 
@@ -112,7 +115,7 @@ function atText(value) {
 function statsPopover(ctx) {
   const value = stats(ctx);
   const weekly = weeklyText(value.weekly);
-  return `<div class="review-pop"><b>Reviewer stats</b><dl><dt>last tick</dt><dd>${ctx.esc(atText(value.lastTickAt))}</dd><dt>last skip</dt><dd>${ctx.esc(value.lastSkip ? `${atText(value.lastSkip.at)} · ${value.lastSkip.why || ''}` : '—')}</dd><dt>compactions</dt><dd>${ctx.esc(value.compactionsToday ?? 0)} today</dd><dt>median ctx</dt><dd>${value.medianContextTokens == null ? '—' : `${Math.round(Number(value.medianContextTokens) / 1000)}k`}</dd><dt>weekly</dt><dd>${ctx.esc(`${weekly.cost} · ${weekly.share}`)}</dd><dt>findings</dt><dd>${ctx.esc(value.findingsTotal ?? '—')} total · ${ctx.esc(value.dismissed ?? '—')} dismissed</dd></dl></div>`;
+  return `<div class="review-pop"><b>Reviewer stats</b><dl><dt>last tick</dt><dd>${ctx.esc(atText(value.lastTickAt))}</dd><dt>last skip</dt><dd>${ctx.esc(value.lastSkip ? `${atText(value.lastSkip.at)} · ${value.lastSkip.why || ''}` : '—')}</dd><dt>compactions</dt><dd>${ctx.esc(value.compactionsToday ?? 0)} today</dd><dt>median ctx</dt><dd>${value.medianContextTokens == null ? '—' : `${Math.round(Number(value.medianContextTokens) / 1000)}k`}</dd><dt>weekly</dt><dd>${ctx.esc(`${weekly.usage} · ${weekly.label}`)}</dd><dt>findings</dt><dd>${ctx.esc(value.findingsTotal ?? '—')} total · ${ctx.esc(value.dismissed ?? '—')} dismissed</dd></dl></div>`;
 }
 
 export function reviewerNewCount(ctx) {
@@ -120,7 +123,9 @@ export function reviewerNewCount(ctx) {
 }
 
 export function markReviewerSeen(ctx) {
-  const visibleReviewer = ctx.state.mode === 'reviewer' && document.hasFocus() && document.visibilityState !== 'hidden';
+  // A visible Reviewer screen is being looked at even when the terminal, not the console
+  // window, holds keyboard focus — requiring focus left the badge lit while it was read.
+  const visibleReviewer = ctx.state.mode === 'reviewer' && document.visibilityState !== 'hidden';
   const visibleDock = ctx.state.dock && window.innerWidth >= 1100 && ctx.state.mode !== 'reviewer'
     && document.hasFocus() && document.visibilityState !== 'hidden';
   if (!visibleReviewer && !visibleDock) return false;
@@ -146,12 +151,14 @@ export function renderReviewerTop(ctx) {
   const marker = value.reviewer;
   const live = marker && marker.state !== 'gone';
   const fresh = Number(value.lastTickAt || 0) && Date.now() - Number(value.lastTickAt) <= 90 * 60e3;
-  const healthy = live && ['running', 'idle'].includes(marker.state) && fresh;
+  // A running reviewer cannot tick mid-turn, so a long turn must not read as stale.
+  const healthy = live && (marker.state === 'running' || (marker.state === 'idle' && fresh));
   dot.style.background = healthy ? 'var(--ok)' : live ? 'var(--warn)' : 'var(--faint)';
-  modeButton.title = !live ? 'No live reviewer session' : healthy
-    ? `${marker.state}; reviewer ticked within 90 minutes`
-    : fresh ? `${marker.state}; reviewer is not currently running or idle`
-      : `${marker.state}; no reviewer tick in the last 90 minutes`;
+  modeButton.title = !live ? 'No live reviewer session'
+    : marker.state === 'running' ? `${marker.state}; reviewer is mid-turn`
+      : healthy ? `${marker.state}; reviewer ticked within 90 minutes`
+        : fresh ? `${marker.state}; reviewer is not currently running or idle`
+          : `${marker.state}; no reviewer tick in the last 90 minutes`;
 }
 
 export function renderReviewer(ctx) {
@@ -181,7 +188,7 @@ export function renderReviewer(ctx) {
   const actionCount = ['acks', 'notes', 'ideas', 'dismisses', 'nudges'].reduce((sum, key) => sum + Number(day[key] || 0), 0);
   const weekly = weeklyText(value.weekly);
   const median = value.medianContextTokens == null ? '—' : `${Math.round(Number(value.medianContextTokens) / 1000)}<small>k</small>`;
-  ctx.patchHTML(document.querySelector('#reviewStats'), `<div class="rstat"><div class="v">${Number(day.ticks || 0)}</div><div class="l">ticks today</div></div><div class="rstat hot"><div class="v">${actionCount}</div><div class="l">actions today</div></div><div class="rstat"><div class="v">${median}</div><div class="l">median ctx</div></div><div class="rstat"><div class="v">${ctx.esc(weekly.cost)}</div><div class="l">${ctx.esc(weekly.share)}</div></div>`);
+  ctx.patchHTML(document.querySelector('#reviewStats'), `<div class="rstat"><div class="v">${Number(day.ticks || 0)}</div><div class="l">ticks today</div></div><div class="rstat hot"><div class="v">${actionCount}</div><div class="l">actions today</div></div><div class="rstat"><div class="v">${median}</div><div class="l">median ctx</div></div><div class="rstat" title="${ctx.esc(weekly.title)}"><div class="v">${ctx.esc(weekly.usage)}</div><div class="l">${ctx.esc(weekly.label)}</div></div>`);
 
   const cursor = seenAt;
   const count = reviewerNewCount(ctx);

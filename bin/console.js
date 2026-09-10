@@ -196,6 +196,7 @@ function install(input) {
   const webRoot = path.join(__dirname, '..', 'web', 'app');
   const modulesRoot = path.join(__dirname, '..', 'node_modules');
   const layoutsFile = path.join(deps.root, '.keep', 'layouts.json');
+  const projectIcons = input.projectIcons || require('./project-icons').createProjectIcons({ root: deps.root });
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
   const killTimers = new Set();
   const retryHostRequest = async (type, params) => {
@@ -239,9 +240,10 @@ function install(input) {
     const isApp = req.method === 'GET' && (url.pathname === '/app' || url.pathname.startsWith('/app/'));
     const isVendor = req.method === 'GET' && url.pathname.startsWith('/vendor/');
     const isLayouts = url.pathname === '/api/layouts' && (req.method === 'GET' || req.method === 'PUT');
+    const isProjectIcons = url.pathname === '/api/project-icons' && req.method === 'POST';
     const isSpawn = url.pathname === '/api/panes/spawn' && req.method === 'POST';
     const paneAction = req.method === 'POST' ? paneRoute(url.pathname) : null;
-    if (!isApp && !isVendor && !isLayouts && !isSpawn && !paneAction && !appTraversal) return false;
+    if (!isApp && !isVendor && !isLayouts && !isProjectIcons && !isSpawn && !paneAction && !appTraversal) return false;
     req.keepConsoleHandled = true;
     if (!authorized(req, deps)) { writeDenied(res); return true; }
     try {
@@ -271,8 +273,10 @@ function install(input) {
         json(res, 403, { error: 'missing x-keep header' });
         return true;
       }
-      const body = isLayouts || isSpawn ? await readBody(req) : {};
-      if (isLayouts) {
+      const body = isLayouts || isSpawn || isProjectIcons ? await readBody(req) : {};
+      if (isProjectIcons) {
+        json(res, 200, await projectIcons.lookup(body.projects));
+      } else if (isLayouts) {
         json(res, 200, await writeLayouts(layoutsFile, body));
       } else if (isSpawn) {
         if (typeof body.cwd !== 'string') throw new Error('cwd must be an existing directory');
@@ -362,7 +366,7 @@ function install(input) {
     };
     const forwardPane = (state, event) => {
       if (closed || state.closed || event?.ev !== 'pane' || event.pane?.id !== pane
-          || !['resized', 'primary', 'title', 'meta'].includes(event.type)) return;
+          || !['resized', 'primary', 'title', 'meta', 'visibility'].includes(event.type)) return;
       const message = { t: 'pane', pane: event.pane };
       if (!state.attached) state.pending.push({ message });
       else sendText(message);
@@ -495,6 +499,9 @@ function install(input) {
         } else if (message.t === 'primary') {
           if (!validSize(message)) return;
           operation = resize(message, true);
+        } else if (message.t === 'visibility') {
+          if (typeof message.visible !== 'boolean') return;
+          operation = hostRequest('visibility', { pane, visible: message.visible });
         } else if (message.t === 'clear') {
           operation = hostRequest('clear', { pane });
         } else if (message.t === 'reply') {

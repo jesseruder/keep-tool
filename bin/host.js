@@ -212,6 +212,7 @@ function publicPane(pane) {
     cols: pane.cols,
     rows: pane.rows,
     attached: pane.attachments.size,
+    visibleAttached: [...pane.attachments.values()].filter(a => a.visible !== false).length,
     createdAt: pane.createdAt,
     exitedAt: pane.exitedAt,
     lastOutputAt: pane.lastOutputAt,
@@ -507,7 +508,7 @@ function createHost(options = {}) {
     switch (params.type) {
       case 'hello':
         return { result: {
-          version: 1, bootVersion: options.boot && options.boot.version || null,
+          version: 1, replaceExited: true, bootVersion: options.boot && options.boot.version || null,
           panes: panes.size, pid: process.pid, sock,
           reloads: options.boot && options.boot.reloads || 0,
           lastReload: options.boot && options.boot.lastReload || null,
@@ -515,6 +516,24 @@ function createHost(options = {}) {
       case 'spawn': {
         const pane = spawnPane(params);
         return { result: { pane: publicPane(pane) } };
+      }
+      case 'replace-exited': {
+        const old = needPane(params.paneId);
+        if (old.alive || old.pty.pid !== params.expectedPid || old.meta?.sessionId !== params.sessionId) {
+          throw new Error('replacement requires the exact exited session process');
+        }
+        await settled(old);
+        if (panes.get(old.id) !== old) throw new Error('session process changed during replacement');
+        panes.delete(old.id);
+        let replacement;
+        try { replacement = spawnPane({ ...params, meta: { ...old.meta, ...params.meta } }); }
+        catch (error) { panes.set(old.id, old); throw error; }
+        for (const connection of old.attachments.keys()) detachPane(connection, old, true);
+        for (const disposable of [old.dataDisposable, old.exitDisposable, old.titleDisposable]) {
+          try { disposable?.dispose(); } catch {}
+        }
+        old.term.dispose();
+        return { result: { pane: publicPane(replacement) } };
       }
       case 'list':
         return { result: { panes: [...panes.values()].map(publicPane) } };
@@ -575,6 +594,7 @@ function createHost(options = {}) {
         }
         await settled(pane);
         if (!pane.alive) throw new Error('pane has exited');
+        if (panes.get(pane.id) !== pane) throw new Error('pane process changed');
         pane.pty.resize(cols, rows);
         pane.term.resize(cols, rows);
         pane.cols = cols;
@@ -647,14 +667,24 @@ function createHost(options = {}) {
         detachPane(connection, pane);
         return { result: { pane: publicPane(pane) } };
       }
+      case 'visibility': {
+        const pane = needPane(params.pane);
+        const attachment = pane.attachments.get(connection);
+        if (!attachment || typeof params.visible !== 'boolean') throw new Error('Expected attached viewer and boolean visibility');
+        attachment.visible = params.visible;
+        emitPane('visibility', pane);
+        return { result: { pane: publicPane(pane) } };
+      }
       case 'screen': {
         const pane = needPane(params.pane);
         await settled(pane);
+        if (panes.get(pane.id) !== pane) throw new Error('pane process changed');
         return { result: renderScreen(pane.term, { lines: params.lines, scrollback: params.scrollback, title: pane.title }) };
       }
       case 'clear': {
         const pane = needPane(params.pane);
         await settled(pane);
+        if (panes.get(pane.id) !== pane) throw new Error('pane process changed');
         pane.buffer.clear();
         pane.term.clear();
         if (params.repaint !== false && pane.alive && pane.cols > 1) {
@@ -679,6 +709,7 @@ function createHost(options = {}) {
         const pane = needPane(params.pane);
         if (pane.alive) throw new Error('pane is still alive');
         await settled(pane);
+        if (panes.get(pane.id) !== pane) throw new Error('pane process changed');
         for (const connection of pane.attachments.keys()) detachPane(connection, pane);
         pane.attachments.clear();
         panes.delete(pane.id);

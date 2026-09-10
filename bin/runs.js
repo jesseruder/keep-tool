@@ -18,10 +18,11 @@ const summarize = require('./summarize.js');
 const RUNS_DIR = path.join(keep.ROOT, '.keep', 'runs');
 const CHECK_BUDGET_MS = (parseInt(process.env.KEEP_CHECK_BUDGET_MIN || '15', 10)) * 60e3;
 const TASK_BUDGET_MS = (parseInt(process.env.KEEP_TASK_BUDGET_MIN || '60', 10)) * 60e3;
-const parsedMaxDeferrals = parseInt(process.env.KEEP_DELIVER_MAX_DEFERRALS || '12', 10);
+// Poll more often without shortening the default ~two-hour busy-thread grace.
+const parsedMaxDeferrals = parseInt(process.env.KEEP_DELIVER_MAX_DEFERRALS || '120', 10);
 const MAX_DELIVER_DEFERRALS = Number.isFinite(parsedMaxDeferrals) && parsedMaxDeferrals >= 0
   ? parsedMaxDeferrals
-  : 12;
+  : 120;
 const MAX_CONCURRENT = 3;
 const NO_RESULT = 'check produced no result';
 const MAX_LINE_BUFFER = 1024 * 1024;
@@ -428,7 +429,7 @@ function retryPending() {
 function checkDeliveryMessage(task) {
   const fm = task && task.fm || {};
   const recipe = String(fm.check || '').replace(/\s+/g, ' ').trim();
-  const recipeLimit = 1100;
+  const recipeLimit = 900; // Reserve room for handoff guidance and the full card ID.
   const clipped = recipe.length > recipeLimit;
   const shownRecipe = clipped ? `${recipe.slice(0, recipeLimit - 1)}…` : recipe;
   const title = String(fm.title || '').replace(/\s+/g, ' ').trim().slice(0, 240);
@@ -436,7 +437,8 @@ function checkDeliveryMessage(task) {
     `[keep] scheduled check due for ${task.id} ("${title}"), scheduled for ${fm.check_after || '(unspecified)'}.`,
     `This is the reminder you scheduled; run the recipe now in this session: ${shownRecipe}`,
     clipped ? '(recipe truncated; full text on the card)' : '',
-    `— then land the outcome with keep checkin ${task.id} -m "<what you found and the next step>" plus --clear-check-after (or --check-after <when> to reschedule) and the status that is true.`,
+    `Do only the read-only check; report any required changes rather than performing them.`,
+    `Then record the outcome with keep checkin ${task.id} -m "<findings and next step>" plus --clear-check-after (or --check-after <when> to reschedule) and the true status. Rescheduling yields this turn; add --handoff needs-input if Jesse must decide.`,
     `Full card: keep show ${task.id}.`,
   ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
   return message.slice(0, 2000);
@@ -635,7 +637,7 @@ async function schedulerTick() {
 }
 
 function startScheduler() {
-  const iv = setInterval(schedulerTick, 10 * 60e3);
+  const iv = setInterval(schedulerTick, 60e3);
   iv.unref();
   setTimeout(schedulerTick, 30e3).unref(); // first pass shortly after boot
 }

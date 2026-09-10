@@ -33,6 +33,40 @@ const {
 
 const jsonl = (records) => records.map((r) => JSON.stringify(r));
 
+test('question health recovers cancelled deliveries but preserves unresolved failure state', () => {
+  const { questionHealth } = require('./review');
+  const ok = { errors: [], delivered: [], expired: [] };
+  assert.deepEqual(questionHealth(ok, [{ answerDelivery: { pending: false } }]), { ok: true, detail: 'question queue checked' });
+  assert.equal(questionHealth(ok, [{ answerDelivery: { pending: true, attempts: 20 } }]).skipped, true);
+  assert.equal(questionHealth(ok, [{ answerDelivery: { pending: false, attempts: 20, gaveUp: true } }]).skipped, true);
+  assert.equal(questionHealth(ok, [{ timeoutDelivery: { pending: false, gaveUp: true } }]).skipped, true);
+  assert.equal(questionHealth(ok, [{ answerDelivery: { pending: false, gaveUp: true, cancelledAt: 1 } }]).skipped, undefined);
+  assert.equal(questionHealth({ errors: [Error('failed')] }, []).ok, false);
+});
+
+test('answer CLI acknowledges its own session for both agents, but retains cross-session delivery', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-self-answer-'));
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'));
+    assert.equal(spawnSync('git', ['init', '-q', root]).status, 0);
+    const dir = path.join(root, '.keep/review'); fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, '_questions.json');
+    for (const agent of ['claude', 'codex']) for (const self of [true, false]) {
+      fs.writeFileSync(file, JSON.stringify([{ id: 'q-test', status: 'open', question: 'test', from: { sessionId: 'owner', agent } }]));
+      const env = { ...process.env, KEEP_DIR: root, KEEP_PORT: '1' };
+      for (const k of ['CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'CLAUDE_CODE_SESSION_ID', 'KEEP_REVIEWER', 'KEEP_REVIEWER_NAME']) delete env[k];
+      env[agent === 'codex' ? 'CODEX_THREAD_ID' : 'CLAUDE_CODE_SESSION_ID'] = self ? 'owner' : 'other';
+      const result = spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'answer', 'q-test', '-m', 'answer'], { env, cwd: root, encoding: 'utf8', timeout: 10000 });
+      assert.equal(result.status, 0, result.stderr);
+      const q = JSON.parse(fs.readFileSync(file))[0];
+      assert.equal(q.status, 'answered');
+      assert.equal(q.answerDelivery.pending, !self);
+      if (self) { assert.equal(q.answerDelivery.reason, 'answered-in-owning-session'); assert.match(result.stdout, /no terminal delivery needed/); }
+      else assert.match(result.stdout, /delivery failed/);
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 function claudeToolUse(name, input, id) {
   return { type: 'assistant', message: { content: [{ type: 'tool_use', name, id, input: input || {} }] } };
 }
@@ -1098,8 +1132,17 @@ test('the fleet reviewer cannot change card status without --force', () => {
     const reviewerEnv = { ...baseEnv, KEEP_REVIEWER: '1' };
     const denied = run(['done', 'reviewed-card'], reviewerEnv);
     assert.equal(denied.status, 4);
-    assert.match(denied.stderr, /the fleet reviewer never changes status; use keep review-note --suggest-status <s> \(or --force if Owner asked\)/);
+    assert.match(denied.stderr, /the fleet reviewer applies done\/deferred only through a wrong-status finding; use keep review-note --kind wrong-status --suggest-status <s> \(or --force if Owner asked\)/);
     assert.match(read(), /^status: active$/m, 'the refused command leaves the card open');
+    for (const args of [
+      ['checkin', 'reviewed-card', '--status', 'done', '-m', 'Close it.'],
+      ['checkin', 'reviewed-card', '--status', 'deferred', '-m', 'Set aside.'],
+      ['add', 'Reviewer addition', '--status', 'done'],
+    ]) {
+      const direct = run(args, reviewerEnv);
+      assert.equal(direct.status, 4, direct.stderr);
+      assert.match(direct.stderr, /only through a wrong-status finding/);
+    }
 
     const note = run(['checkin', 'reviewed-card', '-m', 'Review observation only.'], reviewerEnv);
     assert.equal(note.status, 0, note.stderr);
@@ -2204,4 +2247,133 @@ test('gitState on a project that is not a repository reports the reason without 
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('wrong-status findings apply only safe done/deferred transitions through normal check-in', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-apply-'));
+  const env = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', KEEP_REVIEWER: '1', KEEP_PORT: '1' };
+  const script = `
+    const assert = require('node:assert/strict');
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const keep = require(${JSON.stringify(path.join(__dirname, 'keep.js'))});
+    const review = require(${JSON.stringify(path.join(__dirname, 'review.js'))});
+    let sessions = [];
+    let race = null;
+    keep.getKeepApi = async (endpoint) => {
+      assert.equal(endpoint, '/api/state');
+      if (race) { const run = race; race = null; run(); }
+      return { status: 200, data: JSON.stringify({ sessions }) };
+    };
+    const make = (id, fm = {}) => {
+      const task = { id, fm: { title: id, status: 'active', tags: ['personal'], ...fm }, body: '\\n## 2020-01-01 00:00 — check-in\\nOld evidence.\\n' };
+      fs.writeFileSync(path.join(keep.ROOT, 'tasks', id + '.md'), keep.serializeTask(task));
+      return task;
+    };
+    const note = (id, extra = {}) => review.reviewNote(id, { kind: 'wrong-status', subject: id, severity: 'low', message: 'Obsolete work.', suggestStatus: 'done', ...extra });
+    const body = (id) => keep.loadTask(id).body;
+    const refuse = async (id, reason, fm = {}, extra = {}) => {
+      make(id, fm);
+      await note(id, extra);
+      assert.equal(keep.loadTask(id).fm.status, fm.status || 'active', id);
+      assert.ok(body(id).includes('Suggested status: ' + (extra.suggestStatus || 'done') + ' — not applied: ' + reason), body(id));
+    };
+    (async () => {
+      for (const target of ['done', 'deferred']) {
+        make('apply-' + target, { sessions: [{ id: 'closed-owner', agent: 'codex' }] });
+        sessions = [{ id: 'closed-owner', runtime: { state: 'exited' }, exited: true }];
+        if (target === 'done') make('dependent', { status: 'waiting', depends_on: ['apply-done'] });
+        const out = await note('apply-' + target, { suggestStatus: target });
+        assert.equal(keep.loadTask('apply-' + target).fm.status, target);
+        assert.ok(body('apply-' + target).includes('Suggested status: ' + target + ' — applied'));
+        assert.ok(body('apply-' + target).includes('status ' + target + ' applied by reviewer from finding ' + out.key));
+        assert.deepEqual(keep.loadTask('apply-' + target).fm.sessions, [{ id: 'closed-owner', agent: 'codex' }]);
+        assert.equal(review.loadState('apply-' + target).lastStatus, target);
+      }
+      assert.ok(fs.readdirSync(path.join(keep.ROOT, '.keep/unblocked')).some((file) => file.startsWith('dependent--apply-done--')));
+      for (const state of ['live', 'external']) {
+        sessions = [{ id: 'owner', runtime: { state }, state: 'idle' }];
+        await refuse('live-' + state, 'live linked session', { sessions: [{ id: 'owner', agent: 'claude' }] });
+      }
+      sessions = [{ id: 'daemon-owner', taskId: 'registry-link', runtime: { state: 'live' } }];
+      await refuse('registry-link', 'live linked session');
+      sessions = [{ id: 'owner', runtime: { state: 'unknown' } }];
+      await refuse('unknown-live', 'linked session liveness unknown', { sessions: [{ id: 'owner', agent: 'claude' }] });
+      sessions = null;
+      await refuse('daemon-down', 'live session registry unavailable');
+      sessions = [];
+      const questions = path.join(keep.ROOT, '.keep/review/_questions.json');
+      fs.writeFileSync(questions, JSON.stringify([{ task: 'question', to: 'jesse', status: 'open' }]));
+      await refuse('question', 'open question for Jesse');
+      await refuse('needs', 'open keep needs block', { needs: [{ text: 'Decision', at: '2020-01-01 00:00' }] });
+      await refuse('scheduled', 'pending scheduled check', { status: 'waiting', check_after: '2099-01-01', check: 'check it' });
+      make('upstream');
+      await refuse('dependency', 'unresolved wait-on dependency', { status: 'waiting', depends_on: ['upstream'] });
+      for (const target of ['active', 'review', 'waiting', 'blocked', 'landing', 'inbox']) {
+        await refuse('target-' + target, 'target is not done or deferred', {}, { suggestStatus: target });
+      }
+      await refuse('kind', 'kind is not wrong-status', {}, { kind: 'other' });
+      make('new-log');
+      const state = review.loadState('new-log');
+      state.lastReviewedAt = new Date(2019, 0, 1).getTime();
+      review.saveState(state);
+      await note('new-log');
+      assert.ok(body('new-log').includes('not applied: newer check-in than finding evidence'));
+      assert.equal(keep.loadTask('new-log').fm.status, 'active');
+      make('race');
+      race = () => keep.checkinTask('race', { message: 'Reopened by Jesse.', force: true, linkSession: false, commit: false });
+      await note('race');
+      assert.ok(body('race').includes('not applied: newer check-in than finding evidence'));
+      assert.equal(keep.loadTask('race').fm.status, 'active');
+      make('bundle-race');
+      const bundle = review.buildBundle('bundle-race', { force: true });
+      keep.checkinTask('bundle-race', { message: 'New check-in after bundle.', linkSession: false, commit: false });
+      await note('bundle-race', { bundle: bundle.bundleId });
+      assert.equal(keep.loadTask('bundle-race').fm.status, 'active');
+      assert.ok(body('bundle-race').includes('not applied: newer check-in than finding evidence'));
+      make('first-seen');
+      const firstSeen = review.loadState('first-seen');
+      const anchor = review.findingKey('first-seen', 'wrong-status', 'first-seen');
+      firstSeen.findings[anchor] = { kind: 'wrong-status', subject: 'first-seen', firstAt: new Date(2019, 0, 1).getTime(), lastAt: 0, count: 1 };
+      review.saveState(firstSeen);
+      await note('first-seen');
+      assert.equal(keep.loadTask('first-seen').fm.status, 'active');
+      assert.ok(body('first-seen').includes('not applied: newer check-in than finding evidence'));
+      make('dismissed');
+      const first = await note('dismissed', { suggestStatus: 'active' });
+      review.reviewDismiss('dismissed', first.key, 'Keep it open.');
+      const dismissedBody = body('dismissed');
+      for (const force of [false, true, false]) {
+        const refused = await note('dismissed', { force });
+        assert.equal(refused.notApplied, 'dismissed by Jesse');
+        assert.equal(keep.loadTask('dismissed').fm.status, 'active');
+        assert.equal(review.loadState('dismissed').findings[first.key].dismissed, true);
+        assert.equal(body('dismissed'), dismissedBody, 'dismissed finding is not re-posted');
+      }
+      make('batch-done');
+      make('batch-deferred');
+      make('batch-refused', { needs: [{ text: 'Approval' }] });
+      const notes = ['batch-done', 'batch-deferred', 'batch-refused'].map((id) => ({
+        id, kind: 'wrong-status', subject: id, severity: 'low', message: 'Obsolete.',
+        bundle: 'historical', suggestStatus: id === 'batch-deferred' ? 'deferred' : 'done',
+      }));
+      notes.push({ id: 'dismissed', kind: 'wrong-status', subject: 'dismissed', severity: 'low', message: 'Again.', bundle: 'historical', suggestStatus: 'done' });
+      const landed = await review.reviewLand({ notes });
+      assert.ok(landed.results.some((row) => row.detail.includes('not applied: dismissed by Jesse')));
+      assert.equal(body('dismissed'), dismissedBody);
+      assert.equal(landed.failed, 0, JSON.stringify(landed));
+      assert.equal(keep.loadTask('batch-done').fm.status, 'done');
+      assert.equal(keep.loadTask('batch-deferred').fm.status, 'deferred');
+      assert.equal(keep.loadTask('batch-refused').fm.status, 'active');
+      assert.ok(body('batch-refused').includes('not applied: open keep needs block'));
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `;
+  try {
+    for (const dir of ['tasks', 'archive', 'reviews']) fs.mkdirSync(path.join(root, dir));
+    spawnSync('git', ['init', '-q', root]);
+    spawnSync('git', ['-C', root, 'config', 'user.name', 'Keep Test']);
+    spawnSync('git', ['-C', root, 'config', 'user.email', 'keep@example.test']);
+    const out = spawnSync(process.execPath, ['-e', script], { env, cwd: root, encoding: 'utf8', timeout: 60000 });
+    assert.equal(out.status, 0, out.stderr);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

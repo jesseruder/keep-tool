@@ -15,6 +15,7 @@ const runs = require('./runs.js');
 const summarize = require('./summarize.js');
 const titles = require('./titles.js');
 const usage = require('./usage.js');
+const cardUsage = require('./card-usage.js');
 const codex = require('./codex.js');
 const transcripts = require('./transcripts.js');
 const review = require('./review.js');
@@ -37,6 +38,8 @@ const PORT = parseInt(process.env.KEEP_PORT || '7777', 10);
 const { PROJECTS_DIR, TAIL_BYTES, textOf, readTranscriptTail, findSessionFile } = transcripts;
 const WEB_ROOT = path.join(__dirname, '..', 'web');
 const SESSION_WINDOW_MS = 48 * 3600e3; // ignore transcripts older than this
+const claudeTranscriptIndex = require('./transcript-index').createTranscriptIndex(PROJECTS_DIR);
+const { compactState, wantsCompactState, createJobChangeTracker } = require('./dashboard-state');
 const execFileAsync = promisify(execFile);
 const ATTENTION_KINDS = new Set(['question', 'plan', 'permission', 'complete', 'input', 'review', 'blocked', 'overdue', 'unblocked', 'health', 'stalled']);
 const CODEX_DIALOG_MARKERS = [
@@ -45,6 +48,17 @@ const CODEX_DIALOG_MARKERS = [
   'Do you trust the contents of this directory?',
   'Press enter to continue',
 ];
+// Claude Code renders an AI prompt suggestion on the `❯` line only while the input box
+// is empty; typing any character hides it. The host trims trailing whitespace from screen
+// lines, so a space cannot tell a draft from a lagging re-render — a visible character can:
+// a suggestion collapses to exactly the probe key, a draft grows by it. A comma is harmless
+// at the Claude Code prompt (no leading-character mode like `/`, `!`, `#`, `@`, `:`, `?`)
+// and a no-op in vim NORMAL mode. Escape is not usable: on an empty prompt it opens rewind.
+const SUGGESTION_PROBE_KEY = ',';
+const SUGGESTION_PROBE_WAIT_MS = 150;
+const SUGGESTION_PROBE_MAX_MS = 2000;
+// A frozen or non-advancing clock must not spin the poll loop forever.
+const SUGGESTION_PROBE_MAX_READS = Math.ceil(SUGGESTION_PROBE_MAX_MS / SUGGESTION_PROBE_WAIT_MS) + 1;
 
 function attentionAckKey(item) {
   if (item.kind === 'health' && item.id) {
@@ -105,13 +119,19 @@ function attentionSince(value) {
 
 function setAsideCandidates(attention, sessions) {
   const represented = new Set(attention.map((item) => item.sessionId).filter(Boolean));
+  const bySession = new Map(sessions.map((session) => [session.id, session]));
   return [
-    ...attention,
+    ...attention.map((item) => {
+      const lastUserAt = bySession.get(item.sessionId)?.lastUserAt;
+      if (Number.isFinite(lastUserAt)) item.lastUserAt = lastUserAt;
+      return item;
+    }),
     ...sessions.filter((session) => !session.reviewer && !represented.has(session.id)).map((session) => ({
       kind: session.rateLimit ? 'rateLimit' : 'session',
       sessionId: session.id,
-      since: session.rateLimit?.at || session.mtime,
+      since: session.rateLimit?.at || session.attentionAt || session.mtime,
       synthetic: true,
+      ...(Number.isFinite(session.lastUserAt) ? { lastUserAt: session.lastUserAt } : {}),
     })),
   ];
 }
@@ -133,7 +153,8 @@ function applySetAside(attention, options = {}) {
   for (const [key, entry] of Object.entries(store.items || {})) {
     if (!setAsideEntryValid(entry)) { changed = true; continue; }
     if (entry.kind === 'snooze') {
-      if (entry.until <= now) { changed = true; continue; }
+      const userAt = current.get(key)?.lastUserAt;
+      if (entry.until <= now || (Number.isFinite(userAt) && userAt > entry.at)) { changed = true; continue; }
       items[key] = entry;
       continue;
     }
@@ -226,6 +247,13 @@ let onFocus = () => {};
 let injectionBusy = false;
 let sweepInFlight = false;
 let inFlightSwap = null;
+const daemonRestartGate = require('./daemon-restart').createGate({
+  pending: () => {
+    try { return fs.readdirSync(autoCompactDir()).filter(name => name.endsWith('.swap.json')); }
+    catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+  },
+  busy: () => sweepInFlight || injectionBusy,
+});
 let liveSessionTickInFlight = false;
 let lastAutoCompactGc = 0;
 let reviewStateCache = { at: 0, value: null };
@@ -258,6 +286,12 @@ function isBoundedBackgroundWatcher(name, input) {
   // servers, tails, and loops with no exit path must still surface as needing input.
   if (/^\s*sleep\s+\d+(?:\.\d+)?(?:ms|s|m|h|d)?(?:\s*(?:;|&&)\s*(?:echo|printf)\b[^\n]*)?\s*$/.test(command)) return true;
   if (/(^|[;&|]\s*)keep\s+wait\b/.test(command)) return true;
+  // Polling helpers hide their loop inside a script. A standalone wait_for_*
+  // shell helper with an explicit execution bound is still self-driven work.
+  // Do not classify arbitrary background scripts or compound commands this way.
+  if (Number.isFinite(input.timeout) && input.timeout > 0
+      && !/[\n;&|`$]/.test(command)
+      && /^\s*(?:(?:bash|sh|zsh)\s+)?["']?(?:[\w./-]+\/)?wait_for_[\w-]+\.sh["']?(?:\s+[^\n;&|]*)?\s*$/.test(command)) return true;
   const loop = command.match(/\b(while|until|for)\b[\s\S]*?\bdo\b/);
   const done = [...command.matchAll(/\bdone\b/g)].at(-1);
   const loopCommand = loop && done ? command.slice(loop.index, done.index) : '';
@@ -277,6 +311,13 @@ function isBoundedBackgroundWatcher(name, input) {
   const firstWord = tail.match(/^\S+/)?.[0];
   if (!['echo', 'printf', 'cat', 'date', 'node', 'python3', 'python', 'keep', 'tail'].includes(firstWord)) return false;
   return firstWord !== 'tail' || !/(?:^|\s)-\S*[fF]\S*(?:\s|$)/.test(tail);
+}
+
+function isBackgroundService(name, input) {
+  if (name !== 'Bash') return false;
+  const command = String(input?.command || '').replace(/^\s*#.*$/gm, '');
+  return /\b(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:dev|serve|watch)\b|\btail\s+-\S*[fF]|--(?:watch|continuous)\b/.test(command)
+    || (/\bwhile\s+(?:true|:)\s*(?:;|\bdo\b)/.test(command) && !/\b(?:break|exit)\b/.test(command));
 }
 
 function stallAliveIds(ledger, now) {
@@ -334,9 +375,13 @@ function scanTranscript(file, options = {}) {
   const out = { title: '', cwd: '', gitBranch: '', lastUser: '', lastHuman: '', lastUserAt: null, lastAssistant: '', lastTs: '' };
   const pending = new Map();
   const bgAgents = new Set(); // launched background agents with no completion notification yet
+  const agentResumedAt = {};
+  const completedAgents = {};
+  const seenCompletions = new Set();
   const bgTimers = new Set(); // finite background sleeps with no completion notification yet
   const bgMonitors = new Set();
   const bgCommands = new Set();
+  const bgServices = new Set();
   let lastAssistantToolIds = [];
   let lastRealEvent = '';
   let lastStopReason = null;
@@ -358,11 +403,16 @@ function scanTranscript(file, options = {}) {
       const terminalStatus = /<status>(?:completed|failed|killed|stopped|cancelled)<\/status>/i.test(notification);
       const monitorTimeout = /<event>\s*\[Monitor timed out — re-arm if needed\.\]\s*<\/event>/.test(notification);
       const legacyCompletion = !/<status>|<event>|<summary>Monitor event:/i.test(notification);
-      if (id && (terminalStatus || legacyCompletion || monitorTimeout)) {
+      const queued = j.type === 'queue-operation' && (!j.operation || j.operation === 'enqueue');
+      const delivered = j.type !== 'queue-operation' && !seenCompletions.has(notification.trim());
+      if (id && (terminalStatus || legacyCompletion || monitorTimeout) && (queued || delivered)) {
+        if (queued) seenCompletions.add(notification.trim());
+        completedAgents[id] = Date.parse(j.timestamp || '') || 0;
         bgAgents.delete(id);
         bgTimers.delete(id);
         bgMonitors.delete(id);
         bgCommands.delete(id);
+        bgServices.delete(id);
       }
     }
     if (out.exited && j.type !== 'file-history-snapshot') out.exited = false;
@@ -375,6 +425,8 @@ function scanTranscript(file, options = {}) {
     if (j.cwd) out.cwd = j.cwd;
     if (j.gitBranch) out.gitBranch = j.gitBranch;
     if (j.timestamp) out.lastTs = j.timestamp;
+    if ((['user', 'assistant'].includes(j.type) || (j.type === 'attachment' && j.attachment?.type === 'queued_command'))
+        && Number.isFinite(Date.parse(j.timestamp))) out.attentionAt = Date.parse(j.timestamp);
     if (j.type === 'user' && j.message) {
       if (Array.isArray(j.message.content)) {
         for (const item of j.message.content) {
@@ -385,9 +437,19 @@ function scanTranscript(file, options = {}) {
           const rt = typeof item.content === 'string' ? item.content : textOf(item.content);
           const backgroundCommand = rt && rt.match(/^Command running in background with ID:\s*([a-z0-9_-]+)/i);
           if (backgroundCommand) bgCommands.add(backgroundCommand[1]);
+          if (backgroundCommand && tool?.backgroundService) bgServices.add(backgroundCommand[1]);
           if (rt && rt.includes('Async agent launched')) {
             const m = rt.match(/agentId:\s*([a-z0-9_-]+)/i);
             if (m) bgAgents.add(m[1]);
+          }
+          if (rt && tool?.name === 'SendMessage' && !item.is_error) {
+            try {
+              const result = JSON.parse(rt);
+              if (result.success === true && /^[a-z0-9_-]+$/i.test(result.resumedAgentId || '')) {
+                bgAgents.add(result.resumedAgentId);
+                agentResumedAt[result.resumedAgentId] = Date.parse(j.timestamp || '') || 0;
+              }
+            } catch {} // Ordinary messages are not evidence of a new agent run.
           }
           if (rt && tool && tool.backgroundTimer) {
             const m = rt.match(/Command running in background with ID:\s*([a-z0-9_-]+)/i);
@@ -398,10 +460,12 @@ function scanTranscript(file, options = {}) {
             if (m) bgMonitors.add(m[1]);
           }
           if (tool?.name === 'TaskStop' && !item.is_error && /successfully stopped/i.test(rt)) {
+            if (tool.input?.task_id) completedAgents[tool.input.task_id] = Date.parse(j.timestamp || '') || 0;
             bgMonitors.delete(tool.input?.task_id);
             bgTimers.delete(tool.input?.task_id);
             bgAgents.delete(tool.input?.task_id);
             bgCommands.delete(tool.input?.task_id);
+            bgServices.delete(tool.input?.task_id);
           }
         }
       }
@@ -412,6 +476,7 @@ function scanTranscript(file, options = {}) {
       const hasToolResult = Array.isArray(j.message.content)
         && j.message.content.some((item) => item && item.type === 'tool_result');
       const humanAt = Date.parse(j.timestamp || '');
+      if (t && !hasToolResult && !j.isCompactSummary && !isWrapperUser(t) && Number.isFinite(humanAt)) out.turnStartedAt = humanAt;
       // Hook and cross-session wrappers arrive as user turns too; they are not Owner typing.
       if (t && !hasToolResult && !isWrapperUser(t) && !INJECTED_TURN_RE.test(t) && !/^\[keep\](?:\s|$)/.test(t)
           && !j.isCompactSummary && Number.isFinite(humanAt)
@@ -464,7 +529,7 @@ function scanTranscript(file, options = {}) {
           lastAssistantToolIds.push(item.id);
           pending.set(item.id, ['AskUserQuestion', 'ExitPlanMode'].includes(item.name)
             ? { name: item.name, input: item.input, ts: j.timestamp || '' }
-            : { name: item.name, input: item.name === 'TaskStop' ? item.input : undefined, waitingFor: sessionStatus.toolWaitReason(item.name, item.input), backgroundTimer: isBoundedBackgroundWatcher(item.name, item.input) });
+            : { name: item.name, input: item.name === 'TaskStop' ? item.input : undefined, waitingFor: sessionStatus.toolWaitReason(item.name, item.input), backgroundTimer: isBoundedBackgroundWatcher(item.name, item.input), backgroundService: isBackgroundService(item.name, item.input) });
         }
       }
       const t = textOf(j.message.content);
@@ -493,10 +558,17 @@ function scanTranscript(file, options = {}) {
   out.endedTurn = lastRealEvent === 'assistant' && pending.size === 0
     && (lastStopReason === 'end_turn' || (lastStopReason === null && lastAssistantHadText));
   out.explicitEndTurn = out.endedTurn && lastStopReason === 'end_turn';
+  // Local slash commands may finish on screen before Claude flushes stdout to
+  // its transcript. This is only permission to inspect the terminal, not idle proof.
+  out.localCommandPending = lastRealEvent === 'user' && /^\/(?:compact|model)(?:\s|$)/.test(out.lastUser || '')
+    ? out.lastUser : null;
   out.pendingBackground = bgAgents.size > 0 || bgTimers.size > 0 || bgMonitors.size > 0;
   out.backgroundAgents = [...bgAgents];
+  out.agentResumedAt = agentResumedAt;
+  out.completedAgents = completedAgents;
   out.backgroundTimerCount = bgTimers.size + bgMonitors.size;
   out.hasBackgroundCommands = bgCommands.size > 0;
+  out.unknownBackgroundJobs = [...bgCommands].filter((id) => !bgTimers.has(id) && !bgServices.has(id));
   out.backgroundParentFile = file;
   out.waitingFor = [...pending.values()].find((tool) => tool.waitingFor)?.waitingFor || null;
   return out;
@@ -512,6 +584,8 @@ function sessionBackgroundPending(info) {
       // Notifications can be absent even after the child has finished. Consult
       // its actual final turn; unknown/missing children remain conservatively pending.
       const state = scanTranscript(child, { includeSidechain: true });
+      // The child's previous completed turn cannot finish a newly resumed run.
+      if (info.agentResumedAt?.[id] && !(state.attentionAt >= info.agentResumedAt[id])) return true;
       return !state.explicitEndTurn || state.pendingOther || state.pendingBackground;
     } catch { return true; }
   });
@@ -556,6 +630,7 @@ class InjectionError extends Error {
 }
 
 async function withInjectionLock(fn) {
+  if (daemonRestartGate.stopping) throw new InjectionError(429, 'daemon restart is pending');
   if (injectionBusy) throw new InjectionError(429, 'another session injection is busy');
   injectionBusy = true;
   try {
@@ -761,6 +836,9 @@ async function listHostPanes(deps = {}, fresh = false) {
   try {
     const result = await requestHostClient(client, 'list', {}, deps);
     const panes = Array.isArray(result && result.panes) ? result.panes : [];
+    if (panes.some((p) => p?.alive && Number.isInteger(p.pid) && ['claude', 'codex'].includes(p.meta?.agent))) {
+      try { annotatePaneAgents(panes, await (deps.agentProcessRows || agentProcessRows)(deps)); } catch {}
+    }
     hostPaneCaches.set(client, { at: now(), panes });
     return panes;
   } catch {
@@ -769,12 +847,30 @@ async function listHostPanes(deps = {}, fresh = false) {
   }
 }
 
+function annotatePaneAgents(panes, rows) {
+  const byPid = new Map(rows.map((row) => [row.pid, row]));
+  for (const pane of panes) {
+    if (!pane?.alive || !['claude', 'codex'].includes(pane.meta?.agent)) continue;
+    const root = byPid.get(pane.pid);
+    if (!root) continue; // An incomplete process snapshot is not proof of exit.
+    const tree = new Set([pane.pid]);
+    for (let size = -1; size !== tree.size;) {
+      size = tree.size;
+      for (const row of rows) if (tree.has(row.ppid)) tree.add(row.pid);
+    }
+    const agent = rows.find((row) => tree.has(row.pid) && row.interactive && row.agent === pane.meta.agent);
+    if (agent) { pane.agentAlive = true; pane.agentPid = agent.pid; }
+    else if (tree.size === 1 && /^(?:\/bin\/(?:zsh|bash)|-(?:zsh|bash))(?:\s+-l)?$/.test(root.args)) {
+      pane.agentAlive = false;
+    }
+  }
+  return panes;
+}
+
 function sessionHostPane(panes, sessionId) {
   const matches = (Array.isArray(panes) ? panes : []).filter((pane) => pane && pane.meta
     && pane.meta.sessionId === sessionId);
-  matches.sort((a, b) => Number(Boolean(b.alive)) - Number(Boolean(a.alive))
-    || (Date.parse(b.createdAt || '') || 0) - (Date.parse(a.createdAt || '') || 0));
-  return matches[0] || null;
+  return matches.reduce((preferred, pane) => preferredHostPane(preferred, pane), null);
 }
 
 async function readScreenResult(target, lines, scrollback, deps = {}) {
@@ -846,13 +942,50 @@ function promptLine(screen) {
     .find((line) => /^\s*❯(?:\s|$)/.test(line));
 }
 
-function classifyPromptLine(beforeScreen, afterScreen) {
+function promptText(line) {
+  return line == null ? '' : line.replace(/^\s*❯\s*/, '').trim();
+}
+
+// Did the probe keystroke actually reach the input box? Only two shapes prove it: the
+// suggestion collapsed to exactly the probe key, or the existing text grew by it.
+// Anything else (a user edit landing at the same moment) must not trigger a Backspace.
+function probeLanded(beforeScreen, afterScreen, probe = SUGGESTION_PROBE_KEY) {
+  const afterText = promptText(promptLine(afterScreen));
+  if (afterText === probe) return true;
+  if (!afterText.endsWith(probe)) return false;
+  return normalizedText(afterText.slice(0, -probe.length))
+    === normalizedText(promptText(promptLine(beforeScreen)));
+}
+
+function classifyPromptLine(beforeScreen, afterScreen, probe = SUGGESTION_PROBE_KEY) {
   const before = promptLine(beforeScreen);
   const beforeText = before == null ? '' : before.replace(/^\s*❯\s*/, '');
   if (!normalizedText(beforeText)) return 'empty';
   const after = promptLine(afterScreen);
-  const afterText = after == null ? '' : after.replace(/^\s*❯\s*/, '');
-  return after != null && !normalizedText(afterText) ? 'suggestion' : 'draft';
+  // No prompt line at all: Claude Code is mid-render. Not evidence either way — the
+  // caller keeps polling and refuses at the deadline.
+  if (after == null) return 'unchanged';
+  const afterText = after.replace(/^\s*❯\s*/, '').trim();
+  // The suggestion is drawn only while the input value is empty, so the probe key
+  // replaces it outright. A draft keeps its text and grows by the probe key. A draft
+  // that is *already* exactly the probe key is the one case the collapsed suggestion
+  // cannot be told from a stale read, so it falls through to unchanged/draft instead.
+  if (afterText === probe && normalizedText(beforeText) !== probe) return 'suggestion';
+  if (normalizedText(afterText) === normalizedText(beforeText)) return 'unchanged';
+  return 'draft';
+}
+
+// The 409 body carries the screen tail, but nothing wrote it down: 21 refusals against
+// sessions that only showed a suggestion left no trace of what the prompt line held.
+function logDraftRefusal(target, message, beforeScreen, afterScreen, probe, deps = {}) {
+  const write = deps.stderr || process.stderr.write.bind(process.stderr);
+  const show = (line) => (line == null ? '(none)' : JSON.stringify(line));
+  const out = [`keep serve: draft refusal on pane ${(target && target.pane) || 'unknown'}: ${message}`];
+  out.push(`  prompt before: ${show(promptLine(beforeScreen))}`);
+  if (afterScreen != null) out.push(`  prompt after probe ${JSON.stringify(probe)}: ${show(promptLine(afterScreen))}`);
+  out.push('  screen tail:');
+  for (const line of screenTail(afterScreen == null ? beforeScreen : afterScreen).split('\n')) out.push(`    | ${line}`);
+  write(`${out.join('\n')}\n`);
 }
 
 async function probeSuggestion(target, beforeScreen, deps = {}) {
@@ -863,33 +996,105 @@ async function probeSuggestion(target, beforeScreen, deps = {}) {
   } catch (error) {
     precheckError = error;
   }
-  if (!/session input box already contains text/.test(precheckError.message)
-      || process.env.KEEP_PROBE_SUGGESTION === '0') {
+  const containsText = /session input box already contains text/.test(precheckError.message);
+  if (!containsText || process.env.KEEP_PROBE_SUGGESTION === '0') {
+    if (containsText) logDraftRefusal(target, precheckError.message, beforeScreen, null, null, deps);
     throw precheckError;
   }
 
   const read = deps.readScreen || ((t, lines, scrollback) => readScreen(t, lines, scrollback, deps));
   const wait = deps.wait || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const now = deps.now || Date.now;
+  const beforeText = promptText(promptLine(beforeScreen));
   let typed = false;
+  // The error we are on our way out with, so the finally block knows whether a failed
+  // Backspace is the only thing that went wrong.
+  let failure = null;
+  let lastScreen = null;
   try {
-    await writeTarget(target, ' ', deps);
-    typed = true;
-    await wait(400);
-    let afterScreen;
     try {
-      afterScreen = await read(target, 30, false);
-    } catch {
-      throw precheckError;
+      await writeTarget(target, SUGGESTION_PROBE_KEY, deps);
+      typed = true;
+    } catch (error) {
+      // A write that reported failure may still have delivered the keystroke. Watch
+      // for the probe's own signature — never for "something changed", which would
+      // Backspace a character the user typed at the same moment.
+      for (let attempt = 0; attempt < 3 && !typed; attempt += 1) {
+        await wait(SUGGESTION_PROBE_WAIT_MS);
+        try {
+          lastScreen = await read(target, 30, false);
+        } catch {
+          break;
+        }
+        if (probeLanded(beforeScreen, lastScreen)) typed = true;
+      }
+      throw error;
     }
-    if (classifyPromptLine(beforeScreen, afterScreen) === 'suggestion') return;
-    throw new InjectionError(409, 'the session input box contains a draft (not a prompt suggestion); clear it in the terminal first', {
-      screenTail: screenTail(afterScreen),
-    });
+    const startedAt = now();
+    let reads = 0;
+    for (;;) {
+      await wait(SUGGESTION_PROBE_WAIT_MS);
+      let afterScreen;
+      try {
+        afterScreen = await read(target, 30, false);
+      } catch {
+        logDraftRefusal(
+          target,
+          `${precheckError.message} (screen could not be re-read after the probe)`,
+          beforeScreen, null, null, deps,
+        );
+        throw precheckError;
+      }
+      reads += 1;
+      lastScreen = afterScreen;
+      const outcome = classifyPromptLine(beforeScreen, afterScreen);
+      // 'empty' cannot happen here (sendPrecheck already saw text), but an empty box
+      // is as safe to type into as a suggestion.
+      if (outcome === 'suggestion' || outcome === 'empty') return;
+      const afterText = promptText(promptLine(afterScreen));
+      const extra = () => ({
+        screenTail: screenTail(afterScreen),
+        probe: { key: SUGGESTION_PROBE_KEY, before: beforeText, after: afterText, outcome },
+      });
+      if (outcome === 'draft') {
+        const message = 'the session input box contains a draft (not a prompt suggestion); clear it in the terminal first';
+        logDraftRefusal(target, message, beforeScreen, afterScreen, SUGGESTION_PROBE_KEY, deps);
+        throw new InjectionError(409, message, extra());
+      }
+      // 'unchanged': Claude Code may simply not have re-rendered yet. Keep polling
+      // until the deadline, then refuse — an unreactive prompt is not provably empty.
+      if (now() - startedAt >= SUGGESTION_PROBE_MAX_MS || reads >= SUGGESTION_PROBE_MAX_READS) {
+        const message = 'the session input box shows text that did not react to a probe keystroke (a draft, or a prompt suggestion that has not re-rendered); clear it in the terminal first';
+        logDraftRefusal(target, message, beforeScreen, afterScreen, SUGGESTION_PROBE_KEY, deps);
+        throw new InjectionError(409, message, extra());
+      }
+    }
+  } catch (error) {
+    // Single place that records what we are throwing, so no exit path can reach the
+    // cleanup below looking like a success.
+    if (failure == null) failure = error;
+    throw error;
   } finally {
-    // Only undo a space that actually landed: a failed send followed by Backspace
+    // Only undo a keystroke that actually landed: a failed send followed by Backspace
     // would eat the last character of a real draft.
     if (typed) {
-      try { await pressTargetKey(target, 'Backspace', deps); } catch {}
+      try {
+        await pressTargetKey(target, 'Backspace', deps);
+      } catch (error) {
+        const message = 'the probe keystroke could not be undone; clear the session input box in the terminal first';
+        if (failure == null) {
+          // A probe we could not undo left a stray comma in the box, and nothing else
+          // went wrong — that is the whole refusal.
+          logDraftRefusal(target, message, beforeScreen, lastScreen, SUGGESTION_PROBE_KEY, deps);
+          throw new InjectionError(409, message, { screenTail: screenTail(lastScreen == null ? beforeScreen : lastScreen) });
+        }
+        // A more specific refusal is already on its way out and wins, but the stray
+        // comma still has to be visible to whoever reads the error or the log.
+        const detail = String((error && error.message) || error);
+        if (failure.extra) failure.extra.cleanupError = detail;
+        const write = deps.stderr || process.stderr.write.bind(process.stderr);
+        write(`keep serve: draft refusal cleanup failed on pane ${(target && target.pane) || 'unknown'}: ${detail}\n`);
+      }
     }
   }
 }
@@ -978,16 +1183,19 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
   const chunkChars = Math.max(1, Math.floor(envNumber('KEEP_SEND_CHUNK_CHARS', 200)));
   const chunkDelayMs = envNumber('KEEP_SEND_CHUNK_DELAY_MS', 120);
   const chunks = chunkForTyping(text, chunkChars);
+  deps.deliveryTrace?.('write-start');
   for (let index = 0; index < chunks.length; index += 1) {
     await writeTarget(target, chunks[index], deps);
     if (index + 1 < chunks.length && chunkDelayMs > 0) await sleep(chunkDelayMs);
   }
+  deps.deliveryTrace?.('write-finished');
   let confirmed = false;
   let confirmation = '';
   for (let attempt = 0; attempt < 4 && !confirmed; attempt += 1) {
     await sleep(400);
-    try { confirmation = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false); } catch { continue; }
+    try { confirmation = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false); } catch { deps.deliveryTrace?.('screen-read-failed'); continue; }
     confirmed = confirmationCheck(confirmation, text);
+    deps.deliveryTrace?.('screen-confirmation', { matched: confirmed });
   }
   if (!confirmed) {
     throw new InjectionError(409, 'message was typed but could not be confirmed; Enter was not pressed', {
@@ -995,7 +1203,9 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
     });
   }
   if (deps.beforeEnter) await deps.beforeEnter();
+  deps.deliveryTrace?.('enter-start');
   await pressTargetKey(target, 'Enter', deps);
+  deps.deliveryTrace?.('enter-sent');
   return { ok: true };
 }
 
@@ -1284,8 +1494,9 @@ function shutdownSettingsRepair(swap, currentSettings) {
 }
 
 function compactRestoreBusy(session) {
-  return !session || session.exited || session.endedTurn === false
+  return !session || session.exited || (session.endedTurn === false && !session.localCommandPending)
     || (session.state === 'running' && session.endedTurn === undefined)
+    || session.toolRunning || session.pendingOther
     || session.pendingQuestion || session.pendingPlan
     || (session.notify && ['permission', 'question'].includes(session.notify.type));
 }
@@ -1394,10 +1605,20 @@ async function sweepPendingCompactSwaps(deps = {}) {
           const current = scan().find((candidate) => candidate.id === record.sessionId);
           if (compactRestoreBusy(current)) return null;
           const target = await resolve(current, null, deps);
+          if (current.localCommandPending) {
+            const screen = await read(target, 30, false);
+            const after = linesAfterLastEcho(screen, current.localCommandPending).join('\n');
+            const complete = /^\/compact(?:\s|$)/.test(current.localCommandPending)
+              ? /(?:Compacted|Conversation compacted|Conversation recap|Not enough messages to compact)/i.test(after)
+              : /(?:Set model to|Switched to) /i.test(after);
+            if (!complete || !promptLine(screen) || /esc to (?:interrupt|cancel)|Compacting[.…]/i.test(screen)) return null;
+          }
           await precheck(current, target, deps);
           // typeAndSubmit confirms the typed command, but does not check the
-          // input box or modal before typing. Re-read after the suggestion probe.
-          sendPrecheck(await read(target, 30, false));
+          // input box or modal before typing. The re-read goes through the suggestion
+          // probe too: the probe's Backspace puts the prompt suggestion back, so a
+          // bare sendPrecheck here would see it again and refuse.
+          await probeSuggestion(target, await read(target, 30, false), deps);
           const via = String(record.switchModel || envString('KEEP_COMPACT_VIA_MODEL', 'opus')).trim();
           const before = readSettings();
           // /model also overwrites settings.json. Save a hand change so we can
@@ -1453,6 +1674,12 @@ async function sweepPendingCompactSwaps(deps = {}) {
 }
 
 async function compactSession(session, target, instruction, deps = {}) {
+  const leave = daemonRestartGate.enter();
+  try { return await compactSessionTransaction(session, target, instruction, deps); }
+  finally { leave(); }
+}
+
+async function compactSessionTransaction(session, target, instruction, deps = {}) {
   const sid = String(session && session.id || 'unknown').slice(0, 8);
   process.stderr.write(`keep serve: compacting ${session && session.kind || 'unknown'} session ${sid}\n`);
   const dir = deps.dir || autoCompactDir();
@@ -1751,7 +1978,7 @@ async function liveSessionPids(deps = {}) {
   // Explicit resume argv is the strongest process-to-session identity.
   for (const row of interactive) {
     const match = row.agent === 'claude'
-      ? /(?:^|\s)--resume\s+([A-Za-z0-9_-]+)(?=\s|$)/.exec(row.args)
+      ? /(?:^|\s)--(?:resume|session-id)\s+([A-Za-z0-9_-]+)(?=\s|$)/.exec(row.args)
       : /(?:^|\s)(?:\S*\/)?codex\s+(?:--?[A-Za-z0-9-]+(?:=\S*)?\s+)*resume\s+([A-Za-z0-9_-]+)(?=\s|$)/.exec(row.args);
     if (match) setLiveSession(live, match[1], row, 'argv');
   }
@@ -1829,13 +2056,13 @@ async function resolveSessionTarget(session, targetHint, deps = {}) {
   const panes = await listHostPanes(deps);
   if (targetHint?.expectedPane) {
     const selected = panes.find((pane) => pane.id === targetHint.expectedPane);
-    if (!selected?.alive || selected.meta?.sessionId !== session.id || selected.meta?.agent !== session.kind) {
+    if (!selected?.alive || selected.agentAlive === false || selected.meta?.sessionId !== session.id || selected.meta?.agent !== session.kind) {
       throw new InjectionError(409, 'selected pane is no longer a live instance of this session; nothing was sent');
     }
     return { pane: selected.id };
   }
   const hosted = sessionHostPane(panes, session.id);
-  if (hosted && hosted.alive) return { pane: hosted.id };
+  if (hosted && hosted.alive && hosted.agentAlive !== false) return { pane: hosted.id };
   throw new InjectionError(404, `${session.id} has no live host pane`, { notLive: true });
 }
 
@@ -1971,6 +2198,159 @@ async function sendSessionKeys(body, deps = {}) {
   });
 }
 
+async function closeExitedCodexShell(session, pane, deps = {}) {
+  if (!deps.closePolicy?.manual || session?.kind !== 'codex' || session.reviewer || !pane?.alive
+      || pane.meta?.sessionId !== session.id || pane.meta?.agent !== 'codex'
+      || pane.cmd !== '/bin/zsh' || JSON.stringify(pane.args) !== '["-l"]') return false;
+  const target = { pane: pane.id };
+  const verify = async () => {
+    const current = (await listHostPanes(deps, true))?.find((p) => p.id === pane.id);
+    if (!current?.alive || current.pid !== pane.pid || current.meta?.sessionId !== session.id || current.meta?.agent !== 'codex') return false;
+    const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
+    const shell = rows.find((p) => p.pid === pane.pid);
+    if (!shell || !/^(?:\/bin\/zsh|-zsh)(?:\s+-l)?$/.test(shell.args) || rows.some((p) => p.ppid === pane.pid)) return false;
+    const screen = await (deps.readScreenResult || readScreenResult)(target, null, false, deps);
+    const lines = String(screen?.text || '').split('\n');
+    const last = lines.findLastIndex((line) => line.trim());
+    // This is the console's zsh prompt, not a general-purpose shell parser.
+    // A draft after the prompt, a different prompt, or an unknown cursor fails closed.
+    if (!/^\s*(?:\([^)]*\) )?(?:~|\/)[^>\n]* >\s*$/.test(lines[last] || '')) return false;
+    if (!Number.isInteger(screen?.cursor?.x) || screen.cursor.x < lines[last].trimEnd().length
+        || screen.cursor.x > lines[last].trimEnd().length + 1 || screen.cursor.y !== last) return false;
+    return lines.slice(0, last).some((line) => line.trim() === `codex resume ${session.id}`);
+  };
+  if (!await verify()) return false;
+  if (!await verify()) throw new InjectionError(409, 'Leftover shell changed during Close; nothing closed');
+  // EOF closes an empty interactive shell without executing text or signalling a process.
+  await writeTarget(target, '\x04', deps);
+  return true;
+}
+
+// SessionEnd may demote the original pane to a shell before restart observes
+// the exit. Accept only that narrow transition, never another conversation.
+function restartPaneMatches(original, current, sessionId) {
+  return current?.pid === original.pid && current.createdAt === original.createdAt
+    && (current.meta?.sessionId === sessionId || (current.meta?.agent === 'shell' && !current.meta.sessionId));
+}
+
+async function closeRestartShell(original, session, originalAgentPid, deps) {
+  if (original.cmd !== '/bin/zsh' || JSON.stringify(original.args) !== '["-l"]') return false;
+  const verify = async () => {
+    const current = (await hostRequest('get', { pane: original.id }, deps)).pane;
+    if (!current?.alive || !restartPaneMatches(original, current, session.id)
+        || (deps.queued && (current.visibleAttached ?? current.attached) !== 0)) return false;
+    const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
+    const shell = rows.find(p => p.pid === original.pid);
+    if (!shell || !/^(?:\/bin\/zsh|-zsh)(?:\s+-l)?$/.test(shell.args)
+        || rows.some(p => p.pid === originalAgentPid || p.ppid === original.pid)) return false;
+    const screen = await (deps.readScreenResult || readScreenResult)({ pane: original.id }, null, false, deps);
+    const lines = String(screen?.text || '').split('\n');
+    const last = lines.findLastIndex(line => line.trim());
+    if (!/^\s*(?:\([^)]*\) )?(?:~|\/)[^>\n]* >\s*$/.test(lines[last] || '')
+        || !Number.isInteger(screen?.cursor?.x) || screen.cursor.y !== last
+        || screen.cursor.x < lines[last].trimEnd().length || screen.cursor.x > lines[last].trimEnd().length + 1) return false;
+    const resume = session.kind === 'claude' ? `claude --resume ${session.id}` : `codex resume ${session.id}`;
+    return lines.slice(0, last).some(line => line.trim() === resume);
+  };
+  if (!await verify()) return false;
+  if (!await verify()) throw new InjectionError(409, 'Original shell changed during restart');
+  await writeTarget({ pane: original.id }, '\x04', deps);
+  return true;
+}
+
+async function restartSession(body, deps = {}) {
+  const host = (type, params) => hostRequest(type, params, deps);
+  let exitInputStarted = false;
+  const transient = (reason) => body.mode === 'idle' && !exitInputStarted
+    ? new (require('./session-restart').RestartDeferred)(reason) : new InjectionError(409, reason);
+  return (deps.withInjectionLock || withInjectionLock)(async () => {
+    if (!(await host('hello')).replaceExited) throw Error('Terminal host must be refreshed before restarting sessions');
+    const pane = (await host('get', { pane: body.pane })).pane;
+    const session = (await (deps.buildState || buildState)({ hostPanes: [pane] })).sessions.find((s) => s.id === body.sessionId);
+    const reason = require('./session-restart').refusal(session, pane, body.mode === 'idle');
+    if (pane.pid !== body.pid) throw new InjectionError(409, 'Session process changed');
+    if (reason) {
+      if (/^Waiting |^Pause session-local scheduled jobs/.test(reason)) throw transient(reason);
+      throw new InjectionError(409, reason);
+    }
+    const cwd = session.project || pane.cwd;
+    if (!cwd || !fs.statSync(cwd).isDirectory()) throw Error('Session directory is unavailable');
+    const originalRows = await (deps.agentProcessRows || agentProcessRows)(deps);
+    const originalIdentity = (await liveSessionPids({ ...deps, agentProcessRows: async () => originalRows })).get(session.id);
+    if (!originalIdentity?.primary) throw Error('Original agent process identity is unverified');
+    const originalArgs = originalRows.find((p) => p.pid === originalIdentity.pid)?.args || '';
+    const ledger = require('./restart-ledger');
+    const file = session.kind === 'codex' ? (deps.codexRolloutFile || codex.rolloutFileFor)(session.id)
+      : (deps.claudeRolloutFile || findSessionFile)(session.id);
+    const resolveChild = session.kind === 'codex' ? deps.codexChildRolloutFile || codex.findRolloutFile
+      : (id, parentFile = file) => path.join(path.dirname(parentFile), path.basename(parentFile, '.jsonl'), 'subagents', `agent-${id}.jsonl`);
+    let childProof;
+    try {
+      childProof = ledger.verify({ root: deps.root || keep.ROOT, agent: session.kind, sid: session.id, file,
+        instance: { id: `${pane.id}:${pane.pid}:${originalIdentity.pid}`, processScoped: true, live: true }, resolveChild });
+    } catch (error) {
+      if (error instanceof ledger.Recovering) throw transient(error.message);
+      throw error;
+    }
+    const mcpRestart = require('./mcp-restart');
+    let restartHelpers;
+    const checkChildren = async () => {
+      const currentPane = (await host('get', { pane: pane.id })).pane;
+      if (!currentPane.alive || currentPane.pid !== pane.pid || currentPane.meta?.sessionId !== session.id) throw Error('Session changed during restart');
+      if (body.mode === 'idle' && (currentPane.visibleAttached ?? currentPane.attached) !== 0) throw transient('Waiting until the pane is no longer being viewed');
+      const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
+      const identity = (await liveSessionPids({ ...deps, agentProcessRows: async () => rows })).get(session.id);
+      if (!identity?.primary || identity.pid !== originalIdentity.pid || identity.pidStart !== originalIdentity.pidStart) throw Error('Agent process identity changed during restart');
+      const parent = rows.find((p) => p.pid === identity.pid);
+      const helpers = mcpRestart.inspect({ root: deps.root || keep.ROOT, agent: session.kind, sessionId: session.id, parent, rows });
+      if (restartHelpers && JSON.stringify(helpers) !== JSON.stringify(restartHelpers)) throw Error('Session helper processes changed during restart');
+      restartHelpers = helpers;
+      try { childProof(); } catch (error) {
+        if (['Job ledger source changed during restart', 'Job ledger evidence changed during restart', 'New hook activity arrived during restart'].includes(error.message)) throw transient(error.message);
+        throw error;
+      }
+    };
+    await checkChildren();
+    try {
+      await (deps.closeIdleSession || closeIdleSession)(body, { ...deps, restartProof: childProof, closePolicy: { manual: true, restart: true }, withInjectionLock: (fn) => fn(), beforeClose: checkChildren,
+        beforeExitInput: () => { exitInputStarted = true; },
+      });
+    } catch (error) {
+      if (!exitInputStarted && ['Session changed during cleanup; nothing closed', 'Waiting for the turn and background work to finish', 'Waiting for pending input to be resolved'].includes(error.message)) throw transient(error.message);
+      throw error;
+    }
+    const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    let stopped;
+    for (let i = 0; i < 30; i++) {
+      stopped = (await host('get', { pane: body.pane })).pane;
+      if (!restartPaneMatches(pane, stopped, session.id)) throw Error('Session process changed during restart');
+      if (!stopped.alive) break;
+      await closeRestartShell(pane, session, originalIdentity.pid, { ...deps, queued: body.mode === 'idle' });
+      await sleep(200);
+    }
+    if (stopped.alive) throw Error('Graceful exit did not finish; session was not force-closed');
+    let helpersStopped = false;
+    for (let i = 0; i < 30; i++) {
+      helpersStopped = mcpRestart.gone(restartHelpers || [], await (deps.agentProcessRows || agentProcessRows)(deps));
+      if (helpersStopped) break;
+      await sleep(200);
+    }
+    if (!helpersStopped) throw Error('Session helper did not exit; restart stopped without killing it');
+    const live = await liveSessionPids(deps);
+    if (live.has(session.id)) throw Error('An agent process still owns this conversation');
+    // Preserve an explicit permission bypass only when the old process used it.
+    // Do not apply the fresh-session defaults to a previously restricted agent.
+    const bypass = session.kind === 'codex' ? '--dangerously-bypass-approvals-and-sandbox' : '--dangerously-skip-permissions';
+    const flags = originalArgs.split(/\s+/).includes(bypass) ? [bypass] : [];
+    const argv = [session.kind, ...flags, session.kind === 'codex' ? 'resume' : '--resume', session.id];
+    const result = await host('replace-exited', { paneId: pane.id, expectedPid: pane.pid, sessionId: stopped.meta?.sessionId,
+      cmd: '/bin/zsh', args: ['-lic', `exec ${argv.map(shellQuoteArg).join(' ')}`], cwd,
+      cols: pane.cols, rows: pane.rows, meta: { ...pane.meta, agent: session.kind, sessionId: session.id, restartedAt: Date.now() } });
+    await (deps.waitForHostAgent || waitForHostAgent)({ pane: pane.id }, session.kind, deps);
+    return { ok: true, sessionId: session.id, pane: result.pane.id, pid: result.pane.pid };
+  });
+}
+
 async function closeIdleSession(body, deps = {}) {
   if (!/^[A-Za-z0-9_-]+$/.test(String(body.sessionId || '')) || !/^[A-Za-z0-9_-]+$/.test(String(body.pane || ''))) throw new InjectionError(400, 'Expected an exact session and pane');
   return (deps.withInjectionLock || withInjectionLock)(async () => {
@@ -1979,6 +2359,7 @@ async function closeIdleSession(body, deps = {}) {
     const state = await addHostSessionState(await (deps.buildState || buildState)({ hostPanes: panes }), { ...deps, panes });
     const session = state.sessions.find((s) => s.id === body.sessionId);
     const pane = state.panes.find((p) => p.id === body.pane);
+    if (await closeExitedCodexShell(session, pane, deps)) return { ok: true, closing: true, sessionId: session.id, pane: pane.id };
     const layouts = await keepConsole.readLayouts(path.join(deps.root || keep.ROOT, '.keep', 'layouts.json'));
     const pinned = new Set((layouts.layouts || []).flatMap((layout) => layout.ids || []));
     const reason = require('./session-cleanup').refusal(session, pane, pinned, Date.now(), deps.closePolicy);
@@ -1987,7 +2368,7 @@ async function closeIdleSession(body, deps = {}) {
       const owner = current.sessions.find((s) => s.id === session.id);
       const task = current.tasks.find((t) => t.id === owner?.taskId);
       const fm = task?.fm || task || {};
-      if ((!deps.closePolicy?.manual && fm.check_after) || fm.needs?.length || fm.depends_on?.length) throw new InjectionError(409, 'Task has a scheduled check, need, or dependency; leave the session open');
+      if ((!deps.closePolicy?.manual && fm.check_after) || fm.needs?.length || (!deps.closePolicy?.restart && fm.depends_on?.length)) throw new InjectionError(409, 'Task has a scheduled check, need, or dependency; leave the session open');
       // Explicit Close retires the process, not its durable scheduled recipes.
       // The scheduler falls back to a headless run when the owner is closed.
       if (!deps.closePolicy?.manual && current.tasks.some((t) => { const f = t.fm || t; return f.check_after && (f.scheduled_by === session.id || f.sessions?.some((s) => s.id === session.id)); })) throw new InjectionError(409, 'Session owns a scheduled check on another card');
@@ -1997,14 +2378,15 @@ async function closeIdleSession(body, deps = {}) {
     const target = await resolveSessionTarget(session, { expectedPane: pane.id }, deps);
     await precheckSessionTarget(session, target, deps); // Preserve unsent drafts and modal prompts.
     const fresh = session.kind === 'claude' ? (deps.claudeSessionFor || claudeSessionFor)(session.id) : (deps.codexSessionFor || codex.sessionFor)(session.id);
-    if (!fresh) throw new InjectionError(409, 'Session activity could not be verified');
+    if (!fresh || typeof fresh.endedTurn !== 'boolean' || !Number.isFinite(fresh.mtime)) throw new InjectionError(409, 'Session activity could not be verified');
     if (fresh.mtime !== session.mtime || fresh.endedTurn !== true || fresh.pendingBackground || fresh.toolRunning) throw new InjectionError(409, 'Session changed during cleanup; nothing closed');
-    if (session.kind === 'claude') {
+    let verifyCodexChildren = null;
+    if (session.kind === 'claude' && !(deps.closePolicy?.restart && deps.restartProof)) {
       const file = findSessionFile(session.id);
       if (!file || fs.statSync(file).size > 64 * 1024 * 1024) throw new InjectionError(409, 'Session history is too large to safely verify background completion');
       const lifecycle = scanTranscript(file, { full: true });
       if (lifecycle.hasBackgroundCommands || sessionBackgroundPending(lifecycle)) throw new InjectionError(409, 'Background command completion is unverified; leave the session open');
-    } else {
+    } else if (session.kind === 'codex') {
       // The transcript's ended turn does not prove that yielded Codex commands
       // ended. Automatic retirement requires no children; explicit Close may
       // override that conservative check (Codex also keeps idle runtime helpers).
@@ -2016,20 +2398,30 @@ async function closeIdleSession(body, deps = {}) {
         if (processes.some((p) => p.ppid === identity.pid)) throw new InjectionError(409, 'Automatic cleanup protects Codex child processes; use Close to request an explicit graceful exit');
         const file = (deps.codexRolloutFile || codex.rolloutFileFor)(session.id);
         if (!file || fs.statSync(file).size > 64 * 1024 * 1024) throw new InjectionError(409, 'Codex background history cannot be verified safely');
-        // Remote child agents do not have separate local PIDs. Until their
-        // lifecycle is independently reconciled, retain any session that used them.
+        // Remote children have no local PID. Verify durable child transcripts,
+        // not expiring UI hints, before retiring a parent that used them.
         const launched = fs.readFileSync(file, 'utf8').split('\n').some((line) => {
           let r; try { r = JSON.parse(line); } catch { return false; }
+          if (r.type === 'event_msg' && ['SubAgentActivity', 'CollabAgentToolCall'].includes(r.payload?.item?.type)) return true;
           const p = r.type === 'response_item' && r.payload;
           if (!p || !['function_call', 'custom_tool_call'].includes(p.type)) return false;
-          return /spawn_agent|spawn_agents|collaboration\.followup_task/.test(`${p.name || ''} ${p.arguments || ''} ${p.input || ''}`);
+          return /spawn_agent|spawn_agents|followup_task|send_input/.test(`${p.name || ''} ${p.arguments || ''} ${p.input || ''}`);
         });
-        if (launched) throw new InjectionError(409, 'Codex child-agent lifecycle is unverified; close manually after checking its agents');
+        if (launched) {
+          try { verifyCodexChildren = require('./codex-cleanup').verify(file, session.id, deps.codexChildRolloutFile || codex.findRolloutFile); }
+          catch (error) { throw new InjectionError(409, error.message); }
+        }
       }
     }
     const unchanged = async () => {
+      if (session.kind === 'codex' && !deps.closePolicy?.manual) {
+        const rows = await agentProcessRows(deps);
+        const identity = (await liveSessionPids({ ...deps, agentProcessRows: async () => rows })).get(session.id);
+        if (!identity?.primary || rows.some((p) => p.ppid === identity.pid)) throw new InjectionError(409, 'Codex child processes changed during cleanup');
+      }
       const latest = session.kind === 'claude' ? (deps.claudeSessionFor || claudeSessionFor)(session.id) : (deps.codexSessionFor || codex.sessionFor)(session.id);
-      if (!latest || latest.mtime !== session.mtime || latest.endedTurn !== true || latest.pendingBackground || latest.toolRunning || latest.pendingQuestion || latest.pendingPlan) throw new InjectionError(409, 'Session changed during cleanup; nothing closed');
+      if (!latest || typeof latest.endedTurn !== 'boolean' || !Number.isFinite(latest.mtime)) throw new InjectionError(409, 'Session activity could not be verified');
+      if (latest.mtime !== session.mtime || latest.endedTurn !== true || latest.pendingBackground || latest.toolRunning || latest.pendingQuestion || latest.pendingPlan) throw new InjectionError(409, 'Session changed during cleanup; nothing closed');
       if (deps.closePolicy?.automatic) {
         const currentPane = (await listHostPanes(deps, true))?.find((p) => p.id === pane.id);
         if (!currentPane?.alive || currentPane.attached !== 0 || currentPane.meta?.sessionId !== session.id) throw new InjectionError(409, 'Session acquired a viewer or changed during cleanup');
@@ -2037,8 +2429,13 @@ async function closeIdleSession(body, deps = {}) {
         if ((currentLayouts.layouts || []).some((layout) => layout.ids?.includes(pane.id))) throw new InjectionError(409, 'Session was pinned during cleanup');
       }
       checkTaskSafety(await (deps.buildState || buildState)({ hostPanes: panes }));
+      if (verifyCodexChildren) {
+        try { verifyCodexChildren(); } catch (error) { throw new InjectionError(409, error.message); }
+      }
+      if (deps.beforeClose) await deps.beforeClose();
     };
     await unchanged();
+    deps.beforeExitInput?.();
     // Claude's slash menu can occupy more than 30 rows below the input.
     await typeAndSubmit(target, '/exit', (screen, text) => closeDraftVisible(screen, text, session.kind), {
       ...deps, confirmationLines: session.kind === 'claude' ? null : 30, beforeEnter: unchanged,
@@ -2300,6 +2697,7 @@ function startAutoCompact() {
 
 async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
   const pendingDirectory = deps.deliveryDirectory || path.join(keep.ROOT, '.keep', 'delivery');
+  const trace = require('./delivery-trace').recorder(pendingDirectory, session, target.pane);
   const precheck = async () => {
   await precheckSessionTarget(session, target, deps);
   if (opts && opts.compactIfCold && !session.reviewer) {
@@ -2319,14 +2717,15 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
   const confirmation = session.kind === 'codex' ? codexTypedTextVisible : claudeTypedTextVisible;
   try {
     return await require('./delivery').deliver({
-      session, pane: target.pane, text, file: transcriptFileForSession(session), directory: pendingDirectory,
+      session, pane: target.pane, text, file: transcriptFileForSession(session), directory: pendingDirectory, trace,
       retainReceipt: opts?.retainReceipt === true,
       key: opts?.deliveryKey,
       precheck,
-      type: () => typeAndSubmit(target, text, confirmation, deps),
+      type: () => typeAndSubmit(target, text, confirmation, { ...deps, deliveryTrace: trace }),
       submitDraft: () => pressTargetKey(target, 'Enter', deps),
       draftMatches: async () => {
         const current = session.kind === 'claude' ? claudeSessionFor(session.id) : codex.sessionFor(session.id);
+        trace('draft-session-state', { idle: current?.endedTurn === true, question: Boolean(current?.pendingQuestion), plan: Boolean(current?.pendingPlan) });
         if (!current || current.endedTurn !== true || current.pendingQuestion || current.pendingPlan) return false;
         const screen = await readScreenResult(target, 200, false, deps);
         const lines = String(screen.text || '').split(/\r?\n/);
@@ -2335,8 +2734,10 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
         lines.forEach((line, i) => { if (prompt.test(line)) start = i; });
         let end = start;
         while (end + 1 < lines.length && lines[end + 1].trim() && !/^\s*[─━]/.test(lines[end + 1])) end++;
-        return Number.isFinite(screen.cursor?.y) && screen.cursor.y >= start && screen.cursor.y <= end
-          && exactDraft(screen.text, text, session.kind);
+        const cursorInPrompt = Number.isFinite(screen.cursor?.y) && screen.cursor.y >= start && screen.cursor.y <= end;
+        const matched = exactDraft(screen.text, text, session.kind);
+        trace('draft-screen-check', { cursorInPrompt, matched });
+        return cursorInPrompt && matched;
       },
     });
   } catch (error) {
@@ -2617,7 +3018,10 @@ async function openSession(body, deps = {}) {
   body = body && typeof body === 'object' ? body : {};
   if (body.agent != null && !['claude', 'codex'].includes(body.agent)) throw new InjectionError(400, 'agent must be claude or codex');
   if (body.command != null) throw new InjectionError(400, 'command is not accepted');
-  const message = body.message == null ? '' : normalizedText(body.message).slice(0, 2000);
+  if (body.message != null && String(body.message).length > keep.OPEN_MESSAGE_LIMIT) {
+    throw new InjectionError(400, keep.OPEN_MESSAGE_ERROR);
+  }
+  const message = body.message == null ? '' : normalizedText(body.message);
   if (body.message != null && !message) throw new InjectionError(400, 'message is empty');
   if (body.requester != null && (typeof body.requester !== 'string' || !/^[A-Za-z0-9_-]+$/.test(body.requester))) {
     throw new InjectionError(400, 'bad requester session id');
@@ -2799,6 +3203,7 @@ async function openSession(body, deps = {}) {
 }
 const scanCache = new Map(); // file -> { mtimeMs, size, info }
 const claudeSessionPathCache = new Map(); // session id -> transcript file
+const backgroundTargets = new Map();
 const claudeSessionParseCache = new Map(); // file -> { mtimeMs, size, info }
 const SESSION_LOOKUP_CACHE_LIMIT = 300;
 let sessionSnapshot = [];
@@ -2813,8 +3218,13 @@ function cacheClaudeSessionLookup(cache, key, value) {
 }
 
 function claudeSessionFromInfo(id, info, stat, dir, reviewer, now) {
+  if (info.backgroundParentFile) cacheClaudeSessionLookup(claudeSessionPathCache, id, info.backgroundParentFile);
   const activityMs = transcriptActivityMs(info, stat.mtimeMs);
   const ageMs = now - activityMs;
+  const lifecycle = require('./session-lifecycle');
+  const lifecycleEvents = lifecycle.read(keep.ROOT, id, now);
+  const lifecycleAgents = info.backgroundParentFile ? lifecycle.pendingAgents(lifecycleEvents,
+    info.backgroundParentFile, (file) => scanTranscript(file, { includeSidechain: true }), now, info.completedAgents) : [];
   return {
     id,
     kind: 'claude',
@@ -2825,16 +3235,25 @@ function claudeSessionFromInfo(id, info, stat, dir, reviewer, now) {
     lastUser: info.lastUser.slice(0, 300),
     lastHuman: info.lastHuman,
     lastUserAt: info.lastUserAt,
+    turnStartedAt: info.turnStartedAt,
     lastAssistant: info.lastAssistant.slice(0, 300),
     lastAssistantFull: info.lastAssistant.slice(0, 12000),
     mtime: activityMs,
+    attentionAt: info.attentionAt,
     size: stat.size,
     exited: info.exited === true,
     state: info.exited ? 'recent' : info.endedTurn ? (ageMs < 3600e3 ? 'idle' : 'recent') : 'running',
     pendingQuestion: info.pendingQuestion,
     pendingPlan: info.pendingPlan,
     endedTurn: info.endedTurn,
-    pendingBackground: sessionBackgroundPending(info),
+    localCommandPending: info.localCommandPending,
+    pendingOther: info.pendingOther,
+    pendingBackground: lifecycleAgents.length > 0 || sessionBackgroundPending(info),
+    unknownBackgroundJobs: info.unknownBackgroundJobs || [],
+    lifecycleAgents,
+    lifecycleForeground: lifecycle.foreground(lifecycleEvents, info, now),
+    lifecycleStop: lifecycle.stopReason(lifecycleEvents, info),
+    lifecycleTurnAt: lifecycle.turnAt(lifecycleEvents),
     waitingFor: info.waitingFor,
     toolRunning: info.toolRunning,
     rateLimit: info.rateLimit || null,
@@ -2899,61 +3318,48 @@ function scanClaudeSessions(options = {}) {
       } catch {}
     }
   } catch {}
-  let dirs = [];
-  try { dirs = fs.readdirSync(PROJECTS_DIR); } catch {}
   const seen = new Set();
   const sessionIds = new Set();
-  for (const dir of dirs) {
-    const full = path.join(PROJECTS_DIR, dir);
-    let files;
-    try { files = fs.readdirSync(full); } catch { continue; }
-    for (const f of files) {
-      if (!f.endsWith('.jsonl')) continue;
-      const id = f.slice(0, -6);
-      const file = path.join(full, f);
-      let stat;
-      try { stat = fs.statSync(file); } catch { continue; }
-      if (!stat.isFile()) continue;
-      sessionIds.add(id);
-      if (spawned.has(id) || now - stat.mtimeMs > SESSION_WINDOW_MS) continue;
-      seen.add(file);
-      let info;
-      const cached = scanCache.get(file);
-      if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-        info = cached.info;
-      } else {
-        try { info = scanTranscript(file); } catch { continue; }
-        scanCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, info });
-      }
-      // headless `claude -p` spawns (batch jobs from any project) have no TUI
-      // records and never earn a title — they're pipeline noise, not sessions
-      if (!info.title && !info.interactive) continue;
-      // Claude can append untimestamped housekeeping records (ai-title, mode,
-      // bridge-session) when an old session is merely reopened or inspected. Those
-      // writes are not conversation activity and must not resurrect the session.
-      const activityMs = transcriptActivityMs(info, stat.mtimeMs);
-      const ageMs = now - activityMs;
-      if (ageMs > SESSION_WINDOW_MS) continue;
-      const session = claudeSessionFromInfo(id, info, stat, dir, reviewers.has(id), now);
-      try {
-        const markerFile = path.join(attentionDir, `${id}.json`);
-        const marker = JSON.parse(fs.readFileSync(markerFile, 'utf8'));
-        if (marker.source !== 'codex') {
-          const at = Number(marker.at);
-          // Liveness follows timestamped conversation activity, not raw file writes:
-          // Claude appends untimestamped metadata when old sessions are reopened.
-          // Prefer the mtime captured at hook time (mt); fall back to wall-clock for
-          // markers written by older hooks.
-          const ref = Number.isFinite(Number(marker.mt)) ? Number(marker.mt) + 1500 : at + 5000;
-          if (!Number.isFinite(at) || now - at > 24 * 3600e3 || activityMs > ref) {
-            if (!readOnly) try { fs.unlinkSync(markerFile); } catch {}
-          } else if (['permission', 'waiting', 'complete'].includes(marker.type)) {
-            session.notify = { type: marker.type, message: String(marker.message || '').slice(0, 200) };
-          }
-        }
-      } catch {}
-      sessions.push(session);
+  for (const { dir, file, id, stat } of claudeTranscriptIndex.scan({ fresh: options.dashboard !== true })) {
+    sessionIds.add(id);
+    if (spawned.has(id) || now - stat.mtimeMs > SESSION_WINDOW_MS) continue;
+    seen.add(file);
+    let info;
+    const cached = scanCache.get(file);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      info = cached.info;
+    } else {
+      try { info = scanTranscript(file); } catch { continue; }
+      scanCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, info });
     }
+    // headless `claude -p` spawns (batch jobs from any project) have no TUI
+    // records and never earn a title — they're pipeline noise, not sessions
+    if (!info.title && !info.interactive) continue;
+    // Claude can append untimestamped housekeeping records (ai-title, mode,
+    // bridge-session) when an old session is merely reopened or inspected. Those
+    // writes are not conversation activity and must not resurrect the session.
+    const activityMs = transcriptActivityMs(info, stat.mtimeMs);
+    const ageMs = now - activityMs;
+    if (ageMs > SESSION_WINDOW_MS) continue;
+    const session = claudeSessionFromInfo(id, info, stat, dir, reviewers.has(id), now);
+    try {
+      const markerFile = path.join(attentionDir, `${id}.json`);
+      const marker = JSON.parse(fs.readFileSync(markerFile, 'utf8'));
+      if (marker.source !== 'codex') {
+        const at = Number(marker.at);
+        // Liveness follows timestamped conversation activity, not raw file writes:
+        // Claude appends untimestamped metadata when old sessions are reopened.
+        // Prefer the mtime captured at hook time (mt); fall back to wall-clock for
+        // markers written by older hooks.
+        const ref = Number.isFinite(Number(marker.mt)) ? Number(marker.mt) + 1500 : at + 5000;
+        if (!Number.isFinite(at) || now - at > 24 * 3600e3 || activityMs > ref) {
+          if (!readOnly) try { fs.unlinkSync(markerFile); } catch {}
+        } else if (['permission', 'waiting', 'complete'].includes(marker.type)) {
+          session.notify = { type: marker.type, message: String(marker.message || '').slice(0, 200) };
+        }
+      }
+    } catch {}
+    sessions.push(session);
   }
   for (const key of scanCache.keys()) if (!seen.has(key)) scanCache.delete(key);
   if (!readOnly) try {
@@ -3055,9 +3461,9 @@ async function liveSessionTick(deps = {}) {
     const hostPanes = await listHostPanes(deps, true) || [];
     for (const pane of hostPanes) {
       const meta = pane && pane.meta;
-      if (!pane.alive || !meta || !/^[A-Za-z0-9_-]+$/.test(String(meta.sessionId || ''))) continue;
+      if (!pane.alive || pane.agentAlive === false || !meta || !/^[A-Za-z0-9_-]+$/.test(String(meta.sessionId || ''))) continue;
       live.set(meta.sessionId, {
-        pid: Number.isInteger(pane.pid) ? pane.pid : null,
+        pid: pane.agentPid || (Number.isInteger(pane.pid) ? pane.pid : null),
         agent: meta.agent || 'claude',
         project: meta.project || '',
         source: 'host',
@@ -3133,11 +3539,7 @@ async function restorePlan(query, deps = {}) {
     const id = pane && pane.meta && pane.meta.sessionId;
     if (!/^[A-Za-z0-9_-]+$/.test(String(id || ''))) continue;
     const current = paneBySession.get(id);
-    if (!current || (!current.alive && pane.alive)
-        || Boolean(current.alive) === Boolean(pane.alive)
-          && (Date.parse(pane.createdAt || '') || 0) > (Date.parse(current.createdAt || '') || 0)) {
-      paneBySession.set(id, pane);
-    }
+    paneBySession.set(id, preferredHostPane(current, pane));
   }
   for (const [id, pane] of paneBySession) {
     const meta = pane.meta || {};
@@ -3149,7 +3551,7 @@ async function restorePlan(query, deps = {}) {
       project: meta.project || previous.project || '',
       source: 'host',
       primary: true,
-      lastSeenAlive: pane.alive ? now
+      lastSeenAlive: pane.alive && pane.agentAlive !== false ? now
         : Date.parse(pane.exitedAt || pane.lastOutputAt || pane.createdAt || '') || previous.lastSeenAlive || now,
     });
   }
@@ -3162,7 +3564,7 @@ async function restorePlan(query, deps = {}) {
 
     const session = scannedById.get(id);
     const pane = paneBySession.get(id);
-    const state = live.has(id) || pane && pane.alive ? 'alive' : 'gone';
+    const state = live.has(id) || pane && pane.alive && pane.agentAlive !== false ? 'alive' : 'gone';
     const agent = entry.agent || session && (session.kind || session.agent) || 'claude';
     let codexChild = false;
     if (agent === 'codex') {
@@ -3171,7 +3573,7 @@ async function restorePlan(query, deps = {}) {
       } else {
         try {
           const meta = (deps.codexSessionMeta || codex.sessionMetaFor)(id);
-          codexChild = Boolean(meta && meta.originator === 'Claude Code');
+          codexChild = codex.isChildSession(meta);
         } catch {}
       }
     }
@@ -3179,7 +3581,7 @@ async function restorePlan(query, deps = {}) {
     const hasTranscript = agent === 'codex' || Boolean((deps.transcriptExists || findSessionFile)(id));
     let action = 'skip';
     let reason;
-    if (codexChild) reason = 'codex child of a Claude session';
+    if (codexChild) reason = 'codex child session';
     else if (session && session.exited) reason = 'session exited';
     else if (!hasTranscript) reason = 'no transcript to resume (zero-turn session)';
     else if (state === 'alive') reason = 'agent process is alive';
@@ -3233,10 +3635,14 @@ function stalledSessionSnapshot(now = Date.now()) {
 
 // ---------- state assembly ----------
 
+function applyHostedExitState(sessions, panes, independentLive) {
+  require('./session-model').attachRuntime(sessions, panes || [], independentLive);
+}
+
 function applySessionLiveness(sessions, ledger, panes, now = Date.now()) {
   const aliveIds = stallAliveIds(ledger, now);
   const paneAliveIds = new Set((panes || [])
-    .filter((pane) => pane?.alive && pane.meta?.sessionId)
+    .filter((pane) => pane?.alive && pane.agentAlive !== false && pane.meta?.sessionId)
     .map((pane) => pane.meta.sessionId));
   const kept = [];
   for (const session of sessions || []) {
@@ -3301,23 +3707,32 @@ function ensureDigest() {
 }
 
 function buildState(options = {}) {
+  let cardUsageSummary = null;
+  try { cardUsageSummary = cardUsage.snapshot(keep.ROOT); } catch (error) { health.record('card-usage', { ok: false, error }); }
   const tasks = keep.loadAll(false).map((t) => ({
     id: t.id,
     fm: t.fm,
     body: t.body,
+    modelUsage: cardUsage.forCard(cardUsageSummary, t.id),
     lastLog: keep.lastLogLine(t),
     overdue: keep.isOverdue(t),
   }));
-  const sessions = scanSessions({ dashboard: true });
+  const sessions = scanSessions({ dashboard: options.dashboard === true });
+  const now = typeof options.now === 'function' ? Number(options.now()) : Number(options.now ?? Date.now());
+  const liveLedger = readLiveSessionLedger(options);
+  const independentLive = stallAliveIds({ ...liveLedger, sessions: Object.fromEntries(
+    Object.entries(liveLedger.sessions || {}).filter(([, entry]) => entry.source !== 'host'),
+  ) }, now);
   if (Object.prototype.hasOwnProperty.call(options, 'hostPanes')) {
     backfillHostSessions(sessions, options.hostPanes, {
       tasks,
       codexSessionFor: options.codexSessionFor,
       claudeSessionFor: options.claudeSessionFor,
+      independentLive,
     });
   }
-  // Archiving a completed card must not turn its still-open terminal into a
-  // new instruction request. Current card links win over historical links.
+  // Current card links win over historical links; task progress stays separate
+  // from the live conversation's readiness for another instruction.
   const allTasks = keep.loadAll(true);
   const byId = { ...sessionTaskOwners(allTasks), ...sessionTaskOwners(tasks) };
   const taskById = new Map([...allTasks, ...tasks].map((task) => [task.id, task]));
@@ -3325,17 +3740,38 @@ function buildState(options = {}) {
     s.taskId = byId[s.id] || null;
     s.taskStatus = taskById.get(s.taskId)?.fm.status || null;
   }
-  const now = typeof options.now === 'function' ? Number(options.now()) : Number(options.now ?? Date.now());
   titles.applyLiveTitles(sessions, { onChange, taskFor: (session) => taskById.get(session.taskId) });
-  applySessionLiveness(sessions, readLiveSessionLedger(options), options.hostPanes || [], now);
+  applySessionLiveness(sessions, liveLedger, options.hostPanes || [], now);
   const dependencyCache = new Map();
-  const liveHostedSessions = new Set((options.hostPanes || []).filter((pane) => pane.alive).map((pane) => pane.meta?.sessionId));
+  const ownerQuestions = new Map();
+  for (const question of review.loadQuestions()) {
+    const id = question.from?.sessionId;
+    if (['owner', 'jesse'].includes(question.to) && question.status === 'open' && id && !ownerQuestions.has(id)) ownerQuestions.set(id, question);
+  }
+  const liveHostedSessions = new Set((options.hostPanes || []).filter((pane) => pane.alive && pane.agentAlive !== false).map((pane) => pane.meta?.sessionId));
+  applyHostedExitState(sessions, options.hostPanes, independentLive);
   for (const session of sessions) {
+    if (['claude', 'codex'].includes(session.kind) && options.hostPanes) {
+      const file = session.kind === 'claude' ? claudeSessionPathCache.get(session.id) : codex.rolloutFileFor(session.id);
+      if (file) {
+        const hosted = options.hostPanes.find(p => p.id === session.runtime?.paneId);
+        backgroundTargets.set(`${session.kind}:${session.id}`, { agent: session.kind, sid: session.id, file,
+          instance: { id: hosted?.agentPid ? `${hosted.id}:${hosted.pid}:${hosted.agentPid}` : null,
+            processScoped: true, live: session.runtime?.state === 'live' ? true : session.runtime?.state === 'exited' ? false : null } });
+        const jobs = require('./background-jobs').read(keep.ROOT, session.kind, session.id, now);
+        session.backgroundJobs = jobs;
+        session.pendingBackground = jobs.pending || (!jobs.caughtUp && session.pendingBackground);
+        session.unknownBackgroundJobs = [...new Set([...jobs.uncertain, ...(!jobs.caughtUp ? session.unknownBackgroundJobs || [] : [])])];
+      }
+    }
     const task = taskById.get(session.taskId);
+    session.ownerQuestion = ownerQuestions.get(session.id) || null;
     if (task && !dependencyCache.has(task.id)) dependencyCache.set(task.id, keep.unresolvedDependencyIds(task));
     session.activity = sessionStatus.activity(session, { task, dependencies: dependencyCache.get(task?.id) || [], live: liveHostedSessions.has(session.id) });
+    session.observation = require('./session-model').normalize(session, { task, dependencies: dependencyCache.get(task?.id) || [], live: liveHostedSessions.has(session.id) });
     session.state = session.activity.state;
     session.stateLabel = session.activity.label;
+    require('./session-debug').record(session, now);
   }
   const stalledItems = stalled.readCurrent({ root: keep.ROOT });
   const stalledSessionIds = new Set(stalledItems.filter((item) => item.kind === 'session').map((item) => item.id));
@@ -3392,6 +3828,9 @@ function buildState(options = {}) {
   const alertMeta = alerts.loadMeta(keep.ROOT);
   const state = {
     generatedAt: Date.now(),
+    scopes: { ...require('./preferences').scopes(), home: os.homedir() },
+    projectCatalog: require('./preferences').projectCatalog(),
+    restarts: require('./session-restart').read(path.join(keep.ROOT, '.keep', 'session-restarts.json')),
     tasks,
     sessions,
     attention: visibleAttention,
@@ -3482,6 +3921,8 @@ function buildState(options = {}) {
 // a session relaunched after Ctrl+C is attached to the pane that carries its exit.
 function preferredHostPane(current, pane) {
   if (!current) return pane;
+  const liveAgent = (p) => Boolean(p.alive && p.agentAlive !== false);
+  if (liveAgent(current) !== liveAgent(pane)) return liveAgent(pane) ? pane : current;
   if (Boolean(current.alive) !== Boolean(pane.alive)) return pane.alive ? pane : current;
   const stamp = (candidate) => Date.parse(candidate.exitedAt || candidate.createdAt || '') || 0;
   return stamp(pane) > stamp(current) ? pane : current;
@@ -3536,7 +3977,7 @@ function backfillHostSessions(sessions, panes, deps = {}) {
       session.pane = pane.id;
       session.hostOnly = true;
       session.taskId = owners[id] || null;
-      if (!pane.alive) {
+      if ((!pane.alive || pane.agentAlive === false) && !deps.independentLive?.has(id)) {
         // An exited agent cannot be answered: keep the transcript tail for display
         // but drop the prompts that would otherwise resurface in "Needs you".
         session.state = 'exited';
@@ -3939,9 +4380,9 @@ function start(deps = {}) {
   // A focus request (mobile 'Open on Mac') is a named SSE event the console acts on.
   onFocus = (sessionId) => { for (const res of clients) res.write(`event: focus\ndata: ${sessionId}\n\n`); };
 
-  const watch = (target, opts) => {
+  const watch = (target, opts, invalidate) => {
     try {
-      const w = fs.watch(target, opts || {}, broadcast);
+      const w = fs.watch(target, opts || {}, (_event, name) => { invalidate?.(name); broadcast(); });
       w.on('error', () => {}); // a dead watch must never crash the server; the client's 30s poll covers it
     } catch (e) {
       process.stderr.write(`keep serve: cannot watch ${target} (${e.message}); relying on client polling\n`);
@@ -3962,7 +4403,37 @@ function start(deps = {}) {
   watch(path.join(keep.ROOT, '.keep', 'unblocked'));
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'review'), { recursive: true }); } catch {}
   watch(path.join(keep.ROOT, '.keep', 'review'));
-  watch(PROJECTS_DIR, { recursive: true });
+  watch(PROJECTS_DIR, { recursive: true }, (name) => claudeTranscriptIndex.invalidate(name));
+  watch(path.join(os.homedir(), '.codex', 'sessions'), { recursive: true });
+  try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'lifecycle'), { recursive: true }); } catch {}
+  watch(path.join(keep.ROOT, '.keep', 'lifecycle'), { recursive: true });
+
+  const jobLedger = require('./background-jobs');
+  for (const target of jobLedger.targets(keep.ROOT)) backgroundTargets.set(`${target.agent}:${target.sid}`, target);
+  // One bounded incremental read per tick, outside HTTP state assembly.
+  let jobCursor = 0;
+  const jobsChanged = createJobChangeTracker();
+  const jobTick = () => {
+    const targets = [...backgroundTargets.values()];
+    if (!targets.length) return;
+    const target = jobLedger.nextTarget(targets, jobCursor++);
+    try {
+      const result = jobLedger.sync({ root: keep.ROOT, ...target,
+        classify: (name, input) => isBoundedBackgroundWatcher('Bash', { ...input, command: input?.command || input?.cmd, run_in_background: true }) ? 'finite'
+          : isBackgroundService('Bash', { ...input, command: input?.command || input?.cmd }) ? 'service' : 'unknown',
+        inspectAgent: (id) => {
+          if (target.agent === 'claude') {
+            if (!/^[a-zA-Z0-9_-]{1,160}$/.test(id)) return null;
+            const child = scanTranscript(path.join(path.dirname(target.file), path.basename(target.file, '.jsonl'), 'subagents', `agent-${id}.jsonl`), { includeSidechain: true });
+            return { at: child.attentionAt || 0, done: child.explicitEndTurn && !child.pendingOther && !child.pendingBackground };
+          }
+          return require('./codex-lifecycle').inspectChild(id, target.sid);
+        },
+      });
+      if (jobsChanged(`${target.agent}:${target.sid}`, result)) broadcast();
+    } catch (error) { process.stderr.write(`keep jobs: ${error.message}\n`); }
+  };
+  setInterval(jobTick, 500).unref();
 
   runs.setOnChange(broadcast);
   runs.setNotifier(notifyTaskSession); // before recover(), which can finalize immediately
@@ -3982,6 +4453,19 @@ function start(deps = {}) {
     deps: { deliver: deliverUnblockToThread },
   });
   startAutoCompact();
+  const restarts = require('./session-restart').createManager({
+    file: path.join(keep.ROOT, '.keep', 'session-restarts.json'),
+    inspect: async (body) => {
+      const panes = await listHostPanes({}, true);
+      const state = await addHostSessionState(await buildState({ hostPanes: panes }), { panes });
+      return { session: state.sessions.find((s) => s.id === body.sessionId), pane: panes?.find((p) => p.id === body.pane) };
+    },
+    restart: restartSession, onChange: broadcast,
+  });
+  // Queued idle restarts need fresh safety evidence, but scanning the fleet every
+  // two seconds competes with foreground work. Explicit restart-now stays immediate.
+  const restartTimer = setInterval(() => restarts.tick().catch((error) => process.stderr.write(`keep restart: ${error.message}\n`)), 10000);
+  restartTimer.unref();
   if (process.env.KEEP_AUTO_CLOSE !== '0') {
     require('./session-cleanup').startScheduler({
       snapshot: async () => {
@@ -4061,6 +4545,23 @@ function start(deps = {}) {
       health.record('fleet-usage', { ok: false, error });
     }
   };
+  let cardUsageRunning = false;
+  const collectCardUsage = () => {
+    if (cardUsageRunning) return;
+    cardUsageRunning = true;
+    require('child_process').execFile(process.execPath, [path.join(__dirname, 'card-usage.js')], {
+      env: { ...process.env, KEEP_DIR: keep.ROOT }, timeout: 120e3, maxBuffer: 64 * 1024,
+    }, (error, stdout, stderr) => {
+      cardUsageRunning = false;
+      health.record('card-usage', { ok: !error, ...(error ? { error: new Error(stderr || error.message) } : {}) });
+      broadcast();
+      if (!error) {
+        try { if (cardUsage.snapshot(keep.ROOT)?.backlog) setTimeout(collectCardUsage, 500).unref(); } catch {}
+      }
+    });
+  };
+  setInterval(collectCardUsage, 30e3).unref();
+  setTimeout(collectCardUsage, 1000).unref();
   setInterval(foldFleetUsage, 5 * 60e3).unref();
   setTimeout(foldFleetUsage, 20e3).unref();
 
@@ -4113,6 +4614,9 @@ function start(deps = {}) {
 
       if (req.method === 'GET' && url.pathname === '/api/ui-debug') {
         return json(res, 200, { events: require('./ui-debug').read() });
+      }
+      if (req.method === 'GET' && url.pathname === '/api/session-debug') {
+        return json(res, 200, { events: require('./session-debug').read(url.searchParams.get('session')) });
       }
 
       if (req.method === 'GET' && url.pathname === '/api/restore-plan') {
@@ -4183,6 +4687,15 @@ function start(deps = {}) {
         let body;
         try { body = await readBody(req); } catch (e) { return json(res, 400, { error: e.message }); }
         try {
+          if (url.pathname === '/api/restart-daemon') {
+            try {
+              const result = daemonRestartGate.prepare();
+              // launchd KeepAlive starts the new daemon. The terminal host and
+              // its PTYs are separate processes and are not stopped here.
+              setTimeout(shutdown, 50);
+              return json(res, 200, result);
+            } catch (error) { return json(res, 409, { error: error.message }); }
+          }
           if (url.pathname === '/api/notifications') {
             let result;
             try { result = notifications.update(keep.ROOT, body); }
@@ -4295,8 +4808,21 @@ function start(deps = {}) {
               return json(res, 502, { error: String(e && e.message || e).slice(0, 500) });
             }
           }
+          if (url.pathname === '/api/restart-session') {
+            try { return json(res, 200, await restarts.request(body)); }
+            catch (error) { return json(res, error.status || 409, { error: error.message }); }
+          }
           if (url.pathname === '/api/close-idle' || url.pathname === '/api/close-session') {
-            try { const result = await closeIdleSession(body, { closePolicy: { manual: url.pathname === '/api/close-session' } }); broadcast(); return json(res, 200, result); }
+            try {
+              const result = url.pathname === '/api/close-session'
+                ? await require('./manual-close').manualClose(body, {
+                  getPane: async (pane) => (await hostRequest('get', { pane })).pane,
+                  graceful: (request) => closeIdleSession(request, { closePolicy: { manual: true } }),
+                  signal: (pane, signal) => hostRequest('kill', { pane, signal }),
+                })
+                : await closeIdleSession(body);
+              broadcast(); return json(res, 200, result);
+            }
             catch (e) { return json(res, e.status || 500, { error: e.message }); }
           }
           if (url.pathname === '/api/keys') {
@@ -4349,9 +4875,10 @@ function start(deps = {}) {
         res.end(body);
       } else if (url.pathname === '/api/state') {
         const panes = await listHostPanes(deps);
-        const state = buildState({ hostPanes: panes });
-        const body = JSON.stringify(await addHostSessionState(state, { ...deps, panes }));
-        res.writeHead(200, { 'content-type': 'application/json' });
+        const state = buildState({ hostPanes: panes, dashboard: true });
+        const enriched = await addHostSessionState(state, { ...deps, panes });
+        const body = JSON.stringify(wantsCompactState(req, url) ? compactState(enriched) : enriched);
+        res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
         res.end(body);
       } else if (url.pathname === '/api/events') {
         res.writeHead(200, {
@@ -4429,6 +4956,9 @@ module.exports = {
   codexTypedTextVisible,
   claudeTypedTextVisible,
   closeIdleSession,
+  restartSession,
+  applyHostedExitState,
+  closeExitedCodexShell,
   scanSessions,
   stalledSessionSnapshot,
   buildState,
@@ -4438,6 +4968,7 @@ module.exports = {
   startBriefScheduler,
   buildWhoSnapshot,
   scanTranscript,
+  claudeSessionFromInfo,
   sessionBackgroundPending,
   stallAliveIds,
   claudeSessionFor,
@@ -4454,6 +4985,10 @@ module.exports = {
   updateSetAside,
   classifyPromptLine,
   probeSuggestion,
+  logDraftRefusal,
+  sendPrecheck,
+  SUGGESTION_PROBE_KEY,
+  SUGGESTION_PROBE_MAX_READS,
   isHostTarget,
   hostClient,
   hostRequest,
@@ -4466,6 +5001,7 @@ module.exports = {
   resolveSessionTarget,
   resolveSessionId, screenSession, sendSessionKeys, shellPaneTarget, stripTerminalAnsi, writeToShellPane,
   agentProcessRows, liveSessionPids, liveSessionTick, restorePlan,
+  annotatePaneAgents,
   readPaneRecord, sessionProjectFromTranscript, openSession,
   waitForHostAgent, waitForHostSessionId, addHostSessionState,
   sendToSession, sendToResolvedTarget, precheckSessionTarget, InjectionError,

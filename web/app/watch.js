@@ -1,4 +1,5 @@
 import * as api from './api.js';
+import { sessionExplanation } from './status.js';
 
 const SHELL_PROJECT_KEY = 'keep.console.shellProject';
 
@@ -20,7 +21,7 @@ async function save(ctx) {
 
 function paneRow(ctx, pane, controls = '') {
   const entity = ctx.entityForPane(pane.id);
-  return `<div class="row">${ctx.projectHTML(entity.project)}<b>${ctx.esc(entity.title)}${entity.reviewer ? ' <span class="rv">reviewer</span>' : ''}</b><span class="st">${ctx.esc(entity.stateLabel || entity.state)}</span>${controls}</div>`;
+  return `<div class="row">${ctx.projectHTML(entity.project)}<b>${ctx.esc(entity.title)}${entity.reviewer ? ' <span class="rv">reviewer</span>' : ''}</b><span class="st" title="${ctx.esc(sessionExplanation(entity.session))}">${ctx.esc(entity.stateLabel || entity.state)}</span>${controls}</div>`;
 }
 
 function renderEditor(ctx, layout) {
@@ -115,6 +116,13 @@ function renderGrid(ctx, layout) {
     retained.add(element);
     const closeButton = element.querySelector('[data-close-session]');
     if (closeButton) closeButton.onclick = () => closeSession(ctx, pane.meta.sessionId, pane.id, closeButton);
+    if (closable && !entity.session?.reviewer) {
+      const header = element.querySelector('.ph');
+      let controls = header.querySelector('.restart-controls');
+      if (!controls) { controls = document.createElement('span'); controls.className = 'restart-controls'; header.append(controls); }
+      ctx.patchHTML(controls, restartControls(ctx, pane.meta.sessionId));
+      installRestartControls(controls, ctx, pane.meta.sessionId, pane.id);
+    }
     if (element !== cursor) grid.insertBefore(element, cursor);
     cursor = element.nextElementSibling;
     const focus = ctx.state.focusPane === pane.id;
@@ -214,3 +222,4 @@ export function installWatchControls(ctx) {
   });
 }
 import { closeSession } from './close-session.js';
+import { restartControls, installRestartControls } from './restart-session.js';

@@ -424,13 +424,18 @@
 </dialog>
 <div id="toast"></div>
 
+<script type="module">
+import { modelUsageHTML } from "/app/model-usage.js";
+window.modelUsageHTML = modelUsageHTML;
+</script>
 <script>
 'use strict';
 const COLS = ['active', 'review', 'landing', 'blocked', 'waiting', 'inbox'];
 const STALE_DAYS = 7;
 let state = { tasks: [], sessions: [], attention: [], stalled: [], unblocked: [], alerts: [], brief: null, standup: null, landed: {}, slack: null, health: null, digest: null, runs: [], usage: {}, reviewUsage: null };
 let tagFilter = null;
-let scopeFilter = ['castle', 'personal'].includes(localStorage.keepScope) ? localStorage.keepScope : null;
+let scopeFilter = localStorage.keepScope || null;
+const scopeNames = () => state.scopes?.names || ['work', 'personal'];
 let kindFilter = localStorage.keepKind === 'experiment' ? 'experiment' : null;
 let attentionView = ['focus', 'list'].includes(localStorage.keepAttnView) ? localStorage.keepAttnView : 'focus';
 let attentionMax = localStorage.keepAttnMax === '1';
@@ -961,11 +966,12 @@ function render() {
   $('reviewStrip').style.display = hasReview && state.reviewSummary ? '' : 'none';
   $('reviewStrip').innerHTML = hasReview && state.reviewSummary ? `<div class="review-hdr">Needs your review</div><div class="md">${md(state.reviewSummary)}</div>` : '';
 
-  const scopes = ['castle', 'personal'].map((s) =>
-    `<button class="chip scope ${scopeFilter === s ? 'on' : ''}" data-scope="${s}">${s}</button>`).join('');
+  if (scopeFilter && !scopeNames().includes(scopeFilter)) scopeFilter = null;
+  const scopes = scopeNames().map((s) =>
+    `<button class="chip scope ${scopeFilter === s ? 'on' : ''}" data-scope="${esc(s)}">${esc(s)}</button>`).join('');
   const kindChip = `<button class="chip ${kindFilter === 'experiment' ? 'on' : ''}" data-kind="experiment" title="Only show experiment tasks">🧪 experiments</button>`;
   const tags = [...new Set(state.tasks.flatMap((t) => t.fm.tags || []))]
-    .filter((t) => !['castle', 'personal'].includes(t)).sort();
+    .filter((t) => !scopeNames().includes(t)).sort();
   $('filters').innerHTML = scopes + kindChip + tags.map((t) =>
     `<button class="chip ${tagFilter === t ? 'on' : ''}" data-tag="${esc(t)}">#${esc(t)}</button>`).join('');
 
@@ -1370,6 +1376,7 @@ function openTask(id) {
     <button class="close" onclick="detail.close()">✕</button>
     <h3>${esc(t.fm.title)}</h3>
     <div class="sub">${esc(t.id)} · ${esc(t.fm.status)}${t.fm.kind !== 'task' ? ` · ${esc(t.fm.kind)}` : ''}${t.fm.project ? ` · ${esc(t.fm.project)}` : ''}${t.fm.check_after ? ` · check after ${esc(t.fm.check_after.replace('T', ' '))}` : ''}${(t.fm.depends_on || []).length ? ` · waits on ${esc(t.fm.depends_on.join(', '))}` : ''}</div>
+    ${window.modelUsageHTML ? window.modelUsageHTML(t.modelUsage) : ''}
     ${experimentChip(t.fm.experiment_id)}
     <div class="actions">${resume ? `<div class="resume" title="click to copy" onclick="navigator.clipboard.writeText(this.textContent)">${esc(resume)}</div>` : ''}${sessionOpenButton(s ? { sessionId: s.id } : { taskId: t.id, fresh: true })}</div>
     <div id="taskSummary" class="md summary-card"><span class="empty">summarizing…</span></div>

@@ -77,11 +77,11 @@ function scopeMismatch(task, _ctx) {
   const expected = keep.scopeForProject(task.fm.project);
   if (!expected) return [];
   const tags = task.fm.tags || [];
-  const wrong = expected === 'personal' ? tags.includes('castle') : tags.includes('personal');
+  const wrong = require('./preferences').scopes().names.find((name) => name !== expected && tags.includes(name));
   if (!wrong) return [];
   return [finding(
     'scope-mismatch', task, 'med',
-    `#${expected === 'personal' ? 'castle' : 'personal'} conflicts with project ${task.fm.project}`,
+    `#${wrong} conflicts with project ${task.fm.project}`,
     `edit tags: [${expected}]`,
   )];
 }
@@ -259,10 +259,10 @@ function missingScope(task, _ctx) {
   const expected = keep.scopeForProject(task.fm.project);
   if (expected == null) return [];
   const tags = task.fm.tags || [];
-  if (tags.includes('castle') || tags.includes('personal')) return [];
+  if (require('./preferences').scopes().names.some((name) => tags.includes(name))) return [];
   return [finding(
     'missing-scope', task, 'med',
-    'card has neither a #castle nor #personal scope tag',
+    'card has no configured scope tag',
     `edit tags: [${expected}]`,
   )];
 }

@@ -62,7 +62,9 @@ test('summary snapshot does not load tasks or transcripts when no agents are liv
 test('summary workers retain two-process bound, prioritize queued human requests and coalesce latest input', () => {
   const fs = require('node:fs'), path = require('node:path'), vm = require('node:vm'), { EventEmitter } = require('node:events');
   const children = [], files = new Map();
-  const fakeFs = { existsSync: () => true, mkdirSync() {}, readFileSync(file) { if (!files.has(file)) throw Error('missing'); return files.get(file); }, writeFileSync(file, value) { files.set(file, value); } };
+  const fakeFs = { existsSync: () => true, mkdirSync() {}, mkdtempSync: () => '/temporary/summary', rmSync() {},
+    renameSync(from, to) { files.set(to, files.get(from)); files.delete(from); },
+    readFileSync(file) { if (!files.has(file)) throw Error('missing'); return files.get(file); }, writeFileSync(file, value) { files.set(file, value); } };
   const c = vm.createContext({ module: { exports: {} }, process: { env: {}, stderr: { write() {} } }, setTimeout: () => 1, clearTimeout() {},
     require: (name) => name === 'fs' ? fakeFs : name === './keep.js' ? { ROOT: '/fixture' } : name === 'child_process' ? {
       spawn(_cmd, args) { const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter(); child.args = args; children.push(child); return child; },

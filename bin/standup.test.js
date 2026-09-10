@@ -1,4 +1,5 @@
 'use strict';
+process.env.KEEP_STANDUP_SCOPE = 'castle';
 
 // Reviewer launchers export these into their shell. Standup generation is allowed
 // there, but tests should not inherit reviewer identity into spawned CLI fixtures.

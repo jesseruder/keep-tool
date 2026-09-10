@@ -1,6 +1,8 @@
+import { modelUsageHTML } from './model-usage.js';
 import * as api from './api.js';
 import { closeSession } from './close-session.js';
-import { sessionLabel } from './status.js';
+import { restartControls, installRestartControls } from './restart-session.js';
+import { sessionLabel, sessionExplanation, backgroundLabel } from './status.js';
 import { retainSelection, selectionIndex } from './selection.js';
 
 const summaryCache = new Map(); // session id -> { text, fetchedAt, mtime, fresh }
@@ -32,10 +34,6 @@ function ensurePinnedState(ctx) {
 
 function togglePinned(ctx) {
   ctx.state.showPinned = !ctx.state.showPinned;
-  if (!ctx.state.showPinned && ctx.state.currentItem?.kind === 'pinned') {
-    ctx.state.selected = 0;
-    ctx.state.selectedKey = null;
-  }
   try { sessionStorage.setItem('keep-pinned-expanded', ctx.state.showPinned ? '1' : '0'); } catch {}
   ctx.refresh();
 }
@@ -96,7 +94,8 @@ function shellProject(ctx) {
 
 function renderRail(ctx, items) {
   const rail = document.querySelector('#rail');
-  const counted = items.filter((item) => !ctx.state.dismissed.has(ctx.itemKey(item)));
+  const counted = [...new Map(items.filter((item) => item.kind === 'pinned'
+    || !ctx.state.dismissed.has(ctx.itemKey(item))).map((item) => [ctx.itemKey(item), item])).values()];
   const counts = new Map();
   for (const item of counted) {
     const key = ctx.projectOf(item.project).key;
@@ -104,18 +103,17 @@ function renderRail(ctx, items) {
   }
   const projects = ctx.knownProjects().filter((project) => counts.has(project.key));
   const collapsed = ctx.state.collapsed.rail;
-  const row = (project) => `<button data-project="${ctx.esc(project.key)}" class="${ctx.state.filter === project.key ? 'on' : ''}" style="--h:${project.h}"><i></i><span>${ctx.esc(project.name)}</span><span class="c ${counts.get(project.key) ? 'hot' : ''}">${counts.get(project.key) || ''}</span></button>`;
-  const dot = (project) => `<button data-project="${ctx.esc(project.key)}" class="rail-dot ${ctx.state.filter === project.key ? 'on' : ''}" style="--h:${project.h}" title="${ctx.esc(project.name)}"><i></i></button>`;
+  const row = (project) => `<button data-project="${ctx.esc(project.key)}" class="${ctx.state.filter === project.key ? 'on' : ''}" style="--h:${project.h}">${ctx.projectIcon(project)}<span>${ctx.esc(project.name)}</span><span class="c ${counts.get(project.key) ? 'hot' : ''}">${counts.get(project.key) || ''}</span></button>`;
+  const dot = (project) => `<button data-project="${ctx.esc(project.key)}" class="rail-dot ${ctx.state.filter === project.key ? 'on' : ''}" style="--h:${project.h}" title="${ctx.esc(project.name)}">${ctx.projectIcon(project)}</button>`;
   const shell = shellProject(ctx);
   const shellButton = collapsed
     ? '<button class="rail-shell rail-dot" data-shell title="New shell"><span class="rail-shell-mark">+</span></button>'
     : `<button class="rail-shell" data-shell title="New shell in ${ctx.esc(shell.name)}"><span class="rail-shell-mark">+</span><span>shell</span></button>`;
   rail.classList.toggle('collapsed', collapsed);
   rail.innerHTML = collapsed
-    ? `<div class="rh"><button class="collapse" aria-expanded="false" title="Expand (⌘B)">›</button></div><button data-project="" class="rail-dot all ${ctx.state.filter ? '' : 'on'}" title="All"><i></i></button>${projects.map(dot).join('')}${shellButton}`
-    : `<div class="rh"><span>Projects</span><button class="collapse" aria-expanded="true" title="Collapse (⌘B)">‹</button></div><button data-project="" class="all ${ctx.state.filter ? '' : 'on'}"><i></i><span>All</span><span class="c hot">${counted.length}</span></button>`
-      + `<div class="scope">castle</div>${projects.filter((p) => p.scope === 'castle').map(row).join('')}`
-      + `<div class="scope">personal</div>${projects.filter((p) => p.scope !== 'castle').map(row).join('')}${shellButton}`;
+    ? `<div class="rh"><button class="collapse" aria-expanded="false" title="Expand (⌘B)">›</button></div><button data-project="" class="rail-dot all ${ctx.state.filter ? '' : 'on'}" title="All">${ctx.projectIcon({ key: 'all' })}</button>${projects.map(dot).join('')}${shellButton}`
+    : `<div class="rh"><span>Projects</span><button class="collapse" aria-expanded="true" title="Collapse (⌘B)">‹</button></div><button data-project="" class="all ${ctx.state.filter ? '' : 'on'}">${ctx.projectIcon({ key: 'all' })}<span>All</span><span class="c hot">${counted.length}</span></button>`
+      + (ctx.data.scopes || globalThis.KeepScopeRules.defaults).names.map((scope) => `<div class="scope">${ctx.esc(scope)}</div>${projects.filter((p) => p.scope === scope).map(row).join('')}`).join('') + shellButton;
   rail.querySelector('.collapse').addEventListener('click', () => ctx.toggleCollapsed('rail'));
   rail.querySelectorAll('[data-project]').forEach((button) => button.addEventListener('click', () => {
     ctx.state.filter = button.dataset.project || null;
@@ -134,6 +132,12 @@ function renderRail(ctx, items) {
       const title = ctx.entityForPane(pane.id).title;
       const pinned = await ctx.pinPane(pane.id, title);
       if (!pinned) { ctx.refresh(); ctx.toast(`Shell started in ${shell.name}, but pinning failed; it is listed in Watch`); return; }
+      // Creating a shell is explicit navigation, including from waiting-only
+      // Focus mode or a collapsed Pinned group.
+      if (ctx.state.focusMode) ctx.toggleFocus(false, false);
+      ctx.state.showPinned = true;
+      try { sessionStorage.setItem('keep-pinned-expanded', '1'); } catch {}
+      ctx.state.filter = null;
       const index = ctx.triageItems().findIndex((item) => item.kind === 'pinned' && item.pane === pane.id);
       if (index >= 0) ctx.setSelected(index, true);
       ctx.state.ensureSelectedVisible = true;
@@ -158,13 +162,13 @@ function queueRow(ctx, item) {
     return `<span class="stripe"></span><span class="t ${title === 'untitled session' ? 'untitled' : ''}">${ctx.esc(title)}</span>
       ${recentTime}
       <span class="p">${ctx.projectHTML(project)}${item.taskId ? `<span class="card">${ctx.esc(item.taskId)}</span>` : ''}${ctx.tagsHTML(task)}</span>
-      <span class="s">${shell ? '<span class="kind shell">shell</span>' : ''}<span class="kind state ${ctx.esc(session?.state || item.state || '')}">${ctx.esc(sessionState)}</span></span>`;
+      <span class="s">${shell ? '<span class="kind shell">shell</span>' : ''}<span title="${ctx.esc(sessionExplanation(session))}" class="kind state ${ctx.esc(session?.state || item.state || '')}">${ctx.esc(sessionState)}</span>${backgroundLabel(session) ? `<span class="kind">${ctx.esc(backgroundLabel(session))}</span>` : ''}</span>`;
   }
   const waited = waitText(item.since);
   return `<span class="stripe"></span><span class="t ${title === 'untitled session' ? 'untitled' : ''}">${ctx.esc(title)}</span>
     <span class="w num ${waited.includes('d') ? 'long' : ''}">${ctx.esc(waited)}</span>
     <span class="p">${ctx.projectHTML(project)}${item.taskId ? `<span class="card">${ctx.esc(item.taskId)}</span>` : ''}${ctx.tagsHTML(task)}</span>
-    <span class="s"><span class="kind ${ctx.esc(item.kind)}">${ctx.esc(ctx.kindLabel(item.kind))}</span>${ctx.esc(itemSummary(item, session))}</span>`;
+    <span class="s"><span title="${ctx.esc(sessionExplanation(session))}" class="kind ${ctx.esc(item.kind)}">${ctx.esc(item.attentionLabel || ctx.kindLabel(item.kind))}</span>${backgroundLabel(session) ? `<span class="kind">${ctx.esc(backgroundLabel(session))}</span>` : ''}${ctx.esc(itemSummary(item, session))}</span>`;
 }
 
 function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
@@ -173,7 +177,7 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
   const shownRunning = ctx.state.showRunning ? running : [];
   const shownPinned = ctx.state.showPinned ? pinned : [];
   const active = [...waiting, ...shownRunning, ...shownPinned, ...(ctx.state.showRecent ? recent : [])];
-  const retainedSelection = ctx.state.focusMode ? [] : retainSelection(active, ctx.state.currentItem, ctx.state.selectedKey, ctx.itemKey, ctx.triageKey,
+  const retainedSelection = retainSelection(active, ctx.state.currentItem, ctx.state.selectedKey, ctx.itemKey, ctx.triageKey,
     ctx.retainedSelectionItem);
   active.push(...retainedSelection);
   const collapsed = ctx.state.collapsed.queue;
@@ -183,15 +187,14 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
   strip.classList.toggle('on', collapsed);
   const head = queue.querySelector('.qhead');
   head.classList.add('focus-head');
-  ctx.patchHTML(head, `<button type="button" class="qfocus" aria-pressed="${ctx.state.focusMode}" title="Toggle Focus (Shift+F)"><b id="qn">${ctx.esc(waiting.length)}</b> waiting on you ${ctx.state.focusMode ? '<span class="focus-pill">focus</span>' : ''}<span class="order">oldest first</span></button><button class="collapse" aria-expanded="true" title="Collapse (⌘\\)">‹</button>`);
+  ctx.patchHTML(head, `<button type="button" class="qfocus" aria-pressed="${ctx.state.focusMode}" title="Toggle Focus (Shift+F)"><b id="qn">${ctx.esc(waiting.length)}</b> waiting on you ${ctx.state.focusMode ? '<span class="focus-pill">focus</span>' : ''}</button><button class="collapse" aria-expanded="true" title="Collapse (⌘\\)">‹</button>`);
   head.querySelector('.qfocus').onclick = () => ctx.toggleFocus();
   head.querySelector('.collapse').onclick = () => ctx.toggleCollapsed('queue');
   strip.innerHTML = `<button class="collapse" aria-expanded="false" title="Expand (⌘\\)">›</button><span class="strip-label"><b class="${waiting.length ? 'hot' : ''}">${ctx.esc(waiting.length)}</b> waiting</span>`;
   strip.querySelector('.collapse').addEventListener('click', () => ctx.toggleCollapsed('queue'));
-  if (!ctx.state.focusMode) {
-    ctx.state.selected = selectionIndex(active, ctx.state.selectedKey, ctx.state.currentItem, ctx.state.selected, ctx.itemKey, ctx.triageKey);
-    ctx.state.selectedKey = active[ctx.state.selected] ? ctx.triageKey(active[ctx.state.selected]) : null;
-  }
+  ctx.state.selected = ctx.state.focusMode && !ctx.state.currentItem ? -1
+    : selectionIndex(active, ctx.state.selectedKey, ctx.state.currentItem, ctx.state.selected, ctx.itemKey, ctx.triageKey);
+  ctx.state.selectedKey = active[ctx.state.selected] ? ctx.triageKey(active[ctx.state.selected]) : null;
   const existing = new Map([...list.querySelectorAll(':scope > .qitem')].map((row) => [row.dataset.key, row]));
   const retained = new Set();
   let cursor = list.firstElementChild;
@@ -310,7 +313,9 @@ async function chooseOption(ctx, item, number) {
 }
 
 function renderStage(ctx, active, focusItem, running, pinned) {
-  const item = ctx.state.focusMode ? focusItem : active[ctx.state.selected];
+  const item = ctx.state.focusMode
+    ? active.find((candidate) => focusItem && ctx.itemKey(candidate) === ctx.itemKey(focusItem)) || focusItem
+    : active[ctx.state.selected];
   const stage = document.querySelector('#stage');
   // Check before replacing the stage: its find bar may be about to detach.
   const focusedElement = document.activeElement;
@@ -349,12 +354,19 @@ function renderStage(ctx, active, focusItem, running, pinned) {
   const pinLabel = ctx.isPanePinned(item.pane) ? 'Unpin from Watch' : 'Pin to Watch';
   const closable = hasLivePane && item.sessionId && ['claude', 'codex'].includes(pane.meta?.agent);
   const reopen = hasLivePane ? '' : '<button class="btn" data-reopen>Reopen</button>';
-  ctx.patchHTML(stage.querySelector('.shead'), `<div class="session-heading"><h2>${ctx.esc(title)}</h2><div class="meta mono">${ctx.projectHTML(item.project || session?.project || '', true)}${item.taskId ? `<a href="#" data-card>${ctx.esc(item.taskId)}</a>${ctx.tagsHTML(task)}` : ''}</div></div><div class="acts"><button class="btn" data-pin ${item.pane ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}<button class="btn" data-card><kbd>o</kbd> Card</button>${item.sessionId || waitingItem ? '<button class="btn" data-snooze>Snooze 1h</button><button class="btn" data-dismiss><kbd>x</kbd> Dismiss</button>' : ''}${closable ? '<button class="btn" data-close-session>Close</button>' : ''}</div>`);
+  ctx.patchHTML(stage.querySelector('.shead'), `<div class="session-heading"><h2>${ctx.esc(title)}</h2><div class="meta mono">${ctx.projectHTML(item.project || session?.project || '', true)}${item.taskId ? `<span>${ctx.esc(item.taskId)}</span>${ctx.tagsHTML(task)}` : ''}</div>${task ? modelUsageHTML(task.modelUsage) : ''}</div><div class="acts"><button class="btn" data-pin ${item.pane ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}${item.sessionId || waitingItem ? '<button class="btn" data-snooze>Snooze 1h</button><button class="btn" data-dismiss><kbd>x</kbd> Dismiss</button>' : ''}${closable ? '<button class="btn" data-close-session>Close</button>' : ''}</div>`);
   const brief = stage.querySelector('.brief');
+  if (closable && !session?.reviewer) {
+    const actions = stage.querySelector('.shead .acts');
+    let controls = actions.querySelector('.restart-controls');
+    if (!controls) { controls = document.createElement('span'); controls.className = 'restart-controls'; actions.append(controls); }
+    ctx.patchHTML(controls, restartControls(ctx, item.sessionId));
+    installRestartControls(controls, ctx, item.sessionId, item.pane);
+  }
   const briefChanged = ctx.patchHTML(brief, briefHTML(ctx, item, session));
   const terminalHost = stage.querySelector('.stage-terminal');
   if (hasLivePane) {
-    const focusKey = `${ctx.eventKey(item)}:${item.pane}`;
+    const focusKey = `${key}:${item.pane}`;
     const autoFocus = ctx.state.focusMode && stage.dataset.focusKey !== focusKey && !editing && !ctx.state.pendingFocus;
     const focus = (ctx.state.focusPane === item.pane || autoFocus) && !editing;
     ctx.mount(terminalHost, item.pane, { slot: 'triage', focus });
@@ -381,7 +393,6 @@ function renderStage(ctx, active, focusItem, running, pinned) {
   const pin = () => ctx.pinPane(item.pane, title);
   const dismiss = () => ctx.dismiss(item);
   const snooze = () => ctx.setAside(item, 'snooze', 60);
-  const open = () => ctx.toast(`would open keep show ${item.taskId || '(no card)'}`);
   stage.querySelector('[data-pin]').onclick = pin;
   const reopenButton = stage.querySelector('[data-reopen]');
   if (reopenButton) reopenButton.onclick = async () => {
@@ -400,9 +411,8 @@ function renderStage(ctx, active, focusItem, running, pinned) {
   if (dismissButton) dismissButton.onclick = dismiss;
   const snoozeButton = stage.querySelector('[data-snooze]');
   if (snoozeButton) snoozeButton.onclick = snooze;
-  stage.querySelectorAll('[data-card]').forEach((button) => { button.onclick = (event) => { event.preventDefault(); open(); }; });
   ctx.state.currentActions = {
-    pin, dismiss: item.sessionId || waitingItem ? dismiss : undefined, open,
+    pin, dismiss: item.sessionId || waitingItem ? dismiss : undefined,
     number(number) {
       if (item.kind === 'question') chooseOption(ctx, item, number);
       else if (item.kind === 'rateLimit') { if (number === 1) sendReply(ctx, item, 'continue'); else if (number === 2) dismiss(); }
@@ -425,17 +435,24 @@ export function renderTriage(ctx) {
     }))];
   const notDismissed = (item) => matchesFilter(item) && !ctx.state.dismissed.has(ctx.itemKey(item));
   const running = ctx.runningItems().filter(notDismissed);
-  const pinned = ctx.pinnedItems().filter(notDismissed);
+  // Pins are navigation, not attention. Snoozing/dismissing must not hide them.
+  const pinned = ctx.pinnedItems().filter(matchesFilter);
   const recent = ctx.recentItems().filter(notDismissed);
   const dismissed = [...new Map([...visible, ...sessions.filter(matchesFilter)].filter((item) => ctx.state.dismissed.has(ctx.itemKey(item))).map((item) => [ctx.itemKey(item), item])).values()];
-  const focusItem = ctx.state.focusMode ? waiting[0] : null;
+  // Focus starts with the oldest request, but background queue updates are not
+  // navigation. Retain it only while it still needs input, never in other groups.
+  const focusItem = ctx.state.focusMode
+    ? waiting.find((item) => ctx.itemKey(item) === ctx.state.focusItemKey) || waiting[0]
+    : null;
   if (ctx.state.focusMode) {
+    ctx.state.focusItemKey = focusItem ? ctx.itemKey(focusItem) : null;
     const key = focusItem ? ctx.triageKey(focusItem) : null;
     if (ctx.state.selectedKey !== key) ctx.state.ensureSelectedVisible = true;
     ctx.state.selected = focusItem ? 0 : -1;
     ctx.state.selectedKey = key;
+    ctx.state.currentItem = focusItem || null;
   }
-  renderRail(ctx, items);
+  renderRail(ctx, [...items, ...ctx.runningItems(), ...ctx.pinnedItems()]);
   const active = renderQueue(ctx, waiting, running, pinned, recent, dismissed);
   renderStage(ctx, active, focusItem, running, pinned);
 }

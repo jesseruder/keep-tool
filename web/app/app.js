@@ -1,8 +1,13 @@
+import './shared/scope-rules.js';
+import { PROJECTS } from './project-catalog.js';
+import { projectIcon } from './project-icons.js';
+import { installAttentionSound } from './attention-sound.js';
 import { installNotifications } from './notifications.js';
 import { PALETTES, paletteById, swatches } from './palettes.js';
 import { applyTheme, getPalette, getPreference, onThemeChange, resolvedTheme, setPalette, setPreference, xtermTheme } from './theme.js';
 import * as api from './api.js';
 import { humanAttention, sessionLabel } from './status.js';
+import { captureFocusIntent } from './focus-intent.js';
 import { mountTerminal } from './terminal.js';
 import { installFocusDebug } from './focus-debug.js';
 import { retainSelection, stableSessionOrder } from './selection.js';
@@ -15,8 +20,10 @@ import { acknowledgeNotificationClick, installNotificationClicks, notificationPe
 
 applyTheme();
 
-export const PROJECTS = { keep: { name: 'Keep', h: 210, scope: 'personal' } };
-const HOME = '';
+export { PROJECTS } from './project-catalog.js';
+let projectChoices = Object.create(null);
+
+const HOME = ''; 
 const esc = (value) => String(value ?? '').replace(/[&<>'"]/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[character]);
 export function rel(ms) {
   const at = typeof ms === 'number' ? ms : Date.parse(ms);
@@ -38,14 +45,17 @@ const hashHue = (value) => {
 
 function projectOf(projectPath = '') {
   const clean = String(projectPath || 'unknown').replace(/\/$/, '');
-  const relative = clean.replace(/^\/Users\/[^/]+\/|^\/home\/[^/]+\/|^~\//, '');
+  const choice = projectChoices[clean];
+  const canonical = choice?.path || clean;
+  const relative = canonical.replace(/^\/Users\/[^/]+\/|^\/home\/[^/]+\/|^~\//, '');
   const worktree = relative.match(/^wt\/([^/]+)\/([^/]+)/);
   let key = relative;
-  if (worktree) key = Object.keys(PROJECTS).find((candidate) => candidate.split('/').pop() === worktree[1]) || worktree[1];
-  const known = PROJECTS[key];
+  if (worktree && !choice) key = Object.keys(PROJECTS).find((candidate) => candidate.split('/').pop() === worktree[1]) || worktree[1];
+  const known = Object.hasOwn(PROJECTS, key) ? PROJECTS[key] : null;
   const name = known?.name || relative.split('/').filter(Boolean).pop() || 'Unknown';
-  const scope = known?.scope || (relative.startsWith('castle/') ? 'castle' : 'personal');
-  return { key, path: clean, name, scope, h: known?.h ?? hashHue(clean), wt: worktree?.[2] || null };
+  const settings = data.scopes || globalThis.KeepScopeRules.defaults;
+  const scope = globalThis.KeepScopeRules.scopeForProject(clean, settings, settings.home) || settings.default;
+  return { key, path: clean, name, scope, h: known?.h ?? choice?.h ?? hashHue(canonical), icon: known?.icon || choice?.icon, wt: worktree?.[2] || null };
 }
 
 let restoredRunning = true;
@@ -207,7 +217,7 @@ function recentItems() {
 function matchesTriageFilter(item) {
   return !state.filter || projectOf(item.project).key === state.filter;
 }
-function triageVisible(item) { return !state.dismissed.has(itemKey(item)) && matchesTriageFilter(item); }
+function triageVisible(item) { return (item.kind === 'pinned' || !state.dismissed.has(itemKey(item))) && matchesTriageFilter(item); }
 function retainedSelectionItem(item) {
   const session = sessionFor(item);
   if (state.historyTarget?.sessionId === item?.sessionId && matchesTriageFilter(item)) return session
@@ -237,10 +247,10 @@ function knownProjects() {
 }
 function projectHTML(projectPath, large = false) {
   const project = projectOf(projectPath);
-  return `<span class="pj ${large ? 'lg' : ''}" style="--h:${project.h}"><i></i>${esc(project.name)}${project.wt ? `<span class="wt">${esc(project.wt)}</span>` : ''}</span>`;
+  return `<span class="pj ${large ? 'lg' : ''}" style="--h:${project.h}">${projectIcon(project)}${esc(project.name)}${project.wt ? `<span class="wt">${esc(project.wt)}</span>` : ''}</span>`;
 }
 function tagsHTML(task) {
-  return (task?.fm?.tags || []).map((tag) => `<span class="tagc ${tag === 'castle' || tag === 'personal' ? 'scope-tag' : ''}">${esc(tag)}</span>`).join('');
+  return (task?.fm?.tags || []).map((tag) => `<span class="tagc ${(data.scopes || globalThis.KeepScopeRules.defaults).names.includes(tag) ? 'scope-tag' : ''}">${esc(tag)}</span>`).join('');
 }
 function kindLabel(kind) { return ({ question: 'question', permission: 'permission', rateLimit: 'limit', complete: 'done', input: 'input', plan: 'plan', running: 'running', pinned: 'pinned', recent: 'recent' })[kind] || kind; }
 function limitResumeFor(sessionId) {
@@ -340,6 +350,7 @@ function toggleRecent() {
 }
 function toggleFocus(value = !state.focusMode, render = true) {
   state.focusMode = value;
+  state.focusItemKey = null;
   try { localStorage.setItem('keep.console.focus', value ? '1' : '0'); } catch {}
   state.ensureSelectedVisible = true;
   toast(value ? 'Focus on' : 'Focus off');
@@ -468,8 +479,20 @@ function mount(container, pane, options = {}) {
   let mounts = terminals.get(pane);
   if (!mounts) { mounts = new Map(); terminals.set(pane, mounts); }
   let entry = mounts.get(slot);
+  const currentPane = paneMap().get(pane);
+  const pid = currentPane?.pid;
+  const agentSession = Boolean(currentPane?.meta?.sessionId || data.sessions.some((session) => session.pane === pane));
+  // SessionEnd may demote an agent pane to shell before its restart exits.
+  // Preserve its identity across that transient observation, not across PIDs.
+  if (entry && agentSession) entry.agentSession = true;
+  if (entry && pid && entry.pid && entry.pid !== pid) {
+    options = { ...options, focus: options.focus || entry.mounted.element.contains(document.activeElement) };
+    entry.mounted.dispose();
+    mounts.delete(slot);
+    entry = null;
+  }
   if (!entry) {
-    entry = { options };
+    entry = { options, pid, agentSession };
     entry.mounted = mountTerminal(container, pane, {
       ...options,
       slot,
@@ -481,7 +504,7 @@ function mount(container, pane, options = {}) {
       },
       onExit() {
         const agent = paneMap().get(pane)?.meta?.agent;
-        if (!agent || agent === 'shell') {
+        if (!entry.agentSession && (!agent || agent === 'shell')) {
           dropPane(pane).catch((error) => toast(`Pane cleanup failed: ${error.message}`));
         } else refresh();
         entry.options.onExit?.();
@@ -529,13 +552,13 @@ function disposeUnusedTerminals(focused) {
 }
 function scheduleFocus(mounted) {
   cancelAnimationFrame(focusFrame);
-  const origin = document.activeElement;
+  const stillWanted = captureFocusIntent();
   const container = mounted.element.parentElement;
   focusFrame = requestAnimationFrame(() => {
     if (mounted.element.parentElement !== container || !visibleTerminals.includes(mounted)
         || !mounted.element.isConnected || !mounted.element.getClientRects().length) return;
     // A click or keyboard action after scheduling owns focus now.
-    if (document.activeElement !== origin && document.activeElement !== document.body) return;
+    if (!stillWanted()) return;
     mounted.focus();
   });
 }
@@ -587,6 +610,7 @@ function renderTop() {
   renderHealth();
   const count = queueItems().filter((item) => !state.dismissed.has(itemKey(item))).length;
   setBadge(count + (data.notifications || []).filter((entry) => !entry.read).length);
+  if (attentionSeeded) attentionSound.update(count);
   document.querySelector('#qcount').textContent = count;
   document.querySelector('#qcount').classList.toggle('zero', count === 0);
   const sessionCount = data.sessions?.length || 0;
@@ -646,6 +670,35 @@ function toggleCollapsed(panel) {
   refresh();
   scheduleTerminalFit();
 }
+let projectChoicesBusy = false;
+let projectChoicesCheckedAt = 0;
+async function refreshProjectChoices() {
+  if (projectChoicesBusy || Date.now() - projectChoicesCheckedAt < 10000) return;
+  projectChoicesBusy = true;
+  projectChoicesCheckedAt = Date.now();
+  try {
+    const paths = [...new Set([
+      ...(data.sessions || []).map((session) => session.project),
+      ...(data.panes || []).map((pane) => pane.meta?.project || pane.cwd),
+      ...(data.tasks || []).map((task) => task.fm?.project),
+    ].filter(Boolean))];
+    const result = { projects: Object.create(null) };
+    for (let offset = 0; offset < paths.length; offset += 200) {
+      const batch = await api.write('/api/project-icons', { projects: paths.slice(offset, offset + 200) });
+      if (!batch?.projects || typeof batch.projects !== 'object' || Array.isArray(batch.projects)) return;
+      Object.assign(result.projects, batch.projects);
+    }
+    if (JSON.stringify(result.projects) !== JSON.stringify(projectChoices)) {
+      const filteredProject = state.filter && knownProjects().find((project) => project.key === state.filter);
+      projectChoices = result.projects;
+      // Canonicalizing a newly discovered worktree must preserve the active filter.
+      if (filteredProject) state.filter = projectOf(filteredProject.path).key;
+      refresh();
+    }
+  } catch { /* Older/offline daemons keep the immediate folder fallback. */ }
+  finally { projectChoicesBusy = false; }
+}
+
 let reloadRetry;
 let pendingNotificationKey = null;
 async function reload() {
@@ -660,6 +713,7 @@ async function reload() {
     if (generation < appliedReloadGeneration) return;
     appliedReloadGeneration = generation;
     data = nextData;
+    void refreshProjectChoices();
     optimisticSetAside.clear();
     deriveDismissed();
     for (const pane of [...droppedPanes]) {
@@ -720,7 +774,7 @@ function navigateHistory(entry, focus = true) {
 }
 
 const ctx = {
-  state, get data() { return data; }, esc, rel, projectOf, projectHTML, tagsHTML, knownProjects,
+  state, get data() { return data; }, esc, rel, projectOf, projectIcon, projectHTML, tagsHTML, knownProjects,
   queueItems, runningItems, pinnedItems, recentItems, triageItems, toggleCollapsed, toggleRunning, toggleRecent, setSelected,
   itemKey, triageKey, eventKey, sessionFor, taskFor, paneMap, entityForPane, kindLabel, limitResumeFor, toast, dismiss, restore, setAside, setAsideFor,
   pinPane, startShell, reopenSession, removePane, isPanePinned, knownPaneCount, saveLayouts, dropPane, mount, patchHTML, clearElement, refresh, reload,
@@ -885,6 +939,7 @@ function setSelected(index, explicit = false) {
       && (state.selected !== 0 || !state.selectedKey.startsWith('waiting:'))) toggleFocus(false, false);
   if (explicit) {
     const item = items[state.selected];
+    if (state.focusMode) state.focusItemKey = item ? itemKey(item) : null;
     if (item?.sessionId !== state.historyTarget?.sessionId) state.historyTarget = null;
     rememberSession(item?.sessionId, 'triage');
     if (item?.pane && paneMap().get(item.pane)?.alive) state.focusPane = item.pane;
@@ -925,7 +980,7 @@ document.addEventListener('keydown', (event) => {
   const health = document.querySelector('#health');
   const paletteOpen = document.querySelector('#themePicker').classList.contains('open');
   const reviewerStatsOpen = document.querySelector('#rterm .acts')?.classList.contains('open');
-  // Plain keys belong to a focused terminal; ⌘ combos and Escape stay app-wide.
+  // Plain keys belong to a focused terminal; Escape only closes app popovers.
   const termFocus = Boolean(state.pendingFocus || inTerminal || terminalFocused);
   if (termFocus && !event.metaKey && key !== 'Escape') return;
   if (key === 'Escape' && (help.classList.contains('on') || health.classList.contains('open') || paletteOpen || reviewerStatsOpen)) {
@@ -961,21 +1016,10 @@ document.addEventListener('keydown', (event) => {
     event.preventDefault();
     return;
   }
-  if (event.metaKey && (key === 'ArrowUp' || key === 'ArrowDown')) {
-    moveQueue(key === 'ArrowUp' ? -1 : 1, termFocus);
-    event.preventDefault();
-    event.stopPropagation();
-    return;
-  }
   if (event.metaKey && key === 'Enter') {
     // The terminal owns Cmd+Enter (multiline input); let its handler receive it.
     if (termFocus) return;
     if (state.focused || termFocus) focusQueue(); else focusTerminal(true);
-    event.preventDefault();
-    return;
-  }
-  if (key === 'Escape' && (state.focused || termFocus)) {
-    focusQueue();
     event.preventDefault();
     return;
   }
@@ -986,13 +1030,10 @@ document.addEventListener('keydown', (event) => {
   if ({ t: 'triage', w: 'watch', f: 'fleet' }[key]) { setMode({ t: 'triage', w: 'watch', f: 'fleet' }[key]); event.preventDefault(); return; }
   if (state.mode === 'watch' && key === 'e') { state.editing = !state.editing; refresh(); event.preventDefault(); return; }
   if (state.mode !== 'triage') return;
-  if (event.target.closest('.qfocus') && (key === 'Enter' || key === ' ')) return;
   if (key === 'j' || key === 'ArrowDown') { moveQueue(1); event.preventDefault(); }
   else if (key === 'k' || key === 'ArrowUp') { moveQueue(-1); event.preventDefault(); }
-  else if (key === 'Enter') { focusTerminal(true); event.preventDefault(); }
   else if (key === 'p') state.currentActions.pin?.();
   else if (key === 'x') state.currentActions.dismiss?.();
-  else if (key === 'o') state.currentActions.open?.();
   else if (/^[1-9]$/.test(key)) state.currentActions.number?.(Number(key));
 }, true);
 
@@ -1008,8 +1049,14 @@ window.addEventListener('resize', () => {
   }, 100);
 });
 window.addEventListener('focus', () => { if (markReviewerSeen(ctx)) refresh(); });
-document.addEventListener('visibilitychange', () => { if (markReviewerSeen(ctx)) refresh(); });
+document.addEventListener('visibilitychange', () => {
+  for (const mounts of terminals.values()) {
+    for (const entry of mounts.values()) entry.mounted.syncVisibility();
+  }
+  if (markReviewerSeen(ctx)) refresh();
+});
 
+const attentionSound = installAttentionSound();
 const notificationPanel = installNotifications({
   reload, toast,
   openSession(sessionId) {

@@ -1,0 +1,31 @@
+// Bundled, trusted SVG paths. Model output can select an ID, never provide markup.
+export const ICONS = {
+  castle: { h: 210, body: '<path d="M4 21V8h4v3h3V5h2v6h3V8h4v13H4Z"/><path d="M10 21v-5h4v5M11 5V2h5l-1 2h-4"/>' },
+  ghost: { h: 270, body: '<path d="M5 21V10a7 7 0 0 1 14 0v11l-3-2-4 2-4-2-3 2Z"/><path d="M9 10v2m6-2v2m-5 4h4"/>' },
+  phone: { h: 150, body: '<rect x="6" y="2" width="12" height="20" rx="3"/><path d="M10 5h4m-3 14h2"/>' },
+  globe: { h: 190, body: '<circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18"/>' },
+  shield: { h: 40, body: '<path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6l8-3Z"/><path d="m8 12 3 3 5-6"/>' },
+  sandbox: { h: 35, body: '<path d="m3 9 9-5 9 5v10H3V9Zm0 0 9 5 9-5m-9 5v5M8 6V3m8 3V3"/>' },
+  gamepad: { h: 12, body: '<path d="M7 7h10c3 0 4 5 4 9 0 3-3 4-5 0H8c-2 4-5 3-5 0 0-4 1-9 4-9Z"/><path d="M8 10v4m-2-2h4m6-1h.01M18 13h.01"/>' },
+  palm: { h: 150, body: '<path d="M11 21c2-4 3-8 1-13m0 0C7 3 3 5 2 9c4-1 7-1 10-1Zm0 0c0-6 6-7 9-4-4 0-6 2-9 4Zm0 0c5-2 9 1 9 5-3-3-6-4-9-5ZM6 21h12"/>' },
+  chart: { h: 145, body: '<path d="M4 3v17h17M7 14l5-5 4 3 5-7m-5 0h5v5"/>' },
+  key: { h: 300, body: '<circle cx="8" cy="8" r="5"/><path d="m12 12 9 9m-5-5 3-3m-1 5 3-3M7 7h.01"/>' },
+  grid: { h: 210, body: '<rect x="3" y="3" width="6" height="6" rx="1"/><rect x="15" y="3" width="6" height="6" rx="1"/><rect x="3" y="15" width="6" height="6" rx="1"/><rect x="15" y="15" width="6" height="6" rx="1"/>' },
+  folder: { h: 210, body: '<path d="M3 7V5a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"/>' },
+  plane: { h: 200, body: '<path d="m22 2-7 20-4-9-9-4L22 2ZM11 13 22 2"/>' },
+  book: { h: 35, body: '<path d="M12 5C8 2 4 3 2 4v16c4-2 7-1 10 1 3-2 6-3 10-1V4c-2-1-6-2-10 1Zm0 0v16"/>' },
+  music: { h: 285, body: '<path d="M9 18V5l12-3v13M9 9l12-3"/><ellipse cx="6" cy="18" rx="3" ry="3"/><ellipse cx="18" cy="15" rx="3" ry="3"/>' },
+  camera: { h: 330, body: '<path d="M3 6h4l2-3h6l2 3h4v15H3V6Z"/><circle cx="12" cy="13" r="4"/>' },
+  chat: { h: 170, body: '<path d="M3 3h18v14H8l-5 4V3Z"/><path d="M7 8h10M7 12h6"/>' },
+  robot: { h: 210, body: '<rect x="4" y="6" width="16" height="15" rx="3"/><path d="M12 2v4M2 11v5m20-5v5M8 11v2m8-2v2m-7 4h6"/>' },
+  database: { h: 195, body: '<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 4 16 4 16 0V5M4 12c0 4 16 4 16 0"/>' },
+  code: { h: 220, body: '<path d="m7 6-6 6 6 6m10-12 6 6-6 6M14 3l-4 18"/>' },
+  leaf: { h: 125, body: '<path d="M20 3C5 1 1 9 5 16s17 3 15-13ZM4 21 16 8"/>' },
+  flask: { h: 170, body: '<path d="M8 2h8m-6 0v7L3 20c-1 2 19 2 18 0L14 9V2M7 14h10"/>' },
+  home: { h: 25, body: '<path d="m2 10 10-8 10 8M5 8v13h14V8m-10 13v-8h6v8"/>' },
+  heart: { h: 350, body: '<path d="M12 21 3 12C-3 4 7-1 12 6c5-7 15-2 9 6l-9 9Z"/>' },
+  calendar: { h: 12, body: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M7 2v6m10-6v6M3 11h18m-14 4h3m4 0h3"/>' },
+  bolt: { h: 45, body: '<path d="m14 2-11 12h8l-1 8 11-12h-8l1-8Z"/>' },
+};
+
+export const PROJECTS = { keep: { icon: 'castle', name: 'Keep', h: 210 } };

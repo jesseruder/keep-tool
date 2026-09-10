@@ -5,8 +5,9 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { Terminal: HeadlessTerminal } = require('@xterm/headless');
 
-const source = fs.readFileSync(path.join(__dirname, '../web/app/terminal.js'), 'utf8')
-  .replace(/^import .*;\n/m, '').replace('export function mountTerminal', 'function mountTerminal');
+const imagePasteSource = fs.readFileSync(path.join(__dirname, '../web/app/image-paste.js'), 'utf8').replace(/^export /gm, '');
+const source = imagePasteSource + '\n' + fs.readFileSync(path.join(__dirname, '../web/app/terminal.js'), 'utf8')
+  .replace(/^import .*;\n/gm, '').replace('export function mountTerminal', 'function mountTerminal');
 
 test('Triage and Watch move one terminal viewer instead of retaining a hidden primary', () => {
   const app = fs.readFileSync(path.join(__dirname, '../web/app/app.js'), 'utf8');
@@ -15,7 +16,9 @@ test('Triage and Watch move one terminal viewer instead of retaining a hidden pr
   const shown = [];
   const context = vm.createContext({
     terminals: new Map(), terminalRender: 1, visibleTerminals: [],
+    data: { sessions: [] },
     document: { activeElement: null },
+    paneMap: () => new Map(),
     mountTerminal(container, pane, options) {
       count++;
       const element = { parentElement: container };
@@ -55,6 +58,7 @@ function fixture() {
     }
     replaceChildren() {}
     getClientRects() { return [{ width: 800, height: 500 }]; }
+    getBoundingClientRect() { return { width: this.offsetWidth, height: this.offsetHeight }; }
     contains() { return false; }
     addEventListener() {}
   }
@@ -62,7 +66,13 @@ function fixture() {
   class Terminal extends HeadlessTerminal {
     constructor(options) { super(options); terminal = this; this.textarea = new Element(); this.visualElement = new Element(); }
     get element() { return this.visualElement; }
-    open() {}
+    open() {
+      const screen = this.visualElement.querySelector('.xterm-screen');
+      Object.defineProperties(screen, {
+        offsetWidth: { configurable: true, get: () => this.cols * this.options.fontSize * 0.6 },
+        offsetHeight: { configurable: true, get: () => this.rows * this.options.fontSize * 1.2 },
+      });
+    }
     loadAddon() {}
     attachCustomKeyEventHandler(handler) { this.keyHandler = handler; }
     focus() {}
@@ -70,14 +80,17 @@ function fixture() {
   class WebSocket {
     static OPEN = 1;
     static CLOSING = 2;
-    constructor() { this.readyState = 1; this.sent = []; }
-    send(data) { this.sent.push(data); }
+    constructor() { this.readyState = 1; this.sent = []; this.visibility = []; }
+    send(data) {
+      if (typeof data === 'string' && JSON.parse(data).t === 'visibility') this.visibility.push(JSON.parse(data).visible);
+      else this.sent.push(data);
+    }
     close() { this.readyState = 3; }
   }
   const timers = new Map();
   let timerId = 0;
   const context = vm.createContext({
-    TextEncoder, Uint8Array, URLSearchParams, WebSocket,
+    TextEncoder, Uint8Array, URLSearchParams, WebSocket, devicePixelRatio: 2,
     document: { createElement: () => new Element(), activeElement: null },
     window: {
       Terminal,
@@ -90,6 +103,7 @@ function fixture() {
     performance: { now: () => 1 },
     getComputedStyle: () => ({ paddingLeft: '8', paddingRight: '8', paddingTop: '8', paddingBottom: '0' }),
     resolvedTheme() {}, getPalette() {}, xtermTheme: () => ({}),
+    captureFocusIntent: () => () => true,
     setTimeout(fn) { timers.set(++timerId, fn); return timerId; },
     clearTimeout(id) { timers.delete(id); },
     requestAnimationFrame: () => 1, cancelAnimationFrame() {},
@@ -103,6 +117,18 @@ function fixture() {
   const drain = () => new Promise((resolve) => terminal.write('', resolve));
   return { mounted, terminal, socket, message, drain, timers, get fits() { return fits; } };
 }
+
+test('cached terminal visibility reports hide, show and reattachment', () => {
+  const f = fixture();
+  assert.equal(f.socket.visibility.at(-1), true);
+  f.mounted.hide();
+  assert.equal(f.socket.visibility.at(-1), false);
+  f.message({ t: 'attached', pane: { id: 'pane', primary: 'viewer', cols: 80, rows: 50 } });
+  assert.equal(f.socket.visibility.at(-1), false);
+  f.mounted.show();
+  assert.equal(f.socket.visibility.at(-1), true);
+  f.mounted.dispose();
+});
 
 test('hidden terminal cache is bounded and expires without terminating host sessions', () => {
   const app = fs.readFileSync(path.join(__dirname, '../web/app/app.js'), 'utf8');
@@ -156,6 +182,57 @@ test('a disconnected replay callback cannot resize or flush queued input', async
   } finally { f.mounted.dispose(); }
 });
 
+test('a hidden primary cannot resize even while its DOM still has positive dimensions', async () => {
+  const f = fixture();
+  try {
+    f.mounted.hide();
+    f.message({ t: 'replay-end' });
+    await f.drain();
+    f.mounted.fit();
+    assert.equal(f.fits, 0);
+    assert.equal(f.socket.sent.length, 0);
+    f.mounted.show(); f.mounted.fit();
+    assert.equal(f.fits, 1, 'show explicitly restores layout ownership');
+  } finally { f.mounted.dispose(); }
+});
+
+test('obsolete socket output and exit callbacks cannot affect the current terminal', () => {
+  const f = fixture();
+  try {
+    f.socket.close(); f.socket.onclose();
+    for (const [id, fn] of [...f.timers]) { f.timers.delete(id); fn(); }
+    assert.notEqual(f.mounted.socket, f.socket);
+    let writes = 0;
+    const original = f.terminal.write.bind(f.terminal);
+    f.terminal.write = (...args) => { writes++; return original(...args); };
+    f.socket.onmessage({ data: new TextEncoder().encode('obsolete output').buffer });
+    f.message({ t: 'exit', code: 0 });
+    f.socket.onclose();
+    assert.equal(writes, 0);
+    assert.equal(f.timers.size, 0);
+    f.mounted.dispose();
+    f.mounted.socket.onmessage({ data: new TextEncoder().encode('disposed output').buffer });
+    assert.equal(writes, 0);
+  } finally { f.mounted.dispose(); }
+});
+
+test('hidden observers adopt remote dimensions before parsing cursor-addressed output', async () => {
+  const f = fixture();
+  try {
+    f.message({ t: 'pane', pane: { id: 'pane', primary: 'other', cols: 80, rows: 30 } });
+    f.message({ t: 'replay-end' });
+    await f.drain();
+    f.mounted.hide();
+    f.message({ t: 'pane', pane: { id: 'pane', primary: 'other', cols: 100, rows: 60 } });
+    f.socket.onmessage({ data: new TextEncoder().encode('\x1b[60;1Hbottom prompt').buffer });
+    await f.drain();
+    assert.equal(f.terminal.rows, 60);
+    assert.equal(f.terminal.buffer.active.getLine(59).translateToString(true), 'bottom prompt');
+    assert.equal(f.fits, 0);
+    assert.equal(f.socket.sent.length, 0, 'remote buffer synchronization sends no PTY resize');
+  } finally { f.mounted.dispose(); }
+});
+
 test('observers also retain snapshot dimensions until parsing completes', async () => {
   const f = fixture();
   try {
@@ -165,10 +242,26 @@ test('observers also retain snapshot dimensions until parsing completes', async 
     await f.drain();
     assert.equal(f.terminal.rows, 30);
     assert.equal(f.fits, 0);
-    assert.equal(f.terminal.options.fontSize, 3, 'xterm cell metrics shrink to fit above the status bar');
+    assert.equal(f.terminal.options.fontSize, 5.25, 'xterm cell metrics shrink to fit above the status bar');
     assert.equal(f.terminal.element.style.transform, undefined, 'CSS must not distort pointer coordinates');
     f.message({ t: 'pane', pane: { id: 'pane', primary: 'viewer', cols: 80, rows: 30 } });
     assert.equal(f.terminal.options.fontSize, 12.5, 'taking control restores normal-sized rendering');
+  } finally { f.mounted.dispose(); }
+});
+
+test('observer fitting remeasures changed cell metrics with unchanged geometry', async () => {
+  const f = fixture();
+  try {
+    f.message({ t: 'pane', pane: { id: 'pane', primary: 'other', cols: 80, rows: 30 } });
+    f.message({ t: 'replay-end' });
+    await f.drain();
+    const before = f.terminal.options.fontSize;
+    const screen = f.terminal.element.querySelector('.xterm-screen');
+    Object.defineProperty(screen, 'offsetWidth', { get: () => 80 * f.terminal.options.fontSize });
+    f.mounted.fit();
+    assert.ok(f.terminal.options.fontSize < before);
+    assert.ok(screen.offsetWidth <= 284, 'changed renderer metrics still fit the padded host');
+    assert.equal(f.socket.sent.length, 0, 'observer does not resize the live PTY');
   } finally { f.mounted.dispose(); }
 });
 
@@ -208,6 +301,7 @@ test('observer fitting converges with rounded cell heights and grows only after 
       }
       assert.equal(f.timers.size, 0, 'font fitting must settle rather than oscillate');
     };
+    assert.equal(f.terminal.options.fontSize, 8.25, 'font fits before deferred timers run');
     settleTimers();
     assert.equal(f.terminal.options.fontSize, 8.25);
     assert.ok(screen.offsetHeight <= host.clientHeight - 8);

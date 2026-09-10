@@ -9,7 +9,7 @@ const shell = fs.readFileSync(path.join(__dirname, '../web/app/shell.js'), 'utf8
 const settle = () => new Promise((resolve) => setImmediate(resolve));
 
 test('startup subscribes despite a failed request, retries, and refreshes on reconnect', async () => {
-  let onStatus, retry, attempts = 0, renders = 0;
+  let onStatus, retry, attempts = 0, renders = 0, iconRefreshes = 0;
   const label = { dataset: {} };
   const context = vm.createContext({
     document: { querySelector: () => label },
@@ -23,6 +23,7 @@ test('startup subscribes despite a failed request, retries, and refreshes on rec
     data: {}, optimisticSetAside: new Map(), droppedPanes: new Set(),
     historyRestored: false, sessionHistory: {}, state: { mode: 'triage', focusMode: false },
     deriveDismissed() {}, applyLayouts() {}, applyStateEffects() {}, toast() {},
+    refreshProjectChoices() { iconRefreshes++; },
     refresh() { renders++; }, installNotificationClicks() {}, selectAttention() {}, focusSession() {}, acknowledgeNotificationClick() {},
   });
   const reloadStart = app.indexOf('let reloadRetry;');
@@ -34,10 +35,12 @@ test('startup subscribes despite a failed request, retries, and refreshes on rec
   assert.equal(renders, 0);
   await retry();
   assert.equal(renders, 1);
+  assert.equal(iconRefreshes, 1);
   assert.equal(retry, null);
   onStatus('live');
   await settle();
   assert.equal(renders, 2);
+  assert.equal(iconRefreshes, 2);
   assert.equal(label.dataset.status, 'live');
 });
 

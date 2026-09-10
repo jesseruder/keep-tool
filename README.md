@@ -8,8 +8,7 @@ This repository contains application source, never your cards or session history
 The full automation suite is included: fleet reviews, scheduled checks, dependency
 notifications, usage-limit recovery, compaction, session cleanup, and daily ideas.
 The first distribution targets macOS. The browser console and terminal host ship
-with the CLI; the optional desktop shell is in `desktop/`. The mobile app is not
-part of this initial source distribution.
+with the CLI; the optional desktop shell is in `desktop/`. The Expo mobile app is in `app/`.
 
 ## Screenshots
 
@@ -80,6 +79,11 @@ when prompted. If the launcher stays on its waiting screen, check
 The app uses the local console, so most CLI and web changes need no native rebuild.
 Rebuild it when the desktop shell changes. See [desktop details](desktop/README.md).
 
+## Mobile app
+
+The Expo app supports your own server and access token. See [mobile setup and build
+instructions](app/README.md).
+
 ## Configuration
 
 `~/.config/keep/config.json` selects your private registry and environment defaults:
@@ -127,9 +131,41 @@ channels. Its adapter currently requires a compatible MCP CLI configured through
 Phone pushes use `KEEP_PUSH_WEBHOOK`; speaker notifications require an `announce`
 command. Credentials belong in the local environment/configuration, never source.
 
-Some legacy schema and command names remain for compatibility: `castle`/`personal`
-scope tags, `keep ask --jesse` (the registry owner), and model-family budget rules.
-These do not indicate a shared registry. Broader customization is follow-up work.
+Use `keep ask --owner` for questions requiring the registry owner's answer.
+`--jesse` remains a compatibility alias, and existing questions keep working.
+
+Scope tags default to `work` and `personal`, with projects under `~/work` assigned
+`work`. Customize the names and ordered path rules in your local configuration:
+
+```json
+{
+  "version": 1,
+  "dataDir": "~/keep",
+  "scopes": {
+    "names": ["work", "personal"],
+    "default": "personal",
+    "rules": [{ "path": "~/work", "scope": "work" }]
+  },
+  "modelBudgets": {
+    "fable": { "inputPrice": 15, "minHeadroom": 10 }
+  }
+}
+```
+
+Merge these fields into your existing config, preserving its `env` settings.
+The CLI, lint checks, and console share scope rules; the first matching rule wins.
+The standup uses the first configured scope (`KEEP_STANDUP_SCOPE` overrides it).
+Paths match directory boundaries, and a rule can set `excludeSegmentPrefix` to
+skip projects with a matching path segment. Existing tags are never renamed.
+To retain a `castle`/`personal` setup, use those names and a `~/castle` rule;
+`excludeSegmentPrefix: "jesse-"` preserves the original personal-project exception.
+
+Fable remains the reviewer and ideas default. `modelBudgets` overrides each
+family's input-price weight (per million tokens), minimum remaining usage percentage,
+and optional exact `weeklyLabel`. Existing family weights and shared weekly/5-hour
+checks remain in effect; a missing configured bucket stops review until usage is
+available. Environment overrides `KEEP_SCOPES` and `KEEP_MODEL_BUDGETS` accept the
+corresponding JSON objects. Restart the daemon after changing configuration.
 
 ## Develop and update
 
@@ -167,3 +203,10 @@ here rather than by copying whole private checkouts back into this repository.
 
 See the [full command reference](docs/reference.md), [Keep skill](skills/keep/SKILL.md),
 [fleet reviewer procedure](skills/fleet-review/SKILL.md), and [desktop README](desktop/README.md).
+
+## Session handoffs
+
+Handoffs are turn-scoped: use `keep checkin <card> --handoff needs-input` when waiting
+for the owner, or `--handoff waiting` while independent work continues. Schedule
+follow-up work with `--check-after` and `--check "recipe"`; see
+[session reliability](docs/session-reliability.md).

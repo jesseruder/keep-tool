@@ -229,7 +229,7 @@ function buildEvidence({ now = Date.now(), since, root = keep.ROOT } = {}) {
   for (const name of names) {
     const id = name.slice(0, -3);
     const task = keep.loadTask(id, root);
-    if (!(task.fm.tags || []).includes('castle')) continue;
+    if (!(task.fm.tags || []).includes(process.env.KEEP_STANDUP_SCOPE || require('./preferences').scopes().names[0])) continue;
     const entries = review.stampedLogEntries(task.body).filter((entry) => {
       const stamp = localStampMs(entry.stamp);
       return stamp >= since && stamp <= latest;

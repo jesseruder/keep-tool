@@ -51,20 +51,23 @@ function saveReceipt(directory, entry) {
   fs.renameSync(file + '.tmp', file);
 }
 
-async function deliver({ session, pane, text, key, file, directory, retainReceipt = false, precheck, type, submitDraft, draftMatches, pause = (ms) => new Promise((r) => setTimeout(r, ms)), attempts = 16 }) {
+async function deliverAttempt({ session, pane, text, key, file, directory, trace, retainReceipt = false, precheck, type, submitDraft, draftMatches, pause = (ms) => new Promise((r) => setTimeout(r, ms)), attempts = 16 }) {
   let typingError;
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const journal = path.join(directory, hash(session.id) + '.json');
   let entry;
   try { entry = JSON.parse(fs.readFileSync(journal, 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   if (entry) {
+    trace('pending-journal-found');
     if (received(entry)) {
       saveReceipt(directory, entry);
       fs.unlinkSync(journal);
       if (entry.hash === hash(text)) return { ok: true, delivery: 'received', recovered: true };
       entry = null;
     } else {
-      if (entry.hash !== hash(text) || entry.pane !== pane || !await draftMatches()) {
+      const sameMessage = entry.hash === hash(text), samePane = entry.pane === pane;
+      trace('retry-identity', { sameMessage, samePane });
+      if (!sameMessage || !samePane || !await draftMatches()) {
         throw new Error('Previous delivery is unconfirmed; no message was retyped. Inspect the session draft/transcript before retrying.');
       }
       await submitDraft();
@@ -99,6 +102,22 @@ async function deliver({ session, pane, text, key, file, directory, retainReceip
   }
   if (typingError) throw typingError;
   throw new Error('Delivery unconfirmed: no matching transcript receipt. Pending attempt retained; no automatic retyping.');
+}
+
+async function deliver(options) {
+  const trace = options.trace || require('./delivery-trace').recorder(options.directory, options.session, options.pane);
+  const wrap = (name, fn) => async (...args) => {
+    trace(name + '-start');
+    try { const result = await fn(...args); trace(name + '-ok', typeof result === 'boolean' ? { matched: result } : {}); return result; }
+    catch (e) { trace(name + '-failed'); throw e; }
+  };
+  trace('attempt-start');
+  try {
+    const result = await deliverAttempt({ ...options, trace,
+      precheck: wrap('precheck', options.precheck), type: wrap('type-submit', options.type),
+      submitDraft: wrap('submit-draft', options.submitDraft), draftMatches: wrap('draft-check', options.draftMatches) });
+    trace('receipt-confirmed'); return result;
+  } catch (e) { trace('attempt-unconfirmed'); throw e; }
 }
 
 function statusForText(directory, text, key) {

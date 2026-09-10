@@ -14,7 +14,7 @@ const path = require('path');
 const keep = require('./keep.js');
 const health = require('./health.js');
 
-const RESUME_TEXT = 'continue';
+const RESUME_TEXT = '[keep] continue after the rate limit reset';
 // The reset time is a minute-granularity display value; wait past it so the
 // first request after the window is not rejected by a few seconds of skew.
 const RESET_GRACE_MS = 60e3;

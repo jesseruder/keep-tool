@@ -49,6 +49,46 @@ async function withHost(options, body) {
   }
 }
 
+test('replace-exited preserves pane identity and refuses live or stale processes', async () => {
+  await withHost({}, async ({ client }) => {
+    assert.equal((await client.request('hello')).replaceExited, true);
+    const { pane } = await client.request('spawn', { cmd: '/bin/sh', args: ['-c', 'sleep 0.2'], meta: { agent: 'claude', sessionId: 'session', title: 'Original' } });
+    const request = { paneId: pane.id, expectedPid: pane.pid, sessionId: 'session', cmd: '/bin/sh', args: ['-c', 'sleep 5'] };
+    await assert.rejects(client.request('replace-exited', request), /exact exited/);
+    await waitFor(async () => !(await client.request('get', { pane: pane.id })).pane.alive, 'old exit');
+    await assert.rejects(client.request('replace-exited', { ...request, expectedPid: -1 }), /exact exited/);
+    await assert.rejects(client.request('replace-exited', { ...request, sessionId: 'wrong' }), /exact exited/);
+    await assert.rejects(client.request('replace-exited', { ...request, args: 'invalid' }));
+    assert.equal((await client.request('get', { pane: pane.id })).pane.pid, pane.pid, 'failed replacement retains original record');
+    const replaced = (await client.request('replace-exited', request)).pane;
+    assert.equal(replaced.id, pane.id);
+    assert.notEqual(replaced.pid, pane.pid);
+    assert.equal(replaced.meta.title, 'Original');
+    assert.equal(replaced.meta.sessionId, 'session');
+  });
+});
+
+test('stale remove cannot delete a replacement with the same pane ID', async () => {
+  await withHost({}, async ({ host, client, sock }) => {
+    const other = await connect({ sock });
+    try {
+      const { pane } = await client.request('spawn', { cmd: '/bin/sh', args: ['-c', 'exit 0'], meta: { agent: 'claude', sessionId: 's' } });
+      await waitFor(async () => !(await client.request('get', { pane: pane.id })).pane.alive, 'old exit');
+      const old = host.panes.get(pane.id), waiters = [];
+      old.writeChain = { then(resolve) { waiters.push(resolve); } };
+      const replace = client.request('replace-exited', { paneId: pane.id, expectedPid: pane.pid, sessionId: 's', cmd: '/bin/sh', args: ['-c', 'sleep 5'] });
+      await waitFor(() => waiters.length === 1, 'replacement waits for output');
+      const remove = assert.rejects(other.request('remove', { pane: pane.id }), /process changed/);
+      await waitFor(() => waiters.length === 2, 'removal waits for output');
+      waiters.forEach((resolve) => resolve());
+      const replacement = (await replace).pane;
+      await remove;
+      assert.equal((await client.request('get', { pane: pane.id })).pane.pid, replacement.pid);
+      assert.notEqual(replacement.pid, pane.pid);
+    } finally { other.close(); }
+  });
+});
+
 function writeTerminal(term, data) {
   return new Promise((resolve) => term.write(data, resolve));
 }
@@ -251,6 +291,26 @@ test('screen waits for writes appended while the current terminal write is pendi
     } finally { releaseFirst(); }
     const screen = await screenPromise;
     assert.match(screen.text, /readyfirstsecond/);
+  });
+});
+
+test('visibility counts each attachment and defaults unknown viewers to visible', async () => {
+  await withHost({}, async ({ client, sock }) => {
+    const { pane } = await client.request('spawn', { cmd: '/bin/sh', args: ['-c', 'cat'] });
+    const other = await connect({ sock });
+    try {
+      await client.attach(pane.id, { replay: false }, () => {});
+      await other.attach(pane.id, { replay: false }, () => {});
+      assert.equal((await client.request('get', { pane: pane.id })).pane.visibleAttached, 2);
+      assert.equal((await client.request('visibility', { pane: pane.id, visible: false })).pane.visibleAttached, 1);
+      const hidden = (await other.request('visibility', { pane: pane.id, visible: false })).pane;
+      assert.equal(hidden.attached, 2);
+      assert.equal(hidden.visibleAttached, 0);
+      assert.equal((await client.request('visibility', { pane: pane.id, visible: true })).pane.visibleAttached, 1);
+      await assert.rejects(client.request('visibility', { pane: pane.id, visible: 'false' }), /boolean/);
+      await other.request('detach', { pane: pane.id });
+      await assert.rejects(other.request('visibility', { pane: pane.id, visible: false }), /attached/);
+    } finally { other.close(); }
   });
 });
 

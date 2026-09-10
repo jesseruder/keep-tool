@@ -4,6 +4,32 @@ const assert = require('node:assert/strict');
 const { refusal } = require('./session-cleanup');
 const fs = require('fs'), os = require('os'), path = require('path');
 
+test('explicit Close retires only a verified empty leftover Codex shell', async () => {
+  const { closeExitedCodexShell } = require('./serve');
+  const session = { id: 's', kind: 'codex' };
+  const pane = { id: 'p', pid: 123, cmd: '/bin/zsh', args: ['-l'], alive: true, meta: { agent: 'codex', sessionId: 's' } };
+  const line = '(base) ~/keep (main) >';
+  for (const mode of ['ok', 'automatic', 'child', 'draft', 'wrong-receipt', 'cursor', 'identity', 'race', 'other-process']) {
+    let writes = '', reads = 0;
+    const deps = { closePolicy: { manual: mode !== 'automatic' },
+      host: { request: async (type, params) => {
+        if (type === 'list') return { panes: [mode === 'identity' ? { ...pane, meta: { sessionId: 'other' } } : pane] };
+        if (type === 'input') { writes += Buffer.from(params.data, 'base64').toString(); return {}; }
+        assert.fail(type);
+      } },
+      agentProcessRows: async () => [{ pid: 123, ppid: 1, args: mode === 'other-process' ? 'vim' : '/bin/zsh -l' }, ...(mode === 'child' ? [{ pid: 124, ppid: 123, args: 'codex' }] : [])],
+      readScreenResult: async () => {
+        reads++;
+        const prompt = mode === 'draft' || (mode === 'race' && reads === 2) ? line + ' git push' : line;
+        return { text: `codex resume ${mode === 'wrong-receipt' ? 'other' : 's'}\n${prompt}`, cursor: { x: prompt.length + 1, y: mode === 'cursor' ? 0 : 1 } };
+      },
+    };
+    if (mode === 'race') await assert.rejects(closeExitedCodexShell(session, pane, deps), /changed during Close/);
+    else assert.equal(await closeExitedCodexShell(session, pane, deps), mode === 'ok', mode);
+    assert.equal(writes, mode === 'ok' ? '\x04' : '', mode);
+  }
+});
+
 test('manual Close allows recent pinned next-instruction sessions, but not active work or prompts', () => {
   const now = Date.now();
   const session = { id: 's', kind: 'claude', state: 'needs-input', endedTurn: true, mtime: now, activity: { needsInput: true, reason: 'next instruction' } };
@@ -147,6 +173,45 @@ test('Codex cleanup ignores instruction mentions, but stops when activity starts
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('automatic cleanup verifies remote children again before submitting exit', async () => {
+  const { closeIdleSession } = require('./serve');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-close-children-'));
+  const file = path.join(root, 'parent.jsonl'), child = path.join(root, 'child.jsonl');
+  const row = (type, payload) => JSON.stringify({ type, payload }) + '\n';
+  const done = row('event_msg', { type: 'task_complete' });
+  const session = { id: 's', kind: 'codex', state: 'done', endedTurn: true, mtime: Date.now() - 2 * 86400e3 };
+  const pane = { id: 'p', alive: true, attached: 0, lastOutputAt: new Date(session.mtime).toISOString(), meta: { sessionId: 's', agent: 'codex' } };
+  try {
+    for (const race of [false, true]) {
+      fs.writeFileSync(file, row('session_meta', { id: 's' }) + row('event_msg', { item: { type: 'SubAgentActivity', id: 'spawn', kind: 'completed', agent_thread_id: 'child' } }) + done);
+      fs.writeFileSync(child, row('session_meta', { id: 'child', parent_thread_id: 's' }) + done);
+      let typed = '';
+      const host = { request: async (type, params) => {
+        if (type === 'list') return { panes: [pane] };
+        if (type === 'screen') return { text: typed ? `› ${typed}\n\nstatus` : '› Ask Codex to do anything' };
+        if (type === 'input') {
+          typed += Buffer.from(params.data, 'base64').toString();
+          if (race) fs.appendFileSync(child, row('event_msg', { type: 'task_started' }));
+          return {};
+        }
+        assert.fail(type);
+      } };
+      const deps = { root, host, closePolicy: { automatic: true }, withInjectionLock: (fn) => fn(),
+        buildState: () => ({ sessions: [session], tasks: [] }), codexSessionFor: () => session,
+        codexRolloutFile: () => file, codexChildRolloutFile: () => child, sleep: async () => {},
+        psTable: '123 1 ttys001 Tue Sep  8 10:00:00 2026 codex resume s', lsof: async () => '',
+      };
+      if (race) {
+        await assert.rejects(closeIdleSession({ sessionId: 's', pane: 'p' }, deps), /changed during cleanup/);
+        assert.equal(typed, '/exit'); // Never press Enter after a child resumes.
+      } else {
+        assert.equal((await closeIdleSession({ sessionId: 's', pane: 'p' }, deps)).closing, true);
+        assert.equal(typed, '/exit\r');
+      }
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('automatic cleanup refuses a newly attached viewer before typing exit', async () => {
   const { closeIdleSession } = require('./serve');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-close-viewer-'));
@@ -178,7 +243,9 @@ test('explicit Close overrides Codex child checks but automatic cleanup and iden
   const session = { id: 's', kind: 'codex', state: 'done', endedTurn: true, mtime: Date.now() - 2 * 86400e3 };
   const pane = { id: 'p', alive: true, attached: 0, lastOutputAt: new Date(session.mtime).toISOString(), meta: { sessionId: 's', agent: 'codex' } };
   try {
-    for (const mode of ['automatic', 'manual', 'unknown', 'scheduled', 'scheduled-auto']) {
+    for (const mode of ['automatic', 'manual', 'unknown', 'scheduled', 'scheduled-auto', 'scheduled-restart']) {
+      session.state = mode === 'scheduled-restart' ? 'waiting' : 'done';
+      session.activity = mode === 'scheduled-restart' ? { reason: 'scheduled check', needsInput: false } : undefined;
       let typed = '';
       const tasks = mode.startsWith('scheduled') ? [{ id: 'owner', fm: { check_after: '2026-10-02T09:00', sessions: [{ id: 's' }], check: 'Read-only backup check' } }] : [];
       const tasksBefore = JSON.stringify(tasks);
@@ -188,13 +255,13 @@ test('explicit Close overrides Codex child checks but automatic cleanup and iden
         if (type === 'input') { typed += Buffer.from(params.data, 'base64').toString(); return {}; }
         assert.fail(type);
       } };
-      const deps = { root, host, closePolicy: ['automatic', 'scheduled-auto'].includes(mode) ? { automatic: true } : { manual: true },
+      const deps = { root, host, closePolicy: ['automatic', 'scheduled-auto'].includes(mode) ? { automatic: true } : { manual: true, restart: mode === 'scheduled-restart' },
         withInjectionLock: (fn) => fn(), buildState: () => ({ sessions: [session], tasks }), codexSessionFor: () => session,
         codexRolloutFile: () => assert.fail('explicit Close must not require historical child-agent records'), sleep: async () => {},
         psTable: mode === 'unknown' ? '' : '123 1 ttys001 Tue Sep  8 10:00:00 2026 codex resume s\n124 123 ?? Tue Sep  8 10:00:00 2026 codex-code-mode-host', lsof: async () => '',
       };
       const operation = closeIdleSession({ sessionId: 's', pane: 'p' }, deps);
-      if (['manual', 'scheduled'].includes(mode)) { assert.equal((await operation).closing, true); assert.equal(typed, '/exit\r'); }
+      if (['manual', 'scheduled', 'scheduled-restart'].includes(mode)) { assert.equal((await operation).closing, true); assert.equal(typed, '/exit\r'); }
       else { await assert.rejects(operation, mode === 'automatic' ? /child processes/ : mode === 'scheduled-auto' ? /scheduled check/ : /identity/); assert.equal(typed, ''); }
       assert.equal(JSON.stringify(tasks), tasksBefore, 'Close leaves scheduled recipes intact');
     }
@@ -205,7 +272,7 @@ test('Close UI sends exact target immediately and reports refusal without dismis
   const vm = require('node:vm');
   const writes = [], toasts = [];
   let fail = false, refreshes = 0, pinned = true, unpins = 0;
-  const context = vm.createContext({ write: async (...args) => { writes.push(args); if (fail) throw new Error('unsent draft'); } });
+  const context = vm.createContext({ write: async (...args) => { writes.push(args); if (fail) throw new Error('unsent draft'); return { closed: true }; } });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../web/app/close-session.js'), 'utf8').replace(/^import .*;\n/gm, '').replace('export async function', 'async function'), context);
   const ctx = { toast: (text) => toasts.push(text), refresh: () => refreshes++, isPanePinned: () => pinned,
     pinPane: async (pane) => { assert.equal(pane, 'p'); unpins++; pinned = false; return true; } };
@@ -213,6 +280,7 @@ test('Close UI sends exact target immediately and reports refusal without dismis
   await context.closeSession(ctx, 's', 'p', button);
   assert.equal(JSON.stringify(writes[0]), JSON.stringify(['/api/close-session', { sessionId: 's', pane: 'p' }]));
   assert.equal(refreshes, 1);
+  assert.match(toasts.at(-1), /Session closed/);
   assert.equal(unpins, 1);
   assert.equal(pinned, false);
   pinned = true;

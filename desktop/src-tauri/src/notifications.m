@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
 #import <UserNotifications/UserNotifications.h>
 
 extern void keep_notification_clicked(const char *key);
@@ -18,7 +19,7 @@ extern void keep_notification_clicked(const char *key);
 - (void)userNotificationCenter:(UNUserNotificationCenter *)center
     willPresentNotification:(UNNotification *)notification
     withCompletionHandler:(void (^)(UNNotificationPresentationOptions))completionHandler {
-    completionHandler(UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionList | UNNotificationPresentationOptionSound);
+    completionHandler(UNNotificationPresentationOptionBanner | UNNotificationPresentationOptionList);
 }
 @end
 
@@ -44,6 +45,7 @@ void keep_send_notification(const char *title, const char *body, const char *key
                 UNMutableNotificationContent *content = [UNMutableNotificationContent new];
                 content.title = notificationTitle;
                 content.body = notificationBody;
+                // Queue transitions own audio; banners stay silent.
                 content.userInfo = @{@"keepKey": notificationKey};
                 NSString *identifier = notificationKey.length ? notificationKey : NSUUID.UUID.UUIDString;
                 UNNotificationRequest *request = [UNNotificationRequest requestWithIdentifier:identifier content:content trigger:nil];
@@ -51,5 +53,11 @@ void keep_send_notification(const char *title, const char *body, const char *key
                     if (error) NSLog(@"Keep notification failed: %@", error);
                 }];
             }];
+    });
+}
+
+void keep_play_attention_sound(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSSound soundNamed:@"Pop"] play];
     });
 }

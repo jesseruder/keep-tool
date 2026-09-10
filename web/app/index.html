@@ -40,6 +40,7 @@
     <div class="theme-picker" id="themePicker"><button class="themebtn" id="themebtn" title="appearance and palette" aria-haspopup="true" aria-expanded="false">Moss · Auto</button><div class="theme-pop"></div></div>
     <button class="dockbtn" id="dockbtn" title="show the reviewer beside any mode"><span>Reviewer pane</span><span class="nw" hidden></span><kbd>R</kbd></button>
     <div class="meters num" id="meters"></div>
+    <button id="soundButton" class="dockbtn" hidden title="Waiting sounds on" aria-label="Mute waiting sounds" aria-pressed="false"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4Z"/><path class="sound-waves" d="M15 8a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/><path class="sound-off" d="m16 9 6 6m0-6-6 6"/></svg></button>
     <button id="notificationsButton" class="dockbtn" title="Notifications" aria-label="Notifications" aria-haspopup="dialog" aria-expanded="false" aria-controls="notificationsPanel"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M10 21h4"/></svg><span class="notification-count"></span></button>
   </header>
 
@@ -52,7 +53,7 @@
   <main>
     <section class="mode on" id="triage">
       <nav class="rail" id="rail"></nav>
-      <aside class="queue"><div class="qhead"><b id="qn">0</b> waiting on you <span class="order">oldest first</span></div><div class="qlist" id="qlist"></div></aside><aside class="queue-strip"></aside>
+      <aside class="queue"><div class="qhead"><b id="qn">0</b> waiting on you </div><div class="qlist" id="qlist"></div></aside><aside class="queue-strip"></aside>
       <div class="stage" id="stage"><div class="qempty stage-empty"><b>Connecting</b>Loading Keep state…</div></div>
     </section>
     <section class="mode watch" id="watch">
@@ -66,9 +67,9 @@
     <aside class="dock" id="dock"></aside>
   </main>
 
-  <footer class="keys"><span><kbd>j</kbd><kbd>k</kbd> move</span><span><kbd>⌘↵</kbd> focus terminal</span><span><kbd>esc</kbd> back to queue</span><span><kbd>1</kbd>–<kbd>9</kbd> pick</span><span><kbd>p</kbd> pin</span><span><kbd>?</kbd> all keys</span><span class="note">live Keep state · terminals stream from the host</span></footer>
+  <footer class="keys"><span><kbd>j</kbd><kbd>k</kbd> move in Triage</span><span><kbd>⌘↵</kbd> focus terminal</span><span><kbd>1</kbd>–<kbd>9</kbd> pick in Triage</span><span><kbd>p</kbd> pin in Triage</span><span><kbd>?</kbd> all keys</span><span class="note">live Keep state · terminals stream from the host</span></footer>
   <div class="toast" id="toast"></div>
-  <div class="help" id="help"><div class="card"><h3>Keys</h3><dl><dt><kbd>⌘1</kbd>–<kbd>⌘4</kbd></dt><dd>Triage, Watch, Reviewer, Fleet</dd><dt><kbd>⌘B</kbd></dt><dd>Collapse / expand the project rail</dd><dt><kbd>⌘\</kbd></dt><dd>Collapse / expand the queue</dd><dt><kbd>⌘⇧B</kbd></dt><dd>Collapse / expand the Reviewer side panel</dd><dt><kbd>⌘↑</kbd> / <kbd>⌘↓</kbd></dt><dd>Previous / next queue item, even in a terminal</dd><dt><kbd>⌘↵</kbd></dt><dd>Focus terminal; insert a newline when already in the terminal</dd><dt><kbd>esc</kbd></dt><dd>Return from terminal to queue</dd><dt><kbd>j</kbd> / <kbd>k</kbd></dt><dd>Move in the queue</dd><dt><kbd>1</kbd>–<kbd>9</kbd></dt><dd>Choose an option or quick reply</dd><dt><kbd>p</kbd></dt><dd>Pin or unpin from Watch</dd><dt><kbd>x</kbd></dt><dd>Dismiss with Undo</dd><dt><kbd>o</kbd></dt><dd>Open the Keep card (toast for now)</dd><dt><kbd>e</kbd></dt><dd>Edit the current Watch layout</dd><dt><kbd>R</kbd></dt><dd>Toggle the reviewer dock</dd><dt><kbd>F</kbd></dt><dd>Toggle Focus: stay on the top waiting item</dd><dt>Theme button</dt><dd>appearance and palette</dd><dt><kbd>⌘F</kbd></dt><dd>Find in the focused terminal</dd><dt><kbd>⌘K</kbd></dt><dd>Clear terminal and host replay buffer</dd><dt><kbd>⌘C</kbd></dt><dd>Copy a terminal selection; Ctrl-C sends interrupt</dd></dl><p><kbd>+ shell</kbd> in the rail opens a shell in the active project. Running, Pinned, and Recent groups sit under the queue; <kbd>p</kbd> pins/unpins. Press any key to close.</p></div></div>
+  <div class="help" id="help"><div class="card"><h3>Keys</h3><dl><dt><kbd>⌘1</kbd>–<kbd>⌘4</kbd></dt><dd>Triage, Watch, Reviewer, Fleet</dd><dt><kbd>⌘B</kbd></dt><dd>Collapse / expand the project rail</dd><dt><kbd>⌘\</kbd></dt><dd>Collapse / expand the queue</dd><dt><kbd>⌘⇧B</kbd></dt><dd>Collapse / expand the Reviewer side panel</dd><dt><kbd>⌘↵</kbd></dt><dd>Focus terminal; insert a newline when already in the terminal</dd><dt><kbd>j</kbd> / <kbd>k</kbd></dt><dd>Move in the queue</dd><dt><kbd>1</kbd>–<kbd>9</kbd></dt><dd>Choose an option or quick reply</dd><dt><kbd>p</kbd></dt><dd>Pin or unpin from Watch</dd><dt><kbd>x</kbd></dt><dd>Dismiss with Undo</dd><dt><kbd>e</kbd></dt><dd>Edit the current Watch layout</dd><dt><kbd>R</kbd></dt><dd>Toggle the reviewer dock</dd><dt><kbd>F</kbd></dt><dd>Toggle Focus: stay on the top waiting item</dd><dt>Theme button</dt><dd>appearance and palette</dd><dt><kbd>⌘F</kbd></dt><dd>Find in the focused terminal</dd><dt><kbd>⌘K</kbd></dt><dd>Clear terminal and host replay buffer</dd><dt><kbd>⌘C</kbd></dt><dd>Copy a terminal selection; Ctrl-C sends interrupt</dd></dl><p><kbd>+ shell</kbd> in the rail opens a shell in the active project. Running, Pinned, and Recent groups sit under the queue; <kbd>p</kbd> pins/unpins. Press any key to close.</p></div></div>
 
   <script src="/vendor/xterm.js"></script>
   <script src="/vendor/addon-webgl.js"></script>

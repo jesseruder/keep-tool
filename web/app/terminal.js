@@ -1,4 +1,6 @@
+import { createImagePasteHandler } from './image-paste.js';
 import { getPalette, resolvedTheme, xtermTheme } from './theme.js';
+import { captureFocusIntent } from './focus-intent.js';
 
 const encoder = new TextEncoder();
 
@@ -60,8 +62,9 @@ export function mountTerminal(container, pane, options = {}) {
   let resizeTimer;
   let showFrame = 0;
   let showFocus = false;
-  let showFocusOrigin = null;
+  let showFocusIntent = null;
   let showFocusContainer = null;
+  let presented = true;
   let observing = false;
   let connectedOnce = false;
   let retryable = true;
@@ -73,6 +76,7 @@ export function mountTerminal(container, pane, options = {}) {
   let sentRows = null;
   let userInputUntil = 0;
   let observerGeometry = '';
+  let observerFont = null;
   const pendingInput = [];
 
   const sendJson = (value) => {
@@ -81,13 +85,14 @@ export function mountTerminal(container, pane, options = {}) {
   const setStatus = (value) => { statusState.textContent = value; };
   const isVisible = () => {
     const bounds = wrapper.getClientRects()[0];
-    return wrapper.isConnected && Boolean(bounds?.width && bounds?.height);
+    return presented && wrapper.isConnected && Boolean(bounds?.width && bounds?.height);
   };
   const disposeWebgl = () => {
     webglContextLoss?.dispose();
     webglContextLoss = null;
     webglAddon?.dispose();
     webglAddon = null;
+    observerGeometry = '';
   };
   const loadWebgl = () => {
     if (disposed || webglAddon || !isVisible()) return;
@@ -96,9 +101,11 @@ export function mountTerminal(container, pane, options = {}) {
       addon = new window.WebglAddon.WebglAddon();
       terminal.loadAddon(addon);
       webglAddon = addon;
+      observerGeometry = '';
       webglContextLoss = addon.onContextLoss(() => {
         if (webglAddon !== addon) return;
         disposeWebgl();
+        if (!disposed && isVisible()) scaleObserver();
       });
     } catch { addon?.dispose(); }
   };
@@ -121,25 +128,27 @@ export function mountTerminal(container, pane, options = {}) {
     const width = host.clientWidth - parseFloat(padding.paddingLeft || 0) - parseFloat(padding.paddingRight || 0);
     const height = host.clientHeight - parseFloat(padding.paddingTop || 0) - parseFloat(padding.paddingBottom || 0);
     if (!screen?.offsetWidth || !screen.offsetHeight || width <= 0 || height <= 0) return;
-    const geometry = `${width}:${height}:${terminal.cols}:${terminal.rows}`;
-    if (geometry !== observerGeometry) {
-      observerGeometry = geometry;
-      if (terminal.options.fontSize !== 12.5) {
-        terminal.options.fontSize = 12.5;
-        fitAndResize();
-        return;
-      }
+    const geometry = `${width}:${height}:${terminal.cols}:${terminal.rows}:${devicePixelRatio}:${terminal.options.fontFamily}:${terminal.options.lineHeight}:${terminal.options.letterSpacing}`;
+    const currentBounds = screen.getBoundingClientRect();
+    if (geometry === observerGeometry && terminal.options.fontSize === observerFont
+        && currentBounds.width <= width && currentBounds.height <= height) return;
+    // Xterm updates cell/screen dimensions synchronously on font changes. Search
+    // the quarter-pixel sizes before the browser paints, instead of flashing a
+    // full-size font and shrinking it over multiple 50ms timers. No CSS transform:
+    // pointer coordinates continue to match xterm's actual rendered cell metrics.
+    let low = 4; let high = 50; let best = 4;
+    while (low <= high) {
+      const candidate = Math.floor((low + high) / 2);
+      terminal.options.fontSize = candidate / 4;
+      const bounds = screen.getBoundingClientRect();
+      if (bounds.width <= width && bounds.height <= height) {
+        best = candidate;
+        low = candidate + 1;
+      } else high = candidate - 1;
     }
-    // Shrink monotonically until it fits. Growing into the rounding slack can
-    // oscillate forever between adjacent fonts with different rounded cell heights.
-    const scale = Math.min(1, width / screen.offsetWidth, height / screen.offsetHeight);
-    // Use xterm's own cell metrics, not CSS transforms: its pointer coordinates
-    // must agree with rendered cells when selecting/copying observer output.
-    const fontSize = Math.max(1, Math.min(12.5, Math.floor(terminal.options.fontSize * scale * 4) / 4));
-    if (fontSize !== terminal.options.fontSize) {
-      terminal.options.fontSize = fontSize;
-      fitAndResize(); // settle rounded cell measurements after xterm's render
-    }
+    observerFont = best / 4;
+    terminal.options.fontSize = observerFont;
+    observerGeometry = geometry;
   };
   const adoptPaneSize = () => {
     if (!replayDone || isPrimary || !Number.isInteger(paneState?.cols) || !Number.isInteger(paneState?.rows)) return;
@@ -148,7 +157,9 @@ export function mountTerminal(container, pane, options = {}) {
         terminal.resize(paneState.cols, paneState.rows);
       }
     } catch {}
-    scaleObserver();
+    // Hidden observers still parse incoming cursor-addressed output. Their local
+    // buffer must track host dimensions even though they cannot resize the PTY.
+    if (isVisible()) scaleObserver();
   };
   const setPaneState = (next) => {
     if (!next || next.id !== pane) return;
@@ -213,7 +224,7 @@ export function mountTerminal(container, pane, options = {}) {
     observing = true;
   };
   const takeControl = () => {
-    if (disposed || exited || paneState?.primary === viewer || claimPending) return;
+    if (disposed || !isVisible() || exited || paneState?.primary === viewer || claimPending) return;
     claimPending = true;
     isPrimary = true;
     wrapper.classList.remove('observer');
@@ -226,6 +237,14 @@ export function mountTerminal(container, pane, options = {}) {
     if (replayDone) fitNow(true);
   };
 
+  let reportedVisibility;
+  const reportVisibility = (force = false) => {
+    const visible = !document.hidden && isVisible();
+    if (!disposed && socket?.readyState === WebSocket.OPEN && (force || visible !== reportedVisibility)) {
+      socket.send(JSON.stringify({ t: 'visibility', visible }));
+      reportedVisibility = visible;
+    }
+  };
   const connect = () => {
     if (disposed || exited || !retryable) return;
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -250,12 +269,14 @@ export function mountTerminal(container, pane, options = {}) {
       flushInput();
     };
     socket.onopen = () => {
+      if (disposed || socket !== connection) return;
       connectedOnce = true;
       sentCols = null;
       sentRows = null;
       if (claimPending && replayDone) fitNow(true);
     };
     socket.onmessage = (event) => {
+      if (disposed || socket !== connection) return;
       if (typeof event.data !== 'string') {
         terminal.write(new Uint8Array(event.data));
         if (replayDone) markHealthy();
@@ -264,6 +285,7 @@ export function mountTerminal(container, pane, options = {}) {
       let message;
       try { message = JSON.parse(event.data); } catch { return; }
       if (message.t === 'attached') {
+        reportVisibility(true);
         // The bridge guarantees this precedes the serialized snapshot, so stale
         // local scrollback cannot be doubled when the host reconnects after reload.
         terminal.reset();
@@ -308,7 +330,7 @@ export function mountTerminal(container, pane, options = {}) {
       }
     };
     socket.onclose = () => {
-      if (disposed || exited || !retryable) return;
+      if (disposed || socket !== connection || exited || !retryable) return;
       setStatus('reconnecting');
       const delay = Math.min(8000, 250 * (2 ** retry++));
       retryTimer = setTimeout(connect, delay);
@@ -363,6 +385,15 @@ export function mountTerminal(container, pane, options = {}) {
       userInputUntil = performance.now() + 250;
     }
   };
+  wrapper.addEventListener('paste', createImagePasteHandler({
+    isDesktop: () => Boolean(window.__TAURI__),
+    agent: () => paneState?.meta?.agent,
+    active: () => !disposed && !exited && isVisible() && document.activeElement === terminal.textarea,
+    ready: () => socket?.readyState === WebSocket.OPEN && replayDone,
+    hasClipboardImage: () => window.__TAURI__.core.invoke('clipboard_has_image'),
+    pasteImage: () => sendInput('\x16', { user: true }),
+    report: (message) => { statusNote.textContent = message; },
+  }), true);
   terminal.textarea?.addEventListener('paste', markInsertedInput, true);
   terminal.textarea?.addEventListener('compositionend', markInsertedInput, true);
   terminal.textarea?.addEventListener('input', markInsertedInput, true);
@@ -395,9 +426,11 @@ export function mountTerminal(container, pane, options = {}) {
   });
 
   const show = (focus = false) => {
+    presented = true;
+    reportVisibility();
     showFocus = showFocus || focus;
     if (focus) {
-      showFocusOrigin = document.activeElement;
+      showFocusIntent = captureFocusIntent();
       showFocusContainer = wrapper.parentElement;
     }
     if (showFrame) return;
@@ -410,7 +443,7 @@ export function mountTerminal(container, pane, options = {}) {
       loadWebgl();
       fitNow();
       if (wanted && wrapper.parentElement === showFocusContainer
-          && (document.activeElement === showFocusOrigin || document.activeElement === document.body)) terminal.focus();
+          && showFocusIntent?.()) terminal.focus();
     });
   };
   show(Boolean(options.focus));
@@ -420,16 +453,22 @@ export function mountTerminal(container, pane, options = {}) {
     element: wrapper,
     terminal,
     get socket() { return socket; },
-    focus: () => terminal.focus(),
+    focus: () => { if (!disposed && isVisible()) terminal.focus(); },
     fit: fitNow,
     setTheme(theme) { terminal.options.theme = theme?.mode ? xtermTheme(theme.mode, theme.palette) : theme; },
     show,
     hide() {
+      presented = false;
+      reportVisibility();
       showFocus = false;
+      clearTimeout(resizeTimer);
+      cancelAnimationFrame(showFrame);
+      showFrame = 0;
       stopObserving();
       disposeWebgl();
     },
     syncVisibility() {
+      reportVisibility();
       if (isVisible()) show(false);
       else {
         stopObserving();

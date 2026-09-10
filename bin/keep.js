@@ -12,6 +12,7 @@ const http = require('http');
 const { execFileSync, spawn } = require('child_process');
 const stepRegistry = require('./steps.js');
 const allow = require('./allow.js');
+const cardUsage = require('./card-usage.js');
 const { readTranscriptTail, textOf } = require('./transcripts.js');
 
 const ROOT = process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
@@ -21,15 +22,17 @@ const META = path.join(ROOT, '.keep');
 const LOCK = path.join(META, 'lock');
 const HOLDS_DIR = path.join(META, 'holds');
 
-const STATUSES = ['inbox', 'active', 'waiting', 'blocked', 'landing', 'review', 'done'];
+const STATUSES = ['inbox', 'active', 'waiting', 'blocked', 'landing', 'review', 'deferred', 'done'];
+const OPEN_MESSAGE_LIMIT = 2000;
+const OPEN_MESSAGE_ERROR = 'agent messages are limited to 2000 characters';
 const KINDS = ['task', 'experiment', 'idea', 'chore', 'bug'];
-const STATUS_ORDER = ['active', 'review', 'blocked', 'waiting', 'landing', 'inbox', 'done'];
+const STATUS_ORDER = ['active', 'review', 'blocked', 'waiting', 'landing', 'inbox', 'deferred', 'done'];
 
 class KeepError extends Error {}
 
 const isTTY = process.stdout.isTTY;
 const color = (code, s) => (isTTY ? `\x1b[${code}m${s}\x1b[0m` : s);
-const STATUS_COLOR = { active: '32', review: '35', blocked: '31', waiting: '33', landing: '34', inbox: '36', done: '90' };
+const STATUS_COLOR = { active: '32', review: '35', blocked: '31', waiting: '33', landing: '34', inbox: '36', deferred: '90', done: '90' };
 
 // ---------- time ----------
 
@@ -146,6 +149,9 @@ function serializeTask(task) {
     for (const l of fm.check.split('\n')) out.push(`  ${l}`);
   }
   scalar('scheduled_by');
+  scalar('scheduled_at');
+  scalar('scheduled_for');
+  scalar('scheduled_intent');
   if (fm.sessions && fm.sessions.length) {
     out.push('sessions:');
     for (const s of fm.sessions) {
@@ -168,7 +174,7 @@ function serializeTask(task) {
   const known = new Set([
     'title', 'status', 'kind', 'experiment_id', 'autocontinue', 'autonomous', 'allow', 'allow_until',
     'tags', 'depends_on', 'project', 'check_after', 'check',
-    'scheduled_by', 'sessions', 'needs', 'created', 'updated',
+    'scheduled_by', 'scheduled_at', 'scheduled_for', 'scheduled_intent', 'sessions', 'needs', 'created', 'updated',
   ]);
   for (const key of Object.keys(fm)) {
     if (!known.has(key) && typeof fm[key] === 'string') out.push(`${key}: ${fm[key]}`);
@@ -303,6 +309,7 @@ function releaseCardSession(taskId, sessionId) {
     if (!task || !Array.isArray(task.fm.sessions)) return false;
     const kept = task.fm.sessions.filter((entry) => entry.id !== sessionId);
     if (kept.length === task.fm.sessions.length) return false;
+    cardUsage.recordOwner(ROOT, { id: sessionId, agent: task.fm.sessions.find(s => s.id === sessionId).agent }, null);
     task.fm.sessions = kept;
     // Metadata maintenance, not activity: keep `updated` and the board position.
     fs.writeFileSync(taskPath(task.id), serializeTask(task));
@@ -318,6 +325,7 @@ function linkLaunchedSession(taskId, session) {
     const all = loadAll(false);
     const task = all.find((entry) => entry.id === taskId);
     if (!task) return null;
+    cardUsage.recordOwner(ROOT, { id: session.id, agent }, task.id);
     const previousOwners = claimSession(task, { id: session.id, agent }, all);
     for (const previous of previousOwners) fs.writeFileSync(taskPath(previous.id), serializeTask(previous));
     fs.writeFileSync(taskPath(task.id), serializeTask(task));
@@ -336,7 +344,7 @@ function isReviewerSession() {
   try { return fs.existsSync(path.join(META, 'reviewer', session.id)); } catch { return false; }
 }
 
-const REVIEWER_STATUS_ERROR = 'the fleet reviewer never changes status; use keep review-note --suggest-status <s> (or --force if Owner asked)';
+const REVIEWER_STATUS_ERROR = 'the fleet reviewer applies done/deferred only through a wrong-status finding; use keep review-note --kind wrong-status --suggest-status <s> (or --force if Owner asked)';
 
 function guardReviewerStatusChange(changesStatus, force) {
   if (!changesStatus || force || !isReviewerSession()) return;
@@ -358,13 +366,24 @@ function sessionInTaskProject(task) {
 // a scheduled check has to reach the session that asked for it however many cards
 // that session touched afterwards, so record the scheduler separately. Nothing but
 // a new schedule (or --clear-check-after) moves it.
-function recordScheduler(task) {
+function recordScheduler(task, intent = 'waiting') {
   if (isReviewerSession()) return;
   const session = currentSession();
   const sid = session && session.id;
   if (!sid || !/^[A-Za-z0-9_-]+$/.test(sid)) return;
   if (!sessionInTaskProject(task)) return;
   task.fm.scheduled_by = sid;
+  if (intent === null) {
+    for (const field of ['scheduled_at', 'scheduled_for', 'scheduled_intent']) delete task.fm[field];
+    return;
+  }
+  task.fm.scheduled_at = new Date().toISOString();
+  task.fm.scheduled_for = task.fm.check_after || '';
+  task.fm.scheduled_intent = intent;
+}
+
+function clearScheduler(task) {
+  for (const field of ['scheduled_by', 'scheduled_at', 'scheduled_for', 'scheduled_intent']) delete task.fm[field];
 }
 
 function recordSession(task) {
@@ -384,6 +403,7 @@ function recordSession(task) {
   // A live session has exactly one owning card. Without removing old links the
   // dashboard resolves duplicates by filesystem iteration order, so a check-in
   // can make the session appear under an unrelated task.
+  cardUsage.recordOwner(ROOT, session, task.id);
   const previousOwners = claimSession(task, session, loadAll(false));
   for (const previous of previousOwners) {
     // Moving a session link is metadata maintenance, not activity on the old
@@ -581,8 +601,8 @@ function git(...args) {
   return execFileSync('git', ['-C', ROOT, ...args], { encoding: 'utf8' });
 }
 
-function commitAndPush(message, pathspecs = ['tasks', 'archive', 'digests']) {
-  git('add', '-A', ...pathspecs);
+function commitAndPush(message, pathspecs = ['tasks', 'archive', 'digests'], { staged = false } = {}) {
+  if (!staged) git('add', '-A', ...pathspecs);
   const status = git('status', '--porcelain', ...pathspecs);
   if (!status.trim()) return;
   // pathspec-scoped so unrelated staged files never ride along in a keep commit
@@ -770,15 +790,7 @@ function holdFile(id) {
   return path.join(HOLDS_DIR, `${id}.json`);
 }
 
-function scopeForProject(projectPath) {
-  if (!projectPath || !/^(?:~|\/)/.test(String(projectPath))) return null;
-  const resolved = path.resolve(String(projectPath).replace(/^~(?=\/|$)/, os.homedir()));
-  const castleRoot = path.join(os.homedir(), 'castle');
-  const isCastleProject = resolved === castleRoot || resolved.startsWith(castleRoot + path.sep);
-  if (!isCastleProject) return 'personal';
-  const segments = path.relative(castleRoot, resolved).split(path.sep).filter(Boolean);
-  return segments.some((segment) => segment.startsWith('jesse-')) ? 'personal' : 'castle';
-}
+const scopeForProject = require('./preferences').scopeForProject;
 
 // ---------- rendering ----------
 
@@ -905,6 +917,23 @@ function structuredFieldTips(message, next, commits) {
 
 const commands = {};
 
+commands.usage = (argv) => {
+  const o = parseArgs(argv, { json: 'bool' });
+  if (o._.length !== 1) die('usage: keep usage <card> [--json]');
+  const task = loadTaskAnywhere(o._[0]);
+  if (!task) die(`unknown card: ${o._[0]}`);
+  const summary = cardUsage.forCard(cardUsage.snapshot(ROOT), task.id);
+  if (o.json) { console.log(JSON.stringify(summary, null, 2)); return; }
+  if (!summary) { console.log('Model usage collection has not started.'); return; }
+  console.log(`Model usage for ${task.id} (since ${new Date(summary.since).toISOString()})`);
+  console.log('Model | Uncached input | Cache read | Cache write | Output | Events');
+  for (const [model, u] of Object.entries(summary.models)) {
+    console.log(`${model} | ${u.input} | ${u.cacheRead} | ${u.cacheWrite} | ${u.output} | ${u.calls}`);
+  }
+  if (!summary.calls) console.log('No attributed usage yet.');
+  if (summary.pending || Object.keys(summary.issues).length) console.log('Collection is catching up or has incomplete evidence; see --json.');
+};
+
 function addTask({
   title, kind, tags, project, checkAfter, check, status, note, experimentId, force, beforeSave,
   withinLock = false, commit = true, linkSession = true,
@@ -934,10 +963,10 @@ function addTask({
 
   project = inferProject(project);
   tags = tags || [];
-  if (!tags.includes('castle') && !tags.includes('personal')) {
-    tags.push(scopeForProject(project) || 'personal');
+  if (!require('./preferences').scopes().names.some((name) => tags.includes(name))) {
+    tags.push(scopeForProject(project) || require('./preferences').scopes().default);
     if (!project) {
-      process.stderr.write('keep: no project — defaulting to #personal (pass --tag castle to override)\n');
+      process.stderr.write(`keep: no project — defaulting to #${require('./preferences').scopes().default} (pass --tag to override)\n`);
     }
   }
 
@@ -1320,8 +1349,9 @@ function guardBlocked(task, status, force) {
 function checkinTask(id, {
   message, status, checkAfter, clearCheckAfter, check, heading, experimentId, step,
   linkSession = true, commitLabel, force, withinLock = false, commit = true, dependencyWait = false,
-  next, commits,
+  next, commits, handoff,
 }) {
+  if (handoff !== undefined && !['waiting', 'needs-input'].includes(handoff)) die('--handoff must be waiting or needs-input');
   if (!message || !String(message).trim()) die('a check-in needs a message');
   next = cleanNext(next);
   commits = cleanCommits(commits);
@@ -1371,8 +1401,9 @@ function checkinTask(id, {
       task.fm.status = status;
     }
     if (checkAfter) task.fm.check_after = parseWhen(checkAfter);
-    if (clearCheckAfter) { task.fm.check_after = ''; delete task.fm.scheduled_by; }
+    if (clearCheckAfter) { task.fm.check_after = ''; clearScheduler(task); }
     if (check) task.fm.check = check;
+    if (handoff && (!task.fm.check_after || !task.fm.check)) die('--handoff needs a scheduled check with a recipe');
     if (experimentId !== undefined) task.fm.experiment_id = experimentId;
     if (status === 'waiting' && !task.fm.check_after && !dependencyWait
         && !unresolvedDependencyIds(task).length && !openNeeds([task]).length) {
@@ -1382,7 +1413,7 @@ function checkinTask(id, {
     guardLanding(task, status, commits, force);
     if (linkSession !== false) {
       recordSession(task);
-      if (!clearCheckAfter && (checkAfter || check)) recordScheduler(task);
+      if (!clearCheckAfter && (checkAfter || check || handoff)) recordScheduler(task, handoff || (checkAfter ? 'waiting' : null));
     }
     appendLog(task, `${heading || 'check-in'}${status ? ` → ${status}` : ''}`, logMessage(message, next, commits));
     saveTask(task);
@@ -1395,15 +1426,15 @@ function checkinTask(id, {
 }
 
 commands.checkin = (argv) => {
-  const o = parseArgs(argv, { status: 'str', 'check-after': 'str', 'clear-check-after': 'bool', check: 'str', 'experiment-id': 'str', step: 'str', force: 'bool', next: 'str', commit: 'list' });
+  const o = parseArgs(argv, { status: 'str', 'check-after': 'str', 'clear-check-after': 'bool', check: 'str', 'experiment-id': 'str', step: 'str', force: 'bool', next: 'str', commit: 'list', handoff: 'str' });
   const id = o._[0];
-  if (!id || !o.m) die('usage: keep checkin <id> -m "state + next step" [--next "text"] [--commit sha]... [--step <n|next>] [--status s] [--experiment-id id] [--check-after when] [--clear-check-after] [--force]');
+  if (!id || !o.m) die('usage: keep checkin <id> -m "state + next step" [--next "text"] [--commit sha]... [--step <n|next>] [--status s] [--experiment-id id] [--check-after when] [--check "recipe"] [--clear-check-after] [--handoff waiting|needs-input] [--force]');
   const next = cleanNext(o.next);
   const commits = cleanCommits(o.commit);
   const task = checkinTask(id, {
     message: o.m, status: o.status, checkAfter: o['check-after'],
     clearCheckAfter: o['clear-check-after'], check: o.check, experimentId: o['experiment-id'],
-    step: o.step, force: o.force, next, commits,
+    step: o.step, force: o.force, next, commits, handoff: o.handoff,
   });
   structuredFieldTips(o.m, next, commits);
   console.log(fmtTask(task));
@@ -1440,7 +1471,7 @@ commands.done = (argv) => {
     const task = loadTask(id);
     task.fm.status = 'done';
     task.fm.check_after = '';
-    delete task.fm.scheduled_by;
+    clearScheduler(task);
     recordSession(task);
     appendLog(task, 'done', logMessage(message, next, commits));
     saveTask(task);
@@ -2778,13 +2809,14 @@ function normalizeQuestion(value) {
 }
 
 commands.ask = async (argv) => {
-  const o = parseArgs(argv, { about: 'str', task: 'str', timeout: 'str', jesse: 'bool' });
-  if (!o._.length) die('usage: keep ask "<question>" [--jesse] [--about <project>] [--task <id>] [--timeout <min>]');
+  const o = parseArgs(argv, { about: 'str', task: 'str', timeout: 'str', owner: 'bool', jesse: 'bool' });
+  o.owner = o.owner || o.jesse;
+  if (!o._.length) die('usage: keep ask "<question>" [--owner] [--about <project>] [--task <id>] [--timeout <min>]');
   if (isReviewerSession()) die('the fleet reviewer cannot ask questions');
   const question = normalizeQuestion(o._.join(' '));
   const about = o.about ? resolveProjectArg(o.about) : '';
   if (o.task) loadTask(o.task);
-  if (o.jesse && o.timeout !== undefined) die('--jesse questions do not time out; drop --timeout');
+  if (o.owner && o.timeout !== undefined) die('--owner questions do not time out; drop --timeout');
   const timeoutMin = o.timeout === undefined ? 10 : Number(o.timeout);
   if (!Number.isFinite(timeoutMin) || timeoutMin <= 0) die('--timeout must be a positive number of minutes');
   const review = require('./review.js');
@@ -2795,7 +2827,7 @@ commands.ask = async (argv) => {
     question,
     about,
     task: o.task || '',
-    to: o.jesse ? 'jesse' : 'reviewer',
+    to: o.owner ? 'owner' : 'reviewer',
     from: { sessionId: session ? session.id : '', agent: session ? session.agent : 'manual' },
     timeoutMs: Math.round(timeoutMin * 60e3),
     status: 'open',
@@ -2816,7 +2848,7 @@ commands.ask = async (argv) => {
   });
   console.log(entry.id);
   if (about) console.log(require('./who.js').renderWho(await whoSnapshot(about)));
-  console.log(o.jesse
+  console.log(o.owner
     ? `queued for Owner (${entry.id}); it shows in keep questions, keep brief and the dashboard until he runs keep answer ${entry.id} -m "...", and the answer is sent into this session. Do not wait on it — carry on with anything that does not depend on the answer.`
     : `queued for the reviewer; the answer will be sent into this session, or fleet facts after ${timeoutMin} min if it does not answer`);
 };
@@ -2839,6 +2871,7 @@ commands.answer = async (argv) => {
     sessionId: session ? session.id : '',
     reviewer: fromReviewer,
   };
+  const selfAnswer = Boolean(session && question.from?.sessionId === session.id && question.from?.agent === session.agent);
   let claimed = false;
   const current = review.updateQuestion(id, (fresh) => {
     if (fresh.status !== 'open') return null;
@@ -2848,6 +2881,7 @@ commands.answer = async (argv) => {
       answeredAt: Date.now(),
       answer,
       answeredBy,
+      ...(selfAnswer ? { answerDelivery: { pending: false, attempts: 0, acknowledgedAt: Date.now(), reason: 'answered-in-owning-session' } } : {}),
     };
   });
   if (!claimed) die(`${id} is already ${current ? current.status : 'missing'}`);
@@ -2871,7 +2905,9 @@ commands.answer = async (argv) => {
       notes.push(`could not record on ${current.task}: ${error.message}`);
     }
   }
-  if (current.from && current.from.sessionId) {
+  if (selfAnswer) {
+    notes.push('already in the asking session; no terminal delivery needed');
+  } else if (current.from && current.from.sessionId) {
     try {
       const response = await postKeepApi('/api/send', {
         sessionId: current.from.sessionId,
@@ -2931,8 +2967,8 @@ commands.questions = (argv) => {
   };
   // Owner's own queue first and under its own heading: the point of the lane is
   // that he can see what is waiting on him without reading past reviewer traffic.
-  const mine = questions.filter((question) => question.to === 'jesse');
-  const rest = questions.filter((question) => question.to !== 'jesse');
+  const mine = questions.filter((question) => ['owner', 'jesse'].includes(question.to));
+  const rest = questions.filter((question) => !['owner', 'jesse'].includes(question.to));
   if (mine.length) {
     console.log(`Waiting on Owner (${mine.filter((q) => q.status === 'open').length} open):`);
     for (const question of mine) line(question);
@@ -3359,6 +3395,13 @@ function formatOpenResult(result) {
 }
 
 async function postOpen(payload, post = postKeepApi, timeoutMs) {
+  // Check the actual typed payload before contacting a daemon that might still
+  // have the old truncating implementation. The CLI spills long source text first.
+  if (payload.message != null && String(payload.message).length > OPEN_MESSAGE_LIMIT) {
+    const error = new KeepError(OPEN_MESSAGE_ERROR);
+    error.status = 400;
+    throw error;
+  }
   const response = await post('/api/open', payload, timeoutMs);
   let result = {};
   try { result = JSON.parse(response.data); } catch {}
@@ -3370,17 +3413,58 @@ async function postOpen(payload, post = postKeepApi, timeoutMs) {
   return result;
 }
 
+function writeOpenHandoff(id, message, task) {
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) die('bad card or session id');
+  return withLock(() => {
+    const directory = path.join(META, 'handoffs');
+    fs.mkdirSync(directory, { recursive: true });
+    let file;
+    let pointer;
+    for (let timestamp = Date.now(); ; timestamp++) {
+      file = path.join(directory, `${id}-${timestamp}.md`);
+      pointer = `Your instructions are in ${file}; read that file first.`;
+      if (pointer.length > OPEN_MESSAGE_LIMIT) die(OPEN_MESSAGE_ERROR);
+      if (/[\r\n]/.test(pointer)) die('handoff path cannot contain newlines');
+      try { fs.writeFileSync(file, message, { flag: 'wx' }); break; }
+      catch (error) { if (error.code !== 'EEXIST') throw error; }
+    }
+    const paths = [path.relative(ROOT, file)];
+    const owner = task ? loadTask(task.id) : taskForSession(id);
+    if (owner) {
+      // Commit the complete instructions before a session can read the pointer.
+      // This is a launch request, not a claim that the daemon succeeded.
+      appendLog(owner, 'open requested', `Handoff instructions: ${file}`);
+      saveTask(owner);
+      paths.push(path.relative(ROOT, taskPath(owner.id)));
+    }
+    // .keep is otherwise ignored runtime state; only this immutable handoff is
+    // deliberately tracked. Never sweep up another launch's handoff or card.
+    git('add', '-f', '--', ...paths);
+    commitAndPush(`keep: open ${id} (handoff instructions)`, paths, { staged: true });
+    return pointer;
+  });
+}
+
 commands.open = async (argv, deps = {}) => {
-  const o = parseArgs(argv, { fresh: 'bool', agent: 'str' });
+  const o = parseArgs(argv, { fresh: 'bool', agent: 'str', 'message-file': 'str' });
   const id = o._[0];
-  if (!id) die('usage: keep open <card-id|session-id> [--fresh] [--agent claude|codex] [-m "opening message"]');
+  if (!id) die('usage: keep open <card-id|session-id> [--fresh] [--agent claude|codex] [-m "opening message" | --message-file <path>]');
   if (o.agent && !['claude', 'codex'].includes(o.agent)) die('agent must be claude or codex');
-  if (o.m != null && !o.m.trim()) die('-m needs a message');
+  if (o.m != null && o['message-file'] != null) die('use either -m or --message-file, not both');
+  let message = o.m;
+  if (o['message-file'] != null) {
+    try { message = fs.readFileSync(path.resolve(o['message-file']), 'utf8'); }
+    catch (error) { die('cannot read message file: ' + error.message); }
+  }
+  if (message != null && !message.trim()) die(o['message-file'] != null ? '--message-file needs a message' : '-m needs a message');
   let task;
   try { task = (deps.loadTask || loadTask)(id); } catch {}
+  if (message != null && (o['message-file'] != null || message.length > OPEN_MESSAGE_LIMIT || /[\r\n]/.test(message))) {
+    message = writeOpenHandoff(id, message, task);
+  }
   try {
     const payload = { ...(task ? { taskId: id } : { sessionId: id }), fresh: Boolean(o.fresh), agent: o.agent };
-    if (o.m != null) payload.message = o.m;
+    if (message != null) payload.message = message;
     // The launching session hands the card over; the daemon unlinks it once the new session is on the card.
     const self = (deps.currentSession || currentSession)();
     if (task && self && self.id) payload.requester = self.id;
@@ -3589,6 +3673,17 @@ function dumpHookInput(kind, input) {
 }
 
 function codexHook(kind, input) {
+  if (kind === 'stop') {
+    // Child hooks may carry the parent's session_id. Never enforce its plan
+    // against a child, an unknown transcript, or a headless run.
+    if (!codexStopState(input)) return;
+    if (stopHook(input, 'codex') === true) return true;
+    return codexHook('complete', input);
+  }
+  if (kind === 'lifecycle') {
+    try { require('./codex-lifecycle').record(ROOT, input); } catch {}
+    return;
+  }
   if (!['start', 'question', 'approval', 'complete', 'end', 'client-end', 'pre-tool', 'post-tool'].includes(kind)) return;
   if (kind === 'pre-tool' || kind === 'post-tool') {
     dumpHookInput(kind, input);
@@ -3615,6 +3710,7 @@ function codexHook(kind, input) {
     // hook binds the inherited host pane to the ID it just assigned.
     const pending = recordSessionPane(input, 'codex');
     recordCodexParent(input);
+    if (codexStopState(input)) initializeStopCheck(input);
     return pending;
   }
   if (kind === 'end') {
@@ -3637,8 +3733,9 @@ function codexHook(kind, input) {
       .find((entry) => {
         try {
           const meta = codexSessionMeta(entry.file);
-          if (!meta || meta.originator === 'Claude Code' || typeof meta.session_id !== 'string') return false;
-          sid = meta.session_id;
+          if (!meta || require('./codex.js').isChildSession(meta)) return false;
+          sid = typeof meta.id === 'string' && meta.id ? meta.id : meta.session_id;
+          if (typeof sid !== 'string') return false;
           return /^[A-Za-z0-9_-]+$/.test(sid);
         } catch { return false; }
       }) || null;
@@ -3658,7 +3755,7 @@ function codexHook(kind, input) {
       ? toolInput.questions[0]
       : {};
     type = 'question';
-    message = String(question.question || '').slice(0, 500);
+    message = String(question.question || question.title || '').slice(0, 500);
     if (Array.isArray(question.options)) {
       options = question.options.map((option) => {
         if (typeof option === 'string') return option;
@@ -3751,11 +3848,20 @@ commands.hook = async (argv) => {
       codexInputValid = Boolean(input && typeof input === 'object' && !Array.isArray(input));
     } catch {}
   }
+  if (argv[0] === 'lifecycle') {
+    try { require('./session-lifecycle').record(ROOT, input); } catch {}
+    return; // Observation only: never block or inject context.
+  }
   if (argv[0] === 'codex') {
     // Codex hooks must always receive valid JSON and success, even for malformed
     // input or local filesystem failures. The one exception is a step-guard deny,
     // which blocks the tool call the way the Claude pre-bash hook does.
-    try { if (codexInputValid) await codexHook(argv[1], input); } catch (error) {
+    try {
+      if (codexInputValid) {
+        const blocked = await codexHook(argv[1], input);
+        if (argv[1] === 'stop' && blocked === true) return;
+      }
+    } catch (error) {
       if (error && error.hookDeny) {
         console.log(JSON.stringify({
           decision: 'block',
@@ -3858,7 +3964,7 @@ commands.hook = async (argv) => {
     } catch {}
     return;
   }
-  if (argv[0] !== 'session-start') die('usage: keep hook session-start|session-end|stop|notification|pre-bash|post-bash|codex <start|question|approval|complete|end|client-end|pre-tool|post-tool>');
+  if (argv[0] !== 'session-start') die('usage: keep hook session-start|session-end|stop|notification|lifecycle|pre-bash|post-bash|codex <start|stop|question|approval|complete|end|client-end|pre-tool|post-tool|lifecycle>');
   // A Claude session ID survives `--resume`, so marker age alone cannot tell a
   // resumed run from the work that preceded it. Anchor enforcement at the
   // transcript's current end on every startup/resume hook instead.
@@ -3872,7 +3978,7 @@ commands.hook = async (argv) => {
   const overdue = loadAll(false).filter(isOverdue);
   if (overdue.length) {
     lines.push(`Overdue checks (${overdue.length}):`);
-    for (const t of overdue.slice(0, CAP)) lines.push(`- ${t.id}: "${clip(t.fm.title)}" — check was due ${t.fm.check_after.replace('T', ' ')}${t.fm.check ? '; run its check recipe (keep show ' + t.id + ')' : ''}`);
+    for (const t of overdue.slice(0, CAP)) lines.push(`- ${t.id}: "${clip(t.fm.title)}" — check was due ${t.fm.check_after.replace('T', ' ')}${t.fm.check ? '; daemon handles due delivery; inspect before duplicating it (keep show ' + t.id + ')' : ''}`);
     if (overdue.length > CAP) lines.push(`…and ${overdue.length - CAP} more (keep overdue)`);
   }
   // Sweep before the snapshot below, so a need this session's env just cleared
@@ -3924,7 +4030,7 @@ commands.hook = async (argv) => {
   } catch {}
   const paragraphs = [];
   if (lines.length) {
-    paragraphs.push(`[keep — work registry]\n${lines.join('\n')}\nCheck in with \`keep checkin <id> -m "..."\` when status changes. Conventions: /keep skill.`);
+    paragraphs.push(`[keep — work registry]\n${lines.join('\n')}\nCheck in with \`keep checkin <id> -m "..."\` when status changes. Conventions: read the shared keep skill (${path.join(ROOT, 'skills/keep/SKILL.md')}). Card status is not conversation readiness; scheduling a check yields this turn unless you also pass --handoff needs-input.`);
   }
   if (nudge) paragraphs.push(nudge);
   if (paragraphs.length) console.log(paragraphs.join('\n\n'));
@@ -4000,6 +4106,16 @@ function scanStopEvidence(state, chunk) {
     if (!line.trim()) continue;
     let record;
     try { record = JSON.parse(line); } catch { continue; }
+    // Codex code-mode emits completed typed items even when tools run inside
+    // an exec cell. Count these rather than guessing from the cell's source.
+    const codexItem = record.type === 'event_msg' && record.payload?.item;
+    if (codexItem?.status === 'completed') {
+      if (codexItem.type === 'FileChange') next.edits++;
+      if (codexItem.type === 'CommandExecution') {
+        const command = Array.isArray(codexItem.command) ? codexItem.command.at(-1) : codexItem.command;
+        if (typeof command === 'string' && looksLikeGitWrite(command)) next.bashGitWrites++;
+      }
+    }
     const editedAttachment = Boolean(record && record.type === 'attachment' &&
       record.attachment && record.attachment.type === 'edited_text_file');
     if (next.awaitingAgentAttachment) {
@@ -4653,7 +4769,7 @@ function authorizedReason(task, grantCheck) {
   return `[keep] You stopped to ask about ${actions}. You do not need to ask: card ${task.id} already grants ${actions}`
     + `${task.fm.allow_until ? ` (until ${task.fm.allow_until})` : ''}. Owner granted this at planning time — proceed without waiting.`
     + ` Check any other action with \`keep allow ${task.id} <action>\` (exit 3 means ask him).`
-    + ` If you were stopping for a different reason than ${actions}, say so and file it with \`keep ask --jesse\`.`;
+    + ` If you were stopping for a different reason than ${actions}, say so and file it with \`keep ask --owner\`.`;
 }
 
 // One authorization message per (card, action set) per session: a second Stop on
@@ -4668,7 +4784,7 @@ function wasAuthorizedFor(state, task, actions) {
 // The agent ended its turn with a question the card does not answer. That is a
 // legitimate handoff — but in a session nobody is watching it is an invisible
 // stall, which is how a Codex thread sat waiting on the cAdvisor deploy with no
-// dependency recorded (2026-09-03). Push it into `keep ask --jesse`, once, and
+// dependency recorded (2026-09-03). Push it into `keep ask --owner`, once, and
 // only when Owner is demonstrably not at this keyboard.
 const STOP_PRESENT_MS = 30 * 60e3;
 
@@ -4688,7 +4804,7 @@ function stopAskedForOwner({ input, sid, task, state, stateFile, transcriptState
   // Already parked a question for Owner: it is queued, not stalled.
   try {
     const open = require('./review.js').loadQuestions()
-      .filter((q) => q && q.status === 'open' && q.to === 'jesse' && q.from && q.from.sessionId === sid);
+      .filter((q) => q && q.status === 'open' && ['owner', 'jesse'].includes(q.to) && q.from && q.from.sessionId === sid);
     if (open.length) return;
   } catch {}
 
@@ -4703,8 +4819,8 @@ function stopAskedForOwner({ input, sid, task, state, stateFile, transcriptState
     : '';
   console.log(JSON.stringify({
     decision: 'block',
-    reason: `[keep] You ended your turn with a question for Owner, but nobody has typed in this session for ${Math.round(since / 60e3)} minutes, so he will not see it here.${missing}`
-      + ` File it where he reads it: \`keep ask --jesse "<the question>" --task ${task.id}\`. It shows in keep questions, keep brief and the dashboard, and his answer is delivered back into this session.`
+    reason: `[keep] You ended your turn with a question for Owner, but nobody has typed in this session for ${Math.round(since / 60e3)} minutes, so he may not notice it here.${missing}`
+      + ` File it where he reads it: \`keep ask --owner "<the question>" --task ${task.id}\`. It shows in keep questions, keep brief and the dashboard, and his answer is delivered back into this session.`
       + ` Then do everything on ${task.id} that does not depend on the answer, and check in with what you are waiting for.`
       + ` If the card genuinely cannot move without him, \`keep needs ${task.id} "<what you need>"\` blocks it instead.`
       + ` This reminder fires at most once per session per 6h.`,
@@ -4712,7 +4828,20 @@ function stopAskedForOwner({ input, sid, task, state, stateFile, transcriptState
   return true;
 }
 
-function stopHook(input) {
+function codexStopState(input) {
+  const codex = require('./codex');
+  const meta = input.transcript_path && codex.readSessionMeta(input.transcript_path);
+  if (!meta || codex.isChildSession(meta) || input.agent_id ||
+      (meta.id || meta.session_id) !== input.session_id ||
+      !(meta.originator === 'codex-tui' || meta.source === 'cli')) return null;
+  const info = codex.scanRollout(input.transcript_path);
+  if (!info) return null;
+  return { interactive: true, lastAssistant: input.last_assistant_message || info.lastAssistant,
+    pendingDecisionTool: Boolean(info.pendingQuestion || info.toolRunning ||
+      require('./codex-lifecycle').state(ROOT, info).pendingBackground), lastHumanAt: info.lastUserAt || 0 };
+}
+
+function stopHook(input, agent = 'claude') {
   if (input.stop_hook_active) return; // never double-block
   if (process.env.KEEP_RUN) return; // keep's own headless runs check themselves in
   if (isReviewerSession()) return; // the reviewer writes no code; nagging it is noise
@@ -4777,7 +4906,8 @@ function stopHook(input) {
 
   // A pending AskUserQuestion or plan approval is a UI-level handoff: the
   // terminal is already showing Owner a dialog, and nothing here may override it.
-  const transcriptState = stopTranscriptState(transcript);
+  const transcriptState = agent === 'codex' ? codexStopState(input) : stopTranscriptState(transcript);
+  if (!transcriptState) return;
   if (input.permission_mode === 'plan' || transcriptState.pendingDecisionTool) return;
 
   const checkedIn = checkinMt > startedAt && Date.now() - checkinMt < MARKER_FRESH_MS;
@@ -4956,11 +5086,11 @@ commands['review-queue'] = (argv) => {
   if (!out.ranked.length) process.exit(3);
 };
 
-commands['review-note'] = (argv) => {
+commands['review-note'] = async (argv) => {
   const o = parseArgs(argv, { kind: 'str', subject: 'str', severity: 'str', 'suggest-status': 'str', bundle: 'str', force: 'bool', 'no-digest': 'bool' });
   const id = o._[0];
   if (!id || !o.m) die('usage: keep review-note <id> --kind <k> --subject <s> [--severity low|med|high] [--suggest-status s] [--force] -m "finding"');
-  const out = require('./review.js').reviewNote(id, {
+  const out = await require('./review.js').reviewNote(id, {
     kind: o.kind,
     subject: o.subject,
     severity: o.severity,
@@ -4970,7 +5100,8 @@ commands['review-note'] = (argv) => {
     force: o.force,
     noDigest: o['no-digest'],
   });
-  console.log(`recorded finding ${out.key} on ${id}${out.count > 1 ? ` (seen ${out.count}x)` : ''}`);
+  console.log(out.notApplied ? `finding ${out.key} on ${id} — not applied: ${out.notApplied}`
+    : `recorded finding ${out.key} on ${id}${out.count > 1 ? ` (seen ${out.count}x)` : ''}`);
 };
 
 commands['review-idea'] = (argv) => {
@@ -5005,7 +5136,7 @@ commands['review-dismiss'] = (argv) => {
   console.log(`dismissed ${key} on ${id} — it will not be raised again`);
 };
 
-commands['review-land'] = (argv) => {
+commands['review-land'] = async (argv) => {
   const o = parseArgs(argv, { file: 'str' });
   if ((o.file && o._.length) || (!o.file && (o._.length !== 1 || o._[0] !== '-'))) {
     die('usage: keep review-land --file <path> or keep review-land -');
@@ -5025,7 +5156,7 @@ commands['review-land'] = (argv) => {
     out.exitCode = 2;
     throw out;
   }
-  const out = require('./review.js').reviewLand(document);
+  const out = await require('./review.js').reviewLand(document);
   console.log('type\titem\ttarget\tresult\tdetail');
   for (const result of out.results) {
     console.log([
@@ -5154,6 +5285,15 @@ commands.nudge = async (argv) => {
 
 commands.serve = () => {
   require('./serve.js').start();
+};
+
+commands['restart-daemon'] = async (argv) => {
+  if (argv.length) die('usage: keep restart-daemon');
+  const response = await postKeepApi('/api/restart-daemon', {});
+  let result = {};
+  try { result = JSON.parse(response.data); } catch {}
+  if (response.status !== 200) die(result.error || `Daemon restart refused (${response.status})`);
+  console.log(`Daemon ${result.pid} is restarting under launchd; terminal sessions are preserved.`);
 };
 
 async function connectHost(deps = {}) {
@@ -5600,7 +5740,10 @@ function helpText() {
                    [--check "recipe"] [--status s] [--force] [-m note]
                    # --autonomous requires both --plan and --allow
   keep checkin <id> -m "state + next step" [--step <n|next>] [--status s] [--experiment-id id]
-                    [--next "text"] [--commit sha]… [--check-after when] [--clear-check-after] [--force]
+                    [--next "text"] [--commit sha]… [--check-after when] [--check "recipe"] [--clear-check-after]
+                    [--handoff waiting|needs-input] [--force]
+                    # --check-after yields this turn to its scheduled recipe; --handoff needs-input keeps a decision visible
+                    # --handoff requires a check time and recipe; --check alone edits the recipe without yielding
   keep plan <id> [--set "step" … | --add "text" | --insert <n> "text" | --remove <n>
                   | --done <n> | --start <n> | --undo <n>]
                  [--done-when "cmd"]…          # positional against --set/--add
@@ -5631,8 +5774,8 @@ function helpText() {
   keep needs [<card> "<secret or action>" [--env NAME] | <card> --met [--env NAME|"<text>"]]
                           # what only Owner can supply; no args lists open needs and clears any whose env var is set here
 ${stepUsage()}
-  keep ask "<question>" [--jesse] [--about <project>] [--task <id>] [--timeout <min>]
-                         # --jesse queues it for Owner (no timeout, no reviewer)
+  keep ask "<question>" [--owner] [--about <project>] [--task <id>] [--timeout <min>]
+                         # --owner queues it for Owner (no timeout, no reviewer)
   keep answer <qid> -m "<answer>"
   keep questions [--all]
   keep decide <type> [--card <id>] [--session <sid>] --send "<message>" -m "why"
@@ -5661,7 +5804,7 @@ ${stepUsage()}
   keep slack mode log|cards|alerts
   keep verify <id>     # run this task's check recipe now (needs keep serve)
   keep compact <sid>   # compact a live Claude or Codex session (needs keep serve)
-  keep open <card-id|session-id> [--fresh] [--agent claude|codex] [-m "opening message"]
+  keep open <card-id|session-id> [--fresh] [--agent claude|codex] [-m "opening message" | --message-file <path>]
                          # -m waits for the agent's prompt and types the message;
                          # --fresh on a card links the new session and unlinks the caller's
   keep pane ls [--json] | show <pane> [--json]
@@ -5681,6 +5824,7 @@ ${stepUsage()}
   keep sync              # pull --rebase + push
   keep digest            # write digests/YYYY-MM-DD.md and print it
   keep serve             # start the dashboard server (KEEP_PORT, default 7777)
+  keep restart-daemon    # guarded daemon-only restart (requires launchd KeepAlive)
   keep review-queue [--limit n] [--min-score n] [--json]   # what deserves review now
   keep review-bundle <id> [--budget n] [--session id] [--force]
   keep review-bundle <id> [<id>...] [--budget n] [--total-budget n] [--force]
@@ -5696,13 +5840,16 @@ ${stepUsage()}
                          # land one JSON review tick under one lock and commit
   keep review-budget [--json] [--model m]  # may the reviewer spend right now?
   keep review-tick [--force]               # wake the reviewer now (needs keep serve)
+  keep usage <card> [--json]     Forward-only model token usage
   keep review-stats [--json]               # last tick, skips, per-day counts
   keep nudge <id> --session <sid> --key <k> -m "finding" [--send]
   keep nudge live [on|off|contradictions|<kind,kind>]
                          # --send only delivers for a live kind
                          # message a live agent about a finding (dry-run without --send)
-  keep hook codex <start|question|approval|complete|end|client-end>
-                         # record or clear Codex attention (hook integration)
+  keep hook session-start|session-end|stop|notification|lifecycle|pre-bash|post-bash
+                         # Claude context, enforcement, notifications and observation-only lifecycle records
+  keep hook codex <start|stop|question|approval|complete|end|client-end|pre-tool|post-tool|lifecycle>
+                         # Codex attention, lifecycle and Stop enforcement hooks
 
   when: YYYY-MM-DD | YYYY-MM-DDTHH:MM | +15m | +3d | +12h | +2w | tomorrow
   statuses: ${STATUSES.join(' → ')}`;
@@ -5747,7 +5894,7 @@ module.exports = {
   taskForSession, deployCommand, deployEntry, recordDeploy, redactCommand,
   stepMatchForInput, guardStepCommand, recordStepRun, codexToolInput, codexExitCode,
   codexJobText, renderCodexJobs,
-  commandUsage, helpText, formatOpenResult, openCommand: commands.open,
+  commandUsage, helpText, formatOpenResult, openCommand: commands.open, postOpen, OPEN_MESSAGE_LIMIT, OPEN_MESSAGE_ERROR,
   restoreCommandCli: commands.restore, resumeCommandCli: commands.resume,
   hostCommandCli: commands.host, paneCommandCli: commands.pane, attachCommandCli: commands.attach,
   resolveHostPane, renderHostPanes, parseHostSpawn,

@@ -130,20 +130,41 @@ function recentText(file) {
   return messages.join('\n\n').slice(-6000);
 }
 
-function scanRollout(file) {
+function isChildSession(meta) {
+  return Boolean(meta && (meta.originator === 'Claude Code' || meta.parent_thread_id
+    || meta.thread_source === 'subagent' || meta.source?.subagent));
+}
+
+function isHeadlessSession(meta) {
+  return meta?.source === 'exec' || meta?.originator === 'codex_exec';
+}
+
+function scanRollout(file, { includeChild = false, includeHeadless = false } = {}) {
   const meta = readSessionMeta(file);
-  if (!meta || typeof meta.session_id !== 'string' || meta.originator === 'Claude Code') return null;
+  // Multi-agent rollouts share session_id with their parent, but id identifies
+  // the actual thread. Children must never compete with the parent by mtime.
+  if (!meta || (!includeChild && (isChildSession(meta) || (!includeHeadless && isHeadlessSession(meta))))) return null;
+  const id = typeof meta.id === 'string' && meta.id ? meta.id : meta.session_id;
+  if (typeof id !== 'string' || !id) return null;
   // A completion marker is written at the end of every finished turn. Default
   // open so a very large in-progress turn remains running even after its user
   // message has fallen outside the tail window.
-  const out = { id: meta.session_id, cwd: typeof meta.cwd === 'string' ? meta.cwd : '', lastUser: '', lastAssistant: '', endedTurn: false };
+  const out = { id, cwd: typeof meta.cwd === 'string' ? meta.cwd : '', lastUser: '', lastAssistant: '', endedTurn: false };
   const pending = new Map();
+  let nonMetadata = false;
   for (const line of readTail(file).split('\n')) {
     if (!line) continue;
     let record;
     try { record = JSON.parse(line); } catch { continue; }
+    if (record?.type !== 'session_meta') nonMetadata = true;
     const payload = record && record.payload;
     if (!payload || typeof payload !== 'object') continue;
+    if (((record.type === 'event_msg' && ['user_message', 'task_started'].includes(payload.type))
+        || (record.type === 'response_item' && payload.type === 'message' && payload.role === 'user'))
+        && Number.isFinite(Date.parse(record.timestamp))) out.turnStartedAt = Date.parse(record.timestamp);
+    if (((record.type === 'event_msg' && ['user_message', 'agent_message', 'task_started', 'task_complete', 'turn_aborted'].includes(payload.type))
+        || (record.type === 'response_item' && ['message', 'function_call', 'custom_tool_call', 'function_call_output', 'custom_tool_call_output'].includes(payload.type)))
+        && Number.isFinite(Date.parse(record.timestamp))) out.attentionAt = Date.parse(record.timestamp);
     if (record.type === 'event_msg') {
       if (payload.type === 'user_message' && typeof payload.message === 'string') {
         out.lastUser = payload.message;
@@ -152,7 +173,7 @@ function scanRollout(file) {
       }
       else if (payload.type === 'agent_message' && typeof payload.message === 'string') out.lastAssistant = payload.message;
       else if (payload.type === 'task_started') out.endedTurn = false;
-      else if (payload.type === 'task_complete') out.endedTurn = true;
+      else if (['task_complete', 'turn_aborted'].includes(payload.type)) out.endedTurn = true;
     } else if (record.type === 'response_item' && ['function_call', 'custom_tool_call'].includes(payload.type)) {
       let input = {};
       try { input = JSON.parse(payload.arguments || payload.input || '{}'); } catch {}
@@ -180,9 +201,17 @@ function scanRollout(file) {
       else if (payload.role === 'assistant' && text) out.lastAssistant = text;
     }
   }
+  // Starting the TUI can leave a metadata-only rollout without any submitted
+  // turn. Only decide this from the complete file, never a truncated tail.
+  if (!nonMetadata && fs.statSync(file).size <= TAIL_BYTES) {
+    if (!includeHeadless && !includeChild) return null;
+    out.endedTurn = true;
+  }
   out.waitingFor = [...pending.values()].find((tool) => tool.waitingFor)?.waitingFor || null;
   out.toolRunning = pending.size > 0;
   out.pendingQuestion = scanQuestion(file);
+  out.lastUserAt = questionCache.get(file)?.lastUserAt;
+  out.turnStartedAt = questionCache.get(file)?.turnStartedAt || out.turnStartedAt;
   return out;
 }
 
@@ -209,9 +238,17 @@ function scanQuestion(file) {
         try { row = JSON.parse(line); } catch { continue; }
         const p = row.payload;
         if (!p) continue;
+        if (((row.type === 'event_msg' && ['user_message', 'task_started'].includes(p.type))
+            || (row.type === 'response_item' && p.type === 'message' && p.role === 'user'))
+            && Number.isFinite(Date.parse(row.timestamp))) state.turnStartedAt = Date.parse(row.timestamp);
         if ((row.type === 'event_msg' && p.type === 'user_message')
             || (row.type === 'response_item' && p.type === 'message' && p.role === 'user')) {
           state.question = null;
+          // Track actual user events across the full file, even after a large
+          // tool result pushes the request out of the rollout tail.
+          const text = p.message || textOf(p.content);
+          if (text && !/^\s*(?:\[keep\]|<(?:environment_context|user_instructions|system-reminder|task-notification|cross-session-message)\b|# AGENTS\.md)/i.test(text)
+              && Number.isFinite(Date.parse(row.timestamp))) state.lastUserAt = Date.parse(row.timestamp);
         } else if (row.type === 'response_item' && ['function_call', 'custom_tool_call'].includes(p.type)
             && /request_user_input(?:_async)?$/.test(p.name || '')) {
           let input;
@@ -234,20 +271,25 @@ function scanQuestion(file) {
 
 function sessionFromRollout(info, stat, title, now) {
   const ageMs = now - stat.mtimeMs;
+  const lifecycle = require('./codex-lifecycle').state(process.env.KEEP_DIR || path.join(os.homedir(), 'keep'), info, now);
   return {
     id: info.id,
     kind: 'codex',
     project: info.cwd,
     title,
     lastUser: info.lastUser.slice(0, 300),
+    lastUserAt: info.lastUserAt,
+    turnStartedAt: info.turnStartedAt,
     lastAssistant: info.lastAssistant.slice(0, 300),
     lastAssistantFull: info.lastAssistant.slice(0, 12000),
     mtime: stat.mtimeMs,
+    attentionAt: info.attentionAt,
     size: stat.size,
     endedTurn: info.endedTurn,
     pendingQuestion: info.pendingQuestion,
     waitingFor: info.waitingFor,
     toolRunning: info.toolRunning,
+    ...lifecycle,
     askedProse: sessionStatus.proseRequest(info.lastAssistant),
     state: info.endedTurn ? (ageMs < 3600e3 ? 'idle' : 'recent') : 'running',
   };
@@ -353,11 +395,13 @@ function sessionFor(sessionId) {
   if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
     info = cached.info;
   } else {
-    info = scanRollout(file);
+    // An explicitly hosted/resumed exec-origin conversation is now interactive.
+    // Only fleet discovery excludes headless jobs; exact lookup keeps its history.
+    info = scanRollout(file, { includeHeadless: true });
     cacheSessionLookup(sessionParseCache, file, { mtimeMs: stat.mtimeMs, size: stat.size, info });
   }
   if (!info) return null;
   return sessionFromRollout(info, stat, loadTitles().get(info.id) || '', Date.now());
 }
 
-module.exports = { scan, scanRollout, sessionFor, rolloutFileFor, findRolloutFile, readTail, recentText, readSessionMeta, sessionMetaFor };
+module.exports = { scan, scanRollout, sessionFor, rolloutFileFor, findRolloutFile, readTail, recentText, readSessionMeta, sessionMetaFor, isChildSession };

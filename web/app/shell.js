@@ -92,3 +92,8 @@ if (isDesktop()) {
     .then((granted) => { if (granted) desktopPermission = 'granted'; })
     .catch(() => {});
 }
+
+export async function playAttentionSound() {
+  if (!isDesktop()) return;
+  try { await window.__TAURI__.core.invoke('play_attention_sound'); } catch {}
+}

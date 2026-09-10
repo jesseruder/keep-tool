@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main",
-  "description": "Keep console window: the loopback web app may set the dock badge, send notifications, and use events; nothing else",
+  "description": "Keep console window: the loopback web app may set the dock badge, send notifications, use events, and check whether the clipboard contains an image",
   "windows": [
     "main"
   ],
@@ -16,6 +16,8 @@
     "core:window:allow-set-badge-count",
     "notification:default",
     "allow-set-badge",
+    "allow-clipboard-has-image",
+    "allow-play-attention-sound",
     "allow-send-notification",
     "allow-get-notification-click",
     "allow-acknowledge-notification-click",

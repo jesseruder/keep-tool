@@ -35,12 +35,29 @@ test('deferred terminal focus cannot target an old render or override a newer us
   const origin = {}, body = {};
   const mounted = { element: { isConnected: true, getClientRects: () => [1] }, focus: () => focuses++ };
   const ctx = vm.createContext({ focusFrame: 0, terminalRender: 1, visibleTerminals: [mounted], document: { activeElement: origin, body },
+    captureFocusIntent() { const origin = ctx.document.activeElement; return () => ctx.document.activeElement === origin || ctx.document.activeElement === body; },
     cancelAnimationFrame() {}, requestAnimationFrame(fn) { callback = fn; return 1; } });
   vm.runInContext(fn, ctx);
   ctx.scheduleFocus(mounted); callback(); assert.equal(focuses, 1);
   ctx.scheduleFocus(mounted); mounted.element.parentElement = {}; callback(); assert.equal(focuses, 1);
   ctx.scheduleFocus(mounted); ctx.document.activeElement = {}; callback(); assert.equal(focuses, 1);
   ctx.scheduleFocus(mounted); ctx.visibleTerminals = []; callback(); assert.equal(focuses, 1);
+});
+
+test('focus intent expires on newer input even when the new target leaves focus on body', async () => {
+  const { captureFocusIntent } = await import('../web/app/focus-intent.js');
+  const events = new Map(), windowEvents = new Map();
+  const doc = { body: {}, activeElement: {}, visibilityState: 'visible',
+    addEventListener: (name, fn) => events.set(name, fn), defaultView: { addEventListener: (name, fn) => windowEvents.set(name, fn) } };
+  let wanted = captureFocusIntent(doc);
+  doc.activeElement = doc.body;
+  assert.equal(wanted(), true, 'DOM reparenting alone may restore focus');
+  for (const event of ['pointerdown', 'keydown']) {
+    wanted = captureFocusIntent(doc); events.get(event)();
+    assert.equal(wanted(), false, event);
+  }
+  wanted = captureFocusIntent(doc); windowEvents.get('blur')(); assert.equal(wanted(), false);
+  wanted = captureFocusIntent(doc); doc.visibilityState = 'hidden'; assert.equal(wanted(), false);
 });
 
 test('UI diagnostics bound storage, strip unknown text fields, and expire after an hour', () => {

@@ -45,6 +45,9 @@ test('parseDependency and help expose step-qualified wait-on syntax', () => {
     });
     assert.equal(help.status, 0, help.stderr);
     assert.match(help.stdout, /keep wait-on <card> <upstream>\[#<step>\]/);
+    assert.match(help.stdout, /--handoff waiting\|needs-input/);
+    assert.match(help.stdout, /--check "recipe"/);
+    assert.match(help.stdout, /keep hook session-start\|session-end\|stop\|notification\|lifecycle/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -306,6 +309,29 @@ test('releaseCardSession and linkLaunchedSession hand a card to the launched ses
     assert.equal(JSON.parse(call('linkLaunchedSession', ['missing-card', { id: 'new-sid' }]).stdout.trim()), null);
     assert.equal(JSON.parse(call('linkLaunchedSession', ['other-card', { id: 'bad id' }]).stdout.trim()), null);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('Codex async question hook records title and string options immediately', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-question-'));
+  try {
+    const result = spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'hook', 'codex', 'question'], {
+      input: JSON.stringify({ session_id: 'async-thread', tool_input: { questions: [{ title: 'Which path?', options: ['A', 'B'] }] } }),
+      encoding: 'utf8', env: { ...process.env, KEEP_DIR: root },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {});
+    const marker = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'attention', 'async-thread.json'), 'utf8'));
+    assert.equal(marker.message, 'Which path?');
+    assert.deepEqual(marker.options, ['A', 'B']);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('Codex completed typed changes and git commands supply Stop evidence', () => {
+  const row = (item) => JSON.stringify({ type: 'event_msg', payload: { item } }) + '\n';
+  const changes = row({ type: 'FileChange', status: 'completed' });
+  assert.equal(hasSubstantiveStopEvidence(scanStopEvidence(emptyStopEvidence(), changes.repeat(5))), true);
+  assert.equal(hasSubstantiveStopEvidence(scanStopEvidence(emptyStopEvidence(), row({ type: 'FileChange', status: 'in_progress' }).repeat(5))), false);
+  assert.equal(hasSubstantiveStopEvidence(scanStopEvidence(emptyStopEvidence(), row({ type: 'CommandExecution', status: 'completed', command: ['/bin/zsh', '-lc', 'git commit -m test'] }))), true);
 });
 
 test('Codex complete persists until SessionEnd acknowledges it', () => {
@@ -698,9 +724,28 @@ test('scheduling a check records the scheduling session and survives a round-tri
     const { parseTask, serializeTask } = require('./keep.js');
     const parsed = parseTask(text, 'sched-one');
     assert.equal(parsed.fm.scheduled_by, 'sched-sid');
+    assert.ok(Number.isFinite(Date.parse(parsed.fm.scheduled_at)));
+    assert.equal(parsed.fm.scheduled_for, parsed.fm.check_after);
+    assert.equal(parsed.fm.scheduled_intent, 'waiting');
     assert.equal(serializeTask(parsed), text);
     assert.doesNotMatch(text, /^scheduled_by: sched-sid\n[\s\S]*^scheduled_by:/m);
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('both agents can explicitly hand off for input without a recipe edit implying a wait', () => {
+  for (const agent of ['claude', 'codex']) {
+    const f = schedulerFixture();
+    const env = agent === 'claude' ? { CLAUDE_CODE_SESSION_ID: 's' } : { CODEX_THREAD_ID: 's' };
+    try {
+      assert.equal(f.run(['add', 'Scheduled', '--check-after', '+1h', '--check', 'probe'], env).status, 0);
+      assert.equal(f.run(['checkin', 'scheduled', '-m', 'Proposed change', '--handoff', 'needs-input'], env).status, 0);
+      assert.match(f.read('scheduled'), /^scheduled_intent: needs-input$/m);
+      assert.equal(f.run(['checkin', 'scheduled', '-m', 'Edit recipe', '--check', 'new probe'], env).status, 0);
+      assert.doesNotMatch(f.read('scheduled'), /^scheduled_intent:/m);
+      assert.equal(f.run(['checkin', 'scheduled', '-m', 'Next poll', '--check-after', '+2h'], env).status, 0);
+      assert.match(f.read('scheduled'), /^scheduled_intent: waiting$/m);
+    } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+  }
 });
 
 test('a later check-in elsewhere moves the resume link but not the scheduler stamp', () => {
@@ -726,6 +771,7 @@ test('--clear-check-after drops the scheduler stamp with the schedule', () => {
     const cleared = f.run(['checkin', 'sched-one', '-m', 'Check ran; nothing to reschedule.', '--clear-check-after'], env);
     assert.equal(cleared.status, 0, cleared.stderr);
     assert.doesNotMatch(f.read('sched-one'), /^scheduled_by:/m);
+    assert.doesNotMatch(f.read('sched-one'), /^scheduled_(?:at|for|intent):/m);
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
@@ -1186,4 +1232,81 @@ test('keep add canonicalizes --project so a bare name never lands on the card', 
   } finally {
     fs.rmSync(f.root, { recursive: true, force: true });
   }
+});
+
+test('open client refuses an oversized typed payload before contacting the daemon', async () => {
+  const { postOpen } = require('./keep.js');
+  await assert.rejects(postOpen({ taskId: 'card', message: 'x'.repeat(2001) }, async () => {
+    assert.fail('oversized typed payload must not launch anything');
+  }), (error) => error.status === 400 && error.message === 'agent messages are limited to 2000 characters');
+});
+
+test('open preserves handoffs verbatim in a committed file and sends only a pointer', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-handoff-'));
+  const script = `
+    const assert = require('node:assert/strict');
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const { execFileSync } = require('node:child_process');
+    const keep = require(${JSON.stringify(path.join(__dirname, 'keep.js'))});
+    const git = (...args) => execFileSync('git', args, { cwd: keep.ROOT, encoding: 'utf8' });
+    fs.writeFileSync(path.join(keep.ROOT, 'tasks/card.md'), keep.serializeTask({ id: 'card', fm: {
+      title: 'Handoff', status: 'active', project: keep.ROOT, sessions: [{ id: 'owner', agent: 'claude' }],
+    }, body: '' }));
+    fs.writeFileSync(path.join(keep.ROOT, 'unrelated.txt'), 'Do not commit me');
+    git('add', 'unrelated.txt');
+    let expected;
+    let calls = 0;
+    const files = [];
+    const deps = { currentSession: () => null, postKeepApi: async (url, payload) => {
+      calls++;
+      assert.equal(url, '/api/open');
+      assert.ok(payload.message.length <= 2000);
+      assert.ok(!payload.message.includes('\\n'));
+      const match = payload.message.match(/^Your instructions are in (.+); read that file first\\.$/);
+      assert.ok(match, payload.message);
+      const file = match[1];
+      files.push(file);
+      assert.equal(fs.readFileSync(file, 'utf8'), expected);
+      const relative = path.relative(keep.ROOT, file);
+      assert.equal(git('show', 'HEAD:' + relative), expected, 'instructions committed before launch');
+      const committedCard = git('show', 'HEAD:tasks/card.md');
+      assert.ok(committedCard.includes('— open requested'));
+      assert.ok(committedCard.includes(file), committedCard);
+      const paths = git('show', '--pretty=', '--name-only', 'HEAD').trim().split('\\n').sort();
+      assert.deepEqual(paths, [relative, 'tasks/card.md'].sort(), 'only this file and card enter the commit');
+      return { status: 200, data: JSON.stringify({ ok: true, created: 'pane', pane: 'fake', command: 'codex', sent: true }) };
+    } };
+    (async () => {
+      expected = '# Full handoff\\r\\n\\r\\n' + 'x'.repeat(4600) + '\\nLast instruction.\\n';
+      await keep.openCommand(['card', '--fresh', '-m', expected], deps);
+      expected = 'x'.repeat(2001);
+      await keep.openCommand(['card', '--fresh', '-m', expected], deps);
+      expected = 'Short single-line file with trailing spaces.  ';
+      const source = path.join(keep.ROOT, 'source.md');
+      fs.writeFileSync(source, expected);
+      await keep.openCommand(['card', '--message-file', source], deps);
+      expected = 'First line\\nSecond line\\n';
+      await keep.openCommand(['owner', '-m', expected], deps);
+      assert.equal(new Set(files).size, 4, 'each handoff is immutable and unique');
+      assert.equal(calls, 4);
+      assert.equal(git('diff', '--cached', '--name-only').trim(), 'unrelated.txt');
+      for (const args of [['card', '--message-file', 'missing'], ['card', '-m', 'x', '--message-file', source]]) {
+        await assert.rejects(keep.openCommand(args, deps));
+      }
+      assert.equal(calls, 4, 'invalid input never contacts the daemon');
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `;
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'));
+    fs.writeFileSync(path.join(root, '.gitignore'), '.keep/\n');
+    spawnSync('git', ['init', '-q', root]);
+    spawnSync('git', ['-C', root, 'config', 'user.name', 'Keep Test']);
+    spawnSync('git', ['-C', root, 'config', 'user.email', 'keep@example.test']);
+    const out = spawnSync(process.execPath, ['-e', script], {
+      cwd: root, encoding: 'utf8', timeout: 15000,
+      env: { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1' },
+    });
+    assert.equal(out.status, 0, out.stderr);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

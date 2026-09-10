@@ -20,3 +20,12 @@ desktop/node_modules/
 desktop/src-tauri/target/
 desktop/src-tauri/gen/
 *.tgz
+
+app/.expo/
+app/node_modules/
+app/android/
+app/ios/
+app/dist/
+*.jks
+*.keystore
+*.mobileprovision

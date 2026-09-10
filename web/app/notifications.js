@@ -7,6 +7,13 @@ export function installNotifications({ reload, toast, openSession, openReviewer 
   const button = document.querySelector('#notificationsButton');
   const panel = document.querySelector('#notificationsPanel');
   const list = panel.querySelector('.notification-list');
+  const preview = document.createElement('button');
+  preview.className = 'notification-preview';
+  preview.hidden = true;
+  preview.setAttribute('aria-haspopup', 'dialog');
+  preview.setAttribute('aria-controls', 'notificationsPanel');
+  button.closest('.bar').after(preview);
+  preview.addEventListener('click', () => open(preview.dataset.id));
   let data = {}, selected = null, filter = 'all', signature = '', afterClose = null;
   const attempted = new Set();
   const entries = () => data.notifications || [];
@@ -23,6 +30,13 @@ export function installNotifications({ reload, toast, openSession, openReviewer 
   function render() {
     button.querySelector('.notification-count').textContent = unread() || '';
     button.setAttribute('aria-label', `Notifications${unread() ? `, ${unread()} unread` : ''}`);
+    button.classList.toggle('has-unread', unread() > 0);
+    const latest = entries().find((entry) => !entry.read && entry.level !== 'brief');
+    preview.hidden = !latest || panel.open;
+    if (latest) {
+      preview.dataset.id = latest.id;
+      preview.innerHTML = `<b>${esc(latest.from === 'manual' ? 'Keep' : latest.from || 'Keep')} · ${unread()} unread</b><span>${esc(latest.text)}</span><strong>Read notification →</strong>`;
+    }
     if (!panel.open) return;
     panel.querySelector('[data-mark-all]').disabled = !unread();
     panel.querySelector('[data-filter="all"]').setAttribute('aria-pressed', filter === 'all');
@@ -80,6 +94,7 @@ export function installNotifications({ reload, toast, openSession, openReviewer 
   button.addEventListener('click', () => open());
   panel.addEventListener('close', () => {
     button.setAttribute('aria-expanded', 'false');
+    render();
     const navigate = afterClose;
     afterClose = null;
     if (navigate) navigate();

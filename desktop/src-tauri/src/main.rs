@@ -12,6 +12,8 @@ static NOTIFICATION_CLICK: std::sync::Mutex<Option<String>> = std::sync::Mutex::
 #[cfg(target_os = "macos")]
 extern "C" {
     fn keep_init_notifications() -> bool;
+    fn keep_play_attention_sound();
+    fn keep_clipboard_has_image() -> bool;
     fn keep_send_notification(
         title: *const std::ffi::c_char,
         body: *const std::ffi::c_char,
@@ -76,6 +78,20 @@ fn send_notification(title: String, body: String, key: String) -> Result<(), Str
 }
 
 #[tauri::command]
+fn clipboard_has_image() -> bool {
+    #[cfg(target_os = "macos")]
+    unsafe { return keep_clipboard_has_image(); }
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
+#[tauri::command]
+fn play_attention_sound() {
+    #[cfg(target_os = "macos")]
+    unsafe { keep_play_attention_sound(); }
+}
+
+#[tauri::command]
 fn set_badge(window: tauri::Window, count: Option<i64>) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -116,6 +132,8 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             set_badge,
+            clipboard_has_image,
+            play_attention_sound,
             send_notification,
             get_notification_click,
             acknowledge_notification_click

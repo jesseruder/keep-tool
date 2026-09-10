@@ -12,6 +12,8 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const { spawnSync } = require('node:child_process');
+// State-shape fixtures must never call real models, even through async summaries.
+const STATE_FIXTURE_SETUP = "require('./bin/summarize').getSummary = () => ({ text: null }); require('./bin/titles').applyLiveTitles = () => {};";
 const codex = require('./codex.js');
 const {
   scanTranscript,
@@ -60,6 +62,8 @@ const {
   updateSetAside,
   classifyPromptLine,
   probeSuggestion,
+  sendPrecheck,
+  SUGGESTION_PROBE_MAX_READS,
   isHostTarget,
   hostClient,
   hostRequest,
@@ -130,13 +134,19 @@ function compactRestoreDeps(dir, session, calls = [], settingsFile) {
 
 test('classifyPromptLine distinguishes empty, suggestion, and draft prompts', () => {
   assert.equal(classifyPromptLine('header\n❯ ', 'header\n❯ '), 'empty');
-  assert.equal(classifyPromptLine('header\n❯ suggested next prompt', 'header\n❯  '), 'suggestion');
-  assert.equal(classifyPromptLine('header\n❯ my draft', 'header\n❯ my draft '), 'draft');
+  assert.equal(classifyPromptLine('header\n❯ suggested next prompt', 'header\n❯ ,'), 'suggestion');
+  assert.equal(classifyPromptLine('header\n❯ my draft', 'header\n❯ my draft,'), 'draft');
+  assert.equal(classifyPromptLine('header\n❯ my draft', 'header\n❯ my, draft'), 'draft');
+  assert.equal(classifyPromptLine('header\n❯ suggested next prompt', 'header\n❯ suggested next prompt'), 'unchanged');
+  assert.equal(classifyPromptLine('header\n❯ suggested', 'header\nno prompt here'), 'unchanged');
+  // A draft that is literally the probe key must not pass as a collapsed suggestion.
+  assert.equal(classifyPromptLine('header\n❯ ,', 'header\n❯ ,'), 'unchanged');
+  assert.equal(classifyPromptLine('header\n❯ ,', 'header\n❯ ,,'), 'draft');
 });
 
 test('classifyPromptLine uses the last prompt in the bottom ten lines', () => {
   const before = ['assistant quoted this:', '❯ old quoted prompt', 'answer', '❯ actual suggestion'].join('\n');
-  const after = ['assistant quoted this:', '❯ old quoted prompt', 'answer', '❯  '].join('\n');
+  const after = ['assistant quoted this:', '❯ old quoted prompt', 'answer', '❯ ,'].join('\n');
   assert.equal(classifyPromptLine(before, after), 'suggestion');
 });
 
@@ -160,17 +170,257 @@ test('probeSuggestion distinguishes generated suggestions from drafts through ho
     if (type === 'input') inputs.push(Buffer.from(params.data, 'base64').toString('utf8'));
     return {};
   });
+  const logged = [];
+  const stderr = (message) => { logged.push(message); };
   const target = { pane: 'pane-probe' };
   await probeSuggestion(target, 'header\n❯ suggested next prompt', {
-    host, wait: async () => {}, readScreen: async () => 'header\n❯ ',
+    host, wait: async () => {}, readScreen: async () => 'header\n❯ ,', stderr,
   });
-  assert.deepEqual(inputs, [' ', '\x7f']);
+  assert.deepEqual(inputs, [',', '\x7f']);
+  assert.deepEqual(logged, []);
 
   inputs.length = 0;
   await assert.rejects(probeSuggestion(target, 'header\n❯ real draft', {
-    host, wait: async () => {}, readScreen: async () => 'header\n❯ real draft ',
+    host, wait: async () => {}, readScreen: async () => 'header\n❯ real draft,', stderr,
   }), /contains a draft/);
-  assert.deepEqual(inputs, [' ', '\x7f']);
+  assert.deepEqual(inputs, [',', '\x7f']);
+  assert.equal(logged.length, 1);
+  assert.match(logged[0], /draft refusal on pane pane-probe/);
+  assert.match(logged[0], /"❯ real draft,"/);
+});
+
+// A real screen capture: host pane 8460a8a0, Claude Code 2.1.267, an AI prompt
+// suggestion on the input line. The rendered `❯` is followed by U+00A0, not a space.
+const REVIEWER_SUGGESTION_LINES = [
+  '',
+  "※ recap: Fleet reviewer session, watching other agents' cards each tick. Tick 36 just landed two low findings and three acks, and a fresh session 30f8c34e is",
+  '  working the autocomplete draft-guard bug. Next action: wait for the next review tick. (disable recaps in /config)',
+  '',
+  '────────',
+  '❯\u00a0who keeps restarting the daemon?',
+  '────────',
+  '  keep  (main)  ctx:13%  5h:9%  7d:42%  Fable 5.1  effort:high      ✔ Update installed · Restart to update',
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent      /rc',
+];
+const REVIEWER_SUGGESTION_BEFORE = REVIEWER_SUGGESTION_LINES.join('\n');
+// While a key is being typed the suggestion collapses to the probe character, and the
+// status line drops its `← 1 agent` segment — both are what the live screen did.
+const REVIEWER_SUGGESTION_AFTER = REVIEWER_SUGGESTION_LINES
+  .map((line, index) => {
+    if (index === 5) return '❯\u00a0,';
+    if (index === 8) return '  ⏵⏵ bypass permissions on (shift+tab to cycle)      /rc';
+    return line;
+  })
+  .join('\n');
+
+// The same screen with an arbitrary input box rendered on the prompt line.
+function suggestionScreenWithBox(box) {
+  return REVIEWER_SUGGESTION_AFTER.split('\n')
+    .map((line, index) => (index === 5 ? `❯\u00a0${box}` : line)).join('\n');
+}
+
+function probeInputRecorder() {
+  const inputs = [];
+  const host = recordingHost((type, params) => {
+    if (type === 'input') inputs.push(Buffer.from(params.data, 'base64').toString('utf8'));
+    return {};
+  });
+  return { inputs, host };
+}
+
+test('probeSuggestion accepts a real Claude Code prompt suggestion captured from the reviewer pane', async () => {
+  const { inputs, host } = probeInputRecorder();
+  const logged = [];
+  assert.throws(() => sendPrecheck(REVIEWER_SUGGESTION_BEFORE), /already contains text/);
+  await probeSuggestion({ pane: 'pane-8460a8a0' }, REVIEWER_SUGGESTION_BEFORE, {
+    host,
+    wait: async () => {},
+    readScreen: async () => REVIEWER_SUGGESTION_AFTER,
+    stderr: (message) => { logged.push(message); },
+  });
+  assert.deepEqual(inputs, [',', '\x7f']);
+  assert.deepEqual(logged, []);
+});
+
+test('probeSuggestion keeps polling while Claude Code has not re-rendered the probe', async () => {
+  const { inputs, host } = probeInputRecorder();
+  let reads = 0;
+  await probeSuggestion({ pane: 'pane-8460a8a0' }, REVIEWER_SUGGESTION_BEFORE, {
+    host,
+    wait: async () => {},
+    readScreen: async () => {
+      reads += 1;
+      return reads < 3 ? REVIEWER_SUGGESTION_BEFORE : REVIEWER_SUGGESTION_AFTER;
+    },
+  });
+  assert.equal(reads, 3);
+  assert.deepEqual(inputs, [',', '\x7f']);
+});
+
+test('probeSuggestion refuses and logs the screen tail when the prompt never reacts to the probe', async () => {
+  const { inputs, host } = probeInputRecorder();
+  const logged = [];
+  let clock = 1_000_000;
+  const error = await probeSuggestion({ pane: 'pane-8460a8a0' }, REVIEWER_SUGGESTION_BEFORE, {
+    host,
+    wait: async () => {},
+    now: () => { clock += 600; return clock; },
+    readScreen: async () => REVIEWER_SUGGESTION_BEFORE,
+    stderr: (message) => { logged.push(message); },
+  }).then(() => null, (e) => e);
+  assert.ok(error, 'an unreactive prompt must be refused');
+  assert.match(error.message, /did not react to a probe keystroke/);
+  assert.equal(error.status, 409);
+  assert.equal(error.extra.probe.outcome, 'unchanged');
+  assert.match(error.extra.screenTail, /who keeps restarting the daemon\?/);
+  assert.equal(logged.length, 1);
+  assert.match(logged[0], /draft refusal on pane/);
+  assert.match(logged[0], /prompt before:/);
+  assert.match(logged[0], /who keeps restarting the daemon\?/);
+  assert.match(logged[0], /screen tail:/);
+  assert.deepEqual(inputs, [',', '\x7f']);
+});
+
+test('probeSuggestion refuses a draft that is exactly the probe key', async () => {
+  const { inputs, host } = probeInputRecorder();
+  let reads = 0;
+  await assert.rejects(probeSuggestion({ pane: 'pane-comma' }, 'header\n❯ ,', {
+    host,
+    wait: async () => {},
+    readScreen: async () => {
+      reads += 1;
+      return reads === 1 ? 'header\n❯ ,' : 'header\n❯ ,,';
+    },
+    stderr: () => {},
+  }), /contains a draft/);
+  assert.deepEqual(inputs, [',', '\x7f']);
+});
+
+test('probeSuggestion stops polling after a bounded number of reads on a frozen clock', async () => {
+  const { inputs, host } = probeInputRecorder();
+  let reads = 0;
+  await assert.rejects(probeSuggestion({ pane: 'pane-8460a8a0' }, REVIEWER_SUGGESTION_BEFORE, {
+    host,
+    wait: async () => {},
+    now: () => 1_000_000,
+    readScreen: async () => { reads += 1; return REVIEWER_SUGGESTION_BEFORE; },
+    stderr: () => {},
+  }), /did not react/);
+  assert.equal(reads, SUGGESTION_PROBE_MAX_READS);
+  assert.deepEqual(inputs, [',', '\x7f']);
+});
+
+test('probeSuggestion logs when the screen cannot be re-read after the probe', async () => {
+  const { inputs, host } = probeInputRecorder();
+  const logged = [];
+  await assert.rejects(probeSuggestion({ pane: 'pane-blind' }, REVIEWER_SUGGESTION_BEFORE, {
+    host,
+    wait: async () => {},
+    readScreen: async () => { throw new Error('pane went away'); },
+    stderr: (message) => { logged.push(message); },
+  }), /already contains text/);
+  assert.equal(logged.length, 1);
+  assert.match(logged[0], /could not be re-read/);
+  assert.deepEqual(inputs, [',', '\x7f']);
+});
+
+function stuckBackspaceHost(inputs) {
+  return recordingHost((type, params) => {
+    if (type !== 'input') return {};
+    inputs.push(Buffer.from(params.data, 'base64').toString('utf8'));
+    if (inputs.length === 2) throw new Error('pane input failed');
+    return {};
+  });
+}
+
+test('probeSuggestion refuses when the probe keystroke cannot be undone', async () => {
+  const inputs = [];
+  const logged = [];
+  const error = await probeSuggestion({ pane: 'pane-stuck' }, 'header\n❯ suggested next prompt', {
+    host: stuckBackspaceHost(inputs),
+    wait: async () => {},
+    readScreen: async () => 'header\n❯ ,',
+    stderr: (message) => { logged.push(message); },
+  }).then(() => null, (e) => e);
+  assert.ok(error, 'a stuck probe keystroke must be reported');
+  assert.match(error.message, /could not be undone/);
+  assert.equal(error.status, 409);
+  assert.deepEqual(inputs, [',', '\x7f']);
+  assert.equal(logged.length, 1);
+  assert.match(logged[0], /could not be undone/);
+});
+
+test('probeSuggestion keeps the draft refusal but records a failed cleanup', async () => {
+  const inputs = [];
+  const logged = [];
+  const error = await probeSuggestion({ pane: 'pane-stuck-draft' }, 'header\n❯ real draft', {
+    host: stuckBackspaceHost(inputs),
+    wait: async () => {},
+    readScreen: async () => 'header\n❯ real draft,',
+    stderr: (message) => { logged.push(message); },
+  }).then(() => null, (e) => e);
+  assert.ok(error, 'the draft refusal must still win');
+  assert.match(error.message, /contains a draft/);
+  assert.equal(error.extra.cleanupError, 'pane input failed');
+  assert.deepEqual(inputs, [',', '\x7f']);
+  assert.equal(logged.length, 2);
+  assert.match(logged[1], /draft refusal cleanup failed on pane pane-stuck-draft/);
+});
+
+test('probeSuggestion undoes a probe whose write failed after landing', async () => {
+  const inputs = [];
+  let box = '';
+  const host = recordingHost((type, params) => {
+    if (type !== 'input') return {};
+    const data = Buffer.from(params.data, 'base64').toString('utf8');
+    inputs.push(data);
+    // The keystroke reached the pane; only the acknowledgement was lost.
+    box = data === '\x7f' ? box.slice(0, -1) : box + data;
+    if (inputs.length === 1) throw new Error('pane input acknowledgement lost');
+    return {};
+  });
+  await assert.rejects(probeSuggestion({ pane: 'pane-lost-ack' }, REVIEWER_SUGGESTION_BEFORE, {
+    host,
+    wait: async () => {},
+    readScreen: async () => (box ? suggestionScreenWithBox(box) : REVIEWER_SUGGESTION_BEFORE),
+    stderr: () => {},
+  }), /acknowledgement lost/);
+  assert.deepEqual(inputs, [',', '\x7f']);
+  assert.equal(box, '', 'the landed probe has to be backed out');
+});
+
+test('probeSuggestion leaves the box alone when a failed write did not land', async () => {
+  const inputs = [];
+  const host = recordingHost((type, params) => {
+    if (type !== 'input') return {};
+    inputs.push(Buffer.from(params.data, 'base64').toString('utf8'));
+    throw new Error('pane input rejected');
+  });
+  // The box changed while we were writing, but not by the probe key: someone deleted a
+  // character. Backspacing here would eat another one.
+  await assert.rejects(probeSuggestion({ pane: 'pane-no-land' }, 'header\n❯ abc', {
+    host, wait: async () => {}, readScreen: async () => 'header\n❯ ab', stderr: () => {},
+  }), /pane input rejected/);
+  assert.deepEqual(inputs, [',']);
+});
+
+test('probeSuggestion logs the screen tail when probing is disabled', async () => {
+  const { inputs, host } = probeInputRecorder();
+  const logged = [];
+  process.env.KEEP_PROBE_SUGGESTION = '0';
+  try {
+    await assert.rejects(probeSuggestion({ pane: 'pane-off' }, 'header\n❯ my draft', {
+      host, wait: async () => {}, readScreen: async () => 'header\n❯ my draft,',
+      stderr: (message) => { logged.push(message); },
+    }), /already contains text/);
+  } finally {
+    delete process.env.KEEP_PROBE_SUGGESTION;
+  }
+  assert.deepEqual(inputs, []);
+  assert.equal(logged.length, 1);
+  assert.match(logged[0], /draft refusal on pane/);
+  assert.match(logged[0], /"❯ my draft"/);
+  assert.equal(/prompt after probe/.test(logged[0]), false);
 });
 
 test('health acknowledgements follow scheduler and error text, not failure time', () => {
@@ -461,6 +711,30 @@ test('bounded background watchdog suppresses input attention until it completes'
   }
 });
 
+test('bounded wait helper scripts keep a stopped foreground turn out of input attention', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-wait-helper-'));
+  const file = path.join(dir, 'session.jsonl');
+  try {
+    for (const [command, timeout, expected] of [
+      ['bash .claude/skills/android-release/scripts/wait_for_job.sh workflow build_beta_android', 600000, true],
+      ['bash scripts/wait_for_job.sh workflow', undefined, false],
+      ['bash scripts/dev_server.sh', 600000, false],
+      ['bash scripts/wait_for_job.sh workflow; npm run dev', 600000, false],
+    ]) {
+      fs.writeFileSync(file, [
+        record('assistant', [{ type: 'tool_use', id: 'wait', name: 'Bash', input: { command, timeout, run_in_background: true } }]),
+        record('user', [{ type: 'tool_result', tool_use_id: 'wait', content: 'Command running in background with ID: build-1.' }]),
+        record('assistant', [{ type: 'text', text: 'Polling in the background; I will continue when the build finishes.' }]),
+      ].join('\n') + '\n');
+      const info = scanTranscript(file);
+      assert.equal(info.pendingBackground, expected, command);
+      if (expected) assert.equal(sessionNeedsInput({ ...info, pane: 'live', alive: true }, 0), false);
+      fs.appendFileSync(file, record('user', '<task-notification><task-id>build-1</task-id><status>completed</status></task-notification>') + '\n');
+      assert.equal(scanTranscript(file).pendingBackground, false);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('bounded background watchers require a finite tail after the polling loop', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-serve-test-'));
   const file = path.join(dir, 'session.jsonl');
@@ -581,6 +855,47 @@ test('live ledger sightings and host panes keep Claude sessions alive; Codex sta
     updatedAt: now, sessions: { ledger: { lastSeenAlive: now }, codex: { lastSeenAlive: now } },
   }, [{ alive: true, meta: { sessionId: 'pane' } }, { alive: true, meta: { sessionId: 'codex' } }], now);
   assert.deepEqual(sessions.map((s) => [s.state, s.alive]), [['running', true], ['running', true], ['running', null]]);
+});
+
+test('successful SendMessage resumes restore background work after completion', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-agent-resume-'));
+  const file = path.join(dir, 'session.jsonl');
+  const notification = JSON.stringify({ type: 'queue-operation', content: '<task-notification><task-id>child-1</task-id><status>completed</status></task-notification>' });
+  try {
+    const records = [notification,
+      record('assistant', [{ type: 'tool_use', id: 'resume', name: 'SendMessage', input: { to: 'child-1', message: 'Follow up' } }]),
+      JSON.stringify({ type: 'user', timestamp: '2026-09-09T22:00:00Z', message: { content: [{ type: 'tool_result', tool_use_id: 'resume', content: JSON.stringify({ success: true, resumedAgentId: 'child-1' }) }] } }),
+      record('assistant', [{ type: 'text', text: 'Waiting for the subagent.' }]),
+    ];
+    fs.writeFileSync(file, records.join('\n') + '\n');
+    assert.deepEqual(scanTranscript(file).backgroundAgents, ['child-1']);
+    fs.appendFileSync(file, JSON.stringify({ type: 'attachment', timestamp: '2026-09-09T22:00:01Z', attachment: { type: 'queued_command', prompt: JSON.parse(notification).content } }) + '\n');
+    assert.deepEqual(scanTranscript(file).backgroundAgents, ['child-1'], 'delivery of an old queued completion must not finish a resumed child');
+    const childDir = path.join(dir, 'session', 'subagents');
+    fs.mkdirSync(childDir, { recursive: true });
+    const end = (timestamp) => JSON.stringify({ type: 'assistant', timestamp, message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'Done' }] } });
+    fs.writeFileSync(path.join(childDir, 'agent-child-1.jsonl'), end('2026-09-09T21:00:00Z'));
+    assert.equal(require('./serve').sessionBackgroundPending(scanTranscript(file)), true, 'old completion does not finish resumed run');
+    fs.writeFileSync(path.join(childDir, 'agent-child-1.jsonl'), end('2026-09-09T22:01:00Z'));
+    assert.equal(require('./serve').sessionBackgroundPending(scanTranscript(file)), false, 'new completion reconciles missing notification');
+    fs.appendFileSync(file, notification + '\n');
+    assert.equal(scanTranscript(file).pendingBackground, false);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('parent cancellation provides dated lifecycle completion evidence', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-agent-cancel-'));
+  const file = path.join(dir, 'session.jsonl');
+  try {
+    fs.writeFileSync(file, [
+      record('assistant', [{ type: 'tool_use', id: 'stop', name: 'TaskStop', input: { task_id: 'child' } }]),
+      JSON.stringify({ type: 'user', timestamp: '2026-09-09T22:00:00Z', message: { content: [{ type: 'tool_result', tool_use_id: 'stop', content: 'Successfully stopped task' }] } }),
+      JSON.stringify({ type: 'queue-operation', timestamp: '2026-09-09T22:01:00Z', content: '<task-notification><task-id>other-child</task-id><status>failed</status></task-notification>' }),
+    ].join('\n'));
+    const info = scanTranscript(file);
+    assert.equal(info.completedAgents.child, Date.parse('2026-09-09T22:00:00Z'));
+    assert.equal(info.completedAgents['other-child'], Date.parse('2026-09-09T22:01:00Z'));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('background install jobs remain pending until their completion notification', () => {
@@ -707,7 +1022,7 @@ test('an idle prompt after starting a dev server is not a human request', () => 
   }
 });
 
-test('explicit prose question still surfaces while background work runs', () => {
+test('old prose question does not override current background work', () => {
   const session = {
     notify: { type: 'waiting' },
     pendingBackground: true,
@@ -716,7 +1031,7 @@ test('explicit prose question still surfaces while background work runs', () => 
     taskId: 'task-1',
     mtime: 0,
   };
-  assert.equal(sessionNeedsInput(session, 60e3), true);
+  assert.equal(sessionNeedsInput(session, 60e3), false);
 });
 
 test('untimestamped metadata appends do not refresh session activity', () => {
@@ -825,6 +1140,7 @@ test('linked card status suppresses only idle session attention', () => {
     pendingQuestion: { question: 'Which target?', options: ['staging', 'production'] },
   }, now), {
     pri: 0,
+    attentionLabel: 'Needs an answer',
     kind: 'question',
     sessionId: 'claude-session',
     project: '/work/keep',
@@ -1402,6 +1718,33 @@ test('pending swap sweep repairs settings without typing exited, absent, or unsa
   }
 });
 
+test('pending swap recovery requires live local-command completion instead of stale endedTurn', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-local-'));
+  try {
+    const transcript = path.join(dir, 'local.jsonl');
+    fs.writeFileSync(transcript, JSON.stringify({ type: 'user', timestamp: '2026-09-04T12:00:00Z', message: { content: '/compact' } }) + '\n');
+    const parsed = scanTranscript(transcript);
+    assert.equal(parsed.endedTurn, false);
+    assert.equal(parsed.localCommandPending, '/compact');
+    for (const [screen, restored] of [
+      ['❯ /compact\nCompacted\n❯', true],
+      ['❯ /compact\nCompacting… (esc to interrupt)\n❯', false],
+      ['❯ /compact\n❯', false],
+      ['Compacted\n❯ /compact\n❯', false],
+    ]) {
+      const calls = [], session = require('./serve').claudeSessionFromInfo('local', parsed, fs.statSync(transcript), 'keep', false, Date.now());
+      writeCompactSwapFixture(dir, session.id);
+      const deps = compactRestoreDeps(dir, session, calls);
+      deps.readScreen = async () => screen;
+      const summary = await sweepPendingCompactSwaps(deps);
+      assert.equal(summary.restored, restored ? 1 : 0, screen);
+      assert.equal(calls.length, restored ? 1 : 0, screen);
+    }
+    fs.appendFileSync(transcript, JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'x', name: 'Bash', input: {} }] } }) + '\n');
+    assert.equal(scanTranscript(transcript).localCommandPending, null, 'new assistant work invalidates local-command exception');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('pending swap sweep leaves a mid-turn session for a later tick', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-busy-test-'));
   const session = { id: 'busy-opus', kind: 'claude', model: 'claude-opus-5', endedTurn: false };
@@ -1426,6 +1769,52 @@ test('pending swap sweep restores even when the last assistant model is already 
     const summary = await sweepPendingCompactSwaps(compactRestoreDeps(dir, session, calls));
     assert.deepEqual(summary, { checked: 1, restored: 1, dropped: 0, skipped: 0, repairedSettings: 0 });
     assert.deepEqual(calls, ['/model claude-fable-5-1[1m]']);
+    assert.equal(fs.existsSync(swapFile), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pending swap sweep restores through a prompt suggestion that Backspace puts back', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-suggestion-test-'));
+  const session = { id: 'suggesting', kind: 'claude', model: 'claude-fable-5-1', endedTurn: true };
+  const calls = [];
+  const order = [];
+  const inputs = [];
+  const swapFile = writeCompactSwapFixture(dir, session.id);
+  // The pane echoes what is typed: the probe hides the suggestion, and the probe's
+  // Backspace empties the box again, which is when the suggestion comes back. A bare
+  // sendPrecheck on the sweep's re-read used to refuse exactly there.
+  let box = '';
+  const host = recordingHost((type, params) => {
+    if (type !== 'input') return {};
+    const data = Buffer.from(params.data, 'base64').toString('utf8');
+    inputs.push(data);
+    order.push(`input:${data}`);
+    box = data === '\x7f' ? box.slice(0, -1) : box + data;
+    return {};
+  });
+  const readScreen = async () => (box ? suggestionScreenWithBox(box) : REVIEWER_SUGGESTION_BEFORE);
+  try {
+    // Drop the no-op precheck so the production precheckSessionTarget runs: it reads
+    // the screen and probes it too, so the suggestion is met twice per restore.
+    const { precheckSessionTarget: _skip, ...base } = compactRestoreDeps(dir, session, calls);
+    const summary = await sweepPendingCompactSwaps({
+      ...base,
+      host,
+      wait: async () => {},
+      readScreen,
+      typeAndSubmit: async (target, command) => {
+        order.push(`type:${command}`);
+        return base.typeAndSubmit(target, command);
+      },
+    });
+    assert.deepEqual(summary, { checked: 1, restored: 1, dropped: 0, skipped: 0, repairedSettings: 0 });
+    assert.deepEqual(calls, ['/model claude-fable-5-1[1m]']);
+    assert.deepEqual(inputs, [',', '\x7f', ',', '\x7f']);
+    assert.deepEqual(order, [
+      'input:,', 'input:\x7f', 'input:,', 'input:\x7f', 'type:/model claude-fable-5-1[1m]',
+    ]);
     assert.equal(fs.existsSync(swapFile), false);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -2060,8 +2449,11 @@ test('/api/state payload includes reviewer events and compact reviewer stats', (
       lastSkip: { at: 1000, why: 'quiet' },
       days: { '2026-09-06': { ticks: 1 }, '2026-09-07': { ticks: 2 }, '2026-09-08': { ticks: 3, acks: 1 } },
     }));
-    const child = spawnSync(process.execPath, ['-e', "process.stdout.write(JSON.stringify(require('./bin/serve.js').buildState().review))"], {
-      cwd: path.join(__dirname, '..'), env: { ...process.env, KEEP_DIR: root }, encoding: 'utf8',
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    fs.writeFileSync(path.join(root, 'digests', `${today}.md`), '# Test digest\n');
+    const child = spawnSync(process.execPath, ['-e', STATE_FIXTURE_SETUP + "process.stdout.write(JSON.stringify(require('./bin/serve.js').buildState().review))"], {
+      cwd: path.join(__dirname, '..'), env: { ...process.env, KEEP_DIR: root, HOME: root }, encoding: 'utf8', timeout: 10000,
     });
     assert.equal(child.status, 0, child.stderr);
     const review = JSON.parse(child.stdout);
@@ -2198,6 +2590,26 @@ test('typing exit confirms the prompt above a tall Claude slash-command menu', a
   assert.equal(check('──────────────────── my-debug-session ─\n❯ /exit\n──────────────────────────────\n? for shortcuts', '/exit'), true);
   await typeAndSubmit({ pane: 'p' }, '/exit', check, { host, confirmationLines: null, sleep: async () => {} });
   assert.equal(typed, '/exit\r');
+});
+
+test('delivery trace distinguishes screen mismatch from Enter submission without screen text', async () => {
+  for (const confirmed of [false, true]) {
+    const events = [], inputs = [];
+    const host = recordingHost(async (type, params) => {
+      if (type === 'screen') return { text: 'PRIVATE SCREEN' };
+      if (type === 'input') inputs.push(Buffer.from(params.data, 'base64').toString());
+      return {};
+    });
+    const run = typeAndSubmit({ pane: 'p' }, 'PRIVATE MESSAGE', () => confirmed, {
+      host, sleep: async () => {}, deliveryTrace: (stage, fields) => events.push({ stage, ...fields }),
+    });
+    if (confirmed) await run;
+    else await assert.rejects(run, /Enter was not pressed/);
+    assert.equal(events.some(e => e.stage === 'enter-sent'), confirmed);
+    assert.equal(inputs.includes('\r'), confirmed);
+    assert.ok(events.some(e => e.stage === 'screen-confirmation' && e.matched === confirmed));
+    assert.doesNotMatch(JSON.stringify(events), /PRIVATE/);
+  }
 });
 
 test('screen session returns plain pane lines and terminal metadata', async () => {
@@ -2411,6 +2823,36 @@ test('live session tick merges direct host bindings without pane-record backfill
   assert.deepEqual(host.calls.map((call) => call.type), ['list']);
 });
 
+test('pane process liveness distinguishes an empty parent shell from an agent subtree', () => {
+  const { annotatePaneAgents } = require('./serve');
+  const panes = [1, 2, 3, 4].map((pid) => ({ id: `p${pid}`, pid, alive: true, meta: { agent: 'codex', sessionId: `s${pid}` } }));
+  annotatePaneAgents(panes, [
+    { pid: 1, ppid: 0, args: '/bin/zsh -l' },
+    { pid: 2, ppid: 0, args: '/bin/zsh -l' },
+    { pid: 20, ppid: 2, args: 'launcher' },
+    { pid: 21, ppid: 20, args: 'codex', agent: 'codex', interactive: true },
+    { pid: 3, ppid: 0, args: '/bin/zsh -l' },
+    { pid: 30, ppid: 3, args: 'starting an unknown wrapper' },
+  ]);
+  assert.equal(panes[0].alive, true, 'the terminal remains accessible');
+  assert.equal(panes[0].agentAlive, false);
+  assert.equal(panes[1].agentAlive, true);
+  assert.equal(panes[1].agentPid, 21);
+  assert.equal(panes[2].agentAlive, undefined, 'unknown descendants are not proof of exit');
+  assert.equal(panes[3].agentAlive, undefined, 'missing process rows are inconclusive');
+});
+
+test('empty parent shell is not refreshed into the live-session ledger or targeted for injection', async () => {
+  const pane = { id: 'p', pid: 123, alive: true, meta: { sessionId: 's', agent: 'codex' } };
+  const host = recordingHost((type) => type === 'list' ? { panes: [{ ...pane }] } : {});
+  let written;
+  const deps = { host, agentProcessRows: async () => [{ pid: 123, ppid: 1, args: '/bin/zsh -l' }],
+    liveSessionPids: async () => new Map(), now: () => 9000, ledger: { sessions: {} }, paneRecords: new Map(), scanSessions: () => [], writeLedger: (value) => { written = value; } };
+  await liveSessionTick(deps);
+  assert.deepEqual(written.sessions, {});
+  await assert.rejects(resolveSessionTarget({ id: 's', kind: 'codex' }, { expectedPane: 'p' }, deps), /no longer a live instance/);
+});
+
 test('restore plan reopens recent sessions only when their process and host pane are gone', async () => {
   const now = Date.parse('2026-09-08T12:00:00Z');
   const recent = now - 5 * 60e3;
@@ -2438,6 +2880,36 @@ test('restore plan reopens recent sessions only when their process and host pane
   assert.equal(byId.get('hosted').action, 'skip');
   assert.deepEqual([byId.get('hosted').pane, byId.get('hosted').state], ['pane-hosted', 'alive']);
   assert.match(byId.get('exited').reason, /session exited/);
+});
+
+test('restore never promotes Codex subagents into standalone sessions', async () => {
+  const now = Date.now();
+  const plan = await restorePlan({ since: 30 * 60e3 }, {
+    now: () => now,
+    ledger: { sessions: { child: { agent: 'codex', project: '/project', primary: true, lastSeenAlive: now - 1000 } } },
+    liveSessionPids: async () => new Map(),
+    scanSessions: () => [],
+    codexSessionMeta: () => ({ id: 'child', session_id: 'parent', parent_thread_id: 'parent' }),
+    host: recordingHost((type) => type === 'list' ? { panes: [] } : {}),
+  });
+  assert.equal(plan.sessions[0].action, 'skip');
+  assert.equal(plan.sessions[0].reason, 'codex child session');
+});
+
+test('targeting and restore prefer a live agent over a newer leftover shell for the same session', async () => {
+  const now = Date.now();
+  const panes = [
+    { id: 'live', alive: true, agentAlive: true, createdAt: new Date(now - 1000).toISOString(), meta: { sessionId: 's', agent: 'claude', project: '/project' } },
+    { id: 'leftover', alive: true, agentAlive: false, createdAt: new Date(now).toISOString(), meta: { sessionId: 's', agent: 'claude', project: '/project' } },
+  ];
+  const host = recordingHost((type) => type === 'list' ? { panes } : {});
+  assert.deepEqual(await resolveSessionTarget({ id: 's', kind: 'claude' }, null, { host }), { pane: 'live' });
+  const plan = await restorePlan({ since: 30 * 60e3 }, {
+    host, now: () => now, ledger: { sessions: {} }, liveSessionPids: async () => new Map(),
+    scanSessions: () => [{ id: 's', kind: 'claude' }], transcriptExists: () => true,
+  });
+  assert.equal(plan.sessions[0].pane, 'live');
+  assert.equal(plan.sessions[0].action, 'skip');
 });
 
 test('open resolves a unique session prefix and refuses a session running outside the host', async () => {
@@ -2580,7 +3052,7 @@ test('API state synthesizes a minimal session when a host transcript lookup find
   });
 });
 
-function buildStateWithHostSession(root, ack = false, needsQuestion = true) {
+function buildStateWithHostSession(root, ack = false, needsQuestion = true, agentAlive = true, externalLive = false) {
   for (const dir of ['tasks', 'archive', 'digests', path.join('.keep', 'acks')]) {
     fs.mkdirSync(path.join(root, dir), { recursive: true });
   }
@@ -2596,11 +3068,13 @@ function buildStateWithHostSession(root, ack = false, needsQuestion = true) {
     fs.writeFileSync(path.join(root, '.keep', 'acks', name), JSON.stringify({ key }));
   }
   const script = `
+    ${STATE_FIXTURE_SETUP}
     const { buildState } = require('./bin/serve.js');
     const id = ${JSON.stringify(id)};
     const state = buildState({
+      ledger: ${externalLive ? "{ updatedAt: Date.now(), sessions: { [id]: { lastSeenAlive: Date.now(), source: 'argv', pid: 999 } } }" : "{ updatedAt: Date.now(), sessions: {} }"},
       hostPanes: [{
-        id: 'pane-host-only', alive: true,
+        id: 'pane-host-only', alive: true, agentAlive: ${agentAlive},
         meta: { sessionId: id, agent: 'claude', project: '/host/project' },
       }],
       claudeSessionFor: (sessionId) => ({
@@ -2616,13 +3090,34 @@ function buildStateWithHostSession(root, ack = false, needsQuestion = true) {
     }));
   `;
   const child = spawnSync(process.execPath, ['-e', script], {
-    cwd: path.join(__dirname, '..'), env: { ...process.env, KEEP_DIR: root, HOME: root }, encoding: 'utf8',
+    cwd: path.join(__dirname, '..'), env: { ...process.env, KEEP_DIR: root, HOME: root }, encoding: 'utf8', timeout: 10000,
   });
   assert.equal(child.status, 0, child.stderr);
   return JSON.parse(child.stdout);
 }
 
-test('archived completed cards do not become next-instruction requests, while current links win', () => {
+test('open owner questions put a landing session in attention until answered', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-owner-attention-'));
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+    fs.mkdirSync(path.join(root, '.keep', 'review'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'tasks', 'land.md'), '---\ntitle: Land\nstatus: landing\nkind: task\ntags: [personal]\nsessions:\n  - id: claude-host-only\n    agent: claude\n    at: 2026-09-09T00:00:00Z\n---\n');
+    const file = path.join(root, '.keep', 'review', '_questions.json');
+    const question = { id: 'approval', to: 'jesse', status: 'open', at: Date.now(), question: 'OK to land?', from: { sessionId: 'claude-host-only' } };
+    fs.writeFileSync(file, JSON.stringify([question]));
+    let result = buildStateWithHostSession(root, false, false);
+    assert.equal(result.session.state, 'needs-input');
+    assert.equal(result.attention[0].detail, 'OK to land?');
+    fs.writeFileSync(file, JSON.stringify([{ ...question, status: 'answered' }]));
+    result = buildStateWithHostSession(root, false, false);
+    assert.equal(result.session.state, 'needs-input');
+    assert.equal(result.attention[0].attentionLabel, 'Ready for next instruction');
+    fs.writeFileSync(file, JSON.stringify([{ ...question, to: 'reviewer' }]));
+    assert.equal(buildStateWithHostSession(root, false, false).attention[0].attentionLabel, 'Ready for next instruction');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('live hosted conversations remain ready after an archived task completes, while current links win', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-archived-attention-'));
   try {
     fs.mkdirSync(path.join(root, 'archive'), { recursive: true });
@@ -2630,8 +3125,8 @@ test('archived completed cards do not become next-instruction requests, while cu
     fs.writeFileSync(path.join(root, 'archive', 'finished.md'), card('done', '2026-09-08T23:00'));
     let state = buildStateWithHostSession(root, false, false);
     assert.equal(state.session.taskStatus, 'done');
-    assert.equal(state.session.state, 'done');
-    assert.equal(state.attention.length, 0);
+    assert.equal(state.session.state, 'needs-input');
+    assert.equal(state.attention[0].attentionLabel, 'Ready for next instruction');
     fs.writeFileSync(path.join(root, 'tasks', 'current.md'), card('active', '2026-09-08T22:00'));
     state = buildStateWithHostSession(root, false, false);
     assert.equal(state.session.taskId, 'current');
@@ -2650,6 +3145,19 @@ test('buildState puts a host-only Claude question in attention before stalled an
     assert.deepEqual(result.attention.map(({ kind, sessionId }) => ({ kind, sessionId })), [
       { kind: 'question', sessionId: 'claude-host-only' },
     ]);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('buildState does not surface a question from an agent that exited into its parent shell', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-leftover-attention-'));
+  try {
+    const result = buildStateWithHostSession(root, false, true, false);
+    assert.equal(result.session.state, 'exited');
+    assert.equal(result.session.pane, 'pane-host-only', 'keep the leftover terminal accessible');
+    assert.deepEqual(result.attention, []);
+    const external = buildStateWithHostSession(root, false, true, false, true);
+    assert.equal(external.session.state, 'needs-input', 'a live external agent is not exited because its old host shell remains');
+    assert.equal(external.attention[0].kind, 'question');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -2709,14 +3217,14 @@ test('codex sessionFor reuses the path and parsed rollout while mtime and size a
       let opens = 0;
       let readdirs = 0;
       fs.openSync = (...args) => { opens += 1; return realOpen(...args); };
-      fs.readdirSync = (...args) => { readdirs += 1; return realReaddir(...args); };
+      fs.readdirSync = (...args) => { if (String(args[0]).includes('/.codex/sessions/')) readdirs += 1; return realReaddir(...args); };
       const first = codex.sessionFor(${JSON.stringify(id)});
       const firstReaddirs = readdirs;
       const second = codex.sessionFor(${JSON.stringify(id)});
       process.stdout.write(JSON.stringify({ first, second, opens, readdirs, firstReaddirs }));
     `;
     const child = spawnSync(process.execPath, ['-e', script], {
-      cwd: path.join(__dirname, '..'), env: { ...process.env, HOME: home }, encoding: 'utf8',
+      cwd: path.join(__dirname, '..'), env: { ...process.env, HOME: home }, encoding: 'utf8', timeout: 10000,
     });
     assert.equal(child.status, 0, child.stderr);
     const result = JSON.parse(child.stdout);
@@ -2892,4 +3400,36 @@ test('hostRequest derives each attempt timeout from the remaining reload deadlin
     host, hostReloadRetryMs: 25, hostRequestTimeoutMs: 1000,
   }), /host request timed out \(hello\)/);
   assert.ok(Date.now() - started < 250, 'the 25 ms reload deadline is a hard wall-clock bound');
+});
+
+test('open refuses oversized messages before resolving a card or opening a pane', async () => {
+  for (const message of ['x'.repeat(2001), 'x' + ' '.repeat(2000)]) {
+    await assert.rejects(openSession({ taskId: 'card', fresh: true, message }, {
+      loadTask: () => assert.fail('oversized input must fail before card lookup'),
+      host: { request: () => assert.fail('oversized input must not open a pane') },
+    }), (error) => error.status === 400 && error.message === 'agent messages are limited to 2000 characters');
+  }
+  const messages = [];
+  await openSession({ taskId: 'card', message: 'x'.repeat(2000) }, {
+    loadTask: () => ({ fm: { project: os.tmpdir(), sessions: [{ id: 'owner', agent: 'claude' }] } }),
+    resolveSessionTarget: async () => ({ pane: 'existing' }),
+    sendToResolvedTarget: async (_session, _target, text) => messages.push(text),
+  });
+  assert.deepEqual(messages, ['x'.repeat(2000)], 'the boundary is delivered in full');
+});
+
+test('open types the complete handoff file pointer into a fresh session', async () => {
+  const message = `Your instructions are in ${path.join(os.tmpdir(), 'keep/.keep/handoffs/card-123.md')}; read that file first.`;
+  const typed = [];
+  const host = recordingHost((type) => type === 'spawn' ? { pane: { id: 'handoff-pane' } } : {});
+  const result = await openSession({ taskId: 'card', fresh: true, message }, {
+    host,
+    loadTask: () => ({ fm: { project: os.tmpdir(), sessions: [] } }),
+    randomUUID: () => 'handoff-session',
+    waitForHostAgent: async () => true,
+    typeOpeningMessage: async (target, agent, text) => typed.push({ target, agent, text }),
+    linkLaunchedSession: () => true,
+  });
+  assert.equal(result.sent, true);
+  assert.deepEqual(typed, [{ target: { pane: 'handoff-pane' }, agent: 'claude', text: message }]);
 });

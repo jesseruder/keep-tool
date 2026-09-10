@@ -120,6 +120,7 @@ async function fixture(options = {}) {
     token: options.token || 'secret',
     isLocal: options.isLocal || (() => true),
     killGraceMs: options.killGraceMs,
+    projectIcons: options.projectIcons,
     hostClient: async () => makeHost(),
     hostRequest: (type, params) => sharedHost.request(type, params),
   });
@@ -621,4 +622,19 @@ test('two websocket viewers use separate host clients and both receive live byte
   first.close();
   second.close();
   await Promise.all([once(first, 'close'), once(second, 'close')]);
+});
+
+
+test('project icon discovery requires write authorization and routes validated requests', async (t) => {
+  const seen = [];
+  const fx = await fixture({ projectIcons: { lookup: async (projects) => { seen.push(projects); return { projects: {} }; } } });
+  t.after(() => fx.close());
+  const url = `http://127.0.0.1:${fx.port}/api/project-icons`;
+  const denied = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"projects":["/repo"]}' });
+  assert.equal(denied.status, 403);
+  assert.equal(seen.length, 0);
+  const accepted = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-keep': '1' }, body: '{"projects":["/repo"]}' });
+  assert.equal(accepted.status, 200);
+  assert.deepEqual(await accepted.json(), { projects: {} });
+  assert.deepEqual(seen, [['/repo']]);
 });

@@ -9,6 +9,18 @@ for (const k of ['KEEP_REVIEWER', 'KEEP_REVIEWER_NAME', 'KEEP_REVIEWER_MODEL']) 
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
+test('scheduled-task timer polls each minute and matches health cadence', () => {
+  const intervals = [], timeouts = [];
+  const context = { require, module: { exports: {} }, process, Buffer, console,
+    setInterval: (_fn, ms) => ({ unref: () => intervals.push(ms) }),
+    setTimeout: (_fn, ms) => ({ unref: () => timeouts.push(ms) }) };
+  require('node:vm').runInNewContext(require('node:fs').readFileSync(require.resolve('./runs'), 'utf8'), context);
+  context.module.exports.startScheduler();
+  assert.deepEqual(intervals, [60000]);
+  assert.deepEqual(timeouts, [30000]);
+  assert.equal(require('./health').CADENCES.runs.cadenceMs, intervals[0]);
+});
+
 const {
   buildPrompt, headlessRunArgs, checkDeliveryMessage, planDueCard, deliveryWarning, finalizePayload, NO_RESULT,
 } = require('./runs.js');
@@ -102,12 +114,19 @@ test('scheduled check delivery is a bounded one-line instruction', () => {
   assert.match(short, /some-card/);
   assert.match(short, /keep checkin/);
   assert.match(short, /--clear-check-after/);
+  assert.match(short, /read-only check/);
+  assert.match(short, /--handoff needs-input/);
   assert.doesNotMatch(short, /recipe truncated/);
 
   const long = checkDeliveryMessage(card({ check: 'inspect the rollout '.repeat(300) }));
   assert.doesNotMatch(long, /\n/);
   assert.ok(long.length <= 2000);
   assert.match(long, /recipe truncated; full text on the card/);
+  assert.match(long, /--handoff needs-input/);
+  assert.match(long, /Full card: keep show some-card\./);
+  const wide = checkDeliveryMessage(card({ title: 't'.repeat(240), check: 'inspect '.repeat(400), task: { id: 'x'.repeat(48) } }));
+  assert.ok(wide.length <= 2000);
+  assert.ok(wide.endsWith(`Full card: keep show ${'x'.repeat(48)}.`));
 });
 
 test('a delivery stamp only suppresses the exact schedule it records', () => {

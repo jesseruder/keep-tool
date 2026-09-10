@@ -409,9 +409,9 @@ function buildBrief(input) {
   const allOpenQuestions = (input.questions || []).filter((question) => question && question.status === 'open' && !question.answer);
   // A `--jesse` question is an agent parked on a decision only he can make, so it
   // gets its own block above reviewer traffic: answering it restarts a session.
-  const askedOfOwner = allOpenQuestions.filter((question) => question.to === 'jesse')
+  const askedOfOwner = allOpenQuestions.filter((question) => ['owner', 'jesse'].includes(question.to))
     .sort((a, b) => Number(a.at || 0) - Number(b.at || 0));
-  const openQuestions = allOpenQuestions.filter((question) => question.to !== 'jesse');
+  const openQuestions = allOpenQuestions.filter((question) => !['owner', 'jesse'].includes(question.to));
   const answeredQuestions = (input.questions || []).filter((question) => {
     if (!question || question.status !== 'answered' || !question.answer) return false;
     const hasAskingSession = Boolean(question.from && question.from.sessionId);

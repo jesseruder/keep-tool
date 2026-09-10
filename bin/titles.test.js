@@ -162,3 +162,17 @@ test('read-only scans reuse generated titles without starting model work', () =>
   assert.equal(session.title, 'Ghost rebalance');
   assert.equal(session.baseTitle, 'Continue task');
 });
+
+test('invalidated title cache repairs from the actual card and project even after a trivial reply', () => {
+  let input;
+  const session = { id: 'sandbox', kind: 'codex', title: 'Review playtest proposal', project: '/castle/castle-sandboxes', lastUser: 'ok' };
+  const result = liveTitle(session, {
+    peekSummary: () => null,
+    taskFor: () => ({ title: 'Build Redis-pull shared browser service' }),
+    getSummary: (_, text) => { input = text; return { text: 'Redis-pull browser service' }; },
+  });
+  assert.equal(result, 'Redis-pull browser service');
+  assert.match(input, /Session project: \/castle\/castle-sandboxes/);
+  assert.match(input, /Linked Keep card: Build Redis-pull/);
+  assert.doesNotMatch(input, /Latest request: ok/);
+});

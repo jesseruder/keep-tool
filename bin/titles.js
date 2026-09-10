@@ -69,7 +69,7 @@ function liveTitle(session, deps = {}) {
   const card = task.fm?.title || task.title || '';
   const summary = peekSummary(`session-${session.id}`)?.text || '';
   const repair = genericTitle(previousTitle || baseTitle);
-  if (!deps.force && !repair && isTrivialPrompt(prompt)) return previousTitle;
+  if (!deps.force && previousTitle && !repair && isTrivialPrompt(prompt)) return previousTitle;
   if (!deps.force && cached && now() - cached.generatedAt < TITLE_MIN_INTERVAL_MS) return previousTitle;
   const request = isTrivialPrompt(prompt) ? '' : prompt;
   if (!request && !card && !summary) return previousTitle;
@@ -78,8 +78,9 @@ function liveTitle(session, deps = {}) {
     ? `${TITLE_INSTRUCTION} Previous title for this session: ${previousTitle}`
     : TITLE_INSTRUCTION;
   // Stable content hash prevents unchanged polling from regenerating a title.
-  const input = `${titleInput(baseTitle, request)}\nLinked Keep card: ${String(card).slice(0, 500)}\nSession summary: ${String(summary).slice(0, 2000)}\nTitle policy: 2`;
-  const result = getSummary(key, input, instruction, onChange, { priority: 2 });
+  const input = `${titleInput(baseTitle, request)}\nSession project: ${String(session.project || '').slice(0, 500)}\nLinked Keep card: ${String(card).slice(0, 500)}\nSession summary: ${String(summary).slice(0, 2000)}\nTitle policy: 3`;
+  // The previous-title hint is model output, not changed source evidence.
+  const result = getSummary(key, input, instruction, onChange, { priority: 2, cacheInstruction: TITLE_INSTRUCTION });
   return sanitizeTitle(result && result.text, repair ? card : null);
 }
 

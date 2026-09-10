@@ -19,7 +19,7 @@ let queuedStateRequest;
 async function fetchState() {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10000);
-  try { return await request('/api/state', { signal: controller.signal }); }
+  try { return await request('/api/state?compact=1', { signal: controller.signal }); }
   catch (error) {
     if (controller.signal.aborted) throw new Error('State refresh timed out after 10 seconds');
     throw error;
@@ -79,11 +79,12 @@ export const killPane = (pane) => write(`/api/panes/${encodeURIComponent(pane)}/
 export const removePane = (pane) => write(`/api/panes/${encodeURIComponent(pane)}/remove`);
 export const reviewTick = () => write('/api/reviewtick', { force: true });
 
-export function subscribe(onChange, onStatus, onFocus) {
+export function subscribe(onChange, onStatus, onFocus, timers = globalThis) {
   const events = new EventSource('/api/events');
   events.onopen = () => onStatus?.('live');
   events.onerror = () => onStatus?.('reconnecting');
   events.onmessage = () => onChange();
   events.addEventListener('focus', (event) => onFocus?.(String(event.data || '')));
-  return () => events.close();
+  const poll = timers.setInterval(onChange, 30000);
+  return () => { timers.clearInterval(poll); events.close(); };
 }

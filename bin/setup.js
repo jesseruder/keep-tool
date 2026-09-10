@@ -151,7 +151,7 @@ function service(args, root) {
     console.log('Service files installed. Run keep service start to start the host and daemon.');
   } else if (action === 'restart') {
     // Preserve host-owned interactive terminals when refreshing daemon code.
-    run(['kickstart', '-k', `${target}/games.castle.keep.serve`]);
+    execFileSync(process.execPath, [path.join(__dirname, 'keep.js'), 'restart-daemon'], { stdio: 'inherit' });
   } else {
     for (const entry of action === 'stop' ? [...entries].reverse() : entries) {
       if (action === 'start') run(['bootstrap', target, entry.file]);

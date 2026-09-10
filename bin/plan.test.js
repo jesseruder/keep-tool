@@ -326,6 +326,37 @@ test('Stop auto-continues a linked card once per step and advances after plan --
   } finally { f.cleanup(); }
 });
 
+test('Codex Stop shares the plan policy and emits exactly one JSON result', () => {
+  const f = registryFixture();
+  try {
+    const linked = writeLinkedCard(f);
+    const transcript = path.join(f.root, 'codex.jsonl');
+    const row = (type, payload) => JSON.stringify({ type, payload, timestamp: new Date().toISOString() }) + '\n';
+    const base = row('session_meta', { id: linked.sid, source: 'cli', originator: 'codex-tui' }) +
+      row('event_msg', { type: 'user_message', message: 'Continue the work.' }) +
+      row('event_msg', { type: 'agent_message', message: 'Finished a chunk.' });
+    fs.writeFileSync(transcript, base);
+    const run = (extra = {}) => spawnSync(process.execPath, [CLI, 'hook', 'codex', 'stop'], {
+      cwd: f.root, env: f.env, encoding: 'utf8',
+      input: JSON.stringify({ session_id: linked.sid, cwd: linked.project, transcript_path: transcript, ...extra }),
+    });
+    assert.deepEqual(JSON.parse(run({ stop_hook_active: true }).stdout), {});
+    assert.match(JSON.parse(run().stdout).reason, /Continue with step 1 of 2/);
+    assert.deepEqual(JSON.parse(run().stdout), {});
+    assert.equal(f.run(['plan', 'planned-card', '--done', '1']).status, 0);
+    assert.deepEqual(JSON.parse(run({ last_assistant_message: 'Should I deploy?' }).stdout), {});
+    fs.appendFileSync(transcript, row('response_item', { type: 'function_call', name: 'request_user_input_async', call_id: 'q', arguments: JSON.stringify({ questions: [{ title: 'Which option?' }] }) }) +
+      row('response_item', { type: 'function_call_output', call_id: 'q', output: '{}' }));
+    assert.deepEqual(JSON.parse(run().stdout), {});
+    fs.writeFileSync(transcript, base.replace('"source":"cli"', '"source":"exec"').replace('codex-tui', 'codex-exec'));
+    assert.deepEqual(JSON.parse(run().stdout), {});
+    fs.writeFileSync(transcript, base.replace('"source":"cli"', '"source":"cli","parent_thread_id":"parent"'));
+    assert.deepEqual(JSON.parse(run().stdout), {});
+    fs.writeFileSync(transcript, base);
+    assert.match(JSON.parse(run().stdout).reason, /Continue with step 2 of 2/);
+  } finally { f.cleanup(); }
+});
+
 test('Stop allows a question anywhere in the last 400 characters of the last non-empty assistant text', () => {
   const f = registryFixture();
   try {
@@ -539,7 +570,7 @@ test('Stop tells an unattended session to file its question for Owner', () => {
     const out = stop(f, linked, transcript);
     assert.equal(out.status, 0, out.stderr);
     const reason = JSON.parse(out.stdout).reason;
-    assert.match(reason, /keep ask --jesse/);
+    assert.match(reason, /keep ask --owner/);
     assert.match(reason, /planned-card/);
     // Once per session per window.
     assert.equal(stop(f, linked, transcript).stdout, '');
@@ -575,7 +606,7 @@ test('a [keep] injection is not mistaken for Owner typing', () => {
     fs.writeFileSync(transcript, interactive() + human('start on this', 3 * 3600e3)
       + human('[keep] scheduled check due for planned-card', 60e3)
       + assistant('Which region should the replica live in?'));
-    assert.match(JSON.parse(stop(f, linked, transcript).stdout).reason, /keep ask --jesse/);
+    assert.match(JSON.parse(stop(f, linked, transcript).stdout).reason, /keep ask --owner/);
   } finally { f.cleanup(); }
 });
 
@@ -804,7 +835,7 @@ test('a compaction summary is not mistaken for Owner typing', () => {
     fs.writeFileSync(transcript, interactive() + human('start on this', 3 * 3600e3) + compact
       + assistant('Which region should the replica live in?'));
     // The compaction is the harness speaking, so Owner is still absent.
-    assert.match(JSON.parse(stop(f, linked, transcript).stdout).reason, /keep ask --jesse/);
+    assert.match(JSON.parse(stop(f, linked, transcript).stdout).reason, /keep ask --owner/);
   } finally { f.cleanup(); }
 });
 
@@ -820,7 +851,7 @@ test('a question another session parked does not silence this one', () => {
     const transcript = path.join(f.root, 'transcript.jsonl');
     fs.writeFileSync(transcript, interactive() + human('start on this', 3 * 3600e3)
       + assistant('Which region should the replica live in?'));
-    assert.match(JSON.parse(stop(f, linked, transcript).stdout).reason, /keep ask --jesse/);
+    assert.match(JSON.parse(stop(f, linked, transcript).stdout).reason, /keep ask --owner/);
   } finally { f.cleanup(); }
 });
 

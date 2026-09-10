@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-clipboard-has-image"
+description = "Enables the clipboard_has_image command without any pre-configured scope."
+commands.allow = ["clipboard_has_image"]
+
+[[permission]]
+identifier = "deny-clipboard-has-image"
+description = "Denies the clipboard_has_image command without any pre-configured scope."
+commands.deny = ["clipboard_has_image"]

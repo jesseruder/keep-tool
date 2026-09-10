@@ -6,6 +6,26 @@ const os = require('os');
 const path = require('path');
 const { deliver, userText } = require('./delivery');
 
+test('delivery diagnostics persist stages without text and rotate within a bounded footprint', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-trace-'));
+  try {
+    const file = path.join(dir, 'transcript'); fs.writeFileSync(file, '');
+    const directory = path.join(dir, 'journal');
+    await assert.rejects(deliver({ session: { id: 's', kind: 'codex' }, pane: 'p', text: 'SECRET MESSAGE', file, directory,
+      precheck: async () => {}, type: async () => { throw Error('SECRET SCREEN'); }, submitDraft: async () => {}, draftMatches: async () => false }), /SECRET SCREEN/);
+    const trace = path.join(directory, 'diagnostics/events.jsonl');
+    const raw = fs.readFileSync(trace, 'utf8');
+    assert.doesNotMatch(raw, /SECRET|transcript/);
+    assert.deepEqual(raw.trim().split('\n').map(l => JSON.parse(l).stage), ['attempt-start', 'precheck-start', 'precheck-ok', 'type-submit-start', 'type-submit-failed', 'attempt-unconfirmed']);
+    assert.equal(fs.statSync(trace).mode & 0o777, 0o600);
+    fs.writeFileSync(trace, 'x'.repeat(1024 * 1024));
+    require('./delivery-trace').recorder(directory, { id: 's', kind: 'codex' }, 'p')('retry', { text: 'SECRET', matched: false });
+    assert.equal(fs.statSync(trace + '.1').size, 1024 * 1024);
+    assert.ok(fs.statSync(trace).size < 1000);
+    assert.doesNotMatch(fs.readFileSync(trace, 'utf8'), /SECRET/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('wrapped prompt fingerprints and exact recovery drafts tolerate terminal hard wraps', () => {
   const { codexTypedTextVisible, exactDraft } = require('./serve');
   const text = '[keep] scheduled check due; Full card: keep show example-regression-208.';
@@ -90,7 +110,7 @@ for (const kind of ['claude', 'codex']) test(`${kind} requires a matching transc
     assert.equal((await deliver(args)).delivery, 'received');
     assert.equal(typed, 1);
     assert.equal(submitted, 1);
-    assert.equal(fs.readdirSync(args.directory).length, 0);
+    assert.equal(fs.readdirSync(args.directory).filter(f => f.endsWith('.json')).length, 0);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

@@ -233,7 +233,7 @@ test('tick sends continue once, records the ledger, and does not repeat itself',
   try {
     const first = await tick(deps);
     assert.deepEqual(first, { ok: true, sent: 1, waiting: 0, detail: 'sent 1' });
-    assert.deepEqual(sends, [['session-one', 'continue']]);
+    assert.deepEqual(sends, [['session-one', '[keep] continue after the rate limit reset']]);
 
     const ledger = readLedger(root);
     assert.equal(ledger.sessions['session-one'].sentAt, NOW);
@@ -304,7 +304,7 @@ test('a failed send is retried on the next tick and counted against the attempt 
     assert.equal(afterFailure.attempts, 1);
     assert.equal(afterFailure.sentAt, undefined);
     assert.equal(afterFailure.lastError, 'another session injection is busy');
-    assert.match(lines[0], /^keep resume: could not send continue to session-/);
+    assert.match(lines[0], /^keep resume: could not send \[keep\] continue after the rate limit reset to session-/);
 
     fail = false;
     const second = await tick({ ...deps, now: NOW + 60e3 });
@@ -313,7 +313,7 @@ test('a failed send is retried on the next tick and counted against the attempt 
     assert.equal(afterSend.sentAt, NOW + 60e3);
     assert.equal(afterSend.attempts, 0);
     assert.equal(afterSend.lastError, undefined);
-    assert.match(lines[1], /^keep resume: sent continue to session- after five_hour limit reset \(hit 2026-09-06T18:00:00.000Z, reset 2026-09-06T19:50:00.000Z\)\n$/);
+    assert.match(lines[1], /^keep resume: sent \[keep\] continue after the rate limit reset to session- after five_hour limit reset \(hit 2026-09-06T18:00:00.000Z, reset 2026-09-06T19:50:00.000Z\)\n$/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -513,7 +513,7 @@ test('a session that moved on before the lock costs no attempt', async () => {
     error = Object.assign(new Error('no Claude prompt visible'), { status: 409 });
     await tick({ ...deps, now: NOW + 60e3 });
     assert.equal(readLedger(root).sessions['session-one'].attempts, 1);
-    assert.match(lines[1], /^keep resume: could not send continue to session-: no Claude prompt visible\n$/);
+    assert.match(lines[1], /^keep resume: could not send \[keep\] continue after the rate limit reset to session-: no Claude prompt visible\n$/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
