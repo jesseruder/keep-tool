@@ -17,17 +17,24 @@ const { createFixture } = require('./fixture.cjs');
   }));
   console.log(`Native sandbox: ${fixture.url}/app\nControls: ${fixture.url}/__fixture`);
   const child = spawn(path.resolve(__dirname, '../../desktop/node_modules/.bin/tauri'), ['dev', '--no-watch', '--config', configPath], {
-    cwd: path.resolve(__dirname, '../../desktop'), stdio: 'inherit',
+    cwd: path.resolve(__dirname, '../../desktop'), stdio: 'inherit', detached: true,
   });
+  const signalGroup = signal => {
+    if (!child.pid) return;
+    try { process.kill(-child.pid, signal); }
+    catch (error) { if (error.code !== 'ESRCH') console.error(error.message); }
+  };
   let cleaned = false;
   async function cleanup(code) {
     if (cleaned) return;
     cleaned = true;
+    // Tauri CLI can exit before its app. Its dedicated group owns both.
+    signalGroup('SIGTERM');
     await fixture.close();
     fs.rmSync(dir, { recursive: true, force: true });
     process.exit(code);
   }
   child.once('error', error => { console.error(error.message); cleanup(1); });
   child.once('exit', code => cleanup(code ?? 1));
-  for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => child.kill(signal));
+  for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => signalGroup(signal));
 })().catch(error => { console.error(error); process.exit(1); });
