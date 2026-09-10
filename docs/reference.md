@@ -2,11 +2,15 @@
 
 A work registry: mission control for tasks, experiments, and Claude Code/Codex sessions.
 One markdown file per task in `tasks/` — YAML frontmatter is machine state, the body
-is an append-only log (newest first). Every mutation is a git commit; manual terminal
-use pushes best-effort in the background.
+is an append-only log (newest first). Registry mutations create local Git commits;
+remote sync is optional and belongs on a private registry remote.
 
 
 ## Layout
+
+Application paths (`bin/` and `skills/`) live in the source checkout. Task and runtime
+paths live in your separate data directory (`~/keep` by default). Never commit
+registry data or credentials to the public source repository.
 
 - `bin/keep` — the CLI (sh launcher + `keep.js`, runs on Node; symlinked from `~/bin/keep`)
 - `tasks/` — live tasks, one `.md` per task
@@ -33,7 +37,7 @@ use pushes best-effort in the background.
 ```
 keep add "title" [--kind task|experiment|idea|chore|bug] [--tag t]… [--project p]
                  [--plan "step"…] [--check-after when] [--check "recipe"] [--status s] [-m note]
-keep checkin <id> -m "state + next step" [--next "text"] [--commit <sha>]... [--step <n|next>] [--status s] [--check-after when] [--clear-check-after]
+keep checkin <id> -m "state + next step" [--next "text"] [--commit <sha>]... [--step <n|next>] [--status s] [--check-after when] [--check "recipe"] [--clear-check-after] [--handoff waiting|needs-input]
 keep plan <id> [--set "step"… | --add "text" | --insert <n> "text" | --remove <n>
                 | --done <n> | --start <n> | --undo <n>]
 keep list [--status s]… [--tag t] [--project p] [--overdue] [--brief] [--all]
@@ -44,8 +48,8 @@ keep done <id> [-m note] [--next "text"] [--commit <sha>]...
 keep tag <id> +a -b
 keep tags
 keep overdue [--brief]
-keep who <project> [--json]
-keep hold <project> --for +15m -m "why" [--task <id>]
+keep who <project> [--json] [--scope <resource>]
+keep hold <project> --for +15m -m "why" [--task <id>] [--scope <resource>]...
 keep release <hold-id>
 keep holds
 keep steps [<project>] [--json]
@@ -54,7 +58,7 @@ keep step run <project> <step> [--sha <sha>] [--no-done]
 keep step done <project> <step> [--artifact <id>] [--sha <sha>] [--force] [-m note]
 keep step fail <project> <step> [--force] -m "why"
 keep step notify <project> <step>
-keep ask "<question>" [--about <project>] [--task <id>] [--timeout <min>]
+keep ask "<question>" [--owner] [--about <project>] [--task <id>] [--timeout <min>]
 keep answer <qid> -m "<answer>"
 keep questions [--all]
 keep alert -m "text" --level attention|urgent [--key k] [--card id] [--from name] [--dry]
@@ -90,13 +94,35 @@ keep review-stats [--json]                               # last tick, skips, per
 keep nudge <id> --session <sid> --key <k> -m "..." [--send]  # message a live agent (dry-run default)
 ```
 
+Claude subagent lifecycle tracking uses `keep hook lifecycle` for both
+`SubagentStart` and `SubagentStop` in Claude's user settings. These observation-only
+hooks write bounded, content-free records under `.keep/lifecycle/<session-id>`;
+they never block a turn or inject a message. The dashboard reconciles child
+transcripts when completion hooks are missing and falls back to existing transcript
+tracking for sessions that have not loaded the hooks. Existing Claude sessions may
+need to restart/resume before newly configured hooks take effect.
+
+`keep ask --owner` addresses the registry owner; `--jesse` remains a compatibility alias.
+
 `when`: `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`, `+15m`, `+3d`, `+12h`, `+2w`, `tomorrow`.
 
-Statuses: `inbox → active → waiting/blocked → review → done`. `waiting` requires
-`check_after` or an unresolved `depends_on` entry; `review` means the ball is in Owner's
+Statuses: `inbox → active → waiting/blocked → review/landing → done`. `waiting` requires
+`check_after` or an unresolved `depends_on` entry; `review` means the ball is in the owner's
 court with an artifact to look at.
-Experiments (`kind: experiment`) must have a `check_after` and ideally a `check` recipe
+Experiments (`kind: experiment`) must have a `check_after` and a `check` recipe
 an agent can execute cold.
+
+Scheduled recipes are polled every minute. `--check-after` plus a recipe records a
+turn-scoped waiting handoff; add `--handoff needs-input` when scheduling and also
+asking for a decision. A later turn invalidates that handoff. Card state is separate
+from conversation readiness: a live session that has proposed a next step belongs in
+Waiting on you even without a question. See the shared [Keep skill](../skills/keep/SKILL.md)
+and [status model](session-reliability.md). `keep help` is the complete command
+reference; this list is a quick overview.
+
+Testing: `npm run test:scenarios` replays deterministic session transitions for both
+agents; `npm run test:scenarios:browser` checks the isolated desktop-web UI.
+See [scenario testing](session-scenarios.md) for seeds and failure replay.
 
 `keep lint` runs advisory daily hygiene checks including `malformed-card`, scope tags,
 review next steps, waiting triggers, uncited commits, stale active work, old done cards,
@@ -113,7 +139,7 @@ set after push approval.
 Use `keep wait-on <your-card> <upstream> [<upstream>...]` when one card cannot continue
 until another finishes. It records `depends_on`, rejects missing cards and cycles, and
 moves active or review work to waiting. `keep deps [<card>]` shows resolved and pending
-edges. Do not use review for this: review is reserved for Owner's review.
+edges. Do not use review for this: review is reserved for the owner's review.
 
 When an upstream card becomes done, every completion path queues a local unblock record.
 The daemon appends the dependency result to the dependent card, returns a fully unblocked
@@ -140,19 +166,44 @@ The next incomplete step appears in `keep list`, `keep resume`, `keep show`, ses
 startup context, `keep who`, and fleet-review bundles. The full checklist stays above
 the newest-first card log so fresh agents and scheduled runs see the plan first.
 
+## Session restart
+
+Keep can resume a conversation in the same pane ID, preserving pins and history.
+Conservative restarts require a verified idle prompt, no draft or unresolved
+background work, and graceful process exit. Queued restarts wait until the pane
+has no viewers, can be cancelled, and survive daemon restart. Fleet reviewers
+require a separate coordinated restart. Explicit force-restart recovery has its
+own durable transaction and recovery checks; it is not ordinary idle cleanup.
+See the [session reliability contract](session-reliability.md) for restart proof
+and recovery behavior, and `keep help` for available commands.
+
+Resume uses the agent's saved conversation/settings; an explicit permission bypass
+is carried over only when the old process used it. Other one-off CLI overrides
+are not replayed. Existing sessions may need a controlled restart/resume to load
+new hooks; verify hook uptake separately from isolated tests.
+
 ## Auto-continue
 
-For interactive Claude sessions, the Stop hook blocks once when a card explicitly
-linked to that session is active and has a next plan step. Headless `claude -p` runs
+For interactive Claude and Codex sessions, the Stop hook blocks once when a card explicitly
+linked to that session is active and has a next plan step. Headless runs
 are never continued. It will not block while an `AskUserQuestion` or `ExitPlanMode`
 tool is unresolved, while Claude is in plan permission mode, or when the last non-empty
-assistant text asks Owner a question. It will not repeat for the same card, position,
+assistant text asks the owner a question. It will not repeat for the same card, position,
 and step text; advancing the plan enables the next reminder. A session is capped at 25
 continuations. The reminder fences the card's step text as data and clips it to 200
 characters rather than treating card content as instructions.
 `KEEP_AUTO_CONTINUE` defaults to `1`; set it to `0` to disable the feature globally, or
-add `autocontinue: off` to a card's frontmatter to opt that card out. Codex sessions are
-out of scope because their Stop hook protocol differs.
+add `autocontinue: off` to a card's frontmatter to opt that card out. Codex uses
+`keep hook codex stop` on Stop and `keep hook codex start` on SessionStart.
+Only a validated interactive root transcript may continue; child threads, pending
+tools, and unanswered synchronous or asynchronous questions are protected.
+The question PreToolUse matcher is `^(?:.*\.)?request_user_input(?:_async)?$`.
+
+Automatic Codex cleanup can retire parents with completed remote children only
+when the full, identity-checked descendant history proves completion and remains
+unchanged before exit. Missing/legacy child evidence, yielded commands and local
+child processes remain protected. The existing age, pin, viewer, draft and task
+guards still apply; explicit Close retains its separate graceful-then-force policy.
 
 Each continuation is appended to `.keep/continues.jsonl` with its card, session, step,
 text, and timestamp. Fleet-review bundles count those entries since the last review so
@@ -174,7 +225,7 @@ and expires automatically. Release it early with `keep release <hold-id>`.
 ## Alerts and the morning brief
 
 `keep alert` adds a judged push layer in front of Keep's cards. `attention` is for
-something Owner should see soon; `urgent` is for something that warrants an immediate
+something the owner should see soon; `urgent` is for something that warrants an immediate
 phone notification and speaker announcement. Every accepted or deferred alert is
 appended to `.keep/alerts.jsonl`, including each attempted channel's `ok`, `suppressed`,
 or `failed` outcome; `keep alerts` shows the last 24 hours and `--all`
@@ -378,7 +429,7 @@ eligible linked Claude or Codex thread. A successful delivery is recorded in
 `.keep/runs/<taskId>.delivered.json` for that exact `check_after`, so daemon restarts do
 not redeliver it; the thread must check in with `--clear-check-after` or reschedule it.
 An open linked thread remains eligible even after hours of inactivity. A thread that
-is mid-turn or waiting on Owner defers the check for 12 scheduler ticks by default
+is mid-turn or waiting on the owner defers the check for 120 scheduler ticks (about two hours) by default
 (`KEEP_DELIVER_MAX_DEFERRALS`) before a headless run takes over; if no linked pane is
 open, Keep falls back to headless immediately.
 Headless Keep runs disable `codex@openai-codex` by default; set
@@ -510,3 +561,34 @@ Two invariants the code enforces:
 
 Findings dedupe on `sha1(task, kind, normalized subject)` — never on the prose, which
 varies every tick — and go quiet for 24h unless the status or HEAD moves.
+
+## Per-card model usage
+
+`keep usage <card> [--json]` shows local Claude and Codex token usage by model.
+The card detail and console session header show the same expandable breakdown.
+`keep serve` collects every 30 seconds in a separate process; the first collection
+sets a durable start time. There is no historical backfill. Old transcript records
+are read only to establish counter baselines and suppress copied responses.
+
+Input, cache reads, cache writes, and output are disjoint buckets. Reasoning tokens
+are available in JSON and already included in output. These are reported tokens,
+not subscription charges or dollar estimates. `calls` counts distinct Claude
+responses and positive Codex usage deltas; a Codex delta can cover multiple calls
+if the transcript omitted intermediate usage events.
+
+A session claim records an accounting ownership transition independently of its
+movable resume link. Usage belongs to the card linked when the first usage record
+for that response was timestamped; later chunks update that response on the same
+card. Child sessions inherit the parent's card at spawn and retain it when the
+parent changes cards. Claude subagent paths, Codex parent metadata, and Keep's
+explicit Claude-to-Codex parent records provide those relationships. Unlinked or
+unresolved sessions remain unassigned instead of being guessed from a project.
+
+The local `.keep/card-usage/` directory contains the ownership timeline, a durable
+ledger of deduplicated usage records and byte checkpoints, and a dashboard summary.
+Keep's existing cross-process lock serializes collection and ownership changes;
+atomic replacement commits counts and checkpoints together. Totals survive
+restarts, card closure, and source transcript removal. Preserve this directory to
+preserve accounting; it is not synced through Git. Missing/corrupt evidence is
+reported as incomplete or as a `card-usage` health error, never silently reset.
+Only transcripts available on this machine can be measured.
