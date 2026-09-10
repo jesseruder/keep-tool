@@ -1,5 +1,8 @@
 'use strict';
 
+// Fixture ideas must never notify through the host's speakers or phone.
+process.env.KEEP_ALERT_CHANNELS = 'none';
+
 // The reviewer launcher exports KEEP_REVIEWER* into its shell; tests spawn the CLI
 // from process.env, so reviewer-only refusals fired inside them when run from that
 // session (17 spurious failures on 2026-09-02). Tests that need reviewer identity set

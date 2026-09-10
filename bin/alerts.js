@@ -225,6 +225,10 @@ function enabledChannels() {
 }
 
 function availableChannels(channels, root = DEFAULT_ROOT) {
+  // node --test propagates this to spawned fixture CLIs. Temporary registries
+  // still share the real speakers/webhook unless native delivery is disabled.
+  // Adapter tests can explicitly inject availableChannels and a fake deliver.
+  if (process.env.NODE_TEST_CONTEXT) return [];
   const enabled = enabledChannels();
   return channels.filter((channel) => {
     if (enabled && !enabled.has(channel)) return false;

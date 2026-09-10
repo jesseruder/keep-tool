@@ -15,6 +15,24 @@ const { EventEmitter } = require('node:events');
 const test = require('node:test');
 const { route, alertDecision, buildBrief, deliver, sendAlert, loadMeta, readAlerts } = require('./alerts.js');
 
+test('test runners and their fixture CLIs cannot enable real alert channels', (t) => {
+  assert.ok(process.env.NODE_TEST_CONTEXT);
+  const root = makeRoot('keep-test-alert-isolation-');
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const child = spawnSync(process.execPath, ['-e', `
+    const assert = require('node:assert/strict');
+    const alerts = require(${JSON.stringify(path.join(__dirname, 'alerts.js'))});
+    (async () => {
+      for (const [level, state] of [['attention', 'present'], ['attention', 'away'], ['urgent', 'away']]) {
+        const result = await alerts.sendAlert({ root: ${JSON.stringify(root)}, level, text: 'Fixture',
+          presence: { state }, deliver: async (entry) => { assert.deepEqual(entry.channels, []); return {}; } });
+        assert.deepEqual(result.channels, []);
+      }
+    })().catch(error => { console.error(error); process.exitCode = 1; });
+  `], { encoding: 'utf8', env: { ...process.env, KEEP_ALERT_CHANNELS: 'sound,push,speak', KEEP_PUSH_WEBHOOK: 'https://example.invalid/test' } });
+  assert.equal(child.status, 0, child.stderr);
+});
+
 test('route table covers attention presence and quiet, urgent, and brief', () => {
   const now = Date.parse('2026-09-02T08:00:00');
   assert.deepEqual(route('attention', { state: 'present' }, now), { channels: ['sound'], deferred: false });
