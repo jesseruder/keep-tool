@@ -7,7 +7,7 @@ async function ownsPane(sessionId, pane, deps = {}) {
   const codex = require('./codex');
   const meta = (deps.sessionMetaFor || codex.sessionMetaFor)(sessionId);
   if (!meta || (meta.id || meta.session_id) !== sessionId
-      || codex.isChildSession(meta) || meta.source === 'exec' || meta.originator === 'codex_exec') return false;
+      || codex.isChildSession(meta)) return false;
   const serve = require('./serve');
   const rows = await (deps.agentProcessRows || serve.agentProcessRows)();
   const live = await (deps.liveSessionPids || serve.liveSessionPids)({ agentProcessRows: async () => rows, codexRolloutOnly: true });

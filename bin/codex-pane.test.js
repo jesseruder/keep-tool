@@ -47,8 +47,10 @@ test('Codex conversation switches rebind the pane only with direct process and o
           }, close() {},
         }),
       });
-      assert.equal(record.bound, scenario === 'switch', scenario);
-      assert.equal(owner, scenario === 'switch' ? 'new' : 'old', scenario);
+      // An exec-origin history can be resumed by the interactive TUI.
+      const accepted = ['switch', 'headless'].includes(scenario);
+      assert.equal(record.bound, accepted, scenario);
+      assert.equal(owner, accepted ? 'new' : 'old', scenario);
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   }
 });
