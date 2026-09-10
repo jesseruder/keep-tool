@@ -1217,12 +1217,12 @@ function transcriptFileForSession(session) {
 
 function appendedBytes(file, offset) {
   const stat = fs.statSync(file);
-  if (stat.size <= offset) return { text: '', offset };
+  if (stat.size <= offset) return { text: '', offset, stat, bytesRead: 0 };
   const fd = fs.openSync(file, 'r');
   try {
     const buffer = Buffer.alloc(stat.size - offset);
     const read = fs.readSync(fd, buffer, 0, buffer.length, offset);
-    return { text: buffer.subarray(0, read).toString('utf8'), offset: offset + read };
+    return { text: buffer.subarray(0, read).toString('utf8'), offset: offset + read, stat, bytesRead: read };
   } finally {
     fs.closeSync(fd);
   }
@@ -1724,6 +1724,7 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
     via = swap ? configuredVia : null;
   }
   let result;
+  let compactDiagnostic;
   inFlightSwap = swap ? { ...swap, switchModel: via } : null;
   try {
     const file = (deps.transcriptFileForSession || transcriptFileForSession)(session);
@@ -1747,9 +1748,13 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
 
     if (!result) {
       const started = Date.now();
-      let offset = fs.statSync(file).size;
+      const initialStat = fs.statSync(file);
+      let offset = initialStat.size;
+      compactDiagnostic = require('./compact-trace').compactTrace(session);
+      compactDiagnostic.start(initialStat, offset);
       const confirmation = session.kind === 'codex' ? codexTypedTextVisible : claudeTypedTextVisible;
       await (deps.typeAndSubmit || typeAndSubmit)(target, compactCommand(instruction), confirmation, deps);
+      compactDiagnostic.submitted();
 
       const timeoutMs = envNumber('KEEP_COMPACT_TIMEOUT_MS', 240000);
       let appended = '';
@@ -1759,7 +1764,7 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
         // A too-short thread is refused on screen and never writes a marker; stop
         // instead of waiting out the timeout (seen live: "Not enough messages to compact.").
         let refusal = '';
-        try { refusal = compactRefusal(await readScreen(target, 30, false, deps)); } catch {}
+        try { refusal = compactRefusal(await readScreen(target, 30, false, deps)); } catch { compactDiagnostic.screenError(); }
         if (refusal) {
           process.stderr.write(`keep serve: compaction refused for ${session.kind} session ${sid}: ${refusal}\n`);
           result = { compacted: false, reason: refusal, via };
@@ -1767,6 +1772,7 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
         }
         const chunk = appendedBytes(file, offset);
         offset = chunk.offset;
+        compactDiagnostic.poll(chunk.stat, offset, chunk.bytesRead);
         appended = `${appended}${chunk.text}`;
         if (hasCompactionMarker(appended, session.kind)) {
           const ms = Date.now() - started;
@@ -1788,6 +1794,7 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
     process.stderr.write(`keep serve: compaction failed for ${session && session.kind || 'unknown'} session ${sid}: ${reason}\n`);
     result = { compacted: false, reason, via };
   } finally {
+    compactDiagnostic?.finish(result?.compacted ? 'marker-confirmed' : result?.reason === 'timeout' ? 'timeout' : 'failed');
     if (swap && pendingSwapFile) {
       let restored = false;
       try {
