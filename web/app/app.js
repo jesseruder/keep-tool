@@ -626,7 +626,7 @@ function renderTop() {
   const count = queueItems().filter((item) => !state.dismissed.has(itemKey(item))).length;
   setBadge(count + (data.notifications || []).filter((entry) => !entry.read).length);
   if (attentionSeeded) attentionSound.update(queueItems()
-    .filter((item) => !state.dismissed.has(itemKey(item))).map(attentionKey));
+    .filter((item) => !state.dismissed.has(itemKey(item))).map(eventKey));
   document.querySelector('#qcount').textContent = count;
   document.querySelector('#qcount').classList.toggle('zero', count === 0);
   const sessionCount = data.sessions?.length || 0;
