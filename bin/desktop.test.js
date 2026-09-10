@@ -20,6 +20,7 @@ test('startup subscribes despite a failed request, retries, and refreshes on rec
     },
     setTimeout(fn) { retry = fn; return 1; }, clearTimeout() { retry = null; },
     reloadGeneration: 0, appliedReloadGeneration: 0, layoutRevision: 0, layoutSavesPending: 0,
+    closingSessions: { reconcile() {} },
     data: {}, optimisticSetAside: new Map(), droppedPanes: new Set(),
     historyRestored: false, sessionHistory: {}, state: { mode: 'triage', focusMode: false },
     deriveDismissed() {}, applyLayouts() {}, applyStateEffects() {}, toast() {},

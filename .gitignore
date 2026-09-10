@@ -29,3 +29,6 @@ app/dist/
 *.jks
 *.keystore
 *.mobileprovision
+
+test-results/
+playwright-report/

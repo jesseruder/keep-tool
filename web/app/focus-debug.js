@@ -18,7 +18,7 @@ export function installFocusDebug(snapshot) {
     if (!timer) timer = setTimeout(flush, 500);
   };
   document.addEventListener('keydown', () => { lastInput = Date.now(); }, true);
-  for (const event of ['focusin', 'focusout', 'pointerdown']) document.addEventListener(event, (e) => log(event, { target: targetName(e.target), related: targetName(e.relatedTarget) }), true);
+  for (const event of ['focusin', 'focusout', 'pointerdown', 'pointerup', 'pointercancel', 'click']) document.addEventListener(event, (e) => log(event, { target: targetName(e.target), related: targetName(e.relatedTarget), targetKey: e.target?.closest?.('[data-key]')?.dataset.key || '', pointerId: e.pointerId, x: e.clientX, y: e.clientY }), true);
   for (const event of ['focus', 'blur']) window.addEventListener(event, () => log(`window-${event}`));
   document.addEventListener('visibilitychange', () => log('visibility'));
   log('loaded');

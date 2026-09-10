@@ -271,10 +271,14 @@ test('explicit Close overrides Codex child checks but automatic cleanup and iden
 test('Close UI sends exact target immediately and reports refusal without dismissing the session', async () => {
   const vm = require('node:vm');
   const writes = [], toasts = [];
+  const { createClosingSessions } = await import('../web/app/closing-sessions.js');
+  const closingSessions = createClosingSessions();
   let fail = false, refreshes = 0, pinned = true, unpins = 0;
   const context = vm.createContext({ write: async (...args) => { writes.push(args); if (fail) throw new Error('unsent draft'); return { closed: true }; } });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../web/app/close-session.js'), 'utf8').replace(/^import .*;\n/gm, '').replace('export async function', 'async function'), context);
-  const ctx = { toast: (text) => toasts.push(text), refresh: () => refreshes++, isPanePinned: () => pinned,
+  const ctx = { closingSessions, beginClose: (id, pane) => closingSessions.begin(id, pane),
+    reload: async () => { closingSessions.reconcile({ sessions: [], panes: [] }); refreshes++; },
+    toast: (text) => toasts.push(text), refresh: () => refreshes++, isPanePinned: () => pinned,
     pinPane: async (pane) => { assert.equal(pane, 'p'); unpins++; pinned = false; return true; } };
   const button = { disabled: false };
   await context.closeSession(ctx, 's', 'p', button);
@@ -287,12 +291,13 @@ test('Close UI sends exact target immediately and reports refusal without dismis
   fail = true;
   await context.closeSession(ctx, 's', 'p', button);
   assert.match(toasts.at(-1), /Not closed: unsent draft/);
-  assert.equal(refreshes, 1);
+  assert.equal(refreshes, 2);
+  assert.equal(closingSessions.has('s'), false);
   assert.equal(button.disabled, false);
   assert.equal(pinned, true);
   assert.equal(unpins, 1);
   fail = false;
   ctx.pinPane = async () => false;
   await context.closeSession(ctx, 's', 'p', button);
-  assert.match(toasts.at(-1), /Exit requested, but unpinning failed/);
+  assert.match(toasts.at(-1), /Session closed, but unpinning failed/);
 });

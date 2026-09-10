@@ -16,6 +16,7 @@ export function renderFleet(ctx) {
     if (!prior || Number(item.pri || 0) < Number(prior.pri || 0)) waitingBySession.set(item.sessionId, item);
   }
   for (const session of ctx.data.sessions || []) {
+    if (ctx.isClosingSession(session.id, session.pane)) continue;
     panesBySession.set(session.id, session.pane);
     const pane = session.pane ? panes.get(session.pane) : null;
     rows.push({
@@ -27,6 +28,7 @@ export function renderFleet(ctx) {
     });
   }
   for (const pane of ctx.data.panes || []) {
+    if (ctx.isClosingSession(pane.meta?.sessionId, pane.id)) continue;
     const sessionId = pane.meta?.sessionId;
     if (sessionId && panesBySession.has(sessionId)) continue;
     const agent = pane.meta?.agent;

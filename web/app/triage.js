@@ -434,7 +434,7 @@ export function renderTriage(ctx) {
   const visible = items.filter(matchesFilter);
   const waiting = visible.filter((item) => !ctx.state.dismissed.has(ctx.itemKey(item)));
   const sessions = [...ctx.runningItems(), ...ctx.pinnedItems(), ...ctx.recentItems(),
-    ...(ctx.data.sessions || []).filter((session) => !session.reviewer).map((session) => ({
+    ...(ctx.data.sessions || []).filter((session) => !session.reviewer && !ctx.isClosingSession(session.id, session.pane)).map((session) => ({
       kind: 'recent', sessionId: session.id, pane: session.pane, project: session.project,
       title: session.title, taskId: session.taskId, since: session.mtime, state: session.state,
     }))];

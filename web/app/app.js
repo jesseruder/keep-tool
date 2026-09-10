@@ -7,6 +7,8 @@ import { PALETTES, paletteById, swatches } from './palettes.js';
 import { applyTheme, getPalette, getPreference, onThemeChange, resolvedTheme, setPalette, setPreference, xtermTheme } from './theme.js';
 import * as api from './api.js';
 import { humanAttention, sessionLabel } from './status.js';
+import { createClosingSessions } from './closing-sessions.js';
+import { installInteractionGuard } from './interaction-guard.js';
 import { captureFocusIntent } from './focus-intent.js';
 import { mountTerminal } from './terminal.js';
 import { installFocusDebug } from './focus-debug.js';
@@ -124,6 +126,18 @@ onThemeChange((appearance) => {
   }
 });
 const droppedPanes = new Set();
+const closingSessions = createClosingSessions();
+const interactionGuard = installInteractionGuard(refresh);
+function isClosingSession(sessionId, pane) { return closingSessions.has(sessionId, pane); }
+function beginClose(sessionId, pane) {
+  if (!closingSessions.begin(sessionId, pane, paneMap().get(pane)?.pid)) return false;
+  if (state.currentItem?.sessionId === sessionId || state.currentItem?.pane === pane) {
+    state.currentItem = null; state.selectedKey = null; state.focused = false; state.focusPane = null;
+  }
+  if (state.historyTarget?.sessionId === sessionId) state.historyTarget = null;
+  refresh();
+  return true;
+}
 const renderedHTML = new WeakMap();
 let terminalRender = 0;
 let visibleTerminals = [];
@@ -166,7 +180,7 @@ function entityForPane(id) {
   };
 }
 function queueItems() {
-  return humanAttention(data).filter((item) => !state.sent.has(eventKey(item)))
+  return humanAttention(data).filter((item) => !isClosingSession(item.sessionId, item.pane) && !state.sent.has(eventKey(item)))
     .sort((a, b) => Number(a.pri || 0) - Number(b.pri || 0)
       || (typeof a.since === 'number' ? a.since : Date.parse(a.since) || 0) - (typeof b.since === 'number' ? b.since : Date.parse(b.since) || 0));
 }
@@ -184,7 +198,7 @@ function sessionItem(kind, session, pane = session.pane) {
 }
 function runningItems() {
   const sessions = (data.sessions || [])
-    .filter((session) => ['running', 'waiting'].includes(session.state) && !session.reviewer)
+    .filter((session) => ['running', 'waiting'].includes(session.state) && !session.reviewer && !isClosingSession(session.id, session.pane))
     .sort((a, b) => (typeof b.mtime === 'number' ? b.mtime : Date.parse(b.mtime) || 0)
       - (typeof a.mtime === 'number' ? a.mtime : Date.parse(a.mtime) || 0));
   return stableSessionOrder(sessions, runningOrder, new Set((data.sessions || []).map((session) => session.id)))
@@ -193,7 +207,7 @@ function runningItems() {
 function pinnedItems() {
   return (pinnedLayout()?.ids || []).flatMap((paneId) => {
     const pane = paneMap().get(paneId);
-    if (!pane) return [];
+    if (!pane || isClosingSession(pane.meta?.sessionId, paneId)) return [];
     const entity = entityForPane(paneId);
     if (!entity.session) return [{
       kind: 'pinned', pane: paneId, project: entity.project, title: entity.title, state: entity.state,
@@ -208,7 +222,7 @@ function recentSessionTime(session) {
 }
 function recentItems() {
   return (data.sessions || [])
-    .filter((session) => !session.reviewer && session.state !== 'running'
+    .filter((session) => !session.reviewer && !isClosingSession(session.id, session.pane) && session.state !== 'running'
       && (Number.isFinite(typeof session.lastUserAt === 'number' ? session.lastUserAt : Date.parse(session.lastUserAt)) || session.exited))
     .sort((a, b) => recentSessionTime(b) - recentSessionTime(a))
     .slice(0, 6)
@@ -219,6 +233,7 @@ function matchesTriageFilter(item) {
 }
 function triageVisible(item) { return (item.kind === 'pinned' || !state.dismissed.has(itemKey(item))) && matchesTriageFilter(item); }
 function retainedSelectionItem(item) {
+  if (isClosingSession(item?.sessionId, item?.pane)) return null;
   const session = sessionFor(item);
   if (state.historyTarget?.sessionId === item?.sessionId && matchesTriageFilter(item)) return session
     ? sessionItem('recent', session) : { ...state.historyTarget, kind: 'recent', pane: null, state: 'exited' };
@@ -632,6 +647,7 @@ function updateDockButton() {
 }
 
 function refresh() {
+  if (interactionGuard.defer()) return;
   terminalRender += 1;
   visibleTerminals = [];
   let focused;
@@ -713,6 +729,7 @@ async function reload() {
     if (generation < appliedReloadGeneration) return;
     appliedReloadGeneration = generation;
     data = nextData;
+    closingSessions.reconcile(data);
     void refreshProjectChoices();
     optimisticSetAside.clear();
     deriveDismissed();
@@ -774,7 +791,7 @@ function navigateHistory(entry, focus = true) {
 }
 
 const ctx = {
-  state, get data() { return data; }, esc, rel, projectOf, projectIcon, projectHTML, tagsHTML, knownProjects,
+  state, get data() { return data; }, closingSessions, isClosingSession, beginClose, esc, rel, projectOf, projectIcon, projectHTML, tagsHTML, knownProjects,
   queueItems, runningItems, pinnedItems, recentItems, triageItems, toggleCollapsed, toggleRunning, toggleRecent, setSelected,
   itemKey, triageKey, eventKey, sessionFor, taskFor, paneMap, entityForPane, kindLabel, limitResumeFor, toast, dismiss, restore, setAside, setAsideFor,
   pinPane, startShell, reopenSession, removePane, isPanePinned, knownPaneCount, saveLayouts, dropPane, mount, patchHTML, clearElement, refresh, reload,
@@ -928,6 +945,8 @@ function setSelected(index, explicit = false) {
   if (typeof index === 'string') {
     const key = index;
     index = items.findIndex((item) => triageKey(item) === key);
+    // A session can change section while its pressed row is held on screen.
+    if (index < 0) index = items.findIndex((item) => itemKey(item) === key.slice(key.indexOf(':') + 1));
     // A disappearing row is not permission to select its new neighbour.
     if (index < 0) return;
   }

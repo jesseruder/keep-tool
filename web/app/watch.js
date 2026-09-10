@@ -81,7 +81,7 @@ function renderEditor(ctx, layout) {
 
 function renderGrid(ctx, layout) {
   const grid = document.querySelector('#wgrid');
-  const panes = layout.ids.map((id) => ctx.paneMap().get(id)).filter(Boolean);
+  const panes = layout.ids.map((id) => ctx.paneMap().get(id)).filter((pane) => pane && !ctx.isClosingSession(pane.meta?.sessionId, pane.id));
   const columns = layout.cols || (panes.length <= 1 ? 1 : panes.length <= 4 ? 2 : 3);
   const gridKey = `${columns}:${panes.map((pane) => pane.id).join(',')}`;
   const gridChanged = grid.dataset.gridKey !== gridKey;

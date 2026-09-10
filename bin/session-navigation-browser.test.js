@@ -22,7 +22,6 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
   const state = { sessions, panes, tasks: sessions.map((s) => ({ id: s.taskId, fm: { tags: ['personal'] } })), attention: [], setAside: {}, health: {}, usage: {}, review: { events: [], stats: {} }, limitResume: {} };
   sessions.push({ id: 'recent-only', kind: 'claude', title: 'Recent only', project: '/tmp/recent-fixture', state: 'exited', exited: true, endedTurn: true, lastUserAt: Date.now() - 60000, mtime: Date.now() - 60000 });
   let shells = 0;
-  let lifecycleClose = false;
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://fixture');
     if (req.method === 'POST') posts.push(url.pathname);
@@ -51,7 +50,7 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
         const entry = { ...request, status: request.mode === 'cancel' ? 'cancelled' : 'queued', reason: 'Waiting until the pane is no longer being viewed' };
         state.restarts = [entry]; res.end(JSON.stringify(entry)); return;
       }
-      if (url.pathname === '/api/close-session' && lifecycleClose) {
+      if (url.pathname === '/api/close-session') {
         let body = ''; for await (const chunk of req) body += chunk;
         const request = JSON.parse(body);
         const session = sessions.find((s) => s.id === request.sessionId);
@@ -242,6 +241,14 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     assert.equal(await evaluate("document.querySelector('.mode.on').id"), 'watch', 'header focus preserves app-wide shortcuts');
     assert.ok(posts.includes('/api/close-session'));
     assert.ok(!posts.includes('/api/open'), 'navigation must not reopen processes');
+    // The first close is real in the fixture now. Model an external reopen for
+    // the later navigation cases instead of returning success with a live pane.
+    sessions[1] = { id: 'b', kind: 'claude', title: 'Session b reopened', project: '/tmp/history-fixture', taskId: 'card-b', pane: 'pb', mtime: Date.now(), state: 'running', endedTurn: false };
+    panes[1].alive = true;
+    panes[1].pid += 1;
+    for (const client of eventClients) client.write('data: changed\n\n');
+    await evaluate("document.querySelector('[data-mode=triage]').click()");
+    await wait("document.querySelector('#qlist [data-key=\"running:b\"]')");
     await evaluate("document.querySelector('[data-mode=triage]').click(); document.querySelector('#qlist [data-key=\"running:b\"]').click(); document.querySelector('#rail .collapse').click()");
     await wait("document.querySelector('#stage').dataset.pane === 'pb' && document.activeElement?.matches('.xterm-helper-textarea')");
     panes.push({ id: 'ps', alive: true, cwd: '/tmp/history-fixture', meta: { agent: 'shell', title: 'shell' } });
@@ -406,7 +413,6 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     await evaluate("document.querySelector('[data-mode=watch]').click(); document.querySelector('[data-mode=triage]').click(); document.body.dispatchEvent(new PointerEvent('pointerdown', {bubbles:true})); document.activeElement?.blur()");
     await evaluate('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
     assert.ok(await evaluate('document.activeElement === document.body'), 'a newer click on empty space cancels deferred terminal focus');
-    lifecycleClose = true;
     await evaluate("document.querySelector('#stage [data-close-session]').click()");
     await wait("document.querySelector('#toast').textContent.includes('Session closed')");
     await call('Page.reload');

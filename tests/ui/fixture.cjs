@@ -1,0 +1,129 @@
+'use strict';
+// Standalone fake backend. No daemon, registry, agent processes or real PTYs.
+const http = require('node:http');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { WebSocketServer } = require('ws');
+
+async function createFixture() {
+  const root = path.resolve(__dirname, '../..');
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-ui-fixture-'));
+  fs.writeFileSync(path.join(repo, 'README.md'), '# Disposable Keep UI test project\n');
+  const events = [], clients = new Set();
+  let revision = 0, ticks = 0, timer;
+  let closeDelay = 1200, closeFails = false, layoutFails = false;
+  const sessions = Array.from({ length: 12 }, (_, i) => {
+    const id = String.fromCharCode(97 + i);
+    return { id, kind: i % 2 ? 'codex' : 'claude', title: `Session ${id.toUpperCase()}`, project: repo,
+      taskId: `card-${id}`, pane: `p${id}`, mtime: Date.now() - i, lastUserAt: Date.now(), state: 'running', endedTurn: false };
+  });
+  const panes = sessions.map((s, i) => ({ id: s.pane, pid: 100 + i, alive: true, cwd: repo, meta: { agent: s.kind, sessionId: s.id } }));
+  let layouts = [{ name: 'Pinned', role: 'pinned', ids: ['pa', 'pb'], cols: 2 }];
+  const state = { sessions, panes, tasks: sessions.map(s => ({ id: s.taskId, fm: { tags: ['personal'] } })), attention: [],
+    setAside: {}, health: { daemon: { running: true } }, usage: {}, review: { events: [], stats: {} }, limitResume: {} };
+  const record = (event, detail = {}) => { events.push({ at: Date.now(), event, ...detail }); if (events.length > 5000) events.shift(); };
+  const publish = () => { revision++; record('state', { revision, sessions: sessions.map(s => ({ id: s.id, state: s.state })) }); for (const client of clients) client.write('data: changed\n\n'); };
+  function update(id, patch) { Object.assign(sessions.find(s => s.id === id), patch); publish(); }
+  function churn(on) {
+    clearInterval(timer);
+    if (on) timer = setInterval(() => {
+      ticks++;
+      const session = sessions[ticks % sessions.length];
+      if (session.exited) return;
+      session.state = ticks % 3 ? 'running' : 'waiting';
+      session.title = `Session ${session.id.toUpperCase()} · update ${ticks}`;
+      session.mtime = Date.now();
+      for (const socket of sockets.clients) if (socket.pane === session.pane) socket.send(Buffer.from(`\r\nupdate ${ticks}\r\nfixture ${session.id}> `));
+      publish();
+    }, 150);
+  }
+  const vendors = { '/vendor/xterm.js': 'node_modules/@xterm/xterm/lib/xterm.js', '/vendor/xterm.css': 'node_modules/@xterm/xterm/css/xterm.css',
+    '/vendor/addon-webgl.js': 'node_modules/@xterm/addon-webgl/lib/addon-webgl.js', '/vendor/addon-fit.js': 'node_modules/@xterm/addon-fit/lib/addon-fit.js', '/vendor/addon-search.js': 'node_modules/@xterm/addon-search/lib/addon-search.js' };
+  const server = http.createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url, 'http://fixture');
+      const json = (value, status = 200) => { res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' }); res.end(JSON.stringify(value)); };
+      let body = '';
+      for await (const chunk of req) { body += chunk; if (body.length > 100000) { json({ error: 'body too large' }, 413); return; } }
+      const input = body ? JSON.parse(body) : {};
+      // Reject cross-origin mutations, including drive-by requests to fixture controls.
+      if (req.method !== 'GET' && (req.headers.origin && req.headers.origin !== `http://${req.headers.host}` || req.headers['sec-fetch-site'] === 'cross-site')) { json({ error: 'wrong origin' }, 403); return; }
+      if (url.pathname === '/api/events') { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(': ready\n\n'); clients.add(res); res.on('close', () => clients.delete(res)); return; }
+      if (url.pathname === '/__fixture') { res.setHeader('content-type', 'text/html'); res.end('<h1>Keep UI sandbox</h1><p>Disposable fake sessions. No live agents.</p><p><a href="/app" target="_blank">Open test app</a></p><button onclick="fetch(\'/__fixture/control\',{method:\'POST\',body:JSON.stringify({churn:true})})">Start updates</button> <button onclick="fetch(\'/__fixture/control\',{method:\'POST\',body:JSON.stringify({churn:false})})">Stop updates</button><p><a href="/__fixture/events">Recorded events</a></p>'); return; }
+      if (url.pathname === '/__fixture/events') { json({ revision, events }); return; }
+      if (url.pathname === '/__fixture/control' && req.method === 'POST') {
+        if ('churn' in input) churn(input.churn);
+        if (Number.isFinite(input.closeDelay)) closeDelay = Math.max(0, Math.min(10000, input.closeDelay));
+        if ('closeFails' in input) closeFails = Boolean(input.closeFails);
+        if ('layoutFails' in input) layoutFails = Boolean(input.layoutFails);
+        if (input.id && sessions.some(s => s.id === input.id)) update(input.id, input.patch || {});
+        json({ ok: true, revision }); return;
+      }
+      if (url.pathname.startsWith('/api/')) {
+        record('request', { method: req.method, path: url.pathname, body: input });
+        if (url.pathname === '/api/state') { json(state); return; }
+        if (url.pathname === '/api/layouts') {
+          if (req.method === 'PUT') { if (layoutFails) { json({ error: 'Fixture layout failure' }, 500); return; } layouts = input.layouts; }
+          json({ layouts }); return;
+        }
+        if (url.pathname === '/api/project-icons') { json({ projects: {} }); return; }
+        if (url.pathname === '/api/ui-debug') { for (const e of input.events || []) record('ui', e); json({ ok: true }); return; }
+        if (url.pathname === '/api/sessionsummary') { json({ text: 'Fake session for interaction testing. Type freely; input is only echoed and recorded.', fresh: true }); return; }
+        if (url.pathname === '/api/close-session') {
+          const session = sessions.find(s => s.id === input.sessionId && s.pane === input.pane);
+          if (!session) { json({ error: 'Unknown fixture session/pane' }, 409); return; }
+          const fail = closeFails;
+          await new Promise(resolve => setTimeout(resolve, closeDelay));
+          if (fail) { json({ error: 'Fixture close failure' }, 500); return; }
+          Object.assign(session, { state: 'exited', exited: true, endedTurn: true });
+          panes.find(p => p.id === input.pane).alive = false;
+          state.attention = state.attention.filter(s => s.sessionId !== session.id);
+          publish(); json({ ok: true, closed: true, forced: false }); return;
+        }
+        if (url.pathname === '/api/setaside') { if (input.kind === 'clear') delete state.setAside[input.key]; else state.setAside[input.key] = { kind: input.kind, at: Date.now() }; json({ ok: true }); publish(); return; }
+        // Unsupported actions fail visibly instead of accidentally invoking real services.
+        json({ error: `Unsupported fixture endpoint: ${url.pathname}` }, 404); return;
+      }
+      const relative = vendors[url.pathname] || (url.pathname === '/' || url.pathname === '/app' ? 'web/app/index.html' : `web${url.pathname}`);
+      const file = path.resolve(root, relative);
+      const allowed = vendors[url.pathname] || file.startsWith(path.join(root, 'web') + path.sep);
+      if (!allowed || !fs.existsSync(file) || !fs.statSync(file).isFile()) { res.writeHead(404); res.end(); return; }
+      res.setHeader('content-type', file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : file.endsWith('.svg') ? 'image/svg+xml' : 'text/html');
+      res.end(fs.readFileSync(file));
+    } catch (error) { res.writeHead(500, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: error.message })); }
+  });
+  const sockets = new WebSocketServer({ noServer: true });
+  server.on('upgrade', (req, socket, head) => {
+    const url = new URL(req.url, 'http://fixture');
+    const pane = panes.find(p => `/ws/pane/${p.id}` === url.pathname);
+    if (!pane || req.headers.origin && req.headers.origin !== `http://${req.headers.host}`) { socket.destroy(); return; }
+    sockets.handleUpgrade(req, socket, head, client => {
+      client.pane = pane.id;
+      const attached = { ...pane, cols: 100, rows: 30, primary: url.searchParams.get('primary') === '1' ? url.searchParams.get('viewer') : null };
+      client.send(JSON.stringify({ t: 'attached', pane: attached }));
+      client.send(Buffer.from(`\x1b[2J\x1b[HFAKE SESSION ${pane.meta.sessionId.toUpperCase()}\r\nfixture> `));
+      client.send(JSON.stringify({ t: 'replay-end' }));
+      client.on('message', (bytes, binary) => {
+        if (binary) { record('input', { pane: pane.id, text: bytes.toString() }); client.send(bytes); return; }
+        const message = JSON.parse(bytes);
+        record('terminal', { pane: pane.id, ...message });
+        if (['primary', 'resize'].includes(message.t)) {
+          Object.assign(attached, { cols: message.cols, rows: message.rows });
+          if (message.t === 'primary') attached.primary = url.searchParams.get('viewer');
+          client.send(JSON.stringify({ t: 'pane', pane: attached }));
+        }
+      });
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  return { url: `http://127.0.0.1:${server.address().port}`, events, state, update, publish, churn,
+    configure: options => { if ('closeDelay' in options) closeDelay = options.closeDelay; if ('closeFails' in options) closeFails = options.closeFails; if ('layoutFails' in options) layoutFails = options.layoutFails; },
+    async close() { clearInterval(timer); for (const c of clients) c.end(); for (const c of sockets.clients) c.terminate(); sockets.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); fs.rmSync(repo, { recursive: true, force: true }); },
+  };
+}
+module.exports = { createFixture };
+if (require.main === module) createFixture().then(f => {
+  console.log(`Keep UI sandbox: ${f.url}/app\nControls: ${f.url}/__fixture`);
+  for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, async () => { await f.close(); process.exit(0); });
+});

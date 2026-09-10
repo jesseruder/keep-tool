@@ -44,3 +44,6 @@ A native format-only check handles clipboard images that WebKit does not expose;
 older Keep builds can still handle exposed PNG items, or use Control+V directly.
 Disconnected terminals ask for another paste after reconnecting instead of queuing
 an image shortcut against clipboard contents that may have changed.
+
+For isolated interaction tests and a native shell running fake sessions, see
+[Desktop interaction QA](../docs/ui-reliability.md).
