@@ -151,13 +151,17 @@ test('isolated browser: alert inbox, read persistence, card links and desktop cl
     await evaluate("document.querySelector('#notificationsPanel').close()");
     assert.equal(await evaluate('window.soundCalls'), 0, 'boot and inbox changes are silent');
     assert.ok(await evaluate("document.querySelector('#soundButton').nextElementSibling.id === 'notificationsButton' && !document.querySelector('#soundButton').hidden"));
-    const updateWaiting = async (count) => {
-      state.attention = sessions.slice(0, count).map((session) => ({ kind: 'input', sessionId: session.id, title: session.title, project: session.project, pri: 0, since: Date.now() }));
+    const updateWaiting = async (count, since = Date.now()) => {
+      state.attention = sessions.slice(0, count).map((session) => ({ kind: 'input', sessionId: session.id, title: session.title, project: session.project, pri: 0, since }));
       for (const client of eventClients) client.write('data: changed\n\n');
       await wait(`document.querySelector('#qcount').textContent === '${count}'`);
     };
     await updateWaiting(1);
     await wait('window.soundCalls === 1');
+    const firstSince = state.attention[0].since;
+    await updateWaiting(0);
+    await updateWaiting(1, firstSince);
+    assert.equal(await evaluate('window.soundCalls'), 1, 'restoring the same waiting event is silent');
     await updateWaiting(2);
     assert.equal(await evaluate('window.soundCalls'), 1, 'additional waiting items are silent');
     await evaluate("document.querySelector('#soundButton').focus()");

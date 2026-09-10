@@ -4,6 +4,7 @@ import { isDesktop, playAttentionSound } from './shell.js';
 export function installAttentionSound() {
   const button = document.querySelector('#soundButton');
   let previous;
+  const seen = new Set();
   let muted = false;
   try { muted = localStorage.getItem('keep-attention-muted') === '1'; } catch {}
   button.hidden = !isDesktop();
@@ -20,8 +21,13 @@ export function installAttentionSound() {
   });
   render();
   return {
-    update(count) {
-      const shouldPlay = previous === 0 && count > 0 && !muted;
+    update(keys) {
+      const count = keys.length;
+      // Keep event identities across empty snapshots: a refresh, dismissal or
+      // transient status change must not announce the same request again.
+      const hasNew = keys.some((key) => !seen.has(key));
+      for (const key of keys) seen.add(key);
+      const shouldPlay = previous === 0 && count > 0 && hasNew && !muted;
       previous = count;
       if (shouldPlay && isDesktop()) void playAttentionSound();
     },
