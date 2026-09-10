@@ -2496,6 +2496,9 @@ function recordReviewNote(taskId, opts, sessions, evidence) {
 // re-read forever. Silence is a normal outcome, not a skipped review.
 function reviewAck(taskId, message, opts) {
   const options = opts || {};
+  if (!options.withinLock) {
+    return keep.withLock(() => reviewAck(taskId, message, { ...options, withinLock: true }));
+  }
   const task = keep.loadTask(taskId);
   const state = commitState(taskId, { status: task.fm.status, bundle: options.bundle });
   if (message) {

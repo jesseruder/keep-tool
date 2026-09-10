@@ -256,6 +256,7 @@ test('project command canonicalizes worktrees without taking over card ownership
       const assert = require('node:assert/strict');
       const keep = require(${JSON.stringify(path.join(__dirname, 'keep.js'))});
       const review = require(${JSON.stringify(path.join(__dirname, 'review.js'))});
+      const staleBundle = review.loadState('project-test').pendingBundle;
       const lock = keep.withLock;
       keep.withLock = fn => lock(() => {
         const card = keep.loadTask('project-test');
@@ -264,6 +265,10 @@ test('project command canonicalizes worktrees without taking over card ownership
         keep.saveTask(card);
         return fn();
       });
+      assert.throws(() => review.reviewAck('project-test', null, { bundle: staleBundle }), /is stale/);
+      const card = keep.loadTask('project-test');
+      card.fm.project = ${JSON.stringify(f.main)};
+      keep.saveTask(card);
       assert.throws(() => review.buildBundle('project-test', { force: true }), /changed project while its bundle was building/);
       assert.match(review.loadState('project-test').pendingBundle, /^project-changed-/);
     `], { cwd: f.main, env, encoding: 'utf8' });
