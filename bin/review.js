@@ -2198,7 +2198,24 @@ function reviewIdea(title, opts) {
       throw error;
     }
   };
-  return options.withinLock ? land() : keep.withLock(land);
+  const result = options.withinLock ? land() : keep.withLock(land);
+  // Preserve the synchronous landing API used by ticks and sweeps. Delivery is
+  // best-effort, outside the filing rollback, and never uses the speakers.
+  // The separate caller exempts ideas from the reviewer finding budget; filing
+  // already limits ideas to three per day. Global attention limits still apply.
+  const deliveryError = (error) => process.stderr.write(`keep review-idea: alert delivery failed: ${error?.message || error}\n`);
+  try {
+    const delivery = require('./alerts.js').sendAlert({
+      root: keep.ROOT, level: 'attention', key: 'idea:' + result.task.id,
+      card: result.task.id, caller: 'reviewer-idea', from: 'reviewer',
+      text: result.task.fm.title + ' — ' + message.replace(/\s+/g, ' ').slice(0, 140),
+      withLock: options.withinLock ? undefined : keep.withLock,
+    });
+    Promise.resolve(delivery).then((out) => {
+      if (out && out.entry && out.entry.failed) deliveryError(new Error('no channel delivered'));
+    }).catch(deliveryError);
+  } catch (error) { deliveryError(error); }
+  return result;
 }
 
 // Use the daemon's process-backed registry, exactly as keep who does. Transcript

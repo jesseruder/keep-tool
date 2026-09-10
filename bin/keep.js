@@ -5012,8 +5012,14 @@ commands.digest = () => {
   console.log(md);
 };
 
-function buildDigest() {
-  const today = nowStamp().slice(0, 10);
+function buildDigest(options = {}) {
+  const now = options.now == null ? new Date() : new Date(options.now);
+  const today = stampOf(now).slice(0, 10);
+  // Match the existing recent-activity window: yesterday at 05:00 local time.
+  const since = new Date(now);
+  since.setDate(since.getDate() - 1);
+  since.setHours(5, 0, 0, 0);
+  const allTasks = loadAll(true);
   const tasks = loadAll(false);
   const lines = [`# Keep digest — ${today}`, ''];
   const section = (title, items, fmt) => {
@@ -5022,7 +5028,22 @@ function buildDigest() {
     for (const t of items) lines.push(fmt(t));
     lines.push('');
   };
-  const last = (t) => { const l = lastLogLine(t); return l ? ` — ${l}` : ''; };
+  const last = (t) => {
+    let line = lastLogLine(t);
+    const idea = line.match(/^Reviewer idea: (\S+)$/);
+    if (idea) {
+      try { line = loadTaskAnywhere(idea[1]).fm.title || line; } catch {}
+    }
+    return line ? ` — ${line}` : '';
+  };
+  const ideas = allTasks.filter((t) => t.fm.kind === 'idea').map((task) => {
+    const created = String(task.body || '').match(/^## (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) — created\n([\s\S]*?)(?=^## |(?![\s\S]))/m);
+    const at = Date.parse(created ? created[1].replace(' ', 'T') : task.fm.created);
+    const proposal = created ? created[2].trim().replace(/\s+/g, ' ').match(/^.*?[.!?](?:\s|$)|^.+$/)?.[0].trim() || '' : '';
+    return { task, at, proposal };
+  }).filter((idea) => idea.at >= since.getTime() && idea.at <= now.getTime())
+    .sort((a, b) => b.at - a.at);
+  section('Ideas', ideas, ({ task, proposal }) => `- **${task.fm.title}**${proposal ? ` — ${proposal}` : ''}`);
   section('Needs you', tasks.filter((t) => t.fm.status === 'review'), (t) => `- **${t.id}**: ${t.fm.title}${last(t)}`);
   section('Overdue checks', tasks.filter(isOverdue), (t) => `- **${t.id}**: ${t.fm.title} — due ${t.fm.check_after.replace('T', ' ')}`);
   section('Blocked', tasks.filter((t) => t.fm.status === 'blocked'), (t) => `- **${t.id}**: ${t.fm.title}${last(t)}`);

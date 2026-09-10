@@ -406,6 +406,13 @@ function buildBrief(input) {
   const lastBriefAt = Number(input.lastBriefAt || 0);
   const reviewCards = (input.tasks || []).filter((task) => task.fm && task.fm.status === 'review')
     .sort((a, b) => String(a.fm.updated || a.fm.created || '').localeCompare(String(b.fm.updated || b.fm.created || '')));
+  const ideaCreatedAt = (task) => {
+    const stamp = String(task.body || '').match(/^## (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) — created$/m)?.[1];
+    return Date.parse(stamp ? stamp.replace(' ', 'T') : task.fm.created);
+  };
+  const ideas = (input.tasks || []).filter((task) => task.fm
+    && (task.fm.tags || []).includes('reviewer-idea') && ['active', 'review'].includes(task.fm.status))
+    .sort((a, b) => (ideaCreatedAt(b) || 0) - (ideaCreatedAt(a) || 0));
   const allOpenQuestions = (input.questions || []).filter((question) => question && question.status === 'open' && !question.answer);
   // A `--jesse` question is an agent parked on a decision only he can make, so it
   // gets its own block above reviewer traffic: answering it restarts a session.
@@ -462,6 +469,7 @@ function buildBrief(input) {
     countLabel(overdue.length, 'overdue check'),
     countLabel(deferred.length, 'deferred alert'),
     countLabel(findings.length, 'finding'),
+    countLabel(ideas.length, 'idea'),
     countLabel(unblocked.length, 'unreported unblock'),
     ...(shadow.length ? [countLabel(shadow.length, 'shadow decision')] : []),
   ];
@@ -479,6 +487,15 @@ function buildBrief(input) {
   add('Overdue', overdue.map((task) => `${oneLine(task.fm.title, 110)} — ${task.fm.check_after}`));
   add('Deferred alerts', deferred.map((alert) => `${alert.level}: ${oneLine(alert.text, 130)}${alert.why ? ` (${oneLine(alert.why, 50)})` : ''}`));
   add('Reviewer findings', findings.map((finding) => `${finding.severity} ${oneLine(finding.card, 50)}: ${oneLine(finding.text || finding.kind, 100)}`));
+  if (ideas.length) {
+    const rows = ideas.slice(0, 10).map((task) => {
+      const created = ideaCreatedAt(task);
+      const age = Number.isFinite(created) ? Math.max(0, Math.floor((now - created) / DAY_MS)) : 0;
+      return `- ${oneLine(task.fm.title, 100)} — ${countLabel(age, 'day')} old`;
+    });
+    if (ideas.length > 10) rows.push(`- …and ${ideas.length - 10} more (keep list)`);
+    sections.push(`Ideas awaiting a decision (${ideas.length})\n${rows.join('\n')}`);
+  }
   if (hygiene.length) {
     const rows = hygiene.slice(0, 5).map((finding) =>
       `- ${finding.severity} ${oneLine(finding.rule, 40)} ${oneLine(finding.id, 55)} — ${oneLine(finding.text, 100)}`);
