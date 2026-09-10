@@ -26,12 +26,12 @@ function read(file) {
   try { const rows = JSON.parse(fs.readFileSync(file, 'utf8')); return Array.isArray(rows) ? rows : []; } catch { return []; }
 }
 
-function createManager({ file, inspect, restart, onChange = () => {} }) {
+function createManager({ file, inspect, restart, forceRestart, onChange = () => {} }) {
   let entries = read(file).map((entry) => entry.status === 'restarting'
-    ? { ...entry, status: 'failed', reason: 'Daemon stopped during restart; inspect the session before retrying' } : entry);
+    ? { ...entry, status: entry.mode === 'force' && entry.original ? 'recovery-needed' : 'failed', reason: 'Daemon stopped during restart; inspect the session before retrying' } : entry);
   let busy = false;
   const save = () => {
-    const active = (e) => ['queued', 'restarting'].includes(e.status);
+    const active = (e) => ['queued', 'restarting', 'recovery-needed'].includes(e.status);
     const history = new Set(entries.filter((e) => !active(e) && Date.now() - e.at < 86400e3).slice(-100));
     entries = entries.filter((e) => active(e) || history.has(e));
     fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -45,6 +45,12 @@ function createManager({ file, inspect, restart, onChange = () => {} }) {
     if (busy) return entry;
     busy = true;
     try {
+      if (entry.mode === 'force') {
+        if (!forceRestart) throw Error('Force restart unavailable');
+        entry.status = 'restarting'; entry.reason = ''; save();
+        entry.result = await forceRestart(entry, save);
+        entry.status = 'done'; entry.at = Date.now(); save(); return entry;
+      }
       const { session, pane } = await inspect(entry);
       if (entry.status !== 'queued') return entry;
       // A missing observation (for example while the host reconnects) is not
@@ -62,7 +68,8 @@ function createManager({ file, inspect, restart, onChange = () => {} }) {
       entry.status = 'done'; entry.result = result; entry.at = Date.now(); save();
       return entry;
     } catch (error) {
-      entry.status = entry.mode === 'idle' && error instanceof RestartDeferred ? 'queued' : 'failed';
+      entry.status = entry.mode === 'force' && entry.original ? 'recovery-needed'
+        : entry.mode === 'idle' && error instanceof RestartDeferred ? 'queued' : 'failed';
       entry.reason = error.message; entry.at = Date.now(); save();
       return entry;
     } finally { busy = false; }
@@ -70,20 +77,32 @@ function createManager({ file, inspect, restart, onChange = () => {} }) {
   return {
     snapshot: () => entries.map((e) => ({ ...e })),
     async request(body) {
-      if (!/^[a-z0-9_-]+$/i.test(body?.sessionId || '') || !/^[a-z0-9_-]+$/i.test(body?.pane || '') || !['now', 'idle', 'cancel'].includes(body.mode)) throw Error('Expected exact session, pane and restart mode');
+      if (!/^[a-z0-9_-]+$/i.test(body?.sessionId || '') || !/^[a-z0-9_-]+$/i.test(body?.pane || '') || !['now', 'idle', 'cancel', 'force', 'recover'].includes(body.mode)) throw Error('Expected exact session, pane and restart mode');
+      if (['force', 'recover'].includes(body.mode) && body.confirmInterruption !== true) throw Error('Explicit interruption confirmation required');
+      const recovery = entries.find(e => e.sessionId === body.sessionId && e.status === 'recovery-needed');
+      if (recovery) {
+        if (body.mode !== 'recover' || body.pane !== recovery.pane) throw Error('Interrupted restart requires explicit recovery');
+        recovery.status = 'queued'; recovery.reason = ''; save(); return recovery;
+      }
+      if (body.mode === 'recover') throw Error('No interrupted restart to recover');
       const existing = entries.find((e) => e.sessionId === body.sessionId && ['queued', 'restarting'].includes(e.status));
       if (body.mode === 'cancel') {
         if (existing?.status === 'restarting') throw Error('Restart has already started');
+        if (existing?.original) throw Error('Interrupted restart requires explicit recovery');
         if (existing) { existing.status = 'cancelled'; save(); }
         return existing || { status: 'cancelled' };
       }
-      if (existing) return existing;
-      if (entries.filter((e) => ['queued', 'restarting'].includes(e.status)).length >= 50) throw Error('Restart queue is full');
+      if (existing) {
+        if (existing.mode !== body.mode || existing.pane !== body.pane) throw Error('A different restart is already pending; cancel it first');
+        return existing;
+      }
+      if (entries.filter((e) => ['queued', 'restarting', 'recovery-needed'].includes(e.status)).length >= 50) throw Error('Restart queue is full');
       const { session, pane } = await inspect(body);
       const raced = entries.find((e) => e.sessionId === body.sessionId && ['queued', 'restarting'].includes(e.status));
       if (raced) return raced;
       if (!session || !pane?.alive || pane.meta?.sessionId !== body.sessionId || session.reviewer) throw Error('Expected a live non-reviewer session in this pane');
-      const entry = { sessionId: body.sessionId, pane: body.pane, pid: pane.pid, mode: body.mode, status: 'queued', at: Date.now() };
+      const entry = { sessionId: body.sessionId, pane: body.pane, pid: pane.pid, mode: body.mode, status: 'queued', at: Date.now(),
+        ...(body.mode === 'force' ? { token: require('node:crypto').randomUUID() } : {}) };
       entries.push(entry); save();
       return body.mode === 'now' ? run(entry) : entry;
     },

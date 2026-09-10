@@ -25,6 +25,7 @@ version; automatic editing of Codex hook settings is not included in this releas
 Configure the supported events in your installation to invoke these adapters:
 
 - `keep hook codex start`
+- `keep hook codex lifecycle` (normalized lifecycle/job evidence; wire supported lifecycle events alongside the specialized adapters)
 - `keep hook codex question`
 - `keep hook codex approval`
 - `keep hook codex complete`

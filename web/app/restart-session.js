@@ -2,6 +2,7 @@ import { write } from './api.js';
 
 export function restartControls(ctx, sessionId) {
   const entry = [...(ctx.data.restarts || [])].reverse().find((e) => e.sessionId === sessionId);
+  if (entry?.status === 'recovery-needed') return `<span title="${ctx.esc(entry.reason || '')}">Restart interrupted; recovery required</span>`;
   // A failed attempt belongs to its original process, not every later resume
   // of this conversation. Preserve history; do not claim a successful restart.
   const live = (ctx.data.panes || []).filter(p => p.alive === true && p.agentAlive !== false && p.meta?.sessionId === sessionId

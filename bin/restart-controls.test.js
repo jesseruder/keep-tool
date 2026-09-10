@@ -20,10 +20,11 @@ test('restart failure labels belong to the original process, not a later resume'
   entry.status = 'restarting'; assert.match(render([{ ...pane, pid: 20 }]), /Restarting/);
 });
 test('headers offer no restart buttons, but queued restarts remain cancellable', () => {
-  for (const status of [undefined, 'done', 'failed', 'cancelled', 'queued', 'restarting']) {
+  for (const status of [undefined, 'done', 'failed', 'cancelled', 'queued', 'restarting', 'recovery-needed']) {
     const html = context.restartControls({ data: { restarts: status ? [{ sessionId: 's', status, reason: 'reason' }] : [] }, esc: s => s }, 's');
     assert.doesNotMatch(html, /data-restart="(?:now|idle)"/);
     assert.equal(html.includes('data-restart="cancel"'), status === 'queued');
     if (!status || ['done', 'cancelled'].includes(status)) assert.equal(html, '');
+    if (status === 'recovery-needed') assert.match(html, /recovery required/);
   }
 });

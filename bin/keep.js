@@ -5296,6 +5296,19 @@ commands['restart-daemon'] = async (argv) => {
   console.log(`Daemon ${result.pid} is restarting under launchd; terminal sessions are preserved.`);
 };
 
+commands['force-restart'] = async argv => {
+  const o = parseArgs(argv, { pane: 'str', recover: 'bool' });
+  const sessionId = o._[0];
+  if (o._.length !== 1 || !/^[a-z0-9_-]+$/i.test(sessionId || '') || !/^[a-z0-9_-]+$/i.test(o.pane || '')) {
+    die('usage: keep force-restart <session-id> --pane <pane-id> [--recover]');
+  }
+  const response = await postKeepApi('/api/restart-session', { sessionId, pane: o.pane,
+    mode: o.recover ? 'recover' : 'force', confirmInterruption: true });
+  const result = JSON.parse(response.data);
+  if (response.status !== 200) die(result.error || 'Force restart refused');
+  console.log(`Force restart ${result.status}; daemon owns recovery. Inspect /api/state restarts for outcome.`);
+};
+
 async function connectHost(deps = {}) {
   try {
     return await (deps.connectHost || require('./hostclient.js').connect)({ sock: deps.sock });
@@ -5825,6 +5838,7 @@ ${stepUsage()}
   keep digest            # write digests/YYYY-MM-DD.md and print it
   keep serve             # start the dashboard server (KEEP_PORT, default 7777)
   keep restart-daemon    # guarded daemon-only restart (requires launchd KeepAlive)
+  keep force-restart <session-id> --pane <pane-id> [--recover]    # explicit interruption; never automatic cleanup
   keep review-queue [--limit n] [--min-score n] [--json]   # what deserves review now
   keep review-bundle <id> [--budget n] [--session id] [--force]
   keep review-bundle <id> [<id>...] [--budget n] [--total-budget n] [--force]

@@ -3,6 +3,29 @@ const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { refusal, createManager, RestartDeferred } = require('./session-restart');
 
+test('explicit force requests are durable and interrupted transactions require explicit recovery', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-force-manager-')), file = path.join(root, 'queue.json');
+  try {
+    let closed = false, saves = 0;
+    const inspect = async () => ({ session: { id: 's', endedTurn: false }, pane: { id: 'p', pid: 10, alive: true, meta: { sessionId: 's' } } });
+    let manager = createManager({ file, inspect, restart: () => { throw Error('must not use idle path'); }, forceRestart: async (entry, save) => {
+      entry.original = { pid: 10 }; entry.phase = 'closed'; save(); closed = true; throw Error('cleanup interrupted');
+    } });
+    await assert.rejects(manager.request({ sessionId: 's', pane: 'p', mode: 'force' }), /confirmation/);
+    await manager.request({ sessionId: 's', pane: 'p', mode: 'force', confirmInterruption: true });
+    assert.equal(closed, false, 'request returns before closing its caller');
+    await manager.tick(); assert.equal(manager.snapshot()[0].status, 'recovery-needed');
+    assert.equal(JSON.parse(fs.readFileSync(file))[0].phase, 'closed');
+    manager = createManager({ file, inspect: () => { throw Error('closed pane need not be live'); }, restart: () => {}, forceRestart: async entry => { saves++; return { pid: 20 }; } });
+    await assert.rejects(manager.request({ sessionId: 's', pane: 'p', mode: 'force', confirmInterruption: true }), /recovery/);
+    await manager.request({ sessionId: 's', pane: 'p', mode: 'recover', confirmInterruption: true });
+    await manager.tick(); assert.equal(manager.snapshot()[0].status, 'done'); assert.equal(saves, 1);
+    fs.writeFileSync(file, JSON.stringify([{ sessionId: 's', mode: 'force', status: 'restarting', original: { pid: 10 }, at: Date.now() }]));
+    manager = createManager({ file, inspect, restart: () => {} });
+    assert.equal(manager.snapshot()[0].status, 'recovery-needed');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('pre-input safety races stay queued, persist and retry, while hard failures do not', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-restart-race-'));
   const file = path.join(root, 'queue.json');

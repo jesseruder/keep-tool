@@ -2351,6 +2351,49 @@ async function restartSession(body, deps = {}) {
   });
 }
 
+async function forceRestartSession(entry, save, deps = {}) {
+  return (deps.withInjectionLock || withInjectionLock)(async () => {
+    const host = (type, params) => hostRequest(type, params, deps);
+    if (!(await host('hello')).replaceExited) throw Error('Terminal host must be refreshed before restarting sessions');
+    const initial = (await host('get', { pane: entry.pane })).pane;
+    const cwd = entry.original?.cwd || initial?.cwd;
+    if (!cwd || !fs.statSync(cwd).isDirectory()) throw Error('Session directory is unavailable');
+    const rows = deps.forceRows || (async () => {
+      const result = await execFileAsync('ps', ['-axo', 'pid=,ppid=,tty=,lstart=,stat=,args='], {
+        encoding: 'utf8', timeout: 5000, maxBuffer: 32e6, env: { ...process.env, LC_ALL: 'C' },
+      });
+      return String(result.stdout).split('\n').flatMap(line => {
+        const m = PS_TABLE_RE.exec(line);
+        if (!m) return [];
+        const state = /^(\S+)\s+(.*)$/.exec(m[5]);
+        if (!state) return [];
+        return parseProcessTable(`${m[1]} ${m[2]} ${m[3]} ${m[4]} ${state[2]}`).map(p => ({ ...p, zombie: state[1].includes('Z') }));
+      });
+    });
+    return require('./force-restart').run(entry, {
+      save, rows, sleep: deps.sleep,
+      verifyStarted: original => (deps.waitForHostAgent || waitForHostAgent)({ pane: entry.pane }, original.agent, deps),
+      getPane: async pane => (await host('get', { pane })).pane,
+      close: body => require('./manual-close').manualClose(body, {
+        getPane: async pane => (await host('get', { pane })).pane,
+        graceful: request => (deps.closeIdleSession || closeIdleSession)(request, { ...deps, closePolicy: { manual: true }, withInjectionLock: fn => fn() }),
+        signal: (pane, signal) => host('kill', { pane, signal }),
+      }),
+      signal: async (pid, signal) => { try { process.kill(pid, signal); } catch (e) { if (e.code !== 'ESRCH') throw e; } },
+      sessionLive: async sid => (await liveSessionPids({ ...deps, agentProcessRows: rows })).has(sid),
+      replace: async (original, job) => {
+        const bypass = original.agent === 'codex' ? '--dangerously-bypass-approvals-and-sandbox' : '--dangerously-skip-permissions';
+        const argv = [original.agent, ...(original.bypass ? [bypass] : []), original.agent === 'codex' ? 'resume' : '--resume', job.sessionId];
+        const stopped = (await host('get', { pane: job.pane })).pane;
+        const result = await host('replace-exited', { paneId: job.pane, expectedPid: job.pid, sessionId: stopped.meta?.sessionId,
+          cmd: '/bin/zsh', args: ['-lic', `exec ${argv.map(shellQuoteArg).join(' ')}`], cwd: original.cwd,
+          cols: original.cols, rows: original.rows, meta: { ...original.meta, forceRestartToken: job.token, restartedAt: Date.now() } });
+        return { ok: true, pane: result.pane.id, pid: result.pane.pid, sessionId: job.sessionId };
+      },
+    });
+  });
+}
+
 async function closeIdleSession(body, deps = {}) {
   if (!/^[A-Za-z0-9_-]+$/.test(String(body.sessionId || '')) || !/^[A-Za-z0-9_-]+$/.test(String(body.pane || ''))) throw new InjectionError(400, 'Expected an exact session and pane');
   return (deps.withInjectionLock || withInjectionLock)(async () => {
@@ -4460,7 +4503,7 @@ function start(deps = {}) {
       const state = await addHostSessionState(await buildState({ hostPanes: panes }), { panes });
       return { session: state.sessions.find((s) => s.id === body.sessionId), pane: panes?.find((p) => p.id === body.pane) };
     },
-    restart: restartSession, onChange: broadcast,
+    restart: restartSession, forceRestart: forceRestartSession, onChange: broadcast,
   });
   // Queued idle restarts need fresh safety evidence, but scanning the fleet every
   // two seconds competes with foreground work. Explicit restart-now stays immediate.
@@ -4957,6 +5000,7 @@ module.exports = {
   claudeTypedTextVisible,
   closeIdleSession,
   restartSession,
+  forceRestartSession,
   applyHostedExitState,
   closeExitedCodexShell,
   scanSessions,
