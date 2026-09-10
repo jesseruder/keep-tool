@@ -4,9 +4,13 @@
 // Only its open rollout and process ancestry can authorize replacing a binding.
 async function ownsPane(sessionId, pane, deps = {}) {
   if (!pane?.alive || !Number.isInteger(pane.pid)) return false;
+  const codex = require('./codex');
+  const meta = (deps.sessionMetaFor || codex.sessionMetaFor)(sessionId);
+  if (!meta || (meta.id || meta.session_id) !== sessionId
+      || codex.isChildSession(meta) || meta.source === 'exec' || meta.originator === 'codex_exec') return false;
   const serve = require('./serve');
   const rows = await (deps.agentProcessRows || serve.agentProcessRows)();
-  const live = await (deps.liveSessionPids || serve.liveSessionPids)({ agentProcessRows: async () => rows });
+  const live = await (deps.liveSessionPids || serve.liveSessionPids)({ agentProcessRows: async () => rows, codexRolloutOnly: true });
   const identity = live.get(sessionId);
   if (identity?.agent !== 'codex' || identity.source !== 'rollout' || !identity.primary) return false;
   const byPid = new Map(rows.map(row => [row.pid, row]));

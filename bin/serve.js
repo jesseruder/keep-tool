@@ -1977,6 +1977,8 @@ async function liveSessionPids(deps = {}) {
 
   // Explicit resume argv is the strongest process-to-session identity.
   for (const row of interactive) {
+    // A pane switch needs current open-file evidence; launch argv survives /new.
+    if (deps.codexRolloutOnly && row.agent === 'codex') continue;
     const match = row.agent === 'claude'
       ? /(?:^|\s)--(?:resume|session-id)\s+([A-Za-z0-9_-]+)(?=\s|$)/.exec(row.args)
       : /(?:^|\s)(?:\S*\/)?codex\s+(?:--?[A-Za-z0-9-]+(?:=\S*)?\s+)*resume\s+([A-Za-z0-9_-]+)(?=\s|$)/.exec(row.args);
