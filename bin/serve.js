@@ -104,10 +104,13 @@ function writeSetAside(value, root = keep.ROOT) {
 }
 
 function setAsideEntryValid(entry) {
-  return entry && (entry.kind === 'dismiss' || entry.kind === 'snooze')
+  return entry && ['dismiss', 'snooze', 'dependency'].includes(entry.kind)
     && Number.isFinite(entry.at)
     && (typeof entry.since === 'number' || typeof entry.since === 'string')
-    && (entry.kind === 'dismiss' ? entry.until === null : Number.isFinite(entry.until));
+    && (entry.kind === 'snooze' ? Number.isFinite(entry.until) : entry.until === null)
+    && (entry.kind !== 'dependency' || (typeof entry.taskId === 'string'
+      && Array.isArray(entry.dependencies) && entry.dependencies.length > 0
+      && entry.dependencies.every((id) => typeof id === 'string')));
 }
 
 function attentionSince(value) {
@@ -117,6 +120,11 @@ function attentionSince(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function dependencyAsideContext(session) {
+  const dependencies = session?.activity?.background?.dependencies || [];
+  return dependencies.length ? { taskId: session.taskId, dependencies: [...new Set(dependencies)].sort() } : {};
+}
+
 function setAsideCandidates(attention, sessions) {
   const represented = new Set(attention.map((item) => item.sessionId).filter(Boolean));
   const bySession = new Map(sessions.map((session) => [session.id, session]));
@@ -124,6 +132,7 @@ function setAsideCandidates(attention, sessions) {
     ...attention.map((item) => {
       const lastUserAt = bySession.get(item.sessionId)?.lastUserAt;
       if (Number.isFinite(lastUserAt)) item.lastUserAt = lastUserAt;
+      Object.assign(item, dependencyAsideContext(bySession.get(item.sessionId)));
       return item;
     }),
     ...sessions.filter((session) => !session.reviewer && !represented.has(session.id)).map((session) => ({
@@ -131,6 +140,7 @@ function setAsideCandidates(attention, sessions) {
       sessionId: session.id,
       since: session.rateLimit?.at || session.attentionAt || session.mtime,
       synthetic: true,
+      ...dependencyAsideContext(session),
       ...(Number.isFinite(session.lastUserAt) ? { lastUserAt: session.lastUserAt } : {}),
     })),
   ];
@@ -159,6 +169,12 @@ function applySetAside(attention, options = {}) {
       continue;
     }
     const item = current.get(key);
+    if (entry.kind === 'dependency' && (!item || item.taskId !== entry.taskId
+        || JSON.stringify(item.dependencies) !== JSON.stringify(entry.dependencies)
+        || (Number.isFinite(item.lastUserAt) && item.lastUserAt > entry.at))) {
+      changed = true;
+      continue;
+    }
     const itemSince = item && attentionSince(item.since);
     const entrySince = attentionSince(entry.since);
     if (!item || (itemSince !== null && entrySince !== null && itemSince > entrySince)) {
@@ -179,7 +195,7 @@ function parseSetAsideRequest(body) {
   }
   const keys = Object.keys(body);
   const allowed = body.kind === 'snooze' ? ['key', 'kind', 'minutes'] : ['key', 'kind'];
-  if (!['dismiss', 'snooze', 'clear'].includes(body.kind)
+  if (!['dismiss', 'snooze', 'dependency', 'clear'].includes(body.kind)
       || typeof body.key !== 'string' || !body.key.trim() || body.key.length > 4096
       || keys.some((key) => !allowed.includes(key))
       || (body.kind !== 'snooze' && keys.length !== 2)
@@ -202,7 +218,11 @@ function updateSetAside(body, attention, options = {}) {
   }
   const item = attention.find((candidate) => (candidate.key || attentionItemKey(candidate)) === input.key);
   if (!item) throw new InjectionError(400, 'unknown attention key');
+  if (input.kind === 'dependency' && (!item.taskId || !item.dependencies?.length)) {
+    throw new InjectionError(400, 'session has no unresolved dependencies');
+  }
   const entry = {
+    ...(input.kind === 'dependency' ? { taskId: item.taskId, dependencies: [...item.dependencies] } : {}),
     kind: input.kind,
     until: input.kind === 'snooze' ? now + input.minutes * 60e3 : null,
     at: now,

@@ -510,6 +510,36 @@ test('set-aside pruning drops gone dismissals and resurfaces a newer event', () 
   assert.deepEqual(attention.map((item) => item.setAside), [null, 'dismiss']);
 });
 
+test('dependency acknowledgement persists without a timer and clears on new work or changed blockers', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-setaside-dependency-'));
+  try {
+    const session = { id: 'dependent-session', taskId: 'dependent-card', mtime: 1000,
+      activity: { background: { dependencies: ['upstream#2', 'other'] } } };
+    const candidates = (changes = {}, attention = []) => setAsideCandidates(attention, [{ ...session, ...changes }]);
+    const entry = updateSetAside({ key: session.id, kind: 'dependency' }, candidates(), { root, now: 2000 });
+    assert.equal(entry.until, null);
+    assert.deepEqual(entry.dependencies, ['other', 'upstream#2']);
+    const store = readSetAside(root);
+    const remaining = (items) => applySetAside(items, { store, now: 30 * 86400e3, write: false }).value.items;
+    assert.deepEqual(remaining(candidates()), { [session.id]: entry }, 'survives reload and a month of waiting');
+    assert.deepEqual(remaining(candidates({ activity: { background: { dependencies: ['other', 'upstream#2'] } } })), { [session.id]: entry });
+    for (const changes of [
+      { activity: { background: { dependencies: [] } } },
+      { activity: { background: { dependencies: ['other'] } } },
+      { activity: { background: { dependencies: ['replacement'] } } },
+      { taskId: 'different-card' },
+      { lastUserAt: 2500 },
+      { mtime: 3000 },
+    ]) assert.deepEqual(remaining(candidates(changes)), {}, JSON.stringify(changes));
+    assert.deepEqual(remaining(candidates({}, [{ kind: 'question', sessionId: session.id, since: 3000 }])), {});
+    assert.deepEqual(remaining([]), {});
+    assert.throws(() => updateSetAside({ key: session.id, kind: 'dependency' },
+      candidates({ activity: { background: { dependencies: [] } } }), { root }), /no unresolved dependencies/);
+    updateSetAside({ key: session.id, kind: 'clear' }, candidates(), { root });
+    assert.deepEqual(readSetAside(root).items, {});
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('set-aside requests validate kinds, keys, minutes, fields, and current attention', () => {
   assert.deepEqual(parseSetAsideRequest({ key: 'one', kind: 'snooze' }), { key: 'one', kind: 'snooze', minutes: 60 });
   assert.deepEqual(parseSetAsideRequest({ key: 'one', kind: 'snooze', minutes: 1440 }), { key: 'one', kind: 'snooze', minutes: 1440 });

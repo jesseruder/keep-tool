@@ -314,7 +314,7 @@ async function setAside(item, kind = 'dismiss', minutes) {
   refresh();
   try {
     await api.setAside(key, kind, minutes);
-    toast(kind === 'snooze' ? 'Snoozed for 1 hour.' : 'Dismissed. Restore it from the collapsed row.', { label: 'Undo', run: () => restore(key) });
+    toast(kind === 'dependency' ? 'Waiting for dependency. New messages or changed dependencies bring it back.' : kind === 'snooze' ? 'Snoozed for 1 hour.' : 'Dismissed. Restore it from the collapsed row.', { label: 'Undo', run: () => restore(key) });
   } catch (error) {
     optimisticSetAside.delete(key);
     deriveDismissed();

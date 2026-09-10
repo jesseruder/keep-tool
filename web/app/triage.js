@@ -253,7 +253,7 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
     wrap.innerHTML = `<button class="qdis-head" data-dismiss-toggle>${ctx.state.showDismissed ? '▾' : '▸'} dismissed · ${ctx.esc(dismissed.length)}</button>${ctx.state.showDismissed ? dismissed.map((item) => {
       const entry = ctx.setAsideFor(item);
       const minutes = entry?.kind === 'snooze' ? Math.max(1, Math.ceil((entry.until - Date.now()) / 60e3)) : null;
-      const status = minutes === null ? 'dismissed' : `snoozed · ${minutes}m left`;
+      const status = entry?.kind === 'dependency' ? 'waiting for dependency' : minutes === null ? 'dismissed' : `snoozed · ${minutes}m left`;
       return `<div class="qdis" style="--h:${ctx.esc(ctx.projectOf(item.project).h)}"><span class="stripe"></span><span class="t">${ctx.esc(item.title || 'untitled session')} <small>${ctx.esc(status)}</small></span><button class="btn" data-restore="${ctx.esc(ctx.itemKey(item))}">Restore</button><span class="p">${ctx.projectHTML(item.project)}</span></div>`;
     }).join('') : ''}`;
     place(wrap);
@@ -353,8 +353,10 @@ function renderStage(ctx, active, focusItem, running, pinned) {
   }
   const pinLabel = ctx.isPanePinned(item.pane) ? 'Unpin from Watch' : 'Pin to Watch';
   const closable = hasLivePane && item.sessionId && ['claude', 'codex'].includes(pane.meta?.agent);
+  const dependencyWait = session?.activity?.background?.dependencies?.length
+    ? '<button class="btn" data-wait-dependency>Wait for dependency</button>' : '';
   const reopen = hasLivePane ? '' : '<button class="btn" data-reopen>Reopen</button>';
-  ctx.patchHTML(stage.querySelector('.shead'), `<div class="session-heading"><h2>${ctx.esc(title)}</h2><div class="meta mono">${ctx.projectHTML(item.project || session?.project || '', true)}${item.taskId ? `<span>${ctx.esc(item.taskId)}</span>${ctx.tagsHTML(task)}` : ''}</div>${task ? modelUsageHTML(task.modelUsage) : ''}</div><div class="acts"><button class="btn" data-pin ${item.pane ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}${item.sessionId || waitingItem ? '<button class="btn" data-snooze>Snooze 1h</button><button class="btn" data-dismiss><kbd>x</kbd> Dismiss</button>' : ''}${closable ? '<button class="btn" data-close-session>Close</button>' : ''}</div>`);
+  ctx.patchHTML(stage.querySelector('.shead'), `<div class="session-heading"><h2>${ctx.esc(title)}</h2><div class="meta mono">${ctx.projectHTML(item.project || session?.project || '', true)}${item.taskId ? `<span>${ctx.esc(item.taskId)}</span>${ctx.tagsHTML(task)}` : ''}</div>${task ? modelUsageHTML(task.modelUsage) : ''}</div><div class="acts"><button class="btn" data-pin ${item.pane ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}${dependencyWait}${item.sessionId || waitingItem ? '<button class="btn" data-snooze>Snooze 1h</button><button class="btn" data-dismiss><kbd>x</kbd> Dismiss</button>' : ''}${closable ? '<button class="btn" data-close-session>Close</button>' : ''}</div>`);
   const brief = stage.querySelector('.brief');
   if (closable && !session?.reviewer) {
     const actions = stage.querySelector('.shead .acts');
@@ -409,6 +411,8 @@ function renderStage(ctx, active, focusItem, running, pinned) {
   const closeButton = stage.querySelector('[data-close-session]');
   if (closeButton) closeButton.onclick = () => closeSession(ctx, item.sessionId, item.pane, closeButton);
   if (dismissButton) dismissButton.onclick = dismiss;
+  const dependencyButton = stage.querySelector('[data-wait-dependency]');
+  if (dependencyButton) dependencyButton.onclick = () => ctx.setAside(item, 'dependency');
   const snoozeButton = stage.querySelector('[data-snooze]');
   if (snoozeButton) snoozeButton.onclick = snooze;
   ctx.state.currentActions = {

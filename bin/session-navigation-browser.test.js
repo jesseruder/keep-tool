@@ -29,6 +29,13 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     if (url.pathname === '/api/events') { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(': ready\n\n'); eventClients.add(res); req.on('close', () => eventClients.delete(res)); return; }
     if (url.pathname.startsWith('/api/')) {
       res.setHeader('content-type', 'application/json');
+      if (url.pathname === '/api/setaside') {
+        let body = ''; for await (const chunk of req) body += chunk;
+        const request = JSON.parse(body);
+        if (request.kind === 'clear') delete state.setAside[request.key];
+        else state.setAside[request.key] = { kind: request.kind, at: Date.now(), until: null };
+        res.end(JSON.stringify({ ok: true })); return;
+      }
       if (url.pathname === '/api/project-icons') { res.end(JSON.stringify({ projects: {} })); return; }
       if (url.pathname === '/api/layouts' && req.method === 'PUT') {
         let body = ''; for await (const chunk of req) body += chunk;
@@ -139,6 +146,22 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     await evaluate("document.querySelector('#qlist [data-key=\"running:a\"]').click()");
     await wait("document.activeElement?.matches('.xterm-helper-textarea') && document.querySelector('#stage').dataset.itemKey === 'a'");
     await wait("document.querySelector('#stage .term-state')?.textContent === 'live'");
+    assert.equal(await evaluate("document.querySelector('[data-wait-dependency]')"), null);
+    sessions[0].activity = { background: { dependencies: ['upstream#2'] } };
+    for (const client of eventClients) client.write('data: changed\n\n');
+    await wait("document.querySelector('[data-wait-dependency]')?.textContent === 'Wait for dependency'");
+    await evaluate("document.querySelector('[data-wait-dependency]').click()");
+    await wait("document.querySelector('[data-dismiss-toggle]')");
+    assert.equal(state.setAside.a.kind, 'dependency');
+    await evaluate("document.querySelector('[data-dismiss-toggle]').click()");
+    await wait("document.querySelector('.qdis')?.textContent.includes('waiting for dependency')");
+    await evaluate("document.querySelector('[data-restore=\"a\"]').click()");
+    await wait("!document.querySelector('[data-dismiss-toggle]')");
+    delete sessions[0].activity;
+    for (const client of eventClients) client.write('data: changed\n\n');
+    await wait("!document.querySelector('[data-wait-dependency]')");
+    await evaluate("document.querySelector('#qlist [data-key=\"running:a\"]').click()");
+    await wait("document.activeElement?.matches('.xterm-helper-textarea')");
     // Simulate native desktop clipboard metadata without touching the real clipboard.
     const pasteStart = inputEvents.length;
     await evaluate(`(() => {
