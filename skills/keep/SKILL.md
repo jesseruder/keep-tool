@@ -204,7 +204,11 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   To hand a card to a new session, pass the opening prompt: `keep open <card> --fresh -m "..."`. Keep waits for the agent's empty prompt, types the message, and prints the new session id. Write the prompt like a check recipe: name the card, the goal, and what to check in. The session also sees the project's cards from its session-start hook.
   Long or multiline opening messages, and `--message-file <path>` even for short text,
   are saved verbatim in committed `.keep/handoffs/` files; the session gets a one-line file pointer.
-  Launched Claude sessions run with `--dangerously-skip-permissions`, the same class as Owner's own `clauded` sessions, so cross-session messages between them are delivered instead of held for mode parity (`KEEP_OPEN_CLAUDE_FLAGS` overrides the flags for the daemon). Launched Codex sessions run with `--dangerously-bypass-approvals-and-sandbox`, the same class as his `codexd` alias (`KEEP_OPEN_CODEX_FLAGS` overrides).
+  Keep launches the `claude` and `codex` executables from PATH; shell aliases are not
+  required. `KEEP_OPEN_CLAUDE_FLAGS` and `KEEP_OPEN_CODEX_FLAGS` configure launch
+  permissions. `keep init` sets both to empty strings, retaining the agent's normal
+  approval behavior. Older configurations that omit these variables retain the
+  legacy permission-bypass defaults; set them explicitly for your intended policy.
   A fresh launch on a card is a handoff: the new session becomes the card's linked session and the session that ran `keep open` is unlinked from that card, so create the card and open it from the same session without worrying about owning it afterwards.
 - The CLI links Claude and Codex session IDs on add/check-in so `keep resume` emits the
   correct agent-specific resume command. A session belongs to exactly one card;
@@ -245,4 +249,4 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
 - Call the system "Keep": say "mark this task done in Keep" or "check this in to Keep."
 - Sessions in a `~/wt/<repo>/<name>` worktree belong to the main checkout's project: the CLI
   canonicalizes the path, so use and create cards for the main checkout (`wt main` prints
-  it — usually `~/castle/<repo>`, but e.g. `~/jesseland`), never for the worktree path.
+  it, for example `~/work/<repo>`), never for the worktree path.

@@ -300,7 +300,13 @@ See the [full command reference](docs/reference.md), [Keep skill](skills/keep/SK
 
 ## Session handoffs
 
-Handoffs are turn-scoped: use `keep checkin <card> --handoff needs-input` when waiting
-for the owner, or `--handoff waiting` while independent work continues. Schedule
-follow-up work with `--check-after` and `--check "recipe"`; see
-[session reliability](docs/session-reliability.md).
+Handoffs are turn-scoped and require a scheduled check time and recipe. For example:
+
+```sh
+keep checkin <card> --check-after +1h --check "Check progress and report the result" --handoff waiting -m "Waiting for the scheduled check"
+```
+
+Use `--handoff needs-input` instead when you also need the owner's decision.
+A later turn invalidates the handoff. Without a scheduled recipe, record the
+appropriate card status and next step; see the [Keep skill](skills/keep/SKILL.md)
+and [session reliability](docs/session-reliability.md).

@@ -175,7 +175,7 @@ has no viewers, can be cancelled, and survive daemon restart. Fleet reviewers
 require a separate coordinated restart. Explicit force-restart recovery has its
 own durable transaction and recovery checks; it is not ordinary idle cleanup.
 See the [session reliability contract](session-reliability.md) for restart proof
-and recovery behavior, and `keep help` for available commands.
+and the [force-restart guide](force-restart.md) for explicit recovery commands.
 
 Resume uses the agent's saved conversation/settings; an explicit permission bypass
 is carried over only when the old process used it. Other one-off CLI overrides
@@ -389,13 +389,13 @@ Example registry entry:
 
 ```json
 {
-  "project": "~/castle/example",
+  "project": "~/work/example",
   "steps": {
     "image": {
       "title": "Build the image",
       "paths": ["packer/**", "host-agent/**"],
       "from": "landed",
-      "worktree": "~/castle/example.step-image",
+      "worktree": "~/work/example.step-image",
       "prepare": "yarn install --frozen-lockfile",
       "command": "cd packer && ./build.sh",
       "artifactPattern": "ami-[0-9a-f]{8,}",
@@ -503,7 +503,7 @@ tree for the next agent; use `--delete` to remove it instead.
 
 ```
 keep-reviewer            # latest fable (default)
-keep-reviewer sonnet     # cheaper shake-out runs
+keep-reviewer <model>    # override with a model available to your Claude installation
 ```
 
 Open it in its own terminal tab and **leave it idle** — it is not a session you drive.
@@ -521,8 +521,8 @@ reviewer check-ins on the evidence cards. The message should name the observed p
 cite the cards, sessions, or commits that demonstrate it, and propose the workflow or
 Keep change.
 
-The model argument is an **alias** (`fable`, `sonnet`, `opus`), passed to
-`claude --model` verbatim so it always resolves to the latest model in that family.
+The model argument is passed to `claude --model` verbatim. Model aliases resolve
+according to your Claude installation and account access.
 Do not substitute a pinned id unless you mean to freeze the version. Only the family
 name is derived from it, for the budget governor (which matches the `Fable wk` usage
 limit by label prefix) and for the `review (fable)` heading findings land under.

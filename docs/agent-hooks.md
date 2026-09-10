@@ -15,7 +15,13 @@ are never replaced automatically.
 | PreToolUse (Bash) | `keep hook pre-bash` |
 | PostToolUse (Bash) | `keep hook post-bash` |
 
-Restart agent sessions after installation. The reviewer launcher sets
+The installer currently adds only the Claude hooks in this table. For supported
+Claude installations, also configure `SubagentStart` and `SubagentStop` to invoke
+`keep hook lifecycle`. These observation-only adapters record child lifecycle
+hints; transcript reconciliation remains the fallback when hooks are missing.
+Use the same checkout path and `KEEP_CONFIG` prefix as the installed commands.
+
+Restart/resume existing agent sessions in a controlled manner to load new hooks. The reviewer launcher sets
 `KEEP_REVIEWER=1`, allowing the SessionStart hook to register it for daemon ticks.
 
 Codex transcript discovery works without event hooks. Rich attention notifications,
@@ -25,6 +31,7 @@ version; automatic editing of Codex hook settings is not included in this releas
 Configure the supported events in your installation to invoke these adapters:
 
 - `keep hook codex start`
+- `keep hook codex stop` (Stop continuation guard)
 - `keep hook codex lifecycle` (normalized lifecycle/job evidence; wire supported lifecycle events alongside the specialized adapters)
 - `keep hook codex question`
 - `keep hook codex approval`
