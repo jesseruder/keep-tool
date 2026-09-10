@@ -187,6 +187,51 @@ test('project matching and project inference canonicalize linked worktree cwd', 
   }
 });
 
+test('project command canonicalizes worktrees without taking over card ownership or scheduling', () => {
+  const f = linkedWorktreeFixture();
+  const root = path.join(f.root, 'registry');
+  const file = path.join(root, 'tasks', 'project-test.md');
+  const { parseTask, serializeTask } = require('./keep.js');
+  const env = { ...process.env, KEEP_DIR: root, KEEP_ALLOW_PUSH: '0', CODEX_THREAD_ID: 'curator' };
+  const run = (args, extra = {}) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), ...args], {
+    cwd: f.main, env: { ...env, ...extra }, encoding: 'utf8',
+  });
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    for (const dir of ['archive', 'digests']) fs.mkdirSync(path.join(root, dir));
+    spawnSync('git', ['init', '-q', root]);
+    spawnSync('git', ['-C', root, 'config', 'user.name', 'Test']);
+    spawnSync('git', ['-C', root, 'config', 'user.email', 'test@example.test']);
+    const original = { id: 'project-test', fm: {
+      title: 'Project test', status: 'waiting', project: root, tags: ['personal'],
+      sessions: [{ id: 'owner-session', agent: 'codex', at: '2026-09-10T12:00' }],
+      check_after: '2026-09-11T12:00', check: 'Read-only verification',
+      scheduled_by: 'owner-session', scheduled_at: '2026-09-10T22:00:00Z',
+      depends_on: ['upstream#2'],
+    }, body: '## Plan\n- [ ] Original work\n\n## 2026-09-10 12:00 — check-in\nOriginal history.\n' };
+    fs.writeFileSync(file, serializeTask(original));
+    const before = parseTask(fs.readFileSync(file, 'utf8'), original.id);
+    const changed = run(['project', original.id, f.worktree, '-m', 'Correct repository.']);
+    assert.equal(changed.status, 0, changed.stderr);
+    const after = parseTask(fs.readFileSync(file, 'utf8'), original.id);
+    assert.equal(after.fm.project, f.main);
+    for (const key of Object.keys(before.fm).filter(k => !['project', 'updated'].includes(k))) {
+      assert.deepEqual(after.fm[key], before.fm[key], key);
+    }
+    assert.deepEqual(require('./keep.js').parsePlan(after), require('./keep.js').parsePlan(before), 'plan survives');
+    assert.ok(after.body.includes('## 2026-09-10 12:00 — check-in\nOriginal history.'), 'history survives');
+    assert.match(after.body, /project changed[\s\S]*Correct repository/);
+    assert.equal(run(['project', original.id]).stdout.trim(), f.main);
+    const saved = fs.readFileSync(file, 'utf8');
+    assert.equal(run(['project', original.id, f.worktree]).status, 0);
+    assert.equal(fs.readFileSync(file, 'utf8'), saved, 'same project is a no-op');
+    assert.notEqual(run(['project', original.id, path.join(f.root, 'missing')]).status, 0);
+    assert.notEqual(run(['project', original.id, root], { KEEP_REVIEWER: '1' }).status, 0);
+    assert.equal(fs.readFileSync(file, 'utf8'), saved, 'invalid or reviewer mutation cannot change the card');
+    assert.match(run(['help', 'project']).stdout, /keep project <id>/);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test('session-start prints the wt nudge from a default repository main checkout', () => {
   const f = linkedWorktreeFixture();
   const keepRoot = path.join(f.root, 'registry');

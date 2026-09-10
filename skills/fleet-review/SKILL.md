@@ -70,6 +70,19 @@ findings no single agent can see: two cards editing the same files, duplicated e
 the `review` backlog piling up, experiments past their window with no readout, shipped
 work whose follow-up step never ran.
 
+## Timestamp and command accuracy
+
+Read the bundle's explicit time zone before comparing local Keep timestamps with
+UTC transcript or service timestamps. Use the offset at the event date, including
+DST where applicable; do not assume that “local” means Pacific time. Preserve
+explicit source offsets and verify historical zone changes before calling a window
+wrong.
+
+Before recommending unfamiliar CLI syntax, check `keep help <command>`. To correct
+a card's repository, recommend `keep project <id> <path|name> -m "reason"`; it
+preserves session links, status and scheduled checks. `keep checkin --project` is
+not supported. The reviewer reports the correction for an owning session to apply.
+
 ## Lenses
 
 Look for these, and nothing else:

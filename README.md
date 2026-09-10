@@ -39,6 +39,11 @@ agent sessions your Keep tracks across your projects.
   such as stalled work, conflicting claims, or missing verification. A separate
   daily ideas pass proposes improvements to recurring workflows.
 
+To correct a card's repository, use `keep project <card> <path|name> -m "reason"`.
+Run `keep project <card>` to see the current value. Reassignment preserves the
+card's session links, status, scheduled checks, tags, and dependencies; a linked
+worktree path resolves to its main checkout.
+
 ## A typical workflow
 
 After setup, create a task and hand it to an agent. For example, from a project

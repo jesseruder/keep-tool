@@ -1459,6 +1459,32 @@ commands.retitle = (argv) => {
   });
 };
 
+commands.project = (argv) => {
+  const o = parseArgs(argv, {});
+  const [id, target] = o._;
+  if (!id || o._.length > 2) die('usage: keep project <id> [<path|name>] [-m "reason"]');
+  if (target === undefined) {
+    console.log(loadTask(id).fm.project || '(none)');
+    return;
+  }
+  if (isReviewerSession()) die('the fleet reviewer may suggest a project change, but cannot apply it');
+  const project = cleanScalar(normalizeProjectPath(canonicalCwd(
+    resolveProjectArg(target).replace(/^~(?=\/|$)/, os.homedir()),
+  )), 'project');
+  withLock(() => {
+    const task = loadTask(id);
+    const previous = task.fm.project || '';
+    if (previous !== project) {
+      task.fm.project = project;
+      // Metadata curation must not transfer the owner's resume link or schedule.
+      appendLog(task, 'project changed', `Project changed from ${previous || '(none)'} to ${project}.${o.m ? ` ${o.m}` : ''}`);
+      saveTask(task);
+      commitAndPush(`keep: project ${id}`);
+    }
+    console.log(fmtTask(task, { brief: true }));
+  });
+};
+
 commands.done = (argv) => {
   const o = parseArgs(argv, { force: 'bool', next: 'str', commit: 'list' });
   const id = o._[0];
@@ -5794,6 +5820,7 @@ function helpText() {
   keep allow <id> <action> [--amount n] [--quiet]   # exit 0 allowed, 3 not allowed
   keep allow <id> --grant a,b [--until when] | --revoke a,b | --clear
   keep retitle <id> "new title"
+  keep project <id> [<path|name>] [-m "reason"]   # show or change project; preserves session links and schedule
   keep list [--status s]… [--tag t] [--project p] [--overdue] [--brief] [--all]
   keep show <id>
   keep wait [--no-hold <project> [--scope <resource>]] [--card <id>[#<n>]] [--lane <project> <step>]

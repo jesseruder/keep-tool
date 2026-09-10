@@ -866,6 +866,23 @@ test('a reviewer log entry alone is not evidence', () => {
     { score: 0, reasons: ['no-evidence'], skip: 'no-evidence' });
 });
 
+test('bundle time context supplies the event-date offset for Honolulu, DST and fractional zones', () => {
+  for (const [zone, iso, offset] of [
+    ['Pacific/Honolulu', '2026-09-09T07:17:00.000Z', '-10:00'],
+    ['America/Los_Angeles', '2026-01-15T12:34:00.000Z', '-08:00'],
+    ['America/Los_Angeles', '2026-07-15T12:34:00.000Z', '-07:00'],
+    ['Asia/Kathmandu', '2026-09-09T07:17:00.000Z', '+05:45'],
+  ]) {
+    const result = spawnSync(process.execPath, ['-e',
+      `console.log(require('./bin/review.js').bundleTimeContext(new Date(${JSON.stringify(iso)})))`,
+    ], { cwd: path.join(__dirname, '..'), env: { ...process.env, TZ: zone }, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(result.stdout.includes(`UTC${offset} at generation`), result.stdout);
+    assert.ok(result.stdout.includes(`generated UTC: ${iso}`));
+    if (zone === 'Pacific/Honolulu') assert.match(result.stdout, /Pacific\/Honolulu/);
+  }
+});
+
 test('bundle run timestamps use Keep local wall-clock time', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-run-stamp-'));
   const at = new Date('2026-01-15T12:34:00.000Z');
@@ -884,6 +901,8 @@ test('bundle run timestamps use Keep local wall-clock time', () => {
       "const bundle = review.buildBundle('run-stamp', { force: true });",
       "const expected = keep.stampOf(at).replace('T', ' ');",
       "if (!bundle.md.includes('- run-stamp-abc — ' + expected)) process.exit(1);",
+      "if (!bundle.md.includes('time zone: Pacific/Honolulu (UTC-10:00')) process.exit(2);",
+      "if (!bundle.md.includes('keep project <card-id>') || !bundle.md.includes('keep help <command>')) process.exit(3);",
     ].join(' ');
     const child = spawnSync(process.execPath, ['-e', script], {
       cwd: path.join(__dirname, '..'),

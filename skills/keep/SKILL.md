@@ -45,6 +45,10 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   scheduled recipe. Both require a check time and recipe. A new human or automated
   turn, cancellation, changed schedule, or completed card invalidates the old handoff;
   explicit questions still take priority. Editing only `--check` does not yield a turn.
+- **Correcting a card's repository**: `keep project <id>` shows its project;
+  `keep project <id> <path|name> -m "reason"` changes it without taking over its
+  session link or changing its status, schedule, tags, or dependencies. Worktree
+  paths resolve to their main checkout. Use this instead of `keep checkin --project`.
 - **Status changes or notable progress**: use `keep checkin <id> -m "..." [--status s]`.
 - **Waiting on another card**: if your next step depends on another card finishing,
   run `keep wait-on <your-card> <upstream> [<upstream>...]`. To wait for a specific

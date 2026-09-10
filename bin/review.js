@@ -1003,6 +1003,17 @@ function renderActivity(session, act, delta) {
   return lines.join('\n');
 }
 
+function bundleTimeContext(at = new Date()) {
+  const minutes = -at.getTimezoneOffset();
+  const pad = (n) => String(n).padStart(2, '0');
+  const offset = `${minutes < 0 ? '-' : '+'}${pad(Math.floor(Math.abs(minutes) / 60))}:${pad(Math.abs(minutes) % 60)}`;
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'system local time';
+  return [
+    `time zone: ${zone} (UTC${offset} at generation); generated UTC: ${at.toISOString()}`,
+    'Unzoned Keep timestamps are local wall-clock time. Use the named zone and the offset at each timestamp (DST may differ); explicit source offsets remain authoritative. Historical records do not store their original zone: verify any suspected zone change before recommending a correction.',
+  ].join('\n');
+}
+
 function buildBundle(taskId, opts = {}) {
   const budgetTokens = Math.min(Number(opts.budget) || DEFAULT_BUDGET_TOKENS, MAX_BUDGET_TOKENS);
   const budgetChars = budgetTokens * CHARS_PER_TOKEN;
@@ -1167,6 +1178,8 @@ function buildBundle(taskId, opts = {}) {
     'KEEP_CONTEXT>>>',
     '',
     `generated: ${keep.nowStamp()}  ·  budget: ${budgetTokens} tokens  ·  bundle: ${bundleId}`,
+    bundleTimeContext(),
+    'Project correction: keep project <card-id> <path|name> -m "reason" preserves session links and schedules. Verify unfamiliar CLI syntax with keep help <command> before recommending it; keep checkin does not accept --project.',
     'pass --bundle ' + bundleId + ' to review-note/review-ack so the right evidence is marked reviewed.',
     `last reviewed: ${state.lastReviewedStamp || 'never'}${firstReview ? ' (first review — everything below is new)' : ''}`,
     `since then: ${newBytes} new transcript bytes across ${perSession.length} session(s)` +
@@ -3653,6 +3666,7 @@ function startScheduler(deps) {
 
 
 module.exports = {
+  bundleTimeContext,
   recordTickOutcome,
   recordTickError,
   REVIEW_DIR,
