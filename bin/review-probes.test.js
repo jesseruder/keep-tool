@@ -42,6 +42,7 @@ test('errors, human input, writes, unknown formats, compaction and incomplete pr
     rows => { rows.pop(); },
     rows => { rows.unshift({ type: 'system', subtype: 'compact_boundary' }); },
     rows => { rows.unshift('malformed'); },
+    rows => { rows.push({ type: 'assistant', isSidechain: true, message: { content: 'background work' } }); },
   ]) {
     const rows = turn(1); mutate(rows);
     assert.equal(scanProbes(rows).eligible, false, JSON.stringify(rows));

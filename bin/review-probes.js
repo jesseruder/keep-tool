@@ -30,7 +30,9 @@ function scanProbes(lines, agent = 'claude') {
   for (const line of lines) {
     let r;
     try { r = typeof line === 'string' ? JSON.parse(line) : line; } catch { unsafe = 'unreadable record'; continue; }
-    if (!r || r.isSidechain || noise.has(r.type)) continue;
+    if (!r) { unsafe = 'unreadable record'; continue; }
+    if (r.isSidechain) { unsafe = 'background activity'; continue; }
+    if (noise.has(r.type)) continue;
     if (r.type === 'attachment') {
       if (!attachments.has(r.attachment?.type)) unsafe = 'unrecognized attachment';
       continue;

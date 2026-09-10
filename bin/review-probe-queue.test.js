@@ -64,6 +64,24 @@ test('queue backoff leaves cursors intact and yields to human, result, card, Git
     rows[2].message.content[0].is_error=true; write();
     assert.equal(queue().skips['probe-backoff'],0);
     assert.equal(review.loadState(task.id).sessions['probe-worker'].offset,0);
+    // A concurrent outcome lands after bundle gathering began but before staging.
+    keep.loadTask = () => task;
+    const lock = keep.withLock;
+    let injected = false;
+    keep.withLock = fn => {
+      if (!injected) {
+        injected = true;
+        const fresh = review.loadState(task.id);
+        fresh.findings['0123456789abcdef'] = { kind: 'other', subject: 'race', outcome: { status: 'incorrect', message: 'Correction landed', evidence: 'owner check-in' } };
+        review.saveState(fresh);
+      }
+      return lock(fn);
+    };
+    assert.throws(() => review.buildBundle(task.id, { force: true }), /review state changed/);
+    assert.equal(review.loadState(task.id).findings['0123456789abcdef'].outcome.status, 'incorrect');
+    assert.equal(review.loadState(task.id).sessions['probe-worker'].offset, 0);
+    keep.withLock = lock;
+    assert.match(review.buildBundle(task.id, { force: true }).md, /Correction landed/);
   `;
   try {
     const result = spawnSync(process.execPath, ['-e', source], {

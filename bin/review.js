@@ -1057,6 +1057,7 @@ function buildBundle(taskId, opts = {}) {
   }
   const excluded = excludedSessionIds();
   const state = loadState(taskId);
+  const stateSnapshot = JSON.stringify(state);
   const firstReview = !state.lastReviewedAt;
   const autoContinued = autoContinuesSince(task, state.lastReviewedAt);
 
@@ -1339,7 +1340,13 @@ function buildBundle(taskId, opts = {}) {
   state.pendingProbe = pendingProbe;
   state.pendingStatusEvidence = { since: state.lastReviewedAt || Date.now(), logHash: statusLogHash(task.body) };
   state.pendingLog = advanceLogWatermark(state.logSeen, logEntriesForReview);
-  keep.withLock(() => { assertProjectUnchanged(); saveState(state); });
+  keep.withLock(() => {
+    assertProjectUnchanged();
+    if (JSON.stringify(loadState(taskId)) !== stateSnapshot) {
+      throw new keep.KeepError('review state changed while gathering evidence; rebuild this bundle');
+    }
+    saveState(state);
+  });
   return { md, bundleId, taskId, newBytes, gitMoved, statusChanged, sessions: perSession.length };
 }
 
