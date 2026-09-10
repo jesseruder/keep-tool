@@ -163,14 +163,21 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
 
 ## Landing and closing
 
+- When the requested work and validation are complete, default to `--status done`
+  with `--next "nothing"`. Jesse can reopen the card if an issue appears. Use
+  `review` only for a concrete decision, approval, or review Jesse explicitly requested;
+  describe what he needs to decide. Do not add "Jesse review" / "Owner review" as a
+  routine final step in check-ins or agent handoffs. If another agent still has work
+  to do, record that remaining work instead of assigning it to Jesse.
 - When the work is finished, its commits are cited, and the only remaining step is the
   merge, use `--status landing` (it requires a cited sha). The landed sweep closes it
   when the shas reach the default branch, with no prose to parse and no model call, and
-  it never occupies Owner's review queue. `review` is only ever "Owner should look".
+  it never occupies Owner's review queue.
 - End your final check-in with `--next "land"` when landing is the only thing left,
   `--next "nothing"` when the card can close once landed, or `--next "Owner review"`
-  when Owner should look but nothing else is pending. Otherwise pass the real pending
-  step: a deploy, a readout date, a decision, or something Owner must do.
+  when a concrete Owner decision or explicitly requested review remains. Otherwise
+  pass the real pending step: a deploy, a readout date, a decision, or something Owner
+  must do.
 - Pass `--commit <sha>` for every commit you produced. The flag is repeatable and also
   accepts comma-separated shas.
 - Prose `Next:` lines and commit citations still work as a fallback, but structured
