@@ -165,6 +165,14 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   so `--send` delivers only the classes Owner has turned on and every other kind stays a
   dry-run envelope in the digest.
 
+- `keep review-outcome [card] --json` lists explicit finding outcomes. Owners/working
+  sessions can record `keep review-outcome <card> <key> <fixed|confirmed-deferred|incorrect|superseded|unresolved>
+  -m "reason" --evidence "check-in/commit reference"`. The reviewer cannot grade itself;
+  silence stays unresolved. Record incorrect findings with the counter-evidence so
+  future reviews retain the lesson. This preserves card ownership, status and schedule.
+- `keep review-replay <card> [--session <id>] [--since ISO]` estimates repeated-probe
+  backoff against recorded reviews, without changing review state.
+
 ## Landing and closing
 
 - When the requested work and validation are complete, default to `--status done`

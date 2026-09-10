@@ -3991,6 +3991,7 @@ function buildState(options = {}) {
           weekly: state.reviewUsage?.weekly ?? null,
           findingsTotal: reviewerStats.findingsTotal,
           dismissed: reviewerStats.dismissed,
+          outcomes: reviewerStats.outcomes,
           tickIntervalMs: review.TICK_MS,
           reviewer: current ? { id: current.id, state: current.state, model: current.model } : null,
         },

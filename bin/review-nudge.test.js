@@ -19,7 +19,7 @@ test('waiting-session nudges use guarded delivery and retain refusal gates', asy
   fs.writeFileSync(path.join(root, 'watch/nudge.json'), JSON.stringify({ live: true }));
   const key = '0123456789abcdef'; // gitleaks:allow — synthetic finding ID, not a credential
   fs.writeFileSync(path.join(reviewDir, 'fixture.json'), JSON.stringify({
-    version: 1, findings: { [key]: { kind: 'stale-checkin' } },
+    version: 1, findings: { [key]: { kind: 'stale-checkin', basis: 'observed', evidence: 'fixture check-in', checked: 'compared check-in and activity' } },
   }));
   let session, sendStatus = 200;
   const sends = [];
@@ -68,4 +68,14 @@ test('waiting-session nudges use guarded delivery and retain refusal gates', asy
   await assert.rejects(attempt(), /draft in input box/);
   const ledger = JSON.parse(fs.readFileSync(path.join(reviewDir, '_nudges.json')));
   assert.equal(ledger.keys[key], undefined, 'a downstream refusal must release the finding reservation');
+  for (const finding of [
+    { basis: 'inferred', evidence: 'partial evidence', checked: 'delta only' },
+    { basis: 'observed', evidence: 'commit', checked: 'verified', outcome: { status: 'fixed' } },
+    { basis: 'observed', evidence: 'commit', checked: 'verified', dismissed: true },
+  ]) {
+    fs.writeFileSync(path.join(reviewDir, 'fixture.json'), JSON.stringify({ version: 1, findings: { [key]: finding } }));
+    const before = sends.length;
+    await assert.rejects(attempt(), /live nudges require/);
+    assert.equal(sends.length, before);
+  }
 });

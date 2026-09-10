@@ -31,7 +31,8 @@ context, so the shape matters as much as the judgment.
    {"acks":  [{"id": "card-b", "bundle": "b2"}],
     "notes": [{"id": "card-a", "bundle": "b1", "kind": "unverified-claim",
                "subject": "src/foo.ts", "severity": "med",
-               "message": "what is wrong, the evidence, the next action"}],
+               "basis": "needs-verification",
+               "message": "what needs checking, available evidence, the next action"}],
     "ideas": [{"title": "...", "message": "..."}]}
    ```
 
@@ -82,6 +83,38 @@ Before recommending unfamiliar CLI syntax, check `keep help <command>`. To corre
 a card's repository, recommend `keep project <id> <path|name> -m "reason"`; it
 preserves session links, status and scheduled checks. `keep checkin --project` is
 not supported. The reviewer reports the correction for an owning session to apply.
+
+## Evidence quality, repeated probes, and outcomes
+
+Treat a bundle as a delta, not a complete authorization or test history. Label each
+finding `observed`, `inferred`, or `needs-verification` using `basis` in landing JSON
+(or `--basis` for review-note). An observed finding also requires `evidence` with
+specific references and `checked` describing what you actually verified. Before
+alleging missing authorization, tests, or unsafe action, inspect the relevant earlier
+human instruction and owning/parent session or cited test result. If you cannot,
+state the uncertainty and the next verification step. Unverified findings cannot
+trigger live nudges or speaker announcements. Absence from the delta is not proof.
+
+A bundle may identify complete identical scheduled probes. Only after inspecting the
+exact tool inputs and verifying that they are read-only and results are clean, add
+`"probeSafe": true` to that card's ack (or `review-ack --probe-safe`). Generic browser
+JavaScript needs inspection too. This approves only that exact fingerprint. After
+two clean reviews, unchanged probes back off from one hour to two hours to a four-hour
+cap; changed prompts, calls, results, errors, human activity, card or repository work
+bypass that backoff. Skipped probes do not advance evidence cursors. Unknown transcript
+formats stay reviewable. Use `keep review-replay <card> [--session <id>] [--since ISO]`
+for a read-only historical estimate; it cannot reconstruct external Git/card changes.
+
+Owners and working sessions record explicit outcomes with
+`keep review-outcome <card> <key> <status> -m "reason" --evidence "check-in/commit reference"`.
+Statuses are `fixed`, `confirmed-deferred`, `incorrect`, `superseded`, and `unresolved`.
+The reviewer does not grade its own findings. Silence is unresolved, not agreement.
+Use `keep review-outcome [card] --json` to read outcomes; stats report all-time counts.
+Incorrect and superseded findings stay suppressed, including forced repetitions.
+Fixed/deferred findings may re-enter when source or status changes. If new evidence
+invalidates a correction, ask the owner/working session to reopen it explicitly.
+During compaction preserve the correction, evidence reference and resulting lesson;
+bundles also carry recent incorrect findings so a fresh session can recover them.
 
 ## Lenses
 

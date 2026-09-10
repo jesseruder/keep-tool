@@ -5142,7 +5142,7 @@ commands['review-queue'] = (argv) => {
 };
 
 commands['review-note'] = async (argv) => {
-  const o = parseArgs(argv, { kind: 'str', subject: 'str', severity: 'str', 'suggest-status': 'str', bundle: 'str', force: 'bool', 'no-digest': 'bool' });
+  const o = parseArgs(argv, { kind: 'str', subject: 'str', severity: 'str', 'suggest-status': 'str', bundle: 'str', force: 'bool', 'no-digest': 'bool', basis: 'str', evidence: 'str', checked: 'str' });
   const id = o._[0];
   if (!id || !o.m) die('usage: keep review-note <id> --kind <k> --subject <s> [--severity low|med|high] [--suggest-status s] [--force] -m "finding"');
   const out = await require('./review.js').reviewNote(id, {
@@ -5154,6 +5154,7 @@ commands['review-note'] = async (argv) => {
     bundle: o.bundle,
     force: o.force,
     noDigest: o['no-digest'],
+    basis: o.basis, evidence: o.evidence, checked: o.checked,
   });
   console.log(out.notApplied ? `finding ${out.key} on ${id} — not applied: ${out.notApplied}`
     : `recorded finding ${out.key} on ${id}${out.count > 1 ? ` (seen ${out.count}x)` : ''}`);
@@ -5176,10 +5177,10 @@ commands['review-idea'] = (argv) => {
 };
 
 commands['review-ack'] = (argv) => {
-  const o = parseArgs(argv, { bundle: 'str' });
+  const o = parseArgs(argv, { bundle: 'str', 'probe-safe': 'bool' });
   const id = o._[0];
   if (!id) die('usage: keep review-ack <id> [--bundle id] [-m "nothing to flag"]');
-  require('./review.js').reviewAck(id, o.m, { bundle: o.bundle });
+  require('./review.js').reviewAck(id, o.m, { bundle: o.bundle, probeSafe: o['probe-safe'] });
   console.log(`reviewed ${id}: no findings`);
 };
 
@@ -5189,6 +5190,27 @@ commands['review-dismiss'] = (argv) => {
   if (!id || !key) die('usage: keep review-dismiss <id> <finding-key> [-m why]');
   require('./review.js').reviewDismiss(id, key, o.m);
   console.log(`dismissed ${key} on ${id} — it will not be raised again`);
+};
+
+commands['review-outcome'] = (argv) => {
+  const o = parseArgs(argv, { evidence: 'str', json: 'bool' });
+  const [id, key, status] = o._;
+  const review = require('./review.js');
+  if (!key && !status) {
+    const rows = review.findingOutcomes().filter(row => !id || row.card === id);
+    if (o.json) console.log(JSON.stringify(rows, null, 2));
+    else for (const row of rows) console.log(`${row.card}\t${row.key}\t${row.outcome.status}\t${row.subject}${row.outcome.evidence ? ` · ${row.outcome.evidence}` : ''}`);
+    return;
+  }
+  if (!id || !key || !status || o._.length !== 3) die('usage: keep review-outcome [<card> [<key> <status> -m "reason" --evidence "reference"]] [--json]');
+  const outcome = review.recordFindingOutcome(id, key, status, { message: o.m, evidence: o.evidence });
+  console.log(o.json ? JSON.stringify(outcome, null, 2) : `${id}/${key}: ${outcome.status}`);
+};
+
+commands['review-replay'] = (argv) => {
+  const o = parseArgs(argv, { since: 'str', session: 'str' });
+  if (o._.length !== 1) die('usage: keep review-replay <card> [--since ISO-timestamp] [--session id]');
+  console.log(JSON.stringify(require('./review-replay').replayCard(o._[0], o.since, o.session), null, 2));
 };
 
 commands['review-land'] = async (argv) => {
@@ -5284,6 +5306,7 @@ commands['review-stats'] = async (argv) => {
     console.log(`${day}: ticks ${d.ticks || 0}, notes ${d.notes || 0}, ideas ${d.ideas || 0}, acks ${d.acks || 0}, nudges ${d.nudges || 0}, compacts ${d.compacts || 0}`);
   }
   console.log(`findings on record: ${stats.findingsTotal} (${stats.dismissed} dismissed)`);
+  console.log('finding outcomes: ' + Object.entries(stats.outcomes).map(([key, n]) => `${n} ${key}`).join(', '));
   if (stats.transcript) {
     const t = stats.transcript;
     const fmtTokens = (value) => value == null ? 'n/a' : value >= 1e6 ? (value / 1e6).toFixed(1) + 'M' : value >= 1e3 ? Math.round(value / 1e3) + 'k' : String(value);
@@ -5903,9 +5926,13 @@ ${stepUsage()}
   keep review-bundle <id> --session <id> --from <byte> --raw
                          # re-read a coverage gap the delta cap skipped
   keep review-note <id> --kind k --subject s [--severity s] -m "finding"
+                         [--basis observed|inferred|needs-verification] [--evidence "references"] [--checked "verification performed"]
   keep review-idea "<title>" -m "<body>" [--project p] [--cards a,b,c] [--severity low|med]
-  keep review-ack <id> [-m note]        # reviewed, nothing to flag
+  keep review-ack <id> [--bundle id] [--probe-safe] [-m note]  # reviewed; probe-safe approves exact read-only automated calls
+  keep review-replay <card> [--since ISO-timestamp] [--session id]  # read-only counterfactual against recorded review times
   keep review-dismiss <id> <key> [-m why]
+  keep review-outcome [<card> [<key> <status> -m "reason" --evidence "reference"]] [--json]
+                         # fixed, confirmed-deferred, incorrect, superseded, unresolved; list when status omitted
   keep review-land --file <path> | keep review-land -
                          # land one JSON review tick under one lock and commit
   keep review-budget [--json] [--model m]  # may the reviewer spend right now?

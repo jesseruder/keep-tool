@@ -22,6 +22,8 @@ const keep = require('./keep.js');
 const steps = require('./steps.js');
 const codex = require('./codex.js');
 const health = require('./health.js');
+const probes = require('./review-probes.js');
+const quality = require('./review-quality.js');
 const { PROJECTS_DIR, findSessionFile, readTranscript, textOf: transcriptTextOf } = require('./transcripts.js');
 
 const META = path.join(keep.ROOT, '.keep');
@@ -343,7 +345,7 @@ function summarizeClaudeDelta(lines) {
       }
       const text = textOfClaude(j.message.content).trimStart();
       // harness wrappers (system reminders, task notifications) are not prompts
-      if (text && !text.startsWith('<')) a.userPrompts.push(clip(text, 600));
+      if (text && !j.isMeta && !text.startsWith('<')) a.userPrompts.push(clip(text, 600));
     }
     // NOTE: toolUseResult also carries originalFile / structuredPatch / oldString /
     // newString — whole file bodies. Only these two scalars are safe to read.
@@ -525,6 +527,8 @@ function resetProjectEvidence(taskId) {
   if (!fs.existsSync(statePath(taskId))) return;
   const state = loadState(taskId);
   state.git = emptyState(taskId).git;
+  delete state.probe;
+  delete state.pendingProbe;
   // A tombstone, rather than deletion: commitState accepts an explicit bundle
   // when none is pending. Force old acknowledgements to fail until a fresh read.
   state.pendingBundle = `project-changed-${crypto.randomBytes(8).toString('hex')}`;
@@ -537,7 +541,7 @@ function resetProjectEvidence(taskId) {
 
 // Promote the offsets a bundle staged. Called only once a finding (or an explicit
 // clean bill of health) has landed — so a crashed tick re-reads rather than skips.
-function commitState(taskId, { status, bundle } = {}) {
+function commitState(taskId, { status, bundle, clean = false, probeSafe = false } = {}) {
   const state = loadState(taskId);
   const hadPendingBundle = Boolean(state.pendingBundle);
   // Promotion belongs to the bundle that was actually reviewed. Without this, two
@@ -590,6 +594,8 @@ function commitState(taskId, { status, bundle } = {}) {
   if (Number.isFinite(state.pendingRunAt)) { state.lastRunAt = state.pendingRunAt; delete state.pendingRunAt; }
   delete state.pendingBundle;
   delete state.pendingStatusEvidence;
+  state.probe = clean ? probes.acknowledgeProbe(state.probe, state.pendingProbe, probeSafe, Date.now()) : null;
+  delete state.pendingProbe;
   state.lastReviewedAt = Date.now();
   state.lastReviewedStamp = keep.nowStamp();
   if (status) state.lastStatus = status;
@@ -1165,7 +1171,7 @@ function buildBundle(taskId, opts = {}) {
 
   // ---- sections ----
   const dismissed = Object.values(state.findings).filter((f) => f.dismissed);
-  const open = Object.values(state.findings).filter((f) => !f.dismissed);
+  const open = Object.values(state.findings).filter((f) => !f.dismissed && (!f.outcome || ['unresolved', 'confirmed-deferred'].includes(f.outcome.status)));
   const headerLines = [
     `# review bundle — ${taskId}`,
     '',
@@ -1203,6 +1209,7 @@ function buildBundle(taskId, opts = {}) {
     '',
     `generated: ${keep.nowStamp()}  ·  budget: ${budgetTokens} tokens  ·  bundle: ${bundleId}`,
     bundleTimeContext(),
+    quality.GUIDANCE,
     'Project correction: keep project <card-id> <path|name> -m "reason" preserves session links and schedules. Verify unfamiliar CLI syntax with keep help <command> before recommending it; keep checkin does not accept --project.',
     'pass --bundle ' + bundleId + ' to review-note/review-ack so the right evidence is marked reviewed.',
     `last reviewed: ${state.lastReviewedStamp || 'never'}${firstReview ? ' (first review — everything below is new)' : ''}`,
@@ -1211,6 +1218,11 @@ function buildBundle(taskId, opts = {}) {
       `${autoContinued ? `, auto-continued ${autoContinued} time(s)` : ''}`,
   );
   const protectedEnd = headerLines.length;
+  const pendingProbe = probes.combineProbes(perSession.filter(p => p.missing || p.error || p.delta?.read).map(p => ({
+    id: p.session.id,
+    probe: p.delta && !p.delta.skipped ? probes.scanProbes(p.delta.lines, p.session.agent) : null,
+  })));
+  if (pendingProbe) headerLines.push('', `Automated probe candidate: ${pendingProbe.count} complete identical scheduled turns. If you verify these exact calls are read-only and results are clean, add probeSafe:true to its ack to allow bounded backoff. Changed results, errors, human input and code activity bypass backoff.`);
   const gaps = Object.entries(state.sessions)
     .filter(([, v]) => (v.skippedBytes || 0) > 0)
     .map(([id, v]) => `- ${id.slice(0, 8)}: ${Math.round((v.skippedBytes || 0) / 1024)} KB never read${v.skipFrom ? `, from byte ${v.skipFrom}` : ''}`);
@@ -1223,9 +1235,19 @@ function buildBundle(taskId, opts = {}) {
     headerLines.push('', 'findings already reported on this card (do not repeat unless the evidence is new):');
     for (const f of open.slice(0, 12)) headerLines.push(`- [${f.severity || '?'}] ${f.kind} · ${f.subject} (×${f.count || 1}, last ${f.lastStamp || '?'})`);
   }
+  const outcomes = Object.entries(state.findings).filter(([, f]) => f.outcome);
+  if (outcomes.length) {
+    headerLines.push('', 'Recorded finding outcomes (unrecorded outcomes remain unresolved):');
+    for (const [key, f] of outcomes.slice(-12)) headerLines.push(`- ${key}: ${f.outcome.status} · ${clip(f.outcome.message, 300)} · evidence: ${clip(f.outcome.evidence, 200)}`);
+  }
   if (dismissed.length) {
     headerLines.push('', 'findings Owner dismissed — do not raise these again:');
     for (const f of dismissed.slice(0, 12)) headerLines.push(`- ${f.kind} · ${f.subject}${f.why ? ` — ${f.why}` : ''}`);
+  }
+  const corrections = findingOutcomes().filter(row => row.outcome?.status === 'incorrect').slice(0, 6);
+  if (corrections.length) {
+    headerLines.push('', 'Prior corrected findings — retain these lessons, not the disproven claim:');
+    for (const row of corrections) headerLines.push(`- ${row.card}/${row.key}: ${clip(row.outcome.message, 400)} (evidence: ${clip(row.outcome.evidence, 200)})`);
   }
 
   const fm = task.fm;
@@ -1314,6 +1336,7 @@ function buildBundle(taskId, opts = {}) {
   const separators = Math.max(0, sections.length - 1) * 2;
   const md = applyBudget(sections, Math.max(0, budgetChars - separators)).join('\n\n');
   state.pendingBundle = bundleId;
+  state.pendingProbe = pendingProbe;
   state.pendingStatusEvidence = { since: state.lastReviewedAt || Date.now(), logHash: statusLogHash(task.body) };
   state.pendingLog = advanceLogWatermark(state.logSeen, logEntriesForReview);
   keep.withLock(() => { assertProjectUnchanged(); saveState(state); });
@@ -1427,6 +1450,7 @@ function suppressionReason(finding, task, headSha) {
   if (!finding) return null;
   if (finding.dismissed) return 'dismissed by Owner';
   const age = Date.now() - (finding.lastAt || 0);
+  if (['fixed', 'confirmed-deferred'].includes(finding.outcome?.status) && finding.lastSha === headSha && finding.lastStatus === task.fm.status) return 'outcome ' + finding.outcome.status;
   if (age >= SUPPRESS_MS) return null;
   if (finding.lastStatus && finding.lastStatus !== task.fm.status) return null;
   if (headSha && (finding.lastSha || '') !== headSha) return null;
@@ -1969,6 +1993,7 @@ async function nudge(taskId, opts) {
   if (!/^[0-9a-f]{16}$/.test(key)) throw new keep.KeepError('--key <finding-key> is required: nudges are tied to recorded findings (review-note first)');
   const state = loadState(taskId);
   if (!state.findings[key]) throw new keep.KeepError('no finding ' + key + ' on ' + taskId + ' - record it with review-note first');
+  if (options.send && !quality.canInterrupt(state.findings[key])) throw new keep.KeepError('live nudges require an unresolved observed finding with evidence and checked references; record or verify the finding first');
   if (fs.existsSync(path.join(REVIEWER_DIR, sessionId))) throw new keep.KeepError('refusing to nudge the reviewer itself');
   if (fs.existsSync(path.join(SPAWNED_DIR, sessionId))) throw new keep.KeepError('refusing to nudge a keep-spawned headless run');
 
@@ -2042,6 +2067,7 @@ async function nudge(taskId, opts) {
   // nudges must not both pass the decision and both deliver. A failed send rolls
   // the reservation back (lastAt deliberately kept - erring quiet, not loud).
   const gate = keep.withLock(() => {
+    if (!quality.canInterrupt(loadState(taskId).findings[key])) throw new keep.KeepError('finding changed or was resolved before nudge delivery');
     const store = loadNudges();
     const decision = nudgeDecision(store, { sessionId, key, now });
     if (decision.ok) saveNudges(recordNudge(store, { sessionId, key, now }));
@@ -2315,6 +2341,7 @@ async function reviewNote(taskId, opts) {
 }
 
 function recordReviewNote(taskId, opts, sessions, evidence) {
+  const assessment = quality.assessment(opts);
   const kind = String(opts.kind || '');
   if (!FINDING_KINDS.includes(kind)) {
     throw new keep.KeepError('--kind must be one of: ' + FINDING_KINDS.join(', '));
@@ -2366,7 +2393,9 @@ function recordReviewNote(taskId, opts, sessions, evidence) {
     commitState(taskId, { status: task.fm.status, bundle: opts.bundle });
     return { key, count: prior.count || 1, notApplied: 'dismissed by Jesse', suppressed: true };
   }
-  const reason = opts.force && !prior?.dismissed ? null : suppressionReason(prior, task, headSha);
+  const settled = ['incorrect', 'superseded'].includes(prior?.outcome?.status);
+  const reason = settled ? `outcome ${prior.outcome.status}: ${prior.outcome.message}`
+    : opts.force && !prior?.dismissed ? null : suppressionReason(prior, task, headSha);
   if (reason) {
     // Silence is not the same as unread. Promote the offsets anyway, or every later
     // tick re-reads these same bytes until the 24h suppression expires.
@@ -2380,6 +2409,9 @@ function recordReviewNote(taskId, opts, sessions, evidence) {
   const count = (prior && prior.count ? prior.count : 0) + 1;
   const stamp = keep.nowStamp();
   const finding = {
+    ...assessment,
+    outcome: null,
+    outcomeHistory: [...(prior?.outcomeHistory || []), ...(prior?.outcome ? [prior.outcome] : [])],
     kind,
     subject,
     severity,
@@ -2396,7 +2428,7 @@ function recordReviewNote(taskId, opts, sessions, evidence) {
   const tick = '`';
   const repeat = count > 1 ? '**(' + ordinal(count) + ' time)** ' : '';
   const head = repeat + '**' + kind + '** - ' + tick + clip(subject, 120) + tick + ' - severity ' + severity;
-  const body = [head, '', message];
+  const body = [head, '', quality.assessmentText(finding), '', message];
   // Only evidence-backed wrong-status findings can close or defer an unowned card.
   const refusal = opts.suggestStatus ? reviewerStatusRefusal(task, opts, prior, finding, sessions, evidence) : null;
   const appliedStatus = opts.suggestStatus && !refusal ? opts.suggestStatus : undefined;
@@ -2428,7 +2460,9 @@ function recordReviewNote(taskId, opts, sessions, evidence) {
         err.commitEvidence = true; // promote offsets outside the lock, as above
         throw err;
       }
-      const u = announceDecision({ kind, severity, count, key }, meta, Date.now());
+      const proposed = announceDecision({ kind, severity, count, key }, meta, Date.now());
+      const u = !proposed.announce || quality.canInterrupt(finding) ? proposed
+        : { announce: false, suppressed: 'finding needs verified evidence before interruption' };
       if (u.announce) meta.announce = recordAnnounce(meta.announce, key, Date.now());
       meta.global = meta.global || {};
       meta.global[gkey] = { taskId, key, at: Date.now() };
@@ -2456,7 +2490,7 @@ function recordReviewNote(taskId, opts, sessions, evidence) {
     if (urgency.announce) lines.push('[announced over speakers]');
     // visible, so you can see that something wanted to shout and was rate-limited
     else if (urgency.suppressed) lines.push('[suppressed-urgent] ' + urgency.suppressed);
-    lines.push('', message);
+    lines.push('', quality.assessmentText(finding), '', message);
     digestFile = landDigestLines(lines, opts);
   }
 
@@ -2500,7 +2534,7 @@ function reviewAck(taskId, message, opts) {
     return keep.withLock(() => reviewAck(taskId, message, { ...options, withinLock: true }));
   }
   const task = keep.loadTask(taskId);
-  const state = commitState(taskId, { status: task.fm.status, bundle: options.bundle });
+  const state = commitState(taskId, { status: task.fm.status, bundle: options.bundle, clean: true, probeSafe: options.probeSafe === true });
   if (message) {
     landDigestLines(['## ' + keep.nowStamp().slice(11) + ' - ' + taskId + '  [clean]', '', message], options);
     // Commit it here rather than leaving it for whichever review-note runs next to
@@ -2536,6 +2570,48 @@ function reviewDismiss(taskId, key, why, opts) {
     return finding;
   };
   return options.withinLock ? land() : keep.withLock(land);
+}
+
+function findingOutcomes() {
+  const rows = [];
+  let names = [];
+  try { names = fs.readdirSync(REVIEW_DIR); } catch { return rows; }
+  for (const name of names) {
+    if (!/^[a-z0-9][a-z0-9-]*\.json$/.test(name)) continue;
+    const card = name.slice(0, -5);
+    for (const [key, f] of Object.entries(loadState(card).findings)) {
+      rows.push({ card, key, kind: f.kind, subject: f.subject, severity: f.severity,
+        basis: f.basis || 'needs-verification', dismissed: Boolean(f.dismissed),
+        outcome: f.outcome || { status: 'unresolved' }, lastAt: f.lastAt });
+    }
+  }
+  return rows.sort((a, b) => (b.outcome.at || b.lastAt || 0) - (a.outcome.at || a.lastAt || 0));
+}
+
+function recordFindingOutcome(taskId, key, status, { message, evidence } = {}) {
+  if (keep.isReviewerSession()) throw new keep.KeepError('finding outcomes must be recorded by Owner or the work session, not self-graded by the reviewer');
+  if (!quality.OUTCOMES.includes(status)) throw new keep.KeepError('outcome must be one of: ' + quality.OUTCOMES.join(', '));
+  if (!String(message || '').trim() || !String(evidence || '').trim()) throw new keep.KeepError('an outcome needs -m reason and --evidence commit/check-in/reference (silence is not agreement)');
+  if (message.length > 2000 || evidence.length > 2000) throw new keep.KeepError('outcome reason and evidence are limited to 2000 characters each');
+  return keep.withLock(() => {
+    const task = keep.loadTask(taskId);
+    const state = loadState(taskId);
+    const finding = state.findings[key];
+    if (!finding) throw new keep.KeepError('no finding ' + key + ' on ' + taskId);
+    const outcome = { status, message: message.trim(), evidence: evidence.trim(), at: Date.now(),
+      by: keep.currentSession() || { agent: 'manual' } };
+    const body = `Finding ${key} (${finding.kind} · ${finding.subject}) → ${status}\n${outcome.message}\nEvidence: ${outcome.evidence}`;
+    keep.checkinTask(taskId, { message: body, heading: 'review outcome', linkSession: false, withinLock: true, commit: false });
+    // Reload in case check-in helpers touched the state; never replace coverage.
+    const fresh = loadState(taskId);
+    fresh.findings[key].outcomeHistory = [...(finding.outcomeHistory || []), ...(finding.outcome ? [finding.outcome] : [])];
+    fresh.findings[key].outcome = outcome;
+    saveState(fresh);
+    appendDigest(['## ' + keep.nowStamp().slice(11) + ' - finding outcome - ' + taskId, '', body]);
+    keep.commitAndPush(`keep: review outcome ${task.id} ${status}`, ['tasks', 'reviews']);
+    appendReviewEvent({ kind: 'outcome', card: taskId, key, title: status, detail: outcome.message });
+    return outcome;
+  });
 }
 
 const REVIEW_LAND_ARRAYS = ['acks', 'notes', 'ideas', 'dismiss'];
@@ -2589,6 +2665,7 @@ function validateReviewLand(document) {
     }
   };
   eachObject('acks', (item, label) => {
+    if (item.probeSafe !== undefined && typeof item.probeSafe !== 'boolean') problems.push(`${label}.probeSafe must be a boolean`);
     requiredString(item, 'id', label);
     requiredString(item, 'bundle', label);
     optionalString(item, 'message', label);
@@ -2596,6 +2673,8 @@ function validateReviewLand(document) {
     currentBundle(item, label);
   });
   eachObject('notes', (item, label) => {
+    for (const field of ['basis', 'evidence', 'checked']) optionalString(item, field, label);
+    try { quality.assessment(item); } catch (error) { problems.push(`${label}: ${error.message}`); }
     for (const field of ['id', 'kind', 'subject', 'severity', 'bundle', 'message']) requiredString(item, field, label);
     if (typeof item.kind === 'string' && item.kind && !FINDING_KINDS.includes(item.kind)) {
       problems.push(`${label}.kind must be one of: ${FINDING_KINDS.join(', ')}`);
@@ -2669,7 +2748,7 @@ async function reviewLand(document) {
       try {
         let detail;
         if (entry.type === 'ack') {
-          reviewAck(item.id, item.message, { bundle: item.bundle, withinLock: true, commit: false, digestLines: ackLines });
+          reviewAck(item.id, item.message, { bundle: item.bundle, probeSafe: item.probeSafe, withinLock: true, commit: false, digestLines: ackLines });
           counts.reviewed += 1;
           counts.clean += 1;
           detail = 'reviewed with no findings';
@@ -2677,6 +2756,7 @@ async function reviewLand(document) {
           const out = recordReviewNote(item.id, {
             kind: item.kind, subject: item.subject, severity: item.severity, bundle: item.bundle,
             message: item.message, suggestStatus: item.suggestStatus,
+            basis: item.basis, evidence: item.evidence, checked: item.checked,
             withinLock: true, commit: false, digestLines,
           }, sessions, evidence.get(item.id));
           counts.reviewed += 1;
@@ -2819,6 +2899,8 @@ function reviewStats() {
       } catch {}
     }
   } catch {}
+  const outcomeRows = findingOutcomes();
+  const outcomeCounts = Object.fromEntries(quality.OUTCOMES.map(status => [status, outcomeRows.filter(row => row.outcome.status === status).length]));
   let usage = null;
   try { usage = reviewerUsage(); } catch {}
   const today = keep.nowStamp().slice(0, 10);
@@ -2851,6 +2933,7 @@ function reviewStats() {
     announce: meta.announce || {},
     findingsTotal,
     dismissed,
+    outcomes: outcomeCounts,
     usage,
     transcript,
   };
@@ -2963,7 +3046,8 @@ function scoreTask(task, state, ctx) {
   // minutes as its age boost grows costs a bundle and an ack for the same verdict.
   // The card comes back when evidence lands or the finding is dismissed.
   const onlyOverdue = reasons.length === 1 && reasons[0] === 'overdue(15)';
-  const openFinding = Object.values(state.findings || {}).some((finding) => finding && !finding.dismissed);
+  const openFinding = Object.values(state.findings || {}).some((finding) => finding && !finding.dismissed
+    && (!finding.outcome || ['unresolved', 'confirmed-deferred'].includes(finding.outcome.status)));
   if (onlyOverdue && openFinding) return { score: 0, reasons, skip: 'open-finding' };
 
   const excluded = ctx.excluded || new Set();
@@ -3010,7 +3094,7 @@ function reviewQueue(options) {
   const excluded = excludedSessionIds();
   const reviewerIds = markerIds(REVIEWER_DIR);
   const shaCache = new Map();
-  const skips = { cooldown: 0, 'no-evidence': 0, 'open-finding': 0, selfExcluded: 0, lowScore: 0, 'same-stem': 0, 'reviewer-idea': 0 };
+  const skips = { cooldown: 0, 'probe-backoff': 0, 'no-evidence': 0, 'open-finding': 0, selfExcluded: 0, lowScore: 0, 'same-stem': 0, 'reviewer-idea': 0 };
   const ranked = [];
 
   for (const task of keep.loadAll(false)) {
@@ -3057,6 +3141,30 @@ function reviewQueue(options) {
     });
     if (result.skip) { skips[result.skip] += 1; continue; }
     if (result.score < minScore) { skips.lowScore += 1; continue; }
+    if (state.probe?.clean >= 2 && now < state.probe.nextReviewAt
+        && !result.reasons.some(reason => /^(new-log-entries|run-log-entries|status-change|failed-run|overdue)/.test(reason))
+        && !recentRun && !failedRun && !pendingHuman && !state.git.skippedFrom
+        && headSha && headSha === state.git.sha) {
+      const entries = [];
+      for (const session of sessions) {
+        const info = liveness.get(session.id);
+        const offset = state.sessions[session.id]?.offset || 0;
+        if (!info || info.state === 'gone') { entries.push({ id: session.id, probe: null }); continue; }
+        if (info.size === offset) continue;
+        try {
+          const delta = readDeltaLines(locateSession(session), offset, ACTIVITY_PROBE_BYTES);
+          entries.push({ id: session.id, probe: !delta.skipped ? probes.scanProbes(delta.lines, session.agent) : null });
+        } catch { entries.push({ id: session.id, probe: null }); }
+      }
+      const candidate = probes.combineProbes(entries);
+      if (probes.probeBackoff(state.probe, candidate, now)) {
+        // External edits/deploy commits must also bypass transcript-only backoff.
+        const currentGit = gitState(task.fm.project, state.git.sha);
+        if (currentGit.available && !/^\?\?/m.test(currentGit.status) && currentGit.head === state.git.sha && currentGit.dirtyHash === state.git.dirtyHash) {
+          skips['probe-backoff']++; continue;
+        }
+      }
+    }
     ranked.push({
       task: task.id,
       score: Math.round(result.score),
@@ -3693,6 +3801,8 @@ function startScheduler(deps) {
 
 
 module.exports = {
+  findingOutcomes,
+  recordFindingOutcome,
   resetProjectEvidence,
   bundleTimeContext,
   recordTickOutcome,

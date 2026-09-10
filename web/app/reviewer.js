@@ -2,7 +2,7 @@ import * as api from './api.js';
 
 const ACTIONS_KEY = 'keep.console.reviewer.actionsOnly';
 const SEEN_KEY = 'keep.console.reviewer.seenAt';
-const ICONS = { ack: '✓', finding: '!', idea: '◇', nudge: '→', dismiss: '✕', compact: '↓', tick: '·' };
+const ICONS = { ack: '✓', finding: '!', idea: '◇', nudge: '→', dismiss: '✕', compact: '↓', tick: '·', outcome: '✓' };
 const expandedDays = new Set();
 let actionsOnly = true;
 let seenAt = 0;
@@ -45,8 +45,8 @@ function eventHTML(ctx, event, cursor = seenAt, compact = false) {
 function countSummary(dayEvents) {
   const counts = new Map();
   for (const event of dayEvents) counts.set(event.kind, (counts.get(event.kind) || 0) + 1);
-  const labels = { tick: 'ticks', ack: 'acks', finding: 'findings', idea: 'ideas', dismiss: 'dismissals', nudge: 'nudges', compact: 'compacts' };
-  return ['tick', 'ack', 'finding', 'idea', 'dismiss', 'nudge', 'compact']
+  const labels = { tick: 'ticks', ack: 'acks', finding: 'findings', idea: 'ideas', dismiss: 'dismissals', outcome: 'outcomes', nudge: 'nudges', compact: 'compacts' };
+  return ['tick', 'ack', 'finding', 'idea', 'dismiss', 'outcome', 'nudge', 'compact']
     .filter((kind) => counts.has(kind)).map((kind) => `${counts.get(kind)} ${labels[kind]}`).join(', ');
 }
 
@@ -115,7 +115,12 @@ function atText(value) {
 function statsPopover(ctx) {
   const value = stats(ctx);
   const weekly = weeklyText(value.weekly);
-  return `<div class="review-pop"><b>Reviewer stats</b><dl><dt>last tick</dt><dd>${ctx.esc(atText(value.lastTickAt))}</dd><dt>last skip</dt><dd>${ctx.esc(value.lastSkip ? `${atText(value.lastSkip.at)} · ${value.lastSkip.why || ''}` : '—')}</dd><dt>compactions</dt><dd>${ctx.esc(value.compactionsToday ?? 0)} today</dd><dt>median ctx</dt><dd>${value.medianContextTokens == null ? '—' : `${Math.round(Number(value.medianContextTokens) / 1000)}k`}</dd><dt>weekly</dt><dd>${ctx.esc(`${weekly.usage} · ${weekly.label}`)}</dd><dt>findings</dt><dd>${ctx.esc(value.findingsTotal ?? '—')} total · ${ctx.esc(value.dismissed ?? '—')} dismissed</dd></dl></div>`;
+  return `<div class="review-pop"><b>Reviewer stats</b><dl><dt>last tick</dt><dd>${ctx.esc(atText(value.lastTickAt))}</dd><dt>last skip</dt><dd>${ctx.esc(value.lastSkip ? `${atText(value.lastSkip.at)} · ${value.lastSkip.why || ''}` : '—')}</dd><dt>compactions</dt><dd>${ctx.esc(value.compactionsToday ?? 0)} today</dd><dt>median ctx</dt><dd>${value.medianContextTokens == null ? '—' : `${Math.round(Number(value.medianContextTokens) / 1000)}k`}</dd><dt>weekly</dt><dd>${ctx.esc(`${weekly.usage} · ${weekly.label}`)}</dd><dt>findings</dt><dd>${ctx.esc(value.findingsTotal ?? '—')} total · ${ctx.esc(value.dismissed ?? '—')} dismissed</dd><dt>outcomes</dt><dd>${ctx.esc(outcomeSummary(value.outcomes))}</dd></dl></div>`;
+}
+
+export function outcomeSummary(outcomes) {
+  const labels = { fixed: 'fixed', 'confirmed-deferred': 'confirmed, deferred', incorrect: 'incorrect', superseded: 'superseded', unresolved: 'unresolved' };
+  return Object.entries(labels).map(([key, label]) => `${Number(outcomes?.[key] || 0)} ${label}`).join(' · ');
 }
 
 export function reviewerNewCount(ctx) {
