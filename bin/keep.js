@@ -4614,7 +4614,14 @@ async function recordSessionPane(input, agent = 'claude', deps = {}) {
         if (typeof owner === 'string' && /^[A-Za-z0-9_-]+$/.test(owner)) {
           try { released = Boolean(JSON.parse(fs.readFileSync(path.join(dir, `${owner}.json`), 'utf8')).released); } catch {}
         }
-        if (!released) { record.boundTo = owner; break; }
+        const switched = !released && agent === 'codex'
+          && await require('./codex-pane').ownsPane(sid, current.pane, deps);
+        if (!released && !switched) { record.boundTo = owner; break; }
+        if (switched) {
+          const fresh = await client.request('get', { pane }, { timeoutMs });
+          if (!fresh.pane?.alive || fresh.pane.pid !== current.pane.pid
+              || fresh.pane.meta?.sessionId !== owner) { record.boundTo = owner; break; }
+        }
         record.claimed = true;
       } else if (!owner) {
         record.claimed = true;
