@@ -99,8 +99,13 @@ function createManager({ file, inspect, restart, forceRestart, onChange = () => 
       }
       if (entries.filter((e) => ['queued', 'restarting', 'recovery-needed'].includes(e.status)).length >= 50) throw Error('Restart queue is full');
       const { session, pane } = await inspect(body);
+      if (entries.some(e => e.sessionId === body.sessionId && e.status === 'recovery-needed')) throw Error('Interrupted restart requires explicit recovery');
       const raced = entries.find((e) => e.sessionId === body.sessionId && ['queued', 'restarting'].includes(e.status));
-      if (raced) return raced;
+      if (raced) {
+        if (raced.mode !== body.mode || raced.pane !== body.pane) throw Error('A different restart is already pending; cancel it first');
+        return raced;
+      }
+      if (entries.filter((e) => ['queued', 'restarting', 'recovery-needed'].includes(e.status)).length >= 50) throw Error('Restart queue is full');
       if (!session || !pane?.alive || pane.meta?.sessionId !== body.sessionId || session.reviewer) throw Error('Expected a live non-reviewer session in this pane');
       const entry = { sessionId: body.sessionId, pane: body.pane, pid: pane.pid, mode: body.mode, status: 'queued', at: Date.now(),
         ...(body.mode === 'force' ? { token: require('node:crypto').randomUUID() } : {}) };

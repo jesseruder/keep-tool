@@ -2395,7 +2395,8 @@ async function forceRestartSession(entry, save, deps = {}) {
         const argv = [original.agent, ...(original.bypass ? [bypass] : []), original.agent === 'codex' ? 'resume' : '--resume', job.sessionId];
         const stopped = (await host('get', { pane: job.pane })).pane;
         if (stopped.alive || stopped.pid !== expectedPid || (stopped.meta?.sessionId !== job.sessionId
-          && !(expectedPid === job.pid && stopped.createdAt === original.createdAt && stopped.meta?.agent === 'shell' && !stopped.meta.sessionId))) {
+          && !(stopped.meta?.agent === 'shell' && !stopped.meta.sessionId
+            && ((expectedPid === job.pid && stopped.createdAt === original.createdAt) || stopped.meta.forceRestartToken === job.token)))) {
           throw Error('Exited pane changed before resume');
         }
         const result = await host('replace-exited', { paneId: job.pane, expectedPid, sessionId: stopped.meta?.sessionId,

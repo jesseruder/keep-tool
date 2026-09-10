@@ -40,6 +40,21 @@ test('explicit force requests are durable and interrupted transactions require e
     assert.equal(manager.snapshot()[0].status, 'recovery-needed');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+test('a concurrent inspect cannot queue around a newly interrupted journal', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-force-raced-')), file = path.join(root, 'queue.json');
+  try {
+    let release, entered, calls = 0; const pending = new Promise(r => { release = r; }), ready = new Promise(r => { entered = r; });
+    const manager = createManager({ file, inspect: async () => {
+      if (++calls === 1) { entered(); await pending; }
+      return { session: { id: 's' }, pane: { id: 'p', pid: 10, alive: true, meta: { sessionId: 's' } } };
+    }, forceRestart: async (entry, save) => { entry.original = { pid: 10 }; save(); throw Error('interrupted'); } });
+    const body = { sessionId: 's', pane: 'p', mode: 'force', confirmInterruption: true };
+    const first = manager.request(body); await ready;
+    await manager.request(body); await manager.tick(); release();
+    await assert.rejects(first, /explicit recovery/);
+    assert.deepEqual(manager.snapshot().map(e => e.status), ['recovery-needed']);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
 
 test('pre-input safety races stay queued, persist and retry, while hard failures do not', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-restart-race-'));

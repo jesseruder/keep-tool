@@ -35,7 +35,7 @@ async function run(entry, deps) {
   }
   const original = entry.original;
   const ownReplacement = pane?.id === entry.pane && pane.meta?.forceRestartToken === entry.token
-    && pane.meta?.sessionId === entry.sessionId;
+    && (pane.meta?.sessionId === entry.sessionId || (!pane.alive && pane.meta?.agent === 'shell' && !pane.meta.sessionId));
   // Recovery after replace-exited succeeded but its response/checkpoint was lost.
   if (ownReplacement && pane.alive) {
     await deps.verifyStarted?.(original);

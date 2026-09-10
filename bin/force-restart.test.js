@@ -37,11 +37,14 @@ test('lost replace acknowledgement recognizes exact token and does not launch tw
   await run(f.entry, f.deps); assert.equal(f.replaces(), 1);
 });
 test('dead replacement can be explicitly recovered with its own PID as CAS target', async () => {
+  for (const demote of [false, true]) {
   const f = fixture(), replace = f.deps.replace;
-  f.deps.replace = async () => { await replace(); f.pane().alive = false; throw Error('launch exited'); };
+  f.deps.replace = async () => { await replace(); f.pane().alive = false;
+    if (demote) f.pane().meta = { agent: 'shell', forceRestartToken: 'unique' }; throw Error('launch exited'); };
   await assert.rejects(run(f.entry, f.deps), /launch exited/);
   f.deps.replace = async (original, job, expectedPid) => { assert.equal(expectedPid, 20); return replace(); };
   await run(f.entry, f.deps); assert.equal(f.replaces(), 2); assert.equal(f.closes(), 1);
+  }
 });
 test('zombies do not block resume; live leftovers and another session instance do', async () => {
   const f = fixture(); f.deps.signal = async () => {};
