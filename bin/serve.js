@@ -4534,11 +4534,12 @@ function start(deps = {}) {
   restartTimer.unref();
   if (process.env.KEEP_AUTO_CLOSE !== '0') {
     const cleanupSnapshot = async () => {
-        const panes = await listHostPanes();
-        const state = await addHostSessionState(await buildState({ hostPanes: panes }), { panes });
-        const layouts = await keepConsole.readLayouts(path.join(keep.ROOT, '.keep', 'layouts.json'));
-        return { ...state, pinned: new Set((layouts.layouts || []).flatMap((layout) => layout.ids || [])) };
-      };
+      // Shell verification must see new viewers/output even inside the host-list cache TTL.
+      const panes = await listHostPanes({}, true);
+      const state = await addHostSessionState(await buildState({ hostPanes: panes }), { panes });
+      const layouts = await keepConsole.readLayouts(path.join(keep.ROOT, '.keep', 'layouts.json'));
+      return { ...state, pinned: new Set((layouts.layouts || []).flatMap((layout) => layout.ids || [])) };
+    };
     require('./session-cleanup').startScheduler({
       snapshot: cleanupSnapshot,
       closeShell: pane => withInjectionLock(() => require('./shell-cleanup').close(pane, {
