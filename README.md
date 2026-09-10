@@ -1,14 +1,108 @@
 # Keep
 
-A local work registry and console for Claude Code and Codex. Keep tracks tasks,
-experiments, agent sessions, dependencies, and work that needs your attention.
-Each person runs their own Keep and owns their own private, Git-backed registry.
-This repository contains application source, never your cards or session history.
+Keep helps you manage work across Claude Code and Codex sessions. It combines a
+private task registry, a console for your agents' terminals, and a background service
+that follows up on work after you leave a conversation.
 
-The full automation suite is included: fleet reviews, scheduled checks, dependency
-notifications, usage-limit recovery, compaction, session cleanup, and daily ideas.
-The first distribution targets macOS. The browser console and terminal host ship
-with the CLI; the optional desktop shell is in `desktop/`. The Expo mobile app is in `app/`.
+Use it when you have several projects or agents running at once: see who needs an
+answer, remember what each session is doing, resume unfinished work, and arrange
+for an agent to check something later. A task survives the terminal session that
+started it, with its plan, decisions, dependencies, and next step intact.
+
+Each person runs their own Keep. Your tasks live in a private, Git-backed registry;
+this repository contains the application source. “Fleet” means the collection of
+agent sessions your Keep tracks across your projects.
+
+## What you can do with it
+
+- **Keep a durable record of work.** Each task is a Markdown card with a status,
+  project, tags, plan, and check-in history. Agents can record commits, experiment
+  identifiers, results, and the next action, so a later session can pick up where
+  they left off.
+- **See where your input is needed.** Triage brings together agent questions,
+  permission requests, completed turns, and other attention items. Open the related
+  terminal, answer a question, or snooze an item while working on something else.
+- **Follow several sessions at once.** Pin terminals in Watch, switch between
+  projects, and launch or resume Claude Code and Codex sessions from the console or
+  CLI. The terminal host owns the processes, so closing the console window or
+  restarting the daemon leaves those sessions running.
+- **Make follow-up work executable.** Give a task a time and a check recipe, such as
+  “check the experiment tomorrow and report whether it has enough samples.” Keep
+  attempts to deliver the recipe to the associated session when it is available,
+  or runs it in a headless agent when needed.
+- **Coordinate dependent work.** Record that one task depends on another task or a
+  particular plan step. When that dependency is satisfied, Keep notifies the
+  waiting session so it can continue. Questions for you can also be recorded in a
+  persistent inbox instead of getting lost at the end of a conversation.
+- **Get a second opinion across projects.** A dedicated reviewer examines changes
+  in task records and session evidence, records findings, and highlights problems
+  such as stalled work, conflicting claims, or missing verification. A separate
+  daily ideas pass proposes improvements to recurring workflows.
+
+## A typical workflow
+
+After setup, create a task and hand it to an agent. For example, from a project
+checkout:
+
+```sh
+keep add "Improve checkout errors" --project "$PWD" --status active
+keep open improve-checkout-errors --fresh -m "Inspect checkout validation, improve the error messages, and verify the changes."
+```
+
+The bundled Keep skill teaches the agent to record progress and next steps on the
+card. You can watch its terminal in the console and respond when it needs a
+decision. From another terminal, inspect the task or get an overview:
+
+```sh
+keep show improve-checkout-errors
+keep list
+keep brief
+keep resume
+```
+
+For longer-running work, the important part is recording what should happen next.
+A deployment check can have a scheduled recipe; a frontend task can wait on an API
+task; an experiment can retain its identifier and the criteria for evaluating it.
+These records give the next agent concrete instructions rather than requiring you
+to reconstruct the previous conversation.
+
+## Automation included
+
+The daemon runs scheduling and bookkeeping in the background. Depending on your
+configuration and available agent sessions, Keep can:
+
+- Run due check recipes, deliver dependency notifications, and surface unanswered
+  owner questions.
+- Run reviewer ticks and the daily ideas sweep, generate a standup draft, and flag
+  stale or inconsistent task records.
+- Detect when cited commits reach a project's default branch and update eligible
+  task records according to the configured landing policy.
+- Track model usage, defer work when budget headroom is low, and resume eligible
+  sessions after usage limits reset.
+- Compact supported sessions when enabled, reconcile parent and child session
+  activity, and check process ownership and outstanding jobs before automated
+  session cleanup or restart.
+
+Scheduling, model access, and launch permissions are separate controls. Model-backed
+checks and reviews use your Claude account; Keep is not a model service. Optional
+Slack polling and notification integrations require their own configuration.
+See [configuration](#configuration) and the [command reference](docs/reference.md)
+for the controls and prerequisites.
+
+## How the pieces fit together
+
+| Piece | What it does |
+| --- | --- |
+| Private registry | Stores task cards, plans, and check-ins in Git, with runtime state kept separately inside the registry directory. |
+| CLI and agent hooks | Let you and your agents update cards and connect work to session activity. |
+| Daemon | Serves the console/API and runs the background schedulers. |
+| Terminal host | Owns agent processes and streams their terminals to the console. |
+| Browser and desktop app | Provide Triage, pinned terminals, fleet status, and reviewer views. The macOS shell adds native notifications and a Dock badge. |
+| Mobile app | Connects to your daemon to check work, respond to sessions, and read reviewer activity from your phone. |
+
+The initial host setup targets macOS. The desktop shell and Expo mobile app are
+included in this repo; each connects to your own running Keep service. The registry
+stays local unless you explicitly configure synchronization with a private remote.
 
 ## Screenshots
 
