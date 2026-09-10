@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { scanProbes, combineProbes, acknowledgeProbe, probeBackoff } = require('./review-probes');
-const { replayReviews } = require('./review-replay');
+const { replayReviews, replayRecords } = require('./review-replay');
 
 function turn(n, result = '{"count":0,"error":false}') {
   const timestamp = new Date(1000000 + n * 20 * 60e3).toISOString();
@@ -85,4 +85,23 @@ test('benign harness metadata is ignored but hook errors and context force revie
   for (const override of [{ hookErrors: ['failed'] }, { hookAdditionalContext: ['new instruction'] }, { preventedContinuation: true }, { hasOutput: true }]) {
     assert.equal(scanProbes([...turn(1), { ...hook, ...override }]).eligible, false);
   }
+});
+
+test('historical replay retains unknown undated and malformed records as live vetoes', () => {
+  const rows = [...turn(0), ...turn(1), { type: 'unknown-undated-metadata' }, ...turn(2)];
+  const records = replayRecords(rows.map(row => JSON.stringify(row)).join('\n'), 0);
+  assert.equal(records.length, rows.length);
+  assert.equal(scanProbes(records).eligible, false);
+  assert.equal(replayRecords('malformed\n' + JSON.stringify(turn(1)[0]), 0)[0].type, 'unreadable');
+});
+
+test('session presentation metadata is benign while mode changes change the fingerprint', () => {
+  const metadata = [{ type: 'ai-title', sessionId: 's', aiTitle: 'Generated title' }, { type: 'bridge-session', sessionId: 's', bridgeSessionId: 'id', lastSequenceNum: 0 }, { type: 'atis-latch', atis: '' }];
+  assert.equal(scanProbes([...turn(0), ...metadata]).fingerprint, scanProbes(turn(0)).fingerprint);
+  assert.equal(scanProbes([...turn(0), { ...metadata[0], context: 'new evidence' }]).eligible, false);
+  const normal = { type: 'mode', mode: 'normal' };
+  const plan = { type: 'mode', mode: 'plan' };
+  assert.notEqual(scanProbes([...turn(0), normal]).fingerprint, scanProbes([...turn(0), plan]).fingerprint);
+  assert.equal(scanProbes([...turn(0), normal, plan]).eligible, false);
+  assert.equal(scanProbes([...turn(0), { type: 'atis-latch', atis: 'unknown' }]).eligible, false);
 });

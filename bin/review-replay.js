@@ -26,6 +26,23 @@ function replayReviews(records, ticks) {
   return { reviews: rows.length, deferred: rows.filter(r => r.deferred).length, retained: rows.filter(r => !r.deferred).length, rows };
 }
 
+// Preserve file order and every classifier veto. Undated metadata is assigned to
+// the preceding dated event (leading metadata to the first event), not discarded.
+function replayRecords(text, start) {
+  let at = null;
+  const rows = text.split('\n').filter(Boolean).map(line => {
+    let record;
+    try { record = JSON.parse(line); } catch { record = { type: 'unreadable' }; }
+    if (!record || typeof record !== 'object') record = { type: 'unreadable' };
+    const timestamp = Date.parse(record.timestamp);
+    if (Number.isFinite(timestamp)) at = at === null ? timestamp : Math.max(at, timestamp);
+    return { record, at };
+  });
+  const first = rows.find(row => row.at !== null)?.at ?? start;
+  return rows.map(row => ({ ...row.record, timestamp: new Date(row.at ?? first).toISOString() }))
+    .filter(record => Date.parse(record.timestamp) >= start);
+}
+
 function replayCard(card, since, sessionId) {
   const keep = require('./keep.js');
   const task = keep.loadTask(card);
@@ -37,10 +54,7 @@ function replayCard(card, since, sessionId) {
   const transcripts = require('./transcripts');
   const file = transcripts.findSessionFile(session.id);
   if (!file || fs.statSync(file).size > 32 * 1024 * 1024) throw new keep.KeepError('replay needs a readable transcript under 32 MB');
-  const records = transcripts.readTranscript(file).split('\n').filter(Boolean).map(line => {
-    try { return JSON.parse(line); } catch { return null; }
-  }).filter(r => r && Number.isFinite(Date.parse(r.timestamp)) && Date.parse(r.timestamp) >= start)
-    .sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+  const records = replayRecords(transcripts.readTranscript(file), start);
   const ticks = new Map();
   const directory = path.join(keep.ROOT, 'reviews');
   for (const name of fs.readdirSync(directory)) {
@@ -50,14 +64,15 @@ function replayCard(card, since, sessionId) {
       if (!match) continue;
       const at = Date.parse(`${name.slice(0, 10)}T${match[1]}:59`);
       if (at < start) continue;
-      const clean = block.match(/clean, nothing to flag \(\d+\): (.+)/)?.[1].split(', ').includes(card);
+      const clean = match[2] === card + '  [clean]'
+        || block.match(/clean, nothing to flag \(\d+\): (.+)/)?.[1].split(', ').includes(card);
       const finding = match[2].startsWith(card + '  [') && /\*\*[^*]+\*\* - subject:/.test(block);
       if (finding || clean) ticks.set(at, { at, clean: finding ? false : ticks.get(at)?.clean ?? true });
     }
   }
   return { card, session: session.id, ignoredSessions: sessions.filter(s => s.id !== session.id).map(s => s.id), since: new Date(start).toISOString(), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-    assumption: 'Transcript-only counterfactual at recorded review times; historical clean probes treated as reviewer-approved read-only. Does not reconstruct external git, card, or scheduler changes, which bypass backoff in live selection. Inspect retained/deferred rows before enabling a probe.',
+    assumption: 'Transcript-only counterfactual at recorded review times; undated metadata attributed to the preceding dated event (leading metadata to the first event); historical clean probes treated as reviewer-approved read-only. Does not reconstruct external git, card, or scheduler changes, which bypass backoff in live selection. Inspect retained/deferred rows before enabling a probe.',
     ...replayReviews(records, [...ticks.values()]) };
 }
 
-module.exports = { replayReviews, replayCard };
+module.exports = { replayReviews, replayRecords, replayCard };

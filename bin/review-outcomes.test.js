@@ -36,6 +36,13 @@ test('outcomes require explicit evidence, preserve ownership, appear in stats an
     assert.equal(JSON.parse(ok(['review-outcome', 'outcome-fixture', '--json']))[0].outcome.status, 'unresolved');
     const invalid = run([...note, '--basis', 'observed', '--evidence', 'delta']);
     assert.notEqual(invalid.status, 0);
+    const upgradedBundle = ok(['review-bundle', 'outcome-fixture', '--force']);
+    const bundleId = upgradedBundle.match(/bundle: ([0-9a-f]{8})/)[1];
+    const document = { notes: [{ id: 'outcome-fixture', bundle: bundleId, kind: 'no-tests', subject: 'unit test', severity: 'low', message: 'Verified no test exists.', basis: 'observed', evidence: 'repository test inventory', checked: 'Inspected parent verification and test files' }] };
+    const docFile = path.join(root, 'landing.json'); fs.writeFileSync(docFile, JSON.stringify(document));
+    ok(['review-land', '--file', docFile]);
+    assert.equal(state().findings[key].basis, 'observed', 'a verified follow-up bypasses repeat suppression');
+    assert.equal(state().findings[key].checked, document.notes[0].checked);
     const before = fs.readFileSync(stateFile, 'utf8');
     assert.notEqual(run(['review-outcome', 'outcome-fixture', key, 'fixed', '-m', 'fixed']).status, 0);
     assert.equal(fs.readFileSync(stateFile, 'utf8'), before);

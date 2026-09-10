@@ -9,6 +9,24 @@ const blockedTool = /^(Bash|Write|Edit|MultiEdit|NotebookEdit|Agent|Task|CronCre
 const noise = new Set(['queue-operation', 'progress', 'file-history-snapshot', 'last-prompt']);
 const attachments = new Set(['total_tokens_reminder', 'skill_listing', 'budget_usd', 'token_usage']);
 
+const metadataKeys = {
+  'ai-title': ['type', 'sessionId', 'aiTitle'],
+  'bridge-session': ['type', 'sessionId', 'bridgeSessionId', 'lastSequenceNum', 'ownerAccountUuid', 'ownerOrganizationUuid'],
+  'cost-state': ['type', 'sessionId', 'totalCostUSD', 'totalAPIDuration', 'totalAPIDurationWithoutRetries', 'totalToolDuration', 'totalLinesAdded', 'totalLinesRemoved', 'totalDuration', 'startTime', 'modelUsage', 'hasUnknownModelCost'],
+};
+const onlyKeys = (record, keys) => Object.keys(record).every(key => keys.includes(key) || key === 'timestamp');
+function benignMetadata(record) {
+  const keys = metadataKeys[record.type];
+  if (!keys || !onlyKeys(record, keys) || typeof record.sessionId !== 'string') return false;
+  if (record.type === 'ai-title') return typeof record.aiTitle === 'string';
+  if (record.type === 'bridge-session') return typeof record.bridgeSessionId === 'string' && Number.isSafeInteger(record.lastSequenceNum)
+    && ['ownerAccountUuid', 'ownerOrganizationUuid'].every(key => record[key] === undefined || typeof record[key] === 'string');
+  return keys.filter(key => !['type', 'sessionId', 'modelUsage', 'hasUnknownModelCost'].includes(key))
+    .every(key => Number.isFinite(record[key])) && typeof record.hasUnknownModelCost === 'boolean'
+    && record.modelUsage && typeof record.modelUsage === 'object' && !Array.isArray(record.modelUsage)
+    && Object.values(record.modelUsage).every(value => value && typeof value === 'object' && Object.values(value).every(Number.isFinite));
+}
+
 function stable(value) {
   if (Array.isArray(value)) return value.map(stable);
   if (value && typeof value === 'object') return Object.fromEntries(Object.keys(value).sort().map(k => [k, stable(value[k])]));
@@ -18,6 +36,7 @@ function stable(value) {
 function scanProbes(lines, agent = 'claude') {
   if (agent !== 'claude') return { eligible: false, reason: 'unrecognized automation provenance', turns: [] };
   const turns = [];
+  const modes = {};
   let current = null;
   let unsafe = '';
   const finish = () => {
@@ -32,7 +51,14 @@ function scanProbes(lines, agent = 'claude') {
     try { r = typeof line === 'string' ? JSON.parse(line) : line; } catch { unsafe = 'unreadable record'; continue; }
     if (!r) { unsafe = 'unreadable record'; continue; }
     if (r.isSidechain) { unsafe = 'background activity'; continue; }
-    if (noise.has(r.type)) continue;
+    if (noise.has(r.type) || benignMetadata(r)) continue;
+    if (r.type === 'mode' || r.type === 'permission-mode') {
+      const value = r.type === 'mode' ? r.mode : r.permissionMode;
+      if (!onlyKeys(r, ['type', 'sessionId', r.type === 'mode' ? 'mode' : 'permissionMode']) || typeof value !== 'string' || (modes[r.type] !== undefined && modes[r.type] !== value)) unsafe = 'session mode changed';
+      modes[r.type] = value;
+      continue;
+    }
+    if (r.type === 'atis-latch' && r.atis === '' && onlyKeys(r, ['type', 'sessionId', 'atis'])) continue;
     if (r.type === 'attachment') {
       if (!attachments.has(r.attachment?.type)) unsafe = 'unrecognized attachment';
       continue;
@@ -91,7 +117,7 @@ function scanProbes(lines, agent = 'claude') {
   finish();
   const fingerprint = turns[0]?.fingerprint;
   const eligible = !unsafe && turns.length > 0 && turns.every(t => t.eligible && t.fingerprint === fingerprint);
-  return { eligible, fingerprint: eligible ? fingerprint : null, count: turns.length,
+  return { eligible, fingerprint: eligible ? hash([fingerprint, stable(modes)]) : null, count: turns.length,
     reason: unsafe || turns.find(t => !t.eligible)?.reason || (!eligible ? 'probe results changed' : ''), turns };
 }
 

@@ -2400,9 +2400,12 @@ function recordReviewNote(taskId, opts, sessions, evidence) {
     commitState(taskId, { status: task.fm.status, bundle: opts.bundle });
     return { key, count: prior.count || 1, notApplied: 'dismissed by Jesse', suppressed: true };
   }
+  const verifiedFollowup = prior && !prior.dismissed
+    && (!prior.outcome || prior.outcome.status === 'unresolved')
+    && !quality.canInterrupt(prior) && quality.canInterrupt(assessment);
   const settled = ['incorrect', 'superseded'].includes(prior?.outcome?.status);
   const reason = settled ? `outcome ${prior.outcome.status}: ${prior.outcome.message}`
-    : opts.force && !prior?.dismissed ? null : suppressionReason(prior, task, headSha);
+    : (opts.force && !prior?.dismissed) || verifiedFollowup ? null : suppressionReason(prior, task, headSha);
   if (reason) {
     // Silence is not the same as unread. Promote the offsets anyway, or every later
     // tick re-reads these same bytes until the 24h suppression expires.
