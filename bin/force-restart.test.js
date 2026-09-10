@@ -9,6 +9,7 @@ function fixture() {
   const phases = [], signals = []; let closes = 0, replaces = 0;
   const deps = {
     getPane: async () => pane, rows: async () => rows, save: async () => phases.push(entry.phase), sleep: async () => {},
+    identifyOriginal: async () => ({ pid: 11, pidStart: 'agent', primary: true }),
     close: async () => { assert.equal(entry.phase, 'closing'); assert.ok(entry.processes); closes++; pane.alive = false; rows = rows.filter(p => p.pid === 12).map(p => ({ ...p, ppid: 1, args: 'changed during exit' })); },
     signal: async (pid, signal) => { signals.push({ pid, signal }); rows = rows.filter(p => p.pid !== pid); },
     sessionLive: async () => false,
@@ -35,6 +36,13 @@ test('lost replace acknowledgement recognizes exact token and does not launch tw
   await assert.rejects(run(f.entry, f.deps), /lost reply/);
   await run(f.entry, f.deps); assert.equal(f.replaces(), 1);
 });
+test('dead replacement can be explicitly recovered with its own PID as CAS target', async () => {
+  const f = fixture(), replace = f.deps.replace;
+  f.deps.replace = async () => { await replace(); f.pane().alive = false; throw Error('launch exited'); };
+  await assert.rejects(run(f.entry, f.deps), /launch exited/);
+  f.deps.replace = async (original, job, expectedPid) => { assert.equal(expectedPid, 20); return replace(); };
+  await run(f.entry, f.deps); assert.equal(f.replaces(), 2); assert.equal(f.closes(), 1);
+});
 test('zombies do not block resume; live leftovers and another session instance do', async () => {
   const f = fixture(); f.deps.signal = async () => {};
   await assert.rejects(run(f.entry, f.deps), /Old processes remain/);
@@ -48,6 +56,14 @@ test('recovery refuses pane identity replacement', async () => {
   await assert.rejects(run(f.entry, f.deps), /did not close/);
   await assert.rejects(run(f.entry, f.deps), /Pane changed/);
   assert.equal(f.replaces(), 0);
+});
+test('permission class comes only from the verified original agent, never a nested agent', async () => {
+  const f = fixture(), rows = await f.deps.rows();
+  f.rows([...rows, { pid: 13, ppid: 11, pidStart: 'child-agent', agent: 'codex', interactive: true,
+    args: 'codex --dangerously-bypass-approvals-and-sandbox resume child' }]);
+  await run(f.entry, f.deps); assert.equal(f.entry.original.bypass, false);
+  const other = fixture(); other.deps.identifyOriginal = async () => ({ pid: 90, pidStart: 'other', primary: true });
+  await assert.rejects(run(other.entry, other.deps), /No verified owned/); assert.equal(other.closes(), 0);
 });
 test('new descendants of a still-owned helper are captured before cleanup', async () => {
   const f = fixture(), close = f.deps.close;
@@ -72,7 +88,7 @@ test('same-instance shell demotion remains recoverable and startup failure stays
 });
 test('daemon adapter preserves pane, conversation and permission class for both agents', async () => {
   const { forceRestartSession } = require('./serve');
-  for (const agent of ['codex', 'claude']) for (const bypass of [true, false]) {
+  for (const agent of ['codex', 'claude']) for (const bypass of [true, false]) for (const demote of [true, false]) {
     const f = fixture(); f.pane().meta.agent = agent;
     const flag = agent === 'codex' ? '--dangerously-bypass-approvals-and-sandbox' : '--dangerously-skip-permissions';
     f.rows([{ pid: 10, ppid: 1, pidStart: 'shell' }, { pid: 11, ppid: 10, pidStart: 'agent',
@@ -80,18 +96,20 @@ test('daemon adapter preserves pane, conversation and permission class for both 
     let launch, verified = false;
     await forceRestartSession(f.entry, f.deps.save, {
       withInjectionLock: fn => fn(), forceRows: f.deps.rows, sleep: async () => {}, lsof: async () => '',
-      closeIdleSession: async () => { f.pane().alive = false; f.rows([]); },
+      closeIdleSession: async () => { f.pane().alive = demote; if (demote) f.pane().meta = { agent: 'shell' }; f.rows([]); },
       waitForHostAgent: async () => { assert.ok(launch); verified = true; },
       host: { request: async (type, params) => {
         if (type === 'hello') return { replaceExited: true };
         if (type === 'get') return { pane: f.pane() };
+        if (type === 'kill') { assert.equal(params.pane, 'p'); f.pane().alive = false; return {}; }
         assert.equal(type, 'replace-exited'); launch = params;
         assert.equal(f.pane().alive, false);
         return { pane: { id: 'p', pid: 20 } };
       } },
     });
     assert.equal(launch.paneId, 'p'); assert.equal(launch.expectedPid, 10);
-    assert.equal(launch.sessionId, 's'); assert.equal(launch.meta.forceRestartToken, 'unique');
+    assert.equal(launch.sessionId, demote ? undefined : 's'); assert.equal(launch.meta.sessionId, 's');
+    assert.equal(launch.meta.forceRestartToken, 'unique');
     assert.equal(launch.args[1].includes(flag), bypass); assert.equal(verified, true);
   }
 });

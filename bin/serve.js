@@ -2372,20 +2372,33 @@ async function forceRestartSession(entry, save, deps = {}) {
     });
     return require('./force-restart').run(entry, {
       save, rows, sleep: deps.sleep,
+      identifyOriginal: async (sid, snapshot) => (await liveSessionPids({ ...deps, agentProcessRows: async () => snapshot })).get(sid),
       verifyStarted: original => (deps.waitForHostAgent || waitForHostAgent)({ pane: entry.pane }, original.agent, deps),
       getPane: async pane => (await host('get', { pane })).pane,
       close: body => require('./manual-close').manualClose(body, {
-        getPane: async pane => (await host('get', { pane })).pane,
+        sleep: deps.sleep,
+        getPane: async id => {
+          const pane = (await host('get', { pane: id })).pane;
+          // SessionEnd can clear the conversation link before the owning login
+          // shell exits. Normalize only this exact captured pane instance.
+          return pane?.id === entry.pane && pane.pid === entry.pid && pane.createdAt === entry.original.createdAt
+            && pane.meta?.agent === 'shell' && !pane.meta.sessionId
+            ? { ...pane, meta: { ...pane.meta, agent: entry.original.agent, sessionId: entry.sessionId } } : pane;
+        },
         graceful: request => (deps.closeIdleSession || closeIdleSession)(request, { ...deps, closePolicy: { manual: true }, withInjectionLock: fn => fn() }),
         signal: (pane, signal) => host('kill', { pane, signal }),
       }),
       signal: async (pid, signal) => { try { process.kill(pid, signal); } catch (e) { if (e.code !== 'ESRCH') throw e; } },
       sessionLive: async sid => (await liveSessionPids({ ...deps, agentProcessRows: rows })).has(sid),
-      replace: async (original, job) => {
+      replace: async (original, job, expectedPid) => {
         const bypass = original.agent === 'codex' ? '--dangerously-bypass-approvals-and-sandbox' : '--dangerously-skip-permissions';
         const argv = [original.agent, ...(original.bypass ? [bypass] : []), original.agent === 'codex' ? 'resume' : '--resume', job.sessionId];
         const stopped = (await host('get', { pane: job.pane })).pane;
-        const result = await host('replace-exited', { paneId: job.pane, expectedPid: job.pid, sessionId: stopped.meta?.sessionId,
+        if (stopped.alive || stopped.pid !== expectedPid || (stopped.meta?.sessionId !== job.sessionId
+          && !(expectedPid === job.pid && stopped.createdAt === original.createdAt && stopped.meta?.agent === 'shell' && !stopped.meta.sessionId))) {
+          throw Error('Exited pane changed before resume');
+        }
+        const result = await host('replace-exited', { paneId: job.pane, expectedPid, sessionId: stopped.meta?.sessionId,
           cmd: '/bin/zsh', args: ['-lic', `exec ${argv.map(shellQuoteArg).join(' ')}`], cwd: original.cwd,
           cols: original.cols, rows: original.rows, meta: { ...original.meta, forceRestartToken: job.token, restartedAt: Date.now() } });
         return { ok: true, pane: result.pane.id, pid: result.pane.pid, sessionId: job.sessionId };

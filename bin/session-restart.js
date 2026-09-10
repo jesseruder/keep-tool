@@ -42,6 +42,7 @@ function createManager({ file, inspect, restart, forceRestart, onChange = () => 
   };
   save();
   const run = async (entry) => {
+    if (entry.status !== 'queued') return entry;
     if (busy) return entry;
     busy = true;
     try {

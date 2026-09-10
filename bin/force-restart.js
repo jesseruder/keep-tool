@@ -22,23 +22,27 @@ async function run(entry, deps) {
     const shell = rows.find(p => p.pid === pane.pid);
     if (!shell?.pidStart) throw Error('Original process identity is incomplete');
     walk(pane.pid, 0);
-    const agents = rows.filter(p => (visited.has(p.pid)) && p.agent === pane.meta.agent && p.interactive);
-    if (!agents.length) throw Error('No owned agent process');
+    const identity = await deps.identifyOriginal(entry.sessionId, rows);
+    const agent = rows.find(p => same(p, identity) && visited.has(p.pid)
+      && p.agent === pane.meta.agent && p.interactive);
+    if (!identity?.primary || !agent || !['codex', 'claude'].includes(pane.meta.agent)) throw Error('No verified owned agent process');
     const bypass = pane.meta.agent === 'codex' ? '--dangerously-bypass-approvals-and-sandbox' : '--dangerously-skip-permissions';
     entry.original = { id: pane.id, pid: pane.pid, pidStart: shell.pidStart, createdAt: pane.createdAt, cwd: pane.cwd,
       cols: pane.cols, rows: pane.rows, meta: pane.meta, agent: pane.meta.agent,
-      bypass: agents.some(p => p.args.split(/\s+/).includes(bypass)) };
+      bypass: agent.args.split(/\s+/).includes(bypass) };
     entry.processes = [{ pid: shell.pid, pidStart: shell.pidStart }, ...children];
     await checkpoint('prepared');
   }
   const original = entry.original;
+  const ownReplacement = pane?.id === entry.pane && pane.meta?.forceRestartToken === entry.token
+    && pane.meta?.sessionId === entry.sessionId;
   // Recovery after replace-exited succeeded but its response/checkpoint was lost.
-  if (pane?.id === entry.pane && pane.alive && pane.meta?.forceRestartToken === entry.token && pane.meta?.sessionId === entry.sessionId) {
+  if (ownReplacement && pane.alive) {
     await deps.verifyStarted?.(original);
     entry.result = { ok: true, pane: pane.id, pid: pane.pid, sessionId: entry.sessionId };
     await checkpoint('resumed'); return entry.result;
   }
-  if (!paneMatches(pane)) throw Error('Pane changed; inspect before recovering');
+  if (!paneMatches(pane) && !ownReplacement) throw Error('Pane changed; inspect before recovering');
   // Capture newly observable descendants while their parent identity is still
   // proven. Never discover ownership from a reused PID or process name.
   const refresh = async () => {
@@ -62,7 +66,7 @@ async function run(entry, deps) {
     await deps.close({ sessionId: entry.sessionId, pane: entry.pane });
     pane = await deps.getPane(entry.pane);
   }
-  if (!paneMatches(pane) || pane.alive) throw Error('Original pane did not close');
+  if ((!paneMatches(pane) && !ownReplacement) || pane.alive) throw Error('Original pane did not close');
   await checkpoint('closed');
   // argv may change during exit (including zombie process labels). Start time,
   // not mutable argv, binds authorization to the captured process instance.
@@ -80,7 +84,7 @@ async function run(entry, deps) {
   // Independently live replacements must not be duplicated, even in another pane.
   if (await deps.sessionLive(entry.sessionId)) throw Error('Conversation already live; inspect before recovering');
   await checkpoint('resuming');
-  entry.result = await deps.replace(original, entry);
+  entry.result = await deps.replace(original, entry, pane.pid);
   await deps.verifyStarted?.(original);
   await checkpoint('resumed');
   return entry.result;

@@ -3,6 +3,21 @@ const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { refusal, createManager, RestartDeferred } = require('./session-restart');
 
+test('cancelled force entry in a stale tick snapshot is never executed', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-force-cancel-')), file = path.join(root, 'queue.json');
+  try {
+    fs.writeFileSync(file, JSON.stringify([{ sessionId: 'idle', pane: 'p1', pid: 10, mode: 'idle', status: 'queued' },
+      { sessionId: 'force', pane: 'p2', pid: 20, mode: 'force', status: 'queued', at: Date.now() }]));
+    let release, entered; const pending = new Promise(r => { release = r; }), ready = new Promise(r => { entered = r; });
+    const manager = createManager({ file, inspect: async () => { entered(); await pending; return {
+      session: { endedTurn: false }, pane: { pid: 10, alive: true, meta: { sessionId: 'idle' } },
+    }; }, forceRestart: () => assert.fail('cancelled force must never execute') });
+    const tick = manager.tick(); await ready;
+    await manager.request({ sessionId: 'force', pane: 'p2', mode: 'cancel' }); release(); await tick;
+    assert.equal(manager.snapshot().find(e => e.sessionId === 'force').status, 'cancelled');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('explicit force requests are durable and interrupted transactions require explicit recovery', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-force-manager-')), file = path.join(root, 'queue.json');
   try {
