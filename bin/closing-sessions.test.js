@@ -19,6 +19,8 @@ test('confirmed close stays hidden until exit, but cannot hide a reopened proces
     { panes: [{ id: 'pa', pid: 101, alive: false }] },
     { panes: [{ id: 'pa', pid: 102, alive: true }] },
     { sessions: [{ id: 'a', pane: 'new-pane', state: 'running' }] },
+    // Another client removed the exited pane; transcript-only history remains.
+    { sessions: [{ id: 'a', pane: null, state: 'inactive' }], panes: [] },
     { sessions: [], panes: [] },
   ]) {
     const closing = createClosingSessions();

@@ -16,7 +16,7 @@ export function createClosingSessions() {
         if (!entry.confirmed) continue;
         const pane = data.panes?.find(p => p.id === entry.pane);
         const session = data.sessions?.find(s => s.id === id);
-        if (pane?.alive === false || !pane && (!session || session.exited || session.state === 'exited')
+        if (pane?.alive === false || !pane && (!session || !session.pane || session.exited || session.state === 'exited')
             || pane && entry.pid && pane.pid && pane.pid !== entry.pid
             || session?.pane && session.pane !== entry.pane) entries.delete(id);
       }
