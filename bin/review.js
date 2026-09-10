@@ -519,6 +519,22 @@ function saveState(state) {
   return state;
 }
 
+// Caller holds Keep's lock. Git ranges belong to a repository, while transcript
+// coverage and findings belong to the card and must survive project curation.
+function resetProjectEvidence(taskId) {
+  if (!fs.existsSync(statePath(taskId))) return;
+  const state = loadState(taskId);
+  state.git = emptyState(taskId).git;
+  // A tombstone, rather than deletion: commitState accepts an explicit bundle
+  // when none is pending. Force old acknowledgements to fail until a fresh read.
+  state.pendingBundle = `project-changed-${crypto.randomBytes(8).toString('hex')}`;
+  for (const field of ['pendingStatusEvidence', 'pendingLog', 'pendingRunAt']) delete state[field];
+  for (const session of Object.values(state.sessions)) {
+    for (const field of ['pendingOffset', 'pendingSkipped', 'pendingSkipFrom']) delete session[field];
+  }
+  saveState(state);
+}
+
 // Promote the offsets a bundle staged. Called only once a finding (or an explicit
 // clean bill of health) has landed — so a crashed tick re-reads rather than skips.
 function commitState(taskId, { status, bundle } = {}) {
@@ -1019,6 +1035,13 @@ function buildBundle(taskId, opts = {}) {
   const budgetChars = budgetTokens * CHARS_PER_TOKEN;
   const bundleId = crypto.randomBytes(4).toString('hex');
   const task = keep.loadTask(taskId);
+  const assertProjectUnchanged = () => {
+    if ((keep.loadTask(taskId).fm.project || '') !== (task.fm.project || '')) {
+      const error = new keep.KeepError(`${taskId} changed project while its bundle was building — re-run keep review-bundle`);
+      error.exitCode = 5;
+      throw error;
+    }
+  };
   const reviewerIds = markerIds(REVIEWER_DIR);
   const linked = Array.isArray(task.fm.sessions) ? task.fm.sessions : [];
   if (linked.length && linked.every((s) => s && reviewerIds.has(s.id))) {
@@ -1110,6 +1133,7 @@ function buildBundle(taskId, opts = {}) {
       // only that baseline so a later real review starts at the new head; do not
       // promote transcript/run offsets or claim that the card was reviewed.
       keep.withLock(() => {
+        assertProjectUnchanged();
         const baseline = loadState(taskId);
         if (!baseline.pendingBundle) {
           if (!baseline.git.skippedFrom) baseline.git.skippedFrom = baseline.git.sha;
@@ -1292,7 +1316,7 @@ function buildBundle(taskId, opts = {}) {
   state.pendingBundle = bundleId;
   state.pendingStatusEvidence = { since: state.lastReviewedAt || Date.now(), logHash: statusLogHash(task.body) };
   state.pendingLog = advanceLogWatermark(state.logSeen, logEntriesForReview);
-  keep.withLock(() => saveState(state));
+  keep.withLock(() => { assertProjectUnchanged(); saveState(state); });
   return { md, bundleId, taskId, newBytes, gitMoved, statusChanged, sessions: perSession.length };
 }
 
@@ -3666,6 +3690,7 @@ function startScheduler(deps) {
 
 
 module.exports = {
+  resetProjectEvidence,
   bundleTimeContext,
   recordTickOutcome,
   recordTickError,

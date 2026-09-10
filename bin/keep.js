@@ -1475,6 +1475,7 @@ commands.project = (argv) => {
     const task = loadTask(id);
     const previous = task.fm.project || '';
     if (previous !== project) {
+      require('./review.js').resetProjectEvidence(id);
       task.fm.project = project;
       // Metadata curation must not transfer the owner's resume link or schedule.
       appendLog(task, 'project changed', `Project changed from ${previous || '(none)'} to ${project}.${o.m ? ` ${o.m}` : ''}`);

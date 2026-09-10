@@ -210,6 +210,14 @@ test('project command canonicalizes worktrees without taking over card ownership
       depends_on: ['upstream#2'],
     }, body: '## Plan\n- [ ] Original work\n\n## 2026-09-10 12:00 — check-in\nOriginal history.\n' };
     fs.writeFileSync(file, serializeTask(original));
+    const reviewFile = path.join(root, '.keep', 'review', 'project-test.json');
+    fs.mkdirSync(path.dirname(reviewFile), { recursive: true });
+    const reviewState = require('./review.js').emptyState(original.id);
+    reviewState.git = { sha: 'a'.repeat(40), skippedFrom: 'b'.repeat(40), pendingSha: 'c'.repeat(40) };
+    reviewState.pendingBundle = '12345678';
+    reviewState.sessions = { historical: { offset: 100, pendingOffset: 200, skippedBytes: 30 } };
+    reviewState.findings = { dismissed: { dismissed: true } };
+    fs.writeFileSync(reviewFile, JSON.stringify(reviewState));
     const before = parseTask(fs.readFileSync(file, 'utf8'), original.id);
     const changed = run(['project', original.id, f.worktree, '-m', 'Correct repository.']);
     assert.equal(changed.status, 0, changed.stderr);
@@ -229,6 +237,37 @@ test('project command canonicalizes worktrees without taking over card ownership
     assert.notEqual(run(['project', original.id, root], { KEEP_REVIEWER: '1' }).status, 0);
     assert.equal(fs.readFileSync(file, 'utf8'), saved, 'invalid or reviewer mutation cannot change the card');
     assert.match(run(['help', 'project']).stdout, /keep project <id>/);
+    const reset = JSON.parse(fs.readFileSync(reviewFile, 'utf8'));
+    assert.equal(reset.git.skippedFrom, '');
+    assert.equal(reset.git.sha, '');
+    assert.deepEqual(reset.sessions, { historical: { offset: 100, skippedBytes: 30 } });
+    assert.deepEqual(reset.findings, reviewState.findings);
+    assert.equal(run(['review-ack', original.id, '--bundle', '12345678']).status, 5, 'old bundle cannot acknowledge the new project');
+    const first = run(['review-bundle', original.id, '--force']);
+    assert.equal(first.status, 0, first.stderr);
+    assert.doesNotMatch(first.stdout, /could not diff from/);
+    const bundleId = first.stdout.match(/bundle: ([0-9a-f]{8})/)[1];
+    assert.equal(run(['review-ack', original.id, '--bundle', bundleId]).status, 0);
+    assert.equal(spawnSync('git', ['-C', f.main, 'commit', '--allow-empty', '-qm', 'New target commit']).status, 0);
+    const second = run(['review-bundle', original.id, '--force']);
+    assert.equal(second.status, 0, second.stderr);
+    assert.match(second.stdout, /New target commit/, 'later commit evidence is from the destination repo');
+    const race = spawnSync(process.execPath, ['-e', `
+      const assert = require('node:assert/strict');
+      const keep = require(${JSON.stringify(path.join(__dirname, 'keep.js'))});
+      const review = require(${JSON.stringify(path.join(__dirname, 'review.js'))});
+      const lock = keep.withLock;
+      keep.withLock = fn => lock(() => {
+        const card = keep.loadTask('project-test');
+        review.resetProjectEvidence(card.id);
+        card.fm.project = ${JSON.stringify(root)};
+        keep.saveTask(card);
+        return fn();
+      });
+      assert.throws(() => review.buildBundle('project-test', { force: true }), /changed project while its bundle was building/);
+      assert.match(review.loadState('project-test').pendingBundle, /^project-changed-/);
+    `], { cwd: f.main, env, encoding: 'utf8' });
+    assert.equal(race.status, 0, race.stderr);
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
