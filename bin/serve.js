@@ -4533,13 +4533,20 @@ function start(deps = {}) {
   const restartTimer = setInterval(() => restarts.tick().catch((error) => process.stderr.write(`keep restart: ${error.message}\n`)), 10000);
   restartTimer.unref();
   if (process.env.KEEP_AUTO_CLOSE !== '0') {
-    require('./session-cleanup').startScheduler({
-      snapshot: async () => {
+    const cleanupSnapshot = async () => {
         const panes = await listHostPanes();
         const state = await addHostSessionState(await buildState({ hostPanes: panes }), { panes });
         const layouts = await keepConsole.readLayouts(path.join(keep.ROOT, '.keep', 'layouts.json'));
         return { ...state, pinned: new Set((layouts.layouts || []).flatMap((layout) => layout.ids || [])) };
-      },
+      };
+    require('./session-cleanup').startScheduler({
+      snapshot: cleanupSnapshot,
+      closeShell: pane => withInjectionLock(() => require('./shell-cleanup').close(pane, {
+        snapshot: cleanupSnapshot,
+        processes: () => agentProcessRows(),
+        screen: p => readScreenResult({ pane: p.id }, null, false),
+        eof: p => writeTarget({ pane: p.id }, '\x04'),
+      })),
       close: async (body) => {
         const result = await closeIdleSession(body, { closePolicy: { automatic: true } });
         broadcast();

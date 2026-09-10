@@ -199,6 +199,15 @@ Only a validated interactive root transcript may continue; child threads, pendin
 tools, and unanswered synchronous or asynchronous questions are protected.
 The question PreToolUse matcher is `^(?:.*\.)?request_user_input(?:_async)?$`.
 
+Automatic cleanup checks every five minutes and retires eligible agent sessions
+after eight hours without transcript or pane output activity. It also closes
+managed zsh panes, including shells left after an agent exits, after eight hours
+without output. Shell cleanup requires a verified empty prompt and no child
+processes, and rechecks identity and activity before sending EOF. Pinned panes,
+attached viewers, unknown state, and drafts remain protected. Exit attempts and
+refusals are recorded in `.keep/session-cleanup.json`; failures retry at most once
+per hour. Set `KEEP_AUTO_CLOSE=0` to disable both forms of automatic cleanup.
+
 Automatic Codex cleanup can retire parents with completed remote children only
 when the full, identity-checked descendant history proves completion and remains
 unchanged before exit. Missing/legacy child evidence, yielded commands and local

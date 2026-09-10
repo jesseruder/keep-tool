@@ -1,4 +1,5 @@
 'use strict';
+const IDLE_MS = 8 * 3600e3;
 
 // Both paths request a graceful exit only. Unknown activity is unsafe.
 function refusal(session, pane, pinned, now = Date.now(), options = {}) {
@@ -19,15 +20,15 @@ function refusal(session, pane, pinned, now = Date.now(), options = {}) {
   );
   if ((!['idle', 'done'].includes(session.state) && !nextInstruction && !manualAttention && !manualScheduled) || session.endedTurn !== true || session.toolRunning || session.pendingBackground || session.waitingFor || session.pendingQuestion || session.pendingPlan || session.rateLimit || (session.activity?.needsInput && !nextInstruction && !manualAttention)) return 'Session is active, waiting, needs input, or activity is unknown';
   if (!Number.isFinite(session.mtime)) return 'Session activity time is unknown';
-  if (!options.manual && now - session.mtime < 24 * 3600e3) return 'Session has activity within the last 24 hours';
+  if (!options.manual && now - session.mtime < IDLE_MS) return 'Session has activity within the last 8 hours';
   if (options.automatic && pane.attached !== 0) return 'Attached session or unknown viewer state is protected';
-  if (options.automatic && (!Number.isFinite(Date.parse(pane.lastOutputAt)) || now - Date.parse(pane.lastOutputAt) < 24 * 3600e3)) return 'Pane has recent or unknown output activity';
+  if (options.automatic && (!Number.isFinite(Date.parse(pane.lastOutputAt)) || now - Date.parse(pane.lastOutputAt) < IDLE_MS)) return 'Pane has recent or unknown output activity';
   return null;
 }
 
 // At most one pass at a time, and one attempt per session per hour. Refusals
 // remain cheap on subsequent ticks; the close function rechecks everything.
-function startScheduler({ snapshot, close, record, onError = () => {}, now = Date.now, intervalMs = 5 * 60e3 }) {
+function startScheduler({ snapshot, close, closeShell, record, onError = () => {}, now = Date.now, intervalMs = 5 * 60e3 }) {
   const attempted = new Map();
   let busy = false;
   const tick = async () => {
@@ -35,7 +36,7 @@ function startScheduler({ snapshot, close, record, onError = () => {}, now = Dat
     busy = true;
     try {
       const state = await snapshot();
-      const ids = new Set(state.sessions.map((s) => s.id));
+      const ids = new Set([...state.sessions.map((s) => s.id), ...state.panes.map(p => `shell:${p.id}`)]);
       for (const id of attempted.keys()) if (!ids.has(id)) attempted.delete(id);
       for (const session of state.sessions) {
         const pane = state.panes.find((p) => p.id === session.pane);
@@ -47,6 +48,16 @@ function startScheduler({ snapshot, close, record, onError = () => {}, now = Dat
         catch (error) { outcome = `not closed: ${error.message}`; }
         await record({ at: now(), sessionId: session.id, pane: pane.id, outcome });
       }
+      if (closeShell) for (const pane of state.panes) {
+        if (require('./shell-cleanup').refusal(pane, state, now())) continue;
+        const key = `shell:${pane.id}`;
+        if (attempted.has(key) && now() - attempted.get(key) < 3600e3) continue;
+        attempted.set(key, now());
+        let outcome;
+        try { await closeShell(pane); outcome = 'shell exit requested'; }
+        catch (error) { outcome = `shell not closed: ${error.message}`; }
+        await record({ at: now(), sessionId: pane.meta?.sessionId || null, pane: pane.id, outcome });
+      }
     } catch (error) { onError(error); }
     finally { busy = false; }
   };
@@ -56,4 +67,4 @@ function startScheduler({ snapshot, close, record, onError = () => {}, now = Dat
   return { tick, stop: () => clearInterval(timer) };
 }
 
-module.exports = { refusal, startScheduler };
+module.exports = { refusal, startScheduler, IDLE_MS };
