@@ -1,7 +1,7 @@
 import './shared/scope-rules.js';
 import { PROJECTS } from './project-catalog.js';
 import { projectIcon } from './project-icons.js';
-import { installAttentionSound } from './attention-sound.js';
+import { installAttentionSound, soundEventKey } from './attention-sound.js';
 import { installNotifications } from './notifications.js';
 import { PALETTES, paletteById, swatches } from './palettes.js';
 import { applyTheme, getPalette, getPreference, onThemeChange, resolvedTheme, setPalette, setPreference, xtermTheme } from './theme.js';
@@ -626,7 +626,7 @@ function renderTop() {
   const count = queueItems().filter((item) => !state.dismissed.has(itemKey(item))).length;
   setBadge(count + (data.notifications || []).filter((entry) => !entry.read).length);
   if (attentionSeeded) attentionSound.update(queueItems()
-    .filter((item) => !state.dismissed.has(itemKey(item))).map(eventKey));
+    .filter((item) => !state.dismissed.has(itemKey(item))).map(soundEventKey));
   document.querySelector('#qcount').textContent = count;
   document.querySelector('#qcount').classList.toggle('zero', count === 0);
   const sessionCount = data.sessions?.length || 0;
@@ -1076,7 +1076,8 @@ document.addEventListener('visibilitychange', () => {
   if (markReviewerSeen(ctx)) refresh();
 });
 
-const attentionSound = installAttentionSound();
+const attentionSound = installAttentionSound({ onPlay: () => focusDebug('attention-sound', { reason: 'new-request-v2' }) });
+focusDebug('attention-sound-ready', { reason: 'turn-request-v2' });
 const notificationPanel = installNotifications({
   reload, toast,
   openSession(sessionId) {

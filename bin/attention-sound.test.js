@@ -9,7 +9,7 @@ test('waiting sound does not replay an existing event after an empty snapshot', 
   globalThis.document = { documentElement: { classList: { toggle() {} } }, querySelector: () => ({ setAttribute() {}, classList: { toggle() {} }, addEventListener(_, fn) { click = fn; } }) };
   globalThis.localStorage = { getItem: () => null, setItem() {} };
   try {
-    const { installAttentionSound } = await import('../web/app/attention-sound.js');
+    const { installAttentionSound, soundEventKey } = await import('../web/app/attention-sound.js');
     const sound = installAttentionSound();
     sound.update(['boot:1']);
     sound.update([]);
@@ -34,6 +34,19 @@ test('waiting sound does not replay an existing event after an empty snapshot', 
     sound.update([]);
     sound.update(['a:3']);
     assert.equal(sounds, 2, 'unmuting does not replay a muted event');
+    const question = { key: 'session', sessionId: 'session', lastUserAt: 100, since: 110, kind: 'question', question: 'Proceed?', options: ['Yes', 'No'] };
+    sound.update([]);
+    sound.update([soundEventKey(question)]);
+    assert.equal(sounds, 3);
+    sound.update([]);
+    sound.update([soundEventKey({ ...question, since: 120 })]);
+    assert.equal(sounds, 3, 'ongoing transcript activity cannot replay an async question');
+    sound.update([]);
+    sound.update([soundEventKey({ ...question, question: 'Which target?' })]);
+    assert.equal(sounds, 4, 'a different question in the same turn can sound');
+    sound.update([]);
+    sound.update([soundEventKey({ ...question, lastUserAt: 200 })]);
+    assert.equal(sounds, 5, 'the same question in a new user turn can sound');
   } finally {
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete globalThis[key]; else globalThis[key] = value;
