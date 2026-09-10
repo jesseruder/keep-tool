@@ -1,10 +1,14 @@
 import { isDesktop, playAttentionSound } from './shell.js';
 
-export function soundEventKey(item) {
+export function soundEventKey(item, session = {}) {
   // `since` follows transcript activity, including tools and commentary while
   // an async question is pending. It is not the identity of that question.
-  return JSON.stringify([item.sessionId || item.key, item.lastUserAt ?? item.since,
-    item.kind, item.question || '', item.kind === 'input' ? '' : item.detail || '', item.options || []]);
+  const request = item.kind === 'question' ? session.pendingQuestion : item.kind === 'plan' ? session.pendingPlan : null;
+  const requestId = request?.callId ?? request?.ts
+    ?? (item.kind === 'permission' ? session.activity?.decision?.at ?? item.since : null);
+  return JSON.stringify([item.sessionId || item.key,
+    session.turnStartedAt ?? item.lastUserAt ?? item.since, requestId,
+    item.kind, item.question || '', item.detail || '', item.options || []]);
 }
 
 // Follow the displayed queue, including local dismissals, without sounding on boot.

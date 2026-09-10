@@ -47,6 +47,16 @@ test('waiting sound does not replay an existing event after an empty snapshot', 
     sound.update([]);
     sound.update([soundEventKey({ ...question, lastUserAt: 200 })]);
     assert.equal(sounds, 5, 'the same question in a new user turn can sound');
+    const permission = { sessionId: 'session', lastUserAt: 100, kind: 'permission' };
+    assert.notEqual(soundEventKey(permission, { activity: { decision: { at: 110 } } }),
+      soundEventKey(permission, { activity: { decision: { at: 120 } } }), 'distinct approvals within one turn remain distinct');
+    const ready = { sessionId: 'session', lastUserAt: 100, kind: 'input', detail: 'Ready for your next instruction.' };
+    assert.notEqual(soundEventKey(ready, { turnStartedAt: 110 }), soundEventKey(ready, { turnStartedAt: 120 }),
+      'automated turns have their own identity despite unchanged human input');
+    assert.notEqual(soundEventKey(ready), soundEventKey({ ...ready, detail: 'Deploy the new build?' }),
+      'new prose requests are distinct');
+    assert.notEqual(soundEventKey(question, { pendingQuestion: { callId: 'first' } }),
+      soundEventKey(question, { pendingQuestion: { callId: 'second' } }), 'repeated question text in different tool calls is distinct');
   } finally {
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete globalThis[key]; else globalThis[key] = value;
