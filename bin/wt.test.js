@@ -64,6 +64,12 @@ function commitIn(repo, message) {
   git(repo, 'commit', '-q', '-m', message);
 }
 
+function ageHead(repo, iso) {
+  execFileSync('git', ['-C', repo, 'commit', '--amend', '-q', '--no-edit', `--date=${iso}`], {
+    env: { ...process.env, GIT_COMMITTER_DATE: iso },
+  });
+}
+
 test('new creates a branch at origin/main, metadata, and excludes, then refuses duplicates', () => {
   const f = fixture();
   try {
@@ -548,5 +554,138 @@ test('new rolls back its registered worktree and branch after a post-add failure
     assert.equal(fs.existsSync(destination), false);
     assert.equal(spawnSync('git', ['-C', f.main, 'show-ref', '--verify', '--quiet', 'refs/heads/wt/rollback']).status, 1);
     assert.equal(git(f.main, 'worktree', 'list', '--porcelain').includes(destination), false);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('gc recycles only old landed worktrees and explains every safety skip', () => {
+  const f = fixture();
+  try {
+    const old = '2026-08-01T00:00:00Z';
+    ageHead(f.main, old);
+    git(f.main, 'push', '-q', '--force', 'origin', 'main');
+    const landed = runCli(f, ['new', f.name, 'landed', '--no-install']).stdout.trim();
+    const dirty = runCli(f, ['new', f.name, 'dirty', '--no-install']).stdout.trim();
+    const ahead = runCli(f, ['new', f.name, 'ahead', '--no-install']).stdout.trim();
+    const live = runCli(f, ['new', f.name, 'live', '--no-install']).stdout.trim();
+    write(path.join(dirty, 'dirty.txt'), 'dirty\n');
+    write(path.join(ahead, 'ahead.txt'), 'ahead\n');
+    commitIn(ahead, 'ahead');
+    write(path.join(f.main, 'fresh.txt'), 'fresh\n');
+    commitIn(f.main, 'fresh origin');
+    git(f.main, 'push', '-q', 'origin', 'main');
+    const fresh = runCli(f, ['new', f.name, 'fresh', '--no-install']).stdout.trim();
+    fs.mkdirSync(path.join(live, 'subdir'));
+    const fixtureDir = path.join(f.worktreeRoot, 'optimizer-fixture.probe');
+    fs.mkdirSync(fixtureDir, { recursive: true });
+
+    const result = wt.gcWorktrees({ cfg: f.cfg, days: 3, keepFree: 2,
+      now: Date.parse('2026-09-10T00:00:00Z'), deps: { liveCwds: [path.join(live, 'subdir')] } });
+    const byName = new Map(result.rows.map((row) => [row.name, row]));
+    assert.equal(byName.get('landed').action, 'recycle');
+    assert.match(byName.get('dirty').reason, /dirty/);
+    assert.match(byName.get('ahead').reason, /ahead of origin\/main/);
+    assert.match(byName.get('fresh').reason, /newer than 3 day/);
+    assert.match(byName.get('live').reason, /live session cwd/);
+    assert.ok(result.rows.some((row) => row.repoName === 'optimizer-fixture.probe'
+      && /not a linked worktree/.test(row.reason)));
+    assert.equal(fs.existsSync(path.join(landed, '.wt-free')), true);
+    assert.equal(fs.existsSync(path.join(dirty, 'dirty.txt')), true);
+    assert.equal(fs.existsSync(ahead), true);
+    assert.equal(fs.existsSync(fresh), true);
+    assert.equal(fs.existsSync(live), true);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('gc dry-run preserves trees, then deletes the oldest safe free trees beyond the cap', () => {
+  const f = fixture();
+  try {
+    const frees = [];
+    for (const name of ['one', 'two', 'three', 'four']) {
+      frees.push(runCli(f, ['new', f.name, name, '--no-install']).stdout.trim());
+    }
+    for (const worktree of frees) assert.equal(runCli(f, ['rm', worktree]).status, 0);
+    frees.forEach((worktree, index) => fs.writeFileSync(path.join(worktree, '.wt-free'), JSON.stringify({
+      freedAt: new Date(Date.UTC(2026, 8, index + 1)).toISOString(), previousName: path.basename(worktree),
+    }) + '\n'));
+
+    const dry = wt.gcWorktrees({ cfg: f.cfg, dryRun: true, keepFree: 2, deps: { liveCwds: [] } });
+    assert.deepEqual(dry.rows.filter((row) => row.action === 'would-delete').map((row) => row.name), ['one', 'two']);
+    assert.ok(frees.every((worktree) => fs.existsSync(worktree)));
+
+    const result = wt.gcWorktrees({ cfg: f.cfg, keepFree: 2, deps: { liveCwds: [] } });
+    assert.deepEqual(result.rows.filter((row) => row.action === 'delete').map((row) => row.name), ['one', 'two']);
+    assert.equal(fs.existsSync(frees[0]), false);
+    assert.equal(fs.existsSync(frees[1]), false);
+    assert.equal(fs.existsSync(frees[2]), true);
+    assert.equal(fs.existsSync(frees[3]), true);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('gc never deletes dirty, ahead, or live free worktrees while shrinking the safe pool', () => {
+  const f = fixture();
+  try {
+    const names = ['dirty-free', 'ahead-free', 'live-free', 'safe-one', 'safe-two', 'safe-three'];
+    const trees = names.map((name) => runCli(f, ['new', f.name, name, '--no-install']).stdout.trim());
+    for (const tree of trees) assert.equal(runCli(f, ['rm', tree]).status, 0);
+    trees.forEach((tree, index) => fs.writeFileSync(path.join(tree, '.wt-free'), JSON.stringify({
+      freedAt: new Date(Date.UTC(2026, 7, index + 1)).toISOString(), previousName: names[index],
+    }) + '\n'));
+    write(path.join(trees[0], 'dirty.txt'), 'dirty\n');
+    write(path.join(trees[1], 'ahead.txt'), 'ahead\n');
+    commitIn(trees[1], 'ahead after free');
+    fs.mkdirSync(path.join(trees[2], 'running'));
+
+    const result = wt.gcWorktrees({ cfg: f.cfg, keepFree: 2,
+      deps: { liveCwds: [path.join(trees[2], 'running')] } });
+    const byName = new Map(result.rows.map((row) => [row.name, row]));
+    assert.match(byName.get('dirty-free').reason, /dirty/);
+    assert.match(byName.get('ahead-free').reason, /ahead/);
+    assert.match(byName.get('live-free').reason, /live session cwd/);
+    for (const tree of trees.slice(0, 3)) assert.equal(fs.existsSync(tree), true);
+    for (const tree of trees.slice(3)) assert.equal(fs.existsSync(tree), false);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('gc dry-run plans an old active tree through recycle and deletion when keep-free is zero', () => {
+  const f = fixture();
+  try {
+    const old = '2026-08-01T00:00:00Z';
+    ageHead(f.main, old);
+    git(f.main, 'push', '-q', '--force', 'origin', 'main');
+    const worktree = runCli(f, ['new', f.name, 'disposable', '--no-install']).stdout.trim();
+    const options = { cfg: f.cfg, days: 3, keepFree: 0,
+      now: Date.parse('2026-09-10T00:00:00Z'), deps: { liveCwds: [] } };
+    const dry = wt.gcWorktrees({ ...options, dryRun: true });
+    assert.equal(dry.rows.find((row) => row.name === 'disposable').action, 'would-delete');
+    assert.equal(fs.existsSync(path.join(worktree, '.wt.json')), true);
+    const real = wt.gcWorktrees(options);
+    assert.equal(real.rows.find((row) => row.name === 'disposable').action, 'delete');
+    assert.equal(fs.existsSync(worktree), false);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('live cwd inventory protects Codex app-server and fails closed when a live cwd is omitted', () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-live-cwd-test-')));
+  try {
+    const outputs = (lsof) => ({ execFileSync: (command) => {
+      if (command === 'ps') return '123  /usr/local/bin/codex app-server\n';
+      if (command === 'lsof') return lsof;
+      assert.fail(`unexpected command ${command}`);
+    } });
+    assert.deepEqual(wt.liveAgentCwds(outputs(`p123\nfcwd\nn${root}\n`)), [root]);
+    assert.throws(() => wt.liveAgentCwds({ ...outputs(''), isPidAlive: () => true }),
+      /live session cwd inventory omitted process 123/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('gc refuses all cleanup when live process cwd discovery fails', () => {
+  const f = fixture();
+  try {
+    const worktree = runCli(f, ['new', f.name, 'safe', '--no-install']).stdout.trim();
+    assert.throws(() => wt.gcWorktrees({ cfg: f.cfg, deps: {
+      execFileSync: () => { throw new Error('ps unavailable'); },
+    } }), /live session inventory unavailable/);
+    assert.equal(fs.existsSync(path.join(worktree, '.wt.json')), true);
+    assert.equal(fs.existsSync(path.join(worktree, '.wt-free')), false);
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });

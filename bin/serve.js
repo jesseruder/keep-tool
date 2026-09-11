@@ -4912,6 +4912,44 @@ function startBriefScheduler(options = {}) {
   return { tick, timer };
 }
 
+function startWtGcScheduler(options = {}) {
+  const run = options.execFile || execFile;
+  const record = options.record || health.record;
+  const write = options.write || process.stderr.write.bind(process.stderr);
+  const later = options.setTimeout || setTimeout;
+  const repeat = options.setInterval || setInterval;
+  let running = false;
+  const tick = () => {
+    if (running) return Promise.resolve({ skipped: true });
+    running = true;
+    return new Promise((resolve) => {
+      run(process.execPath, [path.join(__dirname, 'wt.js'), 'gc'], {
+        env: process.env, timeout: 30 * 60e3, maxBuffer: 4 << 20,
+      }, (error, stdout, stderr) => {
+        const output = [stdout, stderr].map((value) => String(value || '').trim()).filter(Boolean).join('\n');
+        if (output) write(`${output}\n`);
+        if (error) {
+          record('wt-gc', { ok: false, error });
+          write(`keep serve: wt gc failed: ${error.message}\n`);
+        } else {
+          const mutations = String(stdout || '').split(/\r?\n/)
+            .filter((line) => /^(?:recycle|delete)\s/.test(line)).length;
+          record('wt-gc', { ok: true, skipped: mutations === 0,
+            detail: mutations ? `${mutations} worktree(s) cleaned` : 'nothing due' });
+          options.onChange?.();
+        }
+        running = false;
+        resolve({ ok: !error });
+      });
+    });
+  };
+  const first = later(() => { void tick(); }, options.firstRunMs ?? 5 * 60e3);
+  first.unref?.();
+  const timer = repeat(() => { void tick(); }, options.intervalMs ?? 24 * 60 * 60e3);
+  timer.unref?.();
+  return { tick, first, timer };
+}
+
 function start(deps = {}) {
   health.record('daemon', { at: Date.now(), pid: process.pid, version: health.VERSION });
   const shutdown = () => {
@@ -5112,6 +5150,9 @@ function start(deps = {}) {
   standup.startScheduler({ onChange: broadcast });
   ideas.startScheduler({ onChange: broadcast });
   landed.startScheduler({ onChange: broadcast });
+  if (process.env.KEEP_WT_GC === '0') {
+    health.record('wt-gc', { disabled: true, detail: 'KEEP_WT_GC=0' });
+  } else startWtGcScheduler({ onChange: broadcast });
   slack.startScheduler({ onChange: broadcast });
   const configuredLiveTickMs = Number(process.env.KEEP_LIVE_TICK_MS);
   const liveTickMs = Number.isFinite(configuredLiveTickMs) && configuredLiveTickMs > 0
@@ -5621,6 +5662,7 @@ module.exports = {
   backfillHostSessions,
   briefDue,
   startBriefScheduler,
+  startWtGcScheduler,
   buildWhoSnapshot,
   scanTranscript,
   claudeSessionFromInfo,

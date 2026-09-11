@@ -54,6 +54,7 @@ const {
   chunkForTyping,
   deliveredMatches,
   briefDue,
+  startWtGcScheduler,
   attentionAckKey,
   attentionItemKey,
   readSetAside,
@@ -2307,6 +2308,30 @@ test('compactCommand appends an optional compaction instruction', () => {
   assert.equal(compactCommand(), '/compact');
   assert.equal(compactCommand('  Keep standing instructions.\nDrop bundle text.  '),
     '/compact Keep standing instructions. Drop bundle text.');
+});
+
+test('daily wt gc scheduler logs actions and records health', async () => {
+  const calls = [];
+  const records = [];
+  const writes = [];
+  const inertTimer = { unref() {} };
+  const scheduler = startWtGcScheduler({
+    execFile: (command, args, options, callback) => {
+      calls.push({ command, args, options });
+      callback(null, 'action   worktree   reason\nrecycle sample/old clean and landed\n', '');
+    },
+    record: (name, value) => records.push({ name, value }),
+    write: (value) => writes.push(value),
+    onChange: () => calls.push('changed'),
+    setTimeout: () => inertTimer,
+    setInterval: () => inertTimer,
+  });
+  assert.deepEqual(await scheduler.tick(), { ok: true });
+  assert.deepEqual(calls[0].args.slice(-2), [path.join(__dirname, 'wt.js'), 'gc']);
+  assert.equal(calls[1], 'changed');
+  assert.match(writes.join(''), /recycle sample\/old/);
+  assert.equal(records[0].name, 'wt-gc');
+  assert.equal(records[0].value.detail, '1 worktree(s) cleaned');
 });
 
 test('a compaction summary does not leave the session looking mid-turn', () => {

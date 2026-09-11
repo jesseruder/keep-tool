@@ -634,6 +634,199 @@ function listWorktrees(cfg = loadConfig()) {
   return items.sort((a, b) => a.repoName.localeCompare(b.repoName) || a.name.localeCompare(b.name));
 }
 
+function liveAgentCwds(deps = {}) {
+  if (Array.isArray(deps.liveCwds)) return deps.liveCwds.map((cwd) => fs.realpathSync(cwd));
+  let output;
+  try {
+    output = (deps.execFileSync || execFileSync)('ps', ['-axo', 'pid=,args='], {
+      encoding: 'utf8', timeout: 5e3, maxBuffer: 32e6, env: { ...process.env, LC_ALL: 'C' },
+    });
+  } catch (error) {
+    die(`live session inventory unavailable: ${error.message}`);
+  }
+  const pids = [];
+  for (const line of String(output || '').split(/\r?\n/)) {
+    const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+    if (!match) continue;
+    const args = match[2];
+    // Protect every live Claude or Codex process, including app-server, headless,
+    // and child workers. GC cares about cwd use, not whether Keep would present the
+    // process as an interactive session.
+    if (/(^|\/)(claude|codex)(\s|$)/.test(args)) pids.push(Number(match[1]));
+  }
+  if (!pids.length) return [];
+  let lsof;
+  try {
+    lsof = (deps.execFileSync || execFileSync)('lsof', ['-a', '-p', pids.join(','), '-d', 'cwd', '-Fpn'], {
+      encoding: 'utf8', timeout: 5e3, maxBuffer: 32e6,
+    });
+  } catch (error) {
+    die(`live session cwd inventory unavailable: ${error.message}`);
+  }
+  const cwdByPid = new Map();
+  let pid = null;
+  let cwdEntry = false;
+  for (const line of String(lsof || '').split(/\r?\n/)) {
+    if (/^p\d+$/.test(line)) { pid = Number(line.slice(1)); cwdEntry = false; }
+    else if (line === 'fcwd') cwdEntry = true;
+    else if (pid && cwdEntry && line.startsWith('n')) cwdByPid.set(pid, line.slice(1));
+  }
+  for (const candidate of pids) {
+    if (cwdByPid.has(candidate)) continue;
+    if (typeof deps.isPidAlive === 'function') {
+      let alive;
+      try { alive = deps.isPidAlive(candidate); }
+      catch (error) { die(`cannot verify live session process ${candidate}: ${error.message}`); }
+      if (alive) die(`live session cwd inventory omitted process ${candidate}`);
+      continue;
+    }
+    try {
+      process.kill(candidate, 0);
+      die(`live session cwd inventory omitted process ${candidate}`);
+    } catch (error) {
+      if (error instanceof WtError) throw error;
+      if (error.code !== 'ESRCH') die(`cannot verify live session process ${candidate}: ${error.message}`);
+    }
+  }
+  return [...cwdByPid.values()].map((cwd) => {
+    try { return fs.realpathSync(cwd); }
+    catch (error) { die(`cannot resolve live session cwd ${cwd}: ${error.message}`); }
+  });
+}
+
+function pathContains(candidate, root) {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+function freeMarker(worktree) {
+  try {
+    const value = JSON.parse(fs.readFileSync(path.join(worktree, '.wt-free'), 'utf8'));
+    const freedAt = Date.parse(value && value.freedAt);
+    return Number.isFinite(freedAt) ? { ok: true, freedAt } : { ok: false };
+  } catch { return { ok: false }; }
+}
+
+function fixtureDirectories(cfg, linkedPaths) {
+  const root = path.resolve(expandHome(cfg.worktreeRoot));
+  let entries = [];
+  try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return []; }
+  return entries.filter((entry) => entry.isDirectory()
+      && (entry.name.includes('-fixture') || entry.name.startsWith('optimizer-fixture.')))
+    .map((entry) => path.join(root, entry.name))
+    .filter((entry) => !linkedPaths.has(entry));
+}
+
+function gcTable(rows) {
+  const values = [['action', 'worktree', 'reason'], ...rows.map((row) => [row.action, `${row.repoName}/${row.name}`, row.reason])];
+  const widths = values[0].map((_, index) => Math.max(...values.map((row) => row[index].length)));
+  return values.map((row) => row.map((value, index) => index === row.length - 1 ? value : value.padEnd(widths[index])).join('  ').trimEnd()).join('\n');
+}
+
+function gcWorktrees(options = {}) {
+  const cfg = options.cfg || loadConfig();
+  const days = options.days === undefined ? 3 : Number(options.days);
+  const keepFree = options.keepFree === undefined ? 2 : Number(options.keepFree);
+  if (!Number.isFinite(days) || days < 0) die('--days must be a non-negative number');
+  if (!Number.isInteger(keepFree) || keepFree < 0) die('--keep-free must be a non-negative integer');
+  const now = Number(options.now ?? Date.now());
+  const liveCwds = liveAgentCwds(options.deps || {});
+  let items = listWorktrees(cfg);
+  if (options.repo) {
+    const selected = resolveRepo(options.repo, cfg);
+    items = items.filter((item) => item.main === selected);
+  }
+  const rows = fixtureDirectories(cfg, new Set(items.map((item) => item.path))).map((fixture) => ({
+    action: 'skip', repoName: path.basename(fixture), name: '-', reason: 'fixture directory is not a linked worktree', path: fixture,
+  }));
+  const groups = new Map();
+  for (const item of items) {
+    const entries = groups.get(item.main) || [];
+    entries.push(item);
+    groups.set(item.main, entries);
+  }
+  for (const [main, entries] of groups) {
+    let defaultName;
+    try {
+      defaultName = defaultBranch(main);
+      git(main, ['fetch', '-q', 'origin', defaultName]);
+    } catch (error) {
+      rows.push(...entries.map((item) => ({ ...item, action: 'skip', reason: `cannot refresh origin: ${error.message}` })));
+      continue;
+    }
+    const assessments = [];
+    for (const item of entries) {
+      const wasFree = item.free;
+      const dirty = statusWithoutMarkers(item.path);
+      let ahead;
+      let committedAt;
+      try {
+        ahead = Number(git(item.path, ['rev-list', '--count', `origin/${defaultName}..HEAD`]).trim());
+        committedAt = Number(git(item.path, ['log', '-1', '--format=%ct', 'HEAD']).trim()) * 1000;
+      } catch (error) {
+        assessments.push({ item, wasFree, safe: false, reason: `cannot inspect worktree: ${error.message}` });
+        continue;
+      }
+      let reason = '';
+      if (dirty.length) reason = `dirty (${dirty.length} change(s))`;
+      else if (ahead > 0) reason = `${ahead} commit(s) ahead of origin/${defaultName}`;
+      else if (liveCwds.some((cwd) => pathContains(cwd, item.path))) reason = 'live session cwd is inside worktree';
+      else if (!item.free && (!Number.isFinite(committedAt) || now - committedAt < days * 86400e3)) reason = `last commit is newer than ${days} day(s)`;
+      assessments.push({ item, wasFree, safe: !reason, reason, committedAt });
+    }
+
+    for (const assessment of assessments.filter((entry) => !entry.item.free)) {
+      const { item } = assessment;
+      if (!assessment.safe) {
+        rows.push({ ...item, action: 'skip', reason: assessment.reason });
+        continue;
+      }
+      const liveNow = liveAgentCwds(options.deps || {});
+      if (liveNow.some((cwd) => pathContains(cwd, item.path))) {
+        assessment.safe = false;
+        assessment.reason = 'live session cwd appeared before recycle';
+        rows.push({ ...item, action: 'skip', reason: assessment.reason });
+        continue;
+      }
+      rows.push({ ...item, action: options.dryRun ? 'would-recycle' : 'recycle', reason: `clean, landed, and at least ${days} day(s) old` });
+      if (!options.dryRun) recycleWorktree(item.path);
+      item.free = true;
+    }
+
+    const free = assessments.filter((entry) => entry.item.free).map((assessment) => {
+      const marker = assessment.wasFree ? freeMarker(assessment.item.path) : { ok: true, freedAt: now };
+      return { ...assessment, marker, safe: assessment.safe && marker.ok,
+        reason: assessment.reason || (marker.ok ? '' : 'invalid .wt-free marker') };
+    }).sort((a, b) => (a.marker.freedAt ?? Infinity) - (b.marker.freedAt ?? Infinity));
+    let deletionsNeeded = Math.max(0, free.length - keepFree);
+    for (const assessment of free) {
+      const { item } = assessment;
+      if (!assessment.safe) {
+        rows.push({ ...item, action: 'skip', reason: assessment.reason });
+      } else if (deletionsNeeded > 0) {
+        const liveNow = liveAgentCwds(options.deps || {});
+        if (liveNow.some((cwd) => pathContains(cwd, item.path))) {
+          const prior = !assessment.wasFree && rows.findIndex((row) => row.path === item.path);
+          const skipped = { ...item, action: 'skip', reason: 'live session cwd appeared before delete' };
+          if (prior !== false && prior >= 0) rows[prior] = skipped;
+          else rows.push(skipped);
+          continue;
+        }
+        const deletion = { ...item, action: options.dryRun ? 'would-delete' : 'delete', reason: `free pool exceeds ${keepFree}` };
+        const prior = !assessment.wasFree && rows.findIndex((row) => row.path === item.path);
+        if (prior !== false && prior >= 0) rows[prior] = deletion;
+        else rows.push(deletion);
+        if (!options.dryRun) recycleWorktree(item.path, { delete: true });
+        deletionsNeeded--;
+      } else if (assessment.wasFree) {
+        rows.push({ ...item, action: 'keep', reason: `within free pool limit ${keepFree}` });
+      }
+    }
+  }
+  return { rows, recycled: rows.filter((row) => row.action === 'recycle').length,
+    deleted: rows.filter((row) => row.action === 'delete').length };
+}
+
 function nudgeFor(cwd, cfg = loadConfig()) {
   try {
     const main = mainCheckout(cwd);
@@ -809,6 +1002,11 @@ function main(argv = process.argv.slice(2)) {
   } else if (command === 'rm') {
     const opts = parseArgs(rest, { force: 'bool', delete: 'bool' });
     recycleWorktree(resolveRemoveArgs(opts._, cfg), { force: opts.force, delete: opts.delete });
+  } else if (command === 'gc') {
+    const opts = parseArgs(rest, { 'dry-run': 'bool', days: 'str', 'keep-free': 'str' });
+    if (opts._.length > 1) die('usage: wt gc [--dry-run] [--days N] [--keep-free N] [<repo>]');
+    const result = gcWorktrees({ cfg, repo: opts._[0], dryRun: opts['dry-run'], days: opts.days, keepFree: opts['keep-free'] });
+    console.log(gcTable(result.rows));
   } else if (command === 'land') {
     const opts = parseArgs(rest, { 'dry-run': 'bool', 'no-push': 'bool', 'ignore-main': 'bool' });
     if (opts._.length > 1) die('usage: wt land [<path>] [--dry-run] [--no-push] [--ignore-main]');
@@ -884,7 +1082,7 @@ function main(argv = process.argv.slice(2)) {
       }
     } catch {}
   } else {
-    die('usage: wt <new|ls|rm|land|main|path|nudge|guard|hook> ...');
+    die('usage: wt <new|ls|rm|gc|land|main|path|nudge|guard|hook> ...');
   }
 }
 
@@ -902,6 +1100,9 @@ module.exports = {
   recycleWorktree,
   landWorktree,
   listWorktrees,
+  liveAgentCwds,
+  gcTable,
+  gcWorktrees,
   matchIncludes,
   main,
 };

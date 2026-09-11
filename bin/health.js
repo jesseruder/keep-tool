@@ -28,6 +28,7 @@ const CADENCES = Object.freeze({
   unblock: { cadenceMs: 60e3 },
   slack: { cadenceMs: 15 * 60e3 },
   landed: { cadenceMs: 30 * 60e3 },
+  'wt-gc': { cadenceMs: DAY_MS },
   'auto-compact': { cadenceMs: 2 * 60e3 },
   'limit-resume': { cadenceMs: 60e3 },
   usage: { onDemand: true },

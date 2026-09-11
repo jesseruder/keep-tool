@@ -498,7 +498,9 @@ the full recipe remains available through `keep show <id>`.
 If a headless check or task changes its card's status, its finalizer records the result without overriding that status or clearing the scheduled check.
 
 Before delivering to a cold, large thread, Keep runs `/compact` and waits for its
-transcript marker. The gate is configured by `KEEP_CACHE_TTL_MIN` (default 60),
+transcript marker or Claude Code's on-screen completion line and returned prompt.
+After screen confirmation and model restore, it gives Claude Code ten seconds to
+flush the marker for diagnostics. The gate is configured by `KEEP_CACHE_TTL_MIN` (default 60),
 `KEEP_COMPACT_MIN_TOKENS` (default 80000), and `KEEP_COMPACT_TIMEOUT_MS` (default
 240000). Run compaction directly with `keep compact <sid>` or
 `POST /api/compact { "sessionId": "<sid>" }`.
@@ -543,6 +545,7 @@ wt ls [<repo>]
 wt path <repo> <name>
 wt main [<path>]
 wt rm <path | repo/name> [--force] [--delete]
+wt gc [--dry-run] [--days N] [--keep-free N] [<repo>]
 wt land [<path>] [--dry-run] [--no-push]
 wt guard [on|off|status]
 ```
@@ -551,6 +554,13 @@ Commit freely in the worktree. To land it, run `wt land`: it fetches and rebases
 onto `origin/<default>`, shows the commits, then pushes `HEAD:<default>` without
 checking out or changing the main checkout. After landing, `wt rm` recycles the
 tree for the next agent; use `--delete` to remove it instead.
+
+`wt gc` fetches each repository, then recycles only clean, fully landed worktrees
+whose last commit is at least three days old and whose directory contains no live
+agent cwd. It keeps two safe recycled trees per repository and deletes older extras;
+`--days` and `--keep-free` change those defaults. `--dry-run` prints the same action
+table without changing anything. `keep serve` runs this sweep daily; set
+`KEEP_WT_GC=0` to disable it.
 
 ## Fleet reviewer
 
