@@ -127,6 +127,7 @@ onThemeChange((appearance) => {
   }
 });
 const droppedPanes = new Set();
+const spawnedPanes = new Map();
 const closingSessions = createClosingSessions();
 const interactionGuard = installInteractionGuard(refresh);
 function isClosingSession(sessionId, pane) { return closingSessions.has(sessionId, pane); }
@@ -242,7 +243,7 @@ function triageVisible(item) { return (item.kind === 'pinned' || !state.dismisse
 function retainedSelectionItem(item) {
   if (isClosingSession(item?.sessionId, item?.pane)) return null;
   const session = sessionFor(item);
-  if (state.historyTarget?.sessionId === item?.sessionId && matchesTriageFilter(item)) return session
+  if (state.historyTarget?.sessionId && state.historyTarget.sessionId === item?.sessionId && matchesTriageFilter(item)) return session
     ? sessionItem('recent', session) : { ...state.historyTarget, kind: 'recent', pane: null, state: 'exited' };
   return session && triageVisible(item) ? sessionItem('recent', session) : null;
 }
@@ -421,6 +422,7 @@ async function saveLayouts() {
 }
 async function dropPane(pane) {
   droppedPanes.add(pane);
+  spawnedPanes.delete(pane);
   const mounts = terminals.get(pane);
   if (mounts) {
     for (const entry of mounts.values()) entry.mounted.dispose();
@@ -462,6 +464,10 @@ async function startShell(cwd, name) {
   const known = data.panes.find((pane) => pane.id === result.pane.id);
   if (known) Object.assign(known, result.pane);
   else data.panes.push(result.pane);
+  // A state request can have captured its pane list before this spawn and
+  // finish afterwards. Keep the successful spawn authoritative until a later
+  // state snapshot observes it, so that response cannot erase the new terminal.
+  spawnedPanes.set(result.pane.id, result.pane);
   return result.pane;
 }
 async function reopenSession({ sessionId, taskId, agent, title, stalePane }) {
@@ -739,6 +745,10 @@ async function reload() {
     if (generation < appliedReloadGeneration) return;
     appliedReloadGeneration = generation;
     data = nextData;
+    for (const [id, pane] of spawnedPanes) {
+      if ((data.panes || []).some((candidate) => candidate.id === id)) spawnedPanes.delete(id);
+      else data.panes = [...(data.panes || []), pane];
+    }
     closingSessions.reconcile(data);
     void refreshProjectChoices();
     optimisticSetAside.clear();

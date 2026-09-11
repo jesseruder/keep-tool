@@ -16,6 +16,8 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
   const eventClients = new Set();
   let summaryFresh = false;
   let summaryText = 'Fixture summary';
+  let holdNextState = false;
+  let releaseHeldState = null;
   const sessions = ['a', 'b'].map((id) => ({ id, kind: 'claude', title: `Session ${id}`, project: '/tmp/history-fixture', taskId: `card-${id}`, pane: `p${id}`, mtime: Date.now(), state: 'running', endedTurn: false }));
   const panes = sessions.map((s, i) => ({ id: s.pane, pid: 100 + i, alive: true, meta: { agent: 'claude', sessionId: s.id } }));
   const layouts = [{ name: 'Pinned', role: 'pinned', ids: ['pa', 'pb'], cols: 2 }];
@@ -28,6 +30,15 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     if (url.pathname === '/api/events') { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(': ready\n\n'); eventClients.add(res); req.on('close', () => eventClients.delete(res)); return; }
     if (url.pathname.startsWith('/api/')) {
       res.setHeader('content-type', 'application/json');
+      if (url.pathname === '/api/state' && holdNextState) {
+        holdNextState = false;
+        const snapshot = JSON.stringify({ ...state, health: {
+          ...state.health, daemon: { running: true, pid: 'held-state-applied' }, schedulers: [],
+        } });
+        await new Promise((resolve) => { releaseHeldState = resolve; });
+        releaseHeldState = null;
+        res.end(snapshot); return;
+      }
       if (url.pathname === '/api/setaside') {
         let body = ''; for await (const chunk of req) body += chunk;
         const request = JSON.parse(body);
@@ -342,8 +353,17 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
       const fonts = await evaluate("new Promise(resolve => {const values=[];const sample=()=>{values.push(window.stableTerminal.options.fontSize);if(values.length===8)resolve(values);else requestAnimationFrame(sample)};requestAnimationFrame(sample)})");
       assert.equal(new Set(fonts).size, 1, 'observer font must not step through sizes after the view switch');
     }
+    holdNextState = true;
+    for (const client of eventClients) client.write('data: changed\n\n');
+    const holdDeadline = Date.now() + 2000;
+    while (!releaseHeldState && Date.now() < holdDeadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.ok(releaseHeldState, 'fixture must capture the pre-spawn state request');
     await evaluate("document.querySelector('.qfocus').click(); [...document.querySelectorAll('#qlist .qtoggle')].find(x=>x.textContent.includes('Pinned')).click(); document.querySelector('#rail [data-shell]').click()");
     await wait("document.querySelector('#stage').dataset.pane === 'shell1' && document.activeElement?.matches('#stage .xterm-helper-textarea')");
+    releaseHeldState();
+    await wait("document.querySelector('#health .pop')?.textContent.includes('held-state-applied')");
+    assert.equal(await evaluate("document.querySelector('#stage').dataset.pane"), 'shell1', 'a state response captured before spawn cannot replace the new terminal');
+    assert.notEqual(await evaluate("document.querySelector('#qlist .qitem.sel')?.dataset.key"), 'recent:recent:undefined:undefined');
     assert.equal(await evaluate("document.querySelector('.qfocus').getAttribute('aria-pressed')"), 'false', 'new shell leaves waiting-only Focus mode');
     await evaluate("document.querySelector('[data-mode=watch]').click(); document.querySelector('#spawnShell').click()");
     await wait("document.activeElement?.closest('.wpane')?.dataset.pane === 'shell2'");
@@ -419,6 +439,7 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     await wait("document.querySelector('#qlist .qitem')");
     assert.ok(await evaluate("!document.querySelector('#qlist [data-key=\"waiting:a\"]') && !document.querySelector('#qlist [data-key=\"running:a\"]') && !document.querySelector('#qlist [data-key=\"pinned:a\"]')"), 'closed conversation stays out of active queues and pins after refresh');
   } finally {
+    releaseHeldState?.();
     ws?.close(); chrome.kill();
     await new Promise((resolve) => { if (chrome.exitCode !== null) resolve(); else chrome.once('exit', resolve); });
     for (const client of terminalSockets.clients) client.terminate();

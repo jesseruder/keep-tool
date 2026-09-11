@@ -81,6 +81,17 @@ test('only explicit queue selection records history and requests terminal focus'
   c.setSelected(0, true); assert.equal(visits.length, 1); assert.equal(state.focusPane, 'p');
 });
 
+test('a missing shell selection is not fabricated as an empty history row', () => {
+  const state = { historyTarget: null };
+  const c = vm.createContext({ state, isClosingSession: () => false, sessionFor: () => undefined,
+    matchesTriageFilter: () => true, sessionItem: () => { throw new Error('unexpected session'); } });
+  vm.runInContext(functionText('retainedSelectionItem', '\nfunction triageItems'), c);
+  assert.equal(c.retainedSelectionItem({ kind: 'pinned', pane: 'shell' }), null);
+
+  state.historyTarget = { sessionId: 'gone', title: 'Gone' };
+  assert.equal(c.retainedSelectionItem({ kind: 'recent', sessionId: 'gone' }).sessionId, 'gone');
+});
+
 test('Close follows Dismiss and acts immediately without a confirmation', () => {
   const triage = fs.readFileSync(path.join(__dirname, '../web/app/triage.js'), 'utf8');
   const header = triage.split('\n').find((line) => line.includes("stage.querySelector('.shead')"));
