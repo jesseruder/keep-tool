@@ -1,7 +1,7 @@
 import { configureProjects } from './model';
-export function normalizeServer(value) {
-  return String(value || '').trim().replace(/\/+$/, '');
-}
+const { createStateCache, normalizeServer } = require('./state-cache');
+const stateCache = createStateCache();
+export { normalizeServer };
 
 export async function request(config, path, options = {}) {
   if (!config?.server || !config?.token) throw new Error('Server is not configured');
@@ -57,10 +57,10 @@ export async function request(config, path, options = {}) {
   }
 }
 
-export const getState = async (config) => {
-  const state = await request(config, '/api/state');
-  configureProjects(state);
-  return state;
+export const getState = async (config, descriptor = { view: 'needs' }, options = {}) => {
+  const result = await stateCache.load(config, descriptor, options);
+  configureProjects(result.state);
+  return result;
 };
 export const getLayouts = (config) => request(config, '/api/layouts');
 // Terminals address either an agent session or a bare shell pane; `target` is
@@ -111,3 +111,8 @@ export const getSessionTail = (config, sessionId) => request(
   config,
   `/api/sessiontail?id=${encodeURIComponent(sessionId)}`,
 );
+export const getTask = async (config, taskId, options = {}) => {
+  const result = await getState(config, { view: 'task', id: taskId }, options);
+  if (!result.state.task) throw new Error('Card no longer exists');
+  return result.state.task;
+};

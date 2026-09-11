@@ -46,7 +46,10 @@ const RECENT_KEY = 'keep.recent.expanded';
 const REVIEW_ACTIONS_KEY = 'keep.reviewer.actionsOnly';
 const REVIEW_SEEN_KEY = 'keep.reviewer.seenAt';
 const ATTENTION_SWEEP_TASK = 'keep-attention-sweep';
+const BACKGROUND_ATTENTION_ETAG_KEY = '@keep/backgroundAttentionEtag';
+const BACKGROUND_ATTENTION_STATE_KEY = '@keep/backgroundAttentionState';
 const NOTIFIED_ATTENTION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const { createStateResultGate, stateViewKey } = require('./src/state-cache');
 
 function projName(project) {
   return project ? String(project).split('/').filter(Boolean).pop() || '' : '';
@@ -141,14 +144,32 @@ try {
       const timeout = setTimeout(() => controller.abort(), 15000);
       let response;
       try {
-        response = await fetch(`${api.normalizeServer(config.server)}/api/state`, {
-          headers: { 'x-keep': '1', 'x-keep-token': config.token },
+        const [etag, cachedState] = await Promise.all([
+          AsyncStorage.getItem(BACKGROUND_ATTENTION_ETAG_KEY),
+          AsyncStorage.getItem(BACKGROUND_ATTENTION_STATE_KEY),
+        ]);
+        const headers = { 'x-keep': '1', 'x-keep-token': config.token };
+        if (etag) headers['if-none-match'] = etag;
+        response = await fetch(`${api.normalizeServer(config.server)}/api/state?view=notifications`, {
+          headers,
           signal: controller.signal,
         });
+        if (response.status === 304) {
+          if (!cachedState) {
+            await AsyncStorage.removeItem(BACKGROUND_ATTENTION_ETAG_KEY);
+            return BackgroundTask.BackgroundTaskResult.Failed;
+          }
+          await diffAndNotifyAttention(JSON.parse(cachedState), false, true);
+          return BackgroundTask.BackgroundTaskResult.Success;
+        }
       } finally { clearTimeout(timeout); }
 
       if (!response.ok) return BackgroundTask.BackgroundTaskResult.Failed;
       const state = await response.json();
+      await Promise.all([
+        response.headers.get('etag') ? AsyncStorage.setItem(BACKGROUND_ATTENTION_ETAG_KEY, response.headers.get('etag')) : Promise.resolve(),
+        AsyncStorage.setItem(BACKGROUND_ATTENTION_STATE_KEY, JSON.stringify(state)),
+      ]);
       await diffAndNotifyAttention(state, false, true);
       return BackgroundTask.BackgroundTaskResult.Success;
     } catch { return BackgroundTask.BackgroundTaskResult.Failed; }
@@ -207,6 +228,20 @@ function KeepApp() {
   const backgroundRegistrationRef = useRef(false);
   const foregroundBaselineRef = useRef(true);
   const notificationWorkRef = useRef(Promise.resolve());
+  const activeStateViewRef = useRef({ view: 'needs' });
+  const stateRequestAbortRef = useRef(null);
+  const stateResultGateRef = useRef(createStateResultGate());
+  const integratedStateKeyRef = useRef(null);
+
+  const activeStateView = useMemo(() => {
+    if (route?.name === 'screen') return null;
+    if (route?.name === 'new') return { view: 'new' };
+    if (selection?.sessionId) return { view: 'session', id: selection.sessionId };
+    return { view: mode === 'reviewer' ? 'reviewer' : mode === 'fleet' ? 'fleet' : 'needs' };
+  }, [mode, route, selection?.sessionId]);
+  const activeStateKey = activeStateView ? stateViewKey(activeStateView) : null;
+  activeStateViewRef.current = activeStateView;
+  stateResultGateRef.current.activate(activeStateKey);
 
   const integrateState = useCallback((state) => {
     const fresh = queueItems(state);
@@ -297,31 +332,44 @@ function KeepApp() {
   }, [registerAttentionSweep, setupNotifications]);
 
   const refreshState = useCallback(async () => {
-    if (!config) return null;
+    const descriptor = activeStateViewRef.current;
+    if (!config || !descriptor) return null;
+    const key = stateViewKey(descriptor);
+    const ticket = stateResultGateRef.current.begin(key);
+    if (stateRequestAbortRef.current) stateRequestAbortRef.current.abort();
+    const controller = new AbortController();
+    stateRequestAbortRef.current = controller;
     try {
-      const [state, layoutData] = await Promise.all([
-        api.getState(config),
-        api.getLayouts(config).catch(() => null),
+      const [result, layoutData] = await Promise.all([
+        api.getState(config, descriptor, { signal: controller.signal }),
+        descriptor.view === 'needs' ? api.getLayouts(config).catch(() => null) : Promise.resolve(null),
       ]);
-      integrateState(state);
+      if (!stateResultGateRef.current.accepts(ticket)) return null;
+      const shouldIntegrate = !result.unchanged || integratedStateKeyRef.current !== key;
+      if (shouldIntegrate) {
+        integrateState(result.state);
+        integratedStateKeyRef.current = key;
+      }
       if (Array.isArray(layoutData?.layouts)) setLayouts(layoutData.layouts);
-      handleSuccessfulState(state);
+      if (shouldIntegrate && Array.isArray(result.state?.attention)) handleSuccessfulState(result.state);
       setPollError(null);
-      return state;
+      return result.state;
     } catch (error) {
-      setPollError(error.message || 'Connection failed');
+      if (stateResultGateRef.current.accepts(ticket) && !controller.signal.aborted) setPollError(error.message || 'Connection failed');
       return null;
+    } finally {
+      if (stateRequestAbortRef.current === controller) stateRequestAbortRef.current = null;
     }
   }, [config, handleSuccessfulState, integrateState]);
 
   useEffect(() => {
-    if (!config || showSetup) return undefined;
+    if (!config || showSetup || !activeStateView) return undefined;
     let interval = null;
     const startPolling = () => {
       if (interval) clearInterval(interval);
       interval = setInterval(refreshState, 8000);
     };
-    setInitialLoading(true);
+    if (activeStateView.view === 'needs') setInitialLoading(true);
     refreshState().finally(() => setInitialLoading(false));
     if (AppState.currentState === 'active') startPolling();
     const subscription = AppState.addEventListener('change', (nextState) => {
@@ -335,9 +383,10 @@ function KeepApp() {
     });
     return () => {
       if (interval) clearInterval(interval);
+      if (stateRequestAbortRef.current) stateRequestAbortRef.current.abort();
       subscription.remove();
     };
-  }, [config, refreshState, showSetup]);
+  }, [activeStateKey, config, refreshState, showSetup]);
 
   const allQueue = useMemo(() => queueItems(data, handledRef.current), [data, handledVersion]);
   const waiting = useMemo(() => visibleQueue(allQueue), [allQueue]);
@@ -507,6 +556,7 @@ function KeepApp() {
     setConfig(nextConfig);
     setPollError(null);
     integrateState(state);
+    integratedStateKeyRef.current = 'needs';
     handleSuccessfulState(state);
     const nextLayouts = await api.getLayouts(nextConfig).catch(() => null);
     if (Array.isArray(nextLayouts?.layouts)) setLayouts(nextLayouts.layouts);
@@ -519,7 +569,7 @@ function KeepApp() {
   const reviewerFresh = Number(reviewerStats.lastTickAt || 0) && Date.now() - Number(reviewerStats.lastTickAt) <= 90 * 60e3;
   const reviewerHealthy = Boolean(reviewerMarker && reviewerMarker.state !== 'gone'
     && ['running', 'idle'].includes(reviewerMarker.state) && reviewerFresh);
-  const reportedPaneCount = Array.isArray(data.panes) ? data.panes.length : 0;
+  const reportedPaneCount = Number.isFinite(Number(data.paneCount)) ? Number(data.paneCount) : Array.isArray(data.panes) ? data.panes.length : 0;
   const paneCount = reportedPaneCount || new Set((data.sessions || []).map((session) => session.pane).filter(Boolean)).size;
   const insets = useSafeAreaInsets();
   const statusInset = insets.top;
@@ -608,6 +658,7 @@ function KeepApp() {
           <Session
             config={config}
             data={data}
+            detailLoading={Boolean(selection?.sessionId && !(data.view === 'session' && data.id === selection.sessionId))}
             item={selectedItem}
             onAnswer={answerItem}
             onBack={() => setSelection(null)}

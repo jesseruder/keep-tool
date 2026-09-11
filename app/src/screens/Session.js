@@ -5,7 +5,7 @@ import * as api from '../api';
 import { isClosedSession, kindLabel, optionLabel, projectFor, rateLimitFor, tagsFor } from '../model';
 import { Button, Chip, InlineError, Markdown } from '../ui';
 
-export default function Session({ config, data, item, keyboardOffset = 0, onAnswer, onBack, onDismiss, onFocus, onOpenScreen, onReopen, onSend, onSnooze, styles }) {
+export default function Session({ config, data, detailLoading = false, item, keyboardOffset = 0, onAnswer, onBack, onDismiss, onFocus, onOpenScreen, onReopen, onSend, onSnooze, styles }) {
   const [busy, setBusy] = useState(null);
   const [error, setError] = useState(null);
   const [reply, setReply] = useState('');
@@ -13,9 +13,14 @@ export default function Session({ config, data, item, keyboardOffset = 0, onAnsw
   const [conversationOpen, setConversationOpen] = useState(false);
   const [conversation, setConversation] = useState(null);
   const [tailLoading, setTailLoading] = useState(false);
+  const [cardOpen, setCardOpen] = useState(false);
+  const [card, setCard] = useState(null);
+  const [cardLoading, setCardLoading] = useState(false);
   const tailRequestRef = useRef(0);
+  const cardRequestRef = useRef(0);
   useEffect(() => {
     tailRequestRef.current += 1;
+    cardRequestRef.current += 1;
     setBusy(null);
     setError(null);
     setReply('');
@@ -23,7 +28,10 @@ export default function Session({ config, data, item, keyboardOffset = 0, onAnsw
     setConversationOpen(false);
     setConversation(null);
     setTailLoading(false);
-    return () => { tailRequestRef.current += 1; };
+    setCardOpen(false);
+    setCard(null);
+    setCardLoading(false);
+    return () => { tailRequestRef.current += 1; cardRequestRef.current += 1; };
   }, [item.sessionId, item.kind, item.since]);
 
   const session = item._session || (data.sessions || []).find((candidate) => candidate.id === item.sessionId);
@@ -46,6 +54,7 @@ export default function Session({ config, data, item, keyboardOffset = 0, onAnsw
     finally { setBusy(null); }
   };
   const sendReply = () => {
+    if (detailLoading) return;
     const text = reply.trim();
     if (text) perform('send', () => onSend(item, text));
   };
@@ -69,6 +78,26 @@ export default function Session({ config, data, item, keyboardOffset = 0, onAnsw
       if (tailRequestRef.current === requestId) setTailLoading(false);
     }
   };
+  const toggleCard = async () => {
+    const opening = !cardOpen;
+    setCardOpen(opening);
+    if (!opening || card !== null || cardLoading || !item.taskId) return;
+
+    const requestId = ++cardRequestRef.current;
+    setCardLoading(true);
+    setError(null);
+    try {
+      const result = await api.getTask(config, item.taskId);
+      if (cardRequestRef.current === requestId) setCard(result);
+    } catch (cardError) {
+      if (cardRequestRef.current === requestId) {
+        setError({ message: cardError.message || 'Could not load the card' });
+        setCardOpen(false);
+      }
+    } finally {
+      if (cardRequestRef.current === requestId) setCardLoading(false);
+    }
+  };
 
   return (
     <KeyboardAvoidingView behavior="padding" keyboardVerticalOffset={keyboardOffset} style={styles.screen}>
@@ -87,9 +116,24 @@ export default function Session({ config, data, item, keyboardOffset = 0, onAnsw
               <Text style={styles.openScreenText}>{closed ? 'Open last screen ›' : 'Open screen ›'}</Text>
             </Pressable>
           ) : null}
+          {item.taskId ? (
+            <View style={styles.earlierBlock}>
+              <Pressable accessibilityRole="button" onPress={toggleCard} style={({ pressed }) => [styles.earlierLink, pressed && styles.pressed]}>
+                <Text style={styles.earlierLinkText}>{cardOpen ? 'Hide card history' : 'Card history'}</Text>
+              </Pressable>
+              {cardLoading ? <ActivityIndicator color={styles.colors.info} size="small" /> : null}
+              {cardOpen && card ? (
+                <View style={styles.earlierTranscript}>
+                  <Markdown base={styles.terminalText} styles={styles} text={card.body || 'No card history.'} />
+                </View>
+              ) : null}
+            </View>
+          ) : null}
         </View>
 
-        {item.sessionId ? (
+        {detailLoading ? (
+          <View style={styles.answerArea}><ActivityIndicator color={styles.colors.accent} /></View>
+        ) : item.sessionId ? (
           <View style={styles.answerArea}>
             {rateLimit ? (
               <View style={styles.options}>
@@ -182,12 +226,12 @@ export default function Session({ config, data, item, keyboardOffset = 0, onAnsw
         </View>
       </ScrollView>
       <View style={styles.bottomActions}>
-        <Button disabled={passive || Boolean(busy)} loading={busy === 'snooze'} onPress={() => perform('snooze', () => onSnooze(item))} quiet style={styles.actionButton} styles={styles}>Snooze 1h</Button>
-        <Button disabled={passive || Boolean(busy)} loading={busy === 'dismiss'} onPress={() => perform('dismiss', () => onDismiss(item))} quiet style={styles.actionButton} styles={styles}>Dismiss</Button>
+        <Button disabled={detailLoading || passive || Boolean(busy)} loading={busy === 'snooze'} onPress={() => perform('snooze', () => onSnooze(item))} quiet style={styles.actionButton} styles={styles}>Snooze 1h</Button>
+        <Button disabled={detailLoading || passive || Boolean(busy)} loading={busy === 'dismiss'} onPress={() => perform('dismiss', () => onDismiss(item))} quiet style={styles.actionButton} styles={styles}>Dismiss</Button>
         {closed ? (
-          <Button disabled={!item.sessionId || Boolean(busy)} loading={busy === 'reopen'} onPress={() => perform('reopen', () => onReopen(item))} quiet style={styles.actionButton} styles={styles}>Reopen</Button>
+          <Button disabled={detailLoading || !item.sessionId || Boolean(busy)} loading={busy === 'reopen'} onPress={() => perform('reopen', () => onReopen(item))} quiet style={styles.actionButton} styles={styles}>Reopen</Button>
         ) : (
-          <Button disabled={!item.sessionId || Boolean(busy)} loading={busy === 'focus'} onPress={() => perform('focus', () => onFocus(item))} quiet style={styles.actionButton} styles={styles}>On Mac</Button>
+          <Button disabled={detailLoading || !item.sessionId || Boolean(busy)} loading={busy === 'focus'} onPress={() => perform('focus', () => onFocus(item))} quiet style={styles.actionButton} styles={styles}>On Mac</Button>
         )}
       </View>
     </KeyboardAvoidingView>

@@ -22,8 +22,8 @@ export default function Setup({ initialConfig, onCancel, onConnected, onPalette,
     setConnecting(true);
     setError(null);
     try {
-      const state = await getState(config);
-      await onConnected(config, state);
+      const result = await getState(config);
+      await onConnected(config, result.state);
     } catch (connectError) {
       setError({ message: connectError.message || 'Could not connect', screenTail: connectError.screenTail });
     } finally { setConnecting(false); }
