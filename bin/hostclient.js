@@ -161,6 +161,7 @@ function connect(options = {}) {
             ? {} : { snapshotScrollback: attachOptions.snapshotScrollback }),
           ...(attachOptions.viewer == null ? {} : { viewer: attachOptions.viewer }),
           ...(attachOptions.primary == null ? {} : { primary: attachOptions.primary === true }),
+          ...(attachOptions.visible == null ? {} : { visible: attachOptions.visible === true }),
         });
         let detached = false;
         return {

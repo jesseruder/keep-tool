@@ -295,15 +295,16 @@ test('screen waits for writes appended while the current terminal write is pendi
   });
 });
 
-test('visibility counts each attachment and defaults unknown viewers to visible', async () => {
+test('visibility counts only viewers confirmed visible', async () => {
   await withHost({}, async ({ client, sock }) => {
     const { pane } = await client.request('spawn', { cmd: '/bin/sh', args: ['-c', 'cat'] });
     const other = await connect({ sock });
     try {
       await client.attach(pane.id, { replay: false }, () => {});
       await other.attach(pane.id, { replay: false }, () => {});
-      assert.equal((await client.request('get', { pane: pane.id })).pane.visibleAttached, 2);
-      assert.equal((await client.request('visibility', { pane: pane.id, visible: false })).pane.visibleAttached, 1);
+      assert.equal((await client.request('get', { pane: pane.id })).pane.visibleAttached, 0);
+      assert.equal((await client.request('visibility', { pane: pane.id, visible: true })).pane.visibleAttached, 1);
+      assert.equal((await client.request('visibility', { pane: pane.id, visible: false })).pane.visibleAttached, 0);
       const hidden = (await other.request('visibility', { pane: pane.id, visible: false })).pane;
       assert.equal(hidden.attached, 2);
       assert.equal(hidden.visibleAttached, 0);
@@ -315,11 +316,32 @@ test('visibility counts each attachment and defaults unknown viewers to visible'
   });
 });
 
+test('a hidden snapshot reconnect does not acknowledge unread output', async () => {
+  await withHost({}, async ({ client }) => {
+    const script = "process.stdin.on('data',()=>process.stdout.write('later'));process.stdout.write('earlier');setInterval(()=>{},1000)";
+    const { pane } = await client.request('spawn', { cmd: process.execPath, args: ['-e', script] });
+    await waitFor(async () => (await client.request('get', { pane: pane.id })).pane.outputCount > 0, 'initial output');
+    assert.equal((await client.request('get', { pane: pane.id })).pane.lastReadAt, null);
+
+    const attachment = await client.attach(pane.id, { snapshot: true }, () => {});
+    assert.equal((await client.request('get', { pane: pane.id })).pane.lastReadAt, null);
+    const before = (await client.request('get', { pane: pane.id })).pane.outputCount;
+    await client.request('input', { pane: pane.id, data: Buffer.from('hidden').toString('base64') });
+    await waitFor(async () => (await client.request('get', { pane: pane.id })).pane.outputCount > before, 'hidden output');
+    assert.equal((await client.request('get', { pane: pane.id })).pane.lastReadAt, null);
+
+    await client.request('visibility', { pane: pane.id, visible: true });
+    assert.equal(typeof (await client.request('get', { pane: pane.id })).pane.lastReadAt, 'string');
+    await client.request('kill', { pane: pane.id });
+    await attachment.detach();
+  });
+});
+
 test('input echoes through sh -c cat', async () => {
   await withHost({}, async ({ client }) => {
     const { pane } = await client.request('spawn', { cmd: '/bin/sh', args: ['-c', 'cat'] });
     let output = '';
-    const attachment = await client.attach(pane.id, { replay: false }, (data) => { output += data.toString(); });
+    const attachment = await client.attach(pane.id, { replay: false, visible: true }, (data) => { output += data.toString(); });
     await client.request('input', { pane: pane.id, data: Buffer.from('echo-me\n').toString('base64') });
     await waitFor(() => output.includes('echo-me'), 'cat echo');
     const activity = (await client.request('get', { pane: pane.id })).pane;

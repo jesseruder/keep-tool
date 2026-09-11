@@ -225,7 +225,7 @@ function publicPane(pane) {
     cols: pane.cols,
     rows: pane.rows,
     attached: pane.attachments.size,
-    visibleAttached: [...pane.attachments.values()].filter(a => a.visible !== false).length,
+    visibleAttached: [...pane.attachments.values()].filter(a => a.visible === true).length,
     createdAt: pane.createdAt,
     exitedAt: pane.exitedAt,
     lastInputAt: pane.lastInputAt,
@@ -439,7 +439,7 @@ function createHost(options = {}) {
       pane.buffer.push(data);
       pane.outputCount += 1;
       pane.lastOutputAt = new Date().toISOString();
-      if ([...pane.attachments.values()].some((attachment) => attachment.visible !== false)) {
+      if ([...pane.attachments.values()].some((attachment) => attachment.visible === true)) {
         pane.lastReadAt = pane.lastOutputAt;
       }
       terminalWrite(pane, data).catch(() => {});
@@ -642,6 +642,7 @@ function createHost(options = {}) {
         const attachment = {
           viewer,
           primary: params.primary !== false,
+          visible: params.visible === true,
           order: nextAttachOrder++,
           readsHistory: params.snapshot === true || params.replay !== false,
         };
@@ -674,7 +675,7 @@ function createHost(options = {}) {
             };
           }
           pane.attachments.set(connection, attachment);
-          if (attachment.visible !== false && attachment.readsHistory) pane.lastReadAt = new Date().toISOString();
+          if (attachment.visible === true && attachment.readsHistory) pane.lastReadAt = new Date().toISOString();
           connection.attached.add(pane.id);
           connection.viewers.set(pane.id, viewer);
           connection.pendingAttach.set(pane.id, pending);
