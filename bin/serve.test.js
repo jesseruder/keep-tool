@@ -2200,6 +2200,7 @@ test('a refused compaction is recognised from the screen instead of waiting out 
 
 test('compact screen confirmation is anchored after the command echo and requires the returned prompt', () => {
   assert.equal(compactScreenConfirmed('❯ /compact\n  ⎿  Compacted (ctrl+o to see full summary)\n\n❯ ', '/compact'), true);
+  assert.equal(compactScreenConfirmed('❯ /compact\n  ⎿  Compacted (ctrl+o to see full summary)', '/compact'), false);
   assert.equal(compactScreenConfirmed('❯ /compact\n  ⎿  Compacting… (esc to interrupt)', '/compact'), false);
   assert.equal(compactScreenConfirmed('Compacted\n❯ /compact\n❯ ', '/compact'), false);
 });

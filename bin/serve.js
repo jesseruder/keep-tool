@@ -1524,9 +1524,10 @@ function linesAfterLastEcho(screen, command) {
 }
 
 function compactScreenConfirmed(screen, command) {
-  const after = linesAfterLastEcho(screen, command).join('\n');
-  return /(?:Compacted|Conversation compacted|Conversation recap|Not enough messages to compact)/i.test(after)
-    && Boolean(promptLine(screen))
+  const after = linesAfterLastEcho(screen, command);
+  const completeAt = after.findLastIndex((line) => /(?:Compacted|Conversation compacted|Conversation recap|Not enough messages to compact)/i.test(line));
+  return completeAt !== -1
+    && after.slice(completeAt + 1).some((line) => /^❯\s*$/.test(line))
     && !/esc to (?:interrupt|cancel)|Compacting[.…]/i.test(screen);
 }
 
