@@ -133,6 +133,13 @@ review next steps, waiting triggers, uncited commits, stale active work, old don
 and duplicate titles. It always exits successfully when findings exist, writes the latest
 result to `.keep/lint.json`, and supports one-rule runs plus JSON output and fix hints.
 The brief refreshes findings older than 20 hours and shows the first five.
+The `unsatisfiable-wait` rule flags unresolved waits whose upstream has no live linked
+session, scheduled check recipe, or log activity in 24 hours. It also flags waits whose
+reason or recent downstream check-ins cite a commit already on the upstream's origin
+default branch, excluding commits already specified by that fact target. Hints identify
+the narrower wait to use. Stale or missing daemon session evidence does not prove that
+a linked session is gone. Reviewer bundle headers include bounded, card-specific cached
+lint findings as advisory evidence.
 
 Mutations auto-commit. Manual terminal use also pushes best-effort in the background;
 Claude and Codex sessions leave commits local unless `KEEP_ALLOW_PUSH=1` is explicitly

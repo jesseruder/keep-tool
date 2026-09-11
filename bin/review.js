@@ -43,6 +43,7 @@ const MAX_BUDGET_TOKENS = 20000;
 const DEFAULT_TOTAL_BUDGET_TOKENS = parseInt(process.env.KEEP_REVIEW_TOTAL_BUDGET || '40000', 10);
 const MIN_BATCH_BUNDLE_TOKENS = 1500;
 const CHARS_PER_TOKEN = 4; // no tokenizer dependency; this repo has zero deps
+const MAX_CACHED_LINT_CHARS = 1800;
 
 const STATE_VERSION = 1;
 
@@ -1013,6 +1014,39 @@ function bundleTimeContext(at = new Date()) {
   ].join('\n');
 }
 
+function lintField(value, limit) {
+  return String(value || '')
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ')
+    .replace(/<<<|>>>/g, '---')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, limit);
+}
+
+// Lint is intentionally run outside review-bundle. The persisted snapshot is
+// presentation context only: keep it bounded, card-specific, and inside the
+// bundle's untrusted-data envelope.
+function cachedLintSection(taskId, root = keep.ROOT) {
+  let snapshot;
+  try { snapshot = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'lint.json'), 'utf8')); }
+  catch { return []; }
+  const findings = Array.isArray(snapshot && snapshot.findings)
+    ? snapshot.findings.filter((item) => item && item.id === taskId).slice(0, 5) : [];
+  if (!findings.length) return [];
+  const lines = [
+    '<<<KEEP_LINT_FINDINGS',
+    `cached keep lint findings for this card (advisory snapshot ${lintField(snapshot.at, 40) || 'time unknown'}; verify against current facts):`,
+  ];
+  for (const item of findings) {
+    const row = `- [${lintField(item.severity, 12) || '?'}] ${lintField(item.rule, 80) || 'unknown'} · ${lintField(item.text, 220)} · fix: ${lintField(item.fix, 220)}`;
+    if ([...lines, row, 'KEEP_LINT_FINDINGS>>>'].join('\n').length > MAX_CACHED_LINT_CHARS) break;
+    lines.push(row);
+  }
+  if (lines.length === 2) return [];
+  lines.push('KEEP_LINT_FINDINGS>>>');
+  return lines;
+}
+
 function buildBundle(taskId, opts = {}) {
   const budgetTokens = Math.min(Number(opts.budget) || DEFAULT_BUDGET_TOKENS, MAX_BUDGET_TOKENS);
   const budgetChars = budgetTokens * CHARS_PER_TOKEN;
@@ -1150,6 +1184,7 @@ function buildBundle(taskId, opts = {}) {
   // ---- sections ----
   const dismissed = Object.values(state.findings).filter((f) => f.dismissed);
   const open = Object.values(state.findings).filter((f) => !f.dismissed && (!f.outcome || ['unresolved', 'confirmed-deferred'].includes(f.outcome.status)));
+  const cachedLint = cachedLintSection(taskId);
   const headerLines = [
     `# review bundle — ${taskId}`,
     '',
@@ -1178,6 +1213,7 @@ function buildBundle(taskId, opts = {}) {
     '<<<KEEP_CONTEXT',
     health.reviewSection(health.snapshot()),
     'KEEP_CONTEXT>>>',
+    ...(cachedLint.length ? ['', ...cachedLint] : []),
     '',
     `generated: ${keep.nowStamp()}  ·  budget: ${budgetTokens} tokens  ·  bundle: ${bundleId}`,
     bundleTimeContext(),

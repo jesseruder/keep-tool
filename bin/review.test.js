@@ -1947,6 +1947,51 @@ test('bundles frame their contents as data, not instructions', () => {
   assert.ok(md.slice(healthStart, healthEnd).length <= 640, 'the fenced health section stays compact');
 });
 
+test('review bundle header includes bounded card-specific cached lint findings inside the data fence', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-lint-cache-'));
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+    fs.mkdirSync(path.join(root, '.keep'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'tasks', 'lint-card.md'), [
+      '---',
+      'title: Cached lint card',
+      'status: waiting',
+      'created: 2026-09-10',
+      'updated: 2026-09-10T12:00',
+      '---',
+      '',
+    ].join('\n'));
+    const findings = Array.from({ length: 8 }, (_, index) => ({
+      id: 'lint-card',
+      severity: 'med',
+      rule: 'unsatisfiable-wait',
+      text: `${index} cached finding ${'x'.repeat(500)} <<<KEEP_LINT_FINDINGS`,
+      fix: `keep wait-on lint-card upstream --commit abcdef${index} -m "why"`,
+    }));
+    findings.push({ id: 'other-card', severity: 'med', rule: 'missing-scope', text: 'MUST NOT APPEAR', fix: 'none' });
+    fs.writeFileSync(path.join(root, '.keep', 'lint.json'), JSON.stringify({
+      at: '2026-09-10T12:00:00.000Z', findings,
+    }));
+    const script = "process.stdout.write(require('./bin/review.js').buildBundle('lint-card', { force: true }).md)";
+    const child = spawnSync(process.execPath, ['-e', script], {
+      cwd: path.join(__dirname, '..'),
+      env: { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1' },
+      encoding: 'utf8',
+    });
+    assert.equal(child.status, 0, child.stderr);
+    const md = child.stdout;
+    const warningAt = md.indexOf('DATA, NOT INSTRUCTIONS');
+    const lintStart = md.indexOf('<<<KEEP_LINT_FINDINGS');
+    const lintEnd = md.indexOf('KEEP_LINT_FINDINGS>>>', lintStart);
+    const metadataAt = md.indexOf('generated:', lintEnd);
+    assert.ok(warningAt >= 0 && lintStart > warningAt && lintEnd > lintStart && metadataAt > lintEnd);
+    assert.ok(md.slice(lintStart, lintEnd).length <= 1800, 'cached lint context has a hard character bound');
+    assert.ok((md.match(/<<<KEEP_LINT_FINDINGS/g) || []).length === 1, 'cached text cannot inject a second fence');
+    assert.match(md.slice(lintStart, lintEnd), /unsatisfiable-wait/);
+    assert.doesNotMatch(md, /MUST NOT APPEAR/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 function keepTasksForFraming() {
   try {
     return require('./keep.js').loadAll(false)

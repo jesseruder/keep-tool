@@ -121,6 +121,106 @@ test('watch/lint.json disables a named rule', () => {
   }
 });
 
+test('unsatisfiable-wait requires fresh liveness evidence and honors real upstream triggers', () => {
+  const root = makeRoot();
+  const now = Date.parse('2026-09-10T12:00:00');
+  const oldBody = '## 2026-09-08 09:00 — check-in\nStarted.\n';
+  try {
+    writeCard(root, 'orphan-upstream', { status: 'active' },
+      `## Plan\n- [ ] Publish the result\n\n${oldBody}`);
+    writeCard(root, 'live-upstream', { status: 'active', sessions: [{ id: 'live-session', agent: 'codex' }] }, oldBody);
+    writeCard(root, 'gone-upstream', { status: 'active', sessions: [{ id: 'gone-session', agent: 'claude' }] }, oldBody);
+    writeCard(root, 'scheduled-upstream', {
+      status: 'waiting', check_after: '2026-09-11T09:00', check: 'Inspect the rollout.',
+    }, oldBody);
+    writeCard(root, 'half-scheduled-upstream', { status: 'waiting', check_after: '2026-09-11T09:00' }, oldBody);
+    writeCard(root, 'recent-upstream', { status: 'active' },
+      '## 2026-09-10 11:00 — check-in\nStill working.\n');
+    for (const id of ['orphan', 'live', 'gone', 'scheduled', 'half-scheduled', 'recent']) {
+      writeCard(root, `${id}-waiter`, { status: 'waiting', depends_on: [`${id}-upstream`] });
+    }
+    writeCard(root, 'fact-waiter', { status: 'waiting', depends_on: [{
+      card: 'orphan-upstream', kind: 'commit', commits: ['abcdef1'], reason: 'Wait for the commit.',
+    }] });
+    writeCard(root, 'deploy-waiter', { status: 'waiting', depends_on: [{
+      card: 'orphan-upstream', kind: 'deployed', sha: 'abcdef1', target: 'production', reason: 'Wait for deploy.',
+    }] });
+    writeCard(root, 'status-waiter', { status: 'waiting', depends_on: [{
+      card: 'orphan-upstream', kind: 'status', statuses: ['review'], reason: 'Wait for review.',
+    }] });
+    fs.mkdirSync(path.join(root, '.keep'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.keep', 'live-sessions.json'), JSON.stringify({
+      updatedAt: now,
+      sessions: { 'live-session': { lastSeenAlive: now } },
+    }));
+
+    const fresh = lint({ root, rule: 'unsatisfiable-wait', now }).findings;
+    assert.deepEqual(fresh.map((item) => item.id).sort(), [
+      'deploy-waiter', 'fact-waiter', 'gone-waiter', 'half-scheduled-waiter', 'orphan-waiter', 'status-waiter',
+    ]);
+    assert.match(fresh.find((item) => item.id === 'orphan-waiter').fix,
+      /keep wait-on orphan-waiter orphan-upstream#1 -m "why"/);
+    assert.equal(fresh.find((item) => item.id === 'fact-waiter').fix, 'keep open orphan-upstream');
+
+    fs.writeFileSync(path.join(root, '.keep', 'live-sessions.json'), JSON.stringify({
+      updatedAt: now - 11 * 60e3,
+      sessions: {},
+    }));
+    const stale = lint({ root, rule: 'unsatisfiable-wait', now }).findings;
+    assert.deepEqual(stale.map((item) => item.id).sort(), [
+      'deploy-waiter', 'fact-waiter', 'half-scheduled-waiter', 'orphan-waiter', 'status-waiter',
+    ],
+      'a stale daemon snapshot cannot prove a linked session is gone');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('unsatisfiable-wait spots already-landed shas in the wait reason and recent downstream check-ins', () => {
+  const root = makeRoot();
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-lint-upstream-'));
+  const remote = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-lint-origin-'));
+  const now = Date.parse('2026-09-10T12:00:00');
+  try {
+    git(remote, ['init', '--bare', '--initial-branch=main']);
+    git(repo, ['init', '-b', 'main']);
+    git(repo, ['config', 'user.name', 'Keep Test']);
+    git(repo, ['config', 'user.email', 'keep@example.test']);
+    fs.writeFileSync(path.join(repo, 'landed.txt'), 'landed\n');
+    git(repo, ['add', 'landed.txt']);
+    git(repo, ['commit', '-m', 'landed change']);
+    git(repo, ['remote', 'add', 'origin', remote]);
+    git(repo, ['push', '-u', 'origin', 'main']);
+    const sha = git(repo, ['rev-parse', '--short=10', 'HEAD']);
+
+    writeCard(root, 'source-card', {
+      status: 'active', project: repo,
+      sessions: [{ id: 'source-live', agent: 'codex' }],
+      check_after: '2026-09-11T09:00', check: 'Inspect the next result.',
+    }, '## 2026-09-10 11:30 — check-in\nActive work continues.\n');
+    writeCard(root, 'reason-waiter', { status: 'waiting', depends_on: [{
+      card: 'source-card', kind: 'whole', reason: `Only needs ${sha} on origin.`,
+    }] });
+    writeCard(root, 'checkin-waiter', { status: 'waiting', depends_on: ['source-card'] },
+      `## 2026-09-10 11:45 — check-in\nWaiting for ${sha} to land.\n`);
+    writeCard(root, 'partial-commit-waiter', { status: 'waiting', depends_on: [{
+      card: 'source-card', kind: 'commit', commits: [sha, 'deadbee'], reason: `Needs ${sha} and deadbee.`,
+    }] });
+    writeCard(root, 'pending-deploy-waiter', { status: 'waiting', depends_on: [{
+      card: 'source-card', kind: 'deployed', sha, target: 'production', reason: `Deploy ${sha} to production.`,
+    }] });
+
+    const findings = lint({ root, rule: 'unsatisfiable-wait', now }).findings;
+    assert.deepEqual(findings.map((item) => item.id).sort(), ['checkin-waiter', 'reason-waiter']);
+    for (const item of findings) {
+      assert.match(item.text, new RegExp(`${sha}.*already on`));
+      assert.match(item.fix, new RegExp(`--commit ${sha} -m "why"`));
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(remote, { recursive: true, force: true });
+  }
+});
+
 test('--rule runs only that rule and applies its cap of 10', () => {
   const root = makeRoot();
   try {

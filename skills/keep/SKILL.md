@@ -71,6 +71,9 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   entry, preserves other blockers, cancels queued notices for that dependency, and
   restores `active` only when no dependency, scheduled check, or need remains.
   Already submitted messages cannot be recalled.
+  `keep lint --rule unsatisfiable-wait` finds stalled upstreams and waits whose
+  reason or recent check-ins already cite a landed commit; use its hint to select
+  a narrower target or restore the upstream's progress.
   For fleet state, prefer `keep wait` as a background command over scheduling timed
   `--check-after` rechecks: the Claude harness wakes the session when the command exits.
   In the background pass a long bound (`--for 8h`) so the session actually idles

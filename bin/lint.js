@@ -18,6 +18,7 @@ const RULE_NAMES = [
   'scope-mismatch',
   'review-no-next',
   'waiting-no-trigger',
+  'unsatisfiable-wait',
   'active-no-plan',
   'autonomous-no-grants',
   'uncited-commits',
@@ -116,6 +117,126 @@ function waitingNoTrigger(task, ctx) {
     'waiting card has no future check and no unresolved dependency',
     `keep wait-on ${task.id} <upstream> or keep checkin ${task.id} --check-after <when> --check "..." -m "..."`,
   )];
+}
+
+const LIVE_SESSION_MS = 10 * 60e3;
+
+function loadLiveSessions(root, now) {
+  try {
+    const ledger = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'live-sessions.json'), 'utf8'));
+    const cutoff = now - LIVE_SESSION_MS;
+    const updatedAt = Number(ledger && ledger.updatedAt);
+    if (!Number.isFinite(updatedAt) || updatedAt < cutoff || updatedAt > now + 60e3) {
+      return { known: false, ids: new Set() };
+    }
+    return {
+      known: true,
+      ids: new Set(Object.entries(ledger.sessions || {})
+        .filter(([, entry]) => entry && Number(entry.lastSeenAlive) >= cutoff
+          && Number(entry.lastSeenAlive) <= now + 60e3)
+        .map(([id]) => id)),
+    };
+  } catch { return { known: false, ids: new Set() }; }
+}
+
+// A fresh daemon snapshot can establish that a linked session is gone. A stale
+// or missing snapshot cannot: lint must not turn missing observation into a claim
+// about liveness. Upstreams with no links need no daemon evidence.
+function hasLinkedLiveSession(task, ctx) {
+  const ids = (task.fm.sessions || []).map((session) => session && session.id).filter(Boolean);
+  if (!ids.length) return false;
+  if (!ctx.liveSessions.known) return null;
+  return ids.some((id) => ctx.liveSessions.ids.has(id));
+}
+
+function recentEntries(task, now) {
+  const cutoff = now - DAY_MS;
+  return review.stampedLogEntries(task.body).filter((entry) => {
+    const at = atMs(entry.stamp.replace(' ', 'T'));
+    return Number.isFinite(at) && at >= cutoff;
+  });
+}
+
+function citedWaitShas(task, dependency, ctx) {
+  const entries = recentEntries(task, ctx.now);
+  const reason = keep.dependencyReason(dependency);
+  if (reason) entries.unshift({ kind: 'wait reason', text: reason });
+  const seen = new Set();
+  return landed.citedShas(entries).map((item) => item.sha.toLowerCase()).filter((sha) => {
+    if (seen.has(sha)) return false;
+    seen.add(sha);
+    return true;
+  });
+}
+
+function removeWaitCommand(task, dependency) {
+  return `keep wait-on ${task.id} --remove ${keep.dependencyTarget(dependency)} -m "why"`;
+}
+
+function narrowerWaitCommand(task, dependency, upstream) {
+  const next = keep.nextStep(upstream);
+  if ((dependency.kind || (dependency.step == null ? 'whole' : 'step')) === 'whole' && next) {
+    return `keep wait-on ${task.id} ${upstream.id}#${next.n} -m "why"`;
+  }
+  return `keep wait-on ${task.id} ${upstream.id} --status review,landing,done -m "why"`;
+}
+
+function sameSha(a, b) {
+  a = String(a || '').toLowerCase();
+  b = String(b || '').toLowerCase();
+  return a.startsWith(b) || b.startsWith(a);
+}
+
+function explicitlyWaitedShas(dependency) {
+  const kind = dependency.kind || (dependency.step == null ? 'whole' : 'step');
+  if (kind === 'commit') return dependency.commits || [];
+  if (kind === 'deployed') return [dependency.sha];
+  return [];
+}
+
+function inactiveWaitFix(task, dependency, upstream) {
+  const kind = dependency.kind || (dependency.step == null ? 'whole' : 'step');
+  if (['whole', 'step'].includes(kind)) {
+    return `${removeWaitCommand(task, dependency)}; ${narrowerWaitCommand(task, dependency, upstream)}`;
+  }
+  return `keep open ${upstream.id}`;
+}
+
+// Broad waits still depend on an upstream session remembering to change card
+// state. Flag waits with no remaining trigger, plus the stronger case where the
+// wait's own prose already names a commit that reached that upstream's origin.
+function unsatisfiableWait(task, ctx) {
+  if (task.fm.status !== 'waiting') return [];
+  const out = [];
+  for (const entry of task.fm.depends_on || []) {
+    const dependency = keep.parseDependency(entry);
+    if (dependency.invalid) continue;
+    const upstream = ctx.allTasks.get(dependency.id);
+    if (!upstream || keep.dependencyResolved(upstream, dependency)) continue;
+    const repo = ctx.repoFor(upstream);
+    const explicitShas = explicitlyWaitedShas(dependency);
+    const landedSha = repo && citedWaitShas(task, dependency, ctx)
+      .find((sha) => !explicitShas.some((target) => sameSha(sha, target)) && onOriginFresh(repo, sha, ctx));
+    if (landedSha) {
+      out.push(finding(
+        'unsatisfiable-wait', task, 'med',
+        `wait on ${keep.dependencyTarget(dependency)} cites ${landedSha}, which is already on that upstream's origin default branch`,
+        `${removeWaitCommand(task, dependency)}; keep wait-on ${task.id} ${upstream.id} --commit ${landedSha} -m "why"`,
+      ));
+      continue;
+    }
+
+    const live = hasLinkedLiveSession(upstream, ctx);
+    if (live !== false) continue;
+    if (upstream.fm.check_after && upstream.fm.check) continue;
+    if (recentEntries(upstream, ctx.now).length) continue;
+    out.push(finding(
+      'unsatisfiable-wait', task, 'med',
+      `wait on ${keep.dependencyTarget(dependency)} has no live linked upstream session, scheduled check recipe, or upstream log activity in 24 hours`,
+      inactiveWaitFix(task, dependency, upstream),
+    ));
+  }
+  return out;
 }
 
 function sessionWindow(task, session, now) {
@@ -349,6 +470,7 @@ const RULES = {
   'scope-mismatch': scopeMismatch,
   'review-no-next': reviewNoNext,
   'waiting-no-trigger': waitingNoTrigger,
+  'unsatisfiable-wait': unsatisfiableWait,
   'active-no-plan': activeNoPlan,
   'autonomous-no-grants': autonomousNoGrants,
   'uncited-commits': uncitedCommits,
@@ -421,6 +543,7 @@ function lint(options = {}) {
     tasks,
     allTasks,
     titles,
+    liveSessions: loadLiveSessions(root, Number.isFinite(now) ? now : Date.now()),
     repoFor: landed.repoFor,
     sessionWindow: (task, session) => sessionWindow(task, session, Number.isFinite(now) ? now : Date.now()),
     newestSessionAt,
