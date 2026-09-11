@@ -305,6 +305,28 @@ test('bridges a pane websocket in both directions', async (t) => {
   fixtureClosed = true;
 });
 
+test('full history is an explicit websocket opt-in after the bounded default', async (t) => {
+  const f = await fixture();
+  const options = { origin: `http://127.0.0.1:${f.port}` };
+  const bounded = new WebSocket(`ws://127.0.0.1:${f.port}/ws/pane/p-1?viewer=bounded`, options);
+  const full = new WebSocket(`ws://127.0.0.1:${f.port}/ws/pane/p-1?viewer=full&history=full`, options);
+  const boundedMessages = messageCollector(bounded);
+  const fullMessages = messageCollector(full);
+  t.after(async () => {
+    if (bounded.readyState !== WebSocket.CLOSED) bounded.terminate();
+    if (full.readyState !== WebSocket.CLOSED) full.terminate();
+    await f.close();
+  });
+  await Promise.all([once(bounded, 'open'), once(full, 'open')]);
+  await Promise.all([
+    boundedMessages.until((frames) => frames.some((frame) => jsonMessage(frame)?.t === 'replay-end'), 'bounded replay-end'),
+    fullMessages.until((frames) => frames.some((frame) => jsonMessage(frame)?.t === 'replay-end'), 'full replay-end'),
+  ]);
+  const attaches = f.calls.filter((call) => call.type === 'attach');
+  assert.equal(attaches.find((call) => call.params.viewer === 'bounded').params.snapshotScrollback, undefined);
+  assert.equal(attaches.find((call) => call.params.viewer === 'full').params.snapshotScrollback, 10000);
+});
+
 test('bridges primary terminal replies as bounded automatic input', async (t) => {
   const f = await fixture();
   const ws = new WebSocket(`ws://127.0.0.1:${f.port}/ws/pane/p-1?viewer=primary&primary=1`, {

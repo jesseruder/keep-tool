@@ -8,6 +8,7 @@ const { WebSocketServer, WebSocket } = require('ws');
 
 const MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
 const MAX_REPLY_BYTES = 4 * 1024;
+const FULL_SNAPSHOT_SCROLLBACK = 10000;
 const MIME = {
   '.css': 'text/css; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
@@ -320,7 +321,7 @@ function install(input) {
   };
   deps.server.prependListener('request', onRequest);
 
-  const onConnection = async (ws, req, pane, viewer, attachPrimary) => {
+  const onConnection = async (ws, req, pane, viewer, attachPrimary, snapshotScrollback) => {
     let closed = false;
     let replayEnded = false;
     let replayTimer;
@@ -414,7 +415,10 @@ function install(input) {
           if (replayTimer) clearTimeout(replayTimer);
           state.attachment = await client.attach(
             pane,
-            { snapshot: true, replay: false, viewer, primary: attachPrimary },
+            {
+              snapshot: true, replay: false, viewer, primary: attachPrimary,
+              ...(snapshotScrollback == null ? {} : { snapshotScrollback }),
+            },
             (data, meta) => forward(state, data, meta),
             (codeOrInfo, signal) => exited(state, codeOrInfo, signal),
           );
@@ -555,7 +559,11 @@ function install(input) {
     }
     const viewer = requestedViewer || `console-${crypto.randomUUID()}`;
     const primary = requestedViewer != null && url.searchParams.get('primary') === '1';
-    wss.handleUpgrade(req, socket, head, (ws) => onConnection(ws, req, pane, viewer, primary));
+    const snapshotScrollback = url.searchParams.get('history') === 'full'
+      ? FULL_SNAPSHOT_SCROLLBACK : undefined;
+    wss.handleUpgrade(req, socket, head, (ws) => onConnection(
+      ws, req, pane, viewer, primary, snapshotScrollback,
+    ));
   };
   deps.server.on('upgrade', onUpgrade);
 

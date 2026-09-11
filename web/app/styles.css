@@ -172,6 +172,8 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .term.observer .xterm { flex: none; width: max-content; height: max-content; }
 .term-status { flex: none; min-height: 21px; padding: 3px 10px; color: var(--term-dim); border-top: 1px solid var(--term-line); font: 10px var(--mono); text-transform: uppercase; letter-spacing: .06em; display: flex; gap: 10px; }
 .term-state { flex: none; } .term-note { margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-transform: none; letter-spacing: 0; }
+.term-history { color: var(--term-dim); font: inherit; text-transform: none; letter-spacing: 0; padding: 0; }
+.term-history:hover { color: var(--text); }
 .term-status.exited { color: var(--faint); } .term-status.error { color: var(--bad); }
 .findbar { display: none; position: absolute; top: 7px; right: 15px; z-index: 8; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 5px; box-shadow: var(--shadow); padding: 4px; gap: 3px; }
 .term.finding .findbar { display: flex; } .findbar input { width: 200px; padding: 4px 6px; border: 0; background: var(--panel); } .findbar button { color: var(--muted); padding: 2px 5px; }

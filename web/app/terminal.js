@@ -29,11 +29,13 @@ export function mountTerminal(container, pane, options = {}) {
   wrapper.className = 'term';
   wrapper.tabIndex = 0;
   wrapper.dataset.pane = pane;
-  wrapper.innerHTML = `<div class="findbar"><input aria-label="find in terminal" placeholder="Find"><button data-prev>↑</button><button data-next>↓</button><button data-close>✕</button></div><div class="xterm-host"></div><div class="term-status"><span class="term-state">connecting</span><span class="term-note"></span></div>`;
+  wrapper.innerHTML = `<div class="findbar"><input aria-label="find in terminal" placeholder="Find"><button data-prev>↑</button><button data-next>↓</button><button data-close>✕</button></div><div class="xterm-host"></div><div class="term-status"><span class="term-state">connecting</span><button class="term-history" type="button" hidden>Load earlier output</button><span class="term-note"></span></div>`;
   container.replaceChildren(wrapper);
 
   const status = wrapper.querySelector('.term-status');
   const statusState = wrapper.querySelector('.term-state');
+  const historyButton = wrapper.querySelector('.term-history');
+  historyButton.hidden = true;
   const statusNote = wrapper.querySelector('.term-note');
   const host = wrapper.querySelector('.xterm-host');
   const terminal = new window.Terminal({
@@ -69,6 +71,7 @@ export function mountTerminal(container, pane, options = {}) {
   let connectedOnce = false;
   let retryable = true;
   let replayDone = false;
+  let fullHistory = false;
   let isPrimary = false;
   let claimPending = false;
   let paneState = null;
@@ -252,10 +255,11 @@ export function mountTerminal(container, pane, options = {}) {
     // The upgrade query is the attach handshake. This mount's viewer id is stable
     // across host reconnects (and page reloads in the same tab); only focus sets primary=1.
     const query = new URLSearchParams({ viewer, primary: focused ? '1' : '0' });
+    if (fullHistory) query.set('history', 'full');
     socket = new WebSocket(`${protocol}//${location.host}/ws/pane/${encodeURIComponent(pane)}?${query}`);
     const connection = socket;
     socket.binaryType = 'arraybuffer';
-    setStatus(connectedOnce ? 'reconnecting' : 'connecting');
+    setStatus(fullHistory ? 'loading history' : (connectedOnce ? 'reconnecting' : 'connecting'));
     replayDone = false;
     const flushInput = () => {
       if (socket?.readyState !== WebSocket.OPEN || !replayDone) return;
@@ -301,6 +305,7 @@ export function mountTerminal(container, pane, options = {}) {
         terminal.write('', () => {
           if (disposed || socket !== connection || (!exited && connection.readyState !== WebSocket.OPEN)) return;
           replayDone = true;
+          historyButton.hidden = fullHistory;
           if (isPrimary) fitNow(true);
           else adoptPaneSize();
           if (!exited) markHealthy();
@@ -337,6 +342,16 @@ export function mountTerminal(container, pane, options = {}) {
     };
     socket.onerror = () => {};
   };
+
+  historyButton.addEventListener('click', (event) => {
+    event.stopPropagation();
+    if (disposed || exited || fullHistory || !replayDone) return;
+    fullHistory = true;
+    historyButton.hidden = true;
+    const previous = socket;
+    connect();
+    if (previous && previous.readyState < WebSocket.CLOSING) previous.close();
+  });
 
   const sendInput = (data, { user }) => {
     const bytes = encoder.encode(data);
@@ -417,11 +432,11 @@ export function mountTerminal(container, pane, options = {}) {
   wrapper.querySelector('[data-next]').addEventListener('click', () => find(false));
   wrapper.querySelector('[data-close]').addEventListener('click', () => { wrapper.classList.remove('finding'); terminal.focus(); });
   wrapper.addEventListener('focusin', (event) => {
-    if (!event.target.closest('.findbar')) takeControl();
+    if (!event.target.closest('.findbar, .term-history')) takeControl();
     options.onFocus?.(terminal, wrapper);
   });
   wrapper.addEventListener('mousedown', (event) => {
-    if (!event.target.closest('.findbar')) takeControl();
+    if (!event.target.closest('.findbar, .term-history')) takeControl();
     options.onFocus?.(terminal, wrapper);
   });
 

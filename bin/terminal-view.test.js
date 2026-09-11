@@ -49,6 +49,7 @@ function fixture() {
       this.offsetWidth = 600;
       this.offsetHeight = 750;
       this.children = new Map();
+      this.listeners = new Map();
       this.classList = { add() {}, remove() {}, toggle() {} };
       this.isConnected = true;
     }
@@ -60,7 +61,8 @@ function fixture() {
     getClientRects() { return [{ width: 800, height: 500 }]; }
     getBoundingClientRect() { return { width: this.offsetWidth, height: this.offsetHeight }; }
     contains() { return false; }
-    addEventListener() {}
+    addEventListener(type, listener) { this.listeners.set(type, listener); }
+    dispatch(type, event = {}) { this.listeners.get(type)?.({ stopPropagation() {}, ...event }); }
   }
   let terminal, fits = 0;
   class Terminal extends HeadlessTerminal {
@@ -80,7 +82,7 @@ function fixture() {
   class WebSocket {
     static OPEN = 1;
     static CLOSING = 2;
-    constructor() { this.readyState = 1; this.sent = []; this.visibility = []; }
+    constructor(url) { this.url = url; this.readyState = 1; this.sent = []; this.visibility = []; }
     send(data) {
       if (typeof data === 'string' && JSON.parse(data).t === 'visibility') this.visibility.push(JSON.parse(data).visible);
       else this.sent.push(data);
@@ -168,6 +170,31 @@ test('snapshot parses at its original size before fit or user input', async () =
     assert.ok(f.socket.sent[1] instanceof Uint8Array);
     const buffer = f.terminal.buffer.active;
     assert.equal(buffer.getLine(buffer.baseY + buffer.cursorY).translateToString(true), '› prompt');
+  } finally { f.mounted.dispose(); }
+});
+
+test('earlier output is loaded only after first paint and preserves queued input', async () => {
+  const f = fixture();
+  try {
+    const history = f.mounted.element.querySelector('.term-history');
+    assert.equal(history.hidden, true);
+    f.message({ t: 'replay-end' });
+    await f.drain();
+    assert.equal(history.hidden, false);
+
+    const first = f.socket;
+    history.dispatch('click');
+    const second = f.mounted.socket;
+    assert.notEqual(second, first);
+    assert.match(second.url || '', /history=full/);
+    assert.equal(history.hidden, true);
+    f.terminal.keyHandler({ type: 'keydown', metaKey: true, ctrlKey: false, key: 'Enter', preventDefault() {} });
+    assert.equal(second.sent.length, 0, 'input waits for the full snapshot parser');
+    second.onopen();
+    second.onmessage({ data: JSON.stringify({ t: 'attached', pane: { id: 'pane', primary: 'viewer', cols: 80, rows: 50 } }) });
+    second.onmessage({ data: JSON.stringify({ t: 'replay-end' }) });
+    await f.drain();
+    assert.ok(second.sent.some((item) => item instanceof Uint8Array));
   } finally { f.mounted.dispose(); }
 });
 
