@@ -12,9 +12,14 @@ function fixture(t) {
   fs.mkdirSync(path.join(root, 'project'));
   const calls = [];
   let now = Date.now();
+  let failFile = null;
   const index = createTranscriptIndex(root, {
     now: () => now, sweepMs: 60000, recentMs: 10000,
-    io: { ...fs, statSync(file) { calls.push(file); return fs.statSync(file); } },
+    io: { ...fs, statSync(file) {
+      calls.push(file);
+      if (file === failFile) { failFile = null; throw new Error('transient stat failure'); }
+      return fs.statSync(file);
+    } },
   });
   const write = (name, text = '', old = false) => {
     const file = path.join(root, 'project', name + '.jsonl');
@@ -22,13 +27,14 @@ function fixture(t) {
     const at = new Date(now - (old ? 100000 : 0)); fs.utimesSync(file, at, at);
     return file;
   };
-  return { root, index, calls, write, advance(ms) { now += ms; } };
+  return { root, index, calls, write, advance(ms) { now += ms; }, failNextStat(file) { failFile = file; } };
 }
 
 test('dashboard scans cache metadata and reconcile recent files within five seconds', t => {
   const { index, write, calls, advance } = fixture(t);
   const old = write('old', '', true), recent = write('recent');
   assert.equal(index.scan().length, 2);
+  assert.equal(calls.filter(file => file === path.dirname(old)).length, 1, 'a rebuild reuses its directory stat');
   calls.length = 0;
   const cached = index.scan();
   assert.ok(!calls.includes(old));
@@ -40,6 +46,16 @@ test('dashboard scans cache metadata and reconcile recent files within five seco
   calls.length = 0;
   index.scan({ fresh: true });
   assert.ok(calls.includes(old), 'safety callers do not trust cached historical metadata');
+});
+
+test('a transient transcript stat failure is retried before caching a complete result', t => {
+  const { index, write, calls, failNextStat } = fixture(t);
+  const file = write('retry');
+  failNextStat(file);
+  assert.deepEqual(index.scan(), []);
+  calls.length = 0;
+  assert.deepEqual(index.scan().map(row => row.id), ['retry']);
+  assert.ok(calls.includes(file), 'unchanged listings do not hide a prior stat failure until the sweep');
 });
 
 test('directory metadata detects transcript creation and deletion without watcher events', t => {

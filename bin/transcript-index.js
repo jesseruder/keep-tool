@@ -46,9 +46,12 @@ function createTranscriptIndex(root, { io = fs, now = Date.now, sweepMs = 60000,
       rootNames = names;
       if (rootChanged) rootEntries = names.map((dir) => ({ dir, full: path.join(root, dir) }));
       let directoryChanged = rootChanged;
+      let inspectionFailed = false;
       for (const item of rootEntries) {
+        item.stat = null;
         let stat;
         try { stat = io.statSync(item.full); } catch {
+          inspectionFailed = true;
           if (directories.has(item.full)) directoryChanged = true;
           continue;
         }
@@ -56,6 +59,7 @@ function createTranscriptIndex(root, { io = fs, now = Date.now, sweepMs = 60000,
           if (directories.has(item.full)) directoryChanged = true;
           continue;
         }
+        item.stat = stat;
         const listing = directories.get(item.full);
         if (!listing || listing.mtime !== stat.mtimeMs || listing.ino !== stat.ino) directoryChanged = true;
       }
@@ -65,16 +69,14 @@ function createTranscriptIndex(root, { io = fs, now = Date.now, sweepMs = 60000,
       generation++;
       let next = Infinity;
       const result = [];
-      for (const { dir, full } of rootEntries) {
-        let stat;
-        try { stat = io.statSync(full); } catch { continue; }
-        if (!stat.isDirectory()) continue;
+      for (const { dir, full, stat } of rootEntries) {
+        if (!stat) continue;
         let listing = directories.get(full);
         if (fresh || !listing || listing.mtime !== stat.mtimeMs || listing.ino !== stat.ino || at - listing.at >= sweepMs || at < listing.at) {
           try { listing = { entries: io.readdirSync(full).filter(name => name.endsWith('.jsonl')).map((name) => ({
             file: path.join(full, name), id: name.slice(0, -6),
           })), mtime: stat.mtimeMs, ino: stat.ino, at, seen: generation }; }
-          catch { continue; }
+          catch { inspectionFailed = true; continue; }
           directories.set(full, listing);
         }
         listing.seen = generation;
@@ -85,7 +87,7 @@ function createTranscriptIndex(root, { io = fs, now = Date.now, sweepMs = 60000,
           const ttl = entry && at - entry.stat.mtimeMs <= recentMs ? recentSweepMs : sweepMs;
           if (fresh || !entry || dirty.has(file) || at - entry.at >= ttl || at < entry.at) {
             try { entry = { stat: io.statSync(file), at, seen: generation }; files.set(file, entry); }
-            catch { files.delete(file); continue; }
+            catch { files.delete(file); inspectionFailed = true; continue; }
           }
           entry.seen = generation;
           const entryTtl = at - entry.stat.mtimeMs <= recentMs ? recentSweepMs : sweepMs;
@@ -101,8 +103,9 @@ function createTranscriptIndex(root, { io = fs, now = Date.now, sweepMs = 60000,
       dirty.clear();
       lastScanAt = at;
       nextSweepAt = Number.isFinite(next) ? next : at + sweepMs;
-      resultCache = Object.freeze(result);
-      return resultCache;
+      const snapshot = Object.freeze(result);
+      resultCache = inspectionFailed ? null : snapshot;
+      return snapshot;
     },
   };
 }
