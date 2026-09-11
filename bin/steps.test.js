@@ -23,6 +23,9 @@ const {
   commandSegments,
   cdTargets,
   compoundAfter,
+  loadLedger,
+  pendingCommits,
+  commitsBetween,
 } = require('./steps.js');
 
 const KEEP = path.join(__dirname, 'keep.js');
@@ -148,7 +151,7 @@ test('a running run blocks claims after hold expiry and --force abandons it', ()
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('done refuses a running run from another session and a different pinned sha', () => {
+test('done waits for a running run unless forced, and records a synthetic run on a quiet lane', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-steps-running-done-'));
   try {
     initKeepRoot(root);
@@ -161,20 +164,25 @@ test('done refuses a running run from another session and a different pinned sha
       endedAt: '', by: { agent: 'codex', sessionId: 'holder-session' }, artifact: '', note: '',
     }], waiters: [] }));
 
+    // the lane is unclaimed, but somebody's command is still running
     const other = cli(root, repo.project, 'other-session', ['step', 'done', repo.project, 'build', '--sha', repo.second]);
     assert.equal(other.status, 5);
-    assert.match(other.stderr, /run-owned.*belongs to codex holder-s/);
-    const awaiting = JSON.parse(fs.readFileSync(ledgerFile, 'utf8'));
-    awaiting.runs[0].status = 'done';
-    awaiting.runs[0].endedAt = '2026-09-02T07:30';
-    awaiting.runs[0].note = '[awaiting step done]';
-    fs.writeFileSync(ledgerFile, JSON.stringify(awaiting));
-    const awaitingOther = cli(root, repo.project, 'other-session', ['step', 'done', repo.project, 'build', '--sha', repo.second]);
-    assert.equal(awaitingOther.status, 5);
-    assert.match(awaitingOther.stderr, /run-owned.*belongs to codex holder-s/);
-    const repinned = cli(root, repo.project, 'holder-session', ['step', 'done', repo.project, 'build', '--sha', repo.first]);
-    assert.equal(repinned.status, 1);
-    assert.match(repinned.stderr, /does not match run run-owned.*pinned SHA/);
+    assert.match(other.stderr, /run run-owned is still running by codex holder-s since 2026-09-02T07:00.*--force to record it as done/);
+    const forced = cli(root, repo.project, 'other-session', ['step', 'done', repo.project, 'build', '--sha', repo.second, '--force']);
+    assert.equal(forced.status, 0, forced.stderr);
+    const ledger = JSON.parse(fs.readFileSync(ledgerFile, 'utf8'));
+    assert.equal(ledger.runs.length, 1, 'the running run is finalized in place');
+    assert.equal(ledger.runs[0].status, 'done');
+    assert.ok(ledger.runs[0].finalizedAt);
+    assert.equal(ledger.runs[0].by.sessionId, 'holder-session', 'a forced completion keeps the run owner');
+
+    // no running run and no claim: any session may record the completion
+    const plain = cli(root, repo.project, 'third-session', ['step', 'done', repo.project, 'build', '--sha', repo.first]);
+    assert.equal(plain.status, 0, plain.stderr);
+    const after = JSON.parse(fs.readFileSync(ledgerFile, 'utf8'));
+    assert.equal(after.runs.length, 2);
+    assert.equal(after.runs.at(-1).status, 'done');
+    assert.equal(after.runs.at(-1).by.sessionId, 'third-session');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -211,18 +219,27 @@ test('landed run rejects unlanded sha, creates and re-pins a clean detached work
     git(repo.project, 'commit', '-qm', 'not landed');
     const local = git(repo.project, 'rev-parse', 'HEAD');
     assert.equal(cli(root, repo.project, 'runner-session', ['step', 'claim', repo.project, 'build', '--for', '+1m', '-m', 'test']).status, 0);
-    const refused = cli(root, repo.project, 'runner-session', ['step', 'run', repo.project, 'build', '--sha', local, '--no-done']);
+    const refused = cli(root, repo.project, 'runner-session', ['step', 'run', repo.project, 'build', '--sha', local]);
     assert.equal(refused.status, 1);
     assert.match(refused.stderr, /not an ancestor/);
+    const staleFlag = cli(root, repo.project, 'runner-session', ['step', 'run', repo.project, 'build', '--sha', repo.first, '--no-done']);
+    assert.notEqual(staleFlag.status, 0, '--no-done is gone: runs are single-phase');
+    assert.match(staleFlag.stderr, /unknown flag --no-done/);
     const refusedDone = cli(root, repo.project, 'runner-session', ['step', 'done', repo.project, 'build', '--sha', local]);
     assert.equal(refusedDone.status, 1);
     assert.match(refusedDone.stderr, /not an ancestor of origin\/main.*must complete from a landed revision/);
 
-    const firstRun = cli(root, repo.project, 'runner-session', ['step', 'run', repo.project, 'build', '--sha', repo.first, '--no-done']);
+    const firstRun = cli(root, repo.project, 'runner-session', ['step', 'run', repo.project, 'build', '--sha', repo.first]);
     assert.equal(firstRun.status, 0, firstRun.stderr);
+    assert.match(firstRun.stdout, /finalized step build/, 'a run that exits 0 finalizes itself');
     const holdFile = path.join(root, '.keep', 'holds', fs.readdirSync(path.join(root, '.keep', 'holds'))[0]);
-    assert.ok(Date.parse(JSON.parse(fs.readFileSync(holdFile, 'utf8')).until) > Date.now() + 25 * 60e3,
+    const firstHold = JSON.parse(fs.readFileSync(holdFile, 'utf8'));
+    assert.ok(Date.parse(firstHold.until) > Date.now() + 25 * 60e3,
       'starting the run extends the short claim to the registry defaultHold');
+    assert.ok(firstHold.released, 'and finalizing releases it');
+    const firstLedger = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'steps', 'project', 'build.json'), 'utf8'));
+    assert.equal(firstLedger.runs.at(-1).status, 'done');
+    assert.ok(firstLedger.runs.at(-1).finalizedAt);
     const worktree = path.join(root, 'project.step-build');
     assert.equal(fs.readFileSync(path.join(worktree, 'out.txt'), 'utf8').trim(), repo.first);
     fs.unlinkSync(path.join(worktree, 'out.txt'));
@@ -230,20 +247,22 @@ test('landed run rejects unlanded sha, creates and re-pins a clean detached work
     fs.mkdirSync(path.join(worktree, 'node_modules'), { recursive: true });
     fs.writeFileSync(path.join(worktree, 'node_modules', 'marker'), 'keep me\n');
     fs.writeFileSync(path.join(worktree, 'node_modules', '.yarn-integrity'), '{}\n');
-    const secondRun = cli(root, repo.project, 'runner-session', ['step', 'run', repo.project, 'build', '--sha', repo.second, '--no-done']);
+    assert.equal(cli(root, repo.project, 'runner-session', ['step', 'claim', repo.project, 'build', '-m', 'again']).status, 0);
+    const secondRun = cli(root, repo.project, 'runner-session', ['step', 'run', repo.project, 'build', '--sha', repo.second]);
     assert.equal(secondRun.status, 0, secondRun.stderr);
     assert.match(secondRun.stdout, /log: .*\.keep\/steps\/project\/build\/run-[^/]+\.log/);
     assert.equal(fs.readFileSync(path.join(worktree, 'out.txt'), 'utf8').trim(), repo.second);
     assert.equal(fs.existsSync(path.join(worktree, 'stale.stale')), false);
     assert.equal(fs.readFileSync(path.join(worktree, 'node_modules', 'marker'), 'utf8'), 'keep me\n');
     assert.equal(fs.existsSync(path.join(worktree, 'node_modules', '.yarn-integrity')), false);
-    const dirty = cli(root, repo.project, 'runner-session', ['step', 'run', repo.project, 'build', '--sha', repo.first, '--no-done']);
+    assert.equal(cli(root, repo.project, 'runner-session', ['step', 'claim', repo.project, 'build', '-m', 'third']).status, 0);
+    const dirty = cli(root, repo.project, 'runner-session', ['step', 'run', repo.project, 'build', '--sha', repo.first]);
     assert.equal(dirty.status, 1);
     assert.match(dirty.stderr, /is dirty/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('failed run reports its log path', () => {
+test('a failed run reports its log path, is terminal, keeps the claim, and checks the card in', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-steps-run-failed-'));
   try {
     initKeepRoot(root);
@@ -257,10 +276,27 @@ test('failed run reports its log path', () => {
     git(project, 'add', '.');
     git(project, 'commit', '-qm', 'fixture');
     writeRegistry(root, project, { from: 'any', command: 'exit 3' });
-    assert.equal(cli(root, project, 'runner-session', ['step', 'claim', project, 'build', '-m', 'test']).status, 0);
-    const failed = cli(root, project, 'runner-session', ['step', 'run', project, 'build', '--no-done']);
+    fs.writeFileSync(path.join(root, 'tasks', 'step-card.md'), [
+      '---', 'title: Step card', 'status: active', 'kind: task', 'tags: [personal]',
+      `project: ${project}`, 'created: 2026-01-01', 'updated: 2026-01-01T00:00', '---', 'Body.', '',
+    ].join('\n'));
+    git(root, 'add', '.');
+    git(root, 'commit', '-qm', 'fixture');
+    assert.equal(cli(root, project, 'runner-session', ['step', 'claim', project, 'build', '--task', 'step-card', '-m', 'test']).status, 0);
+    const failed = cli(root, project, 'runner-session', ['step', 'run', project, 'build']);
     assert.equal(failed.status, 3, failed.stderr);
     assert.match(failed.stderr, /keep: step build failed with exit 3; log: .*\.keep\/steps\/project\/build\/run-[^/]+\.log; claim retained/);
+    const ledger = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'steps', 'project', 'build.json'), 'utf8'));
+    const run = ledger.runs.at(-1);
+    assert.equal(run.status, 'failed');
+    assert.equal(run.exitCode, 3);
+    assert.ok(run.finalizedAt, 'a failed run is history, not a pending obligation');
+    const holdsDir = path.join(root, '.keep', 'holds');
+    const holds = fs.readdirSync(holdsDir).map((name) => JSON.parse(fs.readFileSync(path.join(holdsDir, name), 'utf8')));
+    assert.equal(holds.filter((hold) => !hold.released).length, 1, 'the claim is retained for the retry');
+    const card = fs.readFileSync(path.join(root, 'tasks', 'step-card.md'), 'utf8');
+    assert.match(card, /— step build attempt failed\n/);
+    assert.match(card, new RegExp(`Run ${run.id} exited 3; the claim is retained\\. Log: .*${run.id}\\.log`));
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -314,30 +350,55 @@ test('done releases the claim, records artifact, checks in the card, and tolerat
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('fail finalizes its own failed run after hold expiry before retrying waiters', () => {
+test('a failed run is history: done needs no step fail first, and fail resolves a running lane', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-steps-fail-finalize-'));
   try {
     initKeepRoot(root);
-    const project = path.join(root, 'project');
-    fs.mkdirSync(project);
-    writeRegistry(root, project, { from: 'any', command: 'false' });
+    const repo = initProject(root);
+    writeRegistry(root, repo.project, { from: 'any', command: 'false' });
     const ledgerFile = path.join(root, '.keep', 'steps', 'project', 'build.json');
     fs.mkdirSync(path.dirname(ledgerFile), { recursive: true });
+    // a legacy failed run, unfinalized on disk: normalized on load, terminal either way
     fs.writeFileSync(ledgerFile, JSON.stringify({ runs: [{
-      id: 'run-failed', sha: 'abcdef1234567890', status: 'failed', startedAt: '2026-09-02T07:00',
+      id: 'run-failed', sha: repo.first, status: 'failed', startedAt: '2026-09-02T07:00',
       endedAt: '2026-09-02T07:10', exitCode: 1, by: { agent: 'codex', sessionId: 'holder-session' },
       note: '', artifact: '', task: '',
-    }], waiters: [{ sessionId: 'waiter-session', agent: 'codex', at: '2026-09-02T07:05' }] }));
+    }], waiters: [] }));
 
-    const wrongCompletion = cli(root, project, 'holder-session', ['step', 'done', project, 'build']);
-    assert.equal(wrongCompletion.status, 5);
-    assert.match(wrongCompletion.stderr, /run-failed failed and awaits keep step fail/);
-    const failed = cli(root, project, 'holder-session', ['step', 'fail', project, 'build', '-m', 'bake failed']);
-    assert.equal(failed.status, 0, failed.stderr);
+    const afterFailure = cli(root, repo.project, 'holder-session', ['step', 'done', repo.project, 'build', '--sha', repo.second]);
+    assert.equal(afterFailure.status, 0, afterFailure.stderr);
+    const recorded = JSON.parse(fs.readFileSync(ledgerFile, 'utf8'));
+    assert.equal(recorded.runs.length, 2, 'the failed run stays put and the completion is its own run');
+    assert.equal(recorded.runs[0].finalizedAt, '2026-09-02T07:10');
+    assert.equal(recorded.runs.at(-1).status, 'done');
+
+    // a running run plus a waiter: step fail marks the run, releases the claim, notifies
+    assert.equal(cli(root, repo.project, 'holder-session', ['step', 'claim', repo.project, 'build', '-m', 'bake']).status, 0);
     const ledger = JSON.parse(fs.readFileSync(ledgerFile, 'utf8'));
-    assert.equal(ledger.runs[0].note, 'bake failed');
-    assert.ok(ledger.runs[0].finalizedAt);
-    assert.equal(ledger.waiters[0].attempts, 1);
+    ledger.runs.push({
+      id: 'run-live', sha: repo.second, status: 'running', startedAt: '2026-09-02T08:00', endedAt: '',
+      exitCode: null, by: { agent: 'codex', sessionId: 'holder-session' }, note: '', artifact: '', task: '',
+    });
+    ledger.waiters = [{ sessionId: 'waiter-session', agent: 'codex', at: '2026-09-02T08:05' }];
+    fs.writeFileSync(ledgerFile, JSON.stringify(ledger));
+    const failed = cli(root, repo.project, 'holder-session', ['step', 'fail', repo.project, 'build', '-m', 'bake failed']);
+    assert.equal(failed.status, 0, failed.stderr);
+    const afterFail = JSON.parse(fs.readFileSync(ledgerFile, 'utf8'));
+    assert.equal(afterFail.runs.at(-1).id, 'run-live');
+    assert.equal(afterFail.runs.at(-1).status, 'failed');
+    assert.equal(afterFail.runs.at(-1).note, 'bake failed');
+    assert.equal(afterFail.runs.at(-1).exitCode, 1);
+    assert.ok(afterFail.runs.at(-1).finalizedAt);
+    assert.equal(afterFail.waiters[0].attempts, 1, 'the waiter is retried and stays queued after the failed delivery');
+    assert.equal(cli(root, repo.project, 'x', ['holds']).stdout.trim(), 'no active holds');
+
+    // nothing running, nothing claimed, nobody waiting: nothing to fail
+    const cleared = JSON.parse(fs.readFileSync(ledgerFile, 'utf8'));
+    cleared.waiters = [];
+    fs.writeFileSync(ledgerFile, JSON.stringify(cleared));
+    const nothing = cli(root, repo.project, 'holder-session', ['step', 'fail', repo.project, 'build', '-m', 'nothing here']);
+    assert.equal(nothing.status, 1);
+    assert.match(nothing.stderr, /step build has nothing to fail: no running run, no claim, no waiters/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -434,6 +495,115 @@ test('a claim held for hours by an idle session is stale', () => {
   assert.equal(claimStaleness(claim, now, () => false), null, 'a live session is not stale');
   assert.equal(claimStaleness({ ...claim, from: '2026-09-04T11:00' }, now, () => true), null, 'an hour is not stale');
   assert.equal(claimStaleness(null, now), null);
+});
+
+test('ignore globs drop state-only commits from pending and from the included range', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-steps-ignore-'));
+  try {
+    const repo = initProject(root);
+    const step = {
+      paths: ['terraform/**'],
+      ignore: ['terraform/terraform.tfstate', 'terraform/terraform.tfstate.backup'],
+    };
+    const write = (file, body) => {
+      fs.mkdirSync(path.dirname(path.join(repo.project, file)), { recursive: true });
+      fs.writeFileSync(path.join(repo.project, file), body);
+    };
+    const commit = (subject) => { git(repo.project, 'add', '.'); git(repo.project, 'commit', '-qm', subject); };
+    write('terraform/main.tf', 'one\n');
+    commit('config change');
+    write('terraform/terraform.tfstate', '{"serial":1}\n');
+    commit('state only');
+    write('terraform/terraform.tfstate', '{"serial":2}\n');
+    write('terraform/main.tf', 'two\n');
+    commit('config and state');
+    git(repo.project, 'push', '-q');
+    const head = git(repo.project, 'rev-parse', 'HEAD');
+
+    const pending = pendingCommits(repo.project, step, repo.second);
+    assert.deepEqual(pending.commits.map((entry) => entry.subject), ['config and state', 'config change']);
+    assert.deepEqual(pending.files, ['terraform/main.tf'], 'ignored files never reach touchedDirs');
+    const between = commitsBetween(repo.project, repo.second, head, step);
+    assert.deepEqual(between.commits.map((entry) => entry.subject), ['config and state', 'config change']);
+    const unfiltered = pendingCommits(repo.project, { paths: step.paths }, repo.second);
+    assert.equal(unfiltered.commits.length, 3, 'without ignore the tfstate-only commit still counts');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('loadLedger normalizes legacy awaiting and unfinalized failed runs', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-steps-normalize-'));
+  try {
+    const project = path.join(root, 'project');
+    const ledgerFile = path.join(root, '.keep', 'steps', 'project', 'build.json');
+    fs.mkdirSync(path.dirname(ledgerFile), { recursive: true });
+    fs.writeFileSync(ledgerFile, JSON.stringify({ runs: [
+      { id: 'run-await', status: 'done', startedAt: '2026-09-02T07:00', endedAt: '2026-09-02T07:30', note: 'working tree was dirty; [awaiting step done]' },
+      { id: 'run-bare', status: 'done', startedAt: '2026-09-02T08:00', endedAt: '', note: '[awaiting step done]' },
+      { id: 'run-failed', status: 'failed', startedAt: '2026-09-02T09:00', endedAt: '', exitCode: 2, note: 'boom' },
+      { id: 'run-live', status: 'running', startedAt: '2026-09-02T10:00', endedAt: '', note: '' },
+    ], waiters: [] }));
+    const ledger = loadLedger(project, 'build', root);
+    assert.equal(ledger.runs[0].note, 'working tree was dirty');
+    assert.equal(ledger.runs[0].finalizedAt, '2026-09-02T07:30');
+    assert.equal(ledger.runs[1].note, '');
+    assert.equal(ledger.runs[1].finalizedAt, '2026-09-02T08:00');
+    assert.equal(ledger.runs[2].finalizedAt, '2026-09-02T09:00', 'a failed run is terminal');
+    assert.equal(ledger.runs[2].note, 'boom');
+    assert.equal(ledger.runs[3].finalizedAt, undefined, 'a running run is left alone');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('keep steps shows a running run with its owner and age, flags a stale one, and reports the last failure', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-steps-running-line-'));
+  try {
+    initKeepRoot(root);
+    const project = path.join(root, 'project');
+    fs.mkdirSync(project);
+    writeRegistry(root, project, { from: 'any', command: 'true' });
+    const ledgerFile = path.join(root, '.keep', 'steps', 'project', 'build.json');
+    fs.mkdirSync(path.dirname(ledgerFile), { recursive: true });
+    const stamp = (date) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+      + `T${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+    const startedAt = stamp(new Date(Date.now() - (3 * 3600e3 + 15 * 60e3)));
+    fs.writeFileSync(ledgerFile, JSON.stringify({ runs: [{
+      id: 'run-old', sha: 'abcdef1234567890', status: 'running', startedAt, endedAt: '',
+      by: { agent: 'codex', sessionId: 'holder-session' }, note: '', artifact: '',
+    }], waiters: [] }));
+    const script = `
+      const steps = require(${JSON.stringify(path.join(__dirname, 'steps.js'))});
+      const idle = process.argv[2] === 'idle';
+      console.log(JSON.stringify(steps.status(process.argv[1], { holds: [], tasks: [], sessionIdle: () => idle }).steps[0]));
+    `;
+    const row = (mode) => {
+      const out = spawnSync(process.execPath, ['-e', script, project, mode], {
+        encoding: 'utf8', env: { ...process.env, KEEP_DIR: root },
+      });
+      assert.equal(out.status, 0, out.stderr);
+      return JSON.parse(out.stdout);
+    };
+
+    const live = row('live');
+    assert.equal(live.running.id, 'run-old');
+    assert.equal(live.runningStale, null);
+    assert.match(live.runningAge, /^3h 1[45]m$/);
+    assert.match(live.line, /run run-old running from abcdef1 by codex holder-s since \d\d:\d\d \(3h 1[45]m\)/);
+    assert.doesNotMatch(live.line, /STALE/);
+
+    const stale = row('idle');
+    assert.ok(stale.runningStale, 'an idle owner makes a hours-old run stale');
+    assert.match(stale.line, new RegExp(`STALE: owning session idle; if it finished, keep step done ${project} build --force;`
+      + ` if it died, keep step fail ${project} build -m "why"`));
+
+    fs.writeFileSync(ledgerFile, JSON.stringify({ runs: [
+      { id: 'run-ok', sha: 'aaaaaaa1', status: 'done', startedAt: '2026-09-02T06:00', endedAt: '2026-09-02T06:10', finalizedAt: '2026-09-02T06:10', by: { agent: 'codex', sessionId: 'holder-session' } },
+      { id: 'run-bad', sha: 'bbbbbbb2', status: 'failed', startedAt: '2026-09-02T07:00', endedAt: '2026-09-02T07:12', finalizedAt: '2026-09-02T07:12', exitCode: 3, by: { agent: 'codex', sessionId: 'holder-session' } },
+    ], waiters: [] }));
+    const failed = row('live');
+    assert.equal(failed.lastFailed.id, 'run-bad');
+    assert.equal(failed.lastDone.id, 'run-ok', 'lastDone stays the newest done run');
+    assert.equal(failed.running, null);
+    assert.match(failed.line, /last attempt failed \(run run-bad, exit 3, 07:12, by codex holder-s\)/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('the pre-bash guard refuses a gated command without the claim and the post-bash hook records a hand run', () => {

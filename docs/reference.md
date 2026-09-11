@@ -56,7 +56,7 @@ keep release <hold-id>
 keep holds
 keep steps [<project>] [--json]
 keep step claim <project> <step> [--task <id>] [--for <dur>] [--wait] [--force] -m "why"
-keep step run <project> <step> [--sha <sha>] [--no-done]
+keep step run <project> <step> [--sha <sha>]
 keep step done <project> <step> [--artifact <id>] [--sha <sha>] [--force] [-m note]
 keep step fail <project> <step> [--force] -m "why"
 keep step notify <project> <step>
@@ -424,9 +424,9 @@ terraform step died at Terraform's "Enter a value" prompt for exactly this reaso
 
 Gated steps serialize slow or exclusive shared build and deployment operations. A
 committed `steps/<project-basename>.json` registry names the project and each step's
-owned path globs, source policy (`landed` or `any`), command, optional preparation and
-artifact pattern, follow-up instruction, default claim duration, and—for landed
-steps—a dedicated sibling worktree. Local run history, waiters, and mirrored command
+owned path globs, optional `ignore` globs, source policy (`landed` or `any`), command,
+optional preparation and artifact pattern, follow-up instruction, default claim
+duration, and—for landed steps—a dedicated sibling worktree. Local run history, waiters, and mirrored command
 logs live under `.keep/steps/<project-basename>/` and are never committed.
 
 Run `keep steps <project>` before changing a governed path. It shows the last recorded
@@ -436,8 +436,25 @@ with `keep step claim ... -m "why"`, add `--wait` to queue a one-time session
 notification behind another holder, and release the claim by finishing with `keep
 step done` or `keep step fail`. A `running` ledger record blocks a new claim even
 after its hold expires; `step claim --force` explicitly abandons that run and warns.
-Only the session that started a running run may finish it (manual terminal use has no
-session); `step done --force` and `step fail --force` override that ownership check.
+
+The claim is the ownership: whoever holds it owns the lane, and `step done` or
+`step fail` from another session is refused (exit 5) unless it passes `--force`.
+Runs themselves are single-phase. `keep step run` records the run, executes the
+command, and finishes it the moment the command exits — exit 0 marks the run `done`,
+releases the claim, notifies waiters, and checks attributed cards in; a non-zero exit
+marks the run `failed` (terminal, with its exit code and log path), keeps the claim so
+the session can fix and re-run, and checks the claim's card in with the attempt. Only
+`running` is unfinished, and `keep steps` flags a run left running for hours by a
+session that has gone quiet.
+
+`keep step done <project> <step>` records a completion by hand: with a `running` run it
+refuses (exit 5) and names the owning session, since that command may still be going,
+and `--force` finalizes that run as done for a session that died after it succeeded.
+With nothing running it appends a completion run from `--sha` or `origin/<default>`,
+releases the claim, notifies waiters, and checks cards in. `keep step fail <project>
+<step> -m "why"` resolves the lane instead: it marks any `running` run failed with that
+note, releases the claim, and notifies waiters that the step failed; with no running
+run, no claim, and no waiters there is nothing to fail and it says so.
 
 `keep step run` mirrors the command's output live and into the local run log. A
 failed step prints its log path; read it before re-running. A
@@ -448,7 +465,7 @@ registry's detached worktree to that exact SHA. This matters for build scripts t
 copy the working tree: the recorded artifact is then provably built from the pinned,
 landed revision instead of whatever happened to be in another checkout. Successful
 runs release the claim, notify waiters, and check attributed cards in with the
-artifact and registry `next` instruction; use `--no-done` when finalizing separately.
+artifact and registry `next` instruction.
 Failed waiter deliveries stay queued with their latest error and retry count. The
 next `step done` or `step fail` retries them, and `keep step notify <project> <step>`
 retries the last completed run's notification without rerunning the step.
@@ -469,10 +486,26 @@ Example registry entry:
       "artifactPattern": "ami-[0-9a-f]{8,}",
       "next": "update the affected pin and follow the canary procedure",
       "defaultHold": "+2h"
+    },
+    "terraform": {
+      "title": "Apply the infrastructure",
+      "paths": ["terraform/**"],
+      "ignore": ["terraform/terraform.tfstate", "terraform/terraform.tfstate.backup"],
+      "from": "landed",
+      "worktree": "~/work/example.step-terraform",
+      "command": "cd terraform && terraform apply -input=false plan",
+      "defaultHold": "+1h"
     }
   }
 }
 ```
+
+`paths` decides which landed commits count as work the step has not picked up yet, and
+`ignore` (same glob semantics) takes them back out: a commit whose only matching files
+are ignored does not count as pending, is not part of the range a completed run is
+credited with, and contributes nothing to the touched directories in `keep steps`. This
+is for state a run writes back itself — the tfstate commit that follows every Terraform
+apply is the reason the flag exists.
 
 Long messages injected into sessions are typed in paced chunks and, for Claude
 sessions, verified against the transcript after submit; truncated delivery is logged.

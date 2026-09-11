@@ -2632,7 +2632,7 @@ function resolveStepProject(arg) {
 const STEP_USAGE_LINES = [
   '  keep steps [<project>] [--json]',
   '  keep step claim <project> <step> [--task <id>] [--for <dur>] [--wait] [--force] -m "why"',
-  '  keep step run <project> <step> [--sha <sha>] [--no-done]',
+  '  keep step run <project> <step> [--sha <sha>]',
   '  keep step done <project> <step> [--artifact <id>] [--sha <sha>] [--force] [-m note]',
   '  keep step fail <project> <step> [--force] -m "why"',
   '  keep step notify <project> <step>',
@@ -2829,8 +2829,8 @@ function extractArtifact(logFile, pattern) {
 }
 
 async function stepRun(argv) {
-  const o = parseArgs(argv, { sha: 'str', 'no-done': 'bool' });
-  if (o._.length !== 2) die('usage: keep step run <project> <step> [--sha <sha>] [--no-done]');
+  const o = parseArgs(argv, { sha: 'str' });
+  if (o._.length !== 2) die('usage: keep step run <project> <step> [--sha <sha>]');
   const project = resolveStepProject(o._[0]);
   const name = o._[1];
   const { registry, step } = stepConfig(project, name);
@@ -2955,9 +2955,14 @@ async function stepRun(argv) {
     if (!run || run.status !== 'running') return { abandoned: run && run.status === 'abandoned' };
     run.endedAt = nowStamp();
     run.exitCode = exitCode;
-    run.status = exitCode === 0 ? 'done' : 'failed';
     run.artifact = artifact;
-    if (exitCode === 0) run.note = [run.note, '[awaiting step done]'].filter(Boolean).join('; ');
+    // A failed run is history the moment the command exits: nothing to resolve later.
+    // A successful one stays `running` for the few milliseconds until finalizeStep
+    // marks it done, releases the claim, and notifies — it is the same command.
+    if (exitCode !== 0) {
+      run.status = 'failed';
+      run.finalizedAt = nowStamp();
+    }
     stepRegistry.saveLedger(registry.project, name, finalLedger);
     return { run };
   });
@@ -2969,11 +2974,19 @@ async function stepRun(argv) {
   if (!completion.run) die(`run ${runId} disappeared from the ${name} ledger before completion`);
   if (exitCode !== 0) {
     process.stderr.write(`keep: step ${name} failed with exit ${exitCode}; log: ${logFile}; claim retained (use keep step fail to release it)\n`);
+    if (claim && claim.task) {
+      checkinTask(claim.task, {
+        heading: `step ${name} attempt failed`,
+        message: `Run ${runId} exited ${exitCode}; the claim is retained. Log: ${logFile}. Fix and re-run, or keep step fail ${registry.project} ${name} -m "why".`,
+        linkSession: false,
+        commitLabel: 'step',
+      });
+    }
     process.exitCode = exitCode;
     return;
   }
   console.log(`step ${name} completed from ${sha.slice(0, 7)}${artifact ? ` — artifact ${artifact}` : ' — no artifact found'}; log: ${logFile}`);
-  if (!o['no-done']) await finalizeStep(registry, name, step, {
+  await finalizeStep(registry, name, step, {
     sha, artifact, runId, expectedClaimId: claim && claim.id || '',
   });
 }
@@ -3039,22 +3052,9 @@ async function notifyStepWaiters(registry, name, details) {
   return { waiters: waiters.length, failures: failed.size, remaining, message };
 }
 
-function runAwaitsDone(run) {
-  return run && run.status === 'done' && String(run.note || '').includes('[awaiting step done]');
-}
-
-function runNeedsFinalization(run) {
-  return run && (run.status === 'running' || runAwaitsDone(run)
-    || (run.status === 'failed' && !run.finalizedAt));
-}
-
-function requireRunOwner(run, name, force) {
-  const session = currentSession();
-  if (!runNeedsFinalization(run) || !session || force) return;
-  const by = run.by || {};
-  if (by.sessionId !== session.id) {
-    stepExitFive(`run ${run.id} awaiting finalization for step ${name} belongs to ${by.agent || 'manual'} ${String(by.sessionId || '').slice(0, 8) || '(no session)'} since ${run.startedAt || 'unknown'}; pass --force to complete it`);
-  }
+function describeRunOwner(run) {
+  const by = run && run.by || {};
+  return `${by.agent || 'manual'} ${String(by.sessionId || '').slice(0, 8) || '(no session)'}`;
 }
 
 function waiterRetrySuffix(notify) {
@@ -3066,30 +3066,16 @@ function waiterRetrySuffix(notify) {
 async function finalizeStep(registry, name, step, options = {}) {
   const finalized = withLock(() => {
     const ledger = stepRegistry.loadLedger(registry.project, name);
-    let run = options.runId ? ledger.runs.find((entry) => entry.id === options.runId) : null;
-    if (options.runId && (!run || !runNeedsFinalization(run))) {
-      stepExitFive(`run ${options.runId} is no longer awaiting finalization; reload the step before completing it`);
-    }
+    let run = null;
     if (options.runId) {
-      const index = ledger.runs.findIndex((entry) => entry.id === options.runId);
-      const newer = ledger.runs.slice(index + 1).find(runNeedsFinalization);
-      if (newer) stepExitFive(`newer run ${newer.id} is awaiting finalization; reload the step before completing ${options.runId}`);
-    }
-    if (!options.runId) {
-      const appeared = [...ledger.runs].reverse().find(runNeedsFinalization);
-      if (options.observedRun === false && appeared) {
-        stepExitFive(`run ${appeared.id} appeared after step done started; reload the step before completing it`);
+      run = ledger.runs.find((entry) => entry.id === options.runId) || null;
+      if (!run || run.status !== 'running') {
+        stepExitFive(`run ${options.runId} is no longer running; reload the step before completing it`);
       }
-      run = appeared;
     }
-    requireRunOwner(run, name, options.force);
     const prior = [...ledger.runs].reverse().find((entry) => entry.status === 'done' && (!run || entry.id !== run.id));
     const branch = stepRegistry.defaultBranch(registry.project);
     const sha = resolveLocalSha(registry.project, options.sha || run && run.sha || `origin/${branch}`);
-    if (runNeedsFinalization(run) && options.sha && !options.force) {
-      const pinned = resolveLocalSha(registry.project, run.sha);
-      if (sha !== pinned) die(`${sha.slice(0, 7)} does not match run ${run.id}'s pinned SHA ${pinned.slice(0, 7)}; pass --force to override`);
-    }
     if (step.from === 'landed') {
       try { gitAt(stepRegistry.expandProject(registry.project), ['merge-base', '--is-ancestor', sha, `origin/${branch}`]); }
       catch { die(`${sha.slice(0, 7)} is not an ancestor of origin/${branch}; landed steps must complete from a landed revision`); }
@@ -3103,8 +3089,10 @@ async function finalizeStep(registry, name, step, options = {}) {
         && (!activeClaim.by || activeClaim.by.sessionId !== session.id)) {
       stepExitFive(`step ${name} is claimed by ${describeClaim(activeClaim)}`);
     }
-    const actor = session || run && run.by || { id: '', agent: 'manual' };
-    const by = actor.id !== undefined ? { sessionId: actor.id, agent: actor.agent } : actor;
+    // A recorded run keeps the identity of the session that started it; a synthetic
+    // completion belongs to whoever is recording it now.
+    const sessionBy = session ? { sessionId: session.id, agent: session.agent } : { sessionId: '', agent: 'manual' };
+    const by = run && run.by || sessionBy;
     const artifact = options.artifact || run && run.artifact || '';
     if (!run) {
       run = {
@@ -3119,7 +3107,6 @@ async function finalizeStep(registry, name, step, options = {}) {
       run.status = 'done';
       run.finalizedAt = nowStamp();
       run.artifact = artifact;
-      run.note = String(run.note || '').replace(/(?:; )?\[awaiting step done\]/, '');
       if (options.note) run.note = options.note;
     }
     stepRegistry.saveLedger(registry.project, name, ledger);
@@ -3130,7 +3117,7 @@ async function finalizeStep(registry, name, step, options = {}) {
   const notify = await notifyStepWaiters(registry, name, {
     outcome: 'finished', agent: by.agent, sessionId: by.sessionId, artifact, sha,
   });
-  const included = stepRegistry.commitsBetween(registry.project, prior && prior.sha, sha, step.paths || []);
+  const included = stepRegistry.commitsBetween(registry.project, prior && prior.sha, sha, step);
   const attributed = stepRegistry.attributeCommits(included.commits, loadAll(false), registry.project);
   const cards = new Set(attributed.flatMap((commit) => commit.tasks));
   if (claim && claim.task) cards.add(claim.task);
@@ -3156,20 +3143,22 @@ async function stepDone(argv) {
   const name = o._[1];
   const { registry, step } = stepConfig(project, name);
   const ledger = stepRegistry.loadLedger(registry.project, name);
-  const failedRun = [...ledger.runs].reverse().find((entry) => entry.status === 'failed' && !entry.finalizedAt);
-  if (failedRun) stepExitFive(`run ${failedRun.id} failed and awaits keep step fail, not step done`);
-  const completable = [...ledger.runs].reverse().find((entry) =>
-    entry.status === 'running' || runAwaitsDone(entry));
+  const running = [...ledger.runs].reverse().find((entry) => entry.status === 'running') || null;
   const finalized = [...ledger.runs].reverse().find((entry) => entry.finalizedAt
     && (entry.status === 'done' || entry.status === 'failed'));
   const claim = activeHolds(registry.project, Date.now(), { step: name })[0];
-  if (!completable && finalized && !claim && ledger.waiters.length) return stepNotify([registry.project, name]);
   const session = currentSession();
+  // the claim is the ownership: a lane someone else holds is theirs to complete
   if (!o.force && session && claim && (!claim.by || claim.by.sessionId !== session.id)) stepExitFive(`step ${name} is claimed by ${describeClaim(claim)}`);
+  if (running && !o.force) {
+    stepExitFive(`run ${running.id} is still running by ${describeRunOwner(running)} since ${running.startedAt || 'unknown'};`
+      + ` wait for it, or keep step fail ${registry.project} ${name} -m "why" if that session is gone,`
+      + ` or pass --force to record it as done`);
+  }
+  if (!running && finalized && !claim && ledger.waiters.length) return stepNotify([registry.project, name]);
   await finalizeStep(registry, name, step, {
     sha: o.sha, artifact: o.artifact, note: o.m, force: o.force,
-    expectedClaimId: claim && claim.id || '', runId: completable && completable.id,
-    observedRun: Boolean(completable),
+    expectedClaimId: claim && claim.id || '', runId: running && running.id,
   });
 }
 
@@ -3180,53 +3169,58 @@ async function stepFail(argv) {
   const name = o._[1];
   const { registry } = stepConfig(project, name);
   const ledger = stepRegistry.loadLedger(registry.project, name);
-  const run = [...ledger.runs].reverse().find((entry) => entry.status === 'running'
-    || (entry.status === 'failed' && !entry.finalizedAt));
-  const terminalRun = [...ledger.runs].reverse().find((entry) => entry.finalizedAt
-    && (entry.status === 'done' || entry.status === 'failed'));
+  const running = [...ledger.runs].reverse().find((entry) => entry.status === 'running') || null;
   const initialClaim = activeHolds(registry.project, Date.now(), { step: name })[0] || null;
-  if (!run && terminalRun && !initialClaim && ledger.waiters.length) return stepNotify([registry.project, name]);
-  if (!run) die(`step ${name} has no running or failed run to mark failed`);
-  requireRunOwner(run, name, o.force);
+  const session = currentSession();
+  if (!o.force && session && initialClaim
+      && (!initialClaim.by || initialClaim.by.sessionId !== session.id)) {
+    stepExitFive(`step ${name} is claimed by ${describeClaim(initialClaim)}`);
+  }
+  // `step fail` resolves the lane, not one record: a claim to release or a waiter to
+  // tell is reason enough, and with none of the three there is nothing to resolve.
+  if (!running && !initialClaim && !ledger.waiters.length) {
+    die(`step ${name} has nothing to fail: no running run, no claim, no waiters`);
+  }
   const note = cleanScalar(o.m, 'note');
   const finalized = withLock(() => {
     const latest = stepRegistry.loadLedger(registry.project, name);
-    const current = latest.runs.find((entry) => entry.id === run.id);
-    if (!current || !runNeedsFinalization(current)) {
-      stepExitFive(`run ${run.id} is no longer awaiting finalization; reload the step before changing it`);
+    const current = running ? latest.runs.find((entry) => entry.id === running.id) : null;
+    if (running && (!current || current.status !== 'running')) {
+      stepExitFive(`run ${running.id} is no longer running; reload the step before changing it`);
     }
-    requireRunOwner(current, name, o.force);
     const activeClaim = activeHolds(registry.project, Date.now(), { step: name })[0] || null;
     if (activeClaim && activeClaim.id !== (initialClaim && initialClaim.id || '')) {
       stepExitFive(`step ${name}'s claim changed during finalization; reload it before completing the run`);
     }
-    const session = currentSession();
     if (!o.force && session && activeClaim
         && (!activeClaim.by || activeClaim.by.sessionId !== session.id)) {
       stepExitFive(`step ${name} is claimed by ${describeClaim(activeClaim)}`);
     }
-    current.status = 'failed';
-    current.endedAt = nowStamp();
-    current.finalizedAt = nowStamp();
-    if (current.exitCode == null || current.exitCode === 0) current.exitCode = 1;
-    current.note = note;
-    stepRegistry.saveLedger(registry.project, name, latest);
+    if (current) {
+      current.status = 'failed';
+      current.endedAt = nowStamp();
+      current.finalizedAt = nowStamp();
+      if (current.exitCode == null || current.exitCode === 0) current.exitCode = 1;
+      current.note = note;
+      stepRegistry.saveLedger(registry.project, name, latest);
+    }
     const released = releaseStepClaim(registry.project, name, { force: o.force });
     return { run: current, claim: activeClaim, released };
   });
   const finalizedRun = finalized.run;
   const claim = finalized.claim;
   const released = finalized.released;
-  const actor = currentSession() || finalizedRun.by || { id: '', agent: 'manual' };
+  const actor = session || finalizedRun && finalizedRun.by || { id: '', agent: 'manual' };
   const by = actor.id !== undefined ? { sessionId: actor.id, agent: actor.agent } : actor;
+  const sha = finalizedRun && finalizedRun.sha || '';
   const notify = await notifyStepWaiters(registry, name, {
-    outcome: 'failed', agent: by.agent, sessionId: by.sessionId, note: finalizedRun.note, sha: finalizedRun.sha,
+    outcome: 'failed', agent: by.agent, sessionId: by.sessionId, note, sha,
   });
-  const task = claim && claim.task || finalizedRun.task;
+  const task = claim && claim.task || finalizedRun && finalizedRun.task;
   if (task) {
     checkinTask(task, {
       heading: `step ${name} failed`,
-      message: `Failed ${name} from ${String(finalizedRun.sha || '').slice(0, 7)}: ${finalizedRun.note}`,
+      message: `Failed ${name}${sha ? ` from ${String(sha).slice(0, 7)}` : ''}: ${note}`,
       linkSession: false,
       commitLabel: 'step',
     });
@@ -4771,7 +4765,7 @@ async function recordStepRun(input) {
   try {
     await finalizeStep(registry, match.name, match.step, {
       sha, artifact, note: `recorded by the post-bash hook from \`${shownCmd}\``,
-      expectedClaimId: claim.id, observedRun: false,
+      expectedClaimId: claim.id,
     });
     process.stderr.write(`keep: recorded step ${match.name} done from ${sha.slice(0, 7)}${artifact ? ` (${artifact})` : ''} and released ${claim.id}\n`);
     return { recorded: true, sha, artifact };

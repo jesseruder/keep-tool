@@ -127,8 +127,10 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   replacements for gated-step claims. Before changing paths owned by a gated step, run
   `keep steps <project>`, claim it with `keep step claim`, and run it through
   `keep step run` so a `landed` step uses a pinned revision in a clean worktree.
-  A failed step prints its log path; read it before re-running.
-  Use `keep step done` after running it by hand. `keep step help` prints the step commands.
+  A failed step prints its log path and is recorded as a failed run; your claim stays
+  with you, so fix it and run it again — there is no bookkeeping to settle first.
+  Use `keep step done` after running it by hand, and `keep step fail -m "why"` to give
+  up the lane. `keep step help` prints the step commands.
   If someone else holds the step, pass `--wait`; Keep will tell the session when that
   run lands and its queued claim is next.
 - **Blocked on something only Owner can supply** (a secret, an API key, a sign-in, a

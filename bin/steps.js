@@ -197,6 +197,13 @@ function claimStaleness(claim, now, sessionIdle = defaultSessionIdle) {
   return { hours: Math.floor((now - from) / 3600e3), idle: true };
 }
 
+// A run left `running` for hours by a session that has gone quiet: its command is
+// almost certainly over and nobody recorded the outcome.
+function runStaleness(run, now, sessionIdle = defaultSessionIdle) {
+  if (!run) return null;
+  return claimStaleness({ from: run.startedAt, by: run.by }, now, sessionIdle);
+}
+
 function pathMatches(pattern, file) {
   pattern = String(pattern || '').replace(/^\.\//, '').replace(/\\/g, '/').replace(/\/$/, '');
   file = String(file || '').replace(/^\.\//, '').replace(/\\/g, '/').replace(/\/$/, '');
@@ -225,6 +232,27 @@ function stepOwnsFile(step, file) {
   return (step.paths || []).some((pattern) => pathMatches(pattern, file));
 }
 
+function stepIgnores(step) {
+  return (step && Array.isArray(step.ignore) ? step.ignore : []).map(String).filter(Boolean);
+}
+
+function stepIgnoresFile(step, file) {
+  return stepIgnores(step).some((pattern) => pathMatches(pattern, file));
+}
+
+// The files in a commit that count for a step: owned by `paths` and not on the
+// step's `ignore` list (the tfstate a run writes back is not new work).
+function countedFiles(step, files) {
+  const paths = (step && step.paths) || [];
+  return (files || []).filter((file) => (!paths.length || paths.some((pattern) => pathMatches(pattern, file)))
+    && !stepIgnoresFile(step, file));
+}
+
+// Callers historically passed a bare `paths` array where a step is wanted.
+function stepShape(value) {
+  return Array.isArray(value) ? { paths: value } : (value || {});
+}
+
 function ledgerPath(project, step, root = ROOT) {
   const ledgerDir = root === ROOT ? LEDGER_DIR : path.join(root, '.keep', 'steps');
   return path.join(ledgerDir, path.basename(normalizeProject(project)), `${step}.json`);
@@ -238,11 +266,27 @@ function emptyLedger() {
   return { runs: [], waiters: [] };
 }
 
+// Runs are single-phase now: a run that has stopped is terminal. Legacy ledgers hold
+// two-phase leftovers — a `done` run tagged `[awaiting step done]`, or a `failed` run
+// with no `finalizedAt` — which would otherwise read as unfinished forever. Normalize
+// them on load; the next saveLedger persists it.
+function normalizeRun(run) {
+  if (!run || typeof run !== 'object') return run;
+  const note = String(run.note || '');
+  const awaiting = note.includes('[awaiting step done]');
+  if (awaiting) run.note = note.replace(/(?:; )?\[awaiting step done\]/g, '').trim();
+  if (!run.finalizedAt && (awaiting || run.status === 'failed')) {
+    const stamp = run.endedAt || run.startedAt;
+    if (stamp) run.finalizedAt = stamp;
+  }
+  return run;
+}
+
 function loadLedger(project, step, root = ROOT) {
   try {
     const value = JSON.parse(fs.readFileSync(ledgerPath(project, step, root), 'utf8'));
     return {
-      runs: Array.isArray(value.runs) ? value.runs : [],
+      runs: Array.isArray(value.runs) ? value.runs.map(normalizeRun) : [],
       waiters: Array.isArray(value.waiters) ? value.waiters : [],
     };
   } catch { return emptyLedger(); }
@@ -303,14 +347,47 @@ function parseCommits(output) {
   });
 }
 
-function gitCommits(project, args, paths) {
+// `git log --format=%x00%h%x09%s --name-only`: one NUL-delimited record per commit,
+// its file names on the lines that follow.
+function parseCommitEntries(output) {
+  return String(output || '').split('\0').map((chunk) => chunk.replace(/^\n+/, '').trimEnd())
+    .filter(Boolean)
+    .map((chunk) => {
+      const [head, ...rest] = chunk.split('\n');
+      const [sha, ...subject] = head.split('\t');
+      return { sha, subject: subject.join('\t'), files: rest.map((line) => line.trim()).filter(Boolean) };
+    });
+}
+
+// Without an `ignore` list this is the plain subject listing. With one, each commit's
+// files are read alongside it and a commit that touched only ignored files is dropped;
+// `files` then carries the counted files for the caller's touched-directory summary.
+function gitCommits(project, args, step) {
+  const shape = stepShape(step);
+  const paths = shape.paths || [];
+  const ignore = stepIgnores(shape);
   try {
     const output = execFileSync('git', [
-      '-C', expandProject(project), '--no-optional-locks', 'log', '--format=%h%x09%s', ...args,
-      '--', ...(paths || []),
+      '-C', expandProject(project), '--no-optional-locks', 'log',
+      ignore.length ? '--format=%x00%h%x09%s' : '--format=%h%x09%s',
+      ...(ignore.length ? ['--name-only'] : []), ...args,
+      '--', ...paths,
     ], { encoding: 'utf8', timeout: 10e3, stdio: ['ignore', 'pipe', 'ignore'] });
-    return { available: true, commits: parseCommits(output).slice(0, 20) };
-  } catch { return { available: false, commits: [] }; }
+    if (!ignore.length) return { available: true, commits: parseCommits(output).slice(0, 20), files: null };
+    const kept = [];
+    for (const entry of parseCommitEntries(output)) {
+      const files = countedFiles(shape, entry.files);
+      // a merge lists no files of its own; judge it by its presence in the log
+      if (entry.files.length && !files.length) continue;
+      kept.push({ sha: entry.sha, subject: entry.subject, files });
+    }
+    const commits = kept.slice(0, 20);
+    return {
+      available: true,
+      commits: commits.map(({ sha, subject }) => ({ sha, subject })),
+      files: [...new Set(commits.flatMap((entry) => entry.files))],
+    };
+  } catch { return { available: false, commits: [], files: null }; }
 }
 
 function pendingCommits(project, step, lastDoneSha) {
@@ -318,9 +395,9 @@ function pendingCommits(project, step, lastDoneSha) {
   const args = lastDoneSha
     ? [`${lastDoneSha}..origin/${branch}`, '-n', '20']
     : ['--since=7 days ago', '-n', '20'];
-  const result = gitCommits(project, args, step.paths || []);
-  let files = [];
-  if (result.available && result.commits.length) {
+  const result = gitCommits(project, args, step);
+  let files = result.files || [];
+  if (!result.files && result.available && result.commits.length) {
     try {
       const fileArgs = lastDoneSha
         ? ['diff', '--name-only', `${lastDoneSha}..origin/${branch}`, '--', ...(step.paths || [])]
@@ -331,12 +408,13 @@ function pendingCommits(project, step, lastDoneSha) {
       files = [...new Set(output.trim().split('\n').filter(Boolean))];
     } catch {}
   }
-  return { branch, neverRecorded: !lastDoneSha, files, ...result };
+  return { branch, neverRecorded: !lastDoneSha, available: result.available, commits: result.commits, files };
 }
 
-function commitsBetween(project, fromSha, toSha, paths) {
+function commitsBetween(project, fromSha, toSha, step) {
   if (!fromSha || !toSha || fromSha === toSha) return { available: true, commits: [] };
-  return gitCommits(project, [`${fromSha}..${toSha}`, '-n', '20'], paths);
+  const result = gitCommits(project, [`${fromSha}..${toSha}`, '-n', '20'], step);
+  return { available: result.available, commits: result.commits };
 }
 
 function cardLogEntries(body) {
@@ -381,6 +459,18 @@ function shortWhen(value) {
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
 }
 
+function shortAge(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '';
+  const minutes = Math.floor(ms / 60e3);
+  const hours = Math.floor(minutes / 60);
+  return hours ? `${hours}h ${minutes % 60}m` : `${minutes}m`;
+}
+
+function describeBy(by) {
+  by = by || {};
+  return `${by.agent || 'manual'} ${String(by.sessionId || '').slice(0, 8) || '(none)'}`;
+}
+
 function renderStatusLine(row) {
   const bits = [];
   const lastBy = row.lastDone && row.lastDone.by || {};
@@ -409,7 +499,20 @@ function renderStatusLine(row) {
   } else {
     bits.push('unclaimed');
   }
-  if (row.running) bits.push(`run ${row.running.id} running from ${String(row.running.sha || '').slice(0, 7)}`);
+  if (row.running) {
+    const since = shortWhen(row.running.startedAt);
+    bits.push(`run ${row.running.id} running from ${String(row.running.sha || '').slice(0, 7) || 'unknown'}`
+      + ` by ${describeBy(row.running.by)}${since ? ` since ${since}` : ''}${row.runningAge ? ` (${row.runningAge})` : ''}`
+      + (row.runningStale
+        ? ` — STALE: owning session idle; if it finished, keep step done ${row.project || ''} ${row.name} --force;`
+          + ` if it died, keep step fail ${row.project || ''} ${row.name} -m "why"`
+        : ''));
+  }
+  if (row.lastFailed) {
+    const when = shortWhen(row.lastFailed.endedAt || row.lastFailed.finalizedAt || row.lastFailed.startedAt);
+    bits.push(`last attempt failed (run ${row.lastFailed.id}, exit ${row.lastFailed.exitCode ?? 'unknown'}`
+      + `${when ? `, ${when}` : ''}, by ${describeBy(row.lastFailed.by)})`);
+  }
   if (row.waiters) bits.push(`${row.waiters} waiting`);
   return `▶ ${row.name} — ${bits.join('; ')}.`;
 }
@@ -425,14 +528,22 @@ function status(project, options = {}) {
     const ledger = loadLedger(registry.project, name);
     const lastDone = [...ledger.runs].reverse().find((run) => run.status === 'done') || null;
     const running = [...ledger.runs].reverse().find((run) => run.status === 'running') || null;
+    const newest = ledger.runs.length ? ledger.runs[ledger.runs.length - 1] : null;
+    const lastFailed = newest && newest.status === 'failed' ? newest : null;
+    const runningStarted = running ? Date.parse(String(running.startedAt || '').replace(' ', 'T')) : NaN;
     const git = pendingCommits(registry.project, step, lastDone && lastDone.sha);
     const row = {
       name,
+      project: registry.project,
       title: step.title || name,
       paths: step.paths || [],
+      ignore: step.ignore || [],
       from: step.from || 'any',
       lastDone,
+      lastFailed,
       running,
+      runningAge: Number.isFinite(runningStarted) ? shortAge(now - runningStarted) : '',
+      runningStale: runStaleness(running, now, sessionIdle),
       claim: holds.find((hold) => hold && hold.step === name) || null,
       claimStale: claimStaleness(holds.find((hold) => hold && hold.step === name) || null, now, sessionIdle),
       waiters: ledger.waiters.length,
@@ -472,6 +583,8 @@ module.exports = {
   loadSteps,
   pathMatches,
   stepOwnsFile,
+  stepIgnoresFile,
+  countedFiles,
   ledgerPath,
   logPath,
   emptyLedger,
@@ -495,5 +608,7 @@ module.exports = {
   registryForPaths,
   registriesForPaths,
   claimStaleness,
+  runStaleness,
+  parseCommitEntries,
   STALE_CLAIM_MS,
 };

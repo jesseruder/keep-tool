@@ -97,11 +97,11 @@ test('step help prints the full step usage block', () => {
     fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
     const help = run(['step', 'help']);
     assert.equal(help.status, 0, help.stderr);
-    assert.match(help.stdout, /keep step run <project> <step> \[--sha <sha>\] \[--no-done\]/);
+    assert.match(help.stdout, /keep step run <project> <step> \[--sha <sha>\]/);
 
     const missing = run(['step']);
     assert.equal(missing.status, 1);
-    assert.match(missing.stderr, /keep step run <project> <step> \[--sha <sha>\] \[--no-done\]/);
+    assert.match(missing.stderr, /keep step run <project> <step> \[--sha <sha>\]/);
 
     const stepsHelp = run(['steps', '--help']);
     assert.equal(stepsHelp.status, 0, stepsHelp.stderr);
