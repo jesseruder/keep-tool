@@ -90,6 +90,14 @@ test('reviewer and notifications carry only their screen-specific data', () => {
   assert.equal(notifications.review, undefined);
 });
 
+test('fleet keeps a bounded last message for every session', () => {
+  const source = fixture();
+  source.sessions.push({ id: 'second', state: 'running', lastAssistant: 'second answer' });
+  const fleet = projectMobileState(source, 'fleet');
+  assert.equal(fleet.sessions[0].lastAssistant, 'short answer');
+  assert.equal(fleet.sessions[1].lastAssistant, 'second answer');
+});
+
 test('non-rendered timestamps and verbose internals do not churn a list representation', () => {
   const first = fixture();
   const later = structuredClone(first);

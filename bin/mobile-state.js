@@ -180,7 +180,7 @@ function projectMobileState(state, view, id) {
   if (view === 'fleet') {
     return {
       ...attentionState(state, view),
-      sessions: (state.sessions || []).map(sessionSummary),
+      sessions: (state.sessions || []).map((session) => sessionSummary(session)),
       panes: (state.panes || []).map(paneSummary),
       tasks: [],
     };
