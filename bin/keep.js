@@ -29,6 +29,12 @@ const OPEN_MESSAGE_LIMIT = 2000;
 const LAUNCH_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,79}$/;
 const OPEN_MESSAGE_ERROR = 'agent messages are limited to 2000 characters';
 const KINDS = ['task', 'experiment', 'idea', 'chore', 'bug'];
+// What a passing check means for the card. Absent is `review`: every card written
+// before this existed expects a pass to land in Owner's queue.
+const CHECK_ON_PASS = ['done', 'rearm', 'review'];
+// A re-arm shorter than this turns a monitor into a busy loop against the one-minute
+// scheduler tick, and every real recurring check is minutes-to-weeks apart.
+const MIN_CHECK_EVERY_MS = 10 * 60e3;
 const STATUS_ORDER = ['active', 'review', 'blocked', 'waiting', 'landing', 'inbox', 'deferred', 'done'];
 
 class KeepError extends Error {}
@@ -184,6 +190,9 @@ function serializeTask(task) {
     out.push('check: |');
     for (const l of fm.check.split('\n')) out.push(`  ${l}`);
   }
+  scalar('check_on_pass');
+  scalar('check_every');
+  scalar('probe');
   scalar('scheduled_by');
   scalar('scheduled_at');
   scalar('scheduled_for');
@@ -210,7 +219,7 @@ function serializeTask(task) {
   scalar('updated');
   const known = new Set([
     'title', 'status', 'kind', 'experiment_id', 'autocontinue', 'autonomous', 'allow', 'allow_until',
-    'tags', 'depends_on', 'project', 'check_after', 'check',
+    'tags', 'depends_on', 'project', 'check_after', 'check', 'check_on_pass', 'check_every', 'probe',
     'scheduled_by', 'scheduled_at', 'scheduled_for', 'scheduled_intent', 'sessions', 'needs', 'created', 'done_at', 'updated',
   ]);
   for (const key of Object.keys(fm)) {
@@ -1159,6 +1168,7 @@ commands.usage = (argv) => {
 
 function addTask({
   title, kind, tags, project, checkAfter, check, status, note, experimentId, force, beforeSave,
+  onPass, checkEvery, probe,
   withinLock = false, commit = true, linkSession = true,
 }) {
   title = cleanScalar(title, 'title');
@@ -1209,6 +1219,11 @@ function addTask({
       },
       body: '',
     };
+    if (probe !== undefined) {
+      const cleaned = cleanProbe(probe);
+      if (cleaned) task.fm.probe = cleaned;
+    }
+    applyCheckPolicy(task, { onPass, checkEvery });
     const sessionResult = linkSession ? recordSession(task) : null;
     if (linkSession && (checkAfter || check)) recordScheduler(task);
     if (beforeSave) beforeSave(task);
@@ -1222,9 +1237,9 @@ function addTask({
 }
 
 commands.add = (argv) => {
-  const o = parseArgs(argv, { kind: 'str', tag: 'list', project: 'str', 'check-after': 'str', check: 'str', status: 'str', 'experiment-id': 'str', plan: 'many', 'done-when': 'list', allow: 'list', until: 'str', autonomous: 'bool', force: 'bool' });
+  const o = parseArgs(argv, { kind: 'str', tag: 'list', project: 'str', 'check-after': 'str', check: 'str', 'on-pass': 'str', 'check-every': 'str', probe: 'str', status: 'str', 'experiment-id': 'str', plan: 'many', 'done-when': 'list', allow: 'list', until: 'str', autonomous: 'bool', force: 'bool' });
   const title = o._.join(' ');
-  if (!title.trim()) die('usage: keep add "title" [--kind k] [--tag t] [--project p] [--plan "step" …] [--done-when "cmd"]… [--allow a,b] [--until when] [--autonomous] [--experiment-id id] [--check-after when] [--check "recipe"] [--status s] [--force] [-m note]');
+  if (!title.trim()) die('usage: keep add "title" [--kind k] [--tag t] [--project p] [--plan "step" …] [--done-when "cmd"]… [--allow a,b] [--until when] [--autonomous] [--experiment-id id] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"] [--status s] [--force] [-m note]');
   const plan = splitPlanValues(o.plan || []).map((text) => ({ text: cleanPlanText(text), state: 'todo' }));
   applyDoneWhen(plan, o['done-when']);
   let grants = [];
@@ -1245,6 +1260,7 @@ commands.add = (argv) => {
     // hook all miss it. Refuse an unresolvable name rather than store it.
     title, kind: o.kind, tags: o.tag, project: o.project ? resolveProjectArg(o.project) : undefined,
     checkAfter: o['check-after'], check: o.check, status: o.status, note: o.m,
+    onPass: o['on-pass'], checkEvery: o['check-every'], probe: o.probe,
     experimentId: o['experiment-id'], force: o.force,
     beforeSave: (created) => {
       if (plan.length) setPlan(created, plan);
@@ -1273,6 +1289,49 @@ function cleanDoneWhen(value) {
   return text;
 }
 
+// A card's deterministic gate: one shell command whose exit code decides the check,
+// so a green monitor costs no model session at all. '' removes it.
+function cleanProbe(value) {
+  const text = cleanScalar(value, 'probe');
+  if (!text) return '';
+  if (text.length > 400) die('a probe command must be at most 400 characters');
+  return text;
+}
+
+function cleanCheckEvery(value) {
+  const text = String(cleanScalar(value, 'check-every') || '').toLowerCase();
+  const ms = relativeDurationMs(text);
+  if (ms == null) die('--check-every takes a relative interval: +<n><m|h|d|w>, for example +90m, +12h, +7d, +2w');
+  if (ms < MIN_CHECK_EVERY_MS) die('--check-every must be at least +10m');
+  return text;
+}
+
+// `check_on_pass` and `check_every` are only coherent together, and `keep add` and
+// `keep checkin` both set them, so the whole rule lives here. It runs against the card
+// as it will be saved — the recipe or probe may have arrived in the same command.
+function applyCheckPolicy(task, { onPass, checkEvery } = {}) {
+  if (onPass !== undefined && !CHECK_ON_PASS.includes(onPass)) {
+    die(`--on-pass must be one of: ${CHECK_ON_PASS.join(', ')}`);
+  }
+  // An interval alone says what the author meant: keep re-arming this check.
+  const resolved = onPass === undefined && checkEvery ? 'rearm' : onPass;
+  if (checkEvery !== undefined) {
+    if (String(checkEvery).trim() === '') delete task.fm.check_every;
+    else task.fm.check_every = cleanCheckEvery(checkEvery);
+  }
+  if (resolved !== undefined) {
+    task.fm.check_on_pass = resolved;
+    if (resolved !== 'rearm') delete task.fm.check_every;
+  }
+  if (task.fm.check_on_pass === 'rearm' && !task.fm.check_every) {
+    die('--on-pass rearm needs --check-every <+7d>: without an interval a passing check has nothing to re-arm');
+  }
+  if ((task.fm.check_on_pass === 'rearm' || task.fm.check_every) && !task.fm.check && !task.fm.probe) {
+    die('--check-every needs a --check recipe or a --probe: nothing can run on the interval');
+  }
+  return task;
+}
+
 // `--done-when` is positional against `--plan`: the nth one belongs to the nth
 // step. An empty value ('') clears the criterion on that step.
 function applyDoneWhen(steps, values) {
@@ -1294,7 +1353,7 @@ function applyDoneWhen(steps, values) {
 // expands, so the working directory has to be expanded before it is tested or
 // used: an unexpanded path silently failed its existence check and ran every
 // criterion in ~/keep instead of the card's own checkout.
-function runDoneWhen(command, project) {
+function runShellGate(command, project, { marker, timeoutMs }) {
   const started = Date.now();
   const expanded = project ? String(project).replace(/^~(?=\/|$)/, os.homedir()) : '';
   const cwd = expanded && fs.existsSync(expanded) ? expanded : ROOT;
@@ -1302,9 +1361,9 @@ function runDoneWhen(command, project) {
     const out = execFileSync(process.env.SHELL || '/bin/sh', ['-c', command], {
       cwd,
       encoding: 'utf8',
-      timeout: Number(process.env.KEEP_DONE_WHEN_TIMEOUT_MS || 120e3),
+      timeout: timeoutMs,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, KEEP_DONE_WHEN: '1' },
+      env: { ...process.env, [marker]: '1' },
     });
     return { ok: true, code: 0, output: String(out || '').trim().slice(-500), ms: Date.now() - started };
   } catch (error) {
@@ -1313,6 +1372,22 @@ function runDoneWhen(command, project) {
       .filter(Boolean).join('\n').slice(-500);
     return { ok: false, code, output, ms: Date.now() - started, timedOut: error && error.killed };
   }
+}
+
+function runDoneWhen(command, project) {
+  return runShellGate(command, project, {
+    marker: 'KEEP_DONE_WHEN',
+    timeoutMs: Number(process.env.KEEP_DONE_WHEN_TIMEOUT_MS || 120e3),
+  });
+}
+
+// A card's probe, run the way the daemon runs it, so what an agent sees from
+// `keep probe` is what the scheduler will see when the check comes due.
+function runProbe(command, project) {
+  return runShellGate(command, project, {
+    marker: 'KEEP_PROBE',
+    timeoutMs: Number(process.env.KEEP_PROBE_TIMEOUT_MS || 120e3),
+  });
 }
 
 function splitPlanValues(values) {
@@ -1572,6 +1647,7 @@ function guardBlocked(task, status, force) {
 
 function checkinTask(id, {
   message, status, checkAfter, clearCheckAfter, check, heading, experimentId, step,
+  onPass, checkEvery, probe,
   linkSession = true, commitLabel, force, withinLock = false, commit = true, dependencyWait = false,
   next, commits, handoff,
 }) {
@@ -1627,6 +1703,12 @@ function checkinTask(id, {
     if (checkAfter) task.fm.check_after = parseWhen(checkAfter);
     if (clearCheckAfter) { task.fm.check_after = ''; clearScheduler(task); }
     if (check) task.fm.check = check;
+    if (probe !== undefined) {
+      const cleaned = cleanProbe(probe);
+      if (cleaned) task.fm.probe = cleaned;
+      else delete task.fm.probe;
+    }
+    applyCheckPolicy(task, { onPass, checkEvery });
     if (handoff && (!task.fm.check_after || !task.fm.check)) die('--handoff needs a scheduled check with a recipe');
     if (experimentId !== undefined) task.fm.experiment_id = experimentId;
     if (status === 'waiting' && !task.fm.check_after && !dependencyWait
@@ -1652,14 +1734,15 @@ function checkinTask(id, {
 }
 
 commands.checkin = (argv) => {
-  const o = parseArgs(argv, { status: 'str', 'check-after': 'str', 'clear-check-after': 'bool', check: 'str', 'experiment-id': 'str', step: 'str', force: 'bool', next: 'str', commit: 'list', handoff: 'str' });
+  const o = parseArgs(argv, { status: 'str', 'check-after': 'str', 'clear-check-after': 'bool', check: 'str', 'on-pass': 'str', 'check-every': 'str', probe: 'str', 'experiment-id': 'str', step: 'str', force: 'bool', next: 'str', commit: 'list', handoff: 'str' });
   const id = o._[0];
-  if (!id || !o.m) die('usage: keep checkin <id> -m "state + next step" [--next "text"] [--commit sha]... [--step <n|next>] [--status s] [--experiment-id id] [--check-after when] [--check "recipe"] [--clear-check-after] [--handoff waiting|needs-input] [--force]');
+  if (!id || !o.m) die('usage: keep checkin <id> -m "state + next step" [--next "text"] [--commit sha]... [--step <n|next>] [--status s] [--experiment-id id] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"] [--clear-check-after] [--handoff waiting|needs-input] [--force]');
   const next = cleanNext(o.next);
   const commits = cleanCommits(o.commit);
   const task = checkinTask(id, {
     message: o.m, status: o.status, checkAfter: o['check-after'],
     clearCheckAfter: o['clear-check-after'], check: o.check, experimentId: o['experiment-id'],
+    onPass: o['on-pass'], checkEvery: o['check-every'], probe: o.probe,
     step: o.step, force: o.force, next, commits, handoff: o.handoff,
   });
   structuredFieldTips(o.m, next, commits);
@@ -2127,6 +2210,10 @@ commands.show = (argv) => {
   if (f.project) console.log(`  project: ${f.project}`);
   if (f.check_after) console.log(`  check after: ${f.check_after.replace('T', ' ')}${isOverdue(task) ? color('31', '  (overdue)') : ''}`);
   if (f.check) console.log(`  check recipe:\n${f.check.split('\n').map((l) => '    ' + l).join('\n')}`);
+  if (f.check_on_pass) {
+    console.log(`  on pass: ${f.check_on_pass === 'rearm' ? `re-arm every ${f.check_every}` : f.check_on_pass}`);
+  }
+  if (f.probe) console.log(`  probe: ${f.probe}`);
   if (f.sessions && f.sessions.length) {
     const s = f.sessions[f.sessions.length - 1];
     console.log(`  last session: ${s.id} (${s.at})  →  ${resumeCommand(s)}`);
@@ -2144,6 +2231,24 @@ commands.show = (argv) => {
     console.log(next ? `  next: step ${next.n}/${parsed.steps.length} — ${next.text}` : '  next: none');
   }
   if (parsed.rest) console.log('\n' + parsed.rest.trim());
+};
+
+// Run a card's probe once, right now, with the daemon's semantics and none of its
+// consequences: no check-in, no status change, no daemon required. The exit code is
+// the answer, so this is also what a shell script or another agent can call.
+commands.probe = (argv) => {
+  const o = parseArgs(argv, {});
+  const id = o._[0];
+  if (!id || o._.length > 1) die('usage: keep probe <id>');
+  const task = loadTask(id);
+  if (!task.fm.probe) die(`${id} has no probe — set one with keep checkin ${id} --probe "<command>" -m "why"`);
+  const result = runProbe(task.fm.probe, task.fm.project);
+  console.log(task.fm.probe);
+  if (result.output) console.log(result.output);
+  console.log(result.ok
+    ? `probe passed (${result.ms}ms)`
+    : `probe FAILED (exit ${result.code}${result.timedOut ? ', timed out' : ''}, ${result.ms}ms)`);
+  if (!result.ok) process.exitCode = 1;
 };
 
 commands.overdue = (argv) => {
@@ -6017,11 +6122,17 @@ function helpText() {
   keep add "title" [--kind task|experiment|idea|chore|bug] [--tag t]… [--project p]
                    [--plan "step" …] [--done-when "cmd"]… [--allow a,b] [--until when]
                    [--autonomous] [--experiment-id id] [--check-after when]
-                   [--check "recipe"] [--status s] [--force] [-m note]
+                   [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d]
+                   [--probe "cmd"] [--status s] [--force] [-m note]
                    # --autonomous requires both --plan and --allow
   keep checkin <id> -m "state + next step" [--step <n|next>] [--status s] [--experiment-id id]
                     [--next "text"] [--commit sha]… [--check-after when] [--check "recipe"] [--clear-check-after]
+                    [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"]
                     [--handoff waiting|needs-input] [--force]
+                    # --on-pass says what a passing check means: close it, re-arm it every
+                    #   --check-every (minimum +10m, implied by --check-every alone), or Owner review (default)
+                    # --probe "<cmd>" is a read-only one-liner whose exit code decides the check
+                    #   with no model at all; a failing probe escalates to the recipe. --probe "" removes it
                     # --check-after yields this turn to its scheduled recipe; --handoff needs-input keeps a decision visible
                     # --handoff requires a check time and recipe; --check alone edits the recipe without yielding
   keep plan <id> [--set "step" … | --add "text" | --insert <n> "text" | --remove <n>
@@ -6084,6 +6195,7 @@ ${stepUsage()}
   keep slack poll [--dry]
   keep slack status
   keep slack mode log|cards|alerts
+  keep probe <id>      # run this card's probe now (exit 1 = failed); no check-in, no daemon
   keep verify <id>     # run this task's check recipe now (needs keep serve)
   keep compact <sid>   # compact a live Claude or Codex session (needs keep serve)
   keep open <card-id|session-id> [--fresh] [--agent claude|codex] [--model <id>] [-m "opening message" | --message-file <path>]
@@ -6174,6 +6286,7 @@ module.exports = {
   loadAll, loadTask, loadTaskAnywhere, parseTask, serializeTask, parsePlan, renderPlan, setPlan, nextStep, lastLogLine, isOverdue, nowStamp, stampOf, buildDigest,
   parseDependency, dependencyTarget, dependencyReason, dependencyStep, deploymentFact, dependencyResolved, dependencyInfo, unresolvedDependencyIds,
   withLock, commitAndPush, saveTask, recordDoneTransition, recordDaemonSessionClose, addTask, checkinTask, briefSnapshot, scopeForProject, KeepError,
+  CHECK_ON_PASS, MIN_CHECK_EVERY_MS, applyCheckPolicy, cleanProbe, cleanCheckEvery, runProbe,
   claimSession, linkLaunchedSession, releaseCardSession,
   emptyStopEvidence, scanStopEvidence, hasSubstantiveStopEvidence, canonicalCwd, inferProject,
   writePaneRecord, stopHook,

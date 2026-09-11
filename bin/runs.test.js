@@ -28,6 +28,7 @@ test('scheduled-task timer polls each minute and matches health cadence', () => 
 const {
   buildPrompt, headlessRunArgs, checkDeliveryMessage, planDueCard, deliveryWarning,
   cardFingerprint, finalizePayload, pendingCheckin, landFinalCheckin, NO_RESULT,
+  parseVerdict, probePayload, startProbe,
 } = require('./runs.js');
 
 const card = (over = {}) => ({
@@ -373,4 +374,212 @@ test('a locked card load failure is surfaced and queues no blind mutations', () 
   assert.equal('status' in outcome.payload, false);
   assert.equal('clearCheckAfter' in outcome.payload, false);
   assert.equal('_retryCardFingerprint' in outcome.payload, false);
+});
+
+// ---------- structured verdicts ----------
+
+test('the verdict is read from the last VERDICT line, in any case', () => {
+  assert.equal(parseVerdict('VERDICT: PASS — every gate held'), 'pass');
+  assert.equal(parseVerdict('verdict: passed'), 'pass');
+  assert.equal(parseVerdict('VERDICT: ok, nothing to do'), 'pass');
+  assert.equal(parseVerdict('VERDICT: FAIL — seed 3 timed out'), 'fail');
+  assert.equal(parseVerdict('VERDICT: failed'), 'fail');
+  assert.equal(parseVerdict('VERDICT: UNSURE — needs the original thread'), 'unsure');
+  assert.equal(parseVerdict('VERDICT: PASS\nVERDICT: FAIL — correction'), 'fail', 'the last one wins');
+  assert.equal(parseVerdict('I would call this a pass.'), null);
+  assert.equal(parseVerdict('VERDICT: probably fine'), null, 'an invented word is not a verdict');
+  assert.equal(parseVerdict(''), null);
+});
+
+const verdictRun = (start, resultText) => ({ ...completedCheck(start), resultText });
+
+test('a passing check does what the card declared a pass means', () => {
+  const closing = card({ check_on_pass: 'done' });
+  const closed = finalizePayload(verdictRun(closing, 'Recorder healthy.\nVERDICT: PASS — nothing left'), closing);
+  assert.equal(closed.status, 'done');
+  assert.equal(closed.clearCheckAfter, true);
+  assert.equal('checkAfter' in closed, false);
+  assert.match(closed.message, /\(VERDICT pass; closed as declared by on-pass: done\)/);
+
+  const recurring = card({ check_on_pass: 'rearm', check_every: '+7d' });
+  const rearmed = finalizePayload(verdictRun(recurring, 'All green.\nVERDICT: PASS — healthy'), recurring);
+  assert.equal(rearmed.status, 'waiting');
+  // A relative interval, so checkinTask re-arms from now: re-arming from the old date
+  // would fire a week of catch-up checks after a daemon outage.
+  assert.equal(rearmed.checkAfter, '+7d');
+  assert.equal(rearmed.clearCheckAfter, false);
+  assert.match(rearmed.message, /\(VERDICT pass; re-armed every \+7d\)/);
+
+  for (const declared of [card({ check_on_pass: 'review' }), card()]) {
+    const reviewed = finalizePayload(verdictRun(declared, 'Looks fine.\nVERDICT: PASS'), declared);
+    assert.equal(reviewed.status, 'review');
+    assert.equal(reviewed.clearCheckAfter, true);
+    assert.equal('checkAfter' in reviewed, false);
+    assert.match(reviewed.message, /\(VERDICT pass\)$/);
+  }
+});
+
+test('a rearm card with no usable interval falls back to review rather than vanishing', () => {
+  for (const fm of [{ check_on_pass: 'rearm' }, { check_on_pass: 'rearm', check_every: 'next tuesday' }]) {
+    const broken = card(fm);
+    const payload = finalizePayload(verdictRun(broken, 'Green.\nVERDICT: PASS'), broken);
+    assert.equal(payload.status, 'review');
+    assert.equal(payload.clearCheckAfter, true);
+    assert.equal('checkAfter' in payload, false);
+    assert.match(payload.message, /on-pass is rearm but check_every/);
+  }
+});
+
+test('fail, unsure and a missing verdict all keep today behaviour on every card', () => {
+  for (const onPass of [{}, { check_on_pass: 'done' }, { check_on_pass: 'rearm', check_every: '+7d' }]) {
+    const task = card(onPass);
+    const cases = [
+      ['Seed 3 timed out.\nVERDICT: FAIL — not safe to ramp', /\(VERDICT fail\)/],
+      ['Could not reach staging.\nVERDICT: UNSURE — no access', /\(VERDICT unsure\)/],
+      ['I ran the recipe and it seemed fine.', /\(no VERDICT line; treated as unsure\)/],
+    ];
+    for (const [resultText, note] of cases) {
+      const payload = finalizePayload(verdictRun(task, resultText), task);
+      assert.equal(payload.status, 'review', resultText);
+      assert.equal(payload.clearCheckAfter, true, resultText);
+      assert.equal('checkAfter' in payload, false, 'a card is never re-armed on anything but a pass');
+      assert.match(payload.message, note);
+    }
+  }
+});
+
+test('a card that moved under a re-arming check keeps its own schedule', () => {
+  const start = card({ check_on_pass: 'rearm', check_every: '+7d' });
+  const now = structuredClone(start);
+  now.body = `${start.body}\n\n## 2026-09-11 12:00 — check-in → waiting\nRescheduled by hand.`;
+  const payload = finalizePayload(verdictRun(start, 'Green.\nVERDICT: PASS'), now);
+  assert.equal('status' in payload, false);
+  assert.equal('clearCheckAfter' in payload, false);
+  assert.equal('checkAfter' in payload, false, 'a preserved schedule is not re-armed either');
+
+  const stale = pendingCheckin(
+    finalizePayload(verdictRun(start, 'Green.\nVERDICT: PASS'), start),
+    now,
+  );
+  assert.equal(stale.stale, true);
+  assert.equal('checkAfter' in stale.checkin, false, 'a queued re-arm cannot apply after a newer action');
+  assert.match(stale.checkin.message, /card changed after this result was queued/);
+});
+
+test('a check prompt states the verdict contract and what a pass does to this card', () => {
+  const legacy = buildPrompt(card(), 'check');
+  assert.match(legacy, /VERDICT: PASS\|FAIL\|UNSURE/);
+  assert.match(legacy, /do NOT run `keep checkin`/, 'the daemon lands the result, not the run');
+  assert.match(legacy, /PASS means every gate in the recipe held/);
+  assert.match(legacy, /a PASS will send it to Owner review/);
+
+  assert.match(buildPrompt(card({ check_on_pass: 'done' }), 'check'), /a PASS will close the card/);
+  const recurring = buildPrompt(card({ check_on_pass: 'rearm', check_every: '+7d' }), 'check');
+  assert.match(recurring, /a PASS will keep it waiting and re-arm the check for \+7d/);
+  // A rearm the finalizer cannot honour must not promise the run a re-arm either.
+  assert.match(buildPrompt(card({ check_on_pass: 'rearm' }), 'check'), /a PASS will send it to Owner review/);
+});
+
+test('an escalated check is told what the probe already saw', () => {
+  const prompt = buildPrompt(card(), 'check', undefined, {
+    probe: { code: 3, ms: 412, output: 'recorder: 2 segments missing', timedOut: false },
+  });
+  assert.match(prompt, /probe for this card just failed \(exit 3, 412 ms\)/);
+  assert.match(prompt, /recorder: 2 segments missing/);
+  assert.match(prompt, /the recipe below is the fuller check/);
+  assert.match(prompt, /Diagnose why[\s\S]*Execute this check recipe now/, 'the probe context comes before the recipe');
+  assert.match(
+    buildPrompt(card(), 'check', undefined, { probe: { code: 124, ms: 120000, output: '', timedOut: true } }),
+    /exit 124, timed out, 120000 ms[\s\S]*Its output tail: \(no output\)/,
+  );
+  assert.doesNotMatch(buildPrompt(card(), 'check'), /deterministic probe/);
+});
+
+test('an on-pass done card tells a live thread it may close the card itself', () => {
+  const message = checkDeliveryMessage(card({ check_on_pass: 'done' }));
+  assert.match(message, /declares on-pass: done/);
+  assert.match(message, /--status done --clear-check-after/);
+  assert.ok(message.length <= 2000);
+  assert.ok(message.endsWith('Full card: keep show some-card.'));
+  const wide = checkDeliveryMessage(card({ check_on_pass: 'done', check: 'inspect the rollout '.repeat(300) }));
+  assert.ok(wide.length <= 2000);
+  assert.ok(wide.endsWith('Full card: keep show some-card.'), 'the on-pass sentence never crowds out the card id');
+  assert.doesNotMatch(checkDeliveryMessage(card()), /on-pass/);
+});
+
+// ---------- deterministic probes ----------
+
+const probeCard = (over = {}) => card({ probe: 'exit 0', project: os.tmpdir(), ...over });
+
+test('a passing probe lands a check-in and applies the card on-pass action', () => {
+  const result = { ok: true, code: 0, ms: 42, output: 'segments: 0 missing\n', timedOut: false };
+
+  const legacy = probePayload(probeCard(), result);
+  assert.equal(legacy.heading, 'probe result');
+  assert.equal(legacy.linkSession, false);
+  assert.equal(legacy.commitLabel, 'check');
+  assert.equal(legacy.status, 'review');
+  assert.equal(legacy.clearCheckAfter, true);
+  assert.equal(legacy.message, 'probe passed (42ms): segments: 0 missing');
+
+  const closed = probePayload(probeCard({ check_on_pass: 'done' }), result);
+  assert.equal(closed.status, 'done');
+  assert.equal(closed.clearCheckAfter, true);
+  assert.match(closed.message, /closed as declared by on-pass: done/);
+
+  const rearmed = probePayload(probeCard({ check_on_pass: 'rearm', check_every: '+1d' }), result);
+  assert.equal(rearmed.status, 'waiting');
+  assert.equal(rearmed.checkAfter, '+1d');
+  assert.equal(rearmed.clearCheckAfter, false);
+  assert.match(rearmed.message, /re-armed every \+1d/);
+
+  const quiet = probePayload(probeCard(), { ...result, output: '' });
+  assert.match(quiet.message, /probe passed \(42ms\): \(no output\)/);
+});
+
+test('a failing probe always goes to Owner review, whatever the card declared', () => {
+  for (const declared of [{}, { check_on_pass: 'done' }, { check_on_pass: 'rearm', check_every: '+1d' }]) {
+    const payload = probePayload(probeCard(declared), {
+      ok: false, code: 3, ms: 900, output: 'recorder: 2 segments missing', timedOut: false,
+    });
+    assert.equal(payload.status, 'review');
+    assert.equal(payload.clearCheckAfter, true);
+    assert.equal('checkAfter' in payload, false);
+    assert.equal(payload.message, 'probe FAILED (exit 3, 900ms): recorder: 2 segments missing');
+  }
+  const timedOut = probePayload(probeCard(), { ok: false, code: 124, ms: 200, output: '', timedOut: true });
+  assert.equal(timedOut.message, 'probe FAILED (exit 124, timed out, 200ms): (no output)');
+});
+
+const probeOnce = (task, timeoutMs) => new Promise((resolve) => { startProbe(task, resolve, timeoutMs); });
+
+test('the async probe runner reports exit code, output tail and duration', async () => {
+  const passed = await probeOnce(probeCard({ probe: 'echo healthy; echo "to stderr" >&2' }));
+  assert.equal(passed.ok, true);
+  assert.equal(passed.code, 0);
+  assert.equal(passed.timedOut, false);
+  assert.match(passed.output, /healthy/);
+  assert.match(passed.output, /to stderr/, 'stderr is part of the tail too');
+  assert.ok(Number.isFinite(passed.ms));
+
+  const failed = await probeOnce(probeCard({ probe: 'echo "2 segments missing"; exit 3' }));
+  assert.equal(failed.ok, false);
+  assert.equal(failed.code, 3);
+  assert.equal(failed.timedOut, false);
+  assert.match(failed.output, /2 segments missing/);
+});
+
+test('a probe that hangs is killed with its process group and reported as timed out', async () => {
+  const started = Date.now();
+  const result = await probeOnce(probeCard({ probe: 'sleep 5' }), 200);
+  assert.equal(result.ok, false);
+  assert.equal(result.timedOut, true);
+  assert.ok(Date.now() - started < 4000, 'the runner does not wait out the command');
+});
+
+test('the probe output tail is bounded', async () => {
+  const result = await probeOnce(probeCard({ probe: 'for i in $(seq 1 400); do echo "line $i"; done' }));
+  assert.equal(result.ok, true);
+  assert.ok(result.output.length <= 500, `tail was ${result.output.length} chars`);
+  assert.match(result.output, /line 400$/);
 });

@@ -1621,3 +1621,118 @@ test('artifact copies files into a committed per-card directory and logs the dur
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('a card can declare what a pass means and it round-trips through the frontmatter', () => {
+  const f = schedulerFixture();
+  try {
+    const added = f.run(['add', 'Recorder health', '--check-after', '+1h', '--check', 'confirm the recorder wrote every segment',
+      '--check-every', '+7d', '--probe', 'test -f /tmp/recorder.ok', '--status', 'waiting']);
+    assert.equal(added.status, 0, added.stderr);
+    const text = f.read('recorder-health');
+    // --check-every alone says what the author meant: keep re-arming this check.
+    assert.match(text, /^check_on_pass: rearm$/m);
+    assert.match(text, /^check_every: \+7d$/m);
+    assert.match(text, /^probe: test -f \/tmp\/recorder\.ok$/m);
+    const { parseTask, serializeTask } = require('./keep.js');
+    const parsed = parseTask(text, 'recorder-health');
+    assert.equal(parsed.fm.check_on_pass, 'rearm');
+    assert.equal(parsed.fm.check_every, '+7d');
+    assert.equal(parsed.fm.probe, 'test -f /tmp/recorder.ok');
+    assert.equal(serializeTask(parsed), text);
+
+    const shown = f.run(['show', 'recorder-health']);
+    assert.equal(shown.status, 0, shown.stderr);
+    assert.match(shown.stdout, /^ {2}on pass: re-arm every \+7d$/m);
+    assert.match(shown.stdout, /^ {2}probe: test -f \/tmp\/recorder\.ok$/m);
+
+    // done/review are one-shot, so the interval goes with the declaration that needed it.
+    assert.equal(f.run(['checkin', 'recorder-health', '-m', 'One-shot now.', '--on-pass', 'done']).status, 0);
+    const closed = f.read('recorder-health');
+    assert.match(closed, /^check_on_pass: done$/m);
+    assert.doesNotMatch(closed, /^check_every:/m);
+    assert.match(f.run(['show', 'recorder-health']).stdout, /^ {2}on pass: done$/m);
+
+    assert.equal(f.run(['checkin', 'recorder-health', '-m', 'Probe retired.', '--probe', '']).status, 0);
+    assert.doesNotMatch(f.read('recorder-health'), /^probe:/m);
+    assert.doesNotMatch(f.run(['show', 'recorder-health']).stdout, /^ {2}probe:/m);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('an on-pass declaration is refused when nothing could honour it', () => {
+  const f = schedulerFixture();
+  try {
+    const noInterval = f.run(['add', 'No interval', '--check-after', '+1h', '--check', 'look', '--on-pass', 'rearm']);
+    assert.equal(noInterval.status, 1);
+    assert.match(noInterval.stderr, /--on-pass rearm needs --check-every/);
+
+    const badGrammar = f.run(['add', 'Bad grammar', '--check-after', '+1h', '--check', 'look', '--check-every', 'weekly']);
+    assert.equal(badGrammar.status, 1);
+    assert.match(badGrammar.stderr, /\+<n><m\|h\|d\|w>/);
+
+    const tooSoon = f.run(['add', 'Too soon', '--check-after', '+1h', '--check', 'look', '--check-every', '+5m']);
+    assert.equal(tooSoon.status, 1);
+    assert.match(tooSoon.stderr, /at least \+10m/);
+
+    const nothingToRun = f.run(['add', 'Nothing to run', '--check-after', '+1h', '--check-every', '+1d']);
+    assert.equal(nothingToRun.status, 1);
+    assert.match(nothingToRun.stderr, /nothing can run on the interval/);
+
+    const bogus = f.run(['add', 'Bogus', '--check-after', '+1h', '--check', 'look', '--on-pass', 'close']);
+    assert.equal(bogus.status, 1);
+    assert.match(bogus.stderr, /--on-pass must be one of: done, rearm, review/);
+
+    // A probe is a runnable recipe for this rule — which is what lets an experiment
+    // re-arm on a deterministic gate with no prose recipe at all.
+    const probeOnly = f.run(['add', 'Probe only', '--kind', 'experiment', '--check-after', '+1h',
+      '--probe', 'exit 0', '--check-every', '+1d', '--status', 'waiting']);
+    assert.equal(probeOnly.status, 0, probeOnly.stderr);
+    assert.match(f.read('probe-only'), /^check_on_pass: rearm$/m);
+
+    // The rule looks at the card as it will be saved, not just at the flags.
+    const stranded = f.run(['checkin', 'probe-only', '-m', 'Dropping the probe.', '--probe', '']);
+    assert.equal(stranded.status, 1);
+    assert.match(stranded.stderr, /nothing can run on the interval/);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('keep probe runs the card command, reports it, and exits on its code', () => {
+  const f = schedulerFixture();
+  try {
+    assert.equal(f.run(['add', 'Green probe', '--check-after', '+1h', '--probe', 'echo healthy']).status, 0);
+    const passed = f.run(['probe', 'green-probe']);
+    assert.equal(passed.status, 0, passed.stderr);
+    assert.match(passed.stdout, /^echo healthy$/m);
+    assert.match(passed.stdout, /^healthy$/m);
+    assert.match(passed.stdout, /^probe passed \(\d+ms\)$/m);
+    // A probe is a reading, not a check-in: nothing lands on the card.
+    assert.doesNotMatch(f.read('green-probe'), /probe passed/);
+
+    assert.equal(f.run(['add', 'Red probe', '--check-after', '+1h', '--probe', 'echo "2 segments missing"; exit 3']).status, 0);
+    const failed = f.run(['probe', 'red-probe']);
+    assert.equal(failed.status, 1);
+    assert.match(failed.stdout, /^2 segments missing$/m);
+    assert.match(failed.stdout, /^probe FAILED \(exit 3, \d+ms\)$/m);
+
+    assert.equal(f.run(['add', 'No probe', '--check-after', '+1h', '--check', 'look at it']).status, 0);
+    const missing = f.run(['probe', 'no-probe']);
+    assert.equal(missing.status, 1);
+    assert.match(missing.stderr, /no-probe has no probe/);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('help lists the on-pass, check-every and probe flags', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-probe-help-'));
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+    const help = spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'help'], {
+      encoding: 'utf8', env: { ...process.env, KEEP_DIR: root },
+    });
+    assert.equal(help.status, 0, help.stderr);
+    assert.match(help.stdout, /--on-pass done\|rearm\|review/);
+    assert.match(help.stdout, /--check-every \+7d/);
+    assert.match(help.stdout, /--probe "cmd"/);
+    assert.match(help.stdout, /keep probe <id>/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

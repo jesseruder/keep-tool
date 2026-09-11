@@ -34,9 +34,22 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   runs headless only when no linked session is open, or when one stays busy through the
   deferral limit. Headless Keep runs disable the Codex plugin by default; set
   `KEEP_HEADLESS_DISABLED_PLUGINS` to a comma-separated plugin list, or empty to opt out.
-  `--check-after` on its own, with no `--check`, schedules nothing
+  `--check-after` on its own, with no `--check` and no `--probe`, schedules nothing
   — it only makes the card show up in `keep overdue`. Run one early with
   `keep verify <id>`.
+  Say what a pass means, so a green check does not sit in Owner's review queue with
+  nothing to decide: `--on-pass done` closes the card, `--on-pass rearm --check-every
+  +7d` keeps it waiting and re-arms the check from now (minimum `+10m`; `--check-every`
+  alone implies `rearm`), and the default is Owner review. A check run must end its
+  final message with `VERDICT: PASS|FAIL|UNSURE — <one sentence>`; that line is parsed
+  and decides the card, so anything but PASS goes to review. Recurring checks always run
+  headless — they are never delivered into a thread.
+  `--probe "<cmd>"` is better than a recipe whenever the check is really a shell
+  assertion: a read-only one-liner whose exit code decides the card with no model
+  session at all. Use absolute paths (`/opt/homebrew/bin/...`) — the daemon's shell may
+  not have Homebrew on PATH — and keep it read-only. A failing probe escalates to the
+  `--check` recipe when the card has one, and otherwise lands for Owner review. Run it
+  by hand any time with `keep probe <id>` (exit 1 = failed; it lands no check-in).
   The daemon polls due recipes every minute (not every ten minutes); busy sessions
   retain approximately two hours of default deferral before headless fallback.
   Scheduling with `--check-after` records a turn-scoped waiting handoff for the

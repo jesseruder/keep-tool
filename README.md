@@ -29,7 +29,9 @@ agent sessions your Keep tracks across your projects.
 - **Make follow-up work executable.** Give a task a time and a check recipe, such as
   “check the experiment tomorrow and report whether it has enough samples.” Keep
   attempts to deliver the recipe to the associated session when it is available,
-  or runs it in a headless agent when needed.
+  or runs it in a headless agent when needed. A task can also say what a passing
+  check means — close it, re-check it every week, or ask you — and give a one-line
+  shell probe whose exit code decides the check with no agent at all.
 - **Coordinate dependent work.** Record that one task depends on another task or a
   particular plan step. When that dependency is satisfied, Keep notifies the
   waiting session so it can continue. Secrets, sign-ins, and other things only

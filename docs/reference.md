@@ -36,8 +36,10 @@ registry data or credentials to the public source repository.
 
 ```
 keep add "title" [--kind task|experiment|idea|chore|bug] [--tag t]… [--project p]
-                 [--plan "step"…] [--check-after when] [--check "recipe"] [--status s] [-m note]
-keep checkin <id> -m "state + next step" [--next "text"] [--commit <sha>]... [--step <n|next>] [--status s] [--check-after when] [--check "recipe"] [--clear-check-after] [--handoff waiting|needs-input]
+                 [--plan "step"…] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review]
+                 [--check-every +7d] [--probe "cmd"] [--status s] [-m note]
+keep checkin <id> -m "state + next step" [--next "text"] [--commit <sha>]... [--step <n|next>] [--status s] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"] [--clear-check-after] [--handoff waiting|needs-input]
+keep probe <id>
 keep plan <id> [--set "step"… | --add "text" | --insert <n> "text" | --remove <n>
                 | --done <n> | --start <n> | --undo <n>]
 keep list [--status s]… [--tag t] [--project p] [--overdue] [--brief] [--all]
@@ -116,7 +118,7 @@ Statuses: `inbox → active → waiting/blocked → review/landing → done`. `w
 `check_after` or an unresolved `depends_on` entry; `review` means the ball is in the owner's
 court with an artifact to look at.
 Experiments (`kind: experiment`) must have a `check_after` and a `check` recipe
-an agent can execute cold.
+an agent can execute cold, or a `probe` — a shell command whose exit code decides it.
 
 Scheduled recipes are polled every minute. `--check-after` plus a recipe records a
 turn-scoped waiting handoff; add `--handoff needs-input` when scheduling and also
@@ -532,6 +534,33 @@ Keep still stamps it as delivered to avoid typing the prompt twice, then adds a
 the full recipe remains available through `keep show <id>`.
 
 If a headless check or task changes its card's status, its finalizer records the result without overriding that status or clearing the scheduled check.
+
+A check run must end its final message with `VERDICT: PASS|FAIL|UNSURE — <one sentence>`;
+the last such line decides the card. What a PASS means is the card's own declaration,
+`check_on_pass`: `done` closes the card, `rearm` keeps it `waiting` and re-arms
+`check_after` to now plus `check_every` (relative grammar, minimum `+10m`, set with
+`--check-every`, which implies `--on-pass rearm`), and `review` — or no declaration at
+all, which is every older card — sends it to Owner review and clears the schedule. FAIL,
+UNSURE and a missing verdict always go to review. A `rearm` card whose `check_every` is
+missing or unparsable falls back to review with a note saying so. Re-arming is measured
+from now, not from the missed date, so a daemon outage cannot queue a catch-up storm.
+
+A card may also carry a `probe`: a one-line read-only shell command (≤ 400 chars) run
+with `$SHELL -c` in the card's project, `KEEP_PROBE=1`, and a `KEEP_PROBE_TIMEOUT_MS`
+(default 120000) budget. When such a card comes due the daemon runs the probe
+asynchronously instead of spending a model session: exit 0 lands a `probe result`
+check-in and applies the on-pass action directly, and a non-zero exit or timeout
+escalates to the check recipe (the run is told what the probe saw) or, if the card has
+no recipe, lands the failure for Owner review. The same schedule is not re-probed more
+often than every ten minutes, and a card whose fingerprint changed while the probe ran
+keeps its status and schedule. Run one by hand with `keep probe <id>` — same execution
+semantics, no check-in, no daemon, exit 1 when it fails.
+
+Cards that skip thread delivery entirely: anything with a `probe`, and any recurring
+(`check_on_pass: rearm`) recipe card. Both go straight to the daemon, because neither
+needs the scheduling thread's context and a thread cannot be relied on to re-arm an
+interval by hand. A card declaring `on-pass: done` that is delivered to a thread is told
+it may close the card itself with `--status done --clear-check-after`.
 
 Before delivering to a cold, large thread, Keep runs `/compact` and waits for its
 transcript marker or Claude Code's on-screen completion line and returned prompt.
