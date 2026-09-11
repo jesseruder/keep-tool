@@ -17,13 +17,19 @@ function reviewerFlags(model) {
   return ['--model', String(model || 'fable'), '--settings', JSON.stringify(REVIEWER_SETTINGS)];
 }
 
-function reviewerEnv(root, family) {
+// `bashOutput` is the limit this reviewer was actually launched with, recorded in the
+// pane meta: a restart must not silently swap in the daemon's own environment.
+function reviewerBashOutput(bashOutput) {
+  return String(bashOutput || process.env.KEEP_REVIEWER_BASH_OUTPUT || REVIEWER_BASH_OUTPUT_CHARS);
+}
+
+function reviewerEnv(root, family, bashOutput) {
   return {
     KEEP_DIR: root, KEEP_CONFIG: require('./config').configFile(), KEEP_REVIEWER: '1',
     KEEP_REVIEWER_NAME: String(family || 'fable'), KEEP_REVIEWER_MODEL: String(family || 'fable'),
     // Claude Code truncates a Bash result at ~30k chars by default; a five-card
     // review bundle is built to a 40k-token total budget and must land in one read.
-    BASH_MAX_OUTPUT_LENGTH: process.env.KEEP_REVIEWER_BASH_OUTPUT || REVIEWER_BASH_OUTPUT_CHARS,
+    BASH_MAX_OUTPUT_LENGTH: reviewerBashOutput(bashOutput),
   };
 }
 
@@ -40,11 +46,15 @@ async function launch(args, root, deps = {}) {
       cmd: '/bin/zsh', args: ['-lic', `exec ${argv.map(quote).join(' ')}`],
       cwd: root, cols: 200, rows: 50,
       env: reviewerEnv(root, family),
-      meta: { agent: 'claude', reviewer: true, sessionId, project: root, launchedAt: Date.now() },
+      // The marker keeps only the family (the budget governor matches on it), so the
+      // exact model and Bash limit this pane was launched with are recorded here —
+      // a restart resumes from them rather than unfreezing a deliberately pinned id.
+      meta: { agent: 'claude', reviewer: true, sessionId, project: root, launchedAt: Date.now(),
+        reviewerModel: model, reviewerBashOutput: reviewerBashOutput() },
     });
     if (!pane?.id) throw new Error('terminal host did not return a reviewer pane');
     return { pane: pane.id, sessionId, model };
   } finally { client.close(); }
 }
 
-module.exports = { launch, reviewerFlags, reviewerEnv, REVIEWER_BASH_OUTPUT_CHARS };
+module.exports = { launch, reviewerFlags, reviewerEnv, reviewerBashOutput, REVIEWER_BASH_OUTPUT_CHARS };

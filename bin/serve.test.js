@@ -4091,7 +4091,8 @@ test('restarting the fleet reviewer keeps its identity, its launch env, and its 
   try {
     const session = { id: 'rev', kind: 'claude', state: 'idle', endedTurn: true, reviewer: true, project: root };
     let pane = { id: 'p', pid: 10, cmd: '/bin/zsh', args: ['-l'], alive: true, attached: 0, visibleAttached: 0,
-      cols: 200, rows: 50, meta: { sessionId: 'rev', agent: 'claude', reviewer: true, title: 'fable-fleet-reviewer' } };
+      cols: 200, rows: 50, meta: { sessionId: 'rev', agent: 'claude', reviewer: true, title: 'fable-fleet-reviewer',
+        reviewerModel: 'claude-fable-20260101', reviewerBashOutput: '250000' } };
     const row = { pid: 11, ppid: 10, pidStart: 'Tue Sep  8 10:00:00 2026', agent: 'claude', interactive: true, args: '/test/claude --resume rev' };
     let exited = false, replaced = null;
     const deps = {
@@ -4113,6 +4114,7 @@ test('restarting the fleet reviewer keeps its identity, its launch env, and its 
         replaced = params; pane = { ...pane, alive: true, pid: 20 }; return { pane };
       } },
     };
+    const reviewerSpecFlags = require('./reviewer-launch').reviewerFlags('claude-fable-20260101');
     const result = await restartSession({ sessionId: 'rev', pane: 'p', pid: 10, mode: 'now' }, deps);
     assert.equal(result.sessionId, 'rev');
     // The resumed process is the reviewer again, not a nameless claude session: the
@@ -4120,12 +4122,26 @@ test('restarting the fleet reviewer keeps its identity, its launch env, and its 
     assert.equal(replaced.env.KEEP_REVIEWER, '1');
     assert.equal(replaced.env.KEEP_REVIEWER_NAME, 'fable');
     assert.equal(replaced.env.KEEP_DIR, root);
-    assert.ok(Number(replaced.env.BASH_MAX_OUTPUT_LENGTH) >= 200000, 'a five-card bundle must still land in one Bash read');
-    assert.match(replaced.args[1], /'--model' 'fable'/);
+    // The exact launch model and Bash limit come back, not the family and not the
+    // daemon's own environment: a deliberately pinned id must not be unfrozen.
+    assert.equal(replaced.env.BASH_MAX_OUTPUT_LENGTH, '250000');
+    assert.equal(replaced.env.KEEP_REVIEWER_MODEL, 'fable', 'the budget governor still matches on the family');
+    assert.match(replaced.args[1], /'--model' 'claude-fable-20260101'/);
     assert.match(replaced.args[1], /promptSuggestionEnabled/);
     assert.match(replaced.args[1], /'--resume' 'rev'/);
     assert.equal(replaced.meta.reviewer, true, 'the pane stays the reviewer pane');
     assert.equal(replaced.meta.sessionId, 'rev');
+
+    // The explicit force/recover transaction resumes through its own code path; it
+    // must rebuild the same reviewer configuration, not a bare `claude --resume`.
+    const { reviewerResumeSpec } = require('./serve');
+    const forceDeps = { root, reviewerMarker: () => ({ name: 'fable', model: 'fable' }) };
+    const forced = reviewerResumeSpec(true, 'rev', replaced.meta, forceDeps);
+    assert.deepEqual(forced.flags, reviewerSpecFlags);
+    assert.equal(forced.env.KEEP_REVIEWER, '1');
+    assert.equal(forced.env.BASH_MAX_OUTPUT_LENGTH, '250000');
+    assert.deepEqual(reviewerResumeSpec(false, 'rev', replaced.meta, forceDeps), { flags: [], env: null },
+      'a non-reviewer pane never picks up KEEP_REVIEWER');
 
     // Tick address: session-end tombstoned the marker, and the resumed process's
     // session-start hook un-tombstones it, so the scheduler aims at it again.

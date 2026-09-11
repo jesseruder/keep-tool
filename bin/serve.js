@@ -2589,6 +2589,24 @@ async function closeRestartShell(original, session, originalAgentPid, deps) {
   return true;
 }
 
+// One reviewer-aware resume spec for both restart transactions — the guarded restart
+// and the explicit force/recover path. A bare `claude --resume` inherits none of the
+// launch configuration, so rebuild it from the pane meta the launcher recorded plus
+// the .keep/reviewer marker: without this the reviewer comes back nameless, on the
+// wrong model, with prompt suggestions on and a 30k Bash cap that truncates every
+// five-card bundle. The marker itself survives on its own (session-end tombstones it,
+// the resumed process's session-start hook un-tombstones it).
+function reviewerResumeSpec(isReviewer, sessionId, meta, deps = {}) {
+  if (!isReviewer) return { flags: [], env: null };
+  const marker = (deps.reviewerMarker || review.readReviewerMarker)(sessionId) || {};
+  const family = marker.model || marker.name || 'fable';
+  const launch = require('./reviewer-launch');
+  return {
+    flags: launch.reviewerFlags(meta?.reviewerModel || family),
+    env: launch.reviewerEnv(deps.root || keep.ROOT, family, meta?.reviewerBashOutput),
+  };
+}
+
 async function restartSession(body, deps = {}) {
   const host = (type, params) => hostRequest(type, params, deps);
   let exitInputStarted = false;
@@ -2675,21 +2693,12 @@ async function restartSession(body, deps = {}) {
     // Do not apply the fresh-session defaults to a previously restricted agent.
     const bypass = session.kind === 'codex' ? '--dangerously-bypass-approvals-and-sandbox' : '--dangerously-skip-permissions';
     const flags = originalArgs.split(/\s+/).includes(bypass) ? [bypass] : [];
-    // A reviewer must come back as the reviewer. The .keep/reviewer marker survives on
-    // its own (session-end tombstones it, the session-start hook of the resumed process
-    // un-tombstones it, and the tick addresses the session id, not the pid), but a bare
-    // `claude --resume` inherits neither the launch flags nor the env that carry the
-    // rest of its identity: its model, its silenced prompt suggestions, KEEP_REVIEWER,
-    // and the Bash output budget a five-card bundle needs. Rebuild them from the marker.
-    const reviewerLaunch = require('./reviewer-launch');
-    const reviewerMarker = pane.meta?.reviewer || session.reviewer
-      ? (deps.reviewerMarker || review.readReviewerMarker)(session.id) : null;
-    const reviewerModel = reviewerMarker && (reviewerMarker.model || reviewerMarker.name || 'fable');
-    const argv = [session.kind, ...flags, ...(reviewerMarker ? reviewerLaunch.reviewerFlags(reviewerModel) : []),
+    const reviewerSpec = reviewerResumeSpec(Boolean(pane.meta?.reviewer || session.reviewer), session.id, pane.meta, deps);
+    const argv = [session.kind, ...flags, ...reviewerSpec.flags,
       session.kind === 'codex' ? 'resume' : '--resume', session.id];
     const result = await host('replace-exited', { paneId: pane.id, expectedPid: pane.pid, sessionId: stopped.meta?.sessionId,
       cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').command(argv)}`], cwd,
-      ...(reviewerMarker ? { env: reviewerLaunch.reviewerEnv(deps.root || keep.ROOT, reviewerModel) } : {}),
+      ...(reviewerSpec.env ? { env: reviewerSpec.env } : {}),
       cols: pane.cols, rows: pane.rows, meta: { ...pane.meta, agent: session.kind, sessionId: session.id, restartedAt: Date.now() } });
     await (deps.waitForHostAgent || waitForHostAgent)({ pane: pane.id }, session.kind, deps);
     return { ok: true, sessionId: session.id, pane: result.pane.id, pid: result.pane.pid };
@@ -2737,7 +2746,9 @@ async function forceRestartSession(entry, save, deps = {}) {
       sessionLive: async sid => (await liveSessionPids({ ...deps, agentProcessRows: rows })).has(sid),
       replace: async (original, job, expectedPid) => {
         const bypass = original.agent === 'codex' ? '--dangerously-bypass-approvals-and-sandbox' : '--dangerously-skip-permissions';
-        const argv = [original.agent, ...(original.bypass ? [bypass] : []), original.agent === 'codex' ? 'resume' : '--resume', job.sessionId];
+        const reviewerSpec = reviewerResumeSpec(Boolean(original.meta?.reviewer), job.sessionId, original.meta, deps);
+        const argv = [original.agent, ...(original.bypass ? [bypass] : []), ...reviewerSpec.flags,
+          original.agent === 'codex' ? 'resume' : '--resume', job.sessionId];
         const stopped = (await host('get', { pane: job.pane })).pane;
         if (stopped.alive || stopped.pid !== expectedPid || (stopped.meta?.sessionId !== job.sessionId
           && !(stopped.meta?.agent === 'shell' && !stopped.meta.sessionId
@@ -2746,6 +2757,7 @@ async function forceRestartSession(entry, save, deps = {}) {
         }
         const result = await host('replace-exited', { paneId: job.pane, expectedPid, sessionId: stopped.meta?.sessionId,
           cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').command(argv)}`], cwd: original.cwd,
+          ...(reviewerSpec.env ? { env: reviewerSpec.env } : {}),
           cols: original.cols, rows: original.rows, meta: { ...original.meta, forceRestartToken: job.token, restartedAt: Date.now() } });
         return { ok: true, pane: result.pane.id, pid: result.pane.pid, sessionId: job.sessionId };
       },
@@ -5679,6 +5691,7 @@ module.exports = {
   claudeTypedTextVisible,
   closeIdleSession,
   restartSession,
+  reviewerResumeSpec,
   forceRestartSession,
   applyHostedExitState,
   closeExitedCodexShell,

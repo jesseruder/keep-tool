@@ -664,9 +664,12 @@ The console's Fleet reviewer header has a **Restart** button beside `Tick now` a
 in the guarded `idle` mode: the restart queues until the reviewer's turn has ended and
 nobody is viewing its pane, and stays cancellable while it waits. The button is
 disabled when there is no live reviewer pane. Because `claude --resume` inherits none
-of the launch environment, the restart rebuilds the reviewer's flags (`--model`, the
-prompt-suggestion settings) and env (`KEEP_REVIEWER`, `KEEP_DIR`,
-`BASH_MAX_OUTPUT_LENGTH`) from the marker, the pane keeps `meta.reviewer`, and the
+of the launch environment, both restart transactions (the guarded one and the explicit
+force/recover path) rebuild the reviewer's flags (`--model`, the prompt-suggestion
+settings) and env (`KEEP_REVIEWER`, `KEEP_DIR`, `BASH_MAX_OUTPUT_LENGTH`) from the
+`.keep/reviewer` marker plus the pane meta the launcher recorded — so a deliberately
+pinned model id and a `KEEP_REVIEWER_BASH_OUTPUT` override come back as launched, not
+as the family and the daemon's own environment. The pane keeps `meta.reviewer`, and the
 resumed process's session-start hook un-tombstones the marker so ticks resume against
 the same session id.
 
