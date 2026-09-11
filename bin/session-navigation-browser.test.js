@@ -18,6 +18,7 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
   let summaryText = 'Fixture summary';
   let holdNextState = false;
   let releaseHeldState = null;
+  let nextStateMarker = null;
   const sessions = ['a', 'b'].map((id) => ({ id, kind: 'claude', title: `Session ${id}`, project: '/tmp/history-fixture', taskId: `card-${id}`, pane: `p${id}`, mtime: Date.now(), state: 'running', endedTurn: false }));
   const panes = sessions.map((s, i) => ({ id: s.pane, pid: 100 + i, alive: true, meta: { agent: 'claude', sessionId: s.id } }));
   const layouts = [{ name: 'Pinned', role: 'pinned', ids: ['pa', 'pb'], cols: 2 }];
@@ -38,6 +39,13 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
         await new Promise((resolve) => { releaseHeldState = resolve; });
         releaseHeldState = null;
         res.end(snapshot); return;
+      }
+      if (url.pathname === '/api/state' && nextStateMarker) {
+        const marker = nextStateMarker;
+        nextStateMarker = null;
+        res.end(JSON.stringify({ ...state, health: {
+          ...state.health, daemon: { running: true, pid: marker }, schedulers: [],
+        } })); return;
       }
       if (url.pathname === '/api/setaside') {
         let body = ''; for await (const chunk of req) body += chunk;
@@ -364,6 +372,12 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     await wait("document.querySelector('#health .pop')?.textContent.includes('held-state-applied')");
     assert.equal(await evaluate("document.querySelector('#stage').dataset.pane"), 'shell1', 'a state response captured before spawn cannot replace the new terminal');
     assert.notEqual(await evaluate("document.querySelector('#qlist .qitem.sel')?.dataset.key"), 'recent:recent:undefined:undefined');
+    panes.splice(panes.findIndex((pane) => pane.id === 'shell1'), 1);
+    nextStateMarker = 'authoritative-absent-state';
+    for (const client of eventClients) client.write('data: changed\n\n');
+    await wait("document.querySelector('#health .pop')?.textContent.includes('authoritative-absent-state')");
+    assert.notEqual(await evaluate("document.querySelector('#stage').dataset.pane"), 'shell1', 'a later authoritative absence removes the optimistic pane');
+    assert.equal(await evaluate("document.querySelector('#qlist [data-key=\"pinned:shell1\"]')"), null);
     assert.equal(await evaluate("document.querySelector('.qfocus').getAttribute('aria-pressed')"), 'false', 'new shell leaves waiting-only Focus mode');
     await evaluate("document.querySelector('[data-mode=watch]').click(); document.querySelector('#spawnShell').click()");
     await wait("document.activeElement?.closest('.wpane')?.dataset.pane === 'shell2'");

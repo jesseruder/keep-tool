@@ -464,10 +464,10 @@ async function startShell(cwd, name) {
   const known = data.panes.find((pane) => pane.id === result.pane.id);
   if (known) Object.assign(known, result.pane);
   else data.panes.push(result.pane);
-  // A state request can have captured its pane list before this spawn and
-  // finish afterwards. Keep the successful spawn authoritative until a later
-  // state snapshot observes it, so that response cannot erase the new terminal.
-  spawnedPanes.set(result.pane.id, result.pane);
+  // State requests already underway can have captured their pane list before
+  // this spawn and finish afterwards. Keep the successful spawn authoritative
+  // through those reloads; a later reload may confirm or remove it normally.
+  spawnedPanes.set(result.pane.id, { pane: result.pane, throughGeneration: reloadGeneration });
   return result.pane;
 }
 async function reopenSession({ sessionId, taskId, agent, title, stalePane }) {
@@ -745,9 +745,10 @@ async function reload() {
     if (generation < appliedReloadGeneration) return;
     appliedReloadGeneration = generation;
     data = nextData;
-    for (const [id, pane] of spawnedPanes) {
+    for (const [id, pending] of spawnedPanes) {
       if ((data.panes || []).some((candidate) => candidate.id === id)) spawnedPanes.delete(id);
-      else data.panes = [...(data.panes || []), pane];
+      else if (generation <= pending.throughGeneration) data.panes = [...(data.panes || []), pending.pane];
+      else spawnedPanes.delete(id);
     }
     closingSessions.reconcile(data);
     void refreshProjectChoices();
