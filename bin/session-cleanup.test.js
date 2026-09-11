@@ -100,10 +100,13 @@ test('automatic scheduler audits refusals and submissions, throttles attempts, a
   let now = Date.now(), release;
   const gate = new Promise((resolve) => { release = resolve; });
   const sessions = ['ok', 'refused', 'viewed'].map((id) => ({ id, pane: id, kind: 'claude', state: 'done', endedTurn: true, mtime: now - 2 * 86400e3 }));
-  const panes = sessions.map((s) => ({ id: s.id, alive: true, attached: s.id === 'viewed' ? 1 : 0, lastOutputAt: new Date(s.mtime).toISOString(), meta: { sessionId: s.id, agent: 'claude' } }));
+  const panes = sessions.map((s) => ({ id: s.id, alive: true, attached: s.id === 'viewed' ? 1 : 0,
+    inputCount: 0, lastOutputAt: new Date(s.mtime).toISOString(), lastReadAt: new Date(s.mtime + 1).toISOString(),
+    meta: { sessionId: s.id, agent: 'claude' } }));
+  const allTasks = sessions.map((s) => ({ id: `card-${s.id}`, fm: { status: 'done', done_at: new Date(s.mtime).toISOString(), sessions: [{ id: s.id }] } }));
   const closed = [], records = [];
   const scheduler = startScheduler({ now: () => now,
-    snapshot: async () => { await gate; return { sessions, panes, pinned: new Set() }; },
+    snapshot: async () => { await gate; return { sessions, panes, allTasks, questions: [], pinned: new Set() }; },
     close: async ({ sessionId }) => { closed.push(sessionId); if (sessionId === 'refused') throw new Error('draft'); },
     record: (entry) => records.push(entry),
   });
@@ -113,9 +116,59 @@ test('automatic scheduler audits refusals and submissions, throttles attempts, a
     await scheduler.tick();
     release(); await first;
     assert.deepEqual(closed, ['ok', 'refused']);
-    assert.deepEqual(records.map((r) => r.outcome), ['exit requested', 'not closed: draft']);
+    assert.deepEqual(records.map((r) => r.outcome), ['closed after done', 'not closed: draft']);
     await scheduler.tick(); assert.equal(closed.length, 2);
     now += 3600e3; await scheduler.tick(); assert.equal(closed.length, 4);
+  } finally { scheduler.stop(); }
+});
+
+test('done-close policy waits from the latest done or activity time and enforces every durable guard', () => {
+  const { doneClosePlan } = require('./session-cleanup');
+  const now = Date.parse('2026-09-10T12:30:00.000Z');
+  const old = new Date(now - 20 * 60e3).toISOString();
+  const session = { id: 's', kind: 'claude', state: 'done', endedTurn: true, mtime: now - 20 * 60e3 };
+  const pane = { id: 'p', alive: true, attached: 0, inputCount: 0, lastInputAt: old,
+    lastOutputAt: old, lastReadAt: new Date(now - 19 * 60e3).toISOString(), meta: { sessionId: 's', agent: 'claude' } };
+  const done = { id: 'done', fm: { status: 'done', done_at: old, sessions: [{ id: 's' }] } };
+  const state = { allTasks: [done], questions: [], pinned: new Set() };
+  assert.equal(doneClosePlan(session, pane, state, now).reason, null);
+  assert.match(doneClosePlan(session, pane, { ...state, allTasks: [done, { id: 'live', fm: { status: 'review', sessions: [{ id: 's' }] } }] }, now).reason, /not done/);
+  assert.match(doneClosePlan(session, pane, { ...state, questions: [{ status: 'open', to: 'reviewer', from: { sessionId: 's' } }] }, now).reason, /unanswered/);
+  assert.match(doneClosePlan({ ...session, unknownBackgroundJobs: ['history-gap'] }, pane, state, now).reason, /activity is unknown/);
+  assert.match(doneClosePlan(session, { ...pane, lastInputAt: new Date(now - 5 * 60e3).toISOString() }, state, now).reason, /activity within/);
+  assert.match(doneClosePlan(session, { ...pane, lastOutputAt: new Date(now - 5 * 60e3).toISOString(), lastReadAt: null }, state, now).reason, /activity within/);
+  assert.match(doneClosePlan(session, { ...pane, lastReadAt: new Date(now - 21 * 60e3).toISOString() }, state, now).reason, /unread/);
+  assert.match(doneClosePlan(session, pane, { ...state, pinned: new Set(['p']) }, now).reason, /Pinned/);
+  assert.match(doneClosePlan(session, { ...pane, attached: 1 }, state, now).reason, /Attached/);
+  assert.match(doneClosePlan(session, pane, { ...state, allTasks: [] }, now).reason, /not linked/);
+  const codex = { ...session, kind: 'codex' };
+  const codexPane = { ...pane, meta: { sessionId: 's', agent: 'codex' } };
+  assert.match(doneClosePlan(codex, codexPane, { ...state, companion: { known: true, complete: true,
+    jobs: [{ id: 'detached', sessionId: 's', status: 'running' }] } }, now).reason, /running Codex companion/);
+  assert.equal(doneClosePlan(codex, codexPane, { ...state, companion: { known: true, complete: true, jobs: [] } }, now).reason, null);
+  assert.match(doneClosePlan(session, pane, { ...state, companion: { known: true, complete: false,
+    jobs: [{ id: 'claude-launched', ownerSessionId: 's', status: 'running' }] } }, now).reason, /running Codex companion/);
+  assert.equal(doneClosePlan(session, pane, { ...state, companion: { known: false, jobs: [] } }, now).reason, null);
+});
+
+test('legacy done cards begin a conservative observation window before closing', async () => {
+  const { startScheduler } = require('./session-cleanup');
+  let now = Date.parse('2026-09-10T12:00:00.000Z');
+  const old = new Date(now - 24 * 3600e3).toISOString();
+  const session = { id: 'legacy', pane: 'p', kind: 'claude', state: 'done', endedTurn: true, mtime: now - 24 * 3600e3 };
+  const pane = { id: 'p', alive: true, attached: 0, inputCount: 0, lastOutputAt: old, lastReadAt: old,
+    meta: { sessionId: 'legacy', agent: 'claude' } };
+  const state = { sessions: [session], panes: [pane], allTasks: [{ id: 'old-card', fm: { status: 'done', updated: old, sessions: [{ id: 'legacy' }] } }], questions: [], pinned: new Set() };
+  const closed = [];
+  const scheduler = startScheduler({ now: () => now, doneIdleMs: 15 * 60e3, snapshot: async () => state,
+    close: async (body) => closed.push(body), record: async () => {} });
+  try {
+    await scheduler.tick();
+    assert.equal(closed.length, 0);
+    now += 15 * 60e3;
+    await scheduler.tick();
+    assert.equal(closed.length, 1);
+    assert.equal(closed[0].legacyDoneAt['old-card'], now - 15 * 60e3);
   } finally { scheduler.stop(); }
 });
 
@@ -234,6 +287,45 @@ test('automatic cleanup refuses a newly attached viewer before typing exit', asy
       lsof: async () => '',
     }), /viewer/);
     assert.equal(typed, '');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('done-card close authorizes its own exit input while retaining a force-time race guard', async () => {
+  const { closeIdleSession } = require('./serve');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-done-close-'));
+  const rollout = path.join(root, 'rollout.jsonl');
+  fs.writeFileSync(rollout, '{}\n');
+  const now = Date.parse('2026-09-10T12:30:00.000Z');
+  const old = new Date(now - 20 * 60e3).toISOString();
+  const task = { id: 'done-card', fm: { status: 'done', done_at: old, sessions: [{ id: 's' }] } };
+  const session = { id: 's', pane: 'p', kind: 'codex', state: 'done', endedTurn: true, mtime: now - 20 * 60e3 };
+  const pane = { id: 'p', pid: 123, alive: true, attached: 0, inputCount: 0,
+    lastInputAt: old, lastOutputAt: old, lastReadAt: old, meta: { sessionId: 's', agent: 'codex' } };
+  let typed = '';
+  const host = { request: async (type, params) => {
+    if (type === 'list') return { panes: [{ ...pane }] };
+    if (type === 'screen') return { text: typed ? `› ${typed}\n\nstatus` : '› Ask Codex to do anything' };
+    if (type === 'input') {
+      typed += Buffer.from(params.data, 'base64').toString();
+      pane.inputCount += 1;
+      pane.lastInputAt = new Date(now).toISOString();
+      return {};
+    }
+    assert.fail(type);
+  } };
+  try {
+    const result = await closeIdleSession({ sessionId: 's', pane: 'p' }, {
+      root, host, now: () => now, closePolicy: { automatic: true, done: true, idleMs: 15 * 60e3 },
+      withInjectionLock: (fn) => fn(), buildState: () => ({ sessions: [{ ...session }], tasks: [task] }),
+      loadAll: () => [task], loadQuestions: () => [], discoverCodexJobs: async () => ({ known: true, complete: true, jobs: [] }),
+      codexSessionFor: () => ({ ...session }), codexRolloutFile: () => rollout, sleep: async () => {},
+      psTable: '123 1 ttys001 Tue Sep  8 10:00:00 2026 codex resume s', lsof: async () => '',
+    });
+    assert.equal(typed, '/exit\r');
+    assert.equal(result.expectedInputCount, 2);
+    await result.beforeSignal();
+    pane.inputCount += 1;
+    await assert.rejects(result.beforeSignal(), /unexpected input/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

@@ -3015,6 +3015,26 @@ test('open uses host panes for both existing sessions and new Claude and Codex l
   }), (error) => error.status === 504 && /never registered its session id/.test(error.message));
 });
 
+test('opening an auto-closed done card resumes the same Claude and Codex session ids', async () => {
+  const project = os.tmpdir();
+  for (const [agent, id, expected] of [
+    ['claude', 'closed-claude-session', 'claude --dangerously-skip-permissions --resume closed-claude-session'],
+    ['codex', 'closed-codex-session', 'codex --dangerously-bypass-approvals-and-sandbox resume closed-codex-session'],
+  ]) {
+    const host = recordingHost((type) => type === 'spawn' ? { pane: { id: `pane-${agent}` } } : {});
+    const result = await openSession({ taskId: `${agent}-card` }, {
+      host,
+      loadTask: () => ({ fm: { status: 'done', project, sessions: [{ id, agent }] } }),
+      resolveSessionTarget: async () => null,
+      liveSessionPids: async () => new Map(),
+      waitForHostAgent: async () => true,
+    });
+    assert.equal(result.sessionId, id);
+    assert.equal(result.command, expected);
+    assert.equal(host.calls[0].params.meta.sessionId, id);
+  }
+});
+
 test('API state exposes pane ids without copying obsolete viewer metadata', async () => {
   const state = { sessions: [{ id: 'hosted' }, { id: 'missing' }], attention: [{ sessionId: 'hosted' }] };
   const host = recordingHost((type) => type === 'list' ? { panes: [{

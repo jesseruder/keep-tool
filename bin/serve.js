@@ -2452,6 +2452,29 @@ async function closeIdleSession(body, deps = {}) {
     if (await closeExitedCodexShell(session, pane, deps)) return { ok: true, closing: true, sessionId: session.id, pane: pane.id };
     const layouts = await keepConsole.readLayouts(path.join(deps.root || keep.ROOT, '.keep', 'layouts.json'));
     const pinned = new Set((layouts.layouts || []).flatMap((layout) => layout.ids || []));
+    const checkDonePolicy = async (current, currentPane = pane, policyPane = currentPane) => {
+      if (!deps.closePolicy?.done) return null;
+      const companion = await (deps.discoverCodexJobs || stalled.discoverCodexJobs)({
+        root: deps.root || keep.ROOT,
+        fallbackCacheMs: 0,
+      }, deps);
+      const allTasks = (deps.loadAll || keep.loadAll)(true);
+      const questions = (deps.loadQuestions || review.loadQuestions)();
+      const legacy = deps.closePolicy.legacyDoneAt || {};
+      const plan = require('./session-cleanup').doneClosePlan(
+        current.sessions.find((candidate) => candidate.id === session.id),
+        policyPane,
+        { ...current, allTasks, questions, pinned, companion },
+        (deps.now || Date.now)(),
+        {
+          idleMs: deps.closePolicy.idleMs,
+          legacyDoneAt: (task) => legacy[task.id],
+        },
+      );
+      if (plan.reason) throw new InjectionError(409, plan.reason);
+      return plan;
+    };
+    await checkDonePolicy(state);
     const reason = require('./session-cleanup').refusal(session, pane, pinned, Date.now(), deps.closePolicy);
     if (reason) throw new InjectionError(409, reason);
     const checkTaskSafety = (current) => {
@@ -2471,6 +2494,16 @@ async function closeIdleSession(body, deps = {}) {
     if (!fresh || typeof fresh.endedTurn !== 'boolean' || !Number.isFinite(fresh.mtime)) throw new InjectionError(409, 'Session activity could not be verified');
     if (fresh.mtime !== session.mtime || fresh.endedTurn !== true || fresh.pendingBackground || fresh.toolRunning) throw new InjectionError(409, 'Session changed during cleanup; nothing closed');
     let verifyCodexChildren = null;
+    let automaticProcessIdentity = null;
+    let automaticProcessRows = null;
+    if (deps.closePolicy?.done) {
+      automaticProcessRows = await agentProcessRows(deps);
+      automaticProcessIdentity = (await liveSessionPids({ ...deps, agentProcessRows: async () => automaticProcessRows })).get(session.id);
+      if (!automaticProcessIdentity?.primary) throw new InjectionError(409, 'Session process identity could not be verified; nothing closed');
+      if (automaticProcessRows.some((process) => process.ppid === automaticProcessIdentity.pid)) {
+        throw new InjectionError(409, 'Session has child processes; leave it open');
+      }
+    }
     if (session.kind === 'claude' && !(deps.closePolicy?.restart && deps.restartProof)) {
       const file = findSessionFile(session.id);
       if (!file || fs.statSync(file).size > 64 * 1024 * 1024) throw new InjectionError(409, 'Session history is too large to safely verify background completion');
@@ -2480,7 +2513,7 @@ async function closeIdleSession(body, deps = {}) {
       // The transcript's ended turn does not prove that yielded Codex commands
       // ended. Automatic retirement requires no children; explicit Close may
       // override that conservative check (Codex also keeps idle runtime helpers).
-      const processes = await agentProcessRows(deps);
+      const processes = automaticProcessRows || await agentProcessRows(deps);
       const live = await liveSessionPids({ ...deps, agentProcessRows: async () => processes });
       const identity = live.get(session.id);
       if (!identity || !identity.primary) throw new InjectionError(409, 'Codex process identity could not be verified; nothing closed');
@@ -2503,35 +2536,79 @@ async function closeIdleSession(body, deps = {}) {
         }
       }
     }
-    const unchanged = async () => {
-      if (session.kind === 'codex' && !deps.closePolicy?.manual) {
+    let authorizedPane = null;
+    const unchanged = async ({ expectedInputCount = null, useAuthorizedActivity = false } = {}) => {
+      if (deps.closePolicy?.done) {
+        const rows = await agentProcessRows(deps);
+        const identity = (await liveSessionPids({ ...deps, agentProcessRows: async () => rows })).get(session.id);
+        if (!identity?.primary || identity.pid !== automaticProcessIdentity.pid
+            || rows.some((process) => process.ppid === identity.pid)) {
+          throw new InjectionError(409, 'Session process or children changed during cleanup');
+        }
+      } else if (session.kind === 'codex' && !deps.closePolicy?.manual) {
         const rows = await agentProcessRows(deps);
         const identity = (await liveSessionPids({ ...deps, agentProcessRows: async () => rows })).get(session.id);
         if (!identity?.primary || rows.some((p) => p.ppid === identity.pid)) throw new InjectionError(409, 'Codex child processes changed during cleanup');
       }
       const latest = session.kind === 'claude' ? (deps.claudeSessionFor || claudeSessionFor)(session.id) : (deps.codexSessionFor || codex.sessionFor)(session.id);
       if (!latest || typeof latest.endedTurn !== 'boolean' || !Number.isFinite(latest.mtime)) throw new InjectionError(409, 'Session activity could not be verified');
-      if (latest.mtime !== session.mtime || latest.endedTurn !== true || latest.pendingBackground || latest.toolRunning || latest.pendingQuestion || latest.pendingPlan) throw new InjectionError(409, 'Session changed during cleanup; nothing closed');
+      if (latest.mtime !== session.mtime || latest.endedTurn !== true || latest.pendingBackground
+          || latest.unknownBackgroundJobs?.length || latest.toolRunning || latest.pendingQuestion || latest.pendingPlan) {
+        throw new InjectionError(409, 'Session changed during cleanup; nothing closed');
+      }
       if (deps.closePolicy?.automatic) {
         const currentPane = (await listHostPanes(deps, true))?.find((p) => p.id === pane.id);
         if (!currentPane?.alive || currentPane.attached !== 0 || currentPane.meta?.sessionId !== session.id) throw new InjectionError(409, 'Session acquired a viewer or changed during cleanup');
+        if (expectedInputCount !== null && currentPane.inputCount !== expectedInputCount) {
+          throw new InjectionError(409, 'Session received unexpected input during cleanup');
+        }
         const currentLayouts = await keepConsole.readLayouts(path.join(deps.root || keep.ROOT, '.keep', 'layouts.json'));
         if ((currentLayouts.layouts || []).some((layout) => layout.ids?.includes(pane.id))) throw new InjectionError(409, 'Session was pinned during cleanup');
+        const currentState = await addHostSessionState(
+          await (deps.buildState || buildState)({ hostPanes: [currentPane] }),
+          { ...deps, panes: [currentPane] },
+        );
+        await checkDonePolicy(currentState, currentPane, useAuthorizedActivity ? authorizedPane : currentPane);
+        checkTaskSafety(currentState);
+      } else {
+        checkTaskSafety(await (deps.buildState || buildState)({ hostPanes: panes }));
       }
-      checkTaskSafety(await (deps.buildState || buildState)({ hostPanes: panes }));
       if (verifyCodexChildren) {
         try { verifyCodexChildren(); } catch (error) { throw new InjectionError(409, error.message); }
       }
       if (deps.beforeClose) await deps.beforeClose();
     };
     await unchanged();
+    if (deps.closePolicy?.done) {
+      authorizedPane = (await listHostPanes(deps, true))?.find((candidate) => candidate.id === pane.id);
+      if (!authorizedPane || !Number.isInteger(authorizedPane.inputCount)) {
+        throw new InjectionError(409, 'Pane input activity could not be verified');
+      }
+    }
     deps.beforeExitInput?.();
     // Claude's slash menu can occupy more than 30 rows below the input.
     await typeAndSubmit(target, '/exit', (screen, text) => closeDraftVisible(screen, text, session.kind), {
-      ...deps, confirmationLines: session.kind === 'claude' ? null : 30, beforeEnter: unchanged,
+      ...deps,
+      confirmationLines: session.kind === 'claude' ? null : 30,
+      beforeEnter: () => unchanged({
+        expectedInputCount: authorizedPane ? authorizedPane.inputCount + 1 : null,
+        useAuthorizedActivity: Boolean(authorizedPane),
+      }),
     });
     // No process signals, forced exit, transcript removal, or task completion.
-    return { ok: true, closing: true, sessionId: session.id, pane: pane.id };
+    return {
+      ok: true,
+      closing: true,
+      sessionId: session.id,
+      pane: pane.id,
+      ...(authorizedPane ? {
+        expectedInputCount: authorizedPane.inputCount + 2,
+        beforeSignal: () => unchanged({
+          expectedInputCount: authorizedPane.inputCount + 2,
+          useAuthorizedActivity: true,
+        }),
+      } : {}),
+    };
   });
 }
 
@@ -4628,14 +4705,22 @@ function start(deps = {}) {
   const restartTimer = setInterval(() => restarts.tick().catch((error) => process.stderr.write(`keep restart: ${error.message}\n`)), 10000);
   restartTimer.unref();
   if (process.env.KEEP_AUTO_CLOSE !== '0') {
+    const doneIdleMs = envNumber('KEEP_AUTO_CLOSE_DONE_MIN', 15) * 60e3;
     const cleanupSnapshot = async () => {
       // Shell verification must see new viewers/output even inside the host-list cache TTL.
       const panes = await listHostPanes({}, true);
       const state = await addHostSessionState(await buildState({ hostPanes: panes }), { panes });
       const layouts = await keepConsole.readLayouts(path.join(keep.ROOT, '.keep', 'layouts.json'));
-      return { ...state, pinned: new Set((layouts.layouts || []).flatMap((layout) => layout.ids || [])) };
+      return {
+        ...state,
+        allTasks: keep.loadAll(true),
+        questions: review.loadQuestions(),
+        companion: await stalled.discoverCodexJobs({ root: keep.ROOT, fallbackCacheMs: 0 }),
+        pinned: new Set((layouts.layouts || []).flatMap((layout) => layout.ids || [])),
+      };
     };
     require('./session-cleanup').startScheduler({
+      doneIdleMs,
       snapshot: cleanupSnapshot,
       closeShell: pane => withInjectionLock(() => require('./shell-cleanup').close(pane, {
         snapshot: cleanupSnapshot,
@@ -4644,7 +4729,22 @@ function start(deps = {}) {
         eof: p => writeTarget({ pane: p.id }, '\x04'),
       })),
       close: async (body) => {
-        const result = await closeIdleSession(body, { closePolicy: { automatic: true } });
+        const result = await withInjectionLock(() => require('./manual-close').manualClose(body, {
+          requireGraceful: true,
+          protectInput: true,
+          getPane: async (pane) => (await hostRequest('get', { pane })).pane,
+          graceful: (request) => closeIdleSession(request, {
+            closePolicy: {
+              automatic: true,
+              done: true,
+              idleMs: body.doneIdleMs,
+              legacyDoneAt: body.legacyDoneAt,
+            },
+            withInjectionLock: (fn) => fn(),
+          }),
+          signal: (pane, signal) => hostRequest('kill', { pane, signal }),
+        }));
+        keep.recordDaemonSessionClose(body.cardIds, body.sessionId, body.idleMinutes);
         broadcast();
         return result;
       },

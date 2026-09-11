@@ -210,6 +210,9 @@ async function settled(pane) {
 }
 
 function publicPane(pane) {
+  const activityTimes = [pane.lastInputAt, pane.lastOutputAt]
+    .map((value) => Date.parse(value || ''))
+    .filter(Number.isFinite);
   return {
     id: pane.id,
     cmd: pane.cmd,
@@ -225,7 +228,11 @@ function publicPane(pane) {
     visibleAttached: [...pane.attachments.values()].filter(a => a.visible !== false).length,
     createdAt: pane.createdAt,
     exitedAt: pane.exitedAt,
+    lastInputAt: pane.lastInputAt,
     lastOutputAt: pane.lastOutputAt,
+    lastReadAt: pane.lastReadAt,
+    inputCount: pane.inputCount,
+    lastActivityAt: activityTimes.length ? new Date(Math.max(...activityTimes)).toISOString() : null,
     bytes: pane.buffer.size,
     title: pane.title,
     alt: pane.term.buffer.active.type === 'alternate',
@@ -387,7 +394,10 @@ function createHost(options = {}) {
       signal: record.signal == null ? null : record.signal,
       createdAt: record.createdAt,
       exitedAt: record.exitedAt || null,
+      lastInputAt: record.lastInputAt || null,
       lastOutputAt: record.lastOutputAt || null,
+      lastReadAt: record.lastReadAt || null,
+      inputCount: Number.isInteger(record.inputCount) ? record.inputCount : 0,
       title: record.title || '',
       // Viewer connections do not survive a reload. Let the first eligible viewer
       // to attach or type claim the adopted pane instead of retaining a ghost owner.
@@ -425,6 +435,9 @@ function createHost(options = {}) {
       }
       pane.buffer.push(data);
       pane.lastOutputAt = new Date().toISOString();
+      if ([...pane.attachments.values()].some((attachment) => attachment.visible !== false)) {
+        pane.lastReadAt = pane.lastOutputAt;
+      }
       terminalWrite(pane, data).catch(() => {});
       for (const connection of pane.attachments.keys()) {
         const pending = connection.pendingAttach.get(pane.id);
@@ -487,7 +500,8 @@ function createHost(options = {}) {
         id, cmd, args, cwd, cols, rows, pty: processPty,
         meta: params.meta === undefined ? {} : params.meta,
         alive: true, exitCode: null, signal: null,
-        createdAt: new Date().toISOString(), exitedAt: null, lastOutputAt: null,
+        createdAt: new Date().toISOString(), exitedAt: null, lastInputAt: null,
+        lastOutputAt: null, lastReadAt: null,
         title: '', buffer: null, primary: null,
       });
     } catch (error) {
@@ -571,6 +585,8 @@ function createHost(options = {}) {
           if (!attachment || pane.primary !== attachment.viewer) {
             return { result: { dropped: true } };
           }
+          pane.lastInputAt = new Date().toISOString();
+          pane.inputCount += 1;
           pane.pty.write(Buffer.from(String(params.data || ''), 'base64'));
           return { result: {} };
         }
@@ -583,6 +599,8 @@ function createHost(options = {}) {
           connection.primaryClaims.set(pane.id, viewer);
           setPrimary(pane, viewer);
         }
+        pane.lastInputAt = new Date().toISOString();
+        pane.inputCount += 1;
         pane.pty.write(Buffer.from(String(params.data || ''), 'base64'));
         return { result: {} };
       }
@@ -617,7 +635,12 @@ function createHost(options = {}) {
         if (connection.attached.has(pane.id)) throw new Error('already attached on this connection');
         const viewer = params.viewer == null ? connection.id : String(params.viewer);
         if (!viewer) throw new Error('viewer cannot be empty');
-        const attachment = { viewer, primary: params.primary !== false, order: nextAttachOrder++ };
+        const attachment = {
+          viewer,
+          primary: params.primary !== false,
+          order: nextAttachOrder++,
+          readsHistory: params.snapshot === true || params.replay !== false,
+        };
         let pending;
         try {
           if (params.snapshot === true) {
@@ -647,6 +670,7 @@ function createHost(options = {}) {
             };
           }
           pane.attachments.set(connection, attachment);
+          if (attachment.visible !== false && attachment.readsHistory) pane.lastReadAt = new Date().toISOString();
           connection.attached.add(pane.id);
           connection.viewers.set(pane.id, viewer);
           connection.pendingAttach.set(pane.id, pending);
@@ -683,6 +707,7 @@ function createHost(options = {}) {
         const attachment = pane.attachments.get(connection);
         if (!attachment || typeof params.visible !== 'boolean') throw new Error('Expected attached viewer and boolean visibility');
         attachment.visible = params.visible;
+        if (params.visible && attachment.readsHistory) pane.lastReadAt = new Date().toISOString();
         emitPane('visibility', pane);
         return { result: { pane: publicPane(pane) } };
       }
@@ -999,7 +1024,10 @@ function createHost(options = {}) {
           signal: pane.signal,
           createdAt: pane.createdAt,
           exitedAt: pane.exitedAt,
+          lastInputAt: pane.lastInputAt,
           lastOutputAt: pane.lastOutputAt,
+          lastReadAt: pane.lastReadAt,
+          inputCount: pane.inputCount,
           title: pane.title,
           pid: pane.pty.pid,
           pty: pane.pty,

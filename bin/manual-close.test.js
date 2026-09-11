@@ -43,6 +43,20 @@ test('manual close does not report success if termination cannot be verified', a
   assert.deepEqual(f.calls, ['exit', 'SIGTERM', 'SIGKILL']);
 });
 
+test('automatic close never turns a graceful refusal into force permission', async () => {
+  const f = fixture('refusal');
+  await assert.rejects(manualClose(body, { ...f.deps, requireGraceful: true }), /draft/);
+  assert.deepEqual(f.calls, ['exit']);
+});
+
+test('automatic close rechecks its safety closure before each signal', async () => {
+  const f = fixture('SIGKILL');
+  let checks = 0;
+  f.deps.graceful = async () => ({ beforeSignal: async () => { checks += 1; } });
+  await manualClose(body, f.deps);
+  assert.equal(checks, 2);
+});
+
 for (const graceful of [true, false]) test(`isolated real PTY close: ${graceful ? 'graceful' : 'forced fallback'}`, { timeout: 12000 }, async () => {
   const fs = require('node:fs');
   const path = require('node:path');
@@ -63,12 +77,54 @@ for (const graceful of [true, false]) test(`isolated real PTY close: ${graceful 
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     const result = await manualClose({ pane: pane.id, sessionId: 'test-session' }, {
+      requireGraceful: true,
+      protectInput: true,
       getPane: async (id) => (await client.request('get', { pane: id })).pane,
-      graceful: async () => client.request('input', { pane: pane.id, data: Buffer.from('/exit\r').toString('base64') }),
+      graceful: async () => {
+        await client.request('input', { pane: pane.id, data: Buffer.from('/exit\r').toString('base64') });
+        return { expectedInputCount: (await client.request('get', { pane: pane.id })).pane.inputCount };
+      },
       signal: (id, signal) => client.request('kill', { pane: id, signal }),
     });
     assert.equal(result.forced, !graceful);
     assert.equal((await client.request('get', { pane: pane.id })).pane.alive, false);
+  } finally {
+    client?.close();
+    await host.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('real host input after automatic graceful submission cancels force escalation', { timeout: 12000 }, async () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'keep-auto-close-race-'));
+  const sock = path.join(root, 'host.sock');
+  const host = require('./host').createHost({ sock, log: null });
+  let client;
+  try {
+    await host.listen();
+    client = await require('./hostclient').connect({ sock });
+    const script = "process.on('SIGTERM',()=>{});require('readline').createInterface({input:process.stdin}).on('line',()=>{});console.log('ready');setInterval(()=>{},1000);";
+    const { pane } = await client.request('spawn', { cmd: process.execPath, args: ['-e', script], cwd: root,
+      meta: { agent: 'claude', sessionId: 'test-session' } });
+    for (let i = 0; i < 100; i++) {
+      if ((await client.request('screen', { pane: pane.id })).text.includes('ready')) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await assert.rejects(manualClose({ pane: pane.id, sessionId: 'test-session' }, {
+      requireGraceful: true,
+      protectInput: true,
+      getPane: async (id) => (await client.request('get', { pane: id })).pane,
+      graceful: async () => {
+        await client.request('input', { pane: pane.id, data: Buffer.from('/exit\r').toString('base64') });
+        const submitted = (await client.request('get', { pane: pane.id })).pane;
+        await client.request('input', { pane: pane.id, data: Buffer.from('new work\r').toString('base64') });
+        return { expectedInputCount: submitted.inputCount };
+      },
+      signal: (id, signal) => client.request('kill', { pane: id, signal }),
+    }), /received input/);
+    assert.equal((await client.request('get', { pane: pane.id })).pane.alive, true);
   } finally {
     client?.close();
     await host.close();

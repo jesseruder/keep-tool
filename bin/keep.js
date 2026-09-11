@@ -170,11 +170,12 @@ function serializeTask(task) {
     }
   }
   scalar('created');
+  scalar('done_at');
   scalar('updated');
   const known = new Set([
     'title', 'status', 'kind', 'experiment_id', 'autocontinue', 'autonomous', 'allow', 'allow_until',
     'tags', 'depends_on', 'project', 'check_after', 'check',
-    'scheduled_by', 'scheduled_at', 'scheduled_for', 'scheduled_intent', 'sessions', 'needs', 'created', 'updated',
+    'scheduled_by', 'scheduled_at', 'scheduled_for', 'scheduled_intent', 'sessions', 'needs', 'created', 'done_at', 'updated',
   ]);
   for (const key of Object.keys(fm)) {
     if (!known.has(key) && typeof fm[key] === 'string') out.push(`${key}: ${fm[key]}`);
@@ -234,7 +235,7 @@ function loadAll(includeArchive) {
 function saveTask(task) {
   let oldTask = null;
   try { oldTask = parseTask(fs.readFileSync(taskPath(task.id), 'utf8'), task.id); } catch {}
-  if (task.fm.status === 'done' && oldTask?.fm.status !== 'done') task.fm.done_at = nowStamp();
+  if (task.fm.status === 'done' && oldTask?.fm.status !== 'done') task.fm.done_at = new Date().toISOString();
   else if (task.fm.status !== 'done') delete task.fm.done_at;
   task.fm.updated = nowStamp();
   fs.writeFileSync(taskPath(task.id), serializeTask(task));
@@ -526,6 +527,24 @@ function appendLog(task, heading, message) {
   const rest = parsed.rest ? `${entry}\n${parsed.rest.replace(/^\n+/, '')}` : entry;
   const plan = parsed.steps.length ? renderPlan(parsed.steps) : parsed.present ? parsed.raw : '';
   task.body = plan ? `${plan}\n\n${rest}` : rest;
+}
+
+function recordDaemonSessionClose(cardIds, sessionId, idleMinutes) {
+  const wanted = new Set(cardIds || []);
+  return withLock(() => {
+    const changed = [];
+    for (const task of loadAll(true)) {
+      if (!wanted.has(task.id) || task.fm.status !== 'done'
+          || !(task.fm.sessions || []).some((entry) => entry.id === sessionId)) continue;
+      appendLog(task, 'closed (daemon)', `idle ${Math.max(0, Math.floor(idleMinutes))} min after done`);
+      task.fm.updated = nowStamp();
+      const file = fs.existsSync(taskPath(task.id)) ? taskPath(task.id) : path.join(ARCHIVE, `${task.id}.md`);
+      fs.writeFileSync(file, serializeTask(task));
+      changed.push(task.id);
+    }
+    if (changed.length) commitAndPush(`keep: record daemon close ${String(sessionId).slice(0, 8)}`);
+    return changed;
+  });
 }
 
 function lastLogLine(task) {
@@ -6023,7 +6042,7 @@ module.exports = {
   isReviewerSession, registerReviewerSession, currentSession, parseWhen, relativeDurationMs, postKeepApi, getKeepApi,
   loadAll, loadTask, loadTaskAnywhere, parseTask, serializeTask, parsePlan, renderPlan, setPlan, nextStep, lastLogLine, isOverdue, nowStamp, stampOf, buildDigest,
   parseDependency, dependencyStep, dependencyResolved, dependencyInfo, unresolvedDependencyIds,
-  withLock, commitAndPush, saveTask, recordDoneTransition, addTask, checkinTask, briefSnapshot, scopeForProject, KeepError,
+  withLock, commitAndPush, saveTask, recordDoneTransition, recordDaemonSessionClose, addTask, checkinTask, briefSnapshot, scopeForProject, KeepError,
   claimSession, linkLaunchedSession, releaseCardSession,
   emptyStopEvidence, scanStopEvidence, hasSubstantiveStopEvidence, canonicalCwd, inferProject,
   writePaneRecord, stopHook,

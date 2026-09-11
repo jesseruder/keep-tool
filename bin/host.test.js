@@ -322,6 +322,11 @@ test('input echoes through sh -c cat', async () => {
     const attachment = await client.attach(pane.id, { replay: false }, (data) => { output += data.toString(); });
     await client.request('input', { pane: pane.id, data: Buffer.from('echo-me\n').toString('base64') });
     await waitFor(() => output.includes('echo-me'), 'cat echo');
+    const activity = (await client.request('get', { pane: pane.id })).pane;
+    assert.equal(typeof activity.lastInputAt, 'string');
+    assert.equal(typeof activity.lastOutputAt, 'string');
+    assert.equal(typeof activity.lastReadAt, 'string');
+    assert.equal(activity.lastActivityAt, activity.lastOutputAt);
     await client.request('kill', { pane: pane.id });
     await attachment.detach();
   });
@@ -593,6 +598,9 @@ test('handoff adopts a live PTY, rebuilds its screen, and keeps exit detection',
     });
     await waitFor(async () => (await client.request('screen', { pane: pane.id })).text.includes('earlier'), 'early output');
     await client.attach(pane.id, { replay: false, viewer: 'old-primary', primary: true }, () => {});
+    await client.request('input', { pane: pane.id, data: Buffer.from('before\n').toString('base64') });
+    await waitFor(async () => (await client.request('screen', { pane: pane.id })).text.includes('got:before'), 'pre-handoff input');
+    const activityBefore = (await client.request('get', { pane: pane.id })).pane;
     assert.equal((await client.request('get', { pane: pane.id })).pane.primary, 'old-primary');
     const disconnected = new Promise((resolve) => client.onDisconnect(resolve));
     const record = await first.handoff();
@@ -605,7 +613,8 @@ test('handoff adopts a live PTY, rebuilds its screen, and keeps exit detection',
     assert.ok(Buffer.isBuffer(record.panes[0].buffer));
     assert.deepEqual(Object.keys(record.panes[0]).sort(), [
       'alive', 'args', 'buffer', 'cmd', 'cols', 'createdAt', 'cwd', 'exitCode', 'exitedAt',
-      'id', 'lastOutputAt', 'meta', 'pid', 'primary', 'pty', 'rows', 'screen', 'signal', 'title',
+      'id', 'inputCount', 'lastInputAt', 'lastOutputAt', 'lastReadAt', 'meta', 'pid', 'primary',
+      'pty', 'rows', 'screen', 'signal', 'title',
     ]);
 
     active = createHost({ sock, log: null, adopt: record });
@@ -614,6 +623,11 @@ test('handoff adopts a live PTY, rebuilds its screen, and keeps exit detection',
     client = await connect({ sock });
     assert.equal((await client.request('get', { pane: pane.id })).pane.pid, pane.pid);
     assert.equal((await client.request('get', { pane: pane.id })).pane.primary, null);
+    const adoptedActivity = (await client.request('get', { pane: pane.id })).pane;
+    assert.equal(adoptedActivity.lastInputAt, activityBefore.lastInputAt);
+    assert.equal(adoptedActivity.lastOutputAt, activityBefore.lastOutputAt);
+    assert.equal(adoptedActivity.lastReadAt, activityBefore.lastReadAt);
+    assert.equal(adoptedActivity.inputCount, activityBefore.inputCount);
     assert.match((await client.request('screen', { pane: pane.id })).text, /earlier/);
     await client.request('input', { pane: pane.id, data: Buffer.from('again\n').toString('base64') });
     assert.match((await client.request('get', { pane: pane.id })).pane.primary, /^viewer-/);

@@ -400,6 +400,33 @@ test('releaseCardSession and linkLaunchedSession hand a card to the launched ses
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('done transitions are precise and daemon close logs preserve the resume link', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-daemon-close-log-'));
+  const cli = path.join(__dirname, 'keep.js');
+  const env = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', CODEX_THREAD_ID: 'resume-this-codex' };
+  delete env.CLAUDE_CODE_SESSION_ID;
+  const run = (args) => spawnSync(process.execPath, [cli, ...args], { encoding: 'utf8', env });
+  try {
+    for (const dir of ['tasks', 'archive', 'digests']) fs.mkdirSync(path.join(root, dir), { recursive: true });
+    assert.equal(spawnSync('git', ['init', '-q', root]).status, 0);
+    spawnSync('git', ['-C', root, 'config', 'user.name', 'Keep Test']);
+    spawnSync('git', ['-C', root, 'config', 'user.email', 'keep@example.test']);
+    assert.equal(run(['add', 'Close log', '--status', 'active', '-m', 'working']).status, 0);
+    assert.equal(run(['done', 'close-log', '-m', 'finished']).status, 0);
+    const file = path.join(root, 'tasks', 'close-log.md');
+    let text = fs.readFileSync(file, 'utf8');
+    assert.match(text, /^done_at: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/m);
+    const invoke = spawnSync(process.execPath, ['-e', `console.log(JSON.stringify(require(${JSON.stringify(cli)}).recordDaemonSessionClose(['close-log'], 'resume-this-codex', 17)))`], { encoding: 'utf8', env });
+    assert.equal(invoke.status, 0, invoke.stderr);
+    assert.deepEqual(JSON.parse(invoke.stdout), ['close-log']);
+    text = fs.readFileSync(file, 'utf8');
+    assert.match(text, /— closed \(daemon\)\nidle 17 min after done/);
+    assert.match(text, /id: resume-this-codex/);
+    assert.equal(run(['checkin', 'close-log', '--status', 'active', '-m', 'reopened']).status, 0);
+    assert.doesNotMatch(fs.readFileSync(file, 'utf8'), /^done_at:/m);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('Codex async question hook records title and string options immediately', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-question-'));
   try {
