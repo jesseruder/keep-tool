@@ -81,16 +81,37 @@ test('running list does not reorder on output updates or return from idle', () =
   assert.equal(ranks.has('a'), false);
 });
 
-test('running sessions precede waiting sessions with stable ordering inside each group', () => {
+test('running and waiting sessions retain their slots through status changes', () => {
   const ranks = new Map();
   const known = new Set(['a', 'b', 'c', 'd']);
   const order = (items) => Array.from(selection.stableSessionOrder(items, ranks, known), (item) => item.id);
   const a = { id: 'a', state: 'waiting' }, b = { id: 'b', state: 'running' };
   const c = { id: 'c', state: 'waiting' }, d = { id: 'd', state: 'running' };
-  assert.deepEqual(order([a, b, c, d]), ['b', 'd', 'a', 'c']);
-  assert.deepEqual(order([d, c, b, a]), ['b', 'd', 'a', 'c']);
-  assert.deepEqual(order([d, c, b, { ...a, state: 'running' }]), ['a', 'b', 'd', 'c']);
-  assert.deepEqual(order([d, c, b, a]), ['b', 'd', 'a', 'c']);
+  assert.deepEqual(order([a, b, c, d]), ['a', 'b', 'c', 'd']);
+  assert.deepEqual(order([d, c, b, a]), ['a', 'b', 'c', 'd']);
+  assert.deepEqual(order([d, c, b, { ...a, state: 'running' }]), ['a', 'b', 'c', 'd']);
+  assert.deepEqual(order([d, c, b, a]), ['a', 'b', 'c', 'd']);
+});
+
+test('running panel orders by task creation age regardless of activity and refresh order', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../web/app/app.js'), 'utf8');
+  const data = {
+    tasks: [{ id: 'old', fm: { created: '2026-01-01' } }, { id: 'new', fm: { created: '2026-02-01' } }],
+    sessions: [{ id: 'new', taskId: 'new', state: 'running', mtime: 1 },
+      { id: 'shell', pane: 'p', state: 'waiting', mtime: 2 },
+      { id: 'old', taskId: 'old', state: 'waiting', mtime: 3 }],
+  };
+  const ctx = vm.createContext({ data, runningOrder: new Map(), stableSessionOrder: selection.stableSessionOrder,
+    paneMap: () => new Map([['p', { createdAt: '2026-01-15' }]]), isClosingSession: () => false,
+    sessionItem: (kind, session) => session });
+  vm.runInContext(source.slice(source.indexOf('function runningItems('), source.indexOf('function pinnedItems(')), ctx);
+  const order = () => Array.from(ctx.runningItems(), item => item.id);
+  assert.deepEqual(order(), ['old', 'shell', 'new']);
+  data.sessions.reverse();
+  for (const session of data.sessions) { session.state = session.state === 'running' ? 'waiting' : 'running'; session.mtime += 1000; }
+  assert.deepEqual(order(), ['old', 'shell', 'new']);
+  ctx.runningOrder.clear();
+  assert.deepEqual(order(), ['old', 'shell', 'new'], 'reload uses creation age too');
 });
 
 test('scheduled idle sessions can be dismissed without changing their scheduled task', () => {

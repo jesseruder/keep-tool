@@ -135,7 +135,7 @@ function replay(agent, events, { observe = x => x } = {}) {
       check(live || !input, 'closed-not-in-input-queue', false, input);
       // Exercise the production ordering/selection helpers while rows change groups.
       const ordered = selection.stableSessionOrder([{ id: 'neighbor', state: index % 2 ? 'running' : 'waiting' }, { id: 'subject', state: status.state }], ranks, known);
-      check(!ordered.some((x, i) => i && ordered[i - 1].state === 'waiting' && x.state === 'running'), 'running-before-waiting', true, false);
+      check(ordered[0].id === 'neighbor' && ordered[1].id === 'subject', 'stable-running-waiting-order', ['neighbor', 'subject'], ordered.map(x => x.id));
       const rows = ordered.map(x => ({ kind: x.state === 'needs-input' ? 'attention' : 'running', sessionId: x.id, pane: x.id === 'subject' ? 'fixture' : 'other' }));
       check(rows[selection.selectionIndex(rows, section(current), current, 0, key, section)].sessionId === 'subject', 'stable-selection', 'subject', rows);
       if (e.type === 'expect') {

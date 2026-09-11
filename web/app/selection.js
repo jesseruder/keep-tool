@@ -18,12 +18,12 @@ export function selectionIndex(items, selectedKey, current, fallback, keyOf, sec
   return index >= 0 ? index : Math.max(0, Math.min(fallback, items.length - 1));
 }
 
-// Seed once from the initial ranking, then append newly seen sessions. Keep a
-// session's slot through idle/running transitions while it remains in the fleet.
-export function stableSessionOrder(items, ranks, knownIds) {
+// Order by creation time, retaining first-seen order for equal or unknown ages.
+// Activity and running/waiting transitions never affect a session's slot.
+export function stableSessionOrder(items, ranks, knownIds, createdAt = () => 0) {
   for (const id of ranks.keys()) if (!knownIds.has(id)) ranks.delete(id);
   let next = Math.max(-1, ...ranks.values()) + 1;
   for (const item of items) if (!ranks.has(item.id)) ranks.set(item.id, next++);
-  return [...items].sort((a, b) => Number(a.state === 'waiting') - Number(b.state === 'waiting')
+  return [...items].sort((a, b) => createdAt(a) - createdAt(b)
     || ranks.get(a.id) - ranks.get(b.id));
 }

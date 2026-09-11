@@ -198,10 +198,12 @@ function sessionItem(kind, session, pane = session.pane) {
 }
 function runningItems() {
   const sessions = (data.sessions || [])
-    .filter((session) => ['running', 'waiting'].includes(session.state) && !session.reviewer && !isClosingSession(session.id, session.pane))
-    .sort((a, b) => (typeof b.mtime === 'number' ? b.mtime : Date.parse(b.mtime) || 0)
-      - (typeof a.mtime === 'number' ? a.mtime : Date.parse(a.mtime) || 0));
-  return stableSessionOrder(sessions, runningOrder, new Set((data.sessions || []).map((session) => session.id)))
+    .filter((session) => ['running', 'waiting'].includes(session.state) && !session.reviewer && !isClosingSession(session.id, session.pane));
+  const tasks = new Map((data.tasks || []).map((task) => [task.id, task]));
+  const panes = paneMap();
+  const createdAt = (session) => Date.parse(tasks.get(session.taskId)?.fm?.created)
+    || Date.parse(panes.get(session.pane)?.createdAt) || 0;
+  return stableSessionOrder(sessions, runningOrder, new Set((data.sessions || []).map((session) => session.id)), createdAt)
     .map((session) => sessionItem('running', session));
 }
 function pinnedItems() {
