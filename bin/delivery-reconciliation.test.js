@@ -153,7 +153,7 @@ test('busy injection lock skips reconciliation while continuing read-only health
 }));
 
 test('retained receipts have a single owner and cannot reappear after acknowledgement', () => fixture(async f => {
-  const x = f.add('codex', 'scheduled check', { retainReceipt: true, key: 'card:date' });
+  const x = f.add('codex', 'scheduled check', { retainReceipt: true, key: 'card:date', receiptId: hash('key:card:date') });
   x.append({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'scheduled check' }] } });
   delivery.reconcile(f.directory);
   assert.equal(delivery.statusForText(f.directory, 'scheduled check', 'card:date').received, true);
