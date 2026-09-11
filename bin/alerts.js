@@ -392,7 +392,7 @@ function nonReviewLog(task) {
   for (let index = 0; index < headings.length; index += 1) {
     const heading = headings[index][1];
     if (!/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+—\s+/.test(heading)) continue;
-    if (/(?:^|—\s*)review\s*\(/i.test(heading)) continue;
+    if (require('./review.js').isReviewerHeading(heading)) continue;
     const start = headings[index].index + headings[index][0].length;
     const end = index + 1 < headings.length ? headings[index + 1].index : body.length;
     const line = body.slice(start, end).split('\n').map((part) => part.trim()).find(Boolean);

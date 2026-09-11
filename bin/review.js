@@ -840,11 +840,19 @@ function autoContinuesSince(task, since) {
   return count;
 }
 
+// Everything the reviewer writes on a card, whether as a finding (`review (fable)`)
+// or as one of the ordinary card changes it may now make (`check-in (reviewer fable)
+// → done`). Accepts a bare kind or a full `<stamp> — <kind>` heading, because the
+// callers hold one or the other.
+function isReviewerHeading(heading) {
+  return /(?:^|—\s*)review\s*\(|\(reviewer /i.test(String(heading || ''));
+}
+
 function stampedLogEntries(body) {
   return logEntries(body).map((entry) => {
     const match = entry.heading.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}) — (.*)$/);
     return match ? { ...entry, stamp: match[1], kind: match[2] } : null;
-  }).filter((entry) => entry && !entry.kind.startsWith('review ('));
+  }).filter((entry) => entry && !isReviewerHeading(entry.kind));
 }
 
 function logWatermark(body) {
@@ -894,7 +902,7 @@ function isRunLogEntry(entry) {
 // output; re-reading them is a closed loop. stampedLogEntries drops the `review (`
 // headings already; this is the guard for anything that reaches the scorer anyway.
 function isReviewerLogEntry(entry) {
-  return /^review \(/.test(String(entry && entry.kind || ''));
+  return isReviewerHeading(entry && entry.kind);
 }
 
 // Idea cards and reviewer-filed cards have nothing for the reviewer to judge —
@@ -3955,6 +3963,7 @@ module.exports = {
   setNudgesLive,
   reviewStats,
   recordReviewerStatusChange,
+  isReviewerHeading,
   reviewerTranscriptMetrics,
   usageFromLines,
   reviewerUsage,

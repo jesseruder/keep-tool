@@ -115,7 +115,7 @@ function lastNonReviewLine(task) {
   while ((match = heading.exec(rest)) !== null) marks.push({ title: match[1], headingStart: match.index, bodyStart: heading.lastIndex });
   for (let index = 0; index < marks.length; index += 1) {
     const title = marks[index].title.replace(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2} — /, '');
-    if (title.startsWith('review (')) continue;
+    if (require('./review.js').isReviewerHeading(title)) continue;
     const end = index + 1 < marks.length ? marks[index + 1].headingStart : rest.length;
     const line = rest.slice(marks[index].bodyStart, end).split('\n').map((item) => item.trim()).find(Boolean);
     if (line) return clip(line, 160);

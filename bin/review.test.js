@@ -853,6 +853,25 @@ test('review-land statuses lands a status change, refuses a stale bundle and an 
   }
 });
 
+test('an ordinary card change written by the reviewer is not evidence either', () => {
+  const review = require('./review.js');
+  const body = [
+    '## 2026-09-11 09:00 — review (fable)', 'A finding.', '',
+    '## 2026-09-11 09:01 — check-in (reviewer fable) → done', 'Superseded; closing it.', '',
+    '## 2026-09-11 09:02 — done (reviewer fable)', 'Closed.', '',
+    '## 2026-09-11 09:03 — check-in → done', 'The owner closed it.', '',
+  ].join('\n');
+  assert.deepEqual(review.stampedLogEntries(body).map((entry) => entry.kind), ['check-in → done']);
+  for (const kind of ['review (fable)', 'check-in (reviewer fable) → done', 'done (reviewer fable)']) {
+    assert.equal(review.isReviewerHeading(kind), true, kind);
+  }
+  for (const kind of ['check-in', 'check-in → done', 'review outcome', 'landed (daemon)']) {
+    assert.equal(review.isReviewerHeading(kind), false, kind);
+  }
+  // The full `<stamp> — <kind>` form is accepted too; alerts and steps hold that one.
+  assert.equal(review.isReviewerHeading('2026-09-11 09:01 — check-in (reviewer fable) → done'), true);
+});
+
 test('a reviewer log entry alone is not evidence', () => {
   const now = new Date(2026, 8, 2, 12, 0).getTime();
   const state = { ...require('./review.js').emptyState('x'), lastReviewedAt: now - 2 * 3600e3, lastStatus: 'blocked' };
@@ -2350,6 +2369,13 @@ test('wrong-status findings apply only safe done/deferred transitions through no
     };
     const note = (id, extra = {}) => review.reviewNote(id, { kind: 'wrong-status', subject: id, severity: 'low', message: 'Obsolete work.', basis: 'observed', evidence: 'fixture history', checked: 'current status and owner history', suggestStatus: 'done', ...extra });
     const body = (id) => keep.loadTask(id).body;
+    // These race fixtures stand in for somebody else touching the card mid-finding.
+    // This script runs with KEEP_REVIEWER=1, so a plain checkinTask here would be
+    // written — and skipped — as the reviewer's own entry; drop the flag for it.
+    const ownerCheckin = (id, opts) => {
+      delete process.env.KEEP_REVIEWER;
+      try { return keep.checkinTask(id, opts); } finally { process.env.KEEP_REVIEWER = '1'; }
+    };
     const refuse = async (id, reason, fm = {}, extra = {}) => {
       make(id, fm);
       await note(id, extra);
@@ -2397,13 +2423,13 @@ test('wrong-status findings apply only safe done/deferred transitions through no
       assert.ok(body('new-log').includes('not applied: newer check-in than finding evidence'));
       assert.equal(keep.loadTask('new-log').fm.status, 'active');
       make('race');
-      race = () => keep.checkinTask('race', { message: 'Reopened by Jesse.', force: true, linkSession: false, commit: false });
+      race = () => ownerCheckin('race', { message: 'Reopened by Jesse.', force: true, linkSession: false, commit: false });
       await assert.rejects(note('race'), /card changed after review evidence/);
       assert.ok(!body('race').includes('-- reviewer'));
       assert.equal(keep.loadTask('race').fm.status, 'active');
       make('bundle-race');
       const bundle = review.buildBundle('bundle-race', { force: true });
-      keep.checkinTask('bundle-race', { message: 'New check-in after bundle.', linkSession: false, commit: false });
+      ownerCheckin('bundle-race', { message: 'New check-in after bundle.', linkSession: false, commit: false });
       await assert.rejects(note('bundle-race', { bundle: bundle.bundleId }), /card changed after review evidence/);
       assert.equal(keep.loadTask('bundle-race').fm.status, 'active');
       assert.ok(!body('bundle-race').includes('-- reviewer'));

@@ -444,7 +444,7 @@ function attributeCommits(commits, tasks, project) {
       ? new RegExp(`\\b${needle}[0-9a-f]{0,33}\\b`, 'i') : null;
     const taskIds = open.filter((task) => reference && cardLogEntries(task.body).some((entry) => {
       const heading = entry.heading.replace(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2} — /, '');
-      return !heading.startsWith('review (') && reference.test(entry.text);
+      return !require('./review.js').isReviewerHeading(heading) && reference.test(entry.text);
     }))
       .map((task) => task.id);
     return { ...commit, tasks: taskIds };
