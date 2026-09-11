@@ -439,6 +439,8 @@ after its hold expires; `step claim --force` explicitly abandons that run and wa
 
 The claim is the ownership: whoever holds it owns the lane, and `step done` or
 `step fail` from another session is refused (exit 5) unless it passes `--force`.
+A manual terminal has no session and is Owner at the keyboard: it is never refused,
+and it releases whichever claim is on the lane.
 Runs themselves are single-phase. `keep step run` records the run, executes the
 command, and finishes it the moment the command exits — exit 0 marks the run `done`,
 releases the claim, notifies waiters, and checks attributed cards in; a non-zero exit

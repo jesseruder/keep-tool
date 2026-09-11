@@ -362,6 +362,9 @@ function parseCommitEntries(output) {
 // Without an `ignore` list this is the plain subject listing. With one, each commit's
 // files are read alongside it and a commit that touched only ignored files is dropped;
 // `files` then carries the counted files for the caller's touched-directory summary.
+// Callers get at most 20 commits either way. The cap git applies is wider when there
+// is an ignore list, because it runs before the filter: twenty tfstate commits in a
+// row must not hide the config change behind them.
 function gitCommits(project, args, step) {
   const shape = stepShape(step);
   const paths = shape.paths || [];
@@ -370,7 +373,7 @@ function gitCommits(project, args, step) {
     const output = execFileSync('git', [
       '-C', expandProject(project), '--no-optional-locks', 'log',
       ignore.length ? '--format=%x00%h%x09%s' : '--format=%h%x09%s',
-      ...(ignore.length ? ['--name-only'] : []), ...args,
+      ...(ignore.length ? ['--name-only', '-n', '500'] : ['-n', '20']), ...args,
       '--', ...paths,
     ], { encoding: 'utf8', timeout: 10e3, stdio: ['ignore', 'pipe', 'ignore'] });
     if (!ignore.length) return { available: true, commits: parseCommits(output).slice(0, 20), files: null };
@@ -393,8 +396,8 @@ function gitCommits(project, args, step) {
 function pendingCommits(project, step, lastDoneSha) {
   const branch = defaultBranch(project);
   const args = lastDoneSha
-    ? [`${lastDoneSha}..origin/${branch}`, '-n', '20']
-    : ['--since=7 days ago', '-n', '20'];
+    ? [`${lastDoneSha}..origin/${branch}`]
+    : ['--since=7 days ago'];
   const result = gitCommits(project, args, step);
   let files = result.files || [];
   if (!result.files && result.available && result.commits.length) {
@@ -413,7 +416,7 @@ function pendingCommits(project, step, lastDoneSha) {
 
 function commitsBetween(project, fromSha, toSha, step) {
   if (!fromSha || !toSha || fromSha === toSha) return { available: true, commits: [] };
-  const result = gitCommits(project, [`${fromSha}..${toSha}`, '-n', '20'], step);
+  const result = gitCommits(project, [`${fromSha}..${toSha}`], step);
   return { available: result.available, commits: result.commits };
 }
 

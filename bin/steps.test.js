@@ -527,6 +527,18 @@ test('ignore globs drop state-only commits from pending and from the included ra
     assert.deepEqual(between.commits.map((entry) => entry.subject), ['config and state', 'config change']);
     const unfiltered = pendingCommits(repo.project, { paths: step.paths }, repo.second);
     assert.equal(unfiltered.commits.length, 3, 'without ignore the tfstate-only commit still counts');
+
+    // A burst of state-only commits must not push the real change past the 20-commit cap.
+    for (let serial = 3; serial < 28; serial += 1) {
+      write('terraform/terraform.tfstate', `{"serial":${serial}}\n`);
+      commit(`state only ${serial}`);
+    }
+    git(repo.project, 'push', '-q');
+    const buried = pendingCommits(repo.project, step, repo.second);
+    assert.deepEqual(buried.commits.map((entry) => entry.subject), ['config and state', 'config change'],
+      'ignored commits are filtered before the cap, not after');
+    const buriedRange = commitsBetween(repo.project, repo.second, git(repo.project, 'rev-parse', 'HEAD'), step);
+    assert.deepEqual(buriedRange.commits.map((entry) => entry.subject), ['config and state', 'config change']);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
