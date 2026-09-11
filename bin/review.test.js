@@ -948,7 +948,7 @@ function withReviewIdeaRepo(name, callback) {
   }
 }
 
-test('review-idea creates a kind idea card with the tag and body', () => {
+test('review-idea defaults its project to the code checkout and preserves an explicit project', () => {
   withReviewIdeaRepo('keep-review-idea-create-', ({ root, run }) => {
     const body = 'Pattern: agents hand-coordinate locks. Evidence: cards a and b. Proposed: add claims.';
     const out = run(['review-idea', 'Shared lock primitive', '--severity', 'med', '-m', body], {
@@ -962,12 +962,19 @@ test('review-idea creates a kind idea card with the tag and body', () => {
     assert.match(card, /^status: active$/m);
     assert.match(card, /^kind: idea$/m);
     assert.match(card, /^tags: \[reviewer-idea, personal\]$/m);
-    // no --project: the idea belongs to Keep itself, never to the reviewer's cwd
-    assert.match(card, new RegExp('^project: ' + root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'm'));
+    // The temp registry is also the CLI cwd; neither should become the idea project.
+    const codeRoot = path.resolve(__dirname, '..');
+    const codeProject = codeRoot.replace(os.homedir(), '~');
+    assert.match(card, new RegExp('^project: ' + codeProject.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'm'));
     assert.match(card, new RegExp(body.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     assert.match(digest, /^\[med\] idea \(claude ordinary\)$/m);
     assert.doesNotMatch(digest, /review \(fable\) idea|reviewer fable/);
     assert.doesNotMatch(card, /ordinary-session-1234/);
+
+    const explicit = run(['review-idea', 'Explicit project', '--project', root, '-m', body]);
+    assert.equal(explicit.status, 0, explicit.stderr);
+    const explicitCard = fs.readFileSync(path.join(root, 'tasks', 'reviewer-idea-explicit-project.md'), 'utf8');
+    assert.match(explicitCard, new RegExp('^project: ' + root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$', 'm'));
   });
 });
 

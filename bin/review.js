@@ -2244,8 +2244,9 @@ function reviewIdea(title, opts) {
         kind: 'idea',
         tags: ['reviewer-idea'],
         // The reviewer files ideas from wherever it happens to run (cwd / from a
-        // sweep); the idea is about Keep, and a project of / fails every git call.
-        project: options.project || keep.ROOT,
+        // sweep); the idea is about this Keep checkout, while keep.ROOT is the
+        // separate private registry and may not be a project at all.
+        project: options.project || path.resolve(__dirname, '..'),
         status: 'active',
         note,
         force: true,
