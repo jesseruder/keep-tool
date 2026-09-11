@@ -59,6 +59,57 @@ test('lifecycle records survive restart, deduplicate, and omit content', () => {
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('lifecycle reads cache immutable records while reconciling files, age, roots, and caller mutation', () => {
+  const roots = [fs.mkdtempSync(path.join(os.tmpdir(), 'keep-lifecycle-cache-a-')),
+    fs.mkdtempSync(path.join(os.tmpdir(), 'keep-lifecycle-cache-b-'))];
+  const sid = 'session', names = [`${'a'.repeat(64)}.json`, `${'b'.repeat(64)}.json`];
+  const dirs = roots.map((root) => path.join(root, '.keep', 'lifecycle', sid));
+  const write = (dir, name, value) => {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, name), JSON.stringify(value));
+  };
+  try {
+    write(dirs[0], names[0], { event: 'PreToolUse', entity: 'one', at: 1000, tool: 'Read' });
+    write(dirs[1], names[0], { event: 'PreToolUse', entity: 'other-root', at: 1000, tool: 'Read' });
+    const original = fs.readFileSync;
+    let reads = 0;
+    fs.readFileSync = function(file, ...args) {
+      if (dirs.some((dir) => String(file).startsWith(dir + path.sep))) reads++;
+      return original.call(this, file, ...args);
+    };
+    try {
+      const first = read(roots[0], sid, 1100);
+      first[0].at = 9999;
+      assert.equal(read(roots[0], sid, 1100)[0].at, 1000, 'returned records do not mutate the cache');
+      assert.equal(reads, 1, 'an unchanged immutable record is parsed once');
+      write(dirs[0], names[1], { event: 'PostToolUse', entity: 'two', at: 1050 });
+      assert.deepEqual(read(roots[0], sid, 1100).map((event) => event.entity), ['one', 'two']);
+      assert.equal(reads, 2, 'a newly listed record is parsed without rereading old records');
+      fs.unlinkSync(path.join(dirs[0], names[0]));
+      assert.deepEqual(read(roots[0], sid, 1100).map((event) => event.entity), ['two']);
+      assert.deepEqual(read(roots[0], sid, 24 * 3600e3 + 1050), [], 'age is evaluated on every read');
+      assert.equal(read(roots[1], sid, 1100)[0].entity, 'other-root', 'identical names in different roots stay isolated');
+    } finally { fs.readFileSync = original; }
+  } finally { for (const root of roots) fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('lifecycle reads retry partial files and invalidate a recreated directory', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-lifecycle-recreate-'));
+  const dir = path.join(root, '.keep', 'lifecycle', 'session');
+  const file = path.join(dir, `${'c'.repeat(64)}.json`);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(file, '{"event":');
+    assert.deepEqual(read(root, 'session', 1100), []);
+    fs.writeFileSync(file, JSON.stringify({ event: 'PreToolUse', entity: 'completed', at: 1000 }));
+    assert.equal(read(root, 'session', 1100)[0].entity, 'completed', 'a raced partial write is retried');
+    fs.rmSync(dir, { recursive: true });
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ event: 'PostToolUse', entity: 'replacement', at: 1050 }));
+    assert.equal(read(root, 'session', 1100)[0].entity, 'replacement');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('subagent hooks reconcile completion, resume gaps, missing stops and continued children', () => {
   const start = { event: 'SubagentStart', entity: 'child', at: 1000 };
   const stop = { ...start, event: 'SubagentStop', at: 2000 };

@@ -7,8 +7,12 @@ const path = require('path');
 const crypto = require('crypto');
 const EVENTS = new Set(['SubagentStart', 'SubagentStop', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'PermissionRequest', 'UserPromptSubmit', 'Stop', 'SessionStart', 'SessionEnd', 'Interrupt']);
 const ID = /^[a-z0-9_-]{1,160}$/i;
+const EVENT_FILE = /^[a-f0-9]{64}\.json$/;
 const LIMIT = 256;
 const MAX_AGE = 24 * 3600e3;
+const READ_CACHE_DIRECTORIES = 2048;
+const READ_CACHE_FILES = LIMIT + 64;
+const readCache = new Map();
 
 function directory(root, sid) {
   if (!ID.test(sid || '')) throw new Error('Invalid lifecycle session id');
@@ -66,15 +70,45 @@ function foreground(events, info, now = Date.now()) {
 function read(root, sid, now = Date.now()) {
   try {
     const dir = directory(root, sid);
-    return fs.readdirSync(dir).filter((name) => /^[a-f0-9]{64}\.json$/.test(name)).flatMap((name) => {
-      try {
-        const value = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
-        return EVENTS.has(value.event) && ID.test(value.entity) && Number.isFinite(value.at)
-          && value.at <= now && now - value.at < MAX_AGE ? [value] : [];
-      } catch { return []; }
-    }).sort((a, b) => (a.offset != null && b.offset != null ? a.offset - b.offset : 0)
+    const stat = fs.statSync(dir);
+    let cache = readCache.get(dir);
+    if (!cache || cache.dev !== stat.dev || cache.ino !== stat.ino) {
+      cache = { dev: stat.dev, ino: stat.ino, files: new Map() };
+      readCache.set(dir, cache);
+      if (readCache.size > READ_CACHE_DIRECTORIES) readCache.delete(readCache.keys().next().value);
+    } else {
+      // Keep recently read sessions while bounding daemon-long retention.
+      readCache.delete(dir);
+      readCache.set(dir, cache);
+    }
+    const names = fs.readdirSync(dir).filter((name) => EVENT_FILE.test(name));
+    const present = new Set(names);
+    for (const name of cache.files.keys()) if (!present.has(name)) cache.files.delete(name);
+    const events = [];
+    for (const name of names) {
+      let value = cache.files.get(name);
+      if (!value) {
+        try {
+          const parsed = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
+          if (EVENTS.has(parsed.event) && ID.test(parsed.entity) && Number.isFinite(parsed.at)) {
+            value = parsed;
+            cache.files.set(name, value);
+            if (cache.files.size > READ_CACHE_FILES) cache.files.delete(cache.files.keys().next().value);
+          }
+        } catch {}
+      }
+      if (value && value.at <= now && now - value.at < MAX_AGE) {
+        // Parsed values stay private to the cache so callers cannot corrupt later reads.
+        events.push({ ...value });
+      }
+    }
+    return events.sort((a, b) => (a.offset != null && b.offset != null ? a.offset - b.offset : 0)
       || a.at - b.at || Number(a.event === 'SubagentStop') - Number(b.event === 'SubagentStop'));
-  } catch { return []; }
+  } catch {
+    // Do not retain removed session directories indefinitely.
+    try { readCache.delete(directory(root, sid)); } catch {}
+    return [];
+  }
 }
 
 function stopReason(events, info) {

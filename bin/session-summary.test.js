@@ -42,7 +42,7 @@ test('daemon warmer resolves old live Codex transcripts outside the recent scan 
   const pane = { id: 'p', alive: true, meta: { agent: 'codex', sessionId: session.id } };
   const calls = [];
   const deps = { host: { request: async () => ({ panes: [pane] }) },
-    buildState: ({ hostPanes }) => { assert.equal(hostPanes[0], pane); return { sessions: [{ ...session, activity: { needsInput: true } }] }; },
+    buildState: ({ hostPanes, dashboard }) => { assert.equal(hostPanes[0], pane); assert.equal(dashboard, true); return { sessions: [{ ...session, activity: { needsInput: true } }] }; },
     codex: { rolloutFileFor: () => null, findRolloutFile: () => '/old/rollout.jsonl', recentText: (file) => { assert.equal(file, '/old/rollout.jsonl'); return 'completed old turn'; } },
     getSummary: (...args) => { calls.push(args); return { fresh: true, text: 'Prepared' }; },
   };

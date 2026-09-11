@@ -30,15 +30,45 @@ test('dashboard scans cache metadata and reconcile recent files within five seco
   const old = write('old', '', true), recent = write('recent');
   assert.equal(index.scan().length, 2);
   calls.length = 0;
-  index.scan();
+  const cached = index.scan();
   assert.ok(!calls.includes(old));
   assert.ok(!calls.includes(recent));
+  assert.equal(index.scan(), cached, 'warm scans reuse the complete result');
   advance(5000);
   index.scan();
   assert.ok(calls.includes(recent));
   calls.length = 0;
   index.scan({ fresh: true });
   assert.ok(calls.includes(old), 'safety callers do not trust cached historical metadata');
+});
+
+test('directory metadata detects transcript creation and deletion without watcher events', t => {
+  const { index, write } = fixture(t);
+  const first = write('first');
+  index.scan();
+  write('second');
+  assert.deepEqual(index.scan().map(row => row.id), ['first', 'second']);
+  fs.unlinkSync(first);
+  assert.deepEqual(index.scan().map(row => row.id), ['second']);
+});
+
+test('a project directory replaced under the same name cannot retain stale transcripts', t => {
+  const { index, write, root } = fixture(t);
+  write('old');
+  index.scan();
+  fs.rmSync(path.join(root, 'project'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'project'));
+  write('replacement');
+  assert.deepEqual(index.scan().map(row => row.id), ['replacement']);
+});
+
+test('fresh scans bypass complete-result caching and discover uninvalidated files', t => {
+  const { index, write } = fixture(t);
+  write('first');
+  const cached = index.scan();
+  write('second');
+  assert.notEqual(index.scan({ fresh: true }), cached);
+  assert.deepEqual(index.scan({ fresh: true }).map(row => row.id), ['first', 'second']);
 });
 
 test('watcher invalidation discovers resumed history and directory changes immediately', t => {
