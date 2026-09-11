@@ -193,6 +193,45 @@ test('project matching and project inference canonicalize linked worktree cwd', 
   }
 });
 
+test('checkin links the current session from a linked worktree of the card project', () => {
+  const f = linkedWorktreeFixture();
+  const keepRoot = path.join(f.root, 'registry');
+  const configFile = path.join(f.root, 'wt-config.json');
+  const file = path.join(keepRoot, 'tasks', 'worktree-checkin.md');
+  const { parseTask, serializeTask } = require('./keep.js');
+  const sessionId = 'worktree-checkin-session';
+  try {
+    for (const dir of ['tasks', 'archive', 'digests']) fs.mkdirSync(path.join(keepRoot, dir), { recursive: true });
+    spawnSync('git', ['init', '-q', keepRoot]);
+    spawnSync('git', ['-C', keepRoot, 'config', 'user.name', 'Test']);
+    spawnSync('git', ['-C', keepRoot, 'config', 'user.email', 'test@example.test']);
+    fs.writeFileSync(configFile, JSON.stringify({
+      worktreeRoot: path.join(f.root, 'managed-worktrees'),
+      roots: [f.root],
+      defaultRepos: [path.basename(f.main)],
+      guard: false,
+      include: [],
+    }));
+    fs.writeFileSync(file, serializeTask({ id: 'worktree-checkin', fm: {
+      title: 'Worktree checkin', status: 'active', kind: 'task', tags: ['personal'],
+      project: f.main, sessions: [], created: '2026-09-11',
+    }, body: '' }));
+
+    const result = spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'checkin', 'worktree-checkin', '-m', 'Linked from the worktree.'], {
+      cwd: f.worktree,
+      encoding: 'utf8',
+      env: { ...process.env, KEEP_DIR: keepRoot, KEEP_ALLOW_PUSH: '0', WT_CONFIG: configFile, CODEX_THREAD_ID: sessionId },
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.stderr, /was not linked because the current directory is outside the card project/);
+    const task = parseTask(fs.readFileSync(file, 'utf8'), 'worktree-checkin');
+    assert.deepEqual(task.fm.sessions.map((session) => [session.id, session.agent]), [[sessionId, 'codex']]);
+  } finally {
+    fs.rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
 test('project command canonicalizes worktrees without taking over card ownership or scheduling', () => {
   const f = linkedWorktreeFixture();
   const root = path.join(f.root, 'registry');

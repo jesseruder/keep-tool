@@ -198,6 +198,35 @@ test('link transfers the explicit session without using caller identity or chang
   } finally { f.cleanup(); }
 });
 
+test('checkin and add warn when their session link is outside the card project', () => {
+  const f = fixture();
+  const sid = 'outside-project-session';
+  try {
+    writeTask(f, 'outside-card', { project: '/different/project' });
+    f.commit();
+
+    const checked = f.run(['checkin', 'outside-card', '-m', 'Recorded without taking ownership.'], { CODEX_THREAD_ID: sid });
+    assert.equal(checked.status, 0, checked.stderr);
+    assert.match(f.load('outside-card').body, /Recorded without taking ownership\./);
+    assert.deepEqual(f.load('outside-card').fm.sessions || [], []);
+    assert.equal(checked.stderr,
+      `keep: check-in recorded, but session ${sid} was not linked because the current directory is outside the card project (/different/project); run keep from the project or repair explicitly with keep link outside-card --session ${sid} --agent codex\n`);
+
+    const added = f.run(['add', 'Outside created', '--project', '/different/project'], { CODEX_THREAD_ID: sid });
+    assert.equal(added.status, 0, added.stderr);
+    assert.deepEqual(f.load('outside-created').fm.sessions || [], []);
+    assert.equal(added.stderr,
+      `keep: card created, but session ${sid} was not linked because the current directory is outside the card project (/different/project); run keep from the project or repair explicitly with keep link outside-created --session ${sid} --agent codex\n`);
+
+    const script = `require(${JSON.stringify(CLI)}).checkinTask('outside-card', { message: 'Internal update.', linkSession: false, commit: false })`;
+    const internal = spawnSync(process.execPath, ['-e', script], {
+      cwd: f.root, encoding: 'utf8', env: { ...f.env, CODEX_THREAD_ID: sid },
+    });
+    assert.equal(internal.status, 0, internal.stderr);
+    assert.equal(internal.stderr, '');
+  } finally { f.cleanup(); }
+});
+
 test('link commits locally without pushing from a manual shell', () => {
   const f = fixture();
   const remote = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-link-remote-'));

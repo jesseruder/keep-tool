@@ -412,11 +412,14 @@ function guardReviewerStatusChange(changesStatus, force) {
 
 // Curation from another directory must not claim a card, so both the resume link
 // and the scheduler stamp only stick when this session is working in the project.
+// Linked worktrees of the project count as inside it.
 function sessionInTaskProject(task) {
   if (!task.fm.project) return true;
   const project = path.resolve(task.fm.project.replace(/^~/, os.homedir()));
   const cwd = process.cwd();
-  return cwd === project || cwd.startsWith(project + path.sep);
+  const canonical = canonicalCwd(cwd);
+  return [cwd, canonical].some((candidate) =>
+    candidate === project || candidate.startsWith(project + path.sep));
 }
 
 // `sessions` is the card's resume link and follows the session to its newest card;
@@ -446,17 +449,21 @@ function clearScheduler(task) {
 function recordSession(task) {
   // Guards addTask, checkinTask, retitle and done in one place — the reviewer may
   // legitimately file a follow-up card, and must not claim that one either.
-  if (isReviewerSession()) return;
+  if (isReviewerSession()) return { linked: false, skipped: 'reviewer', session: null };
   const session = currentSession();
   const sid = session && session.id;
-  if (!sid || !/^[A-Za-z0-9_-]+$/.test(sid)) return;
+  if (!sid || !/^[A-Za-z0-9_-]+$/.test(sid)) {
+    return { linked: false, skipped: 'no-session', session };
+  }
   // marker for the Stop hook: this session has touched the keep
   try {
     const dir = path.join(META, 'checkins');
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, sid), nowStamp());
   } catch {}
-  if (!sessionInTaskProject(task)) return;
+  if (!sessionInTaskProject(task)) {
+    return { linked: false, skipped: 'outside-project', session };
+  }
   // A live session has exactly one owning card. Without removing old links the
   // dashboard resolves duplicates by filesystem iteration order, so a check-in
   // can make the session appear under an unrelated task.
@@ -467,6 +474,14 @@ function recordSession(task) {
     // card, so preserve its `updated` timestamp and board position.
     fs.writeFileSync(taskPath(previous.id), serializeTask(previous));
   }
+  return { linked: true, skipped: null, session };
+}
+
+function warnSkippedSessionLink(task, result, action) {
+  if (!result || result.skipped !== 'outside-project') return;
+  process.stderr.write(
+    `keep: ${action}, but session ${result.session.id} was not linked because the current directory is outside the card project (${task.fm.project}); run keep from the project or repair explicitly with keep link ${task.id} --session ${result.session.id} --agent ${result.session.agent}\n`,
+  );
 }
 
 function parsePlan(body) {
@@ -1197,11 +1212,12 @@ function addTask({
       },
       body: '',
     };
-    if (linkSession) recordSession(task);
+    const sessionResult = linkSession ? recordSession(task) : null;
     if (linkSession && (checkAfter || check)) recordScheduler(task);
     if (beforeSave) beforeSave(task);
     if (note) appendLog(task, 'created', note);
     saveTask(task);
+    warnSkippedSessionLink(task, sessionResult, 'card created');
     if (commit) commitAndPush(`keep: add ${id}`);
     return task;
   };
@@ -1622,12 +1638,14 @@ function checkinTask(id, {
     }
     guardBlocked(task, status, force);
     guardLanding(task, status, commits, force);
+    let sessionResult = null;
     if (linkSession !== false) {
-      recordSession(task);
+      sessionResult = recordSession(task);
       if (!clearCheckAfter && (checkAfter || check || handoff)) recordScheduler(task, handoff || (checkAfter ? 'waiting' : null));
     }
     appendLog(task, `${heading || 'check-in'}${status ? ` → ${status}` : ''}`, logMessage(message, next, commits));
     saveTask(task);
+    warnSkippedSessionLink(task, sessionResult, 'check-in recorded');
     if (commit) {
       commitAndPush(`keep: ${commitLabel || 'checkin'} ${id}${status ? ` (${status})` : ''}`, commitLabel === 'review' ? ['tasks', 'reviews'] : undefined);
     }
