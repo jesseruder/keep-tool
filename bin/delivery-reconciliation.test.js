@@ -151,3 +151,16 @@ test('busy injection lock skips reconciliation while continuing read-only health
   assert.equal((await sweep(options)).length, 1);
   assert.equal(rows.at(-1).ok, false, 'contention must not conceal a real stale draft');
 }));
+
+test('retained receipts have a single owner and cannot reappear after acknowledgement', () => fixture(async f => {
+  const x = f.add('codex', 'scheduled check', { retainReceipt: true, key: 'card:date' });
+  x.append({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'scheduled check' }] } });
+  delivery.reconcile(f.directory);
+  assert.equal(delivery.statusForText(f.directory, 'scheduled check', 'card:date').received, true);
+  delivery.acknowledge(f.directory, 'scheduled check', 'card:date');
+  assert.equal(delivery.statusForText(f.directory, 'scheduled check', 'card:date'), null);
+  await assert.rejects(delivery.deliver({ session: { id: x.entry.sessionId, kind: 'codex' }, pane: 'pane', text: 'unrelated message',
+    file: x.entry.file, directory: f.directory, attempts: 0, precheck: async () => {}, type: async () => {},
+    submitDraft: async () => assert.fail('unexpected Enter'), draftMatches: async () => false }), /unconfirmed/);
+  assert.equal(delivery.statusForText(f.directory, 'scheduled check', 'card:date'), null);
+}));

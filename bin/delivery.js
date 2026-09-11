@@ -229,8 +229,11 @@ function reconcile(directory) {
         // sendPlain callers without retainReceipt. Otherwise a late success
         // followed by this sweep would make the next retry type it again.
         saveReceipt(directory, entry);
-        fs.mkdirSync(path.join(directory, 'settled'), { recursive: true, mode: 0o700 });
-        fs.renameSync(path.join(directory, name), path.join(directory, 'settled', name));
+        if (entry.retainReceipt) fs.unlinkSync(path.join(directory, name));
+        else {
+          fs.mkdirSync(path.join(directory, 'settled'), { recursive: true, mode: 0o700 });
+          fs.renameSync(path.join(directory, name), path.join(directory, 'settled', name));
+        }
       } else continue;
       settled.push(entry.sessionId);
     } catch {} // Read-only health inspection still exposes the unresolved record.
