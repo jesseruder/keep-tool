@@ -1070,7 +1070,8 @@ document.addEventListener('keydown', (event) => {
   }
   if (event.metaKey && key === '\\') { event.preventDefault(); toggleCollapsed('queue'); return; }
   if (event.metaKey && /^[1-5]$/.test(key)) {
-    setMode(['triage', 'watch', 'reviewer', 'fleet', 'review-queue'][Number(key) - 1]);
+    // Same order as the nav buttons: ⌘4 is Review queue, ⌘5 is Fleet.
+    setMode(['triage', 'watch', 'reviewer', 'review-queue', 'fleet'][Number(key) - 1]);
     event.preventDefault();
     return;
   }
