@@ -4081,3 +4081,70 @@ test('compact session restores the pane launch model rather than the transcript 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('restarting the fleet reviewer keeps its identity, its launch env, and its tick address', async () => {
+  const { restartSession } = require('./serve');
+  const review = require('./review.js');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-reviewer-restart-'));
+  const claudeFile = path.join(root, 'claude.jsonl');
+  fs.writeFileSync(claudeFile, JSON.stringify({ type: 'assistant', sessionId: 'rev', message: { content: [], stop_reason: 'end_turn' } }) + '\n');
+  try {
+    const session = { id: 'rev', kind: 'claude', state: 'idle', endedTurn: true, reviewer: true, project: root };
+    let pane = { id: 'p', pid: 10, cmd: '/bin/zsh', args: ['-l'], alive: true, attached: 0, visibleAttached: 0,
+      cols: 200, rows: 50, meta: { sessionId: 'rev', agent: 'claude', reviewer: true, title: 'fable-fleet-reviewer' } };
+    const row = { pid: 11, ppid: 10, pidStart: 'Tue Sep  8 10:00:00 2026', agent: 'claude', interactive: true, args: '/test/claude --resume rev' };
+    let exited = false, replaced = null;
+    const deps = {
+      root, withInjectionLock: (fn) => fn(), buildState: async () => ({ sessions: [session], tasks: [] }),
+      claudeRolloutFile: () => claudeFile,
+      reviewerMarker: (id) => { assert.equal(id, 'rev'); return { name: 'fable', model: 'fable', ended: Date.now() }; },
+      agentProcessRows: async () => (exited ? [] : [row]),
+      psTable: '11 10 ttys001 Tue Sep  8 10:00:00 2026 /test/claude --resume rev',
+      lsof: async () => '',
+      closeIdleSession: async (_body, guards) => { await guards.beforeClose(); exited = true; pane.alive = false; },
+      sleep: async () => {},
+      readScreenResult: async () => ({ text: 'claude --resume rev\n~/keep > ', cursor: { x: 9, y: 1 } }),
+      waitForHostAgent: async () => { assert.ok(replaced); },
+      host: { request: async (type, params) => {
+        if (type === 'hello') return { replaceExited: true };
+        if (type === 'get') return { pane: { ...pane } };
+        if (type === 'list') return { panes: [{ ...pane }] };
+        assert.equal(type, 'replace-exited');
+        replaced = params; pane = { ...pane, alive: true, pid: 20 }; return { pane };
+      } },
+    };
+    const result = await restartSession({ sessionId: 'rev', pane: 'p', pid: 10, mode: 'now' }, deps);
+    assert.equal(result.sessionId, 'rev');
+    // The resumed process is the reviewer again, not a nameless claude session: the
+    // marker env, the model, and the silenced prompt suggestion all come back.
+    assert.equal(replaced.env.KEEP_REVIEWER, '1');
+    assert.equal(replaced.env.KEEP_REVIEWER_NAME, 'fable');
+    assert.equal(replaced.env.KEEP_DIR, root);
+    assert.ok(Number(replaced.env.BASH_MAX_OUTPUT_LENGTH) >= 200000, 'a five-card bundle must still land in one Bash read');
+    assert.match(replaced.args[1], /'--model' 'fable'/);
+    assert.match(replaced.args[1], /promptSuggestionEnabled/);
+    assert.match(replaced.args[1], /'--resume' 'rev'/);
+    assert.equal(replaced.meta.reviewer, true, 'the pane stays the reviewer pane');
+    assert.equal(replaced.meta.sessionId, 'rev');
+
+    // Tick address: session-end tombstoned the marker, and the resumed process's
+    // session-start hook un-tombstones it, so the scheduler aims at it again.
+    const keepRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-reviewer-marker-'));
+    const markerDir = path.join(keepRoot, '.keep', 'reviewer');
+    fs.mkdirSync(markerDir, { recursive: true });
+    fs.writeFileSync(path.join(markerDir, 'rev'), JSON.stringify({ at: Date.now(), name: 'fable', model: 'fable', ended: Date.now() }));
+    const sessions = [{ id: 'rev', state: 'idle', mtime: Date.now() }];
+    const tombstoned = JSON.parse(fs.readFileSync(path.join(markerDir, 'rev'), 'utf8'));
+    assert.equal(review.pickReviewer(sessions, { rev: tombstoned }, Date.now()), null, 'a tombstoned marker receives no ticks');
+    const hookEnv = { ...process.env, KEEP_DIR: keepRoot, KEEP_NO_PUSH: '1' };
+    delete hookEnv.KEEP_REVIEWER; // a plain `claude --resume` carries none of it
+    const hook = spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'hook', 'session-start'],
+      { encoding: 'utf8', env: hookEnv, cwd: keepRoot, input: JSON.stringify({ session_id: 'rev', cwd: keepRoot }) });
+    assert.equal(hook.status, 0, hook.stderr);
+    const refreshed = JSON.parse(fs.readFileSync(path.join(markerDir, 'rev'), 'utf8'));
+    assert.equal(refreshed.ended, undefined);
+    assert.equal(refreshed.name, 'fable');
+    assert.equal(review.pickReviewer(sessions, { rev: refreshed }, Date.now())?.id, 'rev');
+    fs.rmSync(keepRoot, { recursive: true, force: true });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

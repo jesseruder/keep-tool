@@ -5,7 +5,9 @@ class RestartDeferred extends Error {}
 
 function refusal(session, pane, queued = false) {
   if (!session || !pane?.alive || pane.meta?.sessionId !== session.id || !['claude', 'codex'].includes(pane.meta?.agent)) return 'Session is not live in its original pane';
-  if (session.reviewer) return 'The fleet reviewer needs a coordinated restart';
+  // The fleet reviewer restarts like any other session: its pane keeps meta.reviewer,
+  // and bin/serve.js rebuilds its launch flags and env on the resume, so the marker,
+  // the model and the tick address all survive. Every guard below still applies.
   if (session.activity?.background?.scheduled?.length || session.backgroundJobs?.jobs?.some(j => j.kind === 'scheduled' && j.status === 'pending')) return 'Pause session-local scheduled jobs before restarting';
   if (session.endedTurn !== true || session.toolRunning || session.pendingBackground || session.waitingFor || session.rateLimit
       || session.unknownBackgroundJobs?.length || session.lifecycleAgents?.length
@@ -106,7 +108,7 @@ function createManager({ file, inspect, restart, forceRestart, onChange = () => 
         return raced;
       }
       if (entries.filter((e) => ['queued', 'restarting', 'recovery-needed'].includes(e.status)).length >= 50) throw Error('Restart queue is full');
-      if (!session || !pane?.alive || pane.meta?.sessionId !== body.sessionId || session.reviewer) throw Error('Expected a live non-reviewer session in this pane');
+      if (!session || !pane?.alive || pane.meta?.sessionId !== body.sessionId) throw Error('Expected a live session in this pane');
       const entry = { sessionId: body.sessionId, pane: body.pane, pid: pane.pid, mode: body.mode, status: 'queued', at: Date.now(),
         ...(body.mode === 'force' ? { token: require('node:crypto').randomUUID() } : {}) };
       entries.push(entry); save();

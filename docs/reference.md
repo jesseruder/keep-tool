@@ -659,6 +659,17 @@ limit by label prefix) and for the `review (fable)` heading findings land under.
 Switching models means restarting the session: the model is fixed at launch, and the
 governor reads it from the `.keep/reviewer/<id>` marker written at startup.
 
+The console's Fleet reviewer header has a **Restart** button beside `Tick now` and
+`Stats`. It uses the same `/api/restart-session` machinery as a pinned pane in Watch,
+in the guarded `idle` mode: the restart queues until the reviewer's turn has ended and
+nobody is viewing its pane, and stays cancellable while it waits. The button is
+disabled when there is no live reviewer pane. Because `claude --resume` inherits none
+of the launch environment, the restart rebuilds the reviewer's flags (`--model`, the
+prompt-suggestion settings) and env (`KEEP_REVIEWER`, `KEEP_DIR`,
+`BASH_MAX_OUTPUT_LENGTH`) from the marker, the pane keeps `meta.reviewer`, and the
+resumed process's session-start hook un-tombstones the marker so ticks resume against
+the same session id.
+
 ### Trust boundary — accepted risk
 
 The reviewer runs as an ordinary agent session with the permissions supplied at

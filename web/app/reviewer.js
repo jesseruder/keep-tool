@@ -1,4 +1,5 @@
 import * as api from './api.js';
+import { restartControls, installRestartControls } from './restart-session.js';
 
 const ACTIONS_KEY = 'keep.console.reviewer.actionsOnly';
 const SEEN_KEY = 'keep.console.reviewer.seenAt';
@@ -167,11 +168,25 @@ export function renderReviewerTop(ctx) {
           : `${marker.state}; no reviewer tick in the last 90 minutes`;
 }
 
+// The reviewer is the one session with no pane header of its own, so its restart
+// lives here. Same endpoint, same modes and the same queued/restarting/failed states
+// as a pinned pane in Watch: the guarded `idle` restart, cancellable while it waits.
+export function reviewerRestartHTML(ctx) {
+  const { session } = liveReviewer(ctx);
+  // A pending restart already renders its own state and Cancel through restartControls.
+  const pending = (ctx.data.restarts || []).some((entry) => entry.sessionId === session?.id
+    && ['queued', 'restarting', 'recovery-needed'].includes(entry.status));
+  if (pending) return '';
+  return session?.id && session?.pane
+    ? '<button class="btn" data-restart="idle" title="Restart the reviewer once its prompt is idle and the pane is not being viewed; the conversation is resumed">Restart</button>'
+    : '<button class="btn" disabled title="No live reviewer pane to restart">Restart</button>';
+}
+
 export function renderReviewer(ctx) {
   const { marker, session } = liveReviewer(ctx);
   const terminal = document.querySelector('#rterm');
   const status = `${marker?.state || session?.state || 'offline'} · ${tickPhrase(ctx)}`;
-  const structure = `<div class="shead"><h2>Fleet reviewer</h2><div class="meta mono">${ctx.projectHTML(session?.project || '~/keep')}<span>${ctx.esc(marker?.id || session?.id || '—')}</span><span>${ctx.esc(marker?.model || '—')}</span><span class="reviewer-state">${ctx.esc(status)}</span></div><div class="acts"><button class="btn" data-review-tick>Tick now</button><button class="btn" data-review-stats>Stats</button>${statsPopover(ctx)}</div></div><div class="review-terminal"></div>`;
+  const structure = `<div class="shead"><h2>Fleet reviewer</h2><div class="meta mono">${ctx.projectHTML(session?.project || '~/keep')}<span>${ctx.esc(marker?.id || session?.id || '—')}</span><span>${ctx.esc(marker?.model || '—')}</span><span class="reviewer-state">${ctx.esc(status)}</span></div><div class="acts"><button class="btn" data-review-tick>Tick now</button><button class="btn" data-review-stats>Stats</button>${statsPopover(ctx)}<span class="restart-controls"></span></div></div><div class="review-terminal"></div>`;
   const changed = ctx.patchHTML(terminal, structure);
   if (session?.pane) ctx.mount(terminal.querySelector('.review-terminal'), session.pane, { slot: 'reviewer' });
   else terminal.querySelector('.review-terminal').innerHTML = '<div class="placeholder">The reviewer is not currently attached to a host pane.</div>';
@@ -188,6 +203,17 @@ export function renderReviewer(ctx) {
       terminal.querySelector('.acts').classList.toggle('open');
     });
   }
+
+  // Re-rendered every refresh, not only on a structural change: the button has to
+  // follow the reviewer's pane appearing and going away, and the queued/failed state.
+  const restart = terminal.querySelector('.restart-controls');
+  ctx.patchHTML(restart, `${restartControls(ctx, session?.id)}${reviewerRestartHTML(ctx)}`);
+  // Cancel has to keep working even if the pane has gone out from under a queued
+  // restart, so fall back to the pane the entry was queued against.
+  const queued = (ctx.data.restarts || []).find((entry) => entry.sessionId === session?.id
+    && ['queued', 'restarting'].includes(entry.status));
+  const restartPane = session?.pane || queued?.pane || '';
+  if (session?.id && restartPane) installRestartControls(restart, ctx, session.id, restartPane);
 
   const value = stats(ctx);
   const day = value.days?.[today()] || {};

@@ -121,16 +121,19 @@ test('missing pane observations defer idle restarts across recovery without acce
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('restart readiness protects active work, decisions, reviewers and viewed queued panes', () => {
+test('restart readiness protects active work, decisions, and viewed queued panes', () => {
   const session = { id: 's', state: 'idle', endedTurn: true };
   const pane = { alive: true, attached: 0, meta: { sessionId: 's', agent: 'codex' } };
   assert.equal(refusal(session, pane), null);
-  for (const patch of [{ endedTurn: false }, { reviewer: true }, { pendingQuestion: {} }, { pendingBackground: true }, { toolRunning: true }, { waitingFor: 'lock' }, { unknownBackgroundJobs: ['job'] }, { lifecycleAgents: ['agent'] }, { notify: { type: 'permission' } }, { lastAssistantFull: 'Which environment?' }]) assert.ok(refusal({ ...session, ...patch }, pane));
+  for (const patch of [{ endedTurn: false }, { pendingQuestion: {} }, { pendingBackground: true }, { toolRunning: true }, { waitingFor: 'lock' }, { unknownBackgroundJobs: ['job'] }, { lifecycleAgents: ['agent'] }, { notify: { type: 'permission' } }, { lastAssistantFull: 'Which environment?' }]) assert.ok(refusal({ ...session, ...patch }, pane));
   for (const state of ['waiting', 'idle', 'done', 'running']) {
     const stopped = { ...session, kind: 'codex', state, mtime: Date.now(), activity: { needsInput: false, background: { checkAfter: 'tomorrow' } } };
     assert.equal(refusal(stopped, pane), null, 'displayed status cannot veto a stopped safe session');
     assert.equal(require('./session-cleanup').refusal(stopped, pane, new Set(), Date.now(), { manual: true, restart: true }), null);
   }
+  // The fleet reviewer restarts like any other session; only the ordinary guards apply.
+  assert.equal(refusal({ ...session, reviewer: true }, pane), null);
+  assert.ok(refusal({ ...session, reviewer: true, endedTurn: false }, pane));
   assert.ok(refusal(session, { ...pane, attached: 1 }, true));
   assert.equal(refusal(session, { ...pane, attached: 2, visibleAttached: 0 }, true), null);
   assert.ok(refusal(session, { ...pane, attached: 2, visibleAttached: 1 }, true));

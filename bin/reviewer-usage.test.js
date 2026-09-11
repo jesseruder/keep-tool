@@ -21,3 +21,23 @@ test('reviewer shows weekly allowance usage, preferring the model window', async
     assert.equal(weeklyText(value).usage, '—');
   }
 });
+
+test('the reviewer toolbar offers a guarded restart only when it has a live pane', async () => {
+  const { reviewerRestartHTML } = await import('../web/app/reviewer.js');
+  const ctx = (sessions, restarts = []) => ({ data: { sessions, restarts, review: { stats: { reviewer: { id: 'r1' } } } } });
+  const live = [{ id: 'r1', reviewer: true, pane: 'p7' }];
+  assert.match(reviewerRestartHTML(ctx(live)), /data-restart="idle"/);
+  // The guarded mode is the one Watch uses; nothing here may force or skip the guards.
+  assert.doesNotMatch(reviewerRestartHTML(ctx(live)), /data-restart="(?:now|force|recover)"/);
+  for (const sessions of [[], [{ id: 'r1', reviewer: true, pane: null }], [{ id: 'other', pane: 'p7' }]]) {
+    const html = reviewerRestartHTML(ctx(sessions));
+    assert.match(html, /disabled/);
+    assert.match(html, /No live reviewer pane/);
+    assert.doesNotMatch(html, /data-restart=/);
+  }
+  // A pending restart renders through restartControls instead; no second button.
+  for (const status of ['queued', 'restarting', 'recovery-needed']) {
+    assert.equal(reviewerRestartHTML(ctx(live, [{ sessionId: 'r1', status }])), '');
+  }
+  assert.match(reviewerRestartHTML(ctx(live, [{ sessionId: 'r1', status: 'done' }])), /data-restart="idle"/);
+});

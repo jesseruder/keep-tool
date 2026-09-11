@@ -2675,9 +2675,21 @@ async function restartSession(body, deps = {}) {
     // Do not apply the fresh-session defaults to a previously restricted agent.
     const bypass = session.kind === 'codex' ? '--dangerously-bypass-approvals-and-sandbox' : '--dangerously-skip-permissions';
     const flags = originalArgs.split(/\s+/).includes(bypass) ? [bypass] : [];
-    const argv = [session.kind, ...flags, session.kind === 'codex' ? 'resume' : '--resume', session.id];
+    // A reviewer must come back as the reviewer. The .keep/reviewer marker survives on
+    // its own (session-end tombstones it, the session-start hook of the resumed process
+    // un-tombstones it, and the tick addresses the session id, not the pid), but a bare
+    // `claude --resume` inherits neither the launch flags nor the env that carry the
+    // rest of its identity: its model, its silenced prompt suggestions, KEEP_REVIEWER,
+    // and the Bash output budget a five-card bundle needs. Rebuild them from the marker.
+    const reviewerLaunch = require('./reviewer-launch');
+    const reviewerMarker = pane.meta?.reviewer || session.reviewer
+      ? (deps.reviewerMarker || review.readReviewerMarker)(session.id) : null;
+    const reviewerModel = reviewerMarker && (reviewerMarker.model || reviewerMarker.name || 'fable');
+    const argv = [session.kind, ...flags, ...(reviewerMarker ? reviewerLaunch.reviewerFlags(reviewerModel) : []),
+      session.kind === 'codex' ? 'resume' : '--resume', session.id];
     const result = await host('replace-exited', { paneId: pane.id, expectedPid: pane.pid, sessionId: stopped.meta?.sessionId,
       cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').command(argv)}`], cwd,
+      ...(reviewerMarker ? { env: reviewerLaunch.reviewerEnv(deps.root || keep.ROOT, reviewerModel) } : {}),
       cols: pane.cols, rows: pane.rows, meta: { ...pane.meta, agent: session.kind, sessionId: session.id, restartedAt: Date.now() } });
     await (deps.waitForHostAgent || waitForHostAgent)({ pane: pane.id }, session.kind, deps);
     return { ok: true, sessionId: session.id, pane: result.pane.id, pid: result.pane.pid };
