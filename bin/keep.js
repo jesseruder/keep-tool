@@ -3299,6 +3299,10 @@ function renderCodexJobs(result) {
   for (const orphan of result.orphans) {
     lines.push(`orphan pid ${codexJobText(orphan.pid)} (${codexJobText(orphan.etime)}) job ${codexJobText(orphan.jobId)}`);
   }
+  for (const agent of result.orphanAgents?.agents || []) {
+    lines.push(`orphan ${codexJobText(agent.agent)} pid ${agent.pid}: ${codexJobText(agent.reason)} (${codexJobText(agent.cwd)})`);
+  }
+  if (result.orphanAgents?.known === false) lines.push(`Orphan agent discovery unavailable: ${codexJobText(result.orphanAgents.reason)}`);
   lines.push('', 'brokers', 'pid  age  state  reason  cwd');
   for (const broker of result.brokers || []) {
     lines.push([broker.pid ?? '-', broker.etime ?? '-', broker.state, broker.reason, broker.cwd ?? '-'].map(codexJobText).join('  '));
@@ -3313,7 +3317,7 @@ commands['codex-jobs'] = async (argv) => {
   const codexJobs = require('./codexjobs.js');
   const codexBrokers = require('./codexbrokers.js');
   if (o.reap) {
-    const result = await codexJobs.reap({ dry: o.dry });
+    const result = await codexJobs.reap({ dry: o.dry, deps: { includeAgents: true } });
     result.brokers = await codexBrokers.reap({ dry: o.dry });
     if (o.json) return process.stdout.write(JSON.stringify(result, null, 2) + '\n');
     for (const item of result.brokers.shutdown) console.log(`${o.dry ? 'would shut down' : 'shut down'} broker ${codexJobText(item.pid ?? item.stateDir)} (${codexJobText(item.reason)}) ${codexJobText(item.cwd)}`);
@@ -3326,7 +3330,7 @@ commands['codex-jobs'] = async (argv) => {
     return;
   }
 
-  const result = await codexJobs.list();
+  const result = await codexJobs.list({ includeAgents: true });
   result.brokers = await codexBrokers.list();
   if (o.json) return process.stdout.write(JSON.stringify(result, null, 2) + '\n');
   console.log(renderCodexJobs(result));

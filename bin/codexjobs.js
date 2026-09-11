@@ -70,7 +70,9 @@ async function inspect(deps = {}, only) {
 }
 
 async function list(deps = {}) {
-  return (await inspect(deps)).report;
+  const report = (await inspect(deps)).report;
+  if (deps.includeAgents) report.orphanAgents = await require('./orphan-agents').list(deps.agentDeps);
+  return report;
 }
 
 async function cancelJob(id, cwd, script, deps) {
@@ -146,6 +148,11 @@ async function reap({ dry = false, only, deps = {} } = {}) {
     : await inspect(deps, only);
   const { report, workspaceById } = snapshot;
   const result = { cancelled: [], killed: [], skipped: [] };
+  if (deps.includeAgents) {
+    const agents = await require('./orphan-agents').reap({ dry, only: only?.agents, deps: deps.agentDeps });
+    result.killed.push(...agents.killed);
+    result.skipped.push(...agents.skipped);
+  }
   if (report.discovery === 'unknown') {
     result.skipped.push({ id: 'discovery', why: 'Codex companion discovery is unknown; no jobs or shells were touched' });
     return result;

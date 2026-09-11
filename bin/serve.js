@@ -4896,7 +4896,7 @@ function start(deps = {}) {
       const ledger = readLiveSessionLedger();
       const aliveIds = stallAliveIds(ledger, now);
       const result = await stalled.sweep({
-        root: keep.ROOT, sessions: stalledSessionSnapshot(), runs: runs.listRuns(),
+        root: keep.ROOT, sessions: stalledSessionSnapshot(), runs: runs.listRuns(), includeAgents: true,
         ...(aliveIds ? { aliveIds } : {}),
       });
       health.record('stalled', { ok: true, cadenceMs: 60e3, detail: result.detail });

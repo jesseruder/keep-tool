@@ -691,3 +691,13 @@ the label-free input; `--predictions result.json` scores saved output without a 
 call. Results are informational and never gate pushes or restarts. See
 [Reviewer evaluation](reviewer-evaluation.md) for metrics, corpus limitations and
 custom suite format.
+
+The stalled daemon sweep and `keep codex-jobs --reap` also inspect orphaned
+interactive Codex and Claude processes. This check uses **PPID 1 and missing live
+pane/session ownership**, never process age or transcript idle time. Known session
+PIDs, explicit resume IDs, child processes, open conversation files, and running
+companion work protect a process. Unknown host, process, or companion evidence
+refuses cleanup. Only the current user's recognized interactive agent executables
+qualify; shell wrappers, headless commands, and unknown arguments are excluded.
+The reaper refreshes identity and safety evidence before SIGTERM. Use
+`keep codex-jobs --reap --dry` to inspect planned actions without sending signals.

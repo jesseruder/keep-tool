@@ -441,7 +441,7 @@ function reconcileFirstSeen(items, prior, now) {
   });
   for (const item of prior || []) {
     if (detected.has(itemKey(item))) continue;
-    if (['codex-job', 'orphan-shell', 'codex-broker'].includes(item.kind)) continue;
+    if (['codex-job', 'orphan-shell', 'codex-broker', 'orphan-agent'].includes(item.kind)) continue;
     const missingSweeps = Math.max(0, number(item.missingSweeps)) + 1;
     if (missingSweeps > 3) continue;
     current.push({
@@ -534,6 +534,19 @@ async function sweep(options = {}) {
         done.stateDir ? done.stateDir === item.stateDir : Number(done.pid) === Number(item.pid)));
     } catch (error) { reapError = error; }
   }
+  let agentReapResult = null;
+  if (options.includeAgents) {
+    const agentModule = require('./orphan-agents');
+    const report = await (deps.listOrphanAgents || agentModule.list)(options.agentDeps);
+    let agents = report.agents;
+    if (report.known && agents.length && options.autoReap !== false) {
+      agentReapResult = await (deps.reapOrphanAgents || agentModule.reap)({
+        only: new Set(agents.map(agent => agent.pid)), deps: options.agentDeps,
+      });
+      agents = agents.filter(agent => !agentReapResult.killed.includes(agent.pid));
+    }
+    detected.push(...agents);
+  }
   const current = reconcileFirstSeen(detected, readCurrent(options), now);
   saveCurrent(current, options);
   let detail = discovery.known ? `${current.length} current` : 'companion state unknown';
@@ -546,6 +559,7 @@ async function sweep(options = {}) {
     if (skipped) parts.push(`skipped ${skipped}`);
     detail += `; ${parts.join(', ')}`;
   }
+  if (agentReapResult) detail += `; reaped ${agentReapResult.killed.length} orphan agents`;
   if (reapError) {
     detail += `; reap failed: ${reapError.message || reapError}`;
   }
@@ -573,6 +587,7 @@ function attentionItems(items) {
     if (item.kind === 'session' && item.label === 'quiet (tool running)') text = `quiet (tool running): ${item.agent} "${item.title}" with no transcript growth for ${duration(item.idleMs)}`;
     else if (item.kind === 'session') text = `Stalled: ${item.agent} "${item.title}" running with no transcript growth for ${duration(item.idleMs)}`;
     else if (item.kind === 'run') text = `Stalled run: ${item.taskId} log idle ${duration(item.idleMs)}`;
+    else if (item.kind === 'orphan-agent') text = `Orphan ${item.agent} pid ${item.pid}: ${item.reason}; keep codex-jobs --reap`;
     else if (item.kind === 'codex-broker') text = `Codex broker ${item.pid ?? item.stateDir} for ${item.cwd || '(unknown)'}: ${item.reason}`;
     else if (item.kind === 'codex-job' && item.status === 'dead' && item.reason === 'worker gone') text = `Dead Codex job ${item.id}: worker process gone (record still running); keep codex-jobs --reap`;
     else if (item.kind === 'codex-job' && item.status === 'dead') text = `Dead Codex job ${item.id} (log ${bytes(item.logBytes)}, ${duration(item.idleMs)})`;
