@@ -17,7 +17,7 @@ const SESSION_SUMMARY_FIELDS = [
   'gitBranch', 'stalled',
 ];
 const SESSION_DETAIL_FIELDS = [
-  ...SESSION_SUMMARY_FIELDS, 'lastAssistantFull', 'pendingQuestion', 'pendingPlan', 'waitingFor',
+  ...SESSION_SUMMARY_FIELDS, 'lastAssistant', 'lastAssistantFull', 'pendingQuestion', 'pendingPlan', 'waitingFor',
   'toolRunning', 'pendingBackground', 'unknownBackgroundJobs', 'askedProse', 'attentionAt',
 ];
 const PANE_FIELDS = ['id', 'cwd', 'alive', 'agentAlive', 'createdAt', 'exitedAt', 'title', 'meta'];
@@ -44,8 +44,10 @@ function openTaskSummaries(state) {
   return (state.tasks || []).filter((task) => task?.fm?.status !== 'done').map(taskPickerSummary);
 }
 
-function sessionSummary(session) {
-  return pick(session, SESSION_SUMMARY_FIELDS);
+function sessionSummary(session, includeLastMessage = true) {
+  const summary = pick(session, SESSION_SUMMARY_FIELDS);
+  if (includeLastMessage && session?.lastAssistant !== undefined) summary.lastAssistant = clip(session.lastAssistant);
+  return summary;
 }
 
 function attentionSummary(item) {
@@ -127,8 +129,8 @@ function projectMobileState(state, view, id) {
   if (view === 'task') {
     requireId(view, id);
     const task = exactTask(state, id);
-    if (!task) return { ...shared(state, view), task: null };
-    return { ...shared(state, view), task };
+    if (!task) return { ...shared(state, view), id, task: null };
+    return { ...shared(state, view), id, task };
   }
 
   if (view === 'session') {
@@ -139,6 +141,7 @@ function projectMobileState(state, view, id) {
     const pane = session?.pane ? (state.panes || []).find((candidate) => candidate.id === session.pane) : null;
     return {
       ...shared(state, view),
+      id,
       sessions: session ? [pick(session, SESSION_DETAIL_FIELDS)] : [],
       tasks: task ? [taskSummary(task)] : [],
       attention,
@@ -153,6 +156,7 @@ function projectMobileState(state, view, id) {
     const pane = (state.panes || []).find((candidate) => candidate.id === id || candidate.id === session?.pane) || null;
     return {
       ...shared(state, view),
+      id,
       sessions: session ? [sessionSummary(session)] : [],
       panes: pane ? [paneSummary(pane)] : [],
     };
@@ -189,7 +193,10 @@ function projectMobileState(state, view, id) {
       ].filter(Boolean));
       return (state.tasks || []).filter((task) => taskIds.has(task.id) && task?.fm?.status !== 'done').map(taskPickerSummary);
     })(),
-    sessions: (state.sessions || []).map(sessionSummary),
+    sessions: (() => {
+      const attentionSessions = new Set((state.attention || []).map((item) => item.sessionId).filter(Boolean));
+      return (state.sessions || []).map((session) => sessionSummary(session, attentionSessions.has(session.id)));
+    })(),
     panes: (state.panes || []).map((pane) => {
       const summary = pick(pane, ['id', 'cwd', 'alive', 'createdAt', 'title']);
       summary.meta = pick(pane.meta, ['agent', 'sessionId', 'project', 'title']);

@@ -39,7 +39,7 @@ test('needs is a bounded allowlist with no done cards or detail bodies', () => {
   assert.equal(view.tasks[0].fm.sessions, undefined);
   assert.equal(view.sessions[0].backgroundJobs, undefined);
   assert.equal(view.sessions[0].lastAssistantFull, undefined);
-  assert.equal(view.sessions[0].lastAssistant, undefined);
+  assert.equal(view.sessions[0].lastAssistant, 'short answer');
   assert.equal(view.panes[0].cmd, undefined);
   assert.equal(view.generatedAt, undefined);
   assert.ok(Buffer.byteLength(JSON.stringify(view)) < 5000);
