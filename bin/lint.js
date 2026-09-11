@@ -108,7 +108,7 @@ function waitingNoTrigger(task, ctx) {
   const unresolved = (task.fm.depends_on || []).some((entry) => {
     const dependency = keep.parseDependency(entry);
     const upstream = ctx.allTasks.get(dependency.id);
-    return !keep.dependencyResolved(upstream, dependency.step);
+    return !keep.dependencyResolved(upstream, dependency);
   });
   if (futureCheck || unresolved) return [];
   return [finding(

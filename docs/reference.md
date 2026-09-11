@@ -42,7 +42,7 @@ keep plan <id> [--set "step"… | --add "text" | --insert <n> "text" | --remove 
 keep list [--status s]… [--tag t] [--project p] [--overdue] [--brief] [--all]
 keep show <id>
 keep link <card> --session <sid> --agent claude|codex
-keep wait-on <card> <upstream> [<upstream>...]
+keep wait-on <card> <upstream>[#<step>] [<upstream>...] -m "why"
 keep deps [<card>]
 keep done <id> [-m note] [--next "text"] [--commit <sha>]...
 keep tag <id> +a -b
@@ -140,15 +140,36 @@ set after push approval.
 
 ## Card dependencies
 
-Use `keep wait-on <your-card> <upstream> [<upstream>...]` when one card cannot continue
-until another finishes. It records `depends_on`, rejects missing cards and cycles, and
-moves active or review work to waiting. `keep deps [<card>]` shows resolved and pending
-edges. Do not use review for this: review is reserved for the owner's review.
+Use `keep wait-on <your-card> <upstream> -m "why"` when one card cannot continue
+until another finishes, or `<upstream>#<n>` for a specific plan step. Every new wait
+requires a nonempty reason, stored with that dependency. Step numbers are positional;
+re-check `keep deps` after inserting or removing upstream steps.
 
-When an upstream card becomes done, every completion path queues a local unblock record.
-The daemon appends the dependency result to the dependent card, returns a fully unblocked
-waiting card to active, and sends a fenced `[keep] unblocked` notice to its latest eligible
-linked session. Busy or missing sessions are retried without delivering from the CLI.
+Prefer a target that describes the fact you actually need:
+
+```sh
+keep wait-on <card> <upstream> --commit <sha>[,<sha>] -m "need these commits on origin"
+keep wait-on <card> <upstream> --deployed <sha> --target <name> -m "need this deployment"
+keep wait-on <card> <upstream> --status review,landing,done -m "need a reviewable result"
+```
+
+Commit waits resolve when every SHA reaches the upstream project's origin default
+branch, verified through the existing `keep landed` sweep. Deployment waits resolve
+from a `deployed <sha> to <target>` entry on the upstream card, as recorded by the deploy
+hook. Status waits resolve when the upstream reaches any listed status (`review`,
+`landing`, or `done`). Quote a pipe-separated status list if using `|` instead of commas.
+
+`keep wait-on` rejects missing cards and cycles and moves active or review work to
+waiting. `keep deps [<card>]` shows resolved and pending targets and their reasons.
+Remove an exact entry by repeating its target flags with `--remove`; for example,
+`keep wait-on <card> <upstream> --commit <sha> --remove -m "no longer needed"`.
+Other dependencies remain intact, and pending notices for the removed entry are cancelled.
+Already submitted messages cannot be recalled.
+
+The daemon appends satisfied dependency results to the dependent card, returns a fully
+unblocked waiting card to active when no scheduled check or need remains, and sends a
+fenced `[keep] unblocked` notice to its latest eligible linked session. Busy or missing
+sessions are retried without delivering from the CLI.
 
 ## Plans
 

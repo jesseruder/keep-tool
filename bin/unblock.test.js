@@ -42,6 +42,7 @@ function writeTask(root, id, options = {}) {
     'kind: task',
     'tags: [personal]',
     ...(options.dependsOn && options.dependsOn.length ? [`depends_on: [${options.dependsOn.join(', ')}]`] : []),
+    ...(options.project ? [`project: ${options.project}`] : []),
     ...(options.sessions && options.sessions.length ? [
       'sessions:',
       ...options.sessions.flatMap((session) => [
@@ -87,7 +88,7 @@ test('wait-on removal is exact, audited, cancels only removed notices and preser
     const records = unblock.readRecords({ root });
     assert.equal(records.find((r) => r.upstream === 'upstream#1').gaveUp, 'dependency-removed');
     assert.equal(records.find((r) => r.upstream === 'other').gaveUp, null);
-    const readd = cli(fixture, ['wait-on', 'dependent', 'upstream#1']);
+    const readd = cli(fixture, ['wait-on', 'dependent', 'upstream#1', '-m', 'need deploy']);
     assert.equal(readd.status, 0, readd.stderr);
     assert.equal(unblock.readRecords({ root }).find((r) => r.upstream === 'upstream#1').gaveUp, null);
     assert.equal(run('upstream#1').status, 0);
@@ -140,11 +141,11 @@ test('a delivered dependency can be removed and re-added as a fresh wait', () =>
     writeTask(fixture.root, 'dependent');
     commitFixtures(fixture);
     const deliver = `(async()=>{await require(${JSON.stringify(UNBLOCK)}).sweep({deps:{deliver:async()=>({sessionId:'test'})}})})().catch(e=>{console.error(e);process.exitCode=1})`;
-    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream']).status, 0);
+    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream', '-m', 'need upstream']).status, 0);
     sweep(fixture, deliver);
     assert.equal(task(fixture.root, 'dependent').fm.status, 'active');
     assert.equal(cli(fixture, ['wait-on', 'dependent', '--remove', 'upstream']).status, 0);
-    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream']).status, 0);
+    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream', '-m', 'need upstream']).status, 0);
     sweep(fixture, deliver);
     assert.equal(task(fixture.root, 'dependent').fm.status, 'active');
     assert.ok(records(fixture.root).some((r) => r.deliveredAt && !r.gaveUp));
@@ -157,10 +158,10 @@ test('removal during sweep preserves cancellation and permits a later re-add', (
     writeTask(fixture.root, 'upstream', { status: 'done' });
     writeTask(fixture.root, 'dependent');
     commitFixtures(fixture);
-    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream']).status, 0);
+    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream', '-m', 'need upstream']).status, 0);
     sweep(fixture, `(async()=>{await require(${JSON.stringify(UNBLOCK)}).sweep({deps:{beforeLock:()=>require('child_process').execFileSync(process.execPath,[${JSON.stringify(CLI)},'wait-on','dependent','--remove','upstream']),deliver:async()=>{throw Error('should not deliver')}}})})().catch(e=>{console.error(e);process.exitCode=1})`);
     assert.equal(records(fixture.root)[0].gaveUp, 'dependency-removed');
-    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream']).status, 0);
+    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream', '-m', 'need upstream']).status, 0);
     sweep(fixture, `(async()=>{await require(${JSON.stringify(UNBLOCK)}).sweep({deps:{deliver:async()=>({sessionId:'test'})}})})().catch(e=>{console.error(e);process.exitCode=1})`);
     assert.equal(task(fixture.root, 'dependent').fm.status, 'active');
   } finally { fs.rmSync(fixture.root, { recursive: true, force: true }); }
@@ -172,12 +173,12 @@ test('background repair cannot revive cancellation and every sweep write is regi
     writeTask(fixture.root, 'upstream', { status: 'done', body: '## Plan\n- [x] deploy\n' });
     writeTask(fixture.root, 'dependent');
     commitFixtures(fixture);
-    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream#1']).status, 0);
+    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream#1', '-m', 'need deploy']).status, 0);
     const old = task(fixture.root, 'dependent');
     assert.equal(cli(fixture, ['wait-on', 'dependent', '--remove', 'upstream#1']).status, 0);
     unblock.writePending(old, task(fixture.root, 'upstream'), { root: fixture.root, dependency: 'upstream#1' });
     assert.equal(records(fixture.root)[0].gaveUp, 'dependency-removed');
-    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream#1']).status, 0);
+    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream#1', '-m', 'need deploy']).status, 0);
     sweep(fixture, `(async()=>{
       const fs=require('fs'),keep=require(${JSON.stringify(CLI)}),u=require(${JSON.stringify(UNBLOCK)});
       const write=fs.writeFileSync;let locked=false,writes=0;
@@ -197,7 +198,7 @@ test('completed sibling sweep cannot override a check or need preserved by remov
       writeTask(fixture.root, 'open-upstream');
       writeTask(fixture.root, 'dependent');
       commitFixtures(fixture);
-      assert.equal(cli(fixture, ['wait-on', 'dependent', 'done-upstream', 'open-upstream']).status, 0);
+      assert.equal(cli(fixture, ['wait-on', 'dependent', 'done-upstream', 'open-upstream', '-m', 'need both']).status, 0);
       const dependent = task(fixture.root, 'dependent'); Object.assign(dependent.fm, extra);
       fs.writeFileSync(path.join(fixture.root, 'tasks', 'dependent.md'), serializeTask(dependent));
       assert.equal(cli(fixture, ['wait-on', 'dependent', '--remove', 'open-upstream']).status, 0);
@@ -244,22 +245,104 @@ test('depends_on round-trips through task serialization', () => {
   assert.deepEqual(parseTask(serializeTask(parsed), 'dependent').fm.depends_on, ['alpha', 'beta']);
 });
 
+test('reasoned wait targets round-trip as readable dependency objects', () => {
+  const task = {
+    id: 'dependent',
+    fm: {
+      title: 'dependent', status: 'waiting', kind: 'task', tags: ['personal'], created: '2026-09-03',
+      depends_on: [
+        'legacy#2',
+        { card: 'release', kind: 'commit', commits: ['bbbbbbb', 'aaaaaaa'], reason: 'need both: API, UI' },
+      ],
+    },
+    body: '',
+  };
+  const serialized = serializeTask(task);
+  assert.match(serialized, /depends_on:\n  - legacy#2\n  - card: release\n    kind: commit\n    commits: aaaaaaa\|bbbbbbb\n    reason: "need both: API, UI"/);
+  const reparsed = parseTask(serialized, task.id);
+  assert.equal(reparsed.fm.depends_on[0], 'legacy#2');
+  assert.deepEqual(parseDependency(reparsed.fm.depends_on[1]), {
+    id: 'release', step: null, kind: 'commit', commits: ['aaaaaaa', 'bbbbbbb'], sha: '', target: '', statuses: [], reason: 'need both: API, UI',
+  });
+});
+
+test('wait-on requires and stores a reason and exact removal canonicalizes target sets', () => {
+  const fixture = registry();
+  try {
+    writeTask(fixture.root, 'upstream', { status: 'review' });
+    writeTask(fixture.root, 'dependent');
+    commitFixtures(fixture);
+    const missingReason = cli(fixture, ['wait-on', 'dependent', 'upstream', '--status', 'done,review']);
+    assert.equal(missingReason.status, 2);
+    assert.match(missingReason.stderr, /every new wait needs -m "why"/);
+    const added = cli(fixture, ['wait-on', 'dependent', 'upstream', '--status', 'done|review', '-m', 'need a reviewable result']);
+    assert.equal(added.status, 0, added.stderr);
+    const dependency = parseDependency(task(fixture.root, 'dependent').fm.depends_on[0]);
+    assert.deepEqual(dependency.statuses, ['review', 'done']);
+    assert.equal(dependency.reason, 'need a reviewable result');
+    assert.match(cli(fixture, ['deps', 'dependent']).stdout, /upstream --status review,done.+need a reviewable result/);
+    const alternate = cli(fixture, ['wait-on', 'dependent', 'upstream', '--commit', 'deadbeef', '-m', 'need exact commit']);
+    assert.equal(alternate.status, 0, alternate.stderr);
+    const wrong = cli(fixture, ['wait-on', 'dependent', 'upstream', '--status', 'landing', '--remove']);
+    assert.equal(wrong.status, 2);
+    const removed = cli(fixture, ['wait-on', 'dependent', 'upstream', '--status', 'review,done', '--remove', '-m', 'scope changed']);
+    assert.equal(removed.status, 0, removed.stderr);
+    assert.deepEqual(task(fixture.root, 'dependent').fm.depends_on.map((entry) => parseDependency(entry).kind), ['commit']);
+    assert.equal(unblock.readRecords({ root: fixture.root }).find((record) => record.upstream === 'upstream --status review,done').gaveUp, 'dependency-removed');
+    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream', '--commit', 'deadbeef', '--remove']).status, 0);
+    assert.deepEqual(task(fixture.root, 'dependent').fm.depends_on || [], []);
+  } finally { fs.rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test('status and deployed targets resolve only from their named facts and preserve delivery semantics', () => {
+  const fixture = registry();
+  try {
+    writeTask(fixture.root, 'done-without-review', { status: 'done' });
+    writeTask(fixture.root, 'review-reached', {
+      body: '## 2026-09-03 11:00 — check-in → active\nMoved on.\n\n## 2026-09-03 10:00 — check-in → review\nReady.\n',
+    });
+    writeTask(fixture.root, 'reviewer-noise', {
+      body: '## 2026-09-03 11:00 — review (fable)\nThis is a fleet review heading, not card status.\n',
+    });
+    writeTask(fixture.root, 'deployed', {
+      status: 'done',
+      body: '## 2026-09-03 11:00 — deployed\ndeployed abc1234 to prod/us-west — repo /tmp/example\n',
+    });
+    for (const id of ['status-stuck', 'status-ready', 'status-noise', 'deploy-ready']) writeTask(fixture.root, id);
+    commitFixtures(fixture);
+
+    assert.equal(cli(fixture, ['wait-on', 'status-stuck', 'done-without-review', '--status', 'review', '-m', 'need review']).status, 0);
+    assert.equal(cli(fixture, ['wait-on', 'status-ready', 'review-reached', '--status', 'review', '-m', 'need review']).status, 0);
+    assert.equal(cli(fixture, ['wait-on', 'status-noise', 'reviewer-noise', '--status', 'review', '-m', 'need real review status']).status, 0);
+    assert.equal(cli(fixture, ['wait-on', 'deploy-ready', 'deployed', '--deployed', 'abc1234', '--target', 'prod/us-west', '-m', 'need rollout']).status, 0);
+    assert.equal(records(fixture.root).filter((record) => record.dependent !== 'status-stuck').length, 2);
+    assert.ok(fs.readdirSync(path.join(fixture.root, '.keep', 'unblocked')).every((name) => !name.includes('prod/us-west')));
+
+    sweep(fixture, `(async()=>{await require(${JSON.stringify(UNBLOCK)}).sweep({deps:{deliver:async()=>({sessionId:'test'})}})})().catch(e=>{console.error(e);process.exitCode=1})`);
+    assert.equal(task(fixture.root, 'status-stuck').fm.status, 'waiting');
+    assert.equal(task(fixture.root, 'status-ready').fm.status, 'active');
+    assert.equal(task(fixture.root, 'status-noise').fm.status, 'waiting');
+    assert.equal(task(fixture.root, 'deploy-ready').fm.status, 'active');
+    assert.match(task(fixture.root, 'deploy-ready').body, /unblocked: deployed --deployed abc1234 --target prod\/us-west was recorded/);
+  } finally { fs.rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
 test('wait-on refuses missing, self, and cyclic upstream cards', () => {
   const fixture = registry();
   try {
     writeTask(fixture.root, 'dependent');
     writeTask(fixture.root, 'upstream', { dependsOn: ['dependent'] });
     commitFixtures(fixture);
-    const missing = cli(fixture, ['wait-on', 'dependent', 'missing']);
+    const missing = cli(fixture, ['wait-on', 'dependent', 'missing', '-m', 'need it']);
     assert.notEqual(missing.status, 0);
     assert.match(missing.stderr, /no task "missing"/);
-    const self = cli(fixture, ['wait-on', 'dependent', 'dependent']);
+    const self = cli(fixture, ['wait-on', 'dependent', 'dependent', '-m', 'need it']);
     assert.equal(self.status, 2);
     assert.match(self.stderr, /dependent -> dependent/);
-    const cycle = cli(fixture, ['wait-on', 'dependent', 'upstream']);
+    const cycle = cli(fixture, ['wait-on', 'dependent', 'upstream', '-m', 'need it']);
     assert.equal(cycle.status, 2);
     assert.match(cycle.stderr, /dependent -> upstream -> dependent/);
-    const reviewer = cli(fixture, ['wait-on', 'dependent', 'upstream'], { KEEP_REVIEWER: '1' });
+    const reviewer = cli(fixture, ['wait-on', 'dependent', 'upstream', '-m', 'need it'], { KEEP_REVIEWER: '1' });
     assert.equal(reviewer.status, 4);
     assert.match(reviewer.stderr, /fleet reviewer applies done\/deferred only through a wrong-status finding/);
   } finally { fs.rmSync(fixture.root, { recursive: true, force: true }); }
@@ -274,10 +357,10 @@ test('wait-on validates plan steps and detects cycles through qualified dependen
       dependsOn: ['dependent#1'],
     });
     commitFixtures(fixture);
-    const missingStep = cli(fixture, ['wait-on', 'dependent', 'upstream#3']);
+    const missingStep = cli(fixture, ['wait-on', 'dependent', 'upstream#3', '-m', 'need step']);
     assert.equal(missingStep.status, 2);
     assert.match(missingStep.stderr, /upstream has no plan step 3 \(plan has 2\)/);
-    const cycle = cli(fixture, ['wait-on', 'dependent', 'upstream#2']);
+    const cycle = cli(fixture, ['wait-on', 'dependent', 'upstream#2', '-m', 'need step']);
     assert.equal(cycle.status, 2);
     assert.match(cycle.stderr, /dependent -> upstream -> dependent/);
   } finally { fs.rmSync(fixture.root, { recursive: true, force: true }); }
@@ -289,11 +372,12 @@ test('wait-on moves active to waiting, logs, and queues an already-done upstream
     writeTask(fixture.root, 'dependent');
     writeTask(fixture.root, 'upstream', { status: 'done', title: 'Finished upstream' });
     commitFixtures(fixture);
-    const result = cli(fixture, ['wait-on', 'dependent', 'upstream']);
+    const result = cli(fixture, ['wait-on', 'dependent', 'upstream', '-m', 'need completion']);
     assert.equal(result.status, 0, result.stderr);
     const dependent = task(fixture.root, 'dependent');
     assert.equal(dependent.fm.status, 'waiting');
-    assert.deepEqual(dependent.fm.depends_on, ['upstream']);
+    assert.equal(parseDependency(dependent.fm.depends_on[0]).id, 'upstream');
+    assert.equal(parseDependency(dependent.fm.depends_on[0]).reason, 'need completion');
     assert.match(dependent.body, /— check-in(?: → waiting)?\nwaiting on: upstream; already done: upstream/);
     assert.match(dependent.body, /next: waiting on upstream/);
     assert.deepEqual(records(fixture.root).map((record) => [record.dependent, record.upstream, record.deliveredAt]), [
@@ -349,7 +433,7 @@ test('a completed plan step unblocks its dependent while the upstream stays acti
     });
     writeTask(fixture.root, 'dependent');
     commitFixtures(fixture);
-    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream#2']).status, 0);
+    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream#2', '-m', 'need production']).status, 0);
     const marked = cli(fixture, ['plan', 'upstream', '--done', '2']);
     assert.equal(marked.status, 0, marked.stderr);
     assert.equal(task(fixture.root, 'upstream').fm.status, 'active');
@@ -371,7 +455,7 @@ test('checkin --step queues a qualified dependency record', () => {
     });
     writeTask(fixture.root, 'dependent');
     commitFixtures(fixture);
-    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream#2']).status, 0);
+    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream#2', '-m', 'need production']).status, 0);
     const marked = cli(fixture, ['checkin', 'upstream', '--step', '2', '-m', 'Rollout reached steady state.']);
     assert.equal(marked.status, 0, marked.stderr);
     assert.deepEqual(records(fixture.root).map((record) => record.upstream), ['upstream#2']);
@@ -386,7 +470,7 @@ test('whole-card done satisfies and triggers a step-qualified dependency', () =>
     });
     writeTask(fixture.root, 'dependent');
     commitFixtures(fixture);
-    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream#2']).status, 0);
+    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream#2', '-m', 'need production']).status, 0);
     assert.equal(cli(fixture, ['done', 'upstream']).status, 0);
     assert.deepEqual(records(fixture.root).map((record) => record.upstream), ['upstream#2']);
     const source = `(async()=>{const u=require(${JSON.stringify(UNBLOCK)});await u.sweep({deps:{deliver:async()=>({sessionId:'thread-done'})}})})().catch(e=>{console.error(e);process.exitCode=1})`;
@@ -420,7 +504,7 @@ test('all-resolved sweep activates once, logs once, and delivers once', () => {
     writeTask(fixture.root, 'upstream', { status: 'done', title: 'Upstream rollout' });
     writeTask(fixture.root, 'dependent');
     commitFixtures(fixture);
-    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream']).status, 0);
+    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream', '-m', 'need upstream']).status, 0);
     const source = `(async()=>{const u=require(${JSON.stringify(UNBLOCK)});let sent=0;const deps={deliver:async()=>{sent++;return {sessionId:'thread-one',kind:'codex'}}};await u.sweep({deps});await u.sweep({deps});process.stdout.write(String(sent))})().catch(e=>{console.error(e);process.exitCode=1})`;
     assert.equal(sweep(fixture, source), '1');
     const dependent = task(fixture.root, 'dependent');
@@ -438,7 +522,7 @@ test('partial resolution logs once, stays waiting, and does not deliver', () => 
     writeTask(fixture.root, 'open-two');
     writeTask(fixture.root, 'dependent');
     commitFixtures(fixture);
-    assert.equal(cli(fixture, ['wait-on', 'dependent', 'done-one', 'open-two']).status, 0);
+    assert.equal(cli(fixture, ['wait-on', 'dependent', 'done-one', 'open-two', '-m', 'need both']).status, 0);
     const source = `(async()=>{const u=require(${JSON.stringify(UNBLOCK)});let sent=0;await u.sweep({deps:{deliver:async()=>{sent++;return {sessionId:'x'}}}});process.stdout.write(String(sent))})().catch(e=>{console.error(e);process.exitCode=1})`;
     assert.equal(sweep(fixture, source), '0');
     const dependent = task(fixture.root, 'dependent');
@@ -453,7 +537,7 @@ test('missing sessions increment attempts and give up at the configured cap', ()
     writeTask(fixture.root, 'upstream', { status: 'done' });
     writeTask(fixture.root, 'dependent');
     commitFixtures(fixture);
-    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream']).status, 0);
+    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream', '-m', 'need upstream']).status, 0);
     const source = `(async()=>{const u=require(${JSON.stringify(UNBLOCK)});await u.sweep();await u.sweep()})().catch(e=>{console.error(e);process.exitCode=1})`;
     sweep(fixture, source, { KEEP_DELIVER_MAX_DEFERRALS: '2' });
     const record = records(fixture.root)[0];
@@ -505,7 +589,7 @@ test('reopening and waiting again creates a fresh completion-keyed delivery', ()
     writeTask(fixture.root, 'upstream', { status: 'done', updated: '2026-09-03T09:00' });
     writeTask(fixture.root, 'dependent');
     commitFixtures(fixture);
-    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream']).status, 0);
+    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream', '-m', 'need upstream']).status, 0);
     const deliver = `(async()=>{const u=require(${JSON.stringify(UNBLOCK)});await u.sweep({deps:{deliver:async()=>({sessionId:'thread'})}})})().catch(e=>{console.error(e);process.exitCode=1})`;
     sweep(fixture, deliver);
     const firstName = fs.readdirSync(path.join(fixture.root, '.keep', 'unblocked'))[0];
@@ -516,7 +600,7 @@ test('reopening and waiting again creates a fresh completion-keyed delivery', ()
       updated: '2026-09-03T10:00',
       body: '## 2026-09-03 10:00 — check-in → active\nReopened.\n',
     });
-    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream']).status, 0);
+    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream', '-m', 'need upstream again']).status, 0);
     assert.equal(records(fixture.root).length, 0, 'wait-on removes the prior delivered record');
     assert.equal(cli(fixture, ['done', 'upstream']).status, 0);
     sweep(fixture, deliver);
@@ -611,7 +695,7 @@ test('deps, brief, and resume surface unresolved or undelivered dependencies', (
     writeTask(fixture.root, 'still-open');
     writeTask(fixture.root, 'dependent');
     commitFixtures(fixture);
-    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream', 'still-open']).status, 0);
+    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream', 'still-open', '-m', 'need both']).status, 0);
     const deps = cli(fixture, ['deps', 'dependent']);
     assert.equal(deps.status, 0, deps.stderr);
     assert.match(deps.stdout, /resolved\s+upstream/);

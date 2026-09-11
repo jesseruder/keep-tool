@@ -479,10 +479,10 @@ function rulesDecision(entry, task, policy, now) {
     // `landing`, so the fixed rule has to look for one itself.
     const blocking = (task.fm.depends_on || []).filter((entry) => {
       const dependency = keep.parseDependency(entry);
-      return !keep.dependencyResolved(keep.loadTaskAnywhere(dependency.id), dependency.step);
+      return !keep.dependencyResolved(keep.loadTaskAnywhere(dependency.id), dependency);
     });
     if (blocking.length) {
-      return { wouldClose: false, reason: `landing card waits on ${blocking.join(', ')}`, fixed: true };
+      return { wouldClose: false, reason: `landing card waits on ${blocking.map(keep.dependencyTarget).join(', ')}`, fixed: true };
     }
     return { wouldClose: true, reason: 'card is landing and its commits are on the default branch', fixed: true };
   }
@@ -549,6 +549,49 @@ async function sweep({ now = Date.now(), dry = false, only } = {}) {
   let checkins = 0;
   let shadowCalls = 0;
   const tasks = keep.loadAll(false).filter((task) => !only || task.id === only);
+  const allTasks = new Map(keep.loadAll(true).map((task) => [task.id, task]));
+
+  // Commit wait targets are explicit origin facts, so include them even when the
+  // upstream is archived, done, or has no recent check-in. They share this
+  // sweep's per-repository fetch cache with ordinary landed citations.
+  const commitWaits = [];
+  for (const dependent of keep.loadAll(false)) {
+    if (dependent.fm.status !== 'waiting') continue;
+    for (const dependency of dependent.fm.depends_on || []) {
+      const target = keep.parseDependency(dependency);
+      if (target.kind !== 'commit' || (only && only !== dependent.id && only !== target.id)) continue;
+      const upstream = allTasks.get(target.id);
+      if (upstream) commitWaits.push({ dependent, dependency, target, upstream });
+    }
+  }
+
+  for (const wait of commitWaits) {
+    const repo = repoFor(wait.upstream);
+    if (!repo) continue;
+    const branch = defaultBranch(repo);
+    if (!branch) continue;
+    if (!fetchResults.has(repo)) fetchResults.set(repo, fetchDefault(repo, branch, state, now));
+    const failure = fetchResults.get(repo);
+    if (failure && !failedRepos.has(repo)) {
+      failedRepos.add(repo);
+      const item = { repo, message: failure };
+      fetchFailures.push(item);
+      process.stderr.write(`keep landed: fetch failed for ${repo}: ${failure}\n`);
+    }
+    checked += 1;
+    if (dry || !keep.dependencyResolved(wait.upstream, wait.target, {
+      onOrigin: (_task, sha) => isOnDefault(repo, sha, branch),
+    })) continue;
+    keep.withLock(() => {
+      let dependent;
+      try { dependent = keep.loadTask(wait.dependent.id); } catch { return; }
+      const current = (dependent.fm.depends_on || []).find((entry) => keep.dependencyTarget(entry) === keep.dependencyTarget(wait.target));
+      if (!current) return;
+      require('./unblock.js').writePending(dependent, keep.loadTaskAnywhere(wait.upstream.id), {
+        root: keep.ROOT, now, dependency: current,
+      });
+    });
+  }
 
   for (const task of tasks) {
     if (!OPEN_STATUSES.has(task.fm.status)) continue;

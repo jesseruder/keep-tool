@@ -105,11 +105,16 @@ function parseTask(text, id) {
         const first = lines[i].replace(/^\s+-\s*/, '');
         const item = {};
         const fkv = first.match(/^([A-Za-z_]+):\s*(.*)$/);
-        if (fkv) item[fkv[1]] = fkv[2].trim();
+        if (!fkv) {
+          items.push(parseFrontmatterScalar(first));
+          i++;
+          continue;
+        }
+        item[fkv[1]] = parseFrontmatterScalar(fkv[2].trim());
         i++;
         while (i < lines.length && /^\s{4,}[A-Za-z_]+:/.test(lines[i]) && !/^\s+-\s/.test(lines[i])) {
           const ckv = lines[i].trim().match(/^([A-Za-z_]+):\s*(.*)$/);
-          if (ckv) item[ckv[1]] = ckv[2].trim();
+          if (ckv) item[ckv[1]] = parseFrontmatterScalar(ckv[2].trim());
           i++;
         }
         items.push(item);
@@ -120,12 +125,19 @@ function parseTask(text, id) {
     if (val.startsWith('[') && val.endsWith(']')) {
       fm[key] = val.slice(1, -1).split(',').map((t) => t.trim()).filter(Boolean);
     } else {
-      fm[key] = val;
+      fm[key] = parseFrontmatterScalar(val);
     }
     i++;
   }
   if (!fm.status) fm.status = 'inbox';
   return { id, fm, body: m[2].replace(/^\n+/, ''), };
+}
+
+function parseFrontmatterScalar(value) {
+  if (/^"(?:[^"\\]|\\.)*"$/.test(value)) {
+    try { return JSON.parse(value); } catch {}
+  }
+  return value;
 }
 
 function serializeTask(task) {
@@ -141,7 +153,28 @@ function serializeTask(task) {
   if (fm.allow && fm.allow.length) out.push(`allow: [${fm.allow.join(', ')}]`);
   scalar('allow_until');
   if (fm.tags && fm.tags.length) out.push(`tags: [${fm.tags.join(', ')}]`);
-  if (fm.depends_on && fm.depends_on.length) out.push(`depends_on: [${fm.depends_on.join(', ')}]`);
+  if (fm.depends_on && fm.depends_on.length) {
+    if (fm.depends_on.every((entry) => typeof entry === 'string')) {
+      out.push(`depends_on: [${fm.depends_on.join(', ')}]`);
+    } else {
+      out.push('depends_on:');
+      for (const entry of fm.depends_on) {
+        if (typeof entry === 'string') {
+          out.push(`  - ${entry}`);
+          continue;
+        }
+        const parsed = parseDependency(entry);
+        out.push(`  - card: ${parsed.id}`);
+        out.push(`    kind: ${parsed.kind}`);
+        if (parsed.step != null) out.push(`    step: ${parsed.step}`);
+        if (parsed.commits && parsed.commits.length) out.push(`    commits: ${parsed.commits.join('|')}`);
+        if (parsed.sha) out.push(`    sha: ${parsed.sha}`);
+        if (parsed.target) out.push(`    target: ${JSON.stringify(parsed.target)}`);
+        if (parsed.statuses && parsed.statuses.length) out.push(`    statuses: ${parsed.statuses.join('|')}`);
+        if (parsed.reason) out.push(`    reason: ${JSON.stringify(parsed.reason)}`);
+      }
+    }
+  }
   scalar('project');
   scalar('check_after');
   if (fm.check) {
@@ -865,6 +898,31 @@ function isOverdue(t) {
 }
 
 function parseDependency(entry) {
+  if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+    const id = String(entry.card || entry.id || '');
+    const kind = String(entry.kind || (entry.step ? 'step' : 'whole'));
+    const step = entry.step == null || entry.step === '' ? null : Number(entry.step);
+    const commits = Array.isArray(entry.commits) ? entry.commits
+      : String(entry.commits || '').split(/[|,]/).map((value) => value.trim()).filter(Boolean);
+    const statuses = Array.isArray(entry.statuses) ? entry.statuses
+      : String(entry.statuses || '').split(/[|,]/).map((value) => value.trim()).filter(Boolean);
+    const parsed = {
+      id,
+      step,
+      kind,
+      commits: commits.map((sha) => String(sha).toLowerCase()).sort(),
+      sha: String(entry.sha || '').toLowerCase(),
+      target: String(entry.target || ''),
+      statuses: [...new Set(statuses)].sort((a, b) => ['review', 'landing', 'done'].indexOf(a) - ['review', 'landing', 'done'].indexOf(b)),
+      reason: String(entry.reason || ''),
+    };
+    if (!/^[a-z0-9][a-z0-9-]*$/.test(id) || !['whole', 'step', 'commit', 'deployed', 'status'].includes(kind)
+        || (kind === 'step' && (!Number.isInteger(step) || step < 1))
+        || (kind === 'commit' && (!parsed.commits.length || parsed.commits.some((sha) => !/^[0-9a-f]{7,40}$/.test(sha))))
+        || (kind === 'deployed' && (!/^[0-9a-f]{7,40}$/.test(parsed.sha) || !parsed.target))
+        || (kind === 'status' && !parsed.statuses.length)) parsed.invalid = true;
+    return parsed;
+  }
   const value = String(entry || '');
   const match = value.match(/^([^#\s]+)(?:#([1-9]\d*))?$/);
   // Reads must never throw on a hand-edited entry; only wait-on rejects it.
@@ -872,13 +930,61 @@ function parseDependency(entry) {
   return { id: match[1], step: match[2] ? Number(match[2]) : null };
 }
 
+function dependencyTarget(entry) {
+  const parsed = entry && entry.id && Object.prototype.hasOwnProperty.call(entry, 'step') ? entry : parseDependency(entry);
+  const kind = parsed.kind || (parsed.step == null ? 'whole' : 'step');
+  if (kind === 'step') return `${parsed.id}#${parsed.step}`;
+  if (kind === 'commit') return `${parsed.id} --commit ${parsed.commits.join(',')}`;
+  if (kind === 'deployed') return `${parsed.id} --deployed ${parsed.sha} --target ${parsed.target}`;
+  if (kind === 'status') return `${parsed.id} --status ${parsed.statuses.join(',')}`;
+  return parsed.id;
+}
+
+function dependencyReason(entry) {
+  const parsed = entry && entry.id && Object.prototype.hasOwnProperty.call(entry, 'step') ? entry : parseDependency(entry);
+  return parsed.reason || '';
+}
+
 function dependencyStep(task, step) {
   if (step == null) return null;
   return parsePlan(task && task.body).steps[step - 1] || null;
 }
 
-function dependencyResolved(task, step) {
-  return Boolean(task && task.fm && (task.fm.status === 'done' || (dependencyStep(task, step) || {}).state === 'done'));
+function dependencyResolved(task, target, options = {}) {
+  if (!task || !task.fm) return false;
+  const parsed = target && typeof target === 'object'
+    ? target
+    : { id: task.id, step: target == null ? null : Number(target) };
+  const kind = parsed.kind || (parsed.step == null ? 'whole' : 'step');
+  if (parsed.invalid) return false;
+  if (kind === 'whole') return task.fm.status === 'done';
+  if (kind === 'step') return task.fm.status === 'done' || (dependencyStep(task, parsed.step) || {}).state === 'done';
+  if (kind === 'status') {
+    if (parsed.statuses.includes(task.fm.status)) return true;
+    return require('./review.js').stampedLogEntries(task.body).some((entry) => parsed.statuses.some((status) =>
+      status === 'done' ? /^(?:done|.+\s→\s*done)$/i.test(entry.kind) : new RegExp(`^.+\\s→\\s*${status}$`, 'i').test(entry.kind)));
+  }
+  if (kind === 'deployed') {
+    return require('./review.js').stampedLogEntries(task.body).some((entry) => {
+      if (entry.kind !== 'deployed') return false;
+      const match = entry.text.match(/^deployed ([0-9a-f]{7,40}) to ([^\n]*?)(?: — |\n|$)/i);
+      return Boolean(match && sameCommit(parsed.sha, match[1]) && match[2] === parsed.target);
+    });
+  }
+  if (kind === 'commit') {
+    if (typeof options.onOrigin === 'function') return parsed.commits.every((sha) => options.onOrigin(task, sha));
+    const landed = require('./landed.js');
+    const repo = landed.repoFor(task);
+    const branch = repo && landed.defaultBranch(repo);
+    return Boolean(branch && parsed.commits.every((sha) => landed.isOnDefault(repo, sha, branch)));
+  }
+  return false;
+}
+
+function sameCommit(a, b) {
+  a = String(a || '').toLowerCase();
+  b = String(b || '').toLowerCase();
+  return Boolean(a && b && (a.startsWith(b) || b.startsWith(a)));
 }
 
 function dependencyInfo(task, root = ROOT) {
@@ -887,15 +993,18 @@ function dependencyInfo(task, root = ROOT) {
     try {
       const upstream = loadTaskAnywhere(parsed.id, root);
       return {
-        id: entry,
+        id: dependencyTarget(parsed),
+        entry,
         upstreamId: parsed.id,
         step: parsed.step,
         stepInfo: dependencyStep(upstream, parsed.step),
         task: upstream,
-        resolved: dependencyResolved(upstream, parsed.step),
+        target: parsed,
+        reason: dependencyReason(parsed),
+        resolved: dependencyResolved(upstream, parsed),
       };
     } catch {
-      return { id: entry, upstreamId: parsed.id, step: parsed.step, stepInfo: null, task: null, resolved: false };
+      return { id: dependencyTarget(parsed), entry, upstreamId: parsed.id, step: parsed.step, stepInfo: null, task: null, target: parsed, reason: dependencyReason(parsed), resolved: false };
     }
   });
 }
@@ -935,7 +1044,47 @@ function cleanCommits(values) {
   if (commits.some((sha) => !/^[0-9a-f]{7,40}$/i.test(sha))) {
     dependencyError('--commit values must be 7-40 hexadecimal characters');
   }
-  return commits.map((sha) => sha.toLowerCase());
+  return [...new Set(commits.map((sha) => sha.toLowerCase()))];
+}
+
+const WAIT_STATUSES = ['review', 'landing', 'done'];
+
+function waitStatuses(value) {
+  if (value == null) return [];
+  const statuses = [...new Set(String(value).split(/[,|]/).map((status) => status.trim()).filter(Boolean))];
+  if (!statuses.length || statuses.some((status) => !WAIT_STATUSES.includes(status))) {
+    dependencyError(`--status must list one or more of: ${WAIT_STATUSES.join(', ')}`);
+  }
+  return statuses.sort((a, b) => WAIT_STATUSES.indexOf(a) - WAIT_STATUSES.indexOf(b));
+}
+
+function requestedWaits(options, upstreamEntries, adding) {
+  const reason = cleanScalar(options.m, 'wait reason');
+  if (adding && !reason) dependencyError('every new wait needs -m "why"');
+  const commits = cleanCommits(options.commit);
+  const statuses = waitStatuses(options.status);
+  const hasDeploy = options.deployed != null || options.target != null;
+  const kinds = [commits.length > 0, statuses.length > 0, hasDeploy].filter(Boolean).length;
+  if (kinds > 1) dependencyError('choose one wait target: --commit, --deployed with --target, or --status');
+  if ((options.deployed == null) !== (options.target == null)) dependencyError('--deployed <sha> and --target <name> must be used together');
+  if (kinds && upstreamEntries.length !== 1) dependencyError('fact-based waits take exactly one upstream card');
+
+  return upstreamEntries.map((entry) => {
+    const base = parseDependency(entry);
+    if (base.invalid) dependencyError(`invalid dependency "${entry}"; use <card> or <card>#<step>`);
+    if (kinds && base.step != null) dependencyError('a card#step wait cannot also use a fact target');
+    const target = { card: base.id, kind: base.step == null ? 'whole' : 'step', ...(base.step == null ? {} : { step: base.step }) };
+    if (commits.length) Object.assign(target, { kind: 'commit', commits: [...commits].sort() });
+    if (statuses.length) Object.assign(target, { kind: 'status', statuses });
+    if (hasDeploy) {
+      const deployed = cleanCommits([options.deployed]);
+      const deployTarget = cleanScalar(options.target, 'deploy target');
+      if (deployed.length !== 1 || !deployTarget) dependencyError('--deployed needs one sha and a nonempty --target');
+      Object.assign(target, { kind: 'deployed', sha: deployed[0], target: deployTarget });
+    }
+    if (adding) target.reason = reason;
+    return target;
+  });
 }
 
 function logMessage(message, next, commits) {
@@ -1566,27 +1715,29 @@ commands.done = (argv) => {
 };
 
 commands['wait-on'] = (argv) => {
-  const o = parseArgs(argv, { remove: 'bool' });
+  const o = parseArgs(argv, { remove: 'bool', commit: 'list', deployed: 'str', target: 'str', status: 'str' });
   const dependentId = o._[0];
   const upstreamEntries = o._.slice(1);
-  if (!dependentId || !upstreamEntries.length) die('usage: keep wait-on <card> <upstream>[#<step>] [<upstream>[#<step>]...]');
+  if (!dependentId || !upstreamEntries.length) die('usage: keep wait-on <card> <upstream>[#<step>] [--commit <sha>[,<sha>] | --deployed <sha> --target <name> | --status review,landing,done] -m "why"');
+  const requested = requestedWaits(o, upstreamEntries, !o.remove);
   guardReviewerStatusChange(true, false);
   withLock(() => {
     const dependent = loadTask(dependentId);
     const session = currentSession();
     const crossProjectSession = Boolean(session && !sessionInTaskProject(dependent));
     if (o.remove) {
-      for (const entry of upstreamEntries) {
-        if (parseDependency(entry).invalid) dependencyError(`invalid dependency "${entry}"`);
-        if (!(dependent.fm.depends_on || []).includes(entry)) dependencyError(`dependency not present: ${entry}; removal matches the exact card or card#step entry`);
+      const removeTargets = requested.map(dependencyTarget);
+      const present = new Set((dependent.fm.depends_on || []).map(dependencyTarget));
+      for (const target of removeTargets) {
+        if (!present.has(target)) dependencyError(`dependency not present: ${target}; removal matches the exact wait target`);
       }
-      dependent.fm.depends_on = (dependent.fm.depends_on || []).filter((entry) => !upstreamEntries.includes(entry));
+      dependent.fm.depends_on = (dependent.fm.depends_on || []).filter((entry) => !removeTargets.includes(dependencyTarget(entry)));
       const open = unresolvedDependencyIds(dependent);
       const activate = dependent.fm.status === 'waiting' && !open.length && !dependent.fm.check_after && !openNeeds([dependent]).length;
       saveTask(dependent);
-      require('./unblock').cancelDependencies(dependentId, upstreamEntries, { root: ROOT });
+      require('./unblock').cancelDependencies(dependentId, removeTargets, { root: ROOT });
       const checked = checkinTask(dependentId, {
-        message: `Removed dependencies: ${upstreamEntries.join(', ')}${o.m ? ` — ${o.m}` : ''}. Other dependencies and blockers preserved.`,
+        message: `Removed dependencies: ${removeTargets.join(', ')}${o.m ? ` — ${o.m}` : ''}. Other dependencies and blockers preserved.`,
         next: open.length ? `waiting on ${open.join(', ')}` : activate ? 'Continue work; removed dependency no longer blocks it' : undefined,
         status: activate ? 'active' : undefined,
         linkSession: false, withinLock: true, commit: false,
@@ -1596,9 +1747,8 @@ commands['wait-on'] = (argv) => {
       return;
     }
     const tasks = new Map(loadAll(true).map((task) => [task.id, task]));
-    for (const entry of upstreamEntries) {
-      const { id: upstreamId, step, invalid } = parseDependency(entry);
-      if (invalid) dependencyError(`invalid dependency "${entry}"; use <card> or <card>#<step>`);
+    for (const entry of requested) {
+      const { id: upstreamId, step } = parseDependency(entry);
       const upstream = loadTaskAnywhere(upstreamId);
       if (step != null) {
         const steps = parsePlan(upstream.body).steps;
@@ -1609,17 +1759,22 @@ commands['wait-on'] = (argv) => {
       if (path) dependencyError(`dependency cycle: ${dependentId} -> ${path.join(' -> ')}`);
     }
 
-    dependent.fm.depends_on = [...new Set([...(dependent.fm.depends_on || []), ...upstreamEntries])];
+    const requestedByTarget = new Map(requested.map((entry) => [dependencyTarget(entry), entry]));
+    dependent.fm.depends_on = (dependent.fm.depends_on || []).map((entry) =>
+      requestedByTarget.get(dependencyTarget(entry)) || entry);
+    const present = new Set(dependent.fm.depends_on.map(dependencyTarget));
+    dependent.fm.depends_on.push(...requested.filter((entry) => !present.has(dependencyTarget(entry))));
     saveTask(dependent);
-    const alreadyDone = upstreamEntries.filter((entry) => {
+    const alreadyDone = requested.filter((entry) => {
       const parsed = parseDependency(entry);
-      return dependencyResolved(loadTaskAnywhere(parsed.id), parsed.step);
-    });
+      return dependencyResolved(loadTaskAnywhere(parsed.id), parsed);
+    }).map(dependencyTarget);
     const status = ['active', 'review', 'landing'].includes(dependent.fm.status) ? 'waiting' : undefined;
     const suffix = alreadyDone.length ? `; already done: ${alreadyDone.join(', ')}` : '';
+    const targets = requested.map(dependencyTarget);
     const checked = checkinTask(dependentId, {
-      message: `waiting on: ${upstreamEntries.join(', ')}${suffix}`,
-      next: `waiting on ${upstreamEntries.join(', ')}`,
+      message: `waiting on: ${targets.join(', ')}${suffix} — reason: ${cleanScalar(o.m, 'wait reason')}`,
+      next: `waiting on ${targets.join(', ')}`,
       status,
       heading: 'check-in',
       withinLock: true,
@@ -1627,14 +1782,15 @@ commands['wait-on'] = (argv) => {
       commit: false,
     });
     const unblock = require('./unblock.js');
-    for (const entry of upstreamEntries) {
-      unblock.beginWait(dependentId, entry, { root: ROOT });
+    for (const entry of requested) {
+      const target = dependencyTarget(entry);
+      unblock.beginWait(dependentId, target, { root: ROOT });
       const parsed = parseDependency(entry);
       const upstream = loadTaskAnywhere(parsed.id);
-      if (dependencyResolved(upstream, parsed.step)) {
-        unblock.writePending(checked, upstream, { root: ROOT, dependency: entry, step: parsed.step });
+      if (dependencyResolved(upstream, parsed)) {
+        unblock.writePending(checked, upstream, { root: ROOT, dependency: entry });
       } else {
-        unblock.removeDelivered(dependentId, entry, { root: ROOT });
+        unblock.removeDelivered(dependentId, target, { root: ROOT });
       }
     }
     commitAndPush(`keep: wait-on ${dependentId}`);
@@ -1665,7 +1821,13 @@ commands.deps = (argv) => {
     for (const entry of dependencyInfo(task)) {
       const status = entry.resolved ? 'resolved' : 'pending';
       let detail = ' (missing)';
-      if (entry.task && entry.step != null) {
+      if (entry.task && entry.target.kind === 'commit') {
+        detail = ` (${entry.target.commits.join(', ')} on origin) — ${entry.task.fm.title}`;
+      } else if (entry.task && entry.target.kind === 'deployed') {
+        detail = ` (${entry.target.sha} deployed to ${entry.target.target}) — ${entry.task.fm.title}`;
+      } else if (entry.task && entry.target.kind === 'status') {
+        detail = ` (status ${entry.task.fm.status}; wants ${entry.target.statuses.join('|')}) — ${entry.task.fm.title}`;
+      } else if (entry.task && entry.step != null) {
         const total = parsePlan(entry.task.body).steps.length;
         detail = entry.resolved
           ? ` (step ${entry.step} done) — ${entry.task.fm.title}`
@@ -1673,7 +1835,7 @@ commands.deps = (argv) => {
       } else if (entry.task) {
         detail = ` (${entry.task.fm.status}) — ${entry.task.fm.title}`;
       }
-      console.log(`  ${status}  ${entry.id}${detail}`);
+      console.log(`  ${status}  ${entry.id}${detail}${entry.reason ? ` — ${entry.reason}` : ''}`);
     }
   };
   if (argv[0]) {
@@ -1770,7 +1932,7 @@ commands.show = (argv) => {
   console.log(fmtTask(task, { brief: true }));
   const f = task.fm;
   if (f.experiment_id) console.log(`  experiment_id: ${f.experiment_id}`);
-  if (f.depends_on && f.depends_on.length) console.log(`  depends_on: ${f.depends_on.join(', ')}`);
+  if (f.depends_on && f.depends_on.length) console.log(`  depends_on: ${f.depends_on.map(dependencyTarget).join(', ')}`);
   if (f.project) console.log(`  project: ${f.project}`);
   if (f.check_after) console.log(`  check after: ${f.check_after.replace('T', ' ')}${isOverdue(task) ? color('31', '  (overdue)') : ''}`);
   if (f.check) console.log(`  check recipe:\n${f.check.split('\n').map((l) => '    ' + l).join('\n')}`);
@@ -5672,8 +5834,9 @@ function helpText() {
   keep show <id>
   keep wait [--no-hold <project> [--scope <resource>]] [--card <id>[#<n>]] [--lane <project> <step>]
             [--check-due <id>] [--for <duration>] [--interval <seconds>]
-  keep wait-on <card> <upstream>[#<step>] [<upstream>[#<step>]...]
-  keep wait-on <card> --remove <upstream>[#<step>] [...] [-m "why"]
+  keep wait-on <card> <upstream>[#<step>] [<upstream>[#<step>]...] -m "why"
+  keep wait-on <card> <upstream> [--commit <sha>[,<sha>] | --deployed <sha> --target <name> | --status review,landing,done] -m "why"
+  keep wait-on <card> --remove <upstream>[#<step>] [...] [matching target flags] [-m "why"]
   keep deps [<card>]
   keep done <id> [--next "text"] [--commit sha]… [--force] [-m note]
   keep archive [<id>]     # archive one task, or sweep all done tasks
@@ -5801,7 +5964,7 @@ module.exports = {
   ROOT, TASKS, ARCHIVE, STATUSES, KINDS, STATUS_ORDER, META, HOLDS_DIR,
   isReviewerSession, registerReviewerSession, currentSession, parseWhen, relativeDurationMs, postKeepApi, getKeepApi,
   loadAll, loadTask, loadTaskAnywhere, parseTask, serializeTask, parsePlan, renderPlan, setPlan, nextStep, lastLogLine, isOverdue, nowStamp, stampOf, buildDigest,
-  parseDependency, dependencyStep, dependencyResolved, dependencyInfo, unresolvedDependencyIds,
+  parseDependency, dependencyTarget, dependencyReason, dependencyStep, dependencyResolved, dependencyInfo, unresolvedDependencyIds,
   withLock, commitAndPush, saveTask, recordDoneTransition, recordDaemonSessionClose, addTask, checkinTask, briefSnapshot, scopeForProject, KeepError,
   claimSession, linkLaunchedSession, releaseCardSession,
   emptyStopEvidence, scanStopEvidence, hasSubstantiveStopEvidence, canonicalCwd, inferProject,

@@ -290,7 +290,7 @@ test('wait-on moves a landing card to waiting like any other', () => {
   try {
     assert.equal(f.run(['add', 'Upstream card', '--status', 'active', '--tag', 'personal', '-m', 'x']).status, 0);
     assert.equal(f.run(['checkin', 'status-card', '--status', 'landing', '--commit', 'abc1234', '-m', 'only the land']).status, 0);
-    const out = f.run(['wait-on', 'status-card', 'upstream-card']);
+    const out = f.run(['wait-on', 'status-card', 'upstream-card', '-m', 'need upstream']);
     assert.equal(out.status, 0, out.stderr);
     assert.match(f.read(), /^status: waiting$/m);
   } finally { f.cleanup(); }

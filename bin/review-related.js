@@ -15,7 +15,7 @@ function relatedCards(task, cards, outcomes = [], limit = 4) {
   const titles = cards.map(c => tokens(c.fm.title));
   const frequencies = new Map();
   for (const set of titles) for (const token of set) frequencies.set(token, (frequencies.get(token) || 0) + 1);
-  const dependencies = (Array.isArray(task.fm.depends_on) ? task.fm.depends_on : []).map(id => String(id).split('#')[0]);
+  const dependencies = (Array.isArray(task.fm.depends_on) ? task.fm.depends_on : []).map(entry => require('./keep.js').parseDependency(entry).id);
   return cards.flatMap((card, index) => {
     if (card.id === task.id || card.fm.kind === 'idea') return [];
     const explicit = dependencies.includes(card.id) || source.includes(card.id)

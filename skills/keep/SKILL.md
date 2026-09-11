@@ -50,20 +50,24 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   session link or changing its status, schedule, tags, or dependencies. Worktree
   paths resolve to their main checkout. Use this instead of `keep checkin --project`.
 - **Status changes or notable progress**: use `keep checkin <id> -m "..." [--status s]`.
-- **Waiting on another card**: if your next step depends on another card finishing,
-  run `keep wait-on <your-card> <upstream> [<upstream>...]`. To wait for a specific
-  plan milestone, use `keep wait-on <your-card> <upstream>#<n>`; for example, wait
-  on the "production converged" step of a rollout card instead of the whole card
-  becoming done. `#n` is positional: inserting or removing a step on the upstream
-  card shifts what it points at, so re-check `keep deps` after editing a plan.
-  Never write "await task X" only as prose. `review` means awaiting
-  Owner's review, not another task. Keep will send a `[keep] unblocked` message into
-  your linked session when the upstream work or selected step completes. Inspect
-  dependencies with `keep deps [<card>]`.
-  Remove a mistaken dependency with `keep wait-on <card> --remove <upstream>[#<n>]
-  -m "why"`. Removal matches the exact entry, preserves other blockers, cancels
-  queued notices for that dependency, and restores `active` only when no dependency,
-  scheduled check, or need remains. Already submitted messages cannot be recalled.
+- **Waiting on another card**: record the fact your next step needs with a required
+  reason: `keep wait-on <your-card> <upstream> --commit <sha>[,<sha>] -m "why"`
+  waits for every SHA on the upstream project's origin default branch (verified by
+  the landed sweep); `--deployed <sha> --target <name>` waits for the upstream's
+  matching deploy log; `--status review,landing,done` waits for any listed status.
+  For a plan milestone, use `keep wait-on <your-card> <upstream>#<n> -m "why"`.
+  `#n` is positional: inserting or removing an upstream step shifts its target,
+  so re-check `keep deps` after editing a plan. A whole-card wait uses
+  `keep wait-on <your-card> <upstream> -m "why"`.
+  Never write "await task X" only as prose. `review` means awaiting Owner's review,
+  not another task. Keep sends a `[keep] unblocked` message into your linked session
+  when the target is satisfied. Inspect targets and stored reasons with
+  `keep deps [<card>]`.
+  Remove a mistaken dependency with `keep wait-on <card> <upstream> --remove`
+  and the same target flags (or `#<n>`), plus `-m "why"`. Removal matches the exact
+  entry, preserves other blockers, cancels queued notices for that dependency, and
+  restores `active` only when no dependency, scheduled check, or need remains.
+  Already submitted messages cannot be recalled.
   For fleet state, prefer `keep wait` as a background command over scheduling timed
   `--check-after` rechecks: the Claude harness wakes the session when the command exits.
   In the background pass a long bound (`--for 8h`) so the session actually idles

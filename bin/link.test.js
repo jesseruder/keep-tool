@@ -135,7 +135,7 @@ test('link transfers the explicit session without using caller identity or chang
       '',
     ].join('\n') });
     f.commit();
-    const wait = f.run(['wait-on', 'detach', 'npm-setup#4'], { CODEX_THREAD_ID: sid });
+    const wait = f.run(['wait-on', 'detach', 'npm-setup#4', '-m', 'need publishing setup'], { CODEX_THREAD_ID: sid });
     assert.equal(wait.status, 0, wait.stderr);
     assert.match(wait.stderr, /dependency recorded, but session .* was not linked because the current directory is outside the card project/);
     assert.match(wait.stderr, new RegExp(`keep link detach --session ${sid} --agent codex`));

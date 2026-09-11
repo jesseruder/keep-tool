@@ -1347,6 +1347,71 @@ test('sweep annotates landed shas, closes only land-only review cards, and is id
   }
 });
 
+test('sweep fetches explicit commit waits once and queues archived done upstream facts under --only', () => {
+  const { temp, repo, root, origin, env } = (() => {
+    const fixture = landedFixture('keep-landed-fact-wait-');
+    return { ...fixture, origin: path.join(fixture.temp, 'origin.git') };
+  })();
+  const pusher = path.join(temp, 'pusher');
+  try {
+    runGit(['clone', '-q', origin, pusher], { env });
+    configureGit(pusher, env);
+    const shas = [];
+    for (const name of ['api', 'ui']) {
+      fs.writeFileSync(path.join(pusher, `${name}.txt`), `${name}\n`);
+      runGit(['-C', pusher, 'add', `${name}.txt`], { env });
+      runGit(['-C', pusher, 'commit', '-q', '-m', name], { env });
+      shas.push(runGit(['-C', pusher, 'rev-parse', 'HEAD'], { env }));
+    }
+    runGit(['-C', pusher, 'push', '-q', 'origin', 'main'], { env });
+
+    const keep = require('./keep.js');
+    const upstream = {
+      id: 'upstream', fm: {
+        title: 'upstream', status: 'done', kind: 'task', tags: ['personal'], project: repo,
+        created: '2026-01-01', updated: '2026-01-01T00:00',
+      }, body: '## 2026-01-01 00:00 — done\nOld and archived.\n',
+    };
+    const dependent = {
+      id: 'dependent', fm: {
+        title: 'dependent', status: 'active', kind: 'task', tags: ['personal'],
+        created: '2026-09-10', updated: '2026-09-10T12:00',
+      }, body: '',
+    };
+    fs.writeFileSync(path.join(root, 'archive', 'upstream.md'), keep.serializeTask(upstream));
+    fs.writeFileSync(path.join(root, 'tasks', 'dependent.md'), keep.serializeTask(dependent));
+    fs.mkdirSync(path.join(root, 'watch'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'watch', 'landed.json'), '{}\n');
+    runGit(['-C', root, 'add', 'archive', 'tasks', 'watch'], { env });
+    runGit(['-C', root, 'commit', '-q', '-m', 'fact wait fixtures'], { env });
+
+    const wait = spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'wait-on', 'dependent', 'upstream',
+      '--commit', shas.join(','), '-m', 'need API and UI on origin'], { env, encoding: 'utf8' });
+    assert.equal(wait.status, 0, wait.stderr);
+    assert.equal(keep.dependencyResolved(upstream, keep.parseDependency(keep.loadTask('dependent', root).fm.depends_on[0])), false,
+      'the local origin ref is stale before the landed sweep fetch');
+
+    const now = Date.now();
+    const script = `(async () => process.stdout.write(JSON.stringify(await require(${JSON.stringify(path.join(__dirname, 'landed.js'))}).sweep({now:${now},only:'upstream'}))))().catch((error) => { console.error(error); process.exitCode = 1; })`;
+    const result = spawnSync(process.execPath, ['-e', script], { cwd: path.join(__dirname, '..'), env, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).checked, 1);
+    assert.deepEqual(runGit(['-C', repo, 'rev-parse', 'refs/remotes/origin/main'], { env }), shas.at(-1));
+    const names = fs.readdirSync(path.join(root, '.keep', 'unblocked'));
+    assert.equal(names.length, 1);
+    assert.ok(names[0].length < 120);
+    assert.doesNotMatch(names[0], /\s|,/);
+
+    const unblockScript = `(async()=>{await require(${JSON.stringify(path.join(__dirname, 'unblock.js'))}).sweep({deps:{deliver:async()=>({sessionId:'test'})}})})().catch(e=>{console.error(e);process.exitCode=1})`;
+    const unblocked = spawnSync(process.execPath, ['-e', unblockScript], { env, encoding: 'utf8' });
+    assert.equal(unblocked.status, 0, unblocked.stderr);
+    assert.equal(keep.loadTask('dependent', root).fm.status, 'active');
+    assert.match(keep.loadTask('dependent', root).body, /reached origin's default branch/);
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
 test('sweep closes after separately landed shas without mistaking its annotation for the newest entry', () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-landed-split-'));
   const origin = path.join(temp, 'origin.git');
