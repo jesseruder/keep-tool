@@ -12,12 +12,13 @@ function agentKind(command) {
   if (!['codex', 'claude'].includes(agent)) return null;
   const switches = new Set(['--dangerously-bypass-approvals-and-sandbox', '--dangerously-skip-permissions',
     '--allow-dangerously-skip-permissions', '--no-alt-screen', '--no-session-persistence']);
-  const values = new Set(['--model', '-m', '--config', '-c', '--sandbox', '-s', '--ask-for-approval', '-a',
-    '--permission-mode', '--effort', '--settings', '--cwd', '-C']);
+  const values = new Set(agent === 'codex'
+    ? ['--model', '-m', '--config', '-c', '--sandbox', '-s', '--ask-for-approval', '-a', '--cwd', '-C']
+    : ['--model', '--permission-mode', '--effort', '--settings']);
   while (words.length) {
     const word = words.shift();
     if (switches.has(word)) continue;
-    if (values.has(word) && words.length) { words.shift(); continue; }
+    if (values.has(word) && words.length && !words[0].startsWith('-')) { words.shift(); continue; }
     // Explicit resume/session IDs are durable ownership evidence, not orphans.
     return null;
   }

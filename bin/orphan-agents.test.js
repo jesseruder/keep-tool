@@ -16,7 +16,8 @@ test('recognition only accepts an interactive agent executable, without age heur
   assert.equal(orphans.agentKind('/bin/claude --dangerously-skip-permissions'), 'claude');
   for (const command of ['sh -c codex', 'node /x/agent-launcher.js codex /bin/codex', '/bin/codex exec work',
     '/bin/codex review', '/bin/codex app-server', '/bin/claude -p hi', '/bin/claude --print',
-    '/bin/codex resume known', '/bin/claude --resume known', '/bin/codex unknown-command']) {
+    '/bin/codex resume known', '/bin/claude --resume known', '/bin/claude -c --dangerously-skip-permissions',
+    '/bin/claude --continue', '/bin/codex -c --resume known', '/bin/codex unknown-command']) {
     assert.equal(orphans.agentKind(command), null, command);
   }
   const parsed = orphans.parseRows(' 123 1 500 ?? Thu Sep 10 20:00:00 2026 /bin/codex');
