@@ -70,10 +70,7 @@ function stepDoneStamp(upstream, step) {
 function factStamp(upstream, target) {
   if (target.kind === 'commit') return `commit-${target.commits.join('-')}`;
   if (target.kind === 'deployed') {
-    const entry = require('./review.js').stampedLogEntries(upstream.body).find((candidate) => {
-      const match = candidate.kind === 'deployed' && candidate.text.match(/^deployed ([0-9a-f]{7,40}) to ([^\n]*?)(?: — |\n|$)/i);
-      return match && (match[1].startsWith(target.sha) || target.sha.startsWith(match[1])) && match[2] === target.target;
-    });
+    const entry = require('./keep.js').deploymentFact(upstream, target);
     return entry ? entry.stamp.replace(' ', 'T') : `deployed-${target.sha}-${target.target}`;
   }
   return String(upstream && upstream.fm && upstream.fm.updated || target.statuses.join('-'));

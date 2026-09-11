@@ -11,6 +11,7 @@ const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
 const test = require('node:test');
 const keep = require('./keep.js');
+const landed = require('./landed.js');
 const { buildBrief } = require('./alerts.js');
 const { lint } = require('./lint.js');
 
@@ -143,7 +144,7 @@ test('unsatisfiable-wait requires fresh liveness evidence and honors real upstre
       card: 'orphan-upstream', kind: 'commit', commits: ['abcdef1'], reason: 'Wait for the commit.',
     }] });
     writeCard(root, 'deploy-waiter', { status: 'waiting', depends_on: [{
-      card: 'orphan-upstream', kind: 'deployed', sha: 'abcdef1', target: 'production', reason: 'Wait for deploy.',
+      card: 'orphan-upstream', kind: 'deployed', sha: 'abcdef1', target: 'prod west; echo unsafe', reason: 'Wait for deploy.',
     }] });
     writeCard(root, 'status-waiter', { status: 'waiting', depends_on: [{
       card: 'orphan-upstream', kind: 'status', statuses: ['review'], reason: 'Wait for review.',
@@ -161,6 +162,8 @@ test('unsatisfiable-wait requires fresh liveness evidence and honors real upstre
     assert.match(fresh.find((item) => item.id === 'orphan-waiter').fix,
       /keep wait-on orphan-waiter orphan-upstream#1 -m "why"/);
     assert.equal(fresh.find((item) => item.id === 'fact-waiter').fix, 'keep open orphan-upstream');
+    assert.equal(fresh.find((item) => item.id === 'deploy-waiter').fix, 'keep open orphan-upstream',
+      'fact-target inactivity never emits the arbitrary deployment target as a shell command');
 
     fs.writeFileSync(path.join(root, '.keep', 'live-sessions.json'), JSON.stringify({
       updatedAt: now - 11 * 60e3,
@@ -207,6 +210,9 @@ test('unsatisfiable-wait spots already-landed shas in the wait reason and recent
     writeCard(root, 'pending-deploy-waiter', { status: 'waiting', depends_on: [{
       card: 'source-card', kind: 'deployed', sha, target: 'production', reason: `Deploy ${sha} to production.`,
     }] });
+    writeCard(root, 'pending-status-waiter', { status: 'waiting', depends_on: [{
+      card: 'source-card', kind: 'status', statuses: ['review'], reason: `${sha} landed; still waiting for review.`,
+    }] });
 
     const findings = lint({ root, rule: 'unsatisfiable-wait', now }).findings;
     assert.deepEqual(findings.map((item) => item.id).sort(), ['checkin-waiter', 'reason-waiter']);
@@ -218,6 +224,62 @@ test('unsatisfiable-wait spots already-landed shas in the wait reason and recent
     fs.rmSync(root, { recursive: true, force: true });
     fs.rmSync(repo, { recursive: true, force: true });
     fs.rmSync(remote, { recursive: true, force: true });
+  }
+});
+
+test('unsatisfiable-wait refreshes origin before judging an inactive commit target unresolved', () => {
+  const root = makeRoot();
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-lint-stale-origin-'));
+  const remote = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-lint-fresh-remote-'));
+  const cloneRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-lint-pusher-'));
+  const pusher = path.join(cloneRoot, 'clone');
+  const now = Date.parse('2026-09-10T12:00:00');
+  try {
+    git(remote, ['init', '--bare', '--initial-branch=main']);
+    git(repo, ['init', '-b', 'main']);
+    git(repo, ['config', 'user.name', 'Keep Test']);
+    git(repo, ['config', 'user.email', 'keep@example.test']);
+    fs.writeFileSync(path.join(repo, 'work.txt'), 'base\n');
+    git(repo, ['add', 'work.txt']);
+    git(repo, ['commit', '-m', 'base']);
+    git(repo, ['remote', 'add', 'origin', remote]);
+    git(repo, ['push', '-u', 'origin', 'main']);
+
+    execFileSync('git', ['clone', '--quiet', remote, pusher]);
+    git(pusher, ['config', 'user.name', 'Keep Test']);
+    git(pusher, ['config', 'user.email', 'keep@example.test']);
+    fs.writeFileSync(path.join(pusher, 'work.txt'), 'base\nnew\n');
+    git(pusher, ['add', 'work.txt']);
+    git(pusher, ['commit', '-m', 'remote target']);
+    git(pusher, ['push', 'origin', 'main']);
+    const sha = git(pusher, ['rev-parse', '--short=10', 'HEAD']);
+    assert.notEqual(git(repo, ['rev-parse', '--short=10', 'refs/remotes/origin/main']), sha,
+      'fixture starts with a stale local tracking ref');
+
+    writeCard(root, 'remote-upstream', { status: 'active', project: repo },
+      '## 2026-09-08 09:00 — check-in\nInactive locally.\n');
+    writeCard(root, 'remote-waiter', { status: 'waiting', depends_on: [{
+      card: 'remote-upstream', kind: 'commit', commits: [sha], reason: `Wait for ${sha}.`,
+    }] });
+
+    assert.deepEqual(lint({ root, rule: 'unsatisfiable-wait', now }).findings, []);
+    assert.equal(git(repo, ['rev-parse', '--short=10', 'refs/remotes/origin/main']), sha,
+      'lint refreshed origin before resolving the commit target');
+
+    writeCard(root, 'unknown-waiter', { status: 'waiting', depends_on: [{
+      card: 'remote-upstream', kind: 'commit', commits: ['deadbee'], reason: 'Wait for the unknown remote fact.',
+    }] });
+    const fetchDefault = landed.fetchDefault;
+    landed.fetchDefault = () => 'origin unavailable';
+    try {
+      assert.deepEqual(lint({ root, rule: 'unsatisfiable-wait', now }).findings, [],
+        'a failed fresh fetch leaves commit resolution unknown instead of alleging inactivity');
+    } finally { landed.fetchDefault = fetchDefault; }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(remote, { recursive: true, force: true });
+    fs.rmSync(cloneRoot, { recursive: true, force: true });
   }
 });
 

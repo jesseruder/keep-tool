@@ -170,7 +170,8 @@ function citedWaitShas(task, dependency, ctx) {
 }
 
 function removeWaitCommand(task, dependency) {
-  return `keep wait-on ${task.id} --remove ${keep.dependencyTarget(dependency)} -m "why"`;
+  const target = dependency.step == null ? dependency.id : `${dependency.id}#${dependency.step}`;
+  return `keep wait-on ${task.id} --remove ${target} -m "why"`;
 }
 
 function narrowerWaitCommand(task, dependency, upstream) {
@@ -181,19 +182,6 @@ function narrowerWaitCommand(task, dependency, upstream) {
   return `keep wait-on ${task.id} ${upstream.id} --status review,landing,done -m "why"`;
 }
 
-function sameSha(a, b) {
-  a = String(a || '').toLowerCase();
-  b = String(b || '').toLowerCase();
-  return a.startsWith(b) || b.startsWith(a);
-}
-
-function explicitlyWaitedShas(dependency) {
-  const kind = dependency.kind || (dependency.step == null ? 'whole' : 'step');
-  if (kind === 'commit') return dependency.commits || [];
-  if (kind === 'deployed') return [dependency.sha];
-  return [];
-}
-
 function inactiveWaitFix(task, dependency, upstream) {
   const kind = dependency.kind || (dependency.step == null ? 'whole' : 'step');
   if (['whole', 'step'].includes(kind)) {
@@ -202,9 +190,9 @@ function inactiveWaitFix(task, dependency, upstream) {
   return `keep open ${upstream.id}`;
 }
 
-// Broad waits still depend on an upstream session remembering to change card
-// state. Flag waits with no remaining trigger, plus the stronger case where the
-// wait's own prose already names a commit that reached that upstream's origin.
+// Every unresolved wait still needs a producer. Flag waits with no remaining
+// trigger; for whole-card and step waits, also flag the stronger case where the
+// wait's own prose names a commit that already reached the upstream's origin.
 function unsatisfiableWait(task, ctx) {
   if (task.fm.status !== 'waiting') return [];
   const out = [];
@@ -212,11 +200,25 @@ function unsatisfiableWait(task, ctx) {
     const dependency = keep.parseDependency(entry);
     if (dependency.invalid) continue;
     const upstream = ctx.allTasks.get(dependency.id);
-    if (!upstream || keep.dependencyResolved(upstream, dependency)) continue;
+    if (!upstream) continue;
+    const kind = dependency.kind || (dependency.step == null ? 'whole' : 'step');
     const repo = ctx.repoFor(upstream);
-    const explicitShas = explicitlyWaitedShas(dependency);
-    const landedSha = repo && citedWaitShas(task, dependency, ctx)
-      .find((sha) => !explicitShas.some((target) => sameSha(sha, target)) && onOriginFresh(repo, sha, ctx));
+    let resolved;
+    if (kind === 'commit') {
+      if (repo) {
+        const origin = freshOrigin(repo, ctx);
+        if (!origin.usable) continue;
+        resolved = keep.dependencyResolved(upstream, dependency, {
+          onOrigin: (_task, sha) => landed.isOnDefault(repo, sha, origin.branch),
+        });
+      } else resolved = false;
+    } else {
+      resolved = keep.dependencyResolved(upstream, dependency);
+    }
+    if (resolved) continue;
+
+    const landedSha = ['whole', 'step'].includes(kind) && repo && citedWaitShas(task, dependency, ctx)
+      .find((sha) => originContainsFresh(repo, sha, ctx) === true);
     if (landedSha) {
       out.push(finding(
         'unsatisfiable-wait', task, 'med',
@@ -422,15 +424,26 @@ function checkNoResult(task, _ctx) {
 // or a sha origin never got is exactly the divergence the entry exists to expose.
 // A local tracking ref can lag another clone's push; fetch once per repo per lint
 // run before saying origin lacks a sha. A failed fetch falls back to the local ref.
-function onOriginFresh(repo, sha, ctx) {
+function freshOrigin(repo, ctx) {
+  ctx.originState = ctx.originState || new Map();
+  if (ctx.originState.has(repo)) return ctx.originState.get(repo);
   const branch = landed.defaultBranch(repo) || 'main';
   ctx.fetchState = ctx.fetchState || {};
-  ctx.fetched = ctx.fetched || new Set();
-  if (!ctx.fetched.has(repo)) {
-    ctx.fetched.add(repo);
-    try { landed.fetchDefault(repo, branch, ctx.fetchState, ctx.now); } catch {}
-  }
-  return landed.isOnDefault(repo, sha, branch);
+  let failure = 'fetch failed';
+  try { failure = landed.fetchDefault(repo, branch, ctx.fetchState, ctx.now); } catch {}
+  const state = { branch, usable: !failure };
+  ctx.originState.set(repo, state);
+  return state;
+}
+
+function originContainsFresh(repo, sha, ctx) {
+  const origin = freshOrigin(repo, ctx);
+  return origin.usable ? landed.isOnDefault(repo, sha, origin.branch) : null;
+}
+
+function onOriginFresh(repo, sha, ctx) {
+  const origin = freshOrigin(repo, ctx);
+  return landed.isOnDefault(repo, sha, origin.branch);
 }
 
 const DEPLOY_ENTRY_RE = /^deployed ([0-9a-f]{7,40}) to ([^\n]*?)(?: — |\n|$)/;

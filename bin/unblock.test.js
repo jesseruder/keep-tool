@@ -10,7 +10,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const test = require('node:test');
-const { parseDependency, parseTask, serializeTask } = require('./keep.js');
+const { dependencyResolved, parseDependency, parseTask, serializeTask } = require('./keep.js');
 const unblock = require('./unblock.js');
 
 const CLI = path.join(__dirname, 'keep.js');
@@ -235,6 +235,12 @@ test('parseDependency splits whole-card and step-qualified entries', () => {
   assert.deepEqual(parseDependency('daily-rollout#4'), { id: 'daily-rollout', step: 4 });
 });
 
+test('malformed hand-edited status waits fail closed without compiling a regexp', () => {
+  const parsed = parseDependency({ card: 'upstream', kind: 'status', statuses: ['['], reason: 'malformed by hand' });
+  assert.equal(parsed.invalid, true);
+  assert.equal(dependencyResolved({ id: 'upstream', fm: { status: 'active' }, body: '' }, parsed), false);
+});
+
 test('depends_on round-trips through task serialization', () => {
   const source = [
     '---', 'title: dependent', 'status: waiting', 'kind: task',
@@ -308,13 +314,18 @@ test('status and deployed targets resolve only from their named facts and preser
       status: 'done',
       body: '## 2026-09-03 11:00 — deployed\ndeployed abc1234 to prod/us-west — repo /tmp/example\n',
     });
-    for (const id of ['status-stuck', 'status-ready', 'status-noise', 'deploy-ready']) writeTask(fixture.root, id);
+    writeTask(fixture.root, 'deployed-unconfirmed', {
+      status: 'done',
+      body: '## 2026-09-03 11:00 — deployed\ndeployed abc1234 to prod/us-west — repo /tmp/example\nCommand: `codex deploy`\nExit status unknown (Codex hook without a rollout record); confirm the release landed.\n',
+    });
+    for (const id of ['status-stuck', 'status-ready', 'status-noise', 'deploy-ready', 'deploy-stuck']) writeTask(fixture.root, id);
     commitFixtures(fixture);
 
     assert.equal(cli(fixture, ['wait-on', 'status-stuck', 'done-without-review', '--status', 'review', '-m', 'need review']).status, 0);
     assert.equal(cli(fixture, ['wait-on', 'status-ready', 'review-reached', '--status', 'review', '-m', 'need review']).status, 0);
     assert.equal(cli(fixture, ['wait-on', 'status-noise', 'reviewer-noise', '--status', 'review', '-m', 'need real review status']).status, 0);
     assert.equal(cli(fixture, ['wait-on', 'deploy-ready', 'deployed', '--deployed', 'abc1234', '--target', 'prod/us-west', '-m', 'need rollout']).status, 0);
+    assert.equal(cli(fixture, ['wait-on', 'deploy-stuck', 'deployed-unconfirmed', '--deployed', 'abc1234', '--target', 'prod/us-west', '-m', 'need confirmed rollout']).status, 0);
     assert.equal(records(fixture.root).filter((record) => record.dependent !== 'status-stuck').length, 2);
     assert.ok(fs.readdirSync(path.join(fixture.root, '.keep', 'unblocked')).every((name) => !name.includes('prod/us-west')));
 
@@ -323,6 +334,7 @@ test('status and deployed targets resolve only from their named facts and preser
     assert.equal(task(fixture.root, 'status-ready').fm.status, 'active');
     assert.equal(task(fixture.root, 'status-noise').fm.status, 'waiting');
     assert.equal(task(fixture.root, 'deploy-ready').fm.status, 'active');
+    assert.equal(task(fixture.root, 'deploy-stuck').fm.status, 'waiting');
     assert.match(task(fixture.root, 'deploy-ready').body, /unblocked: deployed --deployed abc1234 --target prod\/us-west was recorded/);
   } finally { fs.rmSync(fixture.root, { recursive: true, force: true }); }
 });

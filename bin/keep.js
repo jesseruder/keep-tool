@@ -920,7 +920,8 @@ function parseDependency(entry) {
         || (kind === 'step' && (!Number.isInteger(step) || step < 1))
         || (kind === 'commit' && (!parsed.commits.length || parsed.commits.some((sha) => !/^[0-9a-f]{7,40}$/.test(sha))))
         || (kind === 'deployed' && (!/^[0-9a-f]{7,40}$/.test(parsed.sha) || !parsed.target))
-        || (kind === 'status' && !parsed.statuses.length)) parsed.invalid = true;
+        || (kind === 'status' && (!parsed.statuses.length
+          || parsed.statuses.some((status) => !['review', 'landing', 'done'].includes(status))))) parsed.invalid = true;
     return parsed;
   }
   const value = String(entry || '');
@@ -950,6 +951,17 @@ function dependencyStep(task, step) {
   return parsePlan(task && task.body).steps[step - 1] || null;
 }
 
+const UNCONFIRMED_DEPLOYMENT_LINE = 'Exit status unknown (Codex hook without a rollout record); confirm the release landed.';
+
+function deploymentFact(task, target) {
+  if (!task || !target || target.invalid) return null;
+  return require('./review.js').stampedLogEntries(task.body).find((entry) => {
+    if (entry.kind !== 'deployed' || String(entry.text).split('\n').includes(UNCONFIRMED_DEPLOYMENT_LINE)) return false;
+    const match = entry.text.match(/^deployed ([0-9a-f]{7,40}) to ([^\n]*?)(?: — |\n|$)/i);
+    return Boolean(match && sameCommit(target.sha, match[1]) && match[2] === target.target);
+  }) || null;
+}
+
 function dependencyResolved(task, target, options = {}) {
   if (!task || !task.fm) return false;
   const parsed = target && typeof target === 'object'
@@ -965,18 +977,15 @@ function dependencyResolved(task, target, options = {}) {
       status === 'done' ? /^(?:done|.+\s→\s*done)$/i.test(entry.kind) : new RegExp(`^.+\\s→\\s*${status}$`, 'i').test(entry.kind)));
   }
   if (kind === 'deployed') {
-    return require('./review.js').stampedLogEntries(task.body).some((entry) => {
-      if (entry.kind !== 'deployed') return false;
-      const match = entry.text.match(/^deployed ([0-9a-f]{7,40}) to ([^\n]*?)(?: — |\n|$)/i);
-      return Boolean(match && sameCommit(parsed.sha, match[1]) && match[2] === parsed.target);
-    });
+    return Boolean(deploymentFact(task, parsed));
   }
   if (kind === 'commit') {
     if (typeof options.onOrigin === 'function') return parsed.commits.every((sha) => options.onOrigin(task, sha));
     const landed = require('./landed.js');
     const repo = landed.repoFor(task);
     const branch = repo && landed.defaultBranch(repo);
-    return Boolean(branch && parsed.commits.every((sha) => landed.isOnDefault(repo, sha, branch)));
+    return Boolean(branch && landed.originEvidenceUsable(repo)
+      && parsed.commits.every((sha) => landed.isOnDefault(repo, sha, branch)));
   }
   return false;
 }
@@ -5991,7 +6000,7 @@ module.exports = {
   ROOT, TASKS, ARCHIVE, STATUSES, KINDS, STATUS_ORDER, META, HOLDS_DIR,
   isReviewerSession, registerReviewerSession, currentSession, parseWhen, relativeDurationMs, postKeepApi, getKeepApi,
   loadAll, loadTask, loadTaskAnywhere, parseTask, serializeTask, parsePlan, renderPlan, setPlan, nextStep, lastLogLine, isOverdue, nowStamp, stampOf, buildDigest,
-  parseDependency, dependencyTarget, dependencyReason, dependencyStep, dependencyResolved, dependencyInfo, unresolvedDependencyIds,
+  parseDependency, dependencyTarget, dependencyReason, dependencyStep, deploymentFact, dependencyResolved, dependencyInfo, unresolvedDependencyIds,
   withLock, commitAndPush, saveTask, recordDoneTransition, recordDaemonSessionClose, addTask, checkinTask, briefSnapshot, scopeForProject, KeepError,
   claimSession, linkLaunchedSession, releaseCardSession,
   emptyStopEvidence, scanStopEvidence, hasSubstantiveStopEvidence, canonicalCwd, inferProject,

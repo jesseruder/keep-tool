@@ -130,8 +130,9 @@ function latestDecisions() {
 
 function loadState() {
   const state = readJson(stateFile(), {});
-  if (!state || typeof state !== 'object' || Array.isArray(state)) return { fetchedAt: {} };
+  if (!state || typeof state !== 'object' || Array.isArray(state)) return { fetchedAt: {}, fetchStatus: {} };
   if (!state.fetchedAt || typeof state.fetchedAt !== 'object' || Array.isArray(state.fetchedAt)) state.fetchedAt = {};
+  if (!state.fetchStatus || typeof state.fetchStatus !== 'object' || Array.isArray(state.fetchStatus)) state.fetchStatus = {};
   return state;
 }
 
@@ -228,15 +229,23 @@ function errorText(error) {
 
 function fetchDefault(repo, branch, state, now = Date.now()) {
   state.fetchedAt = state.fetchedAt || {};
+  state.fetchStatus = state.fetchStatus || {};
   const prior = Number(state.fetchedAt[repo]);
   if (Number.isFinite(prior) && now - prior >= 0 && now - prior < FETCH_INTERVAL_MS) return null;
   try {
     git(repo, ['fetch', '--no-tags', '--quiet', 'origin', branch], 20e3);
     state.fetchedAt[repo] = now;
+    state.fetchStatus[repo] = { at: now, branch, ok: true };
     return null;
   } catch (error) {
+    state.fetchStatus[repo] = { at: now, branch, ok: false };
     return errorText(error);
   }
+}
+
+function originEvidenceUsable(repo) {
+  const status = loadState().fetchStatus[repo];
+  return !status || status.ok !== false;
 }
 
 function isOnDefault(repo, sha, branch) {
@@ -530,7 +539,13 @@ function persistState(sweepState, now) {
     for (const [repo, at] of Object.entries(sweepState.fetchedAt || {})) {
       if (!Number.isFinite(Number(fetchedAt[repo])) || Number(at) > Number(fetchedAt[repo])) fetchedAt[repo] = at;
     }
-    writeJsonAtomic(stateFile(), { ...current, fetchedAt, lastSweepAt: now });
+    const fetchStatus = { ...current.fetchStatus };
+    for (const [repo, status] of Object.entries(sweepState.fetchStatus || {})) {
+      if (!status || typeof status !== 'object') continue;
+      const prior = fetchStatus[repo];
+      if (!prior || Number(status.at) >= Number(prior.at)) fetchStatus[repo] = status;
+    }
+    writeJsonAtomic(stateFile(), { ...current, fetchedAt, fetchStatus, lastSweepAt: now });
   });
 }
 
@@ -577,9 +592,10 @@ async function sweep({ now = Date.now(), dry = false, only } = {}) {
       const item = { repo, message: failure };
       fetchFailures.push(item);
       process.stderr.write(`keep landed: fetch failed for ${repo}: ${failure}\n`);
+      if (!dry) persistState(state, now);
     }
     checked += 1;
-    if (dry || !keep.dependencyResolved(wait.upstream, wait.target, {
+    if (dry || failure || !keep.dependencyResolved(wait.upstream, wait.target, {
       onOrigin: (_task, sha) => isOnDefault(repo, sha, branch),
     })) continue;
     keep.withLock(() => {
@@ -610,6 +626,7 @@ async function sweep({ now = Date.now(), dry = false, only } = {}) {
       const item = { repo, message: failure };
       fetchFailures.push(item);
       process.stderr.write(`keep landed: fetch failed for ${repo}: ${failure}\n`);
+      if (!dry) persistState(state, now);
     }
 
     const existing = loadRecords(task.id);
@@ -940,6 +957,7 @@ module.exports = {
   repoFor,
   defaultBranch,
   fetchDefault,
+  originEvidenceUsable,
   isOnDefault,
   nextStepIsLanding,
   otherPendingStep,

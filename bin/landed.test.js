@@ -1459,7 +1459,7 @@ test('sweep closes after separately landed shas without mistaking its annotation
   }
 });
 
-test('sweep annotates local evidence but neither closes nor throttles after a failed fetch', () => {
+test('a failed fetch blocks commit waits and stale local refs until a later successful fetch', () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-landed-fetch-failure-'));
   const repo = path.join(temp, 'project');
   const root = path.join(temp, 'registry');
@@ -1480,6 +1480,16 @@ test('sweep annotates local evidence but neither closes nor throttles after a fa
     const now = Date.now();
     const stamp = new Date(now).toISOString().slice(0, 16).replace('T', ' ');
     writeTask(root, 'failed-fetch', { status: 'review', project: repo, sha, next: 'Next: land', stamp });
+    const keep = require('./keep.js');
+    fs.writeFileSync(path.join(root, 'tasks', 'dependent.md'), keep.serializeTask({
+      id: 'dependent',
+      fm: {
+        title: 'dependent', status: 'waiting', kind: 'task', tags: ['personal'],
+        depends_on: [{ card: 'failed-fetch', kind: 'commit', commits: [sha], reason: 'need the remote commit' }],
+        created: stamp.slice(0, 10), updated: stamp.replace(' ', 'T'),
+      },
+      body: '',
+    }));
     runGit(['-C', root, 'add', 'tasks'], { env });
     runGit(['-C', root, 'commit', '-q', '-m', 'fixture'], { env });
 
@@ -1489,10 +1499,27 @@ test('sweep annotates local evidence but neither closes nor throttles after a fa
     assert.match(fs.readFileSync(path.join(root, 'tasks', 'failed-fetch.md'), 'utf8'), /^status: review$/m);
     const state = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'landed', '_state.json'), 'utf8'));
     assert.equal(Object.hasOwn(state.fetchedAt, repo), false);
+    assert.deepEqual(state.fetchStatus[repo], { at: now, branch: 'main', ok: false });
+    assert.equal(fs.existsSync(path.join(root, '.keep', 'unblocked')), false);
+
+    const unblockScript = `(async()=>{await require(${JSON.stringify(path.join(__dirname, 'unblock.js'))}).sweep({deps:{deliver:async()=>({sessionId:'test'})}})})().catch(e=>{console.error(e);process.exitCode=1})`;
+    const stillBlocked = spawnSync(process.execPath, ['-e', unblockScript], { env, encoding: 'utf8' });
+    assert.equal(stillBlocked.status, 0, stillBlocked.stderr);
+    assert.equal(keep.loadTask('dependent', root).fm.status, 'waiting');
 
     const second = runSweep(env, now + 1000);
     assert.equal(second.fetchFailures.length, 1);
     assert.deepEqual(second.landed, []);
+
+    const origin = path.join(temp, 'missing-origin.git');
+    runGit(['init', '-q', '--bare', '--initial-branch=main', origin], { env });
+    runGit(['-C', repo, 'push', '-q', '-u', 'origin', 'main'], { env });
+    const recovered = runSweep(env, now + 2000);
+    assert.deepEqual(recovered.fetchFailures, []);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, '.keep', 'landed', '_state.json'), 'utf8')).fetchStatus[repo].ok, true);
+    const unblocked = spawnSync(process.execPath, ['-e', unblockScript], { env, encoding: 'utf8' });
+    assert.equal(unblocked.status, 0, unblocked.stderr);
+    assert.equal(keep.loadTask('dependent', root).fm.status, 'active');
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });
   }
