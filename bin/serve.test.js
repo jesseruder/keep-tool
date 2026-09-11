@@ -81,6 +81,7 @@ const {
   stripTerminalAnsi,
   openSession,
   addHostSessionState,
+  applyCompanionJobs,
   applySessionLiveness,
   resumeAfterLimit,
   agentPromptVisible,
@@ -3164,7 +3165,7 @@ test('API state synthesizes a minimal session when a host transcript lookup find
   });
 });
 
-function buildStateWithHostSession(root, ack = false, needsQuestion = true, agentAlive = true, externalLive = false) {
+function buildStateWithHostSession(root, ack = false, needsQuestion = true, agentAlive = true, externalLive = false, companion = null) {
   for (const dir of ['tasks', 'archive', 'digests', path.join('.keep', 'acks')]) {
     fs.mkdirSync(path.join(root, dir), { recursive: true });
   }
@@ -3195,6 +3196,7 @@ function buildStateWithHostSession(root, ack = false, needsQuestion = true, agen
         mtime: ${mtime}, size: 10, endedTurn: true, state: 'recent',
         pendingQuestion: ${needsQuestion ? JSON.stringify({ question: 'Which one?', options: ['A', 'B'] }) : 'null'},
       }),
+      companion: ${JSON.stringify(companion)},
     });
     process.stdout.write(JSON.stringify({
       session: state.sessions.find((session) => session.id === id),
@@ -3207,6 +3209,43 @@ function buildStateWithHostSession(root, ack = false, needsQuestion = true, agen
   assert.equal(child.status, 0, child.stderr);
   return JSON.parse(child.stdout);
 }
+
+test('live companion jobs wait only their exact owning Claude session', () => {
+  const now = Date.now();
+  const sessions = ['owner', 'same-cwd'].map((id) => ({
+    id, kind: 'claude', project: '/same/project', pane: `pane-${id}`, endedTurn: true,
+    lastUserAt: now - 1000, lastAssistant: 'Watchdog running. I will resume when the Codex job finishes.',
+  }));
+  applyCompanionJobs(sessions, { known: true, complete: true, jobs: [
+    { id: 'task-current', sessionId: 'owner', status: 'running', startedAt: now },
+    { id: 'task-complete', sessionId: 'same-cwd', status: 'completed', startedAt: now },
+    { id: 'task-dead', sessionId: 'same-cwd', status: 'dead', startedAt: now },
+  ] });
+  const { activity } = require('./session-status');
+  assert.equal(activity(sessions[0], { now }).state, 'waiting');
+  assert.equal(activity(sessions[0], { now }).needsInput, false);
+  assert.equal(activity(sessions[1], { now }).state, 'needs-input', 'same cwd does not imply job ownership');
+  assert.equal(activity({ ...sessions[0], lastUserAt: now + 1000 }, { now: now + 2000 }).state, 'waiting',
+    'a status question does not detach a still-live owned job');
+  assert.equal(activity({ ...sessions[0], pendingQuestion: { question: 'Approve?', options: ['Yes', 'No'] } }, { now }).state, 'needs-input',
+    'an explicit question remains visible while its companion runs');
+});
+
+test('buildState includes companion ownership in normal session classification', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-companion-status-'));
+  try {
+    const running = buildStateWithHostSession(root, false, false, true, false, { known: true, complete: true, jobs: [
+      { id: 'task-live', sessionId: 'claude-host-only', status: 'running', createdAt: new Date().toISOString() },
+    ] });
+    assert.equal(running.session.state, 'waiting');
+    assert.equal(running.attention.length, 0);
+    const unrelated = buildStateWithHostSession(root, false, false, true, false, { known: true, complete: true, jobs: [
+      { id: 'task-other', sessionId: 'different-session', status: 'running', createdAt: new Date().toISOString() },
+    ] });
+    assert.equal(unrelated.session.state, 'needs-input');
+    assert.equal(unrelated.attention[0].attentionLabel, 'Ready for next instruction');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
 
 test('live hosted conversations remain ready after an archived task completes, while current links win', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-archived-attention-'));

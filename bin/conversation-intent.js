@@ -28,7 +28,7 @@ function resolve(session, model, now = Date.now()) {
   const jobInstance = Object.hasOwn(model.process, 'jobInstance') ? model.process.jobInstance : model.process.instance;
   const scheduled = jobs.filter(j => model.process.state === 'live' && j.kind === 'scheduled' && j.recurring === true && j.instance && j.instance === jobInstance && j.expiresAt > now);
   const currentJobs = jobs.filter(j => j.kind !== 'service' && j.kind !== 'scheduled'
-    && (!session.lastUserAt || j.startedAt >= session.lastUserAt));
+    && (j.current === true || !session.lastUserAt || j.startedAt >= session.lastUserAt));
   const concrete = model.background.pending || model.background.uncertain.length || model.background.agents.length || scheduled.length
     || model.task.dependencies.length || model.task.checkAfter;
   const intentional = hint === 'waiting' && Boolean(concrete);

@@ -36,11 +36,12 @@ test('reap cancels a dead job and leaves a fresh running job untouched', async (
 
 test('list preserves the dead-worker reason and the table renders it', async () => {
   const report = await codexJobs.list({
-    ...fakeDeps([{ id: 'gone', pid: 303, status: 'running', updatedAt: NOW, logMtime: NOW, logBytes: 4096 }]),
+    ...fakeDeps([{ id: 'gone', sessionId: 'owner-session', pid: 303, status: 'running', updatedAt: NOW, logMtime: NOW, logBytes: 4096 }]),
     processAlive: () => false,
   });
   assert.equal(report.jobs[0].state, 'dead');
   assert.equal(report.jobs[0].reason, 'worker gone');
+  assert.equal(report.jobs[0].sessionId, 'owner-session');
   const { renderCodexJobs } = require('./keep.js');
   assert.match(renderCodexJobs(report), /dead \(worker gone\)/);
 });

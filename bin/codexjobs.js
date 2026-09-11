@@ -41,6 +41,7 @@ async function inspect(deps = {}, only) {
     })[0];
     return {
       id: String(job.id),
+      sessionId: typeof job.sessionId === 'string' ? job.sessionId : null,
       pid: Number.isInteger(Number(job.pid)) && Number(job.pid) > 0 ? Number(job.pid) : null,
       state: finding ? finding.status : 'running',
       createdAt: job.createdAt ?? null,

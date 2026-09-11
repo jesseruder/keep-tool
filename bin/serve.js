@@ -65,6 +65,8 @@ const SUGGESTION_PROBE_MAX_MS = 2000;
 const SCREEN_HISTORY_LINES = 200;
 const SCREEN_HISTORY_SCROLLBACK = 10000;
 const screenHistoryCache = createScreenHistoryCache();
+const COMPANION_SNAPSHOT_MS = 1000;
+let companionSnapshotCache = { at: 0, value: null, pending: null };
 // A frozen or non-advancing clock must not spin the poll loop forever.
 const SUGGESTION_PROBE_MAX_READS = Math.ceil(SUGGESTION_PROBE_MAX_MS / SUGGESTION_PROBE_WAIT_MS) + 1;
 
@@ -355,6 +357,55 @@ function stallAliveIds(ledger, now) {
     .filter(([, entry]) => entry && Number(entry.lastSeenAlive) >= cutoff)
     .map(([id]) => id);
   return liveIds.length ? new Set(liveIds) : null;
+}
+
+async function companionSnapshot(deps = {}) {
+  const discover = deps.discoverCodexJobs || ((options) => require('./codexjobs').list(options));
+  const now = typeof deps.now === 'function' ? Number(deps.now()) : Number(deps.now ?? Date.now());
+  // Injected discovery is request scoped and must not share production cache state.
+  if (deps.discoverCodexJobs) return discover({ root: deps.root || keep.ROOT, fallbackCacheMs: COMPANION_SNAPSHOT_MS }, deps);
+  if (companionSnapshotCache.value && now - companionSnapshotCache.at < COMPANION_SNAPSHOT_MS) return companionSnapshotCache.value;
+  if (companionSnapshotCache.pending) return companionSnapshotCache.pending;
+  companionSnapshotCache.pending = discover({ root: deps.root || keep.ROOT, fallbackCacheMs: COMPANION_SNAPSHOT_MS })
+    .then((value) => {
+      companionSnapshotCache = { at: Date.now(), value, pending: null };
+      return value;
+    }, (error) => {
+      companionSnapshotCache.pending = null;
+      throw error;
+    });
+  return companionSnapshotCache.pending;
+}
+
+function applyCompanionJobs(sessions, companion) {
+  const known = companion?.known ?? (companion?.discovery && companion.discovery !== 'unknown');
+  if (!known) return sessions;
+  const byOwner = new Map();
+  for (const job of companion.jobs || []) {
+    if (!job) continue;
+    const state = job.state || job.status;
+    if (!job.id || !['running', 'queued', 'stalled'].includes(state) || typeof job.sessionId !== 'string' || !job.sessionId) continue;
+    if (!byOwner.has(job.sessionId)) byOwner.set(job.sessionId, []);
+    byOwner.get(job.sessionId).push({
+      id: String(job.id), kind: 'companion', status: 'pending', recurring: false,
+      startedAt: stalled.timeMs(job.startedAt || job.createdAt), expiresAt: null, current: true,
+    });
+  }
+  for (const session of sessions || []) {
+    const owned = byOwner.get(session.id);
+    if (!owned?.length) continue;
+    const background = session.backgroundJobs || {
+      jobs: [], uncertain: [], caughtUp: true, turnStartedAt: session.turnStartedAt || 0,
+    };
+    const companionIds = new Set(owned.map((job) => job.id));
+    session.backgroundJobs = {
+      ...background,
+      jobs: [...(background.jobs || []).filter((job) => !companionIds.has(String(job.id))), ...owned],
+      pending: true,
+    };
+    session.pendingBackground = true;
+  }
+  return sessions;
 }
 
 // A hit usage limit is written as a synthetic assistant record (model
@@ -4208,6 +4259,9 @@ function buildState(options = {}) {
         session.unknownBackgroundJobs = [...new Set([...jobs.uncertain, ...(!jobs.caughtUp ? session.unknownBackgroundJobs || [] : [])])];
       }
     }
+  }
+  applyCompanionJobs(sessions, options.companion);
+  for (const session of sessions) {
     const task = taskById.get(session.taskId);
     if (task && !dependencyCache.has(task.id)) dependencyCache.set(task.id, keep.unresolvedDependencyIds(task));
     session.activity = sessionStatus.activity(session, { task, dependencies: dependencyCache.get(task?.id) || [], live: liveHostedSessions.has(session.id) });
@@ -5394,7 +5448,8 @@ function start(deps = {}) {
           // it must bypass the dashboard host-list cache and inspect a complete list.
           inspectLaunch: (active) => inspectReviewQueueLaunch(active),
         });
-        const state = buildState({ hostPanes: panes, dashboard: true });
+        const companion = await companionSnapshot(deps);
+        const state = buildState({ hostPanes: panes, dashboard: true, companion });
         const enriched = await addHostSessionState(state, { ...deps, panes });
         let responseState;
         try {
@@ -5501,6 +5556,8 @@ module.exports = {
   claudeSessionFromInfo,
   sessionBackgroundPending,
   stallAliveIds,
+  companionSnapshot,
+  applyCompanionJobs,
   claudeSessionFor,
   transcriptActivityMs,
   sessionNeedsInput,
