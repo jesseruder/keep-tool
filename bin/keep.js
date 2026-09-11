@@ -412,14 +412,11 @@ function guardReviewerStatusChange(changesStatus, force) {
 
 // Curation from another directory must not claim a card, so both the resume link
 // and the scheduler stamp only stick when this session is working in the project.
-// Linked worktrees of the project count as inside it.
+// Linked worktrees of the project count as inside it, and both sides are compared
+// by realpath so a symlinked project path still matches.
 function sessionInTaskProject(task) {
   if (!task.fm.project) return true;
-  const project = path.resolve(task.fm.project.replace(/^~/, os.homedir()));
-  const cwd = process.cwd();
-  const canonical = canonicalCwd(cwd);
-  return [cwd, canonical].some((candidate) =>
-    candidate === project || candidate.startsWith(project + path.sep));
+  return projectMatchesCwd(task.fm.project, process.cwd());
 }
 
 // `sessions` is the card's resume link and follows the session to its newest card;
@@ -1760,8 +1757,6 @@ commands['wait-on'] = (argv) => {
   guardReviewerStatusChange(true, false);
   withLock(() => {
     const dependent = loadTask(dependentId);
-    const session = currentSession();
-    const crossProjectSession = Boolean(session && !sessionInTaskProject(dependent));
     if (o.remove) {
       const removeTargets = requested.map(dependencyTarget);
       const present = new Set((dependent.fm.depends_on || []).map(dependencyTarget));
@@ -1855,11 +1850,9 @@ commands['wait-on'] = (argv) => {
         unblock.removeDelivered(dependentId, target, { root: ROOT });
       }
     }
+    // checkinTask already warned if the session link was skipped for this cwd.
     commitAndPush(`keep: wait-on ${dependentId}`);
     console.log(fmtTask(checked));
-    if (crossProjectSession) {
-      process.stderr.write(`keep: dependency recorded, but session ${session.id} was not linked because the current directory is outside the card project; repair explicitly with keep link ${dependentId} --session ${session.id} --agent ${session.agent}\n`);
-    }
   });
 };
 
