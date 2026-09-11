@@ -823,13 +823,14 @@ test('review-land continues after item failure and commits successful items once
     const suppressedKey = Object.keys(JSON.parse(fs.readFileSync(
       path.join(root, '.keep', 'review', 'suppressed-card.json'), 'utf8',
     )).findings)[0];
+    assert.equal(run(['review-dismiss', 'suppressed-card', suppressedKey, '-m', 'Already dismissed.']).status, 0);
     const cleanBundle = bundleFor('clean-card');
     const findingBundle = bundleFor('finding-card');
     const beforeCommits = Number(spawnSync('git', ['-C', root, 'rev-list', '--count', 'HEAD'], { env, encoding: 'utf8' }).stdout.trim());
     const document = {
       acks: [{ id: 'clean-card', bundle: cleanBundle, message: 'Looks good.' }],
       notes: [
-        { id: 'suppressed-card', kind: 'no-tests', subject: 'src/old.js', severity: 'med', bundle: 'historical', message: 'Same finding.' },
+        { id: 'suppressed-card', kind: 'no-tests', subject: 'src/old.js', severity: 'med', bundle: bundleFor('suppressed-card'), message: 'Same finding.' },
         { id: 'finding-card', kind: 'broken-build', subject: 'npm test', severity: 'med', bundle: findingBundle, message: 'Tests fail.' },
       ],
       ideas: [{ title: 'Batch follow-up', message: 'Automate another review step.' }],
@@ -1333,8 +1334,8 @@ test('a check-in added between bundle and ack is counted by the next bundle', ()
     fs.writeFileSync(cardFile, card.replace(/^(---\n[\s\S]*?\n---\n)/,
       `$1## ${pending.stamp} — check-in\nArrived after the bundle.\n\n`));
 
-    assert.equal(run(['review-ack', 'watermark', '--bundle', bundle]).status, 0);
-    assert.deepEqual(stateOf().logSeen, pending, 'ack promotes only the bundled watermark');
+    assert.equal(run(['review-ack', 'watermark', '--bundle', bundle]).status, 5);
+    assert.equal(stateOf().logSeen, null, 'stale ack does not advance coverage');
     const next = run(['review-bundle', 'watermark']);
     assert.equal(next.status, 0, next.stderr);
     assert.match(next.stdout, /Arrived after the bundle/);
@@ -2159,7 +2160,8 @@ test('review landing actions append ack, finding, idea, and dismiss events', () 
     const events = fs.readFileSync(path.join(root, '.keep', 'review', '_events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
     assert.deepEqual(events.map((event) => event.kind), ['ack', 'finding', 'idea', 'dismiss']);
     assert.deepEqual(events[0], { at: events[0].at, kind: 'ack', card: 'event-card', title: 'acked', detail: 'Nothing concerning.' });
-    assert.match(events[1].detail, /^no-tests · bin\/event\.js$/);
+    assert.match(events[1].detail, /Does the concern about bin\/event\.js/);
+    assert.equal(events[1].title, 'verification question');
     assert.equal(events[1].key, findingKey);
     assert.equal(events[1].severity, 'low');
     assert.equal(events[2].title, 'idea filed');
@@ -2292,7 +2294,7 @@ test('wrong-status findings apply only safe done/deferred transitions through no
       fs.writeFileSync(path.join(keep.ROOT, 'tasks', id + '.md'), keep.serializeTask(task));
       return task;
     };
-    const note = (id, extra = {}) => review.reviewNote(id, { kind: 'wrong-status', subject: id, severity: 'low', message: 'Obsolete work.', suggestStatus: 'done', ...extra });
+    const note = (id, extra = {}) => review.reviewNote(id, { kind: 'wrong-status', subject: id, severity: 'low', message: 'Obsolete work.', basis: 'observed', evidence: 'fixture history', checked: 'current status and owner history', suggestStatus: 'done', ...extra });
     const body = (id) => keep.loadTask(id).body;
     const refuse = async (id, reason, fm = {}, extra = {}) => {
       make(id, fm);
@@ -2337,6 +2339,7 @@ test('wrong-status findings apply only safe done/deferred transitions through no
         await refuse('target-' + target, 'target is not done or deferred', {}, { suggestStatus: target });
       }
       await refuse('kind', 'kind is not wrong-status', {}, { kind: 'other' });
+      await refuse('uncertain', 'status change requires an observed finding with verified evidence', {}, { basis: 'needs-verification' });
       make('new-log');
       const state = review.loadState('new-log');
       state.lastReviewedAt = new Date(2019, 0, 1).getTime();
@@ -2346,15 +2349,15 @@ test('wrong-status findings apply only safe done/deferred transitions through no
       assert.equal(keep.loadTask('new-log').fm.status, 'active');
       make('race');
       race = () => keep.checkinTask('race', { message: 'Reopened by Jesse.', force: true, linkSession: false, commit: false });
-      await note('race');
-      assert.ok(body('race').includes('not applied: newer check-in than finding evidence'));
+      await assert.rejects(note('race'), /card changed after review evidence/);
+      assert.ok(!body('race').includes('-- reviewer'));
       assert.equal(keep.loadTask('race').fm.status, 'active');
       make('bundle-race');
       const bundle = review.buildBundle('bundle-race', { force: true });
       keep.checkinTask('bundle-race', { message: 'New check-in after bundle.', linkSession: false, commit: false });
-      await note('bundle-race', { bundle: bundle.bundleId });
+      await assert.rejects(note('bundle-race', { bundle: bundle.bundleId }), /card changed after review evidence/);
       assert.equal(keep.loadTask('bundle-race').fm.status, 'active');
-      assert.ok(body('bundle-race').includes('not applied: newer check-in than finding evidence'));
+      assert.ok(!body('bundle-race').includes('-- reviewer'));
       make('first-seen');
       const firstSeen = review.loadState('first-seen');
       const anchor = review.findingKey('first-seen', 'wrong-status', 'first-seen');
@@ -2378,10 +2381,10 @@ test('wrong-status findings apply only safe done/deferred transitions through no
       make('batch-deferred');
       make('batch-refused', { needs: [{ text: 'Approval' }] });
       const notes = ['batch-done', 'batch-deferred', 'batch-refused'].map((id) => ({
-        id, kind: 'wrong-status', subject: id, severity: 'low', message: 'Obsolete.',
-        bundle: 'historical', suggestStatus: id === 'batch-deferred' ? 'deferred' : 'done',
+        id, kind: 'wrong-status', subject: id, severity: 'low', message: 'Obsolete.', basis: 'observed', evidence: 'fixture history', checked: 'status and owner history',
+        bundle: review.buildBundle(id, { force: true }).bundleId, suggestStatus: id === 'batch-deferred' ? 'deferred' : 'done',
       }));
-      notes.push({ id: 'dismissed', kind: 'wrong-status', subject: 'dismissed', severity: 'low', message: 'Again.', bundle: 'historical', suggestStatus: 'done' });
+      notes.push({ id: 'dismissed', kind: 'wrong-status', subject: 'dismissed', severity: 'low', message: 'Again.', bundle: review.buildBundle('dismissed', { force: true }).bundleId, suggestStatus: 'done' });
       const landed = await review.reviewLand({ notes });
       assert.ok(landed.results.some((row) => row.detail.includes('not applied: dismissed by Jesse')));
       assert.equal(body('dismissed'), dismissedBody);

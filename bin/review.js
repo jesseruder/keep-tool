@@ -24,6 +24,7 @@ const codex = require('./codex.js');
 const health = require('./health.js');
 const probes = require('./review-probes.js');
 const quality = require('./review-quality.js');
+const related = require('./review-related.js');
 const { PROJECTS_DIR, findSessionFile, readTranscript, textOf: transcriptTextOf } = require('./transcripts.js');
 
 const META = path.join(keep.ROOT, '.keep');
@@ -529,6 +530,8 @@ function resetProjectEvidence(taskId) {
   state.git = emptyState(taskId).git;
   delete state.probe;
   delete state.pendingProbe;
+  delete state.lastFindingBundle;
+  delete state.lastFindingEvidence;
   // A tombstone, rather than deletion: commitState accepts an explicit bundle
   // when none is pending. Force old acknowledgements to fail until a fresh read.
   state.pendingBundle = `project-changed-${crypto.randomBytes(8).toString('hex')}`;
@@ -592,6 +595,10 @@ function commitState(taskId, { status, bundle, clean = false, probeSafe = false 
   if (hadPendingBundle && state.git.pendingClearsSkipped) state.git.skippedFrom = '';
   delete state.git.pendingClearsSkipped;
   if (Number.isFinite(state.pendingRunAt)) { state.lastRunAt = state.pendingRunAt; delete state.pendingRunAt; }
+  if (state.pendingBundle && state.pendingStatusEvidence) {
+    state.lastFindingBundle = state.pendingBundle;
+    state.lastFindingEvidence = state.pendingStatusEvidence;
+  }
   delete state.pendingBundle;
   delete state.pendingStatusEvidence;
   state.probe = clean ? probes.acknowledgeProbe(state.probe, state.pendingProbe, probeSafe, Date.now()) : null;
@@ -1245,10 +1252,19 @@ function buildBundle(taskId, opts = {}) {
     headerLines.push('', 'findings Owner dismissed — do not raise these again:');
     for (const f of dismissed.slice(0, 12)) headerLines.push(`- ${f.kind} · ${f.subject}${f.why ? ` — ${f.why}` : ''}`);
   }
-  const corrections = findingOutcomes().filter(row => row.outcome?.status === 'incorrect').slice(0, 6);
+  const allOutcomes = findingOutcomes();
+  const corrections = allOutcomes.filter(row => row.outcome?.status === 'incorrect').slice(0, 6);
   if (corrections.length) {
     headerLines.push('', 'Prior corrected findings — retain these lessons, not the disproven claim:');
     for (const row of corrections) headerLines.push(`- ${row.card}/${row.key}: ${clip(row.outcome.message, 400)} (evidence: ${clip(row.outcome.evidence, 200)})`);
+  }
+
+  const relatedRows = related.relatedCards(task, keep.loadAll(true), allOutcomes);
+  const relatedLines = relatedRows.length ? ['## related work — verify resolution before alleging unfinished/unowned work',
+    'These are bounded retrieval leads, not proof that the current concern is resolved. Read the cited card when relevant.'] : [];
+  for (const row of relatedRows) {
+    relatedLines.push(`- ${row.id} [${row.status}] ${clip(row.title, 140)} — ${row.reason}`, row.evidence);
+    for (const outcome of row.outcomes) relatedLines.push(`  outcome ${outcome.key}: ${outcome.status} — ${clip(outcome.message, 240)}; evidence: ${clip(outcome.evidence, 200)}`);
   }
 
   const fm = task.fm;
@@ -1327,6 +1343,7 @@ function buildBundle(taskId, opts = {}) {
     { name: 'header', share: 2, text: headerLines.slice(0, protectedStart).join('\n') },
     { name: 'safety envelope', fixed: true, share: 0, text: headerLines.slice(protectedStart, protectedEnd).join('\n') },
     { name: 'finding context', share: 3, text: headerLines.slice(protectedEnd).join('\n') },
+    { name: 'related work', share: 8, text: relatedLines.join('\n').slice(0, 6500) },
     { name: 'card', share: 12, text: taskLines.join('\n') },
     { name: 'git', share: 15, text: gitLines.join('\n') },
     { name: 'diff', share: 25, text: diffLines.join('\n') },
@@ -1338,7 +1355,7 @@ function buildBundle(taskId, opts = {}) {
   const md = applyBudget(sections, Math.max(0, budgetChars - separators)).join('\n\n');
   state.pendingBundle = bundleId;
   state.pendingProbe = pendingProbe;
-  state.pendingStatusEvidence = { since: state.lastReviewedAt || Date.now(), logHash: statusLogHash(task.body) };
+  state.pendingStatusEvidence = { since: state.lastReviewedAt || Date.now(), logHash: statusLogHash(task.body), cardHash: findingCardHash(task) };
   state.pendingLog = advanceLogWatermark(state.logSeen, logEntriesForReview);
   keep.withLock(() => {
     assertProjectUnchanged();
@@ -2303,16 +2320,40 @@ function statusLogHash(body) {
   return crypto.createHash('sha256').update(JSON.stringify(logEntries(body))).digest('hex');
 }
 
-function statusEvidence(taskId) {
+function findingCardHash(task) {
+  const fields = ['title', 'status', 'project', 'kind', 'check', 'check_after', 'needs', 'depends_on', 'sessions'];
+  return crypto.createHash('sha256').update(JSON.stringify([
+    fields.map(field => [field, task.fm[field] ?? null]),
+    String(task.body || '').split(/^## \d{4}-/m)[0],
+    stampedLogEntries(task.body),
+  ])).digest('hex');
+}
+
+function assertFindingFresh(task, evidence) {
+  if (evidence?.invalidBundle) { const error = new keep.KeepError('stale or unknown bundle; rebuild review evidence'); error.exitCode = 5; throw error; }
+  if (!evidence || (evidence.cardHash ? findingCardHash(task) !== evidence.cardHash : statusLogHash(task.body) !== evidence.logHash)) {
+    const error = new keep.KeepError('card changed after review evidence was read; rebuild the bundle before posting or acknowledging (no evidence advanced)');
+    error.exitCode = 5;
+    throw error;
+  }
+}
+
+function statusEvidence(taskId, bundle) {
   const state = loadState(taskId);
+  if (bundle && bundle !== state.pendingBundle) {
+    return !state.pendingBundle && bundle === state.lastFindingBundle && state.lastFindingEvidence
+      ? state.lastFindingEvidence : { invalidBundle: true };
+  }
   return state.pendingStatusEvidence || {
     since: state.lastReviewedAt || 0,
     logHash: statusLogHash(keep.loadTask(taskId).body),
+    cardHash: findingCardHash(keep.loadTask(taskId)),
   };
 }
 
 function reviewerStatusRefusal(task, opts, prior, finding, sessions, evidence) {
   if (opts.kind !== 'wrong-status') return 'kind is not wrong-status';
+  if (!quality.canInterrupt(finding)) return 'status change requires an observed finding with verified evidence';
   if (!['done', 'deferred'].includes(opts.suggestStatus)) return 'target is not done or deferred';
   if (prior?.dismissed) return 'dismissed by Jesse';
   if (!sessions) return 'live session registry unavailable';
@@ -2341,7 +2382,7 @@ function reviewerStatusRefusal(task, opts, prior, finding, sessions, evidence) {
 }
 
 async function reviewNote(taskId, opts) {
-  const evidence = statusEvidence(taskId);
+  const evidence = statusEvidence(taskId, opts.bundle);
   const sessions = opts.kind === 'wrong-status' && ['done', 'deferred'].includes(opts.suggestStatus)
     ? await reviewerSessions() : null;
   return keep.withLock(() => recordReviewNote(taskId, { ...opts, withinLock: true }, sessions, evidence));
@@ -2394,6 +2435,8 @@ function recordReviewNote(taskId, opts, sessions, evidence) {
     throw err;
   }
 
+  assertFindingFresh(task, evidence);
+
   // Dismissal is permanent, even with --force. A status suggestion returns a
   // successful refusal so a batch can continue, without re-posting the finding.
   if (prior?.dismissed && opts.suggestStatus) {
@@ -2438,7 +2481,8 @@ function recordReviewNote(taskId, opts, sessions, evidence) {
   const tick = '`';
   const repeat = count > 1 ? '**(' + ordinal(count) + ' time)** ' : '';
   const head = repeat + '**' + kind + '** - ' + tick + clip(subject, 120) + tick + ' - severity ' + severity;
-  const body = [head, '', quality.assessmentText(finding), '', message];
+  const report = quality.reportMessage(finding, message);
+  const body = [head, '', quality.assessmentText(finding), '', report];
   // Only evidence-backed wrong-status findings can close or defer an unowned card.
   const refusal = opts.suggestStatus ? reviewerStatusRefusal(task, opts, prior, finding, sessions, evidence) : null;
   const appliedStatus = opts.suggestStatus && !refusal ? opts.suggestStatus : undefined;
@@ -2500,7 +2544,7 @@ function recordReviewNote(taskId, opts, sessions, evidence) {
     if (urgency.announce) lines.push('[announced over speakers]');
     // visible, so you can see that something wanted to shout and was rate-limited
     else if (urgency.suppressed) lines.push('[suppressed-urgent] ' + urgency.suppressed);
-    lines.push('', quality.assessmentText(finding), '', message);
+    lines.push('', quality.assessmentText(finding), '', report);
     digestFile = landDigestLines(lines, opts);
   }
 
@@ -2530,8 +2574,8 @@ function recordReviewNote(taskId, opts, sessions, evidence) {
     ? spawnAnnounce('Keep reviewer: ' + severity + ' severity ' + kind + ' flagged on ' + taskId)
     : false;
   appendReviewEvent({
-    kind: 'finding', card: taskId, key, severity, title: 'finding',
-    detail: `${kind} · ${clip(subject || message, 240)}`,
+    kind: 'finding', card: taskId, key, severity, title: finding.basis === 'observed' ? 'finding' : 'verification question',
+    detail: finding.basis === 'observed' ? `${kind} · ${clip(subject || message, 240)}` : clip(finding.question || `Does the concern about ${subject} hold after checking the relevant history?`, 240),
   });
   return { key, count, digestFile, announced, suppressedUrgent: urgency.suppressed || null };
 }
@@ -2544,6 +2588,7 @@ function reviewAck(taskId, message, opts) {
     return keep.withLock(() => reviewAck(taskId, message, { ...options, withinLock: true }));
   }
   const task = keep.loadTask(taskId);
+  assertFindingFresh(task, statusEvidence(taskId, options.bundle));
   const state = commitState(taskId, { status: task.fm.status, bundle: options.bundle, clean: true, probeSafe: options.probeSafe === true });
   if (message) {
     landDigestLines(['## ' + keep.nowStamp().slice(11) + ' - ' + taskId + '  [clean]', '', message], options);
@@ -2683,7 +2728,7 @@ function validateReviewLand(document) {
     currentBundle(item, label);
   });
   eachObject('notes', (item, label) => {
-    for (const field of ['basis', 'evidence', 'checked']) optionalString(item, field, label);
+    for (const field of ['basis', 'evidence', 'checked', 'question', 'unknown']) optionalString(item, field, label);
     try { quality.assessment(item); } catch (error) { problems.push(`${label}: ${error.message}`); }
     for (const field of ['id', 'kind', 'subject', 'severity', 'bundle', 'message']) requiredString(item, field, label);
     if (typeof item.kind === 'string' && item.kind && !FINDING_KINDS.includes(item.kind)) {
@@ -2738,7 +2783,7 @@ async function reviewLand(document) {
     ...(document.ideas || []).map((item, index) => ({ type: 'idea', index, item })),
     ...(document.dismiss || []).map((item, index) => ({ type: 'dismiss', index, item })),
   ];
-  const evidence = new Map((document.notes || []).map((item) => [item.id, statusEvidence(item.id)]));
+  const evidence = new Map((document.notes || []).map((item) => [item.id, statusEvidence(item.id, item.bundle)]));
   const sessions = (document.notes || []).some((item) => item.kind === 'wrong-status' && ['done', 'deferred'].includes(item.suggestStatus))
     ? await reviewerSessions() : null;
   const results = [];
@@ -2766,7 +2811,7 @@ async function reviewLand(document) {
           const out = recordReviewNote(item.id, {
             kind: item.kind, subject: item.subject, severity: item.severity, bundle: item.bundle,
             message: item.message, suggestStatus: item.suggestStatus,
-            basis: item.basis, evidence: item.evidence, checked: item.checked,
+            basis: item.basis, evidence: item.evidence, checked: item.checked, question: item.question, unknown: item.unknown,
             withinLock: true, commit: false, digestLines,
           }, sessions, evidence.get(item.id));
           counts.reviewed += 1;

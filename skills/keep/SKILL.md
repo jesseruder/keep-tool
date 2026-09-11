@@ -173,6 +173,12 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
 - `keep review-replay <card> [--session <id>] [--since ISO]` estimates repeated-probe
   backoff against recorded reviews, without changing review state.
 
+- Review findings/acks refuse stale card evidence without advancing coverage; rebuild
+  the bundle after a refusal. Unverified findings are open verification questions:
+  `review-note --question "what to verify?" --unknown "missing evidence"`; they cannot
+  change status. Related-work leads in bundles include completed cards but do not
+  automatically prove a concern resolved.
+
 ## Landing and closing
 
 - When the requested work and validation are complete, default to `--status done`

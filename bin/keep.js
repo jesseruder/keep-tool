@@ -5142,7 +5142,7 @@ commands['review-queue'] = (argv) => {
 };
 
 commands['review-note'] = async (argv) => {
-  const o = parseArgs(argv, { kind: 'str', subject: 'str', severity: 'str', 'suggest-status': 'str', bundle: 'str', force: 'bool', 'no-digest': 'bool', basis: 'str', evidence: 'str', checked: 'str' });
+  const o = parseArgs(argv, { kind: 'str', subject: 'str', severity: 'str', 'suggest-status': 'str', bundle: 'str', force: 'bool', 'no-digest': 'bool', basis: 'str', evidence: 'str', checked: 'str', question: 'str', unknown: 'str' });
   const id = o._[0];
   if (!id || !o.m) die('usage: keep review-note <id> --kind <k> --subject <s> [--severity low|med|high] [--suggest-status s] [--force] -m "finding"');
   const out = await require('./review.js').reviewNote(id, {
@@ -5154,7 +5154,7 @@ commands['review-note'] = async (argv) => {
     bundle: o.bundle,
     force: o.force,
     noDigest: o['no-digest'],
-    basis: o.basis, evidence: o.evidence, checked: o.checked,
+    basis: o.basis, evidence: o.evidence, checked: o.checked, question: o.question, unknown: o.unknown,
   });
   console.log(out.notApplied ? `finding ${out.key} on ${id} — not applied: ${out.notApplied}`
     : `recorded finding ${out.key} on ${id}${out.count > 1 ? ` (seen ${out.count}x)` : ''}`);
@@ -5926,7 +5926,7 @@ ${stepUsage()}
   keep review-bundle <id> --session <id> --from <byte> --raw
                          # re-read a coverage gap the delta cap skipped
   keep review-note <id> --kind k --subject s [--severity s] -m "finding"
-                         [--basis observed|inferred|needs-verification] [--evidence "references"] [--checked "verification performed"]
+                         [--basis observed|inferred|needs-verification] [--evidence "references"] [--checked "verification performed"] [--question "what to verify?"] [--unknown "missing evidence"]
   keep review-idea "<title>" -m "<body>" [--project p] [--cards a,b,c] [--severity low|med]
   keep review-ack <id> [--bundle id] [--probe-safe] [-m note]  # reviewed; probe-safe approves exact read-only automated calls
   keep review-replay <card> [--since ISO-timestamp] [--session id]  # read-only counterfactual against recorded review times

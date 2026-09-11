@@ -633,3 +633,22 @@ Fixed/deferred findings may re-enter when source or status changes. If new evide
 invalidates a correction, ask the owner/working session to reopen it explicitly.
 During compaction preserve the correction, evidence reference and resulting lesson;
 bundles also carry recent incorrect findings so a fresh session can recover them.
+
+Before posting or acknowledging, Keep checks that the card still matches the evidence
+snapshot. A newer owner check-in, status, plan, schedule, need, dependency or session
+link invalidates it; `--force` does not bypass this. On a freshness refusal, rebuild
+that card's bundle and reconsider the finding. Other cards in the batch may still land.
+
+Bundles include at most four related-work leads: explicit dependencies/successors and
+specific topic matches in the same project, including completed/archived cards and
+recorded outcomes. Before claiming unfinished or unowned work, read relevant leads.
+A match is not proof that every defect is fixed: an OOM fix does not settle teardown
+re-entry or lost failure reasons. Check the current phase before recommending a
+project change; CLI implementation and image deployment can belong to different repos.
+
+For uncertain notes supply `question` (the verification question) and `unknown`
+(the evidence still missing), using `--question`/`--unknown` in review-note. The public
+report opens with that question and quotes the message as an unverified hypothesis.
+Use the same wording in your final tick summary. Do not put a confident accusation
+under a needs-verification label. Unverified notes cannot apply status changes;
+observed notes still require evidence references and verification performed.
