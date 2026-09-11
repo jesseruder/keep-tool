@@ -1,6 +1,13 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
+test('reviewer feed labels uncertain reports as verification questions', async () => {
+  const { eventHeading } = await import('../web/app/reviewer.js');
+  assert.equal(eventHeading({ kind: 'finding', title: 'verification question' }), 'verification question');
+  assert.equal(eventHeading({ kind: 'finding', title: 'finding' }), 'finding');
+  assert.equal(eventHeading({ kind: 'finding' }), 'finding');
+});
+
 test('reviewer shows weekly allowance usage, preferring the model window', async () => {
   const { weeklyText } = await import('../web/app/reviewer.js');
   const model = weeklyText({ reviewerCost: 182, shareOfLocal: .02, pointsOfModelWeek: 1.25, modelLabel: 'Fable wk', modelPercent: 40, pointsOfWeek: .8 });

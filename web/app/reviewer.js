@@ -28,8 +28,9 @@ function today() { return localDay(Date.now()); }
 
 function yesterday() { return localDay(Date.now() - 86400e3); }
 
-function eventHeading(event) {
+export function eventHeading(event) {
   if (event.kind === 'nudge') return `nudged session ${String(event.sessionId || '').slice(0, 8)}`.trim();
+  if (event.kind === 'finding' && event.title === 'verification question') return event.title;
   return ({ ack: 'acked', finding: 'finding', idea: 'idea filed', dismiss: 'dismissed', compact: 'compacted', tick: 'tick' })[event.kind]
     || event.title || event.kind || 'event';
 }
