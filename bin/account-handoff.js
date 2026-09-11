@@ -59,8 +59,9 @@ async function authPreflight(account, deps = {}) {
 }
 
 function permissionClass(args) {
-  const text = String(args || '');
-  if (/--(?:permission-mode|allowedTools|disallowedTools|settings|tools|add-dir|append-system-prompt|system-prompt|strict-mcp-config|agent|setting-sources|plugin-dir|disable-slash-commands)(?:=|\s)/.test(text)) return null;
+  const reviewerSettings = JSON.stringify(require('./reviewer-launch').REVIEWER_SETTINGS).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const text = String(args || '').replace(new RegExp(`--settings(?:=|\\s+)["']?${reviewerSettings}["']?(?=\\s|$)`), '');
+  if (/--(?:permission-mode|permission-prompts|permission-prompt-tool|allow-dangerously-skip-permissions|allowedTools|allowed-tools|disallowedTools|disallowed-tools|restricted|settings|tools|add-dir|append-system-prompt|system-prompt|strict-mcp-config|agent|agents|setting-sources|plugin-dir|disable-slash-commands)(?==|\s|$)/.test(text)) return null;
   return text.split(/\s+/).includes('--dangerously-skip-permissions') ? 'bypass' : 'restricted';
 }
 
@@ -108,10 +109,17 @@ async function run(body, deps = {}) {
       const error = new Error('Cross-profile handoff is currently verified only for Claude sessions'); error.status = 409; throw error;
     }
     if (source.id === target.id) { const error = new Error('source and target account are the same'); error.status = 409; throw error; }
+    if (current && !pane.alive && pane.meta?.handoffTransactionId === current.id && pane.meta?.accountId === target.id
+        && ['starting-target', 'verifying-target', 'delivering-continuation'].includes(current.phase)
+        && Number.isInteger(pane.pid) && pane.pid !== current.pid) {
+      current.pid = pane.pid;
+      writeOne(root, current);
+    }
     if (current?.status === 'recovery-needed' && pane.alive && pane.meta?.accountId === target.id
         && pane.meta?.handoffTransactionId === current.id
         && ['starting-target', 'verifying-target', 'delivering-continuation'].includes(current.phase)) {
       try {
+        if (!current.sourceStopVerifiedAt) throw new Error('Source exit was not verified by the handoff transaction; recovery is blocked');
         if (current.phase !== 'delivering-continuation') {
           const record = await deps.waitForAccountRecord(session.id, pane.id, target.id, current.targetLaunchStartedAt);
           if (!record) throw new Error('Target SessionStart identity was not verified');
@@ -132,6 +140,7 @@ async function run(body, deps = {}) {
     }
     if (current?.status === 'recovery-needed' && !pane.alive) {
       try {
+        if (!current.sourceStopVerifiedAt) throw new Error('Source exit was not verified by the handoff transaction; recovery is blocked');
         if (!await authPreflight(target, deps)) throw new Error('Target Claude account is not logged in');
         const compatibility = (deps.compatible || require('./account-setup').compatible)(source, target, session.project || current.cwd || pane.cwd);
         if (!compatibility.ok) throw new Error(`Target account setup is incompatible: ${compatibility.reasons.join('; ')}`);
@@ -194,7 +203,7 @@ async function run(body, deps = {}) {
     const baseHost = deps.host;
     const wrappedHost = { request: async (type, params) => {
       if (type !== 'replace-exited') return baseHost.request(type, params);
-      Object.assign(current, { status: 'copying', phase: 'copying-artifacts' }); writeOne(root, current);
+      Object.assign(current, { status: 'copying', phase: 'copying-artifacts', sourceStopVerifiedAt: Date.now() }); writeOne(root, current);
       artifacts.copyClaudeArtifacts(session.id, source, target, current.id, { root, env });
       copied = true;
       accounts.stageSession(session.id, target.id, current.id, { root, env });

@@ -107,6 +107,7 @@ async function createFixture() {
             transaction = { id: `handoff-${state.handoffs.length + 1}`, sessionId: session.id, pane: pane.id,
               sourceAccountId: session.accountId, targetAccountId: account.id, status: 'recovery-needed', phase: 'stopped', reason: 'Fixture interruption' };
             state.handoffs.push(transaction);
+            pane.alive = false;
             publish(); json({ ok: false, transactionId: transaction.id, status: transaction.status, phase: transaction.phase, reason: transaction.reason }); return;
           }
           if (!transaction) {
@@ -115,6 +116,7 @@ async function createFixture() {
             state.handoffs.push(transaction);
           }
           transaction.status = 'done';
+          pane.alive = true;
           session.accountId = account.id; session.accountLabel = account.label;
           pane.meta.accountId = account.id; pane.meta.accountLabel = account.label;
           publish(); json({ ok: true, transactionId: transaction.id, sessionId: session.id, pane: pane.id,

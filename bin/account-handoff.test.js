@@ -96,6 +96,9 @@ test('actual restart busy refusal leaves source live and does not copy artifacts
     assert.equal(d.pane.alive, true);
     assert.equal(accounts.forSession(f.sid, 'claude', { root: f.root, env: f.env }).id, 'one');
     assert.equal(fs.existsSync(path.join(f.profiles.two, 'projects', f.projectName, `${f.sid}.jsonl`)), false);
+    d.pane.alive = false;
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /Source exit was not verified/,
+      'an unrelated source crash cannot bypass the restart ledger refusal');
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
@@ -114,8 +117,14 @@ test('copy-before-launch failure is recoverable without a duplicate owner or dup
     const journalFile = path.join(f.root, '.keep', 'account-handoffs', `${f.sid}.json`);
     const interrupted = JSON.parse(fs.readFileSync(journalFile, 'utf8'));
     interrupted.status = 'starting';
+    interrupted.pid = 10;
     fs.writeFileSync(journalFile, JSON.stringify(interrupted));
+    d.pane.pid = 20;
     d.inspect = async () => ({ session: { id: f.sid, kind: 'claude', project: f.project }, pane: d.pane, processArgs: '' });
+    d.resumeExited = async (entry) => {
+      assert.equal(entry.pid, 20, 'the transaction-marked replacement pid is adopted after a crash before journal persistence');
+      return { ok: true, pane: 'pane-1', pid: 30 };
+    };
     const recovered = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d);
     assert.equal(recovered.status, 'done');
     assert.equal(d.continuations(), 1);
@@ -179,16 +188,21 @@ test('same-account and cross-provider targets are refused before stopping', asyn
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
-test('custom settings and tool restrictions are refused before source exit', async () => {
+test('custom settings, tool aliases, and restricted mode are refused before source exit', async () => {
   const f = fixture();
   try {
-    for (const flag of ['--settings custom.json', '--tools Read']) {
+    for (const flag of ['--settings custom.json', '--tools Read', '--allowed-tools Read', '--disallowed-tools', '--restricted']) {
       const d = deps(f);
       d.inspect = async () => ({ session: { id: f.sid, kind: 'claude', project: f.project }, pane: d.pane,
         processArgs: `claude ${flag} --resume ${f.sid}` });
       await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /custom permission configuration/);
       assert.equal(d.pane.alive, true);
     }
+    const reviewer = deps(f);
+    reviewer.inspect = async () => ({ session: { id: f.sid, kind: 'claude', project: f.project }, pane: reviewer.pane,
+      processArgs: `claude --settings '${JSON.stringify(require('./reviewer-launch').REVIEWER_SETTINGS)}' --resume ${f.sid}` });
+    const result = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, reviewer);
+    assert.equal(result.status, 'done', 'the exact generated reviewer settings are reproducible');
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 

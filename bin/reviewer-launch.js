@@ -36,9 +36,11 @@ async function launch(args, root, deps = {}) {
   const model = args[0] || process.env.KEEP_REVIEWER_MODEL || 'fable';
   const family = ['fable', 'opus', 'sonnet', 'haiku'].find((name) => model.includes(name)) || model;
   const sessionId = (deps.randomUUID || crypto.randomUUID)();
-  const argv = ['claude', ...reviewerFlags(model), '--session-id', sessionId, ...args.slice(1)];
   const accountApi = deps.accounts || require('./accounts.js');
   const account = deps.account || accountApi.automationFor('claude', 'reviewer');
+  const shared = (deps.ensureSharedMemory || require('./account-setup').ensureSharedMemory)(account, root);
+  const argv = ['claude', ...reviewerFlags(model), ...(shared.mcpConfig ? ['--mcp-config', shared.mcpConfig] : []),
+    '--session-id', sessionId, ...args.slice(1)];
   const profileCommand = (deps.profileCommand || require('./agent-launcher').profileCommand)(argv, account);
   const client = await (deps.connect || require('./hostclient').connect)();
   try {
@@ -60,4 +62,4 @@ async function launch(args, root, deps = {}) {
   } finally { client.close(); }
 }
 
-module.exports = { launch, reviewerFlags, reviewerEnv, reviewerBashOutput, REVIEWER_BASH_OUTPUT_CHARS };
+module.exports = { launch, reviewerFlags, reviewerEnv, reviewerBashOutput, REVIEWER_SETTINGS, REVIEWER_BASH_OUTPUT_CHARS };

@@ -2634,6 +2634,21 @@ async function restartSession(body, deps = {}) {
     }
     const cwd = session.project || pane.cwd;
     if (!cwd || !fs.statSync(cwd).isDirectory()) throw Error('Session directory is unavailable');
+    let account = deps.resumeAccount || null;
+    if (!account) {
+      try { account = accounts.forSession(session.id, session.kind, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
+      catch (error) { throw new InjectionError(409, error.message); }
+      if (!account && session.accountId) {
+        account = accounts.get(session.accountId, deps.env || process.env);
+        if (!account || account.agent !== session.kind) throw new InjectionError(409, `session belongs to unavailable account ${session.accountId}`);
+      }
+      account ||= accounts.defaultFor(session.kind, deps.env || process.env);
+    }
+    let resumeMcpConfig = deps.resumeMcpConfig || null;
+    if (session.kind === 'claude' && account.managed) {
+      try { resumeMcpConfig ||= (deps.ensureSharedMemory || require('./account-setup').ensureSharedMemory)(account, cwd).mcpConfig; }
+      catch (error) { throw new InjectionError(409, `account shared setup is unavailable: ${error.message}`); }
+    }
     const originalRows = await (deps.agentProcessRows || agentProcessRows)(deps);
     const originalIdentity = (await liveSessionPids({ ...deps, agentProcessRows: async () => originalRows })).get(session.id);
     if (!originalIdentity?.primary) throw Error('Original agent process identity is unverified');
@@ -2708,13 +2723,7 @@ async function restartSession(body, deps = {}) {
     const requestedResumeModel = deps.resumeModel || pane.meta?.model;
     const launchModel = typeof requestedResumeModel === 'string' && keep.LAUNCH_MODEL_RE.test(requestedResumeModel) ? requestedResumeModel : '';
     const modelArgs = launchModel ? (session.kind === 'codex' ? ['-m', launchModel] : ['--model', launchModel]) : [];
-    let account = deps.resumeAccount || null;
-    if (!account) {
-      try { account = accounts.forSession(session.id, session.kind, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
-      catch (error) { throw new InjectionError(409, error.message); }
-      account ||= accounts.defaultFor(session.kind, deps.env || process.env);
-    }
-    const mcpArgs = session.kind === 'claude' && deps.resumeMcpConfig ? ['--mcp-config', deps.resumeMcpConfig] : [];
+    const mcpArgs = session.kind === 'claude' && resumeMcpConfig ? ['--mcp-config', resumeMcpConfig] : [];
     const argv = [session.kind, ...flags, ...reviewerSpec.flags, ...mcpArgs, ...modelArgs,
       session.kind === 'codex' ? 'resume' : '--resume', session.id];
     const result = await host('replace-exited', { paneId: pane.id, expectedPid: pane.pid, sessionId: stopped.meta?.sessionId,
@@ -2734,6 +2743,22 @@ async function forceRestartSession(entry, save, deps = {}) {
     const initial = (await host('get', { pane: entry.pane })).pane;
     const cwd = entry.original?.cwd || initial?.cwd;
     if (!cwd || !fs.statSync(cwd).isDirectory()) throw Error('Session directory is unavailable');
+    const originalAccountId = entry.original?.meta?.accountId || initial?.meta?.accountId;
+    let resumeAccount;
+    try { resumeAccount = accounts.forSession(entry.sessionId, entry.original?.agent, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
+    catch (error) { throw new InjectionError(409, error.message); }
+    if (!resumeAccount && originalAccountId) {
+      resumeAccount = accounts.get(originalAccountId, deps.env || process.env);
+      if (!resumeAccount || resumeAccount.agent !== entry.original?.agent) {
+        throw new InjectionError(409, `session belongs to unavailable account ${originalAccountId}`);
+      }
+    }
+    resumeAccount ||= accounts.defaultFor(entry.original?.agent, deps.env || process.env);
+    let resumeMcpConfig = null;
+    if (entry.original?.agent === 'claude' && resumeAccount.managed) {
+      try { resumeMcpConfig = (deps.ensureSharedMemory || require('./account-setup').ensureSharedMemory)(resumeAccount, cwd).mcpConfig; }
+      catch (error) { throw new InjectionError(409, `account shared setup is unavailable: ${error.message}`); }
+    }
     const rows = deps.forceRows || (async () => {
       const result = await execFileAsync('ps', ['-axo', 'pid=,ppid=,tty=,lstart=,stat=,args='], {
         encoding: 'utf8', timeout: 5000, maxBuffer: 32e6, env: { ...process.env, LC_ALL: 'C' },
@@ -2771,11 +2796,9 @@ async function forceRestartSession(entry, save, deps = {}) {
         const reviewerSpec = reviewerResumeSpec({ id: job.sessionId }, original, deps);
         const launchModel = typeof original.meta?.model === 'string' && keep.LAUNCH_MODEL_RE.test(original.meta.model) ? original.meta.model : '';
         const modelArgs = launchModel ? (original.agent === 'codex' ? ['-m', launchModel] : ['--model', launchModel]) : [];
-        let account;
-        try { account = accounts.forSession(job.sessionId, original.agent, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
-        catch (error) { throw new InjectionError(409, error.message); }
-        account ||= accounts.defaultFor(original.agent, deps.env || process.env);
-        const argv = [original.agent, ...(original.bypass ? [bypass] : []), ...reviewerSpec.flags, ...modelArgs,
+        const account = resumeAccount;
+        const mcpArgs = resumeMcpConfig ? ['--mcp-config', resumeMcpConfig] : [];
+        const argv = [original.agent, ...(original.bypass ? [bypass] : []), ...reviewerSpec.flags, ...mcpArgs, ...modelArgs,
           original.agent === 'codex' ? 'resume' : '--resume', job.sessionId];
         const stopped = (await host('get', { pane: job.pane })).pane;
         if (stopped.alive || stopped.pid !== expectedPid || (stopped.meta?.sessionId !== job.sessionId
@@ -3267,14 +3290,15 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
   const confirmation = session.kind === 'codex' ? codexTypedTextVisible : claudeTypedTextVisible;
   try {
     return await require('./delivery').deliver({
-      session, pane: target.pane, text, file: transcriptFileForSession(session), directory: pendingDirectory, trace,
+      session, pane: target.pane, text, file: (deps.transcriptFileForSession || transcriptFileForSession)(session), directory: pendingDirectory, trace,
       retainReceipt: opts?.retainReceipt === true,
       key: opts?.deliveryKey,
       precheck,
       type: () => typeAndSubmit(target, text, confirmation, { ...deps, deliveryTrace: trace }),
       submitDraft: () => pressTargetKey(target, 'Enter', deps),
       draftMatches: async () => {
-        const current = session.kind === 'claude' ? claudeSessionFor(session.id) : codex.sessionFor(session.id);
+        const current = deps.loadDeliverySession ? deps.loadDeliverySession(session.id)
+          : session.kind === 'claude' ? claudeSessionFor(session.id) : codex.sessionFor(session.id);
         trace('draft-session-state', { idle: current?.endedTurn === true, question: Boolean(current?.pendingQuestion), plan: Boolean(current?.pendingPlan) });
         if (!current || current.endedTurn !== true || current.pendingQuestion || current.pendingPlan) return false;
         const screen = await readScreenResult(target, 200, false, deps);
@@ -4796,6 +4820,29 @@ async function waitForAccountRecord(sessionId, pane, accountId, startedAfter, de
   return null;
 }
 
+function accountClaudeTranscript(sessionId, account, env = process.env) {
+  const matches = accounts.locateClaudeFiles(sessionId, env).filter((entry) => entry.accountId === account.id);
+  if (matches.length !== 1) throw new InjectionError(409, `Expected one target transcript for ${sessionId} in account ${account.id}`);
+  return matches[0].file;
+}
+
+function accountClaudeSession(sessionId, account, file) {
+  const stat = fs.statSync(file);
+  return claudeSessionFromInfo(sessionId, scanTranscript(file), stat, path.dirname(file), false, Date.now(), account.id);
+}
+
+function continueAccountHandoff(sessionId, pane, accountId, text, deps = {}) {
+  const env = deps.env || process.env;
+  const target = accounts.get(accountId, env);
+  if (!target || target.agent !== 'claude') throw new InjectionError(409, 'Target account changed before continuation delivery');
+  const file = accountClaudeTranscript(sessionId, target, env);
+  const loadTarget = () => accountClaudeSession(sessionId, target, file);
+  return sendToSessionLocked({ sessionId, pane, text }, {
+    ...deps, loadCurrentSession: loadTarget, loadDeliverySession: loadTarget,
+    transcriptFileForSession: () => file,
+  });
+}
+
 async function resumeExitedAccountHandoff(entry, account, mcpConfig, deps = {}) {
   const host = (type, params) => hostRequest(type, params, deps);
   const pane = (await host('get', { pane: entry.pane })).pane;
@@ -4818,16 +4865,17 @@ async function resumeExitedAccountHandoff(entry, account, mcpConfig, deps = {}) 
 }
 
 async function handoffSession(body, deps = {}) {
+  const root = deps.root || keep.ROOT;
   return require('./account-handoff').run(body, {
     ...deps,
-    root: deps.root || keep.ROOT,
+    root,
     inspect: deps.inspect || ((request) => inspectAccountHandoff(request, deps)),
     host: deps.host || { request: (type, params) => hostRequest(type, params, deps) },
     restartSession: deps.restartSession || restartSession,
     restartDeps: deps.restartDeps || deps,
     resumeExited: deps.resumeExited || ((entry, account, mcpConfig) => resumeExitedAccountHandoff(entry, account, mcpConfig, deps)),
     waitForAccountRecord: deps.waitForAccountRecord || ((sid, pane, accountId, after) => waitForAccountRecord(sid, pane, accountId, after, deps)),
-    continueSession: deps.continueSession || ((sessionId, text) => sendToSessionLocked({ sessionId, text }, deps)),
+    continueSession: deps.continueSession || ((sessionId, text) => continueAccountHandoff(sessionId, body.pane, body.accountId, text, deps)),
   });
 }
 
@@ -5917,7 +5965,7 @@ module.exports = {
   agentProcessRows, liveSessionPids, liveSessionTick, restorePlan,
   annotatePaneAgents,
   readPaneRecord, sessionProjectFromTranscript, openSession,
-  inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, handoffSession,
+  inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, continueAccountHandoff, handoffSession,
   launchReviewQueueSession, inspectReviewQueueLaunch, recoverReviewQueueLaunch,
   waitForHostAgent, waitForHostSessionId, addHostSessionState,
   sendToSession, sendToResolvedTarget, precheckSessionTarget, InjectionError,

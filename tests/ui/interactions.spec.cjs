@@ -123,10 +123,25 @@ test('interrupted account handoff exposes retry and never claims an unverified r
   await expect(page.locator('#toast')).toContainText('Transfer needs recovery');
   await expect(page.locator('#stage .handoff-error')).toHaveText('Transfer interrupted');
   await expect(page.locator('#stage [data-handoff-account="claude-two"]')).toHaveText('Retry');
+  await expect(page.locator('#stage [data-reopen]')).toHaveCount(0);
+  await expect(page.locator('#stage .stage-terminal .legacy')).toBeVisible();
   await expect(page.locator('#stage .account-label')).toHaveText('Claude Main');
   await page.locator('#stage [data-handoff-account="claude-two"]').click();
   await expect(page.locator('#toast')).toContainText('Continued on Claude Two');
   await expect(page.locator('#stage .account-label')).toHaveText('Claude Two');
+});
+
+test('Watch can retry an interrupted handoff after its target pane exits', async ({ page }) => {
+  fixture.configure({ handoffRecoversOnce: true });
+  await page.locator('[data-mode="watch"]').click();
+  const pane = page.locator('.wpane[data-pane="pa"]');
+  await pane.locator('.account-handoff > summary').click();
+  await pane.locator('[data-handoff-account="claude-two"]').click();
+  await expect(pane.locator('.handoff-error')).toHaveText('Transfer interrupted');
+  await expect(pane.locator('[data-reopen]')).toHaveCount(0);
+  await expect(pane.locator('[data-handoff-account="claude-two"]')).toHaveText('Retry');
+  await pane.locator('[data-handoff-account="claude-two"]').click();
+  await expect(pane.locator('.account-label')).toHaveText('Claude Two');
 });
 
 test('dragging off a pressed row cancels navigation and releases queued renders', async ({ page }) => {

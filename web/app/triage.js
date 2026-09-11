@@ -2,7 +2,7 @@ import { modelUsageHTML } from './model-usage.js';
 import * as api from './api.js';
 import { closeSession } from './close-session.js';
 import { restartControls, installRestartControls } from './restart-session.js';
-import { accountLabelHTML, handoffControls, installHandoffControls } from './account-controls.js';
+import { accountLabelHTML, handoffControls, installHandoffControls, hasPendingHandoff } from './account-controls.js';
 import { sessionLabel, sessionExplanation, backgroundLabel } from './status.js';
 import { retainSelection, selectionIndex } from './selection.js';
 
@@ -357,15 +357,19 @@ function renderStage(ctx, active, focusItem, running, pinned) {
   const dependencyAcknowledged = ctx.setAsideFor(item)?.kind === 'dependency';
   const dependencyWait = session?.activity?.background?.dependencies?.length
     ? `<button class="btn" data-wait-dependency ${dependencyAcknowledged ? 'disabled' : ''}>${dependencyAcknowledged ? 'Waiting for dependency' : 'Wait for dependency'}</button>` : '';
-  const reopen = hasLivePane ? '' : '<button class="btn" data-reopen>Reopen</button>';
+  const pendingHandoff = hasPendingHandoff(ctx, item.sessionId, item.pane);
+  const reopen = hasLivePane || pendingHandoff ? '' : '<button class="btn" data-reopen>Reopen</button>';
   ctx.patchHTML(stage.querySelector('.shead'), `<div class="session-heading"><h2>${ctx.esc(title)}</h2><div class="meta mono">${ctx.projectHTML(item.project || session?.project || '', true)}${item.taskId ? `<span>${ctx.esc(item.taskId)}</span>${ctx.tagsHTML(task)}` : ''}${accountLabelHTML(ctx, session, pane)}</div>${task ? modelUsageHTML(task.modelUsage) : ''}</div><div class="acts"><button class="btn" data-pin ${item.pane ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}${dependencyWait}${item.sessionId || waitingItem ? '<button class="btn" data-snooze>Snooze 1h</button><button class="btn" data-dismiss><kbd>x</kbd> Dismiss</button>' : ''}${closable ? '<button class="btn" data-close-session>Close</button>' : ''}</div>`);
   const brief = stage.querySelector('.brief');
-  if (closable && !session?.reviewer) {
+  if ((closable || pendingHandoff) && !session?.reviewer) {
     const actions = stage.querySelector('.shead .acts');
     let accounts = actions.querySelector('.account-controls');
     if (!accounts) { accounts = document.createElement('div'); accounts.className = 'account-controls'; actions.append(accounts); }
     ctx.patchHTML(accounts, handoffControls(ctx, item.sessionId, item.pane));
     installHandoffControls(accounts, ctx, item.sessionId, item.pane);
+  }
+  if (closable && !pendingHandoff && !session?.reviewer) {
+    const actions = stage.querySelector('.shead .acts');
     let controls = actions.querySelector('.restart-controls');
     if (!controls) { controls = document.createElement('span'); controls.className = 'restart-controls'; actions.append(controls); }
     ctx.patchHTML(controls, restartControls(ctx, item.sessionId));

@@ -276,3 +276,25 @@ test('account authority filters copied transcript roots before attribution', t =
   assert.equal(result.cards.a.calls, 1);
   assert.equal(result.cards.a.output, 7);
 });
+
+test('staged target usage is replayed once after account authority commits', t => {
+  const f = fixture(t);
+  f.collect();
+  f.append(claude('before-handoff', 10, 7));
+  const target = path.join(f.root, 'target', 's.jsonl');
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.copyFileSync(f.file, target);
+  fs.appendFileSync(target, JSON.stringify(claude('during-handoff', 20, 9)) + '\n');
+  const files = [
+    { file: f.file, agent: 'claude', accountId: 'old-account' },
+    { file: target, agent: 'claude', accountId: 'new-account' },
+  ];
+  const staged = { s: { agent: 'claude', accountId: 'old-account', stagedAccountId: 'new-account' } };
+  assert.equal(f.collect({ files, authority: staged }).cards.a.output, 7);
+  assert.equal(f.collect({ files, authority: staged }).cards.a.output, 7);
+  const committed = { s: { agent: 'claude', accountId: 'new-account' } };
+  const result = f.collect({ files, authority: committed });
+  assert.equal(result.cards.a.output, 16);
+  assert.equal(result.cards.a.calls, 2, 'the copied historical message is not counted twice');
+  assert.equal(f.collect({ files, authority: committed }).cards.a.output, 16);
+});

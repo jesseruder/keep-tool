@@ -124,7 +124,12 @@ function fold(ledger, cursor, record, owners, root, authority) {
     };
   }
   if (agent === 'codex' && record.type === 'turn_context') cursor.model = record.payload?.model || 'unknown';
-  if (!accountAllows(cursor, authority)) return;
+  if (!accountAllows(cursor, authority)) {
+    // These rows may belong to a staged destination. Remember to replay them
+    // when it becomes authoritative; consuming them permanently loses usage.
+    cursor.accountBlocked = true;
+    return;
+  }
   let usage, identity, model;
   if (agent === 'claude' && record.type === 'assistant' && record.message?.usage) {
     // Sidechain copies in the main log are accounted from their own transcript.
@@ -214,7 +219,8 @@ function collect(root, tasks, options = {}) {
     let c = ledger.cursors[source.file];
     if (!c && stat.mtimeMs < ledger.since) continue;
     const rewritten = c?.anchor && c.offset <= stat.size && anchor(source.file, c.offset) !== c.anchor;
-    if (!c || c.ino !== String(stat.ino) || c.offset > stat.size || rewritten) {
+    const authorityChanged = c?.accountBlocked && accountAllows(c, authority);
+    if (!c || c.ino !== String(stat.ino) || c.offset > stat.size || rewritten || authorityChanged) {
       c = ledger.cursors[source.file] = { ...source, ino: String(stat.ino), offset: 0 };
     }
     if (c.offset === stat.size) continue;

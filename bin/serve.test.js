@@ -91,6 +91,7 @@ const {
   isInjectionBusy,
   withInjectionLock,
   sendToSessionLocked,
+  continueAccountHandoff,
   InjectionError,
 } = require('./serve.js');
 const { createScreenHistoryCache } = require('./screen-history.js');
@@ -2871,6 +2872,52 @@ test('host targets dispatch screen, typed text, and named keys through host inpu
   assert.equal(input, 'hé\x1b\x7fhello\r');
 });
 
+test('handoff continuation receipts are bound to the staged target transcript', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-handoff-delivery-'));
+  const root = path.join(base, 'registry'); fs.mkdirSync(root);
+  const source = path.join(base, 'source'), target = path.join(base, 'target');
+  const projectName = '-repo', sid = 'handoff-delivery';
+  for (const dir of [source, target]) fs.mkdirSync(path.join(dir, 'projects', projectName), { recursive: true });
+  const sourceFile = path.join(source, 'projects', projectName, `${sid}.jsonl`);
+  const targetFile = path.join(target, 'projects', projectName, `${sid}.jsonl`);
+  const initial = JSON.stringify({ type: 'assistant', sessionId: sid, cwd: base,
+    message: { content: 'ready', stop_reason: 'end_turn' } }) + '\n';
+  fs.writeFileSync(sourceFile, initial); fs.writeFileSync(targetFile, initial);
+  const config = path.join(base, 'config.json');
+  fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+    { id: 'source', label: 'Source', agent: 'claude', configDir: source },
+    { id: 'target', label: 'Target', agent: 'claude', configDir: target },
+  ], defaultAccounts: { claude: 'source' } }));
+  const env = { KEEP_DIR: root, KEEP_CONFIG: config };
+  const accountStore = require('./accounts');
+  accountStore.pinSession(sid, 'claude', 'source', { root, env });
+  accountStore.stageSession(sid, 'target', 'tx-delivery', { root, env });
+  const message = 'Continue from the limit.';
+  let draft = '';
+  const host = recordingHost((type, params) => {
+    if (type === 'list') return { panes: [{ id: 'pane-target', alive: true,
+      meta: { sessionId: sid, agent: 'claude', accountId: 'target', handoffTransactionId: 'tx-delivery' } }] };
+    if (type === 'screen') return { text: `────────────────────\n❯ ${draft}`, cursor: { x: draft.length + 2, y: 1 } };
+    if (type === 'input') {
+      const value = Buffer.from(params.data, 'base64').toString();
+      if (value === '\r') {
+        fs.appendFileSync(targetFile, JSON.stringify({ type: 'user', sessionId: sid,
+          message: { content: draft } }) + '\n');
+        draft = '';
+      } else draft += value;
+    }
+    return {};
+  });
+  try {
+    const result = await continueAccountHandoff(sid, 'pane-target', 'target', message, {
+      root, env, host, sleep: async () => {}, deliveryDirectory: path.join(root, '.keep', 'delivery'),
+    });
+    assert.equal(result.delivery, 'received');
+    assert.doesNotMatch(fs.readFileSync(sourceFile, 'utf8'), /Continue from the limit/);
+    assert.match(fs.readFileSync(targetFile, 'utf8'), /Continue from the limit/);
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
 test('typing exit confirms the prompt above a tall Claude slash-command menu', async () => {
   let typed = '';
   const screen = ['Old assistant advice: Esc to cancel', '────────────────', '❯ /exit', '────────────────', ...Array.from({ length: 40 }, (_, i) => `  /command${i}  Command description`)].join('\n');
@@ -4165,6 +4212,11 @@ test('restarting the fleet reviewer keeps its identity, its launch env, and its 
       root, env: accountEnv, withInjectionLock: (fn) => fn(), buildState: async () => ({ sessions: [session], tasks: [] }),
       claudeRolloutFile: () => claudeFile,
       reviewerMarker: (id) => { assert.equal(id, 'rev'); return { name: 'fable', model: 'fable', ended: Date.now() }; },
+      ensureSharedMemory: (account, cwd) => {
+        assert.equal(account.id, 'claude-secondary'); assert.equal(cwd, root);
+        assert.equal(exited, false, 'managed profile setup is verified before the source process exits');
+        return { mcpConfig: path.join(secondaryDir, 'project.keep-mcp.json') };
+      },
       agentProcessRows: async () => (exited ? [{ pid: 10, ppid: 1, args: '/bin/zsh -l' }] : [row]),
       psTable: '11 10 ttys001 Tue Sep  8 10:00:00 2026 /test/claude --resume rev',
       lsof: async () => '',
@@ -4210,6 +4262,7 @@ test('restarting the fleet reviewer keeps its identity, its launch env, and its 
     assert.equal(replaced.env.KEEP_REVIEWER_MODEL, 'fable', 'the budget governor still matches on the family');
     assert.match(replaced.args[1], /'--model' 'claude-fable-20260101'/);
     assert.match(replaced.args[1], /promptSuggestionEnabled/);
+    assert.match(replaced.args[1], /project\.keep-mcp\.json/);
     assert.match(replaced.args[1], /'--resume' 'rev'/);
     const encodedProfile = /'--profile' '([^']+)'/.exec(replaced.args[1])?.[1];
     assert.equal(JSON.parse(Buffer.from(encodedProfile, 'base64url')).id, 'claude-secondary',

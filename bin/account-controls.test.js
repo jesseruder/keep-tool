@@ -49,7 +49,7 @@ test('recovery remains actionable when the original session and account metadata
 test('pending, failed, recovery, and done transactions describe only verified state', () => {
   const render = (status, extra = {}) => context.handoffControls(fixture({ handoffs: [{ sessionId: 's', targetAccountId: 'claude-two', status, ...extra }] }), 's', 'p');
   assert.match(render('starting'), /Continuing on Claude Two/);
-  assert.doesNotMatch(render('starting'), /data-handoff-account/);
+  assert.match(render('starting'), /data-handoff-account="claude-two"/);
   assert.match(render('failed', { reason: '<unsafe>' }), /Transfer failed/);
   assert.match(render('failed', { reason: '<unsafe>' }), /&lt;unsafe&gt;/);
   assert.match(render('recovery-needed', { reason: 'stopped' }), /Transfer interrupted/);
@@ -62,6 +62,15 @@ test('pending, failed, recovery, and done transactions describe only verified st
     panes: [{ id: 'p', meta: { agent: 'claude', sessionId: 's', accountId: 'claude-two' } }] });
   assert.doesNotMatch(context.handoffControls(verified, 's', 'p'), /Verifying|Continued on/);
   assert.match(context.handoffControls(verified, 's', 'p'), /Claude &lt;main&gt;/);
+});
+
+test('durable pending handoffs expose retry only for the original pane', () => {
+  for (const status of ['stopping', 'copying', 'staged', 'starting', 'verifying', 'delivering', 'recovery-needed']) {
+    const ctx = fixture({ handoffs: [{ sessionId: 's', pane: 'p', targetAccountId: 'claude-two', status }] });
+    assert.equal(context.hasPendingHandoff(ctx, 's', 'p'), true);
+    assert.equal(context.hasPendingHandoff(ctx, 's', 'other'), false);
+    assert.match(context.handoffControls(ctx, 's', 'p'), /data-handoff-account="claude-two"/);
+  }
 });
 
 test('click posts the explicit destination and only claims success after refreshed state confirms it', async () => {

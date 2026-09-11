@@ -20,6 +20,12 @@ function latestHandoff(ctx, sessionId) {
   return [...(ctx.data.handoffs || [])].reverse().find((entry) => entry.sessionId === sessionId);
 }
 
+export function hasPendingHandoff(ctx, sessionId, paneId) {
+  const handoff = latestHandoff(ctx, sessionId);
+  return Boolean(handoff && !['done', 'failed'].includes(handoff.status)
+    && (!handoff.pane || handoff.pane === paneId));
+}
+
 function targetFor(ctx, handoff) {
   return (ctx.data.accounts || []).find((account) => account.id === handoff?.targetAccountId);
 }
@@ -60,7 +66,9 @@ export function handoffControls(ctx, sessionId, paneId) {
     return `<span class="handoff-status" role="status">Verifying transfer to ${ctx.esc(targetLabel)}…</span>`;
   }
   if (handoff && !['done', 'failed', 'recovery-needed'].includes(handoff.status)) {
-    return `<span class="handoff-status" role="status">Continuing on ${ctx.esc(targetLabel)}…</span>`;
+    // Retrying the same transaction joins a live request, or resumes its durable
+    // journal after a daemon crash. Do not strand a persisted in-flight status.
+    return `<span class="handoff-status" role="status">Continuing on ${ctx.esc(targetLabel)}…</span><button class="btn" data-handoff-account="${ctx.esc(handoff.targetAccountId || '')}">Retry</button>`;
   }
 
   const error = handoff?.status === 'failed'

@@ -9,9 +9,15 @@ test('reviewer launches in a host-owned Claude pane with a pinned session and re
   const account = { id: 'reviewer-account', label: 'Reviewer account', agent: 'claude', configDir: '/profiles/reviewer' };
   const result = await launch(['sonnet'], '/tmp/private registry', {
     account,
+    ensureSharedMemory: (selected, cwd) => {
+      assert.equal(selected, account); assert.equal(cwd, '/tmp/private registry');
+      return { mcpConfig: '/profiles/reviewer/project.keep-mcp.json' };
+    },
     profileCommand: (argv, selected) => {
       assert.equal(selected, account);
       assert.equal(argv[0], 'claude');
+      assert.deepEqual(argv.slice(1), ['--model', 'sonnet', '--settings', '{"promptSuggestionEnabled":false,"preferredNotifChannel":"notifications_disabled"}',
+        '--mcp-config', '/profiles/reviewer/project.keep-mcp.json', '--session-id', '11111111-1111-4111-8111-111111111111']);
       return 'profiled-reviewer-command';
     },
     randomUUID: () => '11111111-1111-4111-8111-111111111111',
@@ -40,6 +46,8 @@ test('reviewer launches in a host-owned Claude pane with a pinned session and re
 test('an existing hosted reviewer prevents an accidental duplicate launch', async () => {
   let closed = false;
   await assert.rejects(launch([], '/tmp/registry', {
+    account: { id: 'reviewer-account', label: 'Reviewer', agent: 'claude', configDir: '/profiles/reviewer' },
+    ensureSharedMemory: () => ({ mcpConfig: null }),
     connect: async () => ({
       request: async (method) => { assert.equal(method, 'list'); return { panes: [{ alive: true, meta: { reviewer: true } }] }; },
       close: () => { closed = true; },
