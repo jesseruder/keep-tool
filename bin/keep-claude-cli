@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "${KEEP_NODE:-node}" "$(dirname "$0")/agent-launcher.js" claude "$@"

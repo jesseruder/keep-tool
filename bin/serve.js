@@ -2476,7 +2476,7 @@ async function restartSession(body, deps = {}) {
     const flags = originalArgs.split(/\s+/).includes(bypass) ? [bypass] : [];
     const argv = [session.kind, ...flags, session.kind === 'codex' ? 'resume' : '--resume', session.id];
     const result = await host('replace-exited', { paneId: pane.id, expectedPid: pane.pid, sessionId: stopped.meta?.sessionId,
-      cmd: '/bin/zsh', args: ['-lic', `exec ${argv.map(shellQuoteArg).join(' ')}`], cwd,
+      cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').command(argv)}`], cwd,
       cols: pane.cols, rows: pane.rows, meta: { ...pane.meta, agent: session.kind, sessionId: session.id, restartedAt: Date.now() } });
     await (deps.waitForHostAgent || waitForHostAgent)({ pane: pane.id }, session.kind, deps);
     return { ok: true, sessionId: session.id, pane: result.pane.id, pid: result.pane.pid };
@@ -2532,7 +2532,7 @@ async function forceRestartSession(entry, save, deps = {}) {
           throw Error('Exited pane changed before resume');
         }
         const result = await host('replace-exited', { paneId: job.pane, expectedPid, sessionId: stopped.meta?.sessionId,
-          cmd: '/bin/zsh', args: ['-lic', `exec ${argv.map(shellQuoteArg).join(' ')}`], cwd: original.cwd,
+          cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').command(argv)}`], cwd: original.cwd,
           cols: original.cols, rows: original.rows, meta: { ...original.meta, forceRestartToken: job.token, restartedAt: Date.now() } });
         return { ok: true, pane: result.pane.id, pid: result.pane.pid, sessionId: job.sessionId };
       },
@@ -3369,7 +3369,7 @@ async function openSession(body, deps = {}) {
     const command = argv.join(' ');
     const spawned = await hostRequest('spawn', {
       cmd: '/bin/zsh',
-      args: ['-lic', `exec ${argv.map(shellQuoteArg).join(' ')}`],
+      args: ['-lic', `exec ${require('./agent-launcher').command(argv)}`],
       cwd: project,
       cols: 200,
       rows: 50,

@@ -78,3 +78,12 @@ delivery lock defers reconciliation while read-only inspection continues.
 The watchdog itself stays read-only and never sends input or restarts clients.
 It monitors attempted deliveries; it is not a startup compatibility certification
 and does not flag sends deferred before any draft was typed.
+
+Interactive sessions opened or restarted by Keep run through `agent-launcher.js`.
+The `keep-codex-cli /path/to/codex ...` and `keep-claude-cli /path/to/claude ...`
+wrappers use the same supervision. A guardian owns the agent and watches the
+launcher's private IPC connection; launcher exit or SIGKILL closes that connection,
+causing TERM followed by KILL after two seconds if necessary. Terminal descriptors
+and the foreground process group are inherited. Codex still acknowledges normal
+and interrupted client exits; abnormal exits retain recovery markers. Existing
+sessions acquire supervision when next opened or restarted.
