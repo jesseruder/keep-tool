@@ -336,6 +336,24 @@ function linkLaunchedSession(taskId, session) {
   });
 }
 
+function linkSession(taskId, session) {
+  return withLock(() => {
+    const all = loadAll(true);
+    const task = all.find((entry) => entry.id === taskId && fs.existsSync(taskPath(entry.id)));
+    if (!task) return null;
+    cardUsage.recordOwner(ROOT, session, task.id);
+    const previousOwners = claimSession(task, session, all);
+    for (const previous of previousOwners) {
+      const file = fs.existsSync(taskPath(previous.id)) ? taskPath(previous.id) : path.join(ARCHIVE, `${previous.id}.md`);
+      fs.writeFileSync(file, serializeTask(previous));
+    }
+    fs.writeFileSync(taskPath(task.id), serializeTask(task));
+    // Explicit metadata repair is always local, including from a manual shell.
+    commitAndPush(`keep: link ${task.id}`, ['tasks', 'archive'], { push: false });
+    return { linked: session.id, agent: session.agent };
+  });
+}
+
 // The fleet reviewer is a normal interactive session, so every ordinary guard
 // treats it as a working agent. It is not one: it produces no code, and linking it
 // to a card would hand that card's resume slot to the reviewer.
@@ -603,7 +621,7 @@ function git(...args) {
   return execFileSync('git', ['-C', ROOT, ...args], { encoding: 'utf8' });
 }
 
-function commitAndPush(message, pathspecs = ['tasks', 'archive', 'digests'], { staged = false } = {}) {
+function commitAndPush(message, pathspecs = ['tasks', 'archive', 'digests'], { staged = false, push = true } = {}) {
   if (!staged) git('add', '-A', ...pathspecs);
   const status = git('status', '--porcelain', ...pathspecs);
   if (!status.trim()) return;
@@ -619,7 +637,7 @@ function commitAndPush(message, pathspecs = ['tasks', 'archive', 'digests'], { s
   const inAgentSession = Boolean(
     process.env.CLAUDE_CODE_SESSION_ID || process.env.CODEX_SESSION_ID || process.env.CODEX_THREAD_ID,
   );
-  if (process.env.KEEP_NO_PUSH || (inAgentSession && process.env.KEEP_ALLOW_PUSH !== '1')) return;
+  if (!push || process.env.KEEP_NO_PUSH || (inAgentSession && process.env.KEEP_ALLOW_PUSH !== '1')) return;
   try {
     const child = spawn('git', ['-C', ROOT, 'push', '-q', 'origin', 'HEAD'], { detached: true, stdio: 'ignore' });
     child.unref();
@@ -1501,7 +1519,7 @@ commands.link = (argv) => {
   if (!/^[A-Za-z0-9_-]+$/.test(o.session)) die('session id must contain only letters, digits, _ or -');
   if (!['claude', 'codex'].includes(o.agent)) die('agent must be claude or codex');
   if (isReviewerSession()) die('the fleet reviewer cannot link a working session to a card');
-  const linked = linkLaunchedSession(id, { id: o.session, agent: o.agent });
+  const linked = linkSession(id, { id: o.session, agent: o.agent });
   if (!linked) die(`no task "${id}"`);
   console.log(`${id} linked to ${o.agent} session ${o.session}`);
 };
