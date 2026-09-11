@@ -113,14 +113,26 @@ test('isolated browser: review queue decisions, drafts, notification links, and 
     assert.equal(await evaluate("document.querySelector('[role=tab][aria-selected=true]').dataset.reviewType"), 'idea', 'Ideas is the default tab');
     assert.deepEqual(await evaluate("[...document.querySelectorAll('[data-review-type]')].map(node=>node.textContent.trim())"), ['Ideas 3', 'Findings 2']);
     assert.deepEqual(await evaluate("[...document.querySelectorAll('[data-review-filter] span')].map(node=>node.textContent)"), ['3', '0', '0'], 'status counts are scoped to Ideas');
+    assert.equal(await evaluate("document.querySelector('[data-review-sort]').labels[0].textContent.trim().startsWith('Sort')"), true, 'sort control has an accessible label');
+    assert.equal(await evaluate("document.querySelector('[data-review-action=start]').textContent"), 'Start work');
+    await evaluate("document.querySelector('[data-review-type=idea]').focus(); document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',bubbles:true}))");
+    await wait("document.querySelector('[data-review-type=finding][aria-selected=true]') && document.activeElement?.dataset.reviewType === 'finding'");
+    await evaluate("document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowLeft',bubbles:true}))");
+    await wait("document.querySelector('[data-review-type=idea][aria-selected=true]') && document.activeElement?.dataset.reviewType === 'idea'");
     assert.equal(await evaluate("document.querySelector('[data-review-later]').textContent.trim()"), 'Show 1 saved for later', 'saved-later count is scoped to Ideas');
     assert.equal(await evaluate("document.querySelectorAll('[data-review-item]').length"), 3, 'future deferred idea and findings are hidden');
-    await evaluate("const sort=document.querySelector('[data-review-sort]'); sort.value='oldest'; sort.dispatchEvent(new Event('change',{bubbles:true}))");
+    await evaluate("(()=>{const sort=document.querySelector('[data-review-sort]'); sort.focus(); sort.value='oldest'; sort.dispatchEvent(new Event('change',{bubbles:true}))})()");
     assert.deepEqual(await evaluate("[...document.querySelectorAll('[data-review-item]')].map(node=>node.dataset.reviewItem)"), ['idea:card-idea', 'idea:lost-response', 'idea:partial-start']);
+    assert.equal(await evaluate("document.activeElement?.dataset.reviewSort !== undefined"), true, 'sort change preserves keyboard focus');
+    await evaluate("window.reviewSortBeforeRefresh=document.activeElement");
+    idea.title = 'Searchable workflow idea refreshed';
+    for (const client of eventClients) client.write('data: changed\n\n');
+    await wait("document.activeElement !== window.reviewSortBeforeRefresh && document.activeElement?.dataset.reviewSort !== undefined && document.querySelector('[data-review-sort]').value === 'oldest'");
     await evaluate("document.querySelector('[data-review-type=finding]').click()");
     assert.equal(await evaluate("document.querySelector('[data-review-detail]').dataset.reviewDetail"), 'finding:card-find:key-two', 'Findings retains its independent Newest default');
+    assert.equal(await evaluate("document.querySelector('[data-review-action=start]').textContent"), 'Investigate');
     assert.equal(await evaluate("document.querySelector('[data-review-later]')"), null, 'Ideas saved-later count does not leak into Findings');
-    await evaluate("const sort=document.querySelector('[data-review-sort]'); sort.value='severity'; sort.dispatchEvent(new Event('change',{bubbles:true}))");
+    await evaluate("(()=>{const sort=document.querySelector('[data-review-sort]'); sort.value='severity'; sort.dispatchEvent(new Event('change',{bubbles:true}))})()");
     assert.deepEqual(await evaluate("[...document.querySelectorAll('[data-review-item]')].map(node=>node.dataset.reviewItem)"), ['finding:card-find:key-one', 'finding:card-find:key-two'], 'Severity orders high before low despite timestamps');
     await call('Page.reload');
     await wait("document.querySelector('[data-mode=review-queue]') && document.querySelector('#reviewQueueCount')?.textContent === '5'");
@@ -129,9 +141,9 @@ test('isolated browser: review queue decisions, drafts, notification links, and 
     assert.equal(await evaluate("document.querySelector('[role=tab][aria-selected=true]').dataset.reviewType"), 'finding', 'selected type survives reload');
     await evaluate("document.querySelector('[data-review-type=idea]').click()");
     assert.equal(await evaluate("document.querySelector('[data-review-sort]').value"), 'oldest', 'sort is remembered separately for Ideas');
-    await evaluate("const sort=document.querySelector('[data-review-sort]'); sort.value='project'; sort.dispatchEvent(new Event('change',{bubbles:true}))");
+    await evaluate("(()=>{const sort=document.querySelector('[data-review-sort]'); sort.value='project'; sort.dispatchEvent(new Event('change',{bubbles:true}))})()");
     assert.deepEqual(await evaluate("[...document.querySelectorAll('[data-review-item]')].map(node=>node.dataset.reviewItem)"), ['idea:lost-response', 'idea:card-idea', 'idea:partial-start'], 'Project sort is alphabetical');
-    await evaluate("const sort=document.querySelector('[data-review-sort]'); sort.value='newest'; sort.dispatchEvent(new Event('change',{bubbles:true}))");
+    await evaluate("(()=>{const sort=document.querySelector('[data-review-sort]'); sort.value='newest'; sort.dispatchEvent(new Event('change',{bubbles:true}))})()");
     await evaluate("document.querySelector('[data-review-item=\"idea:partial-start\"]').click(); document.querySelector('[data-review-action=start]').click()");
     await wait("document.querySelector('[data-review-detail]')?.dataset.reviewDetail === 'idea:partial-start' && document.querySelector('.review-status')?.textContent === 'In progress' && document.querySelector('[data-review-session=partial-session]')");
     assert.equal(await evaluate("document.querySelectorAll('[data-review-retry], [data-review-recover], [data-review-action]').length"), 0, 'ambiguous partial start offers only its existing conversation');
@@ -197,6 +209,7 @@ test('isolated browser: review queue decisions, drafts, notification links, and 
     await call('Emulation.setDeviceMetricsOverride', { width: 650, height: 800, deviceScaleFactor: 1, mobile: false });
     await evaluate('window.dispatchEvent(new Event(\'resize\'))');
     assert.equal(await evaluate("getComputedStyle(document.querySelector('#review-queue')).flexDirection"), 'column');
+    assert.ok(await evaluate("document.querySelector('.review-queue-tools').scrollWidth <= document.querySelector('.review-queue-tools').clientWidth"), 'search and sort fit the mobile queue width');
     assert.ok(await evaluate("document.querySelector('.modes').scrollWidth >= document.querySelector('.modes').clientWidth"), 'narrow navigation remains horizontally reachable');
     const shot = await call('Page.captureScreenshot', { format: 'png' }); fs.writeFileSync('/tmp/keep-review-queue-qa.png', Buffer.from(shot.data, 'base64'));
   } finally {

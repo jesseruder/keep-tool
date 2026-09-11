@@ -164,6 +164,14 @@ async function submit(ctx, item, action, fields = {}, retry = false, requestIdOv
 
 function bind(ctx, root, current) {
   root.querySelectorAll('[data-review-type]').forEach((button) => button.addEventListener('click', () => { type = button.dataset.reviewType; store(STORAGE_TYPE, type); selectedId = null; suppressAutoSelect = false; form = null; renderReviewQueue(ctx); }));
+  root.querySelector('.review-queue-types')?.addEventListener('keydown', (event) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const index = TYPES.indexOf(type);
+    const next = event.key === 'Home' ? 0 : event.key === 'End' ? TYPES.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + TYPES.length) % TYPES.length;
+    root.querySelector(`[data-review-type=${TYPES[next]}]`)?.click();
+    requestAnimationFrame(() => root.querySelector(`[data-review-type=${TYPES[next]}]`)?.focus());
+  });
   root.querySelectorAll('[data-review-filter]').forEach((button) => button.addEventListener('click', () => { status = button.dataset.reviewFilter; selectedId = null; suppressAutoSelect = false; form = null; renderReviewQueue(ctx); }));
   root.querySelector('[data-review-sort]')?.addEventListener('change', (event) => { sorts[type] = event.target.value; store(STORAGE_SORT, JSON.stringify(sorts)); selectedId = null; suppressAutoSelect = false; renderReviewQueue(ctx); });
   root.querySelector('[data-review-search]')?.addEventListener('input', (event) => { query = event.target.value; suppressAutoSelect = false; renderReviewQueue(ctx); });
@@ -212,20 +220,20 @@ export function renderReviewQueue(ctx) {
   const later = allItems(ctx).filter((item) => item.type === type && item.status === 'needs-decision' && isLater(item)).length;
   const activeNode = root.contains(document.activeElement) ? document.activeElement : null;
   const active = activeNode ? {
-    name: activeNode.getAttribute('name'), search: activeNode.hasAttribute('data-review-search'), start: activeNode.selectionStart, end: activeNode.selectionEnd,
+    name: activeNode.getAttribute('name'), search: activeNode.hasAttribute('data-review-search'), sort: activeNode.hasAttribute('data-review-sort'), start: activeNode.selectionStart, end: activeNode.selectionEnd,
     attr: ['reviewItem', 'reviewType', 'reviewFilter', 'reviewAction', 'reviewSession', 'reviewRecover', 'reviewRetry', 'reviewLater', 'reviewCancel'].find((key) => activeNode.dataset[key] !== undefined),
   } : null;
   if (active?.attr) active.value = activeNode.dataset[active.attr];
   const listScroll = root.querySelector('.review-queue-items')?.scrollTop || 0;
   const mainScroll = root.querySelector('.review-queue-main')?.scrollTop || 0;
   const sortOptions = ['newest', 'oldest', 'project', ...(type === 'finding' ? ['severity'] : [])];
-  const html = `<aside class="review-queue-list"><div class="review-queue-heading"><h1>Review queue</h1><p>Ideas and findings waiting for a decision.</p></div><div class="review-queue-types" role="tablist" aria-label="Review item type">${TYPES.map((value) => `<button role="tab" aria-selected="${type === value}" class="${type === value ? 'on' : ''}" data-review-type="${value}">${TYPE_LABELS[value]} <span>${typeCount(ctx, value)}</span></button>`).join('')}</div><nav class="review-queue-filters" aria-label="Review status">${STATUSES.map((value) => `<button class="btn ${status === value ? 'on' : ''}" data-review-filter="${value}" aria-pressed="${status === value}">${LABELS[value]} <span>${count(ctx, value)}</span></button>`).join('')}</nav><div class="review-queue-tools"><input type="search" data-review-search aria-label="Search ${TYPE_LABELS[type].toLowerCase()}" placeholder="Search title, card, project, or notes" value="${ctx.esc(query)}"><label>Sort <select data-review-sort>${sortOptions.map((value) => `<option value="${value}" ${sorts[type] === value ? 'selected' : ''}>${SORT_LABELS[value]}</option>`).join('')}</select></label></div>${status === 'needs-decision' && later ? `<button class="review-later-toggle" data-review-later aria-pressed="${showLater}">${showLater ? 'Hide' : 'Show'} ${later} saved for later</button>` : ''}<div class="review-queue-items">${itemList(ctx, current)}</div></aside><div class="review-queue-main">${detail(ctx, current)}</div>`;
+  const html = `<aside class="review-queue-list"><div class="review-queue-heading"><h1>Review queue</h1><p>Ideas and findings waiting for a decision.</p></div><div class="review-queue-types" role="tablist" aria-label="Review item type">${TYPES.map((value) => `<button role="tab" aria-selected="${type === value}" aria-controls="review-queue-items" tabindex="${type === value ? 0 : -1}" class="${type === value ? 'on' : ''}" data-review-type="${value}">${TYPE_LABELS[value]} <span>${typeCount(ctx, value)}</span></button>`).join('')}</div><nav class="review-queue-filters" aria-label="Review status">${STATUSES.map((value) => `<button class="btn ${status === value ? 'on' : ''}" data-review-filter="${value}" aria-pressed="${status === value}">${LABELS[value]} <span>${count(ctx, value)}</span></button>`).join('')}</nav><div class="review-queue-tools"><input type="search" data-review-search aria-label="Search ${TYPE_LABELS[type].toLowerCase()}" placeholder="Search title, card, project, or notes" value="${ctx.esc(query)}"><label>Sort <select data-review-sort>${sortOptions.map((value) => `<option value="${value}" ${sorts[type] === value ? 'selected' : ''}>${SORT_LABELS[value]}</option>`).join('')}</select></label></div>${status === 'needs-decision' && later ? `<button class="review-later-toggle" data-review-later aria-pressed="${showLater}">${showLater ? 'Hide' : 'Show'} ${later} saved for later</button>` : ''}<div class="review-queue-items" id="review-queue-items" role="tabpanel" aria-label="${TYPE_LABELS[type]}">${itemList(ctx, current)}</div></aside><div class="review-queue-main">${detail(ctx, current)}</div>`;
   const changed = ctx.patchHTML(root, html);
   if (changed) bind(ctx, root, current);
   root.querySelector('.review-queue-items').scrollTop = listScroll;
   root.querySelector('.review-queue-main').scrollTop = mainScroll;
   if (active) {
-    const replacement = active.search ? root.querySelector('[data-review-search]') : active.name ? root.querySelector(`[name="${active.name}"]`)
+    const replacement = active.search ? root.querySelector('[data-review-search]') : active.sort ? root.querySelector('[data-review-sort]') : active.name ? root.querySelector(`[name="${active.name}"]`)
       : active.attr ? [...root.querySelectorAll(`[data-${active.attr.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}]`)].find((node) => node.dataset[active.attr] === active.value) : null;
     replacement?.focus({ preventScroll: true });
     if (replacement && Number.isInteger(active.start)) replacement.setSelectionRange(active.start, active.end);
