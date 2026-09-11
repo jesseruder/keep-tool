@@ -231,6 +231,14 @@ deploy, migration, restart, or secret. The hold is written atomically under
 `.keep/holds/`, appears in `keep who`, session-start context, and reviewer bundles,
 and expires automatically. Release it early with `keep release <hold-id>`.
 
+A `device:<serial>` scope names shared hardware, such as a test phone driven from cards
+in several repositories. It is the one scope that crosses projects: other projects'
+device holds appear in every `keep who`, Claude session-start context, and reviewer
+bundle, and `keep who <project> --scope device:<serial>` or `keep wait --no-hold
+<project> --scope device:<serial>` matches them from any project. An unscoped
+`keep wait --no-hold` still waits only on its own project's holds. Serials are
+lowercased, so `--scope device:ABC123` and `--scope device:abc123` are the same hold.
+
 ## Alerts and the morning brief
 
 `keep alert` adds a judged push layer in front of Keep's cards. `attention` is for

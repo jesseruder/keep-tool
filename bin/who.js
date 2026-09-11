@@ -111,8 +111,10 @@ function fleetSnapshot(project, input) {
   }).sort((a, b) => a.due.localeCompare(b.due));
 
   const runs = sourceRuns.filter((run) => run && run.status === 'running' && taskIds.has(run.taskId));
+  // deviceHolds: the caller asked for other projects' shared-device holds too.
   const holds = sourceHolds.filter((hold) => hold && !hold.released && Date.parse(hold.until) > now
-    && normalizeProject(hold.project) === normalized);
+    && (normalizeProject(hold.project) === normalized
+      || (data.deviceHolds === true && require('./hold-scopes').devices(hold).length > 0)));
 
   return {
     project: normalized,
@@ -163,7 +165,8 @@ function renderWho(snapshot) {
   if (!snapshot.holds.length) out.push('  (none)');
   for (const hold of snapshot.holds) {
     const by = hold.by || {};
-    out.push(`  - ${hold.id} · scope: ${require('./hold-scopes').label(hold)} · until ${hold.until} · ${by.agent || 'manual'} ${String(by.sessionId || '').slice(0, 8) || '(no session)'} · ${hold.reason}`);
+    const elsewhere = normalizeProject(hold.project) === snapshot.project ? '' : ` · from ${hold.project}`;
+    out.push(`  - ${hold.id} · scope: ${require('./hold-scopes').label(hold)}${elsewhere} · until ${hold.until} · ${by.agent || 'manual'} ${String(by.sessionId || '').slice(0, 8) || '(no session)'} · ${hold.reason}`);
   }
 
   out.push('steps:');

@@ -1190,7 +1190,7 @@ function buildBundle(taskId, opts = {}) {
   }) : null;
   for (const row of stepSnapshot ? stepSnapshot.steps : []) headerLines.push(`STEPS: ${row.line}`);
   if (stepSnapshot && stepSnapshot.steps.length) headerLines.push('');
-  const holds = task.fm.project ? keep.activeHolds(task.fm.project) : [];
+  const holds = task.fm.project ? keep.activeHolds(task.fm.project, Date.now(), { devices: true }) : [];
   for (const hold of holds) {
     const by = hold.by || {};
     headerLines.push(`HOLDS: ${hold.id} on ${hold.project} until ${hold.until} by ${by.agent || 'manual'} session ${String(by.sessionId || '').slice(0, 8) || '(none)'} — ${clip(hold.reason, 300)}`);

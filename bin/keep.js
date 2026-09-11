@@ -758,8 +758,11 @@ function writeJsonAtomic(file, value) {
   }
 }
 
+// `devices: true` also returns other projects' holds on a shared device (a
+// `device:` scope) that concern this caller; see hold-scopes.sharesDevice.
 function activeHolds(project, now = Date.now(), options = {}) {
-  const scopes = require('./hold-scopes').parse(options.scopes);
+  const holdScopes = require('./hold-scopes');
+  const scopes = holdScopes.parse(options.scopes);
   const holdsDir = options.root && options.root !== ROOT ? path.join(options.root, '.keep', 'holds') : HOLDS_DIR;
   let names = [];
   try { names = fs.readdirSync(holdsDir); } catch { return []; }
@@ -776,10 +779,11 @@ function activeHolds(project, now = Date.now(), options = {}) {
         continue;
       }
       const hold = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const local = !wanted || normalizeProjectPath(hold.project) === wanted;
+      const matches = local ? holdScopes.overlaps(hold, scopes)
+        : Boolean(options.devices && !options.step) && holdScopes.sharesDevice(hold, scopes);
       if (!hold.released && Date.parse(hold.until) > now &&
-          (!wanted || normalizeProjectPath(hold.project) === wanted) &&
-          (!options.step || hold.step === options.step) &&
-          require('./hold-scopes').overlaps(hold, scopes)) active.push(hold);
+          (!options.step || hold.step === options.step) && matches) active.push(hold);
     } catch {}
   }
   return active.sort((a, b) => String(a.until).localeCompare(String(b.until)));
@@ -1800,7 +1804,7 @@ function getKeepApi(pathname, timeoutMs) {
 async function whoSnapshot(project) {
   const who = require('./who.js');
   const tasks = loadAll(false);
-  const holds = activeHolds(project);
+  const holds = activeHolds(project, Date.now(), { devices: true });
   let sessions = null;
   let runs = [];
   try {
@@ -1816,7 +1820,8 @@ async function whoSnapshot(project) {
     sessions,
     runs,
     holds,
-    steps: stepRegistry.status(project, { tasks, holds }),
+    deviceHolds: true,
+    steps: stepRegistry.status(project, { tasks, holds: activeHolds(project) }),
     git: who.gitSnapshot(project),
     now: Date.now(),
   });
@@ -1828,7 +1833,9 @@ commands.who = async (argv) => {
   if (o._.length !== 1) die('usage: keep who <project> [--json]');
   const project = resolveProjectArg(o._[0]);
   const snapshot = await whoSnapshot(project);
-  snapshot.holds = snapshot.holds.filter((hold) => require('./hold-scopes').overlaps(hold, scopes));
+  const holdScopes = require('./hold-scopes');
+  snapshot.holds = snapshot.holds.filter((hold) => (normalizeProjectPath(hold.project) === normalizeProjectPath(project)
+    ? holdScopes.overlaps(hold, scopes) : holdScopes.sharesDevice(hold, scopes)));
   if (scopes.length) snapshot.holdScopes = scopes;
   console.log(o.json ? JSON.stringify(snapshot, null, 2) : require('./who.js').renderWho(snapshot));
 };
@@ -4031,14 +4038,23 @@ commands.hook = async (argv) => {
     lines.push('Waiting on Owner (do not work around these; he supplies them):');
     for (const need of needs.slice(0, CAP)) lines.push(`- ${need.task}: ${clip(need.text)}${need.env ? ` [env ${need.env}]` : ''}`);
   }
-  const holds = activeHolds().filter((hold) => projectMatchesCwd(hold.project, cwd));
+  const allHolds = activeHolds();
+  const holdLine = (hold, advice) => {
+    const by = hold.by || {};
+    return `⛔ ${hold.project} [${require('./hold-scopes').label(hold)}] held until ${String(hold.until).slice(11, 16)} by ${by.agent || 'manual'} session ${String(by.sessionId || '').slice(0, 8) || '(none)'}: ${clip(hold.reason)}. ${advice}`;
+  };
+  const holds = allHolds.filter((hold) => projectMatchesCwd(hold.project, cwd));
   if (holds.length) {
     lines.push('Holds on this project:');
-    for (const hold of holds.slice(0, CAP)) {
-      const by = hold.by || {};
-      lines.push(`⛔ ${hold.project} [${require('./hold-scopes').label(hold)}] held until ${String(hold.until).slice(11, 16)} by ${by.agent || 'manual'} session ${String(by.sessionId || '').slice(0, 8) || '(none)'}: ${clip(hold.reason)}. Coordinate before touching these resources; unrelated work is not blocked by a scoped hold.`);
-    }
+    for (const hold of holds.slice(0, CAP)) lines.push(holdLine(hold, 'Coordinate before touching these resources; unrelated work is not blocked by a scoped hold.'));
     if (holds.length > CAP) lines.push(`…and ${holds.length - CAP} more (keep holds)`);
+  }
+  // Shared hardware is driven from cards in several projects, so its holds show everywhere.
+  const deviceHolds = allHolds.filter((hold) => !projectMatchesCwd(hold.project, cwd) && require('./hold-scopes').devices(hold).length);
+  if (deviceHolds.length) {
+    lines.push('Shared devices held from other projects:');
+    for (const hold of deviceHolds.slice(0, CAP)) lines.push(holdLine(hold, 'Do not drive the held device until it is released.'));
+    if (deviceHolds.length > CAP) lines.push(`…and ${deviceHolds.length - CAP} more (keep holds)`);
   }
   const stepProject = stepProjectFromCwd(cwd);
   const stepSnapshot = stepRegistry.status(stepProject, {
@@ -5867,6 +5883,7 @@ function helpText() {
   keep hold <project> --for +15m -m "why" [--task <id>] [--scope <resource>]
     Repeat --scope for each touched resource (e.g. browser-hosts and terraform).
     Exact labels overlap; omitted/legacy scopes are project-wide. Advisory, not authorization.
+    device:<serial> names shared hardware and shows in every project (who, session start).
   keep release <hold-id>
   keep holds
   keep needs [<card> "<secret or action>" [--env NAME] | <card> --met [--env NAME|"<text>"]]

@@ -75,7 +75,10 @@ function evaluate(conditions, deps) {
   const results = conditions.map((condition) => {
     if (condition.type === 'no-hold') {
       const project = deps.resolveProject(condition.project);
-      const holds = deps.activeHolds(project, now, { prune: false, scopes: condition.scopes });
+      // Another project's device hold blocks only a wait that names that device, so an
+      // unscoped project wait never stalls on a phone someone else is driving.
+      const scoped = Boolean(condition.scopes && condition.scopes.length);
+      const holds = deps.activeHolds(project, now, { prune: false, scopes: condition.scopes, devices: scoped });
       return {
         ...condition,
         satisfied: holds.length === 0,

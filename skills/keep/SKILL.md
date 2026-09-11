@@ -110,6 +110,9 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   but both actions using shared Terraform must include `terraform`. Inspect matching
   holds with `keep who <project> --scope <resource>`; wait with
   `keep wait --no-hold <project> --scope <resource> --for 8h`.
+  Shared hardware is the exception to project-local labels: `--scope device:<serial>`
+  (for example a test phone) is seen from every project, so hold the device there
+  under your own card's project and check it with `--scope device:<serial>`.
   Omitted scopes, including legacy holds, remain project-wide; do not reinterpret or
   release someone else's hold. Holds are advisory coordination, not permission or
   replacements for gated-step claims. Before changing paths owned by a gated step, run

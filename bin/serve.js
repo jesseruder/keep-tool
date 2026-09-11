@@ -4174,7 +4174,7 @@ async function addHostSessionState(state, deps = {}) {
 function buildWhoSnapshot(project) {
   const tasks = keep.loadAll(false);
   const sessions = scanSessions();
-  const holds = keep.activeHolds(project);
+  const holds = keep.activeHolds(project, Date.now(), { devices: true });
   const owners = sessionTaskOwners(tasks);
   for (const session of sessions) session.taskId = owners[session.id] || null;
   return who.fleetSnapshot(project, {
@@ -4182,7 +4182,8 @@ function buildWhoSnapshot(project) {
     sessions,
     runs: runs.listRuns(),
     holds,
-    steps: steps.status(project, { tasks, holds }),
+    deviceHolds: true,
+    steps: steps.status(project, { tasks, holds: keep.activeHolds(project) }),
     git: who.gitSnapshot(project),
     now: Date.now(),
   });
