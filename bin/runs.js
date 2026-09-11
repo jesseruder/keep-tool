@@ -347,6 +347,38 @@ function pendingCheckin(payload, taskNow) {
   return { taskId, checkin, stale };
 }
 
+function conservativePayload(run, taskNow, code) {
+  const payload = finalizePayload(run, taskNow, code);
+  if (!taskNow) {
+    // Keep the result durable when even the fallback read fails, but never queue
+    // state changes without a card snapshot that a retry can compare.
+    delete payload.status;
+    delete payload.clearCheckAfter;
+  }
+  return payload;
+}
+
+function landFinalCheckin(run, code, deps = keep) {
+  // This fallback makes a lock timeout durable. The card is reloaded after the
+  // lock is acquired before any mutation, so this snapshot never authorizes the
+  // direct write.
+  let taskNow;
+  try { taskNow = deps.loadTask(run.taskId); } catch {}
+  let payload = conservativePayload(run, taskNow, code);
+  let error = null;
+  try {
+    deps.withLock(() => {
+      taskNow = deps.loadTask(run.taskId);
+      payload = finalizePayload(run, taskNow, code);
+      const prepared = pendingCheckin(payload, taskNow);
+      deps.checkinTask(prepared.taskId, { ...prepared.checkin, withinLock: true });
+    });
+  } catch (e) {
+    error = e;
+  }
+  return { taskNow, payload, error };
+}
+
 function finalize(run, code) {
   run.exitCode = code;
   run.endedAt = Date.now();
@@ -371,13 +403,10 @@ function finalize(run, code) {
     } catch {}
   }
 
-  let taskNow;
-  try { taskNow = keep.loadTask(run.taskId); } catch {}
-  const payload = finalizePayload(run, taskNow, code);
-  try {
-    const { taskId, checkin } = pendingCheckin(payload, taskNow);
-    keep.checkinTask(taskId, checkin);
-  } catch (e) {
+  const landed = landFinalCheckin(run, code);
+  const { taskNow, payload } = landed;
+  if (landed.error) {
+    const e = landed.error;
     const pendingFile = path.join(RUNS_DIR, `${run.id}.pending.json`);
     try {
       fs.writeFileSync(pendingFile, JSON.stringify(payload, null, 2) + '\n');
@@ -695,5 +724,5 @@ function startScheduler() {
 module.exports = {
   startRun, stopRun, listRuns, readDiff, recover, retryPending, startScheduler, setOnChange, setNotifier, setDeliverer,
   buildPrompt, headlessRunArgs, checkDeliveryMessage, checkDeliveryKey, planDueCard, deliveryWarning,
-  cardFingerprint, finalizePayload, pendingCheckin, NO_RESULT,
+  cardFingerprint, finalizePayload, pendingCheckin, landFinalCheckin, NO_RESULT,
 };

@@ -27,7 +27,7 @@ test('scheduled-task timer polls each minute and matches health cadence', () => 
 
 const {
   buildPrompt, headlessRunArgs, checkDeliveryMessage, planDueCard, deliveryWarning,
-  cardFingerprint, finalizePayload, pendingCheckin, NO_RESULT,
+  cardFingerprint, finalizePayload, pendingCheckin, landFinalCheckin, NO_RESULT,
 } = require('./runs.js');
 
 const card = (over = {}) => ({
@@ -273,7 +273,7 @@ test('a pending retry cannot apply state or schedule from before a newer card ac
   assert.equal('_retryCardFingerprint' in fresh.checkin, false, 'retry metadata never reaches checkinTask');
 });
 
-test('the blocked same-status result lands through real check-in validation', () => {
+test('direct finalization reloads a concurrent check-in inside the registry lock', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-runs-finalize-'));
   try {
     fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
@@ -301,25 +301,34 @@ test('the blocked same-status result lands through real check-in validation', ()
       const keep = require(${JSON.stringify(require.resolve('./keep.js'))});
       const runs = require(${JSON.stringify(require.resolve('./runs.js'))});
       const start = keep.loadTask('blocked-check');
-      keep.checkinTask('blocked-check', {
-        message: 'Still waiting on npm MFA; schedule cleared.', status: 'blocked',
-        clearCheckAfter: true, commit: false,
-      });
-      const now = keep.loadTask('blocked-check');
       const run = {
         taskId: 'blocked-check', kind: 'check', startStatus: start.fm.status,
         startCardFingerprint: runs.cardFingerprint(start), status: 'done',
         startedAt: 0, endedAt: 60000,
         resultText: 'Still waiting on npm MFA.', diffStat: '', exitCode: 0,
       };
-      const payload = runs.finalizePayload(run, now);
-      const prepared = runs.pendingCheckin(payload, now);
-      keep.checkinTask(prepared.taskId, { ...prepared.checkin, commit: false });
+      let boundaryMutation = false;
+      const deps = {
+        ...keep,
+        withLock(fn) {
+          if (!boundaryMutation) {
+            boundaryMutation = true;
+            keep.checkinTask('blocked-check', {
+              message: 'Still waiting on npm MFA; schedule cleared.', status: 'blocked',
+              clearCheckAfter: true, commit: false,
+            });
+          }
+          return keep.withLock(fn);
+        },
+        checkinTask(id, checkin) { return keep.checkinTask(id, { ...checkin, commit: false }); },
+      };
+      const outcome = runs.landFinalCheckin(run, 0, deps);
+      if (outcome.error) throw outcome.error;
       const landed = keep.loadTask('blocked-check');
       process.stdout.write(JSON.stringify({
         status: landed.fm.status, checkAfter: landed.fm.check_after || '',
-        needs: landed.fm.needs, payloadStatus: payload.status,
-        payloadClear: payload.clearCheckAfter,
+        needs: landed.fm.needs, payloadStatus: outcome.payload.status,
+        payloadClear: outcome.payload.clearCheckAfter,
       }));
     `;
     const output = execFileSync(process.execPath, ['-e', script], {
@@ -335,4 +344,33 @@ test('the blocked same-status result lands through real check-in validation', ()
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('a lock timeout retains a guarded payload for durable retry', () => {
+  const start = card();
+  const run = completedCheck(start);
+  const timeout = new Error('could not acquire lock');
+  const outcome = landFinalCheckin(run, 0, {
+    loadTask: () => start,
+    withLock: () => { throw timeout; },
+    checkinTask: () => { throw new Error('must not run without the lock'); },
+  });
+  assert.equal(outcome.error, timeout);
+  assert.equal(outcome.payload.status, 'review');
+  assert.equal(outcome.payload.clearCheckAfter, true);
+  assert.equal(outcome.payload._retryCardFingerprint, cardFingerprint(start));
+});
+
+test('a locked card load failure is surfaced and queues no blind mutations', () => {
+  const start = card();
+  const loadFailure = new Error('card is temporarily unreadable');
+  const outcome = landFinalCheckin(completedCheck(start), 0, {
+    loadTask: () => { throw loadFailure; },
+    withLock: (fn) => fn(),
+    checkinTask: () => { throw new Error('must not write without a snapshot'); },
+  });
+  assert.equal(outcome.error, loadFailure);
+  assert.equal('status' in outcome.payload, false);
+  assert.equal('clearCheckAfter' in outcome.payload, false);
+  assert.equal('_retryCardFingerprint' in outcome.payload, false);
 });
