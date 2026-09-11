@@ -107,7 +107,7 @@ test('isolated browser: review queue decisions, drafts, notification links, and 
     const wait = (condition) => evaluate(`new Promise((resolve,reject)=>{const deadline=Date.now()+5000;const tick=()=>{if(${condition})resolve(true);else if(Date.now()>deadline)reject(new Error('condition timed out: '+${JSON.stringify(condition)}));else setTimeout(tick,30)};tick()})`);
     await call('Page.enable'); await call('Emulation.setDeviceMetricsOverride', { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false });
     await call('Page.navigate', { url: `http://127.0.0.1:${server.address().port}/` });
-    await wait("document.querySelector('#reviewQueueCount')?.textContent === '5'");
+    await wait("document.querySelector('#connection')?.textContent === '0 sessions · 0 panes'");
     await evaluate("document.querySelector('[data-mode=review-queue]').click()");
     await wait("document.querySelector('[data-review-detail]')?.dataset.reviewDetail === 'idea:partial-start'");
     assert.equal(await evaluate("document.querySelector('[role=tab][aria-selected=true]').dataset.reviewType"), 'idea', 'Ideas is the default tab');
@@ -135,7 +135,7 @@ test('isolated browser: review queue decisions, drafts, notification links, and 
     await evaluate("(()=>{const sort=document.querySelector('[data-review-sort]'); sort.value='severity'; sort.dispatchEvent(new Event('change',{bubbles:true}))})()");
     assert.deepEqual(await evaluate("[...document.querySelectorAll('[data-review-item]')].map(node=>node.dataset.reviewItem)"), ['finding:card-find:key-one', 'finding:card-find:key-two'], 'Severity orders high before low despite timestamps');
     await call('Page.reload');
-    await wait("document.querySelector('[data-mode=review-queue]') && document.querySelector('#reviewQueueCount')?.textContent === '5'");
+    await wait("document.querySelector('#connection')?.textContent === '0 sessions · 0 panes'");
     await evaluate("document.querySelector('[data-mode=review-queue]').click()");
     await wait("document.querySelector('[data-review-sort]')?.value === 'severity'");
     assert.equal(await evaluate("document.querySelector('[role=tab][aria-selected=true]').dataset.reviewType"), 'finding', 'selected type survives reload');

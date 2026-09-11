@@ -636,10 +636,6 @@ function renderTop() {
     .filter((item) => !state.dismissed.has(itemKey(item))).map((item) => soundEventKey(item, sessionFor(item))));
   document.querySelector('#qcount').textContent = count;
   document.querySelector('#qcount').classList.toggle('zero', count === 0);
-  const reviewCount = (data.reviewQueue?.items || []).filter((item) => item.status === 'needs-decision'
-    && !(Number.isFinite(Date.parse(item.deferredUntil)) && Date.parse(item.deferredUntil) > Date.now())).length;
-  document.querySelector('#reviewQueueCount').textContent = reviewCount;
-  document.querySelector('#reviewQueueCount').classList.toggle('zero', reviewCount === 0);
   const sessionCount = data.sessions?.length || 0;
   const paneCount = data.panes?.length || 0;
   document.querySelector('#connection').textContent = `${sessionCount} session${sessionCount === 1 ? '' : 's'} · ${paneCount} pane${paneCount === 1 ? '' : 's'}`;
