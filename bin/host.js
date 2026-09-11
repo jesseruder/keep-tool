@@ -536,7 +536,8 @@ function createHost(options = {}) {
     switch (params.type) {
       case 'hello':
         return { result: {
-          version: 1, replaceExited: true, bootVersion: options.boot && options.boot.version || null,
+          version: 1, replaceExited: true, guardedKill: true,
+          bootVersion: options.boot && options.boot.version || null,
           panes: panes.size, pid: process.pid, sock,
           reloads: options.boot && options.boot.reloads || 0,
           lastReload: options.boot && options.boot.lastReload || null,
@@ -739,6 +740,22 @@ function createHost(options = {}) {
             pane.term.resize(cols, pane.rows);
           }
         }
+        return { result: { pane: publicPane(pane) } };
+      }
+      case 'guarded-kill': {
+        const pane = needPane(params.pane);
+        if (!Number.isInteger(params.expectedPid) || typeof params.expectedSessionId !== 'string'
+            || !Number.isInteger(params.expectedInputCount) || !Number.isInteger(params.expectedOutputCount)) {
+          throw new Error('guarded kill requires exact pane identity and activity counts');
+        }
+        if (pane.pty.pid !== params.expectedPid || pane.meta?.sessionId !== params.expectedSessionId
+            || !['claude', 'codex'].includes(pane.meta?.agent)
+            || pane.inputCount !== params.expectedInputCount || pane.outputCount !== params.expectedOutputCount) {
+          const error = new Error('Pane identity or activity changed; nothing signalled');
+          error.code = 'guard_rejected';
+          throw error;
+        }
+        if (pane.alive) pane.pty.kill(params.signal || 'SIGTERM');
         return { result: { pane: publicPane(pane) } };
       }
       case 'kill': {

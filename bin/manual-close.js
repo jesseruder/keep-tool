@@ -4,6 +4,9 @@
 async function manualClose(body, deps) {
   if (!/^[a-z0-9_-]+$/i.test(body?.sessionId || '') || !/^[a-z0-9_-]+$/i.test(body?.pane || '')) throw new Error('Expected exact session and pane');
   const initial = await deps.getPane(body.pane);
+  if (deps.requireSignalGuard && deps.signalGuarded !== true) {
+    throw new Error('Terminal host must be refreshed before automatic force close');
+  }
   let expectedInputCount = null;
   let expectedOutputCount = null;
   const verify = (pane) => {
@@ -14,9 +17,15 @@ async function manualClose(body, deps) {
     if (deps.protectInput && expectedInputCount !== null && pane.inputCount !== expectedInputCount) {
       throw new Error('Session received input after graceful close; nothing force-terminated');
     }
+    if (deps.protectInput && !Number.isInteger(pane.inputCount)) {
+      throw new Error('Session input activity cannot be verified; nothing force-terminated');
+    }
     if (deps.protectOutput && expectedOutputCount !== null && pane.alive
         && pane.outputCount !== expectedOutputCount) {
       throw new Error('Session produced output after graceful close; nothing force-terminated');
+    }
+    if (deps.protectOutput && !Number.isInteger(pane.outputCount)) {
+      throw new Error('Session output activity cannot be verified; nothing force-terminated');
     }
     return pane;
   };
@@ -43,11 +52,17 @@ async function manualClose(body, deps) {
   if (await wait(200)) return result();
   await gracefulResult?.beforeSignal?.();
   verify(await deps.getPane(body.pane));
-  await deps.signal(body.pane, 'SIGTERM');
+  const guard = () => ({
+    expectedPid: initial.pid,
+    expectedSessionId: body.sessionId,
+    expectedInputCount,
+    expectedOutputCount,
+  });
+  await deps.signal(body.pane, 'SIGTERM', deps.requireSignalGuard ? guard() : null);
   if (await wait(100)) return result();
   await gracefulResult?.beforeSignal?.();
   verify(await deps.getPane(body.pane));
-  await deps.signal(body.pane, 'SIGKILL');
+  await deps.signal(body.pane, 'SIGKILL', deps.requireSignalGuard ? guard() : null);
   if (await wait(100)) return result(true);
   throw new Error('Termination requested but the pane is still alive');
 }

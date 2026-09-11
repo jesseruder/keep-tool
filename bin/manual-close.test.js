@@ -49,6 +49,25 @@ test('automatic close never turns a graceful refusal into force permission', asy
   assert.deepEqual(f.calls, ['exit']);
 });
 
+test('automatic close requires guarded-signal capability and durable activity counts', async () => {
+  const staleCapability = fixture('SIGKILL');
+  await assert.rejects(manualClose(body, {
+    ...staleCapability.deps, requireSignalGuard: true, signalGuarded: false,
+  }), /must be refreshed/);
+  assert.deepEqual(staleCapability.calls, []);
+
+  const staleCounts = fixture('SIGKILL');
+  staleCounts.deps.getPane = async () => ({
+    id: 'pane', pid: 123, alive: true, inputCount: 0,
+    meta: { agent: 'claude', sessionId: 'session' },
+  });
+  await assert.rejects(manualClose(body, {
+    ...staleCounts.deps, requireSignalGuard: true, signalGuarded: true,
+    protectInput: true, protectOutput: true,
+  }), /output activity cannot be verified/);
+  assert.deepEqual(staleCounts.calls, []);
+});
+
 test('automatic close rechecks its safety closure before each signal', async () => {
   const f = fixture('SIGKILL');
   let checks = 0;
@@ -72,6 +91,24 @@ test('automatic close never force-terminates a live session that responds after 
     ...f.deps, requireGraceful: true, protectInput: true, protectOutput: true,
   }), /produced output/);
   assert.deepEqual(f.calls, []);
+});
+
+test('automatic force passes its exact identity and activity guard to each signal', async () => {
+  const f = fixture('SIGKILL');
+  const guards = [];
+  f.deps.getPane = async () => ({
+    id: 'pane', pid: 123, alive: true, inputCount: 2, outputCount: 4,
+    meta: { agent: 'claude', sessionId: 'session' },
+  });
+  f.deps.graceful = async () => ({ expectedInputCount: 2, expectedOutputCount: 4 });
+  f.deps.signal = async (_pane, signal, guard) => { guards.push({ signal, guard }); };
+  await assert.rejects(manualClose(body, {
+    ...f.deps, requireSignalGuard: true, signalGuarded: true,
+    protectInput: true, protectOutput: true,
+  }), /still alive/);
+  assert.deepEqual(guards, ['SIGTERM', 'SIGKILL'].map((signal) => ({ signal, guard: {
+    expectedPid: 123, expectedSessionId: 'session', expectedInputCount: 2, expectedOutputCount: 4,
+  } })));
 });
 
 for (const graceful of [true, false]) test(`isolated real PTY close: ${graceful ? 'graceful' : 'forced fallback'}`, { timeout: 12000 }, async () => {

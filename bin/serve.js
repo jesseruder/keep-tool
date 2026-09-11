@@ -4735,8 +4735,11 @@ function start(deps = {}) {
         eof: p => writeTarget({ pane: p.id }, '\x04'),
       })),
       close: async (body) => {
+        const hostCapabilities = await hostRequest('hello');
         const result = await withInjectionLock(() => require('./manual-close').manualClose(body, {
           requireGraceful: true,
+          requireSignalGuard: true,
+          signalGuarded: hostCapabilities.guardedKill === true,
           protectInput: true,
           protectOutput: true,
           getPane: async (pane) => (await hostRequest('get', { pane })).pane,
@@ -4749,7 +4752,7 @@ function start(deps = {}) {
             },
             withInjectionLock: (fn) => fn(),
           }),
-          signal: (pane, signal) => hostRequest('kill', { pane, signal }),
+          signal: (pane, signal, guard) => hostRequest('guarded-kill', { pane, signal, ...guard }),
         }));
         keep.recordDaemonSessionClose(body.cardIds, body.sessionId, body.idleMinutes);
         broadcast();

@@ -1329,6 +1329,7 @@ test('attach CLI defaults to snapshots and observer mode never resizes or claims
   await runAttach((deps) => attachCommandCli(['pane-1', '--raw'], deps));
   assert.equal(runs[0].find((call) => call.type === 'attach').params.snapshot, false);
   assert.equal(runs[0].find((call) => call.type === 'attach').params.replay, true);
+  assert.equal(runs[0].find((call) => call.type === 'attach').params.visible, true);
   assert.equal(runs[0].filter((call) => call.type === 'resize').length, 1);
 
   await runAttach((deps) => paneCommandCli(['attach', 'pane-1', '--observer'], deps));
@@ -1336,6 +1337,7 @@ test('attach CLI defaults to snapshots and observer mode never resizes or claims
   assert.equal(observer.snapshot, true);
   assert.equal(observer.replay, false);
   assert.equal(observer.primary, false);
+  assert.equal(observer.visible, true);
   assert.equal(runs[1].filter((call) => call.type === 'resize').length, 0);
 });
 

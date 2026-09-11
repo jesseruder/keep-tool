@@ -5875,6 +5875,7 @@ commands.attach = async (argv, deps = {}) => {
         replay: o.raw === true,
         viewer: `keep-attach-${process.pid}`,
         primary: !o.observer,
+        visible: true,
       },
       (data) => stdout.write(data),
       (exitCode) => {

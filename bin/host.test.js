@@ -53,6 +53,7 @@ async function withHost(options, body) {
 test('replace-exited preserves pane identity and refuses live or stale processes', async () => {
   await withHost({}, async ({ client }) => {
     assert.equal((await client.request('hello')).replaceExited, true);
+    assert.equal((await client.request('hello')).guardedKill, true);
     const { pane } = await client.request('spawn', { cmd: '/bin/sh', args: ['-c', 'sleep 0.2'], meta: { agent: 'claude', sessionId: 'session', title: 'Original' } });
     const request = { paneId: pane.id, expectedPid: pane.pid, sessionId: 'session', cmd: '/bin/sh', args: ['-c', 'sleep 5'] };
     await assert.rejects(client.request('replace-exited', request), /exact exited/);
@@ -66,6 +67,32 @@ test('replace-exited preserves pane identity and refuses live or stale processes
     assert.notEqual(replaced.pid, pane.pid);
     assert.equal(replaced.meta.title, 'Original');
     assert.equal(replaced.meta.sessionId, 'session');
+  });
+});
+
+test('guarded kill atomically refuses stale input and output counts', async () => {
+  await withHost({}, async ({ client }) => {
+    const script = "process.on('SIGTERM',()=>{});process.stdin.setRawMode(true);process.stdin.on('data',()=>setTimeout(()=>process.stdout.write('late'),300));process.stdout.write('ready');setInterval(()=>{},1000)";
+    const { pane } = await client.request('spawn', {
+      cmd: process.execPath, args: ['-e', script], meta: { agent: 'codex', sessionId: 'guarded-session' },
+    });
+    await waitFor(async () => (await client.request('get', { pane: pane.id })).pane.outputCount > 0, 'guard fixture');
+    const initial = (await client.request('get', { pane: pane.id })).pane;
+    const guarded = (expected, signal = 'SIGTERM') => client.request('guarded-kill', {
+      pane: pane.id, signal, expectedPid: expected.pid, expectedSessionId: 'guarded-session',
+      expectedInputCount: expected.inputCount, expectedOutputCount: expected.outputCount,
+    });
+
+    await client.request('input', { pane: pane.id, data: Buffer.from('respond').toString('base64') });
+    await assert.rejects(guarded(initial), /activity changed/);
+    assert.equal((await client.request('get', { pane: pane.id })).pane.alive, true);
+
+    const beforeOutput = (await client.request('get', { pane: pane.id })).pane;
+    await waitFor(async () => (await client.request('get', { pane: pane.id })).pane.outputCount > beforeOutput.outputCount, 'late output');
+    await assert.rejects(guarded(beforeOutput), /activity changed/);
+    const current = (await client.request('get', { pane: pane.id })).pane;
+    assert.equal(current.alive, true);
+    await guarded(current, 'SIGKILL');
   });
 });
 
