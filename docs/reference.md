@@ -677,9 +677,10 @@ body, and renders it inside a token budget.
 
 Two invariants the code enforces:
 
-- **A reviewer note never claims a card's resume link.** `checkinTask` takes
+- **A reviewer entry never claims a card's resume link.** `checkinTask` takes
   `linkSession: false`, and `recordSession` returns early for a reviewer session
   (`KEEP_REVIEWER=1`, or a `.keep/reviewer/<id>` marker the daemon can also see).
+  This holds for a reviewer `keep done` or `--status` change too.
 - **Reading never advances committed offsets.** `review-bundle` stages pending
   offsets; only `review-note` / `review-ack` promote them, so a crashed tick re-reads
   its evidence instead of silently skipping it.
@@ -703,6 +704,35 @@ Two invariants the code enforces:
 
 Findings dedupe on `sha1(task, kind, normalized subject)` — never on the prose, which
 varies every tick — and go quiet for 24h unless the status or HEAD moves.
+
+### The reviewer may change a card directly
+
+The reviewer is not limited to suggesting. It makes ordinary card changes — status,
+`keep done`, plan steps, `wait-on`, `needs`, `check-after` — like any other session,
+when the evidence is conclusive and the change is what a careful owner would do. It
+was previously refused with exit 4 and told to file a `wrong-status` finding instead;
+that rule is gone. Two things did not change: it never becomes a card's linked/resume
+session, and every entry it writes names it. A reviewer check-in is headed
+`check-in (reviewer fable) → done`, a closure `done (reviewer fable)`, alongside the
+`review (fable)` heading its findings already use.
+
+When the owning session is live and mid-turn, prefer a `wrong-status` finding with
+`--suggest-status` so the owner decides.
+
+`keep review-land` carries a `statuses` array beside `acks`, `notes`, `ideas`, and
+`dismiss`, so a status change lands in the same one-commit tick:
+
+```json
+{"statuses": [{"id": "some-card", "bundle": "b1", "status": "done",
+               "message": "Superseded by the landed change in abc1234."}]}
+```
+
+`status` must be a normal Keep status, `message` is required, and a bundle built
+before the card moved is refused exactly as an ack is. It lands through the same
+`keep checkin --status` code path, so the blocked/landing/waiting guards apply
+unchanged, and it prints as a `status` row in the result table. Each change is counted
+in the review ledger as `statuses`, shown by `keep review-stats` and in the console's
+"actions today".
 
 ## Per-card model usage
 

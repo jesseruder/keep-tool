@@ -2800,6 +2800,32 @@ function reviewDismiss(taskId, key, why, opts) {
   return options.withinLock ? land() : keep.withLock(land);
 }
 
+// A status change in a landing document goes through keep.checkinTask, exactly as
+// `keep checkin --status` does, so guards (blocked/landing/waiting), attribution and
+// the ledger count all behave identically. Only the staleness check is ours, and it
+// is the same one acks use: a bundle built before the card moved proves nothing.
+function landReviewerStatus(item, opts) {
+  const options = opts || {};
+  const task = keep.loadTask(item.id);
+  assertFindingFresh(task, statusEvidence(item.id, item.bundle));
+  keep.checkinTask(item.id, {
+    message: item.message, status: item.status, withinLock: true, commit: false,
+  });
+  landDigestLines(['## ' + keep.nowStamp().slice(11) + ' - ' + item.id + '  [status ' + task.fm.status + ' \u2192 ' + item.status + ']', '', item.message], options);
+  return item.status;
+}
+
+// Owner dropped the rule that the reviewer may only *suggest* a status. A direct
+// change is a reviewer action like an ack or a dismissal, so it lands in the same
+// per-day ledger that feeds `keep review-stats` and the console's "actions today".
+// Called by keep.js after the card is saved, so a refused change counts for nothing.
+function recordReviewerStatusChange(taskId, status, opts) {
+  const options = opts || {};
+  if (options.withinLock) saveMeta(bumpDay(loadMeta(), 'statuses'));
+  else metaBump('statuses');
+  appendReviewEvent({ kind: 'status', card: taskId, title: 'status \u2192 ' + status, detail: clip(options.message || '', 240) });
+}
+
 function findingOutcomes() {
   const rows = [];
   let names = [];
@@ -2844,7 +2870,7 @@ function recordFindingOutcome(taskId, key, status, { message, evidence } = {}) {
   });
 }
 
-const REVIEW_LAND_ARRAYS = ['acks', 'notes', 'ideas', 'dismiss'];
+const REVIEW_LAND_ARRAYS = ['acks', 'notes', 'ideas', 'dismiss', 'statuses'];
 
 // ideas[].cards arrives as an array from a careful reviewer and as "a,b,c" from one
 // that copied the review-idea CLI form. Both mean the same list; a validation error
@@ -2948,6 +2974,14 @@ function validateReviewLand(document) {
       else existingTask(id, `${label}.cards[${index}]`);
     }
   });
+  eachObject('statuses', (item, label) => {
+    for (const field of ['id', 'bundle', 'status', 'message']) requiredString(item, field, label);
+    if (typeof item.status === 'string' && item.status && !keep.STATUSES.includes(item.status)) {
+      problems.push(`${label}.status must be one of: ${keep.STATUSES.join(', ')}`);
+    }
+    existingTask(item.id, label);
+    currentBundle(item, label);
+  });
   eachObject('dismiss', (item, label) => {
     requiredString(item, 'id', label);
     requiredString(item, 'key', label);
@@ -2973,6 +3007,7 @@ async function reviewLand(document) {
     ...(document.notes || []).map((item, index) => ({ type: 'note', index, item })),
     ...(document.ideas || []).map((item, index) => ({ type: 'idea', index, item })),
     ...(document.dismiss || []).map((item, index) => ({ type: 'dismiss', index, item })),
+    ...(document.statuses || []).map((item, index) => ({ type: 'status', index, item })),
   ];
   const evidence = new Map((document.notes || []).map((item) => [item, statusEvidence(item.id, item.bundle)]));
   const sessions = (document.notes || []).some((item) => item.kind === 'wrong-status' && ['done', 'deferred'].includes(item.suggestStatus))
@@ -3015,6 +3050,8 @@ async function reviewLand(document) {
           });
           counts.ideas += 1;
           detail = 'proposed ' + out.task.id;
+        } else if (entry.type === 'status') {
+          detail = 'status \u2192 ' + landReviewerStatus(item, { digestLines });
         } else {
           reviewDismiss(item.id, item.key, item.message, { withinLock: true, commit: false });
           detail = 'dismissed ' + item.key;
@@ -3917,6 +3954,7 @@ module.exports = {
   nudgesLive, loadNudgeConfig, describeNudgeConfig, CONTRADICTION_KINDS,
   setNudgesLive,
   reviewStats,
+  recordReviewerStatusChange,
   reviewerTranscriptMetrics,
   usageFromLines,
   reviewerUsage,

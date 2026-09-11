@@ -54,7 +54,9 @@ have carried; say which in the report.
                "message": "work finished and landed; nothing pending"}],
     "ideas": [{"title": "...", "message": "pattern · evidence: cards, sessions, commits · proposed change",
                "cards": ["card-a", "card-c"], "project": "~/repo", "severity": "low"}],
-    "dismiss": [{"id": "card-a", "key": "finding-key", "message": "why"}]}
+    "dismiss": [{"id": "card-a", "key": "finding-key", "message": "why"}],
+    "statuses": [{"id": "card-e", "bundle": "b5", "status": "done",
+                  "message": "superseded by 3b08d08 on origin/master; nothing pending"}]}
    ```
 
    `acks[]`: `id` and `bundle` required; `message` optional; `probeSafe` optional
@@ -65,6 +67,10 @@ have carried; say which in the report.
    is optional. `ideas[]`: `title` and `message` required; `cards` is an array of card
    ids (a comma-separated string is accepted too); `project` and `severity`
    (`low|med`) optional. `dismiss[]`: `id` and `key` required; `message` optional.
+   `statuses[]`: `id`, `bundle`, `status` (a normal Keep status) and `message` all
+   required — it changes the card's status directly, through the same path as
+   `keep checkin --status`, and a bundle built before the card moved is refused just
+   as an ack is.
    Every card with new evidence appears as an ack or as up to three notes; omit
    cards explicitly marked nothing new since last review.
    The command validates everything first and lands nothing if any item is malformed;
@@ -219,14 +225,21 @@ next week.
 6. **Facts beat prose.** A bundle's tool counts, file lists, commands and errors come
    from the transcript verbatim. Sections labelled as the agent's own narration are
    lower trust — when they disagree with the facts, the facts win.
-7. **Status changes go through findings.** A `wrong-status` finding with
-   `--suggest-status done` or `deferred` applies only when the card has no live linked
-   session, no check-in newer than the finding's evidence, no open need, no pending
-   scheduled check, and no unresolved dependency. A dismissed anchor
-   is permanently vetoed, even with `--force`, and is not posted again. Keep reports
-   each refusal; every other target stays suggestion-only. The reviewer never sets
-   `active`. Direct `keep done` and `--status` commands still exit 4 unless Owner
-   explicitly authorized `--force`.
+7. **You may change status directly — when the evidence is conclusive.** Make the
+   change a careful owner would make: close a superseded idea, put a card back to
+   `waiting` with the schedule it lost, mark a stale card `done`. Always with a message
+   that says why. Use `keep checkin <id> --status <s> -m "why"`, `keep done <id>`, or a
+   `statuses` entry in the landing document. Your entries are headed
+   `check-in (reviewer <you>) → <status>`, so the owning session can see it was you, and
+   you still never become a card's linked/resume session.
+   **When the owning session is live and mid-turn, do not touch the card.** File a
+   `wrong-status` finding with `--suggest-status` instead and let the owner decide.
+   A `wrong-status` finding with `--suggest-status done` or `deferred` applies its own
+   status only when the card has no live linked session, no check-in newer than the
+   finding's evidence, no open need, no pending scheduled check, and no unresolved
+   dependency. A dismissed anchor is permanently vetoed, even with `--force`, and is not
+   posted again. Keep reports each refusal; every other finding target stays
+   suggestion-only.
 8. A suppressed result (a `suppressed` row from `review-land`, exit 4 from
    `review-note`) means you already said this — including on a *different* card: the
    same anchor is one fleet-level problem, not one finding per card. Do not rephrase it
@@ -372,10 +385,12 @@ should end in `review-ack`. Spend your attention on the gap between what the age
   after that is consistent with what it decided before.
 - `flags: aborted=interrupted` on a card still marked `active` is often `hung` or
   `wrong-status`.
-- Superseded or completed work can warrant a `wrong-status` finding suggesting
-  `done`; work deliberately put aside can warrant `deferred`. Cite the evidence.
-  Keep checks eligibility and reports whether it applied the status. A live session,
-  a newer check-in, or a recorded blocker means the status stays with the owner.
+- Superseded or completed work can warrant `done`; work deliberately put aside can
+  warrant `deferred`. Cite the evidence. With no live session on the card, change it
+  yourself (a `statuses` entry, or `keep checkin --status`). With a live session
+  mid-turn, file a `wrong-status` finding suggesting it instead: Keep checks
+  eligibility and reports whether it applied the status, and a newer check-in or a
+  recorded blocker means the status stays with the owner.
 - A card in `review` for days with no artifact named in its last check-in is
   `stale-checkin` — the ball is with Owner but he was never told what to look at.
 

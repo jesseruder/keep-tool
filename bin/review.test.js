@@ -783,6 +783,76 @@ test('review-land continues after item failure and commits successful items once
   }
 });
 
+test('review-land statuses lands a status change, refuses a stale bundle and an unknown status', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-land-status-'));
+  const cli = path.join(__dirname, 'keep.js');
+  const env = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', KEEP_REVIEWER: '1', KEEP_REVIEWER_NAME: 'fable' };
+  delete env.CLAUDE_CODE_SESSION_ID;
+  delete env.CODEX_THREAD_ID;
+  delete env.CODEX_SESSION_ID;
+  const run = (args, input) => spawnSync(process.execPath, [cli, ...args], { encoding: 'utf8', env, cwd: root, input });
+  const bundleFor = (id) => {
+    const out = run(['review-bundle', id]);
+    assert.equal(out.status, 0, out.stderr);
+    return out.stdout.match(/bundle: ([0-9a-f]{8})/)[1];
+  };
+  const owner = { ...env };
+  delete owner.KEEP_REVIEWER;
+  delete owner.KEEP_REVIEWER_NAME;
+  try {
+    for (const dir of ['tasks', 'archive', 'digests']) fs.mkdirSync(path.join(root, dir), { recursive: true });
+    spawnSync('git', ['init', '-q', root], { env });
+    spawnSync('git', ['-C', root, 'config', 'user.name', 'Keep Test'], { env });
+    spawnSync('git', ['-C', root, 'config', 'user.email', 'keep@example.test'], { env });
+    for (const title of ['Superseded idea', 'Stale bundle card']) {
+      assert.equal(spawnSync(process.execPath, [cli, 'add', title, '--status', 'active', '-m', 'Evidence.'],
+        { encoding: 'utf8', env: owner, cwd: root }).status, 0);
+    }
+
+    // An unknown status fails validation, so nothing at all lands.
+    const bad = run(['review-land', '-'], JSON.stringify({
+      statuses: [{ id: 'superseded-idea', bundle: bundleFor('superseded-idea'), status: 'archived', message: 'Close it.' }],
+    }));
+    assert.equal(bad.status, 2, bad.stdout);
+    assert.match(bad.stderr, /statuses\[0\]\.status must be one of/);
+    assert.match(fs.readFileSync(path.join(root, 'tasks', 'superseded-idea.md'), 'utf8'), /^status: active$/m);
+
+    // A missing message is refused the same way.
+    const noMessage = run(['review-land', '-'], JSON.stringify({
+      statuses: [{ id: 'superseded-idea', bundle: bundleFor('superseded-idea'), status: 'done' }],
+    }));
+    assert.equal(noMessage.status, 2, noMessage.stdout);
+    assert.match(noMessage.stderr, /statuses\[0\]\.message is required/);
+
+    // A bundle built before the card moved is stale, exactly as for an ack.
+    const staleBundle = bundleFor('stale-bundle-card');
+    assert.equal(spawnSync(process.execPath, [cli, 'checkin', 'stale-bundle-card', '-m', 'Owner moved it on.'],
+      { encoding: 'utf8', env: owner, cwd: root }).status, 0);
+    const stale = run(['review-land', '-'], JSON.stringify({
+      statuses: [{ id: 'stale-bundle-card', bundle: staleBundle, status: 'done', message: 'Stale.' }],
+    }));
+    assert.equal(stale.status, 1, stale.stdout);
+    assert.match(stale.stdout, /status\t1\tstale-bundle-card\tfailed\t.*(?:stale|rebuild)/);
+    assert.match(fs.readFileSync(path.join(root, 'tasks', 'stale-bundle-card.md'), 'utf8'), /^status: active$/m);
+
+    // The good path: one commit, a `status` row, an attributed entry, a ledger count.
+    const good = run(['review-land', '-'], JSON.stringify({
+      statuses: [{ id: 'superseded-idea', bundle: bundleFor('superseded-idea'), status: 'done', message: 'Superseded by the landed change.' }],
+    }));
+    assert.equal(good.status, 0, good.stderr + good.stdout);
+    assert.match(good.stdout, /status\t1\tsuperseded-idea\tok\tstatus → done/);
+    const card = fs.readFileSync(path.join(root, 'tasks', 'superseded-idea.md'), 'utf8');
+    assert.match(card, /^status: done$/m);
+    assert.match(card, /check-in \(reviewer fable\) → done/);
+    const day = require('./keep.js').nowStamp().slice(0, 10);
+    const meta = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'review', '_meta.json'), 'utf8'));
+    assert.equal(meta.days[day].statuses, 1);
+    assert.match(run(['review-stats']).stdout, /statuses 1/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('a reviewer log entry alone is not evidence', () => {
   const now = new Date(2026, 8, 2, 12, 0).getTime();
   const state = { ...require('./review.js').emptyState('x'), lastReviewedAt: now - 2 * 3600e3, lastStatus: 'blocked' };
@@ -1063,7 +1133,7 @@ test('a repeated finding is suppressed with exit 4, and --force says it anyway',
   }
 });
 
-test('the fleet reviewer cannot change card status without --force', () => {
+test('the fleet reviewer changes card status directly, attributed, without taking the resume link', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-status-'));
   const cli = path.join(__dirname, 'keep.js');
   const baseEnv = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1' };
@@ -1080,29 +1150,38 @@ test('the fleet reviewer cannot change card status without --force', () => {
     spawnSync('git', ['-C', root, 'config', 'user.email', 'keep@example.test'], { env: baseEnv });
     assert.equal(run(['add', 'Reviewed card', '--status', 'active', '-m', 'Started.']).status, 0);
 
-    const reviewerEnv = { ...baseEnv, KEEP_REVIEWER: '1' };
-    const denied = run(['done', 'reviewed-card'], reviewerEnv);
-    assert.equal(denied.status, 4);
-    assert.match(denied.stderr, /the fleet reviewer applies done\/deferred only through a wrong-status finding; use keep review-note --kind wrong-status --suggest-status <s> \(or --force if Owner asked\)/);
-    assert.match(read(), /^status: active$/m, 'the refused command leaves the card open');
-    for (const args of [
-      ['checkin', 'reviewed-card', '--status', 'done', '-m', 'Close it.'],
-      ['checkin', 'reviewed-card', '--status', 'deferred', '-m', 'Set aside.'],
-      ['add', 'Reviewer addition', '--status', 'done'],
+    const reviewerEnv = {
+      ...baseEnv, KEEP_REVIEWER: '1', KEEP_REVIEWER_NAME: 'fable',
+      CLAUDE_CODE_SESSION_ID: 'reviewer-session-id',
+    };
+    // Ordinary card changes are allowed now; each one still names the reviewer.
+    for (const [args, expected] of [
+      [['checkin', 'reviewed-card', '--status', 'deferred', '-m', 'Set aside.'], 'deferred'],
+      [['checkin', 'reviewed-card', '--status', 'active', '-m', 'Back to it.'], 'active'],
     ]) {
       const direct = run(args, reviewerEnv);
-      assert.equal(direct.status, 4, direct.stderr);
-      assert.match(direct.stderr, /only through a wrong-status finding/);
+      assert.equal(direct.status, 0, direct.stderr);
+      assert.match(read(), new RegExp(`^status: ${expected}$`, 'm'));
     }
+    assert.match(read(), /check-in \(reviewer fable\) → deferred/);
 
     const note = run(['checkin', 'reviewed-card', '-m', 'Review observation only.'], reviewerEnv);
     assert.equal(note.status, 0, note.stderr);
-    assert.match(read(), /Review observation only\./);
-    assert.match(read(), /^status: active$/m, 'a status-free check-in remains allowed');
+    assert.match(read(), /check-in \(reviewer fable\)\n/);
 
-    const forced = run(['done', 'reviewed-card', '--force'], reviewerEnv);
-    assert.equal(forced.status, 0, forced.stderr);
-    assert.match(read(), /^status: done$/m, '--force permits Owner-authorized closure');
+    const closed = run(['done', 'reviewed-card'], reviewerEnv);
+    assert.equal(closed.status, 0, closed.stderr);
+    assert.match(read(), /^status: done$/m);
+    assert.match(read(), /done \(reviewer fable\)/);
+
+    // The one reviewer rule that stays: it never becomes the card's resume session.
+    assert.doesNotMatch(read(), /reviewer-session-id/);
+    assert.doesNotMatch(read(), /^sessions:/m);
+
+    // review-stats counts the change like any other reviewer action.
+    const stats = run(['review-stats'], reviewerEnv);
+    assert.equal(stats.status, 0, stats.stderr);
+    assert.match(stats.stdout, /statuses 3/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

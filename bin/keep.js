@@ -416,13 +416,40 @@ function isReviewerSession() {
   try { return fs.existsSync(path.join(META, 'reviewer', session.id)); } catch { return false; }
 }
 
-const REVIEWER_STATUS_ERROR = 'the fleet reviewer applies done/deferred only through a wrong-status finding; use keep review-note --kind wrong-status --suggest-status <s> (or --force if Owner asked)';
+// The reviewer used to be refused every status change (exit 4, "use a wrong-status
+// finding"). Owner dropped that design on 2026-09-11: the reviewer may make ordinary
+// card changes like any other session, as long as the entry says it was the reviewer
+// and the card's resume link still never moves to it (see recordSession).
+// Its name, for log attribution — mirrors review.js's reviewerName(), which cannot be
+// required here without a cycle at load time.
+function reviewerLabel() {
+  if (process.env.KEEP_REVIEWER_NAME) return process.env.KEEP_REVIEWER_NAME;
+  const session = currentSession();
+  if (session) {
+    try {
+      const marker = JSON.parse(fs.readFileSync(path.join(META, 'reviewer', session.id), 'utf8'));
+      if (marker && marker.name) return String(marker.name);
+    } catch {}
+  }
+  return 'fable';
+}
 
-function guardReviewerStatusChange(changesStatus, force) {
-  if (!changesStatus || force || !isReviewerSession()) return;
-  const error = new KeepError(REVIEWER_STATUS_ERROR);
-  error.exitCode = 4;
-  throw error;
+// `review (fable)` headings already mark the reviewer's notes; an ordinary entry it
+// writes gets the same treatment so the owning session and Owner can tell at a glance.
+function attributeHeading(heading) {
+  const text = String(heading || '');
+  if (!isReviewerSession() || /^review\b/.test(text) || text.includes('(reviewer ')) return text;
+  // Headings carry the new status as ` → done`; the attribution belongs to the verb,
+  // so `check-in → done` reads `check-in (reviewer fable) → done`.
+  const split = /^([^→]*?)(\s*→[\s\S]*)?$/.exec(text);
+  return `${split[1]} (reviewer ${reviewerLabel()})${split[2] || ''}`;
+}
+
+// The review ledger counts reviewer actions (acks/notes/ideas/dismisses/nudges) for
+// `keep review-stats` and the console's "actions today"; a status change is one too.
+function countReviewerStatusChange(taskId, status) {
+  if (!isReviewerSession()) return;
+  try { require('./review.js').recordReviewerStatusChange(taskId, status); } catch {}
 }
 
 // Curation from another directory must not claim a card, so both the resume link
@@ -603,7 +630,7 @@ function demoteHeadings(message) {
 }
 
 function appendLog(task, heading, message) {
-  const entry = `## ${nowStamp().replace('T', ' ')} — ${heading}\n${demoteHeadings(message.trim())}\n`;
+  const entry = `## ${nowStamp().replace('T', ' ')} — ${attributeHeading(heading)}\n${demoteHeadings(message.trim())}\n`;
   const parsed = parsePlan(task.body);
   const rest = parsed.rest ? `${entry}\n${parsed.rest.replace(/^\n+/, '')}` : entry;
   const plan = parsed.steps.length ? renderPlan(parsed.steps) : parsed.present ? parsed.raw : '';
@@ -1187,7 +1214,6 @@ function addTask({
   status = status || 'inbox';
   if (!STATUSES.includes(status)) die(`status must be one of: ${STATUSES.join(', ')}`);
   if (status === 'waiting' && !checkAfter) die('waiting needs --check-after or an unresolved depends_on entry');
-  guardReviewerStatusChange(status !== 'inbox', force);
   if (kind === 'experiment' && !checkAfter) die('experiments need --check-after (that\'s the point)');
 
   // near-miss tag warning
@@ -1663,7 +1689,6 @@ function checkinTask(id, {
   commits = cleanCommits(commits);
   experimentId = cleanExperimentId(experimentId);
   if (status && !STATUSES.includes(status)) die(`status must be one of: ${STATUSES.join(', ')}`);
-  guardReviewerStatusChange(Boolean(status), force);
   guardReviewProse(status, [message, next].filter(Boolean).join(' '), force);
   // `withinLock` callers already hold the registry lock, and a criterion is a
   // subprocess that can run for a minute — long enough for another session to
@@ -1730,6 +1755,7 @@ function checkinTask(id, {
     }
     appendLog(task, `${heading || 'check-in'}${status ? ` → ${status}` : ''}`, logMessage(message, next, commits));
     saveTask(task);
+    if (status) countReviewerStatusChange(task.id, status);
     warnSkippedSessionLink(task, sessionResult, 'check-in recorded');
     if (commit) {
       commitAndPush(`keep: ${commitLabel || 'checkin'} ${id}${status ? ` (${status})` : ''}`, commitLabel === 'review' ? ['tasks', 'reviews'] : undefined);
@@ -1822,7 +1848,6 @@ commands.done = (argv) => {
   const next = cleanNext(o.next);
   const commits = cleanCommits(o.commit);
   const message = o.m || 'Done.';
-  guardReviewerStatusChange(true, o.force);
   withLock(() => {
     const task = loadTask(id);
     task.fm.status = 'done';
@@ -1831,6 +1856,7 @@ commands.done = (argv) => {
     recordSession(task);
     appendLog(task, 'done', logMessage(message, next, commits));
     saveTask(task);
+    countReviewerStatusChange(task.id, 'done');
     commitAndPush(`keep: done ${id}`);
     console.log(fmtTask(task, { brief: true }));
   });
@@ -1843,7 +1869,6 @@ commands['wait-on'] = (argv) => {
   const upstreamEntries = o._.slice(1);
   if (!dependentId || !upstreamEntries.length) die('usage: keep wait-on <card> <upstream>[#<step>] [--commit <sha>[,<sha>] | --deployed <sha> --target <name> | --status review,landing,done] -m "why"');
   const requested = requestedWaits(o, upstreamEntries, !o.remove);
-  guardReviewerStatusChange(true, false);
   withLock(() => {
     const dependent = loadTask(dependentId);
     if (o.remove) {
@@ -5600,7 +5625,7 @@ commands['review-stats'] = async (argv) => {
   const days = Object.keys(stats.days).sort().slice(-3);
   for (const day of days) {
     const d = stats.days[day];
-    console.log(`${day}: ticks ${d.ticks || 0}, notes ${d.notes || 0}, ideas ${d.ideas || 0}, acks ${d.acks || 0}, nudges ${d.nudges || 0}, compacts ${d.compacts || 0}`);
+    console.log(`${day}: ticks ${d.ticks || 0}, notes ${d.notes || 0}, ideas ${d.ideas || 0}, acks ${d.acks || 0}, statuses ${d.statuses || 0}, nudges ${d.nudges || 0}, compacts ${d.compacts || 0}`);
   }
   console.log(`findings on record: ${stats.findingsTotal} (${stats.dismissed} dismissed)`);
   console.log('finding outcomes: ' + Object.entries(stats.outcomes).map(([key, n]) => `${n} ${key}`).join(', '));

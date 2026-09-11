@@ -2,7 +2,7 @@ import * as api from './api.js';
 
 const ACTIONS_KEY = 'keep.console.reviewer.actionsOnly';
 const SEEN_KEY = 'keep.console.reviewer.seenAt';
-const ICONS = { ack: '✓', finding: '!', idea: '◇', nudge: '→', dismiss: '✕', compact: '↓', tick: '·', outcome: '✓' };
+const ICONS = { ack: '✓', finding: '!', idea: '◇', nudge: '→', dismiss: '✕', compact: '↓', tick: '·', outcome: '✓', status: '⇄' };
 const expandedDays = new Set();
 let actionsOnly = true;
 let seenAt = 0;
@@ -46,8 +46,8 @@ function eventHTML(ctx, event, cursor = seenAt, compact = false) {
 function countSummary(dayEvents) {
   const counts = new Map();
   for (const event of dayEvents) counts.set(event.kind, (counts.get(event.kind) || 0) + 1);
-  const labels = { tick: 'ticks', ack: 'acks', finding: 'findings', idea: 'ideas', dismiss: 'dismissals', outcome: 'outcomes', nudge: 'nudges', compact: 'compacts' };
-  return ['tick', 'ack', 'finding', 'idea', 'dismiss', 'outcome', 'nudge', 'compact']
+  const labels = { tick: 'ticks', ack: 'acks', finding: 'findings', idea: 'ideas', dismiss: 'dismissals', status: 'status changes', outcome: 'outcomes', nudge: 'nudges', compact: 'compacts' };
+  return ['tick', 'ack', 'finding', 'idea', 'dismiss', 'status', 'outcome', 'nudge', 'compact']
     .filter((kind) => counts.has(kind)).map((kind) => `${counts.get(kind)} ${labels[kind]}`).join(', ');
 }
 
@@ -191,7 +191,7 @@ export function renderReviewer(ctx) {
 
   const value = stats(ctx);
   const day = value.days?.[today()] || {};
-  const actionCount = ['acks', 'notes', 'ideas', 'dismisses', 'nudges'].reduce((sum, key) => sum + Number(day[key] || 0), 0);
+  const actionCount = ['acks', 'notes', 'ideas', 'dismisses', 'statuses', 'nudges'].reduce((sum, key) => sum + Number(day[key] || 0), 0);
   const weekly = weeklyText(value.weekly);
   const median = value.medianContextTokens == null ? '—' : `${Math.round(Number(value.medianContextTokens) / 1000)}<small>k</small>`;
   ctx.patchHTML(document.querySelector('#reviewStats'), `<div class="rstat"><div class="v">${Number(day.ticks || 0)}</div><div class="l">ticks today</div></div><div class="rstat hot"><div class="v">${actionCount}</div><div class="l">actions today</div></div><div class="rstat"><div class="v">${median}</div><div class="l">median ctx</div></div><div class="rstat" title="${ctx.esc(weekly.title)}"><div class="v">${ctx.esc(weekly.usage)}</div><div class="l">${ctx.esc(weekly.label)}</div></div>`);
