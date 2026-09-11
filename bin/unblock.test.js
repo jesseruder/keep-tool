@@ -39,7 +39,7 @@ function writeTask(root, id, options = {}) {
     '---',
     `title: ${options.title || id}`,
     `status: ${options.status || 'active'}`,
-    'kind: task',
+    `kind: ${options.kind || 'task'}`,
     'tags: [personal]',
     ...(options.dependsOn && options.dependsOn.length ? [`depends_on: [${options.dependsOn.join(', ')}]`] : []),
     ...(options.project ? [`project: ${options.project}`] : []),
@@ -363,6 +363,55 @@ test('wait-on validates plan steps and detects cycles through qualified dependen
     const cycle = cli(fixture, ['wait-on', 'dependent', 'upstream#2', '-m', 'need step']);
     assert.equal(cycle.status, 2);
     assert.match(cycle.stderr, /dependent -> upstream -> dependent/);
+  } finally { fs.rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test('wait-on refuses a planned whole-card wait with an actionable step list unless --whole is explicit', () => {
+  const fixture = registry();
+  try {
+    writeTask(fixture.root, 'upstream', {
+      body: planBody([{ text: 'Publish package', done: true }, { text: 'Transfer fonts ownership' }]),
+    });
+    writeTask(fixture.root, 'dependent');
+    commitFixtures(fixture);
+
+    const refused = cli(fixture, ['wait-on', 'dependent', 'upstream', '-m', 'need package']);
+    assert.equal(refused.status, 2);
+    assert.match(refused.stderr, /upstream has a plan; a whole-card wait can remain blocked/);
+    assert.match(refused.stderr, /upstream#1\s+\[done\] Publish package/);
+    assert.match(refused.stderr, /upstream#2\s+\[todo\] Transfer fonts ownership/);
+    assert.match(refused.stderr, /--commit, --deployed with --target, or --status/);
+    assert.equal(task(fixture.root, 'dependent').fm.status, 'active');
+    assert.deepEqual(task(fixture.root, 'dependent').fm.depends_on || [], []);
+
+    const explicit = cli(fixture, ['wait-on', 'dependent', 'upstream', '--whole', '-m', 'need every step']);
+    assert.equal(explicit.status, 0, explicit.stderr);
+    assert.equal(parseDependency(task(fixture.root, 'dependent').fm.depends_on[0]).kind, 'whole');
+    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream#1', '--whole', '-m', 'bad']).status, 2);
+    assert.equal(cli(fixture, ['wait-on', 'dependent', 'upstream', '--commit', 'deadbeef', '--whole', '-m', 'bad']).status, 2);
+  } finally { fs.rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test('whole-card waits warn on review, landing, and idea upstreams while fact waits stay quiet', () => {
+  const fixture = registry();
+  try {
+    writeTask(fixture.root, 'in-review', { status: 'review' });
+    writeTask(fixture.root, 'landing-now', { status: 'landing' });
+    writeTask(fixture.root, 'open-idea', { kind: 'idea' });
+    for (const id of ['review-wait', 'landing-wait', 'idea-wait', 'fact-wait']) writeTask(fixture.root, id);
+    commitFixtures(fixture);
+
+    for (const [dependent, upstream] of [
+      ['review-wait', 'in-review'], ['landing-wait', 'landing-now'], ['idea-wait', 'open-idea'],
+    ]) {
+      const result = cli(fixture, ['wait-on', dependent, upstream, '-m', 'need everything']);
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.stderr, new RegExp(`whole-card wait on ${upstream} may sit for days`));
+      assert.match(result.stderr, /prefer --commit <sha>.+--status review,landing,done/);
+    }
+    const fact = cli(fixture, ['wait-on', 'fact-wait', 'in-review', '--status', 'review', '-m', 'need review state']);
+    assert.equal(fact.status, 0, fact.stderr);
+    assert.equal(fact.stderr, '');
   } finally { fs.rmSync(fixture.root, { recursive: true, force: true }); }
 });
 

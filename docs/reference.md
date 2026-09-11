@@ -159,6 +159,12 @@ from a `deployed <sha> to <target>` entry on the upstream card, as recorded by t
 hook. Status waits resolve when the upstream reaches any listed status (`review`,
 `landing`, or `done`). Quote a pipe-separated status list if using `|` instead of commas.
 
+A bare whole-card wait is refused with exit code 2 when the upstream has a plan;
+the error lists its steps. Select a step or fact target, or pass `--whole` to explicitly
+wait for completion of the entire card. A broad wait on an upstream in `review` or
+`landing`, or with kind `idea`, also warns on stderr that it may sit for days and
+suggests fact targets. Warnings alone do not fail the command.
+
 `keep wait-on` rejects missing cards and cycles and moves active or review work to
 waiting. `keep deps [<card>]` shows resolved and pending targets and their reasons.
 Remove an exact entry by repeating its target flags with `--remove`; for example,

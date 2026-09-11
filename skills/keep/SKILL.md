@@ -59,6 +59,9 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   `#n` is positional: inserting or removing an upstream step shifts its target,
   so re-check `keep deps` after editing a plan. A whole-card wait uses
   `keep wait-on <your-card> <upstream> -m "why"`.
+  If the upstream has a plan, a bare whole-card wait is refused with the step list;
+  select a step or fact target, or pass `--whole` deliberately. Broad waits on cards
+  in `review` or `landing`, or of kind `idea`, warn that they may sit for days.
   Never write "await task X" only as prose. `review` means awaiting Owner's review,
   not another task. Keep sends a `[keep] unblocked` message into your linked session
   when the target is satisfied. Inspect targets and stored reasons with

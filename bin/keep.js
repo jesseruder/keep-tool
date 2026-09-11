@@ -1068,11 +1068,13 @@ function requestedWaits(options, upstreamEntries, adding) {
   if (kinds > 1) dependencyError('choose one wait target: --commit, --deployed with --target, or --status');
   if ((options.deployed == null) !== (options.target == null)) dependencyError('--deployed <sha> and --target <name> must be used together');
   if (kinds && upstreamEntries.length !== 1) dependencyError('fact-based waits take exactly one upstream card');
+  if (options.whole && kinds) dependencyError('--whole applies only to a bare whole-card wait, not a fact target');
 
   return upstreamEntries.map((entry) => {
     const base = parseDependency(entry);
     if (base.invalid) dependencyError(`invalid dependency "${entry}"; use <card> or <card>#<step>`);
     if (kinds && base.step != null) dependencyError('a card#step wait cannot also use a fact target');
+    if (options.whole && base.step != null) dependencyError('--whole cannot be combined with a card#step wait');
     const target = { card: base.id, kind: base.step == null ? 'whole' : 'step', ...(base.step == null ? {} : { step: base.step }) };
     if (commits.length) Object.assign(target, { kind: 'commit', commits: [...commits].sort() });
     if (statuses.length) Object.assign(target, { kind: 'status', statuses });
@@ -1715,7 +1717,7 @@ commands.done = (argv) => {
 };
 
 commands['wait-on'] = (argv) => {
-  const o = parseArgs(argv, { remove: 'bool', commit: 'list', deployed: 'str', target: 'str', status: 'str' });
+  const o = parseArgs(argv, { remove: 'bool', whole: 'bool', commit: 'list', deployed: 'str', target: 'str', status: 'str' });
   const dependentId = o._[0];
   const upstreamEntries = o._.slice(1);
   if (!dependentId || !upstreamEntries.length) die('usage: keep wait-on <card> <upstream>[#<step>] [--commit <sha>[,<sha>] | --deployed <sha> --target <name> | --status review,landing,done] -m "why"');
@@ -1747,9 +1749,11 @@ commands['wait-on'] = (argv) => {
       return;
     }
     const tasks = new Map(loadAll(true).map((task) => [task.id, task]));
+    const checkedUpstreams = [];
     for (const entry of requested) {
       const { id: upstreamId, step } = parseDependency(entry);
       const upstream = loadTaskAnywhere(upstreamId);
+      checkedUpstreams.push({ entry, upstream });
       if (step != null) {
         const steps = parsePlan(upstream.body).steps;
         if (steps.length < step) dependencyError(`${upstreamId} has no plan step ${step} (plan has ${steps.length})`);
@@ -1757,6 +1761,29 @@ commands['wait-on'] = (argv) => {
       if (upstreamId === dependentId) dependencyError(`dependency cycle: ${dependentId} -> ${dependentId}`);
       const path = dependencyPath(upstreamId, dependentId, tasks);
       if (path) dependencyError(`dependency cycle: ${dependentId} -> ${path.join(' -> ')}`);
+    }
+
+    for (const { entry, upstream } of checkedUpstreams) {
+      const target = parseDependency(entry);
+      if (target.kind !== 'whole') continue;
+      const steps = parsePlan(upstream.body).steps;
+      if (steps.length && !o.whole) {
+        const choices = steps.map((step) => `  ${upstream.id}#${step.n}  [${step.state}] ${step.text}`).join('\n');
+        dependencyError(
+          `${upstream.id} has a plan; a whole-card wait can remain blocked by unrelated later work.\n`
+          + `Choose the plan step you actually need:\n${choices}\n`
+          + `Or use --commit, --deployed with --target, or --status for a fact target. Pass --whole only when completion of the entire card is required.`,
+        );
+      }
+    }
+
+    for (const { entry, upstream } of checkedUpstreams) {
+      if (parseDependency(entry).kind !== 'whole') continue;
+      if (!['review', 'landing'].includes(upstream.fm.status) && upstream.fm.kind !== 'idea') continue;
+      process.stderr.write(
+        `keep: warning — whole-card wait on ${upstream.id} may sit for days (${upstream.fm.kind === 'idea' ? 'idea cards may never close' : `status ${upstream.fm.status}`}); `
+        + `prefer --commit <sha>, --deployed <sha> --target <name>, or --status review,landing,done when one of those facts is enough.\n`,
+      );
     }
 
     const requestedByTarget = new Map(requested.map((entry) => [dependencyTarget(entry), entry]));
@@ -5834,7 +5861,7 @@ function helpText() {
   keep show <id>
   keep wait [--no-hold <project> [--scope <resource>]] [--card <id>[#<n>]] [--lane <project> <step>]
             [--check-due <id>] [--for <duration>] [--interval <seconds>]
-  keep wait-on <card> <upstream>[#<step>] [<upstream>[#<step>]...] -m "why"
+  keep wait-on <card> <upstream>[#<step>] [<upstream>[#<step>]...] [--whole] -m "why"
   keep wait-on <card> <upstream> [--commit <sha>[,<sha>] | --deployed <sha> --target <name> | --status review,landing,done] -m "why"
   keep wait-on <card> --remove <upstream>[#<step>] [...] [matching target flags] [-m "why"]
   keep deps [<card>]
