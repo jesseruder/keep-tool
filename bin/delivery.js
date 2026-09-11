@@ -75,7 +75,7 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
   }
   if (!entry) {
     await precheck();
-    entry = { sessionId: session.id, kind: session.kind, file, offset: fs.statSync(file).size, pane, hash: hash(text), key, receiptId: receiptId(text, key), retainReceipt };
+    entry = { createdAt: Date.now(), sessionId: session.id, kind: session.kind, file, offset: fs.statSync(file).size, pane, hash: hash(text), key, receiptId: receiptId(text, key), retainReceipt };
     const temp = journal + '.tmp';
     fs.writeFileSync(temp, JSON.stringify(entry), { mode: 0o600 });
     fs.renameSync(temp, journal);

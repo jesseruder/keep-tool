@@ -53,3 +53,18 @@ and do not edit the user's Codex configuration. They apply on the next launch or
 resume; already-running clients retain their settings. Explicit later `-c`
 arguments can override these defaults. Direct Codex launches that bypass this
 wrapper need the same overrides to prevent animation interference.
+
+`keep serve` also checks durable unconfirmed deliveries every minute for both
+Claude and Codex. After a two-minute grace period, three consecutive failed
+checks produce a `delivery` warning in `keep health` and the console's daemon
+health attention list (normally within four to five minutes of a stuck send).
+The warning identifies the session and pane, and distinguishes failed screen
+verification, missing receipts after Enter, and unreadable transcripts/journals.
+It keeps the same attention timestamp while the incident persists and clears
+when the transcript confirms receipt. Other sessions succeeding cannot clear it.
+From the Keep source directory, `node bin/delivery-health.js` lists every current
+incident as JSON without message or screen contents. Rotated delivery traces help
+classify the failure; older attempts without traces are still reported as missing
+receipts. The watchdog never sends input, restarts clients, or deletes journals.
+It monitors attempted deliveries; it is not a startup compatibility certification
+and does not flag sends deferred before any draft was typed.

@@ -4535,6 +4535,7 @@ function start(deps = {}) {
   usage.setCacheFile(path.join(keep.ROOT, '.keep', 'usage-cache.json'));
   runs.recover(); // surface any orphaned run logs from a prior crash/restart
   runs.startScheduler();
+  require('./delivery-health').startScheduler({ root: keep.ROOT, onChange: broadcast });
   unblock.startScheduler({
     onChange: broadcast,
     deps: { deliver: deliverUnblockToThread },

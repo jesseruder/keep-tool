@@ -21,6 +21,7 @@ const CADENCES = Object.freeze({
   'review-questions': { cadenceMs: 60e3 },
   'review-compact': { cadenceMs: 60e3 },
   runs: { cadenceMs: 60e3 },
+  delivery: { cadenceMs: 60e3 },
   unblock: { cadenceMs: 60e3 },
   slack: { cadenceMs: 15 * 60e3 },
   landed: { cadenceMs: 30 * 60e3 },
@@ -125,6 +126,8 @@ function record(name, options = {}) {
     entry.lastErrorAt = at;
     entry.lastError = clipError(options.error || 'tick failed');
   }
+  if (!ok && Number.isFinite(options.incidentAt)) entry.incidentAt = options.incidentAt;
+  else delete entry.incidentAt;
   if (options.detail == null || options.detail === '') delete entry.detail;
   else entry.detail = clipError(options.detail);
   store[name] = entry;
@@ -199,6 +202,7 @@ function snapshot(now = Date.now()) {
       lastOkAt: entry.lastOkAt || null,
       lastErrorAt: entry.lastErrorAt || null,
       lastError: entry.lastError || '',
+      incidentAt: entry.incidentAt || null,
       consecutiveFailures: Number(entry.consecutiveFailures || 0),
       cadenceMs: Number(entry.cadenceMs || config.cadenceMs || 0),
       detail: entry.detail || '',
@@ -229,7 +233,7 @@ function attentionItems(value, now = Date.now()) {
   const items = unhealthyRows(value).map((entry) => {
     const anchor = entry.lastRunAt || daemon.startedAt || at;
     const reason = entry.lastError || `no tick for ${duration(at - atMs(anchor, at))}`;
-    const eventAt = entry.lastErrorAt || entry.lastRunAt || daemon.startedAt || at;
+    const eventAt = entry.incidentAt || entry.lastErrorAt || entry.lastRunAt || daemon.startedAt || at;
     return {
       id: `health:${entry.name}`,
       text: `${entry.name} ${entry.state}: ${reason}`,
