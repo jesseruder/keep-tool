@@ -65,6 +65,13 @@ when the transcript confirms receipt. Other sessions succeeding cannot clear it.
 From the Keep source directory, `node bin/delivery-health.js` lists every current
 incident as JSON without message or screen contents. Rotated delivery traces help
 classify the failure; older attempts without traces are still reported as missing
-receipts. The watchdog never sends input, restarts clients, or deletes journals.
+receipts. The daemon reconciles completed attempts under its delivery lock before
+each health check. Claude's structured local-command receipts and Codex's native
+`/compact` completion count as confirmation; unrelated later conversational work
+prevents an old compaction draft from being acknowledged. An explicitly cancelled
+or locally acknowledged question answer is removed only when its exact rendered
+payload and recipient match; cancellation never becomes a successful receipt or
+causes the answer to be resent. Corrupt or ambiguous attempts remain visible.
+The watchdog itself stays read-only and never sends input or restarts clients.
 It monitors attempted deliveries; it is not a startup compatibility certification
 and does not flag sends deferred before any draft was typed.

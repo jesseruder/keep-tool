@@ -25,6 +25,8 @@ function received(entry) {
     const decoder = new (require('string_decoder').StringDecoder)('utf8');
     const bytes = Buffer.alloc(256 * 1024);
     let offset = entry.offset, partial = '';
+    let compactEligible = entry.kind === 'codex' && entry.hash === hash('/compact');
+    let startedTurns = 0;
     while (offset < size) {
       const n = fs.readSync(fd, bytes, 0, Math.min(bytes.length, size - offset), offset);
       if (!n) break;
@@ -32,12 +34,51 @@ function received(entry) {
       const lines = (partial + decoder.write(bytes.subarray(0, n))).split('\n');
       partial = lines.pop();
       for (const line of lines) {
-        try { const text = userText(JSON.parse(line), entry.kind); if (text !== null && hash(text) === entry.hash) return true; }
+        try {
+          const record = JSON.parse(line);
+          const text = userText(record, entry.kind);
+          if (text !== null && hash(text) === entry.hash) return true;
+          // Claude records accepted local commands as structured user messages,
+          // rather than as the literal slash command Keep submitted.
+          if (entry.kind === 'claude' && text !== null) {
+            const command = text.match(/^<command-name>(\/[^<>\s]+)<\/command-name>\s*<command-message>[^<>]*<\/command-message>\s*<command-args>([^<>]*)<\/command-args>$/);
+            if (command && hash(command[1] + (command[2].trim() ? ' ' + command[2].trim() : '')) === entry.hash) return true;
+          }
+          // Codex /compact has no ordinary user receipt. Accept its native
+          // completion only before any intervening conversational work/turn.
+          // A later automatic compaction must not acknowledge an old draft.
+          if (compactEligible) {
+            if (record.type === 'compacted') return true;
+            if (record.type === 'response_item' || (record.type === 'event_msg' &&
+                (['user_message', 'agent_message', 'task_complete', 'turn_aborted', 'error'].includes(record.payload?.type)
+                  || (record.payload?.type === 'task_started' && ++startedTurns > 1)))) compactEligible = false;
+          }
+        }
         catch {}
       }
     }
     return false;
   } finally { fs.closeSync(fd); }
+}
+
+// A cancelled/locally acknowledged question answer is terminal, not delivered.
+// Match its exact rendered payload and recipient; pending=false or exhausted
+// retries alone are never cancellation evidence. Read from this journal's root.
+function cancelled(entry, directory) {
+  let questions;
+  try { questions = JSON.parse(fs.readFileSync(path.join(directory, '..', 'review', '_questions.json'), 'utf8')); }
+  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+  if (!Array.isArray(questions)) throw Error('Invalid question delivery state');
+  return questions.some(question => {
+    const state = question?.answerDelivery;
+    if (question?.status !== 'answered' || question.from?.sessionId !== entry.sessionId || question.from?.agent !== entry.kind
+        || state?.pending !== false || !(Number(state.cancelledAt) > 0 || Number(state.acknowledgedAt) > 0)) return false;
+    const by = question.answeredBy || {};
+    const text = require('./review').answerMessage(question.id, question.answer, {
+      fromReviewer: by.reviewer === true, agent: by.agent, sessionId: by.sessionId,
+    });
+    return hash(text) === entry.hash;
+  });
 }
 
 // One pending attempt per session, retained across daemon restarts. Never retype
@@ -59,7 +100,10 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
   try { entry = JSON.parse(fs.readFileSync(journal, 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   if (entry) {
     trace('pending-journal-found');
-    if (received(entry)) {
+    if (cancelled(entry, directory)) {
+      fs.unlinkSync(journal);
+      entry = null;
+    } else if (received(entry)) {
       saveReceipt(directory, entry);
       fs.unlinkSync(journal);
       if (entry.hash === hash(text)) return { ok: true, delivery: 'received', recovered: true };
@@ -74,6 +118,9 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
     }
   }
   if (!entry) {
+    if (cancelled({ sessionId: session.id, kind: session.kind, hash: hash(text) }, directory)) {
+      throw Error('Delivery explicitly cancelled or acknowledged in the owning session; no message sent.');
+    }
     await precheck();
     entry = { createdAt: Date.now(), sessionId: session.id, kind: session.kind, file, offset: fs.statSync(file).size, pane, hash: hash(text), key, receiptId: receiptId(text, key), retainReceipt };
     const temp = journal + '.tmp';
@@ -128,6 +175,7 @@ function statusForText(directory, text, key) {
   for (const file of files.filter((f) => f.endsWith('.json'))) {
     const entry = JSON.parse(fs.readFileSync(path.join(directory, file), 'utf8'));
     if (key ? entry.key !== key : entry.hash !== hash(text)) continue;
+    if (cancelled(entry, directory)) return { sessionId: entry.sessionId, kind: entry.kind, received: false, pending: false, cancelled: true };
     const confirmed = received(entry);
     if (confirmed && entry.retainReceipt) {
       saveReceipt(directory, entry);
@@ -147,9 +195,27 @@ function pendingForSession(directory, sessionId) {
   let entry;
   try { entry = JSON.parse(fs.readFileSync(journal, 'utf8')); }
   catch (e) { if (e.code === 'ENOENT') return false; throw e; }
-  if (!received(entry)) return true;
-  saveReceipt(directory, entry);
+  const wasCancelled = cancelled(entry, directory);
+  if (!wasCancelled && !received(entry)) return true;
+  if (!wasCancelled) saveReceipt(directory, entry);
   fs.unlinkSync(journal);
   return false;
 }
-module.exports = { deliver, received, userText, statusForText, acknowledge, pendingForSession };
+
+// Call under the daemon's injection lock, just like normal delivery recovery.
+// Corrupt/unreadable attempts remain for the health watchdog to report.
+function reconcile(directory) {
+  let files;
+  try { files = fs.readdirSync(directory).filter(name => name.endsWith('.json')); }
+  catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+  const settled = [];
+  for (const name of files) {
+    try {
+      const entry = JSON.parse(fs.readFileSync(path.join(directory, name), 'utf8'));
+      if (name !== hash(entry.sessionId) + '.json') continue;
+      if (!pendingForSession(directory, entry.sessionId)) settled.push(entry.sessionId);
+    } catch {} // Read-only health inspection still exposes the unresolved record.
+  }
+  return settled;
+}
+module.exports = { deliver, received, cancelled, reconcile, userText, statusForText, acknowledge, pendingForSession };
