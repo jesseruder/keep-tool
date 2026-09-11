@@ -3032,6 +3032,10 @@ function logAutoCompactDecision(candidate, stamp) {
   const context = Math.round(candidate.contextTokens / 1000);
   const model = normalizedText(stamp.model);
   const via = normalizedText(stamp.via) || 'none';
+  if (stamp.result === 'skipped') {
+    process.stderr.write(`keep serve: auto-compact skipped ${sid}: ${normalizedText(stamp.reason).slice(0, 300)}\n`);
+    return;
+  }
   if (stamp.result === 'would') {
     process.stderr.write(`keep serve: auto-compact would compact ${sid} ${title} idle ${idle}m ctx ${context}k model ${model} via ${via}\n`);
     return;
@@ -3057,8 +3061,8 @@ function recordCompactRestoreHealth(summary) {
   });
 }
 
-async function autoCompactTick() {
-  recordCompactRestoreHealth(await sweepPendingCompactSwaps());
+async function autoCompactTick(deps = {}) {
+  recordCompactRestoreHealth(await (deps.sweepPendingCompactSwaps || sweepPendingCompactSwaps)());
   const mode = envString('KEEP_AUTO_COMPACT', 'off').toLowerCase();
   if (!['dry', 'on'].includes(mode)) return { ok: true, detail: 'nothing due' };
   const now = Date.now();
@@ -3068,11 +3072,18 @@ async function autoCompactTick() {
     minTokens: envNumber('KEEP_AUTO_COMPACT_MIN_TOKENS', 100000),
     models: compactModelFamilies(),
   };
-  gcAutoCompactStamps(now);
-  const stamps = readAutoCompactStamps();
-  const cheap = scanSessions().filter((session) => autoCompactIdleMs(session, stamps, now, opts) !== null);
+  (deps.gcAutoCompactStamps || gcAutoCompactStamps)(now);
+  const stamps = (deps.readAutoCompactStamps || readAutoCompactStamps)();
+  // Transcript-derived `exited` only observes explicit exit commands, not process
+  // death. Keep live host state here rather than in the cached transcript record.
+  const panes = await (deps.listHostPanes || listHostPanes)({}, true);
+  const liveIds = new Set([...hostPanesBySession(panes).entries()]
+    .filter(([, pane]) => pane.alive && pane.agentAlive !== false)
+    .map(([id]) => id));
+  const cheap = (deps.scanSessions || scanSessions)().filter((session) =>
+    liveIds.has(session.id) && autoCompactIdleMs(session, stamps, now, opts) !== null);
   const candidates = autoCompactCandidates(
-    cheap.map((session) => ({ ...session, ...sessionLastTurn(session) })),
+    cheap.map((session) => ({ ...session, ...(deps.sessionLastTurn || sessionLastTurn)(session) })),
     stamps,
     now,
     opts,
@@ -3088,14 +3099,14 @@ async function autoCompactTick() {
     const started = Date.now();
     let phase = 'lock';
     try {
-      const compacted = await withInjectionLock(async () => {
+      const compacted = await (deps.withInjectionLock || withInjectionLock)(async () => {
         phase = 'resolve';
-        const session = loadCurrentSession(candidate.session.id);
+        const session = (deps.loadCurrentSession || loadCurrentSession)(candidate.session.id);
         if (session.mtime !== candidate.session.mtime || autoCompactIdleMs(session, stamps, Date.now(), opts) === null) {
           phase = 'eligibility';
           throw new InjectionError(409, 'session changed or left the eligible cold idle window');
         }
-        const target = await resolveSessionTarget(session, null);
+        const target = await (deps.resolveSessionTarget || resolveSessionTarget)(session, null);
         // A busy pane is another sender, not a busy session: stay in the lock phase.
         phase = 'lock';
         claimInjectionTarget(target);
@@ -3115,7 +3126,8 @@ async function autoCompactTick() {
         process.stderr.write(`keep serve: auto-compact skipped ${String(candidate.session.id).slice(0, 8)} this tick: ${reason}\n`);
         return { ok: true, detail: 'nothing due' };
       }
-      if (phase === 'precheck' || phase === 'eligibility') result = 'busy';
+      if (phase === 'resolve' && e instanceof InjectionError && e.status === 404 && e.extra.notLive) result = 'skipped';
+      else if (phase === 'precheck' || phase === 'eligibility') result = 'busy';
       else if (phase === 'resolve') result = 'unmatched';
       else result = 'error';
     }
@@ -3137,14 +3149,14 @@ async function autoCompactTick() {
   if (reason) stamp.reason = reason.slice(0, 500);
   let decisionError = null;
   try {
-    writeAutoCompactDecision(stamp);
+    (deps.writeAutoCompactDecision || writeAutoCompactDecision)(stamp);
   } catch (e) {
     decisionError = e;
     process.stderr.write(`keep serve: could not save auto-compact decision for ${String(stamp.sessionId).slice(0, 8)}: ${e.message}\n`);
   }
-  logAutoCompactDecision(candidate, stamp);
-  const ok = ['would', 'compacted', 'busy'].includes(result);
-  return { ok: ok && !decisionError, detail: decisionError ? 'decision write failed' : result, error: decisionError || (ok ? '' : reason || result) };
+  (deps.logAutoCompactDecision || logAutoCompactDecision)(candidate, stamp);
+  const ok = ['would', 'compacted', 'busy', 'skipped'].includes(result);
+  return { ok: ok && !decisionError, detail: decisionError ? 'decision write failed' : result === 'skipped' ? 'nothing due' : result, error: decisionError || (ok ? '' : reason || result) };
 }
 
 function startAutoCompact() {
@@ -5621,6 +5633,7 @@ module.exports = {
   autoCompactIdleMs,
   autoCompactCandidates,
   autoCompactOutcome,
+  autoCompactTick,
   compactSession,
   compactSwapPlan,
   ensureCompactionRestored,

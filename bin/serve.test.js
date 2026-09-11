@@ -28,6 +28,7 @@ const {
   autoCompactIdleMs,
   autoCompactCandidates,
   autoCompactOutcome,
+  autoCompactTick,
   compactSession,
   compactSwapPlan,
   ensureCompactionRestored,
@@ -1443,6 +1444,93 @@ test('auto-compact candidates are cold, large, safe Claude sessions ordered by c
     autoCompactCandidates([opus], {}, now, { ...opts, models: ['fable', 'opus'] }).map((candidate) => candidate.session.id),
     ['opus'],
   );
+});
+
+test('auto-compact tick filters dead panes before reading context or spending a tick', async (t) => {
+  const previous = process.env.KEEP_AUTO_COMPACT;
+  process.env.KEEP_AUTO_COMPACT = 'dry';
+  t.after(() => {
+    if (previous === undefined) delete process.env.KEEP_AUTO_COMPACT;
+    else process.env.KEEP_AUTO_COMPACT = previous;
+  });
+  const sessions = ['missing', 'exited', 'agent-exited', 'live'].map((id) => ({
+    id, kind: 'claude', endedTurn: true, mtime: Date.now() - 2 * 60 * 60e3,
+  }));
+  const reads = [];
+  const decisions = [];
+  let paneReads = 0;
+  const deps = {
+    sweepPendingCompactSwaps: async () => ({ checked: 0 }),
+    gcAutoCompactStamps: () => {},
+    readAutoCompactStamps: () => ({}),
+    scanSessions: () => sessions,
+    listHostPanes: async () => {
+      paneReads++;
+      return [
+        { alive: false, meta: { sessionId: 'exited' } },
+        { alive: true, agentAlive: false, meta: { sessionId: 'agent-exited' } },
+        { alive: false, meta: { sessionId: 'live' } },
+        { alive: true, meta: { sessionId: 'live' } },
+      ];
+    },
+    sessionLastTurn: (session) => {
+      reads.push(session.id);
+      return { contextTokens: session.id === 'live' ? 140000 : 428000, model: 'claude-fable-5-1' };
+    },
+    writeAutoCompactDecision: (stamp) => decisions.push(stamp),
+    logAutoCompactDecision: () => {},
+  };
+  assert.equal((await autoCompactTick(deps)).ok, true);
+  assert.equal(paneReads, 1);
+  assert.deepEqual(reads, ['live']);
+  assert.deepEqual(decisions.map((stamp) => stamp.sessionId), ['live']);
+  sessions.pop();
+  assert.deepEqual(await autoCompactTick(deps), { ok: true, detail: 'nothing due' });
+  assert.equal(decisions.length, 1);
+});
+
+test('auto-compact resolve-time pane exit is stamped and skipped, while other resolve errors fail', async (t) => {
+  const previous = process.env.KEEP_AUTO_COMPACT;
+  process.env.KEEP_AUTO_COMPACT = 'on';
+  t.after(() => {
+    if (previous === undefined) delete process.env.KEEP_AUTO_COMPACT;
+    else process.env.KEEP_AUTO_COMPACT = previous;
+  });
+  const session = { id: 'live', kind: 'claude', endedTurn: true, mtime: Date.now() - 2 * 60 * 60e3 };
+  const stamps = {};
+  let failure = new InjectionError(404, 'live has no live host pane', { notLive: true });
+  let resolves = 0;
+  const deps = {
+    sweepPendingCompactSwaps: async () => ({ checked: 0 }),
+    gcAutoCompactStamps: () => {},
+    readAutoCompactStamps: () => stamps,
+    scanSessions: () => [session],
+    listHostPanes: async () => [{ alive: true, meta: { sessionId: session.id } }],
+    sessionLastTurn: () => ({ contextTokens: 140000, model: 'claude-fable-5-1' }),
+    withInjectionLock: async (fn) => fn(),
+    loadCurrentSession: () => session,
+    resolveSessionTarget: async () => { resolves++; throw failure; },
+    writeAutoCompactDecision: (stamp) => { stamps[stamp.sessionId] = stamp; },
+    logAutoCompactDecision: () => {},
+  };
+  const outcome = await autoCompactTick(deps);
+  assert.equal(outcome.ok, true);
+  assert.equal(outcome.detail, 'nothing due');
+  assert.equal(stamps.live.result, 'skipped');
+  assert.equal(stamps.live.reason, failure.message);
+  assert.equal(stamps.live.mtime, session.mtime);
+  assert.deepEqual(await autoCompactTick(deps), { ok: true, detail: 'nothing due' });
+  assert.equal(resolves, 1);
+  delete stamps.live;
+  failure = new InjectionError(404, 'no session transcript');
+  assert.equal((await autoCompactTick(deps)).ok, false);
+  assert.equal(stamps.live.result, 'unmatched');
+  delete stamps.live;
+  failure = new InjectionError(404, 'live has no live host pane', { notLive: true });
+  deps.writeAutoCompactDecision = () => { throw new Error('disk full'); };
+  const writeFailure = await autoCompactTick(deps);
+  assert.equal(writeFailure.ok, false);
+  assert.equal(writeFailure.detail, 'decision write failed');
 });
 
 test('auto-compact idle eligibility treats waiting as idle but real prompts as blocking', () => {
