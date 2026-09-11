@@ -453,11 +453,17 @@ function KeepApp() {
     return session ? { ...sessionItem(selection.kind || 'recent', session), _task: (data.tasks || []).find((task) => task.id === session.taskId) } : selection;
   }, [data, pinned, recent, selection, waiting]);
 
+  const selectedDetailReady = useMemo(() => {
+    if (!selection?.sessionId) return true;
+    if (data.view !== 'session' || data.id !== selection.sessionId) return false;
+    if (!ACTIONABLE_SELECTION_KINDS.has(selection.kind)) return true;
+    return (data.attention || []).some((item) => item.sessionId === selection.sessionId && item.kind === selection.kind);
+  }, [data.attention, data.id, data.view, selection?.kind, selection?.sessionId]);
+
   useEffect(() => {
     if (data.view !== 'session' || data.id !== selection?.sessionId || !ACTIONABLE_SELECTION_KINDS.has(selection?.kind)) return;
-    const stillPresent = (data.attention || []).some((item) => item.sessionId === selection.sessionId && item.kind === selection.kind);
-    if (!stillPresent) setSelection(null);
-  }, [data.attention, data.id, data.view, selection?.kind, selection?.sessionId]);
+    if (!selectedDetailReady) setSelection(null);
+  }, [data.id, data.view, selectedDetailReady, selection?.kind, selection?.sessionId]);
 
   const advance = useCallback((item) => {
     handledRef.current.add(snoozeId(item));
@@ -710,7 +716,7 @@ function KeepApp() {
           <Session
             config={config}
             data={data}
-            detailLoading={Boolean(selection?.sessionId && !(data.view === 'session' && data.id === selection.sessionId))}
+            detailLoading={!selectedDetailReady}
             item={selectedItem}
             onAnswer={answerItem}
             onBack={() => setSelection(null)}
