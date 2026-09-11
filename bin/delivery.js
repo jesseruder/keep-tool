@@ -39,7 +39,7 @@ function received(entry) {
           // Claude can accept input into its queue without ever writing a user
           // message (including when it absorbs the input into the current turn).
           if (entry.kind === 'claude' && !record.isSidechain) {
-            const queuedText = record.type === 'queue-operation' && record.operation === 'enqueue' ? record.content
+            const queuedText = record.type === 'queue-operation' && (!record.operation || record.operation === 'enqueue') ? record.content
               : record.type === 'attachment' && record.attachment?.type === 'queued_command' ? record.attachment.prompt : null;
             if (typeof queuedText === 'string' && hash(queuedText) === entry.hash) return true;
           }

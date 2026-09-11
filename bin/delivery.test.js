@@ -6,7 +6,7 @@ const os = require('os');
 const path = require('path');
 const { deliver, userText } = require('./delivery');
 
-for (const mode of ['absorbed mid-turn', 'enqueue', 'attachment', 'different attachment', 'different enqueue', 'remove only', 'before offset']) {
+for (const mode of ['absorbed mid-turn', 'enqueue', 'legacy enqueue', 'attachment', 'different attachment', 'different enqueue', 'remove only', 'before offset']) {
   test(`Claude queued delivery receipt: ${mode}`, async () => {
     const { received, reconcile, statusForText } = require('./delivery');
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-queued-delivery-'));
@@ -27,12 +27,13 @@ for (const mode of ['absorbed mid-turn', 'enqueue', 'attachment', 'different att
       const records = {
         'absorbed mid-turn': [enqueue, attachment, remove],
         enqueue: [enqueue], attachment: [attachment],
+        'legacy enqueue': [{ type: 'queue-operation', content: enqueue.content }],
         'different attachment': [{ ...attachment, attachment: { ...attachment.attachment, prompt: 'different text' } }],
         'different enqueue': [{ ...enqueue, content: 'different text' }],
         'remove only': [remove], 'before offset': [],
       };
       append(records[mode]);
-      const expected = ['absorbed mid-turn', 'enqueue', 'attachment'].includes(mode);
+      const expected = ['absorbed mid-turn', 'enqueue', 'legacy enqueue', 'attachment'].includes(mode);
       assert.equal(received(entry), expected);
       assert.deepEqual(reconcile(directory), expected ? ['s'] : []);
       assert.equal(fs.existsSync(journal), !expected);
