@@ -24,10 +24,11 @@ test('isolated browser: alert inbox, read persistence, card links and desktop cl
   const inboxRoot = path.join(profile, 'inbox');
   state.tasks[0].body = 'Card notes';
   state.tasks[0].fm.title = 'Investigate reviewer finding';
+  state.tasks.push({ id: 'idea-one', fm: { kind: 'idea', title: 'Reviewer idea: Preserve <card> notes', status: 'active', tags: ['reviewer-idea'] }, body: 'Full idea notes, including the proposed workflow.' });
   const alert = { id: 'a-one', at: Date.now(), text: '<img src=x onerror=alert(1)> Reviewer finding', level: 'attention', from: 'Reviewer', caller: 'reviewer', card: 'card-a', desktop: true, presence: { state: 'present' } };
   appendAlert(alert, inboxRoot);
   appendAlert({ ...alert, id: 'a-two', at: Date.now() - 1000, text: 'Deferred result', deferred: true }, inboxRoot);
-  appendAlert({ ...alert, id: 'a-three', at: Date.now() - 3600000, text: 'Older result' }, inboxRoot);
+  appendAlert({ ...alert, id: 'a-idea', at: Date.now() - 3600000, text: 'Reviewer idea: Preserve <card> notes — a truncated proposal that must not repeat', caller: 'reviewer-idea', card: 'idea-one' }, inboxRoot);
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://fixture');
     if (req.method === 'POST') posts.push(url.pathname);
@@ -105,14 +106,21 @@ test('isolated browser: alert inbox, read persistence, card links and desktop cl
     assert.ok(await evaluate("document.querySelector('#notificationsPanel').open"), 'empty space inside keeps the panel open');
     assert.equal(await evaluate("document.querySelector('.notification-text').textContent"), '<img src=x onerror=alert(1)> Reviewer finding');
     assert.equal(await evaluate("document.querySelectorAll('.notification-list img').length"), 0, 'alert text is escaped');
+    assert.equal(await evaluate("document.querySelector('[data-id=a-idea] .notification-text').textContent"), 'Reviewer idea: Preserve <card> notes — a truncated proposal that must not repeat', 'collapsed reviewer ideas preserve their proposal preview');
+    assert.equal(await evaluate("document.querySelectorAll('[data-id=a-idea] .notification-card').length"), 0, 'reviewer ideas do not repeat the linked card title');
+    await evaluate("document.querySelector('[data-select=a-idea]').click()");
+    await wait("document.querySelector('[data-id=a-idea].selected .notification-detail pre').textContent.includes('Full idea notes')");
+    assert.equal(await evaluate("document.querySelector('[data-id=a-idea].selected .notification-text').textContent"), 'Reviewer idea: Preserve <card> notes', 'expanded reviewer ideas replace the truncated proposal with one title');
+    assert.equal(await evaluate("document.querySelectorAll('[data-id=a-idea].selected .notification-detail > b').length"), 0, 'expanded reviewer ideas do not repeat their title in the card detail');
     await evaluate("document.querySelector('[data-select=\"a-one\"]').focus(); document.querySelector('[data-select=\"a-one\"]').click()");
-    await wait("document.querySelector('.notification-count')?.textContent === '2'");
+    await wait("document.querySelector('.notification-count')?.textContent === '1'");
     assert.ok(await evaluate("document.querySelector('.notification-detail').textContent.includes('Card notes')"));
+    assert.equal(await evaluate("document.querySelector('[data-id=a-idea] .notification-text').textContent"), 'Reviewer idea: Preserve <card> notes — a truncated proposal that must not repeat', 'selecting another alert restores the reviewer idea preview');
     assert.equal(await evaluate("document.activeElement.dataset.select"), 'a-one', 'reading preserves focus in the dialog');
     await evaluate("document.querySelector('[data-session=\"a\"]').click()");
     await wait("!document.querySelector('#notificationsPanel').open && document.querySelector('#stage').dataset.itemKey === 'a'");
     await evaluate("document.querySelector('#notificationsButton').click(); document.querySelector('[data-filter=unread]').click()");
-    assert.equal(await evaluate("document.querySelectorAll('.notification-item').length"), 2);
+    assert.equal(await evaluate("document.querySelectorAll('.notification-item').length"), 1);
     await evaluate("document.querySelector('[data-mark-all]').click()");
     await wait("document.querySelector('.notification-count')?.textContent === ''");
     assert.ok(await evaluate("document.querySelector('.notification-list').textContent.includes('caught up')"));

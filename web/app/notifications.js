@@ -59,18 +59,21 @@ export function installNotifications({ reload, toast, openSession, openReviewer 
       const task = (data.tasks || []).find((task) => task.id === entry.card);
       const session = (data.sessions || []).find((session) => session.taskId === entry.card && !session.reviewer);
       const expanded = selected === entry.id;
+      // Reviewer ideas already put the card title at the start of their alert text.
+      // On expansion, use the linked card title and notes instead of repeating it.
+      const reviewerIdea = entry.caller === 'reviewer-idea' && task?.fm?.kind === 'idea';
       const date = new Date(entry.at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
       return `<article class="notification-item ${entry.read ? '' : 'unread'} ${expanded ? 'selected' : ''}" data-id="${esc(entry.id)}">
         <button class="notification-message" data-select="${esc(entry.id)}" aria-expanded="${expanded}">
           <span class="notification-meta"><b>${esc(entry.from === 'manual' ? 'Keep' : entry.from || 'Keep')}</b><time>${esc(date)}</time>${entry.level === 'urgent' ? '<strong>Urgent</strong>' : ''}${!entry.read ? '<span class="notification-unread" aria-label="Unread"></span>' : ''}</span>
-          <span class="notification-text">${esc(entry.text)}</span>
-          ${entry.card ? `<span class="notification-card">${esc(task?.fm?.title || entry.card)}</span>` : ''}
+          <span class="notification-text">${esc(reviewerIdea && expanded ? task.fm.title : entry.text)}</span>
+          ${entry.card && !reviewerIdea ? `<span class="notification-card">${esc(task?.fm?.title || entry.card)}</span>` : ''}
         </button>
         <div class="notification-actions"><button class="btn" data-read="${esc(entry.id)}" data-action="${entry.read ? 'unread' : 'read'}">Mark ${entry.read ? 'unread' : 'read'}</button>
           ${session ? `<button class="btn" data-session="${esc(session.id)}">Open session</button>` : ''}
           ${entry.caller === 'reviewer' ? '<button class="btn" data-reviewer>Open reviewer</button>' : ''}
         </div>
-        ${expanded && entry.card ? `<div class="notification-detail">${task ? `<b>${esc(task.fm?.title || task.id)}</b><span class="muted">${esc(task.fm?.status || '')}</span><pre>${esc(task.body || 'No card notes yet.')}</pre>` : '<p>This card is no longer in the active task list.</p>'}</div>` : ''}
+        ${expanded && entry.card ? `<div class="notification-detail">${task ? `${reviewerIdea ? '' : `<b>${esc(task.fm?.title || task.id)}</b>`}<span class="muted">${esc(task.fm?.status || '')}</span><pre>${esc(task.body || 'No card notes yet.')}</pre>` : '<p>This card is no longer in the active task list.</p>'}</div>` : ''}
       </article>`;
     }).join('') : `<div class="qempty"><b>${filter === 'unread' ? 'You’re caught up' : 'No notifications yet'}</b>Reviewer findings, results, and agent heads-ups appear here.<br>Session questions stay in Waiting on you.</div>`;
     if (focused) {
