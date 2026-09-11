@@ -74,6 +74,7 @@ const {
   typeAndSubmit,
   resolveSessionTarget,
   screenSession,
+  screenHistorySession,
   sendSessionKeys,
   shellPaneTarget,
   writeToShellPane,
@@ -86,6 +87,7 @@ const {
   isInjectionBusy,
   InjectionError,
 } = require('./serve.js');
+const { createScreenHistoryCache } = require('./screen-history.js');
 
 function record(type, content) {
   return JSON.stringify({ type, message: { content } });
@@ -2674,6 +2676,63 @@ test('screen session returns plain pane lines and terminal metadata', async () =
     cursor: { x: 7, y: 3 },
     alt: true,
   });
+});
+
+test('screen history takes one stable full host snapshot and returns bounded older pages', async () => {
+  const id = 'abcdef12-0000-4000-8000-000000000001';
+  const history = Array.from({ length: 450 }, (_, index) => `old-${index}`);
+  const tail = Array.from({ length: 40 }, (_, index) => `live-${index}`);
+  const host = recordingHost((type, params) => {
+    if (type === 'get') return { pane: { id: 'pane-screen', pid: 42, createdAt: '2026-09-10T00:00:00Z' } };
+    if (type === 'screen') {
+      assert.deepEqual(params, { pane: 'pane-screen', lines: 120, scrollback: 10000 });
+      return { lines: [...history, ...tail], cols: 120, rows: 40, title: 'history', alt: false };
+    }
+    return {};
+  });
+  const cache = createScreenHistoryCache({ makeId: () => 'stable' });
+  const deps = {
+    scanSessions: () => [{ id, kind: 'claude' }],
+    resolveSessionTarget: async () => ({ pane: 'pane-screen' }),
+    screenHistoryCache: cache,
+    host,
+  };
+
+  const first = await screenHistorySession({ session: 'abcdef12', lines: '200', tailLines: '120' }, deps);
+  assert.deepEqual(first.lines, history.slice(250));
+  assert.deepEqual(first.tail, tail);
+  assert.equal(first.start, 250);
+  assert.equal(first.tailStart, 450);
+  assert.equal(first.cursor, 'stable.250');
+  assert.equal(first.exhausted, false);
+  assert.equal(first.sessionId, id);
+  assert.equal(first.pane, 'pane-screen');
+
+  const second = await screenHistorySession({ session: 'abcdef12', cursor: first.cursor, lines: '200' }, deps);
+  assert.deepEqual(second.lines, history.slice(50, 250));
+  assert.equal(second.cursor, 'stable.50');
+  assert.equal(host.calls.filter((call) => call.type === 'screen').length, 1,
+    'later pages must reuse the frozen daemon snapshot');
+});
+
+test('screen history supports a bare shell and an alternate buffer with no scrollback', async () => {
+  const cache = createScreenHistoryCache({ makeId: () => 'alternate' });
+  const result = await screenHistorySession({ pane: 'pane-shell', lines: '200' }, {
+    shellPaneTarget: async (pane) => ({ pane }),
+    paneIncarnation: async () => 'pane-shell:7:created',
+    readHistoryScreen: async (target, tailLines) => {
+      assert.deepEqual(target, { pane: 'pane-shell' });
+      assert.equal(tailLines, 120);
+      return { lines: ['vim'], cols: 80, rows: 24, title: 'vim', alt: true };
+    },
+    screenHistoryCache: cache,
+    scanSessions: () => assert.fail('shell history must not scan sessions'),
+  });
+  assert.deepEqual(result.lines, []);
+  assert.deepEqual(result.tail, ['vim']);
+  assert.equal(result.exhausted, true);
+  assert.equal(result.alt, true);
+  assert.equal(result.sessionId, null);
 });
 
 test('screen session returns no-host-pane for a session without a pane', async () => {

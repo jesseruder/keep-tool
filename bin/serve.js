@@ -36,6 +36,7 @@ const keepConsole = require('./console.js');
 const sessionStatus = require('./session-status.js');
 const { sendStateJson } = require('./state-response.js');
 const { MOBILE_VIEWS, projectMobileState } = require('./mobile-state.js');
+const { createScreenHistoryCache } = require('./screen-history.js');
 
 const PORT = parseInt(process.env.KEEP_PORT || '7777', 10);
 const { PROJECTS_DIR, TAIL_BYTES, textOf, readTranscriptTail, findSessionFile } = transcripts;
@@ -60,6 +61,9 @@ const CODEX_DIALOG_MARKERS = [
 const SUGGESTION_PROBE_KEY = ',';
 const SUGGESTION_PROBE_WAIT_MS = 150;
 const SUGGESTION_PROBE_MAX_MS = 2000;
+const SCREEN_HISTORY_LINES = 200;
+const SCREEN_HISTORY_SCROLLBACK = 10000;
+const screenHistoryCache = createScreenHistoryCache();
 // A frozen or non-advancing clock must not spin the poll loop forever.
 const SUGGESTION_PROBE_MAX_READS = Math.ceil(SUGGESTION_PROBE_MAX_MS / SUGGESTION_PROBE_WAIT_MS) + 1;
 
@@ -261,7 +265,7 @@ async function sessionSummarySnapshot(deps = {}) {
   if (!live.length) return { sessions: [], panes };
   // Use the same marker-enriched classification as Triage. Raw transcript
   // lookups omit permission notifications that can arrive in the middle of a turn.
-  const state = (deps.buildState || buildState)({ hostPanes: panes });
+  const state = (deps.buildState || buildState)({ hostPanes: panes, dashboard: true });
   return { sessions: state.sessions, panes };
 }
 const WEEKLY_INSTRUCTION = "Summarize what this solo developer completed in the last week. Group related work into 3-6 themed bullets and note anything notable that shipped. Be specific; output only the summary.";
@@ -2138,6 +2142,13 @@ function sessionLinesLimit(value) {
   return Math.min(number, 400);
 }
 
+function historyLinesLimit(value) {
+  if (value == null || value === '') return SCREEN_HISTORY_LINES;
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 1) throw new InjectionError(400, 'bad history lines');
+  return Math.min(number, SCREEN_HISTORY_LINES);
+}
+
 // A shell pane has no session and no transcript, so the phone addresses it by pane id.
 // Only a live pane the console itself spawned as a shell is reachable this way: an agent
 // pane still goes through its session, where the injection safety checks live.
@@ -2195,6 +2206,88 @@ async function screenSession(query, deps = {}) {
   }
   if (screen && typeof screen.alt === 'boolean') result.alt = screen.alt;
   return result;
+}
+
+async function paneIncarnation(target, deps = {}) {
+  let result;
+  try { result = await hostRequest('get', { pane: target.pane }, deps); }
+  catch { throw new InjectionError(409, 'terminal pane changed; return to Live and load history again'); }
+  const pane = result && result.pane;
+  if (!pane || pane.id !== target.pane || !pane.createdAt) {
+    throw new InjectionError(409, 'terminal pane changed; return to Live and load history again');
+  }
+  return `${pane.id}:${pane.pid || ''}:${pane.createdAt}`;
+}
+
+async function screenHistorySession(query, deps = {}) {
+  const get = query && typeof query.get === 'function'
+    ? (name) => query.get(name)
+    : (name) => query && query[name];
+  const shellPane = get('session') ? null : get('pane');
+  const session = shellPane ? null : resolveSessionId(get('session'), deps);
+  let target;
+  try {
+    target = shellPane
+      ? await (deps.shellPaneTarget || shellPaneTarget)(shellPane, deps)
+      : await (deps.resolveSessionTarget || resolveSessionTarget)(session, null, deps);
+  } catch (error) {
+    if (error instanceof InjectionError && error.status === 404 && !shellPane) throw new InjectionError(404, 'no host pane');
+    throw error;
+  }
+
+  const pageSize = historyLinesLimit(get('lines'));
+  const cache = deps.screenHistoryCache || screenHistoryCache;
+  const readIncarnation = deps.paneIncarnation || paneIncarnation;
+  const incarnation = await readIncarnation(target, deps);
+  const key = `${session ? session.id : 'shell'}:${target.pane}:${incarnation}`;
+  const cursor = get('cursor');
+  if (cursor) {
+    const cached = cache.read(cursor, key, pageSize);
+    if (cached.error === 'target') {
+      throw new InjectionError(409, 'terminal target changed; return to Live and load history again');
+    }
+    if (cached.error) throw new InjectionError(410, 'history snapshot expired; return to Live and load again');
+    return cached;
+  }
+
+  const tailLines = sessionLinesLimit(get('tailLines') == null ? 120 : get('tailLines'));
+  const readHistoryScreen = deps.readHistoryScreen || ((resolved, tail, innerDeps) => hostRequest('screen', {
+    pane: resolved.pane,
+    lines: tail,
+    scrollback: SCREEN_HISTORY_SCROLLBACK,
+  }, innerDeps));
+  const screen = await readHistoryScreen(target, tailLines, deps);
+  const confirmedIncarnation = await readIncarnation(target, deps);
+  if (confirmedIncarnation !== incarnation) {
+    throw new InjectionError(409, 'terminal pane changed; return to Live and load history again');
+  }
+  const rawLines = Array.isArray(screen && screen.lines)
+    ? screen.lines
+    : String(screen && screen.text || '').split('\n');
+  const cleanLines = rawLines.map(stripTerminalAnsi);
+  const viewportRows = Math.max(0, Math.floor(Number(screen && screen.rows) || tailLines));
+  const tailCount = Math.min(tailLines, viewportRows, cleanLines.length);
+  const splitAt = cleanLines.length - tailCount;
+  const meta = {
+    ok: true,
+    sessionId: session ? session.id : null,
+    pane: target.pane,
+    cols: screen && screen.cols,
+    rows: screen && screen.rows,
+    title: String(screen && screen.title || ''),
+  };
+  if (screen && typeof screen.alt === 'boolean') meta.alt = screen.alt;
+  try {
+    return cache.create({
+      key,
+      lines: cleanLines.slice(0, splitAt),
+      tail: cleanLines.slice(splitAt),
+      meta,
+    }, pageSize);
+  } catch (error) {
+    if (error instanceof RangeError) throw new InjectionError(413, error.message);
+    throw error;
+  }
 }
 
 const SESSION_KEY_BYTES = Object.freeze({
@@ -4948,6 +5041,15 @@ function start(deps = {}) {
         }
       }
 
+      if (req.method === 'GET' && url.pathname === '/api/screen/history') {
+        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
+        try { return json(res, 200, await screenHistorySession(url.searchParams)); }
+        catch (error) {
+          if (error instanceof InjectionError) return json(res, error.status, { error: error.message });
+          throw error;
+        }
+      }
+
       if (req.method === 'GET' && url.pathname === '/api/tagsummary') {
         const tag = url.searchParams.get('tag') || '';
         if (!/^[a-z0-9-]+$/.test(tag)) return json(res, 400, { error: 'bad tag' });
@@ -5310,7 +5412,7 @@ module.exports = {
   pressTargetKey,
   typeAndSubmit,
   resolveSessionTarget,
-  resolveSessionId, screenSession, sendSessionKeys, shellPaneTarget, stripTerminalAnsi, writeToShellPane,
+  resolveSessionId, screenSession, screenHistorySession, sendSessionKeys, shellPaneTarget, stripTerminalAnsi, writeToShellPane,
   agentProcessRows, liveSessionPids, liveSessionTick, restorePlan,
   annotatePaneAgents,
   readPaneRecord, sessionProjectFromTranscript, openSession,

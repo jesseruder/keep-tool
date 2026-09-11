@@ -1,5 +1,6 @@
 import { configureProjects } from './model';
 const { createStateCache, normalizeServer } = require('./state-cache');
+const { screenHistoryPath } = require('./screen-history');
 const stateCache = createStateCache();
 export { normalizeServer };
 
@@ -75,6 +76,11 @@ export const screen = (config, target, lines = 60, signal) => request(
     ? `/api/screen?pane=${encodeURIComponent(target.pane)}&lines=${encodeURIComponent(lines)}`
     : `/api/screen?session=${encodeURIComponent(target.sessionId)}&lines=${encodeURIComponent(lines)}`,
   { signal, timeoutMs: 5000 },
+);
+export const screenHistory = (config, target, options = {}, signal) => request(
+  config,
+  screenHistoryPath(target, options),
+  { signal, timeoutMs: 10000 },
 );
 export const keys = (config, target, names) => request(config, '/api/keys', {
   method: 'POST', body: { ...target, keys: names },

@@ -13,9 +13,11 @@ import {
 import * as api from '../api';
 import { projectFor } from '../model';
 import { mono } from '../ui';
+const { applyScreenHistoryPage, emptyScreenHistory, visibleScreenRows } = require('../screen-history');
 
 const POLL_MS = 1500;
 const SCREEN_LINES = 120;
+const HISTORY_LINES = 200;
 const REPEAT_MS = 120;
 const CELL_WIDTH_EM = 0.6;
 const BODY_PADDING = 10;
@@ -48,6 +50,13 @@ function makeScreenStyles(colors) {
     terminalContent: { padding: BODY_PADDING },
     terminalLine: { color: colors.termFg, fontFamily: mono, includeFontPadding: false },
     cursor: { backgroundColor: colors.termFg, color: colors.termBg },
+    historyBar: { alignItems: 'center', flexDirection: 'row', gap: 9, minHeight: 34, paddingBottom: 7 },
+    historyButton: { backgroundColor: colors.barSel, borderColor: colors.termLine, borderRadius: 5, borderWidth: 1, minHeight: 28, justifyContent: 'center', paddingHorizontal: 10 },
+    historyButtonDisabled: { opacity: 0.52 },
+    historyButtonPressed: { opacity: 0.72 },
+    historyButtonText: { color: colors.info, fontFamily: mono, fontSize: 10, fontWeight: '700' },
+    historyStatus: { color: colors.termDim, flexShrink: 1, fontFamily: mono, fontSize: 10 },
+    historyError: { color: colors.bad, fontFamily: mono, fontSize: 10, paddingBottom: 7 },
     empty: { alignItems: 'center', flex: 1, justifyContent: 'center', padding: 24 },
     emptyText: { color: colors.termDim, fontFamily: mono, fontSize: 12, lineHeight: 18, textAlign: 'center' },
     // The key row is an accessory bar, not a toolbar: keep it thin so the terminal
@@ -134,7 +143,13 @@ export default function Screen({ colors, config, onBack, pane, project: projectP
   const [keyBusy, setKeyBusy] = useState(false);
   const [inputBusy, setInputBusy] = useState(false);
   const [toast, setToast] = useState('');
+  const [history, setHistory] = useState(emptyScreenHistory);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState('');
   const keyBusyRef = useRef(false);
+  const historyRef = useRef(history);
+  const historyBusyRef = useRef(false);
+  const historyRequestRef = useRef(null);
   const mountedRef = useRef(true);
   const toastTimer = useRef(null);
 
@@ -148,8 +163,21 @@ export default function Screen({ colors, config, onBack, pane, project: projectP
 
   useEffect(() => () => {
     mountedRef.current = false;
+    if (historyRequestRef.current) historyRequestRef.current.abort();
     if (toastTimer.current) clearTimeout(toastTimer.current);
   }, []);
+
+  useEffect(() => {
+    if (historyRequestRef.current) historyRequestRef.current.abort();
+    historyRequestRef.current = null;
+    historyBusyRef.current = false;
+    const empty = emptyScreenHistory();
+    historyRef.current = empty;
+    setHistory(empty);
+    setHistoryLoading(false);
+    setHistoryError('');
+    setFrame(null);
+  }, [target]);
 
   useEffect(() => {
     let mounted = true;
@@ -189,14 +217,17 @@ export default function Screen({ colors, config, onBack, pane, project: projectP
       timer = setInterval(poll, POLL_MS);
     };
 
-    if (active) start();
+    if (active && !history.active) start();
     const subscription = AppState.addEventListener('change', (nextState) => {
       active = nextState === 'active';
-      if (active) start();
-      else if (timer) {
-        clearInterval(timer);
-        timer = null;
+      if (active && !history.active) start();
+      else if (!active) {
+        if (timer) {
+          clearInterval(timer);
+          timer = null;
+        }
         cancelPoll();
+        if (historyRequestRef.current) historyRequestRef.current.abort();
       }
     });
 
@@ -206,10 +237,54 @@ export default function Screen({ colors, config, onBack, pane, project: projectP
       cancelPoll();
       subscription.remove();
     };
+  }, [config, history.active, target]);
+
+  const loadHistory = useCallback(async () => {
+    const currentHistory = historyRef.current;
+    if (historyBusyRef.current || (currentHistory.active && currentHistory.exhausted)) return;
+    historyBusyRef.current = true;
+    setHistoryLoading(true);
+    setHistoryError('');
+    const controller = new AbortController();
+    historyRequestRef.current = controller;
+    const cursor = currentHistory.active ? currentHistory.cursor : null;
+    try {
+      const page = await api.screenHistory(config, target, {
+        lines: HISTORY_LINES,
+        cursor,
+        tailLines: SCREEN_LINES,
+      }, controller.signal);
+      if (mountedRef.current && historyRequestRef.current === controller) {
+        const nextHistory = applyScreenHistoryPage(historyRef.current, page);
+        historyRef.current = nextHistory;
+        setHistory(nextHistory);
+      }
+    } catch (error) {
+      if (!controller.signal.aborted && mountedRef.current && historyRequestRef.current === controller) {
+        setHistoryError(error.message || 'Could not load terminal history');
+      }
+    } finally {
+      if (historyRequestRef.current === controller) {
+        historyRequestRef.current = null;
+        historyBusyRef.current = false;
+        if (mountedRef.current) setHistoryLoading(false);
+      }
+    }
   }, [config, target]);
 
+  const returnLive = useCallback(() => {
+    if (historyRequestRef.current) historyRequestRef.current.abort();
+    historyRequestRef.current = null;
+    historyBusyRef.current = false;
+    setHistoryLoading(false);
+    setHistoryError('');
+    const empty = emptyScreenHistory();
+    historyRef.current = empty;
+    setHistory(empty);
+  }, []);
+
   const sendKey = useCallback(async (name) => {
-    if (keyBusyRef.current) return;
+    if (keyBusyRef.current || historyRef.current.active) return;
     keyBusyRef.current = true;
     setKeyBusy(true);
     try { await api.keys(config, target, [name]); }
@@ -221,7 +296,7 @@ export default function Screen({ colors, config, onBack, pane, project: projectP
   }, [config, showToast, target]);
 
   const submitInput = useCallback(async () => {
-    if (inputBusy || keyBusyRef.current) return;
+    if (inputBusy || keyBusyRef.current || historyRef.current.active) return;
     if (!draft.length) {
       await sendKey('Enter');
       return;
@@ -235,15 +310,17 @@ export default function Screen({ colors, config, onBack, pane, project: projectP
   }, [config, draft, inputBusy, sendKey, showToast, target]);
 
   const project = projectFor(session?.project || projectPath || '');
-  const title = frame?.title || session?.title || (sessionId ? 'untitled session' : 'shell');
-  const paneLabel = String(frame?.pane || session?.pane || pane || '—').slice(0, 8);
-  const cols = Number(frame?.cols) || 80;
-  const rows = Number(frame?.rows) || 24;
-  const lines = Array.isArray(frame?.lines) ? frame.lines : [];
+  const displayFrame = history.active ? history.frame : frame;
+  const title = displayFrame?.title || session?.title || (sessionId ? 'untitled session' : 'shell');
+  const paneLabel = String(displayFrame?.pane || session?.pane || pane || '—').slice(0, 8);
+  const cols = Number(displayFrame?.cols) || 80;
+  const rows = Number(displayFrame?.rows) || 24;
+  const liveLines = Array.isArray(frame?.lines) ? frame.lines : [];
+  const displayRows = visibleScreenRows(history, liveLines);
   const cursorRow = Math.floor(Number(frame?.cursor?.y));
-  const rowOffset = Math.max(0, rows - lines.length);
-  const cursor = frame?.cursor && Number.isFinite(cursorRow)
-    && cursorRow >= rowOffset && cursorRow < rowOffset + lines.length
+  const rowOffset = Math.max(0, rows - liveLines.length);
+  const cursor = !history.active && frame?.cursor && Number.isFinite(cursorRow)
+    && cursorRow >= rowOffset && cursorRow < rowOffset + liveLines.length
     ? { ...frame.cursor, y: cursorRow - rowOffset }
     : null;
   const usableWidth = Math.max(0, bodyWidth - BODY_PADDING * 2);
@@ -251,7 +328,7 @@ export default function Screen({ colors, config, onBack, pane, project: projectP
   const fontSize = Math.max(9, Math.min(13, fitted));
   const lineHeight = Math.ceil(fontSize * 1.35);
   const terminalWidth = Math.max(bodyWidth, cols * fontSize * CELL_WIDTH_EM + BODY_PADDING * 2);
-  const inputDisabled = inputBusy || keyBusy;
+  const inputDisabled = inputBusy || keyBusy || history.active;
 
   return (
     <KeyboardAvoidingView behavior="padding" style={styles.root}>
@@ -263,30 +340,56 @@ export default function Screen({ colors, config, onBack, pane, project: projectP
           <View style={styles.heading}>
             <Text numberOfLines={1} style={styles.title}>{title}</Text>
           </View>
-          <View accessibilityLabel={reconnecting ? 'Reconnecting' : 'Live'} style={styles.live}>
-            <View style={[styles.liveDot, { backgroundColor: reconnecting ? colors.barMuted : colors.ok }]} />
-            <Text style={[styles.liveText, { color: reconnecting ? colors.barMuted : colors.ok }]}>{reconnecting ? 'reconnecting' : 'live'}</Text>
-          </View>
+          {history.active ? (
+            <Pressable accessibilityLabel="Return to Live" accessibilityRole="button" onPress={returnLive} style={({ pressed }) => [styles.live, pressed && { opacity: 0.7 }]}>
+              <View style={[styles.liveDot, { backgroundColor: colors.barMuted }]} />
+              <Text style={[styles.liveText, { color: colors.info }]}>return live</Text>
+            </Pressable>
+          ) : (
+            <View accessibilityLabel={reconnecting ? 'Reconnecting' : 'Live'} style={styles.live}>
+              <View style={[styles.liveDot, { backgroundColor: reconnecting ? colors.barMuted : colors.ok }]} />
+              <Text style={[styles.liveText, { color: reconnecting ? colors.barMuted : colors.ok }]}>{reconnecting ? 'reconnecting' : 'live'}</Text>
+            </View>
+          )}
         </View>
         <Text numberOfLines={1} style={styles.meta}>{project.name} · pane {paneLabel} · viewing at {cols}×{rows}</Text>
       </View>
 
       <View onLayout={(event) => setBodyWidth(event.nativeEvent.layout.width)} style={styles.body}>
-        {frame ? (
+        {displayFrame ? (
           <ScrollView horizontal nestedScrollEnabled style={styles.body}>
             <ScrollView
               contentContainerStyle={styles.terminalContent}
               keyboardShouldPersistTaps="handled"
+              maintainVisibleContentPosition={history.active ? { minIndexForVisible: 1 } : undefined}
               nestedScrollEnabled
               style={{ width: terminalWidth }}
             >
-              {lines.map((line, index) => (
+              <View>
+                <View style={styles.historyBar}>
+                  {!history.active || !history.exhausted ? (
+                    <Pressable
+                      accessibilityRole="button"
+                      accessibilityState={{ busy: historyLoading, disabled: historyLoading }}
+                      disabled={historyLoading}
+                      onPress={loadHistory}
+                      style={({ pressed }) => [styles.historyButton, historyLoading && styles.historyButtonDisabled, pressed && styles.historyButtonPressed]}
+                    >
+                      <Text style={styles.historyButtonText}>{historyLoading ? 'Loading…' : (historyError ? 'Retry load more' : 'Load more')}</Text>
+                    </Pressable>
+                  ) : (
+                    <Text style={styles.historyStatus}>{history.truncated ? 'History limit reached' : 'All available history loaded'}</Text>
+                  )}
+                </View>
+                {historyError ? <Text style={styles.historyError}>{historyError}</Text> : null}
+              </View>
+              {displayRows.map((row, index) => (
                 <TerminalLine
                   cols={cols}
                   cursor={cursor}
                   index={index}
-                  key={index}
-                  line={line}
+                  key={row.key}
+                  line={row.text}
                   lineHeight={lineHeight}
                   styles={styles}
                   textStyle={{ fontSize }}
@@ -303,14 +406,14 @@ export default function Screen({ colors, config, onBack, pane, project: projectP
 
       <ScrollView contentContainerStyle={styles.keyContent} horizontal keyboardShouldPersistTaps="always" showsHorizontalScrollIndicator={false} style={styles.keyBar}>
         {KEY_BUTTONS.map(([label, name, repeat]) => (
-          <KeyButton disabled={keyBusy} key={name} label={label} name={name} onKey={sendKey} repeat={repeat} styles={styles} />
+          <KeyButton disabled={keyBusy || history.active} key={name} label={label} name={name} onKey={sendKey} repeat={repeat} styles={styles} />
         ))}
       </ScrollView>
 
       <View style={styles.inputBar}>
         <TextInput
           autoCapitalize="sentences"
-          editable={!inputBusy}
+          editable={!inputBusy && !history.active}
           maxLength={2000}
           onChangeText={setDraft}
           onSubmitEditing={submitInput}
