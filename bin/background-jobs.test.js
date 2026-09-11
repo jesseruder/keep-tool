@@ -393,3 +393,41 @@ test('printed job examples inside stdout never create background jobs', () => fi
   ] } });
   assert.deepEqual(sync().jobs, []);
 }, 'codex'));
+
+test('referrer verification handoff recognizes a live cron through the production runtime identity', () => fixture(({ root, append, sync, now }) => {
+  const { attachRuntime } = require('./session-model');
+  const { attention } = require('./session-status');
+  const pane = { id: 'fa942244', pid: 62523, agentPid: 62523, alive: true,
+    createdAt: new Date(now()).toISOString(), meta: { sessionId: 'parent' } };
+  const instance = { id: jobs.processInstance(pane), processScoped: true, live: true };
+  sync({ instance }); // Observe the process before its cron is created.
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'cron', name: 'CronCreate', input: {} }] } });
+  append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'cron', content: 'Scheduled recurring job poll (7,27,47 * * * *).' }] } });
+  append({ type: 'user', message: { content: 'that looks fine, just notify me when it changes' } });
+  const lastUserAt = now();
+  const lastAssistantFull = 'Already set up that way — the cron pushes a notification to your phone the moment the state deviates from baseline (review finishes, or anything rejection/policy shaped), captures the page state for the skill work, and stops polling. Baseline ticks stay silent apart from the one-line note here.\n\nNothing else needed from you until that fires.';
+  append({ type: 'assistant', message: { content: [{ type: 'text', text: lastAssistantFull }], stop_reason: 'end_turn' } });
+  sync({ instance });
+  const session = { id: 'parent', kind: 'claude', endedTurn: true, lastUserAt, lastAssistantFull,
+    taskStatus: 'review', backgroundJobs: jobs.read(root, 'claude', 'parent', now()) };
+  const observe = (patch = {}, currentPane = pane, at = now()) => {
+    const current = { ...session, ...patch };
+    attachRuntime([current], [currentPane]);
+    return activity(current, { now: at });
+  };
+  const waiting = observe();
+  assert.equal(waiting.label, 'Waiting: scheduled check');
+  assert.equal(waiting.background.scheduled[0].id, 'cron_poll');
+  assert.equal(attention({ ...session, activity: waiting }), null);
+  assert.equal(observe({ lastAssistantFull: 'Should I change the poll?' }).needsInput, true);
+  assert.equal(observe({ lastAssistantFull: 'Here is my proposal.' }).needsInput, true);
+  assert.equal(observe({ endedTurn: false }).state, 'running');
+  assert.equal(observe({}, { ...pane, agentPid: 62524 }).needsInput, true, 'replacement agent cannot inherit a cron');
+  assert.equal(observe({}, { ...pane, agentPid: null }).needsInput, true, 'unverified agent cannot inherit a cron');
+  assert.equal(observe({}, { ...pane, alive: false }).state, 'exited');
+  assert.equal(observe({}, pane, now() + 8 * 86400e3).needsInput, true, 'expired cron cannot keep a session waiting');
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'cancel', name: 'CronDelete', input: { id: 'poll' } }] } });
+  append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'cancel', content: 'Cancelled job poll.' }] } });
+  sync({ instance });
+  assert.equal(observe({ backgroundJobs: jobs.read(root, 'claude', 'parent', now()) }).needsInput, true);
+}));

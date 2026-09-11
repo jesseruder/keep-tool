@@ -2317,7 +2317,7 @@ async function restartSession(body, deps = {}) {
     let childProof;
     try {
       childProof = ledger.verify({ root: deps.root || keep.ROOT, agent: session.kind, sid: session.id, file,
-        instance: { id: `${pane.id}:${pane.pid}:${originalIdentity.pid}`, processScoped: true, live: true }, resolveChild });
+        instance: { id: require('./background-jobs').processInstance(pane, originalIdentity.pid), processScoped: true, live: true }, resolveChild });
     } catch (error) {
       if (error instanceof ledger.Recovering) throw transient(error.message);
       throw error;
@@ -3843,7 +3843,7 @@ function buildState(options = {}) {
       if (file) {
         const hosted = options.hostPanes.find(p => p.id === session.runtime?.paneId);
         backgroundTargets.set(`${session.kind}:${session.id}`, { agent: session.kind, sid: session.id, file,
-          instance: { id: hosted?.agentPid ? `${hosted.id}:${hosted.pid}:${hosted.agentPid}` : null,
+          instance: { id: require('./background-jobs').processInstance(hosted),
             processScoped: true, live: session.runtime?.state === 'live' ? true : session.runtime?.state === 'exited' ? false : null } });
         const jobs = require('./background-jobs').read(keep.ROOT, session.kind, session.id, now);
         session.backgroundJobs = jobs;

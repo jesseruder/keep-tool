@@ -7,6 +7,11 @@ const TERMINAL = new Set(['completed', 'failed', 'cancelled']);
 const hash = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const text = (v) => typeof v === 'string' ? v : Array.isArray(v) ? v.filter(x => ['text', 'input_text', 'output_text'].includes(x?.type)).map(x => x.text || '').join('\n') : '';
 
+// Scheduled jobs belong to an agent process, which may run inside a shell pane.
+function processInstance(pane, agentPid = pane?.agentPid) {
+  return pane && agentPid ? `${pane.id}:${pane.pid}:${agentPid}` : null;
+}
+
 function directory(root, agent, sid) {
   if (!['claude', 'codex'].includes(agent) || !ID.test(sid || '')) throw Error('Invalid job ledger identity');
   return path.join(root, '.keep', 'background-jobs', agent, sid);
@@ -400,4 +405,4 @@ function nextTarget(targets, cursor) {
   return targets[Math.floor(cursor / 4) % targets.length];
 }
 
-module.exports = { sync, read, targets, recordHook, consume, nextTarget };
+module.exports = { processInstance, sync, read, targets, recordHook, consume, nextTarget };

@@ -51,6 +51,7 @@ function attachRuntime(sessions, panes = [], independentLive) {
       : exited ? 'exited' : session.deadMidTurn ? 'missing' : 'unknown',
       paneId: selected?.id || null, pid: selected?.pid || null,
       instance: selected ? `${selected.id}:${selected.pid}:${selected.createdAt || ''}` : null,
+      jobInstance: require('./background-jobs').processInstance(selected),
       observedAt: Date.parse(selected?.exitedAt || selected?.createdAt || '') || null,
       liveInstances: live.length };
     if (session.runtime.state === 'exited') session.exited = true;

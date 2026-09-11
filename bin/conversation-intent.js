@@ -8,6 +8,7 @@ function stopHint(text) {
   if (/^(?:still (?:in review|pending|waiting)|no (?:change|update)(?: yet)?)[\s.,!—-]/i.test(value)) return 'waiting';
   if (/(?:^|[.!?]\s+|\n)(?:I(?:'m| am) )?[Ii]dling until (?:the )?next (?:scheduled )?(?:tick|check|poll)\b/.test(value)) return 'waiting';
   if (/(?:^|[.!?]\s+|\n)(?:[-*]\s+)?(?:I(?:'m| am|'ll| will)?|we(?:'re| are|'ll| will)?|still|now)?\s*(?:waiting (?:on|for)|awaiting|blocked (?:on|by)|(?:keep |continue )?(?:watching|monitoring|polling)|wait for|check again)\b/i.test(value)) return 'waiting';
+  if (/(?:^|[.!?]\s+|\n)Nothing (?:else )?(?:needed|required) from you until\b/i.test(value)) return 'waiting';
   return 'unknown';
 }
 function resolve(session, model, now = Date.now()) {
@@ -24,7 +25,8 @@ function resolve(session, model, now = Date.now()) {
   const hint = handoff === 'needs-input' || hook?.intent === 'needs-input' || prose === 'needs-input' ? 'needs-input' : handoff || (hook && hook.at >= (session.lastUserAt || 0) ? hook.intent
     : prose);
   const jobs = (session.backgroundJobs?.jobs || []).filter(j => j.status === 'pending');
-  const scheduled = jobs.filter(j => j.kind === 'scheduled' && j.recurring === true && j.instance && j.instance === model.process.instance && j.expiresAt > now);
+  const jobInstance = Object.hasOwn(model.process, 'jobInstance') ? model.process.jobInstance : model.process.instance;
+  const scheduled = jobs.filter(j => model.process.state === 'live' && j.kind === 'scheduled' && j.recurring === true && j.instance && j.instance === jobInstance && j.expiresAt > now);
   const currentJobs = jobs.filter(j => j.kind !== 'service' && j.kind !== 'scheduled'
     && (!session.lastUserAt || j.startedAt >= session.lastUserAt));
   const concrete = model.background.pending || model.background.uncertain.length || model.background.agents.length || scheduled.length
