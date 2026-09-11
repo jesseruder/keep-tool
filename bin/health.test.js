@@ -57,6 +57,17 @@ test('skipped polls preserve the failure sequence until a real success', () => {
   assert.equal(health.snapshot(5000).schedulers.find((entry) => entry.name === 'review').state, 'failing');
 });
 
+test('a no-op wt gc success clears an earlier scheduler failure', () => {
+  const { root, health } = fixture();
+  try {
+    health.record('wt-gc', { ok: false, error: 'inventory failed', at: 1000 });
+    health.record('wt-gc', { ok: true, detail: '0 worktree(s) cleaned', at: 2000 });
+    const row = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'health.json'), 'utf8'))['wt-gc'];
+    assert.equal(row.consecutiveFailures, 0);
+    assert.equal(row.lastOkAt, 2000);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('stateOf distinguishes ok, failing, silent, never, skipped, and restart grace', () => {
   const { health } = fixture();
   const now = 10 * 60e3;

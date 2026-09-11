@@ -4935,8 +4935,7 @@ function startWtGcScheduler(options = {}) {
         } else {
           const mutations = String(stdout || '').split(/\r?\n/)
             .filter((line) => /^(?:recycle|delete)\s/.test(line)).length;
-          record('wt-gc', { ok: true, skipped: mutations === 0,
-            detail: mutations ? `${mutations} worktree(s) cleaned` : 'nothing due' });
+          record('wt-gc', { ok: true, detail: `${mutations} worktree(s) cleaned` });
           options.onChange?.();
         }
         running = false;

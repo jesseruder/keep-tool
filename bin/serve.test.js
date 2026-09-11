@@ -2335,6 +2335,20 @@ test('daily wt gc scheduler logs actions and records health', async () => {
   assert.equal(records[0].value.detail, '1 worktree(s) cleaned');
 });
 
+test('daily wt gc scheduler records a zero-mutation run as a real success', async () => {
+  const records = [];
+  const inertTimer = { unref() {} };
+  const scheduler = startWtGcScheduler({
+    execFile: (_command, _args, _options, callback) => callback(null, 'action  worktree  reason\n', ''),
+    record: (name, value) => records.push({ name, value }),
+    write: () => {},
+    setTimeout: () => inertTimer,
+    setInterval: () => inertTimer,
+  });
+  await scheduler.tick();
+  assert.deepEqual(records, [{ name: 'wt-gc', value: { ok: true, detail: '0 worktree(s) cleaned' } }]);
+});
+
 test('a compaction summary does not leave the session looking mid-turn', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-serve-test-'));
   const file = path.join(dir, 'session.jsonl');

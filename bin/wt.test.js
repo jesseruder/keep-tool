@@ -664,6 +664,44 @@ test('gc dry-run plans an old active tree through recycle and deletion when keep
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test('gc re-lists under the creation lock and preserves a free tree claimed before locking', () => {
+  const f = fixture();
+  try {
+    const old = '2026-08-01T00:00:00Z';
+    ageHead(f.main, old);
+    git(f.main, 'push', '-q', '--force', 'origin', 'main');
+    const free = runCli(f, ['new', f.name, 'free', '--no-install']).stdout.trim();
+    assert.equal(runCli(f, ['rm', free]).status, 0);
+    fs.writeFileSync(path.join(free, '.wt-free'), JSON.stringify({
+      freedAt: '2026-08-01T00:00:00Z', previousName: 'free',
+    }) + '\n');
+    let claimed = '';
+    let locks = 0;
+    const result = wt.gcWorktrees({ cfg: f.cfg, days: 3, keepFree: 0,
+      now: Date.parse('2026-09-10T00:00:00Z'), deps: {
+        liveCwds: [],
+        beforeRepoLock: () => {
+          claimed = path.join(f.worktreeRoot, f.name, 'claimed');
+          fs.unlinkSync(path.join(free, '.wt-free'));
+          git(f.main, 'worktree', 'move', free, claimed);
+          git(claimed, 'checkout', '-q', '-B', 'wt/claimed', 'origin/main');
+        },
+        withRepoLock: (_cfg, repoName, fn) => {
+          locks++;
+          assert.equal(repoName, f.name);
+          return fn();
+        },
+      } });
+    assert.equal(locks, 1);
+    assert.equal(claimed, path.join(f.worktreeRoot, f.name, 'claimed'));
+    assert.equal(result.rows.find((row) => row.name === 'claimed').action, 'skip');
+    assert.match(result.rows.find((row) => row.name === 'claimed').reason, /creation is incomplete/);
+    assert.equal(fs.existsSync(path.join(claimed, '.wt.json')), false);
+    assert.equal(fs.existsSync(path.join(claimed, '.wt-free')), false);
+    assert.equal(git(claimed, 'branch', '--show-current'), 'wt/claimed');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test('live cwd inventory protects Codex app-server and fails closed when a live cwd is omitted', () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'wt-live-cwd-test-')));
   try {

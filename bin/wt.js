@@ -603,35 +603,38 @@ function configuredMains(cfg) {
   return [...mains];
 }
 
-function listWorktrees(cfg = loadConfig()) {
+function listWorktreesForMain(main) {
   const items = [];
-  for (const main of configuredMains(cfg)) {
-    let defaultName;
-    try { defaultName = defaultBranch(main); } catch { defaultName = null; }
-    for (const record of worktreeRecords(main)) {
-      const worktree = path.resolve(record.worktree);
-      if (worktree === main) continue;
-      let metadata = {};
-      try { metadata = JSON.parse(fs.readFileSync(path.join(worktree, '.wt.json'), 'utf8')); } catch {}
-      const branch = record.branch ? record.branch.replace(/^refs\/heads\//, '') : '(detached)';
-      const dirty = statusWithoutMarkers(worktree).length > 0;
-      let ahead = 0;
-      if (defaultName) {
-        try { ahead = Number(git(worktree, ['rev-list', '--count', `origin/${defaultName}..HEAD`]).trim()); } catch {}
-      }
-      items.push({
-        repoName: path.basename(main),
-        name: metadata.name || (branch.startsWith('wt/') ? branch.slice(3) : path.basename(worktree)),
-        path: worktree,
-        branch,
-        dirty,
-        ahead,
-        free: fs.existsSync(path.join(worktree, '.wt-free')),
-        main,
-      });
+  let defaultName;
+  try { defaultName = defaultBranch(main); } catch { defaultName = null; }
+  for (const record of worktreeRecords(main)) {
+    const worktree = path.resolve(record.worktree);
+    if (worktree === main) continue;
+    let metadata = {};
+    try { metadata = JSON.parse(fs.readFileSync(path.join(worktree, '.wt.json'), 'utf8')); } catch {}
+    const branch = record.branch ? record.branch.replace(/^refs\/heads\//, '') : '(detached)';
+    const dirty = statusWithoutMarkers(worktree).length > 0;
+    let ahead = 0;
+    if (defaultName) {
+      try { ahead = Number(git(worktree, ['rev-list', '--count', `origin/${defaultName}..HEAD`]).trim()); } catch {}
     }
+    items.push({
+      repoName: path.basename(main),
+      name: metadata.name || (branch.startsWith('wt/') ? branch.slice(3) : path.basename(worktree)),
+      path: worktree,
+      branch,
+      dirty,
+      ahead,
+      free: fs.existsSync(path.join(worktree, '.wt-free')),
+      main,
+    });
   }
-  return items.sort((a, b) => a.repoName.localeCompare(b.repoName) || a.name.localeCompare(b.name));
+  return items;
+}
+
+function listWorktrees(cfg = loadConfig()) {
+  return configuredMains(cfg).flatMap(listWorktreesForMain)
+    .sort((a, b) => a.repoName.localeCompare(b.repoName) || a.name.localeCompare(b.name));
 }
 
 function liveAgentCwds(deps = {}) {
@@ -731,29 +734,35 @@ function gcWorktrees(options = {}) {
   if (!Number.isInteger(keepFree) || keepFree < 0) die('--keep-free must be a non-negative integer');
   const now = Number(options.now ?? Date.now());
   const liveCwds = liveAgentCwds(options.deps || {});
-  let items = listWorktrees(cfg);
+  let mains = configuredMains(cfg);
   if (options.repo) {
     const selected = resolveRepo(options.repo, cfg);
-    items = items.filter((item) => item.main === selected);
+    mains = mains.filter((main) => main === selected);
   }
-  const rows = fixtureDirectories(cfg, new Set(items.map((item) => item.path))).map((fixture) => ({
+  const linkedPaths = new Set(mains.flatMap((main) => {
+    try { return worktreeRecords(main).map((record) => path.resolve(record.worktree)); }
+    catch { return []; }
+  }));
+  const rows = fixtureDirectories(cfg, linkedPaths).map((fixture) => ({
     action: 'skip', repoName: path.basename(fixture), name: '-', reason: 'fixture directory is not a linked worktree', path: fixture,
   }));
-  const groups = new Map();
-  for (const item of items) {
-    const entries = groups.get(item.main) || [];
-    entries.push(item);
-    groups.set(item.main, entries);
-  }
-  for (const [main, entries] of groups) {
+  for (const main of mains) {
     let defaultName;
     try {
       defaultName = defaultBranch(main);
       git(main, ['fetch', '-q', 'origin', defaultName]);
     } catch (error) {
+      let entries = [];
+      try { entries = listWorktreesForMain(main); } catch {}
       rows.push(...entries.map((item) => ({ ...item, action: 'skip', reason: `cannot refresh origin: ${error.message}` })));
       continue;
     }
+    options.deps?.beforeRepoLock?.(main);
+    const lock = options.deps?.withRepoLock || withRepoLock;
+    lock(cfg, path.basename(main), () => {
+    // `wt new` claims and renames free trees under this same lock. Re-list only
+    // after taking it so no candidate can refer to a tree that has since been reused.
+    const entries = listWorktreesForMain(main);
     const assessments = [];
     for (const item of entries) {
       const wasFree = item.free;
@@ -768,7 +777,8 @@ function gcWorktrees(options = {}) {
         continue;
       }
       let reason = '';
-      if (dirty.length) reason = `dirty (${dirty.length} change(s))`;
+      if (!item.free && !hasMetadataFile(item.path)) reason = 'not a wt-managed tree or creation is incomplete';
+      else if (dirty.length) reason = `dirty (${dirty.length} change(s))`;
       else if (ahead > 0) reason = `${ahead} commit(s) ahead of origin/${defaultName}`;
       else if (liveCwds.some((cwd) => pathContains(cwd, item.path))) reason = 'live session cwd is inside worktree';
       else if (!item.free && (!Number.isFinite(committedAt) || now - committedAt < days * 86400e3)) reason = `last commit is newer than ${days} day(s)`;
@@ -822,6 +832,7 @@ function gcWorktrees(options = {}) {
         rows.push({ ...item, action: 'keep', reason: `within free pool limit ${keepFree}` });
       }
     }
+    });
   }
   return { rows, recycled: rows.filter((row) => row.action === 'recycle').length,
     deleted: rows.filter((row) => row.action === 'delete').length };
