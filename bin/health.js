@@ -128,6 +128,8 @@ function record(name, options = {}) {
   }
   if (!ok && Number.isFinite(options.incidentAt)) entry.incidentAt = options.incidentAt;
   else delete entry.incidentAt;
+  if (!ok && typeof options.incidentId === 'string') entry.incidentId = options.incidentId;
+  else delete entry.incidentId;
   if (options.detail == null || options.detail === '') delete entry.detail;
   else entry.detail = clipError(options.detail);
   store[name] = entry;
@@ -203,6 +205,7 @@ function snapshot(now = Date.now()) {
       lastErrorAt: entry.lastErrorAt || null,
       lastError: entry.lastError || '',
       incidentAt: entry.incidentAt || null,
+      incidentId: entry.incidentId || null,
       consecutiveFailures: Number(entry.consecutiveFailures || 0),
       cadenceMs: Number(entry.cadenceMs || config.cadenceMs || 0),
       detail: entry.detail || '',
@@ -240,6 +243,7 @@ function attentionItems(value, now = Date.now()) {
       kind: 'health',
       at: eventAt,
       lastError: entry.lastError || '',
+      incidentId: entry.incidentId || null,
     };
   });
   const recentStarts = (Array.isArray(daemon.startedAts) ? daemon.startedAts : [])

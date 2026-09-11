@@ -62,6 +62,7 @@ const SUGGESTION_PROBE_MAX_READS = Math.ceil(SUGGESTION_PROBE_MAX_MS / SUGGESTIO
 
 function attentionAckKey(item) {
   if (item.kind === 'health' && item.id) {
+    if (item.incidentId) return `${item.id}:incident:${item.incidentId}`;
     const errorHash = crypto.createHash('sha1').update(String(item.errorText || '')).digest('hex');
     return `${item.id}:${errorHash}`;
   }
@@ -4832,7 +4833,7 @@ function start(deps = {}) {
             if (isHealth) {
               const current = health.attentionItems(health.snapshot()).find((item) => item.id === body.id);
               if (!current) return json(res, 400, { error: 'health alert is no longer current' });
-              ackItem = { ...body, errorText: current.lastError || '' };
+              ackItem = { ...body, errorText: current.lastError || '', incidentId: current.incidentId || null };
             }
             const key = attentionAckKey(ackItem);
             const ackDir = path.join(keep.ROOT, '.keep', 'acks');

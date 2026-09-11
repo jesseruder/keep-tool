@@ -5,6 +5,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const crypto = require('node:crypto');
 const { received } = require('./delivery');
 const STALE_MS = 2 * 60e3;
 const safeId = value => /^[A-Za-z0-9_-]{1,160}$/.test(String(value || '')) ? String(value) : 'unknown';
@@ -67,7 +68,8 @@ function tick(options = {}) {
     const detail = first
       ? `${issues.length} unconfirmed delivery issue(s): ${first.agent || 'unknown'} ${first.sessionId || first.journal}; ${first.reason}. ${first.pane ? 'Inspect: keep pane screen ' + first.pane : 'Inspect delivery journals'}. Full list: node bin/delivery-health.js`
       : 'No stale unconfirmed deliveries';
-    health.record('delivery', { at: options.now ?? Date.now(), ok: !issues.length, detail, ...(issues.length ? { error: detail, incidentAt: first.since } : {}) });
+    const incidentId = first && crypto.createHash('sha256').update(JSON.stringify([first.sessionId || first.journal, first.pane, first.since])).digest('hex');
+    health.record('delivery', { at: options.now ?? Date.now(), ok: !issues.length, detail, ...(issues.length ? { error: detail, incidentAt: first.since, incidentId } : {}) });
     options.onChange?.();
     return issues;
   } catch (error) {

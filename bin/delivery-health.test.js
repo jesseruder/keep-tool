@@ -83,12 +83,17 @@ test('persistent delivery faults enter health attention once, stay stable, and r
     const attention = () => health.attentionItems(health.snapshot(f.now + 180e3)).filter(r => r.id === 'health:delivery');
     assert.equal(attention().length, 1);
     const first = attention()[0];
+    const ackKey = require('./serve').attentionAckKey;
+    const firstKey = ackKey(first);
     assert.match(first.text, /codex-session.*receipt-missing.*keep pane screen codex-pane/);
     tick({ ...f, health, now: f.now + 180e3 });
     assert.equal(attention()[0].at, first.at, 'polling must not reannounce the same incident');
+    assert.equal(ackKey(attention()[0]), firstKey);
     const newer = f.add('claude', { createdAt: f.now - 150e3 });
     tick({ ...f, health, now: f.now + 200e3 });
     assert.equal(attention()[0].at, newer.createdAt, 'a new stuck delivery must surface while the older one remains');
+    assert.notEqual(ackKey(attention()[0]), firstKey, 'new incidents must not inherit a prior acknowledgement');
+    assert.equal(ackKey({ ...first, errorText: 'count or diagnostic changed' }), firstKey);
     fs.appendFileSync(newer.file, JSON.stringify({ type: 'user', message: { content: f.message } }) + '\n');
     fs.appendFileSync(entry.file, JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: f.message }] } }) + '\n');
     tick({ ...f, health, now: f.now + 240e3 });
