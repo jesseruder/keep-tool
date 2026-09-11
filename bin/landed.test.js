@@ -1493,6 +1493,11 @@ test('a failed fetch blocks commit waits and stale local refs until a later succ
     runGit(['-C', root, 'add', 'tasks'], { env });
     runGit(['-C', root, 'commit', '-q', '-m', 'fixture'], { env });
 
+    const unblockScript = `(async()=>{await require(${JSON.stringify(path.join(__dirname, 'unblock.js'))}).sweep({deps:{deliver:async()=>({sessionId:'test'})}})})().catch(e=>{console.error(e);process.exitCode=1})`;
+    const noEvidence = spawnSync(process.execPath, ['-e', unblockScript], { env, encoding: 'utf8' });
+    assert.equal(noEvidence.status, 0, noEvidence.stderr);
+    assert.equal(keep.loadTask('dependent', root).fm.status, 'waiting');
+
     const first = runSweep(env, now);
     assert.equal(first.fetchFailures.length, 1);
     assert.deepEqual(first.landed, [{ id: 'failed-fetch', shas: [sha], closed: false }]);
@@ -1502,7 +1507,6 @@ test('a failed fetch blocks commit waits and stale local refs until a later succ
     assert.deepEqual(state.fetchStatus[repo], { at: now, branch: 'main', ok: false });
     assert.equal(fs.existsSync(path.join(root, '.keep', 'unblocked')), false);
 
-    const unblockScript = `(async()=>{await require(${JSON.stringify(path.join(__dirname, 'unblock.js'))}).sweep({deps:{deliver:async()=>({sessionId:'test'})}})})().catch(e=>{console.error(e);process.exitCode=1})`;
     const stillBlocked = spawnSync(process.execPath, ['-e', unblockScript], { env, encoding: 'utf8' });
     assert.equal(stillBlocked.status, 0, stillBlocked.stderr);
     assert.equal(keep.loadTask('dependent', root).fm.status, 'waiting');
@@ -1519,6 +1523,57 @@ test('a failed fetch blocks commit waits and stale local refs until a later succ
     assert.equal(JSON.parse(fs.readFileSync(path.join(root, '.keep', 'landed', '_state.json'), 'utf8')).fetchStatus[repo].ok, true);
     const unblocked = spawnSync(process.execPath, ['-e', unblockScript], { env, encoding: 'utf8' });
     assert.equal(unblocked.status, 0, unblocked.stderr);
+    assert.equal(keep.loadTask('dependent', root).fm.status, 'active');
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test('a recent legacy fetchedAt record seeds positive evidence for a throttled commit wait', () => {
+  const { temp, repo, root, env, sha } = landedFixture('keep-landed-legacy-fetch-');
+  try {
+    const now = Date.now();
+    const keep = require('./keep.js');
+    const upstream = {
+      id: 'upstream',
+      fm: {
+        title: 'upstream', status: 'done', kind: 'task', tags: ['personal'], project: repo,
+        created: '2026-09-10', updated: '2026-09-10T12:00',
+      },
+      body: '## 2026-09-10 12:00 — done\nComplete.\n',
+    };
+    const dependent = {
+      id: 'dependent',
+      fm: {
+        title: 'dependent', status: 'waiting', kind: 'task', tags: ['personal'],
+        depends_on: [{ card: 'upstream', kind: 'commit', commits: [sha], reason: 'need verified origin' }],
+        created: '2026-09-10', updated: '2026-09-10T12:00',
+      },
+      body: '',
+    };
+    fs.writeFileSync(path.join(root, 'archive', 'upstream.md'), keep.serializeTask(upstream));
+    fs.writeFileSync(path.join(root, 'tasks', 'dependent.md'), keep.serializeTask(dependent));
+    fs.mkdirSync(path.join(root, 'watch'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'watch', 'landed.json'), '{}\n');
+    runGit(['-C', root, 'add', 'archive', 'tasks', 'watch'], { env });
+    runGit(['-C', root, 'commit', '-q', '-m', 'legacy state fixture'], { env });
+
+    const unblockScript = `(async()=>{await require(${JSON.stringify(path.join(__dirname, 'unblock.js'))}).sweep({deps:{deliver:async()=>({sessionId:'test'})}})})().catch(e=>{console.error(e);process.exitCode=1})`;
+    const beforeLanded = spawnSync(process.execPath, ['-e', unblockScript], { env, encoding: 'utf8' });
+    assert.equal(beforeLanded.status, 0, beforeLanded.stderr);
+    assert.equal(keep.loadTask('dependent', root).fm.status, 'waiting');
+
+    const stateDir = path.join(root, '.keep', 'landed');
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, '_state.json'), JSON.stringify({ fetchedAt: { [repo]: now - 1000 } }) + '\n');
+    const swept = runSweep(env, now);
+    assert.deepEqual(swept.fetchFailures, []);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(stateDir, '_state.json'), 'utf8')).fetchStatus[repo], {
+      at: now - 1000, branch: 'main', ok: true,
+    });
+
+    const afterLanded = spawnSync(process.execPath, ['-e', unblockScript], { env, encoding: 'utf8' });
+    assert.equal(afterLanded.status, 0, afterLanded.stderr);
     assert.equal(keep.loadTask('dependent', root).fm.status, 'active');
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });

@@ -231,7 +231,15 @@ function fetchDefault(repo, branch, state, now = Date.now()) {
   state.fetchedAt = state.fetchedAt || {};
   state.fetchStatus = state.fetchStatus || {};
   const prior = Number(state.fetchedAt[repo]);
-  if (Number.isFinite(prior) && now - prior >= 0 && now - prior < FETCH_INTERVAL_MS) return null;
+  const priorStatus = state.fetchStatus[repo];
+  if (Number.isFinite(prior) && now - prior >= 0 && now - prior < FETCH_INTERVAL_MS
+      && (!priorStatus || (priorStatus.ok === true && priorStatus.branch === branch))) {
+    // Registries written before fetchStatus was introduced still have valid
+    // fetchedAt evidence. Seed the positive record so later read-only checks do
+    // not have to guess from an unverified tracking ref.
+    if (!priorStatus) state.fetchStatus[repo] = { at: prior, branch, ok: true };
+    return null;
+  }
   try {
     git(repo, ['fetch', '--no-tags', '--quiet', 'origin', branch], 20e3);
     state.fetchedAt[repo] = now;
@@ -243,9 +251,9 @@ function fetchDefault(repo, branch, state, now = Date.now()) {
   }
 }
 
-function originEvidenceUsable(repo) {
+function originEvidenceUsable(repo, branch) {
   const status = loadState().fetchStatus[repo];
-  return !status || status.ok !== false;
+  return Boolean(status && status.ok === true && (!branch || status.branch === branch));
 }
 
 function isOnDefault(repo, sha, branch) {

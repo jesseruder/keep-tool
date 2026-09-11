@@ -984,7 +984,7 @@ function dependencyResolved(task, target, options = {}) {
     const landed = require('./landed.js');
     const repo = landed.repoFor(task);
     const branch = repo && landed.defaultBranch(repo);
-    return Boolean(branch && landed.originEvidenceUsable(repo)
+    return Boolean(branch && landed.originEvidenceUsable(repo, branch)
       && parsed.commits.every((sha) => landed.isOnDefault(repo, sha, branch)));
   }
   return false;
