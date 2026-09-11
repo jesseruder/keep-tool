@@ -199,14 +199,26 @@ Only a validated interactive root transcript may continue; child threads, pendin
 tools, and unanswered synchronous or asynchronous questions are protected.
 The question PreToolUse matcher is `^(?:.*\.)?request_user_input(?:_async)?$`.
 
-Automatic cleanup checks every five minutes and retires eligible agent sessions
-after eight hours without transcript or pane output activity. It also closes
-managed zsh panes, including shells left after an agent exits, after eight hours
-without output. Shell cleanup requires a verified empty prompt and no child
-processes, and rechecks identity and activity before sending EOF. Pinned panes,
-attached viewers, unknown state, and drafts remain protected. Exit attempts and
+Automatic cleanup checks every five minutes. An agent session becomes eligible 15
+minutes after the later of its card's transition to `done` and its last transcript,
+pane input, or pane output activity. Every card linked to the session must be done.
+Open `keep ask` questions, background ledgers, Codex companion jobs, process
+children, pinned panes, attached viewers, drafts, and unknown activity protect the
+session. Output remains unread until a visible viewer receives the pane history;
+unread output protects the session even after the idle window passes.
+
+Eligible sessions use the console's graceful Close path. Only a successfully
+submitted `/exit` may progress to the existing timeout-based TERM/KILL fallback;
+any refusal, changed input, or safety-check race cancels force escalation. The card
+keeps its session link and gets a `closed (daemon): idle N min after done` log entry,
+so `keep open <card>` resumes the same Claude or Codex thread.
+
+Managed zsh panes, including shells left after an agent exits, retain their separate
+eight-hour cleanup. Shell cleanup requires a verified empty prompt and no child
+processes, and rechecks identity and activity before sending EOF. Exit attempts and
 refusals are recorded in `.keep/session-cleanup.json`; failures retry at most once
-per hour. Set `KEEP_AUTO_CLOSE=0` to disable both forms of automatic cleanup.
+per hour. Set `KEEP_AUTO_CLOSE_DONE_MIN` to another idle window in minutes. Set
+`KEEP_AUTO_CLOSE=0` to disable both agent and shell automatic cleanup.
 
 Automatic Codex cleanup can retire parents with completed remote children only
 when the full, identity-checked descendant history proves completion and remains

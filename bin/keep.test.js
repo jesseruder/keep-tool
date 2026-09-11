@@ -53,6 +53,12 @@ test('parseDependency and help expose step-qualified wait-on syntax', () => {
   }
 });
 
+test('serve help documents the done-card close window and opt-out', () => {
+  const text = require('./keep.js').commandUsage('serve');
+  assert.match(text, /KEEP_AUTO_CLOSE_DONE_MIN \(default 15\)/);
+  assert.match(text, /KEEP_AUTO_CLOSE=0 disables auto-close/);
+});
+
 function transcriptRecord(record) {
   return `${JSON.stringify(record)}\n`;
 }

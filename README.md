@@ -198,7 +198,8 @@ instructions](app/README.md).
     "KEEP_REVIEWER_MODEL": "fable",
     "KEEP_IDEAS_MODEL": "fable",
     "KEEP_OPEN_CLAUDE_FLAGS": "",
-    "KEEP_OPEN_CODEX_FLAGS": ""
+    "KEEP_OPEN_CODEX_FLAGS": "",
+    "KEEP_AUTO_CLOSE_DONE_MIN": "15"
   }
 }
 ```
@@ -213,6 +214,9 @@ agent account. Scheduled recipes run in agents, and the reviewer is an ordinary
 interactive agent with the permissions you give it. Set launch permission flags
 explicitly if your workflow needs unattended privileged actions. Compaction keeps
 its existing `KEEP_AUTO_COMPACT` control; see the [command reference](docs/reference.md).
+Done-card sessions close after 15 idle minutes by default; set
+`KEEP_AUTO_CLOSE_DONE_MIN` to another number of minutes, or set `KEEP_AUTO_CLOSE=0`
+to disable automatic session and shell cleanup.
 
 Remote access requires setting `KEEP_HOST` explicitly; the default binds only to
 loopback. Remote API requests use the private registry's `.keep/token`.

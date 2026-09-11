@@ -34,7 +34,8 @@ function refusal(session, pane, pinned, now = Date.now(), options = {}) {
   if (!Number.isFinite(session.mtime)) return 'Session activity time is unknown';
   const idleMs = Number.isFinite(options.idleMs) ? options.idleMs : IDLE_MS;
   const activityAt = Math.max(session.mtime, Number(options.activityAt) || 0);
-  if (!options.manual && now - activityAt < idleMs) return `Session has activity within the last ${Math.ceil(idleMs / 60e3)} minutes`;
+  const idleLabel = idleMs === IDLE_MS ? '8 hours' : `${Math.ceil(idleMs / 60e3)} minutes`;
+  if (!options.manual && now - activityAt < idleMs) return `Session has activity within the last ${idleLabel}`;
   if (options.automatic && pane.attached !== 0) return 'Attached session or unknown viewer state is protected';
   const outputAt = timeMs(pane.lastOutputAt);
   if (options.automatic && (!Number.isFinite(outputAt) || now - outputAt < idleMs)) return 'Pane has recent or unknown output activity';

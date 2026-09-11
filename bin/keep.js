@@ -5977,6 +5977,7 @@ ${stepUsage()}
   keep sync              # pull --rebase + push
   keep digest            # write digests/YYYY-MM-DD.md and print it
   keep serve             # start the dashboard server (KEEP_PORT, default 7777)
+                         # done-card sessions close after KEEP_AUTO_CLOSE_DONE_MIN (default 15); KEEP_AUTO_CLOSE=0 disables auto-close
   keep restart-daemon    # guarded daemon-only restart (requires launchd KeepAlive)
   keep force-restart <session-id> --pane <pane-id> [--recover]    # explicit interruption; never automatic cleanup
   keep review-queue [--limit n] [--min-score n] [--json]   # what deserves review now
