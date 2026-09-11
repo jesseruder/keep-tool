@@ -18,12 +18,13 @@ test('isolated browser: review queue decisions, drafts, notification links, and 
   const idea = { id: 'idea:card-idea', type: 'idea', card: 'card-idea', title: 'Searchable workflow idea', body: 'Make the owner decision flow concise.', project: '/tmp/review-fixture', status: 'needs-decision', at: now - 1000, sessions: [] };
   const finding = { id: 'finding:card-find:key-one', type: 'finding', card: 'card-find', title: 'Protect retry idempotency', body: 'A lost response must not launch twice.', evidence: 'Observed in the launch boundary.', severity: 'high', project: '/tmp/review-fixture', status: 'needs-decision', at: now, sessions: [] };
   const siblingFinding = { ...finding, id: 'finding:card-find:key-two', title: 'A second finding on the same card', at: now - 500 };
+  const partial = { id: 'idea:partial-start', type: 'idea', card: 'partial-start', title: 'Partial start failure', body: 'The pane exists but delivery is ambiguous.', project: '/tmp/review-fixture', status: 'needs-decision', at: now - 250, sessions: [] };
   const lost = { id: 'idea:lost-response', type: 'idea', card: 'lost-response', title: 'Lost response discussion', body: 'Retry the same request safely.', project: '/tmp/review-fixture', status: 'needs-decision', at: now - 750, sessions: [] };
   const later = { id: 'idea:later', type: 'idea', card: 'later', title: 'Deferred idea', body: 'Not due.', project: '/tmp/review-fixture', status: 'needs-decision', deferredUntil: new Date(now + 86400e3).toISOString(), at: now - 2000, sessions: [] };
   const state = {
     sessions: [], panes: [], tasks: [], attention: [], notifications: [{ id: 'notice-find', at: now, text: finding.title, from: 'Reviewer', caller: 'reviewer', card: finding.card, findingKey: 'key-one', read: false }, { id: 'notice-ambiguous', at: now - 1, text: 'Finding without a durable key', from: 'Reviewer', caller: 'reviewer', card: finding.card, read: false }],
     setAside: {}, health: {}, usage: {}, review: { events: [], stats: {} }, limitResume: {},
-    reviewQueue: { items: [idea, finding, siblingFinding, lost, later], counts: { 'needs-decision': 4, 'in-progress': 0, resolved: 0 } },
+    reviewQueue: { items: [idea, finding, partial, siblingFinding, lost, later], counts: { 'needs-decision': 5, 'in-progress': 0, resolved: 0 } },
   };
   const completedRequests = new Map();
   const server = http.createServer((req, res) => {
@@ -36,6 +37,25 @@ test('isolated browser: review queue decisions, drafts, notification links, and 
       let body = ''; req.on('data', (chunk) => { body += chunk; }); req.on('end', () => {
         const request = JSON.parse(body); posts.push(request);
         const item = state.reviewQueue.items.find((candidate) => candidate.id === request.id);
+        if (item.id === partial.id && request.action === 'start') {
+          item.status = 'in-progress';
+          item.sessions.push({ id: 'partial-session', action: 'start', at: Date.now() });
+          item.launchState = { state: 'needs-attention', sessionId: 'partial-session', requestId: request.requestId, action: 'start', recoverable: false, at: Date.now(), message: 'Delivery could not be confirmed.' };
+          item.launchError = { message: 'Delivery could not be confirmed.', sessionId: 'partial-session', at: Date.now() };
+          res.writeHead(503, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'Delivery could not be confirmed.', sessionId: 'partial-session', item }));
+          return;
+        }
+        if (item.launchState?.requestId === request.requestId && item.launchState.action === request.action) {
+          const sessionId = item.launchState.sessionId;
+          delete item.launchState;
+          if (!item.sessions.some((session) => session.id === sessionId)) item.sessions.push({ id: sessionId, action: request.action, at: Date.now() });
+          if (!state.sessions.some((session) => session.id === sessionId)) {
+            state.sessions.push({ id: sessionId, kind: 'claude', title: item.title, project: item.project, pane: `pane-${sessionId}`, mtime: Date.now(), state: 'running' });
+            state.panes.push({ id: `pane-${sessionId}`, alive: true, meta: { agent: 'claude', sessionId } });
+          }
+          res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ ok: true, sessionId, item }));
+          return;
+        }
         if (item.id === lost.id && request.action === 'discuss') {
           const completed = completedRequests.get(request.requestId);
           if (completed) { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(completed)); return; }
@@ -62,7 +82,7 @@ test('isolated browser: review queue decisions, drafts, notification links, and 
           state.reviewQueue.counts = { 'needs-decision': state.reviewQueue.items.filter((row) => row.status === 'needs-decision' && !(Date.parse(row.deferredUntil) > Date.now())).length, 'in-progress': state.reviewQueue.items.filter((row) => row.status === 'in-progress').length, resolved: state.reviewQueue.items.filter((row) => row.status === 'resolved').length };
           res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ ok: true, sessionId, item }));
         };
-        if (request.action === 'start') setTimeout(finish, 120); else finish();
+        if (request.action === 'start' || request.action === 'defer') setTimeout(finish, 120); else finish();
       }); return;
     }
     if (url.pathname.startsWith('/api/')) { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(url.pathname === '/api/state' ? state : url.pathname === '/api/layouts' ? { layouts: [{ name: 'Pinned', role: 'pinned', ids: [], cols: 1 }] } : { ok: true })); return; }
@@ -87,10 +107,28 @@ test('isolated browser: review queue decisions, drafts, notification links, and 
     const wait = (condition) => evaluate(`new Promise((resolve,reject)=>{const deadline=Date.now()+5000;const tick=()=>{if(${condition})resolve(true);else if(Date.now()>deadline)reject(new Error('condition timed out: '+${JSON.stringify(condition)}));else setTimeout(tick,30)};tick()})`);
     await call('Page.enable'); await call('Emulation.setDeviceMetricsOverride', { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false });
     await call('Page.navigate', { url: `http://127.0.0.1:${server.address().port}/` });
-    await wait("document.querySelector('#reviewQueueCount')?.textContent === '4'");
+    await wait("document.querySelector('#reviewQueueCount')?.textContent === '5'");
     await evaluate("document.querySelector('[data-mode=review-queue]').click()");
     await wait("document.querySelector('[data-review-detail]')?.dataset.reviewDetail === 'finding:card-find:key-one'");
-    assert.equal(await evaluate("document.querySelectorAll('[data-review-item]').length"), 4, 'future deferred item is hidden');
+    assert.equal(await evaluate("document.querySelectorAll('[data-review-item]').length"), 5, 'future deferred item is hidden');
+    await evaluate("document.querySelector('[data-review-item=\"idea:partial-start\"]').click(); document.querySelector('[data-review-action=start]').click()");
+    await wait("document.querySelector('[data-review-detail]')?.dataset.reviewDetail === 'idea:partial-start' && document.querySelector('.review-status')?.textContent === 'In progress' && document.querySelector('[data-review-session=partial-session]')");
+    assert.equal(await evaluate("document.querySelectorAll('[data-review-retry], [data-review-recover], [data-review-action]').length"), 0, 'ambiguous partial start offers only its existing conversation');
+    await evaluate("document.querySelector('[data-review-filter=\"needs-decision\"]').click()");
+    siblingFinding.launchState = { state: 'opening', sessionId: 'reserved-session', requestId: 'reserved-request', action: 'discuss', recoverable: true, at: Date.now() };
+    for (const client of eventClients) client.write('data: changed\n\n');
+    await evaluate("document.querySelector('[data-review-item=\"finding:card-find:key-two\"]').click()");
+    await wait("document.querySelector('.review-action-pending')?.textContent.includes('Opening conversation')");
+    assert.equal(await evaluate("document.querySelectorAll('[data-review-action]').length"), 0, 'durable opening state prevents a duplicate launch or mutation');
+    siblingFinding.launchState = { state: 'needs-attention', sessionId: 'reserved-session', requestId: 'reserved-request', action: 'discuss', recoverable: true, at: Date.now(), message: 'Opening was interrupted.' };
+    for (const client of eventClients) client.write('data: changed\n\n');
+    await wait("document.querySelector('.review-action-error')?.textContent.includes('Opening was interrupted') && document.querySelector('[data-review-session=reserved-session]') && document.querySelector('[data-review-recover]')");
+    await evaluate("document.querySelector('[data-review-recover]').click()");
+    await wait("document.querySelector('#triage').classList.contains('on')");
+    const recoveryPost = posts.find((row) => row.requestId === 'reserved-request');
+    assert.equal(recoveryPost.action, 'discuss', 'recovery reuses the durable action and request ID');
+    await evaluate("document.querySelector('[data-mode=review-queue]').click(); document.querySelector('[data-review-item=\"finding:card-find:key-two\"]').click()");
+    await wait("document.querySelector('[data-review-action=defer]') && !document.querySelector('[data-review-recover]')");
     await evaluate("window.fixtureFetch=window.fetch; window.dropReviewResponse=true; window.fetch=async (...args)=>{const response=await window.fixtureFetch(...args); const request=args[1] && JSON.parse(args[1].body || '{}'); if(window.dropReviewResponse && args[0]==='/api/review-queue' && request.id==='idea:lost-response'){window.dropReviewResponse=false; throw new TypeError('simulated lost response')} return response}");
     await evaluate("document.querySelector('[data-review-item=\"idea:lost-response\"]').click(); document.querySelector('[data-review-action=discuss]').click()");
     await wait("document.querySelector('[data-review-retry]')");
@@ -112,12 +150,13 @@ test('isolated browser: review queue decisions, drafts, notification links, and 
     await wait("document.querySelector('.review-action-form [role=alert]')?.textContent.includes('future')");
     assert.equal(posts.filter((row) => row.action === 'defer').length, 0, 'invalid Later time stays inline');
     await evaluate("const futureWhen=document.querySelector('[name=until]'); futureWhen.value='2099-01-01T00:00'; futureWhen.dispatchEvent(new Event('input',{bubbles:true})); document.querySelector('[data-review-form=defer]').requestSubmit()");
+    await wait("document.querySelector('.review-action-pending')?.textContent === 'Saving…'");
     await wait("document.querySelectorAll('[data-review-item]').length === 3");
     assert.equal(posts.filter((row) => row.action === 'defer').length, 1);
     await evaluate("document.querySelector('[data-review-item=\"idea:card-idea\"]').click(); document.querySelector('[data-review-action=start]').click(); document.querySelector('[data-review-action=start]')?.click()");
     await wait("document.querySelector('#triage').classList.contains('on')");
-    assert.equal(posts.filter((row) => row.action === 'start').length, 1, 'double click launches once');
-    await evaluate("document.querySelector('[data-mode=review-queue]').click(); document.querySelector('[data-review-filter=in-progress]').click()");
+    assert.equal(posts.filter((row) => row.id === 'idea:card-idea' && row.action === 'start').length, 1, 'double click launches once');
+    await evaluate("document.querySelector('[data-mode=review-queue]').click(); document.querySelector('[data-review-filter=in-progress]').click(); document.querySelector('[data-review-item=\"idea:card-idea\"]').click()");
     await wait("document.querySelector('[data-review-action=dismiss]')");
     assert.ok(await evaluate("document.querySelector('[data-review-session]').textContent.includes('Work')"), 'in-progress item links its conversation');
     await evaluate("document.querySelector('[data-review-action=dismiss]').click(); const finalReason=document.querySelector('[data-review-form=dismiss] textarea'); finalReason.value='Superseded by the implementation'; finalReason.dispatchEvent(new Event('input',{bubbles:true})); document.querySelector('[data-review-form=dismiss]').requestSubmit()");

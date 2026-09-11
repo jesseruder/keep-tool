@@ -8,7 +8,6 @@ const review = require('./review.js');
 const related = require('./review-related.js');
 
 const VERSION = 1;
-const STALE_LAUNCH_MS = 2 * 60e3;
 const RESOLVED_FINDING_OUTCOMES = new Set(['fixed', 'incorrect', 'superseded']);
 
 class QueueError extends Error {
@@ -75,7 +74,7 @@ function archivedIds(root) {
 }
 
 function findingReport(body, key) {
-  const sections = String(body || '').split(/(?=^## )/m);
+  const sections = String(body || '').split(/(?=^## \d{4}-\d{2}-\d{2} \d{2}:\d{2} — )/m);
   const escaped = String(key).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const footer = new RegExp(`^-- reviewer [^\\n,]+, finding ${escaped}\\s*$`, 'm');
   return sections.find((section) => footer.test(section))?.trim() || '';
@@ -166,6 +165,19 @@ function publicItem(source, meta = {}, now = Date.now()) {
   if (sourceOutcome || meta.outcome) item.outcome = sourceOutcome || meta.outcome;
   if (meta.deferredUntil && timestamp(meta.deferredUntil) > now && status === 'needs-decision') item.deferredUntil = meta.deferredUntil;
   if (meta.launchError) item.launchError = meta.launchError;
+  if (meta.activeLaunch) {
+    const active = meta.activeLaunch;
+    const phase = active.phase || 'reserved';
+    item.launchState = {
+      state: phase === 'delivered' ? 'delivered' : (phase === 'ready' || active.error ? 'needs-attention' : 'opening'),
+      sessionId: active.sessionId,
+      action: active.action,
+      requestId: active.requestId,
+      recoverable: Boolean(active.error && (!active.phase || ['reserved', 'spawned'].includes(active.phase))),
+      at: active.at,
+      ...(active.error ? { message: active.error } : {}),
+    };
+  }
   return item;
 }
 
@@ -298,11 +310,12 @@ async function act(body, deps = {}) {
   const at = now();
   validateRequest(body, at);
   const withLock = deps.withLock || keep.withLock;
+  const ownerId = String(deps.ownerId || process.pid);
   const requestId = body.requestId || crypto.randomUUID();
   const options = { ...deps, root };
   const { source, sources } = findSource(body.id, options);
-  const initialMeta = itemMeta(loadStore(root, { strict: true }), body.id);
-  const existingItem = publicItem(source, initialMeta, at);
+  let initialMeta = itemMeta(loadStore(root, { strict: true }), body.id);
+  let existingItem = publicItem(source, initialMeta, at);
   const initialRequest = initialMeta.requests?.[requestId];
   if (initialRequest && initialRequest.action !== body.action) {
     throw new QueueError(409, 'request id was already used for a different review queue action', { item: existingItem });
@@ -310,42 +323,153 @@ async function act(body, deps = {}) {
   if (initialRequest?.state === 'complete') {
     return { ok: true, ...(initialRequest.sessionId ? { sessionId: initialRequest.sessionId } : {}), item: existingItem };
   }
-  if (initialRequest?.state === 'failed') {
+  if (initialRequest?.state === 'failed' && !initialMeta.activeLaunch) {
     throw new QueueError(initialRequest.status || 502, initialRequest.error || 'review queue launch failed', {
       sessionId: initialRequest.pane ? initialRequest.sessionId : undefined, item: existingItem,
     });
   }
-  if (['discuss', 'start'].includes(body.action) && initialMeta.activeLaunch && !initialMeta.activeLaunch.pane
-      && deps.findLaunchedSession) {
-    const found = await deps.findLaunchedSession(initialMeta.activeLaunch.sessionId);
-    if (found?.pane) {
-      const active = initialMeta.activeLaunch;
-      const recovered = updateStore(root, withLock, (store) => {
+  const finishActive = (active) => updateStore(root, withLock, (store) => {
+    const meta = itemMeta(store, body.id);
+    if (meta.activeLaunch?.sessionId !== active.sessionId) return false;
+    const fresh = findSource(body.id, options).source;
+    const requests = { ...(meta.requests || {}) };
+    requests[active.requestId] = { ...requests[active.requestId], state: 'complete', action: active.action, sessionId: active.sessionId };
+    const sessions = Array.isArray(meta.sessions) ? [...meta.sessions] : [];
+    if (!sessions.some((entry) => entry.id === active.sessionId)) sessions.push({ id: active.sessionId, action: active.action, at: active.at });
+    store.items[body.id] = {
+      ...meta, requests, sessions, activeLaunch: null, launchError: null,
+      ...(fresh.sourceResolved
+        ? { status: 'resolved', deferredUntil: null }
+        : active.action === 'start' ? { status: 'in-progress', deferredUntil: null } : {}),
+    };
+    return true;
+  });
+  const launchActions = ['discuss', 'start'].includes(body.action);
+  if (launchActions && initialMeta.activeLaunch) {
+    const active = initialMeta.activeLaunch;
+    if (source.sourceResolved) {
+      if (!finishActive(active)) throw new QueueError(409, 'review queue launch state changed during resolution; refresh and try again');
+      const item = snapshot({ ...options, now }).items.find((entry) => entry.id === body.id);
+      return { ok: true, sessionId: active.sessionId, item };
+    }
+    if (active.phase === 'delivered') {
+      if (!finishActive(active)) throw new QueueError(409, 'review queue launch state changed during recovery; refresh and try again');
+      const item = snapshot({ ...options, now }).items.find((entry) => entry.id === body.id);
+      return { ok: true, sessionId: active.sessionId, item };
+    }
+    if (active.ownerId === ownerId && !active.error) {
+      const item = snapshot({ ...options, now }).items.find((entry) => entry.id === body.id);
+      throw new QueueError(409, 'review queue conversation is still opening', { sessionId: active.sessionId, item });
+    }
+    let inspection = { state: 'unknown', message: 'terminal host is unavailable; launch state cannot be reconciled safely' };
+    if (deps.inspectLaunch) inspection = await deps.inspectLaunch(active);
+    else if (deps.findLaunchedSession) {
+      const found = await deps.findLaunchedSession(active.sessionId);
+      inspection = found?.pane ? { state: 'present', pane: found.pane } : { state: 'absent' };
+    }
+    if (!inspection || inspection.state === 'unknown') {
+      const message = inspection?.message || 'terminal host is unavailable; launch state cannot be reconciled safely';
+      updateStore(root, withLock, (store) => {
         const meta = itemMeta(store, body.id);
-        if (meta.activeLaunch?.sessionId !== active.sessionId) return false;
-        const sessions = Array.isArray(meta.sessions) ? [...meta.sessions] : [];
-        if (!sessions.some((entry) => entry.id === active.sessionId)) {
-          sessions.push({ id: active.sessionId, action: active.action, at: active.at });
-        }
+        if (meta.activeLaunch?.sessionId !== active.sessionId) return;
         store.items[body.id] = {
-          ...meta, sessions,
-          activeLaunch: { ...active, pane: found.pane, error: 'daemon interrupted launch after creating this conversation' },
-          launchError: { message: 'daemon interrupted launch after creating this conversation', at, sessionId: active.sessionId },
+          ...meta,
+          activeLaunch: { ...meta.activeLaunch, ...(inspection?.pane ? { pane: inspection.pane } : {}), error: message },
+        };
+      });
+      const item = snapshot({ ...options, now }).items.find((entry) => entry.id === body.id);
+      throw new QueueError(503, message, { sessionId: active.sessionId, item });
+    }
+    if (inspection.state === 'absent') {
+      updateStore(root, withLock, (store) => {
+        const meta = itemMeta(store, body.id);
+        if (meta.activeLaunch?.sessionId !== active.sessionId) return;
+        const requests = { ...(meta.requests || {}) };
+        requests[active.requestId] = { ...requests[active.requestId], state: 'failed', status: 502, error: 'reserved conversation is no longer present in the terminal host' };
+        store.items[body.id] = {
+          ...meta, requests, activeLaunch: null,
+          launchError: { message: 'The previous conversation exited before launch completed. You can start another conversation.', at, sessionId: null },
+          status: active.previousStatus || 'needs-decision',
+        };
+      });
+      initialMeta = itemMeta(loadStore(root, { strict: true }), body.id);
+      existingItem = publicItem(source, initialMeta, at);
+      if (requestId === active.requestId) {
+        throw new QueueError(502, 'reserved conversation is no longer present in the terminal host', { item: existingItem });
+      }
+    } else if (inspection.state === 'present') {
+      const pane = inspection.pane;
+      updateStore(root, withLock, (store) => {
+        const meta = itemMeta(store, body.id);
+        if (meta.activeLaunch?.sessionId !== active.sessionId) return;
+        const sessions = Array.isArray(meta.sessions) ? [...meta.sessions] : [];
+        if (!sessions.some((entry) => entry.id === active.sessionId)) sessions.push({ id: active.sessionId, action: active.action, at: active.at });
+        store.items[body.id] = {
+          ...meta, sessions, activeLaunch: { ...meta.activeLaunch, pane },
           ...(active.action === 'start' ? { status: 'in-progress', deferredUntil: null } : {}),
         };
-        return true;
       });
-      if (!recovered) throw new QueueError(409, 'review queue launch state changed during recovery; refresh and try again');
+      const recoverable = !active.phase || ['reserved', 'spawned'].includes(active.phase);
+      if (recoverable && deps.recoverLaunch) {
+        const claimed = updateStore(root, withLock, (store) => {
+          const meta = itemMeta(store, body.id);
+          if (meta.activeLaunch?.sessionId !== active.sessionId) return false;
+          if (meta.activeLaunch.recoveryOwner === ownerId) return false;
+          store.items[body.id] = { ...meta, activeLaunch: { ...meta.activeLaunch, recoveryOwner: ownerId } };
+          return true;
+        });
+        if (!claimed) {
+          const item = snapshot({ ...options, now }).items.find((entry) => entry.id === body.id);
+          throw new QueueError(409, 'review queue launch recovery is already running', { sessionId: active.sessionId, item });
+        }
+        let recoveryPhase = active.phase || 'reserved';
+        const recordRecoveryPhase = (phase) => {
+          recoveryPhase = phase;
+          return updateStore(root, withLock, (store) => {
+            const meta = itemMeta(store, body.id);
+            if (meta.activeLaunch?.sessionId !== active.sessionId) return false;
+            store.items[body.id] = { ...meta, activeLaunch: { ...meta.activeLaunch, phase, error: null } };
+            return true;
+          });
+        };
+        try {
+          await deps.recoverLaunch({ ...active, pane }, {
+            onReady: () => recordRecoveryPhase('ready'),
+            onDelivered: () => recordRecoveryPhase('delivered'),
+          });
+          recordRecoveryPhase('delivered');
+          if (!finishActive(active)) throw new QueueError(409, 'review queue launch state changed during recovery; refresh and try again');
+          const item = snapshot({ ...options, now }).items.find((entry) => entry.id === body.id);
+          return { ok: true, sessionId: active.sessionId, item };
+        } catch (error) {
+          const message = String(error.message || error).slice(0, 500);
+          updateStore(root, withLock, (store) => {
+            const meta = itemMeta(store, body.id);
+            if (meta.activeLaunch?.sessionId !== active.sessionId) return;
+            store.items[body.id] = {
+              ...meta,
+              activeLaunch: { ...meta.activeLaunch, phase: recoveryPhase, error: message, recoveryOwner: null },
+              launchError: { message, at: now(), sessionId: active.sessionId },
+            };
+          });
+          const item = snapshot({ ...options, now }).items.find((entry) => entry.id === body.id);
+          throw new QueueError(Number(error.status) || 409, message, { sessionId: active.sessionId, item });
+        }
+      }
+      const message = active.phase === 'ready'
+        ? 'opening-message delivery may have started; open the existing conversation and verify it before sending anything again'
+        : 'the reserved conversation exists, but opening instructions could not be recovered automatically';
+      updateStore(root, withLock, (store) => {
+        const meta = itemMeta(store, body.id);
+        if (meta.activeLaunch?.sessionId !== active.sessionId) return;
+        store.items[body.id] = {
+          ...meta, activeLaunch: { ...meta.activeLaunch, error: message },
+          launchError: { message, at, sessionId: active.sessionId },
+        };
+      });
       const item = snapshot({ ...options, now }).items.find((entry) => entry.id === body.id);
-      throw new QueueError(409, 'the conversation was created before the daemon was interrupted; open the existing conversation and verify whether its instructions arrived', {
-        sessionId: active.sessionId, item,
-      });
+      throw new QueueError(409, message, { sessionId: active.sessionId, item });
     }
-  }
-  if (['discuss', 'start'].includes(body.action) && initialMeta.activeLaunch?.pane) {
-    throw new QueueError(409, 'a conversation already exists for this launch; open it and verify whether its instructions arrived', {
-      sessionId: initialMeta.activeLaunch.sessionId, item: existingItem,
-    });
   }
   if (existingItem.status === 'resolved') throw new QueueError(409, 'review queue item is already resolved', { item: existingItem });
   if (existingItem.status === 'in-progress' && !['discuss', 'dismiss'].includes(body.action)) {
@@ -410,21 +534,14 @@ async function act(body, deps = {}) {
     if (current.status === 'in-progress' && body.action === 'start' && !active?.pane) {
       throw new QueueError(409, 'review item is already in progress', { item: current });
     }
-    if (active && active.pane) {
-      throw new QueueError(409, 'a conversation already exists for this launch; open it and verify whether its instructions arrived', {
-        sessionId: active.sessionId, item: current,
-      });
-    }
-    if (active && !active.error && at - Number(active.at || 0) < STALE_LAUNCH_MS) {
-      throw new QueueError(409, 'this review queue item is already opening');
-    }
-    if (active && requests[active.requestId]?.state === 'launching') {
-      requests[active.requestId] = { ...requests[active.requestId], state: 'failed', status: 502, error: active.error || 'launch was interrupted before a pane was created' };
-    }
+    if (active) throw new QueueError(409, 'review queue launch state changed; refresh while Keep reconciles the reserved conversation', { item: current });
     const sessionId = (deps.randomUUID || crypto.randomUUID)();
     requests[requestId] = { state: 'launching', action: body.action, sessionId, at };
     store.items[body.id] = {
-      ...meta, requests, activeLaunch: { requestId, action: body.action, sessionId, at },
+      ...meta, requests, activeLaunch: {
+        requestId, action: body.action, card: source.card, sessionId, at,
+        phase: 'reserved', ownerId, previousStatus: current.status,
+      },
       launchError: null, at,
     };
     return { sessionId };
@@ -438,8 +555,18 @@ async function act(body, deps = {}) {
   }
 
   let observedLaunch = null;
+  let observedPhase = 'reserved';
+  const recordPhase = (phase) => {
+    observedPhase = phase;
+    return updateStore(root, withLock, (store) => {
+      const meta = itemMeta(store, body.id);
+      if (meta.activeLaunch?.requestId !== requestId) throw new QueueError(409, 'review queue launch reservation changed');
+      store.items[body.id] = { ...meta, activeLaunch: { ...meta.activeLaunch, phase, error: null } };
+    });
+  };
   const onLaunched = (launch) => {
     observedLaunch = launch;
+    observedPhase = 'spawned';
     return updateStore(root, withLock, (store) => {
       const meta = itemMeta(store, body.id);
       if (meta.activeLaunch?.requestId !== requestId) throw new QueueError(409, 'review queue launch reservation changed');
@@ -450,17 +577,24 @@ async function act(body, deps = {}) {
       }
       store.items[body.id] = {
         ...meta, sessions,
-        activeLaunch: { ...meta.activeLaunch, pane: launch.pane },
+        activeLaunch: { ...meta.activeLaunch, pane: launch.pane, phase: 'spawned', error: null },
         ...(fresh.sourceResolved
           ? { status: 'resolved', deferredUntil: null }
           : body.action === 'start' ? { status: 'in-progress', deferredUntil: null } : {}),
       };
     });
   };
+  const onReady = () => recordPhase('ready');
+  const onDelivered = () => recordPhase('delivered');
 
   try {
     const message = launchInstructions(source, body.action, sources);
     const pointer = (deps.writeHandoff || writeHandoff)(root, body.id, requestId, message);
+    updateStore(root, withLock, (store) => {
+      const meta = itemMeta(store, body.id);
+      if (meta.activeLaunch?.requestId !== requestId) throw new QueueError(409, 'review queue launch reservation changed before opening');
+      store.items[body.id] = { ...meta, activeLaunch: { ...meta.activeLaunch, pointer } };
+    });
     const launch = await deps.launch({
       taskId: source.card,
       fresh: true,
@@ -469,6 +603,8 @@ async function act(body, deps = {}) {
       sessionId: reservation.sessionId,
       action: body.action,
       onLaunched,
+      onReady,
+      onDelivered,
     });
     const sessionId = launch.sessionId || reservation.sessionId;
     updateStore(root, withLock, (store) => {
@@ -497,11 +633,14 @@ async function act(body, deps = {}) {
       const active = meta.activeLaunch?.requestId === requestId ? meta.activeLaunch : null;
       const pane = active?.pane || observedLaunch?.pane;
       const requests = { ...(meta.requests || {}) };
-      requests[requestId] = { ...requests[requestId], state: 'failed', status, error: failure, pane };
+      requests[requestId] = { ...requests[requestId], state: 'unknown', status, error: failure, pane };
       partialSessionId = pane ? reservation.sessionId : undefined;
       store.items[body.id] = {
         ...meta, requests,
-        activeLaunch: pane ? { ...(active || { requestId, action: body.action, sessionId: reservation.sessionId, at }), pane, error: failure } : null,
+        activeLaunch: {
+          ...(active || { requestId, action: body.action, sessionId: reservation.sessionId, at, ownerId }),
+          ...(pane ? { pane } : {}), phase: observedPhase, error: failure,
+        },
         launchError: { message: failure, at: now(), sessionId: partialSessionId || null },
       };
     });
@@ -512,9 +651,27 @@ async function act(body, deps = {}) {
   }
 }
 
+async function reconcile(deps = {}) {
+  const root = deps.root || keep.ROOT;
+  let store;
+  try { store = loadStore(root, { strict: true }); }
+  catch (error) { return [{ ok: false, error }]; }
+  const pending = Object.entries(store.items)
+    .filter(([, meta]) => meta && meta.activeLaunch)
+    .map(([id, meta]) => ({ id, ...meta.activeLaunch }));
+  const results = [];
+  for (const active of pending) {
+    try {
+      results.push(await act({ id: active.id, action: active.action, requestId: active.requestId }, deps));
+    } catch (error) {
+      results.push({ ok: false, id: active.id, status: error.status || 500, error });
+    }
+  }
+  return results;
+}
+
 module.exports = {
   QueueError,
-  STALE_LAUNCH_MS,
   storeFile,
   loadStore,
   saveStore,
@@ -525,4 +682,5 @@ module.exports = {
   writeHandoff,
   snapshot,
   act,
+  reconcile,
 };

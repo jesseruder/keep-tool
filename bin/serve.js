@@ -3263,10 +3263,12 @@ async function openSession(body, deps = {}) {
     await (deps.waitForHostAgent || waitForHostAgent)(target, agent, deps);
     launch.settled = true;
     if (message) {
+      if (deps.onOpeningReady) await deps.onOpeningReady(launch);
       await withInjectionLockRetry(
         () => (deps.typeOpeningMessage || typeOpeningMessage)(target, agent, message, deps), deps,
       );
       launch.sent = true;
+      if (deps.onOpeningDelivered) await deps.onOpeningDelivered(launch);
     }
     if (!launch.sessionId && handoff) {
       launch.sessionId = await (deps.waitForHostSessionId || waitForHostSessionId)(launch.pane, deps);
@@ -3303,12 +3305,45 @@ async function launchReviewQueueSession(request, deps = {}) {
     loadTask: deps.loadTask || keep.loadTaskAnywhere,
     randomUUID: () => request.sessionId,
     onLaunched: request.onLaunched,
+    onOpeningReady: request.onReady,
+    onOpeningDelivered: request.onDelivered,
     // A discussion is an advisory conversation. It must not take the parent
     // card's ownership/resume slot merely because somebody opened the item.
     linkLaunchedSession: request.action === 'discuss'
       ? () => null
       : (deps.linkLaunchedSession || keep.linkLaunchedSession),
   });
+}
+
+async function inspectReviewQueueLaunch(active, deps = {}) {
+  let panes;
+  try { panes = Object.prototype.hasOwnProperty.call(deps, 'panes') ? deps.panes : await listHostPanes({}, true); }
+  catch (error) { return { state: 'unknown', message: `terminal host lookup failed: ${error.message}` }; }
+  if (!Array.isArray(panes)) return { state: 'unknown', message: 'terminal host is unavailable; launch state cannot be reconciled safely' };
+  const matches = panes.filter((pane) => pane?.meta?.sessionId === active.sessionId);
+  const present = matches.find((pane) => pane.alive !== false && pane.agentAlive !== false);
+  if (present) return { state: 'present', pane: present.id };
+  const shell = matches.find((pane) => pane.alive !== false && pane.agentAlive === false);
+  if (shell && active.pane !== shell.id) {
+    return { state: 'unknown', pane: shell.id, message: 'reserved pane exists, but agent liveness needs another host observation' };
+  }
+  return { state: 'absent' };
+}
+
+async function recoverReviewQueueLaunch(active, hooks = {}, deps = {}) {
+  if (!active?.pane || !active.pointer) throw new InjectionError(409, 'reserved conversation has no recoverable pane or opening-message pointer');
+  const target = { pane: active.pane };
+  await (deps.waitForHostAgent || waitForHostAgent)(target, 'claude', deps);
+  if (hooks.onReady) await hooks.onReady();
+  await withInjectionLockRetry(
+    () => (deps.typeOpeningMessage || typeOpeningMessage)(target, 'claude', active.pointer, deps), deps,
+  );
+  if (hooks.onDelivered) await hooks.onDelivered();
+  if (active.action === 'start' && active.card) {
+    try { (deps.linkLaunchedSession || keep.linkLaunchedSession)(active.card, { id: active.sessionId, agent: 'claude' }); }
+    catch (error) { process.stderr.write(`keep serve: could not link recovered review queue session ${active.sessionId.slice(0, 8)} to ${active.card}: ${error.message}\n`); }
+  }
+  return { sessionId: active.sessionId, pane: active.pane, sent: true };
 }
 const scanCache = new Map(); // file -> { mtimeMs, size, info }
 const claudeSessionPathCache = new Map(); // session id -> transcript file
@@ -4829,11 +4864,8 @@ function start(deps = {}) {
             try {
               const result = await reviewQueue.act(body, {
                 launch: (request) => launchReviewQueueSession(request),
-                findLaunchedSession: async (sessionId) => {
-                  const panes = await listHostPanes({}, true);
-                  const pane = panes?.find((entry) => entry?.meta?.sessionId === sessionId && entry.alive !== false);
-                  return pane ? { pane: pane.id } : null;
-                },
+                inspectLaunch: (active) => inspectReviewQueueLaunch(active),
+                recoverLaunch: (active, hooks) => recoverReviewQueueLaunch(active, hooks),
               });
               broadcast();
               return json(res, 200, result);
@@ -5016,6 +5048,11 @@ function start(deps = {}) {
         res.end(body);
       } else if (url.pathname === '/api/state') {
         const panes = await listHostPanes(deps);
+        await reviewQueue.reconcile({
+          // Reconciliation may authorize a replacement launch after absence, so
+          // it must bypass the dashboard host-list cache and inspect a complete list.
+          inspectLaunch: (active) => inspectReviewQueueLaunch(active),
+        });
         const state = buildState({ hostPanes: panes, dashboard: true });
         const enriched = await addHostSessionState(state, { ...deps, panes });
         const body = JSON.stringify(wantsCompactState(req, url) ? compactState(enriched) : enriched);
@@ -5145,7 +5182,7 @@ module.exports = {
   agentProcessRows, liveSessionPids, liveSessionTick, restorePlan,
   annotatePaneAgents,
   readPaneRecord, sessionProjectFromTranscript, openSession,
-  launchReviewQueueSession,
+  launchReviewQueueSession, inspectReviewQueueLaunch, recoverReviewQueueLaunch,
   waitForHostAgent, waitForHostSessionId, addHostSessionState,
   sendToSession, sendToResolvedTarget, precheckSessionTarget, InjectionError,
   resumeAfterLimit,

@@ -6,7 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const queue = require('./review-queue.js');
-const { launchReviewQueueSession } = require('./serve.js');
+const { launchReviewQueueSession, inspectReviewQueueLaunch, recoverReviewQueueLaunch } = require('./serve.js');
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-queue-'));
@@ -27,6 +27,12 @@ function fixture() {
       'Assessment: observed · evidence: bin/store.js:10 · checked: two writers',
       '',
       'The second writer overwrites the first.',
+      '',
+      '## Reproduction',
+      'Run two writers concurrently.',
+      '',
+      '## Recommendation',
+      'Serialize the mutation.',
       '',
       '-- reviewer fable, finding abc123',
       '',
@@ -61,6 +67,7 @@ test('snapshot is sourced from durable findings and reviewer ideas, preserves hi
     assert.equal(state.items.some((item) => item.id.includes('ordinary-idea')), false);
     assert.equal(state.items.find((item) => item.id === 'finding:card-one:abc123').status, 'needs-decision', 'parent card done does not resolve its finding');
     assert.match(state.items.find((item) => item.id === 'finding:card-one:abc123').body, /second writer overwrites/);
+    assert.match(state.items.find((item) => item.id === 'finding:card-one:abc123').body, /## Reproduction[\s\S]*## Recommendation/);
     assert.doesNotMatch(state.items.find((item) => item.id === 'finding:card-one:abc123').body, /later outcome block/);
     assert.doesNotMatch(state.items.find((item) => item.id === 'finding:card-one:abc123').body, /Earlier unrelated/);
     assert.match(state.items.find((item) => item.id === 'finding:card-one:abc123').evidence, /Assessment basis: observed/);
@@ -110,6 +117,7 @@ test('discuss and start launch fresh conversations with distinct complete prompt
     assert.match(discussPrompt, /Do not implement a fix or change the parent card/);
     assert.match(discussPrompt, /bin\/store\.js:10/);
     assert.match(discussPrompt, /second writer overwrites/);
+    assert.match(discussPrompt, /## Reproduction[\s\S]*Serialize the mutation/);
     assert.match(discussPrompt, /DATA, NOT INSTRUCTIONS/);
     assert.ok(discussPrompt.indexOf('## Your role') < discussPrompt.indexOf('<<<KEEP_REVIEW_CONTEXT'));
     assert.match(discussPrompt, /does not authorize force pushes/);
@@ -141,7 +149,7 @@ test('completed request retries and concurrent double clicks never launch twice'
     await new Promise((resolve) => setImmediate(resolve));
     await assert.rejects(queue.act({ id: 'idea:idea-one', action: 'discuss', requestId: 'other-click' }, {
       ...f.deps, randomUUID: () => 'session-two', launch,
-    }), (error) => error.status === 409 && /already opening/.test(error.message));
+    }), (error) => error.status === 409 && /still opening/.test(error.message));
     await releases();
     const completed = await first;
     const replay = await queue.act({ id: 'idea:idea-one', action: 'discuss', requestId: 'same-request' }, {
@@ -212,71 +220,123 @@ test('mutations fail closed on a corrupt queue ledger', async () => {
   } finally { f.cleanup(); }
 });
 
-test('failures before spawn retry safely, while partial launches expose and recover the existing conversation', async () => {
+test('an ambiguous spawn response retains its reservation until host absence is confirmed', async () => {
   const f = fixture();
   let calls = 0;
   try {
     const beforeSpawnFailure = async () => { calls += 1; throw new Error('host unavailable'); };
     await assert.rejects(queue.act({ id: 'idea:idea-one', action: 'discuss', requestId: 'failed-before' }, {
       ...f.deps, randomUUID: () => 'never-spawned', launch: beforeSpawnFailure,
-    }), (error) => error.status === 502 && !error.extra.sessionId);
+    }), (error) => error.status === 502 && error.extra.item.launchState.sessionId === 'never-spawned');
+    const pending = queue.snapshot(f.deps).items.find((item) => item.id === 'idea:idea-one');
+    assert.equal(pending.launchState.state, 'needs-attention');
+    assert.equal(pending.launchState.recoverable, true);
     await assert.rejects(queue.act({ id: 'idea:idea-one', action: 'discuss', requestId: 'failed-before' }, {
       ...f.deps, randomUUID: () => 'unused', launch: beforeSpawnFailure,
-    }), /host unavailable/);
+      inspectLaunch: async () => ({ state: 'unknown', message: 'host lookup unavailable' }),
+    }), (error) => error.status === 503 && /lookup unavailable/.test(error.message));
     const retried = await queue.act({ id: 'idea:idea-one', action: 'discuss', requestId: 'retry-before' }, {
-      ...f.deps, randomUUID: () => 'retry-session', launch: async (request) => {
+      ...f.deps, randomUUID: () => 'retry-session', inspectLaunch: async () => ({ state: 'absent' }), launch: async (request) => {
         calls += 1;
         await request.onLaunched({ pane: 'retry-pane' });
         return { sessionId: request.sessionId };
       },
     });
     assert.equal(retried.sessionId, 'retry-session');
-
-    const partial = async (request) => {
-      calls += 1;
-      await request.onLaunched({ pane: 'partial-pane' });
-      const error = new Error('prompt disappeared');
-      error.status = 409;
-      throw error;
-    };
-    await assert.rejects(queue.act({ id: 'finding:card-one:abc123', action: 'start', requestId: 'partial-one' }, {
-      ...f.deps, randomUUID: () => 'partial-session', launch: partial,
-    }), (error) => error.status === 409 && error.extra.sessionId === 'partial-session'
-      && error.extra.item.launchError.sessionId === 'partial-session');
-    await assert.rejects(queue.act({ id: 'finding:card-one:abc123', action: 'start', requestId: 'explicit-retry' }, {
-      ...f.deps, randomUUID: () => 'must-not-spawn', launch: partial,
-    }), (error) => error.status === 409 && error.extra.sessionId === 'partial-session'
-      && /conversation already exists/.test(error.message));
-    const item = queue.snapshot(f.deps).items.find((entry) => entry.id === 'finding:card-one:abc123');
-    assert.equal(item.status, 'in-progress');
-    assert.deepEqual(item.sessions.map((entry) => entry.id), ['partial-session']);
-    assert.equal(item.launchError.sessionId, 'partial-session');
-    assert.equal(calls, 3);
+    assert.equal(calls, 2);
   } finally { f.cleanup(); }
 });
 
-test('an interrupted daemon reconciles a host pane by reserved session id before retrying', async () => {
+test('response-loss recovery delivers to the same reserved session and is single-flight', async () => {
   const f = fixture();
-  let launched = false;
+  let recoverCalls = 0;
+  let releaseRecovery;
   try {
-    queue.saveStore({ version: 1, items: {
-      'idea:idea-one': {
-        requests: { abandoned: { state: 'launching', action: 'discuss', sessionId: 'reserved-session', at: 10 } },
-        activeLaunch: { requestId: 'abandoned', action: 'discuss', sessionId: 'reserved-session', at: 10 },
-      },
-    } }, f.root);
-    let failure;
-    try { await queue.act({ id: 'idea:idea-one', action: 'discuss', requestId: 'retry-after-daemon' }, {
+    await assert.rejects(queue.act({ id: 'idea:idea-one', action: 'discuss', requestId: 'lost-response' }, {
+      ...f.deps, randomUUID: () => 'reserved-session', launch: async () => { throw new Error('spawn response lost'); },
+    }), /spawn response lost/);
+    const recoveryDeps = {
       ...f.deps,
-      now: () => queue.STALE_LAUNCH_MS + 20,
-      findLaunchedSession: async (sessionId) => sessionId === 'reserved-session' ? { pane: 'surviving-pane' } : null,
-      launch: async () => { launched = true; },
-    }); } catch (error) { failure = error; }
-    assert.equal(failure.status, 409);
-    assert.equal(failure.extra.sessionId, 'reserved-session');
-    assert.equal(launched, false);
-    assert.equal(failure.extra.item.launchError.sessionId, 'reserved-session');
-    assert.deepEqual(failure.extra.item.sessions.map((entry) => entry.id), ['reserved-session']);
+      inspectLaunch: async (active) => {
+        assert.equal(active.sessionId, 'reserved-session');
+        return { state: 'present', pane: 'surviving-pane' };
+      },
+      recoverLaunch: async (active, hooks) => {
+        recoverCalls += 1;
+        assert.equal(active.sessionId, 'reserved-session');
+        assert.match(active.pointer, /review queue instructions/);
+        await hooks.onReady();
+        await new Promise((resolve) => { releaseRecovery = async () => { await hooks.onDelivered(); resolve(); }; });
+      },
+    };
+    const first = queue.act({ id: 'idea:idea-one', action: 'discuss', requestId: 'lost-response' }, recoveryDeps);
+    await new Promise((resolve) => setImmediate(resolve));
+    await assert.rejects(queue.act({ id: 'idea:idea-one', action: 'discuss', requestId: 'lost-response' }, recoveryDeps),
+      (error) => error.status === 409 && /still opening|already running/.test(error.message));
+    await releaseRecovery();
+    const result = await first;
+    assert.equal(result.sessionId, 'reserved-session');
+    assert.equal(recoverCalls, 1);
+    assert.equal(result.item.launchState, undefined);
+  } finally { f.cleanup(); }
+});
+
+test('a confirmed exited pane clears the reservation and permits a fresh action', async () => {
+  const f = fixture();
+  let calls = 0;
+  try {
+    await assert.rejects(queue.act({ id: 'finding:card-one:abc123', action: 'start', requestId: 'exited-first' }, {
+      ...f.deps, randomUUID: () => 'exited-session', launch: async (request) => {
+        calls += 1;
+        await request.onLaunched({ pane: 'exited-pane' });
+        throw new Error('daemon stopped after pane creation');
+      },
+    }), /daemon stopped/);
+    const result = await queue.act({ id: 'finding:card-one:abc123', action: 'start', requestId: 'fresh-after-exit' }, {
+      ...f.deps,
+      inspectLaunch: async () => ({ state: 'absent' }),
+      randomUUID: () => 'replacement-session',
+      launch: async (request) => {
+        calls += 1;
+        await request.onLaunched({ pane: 'replacement-pane' });
+        return { sessionId: request.sessionId };
+      },
+    });
+    assert.equal(result.sessionId, 'replacement-session');
+    assert.equal(result.item.status, 'in-progress');
+    assert.equal(result.item.launchState, undefined);
+    assert.equal(calls, 2);
+  } finally { f.cleanup(); }
+});
+
+test('ambiguous delivery is never retyped and automatic reconciliation clears it after exit', async () => {
+  const f = fixture();
+  let recoveryCalls = 0;
+  try {
+    await assert.rejects(queue.act({ id: 'idea:idea-one', action: 'discuss', requestId: 'ambiguous-delivery' }, {
+      ...f.deps, randomUUID: () => 'ambiguous-session', launch: async (request) => {
+        await request.onLaunched({ pane: 'ambiguous-pane' });
+        await request.onReady();
+        throw new Error('connection dropped during submit');
+      },
+    }), /connection dropped/);
+    let item = queue.snapshot(f.deps).items.find((entry) => entry.id === 'idea:idea-one');
+    assert.equal(item.launchState.state, 'needs-attention');
+    assert.equal(item.launchState.recoverable, false);
+    const present = await queue.reconcile({
+      ...f.deps, ownerId: 'replacement-daemon',
+      inspectLaunch: async () => ({ state: 'present', pane: 'ambiguous-pane' }),
+      recoverLaunch: async () => { recoveryCalls += 1; },
+    });
+    assert.equal(present[0].status, 409);
+    assert.equal(recoveryCalls, 0, 'typing may have begun, so reconciliation only exposes the conversation');
+    await queue.reconcile({
+      ...f.deps, ownerId: 'replacement-daemon',
+      inspectLaunch: async () => ({ state: 'absent' }),
+    });
+    item = queue.snapshot(f.deps).items.find((entry) => entry.id === 'idea:idea-one');
+    assert.equal(item.launchState, undefined);
+    assert.match(item.launchError.message, /exited before launch completed/);
   } finally { f.cleanup(); }
 });
 
@@ -309,4 +369,28 @@ test('serve launcher suppresses card linking for Discuss and preserves it for St
   assert.equal(captures[0].deps.randomUUID(), 'reserved');
   assert.equal(captures[0].deps.linkLaunchedSession(), null);
   assert.equal(captures[1].deps.linkLaunchedSession, link);
+});
+
+test('server recovery distinguishes unavailable, absent, exited, and live host panes and types once', async () => {
+  const active = { sessionId: 'reserved', pane: 'pane-live', pointer: 'read pointer', action: 'discuss' };
+  assert.deepEqual(await inspectReviewQueueLaunch(active, { panes: null }), {
+    state: 'unknown', message: 'terminal host is unavailable; launch state cannot be reconciled safely',
+  });
+  assert.deepEqual(await inspectReviewQueueLaunch(active, { panes: [] }), { state: 'absent' });
+  assert.deepEqual(await inspectReviewQueueLaunch(active, { panes: [{ id: 'old', alive: false, meta: { sessionId: 'reserved' } }] }), { state: 'absent' });
+  assert.deepEqual(await inspectReviewQueueLaunch(active, { panes: [{ id: 'shell', alive: true, agentAlive: false, meta: { sessionId: 'reserved' } }] }), {
+    state: 'unknown', pane: 'shell', message: 'reserved pane exists, but agent liveness needs another host observation',
+  });
+  assert.deepEqual(await inspectReviewQueueLaunch({ ...active, pane: 'shell' }, { panes: [{ id: 'shell', alive: true, agentAlive: false, meta: { sessionId: 'reserved' } }] }), { state: 'absent' });
+  assert.deepEqual(await inspectReviewQueueLaunch(active, { panes: [{ id: 'live', alive: true, meta: { sessionId: 'reserved' } }] }), { state: 'present', pane: 'live' });
+  const events = [];
+  await recoverReviewQueueLaunch(active, {
+    onReady: () => events.push('ready'), onDelivered: () => events.push('delivered'),
+  }, {
+    waitForHostAgent: async () => events.push('wait'),
+    typeOpeningMessage: async (target, agent, message) => events.push({ target, agent, message }),
+  });
+  assert.deepEqual(events, [
+    'wait', 'ready', { target: { pane: 'pane-live' }, agent: 'claude', message: 'read pointer' }, 'delivered',
+  ]);
 });
