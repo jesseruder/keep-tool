@@ -234,6 +234,8 @@ function loadAll(includeArchive) {
 function saveTask(task) {
   let oldTask = null;
   try { oldTask = parseTask(fs.readFileSync(taskPath(task.id), 'utf8'), task.id); } catch {}
+  if (task.fm.status === 'done' && oldTask?.fm.status !== 'done') task.fm.done_at = nowStamp();
+  else if (task.fm.status !== 'done') delete task.fm.done_at;
   task.fm.updated = nowStamp();
   fs.writeFileSync(taskPath(task.id), serializeTask(task));
   recordDoneTransition(task, oldTask && oldTask.fm.status, { oldTask });
@@ -2888,9 +2890,9 @@ commands.ask = async (argv) => {
 };
 
 commands.answer = async (argv) => {
-  const o = parseArgs(argv, {});
+  const o = parseArgs(argv, { 'no-deliver': 'bool' });
   const id = o._[0];
-  if (o._.length !== 1 || !o.m) die('usage: keep answer <qid> -m "<answer>"');
+  if (o._.length !== 1 || !o.m) die('usage: keep answer <qid> [--no-deliver] -m "<answer>"');
   const answer = String(o.m).replace(/\s+/g, ' ').trim();
   if (!answer) die('an answer is required');
   const review = require('./review.js');
@@ -2906,16 +2908,29 @@ commands.answer = async (argv) => {
     reviewer: fromReviewer,
   };
   const selfAnswer = Boolean(session && question.from?.sessionId === session.id && question.from?.agent === session.agent);
+  const suppressDelivery = o['no-deliver'] === true;
   let claimed = false;
   const current = review.updateQuestion(id, (fresh) => {
     if (fresh.status !== 'open') return null;
     claimed = true;
+    const answeredAt = Date.now();
     return {
       status: 'answered',
-      answeredAt: Date.now(),
+      answeredAt,
       answer,
       answeredBy,
-      ...(selfAnswer ? { answerDelivery: { pending: false, attempts: 0, acknowledgedAt: Date.now(), reason: 'answered-in-owning-session' } } : {}),
+      ...((selfAnswer || suppressDelivery) ? { answerDelivery: {
+        pending: false,
+        attempts: 0,
+        acknowledgedAt: answeredAt,
+        reason: suppressDelivery ? 'delivery-suppressed' : 'answered-in-owning-session',
+      } } : {}),
+      ...(suppressDelivery && fresh.timeoutDelivery ? { timeoutDelivery: {
+        ...fresh.timeoutDelivery,
+        pending: false,
+        acknowledgedAt: answeredAt,
+        reason: 'delivery-suppressed',
+      } } : {}),
     };
   });
   if (!claimed) die(`${id} is already ${current ? current.status : 'missing'}`);
@@ -2939,7 +2954,9 @@ commands.answer = async (argv) => {
       notes.push(`could not record on ${current.task}: ${error.message}`);
     }
   }
-  if (selfAnswer) {
+  if (suppressDelivery) {
+    notes.push('delivery suppressed; no terminal delivery or retry queued');
+  } else if (selfAnswer) {
     notes.push('already in the asking session; no terminal delivery needed');
   } else if (current.from && current.from.sessionId) {
     try {
@@ -5893,7 +5910,7 @@ function helpText() {
 ${stepUsage()}
   keep ask "<question>" [--owner] [--about <project>] [--task <id>] [--timeout <min>]
                          # --owner queues it for Owner (no timeout, no reviewer)
-  keep answer <qid> -m "<answer>"
+  keep answer <qid> [--no-deliver] -m "<answer>"   # --no-deliver saves without waking the asking session or queuing retries
   keep questions [--all]
   keep decide <type> [--card <id>] [--session <sid>] --send "<message>" -m "why"
                          # the reviewer records what it WOULD do; nothing is sent

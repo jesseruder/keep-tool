@@ -59,7 +59,7 @@ keep step done <project> <step> [--artifact <id>] [--sha <sha>] [--force] [-m no
 keep step fail <project> <step> [--force] -m "why"
 keep step notify <project> <step>
 keep ask "<question>" [--owner] [--about <project>] [--task <id>] [--timeout <min>]
-keep answer <qid> -m "<answer>"
+keep answer <qid> [--no-deliver] -m "<answer>"
 keep questions [--all]
 keep alert -m "text" --level attention|urgent [--key k] [--card id] [--from name] [--dry]
 keep quiet <duration>|off
@@ -435,6 +435,10 @@ instead. `keep questions [--all]` inspects the ledger; hand-run questions withou
 session remain on the ledger/card only. Failed answer and timeout-notice sends enter
 an outbox in the question ledger; the daemon retries each pending delivery once per
 tick for up to 20 attempts and records its delivery time or that it gave up.
+
+Use `keep answer <qid> --no-deliver -m "..."` to resolve a stale question without
+waking its asking session. The answer and its author are still recorded in the ledger
+and on the associated card, while answer and timeout delivery retries are suppressed.
 
 Long messages injected into sessions are typed in paced chunks and, for Claude
 sessions, verified against the transcript after submit; truncated delivery is logged.
