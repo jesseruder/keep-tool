@@ -2251,11 +2251,16 @@ async function screenHistorySession(query, deps = {}) {
   }
 
   const tailLines = sessionLinesLimit(get('tailLines') == null ? 120 : get('tailLines'));
-  const readHistoryScreen = deps.readHistoryScreen || ((resolved, tail, innerDeps) => hostRequest('screen', {
-    pane: resolved.pane,
-    lines: tail,
-    scrollback: SCREEN_HISTORY_SCROLLBACK,
-  }, innerDeps));
+  const readHistoryScreen = deps.readHistoryScreen || (async (resolved, tail, innerDeps) => {
+    const hello = await hostRequest('hello', {}, innerDeps);
+    if (!hello.compactScreen) throw new InjectionError(503, 'terminal host reload required to load history');
+    return hostRequest('screen', {
+      pane: resolved.pane,
+      lines: null,
+      compact: true,
+      scrollback: SCREEN_HISTORY_SCROLLBACK,
+    }, innerDeps);
+  });
   const screen = await readHistoryScreen(target, tailLines, deps);
   const confirmedIncarnation = await readIncarnation(target, deps);
   if (confirmedIncarnation !== incarnation) {
@@ -2280,6 +2285,7 @@ async function screenHistorySession(query, deps = {}) {
   try {
     return cache.create({
       key,
+      truncated: screen && screen.truncated === true,
       lines: cleanLines.slice(0, splitAt),
       tail: cleanLines.slice(splitAt),
       meta,

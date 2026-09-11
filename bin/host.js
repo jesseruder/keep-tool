@@ -142,8 +142,8 @@ function renderScreen(term, options = {}) {
   const rows = [];
   for (let index = first; index < viewportStart; index += 1) rows.push(trimLine(buffer, index));
   for (let index = visibleStart; index < viewportEnd; index += 1) rows.push(trimLine(buffer, index));
-  return {
-    text: rows.join('\n'),
+  const result = {
+    ...(options.compact ? {} : { text: rows.join('\n') }),
     lines: rows,
     cursor: { x: buffer.cursorX, y: buffer.cursorY },
     cols: term.cols,
@@ -151,6 +151,24 @@ function renderScreen(term, options = {}) {
     alt: buffer.type === 'alternate',
     title: options.title == null ? (term.title || '') : options.title,
   };
+  if (options.compact) {
+    // Leave room for the protocol envelope. Count JSON bytes, including escaping,
+    // rather than the smaller raw terminal text, before encoding the host frame.
+    const limit = 7 * 1024 * 1024;
+    const scrollbackLines = viewportStart - first;
+    result.scrollbackLines = scrollbackLines;
+    result.truncated = false;
+    const metadataBytes = Buffer.byteLength(JSON.stringify({ ...result, lines: [], truncated: true }));
+    const rowBytes = rows.map((row) => Buffer.byteLength(JSON.stringify(row)) + 1);
+    let bytes = metadataBytes + rowBytes.reduce((sum, size) => sum + size, 0);
+    let removed = 0;
+    while (bytes > limit && removed < scrollbackLines) bytes -= rowBytes[removed++];
+    if (bytes > limit) throw new Error('terminal viewport exceeds history snapshot limit');
+    result.lines = rows.slice(removed);
+    result.scrollbackLines -= removed;
+    result.truncated = removed > 0;
+  }
+  return result;
 }
 
 function socketPath() {
@@ -537,7 +555,7 @@ function createHost(options = {}) {
     switch (params.type) {
       case 'hello':
         return { result: {
-          version: 1, replaceExited: true, guardedKill: true,
+          version: 1, replaceExited: true, guardedKill: true, compactScreen: true,
           bootVersion: options.boot && options.boot.version || null,
           panes: panes.size, pid: process.pid, sock,
           reloads: options.boot && options.boot.reloads || 0,
@@ -725,7 +743,7 @@ function createHost(options = {}) {
         const pane = needPane(params.pane);
         await settled(pane);
         if (panes.get(pane.id) !== pane) throw new Error('pane process changed');
-        return { result: renderScreen(pane.term, { lines: params.lines, scrollback: params.scrollback, title: pane.title }) };
+        return { result: renderScreen(pane.term, { lines: params.compact ? null : params.lines, scrollback: params.scrollback, title: pane.title, compact: params.compact === true }) };
       }
       case 'clear': {
         const pane = needPane(params.pane);

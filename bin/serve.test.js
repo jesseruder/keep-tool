@@ -2683,9 +2683,10 @@ test('screen history takes one stable full host snapshot and returns bounded old
   const history = Array.from({ length: 450 }, (_, index) => `old-${index}`);
   const tail = Array.from({ length: 40 }, (_, index) => `live-${index}`);
   const host = recordingHost((type, params) => {
+    if (type === 'hello') return { compactScreen: true };
     if (type === 'get') return { pane: { id: 'pane-screen', pid: 42, createdAt: '2026-09-10T00:00:00Z' } };
     if (type === 'screen') {
-      assert.deepEqual(params, { pane: 'pane-screen', lines: 120, scrollback: 10000 });
+      assert.deepEqual(params, { pane: 'pane-screen', lines: null, compact: true, scrollback: 10000 });
       return { lines: [...history, ...tail], cols: 120, rows: 40, title: 'history', alt: false };
     }
     return {};
@@ -3552,4 +3553,28 @@ test('open types the complete handoff file pointer into a fresh session', async 
     typeOpeningMessage: async (...args) => rejected.push(args),
   }), (error) => error.status === 409 && /reservation changed before/.test(error.message));
   assert.deepEqual(rejected, [], 'a failed readiness gate prevents the opening message from being typed');
+});
+
+test('screen history retains rows above a capped live tail and propagates host truncation', async () => {
+  const viewport = Array.from({ length: 200 }, (_, i) => `viewport-${i}`);
+  const result = await screenHistorySession({ pane: 'pane-shell' }, {
+    shellPaneTarget: async (pane) => ({ pane }),
+    paneIncarnation: async () => 'pane-shell:7:created',
+    readHistoryScreen: async () => ({ lines: viewport, rows: 200, truncated: true }),
+    screenHistoryCache: createScreenHistoryCache(),
+  });
+  assert.deepEqual(result.lines, viewport.slice(0, 80));
+  assert.deepEqual(result.tail, viewport.slice(80));
+  assert.equal(result.truncated, true);
+});
+
+test('screen history refuses an old host before requesting an oversized snapshot', async () => {
+  const host = recordingHost((type) => {
+    assert.equal(type, 'hello');
+    return { version: 1 };
+  });
+  await assert.rejects(screenHistorySession({ pane: 'pane-shell' }, {
+    shellPaneTarget: async (pane) => ({ pane }),
+    paneIncarnation: async () => 'pane-shell:7:created', host,
+  }), (error) => error.status === 503 && /host reload required/.test(error.message));
 });

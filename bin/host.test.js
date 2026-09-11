@@ -1129,3 +1129,23 @@ test('core cache eviction leaves shared sibling modules cached', () => {
   assert.ok(require.cache[keepPath]);
   require(hostPath);
 });
+
+test('compact screen bounds escaped multibyte history before framing and preserves viewport', () => {
+  const history = '\"\\漢'.repeat(400);
+  const term = { cols: 1200, rows: 200, buffer: { active: {
+    viewportY: 10000, cursorX: 0, cursorY: 199, type: 'normal',
+    getLine: (index) => ({ translateToString: () => index < 10000 ? history : `viewport-${index - 10000}` }),
+  } } };
+  const screen = renderScreen(term, { compact: true, scrollback: 10000, title: '漢'.repeat(10000) });
+  assert.equal(Object.hasOwn(screen, 'text'), false);
+  assert.equal(screen.truncated, true);
+  assert.ok(screen.scrollbackLines > 0);
+  assert.deepEqual(screen.lines.slice(screen.scrollbackLines), Array.from({ length: 200 }, (_, i) => `viewport-${i}`));
+  assert.ok(Buffer.byteLength(JSON.stringify(screen)) < 7 * 1024 * 1024);
+  const frames = [];
+  const decoder = new FrameDecoder((frame) => frames.push(frame), (error) => assert.fail(error));
+  decoder.push(encodeFrame({ id: 1, result: screen }));
+  assert.equal(frames.length, 1);
+  term.buffer.active.getLine = () => ({ translateToString: () => '漢'.repeat(20000) });
+  assert.throws(() => renderScreen(term, { compact: true }), /viewport exceeds/);
+});

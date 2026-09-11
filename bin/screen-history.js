@@ -62,7 +62,7 @@ function createScreenHistoryCache(options = {}) {
   };
 
   return {
-    create({ key, lines, tail, meta }, pageSize) {
+    create({ key, lines, tail, meta, truncated = false }, pageSize) {
       prune();
       const safeTail = Array.isArray(tail) ? tail.map(String) : [];
       const tailBytes = linesBytes(safeTail);
@@ -79,7 +79,7 @@ function createScreenHistoryCache(options = {}) {
         tail: safeTail,
         meta: { ...meta },
         bytes: retained.bytes + tailBytes,
-        truncated: retained.truncated,
+        truncated: truncated || retained.truncated,
         createdAt: now(),
       };
       while (snapshots.size >= maxSnapshots || (snapshots.size && totalBytes + snapshot.bytes > maxTotalBytes)) {
