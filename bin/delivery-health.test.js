@@ -86,6 +86,10 @@ test('persistent delivery faults enter health attention once, stay stable, and r
     assert.match(first.text, /codex-session.*receipt-missing.*keep pane screen codex-pane/);
     tick({ ...f, health, now: f.now + 180e3 });
     assert.equal(attention()[0].at, first.at, 'polling must not reannounce the same incident');
+    const newer = f.add('claude', { createdAt: f.now - 150e3 });
+    tick({ ...f, health, now: f.now + 200e3 });
+    assert.equal(attention()[0].at, newer.createdAt, 'a new stuck delivery must surface while the older one remains');
+    fs.appendFileSync(newer.file, JSON.stringify({ type: 'user', message: { content: f.message } }) + '\n');
     fs.appendFileSync(entry.file, JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: f.message }] } }) + '\n');
     tick({ ...f, health, now: f.now + 240e3 });
     assert.deepEqual(attention(), []);

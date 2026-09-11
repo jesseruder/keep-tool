@@ -61,7 +61,9 @@ function tick(options = {}) {
   const health = options.health || require('./health');
   try {
     const issues = inspect(options);
-    const first = issues[0];
+    // A new stuck attempt must get a new attention event even if an older one
+    // remains unresolved; routine polling and recovery of older ones must not.
+    const first = issues.at(-1);
     const detail = first
       ? `${issues.length} unconfirmed delivery issue(s): ${first.agent || 'unknown'} ${first.sessionId || first.journal}; ${first.reason}. ${first.pane ? 'Inspect: keep pane screen ' + first.pane : 'Inspect delivery journals'}. Full list: node bin/delivery-health.js`
       : 'No stale unconfirmed deliveries';
