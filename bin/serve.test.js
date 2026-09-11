@@ -85,6 +85,8 @@ const {
   resumeAfterLimit,
   agentPromptVisible,
   isInjectionBusy,
+  withInjectionLock,
+  sendToSessionLocked,
   InjectionError,
 } = require('./serve.js');
 const { createScreenHistoryCache } = require('./screen-history.js');
@@ -3413,6 +3415,149 @@ test('a host request timeout releases the injection lock', async () => {
     hostRequestTimeoutMs: 5,
     loadTask: () => ({ fm: { project: os.tmpdir(), sessions: [] } }),
   }), /host request timed out \(spawn\)/);
+  assert.equal(isInjectionBusy(), false);
+});
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function until(check) {
+  for (let i = 0; i < 200 && !check(); i += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(check(), 'condition never became true');
+}
+
+const injectionBusy429 = (error) => error instanceof InjectionError && error.status === 429
+  && error.message === 'another session injection is busy';
+
+// Two live Claude panes. The stub delivery records what it typed and, for a gated pane,
+// stays "mid-typing" until the test releases it.
+function paneLockSendDeps(typed, gates = {}) {
+  return {
+    host: {
+      request: async (type) => (type === 'list' ? { panes: [
+        { id: 'pane-a', alive: true, meta: { sessionId: 'sess-a', agent: 'claude' } },
+        { id: 'pane-b', alive: true, meta: { sessionId: 'sess-b', agent: 'claude' } },
+      ] } : {}),
+    },
+    loadCurrentSession: (id) => ({ id, kind: 'claude' }),
+    sendToResolvedTarget: async (_session, target, text) => {
+      typed.push(`${target.pane}:${text}`);
+      if (gates[target.pane]) await gates[target.pane].promise;
+      return { ok: true, pane: target.pane };
+    },
+  };
+}
+
+test('sends to different panes hold separate injection locks and run concurrently', async () => {
+  const typed = [];
+  const gateA = deferred();
+  const deps = paneLockSendDeps(typed, { 'pane-a': gateA });
+  const first = sendToSessionLocked({ sessionId: 'sess-a', text: 'to a' }, deps);
+  await until(() => typed.length === 1);
+  // The send into pane-a is still typing; a send into pane-b does not wait for it.
+  assert.deepEqual(await sendToSessionLocked({ sessionId: 'sess-b', text: 'to b' }, deps), { ok: true, pane: 'pane-b' });
+  assert.equal(isInjectionBusy(), true);
+  gateA.resolve();
+  assert.deepEqual(await first, { ok: true, pane: 'pane-a' });
+  assert.deepEqual(typed, ['pane-a:to a', 'pane-b:to b']);
+  assert.equal(isInjectionBusy(), false);
+});
+
+test('a second injection into the same pane gets the busy 429 until the first finishes', async () => {
+  const typed = [];
+  const gateA = deferred();
+  const deps = paneLockSendDeps(typed, { 'pane-a': gateA });
+  const paneDeps = { shellPaneTarget: async (pane) => ({ pane }), writeTarget: async (target) => { typed.push(`${target.pane}:raw`); } };
+  const first = sendToSessionLocked({ sessionId: 'sess-a', text: 'first' }, deps);
+  await until(() => typed.length === 1);
+  await assert.rejects(sendToSessionLocked({ sessionId: 'sess-a', text: 'second' }, deps), injectionBusy429);
+  // The send claimed the pane it resolved, so writes that address the pane directly collide too.
+  await assert.rejects(writeToShellPane({ pane: 'pane-a', text: 'ls' }, paneDeps), injectionBusy429);
+  await assert.rejects(sendSessionKeys({ pane: 'pane-a', keys: ['Enter'] }, paneDeps), injectionBusy429);
+  gateA.resolve();
+  await first;
+  assert.deepEqual(await sendToSessionLocked({ sessionId: 'sess-a', text: 'second' }, deps), { ok: true, pane: 'pane-a' });
+  assert.deepEqual(typed, ['pane-a:first', 'pane-a:second']);
+  assert.equal(isInjectionBusy(), false);
+});
+
+test('a compaction locks only its own pane: other panes take sends, its pane and other compactions get 429', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-pane-lock-compact-test-'));
+  const dir = path.join(root, 'compact');
+  fs.mkdirSync(dir);
+  const transcript = path.join(root, 'transcript.jsonl');
+  fs.writeFileSync(transcript, '{}\n');
+  const priorTimeout = process.env.KEEP_COMPACT_TIMEOUT_MS;
+  process.env.KEEP_COMPACT_TIMEOUT_MS = '0';
+  const compactDeps = (onType) => ({
+    dir,
+    sessionLastTurn: () => ({ model: '' }),
+    readClaudeSettingsModel: () => ({ ok: true, present: false, value: '' }),
+    transcriptFileForSession: () => transcript,
+    typeAndSubmit: async (_target, command) => onType(command),
+  });
+  try {
+    const submitted = deferred();
+    const finish = deferred();
+    const compacting = compactSession({ id: 'sess-a', kind: 'claude' }, { pane: 'pane-a' }, null,
+      compactDeps(async (command) => { submitted.resolve(command); await finish.promise; }));
+    assert.equal(await submitted.promise, '/compact');
+
+    const typed = [];
+    const deps = paneLockSendDeps(typed);
+    assert.deepEqual(await sendToSessionLocked({ sessionId: 'sess-b', text: 'to b' }, deps), { ok: true, pane: 'pane-b' });
+    await assert.rejects(sendToSessionLocked({ sessionId: 'sess-a', text: 'to a' }, deps), injectionBusy429);
+    // Compactions share settings.json and the in-flight swap, so they still run one at a time.
+    await assert.rejects(compactSession({ id: 'sess-b', kind: 'claude' }, { pane: 'pane-b' }, null,
+      compactDeps(() => assert.fail('a second compaction must not type'))), injectionBusy429);
+
+    finish.resolve();
+    assert.equal((await compacting).reason, 'timeout');
+    assert.deepEqual(await sendToSessionLocked({ sessionId: 'sess-a', text: 'to a' }, deps), { ok: true, pane: 'pane-a' });
+    assert.deepEqual(typed, ['pane-b:to b', 'pane-a:to a']);
+    assert.equal(isInjectionBusy(), false);
+  } finally {
+    if (priorTimeout === undefined) delete process.env.KEEP_COMPACT_TIMEOUT_MS;
+    else process.env.KEEP_COMPACT_TIMEOUT_MS = priorTimeout;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('the global injection lock excludes pane holders, and nested claims are reentrant', async () => {
+  const paneHeld = deferred();
+  const pane = withInjectionLock(() => paneHeld.promise, { pane: 'pane-a' });
+  await assert.rejects(withInjectionLock(async () => {}), injectionBusy429);
+  paneHeld.resolve();
+  await pane;
+
+  const globalHeld = deferred();
+  const global = withInjectionLock(() => globalHeld.promise);
+  await assert.rejects(withInjectionLock(async () => {}, { pane: 'pane-b' }), injectionBusy429);
+  globalHeld.resolve();
+  await global;
+
+  assert.equal(await withInjectionLock(
+    () => withInjectionLock(async () => 'nested', { pane: 'pane-a', model: true }), { pane: 'pane-a' },
+  ), 'nested');
+
+  // Work started under a holder that outlives it must not inherit the released lock.
+  const lateGate = deferred();
+  let late;
+  await withInjectionLock(async () => {
+    late = (async () => {
+      await lateGate.promise;
+      return withInjectionLock(async () => 'late', { pane: 'pane-a' });
+    })();
+  }, { pane: 'pane-a' });
+  const otherHeld = deferred();
+  const other = withInjectionLock(() => otherHeld.promise, { pane: 'pane-a' });
+  lateGate.resolve();
+  await assert.rejects(late, injectionBusy429);
+  otherHeld.resolve();
+  await other;
   assert.equal(isInjectionBusy(), false);
 });
 

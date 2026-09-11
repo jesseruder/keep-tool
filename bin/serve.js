@@ -9,6 +9,7 @@ const os = require('os');
 const http = require('http');
 const crypto = require('crypto');
 const { execFile } = require('child_process');
+const { AsyncLocalStorage } = require('async_hooks');
 const { promisify } = require('util');
 const keep = require('./keep.js');
 const runs = require('./runs.js');
@@ -272,7 +273,6 @@ const WEEKLY_INSTRUCTION = "Summarize what this solo developer completed in the 
 const TAG_INSTRUCTION = "These tasks share a theme/tag. In 2-3 sentences describe the common thread and what's blocking or driving progress across them. Output only that.";
 let onChange = () => {};
 let onFocus = () => {};
-let injectionBusy = false;
 let sweepInFlight = false;
 let inFlightSwap = null;
 const daemonRestartGate = require('./daemon-restart').createGate({
@@ -280,7 +280,7 @@ const daemonRestartGate = require('./daemon-restart').createGate({
     try { return fs.readdirSync(autoCompactDir()).filter(name => name.endsWith('.swap.json')); }
     catch (error) { if (error.code === 'ENOENT') return []; throw error; }
   },
-  busy: () => sweepInFlight || injectionBusy,
+  busy: () => sweepInFlight || injectionLocked(),
 });
 let liveSessionTickInFlight = false;
 let lastAutoCompactGc = 0;
@@ -657,15 +657,92 @@ class InjectionError extends Error {
   }
 }
 
-async function withInjectionLock(fn) {
-  if (daemonRestartGate.stopping) throw new InjectionError(429, 'daemon restart is pending');
-  if (injectionBusy) throw new InjectionError(429, 'another session injection is busy');
-  injectionBusy = true;
+// Injection is serialized per pane, not daemon-wide: a four-minute compaction of one
+// session must not turn every other pane's send into a 429. A holder claims keys:
+//   pane:<id>     the terminal pane it reads the prompt of and types into.
+//   session:<id>  a conversation whose pane is resolved inside the lock. The holder
+//                 claims the resolved pane (claimInjectionTarget) before any precheck
+//                 or keystroke, so precheck and typing stay atomic for that pane.
+//   model         settings.json's model and the in-flight compaction swap, shared by
+//                 every Claude session: compactions, model restores, agent launches.
+// A call with no scope takes the global lock, which excludes every holder and is
+// excluded by any; keep global holders short. Nested calls in the same async context
+// are reentrant: they claim only what the holder lacks and release that on return.
+const injectionHolders = new Map(); // key -> holder
+let injectionGlobalHolder = null;
+const injectionContext = new AsyncLocalStorage();
+
+function injectionBusyError() {
+  return new InjectionError(429, 'another session injection is busy');
+}
+
+function injectionLocked() {
+  return Boolean(injectionGlobalHolder) || injectionHolders.size > 0;
+}
+
+// Work started under a lock can outlive it (a fire-and-forget promise inherits the
+// context), so a released holder never counts as the caller's own.
+function activeInjectionHolder() {
+  const holder = injectionContext.getStore();
+  return holder && holder.active ? holder : null;
+}
+
+function injectionScopeKeys(scope) {
+  const keys = [];
+  if (scope.pane != null && scope.pane !== '') keys.push(`pane:${scope.pane}`);
+  if (scope.session != null && scope.session !== '') keys.push(`session:${scope.session}`);
+  if (scope.model) keys.push('model');
+  return keys;
+}
+
+// Check and take in one synchronous step, so no other holder interleaves.
+function takeInjectionKeys(holder, keys) {
+  if (holder.global) return [];
+  if (injectionGlobalHolder) throw injectionBusyError();
+  const wanted = [...new Set(keys)].filter((key) => injectionHolders.get(key) !== holder);
+  if (wanted.some((key) => injectionHolders.has(key))) throw injectionBusyError();
+  for (const key of wanted) injectionHolders.set(key, holder);
+  return wanted;
+}
+
+function takeInjectionGlobal(holder) {
+  if (holder.global) return false;
+  if (injectionGlobalHolder) throw injectionBusyError();
+  for (const owner of injectionHolders.values()) if (owner !== holder) throw injectionBusyError();
+  injectionGlobalHolder = holder;
+  holder.global = true;
+  return true;
+}
+
+async function withInjectionLock(fn, scope) {
+  const outer = activeInjectionHolder();
+  if (!outer && daemonRestartGate.stopping) throw new InjectionError(429, 'daemon restart is pending');
+  const holder = outer || { active: true, global: false };
+  let taken = [];
+  let tookGlobal = false;
+  if (scope == null) tookGlobal = takeInjectionGlobal(holder);
+  else taken = takeInjectionKeys(holder, injectionScopeKeys(scope));
   try {
-    return await fn();
+    return outer ? await fn() : await injectionContext.run(holder, fn);
   } finally {
-    injectionBusy = false;
+    if (outer) {
+      for (const key of taken) injectionHolders.delete(key);
+      if (tookGlobal) { injectionGlobalHolder = null; holder.global = false; }
+    } else {
+      holder.active = false;
+      for (const [key, owner] of injectionHolders) if (owner === holder) injectionHolders.delete(key);
+      if (injectionGlobalHolder === holder) injectionGlobalHolder = null;
+    }
   }
+}
+
+// A session-scoped holder learns its pane only once it resolves the session: claim
+// that pane before reading its prompt or typing, until the holder releases. Outside
+// any lock (a unit test's stub lock) there is nothing to claim against.
+function claimInjectionTarget(target) {
+  const holder = activeInjectionHolder();
+  if (holder && isHostTarget(target)) takeInjectionKeys(holder, [`pane:${target.pane}`]);
+  return target;
 }
 
 function normalizedText(value) {
@@ -1577,7 +1654,7 @@ async function sweepPendingCompactSwaps(deps = {}) {
           } else if (repaired.error) {
             process.stderr.write(`keep serve: could not restore settings.json model after an interrupted compaction of ${sid}: ${repaired.error}\n`);
           }
-        });
+        }, { model: true });
       } catch (e) {
         if (!(e instanceof InjectionError && e.status === 429)) {
           process.stderr.write(`keep serve: could not restore settings.json model after an interrupted compaction of ${sid}: ${String(e && e.message || e)}\n`);
@@ -1632,7 +1709,7 @@ async function sweepPendingCompactSwaps(deps = {}) {
         const restored = await lock(async () => {
           const current = scan().find((candidate) => candidate.id === record.sessionId);
           if (compactRestoreBusy(current)) return null;
-          const target = await resolve(current, null, deps);
+          const target = claimInjectionTarget(await resolve(current, null, deps));
           if (current.localCommandPending) {
             const screen = await read(target, 30, false);
             const after = linesAfterLastEcho(screen, current.localCommandPending).join('\n');
@@ -1676,7 +1753,7 @@ async function sweepPendingCompactSwaps(deps = {}) {
           } finally {
             repair();
           }
-        });
+        }, { session: record.sessionId, model: true });
         if (restored === null) {
           summary.skipped += 1;
           continue;
@@ -1701,9 +1778,18 @@ async function sweepPendingCompactSwaps(deps = {}) {
   }
 }
 
+// The whole compaction, model restore included, holds its pane (so no send lands
+// mid-compaction or on the swapped model) and the model key (inFlightSwap and
+// settings.json are shared, so compactions still run one at a time). It does
+// not hold any other pane.
 async function compactSession(session, target, instruction, deps = {}) {
   const leave = daemonRestartGate.enter();
-  try { return await compactSessionTransaction(session, target, instruction, deps); }
+  try {
+    return await (deps.withInjectionLock || withInjectionLock)(
+      () => compactSessionTransaction(session, target, instruction, deps),
+      { pane: isHostTarget(target) ? target.pane : null, model: true },
+    );
+  }
   finally { leave(); }
 }
 
@@ -2167,9 +2253,11 @@ async function writeToShellPane(body, deps = {}) {
   const text = String(body.text ?? '');
   if (!text) throw new InjectionError(400, 'message is empty');
   if (text.length > 2000) throw new InjectionError(400, 'shell input is limited to 2000 characters');
-  const target = await (deps.shellPaneTarget || shellPaneTarget)(body.pane, deps);
-  await (deps.writeTarget || writeTarget)(target, `${text}\r`, deps);
-  return { ok: true, pane: target.pane, sent: text.length };
+  return (deps.withInjectionLock || withInjectionLock)(async () => {
+    const target = await (deps.shellPaneTarget || shellPaneTarget)(body.pane, deps);
+    await (deps.writeTarget || writeTarget)(target, `${text}\r`, deps);
+    return { ok: true, pane: target.pane, sent: text.length };
+  }, { pane: String(body.pane ?? '') });
 }
 
 async function screenSession(query, deps = {}) {
@@ -2325,9 +2413,10 @@ async function sendSessionKeys(body, deps = {}) {
       if (error instanceof InjectionError && error.status === 404 && !shellPane) throw new InjectionError(404, 'no host pane');
       throw error;
     }
+    claimInjectionTarget(target);
     await (deps.writeTarget || writeTarget)(target, bytes.join(''), deps);
     return { ok: true, sessionId: session ? session.id : null, pane: target.pane, sent: body.keys.length };
-  });
+  }, shellPane ? { pane: String(shellPane) } : { session: session.id });
 }
 
 async function closeExitedCodexShell(session, pane, deps = {}) {
@@ -2395,6 +2484,8 @@ async function restartSession(body, deps = {}) {
   let exitInputStarted = false;
   const transient = (reason) => body.mode === 'idle' && !exitInputStarted
     ? new (require('./session-restart').RestartDeferred)(reason) : new InjectionError(409, reason);
+  // The resumed agent reads settings.json's model at startup, so it also holds the
+  // model key: a restart never starts an agent while a compaction has swapped it.
   return (deps.withInjectionLock || withInjectionLock)(async () => {
     if (!(await host('hello')).replaceExited) throw Error('Terminal host must be refreshed before restarting sessions');
     const pane = (await host('get', { pane: body.pane })).pane;
@@ -2480,7 +2571,7 @@ async function restartSession(body, deps = {}) {
       cols: pane.cols, rows: pane.rows, meta: { ...pane.meta, agent: session.kind, sessionId: session.id, restartedAt: Date.now() } });
     await (deps.waitForHostAgent || waitForHostAgent)({ pane: pane.id }, session.kind, deps);
     return { ok: true, sessionId: session.id, pane: result.pane.id, pid: result.pane.pid };
-  });
+  }, { pane: body.pane, session: body.sessionId, model: true });
 }
 
 async function forceRestartSession(entry, save, deps = {}) {
@@ -2537,11 +2628,12 @@ async function forceRestartSession(entry, save, deps = {}) {
         return { ok: true, pane: result.pane.id, pid: result.pane.pid, sessionId: job.sessionId };
       },
     });
-  });
+  }, { pane: entry.pane, session: entry.sessionId, model: true });
 }
 
 async function closeIdleSession(body, deps = {}) {
   if (!/^[A-Za-z0-9_-]+$/.test(String(body.sessionId || '')) || !/^[A-Za-z0-9_-]+$/.test(String(body.pane || ''))) throw new InjectionError(400, 'Expected an exact session and pane');
+  const scope = { pane: body.pane, session: body.sessionId };
   return (deps.withInjectionLock || withInjectionLock)(async () => {
     const panes = await listHostPanes(deps, true);
     if (!panes) throw new InjectionError(409, 'Live pane state could not be verified');
@@ -2586,7 +2678,7 @@ async function closeIdleSession(body, deps = {}) {
       if (require('./delivery').pendingForSession(path.join(deps.root || keep.ROOT, '.keep', 'delivery'), session.id)) throw new InjectionError(409, 'Session has an unconfirmed delivery');
     };
     checkTaskSafety(state);
-    const target = await resolveSessionTarget(session, { expectedPane: pane.id }, deps);
+    const target = claimInjectionTarget(await resolveSessionTarget(session, { expectedPane: pane.id }, deps));
     await precheckSessionTarget(session, target, deps); // Preserve unsent drafts and modal prompts.
     const fresh = session.kind === 'claude' ? (deps.claudeSessionFor || claudeSessionFor)(session.id) : (deps.codexSessionFor || codex.sessionFor)(session.id);
     if (!fresh || typeof fresh.endedTurn !== 'boolean' || !Number.isFinite(fresh.mtime)) throw new InjectionError(409, 'Session activity could not be verified');
@@ -2713,7 +2805,7 @@ async function closeIdleSession(body, deps = {}) {
         }),
       } : {}),
     };
-  });
+  }, scope);
 }
 
 async function precheckSessionTarget(session, target, deps = {}) {
@@ -2894,11 +2986,14 @@ async function autoCompactTick() {
           throw new InjectionError(409, 'session changed or left the eligible cold idle window');
         }
         const target = await resolveSessionTarget(session, null);
+        // A busy pane is another sender, not a busy session: stay in the lock phase.
+        phase = 'lock';
+        claimInjectionTarget(target);
         phase = 'precheck';
         await precheckSessionTarget(session, target);
         phase = 'compact';
         return compactSession(session, target);
-      });
+      }, { session: candidate.session.id, model: true });
       via = compacted.via || null;
       reason = String(compacted.reason || '');
       result = autoCompactOutcome(compacted);
@@ -2967,6 +3062,7 @@ function startAutoCompact() {
 }
 
 async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
+  claimInjectionTarget(target);
   const pendingDirectory = deps.deliveryDirectory || path.join(keep.ROOT, '.keep', 'delivery');
   const trace = require('./delivery-trace').recorder(pendingDirectory, session, target.pane);
   const precheck = async () => {
@@ -3028,15 +3124,23 @@ async function sendToSession(body, targetHint, opts, deps = {}) {
   if (targetHint && targetHint.bootstrap && !findSessionFile(body.sessionId)) {
     const hosted = sessionHostPane(await listHostPanes(deps), body.sessionId);
     if (!hosted || !hosted.alive) throw new InjectionError(409, 'reviewer has no transcript yet and no live host pane');
-    const bootTarget = { pane: hosted.id };
+    const bootTarget = claimInjectionTarget({ pane: hosted.id });
     const bootBefore = await readScreen(bootTarget, 30, false, deps);
     await probeSuggestion(bootTarget, bootBefore, deps);
     return typeAndSubmit(bootTarget, text, claudeTypedTextVisible, deps);
   }
 
   const session = (deps.loadCurrentSession || loadCurrentSession)(body.sessionId);
-  const target = await resolveSessionTarget(session, body.pane ? { expectedPane: body.pane } : targetHint, deps);
+  const target = claimInjectionTarget(await resolveSessionTarget(session, body.pane ? { expectedPane: body.pane } : targetHint, deps));
   return (deps.sendToResolvedTarget || sendToResolvedTarget)(session, target, text, opts, deps);
+}
+
+// /api/send: lock the addressed session (and its selected pane, if any); sendToSession
+// claims the resolved pane before the precheck, so sends to other panes proceed.
+function sendToSessionLocked(body, deps = {}) {
+  const request = body && typeof body === 'object' ? body : {};
+  return withInjectionLock(() => sendToSession(request, undefined, undefined, deps),
+    { session: request.sessionId, pane: request.pane });
 }
 
 // Resume a session that stalled on a usage limit. The scheduler decided this a
@@ -3066,7 +3170,7 @@ async function resumeAfterLimit(sessionId, text, { hitAt } = {}, deps = {}) {
     if (session.notify && ['permission', 'question'].includes(session.notify.type)) {
       throw movedOn(`showing a ${session.notify.type}`);
     }
-    const target = await resolve(session, null);
+    const target = claimInjectionTarget(await resolve(session, null));
     // The transcript can say "parked" while the pane says otherwise (a restarted
     // Claude, a shell prompt, a dialog). Only type when the input box is on screen.
     const screen = await screenOf(target, 30, false);
@@ -3074,13 +3178,13 @@ async function resumeAfterLimit(sessionId, text, { hitAt } = {}, deps = {}) {
       throw new InjectionError(409, 'no Claude prompt visible', { screenTail: screenTail(screen) });
     }
     return deliver(session, target, text);
-  });
+  }, { session: sessionId });
 }
 
 async function compactSessionById(body) {
   body = body && typeof body === 'object' ? body : {};
   const session = loadCurrentSession(body.sessionId);
-  const target = await resolveSessionTarget(session, null);
+  const target = claimInjectionTarget(await resolveSessionTarget(session, null));
   await precheckSessionTarget(session, target);
   return compactSession(session, target, body.instruction || (session.reviewer ? review.DEFAULT_REVIEW_COMPACT_INSTRUCTION : undefined));
 }
@@ -3095,7 +3199,7 @@ async function answerSessionQuestion(body, session, deps = {}) {
   const { file, info } = loadInjectionSession(body.sessionId);
   validateTranscriptAnswer(info.pendingQuestion, option, label);
 
-  const target = await (deps.resolveSessionTarget || resolveSessionTarget)(session, null, deps);
+  const target = claimInjectionTarget(await (deps.resolveSessionTarget || resolveSessionTarget)(session, null, deps));
   let current;
   try {
     current = scanTranscript(file);
@@ -3170,7 +3274,7 @@ async function answerCodexApproval(body, session, deps = {}) {
   }
 
   liveCodexPermissionMarker(session);
-  const target = await (deps.resolveSessionTarget || resolveSessionTarget)(session, null, deps);
+  const target = claimInjectionTarget(await (deps.resolveSessionTarget || resolveSessionTarget)(session, null, deps));
   const screenOf = deps.readScreen || ((t, lines, scrollback) => readScreen(t, lines, scrollback, deps));
   const before = await screenOf(target, 30, false);
   // Resolution can take several seconds. Revalidate marker liveness immediately
@@ -3266,12 +3370,12 @@ async function waitForHostSessionId(pane, deps = {}) {
 
 // The lock may be held by a delivery that started during the wait; give it a
 // moment rather than failing the launch after the agent is already up.
-async function withInjectionLockRetry(fn, deps = {}) {
+async function withInjectionLockRetry(fn, deps = {}, scope) {
   const now = deps.now || Date.now;
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const deadline = now() + 10000;
   for (;;) {
-    try { return await withInjectionLock(fn); }
+    try { return await withInjectionLock(fn, scope); }
     catch (e) {
       if (!(e instanceof InjectionError) || e.status !== 429 || now() >= deadline) throw e;
       await sleep(250);
@@ -3279,7 +3383,7 @@ async function withInjectionLockRetry(fn, deps = {}) {
   }
 }
 
-function isInjectionBusy() { return injectionBusy; }
+function isInjectionBusy() { return injectionLocked(); }
 
 function shellQuoteArg(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
@@ -3420,11 +3524,13 @@ async function openSession(body, deps = {}) {
           result.sent = true;
         }
         return result;
-      });
+      }, { pane: target.pane, session: session.id });
     }
   }
 
-  const launch = await withInjectionLock(launchHost);
+  // A new pane has no lock to collide with. The launched agent reads settings.json's
+  // model at startup, so it holds only the model key: never start mid-compaction.
+  const launch = await withInjectionLock(launchHost, { model: true });
   if (deps.onLaunched) await deps.onLaunched(launch);
   const handoff = Boolean(body.taskId) && !session;
   let releasePending = handoff && Boolean(body.requester);
@@ -3450,7 +3556,7 @@ async function openSession(body, deps = {}) {
         throw new InjectionError(409, 'opening-message reservation changed before instructions were sent');
       }
       await withInjectionLockRetry(
-        () => (deps.typeOpeningMessage || typeOpeningMessage)(target, agent, message, deps), deps,
+        () => (deps.typeOpeningMessage || typeOpeningMessage)(target, agent, message, deps), deps, { pane: target.pane },
       );
       launch.sent = true;
       if (deps.onOpeningDelivered && await deps.onOpeningDelivered(launch) === false) {
@@ -3526,7 +3632,7 @@ async function recoverReviewQueueLaunch(active, hooks = {}, deps = {}) {
     throw new InjectionError(409, 'review queue launch reservation changed before opening instructions were sent');
   }
   await withInjectionLockRetry(
-    () => (deps.typeOpeningMessage || typeOpeningMessage)(target, 'claude', active.pointer, deps), deps,
+    () => (deps.typeOpeningMessage || typeOpeningMessage)(target, 'claude', active.pointer, deps), deps, { pane: target.pane },
   );
   if (typeof hooks.onDelivered === 'function' && await hooks.onDelivered() !== true) {
     throw new InjectionError(409, 'review queue launch reservation changed after opening instructions were sent');
@@ -4457,7 +4563,7 @@ function notifyTaskSession(taskId, text) {
     excludedSessionIds(),
   );
   if (!target) return;
-  withInjectionLock(() => sendToSession({ sessionId: target.id, text })).catch((e) => {
+  withInjectionLock(() => sendToSession({ sessionId: target.id, text }), { session: target.id }).catch((e) => {
     // the card already carries the result; a busy or unreachable terminal is not a failure
     process.stderr.write(`keep runs: could not notify ${target.id.slice(0, 8)} about ${taskId}: ${e.message}\n`);
   });
@@ -4502,7 +4608,8 @@ async function deliverCheckToThread(task, deps = {}) {
       continue;
     }
     try {
-      const result = await withInjectionLock(() => (deps.sendToResolvedTarget || sendToResolvedTarget)(session, target, text, { compactIfCold: true, retainReceipt: true, deliveryKey: runs.checkDeliveryKey(task) }));
+      const result = await withInjectionLock(() => (deps.sendToResolvedTarget || sendToResolvedTarget)(session, target, text, { compactIfCold: true, retainReceipt: true, deliveryKey: runs.checkDeliveryKey(task) }),
+        { pane: target.pane, session: session.id });
       return {
         sessionId: session.id,
         kind: session.kind,
@@ -4538,7 +4645,8 @@ async function deliverUnblockToThread(task, text) {
       continue;
     }
     try {
-      const result = await withInjectionLock(() => sendToResolvedTarget(session, target, text, { compactIfCold: true }));
+      const result = await withInjectionLock(() => sendToResolvedTarget(session, target, text, { compactIfCold: true }),
+        { pane: target.pane, session: session.id });
       return { sessionId: session.id, kind: session.kind, ...(result || {}) };
     } catch (error) {
       return { deferred: true, reason: String(error && error.message || error) };
@@ -4557,11 +4665,11 @@ function sendReviewerMessage(sessionId, text, opts) {
 }
 
 const reviewDeps = {
-  send: (sessionId, text, opts) => withInjectionLock(() => sendReviewerMessage(sessionId, text, opts)),
-  sendPlain: (sessionId, text) => withInjectionLock(() => sendToSession({ sessionId, text })),
+  send: (sessionId, text, opts) => withInjectionLock(() => sendReviewerMessage(sessionId, text, opts), { session: sessionId }),
+  sendPlain: (sessionId, text) => withInjectionLock(() => sendToSession({ sessionId, text }), { session: sessionId }),
   sessions: () => scanSessions(),
   sessionContextTokens,
-  compact: (sessionId, instruction) => withInjectionLock(() => compactSessionById({ sessionId, instruction })),
+  compact: (sessionId, instruction) => withInjectionLock(() => compactSessionById({ sessionId, instruction }), { session: sessionId, model: true }),
   who: (project) => buildWhoSnapshot(project),
 };
 
@@ -4782,6 +4890,8 @@ function start(deps = {}) {
   runs.recover(); // surface any orphaned run logs from a prior crash/restart
   runs.startScheduler();
   require('./delivery-health').startScheduler({ root: keep.ROOT, onChange: broadcast,
+    // Global on purpose: reconcile reads every session's pending delivery record, so no
+    // delivery may be mid-flight anywhere. It is synchronous file work, so the hold is brief.
     reconcile: () => withInjectionLock(() => require('./delivery').reconcile(path.join(keep.ROOT, '.keep', 'delivery'))),
   });
   unblock.startScheduler({
@@ -4824,7 +4934,7 @@ function start(deps = {}) {
         processes: () => agentProcessRows(),
         screen: p => readScreenResult({ pane: p.id }, null, false),
         eof: p => writeTarget({ pane: p.id }, '\x04'),
-      })),
+      }), { pane: pane.id }),
       close: async (body) => {
         const hostCapabilities = await hostRequest('hello');
         const result = await withInjectionLock(() => require('./manual-close').manualClose(body, {
@@ -4844,7 +4954,7 @@ function start(deps = {}) {
             withInjectionLock: (fn) => fn(),
           }),
           signal: (pane, signal, guard) => hostRequest('guarded-kill', { pane, signal, ...guard }),
-        }));
+        }), { pane: body.pane, session: body.sessionId });
         keep.recordDaemonSessionClose(body.cardIds, body.sessionId, body.idleMinutes);
         broadcast();
         return result;
@@ -5190,12 +5300,15 @@ function start(deps = {}) {
           }
           if (url.pathname === '/api/open' || url.pathname === '/api/send' || url.pathname === '/api/compact' ||
               url.pathname === '/api/answer') {
-            if (injectionBusy) return json(res, 429, { error: 'another session injection is busy' });
+            // Each call locks only its own session and pane (compaction also the model
+            // key); a collision there is the same 429 the global lock used to return.
+            const sessionId = body && body.sessionId;
             try {
-              const result = url.pathname === '/api/open' ? await openSession(body) : await withInjectionLock(() => url.pathname === '/api/send' ? sendToSession(body)
-                : url.pathname === '/api/compact'
-                  ? compactSessionById(body)
-                  : answerSession(body));
+              const result = url.pathname === '/api/open' ? await openSession(body)
+                : url.pathname === '/api/send' ? await sendToSessionLocked(body)
+                  : url.pathname === '/api/compact'
+                    ? await withInjectionLock(() => compactSessionById(body), { session: sessionId, model: true })
+                    : await withInjectionLock(() => answerSession(body), { session: sessionId });
               broadcast();
               return json(res, 200, result);
             } catch (e) {
@@ -5228,13 +5341,10 @@ function start(deps = {}) {
             }
           }
           if (url.pathname === '/api/reviewtick') {
-            // No early busy return: withInjectionLock throws the same 429, and landing it
-            // in the catch records the healthy skip the scheduler would.
+            // The tick's send locks only the reviewer's pane. A collision there throws the
+            // same 429, and landing it in the catch records the healthy skip the scheduler would.
             try {
-              const result = await withInjectionLock(() => review.reviewTick(
-                { ...reviewDeps, send: sendReviewerMessage },
-                { force: Boolean(body.force) },
-              ));
+              const result = await review.reviewTick(reviewDeps, { force: Boolean(body.force) });
               review.recordTickOutcome(result);
               if (result.sent) broadcast();
               return json(res, 200, result);
@@ -5333,6 +5443,8 @@ module.exports = {
   agentPromptVisible,
   typeOpeningMessage,
   isInjectionBusy,
+  withInjectionLock,
+  sendToSessionLocked,
   startAutoCompact,
   autoCompactIdleMs,
   autoCompactCandidates,
