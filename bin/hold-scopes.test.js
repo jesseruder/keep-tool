@@ -128,3 +128,21 @@ test('who and session start surface a device held from another project', () => {
     assert.doesNotMatch(home.stdout, /Shared devices held from other projects/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('fleetSnapshot keeps foreign device holds only when the caller opts in', () => {
+  const { fleetSnapshot, renderWho } = require('./who.js');
+  const now = Date.now();
+  const until = new Date(now + 60e3).toISOString();
+  const holds = [
+    { id: 'hold-local', project: '/client', until, reason: 'local' },
+    { id: 'hold-device', project: '/sandboxes', scopes: ['device:abc123'], until, reason: 'pixel' },
+    { id: 'hold-plain', project: '/sandboxes', scopes: ['user1-sandbox'], until, reason: 'plain' },
+  ];
+  const base = { tasks: [], sessions: [], runs: [], holds, git: { available: false }, now };
+  assert.deepEqual(fleetSnapshot('/client', base).holds.map((h) => h.id), ['hold-local'], 'standup-style callers stay project-local');
+  const snapshot = fleetSnapshot('/client', { ...base, deviceHolds: true });
+  assert.deepEqual(snapshot.holds.map((h) => h.id), ['hold-local', 'hold-device']);
+  const text = renderWho(snapshot);
+  assert.match(text, /hold-device · scope: device:abc123 · from \/sandboxes/);
+  assert.doesNotMatch(text, /hold-local[^\n]*from/);
+});

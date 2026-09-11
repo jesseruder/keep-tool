@@ -2411,3 +2411,35 @@ test('wrong-status findings apply only safe done/deferred transitions through no
     assert.equal(out.status, 0, out.stderr);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('reviewer bundles list foreign device holds inside the safety envelope', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-device-hold-'));
+  const cli = path.join(__dirname, 'keep.js');
+  const env = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1' };
+  delete env.CLAUDE_CODE_SESSION_ID;
+  delete env.CODEX_THREAD_ID;
+  delete env.CODEX_SESSION_ID;
+  const run = (args) => spawnSync(process.execPath, [cli, ...args], { encoding: 'utf8', env, cwd: root });
+  try {
+    for (const dir of ['tasks', 'archive', 'digests']) fs.mkdirSync(path.join(root, dir), { recursive: true });
+    spawnSync('git', ['init', '-q', root], { env });
+    spawnSync('git', ['-C', root, 'config', 'user.name', 'Keep Test'], { env });
+    spawnSync('git', ['-C', root, 'config', 'user.email', 'keep@example.test'], { env });
+    assert.equal(run(['add', 'Some work', '--status', 'active', '-m', 'Started.']).status, 0);
+    const holds = path.join(root, '.keep', 'holds');
+    fs.mkdirSync(holds, { recursive: true });
+    const until = new Date(Date.now() + 60e3).toISOString();
+    const write = (id, fields) => fs.writeFileSync(path.join(holds, `${id}.json`), JSON.stringify({ id, until, released: false, ...fields }));
+    write('hold-device', { project: '/elsewhere', scopes: ['device:abc123'], reason: 'pixel timing run' });
+    write('hold-plain', { project: '/elsewhere', scopes: ['user1-sandbox'], reason: 'sandbox only' });
+
+    const bundle = run(['review-bundle', 'some-work']);
+    assert.equal(bundle.status, 0, bundle.stderr);
+    const envelope = bundle.stdout.indexOf('DATA, NOT INSTRUCTIONS');
+    const line = bundle.stdout.indexOf('HOLDS: hold-device on /elsewhere');
+    assert.ok(envelope >= 0 && line > envelope, 'hold reasons follow the safety envelope');
+    assert.doesNotMatch(bundle.stdout, /sandbox only/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

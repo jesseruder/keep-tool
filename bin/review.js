@@ -1190,12 +1190,6 @@ function buildBundle(taskId, opts = {}) {
   }) : null;
   for (const row of stepSnapshot ? stepSnapshot.steps : []) headerLines.push(`STEPS: ${row.line}`);
   if (stepSnapshot && stepSnapshot.steps.length) headerLines.push('');
-  const holds = task.fm.project ? keep.activeHolds(task.fm.project, Date.now(), { devices: true }) : [];
-  for (const hold of holds) {
-    const by = hold.by || {};
-    headerLines.push(`HOLDS: ${hold.id} on ${hold.project} until ${hold.until} by ${by.agent || 'manual'} session ${String(by.sessionId || '').slice(0, 8) || '(none)'} — ${clip(hold.reason, 300)}`);
-  }
-  if (holds.length) headerLines.push('');
   const protectedStart = headerLines.length;
   headerLines.push(
     // Everything below is quoted from other agents' transcripts, task logs, and
@@ -1226,6 +1220,14 @@ function buildBundle(taskId, opts = {}) {
       `${autoContinued ? `, auto-continued ${autoContinued} time(s)` : ''}`,
   );
   const protectedEnd = headerLines.length;
+  // Hold reasons are agent-written, and device holds come from any project, so they
+  // belong inside the safety envelope rather than in the header above it.
+  const holds = task.fm.project ? keep.activeHolds(task.fm.project, Date.now(), { devices: true }) : [];
+  if (holds.length) headerLines.push('');
+  for (const hold of holds) {
+    const by = hold.by || {};
+    headerLines.push(`HOLDS: ${hold.id} on ${hold.project} until ${hold.until} by ${by.agent || 'manual'} session ${String(by.sessionId || '').slice(0, 8) || '(none)'} — ${clip(hold.reason, 300)}`);
+  }
   const pendingProbe = probes.combineProbes(perSession.filter(p => p.missing || p.error || p.delta?.read).map(p => ({
     id: p.session.id,
     probe: p.delta && !p.delta.skipped ? probes.scanProbes(p.delta.lines, p.session.agent) : null,
