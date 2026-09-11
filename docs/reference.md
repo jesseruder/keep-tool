@@ -42,6 +42,7 @@ keep plan <id> [--set "step"… | --add "text" | --insert <n> "text" | --remove 
                 | --done <n> | --start <n> | --undo <n>]
 keep list [--status s]… [--tag t] [--project p] [--overdue] [--brief] [--all]
 keep show <id>
+keep link <card> --session <sid> --agent claude|codex
 keep wait-on <card> <upstream> [<upstream>...]
 keep deps [<card>]
 keep done <id> [-m note] [--next "text"] [--commit <sha>]...
@@ -93,6 +94,11 @@ keep review-tick [--force]                               # wake the reviewer (ne
 keep review-stats [--json]                               # last tick, skips, per-day counts
 keep nudge <id> --session <sid> --key <k> -m "..." [--send]  # message a live agent (dry-run default)
 ```
+
+`keep link` repairs a session's ownership metadata when work was recorded from a
+different project directory. It transfers that explicit session from its old card to
+the named card and does not launch, wake, or message the session. The target card's
+status, schedule, activity timestamp, and body are preserved.
 
 Claude subagent lifecycle tracking uses `keep hook lifecycle` for both
 `SubagentStart` and `SubagentStop` in Claude's user settings. These observation-only
