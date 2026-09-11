@@ -4090,7 +4090,7 @@ test('restarting the fleet reviewer keeps its identity, its launch env, and its 
   fs.writeFileSync(claudeFile, JSON.stringify({ type: 'assistant', sessionId: 'rev', message: { content: [], stop_reason: 'end_turn' } }) + '\n');
   try {
     const session = { id: 'rev', kind: 'claude', state: 'idle', endedTurn: true, reviewer: true, project: root };
-    let pane = { id: 'p', pid: 10, cmd: '/bin/zsh', args: ['-l'], alive: true, attached: 0, visibleAttached: 0,
+    let pane = { id: 'p', pid: 10, cmd: '/bin/zsh', args: ['-l'], alive: true, attached: 1, visibleAttached: 1,
       cols: 200, rows: 50, meta: { sessionId: 'rev', agent: 'claude', reviewer: true, title: 'fable-fleet-reviewer',
         reviewerModel: 'claude-fable-20260101', reviewerBashOutput: '250000' } };
     const row = { pid: 11, ppid: 10, pidStart: 'Tue Sep  8 10:00:00 2026', agent: 'claude', interactive: true, args: '/test/claude --resume rev' };
@@ -4099,10 +4099,13 @@ test('restarting the fleet reviewer keeps its identity, its launch env, and its 
       root, withInjectionLock: (fn) => fn(), buildState: async () => ({ sessions: [session], tasks: [] }),
       claudeRolloutFile: () => claudeFile,
       reviewerMarker: (id) => { assert.equal(id, 'rev'); return { name: 'fable', model: 'fable', ended: Date.now() }; },
-      agentProcessRows: async () => (exited ? [] : [row]),
+      agentProcessRows: async () => (exited ? [{ pid: 10, ppid: 1, args: '/bin/zsh -l' }] : [row]),
       psTable: '11 10 ttys001 Tue Sep  8 10:00:00 2026 /test/claude --resume rev',
       lsof: async () => '',
-      closeIdleSession: async (_body, guards) => { await guards.beforeClose(); exited = true; pane.alive = false; },
+      closeIdleSession: async (_body, guards) => {
+        await guards.beforeClose(); exited = true;
+        pane = { ...pane, meta: { agent: 'shell' } };
+      },
       sleep: async () => {},
       readScreenResult: async () => ({ text: 'claude --resume rev\n~/keep > ', cursor: { x: 9, y: 1 } }),
       waitForHostAgent: async () => { assert.ok(replaced); },
@@ -4110,12 +4113,25 @@ test('restarting the fleet reviewer keeps its identity, its launch env, and its 
         if (type === 'hello') return { replaceExited: true };
         if (type === 'get') return { pane: { ...pane } };
         if (type === 'list') return { panes: [{ ...pane }] };
+        if (type === 'input') {
+          assert.equal(Buffer.from(params.data, 'base64').toString(), '\x04');
+          pane.alive = false; return {};
+        }
         assert.equal(type, 'replace-exited');
         replaced = params; pane = { ...pane, alive: true, pid: 20 }; return { pane };
       } },
     };
     const reviewerSpecFlags = require('./reviewer-launch').reviewerFlags('claude-fable-20260101');
-    const result = await restartSession({ sessionId: 'rev', pane: 'p', pid: 10, mode: 'now' }, deps);
+    const reviewerPane = pane;
+    pane = { ...pane, meta: { sessionId: 'normal', agent: 'claude' } };
+    await assert.rejects(restartSession({ sessionId: 'normal', pane: 'p', pid: 10, mode: 'idle' }, {
+      ...deps, buildState: async () => ({ sessions: [{ ...session, id: 'normal', reviewer: false }], tasks: [] }),
+    }), error => error instanceof require('./session-restart').RestartDeferred
+      && /no longer being viewed/.test(error.message));
+    assert.equal(exited, false);
+    assert.equal(replaced, null);
+    pane = reviewerPane;
+    const result = await restartSession({ sessionId: 'rev', pane: 'p', pid: 10, mode: 'idle' }, deps);
     assert.equal(result.sessionId, 'rev');
     // The resumed process is the reviewer again, not a nameless claude session: the
     // marker env, the model, and the silenced prompt suggestion all come back.
@@ -4136,11 +4152,11 @@ test('restarting the fleet reviewer keeps its identity, its launch env, and its 
     // must rebuild the same reviewer configuration, not a bare `claude --resume`.
     const { reviewerResumeSpec } = require('./serve');
     const forceDeps = { root, reviewerMarker: () => ({ name: 'fable', model: 'fable' }) };
-    const forced = reviewerResumeSpec(true, 'rev', replaced.meta, forceDeps);
+    const forced = reviewerResumeSpec({ id: 'rev' }, { meta: replaced.meta }, forceDeps);
     assert.deepEqual(forced.flags, reviewerSpecFlags);
     assert.equal(forced.env.KEEP_REVIEWER, '1');
     assert.equal(forced.env.BASH_MAX_OUTPUT_LENGTH, '250000');
-    assert.deepEqual(reviewerResumeSpec(false, 'rev', replaced.meta, forceDeps), { flags: [], env: null },
+    assert.deepEqual(reviewerResumeSpec({ id: 'rev' }, { meta: { sessionId: 'rev' } }, forceDeps), { flags: [], env: null },
       'a non-reviewer pane never picks up KEEP_REVIEWER');
 
     // Tick address: session-end tombstoned the marker, and the resumed process's

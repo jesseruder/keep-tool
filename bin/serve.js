@@ -2565,11 +2565,12 @@ function restartPaneMatches(original, current, sessionId) {
 }
 
 async function closeRestartShell(original, session, originalAgentPid, deps) {
+  const reviewer = require('./session-restart').isReviewer(session, original);
   if (original.cmd !== '/bin/zsh' || JSON.stringify(original.args) !== '["-l"]') return false;
   const verify = async () => {
     const current = (await hostRequest('get', { pane: original.id }, deps)).pane;
     if (!current?.alive || !restartPaneMatches(original, current, session.id)
-        || (deps.queued && (current.visibleAttached ?? current.attached) !== 0)) return false;
+        || (deps.queued && !reviewer && (current.visibleAttached ?? current.attached) !== 0)) return false;
     const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
     const shell = rows.find(p => p.pid === original.pid);
     if (!shell || !/^(?:\/bin\/zsh|-zsh)(?:\s+-l)?$/.test(shell.args)
@@ -2596,8 +2597,10 @@ async function closeRestartShell(original, session, originalAgentPid, deps) {
 // wrong model, with prompt suggestions on and a 30k Bash cap that truncates every
 // five-card bundle. The marker itself survives on its own (session-end tombstones it,
 // the resumed process's session-start hook un-tombstones it).
-function reviewerResumeSpec(isReviewer, sessionId, meta, deps = {}) {
-  if (!isReviewer) return { flags: [], env: null };
+function reviewerResumeSpec(session, pane, deps = {}) {
+  if (!require('./session-restart').isReviewer(session, pane)) return { flags: [], env: null };
+  const sessionId = session?.id || pane?.meta?.sessionId;
+  const meta = pane?.meta;
   const marker = (deps.reviewerMarker || review.readReviewerMarker)(sessionId) || {};
   const family = marker.model || marker.name || 'fable';
   const launch = require('./reviewer-launch');
@@ -2648,7 +2651,8 @@ async function restartSession(body, deps = {}) {
     const checkChildren = async () => {
       const currentPane = (await host('get', { pane: pane.id })).pane;
       if (!currentPane.alive || currentPane.pid !== pane.pid || currentPane.meta?.sessionId !== session.id) throw Error('Session changed during restart');
-      if (body.mode === 'idle' && (currentPane.visibleAttached ?? currentPane.attached) !== 0) throw transient('Waiting until the pane is no longer being viewed');
+      if (body.mode === 'idle' && !require('./session-restart').isReviewer(session, pane)
+          && (currentPane.visibleAttached ?? currentPane.attached) !== 0) throw transient('Waiting until the pane is no longer being viewed');
       const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
       const identity = (await liveSessionPids({ ...deps, agentProcessRows: async () => rows })).get(session.id);
       if (!identity?.primary || identity.pid !== originalIdentity.pid || identity.pidStart !== originalIdentity.pidStart) throw Error('Agent process identity changed during restart');
@@ -2693,7 +2697,7 @@ async function restartSession(body, deps = {}) {
     // Do not apply the fresh-session defaults to a previously restricted agent.
     const bypass = session.kind === 'codex' ? '--dangerously-bypass-approvals-and-sandbox' : '--dangerously-skip-permissions';
     const flags = originalArgs.split(/\s+/).includes(bypass) ? [bypass] : [];
-    const reviewerSpec = reviewerResumeSpec(Boolean(pane.meta?.reviewer || session.reviewer), session.id, pane.meta, deps);
+    const reviewerSpec = reviewerResumeSpec(session, pane, deps);
     const argv = [session.kind, ...flags, ...reviewerSpec.flags,
       session.kind === 'codex' ? 'resume' : '--resume', session.id];
     const result = await host('replace-exited', { paneId: pane.id, expectedPid: pane.pid, sessionId: stopped.meta?.sessionId,
@@ -2746,7 +2750,7 @@ async function forceRestartSession(entry, save, deps = {}) {
       sessionLive: async sid => (await liveSessionPids({ ...deps, agentProcessRows: rows })).has(sid),
       replace: async (original, job, expectedPid) => {
         const bypass = original.agent === 'codex' ? '--dangerously-bypass-approvals-and-sandbox' : '--dangerously-skip-permissions';
-        const reviewerSpec = reviewerResumeSpec(Boolean(original.meta?.reviewer), job.sessionId, original.meta, deps);
+        const reviewerSpec = reviewerResumeSpec({ id: job.sessionId }, original, deps);
         const argv = [original.agent, ...(original.bypass ? [bypass] : []), ...reviewerSpec.flags,
           original.agent === 'codex' ? 'resume' : '--resume', job.sessionId];
         const stopped = (await host('get', { pane: job.pane })).pane;

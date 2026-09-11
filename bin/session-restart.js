@@ -3,11 +3,19 @@ const fs = require('node:fs'), path = require('node:path');
 
 class RestartDeferred extends Error {}
 
+// Reviewer identity is durable in the marker-backed session state and duplicated in
+// pane meta so it survives the narrow interval where SessionEnd demotes the pane to a
+// shell. Restart configuration and every viewer guard must use this same predicate.
+function isReviewer(session, pane) {
+  return Boolean(session?.reviewer || pane?.meta?.reviewer);
+}
+
 function refusal(session, pane, queued = false) {
   if (!session || !pane?.alive || pane.meta?.sessionId !== session.id || !['claude', 'codex'].includes(pane.meta?.agent)) return 'Session is not live in its original pane';
   // The fleet reviewer restarts like any other session: its pane keeps meta.reviewer,
   // and bin/serve.js rebuilds its launch flags and env on the resume, so the marker,
-  // the model and the tick address all survive. Every guard below still applies.
+  // the model and the tick address all survive. Every guard below except the viewer
+  // check still applies.
   if (session.activity?.background?.scheduled?.length || session.backgroundJobs?.jobs?.some(j => j.kind === 'scheduled' && j.status === 'pending')) return 'Pause session-local scheduled jobs before restarting';
   if (session.endedTurn !== true || session.toolRunning || session.pendingBackground || session.waitingFor || session.rateLimit
       || session.unknownBackgroundJobs?.length || session.lifecycleAgents?.length
@@ -20,7 +28,7 @@ function refusal(session, pane, queued = false) {
       || (session.activity?.needsInput && session.activity.reason !== 'next instruction')) return 'Waiting for pending input to be resolved';
   // Durable registry checks and dependencies survive resume. Displayed readiness
   // is not proof of process-local work; the close path verifies the actual prompt.
-  if (queued && (pane.visibleAttached ?? pane.attached) !== 0) return 'Waiting until the pane is no longer being viewed';
+  if (queued && !isReviewer(session, pane) && (pane.visibleAttached ?? pane.attached) !== 0) return 'Waiting until the pane is no longer being viewed';
   return null;
 }
 
@@ -124,4 +132,4 @@ function createManager({ file, inspect, restart, forceRestart, onChange = () => 
   };
 }
 
-module.exports = { refusal, read, createManager, RestartDeferred };
+module.exports = { isReviewer, refusal, read, createManager, RestartDeferred };

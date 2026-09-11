@@ -131,8 +131,10 @@ test('restart readiness protects active work, decisions, and viewed queued panes
     assert.equal(refusal(stopped, pane), null, 'displayed status cannot veto a stopped safe session');
     assert.equal(require('./session-cleanup').refusal(stopped, pane, new Set(), Date.now(), { manual: true, restart: true }), null);
   }
-  // The fleet reviewer restarts like any other session; only the ordinary guards apply.
-  assert.equal(refusal({ ...session, reviewer: true }, pane), null);
+  // The fleet reviewer may restart while its read-only pane is watched; every other
+  // guard and the ordinary-session viewer guard still apply.
+  assert.equal(refusal({ ...session, reviewer: true }, { ...pane, visibleAttached: 1 }, true), null);
+  assert.equal(refusal(session, { ...pane, meta: { ...pane.meta, reviewer: true }, visibleAttached: 1 }, true), null);
   assert.ok(refusal({ ...session, reviewer: true, endedTurn: false }, pane));
   assert.ok(refusal(session, { ...pane, attached: 1 }, true));
   assert.equal(refusal(session, { ...pane, attached: 2, visibleAttached: 0 }, true), null);
@@ -213,8 +215,8 @@ test('restart transaction resumes the same ID only after verified exit and prese
   fs.writeFileSync(claudeFile, JSON.stringify({ type: 'assistant', sessionId: 's', message: { content: [], stop_reason: 'end_turn' } }) + '\n');
   fs.writeFileSync(file, JSON.stringify({ type: 'session_meta', payload: { id: 's', source: 'cli' } }) + '\n' + JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete' } }) + '\n');
   try {
-    for (const kind of ['codex', 'claude']) for (const mode of ['ok', 'mcp', 'mcp-orphan', 'mcp-changed', 'bypass', 'busy', 'old-host', 'still-live', 'shell', 'demoted', 'draft', 'child', 'other-session', 'replacement', 'pid-reused', 'viewer', 'late-viewer', 'after-input-viewer']) {
-      const shellMode = ['shell', 'demoted', 'draft', 'child', 'other-session', 'replacement'].includes(mode);
+    for (const kind of ['codex', 'claude']) for (const mode of ['ok', 'mcp', 'mcp-orphan', 'mcp-changed', 'bypass', 'busy', 'old-host', 'still-live', 'shell', 'shell-viewer', 'demoted', 'draft', 'child', 'other-session', 'replacement', 'pid-reused', 'viewer', 'late-viewer', 'after-input-viewer']) {
+      const shellMode = ['shell', 'shell-viewer', 'demoted', 'draft', 'child', 'other-session', 'replacement'].includes(mode);
       const session = { id: 's', kind, state: 'idle', endedTurn: mode !== 'busy', project: root };
       let pane = { id: 'p', pid: 10, cmd: '/bin/zsh', args: ['-l'], alive: true, attached: 0, visibleAttached: mode === 'viewer' ? 1 : 0, cols: 80, rows: 24, meta: { sessionId: 's', agent: kind, title: 'Original' } };
       const bypass = kind === 'claude' ? '--dangerously-skip-permissions' : '--dangerously-bypass-approvals-and-sandbox';
@@ -239,6 +241,7 @@ test('restart transaction resumes the same ID only after verified exit and prese
           if (['late-viewer', 'after-input-viewer'].includes(mode)) pane.visibleAttached = 1;
           if (mode === 'mcp-changed') helper.pidStart = 'replaced';
           await guards.beforeClose(); exited = true; pane.alive = shellMode;
+          if (mode === 'shell-viewer') pane.visibleAttached = 1;
           if (['demoted', 'draft', 'child'].includes(mode)) pane.meta = { agent: 'shell' };
           if (mode === 'other-session') pane.meta = { agent: kind, sessionId: 'other' };
           if (mode === 'replacement') pane.pid = 30;
@@ -262,8 +265,9 @@ test('restart transaction resumes the same ID only after verified exit and prese
         await assert.rejects(restartSession({ sessionId: 's', pane: 'p', pid: 10, mode: 'idle' }, deps), error =>
           /no longer being viewed/.test(error.message) && (error instanceof RestartDeferred) === (mode !== 'after-input-viewer'));
         assert.equal(replaced, null);
-      } else if (['mcp-orphan', 'mcp-changed', 'busy', 'old-host', 'still-live', 'draft', 'child', 'other-session', 'replacement', 'pid-reused'].includes(mode)) {
-        await assert.rejects(restartSession({ sessionId: 's', pane: 'p', pid: 10, mode: 'now' }, deps), undefined, `${kind}:${mode}`);
+      } else if (['mcp-orphan', 'mcp-changed', 'busy', 'old-host', 'still-live', 'shell-viewer', 'draft', 'child', 'other-session', 'replacement', 'pid-reused'].includes(mode)) {
+        await assert.rejects(restartSession({ sessionId: 's', pane: 'p', pid: 10,
+          mode: mode === 'shell-viewer' ? 'idle' : 'now' }, deps), undefined, `${kind}:${mode}`);
         assert.equal(replaced, null);
       } else {
         const result = await restartSession({ sessionId: 's', pane: 'p', pid: 10, mode: 'now' }, deps);

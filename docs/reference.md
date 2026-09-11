@@ -212,8 +212,8 @@ the newest-first card log so fresh agents and scheduled runs see the plan first.
 Keep can resume a conversation in the same pane ID, preserving pins and history.
 Conservative restarts require a verified idle prompt, no draft or unresolved
 background work, and graceful process exit. Queued restarts wait until the pane
-has no viewers, can be cancelled, and survive daemon restart. Fleet reviewers
-require a separate coordinated restart. Explicit force-restart recovery has its
+has no viewers, can be cancelled, and survive daemon restart; the fleet reviewer's
+read-only pane is exempt from the viewer check. Explicit force-restart recovery has its
 own durable transaction and recovery checks; it is not ordinary idle cleanup.
 See the [session reliability contract](session-reliability.md) for restart proof
 and the [force-restart guide](force-restart.md) for explicit recovery commands.
@@ -662,7 +662,8 @@ governor reads it from the `.keep/reviewer/<id>` marker written at startup.
 The console's Fleet reviewer header has a **Restart** button beside `Tick now` and
 `Stats`. It uses the same `/api/restart-session` machinery as a pinned pane in Watch,
 in the guarded `idle` mode: the restart queues until the reviewer's turn has ended and
-nobody is viewing its pane, and stays cancellable while it waits. The button is
+stays cancellable while it waits, but does not wait for viewers of the read-only reviewer
+pane to navigate away. The button is
 disabled when there is no live reviewer pane. Because `claude --resume` inherits none
 of the launch environment, both restart transactions (the guarded one and the explicit
 force/recover path) rebuild the reviewer's flags (`--model`, the prompt-suggestion
