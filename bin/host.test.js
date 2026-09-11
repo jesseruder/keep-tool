@@ -8,6 +8,7 @@ const path = require('node:path');
 const test = require('node:test');
 const { Terminal } = require('@xterm/headless');
 const {
+  DEFAULT_SNAPSHOT_SCROLLBACK,
   MAX_FRAME_BYTES,
   RingBuffer,
   FrameDecoder,
@@ -758,6 +759,57 @@ test('snapshot attach serializes a clean screen instead of a torn escape sequenc
       assert.match(renderScreen(term).text, /clean/);
     } finally { term.dispose(); }
     await attachment.detach();
+    await client.request('kill', { pane: pane.id });
+  });
+});
+
+test('snapshot attach defaults to a bounded, valid xterm tail and permits explicit history', async () => {
+  await withHost({}, async ({ host, client, sock }) => {
+    const { pane } = await client.request('spawn', {
+      cmd: '/bin/sh', args: ['-c', 'exec sleep 30'], cols: 80, rows: 12,
+    });
+    const internal = host.panes.get(pane.id);
+    const output = Array.from({ length: 1000 }, (_, index) => `history-${String(index).padStart(4, '0')}\r\n`).join('');
+    internal.pty._onData.fire(output);
+    await waitFor(async () => (await client.request('get', { pane: pane.id })).pane.bytes >= Buffer.byteLength(output), 'long pane history');
+
+    const bounded = [];
+    const attachment = await client.attach(pane.id, { snapshot: true }, (data, info) => {
+      if (info.snapshot) bounded.push(data);
+    });
+    await waitFor(() => bounded.length > 0, 'bounded snapshot');
+    const snapshot = Buffer.concat(bounded);
+    const term = new Terminal({ cols: 80, rows: 12, scrollback: 10000, allowProposedApi: true });
+    try {
+      await writeTerminal(term, snapshot);
+      const text = renderScreen(term, { scrollback: 10000 }).text;
+      assert.match(text, /history-0999/);
+      assert.doesNotMatch(text, /history-0000/);
+      assert.ok(text.split('\n').length <= DEFAULT_SNAPSHOT_SCROLLBACK + pane.rows);
+      assert.ok(snapshot.length < Buffer.byteLength(output) / 2);
+    } finally { term.dispose(); }
+    await attachment.detach();
+
+    const fullClient = await connect({ sock });
+    try {
+      const full = [];
+      const fullAttachment = await fullClient.attach(
+        pane.id,
+        { snapshot: true, snapshotScrollback: 10000 },
+        (data, info) => { if (info.snapshot) full.push(data); },
+      );
+      await waitFor(() => full.length > 0, 'full snapshot');
+      const fullTerm = new Terminal({ cols: 80, rows: 12, scrollback: 10000, allowProposedApi: true });
+      try {
+        await writeTerminal(fullTerm, Buffer.concat(full));
+        assert.match(renderScreen(fullTerm, { scrollback: 10000 }).text, /history-0000/);
+      } finally { fullTerm.dispose(); }
+      await fullAttachment.detach();
+      await assert.rejects(
+        fullClient.attach(pane.id, { snapshot: true, snapshotScrollback: -1 }, () => {}),
+        /snapshotScrollback must be an integer from 0 to 10000/,
+      );
+    } finally { fullClient.close(); }
     await client.request('kill', { pane: pane.id });
   });
 });

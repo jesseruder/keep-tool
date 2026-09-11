@@ -157,6 +157,8 @@ function connect(options = {}) {
           pane,
           replay: attachOptions.replay !== false,
           snapshot: attachOptions.snapshot === true,
+          ...(attachOptions.snapshotScrollback == null
+            ? {} : { snapshotScrollback: attachOptions.snapshotScrollback }),
           ...(attachOptions.viewer == null ? {} : { viewer: attachOptions.viewer }),
           ...(attachOptions.primary == null ? {} : { primary: attachOptions.primary === true }),
         });

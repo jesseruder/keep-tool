@@ -15,6 +15,7 @@ const DEFAULT_BUFFER_BYTES = 4 * 1024 * 1024;
 const DEFAULT_CLIENT_BUFFER_BYTES = 16 * 1024 * 1024;
 const STREAM_CHUNK_BYTES = 3 * 1024 * 1024;
 const TERMINAL_SCROLLBACK = 10000;
+const DEFAULT_SNAPSHOT_SCROLLBACK = 100;
 const HANDOFF_DRAIN_MS = 2000;
 const PANE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -160,6 +161,15 @@ function positiveInteger(value, fallback, name) {
   if (value == null) return fallback;
   const number = Number(value);
   if (!Number.isInteger(number) || number <= 0) throw new Error(`${name} must be a positive integer`);
+  return number;
+}
+
+function snapshotScrollback(value) {
+  if (value == null) return DEFAULT_SNAPSHOT_SCROLLBACK;
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 0 || number > TERMINAL_SCROLLBACK) {
+    throw new Error(`snapshotScrollback must be an integer from 0 to ${TERMINAL_SCROLLBACK}`);
+  }
   return number;
 }
 
@@ -611,6 +621,7 @@ function createHost(options = {}) {
         let pending;
         try {
           if (params.snapshot === true) {
+            const scrollback = snapshotScrollback(params.snapshotScrollback);
             await settled(pane);
             if (connection.dropped || connection.socket.destroyed || panes.get(pane.id) !== pane) {
               throw new Error('host connection closed');
@@ -618,7 +629,7 @@ function createHost(options = {}) {
             // Serialization and registration as a live consumer are one synchronous
             // boundary: earlier bytes are in the snapshot and later bytes are captured.
             const serialized = pane.serializer.serialize({
-              scrollback: TERMINAL_SCROLLBACK,
+              scrollback,
               excludeAltBuffer: false,
             });
             pending = {
@@ -1098,6 +1109,7 @@ async function runHost(options = {}) {
 }
 
 module.exports = {
+  DEFAULT_SNAPSHOT_SCROLLBACK,
   MAX_FRAME_BYTES,
   RingBuffer,
   FrameDecoder,
