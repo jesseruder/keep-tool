@@ -2,6 +2,29 @@ import { write } from './api.js';
 
 const STATUSES = ['needs-decision', 'in-progress', 'resolved'];
 const LABELS = { 'needs-decision': 'Needs decision', 'in-progress': 'In progress', resolved: 'Resolved' };
+const TYPES = ['idea', 'finding'];
+const TYPE_LABELS = { idea: 'Ideas', finding: 'Findings' };
+const SORT_LABELS = { newest: 'Newest', oldest: 'Oldest', project: 'Project', severity: 'Severity' };
+const STORAGE_TYPE = 'keep-review-queue-type';
+const STORAGE_SORT = 'keep-review-queue-sort';
+const stored = (key, fallback) => {
+  try { return localStorage.getItem(key) || fallback; } catch { return fallback; }
+};
+const store = (key, value) => {
+  try { localStorage.setItem(key, value); } catch {}
+};
+const storedSorts = (() => {
+  try {
+    const value = JSON.parse(stored(STORAGE_SORT, '{}'));
+    return value && typeof value === 'object' ? value : {};
+  } catch { return {}; }
+})();
+const storedType = stored(STORAGE_TYPE, 'idea');
+let type = TYPES.includes(storedType) ? storedType : 'idea';
+const sorts = {
+  idea: ['newest', 'oldest', 'project'].includes(storedSorts.idea) ? storedSorts.idea : 'newest',
+  finding: ['newest', 'oldest', 'project', 'severity'].includes(storedSorts.finding) ? storedSorts.finding : 'newest',
+};
 let status = 'needs-decision';
 let selectedId = null;
 let showLater = false;
@@ -36,9 +59,22 @@ function launchStateHTML(ctx, item) {
 
 function visibleItems(ctx) {
   const needle = query.trim().toLowerCase();
-  return allItems(ctx).filter((item) => item.status === status && (status !== 'needs-decision' || showLater || !isLater(item))
+  return allItems(ctx).filter((item) => item.type === type && item.status === status && (status !== 'needs-decision' || showLater || !isLater(item))
     && (!needle || [item.title, item.card, item.project, item.body].some((value) => String(value || '').toLowerCase().includes(needle))))
-    .sort((a, b) => (Date.parse(b.at) || Number(b.at) || 0) - (Date.parse(a.at) || Number(a.at) || 0));
+    .sort(compareItems);
+}
+
+const itemTime = (item) => typeof item.at === 'number' && Number.isFinite(item.at) ? item.at : Date.parse(item.at) || 0;
+const byId = (a, b) => String(a.id).localeCompare(String(b.id));
+function compareItems(a, b) {
+  const sort = sorts[type];
+  if (sort === 'oldest') return itemTime(a) - itemTime(b) || byId(a, b);
+  if (sort === 'project') return String(a.project || '').localeCompare(String(b.project || '')) || itemTime(b) - itemTime(a) || byId(a, b);
+  if (sort === 'severity') {
+    const rank = { high: 0, med: 1, low: 2 };
+    return (rank[a.severity] ?? 3) - (rank[b.severity] ?? 3) || itemTime(b) - itemTime(a) || byId(a, b);
+  }
+  return itemTime(b) - itemTime(a) || byId(a, b);
 }
 
 function selected(ctx) {
@@ -48,8 +84,11 @@ function selected(ctx) {
 }
 
 function count(ctx, value) {
-  const supplied = Number(ctx.data.reviewQueue?.counts?.[value]);
-  return Number.isFinite(supplied) ? supplied : allItems(ctx).filter((item) => item.status === value).length;
+  return allItems(ctx).filter((item) => item.type === type && item.status === value && (value !== 'needs-decision' || !isLater(item))).length;
+}
+
+function typeCount(ctx, value) {
+  return allItems(ctx).filter((item) => item.type === value && item.status === 'needs-decision' && !isLater(item)).length;
 }
 
 function itemList(ctx, current) {
@@ -83,9 +122,9 @@ function detail(ctx, item) {
     ${item.evidence ? `<section><h3>Evidence</h3><pre>${ctx.esc(text(item.evidence))}</pre></section>` : ''}
     ${outcomeHTML(ctx, item.outcome)}
     ${isLater(item) ? `<p class="review-later">Deferred until ${ctx.esc(new Date(item.deferredUntil).toLocaleString())}</p>` : ''}
-    ${sessions.length ? `<section class="review-conversations"><h3>Conversations</h3>${sessions.map((session) => `<button class="btn" data-review-session="${ctx.esc(session.id)}">${session.action === 'start' ? 'Work' : 'Discussion'} · ${ctx.esc(ctx.rel(session.at))}</button>`).join('')}</section>` : ''}
+    ${sessions.length ? `<section class="review-conversations"><h3>Conversations</h3>${sessions.map((session) => `<button class="btn" data-review-session="${ctx.esc(session.id)}">${session.action === 'start' ? item.type === 'finding' ? 'Investigation' : 'Work' : 'Discussion'} · ${ctx.esc(ctx.rel(session.at))}</button>`).join('')}</section>` : ''}
     ${launchStateHTML(ctx, item)}
-    ${launchBlocked ? '' : item.status === 'needs-decision' ? `<div class="review-actions"><button class="btn primary" data-review-action="start" ${disabled}>Start work</button><button class="btn" data-review-action="discuss" ${disabled}>Discuss</button><button class="btn" data-review-action="defer" ${disabled}>Later</button><button class="btn" data-review-action="dismiss" ${disabled}>Dismiss</button></div>` : item.status === 'in-progress' ? `<div class="review-actions"><button class="btn" data-review-action="discuss" ${disabled}>Discuss</button><button class="btn" data-review-action="dismiss" ${disabled}>Dismiss</button></div>` : ''}
+    ${launchBlocked ? '' : item.status === 'needs-decision' ? `<div class="review-actions"><button class="btn primary" data-review-action="start" ${disabled}>${item.type === 'finding' ? 'Investigate' : 'Start work'}</button><button class="btn" data-review-action="discuss" ${disabled}>Discuss</button><button class="btn" data-review-action="defer" ${disabled}>Later</button><button class="btn" data-review-action="dismiss" ${disabled}>Dismiss</button></div>` : item.status === 'in-progress' ? `<div class="review-actions"><button class="btn" data-review-action="discuss" ${disabled}>Discuss</button><button class="btn" data-review-action="dismiss" ${disabled}>Dismiss</button></div>` : ''}
     ${work?.error ? `<div class="review-action-error" role="alert">${ctx.esc(work.error)} <button class="btn" data-review-retry>Retry</button></div>` : work ? `<div class="review-action-pending" role="status">${['discuss', 'start'].includes(work.action) ? 'Opening a fresh conversation…' : 'Saving…'}</div>` : ''}
     ${formHTML(ctx, item)}
   </article>`;
@@ -124,7 +163,9 @@ async function submit(ctx, item, action, fields = {}, retry = false, requestIdOv
 }
 
 function bind(ctx, root, current) {
+  root.querySelectorAll('[data-review-type]').forEach((button) => button.addEventListener('click', () => { type = button.dataset.reviewType; store(STORAGE_TYPE, type); selectedId = null; suppressAutoSelect = false; form = null; renderReviewQueue(ctx); }));
   root.querySelectorAll('[data-review-filter]').forEach((button) => button.addEventListener('click', () => { status = button.dataset.reviewFilter; selectedId = null; suppressAutoSelect = false; form = null; renderReviewQueue(ctx); }));
+  root.querySelector('[data-review-sort]')?.addEventListener('change', (event) => { sorts[type] = event.target.value; store(STORAGE_SORT, JSON.stringify(sorts)); selectedId = null; suppressAutoSelect = false; renderReviewQueue(ctx); });
   root.querySelector('[data-review-search]')?.addEventListener('input', (event) => { query = event.target.value; suppressAutoSelect = false; renderReviewQueue(ctx); });
   root.querySelector('[data-review-later]')?.addEventListener('click', (event) => { showLater = event.currentTarget.getAttribute('aria-pressed') !== 'true'; selectedId = null; renderReviewQueue(ctx); });
   root.querySelectorAll('[data-review-item]').forEach((button) => button.addEventListener('click', () => { selectedId = button.dataset.reviewItem; suppressAutoSelect = false; form = null; renderReviewQueue(ctx); }));
@@ -168,16 +209,17 @@ function bind(ctx, root, current) {
 export function renderReviewQueue(ctx) {
   const root = document.querySelector('#review-queue');
   const current = selected(ctx);
-  const later = allItems(ctx).filter((item) => item.status === 'needs-decision' && isLater(item)).length;
+  const later = allItems(ctx).filter((item) => item.type === type && item.status === 'needs-decision' && isLater(item)).length;
   const activeNode = root.contains(document.activeElement) ? document.activeElement : null;
   const active = activeNode ? {
     name: activeNode.getAttribute('name'), search: activeNode.hasAttribute('data-review-search'), start: activeNode.selectionStart, end: activeNode.selectionEnd,
-    attr: ['reviewItem', 'reviewFilter', 'reviewAction', 'reviewSession', 'reviewRecover', 'reviewRetry', 'reviewLater', 'reviewCancel'].find((key) => activeNode.dataset[key] !== undefined),
+    attr: ['reviewItem', 'reviewType', 'reviewFilter', 'reviewAction', 'reviewSession', 'reviewRecover', 'reviewRetry', 'reviewLater', 'reviewCancel'].find((key) => activeNode.dataset[key] !== undefined),
   } : null;
   if (active?.attr) active.value = activeNode.dataset[active.attr];
   const listScroll = root.querySelector('.review-queue-items')?.scrollTop || 0;
   const mainScroll = root.querySelector('.review-queue-main')?.scrollTop || 0;
-  const html = `<aside class="review-queue-list"><div class="review-queue-heading"><h1>Review queue</h1><p>Ideas and findings waiting for a decision.</p></div><nav class="review-queue-filters">${STATUSES.map((value) => `<button class="btn ${status === value ? 'on' : ''}" data-review-filter="${value}" aria-pressed="${status === value}">${LABELS[value]} <span>${count(ctx, value)}</span></button>`).join('')}</nav><input type="search" data-review-search aria-label="Search review queue" placeholder="Search title, card, project, or notes" value="${ctx.esc(query)}">${status === 'needs-decision' && later ? `<button class="review-later-toggle" data-review-later aria-pressed="${showLater}">${showLater ? 'Hide' : 'Show'} ${later} saved for later</button>` : ''}<div class="review-queue-items">${itemList(ctx, current)}</div></aside><div class="review-queue-main">${detail(ctx, current)}</div>`;
+  const sortOptions = ['newest', 'oldest', 'project', ...(type === 'finding' ? ['severity'] : [])];
+  const html = `<aside class="review-queue-list"><div class="review-queue-heading"><h1>Review queue</h1><p>Ideas and findings waiting for a decision.</p></div><div class="review-queue-types" role="tablist" aria-label="Review item type">${TYPES.map((value) => `<button role="tab" aria-selected="${type === value}" class="${type === value ? 'on' : ''}" data-review-type="${value}">${TYPE_LABELS[value]} <span>${typeCount(ctx, value)}</span></button>`).join('')}</div><nav class="review-queue-filters" aria-label="Review status">${STATUSES.map((value) => `<button class="btn ${status === value ? 'on' : ''}" data-review-filter="${value}" aria-pressed="${status === value}">${LABELS[value]} <span>${count(ctx, value)}</span></button>`).join('')}</nav><div class="review-queue-tools"><input type="search" data-review-search aria-label="Search ${TYPE_LABELS[type].toLowerCase()}" placeholder="Search title, card, project, or notes" value="${ctx.esc(query)}"><label>Sort <select data-review-sort>${sortOptions.map((value) => `<option value="${value}" ${sorts[type] === value ? 'selected' : ''}>${SORT_LABELS[value]}</option>`).join('')}</select></label></div>${status === 'needs-decision' && later ? `<button class="review-later-toggle" data-review-later aria-pressed="${showLater}">${showLater ? 'Hide' : 'Show'} ${later} saved for later</button>` : ''}<div class="review-queue-items">${itemList(ctx, current)}</div></aside><div class="review-queue-main">${detail(ctx, current)}</div>`;
   const changed = ctx.patchHTML(root, html);
   if (changed) bind(ctx, root, current);
   root.querySelector('.review-queue-items').scrollTop = listScroll;
@@ -194,6 +236,8 @@ export function openReviewQueueItem(ctx, id) {
   const item = allItems(ctx).find((candidate) => candidate.id === id);
   if (!item) return false;
   status = item.status;
+  type = item.type;
+  store(STORAGE_TYPE, type);
   if (isLater(item)) showLater = true;
   query = '';
   selectedId = id;
@@ -218,6 +262,8 @@ export function openReviewQueueNotification(ctx, entry) {
   if (id) return openReviewQueueItem(ctx, id);
   if (!entry?.card) return false;
   status = 'needs-decision';
+  type = entry?.caller === 'reviewer-idea' ? 'idea' : 'finding';
+  store(STORAGE_TYPE, type);
   showLater = true;
   query = entry.card;
   selectedId = null;

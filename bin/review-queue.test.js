@@ -127,9 +127,22 @@ test('discuss and start launch fresh conversations with distinct complete prompt
     });
     assert.equal(started.item.status, 'in-progress');
     const startPrompt = fs.readFileSync(launches[1].message.match(/in (.*); read/)[1], 'utf8');
-    assert.match(startPrompt, /Begin work on this item immediately/);
+    assert.match(startPrompt, /Begin work on this idea immediately/);
     assert.doesNotMatch(startPrompt, /Do not implement a fix/);
     assert.ok(startPrompt.length > launches[1].message.length, 'full context stays in the immutable handoff file');
+
+    const investigated = await queue.act({ id: 'finding:card-one:abc123', action: 'start', requestId: 'investigate-1' }, {
+      ...f.deps, randomUUID: () => 'session-investigate', launch,
+    });
+    assert.equal(investigated.item.status, 'in-progress');
+    assert.equal(launches[2].action, 'start', 'Investigation reuses the existing start transport');
+    const investigationPrompt = fs.readFileSync(launches[2].message.match(/in (.*); read/)[1], 'utf8');
+    assert.match(investigationPrompt, /^# Review queue investigation:/);
+    assert.match(investigationPrompt, /Verify the claim against the cited evidence and current repository state/);
+    assert.match(investigationPrompt, /reviewer finding is a lead, not proof/);
+    assert.match(investigationPrompt, /record a justified durable outcome or give Jesse a concrete fix proposal/);
+    assert.match(investigationPrompt, /implement only after the finding is supported/);
+    assert.doesNotMatch(investigationPrompt, /Starting work authorizes immediate implementation/);
   } finally { f.cleanup(); }
 });
 

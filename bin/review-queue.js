@@ -227,8 +227,9 @@ function relatedContext(source, sources) {
 
 function launchInstructions(source, action, sources) {
   const isDiscuss = action === 'discuss';
+  const isInvestigation = !isDiscuss && source.type === 'finding';
   const lines = [
-    `# Review queue ${isDiscuss ? 'discussion' : 'work'}: ${source.title}`,
+    `# Review queue ${isDiscuss ? 'discussion' : isInvestigation ? 'investigation' : 'work'}: ${source.title}`,
     '',
     `Queue item: ${source.id}`,
     `Card: ${source.card}`,
@@ -238,9 +239,11 @@ function launchInstructions(source, action, sources) {
     '',
     isDiscuss
       ? 'Evaluate this item with Jesse. Investigate enough to explain the evidence, uncertainty, options, and tradeoffs. Do not implement a fix or change the parent card. Do not change its queue status; an item in Needs decision stays there.'
-      : 'Begin work on this item immediately. Inspect the cited evidence, implement or otherwise resolve it, and verify the result. Do not treat session exit or silence as resolution.',
+      : isInvestigation
+        ? 'Investigate this finding immediately. Verify the claim against the cited evidence and current repository state before proposing or making a change. A reviewer finding is a lead, not proof: do not implement it merely because it was reported. Report what you checked and either record a justified durable outcome or give Jesse a concrete fix proposal when the finding remains valid or uncertain. Do not treat session exit or silence as resolution.'
+        : 'Begin work on this idea immediately. Inspect the cited context, implement or otherwise resolve it, and verify the result. Do not treat session exit or silence as resolution.',
     '',
-    'Follow the repository and session approval rules as usual. Starting work authorizes implementation of this item; it does not authorize force pushes, publishing, or other actions that normally require separate approval.',
+    `Follow the repository and session approval rules as usual. ${isInvestigation ? 'Investigation authorizes verification and reporting; implement only after the finding is supported and normal session authority permits the change.' : isDiscuss ? 'Discussion authorizes collaborative evaluation.' : 'Starting work authorizes immediate implementation of this idea.'} This does not authorize force pushes, publishing, or other actions that normally require separate approval.`,
   ];
   if (!isDiscuss && source.type === 'finding') {
     lines.push('', `When the finding is resolved, record an explicit outcome for ${source.card}/${source.row.key} with a reason and concrete evidence using keep review-outcome; the queue resolves only from that durable outcome or an Owner dismissal.`);
