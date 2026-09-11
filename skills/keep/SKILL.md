@@ -153,6 +153,10 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   and `--only <id>` to restrict the sweep to one card.
 - **Card hygiene**: `keep lint [--rule <name>] [--json] [--fix-hints]` runs the
   deterministic daily hygiene checks and refreshes the brief's cached findings.
+- **Durable artifacts**: never cite a `/tmp` path in a check recipe or check-in;
+  macOS purges `/tmp` on reboot. Run `keep artifact <card> <file>...` to copy files into
+  committed `.keep/artifacts/<card>/`, then cite the printed path. `keep show` lists
+  them; `keep lint --rule tmp-artifact` flags cards still citing `/tmp`.
 - **Codex jobs**: `keep codex-jobs [--json] [--reap] [--dry]` lists live, stalled,
   and dead companion jobs and can cancel stale jobs and terminate orphan pollers.
 

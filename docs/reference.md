@@ -26,6 +26,7 @@ registry data or credentials to the public source repository.
 - `bin/landed.js` — default-branch commit detection, card annotation, and scheduling
 - `bin/lint.js` — deterministic card hygiene checks and their cached result
 - `.keep/` — machine state (lock, markers, reviewer state), gitignored
+- `.keep/artifacts/` — committed per-card durable artifacts, force-added like `.keep/handoffs/`
 - `.keep/holds/` — quiet-window ledgers, one JSON file per hold
 - `.keep/unblocked/` — pending and delivered cross-card unblock records
 - `steps/` — committed gated-step registries, one JSON file per project basename
@@ -41,6 +42,7 @@ keep plan <id> [--set "step"… | --add "text" | --insert <n> "text" | --remove 
                 | --done <n> | --start <n> | --undo <n>]
 keep list [--status s]… [--tag t] [--project p] [--overdue] [--brief] [--all]
 keep show <id>
+keep artifact <card> [<file>...] [-m note]
 keep link <card> --session <sid> --agent claude|codex
 keep wait-on <card> <upstream>[#<step>] [<upstream>...] -m "why"
 keep deps [<card>]
@@ -130,7 +132,7 @@ See [scenario testing](session-scenarios.md) for seeds and failure replay.
 
 `keep lint` runs advisory daily hygiene checks including `malformed-card`, scope tags,
 review next steps, waiting triggers, uncited commits, stale active work, old done cards,
-and duplicate titles. It always exits successfully when findings exist, writes the latest
+duplicate titles, and `tmp-artifact` citations. It always exits successfully when findings exist, writes the latest
 result to `.keep/lint.json`, and supports one-rule runs plus JSON output and fix hints.
 The brief refreshes findings older than 20 hours and shows the first five.
 The `unsatisfiable-wait` rule flags unresolved waits whose upstream has no live linked

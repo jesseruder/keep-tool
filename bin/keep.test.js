@@ -1434,3 +1434,100 @@ test('open preserves handoffs verbatim in a committed file and sends only a poin
     assert.equal(out.status, 0, out.stderr);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('artifact copies files into a committed per-card directory and logs the durable path', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-artifact-'));
+  const sourceA = path.join(root, 'source-a');
+  const sourceB = path.join(root, 'source-b');
+  const artifactDirectory = path.join(root, '.keep', 'artifacts', 'card');
+  const run = (args) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), ...args], {
+    cwd: root,
+    encoding: 'utf8',
+    timeout: 15000,
+    env: { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1' },
+  });
+  const git = (...args) => spawnSync('git', ['-C', root, ...args], { encoding: 'utf8' });
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'));
+    fs.mkdirSync(sourceA);
+    fs.mkdirSync(sourceB);
+    fs.writeFileSync(path.join(root, '.gitignore'), '.keep/\n');
+    assert.equal(git('init', '-q').status, 0);
+    assert.equal(git('config', 'user.name', 'Keep Test').status, 0);
+    assert.equal(git('config', 'user.email', 'keep@example.test').status, 0);
+    const keep = require('./keep.js');
+    fs.writeFileSync(path.join(root, 'tasks', 'card.md'), keep.serializeTask({
+      id: 'card', fm: { title: 'Artifacts', status: 'active', kind: 'task', tags: ['personal'] }, body: '',
+    }));
+    const plan = path.join(sourceA, 'plan.json');
+    const notes = path.join(sourceA, 'notes.txt');
+    fs.writeFileSync(plan, '{"ready":true}\n');
+    fs.writeFileSync(notes, 'durable notes\n');
+
+    const first = run(['artifact', 'card', plan, notes, '-m', 'Keep these inputs for the resumed session.']);
+    assert.equal(first.status, 0, first.stderr);
+    const durablePlan = path.join(artifactDirectory, 'plan.json');
+    const durableNotes = path.join(artifactDirectory, 'notes.txt');
+    assert.deepEqual(first.stdout.trim().split('\n'), [durablePlan, durableNotes]);
+    assert.equal(fs.readFileSync(durablePlan, 'utf8'), '{"ready":true}\n');
+    assert.equal(fs.readFileSync(durableNotes, 'utf8'), 'durable notes\n');
+    const card = keep.parseTask(fs.readFileSync(path.join(root, 'tasks', 'card.md'), 'utf8'), 'card');
+    assert.match(card.body, /— artifact/);
+    assert.ok(card.body.includes(durablePlan));
+    assert.ok(card.body.includes(durableNotes));
+    assert.ok(card.body.includes('Keep these inputs for the resumed session.'));
+    const committed = git('log', '-1', '--pretty=format:', '--name-only');
+    assert.equal(committed.status, 0, committed.stderr);
+    assert.deepEqual(committed.stdout.trim().split('\n').sort(), [
+      '.keep/artifacts/card/notes.txt', '.keep/artifacts/card/plan.json', 'tasks/card.md',
+    ].sort());
+
+    const again = run(['artifact', 'card', plan]);
+    assert.equal(again.status, 0, again.stderr);
+    assert.equal(again.stdout.trim(), durablePlan);
+    assert.deepEqual(fs.readdirSync(artifactDirectory).sort(), ['notes.txt', 'plan.json']);
+    const afterAgain = keep.parseTask(fs.readFileSync(path.join(root, 'tasks', 'card.md'), 'utf8'), 'card');
+    assert.match(afterAgain.body, new RegExp(`Already stored ${durablePlan.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+
+    const replacement = path.join(sourceB, 'plan.json');
+    fs.writeFileSync(replacement, '{"ready":false}\n');
+    const collision = run(['artifact', 'card', replacement]);
+    assert.equal(collision.status, 0, collision.stderr);
+    const suffixedPlan = collision.stdout.trim();
+    assert.match(path.basename(suffixedPlan), /^plan-\d+\.json$/);
+    assert.equal(fs.readFileSync(suffixedPlan, 'utf8'), '{"ready":false}\n');
+
+    const show = run(['show', 'card']);
+    assert.equal(show.status, 0, show.stderr);
+    assert.match(show.stdout, /^  artifacts:$/m);
+    for (const file of [durableNotes, durablePlan, suffixedPlan]) {
+      assert.match(show.stdout, new RegExp(`^    ${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\(\\d+(?:\\.\\d)? (?:B|KB|MB)\\)$`, 'm'));
+    }
+
+    const headBeforeList = git('rev-parse', 'HEAD').stdout.trim();
+    const cardBeforeList = fs.readFileSync(path.join(root, 'tasks', 'card.md'), 'utf8');
+    const listed = run(['artifact', 'card']);
+    assert.equal(listed.status, 0, listed.stderr);
+    for (const file of [durableNotes, durablePlan, suffixedPlan]) {
+      assert.match(listed.stdout, new RegExp(`^${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\(.+, \\d{4}-\\d{2}-\\d{2}T`, 'm'));
+    }
+    assert.equal(git('rev-parse', 'HEAD').stdout.trim(), headBeforeList, 'listing does not commit');
+    assert.equal(fs.readFileSync(path.join(root, 'tasks', 'card.md'), 'utf8'), cardBeforeList, 'listing does not log');
+
+    const missing = run(['artifact', 'card', path.join(sourceA, 'missing.txt')]);
+    assert.notEqual(missing.status, 0);
+    assert.match(missing.stderr, /artifact file does not exist:/);
+
+    const small = path.join(sourceA, 'not-stored.txt');
+    const large = path.join(sourceA, 'oversized.bin');
+    fs.writeFileSync(small, 'must not be copied\n');
+    fs.writeFileSync(large, Buffer.alloc(5 * 1024 * 1024 + 1));
+    const oversized = run(['artifact', 'card', small, large]);
+    assert.notEqual(oversized.status, 0);
+    assert.match(oversized.stderr, /artifact too large: .*oversized\.bin \(5\.0 MB\); trim or compress it before storing/);
+    assert.equal(fs.existsSync(path.join(artifactDirectory, 'not-stored.txt')), false);
+    assert.equal(fs.existsSync(path.join(artifactDirectory, 'oversized.bin')), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

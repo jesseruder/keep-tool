@@ -77,7 +77,7 @@ test('lint finds every hygiene rule while leaving a clean card alone', () => {
     writeCard(root, 'scope-card', { title: 'Wrong scope', tags: ['castle'], project: repo });
     writeCard(root, 'review-card', { title: 'Needs review direction', status: 'review' },
       `## ${recent.replace('T', ' ')} — landed (daemon)\nLanded.\n\n## ${recent.replace('T', ' ')} — check-in\nReady for Owner.\n`);
-    writeCard(root, 'waiting-card', { title: 'Waiting forever', status: 'waiting' });
+    writeCard(root, 'waiting-card', { title: 'Waiting forever', status: 'waiting', check: 'cat /tmp/result.log' });
     writeCard(root, 'uncited-card', {
       title: 'Work with a commit', project: repo,
       sessions: [{ id: 'fixture-session', agent: 'codex', at: localStamp(now - 2 * 3600e3) }],
@@ -96,7 +96,7 @@ test('lint finds every hygiene rule while leaving a clean card alone', () => {
     const rules = new Set(result.findings.map((item) => item.rule));
     for (const rule of [
       'malformed-card', 'scope-mismatch', 'review-no-next', 'waiting-no-trigger', 'uncited-commits',
-      'stale-active', 'done-not-archived', 'missing-scope', 'duplicate-title',
+      'stale-active', 'done-not-archived', 'missing-scope', 'duplicate-title', 'tmp-artifact',
     ]) assert.ok(rules.has(rule), rule);
     assert.equal(result.findings.filter((item) => item.rule === 'duplicate-title').length, 2);
     assert.equal(result.findings.filter((item) => item.rule === 'uncited-commits').length, 1);
@@ -341,6 +341,49 @@ test('check-no-result flags a card whose newest entry is a blank scheduled run',
     assert.deepEqual(findings.map((item) => item.id), ['blank-run']);
     assert.equal(findings[0].severity, 'med');
     assert.match(findings[0].fix, /keep verify blank-run/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('tmp-artifact flags /tmp citations in recipes and recent check-ins', () => {
+  const root = makeRoot();
+  const now = Date.parse('2026-09-10T12:00:00');
+  const recent = localStamp(now - 2 * 3600e3).replace('T', ' ');
+  const old = localStamp(now - 20 * 86400e3).replace('T', ' ');
+  try {
+    writeCard(root, 'recipe-card', { check: 'cat /tmp/draft-batch-*.log' });
+    writeCard(root, 'recent-card', {},
+      `## ${recent} — check-in\nReview /tmp/draft-plan.json before continuing.\n`);
+    writeCard(root, 'old-card', {},
+      `## ${old} — check-in\nReview /tmp/old-plan.json before continuing.\n`);
+    writeCard(root, 'review-card', {},
+      `## ${recent} — review (fable) idea\nReview /tmp/reviewer-plan.json before continuing.\n`);
+    writeCard(root, 'done-card', { status: 'done', check: 'cat /tmp/done.log' },
+      `## ${recent} — check-in\nReview /tmp/done-plan.json before continuing.\n`);
+    writeCard(root, 'home-tmp-card', {},
+      `## ${recent} — check-in\nReview /home/u/tmp/x before continuing.\n`);
+    writeCard(root, 'tmpdir-card', { check: 'tail $TMPDIR/x.log' });
+
+    const findings = lint({ root, rule: 'tmp-artifact', now }).findings;
+    assert.deepEqual(findings.map((item) => [item.id, item.severity]), [
+      ['recipe-card', 'med'],
+      ['tmpdir-card', 'med'],
+      ['recent-card', 'low'],
+    ]);
+    assert.equal(findings[0].text,
+      'check recipe reads /tmp/draft-batch-*.log, which macOS purges on reboot');
+    assert.equal(findings[0].fix,
+      'keep artifact recipe-card <file> and cite the printed path in --check');
+    assert.equal(findings[2].text,
+      `check-in on ${recent} cites /tmp/draft-plan.json; /tmp does not survive a reboot`);
+    assert.equal(findings[2].fix, 'keep artifact recent-card /tmp/draft-plan.json');
+
+    const artifactDirectory = path.join(root, '.keep', 'artifacts', 'recent-card');
+    fs.mkdirSync(artifactDirectory, { recursive: true });
+    fs.writeFileSync(path.join(artifactDirectory, 'draft-plan.json'), '{}\n');
+    const afterStore = lint({ root, rule: 'tmp-artifact', now }).findings;
+    assert.equal(afterStore.some((item) => item.id === 'recent-card'), false);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

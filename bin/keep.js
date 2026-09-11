@@ -1961,6 +1961,123 @@ commands.list = (argv) => {
   }
 };
 
+function humanSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let value = bytes / 1024;
+  let unit = units[0];
+  for (let i = 1; value >= 1024 && i < units.length; i++) {
+    value /= 1024;
+    unit = units[i];
+  }
+  return `${value.toFixed(1)} ${unit}`;
+}
+
+function artifactFiles(id) {
+  const directory = path.join(META, 'artifacts', id);
+  let names = [];
+  try { names = fs.readdirSync(directory).sort(); } catch { return []; }
+  const files = [];
+  for (const name of names) {
+    const file = path.join(directory, name);
+    try {
+      const stat = fs.statSync(file);
+      if (stat.isFile()) files.push({ file, name, stat });
+    } catch {}
+  }
+  return files;
+}
+
+function filesIdentical(left, right) {
+  let leftStat;
+  let rightStat;
+  try {
+    leftStat = fs.statSync(left);
+    rightStat = fs.statSync(right);
+  } catch { return false; }
+  return leftStat.isFile() && rightStat.isFile() && leftStat.size === rightStat.size
+    && fs.readFileSync(left).equals(fs.readFileSync(right));
+}
+
+commands.artifact = (argv) => {
+  const o = parseArgs(argv, {});
+  const [id, ...inputs] = o._;
+  if (!id) die('usage: keep artifact <card> [<file>...] [-m "note"]');
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) die(`invalid artifact card id "${id}"`);
+  loadTask(id);
+
+  if (!inputs.length) {
+    const files = artifactFiles(id);
+    if (!files.length) return console.log(`no artifacts stored for ${id}`);
+    for (const { file, stat } of files) {
+      console.log(`${file} (${humanSize(stat.size)}, ${stat.mtime.toISOString()})`);
+    }
+    return;
+  }
+
+  const sources = inputs.map((input) => path.resolve(input));
+  const limit = 5 * 1024 * 1024;
+  for (const source of sources) {
+    let stat;
+    try { stat = fs.statSync(source); }
+    catch { die(`artifact file does not exist: ${source}`); }
+    if (!stat.isFile()) die(`artifact is not a regular file: ${source}`);
+    if (stat.size > limit) {
+      die(`artifact too large: ${source} (${(stat.size / 1024 / 1024).toFixed(1)} MB); trim or compress it before storing`);
+    }
+  }
+
+  const stored = withLock(() => {
+    const task = loadTask(id);
+    const directory = path.join(META, 'artifacts', id);
+    fs.mkdirSync(directory, { recursive: true });
+    const results = [];
+    for (const source of sources) {
+      const basename = path.basename(source);
+      const preferred = path.join(directory, basename);
+      let destination = preferred;
+      let created = false;
+      try {
+        fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL);
+        created = true;
+      } catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+        if (!filesIdentical(source, preferred)) {
+          const ext = path.extname(basename);
+          const stem = ext ? basename.slice(0, -ext.length) : basename;
+          for (let timestamp = Date.now(); ; timestamp++) {
+            destination = path.join(directory, `${stem}-${timestamp}${ext}`);
+            try {
+              fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL);
+              created = true;
+              break;
+            } catch (copyError) {
+              if (copyError.code !== 'EEXIST') throw copyError;
+            }
+          }
+        }
+      }
+      results.push({ source, destination, created });
+    }
+
+    const text = results.map(({ source, destination, created }) =>
+      `${created ? 'Stored' : 'Already stored'} ${destination} (from ${source})`).join('\n');
+    appendLog(task, 'artifact', o.m != null ? `${text}\n${o.m}` : text);
+    saveTask(task);
+    const paths = [...new Set([
+      ...results.filter((result) => result.created).map((result) => path.relative(ROOT, result.destination)),
+      path.relative(ROOT, taskPath(task.id)),
+    ])];
+    // .keep is otherwise ignored runtime state; only these immutable artifacts are
+    // deliberately tracked. Never sweep up another card's artifacts or task.
+    git('add', '-f', '--', ...paths);
+    commitAndPush(`keep: artifact ${id} (${sources.length} file${sources.length === 1 ? '' : 's'})`, paths, { staged: true });
+    return results;
+  });
+
+  for (const result of stored) console.log(result.destination);
+};
+
 commands.show = (argv) => {
   const id = argv[0];
   if (!id) die('usage: keep show <id>');
@@ -1975,6 +2092,11 @@ commands.show = (argv) => {
   if (f.sessions && f.sessions.length) {
     const s = f.sessions[f.sessions.length - 1];
     console.log(`  last session: ${s.id} (${s.at})  →  ${resumeCommand(s)}`);
+  }
+  const artifacts = artifactFiles(task.id);
+  if (artifacts.length) {
+    console.log('  artifacts:');
+    for (const { file, stat } of artifacts) console.log(`    ${file} (${humanSize(stat.size)})`);
   }
   const parsed = parsePlan(task.body);
   if (parsed.steps.length) {
@@ -5868,6 +5990,8 @@ function helpText() {
   keep link <card> --session <sid> --agent claude|codex   # repair ownership metadata without waking or launching
   keep list [--status s]… [--tag t] [--project p] [--overdue] [--brief] [--all]
   keep show <id>
+  keep artifact <card> [<file>...] [-m "note"]
+                         # copies files into committed .keep/artifacts/<card>/ and prints durable paths; use instead of citing /tmp
   keep wait [--no-hold <project> [--scope <resource>]] [--card <id>[#<n>]] [--lane <project> <step>]
             [--check-due <id>] [--for <duration>] [--interval <seconds>]
   keep wait-on <card> <upstream>[#<step>] [<upstream>[#<step>]...] [--whole] -m "why"

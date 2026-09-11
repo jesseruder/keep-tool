@@ -28,6 +28,7 @@ const RULE_NAMES = [
   'duplicate-title',
   'check-no-result',
   'deploy-provenance',
+  'tmp-artifact',
 ];
 const SEVERITY_ORDER = { med: 0, low: 1 };
 
@@ -478,6 +479,58 @@ function deployProvenance(task, ctx) {
   return out;
 }
 
+function tempPaths(text) {
+  const pattern = /(?:^|[\s"'`(=:])((?:\/tmp\/|\/private\/tmp\/|\/var\/folders\/|\/private\/var\/folders\/|\$TMPDIR\/|\$\{TMPDIR\}\/)(?:[^\s"'`),;]*[^\s"'`),;.:])?)/g;
+  const found = [];
+  const seen = new Set();
+  for (const match of String(text || '').matchAll(pattern)) {
+    if (seen.has(match[1])) continue;
+    seen.add(match[1]);
+    found.push(match[1]);
+  }
+  return found;
+}
+
+function tmpArtifact(task, ctx) {
+  if (task.fm.status === 'done') return [];
+  const out = [];
+  const recipePaths = tempPaths(task.fm.check);
+  if (recipePaths.length) {
+    out.push(finding(
+      'tmp-artifact', task, 'med',
+      `check recipe reads ${recipePaths[0]}, which macOS purges on reboot${recipePaths.length > 1 ? ` (+${recipePaths.length - 1} more)` : ''}`,
+      `keep artifact ${task.id} <file> and cite the printed path in --check`,
+    ));
+  }
+
+  const stored = new Set();
+  const directory = path.join(ctx.root, '.keep', 'artifacts', task.id);
+  let names = [];
+  try { names = fs.readdirSync(directory); } catch {}
+  for (const name of names) {
+    try { if (fs.statSync(path.join(directory, name)).isFile()) stored.add(name); } catch {}
+  }
+
+  const cited = new Map();
+  const cutoff = ctx.now - 7 * DAY_MS;
+  for (const entry of review.stampedLogEntries(task.body).sort((a, b) => b.stamp.localeCompare(a.stamp))) {
+    if (atMs(entry.stamp.replace(' ', 'T')) < cutoff) break;
+    if (/\bdaemon\b/i.test(entry.kind) || entry.kind === 'artifact') continue;
+    for (const citedPath of tempPaths(entry.text)) {
+      if (!stored.has(path.basename(citedPath)) && !cited.has(citedPath)) cited.set(citedPath, entry.stamp);
+    }
+  }
+  if (cited.size) {
+    const [[citedPath, stamp]] = cited;
+    out.push(finding(
+      'tmp-artifact', task, 'low',
+      `check-in on ${stamp} cites ${citedPath}; /tmp does not survive a reboot${cited.size > 1 ? ` (+${cited.size - 1} more)` : ''}`,
+      `keep artifact ${task.id} ${citedPath}`,
+    ));
+  }
+  return out;
+}
+
 const RULES = {
   'malformed-card': malformedCard,
   'scope-mismatch': scopeMismatch,
@@ -493,6 +546,7 @@ const RULES = {
   'duplicate-title': duplicateTitle,
   'check-no-result': checkNoResult,
   'deploy-provenance': deployProvenance,
+  'tmp-artifact': tmpArtifact,
 };
 
 function git(repo, args) {

@@ -305,6 +305,8 @@ See the [full command reference](docs/reference.md), [Keep skill](skills/keep/SK
 
 ## Session handoffs
 
+Use `keep artifact <card> <file>...` for durable operator plans, logs, and proposals instead of citing files under `/tmp`.
+
 Handoffs are turn-scoped and require a scheduled check time and recipe. For example:
 
 ```sh
