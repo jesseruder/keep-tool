@@ -131,3 +131,72 @@ test('brief uses created log time to order ideas filed on the same day', () => {
   const { text } = buildBrief({ tasks, now: Date.parse('2026-09-10T12:00:00') });
   assert.match(text, /- 11:00 — 0 days old\n- 08:00 — 0 days old/);
 });
+
+test('desktop-only idea delivery succeeds and no delivered channel reports failure', () => {
+  const result = isolated(`
+    const assert = require('node:assert/strict');
+    const alerts = require('./alerts');
+    const review = require('./review');
+    const send = alerts.sendAlert;
+    const deliveries = [];
+    process.env.KEEP_ALERT_CHANNELS = 'desktop';
+    alerts.sendAlert = (options) => {
+      const delivery = send({ ...options, presence: { state: 'present' },
+        availableChannels: () => [], deliver: async () => ({}) });
+      deliveries.push(delivery);
+      return delivery;
+    };
+    review.reviewIdea('Desktop delivery', { message: 'Proposal.', commit: false });
+    process.env.KEEP_ALERT_CHANNELS = 'none';
+    review.reviewIdea('No delivery', { message: 'Proposal.', commit: false });
+    Promise.all(deliveries).then(([desktop, none]) => {
+      assert.equal(desktop.entry.desktop, true);
+      assert.equal(desktop.deliveryOk, true);
+      assert.equal(desktop.entry.failed, undefined);
+      assert.equal(none.entry.desktop, false);
+      assert.equal(none.deliveryOk, false);
+      assert.equal(none.entry.failed, true);
+    });
+  `);
+  assert.equal((result.stderr.match(/alert delivery failed: no channel delivered/g) || []).length, 1);
+});
+
+test('review ideas appear once in the brief while ordinary review cards remain', () => {
+  const tasks = [
+    { fm: { title: 'Unique review idea', status: 'review', tags: ['reviewer-idea'] } },
+    { fm: { title: 'Unique active idea', status: 'active', tags: ['reviewer-idea'] } },
+    { fm: { title: 'Ordinary review card', status: 'review' } },
+  ];
+  const { text } = buildBrief({ tasks });
+  for (const task of tasks) assert.equal(text.split(task.fm.title).length - 1, 1);
+  assert.match(text, /Review \(1\)\n- Ordinary review card/);
+  assert.match(text, /Ideas awaiting a decision \(2\)/);
+});
+
+test('digest lists recent ideas once with a title fallback and retains older status cards', () => {
+  isolated(`
+    const assert = require('node:assert/strict');
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const keep = require('./keep.js');
+    for (const [id, title, status, created, kind] of [
+      ['active-idea', 'Unique active proposal', 'active', '2026-09-10', 'idea'],
+      ['review-idea', 'Unique review proposal', 'review', '2026-09-10', 'idea'],
+      ['untitled-idea', undefined, 'active', '2026-09-10', 'idea'],
+      ['old-idea', 'Older proposal', 'active', '2026-09-01', 'idea'],
+      ['ordinary-review', 'Ordinary review', 'review', '2026-09-10', 'task'],
+    ]) {
+      fs.writeFileSync(path.join(keep.ROOT, 'tasks', id + '.md'), keep.serializeTask({
+        fm: { ...(title ? { title } : {}), status, kind, created }, body: '',
+      }));
+    }
+    const text = keep.buildDigest({ now: '2026-09-10T08:00:00' });
+    for (const label of ['Unique active proposal', 'Unique review proposal', 'untitled-idea', 'Older proposal', 'Ordinary review']) {
+      assert.equal(text.split(label).length - 1, 1, text);
+    }
+    assert.doesNotMatch(text, /undefined/);
+    assert.match(text, /## Ideas \\(3\\)/);
+    assert.match(text, /## Needs you \\(1\\)/);
+    assert.match(text, /## Active \\(1\\)/);
+  `);
+});

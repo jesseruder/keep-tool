@@ -5093,11 +5093,13 @@ function buildDigest(options = {}) {
     return { task, at, proposal };
   }).filter((idea) => idea.at >= since.getTime() && idea.at <= now.getTime())
     .sort((a, b) => b.at - a.at);
-  section('Ideas', ideas, ({ task, proposal }) => `- **${task.fm.title}**${proposal ? ` — ${proposal}` : ''}`);
-  section('Needs you', tasks.filter((t) => t.fm.status === 'review'), (t) => `- **${t.id}**: ${t.fm.title}${last(t)}`);
+  section('Ideas', ideas, ({ task, proposal }) => `- **${task.fm.title || task.id || 'Untitled idea'}**${proposal ? ` — ${proposal}` : ''}`);
+  const ideaIds = new Set(ideas.map(({ task }) => task.id));
+  const statusTasks = tasks.filter((task) => !ideaIds.has(task.id));
+  section('Needs you', statusTasks.filter((t) => t.fm.status === 'review'), (t) => `- **${t.id}**: ${t.fm.title}${last(t)}`);
   section('Overdue checks', tasks.filter(isOverdue), (t) => `- **${t.id}**: ${t.fm.title} — due ${t.fm.check_after.replace('T', ' ')}`);
-  section('Blocked', tasks.filter((t) => t.fm.status === 'blocked'), (t) => `- **${t.id}**: ${t.fm.title}${last(t)}`);
-  section('Active', tasks.filter((t) => t.fm.status === 'active'), (t) => `- **${t.id}**: ${t.fm.title}${last(t)}`);
+  section('Blocked', statusTasks.filter((t) => t.fm.status === 'blocked'), (t) => `- **${t.id}**: ${t.fm.title}${last(t)}`);
+  section('Active', statusTasks.filter((t) => t.fm.status === 'active'), (t) => `- **${t.id}**: ${t.fm.title}${last(t)}`);
   let activity = '';
   try { activity = git('log', '--since', 'yesterday 05:00', '--pretty=format:- %s (%cr)'); } catch {}
   if (activity.trim()) lines.push('## Recent activity', '', activity.trim(), '');

@@ -353,7 +353,7 @@ async function sendAlert(options) {
   const delivered = result.deferred ? {} : await (options.deliver || deliver)(result.entry, {
     root, force: options.force, spoken: options.spoken,
   });
-  const deliveryOk = Object.values(delivered).includes('ok');
+  const deliveryOk = result.entry.desktop === true || Object.values(delivered).includes('ok');
   const entry = { ...result.entry, delivered, ...(!result.deferred && !deliveryOk ? { failed: true } : {}) };
   const finalize = () => {
     const meta = loadMeta(root);
@@ -408,8 +408,6 @@ function countLabel(count, singular, plural) {
 function buildBrief(input) {
   const now = atMs(input.now == null ? Date.now() : input.now);
   const lastBriefAt = Number(input.lastBriefAt || 0);
-  const reviewCards = (input.tasks || []).filter((task) => task.fm && task.fm.status === 'review')
-    .sort((a, b) => String(a.fm.updated || a.fm.created || '').localeCompare(String(b.fm.updated || b.fm.created || '')));
   const ideaCreatedAt = (task) => {
     const stamp = String(task.body || '').match(/^## (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) — created$/m)?.[1];
     return Date.parse(stamp ? stamp.replace(' ', 'T') : task.fm.created);
@@ -417,6 +415,9 @@ function buildBrief(input) {
   const ideas = (input.tasks || []).filter((task) => task.fm
     && (task.fm.tags || []).includes('reviewer-idea') && ['active', 'review'].includes(task.fm.status))
     .sort((a, b) => (ideaCreatedAt(b) || 0) - (ideaCreatedAt(a) || 0));
+  const ideaCards = new Set(ideas);
+  const reviewCards = (input.tasks || []).filter((task) => task.fm && task.fm.status === 'review' && !ideaCards.has(task))
+    .sort((a, b) => String(a.fm.updated || a.fm.created || '').localeCompare(String(b.fm.updated || b.fm.created || '')));
   const allOpenQuestions = (input.questions || []).filter((question) => question && question.status === 'open' && !question.answer);
   // A `--jesse` question is an agent parked on a decision only he can make, so it
   // gets its own block above reviewer traffic: answering it restarts a session.
