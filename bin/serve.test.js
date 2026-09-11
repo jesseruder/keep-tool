@@ -1446,6 +1446,25 @@ test('auto-compact candidates are cold, large, safe Claude sessions ordered by c
   );
 });
 
+function assertAutoCompactHealthRecovered(outcome) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-auto-compact-health-'));
+  try {
+    const result = spawnSync(process.execPath, ['-e', `
+      const assert = require('node:assert/strict');
+      const health = require('./bin/health');
+      for (let i = 0; i < 3; i++) health.record('auto-compact', { ok: false, error: 'no live host pane' });
+      const entry = health.record('auto-compact', JSON.parse(process.argv[1]));
+      assert.equal(entry.consecutiveFailures, 0);
+      assert.equal(health.stateOf({ ...entry, name: 'auto-compact' }), 'ok');
+    `, JSON.stringify(outcome)], {
+      cwd: path.join(__dirname, '..'), env: { ...process.env, KEEP_DIR: root }, encoding: 'utf8',
+    });
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
 test('auto-compact tick filters dead panes before reading context or spending a tick', async (t) => {
   const previous = process.env.KEEP_AUTO_COMPACT;
   process.env.KEEP_AUTO_COMPACT = 'dry';
@@ -1485,7 +1504,9 @@ test('auto-compact tick filters dead panes before reading context or spending a 
   assert.deepEqual(reads, ['live']);
   assert.deepEqual(decisions.map((stamp) => stamp.sessionId), ['live']);
   sessions.pop();
-  assert.deepEqual(await autoCompactTick(deps), { ok: true, detail: 'nothing due' });
+  const idleOutcome = await autoCompactTick(deps);
+  assert.deepEqual(idleOutcome, { ok: true, detail: 'no eligible sessions' });
+  assertAutoCompactHealthRecovered(idleOutcome);
   assert.equal(decisions.length, 1);
 });
 
@@ -1515,11 +1536,12 @@ test('auto-compact resolve-time pane exit is stamped and skipped, while other re
   };
   const outcome = await autoCompactTick(deps);
   assert.equal(outcome.ok, true);
-  assert.equal(outcome.detail, 'nothing due');
+  assert.equal(outcome.detail, 'pane exited');
+  assertAutoCompactHealthRecovered(outcome);
   assert.equal(stamps.live.result, 'skipped');
   assert.equal(stamps.live.reason, failure.message);
   assert.equal(stamps.live.mtime, session.mtime);
-  assert.deepEqual(await autoCompactTick(deps), { ok: true, detail: 'nothing due' });
+  assert.deepEqual(await autoCompactTick(deps), { ok: true, detail: 'no eligible sessions' });
   assert.equal(resolves, 1);
   delete stamps.live;
   failure = new InjectionError(404, 'no session transcript');

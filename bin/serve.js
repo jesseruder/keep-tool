@@ -3089,7 +3089,9 @@ async function autoCompactTick(deps = {}) {
     opts,
   );
   const candidate = candidates[0];
-  if (!candidate) return { ok: true, detail: 'nothing due' };
+  // A completed scan is healthy even when it has no candidates. Health treats
+  // `nothing due` as an unattempted tick and preserves any prior failure.
+  if (!candidate) return { ok: true, detail: 'no eligible sessions' };
 
   let result = 'would';
   let reason = '';
@@ -3156,7 +3158,7 @@ async function autoCompactTick(deps = {}) {
   }
   (deps.logAutoCompactDecision || logAutoCompactDecision)(candidate, stamp);
   const ok = ['would', 'compacted', 'busy', 'skipped'].includes(result);
-  return { ok: ok && !decisionError, detail: decisionError ? 'decision write failed' : result === 'skipped' ? 'nothing due' : result, error: decisionError || (ok ? '' : reason || result) };
+  return { ok: ok && !decisionError, detail: decisionError ? 'decision write failed' : result === 'skipped' ? 'pane exited' : result, error: decisionError || (ok ? '' : reason || result) };
 }
 
 function startAutoCompact() {
