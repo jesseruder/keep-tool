@@ -9,7 +9,7 @@ const fs = require('node:fs');
 const root = path.resolve(__dirname, '..');
 const git = (args) => execFileSync('git', ['-C', root, ...args]);
 const forbidden = /(?:^|\/)(?:tasks|archive|digests|reviews|watch|steps|\.keep|launchd)(?:\/|$)|(?:^|\/)(?:\.env(?:\..*)?|standup\.md|[^/]*credentials[^/]*|[^/]*\.(?:pem|key|p12|pfx|jks|keystore|mobileprovision))$/i;
-const allowed = /^(?:bin|web|desktop|app|scripts|skills|docs|patches|\.github)\/|^(?:README\.md|AGENTS\.md|CLAUDE\.md|LICENSE|\.gitignore|\.gitattributes|\.gitleaks\.toml|package(?:-lock)?\.json)$/;
+const allowed = /^(?:bin|web|desktop|app|scripts|skills|docs|patches|tests|\.github)\/|^(?:README\.md|AGENTS\.md|CLAUDE\.md|LICENSE|\.gitignore|\.gitattributes|\.gitleaks\.toml|package(?:-lock)?\.json)$/;
 const secrets = [
   /-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----/,
   /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/,

@@ -92,6 +92,8 @@ test('public guard rejects forced-in cards and credential-shaped content without
   assert.deepEqual(inspect('watch/slack.json', Buffer.from('{}')), ['excluded path']);
   assert.deepEqual(inspect('bin/credential.js', Buffer.from('ghp_' + 'a'.repeat(36))), ['credential-shaped content']);
   assert.deepEqual(inspect('bin/example.test.js', Buffer.from('const token = "synthetic";')), []);
+  assert.deepEqual(inspect('tests/ui/fixture.cjs', Buffer.from('synthetic')), []);
+  assert.deepEqual(inspect('tests/ui/tasks/card.md', Buffer.from('synthetic')), ['excluded path']);
 });
 
 
