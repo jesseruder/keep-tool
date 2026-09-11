@@ -652,3 +652,13 @@ report opens with that question and quotes the message as an unverified hypothes
 Use the same wording in your final tick summary. Do not put a confident accusation
 under a needs-verification label. Unverified notes cannot apply status changes;
 observed notes still require evidence references and verification performed.
+
+### Offline reviewer evaluation
+
+`keep review-eval --run [--model fable] [--skill candidate.md] --json` evaluates
+frozen, sanitized cases without live findings or registry changes. Save the JSON and
+pass `--compare baseline.json` on later runs of the same corpus. `--prompt` previews
+the label-free input; `--predictions result.json` scores saved output without a model
+call. Results are informational and never gate pushes or restarts. See
+[Reviewer evaluation](reviewer-evaluation.md) for metrics, corpus limitations and
+custom suite format.

@@ -5213,6 +5213,12 @@ commands['review-replay'] = (argv) => {
   console.log(JSON.stringify(require('./review-replay').replayCard(o._[0], o.since, o.session), null, 2));
 };
 
+commands['review-eval'] = async (argv) => {
+  const o = parseArgs(argv, { run: 'bool', prompt: 'bool', predictions: 'str', suite: 'str', skill: 'str', model: 'str', compare: 'str', json: 'bool' });
+  if (o._.length) die('usage: keep review-eval <--run|--prompt|--predictions file> [--model name] [--skill file] [--suite file] [--compare report.json] [--json]');
+  console.log(await require('./review-eval').evaluate(o));
+};
+
 commands['review-land'] = async (argv) => {
   const o = parseArgs(argv, { file: 'str' });
   if ((o.file && o._.length) || (!o.file && (o._.length !== 1 || o._[0] !== '-'))) {
@@ -5930,6 +5936,7 @@ ${stepUsage()}
   keep review-idea "<title>" -m "<body>" [--project p] [--cards a,b,c] [--severity low|med]
   keep review-ack <id> [--bundle id] [--probe-safe] [-m note]  # reviewed; probe-safe approves exact read-only automated calls
   keep review-replay <card> [--since ISO-timestamp] [--session id]  # read-only counterfactual against recorded review times
+  keep review-eval <--run|--prompt|--predictions file> [--model name] [--skill file] [--suite file] [--compare report.json] [--json]  # informational frozen-case judgment evaluation
   keep review-dismiss <id> <key> [-m why]
   keep review-outcome [<card> [<key> <status> -m "reason" --evidence "reference"]] [--json]
                          # fixed, confirmed-deferred, incorrect, superseded, unresolved; list when status omitted
@@ -6016,7 +6023,7 @@ if (require.main === module) {
   (async () => {
     try {
       const [cmd, ...rest] = process.argv.slice(2);
-      if (!fs.existsSync(TASKS) && !['help', 'hook', 'init', 'doctor', 'setup'].includes(cmd)) die(`no repo at ${ROOT} (set KEEP_DIR?)`);
+      if (!fs.existsSync(TASKS) && !['help', 'hook', 'init', 'doctor', 'setup', 'review-eval'].includes(cmd)) die(`no repo at ${ROOT} (set KEEP_DIR?)`);
       const fn = commands[cmd || 'list'];
       if (!fn) die(`unknown command "${cmd}" — try \`keep help\``);
       const helpArgs = [];
