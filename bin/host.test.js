@@ -326,6 +326,7 @@ test('input echoes through sh -c cat', async () => {
     assert.equal(typeof activity.lastInputAt, 'string');
     assert.equal(typeof activity.lastOutputAt, 'string');
     assert.equal(typeof activity.lastReadAt, 'string');
+    assert.equal(typeof activity.outputCount, 'number');
     assert.equal(activity.lastActivityAt, activity.lastOutputAt);
     await client.request('kill', { pane: pane.id });
     await attachment.detach();
@@ -613,7 +614,7 @@ test('handoff adopts a live PTY, rebuilds its screen, and keeps exit detection',
     assert.ok(Buffer.isBuffer(record.panes[0].buffer));
     assert.deepEqual(Object.keys(record.panes[0]).sort(), [
       'alive', 'args', 'buffer', 'cmd', 'cols', 'createdAt', 'cwd', 'exitCode', 'exitedAt',
-      'id', 'inputCount', 'lastInputAt', 'lastOutputAt', 'lastReadAt', 'meta', 'pid', 'primary',
+      'id', 'inputCount', 'lastInputAt', 'lastOutputAt', 'lastReadAt', 'meta', 'outputCount', 'pid', 'primary',
       'pty', 'rows', 'screen', 'signal', 'title',
     ]);
 
@@ -628,6 +629,7 @@ test('handoff adopts a live PTY, rebuilds its screen, and keeps exit detection',
     assert.equal(adoptedActivity.lastOutputAt, activityBefore.lastOutputAt);
     assert.equal(adoptedActivity.lastReadAt, activityBefore.lastReadAt);
     assert.equal(adoptedActivity.inputCount, activityBefore.inputCount);
+    assert.equal(adoptedActivity.outputCount, activityBefore.outputCount);
     assert.match((await client.request('screen', { pane: pane.id })).text, /earlier/);
     await client.request('input', { pane: pane.id, data: Buffer.from('again\n').toString('base64') });
     assert.match((await client.request('get', { pane: pane.id })).pane.primary, /^viewer-/);

@@ -300,7 +300,7 @@ test('done-card close authorizes its own exit input while retaining a force-time
   const task = { id: 'done-card', fm: { status: 'done', done_at: old, sessions: [{ id: 's' }] } };
   const session = { id: 's', pane: 'p', kind: 'codex', state: 'done', endedTurn: true, mtime: now - 20 * 60e3 };
   const pane = { id: 'p', pid: 123, alive: true, attached: 0, inputCount: 0,
-    lastInputAt: old, lastOutputAt: old, lastReadAt: old, meta: { sessionId: 's', agent: 'codex' } };
+    outputCount: 0, lastInputAt: old, lastOutputAt: old, lastReadAt: old, meta: { sessionId: 's', agent: 'codex' } };
   let typed = '';
   const host = { request: async (type, params) => {
     if (type === 'list') return { panes: [{ ...pane }] };
@@ -323,6 +323,7 @@ test('done-card close authorizes its own exit input while retaining a force-time
     });
     assert.equal(typed, '/exit\r');
     assert.equal(result.expectedInputCount, 2);
+    assert.equal(result.expectedOutputCount, 0);
     await result.beforeSignal();
     pane.inputCount += 1;
     await assert.rejects(result.beforeSignal(), /unexpected input/);

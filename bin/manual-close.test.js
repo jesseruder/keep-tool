@@ -57,6 +57,23 @@ test('automatic close rechecks its safety closure before each signal', async () 
   assert.equal(checks, 2);
 });
 
+test('automatic close never force-terminates a live session that responds after /exit', async () => {
+  let outputCount = 4;
+  const f = fixture('SIGKILL');
+  f.deps.getPane = async () => ({
+    id: 'pane', pid: 123, alive: true, inputCount: 2, outputCount,
+    meta: { agent: 'claude', sessionId: 'session' },
+  });
+  f.deps.graceful = async () => {
+    outputCount += 1;
+    return { expectedInputCount: 2, expectedOutputCount: 4 };
+  };
+  await assert.rejects(manualClose(body, {
+    ...f.deps, requireGraceful: true, protectInput: true, protectOutput: true,
+  }), /produced output/);
+  assert.deepEqual(f.calls, []);
+});
+
 for (const graceful of [true, false]) test(`isolated real PTY close: ${graceful ? 'graceful' : 'forced fallback'}`, { timeout: 12000 }, async () => {
   const fs = require('node:fs');
   const path = require('node:path');

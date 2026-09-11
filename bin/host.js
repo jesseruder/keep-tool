@@ -232,6 +232,7 @@ function publicPane(pane) {
     lastOutputAt: pane.lastOutputAt,
     lastReadAt: pane.lastReadAt,
     inputCount: pane.inputCount,
+    outputCount: pane.outputCount,
     lastActivityAt: activityTimes.length ? new Date(Math.max(...activityTimes)).toISOString() : null,
     bytes: pane.buffer.size,
     title: pane.title,
@@ -398,6 +399,7 @@ function createHost(options = {}) {
       lastOutputAt: record.lastOutputAt || null,
       lastReadAt: record.lastReadAt || null,
       inputCount: Number.isInteger(record.inputCount) ? record.inputCount : 0,
+      outputCount: Number.isInteger(record.outputCount) ? record.outputCount : 0,
       title: record.title || '',
       // Viewer connections do not survive a reload. Let the first eligible viewer
       // to attach or type claim the adopted pane instead of retaining a ghost owner.
@@ -430,10 +432,12 @@ function createHost(options = {}) {
             ? combined.subarray(combined.length - maxBufferBytes) : combined;
           pane.handoffRecord.screen = Buffer.concat([pane.handoffRecord.screen, data]);
           pane.handoffRecord.lastOutputAt = new Date().toISOString();
+          pane.handoffRecord.outputCount = (pane.handoffRecord.outputCount || 0) + 1;
         }
         return;
       }
       pane.buffer.push(data);
+      pane.outputCount += 1;
       pane.lastOutputAt = new Date().toISOString();
       if ([...pane.attachments.values()].some((attachment) => attachment.visible !== false)) {
         pane.lastReadAt = pane.lastOutputAt;
@@ -1028,6 +1032,7 @@ function createHost(options = {}) {
           lastOutputAt: pane.lastOutputAt,
           lastReadAt: pane.lastReadAt,
           inputCount: pane.inputCount,
+          outputCount: pane.outputCount,
           title: pane.title,
           pid: pane.pty.pid,
           pty: pane.pty,

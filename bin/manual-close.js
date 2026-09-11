@@ -5,6 +5,7 @@ async function manualClose(body, deps) {
   if (!/^[a-z0-9_-]+$/i.test(body?.sessionId || '') || !/^[a-z0-9_-]+$/i.test(body?.pane || '')) throw new Error('Expected exact session and pane');
   const initial = await deps.getPane(body.pane);
   let expectedInputCount = null;
+  let expectedOutputCount = null;
   const verify = (pane) => {
     if (!pane || pane.id !== body.pane || pane.meta?.sessionId !== body.sessionId
         || !['claude', 'codex'].includes(pane.meta?.agent) || (initial?.pid && pane.pid !== initial.pid)) {
@@ -12,6 +13,10 @@ async function manualClose(body, deps) {
     }
     if (deps.protectInput && expectedInputCount !== null && pane.inputCount !== expectedInputCount) {
       throw new Error('Session received input after graceful close; nothing force-terminated');
+    }
+    if (deps.protectOutput && expectedOutputCount !== null && pane.alive
+        && pane.outputCount !== expectedOutputCount) {
+      throw new Error('Session produced output after graceful close; nothing force-terminated');
     }
     return pane;
   };
@@ -34,6 +39,7 @@ async function manualClose(body, deps) {
     if (deps.requireGraceful) throw error;
   }
   if (deps.protectInput) expectedInputCount = gracefulResult?.expectedInputCount;
+  if (deps.protectOutput) expectedOutputCount = gracefulResult?.expectedOutputCount;
   if (await wait(200)) return result();
   await gracefulResult?.beforeSignal?.();
   verify(await deps.getPane(body.pane));

@@ -2537,7 +2537,9 @@ async function closeIdleSession(body, deps = {}) {
       }
     }
     let authorizedPane = null;
+    let submittedPane = null;
     const unchanged = async ({ expectedInputCount = null, useAuthorizedActivity = false } = {}) => {
+      let currentPane = null;
       if (deps.closePolicy?.done) {
         const rows = await agentProcessRows(deps);
         const identity = (await liveSessionPids({ ...deps, agentProcessRows: async () => rows })).get(session.id);
@@ -2557,7 +2559,7 @@ async function closeIdleSession(body, deps = {}) {
         throw new InjectionError(409, 'Session changed during cleanup; nothing closed');
       }
       if (deps.closePolicy?.automatic) {
-        const currentPane = (await listHostPanes(deps, true))?.find((p) => p.id === pane.id);
+        currentPane = (await listHostPanes(deps, true))?.find((p) => p.id === pane.id);
         if (!currentPane?.alive || currentPane.attached !== 0 || currentPane.meta?.sessionId !== session.id) throw new InjectionError(409, 'Session acquired a viewer or changed during cleanup');
         if (expectedInputCount !== null && currentPane.inputCount !== expectedInputCount) {
           throw new InjectionError(409, 'Session received unexpected input during cleanup');
@@ -2577,6 +2579,7 @@ async function closeIdleSession(body, deps = {}) {
         try { verifyCodexChildren(); } catch (error) { throw new InjectionError(409, error.message); }
       }
       if (deps.beforeClose) await deps.beforeClose();
+      return currentPane;
     };
     await unchanged();
     if (deps.closePolicy?.done) {
@@ -2590,10 +2593,12 @@ async function closeIdleSession(body, deps = {}) {
     await typeAndSubmit(target, '/exit', (screen, text) => closeDraftVisible(screen, text, session.kind), {
       ...deps,
       confirmationLines: session.kind === 'claude' ? null : 30,
-      beforeEnter: () => unchanged({
-        expectedInputCount: authorizedPane ? authorizedPane.inputCount + 1 : null,
-        useAuthorizedActivity: Boolean(authorizedPane),
-      }),
+      beforeEnter: async () => {
+        submittedPane = await unchanged({
+          expectedInputCount: authorizedPane ? authorizedPane.inputCount + 1 : null,
+          useAuthorizedActivity: Boolean(authorizedPane),
+        });
+      },
     });
     // No process signals, forced exit, transcript removal, or task completion.
     return {
@@ -2603,6 +2608,7 @@ async function closeIdleSession(body, deps = {}) {
       pane: pane.id,
       ...(authorizedPane ? {
         expectedInputCount: authorizedPane.inputCount + 2,
+        expectedOutputCount: submittedPane.outputCount,
         beforeSignal: () => unchanged({
           expectedInputCount: authorizedPane.inputCount + 2,
           useAuthorizedActivity: true,
@@ -4732,6 +4738,7 @@ function start(deps = {}) {
         const result = await withInjectionLock(() => require('./manual-close').manualClose(body, {
           requireGraceful: true,
           protectInput: true,
+          protectOutput: true,
           getPane: async (pane) => (await hostRequest('get', { pane })).pane,
           graceful: (request) => closeIdleSession(request, {
             closePolicy: {
