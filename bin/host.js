@@ -750,7 +750,8 @@ function createHost(options = {}) {
         }
         if (pane.pty.pid !== params.expectedPid || pane.meta?.sessionId !== params.expectedSessionId
             || !['claude', 'codex'].includes(pane.meta?.agent)
-            || pane.inputCount !== params.expectedInputCount || pane.outputCount !== params.expectedOutputCount) {
+            || pane.inputCount !== params.expectedInputCount || pane.outputCount !== params.expectedOutputCount
+            || pane.attachments.size !== 0) {
           const error = new Error('Pane identity or activity changed; nothing signalled');
           error.code = 'guard_rejected';
           throw error;

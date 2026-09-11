@@ -92,6 +92,13 @@ test('guarded kill atomically refuses stale input and output counts', async () =
     await assert.rejects(guarded(beforeOutput), /activity changed/);
     const current = (await client.request('get', { pane: pane.id })).pane;
     assert.equal(current.alive, true);
+
+    for (const visible of [false, true]) {
+      const attachment = await client.attach(pane.id, { replay: false, visible }, () => {});
+      await assert.rejects(guarded(current), /activity changed/);
+      assert.equal((await client.request('get', { pane: pane.id })).pane.alive, true);
+      await attachment.detach();
+    }
     await guarded(current, 'SIGKILL');
   });
 });
