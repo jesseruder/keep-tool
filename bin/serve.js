@@ -34,6 +34,7 @@ const health = require('./health.js');
 const stalled = require('./stalled.js');
 const keepConsole = require('./console.js');
 const sessionStatus = require('./session-status.js');
+const { sendStateJson } = require('./state-response.js');
 
 const PORT = parseInt(process.env.KEEP_PORT || '7777', 10);
 const { PROJECTS_DIR, TAIL_BYTES, textOf, readTranscriptTail, findSessionFile } = transcripts;
@@ -5066,8 +5067,7 @@ function start(deps = {}) {
         const state = buildState({ hostPanes: panes, dashboard: true });
         const enriched = await addHostSessionState(state, { ...deps, panes });
         const body = JSON.stringify(wantsCompactState(req, url) ? compactState(enriched) : enriched);
-        res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-        res.end(body);
+        await sendStateJson(req, res, body);
       } else if (url.pathname === '/api/events') {
         res.writeHead(200, {
           'content-type': 'text/event-stream',
