@@ -178,6 +178,29 @@ test('durable delivery recovery never repeats an ambiguous continuation on a dea
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test('durable matching delivery receipt completes authority without resending after a daemon crash', async () => {
+  const f = fixture();
+  try {
+    let sends = 0;
+    const d = deps(f, { continueSession: async () => { sends++; throw new Error('daemon stopped after accepted submission'); } });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /daemon stopped/);
+    const journalFile = path.join(f.root, '.keep', 'account-handoffs', `${f.sid}.json`);
+    const interrupted = JSON.parse(fs.readFileSync(journalFile, 'utf8'));
+    interrupted.status = 'delivering';
+    fs.writeFileSync(journalFile, JSON.stringify(interrupted));
+    accounts.commitStaged(f.sid, interrupted.id, { root: f.root });
+    d.pane.alive = false;
+    d.deliveryStatus = async (sessionId, text, deliveryId) => {
+      assert.equal(sessionId, f.sid); assert.match(text, /Continue the work/); assert.equal(deliveryId, interrupted.deliveryId);
+      return { sessionId: f.sid, kind: 'claude', received: true, pending: false };
+    };
+    const recovered = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d);
+    assert.equal(recovered.status, 'done');
+    assert.equal(sends, 1, 'a receipt finalizes the transaction without another continuation');
+    assert.equal(accounts.forSession(f.sid, 'claude', { root: f.root, env: f.env }).id, 'two');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test('same-account and cross-provider targets are refused before stopping', async () => {
   const f = fixture();
   try {
@@ -191,7 +214,8 @@ test('same-account and cross-provider targets are refused before stopping', asyn
 test('custom settings, tool aliases, and restricted mode are refused before source exit', async () => {
   const f = fixture();
   try {
-    for (const flag of ['--settings custom.json', '--tools Read', '--allowed-tools Read', '--disallowed-tools', '--restricted']) {
+    for (const flag of ['--settings custom.json', '--tools Read', '--allowed-tools Read', '--disallowed-tools', '--restricted',
+      '--mcp-config custom.json', '--safe-mode', '--bare', '--unknown-option']) {
       const d = deps(f);
       d.inspect = async () => ({ session: { id: f.sid, kind: 'claude', project: f.project }, pane: d.pane,
         processArgs: `claude ${flag} --resume ${f.sid}` });
@@ -203,6 +227,8 @@ test('custom settings, tool aliases, and restricted mode are refused before sour
       processArgs: `claude --settings '${JSON.stringify(require('./reviewer-launch').REVIEWER_SETTINGS)}' --resume ${f.sid}` });
     const result = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, reviewer);
     assert.equal(result.status, 'done', 'the exact generated reviewer settings are reproducible');
+    assert.equal(handoff.permissionClass(`claude --mcp-config '${path.join(f.base, 'managed mcp.json')}' --resume ${f.sid}`,
+      { mcpConfig: path.join(f.base, 'managed mcp.json') }), 'restricted', 'the exact generated managed MCP path is reproducible');
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 

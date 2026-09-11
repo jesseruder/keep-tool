@@ -2909,10 +2909,12 @@ test('handoff continuation receipts are bound to the staged target transcript', 
     return {};
   });
   try {
-    const result = await continueAccountHandoff(sid, 'pane-target', 'target', message, {
+    const result = await continueAccountHandoff(sid, 'pane-target', 'target', message, 'tx-delivery', {
       root, env, host, sleep: async () => {}, deliveryDirectory: path.join(root, '.keep', 'delivery'),
     });
     assert.equal(result.delivery, 'received');
+    assert.deepEqual(require('./delivery').statusForText(path.join(root, '.keep', 'delivery'), message, 'tx-delivery'),
+      { sessionId: sid, kind: 'claude', received: true });
     assert.doesNotMatch(fs.readFileSync(sourceFile, 'utf8'), /Continue from the limit/);
     assert.match(fs.readFileSync(targetFile, 'utf8'), /Continue from the limit/);
   } finally { fs.rmSync(base, { recursive: true, force: true }); }

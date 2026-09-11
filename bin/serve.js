@@ -2743,19 +2743,21 @@ async function forceRestartSession(entry, save, deps = {}) {
     const initial = (await host('get', { pane: entry.pane })).pane;
     const cwd = entry.original?.cwd || initial?.cwd;
     if (!cwd || !fs.statSync(cwd).isDirectory()) throw Error('Session directory is unavailable');
+    const resumeAgent = entry.original?.agent || initial?.meta?.agent;
+    if (!['claude', 'codex'].includes(resumeAgent)) throw new InjectionError(409, 'Original agent is unavailable');
     const originalAccountId = entry.original?.meta?.accountId || initial?.meta?.accountId;
     let resumeAccount;
-    try { resumeAccount = accounts.forSession(entry.sessionId, entry.original?.agent, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
+    try { resumeAccount = accounts.forSession(entry.sessionId, resumeAgent, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
     catch (error) { throw new InjectionError(409, error.message); }
     if (!resumeAccount && originalAccountId) {
       resumeAccount = accounts.get(originalAccountId, deps.env || process.env);
-      if (!resumeAccount || resumeAccount.agent !== entry.original?.agent) {
+      if (!resumeAccount || resumeAccount.agent !== resumeAgent) {
         throw new InjectionError(409, `session belongs to unavailable account ${originalAccountId}`);
       }
     }
-    resumeAccount ||= accounts.defaultFor(entry.original?.agent, deps.env || process.env);
+    resumeAccount ||= accounts.defaultFor(resumeAgent, deps.env || process.env);
     let resumeMcpConfig = null;
-    if (entry.original?.agent === 'claude' && resumeAccount.managed) {
+    if (resumeAgent === 'claude' && resumeAccount.managed) {
       try { resumeMcpConfig = (deps.ensureSharedMemory || require('./account-setup').ensureSharedMemory)(resumeAccount, cwd).mcpConfig; }
       catch (error) { throw new InjectionError(409, `account shared setup is unavailable: ${error.message}`); }
     }
@@ -4831,16 +4833,19 @@ function accountClaudeSession(sessionId, account, file) {
   return claudeSessionFromInfo(sessionId, scanTranscript(file), stat, path.dirname(file), false, Date.now(), account.id);
 }
 
-function continueAccountHandoff(sessionId, pane, accountId, text, deps = {}) {
+function continueAccountHandoff(sessionId, pane, accountId, text, deliveryId, deps = {}) {
   const env = deps.env || process.env;
   const target = accounts.get(accountId, env);
   if (!target || target.agent !== 'claude') throw new InjectionError(409, 'Target account changed before continuation delivery');
   const file = accountClaudeTranscript(sessionId, target, env);
   const loadTarget = () => accountClaudeSession(sessionId, target, file);
-  return sendToSessionLocked({ sessionId, pane, text }, {
+  const exactDeps = {
     ...deps, loadCurrentSession: loadTarget, loadDeliverySession: loadTarget,
     transcriptFileForSession: () => file,
-  });
+  };
+  exactDeps.sendToResolvedTarget = (session, resolved, message) => sendToResolvedTarget(session, resolved, message,
+    { retainReceipt: true, deliveryKey: deliveryId }, exactDeps);
+  return sendToSessionLocked({ sessionId, pane, text }, exactDeps);
 }
 
 async function resumeExitedAccountHandoff(entry, account, mcpConfig, deps = {}) {
@@ -4866,6 +4871,7 @@ async function resumeExitedAccountHandoff(entry, account, mcpConfig, deps = {}) 
 
 async function handoffSession(body, deps = {}) {
   const root = deps.root || keep.ROOT;
+  const deliveryDirectory = deps.deliveryDirectory || path.join(root, '.keep', 'delivery');
   return require('./account-handoff').run(body, {
     ...deps,
     root,
@@ -4875,7 +4881,9 @@ async function handoffSession(body, deps = {}) {
     restartDeps: deps.restartDeps || deps,
     resumeExited: deps.resumeExited || ((entry, account, mcpConfig) => resumeExitedAccountHandoff(entry, account, mcpConfig, deps)),
     waitForAccountRecord: deps.waitForAccountRecord || ((sid, pane, accountId, after) => waitForAccountRecord(sid, pane, accountId, after, deps)),
-    continueSession: deps.continueSession || ((sessionId, text) => continueAccountHandoff(sessionId, body.pane, body.accountId, text, deps)),
+    continueSession: deps.continueSession || ((sessionId, text, options) => continueAccountHandoff(sessionId, body.pane, body.accountId,
+      text, options?.deliveryId, { ...deps, deliveryDirectory })),
+    deliveryStatus: deps.deliveryStatus || ((_sessionId, text, deliveryId) => require('./delivery').statusForText(deliveryDirectory, text, deliveryId)),
   });
 }
 

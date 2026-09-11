@@ -116,3 +116,40 @@ test('daemon adapter preserves pane, conversation and permission class for both 
     assert.equal(launch.args[1].includes(flag), bypass); assert.equal(verified, true);
   }
 });
+
+test('fresh daemon force restart preflights a pinned managed Claude profile before close', async t => {
+  const { forceRestartSession } = require('./serve');
+  const accounts = require('./accounts');
+  const root = require('fs').mkdtempSync(require('path').join(require('os').tmpdir(), 'keep-force-account-'));
+  t.after(() => require('fs').rmSync(root, { recursive: true, force: true }));
+  const configDir = require('path').join(root, 'secondary'); require('fs').mkdirSync(configDir);
+  const config = require('path').join(root, 'config.json');
+  require('fs').writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+    { id: 'secondary', label: 'Secondary', agent: 'claude', configDir },
+  ], defaultAccounts: { claude: 'secondary' } }));
+  const env = { KEEP_DIR: root, KEEP_CONFIG: config };
+  accounts.pinSession('s', 'claude', 'secondary', { root, env });
+  const f = fixture();
+  f.pane().meta = { sessionId: 's', agent: 'claude', accountId: 'secondary' };
+  f.rows([{ pid: 10, ppid: 1, pidStart: 'shell' }, { pid: 11, ppid: 10, pidStart: 'agent', agent: 'claude', interactive: true, args: 'claude --resume s' }]);
+  let closed = false, launch;
+  await forceRestartSession(f.entry, f.deps.save, {
+    root, env, withInjectionLock: fn => fn(), forceRows: f.deps.rows, sleep: async () => {}, lsof: async () => '',
+    ensureSharedMemory: account => {
+      assert.equal(account.id, 'secondary'); assert.equal(closed, false);
+      return { mcpConfig: require('path').join(configDir, 'managed.keep-mcp.json') };
+    },
+    closeIdleSession: async () => { closed = true; f.pane().alive = false; f.rows([]); },
+    waitForHostAgent: async () => {},
+    host: { request: async (type, params) => {
+      if (type === 'hello') return { replaceExited: true };
+      if (type === 'get') return { pane: f.pane() };
+      if (type === 'kill') { f.pane().alive = false; return {}; }
+      assert.equal(type, 'replace-exited'); launch = params; return { pane: { id: 'p', pid: 20 } };
+    } },
+  });
+  assert.equal(closed, true);
+  assert.match(launch.args[1], /managed\.keep-mcp\.json/);
+  const encodedProfile = /'--profile' '([^']+)'/.exec(launch.args[1])?.[1];
+  assert.equal(JSON.parse(Buffer.from(encodedProfile, 'base64url')).id, 'secondary');
+});

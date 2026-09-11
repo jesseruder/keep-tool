@@ -11,6 +11,7 @@ const artifacts = require('./account-artifacts');
 
 const execFileAsync = promisify(execFile);
 const active = new Map();
+const CONTINUATION_TEXT = 'Continue the work from the request that hit the account limit.';
 
 function dir(root) { return path.join(root, '.keep', 'account-handoffs'); }
 function fileFor(root, sessionId) { return path.join(dir(root), `${sessionId}.json`); }
@@ -58,11 +59,30 @@ async function authPreflight(account, deps = {}) {
   } catch { return false; }
 }
 
-function permissionClass(args) {
+function permissionClass(args, options = {}) {
+  let text = String(args || '').trim();
+  if (!/^(?:\S*\/)?claude(?=\s|$)/.test(text)) return null;
+  text = text.replace(/^(?:\S*\/)?claude(?=\s|$)/, '');
+  let bypass = false;
+  const consume = (pattern, effect) => {
+    let changed = false;
+    text = text.replace(pattern, (...match) => { changed = true; if (effect) effect(...match); return ' '; });
+    return changed;
+  };
   const reviewerSettings = JSON.stringify(require('./reviewer-launch').REVIEWER_SETTINGS).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const text = String(args || '').replace(new RegExp(`--settings(?:=|\\s+)["']?${reviewerSettings}["']?(?=\\s|$)`), '');
-  if (/--(?:permission-mode|permission-prompts|permission-prompt-tool|allow-dangerously-skip-permissions|allowedTools|allowed-tools|disallowedTools|disallowed-tools|restricted|settings|tools|add-dir|append-system-prompt|system-prompt|strict-mcp-config|agent|agents|setting-sources|plugin-dir|disable-slash-commands)(?==|\s|$)/.test(text)) return null;
-  return text.split(/\s+/).includes('--dangerously-skip-permissions') ? 'bypass' : 'restricted';
+  const allowed = [
+    /(?:^|\s)--resume(?:=|\s+)["']?[A-Za-z0-9_-]+["']?(?=\s|$)/g,
+    /(?:^|\s)--session-id(?:=|\s+)["']?[A-Za-z0-9_-]+["']?(?=\s|$)/g,
+    /(?:^|\s)--model(?:=|\s+)["']?[A-Za-z0-9][A-Za-z0-9._:/-]*["']?(?=\s|$)/g,
+    new RegExp(`(?:^|\\s)--settings(?:=|\\s+)(?:'${reviewerSettings}'|"${reviewerSettings}"|${reviewerSettings})(?=\\s|$)`, 'g'),
+  ];
+  if (options.mcpConfig) {
+    const mcp = String(options.mcpConfig).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    allowed.push(new RegExp(`(?:^|\\s)--mcp-config(?:=|\\s+)(?:'${mcp}'|"${mcp}"|${mcp})(?=\\s|$)`, 'g'));
+  }
+  for (const pattern of allowed) consume(pattern);
+  consume(/(?:^|\s)--dangerously-skip-permissions(?=\s|$)/g, () => { bypass = true; });
+  return text.trim() ? null : bypass ? 'bypass' : 'restricted';
 }
 
 async function run(body, deps = {}) {
@@ -109,6 +129,18 @@ async function run(body, deps = {}) {
       const error = new Error('Cross-profile handoff is currently verified only for Claude sessions'); error.status = 409; throw error;
     }
     if (source.id === target.id) { const error = new Error('source and target account are the same'); error.status = 409; throw error; }
+    if (current?.deliveryStartedAt && !current.deliveredAt && current.deliveryId && deps.deliveryStatus) {
+      const receipt = await deps.deliveryStatus(session.id, CONTINUATION_TEXT, current.deliveryId);
+      if (receipt?.received) {
+        if (receipt.sessionId !== session.id || receipt.kind !== 'claude') {
+          const error = new Error('Continuation receipt does not belong to this Claude session'); error.status = 409; throw error;
+        }
+        current.deliveredAt = Date.now();
+        commitTargetAuthority(session.id, target.id, current.id, root);
+        Object.assign(current, { status: 'done', phase: 'done', reason: '' }); writeOne(root, current);
+        return { ok: true, ...safe(current) };
+      }
+    }
     if (current && !pane.alive && pane.meta?.handoffTransactionId === current.id && pane.meta?.accountId === target.id
         && ['starting-target', 'verifying-target', 'delivering-continuation'].includes(current.phase)
         && Number.isInteger(pane.pid) && pane.pid !== current.pid) {
@@ -128,7 +160,7 @@ async function run(body, deps = {}) {
         writeOne(root, current);
         if (current.deliveryStartedAt && !current.deliveredAt) throw new Error('Continuation delivery is unconfirmed; it will not be sent twice');
         current.deliveryStartedAt = Date.now(); writeOne(root, current);
-        if (!current.deliveredAt) await deps.continueSession(session.id, 'Continue the work from the request that hit the account limit.');
+        if (!current.deliveredAt) await deps.continueSession(session.id, CONTINUATION_TEXT, { deliveryId: current.deliveryId });
         current.deliveredAt ||= Date.now();
         commitTargetAuthority(session.id, target.id, current.id, root);
         Object.assign(current, { status: 'done', phase: 'done', reason: '' }); writeOne(root, current);
@@ -160,7 +192,7 @@ async function run(body, deps = {}) {
           deliveryId: current.deliveryId || crypto.randomUUID() }); writeOne(root, current);
         if (current.deliveryStartedAt && !current.deliveredAt) throw new Error('Continuation delivery is unconfirmed; it will not be sent twice');
         current.deliveryStartedAt = Date.now(); writeOne(root, current);
-        if (!current.deliveredAt) await deps.continueSession(session.id, 'Continue the work from the request that hit the account limit.');
+        if (!current.deliveredAt) await deps.continueSession(session.id, CONTINUATION_TEXT, { deliveryId: current.deliveryId });
         current.deliveredAt ||= Date.now();
         commitTargetAuthority(session.id, target.id, current.id, root);
         Object.assign(current, { status: 'done', phase: 'done' }); writeOne(root, current);
@@ -171,7 +203,12 @@ async function run(body, deps = {}) {
       }
     }
     if (!pane.alive) { const error = new Error('Interrupted handoff requires explicit recovery'); error.status = 409; throw error; }
-    if (permissionClass(inspected.processArgs) == null) {
+    let sourceMcpConfig = null;
+    if ((deps.readSetup || require('./account-setup').readSetup)(source)) {
+      try { sourceMcpConfig = (deps.ensureSharedMemory || require('./account-setup').ensureSharedMemory)(source, session.project || pane.cwd).mcpConfig; }
+      catch (error) { const failure = new Error(`Source account setup is unavailable: ${error.message}`); failure.status = 409; throw failure; }
+    }
+    if (permissionClass(inspected.processArgs, { mcpConfig: sourceMcpConfig }) == null) {
       const error = new Error('Session uses a custom permission configuration that cannot be reproduced safely'); error.status = 409; throw error;
     }
     if (inspected.currentModel && !require('./keep.js').LAUNCH_MODEL_RE.test(inspected.currentModel)) {
@@ -197,7 +234,7 @@ async function run(body, deps = {}) {
     accounts.pinSession(session.id, 'claude', source.id, { root, env });
     Object.assign(current, { status: 'stopping', phase: 'stopping-source', reason: '', cwd: session.project || pane.cwd,
       pid: pane.pid, cols: pane.cols, rows: pane.rows, model: inspected.currentModel || pane.meta?.model || '',
-      permissionClass: permissionClass(inspected.processArgs) });
+      permissionClass: permissionClass(inspected.processArgs, { mcpConfig: sourceMcpConfig }) });
     writeOne(root, current);
     let copied = false;
     const baseHost = deps.host;
@@ -225,7 +262,7 @@ async function run(body, deps = {}) {
       Object.assign(current, { status: 'delivering', phase: 'delivering-continuation', reason: '', result,
         deliveryId: current.deliveryId || crypto.randomUUID() }); writeOne(root, current);
       current.deliveryStartedAt = Date.now(); writeOne(root, current);
-      await deps.continueSession(session.id, 'Continue the work from the request that hit the account limit.');
+      await deps.continueSession(session.id, CONTINUATION_TEXT, { deliveryId: current.deliveryId });
       current.deliveredAt = Date.now();
       commitTargetAuthority(session.id, target.id, current.id, root);
       Object.assign(current, { status: 'done', phase: 'done' }); writeOne(root, current);
@@ -240,4 +277,4 @@ async function run(body, deps = {}) {
   return pending;
 }
 
-module.exports = { run, list, safe, authPreflight, permissionClass };
+module.exports = { run, list, safe, authPreflight, permissionClass, CONTINUATION_TEXT };
