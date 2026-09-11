@@ -306,7 +306,7 @@ dedupe window; `KEEP_ALERT_CHANNELS=none` disables channel processes for isolate
 
 `keep brief` prints the current brief; `keep brief --send` also routes it. The daemon
 sends one each local day at `KEEP_BRIEF_AT` (default `08:00`). It covers review cards,
-questions and newly delivered answers, overdue checks, deferred alerts, recent
+open needs, overdue checks, deferred alerts, recent
 medium/high reviewer findings, active holds, and gated steps with pending commits. A
 failed delivery retries every 30 minutes until 12:00 local, when the daemon records the
 failure and gives up for that day; `keep brief --send` always sends immediately.

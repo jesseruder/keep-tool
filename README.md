@@ -32,8 +32,8 @@ agent sessions your Keep tracks across your projects.
   or runs it in a headless agent when needed.
 - **Coordinate dependent work.** Record that one task depends on another task or a
   particular plan step. When that dependency is satisfied, Keep notifies the
-  waiting session so it can continue. Questions for you can also be recorded in a
-  persistent inbox instead of getting lost at the end of a conversation.
+  waiting session so it can continue. Secrets, sign-ins, and other things only
+  you can supply are recorded as blockers on the task, so they outlive the session.
 - **Get a second opinion across projects.** A dedicated reviewer examines changes
   in task records and session evidence, records findings, and highlights problems
   such as stalled work, conflicting claims, or missing verification. A separate
