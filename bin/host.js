@@ -667,6 +667,7 @@ function createHost(options = {}) {
           readsHistory: params.snapshot === true || params.replay !== false,
         };
         let pending;
+        let history = null;
         pane.pendingAttachments += 1;
         try {
           if (params.snapshot === true) {
@@ -681,6 +682,10 @@ function createHost(options = {}) {
               scrollback,
               excludeAltBuffer: false,
             });
+            // What the snapshot left behind, so a viewer can offer "load earlier
+            // output" only when there is earlier output to load.
+            const available = pane.term.buffer.normal.baseY;
+            history = { lines: available, sent: Math.min(available, scrollback), truncated: available > scrollback };
             pending = {
               replay: null,
               snapshot: Buffer.from(`\x1bc${serialized}`, 'utf8'),
@@ -708,7 +713,7 @@ function createHost(options = {}) {
           pane.pendingAttachments -= 1;
         }
         return {
-          result: { pane: publicPane(pane), viewer },
+          result: { pane: publicPane(pane), viewer, ...(history ? { history } : {}) },
           after: () => {
             const ready = connection.pendingAttach.get(pane.id);
             if (!ready) return;

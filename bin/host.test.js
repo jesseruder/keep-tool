@@ -884,6 +884,9 @@ test('snapshot attach defaults to a bounded, valid xterm tail and permits explic
     const attachment = await client.attach(pane.id, { snapshot: true }, (data, info) => {
       if (info.snapshot) bounded.push(data);
     });
+    assert.equal(attachment.history.truncated, true, 'the bounded snapshot left scrollback behind');
+    assert.equal(attachment.history.sent, DEFAULT_SNAPSHOT_SCROLLBACK);
+    assert.ok(attachment.history.lines > DEFAULT_SNAPSHOT_SCROLLBACK);
     await waitFor(() => bounded.length > 0, 'bounded snapshot');
     const snapshot = Buffer.concat(bounded);
     const term = new Terminal({ cols: 80, rows: 12, scrollback: 10000, allowProposedApi: true });
@@ -906,6 +909,8 @@ test('snapshot attach defaults to a bounded, valid xterm tail and permits explic
         (data, info) => { if (info.snapshot) full.push(data); },
       );
       await waitFor(() => full.length > 0, 'full snapshot');
+      assert.equal(fullAttachment.history.truncated, false, 'the full snapshot carries everything');
+      assert.equal(fullAttachment.history.sent, fullAttachment.history.lines);
       const fullTerm = new Terminal({ cols: 80, rows: 12, scrollback: 10000, allowProposedApi: true });
       try {
         await writeTerminal(fullTerm, Buffer.concat(full));

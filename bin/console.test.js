@@ -78,6 +78,7 @@ async function fixture(options = {}) {
         }
         return {
           pane: { ...currentPane },
+          history: { lines: 250, sent: attachOptions.snapshotScrollback || 100, truncated: !attachOptions.snapshotScrollback },
           detach: async () => {
             calls.push({ type: 'detach', params: { pane }, client: clients.indexOf(host) });
             attached.delete(pane);
@@ -262,6 +263,8 @@ test('bridges a pane websocket in both directions', async (t) => {
   const attachedIndex = replayFrames.findIndex((frame) => jsonMessage(frame)?.t === 'attached');
   const replayIndex = replayFrames.findIndex((frame) => frame.binary && frame.data.toString() === 'replay');
   assert.ok(attachedIndex >= 0 && attachedIndex < replayIndex);
+  assert.deepEqual(jsonMessage(replayFrames[attachedIndex]).history, { lines: 250, sent: 100, truncated: true },
+    'the attached frame says whether the snapshot left earlier output behind');
   assert.ok(replayFrames.some((frame) => frame.binary && frame.data.toString() === 'replay'));
   const replayEndFrames = await messages.until(
     (frames) => frames.some((frame) => jsonMessage(frame)?.t === 'replay-end'),

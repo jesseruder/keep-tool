@@ -39,7 +39,7 @@ test('Triage and Watch move one terminal viewer instead of retaining a hidden pr
   assert.deepEqual(shown, [false, false], 'both moves schedule layout without requiring a click');
 });
 
-function fixture() {
+function fixture(options = {}) {
   class Element {
     constructor() {
       this.dataset = {};
@@ -115,7 +115,11 @@ function fixture() {
   const socket = mounted.socket;
   const message = (value) => socket.onmessage({ data: JSON.stringify(value) });
   socket.onopen();
-  message({ t: 'attached', pane: { id: 'pane', primary: 'viewer', cols: 80, rows: 50 } });
+  message({
+    t: 'attached',
+    pane: { id: 'pane', primary: 'viewer', cols: 80, rows: 50 },
+    ...(options.history ? { history: options.history } : {}),
+  });
   const drain = () => new Promise((resolve) => terminal.write('', resolve));
   return {
     mounted, terminal, socket, message, drain, timers,
@@ -176,8 +180,23 @@ test('snapshot parses at its original size before fit or user input', async () =
   } finally { f.mounted.dispose(); }
 });
 
+test('a terminal with nothing beyond the snapshot never offers earlier output', async () => {
+  const f = fixture({ history: { lines: 12, sent: 12, truncated: false } });
+  try {
+    const history = f.mounted.element.querySelector('.term-history');
+    f.message({ t: 'replay-end' });
+    await f.drain();
+    assert.equal(history.hidden, true, 'nothing earlier to load');
+    // An older bridge that reports no history at all is treated the same way.
+    f.message({ t: 'attached', pane: { id: 'pane', primary: 'viewer', cols: 80, rows: 50 } });
+    f.message({ t: 'replay-end' });
+    await f.drain();
+    assert.equal(history.hidden, true);
+  } finally { f.mounted.dispose(); }
+});
+
 test('earlier output is loaded only after first paint and preserves queued input', async () => {
-  const f = fixture();
+  const f = fixture({ history: { lines: 900, sent: 100, truncated: true } });
   try {
     const history = f.mounted.element.querySelector('.term-history');
     assert.equal(history.hidden, true);
@@ -202,7 +221,7 @@ test('earlier output is loaded only after first paint and preserves queued input
 });
 
 test('earlier output remains available after exit without reporting exit twice', async () => {
-  const f = fixture();
+  const f = fixture({ history: { lines: 900, sent: 100, truncated: true } });
   try {
     const history = f.mounted.element.querySelector('.term-history');
     f.message({ t: 'replay-end' });

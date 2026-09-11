@@ -432,7 +432,11 @@ function install(input) {
             continue;
           }
           current = state;
-          sendText({ t: 'attached', pane: state.attachment.pane });
+          sendText({
+            t: 'attached',
+            pane: state.attachment.pane,
+            ...(state.attachment.history ? { history: state.attachment.history } : {}),
+          });
           state.attached = true;
           for (const pending of state.pending) {
             if (pending.message) sendText(pending.message);

@@ -166,6 +166,7 @@ function connect(options = {}) {
         let detached = false;
         return {
           pane: result.pane,
+          ...(result.history ? { history: result.history } : {}),
           detach: async () => {
             if (detached) return;
             detached = true;

@@ -73,6 +73,9 @@ export function mountTerminal(container, pane, options = {}) {
   let retryable = true;
   let replayDone = false;
   let fullHistory = false;
+  // Whether the attach snapshot left scrollback behind on the host. A new terminal
+  // has nothing earlier to load, so the button stays hidden until it does.
+  let moreHistory = false;
   let isPrimary = false;
   let claimPending = false;
   let paneState = null;
@@ -294,6 +297,7 @@ export function mountTerminal(container, pane, options = {}) {
         // The bridge guarantees this precedes the serialized snapshot, so stale
         // local scrollback cannot be doubled when the host reconnects after reload.
         terminal.reset();
+        moreHistory = message.history?.truncated === true;
         setPaneState(message.pane);
         if (Number.isInteger(message.pane?.cols) && Number.isInteger(message.pane?.rows)
             && (terminal.cols !== message.pane.cols || terminal.rows !== message.pane.rows)) {
@@ -306,7 +310,7 @@ export function mountTerminal(container, pane, options = {}) {
         terminal.write('', () => {
           if (disposed || socket !== connection || (!exited && connection.readyState !== WebSocket.OPEN)) return;
           replayDone = true;
-          historyButton.hidden = fullHistory;
+          historyButton.hidden = fullHistory || !moreHistory;
           if (isPrimary) fitNow(true);
           else adoptPaneSize();
           if (!exited) markHealthy();
