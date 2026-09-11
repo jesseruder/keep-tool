@@ -243,7 +243,7 @@ function attentionItems(value, now = Date.now()) {
       kind: 'health',
       at: eventAt,
       lastError: entry.lastError || '',
-      incidentId: entry.incidentId || null,
+      ...(entry.incidentId ? { incidentId: entry.incidentId } : {}),
     };
   });
   const recentStarts = (Array.isArray(daemon.startedAts) ? daemon.startedAts : [])
