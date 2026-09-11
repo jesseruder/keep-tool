@@ -1511,6 +1511,20 @@ commands.project = (argv) => {
   });
 };
 
+commands.link = (argv) => {
+  const o = parseArgs(argv, { session: 'str', agent: 'str' });
+  const id = o._[0];
+  if (o._.length !== 1 || !o.session || !o.agent) {
+    die('usage: keep link <card> --session <sid> --agent claude|codex');
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(o.session)) die('session id must contain only letters, digits, _ or -');
+  if (!['claude', 'codex'].includes(o.agent)) die('agent must be claude or codex');
+  if (isReviewerSession()) die('the fleet reviewer cannot link a working session to a card');
+  const linked = linkLaunchedSession(id, { id: o.session, agent: o.agent });
+  if (!linked) die(`no task "${id}"`);
+  console.log(`${id} linked to ${o.agent} session ${o.session}`);
+};
+
 commands.done = (argv) => {
   const o = parseArgs(argv, { force: 'bool', next: 'str', commit: 'list' });
   const id = o._[0];
@@ -1541,6 +1555,8 @@ commands['wait-on'] = (argv) => {
   guardReviewerStatusChange(true, false);
   withLock(() => {
     const dependent = loadTask(dependentId);
+    const session = currentSession();
+    const crossProjectSession = Boolean(session && !sessionInTaskProject(dependent));
     if (o.remove) {
       for (const entry of upstreamEntries) {
         if (parseDependency(entry).invalid) dependencyError(`invalid dependency "${entry}"`);
@@ -1605,6 +1621,9 @@ commands['wait-on'] = (argv) => {
     }
     commitAndPush(`keep: wait-on ${dependentId}`);
     console.log(fmtTask(checked));
+    if (crossProjectSession) {
+      process.stderr.write(`keep: dependency recorded, but session ${session.id} was not linked because the current directory is outside the card project; repair explicitly with keep link ${dependentId} --session ${session.id} --agent ${session.agent}\n`);
+    }
   });
 };
 
@@ -5905,6 +5924,7 @@ function helpText() {
   keep allow <id> --grant a,b [--until when] | --revoke a,b | --clear
   keep retitle <id> "new title"
   keep project <id> [<path|name>] [-m "reason"]   # show or change project; preserves session links and schedule
+  keep link <card> --session <sid> --agent claude|codex   # repair ownership metadata without waking or launching
   keep list [--status s]… [--tag t] [--project p] [--overdue] [--brief] [--all]
   keep show <id>
   keep wait [--no-hold <project> [--scope <resource>]] [--card <id>[#<n>]] [--lane <project> <step>]
