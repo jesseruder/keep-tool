@@ -6,6 +6,41 @@ const os = require('os');
 const path = require('path');
 const { deliver, userText } = require('./delivery');
 
+for (const mode of ['absorbed mid-turn', 'enqueue', 'attachment', 'different attachment', 'different enqueue', 'remove only', 'before offset']) {
+  test(`Claude queued delivery receipt: ${mode}`, async () => {
+    const { received, reconcile, statusForText } = require('./delivery');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-queued-delivery-'));
+    const file = path.join(dir, 'transcript');
+    const directory = path.join(dir, 'journal');
+    const enqueue = { type: 'queue-operation', operation: 'enqueue', content: 'hello\n world' };
+    const attachment = { type: 'attachment', attachment: { type: 'queued_command', prompt: 'hello\n world' } };
+    const remove = { type: 'queue-operation', operation: 'remove', reason: 'absorbed_mid_turn', content: 'hello world' };
+    const append = records => fs.appendFileSync(file, records.map(record => JSON.stringify(record) + '\n').join(''));
+    fs.writeFileSync(file, '');
+    try {
+      if (mode === 'before offset') append([enqueue, attachment]);
+      await assert.rejects(deliver({ session: { id: 's', kind: 'claude' }, pane: 'p', text: 'hello world', file, directory,
+        precheck: async () => {}, type: async () => {}, submitDraft: async () => assert.fail('unexpected Enter'),
+        draftMatches: async () => false, pause: async () => {}, attempts: 1 }), /unconfirmed/);
+      const journal = path.join(directory, fs.readdirSync(directory).find(name => name.endsWith('.json')));
+      const entry = JSON.parse(fs.readFileSync(journal, 'utf8'));
+      const records = {
+        'absorbed mid-turn': [enqueue, attachment, remove],
+        enqueue: [enqueue], attachment: [attachment],
+        'different attachment': [{ ...attachment, attachment: { ...attachment.attachment, prompt: 'different text' } }],
+        'different enqueue': [{ ...enqueue, content: 'different text' }],
+        'remove only': [remove], 'before offset': [],
+      };
+      append(records[mode]);
+      const expected = ['absorbed mid-turn', 'enqueue', 'attachment'].includes(mode);
+      assert.equal(received(entry), expected);
+      assert.deepEqual(reconcile(directory), expected ? ['s'] : []);
+      assert.equal(fs.existsSync(journal), !expected);
+      assert.equal(statusForText(directory, 'hello world').received, expected);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+}
+
 test('delivery diagnostics persist stages without text and rotate within a bounded footprint', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-trace-'));
   try {

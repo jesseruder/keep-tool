@@ -36,6 +36,13 @@ function received(entry) {
       for (const line of lines) {
         try {
           const record = JSON.parse(line);
+          // Claude can accept input into its queue without ever writing a user
+          // message (including when it absorbs the input into the current turn).
+          if (entry.kind === 'claude' && !record.isSidechain) {
+            const queuedText = record.type === 'queue-operation' && record.operation === 'enqueue' ? record.content
+              : record.type === 'attachment' && record.attachment?.type === 'queued_command' ? record.attachment.prompt : null;
+            if (typeof queuedText === 'string' && hash(queuedText) === entry.hash) return true;
+          }
           const text = userText(record, entry.kind);
           if (text !== null && hash(text) === entry.hash) return true;
           // Claude records accepted local commands as structured user messages,
