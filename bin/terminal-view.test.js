@@ -64,7 +64,7 @@ function fixture() {
     addEventListener(type, listener) { this.listeners.set(type, listener); }
     dispatch(type, event = {}) { this.listeners.get(type)?.({ stopPropagation() {}, ...event }); }
   }
-  let terminal, fits = 0;
+  let terminal, fits = 0, exits = 0;
   class Terminal extends HeadlessTerminal {
     constructor(options) { super(options); terminal = this; this.textarea = new Element(); this.visualElement = new Element(); }
     get element() { return this.visualElement; }
@@ -111,13 +111,16 @@ function fixture() {
     requestAnimationFrame: () => 1, cancelAnimationFrame() {},
   });
   vm.runInContext(source, context);
-  const mounted = context.mountTerminal(new Element(), 'pane', { focus: true });
+  const mounted = context.mountTerminal(new Element(), 'pane', { focus: true, onExit: () => { exits++; } });
   const socket = mounted.socket;
   const message = (value) => socket.onmessage({ data: JSON.stringify(value) });
   socket.onopen();
   message({ t: 'attached', pane: { id: 'pane', primary: 'viewer', cols: 80, rows: 50 } });
   const drain = () => new Promise((resolve) => terminal.write('', resolve));
-  return { mounted, terminal, socket, message, drain, timers, get fits() { return fits; } };
+  return {
+    mounted, terminal, socket, message, drain, timers,
+    get fits() { return fits; }, get exits() { return exits; },
+  };
 }
 
 test('cached terminal visibility reports hide, show and reattachment', () => {
@@ -195,6 +198,29 @@ test('earlier output is loaded only after first paint and preserves queued input
     second.onmessage({ data: JSON.stringify({ t: 'replay-end' }) });
     await f.drain();
     assert.ok(second.sent.some((item) => item instanceof Uint8Array));
+  } finally { f.mounted.dispose(); }
+});
+
+test('earlier output remains available after exit without reporting exit twice', async () => {
+  const f = fixture();
+  try {
+    const history = f.mounted.element.querySelector('.term-history');
+    f.message({ t: 'replay-end' });
+    f.message({ t: 'exit', code: 0 });
+    await f.drain();
+    assert.equal(f.exits, 1);
+    assert.equal(history.hidden, false);
+
+    history.dispatch('click');
+    const full = f.mounted.socket;
+    assert.match(full.url || '', /history=full/);
+    full.onopen();
+    full.onmessage({ data: JSON.stringify({ t: 'attached', pane: { id: 'pane', primary: 'viewer', cols: 80, rows: 50 } }) });
+    full.onmessage({ data: JSON.stringify({ t: 'replay-end' }) });
+    full.onmessage({ data: JSON.stringify({ t: 'exit', code: 0 }) });
+    await f.drain();
+    assert.equal(f.exits, 1);
+    assert.equal(f.mounted.element.querySelector('.term-state').textContent, 'exited (code 0)');
   } finally { f.mounted.dispose(); }
 });
 

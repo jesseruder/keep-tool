@@ -59,6 +59,7 @@ export function mountTerminal(container, pane, options = {}) {
   let webglContextLoss;
   let disposed = false;
   let exited = false;
+  let exitReported = false;
   let retry = 0;
   let retryTimer;
   let resizeTimer;
@@ -323,7 +324,10 @@ export function mountTerminal(container, pane, options = {}) {
         const detail = message.code == null ? (message.signal || '') : `code ${message.code}`;
         setStatus(`exited${detail ? ` (${detail})` : ''}`);
         status.classList.add('exited');
-        options.onExit?.(pane);
+        if (!exitReported) {
+          exitReported = true;
+          options.onExit?.(pane);
+        }
       } else if (message.t === 'error') {
         setStatus(message.message || 'terminal error');
         status.classList.add('error');
@@ -345,10 +349,13 @@ export function mountTerminal(container, pane, options = {}) {
 
   historyButton.addEventListener('click', (event) => {
     event.stopPropagation();
-    if (disposed || exited || fullHistory || !replayDone) return;
+    if (disposed || fullHistory || !replayDone) return;
     fullHistory = true;
     historyButton.hidden = true;
     const previous = socket;
+    // Exited panes remain attachable long enough to inspect their retained screen.
+    // The second exit frame is presentation state, not a second lifecycle event.
+    exited = false;
     connect();
     if (previous && previous.readyState < WebSocket.CLOSING) previous.close();
   });
