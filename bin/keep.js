@@ -2900,6 +2900,15 @@ async function stepRun(argv) {
     }
     cwd = top;
     sha = resolveLocalSha(cwd, 'HEAD');
+    // An `any` step runs whatever is checked out; `--sha` is the caller asserting
+    // that this is the revision it thinks it is applying (2026-09-10: four production
+    // applies passed --sha believing it pinned the run, and it was silently ignored).
+    if (o.sha) {
+      const wanted = resolveLocalSha(cwd, o.sha);
+      if (wanted !== sha) {
+        die(`${cwd} is at ${sha.slice(0, 7)}, not ${wanted.slice(0, 7)}; step ${name} runs from the current checkout, so check out ${wanted.slice(0, 7)} first`);
+      }
+    }
     dirty = Boolean(gitAt(cwd, ['status', '--porcelain']));
   } else {
     die(`step ${name} has unsupported from value "${step.from}"`);

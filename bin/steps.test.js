@@ -262,6 +262,27 @@ test('landed run rejects unlanded sha, creates and re-pins a clean detached work
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('--sha on an any step asserts the checkout is at that revision', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-steps-any-sha-'));
+  try {
+    initKeepRoot(root);
+    const repo = initProject(root);
+    const project = fs.realpathSync(repo.project);
+    writeRegistry(root, project, { from: 'any', command: 'true' });
+    assert.equal(cli(root, project, 'runner-session', ['step', 'claim', project, 'build', '-m', 'test']).status, 0);
+    const wrong = cli(root, project, 'runner-session', ['step', 'run', project, 'build', '--sha', repo.first]);
+    assert.equal(wrong.status, 1);
+    assert.match(wrong.stderr, new RegExp(`is at ${repo.second.slice(0, 7)}, not ${repo.first.slice(0, 7)}.*check out ${repo.first.slice(0, 7)} first`));
+    assert.equal(fs.existsSync(path.join(root, '.keep', 'steps', 'project', 'build.json')), false, 'a refused assertion records no run');
+    const right = cli(root, project, 'runner-session', ['step', 'run', project, 'build', '--sha', repo.second]);
+    assert.equal(right.status, 0, right.stderr);
+    assert.equal(cli(root, project, 'runner-session', ['step', 'claim', project, 'build', '-m', 'again']).status, 0);
+    const bogus = cli(root, project, 'runner-session', ['step', 'run', project, 'build', '--sha', 'no-such-ref']);
+    assert.equal(bogus.status, 1);
+    assert.match(bogus.stderr, /cannot resolve git revision "no-such-ref"/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('a failed run reports its log path, is terminal, keeps the claim, and checks the card in', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-steps-run-failed-'));
   try {

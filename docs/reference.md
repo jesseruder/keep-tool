@@ -461,7 +461,8 @@ run, no claim, and no waiters there is nothing to fail and it says so.
 `keep step run` mirrors the command's output live and into the local run log. A
 failed step prints its log path; read it before re-running. A
 `from: any` step runs only in the project or one of its linked worktrees and records
-HEAD plus dirty state. A `from: landed` step first fetches `origin`, refuses a revision
+HEAD plus dirty state; `--sha` there is an assertion, refused when HEAD is not that
+revision, since the step cannot pin a checkout it does not own. A `from: landed` step first fetches `origin`, refuses a revision
 that is not an ancestor of `origin/<default>`, and creates or cleanly re-pins the
 registry's detached worktree to that exact SHA. This matters for build scripts that
 copy the working tree: the recorded artifact is then provably built from the pinned,
