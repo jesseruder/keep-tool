@@ -8,6 +8,7 @@ async function request(url, options = {}) {
   if (!response.ok) {
     const error = new Error(body?.error || text || `${response.status} ${response.statusText}`);
     error.status = response.status;
+    error.body = body;
     throw error;
   }
   return body;

@@ -3,7 +3,7 @@ import { isDesktop, notificationPermission, notify, requestPermission } from './
 
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
-export function installNotifications({ reload, toast, openSession, openReviewer }) {
+export function installNotifications({ reload, toast, openSession, openReviewer, isReviewItem = () => false, openReviewItem = () => false }) {
   const button = document.querySelector('#notificationsButton');
   const panel = document.querySelector('#notificationsPanel');
   const list = panel.querySelector('.notification-list');
@@ -82,7 +82,15 @@ export function installNotifications({ reload, toast, openSession, openReviewer 
       (replacement || panel.querySelector(`[data-filter="${filter}"]`)).focus({ preventScroll: true });
     }
   }
-  function open(id) {
+  function open(id, preferReview = false) {
+    const entry = id ? entries().find((candidate) => candidate.id === id) : null;
+    if (entry && isReviewItem(entry) && (preferReview || id)) {
+      const navigate = () => openReviewItem(entry);
+      if (!entry.read) void change([id], 'read');
+      if (panel.open) { afterClose = navigate; panel.close(); }
+      else navigate();
+      return;
+    }
     selected = id || null;
     if (id) filter = 'all';
     if (!panel.open) panel.showModal();

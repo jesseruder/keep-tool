@@ -19,6 +19,7 @@ const cardUsage = require('./card-usage.js');
 const codex = require('./codex.js');
 const transcripts = require('./transcripts.js');
 const review = require('./review.js');
+const reviewQueue = require('./review-queue.js');
 const who = require('./who.js');
 const steps = require('./steps.js');
 const alerts = require('./alerts.js');
@@ -3241,6 +3242,7 @@ async function openSession(body, deps = {}) {
   }
 
   const launch = await withInjectionLock(launchHost);
+  if (deps.onLaunched) await deps.onLaunched(launch);
   const handoff = Boolean(body.taskId) && !session;
   let releasePending = handoff && Boolean(body.requester);
   const release = () => {
@@ -3287,6 +3289,26 @@ async function openSession(body, deps = {}) {
     }
   }
   return launch;
+}
+
+async function launchReviewQueueSession(request, deps = {}) {
+  const open = deps.openSession || openSession;
+  return open({
+    taskId: request.taskId,
+    fresh: true,
+    agent: 'claude',
+    message: request.message,
+  }, {
+    ...deps,
+    loadTask: deps.loadTask || keep.loadTaskAnywhere,
+    randomUUID: () => request.sessionId,
+    onLaunched: request.onLaunched,
+    // A discussion is an advisory conversation. It must not take the parent
+    // card's ownership/resume slot merely because somebody opened the item.
+    linkLaunchedSession: request.action === 'discuss'
+      ? () => null
+      : (deps.linkLaunchedSession || keep.linkLaunchedSession),
+  });
 }
 const scanCache = new Map(); // file -> { mtimeMs, size, info }
 const claudeSessionPathCache = new Map(); // session id -> transcript file
@@ -3935,6 +3957,7 @@ function buildState(options = {}) {
     health: healthSnapshot,
     runs: runs.listRuns(),
     usage: usage.getUsage(),
+    reviewQueue: reviewQueue.snapshot({ loadTasks: () => allTasks, now }),
   };
   try {
     if (digest) digest.summary = summarize.getSummary(`digest-${digest.date}`, digest.md, DIGEST_INSTRUCTION, onChange).text;
@@ -4802,6 +4825,25 @@ function start(deps = {}) {
             broadcast();
             return json(res, 200, result);
           }
+          if (url.pathname === '/api/review-queue') {
+            try {
+              const result = await reviewQueue.act(body, {
+                launch: (request) => launchReviewQueueSession(request),
+                findLaunchedSession: async (sessionId) => {
+                  const panes = await listHostPanes({}, true);
+                  const pane = panes?.find((entry) => entry?.meta?.sessionId === sessionId && entry.alive !== false);
+                  return pane ? { pane: pane.id } : null;
+                },
+              });
+              broadcast();
+              return json(res, 200, result);
+            } catch (error) {
+              if (error instanceof reviewQueue.QueueError) {
+                return json(res, error.status, { error: error.message, ...error.extra });
+              }
+              return json(res, 502, { error: String(error && error.message || error).slice(0, 500) });
+            }
+          }
           if (url.pathname === '/api/add') {
             const task = keep.addTask({
               title: body.title, kind: body.kind, tags: body.tags, project: body.project,
@@ -5103,6 +5145,7 @@ module.exports = {
   agentProcessRows, liveSessionPids, liveSessionTick, restorePlan,
   annotatePaneAgents,
   readPaneRecord, sessionProjectFromTranscript, openSession,
+  launchReviewQueueSession,
   waitForHostAgent, waitForHostSessionId, addHostSessionState,
   sendToSession, sendToResolvedTarget, precheckSessionTarget, InjectionError,
   resumeAfterLimit,

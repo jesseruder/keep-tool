@@ -29,6 +29,7 @@
       <button data-mode="watch">Watch <kbd>⌘2</kbd></button>
       <button data-mode="reviewer">Reviewer <kbd>⌘3</kbd><span class="dot"></span><span class="nw" hidden></span></button>
       <button data-mode="fleet">Fleet <kbd>⌘4</kbd></button>
+      <button data-mode="review-queue">Review queue <kbd>⌘5</kbd><span class="count zero" id="reviewQueueCount">0</span></button>
     </nav>
     <div class="session-history" id="sessionHistory" aria-label="Session navigation">
       <button data-history-back title="Previous session" aria-label="Previous session" disabled>←</button>
@@ -63,13 +64,14 @@
     <section class="mode rev" id="reviewer">
       <div class="rterm" id="rterm"></div><aside class="rside"><div class="rstats num" id="reviewStats"></div><div class="rhead"><span class="lbl">Reviewer actions</span></div><div class="feed" id="feed"></div></aside><aside class="rside-strip"></aside>
     </section>
+    <section class="mode review-queue" id="review-queue"></section>
     <section class="mode fleet" id="fleet"></section>
     <aside class="dock" id="dock"></aside>
   </main>
 
   <footer class="keys"><span><kbd>j</kbd><kbd>k</kbd> move in Triage</span><span><kbd>⌘↵</kbd> focus terminal</span><span><kbd>1</kbd>–<kbd>9</kbd> pick in Triage</span><span><kbd>p</kbd> pin in Triage</span><span><kbd>?</kbd> all keys</span><span class="note">live Keep state · terminals stream from the host</span></footer>
   <div class="toast" id="toast"></div>
-  <div class="help" id="help"><div class="card"><h3>Keys</h3><dl><dt><kbd>⌘1</kbd>–<kbd>⌘4</kbd></dt><dd>Triage, Watch, Reviewer, Fleet</dd><dt><kbd>⌘B</kbd></dt><dd>Collapse / expand the project rail</dd><dt><kbd>⌘\</kbd></dt><dd>Collapse / expand the queue</dd><dt><kbd>⌘⇧B</kbd></dt><dd>Collapse / expand the Reviewer side panel</dd><dt><kbd>⌘↵</kbd></dt><dd>Focus terminal; insert a newline when already in the terminal</dd><dt><kbd>j</kbd> / <kbd>k</kbd></dt><dd>Move in the queue</dd><dt><kbd>1</kbd>–<kbd>9</kbd></dt><dd>Choose an option or quick reply</dd><dt><kbd>p</kbd></dt><dd>Pin or unpin from Watch</dd><dt><kbd>x</kbd></dt><dd>Dismiss with Undo</dd><dt><kbd>e</kbd></dt><dd>Edit the current Watch layout</dd><dt><kbd>R</kbd></dt><dd>Toggle the reviewer dock</dd><dt><kbd>F</kbd></dt><dd>Toggle Focus: stay on the top waiting item</dd><dt>Theme button</dt><dd>appearance and palette</dd><dt><kbd>⌘F</kbd></dt><dd>Find in the focused terminal</dd><dt><kbd>⌘K</kbd></dt><dd>Clear terminal and host replay buffer</dd><dt><kbd>⌘C</kbd></dt><dd>Copy a terminal selection; Ctrl-C sends interrupt</dd></dl><p><kbd>+ shell</kbd> in the rail opens a shell in the active project. Running, Pinned, and Recent groups sit under the queue; <kbd>p</kbd> pins/unpins. Press any key to close.</p></div></div>
+  <div class="help" id="help"><div class="card"><h3>Keys</h3><dl><dt><kbd>⌘1</kbd>–<kbd>⌘4</kbd></dt><dd>Triage, Watch, Reviewer, Fleet</dd><dt><kbd>⌘5</kbd></dt><dd>Review queue</dd><dt><kbd>⌘B</kbd></dt><dd>Collapse / expand the project rail</dd><dt><kbd>⌘\</kbd></dt><dd>Collapse / expand the queue</dd><dt><kbd>⌘⇧B</kbd></dt><dd>Collapse / expand the Reviewer side panel</dd><dt><kbd>⌘↵</kbd></dt><dd>Focus terminal; insert a newline when already in the terminal</dd><dt><kbd>j</kbd> / <kbd>k</kbd></dt><dd>Move in the queue</dd><dt><kbd>1</kbd>–<kbd>9</kbd></dt><dd>Choose an option or quick reply</dd><dt><kbd>p</kbd></dt><dd>Pin or unpin from Watch</dd><dt><kbd>x</kbd></dt><dd>Dismiss with Undo</dd><dt><kbd>e</kbd></dt><dd>Edit the current Watch layout</dd><dt><kbd>R</kbd></dt><dd>Toggle the reviewer dock</dd><dt><kbd>F</kbd></dt><dd>Toggle Focus: stay on the top waiting item</dd><dt>Theme button</dt><dd>appearance and palette</dd><dt><kbd>⌘F</kbd></dt><dd>Find in the focused terminal</dd><dt><kbd>⌘K</kbd></dt><dd>Clear terminal and host replay buffer</dd><dt><kbd>⌘C</kbd></dt><dd>Copy a terminal selection; Ctrl-C sends interrupt</dd></dl><p><kbd>+ shell</kbd> in the rail opens a shell in the active project. Running, Pinned, and Recent groups sit under the queue; <kbd>p</kbd> pins/unpins. Press any key to close.</p></div></div>
 
   <script src="/vendor/xterm.js"></script>
   <script src="/vendor/addon-webgl.js"></script>

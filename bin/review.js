@@ -2636,7 +2636,9 @@ function findingOutcomes() {
     const card = name.slice(0, -5);
     for (const [key, f] of Object.entries(loadState(card).findings)) {
       rows.push({ card, key, kind: f.kind, subject: f.subject, severity: f.severity,
-        basis: f.basis || 'needs-verification', dismissed: Boolean(f.dismissed),
+        basis: f.basis || 'needs-verification', evidence: f.evidence || '', checked: f.checked || '',
+        question: f.question || '', unknown: f.unknown || '', message: f.message || '',
+        dismissed: Boolean(f.dismissed), why: f.why || '',
         outcome: f.outcome || { status: 'unresolved' }, lastAt: f.lastAt });
     }
   }

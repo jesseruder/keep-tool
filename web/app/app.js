@@ -17,6 +17,7 @@ import { createSessionHistory, installSessionHistory } from './session-history.j
 import { installTriageControls, renderTriage } from './triage.js';
 import { renderWatch, installWatchControls } from './watch.js';
 import { renderFleet } from './fleet.js';
+import { openReviewQueueNotification, renderReviewQueue, reviewQueueIdForNotification } from './review-queue.js';
 import { closeReviewerPopover, markReviewerSeen, renderDock, renderReviewer, renderReviewerTop } from './reviewer.js';
 import { acknowledgeNotificationClick, installNotificationClicks, notificationPermission, notify, requestPermission, setBadge } from './shell.js';
 
@@ -70,7 +71,7 @@ let restoredFocus = false;
 let restoredCollapsed = { rail: false, queue: false, rside: false };
 try {
   const savedMode = localStorage.getItem('keep-mode');
-  if (['triage', 'watch', 'reviewer', 'fleet'].includes(savedMode)) restoredMode = savedMode;
+  if (['triage', 'watch', 'reviewer', 'review-queue', 'fleet'].includes(savedMode)) restoredMode = savedMode;
   restoredDock = localStorage.getItem('keep-dock') === '1';
   restoredFocus = localStorage.getItem('keep.console.focus') === '1';
   const savedCollapsed = JSON.parse(localStorage.getItem('keep.console.collapsed') || 'null');
@@ -95,7 +96,7 @@ try { historyStorage = localStorage; } catch {}
 const sessionHistory = createSessionHistory(historyStorage);
 let historyControls;
 let historyRestored = false;
-let data = { tasks: [], sessions: [], attention: [], setAside: {}, panes: [], health: {}, usage: {}, reviewUsage: null, review: { events: [], stats: {} }, limitResume: {} };
+let data = { tasks: [], sessions: [], attention: [], setAside: {}, panes: [], health: {}, usage: {}, reviewUsage: null, review: { events: [], stats: {} }, reviewQueue: { items: [], counts: {} }, limitResume: {} };
 const terminals = new Map();
 const THEME_LABELS = { system: 'Auto', light: 'Light', dark: 'Dark' };
 function renderPalettePicker({ mode, palette }) {
@@ -635,6 +636,10 @@ function renderTop() {
     .filter((item) => !state.dismissed.has(itemKey(item))).map((item) => soundEventKey(item, sessionFor(item))));
   document.querySelector('#qcount').textContent = count;
   document.querySelector('#qcount').classList.toggle('zero', count === 0);
+  const reviewCount = (data.reviewQueue?.items || []).filter((item) => item.status === 'needs-decision'
+    && !(Number.isFinite(Date.parse(item.deferredUntil)) && Date.parse(item.deferredUntil) > Date.now())).length;
+  document.querySelector('#reviewQueueCount').textContent = reviewCount;
+  document.querySelector('#reviewQueueCount').classList.toggle('zero', reviewCount === 0);
   const sessionCount = data.sessions?.length || 0;
   const paneCount = data.panes?.length || 0;
   document.querySelector('#connection').textContent = `${sessionCount} session${sessionCount === 1 ? '' : 's'} · ${paneCount} pane${paneCount === 1 ? '' : 's'}`;
@@ -669,6 +674,7 @@ function refresh() {
   if (state.mode === 'triage') renderTriage(ctx);
   else if (state.mode === 'watch') renderWatch(ctx);
   else if (state.mode === 'reviewer') renderReviewer(ctx);
+  else if (state.mode === 'review-queue') renderReviewQueue(ctx);
   else renderFleet(ctx);
   renderDock(ctx);
   disposeUnusedTerminals(focused);
@@ -724,6 +730,7 @@ async function refreshProjectChoices() {
 
 let reloadRetry;
 let pendingNotificationKey = null;
+let pendingReviewNavigation = null;
 async function reload() {
   clearTimeout(reloadRetry);
   const generation = ++reloadGeneration;
@@ -752,9 +759,22 @@ async function reload() {
       if (sessionHistory.current && ['triage', 'watch'].includes(state.mode) && !state.focusMode && !pendingNotificationKey) navigateHistory(sessionHistory.current, false);
     }
     refresh();
+    if (pendingReviewNavigation) {
+      const target = pendingReviewNavigation;
+      const session = data.sessions.find((candidate) => candidate.id === target.id);
+      if (session) {
+        pendingReviewNavigation = null;
+        navigateHistory({ sessionId: session.id, view: 'triage' });
+        refresh();
+      } else if (++target.attempts < 15) setTimeout(reload, 350);
+      else {
+        pendingReviewNavigation = null;
+        toast('The conversation was created but has not appeared in the session list yet. Its link remains on the review item.');
+      }
+    }
     if (pendingNotificationKey) {
       const key = pendingNotificationKey;
-      if (key.startsWith('alert:')) notificationPanel.open(key.slice(6));
+      if (key.startsWith('alert:')) notificationPanel.open(key.slice(6), true);
       else selectAttention(key);
       pendingNotificationKey = null;
       acknowledgeNotificationClick(key);
@@ -803,6 +823,22 @@ const ctx = {
   itemKey, triageKey, eventKey, sessionFor, taskFor, paneMap, entityForPane, kindLabel, limitResumeFor, toast, dismiss, restore, setAside, setAsideFor,
   pinPane, startShell, reopenSession, removePane, isPanePinned, knownPaneCount, saveLayouts, dropPane, mount, patchHTML, clearElement, refresh, reload,
   scheduleTerminalFit, setMode, setDock, toggleFocus, focusTerminal, focusDebug, retainedSelectionItem,
+  openReviewSession(sessionId) {
+    const session = data.sessions.find((candidate) => candidate.id === sessionId);
+    if (!session) {
+      pendingReviewNavigation = { id: sessionId, attempts: 0 };
+      toast('Opening the new conversation…');
+      setTimeout(reload, 100);
+      return;
+    }
+    navigateHistory({ sessionId, view: 'triage' });
+    refresh();
+  },
+  openReviewCard(cardId) {
+    const session = data.sessions.find((candidate) => candidate.taskId === cardId && !candidate.reviewer);
+    if (session) { navigateHistory({ sessionId: session.id, view: 'triage' }); refresh(); }
+    else toast(data.tasks.find((task) => task.id === cardId)?.fm?.title || cardId);
+  },
 };
 
 historyControls = installSessionHistory({ history: sessionHistory, esc,
@@ -1037,8 +1073,8 @@ document.addEventListener('keydown', (event) => {
     return;
   }
   if (event.metaKey && key === '\\') { event.preventDefault(); toggleCollapsed('queue'); return; }
-  if (event.metaKey && /^[1-4]$/.test(key)) {
-    setMode(['triage', 'watch', 'reviewer', 'fleet'][Number(key) - 1]);
+  if (event.metaKey && /^[1-5]$/.test(key)) {
+    setMode(['triage', 'watch', 'reviewer', 'fleet', 'review-queue'][Number(key) - 1]);
     event.preventDefault();
     return;
   }
@@ -1092,6 +1128,10 @@ const notificationPanel = installNotifications({
     refresh();
   },
   openReviewer: () => setMode('reviewer'),
+  isReviewItem(entry) { return Boolean(reviewQueueIdForNotification(ctx, entry)
+      || (entry?.card && ['reviewer', 'reviewer-idea'].includes(entry.caller)
+        && (data.reviewQueue?.items || []).some((item) => item.card === entry.card))); },
+  openReviewItem(entry) { return openReviewQueueNotification(ctx, entry); },
 });
 
 document.querySelector('#connection').textContent = 'connecting';
