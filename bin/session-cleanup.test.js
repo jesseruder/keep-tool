@@ -106,7 +106,7 @@ test('automatic scheduler audits refusals and submissions, throttles attempts, a
   const allTasks = sessions.map((s) => ({ id: `card-${s.id}`, fm: { status: 'done', done_at: new Date(s.mtime).toISOString(), sessions: [{ id: s.id }] } }));
   const closed = [], records = [];
   const scheduler = startScheduler({ now: () => now,
-    snapshot: async () => { await gate; return { sessions, panes, allTasks, questions: [], pinned: new Set() }; },
+    snapshot: async () => { await gate; return { sessions, panes, allTasks, pinned: new Set() }; },
     close: async ({ sessionId }) => { closed.push(sessionId); if (sessionId === 'refused') throw new Error('draft'); },
     record: (entry) => records.push(entry),
   });
@@ -130,10 +130,9 @@ test('done-close policy waits from the latest done or activity time and enforces
   const pane = { id: 'p', alive: true, attached: 0, inputCount: 0, lastInputAt: old,
     lastOutputAt: old, lastReadAt: new Date(now - 19 * 60e3).toISOString(), meta: { sessionId: 's', agent: 'claude' } };
   const done = { id: 'done', fm: { status: 'done', done_at: old, sessions: [{ id: 's' }] } };
-  const state = { allTasks: [done], questions: [], pinned: new Set() };
+  const state = { allTasks: [done], pinned: new Set() };
   assert.equal(doneClosePlan(session, pane, state, now).reason, null);
   assert.match(doneClosePlan(session, pane, { ...state, allTasks: [done, { id: 'live', fm: { status: 'review', sessions: [{ id: 's' }] } }] }, now).reason, /not done/);
-  assert.match(doneClosePlan(session, pane, { ...state, questions: [{ status: 'open', to: 'reviewer', from: { sessionId: 's' } }] }, now).reason, /unanswered/);
   assert.match(doneClosePlan({ ...session, unknownBackgroundJobs: ['history-gap'] }, pane, state, now).reason, /activity is unknown/);
   assert.match(doneClosePlan(session, { ...pane, lastInputAt: new Date(now - 5 * 60e3).toISOString() }, state, now).reason, /activity within/);
   assert.match(doneClosePlan(session, { ...pane, lastOutputAt: new Date(now - 5 * 60e3).toISOString(), lastReadAt: null }, state, now).reason, /activity within/);
@@ -158,7 +157,7 @@ test('legacy done cards begin a conservative observation window before closing',
   const session = { id: 'legacy', pane: 'p', kind: 'claude', state: 'done', endedTurn: true, mtime: now - 24 * 3600e3 };
   const pane = { id: 'p', alive: true, attached: 0, inputCount: 0, lastOutputAt: old, lastReadAt: old,
     meta: { sessionId: 'legacy', agent: 'claude' } };
-  const state = { sessions: [session], panes: [pane], allTasks: [{ id: 'old-card', fm: { status: 'done', updated: old, sessions: [{ id: 'legacy' }] } }], questions: [], pinned: new Set() };
+  const state = { sessions: [session], panes: [pane], allTasks: [{ id: 'old-card', fm: { status: 'done', updated: old, sessions: [{ id: 'legacy' }] } }], pinned: new Set() };
   const closed = [];
   const scheduler = startScheduler({ now: () => now, doneIdleMs: 15 * 60e3, snapshot: async () => state,
     close: async (body) => closed.push(body), record: async () => {} });
@@ -317,7 +316,7 @@ test('done-card close authorizes its own exit input while retaining a force-time
     const result = await closeIdleSession({ sessionId: 's', pane: 'p' }, {
       root, host, now: () => now, closePolicy: { automatic: true, done: true, idleMs: 15 * 60e3 },
       withInjectionLock: (fn) => fn(), buildState: () => ({ sessions: [{ ...session }], tasks: [task] }),
-      loadAll: () => [task], loadQuestions: () => [], discoverCodexJobs: async () => ({ known: true, complete: true, jobs: [] }),
+      loadAll: () => [task], discoverCodexJobs: async () => ({ known: true, complete: true, jobs: [] }),
       codexSessionFor: () => ({ ...session }), codexRolloutFile: () => rollout, sleep: async () => {},
       psTable: '123 1 ttys001 Tue Sep  8 10:00:00 2026 codex resume s', lsof: async () => '',
     });

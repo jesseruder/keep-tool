@@ -46,12 +46,6 @@ test('fresh initialization supports the full task lifecycle without a source che
     const git = (...args) => spawnSync('git', ['-C', root, ...args], { env, encoding: 'utf8' }).stdout.trim();
     assert.equal(git('remote'), '');
     assert.equal(git('rev-list', '--count', 'HEAD'), '4');
-    for (const flag of ['--owner', '--jesse']) {
-      assert.match(ok('ask', 'Synthetic owner question ' + flag, flag), /queued for Owner/);
-      assert.notEqual(cli('ask', 'Invalid timeout', flag, '--timeout', '1').status, 0);
-    }
-    const questions = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'review', '_questions.json'), 'utf8'));
-    assert.equal(questions.filter((q) => q.to === 'owner').length, 2);
 
     assert.notEqual(cli('init', '--dir', root).status, 0, 'init must not overwrite existing data');
   } finally { fs.rmSync(tmp, { recursive: true, force: true }); }

@@ -3206,27 +3206,6 @@ function buildStateWithHostSession(root, ack = false, needsQuestion = true, agen
   return JSON.parse(child.stdout);
 }
 
-test('open owner questions put a landing session in attention until answered', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-owner-attention-'));
-  try {
-    fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
-    fs.mkdirSync(path.join(root, '.keep', 'review'), { recursive: true });
-    fs.writeFileSync(path.join(root, 'tasks', 'land.md'), '---\ntitle: Land\nstatus: landing\nkind: task\ntags: [personal]\nsessions:\n  - id: claude-host-only\n    agent: claude\n    at: 2026-09-09T00:00:00Z\n---\n');
-    const file = path.join(root, '.keep', 'review', '_questions.json');
-    const question = { id: 'approval', to: 'jesse', status: 'open', at: Date.now(), question: 'OK to land?', from: { sessionId: 'claude-host-only' } };
-    fs.writeFileSync(file, JSON.stringify([question]));
-    let result = buildStateWithHostSession(root, false, false);
-    assert.equal(result.session.state, 'needs-input');
-    assert.equal(result.attention[0].detail, 'OK to land?');
-    fs.writeFileSync(file, JSON.stringify([{ ...question, status: 'answered' }]));
-    result = buildStateWithHostSession(root, false, false);
-    assert.equal(result.session.state, 'needs-input');
-    assert.equal(result.attention[0].attentionLabel, 'Ready for next instruction');
-    fs.writeFileSync(file, JSON.stringify([{ ...question, to: 'reviewer' }]));
-    assert.equal(buildStateWithHostSession(root, false, false).attention[0].attentionLabel, 'Ready for next instruction');
-  } finally { fs.rmSync(root, { recursive: true, force: true }); }
-});
-
 test('live hosted conversations remain ready after an archived task completes, while current links win', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-archived-attention-'));
   try {

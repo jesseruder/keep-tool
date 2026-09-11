@@ -59,7 +59,6 @@ function activity(session, context = {}) {
   add(session.rateLimit, 'rate-limit', 'transcript', 'waiting', 'Waiting: rate limit', 'rate limit');
   const text = session.lastAssistantFull || session.lastAssistant || '';
   const ended = session.endedTurn === true || (session.endedTurn == null && notify.type === 'complete');
-  add(ended && !model.foreground.toolRunning && model.requests.owner, 'owner-question', 'registry', 'needs-input', 'Needs your answer', 'question', { kind: 'input', detail: session.ownerQuestion?.question }, 'observed', session.ownerQuestion?.at || null);
   add(model.foreground.wait, 'foreground-wait', 'transcript', 'waiting', `Waiting: ${model.foreground.wait}`, model.foreground.wait);
   add(model.foreground.state === 'active', 'foreground-active', 'transcript', 'running', 'Running');
   const waiting = text.match(/\b(?:waiting (?:on|for)|awaiting|blocked (?:on|by))\b[^.!?\n]*/i)?.[0];

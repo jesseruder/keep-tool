@@ -11,7 +11,7 @@ function refusal(session, pane, queued = false) {
       || session.unknownBackgroundJobs?.length || session.lifecycleAgents?.length
       || session.backgroundJobs?.jobs?.some(j => j.status === 'pending')
       || session.lifecycleForeground?.state === 'running' || session.lifecycleForeground?.state === 'waiting') return 'Waiting for the turn and background work to finish';
-  if (session.pendingQuestion || session.pendingPlan || session.ownerQuestion
+  if (session.pendingQuestion || session.pendingPlan
       || ['permission', 'question'].includes(session.notify?.type)
       || session.lifecycleForeground?.state === 'needs-input'
       || require('./session-status').proseRequest(session.lastAssistantFull || session.lastAssistant)

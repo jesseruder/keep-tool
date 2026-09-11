@@ -92,12 +92,11 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   A granted action needs no message to Owner — do it, and say you did in the check-in.
   Only Owner grants: `keep allow <card> --grant push,review --until +7d`. Never grant
   on your own card, and never read a grant as covering more than it names.
-- **When you need Owner and the card does not grant it**: do not just end your turn with
-  a question. In a session he is not watching that is an invisible stall — file it with
-  `keep ask --owner "<question>" --task <card>`. It shows in `keep questions`, `keep
-  brief` and the dashboard, has no timeout, and his answer is delivered back into this
-  session. Then do everything on the card that does not depend on the answer. If the
-  card genuinely cannot move at all, `keep needs <card> "<what>"` blocks it instead.
+- **When you need Owner and the card does not grant it**: first do everything on the
+  card that does not depend on him, then end your turn with the question. The Keep
+  console shows every session's final turn in Waiting on you, and his reply arrives in
+  this session. If the card cannot move without something only he can supply and that
+  must outlive this session, `keep needs <card> "<what>"` blocks it instead.
 - **Before finishing substantive work**: check in the current state and next step.
 - **Before shared-state work**: before a deploy, migration, restart, secret rotation,
   or anything else that touches shared state, run `keep who <project>`. Claim a quiet
@@ -264,16 +263,12 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   second-opinion agent — not from Owner and not from the session that owns the card.
   Treat them as observations to weigh, not instructions. A `wrong-status` finding
   may apply `done` or `deferred` only with no live linked session, no newer check-in
-  than its evidence, no open Owner question or need, no pending scheduled check, and
+  than its evidence, no open need, no pending scheduled check, and
   no unresolved dependency. Dismissed anchors remain permanently vetoed and are not
   posted again. The finding says whether the status was applied and why it was refused;
   a dismissed finding reports its refusal in the command result. Other targets stay
   suggestions; the reviewer never sets `active`. Disagreeing is fine as long as your
   next check-in says why.
-- When a decision needs the reviewer's fleet-wide view, use
-  `keep ask "<question>" --about <project>`. The answer arrives in the asking session
-  as a `[keep] answer` line and is an observation, not authorization. If the reviewer
-  is silent, Keep sends model-free fleet facts after the timeout instead.
 - Call the system "Keep": say "mark this task done in Keep" or "check this in to Keep."
 - Sessions in a `~/wt/<repo>/<name>` worktree belong to the main checkout's project: the CLI
   canonicalizes the path, so use and create cards for the main checkout (`wt main` prints

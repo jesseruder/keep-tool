@@ -16,9 +16,12 @@ const DAY_MS = 24 * HOUR_MS;
 const VERSION = 1;
 let warnedWrite = false;
 
+// Schedulers that no longer exist. Their rows stay in health.json from older
+// daemons and would otherwise read as silent forever.
+const RETIRED = new Set(['review-questions']);
+
 const CADENCES = Object.freeze({
   review: { cadenceMs: 10 * 60e3 },
-  'review-questions': { cadenceMs: 60e3 },
   'review-compact': { cadenceMs: 60e3 },
   runs: { cadenceMs: 60e3 },
   delivery: { cadenceMs: 60e3 },
@@ -192,7 +195,7 @@ function snapshot(now = Date.now()) {
   daemon.running = pidAlive(daemon.pid);
   const names = [...new Set([
     ...Object.keys(CADENCES),
-    ...Object.keys(store).filter((name) => name !== 'daemon'),
+    ...Object.keys(store).filter((name) => name !== 'daemon' && !RETIRED.has(name)),
   ])];
   const schedulers = names.map((name) => {
     const config = CADENCES[name] || {};

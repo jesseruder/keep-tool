@@ -61,26 +61,6 @@ function received(entry) {
   } finally { fs.closeSync(fd); }
 }
 
-// A cancelled/locally acknowledged question answer is terminal, not delivered.
-// Match its exact rendered payload and recipient; pending=false or exhausted
-// retries alone are never cancellation evidence. Read from this journal's root.
-function cancelled(entry, directory) {
-  let questions;
-  try { questions = JSON.parse(fs.readFileSync(path.join(directory, '..', 'review', '_questions.json'), 'utf8')); }
-  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
-  if (!Array.isArray(questions)) throw Error('Invalid question delivery state');
-  return questions.some(question => {
-    const state = question?.answerDelivery;
-    if (question?.status !== 'answered' || question.from?.sessionId !== entry.sessionId || question.from?.agent !== entry.kind
-        || state?.pending !== false || !(Number(state.cancelledAt) > 0 || Number(state.acknowledgedAt) > 0)) return false;
-    const by = question.answeredBy || {};
-    const text = require('./review').answerMessage(question.id, question.answer, {
-      fromReviewer: by.reviewer === true, agent: by.agent, sessionId: by.sessionId,
-    });
-    return hash(text) === entry.hash;
-  });
-}
-
 // One pending attempt per session, retained across daemon restarts. Never retype
 // an ambiguous submission. Only an unchanged, exact draft may receive another Enter.
 function saveReceipt(directory, entry) {
@@ -106,10 +86,7 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
   }
   if (entry) {
     trace('pending-journal-found');
-    if (cancelled(entry, directory)) {
-      fs.unlinkSync(journal);
-      entry = null;
-    } else if (settled || received(entry)) {
+    if (settled || received(entry)) {
       saveReceipt(directory, entry);
       fs.unlinkSync(journal);
       if (entry.hash === hash(text)) return { ok: true, delivery: 'received', recovered: true };
@@ -125,9 +102,6 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
   }
   if (!entry) {
     journal = activeJournal;
-    if (cancelled({ sessionId: session.id, kind: session.kind, hash: hash(text) }, directory)) {
-      throw Error('Delivery explicitly cancelled or acknowledged in the owning session; no message sent.');
-    }
     await precheck();
     entry = { createdAt: Date.now(), sessionId: session.id, kind: session.kind, file, offset: fs.statSync(file).size, pane, hash: hash(text), key, receiptId: receiptId(text, key), retainReceipt };
     const temp = journal + '.tmp';
@@ -185,7 +159,6 @@ function statusForText(directory, text, key) {
   for (const item of files) {
     const entry = JSON.parse(fs.readFileSync(item.file, 'utf8'));
     if (key ? entry.key !== key : entry.hash !== hash(text)) continue;
-    if (cancelled(entry, directory)) return { sessionId: entry.sessionId, kind: entry.kind, received: false, pending: false, cancelled: true };
     const confirmed = item.settled || received(entry);
     if (confirmed && entry.retainReceipt) {
       saveReceipt(directory, entry);
@@ -205,9 +178,8 @@ function pendingForSession(directory, sessionId) {
   let entry;
   try { entry = JSON.parse(fs.readFileSync(journal, 'utf8')); }
   catch (e) { if (e.code === 'ENOENT') return false; throw e; }
-  const wasCancelled = cancelled(entry, directory);
-  if (!wasCancelled && !received(entry)) return true;
-  if (!wasCancelled) saveReceipt(directory, entry);
+  if (!received(entry)) return true;
+  saveReceipt(directory, entry);
   fs.unlinkSync(journal);
   return false;
 }
@@ -223,8 +195,7 @@ function reconcile(directory) {
     try {
       const entry = JSON.parse(fs.readFileSync(path.join(directory, name), 'utf8'));
       if (name !== hash(entry.sessionId) + '.json') continue;
-      if (cancelled(entry, directory)) fs.unlinkSync(path.join(directory, name));
-      else if (received(entry)) {
+      if (received(entry)) {
         // Keep successful evidence available to the owning retry loop, including
         // sendPlain callers without retainReceipt. Otherwise a late success
         // followed by this sweep would make the next retry type it again.
@@ -240,4 +211,4 @@ function reconcile(directory) {
   }
   return settled;
 }
-module.exports = { deliver, received, cancelled, reconcile, userText, statusForText, acknowledge, pendingForSession };
+module.exports = { deliver, received, reconcile, userText, statusForText, acknowledge, pendingForSession };

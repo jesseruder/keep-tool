@@ -216,19 +216,6 @@ function collectStepsAndHolds(root, now, cutoff) {
   return { steps: stepRuns, holds };
 }
 
-function collectQuestions(root, now, cutoff) {
-  const questions = readJson(path.join(root, '.keep', 'review', '_questions.json'), []);
-  return (Array.isArray(questions) ? questions : []).filter((question) => {
-    const stamp = Math.max(Number(question && question.at || 0), Number(question && question.answeredAt || 0));
-    return stamp >= cutoff && stamp <= now;
-  }).map((question) => ({
-    id: safe(question.id || ''), at: Number(question.at || 0), answeredAt: Number(question.answeredAt || 0),
-    status: safe(question.status || ''), about: safe(question.about || question.task || ''),
-    from: actor(question.from), question: clip(question.question || '', 2000), answer: clip(question.answer || '', 3000),
-    answeredBy: actor(question.answeredBy),
-  })).sort((a, b) => Math.max(a.at, a.answeredAt) - Math.max(b.at, b.answeredAt));
-}
-
 function collectKeepLog(root) {
   try {
     const output = execFileSync('git', [
@@ -313,11 +300,6 @@ function renderEvidenceRaw(evidence) {
   for (const hold of evidence.holds) lines.push(`- id=${hold.id} at=${hold.at} until=${hold.until} released=${hold.released || false} project=${hold.project} step=${hold.step || '(none)'} task=${hold.task || '(none)'} who=${hold.who || '(unknown)'} reason=${JSON.stringify(hold.reason)}`);
   if (omissionNote(evidence, 'holds')) lines.push(omissionNote(evidence, 'holds'));
 
-  heading('ASK-THE-REVIEWER QUESTIONS');
-  if (!evidence.questions.length) lines.push('- (none)');
-  for (const question of evidence.questions) lines.push(`- id=${question.id} status=${question.status} at=${question.at} about=${question.about || '(none)'} from=${question.from || '(unknown)'} question=${JSON.stringify(question.question)} answer=${JSON.stringify(question.answer)} answeredBy=${question.answeredBy || '(none)'}`);
-  if (omissionNote(evidence, 'questions')) lines.push(omissionNote(evidence, 'questions'));
-
   heading('KEEP LOG (ALREADY SHIPPED)');
   if (!evidence.keepLog.length) lines.push('- (none or unavailable)');
   for (const entry of evidence.keepLog) lines.push(`- ${entry.sha} ${entry.day} ${entry.subject}`);
@@ -356,7 +338,6 @@ function fitEvidence(evidence) {
     },
     alerts() { return shift('alerts'); },
     keepLog() { return shift('keepLog'); },
-    questions() { return shift('questions'); },
     stepsAndHolds() {
       const stepAt = evidence.steps[0] && evidence.steps[0].atMs;
       const holdAt = evidence.holds[0] && evidence.holds[0].atMs;
@@ -366,7 +347,7 @@ function fitEvidence(evidence) {
     reviews() { return shift('reviews'); },
     cards() { return shift('cards'); },
   };
-  for (const key of ['sessions', 'alerts', 'keepLog', 'questions', 'stepsAndHolds', 'reviews', 'cards']) {
+  for (const key of ['sessions', 'alerts', 'keepLog', 'stepsAndHolds', 'reviews', 'cards']) {
     while (renderEvidenceRaw(evidence).length > EVIDENCE_MAX && remove[key]()) {}
     if (renderEvidenceRaw(evidence).length <= EVIDENCE_MAX) break;
   }
@@ -402,9 +383,9 @@ function buildEvidence({ now = Date.now(), root = keep.ROOT } = {}) {
   })).sort((a, b) => a.at - b.at);
   const evidence = {
     now, since: cutoff, existingIdeas, reviews: collectReviews(root, now), cards,
-    steps: gated.steps, holds: gated.holds, questions: collectQuestions(root, now, cutoff),
+    steps: gated.steps, holds: gated.holds,
     keepLog: collectKeepLog(root), alerts: alertRows, sessions: collectSessions(root, now),
-    omissions: { sessions: 0, alerts: 0, keepLog: 0, questions: 0, steps: 0, holds: 0, reviews: 0, cards: 0 },
+    omissions: { sessions: 0, alerts: 0, keepLog: 0, steps: 0, holds: 0, reviews: 0, cards: 0 },
   };
   return fitEvidence(evidence);
 }

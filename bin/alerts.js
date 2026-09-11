@@ -418,21 +418,6 @@ function buildBrief(input) {
   const ideaCards = new Set(ideas);
   const reviewCards = (input.tasks || []).filter((task) => task.fm && task.fm.status === 'review' && !ideaCards.has(task))
     .sort((a, b) => String(a.fm.updated || a.fm.created || '').localeCompare(String(b.fm.updated || b.fm.created || '')));
-  const allOpenQuestions = (input.questions || []).filter((question) => question && question.status === 'open' && !question.answer);
-  // A `--jesse` question is an agent parked on a decision only he can make, so it
-  // gets its own block above reviewer traffic: answering it restarts a session.
-  const askedOfOwner = allOpenQuestions.filter((question) => ['owner', 'jesse'].includes(question.to))
-    .sort((a, b) => Number(a.at || 0) - Number(b.at || 0));
-  const openQuestions = allOpenQuestions.filter((question) => !['owner', 'jesse'].includes(question.to));
-  const answeredQuestions = (input.questions || []).filter((question) => {
-    if (!question || question.status !== 'answered' || !question.answer) return false;
-    const hasAskingSession = Boolean(question.from && question.from.sessionId);
-    const delivered = Number(question.answerDelivery
-      ? question.answerDelivery.deliveredAt || 0
-      : hasAskingSession ? 0 : question.answeredAt || 0);
-    return delivered > lastBriefAt;
-  });
-  const questionCount = openQuestions.length + answeredQuestions.length;
   const overdue = (input.tasks || []).filter((task) => {
     const due = task.fm && task.fm.check_after && Date.parse(task.fm.check_after);
     return task.fm && task.fm.status !== 'done' && Number.isFinite(due) && due <= now;
@@ -468,8 +453,6 @@ function buildBrief(input) {
     .sort((a, b) => Number(a.at || 0) - Number(b.at || 0));
   const headerCounts = [
     countLabel(reviewCards.length, 'needs review', 'need review'),
-    ...(askedOfOwner.length ? [countLabel(askedOfOwner.length, 'agent waiting on you', 'agents waiting on you')] : []),
-    countLabel(questionCount, 'question'),
     ...(needs.length ? [countLabel(needs.length, 'need from you', 'needs from you')] : []),
     countLabel(overdue.length, 'overdue check'),
     countLabel(deferred.length, 'deferred alert'),
@@ -481,13 +464,7 @@ function buildBrief(input) {
   const sections = [];
   const add = (title, rows) => { if (rows.length) sections.push(`${title} (${rows.length})\n${rows.map((row) => `- ${row}`).join('\n')}`); };
   if (daemonLine) sections.push(daemonLine);
-  add('Agents waiting on your answer', askedOfOwner.map((question) =>
-    `${question.id} ${oneLine(question.task || question.about || '', 40)} — ${oneLine(question.question, 110)}`));
   add('Review', reviewCards.slice(0, 8).map((task) => `${oneLine(task.fm.title, 100)}${nonReviewLog(task) ? ` — ${nonReviewLog(task)}` : ''}`));
-  add('Questions', [
-    ...openQuestions.map((question) => oneLine(question.question, 140)),
-    ...answeredQuestions.map((question) => `${oneLine(question.question, 90)} — answered: ${oneLine(question.answer, 90)}`),
-  ]);
   add('Waiting on you', needs.map((need) => `${oneLine(need.task, 50)} — ${oneLine(need.text, 90)}${need.env ? ` [env ${oneLine(need.env, 30)}]` : ''}`));
   add('Overdue', overdue.map((task) => `${oneLine(task.fm.title, 110)} — ${task.fm.check_after}`));
   add('Deferred alerts', deferred.map((alert) => `${alert.level}: ${oneLine(alert.text, 130)}${alert.why ? ` (${oneLine(alert.why, 50)})` : ''}`));
@@ -521,9 +498,7 @@ function buildBrief(input) {
   if (text.length > 1500) text = text.slice(0, 1499).replace(/\s+$/, '') + '…';
   const important = daemonLine || (findings.find((finding) => finding.severity === 'high')
     ? `High finding: ${oneLine(findings.find((finding) => finding.severity === 'high').kind, 100)}`
-    : askedOfOwner[0] ? `Agent waiting on you: ${oneLine(askedOfOwner[0].question, 100)}`
     : overdue[0] ? `Overdue: ${oneLine(overdue[0].fm.title, 100)}`
-      : openQuestions[0] ? `Question: ${oneLine(openQuestions[0].question, 100)}`
         : needs[0] ? `Waiting on you: ${oneLine(needs[0].text, 100)}`
         : reviewCards[0] ? `Review: ${oneLine(reviewCards[0].fm.title, 100)}`
           : deferred[0] ? `Deferred: ${oneLine(deferred[0].text, 100)}`

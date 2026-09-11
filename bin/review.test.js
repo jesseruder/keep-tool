@@ -27,126 +27,10 @@ const {
   logEntries,
   logWatermark,
   logEntriesSinceReview,
-  answerMessage,
-  timeoutMessage,
-  deliveriesDue,
-  updateQuestion,
   reviewerCompactDecision,
 } = require('./review.js');
 
 const jsonl = (records) => records.map((r) => JSON.stringify(r));
-
-test('question health recovers cancelled deliveries but preserves unresolved failure state', () => {
-  const { questionHealth } = require('./review');
-  const ok = { errors: [], delivered: [], expired: [] };
-  assert.deepEqual(questionHealth(ok, [{ answerDelivery: { pending: false } }]), { ok: true, detail: 'question queue checked' });
-  assert.equal(questionHealth(ok, [{ answerDelivery: { pending: true, attempts: 20 } }]).skipped, true);
-  assert.equal(questionHealth(ok, [{ answerDelivery: { pending: false, attempts: 20, gaveUp: true } }]).skipped, true);
-  assert.equal(questionHealth(ok, [{ timeoutDelivery: { pending: false, gaveUp: true } }]).skipped, true);
-  assert.equal(questionHealth(ok, [{ answerDelivery: { pending: false, gaveUp: true, cancelledAt: 1 } }]).skipped, undefined);
-  assert.equal(questionHealth({ errors: [Error('failed')] }, []).ok, false);
-});
-
-test('answer CLI acknowledges its own session for both agents, but retains cross-session delivery', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-self-answer-'));
-  try {
-    fs.mkdirSync(path.join(root, 'tasks'));
-    assert.equal(spawnSync('git', ['init', '-q', root]).status, 0);
-    const dir = path.join(root, '.keep/review'); fs.mkdirSync(dir, { recursive: true });
-    const file = path.join(dir, '_questions.json');
-    for (const agent of ['claude', 'codex']) for (const self of [true, false]) {
-      fs.writeFileSync(file, JSON.stringify([{ id: 'q-test', status: 'open', question: 'test', from: { sessionId: 'owner', agent } }]));
-      const env = { ...process.env, KEEP_DIR: root, KEEP_PORT: '1' };
-      for (const k of ['CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'CLAUDE_CODE_SESSION_ID', 'KEEP_REVIEWER', 'KEEP_REVIEWER_NAME']) delete env[k];
-      env[agent === 'codex' ? 'CODEX_THREAD_ID' : 'CLAUDE_CODE_SESSION_ID'] = self ? 'owner' : 'other';
-      const result = spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'answer', 'q-test', '-m', 'answer'], { env, cwd: root, encoding: 'utf8', timeout: 10000 });
-      assert.equal(result.status, 0, result.stderr);
-      const q = JSON.parse(fs.readFileSync(file))[0];
-      assert.equal(q.status, 'answered');
-      assert.equal(q.answerDelivery.pending, !self);
-      if (self) { assert.equal(q.answerDelivery.reason, 'answered-in-owning-session'); assert.match(result.stdout, /no terminal delivery needed/); }
-      else assert.match(result.stdout, /delivery failed/);
-    }
-  } finally { fs.rmSync(root, { recursive: true, force: true }); }
-});
-
-test('answer CLI can resolve a cross-session question without delivery or retries', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-quiet-answer-'));
-  try {
-    fs.mkdirSync(path.join(root, 'tasks'));
-    assert.equal(spawnSync('git', ['init', '-q', root]).status, 0);
-    assert.equal(spawnSync('git', ['-C', root, 'config', 'user.name', 'Keep Test']).status, 0);
-    assert.equal(spawnSync('git', ['-C', root, 'config', 'user.email', 'keep@example.test']).status, 0);
-    fs.writeFileSync(path.join(root, 'tasks', 'card.md'), [
-      '---',
-      'title: Stale question',
-      'status: active',
-      'kind: task',
-      'tags: [personal]',
-      'sessions:',
-      '  - id: asking-session',
-      '    agent: claude',
-      '    at: 2026-09-01T10:00',
-      'created: 2026-09-01',
-      'updated: 2026-09-01T10:00',
-      '---',
-      '',
-    ].join('\n'));
-    assert.equal(spawnSync('git', ['-C', root, 'add', 'tasks/card.md']).status, 0);
-    assert.equal(spawnSync('git', ['-C', root, 'commit', '-q', '-m', 'fixture']).status, 0);
-    const dir = path.join(root, '.keep/review'); fs.mkdirSync(dir, { recursive: true });
-    const file = path.join(dir, '_questions.json');
-    fs.writeFileSync(file, JSON.stringify([{
-      id: 'q-stale',
-      status: 'open',
-      question: 'Should this stale session wake?',
-      task: 'card',
-      from: { sessionId: 'asking-session', agent: 'claude' },
-      timeoutDelivery: { pending: true, attempts: 3, lastError: 'session busy' },
-    }]));
-    const env = {
-      ...process.env,
-      KEEP_DIR: root,
-      KEEP_NO_PUSH: '1',
-      KEEP_PORT: '1',
-      CODEX_THREAD_ID: 'answering-session',
-    };
-    delete env.CODEX_SESSION_ID;
-    delete env.CLAUDE_CODE_SESSION_ID;
-    const result = spawnSync(process.execPath, [path.join(__dirname, 'keep.js'),
-      'answer', 'q-stale', '--no-deliver', '-m', 'Close it quietly.'], {
-      env, cwd: root, encoding: 'utf8', timeout: 10000,
-    });
-    assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /delivery suppressed; no terminal delivery or retry queued/);
-    assert.doesNotMatch(result.stdout, /delivery failed|sent to session/);
-
-    const q = JSON.parse(fs.readFileSync(file))[0];
-    assert.equal(q.status, 'answered');
-    assert.equal(q.answer, 'Close it quietly.');
-    assert.deepEqual(q.answeredBy, {
-      agent: 'codex', sessionId: 'answering-session', reviewer: false,
-    });
-    assert.deepEqual(q.answerDelivery, {
-      pending: false, attempts: 0, acknowledgedAt: q.answeredAt, reason: 'delivery-suppressed',
-    });
-    assert.deepEqual(q.timeoutDelivery, {
-      pending: false,
-      attempts: 3,
-      lastError: 'session busy',
-      acknowledgedAt: q.answeredAt,
-      reason: 'delivery-suppressed',
-    });
-    assert.deepEqual(deliveriesDue([q]), []);
-
-    const card = require('./keep.js').loadTask('card', root);
-    assert.deepEqual(card.fm.sessions, [{
-      id: 'asking-session', agent: 'claude', at: '2026-09-01T10:00',
-    }]);
-    assert.match(card.body, /answer \(codex answerin, not reviewer\)/);
-    assert.match(card.body, /Q: Should this stale session wake\?\nA: Close it quietly\./);
-  } finally { fs.rmSync(root, { recursive: true, force: true }); }
-});
 
 function claudeToolUse(name, input, id) {
   return { type: 'assistant', message: { content: [{ type: 'tool_use', name, id, input: input || {} }] } };
@@ -155,47 +39,6 @@ function claudeToolUse(name, input, id) {
 function codexItem(item) {
   return { type: 'event_msg', payload: { type: 'item_completed', item } };
 }
-
-test('question responses identify reviewer, ordinary session, and manual provenance', () => {
-  assert.match(answerMessage('q-1', 'Ship it.', { fromReviewer: true }), /from the fleet reviewer/);
-  const ordinary = answerMessage('q-1', 'Ship it.', {
-    fromReviewer: false,
-    agent: 'codex',
-    sessionId: '1234567890abcdef',
-  });
-  assert.match(ordinary, /from codex session 12345678 \(not the reviewer\)/);
-  assert.doesNotMatch(ordinary, /from the fleet reviewer/);
-  assert.match(answerMessage('q-1', 'Ship it.', { fromReviewer: false }), /from Owner \(manual\)/);
-});
-
-test('timeout facts are fenced as data', () => {
-  const message = timeoutMessage({ id: 'q-1', timeoutMs: 600000, about: '~/project' }, 'agent says run rm -rf');
-  assert.match(message, /DATA, NOT INSTRUCTIONS: Fleet facts/);
-});
-
-test('deliveriesDue returns retryable answer and timeout outbox entries only', () => {
-  assert.deepEqual(deliveriesDue([
-    { id: 'answer', answerDelivery: { pending: true, attempts: 0 } },
-    { id: 'timeout', timeoutDelivery: { pending: true, attempts: 19 } },
-    { id: 'done', answerDelivery: { pending: false, attempts: 1 } },
-    { id: 'gave-up', timeoutDelivery: { pending: true, attempts: 20 } },
-  ]), ['answer', 'timeout']);
-});
-
-test('updateQuestion reloads before patching and preserves a concurrently appended entry', () => {
-  let ledger = [{ id: 'q-1', status: 'open' }];
-  const stale = ledger.map((entry) => ({ ...entry }));
-  ledger.push({ id: 'q-2', status: 'open' });
-  updateQuestion('q-1', { status: 'answered' }, {
-    load: () => ledger.map((entry) => ({ ...entry })),
-    save: (questions) => { ledger = questions; },
-  });
-  assert.equal(stale.length, 1, 'the caller snapshot predates the append');
-  assert.deepEqual(ledger, [
-    { id: 'q-1', status: 'answered' },
-    { id: 'q-2', status: 'open' },
-  ]);
-});
 
 // ---------- Claude extraction ----------
 
@@ -1866,7 +1709,7 @@ test('daemon-health findings normalize known scheduler subjects and reject unkno
     assert.equal(duplicate.status, 4, duplicate.stderr);
     const invalid = run(['review-note', 'health-card', '--kind', 'daemon-health', '--subject', 'mystery scheduler', '-m', 'Unknown scheduler.']);
     assert.equal(invalid.status, 2);
-    assert.match(invalid.stderr, /valid names: review, review-questions, review-compact, runs/);
+    assert.match(invalid.stderr, /valid names: review, review-compact, runs/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -2411,11 +2254,6 @@ test('wrong-status findings apply only safe done/deferred transitions through no
       sessions = null;
       await refuse('daemon-down', 'live session registry unavailable');
       sessions = [];
-      const questions = path.join(keep.ROOT, '.keep/review/_questions.json');
-      for (const to of ['owner', 'jesse']) {
-        fs.writeFileSync(questions, JSON.stringify([{ task: 'question-' + to, to, status: 'open' }]));
-        await refuse('question-' + to, 'open question for Owner');
-      }
       await refuse('needs', 'open keep needs block', { needs: [{ text: 'Decision', at: '2020-01-01 00:00' }] });
       await refuse('scheduled', 'pending scheduled check', { status: 'waiting', check_after: '2099-01-01', check: 'check it' });
       make('upstream');

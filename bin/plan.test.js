@@ -558,9 +558,9 @@ test('a question with no recognisable action is never auto-authorized', () => {
   } finally { f.cleanup(); }
 });
 
-// ---------- questions for Owner get filed, not stalled ----------
+// ---------- questions for Owner stay in the pane ----------
 
-test('Stop tells an unattended session to file its question for Owner', () => {
+test('Stop leaves an unanswered question in the pane however long Owner has been away', () => {
   const f = registryFixture();
   try {
     const linked = writeLinkedCard(f);
@@ -569,55 +569,8 @@ test('Stop tells an unattended session to file its question for Owner', () => {
       + assistant('Which region should the replica live in?'));
     const out = stop(f, linked, transcript);
     assert.equal(out.status, 0, out.stderr);
-    const reason = JSON.parse(out.stdout).reason;
-    assert.match(reason, /keep ask --owner/);
-    assert.match(reason, /planned-card/);
-    // Once per session per window.
-    assert.equal(stop(f, linked, transcript).stdout, '');
-  } finally { f.cleanup(); }
-});
-
-test('Stop leaves a live conversation alone', () => {
-  const f = registryFixture();
-  try {
-    const linked = writeLinkedCard(f);
-    const transcript = path.join(f.root, 'transcript.jsonl');
-    fs.writeFileSync(transcript, interactive() + human('what about the index?', 60e3)
-      + assistant('Which region should the replica live in?'));
-    assert.equal(stop(f, linked, transcript).stdout, '');
-  } finally { f.cleanup(); }
-});
-
-test('Stop stays quiet when it cannot see any message Owner typed', () => {
-  const f = registryFixture();
-  try {
-    const linked = writeLinkedCard(f);
-    const transcript = path.join(f.root, 'transcript.jsonl');
-    fs.writeFileSync(transcript, interactive() + assistant('Which region should the replica live in?'));
-    assert.equal(stop(f, linked, transcript).stdout, '');
-  } finally { f.cleanup(); }
-});
-
-test('a [keep] injection is not mistaken for Owner typing', () => {
-  const f = registryFixture();
-  try {
-    const linked = writeLinkedCard(f);
-    const transcript = path.join(f.root, 'transcript.jsonl');
-    fs.writeFileSync(transcript, interactive() + human('start on this', 3 * 3600e3)
-      + human('[keep] scheduled check due for planned-card', 60e3)
-      + assistant('Which region should the replica live in?'));
-    assert.match(JSON.parse(stop(f, linked, transcript).stdout).reason, /keep ask --owner/);
-  } finally { f.cleanup(); }
-});
-
-test('KEEP_ASK_NAG=0 turns the ask reminder off', () => {
-  const f = registryFixture();
-  try {
-    const linked = writeLinkedCard(f);
-    const transcript = path.join(f.root, 'transcript.jsonl');
-    fs.writeFileSync(transcript, interactive() + human('start on this', 3 * 3600e3)
-      + assistant('Which region should the replica live in?'));
-    assert.equal(stop(f, linked, transcript, { KEEP_ASK_NAG: '0' }).stdout, '');
+    assert.equal(out.stdout, '');
+    assert.equal(fs.existsSync(path.join(f.root, '.keep', 'review', '_questions.json')), false);
   } finally { f.cleanup(); }
 });
 
@@ -820,38 +773,6 @@ test('a malformed plan yields no next step, so the Stop hook cannot drive it', (
     const transcript = path.join(f.root, 'transcript.jsonl');
     fs.writeFileSync(transcript, interactive() + assistant('Finished a chunk.'));
     assert.equal(stop(f, { project, sid }, transcript).stdout, '');
-  } finally { f.cleanup(); }
-});
-
-test('a compaction summary is not mistaken for Owner typing', () => {
-  const f = registryFixture();
-  try {
-    const linked = writeLinkedCard(f);
-    const transcript = path.join(f.root, 'transcript.jsonl');
-    const compact = `${JSON.stringify({
-      type: 'user', isCompactSummary: true, timestamp: new Date().toISOString(),
-      message: { role: 'user', content: [{ type: 'text', text: 'This session is being continued…' }] },
-    })}\n`;
-    fs.writeFileSync(transcript, interactive() + human('start on this', 3 * 3600e3) + compact
-      + assistant('Which region should the replica live in?'));
-    // The compaction is the harness speaking, so Owner is still absent.
-    assert.match(JSON.parse(stop(f, linked, transcript).stdout).reason, /keep ask --owner/);
-  } finally { f.cleanup(); }
-});
-
-test('a question another session parked does not silence this one', () => {
-  const f = registryFixture();
-  try {
-    const linked = writeLinkedCard(f);
-    fs.mkdirSync(path.join(f.root, '.keep', 'review'), { recursive: true });
-    fs.writeFileSync(path.join(f.root, '.keep', 'review', '_questions.json'), JSON.stringify([{
-      id: 'q-old', at: Date.now(), status: 'open', to: 'jesse', task: 'planned-card',
-      question: 'A different question', from: { sessionId: 'some-other-session', agent: 'claude' },
-    }]));
-    const transcript = path.join(f.root, 'transcript.jsonl');
-    fs.writeFileSync(transcript, interactive() + human('start on this', 3 * 3600e3)
-      + assistant('Which region should the replica live in?'));
-    assert.match(JSON.parse(stop(f, linked, transcript).stdout).reason, /keep ask --owner/);
   } finally { f.cleanup(); }
 });
 

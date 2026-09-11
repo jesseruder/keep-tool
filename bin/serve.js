@@ -2558,12 +2558,11 @@ async function closeIdleSession(body, deps = {}) {
         fallbackCacheMs: 0,
       }, deps);
       const allTasks = (deps.loadAll || keep.loadAll)(true);
-      const questions = (deps.loadQuestions || review.loadQuestions)();
       const legacy = deps.closePolicy.legacyDoneAt || {};
       const plan = require('./session-cleanup').doneClosePlan(
         current.sessions.find((candidate) => candidate.id === session.id),
         policyPane,
-        { ...current, allTasks, questions, pinned, companion },
+        { ...current, allTasks, pinned, companion },
         (deps.now || Date.now)(),
         {
           idleMs: deps.closePolicy.idleMs,
@@ -4080,11 +4079,6 @@ function buildState(options = {}) {
   titles.applyLiveTitles(sessions, { onChange, taskFor: (session) => taskById.get(session.taskId) });
   applySessionLiveness(sessions, liveLedger, options.hostPanes || [], now);
   const dependencyCache = new Map();
-  const ownerQuestions = new Map();
-  for (const question of review.loadQuestions()) {
-    const id = question.from?.sessionId;
-    if (['owner', 'jesse'].includes(question.to) && question.status === 'open' && id && !ownerQuestions.has(id)) ownerQuestions.set(id, question);
-  }
   const liveHostedSessions = new Set((options.hostPanes || []).filter((pane) => pane.alive && pane.agentAlive !== false).map((pane) => pane.meta?.sessionId));
   applyHostedExitState(sessions, options.hostPanes, independentLive);
   for (const session of sessions) {
@@ -4102,7 +4096,6 @@ function buildState(options = {}) {
       }
     }
     const task = taskById.get(session.taskId);
-    session.ownerQuestion = ownerQuestions.get(session.id) || null;
     if (task && !dependencyCache.has(task.id)) dependencyCache.set(task.id, keep.unresolvedDependencyIds(task));
     session.activity = sessionStatus.activity(session, { task, dependencies: dependencyCache.get(task?.id) || [], live: liveHostedSessions.has(session.id) });
     session.observation = require('./session-model').normalize(session, { task, dependencies: dependencyCache.get(task?.id) || [], live: liveHostedSessions.has(session.id) });
@@ -4819,7 +4812,6 @@ function start(deps = {}) {
       return {
         ...state,
         allTasks: keep.loadAll(true),
-        questions: review.loadQuestions(),
         companion: await stalled.discoverCodexJobs({ root: keep.ROOT, fallbackCacheMs: 0 }),
         pinned: new Set((layouts.layouts || []).flatMap((layout) => layout.ids || [])),
       };

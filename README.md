@@ -76,8 +76,7 @@ to reconstruct the previous conversation.
 The daemon runs scheduling and bookkeeping in the background. Depending on your
 configuration and available agent sessions, Keep can:
 
-- Run due check recipes, deliver dependency notifications, and surface unanswered
-  owner questions.
+- Run due check recipes and deliver dependency notifications.
 - Run reviewer ticks and the daily ideas sweep, generate a standup draft, and flag
   stale or inconsistent task records.
 - Detect when cited commits reach a project's default branch and update eligible
@@ -233,9 +232,6 @@ channels. Its adapter currently requires a compatible MCP CLI configured through
 `KEEP_JESSE_MCP` (legacy variable name); it is not a standalone Slack integration.
 Phone pushes use `KEEP_PUSH_WEBHOOK`; speaker notifications require an `announce`
 command. Credentials belong in the local environment/configuration, never source.
-
-Use `keep ask --owner` for questions requiring the registry owner's answer.
-`--jesse` remains a compatibility alias, and existing questions keep working.
 
 Scope tags default to `work` and `personal`, with projects under `~/work` assigned
 `work`. Customize the names and ordered path rules in your local configuration:

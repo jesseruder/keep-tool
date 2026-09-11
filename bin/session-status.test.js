@@ -16,13 +16,13 @@ test('permission notifications remain visible despite newer non-input hook hints
   }
 });
 
-test('explicit owner approval question beats landing and dependency status', () => {
-  const session = { id: 'session', pane: 'pane', endedTurn: true, taskStatus: 'landing', ownerQuestion: { question: 'May I land this commit?' } };
+test('an approval question in the final turn beats landing and dependency status', () => {
+  const session = { id: 'session', pane: 'pane', endedTurn: true, taskStatus: 'landing', lastAssistantFull: 'Reviewed. May I land this commit?' };
   assert.equal(activity(session).state, 'needs-input');
-  assert.equal(attention(session).detail, 'May I land this commit?');
+  assert.equal(activity(session).label, 'Needs an answer');
+  assert.equal(attention(session).detail, 'Reviewed. May I land this commit?');
   assert.equal(activity({ ...session, pendingBackground: true }).needsInput, true);
   assert.equal(activity({ ...session, taskStatus: 'waiting' }, { dependencies: ['other'] }).needsInput, true);
-  assert.equal(activity({ ...session, ownerQuestion: null }).state, 'needs-input');
   assert.equal(activity({ ...session, endedTurn: false }).state, 'running');
 });
 

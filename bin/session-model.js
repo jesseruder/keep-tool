@@ -21,7 +21,7 @@ function normalize(session, context = {}) {
       uncertain: (session.unknownBackgroundJobs || []).slice(0, 100),
       agents: (session.lifecycleAgents || []).slice(0, 100) },
     requests: { question: Boolean(session.pendingQuestion), async: Boolean(session.pendingQuestion?.async),
-      plan: Boolean(session.pendingPlan), owner: Boolean(session.ownerQuestion), notification: session.notify?.type || null },
+      plan: Boolean(session.pendingPlan), notification: session.notify?.type || null },
     task: { id: session.taskId || null, status: task.status || session.taskStatus || null,
       dependencies: context.dependencies || [], checkAfter: task.check_after || null, needs: Boolean(task.needs?.length),
       hasCheck: Boolean(task.check), scheduledBy: task.scheduled_by || null, scheduledAt: Date.parse(task.scheduled_at || '') || null,

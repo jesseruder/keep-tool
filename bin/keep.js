@@ -2893,200 +2893,6 @@ async function stepNotify(argv) {
   console.log(`notified ${notify.waiters - notify.failures}/${notify.waiters} waiter(s) for step ${name}${waiterRetrySuffix(notify)}`);
 }
 
-function normalizeQuestion(value) {
-  const question = String(value || '').replace(/\s+/g, ' ').trim();
-  if (!question) die('a question is required');
-  if (question.length > 1000) die('question must be at most 1000 characters');
-  return question;
-}
-
-commands.ask = async (argv) => {
-  const o = parseArgs(argv, { about: 'str', task: 'str', timeout: 'str', owner: 'bool', jesse: 'bool' });
-  o.owner = o.owner || o.jesse;
-  if (!o._.length) die('usage: keep ask "<question>" [--owner] [--about <project>] [--task <id>] [--timeout <min>]');
-  if (isReviewerSession()) die('the fleet reviewer cannot ask questions');
-  const question = normalizeQuestion(o._.join(' '));
-  const about = o.about ? resolveProjectArg(o.about) : '';
-  if (o.task) loadTask(o.task);
-  if (o.owner && o.timeout !== undefined) die('--owner questions do not time out; drop --timeout');
-  const timeoutMin = o.timeout === undefined ? 10 : Number(o.timeout);
-  if (!Number.isFinite(timeoutMin) || timeoutMin <= 0) die('--timeout must be a positive number of minutes');
-  const review = require('./review.js');
-  const session = currentSession();
-  const entry = {
-    id: `q-${Date.now().toString(36)}`,
-    at: Date.now(),
-    question,
-    about,
-    task: o.task || '',
-    to: o.owner ? 'owner' : 'reviewer',
-    from: { sessionId: session ? session.id : '', agent: session ? session.agent : 'manual' },
-    timeoutMs: Math.round(timeoutMin * 60e3),
-    status: 'open',
-    deliveredAt: null,
-    answeredAt: null,
-    answer: '',
-    answeredBy: null,
-  };
-  withLock(() => {
-    const latestQuestions = review.loadQuestions();
-    if (session) {
-      const latestPrior = latestQuestions.find((candidate) => candidate.status === 'open'
-        && candidate.from && candidate.from.sessionId === session.id);
-      if (latestPrior) die(`session already has open question ${latestPrior.id}`);
-    }
-    latestQuestions.push(entry);
-    review.saveQuestions(latestQuestions);
-  });
-  console.log(entry.id);
-  if (about) console.log(require('./who.js').renderWho(await whoSnapshot(about)));
-  console.log(o.owner
-    ? `queued for Owner (${entry.id}); it shows in keep questions, keep brief and the dashboard until he runs keep answer ${entry.id} -m "...", and the answer is sent into this session. Do not wait on it — carry on with anything that does not depend on the answer.`
-    : `queued for the reviewer; the answer will be sent into this session, or fleet facts after ${timeoutMin} min if it does not answer`);
-};
-
-commands.answer = async (argv) => {
-  const o = parseArgs(argv, { 'no-deliver': 'bool' });
-  const id = o._[0];
-  if (o._.length !== 1 || !o.m) die('usage: keep answer <qid> [--no-deliver] -m "<answer>"');
-  const answer = String(o.m).replace(/\s+/g, ' ').trim();
-  if (!answer) die('an answer is required');
-  const review = require('./review.js');
-  const questions = review.loadQuestions();
-  const question = questions.find((entry) => entry.id === id);
-  if (!question) die(`no question "${id}"`);
-  if (question.status !== 'open') die(`${id} is already ${question.status}`);
-  const session = currentSession();
-  const fromReviewer = isReviewerSession();
-  const answeredBy = {
-    agent: session ? session.agent : 'manual',
-    sessionId: session ? session.id : '',
-    reviewer: fromReviewer,
-  };
-  const selfAnswer = Boolean(session && question.from?.sessionId === session.id && question.from?.agent === session.agent);
-  const suppressDelivery = o['no-deliver'] === true;
-  let claimed = false;
-  const current = review.updateQuestion(id, (fresh) => {
-    if (fresh.status !== 'open') return null;
-    claimed = true;
-    const answeredAt = Date.now();
-    return {
-      status: 'answered',
-      answeredAt,
-      answer,
-      answeredBy,
-      ...((selfAnswer || suppressDelivery) ? { answerDelivery: {
-        pending: false,
-        attempts: 0,
-        acknowledgedAt: answeredAt,
-        reason: suppressDelivery ? 'delivery-suppressed' : 'answered-in-owning-session',
-      } } : {}),
-      ...(suppressDelivery && fresh.timeoutDelivery ? { timeoutDelivery: {
-        ...fresh.timeoutDelivery,
-        pending: false,
-        acknowledgedAt: answeredAt,
-        reason: 'delivery-suppressed',
-      } } : {}),
-    };
-  });
-  if (!claimed) die(`${id} is already ${current ? current.status : 'missing'}`);
-
-  const notes = [];
-  if (current.task) {
-    try {
-      const heading = fromReviewer
-        ? `review (${process.env.KEEP_REVIEWER_NAME || 'fable'}) answer`
-        : session
-          ? `answer (${session.agent} ${session.id.slice(0, 8)}, not reviewer)`
-          : 'answer (Owner manual)';
-      checkinTask(current.task, {
-        heading,
-        message: `Q: ${current.question}\nA: ${answer}`,
-        linkSession: false,
-        commitLabel: 'review',
-      });
-      notes.push(`recorded on ${current.task}`);
-    } catch (error) {
-      notes.push(`could not record on ${current.task}: ${error.message}`);
-    }
-  }
-  if (suppressDelivery) {
-    notes.push('delivery suppressed; no terminal delivery or retry queued');
-  } else if (selfAnswer) {
-    notes.push('already in the asking session; no terminal delivery needed');
-  } else if (current.from && current.from.sessionId) {
-    try {
-      const response = await postKeepApi('/api/send', {
-        sessionId: current.from.sessionId,
-        text: review.answerMessage(current.id, answer, {
-          fromReviewer,
-          agent: answeredBy.agent,
-          sessionId: answeredBy.sessionId,
-        }),
-      });
-      let sendResult = null;
-      try { sendResult = JSON.parse(response.data); } catch {}
-      if (response.status === 200 && !(sendResult && sendResult.truncated)) {
-        review.updateQuestion(id, { answerDelivery: { pending: false, attempts: 0, deliveredAt: Date.now() } });
-        notes.push(`sent to session ${current.from.sessionId.slice(0, 8)}`);
-      }
-      else {
-        let detail = '';
-        try { detail = JSON.parse(response.data).error || ''; } catch {}
-        if (sendResult && sendResult.truncated) {
-          detail = `delivery truncated (${sendResult.received}/${sendResult.expected} chars)`;
-        }
-        const lastError = detail || `HTTP ${response.status}`;
-        review.updateQuestion(id, { answerDelivery: { pending: true, attempts: 0, lastError } });
-        notes.push(`answer saved but session delivery failed${detail ? `: ${detail}` : ` (HTTP ${response.status})`}`);
-      }
-    } catch (error) {
-      review.updateQuestion(id, { answerDelivery: {
-        pending: true,
-        attempts: 0,
-        lastError: String(error && error.message || error).replace(/\s+/g, ' ').trim().slice(0, 500),
-      } });
-      notes.push(`answer saved but session delivery failed: ${error.message}`);
-    }
-  } else {
-    notes.push('no asking session; answer remains in the ledger' + (current.task ? ' and on the card' : ''));
-  }
-  console.log(`${id} answered; ${notes.join('; ')}`);
-};
-
-commands.questions = (argv) => {
-  const o = parseArgs(argv, { all: 'bool' });
-  if (o._.length) die('usage: keep questions [--all]');
-  const cutoff = Date.now() - 24 * 3600e3;
-  const questions = require('./review.js').loadQuestions().filter((question) => {
-    if (question.status === 'open') return true;
-    if (!o.all) return false;
-    if (question.status === 'answered') return Number(question.answeredAt || 0) >= cutoff;
-    if (question.status === 'expired') {
-      return Number(question.at || 0) + Number(question.timeoutMs || 0) >= cutoff;
-    }
-    return false;
-  });
-  if (!questions.length) return console.log('no questions');
-  const line = (question) => {
-    console.log(`${question.id}  ${question.status}  ${question.about || question.task || '(no project)'}  ${question.from && question.from.agent || 'manual'} ${question.from && String(question.from.sessionId || '').slice(0, 8)}  ${question.question}`);
-    if (o.all && question.answer) console.log(`  answer: ${question.answer}`);
-  };
-  // Owner's own queue first and under its own heading: the point of the lane is
-  // that he can see what is waiting on him without reading past reviewer traffic.
-  const mine = questions.filter((question) => ['owner', 'jesse'].includes(question.to));
-  const rest = questions.filter((question) => !['owner', 'jesse'].includes(question.to));
-  if (mine.length) {
-    console.log(`Waiting on Owner (${mine.filter((q) => q.status === 'open').length} open):`);
-    for (const question of mine) line(question);
-    if (rest.length) console.log('');
-  }
-  if (rest.length) {
-    if (mine.length) console.log('Reviewer:');
-    for (const question of rest) line(question);
-  }
-};
-
 function alertText(value) {
   if (value == null || !String(value).trim()) die('an alert needs -m "text"');
   const text = String(value).trim();
@@ -3097,7 +2903,6 @@ function alertText(value) {
 
 function briefSnapshot(now = Date.now()) {
   const alerts = require('./alerts.js');
-  const review = require('./review.js');
   const lintTool = require('./lint.js');
   const tasks = loadAll(false);
   const holds = activeHolds(null, now);
@@ -3121,7 +2926,6 @@ function briefSnapshot(now = Date.now()) {
   }
   return alerts.buildBrief({
     tasks,
-    questions: review.loadQuestions(),
     decisions: require('./decisions.js').loadSafe(),
     alerts: alerts.readAlerts({ root: ROOT, all: true }),
     findings: alerts.loadReviewFindings(ROOT, now),
@@ -4295,38 +4099,8 @@ function openTasksForProject(cwd) {
       (b.fm.updated || '').localeCompare(a.fm.updated || ''));
 }
 
-// Text a person actually typed, as opposed to a tool result, a hook injection,
-// a system reminder, or one of Keep's own `[keep]` messages. Used to tell a
-// live conversation (Owner is at the keyboard; a closing question is just talk)
-// from an unattended session (a closing question is a stall nobody will see).
-// The wrappers the harness injects as user turns. Matching the opening tag is
-// deliberately narrower than "starts with <": a message Owner typed that opens
-// with a tag-like token is rare, but rejecting it would age his last-seen
-// timestamp and could fire the ask reminder in a live conversation.
-const INJECTED_TURN_RE = /^<(?:system-reminder|task-notification|command-\w+|local-command-\w+|user-prompt-submit-hook|session-start-hook|cross-session-message)\b/i;
-
-function typedUserText(record) {
-  if (!record || record.type !== 'user' || record.isMeta || !record.message) return '';
-  // A compaction writes the summary back as a user turn; it is the harness
-  // speaking, not Owner, and treating it as him silences the reminder in exactly
-  // the long unattended session the reminder exists for.
-  if (record.isCompactSummary || record.isSidechain || record.isApiErrorMessage) return '';
-  const content = record.message.content;
-  let text = '';
-  if (typeof content === 'string') text = content;
-  else if (Array.isArray(content)) {
-    if (content.some((item) => item && item.type === 'tool_result')) return '';
-    text = content.filter((item) => item && item.type === 'text').map((item) => item.text || '').join(' ');
-  }
-  text = String(text).trim();
-  if (!text) return '';
-  if (INJECTED_TURN_RE.test(text)) return '';
-  if (text.startsWith('[keep]') || text.startsWith('[Request interrupted')) return '';
-  return text;
-}
-
 function stopTranscriptState(transcript) {
-  const out = { interactive: false, lastAssistant: '', pendingDecisionTool: false, lastHumanAt: 0 };
+  const out = { interactive: false, lastAssistant: '', pendingDecisionTool: false };
   const pending = new Map();
   try {
     for (const line of readTranscriptTail(transcript).split('\n')) {
@@ -4335,10 +4109,6 @@ function stopTranscriptState(transcript) {
       try { record = JSON.parse(line); } catch { continue; }
       if (!record || record.isSidechain) continue;
       if (record.type === 'mode' || record.type === 'permission-mode') out.interactive = true;
-      if (typedUserText(record)) {
-        const at = Date.parse(record.timestamp || '');
-        if (Number.isFinite(at)) out.lastHumanAt = Math.max(out.lastHumanAt, at);
-      }
       if (record.type === 'user' && record.message && Array.isArray(record.message.content)) {
         for (const item of record.message.content) {
           if (item && item.type === 'tool_result' && item.tool_use_id) pending.delete(item.tool_use_id);
@@ -4896,7 +4666,7 @@ function authorizedReason(task, grantCheck) {
   return `[keep] You stopped to ask about ${actions}. You do not need to ask: card ${task.id} already grants ${actions}`
     + `${task.fm.allow_until ? ` (until ${task.fm.allow_until})` : ''}. Owner granted this at planning time — proceed without waiting.`
     + ` Check any other action with \`keep allow ${task.id} <action>\` (exit 3 means ask him).`
-    + ` If you were stopping for a different reason than ${actions}, say so and file it with \`keep ask --owner\`.`;
+    + ` If you were stopping for a different reason than ${actions}, say so and end your turn with that question.`;
 }
 
 // One authorization message per (card, action set) per session: a second Stop on
@@ -4906,53 +4676,6 @@ function wasAuthorizedFor(state, task, actions) {
   const prior = state && state.authorized;
   if (!prior || prior.task !== task.id) return false;
   return JSON.stringify(prior.actions || []) === JSON.stringify(actions || []);
-}
-
-// The agent ended its turn with a question the card does not answer. That is a
-// legitimate handoff — but in a session nobody is watching it is an invisible
-// stall, which is how a Codex thread sat waiting on the cAdvisor deploy with no
-// dependency recorded (2026-09-03). Push it into `keep ask --owner`, once, and
-// only when Owner is demonstrably not at this keyboard.
-const STOP_PRESENT_MS = 30 * 60e3;
-
-function stopAskedForOwner({ input, sid, task, state, stateFile, transcriptState, grantCheck, markerFreshMs }) {
-  if (process.env.KEEP_ASK_NAG === '0') return;
-  // Fail safe toward silence. Nagging only happens on a positive observation
-  // that Owner's last message here is old; the 256KB transcript tail can be all
-  // tool results in a busy turn, and a missed message must not turn a live
-  // conversation into a ticket demand.
-  if (!transcriptState.lastHumanAt) return;
-  const since = Date.now() - Number(transcriptState.lastHumanAt);
-  if (since < STOP_PRESENT_MS) return;
-  if (!task) return; // No card, no queue to file into and no project to attribute it to.
-  const asklessDir = path.join(META, 'askless');
-  const marker = markerMtime(path.join(asklessDir, sid));
-  if (marker && Date.now() - marker < markerFreshMs) return;
-  // Already parked a question for Owner: it is queued, not stalled.
-  try {
-    const open = require('./review.js').loadQuestions()
-      .filter((q) => q && q.status === 'open' && ['owner', 'jesse'].includes(q.to) && q.from && q.from.sessionId === sid);
-    if (open.length) return;
-  } catch {}
-
-  fs.mkdirSync(asklessDir, { recursive: true });
-  fs.writeFileSync(path.join(asklessDir, sid), nowStamp());
-  if (state && stateFile) {
-    state.askless = { task: task.id, at: new Date().toISOString() };
-    try { fs.writeFileSync(stateFile, JSON.stringify(state)); } catch {}
-  }
-  const missing = grantCheck && grantCheck.missing && grantCheck.missing.length
-    ? ` The action you asked about (${grantCheck.missing.join(', ')}) is not granted on this card, so it does need him.`
-    : '';
-  console.log(JSON.stringify({
-    decision: 'block',
-    reason: `[keep] You ended your turn with a question for Owner, but nobody has typed in this session for ${Math.round(since / 60e3)} minutes, so he may not notice it here.${missing}`
-      + ` File it where he reads it: \`keep ask --owner "<the question>" --task ${task.id}\`. It shows in keep questions, keep brief and the dashboard, and his answer is delivered back into this session.`
-      + ` Then do everything on ${task.id} that does not depend on the answer, and check in with what you are waiting for.`
-      + ` If the card genuinely cannot move without him, \`keep needs ${task.id} "<what you need>"\` blocks it instead.`
-      + ` This reminder fires at most once per session per 6h.`,
-  }));
-  return true;
 }
 
 function codexStopState(input) {
@@ -4965,7 +4688,7 @@ function codexStopState(input) {
   if (!info) return null;
   return { interactive: true, lastAssistant: input.last_assistant_message || info.lastAssistant,
     pendingDecisionTool: Boolean(info.pendingQuestion || info.toolRunning ||
-      require('./codex-lifecycle').state(ROOT, info).pendingBackground), lastHumanAt: info.lastUserAt || 0 };
+      require('./codex-lifecycle').state(ROOT, info).pendingBackground) };
 }
 
 function stopHook(input, agent = 'claude') {
@@ -5053,12 +4776,9 @@ function stopHook(input, agent = 'claude') {
   const grantCheck = asked && task ? allow.coversStop(task, transcriptState.lastAssistant) : null;
   const preauthorized = Boolean(grantCheck && grantCheck.covered);
 
-  if (asked && !preauthorized) {
-    return stopAskedForOwner({
-      input, sid, task, state, stateFile, transcriptState, grantCheck,
-      markerFreshMs: MARKER_FRESH_MS,
-    });
-  }
+  // Any other question is a handoff to Owner. The console shows every pane's
+  // final turn as needing an answer, so the pane is the inbox.
+  if (asked && !preauthorized) return;
 
   const canContinue = transcriptState.interactive && task && task.fm.status === 'active'
     && String(task.fm.autocontinue || '').toLowerCase() !== 'off' && (next || preauthorized);
@@ -5970,10 +5690,6 @@ function helpText() {
   keep needs [<card> "<secret or action>" [--env NAME] | <card> --met [--env NAME|"<text>"]]
                           # what only Owner can supply; no args lists open needs and clears any whose env var is set here
 ${stepUsage()}
-  keep ask "<question>" [--owner] [--about <project>] [--task <id>] [--timeout <min>]
-                         # --owner queues it for Owner (no timeout, no reviewer)
-  keep answer <qid> [--no-deliver] -m "<answer>"   # --no-deliver saves without waking the asking session or queuing retries
-  keep questions [--all]
   keep decide <type> [--card <id>] [--session <sid>] --send "<message>" -m "why"
                          # the reviewer records what it WOULD do; nothing is sent
   keep decisions [--all] [--type t] [--json]

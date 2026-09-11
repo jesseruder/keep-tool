@@ -222,32 +222,3 @@ test('link commits locally without pushing from a manual shell', () => {
     fs.rmSync(remote, { recursive: true, force: true });
   }
 });
-
-test('quietly resolving an owner question restores the existing scheduled handoff', () => {
-  const f = fixture();
-  try {
-    const sid = 'scheduled-session';
-    writeTask(f, 'scheduled', {
-      status: 'waiting', sessions: [{ id: sid, agent: 'codex', at: '2026-09-10T07:00' }],
-      checkAfter: '2099-01-01', check: 'Verify the rollout.', scheduledBy: sid,
-      scheduledAt: new Date(2500).toISOString(), scheduledFor: '2099-01-01', scheduledIntent: 'waiting',
-    });
-    f.commit();
-    const reviewDir = path.join(f.root, '.keep', 'review');
-    fs.mkdirSync(reviewDir, { recursive: true });
-    const questionsFile = path.join(reviewDir, '_questions.json');
-    fs.writeFileSync(questionsFile, JSON.stringify([{ id: 'q-owner', status: 'open', to: 'owner', question: 'Stale?',
-      from: { sessionId: sid, agent: 'codex' } }]));
-    const before = builtSession(f, sid);
-    assert.equal(before.ownerQuestion.id, 'q-owner');
-    assert.equal(before.activity.decision.rule, 'owner-question');
-    const result = f.run(['answer', 'q-owner', '--no-deliver', '-m', 'No longer needed.'], { CODEX_THREAD_ID: 'owner-session' });
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(JSON.parse(fs.readFileSync(questionsFile))[0].status, 'answered');
-    const restored = builtSession(f, sid);
-    assert.equal(restored.ownerQuestion, null);
-    assert.equal(restored.activity.state, 'waiting');
-    assert.equal(restored.activity.label, 'Waiting: scheduled check');
-    assert.equal(restored.activity.decision.rule, 'conversation-wait');
-  } finally { f.cleanup(); }
-});

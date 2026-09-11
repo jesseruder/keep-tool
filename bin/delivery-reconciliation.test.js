@@ -21,11 +21,7 @@ async function fixture(fn) {
     fs.writeFileSync(journal, JSON.stringify(entry));
     return { entry, journal, append: record => fs.appendFileSync(entry.file, JSON.stringify(record) + '\n') };
   };
-  const questions = records => {
-    fs.mkdirSync(path.join(root, '.keep/review'), { recursive: true });
-    fs.writeFileSync(path.join(root, '.keep/review/_questions.json'), JSON.stringify(records));
-  };
-  try { await fn({ root, directory, add, questions }); }
+  try { await fn({ root, directory, add }); }
   finally { fs.rmSync(root, { recursive: true, force: true }); }
 }
 
@@ -71,37 +67,6 @@ test('Codex compaction completion confirms /compact without acknowledging later 
   prior.append({ type: 'compacted', payload: {} });
   prior.entry.offset = fs.statSync(prior.entry.file).size;
   assert.equal(delivery.received(prior.entry), false);
-}));
-
-test('explicit answer cancellation reconciles only the exact recipient/payload, never fakes receipt or resends', () => fixture(async f => {
-  const question = { id: 'q-one', status: 'answered', from: { agent: 'codex', sessionId: 'codex-session' },
-    answer: 'Enable nudges for all finding kinds.', answeredBy: { agent: 'codex', sessionId: 'codex-session', reviewer: false },
-    answerDelivery: { pending: false, cancelledAt: Date.now() } };
-  const text = require('./review').answerMessage(question.id, question.answer, { agent: 'codex', sessionId: 'codex-session', fromReviewer: false });
-  const x = f.add('codex', text);
-  for (const other of [
-    { ...question, answerDelivery: { pending: false, gaveUp: true } },
-    { ...question, answerDelivery: { pending: true, cancelledAt: Date.now() } },
-    { ...question, from: { agent: 'claude', sessionId: 'codex-session' } },
-    { ...question, from: { agent: 'codex', sessionId: 'other-session' } },
-    { ...question, answer: 'Changed answer' },
-  ]) {
-    f.questions([other]);
-    assert.equal(delivery.cancelled(x.entry, f.directory), false);
-    assert.equal(inspect(f).length, 1);
-  }
-  f.questions([question]);
-  assert.equal(delivery.received(x.entry), false);
-  assert.deepEqual(delivery.statusForText(f.directory, text), { sessionId: 'codex-session', kind: 'codex', received: false, pending: false, cancelled: true });
-  assert.deepEqual(inspect(f), []);
-  delivery.reconcile(f.directory);
-  assert.equal(fs.existsSync(x.journal), false);
-  assert.equal(fs.existsSync(path.join(f.directory, 'receipts')), false);
-  const unexpected = async () => assert.fail('cancelled delivery touched terminal');
-  await assert.rejects(delivery.deliver({ session: { id: 'codex-session', kind: 'codex' }, pane: 'pane', text,
-    file: x.entry.file, directory: f.directory, precheck: unexpected, type: unexpected, submitDraft: unexpected, draftMatches: unexpected }), /explicitly cancelled/);
-  f.questions([{ ...question, answerDelivery: { pending: false, acknowledgedAt: Date.now() } }]);
-  assert.equal(delivery.cancelled(x.entry, f.directory), true);
 }));
 
 test('unreadable evidence and pending ordinary drafts remain untouched by reconciliation', () => fixture(f => {

@@ -4,7 +4,7 @@ const { applyHostedExitState } = require('./serve');
 const status = require('./session-status');
 
 test('physical pane exit overrides stale questions for already-discovered sessions', () => {
-  const session = { id: 's', kind: 'codex', endedTurn: true, state: 'needs-input', ownerQuestion: { question: 'Old approval?' } };
+  const session = { id: 's', kind: 'codex', endedTurn: true, state: 'needs-input', pendingQuestion: { question: 'Old approval?' } };
   applyHostedExitState([session], [{ alive: false, meta: { sessionId: 's' } }]);
   session.activity = status.activity(session);
   assert.equal(session.activity.state, 'exited');

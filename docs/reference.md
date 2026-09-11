@@ -30,7 +30,6 @@ registry data or credentials to the public source repository.
 - `.keep/unblocked/` — pending and delivered cross-card unblock records
 - `steps/` — committed gated-step registries, one JSON file per project basename
 - `.keep/steps/` — local step run ledgers and logs (gitignored)
-- `.keep/review/_questions.json` — reviewer question/answer ledger
 
 ## CLI
 
@@ -59,9 +58,6 @@ keep step run <project> <step> [--sha <sha>] [--no-done]
 keep step done <project> <step> [--artifact <id>] [--sha <sha>] [--force] [-m note]
 keep step fail <project> <step> [--force] -m "why"
 keep step notify <project> <step>
-keep ask "<question>" [--owner] [--about <project>] [--task <id>] [--timeout <min>]
-keep answer <qid> [--no-deliver] -m "<answer>"
-keep questions [--all]
 keep alert -m "text" --level attention|urgent [--key k] [--card id] [--from name] [--dry]
 keep quiet <duration>|off
 keep alerts [--all]
@@ -108,7 +104,9 @@ transcripts when completion hooks are missing and falls back to existing transcr
 tracking for sessions that have not loaded the hooks. Existing Claude sessions may
 need to restart/resume before newly configured hooks take effect.
 
-`keep ask --owner` addresses the registry owner; `--jesse` remains a compatibility alias.
+An agent that needs the owner ends its turn with the question: the console shows every
+pane's final turn in Waiting on you, and a reply typed there is the answer. Something
+only the owner can supply, and that must outlive the session, is a `keep needs` block.
 
 `when`: `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`, `+15m`, `+3d`, `+12h`, `+2w`, `tomorrow`.
 
@@ -208,7 +206,7 @@ The question PreToolUse matcher is `^(?:.*\.)?request_user_input(?:_async)?$`.
 Automatic cleanup checks every five minutes. An agent session becomes eligible 15
 minutes after the later of its card's transition to `done` and its last transcript,
 pane input, or pane output activity. Every card linked to the session must be done.
-Open `keep ask` questions, background ledgers, Codex companion jobs, process
+Background ledgers, Codex companion jobs, process
 children, pinned panes, attached viewers, drafts, and unknown activity protect the
 session. Output remains unread until a visible viewer receives the pane history;
 unread output protects the session even after the idle window passes.
@@ -440,23 +438,6 @@ Example registry entry:
   }
 }
 ```
-
-## Ask the fleet reviewer
-
-`keep ask "<question>" --about <project>` queues one open question per asking session
-in `.keep/review/_questions.json`. The daemon delivers it to an idle, in-budget fleet
-reviewer, which records the result with `keep answer <qid> -m "..."`; the answer is
-then sent back into the asking session and optionally logged on `--task`. Answers are
-observations, not authorization. If the reviewer does not answer before the timeout
-(10 minutes by default), the daemon sends a fresh model-free `keep who` snapshot
-instead. `keep questions [--all]` inspects the ledger; hand-run questions without a
-session remain on the ledger/card only. Failed answer and timeout-notice sends enter
-an outbox in the question ledger; the daemon retries each pending delivery once per
-tick for up to 20 attempts and records its delivery time or that it gave up.
-
-Use `keep answer <qid> --no-deliver -m "..."` to resolve a stale question without
-waking its asking session. The answer and its author are still recorded in the ledger
-and on the associated card, while answer and timeout delivery retries are suppressed.
 
 Long messages injected into sessions are typed in paced chunks and, for Claude
 sessions, verified against the transcript after submit; truncated delivery is logged.

@@ -49,13 +49,6 @@ test('configured model buckets preserve shared limits and fail closed when missi
   } finally { if (prior === undefined) delete process.env.KEEP_MODEL_BUDGETS; else process.env.KEEP_MODEL_BUDGETS = prior; }
 });
 
-test('owner and legacy questions are excluded from reviewer timeouts', () => {
-  const { questionsDue, jesseQuestions } = require('./review');
-  const entries = ['owner', 'jesse', 'reviewer'].map((to) => ({ id: to, to, status: 'open', at: 1, timeoutMs: 1 }));
-  assert.deepEqual(jesseQuestions(entries).map((q) => q.id).sort(), ['jesse', 'owner']);
-  assert.deepEqual(questionsDue(entries, Date.now()).expire, ['reviewer']);
-});
-
 test('console preserves custom project names and worktree scope after canonicalization', () => {
   const fs = require('node:fs'), path = require('node:path'), vm = require('node:vm');
   const source = fs.readFileSync(path.join(__dirname, '../web/app/app.js'), 'utf8');

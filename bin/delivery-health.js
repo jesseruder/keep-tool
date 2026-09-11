@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
-const { received, cancelled } = require('./delivery');
+const { received } = require('./delivery');
 const STALE_MS = 2 * 60e3;
 const safeId = value => /^[A-Za-z0-9_-]{1,160}$/.test(String(value || '')) ? String(value) : 'unknown';
 
@@ -46,7 +46,7 @@ function inspect(options = {}) {
     const since = Number.isFinite(entry.createdAt) && entry.createdAt > 0 ? entry.createdAt : stat.mtimeMs;
     if (now - since < (options.staleMs ?? STALE_MS)) continue;
     let reason = 'receipt-missing';
-    try { if (cancelled(entry, directory) || received(entry)) continue; }
+    try { if (received(entry)) continue; }
     catch { reason = 'transcript-unreadable'; }
     const trace = events.filter(row => row.session === entry.sessionId && row.pane === entry.pane && row.at >= since - 1);
     if (reason !== 'transcript-unreadable') {

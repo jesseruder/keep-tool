@@ -53,9 +53,6 @@ function doneClosePlan(session, pane, state, now = Date.now(), options = {}) {
   if (cards.some((task) => (task.fm || task).status !== 'done')) {
     return { reason: 'Session is linked to a card that is not done', cards };
   }
-  if ((state.questions || []).some((question) => question?.status === 'open' && question.from?.sessionId === session.id)) {
-    return { reason: 'Session has an unanswered keep ask question', cards };
-  }
   if ((state.companion?.jobs || []).some((job) => [job?.sessionId, job?.session_id, job?.ownerSessionId]
     .includes(session.id) && ['queued', 'running'].includes(job.status))) {
     return { reason: 'Session has a running Codex companion job', cards };

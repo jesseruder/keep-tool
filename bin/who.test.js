@@ -14,7 +14,6 @@ const test = require('node:test');
 const { spawnSync } = require('node:child_process');
 const { fleetSnapshot, renderWho } = require('./who.js');
 const { parseWhen } = require('./keep.js');
-const { questionsDue, questionMessage, answerMessage } = require('./review.js');
 
 const CLI = path.join(__dirname, 'keep.js');
 
@@ -112,44 +111,6 @@ test('session-start shows a matching hold and stays silent in another project', 
   }
 });
 
-test('ask records the ledger shape, allows only one open question, and refuses reviewers', () => {
-  const root = fixture();
-  const env = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', CODEX_THREAD_ID: 'asker-session-1234' };
-  const run = (extraEnv = {}) => spawnSync(process.execPath, [CLI, 'ask', 'Should we deploy?', '--timeout', '3'], {
-    encoding: 'utf8', env: { ...env, ...extraEnv }, cwd: root,
-  });
-  try {
-    const first = run();
-    assert.equal(first.status, 0, first.stderr);
-    const ledger = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'review', '_questions.json'), 'utf8'));
-    assert.equal(ledger.length, 1);
-    assert.match(ledger[0].id, /^q-[a-z0-9]+$/);
-    assert.equal(ledger[0].question, 'Should we deploy?');
-    assert.deepEqual(ledger[0].from, { sessionId: 'asker-session-1234', agent: 'codex' });
-    assert.equal(ledger[0].timeoutMs, 180000);
-    assert.equal(ledger[0].status, 'open');
-    assert.equal(run().status, 1, 'one open question per session');
-    const reviewer = spawnSync(process.execPath, [CLI, 'ask', 'Reviewer question'], {
-      encoding: 'utf8', env: { ...env, CODEX_THREAD_ID: 'reviewer-session', KEEP_REVIEWER: '1' }, cwd: root,
-    });
-    assert.equal(reviewer.status, 1);
-    assert.match(reviewer.stderr, /cannot ask/);
-  } finally { fs.rmSync(root, { recursive: true, force: true }); }
-});
-
-test('questionsDue requires a live idle in-budget reviewer, expires, and delivers one', () => {
-  const now = Date.now();
-  const open = [
-    { id: 'q-one', at: now - 1000, timeoutMs: 60000, status: 'open' },
-    { id: 'q-two', at: now - 1000, timeoutMs: 60000, status: 'open' },
-  ];
-  assert.deepEqual(questionsDue(open, now, { reviewerLive: true, reviewerIdle: true, budgetOk: true }).deliver, ['q-one']);
-  assert.deepEqual(questionsDue(open, now, { reviewerLive: false, reviewerIdle: true, budgetOk: true }).deliver, []);
-  assert.deepEqual(questionsDue(open, now, { reviewerLive: true, reviewerIdle: false, budgetOk: true }).deliver, []);
-  assert.deepEqual(questionsDue(open, now, { reviewerLive: true, reviewerIdle: true, budgetOk: false }).deliver, []);
-  assert.deepEqual(questionsDue([{ ...open[0], at: now - 60001 }], now, { reviewerLive: true, reviewerIdle: true, budgetOk: true }), { deliver: [], expire: ['q-one'] });
-});
-
 test('fleetSnapshot and renderWho include every section and the short session id', () => {
   const now = Date.now();
   const project = '/tmp/fleet-project';
@@ -171,16 +132,4 @@ test('fleetSnapshot and renderWho include every section and the short session id
   assert.match(text, /card-b/);
   assert.equal(snapshot.cards[0].next, '2/2 Second');
   assert.match(text, /next: 2\/2 Second/);
-});
-
-test('question and answer injection messages are single-line and at most 2000 chars', () => {
-  const question = questionMessage({
-    id: 'q-long', question: 'what now? '.repeat(500), about: '~/castle/ghost-server', task: '',
-    from: { agent: 'codex', sessionId: 'abcdefgh1234' },
-  });
-  const answer = answerMessage('q-long', 'evidence says wait '.repeat(500));
-  for (const message of [question, answer]) {
-    assert.doesNotMatch(message, /[\r\n]/);
-    assert.ok(message.length <= 2000);
-  }
 });

@@ -57,8 +57,8 @@ test('Claude lifecycle replay: unknown job, question, completion, close and repl
   append(claude('assistant', [text('Build complete.')], 'end_turn'));
   session = snapshot('needs-input');
   assert.equal(session.activity.decision.rule, 'conversation-ready');
-  session = snapshot('exited', { ownerQuestion: { question: 'Old approval?' } }, [pane(10, false)]);
-  assert.ok(session.activity.decision.alternatives.some((x) => x.rule === 'owner-question'));
+  session = snapshot('exited', { pendingQuestion: { question: 'Old approval?' } }, [pane(10, false)]);
+  assert.ok(session.activity.decision.alternatives.some((x) => x.rule === 'pending-question'));
   session = snapshot('needs-input', {}, [pane(10, false), pane(11)]);
   assert.equal(session.runtime.pid, 11);
   assert.equal(normalize(session).identity.conversationId, 's');
@@ -106,7 +106,7 @@ test('known service and unknown background job are separate facts', () => fixtur
 
 test('decision traces are bounded, deduplicated, copied and contain no prompt text', () => {
   const trace = createTrace(3, 1000);
-  const session = { id: 's', endedTurn: true, pane: 'p', ownerQuestion: { question: 'SECRET' } };
+  const session = { id: 's', endedTurn: true, pane: 'p', lastAssistantFull: 'Should I ship SECRET?' };
   session.activity = activity(session);
   trace.record(session, 10); trace.record(session, 20);
   assert.equal(trace.read(null, 20).length, 1);

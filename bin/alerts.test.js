@@ -91,12 +91,11 @@ test('buildBrief reports counts, caps review cards, and includes deferred alerts
   });
   const brief = buildBrief({
     tasks,
-    questions: [{ id: 'q1', status: 'open', question: 'Which rollout?', answer: '' }],
     alerts: [{ at: now - 60e3, level: 'attention', text: 'Quiet alert', deferred: true, why: 'quiet' }],
     findings: [{ at: now - 60e3, severity: 'high', card: 'review-1', kind: 'data-loss' }],
     now,
   });
-  assert.match(brief.text, /Keep brief — 10 need review, 1 question, 1 overdue check, 1 deferred alert, 1 finding/);
+  assert.match(brief.text, /Keep brief — 10 need review, 1 overdue check, 1 deferred alert, 1 finding/);
   assert.equal((brief.text.match(/^- Review card/gm) || []).length, 8);
   assert.match(brief.text, /Quiet alert/);
   assert.ok(brief.spoken.length <= 280);
@@ -268,30 +267,19 @@ test('CLI alert --card appends a one-line alert log without claiming a session',
   }
 });
 
-test('the brief lists agents waiting on Owner above reviewer questions, and shadow decisions last', () => {
+test('the brief lists shadow decisions last', () => {
   const brief = buildBrief({
     tasks: [],
-    questions: [
-      { id: 'q-1', status: 'open', to: 'jesse', at: 1, task: 'deck-storage', question: 'Postgres or S3 for cauldron decks?' },
-      { id: 'q-2', status: 'open', to: 'reviewer', at: 2, question: 'Is anything touching ghost-server right now?' },
-    ],
     decisions: [
       { id: 'd-1', at: 3, type: 'continue', card: 'some-work', why: 'step 1 is done and nothing needs Owner', verdict: null },
       { id: 'd-2', at: 4, type: 'close', card: 'other-work', why: 'already judged', verdict: 'agree' },
     ],
     now: Date.parse('2026-09-07T12:00:00'),
   });
-  assert.match(brief.text, /1 agent waiting on you/);
-  assert.match(brief.text, /Agents waiting on your answer \(1\)/);
-  assert.match(brief.text, /Postgres or S3/);
   assert.match(brief.text, /1 shadow decision/);
   assert.match(brief.text, /Shadow decisions \(nothing was sent\) \(1\)/);
   assert.match(brief.text, /d-1 continue/);
   assert.doesNotMatch(brief.text, /d-2/);
-  // A parked agent outranks a reviewer question in the spoken line.
-  assert.match(brief.spoken, /Agent waiting on you: Postgres or S3/);
-  // The reviewer question is still listed, just not as Owner's own queue.
-  assert.match(brief.text, /Questions \(1\)/);
 });
 
 test('a shadow decision never wins the spoken line', () => {
