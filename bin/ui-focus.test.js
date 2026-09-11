@@ -93,7 +93,7 @@ test('running and waiting sessions retain their slots through status changes', (
   assert.deepEqual(order([d, c, b, a]), ['a', 'b', 'c', 'd']);
 });
 
-test('running panel orders by task creation age regardless of activity and refresh order', () => {
+test('running panel orders newest-created first regardless of activity and refresh order', () => {
   const source = fs.readFileSync(path.join(__dirname, '../web/app/app.js'), 'utf8');
   const data = {
     tasks: [{ id: 'old', fm: { created: '2026-01-01' } }, { id: 'new', fm: { created: '2026-02-01' } }],
@@ -106,17 +106,17 @@ test('running panel orders by task creation age regardless of activity and refre
     sessionItem: (kind, session) => session });
   vm.runInContext(source.slice(source.indexOf('function runningItems('), source.indexOf('function pinnedItems(')), ctx);
   const order = () => Array.from(ctx.runningItems(), item => item.id);
-  assert.deepEqual(order(), ['old', 'shell', 'new']);
+  assert.deepEqual(order(), ['new', 'shell', 'old']);
   data.sessions.reverse();
   for (const session of data.sessions) { session.state = session.state === 'running' ? 'waiting' : 'running'; session.mtime += 1000; }
-  assert.deepEqual(order(), ['old', 'shell', 'new']);
+  assert.deepEqual(order(), ['new', 'shell', 'old']);
   ctx.runningOrder.clear();
-  assert.deepEqual(order(), ['old', 'shell', 'new'], 'reload uses creation age too');
+  assert.deepEqual(order(), ['new', 'shell', 'old'], 'reload uses creation age too');
   data.tasks[0] = { id: 'old', fm: { created: '2026-02-01' }, body: '## 2026-02-01 09:00 — created\nOlder task' };
   data.tasks[1] = { id: 'new', fm: { created: '2026-02-01' }, body: '## 2026-02-01 14:00 — created\nNewer task' };
-  assert.deepEqual(order(), ['shell', 'old', 'new'], 'same-day tasks use precise creation logs');
+  assert.deepEqual(order(), ['new', 'old', 'shell'], 'same-day tasks use precise creation logs');
   data.sessions.reverse(); ctx.runningOrder.clear();
-  assert.deepEqual(order(), ['shell', 'old', 'new']);
+  assert.deepEqual(order(), ['new', 'old', 'shell']);
   data.tasks[0].body = ''; data.tasks[1].body = '';
   const tied = order();
   data.sessions.reverse(); ctx.runningOrder.clear();

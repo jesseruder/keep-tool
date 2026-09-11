@@ -18,13 +18,13 @@ export function selectionIndex(items, selectedKey, current, fallback, keyOf, sec
   return index >= 0 ? index : Math.max(0, Math.min(fallback, items.length - 1));
 }
 
-// Order by creation time with deterministic ties, or retain first-seen order.
+// Order newest-created first with deterministic ties, or retain first-seen order.
 // Activity and running/waiting transitions never affect a session's slot.
 export function stableSessionOrder(items, ranks, knownIds, createdAt = null) {
   for (const id of ranks.keys()) if (!knownIds.has(id)) ranks.delete(id);
   let next = Math.max(-1, ...ranks.values()) + 1;
   for (const item of items) if (!ranks.has(item.id)) ranks.set(item.id, next++);
   return [...items].sort((a, b) => createdAt
-    ? createdAt(a) - createdAt(b) || a.id.localeCompare(b.id)
+    ? createdAt(b) - createdAt(a) || a.id.localeCompare(b.id)
     : ranks.get(a.id) - ranks.get(b.id));
 }
