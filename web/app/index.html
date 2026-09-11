@@ -12,7 +12,7 @@
         const theme = localStorage.getItem('keep.console.theme');
         if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme;
         const savedPalette = localStorage.getItem('keep.console.palette');
-        if (['moss', 'harbor', 'plum', 'graphite', 'terracotta', 'midnight', 'solar'].includes(savedPalette)) palette = savedPalette;
+        if (['moss', 'harbor', 'plum', 'graphite', 'terracotta', 'midnight', 'evergreen', 'fog', 'hush', 'fjord', 'hearth', 'ink', 'sandstone', 'abyss', 'solar'].includes(savedPalette)) palette = savedPalette;
       } catch {}
       document.documentElement.dataset.palette = palette;
     })();
