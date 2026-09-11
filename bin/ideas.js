@@ -2,7 +2,7 @@
 
 // Daily fleet-wide ideas sweep: seven days of bounded, fenced evidence go to one
 // tool-free model call, and accepted proposals use review.js's existing landing
-// transaction (including its duplicate and daily-cap checks).
+// transaction (including duplicate checks).
 
 const fs = require('fs');
 const os = require('os');
@@ -50,8 +50,8 @@ The bar, in order:
 2. **Evidence you can point at**, the same as a finding. Name the cards and sessions.
 3. **A concrete change**: a Keep command or rule, a hook, a convention, a script — and
    what it would have prevented in the evidence you cite.
-4. **Rare.** At most one per tick and three per day; the command enforces the daily cap
-   and refuses a title you have already proposed. Most ticks produce none.
+4. **Rare.** Keep each review tick focused: at most one idea, and most ticks produce
+   none. The command refuses a title you have already proposed.
 
 Look for these especially: manual coordination of a shared resource (a deploy, a bake,
 a device, a branch); the same question asked of Owner or of you by different agents;

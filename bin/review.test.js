@@ -1030,16 +1030,16 @@ test('a failing review-idea cross-reference records neither the idea nor its ded
   });
 });
 
-test('a fourth review-idea in one day exits 5', () => {
-  withReviewIdeaRepo('keep-review-idea-limit-', ({ run }) => {
+test('review-idea accepts more than three distinct ideas in one day', () => {
+  withReviewIdeaRepo('keep-review-idea-no-limit-', ({ root, run }) => {
     const body = 'Pattern observed. Evidence: session. Proposed change: improve Keep.';
-    for (let i = 1; i <= 3; i += 1) {
+    for (let i = 1; i <= 4; i += 1) {
       const out = run(['review-idea', 'System idea ' + i, '-m', body]);
       assert.equal(out.status, 0, out.stderr);
     }
-    const fourth = run(['review-idea', 'System idea 4', '-m', body]);
-    assert.equal(fourth.status, 5);
-    assert.match(fourth.stderr, /limited to 3 per day/);
+    assert.equal(fs.readdirSync(path.join(root, 'tasks')).filter((file) => file.startsWith('reviewer-idea-system-idea-')).length, 4);
+    const meta = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'review', '_meta.json'), 'utf8'));
+    assert.equal(meta.days[new Date().toLocaleDateString('en-CA', { timeZone: 'Pacific/Honolulu' })].ideas, 4);
   });
 });
 

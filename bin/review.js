@@ -2230,12 +2230,6 @@ function reviewIdea(title, opts) {
       throw err;
     }
     const day = stamp.slice(0, 10);
-    const count = ((meta.days || {})[day] || {}).ideas || 0;
-    if (count >= 3) {
-      const err = new keep.KeepError('review ideas are limited to 3 per day');
-      err.exitCode = 5;
-      throw err;
-    }
 
     const digestFile = path.join(keep.ROOT, 'reviews', day + '.md');
     const snapshots = [
@@ -2288,8 +2282,8 @@ function reviewIdea(title, opts) {
   const result = options.withinLock ? land() : keep.withLock(land);
   // Preserve the synchronous landing API used by ticks and sweeps. Delivery is
   // best-effort, outside the filing rollback, and never uses the speakers.
-  // The separate caller exempts ideas from the reviewer finding budget; filing
-  // already limits ideas to three per day. Global attention limits still apply.
+  // The separate caller exempts ideas from the reviewer finding budget. Global
+  // attention limits still apply.
   const deliveryError = (error) => process.stderr.write(`keep review-idea: alert delivery failed: ${error?.message || error}\n`);
   try {
     const delivery = require('./alerts.js').sendAlert({

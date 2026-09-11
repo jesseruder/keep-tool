@@ -297,8 +297,8 @@ The bar, in order:
 2. **Evidence you can point at**, the same as a finding. Name the cards and sessions.
 3. **A concrete change**: a Keep command or rule, a hook, a convention, a script — and
    what it would have prevented in the evidence you cite.
-4. **Rare.** At most one per tick and three per day; the command enforces the daily cap
-   and refuses a title you have already proposed. Most ticks produce none.
+4. **Rare.** Keep each review tick focused: at most one idea, and most ticks produce
+   none. The command refuses a title you have already proposed.
 
 A daily Fable ideas sweep runs headless at 07:30 local time and lands ideas through the
 same command, so the tick reviewer should still propose an idea it sees but need not

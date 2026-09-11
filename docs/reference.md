@@ -302,7 +302,7 @@ until 13:00 Pacific, and displays the latest note and its source cards on the da
 `keep ideas` runs the fleet-wide workflow-improvement pass immediately. It gives a
 tool-free model seven days of fenced Keep evidence, avoids ideas already filed or
 already shipped, and lands at most three `kind: idea` cards through the reviewer's
-normal duplicate and daily-cap checks. `--dry` prints the evidence and prompt without
+normal duplicate checks. `--dry` prints the evidence and prompt without
 calling a model or writing state; `--model` overrides `KEEP_IDEAS_MODEL` (default
 `fable`). The daemon runs it every day at local `KEEP_IDEAS_AT` (default `07:30`) and
 retries failures every 30 minutes until noon.
@@ -525,10 +525,9 @@ the reviewer has cost against the weekly window.
 
 Systemic suggestions belong in `keep review-idea`, rather than on an individual card:
 it creates an active `idea` card tagged `reviewer-idea`, deduplicates normalized titles,
-limits the channel to three ideas per day, and can use `--cards a,b,c` to leave linked
-reviewer check-ins on the evidence cards. The message should name the observed pattern,
-cite the cards, sessions, or commits that demonstrate it, and propose the workflow or
-Keep change.
+and can use `--cards a,b,c` to leave linked reviewer check-ins on the evidence cards.
+The message should name the observed pattern, cite the cards, sessions, or commits that
+demonstrate it, and propose the workflow or Keep change.
 
 The model argument is passed to `claude --model` verbatim. Model aliases resolve
 according to your Claude installation and account access.
