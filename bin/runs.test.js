@@ -28,7 +28,8 @@ test('scheduled-task timer polls each minute and matches health cadence', () => 
 const {
   buildPrompt, headlessRunArgs, checkDeliveryMessage, planDueCard, deliveryWarning,
   cardFingerprint, finalizePayload, pendingCheckin, landFinalCheckin, NO_RESULT,
-  parseVerdict, probePayload, startProbe,
+  parseVerdict, probePayload, startProbe, probeDue, escalateProbeFailure,
+  isTransientStartError, MAX_CONCURRENT_PROBES, _resetSchedulerState,
 } = require('./runs.js');
 
 const card = (over = {}) => ({
@@ -582,4 +583,57 @@ test('the probe output tail is bounded', async () => {
   assert.equal(result.ok, true);
   assert.ok(result.output.length <= 500, `tail was ${result.output.length} chars`);
   assert.match(result.output, /line 400$/);
+});
+
+test('due probes are capped, and a card held back by the cap is retried unstamped', () => {
+  const task = probeCard();
+  assert.equal(MAX_CONCURRENT_PROBES, 3);
+  assert.equal(probeDue(task, Date.now(), MAX_CONCURRENT_PROBES - 1), true);
+  // After downtime every card is due in the same tick; the cap holds the rest back.
+  assert.equal(probeDue(task, Date.now(), MAX_CONCURRENT_PROBES), false);
+  assert.equal(probeDue(task, Date.now(), MAX_CONCURRENT_PROBES + 4), false);
+  // Nothing is recorded for a card the cap skipped, so the next tick may run it —
+  // unlike a card that really did probe, which waits out the repeat window.
+  assert.equal(probeDue(task, Date.now(), 0), true);
+});
+
+test('a transient start refusal is either cap: per-task or global', () => {
+  assert.equal(isTransientStartError(new Error('a run is already active for some-card')), true);
+  assert.equal(isTransientStartError(new Error('already 3 runs active')), true);
+  assert.equal(isTransientStartError(new Error('project dir ~/castle/ghost does not exist')), false);
+  assert.equal(isTransientStartError(new Error('claude binary not found (set KEEP_CLAUDE)')), false);
+});
+
+test('a per-task run collision does not burn the day escalation budget', () => {
+  _resetSchedulerState();
+  try {
+    const task = probeCard({ check: 'diagnose the recorder' });
+    const result = { ok: false, code: 3, ms: 120, output: '2 segments missing', timedOut: false };
+    const started = [];
+    const collide = () => { throw new Error(`a run is already active for ${task.id}`); };
+    const record = (...args) => { started.push(args); };
+
+    // The card's own earlier run is still finishing: transient, so tomorrow is not the
+    // next chance — this is what the 'runs active' substring test got wrong.
+    assert.match(String(escalateProbeFailure(task, result, { today: '2026-09-11', start: collide })), /already active/);
+    assert.equal(started.length, 0);
+
+    assert.equal(escalateProbeFailure(task, result, { today: '2026-09-11', start: record }), null);
+    assert.equal(started.length, 1, 'a later failed probe on the same day still escalates');
+    assert.equal(started[0][1], 'check');
+    assert.deepEqual(started[0][3].probe, result, 'the run is told what the probe saw');
+
+    // One headless attempt per card per day, once one actually started.
+    assert.equal(escalateProbeFailure(task, result, { today: '2026-09-11', start: record }), null);
+    assert.equal(started.length, 1);
+    assert.equal(escalateProbeFailure(task, result, { today: '2026-09-12', start: record }), null);
+    assert.equal(started.length, 2, 'tomorrow is a fresh attempt');
+
+    // A real failure is not transient: it costs the day.
+    _resetSchedulerState();
+    const broken = () => { throw new Error('project dir /gone does not exist'); };
+    assert.match(String(escalateProbeFailure(task, result, { today: '2026-09-11', start: broken })), /does not exist/);
+    assert.equal(escalateProbeFailure(task, result, { today: '2026-09-11', start: record }), null);
+    assert.equal(started.length, 2, 'no retry after a permanent failure until tomorrow');
+  } finally { _resetSchedulerState(); }
 });

@@ -527,6 +527,14 @@ function finalize(run, code) {
   onChange();
 }
 
+// startRun refuses for two transient reasons: a per-task collision ("a run is already
+// active for X") and the global cap ("already 3 runs active"). Both may have room on a
+// later tick, so neither may burn the card's one headless attempt per day. Matching
+// only "runs active" locked a card out until tomorrow on the per-task race.
+function isTransientStartError(e) {
+  return /already .*active/.test(String((e && e.message) || e));
+}
+
 function stopRun(taskId) {
   const run = active.get(taskId);
   if (!run) throw new keep.KeepError(`no active run for ${taskId}`);
@@ -702,6 +710,10 @@ function landDeliveryWarning(task, delivery) {
 
 const PROBE_REPEAT_MS = 10 * 60e3;
 const PROBE_OUTPUT_TAIL = 500;
+// Probes are cheap but not free, and after daemon downtime every card is due at once.
+// Cap them like runs: the rest are skipped unstamped and picked up on a later tick.
+const parsedMaxProbes = parseInt(process.env.KEEP_MAX_CONCURRENT_PROBES || '3', 10);
+const MAX_CONCURRENT_PROBES = Number.isFinite(parsedMaxProbes) && parsedMaxProbes > 0 ? parsedMaxProbes : 3;
 const probesInFlight = new Set(); // taskId
 const probedAt = new Map(); // taskId -> { checkAfter, at }
 
@@ -807,18 +819,16 @@ function landProbeResult(task, result) {
 // A failing probe on a card that also has a recipe is a question, not an answer: hand
 // the model what the probe saw and let the recipe say why. Probe cards never use thread
 // delivery — the point of a probe is that nobody has to be awake for it.
-function escalateProbeFailure(task, result, today = keep.nowStamp().slice(0, 10)) {
+function escalateProbeFailure(task, result, { today = keep.nowStamp().slice(0, 10), start = startRun } = {}) {
   if (autoAttempted.get(task.id) === today) return null;
   try {
     const threadGone = Boolean(task.fm.scheduled_by) || (Array.isArray(task.fm.sessions) && task.fm.sessions.length > 0);
-    startRun(task.id, 'check', undefined, { threadGone, probe: result });
+    start(task.id, 'check', undefined, { threadGone, probe: result });
     autoAttempted.set(task.id, today);
     process.stderr.write(`keep runs: probe failed for ${task.id} (exit ${result.code}); escalated to a headless check\n`);
     return null;
   } catch (e) {
-    // "runs active" is transient: the next tick may have room, so do not burn the
-    // one-attempt-per-day budget on it.
-    if (!String(e.message).includes('runs active')) autoAttempted.set(task.id, today);
+    if (!isTransientStartError(e)) autoAttempted.set(task.id, today);
     process.stderr.write(`keep runs: probe escalation for ${task.id} failed to start: ${e.message}\n`);
     return e;
   }
@@ -826,8 +836,10 @@ function escalateProbeFailure(task, result, today = keep.nowStamp().slice(0, 10)
 
 // A probe is skipped while one is in flight, and re-probed at most every ten minutes
 // for the same schedule: a landing failure or a "3 runs active" refusal must not turn
-// into a probe every sixty seconds.
-function probeDue(task, now = Date.now()) {
+// into a probe every sixty seconds. A card held back by the concurrency cap records
+// nothing, so the next tick retries it rather than waiting out the repeat window.
+function probeDue(task, now = Date.now(), inFlight = probesInFlight.size) {
+  if (inFlight >= MAX_CONCURRENT_PROBES) return false;
   if (probesInFlight.has(task.id)) return false;
   const last = probedAt.get(task.id);
   return !(last && last.checkAfter === (task.fm.check_after || '') && now - last.at < PROBE_REPEAT_MS);
@@ -967,8 +979,8 @@ async function schedulerTick() {
         autoAttempted.set(t.id, today);
         process.stderr.write(`keep runs: auto-started check for ${t.id}\n`);
       } catch (e) {
-        if (!String(e.message).includes('runs active')) autoAttempted.set(t.id, today);
-        if (!String(e.message).includes('runs active')) tickErrors.push(e);
+        if (!isTransientStartError(e)) autoAttempted.set(t.id, today);
+        if (!isTransientStartError(e)) tickErrors.push(e);
         process.stderr.write(`keep runs: auto-check ${t.id} failed to start: ${e.message}\n`);
       }
     }
@@ -983,6 +995,15 @@ async function schedulerTick() {
   }
 }
 
+// Test seam only: the per-day escalation budget and the probe bookkeeping are module
+// state, and a unit test has to start from a known one and leave none behind.
+function _resetSchedulerState() {
+  autoAttempted.clear();
+  deferrals.clear();
+  probesInFlight.clear();
+  probedAt.clear();
+}
+
 function startScheduler() {
   const iv = setInterval(schedulerTick, 60e3);
   iv.unref();
@@ -994,5 +1015,6 @@ module.exports = {
   buildPrompt, headlessRunArgs, checkDeliveryMessage, checkDeliveryKey, planDueCard, deliveryWarning,
   cardFingerprint, finalizePayload, pendingCheckin, landFinalCheckin, NO_RESULT,
   parseVerdict, verdictOutcome, onPassOutcome, probePayload, startProbe, startDueProbe, probeDue,
-  landProbeResult, escalateProbeFailure,
+  landProbeResult, escalateProbeFailure, isTransientStartError, MAX_CONCURRENT_PROBES,
+  _resetSchedulerState,
 };

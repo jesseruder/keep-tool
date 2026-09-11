@@ -1632,7 +1632,7 @@ test('a card can declare what a pass means and it round-trips through the frontm
     // --check-every alone says what the author meant: keep re-arming this check.
     assert.match(text, /^check_on_pass: rearm$/m);
     assert.match(text, /^check_every: \+7d$/m);
-    assert.match(text, /^probe: test -f \/tmp\/recorder\.ok$/m);
+    assert.match(text, /^probe: \|\n {2}test -f \/tmp\/recorder\.ok$/m);
     const { parseTask, serializeTask } = require('./keep.js');
     const parsed = parseTask(text, 'recorder-health');
     assert.equal(parsed.fm.check_on_pass, 'rearm');
@@ -1735,4 +1735,38 @@ test('help lists the on-pass, check-every and probe flags', () => {
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('a probe full of shell punctuation survives the frontmatter round-trip', () => {
+  const f = schedulerFixture();
+  const { parseTask, serializeTask } = require('./keep.js');
+  try {
+    // The bug this guards: `probe: [ -f /tmp/ready ]` parsed back as a LIST, so the
+    // daemon ran `-f /tmp/ready`. A leading quote was eaten the same way.
+    const cases = [
+      ['Bracket probe', 'bracket-probe', '[ -f /var/empty/ready ]'],
+      ['Quoted probe', 'quoted-probe', '"$HOME/bin/health" --strict'],
+    ];
+    for (const [title, id, probe] of cases) {
+      const added = f.run(['add', title, '--check-after', '+1h', '--probe', probe]);
+      assert.equal(added.status, 0, added.stderr);
+      const text = f.read(id);
+      assert.match(text, /^probe: \|$/m, `${id} stores a block scalar`);
+      const parsed = parseTask(text, id);
+      assert.equal(typeof parsed.fm.probe, 'string', `${id} reads back as a string`);
+      assert.equal(parsed.fm.probe, probe);
+      assert.equal(serializeTask(parsed), text);
+      assert.match(f.run(['show', id]).stdout, new RegExp(`^ {2}probe: ${probe.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
+    }
+    // End to end: a bracket probe only decides correctly if it reached the shell whole.
+    const marker = path.join(f.root, 'ready');
+    fs.writeFileSync(marker, '');
+    const green = f.run(['checkin', 'bracket-probe', '-m', 'Point it at a file that exists.',
+      '--probe', `[ -f ${marker} ]`]);
+    assert.equal(green.status, 0, green.stderr);
+    const passed = f.run(['probe', 'bracket-probe']);
+    assert.equal(passed.status, 0, `${passed.stdout}${passed.stderr}`);
+    fs.rmSync(marker);
+    assert.equal(f.run(['probe', 'bracket-probe']).status, 1, 'and fails once the file is gone');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });

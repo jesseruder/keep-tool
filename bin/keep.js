@@ -192,7 +192,13 @@ function serializeTask(task) {
   }
   scalar('check_on_pass');
   scalar('check_every');
-  scalar('probe');
+  // A block scalar like `check`, never an inline one: a probe is shell, and shell is
+  // full of YAML-ish punctuation. `probe: [ -f /tmp/ready ]` read back as a LIST, so
+  // the daemon would have run `-f /tmp/ready`.
+  if (fm.probe) {
+    out.push('probe: |');
+    for (const l of String(fm.probe).split('\n')) out.push(`  ${l}`);
+  }
   scalar('scheduled_by');
   scalar('scheduled_at');
   scalar('scheduled_for');
