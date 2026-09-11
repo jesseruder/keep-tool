@@ -1,6 +1,7 @@
 'use strict';
 
 const zlib = require('node:zlib');
+const crypto = require('node:crypto');
 
 const GZIP_MIN_BYTES = 1024;
 
@@ -35,12 +36,31 @@ function gzip(body, implementation = zlib.gzip) {
   });
 }
 
+function stateEtag(body) {
+  return `"${crypto.createHash('sha256').update(body).digest('base64url')}"`;
+}
+
+function etagMatches(value, etag) {
+  if (typeof value !== 'string') return false;
+  return value.split(',').some((candidate) => {
+    const tag = candidate.trim();
+    return tag === '*' || tag === etag || tag.replace(/^W\//, '') === etag;
+  });
+}
+
 async function sendStateJson(req, res, body, options = {}) {
+  const etag = options.etag || stateEtag(body);
   const headers = {
     'content-type': 'application/json',
     'cache-control': 'no-store',
     vary: 'Accept-Encoding',
+    etag,
   };
+  if (etagMatches(req.headers['if-none-match'], etag)) {
+    res.writeHead(304, headers);
+    res.end();
+    return;
+  }
   if (!acceptsGzip(req.headers['accept-encoding']) || Buffer.byteLength(body) < GZIP_MIN_BYTES) {
     res.writeHead(200, headers);
     res.end(body);
@@ -63,4 +83,4 @@ async function sendStateJson(req, res, body, options = {}) {
   res.end(compressed);
 }
 
-module.exports = { GZIP_MIN_BYTES, acceptsGzip, sendStateJson };
+module.exports = { GZIP_MIN_BYTES, acceptsGzip, etagMatches, sendStateJson, stateEtag };

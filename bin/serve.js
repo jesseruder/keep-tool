@@ -35,6 +35,7 @@ const stalled = require('./stalled.js');
 const keepConsole = require('./console.js');
 const sessionStatus = require('./session-status.js');
 const { sendStateJson } = require('./state-response.js');
+const { MOBILE_VIEWS, projectMobileState } = require('./mobile-state.js');
 
 const PORT = parseInt(process.env.KEEP_PORT || '7777', 10);
 const { PROJECTS_DIR, TAIL_BYTES, textOf, readTranscriptTail, findSessionFile } = transcripts;
@@ -5058,6 +5059,8 @@ function start(deps = {}) {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
         res.end(body);
       } else if (url.pathname === '/api/state') {
+        const mobileView = url.searchParams.get('view');
+        if (mobileView && !MOBILE_VIEWS.has(mobileView)) return json(res, 400, { error: `unknown mobile state view: ${mobileView}` });
         const panes = await listHostPanes(deps);
         await reviewQueue.reconcile({
           // Reconciliation may authorize a replacement launch after absence, so
@@ -5066,7 +5069,16 @@ function start(deps = {}) {
         });
         const state = buildState({ hostPanes: panes, dashboard: true });
         const enriched = await addHostSessionState(state, { ...deps, panes });
-        const body = JSON.stringify(wantsCompactState(req, url) ? compactState(enriched) : enriched);
+        let responseState;
+        try {
+          responseState = mobileView
+            ? projectMobileState(enriched, mobileView, url.searchParams.get('id') || '')
+            : wantsCompactState(req, url) ? compactState(enriched) : enriched;
+        } catch (error) {
+          if (error.status === 400) return json(res, 400, { error: error.message });
+          throw error;
+        }
+        const body = JSON.stringify(responseState);
         await sendStateJson(req, res, body);
       } else if (url.pathname === '/api/events') {
         res.writeHead(200, {

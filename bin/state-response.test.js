@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const http = require('node:http');
 const test = require('node:test');
 const zlib = require('node:zlib');
-const { sendStateJson } = require('./state-response.js');
+const { sendStateJson, stateEtag } = require('./state-response.js');
 
 const state = {
   sessions: Array.from({ length: 80 }, (_, index) => ({
@@ -48,10 +48,29 @@ test('/api/state helper negotiates gzip and preserves the exact JSON payload', a
     assert.equal(response.headers['content-encoding'], 'gzip');
     assert.equal(response.headers.vary, 'Accept-Encoding');
     assert.equal(response.headers['cache-control'], 'no-store');
+    assert.equal(response.headers.etag, stateEtag(body));
     const decoded = zlib.gunzipSync(response.body).toString('utf8');
     assert.equal(decoded, body);
     assert.deepEqual(JSON.parse(decoded), state);
   });
+});
+
+test('/api/state helper returns an empty 304 for the exact identity or weak conditional tag', async () => {
+  await withServer(async (port) => {
+    const etag = stateEtag(body);
+    for (const value of [etag, `W/${etag}`, `"other", ${etag}`]) {
+      const response = await request(port, { 'if-none-match': value, 'accept-encoding': 'gzip' });
+      assert.equal(response.status, 304);
+      assert.equal(response.headers.etag, etag);
+      assert.equal(response.headers['content-encoding'], undefined);
+      assert.equal(response.body.length, 0);
+    }
+  });
+});
+
+test('/api/state ETags are stable for identical projected content and change with content', () => {
+  assert.equal(stateEtag(body), stateEtag(body));
+  assert.notEqual(stateEtag(body), stateEtag(`${body} `));
 });
 
 test('/api/state helper uses identity when gzip is absent or explicitly refused', async () => {
