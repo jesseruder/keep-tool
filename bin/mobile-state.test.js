@@ -47,12 +47,14 @@ test('needs is a bounded allowlist with no done cards or detail bodies', () => {
 
 test('session returns only the selected session and its open task summary', () => {
   const source = fixture();
+  source.attention.push({ kind: 'permission', sessionId: 'other', pri: 0, since: 4 });
   const view = projectMobileState(source, 'session', 's');
   assert.deepEqual(view.sessions.map((session) => session.id), ['s']);
   assert.equal(view.sessions[0].lastAssistantFull.startsWith('full answer'), true);
   assert.equal(view.sessions[0].backgroundJobs, undefined);
   assert.deepEqual(view.tasks.map((task) => task.id), ['open']);
-  assert.deepEqual(view.attention, source.attention);
+  assert.deepEqual(view.attention, [source.attention[0]]);
+  assert.equal(view.needsCount, 2, 'shared chrome keeps the global queue count');
   assert.deepEqual(view.panes.map((pane) => pane.id), ['p']);
 });
 

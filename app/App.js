@@ -393,6 +393,8 @@ function KeepApp() {
   const pinned = useMemo(() => pinnedItems(data, layouts, allQueue), [allQueue, data, layouts]);
   const recent = useMemo(() => recentItems(data, allQueue, pinned), [allQueue, data, pinned]);
   const setAsideCount = allQueue.filter((item) => item.setAside).length;
+  const globalNeedsCount = data.view && data.view !== 'needs' && Number.isFinite(Number(data.needsCount))
+    ? Number(data.needsCount) : waiting.length;
 
   const selectedItem = useMemo(() => {
     if (!selection) return null;
@@ -408,6 +410,14 @@ function KeepApp() {
   const advance = useCallback((item) => {
     handledRef.current.add(snoozeId(item));
     setHandledVersion((value) => value + 1);
+    // A detail response deliberately contains only one actionable item. Return to
+    // the fresh overview after acting instead of advancing through a stale cached queue.
+    if (data.view === 'session') {
+      setSelection(null);
+      setMode('needs');
+      AsyncStorage.setItem(MODE_KEY, 'needs').catch(() => {});
+      return;
+    }
     const currentIndex = waiting.findIndex((candidate) => snoozeId(candidate) === snoozeId(item));
     const remaining = waiting.filter((candidate) => snoozeId(candidate) !== snoozeId(item));
     const next = remaining[currentIndex] || remaining[0] || null;
@@ -415,7 +425,7 @@ function KeepApp() {
     setMode('needs');
     AsyncStorage.setItem(MODE_KEY, 'needs').catch(() => {});
     refreshState();
-  }, [refreshState, waiting]);
+  }, [data.view, refreshState, waiting]);
 
   const sendReply = useCallback(async (item, text) => {
     await api.send(config, { sessionId: item.sessionId }, text);
@@ -641,7 +651,7 @@ function KeepApp() {
       <SegmentedBar
         daemonHealthy={daemon.healthy}
         mode={mode}
-        needsCount={waiting.length}
+        needsCount={globalNeedsCount}
         onNew={() => setRoute({ name: 'new' })}
         onSelect={selectMode}
         onSettings={() => setShowSetup(true)}

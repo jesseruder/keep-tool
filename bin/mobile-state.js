@@ -1,6 +1,7 @@
 'use strict';
 
 const MOBILE_VIEWS = new Set(['needs', 'fleet', 'reviewer', 'session', 'task', 'new', 'notifications', 'terminal']);
+const HUMAN_ATTENTION_KINDS = new Set(['question', 'permission', 'plan', 'input']);
 
 function pick(source, fields) {
   const out = {};
@@ -80,6 +81,7 @@ function shared(state, view) {
     },
     usage: state.usage || {},
     paneCount: (state.panes || []).length,
+    needsCount: (state.attention || []).filter((item) => item.sessionId && HUMAN_ATTENTION_KINDS.has(item.kind) && !item.setAside).length,
     review: { stats: pick(stats, ['lastTickAt', 'reviewer']) },
   };
 }
@@ -207,6 +209,7 @@ function projectMobileState(state, view, id) {
 
 module.exports = {
   MOBILE_VIEWS,
+  HUMAN_ATTENTION_KINDS,
   projectMobileState,
   taskSummary,
   taskPickerSummary,
