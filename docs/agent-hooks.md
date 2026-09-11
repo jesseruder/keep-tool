@@ -44,3 +44,12 @@ The optional `bin/keep-codex-cli /path/to/codex [args...]` wrapper acknowledges
 completion when an interactive client returns to the shell. It does not replace
 start/tool/attention hooks. The version-specific broker patch under `patches/` is
 optional and never applied by installation.
+
+Inside a Keep terminal (`KEEP_PANE` is set), the wrapper defaults Codex to
+`tui.animations=false` and `tui.whimsy=false`. Composer sparkles can overwrite
+the screen cells Keep uses to verify a typed reminder, leaving it unsubmitted.
+These launch overrides preserve the exact-draft and transcript-receipt safeguards
+and do not edit the user's Codex configuration. They apply on the next launch or
+resume; already-running clients retain their settings. Explicit later `-c`
+arguments can override these defaults. Direct Codex launches that bypass this
+wrapper need the same overrides to prevent animation interference.

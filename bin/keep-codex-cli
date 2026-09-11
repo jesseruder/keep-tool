@@ -10,6 +10,13 @@ fi
 
 keep_codex_executable=$1
 shift
+# Keep verifies automated input against the rendered draft. Codex's composer
+# sparkles overwrite screen cells, making that verification fail even when the
+# input is intact. Disable decorative effects in hosted clients only; keep the
+# exact-draft and transcript-receipt checks intact.
+if [ -n "${KEEP_PANE:-}" ]; then
+  set -- -c tui.animations=false -c tui.whimsy=false "$@"
+fi
 keep_codex_token=$(/usr/bin/uuidgen 2>/dev/null | /usr/bin/tr '[:upper:]' '[:lower:]')
 if [ -z "$keep_codex_token" ]; then
   keep_codex_token="$$-$(/bin/date +%s)"
