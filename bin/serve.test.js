@@ -3510,6 +3510,8 @@ test('a compaction locks only its own pane: other panes take sends, its pane and
     const deps = paneLockSendDeps(typed);
     assert.deepEqual(await sendToSessionLocked({ sessionId: 'sess-b', text: 'to b' }, deps), { ok: true, pane: 'pane-b' });
     await assert.rejects(sendToSessionLocked({ sessionId: 'sess-a', text: 'to a' }, deps), injectionBusy429);
+    // A typed /model rewrites settings.json, which the compaction will restore, so it waits.
+    await assert.rejects(sendToSessionLocked({ sessionId: 'sess-b', text: ' /model opus' }, deps), injectionBusy429);
     // Compactions share settings.json and the in-flight swap, so they still run one at a time.
     await assert.rejects(compactSession({ id: 'sess-b', kind: 'claude' }, { pane: 'pane-b' }, null,
       compactDeps(() => assert.fail('a second compaction must not type'))), injectionBusy429);

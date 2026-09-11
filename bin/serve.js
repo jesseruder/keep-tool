@@ -3135,12 +3135,18 @@ async function sendToSession(body, targetHint, opts, deps = {}) {
   return (deps.sendToResolvedTarget || sendToResolvedTarget)(session, target, text, opts, deps);
 }
 
+// A typed /model rewrites settings.json, which a running compaction restores
+// unconditionally, so such a send also needs the model key.
+function modelCommandText(text) {
+  return /^\s*\/model(?:\s|$)/.test(String(text ?? ''));
+}
+
 // /api/send: lock the addressed session (and its selected pane, if any); sendToSession
 // claims the resolved pane before the precheck, so sends to other panes proceed.
 function sendToSessionLocked(body, deps = {}) {
   const request = body && typeof body === 'object' ? body : {};
   return withInjectionLock(() => sendToSession(request, undefined, undefined, deps),
-    { session: request.sessionId, pane: request.pane });
+    { session: request.sessionId, pane: request.pane, model: modelCommandText(request.text) });
 }
 
 // Resume a session that stalled on a usage limit. The scheduler decided this a
@@ -3524,7 +3530,7 @@ async function openSession(body, deps = {}) {
           result.sent = true;
         }
         return result;
-      }, { pane: target.pane, session: session.id });
+      }, { pane: target.pane, session: session.id, model: modelCommandText(message) });
     }
   }
 
@@ -3556,7 +3562,8 @@ async function openSession(body, deps = {}) {
         throw new InjectionError(409, 'opening-message reservation changed before instructions were sent');
       }
       await withInjectionLockRetry(
-        () => (deps.typeOpeningMessage || typeOpeningMessage)(target, agent, message, deps), deps, { pane: target.pane },
+        () => (deps.typeOpeningMessage || typeOpeningMessage)(target, agent, message, deps), deps,
+        { pane: target.pane, model: modelCommandText(message) },
       );
       launch.sent = true;
       if (deps.onOpeningDelivered && await deps.onOpeningDelivered(launch) === false) {
