@@ -719,6 +719,12 @@ test('open CLI posts card or session identity and formats one-line results', asy
   assert.equal(formatOpenResult({ created: 'pane', pane: 'pane-1', command: 'claude', sessionId: 'new', linked: true }), 'opened pane pane-1: claude as new; card now owned by new');
   assert.equal(formatOpenResult({ existing: true, pane: 'pane-1', sessionId: 'sid', sent: true }), 'session sid is running in pane pane-1; open it in the console (message sent)');
   await assert.rejects(openCommand(['card', '-m', '  '], deps), /-m needs a message/);
+  deps.currentSession = () => ({ id: 'me', agent: 'claude' });
+  await openCommand(['card', '--fresh', '--model', 'claude-fable-5-1'], deps);
+  assert.deepEqual(calls.at(-1).body, { taskId: 'card', fresh: true, agent: undefined, model: 'claude-fable-5-1', requester: 'me' });
+  await openCommand(['card', '--fresh', '--agent', 'codex', '--model', 'gpt-5.6-sol'], deps);
+  assert.equal(calls.at(-1).body.model, 'gpt-5.6-sol');
+  await assert.rejects(openCommand(['card', '--model', 'opus; rm -rf /'], deps), /--model must be a model id/);
 });
 
 test('restore --dry prints a fake daemon plan without opening sessions', async () => {

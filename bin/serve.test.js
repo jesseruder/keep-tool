@@ -3743,3 +3743,77 @@ test('screen history refuses an old host before requesting an oversized snapshot
     paneIncarnation: async () => 'pane-shell:7:created', host,
   }), (error) => error.status === 503 && /host reload required/.test(error.message));
 });
+
+test('open --model rides the launched command line and the pane meta, never settings.json', async () => {
+  const project = os.tmpdir();
+  const claudeHost = recordingHost((type) => type === 'spawn' ? { pane: { id: 'pane-claude-model' } } : {});
+  const claude = await openSession({ taskId: 'card', fresh: true, agent: 'claude', model: 'claude-fable-5-1' }, {
+    host: claudeHost,
+    randomUUID: () => '44444444-4444-4444-8444-444444444444',
+    loadTask: () => ({ fm: { project, sessions: [] } }),
+    waitForHostAgent: async () => true,
+    linkLaunchedSession: () => true,
+  });
+  assert.equal(claude.command, 'claude --dangerously-skip-permissions --model claude-fable-5-1 --session-id 44444444-4444-4444-8444-444444444444');
+  const claudeSpawn = claudeHost.calls.find((call) => call.type === 'spawn').params;
+  assert.equal(claudeSpawn.meta.model, 'claude-fable-5-1');
+  assert.equal(claudeSpawn.meta.agent, 'claude');
+  assert.equal(claudeSpawn.meta.sessionId, '44444444-4444-4444-8444-444444444444');
+
+  const codexHost = recordingHost((type) => type === 'spawn' ? { pane: { id: 'pane-codex-model' } } : {});
+  const codex = await openSession({ taskId: 'card', fresh: true, agent: 'codex', model: 'gpt-5.6-sol' }, {
+    host: codexHost,
+    loadTask: () => ({ fm: { project, sessions: [] } }),
+    waitForHostAgent: async () => true,
+    waitForHostSessionId: async () => 'codex-model-session',
+    linkLaunchedSession: () => true,
+  });
+  assert.equal(codex.command, 'codex --dangerously-bypass-approvals-and-sandbox -m gpt-5.6-sol');
+  assert.equal(codexHost.calls.find((call) => call.type === 'spawn').params.meta.model, 'gpt-5.6-sol');
+
+  const plainHost = recordingHost((type) => type === 'spawn' ? { pane: { id: 'pane-plain' } } : {});
+  await openSession({ taskId: 'card', fresh: true, agent: 'codex' }, {
+    host: plainHost,
+    loadTask: () => ({ fm: { project, sessions: [] } }),
+    waitForHostAgent: async () => true,
+    waitForHostSessionId: async () => 'codex-plain',
+    linkLaunchedSession: () => true,
+  });
+  assert.equal('model' in plainHost.calls.find((call) => call.type === 'spawn').params.meta, false, 'no flag, no meta');
+
+  await assert.rejects(openSession({ taskId: 'card', fresh: true, model: 'opus; rm -rf /' }, {
+    loadTask: () => ({ fm: { project, sessions: [] } }),
+  }), (error) => error.status === 400 && /model must be a model id/.test(error.message));
+});
+
+test('compact session restores the pane launch model rather than the transcript model', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-launch-model-test-'));
+  const dir = path.join(root, 'compact');
+  const transcript = path.join(root, 'transcript.jsonl');
+  const session = { id: 'launched-with-model', kind: 'claude' };
+  const calls = [];
+  const priorTimeout = process.env.KEEP_COMPACT_TIMEOUT_MS;
+  process.env.KEEP_COMPACT_TIMEOUT_MS = '0';
+  fs.writeFileSync(transcript, '{}\n');
+  try {
+    const result = await compactSession(session, { pane: 'pane:model' }, null, {
+      dir,
+      // The transcript's last turn already says Opus (an earlier swap, say); the pane
+      // meta from `keep open --model` is what the session was actually launched as.
+      sessionLastTurn: () => ({ model: 'claude-opus-5' }),
+      hostPaneModel: async (target) => (target.pane === 'pane:model' ? 'claude-fable-5-1' : ''),
+      readClaudeSettingsModel: () => ({ ok: true, present: true, value: 'claude-sonnet-5' }),
+      transcriptFileForSession: () => transcript,
+      readScreen: async () => '❯',
+      typeAndSubmit: async (_target, command) => { calls.push(command); },
+      waitForModelSwitch: async () => true,
+      repairClaudeSettingsModel: () => ({ changed: false }),
+    });
+    assert.equal(result.reason, 'timeout');
+    assert.deepEqual(calls, ['/model opus', '/compact', '/model claude-fable-5-1']);
+  } finally {
+    if (priorTimeout === undefined) delete process.env.KEEP_COMPACT_TIMEOUT_MS;
+    else process.env.KEEP_COMPACT_TIMEOUT_MS = priorTimeout;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -24,6 +24,9 @@ const HOLDS_DIR = path.join(META, 'holds');
 
 const STATUSES = ['inbox', 'active', 'waiting', 'blocked', 'landing', 'review', 'deferred', 'done'];
 const OPEN_MESSAGE_LIMIT = 2000;
+// A model id as claude --model / codex -m accept it: claude-fable-5-1, opus, gpt-5.6-sol,
+// claude-fable-5-1[1m]. Bounded so it can go straight onto a command line.
+const LAUNCH_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,79}$/;
 const OPEN_MESSAGE_ERROR = 'agent messages are limited to 2000 characters';
 const KINDS = ['task', 'experiment', 'idea', 'chore', 'bug'];
 const STATUS_ORDER = ['active', 'review', 'blocked', 'waiting', 'landing', 'inbox', 'deferred', 'done'];
@@ -3705,10 +3708,13 @@ function writeOpenHandoff(id, message, task) {
 }
 
 commands.open = async (argv, deps = {}) => {
-  const o = parseArgs(argv, { fresh: 'bool', agent: 'str', 'message-file': 'str' });
+  const o = parseArgs(argv, { fresh: 'bool', agent: 'str', model: 'str', 'message-file': 'str' });
   const id = o._[0];
-  if (!id) die('usage: keep open <card-id|session-id> [--fresh] [--agent claude|codex] [-m "opening message" | --message-file <path>]');
+  if (!id) die('usage: keep open <card-id|session-id> [--fresh] [--agent claude|codex] [--model <id>] [-m "opening message" | --message-file <path>]');
   if (o.agent && !['claude', 'codex'].includes(o.agent)) die('agent must be claude or codex');
+  // --model goes on the launched command line only (claude --model / codex -m), so it
+  // applies to that process and never touches ~/.claude/settings.json.
+  if (o.model != null && !LAUNCH_MODEL_RE.test(o.model)) die('--model must be a model id like claude-fable-5-1 or gpt-5.6-sol');
   if (o.m != null && o['message-file'] != null) die('use either -m or --message-file, not both');
   let message = o.m;
   if (o['message-file'] != null) {
@@ -3723,6 +3729,7 @@ commands.open = async (argv, deps = {}) => {
   }
   try {
     const payload = { ...(task ? { taskId: id } : { sessionId: id }), fresh: Boolean(o.fresh), agent: o.agent };
+    if (o.model != null) payload.model = o.model;
     if (message != null) payload.message = message;
     // The launching session hands the card over; the daemon unlinks it once the new session is on the card.
     const self = (deps.currentSession || currentSession)();
@@ -5475,7 +5482,8 @@ commands['review-stats'] = async (argv) => {
   if (stats.transcript) {
     const t = stats.transcript;
     const fmtTokens = (value) => value == null ? 'n/a' : value >= 1e6 ? (value / 1e6).toFixed(1) + 'M' : value >= 1e3 ? Math.round(value / 1e3) + 'k' : String(value);
-    console.log(`session today   : ${t.assistantMessages} assistant messages / ${t.ticks} ticks (${t.assistantMessagesPerTick == null ? 'n/a' : t.assistantMessagesPerTick.toFixed(1)} msgs/tick)`);
+    console.log(`session today   : ${t.assistantMessages} assistant messages / ${t.ticks} ticks (${t.assistantMessagesPerTick == null ? 'n/a' : t.assistantMessagesPerTick.toFixed(1)} msgs/tick, target ${t.targetMessagesPerTick || 3})`);
+    if (t.lastTickAssistantMessages != null) console.log(`last tick cost  : ${t.lastTickAssistantMessages} msgs (target ${t.targetMessagesPerTick || 3})`);
     console.log(`context/message : median ${fmtTokens(t.medianContextTokens)}, p90 ${fmtTokens(t.p90ContextTokens)} (input + cache creation/read)`);
     console.log(`compactions     : ${t.compactionsToday} today`);
   }
@@ -5619,6 +5627,7 @@ function renderPaneDetails(pane) {
     `title: ${pane.title || ''}`,
     `agent: ${pane.meta && pane.meta.agent || ''}`,
     `sessionId: ${pane.meta && pane.meta.sessionId || ''}`,
+    `model: ${pane.meta && pane.meta.model || ''}`,
     `cwd: ${pane.cwd || ''}`,
     `command: ${[pane.cmd, ...(pane.args || [])].join(' ')}`,
     `meta: ${JSON.stringify(pane.meta || {})}`,
@@ -6063,7 +6072,8 @@ ${stepUsage()}
   keep slack mode log|cards|alerts
   keep verify <id>     # run this task's check recipe now (needs keep serve)
   keep compact <sid>   # compact a live Claude or Codex session (needs keep serve)
-  keep open <card-id|session-id> [--fresh] [--agent claude|codex] [-m "opening message" | --message-file <path>]
+  keep open <card-id|session-id> [--fresh] [--agent claude|codex] [--model <id>] [-m "opening message" | --message-file <path>]
+                         # --model applies to the launched process only (never settings.json);
                          # -m waits for the agent's prompt and types the message;
                          # --fresh on a card links the new session and unlinks the caller's
   keep pane ls [--json] | show <pane> [--json]
@@ -6160,7 +6170,7 @@ module.exports = {
   taskForSession, deployCommand, deployEntry, recordDeploy, redactCommand,
   stepMatchForInput, guardStepCommand, recordStepRun, codexToolInput, codexExitCode,
   codexJobText, renderCodexJobs,
-  commandUsage, helpText, formatOpenResult, openCommand: commands.open, postOpen, OPEN_MESSAGE_LIMIT, OPEN_MESSAGE_ERROR,
+  commandUsage, helpText, formatOpenResult, openCommand: commands.open, postOpen, OPEN_MESSAGE_LIMIT, OPEN_MESSAGE_ERROR, LAUNCH_MODEL_RE,
   restoreCommandCli: commands.restore, resumeCommandCli: commands.resume,
   hostCommandCli: commands.host, paneCommandCli: commands.pane, attachCommandCli: commands.attach,
   resolveHostPane, renderHostPanes, parseHostSpawn,

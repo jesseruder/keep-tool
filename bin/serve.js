@@ -1829,6 +1829,18 @@ async function sweepPendingCompactSwaps(deps = {}) {
   }
 }
 
+// The model recorded on a host pane's meta by `keep open --model`, or '' when the pane
+// was launched without one (or is not a host pane at all).
+async function hostPaneModel(target, deps = {}) {
+  const id = target && target.pane;
+  if (!id) return '';
+  let panes = [];
+  try { panes = await listHostPanes(deps) || []; } catch { return ''; }
+  const pane = panes.find((candidate) => candidate && candidate.id === id);
+  const model = pane && pane.meta && pane.meta.model;
+  return typeof model === 'string' && keep.LAUNCH_MODEL_RE.test(model) ? model : '';
+}
+
 // The whole compaction, model restore included, holds its pane (so no send lands
 // mid-compaction or on the swapped model) and the model key (inFlightSwap and
 // settings.json are shared, so compactions still run one at a time). It does
@@ -1880,7 +1892,10 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
       settingsPresent = records[0].settingsModelPresent;
       process.stderr.write(`keep serve: using the pre-swap settings.json model from pending restore record ${String(records[0].sessionId || 'unknown').slice(0, 8)}\n`);
     }
-    swap = compactSwapPlan({ ...session, model: lastTurn.model }, {
+    // A pane launched with `keep open --model` knows its model exactly; the transcript's
+    // last-turn model is the fallback for sessions launched any other way.
+    const launchModel = await (deps.hostPaneModel || hostPaneModel)(target, deps);
+    swap = compactSwapPlan({ ...session, model: launchModel || lastTurn.model }, {
       via: configuredVia,
       families: compactModelFamilies(),
       settingsModel,
@@ -3450,6 +3465,11 @@ async function openSession(body, deps = {}) {
   body = body && typeof body === 'object' ? body : {};
   if (body.agent != null && !['claude', 'codex'].includes(body.agent)) throw new InjectionError(400, 'agent must be claude or codex');
   if (body.command != null) throw new InjectionError(400, 'command is not accepted');
+  if (body.model != null && (typeof body.model !== 'string' || !keep.LAUNCH_MODEL_RE.test(body.model))) {
+    throw new InjectionError(400, 'model must be a model id like claude-fable-5-1 or gpt-5.6-sol');
+  }
+  // The model rides the launched command line only; it never writes settings.json.
+  const launchModel = body.model || '';
   if (body.message != null && String(body.message).length > keep.OPEN_MESSAGE_LIMIT) {
     throw new InjectionError(400, keep.OPEN_MESSAGE_ERROR);
   }
@@ -3523,8 +3543,8 @@ async function openSession(body, deps = {}) {
   const launchHost = async () => {
     const sessionId = session ? session.id : agent === 'claude' ? (deps.randomUUID || crypto.randomUUID)() : null;
     const argv = agent === 'codex'
-      ? ['codex', ...codexFlagArgs, ...(sessionId ? ['resume', sessionId] : [])]
-      : ['claude', ...claudeFlagArgs,
+      ? ['codex', ...codexFlagArgs, ...(launchModel ? ['-m', launchModel] : []), ...(sessionId ? ['resume', sessionId] : [])]
+      : ['claude', ...claudeFlagArgs, ...(launchModel ? ['--model', launchModel] : []),
         ...(sessionId ? [session ? '--resume' : '--session-id', sessionId] : [])];
     const command = argv.join(' ');
     const spawned = await hostRequest('spawn', {
@@ -3536,6 +3556,9 @@ async function openSession(body, deps = {}) {
       meta: {
         agent,
         sessionId,
+        // Recorded so the console and the compaction restore read the launch model
+        // from the pane instead of inferring it from the transcript.
+        ...(launchModel ? { model: launchModel } : {}),
         project,
         card: body.taskId || null,
         requester: body.requester || null,
@@ -4508,6 +4531,9 @@ async function addHostSessionState(state, deps = {}) {
   for (const session of state.sessions || []) {
     const pane = bySession.get(session.id);
     session.pane = pane ? pane.id : null;
+    // The launch model from `keep open --model`, when the pane carries one.
+    const launchModel = pane && pane.meta && pane.meta.model;
+    if (typeof launchModel === 'string' && launchModel) session.launchModel = launchModel;
   }
   const sessionPanes = new Map((state.sessions || []).map((session) => [session.id, session.pane || null]));
   for (const item of state.attention || []) item.pane = item.sessionId ? sessionPanes.get(item.sessionId) || null : null;
