@@ -1523,6 +1523,13 @@ function linesAfterLastEcho(screen, command) {
   return echoIndex === -1 ? [] : lines.slice(echoIndex + 1);
 }
 
+function compactScreenConfirmed(screen, command) {
+  const after = linesAfterLastEcho(screen, command).join('\n');
+  return /(?:Compacted|Conversation compacted|Conversation recap|Not enough messages to compact)/i.test(after)
+    && Boolean(promptLine(screen))
+    && !/esc to (?:interrupt|cancel)|Compacting[.…]/i.test(screen);
+}
+
 function modelSwitchConfirmed(screen, command) {
   const argument = String(command || '').replace(/^\s*\/model\s+/i, '');
   const family = ['opus', 'sonnet', 'haiku', 'fable']
@@ -1763,11 +1770,12 @@ async function sweepPendingCompactSwaps(deps = {}) {
           const target = claimInjectionTarget(await resolve(current, null, deps));
           if (current.localCommandPending) {
             const screen = await read(target, 30, false);
-            const after = linesAfterLastEcho(screen, current.localCommandPending).join('\n');
             const complete = /^\/compact(?:\s|$)/.test(current.localCommandPending)
-              ? /(?:Compacted|Conversation compacted|Conversation recap|Not enough messages to compact)/i.test(after)
-              : /(?:Set model to|Switched to) /i.test(after);
-            if (!complete || !promptLine(screen) || /esc to (?:interrupt|cancel)|Compacting[.…]/i.test(screen)) return null;
+              ? compactScreenConfirmed(screen, current.localCommandPending)
+              : modelSwitchConfirmed(screen, current.localCommandPending)
+                && Boolean(promptLine(screen))
+                && !/esc to (?:interrupt|cancel)/i.test(screen);
+            if (!complete) return null;
           }
           await precheck(current, target, deps);
           // typeAndSubmit confirms the typed command, but does not check the
@@ -1905,6 +1913,7 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
   }
   let result;
   let compactDiagnostic;
+  let compactWatch;
   inFlightSwap = swap ? { ...swap, switchModel: via } : null;
   try {
     const file = (deps.transcriptFileForSession || transcriptFileForSession)(session);
@@ -1930,7 +1939,8 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
       const started = Date.now();
       const initialStat = fs.statSync(file);
       let offset = initialStat.size;
-      compactDiagnostic = require('./compact-trace').compactTrace(session);
+      compactWatch = { file, offset, appended: '' };
+      compactDiagnostic = (deps.compactTrace || require('./compact-trace').compactTrace)(session);
       compactDiagnostic.start(initialStat, offset);
       const confirmation = session.kind === 'codex' ? codexTypedTextVisible : claudeTypedTextVisible;
       await (deps.typeAndSubmit || typeAndSubmit)(target, compactCommand(instruction), confirmation, deps);
@@ -1940,11 +1950,14 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
       let appended = '';
       while (Date.now() - started < timeoutMs) {
         const remaining = timeoutMs - (Date.now() - started);
-        await new Promise((resolve) => setTimeout(resolve, Math.min(2000, Math.max(0, remaining))));
+        await new Promise((resolve) => setTimeout(resolve, Math.min(deps.compactPollMs ?? 2000, Math.max(0, remaining))));
         // A too-short thread is refused on screen and never writes a marker; stop
         // instead of waiting out the timeout (seen live: "Not enough messages to compact.").
-        let refusal = '';
-        try { refusal = compactRefusal(await readScreen(target, 30, false, deps)); } catch { compactDiagnostic.screenError(); }
+        let screen = '';
+        try {
+          screen = await (deps.readScreen || ((t, lines, scrollback) => readScreen(t, lines, scrollback, deps)))(target, 30, false);
+        } catch { compactDiagnostic.screenError(); }
+        const refusal = compactRefusal(screen);
         if (refusal) {
           process.stderr.write(`keep serve: compaction refused for ${session.kind} session ${sid}: ${refusal}\n`);
           result = { compacted: false, reason: refusal, via };
@@ -1952,12 +1965,20 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
         }
         const chunk = appendedBytes(file, offset);
         offset = chunk.offset;
+        compactWatch.offset = offset;
         compactDiagnostic.poll(chunk.stat, offset, chunk.bytesRead);
         appended = `${appended}${chunk.text}`;
+        compactWatch.appended = appended;
         if (hasCompactionMarker(appended, session.kind)) {
           const ms = Date.now() - started;
           process.stderr.write(`keep serve: compacted ${session.kind} session ${sid} in ${ms}ms\n`);
           result = { compacted: true, ms, via };
+          break;
+        }
+        if (session.kind === 'claude' && compactScreenConfirmed(screen, compactCommand(instruction))) {
+          const ms = Date.now() - started;
+          process.stderr.write(`keep serve: compacted ${session.kind} session ${sid} in ${ms}ms (screen)\n`);
+          result = { compacted: true, ms, via, confirmedBy: 'screen' };
           break;
         }
         // Markers are single records; retaining a small suffix also covers a split read.
@@ -1974,7 +1995,7 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
     process.stderr.write(`keep serve: compaction failed for ${session && session.kind || 'unknown'} session ${sid}: ${reason}\n`);
     result = { compacted: false, reason, via };
   } finally {
-    compactDiagnostic?.finish(result?.compacted ? 'marker-confirmed' : result?.reason === 'timeout' ? 'timeout' : 'failed');
+    let restoreConfirmed = !swap;
     if (swap && pendingSwapFile) {
       let restored = false;
       try {
@@ -1997,6 +2018,7 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
         process.stderr.write(`keep serve: could not restore settings.json model after compaction of ${sid}: ${repaired.error}\n`);
       }
       if (restored) {
+        restoreConfirmed = true;
         try { fs.unlinkSync(pendingSwapFile); } catch (e) {
           process.stderr.write(`keep serve: could not clear model restore record for claude session ${sid}: ${e.message}\n`);
         }
@@ -2006,6 +2028,27 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
         result.restoreUnconfirmed = true;
       }
     }
+    let diagnosticStage = result?.reason === 'timeout' ? 'timeout' : 'failed';
+    if (result?.compacted && result.confirmedBy !== 'screen') diagnosticStage = 'marker-confirmed';
+    if (result?.compacted && result.confirmedBy === 'screen') {
+      diagnosticStage = 'screen-confirmed-no-marker';
+      if (restoreConfirmed && compactWatch) {
+        const deadline = Date.now() + (deps.compactMarkerGraceMs ?? 10000);
+        do {
+          const chunk = appendedBytes(compactWatch.file, compactWatch.offset);
+          compactWatch.offset = chunk.offset;
+          compactWatch.appended = `${compactWatch.appended}${chunk.text}`;
+          compactDiagnostic?.poll(chunk.stat, chunk.offset, chunk.bytesRead);
+          if (hasCompactionMarker(compactWatch.appended, session.kind)) {
+            diagnosticStage = 'screen-confirmed';
+            break;
+          }
+          if (Date.now() >= deadline) break;
+          await new Promise((resolve) => setTimeout(resolve, Math.min(500, deadline - Date.now())));
+        } while (true);
+      }
+    }
+    compactDiagnostic?.finish(diagnosticStage);
     inFlightSwap = null;
   }
   return result;
@@ -5547,6 +5590,7 @@ module.exports = {
   shutdownSettingsRepair,
   readClaudeSettingsModel,
   linesAfterLastEcho,
+  compactScreenConfirmed,
   modelSwitchConfirmed,
   modelSwitchDialogVisible,
   repairClaudeSettingsModel,

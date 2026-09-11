@@ -33,6 +33,7 @@ const {
   ensureCompactionRestored,
   afterCompactAction,
   linesAfterLastEcho,
+  compactScreenConfirmed,
   modelSwitchConfirmed,
   modelSwitchDialogVisible,
   pendingCompactSwaps,
@@ -135,6 +136,13 @@ function compactRestoreDeps(dir, session, calls = [], settingsFile) {
     readClaudeSettingsModel: () => ({ ok: true, present: true, value: 'claude-sonnet-5' }),
     repairClaudeSettingsModel: () => ({ changed: false }),
   };
+}
+
+function compactTraceSpy(stages) {
+  return () => ({
+    start() {}, submitted() {}, screenError() {}, poll() {},
+    finish(stage) { stages.push(stage); },
+  });
 }
 
 test('classifyPromptLine distinguishes empty, suggestion, and draft prompts', () => {
@@ -2187,6 +2195,112 @@ test('a refused compaction is recognised from the screen instead of waiting out 
   assert.equal(compactRefusal('❯ /compact\n  ⎿  Not enough messages to compact.\n\n❯ '), 'Not enough messages to compact.');
   assert.equal(compactRefusal('❯ /compact\n  ⎿  Compacted (ctrl+o to see full summary)'), '');
   assert.equal(compactRefusal(''), '');
+});
+
+test('compact screen confirmation is anchored after the command echo and requires the returned prompt', () => {
+  assert.equal(compactScreenConfirmed('❯ /compact\n  ⎿  Compacted (ctrl+o to see full summary)\n\n❯ ', '/compact'), true);
+  assert.equal(compactScreenConfirmed('❯ /compact\n  ⎿  Compacting… (esc to interrupt)', '/compact'), false);
+  assert.equal(compactScreenConfirmed('Compacted\n❯ /compact\n❯ ', '/compact'), false);
+});
+
+test('compact session accepts screen completion without transcript growth and restores the model', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-screen-test-'));
+  const transcript = path.join(root, 'transcript.jsonl');
+  const session = { id: 'screen-finish', kind: 'claude' };
+  const calls = [];
+  const stages = [];
+  const priorTimeout = process.env.KEEP_COMPACT_TIMEOUT_MS;
+  process.env.KEEP_COMPACT_TIMEOUT_MS = '500';
+  fs.writeFileSync(transcript, '{}\n');
+  try {
+    const started = Date.now();
+    const result = await compactSession(session, { pane: 'pane:test' }, null, {
+      dir: path.join(root, 'compact'),
+      compactPollMs: 5,
+      compactMarkerGraceMs: 0,
+      compactTrace: compactTraceSpy(stages),
+      sessionLastTurn: () => ({ model: 'claude-fable-5-1' }),
+      readClaudeSettingsModel: () => ({ ok: true, present: true, value: 'claude-fable-5-1' }),
+      transcriptFileForSession: () => transcript,
+      hostPaneModel: async () => '',
+      readScreen: async () => '❯ /compact\n  ⎿  Compacted (ctrl+o to see full summary)\n\n❯ ',
+      typeAndSubmit: async (_target, command) => { calls.push(command); },
+      waitForModelSwitch: async () => true,
+      repairClaudeSettingsModel: () => ({ changed: false }),
+    });
+    assert.equal(result.compacted, true);
+    assert.equal(result.confirmedBy, 'screen');
+    assert.ok(Date.now() - started < 250);
+    assert.deepEqual(calls, ['/model opus', '/compact', '/model claude-fable-5-1']);
+    assert.deepEqual(stages, ['screen-confirmed-no-marker']);
+    assert.equal(fs.readFileSync(transcript, 'utf8'), '{}\n');
+  } finally {
+    if (priorTimeout === undefined) delete process.env.KEEP_COMPACT_TIMEOUT_MS;
+    else process.env.KEEP_COMPACT_TIMEOUT_MS = priorTimeout;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('screen-confirmed compaction records a marker flushed by the model restore', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-screen-marker-test-'));
+  const transcript = path.join(root, 'transcript.jsonl');
+  const stages = [];
+  const priorTimeout = process.env.KEEP_COMPACT_TIMEOUT_MS;
+  process.env.KEEP_COMPACT_TIMEOUT_MS = '500';
+  fs.writeFileSync(transcript, '{}\n');
+  try {
+    const result = await compactSession({ id: 'screen-marker', kind: 'claude' }, { pane: 'pane:test' }, null, {
+      dir: path.join(root, 'compact'),
+      compactPollMs: 5,
+      compactMarkerGraceMs: 0,
+      compactTrace: compactTraceSpy(stages),
+      sessionLastTurn: () => ({ model: 'claude-fable-5-1' }),
+      readClaudeSettingsModel: () => ({ ok: true, present: true, value: 'claude-fable-5-1' }),
+      transcriptFileForSession: () => transcript,
+      hostPaneModel: async () => '',
+      readScreen: async () => '❯ /compact\n  ⎿  Compacted (ctrl+o to see full summary)\n\n❯ ',
+      typeAndSubmit: async (_target, command) => {
+        if (command === '/model claude-fable-5-1') {
+          fs.appendFileSync(transcript, `${JSON.stringify({ type: 'system', subtype: 'compact_boundary' })}\n`);
+        }
+      },
+      waitForModelSwitch: async () => true,
+      repairClaudeSettingsModel: () => ({ changed: false }),
+    });
+    assert.equal(result.confirmedBy, 'screen');
+    assert.deepEqual(stages, ['screen-confirmed']);
+  } finally {
+    if (priorTimeout === undefined) delete process.env.KEEP_COMPACT_TIMEOUT_MS;
+    else process.env.KEEP_COMPACT_TIMEOUT_MS = priorTimeout;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('compact session keeps waiting while the screen still shows compaction in progress', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-screen-busy-test-'));
+  const transcript = path.join(root, 'transcript.jsonl');
+  const priorTimeout = process.env.KEEP_COMPACT_TIMEOUT_MS;
+  process.env.KEEP_COMPACT_TIMEOUT_MS = '35';
+  fs.writeFileSync(transcript, '{}\n');
+  let reads = 0;
+  try {
+    const result = await compactSession({ id: 'screen-busy', kind: 'claude' }, { pane: 'pane:test' }, null, {
+      dir: path.join(root, 'compact'),
+      compactPollMs: 5,
+      sessionLastTurn: () => ({ model: 'claude-sonnet-5' }),
+      readClaudeSettingsModel: () => ({ ok: true, present: true, value: 'claude-sonnet-5' }),
+      transcriptFileForSession: () => transcript,
+      hostPaneModel: async () => '',
+      readScreen: async () => { reads++; return '❯ /compact\n  ⎿  Compacting… (esc to interrupt)'; },
+      typeAndSubmit: async () => {},
+    });
+    assert.equal(result.reason, 'timeout');
+    assert.ok(reads > 1);
+  } finally {
+    if (priorTimeout === undefined) delete process.env.KEEP_COMPACT_TIMEOUT_MS;
+    else process.env.KEEP_COMPACT_TIMEOUT_MS = priorTimeout;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('compactCommand appends an optional compaction instruction', () => {
