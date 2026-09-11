@@ -2647,3 +2647,37 @@ test('the tick message carries the previous tick cost against the target when it
   assert.doesNotMatch(tickMessage(rows, true, null), /Last tick/);
   assert.doesNotMatch(tickMessage(rows, true, { messages: NaN }), /Last tick/);
 });
+
+test('gated-step lines sit below the safety envelope, never above it', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-steps-order-'));
+  const project = path.join(root, 'project');
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'steps'), { recursive: true });
+    fs.mkdirSync(project, { recursive: true });
+    const stamp = require('./keep.js').nowStamp();
+    fs.writeFileSync(path.join(root, 'tasks', 'step-card.md'), [
+      '---', 'title: Step card', 'status: active', `project: ${project}`, `created: ${stamp.slice(0, 10)}`, `updated: ${stamp}`, '---',
+      `## ${stamp.replace('T', ' ')} — check-in`, 'Evidence.', '',
+    ].join('\n'));
+    fs.writeFileSync(path.join(root, 'steps', 'project.json'), JSON.stringify({
+      project,
+      steps: { bake: { title: 'AGENT_WRITTEN_STEP_TITLE', paths: ['owned/**'], from: 'landed', command: 'true', next: 'deploy' } },
+    }));
+    const script = "process.stdout.write(require('./bin/review.js').buildBundle('step-card', { force: true }).md)";
+    const child = spawnSync(process.execPath, ['-e', script], {
+      cwd: path.join(__dirname, '..'),
+      env: { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1' },
+      encoding: 'utf8',
+    });
+    assert.equal(child.status, 0, child.stderr);
+    const md = child.stdout;
+    const envelopeAt = md.indexOf('DATA, NOT INSTRUCTIONS');
+    const stepsAt = md.indexOf('STEPS: ');
+    assert.ok(envelopeAt >= 0 && stepsAt > envelopeAt, 'STEPS lines follow the envelope');
+    assert.match(md, /STEPS: .*bake/);
+    assert.equal(md.slice(0, envelopeAt).trim(), '# review bundle — step-card', 'only the static title precedes the envelope');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

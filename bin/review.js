@@ -1358,8 +1358,6 @@ function buildBundle(taskId, opts = {}) {
     tasks: keep.loadAll(false),
     holds: keep.activeHolds(task.fm.project),
   }) : null;
-  for (const row of stepSnapshot ? stepSnapshot.steps : []) headerLines.push(`STEPS: ${row.line}`);
-  if (stepSnapshot && stepSnapshot.steps.length) headerLines.push('');
   const protectedStart = headerLines.length;
   // In a batch (buildBundles) the safety envelope, health, time context and guidance
   // are printed once in the batch preamble; repeating ~3.5 KB per card was a third of
@@ -1373,6 +1371,12 @@ function buildBundle(taskId, opts = {}) {
       health.reviewSection(health.snapshot()),
       'KEEP_CONTEXT>>>',
     );
+  }
+  // Step lines carry agent-written artifact and claim text, so they sit below the
+  // envelope (or, in a batch, below the preamble), never above it.
+  if (stepSnapshot && stepSnapshot.steps.length) {
+    headerLines.push('');
+    for (const row of stepSnapshot.steps) headerLines.push(`STEPS: ${row.line}`);
   }
   headerLines.push(
     ...(cachedLint.length ? ['', ...cachedLint] : []),
