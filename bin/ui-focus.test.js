@@ -112,6 +112,15 @@ test('running panel orders by task creation age regardless of activity and refre
   assert.deepEqual(order(), ['old', 'shell', 'new']);
   ctx.runningOrder.clear();
   assert.deepEqual(order(), ['old', 'shell', 'new'], 'reload uses creation age too');
+  data.tasks[0] = { id: 'old', fm: { created: '2026-02-01' }, body: '## 2026-02-01 09:00 — created\nOlder task' };
+  data.tasks[1] = { id: 'new', fm: { created: '2026-02-01' }, body: '## 2026-02-01 14:00 — created\nNewer task' };
+  assert.deepEqual(order(), ['shell', 'old', 'new'], 'same-day tasks use precise creation logs');
+  data.sessions.reverse(); ctx.runningOrder.clear();
+  assert.deepEqual(order(), ['shell', 'old', 'new']);
+  data.tasks[0].body = ''; data.tasks[1].body = '';
+  const tied = order();
+  data.sessions.reverse(); ctx.runningOrder.clear();
+  assert.deepEqual(order(), tied, 'missing creation logs have deterministic ties across reloads');
 });
 
 test('scheduled idle sessions can be dismissed without changing their scheduled task', () => {

@@ -201,8 +201,12 @@ function runningItems() {
     .filter((session) => ['running', 'waiting'].includes(session.state) && !session.reviewer && !isClosingSession(session.id, session.pane));
   const tasks = new Map((data.tasks || []).map((task) => [task.id, task]));
   const panes = paneMap();
-  const createdAt = (session) => Date.parse(tasks.get(session.taskId)?.fm?.created)
-    || Date.parse(panes.get(session.pane)?.createdAt) || 0;
+  const createdAt = (session) => {
+    const task = tasks.get(session.taskId);
+    const logged = task?.body?.match(/^## (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) — created(?:\r?$)/m)?.[1];
+    return Date.parse(logged?.replace(' ', 'T')) || Date.parse(task?.fm?.created)
+      || Date.parse(panes.get(session.pane)?.createdAt) || 0;
+  };
   return stableSessionOrder(sessions, runningOrder, new Set((data.sessions || []).map((session) => session.id)), createdAt)
     .map((session) => sessionItem('running', session));
 }
