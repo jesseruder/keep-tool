@@ -109,4 +109,21 @@ function createTranscriptIndex(root, { io = fs, now = Date.now, sweepMs = 60000,
     },
   };
 }
-module.exports = { createTranscriptIndex };
+
+function createMultiRootTranscriptIndex(roots, options = {}) {
+  const entries = roots.map(({ accountId, root }) => ({ accountId, root, index: createTranscriptIndex(root, options) }));
+  return {
+    invalidate(root, name) {
+      const entry = entries.find((candidate) => candidate.root === root || candidate.accountId === root);
+      if (entry) entry.index.invalidate(name);
+      else for (const candidate of entries) candidate.index.invalidate();
+    },
+    scan(options) {
+      return entries.flatMap((entry) => entry.index.scan(options).map((item) => Object.freeze({
+        ...item, accountId: entry.accountId, projectsRoot: entry.root,
+      })));
+    },
+  };
+}
+
+module.exports = { createTranscriptIndex, createMultiRootTranscriptIndex };

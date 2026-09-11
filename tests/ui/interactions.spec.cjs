@@ -97,6 +97,38 @@ test('Watch Close hides the pane immediately', async ({ page }) => {
   await expect(page.locator('.wpane[data-pane="pb"]')).toBeVisible();
 });
 
+test('account handoff sends the explicit destination and confirms refreshed identity', async ({ page }) => {
+  await expect(page.locator('#meters')).toContainText('Claude Main 5h');
+  await expect(page.locator('#meters')).toContainText('Claude Two 5h');
+  await expect(page.locator('#meters')).toContainText('Codex Main 5h');
+  await expect(page.locator('#meters')).not.toContainText('legacy');
+  await expect(page.locator('#stage .account-label')).toHaveText('Claude Main');
+  await page.locator('#stage .account-handoff > summary').click();
+  await expect(page.locator('#stage [data-handoff-account="claude-two"]')).toBeVisible();
+  await expect(page.locator('#stage [data-handoff-account="claude-two"] small')).toHaveText('5h 11%');
+  await expect(page.locator('#stage .account-menu')).not.toContainText('Claude Unsupported');
+  await expect(page.locator('#stage .account-menu')).not.toContainText('Codex');
+  await page.locator('#stage [data-handoff-account="claude-two"]').click();
+  await expect(page.locator('#toast')).toContainText('Continued on Claude Two');
+  await expect(page.locator('#stage .account-label')).toHaveText('Claude Two');
+  const requests = fixture.events.filter(event => event.event === 'request' && event.path === '/api/handoff-session');
+  expect(requests).toHaveLength(1);
+  expect(requests[0].body).toEqual({ sessionId: 'a', pane: 'pa', accountId: 'claude-two' });
+});
+
+test('interrupted account handoff exposes retry and never claims an unverified resume', async ({ page }) => {
+  fixture.configure({ handoffRecoversOnce: true });
+  await page.locator('#stage .account-handoff > summary').click();
+  await page.locator('#stage [data-handoff-account="claude-two"]').click();
+  await expect(page.locator('#toast')).toContainText('Transfer needs recovery');
+  await expect(page.locator('#stage .handoff-error')).toHaveText('Transfer interrupted');
+  await expect(page.locator('#stage [data-handoff-account="claude-two"]')).toHaveText('Retry');
+  await expect(page.locator('#stage .account-label')).toHaveText('Claude Main');
+  await page.locator('#stage [data-handoff-account="claude-two"]').click();
+  await expect(page.locator('#toast')).toContainText('Continued on Claude Two');
+  await expect(page.locator('#stage .account-label')).toHaveText('Claude Two');
+});
+
 test('dragging off a pressed row cancels navigation and releases queued renders', async ({ page }) => {
   await down(page, '#qlist [data-key="running:b"] .t');
   await updateDuringPress(page, () => fixture.update('b', { state: 'waiting', title: 'B after cancelled click' }));

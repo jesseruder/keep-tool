@@ -10,16 +10,13 @@ const sessionStatus = require('./session-status.js');
 const SESSION_WINDOW_MS = 48 * 3600e3;
 const TAIL_BYTES = 256 * 1024;
 const HEAD_BYTES = 256 * 1024;
-const SESSIONS_DIR = path.join(os.homedir(), '.codex', 'sessions');
-const SESSION_INDEX = path.join(os.homedir(), '.codex', 'session_index.jsonl');
-
 const scanCache = new Map(); // file -> { mtimeMs, size, info }
-const sessionPathCache = new Map(); // session id -> rollout file
+const sessionPathCache = new Map(); // session id -> { file, accountId, configDir }
 const sessionParseCache = new Map(); // file -> { mtimeMs, size, info }
 const questionCache = new Map(); // incremental question lifecycle, independent of the text tail
 const SESSION_LOOKUP_CACHE_LIMIT = 300;
-let indexCache = { mtimeMs: null, size: null, titles: new Map() };
-let rolloutFiles = new Map(); // session id -> rollout file, replaced after each scan
+const indexCache = new Map(); // index file -> { mtimeMs, size, titles }
+let rolloutFiles = new Map(); // session id -> { file, accountId, configDir }, replaced after each scan
 
 function cacheSessionLookup(cache, key, value) {
   if (cache.has(key)) cache.delete(key);
@@ -27,7 +24,17 @@ function cacheSessionLookup(cache, key, value) {
   if (cache.size > SESSION_LOOKUP_CACHE_LIMIT) cache.delete(cache.keys().next().value);
 }
 
-function recentDateDirs() {
+function configuredRoots(env = process.env) {
+  const records = require('./accounts.js').list(env).filter((account) => account.agent === 'codex');
+  return records.map((account) => {
+    // In no-config compatibility mode honor the process's HOME (and test homes)
+    // exactly as the old single-root scanner did.
+    const configDir = account.builtIn && !account.managed ? path.join(os.homedir(), '.codex') : account.configDir;
+    return { accountId: account.id, configDir };
+  });
+}
+
+function recentDateDirs(configDir = path.join(os.homedir(), '.codex')) {
   const dirs = [];
   const now = new Date();
   // Rollout dirs are UTC-dated; local time (UTC-10) can lag a day behind, so
@@ -39,7 +46,7 @@ function recentDateDirs() {
     const year = String(date.getFullYear());
     const month = String(date.getMonth() + 1).padStart(2, '0');
     const day = String(date.getDate()).padStart(2, '0');
-    dirs.push(path.join(SESSIONS_DIR, year, month, day));
+    dirs.push(path.join(configDir, 'sessions', year, month, day));
   }
   return dirs;
 }
@@ -73,16 +80,18 @@ function readSessionMeta(file) {
   return record.payload;
 }
 
-function loadTitles() {
+function loadTitles(configDir = path.join(os.homedir(), '.codex')) {
+  const file = path.join(configDir, 'session_index.jsonl');
+  let cached = indexCache.get(file);
   let stat;
-  try { stat = fs.statSync(SESSION_INDEX); } catch {
-    indexCache = { mtimeMs: null, size: null, titles: new Map() };
-    return indexCache.titles;
+  try { stat = fs.statSync(file); } catch {
+    indexCache.delete(file);
+    return new Map();
   }
-  if (indexCache.mtimeMs === stat.mtimeMs && indexCache.size === stat.size) return indexCache.titles;
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.titles;
   const titles = new Map();
   try {
-    for (const line of fs.readFileSync(SESSION_INDEX, 'utf8').split('\n')) {
+    for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
       if (!line) continue;
       let record;
       try { record = JSON.parse(line); } catch { continue; }
@@ -91,7 +100,8 @@ function loadTitles() {
       }
     }
   } catch {}
-  indexCache = { mtimeMs: stat.mtimeMs, size: stat.size, titles };
+  cached = { mtimeMs: stat.mtimeMs, size: stat.size, titles };
+  indexCache.set(file, cached);
   return titles;
 }
 
@@ -269,12 +279,13 @@ function scanQuestion(file) {
   return state.question;
 }
 
-function sessionFromRollout(info, stat, title, now) {
+function sessionFromRollout(info, stat, title, now, accountId) {
   const ageMs = now - stat.mtimeMs;
   const lifecycle = require('./codex-lifecycle').state(process.env.KEEP_DIR || path.join(os.homedir(), 'keep'), info, now);
   return {
     id: info.id,
     kind: 'codex',
+    accountId,
     project: info.cwd,
     title,
     lastUser: info.lastUser.slice(0, 300),
@@ -296,39 +307,56 @@ function sessionFromRollout(info, stat, title, now) {
 }
 
 function scan() {
-  const sessionsById = new Map();
+  const candidatesById = new Map();
   const nextRolloutFiles = new Map();
   const now = Date.now();
-  const titles = loadTitles();
   const seen = new Set();
-  for (const dir of recentDateDirs()) {
-    let files;
-    try { files = fs.readdirSync(dir).filter((name) => /^rollout-.*\.jsonl$/.test(name)); } catch { continue; }
-    for (const name of files) {
-      const file = path.join(dir, name);
-      let stat;
-      try { stat = fs.statSync(file); } catch { continue; }
-      if (!stat.isFile() || now - stat.mtimeMs > SESSION_WINDOW_MS) continue;
-      seen.add(file);
-      let info;
-      const cached = scanCache.get(file);
-      if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-        info = cached.info;
-      } else {
-        try { info = scanRollout(file); } catch { continue; }
-        scanCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, info });
+  for (const root of configuredRoots()) {
+    const titles = loadTitles(root.configDir);
+    for (const dir of recentDateDirs(root.configDir)) {
+      let files;
+      try { files = fs.readdirSync(dir).filter((name) => /^rollout-.*\.jsonl$/.test(name)); } catch { continue; }
+      for (const name of files) {
+        const file = path.join(dir, name);
+        let stat;
+        try { stat = fs.statSync(file); } catch { continue; }
+        if (!stat.isFile() || now - stat.mtimeMs > SESSION_WINDOW_MS) continue;
+        seen.add(file);
+        let info;
+        const cached = scanCache.get(file);
+        if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+          info = cached.info;
+        } else {
+          try { info = scanRollout(file); } catch { continue; }
+          scanCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, info });
+        }
+        if (!info) continue;
+        const title = titles.get(info.id) || '';
+        if (title.startsWith('Codex Companion Task:')) continue;
+        const candidate = { file, accountId: root.accountId, configDir: root.configDir,
+          session: sessionFromRollout(info, stat, title, now, root.accountId) };
+        const list = candidatesById.get(info.id) || [];
+        list.push(candidate);
+        candidatesById.set(info.id, list);
       }
-      if (!info) continue;
-      const title = titles.get(info.id) || '';
-      if (title.startsWith('Codex Companion Task:')) continue;
-      if (sessionsById.has(info.id) && sessionsById.get(info.id).mtime >= stat.mtimeMs) continue;
-      nextRolloutFiles.set(info.id, file);
-      sessionsById.set(info.id, sessionFromRollout(info, stat, title, now));
     }
   }
   for (const file of scanCache.keys()) if (!seen.has(file)) scanCache.delete(file);
+  const sessions = [];
+  for (const [id, candidates] of candidatesById) {
+    let pinned = null;
+    try { pinned = require('./accounts.js').forSession(id, 'codex', {
+      root: process.env.KEEP_DIR || path.join(os.homedir(), 'keep'), allowDiscovery: false,
+    }); } catch { continue; }
+    const eligible = pinned ? candidates.filter((entry) => entry.accountId === pinned.id) : candidates;
+    if (!pinned && new Set(eligible.map((entry) => entry.accountId)).size > 1) continue;
+    eligible.sort((a, b) => b.session.mtime - a.session.mtime);
+    const chosen = eligible[0];
+    if (!chosen) continue;
+    nextRolloutFiles.set(id, chosen);
+    sessions.push(chosen.session);
+  }
   rolloutFiles = nextRolloutFiles;
-  const sessions = [...sessionsById.values()];
   sessions.sort((a, b) => b.mtime - a.mtime);
   return sessions;
 }
@@ -336,24 +364,36 @@ function scan() {
 // Locate a rollout by session id without reading any file: the id is embedded in
 // the filename. rolloutFileFor() only knows sessions that a prior scan() walked, so
 // CLI callers (which never scan) must use this instead.
-function findRolloutFile(sessionId) {
+function findRolloutRecord(sessionId) {
   if (!/^[A-Za-z0-9_-]+$/.test(String(sessionId || ''))) return null;
   const suffix = `-${sessionId}.jsonl`;
-  let newest = null;
-  let newestMtime = -Infinity;
-  for (const dir of recentDateDirs()) {
-    let names;
-    try { names = fs.readdirSync(dir); } catch { continue; }
-    for (const name of names) {
-      if (!name.startsWith('rollout-') || !name.endsWith(suffix)) continue;
-      const file = path.join(dir, name);
-      try {
-        const stat = fs.statSync(file);
-        if (stat.isFile() && stat.mtimeMs > newestMtime) { newest = file; newestMtime = stat.mtimeMs; }
-      } catch {}
+  let pinned = null;
+  try { pinned = require('./accounts.js').forSession(sessionId, 'codex', {
+    root: process.env.KEEP_DIR || path.join(os.homedir(), 'keep'), allowDiscovery: false,
+  }); } catch { return null; }
+  const matches = [];
+  for (const root of configuredRoots()) {
+    if (pinned && root.accountId !== pinned.id) continue;
+    for (const dir of recentDateDirs(root.configDir)) {
+      let names;
+      try { names = fs.readdirSync(dir); } catch { continue; }
+      for (const name of names) {
+        if (!name.startsWith('rollout-') || !name.endsWith(suffix)) continue;
+        const file = path.join(dir, name);
+        try {
+          const stat = fs.statSync(file);
+          if (stat.isFile()) matches.push({ file, mtimeMs: stat.mtimeMs, accountId: root.accountId, configDir: root.configDir });
+        } catch {}
+      }
     }
   }
-  return newest;
+  if (!pinned && new Set(matches.map((entry) => entry.accountId)).size > 1) return null;
+  matches.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return matches[0] || null;
+}
+
+function findRolloutFile(sessionId) {
+  return findRolloutRecord(sessionId)?.file || null;
 }
 
 function sessionMetaFor(sessionId) {
@@ -364,12 +404,23 @@ function sessionMetaFor(sessionId) {
 }
 
 function rolloutFileFor(sessionId) {
-  return rolloutFiles.get(String(sessionId || '')) || null;
+  return rolloutFiles.get(String(sessionId || ''))?.file || null;
 }
 
 function sessionFor(sessionId) {
   const id = String(sessionId || '');
-  let file = rolloutFiles.get(id) || sessionPathCache.get(id) || null;
+  let record = rolloutFiles.get(id) || sessionPathCache.get(id) || null;
+  let file = record && record.file;
+  const roots = new Map(configuredRoots().map((root) => [root.accountId, root]));
+  let pinned = null;
+  try { pinned = require('./accounts.js').forSession(id, 'codex', {
+    root: process.env.KEEP_DIR || path.join(os.homedir(), 'keep'), allowDiscovery: false,
+  }); } catch { return null; }
+  if (record && (!roots.has(record.accountId) || (pinned && pinned.id !== record.accountId))) {
+    sessionPathCache.delete(id);
+    record = null;
+    file = null;
+  }
   let stat;
   if (file) {
     try { stat = fs.statSync(file); } catch {
@@ -384,11 +435,12 @@ function sessionFor(sessionId) {
     }
   }
   if (!file) {
-    file = findRolloutFile(id) || rolloutFileFor(id);
-    if (!file) return null;
+    record = findRolloutRecord(id);
+    file = record && record.file;
+    if (!record || !file) return null;
     try { stat = fs.statSync(file); } catch { return null; }
     if (!stat.isFile()) return null;
-    cacheSessionLookup(sessionPathCache, id, file);
+    cacheSessionLookup(sessionPathCache, id, record);
   }
   let info;
   const cached = sessionParseCache.get(file);
@@ -401,7 +453,7 @@ function sessionFor(sessionId) {
     cacheSessionLookup(sessionParseCache, file, { mtimeMs: stat.mtimeMs, size: stat.size, info });
   }
   if (!info) return null;
-  return sessionFromRollout(info, stat, loadTitles().get(info.id) || '', Date.now());
+  return sessionFromRollout(info, stat, loadTitles(record.configDir).get(info.id) || '', Date.now(), record.accountId);
 }
 
-module.exports = { scan, scanRollout, sessionFor, rolloutFileFor, findRolloutFile, readTail, recentText, readSessionMeta, sessionMetaFor, isChildSession };
+module.exports = { scan, scanRollout, sessionFor, rolloutFileFor, findRolloutFile, readTail, recentText, readSessionMeta, sessionMetaFor, isChildSession, configuredRoots, recentDateDirs };

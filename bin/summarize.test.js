@@ -3,7 +3,8 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
-const { headlessSettingsArgs } = require('./summarize.js');
+const { headlessSettingsArgs, automationEnv } = require('./summarize.js');
+const { profileEnvironment } = require('./agent-launcher.js');
 const fs = require('node:fs'), path = require('node:path'), vm = require('node:vm'), { EventEmitter } = require('node:events');
 
 function fixture(run, failSpawn = false) {
@@ -121,4 +122,31 @@ test('an empty disabled plugin setting opts out', () => {
   withDisabledPlugins('', () => {
     assert.deepEqual(headlessSettingsArgs(), []);
   });
+});
+
+test('automation account selection is stable and strips inherited alternate credentials', () => {
+  const account = { id: 'background', label: 'Background', agent: 'claude', configDir: '/profiles/background', managed: true };
+  const purposes = [];
+  const accountApi = {
+    automationFor(agent, purpose) {
+      assert.equal(agent, 'claude');
+      purposes.push(purpose);
+      return account;
+    },
+    envFor(selected, base) { return profileEnvironment('claude', selected, base); },
+  };
+  const inherited = {
+    PATH: '/bin', ANTHROPIC_API_KEY: 'alternate', CLAUDE_CODE_OAUTH_TOKEN: 'alternate-oauth',
+    CLAUDE_CONFIG_DIR: '/wrong-profile',
+  };
+  const first = automationEnv('standup', inherited, accountApi);
+  const second = automationEnv('standup', inherited, accountApi);
+  assert.equal(first.account.id, 'background');
+  assert.equal(second.account.id, 'background');
+  assert.equal(first.env.CLAUDE_CONFIG_DIR, '/profiles/background');
+  assert.equal(first.env.CLAUDE_SECURESTORAGE_CONFIG_DIR, '/profiles/background');
+  assert.equal(first.env.KEEP_AGENT_ACCOUNT_ID, 'background');
+  assert.equal(first.env.ANTHROPIC_API_KEY, undefined);
+  assert.equal(first.env.CLAUDE_CODE_OAUTH_TOKEN, undefined);
+  assert.deepEqual(purposes, ['standup', 'standup']);
 });

@@ -1,102 +1,19 @@
 'use strict';
-// Cached, best-effort usage snapshots for Claude Code and Codex.
+// Cached, best-effort usage snapshots for every configured Claude Code and Codex
+// account. Credentials are read only from the selected account's own store.
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const https = require('https');
+const crypto = require('crypto');
 const { execFile } = require('child_process');
 const health = require('./health.js');
+const accounts = require('./accounts.js');
 
 const CLAUDE_REFRESH_MS = 60e3;
 const CODEX_REFRESH_MS = 5 * 60e3;
 const TAIL_BYTES = 256 * 1024;
-const CODEX_SESSIONS_DIR = path.join(os.homedir(), '.codex', 'sessions');
-
-let snapshot = {
-  claude: { limits: [], fetchedAt: null },
-  codex: { windows: [], planType: null, asOf: null },
-};
-let lastClaudeStartedAt = 0;
-let lastCodexStartedAt = 0;
-let claudeBackoffMs = 0;
-let refreshInFlight = null;
-let onChange = () => {};
-let cacheFile = null;
-
-function setOnChange(fn) { onChange = typeof fn === 'function' ? fn : () => {}; }
-
-// Survive server restarts: the Claude snapshot comes from a rate-limited network
-// endpoint, so cache the last good fetch on disk (limits only, never the token).
-function setCacheFile(file) {
-  cacheFile = file;
-  try {
-    const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
-    if (cached && cached.claude && Array.isArray(cached.claude.limits)
-        && cached.claude.limits.length && !snapshot.claude.fetchedAt) {
-      snapshot = { ...snapshot, claude: cached.claude };
-    }
-  } catch {}
-}
-
-function saveCache() {
-  if (!cacheFile) return;
-  try { fs.writeFileSync(cacheFile, JSON.stringify({ claude: snapshot.claude })); } catch {}
-}
-
-function requestRefresh(now = Date.now(), performRefresh = refresh) {
-  const doClaude = now - lastClaudeStartedAt >= CLAUDE_REFRESH_MS + claudeBackoffMs;
-  const doCodex = now - lastCodexStartedAt >= CODEX_REFRESH_MS;
-  if (!refreshInFlight && (doClaude || doCodex)) {
-    if (doClaude) lastClaudeStartedAt = now;
-    if (doCodex) lastCodexStartedAt = now;
-    // Do not let even the local rollout scan extend the /api/state call stack.
-    refreshInFlight = new Promise((resolve) => setImmediate(resolve))
-      .then(() => performRefresh(doClaude, doCodex))
-      .then(() => {
-        const errors = [snapshot.claude && snapshot.claude.error, snapshot.codex && snapshot.codex.error].filter(Boolean);
-        if (errors.length) health.record('usage', { ok: false, error: errors.join('; ') });
-        else health.record('usage', { ok: true });
-      })
-      .catch((error) => { health.record('usage', { ok: false, error }); })
-      .finally(() => { refreshInFlight = null; });
-    return true;
-  }
-  if (!refreshInFlight) health.record('usage', { ok: true, skipped: true, detail: 'nothing due' });
-  return false;
-}
-
-function getUsage() {
-  requestRefresh();
-  return snapshot;
-}
-
-async function refresh(doClaude, doCodex) {
-  const [claude, codex] = await Promise.allSettled([
-    doClaude ? fetchClaudeUsage() : Promise.resolve(null),
-    doCodex ? Promise.resolve().then(scanCodexUsage) : Promise.resolve(null),
-  ]);
-
-  snapshot = {
-    claude: claude.status === 'fulfilled'
-      ? (claude.value || snapshot.claude)
-      : { ...snapshot.claude, error: shortError('Claude', claude.reason) },
-    codex: codex.status === 'fulfilled'
-      ? (codex.value || snapshot.codex)
-      : { ...snapshot.codex, error: shortError('Codex', codex.reason) },
-  };
-  if (doClaude) {
-    if (claude.status === 'fulfilled' && claude.value) {
-      claudeBackoffMs = 0;
-      delete snapshot.claude.error;
-      saveCache();
-    } else if (claude.status === 'rejected') {
-      // The usage endpoint 429s under sustained 60s polling; back off up to ~30min.
-      claudeBackoffMs = Math.min(claudeBackoffMs ? claudeBackoffMs * 2 : 4 * 60e3, 29 * 60e3);
-    }
-  }
-  try { onChange(); } catch {}
-}
 
 function shortError(source, error) {
   const code = error && error.code;
@@ -114,31 +31,69 @@ function codedError(code) {
   return error;
 }
 
-function claudeToken() {
+function emptySnapshot(agent) {
+  return agent === 'claude'
+    ? { limits: [], fetchedAt: null }
+    : { windows: [], planType: null, asOf: null };
+}
+
+function safeAccount(account) {
+  return { id: account.id, label: account.label, agent: account.agent };
+}
+
+// Claude Code 2.1.269 derives its macOS Keychain service this way. Merely setting
+// CLAUDE_CONFIG_DIR (even to ~/.claude) opts into the hashed service, so the
+// built-in profile intentionally retains the historical unhashed name.
+function claudeCredentialService(account, env = process.env) {
+  if (account && account.credentialService) return account.credentialService;
+  const oauthSuffix = env.CLAUDE_CODE_CUSTOM_OAUTH_URL ? '-custom-oauth' : '';
+  if (account && account.builtIn) return `Claude Code${oauthSuffix}-credentials`;
+  const configDir = path.resolve(String(account && account.configDir || path.join(os.homedir(), '.claude'))).normalize('NFC');
+  const suffix = crypto.createHash('sha256').update(configDir).digest('hex').slice(0, 8);
+  return `Claude Code${oauthSuffix}-credentials-${suffix}`;
+}
+
+function credentialsToken(text) {
+  let credentials;
+  try { credentials = JSON.parse(text); } catch { throw codedError('credentials'); }
+  const token = credentials && credentials.claudeAiOauth && credentials.claudeAiOauth.accessToken;
+  if (typeof token !== 'string' || !token) throw codedError('credentials');
+  return token;
+}
+
+function claudeToken(account, deps = {}) {
+  const platform = deps.platform || process.platform;
+  const env = deps.env || process.env;
+  const fileSystem = deps.fs || fs;
+  if (platform !== 'darwin') {
+    return Promise.resolve().then(() => credentialsToken(
+      fileSystem.readFileSync(path.join(account.configDir, '.credentials.json'), 'utf8'),
+    )).catch(() => { throw codedError('credentials'); });
+  }
+  const run = deps.execFile || execFile;
+  let username = env.USER;
+  if (!username) {
+    try { username = os.userInfo().username; } catch { username = 'claude-code-user'; }
+  }
+  if (!/^[a-zA-Z0-9._-]+$/.test(username)) username = 'claude-code-user';
+  const service = claudeCredentialService(account, env);
   return new Promise((resolve, reject) => {
-    execFile('security', ['find-generic-password', '-s', 'Claude Code-credentials', '-w'], {
-      encoding: 'utf8',
-      maxBuffer: 1024 * 1024,
-      timeout: 10e3,
+    run('security', ['find-generic-password', '-a', username, '-w', '-s', service], {
+      encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 10e3,
     }, (error, stdout) => {
       if (error) return reject(codedError('credentials'));
-      let credentials;
-      try { credentials = JSON.parse(stdout); } catch { return reject(codedError('credentials')); }
-      const token = credentials && credentials.claudeAiOauth && credentials.claudeAiOauth.accessToken;
-      if (typeof token !== 'string' || !token) return reject(codedError('credentials'));
-      resolve(token);
+      try { resolve(credentialsToken(stdout)); } catch (credentialError) { reject(credentialError); }
     });
   });
 }
 
-async function fetchClaudeUsage() {
-  const token = await claudeToken();
+async function fetchClaudeUsage(account, deps = {}) {
+  const token = await claudeToken(account, deps);
+  const http = deps.https || https;
+  const now = deps.now || Date.now;
   const body = await new Promise((resolve, reject) => {
-    const req = https.get('https://api.anthropic.com/api/oauth/usage', {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'anthropic-beta': 'oauth-2025-04-20',
-      },
+    const req = http.get('https://api.anthropic.com/api/oauth/usage', {
+      headers: { Authorization: `Bearer ${token}`, 'anthropic-beta': 'oauth-2025-04-20' },
     }, (res) => {
       let data = '';
       res.setEncoding('utf8');
@@ -159,9 +114,7 @@ async function fetchClaudeUsage() {
   try { parsed = JSON.parse(body); } catch { throw codedError('response'); }
   if (!parsed || !Array.isArray(parsed.limits)) throw codedError('response');
   const limits = parsed.limits.map((entry) => {
-    if (!entry || typeof entry !== 'object' || !Number.isFinite(Number(entry.percent))) {
-      throw codedError('response');
-    }
+    if (!entry || typeof entry !== 'object' || !Number.isFinite(Number(entry.percent))) throw codedError('response');
     const kind = String(entry.kind || 'limit');
     let label = kind;
     if (kind === 'session') label = '5h';
@@ -171,36 +124,30 @@ async function fetchClaudeUsage() {
       label = typeof displayName === 'string' && displayName ? `${displayName} wk` : kind;
     }
     return {
-      label,
-      percent: Number(entry.percent),
+      label, percent: Number(entry.percent),
       severity: entry.severity == null ? null : String(entry.severity),
       resetsAt: entry.resets_at == null ? null : String(entry.resets_at),
     };
   });
-  return { limits, fetchedAt: Date.now() };
+  return { limits, fetchedAt: now() };
 }
 
-function recentDateDirs() {
+function recentDateDirs(sessionsDir = path.join(os.homedir(), '.codex', 'sessions'), now = new Date()) {
   const dirs = [];
-  const now = new Date();
-  // Rollout dirs are UTC-dated; local time (UTC-10) can lag a day behind, so start at -1.
   for (let daysAgo = -1; daysAgo < 7; daysAgo++) {
     const date = new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysAgo);
-    const year = String(date.getFullYear());
-    const month = String(date.getMonth() + 1).padStart(2, '0');
-    const day = String(date.getDate()).padStart(2, '0');
-    dirs.push(path.join(CODEX_SESSIONS_DIR, year, month, day));
+    dirs.push(path.join(sessionsDir, String(date.getFullYear()), String(date.getMonth() + 1).padStart(2, '0'), String(date.getDate()).padStart(2, '0')));
   }
   return dirs;
 }
 
-function readTail(file) {
-  const stat = fs.statSync(file);
+function readTail(file, fileSystem = fs) {
+  const stat = fileSystem.statSync(file);
   const start = Math.max(0, stat.size - TAIL_BYTES);
   const length = stat.size - start;
   const buffer = Buffer.alloc(length);
-  const fd = fs.openSync(file, 'r');
-  try { fs.readSync(fd, buffer, 0, length, start); } finally { fs.closeSync(fd); }
+  const fd = fileSystem.openSync(file, 'r');
+  try { fileSystem.readSync(fd, buffer, 0, length, start); } finally { fileSystem.closeSync(fd); }
   let text = buffer.toString('utf8');
   if (start > 0) {
     const newline = text.indexOf('\n');
@@ -215,9 +162,7 @@ function codexWindow(window) {
   const minutes = Number(window.window_minutes);
   const resetsAtSeconds = Number(window.resets_at);
   if (![percent, minutes, resetsAtSeconds].every(Number.isFinite)) return null;
-  const label = minutes === 10080 ? 'week'
-    : minutes === 300 || minutes === 600 ? '5h'
-      : `${Math.round(minutes / 60)}h`;
+  const label = minutes === 10080 ? 'week' : minutes === 300 || minutes === 600 ? '5h' : `${Math.round(minutes / 60)}h`;
   return { label, percent, resetsAt: resetsAtSeconds * 1000 };
 }
 
@@ -228,14 +173,10 @@ function codexSnapshotFromLine(line) {
   if (!rateLimits || typeof rateLimits !== 'object') return null;
   const asOf = Date.parse(event.timestamp);
   if (!Number.isFinite(asOf)) return null;
-  const windows = [codexWindow(rateLimits.primary), codexWindow(rateLimits.secondary)].filter(Boolean);
   return {
-    windows,
+    windows: [codexWindow(rateLimits.primary), codexWindow(rateLimits.secondary)].filter(Boolean),
     planType: rateLimits.plan_type == null ? null : String(rateLimits.plan_type),
     asOf,
-    // Codex can emit independent named model buckets alongside the ordinary
-    // account bucket. Keep this private marker so the scanner does not let a
-    // busier named session replace the account usage shown in the header.
     limitId: rateLimits.limit_id == null ? null : String(rateLimits.limit_id),
   };
 }
@@ -245,37 +186,28 @@ function publicCodexSnapshot(snapshot) {
   return result;
 }
 
-function scanCodexUsage(dirs = recentDateDirs()) {
-  // Resumed sessions keep appending to their original date dir, so the freshest
-  // rate_limits can live under an older date. Sort all candidates by mtime globally.
+function scanCodexUsage(dirs = recentDateDirs(), deps = {}) {
+  const fileSystem = deps.fs || fs;
   const files = [];
   for (const dir of dirs) {
     let names;
-    try { names = fs.readdirSync(dir); } catch { continue; }
+    try { names = fileSystem.readdirSync(dir); } catch { continue; }
     for (const name of names) {
       if (!/^rollout-.*\.jsonl$/.test(name)) continue;
       const file = path.join(dir, name);
-      try { files.push({ file, mtimeMs: fs.statSync(file).mtimeMs }); } catch {}
+      try { files.push({ file, mtimeMs: fileSystem.statSync(file).mtimeMs }); } catch {}
     }
   }
   files.sort((a, b) => b.mtimeMs - a.mtimeMs);
-
   let namedFallback = null;
   for (const { file } of files) {
     let lines;
-    try { lines = readTail(file).split('\n'); } catch { continue; }
+    try { lines = readTail(file, fileSystem).split('\n'); } catch { continue; }
     for (let i = lines.length - 1; i >= 0; i--) {
       if (!lines[i].includes('"rate_limits"')) continue;
       const result = codexSnapshotFromLine(lines[i]);
       if (!result) continue;
-      // `codex` is the canonical account bucket. Named limits such as
-      // `codex_bengalfox` (GPT-5.3-Codex-Spark) are separate quotas and can be
-      // updated more recently by another live session; using them made the
-      // dashboard bounce between unrelated percentages. Older events did not
-      // include limit_id, so retain their historical canonical behavior.
-      if (result.limitId == null || result.limitId === 'codex') {
-        return publicCodexSnapshot(result);
-      }
+      if (result.limitId == null || result.limitId === 'codex') return publicCodexSnapshot(result);
       if (!namedFallback) namedFallback = result;
     }
   }
@@ -283,4 +215,129 @@ function scanCodexUsage(dirs = recentDateDirs()) {
   throw codedError('not-found');
 }
 
-module.exports = { getUsage, requestRefresh, setOnChange, setCacheFile, scanCodexUsage };
+function scanCodexAccount(account, deps = {}) {
+  return scanCodexUsage(recentDateDirs(path.join(account.configDir, 'sessions'), deps.date || new Date()), deps);
+}
+
+function createUsageManager(deps = {}) {
+  const accountApi = deps.accounts || accounts;
+  const states = new Map();
+  let onChange = () => {};
+  let cacheFile = null;
+
+  function configured() { return accountApi.list(deps.env || process.env); }
+
+  function sync() {
+    const current = configured();
+    const ids = new Set(current.map((account) => account.id));
+    for (const id of states.keys()) if (!ids.has(id)) states.delete(id);
+    for (const account of current) {
+      const prior = states.get(account.id);
+      if (!prior || prior.account.agent !== account.agent || prior.account.configDir !== account.configDir) {
+        states.set(account.id, { account, snapshot: emptySnapshot(account.agent), lastStartedAt: 0, backoffMs: 0, inFlight: null });
+      } else prior.account = account;
+    }
+    return current;
+  }
+
+  function view() {
+    const current = sync();
+    const result = { accounts: {} };
+    for (const account of current) {
+      const state = states.get(account.id);
+      result.accounts[account.id] = { ...safeAccount(account), ...state.snapshot };
+    }
+    for (const agent of ['claude', 'codex']) {
+      let account = null;
+      try { account = accountApi.defaultFor(agent, deps.env || process.env); } catch {}
+      const entry = account && result.accounts[account.id];
+      result[agent] = entry
+        ? Object.fromEntries(Object.entries(entry).filter(([key]) => !['id', 'label', 'agent'].includes(key)))
+        : emptySnapshot(agent);
+    }
+    return result;
+  }
+
+  function setOnChange(fn) { onChange = typeof fn === 'function' ? fn : () => {}; }
+
+  function setCacheFile(file) {
+    cacheFile = file;
+    sync();
+    let cached;
+    try { cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8')); } catch { return; }
+    const accountCache = cached && cached.accounts && typeof cached.accounts === 'object' ? cached.accounts : {};
+    let defaultClaude = null;
+    try { defaultClaude = accountApi.defaultFor('claude', deps.env || process.env); } catch {}
+    for (const [id, state] of states) {
+      if (state.account.agent !== 'claude') continue;
+      let value = accountCache[id];
+      if (!value && defaultClaude && id === defaultClaude.id) value = cached.claude;
+      if (value && Array.isArray(value.limits) && value.limits.length && !state.snapshot.fetchedAt) {
+        state.snapshot = { limits: value.limits, fetchedAt: value.fetchedAt || null };
+      }
+    }
+  }
+
+  function saveCache() {
+    if (!cacheFile) return;
+    const stored = { accounts: {} };
+    for (const [id, state] of states) if (state.account.agent === 'claude') stored.accounts[id] = state.snapshot;
+    try { fs.writeFileSync(cacheFile, JSON.stringify(stored)); } catch {}
+  }
+
+  async function refreshAccount(stateAccount) {
+    return stateAccount.agent === 'claude'
+      ? fetchClaudeUsage(stateAccount, deps)
+      : Promise.resolve().then(() => scanCodexAccount(stateAccount, deps));
+  }
+
+  function requestRefresh(now = Date.now(), performRefresh = refreshAccount) {
+    const current = sync();
+    const started = [];
+    for (const account of current) {
+      const state = states.get(account.id);
+      const interval = account.agent === 'claude' ? CLAUDE_REFRESH_MS + state.backoffMs : CODEX_REFRESH_MS;
+      if (state.inFlight || now - state.lastStartedAt < interval) continue;
+      state.lastStartedAt = now;
+      state.inFlight = new Promise((resolve) => setImmediate(resolve))
+        .then(() => performRefresh(state.account, state.snapshot))
+        .then((value) => {
+          if (value) state.snapshot = value;
+          delete state.snapshot.error;
+          if (account.agent === 'claude') { state.backoffMs = 0; saveCache(); }
+        }, (error) => {
+          state.snapshot = { ...state.snapshot, error: shortError(account.agent === 'claude' ? 'Claude' : 'Codex', error) };
+          if (account.agent === 'claude') state.backoffMs = Math.min(state.backoffMs ? state.backoffMs * 2 : 4 * 60e3, 29 * 60e3);
+        })
+        .finally(() => { state.inFlight = null; try { onChange(); } catch {} });
+      started.push(state.inFlight);
+    }
+    if (started.length) {
+      Promise.allSettled(started).then(() => {
+        const errors = Object.values(view().accounts).map((entry) => entry.error).filter(Boolean);
+        health.record('usage', errors.length ? { ok: false, error: errors.join('; ') } : { ok: true });
+      });
+      return true;
+    }
+    if (![...states.values()].some((state) => state.inFlight)) health.record('usage', { ok: true, skipped: true, detail: 'nothing due' });
+    return false;
+  }
+
+  function getUsage() { requestRefresh(); return view(); }
+  return { getUsage, requestRefresh, setOnChange, setCacheFile, _view: view, _states: states };
+}
+
+const manager = createUsageManager();
+
+module.exports = {
+  getUsage: manager.getUsage,
+  requestRefresh: manager.requestRefresh,
+  setOnChange: manager.setOnChange,
+  setCacheFile: manager.setCacheFile,
+  scanCodexUsage,
+  scanCodexAccount,
+  claudeCredentialService,
+  claudeToken,
+  fetchClaudeUsage,
+  createUsageManager,
+};

@@ -2027,6 +2027,25 @@ test('classifyBudget fails closed on a snapshot it cannot reason about', () => {
   assert.equal(scoped.code, 6);
 });
 
+test('reviewBudget governs the reviewer against its pinned account snapshot', () => {
+  const { reviewBudget } = require('./review.js');
+  const fresh = Date.now();
+  const limits = (week) => [
+    { label: 'week', percent: week, resetsAt: new Date(fresh + 86400e3).toISOString() },
+    { label: '5h', percent: 10, resetsAt: new Date(fresh + 3600e3).toISOString() },
+  ];
+  const snapshot = {
+    claude: { limits: limits(5), fetchedAt: fresh },
+    accounts: {
+      primary: { id: 'primary', agent: 'claude', limits: limits(5), fetchedAt: fresh },
+      reviewer: { id: 'reviewer', agent: 'claude', limits: limits(99), fetchedAt: fresh },
+    },
+  };
+  assert.equal(reviewBudget('haiku', snapshot, 'reviewer').code, 6);
+  assert.equal(reviewBudget('haiku', snapshot, 'primary').code, 0);
+  assert.equal(reviewBudget('haiku', snapshot, 'missing').code, 8);
+});
+
 test('bundles frame their contents as data, not instructions', () => {
   const { buildBundle } = require('./review.js');
   // any real card will do; we only care about the envelope the model sees

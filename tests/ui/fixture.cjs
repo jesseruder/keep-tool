@@ -13,15 +13,28 @@ async function createFixture() {
   const events = [], clients = new Set();
   let revision = 0, ticks = 0, timer;
   let closeDelay = 1200, closeFails = false, layoutFails = false;
+  let handoffRecoversOnce = false;
   const sessions = Array.from({ length: 12 }, (_, i) => {
     const id = String.fromCharCode(97 + i);
     return { id, kind: i % 2 ? 'codex' : 'claude', title: `Session ${id.toUpperCase()}`, project: repo,
-      taskId: `card-${id}`, pane: `p${id}`, mtime: Date.now() - i, lastUserAt: Date.now(), state: 'running', endedTurn: false };
+      taskId: `card-${id}`, pane: `p${id}`, accountId: i % 2 ? 'codex-main' : 'claude-main',
+      accountLabel: i % 2 ? 'Codex Main' : 'Claude Main', mtime: Date.now() - i, lastUserAt: Date.now(), state: 'running', endedTurn: false };
   });
-  const panes = sessions.map((s, i) => ({ id: s.pane, pid: 100 + i, alive: true, cwd: repo, meta: { agent: s.kind, sessionId: s.id } }));
+  const panes = sessions.map((s, i) => ({ id: s.pane, pid: 100 + i, alive: true, cwd: repo,
+    meta: { agent: s.kind, sessionId: s.id, accountId: s.accountId, accountLabel: s.accountLabel } }));
   let layouts = [{ name: 'Pinned', role: 'pinned', ids: ['pa', 'pb'], cols: 2 }];
+  const accounts = [
+    { id: 'claude-main', agent: 'claude', label: 'Claude Main', isDefault: true, handoffSupported: true },
+    { id: 'claude-two', agent: 'claude', label: 'Claude Two', isDefault: false, handoffSupported: true },
+    { id: 'claude-unsupported', agent: 'claude', label: 'Claude Unsupported', isDefault: false, handoffSupported: false },
+    { id: 'codex-main', agent: 'codex', label: 'Codex Main', isDefault: true, handoffSupported: false },
+    { id: 'codex-two', agent: 'codex', label: 'Codex Two', isDefault: false, handoffSupported: false },
+  ];
+  const usageAccounts = Object.fromEntries(accounts.map((account, index) => [account.id, { ...account,
+    ...(account.agent === 'claude' ? { limits: [{ label: '5h', percent: 10 + index }] } : { windows: [{ label: '5h', percent: 10 + index }] }) }]));
   const state = { sessions, panes, tasks: sessions.map(s => ({ id: s.taskId, fm: { tags: ['personal'] } })), attention: [],
-    setAside: {}, health: { daemon: { running: true } }, usage: {}, review: { events: [], stats: {} }, limitResume: {} };
+    accounts, handoffs: [], setAside: {}, health: { daemon: { running: true } }, usage: { accounts: usageAccounts,
+      claude: { limits: [{ label: 'legacy claude', percent: 99 }] }, codex: { windows: [{ label: 'legacy codex', percent: 99 }] } }, review: { events: [], stats: {} }, limitResume: {} };
   const record = (event, detail = {}) => { events.push({ at: Date.now(), event, ...detail }); if (events.length > 5000) events.shift(); };
   const publish = () => { revision++; record('state', { revision, sessions: sessions.map(s => ({ id: s.id, state: s.state })) }); for (const client of clients) client.write('data: changed\n\n'); };
   function update(id, patch) { Object.assign(sessions.find(s => s.id === id), patch); publish(); }
@@ -57,6 +70,7 @@ async function createFixture() {
         if (Number.isFinite(input.closeDelay)) closeDelay = Math.max(0, Math.min(10000, input.closeDelay));
         if ('closeFails' in input) closeFails = Boolean(input.closeFails);
         if ('layoutFails' in input) layoutFails = Boolean(input.layoutFails);
+        if ('handoffRecoversOnce' in input) handoffRecoversOnce = Boolean(input.handoffRecoversOnce);
         if (input.id && sessions.some(s => s.id === input.id)) update(input.id, input.patch || {});
         json({ ok: true, revision }); return;
       }
@@ -80,6 +94,31 @@ async function createFixture() {
           panes.find(p => p.id === input.pane).alive = false;
           state.attention = state.attention.filter(s => s.sessionId !== session.id);
           publish(); json({ ok: true, closed: true, forced: false }); return;
+        }
+        if (url.pathname === '/api/handoff-session') {
+          const session = sessions.find(s => s.id === input.sessionId && s.pane === input.pane);
+          const pane = panes.find(p => p.id === input.pane && p.meta.sessionId === input.sessionId);
+          const account = accounts.find(a => a.id === input.accountId);
+          if (!session || !pane || !account || account.agent !== session.kind || !account.handoffSupported) {
+            json({ error: 'Unsafe fixture handoff' }, 409); return;
+          }
+          let transaction = state.handoffs.find(h => h.sessionId === session.id && h.targetAccountId === account.id && h.status === 'recovery-needed');
+          if (handoffRecoversOnce && !transaction) {
+            transaction = { id: `handoff-${state.handoffs.length + 1}`, sessionId: session.id, pane: pane.id,
+              sourceAccountId: session.accountId, targetAccountId: account.id, status: 'recovery-needed', phase: 'stopped', reason: 'Fixture interruption' };
+            state.handoffs.push(transaction);
+            publish(); json({ ok: false, transactionId: transaction.id, status: transaction.status, phase: transaction.phase, reason: transaction.reason }); return;
+          }
+          if (!transaction) {
+            transaction = { id: `handoff-${state.handoffs.length + 1}`, sessionId: session.id, pane: pane.id,
+              sourceAccountId: session.accountId, targetAccountId: account.id };
+            state.handoffs.push(transaction);
+          }
+          transaction.status = 'done';
+          session.accountId = account.id; session.accountLabel = account.label;
+          pane.meta.accountId = account.id; pane.meta.accountLabel = account.label;
+          publish(); json({ ok: true, transactionId: transaction.id, sessionId: session.id, pane: pane.id,
+            sourceAccountId: transaction.sourceAccountId, targetAccountId: account.id, status: 'done' }); return;
         }
         if (url.pathname === '/api/setaside') { if (input.kind === 'clear') delete state.setAside[input.key]; else state.setAside[input.key] = { kind: input.kind, at: Date.now() }; json({ ok: true }); publish(); return; }
         // Unsupported actions fail visibly instead of accidentally invoking real services.
@@ -118,7 +157,7 @@ async function createFixture() {
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   return { url: `http://127.0.0.1:${server.address().port}`, events, state, update, publish, churn,
-    configure: options => { if ('closeDelay' in options) closeDelay = options.closeDelay; if ('closeFails' in options) closeFails = options.closeFails; if ('layoutFails' in options) layoutFails = options.layoutFails; },
+    configure: options => { if ('closeDelay' in options) closeDelay = options.closeDelay; if ('closeFails' in options) closeFails = options.closeFails; if ('layoutFails' in options) layoutFails = options.layoutFails; if ('handoffRecoversOnce' in options) handoffRecoversOnce = options.handoffRecoversOnce; },
     async close() { clearInterval(timer); for (const c of clients) c.end(); for (const c of sockets.clients) c.terminate(); sockets.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); fs.rmSync(repo, { recursive: true, force: true }); },
   };
 }

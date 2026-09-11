@@ -520,7 +520,7 @@ function captureModelOutput(child, timeoutMs = MODEL_TIMEOUT_MS) {
 
 function runModel(prompt, model) {
   const sessionId = crypto.randomUUID();
-  const env = { ...process.env, KEEP_RUN: '1' };
+  const env = summarize.automationEnv('ideas').env;
   delete env.CLAUDE_CODE_SESSION_ID;
   try {
     const args = slack.classifierArgs(prompt, model, sessionId, undefined, 'text');

@@ -1999,7 +1999,11 @@ function weeklyAttribution({ reviewerSessions, fleetFiles, limits, now }) {
   return out;
 }
 
-function reviewerWeekly(limits) {
+function reviewerWeekly(limits, accountId) {
+  // Fleet transcript cost is not yet segmented at handoff boundaries. With more
+  // than one Claude account, attributing the whole historical transcript to the
+  // reviewer's current account would manufacture a percentage; report unknown.
+  try { if (require('./accounts.js').hasMultiple('claude')) return null; } catch {}
   // fold before computing, or a cold CLI reports a share against an empty fleet
   if (Date.now() - fleetFoldStatus.at > 5 * 60e3) {
     try { foldFleetUsage(16 * 1024 * 1024); } catch {}
@@ -3561,9 +3565,20 @@ function classifyBudget(snapshot, model, minHeadroom) {
   return { code: 0, reason: 'within budget', model: scoped ? scoped.label : 'week' };
 }
 
-function reviewBudget(model, snapshot) {
+function reviewBudget(model, snapshot, accountId) {
   const usage = require('./usage.js');
-  return classifyBudget(snapshot || usage.getUsage(), model || reviewerModel());
+  const value = snapshot || usage.getUsage();
+  const pinned = accountId || process.env.KEEP_AGENT_ACCOUNT_ID;
+  if (pinned) {
+    const accountUsage = value && value.accounts && value.accounts[pinned];
+    return classifyBudget({ claude: accountUsage && accountUsage.agent === 'claude' ? accountUsage : {} }, model || reviewerModel());
+  }
+  try {
+    if (require('./accounts.js').hasMultiple('claude')) {
+      return { code: 8, reason: 'reviewer account is unknown in multi-account mode' };
+    }
+  } catch {}
+  return classifyBudget(value, model || reviewerModel());
 }
 
 // ---------- waking the reviewer ----------
@@ -3729,7 +3744,7 @@ async function reviewTick(deps, opts) {
   const sessions = deps.sessions ? deps.sessions() : [];
   const reviewer = findReviewerSession(sessions, meta.bootstrapAttempts);
   const model = reviewer ? (readReviewerMarker(reviewer.id).model || reviewerModel()) : reviewerModel();
-  const budget = options.force ? { code: 0, reason: 'forced' } : reviewBudget(model);
+  const budget = options.force ? { code: 0, reason: 'forced' } : reviewBudget(model, undefined, reviewer && reviewer.accountId);
   const queue = reviewQueue({ limit: Number.isFinite(TICK_LIMIT) && TICK_LIMIT > 0 ? TICK_LIMIT : 5 });
   const decision = options.force
     ? (reviewer ? { send: Boolean(queue.ranked.length), why: queue.ranked.length ? '' : 'nothing ranked' } : { send: false, why: 'no live reviewer session registered' })

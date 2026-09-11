@@ -13,7 +13,7 @@ const evidenceKey = state => digest(JSON.stringify({ jobs: state.jobs, calls: st
 // A proof is bound to the exact files and process instance observed here. It
 // does not authorize exit by itself: the caller still checks live descendants,
 // current foreground state, viewers and the actual input prompt before typing.
-function verify({ root, agent, sid, file, instance, resolveChild, budget = 4 * 1024 * 1024 }) {
+function verify({ root, agent, sid, file, instance, resolveChild, budget = 4 * 1024 * 1024, allowTerminalRateLimit = false }) {
   const snapshots = new Map(), visiting = new Set();
   let remaining = budget;
   const load = (id, source, parentSource) => {
@@ -58,7 +58,8 @@ function verify({ root, agent, sid, file, instance, resolveChild, budget = 4 * 1
       && acknowledgement?.kind === 'agent' && acknowledgement.status === 'completed' && acknowledgement.evidence === 'transcript'
       && acknowledgement.eventAt >= s.observedAt;
     const abortedChild = parent && agent === 'codex' && s.aborted === true;
-    if ((!s.completed && !acknowledgedFinal && !abortedChild) || Object.keys(state.calls).length) throw Error('Job ledger turn is not verifiably complete');
+    const terminalRateLimit = allowTerminalRateLimit && !parent && agent === 'claude' && s.rateLimitTerminal === true;
+    if ((!s.completed && !acknowledgedFinal && !abortedChild && !terminalRateLimit) || Object.keys(state.calls).length) throw Error('Job ledger turn is not verifiably complete');
     if (agent === 'codex' && parent && require('./codex').scanRollout(source, { includeChild: true })?.pendingQuestion) throw Error('Child has pending input');
     for (const job of Object.values(state.jobs)) {
       if (!terminal.has(job.status) && job.kind !== 'agent') throw Error(`Job ledger has unresolved ${job.kind} work (${job.id})`);

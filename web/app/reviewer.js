@@ -1,5 +1,6 @@
 import * as api from './api.js';
 import { restartControls, installRestartControls } from './restart-session.js';
+import { accountLabelHTML, handoffControls, installHandoffControls } from './account-controls.js';
 
 const ACTIONS_KEY = 'keep.console.reviewer.actionsOnly';
 const SEEN_KEY = 'keep.console.reviewer.seenAt';
@@ -185,8 +186,9 @@ export function reviewerRestartHTML(ctx) {
 export function renderReviewer(ctx) {
   const { marker, session } = liveReviewer(ctx);
   const terminal = document.querySelector('#rterm');
+  const pane = session?.pane ? ctx.paneMap().get(session.pane) : null;
   const status = `${marker?.state || session?.state || 'offline'} · ${tickPhrase(ctx)}`;
-  const structure = `<div class="shead"><h2>Fleet reviewer</h2><div class="meta mono">${ctx.projectHTML(session?.project || '~/keep')}<span>${ctx.esc(marker?.id || session?.id || '—')}</span><span>${ctx.esc(marker?.model || '—')}</span><span class="reviewer-state">${ctx.esc(status)}</span></div><div class="acts"><button class="btn" data-review-tick>Tick now</button><button class="btn" data-review-stats>Stats</button>${statsPopover(ctx)}<span class="restart-controls"></span></div></div><div class="review-terminal"></div>`;
+  const structure = `<div class="shead"><h2>Fleet reviewer</h2><div class="meta mono">${ctx.projectHTML(session?.project || '~/keep')}<span>${ctx.esc(marker?.id || session?.id || '—')}</span><span>${ctx.esc(marker?.model || '—')}</span>${accountLabelHTML(ctx, session, pane)}<span class="reviewer-state">${ctx.esc(status)}</span></div><div class="acts"><button class="btn" data-review-tick>Tick now</button><button class="btn" data-review-stats>Stats</button>${statsPopover(ctx)}<div class="account-controls"></div><span class="restart-controls"></span></div></div><div class="review-terminal"></div>`;
   const changed = ctx.patchHTML(terminal, structure);
   if (session?.pane) ctx.mount(terminal.querySelector('.review-terminal'), session.pane, { slot: 'reviewer' });
   else terminal.querySelector('.review-terminal').innerHTML = '<div class="placeholder">The reviewer is not currently attached to a host pane.</div>';
@@ -203,6 +205,10 @@ export function renderReviewer(ctx) {
       terminal.querySelector('.acts').classList.toggle('open');
     });
   }
+
+  const accounts = terminal.querySelector('.account-controls');
+  ctx.patchHTML(accounts, handoffControls(ctx, session?.id, session?.pane));
+  if (session?.id && session?.pane) installHandoffControls(accounts, ctx, session.id, session.pane);
 
   // Re-rendered every refresh, not only on a structural change: the button has to
   // follow the reviewer's pane appearing and going away, and the queued/failed state.

@@ -228,3 +228,51 @@ test('a rewritten child rollout retains its parent after the temporary parent re
   fs.writeFileSync(child, [meta('c', 10), context('m'), codex(30, counts(120, 0, 7), counts(20, 0, 2))].map(r => JSON.stringify(r) + '\n').join(''));
   assert.equal(f.collect().cards.a.output, 7);
 });
+
+test('discovery walks every configured account root while options.home stays isolated', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-card-usage-roots-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const records = [
+    { id: 'claude-one', agent: 'claude', configDir: path.join(root, 'claude-one') },
+    { id: 'claude-two', agent: 'claude', configDir: path.join(root, 'claude-two') },
+    { id: 'codex-one', agent: 'codex', configDir: path.join(root, 'codex-one') },
+  ];
+  const expected = [];
+  for (const account of records) {
+    const folders = account.agent === 'claude' ? ['projects/p'] : ['sessions/2026/09/11', 'archived_sessions'];
+    for (const folder of folders) {
+      const file = path.join(account.configDir, folder, `${account.id}-${folder.includes('archived') ? 'old' : 'live'}.jsonl`);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, '');
+      expected.push(`${account.id}:${file}`);
+    }
+  }
+  const found = usage.discover(undefined, { accounts: { list: () => records } });
+  assert.deepEqual(found.map((source) => `${source.accountId}:${source.file}`).sort(), expected.sort());
+
+  const fixtureHome = path.join(root, 'fixture-home');
+  const fixtureFile = path.join(fixtureHome, '.claude', 'projects', 'p', 'fixture.jsonl');
+  fs.mkdirSync(path.dirname(fixtureFile), { recursive: true });
+  fs.writeFileSync(fixtureFile, '');
+  assert.deepEqual(usage.discover(fixtureHome), [{ file: fixtureFile, agent: 'claude' }]);
+});
+
+test('account authority filters copied transcript roots before attribution', t => {
+  const f = fixture(t);
+  f.collect();
+  const source = path.join(f.root, 'source', 's.jsonl');
+  const target = path.join(f.root, 'target', 's.jsonl');
+  fs.mkdirSync(path.dirname(source), { recursive: true });
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(source, JSON.stringify(claude('wrong-account', 10, 90)) + '\n');
+  fs.writeFileSync(target, JSON.stringify(claude('right-account', 20, 7)) + '\n');
+  const result = f.collect({
+    files: [
+      { file: source, agent: 'claude', accountId: 'old-account' },
+      { file: target, agent: 'claude', accountId: 'new-account' },
+    ],
+    authority: { s: { agent: 'claude', accountId: 'new-account' } },
+  });
+  assert.equal(result.cards.a.calls, 1);
+  assert.equal(result.cards.a.output, 7);
+});

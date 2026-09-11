@@ -1,5 +1,6 @@
 import * as api from './api.js';
 import { sessionExplanation } from './status.js';
+import { accountLabelHTML, handoffControls, installHandoffControls } from './account-controls.js';
 
 const SHELL_PROJECT_KEY = 'keep.console.shellProject';
 
@@ -112,12 +113,16 @@ function renderGrid(ctx, layout) {
     const shell = pane.meta?.agent === 'shell';
     const closable = pane.alive && ['claude', 'codex'].includes(pane.meta?.agent) && pane.meta?.sessionId;
     const exitedAgent = pane.alive === false && ['claude', 'codex'].includes(pane.meta?.agent);
-    ctx.patchHTML(element.querySelector('.ph'), `<div class="session-heading"><b>${ctx.esc(entity.title)}</b><div class="meta">${ctx.projectHTML(entity.project)}${entity.taskId ? `<span class="proj">${ctx.esc(entity.taskId)}</span>${ctx.tagsHTML(ctx.taskFor(entity))}` : ''}</div></div><span class="st"><i class="${ctx.esc(entity.state)}"></i>${ctx.esc(entity.stateLabel || entity.state)}</span><button data-unpin title="unpin">✕</button>${closable ? '<button data-close-session>Close</button>' : ''}${shell ? `<button data-kill title="${pane.alive ? 'kill' : 'remove'}">${pane.alive ? '■' : '⌫'}</button>` : ''}${exitedAgent ? '<button data-reopen title="reopen">Reopen</button><button data-remove-pane title="remove">Remove</button>' : ''}`);
+    ctx.patchHTML(element.querySelector('.ph'), `<div class="session-heading"><b>${ctx.esc(entity.title)}</b><div class="meta">${ctx.projectHTML(entity.project)}${entity.taskId ? `<span class="proj">${ctx.esc(entity.taskId)}</span>${ctx.tagsHTML(ctx.taskFor(entity))}` : ''}${accountLabelHTML(ctx, entity.session, pane)}</div></div><span class="st"><i class="${ctx.esc(entity.state)}"></i>${ctx.esc(entity.stateLabel || entity.state)}</span><button data-unpin title="unpin">✕</button>${closable ? '<button data-close-session>Close</button>' : ''}${shell ? `<button data-kill title="${pane.alive ? 'kill' : 'remove'}">${pane.alive ? '■' : '⌫'}</button>` : ''}${exitedAgent ? '<button data-reopen title="reopen">Reopen</button><button data-remove-pane title="remove">Remove</button>' : ''}`);
     retained.add(element);
     const closeButton = element.querySelector('[data-close-session]');
     if (closeButton) closeButton.onclick = () => closeSession(ctx, pane.meta.sessionId, pane.id, closeButton);
     if (closable && !entity.session?.reviewer) {
       const header = element.querySelector('.ph');
+      let accounts = header.querySelector('.account-controls');
+      if (!accounts) { accounts = document.createElement('div'); accounts.className = 'account-controls'; header.append(accounts); }
+      ctx.patchHTML(accounts, handoffControls(ctx, pane.meta.sessionId, pane.id));
+      installHandoffControls(accounts, ctx, pane.meta.sessionId, pane.id);
       let controls = header.querySelector('.restart-controls');
       if (!controls) { controls = document.createElement('span'); controls.className = 'restart-controls'; header.append(controls); }
       ctx.patchHTML(controls, restartControls(ctx, pane.meta.sessionId));

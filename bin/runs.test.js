@@ -26,7 +26,7 @@ test('scheduled-task timer polls each minute and matches health cadence', () => 
 });
 
 const {
-  buildPrompt, headlessRunArgs, checkDeliveryMessage, planDueCard, deliveryWarning,
+  buildPrompt, headlessRunArgs, headlessRunEnvironment, checkDeliveryMessage, planDueCard, deliveryWarning,
   cardFingerprint, finalizePayload, pendingCheckin, landFinalCheckin, NO_RESULT,
   parseVerdict, probePayload, startProbe, probeDue, escalateProbeFailure,
   isTransientStartError, MAX_CONCURRENT_PROBES, _resetSchedulerState,
@@ -101,6 +101,22 @@ test('headless run argv disables the Codex plugin', () => {
     if (previous === undefined) delete process.env.KEEP_HEADLESS_DISABLED_PLUGINS;
     else process.env.KEEP_HEADLESS_DISABLED_PLUGINS = previous;
   }
+});
+
+test('checks and task runs use their stable configured automation accounts', () => {
+  const selected = [];
+  const accountApi = {
+    automationFor(_agent, purpose) {
+      selected.push(purpose);
+      return { id: `${purpose}-account`, label: purpose, agent: 'claude', configDir: `/profiles/${purpose}` };
+    },
+    envFor(account, env) { return { ...env, CLAUDE_CONFIG_DIR: account.configDir, KEEP_AGENT_ACCOUNT_ID: account.id }; },
+  };
+  const check = headlessRunEnvironment('check', { PATH: '/bin' }, accountApi);
+  const task = headlessRunEnvironment('task', { PATH: '/bin' }, accountApi);
+  assert.deepEqual(selected, ['checks', 'runs']);
+  assert.equal(check.env.KEEP_AGENT_ACCOUNT_ID, 'checks-account');
+  assert.equal(task.env.KEEP_AGENT_ACCOUNT_ID, 'runs-account');
 });
 
 test('a headless fallback explains that the linked thread is gone', () => {

@@ -3316,7 +3316,8 @@ test('open uses host panes for both existing sessions and new Claude and Codex l
   });
   assert.deepEqual(claude, {
     ok: true, created: 'pane', command: 'claude --dangerously-skip-permissions --session-id 33333333-3333-4333-8333-333333333333',
-    pane: 'pane-claude', sessionId: '33333333-3333-4333-8333-333333333333', unlinked: 'creator',
+    pane: 'pane-claude', sessionId: '33333333-3333-4333-8333-333333333333',
+    accountId: 'claude/default', accountLabel: 'Claude (default)', unlinked: 'creator',
     settled: true, sent: true, linked: true,
   });
   assert.equal(claudeHost.calls[0].params.meta.sessionId, '33333333-3333-4333-8333-333333333333');
@@ -3340,6 +3341,61 @@ test('open uses host panes for both existing sessions and new Claude and Codex l
     waitForHostAgent: async () => true,
     waitForHostSessionId: async () => null,
   }), (error) => error.status === 504 && /never registered its session id/.test(error.message));
+});
+
+test('explicit account launches stay pinned when the session is resumed', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-account-'));
+  const config = path.join(root, 'config.json');
+  const secondary = path.join(root, 'secondary');
+  const codexSecondary = path.join(root, 'codex-secondary');
+  fs.mkdirSync(secondary); fs.mkdirSync(codexSecondary);
+  fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+    { id: 'claude/default', label: 'Primary', agent: 'claude', configDir: path.join(os.homedir(), '.claude'), useDefaultConfig: true },
+    { id: 'claude-secondary', label: 'Secondary', agent: 'claude', configDir: secondary },
+    { id: 'codex/default', label: 'Codex primary', agent: 'codex', configDir: path.join(os.homedir(), '.codex'), useDefaultConfig: true },
+    { id: 'codex-secondary', label: 'Codex secondary', agent: 'codex', configDir: codexSecondary },
+  ], defaultAccounts: { claude: 'claude/default', codex: 'codex/default' } }));
+  const env = { KEEP_DIR: root, KEEP_CONFIG: config };
+  const sid = '44444444-4444-4444-8444-444444444444';
+  const calls = [];
+  const host = recordingHost((type, params) => {
+    if (type === 'spawn') { calls.push(params); return { pane: { id: `pane-${calls.length}` } }; }
+    return {};
+  });
+  const profileId = (params) => {
+    const encoded = /'--profile' '([^']+)'/.exec(params.args[1])?.[1];
+    return JSON.parse(Buffer.from(encoded, 'base64url')).id;
+  };
+  try {
+    const common = { root, env, host, waitForHostAgent: async () => true };
+    await openSession({ taskId: 'card', fresh: true, agent: 'claude', accountId: 'claude-secondary' }, {
+      ...common, randomUUID: () => sid, loadTask: () => ({ fm: { project: os.tmpdir(), sessions: [] } }),
+    });
+    assert.equal(profileId(calls[0]), 'claude-secondary');
+    assert.equal(require('./accounts').forSession(sid, 'claude', { root, env }).id, 'claude-secondary');
+
+    await openSession({ sessionId: sid }, {
+      ...common, scanSessions: () => [{ id: sid, project: os.tmpdir(), kind: 'claude' }],
+      resolveSessionTarget: async () => null, liveSessionPids: async () => new Map(),
+    });
+    assert.equal(profileId(calls[1]), 'claude-secondary');
+    assert.match(calls[1].args[1], /'--resume' '44444444-4444-4444-8444-444444444444'/);
+    await assert.rejects(openSession({ sessionId: sid, accountId: 'claude/default' }, {
+      ...common, scanSessions: () => [{ id: sid, project: os.tmpdir(), kind: 'claude' }],
+    }), /use handoff/);
+
+    const codexSid = '55555555-5555-4555-8555-555555555555';
+    await openSession({ sessionId: codexSid }, {
+      ...common, scanSessions: () => [{ id: codexSid, project: os.tmpdir(), kind: 'codex', accountId: 'codex-secondary' }],
+      resolveSessionTarget: async () => null, liveSessionPids: async () => new Map(),
+    });
+    assert.equal(profileId(calls[2]), 'codex-secondary', 'Codex rollout account identity wins over the new-session default');
+    assert.match(calls[2].args[1], /'resume' '55555555-5555-4555-8555-555555555555'/);
+    require('./accounts').stageSession(sid, 'claude/default', 'unfinished', { root, env });
+    await assert.rejects(openSession({ sessionId: sid }, {
+      ...common, scanSessions: () => [{ id: sid, project: os.tmpdir(), kind: 'claude' }],
+    }), /retry the explicit handoff/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('opening an auto-closed done card resumes the same Claude and Codex session ids', async () => {
@@ -4085,8 +4141,18 @@ test('compact session restores the pane launch model rather than the transcript 
 test('restarting the fleet reviewer keeps its identity, its launch env, and its tick address', async () => {
   const { restartSession } = require('./serve');
   const review = require('./review.js');
+  const accountStore = require('./accounts');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-reviewer-restart-'));
   const claudeFile = path.join(root, 'claude.jsonl');
+  const secondaryDir = path.join(root, 'claude-secondary');
+  const accountConfig = path.join(root, 'config.json');
+  fs.mkdirSync(secondaryDir);
+  fs.writeFileSync(accountConfig, JSON.stringify({ version: 1, accounts: [
+    { id: 'claude/default', label: 'Primary', agent: 'claude', configDir: path.join(os.homedir(), '.claude'), useDefaultConfig: true },
+    { id: 'claude-secondary', label: 'Secondary', agent: 'claude', configDir: secondaryDir },
+  ], defaultAccounts: { claude: 'claude/default' } }));
+  const accountEnv = { KEEP_DIR: root, KEEP_CONFIG: accountConfig };
+  accountStore.pinSession('rev', 'claude', 'claude-secondary', { root, env: accountEnv });
   fs.writeFileSync(claudeFile, JSON.stringify({ type: 'assistant', sessionId: 'rev', message: { content: [], stop_reason: 'end_turn' } }) + '\n');
   try {
     const session = { id: 'rev', kind: 'claude', state: 'idle', endedTurn: true, reviewer: true, project: root };
@@ -4096,7 +4162,7 @@ test('restarting the fleet reviewer keeps its identity, its launch env, and its 
     const row = { pid: 11, ppid: 10, pidStart: 'Tue Sep  8 10:00:00 2026', agent: 'claude', interactive: true, args: '/test/claude --resume rev' };
     let exited = false, replaced = null;
     const deps = {
-      root, withInjectionLock: (fn) => fn(), buildState: async () => ({ sessions: [session], tasks: [] }),
+      root, env: accountEnv, withInjectionLock: (fn) => fn(), buildState: async () => ({ sessions: [session], tasks: [] }),
       claudeRolloutFile: () => claudeFile,
       reviewerMarker: (id) => { assert.equal(id, 'rev'); return { name: 'fable', model: 'fable', ended: Date.now() }; },
       agentProcessRows: async () => (exited ? [{ pid: 10, ppid: 1, args: '/bin/zsh -l' }] : [row]),
@@ -4145,8 +4211,12 @@ test('restarting the fleet reviewer keeps its identity, its launch env, and its 
     assert.match(replaced.args[1], /'--model' 'claude-fable-20260101'/);
     assert.match(replaced.args[1], /promptSuggestionEnabled/);
     assert.match(replaced.args[1], /'--resume' 'rev'/);
+    const encodedProfile = /'--profile' '([^']+)'/.exec(replaced.args[1])?.[1];
+    assert.equal(JSON.parse(Buffer.from(encodedProfile, 'base64url')).id, 'claude-secondary',
+      'a guarded restart remains on the session authority instead of the configured default');
     assert.equal(replaced.meta.reviewer, true, 'the pane stays the reviewer pane');
     assert.equal(replaced.meta.sessionId, 'rev');
+    assert.equal(replaced.meta.accountId, 'claude-secondary');
 
     // The explicit force/recover transaction resumes through its own code path; it
     // must rebuild the same reviewer configuration, not a bare `claude --resume`.

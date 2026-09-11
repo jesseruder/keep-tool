@@ -15,6 +15,7 @@ function consume(state, row, agent) {
     const content = row.message?.content;
     if (row.type === 'user') s.finalTextAt = 0;
     if (row.type === 'user' && !row.isCompactSummary) {
+      s.rateLimitTerminal = false;
       const t = typeof content === 'string' ? content : '';
       if (!/^<(?:system-reminder|task-notification|command-|local-command|bash-)/.test(t)) s.completed = false;
       const human = typeof content === 'string' ? t && !t.startsWith('<')
@@ -26,6 +27,7 @@ function consume(state, row, agent) {
     }
     if (row.type === 'assistant') {
       s.completed = row.message?.stop_reason === 'end_turn';
+      s.rateLimitTerminal = row.isApiErrorMessage === true && (row.error === 'rate_limit' || row.apiErrorStatus === 429);
       s.finalTextAt = !s.finalTextBlocked && row.message?.stop_reason == null && (typeof content === 'string' ? content.trim().length > 0
         : Array.isArray(content) && content.length > 0 && content.every(b => b.type === 'text') && content.some(b => b.text?.trim())) ? at : 0;
       if (s.finalTextAt) s.finalTextSeen = Math.max(s.finalTextSeen || 0, s.finalTextAt);

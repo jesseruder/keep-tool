@@ -38,14 +38,40 @@ function guardian() {
   });
 }
 
-function launch(agent, executable, args) {
+const AUTH_ENV = {
+  claude: ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_OAUTH_FILE_SUFFIX', 'ANTHROPIC_BASE_URL',
+    'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY'],
+  codex: ['OPENAI_API_KEY', 'CODEX_API_KEY', 'OPENAI_BASE_URL'],
+};
+
+function profileEnvironment(agent, profile, source = process.env) {
+  const env = { ...source };
+  if (!profile) return env;
+  env.KEEP_AGENT_ACCOUNT_ID = profile.id;
+  if (profile.managed) for (const key of AUTH_ENV[agent] || []) delete env[key];
+  if (agent === 'claude') {
+    if (profile.builtIn) {
+      delete env.CLAUDE_CONFIG_DIR;
+      delete env.CLAUDE_SECURESTORAGE_CONFIG_DIR;
+    } else {
+      env.CLAUDE_CONFIG_DIR = profile.configDir;
+      env.CLAUDE_SECURESTORAGE_CONFIG_DIR = profile.configDir;
+    }
+  } else if (profile.builtIn) delete env.CODEX_HOME;
+  else {
+    env.CODEX_HOME = profile.configDir;
+  }
+  return env;
+}
+
+function launch(agent, executable, args, profile = null) {
   if (!['codex', 'claude'].includes(agent) || !executable) {
     process.stderr.write('usage: keep-{codex,claude}-cli <agent executable> [args...]\n');
     process.exitCode = 64;
     return;
   }
   const token = crypto.randomUUID();
-  const env = { ...process.env, ...(agent === 'codex' ? { KEEP_CODEX_CLIENT_TOKEN: token } : {}) };
+  const env = { ...profileEnvironment(agent, profile), ...(agent === 'codex' ? { KEEP_CODEX_CLIENT_TOKEN: token } : {}) };
   if (agent === 'codex' && env.KEEP_PANE) args = ['-c', 'tui.animations=false', '-c', 'tui.whimsy=false', ...args];
   const owner = spawn(process.execPath, [__filename, '--guardian'], { stdio: ['inherit', 'inherit', 'inherit', 'ipc'] });
   let status;
@@ -71,8 +97,24 @@ function command(argv) {
   const quote = (value) => "'" + String(value).replace(/'/g, "'\\''") + "'";
   return [process.execPath, __filename, argv[0], ...argv].map(quote).join(' ');
 }
+function profileCommand(argv, account) {
+  if (!account) return command(argv);
+  const quote = (value) => "'" + String(value).replace(/'/g, "'\\''") + "'";
+  const profile = Buffer.from(JSON.stringify({
+    id: account.id, agent: account.agent, configDir: account.configDir, builtIn: account.builtIn === true, managed: account.managed === true,
+  })).toString('base64url');
+  return [process.execPath, __filename, '--profile', profile, argv[0], ...argv].map(quote).join(' ');
+}
 if (require.main === module) {
   if (process.argv[2] === '--guardian' && process.send) guardian();
-  else launch(process.argv[2], process.argv[3], process.argv.slice(4));
+  else if (process.argv[2] === '--profile') {
+    let profile;
+    try { profile = JSON.parse(Buffer.from(process.argv[3], 'base64url').toString()); } catch {}
+    const agent = process.argv[4];
+    if (!profile || profile.agent !== agent || !profile.configDir) {
+      process.stderr.write('keep launcher: invalid account profile\n');
+      process.exitCode = 64;
+    } else launch(agent, process.argv[5], process.argv.slice(6), profile);
+  } else launch(process.argv[2], process.argv[3], process.argv.slice(4));
 }
-module.exports = { command };
+module.exports = { command, profileCommand, profileEnvironment };

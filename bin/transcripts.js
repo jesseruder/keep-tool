@@ -39,14 +39,32 @@ function readTranscript(file) {
   return fs.readFileSync(file, 'utf8');
 }
 
-function findSessionFile(id) {
-  let dirs = [];
-  try { dirs = fs.readdirSync(PROJECTS_DIR); } catch { return null; }
-  for (const dir of dirs) {
-    const file = path.join(PROJECTS_DIR, dir, `${id}.jsonl`);
-    try { if (fs.statSync(file).isFile()) return file; } catch {}
+function findSessionFile(id, options = {}) {
+  const accounts = require('./accounts');
+  const root = options.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
+  let pinned = null;
+  try { pinned = accounts.forSession(id, 'claude', { root, env: options.env || process.env, allowStagedSource: true }); } catch (error) {
+    if (/multiple accounts without authority/.test(error.message)) throw error;
   }
-  return null;
+  const roots = accounts.projectRoots(options.env || process.env);
+  const ordered = pinned
+    ? [...roots.filter((entry) => entry.accountId === pinned.id), ...roots.filter((entry) => entry.accountId !== pinned.id)]
+    : roots;
+  const found = [];
+  for (const entry of ordered) {
+    let dirs = [];
+    try { dirs = fs.readdirSync(entry.root); } catch { continue; }
+    for (const dir of dirs) {
+      const file = path.join(entry.root, dir, `${id}.jsonl`);
+      try {
+        if (!fs.statSync(file).isFile()) continue;
+        if (pinned && entry.accountId === pinned.id) return file;
+        found.push(file);
+      } catch {}
+    }
+  }
+  if (found.length > 1) throw new Error(`session ${id} exists in multiple accounts without authority`);
+  return found[0] || null;
 }
 
 module.exports = { PROJECTS_DIR, TAIL_BYTES, textOf, readTranscript, readTranscriptTail, findSessionFile };

@@ -1,0 +1,19 @@
+# Shared Claude account setup
+
+`keep accounts setup <target> --share-from <source>` prepares a separate Claude profile for the same work environment. The target keeps its own Claude login and account state while sharing the source profile's instructions and workspace memory.
+
+The setup links `CLAUDE.md`, `skills`, `rules`, `commands`, `agents`, `settings.json`, and `settings.local.json` when they exist. Settings are linked only when they contain no account credential, API-key helper, or provider-routing environment values. The helper refuses a nonempty unmanaged target and never overwrites a conflict.
+
+The helper does not copy or link `.credentials.json`, `auth.json`, a root `.claude.json`, the whole `projects` directory, plugin caches, or marketplace credential state. Log in to the target profile separately. Enabled plugin declarations and marketplace definitions come from shared settings, but a plugin may still need installation or authorization for the target account.
+
+Claude stores memory per project. The launcher calls `ensureSharedMemory(account, cwd)` before a fresh or resumed session. Keep identifies a Git repository through its common Git directory and keeps one source memory directory for that repository. It creates and validates aliases for the exact launch cwd, the current worktree root, and the common/main repository root in both profiles. This covers Claude's project-root lookup for main checkouts, linked worktrees, and nested launch directories without an additional memory setting or launch flag. Every alias must resolve to the same physical directory; Keep refuses an existing divergent directory instead of merging or overwriting it. Outside Git, the canonical working directory is the identity. Claude project directory names replace every non-alphanumeric character with `-`, matching the CLI. Unrelated repositories remain separate.
+
+An explicit `autoMemoryDirectory` in the repository's `.claude/settings.json` or `.claude/settings.local.json` takes precedence. Claude reads that repository setting natively; Keep verifies and prepares its directory instead of adding a command-line override. This avoids changing the invocation class or collapsing every repository into one generated global memory store.
+
+MCP definitions are copied selectively from the source account's `.claude.json`: the global `mcpServers` plus the current canonical project's `mcpServers`. No login, trust history, OAuth state, or other `.claude.json` fields are copied. The resulting private `.keep-mcp.json` is passed to Claude with `--mcp-config`. Definitions that rely on external OAuth or keychain state may still require authorization in the target account.
+
+The generated MCP file is managed conservatively. If its contents differ from the source on a later launch, Keep refuses the conflict instead of overwriting it. Remove only that generated `.keep-mcp.json` and retry the launch to accept an intentional source MCP change. Handoff preflight uses `compatible(source, target, cwd)` and refuses transfer when portable settings or effective MCP tools differ.
+
+Compatibility is direction-independent. A managed profile traces MCP and memory back to its original native profile, so a third profile can be prepared from a second one without losing integrations. Transfers back to the native profile use its native MCP configuration and therefore return no supplemental `mcpConfig`; transfers into a managed profile return its validated `.keep-mcp.json`. Profiles with different effective settings, MCP definitions, or repository memory are refused.
+
+Initial setup is staged in a private sibling directory and renamed into place only after all links and generated files succeed. A failed setup leaves an absent target absent, or restores a pre-existing empty target, so the same command can be retried safely.

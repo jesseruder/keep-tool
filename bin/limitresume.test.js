@@ -112,6 +112,29 @@ test('resumeDecision sends once the window has reset', () => {
   assert.deepEqual(decision, { action: 'send', reason: 'limit window has reset', resetAt: RESET_AT });
 });
 
+test('resumeDecision uses the session account snapshot and fails closed when its account is unknown', () => {
+  const usage = {
+    claude: { limits: [{ label: 'Fable wk', percent: 1, resetsAt: NOW - 3600e3 }], fetchedAt: NOW },
+    accounts: {
+      'account-a': { id: 'account-a', agent: 'claude', limits: [{ label: 'Fable wk', percent: 100, resetsAt: NOW - 3600e3 }], fetchedAt: NOW },
+      'account-b': { id: 'account-b', agent: 'claude', limits: [{ label: 'Fable wk', percent: 2, resetsAt: NOW - 3600e3 }], fetchedAt: NOW },
+    },
+  };
+  const limited = session({ accountId: 'account-a', rateLimit: { at: HIT_AT, type: 'fable_weekly', resetsAt: null } });
+  assert.deepEqual(resumeDecision({ session: limited, usage, ledger: ledgerWith(null), now: NOW, multiAccount: true }), {
+    action: 'wait', reason: 'limit still exhausted', resetAt: NOW - 3600e3,
+  });
+  const available = session({ accountId: 'account-b', rateLimit: { at: HIT_AT, type: 'fable_weekly', resetsAt: null } });
+  assert.equal(resumeDecision({ session: available, usage, ledger: ledgerWith(null), now: NOW, multiAccount: true }).action, 'send');
+  const unknown = session({ accountId: 'gone', rateLimit: { at: HIT_AT, type: 'fable_weekly', resetsAt: null } });
+  assert.deepEqual(resumeDecision({ session: unknown, usage, ledger: ledgerWith(null), now: NOW, multiAccount: true }), {
+    action: 'wait', reason: 'account usage unavailable', resetAt: null,
+  });
+  const unpinned = session({ rateLimit: { at: HIT_AT, type: 'fable_weekly', resetsAt: null } });
+  delete unpinned.accountId;
+  assert.equal(resumeDecision({ session: unpinned, usage, ledger: ledgerWith(null), now: NOW, multiAccount: true }).reason, 'account usage unavailable');
+});
+
 test('resumeDecision waits for the reset, the grace window, and a still-exhausted account', () => {
   const early = resumeDecision({
     session: session({ rateLimit: { at: HIT_AT, type: 'five_hour', resetsAt: NOW + 60 * 60e3 } }),

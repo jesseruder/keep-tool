@@ -332,7 +332,7 @@ function cleanProse(value) {
 function runModel(prompt, model) {
   return new Promise((resolve, reject) => {
     const sessionId = crypto.randomUUID();
-    const env = { ...process.env, KEEP_RUN: '1' };
+    const env = summarize.automationEnv('standup').env;
     delete env.CLAUDE_CODE_SESSION_ID;
     let child;
     try {

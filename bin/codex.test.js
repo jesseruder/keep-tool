@@ -99,3 +99,72 @@ test('newer child rollout cannot replace parent status, text, or lookup path', (
     assert.equal(exact.job.endedTurn, false, 'explicitly hosted/resumed jobs keep their real activity');
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
+
+test('configured Codex roots keep discovery, titles, authority, and path caches account-scoped', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-accounts-'));
+  try {
+    const keepRoot = path.join(home, 'keep');
+    const configFile = path.join(home, 'config.json');
+    const roots = [path.join(home, 'codex-one'), path.join(home, 'codex-two')];
+    fs.mkdirSync(keepRoot, { recursive: true });
+    fs.writeFileSync(configFile, JSON.stringify({
+      version: 1,
+      accounts: [
+        { id: 'codex-one', label: 'One', agent: 'codex', configDir: roots[0] },
+        { id: 'codex-two', label: 'Two', agent: 'codex', configDir: roots[1] },
+      ],
+      defaultAccounts: { codex: 'codex-one' },
+    }));
+    const now = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    const files = {};
+    for (let i = 0; i < roots.length; i += 1) {
+      const account = `codex-${i ? 'two' : 'one'}`;
+      const dir = path.join(roots[i], 'sessions', String(now.getFullYear()), p(now.getMonth() + 1), p(now.getDate()));
+      fs.mkdirSync(dir, { recursive: true });
+      for (const id of ['shared', `${i ? 'two' : 'one'}-only`]) {
+        const file = path.join(dir, `rollout-test-${id}.jsonl`);
+        writeRollout(file, { id, cwd: `/${account}/${id}` }, true);
+        files[`${account}:${id}`] = file;
+      }
+      fs.writeFileSync(path.join(roots[i], 'session_index.jsonl'), [
+        { id: 'shared', thread_name: i ? 'Shared on two' : 'Shared on one' },
+        { id: `${i ? 'two' : 'one'}-only`, thread_name: i ? 'Only two' : 'Only one' },
+      ].map(JSON.stringify).join('\n') + '\n');
+    }
+    const authorityDir = path.join(keepRoot, '.keep', 'session-accounts');
+    fs.mkdirSync(authorityDir, { recursive: true });
+    fs.writeFileSync(path.join(authorityDir, 'shared.json'), JSON.stringify({
+      version: 1, sessionId: 'shared', agent: 'codex', accountId: 'codex-one', updatedAt: Date.now(),
+    }));
+    const script = `
+      const c = require('./bin/codex.js');
+      const accounts = require('./bin/accounts.js');
+      const rows = c.scan();
+      const before = c.sessionFor('shared');
+      const beforeFile = c.findRolloutFile('shared');
+      accounts.pinSession('shared', 'codex', 'codex-two', { root: process.env.KEEP_DIR, transfer: true });
+      const after = c.sessionFor('shared');
+      const afterFile = c.findRolloutFile('shared');
+      console.log(JSON.stringify({ rows, before, beforeFile, after, afterFile }));
+    `;
+    const run = spawnSync(process.execPath, ['-e', script], {
+      cwd: path.join(__dirname, '..'),
+      env: { ...process.env, HOME: home, KEEP_DIR: keepRoot, KEEP_CONFIG: configFile },
+      encoding: 'utf8', timeout: 10000,
+    });
+    assert.equal(run.status, 0, run.stderr);
+    const result = JSON.parse(run.stdout);
+    assert.deepEqual(result.rows.map((row) => [row.id, row.accountId, row.title]).sort(), [
+      ['one-only', 'codex-one', 'Only one'],
+      ['shared', 'codex-one', 'Shared on one'],
+      ['two-only', 'codex-two', 'Only two'],
+    ]);
+    assert.equal(result.before.project, '/codex-one/shared');
+    assert.equal(result.beforeFile, files['codex-one:shared']);
+    assert.equal(result.after.project, '/codex-two/shared');
+    assert.equal(result.after.title, 'Shared on two');
+    assert.equal(result.after.accountId, 'codex-two');
+    assert.equal(result.afterFile, files['codex-two:shared']);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});

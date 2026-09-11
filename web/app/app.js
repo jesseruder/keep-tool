@@ -609,10 +609,17 @@ function clearElement(element) {
 }
 
 function renderMeters() {
-  const meters = [
-    ...(data.usage?.claude?.limits || []).map((limit) => ({ ...limit, source: 'claude' })),
-    ...(data.usage?.codex?.windows || []).map((window) => ({ ...window, label: `Codex ${window.label}`, source: 'codex' })),
-  ];
+  const accountUsage = Object.values(data.usage?.accounts || {});
+  const meters = ['claude', 'codex'].flatMap((agent) => {
+    const configured = accountUsage.filter((account) => account.agent === agent);
+    if (configured.length > 1) return configured.flatMap((account) => {
+      const values = agent === 'claude' ? account.limits || [] : account.windows || [];
+      return values.map((value) => ({ ...value, label: `${account.label || account.id} ${value.label}` }));
+    });
+    const legacy = data.usage?.[agent];
+    const values = agent === 'claude' ? legacy?.limits || [] : legacy?.windows || [];
+    return values.map((value) => ({ ...value, label: agent === 'codex' ? `Codex ${value.label}` : value.label }));
+  });
   document.querySelector('#meters').innerHTML = meters.map((meter) => {
     const percent = Math.max(0, Math.min(100, Number(meter.percent) || 0));
     return `<span class="meter" title="${meter.resetsAt ? `resets ${esc(new Date(meter.resetsAt).toLocaleString())}` : ''}"><span class="meter-label">${esc(meter.label)}</span><i><b class="${percent >= 75 ? 'warn' : ''}" style="width:${percent}%"></b></i><span>${Math.round(percent)}%</span></span>`;

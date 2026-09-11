@@ -203,3 +203,15 @@ test('Claude process-local cron and services block restart; Stop hook alone is i
   call('service', 'Bash', { run_in_background: true }); result('service', 'Command running in background with ID: server');
   append('parent', assistant([], 'end_turn')); assert.throws(verify, /unresolved/);
 }, 'claude'));
+
+test('terminal Claude quota errors are allowed only by explicit handoff proof and never with unresolved work', () => fixture(({ append, verify }) => {
+  append('parent', { type: 'user', sessionId: 'parent', message: { content: 'Continue the task' } });
+  append('parent', { type: 'assistant', sessionId: 'parent', isApiErrorMessage: true, error: 'rate_limit', apiErrorStatus: 429,
+    message: { content: [], stop_reason: null } });
+  assert.throws(verify, /not verifiably complete/, 'normal restart remains strict');
+  verify({ allowTerminalRateLimit: true })();
+  append('parent', { type: 'assistant', sessionId: 'parent', message: { content: [{ type: 'tool_use', id: 'busy', name: 'Bash', input: {} }], stop_reason: 'tool_use' } });
+  append('parent', { type: 'assistant', sessionId: 'parent', isApiErrorMessage: true, error: 'rate_limit', apiErrorStatus: 429,
+    message: { content: [], stop_reason: null } });
+  assert.throws(() => verify({ allowTerminalRateLimit: true }), /calls|complete/);
+}, 'claude'));

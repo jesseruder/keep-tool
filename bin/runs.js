@@ -199,6 +199,10 @@ function headlessRunArgs(prompt, sessionId) {
   ];
 }
 
+function headlessRunEnvironment(kind, inheritedEnv = process.env, accountApi) {
+  return summarize.automationEnv(kind === 'check' ? 'checks' : 'runs', inheritedEnv, accountApi);
+}
+
 function startRun(taskId, kind, extra, opts) {
   if (active.has(taskId)) throw new keep.KeepError(`a run is already active for ${taskId}`);
   if (active.size >= MAX_CONCURRENT) throw new keep.KeepError(`already ${MAX_CONCURRENT} runs active`);
@@ -213,7 +217,8 @@ function startRun(taskId, kind, extra, opts) {
   const logFile = path.join(RUNS_DIR, `${id}.jsonl`);
   const bin = claudeBin();
   const prompt = buildPrompt(task, kind, extra, opts);
-  const env = { ...process.env, KEEP_RUN: '1' }; // KEEP_RUN exempts the run from Stop-hook enforcement
+  const selectedAccount = headlessRunEnvironment(kind);
+  const env = selectedAccount.env; // KEEP_RUN exempts the run from Stop-hook enforcement
   delete env.CLAUDE_CODE_SESSION_ID; // the run is its own session, not ours
   let baseSha = null;
   if (kind === 'task') {
@@ -230,7 +235,7 @@ function startRun(taskId, kind, extra, opts) {
   });
 
   const run = {
-    id, taskId, kind, cwd,
+    id, taskId, kind, cwd, accountId: selectedAccount.account.id,
     startStatus: task.fm.status,
     startCardFingerprint: cardFingerprint(task),
     pid: child.pid,
@@ -1013,6 +1018,7 @@ function startScheduler() {
 module.exports = {
   startRun, stopRun, listRuns, readDiff, recover, retryPending, startScheduler, setOnChange, setNotifier, setDeliverer,
   buildPrompt, headlessRunArgs, checkDeliveryMessage, checkDeliveryKey, planDueCard, deliveryWarning,
+  headlessRunEnvironment,
   cardFingerprint, finalizePayload, pendingCheckin, landFinalCheckin, NO_RESULT,
   parseVerdict, verdictOutcome, onPassOutcome, probePayload, startProbe, startDueProbe, probeDue,
   landProbeResult, escalateProbeFailure, isTransientStartError, MAX_CONCURRENT_PROBES,

@@ -110,6 +110,18 @@ function usageLimitFor(rateLimit, usageSnapshot) {
   return null;
 }
 
+function usageForSession(session, usageSnapshot, multiAccount) {
+  const id = session && session.accountId;
+  const byAccount = usageSnapshot && usageSnapshot.accounts;
+  if (id && byAccount && typeof byAccount === 'object') {
+    const value = byAccount[id];
+    if (value && value.agent === 'claude') return { usage: { claude: value }, unknown: false };
+    return { usage: null, unknown: true };
+  }
+  if (multiAccount) return { usage: null, unknown: true };
+  return { usage: usageSnapshot, unknown: false };
+}
+
 function resetTimeFor(rateLimit, usageSnapshot, now) {
   if (!rateLimit) return null;
   const recorded = msOf(rateLimit.resetsAt);
@@ -146,7 +158,7 @@ function sameWindow(resetAt, priorResetAt) {
   return resetAt !== null && prior !== null && Math.abs(resetAt - prior) <= SAME_WINDOW_MS;
 }
 
-function resumeDecision({ session, usage, ledger, now } = {}) {
+function resumeDecision({ session, usage, ledger, now, multiAccount = false } = {}) {
   const at = Number.isFinite(Number(now)) ? Number(now) : Date.now();
   const s = session || {};
   const rateLimit = s.rateLimit;
@@ -158,6 +170,9 @@ function resumeDecision({ session, usage, ledger, now } = {}) {
   if (s.exited) return skip('session exited');
   // A question or plan on screen is addressed to Owner; "continue" would answer it.
   if (s.pendingQuestion || s.pendingPlan) return skip('waiting on a person');
+  const selected = usageForSession(s, usage, multiAccount);
+  if (selected.unknown) return { action: 'wait', reason: 'account usage unavailable', resetAt: null };
+  usage = selected.usage;
   // A 429 that is not one of the known usage windows (a transient overload, a
   // per-request cap) has no reset to wait for: retrying it on a timer is guessing.
   if (!KNOWN_TYPES.includes(rateLimit.type)) return skip('unrecognized limit');
@@ -228,6 +243,11 @@ async function tick(deps = {}) {
   try { sessions = deps.scanSessions() || []; } catch (error) { return { ok: false, sent: 0, waiting: 0, detail: `scan failed: ${error.message}` }; }
   let usage = null;
   try { usage = deps.getUsage ? deps.getUsage() : null; } catch { usage = null; }
+  let multiAccount = deps.hasMultipleClaude;
+  if (multiAccount === undefined) {
+    try { multiAccount = require('./accounts.js').hasMultiple('claude', deps.env || process.env); }
+    catch { multiAccount = true; }
+  }
 
   const ledger = readLedger(root);
   let sent = 0;
@@ -277,7 +297,7 @@ async function tick(deps = {}) {
       }
       continue;
     }
-    const decision = resumeDecision({ session, usage, ledger, now });
+    const decision = resumeDecision({ session, usage, ledger, now, multiAccount });
     if (decision.action === 'skip') {
       // A terminal skip is worth showing on the dashboard: the session is stuck
       // and nobody is coming for it unless Owner looks. Ordinary skips stay quiet.
@@ -304,6 +324,7 @@ async function tick(deps = {}) {
         sentHistory: prior && Array.isArray(prior.sentHistory) ? prior.sentHistory : [],
       };
     entry.type = session.rateLimit.type;
+    entry.accountId = session.accountId || null;
     entry.resetAt = decision.resetAt;
     entry.reason = decision.reason;
     entry.state = 'waiting';
@@ -446,6 +467,7 @@ module.exports = {
   ledgerFile,
   readLedger,
   resetTimeFor,
+  usageForSession,
   resumeDecision,
   tick,
   dashboardState,

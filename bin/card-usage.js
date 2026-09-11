@@ -46,12 +46,32 @@ function walk(folder, files = []) {
   }
   return files;
 }
-function discover(home = os.homedir()) {
-  return [
+function discover(home, options = {}) {
+  // options.home has long been the isolated fixture contract: preserve its
+  // single-home layout even when the developer machine config has many accounts.
+  if (home !== undefined) return [
     ...walk(path.join(home, '.claude', 'projects')).map(file => ({ file, agent: 'claude' })),
     ...walk(path.join(home, '.codex', 'sessions')).map(file => ({ file, agent: 'codex' })),
     ...walk(path.join(home, '.codex', 'archived_sessions')).map(file => ({ file, agent: 'codex' })),
   ];
+  const accountApi = options.accounts || require('./accounts.js');
+  const records = accountApi.list(options.env || process.env);
+  const files = [];
+  const seen = new Set();
+  for (const account of records) {
+    const configDir = account.builtIn && !account.managed
+      ? path.join(os.homedir(), `.${account.agent}`) : account.configDir;
+    const roots = account.agent === 'claude'
+      ? [path.join(configDir, 'projects')]
+      : [path.join(configDir, 'sessions'), path.join(configDir, 'archived_sessions')];
+    for (const root of roots) for (const file of walk(root)) {
+      const identity = `${account.agent}:${file}`;
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      files.push({ file, agent: account.agent, accountId: account.id });
+    }
+  }
+  return files;
 }
 function normalize(u, agent) {
   const cacheRead = number(agent === 'codex' ? u.cached_input_tokens : u.cache_read_input_tokens);
@@ -72,7 +92,13 @@ function sessionOwner(ledger, owners, id, at, visited = new Set()) {
   if (session?.parent) return sessionOwner(ledger, owners, session.parent, Math.max(ledger.since, session.started), visited);
   return ownerAt(owners, id, at);
 }
-function fold(ledger, cursor, record, owners, root) {
+function accountAllows(cursor, authority) {
+  if (!cursor.accountId || !cursor.session) return true;
+  const raw = cursor.session.slice(cursor.session.indexOf(':') + 1).split('/')[0];
+  const record = authority && authority[raw];
+  return !record || (record.agent === cursor.agent && record.accountId === cursor.accountId);
+}
+function fold(ledger, cursor, record, owners, root, authority) {
   const at = Date.parse(record.timestamp || record.payload?.timestamp || '');
   const agent = cursor.agent;
   if (agent === 'codex' && record.type === 'session_meta') {
@@ -98,6 +124,7 @@ function fold(ledger, cursor, record, owners, root) {
     };
   }
   if (agent === 'codex' && record.type === 'turn_context') cursor.model = record.payload?.model || 'unknown';
+  if (!accountAllows(cursor, authority)) return;
   let usage, identity, model;
   if (agent === 'claude' && record.type === 'assistant' && record.message?.usage) {
     // Sidechain copies in the main log are accounted from their own transcript.
@@ -174,7 +201,11 @@ function collect(root, tasks, options = {}) {
   if (!fs.existsSync(path.join(dir(root), 'initialized.json'))) write(path.join(dir(root), 'initialized.json'), { since: ledger.since });
   ledger.excluded ||= {};
   let budget = options.budget ?? 16 * 1024 * 1024;
-  const files = options.files || discover(options.home);
+  const files = options.files || discover(options.home, { env: options.env, accounts: options.accounts });
+  let authority = options.authority;
+  if (authority === undefined) {
+    try { authority = require('./accounts.js').authority(root); } catch { authority = {}; }
+  }
   let pending = false;
   let backlog = false;
   for (const source of files) {
@@ -210,7 +241,7 @@ function collect(root, tasks, options = {}) {
       if (!line.trim()) continue;
       let record;
       try { record = JSON.parse(line); } catch { ledger.issues.malformedRecord = true; continue; }
-      fold(ledger, c, record, owners, root);
+      fold(ledger, c, record, owners, root, authority);
     }
     c.offset += end + 1;
     c.anchor = anchor(source.file, c.offset);

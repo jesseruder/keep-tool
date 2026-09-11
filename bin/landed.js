@@ -389,7 +389,7 @@ function judgePrompt(entryText, task) {
 function runModel(prompt, model, timeout = MODEL_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const sessionId = crypto.randomUUID();
-    const env = { ...process.env, KEEP_RUN: '1' };
+    const env = summarize.automationEnv('landed').env;
     delete env.CLAUDE_CODE_SESSION_ID;
     let child;
     try {
@@ -917,7 +917,7 @@ function startScheduler({ onChange } = {}) {
     running = true;
     try {
       childProcess.execFile(process.execPath, [path.join(__dirname, 'keep.js'), 'landed'], {
-        env: { ...process.env, KEEP_RUN: '1' },
+        env: summarize.automationEnv('landed').env,
         // 8 shadow calls × 90 s = 12 min worst case, well inside 30 minutes.
         timeout: DAEMON_TIMEOUT_MS,
         maxBuffer: 4 << 20,

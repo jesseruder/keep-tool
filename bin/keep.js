@@ -331,7 +331,10 @@ function currentSession() {
   return null;
 }
 
-function resumeCommand(session) {
+function resumeCommand(session, env = process.env) {
+  try {
+    if (require('./accounts').list(env).some((account) => account.managed)) return `keep open ${session.id}`;
+  } catch {}
   return `${session.agent === 'codex' ? 'codex resume' : 'claude --resume'} ${session.id}`;
 }
 
@@ -3858,9 +3861,9 @@ function writeOpenHandoff(id, message, task) {
 }
 
 commands.open = async (argv, deps = {}) => {
-  const o = parseArgs(argv, { fresh: 'bool', agent: 'str', model: 'str', 'message-file': 'str' });
+  const o = parseArgs(argv, { fresh: 'bool', agent: 'str', model: 'str', account: 'str', 'message-file': 'str' });
   const id = o._[0];
-  if (!id) die('usage: keep open <card-id|session-id> [--fresh] [--agent claude|codex] [--model <id>] [-m "opening message" | --message-file <path>]');
+  if (!id) die('usage: keep open <card-id|session-id> [--fresh] [--agent claude|codex] [--account <id>] [--model <id>] [-m "opening message" | --message-file <path>]');
   if (o.agent && !['claude', 'codex'].includes(o.agent)) die('agent must be claude or codex');
   // --model goes on the launched command line only (claude --model / codex -m), so it
   // applies to that process and never touches ~/.claude/settings.json.
@@ -3879,6 +3882,7 @@ commands.open = async (argv, deps = {}) => {
   }
   try {
     const payload = { ...(task ? { taskId: id } : { sessionId: id }), fresh: Boolean(o.fresh), agent: o.agent };
+    if (o.account != null) payload.accountId = o.account;
     if (o.model != null) payload.model = o.model;
     if (message != null) payload.message = message;
     // The launching session hands the card over; the daemon unlinks it once the new session is on the card.
@@ -3889,6 +3893,63 @@ commands.open = async (argv, deps = {}) => {
   } catch (e) {
     die(e.status ? e.message : "keep serve isn't running (start it or use the dashboard)");
   }
+};
+
+commands.accounts = (argv, deps = {}) => {
+  const accountStore = deps.accounts || require('./accounts');
+  const verb = argv[0] || 'list';
+  if (verb === 'list') {
+    const o = parseArgs(argv.slice(1), { json: 'bool' });
+    if (o._.length) die('usage: keep accounts list [--json]');
+    const state = accountStore.publicState();
+    if (o.json) return console.log(JSON.stringify(state, null, 2));
+    for (const account of state.accounts) console.log(`${account.id}\t${account.agent}\t${account.isDefault ? 'default\t' : '\t'}${account.label}`);
+    return;
+  }
+  if (verb === 'add') {
+    const o = parseArgs(argv.slice(1), { agent: 'str', label: 'str', 'config-dir': 'str', 'credential-service': 'str' });
+    const id = o._[0];
+    if (!id || o._.length !== 1 || !o.agent || !o.label || !o['config-dir']) {
+      die('usage: keep accounts add <id> --agent claude|codex --label <label> --config-dir <dir> [--credential-service <name>]');
+    }
+    if (!['claude', 'codex'].includes(o.agent)) die('--agent must be claude or codex');
+    const account = accountStore.add({ id, agent: o.agent, label: o.label, configDir: o['config-dir'], credentialService: o['credential-service'] });
+    console.log(`added ${account.id} (${account.label}); ${accountStore.defaultFor(account.agent).id} remains the ${account.agent} default`);
+    return;
+  }
+  if (verb === 'default') {
+    const [agent, id, ...extra] = argv.slice(1);
+    if (!['claude', 'codex'].includes(agent) || !id || extra.length) die('usage: keep accounts default claude|codex <id>');
+    const account = accountStore.setDefault(agent, id);
+    console.log(`${account.id} is now the ${agent} default for new sessions`);
+    return;
+  }
+  if (verb === 'setup') {
+    const o = parseArgs(argv.slice(1), { 'share-from': 'str' });
+    const id = o._[0];
+    if (!id || o._.length !== 1 || !o['share-from']) die('usage: keep accounts setup <id> --share-from <source-id>');
+    const target = accountStore.get(id), source = accountStore.get(o['share-from']);
+    if (!target || !source) die('unknown source or target account');
+    const result = require('./account-setup').shareSetup(source, target);
+    console.log(`shared Claude setup from ${source.id} to ${target.id} (${result.sharedEntries.length} shared entries)`);
+    return;
+  }
+  die('usage: keep accounts list|add|default|setup');
+};
+
+commands.handoff = async (argv, deps = {}) => {
+  const o = parseArgs(argv, { pane: 'str', account: 'str' });
+  const sessionId = o._[0];
+  if (!sessionId || o._.length !== 1 || !o.pane || !o.account) {
+    die('usage: keep handoff <session-id> --pane <pane-id> --account <target-id>');
+  }
+  let response;
+  try { response = await (deps.postKeepApi || postKeepApi)('/api/handoff-session', { sessionId, pane: o.pane, accountId: o.account }, 180000); }
+  catch { die("keep serve isn't running (start it or use the dashboard)"); }
+  let result = {};
+  try { result = JSON.parse(response.data); } catch {}
+  if (response.status !== 200 || !result.ok) die(result.error || `keep serve returned an unexpected response (${response.status})`);
+  console.log(`moved session ${result.sessionId} from ${result.sourceAccountId} to ${result.targetAccountId} in pane ${result.pane}`);
 };
 
 function restoreAge(lastSeenAlive, now) {
@@ -4980,7 +5041,9 @@ async function recordSessionPane(input, agent = 'claude', deps = {}) {
       claimed = prior.claimed === true;
     }
   } catch {}
-  const record = { at, startedAt, cwd, agent, pane, claimed };
+  const accountId = /^(?:[a-z0-9][a-z0-9_-]{0,63}|(?:claude|codex)\/default)$/.test(env.KEEP_AGENT_ACCOUNT_ID || '')
+    ? env.KEEP_AGENT_ACCOUNT_ID : null;
+  const record = { at, startedAt, cwd, agent, pane, claimed, ...(accountId ? { accountId } : {}) };
   fs.mkdirSync(dir, { recursive: true });
   (deps.writePaneRecord || writePaneRecord)(file, record);
   for (const name of fs.readdirSync(dir)) {
@@ -5605,13 +5668,20 @@ commands['review-stats'] = async (argv) => {
   const stats = review.reviewStats();
   try {
     const usage = require('./usage.js');
+    const accountApi = require('./accounts.js');
     usage.setCacheFile(path.join(ROOT, '.keep', 'usage-cache.json'));
     usage.getUsage();
-    for (let i = 0; i < 20 && !usage.getUsage().claude.fetchedAt; i += 1) {
+    const authority = accountApi.authority(ROOT);
+    const liveMarker = stats.markers.find((marker) => !marker.ended);
+    const accountId = liveMarker && authority[liveMarker.id] && authority[liveMarker.id].accountId;
+    const selected = (value) => accountId
+      ? value.accounts && value.accounts[accountId]
+      : accountApi.hasMultiple('claude') ? null : value.claude;
+    for (let i = 0; i < 20 && !(selected(usage.getUsage()) || {}).fetchedAt; i += 1) {
       await new Promise((resolve) => setTimeout(resolve, 150));
     }
-    const limits = usage.getUsage().claude.limits || [];
-    stats.weekly = review.reviewerWeekly(limits);
+    const limits = (selected(usage.getUsage()) || {}).limits || [];
+    stats.weekly = review.reviewerWeekly(limits, accountId);
   } catch {}
   if (o.json) { console.log(JSON.stringify(stats, null, 2)); return; }
   const fmt = (t) => t ? new Date(t).toLocaleString() : 'never';
@@ -6252,6 +6322,11 @@ ${stepUsage()}
   keep serve             # start the dashboard server (KEEP_PORT, default 7777)
                          # done-card sessions close after KEEP_AUTO_CLOSE_DONE_MIN (default 15); KEEP_AUTO_CLOSE=0 disables auto-close
   keep restart-daemon    # guarded daemon-only restart (requires launchd KeepAlive)
+  keep accounts list [--json]
+  keep accounts add <id> --agent claude|codex --label <label> --config-dir <dir>
+  keep accounts default claude|codex <id>
+  keep accounts setup <id> --share-from <source-id>
+  keep handoff <session-id> --pane <pane-id> --account <target-id>
   keep force-restart <session-id> --pane <pane-id> [--recover]    # explicit interruption; never automatic cleanup
   keep review-queue [--limit n] [--min-score n] [--json]   # what deserves review now
   keep review-bundle <id> [--budget n] [--session id] [--force]
@@ -6329,7 +6404,8 @@ module.exports = {
   stepMatchForInput, guardStepCommand, recordStepRun, codexToolInput, codexExitCode,
   codexJobText, renderCodexJobs,
   commandUsage, helpText, formatOpenResult, openCommand: commands.open, postOpen, OPEN_MESSAGE_LIMIT, OPEN_MESSAGE_ERROR, LAUNCH_MODEL_RE,
-  restoreCommandCli: commands.restore, resumeCommandCli: commands.resume,
+  restoreCommandCli: commands.restore, resumeCommandCli: commands.resume, resumeCommand,
+  accountsCommandCli: commands.accounts, handoffCommandCli: commands.handoff,
   hostCommandCli: commands.host, paneCommandCli: commands.pane, attachCommandCli: commands.attach,
   resolveHostPane, renderHostPanes, parseHostSpawn,
 };

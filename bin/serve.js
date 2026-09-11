@@ -19,6 +19,7 @@ const usage = require('./usage.js');
 const cardUsage = require('./card-usage.js');
 const codex = require('./codex.js');
 const transcripts = require('./transcripts.js');
+const accounts = require('./accounts.js');
 const review = require('./review.js');
 const reviewQueue = require('./review-queue.js');
 const who = require('./who.js');
@@ -43,7 +44,8 @@ const PORT = parseInt(process.env.KEEP_PORT || '7777', 10);
 const { PROJECTS_DIR, TAIL_BYTES, textOf, readTranscriptTail, findSessionFile } = transcripts;
 const WEB_ROOT = path.join(__dirname, '..', 'web');
 const SESSION_WINDOW_MS = 48 * 3600e3; // ignore transcripts older than this
-const claudeTranscriptIndex = require('./transcript-index').createTranscriptIndex(PROJECTS_DIR);
+const claudeProjectRoots = accounts.projectRoots();
+const claudeTranscriptIndex = require('./transcript-index').createMultiRootTranscriptIndex(claudeProjectRoots);
 const { compactState, wantsCompactState, createJobChangeTracker } = require('./dashboard-state');
 const execFileAsync = promisify(execFile);
 const ATTENTION_KINDS = new Set(['question', 'plan', 'permission', 'complete', 'input', 'review', 'blocked', 'overdue', 'unblocked', 'health', 'stalled']);
@@ -2621,7 +2623,10 @@ async function restartSession(body, deps = {}) {
     if (!(await host('hello')).replaceExited) throw Error('Terminal host must be refreshed before restarting sessions');
     const pane = (await host('get', { pane: body.pane })).pane;
     const session = (await (deps.buildState || buildState)({ hostPanes: [pane] })).sessions.find((s) => s.id === body.sessionId);
-    const reason = require('./session-restart').refusal(session, pane, body.mode === 'idle');
+    const terminalLimit = deps.allowTerminalRateLimit === true && session?.kind === 'claude' && session.rateLimit && !session.pendingBackground
+      && !session.toolRunning && !session.pendingQuestion && !session.pendingPlan && !(session.unknownBackgroundJobs || []).length;
+    const restartSessionState = terminalLimit ? { ...session, endedTurn: true, rateLimit: null } : session;
+    const reason = require('./session-restart').refusal(restartSessionState, pane, body.mode === 'idle');
     if (pane.pid !== body.pid) throw new InjectionError(409, 'Session process changed');
     if (reason) {
       if (/^Waiting |^Pause session-local scheduled jobs/.test(reason)) throw transient(reason);
@@ -2641,6 +2646,7 @@ async function restartSession(body, deps = {}) {
     let childProof;
     try {
       childProof = ledger.verify({ root: deps.root || keep.ROOT, agent: session.kind, sid: session.id, file,
+        allowTerminalRateLimit: terminalLimit,
         instance: { id: require('./background-jobs').processInstance(pane, originalIdentity.pid), processScoped: true, live: true }, resolveChild });
     } catch (error) {
       if (error instanceof ledger.Recovering) throw transient(error.message);
@@ -2667,7 +2673,8 @@ async function restartSession(body, deps = {}) {
     };
     await checkChildren();
     try {
-      await (deps.closeIdleSession || closeIdleSession)(body, { ...deps, restartProof: childProof, closePolicy: { manual: true, restart: true }, withInjectionLock: (fn) => fn(), beforeClose: checkChildren,
+      await (deps.closeIdleSession || closeIdleSession)(body, { ...deps, allowTerminalRateLimit: terminalLimit,
+        restartProof: childProof, closePolicy: { manual: true, restart: true }, withInjectionLock: (fn) => fn(), beforeClose: checkChildren,
         beforeExitInput: () => { exitInputStarted = true; },
       });
     } catch (error) {
@@ -2698,12 +2705,23 @@ async function restartSession(body, deps = {}) {
     const bypass = session.kind === 'codex' ? '--dangerously-bypass-approvals-and-sandbox' : '--dangerously-skip-permissions';
     const flags = originalArgs.split(/\s+/).includes(bypass) ? [bypass] : [];
     const reviewerSpec = reviewerResumeSpec(session, pane, deps);
-    const argv = [session.kind, ...flags, ...reviewerSpec.flags,
+    const requestedResumeModel = deps.resumeModel || pane.meta?.model;
+    const launchModel = typeof requestedResumeModel === 'string' && keep.LAUNCH_MODEL_RE.test(requestedResumeModel) ? requestedResumeModel : '';
+    const modelArgs = launchModel ? (session.kind === 'codex' ? ['-m', launchModel] : ['--model', launchModel]) : [];
+    let account = deps.resumeAccount || null;
+    if (!account) {
+      try { account = accounts.forSession(session.id, session.kind, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
+      catch (error) { throw new InjectionError(409, error.message); }
+      account ||= accounts.defaultFor(session.kind, deps.env || process.env);
+    }
+    const mcpArgs = session.kind === 'claude' && deps.resumeMcpConfig ? ['--mcp-config', deps.resumeMcpConfig] : [];
+    const argv = [session.kind, ...flags, ...reviewerSpec.flags, ...mcpArgs, ...modelArgs,
       session.kind === 'codex' ? 'resume' : '--resume', session.id];
     const result = await host('replace-exited', { paneId: pane.id, expectedPid: pane.pid, sessionId: stopped.meta?.sessionId,
-      cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').command(argv)}`], cwd,
+      cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`], cwd,
       ...(reviewerSpec.env ? { env: reviewerSpec.env } : {}),
-      cols: pane.cols, rows: pane.rows, meta: { ...pane.meta, agent: session.kind, sessionId: session.id, restartedAt: Date.now() } });
+      cols: pane.cols, rows: pane.rows, meta: { ...pane.meta, agent: session.kind, sessionId: session.id,
+        accountId: account.id, accountLabel: account.label, restartedAt: Date.now() } });
     await (deps.waitForHostAgent || waitForHostAgent)({ pane: pane.id }, session.kind, deps);
     return { ok: true, sessionId: session.id, pane: result.pane.id, pid: result.pane.pid };
   }, { pane: body.pane, session: body.sessionId, model: true });
@@ -2751,7 +2769,13 @@ async function forceRestartSession(entry, save, deps = {}) {
       replace: async (original, job, expectedPid) => {
         const bypass = original.agent === 'codex' ? '--dangerously-bypass-approvals-and-sandbox' : '--dangerously-skip-permissions';
         const reviewerSpec = reviewerResumeSpec({ id: job.sessionId }, original, deps);
-        const argv = [original.agent, ...(original.bypass ? [bypass] : []), ...reviewerSpec.flags,
+        const launchModel = typeof original.meta?.model === 'string' && keep.LAUNCH_MODEL_RE.test(original.meta.model) ? original.meta.model : '';
+        const modelArgs = launchModel ? (original.agent === 'codex' ? ['-m', launchModel] : ['--model', launchModel]) : [];
+        let account;
+        try { account = accounts.forSession(job.sessionId, original.agent, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
+        catch (error) { throw new InjectionError(409, error.message); }
+        account ||= accounts.defaultFor(original.agent, deps.env || process.env);
+        const argv = [original.agent, ...(original.bypass ? [bypass] : []), ...reviewerSpec.flags, ...modelArgs,
           original.agent === 'codex' ? 'resume' : '--resume', job.sessionId];
         const stopped = (await host('get', { pane: job.pane })).pane;
         if (stopped.alive || stopped.pid !== expectedPid || (stopped.meta?.sessionId !== job.sessionId
@@ -2760,9 +2784,10 @@ async function forceRestartSession(entry, save, deps = {}) {
           throw Error('Exited pane changed before resume');
         }
         const result = await host('replace-exited', { paneId: job.pane, expectedPid, sessionId: stopped.meta?.sessionId,
-          cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').command(argv)}`], cwd: original.cwd,
+          cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`], cwd: original.cwd,
           ...(reviewerSpec.env ? { env: reviewerSpec.env } : {}),
-          cols: original.cols, rows: original.rows, meta: { ...original.meta, forceRestartToken: job.token, restartedAt: Date.now() } });
+          cols: original.cols, rows: original.rows, meta: { ...original.meta, accountId: account.id, accountLabel: account.label,
+            forceRestartToken: job.token, restartedAt: Date.now() } });
         return { ok: true, pane: result.pane.id, pid: result.pane.pid, sessionId: job.sessionId };
       },
     });
@@ -2803,7 +2828,9 @@ async function closeIdleSession(body, deps = {}) {
       return plan;
     };
     await checkDonePolicy(state);
-    const reason = require('./session-cleanup').refusal(session, pane, pinned, Date.now(), deps.closePolicy);
+    const cleanupSession = deps.allowTerminalRateLimit && session.kind === 'claude' && session.rateLimit
+      ? { ...session, endedTurn: true, rateLimit: null } : session;
+    const reason = require('./session-cleanup').refusal(cleanupSession, pane, pinned, Date.now(), deps.closePolicy);
     if (reason) throw new InjectionError(409, reason);
     const checkTaskSafety = (current) => {
       const owner = current.sessions.find((s) => s.id === session.id);
@@ -2820,7 +2847,9 @@ async function closeIdleSession(body, deps = {}) {
     await precheckSessionTarget(session, target, deps); // Preserve unsent drafts and modal prompts.
     const fresh = session.kind === 'claude' ? (deps.claudeSessionFor || claudeSessionFor)(session.id) : (deps.codexSessionFor || codex.sessionFor)(session.id);
     if (!fresh || typeof fresh.endedTurn !== 'boolean' || !Number.isFinite(fresh.mtime)) throw new InjectionError(409, 'Session activity could not be verified');
-    if (fresh.mtime !== session.mtime || fresh.endedTurn !== true || fresh.pendingBackground || fresh.toolRunning) throw new InjectionError(409, 'Session changed during cleanup; nothing closed');
+    const freshEnded = fresh.endedTurn === true || (deps.allowTerminalRateLimit && fresh.rateLimit && !fresh.pendingBackground
+      && !fresh.toolRunning && !fresh.pendingQuestion && !fresh.pendingPlan && !(fresh.unknownBackgroundJobs || []).length);
+    if (fresh.mtime !== session.mtime || !freshEnded || fresh.pendingBackground || fresh.toolRunning) throw new InjectionError(409, 'Session changed during cleanup; nothing closed');
     let verifyCodexChildren = null;
     let automaticProcessIdentity = null;
     let automaticProcessRows = null;
@@ -2882,7 +2911,9 @@ async function closeIdleSession(body, deps = {}) {
       }
       const latest = session.kind === 'claude' ? (deps.claudeSessionFor || claudeSessionFor)(session.id) : (deps.codexSessionFor || codex.sessionFor)(session.id);
       if (!latest || typeof latest.endedTurn !== 'boolean' || !Number.isFinite(latest.mtime)) throw new InjectionError(409, 'Session activity could not be verified');
-      if (latest.mtime !== session.mtime || latest.endedTurn !== true || latest.pendingBackground
+      const latestEnded = latest.endedTurn === true || (deps.allowTerminalRateLimit && latest.rateLimit && !latest.pendingBackground
+        && !latest.toolRunning && !latest.pendingQuestion && !latest.pendingPlan && !(latest.unknownBackgroundJobs || []).length);
+      if (latest.mtime !== session.mtime || !latestEnded || latest.pendingBackground
           || latest.unknownBackgroundJobs?.length || latest.toolRunning || latest.pendingQuestion || latest.pendingPlan) {
         throw new InjectionError(409, 'Session changed during cleanup; nothing closed');
       }
@@ -3613,6 +3644,30 @@ async function openSession(body, deps = {}) {
   if (session && (typeof session.id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(session.id))) {
     throw new InjectionError(400, 'bad session id');
   }
+  let account;
+  if (session) {
+    try { account = accounts.forSession(session.id, agent, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
+    catch (error) { throw new InjectionError(409, error.message); }
+    if (!account && session.accountId) {
+      account = accounts.get(session.accountId, deps.env || process.env);
+      if (!account || account.agent !== agent) {
+        throw new InjectionError(409, `session ${session.id.slice(0, 8)} belongs to unavailable account ${session.accountId}`);
+      }
+    }
+    account ||= accounts.defaultFor(agent, deps.env || process.env);
+    if (body.accountId != null && body.accountId !== account.id) {
+      throw new InjectionError(409, `session ${session.id.slice(0, 8)} is pinned to account ${account.id}; use handoff to transfer it`);
+    }
+    if (account.managed) accounts.pinSession(session.id, agent, account.id, { root: deps.root || keep.ROOT, env: deps.env || process.env });
+  } else {
+    account = body.accountId == null ? accounts.defaultFor(agent, deps.env || process.env) : accounts.get(body.accountId, deps.env || process.env);
+    if (!account || account.agent !== agent) throw new InjectionError(400, `account ${body.accountId || '?'} is not a ${agent} account`);
+  }
+  let accountMcpConfig = '';
+  if (agent === 'claude' && require('./account-setup').readSetup(account)) {
+    try { accountMcpConfig = require('./account-setup').ensureSharedMemory(account, project).mcpConfig; }
+    catch (error) { throw new InjectionError(409, `account shared setup is unavailable: ${error.message}`); }
+  }
 
   // Launched Claude sessions match Owner's permission-mode class so peer
   // messages are delivered instead of being held for mode parity.
@@ -3630,17 +3685,19 @@ async function openSession(body, deps = {}) {
     const sessionId = session ? session.id : agent === 'claude' ? (deps.randomUUID || crypto.randomUUID)() : null;
     const argv = agent === 'codex'
       ? ['codex', ...codexFlagArgs, ...(launchModel ? ['-m', launchModel] : []), ...(sessionId ? ['resume', sessionId] : [])]
-      : ['claude', ...claudeFlagArgs, ...(launchModel ? ['--model', launchModel] : []),
+      : ['claude', ...claudeFlagArgs, ...(accountMcpConfig ? ['--mcp-config', accountMcpConfig] : []), ...(launchModel ? ['--model', launchModel] : []),
         ...(sessionId ? [session ? '--resume' : '--session-id', sessionId] : [])];
     const command = argv.join(' ');
     const spawned = await hostRequest('spawn', {
       cmd: '/bin/zsh',
-      args: ['-lic', `exec ${require('./agent-launcher').command(argv)}`],
+      args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`],
       cwd: project,
       cols: 200,
       rows: 50,
       meta: {
         agent,
+        accountId: account.id,
+        accountLabel: account.label,
         sessionId,
         // Recorded so the console and the compaction restore read the launch model
         // from the pane instead of inferring it from the transcript.
@@ -3653,7 +3710,8 @@ async function openSession(body, deps = {}) {
     }, deps);
     const pane = spawned && spawned.pane && spawned.pane.id;
     if (!pane) throw new Error('terminal host did not return a pane');
-    return { ok: true, created: 'pane', command, pane, sessionId };
+    if (sessionId) accounts.pinSession(sessionId, agent, account.id, { root: deps.root || keep.ROOT, env: deps.env || process.env });
+    return { ok: true, created: 'pane', command, pane, sessionId, accountId: account.id, accountLabel: account.label };
   };
 
   if (session) {
@@ -3735,6 +3793,9 @@ async function openSession(body, deps = {}) {
       if (!launch.sessionId) {
         throw new InjectionError(504, `${agent} started in host pane ${launch.pane} but never registered its session id`);
       }
+    }
+    if (launch.sessionId) {
+      accounts.pinSession(launch.sessionId, agent, account.id, { root: deps.root || keep.ROOT, env: deps.env || process.env });
     }
   } finally {
     release();
@@ -3826,7 +3887,7 @@ function cacheClaudeSessionLookup(cache, key, value) {
   if (cache.size > SESSION_LOOKUP_CACHE_LIMIT) cache.delete(cache.keys().next().value);
 }
 
-function claudeSessionFromInfo(id, info, stat, dir, reviewer, now) {
+function claudeSessionFromInfo(id, info, stat, dir, reviewer, now, accountId = null) {
   if (info.backgroundParentFile) cacheClaudeSessionLookup(claudeSessionPathCache, id, info.backgroundParentFile);
   const activityMs = transcriptActivityMs(info, stat.mtimeMs);
   const ageMs = now - activityMs;
@@ -3837,6 +3898,7 @@ function claudeSessionFromInfo(id, info, stat, dir, reviewer, now) {
   return {
     id,
     kind: 'claude',
+    ...(accountId ? { accountId } : {}),
     reviewer,
     project: info.cwd || dir.replace(/^-/, '/').replace(/-/g, '/'),
     title: info.title,
@@ -3904,7 +3966,9 @@ function claudeSessionFor(sessionId) {
   const dir = path.basename(path.dirname(file));
   let reviewer = false;
   try { reviewer = fs.readdirSync(path.join(keep.ROOT, '.keep', 'reviewer')).includes(id); } catch {}
-  return claudeSessionFromInfo(id, info, stat, dir, reviewer, Date.now());
+  let accountId = null;
+  try { accountId = accounts.forSession(id, 'claude', { root: keep.ROOT })?.id || null; } catch {}
+  return claudeSessionFromInfo(id, info, stat, dir, reviewer, Date.now(), accountId);
 }
 
 function scanClaudeSessions(options = {}) {
@@ -3929,7 +3993,10 @@ function scanClaudeSessions(options = {}) {
   } catch {}
   const seen = new Set();
   const sessionIds = new Set();
-  for (const { dir, file, id, stat } of claudeTranscriptIndex.scan({ fresh: options.dashboard !== true })) {
+  const accountAuthority = accounts.authority(keep.ROOT);
+  for (const { dir, file, id, stat, accountId } of claudeTranscriptIndex.scan({ fresh: options.dashboard !== true })) {
+    if (accountAuthority[id]?.accountId && accountAuthority[id].accountId !== accountId) continue;
+    if (sessionIds.has(id)) continue;
     sessionIds.add(id);
     if (spawned.has(id) || now - stat.mtimeMs > SESSION_WINDOW_MS) continue;
     seen.add(file);
@@ -3950,7 +4017,7 @@ function scanClaudeSessions(options = {}) {
     const activityMs = transcriptActivityMs(info, stat.mtimeMs);
     const ageMs = now - activityMs;
     if (ageMs > SESSION_WINDOW_MS) continue;
-    const session = claudeSessionFromInfo(id, info, stat, dir, reviewers.has(id), now);
+    const session = claudeSessionFromInfo(id, info, stat, dir, reviewers.has(id), now, accountId);
     try {
       const markerFile = path.join(attentionDir, `${id}.json`);
       const marker = JSON.parse(fs.readFileSync(markerFile, 'utf8'));
@@ -4456,6 +4523,17 @@ function buildState(options = {}) {
     usage: usage.getUsage(),
     reviewQueue: reviewQueue.snapshot({ loadTasks: () => allTasks, now }),
   };
+  Object.assign(state, accounts.publicState(), {
+    handoffs: require('./account-handoff').list(keep.ROOT),
+  });
+  const accountLabels = new Map(state.accounts.map((account) => [account.id, account.label]));
+  for (const session of sessions) {
+    let accountId = session.accountId;
+    if (!accountId) {
+      try { accountId = accounts.forSession(session.id, session.kind, { root: keep.ROOT })?.id || null; } catch {}
+    }
+    if (accountId) { session.accountId = accountId; session.accountLabel = accountLabels.get(accountId) || accountId; }
+  }
   try {
     if (digest) digest.summary = summarize.getSummary(`digest-${digest.date}`, digest.md, DIGEST_INSTRUCTION, onChange).text;
   } catch {}
@@ -4489,8 +4567,11 @@ function buildState(options = {}) {
   try {
     state.reviewUsage = review.reviewerUsage();
     if (state.reviewUsage) {
-      const limits = state.usage && state.usage.claude && state.usage.claude.limits;
-      state.reviewUsage.weekly = review.reviewerWeekly(limits || []);
+      const reviewerSession = (state.sessions || []).find((session) => session.reviewer);
+      const accountId = reviewerSession && reviewerSession.accountId;
+      const selected = accountId && state.usage && state.usage.accounts && state.usage.accounts[accountId];
+      const limits = selected ? selected.limits : state.usage && state.usage.claude && state.usage.claude.limits;
+      state.reviewUsage.weekly = review.reviewerWeekly(limits || [], accountId);
     }
   } catch {}
   try {
@@ -4620,6 +4701,16 @@ async function addHostSessionState(state, deps = {}) {
     // The launch model from `keep open --model`, when the pane carries one.
     const launchModel = pane && pane.meta && pane.meta.model;
     if (typeof launchModel === 'string' && launchModel) session.launchModel = launchModel;
+    const accountId = pane?.meta?.accountId || session.accountId;
+    if (accountId) {
+      const account = accounts.get(accountId);
+      session.accountId = accountId;
+      session.accountLabel = pane?.meta?.accountLabel || account?.label || accountId;
+      if (pane?.meta) {
+        pane.meta.accountId = accountId;
+        pane.meta.accountLabel = session.accountLabel;
+      }
+    }
   }
   const sessionPanes = new Map((state.sessions || []).map((session) => [session.id, session.pane || null]));
   for (const item of state.attention || []) item.pane = item.sessionId ? sessionPanes.get(item.sessionId) || null : null;
@@ -4675,6 +4766,68 @@ function readBody(req) {
       try { resolve(data ? JSON.parse(data) : {}); } catch { reject(new Error('bad JSON body')); }
     });
     req.on('error', reject);
+  });
+}
+
+async function inspectAccountHandoff(body, deps = {}) {
+  const panes = await listHostPanes(deps, true);
+  if (!panes) return {};
+  const state = await addHostSessionState(await buildState({ hostPanes: panes }), { ...deps, panes });
+  const session = state.sessions.find((entry) => entry.id === body.sessionId);
+  const pane = panes.find((entry) => entry.id === body.pane);
+  const rows = await agentProcessRows(deps);
+  const identity = (await liveSessionPids({ ...deps, agentProcessRows: async () => rows })).get(body.sessionId);
+  const processArgs = identity ? rows.find((entry) => entry.pid === identity.pid)?.args || '' : '';
+  let currentModel = '';
+  try {
+    if (session?.kind === 'claude') currentModel = lastTurnUsage(readTranscriptTail(findSessionFile(session.id)), 'claude').model || '';
+  } catch {}
+  return { session, pane, processArgs, currentModel };
+}
+
+async function waitForAccountRecord(sessionId, pane, accountId, startedAfter, deps = {}) {
+  const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const deadline = Date.now() + 45000;
+  while (Date.now() < deadline) {
+    const record = readPaneRecord(sessionId, deps);
+    if (record?.pane === pane && record.accountId === accountId && Number(record.startedAt) > Number(startedAfter)) return record;
+    await sleep(250);
+  }
+  return null;
+}
+
+async function resumeExitedAccountHandoff(entry, account, mcpConfig, deps = {}) {
+  const host = (type, params) => hostRequest(type, params, deps);
+  const pane = (await host('get', { pane: entry.pane })).pane;
+  if (pane.alive || pane.pid !== entry.pid) throw new InjectionError(409, 'Exited handoff pane changed before recovery');
+  if ((await liveSessionPids(deps)).has(entry.sessionId)) throw new InjectionError(409, 'An agent process still owns this conversation');
+  const flags = entry.permissionClass === 'bypass' ? ['--dangerously-skip-permissions'] : [];
+  const modelArgs = entry.model && keep.LAUNCH_MODEL_RE.test(entry.model) ? ['--model', entry.model] : [];
+  const reviewerSpec = reviewerResumeSpec({ id: entry.sessionId }, pane, deps);
+  const argv = ['claude', ...flags, ...reviewerSpec.flags, ...(mcpConfig ? ['--mcp-config', mcpConfig] : []), ...modelArgs, '--resume', entry.sessionId];
+  const result = await host('replace-exited', {
+    paneId: pane.id, expectedPid: entry.pid, sessionId: pane.meta?.sessionId,
+    cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`], cwd: entry.cwd,
+    ...(reviewerSpec.env ? { env: reviewerSpec.env } : {}),
+    cols: entry.cols, rows: entry.rows,
+    meta: { ...pane.meta, agent: 'claude', sessionId: entry.sessionId, accountId: account.id, accountLabel: account.label,
+      handoffTransactionId: entry.id, restartedAt: Date.now() },
+  });
+  await waitForHostAgent({ pane: pane.id }, 'claude', deps);
+  return { ok: true, pane: result.pane.id, pid: result.pane.pid, sessionId: entry.sessionId };
+}
+
+async function handoffSession(body, deps = {}) {
+  return require('./account-handoff').run(body, {
+    ...deps,
+    root: deps.root || keep.ROOT,
+    inspect: deps.inspect || ((request) => inspectAccountHandoff(request, deps)),
+    host: deps.host || { request: (type, params) => hostRequest(type, params, deps) },
+    restartSession: deps.restartSession || restartSession,
+    restartDeps: deps.restartDeps || deps,
+    resumeExited: deps.resumeExited || ((entry, account, mcpConfig) => resumeExitedAccountHandoff(entry, account, mcpConfig, deps)),
+    waitForAccountRecord: deps.waitForAccountRecord || ((sid, pane, accountId, after) => waitForAccountRecord(sid, pane, accountId, after, deps)),
+    continueSession: deps.continueSession || ((sessionId, text) => sendToSessionLocked({ sessionId, text }, deps)),
   });
 }
 
@@ -5054,7 +5207,9 @@ function start(deps = {}) {
   watch(path.join(keep.ROOT, '.keep', 'unblocked'));
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'review'), { recursive: true }); } catch {}
   watch(path.join(keep.ROOT, '.keep', 'review'));
-  watch(PROJECTS_DIR, { recursive: true }, (name) => claudeTranscriptIndex.invalidate(name));
+  for (const entry of claudeProjectRoots) {
+    watch(entry.root, { recursive: true }, (name) => claudeTranscriptIndex.invalidate(entry.root, name));
+  }
   watch(path.join(os.homedir(), '.codex', 'sessions'), { recursive: true });
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'lifecycle'), { recursive: true }); } catch {}
   watch(path.join(keep.ROOT, '.keep', 'lifecycle'), { recursive: true });
@@ -5312,6 +5467,13 @@ function start(deps = {}) {
         return json(res, 200, { events: require('./session-debug').read(url.searchParams.get('session')) });
       }
 
+      if (req.method === 'GET' && url.pathname === '/api/accounts') {
+        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
+        try {
+          return json(res, 200, { ok: true, ...accounts.publicState(), handoffs: require('./account-handoff').list(keep.ROOT) });
+        } catch (error) { return json(res, 500, { error: error.message }); }
+      }
+
       if (req.method === 'GET' && url.pathname === '/api/restore-plan') {
         if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
         try { return json(res, 200, await restorePlan(url.searchParams)); }
@@ -5533,6 +5695,15 @@ function start(deps = {}) {
             try { return json(res, 200, await restarts.request(body)); }
             catch (error) { return json(res, error.status || 409, { error: error.message }); }
           }
+          if (url.pathname === '/api/handoff-session') {
+            try {
+              const result = await handoffSession(body);
+              broadcast();
+              return json(res, 200, result);
+            } catch (error) {
+              return json(res, error.status || 500, { error: error.message, ...(error.extra || {}) });
+            }
+          }
           if (url.pathname === '/api/close-idle' || url.pathname === '/api/close-session') {
             try {
               const result = url.pathname === '/api/close-session'
@@ -5746,6 +5917,7 @@ module.exports = {
   agentProcessRows, liveSessionPids, liveSessionTick, restorePlan,
   annotatePaneAgents,
   readPaneRecord, sessionProjectFromTranscript, openSession,
+  inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, handoffSession,
   launchReviewQueueSession, inspectReviewQueueLaunch, recoverReviewQueueLaunch,
   waitForHostAgent, waitForHostSessionId, addHostSessionState,
   sendToSession, sendToResolvedTarget, precheckSessionTarget, InjectionError,

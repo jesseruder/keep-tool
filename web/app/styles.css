@@ -146,6 +146,16 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .shead .acts .btn { border-color: var(--line); color: var(--muted); }
 .shead .acts .btn:hover:not(:disabled) { border-color: var(--line); color: var(--text); }
 .shead .acts kbd { display: none; }
+.account-label { color: var(--info); white-space: nowrap; }
+.account-controls { display: inline-flex; align-items: center; gap: 6px; position: relative; }
+.account-handoff { position: relative; }
+.account-handoff > summary { list-style: none; cursor: pointer; white-space: nowrap; }
+.account-handoff > summary::-webkit-details-marker { display: none; }
+.account-menu { position: absolute; top: calc(100% + 5px); right: 0; min-width: 190px; padding: 6px; display: flex; flex-direction: column; gap: 4px; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 6px; box-shadow: var(--shadow); z-index: 25; }
+.account-menu .btn { justify-content: space-between; width: 100%; }
+.account-menu .btn small { color: var(--faint); font-size: 10px; }
+.handoff-status, .handoff-error { align-self: center; color: var(--muted); font-size: 11px; white-space: nowrap; }
+.handoff-error { color: var(--bad); }
 .reviewer-state { color: var(--ok); }
 .review-pop { display: none; position: absolute; top: 34px; right: 0; width: 340px; max-height: 65vh; overflow: auto; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 6px; padding: 10px 12px; box-shadow: var(--shadow); z-index: 20; font-size: 12px; }
 .shead .acts.open .review-pop { display: block; }
@@ -195,6 +205,7 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .wpane .ph .st i.idle, .fleet .st i.idle { background: var(--faint); }
 .wpane .ph .st i.needs-input, .fleet .st i.needs-input { background: var(--accent); }
 .wpane .ph button { color: var(--faint); padding: 2px 4px; } .wpane .ph button:hover { color: var(--text); }
+.wpane .account-handoff > summary { color: var(--faint); padding: 2px 4px; }
 .wempty { grid-column: 1 / -1; display: flex; align-items: center; justify-content: center; color: var(--muted); background: var(--bg); text-align: center; line-height: 1.7; }
 
 .rev { flex-direction: row; } .rev .rterm { flex: 1; min-width: 0; display: flex; flex-direction: column; } .rside { width: 460px; flex: none; border-left: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 0; } .rside.collapsed { display: none; }
