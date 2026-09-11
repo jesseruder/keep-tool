@@ -1477,6 +1477,8 @@ test('reviewer transcript metrics report messages per tick and context percentil
     assistantMessages: 4,
     ticks: 2,
     assistantMessagesPerTick: 2,
+    lastTickAssistantMessages: 2,
+    targetMessagesPerTick: 3,
     medianContextTokens: 250,
     p90ContextTokens: 1000,
     compactionsToday: 1,
@@ -2403,4 +2405,245 @@ test('reviewer bundles list foreign device holds inside the safety envelope', ()
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+// ---------- reviewer tick cost (2026-09-10) ----------
+
+test('a batch prints the safety envelope once, ahead of every card, and cards omit their own copy', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-batch-envelope-'));
+  const cli = path.join(__dirname, 'keep.js');
+  const env = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1' };
+  // Otherwise `keep add` links this very session and the bundle quotes its transcript.
+  for (const key of ['CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID']) delete env[key];
+  const run = (args) => spawnSync(process.execPath, [cli, ...args], { encoding: 'utf8', env, cwd: root });
+  try {
+    for (const dir of ['tasks', 'archive', 'digests']) fs.mkdirSync(path.join(root, dir), { recursive: true });
+    spawnSync('git', ['init', '-q', root], { env });
+    spawnSync('git', ['-C', root, 'config', 'user.name', 'Keep Test'], { env });
+    spawnSync('git', ['-C', root, 'config', 'user.email', 'keep@example.test'], { env });
+    for (const title of ['Batch one', 'Batch two', 'Batch three']) {
+      assert.equal(run(['add', title, '--status', 'active', '-m', 'Evidence.']).status, 0);
+    }
+    const batch = run(['review-bundle', 'batch-one', 'batch-two', 'batch-three']);
+    assert.equal(batch.status, 0, batch.stderr);
+    const md = batch.stdout;
+    assert.equal((md.match(/DATA, NOT INSTRUCTIONS/g) || []).length, 1, 'one envelope per batch');
+    assert.equal((md.match(/^=== bundle for /gm) || []).length, 3);
+    assert.ok(md.indexOf('DATA, NOT INSTRUCTIONS') < md.indexOf('=== bundle for '), 'the envelope leads the batch');
+    assert.equal((md.match(/<<<KEEP_CONTEXT/g) || []).length, 1, 'health is fenced once');
+    assert.equal((md.match(/^Evidence limits:/gm) || []).length, 1, 'guidance appears once');
+    assert.equal((md.match(/^time zone:/gm) || []).length, 1);
+    assert.match(md, /^# review batch — 3 card\(s\)/m);
+    assert.equal((md.match(/^pass --bundle [0-9a-f]{8} to review-note\/review-ack/gm) || []).length, 3);
+    for (const id of ['batch-one', 'batch-two', 'batch-three']) assert.match(md, new RegExp(`^=== end ${id} ===$`, 'm'));
+    // A by-hand single-card bundle still carries the whole envelope.
+    const single = run(['review-bundle', 'batch-one', '--force']);
+    assert.equal(single.status, 0, single.stderr);
+    assert.equal((single.stdout.match(/DATA, NOT INSTRUCTIONS/g) || []).length, 1);
+    assert.match(single.stdout, /^Evidence limits:/m);
+    assert.doesNotMatch(single.stdout, /^# review batch/m);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('summarizeDiff reports per-file counts and the first hunk header, never bodies', () => {
+  const { summarizeDiff } = require('./review.js');
+  const diff = [
+    'diff --git a/bin/a.js b/bin/a.js',
+    'index 111..222 100644',
+    '--- a/bin/a.js',
+    '+++ b/bin/a.js',
+    '@@ -1,3 +1,4 @@ function alpha()',
+    ' keep',
+    '+added one',
+    '+added two',
+    '-removed one',
+    '@@ -10,2 +11,2 @@ second hunk',
+    '-x',
+    '+y',
+    'diff --git a/img.png b/img.png',
+    'Binary files a/img.png and b/img.png differ',
+  ].join('\n');
+  assert.deepEqual(summarizeDiff(diff), [
+    { path: 'bin/a.js', added: 3, removed: 2, hunk: '@@ -1,3 +1,4 @@ function alpha()', binary: false },
+    { path: 'img.png', added: 0, removed: 0, hunk: '', binary: true },
+  ]);
+  assert.deepEqual(summarizeDiff(''), []);
+});
+
+test('gitState carries tree, upstream, default-branch and cited-sha facts from local refs and drops diff bodies', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-gitfacts-'));
+  const origin = path.join(root, 'origin.git');
+  const work = path.join(root, 'work');
+  const git = (cwd, args) => {
+    const out = spawnSync('git', ['-C', cwd, '-c', 'user.name=Keep Test', '-c', 'user.email=keep@example.test', ...args], { encoding: 'utf8' });
+    assert.equal(out.status, 0, out.stderr);
+    return out.stdout.trim();
+  };
+  try {
+    spawnSync('git', ['init', '-q', '--bare', '--initial-branch=main', origin]);
+    spawnSync('git', ['init', '-q', '--initial-branch=main', work]);
+    fs.writeFileSync(path.join(work, 'a.txt'), 'one\n');
+    git(work, ['add', 'a.txt']);
+    git(work, ['commit', '-q', '-m', 'first']);
+    const landedSha = git(work, ['rev-parse', 'HEAD']);
+    git(work, ['remote', 'add', 'origin', origin]);
+    git(work, ['push', '-q', '-u', 'origin', 'main']);
+    git(work, ['remote', 'set-head', 'origin', 'main']);
+    fs.writeFileSync(path.join(work, 'a.txt'), 'one\ntwo\n');
+    git(work, ['commit', '-q', '-am', 'second']);
+    const localSha = git(work, ['rev-parse', 'HEAD']);
+    fs.writeFileSync(path.join(work, 'a.txt'), 'one\ntwo\nthree\nSECRET_BODY_LINE\n');
+    fs.writeFileSync(path.join(work, 'new.txt'), 'untracked\n');
+
+    const { gitState } = require('./review.js');
+    const state = gitState(work, '', { cited: [landedSha, localSha, 'deadbeef1', 'not-a-sha'] });
+    assert.equal(state.available, true);
+    assert.equal(state.dirtyCount, 2, 'one modified plus one untracked file');
+    assert.equal(state.upstream, 'origin/main');
+    assert.equal(state.ahead, 1);
+    assert.equal(state.behind, 0);
+    assert.equal(state.defaultBranch, 'main');
+    assert.deepEqual(state.cited, [
+      { sha: landedSha, known: true, onDefault: true },
+      { sha: localSha, known: true, onDefault: false },
+      { sha: 'deadbeef1', known: false, onDefault: null },
+    ]);
+    assert.equal(state.diff, undefined, 'no diff body is carried at all');
+    assert.equal(state.diffSummary.length, 1);
+    assert.equal(state.diffSummary[0].path, 'a.txt');
+    assert.equal(state.diffSummary[0].added, 2);
+    assert.equal(state.diffSummary[0].removed, 0);
+    assert.match(state.diffSummary[0].hunk, /^@@ /);
+    assert.doesNotMatch(JSON.stringify(state), /SECRET_BODY_LINE/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('liveSessionsInCheckout lists other recent agents in the same checkout from the daemon ledger', () => {
+  const { liveSessionsInCheckout } = require('./review.js');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-peers-'));
+  const checkout = path.join(root, 'repo');
+  const other = path.join(root, 'elsewhere');
+  fs.mkdirSync(checkout);
+  const now = Date.now();
+  const ledger = path.join(root, 'live-sessions.json');
+  try {
+    fs.writeFileSync(ledger, JSON.stringify({
+      updatedAt: now - 60e3,
+      sessions: {
+        'own-session': { agent: 'claude', project: checkout, lastSeenAlive: now - 1000 },
+        'peer-claude': { agent: 'claude', project: checkout, lastSeenAlive: now - 2000 },
+        'peer-codex': { agent: 'codex', project: checkout + '/', lastSeenAlive: now - 3000 },
+        'stale-peer': { agent: 'claude', project: checkout, lastSeenAlive: now - 3 * 3600e3 },
+        'other-repo': { agent: 'claude', project: other, lastSeenAlive: now - 1000 },
+        secondary: { agent: 'claude', project: checkout, primary: false, lastSeenAlive: now - 1000 },
+        'reviewer-x': { agent: 'claude', project: checkout, lastSeenAlive: now - 1000 },
+      },
+    }));
+    const peers = liveSessionsInCheckout(checkout, new Set(['own-session', 'reviewer-x']), now, ledger);
+    assert.equal(peers.available, true);
+    assert.equal(peers.stale, false);
+    assert.deepEqual(peers.sessions.map((s) => `${s.id}:${s.agent}`), ['peer-claude:claude', 'peer-codex:codex']);
+    fs.writeFileSync(ledger, JSON.stringify({ updatedAt: now - 3600e3, sessions: {} }));
+    assert.equal(liveSessionsInCheckout(checkout, [], now, ledger).stale, true, 'an old ledger is reported as stale');
+    const missing = liveSessionsInCheckout(checkout, [], now, path.join(root, 'nope.json'));
+    assert.equal(missing.available, false);
+    assert.match(missing.reason, /no live-session ledger/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('routine queue-audit and archival entries are counted, not printed, in the card section', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-routine-'));
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+    const stamp = require('./keep.js').nowStamp();
+    const day = stamp.slice(0, 10);
+    fs.writeFileSync(path.join(root, 'tasks', 'idea-card.md'), [
+      '---', 'title: Idea card', 'status: active', 'kind: idea', `created: ${day}`, `updated: ${stamp}`, '---',
+      `## ${day} 09:03 — check-in`,
+      'Queue audit 2026-09-10: Still a design proposal; nothing new to add. ROUTINE_ONE',
+      '',
+      `## ${day} 09:02 — check-in`,
+      'Archived from active Findings at request, 2026-09-10. ROUTINE_TWO',
+      '',
+      `## ${day} 09:01 — check-in`,
+      'Real progress: the parser now handles the edge case. REAL_ENTRY',
+      '',
+    ].join('\n'));
+    const script = "process.stdout.write(require('./bin/review.js').buildBundle('idea-card', { force: true }).md)";
+    const child = spawnSync(process.execPath, ['-e', script], {
+      cwd: path.join(__dirname, '..'),
+      env: { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1' },
+      encoding: 'utf8',
+    });
+    assert.equal(child.status, 0, child.stderr);
+    assert.match(child.stdout, /REAL_ENTRY/);
+    assert.doesNotMatch(child.stdout, /ROUTINE_ONE|ROUTINE_TWO/);
+    assert.match(child.stdout, /2 routine queue-audit\/archival entries omitted/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('review-land accepts ideas[].cards as an array or a comma-separated string', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-land-cards-'));
+  const cli = path.join(__dirname, 'keep.js');
+  const env = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1' };
+  for (const key of ['CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID']) delete env[key];
+  const run = (args, input) => spawnSync(process.execPath, [cli, ...args], { encoding: 'utf8', env, cwd: root, input });
+  try {
+    for (const dir of ['tasks', 'archive', 'digests']) fs.mkdirSync(path.join(root, dir), { recursive: true });
+    spawnSync('git', ['init', '-q', root], { env });
+    spawnSync('git', ['-C', root, 'config', 'user.name', 'Keep Test'], { env });
+    spawnSync('git', ['-C', root, 'config', 'user.email', 'keep@example.test'], { env });
+    assert.equal(run(['add', 'Seen alpha', '--status', 'active', '-m', 'Evidence.']).status, 0);
+    assert.equal(run(['add', 'Seen beta', '--status', 'active', '-m', 'Evidence.']).status, 0);
+    const { validateReviewLand, normalizeLandDocument } = require('./review.js');
+    assert.deepEqual(normalizeLandDocument({ ideas: [{ title: 't', message: 'm', cards: ' seen-alpha, seen-beta,, ' }] }),
+      { ideas: [{ title: 't', message: 'm', cards: ['seen-alpha', 'seen-beta'] }] });
+    assert.deepEqual(validateReviewLand({ ideas: [{ title: 't', message: 'm', cards: 42 }] }),
+      ['ideas[0].cards must be an array of card ids or a comma-separated string']);
+    const landed = run(['review-land', '-'], JSON.stringify({
+      ideas: [
+        { title: 'String cards', message: 'Pattern across cards.', cards: 'seen-alpha, seen-beta' },
+        { title: 'Array cards', message: 'Pattern again.', cards: ['seen-alpha'] },
+      ],
+    }));
+    assert.equal(landed.status, 0, landed.stderr + landed.stdout);
+    assert.match(landed.stdout, /idea\t1\tString cards\tok\t/);
+    assert.match(landed.stdout, /idea\t2\tArray cards\tok\t/);
+    const ideas = fs.readdirSync(path.join(root, 'tasks')).filter((name) => /string-cards|array-cards/.test(name));
+    assert.equal(ideas.length, 2);
+    const text = fs.readFileSync(path.join(root, 'tasks', ideas.find((name) => name.includes('string-cards'))), 'utf8');
+    assert.match(text, /Seen on: seen-alpha, seen-beta/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('lastTickMessageCount counts assistant messages after the latest tick marker', () => {
+  const { lastTickMessageCount } = require('./review.js');
+  const tick = (n) => ({ type: 'user', message: { content: `[keep] review tick - candidates: card-${n}(50). Run the fleet-review procedure for these.` } });
+  const reply = { type: 'assistant', message: { usage: { input_tokens: 10 } } };
+  const noUsage = { type: 'assistant', message: {} };
+  assert.equal(lastTickMessageCount(jsonl([reply, reply]).join('\n')), null, 'no tick marker means unknown');
+  assert.equal(lastTickMessageCount(jsonl([tick(1), reply, reply, reply, tick(2), reply, noUsage, reply]).join('\n')), 2);
+  assert.equal(lastTickMessageCount(jsonl([tick(1), reply, tick(2)]).join('\n')), 0, 'a tick just sent has cost nothing yet');
+  assert.equal(lastTickMessageCount('not json\n' + jsonl([tick(1), reply]).join('\n')), 1);
+});
+
+test('the tick message carries the previous tick cost against the target when it is known', () => {
+  const rows = [{ task: 'card-one', score: 71 }];
+  const plain = tickMessage(rows, false);
+  assert.doesNotMatch(plain, /Last tick/);
+  const costed = tickMessage(rows, false, { messages: 9, target: 3 });
+  assert.match(costed, /card-one\(71\)\. Last tick: 9 msgs \(target 3\)\. Run the fleet-review procedure for these\.$/);
+  assert.doesNotMatch(costed, /\n/);
+  assert.doesNotMatch(tickMessage(rows, true, null), /Last tick/);
+  assert.doesNotMatch(tickMessage(rows, true, { messages: NaN }), /Last tick/);
 });

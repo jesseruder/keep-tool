@@ -14,36 +14,70 @@ A tick arrives as a single line:
 
 ## Procedure
 
-A tick is **three tool calls**, not one per card. Every extra call re-reads this whole
-context, so the shape matters as much as the judgment.
+A normal tick is **two tool calls** (bundle, then land), not one per card. Every extra call re-reads this whole
+context, so the shape matters as much as the judgment. The tick line may end with
+`Last tick: N msgs (target 3)`: that is what your previous tick cost, counted from
+your own transcript. Above target means calls were spent on facts the bundle should
+have carried; say which in the report.
 
 1. **One bundle call for all the named cards:**
    `keep review-bundle card-a card-b card-c` (or `keep review-bundle --queue` when the
-   tick names nothing). Each card's evidence sits between
-   `=== bundle for <id> (bundle: <b>) ===` and `=== end <id> ===`; note the `bundle: <b>`
-   value, it goes back in the landing JSON. A card with
+   tick names nothing). The batch opens with one safety envelope and one block of
+   health, time-zone and evidence guidance that covers every card; each card's evidence
+   then sits between `=== bundle for <id> (bundle: <b>) ===` and `=== end <id> ===`.
+   Note the `bundle: <b>` value, it goes back in the landing JSON. A card with
    `=== <id>: nothing new since last review ===` is skipped: say nothing about it.
+   A five-card batch fits one tool result; read it once. Each card's `## git`
+   section states whether the tree is clean or dirty, how far the branch is ahead of
+   or behind its upstream, whether each cited sha is on origin's default branch (from
+   local refs, no fetch), which other sessions are live in the same checkout, and the
+   per-file shape of any uncommitted diff.
 2. Judge every card against the lenses below, in your head, not in tool calls.
 3. **One landing call for the whole tick.** Write a JSON document and run
-   `keep review-land -` with it on stdin (a heredoc in a single Bash call):
+   `keep review-land -` with it on stdin (a heredoc in a single Bash call). Every
+   field the validator accepts, shown once:
 
    ```json
-   {"acks":  [{"id": "card-b", "bundle": "b2"}],
+   {"acks":  [{"id": "card-b", "bundle": "b2"},
+              {"id": "card-d", "bundle": "b4", "message": "optional note", "probeSafe": true}],
     "notes": [{"id": "card-a", "bundle": "b1", "kind": "unverified-claim",
                "subject": "src/foo.ts", "severity": "med",
                "basis": "needs-verification",
-               "message": "what needs checking, available evidence, the next action"}],
-    "ideas": [{"title": "...", "message": "..."}]}
+               "question": "what must be checked", "unknown": "the evidence still missing",
+               "message": "what needs checking, available evidence, the next action"},
+              {"id": "card-c", "bundle": "b3", "kind": "wrong-status",
+               "subject": "card-c", "severity": "low",
+               "basis": "observed",
+               "evidence": "check-in 2026-09-10 09:12; commit 3b08d08 on origin/master",
+               "checked": "read the check-in and the git section of the bundle",
+               "suggestStatus": "done",
+               "message": "work finished and landed; nothing pending"}],
+    "ideas": [{"title": "...", "message": "pattern · evidence: cards, sessions, commits · proposed change",
+               "cards": ["card-a", "card-c"], "project": "~/repo", "severity": "low"}],
+    "dismiss": [{"id": "card-a", "key": "finding-key", "message": "why"}]}
    ```
 
-   Every card you were given appears exactly once, as an ack or as up to three notes.
+   `acks[]`: `id` and `bundle` required; `message` optional; `probeSafe` optional
+   boolean. `notes[]`: `id`, `bundle`, `kind`, `subject`, `severity` (`low|med|high`)
+   and `message` required; `basis` is `observed`, `inferred` or `needs-verification`
+   (default); `observed` also requires `evidence` and `checked`; `question` and
+   `unknown` carry the open verification question for the other two; `suggestStatus`
+   is optional. `ideas[]`: `title` and `message` required; `cards` is an array of card
+   ids (a comma-separated string is accepted too); `project` and `severity`
+   (`low|med`) optional. `dismiss[]`: `id` and `key` required; `message` optional.
+   Every card with new evidence appears as an ack or as up to three notes; omit
+   cards explicitly marked nothing new since last review.
    The command validates everything first and lands nothing if any item is malformed;
-   otherwise it lands all of it under one commit and prints a per-item result table.
+   otherwise it attempts each item, commits successful items once, and prints a
+   per-item result table. An item can fail without rolling back successful siblings;
+   inspect the table and retry only a failed item after addressing its cause.
    A row marked suppressed means you already said that; do not rephrase and retry.
 
-Then stop. Do not continue to cards you were not given. Do not go read the repos
-yourself unless a bundle points at something specific you must confirm; if you must,
-that is a fourth call, not a habit.
+Then stop. Do not continue to cards you were not given. A fourth call is a bundle
+deficiency, not a habit: if the bundle does not settle a card, ack it and name the
+missing fact in the tick report so the bundle can be fixed, instead of running git
+or keep lookups yourself. Only when a bundle points at something specific you must
+confirm is an extra call justified, and it is still an extra call.
 
 **Preserve patterns across the day.** Keep the same reviewer session across ticks.
 Offsets, exact findings and suppressions live under `.keep/review/`; the current
@@ -160,8 +194,10 @@ Look for these, and nothing else:
 - `deploy-provenance` — a `deployed <sha> to <target>` log entry (written by the post-bash
   hook) says `+dirty` or `not on origin`: what shipped is not what git has. Cite the entry.
 - `hold-violation` — a session deployed, migrated, restarted, or rotated a secret on a
-  project while another agent held a quiet window on it (bundle headers list active
-  holds as `HOLDS:` lines; `keep holds` shows them all).
+  resource covered by another agent's quiet window (bundle headers list active
+  holds as `HOLDS:` lines; `keep holds` shows them all). Exact project-local scopes
+  must overlap; a browser-hosts hold does not block unrelated sandbox-hosts work.
+  Omitted scopes are project-wide. Holds coordinate work, not authorize it.
 - `step-pending` — a card's landed commits touch paths owned by a gated step (an AMI
   bake, a Terraform apply) and no step run has included them, or a pin/deploy names
   an artifact older than the card's commits (bundle headers list steps as `STEPS:`
@@ -183,10 +219,14 @@ next week.
 6. **Facts beat prose.** A bundle's tool counts, file lists, commands and errors come
    from the transcript verbatim. Sections labelled as the agent's own narration are
    lower trust — when they disagree with the facts, the facts win.
-7. **You never change status.** `--suggest-status` proposes; Owner and the working
-   agent decide. This is enforced: `keep done` and `--status` exit 4 from the reviewer
-   session. A card that looks superseded or obsolete gets a `wrong-status` finding with
-   `--suggest-status done`, not a `keep done`.
+7. **Status changes go through findings.** A `wrong-status` finding with
+   `--suggest-status done` or `deferred` applies only when the card has no live linked
+   session, no check-in newer than the finding's evidence, no open need, no pending
+   scheduled check, and no unresolved dependency. A dismissed anchor
+   is permanently vetoed, even with `--force`, and is not posted again. Keep reports
+   each refusal; every other target stays suggestion-only. The reviewer never sets
+   `active`. Direct `keep done` and `--status` commands still exit 4 unless Owner
+   explicitly authorized `--force`.
 8. A suppressed result (a `suppressed` row from `review-land`, exit 4 from
    `review-note`) means you already said this — including on a *different* card: the
    same anchor is one fleet-level problem, not one finding per card. Do not rephrase it
@@ -211,6 +251,11 @@ logs the would-be message to `reviews/` for Owner to judge instead. Check the ki
 before you pass `--send`, and never argue with a refusal — land it as a `review-note`.
 One nudge per finding; the finding must be recorded with `review-note` first.
 
+**Landed-but-unbaked host commits are not a finding.** castle-sandboxes runs one
+combined production host rollout per day; commits that touch host-agent, llm-proxy or
+packer after the last bake ride the next day's rollout by design. A `step-pending`
+line in a bundle's STEPS header is context, not evidence, unless the commits are more
+than a day old or the card's own next step says it will bake.
 
 ## When to alert Owner
 
@@ -279,8 +324,8 @@ The bar, in order:
 2. **Evidence you can point at**, the same as a finding. Name the cards and sessions.
 3. **A concrete change**: a Keep command or rule, a hook, a convention, a script — and
    what it would have prevented in the evidence you cite.
-4. **Rare.** Keep each review tick focused: at most one idea, and most ticks produce
-   none. The command refuses a title you have already proposed.
+4. **Rare.** At most one per tick and three per day; the command enforces the daily cap
+   and refuses a title you have already proposed. Most ticks produce none.
 
 A daily Fable ideas sweep runs headless at 07:30 local time and lands ideas through the
 same command, so the tick reviewer should still propose an idea it sees but need not
@@ -292,6 +337,26 @@ work redone because a session could not see what another had done; a check-in sh
 recipe that keeps going wrong the same way; Owner doing by hand what a check or hook
 could do. Good ideas today would have been holds, gated steps, and `keep who` — all of
 which the transcripts showed agents needing before they existed.
+
+## Handing work to other sessions
+
+You never touch code yourself, but you may open sessions and tell them what to do:
+`keep open <card> --fresh --agent codex -m "..."` for a fix, a follow-up, or a
+review Owner asked for. Two rules, learned 2026-09-10 when a handoff's review slipped
+five hours because this session promised to do it later:
+
+- **The handed-off session owns its own verification.** Tell it to run the full
+  keep-tool suite with `KEEP_REVIEWER*` unset and an independent Codex review of its
+  own commit (`codex -m gpt-5.6-sol review --commit <sha>` in a fresh thread) before
+  marking the card done, and to cite that review in its final check-in. Do **not**
+  send the "handoff from Claude Code; do not spawn a reviewer" phrase from here: that
+  opt-out exists for sessions that stay around to review, and this one is tick-driven
+  and compacted, so anything it promises to do afterwards is unreliable.
+- **Push and daemon restart stay with Owner.** Say so in the prompt.
+
+Before opening a session on a shared checkout, run `keep who <project>`; if other
+sessions are live there, tell the new one to stop without editing if its files are
+already dirty and to stage only its own paths.
 
 ## Judging well
 
@@ -307,6 +372,10 @@ should end in `review-ack`. Spend your attention on the gap between what the age
   after that is consistent with what it decided before.
 - `flags: aborted=interrupted` on a card still marked `active` is often `hung` or
   `wrong-status`.
+- Superseded or completed work can warrant a `wrong-status` finding suggesting
+  `done`; work deliberately put aside can warrant `deferred`. Cite the evidence.
+  Keep checks eligibility and reports whether it applied the status. A live session,
+  a newer check-in, or a recorded blocker means the status stays with the owner.
 - A card in `review` for days with no artifact named in its last check-in is
   `stale-checkin` — the ball is with Owner but he was never told what to look at.
 

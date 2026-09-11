@@ -3,6 +3,9 @@
 const crypto = require('node:crypto');
 const { quote } = require('./setup');
 
+// 40k tokens × 4 chars, plus headroom for the batch preamble and per-card framing.
+const REVIEWER_BASH_OUTPUT_CHARS = '200000';
+
 async function launch(args, root, deps = {}) {
   const model = args[0] || process.env.KEEP_REVIEWER_MODEL || 'fable';
   const family = ['fable', 'opus', 'sonnet', 'haiku'].find((name) => model.includes(name)) || model;
@@ -16,7 +19,12 @@ async function launch(args, root, deps = {}) {
     const { pane } = await client.request('spawn', {
       cmd: '/bin/zsh', args: ['-lic', `exec ${argv.map(quote).join(' ')}`],
       cwd: root, cols: 200, rows: 50,
-      env: { KEEP_DIR: root, KEEP_CONFIG: require('./config').configFile(), KEEP_REVIEWER: '1', KEEP_REVIEWER_NAME: family, KEEP_REVIEWER_MODEL: family },
+      env: {
+        KEEP_DIR: root, KEEP_CONFIG: require('./config').configFile(), KEEP_REVIEWER: '1', KEEP_REVIEWER_NAME: family, KEEP_REVIEWER_MODEL: family,
+        // Claude Code truncates a Bash result at ~30k chars by default; a five-card
+        // review bundle is built to a 40k-token total budget and must land in one read.
+        BASH_MAX_OUTPUT_LENGTH: process.env.KEEP_REVIEWER_BASH_OUTPUT || REVIEWER_BASH_OUTPUT_CHARS,
+      },
       meta: { agent: 'claude', reviewer: true, sessionId, project: root, launchedAt: Date.now() },
     });
     if (!pane?.id) throw new Error('terminal host did not return a reviewer pane');
@@ -24,4 +32,4 @@ async function launch(args, root, deps = {}) {
   } finally { client.close(); }
 }
 
-module.exports = { launch };
+module.exports = { launch, REVIEWER_BASH_OUTPUT_CHARS };

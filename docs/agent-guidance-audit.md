@@ -34,11 +34,15 @@ or third-party plugin installed on the machine.
   prove that every already-running client has loaded them. Transcript fallback and
   the existing adapter tests remain necessary; do not restart agents merely for this audit.
 
-The installed fleet-review skill is outside this repository at
-`~/.claude/skills/fleet-review/SKILL.md`. Its corrected procedure is two normal tool
-calls (bundle and land), omits unchanged cards, preserves successful siblings when
-an individual landing fails, and checks resource scope overlap before reporting a
-hold violation. It remains an installation-local instruction, not a portable repo asset.
+The fleet-review skill is the repository's `skills/fleet-review/SKILL.md`; the
+installed copy at `~/.claude/skills/fleet-review` is a symlink to it (as
+`~/.claude/skills/keep` already was), so `bin/review-eval.js` and the live reviewer
+read the same file. Its procedure is two normal tool calls (bundle and land), treats
+a further call as a bundle deficiency to report rather than a habit, omits unchanged
+cards, preserves successful siblings when an individual landing fails, and checks
+resource scope overlap before reporting a hold violation. The two copies had drifted
+(Jesse-specific wording and newer sections only in the installed copy) until they
+were unified on 2026-09-10.
 
 ## Drift prevention and limits
 

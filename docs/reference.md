@@ -612,6 +612,19 @@ Two invariants the code enforces:
 - Log entries written by headless runs count as weak evidence, and cards with no non-reviewer, non-spawned linked session have their evidence score halved.
 - Each tick includes at most one card per numeric-suffix-stripped title stem, leaving sibling cohort cards eligible for later ticks.
 - `KEEP_REVIEW_TICK_LIMIT` controls the per-tick candidate limit and defaults to 5.
+- A batch bundle (`review-bundle a b c` or `--queue`) prints the safety envelope, health,
+  time-zone and evidence guidance once ahead of every card; a by-hand single-card bundle
+  still carries them itself. Uncommitted diffs appear as per-file added/removed counts
+  plus the first hunk header, never as bodies, and routine queue-audit/archival log
+  entries are counted rather than printed. Each card's git section carries the tree
+  state, ahead/behind for the checked-out branch, whether each cited sha is on origin's
+  default branch (local refs, no fetch), and the other sessions live in the same
+  checkout, so the reviewer needs no git or `keep who` calls of its own.
+- The reviewer pane is launched with `BASH_MAX_OUTPUT_LENGTH=200000`
+  (`KEEP_REVIEWER_BASH_OUTPUT` overrides it) so a five-card bundle lands in one Bash
+  result instead of being re-read in chunks. Each tick message ends with the previous
+  tick's assistant-message count against the target of 3; `review-stats` prints the
+  same number as `last tick cost`.
 
 Findings dedupe on `sha1(task, kind, normalized subject)` — never on the prose, which
 varies every tick — and go quiet for 24h unless the status or HEAD moves.
