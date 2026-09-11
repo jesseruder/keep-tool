@@ -2324,7 +2324,7 @@ function findingCardHash(task) {
   const fields = ['title', 'status', 'project', 'kind', 'check', 'check_after', 'needs', 'depends_on', 'sessions'];
   return crypto.createHash('sha256').update(JSON.stringify([
     fields.map(field => [field, task.fm[field] ?? null]),
-    String(task.body || '').split(/^## \d{4}-/m)[0],
+    String(task.body || '').split(/^## \d{4}-/m)[0].trimEnd(),
     stampedLogEntries(task.body),
   ])).digest('hex');
 }
@@ -2783,7 +2783,7 @@ async function reviewLand(document) {
     ...(document.ideas || []).map((item, index) => ({ type: 'idea', index, item })),
     ...(document.dismiss || []).map((item, index) => ({ type: 'dismiss', index, item })),
   ];
-  const evidence = new Map((document.notes || []).map((item) => [item.id, statusEvidence(item.id, item.bundle)]));
+  const evidence = new Map((document.notes || []).map((item) => [item, statusEvidence(item.id, item.bundle)]));
   const sessions = (document.notes || []).some((item) => item.kind === 'wrong-status' && ['done', 'deferred'].includes(item.suggestStatus))
     ? await reviewerSessions() : null;
   const results = [];
@@ -2813,7 +2813,7 @@ async function reviewLand(document) {
             message: item.message, suggestStatus: item.suggestStatus,
             basis: item.basis, evidence: item.evidence, checked: item.checked, question: item.question, unknown: item.unknown,
             withinLock: true, commit: false, digestLines,
-          }, sessions, evidence.get(item.id));
+          }, sessions, evidence.get(item));
           counts.reviewed += 1;
           if (!out.suppressed) counts.findings += 1;
           detail = out.notApplied ? 'finding ' + out.key + ' — not applied: ' + out.notApplied : 'finding ' + out.key;

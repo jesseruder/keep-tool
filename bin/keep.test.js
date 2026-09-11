@@ -265,7 +265,7 @@ test('project command canonicalizes worktrees without taking over card ownership
         keep.saveTask(card);
         return fn();
       });
-      assert.throws(() => review.reviewAck('project-test', null, { bundle: staleBundle }), /is stale/);
+      assert.throws(() => review.reviewAck('project-test', null, { bundle: staleBundle }), /stale/);
       const card = keep.loadTask('project-test');
       card.fm.project = ${JSON.stringify(f.main)};
       keep.saveTask(card);

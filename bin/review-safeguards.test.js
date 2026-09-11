@@ -63,6 +63,20 @@ test('closing a card after bundle blocks forced notes and ack without consuming 
     const rebuilt=bundle('sound-card');ok(['review-ack','sound-card','--bundle',rebuilt]);
     ok(['checkin','sound-card','-m','New owner evidence after acknowledged bundle']);
     assert.equal(run(['review-note','sound-card','--bundle',rebuilt,'--kind','other','--subject','old claim','-m','Old evidence']).status,5,'consumed bundles retain their original evidence fingerprint');
+    const current=bundle('sound-card');ok(['review-ack','sound-card','--bundle',current]);
+    fs.writeFileSync(landing,JSON.stringify({notes:[
+      {id:'sound-card',bundle:rebuilt,kind:'other',subject:'stale batch claim',severity:'low',message:'Old evidence'},
+      {id:'sound-card',bundle:current,kind:'other',subject:'current batch claim',severity:'low',message:'Current evidence'},
+    ]}));
+    const mixed=run(['review-land','--file',landing]);
+    assert.match(mixed.stdout,/rebuild/);
+    assert.deepEqual(Object.values(state('sound-card').findings).map(f=>f.subject),['current batch claim'],'each note retains its own bundle evidence: '+mixed.stdout+mixed.stderr);
+    ok(['add','Plan only','--status','active','--project',root,'--plan','Verify implementation']);
+    const planOnly=bundle('plan-only');
+    for (const subject of ['first note','sibling note']) {
+      ok(['review-note','plan-only','--bundle',planOnly,'--kind','other','--subject',subject,'-m','Check evidence']);
+    }
+    ok(['review-ack','plan-only','--bundle',planOnly]);
     ok(['add','Sandbox monitoring','--project',root,'--status','active','-m','OOM classification and teardown re-entry need checking.']);
     ok(['add','Correct sandbox OOM classification','--project',root,'--status','done','-m','Authoritative OOM logging deployed; commit abc1234.']);
     const related=ok(['review-bundle','sandbox-monitoring','--force']);
