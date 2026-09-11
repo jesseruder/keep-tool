@@ -281,6 +281,72 @@ test('response-loss recovery delivers to the same reserved session and is single
   } finally { f.cleanup(); }
 });
 
+test('recovery claim blocks dismissal while the prompt is pending', async () => {
+  const f = fixture();
+  let signalRecoveryStarted;
+  const recoveryStarted = new Promise((resolve) => { signalRecoveryStarted = resolve; });
+  let releasePrompt;
+  let dismissed = false;
+  try {
+    await assert.rejects(queue.act({ id: 'finding:card-one:abc123', action: 'start', requestId: 'recover-start' }, {
+      ...f.deps, randomUUID: () => 'recover-session', launch: async () => { throw new Error('spawn response lost'); },
+    }), /spawn response lost/);
+    const recovering = queue.act({ id: 'finding:card-one:abc123', action: 'start', requestId: 'recover-start' }, {
+      ...f.deps,
+      inspectLaunch: async () => ({ state: 'present', pane: 'recover-pane' }),
+      recoverLaunch: async (_active, hooks) => {
+        signalRecoveryStarted();
+        await new Promise((resolve) => {
+          releasePrompt = async () => {
+            assert.equal(await hooks.onReady(), true);
+            assert.equal(await hooks.onDelivered(), true);
+            resolve();
+          };
+        });
+      },
+    });
+    await recoveryStarted;
+    await assert.rejects(queue.act({
+      id: 'finding:card-one:abc123', action: 'dismiss', requestId: 'dismiss-during-recovery', reason: 'race',
+    }, { ...f.deps, reviewDismiss: () => { dismissed = true; } }),
+    (error) => error.status === 409 && /already opening/.test(error.message));
+    assert.equal(dismissed, false);
+    await releasePrompt();
+    const result = await recovering;
+    assert.equal(result.item.status, 'in-progress');
+  } finally { f.cleanup(); }
+});
+
+test('a new daemon reclaims a recovery interrupted before readiness', async () => {
+  const f = fixture();
+  let recovered = 0;
+  try {
+    await assert.rejects(queue.act({ id: 'idea:idea-one', action: 'discuss', requestId: 'interrupted-recovery' }, {
+      ...f.deps, ownerId: 'old-daemon', randomUUID: () => 'interrupted-session',
+      launch: async () => { throw new Error('spawn response lost'); },
+    }), /spawn response lost/);
+    const store = queue.loadStore(f.root, { strict: true });
+    store.items['idea:idea-one'].activeLaunch = {
+      ...store.items['idea:idea-one'].activeLaunch,
+      pane: 'surviving-pane', error: null, recoveryOwner: 'old-daemon',
+    };
+    queue.saveStore(store, f.root);
+
+    const result = await queue.act({ id: 'idea:idea-one', action: 'discuss', requestId: 'interrupted-recovery' }, {
+      ...f.deps, ownerId: 'new-daemon',
+      inspectLaunch: async () => ({ state: 'present', pane: 'surviving-pane' }),
+      recoverLaunch: async (_active, hooks) => {
+        recovered += 1;
+        assert.equal(await hooks.onReady(), true);
+        assert.equal(await hooks.onDelivered(), true);
+      },
+    });
+    assert.equal(result.sessionId, 'interrupted-session');
+    assert.equal(result.item.launchState, undefined);
+    assert.equal(recovered, 1);
+  } finally { f.cleanup(); }
+});
+
 test('a confirmed exited pane clears the reservation and permits a fresh action', async () => {
   const f = fixture();
   let calls = 0;
@@ -385,7 +451,8 @@ test('server recovery distinguishes unavailable, absent, exited, and live host p
   assert.deepEqual(await inspectReviewQueueLaunch(active, { panes: [{ id: 'live', alive: true, meta: { sessionId: 'reserved' } }] }), { state: 'present', pane: 'live' });
   const events = [];
   await recoverReviewQueueLaunch(active, {
-    onReady: () => events.push('ready'), onDelivered: () => events.push('delivered'),
+    onReady: () => { events.push('ready'); return true; },
+    onDelivered: () => { events.push('delivered'); return true; },
   }, {
     waitForHostAgent: async () => events.push('wait'),
     typeOpeningMessage: async (target, agent, message) => events.push({ target, agent, message }),
@@ -393,4 +460,10 @@ test('server recovery distinguishes unavailable, absent, exited, and live host p
   assert.deepEqual(events, [
     'wait', 'ready', { target: { pane: 'pane-live' }, agent: 'claude', message: 'read pointer' }, 'delivered',
   ]);
+  let typed = false;
+  await assert.rejects(recoverReviewQueueLaunch(active, { onReady: () => false }, {
+    waitForHostAgent: async () => {},
+    typeOpeningMessage: async () => { typed = true; },
+  }), (error) => error.status === 409 && /reservation changed before/.test(error.message));
+  assert.equal(typed, false, 'a lost reservation must prevent opening instructions from being typed');
 });

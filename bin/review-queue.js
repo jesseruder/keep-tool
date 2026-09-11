@@ -357,6 +357,10 @@ async function act(body, deps = {}) {
       const item = snapshot({ ...options, now }).items.find((entry) => entry.id === body.id);
       return { ok: true, sessionId: active.sessionId, item };
     }
+    if (active.recoveryOwner === ownerId) {
+      const item = snapshot({ ...options, now }).items.find((entry) => entry.id === body.id);
+      throw new QueueError(409, 'review queue launch recovery is already running', { sessionId: active.sessionId, item });
+    }
     if (active.ownerId === ownerId && !active.error) {
       const item = snapshot({ ...options, now }).items.find((entry) => entry.id === body.id);
       throw new QueueError(409, 'review queue conversation is still opening', { sessionId: active.sessionId, item });
@@ -415,7 +419,11 @@ async function act(body, deps = {}) {
           const meta = itemMeta(store, body.id);
           if (meta.activeLaunch?.sessionId !== active.sessionId) return false;
           if (meta.activeLaunch.recoveryOwner === ownerId) return false;
-          store.items[body.id] = { ...meta, activeLaunch: { ...meta.activeLaunch, recoveryOwner: ownerId } };
+          store.items[body.id] = {
+            ...meta,
+            activeLaunch: { ...meta.activeLaunch, recoveryOwner: ownerId, error: null },
+            launchError: null,
+          };
           return true;
         });
         if (!claimed) {
@@ -427,7 +435,7 @@ async function act(body, deps = {}) {
           recoveryPhase = phase;
           return updateStore(root, withLock, (store) => {
             const meta = itemMeta(store, body.id);
-            if (meta.activeLaunch?.sessionId !== active.sessionId) return false;
+            if (meta.activeLaunch?.sessionId !== active.sessionId || meta.activeLaunch.recoveryOwner !== ownerId) return false;
             store.items[body.id] = { ...meta, activeLaunch: { ...meta.activeLaunch, phase, error: null } };
             return true;
           });
@@ -437,7 +445,9 @@ async function act(body, deps = {}) {
             onReady: () => recordRecoveryPhase('ready'),
             onDelivered: () => recordRecoveryPhase('delivered'),
           });
-          recordRecoveryPhase('delivered');
+          if (recoveryPhase !== 'delivered' && !recordRecoveryPhase('delivered')) {
+            throw new QueueError(409, 'review queue launch reservation changed during recovery');
+          }
           if (!finishActive(active)) throw new QueueError(409, 'review queue launch state changed during recovery; refresh and try again');
           const item = snapshot({ ...options, now }).items.find((entry) => entry.id === body.id);
           return { ok: true, sessionId: active.sessionId, item };
@@ -484,7 +494,9 @@ async function act(body, deps = {}) {
       const current = publicItem(fresh, meta, at);
       if (current.status === 'resolved') throw new QueueError(409, 'review queue item is already resolved', { item: current });
       if (current.status === 'in-progress') throw new QueueError(409, 'an in-progress review item cannot be deferred', { item: current });
-      if (meta.activeLaunch && !meta.activeLaunch.error) throw new QueueError(409, 'this review queue item is already opening', { item: current });
+      if (meta.activeLaunch && (!meta.activeLaunch.error || meta.activeLaunch.recoveryOwner === ownerId)) {
+        throw new QueueError(409, 'this review queue item is already opening', { item: current });
+      }
       const requests = { ...(meta.requests || {}) };
       if (requests[requestId] && requests[requestId].action !== body.action) throw new QueueError(409, 'request id was already used for a different review queue action');
       requests[requestId] = { state: 'complete', action: body.action, at };
@@ -500,7 +512,9 @@ async function act(body, deps = {}) {
       const fresh = findSource(body.id, options).source;
       const current = publicItem(fresh, meta, at);
       if (current.status === 'resolved') throw new QueueError(409, 'review queue item is already resolved', { item: current });
-      if (meta.activeLaunch && !meta.activeLaunch.error) throw new QueueError(409, 'this review queue item is already opening', { item: current });
+      if (meta.activeLaunch && (!meta.activeLaunch.error || meta.activeLaunch.recoveryOwner === ownerId)) {
+        throw new QueueError(409, 'this review queue item is already opening', { item: current });
+      }
       const requests = { ...(meta.requests || {}) };
       if (requests[requestId] && requests[requestId].action !== body.action) throw new QueueError(409, 'request id was already used for a different review queue action');
       if (fresh.type === 'finding' && !fresh.row.dismissed) {

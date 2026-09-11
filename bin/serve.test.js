@@ -3462,4 +3462,15 @@ test('open types the complete handoff file pointer into a fresh session', async 
   });
   assert.equal(result.sent, true);
   assert.deepEqual(typed, [{ target: { pane: 'handoff-pane' }, agent: 'claude', text: message }]);
+
+  const rejected = [];
+  await assert.rejects(openSession({ taskId: 'card', fresh: true, message }, {
+    host: recordingHost((type) => type === 'spawn' ? { pane: { id: 'rejected-pane' } } : {}),
+    loadTask: () => ({ fm: { project: os.tmpdir(), sessions: [] } }),
+    randomUUID: () => 'rejected-session',
+    waitForHostAgent: async () => true,
+    onOpeningReady: async () => false,
+    typeOpeningMessage: async (...args) => rejected.push(args),
+  }), (error) => error.status === 409 && /reservation changed before/.test(error.message));
+  assert.deepEqual(rejected, [], 'a failed readiness gate prevents the opening message from being typed');
 });

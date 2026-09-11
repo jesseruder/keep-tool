@@ -3263,12 +3263,16 @@ async function openSession(body, deps = {}) {
     await (deps.waitForHostAgent || waitForHostAgent)(target, agent, deps);
     launch.settled = true;
     if (message) {
-      if (deps.onOpeningReady) await deps.onOpeningReady(launch);
+      if (deps.onOpeningReady && await deps.onOpeningReady(launch) === false) {
+        throw new InjectionError(409, 'opening-message reservation changed before instructions were sent');
+      }
       await withInjectionLockRetry(
         () => (deps.typeOpeningMessage || typeOpeningMessage)(target, agent, message, deps), deps,
       );
       launch.sent = true;
-      if (deps.onOpeningDelivered) await deps.onOpeningDelivered(launch);
+      if (deps.onOpeningDelivered && await deps.onOpeningDelivered(launch) === false) {
+        throw new InjectionError(409, 'opening-message reservation changed after instructions were sent');
+      }
     }
     if (!launch.sessionId && handoff) {
       launch.sessionId = await (deps.waitForHostSessionId || waitForHostSessionId)(launch.pane, deps);
@@ -3332,13 +3336,18 @@ async function inspectReviewQueueLaunch(active, deps = {}) {
 
 async function recoverReviewQueueLaunch(active, hooks = {}, deps = {}) {
   if (!active?.pane || !active.pointer) throw new InjectionError(409, 'reserved conversation has no recoverable pane or opening-message pointer');
+  if (typeof hooks.onReady !== 'function') throw new InjectionError(409, 'review queue recovery has no reservation readiness gate');
   const target = { pane: active.pane };
   await (deps.waitForHostAgent || waitForHostAgent)(target, 'claude', deps);
-  if (hooks.onReady) await hooks.onReady();
+  if (await hooks.onReady() !== true) {
+    throw new InjectionError(409, 'review queue launch reservation changed before opening instructions were sent');
+  }
   await withInjectionLockRetry(
     () => (deps.typeOpeningMessage || typeOpeningMessage)(target, 'claude', active.pointer, deps), deps,
   );
-  if (hooks.onDelivered) await hooks.onDelivered();
+  if (typeof hooks.onDelivered === 'function' && await hooks.onDelivered() !== true) {
+    throw new InjectionError(409, 'review queue launch reservation changed after opening instructions were sent');
+  }
   if (active.action === 'start' && active.card) {
     try { (deps.linkLaunchedSession || keep.linkLaunchedSession)(active.card, { id: active.sessionId, agent: 'claude' }); }
     catch (error) { process.stderr.write(`keep serve: could not link recovered review queue session ${active.sessionId.slice(0, 8)} to ${active.card}: ${error.message}\n`); }
