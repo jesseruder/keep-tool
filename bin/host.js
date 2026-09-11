@@ -406,6 +406,7 @@ function createHost(options = {}) {
       primary: record.adopted ? null : (record.primary == null ? null : String(record.primary)),
       buffer: new RingBuffer(maxBufferBytes),
       attachments: new Map(),
+      pendingAttachments: 0,
       writeChain: Promise.resolve(),
       exit,
       resolveExit,
@@ -648,6 +649,7 @@ function createHost(options = {}) {
           readsHistory: params.snapshot === true || params.replay !== false,
         };
         let pending;
+        pane.pendingAttachments += 1;
         try {
           if (params.snapshot === true) {
             const scrollback = snapshotScrollback(params.snapshotScrollback);
@@ -684,6 +686,8 @@ function createHost(options = {}) {
         } catch (error) {
           detachPane(connection, pane);
           throw error;
+        } finally {
+          pane.pendingAttachments -= 1;
         }
         return {
           result: { pane: publicPane(pane), viewer },
@@ -751,7 +755,7 @@ function createHost(options = {}) {
         if (pane.pty.pid !== params.expectedPid || pane.meta?.sessionId !== params.expectedSessionId
             || !['claude', 'codex'].includes(pane.meta?.agent)
             || pane.inputCount !== params.expectedInputCount || pane.outputCount !== params.expectedOutputCount
-            || pane.attachments.size !== 0) {
+            || pane.attachments.size !== 0 || pane.pendingAttachments !== 0) {
           const error = new Error('Pane identity or activity changed; nothing signalled');
           error.code = 'guard_rejected';
           throw error;

@@ -103,6 +103,41 @@ test('guarded kill atomically refuses stale input and output counts', async () =
   });
 });
 
+test('guarded kill refuses an in-flight snapshot attach and failed attach clears its guard', async () => {
+  await withHost({}, async ({ host, client, sock }) => {
+    const other = await connect({ sock });
+    let release;
+    try {
+      const { pane } = await client.request('spawn', {
+        cmd: process.execPath, args: ['-e', 'setInterval(()=>{},1000)'],
+        meta: { agent: 'claude', sessionId: 'pending-viewer' },
+      });
+      const expected = (await other.request('get', { pane: pane.id })).pane;
+      const internal = host.panes.get(pane.id);
+      internal.writeChain = new Promise((resolve) => { release = resolve; });
+      const attaching = client.attach(pane.id, { snapshot: true, visible: false }, () => {});
+      await waitFor(() => internal.pendingAttachments === 1, 'snapshot attach to enter settle wait');
+
+      const guarded = () => other.request('guarded-kill', {
+        pane: pane.id, signal: 'SIGKILL', expectedPid: expected.pid,
+        expectedSessionId: 'pending-viewer', expectedInputCount: expected.inputCount,
+        expectedOutputCount: expected.outputCount,
+      });
+      await assert.rejects(guarded(), /activity changed/);
+      assert.equal((await other.request('get', { pane: pane.id })).pane.alive, true);
+
+      client.close();
+      release();
+      await assert.rejects(attaching, /host connection closed/);
+      await waitFor(() => internal.pendingAttachments === 0, 'failed attach guard cleanup');
+      await guarded();
+    } finally {
+      release?.();
+      other.close();
+    }
+  });
+});
+
 test('stale remove cannot delete a replacement with the same pane ID', async () => {
   await withHost({}, async ({ host, client, sock }) => {
     const other = await connect({ sock });
