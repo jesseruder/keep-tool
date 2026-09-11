@@ -353,6 +353,7 @@ test('tmp-artifact flags /tmp citations in recipes and recent check-ins', () => 
   const old = localStamp(now - 20 * 86400e3).replace('T', ' ');
   try {
     writeCard(root, 'recipe-card', { check: 'cat /tmp/draft-batch-*.log' });
+    writeCard(root, 'bracketed-card', { check: 'cat [/tmp/bracketed.log]' });
     writeCard(root, 'recent-card', {},
       `## ${recent} — check-in\nReview /tmp/draft-plan.json before continuing.\n`);
     writeCard(root, 'old-card', {},
@@ -367,17 +368,20 @@ test('tmp-artifact flags /tmp citations in recipes and recent check-ins', () => 
 
     const findings = lint({ root, rule: 'tmp-artifact', now }).findings;
     assert.deepEqual(findings.map((item) => [item.id, item.severity]), [
+      ['bracketed-card', 'med'],
       ['recipe-card', 'med'],
       ['tmpdir-card', 'med'],
       ['recent-card', 'low'],
     ]);
     assert.equal(findings[0].text,
+      'check recipe reads /tmp/bracketed.log, which macOS purges on reboot');
+    assert.equal(findings[1].text,
       'check recipe reads /tmp/draft-batch-*.log, which macOS purges on reboot');
-    assert.equal(findings[0].fix,
+    assert.equal(findings[1].fix,
       'keep artifact recipe-card <file> and cite the printed path in --check');
-    assert.equal(findings[2].text,
+    assert.equal(findings[3].text,
       `check-in on ${recent} cites /tmp/draft-plan.json; /tmp does not survive a reboot`);
-    assert.equal(findings[2].fix, 'keep artifact recent-card /tmp/draft-plan.json');
+    assert.equal(findings[3].fix, 'keep artifact recent-card /tmp/draft-plan.json');
 
     const artifactDirectory = path.join(root, '.keep', 'artifacts', 'recent-card');
     fs.mkdirSync(artifactDirectory, { recursive: true });

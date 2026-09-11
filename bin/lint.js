@@ -480,7 +480,8 @@ function deployProvenance(task, ctx) {
 }
 
 function tempPaths(text) {
-  const pattern = /(?:^|[\s"'`(=:])((?:\/tmp\/|\/private\/tmp\/|\/var\/folders\/|\/private\/var\/folders\/|\$TMPDIR\/|\$\{TMPDIR\}\/)(?:[^\s"'`),;]*[^\s"'`),;.:])?)/g;
+  // Prose citations with spaces are ambiguous and are deliberately not handled.
+  const pattern = /(?:^|[\s"'`(=:\[])((?:\/tmp\/|\/private\/tmp\/|\/var\/folders\/|\/private\/var\/folders\/|\$TMPDIR\/|\$\{TMPDIR\}\/)(?:[^\s"'`),;\]]*[^\s"'`),;.:\]])?)/g;
   const found = [];
   const seen = new Set();
   for (const match of String(text || '').matchAll(pattern)) {

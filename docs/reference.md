@@ -42,7 +42,7 @@ keep plan <id> [--set "step"… | --add "text" | --insert <n> "text" | --remove 
                 | --done <n> | --start <n> | --undo <n>]
 keep list [--status s]… [--tag t] [--project p] [--overdue] [--brief] [--all]
 keep show <id>
-keep artifact <card> [<file>...] [-m note]
+keep artifact <card> [--] [<file>...] [-m "note"]
 keep link <card> --session <sid> --agent claude|codex
 keep wait-on <card> <upstream>[#<step>] [<upstream>...] -m "why"
 keep deps [<card>]

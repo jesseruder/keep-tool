@@ -675,14 +675,16 @@ function git(...args) {
 
 function commitAndPush(message, pathspecs = ['tasks', 'archive', 'digests'], { staged = false, push = true } = {}) {
   if (!staged) git('add', '-A', ...pathspecs);
-  const status = git('status', '--porcelain', ...pathspecs);
-  if (!status.trim()) return;
+  const status = git('status', '--porcelain', '-z', ...pathspecs);
+  if (!status.length) return;
   // pathspec-scoped so unrelated staged files never ride along in a keep commit
-  const changed = status.trim().split('\n').map((l) => {
-    let p = l.slice(3);
-    if (p.includes(' -> ')) p = p.split(' -> ')[1];
-    return p.replace(/^"|"$/g, '');
-  });
+  const entries = status.split('\0');
+  const changed = [];
+  for (let i = 0; i < entries.length && entries[i]; i++) {
+    const entry = entries[i];
+    changed.push(entry.slice(3));
+    if (entry[0] === 'R' || entry[0] === 'C' || entry[1] === 'R' || entry[1] === 'C') i++;
+  }
   git('commit', '-q', '-m', message, '--', ...changed);
   // Agent sessions must honor the user's explicit push-approval policy. Manual
   // terminal use keeps the original best-effort background sync behavior.
@@ -703,7 +705,10 @@ function parseArgs(argv, spec) {
   const opts = { _: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a.startsWith('--')) {
+    if (a === '--') {
+      opts._.push(...argv.slice(i + 1));
+      break;
+    } else if (a.startsWith('--')) {
       const name = a.slice(2);
       const kind = spec[name];
       if (!kind) die(`unknown flag --${name}`);
@@ -2002,7 +2007,7 @@ function filesIdentical(left, right) {
 commands.artifact = (argv) => {
   const o = parseArgs(argv, {});
   const [id, ...inputs] = o._;
-  if (!id) die('usage: keep artifact <card> [<file>...] [-m "note"]');
+  if (!id) die('usage: keep artifact <card> [--] [<file>...] [-m "note"]');
   if (!/^[A-Za-z0-9_-]+$/.test(id)) die(`invalid artifact card id "${id}"`);
   loadTask(id);
 
@@ -2032,32 +2037,51 @@ commands.artifact = (argv) => {
     const directory = path.join(META, 'artifacts', id);
     fs.mkdirSync(directory, { recursive: true });
     const results = [];
-    for (const source of sources) {
-      const basename = path.basename(source);
-      const preferred = path.join(directory, basename);
-      let destination = preferred;
-      let created = false;
-      try {
-        fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL);
-        created = true;
-      } catch (error) {
-        if (error.code !== 'EEXIST') throw error;
-        if (!filesIdentical(source, preferred)) {
-          const ext = path.extname(basename);
-          const stem = ext ? basename.slice(0, -ext.length) : basename;
-          for (let timestamp = Date.now(); ; timestamp++) {
-            destination = path.join(directory, `${stem}-${timestamp}${ext}`);
-            try {
-              fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL);
-              created = true;
-              break;
-            } catch (copyError) {
-              if (copyError.code !== 'EEXIST') throw copyError;
+    const createdDestinations = [];
+    const cleanupCreated = () => {
+      for (const destination of createdDestinations) {
+        try { fs.unlinkSync(destination); } catch {}
+      }
+    };
+    try {
+      for (const source of sources) {
+        const basename = path.basename(source);
+        const preferred = path.join(directory, basename);
+        let destination = preferred;
+        let created = false;
+        try {
+          fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL);
+          created = true;
+        } catch (error) {
+          if (error.code !== 'EEXIST') throw error;
+          if (!filesIdentical(source, preferred)) {
+            const ext = path.extname(basename);
+            const stem = ext ? basename.slice(0, -ext.length) : basename;
+            for (let timestamp = Date.now(); ; timestamp++) {
+              destination = path.join(directory, `${stem}-${timestamp}${ext}`);
+              try {
+                fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL);
+                created = true;
+                break;
+              } catch (copyError) {
+                if (copyError.code !== 'EEXIST') throw copyError;
+              }
             }
           }
         }
+        if (created) {
+          createdDestinations.push(destination);
+          const destinationStat = fs.statSync(destination);
+          if (destinationStat.size > limit) {
+            cleanupCreated();
+            die(`artifact too large: ${source} (${(destinationStat.size / 1024 / 1024).toFixed(1)} MB); trim or compress it before storing`);
+          }
+        }
+        results.push({ source, destination, created });
       }
-      results.push({ source, destination, created });
+    } catch (error) {
+      cleanupCreated();
+      throw error;
     }
 
     const text = results.map(({ source, destination, created }) =>
@@ -5990,7 +6014,7 @@ function helpText() {
   keep link <card> --session <sid> --agent claude|codex   # repair ownership metadata without waking or launching
   keep list [--status s]… [--tag t] [--project p] [--overdue] [--brief] [--all]
   keep show <id>
-  keep artifact <card> [<file>...] [-m "note"]
+  keep artifact <card> [--] [<file>...] [-m "note"]
                          # copies files into committed .keep/artifacts/<card>/ and prints durable paths; use instead of citing /tmp
   keep wait [--no-hold <project> [--scope <resource>]] [--card <id>[#<n>]] [--lane <project> <step>]
             [--check-due <id>] [--for <duration>] [--interval <seconds>]

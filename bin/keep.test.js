@@ -1451,10 +1451,12 @@ test('artifact copies files into a committed per-card directory and logs the dur
     fs.mkdirSync(path.join(root, 'tasks'));
     fs.mkdirSync(sourceA);
     fs.mkdirSync(sourceB);
-    fs.writeFileSync(path.join(root, '.gitignore'), '.keep/\n');
+    fs.writeFileSync(path.join(root, '.gitignore'), '.keep/\nsource-a/\nsource-b/\n/--weird.log\n');
     assert.equal(git('init', '-q').status, 0);
     assert.equal(git('config', 'user.name', 'Keep Test').status, 0);
     assert.equal(git('config', 'user.email', 'keep@example.test').status, 0);
+    assert.equal(git('add', '.gitignore').status, 0);
+    assert.equal(git('commit', '-q', '-m', 'test fixture').status, 0);
     const keep = require('./keep.js');
     fs.writeFileSync(path.join(root, 'tasks', 'card.md'), keep.serializeTask({
       id: 'card', fm: { title: 'Artifacts', status: 'active', kind: 'task', tags: ['personal'] }, body: '',
@@ -1482,25 +1484,68 @@ test('artifact copies files into a committed per-card directory and logs the dur
       '.keep/artifacts/card/notes.txt', '.keep/artifacts/card/plan.json', 'tasks/card.md',
     ].sort());
 
+    const headBeforeAgain = git('rev-parse', 'HEAD').stdout.trim();
     const again = run(['artifact', 'card', plan]);
     assert.equal(again.status, 0, again.stderr);
     assert.equal(again.stdout.trim(), durablePlan);
     assert.deepEqual(fs.readdirSync(artifactDirectory).sort(), ['notes.txt', 'plan.json']);
     const afterAgain = keep.parseTask(fs.readFileSync(path.join(root, 'tasks', 'card.md'), 'utf8'), 'card');
     assert.match(afterAgain.body, new RegExp(`Already stored ${durablePlan.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.notEqual(git('rev-parse', 'HEAD').stdout.trim(), headBeforeAgain);
+    assert.equal(git('status', '--porcelain').stdout, '');
+    assert.deepEqual(git('show', '--name-only', '--format=', 'HEAD').stdout.trim().split('\n'), ['tasks/card.md']);
 
     const replacement = path.join(sourceB, 'plan.json');
     fs.writeFileSync(replacement, '{"ready":false}\n');
+    const headBeforeCollision = git('rev-parse', 'HEAD').stdout.trim();
     const collision = run(['artifact', 'card', replacement]);
     assert.equal(collision.status, 0, collision.stderr);
     const suffixedPlan = collision.stdout.trim();
     assert.match(path.basename(suffixedPlan), /^plan-\d+\.json$/);
     assert.equal(fs.readFileSync(suffixedPlan, 'utf8'), '{"ready":false}\n');
+    assert.notEqual(git('rev-parse', 'HEAD').stdout.trim(), headBeforeCollision);
+    assert.equal(git('status', '--porcelain').stdout, '');
+    assert.deepEqual(git('show', '--name-only', '--format=', 'HEAD').stdout.trim().split('\n').sort(), [
+      path.relative(root, suffixedPlan), 'tasks/card.md',
+    ].sort());
+
+    const unicodeSource = path.join(sourceA, 'résumé plan.json');
+    fs.writeFileSync(unicodeSource, '{"name":"résumé"}\n');
+    const headBeforeUnicode = git('rev-parse', 'HEAD').stdout.trim();
+    const unicode = run(['artifact', 'card', unicodeSource]);
+    assert.equal(unicode.status, 0, unicode.stderr);
+    const durableUnicode = path.join(artifactDirectory, 'résumé plan.json');
+    assert.equal(unicode.stdout.trim(), durableUnicode);
+    assert.equal(fs.readFileSync(durableUnicode, 'utf8'), '{"name":"résumé"}\n');
+    assert.notEqual(git('rev-parse', 'HEAD').stdout.trim(), headBeforeUnicode);
+    assert.equal(git('status', '--porcelain').stdout, '');
+    assert.deepEqual(git('-c', 'core.quotePath=false', 'show', '--name-only', '--format=', 'HEAD').stdout.trim().split('\n').sort(), [
+      '.keep/artifacts/card/résumé plan.json', 'tasks/card.md',
+    ].sort());
+
+    const weirdSource = path.join(root, '--weird.log');
+    fs.writeFileSync(weirdSource, 'strange but durable\n');
+    const weird = run(['artifact', 'card', '--', '--weird.log']);
+    assert.equal(weird.status, 0, weird.stderr);
+    const durableWeird = path.join(artifactDirectory, '--weird.log');
+    assert.equal(weird.stdout.trim(), durableWeird);
+    const listedWeird = run(['artifact', 'card']);
+    assert.equal(listedWeird.status, 0, listedWeird.stderr);
+    assert.match(listedWeird.stdout, new RegExp(`^${durableWeird.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\(`, 'm'));
+
+    const orphanSource = path.join(sourceA, 'must-not-remain.txt');
+    fs.writeFileSync(orphanSource, 'remove on failure\n');
+    const cardBeforeFailure = fs.readFileSync(path.join(root, 'tasks', 'card.md'), 'utf8');
+    const rejectedDirectory = run(['artifact', 'card', orphanSource, sourceB]);
+    assert.notEqual(rejectedDirectory.status, 0);
+    assert.match(rejectedDirectory.stderr, /artifact is not a regular file:/);
+    assert.equal(fs.existsSync(path.join(artifactDirectory, 'must-not-remain.txt')), false);
+    assert.equal(fs.readFileSync(path.join(root, 'tasks', 'card.md'), 'utf8'), cardBeforeFailure);
 
     const show = run(['show', 'card']);
     assert.equal(show.status, 0, show.stderr);
     assert.match(show.stdout, /^  artifacts:$/m);
-    for (const file of [durableNotes, durablePlan, suffixedPlan]) {
+    for (const file of [durableNotes, durablePlan, suffixedPlan, durableUnicode, durableWeird]) {
       assert.match(show.stdout, new RegExp(`^    ${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\(\\d+(?:\\.\\d)? (?:B|KB|MB)\\)$`, 'm'));
     }
 
@@ -1508,7 +1553,7 @@ test('artifact copies files into a committed per-card directory and logs the dur
     const cardBeforeList = fs.readFileSync(path.join(root, 'tasks', 'card.md'), 'utf8');
     const listed = run(['artifact', 'card']);
     assert.equal(listed.status, 0, listed.stderr);
-    for (const file of [durableNotes, durablePlan, suffixedPlan]) {
+    for (const file of [durableNotes, durablePlan, suffixedPlan, durableUnicode, durableWeird]) {
       assert.match(listed.stdout, new RegExp(`^${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\(.+, \\d{4}-\\d{2}-\\d{2}T`, 'm'));
     }
     assert.equal(git('rev-parse', 'HEAD').stdout.trim(), headBeforeList, 'listing does not commit');
