@@ -49,7 +49,8 @@ const ATTENTION_SWEEP_TASK = 'keep-attention-sweep';
 const BACKGROUND_ATTENTION_ETAG_KEY = '@keep/backgroundAttentionEtag';
 const BACKGROUND_ATTENTION_STATE_KEY = '@keep/backgroundAttentionState';
 const NOTIFIED_ATTENTION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const { createStateResultGate, stateViewKey } = require('./src/state-cache');
+const { createStateResultGate, nextQueueItem, requiresNotificationPoll, stateViewKey } = require('./src/state-cache');
+const ACTIONABLE_SELECTION_KINDS = new Set(['question', 'permission', 'plan', 'input']);
 
 function projName(project) {
   return project ? String(project).split('/').filter(Boolean).pop() || '' : '';
@@ -232,6 +233,8 @@ function KeepApp() {
   const stateRequestAbortRef = useRef(null);
   const stateResultGateRef = useRef(createStateResultGate());
   const integratedStateKeyRef = useRef(null);
+  const needsQueueRef = useRef([]);
+  const notificationRequestAbortRef = useRef(null);
 
   const activeStateView = useMemo(() => {
     if (route?.name === 'screen') return null;
@@ -244,12 +247,14 @@ function KeepApp() {
   stateResultGateRef.current.activate(activeStateKey);
 
   const integrateState = useCallback((state) => {
-    const fresh = queueItems(state);
-    const freshKeys = new Set(fresh.map(snoozeId));
-    for (const key of handledRef.current) if (!freshKeys.has(key)) handledRef.current.delete(key);
-    // Once the daemon confirms an item is set aside, its filter takes over from the
-    // optimistic handled set; otherwise the item stays hidden after expiry or Restore.
-    for (const item of fresh) if (item.setAside) handledRef.current.delete(snoozeId(item));
+    if (state.view === 'needs') {
+      const fresh = queueItems(state);
+      const freshKeys = new Set(fresh.map(snoozeId));
+      for (const key of handledRef.current) if (!freshKeys.has(key)) handledRef.current.delete(key);
+      // Once the daemon confirms an item is set aside, its filter takes over from the
+      // optimistic handled set; otherwise the item stays hidden after expiry or Restore.
+      for (const item of fresh) if (item.setAside) handledRef.current.delete(snoozeId(item));
+    }
     setData({ ...EMPTY_DATA, ...state, review: { ...EMPTY_DATA.review, ...(state.review || {}) } });
     setHandledVersion((value) => value + 1);
   }, []);
@@ -362,6 +367,20 @@ function KeepApp() {
     }
   }, [config, handleSuccessfulState, integrateState]);
 
+  const refreshNotifications = useCallback(async () => {
+    if (!config) return;
+    if (notificationRequestAbortRef.current) notificationRequestAbortRef.current.abort();
+    const controller = new AbortController();
+    notificationRequestAbortRef.current = controller;
+    try {
+      const result = await api.getNotifications(config, { signal: controller.signal });
+      if (!controller.signal.aborted && !result.unchanged) handleSuccessfulState(result.state);
+    } catch {}
+    finally {
+      if (notificationRequestAbortRef.current === controller) notificationRequestAbortRef.current = null;
+    }
+  }, [config, handleSuccessfulState]);
+
   useEffect(() => {
     if (!config || showSetup || !activeStateView) return undefined;
     let interval = null;
@@ -388,7 +407,34 @@ function KeepApp() {
     };
   }, [activeStateKey, config, refreshState, showSetup]);
 
+  useEffect(() => {
+    if (!config || showSetup || !requiresNotificationPoll(activeStateView)) return undefined;
+    let interval = null;
+    const startPolling = () => {
+      if (interval) clearInterval(interval);
+      refreshNotifications();
+      interval = setInterval(refreshNotifications, 8000);
+    };
+    if (AppState.currentState === 'active') startPolling();
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      if (nextState === 'active') startPolling();
+      else {
+        if (interval) clearInterval(interval);
+        interval = null;
+        if (notificationRequestAbortRef.current) notificationRequestAbortRef.current.abort();
+      }
+    });
+    return () => {
+      if (interval) clearInterval(interval);
+      if (notificationRequestAbortRef.current) notificationRequestAbortRef.current.abort();
+      subscription.remove();
+    };
+  }, [activeStateKey, config, refreshNotifications, showSetup]);
+
   const allQueue = useMemo(() => queueItems(data, handledRef.current), [data, handledVersion]);
+  useEffect(() => {
+    if (data.view === 'needs') needsQueueRef.current = allQueue;
+  }, [allQueue, data.view]);
   const waiting = useMemo(() => visibleQueue(allQueue), [allQueue]);
   const pinned = useMemo(() => pinnedItems(data, layouts, allQueue), [allQueue, data, layouts]);
   const recent = useMemo(() => recentItems(data, allQueue, pinned), [allQueue, data, pinned]);
@@ -407,25 +453,21 @@ function KeepApp() {
     return session ? { ...sessionItem(selection.kind || 'recent', session), _task: (data.tasks || []).find((task) => task.id === session.taskId) } : selection;
   }, [data, pinned, recent, selection, waiting]);
 
+  useEffect(() => {
+    if (data.view !== 'session' || data.id !== selection?.sessionId || !ACTIONABLE_SELECTION_KINDS.has(selection?.kind)) return;
+    const stillPresent = (data.attention || []).some((item) => item.sessionId === selection.sessionId && item.kind === selection.kind);
+    if (!stillPresent) setSelection(null);
+  }, [data.attention, data.id, data.view, selection?.kind, selection?.sessionId]);
+
   const advance = useCallback((item) => {
     handledRef.current.add(snoozeId(item));
     setHandledVersion((value) => value + 1);
-    // A detail response deliberately contains only one actionable item. Return to
-    // the fresh overview after acting instead of advancing through a stale cached queue.
-    if (data.view === 'session') {
-      setSelection(null);
-      setMode('needs');
-      AsyncStorage.setItem(MODE_KEY, 'needs').catch(() => {});
-      return;
-    }
-    const currentIndex = waiting.findIndex((candidate) => snoozeId(candidate) === snoozeId(item));
-    const remaining = waiting.filter((candidate) => snoozeId(candidate) !== snoozeId(item));
-    const next = remaining[currentIndex] || remaining[0] || null;
+    const source = data.view === 'session' ? needsQueueRef.current : waiting;
+    const next = nextQueueItem(source, item, handledRef.current, snoozeId);
     setSelection(next);
     setMode('needs');
     AsyncStorage.setItem(MODE_KEY, 'needs').catch(() => {});
-    refreshState();
-  }, [data.view, refreshState, waiting]);
+  }, [data.view, waiting]);
 
   const sendReply = useCallback(async (item, text) => {
     await api.send(config, { sessionId: item.sessionId }, text);

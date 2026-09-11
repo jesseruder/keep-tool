@@ -2,7 +2,9 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { createStateCache, createStateResultGate, statePath, stateViewKey } = require('./state-cache.js');
+const {
+  createStateCache, createStateResultGate, nextQueueItem, requiresNotificationPoll, statePath, stateViewKey,
+} = require('./state-cache.js');
 
 function response(status, data, etag = null) {
   return {
@@ -59,6 +61,24 @@ test('result gate rejects a response after a route change and an older same-rout
   const newer = gate.begin('session:one');
   assert.equal(gate.accepts(older), false);
   assert.equal(gate.accepts(newer), true);
+});
+
+test('detail, new, and terminal routes keep the independent notification poll active', () => {
+  assert.equal(requiresNotificationPoll({ view: 'needs' }), false);
+  assert.equal(requiresNotificationPoll({ view: 'fleet' }), false);
+  assert.equal(requiresNotificationPoll({ view: 'reviewer' }), false);
+  assert.equal(requiresNotificationPoll({ view: 'session', id: 'one' }), true);
+  assert.equal(requiresNotificationPoll({ view: 'new' }), true);
+  assert.equal(requiresNotificationPoll(null), true, 'terminal route suspends global state and uses notification-only polling');
+});
+
+test('queue advancement uses the retained overview order and skips handled items', () => {
+  const keyOf = (item) => item.id;
+  const items = [{ id: 'one' }, { id: 'two' }, { id: 'three' }, { id: 'four' }];
+  assert.equal(nextQueueItem(items, items[0], new Set(['one']), keyOf).id, 'two');
+  assert.equal(nextQueueItem(items, items[1], new Set(['one', 'two']), keyOf).id, 'three');
+  assert.equal(nextQueueItem(items, items[3], new Set(['four']), keyOf).id, 'one', 'last item wraps to the queue head');
+  assert.equal(nextQueueItem(items, items[0], new Set(['one', 'two', 'three', 'four']), keyOf), null);
 });
 
 test('an older overlapping response cannot replace a newer cached representation', async () => {

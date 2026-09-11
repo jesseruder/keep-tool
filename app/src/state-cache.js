@@ -36,6 +36,22 @@ function createStateResultGate() {
   };
 }
 
+function requiresNotificationPoll(descriptor) {
+  return descriptor === null || ['session', 'new', 'task', 'terminal'].includes(descriptor?.view);
+}
+
+function nextQueueItem(items, current, handled, keyOf) {
+  const source = Array.isArray(items) ? items : [];
+  const currentKey = keyOf(current);
+  const currentIndex = source.findIndex((item) => keyOf(item) === currentKey);
+  if (currentIndex < 0) return source.find((item) => !item.setAside && !handled.has(keyOf(item))) || null;
+  for (let offset = 1; offset <= source.length; offset += 1) {
+    const candidate = source[(currentIndex + offset) % source.length];
+    if (!candidate.setAside && !handled.has(keyOf(candidate))) return candidate;
+  }
+  return null;
+}
+
 function createStateCache(fetchImpl = (...args) => fetch(...args)) {
   const entries = new Map();
   const generations = new Map();
@@ -96,4 +112,12 @@ function createStateCache(fetchImpl = (...args) => fetch(...args)) {
   return { load };
 }
 
-module.exports = { createStateCache, createStateResultGate, normalizeServer, statePath, stateViewKey };
+module.exports = {
+  createStateCache,
+  createStateResultGate,
+  nextQueueItem,
+  normalizeServer,
+  requiresNotificationPoll,
+  statePath,
+  stateViewKey,
+};

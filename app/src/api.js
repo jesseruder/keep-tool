@@ -62,6 +62,7 @@ export const getState = async (config, descriptor = { view: 'needs' }, options =
   configureProjects(result.state);
   return result;
 };
+export const getNotifications = (config, options = {}) => stateCache.load(config, { view: 'notifications' }, options);
 export const getLayouts = (config) => request(config, '/api/layouts');
 // Terminals address either an agent session or a bare shell pane; `target` is
 // { sessionId } or { pane }, and the daemon rejects the mixture of both.
