@@ -113,3 +113,41 @@ test('unreadable evidence and pending ordinary drafts remain untouched by reconc
   assert.ok(fs.existsSync(path.join(f.directory, 'corrupt.json')));
   assert.equal(inspect(f).length, 2);
 }));
+
+test('late receipt survives reconciliation until the owner retries, without duplicate typing', () => fixture(async f => {
+  const x = f.add('codex', 'late answer');
+  fs.unlinkSync(x.journal);
+  let typed = 0;
+  const args = { session: { id: x.entry.sessionId, kind: 'codex' }, pane: 'pane', text: 'late answer', file: x.entry.file,
+    directory: f.directory, attempts: 0, precheck: async () => {}, type: async () => { typed++; },
+    submitDraft: async () => assert.fail('unexpected Enter'), draftMatches: async () => false };
+  await assert.rejects(delivery.deliver(args), /unconfirmed/);
+  x.append({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: args.text }] } });
+  delivery.reconcile(f.directory);
+  assert.equal(fs.existsSync(x.journal), false);
+  assert.equal(delivery.statusForText(f.directory, args.text).received, true);
+  assert.deepEqual(await delivery.deliver(args), { ok: true, delivery: 'received', recovered: true });
+  assert.equal(typed, 1);
+  // An archived receipt for a different message must not suppress new work.
+  const y = f.add('codex', 'completed command');
+  y.append({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'completed command' }] } });
+  delivery.reconcile(f.directory);
+  const next = { ...args, text: 'new work', attempts: 1, pause: async () => {}, type: async () => {
+    typed++;
+    y.append({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'new work' }] } });
+  } };
+  assert.equal((await delivery.deliver(next)).delivery, 'received');
+  assert.equal(typed, 2);
+}));
+
+test('busy injection lock skips reconciliation while continuing read-only health inspection', () => fixture(async f => {
+  const rows = [];
+  const options = { ...f, health: { record: (_name, row) => rows.push(row) },
+    reconcile: async () => { throw Object.assign(Error('busy'), { status: 429 }); } };
+  const { sweep } = require('./delivery-health');
+  for (let n = 0; n < 4; n++) assert.deepEqual(await sweep(options), []);
+  assert.ok(rows.every(row => row.ok === true));
+  f.add('claude', 'genuinely stuck');
+  assert.equal((await sweep(options)).length, 1);
+  assert.equal(rows.at(-1).ok, false, 'contention must not conceal a real stale draft');
+}));

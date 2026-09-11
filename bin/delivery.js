@@ -95,15 +95,21 @@ function saveReceipt(directory, entry) {
 async function deliverAttempt({ session, pane, text, key, file, directory, trace, retainReceipt = false, precheck, type, submitDraft, draftMatches, pause = (ms) => new Promise((r) => setTimeout(r, ms)), attempts = 16 }) {
   let typingError;
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const journal = path.join(directory, hash(session.id) + '.json');
+  const activeJournal = path.join(directory, hash(session.id) + '.json');
+  let journal = activeJournal, settled = false;
   let entry;
-  try { entry = JSON.parse(fs.readFileSync(journal, 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  try { entry = JSON.parse(fs.readFileSync(journal, 'utf8')); } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    journal = path.join(directory, 'settled', hash(session.id) + '.json');
+    try { entry = JSON.parse(fs.readFileSync(journal, 'utf8')); settled = true; }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
   if (entry) {
     trace('pending-journal-found');
     if (cancelled(entry, directory)) {
       fs.unlinkSync(journal);
       entry = null;
-    } else if (received(entry)) {
+    } else if (settled || received(entry)) {
       saveReceipt(directory, entry);
       fs.unlinkSync(journal);
       if (entry.hash === hash(text)) return { ok: true, delivery: 'received', recovered: true };
@@ -118,6 +124,7 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
     }
   }
   if (!entry) {
+    journal = activeJournal;
     if (cancelled({ sessionId: session.id, kind: session.kind, hash: hash(text) }, directory)) {
       throw Error('Delivery explicitly cancelled or acknowledged in the owning session; no message sent.');
     }
@@ -170,16 +177,19 @@ async function deliver(options) {
 function statusForText(directory, text, key) {
   try { return JSON.parse(fs.readFileSync(path.join(directory, 'receipts', receiptId(text, key) + '.json'), 'utf8')); }
   catch (e) { if (e.code !== 'ENOENT') throw e; }
-  let files;
-  try { files = fs.readdirSync(directory); } catch (e) { if (e.code === 'ENOENT') return null; throw e; }
-  for (const file of files.filter((f) => f.endsWith('.json'))) {
-    const entry = JSON.parse(fs.readFileSync(path.join(directory, file), 'utf8'));
+  const files = [];
+  for (const dir of [directory, path.join(directory, 'settled')]) {
+    try { files.push(...fs.readdirSync(dir).filter(f => f.endsWith('.json')).map(file => ({ file: path.join(dir, file), settled: dir !== directory }))); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  for (const item of files) {
+    const entry = JSON.parse(fs.readFileSync(item.file, 'utf8'));
     if (key ? entry.key !== key : entry.hash !== hash(text)) continue;
     if (cancelled(entry, directory)) return { sessionId: entry.sessionId, kind: entry.kind, received: false, pending: false, cancelled: true };
-    const confirmed = received(entry);
+    const confirmed = item.settled || received(entry);
     if (confirmed && entry.retainReceipt) {
       saveReceipt(directory, entry);
-      fs.unlinkSync(path.join(directory, file));
+      fs.unlinkSync(item.file);
     }
     return { sessionId: entry.sessionId, kind: entry.kind, received: confirmed, pending: !confirmed };
   }
@@ -213,7 +223,16 @@ function reconcile(directory) {
     try {
       const entry = JSON.parse(fs.readFileSync(path.join(directory, name), 'utf8'));
       if (name !== hash(entry.sessionId) + '.json') continue;
-      if (!pendingForSession(directory, entry.sessionId)) settled.push(entry.sessionId);
+      if (cancelled(entry, directory)) fs.unlinkSync(path.join(directory, name));
+      else if (received(entry)) {
+        // Keep successful evidence available to the owning retry loop, including
+        // sendPlain callers without retainReceipt. Otherwise a late success
+        // followed by this sweep would make the next retry type it again.
+        saveReceipt(directory, entry);
+        fs.mkdirSync(path.join(directory, 'settled'), { recursive: true, mode: 0o700 });
+        fs.renameSync(path.join(directory, name), path.join(directory, 'settled', name));
+      } else continue;
+      settled.push(entry.sessionId);
     } catch {} // Read-only health inspection still exposes the unresolved record.
   }
   return settled;

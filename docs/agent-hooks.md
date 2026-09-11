@@ -72,6 +72,9 @@ prevents an old compaction draft from being acknowledged. An explicitly cancelle
 or locally acknowledged question answer is removed only when its exact rendered
 payload and recipient match; cancellation never becomes a successful receipt or
 causes the answer to be resent. Corrupt or ambiguous attempts remain visible.
+Completed receipts move out of the active queue but remain available to the
+owning retry loop, so a late confirmation cannot cause duplicate typing. A busy
+delivery lock defers reconciliation while read-only inspection continues.
 The watchdog itself stays read-only and never sends input or restarts clients.
 It monitors attempted deliveries; it is not a startup compatibility certification
 and does not flag sends deferred before any draft was typed.

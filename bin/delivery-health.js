@@ -80,17 +80,23 @@ function tick(options = {}) {
   }
 }
 
+async function sweep(options = {}) {
+  try {
+    try { await options.reconcile?.(); }
+    catch (error) { if (error.status !== 429) throw error; } // Routine injection contention; inspect without mutating.
+    return tick(options);
+  } catch {
+    (options.health || require('./health')).record('delivery', { ok: false, error: 'Delivery reconciliation could not run' });
+    return null;
+  }
+}
+
 function startScheduler(options = {}) {
   let running = false;
   const run = async () => {
     if (running) return;
     running = true;
-    try {
-      await options.reconcile?.();
-      tick(options);
-    } catch {
-      (options.health || require('./health')).record('delivery', { ok: false, error: 'Delivery reconciliation could not run' });
-    } finally { running = false; }
+    try { await sweep(options); } finally { running = false; }
   };
   const interval = setInterval(run, 60e3);
   const initial = setTimeout(run, 5e3);
@@ -98,7 +104,7 @@ function startScheduler(options = {}) {
   return () => { clearInterval(interval); clearTimeout(initial); };
 }
 
-module.exports = { inspect, tick, startScheduler, STALE_MS };
+module.exports = { inspect, tick, sweep, startScheduler, STALE_MS };
 if (require.main === module) {
   try { process.stdout.write(JSON.stringify(inspect(), null, 2) + '\n'); }
   catch { process.stderr.write('Delivery watchdog could not inspect journals or diagnostics\n'); process.exitCode = 1; }
