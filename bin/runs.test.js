@@ -7,6 +7,10 @@
 for (const k of ['KEEP_REVIEWER', 'KEEP_REVIEWER_NAME', 'KEEP_REVIEWER_MODEL']) delete process.env[k];
 
 const assert = require('node:assert/strict');
+const { execFileSync } = require('node:child_process');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const test = require('node:test');
 
 test('scheduled-task timer polls each minute and matches health cadence', () => {
@@ -22,7 +26,8 @@ test('scheduled-task timer polls each minute and matches health cadence', () => 
 });
 
 const {
-  buildPrompt, headlessRunArgs, checkDeliveryMessage, planDueCard, deliveryWarning, finalizePayload, NO_RESULT,
+  buildPrompt, headlessRunArgs, checkDeliveryMessage, planDueCard, deliveryWarning,
+  cardFingerprint, finalizePayload, pendingCheckin, NO_RESULT,
 } = require('./runs.js');
 
 const card = (over = {}) => ({
@@ -193,5 +198,141 @@ test('a finalizer does not override a status the check set', () => {
     assert.equal('status' in payload, false, `${kind} finalizer leaves done alone`);
     assert.equal('clearCheckAfter' in payload, false, `${kind} finalizer leaves the schedule alone`);
     assert.match(payload.message, /\(status left as done; the check set it\)/);
+  }
+});
+
+function completedCheck(start) {
+  return {
+    taskId: 'some-card',
+    kind: 'check',
+    startStatus: start.fm.status,
+    startCardFingerprint: cardFingerprint(start),
+    status: 'done',
+    startedAt: 0,
+    endedAt: 60e3,
+    resultText: 'The check completed.',
+    diffStat: '',
+    exitCode: 0,
+  };
+}
+
+test('an untouched successful check still defaults to review and clears its schedule', () => {
+  const start = card();
+  const payload = finalizePayload(completedCheck(start), start);
+  assert.equal(payload.status, 'review');
+  assert.equal(payload.clearCheckAfter, true);
+});
+
+test('a successful check preserves an unchanged blocked card with an open need', () => {
+  const blocked = card({
+    status: 'blocked',
+    needs: [{ text: 'Complete npm MFA', at: '2026-09-11T12:00', was: 'active' }],
+  });
+  const payload = finalizePayload(completedCheck(blocked), blocked);
+  assert.equal('status' in payload, false);
+  assert.equal(payload.clearCheckAfter, true, 'the completed one-shot check is no longer due');
+  assert.match(payload.message, /status left as blocked/);
+});
+
+test('a same-status check-in that clears or reschedules is not overwritten by finalization', () => {
+  const start = card({ status: 'waiting', updated: '2026-09-11T12:00' });
+  for (const checkAfter of ['', '2026-09-12T09:00']) {
+    const now = structuredClone(start);
+    now.fm.check_after = checkAfter;
+    now.body = `${start.body}\n\n## 2026-09-11 12:00 — check-in → waiting\nChecked; ${checkAfter ? 'rescheduled.' : 'schedule cleared.'}`;
+    const payload = finalizePayload(completedCheck(start), now);
+    assert.equal('status' in payload, false, checkAfter || 'cleared');
+    assert.equal('clearCheckAfter' in payload, false, checkAfter || 'cleared');
+  }
+});
+
+test('a same-minute reaffirmed status is visible through the card body fingerprint', () => {
+  const start = card({ status: 'waiting', updated: '2026-09-11T12:00' });
+  const now = structuredClone(start);
+  now.body = `${start.body}\n\n## 2026-09-11 12:00 — check-in → waiting\nStill waiting; keep this schedule.`;
+  const payload = finalizePayload(completedCheck(start), now);
+  assert.equal('status' in payload, false);
+  assert.equal('clearCheckAfter' in payload, false);
+});
+
+test('a pending retry cannot apply state or schedule from before a newer card action', () => {
+  const queuedAgainst = card({ status: 'waiting', updated: '2026-09-11T12:00' });
+  const payload = finalizePayload(completedCheck(queuedAgainst), queuedAgainst);
+  const newer = structuredClone(queuedAgainst);
+  newer.body = `${queuedAgainst.body}\n\n## 2026-09-11 12:00 — check-in → waiting\nA newer action.`;
+  const stale = pendingCheckin(payload, newer);
+  assert.equal(stale.stale, true);
+  assert.equal('status' in stale.checkin, false);
+  assert.equal('clearCheckAfter' in stale.checkin, false);
+  assert.match(stale.checkin.message, /card changed after this result was queued/);
+
+  const fresh = pendingCheckin(payload, queuedAgainst);
+  assert.equal(fresh.stale, false);
+  assert.equal(fresh.checkin.status, 'review');
+  assert.equal(fresh.checkin.clearCheckAfter, true);
+  assert.equal('_retryCardFingerprint' in fresh.checkin, false, 'retry metadata never reaches checkinTask');
+});
+
+test('the blocked same-status result lands through real check-in validation', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-runs-finalize-'));
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'tasks', 'blocked-check.md'), [
+      '---',
+      'title: Blocked scheduled check',
+      'status: blocked',
+      'kind: task',
+      'tags: [personal]',
+      'check_after: 2026-09-11T12:00',
+      'check: |',
+      '  Inspect npm publishing state.',
+      'needs:',
+      '  - text: Complete npm MFA',
+      '    at: 2026-09-11T12:00',
+      '    was: active',
+      'created: 2026-09-11T11:00',
+      'updated: 2026-09-11T12:00',
+      '---',
+      '',
+      'Initial context.',
+      '',
+    ].join('\n'));
+    const script = `
+      const keep = require(${JSON.stringify(require.resolve('./keep.js'))});
+      const runs = require(${JSON.stringify(require.resolve('./runs.js'))});
+      const start = keep.loadTask('blocked-check');
+      keep.checkinTask('blocked-check', {
+        message: 'Still waiting on npm MFA; schedule cleared.', status: 'blocked',
+        clearCheckAfter: true, commit: false,
+      });
+      const now = keep.loadTask('blocked-check');
+      const run = {
+        taskId: 'blocked-check', kind: 'check', startStatus: start.fm.status,
+        startCardFingerprint: runs.cardFingerprint(start), status: 'done',
+        startedAt: 0, endedAt: 60000,
+        resultText: 'Still waiting on npm MFA.', diffStat: '', exitCode: 0,
+      };
+      const payload = runs.finalizePayload(run, now);
+      const prepared = runs.pendingCheckin(payload, now);
+      keep.checkinTask(prepared.taskId, { ...prepared.checkin, commit: false });
+      const landed = keep.loadTask('blocked-check');
+      process.stdout.write(JSON.stringify({
+        status: landed.fm.status, checkAfter: landed.fm.check_after || '',
+        needs: landed.fm.needs, payloadStatus: payload.status,
+        payloadClear: payload.clearCheckAfter,
+      }));
+    `;
+    const output = execFileSync(process.execPath, ['-e', script], {
+      encoding: 'utf8',
+      env: { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1' },
+    });
+    const landed = JSON.parse(output);
+    assert.equal(landed.status, 'blocked');
+    assert.equal(landed.checkAfter, '');
+    assert.equal(landed.needs.length, 1);
+    assert.equal(landed.payloadStatus, undefined);
+    assert.equal(landed.payloadClear, undefined);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });

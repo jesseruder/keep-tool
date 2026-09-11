@@ -154,6 +154,7 @@ function startRun(taskId, kind, extra, opts) {
   const run = {
     id, taskId, kind, cwd,
     startStatus: task.fm.status,
+    startCardFingerprint: cardFingerprint(task),
     pid: child.pid,
     status: 'running',
     startedAt: Date.now(),
@@ -252,11 +253,42 @@ function clip(s, n) {
   return s.length > n ? s.slice(0, n) + '…' : s;
 }
 
+// `updated` is minute-resolution, so it cannot tell whether a check-in happened
+// while a short run was active. Hash the full durable card instead: a check-in that
+// reaffirms the same status and schedule still appends to the body and is therefore
+// visible here.
+function cardFingerprint(task) {
+  if (!task || !task.fm) return '';
+  return crypto.createHash('sha256').update(JSON.stringify({
+    fm: task.fm,
+    body: String(task.body || ''),
+  })).digest('hex');
+}
+
+function hasOpenNeeds(task) {
+  return Boolean(task && task.fm && task.fm.status !== 'done'
+    && Array.isArray(task.fm.needs)
+    && task.fm.needs.some((need) => need && need.text));
+}
+
 function finalizePayload(run, taskNow, code = run.exitCode) {
   const statusChanged = taskNow && (taskNow.fm.status !== run.startStatus || taskNow.fm.status === 'done');
+  const cardChanged = Boolean(taskNow && run.startCardFingerprint
+    && cardFingerprint(taskNow) !== run.startCardFingerprint);
+  // A blocked card is already expressing unresolved work. In particular, forcing
+  // one with an open need to review loses that state and can fail review-prose
+  // validation. A full-card change also covers an explicit same-status check-in
+  // that cleared or rescheduled this check while the run was active.
+  const preserveStatus = Boolean(statusChanged || cardChanged
+    || taskNow?.fm?.status === 'blocked' || hasOpenNeeds(taskNow));
+  const preserveSchedule = Boolean(statusChanged || cardChanged);
   const statusNote = statusChanged
     ? `\n\n(status left as ${taskNow.fm.status}; the check set it)`
-    : '';
+    : cardChanged
+      ? `\n\n(card status and schedule left unchanged; the card changed while the run was active)`
+      : preserveStatus
+        ? `\n\n(status left as ${taskNow.fm.status}; its blocker remains)`
+        : '';
   let payload;
   if (run.status === 'done') {
     const mins = Math.round((run.endedAt - run.startedAt) / 60e3);
@@ -297,11 +329,22 @@ function finalizePayload(run, taskNow, code = run.exitCode) {
       clearCheckAfter: false,
     };
   }
-  if (statusChanged) {
-    delete payload.status;
-    delete payload.clearCheckAfter;
-  }
+  if (preserveStatus) delete payload.status;
+  if (preserveSchedule) delete payload.clearCheckAfter;
+  if (taskNow) payload._retryCardFingerprint = cardFingerprint(taskNow);
   return payload;
+}
+
+function pendingCheckin(payload, taskNow) {
+  const { taskId, _retryCardFingerprint, ...checkin } = payload;
+  const stale = Boolean(_retryCardFingerprint && taskNow
+    && cardFingerprint(taskNow) !== _retryCardFingerprint);
+  if (stale && ('status' in checkin || 'clearCheckAfter' in checkin)) {
+    delete checkin.status;
+    delete checkin.clearCheckAfter;
+    checkin.message = `${checkin.message}\n\n(card changed after this result was queued; current status and check schedule preserved)`;
+  }
+  return { taskId, checkin, stale };
 }
 
 function finalize(run, code) {
@@ -332,7 +375,7 @@ function finalize(run, code) {
   try { taskNow = keep.loadTask(run.taskId); } catch {}
   const payload = finalizePayload(run, taskNow, code);
   try {
-    const { taskId, ...checkin } = payload;
+    const { taskId, checkin } = pendingCheckin(payload, taskNow);
     keep.checkinTask(taskId, checkin);
   } catch (e) {
     const pendingFile = path.join(RUNS_DIR, `${run.id}.pending.json`);
@@ -414,8 +457,15 @@ function retryPending() {
     const pendingFile = path.join(RUNS_DIR, file);
     try {
       const payload = JSON.parse(fs.readFileSync(pendingFile, 'utf8'));
-      const { taskId, ...checkin } = payload;
-      keep.checkinTask(taskId, checkin);
+      let taskId;
+      // Compare and mutate under the same registry lock so a newer card action
+      // cannot land between the stale check and this retry.
+      keep.withLock(() => {
+        const taskNow = payload._retryCardFingerprint ? keep.loadTask(payload.taskId) : null;
+        const prepared = pendingCheckin(payload, taskNow);
+        taskId = prepared.taskId;
+        keep.checkinTask(taskId, { ...prepared.checkin, withinLock: true });
+      });
       fs.unlinkSync(pendingFile);
       process.stderr.write(`keep runs: landed pending check-in for ${taskId}\n`);
     } catch (e) {
@@ -644,5 +694,6 @@ function startScheduler() {
 
 module.exports = {
   startRun, stopRun, listRuns, readDiff, recover, retryPending, startScheduler, setOnChange, setNotifier, setDeliverer,
-  buildPrompt, headlessRunArgs, checkDeliveryMessage, checkDeliveryKey, planDueCard, deliveryWarning, finalizePayload, NO_RESULT,
+  buildPrompt, headlessRunArgs, checkDeliveryMessage, checkDeliveryKey, planDueCard, deliveryWarning,
+  cardFingerprint, finalizePayload, pendingCheckin, NO_RESULT,
 };
