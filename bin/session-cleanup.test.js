@@ -39,6 +39,60 @@ test('manual Close allows recent pinned next-instruction sessions, but not activ
   for (const patch of [{ state: 'running' }, { reviewer: true }, { pendingQuestion: {} }, { pendingPlan: {} }, { pendingBackground: true }, { toolRunning: true }, { waitingFor: 'lock' }, { activity: { needsInput: true, reason: 'question' } }]) assert.ok(check(patch));
 });
 
+test('restart cleanup admits an idle reviewer but ordinary close still protects it', () => {
+  const now = Date.now();
+  const session = { id: 'rev', kind: 'claude', reviewer: true, state: 'idle', endedTurn: true, mtime: now };
+  const pane = { id: 'p', alive: true, attached: 1, meta: { sessionId: 'rev', agent: 'claude', reviewer: true } };
+  assert.equal(refusal(session, pane, new Set(['p']), now, { manual: true, restart: true }), null);
+  assert.match(refusal(session, pane, new Set(), now, { manual: true }), /reviewer is protected/);
+  assert.match(refusal(session, pane, new Set(), now, { automatic: true }), /reviewer is protected/);
+  for (const patch of [{ endedTurn: false }, { pendingBackground: true }, { pendingQuestion: {} }, { toolRunning: true }]) {
+    assert.ok(refusal({ ...session, ...patch }, pane, new Set(), now, { manual: true, restart: true }));
+  }
+});
+
+test('real cleanup path closes an idle watched reviewer for restart and preserves draft and background guards', async () => {
+  const { closeIdleSession } = require('./serve');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-reviewer-close-'));
+  const base = { id: 'rev', kind: 'claude', reviewer: true, state: 'idle', endedTurn: true, mtime: Date.now() };
+  const pane = { id: 'p', alive: true, attached: 1, visibleAttached: 1,
+    meta: { sessionId: 'rev', agent: 'claude', reviewer: true } };
+  try {
+    const run = async (patch = {}, draft = '') => {
+      const session = { ...base, ...patch };
+      let box = draft;
+      const deps = {
+        root, closePolicy: { manual: true, restart: true }, restartProof: () => {},
+        withInjectionLock: (fn) => fn(), buildState: () => ({ sessions: [session], tasks: [] }),
+        claudeSessionFor: () => session, sleep: async () => {},
+        stderr: () => {},
+        readScreen: async () => `────────────────────\n❯ ${box}`,
+        host: { request: async (type, params) => {
+          if (type === 'list') return { panes: [pane] };
+          if (type === 'input') {
+            const input = Buffer.from(params.data, 'base64').toString();
+            box = input === '\x7f' ? box.slice(0, -1) : box + input;
+            return {};
+          }
+          assert.fail(type);
+        } },
+      };
+      return { operation: closeIdleSession({ sessionId: 'rev', pane: 'p' }, deps), box: () => box };
+    };
+    const idle = await run();
+    assert.equal((await idle.operation).closing, true);
+    assert.equal(idle.box(), '/exit\r');
+    for (const [patch, draft, message] of [
+      [{ pendingBackground: true }, '', /background work/],
+      [{}, 'unfinished command', /contains a draft/],
+    ]) {
+      const blocked = await run(patch, draft);
+      await assert.rejects(blocked.operation, message);
+      assert.equal(blocked.box(), draft);
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('manual Close permits card review but preserves real prompt and activity guards', () => {
   const now = Date.now();
   for (const kind of ['claude', 'codex']) {
