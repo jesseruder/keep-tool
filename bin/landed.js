@@ -233,13 +233,7 @@ function fetchDefault(repo, branch, state, now = Date.now()) {
   const prior = Number(state.fetchedAt[repo]);
   const priorStatus = state.fetchStatus[repo];
   if (Number.isFinite(prior) && now - prior >= 0 && now - prior < FETCH_INTERVAL_MS
-      && (!priorStatus || (priorStatus.ok === true && priorStatus.branch === branch))) {
-    // Registries written before fetchStatus was introduced still have valid
-    // fetchedAt evidence. Seed the positive record so later read-only checks do
-    // not have to guess from an unverified tracking ref.
-    if (!priorStatus) state.fetchStatus[repo] = { at: prior, branch, ok: true };
-    return null;
-  }
+      && priorStatus?.ok === true && priorStatus.branch === branch) return null;
   try {
     git(repo, ['fetch', '--no-tags', '--quiet', 'origin', branch], 20e3);
     state.fetchedAt[repo] = now;

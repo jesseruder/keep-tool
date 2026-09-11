@@ -1529,10 +1529,22 @@ test('a failed fetch blocks commit waits and stale local refs until a later succ
   }
 });
 
-test('a recent legacy fetchedAt record seeds positive evidence for a throttled commit wait', () => {
+test('a recent legacy fetchedAt record refetches before satisfying a commit wait', () => {
   const { temp, repo, root, env, sha } = landedFixture('keep-landed-legacy-fetch-');
+  const origin = path.join(temp, 'origin.git');
+  const pusher = path.join(temp, 'pusher');
   try {
     const now = Date.now();
+    runGit(['clone', '-q', origin, pusher], { env });
+    configureGit(pusher, env);
+    fs.writeFileSync(path.join(pusher, 'later.txt'), 'later\n');
+    runGit(['-C', pusher, 'add', 'later.txt'], { env });
+    runGit(['-C', pusher, 'commit', '-q', '-m', 'later'], { env });
+    const remoteSha = runGit(['-C', pusher, 'rev-parse', 'HEAD'], { env });
+    runGit(['-C', pusher, 'push', '-q', 'origin', 'main'], { env });
+    assert.notEqual(remoteSha, sha);
+    assert.equal(runGit(['-C', repo, 'rev-parse', 'refs/remotes/origin/main'], { env }), sha);
+
     const keep = require('./keep.js');
     const upstream = {
       id: 'upstream',
@@ -1546,7 +1558,7 @@ test('a recent legacy fetchedAt record seeds positive evidence for a throttled c
       id: 'dependent',
       fm: {
         title: 'dependent', status: 'waiting', kind: 'task', tags: ['personal'],
-        depends_on: [{ card: 'upstream', kind: 'commit', commits: [sha], reason: 'need verified origin' }],
+        depends_on: [{ card: 'upstream', kind: 'commit', commits: [remoteSha], reason: 'need verified origin' }],
         created: '2026-09-10', updated: '2026-09-10T12:00',
       },
       body: '',
@@ -1568,8 +1580,9 @@ test('a recent legacy fetchedAt record seeds positive evidence for a throttled c
     fs.writeFileSync(path.join(stateDir, '_state.json'), JSON.stringify({ fetchedAt: { [repo]: now - 1000 } }) + '\n');
     const swept = runSweep(env, now);
     assert.deepEqual(swept.fetchFailures, []);
+    assert.equal(runGit(['-C', repo, 'rev-parse', 'refs/remotes/origin/main'], { env }), remoteSha);
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(stateDir, '_state.json'), 'utf8')).fetchStatus[repo], {
-      at: now - 1000, branch: 'main', ok: true,
+      at: now, branch: 'main', ok: true,
     });
 
     const afterLanded = spawnSync(process.execPath, ['-e', unblockScript], { env, encoding: 'utf8' });
