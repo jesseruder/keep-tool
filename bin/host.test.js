@@ -1,7 +1,9 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const childProcess = require('node:child_process');
 const fs = require('node:fs');
+const Module = require('node:module');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
@@ -169,6 +171,28 @@ async function settledTerminal(pane) {
     pending = pane.writeChain;
     await pending;
   } while (pending !== pane.writeChain);
+}
+
+function cellStyle(term, x, y) {
+  const cell = term.buffer.active.getLine(y).getCell(x);
+  return {
+    chars: cell.getChars(),
+    fg: cell.getFgColor(),
+    bg: cell.getBgColor(),
+    bold: Boolean(cell.isBold()),
+  };
+}
+
+function loadPreviousHostCore() {
+  const filename = path.join(__dirname, 'host.js');
+  const source = childProcess.execFileSync('git', ['show', 'b80a958:bin/host.js'], {
+    cwd: path.join(__dirname, '..'), encoding: 'utf8',
+  });
+  const previous = new Module(filename, module);
+  previous.filename = filename;
+  previous.paths = Module._nodeModulePaths(__dirname);
+  previous._compile(source, filename);
+  return previous.exports;
 }
 
 test('RingBuffer evicts whole oldest chunks, retains oversized tails, and clears', () => {
@@ -714,7 +738,7 @@ test('handoff adopts a live PTY, rebuilds its screen, and keeps exit detection',
     assert.deepEqual(Object.keys(record.panes[0]).sort(), [
       'alive', 'args', 'buffer', 'cmd', 'coldSnapshot', 'cols', 'createdAt', 'cwd', 'exitCode', 'exitedAt',
       'id', 'inputCount', 'lastInputAt', 'lastOutputAt', 'lastReadAt', 'meta', 'outputCount', 'pid', 'primary',
-      'pty', 'rows', 'screen', 'signal', 'title',
+      'pty', 'rows', 'screen', 'signal', 'terminalState', 'title',
     ]);
 
     active = createHost({ sock, log: null, adopt: record });
@@ -1018,6 +1042,38 @@ test('exited unviewed panes freeze and restore full screen, scrollback, modes, a
   });
 });
 
+test('cold restoration preserves origin mode, scroll margins, cursor, SGR cells, and snapshot bytes', async () => {
+  await withHost({}, async ({ host, client }) => {
+    const { pane } = await client.request('spawn', {
+      cmd: '/bin/sh', args: ['-c', 'exec sleep 30'], cols: 20, rows: 6,
+    });
+    const internal = host.panes.get(pane.id);
+    internal.pty._onData.fire('\x1b[2;5r\x1b[?6h\x1b[2;3H\x1b[31;44;1mhello');
+    await settledTerminal(internal);
+    const beforeScreen = renderScreen(internal.term);
+    const beforeCell = cellStyle(internal.term, 2, 2);
+    const beforeSnapshot = internal.serializer.serialize({ scrollback: 10000, excludeAltBuffer: false });
+    assert.deepEqual(beforeScreen.cursor, { x: 7, y: 2 });
+    assert.deepEqual(beforeCell, { chars: 'h', fg: 1, bg: 4, bold: true });
+    internal.pty.kill('SIGKILL');
+    await waitFor(() => internal.term === null, 'mode pane to freeze', 4000);
+
+    assert.deepEqual((await client.request('screen', { pane: pane.id })).cursor, beforeScreen.cursor);
+    await waitFor(() => internal.term === null, 'mode pane to refreeze after screen');
+    const attachment = await client.attach(pane.id, { replay: false }, () => {});
+    assert.deepEqual(cellStyle(internal.term, 2, 2), beforeCell);
+    assert.equal(internal.term.modes.originMode, true);
+    assert.equal(internal.term.buffer.active._buffer.scrollTop, 1);
+    assert.equal(internal.term.buffer.active._buffer.scrollBottom, 4);
+    assert.equal(
+      internal.serializer.serialize({ scrollback: 10000, excludeAltBuffer: false }),
+      beforeSnapshot,
+      'restoration leaves xterm snapshot bytes unchanged',
+    );
+    await attachment.detach();
+  });
+});
+
 test('active and attached exited panes remain resident until they are unviewed', async () => {
   await withHost({}, async ({ host, client }) => {
     const { pane } = await client.request('spawn', { cmd: '/bin/sh', args: ['-c', 'exec sleep 30'] });
@@ -1133,6 +1189,157 @@ test('an attach racing the freeze commit keeps the exited terminal resident and 
   } finally { releaseRename(); }
 });
 
+test('clear during a pending freeze commit invalidates the stale archive', async () => {
+  let markRename;
+  let releaseRename;
+  const renameStarted = new Promise((resolve) => { markRename = resolve; });
+  const renameGate = new Promise((resolve) => { releaseRename = resolve; });
+  let gated = false;
+  const coldIO = {
+    mkdir: (...args) => fs.promises.mkdir(...args),
+    writeFile: (...args) => fs.promises.writeFile(...args),
+    rename: async (...args) => {
+      if (!gated) {
+        gated = true;
+        markRename();
+        await renameGate;
+      }
+      return fs.promises.rename(...args);
+    },
+    unlink: (...args) => fs.promises.unlink(...args),
+    readFile: (...args) => fs.promises.readFile(...args),
+  };
+  try {
+    await withHost({ coldIO }, async ({ host, client }) => {
+      const { pane } = await client.request('spawn', {
+        cmd: '/bin/sh', args: ['-c', "printf 'old1\\nold2\\nold3\\nold4\\n'; exit 0"], rows: 2,
+      });
+      const internal = host.panes.get(pane.id);
+      await renameStarted;
+      await client.request('clear', { pane: pane.id, repaint: false });
+      assert.equal(internal.bufferBytes, 0);
+      releaseRename();
+      await waitFor(() => internal.term === null, 'cleared race pane to freeze', 4000);
+      const screen = await client.request('screen', { pane: pane.id, scrollback: 10000 });
+      assert.doesNotMatch(screen.text, /old[12]/, 'cleared scrollback is not resurrected');
+      let replay = Buffer.alloc(0);
+      const attachment = await client.attach(pane.id, { replay: true }, (data, info) => {
+        if (info.replay) replay = Buffer.concat([replay, data]);
+      });
+      await delay(20);
+      assert.equal(replay.length, 0);
+      await attachment.detach();
+    });
+  } finally { releaseRename(); }
+});
+
+test('disconnect during cold restore cannot register a dead raw attachment', async () => {
+  let markRead;
+  let releaseRead;
+  const readStarted = new Promise((resolve) => { markRead = resolve; });
+  const readGate = new Promise((resolve) => { releaseRead = resolve; });
+  let gate = false;
+  const coldIO = {
+    mkdir: (...args) => fs.promises.mkdir(...args),
+    writeFile: (...args) => fs.promises.writeFile(...args),
+    rename: (...args) => fs.promises.rename(...args),
+    unlink: (...args) => fs.promises.unlink(...args),
+    readFile: async (...args) => {
+      if (gate) {
+        markRead();
+        await readGate;
+      }
+      return fs.promises.readFile(...args);
+    },
+  };
+  try {
+    await withHost({ coldIO }, async ({ host, client }) => {
+      const { pane } = await client.request('spawn', { cmd: '/bin/sh', args: ['-c', "printf dead; exit 0"] });
+      const internal = host.panes.get(pane.id);
+      await waitFor(() => internal.term === null, 'dead attach pane to freeze', 4000);
+      gate = true;
+      const failed = assert.rejects(client.attach(pane.id, { replay: true }, () => {}), /host connection closed/);
+      await readStarted;
+      client.close();
+      await delay(50);
+      releaseRead();
+      await failed;
+      await waitFor(
+        () => internal.pendingAttachments === 0 && internal.term === null,
+        'failed attach pane to finish and refreeze',
+        4000,
+      );
+      assert.equal(internal.attachments.size, 0);
+      assert.equal(internal.pendingAttachments, 0);
+    });
+  } finally { releaseRead(); }
+});
+
+test('handoff captures live output and exit that arrive while cold archives are read', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-capture-handoff-'));
+  const sock = path.join(root, 'host.sock');
+  let markRead;
+  let releaseRead;
+  const readStarted = new Promise((resolve) => { markRead = resolve; });
+  const readGate = new Promise((resolve) => { releaseRead = resolve; });
+  let gate = false;
+  const coldIO = {
+    mkdir: (...args) => fs.promises.mkdir(...args),
+    writeFile: (...args) => fs.promises.writeFile(...args),
+    rename: (...args) => fs.promises.rename(...args),
+    unlink: (...args) => fs.promises.unlink(...args),
+    readFile: async (...args) => {
+      if (gate) {
+        markRead();
+        await readGate;
+      }
+      return fs.promises.readFile(...args);
+    },
+  };
+  const first = createHost({ sock, coldIO, log: null });
+  let active = first;
+  let client;
+  try {
+    await first.listen();
+    client = await connect({ sock });
+    const live = (await client.request('spawn', {
+      cmd: '/bin/sh', args: ['-c', 'exec sleep 30'], paneId: 'live-capture',
+    })).pane;
+    const cold = (await client.request('spawn', {
+      cmd: '/bin/sh', args: ['-c', "printf cold; exit 0"], paneId: 'cold-capture',
+    })).pane;
+    await waitFor(() => first.panes.get(cold.id).term === null, 'capture pane to freeze', 4000);
+    gate = true;
+    const handingOff = first.handoff();
+    await readStarted;
+    const liveInternal = first.panes.get(live.id);
+    liveInternal.pty._onData.fire(Buffer.from('DURING-HANDOFF'));
+    liveInternal.pty.kill('SIGKILL');
+    await waitFor(() => !liveInternal.alive, 'live pane exit during handoff');
+    await settledTerminal(liveInternal);
+    releaseRead();
+    const record = await handingOff;
+    const captured = record.panes.find((pane) => pane.id === live.id);
+    assert.equal(captured.alive, false);
+    assert.equal(captured.outputCount, 1);
+    assert.equal(typeof captured.exitedAt, 'string');
+    assert.match(captured.buffer.toString(), /DURING-HANDOFF/);
+    assert.match(captured.screen.toString(), /DURING-HANDOFF/);
+
+    active = createHost({ sock, log: null, adopt: record });
+    first.finalizeHandoff();
+    await active.listen();
+    client = await connect({ sock });
+    assert.match((await client.request('screen', { pane: live.id })).text, /DURING-HANDOFF/);
+  } finally {
+    releaseRead();
+    if (client) client.close();
+    await active.close();
+    await first.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('cold handoff stays cold for new cores and carries a legacy-compatible screen and raw buffer', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-cold-handoff-'));
   const sock = path.join(root, 'host.sock');
@@ -1162,13 +1369,19 @@ test('cold handoff stays cold for new cores and carries a legacy-compatible scre
     await waitFor(() => active.panes.get(pane.id).term === null, 'adopted pane to refreeze');
 
     const compatible = await active.handoff();
-    compatible.panes = compatible.panes.map(({ coldSnapshot: ignored, ...oldRecord }) => oldRecord);
-    const fallback = createHost({ sock, log: null, adopt: compatible });
+    const fallback = loadPreviousHostCore().createHost({ sock, log: null, adopt: compatible });
     active.finalizeHandoff();
     active = fallback;
     await active.listen();
     client = await connect({ sock });
     assert.match((await client.request('screen', { pane: pane.id })).text, /upgrade-history/);
+    let legacyReplay = Buffer.alloc(0);
+    const legacyAttachment = await client.attach(pane.id, { replay: true }, (data, info) => {
+      if (info.replay) legacyReplay = Buffer.concat([legacyReplay, data]);
+    });
+    await waitFor(() => legacyReplay.length === compatible.panes[0].buffer.length, 'legacy raw replay');
+    assert.deepEqual(legacyReplay, compatible.panes[0].buffer);
+    await legacyAttachment.detach();
     assert.ok(fs.existsSync(coldFile));
   } finally {
     if (client) client.close();

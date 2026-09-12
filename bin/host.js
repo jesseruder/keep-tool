@@ -351,6 +351,25 @@ function createHost(options = {}) {
     }
     return archive;
   };
+  const captureTerminalState = (term) => {
+    const active = term.buffer.active;
+    const internal = active._buffer;
+    return {
+      cursorX: active.cursorX,
+      cursorY: active.cursorY,
+      scrollTop: internal.scrollTop,
+      scrollBottom: internal.scrollBottom,
+    };
+  };
+  const applyTerminalState = (term, state) => {
+    if (!state || !Number.isInteger(state.cursorX) || !Number.isInteger(state.cursorY)
+        || !Number.isInteger(state.scrollTop) || !Number.isInteger(state.scrollBottom)) return;
+    const internal = term.buffer.active._buffer;
+    internal.x = Math.max(0, Math.min(term.cols, state.cursorX));
+    internal.y = Math.max(0, Math.min(term.rows - 1, state.cursorY));
+    internal.scrollTop = Math.max(0, Math.min(term.rows - 1, state.scrollTop));
+    internal.scrollBottom = Math.max(internal.scrollTop, Math.min(term.rows - 1, state.scrollBottom));
+  };
   const readColdArchive = async (pane, snapshot = pane.coldSnapshot) => {
     if (!snapshot || !validColdFile(pane.id, snapshot.file)) {
       throw new Error(`invalid cold screen reference for pane ${pane.id}`);
@@ -477,9 +496,13 @@ function createHost(options = {}) {
     pane.term = null;
     pane.serializer = null;
   };
-  const terminalWrite = (pane, data) => {
+  const terminalWrite = (pane, data, terminalState = null) => {
     pane.modelDirty = true;
-    pane.writeChain = pane.writeChain.then(() => new Promise((resolve) => pane.term.write(data, resolve)));
+    pane.modelGeneration += 1;
+    pane.writeChain = pane.writeChain.then(() => new Promise((resolve) => pane.term.write(data, () => {
+      applyTerminalState(pane.term, terminalState);
+      resolve();
+    })));
     return pane.writeChain;
   };
   const canFreeze = (pane) => !closing && !retired && !reloading && !pane.alive && pane.term
@@ -496,12 +519,14 @@ function createHost(options = {}) {
         return true;
       }
       const currentTerm = pane.term;
+      const generation = pane.modelGeneration;
       const archive = {
         version: 1,
         cols: pane.cols,
         rows: pane.rows,
         title: pane.title,
         alt: pane.term.buffer.active.type === 'alternate',
+        terminalState: captureTerminalState(pane.term),
         screen: Buffer.from(pane.serializer.serialize({
           scrollback: TERMINAL_SCROLLBACK,
           excludeAltBuffer: false,
@@ -519,8 +544,10 @@ function createHost(options = {}) {
         eventLog(`host: could not freeze pane ${pane.id}: ${error.message}`);
         return false;
       }
-      if (!canFreeze(pane) || pane.term !== currentTerm) {
+      if (!canFreeze(pane) || pane.term !== currentTerm || pane.modelGeneration !== generation) {
         try { await coldIO.unlink(file); } catch {}
+        const timer = setImmediate(() => scheduleFreeze(pane));
+        if (typeof timer.unref === 'function') timer.unref();
         return false;
       }
       const previous = pane.coldSnapshot;
@@ -556,6 +583,7 @@ function createHost(options = {}) {
       const created = newTerminal(pane.cols, pane.rows);
       try {
         await new Promise((resolve) => created.term.write(archive.screen, resolve));
+        applyTerminalState(created.term, archive.terminalState);
         if (panes.get(pane.id) !== pane || pane.coldSnapshot !== snapshot) {
           throw new Error('pane process changed');
         }
@@ -619,6 +647,7 @@ function createHost(options = {}) {
       bufferBytes: coldSnapshot ? coldSnapshot.rawBytes : 0,
       coldSnapshot,
       modelDirty: false,
+      modelGeneration: 0,
       modelUsers: 0,
       freezePromise: null,
       freezeScheduled: false,
@@ -688,7 +717,7 @@ function createHost(options = {}) {
       scheduleFreeze(pane);
     });
     if (!coldSnapshot) {
-      if (record.screen) terminalWrite(pane, record.screen).catch(() => {});
+      if (record.screen) terminalWrite(pane, record.screen, record.terminalState).catch(() => {});
       else if (pane.buffer.size) terminalWrite(pane, pane.buffer.contents()).catch(() => {});
       if (!pane.alive) scheduleFreeze(pane);
     }
@@ -857,6 +886,8 @@ function createHost(options = {}) {
         pane.term.resize(cols, rows);
         pane.cols = cols;
         pane.rows = rows;
+        pane.modelDirty = true;
+        pane.modelGeneration += 1;
         emitPane('resized', pane);
         return { result: { pane: publicPane(pane), applied: true, primary: pane.primary } };
       }
@@ -877,6 +908,9 @@ function createHost(options = {}) {
         pane.pendingAttachments += 1;
         try {
           await restorePane(pane);
+          if (connection.dropped || connection.socket.destroyed || panes.get(pane.id) !== pane) {
+            throw new Error('host connection closed');
+          }
           if (params.snapshot === true) {
             const scrollback = snapshotScrollback(params.snapshotScrollback);
             await settled(pane);
@@ -918,6 +952,7 @@ function createHost(options = {}) {
           throw error;
         } finally {
           pane.pendingAttachments -= 1;
+          scheduleFreeze(pane);
         }
         return {
           result: { pane: publicPane(pane), viewer, ...(history ? { history } : {}) },
@@ -966,6 +1001,7 @@ function createHost(options = {}) {
           if (panes.get(pane.id) !== pane) throw new Error('pane process changed');
           await removeColdFile(pane);
           pane.modelDirty = true;
+          pane.modelGeneration += 1;
           pane.buffer.clear();
           pane.bufferBytes = 0;
           pane.term.clear();
@@ -1282,10 +1318,20 @@ function createHost(options = {}) {
         if (pane.freezePromise) await pane.freezePromise;
         if (pane.restorePromise) await pane.restorePromise;
       }));
+      const coldArchives = new Map();
+      for (const pane of panes.values()) {
+        if (pane.coldSnapshot && !pane.modelDirty) {
+          coldArchives.set(pane, await readColdArchive(pane));
+        }
+      }
+      // Live PTYs may emit while cold archives are read. Settle once more, then
+      // capture every record without yielding so output and exit callbacks are
+      // either in the record or appended through handoffRecord after retirement.
+      await Promise.all([...panes.values()].map((pane) => settled(pane).catch(() => {})));
       const paneRecords = [];
       for (const pane of panes.values()) {
         const reusableCold = pane.coldSnapshot && !pane.modelDirty;
-        const archive = reusableCold ? await readColdArchive(pane) : null;
+        const archive = reusableCold ? coldArchives.get(pane) : null;
         paneRecords.push({
           id: pane.id,
           cmd: pane.cmd,
@@ -1312,6 +1358,7 @@ function createHost(options = {}) {
             scrollback: TERMINAL_SCROLLBACK,
             excludeAltBuffer: false,
           }), 'utf8'),
+          terminalState: archive ? archive.terminalState : captureTerminalState(pane.term),
           coldSnapshot: reusableCold ? pane.coldSnapshot : null,
           primary: null,
         });
