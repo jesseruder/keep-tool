@@ -73,7 +73,7 @@ function prepareProfile(agent, profile, options = {}) {
   if (source.id === profile.id) {
     source = accountStore.list(options.env || process.env).find((entry) => entry.agent === 'codex' && entry.builtIn && entry.id !== profile.id);
   }
-  if (!source) throw new Error(`no source Codex profile is available for ${profile.id}`);
+  if (!source) return { ok: true, managed: false };
   return setup.shareSetup(source, profile);
 }
 

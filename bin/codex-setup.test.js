@@ -177,6 +177,16 @@ test('launcher adopts an existing Codex profile once and refreshes it before lat
   } finally { f.cleanup(); }
 });
 
+test('launcher preserves a sole custom Codex default when no distinct sharing source exists', () => {
+  const f = fixture();
+  try {
+    const accountStore = { defaultFor: () => f.target, list: () => [f.target] };
+    assert.deepEqual(launcher.prepareProfile('codex', f.target, { accounts: accountStore }), { ok: true, managed: false });
+    assert.equal(setup.readSetup(f.target), null);
+    assert.equal(toml.parse(fs.readFileSync(path.join(f.targetDir, 'config.toml'), 'utf8')).model, 'target-model');
+  } finally { f.cleanup(); }
+});
+
 test('adding a Codex account adopts capabilities from its current default before publishing it', () => {
   const f = fixture();
   const configFile = path.join(f.root, 'keep-config.json');
