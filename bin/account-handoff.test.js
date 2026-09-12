@@ -5,6 +5,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const accounts = require('./accounts');
+const artifacts = require('./account-artifacts');
+const jobs = require('./background-jobs');
 const handoff = require('./account-handoff');
 
 function fixture() {
@@ -203,6 +205,52 @@ test('copy-before-launch failure is recoverable without a duplicate owner or dup
     const recovered = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d);
     assert.equal(recovered.status, 'done');
     assert.equal(d.continuations(), 1);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('recovery catches up final Claude exit rows without a daemon poll before retry', async () => {
+  const f = fixture();
+  try {
+    const source = path.join(f.profiles.one, 'projects', f.projectName, `${f.sid}.jsonl`);
+    const initial = { type: 'assistant', sessionId: f.sid, timestamp: new Date(1000).toISOString(),
+      message: { content: [], stop_reason: 'end_turn' } };
+    fs.writeFileSync(source, JSON.stringify(initial) + '\n');
+    jobs.sync({ root: f.root, agent: 'claude', sid: f.sid, file: source, now: 1100,
+      instance: { id: 'pane-1:10:11', processScoped: true, live: true } });
+    const d = deps(f);
+    d.restartSession = async (_body, options) => {
+      d.pane.alive = false;
+      const exitRows = [
+        { type: 'file-history-snapshot', sessionId: f.sid, timestamp: new Date(1200).toISOString(), snapshot: {} },
+        { type: 'last-prompt', sessionId: f.sid, timestamp: new Date(1210).toISOString(), prompt: '/exit' },
+        { type: 'cost-state', sessionId: f.sid, timestamp: new Date(1220).toISOString(), costUSD: 0 },
+        { type: 'user', isMeta: true, sessionId: f.sid, timestamp: new Date(1230).toISOString(),
+          message: { content: '<command-name>/exit</command-name>\n<command-message>exit</command-message>\n<command-args></command-args>' } },
+        { type: 'user', isMeta: true, sessionId: f.sid, timestamp: new Date(1240).toISOString(),
+          message: { content: '<local-command-stdout>Goodbye!</local-command-stdout>' } },
+      ];
+      fs.appendFileSync(source, exitRows.map(JSON.stringify).join('\n') + '\n');
+      jobs.recordHook(f.root, 'claude', f.sid, { event: 'Stop', entity: 'turn', at: 1250,
+        offset: fs.statSync(source).size });
+      return options.host.request('replace-exited', { meta: { sessionId: f.sid, accountId: options.resumeAccount.id } });
+    };
+    d.rebindLedger = () => { throw new Error('simulated daemon exit before ledger rebind'); };
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /simulated daemon exit/);
+    const stale = JSON.parse(fs.readFileSync(path.join(f.root, '.keep/background-jobs/claude', f.sid, 'state.json')));
+    assert.ok(stale.checkpoint.offset < fs.statSync(source).size, 'the exited source is not daemon-polled before recovery');
+    assert.equal(stale.source.file, path.resolve(source));
+
+    delete d.rebindLedger;
+    const result = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d);
+    assert.equal(result.status, 'done');
+    assert.equal(d.continuations(), 1);
+    const target = path.join(f.profiles.two, 'projects', f.projectName, `${f.sid}.jsonl`);
+    const rebound = JSON.parse(fs.readFileSync(path.join(f.root, '.keep/background-jobs/claude', f.sid, 'state.json')));
+    assert.equal(rebound.source.file, path.resolve(target));
+    assert.equal(rebound.checkpoint.offset, fs.statSync(target).size);
+    assert.equal(rebound.restart.completed, true);
+    assert.equal(rebound.gap, false); assert.equal(rebound.recovering, false);
+    assert.equal(accounts.forSession(f.sid, 'claude', { root: f.root, env: f.env }).id, 'two');
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 

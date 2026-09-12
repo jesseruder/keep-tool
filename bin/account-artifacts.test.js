@@ -188,27 +188,81 @@ test('ledger rebind requires the exact completed artifact transaction and quiesc
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
-test('a final source flush catches up after copy before a retry rebinds the ledger', () => {
+test('rebind catches up a stopped source after Claude appends its exit bookkeeping', () => {
   const f = fixture();
   try {
     const initial = { type: 'assistant', sessionId: f.sid, timestamp: new Date(1000).toISOString(),
       message: { content: [], stop_reason: 'end_turn' } };
     fs.writeFileSync(transcript(f, 'a'), JSON.stringify(initial) + '\n');
     jobs.sync({ root: f.root, agent: 'claude', sid: f.sid, file: transcript(f, 'a'), now: 1100 });
-    const final = { type: 'assistant', sessionId: f.sid, timestamp: new Date(1200).toISOString(),
-      message: { content: [{ type: 'text', text: 'final flush' }], stop_reason: 'end_turn' } };
-    fs.appendFileSync(transcript(f, 'a'), JSON.stringify(final) + '\n');
+    const exitRows = [
+      { type: 'file-history-snapshot', sessionId: f.sid, timestamp: new Date(1200).toISOString(), snapshot: {} },
+      { type: 'last-prompt', sessionId: f.sid, timestamp: new Date(1210).toISOString(), prompt: '/exit' },
+      { type: 'cost-state', sessionId: f.sid, timestamp: new Date(1220).toISOString(), costUSD: 0 },
+      { type: 'user', isMeta: true, sessionId: f.sid, timestamp: new Date(1230).toISOString(),
+        message: { content: '<command-name>/exit</command-name>\n<command-message>exit</command-message>\n<command-args></command-args>' } },
+      { type: 'user', isMeta: true, sessionId: f.sid, timestamp: new Date(1240).toISOString(),
+        message: { content: '<local-command-stdout>Goodbye!</local-command-stdout>' } },
+    ];
+    fs.appendFileSync(transcript(f, 'a'), exitRows.map(JSON.stringify).join('\n') + '\n');
     jobs.recordHook(f.root, 'claude', f.sid, { event: 'Stop', entity: 'turn', at: 1250,
       offset: fs.statSync(transcript(f, 'a')).size });
     artifacts.copyClaudeArtifacts(f.sid, f.records.a, f.records.b, 'tx-final-flush', options(f));
 
-    assert.throws(() => artifacts.rebindLedger(f.sid, f.records.a, f.records.b, 'tx-final-flush', rebindOptions(f)),
-      /unconsumed hook|not caught up/);
-    const caughtUp = jobs.sync({ root: f.root, agent: 'claude', sid: f.sid, file: transcript(f, 'a'), now: 1300 });
-    assert.equal(caughtUp.recovering, false); assert.equal(caughtUp.gap, false);
     assert.equal(artifacts.rebindLedger(f.sid, f.records.a, f.records.b, 'tx-final-flush', rebindOptions(f)).rebound[0].reused, false);
-    assert.equal(JSON.parse(fs.readFileSync(path.join(f.root, '.keep/background-jobs/claude', f.sid, 'state.json'))).source.file,
-      path.resolve(transcript(f, 'b')));
+    const state = JSON.parse(fs.readFileSync(path.join(f.root, '.keep/background-jobs/claude', f.sid, 'state.json')));
+    assert.equal(state.source.file, path.resolve(transcript(f, 'b')));
+    assert.equal(state.restart.completed, true, 'exit bookkeeping does not invent a new user turn');
+    assert.equal(state.gap, false); assert.equal(state.recovering, false);
+    assert.equal(state.checkpoint.offset, fs.statSync(transcript(f, 'b')).size);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('stopped-source catch-up refuses new unresolved work without moving ledger authority', () => {
+  const f = fixture();
+  try {
+    const initial = { type: 'assistant', sessionId: f.sid, timestamp: new Date(1000).toISOString(),
+      message: { content: [], stop_reason: 'end_turn' } };
+    fs.writeFileSync(transcript(f, 'a'), JSON.stringify(initial) + '\n');
+    jobs.sync({ root: f.root, agent: 'claude', sid: f.sid, file: transcript(f, 'a'), now: 1100 });
+    const tool = { type: 'assistant', sessionId: f.sid, timestamp: new Date(1200).toISOString(),
+      message: { stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'late-call', name: 'Bash', input: { command: 'sleep 1' } }] } };
+    fs.appendFileSync(transcript(f, 'a'), JSON.stringify(tool) + '\n');
+    artifacts.copyClaudeArtifacts(f.sid, f.records.a, f.records.b, 'tx-late-work', options(f));
+    assert.throws(() => artifacts.rebindLedger(f.sid, f.records.a, f.records.b, 'tx-late-work', rebindOptions(f)),
+      /stopped source job ledger is unsafe/);
+    const state = JSON.parse(fs.readFileSync(path.join(f.root, '.keep/background-jobs/claude', f.sid, 'state.json')));
+    assert.equal(state.source.file, path.resolve(transcript(f, 'a')));
+    assert.equal(state.calls['call:late-call'].name, 'Bash');
+    assert.equal(state.handoffRebind, undefined);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('bounded stopped-source recovery remains retryable after exhausting one request', () => {
+  const f = fixture();
+  try {
+    const row = { type: 'assistant', sessionId: f.sid, timestamp: new Date(1000).toISOString(),
+      message: { content: [], stop_reason: 'end_turn' } };
+    fs.writeFileSync(transcript(f, 'a'), JSON.stringify(row) + '\n');
+    jobs.sync({ root: f.root, agent: 'claude', sid: f.sid, file: transcript(f, 'a'), now: 1100 });
+    artifacts.copyClaudeArtifacts(f.sid, f.records.a, f.records.b, 'tx-bounded-catchup', options(f));
+    const real = require('./restart-ledger');
+    let attempts = 0;
+    const delayed = { Recovering: real.Recovering, verify(args) {
+      attempts++;
+      if (attempts <= 8) throw new real.Recovering('synthetic bounded recovery');
+      return real.verify(args);
+    } };
+    assert.throws(() => artifacts.rebindLedger(f.sid, f.records.a, f.records.b, 'tx-bounded-catchup',
+      rebindOptions(f, { restartLedger: delayed })), /did not catch up/);
+    let state = JSON.parse(fs.readFileSync(path.join(f.root, '.keep/background-jobs/claude', f.sid, 'state.json')));
+    assert.equal(state.source.file, path.resolve(transcript(f, 'a')));
+    assert.equal(state.handoffRebind, undefined);
+    assert.equal(artifacts.rebindLedger(f.sid, f.records.a, f.records.b, 'tx-bounded-catchup',
+      rebindOptions(f, { restartLedger: delayed })).rebound[0].reused, false);
+    state = JSON.parse(fs.readFileSync(path.join(f.root, '.keep/background-jobs/claude', f.sid, 'state.json')));
+    assert.equal(state.source.file, path.resolve(transcript(f, 'b')));
+    assert.equal(attempts, 9);
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 

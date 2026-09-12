@@ -397,6 +397,53 @@ function completedPlan(sessionId, source, target, transactionId, options) {
   return plan;
 }
 
+// Claude can append bookkeeping and local-command rows after its process has
+// accepted /exit. The normal restart proof runs before that exit, while a dead
+// session is no longer part of the daemon's polling set. Advance the persisted
+// source ledger here, under its ordinary writer lock, and rerun the complete
+// restart proof before any source identity is rebound to the copied profile.
+function catchUpStoppedLedger(plan, sessionId, transactionId, options) {
+  const transcript = plan.artifacts.find((entry) => entry.kind === 'transcript');
+  const sessionTree = plan.artifacts.find((entry) => entry.kind === 'session');
+  if (!transcript) throw failure('Claude transcript artifact is unavailable', 'KEEP_ARTIFACT_LEDGER');
+  const snapshot = path.join(plan.root, '.keep', 'background-jobs', 'claude', sessionId, 'state.json');
+  const before = readJson(snapshot);
+  const alreadyRebound = before?.handoffRebind?.transactionId === transactionId
+    && before.handoffRebind.source?.file === path.resolve(transcript.source)
+    && before.handoffRebind.target?.file === path.resolve(transcript.target)
+    && before.source?.file === path.resolve(transcript.target);
+  if (alreadyRebound) return () => {};
+  if (!before || before.version !== 1 || before.gap || before.source?.agent !== 'claude'
+      || before.source.sid !== sessionId || path.resolve(before.source.file || '') !== path.resolve(transcript.source)) {
+    throw failure('job ledger source evidence is unavailable for stopped-session recovery', 'KEEP_ARTIFACT_LEDGER');
+  }
+  const priorInstance = before.source.instance;
+  const instance = priorInstance && typeof priorInstance === 'object'
+    ? { ...priorInstance, live: false } : priorInstance || null;
+  const resolveChild = (id, parentFile) => {
+    const child = path.join(path.dirname(parentFile), path.basename(parentFile, '.jsonl'), 'subagents', `agent-${id}.jsonl`);
+    if (!sessionTree || !within(sessionTree.source, child)) {
+      throw failure('Claude child artifact escapes its stopped session tree', 'KEEP_ARTIFACT_ESCAPE');
+    }
+    return child;
+  };
+  const ledger = options.restartLedger || require('./restart-ledger');
+  let recovering;
+  for (let pass = 0; pass < 8; pass++) {
+    try {
+      const unchanged = ledger.verify({ root: plan.root, agent: 'claude', sid: sessionId,
+        file: transcript.source, instance, resolveChild, allowTerminalRateLimit: true });
+      unchanged();
+      return unchanged;
+    } catch (error) {
+      if (error instanceof ledger.Recovering) { recovering = error; continue; }
+      throw failure(`stopped source job ledger is unsafe: ${error.message}`, 'KEEP_ARTIFACT_LEDGER');
+    }
+  }
+  throw failure(`stopped source job ledger did not catch up: ${recovering?.message || 'bounded recovery was exhausted'}`,
+    'KEEP_ARTIFACT_LEDGER');
+}
+
 // Rebind every ledger in the persisted Claude child graph while the copied
 // target is still quiescent. Staging/launch happens only after this finishes.
 function rebindLedger(sessionId, source, target, transactionId, options = {}) {
@@ -404,6 +451,9 @@ function rebindLedger(sessionId, source, target, transactionId, options = {}) {
     throw failure('verified source stop evidence is required before ledger rebind', 'KEEP_ARTIFACT_LEDGER');
   }
   const plan = completedPlan(sessionId, source, target, transactionId, options);
+  const unchanged = catchUpStoppedLedger(plan, sessionId, transactionId, options);
+  unchanged();
+  completedPlan(sessionId, source, target, transactionId, options);
   const transcript = plan.artifacts.find((entry) => entry.kind === 'transcript');
   const sessionTree = plan.artifacts.find((entry) => entry.kind === 'session');
   const rebind = options.rebindSource || require('./background-jobs').rebindSource;
