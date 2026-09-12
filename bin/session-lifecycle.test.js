@@ -59,6 +59,43 @@ test('lifecycle records survive restart, deduplicate, and omit content', () => {
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('only a structurally bound missing startup transcript records fresh-session evidence', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-lifecycle-startup-'));
+  const transcript = path.join(root, 'session.jsonl');
+  try {
+    assert.equal(record(root, { session_id: 'session', hook_event_name: 'SessionStart', source: 'startup', transcript_path: transcript }, 1000), true);
+    const startup = read(root, 'session', 1100).find((event) => event.event === 'SessionStart');
+    assert.equal(startup.offset, null);
+    assert.equal(startup.missing, true);
+    assert.equal(startup.freshStart, true);
+    assert.match(startup.transcriptId, /^[a-f0-9]{64}$/);
+    assert.doesNotMatch(JSON.stringify(startup), new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+
+    assert.equal(record(root, { session_id: 'session', hook_event_name: 'SessionStart', source: 'resume', transcript_path: transcript }, 1200), true);
+    assert.equal(read(root, 'session', 1300).find((event) => event.at === 1200).freshStart, undefined);
+
+    const originalStat = fs.statSync;
+    fs.statSync = function(target, ...args) {
+      if (path.resolve(String(target)) === path.resolve(transcript)) {
+        const error = new Error('denied'); error.code = 'EACCES'; throw error;
+      }
+      return originalStat.call(this, target, ...args);
+    };
+    try {
+      assert.equal(record(root, { session_id: 'session', hook_event_name: 'SessionStart', source: 'startup', transcript_path: transcript }, 1400), true);
+    } finally { fs.statSync = originalStat; }
+    const denied = read(root, 'session', 1500).find((event) => event.at === 1400);
+    assert.equal(denied.missing, undefined);
+    assert.equal(denied.freshStart, undefined);
+
+    const wrong = path.join(root, 'other.jsonl');
+    assert.equal(record(root, { session_id: 'session', hook_event_name: 'SessionStart', source: 'startup', transcript_path: wrong }, 1600), true);
+    const unbound = read(root, 'session', 1700).find((event) => event.at === 1600);
+    assert.equal(unbound.transcriptId, undefined);
+    assert.equal(unbound.freshStart, undefined);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('lifecycle reads cache immutable records while reconciling files, age, roots, and caller mutation', () => {
   const roots = [fs.mkdtempSync(path.join(os.tmpdir(), 'keep-lifecycle-cache-a-')),
     fs.mkdtempSync(path.join(os.tmpdir(), 'keep-lifecycle-cache-b-'))];

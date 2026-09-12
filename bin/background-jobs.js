@@ -23,7 +23,10 @@ function recordHook(root, agent, sid, event) {
   if (!/^(?:SubagentStart|SubagentStop|SessionStart|UserPromptSubmit|PreToolUse|PostToolUse|PostToolUseFailure|Stop|Interrupt|PermissionRequest)$/.test(event.event) || !ID.test(event.entity || '')) return;
   const dir = path.join(directory(root, agent, sid), 'inbox');
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const row = { event: event.event, entity: event.entity, at: event.at, offset: event.offset };
+  const transcriptId = /^[a-f0-9]{64}$/.test(event.transcriptId || '') ? event.transcriptId : null;
+  const row = { event: event.event, entity: event.entity, at: event.at, offset: event.offset,
+    ...(transcriptId ? { transcriptId } : {}), ...(event.missing === true ? { missing: true } : {}),
+    ...(event.event === 'SessionStart' && event.freshStart === true ? { freshStart: true } : {}) };
   const body = JSON.stringify(row);
   try { fs.writeFileSync(path.join(dir, hash(body) + '.json'), body, { flag: 'wx', mode: 0o600 }); }
   catch (e) { if (e.code !== 'EEXIST') throw e; }
@@ -265,7 +268,8 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
       state.checkpoint = null; state.calls = {}; state.notices = {}; state.turnStartedAt = null;
       state.cronVersion = 1; state.turnVersion = 1;
     }
-    let recovering = false, bytesRead = 0;
+    const freshBaseEligible = !state.checkpoint && !state.gap && state.hookBarrier == null;
+    let recovering = false, bytesRead = 0, transcriptRead = false;
     try {
       const fd = fs.openSync(file, 'r');
       try {
@@ -309,24 +313,48 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
         if (start === 0 && bytesRead >= (cp.skip ? budget : Math.max(budget, maxRecord))) { start = bytesRead; cp.skip = true; state.gap = true; }
         cp.offset += start; cp.anchor = anchor(cp.offset); cp.mtime = stat.mtimeMs; state.checkpoint = cp;
         recovering = cp.offset < stat.size;
+        transcriptRead = true;
       } finally { fs.closeSync(fd); }
     } catch { recovering = true; }
     const inbox = path.join(dir, 'inbox');
     let consumed = [];
     try {
       consumed = fs.readdirSync(inbox).filter(n => /^[a-f0-9]{64}\.json$/.test(n)).slice(0, 1000);
-      const events = consumed.map(n => JSON.parse(fs.readFileSync(path.join(inbox, n), 'utf8'))).sort((a, b) => a.at - b.at);
+      const eventOrder = { SessionStart: 0, UserPromptSubmit: 1 };
+      const events = consumed.map(n => JSON.parse(fs.readFileSync(path.join(inbox, n), 'utf8')))
+        .sort((a, b) => a.at - b.at || (eventOrder[a.event] ?? 2) - (eventOrder[b.event] ?? 2));
       if (events.length) state.hookGeneration = (state.hookGeneration || 0) + events.length;
+      const expectedTranscriptId = hash(path.resolve(file));
       for (const e of events) {
         if (e.event === 'SubagentStart') update(state, e.entity, 'agent', 'pending', e.at, 'hook', instance?.processScoped ? null : instance, `hook:${e.at}`);
         if (['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'Interrupt', 'PermissionRequest'].includes(e.event)) {
           // A hook bridges the period before the transcript is flushed. Stop
           // alone never clears this barrier: it may be blocked by another hook.
           if (Number.isFinite(e.offset)) state.hookBarrier = Math.max(state.hookBarrier ?? -1, e.offset);
-          else state.gap = true;
+          else {
+            const repeatedFreshStart = state.freshStartup?.transcriptId === expectedTranscriptId
+              && state.freshStartup.at === e.at;
+            const freshStart = e.event === 'SessionStart' && e.freshStart === true && e.missing === true
+              && e.transcriptId === expectedTranscriptId && (freshBaseEligible || repeatedFreshStart);
+            if (freshStart) {
+              if (!repeatedFreshStart) state.freshStartup = { transcriptId: expectedTranscriptId, at: e.at, promptAt: null };
+              state.hookBarrier = Math.max(state.hookBarrier ?? -1, 0);
+            } else {
+              const freshPrompt = e.event === 'UserPromptSubmit' && e.missing === true && e.transcriptId === expectedTranscriptId
+                && state.freshStartup?.transcriptId === expectedTranscriptId
+                && (state.freshStartup.promptAt === e.at
+                  || (state.freshStartup.promptAt == null && e.at >= state.freshStartup.at));
+              if (freshPrompt) { state.freshStartup.promptAt ??= e.at; state.hookBarrier = Math.max(state.hookBarrier ?? -1, 0); }
+              else state.gap = true;
+            }
+          }
+          if (e.event === 'SessionStart' && !(e.freshStart === true && e.missing === true && e.transcriptId === expectedTranscriptId)) {
+            delete state.freshStartup;
+          }
         }
         // Stop hooks can be blocked. They are not completion evidence.
       }
+      if (transcriptRead && state.freshStartup?.transcriptId === expectedTranscriptId) delete state.freshStartup;
     } catch (error) { if (error.code !== 'ENOENT') state.gap = true; consumed = []; }
     for (const j of Object.values(state.jobs)) {
       if (j.kind === 'scheduled' && !TERMINAL.has(j.status)) {

@@ -28,9 +28,15 @@ function record(root, input, now = Date.now()) {
     : event === 'PermissionRequest' ? input.prompt_id || 'permission'
     : /ToolUse/.test(event) ? input.tool_use_id : input.prompt_id || 'turn';
   if (!ID.test(entity || '')) return false;
-  let offset = null;
-  try { offset = fs.statSync(input.transcript_path).size; } catch {}
+  const transcriptPath = typeof input.transcript_path === 'string' && path.isAbsolute(input.transcript_path)
+    && path.basename(input.transcript_path) === `${input.session_id}.jsonl` ? path.resolve(input.transcript_path) : null;
+  const transcriptId = transcriptPath ? crypto.createHash('sha256').update(transcriptPath).digest('hex') : null;
+  let offset = null, missing = false;
+  try { offset = fs.statSync(input.transcript_path).size; }
+  catch (error) { missing = error.code === 'ENOENT'; }
+  const freshStart = event === 'SessionStart' && input.source === 'startup' && missing && transcriptId != null;
   const value = { event, entity, at: now, offset, tool: String(input.tool_name || '').slice(0, 100),
+    ...(transcriptId ? { transcriptId } : {}), ...(missing ? { missing: true } : {}), ...(freshStart ? { freshStart: true } : {}),
     ...(event === 'Stop' ? { intent: require('./conversation-intent').stopHint(input.last_assistant_message) } : {}),
     wait: event === 'PreToolUse' ? require('./session-status').toolWaitReason(input.tool_name || '', input.tool_input) : null };
   const dir = directory(root, input.session_id);

@@ -166,6 +166,85 @@ test('partial lines retry without advancing and truncated transcripts retain unr
   assert.ok(replaced.gap);
 }));
 
+test('verified fresh startup bridges the first hooks until a complete transcript exists', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-jobs-fresh-start-'));
+  const file = path.join(root, 'parent.jsonl');
+  const lifecycle = require('./session-lifecycle');
+  try {
+    const base = { session_id: 'parent', agentKind: 'claude', transcript_path: file };
+    lifecycle.record(root, { ...base, hook_event_name: 'SessionStart', source: 'startup' }, 1000);
+    lifecycle.record(root, { ...base, hook_event_name: 'UserPromptSubmit' }, 1000);
+
+    const waiting = jobs.sync({ root, agent: 'claude', sid: 'parent', file, now: 1100 });
+    assert.equal(waiting.recovering, true);
+    assert.equal(waiting.gap, false);
+    assert.ok(waiting.uncertain.includes('history-recovery'));
+
+    const transcriptId = require('node:crypto').createHash('sha256').update(path.resolve(file)).digest('hex');
+    jobs.recordHook(root, 'claude', 'parent', { event: 'SessionStart', entity: 'turn', at: 1000, offset: null,
+      transcriptId, missing: true, freshStart: true });
+    jobs.recordHook(root, 'claude', 'parent', { event: 'UserPromptSubmit', entity: 'turn', at: 1000, offset: null,
+      transcriptId, missing: true });
+    const replayed = jobs.sync({ root, agent: 'claude', sid: 'parent', file, now: 1150 });
+    assert.equal(replayed.gap, false, 'durable hook replay after snapshot commit is idempotent');
+
+    const rows = [
+      { type: 'user', sessionId: 'parent', timestamp: new Date(1200).toISOString(), message: { content: 'hello' } },
+      { type: 'assistant', sessionId: 'parent', timestamp: new Date(1300).toISOString(), message: { content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' } },
+    ];
+    fs.writeFileSync(file, rows.map(JSON.stringify).join('\n') + '\n');
+    const complete = jobs.sync({ root, agent: 'claude', sid: 'parent', file, now: 1400 });
+    assert.equal(complete.recovering, false);
+    assert.equal(complete.gap, false);
+    assert.deepEqual(complete.uncertain, []);
+
+    const snapshot = JSON.parse(fs.readFileSync(path.join(root, '.keep/background-jobs/claude/parent/state.json')));
+    assert.equal(snapshot.hookBarrier, 0);
+    assert.equal(snapshot.checkpoint.offset, fs.statSync(file).size);
+    assert.equal(snapshot.freshStartup, undefined);
+    require('./restart-ledger').verify({ root, agent: 'claude', sid: 'parent', file,
+      instance: { id: 'pane:1:2', since: 1, live: true } })();
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('missing resume, ungrounded prompt, prior gaps, and transcript read errors stay fail closed', () => {
+  const lifecycle = require('./session-lifecycle');
+  const scenarios = [
+    { name: 'resume', events: [{ hook_event_name: 'SessionStart', source: 'resume' }] },
+    { name: 'prompt', events: [{ hook_event_name: 'UserPromptSubmit' }] },
+  ];
+  for (const scenario of scenarios) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `keep-jobs-${scenario.name}-`));
+    const file = path.join(root, 'parent.jsonl');
+    try {
+      for (const event of scenario.events) lifecycle.record(root,
+        { session_id: 'parent', agentKind: 'claude', transcript_path: file, ...event }, 1000);
+      const missing = jobs.sync({ root, agent: 'claude', sid: 'parent', file, now: 1100 });
+      assert.equal(missing.recovering, true);
+      assert.equal(missing.gap, true);
+
+      fs.writeFileSync(file, JSON.stringify({ type: 'assistant', sessionId: 'parent', timestamp: new Date(1200).toISOString(),
+        message: { content: [], stop_reason: 'end_turn' } }) + '\n');
+      lifecycle.record(root, { session_id: 'parent', agentKind: 'claude', transcript_path: file,
+        hook_event_name: 'SessionStart', source: 'startup' }, 1200);
+      const later = jobs.sync({ root, agent: 'claude', sid: 'parent', file, now: 1300 });
+      assert.equal(later.recovering, false);
+      assert.equal(later.gap, true, `${scenario.name} evidence cannot be migrated into a clean startup`);
+      assert.throws(() => require('./restart-ledger').verify({ root, agent: 'claude', sid: 'parent', file,
+        instance: { id: 'pane:1:2', since: 1, live: true } }), /incomplete/);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  }
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-jobs-read-error-'));
+  const file = path.join(root, 'parent.jsonl');
+  try {
+    fs.mkdirSync(file);
+    const result = jobs.sync({ root, agent: 'claude', sid: 'parent', file, now: 1000 });
+    assert.equal(result.recovering, true);
+    assert.ok(result.uncertain.includes('history-recovery'));
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('bounded bootstrap and oversized records never claim complete recovery', () => fixture(({ file, append, sync }) => {
   launch(append);
   append({ type: 'assistant', message: { content: 'x'.repeat(5000) } });
