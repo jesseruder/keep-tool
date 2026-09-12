@@ -134,6 +134,10 @@ alleging missing authorization, tests, or unsafe action, inspect the relevant ea
 human instruction and owning/parent session or cited test result. If you cannot,
 state the uncertainty and the next verification step. Unverified findings cannot
 trigger live nudges or speaker announcements. Absence from the delta is not proof.
+The `## contributor context` section comes from a full session id stamped on a new
+card entry. Its bounded time window supplies nearby evidence for that contribution;
+it does not make the contributor a card owner or prove that every activity in the
+window belongs to the card. Honor any coverage warning before relying on absence.
 
 A bundle may identify complete identical scheduled probes. Only after inspecting the
 exact tool inputs and verifying that they are read-only and results are clean, add

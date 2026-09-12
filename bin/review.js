@@ -38,6 +38,7 @@ const CONTINUES_FILE = path.join(META, 'continues.jsonl');
 const CODEX_PARENTS_DIR = path.join(META, 'codex-parents');
 
 const MAX_DELTA_BYTES = parseInt(process.env.KEEP_REVIEW_MAX_DELTA || String(8 * 1024 * 1024), 10);
+const MAX_CONTRIBUTOR_SCAN_BYTES = parseInt(process.env.KEEP_REVIEW_MAX_CONTRIBUTOR_SCAN || String(256 * 1024 * 1024), 10);
 const DEFAULT_BUDGET_TOKENS = parseInt(process.env.KEEP_REVIEW_BUDGET || '10000', 10);
 const MAX_BUDGET_TOKENS = 20000;
 const DEFAULT_TOTAL_BUDGET_TOKENS = parseInt(process.env.KEEP_REVIEW_TOTAL_BUDGET || '40000', 10);
@@ -196,6 +197,108 @@ function readDeltaLines(file, offset = 0, maxBytes = MAX_DELTA_BYTES) {
     skipped: capSkipped + (probe ? from - 1 : from),
     size,
     read: endOfComplete - from,
+  };
+}
+
+// Contributor sessions are discovered from card entries after the work happened,
+// so they have no durable transcript offset. Scan a bounded amount of the transcript
+// for timestamped rows in the requested windows and retain only a capped tail of
+// matching rows. This can locate an old contribution even after a long unrelated
+// conversation, without feeding that unrelated conversation to the reviewer.
+function readTimestampWindowLines(file, windows, options = {}) {
+  const ranges = (windows || [])
+    .filter((window) => Number.isFinite(window.startMs) && Number.isFinite(window.endMs) && window.endMs >= window.startMs)
+    .sort((a, b) => a.startMs - b.startMs);
+  const size = fs.statSync(file).size;
+  const maxScanBytes = Math.max(1, Number(options.maxScanBytes) || MAX_CONTRIBUTOR_SCAN_BYTES);
+  const maxBytes = Math.max(1, Number(options.maxBytes) || MAX_DELTA_BYTES);
+  const scanSize = Math.min(size, maxScanBytes);
+  const fd = fs.openSync(file, 'r');
+  const lines = [];
+  let firstLine = 0;
+  let keptBytes = 0;
+  let matchedBytes = 0;
+  let skipped = 0;
+  let oversized = 0;
+  let oversizedBytes = 0;
+  let untimestamped = 0;
+  let carry = Buffer.alloc(0);
+  let discardingLine = false;
+  let discardedLineBytes = 0;
+  let scanned = 0;
+  const noteLine = (buf) => {
+    let row;
+    try { row = JSON.parse(buf.toString('utf8')); } catch { return; }
+    const at = Date.parse(row && row.timestamp || '');
+    if (!Number.isFinite(at)) { untimestamped += 1; return; }
+    if (!ranges.some((range) => at >= range.startMs && at <= range.endMs)) return;
+    const text = buf.toString('utf8');
+    const bytes = buf.length + 1;
+    matchedBytes += bytes;
+    lines.push({ text, bytes });
+    keptBytes += bytes;
+    while (keptBytes > maxBytes && lines.length - firstLine > 1) {
+      const dropped = lines[firstLine++];
+      keptBytes -= dropped.bytes;
+      skipped += dropped.bytes;
+    }
+  };
+  try {
+    while (scanned < scanSize) {
+      const length = Math.min(256 * 1024, scanSize - scanned);
+      const chunk = Buffer.alloc(length);
+      const got = fs.readSync(fd, chunk, 0, length, scanned);
+      if (!got) break;
+      scanned += got;
+      let from = 0;
+      let nl;
+      while (from < got) {
+        nl = chunk.indexOf(0x0a, from);
+        const end = nl === -1 ? got : nl;
+        const part = chunk.subarray(from, end);
+        if (discardingLine) {
+          discardedLineBytes += part.length;
+          if (nl !== -1) {
+            oversized += 1;
+            oversizedBytes += discardedLineBytes + 1;
+            discardedLineBytes = 0;
+            discardingLine = false;
+          }
+        } else if (carry.length + part.length > maxBytes) {
+          discardedLineBytes = carry.length + part.length;
+          carry = Buffer.alloc(0);
+          if (nl !== -1) {
+            oversized += 1;
+            oversizedBytes += discardedLineBytes + 1;
+            discardedLineBytes = 0;
+          } else {
+            discardingLine = true;
+          }
+        } else {
+          carry = carry.length ? Buffer.concat([carry, part]) : Buffer.from(part);
+          if (nl !== -1) {
+            noteLine(carry);
+            carry = Buffer.alloc(0);
+          }
+        }
+        if (nl === -1) break;
+        from = nl + 1;
+      }
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return {
+    lines: lines.slice(firstLine).map((line) => line.text),
+    read: keptBytes,
+    matchedBytes,
+    skipped,
+    scanned,
+    scanSkipped: Math.max(0, size - scanned),
+    size,
+    untimestamped,
+    oversized,
+    oversizedBytes,
   };
 }
 
@@ -442,6 +545,35 @@ function sessionsForTask(task, excluded) {
 }
 
 const SESSION_ID_RE = /^[A-Za-z0-9_-]+$/;
+
+// Ordinary Keep mutations name their author as `(by <agent> <full-id>)` before
+// the optional status arrow. Only entries selected for this bundle's log batch
+// contribute windows; acknowledging the batch then closes the evidence frontier.
+function contributorSessionsForEntries(entries, ownerSessions, excluded) {
+  const owners = new Set((ownerSessions || []).map((session) => session && session.id).filter(Boolean));
+  const skip = excluded instanceof Set ? excluded : new Set(excluded || []);
+  const byId = new Map();
+  for (const entry of entries || []) {
+    const match = String(entry && entry.kind || '').match(/\(by (claude|codex) ([A-Za-z0-9_-]+)\)(?=\s*(?:→|$))/);
+    if (!match || !SESSION_ID_RE.test(match[2]) || owners.has(match[2]) || skip.has(match[2])) continue;
+    const minute = Date.parse(String(entry.stamp || '').replace(' ', 'T'));
+    if (!Number.isFinite(minute)) continue;
+    const session = byId.get(match[2]) || { id: match[2], agent: match[1], windows: [] };
+    // A conflicting agent label is malformed attribution. Keep the first trusted
+    // shape and do not make a second locator guess for the same full id.
+    if (session.agent !== match[1]) continue;
+    if (!session.windows.some((window) => window.stamp === entry.stamp && window.kind === entry.kind)) {
+      session.windows.push({
+        stamp: entry.stamp,
+        kind: entry.kind,
+        startMs: minute - 30 * 60e3,
+        endMs: minute + 60e3 - 1,
+      });
+    }
+    byId.set(session.id, session);
+  }
+  return [...byId.values()];
+}
 
 function locateSession(session) {
   // Frontmatter is only as trustworthy as whatever wrote it; codex.findRolloutFile
@@ -1241,9 +1373,19 @@ function buildBundle(taskId, opts = {}) {
   const firstReview = !state.lastReviewedAt;
   const autoContinued = autoContinuesSince(task, state.lastReviewedAt);
 
+  const unseenLogEntries = logEntriesSinceReview(task.body, state.logSeen);
+  // Card bodies are newest-first, so the tail is the oldest unseen batch. A log
+  // watermark is a chronological frontier: contributor windows must be chosen from
+  // this exact batch or an ack could strand evidence from an older entry.
+  const logEntriesForReview = unseenLogEntries.slice(-8);
+  const newLogEntries = unseenLogEntries.length;
+
   const sessions = sessionsForTask(task, excluded)
     .filter((s) => !opts.session || s.id === opts.session);
+  const contributors = contributorSessionsForEntries(logEntriesForReview, sessions, excluded)
+    .filter((s) => !opts.session || s.id === opts.session);
   const perSession = [];
+  const perContributor = [];
   let newBytes = 0;
   for (const session of sessions) {
     const file = locateSession(session);
@@ -1294,6 +1436,23 @@ function buildBundle(taskId, opts = {}) {
     perSession.push(entry);
   }
 
+  if (Number.isFinite(opts.from) && contributors.length) {
+    throw new keep.KeepError('--from addresses linked-session offsets; contributor context is selected by its stamped card entry');
+  }
+  for (const session of contributors) {
+    let file;
+    try { file = locateSession(session); }
+    catch (e) { perContributor.push({ session, error: e.message }); continue; }
+    if (!file) { perContributor.push({ session, missing: true }); continue; }
+    let window;
+    try { window = readTimestampWindowLines(file, session.windows); }
+    catch (e) { perContributor.push({ session, error: e.message }); continue; }
+    const act = session.agent === 'codex' ? summarizeCodexDelta(window.lines) : summarizeClaudeDelta(window.lines);
+    act.bytes = window.read;
+    act.skipped = window.skipped;
+    perContributor.push({ session, file, window, act, lines: window.lines });
+  }
+
   // Cited shas come from the same parser the landed sweep uses, so "on origin" here
   // means exactly what a later `landed (daemon)` entry would mean.
   let citedShas = [];
@@ -1312,11 +1471,6 @@ function buildBundle(taskId, opts = {}) {
   const gitMoved = git.available && (git.head !== state.git.sha || git.dirtyHash !== state.git.dirtyHash);
   const statusChanged = task.fm.status !== state.lastStatus;
   const runMoved = latestRunAt > (state.lastRunAt || 0);
-  const unseenLogEntries = logEntriesSinceReview(task.body, state.logSeen);
-  // Consume the oldest unseen entries first. A watermark is a chronological
-  // frontier, so advancing it over newer entries would strand an older backlog.
-  const logEntriesForReview = unseenLogEntries.slice(-8);
-  const newLogEntries = unseenLogEntries.length;
   const hasNew = firstReview || newBytes > 0 || newLogEntries > 0 || statusChanged || runMoved || autoContinued > 0;
   if (!hasNew && !opts.force) {
     if (git.available && git.head !== state.git.sha) {
@@ -1344,7 +1498,7 @@ function buildBundle(taskId, opts = {}) {
     throw new keep.KeepError('--from re-reads skipped bytes and must be used with --raw and --session');
   }
   if (opts.raw) {
-    const readable = perSession.filter((p) => p.lines);
+    const readable = [...perSession, ...perContributor].filter((p) => p.lines);
     if (readable.length > 1) {
       throw new keep.KeepError(`${taskId} has ${readable.length} sessions with new activity — pass --session <id> to pick one`);
     }
@@ -1394,9 +1548,24 @@ function buildBundle(taskId, opts = {}) {
     'pass --bundle ' + bundleId + ' to review-note/review-ack so the right evidence is marked reviewed.',
     `last reviewed: ${state.lastReviewedStamp || 'never'}${firstReview ? ' (first review — everything below is new)' : ''}`,
     `since then: ${newBytes} new transcript bytes across ${perSession.length} session(s)` +
+      `${perContributor.length ? `, contributor context from ${perContributor.length} attributed session(s)` : ''}` +
       `${gitMoved ? ', git moved' : ''}${statusChanged ? `, status ${state.lastStatus || '?'} → ${task.fm.status}` : ''}` +
       `${autoContinued ? `, auto-continued ${autoContinued} time(s)` : ''}`,
   );
+  const contributorCoverage = [];
+  for (const p of perContributor) {
+    const id = p.session.id.slice(0, 12);
+    if (p.missing) contributorCoverage.push(`CONTRIBUTOR COVERAGE: ${id} transcript not found; its attributed card entry is shown but transcript context is missing.`);
+    else if (p.error) contributorCoverage.push(`CONTRIBUTOR COVERAGE: ${id} transcript could not be read: ${clip(p.error, 180)}`);
+    else {
+      if (p.window.scanSkipped) contributorCoverage.push(`CONTRIBUTOR COVERAGE: ${id} scan stopped after ${Math.round(p.window.scanned / 1024 / 1024)} MB; ${Math.round(p.window.scanSkipped / 1024 / 1024)} MB was not searched.`);
+      if (p.window.skipped) contributorCoverage.push(`CONTRIBUTOR COVERAGE: ${id} matching context exceeded the ${Math.round(MAX_DELTA_BYTES / 1024 / 1024)} MB cap; ${Math.round(p.window.skipped / 1024)} KB was omitted.`);
+      if (p.window.oversized) contributorCoverage.push(`CONTRIBUTOR COVERAGE: ${id} had ${p.window.oversized} oversized transcript row(s) (${Math.round(p.window.oversizedBytes / 1024)} KB) that could not be timestamped or rendered within the evidence cap.`);
+      if (!p.window.lines.length) contributorCoverage.push(`CONTRIBUTOR COVERAGE: ${id} had no readable timestamped rows in the attributed 30-minute context window.`);
+      if (p.window.untimestamped) contributorCoverage.push(`CONTRIBUTOR COVERAGE: ${id} had ${p.window.untimestamped} untimestamped transcript row(s) that could not be placed in the contribution window.`);
+    }
+  }
+  if (contributorCoverage.length) headerLines.push('', ...contributorCoverage);
   const protectedEnd = headerLines.length;
   // Hold reasons are agent-written, and device holds come from any project, so they
   // belong inside the safety envelope rather than in the header above it.
@@ -1515,6 +1684,23 @@ function buildBundle(taskId, opts = {}) {
     if (p.parentLines) sessionLines.push('', ...p.parentLines);
   }
 
+  const contributorLines = perContributor.length ? [
+    '## contributor context',
+    '',
+    'These sessions are cited by full id in new card entries. They are not card owners and do not affect queue liveness. Each excerpt covers 30 minutes before through the end of the stamped contribution minute; it is nearby context, not proof that every activity in it belongs to this card.',
+  ] : [];
+  for (const p of perContributor) {
+    contributorLines.push('', `### contributor ${p.session.id} (${p.session.agent})`);
+    contributorLines.push(`attributed entries: ${p.session.windows.map((window) => `${window.stamp} · ${window.kind}`).join('; ')}`);
+    if (p.missing) { contributorLines.push('transcript not found on disk.'); continue; }
+    if (p.error) { contributorLines.push(`could not read: ${p.error}`); continue; }
+    const first = p.session.windows.reduce((n, window) => Math.min(n, window.startMs), Infinity);
+    const last = p.session.windows.reduce((n, window) => Math.max(n, window.endMs), 0);
+    contributorLines.push(`context bounds: ${keep.stampOf(new Date(first)).replace('T', ' ')} through ${keep.stampOf(new Date(last)).replace('T', ' ')}`);
+    if (!p.window.lines.length) { contributorLines.push('no readable timestamped transcript rows in the selected window.'); continue; }
+    contributorLines.push(renderActivity(p.session, p.act, { read: p.window.read, skipped: 0 }));
+  }
+
   const runLines = ['## keep runs'];
   if (!runs.available) runLines.push('', '*no run logs on disk*');
   else if (!runs.runs.length) runLines.push('', 'no runs recorded for this card.');
@@ -1533,7 +1719,8 @@ function buildBundle(taskId, opts = {}) {
     { name: 'card', share: 12, text: taskLines.join('\n') },
     { name: 'git', share: 15, text: gitLines.join('\n') },
     { name: 'diff', share: 25, text: diffLines.join('\n') },
-    { name: 'sessions', share: 33, text: sessionLines.join('\n') },
+    { name: 'sessions', share: perContributor.length ? 28 : 33, text: sessionLines.join('\n') },
+    { name: 'contributors', share: 12, text: contributorLines.join('\n') },
     { name: 'runs', share: 10, text: runLines.join('\n') },
   ].filter((s) => s.text.trim());
 
@@ -1550,7 +1737,7 @@ function buildBundle(taskId, opts = {}) {
     }
     saveState(state);
   });
-  return { md, bundleId, taskId, newBytes, gitMoved, statusChanged, sessions: perSession.length };
+  return { md, bundleId, taskId, newBytes, gitMoved, statusChanged, sessions: perSession.length, contributors: perContributor.length };
 }
 
 // Batch framing lives outside buildBundle so the by-hand single-card command keeps
@@ -3920,6 +4107,7 @@ module.exports = {
   REVIEW_EVENTS_ARCHIVE_FILE,
   REVIEWER_DIR,
   MAX_DELTA_BYTES,
+  MAX_CONTRIBUTOR_SCAN_BYTES,
   DEFAULT_BUDGET_TOKENS,
   MAX_BUDGET_TOKENS,
   DEFAULT_TOTAL_BUDGET_TOKENS,
@@ -3935,11 +4123,13 @@ module.exports = {
   signatureHash,
   groupRepeats,
   readDeltaLines,
+  readTimestampWindowLines,
   summarizeClaudeDelta,
   summarizeCodexDelta,
   textOfCodex,
   excludedSessionIds,
   sessionsForTask,
+  contributorSessionsForEntries,
   locateSession,
   statePath,
   emptyState,
