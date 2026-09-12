@@ -42,29 +42,34 @@ function readTranscript(file) {
 function findSessionFile(id, options = {}) {
   const accounts = require('./accounts');
   const root = options.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
+  const env = options.env || process.env;
   let pinned = null;
-  try { pinned = accounts.forSession(id, 'claude', { root, env: options.env || process.env, allowStagedSource: true }); } catch (error) {
-    if (/multiple accounts without authority/.test(error.message)) throw error;
+  let authorityFailed = false;
+  try {
+    // Discover the transcript once below. Asking only for durable authority here
+    // avoids a complete project-tree walk in accounts.forSession followed by the
+    // same walk again to obtain the file.
+    pinned = accounts.forSession(id, 'claude', { root, env, allowStagedSource: true, allowDiscovery: false });
+  } catch {
+    // Preserve the legacy fallback for invalid or unavailable authority: a sole
+    // file can still be read, but multiple files remain ambiguous.
+    authorityFailed = true;
   }
-  const roots = accounts.projectRoots(options.env || process.env);
-  const ordered = pinned
-    ? [...roots.filter((entry) => entry.accountId === pinned.id), ...roots.filter((entry) => entry.accountId !== pinned.id)]
-    : roots;
-  const found = [];
-  for (const entry of ordered) {
-    let dirs = [];
-    try { dirs = fs.readdirSync(entry.root); } catch { continue; }
-    for (const dir of dirs) {
-      const file = path.join(entry.root, dir, `${id}.jsonl`);
-      try {
-        if (!fs.statSync(file).isFile()) continue;
-        if (pinned && entry.accountId === pinned.id) return file;
-        found.push(file);
-      } catch {}
-    }
+  const matches = accounts.locateClaudeFiles(id, env);
+  if (!pinned && !authorityFailed) {
+    const accountIds = [...new Set(matches.map((entry) => entry.accountId))];
+    if (accountIds.length > 1) throw new Error(`session ${id} exists in multiple accounts without authority`);
+    if (accountIds.length === 1) pinned = { id: accountIds[0] };
   }
-  if (found.length > 1) throw new Error(`session ${id} exists in multiple accounts without authority`);
-  return found[0] || null;
+  if (pinned) {
+    const authoritative = matches.find((entry) => entry.accountId === pinned.id);
+    if (authoritative) return authoritative.file;
+    const fallback = matches.filter((entry) => entry.accountId !== pinned.id);
+    if (fallback.length > 1) throw new Error(`session ${id} exists in multiple accounts without authority`);
+    return fallback[0]?.file || null;
+  }
+  if (matches.length > 1) throw new Error(`session ${id} exists in multiple accounts without authority`);
+  return matches[0]?.file || null;
 }
 
 module.exports = { PROJECTS_DIR, TAIL_BYTES, textOf, readTranscript, readTranscriptTail, findSessionFile };

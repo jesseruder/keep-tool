@@ -84,6 +84,8 @@ const {
   stripTerminalAnsi,
   openSession,
   addHostSessionState,
+  backfillHostSessions,
+  createDashboardClaudeSessionResolver,
   applyCompanionJobs,
   applySessionLiveness,
   resumeAfterLimit,
@@ -4069,6 +4071,60 @@ test('API state uses the Claude lookup for an alive Claude host session', async 
   assert.equal(state.sessions[0].kind, 'claude');
   assert.equal(state.sessions[0].pane, 'pane-claude-old');
   assert.equal(state.sessions[0].hostOnly, true);
+});
+
+test('dashboard Claude resolver reuses one indexed snapshot and preserves account authority rules', () => {
+  let rowReads = 0;
+  const rows = [
+    { id: 'single', accountId: 'a', file: '/a/one/single.jsonl', stat: { size: 1, mtimeMs: 1 } },
+    { id: 'same-account', accountId: 'a', file: '/a/one/same-account.jsonl', stat: { size: 2, mtimeMs: 2 } },
+    { id: 'same-account', accountId: 'a', file: '/a/two/same-account.jsonl', stat: { size: 3, mtimeMs: 3 } },
+    { id: 'ambiguous', accountId: 'a', file: '/a/one/ambiguous.jsonl', stat: { size: 4, mtimeMs: 4 } },
+    { id: 'ambiguous', accountId: 'b', file: '/b/one/ambiguous.jsonl', stat: { size: 5, mtimeMs: 5 } },
+    { id: 'pinned', accountId: 'a', file: '/a/one/pinned.jsonl', stat: { size: 6, mtimeMs: 6 } },
+    { id: 'pinned', accountId: 'b', file: '/b/one/pinned.jsonl', stat: { size: 7, mtimeMs: 7 } },
+    { id: 'staged', accountId: 'a', file: '/a/one/staged.jsonl', stat: { size: 8, mtimeMs: 8 } },
+    { id: 'staged', accountId: 'b', file: '/b/one/staged.jsonl', stat: { size: 9, mtimeMs: 9 } },
+  ];
+  const input = {
+    get rows() { rowReads++; return rows; },
+    accountIds: ['a', 'b'],
+    authority: {
+      pinned: { agent: 'claude', accountId: 'b' },
+      staged: { agent: 'claude', accountId: 'a', stagedAccountId: 'b' },
+    },
+    sessionForEntry: (id, file, stat, accountId) => ({ id, file, stat, accountId }),
+  };
+  const resolve = createDashboardClaudeSessionResolver(input);
+  assert.equal(rowReads, 1, 'all host lookups share one transcript-index snapshot');
+  assert.deepEqual(resolve('single'), {
+    id: 'single', file: '/a/one/single.jsonl', stat: { size: 1, mtimeMs: 1 }, accountId: 'a',
+  });
+  assert.equal(resolve('same-account').file, '/a/one/same-account.jsonl', 'duplicates within one account remain resolvable');
+  assert.throws(() => resolve('ambiguous'), /multiple accounts without authority/);
+  assert.deepEqual({ file: resolve('pinned').file, accountId: resolve('pinned').accountId }, {
+    file: '/b/one/pinned.jsonl', accountId: 'b',
+  });
+  assert.deepEqual({ file: resolve('staged').file, accountId: resolve('staged').accountId }, {
+    file: '/a/one/staged.jsonl', accountId: null,
+  }, 'an unfinished handoff reads the source transcript without choosing a resume account');
+  assert.equal(rowReads, 1);
+});
+
+test('host backfill uses indexed Claude discovery only for dashboard state', () => {
+  const pane = { id: 'pane', alive: true, meta: { sessionId: 'host-only', agent: 'claude' } };
+  let exactCalls = 0;
+  let indexedFactories = 0;
+  const deps = {
+    freshClaudeSessionFor: () => { exactCalls++; return null; },
+    createDashboardClaudeSessionResolver: () => { indexedFactories++; return () => null; },
+  };
+  backfillHostSessions([], [pane], deps);
+  assert.equal(exactCalls, 1);
+  assert.equal(indexedFactories, 0);
+  backfillHostSessions([], [pane], { ...deps, dashboard: true });
+  assert.equal(exactCalls, 1);
+  assert.equal(indexedFactories, 1);
 });
 
 test('a host request timeout releases the injection lock', async () => {

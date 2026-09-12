@@ -4039,6 +4039,21 @@ function claudeSessionFromInfo(id, info, stat, dir, reviewer, now, accountId = n
   };
 }
 
+function claudeSessionForEntry(id, file, stat, accountId = null) {
+  let info;
+  const cached = claudeSessionParseCache.get(file);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    info = cached.info;
+  } else {
+    info = scanTranscript(file);
+    cacheClaudeSessionLookup(claudeSessionParseCache, file, { mtimeMs: stat.mtimeMs, size: stat.size, info });
+  }
+  const dir = path.basename(path.dirname(file));
+  let reviewer = false;
+  try { reviewer = fs.readdirSync(path.join(keep.ROOT, '.keep', 'reviewer')).includes(id); } catch {}
+  return claudeSessionFromInfo(id, info, stat, dir, reviewer, Date.now(), accountId);
+}
+
 function claudeSessionFor(sessionId) {
   const id = String(sessionId || '');
   let file = claudeSessionPathCache.get(id) || null;
@@ -4060,22 +4075,63 @@ function claudeSessionFor(sessionId) {
     if (!file) return null;
     try { stat = fs.statSync(file); } catch { return null; }
     if (!stat.isFile()) return null;
-    cacheClaudeSessionLookup(claudeSessionPathCache, id, file);
   }
-  let info;
-  const cached = claudeSessionParseCache.get(file);
-  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-    info = cached.info;
-  } else {
-    info = scanTranscript(file);
-    cacheClaudeSessionLookup(claudeSessionParseCache, file, { mtimeMs: stat.mtimeMs, size: stat.size, info });
-  }
-  const dir = path.basename(path.dirname(file));
-  let reviewer = false;
-  try { reviewer = fs.readdirSync(path.join(keep.ROOT, '.keep', 'reviewer')).includes(id); } catch {}
+  cacheClaudeSessionLookup(claudeSessionPathCache, id, file);
   let accountId = null;
   try { accountId = accounts.forSession(id, 'claude', { root: keep.ROOT })?.id || null; } catch {}
-  return claudeSessionFromInfo(id, info, stat, dir, reviewer, Date.now(), accountId);
+  return claudeSessionForEntry(id, file, stat, accountId);
+}
+
+// Host-only sessions were absent from the recent-session result, but their old
+// transcripts are already present in the dashboard index. Resolve every host
+// pane from one snapshot instead of walking every account's project tree once
+// or twice per pane. Action paths do not consume this bounded snapshot.
+function createDashboardClaudeSessionResolver(deps = {}) {
+  const rows = deps.rows || claudeTranscriptIndex.scan();
+  const authority = deps.authority || accounts.authority(deps.root || keep.ROOT);
+  const configuredAccounts = new Set(deps.accountIds || claudeProjectRoots.map((entry) => entry.accountId));
+  const byId = new Map();
+  for (const row of rows) {
+    const matches = byId.get(row.id) || [];
+    matches.push(row);
+    byId.set(row.id, matches);
+  }
+  const sessionForEntry = deps.sessionForEntry || claudeSessionForEntry;
+  return (sessionId) => {
+    const id = String(sessionId || '');
+    const matches = byId.get(id) || [];
+    const record = authority[id];
+    let pinnedId = null;
+    let accountId = null;
+    let authorityFailed = false;
+    if (record) {
+      if (record.agent === 'claude' && configuredAccounts.has(record.accountId)) {
+        pinnedId = record.accountId;
+        // An unfinished handoff deliberately has no ordinary resume account.
+        if (!record.stagedAccountId) accountId = record.accountId;
+      } else {
+        authorityFailed = true;
+      }
+    }
+    if (!record) {
+      const accountIds = [...new Set(matches.map((entry) => entry.accountId))];
+      if (accountIds.length > 1) throw new Error(`session ${id} exists in multiple accounts without authority`);
+      if (accountIds.length === 1) pinnedId = accountId = accountIds[0];
+    }
+    let entry = null;
+    if (pinnedId) {
+      entry = matches.find((candidate) => candidate.accountId === pinnedId) || null;
+      if (!entry) {
+        const fallback = matches.filter((candidate) => candidate.accountId !== pinnedId);
+        if (fallback.length > 1) throw new Error(`session ${id} exists in multiple accounts without authority`);
+        entry = fallback[0] || null;
+      }
+    } else {
+      if (authorityFailed && matches.length > 1) throw new Error(`session ${id} exists in multiple accounts without authority`);
+      entry = matches[0] || null;
+    }
+    return entry ? sessionForEntry(id, entry.file, entry.stat, accountId) : null;
+  };
 }
 
 function scanClaudeSessions(options = {}) {
@@ -4101,7 +4157,9 @@ function scanClaudeSessions(options = {}) {
   const seen = new Set();
   const sessionIds = new Set();
   const accountAuthority = accounts.authority(keep.ROOT);
-  for (const { dir, file, id, stat, accountId } of claudeTranscriptIndex.scan({ fresh: options.dashboard !== true })) {
+  const transcriptRows = claudeTranscriptIndex.scan({ fresh: options.dashboard !== true });
+  if (typeof options.onTranscriptRows === 'function') options.onTranscriptRows(transcriptRows);
+  for (const { dir, file, id, stat, accountId } of transcriptRows) {
     if (accountAuthority[id]?.accountId && accountAuthority[id].accountId !== accountId) continue;
     if (sessionIds.has(id)) continue;
     sessionIds.add(id);
@@ -4500,7 +4558,13 @@ function buildState(options = {}) {
     lastLog: keep.lastLogLine(t),
     overdue: keep.isOverdue(t),
   }));
-  const sessions = scanSessions({ dashboard: options.dashboard === true });
+  let dashboardTranscriptRows = null;
+  const sessions = scanSessions({
+    dashboard: options.dashboard === true,
+    ...(options.dashboard === true ? { onTranscriptRows: (rows) => { dashboardTranscriptRows = rows; } } : {}),
+  });
+  // scanSessions just reconciled this exact index snapshot synchronously. Reuse
+  // it for host-only rows instead of statting every project directory again.
   const now = typeof options.now === 'function' ? Number(options.now()) : Number(options.now ?? Date.now());
   const liveLedger = readLiveSessionLedger(options);
   const independentLive = stallAliveIds({ ...liveLedger, sessions: Object.fromEntries(
@@ -4512,6 +4576,10 @@ function buildState(options = {}) {
       codexSessionFor: options.codexSessionFor,
       claudeSessionFor: options.claudeSessionFor,
       independentLive,
+      dashboard: options.dashboard === true,
+      ...(dashboardTranscriptRows ? {
+        createDashboardClaudeSessionResolver: () => createDashboardClaudeSessionResolver({ rows: dashboardTranscriptRows }),
+      } : {}),
     });
   }
   // Current card links win over historical links; task progress stays separate
@@ -4637,7 +4705,13 @@ function buildState(options = {}) {
   for (const session of sessions) {
     let accountId = session.accountId;
     if (!accountId) {
-      try { accountId = accounts.forSession(session.id, session.kind, { root: keep.ROOT })?.id || null; } catch {}
+      // Scanned transcripts and host metadata already carry discovered accounts.
+      // For a missing dashboard row, consult durable authority without repeating
+      // a project-tree search for a transcript that was not in the index.
+      try { accountId = accounts.forSession(session.id, session.kind, {
+        root: keep.ROOT,
+        ...(options.dashboard === true ? { allowDiscovery: false } : {}),
+      })?.id || null; } catch {}
     }
     if (accountId) { session.accountId = accountId; session.accountLabel = accountLabels.get(accountId) || accountId; }
   }
@@ -4740,6 +4814,7 @@ function backfillHostSessions(sessions, panes, deps = {}) {
   const sessionIds = new Set(sessions.map((session) => session.id));
   const owners = sessionTaskOwners(deps.tasks || []);
   const added = [];
+  let indexedClaudeSessionFor = null;
   for (const pane of hostPanesBySession(panes).values()) {
     try {
       const meta = pane && pane.meta;
@@ -4749,7 +4824,9 @@ function backfillHostSessions(sessions, panes, deps = {}) {
         || !['claude', 'codex'].includes(agent) || sessionIds.has(id)) continue;
       const lookup = agent === 'codex'
         ? deps.codexSessionFor || codex.sessionFor
-        : deps.claudeSessionFor || claudeSessionFor;
+        : deps.claudeSessionFor || (deps.dashboard === true
+          ? (indexedClaudeSessionFor ||= (deps.createDashboardClaudeSessionResolver || createDashboardClaudeSessionResolver)())
+          : deps.freshClaudeSessionFor || claudeSessionFor);
       let session = null;
       try { session = lookup(id); } catch {}
       if (!session) {
@@ -4773,6 +4850,7 @@ function backfillHostSessions(sessions, panes, deps = {}) {
       session.pane = pane.id;
       session.hostOnly = true;
       session.taskId = owners[id] || null;
+      if (!session.accountId && typeof meta.accountId === 'string' && meta.accountId) session.accountId = meta.accountId;
       if ((!pane.alive || pane.agentAlive === false) && !deps.independentLive?.has(id)) {
         // An exited agent cannot be answered: keep the transcript tail for display
         // but drop the prompts that would otherwise resurface in "Needs you".
@@ -6195,6 +6273,7 @@ module.exports = {
   companionSnapshot,
   applyCompanionJobs,
   claudeSessionFor,
+  createDashboardClaudeSessionResolver,
   transcriptActivityMs,
   sessionNeedsInput,
   sessionTaskOwners,
