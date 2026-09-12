@@ -908,6 +908,22 @@ function normalizeProjectPath(value) {
       : absolute;
 }
 
+// A path-like project argument names a repository, so a linked worktree path (or a
+// directory inside one) resolves to the main checkout its cards are filed under.
+// canonicalCwd shells out to git, so only ever call this on candidate paths.
+function canonicalProjectPath(value) {
+  const expanded = String(value || '').replace(/^~(?=\/|$)/, os.homedir());
+  const absolute = path.isAbsolute(expanded) ? path.normalize(expanded) : path.resolve(expanded);
+  const canonical = canonicalCwd(absolute);
+  const normalized = normalizeProjectPath(canonical);
+  // A main checkout canonicalizes to itself, so seed the memo for the spellings later
+  // callers hand canonicalCwd — projectMatchesCwd passes the `~`-normalized string —
+  // and they skip a second round of git rev-parse on an already-canonical path.
+  if (!canonicalCwdMemo.has(canonical)) canonicalCwdMemo.set(canonical, canonical);
+  if (!canonicalCwdMemo.has(normalized)) canonicalCwdMemo.set(normalized, canonical);
+  return normalized;
+}
+
 function resolveProjectArg(arg) {
   arg = String(arg || '').trim();
   if (!arg) die('a project is required');
@@ -930,6 +946,8 @@ function resolveProjectArg(arg) {
     }
     const match = candidates.find((candidate) => projects.includes(candidate));
     if (match) return match;
+    const canonical = candidates.map(canonicalProjectPath).find((candidate) => projects.includes(candidate));
+    if (canonical) return canonical;
   }
 
   const diskCandidates = bare
@@ -940,7 +958,7 @@ function resolveProjectArg(arg) {
         ? [arg]
         : [path.resolve(arg), path.join(os.homedir(), arg)];
   for (const candidate of diskCandidates) {
-    try { if (fs.statSync(candidate).isDirectory()) return normalizeProjectPath(candidate); } catch {}
+    try { if (fs.statSync(candidate).isDirectory()) return canonicalProjectPath(candidate); } catch {}
   }
   die(`no open Keep project or existing directory matches "${arg}"`);
 }
@@ -2305,8 +2323,26 @@ commands.list = (argv) => {
   if (o.status) tasks = tasks.filter((t) => o.status.includes(t.fm.status));
   if (o.tag) tasks = tasks.filter((t) => (t.fm.tags || []).includes(o.tag));
   if (o.project) {
-    const needle = path.basename(o.project);
-    tasks = tasks.filter((t) => t.fm.project && path.basename(t.fm.project) === needle);
+    const bare = !o.project.includes('/') && !path.isAbsolute(o.project)
+      && !o.project.startsWith('~') && !/^\.\.?$/.test(o.project);
+    if (bare) {
+      const needle = path.basename(o.project);
+      tasks = tasks.filter((t) => t.fm.project && path.basename(t.fm.project) === needle);
+    } else {
+      // A worktree path (or a directory inside one) asks about its main checkout's cards,
+      // but cards filed literally on the worktree path still have to answer to it.
+      const wanted = canonicalProjectPath(o.project);
+      const asTyped = normalizeProjectPath(o.project);
+      // Reverse direction: a repo-root query also finds cards filed on a subdirectory.
+      // String comparison only — canonicalizing every card's project would spawn git per card.
+      const under = (project, root) => project === root || project.startsWith(root + path.sep);
+      tasks = tasks.filter((t) => {
+        if (!t.fm.project) return false;
+        if (projectMatchesCwd(t.fm.project, wanted)) return true;
+        const project = normalizeProjectPath(t.fm.project);
+        return under(project, wanted) || under(project, asTyped) || under(asTyped, project);
+      });
+    }
   }
   if (o.overdue) tasks = tasks.filter(isOverdue);
   tasks.sort((a, b) =>

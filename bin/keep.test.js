@@ -194,6 +194,65 @@ test('project matching and project inference canonicalize linked worktree cwd', 
   }
 });
 
+test('list --project accepts a linked worktree path and still accepts a bare name', () => {
+  const f = linkedWorktreeFixture();
+  const root = path.join(f.root, 'registry');
+  const { serializeTask, normalizeProjectPath } = require('./keep.js');
+  // A live session id would attribute these temp cards to the session running the tests.
+  const env = { ...process.env, KEEP_DIR: root, KEEP_ALLOW_PUSH: '0' };
+  delete env.CLAUDE_CODE_SESSION_ID; delete env.CODEX_THREAD_ID; delete env.CODEX_SESSION_ID;
+  const run = (args) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'list', ...args], {
+    cwd: f.root, env, encoding: 'utf8',
+  });
+  try {
+    for (const dir of ['tasks', 'archive', 'digests']) fs.mkdirSync(path.join(root, dir), { recursive: true });
+    fs.writeFileSync(path.join(root, 'tasks', 'wt-list.md'), serializeTask({ id: 'wt-list', fm: {
+      title: 'Worktree list', status: 'active', kind: 'task', tags: ['personal'],
+      project: f.main, sessions: [], created: '2026-09-12',
+    }, body: '' }));
+    // A card already filed on the worktree path itself still answers to that path.
+    fs.writeFileSync(path.join(root, 'tasks', 'wt-filed.md'), serializeTask({ id: 'wt-filed', fm: {
+      title: 'Filed on the worktree', status: 'active', kind: 'task', tags: ['personal'],
+      project: normalizeProjectPath(f.worktree), sessions: [], created: '2026-09-12',
+    }, body: '' }));
+    const nested = path.join(f.worktree, 'nested');
+    fs.mkdirSync(nested);
+    for (const target of [f.worktree, nested, f.main, path.basename(f.main)]) {
+      const listed = run(['--project', target, '--brief']);
+      assert.equal(listed.status, 0, listed.stderr);
+      assert.match(listed.stdout, /wt-list/, `--project ${target}`);
+    }
+    const fromWorktree = run(['--project', f.worktree, '--brief']);
+    assert.match(fromWorktree.stdout, /wt-list/);
+    assert.match(fromWorktree.stdout, /wt-filed/, 'a card filed on the worktree path stays visible');
+    const fromNested = run(['--project', nested, '--brief']);
+    assert.match(fromNested.stdout, /wt-filed/, 'a nested worktree directory still sees a card filed on the worktree root');
+    const unrelated = run(['--project', path.join(f.root, 'other-repo')]);
+    assert.equal(unrelated.status, 0, unrelated.stderr);
+    assert.match(unrelated.stdout, /nothing here/);
+  } finally {
+    fs.rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test('resolveProjectArg canonicalizes a linked worktree path to its main checkout', () => {
+  const f = linkedWorktreeFixture();
+  const root = path.join(f.root, 'registry');
+  const env = { ...process.env, KEEP_DIR: root, KEEP_ALLOW_PUSH: '0' };
+  delete env.CLAUDE_CODE_SESSION_ID; delete env.CODEX_THREAD_ID; delete env.CODEX_SESSION_ID;
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+    const script = 'process.stdout.write(require(process.argv[2]).resolveProjectArg(process.argv[1]))';
+    const resolved = spawnSync(process.execPath, ['-e', script, f.worktree, path.join(__dirname, 'keep.js')], {
+      cwd: f.root, env, encoding: 'utf8',
+    });
+    assert.equal(resolved.status, 0, resolved.stderr);
+    assert.equal(resolved.stdout, require('./keep.js').normalizeProjectPath(f.main));
+  } finally {
+    fs.rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
 test('checkin preserves an unowned card and claim links from a project worktree', () => {
   const f = linkedWorktreeFixture();
   const keepRoot = path.join(f.root, 'registry');

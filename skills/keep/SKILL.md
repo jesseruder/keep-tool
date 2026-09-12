@@ -13,7 +13,8 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
 ## When to act
 
 - **Starting substantive work** (a feature, debugging effort, or other multi-turn task):
-  run `keep list --project <cwd>`, then claim matching existing work with
+  run `keep list --project <cwd>` (a path argument, including a worktree path or a
+  directory inside one, resolves to its main checkout), then claim matching existing work with
   `keep claim <id>` before checking in, or create it with `keep add "title" --status
   active`. Creating an ordinary task claims it automatically. Use `--file` for a
   follow-up you are recording without starting; ideas file without claiming by default,
