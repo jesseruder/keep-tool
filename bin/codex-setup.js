@@ -265,13 +265,17 @@ function rewriteJsonMetadata(source, destination, sourceDir, targetDir, strict =
   writeJSON(destination, rebaseMetadata(value));
 }
 
-const GENERATED_PLUGIN_FILES = new Set(['extension-host-config.json']);
+const PLUGIN_MANIFEST = '.keep-codex-plugin.json';
+
+function generatedPluginFile(relative) {
+  return path.basename(relative) === 'extension-host-config.json' || path.basename(relative) === PLUGIN_MANIFEST;
+}
 
 function materializePluginTree(source, target, sourceDir, targetDir, relative = '') {
   fs.mkdirSync(target, { recursive: true, mode: 0o700 });
   for (const name of fs.readdirSync(source)) {
     const childRelative = relative ? path.join(relative, name) : name;
-    if (GENERATED_PLUGIN_FILES.has(childRelative)) continue;
+    if (generatedPluginFile(childRelative)) continue;
     const from = path.join(source, name), to = path.join(target, name);
     const stat = fs.statSync(from);
     if (stat.isDirectory()) materializePluginTree(from, to, sourceDir, targetDir, childRelative);
@@ -319,6 +323,7 @@ function filesIn(root) {
   function visit(directory, prefix = '') {
     for (const name of fs.readdirSync(directory)) {
       const relative = prefix ? path.join(prefix, name) : name;
+      if (generatedPluginFile(relative)) continue;
       const file = path.join(directory, name);
       const stat = fs.statSync(file);
       if (stat.isDirectory()) visit(file, relative);
@@ -353,15 +358,31 @@ function syncPluginVersion(entry, destination, sourceDir, targetDir, previous, o
     if (!pathExists(destination)) {
       const records = Object.fromEntries([...desired].map(([relative, file]) => [relative,
         { sourceHash: fileDigest(file), targetHash: fileDigest(file), managed: true }]));
+      writeJSON(path.join(stage, PLUGIN_MANIFEST), { version: 1, sourceConfigDir: sourceDir,
+        pluginVersion: entry.relative, files: records });
       fs.renameSync(stage, destination);
       return records;
     }
-    if (!previous) return null;
+    if (fs.lstatSync(destination).isSymbolicLink()) {
+      if (canonical(destination) !== canonical(entry.source)) return null;
+      const records = Object.fromEntries([...desired].map(([relative, file]) => [relative,
+        { sourceHash: fileDigest(file), targetHash: fileDigest(file), managed: true }]));
+      writeJSON(path.join(stage, PLUGIN_MANIFEST), { version: 1, sourceConfigDir: sourceDir,
+        pluginVersion: entry.relative, files: records });
+      fs.unlinkSync(destination);
+      fs.renameSync(stage, destination);
+      return records;
+    }
+    if (!previous) {
+      const ownership = readJSON(path.join(destination, PLUGIN_MANIFEST), null);
+      if (ownership?.version === 1 && ownership.pluginVersion === entry.relative
+          && canonical(ownership.sourceConfigDir) === canonical(sourceDir)) previous = ownership.files;
+    }
+    previous ||= {};
     const targetFiles = filesIn(destination);
     const keys = new Set([...desired.keys(), ...targetFiles.keys(), ...Object.keys(previous)]);
     const decisions = new Map(), conflicts = [];
     for (const relative of [...keys].sort()) {
-      if (GENERATED_PLUGIN_FILES.has(relative) && !desired.has(relative)) continue;
       const sourceHash = fileDigest(desired.get(relative));
       const targetHash = fileDigest(targetFiles.get(relative));
       const prior = previous[relative];
@@ -383,7 +404,9 @@ function syncPluginVersion(entry, destination, sourceDir, targetDir, previous, o
       const desiredFile = desired.get(relative), targetFile = path.join(destination, relative);
       const sourceChanged = !decision.prior || decision.sourceHash !== decision.prior.sourceHash;
       const targetChanged = !decision.prior || decision.targetHash !== decision.prior.targetHash;
-      if (decision.managed && decision.sourceHash !== decision.targetHash && (!targetChanged || !decision.prior)) {
+      if (!decision.prior && decision.managed && desiredFile) {
+        publishFile(desiredFile, targetFile);
+      } else if (decision.managed && decision.sourceHash !== decision.targetHash && (!targetChanged || !decision.prior)) {
         if (desiredFile) publishFile(desiredFile, targetFile);
         else if (pathExists(targetFile)) fs.unlinkSync(targetFile);
       } else if (decision.managed && sourceChanged && !targetChanged) {
@@ -392,8 +415,11 @@ function syncPluginVersion(entry, destination, sourceDir, targetDir, previous, o
       }
     }
     for (const [relative, decision] of decisions) decision.targetHash = fileDigest(path.join(destination, relative));
-    return Object.fromEntries([...decisions].map(([relative, { sourceHash, targetHash, managed }]) =>
+    const records = Object.fromEntries([...decisions].map(([relative, { sourceHash, targetHash, managed }]) =>
       [relative, { sourceHash, targetHash, managed }]));
+    writeJSON(path.join(destination, PLUGIN_MANIFEST), { version: 1, sourceConfigDir: sourceDir,
+      pluginVersion: entry.relative, files: records });
+    return records;
   } finally {
     fs.rmSync(stage, { recursive: true, force: true });
   }

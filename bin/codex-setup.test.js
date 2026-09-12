@@ -219,6 +219,44 @@ test('invalid critical plugin metadata and concurrent target config edits fail b
       writeToml(path.join(f.targetDir, 'config.toml'), config);
     } }), /config changed during capability sync/);
     assert.equal(toml.parse(fs.readFileSync(path.join(f.targetDir, 'config.toml'), 'utf8')).model, 'concurrent-model-change');
+
+    const recoveredSource = { mcpServers: { recovered: { command: 'node', args: [path.join(f.sourceDir, 'recovered.js')] } } };
+    fs.writeFileSync(path.join(sourcePlugin, '.mcp.json'), JSON.stringify(recoveredSource));
+    setup.shareSetup(f.source, f.target);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(targetPlugin, '.mcp.json'))).mcpServers.recovered.args[0],
+      path.join(f.targetDir, 'recovered.js'), 'per-version sidecar recovers management after global manifest failure');
+
+    const nestedRuntime = path.join('extension-host', 'macos', 'arm64', 'extension-host-config.json');
+    fs.mkdirSync(path.dirname(path.join(sourcePlugin, nestedRuntime)), { recursive: true });
+    fs.mkdirSync(path.dirname(path.join(targetPlugin, nestedRuntime)), { recursive: true });
+    fs.writeFileSync(path.join(sourcePlugin, nestedRuntime), '{"profile":"source"}');
+    fs.writeFileSync(path.join(targetPlugin, nestedRuntime), '{"profile":"target"}');
+    setup.refresh(f.target);
+    assert.equal(fs.readFileSync(path.join(targetPlugin, nestedRuntime), 'utf8'), '{"profile":"target"}');
+  } finally { f.cleanup(); }
+});
+
+test('first adoption manages matching existing plugin files and preserves differing ones', () => {
+  const f = fixture();
+  const sourcePlugin = path.join(f.sourceDir, 'plugins', 'cache', 'bundled', 'sample', '1.2.3');
+  const targetPlugin = path.join(f.targetDir, 'plugins', 'cache', 'bundled', 'sample', '1.2.3');
+  try {
+    fs.mkdirSync(path.dirname(targetPlugin), { recursive: true });
+    fs.cpSync(sourcePlugin, targetPlugin, { recursive: true });
+    fs.writeFileSync(path.join(targetPlugin, '.mcp.json'), JSON.stringify(JSON.parse(
+      fs.readFileSync(path.join(targetPlugin, '.mcp.json'), 'utf8').replaceAll(f.sourceDir, f.targetDir)), null, 2) + '\n');
+    fs.writeFileSync(path.join(targetPlugin, '.codex-plugin', 'plugin.json'), JSON.stringify(
+      JSON.parse(fs.readFileSync(path.join(targetPlugin, '.codex-plugin', 'plugin.json'), 'utf8')), null, 2) + '\n');
+    fs.writeFileSync(path.join(targetPlugin, 'skills', 'sample', 'SKILL.md'), 'target skill override\n');
+    setup.shareSetup(f.source, f.target);
+    assert.equal(fs.readFileSync(path.join(targetPlugin, 'skills', 'sample', 'SKILL.md'), 'utf8'), 'target skill override\n');
+    const changed = JSON.parse(fs.readFileSync(path.join(sourcePlugin, '.mcp.json')));
+    changed.mcpServers.sample.args.push(path.join(f.sourceDir, 'new-entry.js'));
+    fs.writeFileSync(path.join(sourcePlugin, '.mcp.json'), JSON.stringify(changed));
+    setup.refresh(f.target);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(targetPlugin, '.mcp.json'))).mcpServers.sample.args.at(-1),
+      path.join(f.targetDir, 'new-entry.js'));
+    assert.equal(fs.readFileSync(path.join(targetPlugin, 'skills', 'sample', 'SKILL.md'), 'utf8'), 'target skill override\n');
   } finally { f.cleanup(); }
 });
 
