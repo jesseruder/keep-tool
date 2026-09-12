@@ -182,6 +182,20 @@ test('scoped contributor bundles cannot advance a log batch past omitted evidenc
     const staged = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
     assert.deepEqual(staged.pendingLog, { stamp, count: 2 });
     assert.deepEqual(staged.sessions, {}, 'contributor evidence never creates transcript offsets');
+
+    fs.writeFileSync(path.join(root, 'tasks', 'multi-owner-card.md'), [
+      '---', 'title: Multi owner card', 'status: active', 'sessions:',
+      `  - id: ${ids[0]}`, '    agent: claude', `    at: ${stamp}`,
+      `  - id: ${ids[1]}`, '    agent: claude', `    at: ${stamp}`,
+      `created: ${stamp.slice(0, 10)}`, `updated: ${stamp.replace(' ', 'T')}`, '---',
+      `## ${stamp} — check-in (by claude ${ids[1]})`, 'Linked owner B contribution.', '',
+    ].join('\n'));
+    const ownerScoped = run(['review-bundle', 'multi-owner-card', '--session', ids[0]]);
+    assert.equal(ownerScoped.status, 0, ownerScoped.stderr);
+    assert.doesNotMatch(ownerScoped.stdout, /## contributor context/);
+    const ownerState = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'review', 'multi-owner-card.json'), 'utf8'));
+    assert.ok(ownerState.sessions[ids[0]].pendingOffset > 0);
+    assert.equal(ownerState.sessions[ids[1]], undefined, 'the omitted linked owner keeps its transcript cursor available for a later bundle');
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
   }

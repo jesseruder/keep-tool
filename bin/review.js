@@ -1380,9 +1380,14 @@ function buildBundle(taskId, opts = {}) {
   const logEntriesForReview = unseenLogEntries.slice(-8);
   const newLogEntries = unseenLogEntries.length;
 
-  const sessions = sessionsForTask(task, excluded)
+  const allSessions = sessionsForTask(task, excluded);
+  const sessions = allSessions
     .filter((s) => !opts.session || s.id === opts.session);
-  const contributorCandidates = contributorSessionsForEntries(logEntriesForReview, sessions, excluded);
+  // A scoped owner bundle deliberately leaves the other owners' transcript offsets
+  // untouched. Their future evidence remains recoverable through those offsets, so
+  // an attributed log entry from another linked owner is not contributor-only
+  // evidence and must not trigger the contributor watermark guard.
+  const contributorCandidates = contributorSessionsForEntries(logEntriesForReview, allSessions, excluded);
   const contributors = contributorCandidates
     .filter((s) => !opts.session || s.id === opts.session);
   if (opts.session && contributorCandidates.length) {
