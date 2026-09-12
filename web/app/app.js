@@ -91,6 +91,9 @@ const state = {
   focusMode: restoredFocus,
   historyTarget: null,
 };
+const topBar = document.querySelector('.bar');
+const syncTopBarHeight = () => document.documentElement.style.setProperty('--top-bar-height', `${topBar.getBoundingClientRect().height}px`);
+new ResizeObserver(syncTopBarHeight).observe(topBar);
 let historyStorage;
 try { historyStorage = localStorage; } catch {}
 const sessionHistory = createSessionHistory(historyStorage);
@@ -636,7 +639,7 @@ function renderMeters() {
   document.querySelector('#meters').innerHTML = [...groups.values()].map((group) => {
     const details = group.readings.map((reading) => {
       const percent = Math.max(0, Math.min(100, Number(reading.percent) || 0));
-      const resetAt = new Date(reading.resetsAt).getTime();
+      const resetAt = reading.resetsAt == null || reading.resetsAt === '' ? NaN : new Date(reading.resetsAt).getTime();
       const reset = Number.isFinite(resetAt) ? ` · resets ${new Date(resetAt).toLocaleString()}` : '';
       return { ...reading, percent, detail: `${reading.account}: ${Math.round(percent)}%${reset}` };
     });

@@ -117,7 +117,7 @@ test('account handoff sends the explicit destination and confirms refreshed iden
 });
 
 test('account limit groups remain complete and reveal their account details on desktop', async ({ page }) => {
-  for (const width of [1280, 1440]) {
+  for (const width of [1200, 1280, 1440]) {
     await page.setViewportSize({ width, height: 950 });
     const groups = page.locator('#meters .meter-group');
     await expect(groups).toHaveCount(4);
@@ -136,6 +136,30 @@ test('account limit groups remain complete and reveal their account details on d
   const codexFiveHour = page.locator('#meters .meter-group').filter({ hasText: 'Codex 5h' }).first();
   await codexFiveHour.focus();
   await expect(codexFiveHour.locator('.meter-details')).toContainText(`resets ${new Date(1780000000000).toLocaleString()}`);
+  await expect(codexFiveHour.locator('.meter-details')).not.toContainText('1970');
+});
+
+test('top bar popovers start after a wrapped meter header', async ({ page }) => {
+  for (const width of [1200, 1280]) {
+    await page.setViewportSize({ width, height: 950 });
+    const bottom = async () => page.locator('.bar').evaluate((element) => element.getBoundingClientRect().bottom);
+    await page.locator('[data-history-toggle]').click();
+    await expect(page.locator('.history-pop')).toBeVisible();
+    expect(await page.locator('.history-pop').evaluate((element) => element.getBoundingClientRect().top)).toBeGreaterThanOrEqual(await bottom());
+    await page.locator('[data-history-toggle]').click();
+    await page.locator('#health').click();
+    await expect(page.locator('#health .pop')).toBeVisible();
+    expect(await page.locator('#health .pop').evaluate((element) => element.getBoundingClientRect().top)).toBeGreaterThanOrEqual(await bottom());
+    await page.locator('#health').click();
+    await page.locator('#themebtn').click();
+    await expect(page.locator('.theme-pop')).toBeVisible();
+    expect(await page.locator('.theme-pop').evaluate((element) => element.getBoundingClientRect().top)).toBeGreaterThanOrEqual(await bottom());
+    await page.locator('#themebtn').click();
+    await page.locator('#notificationsButton').click();
+    await expect(page.locator('#notificationsPanel')).toBeVisible();
+    expect(await page.locator('#notificationsPanel').evaluate((element) => element.getBoundingClientRect().top)).toBeGreaterThanOrEqual(await bottom());
+    await page.locator('#notificationsPanel [data-close]').click();
+  }
 });
 
 test('interrupted account handoff exposes retry and never claims an unverified resume', async ({ page }) => {
