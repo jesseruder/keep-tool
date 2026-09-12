@@ -303,7 +303,7 @@ async function run(request, deps = {}) {
   const source = { ...(deps.sourceFor || defaultSource)(sessionId, { root, env }), id: sessionId };
   if (!['claude', 'codex'].includes(source.agent) || !source.file) throw problem('source session metadata is incomplete');
   if (source.accountId && source.accountId === target.id) throw problem('source and destination accounts are the same');
-  const task = (deps.taskForSession || (() => require('./keep').taskForSession(sessionId)))(sessionId);
+  const task = (deps.taskForSession || (() => require('./keep.js').taskForSession(sessionId)))(sessionId);
   if (!task?.id) throw problem(`source session ${sessionId} is not linked to an open card`);
   const context = stableFile(request.contextFile, CONTEXT_LIMIT);
   let cwd = request.cwd || source.cwd || task.fm?.project;
@@ -333,7 +333,7 @@ async function run(request, deps = {}) {
       if (!ID.test(request.resolveSessionId) || request.resolveSessionId === sessionId) throw problem('resolved destination session id is invalid');
       const ok = await (deps.validateResolution || (async (id) => {
         const account = accounts.forSession(id, target.agent, { root, env });
-        const owner = require('./keep').taskForSession(id);
+        const owner = require('./keep.js').taskForSession(id);
         return account?.id === target.id && owner?.id === task.id;
       }))(request.resolveSessionId, target, task);
       if (!ok) throw problem('destination session does not match the requested account and card');
