@@ -64,8 +64,13 @@ function gitPath(cwd, argument) {
 }
 
 function repositoryRoot(cwd) {
-  const common = gitPath(cwd, '--git-common-dir');
-  if (common && path.basename(common) === '.git') return canonical(path.dirname(common));
+  const result = spawnSync('git', ['-C', canonical(cwd), 'worktree', 'list', '--porcelain', '-z'], {
+    encoding: 'utf8', timeout: 3000, maxBuffer: 1024 * 1024,
+  });
+  if (result.status === 0) {
+    const main = result.stdout.split('\0').find((field) => field.startsWith('worktree '));
+    if (main) return canonical(main.slice('worktree '.length));
+  }
   return gitPath(cwd, '--show-toplevel') || canonical(cwd);
 }
 

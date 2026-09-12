@@ -180,6 +180,33 @@ test('MCP servers inherit from the main checkout through a real worktree with sc
   }
 });
 
+test('MCP inheritance uses Git-reported main worktree metadata with a separate Git directory', () => {
+  const f = fixture();
+  const gitDir = path.join(f.root, 'repo-a-git-data');
+  const worktree = path.join(f.root, 'repo-a-worktree');
+  try {
+    git(f.repoA, 'init', '-q', '--separate-git-dir', gitDir);
+    git(f.repoA, 'config', 'user.name', 'Setup Test');
+    git(f.repoA, 'config', 'user.email', 'setup@example.test');
+    fs.writeFileSync(path.join(f.repoA, 'tracked'), 'one');
+    git(f.repoA, 'add', 'tracked');
+    git(f.repoA, 'commit', '-qm', 'initial');
+    git(f.repoA, 'worktree', 'add', '--detach', worktree, 'HEAD');
+    const nested = path.join(worktree, 'nested');
+    fs.mkdirSync(nested);
+    const stateFile = path.join(f.home, '.claude.json');
+    const state = JSON.parse(fs.readFileSync(stateFile));
+    state.projects[gitDir] = { mcpServers: { separateMain: { command: 'separate-main' } } };
+    fs.writeFileSync(stateFile, JSON.stringify(state));
+
+    assert.equal(setup.repositoryRoot(nested), fs.realpathSync(gitDir));
+    assert.deepEqual(Object.keys(setup.effectiveMcpServers(f.source, nested)).sort(), ['global', 'separateMain']);
+  } finally {
+    try { git(f.repoA, 'worktree', 'remove', '--force', worktree); } catch {}
+    f.cleanup();
+  }
+});
+
 test('managed MCP config upgrades only an exact legacy generated file', () => {
   const f = fixture();
   const worktree = path.join(f.root, 'repo-a-worktree');
