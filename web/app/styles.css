@@ -166,6 +166,7 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .session-launch-dialog { width: min(560px, calc(100vw - 32px)); max-width: none; padding: 0; border: 1px solid var(--line-2); border-radius: 10px; background: var(--panel); color: var(--text); box-shadow: var(--shadow); }
 .session-launch-dialog::backdrop { background: rgb(0 0 0 / .55); }
 .session-launch-card > header { display: flex; justify-content: space-between; gap: 20px; padding: 20px 22px 14px; border-bottom: 1px solid var(--line); }
+.session-launch-card > header > .btn { align-self: flex-start; }
 .session-launch-card header h2 { margin: 1px 0 5px; font-size: 20px; }
 .session-launch-card header p { margin: 0; color: var(--muted); line-height: 1.4; }
 .session-launch-card .eyebrow { color: var(--info); font: 500 10px var(--mono); text-transform: uppercase; letter-spacing: .09em; }
