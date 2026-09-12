@@ -90,7 +90,9 @@ export function mountTerminal(container, pane, options = {}) {
   const sendJson = (value) => {
     if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(value));
   };
-  const setStatus = (value) => { statusState.textContent = value; };
+  const setStatus = (value) => {
+    if (statusState.textContent !== value) statusState.textContent = value;
+  };
   const isVisible = () => {
     const bounds = wrapper.getClientRects()[0];
     return presented && wrapper.isConnected && Boolean(bounds?.width && bounds?.height);
@@ -273,14 +275,14 @@ export function mountTerminal(container, pane, options = {}) {
     setStatus(fullHistory ? 'loading history' : (connectedOnce ? 'reconnecting' : 'connecting'));
     replayDone = false;
     const flushInput = () => {
-      if (socket?.readyState !== WebSocket.OPEN || !replayDone) return;
+      if (!pendingInput.length || socket?.readyState !== WebSocket.OPEN || !replayDone) return;
       for (const chunk of pendingInput) socket.send(chunk);
       pendingInput.length = 0;
     };
     const markHealthy = () => {
       retry = 0;
       setStatus('live');
-      status.classList.remove('error');
+      if (status.classList.contains('error')) status.classList.remove('error');
       flushInput();
     };
     socket.onopen = () => {

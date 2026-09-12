@@ -51,7 +51,12 @@ function fixture(options = {}) {
       this.offsetHeight = 750;
       this.children = new Map();
       this.listeners = new Map();
-      this.classList = { add() {}, remove() {}, toggle() {} };
+      const classes = new Set();
+      this.classList = {
+        add: (name) => classes.add(name), remove: (name) => classes.delete(name),
+        toggle: (name) => classes.has(name) ? classes.delete(name) : classes.add(name),
+        contains: (name) => classes.has(name),
+      };
       this.isConnected = true;
     }
     querySelector(selector) {
@@ -185,6 +190,37 @@ test('snapshot parses at its original size before fit or user input', async () =
     assert.ok(f.socket.sent[1] instanceof Uint8Array);
     const buffer = f.terminal.buffer.active;
     assert.equal(buffer.getLine(buffer.baseY + buffer.cursorY).translateToString(true), '› prompt');
+  } finally { f.mounted.dispose(); }
+});
+
+test('healthy output chunks do not rewrite live status but recover after an error', async () => {
+  const f = fixture();
+  try {
+    const state = f.mounted.element.querySelector('.term-state');
+    let writes = 0;
+    let value = state.textContent;
+    Object.defineProperty(state, 'textContent', {
+      configurable: true,
+      get: () => value,
+      set: (next) => { writes++; value = next; },
+    });
+    f.message({ t: 'replay-end' });
+    await f.drain();
+    assert.equal(state.textContent, 'live');
+    writes = 0;
+
+    for (let i = 0; i < 100; i++) {
+      f.socket.onmessage({ data: new TextEncoder().encode(String(i)).buffer });
+    }
+    await f.drain();
+    assert.equal(writes, 0, 'steady healthy output leaves the live status alone');
+    assert.match(f.terminal.buffer.active.getLine(0).translateToString(), /0123456789/, 'all output still reaches xterm');
+
+    f.message({ t: 'error', message: 'temporary terminal error' });
+    assert.equal(state.textContent, 'temporary terminal error');
+    f.socket.onmessage({ data: new TextEncoder().encode(' recovered').buffer });
+    assert.equal(state.textContent, 'live');
+    assert.equal(state.classList.contains('error'), false);
   } finally { f.mounted.dispose(); }
 });
 
