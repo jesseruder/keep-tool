@@ -3855,8 +3855,10 @@ test('standalone fresh agent launch uses the selected profile and one request id
     });
     const body = { fresh: true, cwd, agent: 'codex', accountId: 'codex-secondary',
       model: 'gpt-5.6-sol', requestId: 'standalone-request' };
-    const deps = { root, env, host, listHostPanes: async () => [], waitForHostAgent: async () => true,
-      waitForHostSessionId: async () => 'actual-standalone-session' };
+    let existingPanes = [];
+    const deps = { root, env, host, listHostPanes: async () => existingPanes, waitForHostAgent: async () => true,
+      readHostSessionId: async () => null,
+      waitForHostSessionId: async () => assert.fail('message-less standalone Codex must not wait for a first-turn session id') };
     const first = openSession(body, deps);
     await new Promise((resolve) => setImmediate(resolve));
     const second = openSession(body, deps);
@@ -3865,12 +3867,32 @@ test('standalone fresh agent launch uses the selected profile and one request id
     releaseSpawn();
     const [opened, joined] = await Promise.all([first, second]);
     assert.equal(spawns, 1); assert.equal(opened.pane, 'standalone-pane');
-    assert.equal(joined.sessionId, 'actual-standalone-session');
+    assert.equal(opened.sessionId, null); assert.equal(opened.pendingRegistration, true);
+    assert.equal(joined.sessionId, null); assert.equal(joined.pendingRegistration, true);
     const spawn = host.calls.find((call) => call.type === 'spawn').params;
     assert.equal(spawn.cwd, fs.realpathSync(cwd)); assert.equal(spawn.meta.card, null);
     assert.equal(spawn.meta.openRequestId, 'standalone-request'); assert.equal(spawn.meta.model, 'gpt-5.6-sol');
     const encoded = /'--profile' '([^']+)'/.exec(spawn.args[1])?.[1];
     assert.equal(JSON.parse(Buffer.from(encoded, 'base64url')).id, 'codex-secondary');
+
+    existingPanes = [{ id: 'standalone-pane', alive: true, agentAlive: true,
+      meta: { ...spawn.meta, sessionId: 'actual-standalone-session' } }];
+    const rebound = await openSession(body, deps);
+    assert.equal(rebound.existing, true); assert.equal(rebound.sessionId, 'actual-standalone-session');
+    assert.equal('pendingRegistration' in rebound, false); assert.equal(spawns, 1);
+
+    existingPanes = [{ id: 'strict-standalone-pane', alive: true, agentAlive: true,
+      meta: { ...spawn.meta, openRequestId: 'strict-standalone-request', sessionId: null } }];
+    const strictReused = await openSession({ ...body, requestId: 'strict-standalone-request', message: 'Begin.' }, deps);
+    assert.equal(strictReused.existing, true);
+    assert.equal('pendingRegistration' in strictReused, false);
+
+    await assert.rejects(openSession({ ...body, requestId: 'standalone-message-request', message: 'Begin.' }, {
+      ...deps, listHostPanes: async () => [],
+      waitForHostSessionId: async () => null,
+      typeOpeningMessage: async () => assert.fail('must not type before the session id is verified'),
+    }), (error) => error.status === 504 && /never registered its session id/.test(error.message));
+    assert.equal(spawns, 2);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -3947,6 +3969,7 @@ test('standalone post-spawn account pin failures retain the existing-pane receip
         requestId: `${agent}-pin-error-request` }, {
         host: recordingHost((type) => type === 'spawn' ? { pane: { id: pane, pid: 63, createdAt: 64 } } : {}),
         listHostPanes: async () => [], waitForHostAgent: async () => true,
+        readHostSessionId: async () => `${agent}-pin-error-session`,
         waitForHostSessionId: async () => `${agent}-pin-error-session`,
         pinSession: () => { throw new Error('ENOSPC: account registry write failed'); },
       }), (error) => error instanceof InjectionError && error.status === 502

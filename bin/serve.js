@@ -3789,16 +3789,21 @@ async function waitForHostAgent(target, agent, deps = {}) {
   });
 }
 
+async function readHostSessionId(pane, deps = {}) {
+  try {
+    const result = await hostRequest('get', { pane }, deps);
+    const sessionId = result && result.pane && result.pane.meta && result.pane.meta.sessionId;
+    return typeof sessionId === 'string' && /^[A-Za-z0-9_-]+$/.test(sessionId) ? sessionId : null;
+  } catch { return null; }
+}
+
 async function waitForHostSessionId(pane, deps = {}) {
   const now = deps.now || Date.now;
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const deadline = now() + 15000;
   while (now() < deadline) {
-    try {
-      const result = await hostRequest('get', { pane }, deps);
-      const sessionId = result && result.pane && result.pane.meta && result.pane.meta.sessionId;
-      if (typeof sessionId === 'string' && /^[A-Za-z0-9_-]+$/.test(sessionId)) return sessionId;
-    } catch {}
+    const sessionId = await readHostSessionId(pane, deps);
+    if (sessionId) return sessionId;
     await sleep(Math.min(250, Math.max(0, deadline - now())));
   }
   return null;
@@ -3959,6 +3964,9 @@ async function openSession(body, deps = {}) {
     account = body.accountId == null ? accounts.defaultFor(agent, deps.env || process.env) : accounts.get(body.accountId, deps.env || process.env);
     if (!account || account.agent !== agent) throw new InjectionError(400, `account ${body.accountId || '?'} is not a ${agent} account`);
   }
+  const allowPendingRegistration = freshStandalone && agent === 'codex' && !message
+    && !body.portableTransferId && !body.reviewQueueLaunchId
+    && !deps.onSessionReady && !deps.onOpeningReady && !deps.onOpeningDelivered;
   if (freshStandalone && body.requestId) {
     const panes = await (deps.listHostPanes || listHostPanes)(deps, true);
     if (!Array.isArray(panes)) {
@@ -3974,9 +3982,11 @@ async function openSession(body, deps = {}) {
           || (existing.meta?.model || '') !== launchModel) {
         throw new InjectionError(409, 'open request was already used for a different launch');
       }
+      const sessionId = existing.meta?.sessionId || null;
       return { ok: true, existing: true, focus: 'console', pane: existing.id,
-        sessionId: existing.meta?.sessionId || null, accountId: account.id, accountLabel: account.label,
-        agent, recoverable: existing.agentAlive === false };
+        sessionId, accountId: account.id, accountLabel: account.label,
+        agent, recoverable: existing.agentAlive === false,
+        ...(!sessionId && allowPendingRegistration ? { pendingRegistration: true } : {}) };
     }
   }
   let accountMcpConfig = '';
@@ -4102,7 +4112,10 @@ async function openSession(body, deps = {}) {
     await (deps.waitForHostAgent || waitForHostAgent)(target, agent,
       freshStandalone ? { ...deps, detectPortableSetup: true } : deps);
     launch.settled = true;
-    if (!launch.sessionId && (handoff || body.fresh && !body.taskId || deps.onSessionReady)) {
+    if (!launch.sessionId && allowPendingRegistration) {
+      launch.sessionId = await (deps.readHostSessionId || readHostSessionId)(launch.pane, deps);
+      if (!launch.sessionId) launch.pendingRegistration = true;
+    } else if (!launch.sessionId && (handoff || freshStandalone || deps.onSessionReady)) {
       launch.sessionId = await (deps.waitForHostSessionId || waitForHostSessionId)(launch.pane, deps);
       if (!launch.sessionId) {
         throw new InjectionError(504, `${agent} started in host pane ${launch.pane} but never registered its session id`);
