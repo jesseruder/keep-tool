@@ -23,7 +23,12 @@ function apply(env = process.env) {
   // Do not silently import another registry's settings into it.
   const value = env.KEEP_DIR && !env.KEEP_CONFIG ? {} : load(env);
   if (!env.KEEP_DIR && value.dataDir) {
+    // KEEP_DIR came from this config rather than from the caller. Preserve that
+    // provenance in the environment so later modules and child processes do not
+    // mistake the configured registry for an explicitly isolated one.
+    const file = configFile(env);
     env.KEEP_DIR = path.resolve(String(value.dataDir).replace(/^~(?=\/|$)/, os.homedir()));
+    if (!env.KEEP_CONFIG) env.KEEP_CONFIG = file;
   }
   for (const [key, entry] of Object.entries(value.env || {})) {
     if (!/^KEEP_[A-Z0-9_]+$/.test(key) || ['KEEP_DIR', 'KEEP_CONFIG', 'KEEP_ALLOW_PUSH'].includes(key)) {

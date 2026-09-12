@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 const accounts = require('./accounts');
 const launcher = require('./agent-launcher');
 
@@ -88,4 +89,51 @@ test('config rejects traversal ids and physical config directory aliases', () =>
     assert.equal(fs.readFileSync(f.env.KEEP_CONFIG, 'utf8'), before, 'an invalid candidate is never published');
     assert.equal(accounts.list(f.env).length, 4);
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('real CLI account bootstrap preserves the default config and refuses isolated mutation', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-accounts-cli-'));
+  try {
+    const home = path.join(root, 'home');
+    const registry = path.join(root, 'registry');
+    const secondary = path.join(root, 'claude-secondary');
+    const isolated = path.join(root, 'isolated');
+    const file = path.join(home, '.config', 'keep', 'config.json');
+    for (const dir of [path.dirname(file), path.join(registry, 'tasks'), secondary, path.join(isolated, 'tasks')]) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    const original = {
+      version: 1,
+      dataDir: registry,
+      env: { KEEP_PORT: 8123, KEEP_NO_PUSH: true },
+      scopes: { names: ['work', 'personal'], default: 'personal', rules: [{ path: '~/work', scope: 'work' }] },
+      projectCatalog: { 'keep-tool': { name: 'Keep Tool', h: 210 } },
+      modelBudgets: { fable: { inputPrice: 12, minHeadroom: 19 } },
+      unrelated: { future: ['preserve', 1] },
+    };
+    fs.writeFileSync(file, JSON.stringify(original, null, 2) + '\n', { mode: 0o600 });
+    const env = { ...process.env, HOME: home, KEEP_NO_PUSH: '1' };
+    for (const key of ['KEEP_DIR', 'KEEP_CONFIG', 'KEEP_SCOPES', 'KEEP_PROJECT_CATALOG', 'KEEP_MODEL_BUDGETS']) delete env[key];
+    const run = (extraEnv, ...args) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), ...args], {
+      env: { ...env, ...extraEnv }, encoding: 'utf8', timeout: 15000,
+    });
+    const added = run({}, 'accounts', 'add', 'claude-secondary', '--agent', 'claude', '--label', 'Claude secondary', '--config-dir', secondary);
+    assert.equal(added.status, 0, added.stderr);
+    assert.match(added.stdout, /added claude-secondary/);
+    const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+    for (const key of ['dataDir', 'env', 'scopes', 'projectCatalog', 'modelBudgets', 'unrelated']) {
+      assert.deepEqual(saved[key], original[key], `${key} survives account bootstrap`);
+    }
+    assert.deepEqual(saved.accounts.map((entry) => entry.id), ['claude/default', 'claude-secondary']);
+    assert.equal(saved.defaultAccounts.claude, 'claude/default');
+    const listed = run({}, 'accounts', 'list', '--json');
+    assert.equal(listed.status, 0, listed.stderr);
+    assert.equal(JSON.parse(listed.stdout).accounts.some((entry) => entry.id === 'claude-secondary'), true);
+
+    const beforeIsolatedAttempt = fs.readFileSync(file, 'utf8');
+    const refused = run({ KEEP_DIR: isolated }, 'accounts', 'add', 'must-not-write', '--agent', 'claude', '--label', 'No write', '--config-dir', path.join(root, 'other'));
+    assert.notEqual(refused.status, 0);
+    assert.match(refused.stderr, /account configuration changes require KEEP_CONFIG/);
+    assert.equal(fs.readFileSync(file, 'utf8'), beforeIsolatedAttempt, 'isolated KEEP_DIR cannot overwrite the default configuration');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

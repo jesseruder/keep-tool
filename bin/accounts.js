@@ -271,6 +271,9 @@ function publicState(env = process.env) {
 }
 
 function writeConfig(config, env = process.env) {
+  if (env.KEEP_DIR && !env.KEEP_CONFIG) {
+    throw new Error('account configuration changes require KEEP_CONFIG when KEEP_DIR is explicitly set');
+  }
   const file = require('./config').configFile(env);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
