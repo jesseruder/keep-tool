@@ -340,8 +340,10 @@ function currentSession() {
   return null;
 }
 
-function delegationDependencies() {
-  return { loadTask, parsePlan };
+function delegationDependencies(options = {}) {
+  // Command attribution may run while Keep's registry lock is already held.
+  // Keep it read-only; lifecycle entry points persist stale state under that lock.
+  return { loadTask, parsePlan, persist: false, ...options };
 }
 
 function currentDelegation() {
@@ -1928,7 +1930,8 @@ commands.delegate = async (argv, deps = {}) => {
     const assigned = currentDelegation();
     if (['pending', 'invalid', 'identity-mismatch'].includes(assigned.kind)) die(delegation.describe(assigned));
     if (!assigned.record || assigned.explicit) die('the current session has no delegation to end');
-    delegation.end(ROOT, assigned.record, 'worker ended delegation');
+    try { withLock(() => delegation.end(ROOT, assigned.record, 'worker ended delegation')); }
+    catch (error) { die(error.message); }
     console.log(`ended delegation ${assigned.record.id} for ${assigned.record.card} step ${assigned.record.step.number}`);
     return;
   }
@@ -1937,15 +1940,18 @@ commands.delegate = async (argv, deps = {}) => {
     if (o._.length || command.length || o.step || o.prepare || o.session || o.agent) {
       die('usage: keep delegate --accept <delegation-id>');
     }
-    const pending = delegation.read(ROOT, o.accept);
-    if (!pending) die(`unknown delegation ${o.accept}`);
-    const pendingState = delegation.state(ROOT, pending, delegationDependencies());
-    if (pendingState.kind === 'stale') die(delegation.describe(pendingState));
     let worker;
-    try { worker = delegation.acceptSession(pending, process.env); }
-    catch (error) { die(error.message); }
     let bound;
-    try { bound = delegation.bind(ROOT, pending.id, worker, { source: 'accept' }); }
+    try {
+      bound = withLock(() => {
+        const pending = delegation.read(ROOT, o.accept);
+        if (!pending) throw new Error(`unknown delegation ${o.accept}`);
+        const pendingState = delegation.state(ROOT, pending, delegationDependencies({ persist: true }));
+        if (pendingState.kind === 'stale') throw new Error(delegation.describe(pendingState));
+        worker = delegation.acceptSession(pending, process.env);
+        return delegation.bind(ROOT, pending.id, worker, { source: 'accept' });
+      });
+    }
     catch (error) { die(error.message); }
     console.log(`accepted delegation ${bound.id}: ${bound.card} step ${bound.step.number} as ${worker.agent} session ${worker.id}`);
     return;
@@ -1969,13 +1975,22 @@ commands.delegate = async (argv, deps = {}) => {
 
   const parent = commandSession();
   if (!parent || !delegation.SESSION_RE.test(parent.id)) die('keep delegate needs a current Claude or Codex parent session');
-  let task;
-  try { task = loadTask(o._[0]); } catch { die(`no task "${o._[0]}"`); }
-  let step;
-  try { step = delegation.snapshot(task, o.step, parsePlan); }
-  catch (error) { die(error.message); }
   let record;
-  try { record = delegation.create(ROOT, { card: task.id, step, parent }); }
+  try {
+    record = withLock(() => {
+      let task;
+      try { task = loadTask(o._[0]); } catch { throw new Error(`no task "${o._[0]}"`); }
+      const step = delegation.snapshot(task, o.step, parsePlan);
+      const created = delegation.create(ROOT, { card: task.id, step, parent });
+      if (!o.session) return created;
+      try {
+        return delegation.bind(ROOT, created.id, { id: o.session, agent: o.agent }, { source: 'registered' });
+      } catch (error) {
+        delegation.end(ROOT, created, `binding failed: ${error.message}`);
+        throw error;
+      }
+    });
+  }
   catch (error) { die(error.message); }
 
   if (o.prepare) {
@@ -1984,13 +1999,7 @@ commands.delegate = async (argv, deps = {}) => {
     return;
   }
   if (o.session) {
-    let bound;
-    try { bound = delegation.bind(ROOT, record.id, { id: o.session, agent: o.agent }, { source: 'registered' }); }
-    catch (error) {
-      delegation.end(ROOT, record, `binding failed: ${error.message}`);
-      die(error.message);
-    }
-    console.log(`registered delegation ${bound.id}: ${bound.card} step ${bound.step.number} to ${o.agent} session ${o.session}`);
+    console.log(`registered delegation ${record.id}: ${record.card} step ${record.step.number} to ${o.agent} session ${o.session}`);
     return;
   }
 
@@ -2010,7 +2019,7 @@ commands.delegate = async (argv, deps = {}) => {
       stdio: 'inherit',
     });
   } catch (error) {
-    delegation.end(ROOT, record, `launch failed: ${error.message}`);
+    try { withLock(() => delegation.end(ROOT, record, `launch failed: ${error.message}`)); } catch {}
     die(`could not launch delegated command: ${error.message}`);
   }
   const result = await new Promise((resolve) => {
@@ -2018,7 +2027,7 @@ commands.delegate = async (argv, deps = {}) => {
     child.once('exit', (code, signal) => resolve({ code, signal }));
   });
   if (result.error) {
-    delegation.end(ROOT, record, `launch failed: ${result.error.message}`);
+    try { withLock(() => delegation.end(ROOT, record, `launch failed: ${result.error.message}`)); } catch {}
     die(`could not launch delegated command: ${result.error.message}`);
   }
   if (result.signal) process.exitCode = 1;
@@ -2055,7 +2064,8 @@ commands.claim = (argv) => {
     die(`cannot claim ${id} outside its project (${linked.project}); run it from the project, or repair metadata explicitly with keep link ${id} --session ${session.id} --agent ${session.agent}`);
   }
   if ((assigned.kind === 'active' || assigned.kind === 'stale' || (assigned.kind === 'ended' && !assigned.explicit)) && assigned.record) {
-    delegation.end(ROOT, assigned.record, `claimed ${id}`);
+    try { withLock(() => delegation.end(ROOT, assigned.record, `claimed ${id}`)); }
+    catch (error) { die(error.message); }
   }
   console.log(`${id} claimed by current ${session.agent} session ${session.id}`);
 };
@@ -4458,7 +4468,10 @@ function codexHook(kind, input) {
     const pending = recordSessionPane(input, 'codex');
     let delegationStatus = { kind: 'none' };
     try {
-      delegationStatus = delegation.registerStart(ROOT, { id: input.session_id, agent: 'codex' }, process.env, delegationDependencies());
+      delegationStatus = withLock(() => delegation.registerStart(
+        ROOT, { id: input.session_id, agent: 'codex' }, process.env,
+        delegationDependencies({ persist: true }),
+      ));
     } catch {}
     recordCodexParent(input);
     if (codexStopState(input)) initializeStopCheck(input);
@@ -4466,7 +4479,7 @@ function codexHook(kind, input) {
   }
   if (kind === 'end') {
     clearCompletionMarker(input, 'codex');
-    try { delegation.markProcessEnd(ROOT, { id: input.session_id, agent: 'codex' }); } catch {}
+    try { withLock(() => delegation.markProcessEnd(ROOT, { id: input.session_id, agent: 'codex' })); } catch {}
     return;
   }
   if (kind === 'client-end') {
@@ -4670,7 +4683,7 @@ commands.hook = async (argv) => {
     // task state and unresolved permission/question markers remain untouched.
     try { clearCompletionMarker(input, 'claude'); } catch {}
     try { await releaseSessionPane(input); } catch {}
-    try { delegation.markProcessEnd(ROOT, { id: input.session_id, agent: 'claude' }); } catch {}
+    try { withLock(() => delegation.markProcessEnd(ROOT, { id: input.session_id, agent: 'claude' })); } catch {}
     // A reviewer that exits is tombstoned, not deleted: the scheduler must stop
     // ticking a dead pane, but a later `claude --resume` of this session (which
     // lacks KEEP_REVIEWER in its env) still needs the marker to keep its identity -
@@ -4734,7 +4747,10 @@ commands.hook = async (argv) => {
   try { await recordSessionPane(input); } catch {}
   let delegationStatus = { kind: 'none' };
   try {
-    delegationStatus = delegation.registerStart(ROOT, { id: input.session_id, agent: 'claude' }, process.env, delegationDependencies());
+    delegationStatus = withLock(() => delegation.registerStart(
+      ROOT, { id: input.session_id, agent: 'claude' }, process.env,
+      delegationDependencies({ persist: true }),
+    ));
   } catch {}
   try { initializeStopCheck(input); } catch {}
   const cwd = input.cwd || process.cwd();
@@ -5672,7 +5688,9 @@ function stopHook(input, agent = 'claude') {
   // 30% of those got a bare "yes" from Owner. If the card already grants every
   // action the question is about, the answer is on the card, not in his inbox.
   const asked = stopAskedQuestion(transcriptState);
-  const assigned = delegation.resolveForCommand(ROOT, process.env, { id: sid, agent }, delegationDependencies());
+  const assigned = withLock(() => delegation.resolveForCommand(
+    ROOT, process.env, { id: sid, agent }, delegationDependencies({ persist: true }),
+  ));
   // A human question remains a handoff even when the worker's assignment went
   // stale. Otherwise valid delegations suppress every ownership/check-in nag and
   // all parent-card auto-continuation, including permission-grant continuation.

@@ -100,6 +100,15 @@ test('wrapper transports an exact assignment into SessionStart without changing 
 test('prepare/accept and known-session registration bind parallel workers to distinct snapshots', () => {
   const f = fixture();
   try {
+    const oldCard = f.addPlan('Older delegated card');
+    const oldRegistration = f.run(
+      ['delegate', oldCard, '--step', '1', '--session', 'parent-claude', '--agent', 'claude'],
+      { CODEX_THREAD_ID: 'grandparent-codex' },
+    );
+    assert.equal(oldRegistration.status, 0, oldRegistration.stderr);
+    const oldEnd = f.run(['delegate', '--end'], { CLAUDE_CODE_SESSION_ID: 'parent-claude' });
+    assert.equal(oldEnd.status, 0, oldEnd.stderr);
+
     const card = f.addPlan();
     const prepared = f.run(['delegate', card, '--step', '1', '--prepare'], { CLAUDE_CODE_SESSION_ID: 'parent-claude' });
     assert.equal(prepared.status, 0, prepared.stderr);
@@ -128,7 +137,7 @@ test('prepare/accept and known-session registration bind parallel workers to dis
 
     const registered = f.run(['delegate', card, '--step', '2', '--session', 'worker-two', '--agent', 'codex'], { CODEX_THREAD_ID: 'parent-session' });
     assert.equal(registered.status, 0, registered.stderr);
-    const records = f.readDelegations().sort((a, b) => a.step.number - b.step.number);
+    const records = f.readDelegations().filter((record) => record.card === card).sort((a, b) => a.step.number - b.step.number);
     assert.deepEqual(records.map((record) => [record.step.number, record.worker.id]), [[1, 'worker-one'], [2, 'worker-two']]);
 
     const self = f.run(['delegate', card, '--step', '1', '--session', 'parent-session', '--agent', 'codex'], { CODEX_THREAD_ID: 'parent-session' });
