@@ -163,6 +163,28 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .account-menu .btn small { color: var(--faint); font-size: 10px; }
 .handoff-status, .handoff-error { align-self: center; color: var(--muted); font-size: 11px; white-space: nowrap; }
 .handoff-error { color: var(--bad); }
+.session-launch-dialog { width: min(560px, calc(100vw - 32px)); max-width: none; padding: 0; border: 1px solid var(--line-2); border-radius: 10px; background: var(--panel); color: var(--text); box-shadow: var(--shadow); }
+.session-launch-dialog::backdrop { background: rgb(0 0 0 / .55); }
+.session-launch-card > header { display: flex; justify-content: space-between; gap: 20px; padding: 20px 22px 14px; border-bottom: 1px solid var(--line); }
+.session-launch-card header h2 { margin: 1px 0 5px; font-size: 20px; }
+.session-launch-card header p { margin: 0; color: var(--muted); line-height: 1.4; }
+.session-launch-card .eyebrow { color: var(--info); font: 500 10px var(--mono); text-transform: uppercase; letter-spacing: .09em; }
+.session-launch-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 18px 22px; }
+.session-launch-fields label, .session-launch-value { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 12px; min-width: 0; }
+.session-launch-fields label > span, .session-launch-value > span { color: var(--faint); font-size: 10px; }
+.session-launch-fields select, .session-launch-fields input { width: 100%; padding: 8px 9px; border: 1px solid var(--line-2); border-radius: 5px; background: var(--panel-2); color: var(--text); }
+.session-launch-value strong { color: var(--text); overflow-wrap: anywhere; }
+.session-launch-fields .wide { grid-column: 1 / -1; }
+.session-launch-error { margin: 0 22px 14px; color: var(--bad); }
+.session-launch-card > footer { display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 12px 22px 18px; border-top: 1px solid var(--line); }
+.session-launch-card > footer > :first-child { margin-right: auto; }
+@media (max-width: 560px) {
+  .session-launch-dialog { width: calc(100vw - 16px); }
+  .session-launch-fields { grid-template-columns: 1fr; padding-inline: 14px; }
+  .session-launch-fields .wide { grid-column: auto; }
+  .session-launch-card > header, .session-launch-card > footer { padding-inline: 14px; }
+  .session-launch-error { margin-inline: 14px; }
+}
 .portable-transfer-controls { display: inline-flex; align-items: center; }
 .portable-transfer { flex-direction: column; align-items: flex-start; gap: 1px; text-align: left; line-height: 1.15; }
 .portable-transfer small { color: var(--faint); font-size: 9px; }

@@ -222,17 +222,17 @@ export function installWatchControls(ctx) {
     if (!cwd) { ctx.toast('No known project directory'); return; }
     button.disabled = true;
     button.blur();
-    ctx.state.pendingFocus = true;
     try {
-      const pane = await ctx.startShell(cwd);
-      if (!currentLayout(ctx).ids.includes(pane.id)) currentLayout(ctx).ids.push(pane.id);
-      ctx.state.focusPane = pane.id;
-      ctx.refresh();
-      await ctx.saveLayouts();
-      await ctx.reload();
-      ctx.toast(`Shell started in ${ctx.projectOf(cwd).name}`);
-    } catch (error) { ctx.toast(error.message); }
-    finally { button.disabled = false; ctx.state.pendingFocus = false; }
+      await ctx.newSession(cwd, ctx.projectOf(cwd).name, async (pane, selection) => {
+        if (!currentLayout(ctx).ids.includes(pane.id)) currentLayout(ctx).ids.push(pane.id);
+        ctx.state.focusPane = pane.id;
+        ctx.refresh();
+        await ctx.saveLayouts();
+        await ctx.reload();
+        const kind = selection.kind === 'shell' ? 'Shell' : selection.kind === 'claude' ? 'Claude Code' : 'Codex';
+        ctx.toast(`${kind} opened in ${ctx.projectOf(cwd).name}`);
+      });
+    } finally { button.disabled = false; }
   });
 }
 import { closeSession } from './close-session.js';

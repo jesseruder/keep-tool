@@ -190,6 +190,16 @@ test('Watch can retry an interrupted handoff after its target pane exits', async
   await expect(pane.locator('.account-label')).toHaveText('Claude Two');
 });
 
+test('open-only recovery is labeled as a reopen and never as continuation', async ({ page }) => {
+  fixture.state.handoffs.push({ id: 'open-only-recovery', sessionId: 'a', pane: 'pa', sourceAccountId: 'claude-main',
+    targetAccountId: 'claude-two', intent: 'open-only', status: 'recovery-needed', phase: 'launching', reason: 'Fixture interruption' });
+  fixture.publish();
+  await expect(page.locator('#stage .handoff-error')).toHaveText('Reopen interrupted');
+  await page.locator('#stage [data-handoff-account="claude-two"]').click();
+  await expect(page.locator('#toast')).toContainText('Opened on Claude Two');
+  await expect(page.locator('#toast')).not.toContainText('Continued');
+});
+
 test('dragging off a pressed row cancels navigation and releases queued renders', async ({ page }) => {
   await down(page, '#qlist [data-key="running:b"] .t');
   await updateDuringPress(page, () => fixture.update('b', { state: 'waiting', title: 'B after cancelled click' }));

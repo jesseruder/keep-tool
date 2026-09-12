@@ -77,6 +77,7 @@ export async function openSession(body) {
     throw error;
   } finally { clearTimeout(timer); }
 }
+export const reopenSession = (body) => write('/api/reopen-session', body);
 
 export async function putLayouts(layouts) {
   await write('/api/layouts', { layouts }, 'PUT');

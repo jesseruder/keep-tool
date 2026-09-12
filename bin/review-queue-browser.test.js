@@ -29,6 +29,7 @@ test('isolated browser: review queue decisions, drafts, notification links, and 
     generatedAt: 1,
     sessions: [], panes: [], tasks: [], attention: [], notifications: [{ id: 'notice-find', at: now, text: finding.title, from: 'Reviewer', caller: 'reviewer', card: finding.card, findingKey: 'key-one', read: false }, { id: 'notice-ambiguous', at: now - 1, text: 'Finding without a durable key', from: 'Reviewer', caller: 'reviewer', card: finding.card, read: false }],
     setAside: {}, health: {}, usage: {}, review: { events: [], stats: {} }, limitResume: {},
+    accounts: [{ id: 'claude-main', agent: 'claude', label: 'Claude Main', isDefault: true }],
     reviewQueue: { items: [idea, finding, partial, siblingFinding, lost, later], counts: { 'needs-decision': 5, 'in-progress': 0, resolved: 0 } },
   };
   const completedRequests = new Map();
@@ -169,29 +170,34 @@ test('isolated browser: review queue decisions, drafts, notification links, and 
     await evaluate("(()=>{const sort=document.querySelector('[data-review-sort]'); sort.value='project'; sort.dispatchEvent(new Event('change',{bubbles:true}))})()");
     assert.deepEqual(await evaluate("[...document.querySelectorAll('[data-review-item]')].map(node=>node.dataset.reviewItem)"), ['idea:lost-response', 'idea:card-idea', 'idea:partial-start'], 'Project sort is alphabetical');
     await evaluate("(()=>{const sort=document.querySelector('[data-review-sort]'); sort.value='newest'; sort.dispatchEvent(new Event('change',{bubbles:true}))})()");
-    await evaluate("document.querySelector('[data-review-item=\"idea:partial-start\"]').click(); document.querySelector('[data-review-action=start]').click()");
+    await evaluate("document.querySelector('[data-review-item=\"idea:partial-start\"]').click(); document.querySelector('[data-review-action=start]').click(); document.querySelector('.session-launch-card').requestSubmit()");
     await wait("document.querySelector('[data-review-detail]')?.dataset.reviewDetail === 'idea:partial-start' && document.querySelector('.review-status')?.textContent === 'In progress' && document.querySelector('[data-review-session=partial-session]')");
+    await evaluate("document.querySelector('.session-launch-dialog [data-launch-cancel]').click()");
     assert.equal(await evaluate("document.querySelectorAll('[data-review-retry], [data-review-recover], [data-review-action]').length"), 0, 'ambiguous partial start offers only its existing conversation');
     await evaluate("document.querySelector('[data-review-filter=\"needs-decision\"]').click()");
     await evaluate("document.querySelector('[data-review-type=finding]').click()");
-    siblingFinding.launchState = { state: 'opening', sessionId: 'reserved-session', requestId: 'reserved-request', action: 'discuss', recoverable: true, at: Date.now() };
+    siblingFinding.launchState = { state: 'opening', sessionId: 'reserved-session', requestId: 'reserved-request', action: 'discuss', recoverable: true,
+      agent: 'claude', accountId: 'claude-main', model: 'claude-fable-5-1', at: Date.now() };
     for (const client of eventClients) client.write('data: changed\n\n');
     await evaluate("document.querySelector('[data-review-item=\"finding:card-find:key-two\"]').click()");
     await wait("document.querySelector('.review-action-pending')?.textContent.includes('Opening conversation')");
     assert.equal(await evaluate("document.querySelectorAll('[data-review-action]').length"), 0, 'durable opening state prevents a duplicate launch or mutation');
-    siblingFinding.launchState = { state: 'needs-attention', sessionId: 'reserved-session', requestId: 'reserved-request', action: 'discuss', recoverable: true, at: Date.now(), message: 'Opening was interrupted.' };
+    siblingFinding.launchState = { state: 'needs-attention', sessionId: 'reserved-session', requestId: 'reserved-request', action: 'discuss', recoverable: true,
+      agent: 'claude', accountId: 'claude-main', model: 'claude-fable-5-1', at: Date.now(), message: 'Opening was interrupted.' };
     for (const client of eventClients) client.write('data: changed\n\n');
     await wait("document.querySelector('.review-action-error')?.textContent.includes('Opening was interrupted') && document.querySelector('[data-review-session=reserved-session]') && document.querySelector('[data-review-recover]')");
     await evaluate("document.querySelector('[data-review-recover]').click()");
     await wait("document.querySelector('#triage').classList.contains('on')");
     const recoveryPost = posts.find((row) => row.requestId === 'reserved-request');
     assert.equal(recoveryPost.action, 'discuss', 'recovery reuses the durable action and request ID');
+    assert.deepEqual({ agent: recoveryPost.agent, accountId: recoveryPost.accountId, model: recoveryPost.model },
+      { agent: 'claude', accountId: 'claude-main', model: 'claude-fable-5-1' }, 'recovery reuses the frozen launch selection');
     await evaluate("document.querySelector('[data-mode=review-queue]').click(); document.querySelector('[data-review-item=\"finding:card-find:key-two\"]').click()");
     await wait("document.querySelector('[data-review-action=defer]') && !document.querySelector('[data-review-recover]')");
     await evaluate("document.querySelector('[data-review-type=idea]').click(); window.fixtureFetch=window.fetch; window.dropReviewResponse=true; window.fetch=async (...args)=>{const response=await window.fixtureFetch(...args); const request=args[1] && JSON.parse(args[1].body || '{}'); if(window.dropReviewResponse && args[0]==='/api/review-queue' && request.id==='idea:lost-response'){window.dropReviewResponse=false; throw new TypeError('simulated lost response')} return response}");
-    await evaluate("document.querySelector('[data-review-item=\"idea:lost-response\"]').click(); document.querySelector('[data-review-action=discuss]').click()");
-    await wait("document.querySelector('[data-review-retry]')");
-    await evaluate("document.querySelector('[data-review-retry]').click()");
+    await evaluate("document.querySelector('[data-review-item=\"idea:lost-response\"]').click(); document.querySelector('[data-review-action=discuss]').click(); document.querySelector('.session-launch-card').requestSubmit()");
+    await wait("document.querySelector('.session-launch-dialog [role=alert]')");
+    await evaluate("document.querySelector('.session-launch-card').requestSubmit()");
     await wait("document.querySelector('#triage').classList.contains('on')");
     const discussPosts = posts.filter((row) => row.id === 'idea:lost-response' && row.action === 'discuss');
     assert.equal(discussPosts.length, 2);
@@ -234,7 +240,7 @@ test('isolated browser: review queue decisions, drafts, notification links, and 
     await wait("document.querySelector('.review-action-pending')?.textContent === 'Saving…'");
     await wait("document.querySelectorAll('[data-review-item]').length === 1");
     assert.equal(posts.filter((row) => row.action === 'defer').length, 1);
-    await evaluate("document.querySelector('[data-review-type=idea]').click(); document.querySelector('[data-review-item=\"idea:card-idea\"]').click(); document.querySelector('[data-review-action=start]').click(); document.querySelector('[data-review-action=start]')?.click()");
+    await evaluate("document.querySelector('[data-review-type=idea]').click(); document.querySelector('[data-review-item=\"idea:card-idea\"]').click(); document.querySelector('[data-review-action=start]').click(); document.querySelector('.session-launch-card').requestSubmit(); document.querySelector('.session-launch-card').requestSubmit()");
     await wait("document.querySelector('#triage').classList.contains('on')");
     assert.equal(posts.filter((row) => row.id === 'idea:card-idea' && row.action === 'start').length, 1, 'double click launches once');
     await evaluate("document.querySelector('[data-mode=review-queue]').click(); document.querySelector('[data-review-filter=in-progress]').click(); document.querySelector('[data-review-item=\"idea:card-idea\"]').click()");

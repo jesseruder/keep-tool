@@ -14,6 +14,8 @@ async function createFixture() {
   let revision = 0, ticks = 0, timer;
   let closeDelay = 1200, closeFails = false, layoutFails = false;
   let handoffRecoversOnce = false;
+  let openDelay = 0, openFailsAfterSpawn = false, reopenFails = false, reviewFailsOnce = false, launchSequence = 0;
+  const openRequests = new Map();
   const sessions = Array.from({ length: 12 }, (_, i) => {
     const id = String.fromCharCode(97 + i);
     return { id, kind: i % 2 ? 'codex' : 'claude', title: `Session ${id.toUpperCase()}`, project: repo,
@@ -40,9 +42,10 @@ async function createFixture() {
   const portablePreviews = new Map([['portable-one', '# Existing CLI portable package\n']]);
   const portableInputs = new Map();
   let portableSequence = 0;
-  const state = { sessions, panes, tasks: sessions.map(s => ({ id: s.taskId, fm: { tags: ['personal'] } })), attention: [],
+  const state = { sessions, panes, tasks: sessions.map(s => ({ id: s.taskId, fm: { project: repo, tags: ['personal'] } })), attention: [],
     accounts, handoffs: [], setAside: {}, health: { daemon: { running: true } }, usage: { accounts: usageAccounts,
       claude: { limits: [{ label: 'legacy claude', percent: 99 }] }, codex: { windows: [{ label: 'legacy codex', percent: 99 }] } }, review: { events: [], stats: {} }, limitResume: {} };
+  state.reviewQueue = { items: [], counts: { 'needs-decision': 0, 'in-progress': 0, resolved: 0 } };
   const record = (event, detail = {}) => { events.push({ at: Date.now(), event, ...detail }); if (events.length > 5000) events.shift(); };
   const publish = () => { revision++; record('state', { revision, sessions: sessions.map(s => ({ id: s.id, state: s.state })) }); for (const client of clients) client.write('data: changed\n\n'); };
   function update(id, patch) { Object.assign(sessions.find(s => s.id === id), patch); publish(); }
@@ -79,6 +82,10 @@ async function createFixture() {
         if ('closeFails' in input) closeFails = Boolean(input.closeFails);
         if ('layoutFails' in input) layoutFails = Boolean(input.layoutFails);
         if ('handoffRecoversOnce' in input) handoffRecoversOnce = Boolean(input.handoffRecoversOnce);
+        if (Number.isFinite(input.openDelay)) openDelay = Math.max(0, Math.min(10000, input.openDelay));
+        if ('openFailsAfterSpawn' in input) openFailsAfterSpawn = Boolean(input.openFailsAfterSpawn);
+        if ('reopenFails' in input) reopenFails = Boolean(input.reopenFails);
+        if ('reviewFailsOnce' in input) reviewFailsOnce = Boolean(input.reviewFailsOnce);
         if (input.id && sessions.some(s => s.id === input.id)) update(input.id, input.patch || {});
         json({ ok: true, revision }); return;
       }
@@ -108,6 +115,77 @@ async function createFixture() {
             ...(portableInputs.has(transfer.id) ? { inputs: portableInputs.get(transfer.id) } : {}) }); return;
         }
         if (url.pathname === '/api/state') { json(state); return; }
+        if (url.pathname === '/api/panes/spawn' && req.method === 'POST') {
+          const id = `shell-${++launchSequence}`;
+          const pane = { id, pid: 700 + launchSequence, alive: true, cwd: input.cwd,
+            meta: { agent: 'shell', title: input.name || 'shell', project: input.cwd } };
+          panes.push(pane); publish(); json({ ok: true, pane }); return;
+        }
+        if (url.pathname === '/api/open' && req.method === 'POST') {
+          const account = accounts.find(candidate => candidate.id === input.accountId);
+          if (!account || account.agent !== input.agent) { json({ error: 'Explicit account does not match the selected provider' }, 409); return; }
+          if (input.requestId && openRequests.has(input.requestId)) {
+            const prior = openRequests.get(input.requestId);
+            if (openDelay) await new Promise(resolve => setTimeout(resolve, openDelay));
+            json({ ok: true, existing: true, focus: 'console', ...prior }); return;
+          }
+          const existing = input.sessionId ? sessions.find(candidate => candidate.id === input.sessionId) : null;
+          const id = existing?.id || `opened-${++launchSequence}`;
+          const paneId = existing?.pane && panes.find(candidate => candidate.id === existing.pane)?.alive ? existing.pane : `open-pane-${launchSequence}`;
+          let session = existing;
+          if (!session) {
+            session = { id, kind: input.agent, title: input.taskId ? `Card ${input.taskId}` : `${account.label} session`,
+              project: input.cwd || repo, taskId: input.taskId, pane: paneId, accountId: account.id, accountLabel: account.label,
+              model: input.model || '', mtime: Date.now(), lastUserAt: Date.now(), state: 'running', endedTurn: false };
+            sessions.push(session);
+          } else Object.assign(session, { pane: paneId, accountId: account.id, accountLabel: account.label, state: 'running', exited: false });
+          let pane = panes.find(candidate => candidate.id === paneId);
+          if (!pane) {
+            pane = { id: paneId, pid: 700 + launchSequence, alive: true, cwd: session.project || repo,
+              meta: { agent: input.agent, sessionId: session.id, accountId: account.id, accountLabel: account.label,
+                project: session.project || repo, openRequestId: input.requestId } };
+            panes.push(pane);
+          } else pane.alive = true;
+          const launch = { pane: pane.id, sessionId: session.id, accountId: account.id, accountLabel: account.label,
+            agent: account.agent, recoverable: true };
+          if (input.requestId) openRequests.set(input.requestId, launch);
+          publish();
+          if (openDelay) await new Promise(resolve => setTimeout(resolve, openDelay));
+          if (openFailsAfterSpawn) { openFailsAfterSpawn = false; json({ error: 'Fixture setup needs attention', code: 'OPEN_EXISTING_PANE', launch }, 503); return; }
+          json({ ok: true, ...launch }); return;
+        }
+        if (url.pathname === '/api/reopen-session' && req.method === 'POST') {
+          const session = sessions.find(candidate => candidate.id === input.sessionId);
+          const account = accounts.find(candidate => candidate.id === input.accountId);
+          if (!session || !account || account.agent !== session.kind) { json({ error: 'Unsafe fixture reopen' }, 409); return; }
+          if (reopenFails) { json({ error: 'Fixture reopen failed; source remains available' }, 409); return; }
+          const old = panes.find(candidate => candidate.id === session.pane);
+          if (old) old.alive = false;
+          const paneId = `reopen-${++launchSequence}`;
+          session.pane = paneId; session.accountId = account.id; session.accountLabel = account.label;
+          session.state = 'running'; session.exited = false;
+          panes.push({ id: paneId, pid: 800 + launchSequence, alive: true, cwd: session.project,
+            meta: { agent: session.kind, sessionId: session.id, accountId: account.id, accountLabel: account.label, project: session.project } });
+          publish(); json({ ok: true, pane: paneId, sessionId: session.id, accountId: account.id, accountLabel: account.label, agent: session.kind }); return;
+        }
+        if (url.pathname === '/api/review-queue' && req.method === 'POST') {
+          const item = state.reviewQueue.items.find(candidate => candidate.id === input.id);
+          if (!item) { json({ error: 'Unknown review item' }, 404); return; }
+          if (reviewFailsOnce) { reviewFailsOnce = false; json({ error: 'Fixture review launch failed' }, 503); return; }
+          if (['start', 'discuss'].includes(input.action)) {
+            const account = accounts.find(candidate => candidate.id === input.accountId);
+            if (!account || account.agent !== input.agent) { json({ error: 'Review launch needs an explicit matching account' }, 409); return; }
+            const id = `review-${++launchSequence}`, pane = `review-pane-${launchSequence}`;
+            item.sessions ||= []; item.sessions.push({ id, action: input.action, at: Date.now() });
+            if (input.action === 'start') item.status = 'in-progress';
+            sessions.push({ id, kind: input.agent, title: item.title, project: item.project || repo, taskId: item.card,
+              pane, accountId: account.id, accountLabel: account.label, model: input.model || '', mtime: Date.now(), state: 'running' });
+            panes.push({ id: pane, pid: 900 + launchSequence, alive: true, cwd: item.project || repo,
+              meta: { agent: input.agent, sessionId: id, accountId: account.id, accountLabel: account.label } });
+            publish(); json({ ok: true, sessionId: id, item }); return;
+          }
+          json({ ok: true, item }); return;
+        }
         if (url.pathname === '/api/layouts') {
           if (req.method === 'PUT') { if (layoutFails) { json({ error: 'Fixture layout failure' }, 500); return; } layouts = input.layouts; }
           json({ layouts }); return;
@@ -257,7 +335,7 @@ async function createFixture() {
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   return { url: `http://127.0.0.1:${server.address().port}`, events, state, portableTransfers, update, publish, churn,
-    configure: options => { if ('closeDelay' in options) closeDelay = options.closeDelay; if ('closeFails' in options) closeFails = options.closeFails; if ('layoutFails' in options) layoutFails = options.layoutFails; if ('handoffRecoversOnce' in options) handoffRecoversOnce = options.handoffRecoversOnce; },
+    configure: options => { if ('closeDelay' in options) closeDelay = options.closeDelay; if ('closeFails' in options) closeFails = options.closeFails; if ('layoutFails' in options) layoutFails = options.layoutFails; if ('handoffRecoversOnce' in options) handoffRecoversOnce = options.handoffRecoversOnce; if ('openDelay' in options) openDelay = options.openDelay; if ('openFailsAfterSpawn' in options) openFailsAfterSpawn = options.openFailsAfterSpawn; if ('reopenFails' in options) reopenFails = options.reopenFails; if ('reviewFailsOnce' in options) reviewFailsOnce = options.reviewFailsOnce; },
     async close() { clearInterval(timer); for (const c of clients) c.end(); for (const c of sockets.clients) c.terminate(); sockets.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); fs.rmSync(repo, { recursive: true, force: true }); },
   };
 }

@@ -24,7 +24,8 @@ export function renderFleet(ctx) {
       state: pane?.alive === false ? 'exited' : session.state || 'idle', stateLabel: pane?.alive === false ? 'Exited' : sessionLabel(session), kind: session.kind, reviewer: session.reviewer,
       taskId: session.taskId, branch: session.gitBranch || '', since: session.mtime, session: true,
       waiting: waitingBySession.get(session.id)?.kind || '', alive: Boolean(pane?.alive),
-      sessionId: session.id, agent: session.kind,
+      sessionId: session.id, agent: session.kind, accountId: session.accountId || pane?.meta?.accountId || '',
+      accountLabel: session.accountLabel || pane?.meta?.accountLabel || '',
     });
   }
   for (const pane of ctx.data.panes || []) {
@@ -38,7 +39,7 @@ export function renderFleet(ctx) {
       title: pane.meta?.title || pane.title || (agent === 'shell' ? 'shell' : 'exited session'),
       state: pane.alive ? 'running' : 'exited', kind: agent, branch: '', since: pane.createdAt,
       taskId: pane.meta?.card || '', session: false, waiting: '', alive: Boolean(pane.alive),
-      sessionId, agent,
+      sessionId, agent, accountId: pane.meta?.accountId || '', accountLabel: pane.meta?.accountLabel || '',
     });
   }
 
@@ -46,7 +47,7 @@ export function renderFleet(ctx) {
   const visible = rows.filter((row) => {
     if (!needle) return true;
     const project = ctx.projectOf(row.project);
-    return [row.title, row.id, row.taskId, project.name, project.key, project.path, row.branch]
+    return [row.title, row.id, row.taskId, project.name, project.key, project.path, row.branch, row.accountLabel, row.accountId]
       .some((value) => String(value || '').toLowerCase().includes(needle));
   });
   const groups = new Map();
@@ -56,16 +57,18 @@ export function renderFleet(ctx) {
     groups.get(project.key).rows.push(row);
   }
   const ordered = [...groups.values()].sort((a, b) => a.project.scope.localeCompare(b.project.scope) || a.project.name.localeCompare(b.project.name));
-  const table = visible.length ? `<table><thead><tr><th>State</th><th>Session / pane</th><th>Branch</th><th>Card</th><th>Waiting</th><th>Last activity</th><th>Kind</th><th></th></tr></thead><tbody>${ordered.map((group) => {
+  const table = visible.length ? `<table><thead><tr><th>State</th><th>Session / pane</th><th>Branch</th><th>Card</th><th>Waiting</th><th>Last activity</th><th>Kind</th><th>Account</th><th></th></tr></thead><tbody>${ordered.map((group) => {
     const waiting = group.rows.filter((row) => row.waiting).length;
     const sessions = group.rows.filter((row) => row.session).length;
-    return `<tr class="grp"><td colspan="8">${ctx.projectHTML(group.project.path, true)} <span class="group-meta">${sessions} session${sessions === 1 ? '' : 's'}${waiting ? ` · ${waiting} waiting` : ''}</span></td></tr>${group.rows.map((row) => {
+    return `<tr class="grp"><td colspan="9">${ctx.projectHTML(group.project.path, true)} <span class="group-meta">${sessions} session${sessions === 1 ? '' : 's'}${waiting ? ` · ${waiting} waiting` : ''}</span></td></tr>${group.rows.map((row) => {
       const pinned = ctx.isPanePinned(row.pane);
       const reopen = row.sessionId && !row.alive ? `<button class="btn" data-reopen="${ctx.esc(row.sessionId)}" data-agent="${ctx.esc(row.agent)}" data-title="${ctx.esc(row.title)}" data-stale="${ctx.esc(row.pane || '')}">Reopen</button>` : '';
       const closeIdle = row.session && row.alive
         ? `<button class="btn" data-close-idle="${ctx.esc(row.sessionId)}" data-pane="${ctx.esc(row.pane)}">Close</button>` : '';
       const remove = (row.pane && panes.get(row.pane)?.alive === false ? `<button class="btn" data-remove="${ctx.esc(row.pane)}">Remove</button>` : '') + closeIdle;
-      return `<tr><td><span class="st"><i class="${ctx.esc(row.state)}"></i>${ctx.esc(row.stateLabel || row.state)}</span></td><td>${ctx.esc(row.title)}${row.reviewer ? '<span class="rv">reviewer</span>' : ''} <span class="mono faint">${ctx.esc(row.id)}</span></td><td class="mono muted">${ctx.esc(row.branch)}</td><td class="mono info">${ctx.esc(row.taskId || '')}${ctx.tagsHTML(ctx.taskFor(row))}</td><td class="mono waiting-kind">${ctx.esc(row.waiting)}</td><td class="mono muted">${ctx.esc(ctx.rel(row.since))}</td><td class="mono ${row.kind === 'codex' ? 'kind-codex' : ''}">${ctx.esc(row.kind)}</td><td><button class="btn" data-pin="${ctx.esc(row.pane || '')}" data-title="${ctx.esc(row.title)}" ${row.alive && !pinned ? '' : 'disabled'}>${pinned ? 'Pinned' : 'Pin'}</button>${reopen}${remove}</td></tr>`;
+      const configured = (ctx.data.accounts || []).find((account) => account.id === row.accountId);
+      const account = row.accountLabel || configured?.label || row.accountId;
+      return `<tr><td><span class="st"><i class="${ctx.esc(row.state)}"></i>${ctx.esc(row.stateLabel || row.state)}</span></td><td>${ctx.esc(row.title)}${row.reviewer ? '<span class="rv">reviewer</span>' : ''} <span class="mono faint">${ctx.esc(row.id)}</span></td><td class="mono muted">${ctx.esc(row.branch)}</td><td class="mono info">${ctx.esc(row.taskId || '')}${ctx.tagsHTML(ctx.taskFor(row))}</td><td class="mono waiting-kind">${ctx.esc(row.waiting)}</td><td class="mono muted">${ctx.esc(ctx.rel(row.since))}</td><td class="mono ${row.kind === 'codex' ? 'kind-codex' : ''}">${ctx.esc(row.kind)}</td><td>${ctx.esc(account || '—')}</td><td><button class="btn" data-pin="${ctx.esc(row.pane || '')}" data-title="${ctx.esc(row.title)}" ${row.alive && !pinned ? '' : 'disabled'}>${pinned ? 'Pinned' : 'Pin'}</button>${reopen}${remove}</td></tr>`;
     }).join('')}`;
   }).join('')}</tbody></table>` : '<div class="qempty"><b>No fleet rows match</b>Try another title, card, project, or branch.</div>';
 
@@ -91,7 +94,9 @@ export function renderFleet(ctx) {
       if (button.disabled) return;
       button.disabled = true;
       try {
-        await ctx.reopenSession({ sessionId: button.dataset.reopen, agent: button.dataset.agent, title: button.dataset.title, stalePane: button.dataset.stale || undefined });
+        const row = rows.find((candidate) => candidate.sessionId === button.dataset.reopen);
+        await ctx.reopenSession({ sessionId: button.dataset.reopen, agent: button.dataset.agent, title: button.dataset.title,
+          stalePane: button.dataset.stale || undefined, project: row?.project });
       } finally { button.disabled = false; }
     }));
     results.querySelectorAll('[data-remove]').forEach((button) => button.addEventListener('click', async () => {

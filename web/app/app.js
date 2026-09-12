@@ -18,6 +18,8 @@ import { installTriageControls, renderTriage } from './triage.js';
 import { renderWatch, installWatchControls } from './watch.js';
 import { renderFleet } from './fleet.js';
 import { openReviewQueueNotification, renderReviewQueue, reviewQueueIdForNotification } from './review-queue.js';
+import { openSessionChooser } from './session-launcher.js';
+import { openPortableTransfer } from './portable-transfer.js';
 import { closeReviewerPopover, markReviewerSeen, renderDock, renderReviewer, renderReviewerTop } from './reviewer.js';
 import { createDetailStore } from './details.js';
 import { acknowledgeNotificationClick, installNotificationClicks, notificationPermission, notify, requestPermission, setBadge } from './shell.js';
@@ -480,30 +482,104 @@ async function startShell(cwd, name) {
   spawnedPanes.set(result.pane.id, { pane: result.pane, throughGeneration: reloadGeneration });
   return result.pane;
 }
-async function reopenSession({ sessionId, taskId, agent, title, stalePane }) {
-  const key = taskId ? `task:${taskId}` : `session:${sessionId}`;
-  if (reopeningSessions.has(key)) return reopeningSessions.get(key);
-  const operation = (async () => {
-    toast(`Reopening “${title || taskId || sessionId}”…`);
-    try {
-      const result = await api.openSession(taskId ? { taskId } : { sessionId, agent });
-      // The old exited pane has nothing left to show once the session lives elsewhere.
-      if (stalePane && stalePane !== result.pane && paneMap().get(stalePane)?.alive === false) {
-        try { await api.removePane(stalePane); await dropPane(stalePane); } catch {}
-      }
-      await reload();
-      toast(`Reopened "${title}" in pane ${result.pane}`, {
-        label: 'Pin', run: () => pinPane(result.pane, title),
-      });
-      return result;
-    } catch (error) {
-      toast(`Could not reopen: ${error.message}`);
-      return null;
-    }
-  })();
-  reopeningSessions.set(key, operation);
-  try { return await operation; }
-  finally { reopeningSessions.delete(key); }
+async function startChosenSession(cwd, name, selection, requestId) {
+  if (selection.kind === 'shell') return startShell(cwd, name);
+  const result = await api.openSession({ fresh: true, cwd, agent: selection.agent, accountId: selection.accountId, requestId,
+    ...(selection.model ? { model: selection.model } : {}) });
+  await reload();
+  return paneMap().get(result.pane) || { id: result.pane,
+    meta: { agent: selection.agent, accountId: selection.accountId, project: cwd } };
+}
+async function newSession(cwd, name, onOpened) {
+  const requestId = globalThis.crypto?.randomUUID?.() || `open-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  let boundPane = null;
+  let openedPane = null;
+  await openSessionChooser(ctx, {
+    title: 'New session', description: 'Choose what to open in this project.', project: cwd,
+    kinds: ['shell', 'claude', 'codex'], initialKind: 'shell', confirmLabel: 'Open session',
+    models: { claude: 'claude-fable-5-1', codex: '' },
+    async onSubmit(selection) {
+      state.pendingFocus = true;
+      try {
+        let pane;
+        try { pane = await startChosenSession(cwd, name, selection, requestId); }
+        catch (error) {
+          const launch = error?.body?.code === 'OPEN_EXISTING_PANE' ? error.body.launch : null;
+          if (!launch?.pane) throw error;
+          await reload();
+          pane = paneMap().get(launch.pane) || { id: launch.pane,
+            meta: { agent: launch.agent, accountId: launch.accountId, project: cwd } };
+          if (boundPane !== pane.id) { await onOpened(pane, selection); boundPane = pane.id; openedPane = pane.id; }
+          const boundError = new Error(`${error.message} The existing pane is open for inspection; retry resumes setup without creating another.`);
+          boundError.body = error.body;
+          throw boundError;
+        }
+        if (boundPane !== pane.id) { await onOpened(pane, selection); openedPane = pane.id; }
+      } finally { state.pendingFocus = false; }
+    },
+  });
+  if (openedPane && paneMap().get(openedPane)?.alive) {
+    state.focusPane = openedPane;
+    refresh();
+  }
+}
+async function reopenSession({ sessionId, taskId, agent, title, stalePane, project }) {
+  const session = sessionId ? data.sessions.find((candidate) => candidate.id === sessionId) : null;
+  const pane = stalePane ? paneMap().get(stalePane) : null;
+  const provider = agent || session?.kind || pane?.meta?.agent;
+  const currentAccountId = session?.accountId || pane?.meta?.accountId || null;
+  const launchProject = project || session?.project || pane?.meta?.project || pane?.cwd || taskFor({ taskId })?.fm?.project || '';
+  const freshCard = !sessionId && Boolean(taskId);
+  const requestId = globalThis.crypto?.randomUUID?.() || `open-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  let openedPane = null;
+  await openSessionChooser(ctx, {
+    eyebrow: freshCard ? 'Card' : 'Conversation', title: `Reopen ${title || taskId || sessionId || 'session'}`,
+    description: freshCard ? 'Start the first conversation for this card.' : 'Resume this conversation without sending a new instruction.',
+    project: launchProject, kinds: freshCard ? ['claude', 'codex'] : [provider], initialKind: freshCard ? 'claude' : provider,
+    accountId: currentAccountId, showModel: freshCard, confirmLabel: freshCard ? 'Start conversation' : 'Reopen',
+    models: freshCard ? { claude: 'claude-fable-5-1', codex: '' } : undefined,
+    onTransfer: sessionId ? () => openPortableTransfer(ctx, sessionId) : null,
+    async onSubmit(selection) {
+      const key = taskId ? `task:${taskId}` : `session:${sessionId}`;
+      if (reopeningSessions.has(key)) return reopeningSessions.get(key);
+      const operation = (async () => {
+        const request = freshCard
+          ? { taskId, fresh: true, agent: selection.agent, accountId: selection.accountId, requestId,
+            ...(selection.model ? { model: selection.model } : {}) }
+          : { sessionId, agent: provider, accountId: selection.accountId };
+        let result;
+        try {
+          result = !freshCard && currentAccountId && selection.accountId !== currentAccountId
+            ? await api.reopenSession({ sessionId, accountId: selection.accountId })
+            : await api.openSession(request);
+        } catch (error) {
+          const launch = error?.body?.code === 'OPEN_EXISTING_PANE' ? error.body.launch : null;
+          if (!launch?.pane) throw error;
+          await reload();
+          openedPane = launch.pane;
+          ctx.openReviewPane(launch.pane);
+          const boundError = new Error(`${error.message} The existing pane is open for inspection; retry resumes setup without creating another.`);
+          boundError.body = error.body;
+          throw boundError;
+        }
+        // The old exited pane has nothing left to show once the session lives elsewhere.
+        if (stalePane && stalePane !== result.pane && paneMap().get(stalePane)?.alive === false) {
+          try { await api.removePane(stalePane); await dropPane(stalePane); } catch {}
+        }
+        await reload();
+        openedPane = result.pane;
+        const account = (data.accounts || []).find((entry) => entry.id === selection.accountId);
+        toast(`${freshCard ? 'Started' : 'Reopened'} "${title || taskId || sessionId}"${account ? ` on ${account.label || account.id}` : ''}`, {
+          label: 'Pin', run: () => pinPane(result.pane, title),
+        });
+        return result;
+      })();
+      reopeningSessions.set(key, operation);
+      try { return await operation; }
+      finally { reopeningSessions.delete(key); }
+    },
+  });
+  if (openedPane && paneMap().get(openedPane)?.alive) ctx.openReviewPane(openedPane);
 }
 async function removePane(pane) {
   await api.removePane(pane);
@@ -876,7 +952,7 @@ const ctx = {
   state, get data() { return data; }, closingSessions, isClosingSession, beginClose, esc, rel, projectOf, projectIcon, projectHTML, tagsHTML, knownProjects,
   queueItems, runningItems, pinnedItems, recentItems, triageItems, toggleCollapsed, toggleRunning, toggleRecent, setSelected,
   itemKey, triageKey, eventKey, sessionFor, taskFor, paneMap, entityForPane, kindLabel, limitResumeFor, toast, dismiss, restore, setAside, setAsideFor,
-  pinPane, startShell, reopenSession, removePane, isPanePinned, knownPaneCount, saveLayouts, dropPane, mount, patchHTML, clearElement, refresh, reload,
+  pinPane, startShell, newSession, reopenSession, removePane, isPanePinned, knownPaneCount, saveLayouts, dropPane, mount, patchHTML, clearElement, refresh, reload,
   scheduleTerminalFit, setMode, setDock, toggleFocus, focusTerminal, focusDebug, retainedSelectionItem,
   detail(kind, item) { return item ? detailStore.peek(kind, item.id, item._detailVersion) : { status: 'idle', value: null, error: '' }; },
   ensureDetail(kind, item) { return item && item._detailVersion ? detailStore.ensure(kind, item.id, item._detailVersion) : Promise.resolve(item || null); },

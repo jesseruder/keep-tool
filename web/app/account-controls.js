@@ -58,25 +58,26 @@ export function handoffControls(ctx, sessionId, paneId) {
   const pane = (ctx.data.panes || []).find((candidate) => candidate.id === paneId);
   const current = accountFor(ctx, session, pane);
   const handoff = latestHandoff(ctx, sessionId);
+  const openOnly = handoff?.intent === 'open-only';
   const target = targetFor(ctx, handoff);
   const targetLabel = target?.label || handoff?.targetAccountId || 'another account';
   const fallback = handoff?.portableFallbackAvailable && handoff.pane === paneId && pane?.alive === true
     && current?.id === handoff.sourceAccountId
     ? `<button class="btn" data-portable-fallback="${ctx.esc(handoff.id || handoff.transactionId || '')}">Start fresh continuation</button>` : '';
   if (handoff?.status === 'recovery-needed') {
-    return `<span class="handoff-error" role="alert" title="${ctx.esc(handoff.reason || '')}">Transfer interrupted</span><button class="btn" data-handoff-account="${ctx.esc(handoff.targetAccountId || '')}">Retry</button>${fallback}`;
+    return `<span class="handoff-error" role="alert" title="${ctx.esc(handoff.reason || '')}">${openOnly ? 'Reopen interrupted' : 'Transfer interrupted'}</span><button class="btn" data-handoff-account="${ctx.esc(handoff.targetAccountId || '')}">Retry</button>${fallback}`;
   }
   if (handoff?.status === 'done' && current?.id !== handoff.targetAccountId) {
-    return `<span class="handoff-status" role="status">Verifying transfer to ${ctx.esc(targetLabel)}…</span>`;
+    return `<span class="handoff-status" role="status">Verifying ${openOnly ? 'reopen on' : 'transfer to'} ${ctx.esc(targetLabel)}…</span>`;
   }
   if (handoff && !['done', 'failed', 'recovery-needed'].includes(handoff.status)) {
     // Retrying the same transaction joins a live request, or resumes its durable
     // journal after a daemon crash. Do not strand a persisted in-flight status.
-    return `<span class="handoff-status" role="status">Continuing on ${ctx.esc(targetLabel)}…</span><button class="btn" data-handoff-account="${ctx.esc(handoff.targetAccountId || '')}">Retry</button>`;
+    return `<span class="handoff-status" role="status">${openOnly ? 'Opening on' : 'Continuing on'} ${ctx.esc(targetLabel)}…</span><button class="btn" data-handoff-account="${ctx.esc(handoff.targetAccountId || '')}">Retry</button>`;
   }
 
   const error = handoff?.status === 'failed'
-    ? `<span class="handoff-error" role="alert" title="${ctx.esc(handoff.reason || '')}">Transfer failed</span>` : '';
+    ? `<span class="handoff-error" role="alert" title="${ctx.esc(handoff.reason || '')}">${openOnly ? 'Reopen failed' : 'Transfer failed'}</span>` : '';
   const destinations = handoffDestinations(ctx, session, pane);
   if (!current || !destinations.length) return error;
   const provider = current.agent === 'codex' ? 'Codex' : 'Claude';
@@ -107,33 +108,35 @@ export function installHandoffControls(container, ctx, sessionId, pane) {
     button.onclick = async () => {
       if (button.disabled) return;
       const accountId = button.dataset.handoffAccount;
+      const openOnly = latestHandoff(ctx, sessionId)?.intent === 'open-only';
       const destination = (ctx.data.accounts || []).find((account) => account.id === accountId);
       const buttons = [...container.querySelectorAll('[data-handoff-account]')];
       buttons.forEach((candidate) => { candidate.disabled = true; });
       button.blur();
       try {
         const result = await write('/api/handoff-session', { sessionId, pane, accountId });
+        const responseOpenOnly = result.intent === 'open-only' || openOnly;
         if (result.status === 'recovery-needed') {
-          ctx.toast(`Transfer needs recovery: ${result.reason || 'retry when the session is safe'}`);
+          ctx.toast(`${responseOpenOnly ? 'Reopen' : 'Transfer'} needs recovery: ${result.reason || 'retry when the session is safe'}`);
         } else if (result.status === 'failed') {
-          ctx.toast(`Not continued: ${result.reason || 'transfer failed'}`);
+          ctx.toast(`${responseOpenOnly ? 'Not reopened' : 'Not continued'}: ${result.reason || (responseOpenOnly ? 'reopen failed' : 'transfer failed')}`);
         } else if (result.status === 'done') {
           await ctx.reload();
           if (confirmedAccount(ctx, sessionId, pane) === accountId) {
-            ctx.toast(`Continued on ${destination?.label || accountId}`);
+            ctx.toast(`${responseOpenOnly ? 'Opened' : 'Continued'} on ${destination?.label || accountId}`);
           } else {
             ctx.toast(`Transfer finished; verifying ${destination?.label || accountId}…`);
           }
         } else {
-          ctx.toast(`Continuing on ${destination?.label || accountId}…`);
+          ctx.toast(`${responseOpenOnly ? 'Opening' : 'Continuing'} on ${destination?.label || accountId}…`);
           await ctx.reload();
         }
       } catch (error) {
         if (error.body?.status === 'recovery-needed') {
-          ctx.toast(`Transfer needs recovery: ${error.body.reason || error.message}`);
+          ctx.toast(`${openOnly ? 'Reopen' : 'Transfer'} needs recovery: ${error.body.reason || error.message}`);
           await ctx.reload();
         } else {
-          ctx.toast(`Not continued: ${error.body?.reason || error.message}`);
+          ctx.toast(`${openOnly ? 'Not reopened' : 'Not continued'}: ${error.body?.reason || error.message}`);
         }
       } finally {
         buttons.forEach((candidate) => { candidate.disabled = false; });

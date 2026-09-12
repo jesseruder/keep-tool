@@ -109,8 +109,8 @@ function renderRail(ctx, items) {
   const dot = (project) => `<button data-project="${ctx.esc(project.key)}" class="rail-dot ${ctx.state.filter === project.key ? 'on' : ''}" style="--h:${project.h}" title="${ctx.esc(project.name)}">${ctx.projectIcon(project)}</button>`;
   const shell = shellProject(ctx);
   const shellButton = collapsed
-    ? '<button class="rail-shell rail-dot" data-shell title="New shell"><span class="rail-shell-mark">+</span></button>'
-    : `<button class="rail-shell" data-shell title="New shell in ${ctx.esc(shell.name)}"><span class="rail-shell-mark">+</span><span>shell</span></button>`;
+    ? '<button class="rail-shell rail-dot" data-shell title="New session"><span class="rail-shell-mark">+</span></button>'
+    : `<button class="rail-shell" data-shell title="New session in ${ctx.esc(shell.name)}"><span class="rail-shell-mark">+</span><span>session</span></button>`;
   rail.classList.toggle('collapsed', collapsed);
   rail.innerHTML = collapsed
     ? `<div class="rh"><button class="collapse" aria-expanded="false" title="Expand (⌘B)">›</button></div><button data-project="" class="rail-dot all ${ctx.state.filter ? '' : 'on'}" title="All">${ctx.projectIcon({ key: 'all' })}</button>${projects.map(dot).join('')}${shellButton}`
@@ -128,27 +128,30 @@ function renderRail(ctx, items) {
     const button = event.currentTarget;
     button.disabled = true;
     button.blur();
-    ctx.state.pendingFocus = true;
     try {
-      const pane = await ctx.startShell(shell.path, shell.name);
-      const title = ctx.entityForPane(pane.id).title;
-      const pinned = await ctx.pinPane(pane.id, title);
-      if (!pinned) { ctx.refresh(); ctx.toast(`Shell started in ${shell.name}, but pinning failed; it is listed in Watch`); return; }
-      // Creating a shell is explicit navigation, including from waiting-only
-      // Focus mode or a collapsed Pinned group.
-      if (ctx.state.focusMode) ctx.toggleFocus(false, false);
-      ctx.state.showPinned = true;
-      try { sessionStorage.setItem('keep-pinned-expanded', '1'); } catch {}
-      ctx.state.filter = null;
-      const index = ctx.triageItems().findIndex((item) => item.kind === 'pinned' && item.pane === pane.id);
-      if (index >= 0) ctx.setSelected(index, true);
-      ctx.state.ensureSelectedVisible = true;
-      ctx.state.focused = true;
-      ctx.state.focusPane = pane.id;
-      ctx.refresh();
-      ctx.toast(`Shell started in ${shell.name}`);
-    } catch (error) { ctx.toast(error.message); }
-    finally { button.disabled = false; ctx.state.pendingFocus = false; }
+      await ctx.newSession(shell.path, shell.name, async (pane, selection) => {
+        const title = ctx.entityForPane(pane.id).title;
+        const pinned = await ctx.pinPane(pane.id, title);
+        if (!pinned) {
+          ctx.refresh();
+          ctx.toast(`${selection.kind === 'shell' ? 'Shell' : selection.kind === 'claude' ? 'Claude Code' : 'Codex'} opened in ${shell.name}, but pinning failed; it is listed in Watch`);
+          return;
+        }
+        // Creating a session is explicit navigation, including from waiting-only
+        // Focus mode or a collapsed Pinned group.
+        if (ctx.state.focusMode) ctx.toggleFocus(false, false);
+        ctx.state.showPinned = true;
+        try { sessionStorage.setItem('keep-pinned-expanded', '1'); } catch {}
+        ctx.state.filter = null;
+        const index = ctx.triageItems().findIndex((item) => item.kind === 'pinned' && item.pane === pane.id);
+        if (index >= 0) ctx.setSelected(index, true);
+        ctx.state.ensureSelectedVisible = true;
+        ctx.state.focused = true;
+        ctx.state.focusPane = pane.id;
+        ctx.refresh();
+        ctx.toast(`${selection.kind === 'shell' ? 'Shell' : selection.kind === 'claude' ? 'Claude Code' : 'Codex'} opened in ${shell.name}`);
+      });
+    } finally { button.disabled = false; }
   });
 }
 
@@ -424,7 +427,7 @@ function renderStage(ctx, active, focusItem, running, pinned) {
     try {
       await ctx.reopenSession({
         sessionId: item.sessionId, taskId: !item.sessionId ? item.taskId : undefined,
-        agent: session?.kind, title, stalePane: item.pane || undefined,
+        agent: session?.kind, title, stalePane: item.pane || undefined, project: item.project || session?.project,
       });
     } finally { reopenButton.disabled = false; }
   };

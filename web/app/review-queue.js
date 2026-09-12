@@ -1,4 +1,5 @@
 import { searchDashboardReviews, write } from './api.js';
+import { openSessionChooser } from './session-launcher.js';
 
 const STATUSES = ['needs-decision', 'in-progress', 'resolved'];
 const LABELS = { 'needs-decision': 'Needs decision', 'in-progress': 'In progress', resolved: 'Resolved' };
@@ -163,7 +164,7 @@ function detail(ctx, item) {
   </article>`;
 }
 
-async function submit(ctx, item, action, fields = {}, retry = false, requestIdOverride = null, recovery = false) {
+async function submit(ctx, item, action, fields = {}, retry = false, requestIdOverride = null, recovery = false, surfaceError = false) {
   const existing = pending.get(item.id);
   if (existing && !existing.error) return;
   const request = !retry && existing?.action === action
@@ -192,7 +193,31 @@ async function submit(ctx, item, action, fields = {}, retry = false, requestIdOv
       if (error.body.item.launchState || request.recovery && !error.body.item.launchState) pending.delete(item.id);
     }
     renderReviewQueue(ctx);
+    if (surfaceError) throw error;
   }
+}
+
+function launchFields(launch) {
+  const selection = launch?.selection || launch?.request || launch || {};
+  return selection.agent && selection.accountId ? {
+    agent: selection.agent,
+    accountId: selection.accountId,
+    ...(selection.model ? { model: selection.model } : {}),
+  } : {};
+}
+
+function chooseLaunch(ctx, item, action) {
+  const label = action === 'discuss' ? 'Open discussion' : item.type === 'finding' ? 'Start investigation' : 'Start work';
+  return openSessionChooser(ctx, {
+    eyebrow: item.type === 'finding' ? 'Finding' : 'Idea', title: label,
+    description: 'Choose the account for this new conversation.', project: item.project || item.card || '',
+    kinds: ['claude', 'codex'], initialKind: 'claude', confirmLabel: label,
+    models: { claude: 'claude-fable-5-1', codex: '' },
+    onSubmit(selection) {
+      return submit(ctx, item, action, { agent: selection.agent, accountId: selection.accountId,
+        ...(selection.model ? { model: selection.model } : {}) }, false, null, false, true);
+    },
+  });
 }
 
 function bind(ctx, root, current) {
@@ -215,7 +240,7 @@ function bind(ctx, root, current) {
   root.querySelectorAll('[data-review-session]').forEach((button) => button.addEventListener('click', () => ctx.openReviewSession(button.dataset.reviewSession)));
   root.querySelector('[data-review-recover]')?.addEventListener('click', () => {
     const launch = current.launchState;
-    if (launch?.recoverable && launch.action && launch.requestId) void submit(ctx, current, launch.action, {}, false, launch.requestId, true);
+    if (launch?.recoverable && launch.action && launch.requestId) void submit(ctx, current, launch.action, launchFields(launch), false, launch.requestId, true);
   });
   root.querySelector('[data-review-card]')?.addEventListener('click', (event) => ctx.openReviewCard(event.currentTarget.dataset.reviewCard));
   root.querySelectorAll('[data-review-action]').forEach((button) => button.addEventListener('click', () => {
@@ -224,7 +249,7 @@ function bind(ctx, root, current) {
       form = { id: current.id, action, value: '' };
       renderReviewQueue(ctx);
       requestAnimationFrame(() => root.querySelector(`[data-review-form=${action}] ${action === 'defer' ? 'input' : 'textarea'}`)?.focus());
-    } else void submit(ctx, current, action);
+    } else void chooseLaunch(ctx, current, action);
   }));
   root.querySelector('[data-review-cancel]')?.addEventListener('click', () => { form = null; renderReviewQueue(ctx); });
   const actionForm = root.querySelector('[data-review-form]');
