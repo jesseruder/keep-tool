@@ -2,6 +2,8 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { createDashboardWorker, DashboardWorkerError } = require('./dashboard-worker');
 
@@ -78,4 +80,36 @@ test('dashboard worker contains synchronous finalizer failures and closes during
   release({ value: 2 });
   await assert.rejects(pending, /closed/);
   assert.equal(closing.latest(), null);
+});
+
+test('real dashboard build preserves host pane mapping and parent runtime snapshots', async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-dashboard-worker-home-'));
+  const previousHome = process.env.HOME;
+  process.env.HOME = home;
+  for (const dir of ['.claude/projects', '.codex/sessions']) fs.mkdirSync(path.join(home, dir), { recursive: true });
+  const worker = createDashboardWorker();
+  t.after(() => {
+    worker.close();
+    process.env.HOME = previousHome;
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+  const result = await worker.build({
+    hostPanes: [{
+      id: 'pane-host-only', alive: true, agentAlive: true, createdAt: new Date().toISOString(),
+      meta: { sessionId: 'host-only', agent: 'codex', model: 'gpt-test', project: '/tmp/project' },
+    }],
+    companion: null,
+    dashboardRuntime: {
+      digest: null,
+      health: { daemon: {}, schedulers: [] },
+      usage: { accounts: {} },
+      runs: [{ id: 'parent-run', state: 'running' }],
+    },
+  });
+  const session = result.state.sessions.find((item) => item.id === 'host-only');
+  assert.equal(session.pane, 'pane-host-only');
+  assert.equal(session.launchModel, 'gpt-test');
+  assert.equal(result.state.panes[0].id, 'pane-host-only');
+  assert.equal(result.state.attention.find((item) => item.sessionId === 'host-only')?.pane, 'pane-host-only');
+  assert.deepEqual(result.state.runs, [{ id: 'parent-run', state: 'running' }]);
 });

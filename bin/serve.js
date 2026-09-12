@@ -4822,7 +4822,7 @@ function buildState(options = {}) {
     limitResume: limitresume.dashboardState(keep.ROOT),
     slack: slack.dashboardState(),
     health: healthSnapshot,
-    runs: runs.listRuns(),
+    runs: options.dashboardRuntime?.runs || runs.listRuns(),
     usage: options.dashboardRuntime?.usage || usage.getUsage(),
     reviewQueue: reviewQueue.snapshot({ loadTasks: () => allTasks, now }),
   };
@@ -4919,7 +4919,7 @@ function dashboardRuntimeSnapshot() {
   let digest = null;
   try { digest = ensureDigest(); }
   catch (error) { process.stderr.write(`keep serve: digest failed: ${error.message}\n`); }
-  return { digest, health: health.snapshot(), usage: usage.getUsage() };
+  return { digest, health: health.snapshot(), usage: usage.getUsage(), runs: runs.listRuns() };
 }
 
 function setPath(object, pathParts, value) {
@@ -4940,6 +4940,8 @@ function finalizeDashboardWorkerResult(result) {
 
   const taskById = new Map((state.tasks || []).map((task) => [task.id, task]));
   titles.applyLiveTitles(state.sessions, { onChange, taskFor: (session) => taskById.get(session.taskId) });
+  state.runs = runs.listRuns();
+  for (const session of state.sessions || []) require('./session-debug').record(session, Date.now());
   const sessionById = new Map((state.sessions || []).map((session) => [session.id, session]));
   for (const item of state.attention || []) {
     const session = sessionById.get(item.sessionId);
@@ -5710,6 +5712,17 @@ function start(deps = {}) {
     hostPanes: options.hostPanes || [],
     companion: options.companion || null,
   });
+  // Fill the worker's parser caches during daemon startup. The first real
+  // request with the same host snapshot coalesces with this build.
+  setImmediate(async () => {
+    try {
+      const panes = await listHostPanes(deps);
+      const companion = await companionSnapshot(deps);
+      await dashboardBuild({ hostPanes: panes, companion });
+    } catch (error) {
+      process.stderr.write(`keep serve: dashboard warmup failed: ${error.message}\n`);
+    }
+  });
 
   const watch = (target, opts, invalidate) => {
     try {
@@ -5743,8 +5756,10 @@ function start(deps = {}) {
       dashboardBuilder.invalidate({ kind: 'claude', root: entry.root, name });
     });
   }
-  watch(path.join(os.homedir(), '.codex', 'sessions'), { recursive: true },
-    (name) => dashboardBuilder.invalidate({ kind: 'codex', name }));
+  for (const sessionsRoot of new Set(codex.configuredRoots().map((entry) => path.join(entry.configDir, 'sessions')))) {
+    watch(sessionsRoot, { recursive: true },
+      (name) => dashboardBuilder.invalidate({ kind: 'codex', root: sessionsRoot, name }));
+  }
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'lifecycle'), { recursive: true }); } catch {}
   watch(path.join(keep.ROOT, '.keep', 'lifecycle'), { recursive: true },
     (name) => dashboardBuilder.invalidate({ kind: 'lifecycle', name }));

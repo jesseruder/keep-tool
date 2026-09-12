@@ -1,9 +1,9 @@
 'use strict';
 
 const { parentPort } = require('node:worker_threads');
-const { buildState } = require('./serve.js');
+const { buildState, addHostSessionState } = require('./serve.js');
 
-parentPort.on('message', (message) => {
+parentPort.on('message', async (message) => {
   if (message?.type === 'invalidate') {
     try { require('./serve.js').invalidateDashboardSources(message.change); } catch {}
     return;
@@ -21,6 +21,7 @@ parentPort.on('message', (message) => {
       collectSummaryRequests: summaryRequests,
       collectHealthErrors: healthErrors,
     });
+    await addHostSessionState(state, { panes: input.hostPanes || [] });
     parentPort.postMessage({ id, result: { state, backgroundTargets, summaryRequests, healthErrors } });
   } catch (error) {
     parentPort.postMessage({ id, error: { message: error.message, stack: error.stack } });
