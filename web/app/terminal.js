@@ -437,6 +437,11 @@ export function mountTerminal(container, pane, options = {}) {
   terminal.textarea?.addEventListener('paste', markInsertedInput, true);
   terminal.textarea?.addEventListener('compositionend', markInsertedInput, true);
   terminal.textarea?.addEventListener('input', markInsertedInput, true);
+  // Mouse motion and focus reports bypass the wheel frame queue in xterm. Clear
+  // delayed wheel reports in capture phase so they cannot overtake either one.
+  for (const type of ['pointermove', 'mousemove', 'focus', 'blur']) {
+    wrapper.addEventListener(type, () => trackpadWheel.cancel(), true);
+  }
   // Pointer and focus reports are terminal input, so count them as typing before xterm handles them.
   for (const type of ['pointerdown', 'pointerup', 'wheel', 'focusin', 'focusout']) {
     wrapper.addEventListener(type, () => {

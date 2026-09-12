@@ -34,12 +34,15 @@ const fixtureHtml = `<!doctype html>
     });
     terminal.element.addEventListener('pointerdown', () => wheel?.cancel(), true);
     terminal.element.addEventListener('pointerup', () => wheel?.cancel(), true);
+    for (const type of ['pointermove', 'mousemove', 'focus', 'blur']) {
+      terminal.element.addEventListener(type, () => wheel?.cancel(), true);
+    }
     fixtures[name] = { terminal, output, wheel };
   }
 
   open('old', false);
   open('enhanced', true);
-  await Promise.all(Object.values(fixtures).map(({ terminal }) => write(terminal, '\\x1b[?1003h\\x1b[?1006h')));
+  await Promise.all(Object.values(fixtures).map(({ terminal }) => write(terminal, '\\x1b[?1003h\\x1b[?1004h\\x1b[?1006h')));
 
   function point(terminal, col = 3, row = 4) {
     const screen = terminal.element.querySelector('.xterm-screen').getBoundingClientRect();
@@ -77,7 +80,7 @@ const fixtureHtml = `<!doctype html>
       fixture.terminal.reset();
       fixture.output.length = 0;
       fixture.wheel?.cancel();
-      await write(fixture.terminal, '\\x1b[?1003h\\x1b[?1006h');
+      await write(fixture.terminal, '\\x1b[?1003h\\x1b[?1004h\\x1b[?1006h');
     },
     metrics(name) {
       const { terminal } = fixtures[name];
@@ -87,6 +90,8 @@ const fixtureHtml = `<!doctype html>
       };
     },
     wheel, pointer, mouse,
+    focus(name) { fixtures[name].terminal.focus(); },
+    blur(name) { fixtures[name].terminal.blur(); },
     key(name, key) {
       const { terminal } = fixtures[name];
       terminal.textarea.dispatchEvent(new KeyboardEvent('keydown', {
@@ -143,6 +148,7 @@ for (const [name, browserType] of [['chromium', chromium], ['webkit', webkit]]) 
       const page = await browser.newPage({ viewport: { width: 700, height: 500 } });
       await page.goto(url);
       await page.waitForFunction(() => window.fixture?.metrics('enhanced').mode === 'any');
+      await page.evaluate(() => { window.fixture.clear('old'); window.fixture.clear('enhanced'); });
       const cellHeight = await page.evaluate(() => window.fixture.metrics('enhanced').cellHeight);
       const delta = cellHeight * 2.4;
       assert.ok(delta < 50, `fixture delta must use xterm's likely-trackpad path, got ${delta}`);
@@ -205,6 +211,42 @@ for (const [name, browserType] of [['chromium', chromium], ['webkit', webkit]]) 
       }, cellHeight);
       await page.waitForTimeout(100);
       assert.deepEqual(await page.evaluate(() => window.fixture.output('enhanced')), ['\r'], 'keyboard input cancels delayed wheel reports');
+
+      await page.evaluate(() => { window.fixture.clear('enhanced'); });
+      await page.evaluate(value => {
+        window.fixture.wheel('enhanced', value * 2.4);
+        window.fixture.mouse('enhanced', 'mousemove', { buttons: 0 });
+      }, cellHeight);
+      await page.waitForTimeout(100);
+      assert.deepEqual(
+        await page.evaluate(() => window.fixture.output('enhanced')),
+        ['\x1b[<35;3;4M'],
+        'an immediate any-motion report cancels queued wheel reports instead of overtaking them',
+      );
+
+      await page.evaluate(() => { window.fixture.blur('enhanced'); window.fixture.clear('enhanced'); });
+      await page.evaluate(value => {
+        window.fixture.wheel('enhanced', value * 2.4);
+        window.fixture.focus('enhanced');
+      }, cellHeight);
+      await page.waitForTimeout(100);
+      assert.deepEqual(
+        await page.evaluate(() => window.fixture.output('enhanced')),
+        ['\x1b[I'],
+        'an immediate focus report cancels queued wheel reports instead of overtaking them',
+      );
+
+      await page.evaluate(() => { window.fixture.clear('enhanced'); });
+      await page.evaluate(value => {
+        window.fixture.wheel('enhanced', value * 2.4);
+        window.fixture.blur('enhanced');
+      }, cellHeight);
+      await page.waitForTimeout(100);
+      assert.deepEqual(
+        await page.evaluate(() => window.fixture.output('enhanced')),
+        ['\x1b[O'],
+        'an immediate blur report cancels queued wheel reports instead of overtaking them',
+      );
 
       await page.evaluate(() => { window.fixture.clear('enhanced'); });
       await page.evaluate(value => {

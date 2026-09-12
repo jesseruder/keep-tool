@@ -16,7 +16,7 @@
     "test:scenarios": "node bin/session-scenarios.js",
     "test:scenarios:browser": "npm run test:reliability:browser",
     "test:reliability": "node --require ./scripts/test-env.cjs --test bin/force-restart.test.js bin/restart-controls.test.js bin/runtime-restart.test.js bin/mcp-restart.test.js bin/summarize.test.js bin/session-summary.test.js bin/titles.test.js bin/background-jobs.test.js bin/code-mode-output.test.js bin/restart-ledger.test.js bin/daemon-restart.test.js bin/session-model.test.js bin/session-status.test.js bin/session-lifecycle.test.js bin/codex-lifecycle.test.js bin/codex.test.js bin/hosted-exit.test.js bin/session-restart.test.js bin/manual-close.test.js bin/session-cleanup.test.js bin/serve.test.js bin/host.test.js bin/ui-focus.test.js bin/terminal-view.test.js bin/console.test.js",
-    "test:reliability:browser": "KEEP_BROWSER_TEST=1 node --require ./scripts/test-env.cjs --test bin/session-navigation-browser.test.js",
+    "test:reliability:browser": "KEEP_BROWSER_TEST=1 node --require ./scripts/test-env.cjs --test bin/session-navigation-browser.test.js bin/terminal-scroll-browser.test.js",
     "mobile:theme": "node scripts/build-mobile-theme.mjs",
     "test:ui": "playwright test -c tests/ui/playwright.config.cjs",
     "ui:sandbox": "node tests/ui/fixture.cjs",
