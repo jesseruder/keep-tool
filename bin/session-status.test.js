@@ -166,6 +166,10 @@ test('a current process-owned uncertain job suppresses generic readiness', () =>
   assert.equal(waiting.decision.source, 'background');
   assert.equal(waiting.decision.confidence, 'uncertain');
   assert.equal(attention(base), null);
+  const mixedOwnership = { ...base, pendingBackground: true, backgroundJobs: { ...base.backgroundJobs, pending: true, jobs: [pending,
+    { ...pending, id: 'other-job', kind: 'agent', instance: 'other-pane:2:agent' }] } };
+  assert.equal(activity(mixedOwnership).decision.confidence, 'uncertain',
+    'an observed job owned by another process does not raise confidence in this wait');
 
   assert.equal(activity({ ...base, lastAssistantFull: 'Should I change the implementation?' }).state, 'needs-input',
     'an explicit question still wins');

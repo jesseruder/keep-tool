@@ -39,14 +39,15 @@ function resolve(session, model, now = Date.now()) {
   // session from generic readiness until correlated terminal evidence arrives.
   // Unlike the bounded legacy path above, an uncertain entry cannot be inherited
   // across a process restart without exact live ownership evidence.
-  const currentJobWait = model.process.state === 'live' && Boolean(jobInstance)
-    && currentJobs.some(j => Boolean(j.instance) && j.instance === jobInstance);
+  const ownedCurrentJobs = model.process.state === 'live' && jobInstance
+    ? currentJobs.filter(j => Boolean(j.instance) && j.instance === jobInstance) : [];
+  const currentJobWait = ownedCurrentJobs.length > 0;
   return { hint, waiting: intentional || (hint !== 'needs-input' && (jobWait || currentJobWait)),
     reason: handoff === 'waiting' ? 'scheduled check' : intentional && scheduled.length ? 'scheduled check' : intentional && model.task.dependencies.length ? 'dependency'
       : intentional && model.task.checkAfter ? 'scheduled check' : model.background.agents.length ? 'subagent' : require('./session-status').waitReason(session.lastAssistantFull || session.lastAssistant),
     scheduled: scheduled.map(j => ({ id: j.id, expiresAt: j.expiresAt })),
     handoff: handoff ? { taskId: task.id, checkAfter: task.checkAfter, at: task.scheduledAt, intent: handoff } : null,
     source: handoff && hint === handoff ? 'registry' : hook ? 'hook' : currentJobWait ? 'background' : 'conversation',
-    confidence: handoff && hint === handoff ? 'observed' : currentJobWait && currentJobs.every(j => model.background.uncertain.includes(j.id)) ? 'uncertain' : currentJobWait ? 'observed' : 'inferred' };
+    confidence: handoff && hint === handoff ? 'observed' : currentJobWait && ownedCurrentJobs.every(j => model.background.uncertain.includes(j.id)) ? 'uncertain' : currentJobWait ? 'observed' : 'inferred' };
 }
 module.exports = { stopHint, resolve };
