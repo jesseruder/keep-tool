@@ -28,17 +28,23 @@ function resolve(session, model, now = Date.now()) {
   const jobInstance = Object.hasOwn(model.process, 'jobInstance') ? model.process.jobInstance : model.process.instance;
   const scheduled = jobs.filter(j => model.process.state === 'live' && j.kind === 'scheduled' && j.recurring === true && j.instance && j.instance === jobInstance && j.expiresAt > now);
   const currentJobs = jobs.filter(j => j.kind !== 'service' && j.kind !== 'scheduled'
-    && (j.current === true || !session.lastUserAt || j.startedAt >= session.lastUserAt));
+    && (j.current === true || !session.lastUserAt || j.startedAt >= session.lastUserAt)
+    && (!j.instance || (jobInstance && j.instance === jobInstance)));
   const concrete = model.background.pending || model.background.uncertain.length || model.background.agents.length || scheduled.length
     || model.task.dependencies.length || model.task.checkAfter;
   const intentional = hint === 'waiting' && Boolean(concrete);
   // Legacy adapters without job identities still provide bounded live-job evidence.
   const jobWait = model.background.pending && (!session.backgroundJobs || session.backgroundJobs.caughtUp !== true || currentJobs.length > 0);
-  return { hint, waiting: intentional || (hint !== 'needs-input' && jobWait),
+  // A current, process-owned ledger entry is concrete work even when its kind is
+  // uncertain. Uncertainty protects it from cleanup; it must also protect the
+  // session from generic readiness until correlated terminal evidence arrives.
+  const currentJobWait = currentJobs.length > 0;
+  return { hint, waiting: intentional || (hint !== 'needs-input' && (jobWait || currentJobWait)),
     reason: handoff === 'waiting' ? 'scheduled check' : intentional && scheduled.length ? 'scheduled check' : intentional && model.task.dependencies.length ? 'dependency'
       : intentional && model.task.checkAfter ? 'scheduled check' : model.background.agents.length ? 'subagent' : require('./session-status').waitReason(session.lastAssistantFull || session.lastAssistant),
     scheduled: scheduled.map(j => ({ id: j.id, expiresAt: j.expiresAt })),
     handoff: handoff ? { taskId: task.id, checkAfter: task.checkAfter, at: task.scheduledAt, intent: handoff } : null,
-    source: handoff && hint === handoff ? 'registry' : hook ? 'hook' : 'conversation', confidence: handoff && hint === handoff ? 'observed' : 'inferred' };
+    source: handoff && hint === handoff ? 'registry' : hook ? 'hook' : currentJobWait ? 'background' : 'conversation',
+    confidence: handoff && hint === handoff ? 'observed' : currentJobWait && currentJobs.every(j => model.background.uncertain.includes(j.id)) ? 'uncertain' : currentJobWait ? 'observed' : 'inferred' };
 }
 module.exports = { stopHint, resolve };

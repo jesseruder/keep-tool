@@ -148,6 +148,41 @@ test('current work and waits override old prose requests', () => {
   }
 });
 
+test('a current process-owned uncertain job suppresses generic readiness', () => {
+  const pending = {
+    id: 'review-job', kind: 'unknown', status: 'pending', startedAt: 1100,
+    eventAt: 1100, instance: 'pane:1:agent', run: 'review-call',
+  };
+  const base = {
+    ...session, pane: 'pane', lastUserAt: 1000,
+    runtime: { state: 'live', instance: 'pane:1:shell', jobInstance: 'pane:1:agent' },
+    lastAssistantFull: "Watchdog is on the review job. I'll relay the findings and rerun the gate.",
+    pendingBackground: false, unknownBackgroundJobs: ['review-job'],
+    backgroundJobs: { pending: false, uncertain: ['review-job'], caughtUp: true, jobs: [pending] },
+  };
+  const waiting = activity(base);
+  assert.equal(waiting.state, 'waiting');
+  assert.equal(waiting.reason, 'review');
+  assert.equal(waiting.decision.source, 'background');
+  assert.equal(waiting.decision.confidence, 'uncertain');
+  assert.equal(attention(base), null);
+
+  assert.equal(activity({ ...base, lastAssistantFull: 'Should I change the implementation?' }).state, 'needs-input',
+    'an explicit question still wins');
+  for (const job of [
+    { ...pending, status: 'completed' },
+    { ...pending, startedAt: 900 },
+    { ...pending, kind: 'service' },
+    { ...pending, kind: 'scheduled' },
+    { ...pending, instance: 'other-pane:2:agent' },
+  ]) {
+    const current = { ...base, unknownBackgroundJobs: job.status === 'pending' ? [job.id] : [],
+      backgroundJobs: { ...base.backgroundJobs, jobs: [job] } };
+    assert.equal(activity(current).reason, 'next instruction', JSON.stringify(job));
+    assert.equal(attention(current).attentionLabel, 'Ready for next instruction');
+  }
+});
+
 test('dismissal remains tied to conversation activity, not metadata or focus', () => {
   const { applySetAside, setAsideCandidates } = require('./serve');
   const base = { ...session, pane: 'p', taskStatus: 'done', attentionAt: 1000, mtime: 1000 };
