@@ -398,6 +398,89 @@ test('desktop source safety rejects foreground, background, native, and portable
   assert.equal(portable.sourceBusyReason({ session: { endedTurn: true, state: 'needs-input' } }), '');
 });
 
+test('verified terminal quota pause tolerates only caught-up ledger metadata gaps', () => {
+  const rateLimitAt = Date.parse('2026-09-12T20:34:01.831Z');
+  const session = {
+    id: 'source-session-1234', kind: 'claude', accountId: 'claude/default', endedTurn: false, exited: true,
+    rateLimit: { at: '2026-09-12T20:34:01.831Z', type: 'fable_weekly' },
+    lastUserAt: rateLimitAt - 1000, lifecycleTurnAt: rateLimitAt - 1000,
+    pendingBackground: false, pendingOther: false, toolRunning: false, pendingQuestion: null, pendingPlan: null,
+    unknownBackgroundJobs: ['history-gap'], lifecycleAgents: [],
+    backgroundJobs: { pending: false, uncertain: ['history-gap'], caughtUp: true, recovering: false,
+      unresolvedCalls: 0, unconsumedHooks: 0, jobs: [
+        { id: 'job-one', kind: 'agent', status: 'completed' },
+        { id: 'job-two', kind: 'command', status: 'failed' },
+      ] },
+    runtime: { state: 'exited', paneId: 'pane-source', liveInstances: 0 },
+    observation: { foreground: { state: 'active', hook: { state: 'running', at: rateLimitAt - 1 } } },
+  };
+  const inspection = { session, terminalRateLimit: { version: 1, rateLimitAt, runtimeState: 'exited', pane: 'pane-source' } };
+  assert.equal(portable.sourceBusyReason(inspection), '');
+
+  const blocked = [
+    { name: 'missing proof', inspection: { session } },
+    { name: 'newer human activity', inspection: { ...inspection, session: { ...session, lastUserAt: rateLimitAt + 1 } } },
+    { name: 'newer lifecycle turn', inspection: { ...inspection, session: { ...session, lifecycleTurnAt: rateLimitAt + 1 } } },
+    { name: 'malformed activity time', inspection: { ...inspection, session: { ...session, lastUserAt: 'unknown' } } },
+    { name: 'newer running hook', inspection: { ...inspection, session: { ...session,
+      observation: { foreground: { state: 'active', hook: { state: 'running', at: rateLimitAt + 1 } } } } } },
+    { name: 'unknown concrete identity', inspection: { ...inspection, session: { ...session,
+      unknownBackgroundJobs: ['job-unknown'] } } },
+    { name: 'unfinished job', inspection: { ...inspection, session: { ...session,
+      backgroundJobs: { ...session.backgroundJobs, jobs: [{ id: 'job-one', status: 'pending' }] } } } },
+    { name: 'recovering history', inspection: { ...inspection, session: { ...session,
+      unknownBackgroundJobs: ['history-recovery'], backgroundJobs: { ...session.backgroundJobs,
+        uncertain: ['history-recovery'], recovering: true, caughtUp: false } } } },
+    { name: 'running tool', inspection: { ...inspection, session: { ...session, toolRunning: true } } },
+    { name: 'malformed jobs', inspection: { ...inspection, session: { ...session,
+      backgroundJobs: { ...session.backgroundJobs, jobs: null } } } },
+  ];
+  for (const entry of blocked) assert.notEqual(portable.sourceBusyReason(entry.inspection), '', entry.name);
+
+  const live = { ...session, exited: false, runtime: { state: 'live', paneId: 'pane-source', liveInstances: 1 } };
+  assert.equal(portable.sourceBusyReason({ session: live, terminalRateLimit: {
+    version: 1, rateLimitAt, runtimeState: 'live', pane: 'pane-source', sourceAgentPid: 42, sourceAgentPidStart: 'start-42',
+  } }), '');
+  assert.notEqual(portable.sourceBusyReason({ session: live, terminalRateLimit: {
+    version: 1, rateLimitAt, runtimeState: 'live', pane: 'pane-source', sourceAgentPid: 42,
+  } }), '', 'live proof requires the exact process incarnation');
+});
+
+test('desktop draft and prepare accept a verified terminal quota pause, then launch revalidates newer activity', async () => {
+  const f = fixture();
+  const rateLimitAt = Date.parse('2026-09-12T20:34:01.831Z');
+  const session = {
+    id: 'source-session-1234', kind: 'claude', accountId: 'claude/default', endedTurn: false, exited: true,
+    rateLimit: { at: new Date(rateLimitAt).toISOString(), type: 'fable_weekly' },
+    lastUserAt: rateLimitAt - 1000, lifecycleTurnAt: rateLimitAt - 1000, lifecycleAgents: [],
+    pendingBackground: false, pendingOther: false, toolRunning: false, pendingQuestion: null, pendingPlan: null,
+    unknownBackgroundJobs: ['history-gap'],
+    backgroundJobs: { pending: false, uncertain: ['history-gap'], caughtUp: true, recovering: false,
+      unresolvedCalls: 0, unconsumedHooks: 0, jobs: [{ id: 'completed-job', status: 'completed' }] },
+    runtime: { state: 'exited', paneId: 'pane-source', liveInstances: 0 },
+    observation: { foreground: { state: 'active' } },
+  };
+  const inspection = () => ({ session, terminalRateLimit: {
+    version: 1, rateLimitAt, runtimeState: 'exited', pane: 'pane-source',
+  } });
+  f.deps.sourceFor = () => ({ agent: 'claude', accountId: session.accountId,
+    cwd: f.cwd, file: f.transcript, title: 'Quota-paused source' });
+  f.deps.inspectSource = async () => inspection();
+  try {
+    const draft = await portable.draft({ sourceSessionId: session.id }, f.deps);
+    assert.equal(draft.sourceAgent, 'claude');
+    const prepared = await portable.run({ sourceSessionId: session.id, accountId: f.target.id,
+      contextText: 'Wait after reading this quota-paused source.', prepareOnly: true }, f.deps);
+    assert.equal(prepared.status, 'prepared');
+    assert.equal(f.opened.length, 0, 'preparing the reviewed package does not launch a successor');
+
+    session.lastUserAt = rateLimitAt + 1;
+    await assert.rejects(portable.launchPrepared(prepared.requestKey, f.deps),
+      (error) => error.code === 'KEEP_PORTABLE_TRANSFER_SOURCE_BUSY');
+    assert.equal(f.opened.length, 0, 'new activity after preview prevents launch');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test('portable fallback ignores only named ledger metadata and still blocks concrete obligations', () => {
   const base = { portableFallback: { phase: 'portable-fallback' }, session: { endedTurn: true, state: 'needs-input',
     pendingBackground: true, unknownBackgroundJobs: ['history-gap'], backgroundJobs: { jobs: [] } } };

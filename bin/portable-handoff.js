@@ -15,6 +15,9 @@ const EXCERPT_LIMIT = 64 * 1024;
 const GIT_CAPTURE_LIMIT = 8 * 1024 * 1024;
 const DESKTOP_POLICY_VERSION = 2;
 const CLAUDE_DEFAULT_MODEL = 'claude-fable-5-1';
+const TERMINAL_JOB_STATES = new Set(['completed', 'failed', 'cancelled']);
+const TERMINAL_QUOTA_TYPES = new Set(['five_hour', 'seven_day', 'fable_weekly']);
+const TERMINAL_QUOTA_UNCERTAINTY = new Set(['history-gap']);
 
 function problem(message, code = 'KEEP_PORTABLE_TRANSFER', status = 400) {
   const error = new Error(message); error.code = code; error.status = status; return error;
@@ -324,6 +327,39 @@ function modelCompatible(agent, model) {
   return !/^(?:claude-|opus(?:[-_.:]|$)|sonnet(?:[-_.:]|$)|haiku(?:[-_.:]|$)|fable(?:[-_.:]|$))/i.test(model);
 }
 
+function verifiedTerminalQuotaPause(inspection) {
+  const session = inspection?.session;
+  const proof = inspection?.terminalRateLimit;
+  const rateAt = Date.parse(session?.rateLimit?.at || '');
+  const background = session?.backgroundJobs;
+  const unknown = session?.unknownBackgroundJobs;
+  const lastUserAt = session?.lastUserAt == null ? 0 : Number(session.lastUserAt);
+  const lifecycleTurnAt = session?.lifecycleTurnAt == null ? 0 : Number(session.lifecycleTurnAt);
+  if (!session || session.kind !== 'claude' || !proof || proof.version !== 1
+      || proof.rateLimitAt !== rateAt || !Number.isFinite(rateAt)
+      || proof.pane !== session.runtime?.paneId
+      || !TERMINAL_QUOTA_TYPES.has(session.rateLimit?.type)
+      || !background || !Array.isArray(background.jobs) || !Array.isArray(background.uncertain)
+      || !Array.isArray(unknown) || background.pending !== false || background.caughtUp !== true
+      || background.recovering !== false || background.unresolvedCalls !== 0 || background.unconsumedHooks !== 0
+      || session.pendingBackground !== false || session.pendingQuestion || session.pendingPlan
+      || !Array.isArray(session.lifecycleAgents) || session.lifecycleAgents.length
+      || unknown.some((entry) => !TERMINAL_QUOTA_UNCERTAINTY.has(entry))
+      || background.uncertain.some((entry) => !TERMINAL_QUOTA_UNCERTAINTY.has(entry))
+      || background.jobs.some((job) => !TERMINAL_JOB_STATES.has(job?.status))
+      || !Number.isFinite(lastUserAt) || lastUserAt > rateAt
+      || !Number.isFinite(lifecycleTurnAt) || lifecycleTurnAt > rateAt) return false;
+  const hook = session.observation?.foreground?.hook;
+  if (hook && (!Number.isFinite(hook.at) || hook.at > rateAt)) return false;
+  if (proof.runtimeState === 'live') {
+    return session.runtime?.state === 'live' && session.runtime.liveInstances === 1
+      && Number.isInteger(proof.sourceAgentPid) && proof.sourceAgentPid > 0
+      && typeof proof.sourceAgentPidStart === 'string' && proof.sourceAgentPidStart.length > 0;
+  }
+  return proof.runtimeState === 'exited' && session.runtime?.state === 'exited'
+    && session.runtime.liveInstances === 0 && session.exited === true;
+}
+
 function sourceBusyReason(inspection) {
   const session = inspection?.session;
   if (!session) return 'source session activity could not be verified';
@@ -331,8 +367,9 @@ function sourceBusyReason(inspection) {
   if (inspection.portableHandoff) return 'source has another unresolved portable transfer';
   if (session.toolRunning) return 'a source tool is still running';
   if (session.pendingOther) return 'the source has an unfinished tool call';
+  const terminalQuotaPause = verifiedTerminalQuotaPause(inspection);
   const fallback = inspection.portableFallback;
-  if (fallback) {
+  if (!terminalQuotaPause && fallback) {
     const unknown = Array.isArray(session.unknownBackgroundJobs) ? session.unknownBackgroundJobs : ['malformed-history-evidence'];
     const metadataOnly = unknown.every((entry) => typeof entry === 'string'
       && ['history-gap', 'history-recovery'].includes(entry));
@@ -342,10 +379,14 @@ function sourceBusyReason(inspection) {
     if (concrete || !metadataOnly || session.pendingBackground && unknown.length === 0) {
       return 'the source has unfinished background work';
     }
-  } else if (session.pendingBackground || session.unknownBackgroundJobs?.length) return 'the source has unfinished background work';
+  } else if (!terminalQuotaPause && (session.pendingBackground || session.unknownBackgroundJobs?.length)) {
+    return 'the source has unfinished background work';
+  }
   if (session.observation?.foreground?.state === 'active' || session.observation?.foreground?.hook?.state === 'running') {
+    if (terminalQuotaPause) return '';
     return 'the source foreground turn is still running';
   }
+  if (terminalQuotaPause) return '';
   if (session.endedTurn === true || session.exited === true || session.state === 'exited') return '';
   return 'the source turn has not ended';
 }
@@ -472,9 +513,10 @@ async function launchState(state, stateFile, deps) {
   if (resumingOpening && !deps.resumeOpening) throw problem('portable transfer opening recovery is unavailable', 'KEEP_PORTABLE_TRANSFER_UNAVAILABLE', 503);
   if (state.policyVersion === DESKTOP_POLICY_VERSION) {
     const inspection = await inspectReady(state.sourceSessionId, deps, { launching: true, transferId: state.requestKey });
-    if (state.sourceAgentPid && (!inspection.portableFallback
-        || inspection.portableFallback.sourceAgentPid !== state.sourceAgentPid
-        || inspection.portableFallback.sourceAgentPidStart !== state.sourceAgentPidStart)) {
+    const sourceIdentity = inspection.portableFallback || inspection.terminalRateLimit;
+    if (state.sourceAgentPid && (!sourceIdentity
+        || sourceIdentity.sourceAgentPid !== state.sourceAgentPid
+        || sourceIdentity.sourceAgentPidStart !== state.sourceAgentPidStart)) {
       throw problem('portable transfer source process changed after preview', 'KEEP_PORTABLE_TRANSFER_STALE', 409);
     }
     const source = { ...(deps.sourceFor || defaultSource)(state.sourceSessionId, {
@@ -649,6 +691,7 @@ async function run(request, deps = {}) {
     }
     if (!modelCompatible(target.agent, request.model || '')) throw problem(`model ${request.model} is not compatible with ${target.agent}`);
   }
+  const sourceIdentity = inspection?.portableFallback || inspection?.terminalRateLimit;
   const task = (deps.taskForSession || (() => require('./keep.js').taskForSession(sessionId)))(sessionId);
   if (!task?.id) throw problem('Link this session to a task before transferring', 'KEEP_PORTABLE_TRANSFER_CARD', 409);
   const context = contextValue(request);
@@ -708,9 +751,9 @@ async function run(request, deps = {}) {
         note: `Portable continuation from ${sessionId} to ${target.id}` });
       state = { version: 1, ...(desktop ? { policyVersion: DESKTOP_POLICY_VERSION } : {}), requestKey, status: 'prepared', sourceSessionId: sessionId, sourceAgent: source.agent,
         sourceAccountId: source.accountId || '', sourceTranscriptDigest: transcript.digest, targetAccountId: target.id,
-        ...(inspection?.portableFallback?.sourceAgentPid ? {
-          sourceAgentPid: inspection.portableFallback.sourceAgentPid,
-          sourceAgentPidStart: inspection.portableFallback.sourceAgentPidStart,
+        ...(sourceIdentity?.sourceAgentPid ? {
+          sourceAgentPid: sourceIdentity.sourceAgentPid,
+          sourceAgentPidStart: sourceIdentity.sourceAgentPidStart,
         } : {}),
         targetAgent: target.agent, ...(desktop && request.model ? { model: request.model } : {}), cardId: task.id, cwd,
         ...(desktop ? { desktopInputs: { accountId: target.id, model: request.model || '', cwd,
@@ -724,6 +767,6 @@ async function run(request, deps = {}) {
   } finally { unlock(); }
 }
 
-module.exports = { run, draft, launchPrepared, resolvePrepared, readPreview, list, safeSummary, sourceBusyReason,
+module.exports = { run, draft, launchPrepared, resolvePrepared, readPreview, list, safeSummary, sourceBusyReason, verifiedTerminalQuotaPause,
   recordLaunch, reserveDelivery, markAwaitingSetup, recordDelivery, deliveryReceipt, openingMessage,
   extractConversation, renderPackage, defaultGitSnapshot, transactionFile, CLAUDE_DEFAULT_MODEL, CONTEXT_LIMIT };

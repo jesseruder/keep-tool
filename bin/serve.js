@@ -5925,6 +5925,108 @@ function listPortableTransfers(deps = {}) {
   return (deps.portable || require('./portable-handoff')).list(deps.root || keep.ROOT);
 }
 
+const PORTABLE_TERMINAL_JOB_STATES = new Set(['completed', 'failed', 'cancelled']);
+const PORTABLE_TERMINAL_QUOTA_TYPES = new Set(['five_hour', 'seven_day', 'fable_weekly']);
+const PORTABLE_LEDGER_LIMIT = 4 * 1024 * 1024;
+
+function readPortableJobState(root, sessionId) {
+  if (!/^[A-Za-z0-9_-]{8,160}$/.test(sessionId || '')) return null;
+  const file = path.join(root, '.keep', 'background-jobs', 'claude', sessionId, 'state.json');
+  let fd;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const before = fs.fstatSync(fd);
+    if (!before.isFile() || before.size > PORTABLE_LEDGER_LIMIT) return null;
+    const buffer = Buffer.alloc(before.size);
+    if (before.size && fs.readSync(fd, buffer, 0, before.size, 0) !== before.size) return null;
+    const after = fs.fstatSync(fd);
+    if (['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs'].some((field) => before[field] !== after[field])) return null;
+    return { value: JSON.parse(buffer.toString('utf8')), file, stat: after };
+  } catch { return null; }
+  finally { if (fd != null) fs.closeSync(fd); }
+}
+
+function portableTerminalLedgerEvidence(session, transcriptFile, root) {
+  const loaded = readPortableJobState(root, session.id);
+  if (!loaded || !transcriptFile) return null;
+  let transcript;
+  try {
+    transcript = fs.lstatSync(transcriptFile);
+    const currentLedger = fs.lstatSync(loaded.file);
+    const inbox = fs.readdirSync(path.join(path.dirname(loaded.file), 'inbox'));
+    if (!transcript.isFile() || transcript.isSymbolicLink() || inbox.length
+        || ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs'].some((field) => currentLedger[field] !== loaded.stat[field])) return null;
+  } catch { return null; }
+  const value = loaded.value;
+  const restart = value?.restart;
+  const checkpoint = value?.checkpoint;
+  const jobs = value?.jobs && !Array.isArray(value.jobs) ? Object.values(value.jobs) : null;
+  const rateLimitAt = Date.parse(session.rateLimit?.at || '');
+  const transcriptIdentity = `${crypto.createHash('sha256').update(path.resolve(transcriptFile)).digest('hex')}:${transcript.dev}:${transcript.ino}`;
+  // Reconciliation may observe trailing duration/cost metadata after the quota
+  // response. The scanner keeps rateLimit only while no later real turn exists.
+  if (value?.version !== 1 || value.restartVersion !== require('./background-jobs').restartVersion('claude')
+      || value.recovering !== false || !jobs || !value.calls || Array.isArray(value.calls) || Object.keys(value.calls).length
+      || restart?.id !== session.id || restart.rateLimitTerminal !== true
+      || !Number.isFinite(restart.observedAt) || restart.observedAt < rateLimitAt
+      || !Number.isFinite(rateLimitAt) || !PORTABLE_TERMINAL_QUOTA_TYPES.has(session.rateLimit?.type)
+      || value.source?.agent !== 'claude' || value.source.sid !== session.id
+      || path.resolve(value.source.file || '') !== path.resolve(transcriptFile)
+      || checkpoint?.identity !== transcriptIdentity || checkpoint.offset !== transcript.size || checkpoint.mtime !== transcript.mtimeMs
+      || value.hookBarrier != null && (!Number.isFinite(value.hookBarrier) || checkpoint.offset <= value.hookBarrier)
+      || jobs.some((job) => !PORTABLE_TERMINAL_JOB_STATES.has(job?.status))) return null;
+  const byId = new Map(jobs.map((job) => [job.id, job]));
+  if (Object.keys(restart.launches || {}).some((launch) => !restart.mapped?.[launch])
+      || Object.keys(restart.children || {}).some((child) => !PORTABLE_TERMINAL_JOB_STATES.has(byId.get(child)?.status))) return null;
+  return { rateLimitAt, transcriptIdentity, gap: value.gap === true };
+}
+
+async function portableTerminalRateLimitEvidence(session, state, deps = {}) {
+  const rateLimitAt = Date.parse(session?.rateLimit?.at || '');
+  const background = session?.backgroundJobs;
+  const unknown = session?.unknownBackgroundJobs;
+  const lastUserAt = session?.lastUserAt == null ? 0 : Number(session.lastUserAt);
+  const lifecycleTurnAt = session?.lifecycleTurnAt == null ? 0 : Number(session.lifecycleTurnAt);
+  if (session?.kind !== 'claude' || !Number.isFinite(rateLimitAt)
+      || !PORTABLE_TERMINAL_QUOTA_TYPES.has(session.rateLimit?.type)
+      || session.toolRunning || session.pendingOther || session.pendingQuestion || session.pendingPlan || session.pendingBackground !== false
+      || !Array.isArray(session.lifecycleAgents) || session.lifecycleAgents.length
+      || !background || background.pending !== false || background.caughtUp !== true || background.recovering !== false
+      || background.unresolvedCalls !== 0 || background.unconsumedHooks !== 0
+      || !Array.isArray(background.jobs) || background.jobs.some((job) => !PORTABLE_TERMINAL_JOB_STATES.has(job?.status))
+      || !Array.isArray(background.uncertain) || background.uncertain.some((entry) => entry !== 'history-gap')
+      || !Array.isArray(unknown) || unknown.some((entry) => entry !== 'history-gap')
+      || !Number.isFinite(lastUserAt) || lastUserAt > rateLimitAt
+      || !Number.isFinite(lifecycleTurnAt) || lifecycleTurnAt > rateLimitAt) return null;
+  const foregroundHook = session.observation?.foreground?.hook;
+  if (foregroundHook && (!Number.isFinite(foregroundHook.at) || foregroundHook.at > rateLimitAt)) return null;
+  let transcriptFile;
+  try {
+    transcriptFile = deps.portableTranscriptFile
+      ? deps.portableTranscriptFile(session)
+      : findSessionFile(session.id, { root: deps.root || keep.ROOT, env: deps.env || process.env });
+  } catch { return null; }
+  const ledger = portableTerminalLedgerEvidence(session, transcriptFile, deps.root || keep.ROOT);
+  if (!ledger) return null;
+  const pane = (state.panes || []).find((entry) => entry.id === session.runtime?.paneId);
+  if (!pane || pane.meta?.sessionId !== session.id || pane.meta?.agent !== 'claude'
+      || !session.accountId || pane.meta?.accountId !== session.accountId) return null;
+  if (session.runtime?.state === 'exited') {
+    if (session.runtime.liveInstances !== 0 || session.exited !== true || pane.alive !== false && pane.agentAlive !== false) return null;
+    return { version: 1, rateLimitAt, runtimeState: 'exited', pane: pane.id, ledgerGap: ledger.gap };
+  }
+  if (session.runtime?.state !== 'live' || session.runtime.liveInstances !== 1 || pane.alive !== true || pane.agentAlive === false) return null;
+  try {
+    const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
+    const identity = (await (deps.liveSessionPids || liveSessionPids)({ ...deps,
+      agentProcessRows: async () => rows })).get(session.id);
+    if (!identity || identity.primary !== true || !agentIdentityOwnsPane(identity, pane, rows)
+        || !Number.isInteger(identity.pid) || identity.pid <= 0 || !identity.pidStart) return null;
+    return { version: 1, rateLimitAt, runtimeState: 'live', pane: pane.id,
+      sourceAgentPid: identity.pid, sourceAgentPidStart: identity.pidStart, ledgerGap: ledger.gap };
+  } catch { return null; }
+}
+
 async function inspectPortableSource(sessionId, options = {}, deps = {}) {
   let state;
   if (deps.inspectState) state = await deps.inspectState();
@@ -5960,7 +6062,9 @@ async function inspectPortableSource(sessionId, options = {}, deps = {}) {
   if (abandoned && !portableFallback) nativeHandoff ||= abandoned;
   const portableHandoff = listPortableTransfers(deps).find((entry) => entry.sourceSessionId === sessionId
     && entry.id !== options.transferId && ['launching', 'awaiting-setup', 'ambiguous', 'done'].includes(entry.status));
-  return { session, nativeHandoff, portableHandoff, portableFallback, panes: state.panes || [], state };
+  const terminalRateLimit = session && !nativeHandoff && !portableHandoff
+    ? await portableTerminalRateLimitEvidence(session, state, deps) : null;
+  return { session, nativeHandoff, portableHandoff, portableFallback, terminalRateLimit, panes: state.panes || [], state };
 }
 
 async function assertPortablePaneBinding(expected, deps = {}) {
@@ -7422,7 +7526,8 @@ module.exports = {
   readPaneRecord, sessionProjectFromTranscript, openSession, reopenSessionOnAccount,
   inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, continueAccountHandoff, handoffSession,
   abandonAccountHandoff,
-  listPortableTransfers, inspectPortableSource, portableTransferDraft, preparePortableTransfer,
+  listPortableTransfers, inspectPortableSource, portableTerminalRateLimitEvidence,
+  portableTransferDraft, preparePortableTransfer,
   portableTransferPreview, transferSession, resolvePortableTransfer, recoverPortableOpening,
   resolveReviewLaunchSelection, launchReviewQueueSession, inspectReviewQueueLaunch, recoverReviewQueueLaunch,
   waitForHostAgent, waitForHostSessionId, addHostSessionState,

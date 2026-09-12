@@ -7,6 +7,7 @@
 for (const k of ['KEEP_REVIEWER', 'KEEP_REVIEWER_NAME', 'KEEP_REVIEWER_MODEL']) delete process.env[k];
 
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -102,6 +103,7 @@ const {
   resumeExitedAccountHandoff,
   listPortableTransfers,
   inspectPortableSource,
+  portableTerminalRateLimitEvidence,
   portableTransferDraft,
   preparePortableTransfer,
   portableTransferPreview,
@@ -4285,6 +4287,86 @@ test('abandoned pre-stop journal authorizes only its still-identical source for 
     ], panes: [pane], handoffs: [] }), liveSessionPids: identity, agentProcessRows: async () => ownedRows });
     assert.equal(inspection.portableFallback, null);
     assert.ok(inspection.nativeHandoff, 'changed identity restores the unresolved handoff refusal');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('portable terminal quota inspection verifies exited and live source identity against its caught-up ledger', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-portable-quota-'));
+  const sessionId = 'source-session-1234';
+  const transcript = path.join(root, 'source.jsonl');
+  const ledgerDirectory = path.join(root, '.keep', 'background-jobs', 'claude', sessionId);
+  const rateLimitAt = Date.parse('2026-09-12T20:34:01.831Z');
+  fs.mkdirSync(path.join(ledgerDirectory, 'inbox'), { recursive: true });
+  fs.writeFileSync(transcript, `${JSON.stringify({ type: 'assistant', timestamp: new Date(rateLimitAt).toISOString(),
+    message: { content: 'You have reached your weekly limit.' } })}\n`);
+  const transcriptStat = fs.statSync(transcript);
+  const transcriptIdentity = `${crypto.createHash('sha256').update(path.resolve(transcript)).digest('hex')}:${transcriptStat.dev}:${transcriptStat.ino}`;
+  const ledger = {
+    version: 1, restartVersion: require('./background-jobs').restartVersion('claude'), recovering: false, gap: true,
+    source: { agent: 'claude', sid: sessionId, file: transcript },
+    calls: {}, notices: {}, jobs: {
+      child: { id: 'child', kind: 'agent', status: 'completed' },
+      command: { id: 'command', kind: 'command', status: 'failed' },
+    },
+    restart: { id: sessionId, rateLimitTerminal: true, observedAt: rateLimitAt + 15,
+      children: { child: 'owned' }, launches: { launch: true }, mapped: { launch: 'child' } },
+    checkpoint: { identity: transcriptIdentity, offset: transcriptStat.size, mtime: transcriptStat.mtimeMs },
+    hookBarrier: null,
+  };
+  const session = {
+    id: sessionId, kind: 'claude', accountId: 'claude/default', endedTurn: false, exited: true,
+    rateLimit: { at: new Date(rateLimitAt).toISOString(), type: 'fable_weekly' },
+    lastUserAt: rateLimitAt - 1000, lifecycleTurnAt: rateLimitAt - 1000, lifecycleAgents: [],
+    pendingBackground: false, pendingOther: false, toolRunning: false, pendingQuestion: null, pendingPlan: null,
+    unknownBackgroundJobs: ['history-gap'],
+    backgroundJobs: { pending: false, uncertain: ['history-gap'], caughtUp: true, recovering: false,
+      unresolvedCalls: 0, unconsumedHooks: 0, jobs: Object.values(ledger.jobs) },
+    runtime: { state: 'exited', paneId: 'pane-source', liveInstances: 0 },
+    observation: { foreground: { state: 'active', hook: { state: 'running', at: rateLimitAt - 1 } } },
+  };
+  const pane = { id: 'pane-source', pid: 40, alive: true, agentAlive: false,
+    meta: { sessionId, accountId: session.accountId, agent: 'claude' } };
+  const state = { sessions: [session], panes: [pane], handoffs: [] };
+  const inspect = (extra = {}) => inspectPortableSource(sessionId, {}, {
+    root, portableTranscriptFile: () => transcript, inspectState: async () => state, ...extra,
+  });
+  try {
+    fs.writeFileSync(path.join(ledgerDirectory, 'state.json'), JSON.stringify(ledger));
+    let inspection = await inspect();
+    assert.deepEqual(inspection.terminalRateLimit, { version: 1, rateLimitAt,
+      runtimeState: 'exited', pane: pane.id, ledgerGap: true });
+    assert.equal(require('./portable-handoff').sourceBusyReason(inspection), '');
+
+    ledger.restart.rateLimitTerminal = false;
+    fs.writeFileSync(path.join(ledgerDirectory, 'state.json'), JSON.stringify(ledger));
+    inspection = await inspect();
+    assert.equal(inspection.terminalRateLimit, null);
+    assert.match(require('./portable-handoff').sourceBusyReason(inspection), /background work/);
+
+    ledger.restart.rateLimitTerminal = true;
+    ledger.hookBarrier = 'malformed';
+    fs.writeFileSync(path.join(ledgerDirectory, 'state.json'), JSON.stringify(ledger));
+    assert.equal((await inspect()).terminalRateLimit, null, 'malformed ledger evidence fails closed');
+
+    ledger.hookBarrier = null;
+    fs.writeFileSync(path.join(ledgerDirectory, 'state.json'), JSON.stringify(ledger));
+    session.exited = false;
+    session.runtime = { state: 'live', paneId: pane.id, liveInstances: 1 };
+    pane.alive = true;
+    pane.agentAlive = true;
+    const identity = async () => new Map([[sessionId,
+      { pid: 42, pidStart: 'source-start', agent: 'claude', primary: true }]]);
+    const ownedRows = [
+      { pid: pane.pid, ppid: 1, pidStart: 'pane-start', args: '/bin/zsh -l' },
+      { pid: 42, ppid: pane.pid, pidStart: 'source-start', args: '/bin/claude', agent: 'claude', interactive: true },
+    ];
+    inspection = await inspect({ liveSessionPids: identity, agentProcessRows: async () => ownedRows });
+    assert.equal(inspection.terminalRateLimit.sourceAgentPid, 42);
+    assert.equal(inspection.terminalRateLimit.sourceAgentPidStart, 'source-start');
+
+    inspection = await inspect({ liveSessionPids: identity, agentProcessRows: async () => [ownedRows[0],
+      { ...ownedRows[1], ppid: 99 }, { pid: 99, ppid: 1, pidStart: 'external', args: '/bin/zsh -l' }] });
+    assert.equal(inspection.terminalRateLimit, null, 'an external same-session process cannot lend live source proof');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
