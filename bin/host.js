@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
+const v8 = require('node:v8');
 const pty = require('node-pty');
 const { Terminal } = require('@xterm/headless');
 const { SerializeAddon } = require('@xterm/addon-serialize');
@@ -17,6 +18,8 @@ const STREAM_CHUNK_BYTES = 3 * 1024 * 1024;
 const TERMINAL_SCROLLBACK = 10000;
 const DEFAULT_SNAPSHOT_SCROLLBACK = 100;
 const HANDOFF_DRAIN_MS = 2000;
+const COLD_FREEZE_CONCURRENCY = 2;
+const COLD_RESTORE_CONCURRENCY = 4;
 const PANE_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
 class RingBuffer {
@@ -252,9 +255,9 @@ function publicPane(pane) {
     inputCount: pane.inputCount,
     outputCount: pane.outputCount,
     lastActivityAt: activityTimes.length ? new Date(Math.max(...activityTimes)).toISOString() : null,
-    bytes: pane.buffer.size,
+    bytes: pane.bufferBytes,
     title: pane.title,
-    alt: pane.term.buffer.active.type === 'alternate',
+    alt: pane.term ? pane.term.buffer.active.type === 'alternate' : pane.coldSnapshot.alt,
     meta: pane.meta,
     primary: pane.primary,
   };
@@ -295,6 +298,8 @@ function createHost(options = {}) {
   const lockPath = `${sock}.lock`;
   const maxBufferBytes = bufferLimit(options.bufferBytes);
   const maxClientBufferBytes = clientBufferLimit(options.clientBufferBytes);
+  const coldDir = path.resolve(options.coldDir || `${sock}.screens`);
+  const coldIO = options.coldIO || fs.promises;
   const log = options.log === undefined ? (line) => process.stdout.write(`${line}\n`) : options.log;
   const panes = new Map();
   const connections = new Set();
@@ -313,12 +318,73 @@ function createHost(options = {}) {
   let reloading = false;
   let nextConnectionId = 1;
   let nextAttachOrder = 1;
+  let activeFreezes = 0;
+  const freezeQueue = [];
+  let activeRestores = 0;
+  const restoreQueue = [];
   let resolveClosed;
   const closed = new Promise((resolve) => { resolveClosed = resolve; });
 
   const eventLog = (line) => {
     try { if (typeof log === 'function') log(line); } catch {}
   };
+  const validColdFile = (paneId, file) => {
+    if (typeof file !== 'string') return false;
+    const resolved = path.resolve(file);
+    const name = path.basename(resolved);
+    return path.dirname(resolved) === coldDir
+      && name.startsWith(`${paneId}-`)
+      && /^[A-Za-z0-9_-]+-[a-f0-9]{16}\.xterm$/.test(name);
+  };
+  const removeColdFile = async (pane, snapshot = pane.coldSnapshot) => {
+    if (!snapshot || !validColdFile(pane.id, snapshot.file)) return;
+    try { await coldIO.unlink(snapshot.file); }
+    catch (error) { if (error.code !== 'ENOENT') eventLog(`host: could not remove cold screen ${pane.id}: ${error.message}`); }
+    if (pane.coldSnapshot === snapshot) pane.coldSnapshot = null;
+  };
+  const decodeColdArchive = (pane, data) => {
+    const archive = v8.deserialize(data);
+    if (!archive || archive.version !== 1 || !Buffer.isBuffer(archive.screen)
+        || !Buffer.isBuffer(archive.buffer) || archive.cols !== pane.cols || archive.rows !== pane.rows
+        || typeof archive.title !== 'string' || typeof archive.alt !== 'boolean') {
+      throw new Error(`invalid cold screen for pane ${pane.id}`);
+    }
+    return archive;
+  };
+  const readColdArchive = async (pane, snapshot = pane.coldSnapshot) => {
+    if (!snapshot || !validColdFile(pane.id, snapshot.file)) {
+      throw new Error(`invalid cold screen reference for pane ${pane.id}`);
+    }
+    return decodeColdArchive(pane, await coldIO.readFile(snapshot.file));
+  };
+  const runRestore = (task) => new Promise((resolve, reject) => {
+    restoreQueue.push({ task, resolve, reject });
+    const pump = () => {
+      while (activeRestores < COLD_RESTORE_CONCURRENCY && restoreQueue.length) {
+        const next = restoreQueue.shift();
+        activeRestores += 1;
+        Promise.resolve().then(next.task).then(next.resolve, next.reject).finally(() => {
+          activeRestores -= 1;
+          pump();
+        });
+      }
+    };
+    pump();
+  });
+  const runFreeze = (task) => new Promise((resolve, reject) => {
+    freezeQueue.push({ task, resolve, reject });
+    const pump = () => {
+      while (activeFreezes < COLD_FREEZE_CONCURRENCY && freezeQueue.length) {
+        const next = freezeQueue.shift();
+        activeFreezes += 1;
+        Promise.resolve().then(next.task).then(next.resolve, next.reject).finally(() => {
+          activeFreezes -= 1;
+          pump();
+        });
+      }
+    };
+    pump();
+  });
   const setPrimary = (pane, viewer) => {
     const next = viewer == null ? null : String(viewer);
     if (pane.primary === next) return;
@@ -341,6 +407,7 @@ function createHost(options = {}) {
         && ![...pane.attachments.values()].some((candidate) => candidate.viewer === attachment.viewer)) {
       promotePrimary(pane);
     }
+    scheduleFreeze(pane);
   };
   const detachConnection = (connection, preservePrimary = false) => {
     subscribers.delete(connection);
@@ -391,22 +458,148 @@ function createHost(options = {}) {
     else eventLog(`host: ${type} ${pane.id}`);
   };
 
+  const newTerminal = (cols, rows) => {
+    const term = new Terminal({ cols, rows, scrollback: TERMINAL_SCROLLBACK, allowProposedApi: true });
+    const serializer = new SerializeAddon();
+    term.loadAddon(serializer);
+    return { term, serializer };
+  };
+  const watchTitle = (pane) => pane.term.onTitleChange((title) => {
+    if (closing || retired || panes.get(pane.id) !== pane) return;
+    if (pane.title === title) return;
+    pane.title = title;
+    emitPane('title', pane);
+  });
+  const disposeTerminal = (pane) => {
+    try { pane.titleDisposable?.dispose(); } catch {}
+    pane.titleDisposable = null;
+    try { pane.term?.dispose(); } catch {}
+    pane.term = null;
+    pane.serializer = null;
+  };
   const terminalWrite = (pane, data) => {
+    pane.modelDirty = true;
     pane.writeChain = pane.writeChain.then(() => new Promise((resolve) => pane.term.write(data, resolve)));
     return pane.writeChain;
   };
+  const canFreeze = (pane) => !closing && !retired && !reloading && !pane.alive && pane.term
+    && pane.attachments.size === 0 && pane.pendingAttachments === 0 && pane.modelUsers === 0
+    && panes.get(pane.id) === pane;
+  const freezePane = async (pane) => {
+    if (pane.freezePromise) return pane.freezePromise;
+    pane.freezePromise = runFreeze(async () => {
+      await settled(pane);
+      if (!canFreeze(pane)) return false;
+      if (!pane.modelDirty && pane.coldSnapshot) {
+        pane.buffer.clear();
+        disposeTerminal(pane);
+        return true;
+      }
+      const currentTerm = pane.term;
+      const archive = {
+        version: 1,
+        cols: pane.cols,
+        rows: pane.rows,
+        title: pane.title,
+        alt: pane.term.buffer.active.type === 'alternate',
+        screen: Buffer.from(pane.serializer.serialize({
+          scrollback: TERMINAL_SCROLLBACK,
+          excludeAltBuffer: false,
+        }), 'utf8'),
+        buffer: pane.buffer.contents(),
+      };
+      const file = path.join(coldDir, `${pane.id}-${crypto.randomBytes(8).toString('hex')}.xterm`);
+      const temporary = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+      try {
+        await coldIO.mkdir(coldDir, { recursive: true, mode: 0o700 });
+        await coldIO.writeFile(temporary, v8.serialize(archive), { flag: 'wx', mode: 0o600 });
+        await coldIO.rename(temporary, file);
+      } catch (error) {
+        try { await coldIO.unlink(temporary); } catch {}
+        eventLog(`host: could not freeze pane ${pane.id}: ${error.message}`);
+        return false;
+      }
+      if (!canFreeze(pane) || pane.term !== currentTerm) {
+        try { await coldIO.unlink(file); } catch {}
+        return false;
+      }
+      const previous = pane.coldSnapshot;
+      pane.coldSnapshot = {
+        file,
+        size: archive.screen.length,
+        rawBytes: archive.buffer.length,
+        alt: archive.alt,
+      };
+      pane.modelDirty = false;
+      pane.buffer.clear();
+      disposeTerminal(pane);
+      if (previous && previous.file !== file) await removeColdFile(pane, previous);
+      return true;
+    }).finally(() => { pane.freezePromise = null; });
+    return pane.freezePromise;
+  };
+  const scheduleFreeze = (pane) => {
+    if (pane.freezeScheduled || !canFreeze(pane)) return;
+    pane.freezeScheduled = true;
+    const timer = setImmediate(() => {
+      pane.freezeScheduled = false;
+      freezePane(pane).catch((error) => eventLog(`host: could not freeze pane ${pane.id}: ${error.message}`));
+    });
+    if (typeof timer.unref === 'function') timer.unref();
+  };
+  const restorePane = async (pane) => {
+    if (pane.term) return pane.term;
+    if (pane.restorePromise) return pane.restorePromise;
+    const snapshot = pane.coldSnapshot;
+    pane.restorePromise = runRestore(async () => {
+      const archive = await readColdArchive(pane, snapshot);
+      const created = newTerminal(pane.cols, pane.rows);
+      try {
+        await new Promise((resolve) => created.term.write(archive.screen, resolve));
+        if (panes.get(pane.id) !== pane || pane.coldSnapshot !== snapshot) {
+          throw new Error('pane process changed');
+        }
+        pane.term = created.term;
+        pane.serializer = created.serializer;
+        pane.buffer.clear();
+        pane.buffer.push(archive.buffer);
+        pane.bufferBytes = pane.buffer.size;
+        pane.modelDirty = false;
+        pane.titleDisposable = watchTitle(pane);
+        return pane.term;
+      } catch (error) {
+        created.term.dispose();
+        throw error;
+      }
+    }).finally(() => { pane.restorePromise = null; });
+    return pane.restorePromise;
+  };
+  const withTerminal = async (pane, action) => {
+    pane.modelUsers += 1;
+    try {
+      await restorePane(pane);
+      if (panes.get(pane.id) !== pane) throw new Error('pane process changed');
+      return await action();
+    } finally {
+      pane.modelUsers -= 1;
+      scheduleFreeze(pane);
+    }
+  };
 
   const createPane = (record) => {
-    const term = new Terminal({
-      cols: record.cols, rows: record.rows, scrollback: TERMINAL_SCROLLBACK, allowProposedApi: true,
-    });
-    const serializer = new SerializeAddon();
-    term.loadAddon(serializer);
+    const coldSnapshot = record.coldSnapshot || null;
+    if (coldSnapshot && (record.alive || !validColdFile(String(record.id), coldSnapshot.file)
+        || !Number.isInteger(coldSnapshot.rawBytes) || coldSnapshot.rawBytes < 0
+        || typeof coldSnapshot.alt !== 'boolean')) {
+      throw new Error('invalid cold screen in host handoff record');
+    }
+    const created = coldSnapshot ? null : newTerminal(record.cols, record.rows);
     let resolveExit;
     const exit = new Promise((resolve) => { resolveExit = resolve; });
     const pane = {
       id: record.id, cmd: record.cmd, args: record.args, cwd: record.cwd,
-      cols: record.cols, rows: record.rows, term, serializer, pty: record.pty,
+      cols: record.cols, rows: record.rows,
+      term: created && created.term, serializer: created && created.serializer, pty: record.pty,
       meta: record.meta === undefined ? {} : record.meta,
       alive: record.alive,
       exitCode: record.exitCode == null ? null : record.exitCode,
@@ -423,6 +616,13 @@ function createHost(options = {}) {
       // to attach or type claim the adopted pane instead of retaining a ghost owner.
       primary: record.adopted ? null : (record.primary == null ? null : String(record.primary)),
       buffer: new RingBuffer(maxBufferBytes),
+      bufferBytes: coldSnapshot ? coldSnapshot.rawBytes : 0,
+      coldSnapshot,
+      modelDirty: false,
+      modelUsers: 0,
+      freezePromise: null,
+      freezeScheduled: false,
+      restorePromise: null,
       attachments: new Map(),
       pendingAttachments: 0,
       writeChain: Promise.resolve(),
@@ -432,15 +632,11 @@ function createHost(options = {}) {
       dataDisposable: null,
       exitDisposable: null,
     };
-    if (record.buffer) pane.buffer.push(record.buffer);
+    if (!coldSnapshot && record.buffer) pane.buffer.push(record.buffer);
+    if (!coldSnapshot) pane.bufferBytes = pane.buffer.size;
     if (!pane.alive) resolveExit();
     panes.set(pane.id, pane);
-    pane.titleDisposable = term.onTitleChange((title) => {
-      if (closing || retired || panes.get(pane.id) !== pane) return;
-      if (pane.title === title) return;
-      pane.title = title;
-      emitPane('title', pane);
-    });
+    if (pane.term) pane.titleDisposable = watchTitle(pane);
     pane.dataDisposable = pane.pty.onData((value) => {
       if (closing) return;
       const data = Buffer.isBuffer(value) ? value : Buffer.from(value);
@@ -456,6 +652,7 @@ function createHost(options = {}) {
         return;
       }
       pane.buffer.push(data);
+      pane.bufferBytes = pane.buffer.size;
       pane.outputCount += 1;
       pane.lastOutputAt = new Date().toISOString();
       if ([...pane.attachments.values()].some((attachment) => attachment.visible === true)) {
@@ -488,9 +685,13 @@ function createHost(options = {}) {
         else connection.send(frame);
       }
       emitPane('exited', pane);
+      scheduleFreeze(pane);
     });
-    if (record.screen) terminalWrite(pane, record.screen).catch(() => {});
-    else if (pane.buffer.size) terminalWrite(pane, pane.buffer.contents()).catch(() => {});
+    if (!coldSnapshot) {
+      if (record.screen) terminalWrite(pane, record.screen).catch(() => {});
+      else if (pane.buffer.size) terminalWrite(pane, pane.buffer.contents()).catch(() => {});
+      if (!pane.alive) scheduleFreeze(pane);
+    }
     return pane;
   };
 
@@ -558,6 +759,8 @@ function createHost(options = {}) {
           version: 1, replaceExited: true, guardedKill: true, compactScreen: true,
           bootVersion: options.boot && options.boot.version || null,
           panes: panes.size, pid: process.pid, sock,
+          residentTerminals: [...panes.values()].filter((pane) => pane.term).length,
+          coldTerminals: [...panes.values()].filter((pane) => !pane.term && pane.coldSnapshot).length,
           reloads: options.boot && options.boot.reloads || 0,
           lastReload: options.boot && options.boot.lastReload || null,
         } };
@@ -571,6 +774,8 @@ function createHost(options = {}) {
           throw new Error('replacement requires the exact exited session process');
         }
         await settled(old);
+        if (old.restorePromise) await old.restorePromise;
+        if (old.freezePromise) await old.freezePromise;
         if (panes.get(old.id) !== old) throw new Error('session process changed during replacement');
         panes.delete(old.id);
         let replacement;
@@ -580,7 +785,8 @@ function createHost(options = {}) {
         for (const disposable of [old.dataDisposable, old.exitDisposable, old.titleDisposable]) {
           try { disposable?.dispose(); } catch {}
         }
-        old.term.dispose();
+        disposeTerminal(old);
+        await removeColdFile(old);
         return { result: { pane: publicPane(replacement) } };
       }
       case 'list':
@@ -670,6 +876,7 @@ function createHost(options = {}) {
         let history = null;
         pane.pendingAttachments += 1;
         try {
+          await restorePane(pane);
           if (params.snapshot === true) {
             const scrollback = snapshotScrollback(params.snapshotScrollback);
             await settled(pane);
@@ -746,28 +953,35 @@ function createHost(options = {}) {
       }
       case 'screen': {
         const pane = needPane(params.pane);
-        await settled(pane);
-        if (panes.get(pane.id) !== pane) throw new Error('pane process changed');
-        return { result: renderScreen(pane.term, { lines: params.compact ? null : params.lines, scrollback: params.scrollback, title: pane.title, compact: params.compact === true }) };
+        return withTerminal(pane, async () => {
+          await settled(pane);
+          if (panes.get(pane.id) !== pane) throw new Error('pane process changed');
+          return { result: renderScreen(pane.term, { lines: params.compact ? null : params.lines, scrollback: params.scrollback, title: pane.title, compact: params.compact === true }) };
+        });
       }
       case 'clear': {
         const pane = needPane(params.pane);
-        await settled(pane);
-        if (panes.get(pane.id) !== pane) throw new Error('pane process changed');
-        pane.buffer.clear();
-        pane.term.clear();
-        if (params.repaint !== false && pane.alive && pane.cols > 1) {
-          const cols = pane.cols;
-          try {
-            pane.pty.resize(cols - 1, pane.rows);
-            pane.term.resize(cols - 1, pane.rows);
-            await new Promise((resolve) => setTimeout(resolve, 30));
-            if (pane.alive) pane.pty.resize(cols, pane.rows);
-          } finally {
-            pane.term.resize(cols, pane.rows);
+        return withTerminal(pane, async () => {
+          await settled(pane);
+          if (panes.get(pane.id) !== pane) throw new Error('pane process changed');
+          await removeColdFile(pane);
+          pane.modelDirty = true;
+          pane.buffer.clear();
+          pane.bufferBytes = 0;
+          pane.term.clear();
+          if (params.repaint !== false && pane.alive && pane.cols > 1) {
+            const cols = pane.cols;
+            try {
+              pane.pty.resize(cols - 1, pane.rows);
+              pane.term.resize(cols - 1, pane.rows);
+              await new Promise((resolve) => setTimeout(resolve, 30));
+              if (pane.alive) pane.pty.resize(cols, pane.rows);
+            } finally {
+              pane.term.resize(cols, pane.rows);
+            }
           }
-        }
-        return { result: { pane: publicPane(pane) } };
+          return { result: { pane: publicPane(pane) } };
+        });
       }
       case 'guarded-kill': {
         const pane = needPane(params.pane);
@@ -795,6 +1009,8 @@ function createHost(options = {}) {
         const pane = needPane(params.pane);
         if (pane.alive) throw new Error('pane is still alive');
         await settled(pane);
+        if (pane.restorePromise) await pane.restorePromise;
+        if (pane.freezePromise) await pane.freezePromise;
         if (panes.get(pane.id) !== pane) throw new Error('pane process changed');
         for (const connection of pane.attachments.keys()) detachPane(connection, pane);
         pane.attachments.clear();
@@ -804,7 +1020,8 @@ function createHost(options = {}) {
         for (const disposable of [pane.dataDisposable, pane.exitDisposable, pane.titleDisposable]) {
           try { if (disposable) disposable.dispose(); } catch {}
         }
-        pane.term.dispose();
+        disposeTerminal(pane);
+        await removeColdFile(pane);
         return { result: { pane: record } };
       }
       case 'subscribe':
@@ -1003,10 +1220,13 @@ function createHost(options = {}) {
 
   const disposePaneCore = async (pane) => {
     try { await settled(pane); } catch {}
+    try { if (pane.restorePromise) await pane.restorePromise; } catch {}
+    try { if (pane.freezePromise) await pane.freezePromise; } catch {}
     for (const disposable of [pane.dataDisposable, pane.exitDisposable, pane.titleDisposable]) {
       try { if (disposable) disposable.dispose(); } catch {}
     }
-    try { pane.term.dispose(); } catch {}
+    disposeTerminal(pane);
+    await removeColdFile(pane);
   };
 
   const finalizeHandoff = () => {
@@ -1057,11 +1277,16 @@ function createHost(options = {}) {
       ]);
       if (drainTimer) clearTimeout(drainTimer);
 
-      await Promise.all([...panes.values()].map((pane) => settled(pane).catch(() => {})));
-      record = {
-        version: 1,
-        sock,
-        panes: [...panes.values()].map((pane) => ({
+      await Promise.all([...panes.values()].map(async (pane) => {
+        await settled(pane).catch(() => {});
+        if (pane.freezePromise) await pane.freezePromise;
+        if (pane.restorePromise) await pane.restorePromise;
+      }));
+      const paneRecords = [];
+      for (const pane of panes.values()) {
+        const reusableCold = pane.coldSnapshot && !pane.modelDirty;
+        const archive = reusableCold ? await readColdArchive(pane) : null;
+        paneRecords.push({
           id: pane.id,
           cmd: pane.cmd,
           args: pane.args,
@@ -1082,13 +1307,19 @@ function createHost(options = {}) {
           title: pane.title,
           pid: pane.pty.pid,
           pty: pane.pty,
-          buffer: pane.buffer.contents(),
-          screen: Buffer.from(pane.serializer.serialize({
+          buffer: archive ? archive.buffer : pane.buffer.contents(),
+          screen: archive ? archive.screen : Buffer.from(pane.serializer.serialize({
             scrollback: TERMINAL_SCROLLBACK,
             excludeAltBuffer: false,
           }), 'utf8'),
+          coldSnapshot: reusableCold ? pane.coldSnapshot : null,
           primary: null,
-        })),
+        });
+      }
+      record = {
+        version: 1,
+        sock,
+        panes: paneRecords,
       };
       } catch (error) {
         // Nothing has been handed over yet: this core stays the owner. Reopen the
@@ -1118,7 +1349,7 @@ function createHost(options = {}) {
       endpointOwned = false;
       for (const pane of panes.values()) {
         try { if (pane.titleDisposable) pane.titleDisposable.dispose(); } catch {}
-        try { pane.term.dispose(); } catch {}
+        try { pane.term?.dispose(); } catch {}
       }
       // The bootstrap keeps the pid-stamped lock across the core swap.
       lockOwned = false;
