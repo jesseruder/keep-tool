@@ -85,6 +85,7 @@ const {
   stripTerminalAnsi,
   openSession,
   reopenSessionOnAccount,
+  resolveReviewLaunchSelection,
   addHostSessionState,
   backfillHostSessions,
   createDashboardClaudeSessionResolver,
@@ -3873,6 +3874,19 @@ test('standalone fresh agent launch uses the selected profile and one request id
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('standalone request id refuses to launch when existing panes cannot be inventoried', async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-standalone-inventory-'));
+  try {
+    let spawns = 0;
+    await assert.rejects(openSession({ fresh: true, cwd, agent: 'claude',
+      accountId: 'claude/default', requestId: 'inventory-request' }, {
+      listHostPanes: async () => null,
+      host: recordingHost((type) => { if (type === 'spawn') spawns++; return {}; }),
+    }), (error) => error.status === 503 && /identity cannot be verified/.test(error.message));
+    assert.equal(spawns, 0);
+  } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+});
+
 test('standalone post-spawn setup failure exposes and reuses the exact existing pane', async () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-standalone-setup-'));
   try {
@@ -3922,6 +3936,69 @@ test('standalone post-spawn regular errors retain the HTTP existing-pane receipt
       return true;
     });
   } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('review launch rejects unknown explicit accounts and replaced panes before registration or input', async () => {
+  assert.throws(() => resolveReviewLaunchSelection({ agent: 'claude', accountId: 'account-that-does-not-exist' }),
+    (error) => error.status === 400 && /unknown account/.test(error.message));
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-binding-'));
+  try {
+    const cwd = path.join(root, 'project'), configDir = path.join(root, 'codex');
+    fs.mkdirSync(cwd); fs.mkdirSync(configDir);
+    const config = path.join(root, 'accounts.json');
+    fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+      { id: 'codex-review', label: 'Codex review', agent: 'codex', configDir },
+    ], defaultAccounts: { codex: 'codex-review' } }));
+    const env = { KEEP_DIR: root, KEEP_CONFIG: config };
+    const body = { taskId: 'review-card', fresh: true, agent: 'codex', accountId: 'codex-review',
+      message: 'Review this item.', reviewQueueLaunchId: 'review-launch' };
+    const paneMeta = { reviewQueueLaunchId: 'review-launch', accountId: 'codex-review', agent: 'codex',
+      sessionId: 'actual-review-session' };
+    const host = recordingHost((type) => type === 'spawn'
+      ? { pane: { id: 'review-pane', pid: 71, createdAt: 72 } }
+      : {});
+    let registered = 0; let ready = 0; let typed = 0; let linked = 0;
+    const base = { root, env, host, loadTask: () => ({ fm: { project: cwd } }),
+      waitForHostAgent: async () => true, waitForHostSessionId: async () => 'actual-review-session',
+      onSessionReady: async () => { registered++; return true; },
+      onOpeningReady: async () => { ready++; return true; },
+      typeOpeningMessage: async () => { typed++; }, linkLaunchedSession: () => { linked++; } };
+
+    await assert.rejects(openSession(body, { ...base,
+      getPane: async () => ({ id: 'review-pane', alive: true, pid: 99, createdAt: 100,
+        meta: { ...paneMeta, accountId: 'outside-account' } }),
+    }), (error) => error.status === 409 && /pane identity changed/.test(error.message));
+    assert.deepEqual({ registered, ready, typed, linked }, { registered: 0, ready: 0, typed: 0, linked: 0 });
+
+    let reads = 0;
+    await assert.rejects(openSession(body, { ...base,
+      getPane: async () => ++reads === 1
+        ? { id: 'review-pane', alive: true, pid: 71, createdAt: 72, meta: paneMeta }
+        : { id: 'review-pane', alive: true, pid: 171, createdAt: 172,
+          meta: { ...paneMeta, reviewQueueLaunchId: 'replacement-launch' } },
+    }), (error) => error.status === 409 && /pane identity changed/.test(error.message));
+    assert.deepEqual({ registered, ready, typed, linked }, { registered: 1, ready: 0, typed: 0, linked: 0 });
+
+    const opened = await openSession(body, { ...base,
+      getPane: async () => ({ id: 'review-pane', alive: true, pid: 71, createdAt: 72, meta: paneMeta }),
+    });
+    assert.equal(opened.sessionId, 'actual-review-session');
+    assert.deepEqual({ registered, ready, typed, linked }, { registered: 2, ready: 1, typed: 1, linked: 1 });
+
+    let claudeRegistered = 0; let claudeTyped = 0;
+    await assert.rejects(openSession({ ...body, agent: 'claude', accountId: 'claude/default' }, {
+      ...base, host: recordingHost((type) => type === 'spawn'
+        ? { pane: { id: 'claude-review-pane', pid: 81, createdAt: 82 } }
+        : {}), randomUUID: () => 'claude-review-session',
+      onSessionReady: async () => { claudeRegistered++; return true; },
+      typeOpeningMessage: async () => { claudeTyped++; },
+      getPane: async () => ({ id: 'claude-review-pane', alive: true, pid: 181, createdAt: 182,
+        meta: { reviewQueueLaunchId: 'outside-launch', accountId: 'claude/default', agent: 'claude',
+          sessionId: 'claude-review-session' } }),
+    }), (error) => error.status === 409 && /pane identity changed/.test(error.message));
+    assert.deepEqual({ claudeRegistered, claudeTyped }, { claudeRegistered: 0, claudeTyped: 0 });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('portable transfer API lists safe records and launches only an existing transfer id', async () => {

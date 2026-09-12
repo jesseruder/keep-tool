@@ -545,6 +545,32 @@ test('review launch validates selection before mutation and request retries cann
   } finally { f.cleanup(); }
 });
 
+test('concurrent request-id replay rechecks account selection inside the reservation lock', async () => {
+  const f = fixture();
+  try {
+    let releaseSecond;
+    const secondSelection = new Promise((resolve) => { releaseSecond = resolve; });
+    const resolveLaunchSelection = async (body) => {
+      if (body.accountId === 'account-b') await secondSelection;
+      return { agent: 'claude', accountId: body.accountId, model: body.model || '' };
+    };
+    const base = { id: 'idea:idea-one', action: 'discuss', requestId: 'racing-selection', agent: 'claude' };
+    const later = queue.act({ ...base, accountId: 'account-b' }, { ...f.deps, resolveLaunchSelection,
+      launch: async () => assert.fail('the stale request must not launch') });
+    await new Promise((resolve) => setImmediate(resolve));
+    const first = await queue.act({ ...base, accountId: 'account-a' }, { ...f.deps, resolveLaunchSelection,
+      launch: async (request) => {
+        await request.onLaunched({ pane: 'account-a-pane', sessionId: request.sessionId });
+        return { pane: 'account-a-pane', sessionId: request.sessionId };
+      } });
+    releaseSecond();
+    await assert.rejects(later,
+      (error) => error.status === 409 && /different review queue account or model/.test(error.message));
+    assert.equal(first.item.sessions[0].id, first.sessionId);
+    assert.equal(queue.loadStore(f.root).items['idea:idea-one'].requests['racing-selection'].accountId, 'account-a');
+  } finally { f.cleanup(); }
+});
+
 test('Codex response-loss recovery discovers the actual session by immutable launch marker without relaunching', async () => {
   const f = fixture();
   const body = { id: 'idea:idea-one', action: 'discuss', requestId: 'codex-recovery',

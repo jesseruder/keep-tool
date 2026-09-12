@@ -3960,6 +3960,9 @@ async function openSession(body, deps = {}) {
   }
   if (freshStandalone && body.requestId) {
     const panes = await (deps.listHostPanes || listHostPanes)(deps, true);
+    if (!Array.isArray(panes)) {
+      throw new InjectionError(503, 'terminal host is unavailable; open request identity cannot be verified');
+    }
     const matches = (panes || []).filter((entry) => entry?.alive !== false
       && entry.meta?.openRequestId === body.requestId);
     if (matches.length > 1) throw new InjectionError(409, 'open request matches multiple live panes');
@@ -4099,6 +4102,10 @@ async function openSession(body, deps = {}) {
         throw new InjectionError(504, `${agent} started in host pane ${launch.pane} but never registered its session id`);
       }
     }
+    if (body.reviewQueueLaunchId && launch.sessionId) {
+      await assertReviewQueuePaneBinding({ pane: launch.pane, launchId: body.reviewQueueLaunchId,
+        accountId: account.id, agent, sessionId: launch.sessionId, pid: launch.pid, createdAt: launch.createdAt }, deps);
+    }
     if (launch.sessionId && deps.onSessionReady && await deps.onSessionReady(launch) === false) {
       throw new InjectionError(409, 'session launch reservation changed before opening instructions were sent');
     }
@@ -4114,6 +4121,10 @@ async function openSession(body, deps = {}) {
           if (body.portableTransferId) await assertPortablePaneBinding({
             pane: launch.pane, transferId: body.portableTransferId, accountId: account.id,
             cardId: body.taskId || null, sessionId: launch.sessionId, pid: launch.pid, createdAt: launch.createdAt,
+          }, deps);
+          if (body.reviewQueueLaunchId) await assertReviewQueuePaneBinding({
+            pane: launch.pane, launchId: body.reviewQueueLaunchId, accountId: account.id,
+            agent, sessionId: launch.sessionId, pid: launch.pid, createdAt: launch.createdAt,
           }, deps);
           if (deps.onOpeningReady && await deps.onOpeningReady(launch) === false) {
             throw new InjectionError(409, 'opening-message reservation changed before instructions were sent');
@@ -4228,10 +4239,12 @@ async function reopenSessionOnAccount(body, deps = {}) {
 
 function resolveReviewLaunchSelection(body, deps = {}) {
   const env = deps.env || process.env;
-  let account = body.accountId ? accounts.get(body.accountId, env) : null;
+  const explicitAccount = body.accountId != null;
+  let account = explicitAccount ? accounts.get(body.accountId, env) : null;
+  if (explicitAccount && !account) throw new reviewQueue.QueueError(400, `unknown account ${body.accountId}`);
   const agent = body.agent || account?.agent || 'claude';
   if (!['claude', 'codex'].includes(agent)) throw new reviewQueue.QueueError(400, 'review queue agent is invalid');
-  account ||= accounts.defaultFor(agent, env);
+  if (!explicitAccount) account = accounts.defaultFor(agent, env);
   if (!account || account.agent !== agent) {
     throw new reviewQueue.QueueError(400, `account ${body.accountId || '?'} is not a ${agent} account`);
   }
@@ -5693,6 +5706,20 @@ async function assertPortablePaneBinding(expected, deps = {}) {
       || expected.pid && pane.pid !== expected.pid
       || expected.createdAt != null && pane.createdAt !== expected.createdAt) {
     throw new InjectionError(409, 'portable successor pane identity changed before instructions were sent');
+  }
+  return pane;
+}
+
+async function assertReviewQueuePaneBinding(expected, deps = {}) {
+  const pane = deps.getPane
+    ? await deps.getPane(expected.pane)
+    : (await hostRequest('get', { pane: expected.pane }, deps))?.pane;
+  if (!pane || pane.alive !== true || pane.agentAlive === false || pane.id !== expected.pane
+      || pane.meta?.reviewQueueLaunchId !== expected.launchId || pane.meta?.accountId !== expected.accountId
+      || pane.meta?.agent !== expected.agent || pane.meta?.sessionId !== expected.sessionId
+      || expected.pid && pane.pid !== expected.pid
+      || expected.createdAt != null && pane.createdAt !== expected.createdAt) {
+    throw new InjectionError(409, 'review queue pane identity changed before instructions were sent');
   }
   return pane;
 }

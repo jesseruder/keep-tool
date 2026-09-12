@@ -600,6 +600,9 @@ async function act(body, deps = {}) {
     const requests = meta.requests && typeof meta.requests === 'object' ? { ...meta.requests } : {};
     const prior = requests[requestId];
     if (prior && prior.action !== body.action) throw new QueueError(409, 'request id was already used for a different review queue action', { item: current });
+    if (prior && launchActions && !sameLaunchSelection(prior, selection)) {
+      throw new QueueError(409, 'request id was already used with a different review queue account or model', { item: current });
+    }
     if (prior?.state === 'complete') return { replay: true, sessionId: prior.sessionId };
     if (prior?.state === 'failed') {
       throw new QueueError(prior.status || 502, prior.error || 'review queue launch failed', {
