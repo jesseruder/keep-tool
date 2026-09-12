@@ -1316,7 +1316,8 @@ function addTask({
       : null;
     if (linkSession && (checkAfter || check || probe)) recordScheduler(task);
     if (beforeSave) beforeSave(task);
-    if (note) appendLog(task, 'created', note, !shouldClaim && sessionResult && sessionResult.session);
+    const filingSession = !shouldClaim && sessionResult && sessionResult.session;
+    if (note || filingSession) appendLog(task, 'created', note || 'Filed for later.', filingSession);
     saveTask(task);
     if (shouldClaim) warnSkippedSessionLink(task, sessionResult, 'card created');
     if (commit) commitAndPush(`keep: add ${id}`);

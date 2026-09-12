@@ -1035,16 +1035,18 @@ test('filed cards preserve the current owner, ideas file by default, and --claim
   try {
     assert.equal(f.run(['add', 'Current task', '--status', 'active'], env).status, 0);
 
-    const followup = f.run(['add', 'Filed follow-up', '--file', '-m', 'Handle after the current task.'], env);
+    const followup = f.run(['add', 'Filed follow-up', '--file'], env);
     assert.equal(followup.status, 0, followup.stderr);
     assert.deepEqual(parse('current-task').fm.sessions.map((entry) => entry.id), ['working-session']);
     assert.deepEqual(parse('filed-follow-up').fm.sessions || [], []);
     assert.match(f.read('filed-follow-up'), /created \(by codex working-session\)/);
+    assert.match(f.read('filed-follow-up'), /Filed for later\./);
 
-    assert.equal(f.run(['add', 'Future idea', '--kind', 'idea', '-m', 'Consider this later.'], env).status, 0);
+    assert.equal(f.run(['add', 'Future idea', '--kind', 'idea'], env).status, 0);
     assert.deepEqual(parse('current-task').fm.sessions.map((entry) => entry.id), ['working-session']);
     assert.deepEqual(parse('future-idea').fm.sessions || [], []);
     assert.match(f.read('future-idea'), /created \(by codex working-session\)/);
+    assert.match(f.read('future-idea'), /Filed for later\./);
 
     assert.equal(f.run(['add', 'Idea in progress', '--kind', 'idea', '--claim'], env).status, 0);
     assert.deepEqual(parse('current-task').fm.sessions || [], []);
@@ -1067,6 +1069,22 @@ test('a filed scheduled card records its scheduler without moving ownership', ()
     assert.deepEqual(parse('current-task').fm.sessions.map((entry) => entry.id), ['scheduler-session']);
     assert.deepEqual(parse('filed-check').fm.sessions || [], []);
     assert.equal(parse('filed-check').fm.scheduled_by, 'scheduler-session');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('internal idea filing with linkSession false suppresses creator and scheduler identity', () => {
+  const f = schedulerFixture();
+  try {
+    const script = `require(${JSON.stringify(f.cli)}).addTask({
+      title: 'Internal idea', kind: 'idea', note: 'Automated filing.',
+      checkAfter: '+1h', check: 'inspect it', linkSession: false, commit: false,
+    })`;
+    const added = f.call(script, { CODEX_THREAD_ID: 'ambient-session' });
+    assert.equal(added.status, 0, added.stderr);
+    const text = f.read('internal-idea');
+    assert.doesNotMatch(text, /ambient-session/);
+    assert.doesNotMatch(text, /^scheduled_by:/m);
+    assert.match(text, /— created\nAutomated filing\./);
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
