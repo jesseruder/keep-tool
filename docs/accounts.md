@@ -16,6 +16,12 @@ Review-queue **Start work**, **Investigate**, and **Discuss** use the same agent
 
 The existing **Continue on another account** action on a live session still transfers and sends a continuation instruction. Use **Reopen** when the intent is only to open a closed conversation.
 
+## Delegate implementation or review from Claude
+
+Claude's implementation and review skills use `keep codex` to select a Codex account for each new job. Tell Claude which registered account to use, or let it resolve Keep's configured Codex default. The selected account remains explicit for resume lookup, launch, status, results, and cancellation, even if the default changes later.
+
+For example, `keep codex --account codex-secondary context --json` shows the selected account and its job paths without starting a task. Jobs and brokers are isolated per account and configuration directory; existing plugin jobs keep their original state. See [delegated Codex jobs](codex-delegation.md) for commands and lifecycle details. Launching Claude from Codex is not supported yet.
+
 ## Add a Claude subscription
 
 Choose a new, empty config directory. Setup must run before login because it creates the profile directory and shares compatible settings, skills, rules, commands, and repository memory without linking account state or credentials.
