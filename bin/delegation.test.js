@@ -312,8 +312,17 @@ test('SessionEnd resumes safely, while explicit end stays ended and restores ord
     assert.equal(ended.status, 0, ended.stderr);
     assert.ok(f.readDelegations().find((record) => record.id === id).explicitEndedAt);
     assert.doesNotMatch(claudeStart(f, 'worker-session', workerEnv).stdout, /Explicit delegation/);
-    const ordinary = f.run(['add', 'Ordinary after end', '--status', 'active'], workerEnv);
+    const mixedNoToken = { CODEX_THREAD_ID: 'parent-session', CLAUDE_CODE_SESSION_ID: 'worker-session' };
+    const ordinary = f.run(['add', 'Ordinary after end', '--status', 'active'], mixedNoToken);
     assert.equal(ordinary.status, 0, ordinary.stderr);
+    const ordinaryTask = require('./keep.js').parseTask(
+      fs.readFileSync(path.join(f.root, 'tasks', 'ordinary-after-end.md'), 'utf8'), 'ordinary-after-end',
+    );
+    assert.deepEqual(ordinaryTask.fm.sessions.map((row) => row.id), ['worker-session']);
+    const parentTask = require('./keep.js').parseTask(
+      fs.readFileSync(path.join(f.root, 'tasks', `${card}.md`), 'utf8'), card,
+    );
+    assert.deepEqual(parentTask.fm.sessions.map((row) => row.id), ['parent-session']);
   } finally { f.cleanup(); }
 });
 

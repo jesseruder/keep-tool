@@ -239,16 +239,18 @@ function resolveForCommand(root, env, current, dependencies) {
   }
   const candidates = sessionCandidates(env);
   const bound = candidates.map((candidate) => ({ candidate, status: forSession(root, candidate, dependencies) }))
-    .filter((entry) => entry.status.kind !== 'none' && !(entry.status.kind === 'ended' && entry.status.explicit));
+    .filter((entry) => entry.status.kind !== 'none');
   const matches = (candidate, session) => candidate && session && candidate.id === session.id && candidate.agent === session.agent;
   // Cross-agent launchers can expose both the native worker and its ambient
-  // parent. Prefer the exact assignment joining those two identities; an older
-  // ended assignment belonging to the parent must not make the worker ambiguous.
+  // parent. Preserve that exact relationship after an explicit end so later
+  // independent work is still attributed to the worker. Unrelated ended history
+  // is excluded only after relation selection, so it cannot create ambiguity.
   const related = bound.filter((entry) => candidates.some((candidate) => matches(candidate, entry.status.record.parent)));
-  const live = bound.filter((entry) => entry.status.kind !== 'ended');
+  const eligible = bound.filter((entry) => !(entry.status.kind === 'ended' && entry.status.explicit));
+  const live = eligible.filter((entry) => entry.status.kind !== 'ended');
   const selectedEntry = related.length === 1 ? related[0]
     : live.length === 1 ? live[0]
-      : bound.length === 1 && candidates.length === 1 ? bound[0] : null;
+      : eligible.length === 1 && candidates.length === 1 ? eligible[0] : null;
   if (selectedEntry) {
     const selected = selectedEntry.status;
     const record = selected.record;
