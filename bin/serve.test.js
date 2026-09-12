@@ -4305,11 +4305,11 @@ test('portable terminal quota inspection verifies exited and live source identit
     version: 1, restartVersion: require('./background-jobs').restartVersion('claude'), recovering: false, gap: true,
     source: { agent: 'claude', sid: sessionId, file: transcript },
     calls: {}, notices: {}, jobs: {
-      child: { id: 'child', kind: 'agent', status: 'completed' },
-      command: { id: 'command', kind: 'command', status: 'failed' },
+      'command-one': { id: 'command-one', kind: 'command', status: 'completed' },
+      'command-two': { id: 'command-two', kind: 'command', status: 'failed' },
     },
     restart: { id: sessionId, rateLimitTerminal: true, observedAt: rateLimitAt + 15,
-      children: { child: 'owned' }, launches: { launch: true }, mapped: { launch: 'child' } },
+      children: {}, launches: {}, mapped: {} },
     checkpoint: { identity: transcriptIdentity, offset: transcriptStat.size, mtime: transcriptStat.mtimeMs },
     hookBarrier: null,
   };
@@ -4350,6 +4350,32 @@ test('portable terminal quota inspection verifies exited and live source identit
 
     ledger.hookBarrier = null;
     fs.writeFileSync(path.join(ledgerDirectory, 'state.json'), JSON.stringify(ledger));
+    const validJobs = ledger.jobs;
+    ledger.jobs = 1;
+    ledger.calls = true;
+    delete ledger.restart.children;
+    delete ledger.restart.launches;
+    delete ledger.restart.mapped;
+    fs.writeFileSync(path.join(ledgerDirectory, 'state.json'), JSON.stringify(ledger));
+    assert.equal((await inspect()).terminalRateLimit, null, 'primitive and missing ledger maps fail closed');
+
+    ledger.jobs = validJobs;
+    ledger.calls = {};
+    ledger.restart.children = { child: 'owned' };
+    ledger.restart.launches = { launch: true };
+    ledger.restart.mapped = { launch: 'child' };
+    ledger.jobs.child = { id: 'child', kind: 'agent', status: 'completed' };
+    session.backgroundJobs.jobs = Object.values(ledger.jobs);
+    fs.writeFileSync(path.join(ledgerDirectory, 'state.json'), JSON.stringify(ledger));
+    assert.equal((await inspect()).terminalRateLimit, null,
+      'owned descendants require proof of their own complete ledger and are conservatively refused');
+
+    delete ledger.jobs.child;
+    ledger.restart.children = {};
+    ledger.restart.launches = {};
+    ledger.restart.mapped = {};
+    session.backgroundJobs.jobs = Object.values(ledger.jobs);
+    fs.writeFileSync(path.join(ledgerDirectory, 'state.json'), JSON.stringify(ledger));
     session.exited = false;
     session.runtime = { state: 'live', paneId: pane.id, liveInstances: 1 };
     pane.alive = true;
@@ -4360,6 +4386,14 @@ test('portable terminal quota inspection verifies exited and live source identit
       { pid: pane.pid, ppid: 1, pidStart: 'pane-start', args: '/bin/zsh -l' },
       { pid: 42, ppid: pane.pid, pidStart: 'source-start', args: '/bin/claude', agent: 'claude', interactive: true },
     ];
+    const arrivedHook = path.join(ledgerDirectory, 'inbox', 'prompt-arrived.json');
+    inspection = await inspect({ liveSessionPids: identity, agentProcessRows: async () => {
+      fs.writeFileSync(arrivedHook, '{}');
+      return ownedRows;
+    } });
+    assert.equal(inspection.terminalRateLimit, null, 'hook arrival during the async process probe invalidates proof');
+    fs.unlinkSync(arrivedHook);
+
     inspection = await inspect({ liveSessionPids: identity, agentProcessRows: async () => ownedRows });
     assert.equal(inspection.terminalRateLimit.sourceAgentPid, 42);
     assert.equal(inspection.terminalRateLimit.sourceAgentPidStart, 'source-start');

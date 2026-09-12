@@ -5929,6 +5929,19 @@ const PORTABLE_TERMINAL_JOB_STATES = new Set(['completed', 'failed', 'cancelled'
 const PORTABLE_TERMINAL_QUOTA_TYPES = new Set(['five_hour', 'seven_day', 'fable_weekly']);
 const PORTABLE_LEDGER_LIMIT = 4 * 1024 * 1024;
 
+function portableRecordMap(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function portableTerminalJobsValid(jobs) {
+  // A completed parent tombstone does not prove an owned child's own ledger
+  // has no background work. Refuse descendants until that graph is proven.
+  return Array.isArray(jobs) && jobs.every((job) => portableRecordMap(job)
+    && typeof job.id === 'string' && job.id.length > 0
+    && typeof job.kind === 'string' && job.kind.length > 0 && job.kind !== 'agent'
+    && PORTABLE_TERMINAL_JOB_STATES.has(job.status));
+}
+
 function readPortableJobState(root, sessionId) {
   if (!/^[A-Za-z0-9_-]{8,160}$/.test(sessionId || '')) return null;
   const file = path.join(root, '.keep', 'background-jobs', 'claude', sessionId, 'state.json');
@@ -5941,7 +5954,8 @@ function readPortableJobState(root, sessionId) {
     if (before.size && fs.readSync(fd, buffer, 0, before.size, 0) !== before.size) return null;
     const after = fs.fstatSync(fd);
     if (['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs'].some((field) => before[field] !== after[field])) return null;
-    return { value: JSON.parse(buffer.toString('utf8')), file, stat: after };
+    return { value: JSON.parse(buffer.toString('utf8')), file, stat: after,
+      contentDigest: crypto.createHash('sha256').update(buffer).digest('hex') };
   } catch { return null; }
   finally { if (fd != null) fs.closeSync(fd); }
 }
@@ -5960,13 +5974,18 @@ function portableTerminalLedgerEvidence(session, transcriptFile, root) {
   const value = loaded.value;
   const restart = value?.restart;
   const checkpoint = value?.checkpoint;
-  const jobs = value?.jobs && !Array.isArray(value.jobs) ? Object.values(value.jobs) : null;
+  const jobs = portableRecordMap(value?.jobs) ? Object.values(value.jobs) : null;
   const rateLimitAt = Date.parse(session.rateLimit?.at || '');
   const transcriptIdentity = `${crypto.createHash('sha256').update(path.resolve(transcriptFile)).digest('hex')}:${transcript.dev}:${transcript.ino}`;
   // Reconciliation may observe trailing duration/cost metadata after the quota
   // response. The scanner keeps rateLimit only while no later real turn exists.
-  if (value?.version !== 1 || value.restartVersion !== require('./background-jobs').restartVersion('claude')
-      || value.recovering !== false || !jobs || !value.calls || Array.isArray(value.calls) || Object.keys(value.calls).length
+  if (!portableRecordMap(value) || value.version !== 1
+      || value.restartVersion !== require('./background-jobs').restartVersion('claude')
+      || value.recovering !== false || !portableTerminalJobsValid(jobs)
+      || !portableRecordMap(value.calls) || Object.keys(value.calls).length
+      || !portableRecordMap(value.notices) || !portableRecordMap(restart)
+      || !portableRecordMap(restart.children) || !portableRecordMap(restart.launches) || !portableRecordMap(restart.mapped)
+      || Object.keys(restart.children).length || Object.keys(restart.launches).length || Object.keys(restart.mapped).length
       || restart?.id !== session.id || restart.rateLimitTerminal !== true
       || !Number.isFinite(restart.observedAt) || restart.observedAt < rateLimitAt
       || !Number.isFinite(rateLimitAt) || !PORTABLE_TERMINAL_QUOTA_TYPES.has(session.rateLimit?.type)
@@ -5974,11 +5993,10 @@ function portableTerminalLedgerEvidence(session, transcriptFile, root) {
       || path.resolve(value.source.file || '') !== path.resolve(transcriptFile)
       || checkpoint?.identity !== transcriptIdentity || checkpoint.offset !== transcript.size || checkpoint.mtime !== transcript.mtimeMs
       || value.hookBarrier != null && (!Number.isFinite(value.hookBarrier) || checkpoint.offset <= value.hookBarrier)
-      || jobs.some((job) => !PORTABLE_TERMINAL_JOB_STATES.has(job?.status))) return null;
-  const byId = new Map(jobs.map((job) => [job.id, job]));
-  if (Object.keys(restart.launches || {}).some((launch) => !restart.mapped?.[launch])
-      || Object.keys(restart.children || {}).some((child) => !PORTABLE_TERMINAL_JOB_STATES.has(byId.get(child)?.status))) return null;
-  return { rateLimitAt, transcriptIdentity, gap: value.gap === true };
+      || !portableRecordMap(value.source) || !portableRecordMap(checkpoint)) return null;
+  return { rateLimitAt, transcriptIdentity, gap: value.gap === true,
+    fingerprint: `${loaded.contentDigest}:${loaded.stat.dev}:${loaded.stat.ino}:${loaded.stat.size}:${loaded.stat.mtimeMs}:${loaded.stat.ctimeMs}`
+      + `:${transcriptIdentity}:${transcript.size}:${transcript.mtimeMs}:${transcript.ctimeMs}` };
 }
 
 async function portableTerminalRateLimitEvidence(session, state, deps = {}) {
@@ -5993,7 +6011,7 @@ async function portableTerminalRateLimitEvidence(session, state, deps = {}) {
       || !Array.isArray(session.lifecycleAgents) || session.lifecycleAgents.length
       || !background || background.pending !== false || background.caughtUp !== true || background.recovering !== false
       || background.unresolvedCalls !== 0 || background.unconsumedHooks !== 0
-      || !Array.isArray(background.jobs) || background.jobs.some((job) => !PORTABLE_TERMINAL_JOB_STATES.has(job?.status))
+      || !portableTerminalJobsValid(background.jobs)
       || !Array.isArray(background.uncertain) || background.uncertain.some((entry) => entry !== 'history-gap')
       || !Array.isArray(unknown) || unknown.some((entry) => entry !== 'history-gap')
       || !Number.isFinite(lastUserAt) || lastUserAt > rateLimitAt
@@ -6013,6 +6031,8 @@ async function portableTerminalRateLimitEvidence(session, state, deps = {}) {
       || !session.accountId || pane.meta?.accountId !== session.accountId) return null;
   if (session.runtime?.state === 'exited') {
     if (session.runtime.liveInstances !== 0 || session.exited !== true || pane.alive !== false && pane.agentAlive !== false) return null;
+    const finalLedger = portableTerminalLedgerEvidence(session, transcriptFile, deps.root || keep.ROOT);
+    if (!finalLedger || finalLedger.fingerprint !== ledger.fingerprint) return null;
     return { version: 1, rateLimitAt, runtimeState: 'exited', pane: pane.id, ledgerGap: ledger.gap };
   }
   if (session.runtime?.state !== 'live' || session.runtime.liveInstances !== 1 || pane.alive !== true || pane.agentAlive === false) return null;
@@ -6022,6 +6042,8 @@ async function portableTerminalRateLimitEvidence(session, state, deps = {}) {
       agentProcessRows: async () => rows })).get(session.id);
     if (!identity || identity.primary !== true || !agentIdentityOwnsPane(identity, pane, rows)
         || !Number.isInteger(identity.pid) || identity.pid <= 0 || !identity.pidStart) return null;
+    const finalLedger = portableTerminalLedgerEvidence(session, transcriptFile, deps.root || keep.ROOT);
+    if (!finalLedger || finalLedger.fingerprint !== ledger.fingerprint) return null;
     return { version: 1, rateLimitAt, runtimeState: 'live', pane: pane.id,
       sourceAgentPid: identity.pid, sourceAgentPidStart: identity.pidStart, ledgerGap: ledger.gap };
   } catch { return null; }

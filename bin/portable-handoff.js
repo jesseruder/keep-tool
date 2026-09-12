@@ -19,6 +19,13 @@ const TERMINAL_JOB_STATES = new Set(['completed', 'failed', 'cancelled']);
 const TERMINAL_QUOTA_TYPES = new Set(['five_hour', 'seven_day', 'fable_weekly']);
 const TERMINAL_QUOTA_UNCERTAINTY = new Set(['history-gap']);
 
+function terminalQuotaJobsValid(jobs) {
+  return Array.isArray(jobs) && jobs.every((job) => job && typeof job === 'object' && !Array.isArray(job)
+    && typeof job.id === 'string' && job.id.length > 0
+    && typeof job.kind === 'string' && job.kind.length > 0 && job.kind !== 'agent'
+    && TERMINAL_JOB_STATES.has(job.status));
+}
+
 function problem(message, code = 'KEEP_PORTABLE_TRANSFER', status = 400) {
   const error = new Error(message); error.code = code; error.status = status; return error;
 }
@@ -339,14 +346,13 @@ function verifiedTerminalQuotaPause(inspection) {
       || proof.rateLimitAt !== rateAt || !Number.isFinite(rateAt)
       || proof.pane !== session.runtime?.paneId
       || !TERMINAL_QUOTA_TYPES.has(session.rateLimit?.type)
-      || !background || !Array.isArray(background.jobs) || !Array.isArray(background.uncertain)
+      || !background || !terminalQuotaJobsValid(background.jobs) || !Array.isArray(background.uncertain)
       || !Array.isArray(unknown) || background.pending !== false || background.caughtUp !== true
       || background.recovering !== false || background.unresolvedCalls !== 0 || background.unconsumedHooks !== 0
       || session.pendingBackground !== false || session.pendingQuestion || session.pendingPlan
       || !Array.isArray(session.lifecycleAgents) || session.lifecycleAgents.length
       || unknown.some((entry) => !TERMINAL_QUOTA_UNCERTAINTY.has(entry))
       || background.uncertain.some((entry) => !TERMINAL_QUOTA_UNCERTAINTY.has(entry))
-      || background.jobs.some((job) => !TERMINAL_JOB_STATES.has(job?.status))
       || !Number.isFinite(lastUserAt) || lastUserAt > rateAt
       || !Number.isFinite(lifecycleTurnAt) || lifecycleTurnAt > rateAt) return false;
   const hook = session.observation?.foreground?.hook;
