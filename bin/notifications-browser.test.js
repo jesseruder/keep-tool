@@ -117,13 +117,13 @@ test('isolated browser: alert inbox, read persistence, card links and desktop cl
     assert.equal(await evaluate("document.querySelectorAll('[data-id=a-idea] .notification-card').length"), 0, 'reviewer ideas do not repeat the linked card title');
     assert.equal(detailGets.includes('task:idea-one'), false, 'collapsed notifications do not fetch card history');
     await evaluate("document.querySelector('[data-select=a-idea]').click()");
-    await wait("document.querySelector('[data-id=a-idea].selected .notification-detail pre').textContent.includes('Full idea notes')");
+    await wait("document.querySelector('[data-id=a-idea].selected .notification-detail pre')?.textContent.includes('Full idea notes')");
     assert.equal(detailGets.filter((key) => key === 'task:idea-one').length, 1, 'opening a notification fetches its card detail once');
     assert.equal(await evaluate("document.querySelector('[data-id=a-idea].selected .notification-text').textContent"), 'Reviewer idea: Preserve <card> notes', 'expanded reviewer ideas replace the truncated proposal with one title');
     assert.equal(await evaluate("document.querySelectorAll('[data-id=a-idea].selected .notification-detail > b').length"), 0, 'expanded reviewer ideas do not repeat their title in the card detail');
     await evaluate("document.querySelector('[data-select=\"a-one\"]').focus(); document.querySelector('[data-select=\"a-one\"]').click()");
     await wait("document.querySelector('.notification-count')?.textContent === '1'");
-    assert.ok(await evaluate("document.querySelector('.notification-detail').textContent.includes('Card notes')"));
+    await wait("document.querySelector('.notification-detail pre')?.textContent.includes('Card notes')");
     assert.equal(await evaluate("document.querySelector('[data-id=a-idea] .notification-text').textContent"), 'Reviewer idea: Preserve <card> notes — a truncated proposal that must not repeat', 'selecting another alert restores the reviewer idea preview');
     assert.equal(await evaluate("document.activeElement.dataset.select"), 'a-one', 'reading preserves focus in the dialog');
     await evaluate("document.querySelector('[data-session=\"a\"]').click()");

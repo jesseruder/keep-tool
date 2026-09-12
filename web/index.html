@@ -1419,7 +1419,7 @@ function openTask(id, draft = null) {
     return result;
   }).then((result) => {
     if (request !== taskDetailRequest || openTaskId !== id || !$('detail').open) return;
-    renderTaskDetail({ ...summary, ...result.value }, draft);
+    renderTaskDetail({ ...summary, ...result.value }, draft ? taskDraftState() : null);
   }).catch((error) => {
     if (request !== taskDetailRequest || openTaskId !== id || !$('detail').open) return;
     if (draft) {

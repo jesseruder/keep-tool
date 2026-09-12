@@ -23,6 +23,7 @@ test('isolated browser: legacy dashboard task details load on open and reject st
   };
   const detailGets = [];
   let failBroken = true;
+  let delaySecond = false;
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://fixture');
     if (url.pathname === '/api/events') {
@@ -38,7 +39,7 @@ test('isolated browser: legacy dashboard task details load on open and reject st
         failBroken = false; res.writeHead(503, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'fixture unavailable' })); return;
       }
       const send = () => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(dashboardDetail(state, 'task', id))); };
-      if (id === 'first') setTimeout(send, 150); else send();
+      if (id === 'first' || id === 'second' && delaySecond) setTimeout(send, 150); else send();
       return;
     }
     if (url.pathname === '/api/tasksummary') {
@@ -81,14 +82,17 @@ test('isolated browser: legacy dashboard task details load on open and reject st
     second.body = 'Second full history v2';
     second.fm.updated = '2026-09-07T12:01:00Z';
     state.generatedAt += 1;
+    delaySecond = true;
     await page.evaluate(() => refresh());
+    await page.locator('#ciMsg').fill('Latest draft typed during refresh');
+    await page.locator('#ciMsg').evaluate((field) => field.setSelectionRange(7, 12));
     await page.getByText('Second full history v2').waitFor();
     assert.equal(await page.locator('#detail details.recipe pre').textContent(), 'verify second', 'check recipe is rehydrated with refreshed detail');
-    assert.equal(await page.locator('#ciMsg').inputValue(), 'Draft check-in survives refresh');
+    assert.equal(await page.locator('#ciMsg').inputValue(), 'Latest draft typed during refresh');
     assert.equal(await page.locator('#ciStatus').inputValue(), 'waiting');
     assert.equal(await page.locator('#runExtra').inputValue(), 'Draft run instructions');
     assert.deepEqual(await page.locator('#ciMsg').evaluate((field) => ({ id: document.activeElement.id, start: field.selectionStart, end: field.selectionEnd })),
-      { id: 'ciMsg', start: 6, end: 14 }, 'background detail refresh preserves focus and selection');
+      { id: 'ciMsg', start: 7, end: 12 }, 'background detail refresh preserves edits, focus, and selection made during the request');
   } finally {
     await browser.close();
     await new Promise((resolve) => server.close(resolve));
