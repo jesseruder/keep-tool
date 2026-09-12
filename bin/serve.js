@@ -39,6 +39,7 @@ const sessionStatus = require('./session-status.js');
 const { sendStateJson } = require('./state-response.js');
 const { MOBILE_VIEWS, projectMobileState } = require('./mobile-state.js');
 const { createScreenHistoryCache } = require('./screen-history.js');
+const { createSettledSessionCache } = require('./settled-session-cache.js');
 
 const PORT = parseInt(process.env.KEEP_PORT || '7777', 10);
 const { PROJECTS_DIR, TAIL_BYTES, textOf, readTranscriptTail, findSessionFile } = transcripts;
@@ -4354,12 +4355,20 @@ const childScanCache = require('./stat-parse-cache').createStatParseCache({
 });
 const claudeSessionPathCache = new Map(); // session id -> transcript file
 const backgroundTargets = new Map();
+let backgroundJobScheduler = null;
 const claudeSessionParseCache = new Map(); // file -> { mtimeMs, size, info }
 const SESSION_LOOKUP_CACHE_LIMIT = 300;
+// Dashboard-only: action paths never consult this cache. A worker restart starts
+// cold, so restart inspection always rebuilds transcript and lifecycle state.
+const settledSessionCache = createSettledSessionCache({ maxEntries: 512 });
 let sessionSnapshot = [];
 let sessionSnapshotAt = 0;
 let lastDashboardSessionScan = 0;
 let lastStalledSessionScan = 0;
+let codexDashboardRows = new Map();
+let codexDashboardFullScanAt = 0;
+let codexDashboardDiscoveryDirty = true;
+const CODEX_DASHBOARD_FULL_SCAN_MS = 5 * 60e3;
 
 function scanChildTranscript(file) {
   try {
@@ -4371,6 +4380,12 @@ function scanChildTranscript(file) {
     childScanCache.delete(file);
     throw error;
   }
+}
+
+function registerBackgroundTarget(target) {
+  if (!target?.agent || !target?.sid || !target?.file) return;
+  backgroundTargets.set(`${target.agent}:${target.sid}`, target);
+  backgroundJobScheduler?.register(target);
 }
 
 function cacheClaudeSessionLookup(cache, key, value) {
@@ -4516,8 +4531,13 @@ function createDashboardClaudeSessionResolver(deps = {}) {
       entry = matches[0] || null;
     }
     if (!entry) return null;
-    const session = sessionForEntry(id, entry.file, entry.stat, accountId);
-    if (session) deps.onSessionSource?.(session, entry.file);
+    const cached = deps.dashboardWorker === true ? settledSessionCache.get({
+      agent: 'claude', id, file: entry.file, stat: entry.stat, accountId,
+      pane: deps.hostPanesBySession?.get(id), independentLive: deps.independentLive?.has(id), now: Date.now(),
+    }) : null;
+    const session = cached?.session || sessionForEntry(id, entry.file, entry.stat, accountId);
+    if (cached?.backgroundJobs) deps.onSettledHit?.(session, cached.backgroundJobs);
+    if (session) deps.onSessionSource?.(session, entry.file, entry.stat);
     return session;
   };
 }
@@ -4545,6 +4565,7 @@ function scanClaudeSessions(options = {}) {
   const seen = new Set();
   const sessionIds = new Set();
   const accountAuthority = accounts.authority(keep.ROOT);
+  const panesBySession = options.hostPanesBySession || hostPanesBySession(options.hostPanes || []);
   const transcriptRows = claudeTranscriptIndex.scan({ fresh: options.dashboard !== true });
   if (typeof options.onTranscriptRows === 'function') options.onTranscriptRows(transcriptRows);
   for (const { dir, file, id, stat, accountId } of transcriptRows) {
@@ -4553,8 +4574,12 @@ function scanClaudeSessions(options = {}) {
     sessionIds.add(id);
     if (spawned.has(id) || now - stat.mtimeMs > SESSION_WINDOW_MS) continue;
     seen.add(file);
+    const cached = options.dashboardWorker === true ? settledSessionCache.get({
+      agent: 'claude', id, file, stat, accountId, pane: panesBySession.get(id),
+      independentLive: options.independentLive?.has(id), now,
+    }) : null;
     let info;
-    try {
+    if (!cached) try {
       info = scanCache.get(file, stat, () => scanTranscript(file),
         (value) => Buffer.byteLength(JSON.stringify(value)));
     } catch { continue; }
@@ -4562,14 +4587,15 @@ function scanClaudeSessions(options = {}) {
     // TUI record types distinguish a conversation from a batch invocation.
     // Explicitly hosted headless history is restored below by host backfill,
     // whose exact session lookup intentionally does not apply this filter.
-    if (!claudeTranscriptIsInteractive(file, info, stat)) continue;
+    if (!cached && !claudeTranscriptIsInteractive(file, info, stat)) continue;
     // Claude can append untimestamped housekeeping records (ai-title, mode,
     // bridge-session) when an old session is merely reopened or inspected. Those
     // writes are not conversation activity and must not resurrect the session.
-    const activityMs = transcriptActivityMs(info, stat.mtimeMs);
+    const activityMs = cached ? cached.session.mtime : transcriptActivityMs(info, stat.mtimeMs);
     const ageMs = now - activityMs;
     if (ageMs > SESSION_WINDOW_MS) continue;
-    const session = claudeSessionFromInfo(id, info, stat, dir, reviewers.has(id), now, accountId);
+    const session = cached ? cached.session : claudeSessionFromInfo(id, info, stat, dir, reviewers.has(id), now, accountId);
+    if (cached?.backgroundJobs) options.onSettledHit?.(session, cached.backgroundJobs);
     try {
       const markerFile = path.join(attentionDir, `${id}.json`);
       const marker = JSON.parse(fs.readFileSync(markerFile, 'utf8'));
@@ -4588,7 +4614,7 @@ function scanClaudeSessions(options = {}) {
       }
     } catch {}
     sessions.push(session);
-    options.onSessionSource?.(session, file);
+    options.onSessionSource?.(session, file, stat);
   }
   scanCache.retain(seen);
   if (!readOnly) try {
@@ -4641,12 +4667,55 @@ function copySessions(sessions) {
   return (sessions || []).map((session) => ({ ...session }));
 }
 
+function scanDashboardCodexSessions(options, now) {
+  const full = codexDashboardDiscoveryDirty || !codexDashboardRows.size
+    || now < codexDashboardFullScanAt || now - codexDashboardFullScanAt >= CODEX_DASHBOARD_FULL_SCAN_MS;
+  if (full) {
+    let sessions = [];
+    try { sessions = codex.scan({ dashboard: true }); } catch {}
+    const next = new Map();
+    for (const session of sessions) {
+      const file = codex.rolloutFileFor(session.id);
+      let stat = null;
+      try { stat = file && fs.statSync(file); } catch {}
+      if (file && stat) next.set(session.id, { file, stat, accountId: session.accountId || null, session });
+    }
+    codexDashboardRows = next;
+    codexDashboardFullScanAt = now;
+    codexDashboardDiscoveryDirty = false;
+  }
+  const panesBySession = options.hostPanesBySession || hostPanesBySession(options.hostPanes || []);
+  const sessions = [];
+  for (const [id, record] of [...codexDashboardRows]) {
+    let stat;
+    try { stat = fs.statSync(record.file); } catch { codexDashboardRows.delete(id); continue; }
+    let accountId = record.accountId || null;
+    try { accountId = accounts.forSession(id, 'codex', { root: keep.ROOT, allowDiscovery: false })?.id || accountId; } catch {
+      codexDashboardRows.delete(id);
+      continue;
+    }
+    const cached = settledSessionCache.get({ agent: 'codex', id, file: record.file, stat, accountId,
+      pane: panesBySession.get(id), independentLive: options.independentLive?.has(id), now });
+    let session = cached?.session || record.session || null;
+    if (!session) {
+      try { session = codex.sessionFor(id); } catch {}
+    }
+    if (!session) { codexDashboardRows.delete(id); continue; }
+    codexDashboardRows.set(id, { file: record.file, stat, accountId: session.accountId || accountId || null });
+    options.onSessionSource?.(session, record.file, stat);
+    if (cached?.backgroundJobs) options.onSettledHit?.(session, cached.backgroundJobs);
+    sessions.push(session);
+  }
+  return sessions;
+}
+
 function scanSessions(options = {}) {
   const now = Date.now();
   const attentionDir = path.join(keep.ROOT, '.keep', 'attention');
   const sessions = scanClaudeSessions(options);
   let codexSessions = [];
-  try { codexSessions = codex.scan({ dashboard: options.dashboard === true }); } catch {}
+  if (options.dashboardWorker === true) codexSessions = scanDashboardCodexSessions(options, now);
+  else try { codexSessions = codex.scan({ dashboard: options.dashboard === true }); } catch {}
   attachCodexMarkers(codexSessions, attentionDir, now, options);
   sessions.push(...codexSessions);
   titles.applyLiveTitles(sessions, { cachedOnly: true });
@@ -4658,11 +4727,22 @@ function scanSessions(options = {}) {
 }
 
 function invalidateDashboardSources(change = {}) {
+  settledSessionCache.invalidate(change);
   if (change.kind === 'claude') claudeTranscriptIndex.invalidate(change.root, change.name);
-  else if (change.kind === 'codex') codex.invalidate();
+  else if (change.kind === 'codex') {
+    let known = false;
+    if (change.root && change.name) {
+      const changed = path.resolve(change.root, String(change.name));
+      known = [...codexDashboardRows.values()].some((entry) => entry.file === changed);
+    }
+    if (!known) codexDashboardDiscoveryDirty = true;
+    codex.invalidate();
+  }
+  else if (change.kind === 'accounts') codexDashboardDiscoveryDirty = true;
   else if (change.kind === 'all') {
     claudeTranscriptIndex.invalidate();
     codex.invalidate();
+    codexDashboardDiscoveryDirty = true;
   }
 }
 
@@ -4954,6 +5034,12 @@ function dashboardSummary(options, target, key, input, instruction, summaryOptio
 
 function buildState(options = {}) {
   const workerMode = options.dashboardWorker === true;
+  const now = typeof options.now === 'function' ? Number(options.now()) : Number(options.now ?? Date.now());
+  const liveLedger = readLiveSessionLedger(options);
+  const independentLive = stallAliveIds({ ...liveLedger, sessions: Object.fromEntries(
+    Object.entries(liveLedger.sessions || {}).filter(([, entry]) => entry.source !== 'host'),
+  ) }, now);
+  const panesBySession = hostPanesBySession(options.hostPanes || []);
   let cardUsageSummary = null;
   try { cardUsageSummary = cardUsage.snapshot(keep.ROOT); }
   catch (error) {
@@ -4973,22 +5059,28 @@ function buildState(options = {}) {
   // time so the general-purpose 300-entry lookup LRU cannot evict an earlier
   // published session before its path is relayed to the parent.
   const dashboardSourceFiles = new Map();
-  const rememberDashboardSource = (session, file) => {
-    if (session?.kind && session?.id && file) dashboardSourceFiles.set(`${session.kind}:${session.id}`, file);
+  const dashboardSourceEvidence = new Map();
+  const settledBackgroundJobs = new Map();
+  const rememberDashboardSource = (session, file, stat = null) => {
+    if (session?.kind && session?.id && file) {
+      const key = `${session.kind}:${session.id}`;
+      dashboardSourceFiles.set(key, file);
+      if (stat) dashboardSourceEvidence.set(key, { file, stat, accountId: session.accountId || null });
+    }
   };
   const sessions = scanSessions({
     dashboard: options.dashboard === true,
+    dashboardWorker: workerMode,
     readOnly: workerMode,
+    hostPanes: options.hostPanes || [],
+    hostPanesBySession: panesBySession,
+    independentLive,
     onSessionSource: rememberDashboardSource,
+    onSettledHit: (session, jobs) => settledBackgroundJobs.set(`${session.kind}:${session.id}`, jobs),
     ...(options.dashboard === true ? { onTranscriptRows: (rows) => { dashboardTranscriptRows = rows; } } : {}),
   });
   // scanSessions just reconciled this exact index snapshot synchronously. Reuse
   // it for host-only rows instead of statting every project directory again.
-  const now = typeof options.now === 'function' ? Number(options.now()) : Number(options.now ?? Date.now());
-  const liveLedger = readLiveSessionLedger(options);
-  const independentLive = stallAliveIds({ ...liveLedger, sessions: Object.fromEntries(
-    Object.entries(liveLedger.sessions || {}).filter(([, entry]) => entry.source !== 'host'),
-  ) }, now);
   if (Object.prototype.hasOwnProperty.call(options, 'hostPanes')) {
     backfillHostSessions(sessions, options.hostPanes, {
       tasks,
@@ -5000,6 +5092,10 @@ function buildState(options = {}) {
         createDashboardClaudeSessionResolver: () => createDashboardClaudeSessionResolver({
           rows: dashboardTranscriptRows,
           onSessionSource: rememberDashboardSource,
+          onSettledHit: (session, jobs) => settledBackgroundJobs.set(`${session.kind}:${session.id}`, jobs),
+          dashboardWorker: workerMode,
+          hostPanesBySession: panesBySession,
+          independentLive,
         }),
       } : {}),
     });
@@ -5031,12 +5127,16 @@ function buildState(options = {}) {
         || (session.kind === 'claude' ? claudeSessionPathCache.get(session.id) : codex.rolloutFileFor(session.id));
       if (file) {
         const hosted = options.hostPanes.find(p => p.id === session.runtime?.paneId);
+        const sourceEvidence = dashboardSourceEvidence.get(`${session.kind}:${session.id}`)?.stat;
         const target = { agent: session.kind, sid: session.id, file,
+          ...(sourceEvidence ? { sourceFingerprint: [sourceEvidence.dev, sourceEvidence.ino,
+            sourceEvidence.size, sourceEvidence.mtimeMs, sourceEvidence.ctimeMs] } : {}),
           instance: { id: require('./background-jobs').processInstance(hosted),
             processScoped: true, live: session.runtime?.state === 'live' ? true : session.runtime?.state === 'exited' ? false : null } };
         if (workerMode) options.collectBackgroundTargets?.push(target);
-        else backgroundTargets.set(`${session.kind}:${session.id}`, target);
-        const jobs = require('./background-jobs').read(keep.ROOT, session.kind, session.id, now);
+        else registerBackgroundTarget(target);
+        const jobs = settledBackgroundJobs.get(`${session.kind}:${session.id}`)
+          || require('./background-jobs').read(keep.ROOT, session.kind, session.id, now);
         session.backgroundJobs = jobs;
         session.pendingBackground = jobs.pending || (!jobs.caughtUp && session.pendingBackground);
         session.unknownBackgroundJobs = [...new Set([...jobs.uncertain, ...(!jobs.caughtUp ? session.unknownBackgroundJobs || [] : [])])];
@@ -5052,6 +5152,32 @@ function buildState(options = {}) {
     session.state = session.activity.state;
     session.stateLabel = session.activity.label;
     if (!workerMode) require('./session-debug').record(session, now);
+  }
+  if (workerMode) {
+    const terminal = new Set(['completed', 'failed', 'cancelled']);
+    const derived = new Set(['taskId', 'taskStatus', 'runtime', 'pane', 'launchModel', 'accountLabel',
+      'backgroundJobs', 'activity', 'observation', 'stateLabel', 'stalled']);
+    for (const session of sessions) {
+      const key = `${session.kind}:${session.id}`;
+      const evidence = dashboardSourceEvidence.get(key);
+      const pane = panesBySession.get(session.id);
+      const jobs = session.backgroundJobs;
+      const eligible = evidence && session.exited === true && session.runtime?.state === 'exited'
+        && !independentLive?.has(session.id) && !session.pendingBackground
+        && !session.lifecycleForeground && !(session.lifecycleAgents || []).length
+        && jobs?.caughtUp === true && jobs.pending === false && !(jobs.uncertain || []).length
+        && (jobs.jobs || []).every((job) => terminal.has(job.status));
+      if (!eligible) {
+        settledSessionCache.delete(session.kind, session.id);
+        continue;
+      }
+      const frozen = { ...session };
+      for (const field of derived) delete frozen[field];
+      delete frozen.notify; // attention markers are refreshed on every build
+      settledSessionCache.set({ agent: session.kind, id: session.id, file: evidence.file,
+        stat: evidence.stat, accountId: evidence.accountId, pane, independentLive: false, now },
+      { session: frozen, backgroundJobs: jobs });
+    }
   }
   const stalledItems = stalled.readCurrent({ root: keep.ROOT });
   const stalledSessionIds = new Set(stalledItems.filter((item) => item.kind === 'session').map((item) => item.id));
@@ -5244,7 +5370,7 @@ function finalizeDashboardWorkerResult(result) {
   associateDashboardSessionFiles(state, result.backgroundTargets);
   for (const item of result.healthErrors || []) health.record(item.name, { ok: false, error: item.message });
   for (const target of result.backgroundTargets || []) {
-    if (target?.agent && target?.sid && target?.file) backgroundTargets.set(`${target.agent}:${target.sid}`, target);
+    registerBackgroundTarget(target);
   }
 
   const taskById = new Map((state.tasks || []).map((task) => [task.id, task]));
@@ -6252,6 +6378,9 @@ function start(deps = {}) {
     prepare: (input) => ({ ...input, dashboardRuntime: dashboardRuntimeSnapshot() }),
     finalize: finalizeDashboardWorkerResult,
   });
+  const jobLedger = require('./background-jobs');
+  backgroundJobScheduler = jobLedger.createScheduler({ fallbackMs: 10 * 60e3, fallbackSlotTicks: 20 });
+  for (const target of backgroundTargets.values()) backgroundJobScheduler.register(target);
   const dashboardBuild = (options) => dashboardBuilder.build({
     hostPanes: options.hostPanes || [],
     companion: options.companion || null,
@@ -6297,26 +6426,43 @@ function start(deps = {}) {
   for (const entry of claudeProjectRoots) {
     watch(entry.root, { recursive: true }, (name) => {
       claudeTranscriptIndex.invalidate(entry.root, name);
+      if (name) backgroundJobScheduler?.wakeFile(path.join(entry.root, String(name)));
       dashboardBuilder.invalidate({ kind: 'claude', root: entry.root, name });
     });
   }
   for (const sessionsRoot of new Set(codex.configuredRoots().map((entry) => path.join(entry.configDir, 'sessions')))) {
-    watch(sessionsRoot, { recursive: true },
-      (name) => dashboardBuilder.invalidate({ kind: 'codex', root: sessionsRoot, name }));
+    watch(sessionsRoot, { recursive: true }, (name) => {
+      if (name) backgroundJobScheduler?.wakeFile(path.join(sessionsRoot, String(name)));
+      dashboardBuilder.invalidate({ kind: 'codex', root: sessionsRoot, name });
+    });
   }
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'lifecycle'), { recursive: true }); } catch {}
   watch(path.join(keep.ROOT, '.keep', 'lifecycle'), { recursive: true },
     (name) => dashboardBuilder.invalidate({ kind: 'lifecycle', name }));
+  try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'session-accounts'), { recursive: true }); } catch {}
+  watch(path.join(keep.ROOT, '.keep', 'session-accounts'), null,
+    (name) => dashboardBuilder.invalidate({ kind: 'accounts', name }));
+  try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'background-jobs'), { recursive: true }); } catch {}
+  // Only immutable hook inbox writes wake a parked ledger here. sync() itself
+  // atomically rewrites state.json, and waking on that write would immediately
+  // undo every park and recreate the old polling loop.
+  try {
+    const jobsWatch = fs.watch(path.join(keep.ROOT, '.keep', 'background-jobs'), { recursive: true }, (_event, name) => {
+      if (!backgroundJobScheduler?.wakeInbox(name)) return;
+      const key = String(name).split(/[\\/]+/).slice(0, 2).join(':');
+      dashboardBuilder.invalidate({ kind: 'background-jobs', name: key });
+      broadcast();
+    });
+    jobsWatch.on('error', () => {});
+  } catch {}
 
-  const jobLedger = require('./background-jobs');
-  for (const target of jobLedger.targets(keep.ROOT)) backgroundTargets.set(`${target.agent}:${target.sid}`, target);
+  for (const target of jobLedger.targets(keep.ROOT)) registerBackgroundTarget(target);
   // One bounded incremental read per tick, outside HTTP state assembly.
-  let jobCursor = 0;
   const jobsChanged = createJobChangeTracker();
   const jobTick = () => {
-    const targets = [...backgroundTargets.values()];
-    if (!targets.length) return;
-    const target = jobLedger.nextTarget(targets, jobCursor++);
+    const selected = backgroundJobScheduler.select(Date.now());
+    if (!selected) return;
+    const { key, target } = selected;
     try {
       const result = jobLedger.sync({ root: keep.ROOT, ...target,
         classify: (name, input) => isBoundedBackgroundWatcher('Bash', { ...input, command: input?.command || input?.cmd, run_in_background: true }) ? 'finite'
@@ -6330,11 +6476,12 @@ function start(deps = {}) {
           return require('./codex-lifecycle').inspectChild(id, target.sid);
         },
       });
+      backgroundJobScheduler.observe(key, target, result, Date.now());
       if (result.redirect?.agent === target.agent && result.redirect.sid === target.sid && result.redirect.file) {
-        backgroundTargets.set(`${target.agent}:${target.sid}`, result.redirect);
+        registerBackgroundTarget(result.redirect);
       }
-      if (jobsChanged(`${target.agent}:${target.sid}`, result)) {
-        dashboardBuilder.invalidate({ kind: 'background-jobs', name: `${target.agent}:${target.sid}` });
+      if (jobsChanged(key, result)) {
+        dashboardBuilder.invalidate({ kind: 'background-jobs', name: key });
         broadcast();
       }
     } catch (error) { process.stderr.write(`keep jobs: ${error.message}\n`); }

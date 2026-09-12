@@ -14,6 +14,59 @@ test('bounded scheduler prioritizes live histories without starving cold ones', 
   assert.equal(jobs.nextTarget([], 0), undefined);
 });
 
+test('settled exited ledgers park, ignore unchanged registration, and wake on source or inbox change', () => {
+  const scheduler = jobs.createScheduler({ fallbackMs: 10000, fallbackSlotTicks: 20 });
+  const target = { agent: 'claude', sid: 'old', file: '/tmp/old.jsonl', sourceFingerprint: [1, 2, 3, 4, 5],
+    instance: { id: 'pane:1:2', processScoped: true, live: false } };
+  scheduler.register(target);
+  const selected = scheduler.select(1000);
+  assert.equal(selected.key, 'claude:old');
+  const settled = { caughtUp: true, recovering: false, gap: false, pending: false, uncertain: [],
+    unresolvedCalls: 0, unconsumedHooks: 0, jobs: [] };
+  assert.equal(scheduler.observe(selected.key, target, settled, 1000), 'parked');
+  assert.equal(scheduler.register({ ...target }), false, 'dashboard rebuild does not wake an unchanged target');
+  assert.deepEqual(scheduler.stats(), { registered: 1, selected: 1, parked: 1, woken: 0, fallback: 0, active: 0 });
+  assert.equal(scheduler.wakeInbox('claude/old/state.json'), false, 'the scheduler ignores its own snapshot writes');
+  assert.equal(scheduler.wakeInbox('claude/old/inbox/event.json'), true);
+  assert.equal(scheduler.stats().active, 1);
+  scheduler.observe('claude:old', target, settled, 2000);
+  assert.equal(scheduler.register({ ...target, sourceFingerprint: [1, 2, 4, 5, 6] }), true, 'source rewrite wakes the target');
+  scheduler.observe('claude:old', { ...target, sourceFingerprint: [1, 2, 4, 5, 6] }, settled, 3000);
+  assert.equal(scheduler.wakeFile('/tmp/old.jsonl'), 1);
+});
+
+test('parent exit never parks unresolved children, uncertain history, calls, hooks, or live instances', () => {
+  const target = { agent: 'claude', sid: 'parent', file: '/tmp/parent.jsonl',
+    instance: { id: 'pane:1:2', processScoped: true, live: false } };
+  const base = { caughtUp: true, recovering: false, gap: false, pending: false, uncertain: [],
+    unresolvedCalls: 0, unconsumedHooks: 0, jobs: [] };
+  for (const result of [
+    { ...base, jobs: [{ id: 'child', kind: 'agent', status: 'pending' }] },
+    { ...base, uncertain: ['child'] },
+    { ...base, gap: true },
+    { ...base, recovering: true },
+    { ...base, caughtUp: false },
+    { ...base, unresolvedCalls: 1 },
+    { ...base, unconsumedHooks: 1 },
+  ]) assert.equal(jobs.settledResult(target, result), false);
+  assert.equal(jobs.settledResult({ ...target, instance: { ...target.instance, live: true } }, base), false);
+  assert.equal(jobs.settledResult(target, base), true);
+});
+
+test('parked ledgers receive a sparse fallback check without displacing active work every tick', () => {
+  const scheduler = jobs.createScheduler({ fallbackMs: 1000, fallbackSlotTicks: 4 });
+  const settled = { caughtUp: true, recovering: false, gap: false, pending: false, uncertain: [],
+    unresolvedCalls: 0, unconsumedHooks: 0, jobs: [] };
+  const old = { agent: 'claude', sid: 'old', file: '/tmp/old.jsonl', instance: { live: false } };
+  const live = { agent: 'claude', sid: 'live', file: '/tmp/live.jsonl', instance: { live: true } };
+  scheduler.register(old);
+  let item = scheduler.select(1000); scheduler.observe(item.key, item.target, settled, 1000);
+  scheduler.register(live);
+  assert.equal(scheduler.select(5000).target.sid, 'live');
+  assert.equal(scheduler.select(5000).target.sid, 'live');
+  assert.equal(scheduler.select(5000).target.sid, 'old', 'reserved slot probes one due parked ledger');
+});
+
 function fixture(run, agent = 'claude') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-jobs-'));
   const file = path.join(root, 'session.jsonl'); fs.writeFileSync(file, '');

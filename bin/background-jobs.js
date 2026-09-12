@@ -432,7 +432,7 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
       state.cronVersion = 1; state.turnVersion = 1;
     }
     const freshBaseEligible = !state.checkpoint && !state.gap && state.hookBarrier == null;
-    let recovering = false, bytesRead = 0;
+    let recovering = false, bytesRead = 0, sourceCaughtUp = false;
     try {
       const fd = fs.openSync(file, 'r');
       try {
@@ -476,6 +476,7 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
         if (start === 0 && bytesRead >= (cp.skip ? budget : Math.max(budget, maxRecord))) { start = bytesRead; cp.skip = true; state.gap = true; }
         cp.offset += start; cp.anchor = anchor(cp.offset); cp.mtime = stat.mtimeMs; state.checkpoint = cp;
         recovering = cp.offset < stat.size;
+        sourceCaughtUp = !recovering && cp.offset === stat.size && cp.mtime === stat.mtimeMs;
       } finally { fs.closeSync(fd); }
     } catch { recovering = true; }
     const inbox = path.join(dir, 'inbox');
@@ -551,9 +552,11 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
     const open = jobs.filter(j => !TERMINAL.has(j.status) && !['service', 'scheduled'].includes(j.kind));
     const uncertain = open.filter(j => j.kind === 'unknown' || now - (j.lastCorroboratedAt || j.eventAt) > staleAfter || j.evidence === 'transcript-replaced').map(j => j.id);
     if (recovering || state.gap) uncertain.push(recovering ? 'history-recovery' : 'history-gap');
+    const caughtUp = sourceCaughtUp && (state.hookBarrier == null || state.checkpoint.offset > state.hookBarrier);
     return { pending: open.some(j => !uncertain.includes(j.id)), uncertain,
       jobs: jobs.map(j => ({ ...j, confidence: TERMINAL.has(j.status) ? 'observed' : uncertain.includes(j.id) ? 'uncertain' : 'observed' })),
-      recovering, gap: state.gap, bytesRead, lastReconciledAt: now };
+      recovering, gap: state.gap, caughtUp, unresolvedCalls: Object.keys(state.calls).length,
+      unconsumedHooks: consumed.length, bytesRead, lastReconciledAt: now };
   } finally { try { fs.unlinkSync(lock); } catch {} }
 }
 
@@ -566,7 +569,9 @@ function read(root, agent, sid, now = Date.now(), staleAfter = 30 * 60e3) {
     if (state.recovering || state.gap) uncertain.push(state.recovering ? 'history-recovery' : 'history-gap');
     let caughtUp = false;
     try { const s = fs.statSync(state.source.file); caughtUp = !state.recovering && state.checkpoint.offset === s.size && state.checkpoint.mtime === s.mtimeMs; } catch {}
-    return { pending: open.some(j => !uncertain.includes(j.id)), uncertain, jobs, caughtUp, turnStartedAt: state.turnStartedAt || null, lastReconciledAt: state.lastReconciledAt };
+    return { pending: open.some(j => !uncertain.includes(j.id)), uncertain, jobs, caughtUp,
+      recovering: Boolean(state.recovering), gap: Boolean(state.gap), unresolvedCalls: Object.keys(state.calls || {}).length,
+      turnStartedAt: state.turnStartedAt || null, lastReconciledAt: state.lastReconciledAt };
   } catch { return { pending: false, uncertain: ['history-recovery'], jobs: [] }; }
 }
 
@@ -594,4 +599,128 @@ function nextTarget(targets, cursor) {
   return targets[Math.floor(cursor / 4) % targets.length];
 }
 
-module.exports = { restartVersion, processInstance, sync, read, targets, recordHook, consume, nextTarget, rebindSource };
+function targetKey(target) {
+  return `${target?.agent || ''}:${target?.sid || ''}`;
+}
+
+function targetFingerprint(target) {
+  const instance = target?.instance || {};
+  return JSON.stringify([target?.agent || null, target?.sid || null,
+    target?.file ? path.resolve(target.file) : null, target?.includeSidechain === true,
+    target?.sourceFingerprint || null,
+    instance.id || null, instance.processScoped === true, instance.live ?? null]);
+}
+
+function settledResult(target, result) {
+  return target?.instance?.live === false
+    && result?.caughtUp === true
+    && result?.recovering === false
+    && result?.gap === false
+    && result?.pending === false
+    && Array.isArray(result.uncertain) && result.uncertain.length === 0
+    && result?.unresolvedCalls === 0
+    && result?.unconsumedHooks === 0
+    && Array.isArray(result.jobs)
+    && result.jobs.every((job) => TERMINAL.has(job.status));
+}
+
+// Active ledgers retain the existing 500ms round-robin. Settled exited ledgers
+// leave that loop until a source/inbox/host event wakes them; one parked ledger
+// gets a fallback probe every fallbackSlotTicks to cover dropped fs.watch events.
+function createScheduler(options = {}) {
+  const active = new Map();
+  const parked = new Map();
+  const fallbackMs = Math.max(1000, Number(options.fallbackMs) || 10 * 60e3);
+  const fallbackSlotTicks = Math.max(1, Number(options.fallbackSlotTicks) || 20);
+  let cursor = 0;
+  let ticks = 0;
+  const stats = { registered: 0, selected: 0, parked: 0, woken: 0, fallback: 0 };
+
+  function register(target) {
+    const key = targetKey(target);
+    if (!target?.file || !['claude', 'codex'].includes(target.agent) || !ID.test(target.sid || '')) return false;
+    const fingerprint = targetFingerprint(target);
+    const sleeping = parked.get(key);
+    if (sleeping && sleeping.fingerprint === fingerprint) {
+      sleeping.target = target;
+      return false;
+    }
+    if (sleeping) { parked.delete(key); stats.woken++; }
+    const current = active.get(key);
+    if (current?.fingerprint === fingerprint) { current.target = target; return false; }
+    active.set(key, { target, fingerprint });
+    stats.registered++;
+    return true;
+  }
+
+  function wake(key) {
+    const sleeping = parked.get(key);
+    if (!sleeping) return false;
+    parked.delete(key);
+    active.set(key, { target: sleeping.target, fingerprint: sleeping.fingerprint });
+    stats.woken++;
+    return true;
+  }
+
+  function wakeFile(file) {
+    let resolved;
+    try { resolved = path.resolve(file); } catch { return 0; }
+    let count = 0;
+    for (const [key, entry] of parked) {
+      if (path.resolve(entry.target.file) === resolved && wake(key)) count++;
+    }
+    return count;
+  }
+
+  function wakeInbox(relativeName) {
+    const parts = String(relativeName || '').split(/[\\/]+/);
+    if (parts.length < 4 || parts[2] !== 'inbox') return false;
+    return wake(`${parts[0]}:${parts[1]}`);
+  }
+
+  function select(now = Date.now()) {
+    ticks++;
+    const fallbackDue = ticks % fallbackSlotTicks === 0 || active.size === 0;
+    if (fallbackDue) {
+      for (const [key, entry] of parked) {
+        if (now < entry.probeAt) continue;
+        parked.delete(key);
+        active.set(key, { target: entry.target, fingerprint: entry.fingerprint });
+        stats.fallback++;
+        stats.selected++;
+        return { key, target: entry.target, fallback: true };
+      }
+    }
+    if (!active.size) return null;
+    const rows = [...active.values()].map((entry) => entry.target);
+    const target = nextTarget(rows, cursor++);
+    stats.selected++;
+    return { key: targetKey(target), target, fallback: false };
+  }
+
+  function observe(key, target, result, now = Date.now()) {
+    if (result?.redirect?.agent === target?.agent && result.redirect.sid === target.sid && result.redirect.file) {
+      active.delete(key);
+      parked.delete(key);
+      register(result.redirect);
+      return 'redirected';
+    }
+    if (!settledResult(target, result)) return 'active';
+    active.delete(key);
+    const fingerprint = targetFingerprint(target);
+    // Stable jitter prevents a daemon start from lining up every fallback read.
+    let jitter = 0;
+    for (const char of key) jitter = (jitter * 33 + char.charCodeAt(0)) >>> 0;
+    parked.set(key, { target, fingerprint, probeAt: now + fallbackMs + (jitter % Math.max(1, Math.floor(fallbackMs / 2))) });
+    stats.parked++;
+    return 'parked';
+  }
+
+  return {
+    register, wake, wakeFile, wakeInbox, select, observe,
+    stats: () => ({ ...stats, active: active.size, parked: parked.size }),
+  };
+}
+
+module.exports = { restartVersion, processInstance, sync, read, targets, recordHook, consume, nextTarget, rebindSource,
+  targetKey, targetFingerprint, settledResult, createScheduler };
