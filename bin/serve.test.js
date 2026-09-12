@@ -106,6 +106,8 @@ const {
   resolvePortableTransfer,
   recoverPortableOpening,
   waitForHostAgent,
+  prepareSessionSummary,
+  associateDashboardSessionFiles,
   InjectionError,
 } = require('./serve.js');
 const { createScreenHistoryCache } = require('./screen-history.js');
@@ -161,6 +163,52 @@ function compactTraceSpy(stages) {
     finish(stage) { stages.push(stage); },
   });
 }
+
+test('prepareSessionSummary reuses an already resolved transcript path', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-session-summary-'));
+  try {
+    const file = path.join(root, 'selected.jsonl');
+    fs.writeFileSync(file, [
+      record('user', 'Latest request'),
+      record('assistant', 'Latest answer'),
+    ].join('\n') + '\n');
+    let input = '';
+    const result = prepareSessionSummary({ id: 'selected', kind: 'claude' }, { priority: -1 }, {
+      file,
+      findSessionFile: () => { throw new Error('resolved the transcript twice'); },
+      getSummary: (_key, text) => { input = text; return { text: 'summary', fresh: true }; },
+    });
+    assert.deepEqual(result, { text: 'summary', fresh: true });
+    assert.match(input, /Latest request/);
+    assert.match(input, /Latest answer/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('published worker source wins over stale parent Codex discovery', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-session-source-'));
+  try {
+    const oldFile = path.join(root, 'old.jsonl');
+    const authoritativeFile = path.join(root, 'authoritative.jsonl');
+    fs.writeFileSync(oldFile, 'old account transcript');
+    fs.writeFileSync(authoritativeFile, 'new authoritative transcript');
+    const session = { id: 'shared', kind: 'codex' };
+    associateDashboardSessionFiles({ sessions: [session] }, [
+      { agent: 'codex', sid: 'shared', file: authoritativeFile },
+    ]);
+    let discoveryCalls = 0;
+    let input = '';
+    prepareSessionSummary(session, {}, {
+      codex: {
+        rolloutFileFor: () => { discoveryCalls++; return oldFile; },
+        findRolloutFile: () => { discoveryCalls++; return oldFile; },
+        recentText: (file) => fs.readFileSync(file, 'utf8'),
+      },
+      getSummary: (_key, text) => { input = text; return { text: null, fresh: false }; },
+    });
+    assert.equal(discoveryCalls, 0, 'published source lookup does not walk the parent Codex index');
+    assert.equal(input, 'new authoritative transcript');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
 
 test('classifyPromptLine distinguishes empty, suggestion, and draft prompts', () => {
   assert.equal(classifyPromptLine('header\n❯ ', 'header\n❯ '), 'empty');

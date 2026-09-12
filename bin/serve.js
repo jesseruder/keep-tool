@@ -255,14 +255,28 @@ const RESUME_INSTRUCTION = "This developer is returning to work after a break. F
 const REVIEW_INSTRUCTION = "These items are awaiting the developer's decision. For each, give a one-line recommendation (ramp / kill / take a look / merge / etc.) based on its latest status. Output only the list, one '- Title — recommendation' bullet per item. Plain bullets only — never a markdown table, headers, or preamble.";
 const TASK_INSTRUCTION = "Summarize where this task stands for someone resuming it. 2-4 sentences: the goal, what's been done, and the current state / next step. Draw only from the log below. Output only the summary.";
 const SESSION_INSTRUCTION = "Write 2 to 4 short lines, newest first, each naming one thing this coding session worked on recently (feature, bug, file area) and its outcome or current state. Plain text, one item per line, no bullets, no preamble. Output only those lines.";
+const dashboardSessionSources = new WeakMap();
+function associateDashboardSessionFiles(state, targets, store = dashboardSessionSources) {
+  const files = new Map((targets || [])
+    .filter((target) => target?.agent && target?.sid && target?.file)
+    .map((target) => [`${target.agent}:${target.sid}`, target.file]));
+  for (const session of state?.sessions || []) {
+    const file = files.get(`${session.kind}:${session.id}`);
+    if (file) store.set(session, file);
+  }
+  return state;
+}
 function sessionSummaryFile(session, deps = {}) {
+  const published = session && dashboardSessionSources.get(session);
+  if (published) return published;
+  if (deps.publishedOnly) return null;
   const reader = deps.codex || codex;
   return session && (session.kind === 'codex'
     ? reader.rolloutFileFor(session.id) || reader.findRolloutFile(session.id)
     : (deps.findSessionFile || findSessionFile)(session.id));
 }
 function prepareSessionSummary(session, options = {}, deps = {}) {
-  const file = sessionSummaryFile(session, deps);
+  const file = deps.file || sessionSummaryFile(session, deps);
   if (!file) return { text: null, fresh: false };
   const input = session.kind === 'codex' ? (deps.codex || codex).recentText(file) : recentTranscriptText(file);
   return (deps.getSummary || summarize.getSummary)(`session-${session.id}`, input, SESSION_INSTRUCTION, onChange, options);
@@ -4317,7 +4331,10 @@ function createDashboardClaudeSessionResolver(deps = {}) {
       if (authorityFailed && matches.length > 1) throw new Error(`session ${id} exists in multiple accounts without authority`);
       entry = matches[0] || null;
     }
-    return entry ? sessionForEntry(id, entry.file, entry.stat, accountId) : null;
+    if (!entry) return null;
+    const session = sessionForEntry(id, entry.file, entry.stat, accountId);
+    if (session) deps.onSessionSource?.(session, entry.file);
+    return session;
   };
 }
 
@@ -4387,6 +4404,7 @@ function scanClaudeSessions(options = {}) {
       }
     } catch {}
     sessions.push(session);
+    options.onSessionSource?.(session, file);
   }
   scanCache.retain(seen);
   if (!readOnly) try {
@@ -4458,6 +4476,10 @@ function scanSessions(options = {}) {
 function invalidateDashboardSources(change = {}) {
   if (change.kind === 'claude') claudeTranscriptIndex.invalidate(change.root, change.name);
   else if (change.kind === 'codex') codex.invalidate();
+  else if (change.kind === 'all') {
+    claudeTranscriptIndex.invalidate();
+    codex.invalidate();
+  }
 }
 
 function normalizedProject(value) {
@@ -4763,9 +4785,17 @@ function buildState(options = {}) {
     overdue: keep.isOverdue(t),
   }));
   let dashboardTranscriptRows = null;
+  // This map belongs to one build. Capture each selected source at discovery
+  // time so the general-purpose 300-entry lookup LRU cannot evict an earlier
+  // published session before its path is relayed to the parent.
+  const dashboardSourceFiles = new Map();
+  const rememberDashboardSource = (session, file) => {
+    if (session?.kind && session?.id && file) dashboardSourceFiles.set(`${session.kind}:${session.id}`, file);
+  };
   const sessions = scanSessions({
     dashboard: options.dashboard === true,
     readOnly: workerMode,
+    onSessionSource: rememberDashboardSource,
     ...(options.dashboard === true ? { onTranscriptRows: (rows) => { dashboardTranscriptRows = rows; } } : {}),
   });
   // scanSessions just reconciled this exact index snapshot synchronously. Reuse
@@ -4783,9 +4813,15 @@ function buildState(options = {}) {
       independentLive,
       dashboard: options.dashboard === true,
       ...(dashboardTranscriptRows ? {
-        createDashboardClaudeSessionResolver: () => createDashboardClaudeSessionResolver({ rows: dashboardTranscriptRows }),
+        createDashboardClaudeSessionResolver: () => createDashboardClaudeSessionResolver({
+          rows: dashboardTranscriptRows,
+          onSessionSource: rememberDashboardSource,
+        }),
       } : {}),
     });
+  }
+  for (const session of sessions) {
+    if (session.kind === 'codex') rememberDashboardSource(session, codex.rolloutFileFor(session.id));
   }
   // Current card links win over historical links; task progress stays separate
   // from the live conversation's readiness for another instruction.
@@ -4807,7 +4843,8 @@ function buildState(options = {}) {
   applyHostedExitState(sessions, options.hostPanes, independentLive);
   for (const session of sessions) {
     if (['claude', 'codex'].includes(session.kind) && options.hostPanes) {
-      const file = session.kind === 'claude' ? claudeSessionPathCache.get(session.id) : codex.rolloutFileFor(session.id);
+      const file = dashboardSourceFiles.get(`${session.kind}:${session.id}`)
+        || (session.kind === 'claude' ? claudeSessionPathCache.get(session.id) : codex.rolloutFileFor(session.id));
       if (file) {
         const hosted = options.hostPanes.find(p => p.id === session.runtime?.paneId);
         const target = { agent: session.kind, sid: session.id, file,
@@ -5017,6 +5054,10 @@ function setPath(object, pathParts, value) {
 
 function finalizeDashboardWorkerResult(result) {
   const state = result.state;
+  // Bind source paths to these exact session objects. Paths stay private and a
+  // later account handoff cannot make an older parent-process lookup win over
+  // the worker snapshot that selected the session.
+  associateDashboardSessionFiles(state, result.backgroundTargets);
   for (const item of result.healthErrors || []) health.record(item.name, { ok: false, error: item.message });
   for (const target of result.backgroundTargets || []) {
     if (target?.agent && target?.sid && target?.file) backgroundTargets.set(`${target.agent}:${target.sid}`, target);
@@ -6129,7 +6170,11 @@ function start(deps = {}) {
     file: path.join(keep.ROOT, '.keep', 'session-restarts.json'),
     inspect: async (body) => {
       const panes = await listHostPanes({}, true);
-      const state = await addHostSessionState(await buildState({ hostPanes: panes }), { panes });
+      // A queued restart needs a new observation, but its fleet scan need not run
+      // on the request loop. Give it a distinct worker generation so it cannot
+      // join an older dashboard request with the same pane snapshot.
+      dashboardBuilder.invalidate({ kind: 'all', name: 'restart-inspection' });
+      const state = await dashboardBuild({ hostPanes: panes });
       return { session: state.sessions.find((s) => s.id === body.sessionId), pane: panes?.find((p) => p.id === body.pane) };
     },
     restart: restartSession, forceRestart: forceRestartSession, onChange: broadcast,
@@ -6391,20 +6436,37 @@ function start(deps = {}) {
       if (req.method === 'GET' && url.pathname === '/api/sessionsummary') {
         const id = url.searchParams.get('id') || '';
         if (!/^[A-Za-z0-9_-]+$/.test(id)) return json(res, 400, { error: 'bad session id' });
-        const session = scanSessions().find((s) => s.id === id);
-        const file = sessionSummaryFile(session);
+        const current = dashboardBuilder.latest();
+        if (!current) return json(res, 503, { error: 'dashboard state is still loading' });
+        const session = current.sessions?.find((s) => s.id === id);
+        const file = sessionSummaryFile(session, { publishedOnly: true });
         if (!session || !file) return json(res, 404, { error: 'no session' });
-        const result = prepareSessionSummary(session, { priority: -1 });
+        // The dashboard snapshot identifies the session; the transcript itself is
+        // still read now, so summary input includes bytes written after that scan.
+        let result;
+        try { result = prepareSessionSummary(session, { priority: -1 }, { file }); }
+        catch (error) {
+          if (error.code === 'ENOENT') return json(res, 404, { error: 'no session' });
+          throw error;
+        }
         return json(res, 200, { text: result.text, fresh: result.fresh });
       }
 
       if (req.method === 'GET' && url.pathname === '/api/sessiontail') {
         const id = url.searchParams.get('id') || '';
         if (!/^[A-Za-z0-9-]+$/.test(id)) return json(res, 400, { error: 'bad session id' });
-        const session = scanSessions().find((s) => s.id === id);
-        const file = session && findSessionFile(id);
+        const current = dashboardBuilder.latest();
+        if (!current) return json(res, 503, { error: 'dashboard state is still loading' });
+        const session = current.sessions?.find((s) => s.id === id);
+        const file = sessionSummaryFile(session, { publishedOnly: true });
         if (!session || !file) return json(res, 404, { error: 'no session' });
-        return json(res, 200, { text: recentTranscriptText(file) });
+        let text;
+        try { text = session.kind === 'codex' ? codex.recentText(file) : recentTranscriptText(file); }
+        catch (error) {
+          if (error.code === 'ENOENT') return json(res, 404, { error: 'no session' });
+          throw error;
+        }
+        return json(res, 200, { text });
       }
 
       if (req.method === 'GET' && url.pathname === '/api/screen') {
@@ -6753,7 +6815,7 @@ function start(deps = {}) {
 }
 
 module.exports = {
-  prepareSessionSummary, sessionSummarySnapshot,
+  prepareSessionSummary, sessionSummarySnapshot, associateDashboardSessionFiles,
   start,
   apiRequestAuthError,
   agentPromptVisible,

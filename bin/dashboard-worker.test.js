@@ -97,6 +97,17 @@ test('real dashboard build preserves host pane mapping and parent runtime snapsh
     { type: 'assistant', sessionId: 'cached-claude', cwd: '/tmp/project', timestamp: new Date().toISOString(), message: { stop_reason: 'end_turn', content: [{ type: 'text', text: answer }] } },
   ].map(JSON.stringify).join('\n') + '\n';
   fs.writeFileSync(transcript, transcriptText('First!'));
+  let firstBulkTranscript = '';
+  for (let index = 0; index < 301; index++) {
+    const id = `bulk-${String(index).padStart(3, '0')}`;
+    const file = path.join(projectDir, `${id}.jsonl`);
+    if (index === 0) firstBulkTranscript = file;
+    fs.writeFileSync(file, [
+      { type: 'mode', mode: 'normal', sessionId: id },
+      { type: 'user', sessionId: id, cwd: '/tmp/project', timestamp: new Date().toISOString(), message: { content: 'Bulk request' } },
+      { type: 'assistant', sessionId: id, cwd: '/tmp/project', timestamp: new Date().toISOString(), message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'Bulk answer' }] } },
+    ].map(JSON.stringify).join('\n') + '\n');
+  }
   const worker = createDashboardWorker();
   t.after(() => {
     worker.close();
@@ -131,9 +142,14 @@ test('real dashboard build preserves host pane mapping and parent runtime snapsh
   assert.equal(scanned.pane, 'pane-cached');
   assert.equal(scanned.launchModel, 'claude-test');
   assert.equal(scanned.lastAssistant, 'First!');
+  assert.equal(result.backgroundTargets.find((target) => target.agent === 'claude' && target.sid === 'bulk-000')?.file,
+    firstBulkTranscript, 'the earliest published source survives the 300-entry lookup LRU');
 
+  // The restart inspector receives no watcher event for the exact source it is
+  // about to trust. Its explicit all-source invalidation must still bypass the
+  // index TTL and observe a rewrite under the same pane snapshot.
   fs.writeFileSync(transcript, transcriptText('Later!'));
-  worker.invalidate({ kind: 'claude', root: projectsRoot, name: path.join('-tmp-project', 'cached-claude.jsonl') });
+  worker.invalidate({ kind: 'all', name: 'restart-inspection' });
   const changed = await worker.build(input);
   assert.equal(changed.state.sessions.find((item) => item.id === 'cached-claude').lastAssistant, 'Later!');
 });

@@ -41,6 +41,21 @@ test('real dashboard routes use the worker snapshot across full, lightweight, mo
   const port = await freePort();
   for (const dir of ['tasks', 'archive', 'digests', '.keep']) fs.mkdirSync(path.join(root, dir), { recursive: true });
   for (const dir of ['.claude/projects', '.codex/sessions']) fs.mkdirSync(path.join(home, dir), { recursive: true });
+  const sessionId = 'route-session';
+  const projectDir = path.join(home, '.claude', 'projects', '-tmp-route');
+  const transcript = path.join(projectDir, `${sessionId}.jsonl`);
+  fs.mkdirSync(projectDir, { recursive: true });
+  const sessionRecord = (type, content) => JSON.stringify({
+    type, sessionId, cwd: '/tmp/route', timestamp: new Date().toISOString(),
+    message: type === 'assistant'
+      ? { stop_reason: 'end_turn', content: [{ type: 'text', text: content }] }
+      : { content },
+  });
+  fs.writeFileSync(transcript, [
+    JSON.stringify({ type: 'mode', mode: 'normal', sessionId }),
+    sessionRecord('user', 'Inspect the route'),
+    sessionRecord('assistant', 'Initial route answer'),
+  ].join('\n') + '\n');
   const now = new Date();
   const pad = (value) => String(value).padStart(2, '0');
   const day = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
@@ -76,6 +91,15 @@ test('real dashboard routes use the worker snapshot across full, lightweight, mo
   assert.equal(full.status, 200);
   assert.match(full.body.tasks.find((task) => task.id === 'route-card').body, /Full route body/);
   assert.ok(Array.isArray(full.body.panes));
+  assert.equal(full.body.sessions.find((session) => session.id === sessionId).lastAssistant, 'Initial route answer');
+
+  // Read-only detail routes identify the session from the published worker
+  // snapshot, while reading the selected transcript at request time.
+  fs.appendFileSync(transcript, sessionRecord('assistant', 'Tail written after dashboard snapshot') + '\n');
+  const tail = await request(port, `/api/sessiontail?id=${sessionId}`);
+  assert.equal(tail.status, 200);
+  assert.match(tail.body.text, /Tail written after dashboard snapshot/);
+  assert.equal((await request(port, `/api/sessionsummary?id=${sessionId}`)).status, 200);
 
   const light = await request(port, '/api/state?summary=1');
   assert.equal(light.status, 200);
