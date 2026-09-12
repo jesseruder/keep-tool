@@ -11,7 +11,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { EventEmitter } = require('node:events');
-const { spawn } = require('node:child_process');
+const { execFileSync, spawn } = require('node:child_process');
 const test = require('node:test');
 const health = require('./health.js');
 const {
@@ -500,7 +500,13 @@ test('usage cache merge is serialized across processes', async () => {
   const file = path.join(dir, 'usage-cache.json');
   const marker = path.join(dir, 'child-ready');
   const lock = `${file}.lock`;
-  fs.writeFileSync(lock, String(process.pid), { flag: 'wx' });
+  const ownerFile = path.join(lock, 'owner.json');
+  fs.mkdirSync(lock);
+  fs.writeFileSync(ownerFile, JSON.stringify({
+    pid: process.pid,
+    startedAt: execFileSync('ps', ['-p', String(process.pid), '-o', 'lstart='], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' } }).trim(),
+    token: 'parent-test-lock',
+  }));
   const script = `
     const fs = require('fs');
     const usage = require(${JSON.stringify(path.join(__dirname, 'usage.js'))});
@@ -519,15 +525,47 @@ test('usage cache merge is serialized across processes', async () => {
     assert.equal(fs.existsSync(marker), true, 'child reached the locked cache update');
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 75);
     fs.writeFileSync(file, JSON.stringify({ version: 2, accounts: { 'claude-parent': { snapshot: { limits: [], fetchedAt: null } } } }));
-    fs.unlinkSync(lock);
+    fs.unlinkSync(ownerFile);
+    fs.rmdirSync(lock);
     const exitCode = await new Promise((resolve) => child.once('exit', resolve));
     assert.equal(exitCode, 0);
     const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
     assert.deepEqual(Object.keys(stored.accounts).sort(), ['claude-child', 'claude-parent']);
   } finally {
-    try { fs.unlinkSync(lock); } catch {}
+    try { fs.unlinkSync(ownerFile); } catch {}
+    try { fs.rmdirSync(lock); } catch {}
     if (child.exitCode === null) child.kill();
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('fresh dead and reused-PID cache locks recover without blocking the event loop', async () => {
+  for (const owner of [
+    { pid: 2147483647, startedAt: 'dead process', token: 'dead-owner' },
+    { pid: process.pid, startedAt: 'Mon Jan  1 00:00:00 1990', token: 'reused-pid' },
+  ]) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-usage-dead-lock-'));
+    const file = path.join(dir, 'usage-cache.json');
+    const lock = `${file}.lock`;
+    const ownerFile = path.join(lock, 'owner.json');
+    const account = { id: 'claude/default', label: 'Primary', agent: 'claude', configDir: '/profiles/default', builtIn: true };
+    const fixture = { list: () => [account], defaultFor: () => account };
+    try {
+      fs.mkdirSync(lock);
+      fs.writeFileSync(ownerFile, JSON.stringify(owner));
+      const manager = createUsageManager({ accounts: fixture, health: { record() {} } });
+      manager.setCacheFile(file);
+      let eventLoopTicked = false;
+      setTimeout(() => { eventLoopTicked = true; }, 25);
+      const changed = new Promise((resolve) => manager.setOnChange(resolve));
+      const startedAt = Date.now();
+      manager.requestRefresh(Date.now(), async () => ({ limits: [{ label: 'week', percent: 12 }], fetchedAt: Date.now() }));
+      await changed;
+      assert.equal(eventLoopTicked, true, `${owner.token} wait should yield the event loop`);
+      assert.ok(Date.now() - startedAt >= 200 && Date.now() - startedAt < 2000, `${owner.token} should recover after the creation grace`);
+      assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).claude.limits[0].percent, 12);
+      assert.equal(fs.existsSync(lock), false);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   }
 });
 

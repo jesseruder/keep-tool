@@ -7,7 +7,7 @@ const path = require('path');
 const os = require('os');
 const https = require('https');
 const crypto = require('crypto');
-const { execFile } = require('child_process');
+const { execFile, execFileSync } = require('child_process');
 const health = require('./health.js');
 const accounts = require('./accounts.js');
 
@@ -45,32 +45,70 @@ function retryAfterMs(value, now = Date.now()) {
   return Math.min(delay, MAX_RETRY_AFTER_MS);
 }
 
-function withCacheLock(file, fn) {
+function processStartedAt(pid) {
+  try {
+    return execFileSync('ps', ['-p', String(pid), '-o', 'lstart='], {
+      encoding: 'utf8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, LC_ALL: 'C' },
+    }).trim();
+  } catch { return ''; }
+}
+
+function readLockOwner(ownerFile) {
+  try { return JSON.parse(fs.readFileSync(ownerFile, 'utf8')); }
+  catch { return null; }
+}
+
+async function withCacheLock(file, fn) {
   const lock = `${file}.lock`;
+  const ownerFile = path.join(lock, 'owner.json');
   const deadline = Date.now() + 5000;
+  const token = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   fs.mkdirSync(path.dirname(file), { recursive: true });
   for (;;) {
     try {
-      fs.writeFileSync(lock, String(process.pid), { flag: 'wx', mode: 0o600 });
+      fs.mkdirSync(lock, { mode: 0o700 });
+      try {
+        fs.writeFileSync(ownerFile, JSON.stringify({ pid: process.pid, startedAt: processStartedAt(process.pid), token }), { mode: 0o600 });
+      } catch (error) {
+        try { fs.rmdirSync(lock); } catch {}
+        throw error;
+      }
       break;
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
       try {
-        if (Date.now() - fs.statSync(lock).mtimeMs > 30e3) {
-          const owner = Number(fs.readFileSync(lock, 'utf8'));
-          let alive = Number.isInteger(owner) && owner > 0;
-          if (alive) {
-            try { process.kill(owner, 0); } catch (cause) { alive = cause.code === 'EPERM'; }
+        if (Date.now() - fs.statSync(lock).mtimeMs >= 250) {
+          const owner = readLockOwner(ownerFile);
+          let alive = false;
+          if (owner && Number.isInteger(owner.pid) && owner.pid > 0) {
+            const actualStart = processStartedAt(owner.pid);
+            if (owner.startedAt && actualStart) alive = owner.startedAt === actualStart;
+            else {
+              try { process.kill(owner.pid, 0); alive = true; }
+              catch (cause) { alive = cause.code === 'EPERM'; }
+            }
           }
-          if (!alive) { fs.unlinkSync(lock); continue; }
+          if (!alive) {
+            const confirmed = readLockOwner(ownerFile);
+            if ((!owner && !confirmed) || (owner && confirmed && owner.token && confirmed.token === owner.token)) {
+              try { fs.unlinkSync(ownerFile); } catch {}
+              try { fs.rmdirSync(lock); continue; } catch {}
+            }
+          }
         }
       } catch {}
       if (Date.now() >= deadline) throw new Error(`usage cache lock timed out: ${lock}`);
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+      await new Promise((resolve) => setTimeout(resolve, 25));
     }
   }
-  try { return fn(); }
-  finally { try { fs.unlinkSync(lock); } catch {} }
+  try { return await fn(); }
+  finally {
+    const owner = readLockOwner(ownerFile);
+    if (owner && owner.token === token) {
+      try { fs.unlinkSync(ownerFile); } catch {}
+      try { fs.rmdirSync(lock); } catch {}
+    }
+  }
 }
 
 function emptySnapshot(agent) {
@@ -367,10 +405,11 @@ function createUsageManager(deps = {}) {
     }
   }
 
-  function saveCache(state) {
+  async function saveCache(state, stillCurrent) {
     if (!cacheFile || state.account.agent !== 'claude') return;
     try {
-      withCacheLock(cacheFile, () => {
+      await withCacheLock(cacheFile, () => {
+        if (stillCurrent && !stillCurrent()) return;
         let stored = {};
         try { stored = JSON.parse(fs.readFileSync(cacheFile, 'utf8')); } catch {}
         if (!stored || typeof stored !== 'object' || Array.isArray(stored)) stored = {};
@@ -420,7 +459,7 @@ function createUsageManager(deps = {}) {
       };
       state.inFlight = new Promise((resolve) => setImmediate(resolve))
         .then(() => performRefresh(state.account, state.snapshot))
-        .then((value) => {
+        .then(async (value) => {
           if (!currentAttempt()) return { account, state, generation, ok: true, stale: true };
           const completedAt = Number(clock());
           if (value) state.snapshot = value;
@@ -429,10 +468,10 @@ function createUsageManager(deps = {}) {
           if (account.agent === 'claude') {
             state.backoffMs = 0;
             state.failureKind = null;
-            saveCache(state);
+            await saveCache(state, currentAttempt);
           }
           return { account, state, generation, ok: true };
-        }, (error) => {
+        }, async (error) => {
           if (!currentAttempt()) return { account, state, generation, ok: false, stale: true, error: shortError(account.agent === 'claude' ? 'Claude' : 'Codex', error) };
           const completedAt = Number(clock());
           const message = shortError(account.agent === 'claude' ? 'Claude' : 'Codex', error);
@@ -449,7 +488,7 @@ function createUsageManager(deps = {}) {
               state.nextAttemptAt = completedAt + CLAUDE_REFRESH_MS + state.backoffMs;
               state.failureKind = 'other';
             }
-            saveCache(state);
+            await saveCache(state, currentAttempt);
           } else state.nextAttemptAt = completedAt + CODEX_REFRESH_MS;
           return { account, state, generation, ok: false, error: message };
         })
