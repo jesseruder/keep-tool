@@ -440,7 +440,7 @@ test('wait-on moves active to waiting, logs, and queues an already-done upstream
     assert.equal(dependent.fm.status, 'waiting');
     assert.equal(parseDependency(dependent.fm.depends_on[0]).id, 'upstream');
     assert.equal(parseDependency(dependent.fm.depends_on[0]).reason, 'need completion');
-    assert.match(dependent.body, /— check-in(?: → waiting)?\nwaiting on: upstream; already done: upstream/);
+    assert.match(dependent.body, /— check-in(?: \(by (?:claude|codex) [A-Za-z0-9_-]+\))?(?: → waiting)?\nwaiting on: upstream; already done: upstream/);
     assert.match(dependent.body, /next: waiting on upstream/);
     assert.deepEqual(records(fixture.root).map((record) => [record.dependent, record.upstream, record.deliveredAt]), [
       ['dependent', 'upstream', null],
@@ -671,6 +671,31 @@ test('reopening and waiting again creates a fresh completion-keyed delivery', ()
     assert.notEqual(secondNames[0], firstName);
     assert.ok(records(fixture.root)[0].deliveredAt);
     assert.notEqual(records(fixture.root)[0].upstreamDoneAt, '2026-09-03T09:00');
+  } finally { fs.rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+test('an attributed done generation stays stable after a later routine mutation', () => {
+  const fixture = registry();
+  const session = { CODEX_THREAD_ID: 'finishing-session' };
+  try {
+    writeTask(fixture.root, 'upstream');
+    writeTask(fixture.root, 'dependent', { dependsOn: ['upstream'] });
+    commitFixtures(fixture);
+
+    assert.equal(cli(fixture, ['done', 'upstream'], session).status, 0);
+    const first = fs.readdirSync(path.join(fixture.root, '.keep', 'unblocked')).sort();
+    assert.equal(first.length, 1);
+    assert.match(task(fixture.root, 'upstream').body, /done \(by codex finishing-session\)/);
+
+    assert.equal(cli(fixture, ['retitle', 'upstream', 'Retitled upstream'], session).status, 0);
+    assert.deepEqual(fs.readdirSync(path.join(fixture.root, '.keep', 'unblocked')).sort(), first);
+
+    const reopened = task(fixture.root, 'upstream');
+    reopened.fm.status = 'active';
+    reopened.body = `## 2026-09-03 10:00 — check-in (by codex finishing-session) → active\nReopened.\n\n${reopened.body}`;
+    assert.equal(dependencyResolved(reopened, {
+      id: 'upstream', step: null, kind: 'status', statuses: ['done'], reason: 'needs one completed generation',
+    }), true, 'historical attributed done remains a status fact after reopen');
   } finally { fs.rmSync(fixture.root, { recursive: true, force: true }); }
 });
 

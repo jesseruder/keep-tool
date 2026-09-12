@@ -402,8 +402,7 @@ function linkLaunchedSession(taskId, session) {
 function linkSession(taskId, session, options = {}) {
   return withLock(() => {
     const all = loadAll(true);
-    const task = all.find((entry) => entry.id === taskId
-      && (!options.activeOnly || fs.existsSync(taskPath(entry.id))));
+    const task = all.find((entry) => entry.id === taskId && fs.existsSync(taskPath(entry.id)));
     if (!task) return null;
     if (options.requireProject && !sessionInTaskProject(task)) {
       return { linked: false, skipped: 'outside-project', project: task.fm.project || '' };
@@ -1062,6 +1061,11 @@ function deploymentFact(task, target) {
   }) || null;
 }
 
+function isDoneLogHeading(kind) {
+  const text = String(kind || '');
+  return /^(?:done(?:\s+\((?:by (?:claude|codex) [A-Za-z0-9_-]+|reviewer [^)]+)\))?|.+\s→\s*done)\s*$/i.test(text);
+}
+
 function dependencyResolved(task, target, options = {}) {
   if (!task || !task.fm) return false;
   const parsed = target && typeof target === 'object'
@@ -1074,7 +1078,7 @@ function dependencyResolved(task, target, options = {}) {
   if (kind === 'status') {
     if (parsed.statuses.includes(task.fm.status)) return true;
     return require('./review.js').stampedLogEntries(task.body).some((entry) => parsed.statuses.some((status) =>
-      status === 'done' ? /^(?:done|.+\s→\s*done)$/i.test(entry.kind) : new RegExp(`^.+\\s→\\s*${status}$`, 'i').test(entry.kind)));
+      status === 'done' ? isDoneLogHeading(entry.kind) : new RegExp(`^.+\\s→\\s*${status}$`, 'i').test(entry.kind)));
   }
   if (kind === 'deployed') {
     return Boolean(deploymentFact(task, parsed));
@@ -1888,7 +1892,7 @@ commands.claim = (argv) => {
     die('keep claim needs a current Claude or Codex session');
   }
   const id = argv[0];
-  const linked = linkSession(id, session, { activeOnly: true, requireProject: true, commitLabel: 'claim' });
+  const linked = linkSession(id, session, { requireProject: true, commitLabel: 'claim' });
   if (!linked) die(`no task "${id}"`);
   if (linked.skipped === 'outside-project') {
     die(`cannot claim ${id} outside its project (${linked.project}); run it from the project, or repair metadata explicitly with keep link ${id} --session ${session.id} --agent ${session.agent}`);
@@ -6519,7 +6523,7 @@ module.exports = {
   ROOT, TASKS, ARCHIVE, STATUSES, KINDS, STATUS_ORDER, META, HOLDS_DIR,
   isReviewerSession, registerReviewerSession, currentSession, parseWhen, relativeDurationMs, postKeepApi, getKeepApi,
   loadAll, loadTask, loadTaskAnywhere, parseTask, serializeTask, parsePlan, renderPlan, setPlan, nextStep, lastLogLine, isOverdue, nowStamp, stampOf, buildDigest,
-  parseDependency, dependencyTarget, dependencyReason, dependencyStep, deploymentFact, dependencyResolved, dependencyInfo, unresolvedDependencyIds,
+  parseDependency, dependencyTarget, dependencyReason, dependencyStep, deploymentFact, isDoneLogHeading, dependencyResolved, dependencyInfo, unresolvedDependencyIds,
   withLock, commitAndPush, saveTask, recordDoneTransition, recordDaemonSessionClose, addTask, checkinTask, briefSnapshot, scopeForProject, KeepError,
   CHECK_ON_PASS, MIN_CHECK_EVERY_MS, applyCheckPolicy, cleanProbe, cleanCheckEvery, runProbe,
   claimSession, linkLaunchedSession, releaseCardSession,

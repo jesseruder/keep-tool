@@ -53,7 +53,7 @@ function doneStamp(upstream) {
   for (const match of headings) {
     const heading = match[2].trim();
     if (/→\s*(?!done\b)[a-z-]+\s*$/i.test(heading)) break;
-    if (/^(?:done|.*→\s*done)\s*$/i.test(heading)) stamp = match[1].trim().replace(' ', 'T');
+    if (require('./keep.js').isDoneLogHeading(heading)) stamp = match[1].trim().replace(' ', 'T');
   }
   return stamp || String(upstream && upstream.fm && upstream.fm.updated || '');
 }

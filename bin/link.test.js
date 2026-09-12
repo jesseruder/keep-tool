@@ -95,6 +95,7 @@ test('link validates explicit identity and reviewer authority before mutating ca
   const f = fixture();
   try {
     writeTask(f, 'target');
+    writeTask(f, 'archived-target', { archive: true, status: 'done' });
     f.commit();
     const before = fs.readFileSync(path.join(f.root, 'tasks', 'target.md'), 'utf8');
     for (const [args, pattern, env] of [
@@ -102,6 +103,8 @@ test('link validates explicit identity and reviewer authority before mutating ca
       [['link', 'target', '--session', 'bad/session', '--agent', 'codex'], /session id/, {}],
       [['link', 'target', '--session', 'sid', '--agent', 'other'], /agent must be/, {}],
       [['link', 'missing', '--session', 'sid', '--agent', 'codex'], /no task/, {}],
+      [['link', 'archived-target', '--session', 'sid', '--agent', 'codex'], /no task/, {}],
+      [['claim', 'archived-target'], /no task/, { CODEX_THREAD_ID: 'sid' }],
       [['link', 'target', '--session', 'sid', '--agent', 'codex'], /fleet reviewer cannot link/, { KEEP_REVIEWER: '1' }],
     ]) {
       const result = f.run(args, env);
