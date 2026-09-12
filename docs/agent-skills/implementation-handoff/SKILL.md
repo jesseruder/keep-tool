@@ -55,13 +55,23 @@ Run context and every lifecycle command from the same intended worktree. Capture
 the returned `workspace` along with the account so a later shell directory change
 cannot redirect status, results, or cancellation to another project's jobs.
 
-Choose fresh versus resume yourself. Check
+Account choice and conversation choice are separate. Honor Jesse's explicit choice
+of either; otherwise choose fresh versus resume from the work's continuity. Before
+launching, state the account, fresh or resumed conversation, model, and effort—for
+example, "Codex secondary, fresh conversation, Sol at high effort." Do not ask again
+when those choices are already clear.
+
+For a possible resume, check
 `keep codex --account <id> task-resume-candidate --json`. Resume only when that
-account's candidate continues the same work; otherwise start fresh with the scoped
-prompt and relevant prior results. Use `--resume-last` for a chosen resume; omit it
-for a fresh task. Do not copy a thread ID into another profile or silently change the
-account of a running job. A future Codex-to-Claude launcher is not implemented by
-this command.
+account's candidate continues the same work. Use `--resume-last` for that candidate
+and `--fresh` for an explicitly fresh task. A new account does not move the previous
+conversation there. If Jesse names a specific existing conversation, verify that
+it is the candidate on the selected account; if it is not, explain the limitation
+and ask how to proceed. The launcher has no arbitrary conversation picker. Never
+silently substitute another candidate or a fresh task for an explicit resume request.
+
+Do not copy a thread ID into another profile or change the account of a running
+job. A future Codex-to-Claude launcher is not implemented by this command.
 
 Launch directly with one Bash call in the intended worktree, for example:
 
