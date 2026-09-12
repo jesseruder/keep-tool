@@ -31,6 +31,7 @@ function portableFallbackCandidate(entry) {
     || entry.status === 'failed' && entry.phase === 'preflight';
   return Boolean(safePhase && Number.isInteger(entry.sourceAgentPid) && entry.sourceAgentPid > 0
     && typeof entry.sourceAgentPidStart === 'string' && entry.sourceAgentPidStart
+    && entry.sourceOwnsPane === true
     && !entry.sourceStopVerifiedAt && !entry.targetLaunchStartedAt
     && !entry.deliveryStartedAt && !entry.deliveredAt);
 }
@@ -143,6 +144,7 @@ function targetIdentityMatches(entry, inspected, target) {
   return Boolean(targetPaneMatches(entry?.targetIdentity, inspected, entry, target)
     && identity?.primary === true && identity.pid === entry.targetIdentity.agentPid
     && identity.pidStart === entry.targetIdentity.agentPidStart
+    && identity.ownsPane === true
     && targetRolloutMatches(entry, identity));
 }
 
@@ -157,6 +159,7 @@ function targetIdentityBound(entry, target) {
     && launch.accountId === identity.accountId && launch.transactionId === identity.transactionId
     && Number.isInteger(identity.agentPid) && identity.agentPid > 0
     && typeof identity.agentPidStart === 'string' && identity.agentPidStart
+    && identity.ownsPane === true
     && Number.isFinite(Number(identity.sessionStartedAt))
     && Number(identity.sessionStartedAt) > Number(entry.targetLaunchStartedAt));
 }
@@ -170,11 +173,12 @@ async function verifyTargetLaunch(entry, target, record, deps, root) {
   if (!targetPaneMatches(entry.targetLaunch, inspected, entry, target)
       || identity?.primary !== true || !Number.isInteger(identity.pid) || identity.pid <= 0
       || typeof identity.pidStart !== 'string' || !identity.pidStart
+      || identity.ownsPane !== true
       || !targetRolloutMatches(entry, identity)) {
     throw new Error('Target process identity was not verified');
   }
   entry.targetIdentity = { ...entry.targetLaunch, agentPid: identity.pid, agentPidStart: identity.pidStart,
-    sessionStartedAt: Number(record.startedAt) };
+    ownsPane: true, sessionStartedAt: Number(record.startedAt) };
   writeOne(root, entry);
 }
 
@@ -383,7 +387,7 @@ async function run(body, deps = {}) {
     const providerArtifacts = artifactProvider(agent, deps);
     const sourceIdentity = inspected.agentIdentity?.primary === true && Number.isInteger(inspected.agentIdentity.pid)
       && inspected.agentIdentity.pid > 0 && typeof inspected.agentIdentity.pidStart === 'string'
-      && inspected.agentIdentity.pidStart ? inspected.agentIdentity : null;
+      && inspected.agentIdentity.pidStart && inspected.agentIdentity.ownsPane === true ? inspected.agentIdentity : null;
     if (source.id === target.id) { const error = new Error('source and target account are the same'); error.status = 409; throw error; }
     if (current?.deliveryStartedAt && !current.deliveredAt && current.deliveryId && deps.deliveryStatus) {
       const receipt = await deps.deliveryStatus(session.id, CONTINUATION_TEXT, current.deliveryId);
@@ -490,7 +494,8 @@ async function run(body, deps = {}) {
         agent, sourceAccountId: source.id, targetAccountId: target.id };
       current.transactionId ||= current.id;
       Object.assign(current, { agent, status: 'failed', phase: 'preflight',
-        ...(sourceIdentity ? { sourceAgentPid: sourceIdentity.pid, sourceAgentPidStart: sourceIdentity.pidStart } : {}),
+        ...(sourceIdentity ? { sourceAgentPid: sourceIdentity.pid, sourceAgentPidStart: sourceIdentity.pidStart,
+          sourceOwnsPane: true } : {}),
         reason: `Target ${agent} account is not logged in; source session was left running` });
       writeOne(root, current);
       const error = new Error(current.reason); error.status = 409; error.extra = safe(current); throw error;
@@ -511,7 +516,8 @@ async function run(body, deps = {}) {
     current.ownedSessionIds = agent === 'codex' ? artifactPlan.artifacts.map((entry) => entry.sessionId) : [session.id];
     Object.assign(current, { status: 'stopping', phase: 'stopping-source', reason: '', cwd: resumeCwd,
       pid: pane.pid, cols: pane.cols, rows: pane.rows,
-      ...(sourceIdentity ? { sourceAgentPid: sourceIdentity.pid, sourceAgentPidStart: sourceIdentity.pidStart } : {}),
+      ...(sourceIdentity ? { sourceAgentPid: sourceIdentity.pid, sourceAgentPidStart: sourceIdentity.pidStart,
+        sourceOwnsPane: true } : {}),
       ...(resumeSpec ? {
         sourceTranscript: artifactPlan.artifacts.find((entry) => entry.sessionId === session.id)?.source,
         targetTranscript: artifactPlan.artifacts.find((entry) => entry.sessionId === session.id)?.target,
@@ -601,6 +607,7 @@ async function abandonForPortable(body, deps = {}) {
     if (!session || session.id !== current.sessionId || session.kind !== agent
         || !pane || pane.id !== current.pane || pane.alive !== true
         || pane.agentAlive === false || identity?.primary !== true
+        || current.sourceOwnsPane !== true || identity.ownsPane !== true
         || identity.pid !== current.sourceAgentPid || identity.pidStart !== current.sourceAgentPidStart
         || pane.meta?.sessionId !== current.sessionId || observedAccount !== current.sourceAccountId
         || pane.meta?.accountId && pane.meta.accountId !== current.sourceAccountId
@@ -618,7 +625,8 @@ async function abandonForPortable(body, deps = {}) {
 function abandonedForPortable(root, sessionId) {
   const entry = readOne(root, sessionId);
   return entry?.status === 'failed' && entry.phase === 'portable-fallback' && entry.portableFallbackAt
-    ? { ...safe(entry), sourceAgentPid: entry.sourceAgentPid, sourceAgentPidStart: entry.sourceAgentPidStart } : null;
+    ? { ...safe(entry), sourceAgentPid: entry.sourceAgentPid, sourceAgentPidStart: entry.sourceAgentPidStart,
+      sourceOwnsPane: entry.sourceOwnsPane === true } : null;
 }
 
 module.exports = { run, abandonForPortable, abandonedForPortable, list, safe, authPreflight, permissionClass,

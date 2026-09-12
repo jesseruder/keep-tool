@@ -48,8 +48,8 @@ function deps(f, overrides = {}) {
     inspect: async () => ({ session: { id: f.sid, kind: 'claude', project: f.project, endedTurn: true }, pane,
       processArgs: 'claude --dangerously-skip-permissions --resume session-123', currentModel: 'claude-opus-4-1',
       agentIdentity: pane.meta.accountId === 'two'
-        ? { pid: 21, pidStart: 'target-start', primary: true }
-        : { pid: 11, pidStart: 'source-start', primary: true } }),
+        ? { pid: 21, pidStart: 'target-start', primary: true, ownsPane: true }
+        : { pid: 11, pidStart: 'source-start', primary: true, ownsPane: true } }),
     authPreflight: async () => true,
     compatible: () => ({ ok: true, reasons: [], mcpConfig: path.join(f.base, 'mcp.json') }),
     rebindLedger: () => ({ rebound: [{ sessionId: f.sid, reused: false }] }),
@@ -111,8 +111,8 @@ function codexDeps(f, overrides = {}) {
     preflights: () => preflights,
     inspect: async () => ({ session: { id: sid, kind: 'codex', project: f.project, endedTurn: true }, pane,
       processArgs: `codex resume ${sid}`, agentIdentity: pane.meta.accountId === 'codex-two'
-        ? { pid: 41, pidStart: 'codex-target-start', primary: true, rolloutFile: targetFile }
-        : { pid: 31, pidStart: 'codex-source-start', primary: true, rolloutFile: sourceFile } }),
+        ? { pid: 41, pidStart: 'codex-target-start', primary: true, ownsPane: true, rolloutFile: targetFile }
+        : { pid: 31, pidStart: 'codex-source-start', primary: true, ownsPane: true, rolloutFile: sourceFile } }),
     authPreflight: async () => true,
     resumeSpec: () => ({ ...resumeSpec, argv: [...argv] }),
     compatible: (_source, _target, _cwd, spec) => {
@@ -272,7 +272,8 @@ test('native Codex handoff preserves exact launch policy and transfers root plus
     assert.equal(journal.resumeSpec.cwd, latestCwd);
     assert.deepEqual(journal.targetIdentity, { pane: d.pane.id, panePid: 40, paneCreatedAt: 'codex-target-pane',
       sessionId: d.sid, accountId: 'codex-two', transactionId: journal.id,
-      agentPid: 41, agentPidStart: 'codex-target-start', sessionStartedAt: journal.targetLaunchStartedAt + 1 });
+      agentPid: 41, agentPidStart: 'codex-target-start', ownsPane: true,
+      sessionStartedAt: journal.targetLaunchStartedAt + 1 });
     assert.deepEqual(journal.ownedSessionIds, [d.sid, d.child]);
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
@@ -308,7 +309,28 @@ test('Codex delivery receipt finishes partial authority without resending despit
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
-test('recovery refuses a replacement destination process before continuation delivery', async () => {
+test('Codex handoff refuses a target agent outside the destination pane before recording its identity', async () => {
+  const f = fixture();
+  try {
+    const d = codexDeps(f);
+    const inspect = d.inspect;
+    d.inspect = async (...args) => {
+      const inspected = await inspect(...args);
+      if (inspected.pane.meta.accountId === 'codex-two') inspected.agentIdentity.ownsPane = false;
+      return inspected;
+    };
+    let sends = 0; d.continueSession = async () => { sends++; };
+    await assert.rejects(handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two' }, d),
+      (error) => error.status === 409 && /process identity was not verified/.test(error.message));
+    const file = path.join(f.root, '.keep', 'account-handoffs', `${d.sid}.json`);
+    const interrupted = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(interrupted.targetIdentity, undefined);
+    assert.equal(sends, 0);
+    assert.equal(accounts.authority(f.root)[d.sid].accountId, 'codex-work');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('recovery recomputes target agent ownership before continuation delivery', async () => {
   const f = fixture();
   try {
     const d = codexDeps(f, { verifyTargetSpec: async () => { throw new Error('pause after target identity verification'); } });
@@ -319,7 +341,12 @@ test('recovery refuses a replacement destination process before continuation del
     assert.equal(interrupted.targetIdentity.panePid, 40);
     interrupted.status = 'recovery-needed'; interrupted.phase = 'delivering-continuation';
     delete interrupted.deliveryStartedAt; fs.writeFileSync(file, JSON.stringify(interrupted));
-    d.pane.pid = 999;
+    const inspect = d.inspect;
+    d.inspect = async (...args) => {
+      const inspected = await inspect(...args);
+      inspected.agentIdentity.ownsPane = false;
+      return inspected;
+    };
     let sends = 0; d.continueSession = async () => { sends++; };
     await assert.rejects(handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two' }, d),
       (error) => error.status === 409 && /process identity changed/.test(error.message));
@@ -406,6 +433,25 @@ test('explicit portable fallback abandons only a verified pre-stop transaction w
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test('portable fallback is unavailable when the source agent was not proven to belong to its pane', async () => {
+  const f = fixture();
+  try {
+    const d = deps(f, { restartSession: async () => { throw new Error('Waiting for job ledger recovery'); } });
+    const inspect = d.inspect;
+    d.inspect = async (...args) => {
+      const inspected = await inspect(...args);
+      inspected.agentIdentity.ownsPane = false;
+      return inspected;
+    };
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /job ledger recovery/);
+    const pending = handoff.list(f.root)[0];
+    assert.equal(pending.portableFallbackAvailable, undefined);
+    d.inspect = inspect;
+    await assert.rejects(handoff.abandonForPortable({ sessionId: f.sid, pane: 'pane-1', transactionId: pending.id }, d),
+      /cannot be safely replaced/, 'a later pane-owned process does not upgrade the unproven source snapshot');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test('portable fallback refuses changed source identity and any transaction that reached stop or launch', async () => {
   const f = fixture();
   try {
@@ -421,6 +467,10 @@ test('portable fallback refuses changed source identity and any transaction that
       agentIdentity: { pid: 99, pidStart: 'replacement-start', primary: true } });
     await assert.rejects(handoff.abandonForPortable({ sessionId: f.sid, pane: 'pane-1', transactionId: pending.id }, d),
       /identity is no longer intact/);
+    d.inspect = async (body) => ({ ...(await inspect(body)),
+      agentIdentity: { pid: 11, pidStart: 'source-start', primary: true, ownsPane: false } });
+    await assert.rejects(handoff.abandonForPortable({ sessionId: f.sid, pane: 'pane-1', transactionId: pending.id }, d),
+      /identity is no longer intact/, 'matching process identity outside the source pane is refused');
     d.inspect = inspect;
     const journal = path.join(f.root, '.keep', 'account-handoffs', `${f.sid}.json`);
     const state = JSON.parse(fs.readFileSync(journal, 'utf8'));
@@ -609,8 +659,8 @@ test('custom settings, tool aliases, and restricted mode are refused before sour
     reviewer.inspect = async () => ({ session: { id: f.sid, kind: 'claude', project: f.project }, pane: reviewer.pane,
       processArgs: `claude --settings '${JSON.stringify(require('./reviewer-launch').REVIEWER_SETTINGS)}' --resume ${f.sid}`,
       agentIdentity: reviewer.pane.meta.accountId === 'two'
-        ? { pid: 21, pidStart: 'target-start', primary: true }
-        : { pid: 11, pidStart: 'source-start', primary: true } });
+        ? { pid: 21, pidStart: 'target-start', primary: true, ownsPane: true }
+        : { pid: 11, pidStart: 'source-start', primary: true, ownsPane: true } });
     const result = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, reviewer);
     assert.equal(result.status, 'done', 'the exact generated reviewer settings are reproducible');
     assert.equal(handoff.permissionClass(`claude --mcp-config '${path.join(f.base, 'managed mcp.json')}' --resume ${f.sid}`,
