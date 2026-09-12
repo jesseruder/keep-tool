@@ -281,5 +281,9 @@ test('profile overlap and incomplete bounded scans fail closed', () => {
       { id: 'nested', agent: 'codex', configDir: path.join(f.profiles.a, 'nested') }, options(f)), /unavailable|overlap/);
     assert.throws(() => artifacts.preflight(f.sid, f.records.a, f.records.b,
       { ...options(f), maxScanEntries: 1 }), (error) => error.code === 'KEEP_CODEX_ARTIFACT_SCAN');
+    assert.throws(() => artifacts.preflight(f.sid, f.records.a, f.records.b,
+      { ...options(f), maxScanBytes: 1 }), (error) => error.code === 'KEEP_CODEX_ARTIFACT_SCAN');
+    assert.throws(() => artifacts.preflight(f.sid, f.records.a, f.records.b,
+      { ...options(f), maxScanDepth: 0 }), (error) => error.code === 'KEEP_CODEX_ARTIFACT_SCAN');
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });

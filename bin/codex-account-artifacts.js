@@ -7,7 +7,9 @@ const path = require('node:path');
 
 const ID = /^[A-Za-z0-9_-]{1,160}$/;
 const MAX_SCAN_ENTRIES = 20000;
+const MAX_SCAN_BYTES = 64 * 1024 * 1024;
 const MAX_META_BYTES = 256 * 1024;
+const MAX_SCAN_DEPTH = 16;
 const MAX_GRAPH = 128;
 const MAX_DEPTH = 8;
 
@@ -120,11 +122,17 @@ function readMeta(file) {
 
 function scanProfile(profile, options = {}) {
   const result = { byId: new Map(), byParent: new Map(), entries: [] };
-  let visited = 0;
-  const limit = options.maxScanEntries || MAX_SCAN_ENTRIES;
+  let visited = 0, readBytes = 0;
+  const limit = Number.isSafeInteger(options.maxScanEntries) && options.maxScanEntries > 0
+    ? options.maxScanEntries : MAX_SCAN_ENTRIES;
+  const byteLimit = Number.isSafeInteger(options.maxScanBytes) && options.maxScanBytes > 0
+    ? options.maxScanBytes : MAX_SCAN_BYTES;
+  const depthLimit = Number.isSafeInteger(options.maxScanDepth) && options.maxScanDepth >= 0
+    ? options.maxScanDepth : MAX_SCAN_DEPTH;
   function visit(target, relative, depth) {
-    if (++visited > limit || depth > 16) {
-      throw failure(`Codex rollout scan is incomplete after ${limit} entries`, 'KEEP_CODEX_ARTIFACT_SCAN');
+    if (++visited > limit || depth > depthLimit) {
+      throw failure(`Codex rollout scan is incomplete after ${limit} entries or depth ${depthLimit}`,
+        'KEEP_CODEX_ARTIFACT_SCAN');
     }
     const stat = fs.lstatSync(target);
     if (stat.isSymbolicLink()) throw failure(`Codex rollout tree contains a symlink: ${target}`,
@@ -135,6 +143,11 @@ function scanProfile(profile, options = {}) {
     }
     if (!stat.isFile()) throw failure(`Codex rollout tree contains an unsupported entry: ${target}`);
     if (!path.basename(target).startsWith('rollout-') || !target.endsWith('.jsonl')) return;
+    readBytes += Math.min(stat.size, MAX_META_BYTES);
+    if (readBytes > byteLimit) {
+      throw failure(`Codex rollout scan is incomplete after ${byteLimit} metadata bytes`,
+        'KEEP_CODEX_ARTIFACT_SCAN');
+    }
     const parsed = readMeta(target);
     const entry = { ...parsed, file: target, relative };
     result.entries.push(entry);
