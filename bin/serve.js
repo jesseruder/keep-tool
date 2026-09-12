@@ -4904,6 +4904,26 @@ async function handoffSession(body, deps = {}) {
   });
 }
 
+function listPortableTransfers(deps = {}) {
+  return (deps.portable || require('./portable-handoff')).list(deps.root || keep.ROOT);
+}
+
+async function transferSession(body, deps = {}) {
+  if (!body || typeof body.transferId !== 'string' || !/^[a-f0-9]{64}$/.test(body.transferId)) {
+    throw new InjectionError(400, 'portable transfer id is invalid');
+  }
+  const portable = deps.portable || require('./portable-handoff');
+  const result = await portable.launchPrepared(body.transferId, {
+    ...deps,
+    root: deps.root || keep.ROOT,
+    accounts: deps.accounts || accounts,
+    open: deps.open || ((payload) => openSession(payload, deps)),
+  });
+  const transfer = portable.safeSummary(result);
+  if (!transfer) throw new InjectionError(500, 'portable transfer result is invalid');
+  return { ok: true, transfer };
+}
+
 function apiRequestAuthError(req, deps) {
   if (!keepConsole.authorized(req, deps)) return { status: 403, error: 'unauthorized' };
   if (req.method === 'POST' && req.headers['x-keep'] !== '1') {
@@ -5550,6 +5570,12 @@ function start(deps = {}) {
         } catch (error) { return json(res, 500, { error: error.message }); }
       }
 
+      if (req.method === 'GET' && url.pathname === '/api/portable-transfers') {
+        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
+        try { return json(res, 200, { ok: true, transfers: listPortableTransfers() }); }
+        catch (error) { return json(res, error.status || 500, { error: error.message }); }
+      }
+
       if (req.method === 'GET' && url.pathname === '/api/restore-plan') {
         if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
         try { return json(res, 200, await restorePlan(url.searchParams)); }
@@ -5780,6 +5806,15 @@ function start(deps = {}) {
               return json(res, error.status || 500, { error: error.message, ...(error.extra || {}) });
             }
           }
+          if (url.pathname === '/api/transfer-session') {
+            try {
+              const result = await transferSession(body);
+              broadcast();
+              return json(res, 200, result);
+            } catch (error) {
+              return json(res, error.status || 500, { error: error.message });
+            }
+          }
           if (url.pathname === '/api/close-idle' || url.pathname === '/api/close-session') {
             try {
               const result = url.pathname === '/api/close-session'
@@ -5994,6 +6029,7 @@ module.exports = {
   annotatePaneAgents,
   readPaneRecord, sessionProjectFromTranscript, openSession,
   inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, continueAccountHandoff, handoffSession,
+  listPortableTransfers, transferSession,
   launchReviewQueueSession, inspectReviewQueueLaunch, recoverReviewQueueLaunch,
   waitForHostAgent, waitForHostSessionId, addHostSessionState,
   sendToSession, sendToResolvedTarget, precheckSessionTarget, InjectionError,

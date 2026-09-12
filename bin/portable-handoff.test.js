@@ -69,6 +69,14 @@ test('prepared portable package launches once in the exact worktree and stays id
       cwd: f.cwd, prepareOnly: true };
     const prepared = await portable.run(request, f.deps);
     assert.equal(prepared.status, 'prepared'); assert.equal(f.opened.length, 0); assert.equal(f.stored.length, 1);
+    const listed = portable.list(f.root);
+    assert.equal(listed.length, 1);
+    assert.deepEqual({ id: listed[0].id, status: listed[0].status, sourceSessionId: listed[0].sourceSessionId,
+      targetAccountId: listed[0].targetAccountId }, {
+      id: prepared.requestKey, status: 'prepared', sourceSessionId: 'source-session-1234', targetAccountId: f.target.id,
+    });
+    assert.equal(Object.hasOwn(listed[0], 'contextFile'), false);
+    assert.equal(Object.hasOwn(listed[0], 'sourceTranscriptDigest'), false);
     const content = fs.readFileSync(prepared.artifactFile, 'utf8');
     assert.match(content, /fresh codex conversation/);
     assert.match(content, /Source session: source-session-1234/);
@@ -79,7 +87,7 @@ test('prepared portable package launches once in the exact worktree and stays id
     assert.doesNotMatch(content, /raw tool secret|OPENAI_API_KEY=secret|abcdefghijklmnop/);
 
     fs.appendFileSync(f.transcript, JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message', message: 'Command replay row' } }) + '\n');
-    const launched = await portable.run({ ...request, prepareOnly: false }, f.deps);
+    const launched = await portable.launchPrepared(prepared.requestKey, f.deps);
     assert.equal(launched.status, 'done'); assert.equal(launched.destinationSessionId, 'destination-session-5678');
     assert.equal(f.stored.length, 1); assert.equal(f.opened.length, 1);
     assert.deepEqual({ taskId: f.opened[0].taskId, fresh: f.opened[0].fresh, agent: f.opened[0].agent,

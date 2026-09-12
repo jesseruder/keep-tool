@@ -12,8 +12,8 @@ const CONTEXT_LIMIT = 512 * 1024;
 const TRANSCRIPT_TAIL = 1024 * 1024;
 const EXCERPT_LIMIT = 64 * 1024;
 
-function problem(message, code = 'KEEP_PORTABLE_TRANSFER') {
-  const error = new Error(message); error.code = code; return error;
+function problem(message, code = 'KEEP_PORTABLE_TRANSFER', status = 400) {
+  const error = new Error(message); error.code = code; error.status = status; return error;
 }
 
 function digest(value) { return crypto.createHash('sha256').update(value).digest('hex'); }
@@ -166,6 +166,112 @@ function writeJson(file, value) {
   fs.renameSync(temp, file);
 }
 
+function safeSummary(state) {
+  if (!state || state.version !== 1 || !/^[a-f0-9]{64}$/.test(state.requestKey || '')
+      || !ID.test(state.sourceSessionId || '') || !ACCOUNT_ID.test(state.targetAccountId || '')
+      || !['claude', 'codex'].includes(state.targetAgent)
+      || !['prepared', 'launching', 'ambiguous', 'done'].includes(state.status)) return null;
+  return {
+    id: state.requestKey,
+    status: state.status,
+    sourceSessionId: state.sourceSessionId,
+    sourceAgent: state.sourceAgent,
+    sourceAccountId: state.sourceAccountId || '',
+    targetAccountId: state.targetAccountId,
+    targetAgent: state.targetAgent,
+    cardId: state.cardId,
+    cwd: state.cwd,
+    artifactFile: state.artifactFile,
+    ...(state.destinationSessionId ? { destinationSessionId: state.destinationSessionId } : {}),
+    ...(state.destinationPane ? { destinationPane: state.destinationPane } : {}),
+    preparedAt: state.preparedAt,
+    ...(state.completedAt ? { completedAt: state.completedAt } : {}),
+    ...(state.resolvedAt ? { completedAt: state.resolvedAt } : {}),
+  };
+}
+
+function list(root = process.env.KEEP_DIR || path.join(os.homedir(), 'keep')) {
+  const directory = path.join(path.resolve(root), '.keep', 'portable-transfers');
+  let names;
+  try { names = fs.readdirSync(directory); } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+  const transfers = [];
+  for (const name of names) {
+    const match = /^([a-f0-9]{64})\.json$/.exec(name);
+    if (!match) continue;
+    let state;
+    try { state = readJson(path.join(directory, name)); } catch { continue; }
+    if (state?.requestKey !== match[1]) continue;
+    const safe = safeSummary(state);
+    if (safe) transfers.push(safe);
+  }
+  return transfers.sort((a, b) => Number(b.preparedAt || 0) - Number(a.preparedAt || 0) || a.id.localeCompare(b.id));
+}
+
+function lockTransaction(stateFile) {
+  const lockFile = `${stateFile}.lock`;
+  fs.mkdirSync(path.dirname(lockFile), { recursive: true, mode: 0o700 });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      fs.writeFileSync(lockFile, String(process.pid), { flag: 'wx', mode: 0o600 });
+      return () => { try { fs.unlinkSync(lockFile); } catch {} };
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      let alive = true;
+      try { process.kill(Number(fs.readFileSync(lockFile, 'utf8')), 0); }
+      catch (cause) { if (cause.code === 'ESRCH') alive = false; }
+      if (alive) throw problem(`portable transfer ${path.basename(stateFile, '.json').slice(0, 16)} is already running`,
+        'KEEP_PORTABLE_TRANSFER_BUSY', 409);
+      try { fs.unlinkSync(lockFile); } catch {}
+    }
+  }
+  throw problem(`portable transfer ${path.basename(stateFile, '.json').slice(0, 16)} is already running`,
+    'KEEP_PORTABLE_TRANSFER_BUSY', 409);
+}
+
+async function launchState(state, stateFile, deps) {
+  if (state.status === 'done') return { ...state, repeated: true, stateFile };
+  if (['launching', 'ambiguous'].includes(state.status)) {
+    throw problem(`portable transfer launch is ambiguous; inspect the console, then use the CLI with --resolve-session <id> (${stateFile})`,
+      'KEEP_PORTABLE_TRANSFER_AMBIGUOUS', 409);
+  }
+  if (state.status !== 'prepared') throw problem('portable transfer is not prepared');
+  if (!deps.open) throw problem('portable transfer launcher is unavailable', 'KEEP_PORTABLE_TRANSFER_UNAVAILABLE', 503);
+  state = { ...state, status: 'launching', launchStartedAt: Date.now() }; writeJson(stateFile, state);
+  try {
+    const message = `Continue from the portable transfer package at ${state.artifactFile}. Read it first; this is a fresh conversation, not a native session resume.`;
+    const opened = await deps.open({ taskId: state.cardId, fresh: true, agent: state.targetAgent,
+      accountId: state.targetAccountId, cwd: state.cwd, message });
+    if (!opened || !ID.test(opened.sessionId || '') || opened.sessionId === state.sourceSessionId
+        || opened.accountId !== state.targetAccountId) throw problem('destination launch returned incomplete identity');
+    state = { ...state, status: 'done', destinationSessionId: opened.sessionId,
+      destinationPane: opened.pane || '', completedAt: Date.now() };
+    writeJson(stateFile, state);
+    return { ...state, stateFile };
+  } catch (error) {
+    state = { ...state, status: 'ambiguous', reason: String(error?.message || error).slice(0, 500), updatedAt: Date.now() };
+    writeJson(stateFile, state);
+    const wrapped = problem(`destination launch is ambiguous; inspect the console before resolving or retrying (${stateFile})`,
+      'KEEP_PORTABLE_TRANSFER_AMBIGUOUS', 409);
+    wrapped.cause = error; throw wrapped;
+  }
+}
+
+async function launchPrepared(transferId, deps = {}) {
+  if (!/^[a-f0-9]{64}$/.test(transferId || '')) throw problem('portable transfer id is invalid');
+  const root = path.resolve(deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep'));
+  const stateFile = transactionFile(root, transferId);
+  const unlock = lockTransaction(stateFile);
+  try {
+    const state = readJson(stateFile);
+    const safe = safeSummary(state);
+    if (!safe || state.requestKey !== transferId) throw problem('portable transfer was not found', 'KEEP_PORTABLE_TRANSFER_NOT_FOUND', 404);
+    const account = (deps.accounts || require('./accounts')).get(state.targetAccountId, deps.env || process.env);
+    if (!account || account.agent !== state.targetAgent) throw problem('portable transfer destination account is unavailable',
+      'KEEP_PORTABLE_TRANSFER_ACCOUNT', 409);
+    return launchState(state, stateFile, deps);
+  } finally { unlock(); }
+}
+
 function renderPackage(input) {
   const { source, target, card, cwd, context, transcript, conversation, git } = input;
   const task = [`- Card: ${card.id} — ${card.fm?.title || card.title || ''}`, `- Status: ${card.fm?.status || ''}`];
@@ -215,21 +321,7 @@ async function run(request, deps = {}) {
   const requestKey = digest(JSON.stringify({ version: 1, sourceSessionId: sessionId,
     targetAccountId: target.id, contextDigest: context.digest, cwd, cardId: task.id }));
   const stateFile = transactionFile(root, requestKey);
-  const lockFile = `${stateFile}.lock`;
-  fs.mkdirSync(path.dirname(lockFile), { recursive: true, mode: 0o700 });
-  let locked = false;
-  for (let attempt = 0; attempt < 2 && !locked; attempt++) {
-    try { fs.writeFileSync(lockFile, String(process.pid), { flag: 'wx', mode: 0o600 }); locked = true; }
-    catch (error) {
-      if (error.code !== 'EEXIST') throw error;
-      let alive = true;
-      try { process.kill(Number(fs.readFileSync(lockFile, 'utf8')), 0); }
-      catch (cause) { if (cause.code === 'ESRCH') alive = false; }
-      if (alive) throw problem(`portable transfer ${requestKey.slice(0, 16)} is already running`);
-      try { fs.unlinkSync(lockFile); } catch {}
-    }
-  }
-  if (!locked) throw problem(`portable transfer ${requestKey.slice(0, 16)} is already running`);
+  const unlock = lockTransaction(stateFile);
   try {
     let state = readJson(stateFile);
     if (state && (state.requestKey !== requestKey || state.sourceSessionId !== sessionId || state.targetAccountId !== target.id)) {
@@ -251,7 +343,7 @@ async function run(request, deps = {}) {
     }
     if (state && ['launching', 'ambiguous'].includes(state.status)) {
       throw problem(`portable transfer launch is ambiguous; inspect the console, then rerun with --resolve-session <id> (${stateFile})`,
-        'KEEP_PORTABLE_TRANSFER_AMBIGUOUS');
+        'KEEP_PORTABLE_TRANSFER_AMBIGUOUS', 409);
     }
     const content = renderPackage({ source, target, card: task, cwd, context, transcript, conversation, git, nextStep, taskFile });
     const fileName = `portable-transfer-${requestKey.slice(0, 16)}.md`;
@@ -266,25 +358,8 @@ async function run(request, deps = {}) {
       writeJson(stateFile, state);
     }
     if (request.prepareOnly) return { ...state, stateFile };
-    if (!deps.open) throw problem('portable transfer launcher is unavailable');
-    state = { ...state, status: 'launching', launchStartedAt: Date.now() }; writeJson(stateFile, state);
-    try {
-      const message = `Continue from the portable transfer package at ${state.artifactFile}. Read it first; this is a fresh conversation, not a native session resume.`;
-      const opened = await deps.open({ taskId: task.id, fresh: true, agent: target.agent, accountId: target.id, cwd, message });
-      if (!opened || !ID.test(opened.sessionId || '') || opened.sessionId === sessionId || opened.accountId !== target.id) {
-        throw problem('destination launch returned incomplete identity');
-      }
-      state = { ...state, status: 'done', destinationSessionId: opened.sessionId, destinationPane: opened.pane || '', completedAt: Date.now() };
-      writeJson(stateFile, state);
-      return { ...state, stateFile };
-    } catch (error) {
-      state = { ...state, status: 'ambiguous', reason: String(error?.message || error).slice(0, 500), updatedAt: Date.now() };
-      writeJson(stateFile, state);
-      const wrapped = problem(`destination launch is ambiguous; inspect the console before resolving or retrying (${stateFile})`,
-        'KEEP_PORTABLE_TRANSFER_AMBIGUOUS');
-      wrapped.cause = error; throw wrapped;
-    }
-  } finally { try { fs.unlinkSync(lockFile); } catch {} }
+    return launchState(state, stateFile, deps);
+  } finally { unlock(); }
 }
 
-module.exports = { run, extractConversation, renderPackage, defaultGitSnapshot, transactionFile };
+module.exports = { run, launchPrepared, list, safeSummary, extractConversation, renderPackage, defaultGitSnapshot, transactionFile };

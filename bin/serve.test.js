@@ -92,6 +92,8 @@ const {
   withInjectionLock,
   sendToSessionLocked,
   continueAccountHandoff,
+  listPortableTransfers,
+  transferSession,
   InjectionError,
 } = require('./serve.js');
 const { createScreenHistoryCache } = require('./screen-history.js');
@@ -3411,6 +3413,35 @@ test('fresh card open launches in an explicit cwd only when it belongs to the ca
       loadTask: () => ({ fm: { project, sessions: [] } }),
     }), (error) => error.status === 409 && /not part of the card project/.test(error.message));
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('portable transfer API lists safe records and launches only an existing transfer id', async () => {
+  const id = 'a'.repeat(64);
+  const safe = { id, status: 'prepared', sourceSessionId: 'source-session-1234', sourceAgent: 'codex',
+    sourceAccountId: 'codex/default', targetAccountId: 'codex-secondary', targetAgent: 'codex',
+    cardId: 'portable-card', cwd: '/tmp/worktree', artifactFile: '/tmp/package.md', preparedAt: 1 };
+  const launches = [];
+  const portable = {
+    list: (root) => { assert.equal(root, '/tmp/keep-root'); return [safe]; },
+    launchPrepared: async (transferId, deps) => {
+      assert.equal(transferId, id);
+      launches.push(await deps.open({ taskId: safe.cardId, fresh: true, accountId: safe.targetAccountId }));
+      return { ...safe, status: 'done', destinationSessionId: 'destination-session-5678', destinationPane: 'pane-destination' };
+    },
+    safeSummary: (value) => value,
+  };
+  assert.deepEqual(listPortableTransfers({ root: '/tmp/keep-root', portable }), [safe]);
+  const result = await transferSession({ transferId: id }, {
+    root: '/tmp/keep-root', portable, accounts: {}, open: async (payload) => ({ ...payload, accepted: true }),
+  });
+  assert.equal(launches.length, 1);
+  assert.equal(launches[0].accountId, 'codex-secondary');
+  assert.deepEqual({ ok: result.ok, status: result.transfer.status,
+    destinationSessionId: result.transfer.destinationSessionId }, {
+    ok: true, status: 'done', destinationSessionId: 'destination-session-5678',
+  });
+  await assert.rejects(transferSession({ transferId: '../bad' }, { portable }),
+    (error) => error.status === 400 && /invalid/.test(error.message));
 });
 
 test('explicit account launches stay pinned when the session is resumed', async () => {
