@@ -12,6 +12,7 @@ const RUN_RE = /^[a-f0-9]{32}$/;
 const RUNTIMES = new Set(['desktop', 'web']);
 const REASONS = new Set(['duration', 'hidden', 'disposed', 'expired', 'error']);
 const DOMAINS = new Set(['performance', 'epoch', 'mixed', 'unknown']);
+const CLOCK_VALUE_LIMIT = 1e15;
 
 const EVENT_SHAPES = {
   wheel: { max: 2048, length: 4, nullable: new Set([1]) },
@@ -27,6 +28,12 @@ const COUNT_KEYS = new Set([
   ...Object.keys(EVENT_SHAPES), 'frame', 'unknownEventTimeStamp',
   ...Object.keys(EVENT_SHAPES).map((key) => `dropped${key[0].toUpperCase()}${key.slice(1)}`),
 ]);
+const CLOCK_DIAGNOSTIC_SHAPES = {
+  wheelConstruct: { max: 2, length: 3 },
+  wallTimeOrigin: { max: 2, length: 3 },
+  wheelDocumentToWrapper: { max: 2048, length: 2 },
+  wheelDocumentCaptureMissing: { max: 2048, length: 1 },
+};
 
 class TerminalProfileError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -70,11 +77,34 @@ function validateTupleArray(value, key, shape) {
   }
 }
 
+function validateClockDiagnostics(value) {
+  exactKeys(value, new Set(Object.keys(CLOCK_DIAGNOSTIC_SHAPES)), 'bad terminal profile clock diagnostics');
+  for (const [key, tuples] of Object.entries(value)) {
+    const shape = CLOCK_DIAGNOSTIC_SHAPES[key];
+    if (!Array.isArray(tuples) || tuples.length > shape.max) {
+      throw new TerminalProfileError(400, 'bad terminal profile clock diagnostics');
+    }
+    for (const tuple of tuples) {
+      if (!Array.isArray(tuple) || tuple.length !== shape.length
+          || tuple.some((entry) => !finiteNumber(entry, -CLOCK_VALUE_LIMIT, CLOCK_VALUE_LIMIT))) {
+        throw new TerminalProfileError(400, 'bad terminal profile clock diagnostics');
+      }
+      if ((key === 'wheelConstruct' || key === 'wallTimeOrigin') && ![0, 1].includes(tuple[0])) {
+        throw new TerminalProfileError(400, 'bad terminal profile clock diagnostics');
+      }
+      if ((key === 'wheelDocumentToWrapper' || key === 'wheelDocumentCaptureMissing')
+          && (!Number.isInteger(tuple[0]) || tuple[0] < 0 || tuple[0] >= EVENT_SHAPES.wheel.max)) {
+        throw new TerminalProfileError(400, 'bad terminal profile clock diagnostics');
+      }
+    }
+  }
+}
+
 function validateReport(report) {
   exactKeys(report, new Set([
     'schema', 'runtime', 'reason', 'partial', 'startedAt', 'endedAt', 'durationMs',
     'eventTimeStampDomain', 'inputToOutputApproximate', 'paintProxy',
-    'capabilities', 'counts', 'totals', 'events',
+    'capabilities', 'counts', 'totals', 'events', 'clockDiagnostics',
   ]), 'bad terminal profile report');
   if (Buffer.byteLength(JSON.stringify(report)) > MAX_REPORT_BYTES
       || report.schema !== 'keep-terminal-scroll-v1' || report.runtime !== 'desktop'
@@ -104,6 +134,7 @@ function validateReport(report) {
   }
   exactKeys(report.events, new Set(Object.keys(EVENT_SHAPES)), 'bad terminal profile events');
   for (const [key, shape] of Object.entries(EVENT_SHAPES)) validateTupleArray(report.events[key], key, shape);
+  if (Object.hasOwn(report, 'clockDiagnostics')) validateClockDiagnostics(report.clockDiagnostics);
   return report;
 }
 

@@ -2,6 +2,7 @@ const SCHEMA = 'keep-terminal-scroll-v1';
 const PAINT_PROXY = 'xterm-onrender-next-animation-frame';
 const CAPS = { wheel: 2048, input: 4096, output: 1024, parse: 1024, render: 1024,
   frameGap: 1024, longtask: 256, inputToOutput: 1024 };
+const CLOCK_LIMIT = 1e15;
 
 function mouseReport(bytes) {
   if (!(bytes instanceof Uint8Array) || bytes[0] !== 0x1b || bytes[1] !== 0x5b) return null;
@@ -43,7 +44,9 @@ function createRecorder(options, config, initialWheel) {
   for (const key of Object.keys(events)) counts[`dropped${key[0].toUpperCase()}${key.slice(1)}`] = 0;
   const totals = { inputBytes: 0, outputBytes: 0 };
   const timestampDomains = new Set();
+  const clockDiagnostics = {};
   const renderFrames = new Set();
+  const documentWheelAt = typeof WeakMap === 'function' ? new WeakMap() : null;
   let stopped = false;
   let timer = null;
   let frame = null;
@@ -55,6 +58,29 @@ function createRecorder(options, config, initialWheel) {
   let pendingInputLast = 0;
 
   const round = (value) => Math.round(value * 10) / 10;
+  const clockValue = (value) => Number.isFinite(value) && Math.abs(value) <= CLOCK_LIMIT ? round(value) : null;
+  const pushClock = (key, tuple, max) => {
+    if (tuple.some((value) => value == null)) return;
+    const values = clockDiagnostics[key] ||= [];
+    if (values.length < max) values.push(tuple);
+  };
+  const sampleClocks = (phase) => {
+    if (typeof env.WheelEvent === 'function') {
+      try {
+        const before = env.now();
+        const stamp = Number(new env.WheelEvent('wheel').timeStamp);
+        const after = env.now();
+        pushClock('wheelConstruct', [phase, clockValue(stamp - before), clockValue(stamp - after)], 2);
+      } catch {}
+    }
+    if (Number.isFinite(env.timeOrigin)) {
+      const before = env.now();
+      const wall = env.wallNow();
+      const after = env.now();
+      pushClock('wallTimeOrigin', [phase, clockValue(wall - (env.timeOrigin + before)),
+        clockValue(wall - (env.timeOrigin + after))], 2);
+    }
+  };
   const relative = (at = env.now()) => round(Math.max(0, at - startPerf));
   const push = (key, tuple) => {
     counts[key] += 1;
@@ -85,11 +111,33 @@ function createRecorder(options, config, initialWheel) {
     const deltaY = Number(event.deltaY);
     const deltaMode = Number(event.deltaMode);
     if (!Number.isFinite(deltaY) || !Number.isFinite(deltaMode)) return;
+    const wheelIndex = counts.wheel;
+    if (wheelIndex < CAPS.wheel) {
+      const documentAt = documentWheelAt?.get(event);
+      if (Number.isFinite(documentAt)) {
+        pushClock('wheelDocumentToWrapper', [wheelIndex, clockValue(at - documentAt)], CAPS.wheel);
+        documentWheelAt.delete(event);
+      } else {
+        pushClock('wheelDocumentCaptureMissing', [wheelIndex], CAPS.wheel);
+      }
+    }
     push('wheel', [relative(at), wheelTimestamp(event, at), round(deltaY), deltaMode]);
   };
+  const documentWheel = (event) => {
+    if (!stopped && event.isTrusted) documentWheelAt?.set(event, env.now());
+  };
+  let documentListening = false;
+  if (documentWheelAt && typeof env.document?.addEventListener === 'function'
+      && typeof env.document?.removeEventListener === 'function') {
+    try {
+      env.document.addEventListener('wheel', documentWheel, { capture: true, passive: true });
+      documentListening = true;
+    } catch {}
+  }
   const activeWheel = (event) => { if (event !== initialWheel && event.isTrusted) recordWheel(event); };
   options.wrapper.addEventListener('wheel', activeWheel, true);
   recordWheel(initialWheel);
+  sampleClocks(0);
 
   const frameTick = (at) => {
     if (stopped) return;
@@ -134,8 +182,10 @@ function createRecorder(options, config, initialWheel) {
     for (const id of renderFrames) env.cancelAnimationFrame(id);
     renderFrames.clear();
     options.wrapper.removeEventListener('wheel', activeWheel, true);
+    if (documentListening) env.document.removeEventListener('wheel', documentWheel, true);
     renderDisposable?.dispose();
     longtaskObserver?.disconnect();
+    sampleClocks(1);
     const endedPerf = env.now();
     const endedAt = env.wallNow();
     const domains = [...timestampDomains].filter((value) => value !== 'unknown');
@@ -147,6 +197,7 @@ function createRecorder(options, config, initialWheel) {
       eventTimeStampDomain, inputToOutputApproximate: true, paintProxy: PAINT_PROXY,
       capabilities: { longtask: Boolean(longtaskObserver), onRender: Boolean(renderDisposable) },
       counts, totals, events,
+      ...(Object.keys(clockDiagnostics).length ? { clockDiagnostics } : {}),
     };
   };
   timer = env.setTimeout(() => options.onStop(stop('duration')), config.durationMs);
@@ -198,6 +249,7 @@ export function createTerminalProfiler(options) {
     requestAnimationFrame: globalThis.requestAnimationFrame?.bind(globalThis) || (() => 0),
     cancelAnimationFrame: globalThis.cancelAnimationFrame?.bind(globalThis) || (() => {}),
     PerformanceObserver: globalThis.PerformanceObserver, AbortController: globalThis.AbortController,
+    document: globalThis.document, WheelEvent: globalThis.WheelEvent,
     randomNonce: () => globalThis.crypto?.randomUUID?.().replaceAll('-', '') || null,
     ...(options.env || {}),
   };

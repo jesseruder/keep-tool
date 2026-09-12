@@ -71,6 +71,24 @@ test('report validation rejects content fields, nonnumeric tuples, and oversized
   assert.throws(() => validateReport(oversized), /bad terminal profile longtask/);
 });
 
+test('report validation accepts old reports and bounds optional numeric clock diagnostics', () => {
+  const oldReport = emptyReport();
+  assert.equal(validateReport(oldReport), oldReport);
+  const report = emptyReport({
+    clockDiagnostics: {
+      wheelConstruct: [[0, 8.5, 8.2], [1, -53.1, -53.4]],
+      wallTimeOrigin: [[0, -4, -4.2], [1, 6, 5.8]],
+      wheelDocumentToWrapper: [[1, 0.3]],
+      wheelDocumentCaptureMissing: [[0]],
+    },
+  });
+  assert.equal(validateReport(report), report);
+  assert.throws(() => validateReport(emptyReport({ clockDiagnostics: null })), /clock diagnostics/);
+  assert.throws(() => validateReport(emptyReport({ clockDiagnostics: { wheelConstruct: [[0, '8', 8]] } })), /clock diagnostics/);
+  assert.throws(() => validateReport(emptyReport({ clockDiagnostics: { wheelDocumentToWrapper: [[2048, 1]] } })), /clock diagnostics/);
+  assert.throws(() => validateReport(emptyReport({ clockDiagnostics: { terminalText: [[0]] } })), /clock diagnostics/);
+});
+
 test('request validation fixes duration and bounds action fields', () => {
   const store = createTerminalProfileStore({ randomRunId: () => 'c'.repeat(32) });
   assert.throws(() => store.act({ action: 'arm', pane: 'pane', runtime: 'desktop', durationMs: 20000 }), /15000ms/);
@@ -92,6 +110,12 @@ test('a saturated client report stays within the bounded request budget', () => 
   const report = emptyReport();
   report.events = Object.fromEntries(Object.entries(caps)
     .map(([key, length]) => [key, Array.from({ length }, () => tuples[key])]));
+  report.clockDiagnostics = {
+    wheelConstruct: [[0, -999999999999999, 999999999999999], [1, 0, 0]],
+    wallTimeOrigin: [[0, -1, -2], [1, 3, 2]],
+    wheelDocumentToWrapper: Array.from({ length: 2048 }, (_, index) => [index, 123.4]),
+    wheelDocumentCaptureMissing: Array.from({ length: 2048 }, (_, index) => [index]),
+  };
   assert.ok(Buffer.byteLength(JSON.stringify(report)) < 512 * 1024);
   assert.equal(validateReport(report), report);
 });
