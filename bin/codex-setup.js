@@ -334,6 +334,21 @@ function filesIn(root) {
   return result;
 }
 
+function assertNoDirectoryLinks(root, label) {
+  function visit(directory, prefix = '') {
+    for (const name of fs.readdirSync(directory)) {
+      const relative = prefix ? path.join(prefix, name) : name;
+      const file = path.join(directory, name);
+      const link = fs.lstatSync(file);
+      if (link.isSymbolicLink() && fs.statSync(file).isDirectory()) {
+        throw new Error(`Codex plugin sync conflicts at ${label}/${relative}`);
+      }
+      if (link.isDirectory()) visit(file, relative);
+    }
+  }
+  visit(root);
+}
+
 function fileDigest(file) {
   if (!file || !pathExists(file)) return 'missing';
   return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
@@ -373,12 +388,11 @@ function syncPluginVersion(entry, destination, sourceDir, targetDir, previous, o
       fs.renameSync(stage, destination);
       return records;
     }
-    if (!previous) {
-      const ownership = readJSON(path.join(destination, PLUGIN_MANIFEST), null);
-      if (ownership?.version === 1 && ownership.pluginVersion === entry.relative
-          && canonical(ownership.sourceConfigDir) === canonical(sourceDir)) previous = ownership.files;
-    }
+    const ownership = readJSON(path.join(destination, PLUGIN_MANIFEST), null);
+    if (ownership?.version === 1 && ownership.pluginVersion === entry.relative
+        && canonical(ownership.sourceConfigDir) === canonical(sourceDir)) previous = ownership.files;
     previous ||= {};
+    assertNoDirectoryLinks(destination, entry.relative);
     const targetFiles = filesIn(destination);
     const keys = new Set([...desired.keys(), ...targetFiles.keys(), ...Object.keys(previous)]);
     const decisions = new Map(), conflicts = [];

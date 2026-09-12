@@ -260,6 +260,44 @@ test('first adoption manages matching existing plugin files and preserves differ
   } finally { f.cleanup(); }
 });
 
+test('newer per-version provenance wins after an interrupted refresh', () => {
+  const f = fixture();
+  const sourceMetadata = path.join(f.sourceDir, 'plugins', 'cache', 'bundled', 'sample', '1.2.3', '.mcp.json');
+  const targetMetadata = path.join(f.targetDir, 'plugins', 'cache', 'bundled', 'sample', '1.2.3', '.mcp.json');
+  try {
+    setup.shareSetup(f.source, f.target);
+    const versionB = JSON.parse(fs.readFileSync(sourceMetadata));
+    versionB.mcpServers.sample.args.push(path.join(f.sourceDir, 'version-b.js'));
+    fs.writeFileSync(sourceMetadata, JSON.stringify(versionB));
+    assert.throws(() => setup.shareSetup(f.source, f.target, { beforeConfigCommit() {
+      const config = toml.parse(fs.readFileSync(path.join(f.targetDir, 'config.toml'), 'utf8'));
+      config.model = 'concurrent-model';
+      writeToml(path.join(f.targetDir, 'config.toml'), config);
+    } }), /config changed during capability sync/);
+    assert.equal(JSON.parse(fs.readFileSync(targetMetadata)).mcpServers.sample.args.at(-1), path.join(f.targetDir, 'version-b.js'));
+
+    const versionC = JSON.parse(fs.readFileSync(sourceMetadata));
+    versionC.mcpServers.sample.args.push(path.join(f.sourceDir, 'version-c.js'));
+    fs.writeFileSync(sourceMetadata, JSON.stringify(versionC));
+    setup.refresh(f.target);
+    assert.equal(JSON.parse(fs.readFileSync(targetMetadata)).mcpServers.sample.args.at(-1), path.join(f.targetDir, 'version-c.js'));
+  } finally { f.cleanup(); }
+});
+
+test('existing plugin descendant directory symlinks are refused before writes', () => {
+  const f = fixture();
+  const sourcePlugin = path.join(f.sourceDir, 'plugins', 'cache', 'bundled', 'sample', '1.2.3');
+  const targetPlugin = path.join(f.targetDir, 'plugins', 'cache', 'bundled', 'sample', '1.2.3');
+  try {
+    fs.mkdirSync(path.dirname(targetPlugin), { recursive: true });
+    fs.cpSync(sourcePlugin, targetPlugin, { recursive: true });
+    fs.rmSync(path.join(targetPlugin, 'scripts'), { recursive: true });
+    fs.symlinkSync(path.join(sourcePlugin, 'scripts'), path.join(targetPlugin, 'scripts'));
+    assert.throws(() => setup.shareSetup(f.source, f.target), /conflicts at bundled\/sample\/1\.2\.3\/scripts/);
+    assert.equal(fs.existsSync(path.join(sourcePlugin, 'extension-host-config.json')), false);
+  } finally { f.cleanup(); }
+});
+
 test('asset refresh adds and removes managed links while preserving target replacements', () => {
   const f = fixture();
   try {
