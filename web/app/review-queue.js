@@ -1,4 +1,4 @@
-import { write } from './api.js';
+import { searchDashboardReviews, write } from './api.js';
 
 const STATUSES = ['needs-decision', 'in-progress', 'resolved'];
 const LABELS = { 'needs-decision': 'Needs decision', 'in-progress': 'In progress', resolved: 'Resolved' };
@@ -32,6 +32,8 @@ let query = '';
 let form = null;
 let suppressAutoSelect = false;
 const pending = new Map();
+let searchState = { query: '', version: null, status: 'idle', ids: new Set(), error: '' };
+let searchSerial = 0;
 
 const newRequestId = () => globalThis.crypto?.randomUUID?.() || `review-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const allItems = (ctx) => ctx.data.reviewQueue?.items || [];
@@ -59,9 +61,28 @@ function launchStateHTML(ctx, item) {
 
 function visibleItems(ctx) {
   const needle = query.trim().toLowerCase();
+  ensureSearch(ctx, needle);
+  const matches = needle && searchState.query === needle && searchState.status === 'ready' ? searchState.ids : null;
   return allItems(ctx).filter((item) => item.type === type && item.status === status && (status !== 'needs-decision' || showLater || !isLater(item))
-    && (!needle || [item.title, item.card, item.project, item.body].some((value) => String(value || '').toLowerCase().includes(needle))))
+    && (!needle || matches?.has(item.id)))
     .sort(compareItems);
+}
+
+function ensureSearch(ctx, needle) {
+  if (!needle) return;
+  const version = ctx.data.generatedAt || null;
+  if (searchState.query === needle && searchState.version === version && ['loading', 'ready'].includes(searchState.status)) return;
+  const token = ++searchSerial;
+  searchState = { query: needle, version, status: 'loading', ids: new Set(), error: '' };
+  searchDashboardReviews(needle).then((result) => {
+    if (token !== searchSerial || query.trim().toLowerCase() !== needle) return;
+    searchState = { query: needle, version, status: 'ready', ids: new Set(result?.ids || []), error: '' };
+    renderReviewQueue(ctx);
+  }, (error) => {
+    if (token !== searchSerial || query.trim().toLowerCase() !== needle) return;
+    searchState = { query: needle, version, status: 'error', ids: new Set(), error: error?.message || 'Search failed' };
+    renderReviewQueue(ctx);
+  });
 }
 
 const itemTime = (item) => typeof item.at === 'number' && Number.isFinite(item.at) ? item.at : Date.parse(item.at) || 0;
@@ -93,7 +114,11 @@ function typeCount(ctx, value) {
 
 function itemList(ctx, current) {
   const visible = visibleItems(ctx);
-  if (!visible.length) return `<div class="qempty"><b>No matching items</b>${query ? 'Try another title, card, project, or phrase.' : 'Reviewer ideas and findings will appear here.'}</div>`;
+  if (!visible.length) {
+    if (query && searchState.status === 'loading') return '<div class="qempty" role="status"><b>Searching review notes…</b></div>';
+    if (query && searchState.status === 'error') return `<div class="qempty" role="alert"><b>Search failed</b>${ctx.esc(searchState.error)} <button class="btn" data-review-search-retry>Retry</button></div>`;
+    return `<div class="qempty"><b>No matching items</b>${query ? 'Try another title, card, project, or phrase.' : 'Reviewer ideas and findings will appear here.'}</div>`;
+  }
   return visible.map((item) => `<button class="review-queue-item ${item.id === current?.id ? 'selected' : ''}" data-review-item="${ctx.esc(item.id)}">
     <span class="review-queue-item-meta"><span class="review-kind ${ctx.esc(item.type)}">${ctx.esc(item.type)}</span>${item.severity ? `<span class="review-severity">${ctx.esc(item.severity)}</span>` : ''}<time>${ctx.esc(ctx.rel(item.at))}</time></span>
     <strong>${ctx.esc(item.title || item.id)}</strong><span>${ctx.esc(item.project || item.card || '')}</span>
@@ -110,17 +135,24 @@ function formHTML(ctx, item) {
 
 function detail(ctx, item) {
   if (!item) return '<div class="qempty"><b>Select a review item</b>Choose an idea or finding to read it and decide what happens next.</div>';
+  const detailState = item._detailVersion ? ctx.detail('review', item) : { status: 'ready', value: item, error: '' };
+  if (detailState.status === 'idle') void ctx.ensureDetail('review', item);
+  const fullItem = detailState.status === 'ready' ? { ...item, ...detailState.value } : item;
   const work = pending.get(item.id);
   const disabled = work && !work.error ? 'disabled' : '';
   const launchBlocked = ['opening', 'needs-attention'].includes(item.launchState?.state);
-  const sessions = item.sessions || [];
+  const sessions = fullItem.sessions || [];
   return `<article class="review-queue-detail" data-review-detail="${ctx.esc(item.id)}">
     <header><div><span class="review-kind ${ctx.esc(item.type)}">${ctx.esc(item.type)}</span>${item.severity ? `<span class="review-severity">${ctx.esc(item.severity)}</span>` : ''}</div><span class="review-status">${ctx.esc(LABELS[item.status] || item.status)}</span></header>
     <h2>${ctx.esc(item.title || item.id)}</h2>
     <div class="review-context">${item.project ? ctx.projectHTML(item.project) : ''}${item.card ? `<button data-review-card="${ctx.esc(item.card)}">${ctx.esc(item.card)}</button>` : ''}<time>${ctx.esc(new Date(item.at).toLocaleString())}</time></div>
-    <div class="review-body">${ctx.esc(item.body || 'No review notes were provided.')}</div>
-    ${item.evidence ? `<section><h3>Evidence</h3><pre>${ctx.esc(text(item.evidence))}</pre></section>` : ''}
-    ${outcomeHTML(ctx, item.outcome)}
+    ${detailState.status === 'error'
+      ? `<div class="review-action-error" role="alert">Could not load review details: ${ctx.esc(detailState.error)} <button class="btn" data-review-detail-retry>Retry</button></div>`
+      : detailState.status === 'ready'
+        ? `<div class="review-body">${ctx.esc(fullItem.body || 'No review notes were provided.')}</div>
+          ${fullItem.evidence ? `<section><h3>Evidence</h3><pre>${ctx.esc(text(fullItem.evidence))}</pre></section>` : ''}
+          ${outcomeHTML(ctx, fullItem.outcome)}`
+        : '<div class="review-body muted" role="status">Loading review details…</div>'}
     ${isLater(item) ? `<p class="review-later">Deferred until ${ctx.esc(new Date(item.deferredUntil).toLocaleString())}</p>` : ''}
     ${sessions.length ? `<section class="review-conversations"><h3>Conversations</h3>${sessions.map((session) => `<button class="btn" data-review-session="${ctx.esc(session.id)}">${session.action === 'start' ? item.type === 'finding' ? 'Investigation' : 'Work' : 'Discussion'} · ${ctx.esc(ctx.rel(session.at))}</button>`).join('')}</section>` : ''}
     ${launchStateHTML(ctx, item)}
@@ -174,9 +206,11 @@ function bind(ctx, root, current) {
   });
   root.querySelectorAll('[data-review-filter]').forEach((button) => button.addEventListener('click', () => { status = button.dataset.reviewFilter; selectedId = null; suppressAutoSelect = false; form = null; renderReviewQueue(ctx); }));
   root.querySelector('[data-review-sort]')?.addEventListener('change', (event) => { sorts[type] = event.target.value; store(STORAGE_SORT, JSON.stringify(sorts)); selectedId = null; suppressAutoSelect = false; renderReviewQueue(ctx); });
-  root.querySelector('[data-review-search]')?.addEventListener('input', (event) => { query = event.target.value; suppressAutoSelect = false; renderReviewQueue(ctx); });
+  root.querySelector('[data-review-search]')?.addEventListener('input', (event) => { query = event.target.value; selectedId = null; suppressAutoSelect = false; renderReviewQueue(ctx); });
   root.querySelector('[data-review-later]')?.addEventListener('click', (event) => { showLater = event.currentTarget.getAttribute('aria-pressed') !== 'true'; selectedId = null; renderReviewQueue(ctx); });
   root.querySelectorAll('[data-review-item]').forEach((button) => button.addEventListener('click', () => { selectedId = button.dataset.reviewItem; suppressAutoSelect = false; form = null; renderReviewQueue(ctx); }));
+  root.querySelector('[data-review-detail-retry]')?.addEventListener('click', () => void ctx.retryDetail('review', current));
+  root.querySelector('[data-review-search-retry]')?.addEventListener('click', () => { searchState.status = 'idle'; renderReviewQueue(ctx); });
   root.querySelectorAll('[data-review-session]').forEach((button) => button.addEventListener('click', () => ctx.openReviewSession(button.dataset.reviewSession)));
   root.querySelector('[data-review-recover]')?.addEventListener('click', () => {
     const launch = current.launchState;

@@ -1,7 +1,15 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { compactState, wantsCompactState, createJobChangeTracker } = require('./dashboard-state');
+const {
+  compactState,
+  wantsCompactState,
+  lightweightState,
+  wantsLightweightState,
+  dashboardDetail,
+  reviewQueueSearch,
+  createJobChangeTracker,
+} = require('./dashboard-state');
 
 test('already-open consoles use compact state while legacy and CLI clients retain full responses', () => {
   const url = new URL('http://localhost/api/state');
@@ -32,6 +40,80 @@ test('console state removes unused histories while preserving inbox notes and sa
   assert.equal(compact.sessions[0].lastAssistantFull, 'answer');
   assert.deepEqual(compact.attention, state.attention);
   assert.equal(JSON.stringify(state), before, 'internal and legacy state is unmodified');
+});
+
+test('lightweight dashboard state preserves list context and moves opened content to details', () => {
+  const longLog = 'x'.repeat(800);
+  const state = {
+    generatedAt: 123,
+    tasks: [{
+      id: 'card', body: '## 2026-09-07 12:34 — created\n\nFull task history', modelUsage: { total: 42 }, lastLog: longLog,
+      fm: { title: 'Card', status: 'review', kind: 'task', project: '/repo', tags: ['work'], depends_on: ['upstream'], sessions: [{ id: 'linked' }], check: 'expensive recipe', probe: 'true' },
+      overdue: true,
+    }],
+    sessions: [{
+      id: 'session', title: 'Live work', state: 'waiting', stateLabel: 'Waiting', taskId: 'card',
+      lastAssistant: 'Short update', lastAssistantFull: 'Full transcript tail', observation: { evidence: ['large'] },
+      runtime: { process: 'details' }, activity: { background: { pending: true } },
+    }],
+    reviewQueue: { counts: { 'needs-decision': 1 }, items: [{
+      id: 'finding:card:key', type: 'finding', status: 'needs-decision', title: 'Finding', card: 'card',
+      project: '/repo', at: 123, body: 'searchable note', evidence: 'full evidence', outcome: { status: 'unresolved' },
+      sessions: [{ id: 'discussion', action: 'discuss', at: 124 }],
+    }] },
+    notifications: [{ id: 'notification', card: 'card', read: false }],
+    attention: [{ sessionId: 'session', kind: 'input' }],
+  };
+  const before = JSON.stringify(state);
+  const summary = lightweightState(state);
+
+  assert.equal(summary.generatedAt, 123);
+  assert.deepEqual(summary.reviewQueue.counts, state.reviewQueue.counts);
+  assert.deepEqual(summary.notifications, state.notifications);
+  assert.deepEqual(summary.attention, state.attention);
+  assert.equal(summary.tasks[0].body, undefined);
+  assert.equal(summary.tasks[0].modelUsage, undefined);
+  assert.equal(summary.tasks[0].fm.check, undefined);
+  assert.equal(summary.tasks[0].fm.probe, undefined);
+  assert.equal(summary.tasks[0].fm.title, 'Card');
+  assert.deepEqual(summary.tasks[0].fm.sessions, [{ id: 'linked' }]);
+  assert.equal(summary.tasks[0].createdAt, '2026-09-07T12:34');
+  assert.equal(summary.tasks[0].hasCheck, true);
+  assert.equal(summary.tasks[0].lastLog.length, 500);
+  assert.equal(summary.sessions[0].lastAssistantFull, 'Full transcript tail');
+  assert.equal(summary.sessions[0].observation, undefined);
+  assert.equal(summary.sessions[0].runtime, undefined);
+  assert.equal(summary.sessions[0].lastAssistant, 'Short update');
+  assert.deepEqual(summary.sessions[0].activity, state.sessions[0].activity);
+  assert.equal(summary.reviewQueue.items[0].body, undefined);
+  assert.equal(summary.reviewQueue.items[0].evidence, undefined);
+  assert.equal(summary.reviewQueue.items[0].outcome, undefined);
+  assert.equal(summary.reviewQueue.items[0].sessions, undefined);
+  assert.equal(typeof summary.tasks[0]._detailVersion, 'string');
+  assert.equal(JSON.stringify(state), before, 'source state is not mutated');
+
+  assert.deepEqual(dashboardDetail(state, 'task', 'card').value, state.tasks[0]);
+  assert.deepEqual(dashboardDetail(state, 'session', 'session').value, state.sessions[0]);
+  assert.deepEqual(dashboardDetail(state, 'review', 'finding:card:key').value, state.reviewQueue.items[0]);
+  assert.equal(dashboardDetail(state, 'task', 'card').version, summary.tasks[0]._detailVersion);
+});
+
+test('dashboard detail validation and full review-note search stay explicit', () => {
+  const state = { reviewQueue: { items: [
+    { id: 'one', title: 'Visible title', body: 'ordinary notes' },
+    { id: 'two', title: 'Other title', body: 'Needle only appears in the full notes' },
+  ] } };
+  assert.deepEqual(reviewQueueSearch(state, 'needle'), { ids: ['two'] });
+  assert.deepEqual(reviewQueueSearch(state, 'visible'), { ids: ['one'] });
+  assert.throws(() => dashboardDetail(state, 'unknown', 'one'), (error) => error.status === 400);
+  assert.throws(() => dashboardDetail(state, 'review', 'missing'), (error) => error.status === 404);
+});
+
+test('lightweight mode is opt-in and does not change compact or mobile query behavior', () => {
+  assert.equal(wantsLightweightState(new URL('http://localhost/api/state')), false);
+  assert.equal(wantsLightweightState(new URL('http://localhost/api/state?compact=1')), false);
+  assert.equal(wantsLightweightState(new URL('http://localhost/api/state?view=home')), false);
+  assert.equal(wantsLightweightState(new URL('http://localhost/api/state?summary=1')), true);
 });
 
 test('job reconciliation notifies for meaningful changes, including child-only completion and stale confidence', () => {

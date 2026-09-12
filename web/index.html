@@ -448,6 +448,7 @@ let tagSummary = null;
 
 const $ = (id) => document.getElementById(id);
 let openTaskId = null;
+let taskDetailRequest = 0;
 
 const sessionOpenStates = new Map();
 function sessionOpenButton(payload) {
@@ -1382,10 +1383,34 @@ $('afSubmit').addEventListener('click', async () => {
 });
 
 function openTask(id) {
-  const t = state.tasks.find((x) => x.id === id);
-  if (!t) return;
+  const summary = state.tasks.find((x) => x.id === id);
+  if (!summary) return;
+  const request = ++taskDetailRequest;
   openTaskId = id;
   $('detail').dataset.sessionId = '';
+  if (!summary._detailVersion) return renderTaskDetail(summary);
+  $('detail').dataset.detailVersion = summary._detailVersion;
+  $('detail').innerHTML = `<button class="close" onclick="detail.close()">✕</button><h3>${esc(summary.fm.title)}</h3><div class="sub">${esc(summary.id)}</div><p class="empty" role="status">Loading task details…</p>`;
+  if (!$('detail').open) $('detail').showModal();
+  fetch(`/api/dashboard-detail?kind=task&id=${encodeURIComponent(id)}`, { headers: { 'x-keep': '1' } }).then(async (response) => {
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(result.error || `request failed (${response.status})`);
+    return result;
+  }).then((result) => {
+    if (request !== taskDetailRequest || openTaskId !== id || !$('detail').open) return;
+    renderTaskDetail({ ...summary, ...result.value });
+  }).catch((error) => {
+    if (request !== taskDetailRequest || openTaskId !== id || !$('detail').open) return;
+    $('detail').innerHTML = `<button class="close" onclick="detail.close()">✕</button><h3>${esc(summary.fm.title)}</h3><div class="sub">${esc(summary.id)}</div><p role="alert">Could not load task details: ${esc(error.message)}</p><button class="btn" id="retryTaskDetail">Retry</button>`;
+    $('retryTaskDetail').addEventListener('click', () => openTask(id));
+  });
+}
+
+function renderTaskDetail(t) {
+  const id = t.id;
+  openTaskId = id;
+  $('detail').dataset.sessionId = '';
+  $('detail').dataset.detailVersion = t._detailVersion || '';
   const s = (t.fm.sessions || []).slice(-1)[0];
   const resume = s ? `${t.fm.project ? `cd ${t.fm.project} && ` : ''}${s.agent === 'codex' ? 'codex resume' : 'claude --resume'} ${s.id}` : '';
   $('detail').innerHTML = `
@@ -1432,7 +1457,7 @@ function openTask(id) {
   });
 
   renderRunArea(id);
-  $('detail').showModal();
+  if (!$('detail').open) $('detail').showModal();
   fetch(`/api/tasksummary?id=${encodeURIComponent(id)}`).then((r) => {
     if (!r.ok) throw new Error(`request failed (${r.status})`);
     return r.json();
@@ -1556,13 +1581,17 @@ async function renderRunArea(taskId) {
 
 async function refresh() {
   try {
-    const r = await fetch('/api/state');
+    const r = await fetch('/api/state?summary=1');
     state = await r.json();
     $('stale').style.display = 'none';
     render();
     maybeNotify();
     // keep the run area of an open modal live without clobbering the check-in form
-    if ($('detail').open && openTaskId) renderRunArea(openTaskId);
+    if ($('detail').open && openTaskId) {
+      const summary = state.tasks.find((task) => task.id === openTaskId);
+      if (summary?._detailVersion && summary._detailVersion !== $('detail').dataset.detailVersion) openTask(openTaskId);
+      else renderRunArea(openTaskId);
+    }
   } catch {
     $('stale').style.display = '';
   }

@@ -23,7 +23,7 @@ let queuedStateRequest;
 async function fetchState() {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10000);
-  try { return await request('/api/state?compact=1', { signal: controller.signal }); }
+  try { return await request('/api/state?summary=1', { signal: controller.signal }); }
   catch (error) {
     if (controller.signal.aborted) throw new Error('State refresh timed out after 10 seconds');
     throw error;
@@ -51,6 +51,8 @@ export function getState() {
 }
 export const getLayouts = () => request('/api/layouts');
 export const getSessionSummary = (id) => request(`/api/sessionsummary?id=${encodeURIComponent(id)}`);
+export const getDashboardDetail = (kind, id) => request(`/api/dashboard-detail?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(id)}`);
+export const searchDashboardReviews = (query) => request(`/api/dashboard-review-search?q=${encodeURIComponent(query)}`);
 export const getPortableTransfers = () => request('/api/portable-transfers');
 export const getPortableTransferDraft = (sessionId) => request(`/api/portable-transfer-draft?session=${encodeURIComponent(sessionId)}`);
 export const getPortableTransferPreview = (transferId) => request(`/api/portable-transfer-preview?id=${encodeURIComponent(transferId)}`);

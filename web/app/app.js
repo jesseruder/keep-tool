@@ -19,6 +19,7 @@ import { renderWatch, installWatchControls } from './watch.js';
 import { renderFleet } from './fleet.js';
 import { openReviewQueueNotification, renderReviewQueue, reviewQueueIdForNotification } from './review-queue.js';
 import { closeReviewerPopover, markReviewerSeen, renderDock, renderReviewer, renderReviewerTop } from './reviewer.js';
+import { createDetailStore } from './details.js';
 import { acknowledgeNotificationClick, installNotificationClicks, notificationPermission, notify, requestPermission, setBadge } from './shell.js';
 
 applyTheme();
@@ -100,6 +101,7 @@ const sessionHistory = createSessionHistory(historyStorage);
 let historyControls;
 let historyRestored = false;
 let data = { tasks: [], sessions: [], attention: [], setAside: {}, panes: [], portableTransfers: [], health: {}, usage: {}, reviewUsage: null, review: { events: [], stats: {} }, reviewQueue: { items: [], counts: {} }, limitResume: {} };
+const detailStore = createDetailStore(api.getDashboardDetail, () => refresh());
 const terminals = new Map();
 const THEME_LABELS = { system: 'Auto', light: 'Light', dark: 'Dark' };
 function renderPalettePicker({ mode, palette }) {
@@ -208,8 +210,7 @@ function runningItems() {
   const panes = paneMap();
   const createdAt = (session) => {
     const task = tasks.get(session.taskId);
-    const logged = task?.body?.match(/^## (\d{4}-\d{2}-\d{2} \d{2}:\d{2}) — created(?:\r?$)/m)?.[1];
-    return Date.parse(logged?.replace(' ', 'T')) || Date.parse(task?.fm?.created)
+    return Date.parse(task?.createdAt) || Date.parse(task?.fm?.created)
       || Date.parse(panes.get(session.pane)?.createdAt) || 0;
   };
   return stableSessionOrder(sessions, runningOrder, new Set((data.sessions || []).map((session) => session.id)), createdAt)
@@ -784,6 +785,7 @@ async function reload() {
     if (generation < appliedReloadGeneration) return;
     appliedReloadGeneration = generation;
     data = { ...nextData, portableTransfers: portable?.transfers || [] };
+    detailStore.reconcile(data);
     for (const [id, pending] of spawnedPanes) {
       if ((data.panes || []).some((candidate) => candidate.id === id)) spawnedPanes.delete(id);
       else if (generation <= pending.throughGeneration) data.panes = [...(data.panes || []), pending.pane];
@@ -869,6 +871,9 @@ const ctx = {
   itemKey, triageKey, eventKey, sessionFor, taskFor, paneMap, entityForPane, kindLabel, limitResumeFor, toast, dismiss, restore, setAside, setAsideFor,
   pinPane, startShell, reopenSession, removePane, isPanePinned, knownPaneCount, saveLayouts, dropPane, mount, patchHTML, clearElement, refresh, reload,
   scheduleTerminalFit, setMode, setDock, toggleFocus, focusTerminal, focusDebug, retainedSelectionItem,
+  detail(kind, item) { return item ? detailStore.peek(kind, item.id, item._detailVersion) : { status: 'idle', value: null, error: '' }; },
+  ensureDetail(kind, item) { return item && item._detailVersion ? detailStore.ensure(kind, item.id, item._detailVersion) : Promise.resolve(item || null); },
+  retryDetail(kind, item) { return item && item._detailVersion ? detailStore.retry(kind, item.id, item._detailVersion) : Promise.resolve(item || null); },
   openReviewSession(sessionId) {
     const session = data.sessions.find((candidate) => candidate.id === sessionId);
     if (!session) {
@@ -1169,6 +1174,9 @@ const attentionSound = installAttentionSound({ onPlay: () => focusDebug('attenti
 focusDebug('attention-sound-ready', { reason: 'turn-request-v2' });
 const notificationPanel = installNotifications({
   reload, toast,
+  detail(task) { return ctx.detail('task', task); },
+  ensureDetail(task) { return ctx.ensureDetail('task', task); },
+  retryDetail(task) { return ctx.retryDetail('task', task); },
   openSession(sessionId) {
     rememberSession(sessionId, 'triage');
     navigateHistory({ sessionId, view: 'triage' });

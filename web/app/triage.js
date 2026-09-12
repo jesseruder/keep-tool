@@ -339,7 +339,10 @@ function renderStage(ctx, active, focusItem, running, pinned) {
   }
   ctx.state.currentItem = item;
   const session = ctx.sessionFor(item);
-  const task = ctx.taskFor(item);
+  const taskSummary = ctx.taskFor(item);
+  const taskDetail = ctx.detail('task', taskSummary);
+  if (taskSummary?._detailVersion && taskDetail.status === 'idle') void ctx.ensureDetail('task', taskSummary);
+  const task = taskDetail.status === 'ready' ? { ...taskSummary, ...taskDetail.value } : taskSummary;
   const title = item.title || session?.title || 'untitled session';
   const waitingItem = item.kind !== 'running' && item.kind !== 'pinned' && item.kind !== 'recent';
   const key = ctx.itemKey(item);

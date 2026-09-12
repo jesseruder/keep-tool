@@ -3,7 +3,10 @@ import { isDesktop, notificationPermission, notify, requestPermission } from './
 
 const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
-export function installNotifications({ reload, toast, openSession, openReviewer, isReviewItem = () => false, openReviewItem = () => false }) {
+export function installNotifications({
+  reload, toast, openSession, openReviewer, isReviewItem = () => false, openReviewItem = () => false,
+  detail = () => ({ status: 'idle', value: null, error: '' }), ensureDetail = () => Promise.resolve(), retryDetail = () => Promise.resolve(),
+}) {
   const button = document.querySelector('#notificationsButton');
   const panel = document.querySelector('#notificationsPanel');
   const list = panel.querySelector('.notification-list');
@@ -47,7 +50,11 @@ export function installNotifications({ reload, toast, openSession, openReviewer,
     permissionButton.textContent = permission === 'denied' ? 'Notifications disabled in system settings' : 'Enable desktop notifications';
     permissionButton.disabled = permission === 'denied';
     const visible = entries().filter((entry) => filter !== 'unread' || !entry.read || entry.id === selected);
-    const nextSignature = JSON.stringify([visible, selected, data.tasks, data.sessions]);
+    const selectedEntry = visible.find((entry) => entry.id === selected);
+    const selectedTask = selectedEntry?.card ? (data.tasks || []).find((task) => task.id === selectedEntry.card) : null;
+    const selectedDetail = selectedTask ? detail(selectedTask) : null;
+    if (selectedTask?._detailVersion && selectedDetail.status === 'idle') void ensureDetail(selectedTask);
+    const nextSignature = JSON.stringify([visible, selected, data.tasks, data.sessions, selectedDetail]);
     if (signature === nextSignature) return;
     signature = nextSignature;
     const active = document.activeElement;
@@ -59,6 +66,8 @@ export function installNotifications({ reload, toast, openSession, openReviewer,
       const task = (data.tasks || []).find((task) => task.id === entry.card);
       const session = (data.sessions || []).find((session) => session.taskId === entry.card && !session.reviewer);
       const expanded = selected === entry.id;
+      const detailState = expanded && task ? detail(task) : null;
+      const fullTask = detailState?.status === 'ready' ? { ...task, ...detailState.value } : task;
       // Reviewer ideas already put the card title at the start of their alert text.
       // On expansion, use the linked card title and notes instead of repeating it.
       const reviewerIdea = entry.caller === 'reviewer-idea' && task?.fm?.kind === 'idea';
@@ -73,7 +82,12 @@ export function installNotifications({ reload, toast, openSession, openReviewer,
           ${session ? `<button class="btn" data-session="${esc(session.id)}">Open session</button>` : ''}
           ${entry.caller === 'reviewer' ? '<button class="btn" data-reviewer>Open reviewer</button>' : ''}
         </div>
-        ${expanded && entry.card ? `<div class="notification-detail">${task ? `${reviewerIdea ? '' : `<b>${esc(task.fm?.title || task.id)}</b>`}<span class="muted">${esc(task.fm?.status || '')}</span><pre>${esc(task.body || 'No card notes yet.')}</pre>` : '<p>This card is no longer in the active task list.</p>'}</div>` : ''}
+        ${expanded && entry.card ? `<div class="notification-detail">${task
+          ? `${reviewerIdea ? '' : `<b>${esc(task.fm?.title || task.id)}</b>`}<span class="muted">${esc(task.fm?.status || '')}</span>${detailState?.status === 'error'
+            ? `<p role="alert">Could not load card notes: ${esc(detailState.error)} <button class="btn" data-detail-retry="${esc(task.id)}">Retry</button></p>`
+            : detailState?.status === 'ready' || !task._detailVersion ? `<pre>${esc(fullTask.body || 'No card notes yet.')}</pre>`
+              : '<p class="muted" role="status">Loading card notes…</p>'}`
+          : '<p>This card is no longer in the active task list.</p>'}</div>` : ''}
       </article>`;
     }).join('') : `<div class="qempty"><b>${filter === 'unread' ? 'You’re caught up' : 'No notifications yet'}</b>Reviewer findings, results, and agent heads-ups appear here.<br>Session questions stay in Waiting on you.</div>`;
     if (focused) {
@@ -126,6 +140,10 @@ export function installNotifications({ reload, toast, openSession, openReviewer,
     else if (target.hasAttribute('data-mark-all')) void change(entries().filter((entry) => !entry.read).map((entry) => entry.id), 'read');
     else if (target.dataset.read) void change([target.dataset.read], target.dataset.action);
     else if (target.dataset.select) open(target.dataset.select);
+    else if (target.dataset.detailRetry) {
+      const task = (data.tasks || []).find((candidate) => candidate.id === target.dataset.detailRetry);
+      if (task) void retryDetail(task);
+    }
     else if (target.dataset.session) { afterClose = () => openSession(target.dataset.session); panel.close(); }
     else if (target.hasAttribute('data-reviewer')) { afterClose = openReviewer; panel.close(); }
     else if (target.hasAttribute('data-enable')) void requestPermission().then(render);

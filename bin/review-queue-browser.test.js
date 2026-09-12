@@ -8,12 +8,15 @@ const os = require('node:os');
 const http = require('node:http');
 const { spawn } = require('node:child_process');
 const WebSocket = require('ws');
+const { dashboardDetail, lightweightState, reviewQueueSearch } = require('./dashboard-state');
 
 test('isolated browser: review queue decisions, drafts, notification links, and responsive layout', { skip: process.env.KEEP_BROWSER_TEST !== '1', timeout: 45000 }, async () => {
   const root = path.resolve(__dirname, '..');
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-queue-browser-'));
   const posts = [];
   const eventClients = new Set();
+  const detailGets = [];
+  const reviewSearches = [];
   const now = Date.now();
   const idea = { id: 'idea:card-idea', type: 'idea', card: 'card-idea', title: 'Searchable workflow idea', body: 'Make the owner decision flow concise.', project: '/tmp/middle-project', status: 'needs-decision', at: now - 1000, sessions: [] };
   const finding = { id: 'finding:card-find:key-one', type: 'finding', card: 'card-find', title: 'Protect retry idempotency', body: 'A lost response must not launch twice.', evidence: 'Observed in the launch boundary.', severity: 'high', project: '/tmp/review-fixture', status: 'needs-decision', at: now, sessions: [] };
@@ -30,6 +33,19 @@ test('isolated browser: review queue decisions, drafts, notification links, and 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://fixture');
     if (url.pathname === '/api/events') { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(': ready\n\n'); eventClients.add(res); req.on('close', () => eventClients.delete(res)); return; }
+    if (url.pathname === '/api/dashboard-detail') {
+      const kind = url.searchParams.get('kind'); const id = url.searchParams.get('id');
+      detailGets.push(`${kind}:${id}`);
+      const send = () => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(dashboardDetail(state, kind, id))); };
+      if (id === partial.id) setTimeout(send, 120); else send();
+      return;
+    }
+    if (url.pathname === '/api/dashboard-review-search') {
+      const q = url.searchParams.get('q') || '';
+      reviewSearches.push(q);
+      res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(reviewQueueSearch(state, q)));
+      return;
+    }
     if (req.method === 'POST' && url.pathname === '/api/notifications') {
       let body = ''; req.on('data', (chunk) => { body += chunk; }); req.on('end', () => { const request = JSON.parse(body); for (const item of state.notifications) if (request.ids.includes(item.id)) item.read = request.action === 'read'; res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ ok: true })); }); return;
     }
@@ -85,7 +101,7 @@ test('isolated browser: review queue decisions, drafts, notification links, and 
         if (request.action === 'start' || request.action === 'defer') setTimeout(finish, 120); else finish();
       }); return;
     }
-    if (url.pathname.startsWith('/api/')) { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(url.pathname === '/api/state' ? state : url.pathname === '/api/layouts' ? { layouts: [{ name: 'Pinned', role: 'pinned', ids: [], cols: 1 }] } : { ok: true })); return; }
+    if (url.pathname.startsWith('/api/')) { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(url.pathname === '/api/state' ? (url.searchParams.get('summary') === '1' ? lightweightState(state) : state) : url.pathname === '/api/layouts' ? { layouts: [{ name: 'Pinned', role: 'pinned', ids: [], cols: 1 }] } : { ok: true })); return; }
     const vendors = { '/vendor/xterm.js': 'node_modules/@xterm/xterm/lib/xterm.js', '/vendor/xterm.css': 'node_modules/@xterm/xterm/css/xterm.css', '/vendor/addon-webgl.js': 'node_modules/@xterm/addon-webgl/lib/addon-webgl.js', '/vendor/addon-fit.js': 'node_modules/@xterm/addon-fit/lib/addon-fit.js', '/vendor/addon-search.js': 'node_modules/@xterm/addon-search/lib/addon-search.js' };
     const file = path.resolve(root, vendors[url.pathname] || `web${url.pathname === '/' ? '/app/index.html' : url.pathname}`);
     if (!file.startsWith(root + path.sep) || !fs.existsSync(file) || !fs.statSync(file).isFile()) { res.writeHead(404); res.end(); return; }
@@ -110,6 +126,12 @@ test('isolated browser: review queue decisions, drafts, notification links, and 
     await wait("document.querySelector('#connection')?.textContent === '0 sessions · 0 panes'");
     await evaluate("document.querySelector('[data-mode=review-queue]').click()");
     await wait("document.querySelector('[data-review-detail]')?.dataset.reviewDetail === 'idea:partial-start'");
+    assert.equal(await evaluate("document.querySelector('[data-review-detail] .review-body')?.textContent"), 'Loading review details…');
+    await evaluate("document.querySelector('[data-review-item=\"idea:lost-response\"]').click()");
+    await wait("document.querySelector('[data-review-detail=\"idea:lost-response\"] .review-body')?.textContent.includes('Retry the same request safely')");
+    await evaluate("new Promise(resolve => setTimeout(resolve, 180))");
+    assert.equal(await evaluate("document.querySelector('[data-review-detail]').dataset.reviewDetail"), 'idea:lost-response', 'a slower prior detail cannot replace the newly selected item');
+    assert.equal(detailGets.filter((key) => key === 'review:idea:lost-response').length, 1);
     assert.equal(await evaluate("document.querySelector('[role=tab][aria-selected=true]').dataset.reviewType"), 'idea', 'Ideas is the default tab');
     assert.deepEqual(await evaluate("[...document.querySelectorAll('[data-review-type]')].map(node=>node.textContent.trim())"), ['Ideas 3', 'Findings 2']);
     assert.deepEqual(await evaluate("[...document.querySelectorAll('[data-review-filter] span')].map(node=>node.textContent)"), ['3', '0', '0'], 'status counts are scoped to Ideas');
@@ -174,8 +196,10 @@ test('isolated browser: review queue decisions, drafts, notification links, and 
     assert.equal(lost.status, 'needs-decision');
     assert.equal(lost.sessions.length, 1, 'Discuss opens only one fresh conversation and leaves the item pending');
     await evaluate("document.querySelector('[data-mode=review-queue]').click()");
-    await evaluate("const input=document.querySelector('[data-review-search]'); input.value='workflow'; input.dispatchEvent(new Event('input',{bubbles:true}))");
+    await evaluate("const input=document.querySelector('[data-review-search]'); input.value='same request safely'; input.dispatchEvent(new Event('input',{bubbles:true}))");
     await wait("document.querySelectorAll('[data-review-item]').length === 1");
+    assert.equal(await evaluate("document.querySelector('[data-review-item]').dataset.reviewItem"), 'idea:lost-response', 'search includes text omitted from the summary payload');
+    assert.ok(reviewSearches.includes('same request safely'));
     await evaluate("document.querySelector('[data-review-search]').value=''; document.querySelector('[data-review-search]').dispatchEvent(new Event('input',{bubbles:true})); document.querySelector('[data-review-action=dismiss]').click(); const area=document.querySelector('[data-review-form=dismiss] textarea'); area.value='Duplicate of active work'; area.dispatchEvent(new Event('input',{bubbles:true})); area.focus()");
     for (const client of eventClients) client.write('data: changed\n\n');
     await wait("document.querySelector('[data-review-form=dismiss] textarea')?.value === 'Duplicate of active work'");

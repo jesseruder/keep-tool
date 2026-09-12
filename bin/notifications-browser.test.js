@@ -10,12 +10,13 @@ const { spawn } = require('node:child_process');
 const WebSocket = require('ws');
 const notifications = require('./notifications');
 const { appendAlert } = require('./alerts');
-const { compactState } = require('./dashboard-state');
+const { dashboardDetail, lightweightState } = require('./dashboard-state');
 
 test('isolated browser: alert inbox, read persistence, card links and desktop click-through', { skip: process.env.KEEP_BROWSER_TEST !== '1', timeout: 45000 }, async () => {
   const root = path.resolve(__dirname, '..');
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-nav-browser-'));
   const posts = [];
+  const detailGets = [];
   const eventClients = new Set();
   let summaryFresh = false;
   const sessions = ['a', 'b'].map((id) => ({ id, kind: 'claude', title: `Session ${id}`, project: '/tmp/history-fixture', taskId: `card-${id}`, pane: `p${id}`, mtime: Date.now(), state: 'running', endedTurn: false }));
@@ -40,9 +41,15 @@ test('isolated browser: alert inbox, read persistence, card links and desktop cl
     }
     state.notifications = notifications.snapshot(inboxRoot);
     if (url.pathname === '/api/events') { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(': ready\n\n'); eventClients.add(res); req.on('close', () => eventClients.delete(res)); return; }
+    if (url.pathname === '/api/dashboard-detail') {
+      detailGets.push(`${url.searchParams.get('kind')}:${url.searchParams.get('id')}`);
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify(dashboardDetail(state, url.searchParams.get('kind'), url.searchParams.get('id'))));
+      return;
+    }
     if (url.pathname.startsWith('/api/')) {
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify(url.pathname === '/api/state' ? (url.searchParams.get('compact') === '1' ? compactState(state) : state) : url.pathname === '/api/layouts' ? { layouts: [{ name: 'Pinned', role: 'pinned', ids: ['pa', 'pb'], cols: 2 }] } : { text: 'Fixture summary', fresh: summaryFresh, ok: true })); return;
+      res.end(JSON.stringify(url.pathname === '/api/state' ? (url.searchParams.get('summary') === '1' ? lightweightState(state) : state) : url.pathname === '/api/layouts' ? { layouts: [{ name: 'Pinned', role: 'pinned', ids: ['pa', 'pb'], cols: 2 }] } : { text: 'Fixture summary', fresh: summaryFresh, ok: true })); return;
     }
     const vendors = { '/vendor/xterm.js': 'node_modules/@xterm/xterm/lib/xterm.js', '/vendor/xterm.css': 'node_modules/@xterm/xterm/css/xterm.css', '/vendor/addon-webgl.js': 'node_modules/@xterm/addon-webgl/lib/addon-webgl.js', '/vendor/addon-fit.js': 'node_modules/@xterm/addon-fit/lib/addon-fit.js', '/vendor/addon-search.js': 'node_modules/@xterm/addon-search/lib/addon-search.js' };
     const file = path.resolve(root, vendors[url.pathname] || `web${url.pathname === '/' ? '/app/index.html' : url.pathname}`);
@@ -108,8 +115,10 @@ test('isolated browser: alert inbox, read persistence, card links and desktop cl
     assert.equal(await evaluate("document.querySelectorAll('.notification-list img').length"), 0, 'alert text is escaped');
     assert.equal(await evaluate("document.querySelector('[data-id=a-idea] .notification-text').textContent"), 'Reviewer idea: Preserve <card> notes — a truncated proposal that must not repeat', 'collapsed reviewer ideas preserve their proposal preview');
     assert.equal(await evaluate("document.querySelectorAll('[data-id=a-idea] .notification-card').length"), 0, 'reviewer ideas do not repeat the linked card title');
+    assert.equal(detailGets.includes('task:idea-one'), false, 'collapsed notifications do not fetch card history');
     await evaluate("document.querySelector('[data-select=a-idea]').click()");
     await wait("document.querySelector('[data-id=a-idea].selected .notification-detail pre').textContent.includes('Full idea notes')");
+    assert.equal(detailGets.filter((key) => key === 'task:idea-one').length, 1, 'opening a notification fetches its card detail once');
     assert.equal(await evaluate("document.querySelector('[data-id=a-idea].selected .notification-text').textContent"), 'Reviewer idea: Preserve <card> notes', 'expanded reviewer ideas replace the truncated proposal with one title');
     assert.equal(await evaluate("document.querySelectorAll('[data-id=a-idea].selected .notification-detail > b').length"), 0, 'expanded reviewer ideas do not repeat their title in the card detail');
     await evaluate("document.querySelector('[data-select=\"a-one\"]').focus(); document.querySelector('[data-select=\"a-one\"]').click()");
