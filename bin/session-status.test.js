@@ -175,12 +175,24 @@ test('a current process-owned uncertain job suppresses generic readiness', () =>
     { ...pending, kind: 'service' },
     { ...pending, kind: 'scheduled' },
     { ...pending, instance: 'other-pane:2:agent' },
+    { ...pending, instance: null },
   ]) {
     const current = { ...base, unknownBackgroundJobs: job.status === 'pending' ? [job.id] : [],
       backgroundJobs: { ...base.backgroundJobs, jobs: [job] } };
     assert.equal(activity(current).reason, 'next instruction', JSON.stringify(job));
     assert.equal(attention(current).attentionLabel, 'Ready for next instruction');
   }
+  for (const runtime of [
+    { state: 'live', instance: 'pane:1:shell', jobInstance: null },
+    { state: 'live', instance: 'pane:1:shell' },
+    { state: 'live', instance: null, jobInstance: null },
+  ]) {
+    const current = { ...base, runtime };
+    assert.equal(activity(current).reason, 'next instruction', JSON.stringify(runtime));
+    assert.equal(attention(current).attentionLabel, 'Ready for next instruction');
+  }
+  const unverified = { ...base, runtime: { state: 'external', instance: 'pane:1:shell', jobInstance: 'pane:1:agent' } };
+  assert.equal(activity(unverified, { live: true }).reason, 'next instruction', 'an exact identity without a live process is insufficient');
 });
 
 test('dismissal remains tied to conversation activity, not metadata or focus', () => {

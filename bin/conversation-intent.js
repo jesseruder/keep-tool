@@ -28,8 +28,7 @@ function resolve(session, model, now = Date.now()) {
   const jobInstance = Object.hasOwn(model.process, 'jobInstance') ? model.process.jobInstance : model.process.instance;
   const scheduled = jobs.filter(j => model.process.state === 'live' && j.kind === 'scheduled' && j.recurring === true && j.instance && j.instance === jobInstance && j.expiresAt > now);
   const currentJobs = jobs.filter(j => j.kind !== 'service' && j.kind !== 'scheduled'
-    && (j.current === true || !session.lastUserAt || j.startedAt >= session.lastUserAt)
-    && (!j.instance || (jobInstance && j.instance === jobInstance)));
+    && (j.current === true || !session.lastUserAt || j.startedAt >= session.lastUserAt));
   const concrete = model.background.pending || model.background.uncertain.length || model.background.agents.length || scheduled.length
     || model.task.dependencies.length || model.task.checkAfter;
   const intentional = hint === 'waiting' && Boolean(concrete);
@@ -38,7 +37,10 @@ function resolve(session, model, now = Date.now()) {
   // A current, process-owned ledger entry is concrete work even when its kind is
   // uncertain. Uncertainty protects it from cleanup; it must also protect the
   // session from generic readiness until correlated terminal evidence arrives.
-  const currentJobWait = currentJobs.length > 0;
+  // Unlike the bounded legacy path above, an uncertain entry cannot be inherited
+  // across a process restart without exact live ownership evidence.
+  const currentJobWait = model.process.state === 'live' && Boolean(jobInstance)
+    && currentJobs.some(j => Boolean(j.instance) && j.instance === jobInstance);
   return { hint, waiting: intentional || (hint !== 'needs-input' && (jobWait || currentJobWait)),
     reason: handoff === 'waiting' ? 'scheduled check' : intentional && scheduled.length ? 'scheduled check' : intentional && model.task.dependencies.length ? 'dependency'
       : intentional && model.task.checkAfter ? 'scheduled check' : model.background.agents.length ? 'subagent' : require('./session-status').waitReason(session.lastAssistantFull || session.lastAssistant),
