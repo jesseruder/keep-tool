@@ -71,6 +71,29 @@ Source artifacts stay as a backup because tool-result records can contain absolu
 
 Codex profiles can be configured, selected for new sessions, attributed, and kept sticky across restarts. Cross-profile Codex conversation handoff is reported as unsupported until its storage and resume behavior has equivalent end-to-end proof.
 
+## Start a portable continuation
+
+When native handoff is unavailable, create a bounded prose package and start a fresh conversation on another named account:
+
+```sh
+keep transfer <source-session-id> \
+  --account codex-secondary \
+  --context /path/to/handoff.md \
+  --cwd /path/to/worktree
+```
+
+The package contains the explicit handoff document, recent user and assistant prose (including Codex compaction replacement history), the card and next step, and read-only Git state. It excludes tool payloads, environment records, configuration, credentials, and provider cache. The source session remains intact, and the destination gets a new session id.
+
+Use `--prepare-only` to store the package without launching. Rerunning the exact command launches that prepared package once. If the API result is ambiguous after a possible launch, Keep refuses to try again; inspect the console and bind the observed destination explicitly:
+
+```sh
+keep transfer <source-session-id> \
+  --account codex-secondary \
+  --context /path/to/handoff.md \
+  --cwd /path/to/worktree \
+  --resolve-session <destination-session-id>
+```
+
 ## Disposable CLI resume proof
 
 `python3 scripts/account-resume-smoke.py` runs the installed Claude CLI against a local mock API with temporary source and target profiles. It uses a random session, copies the temporary project history, resumes under the second profile, and verifies that the same session id and prior user/assistant context reach the resumed request. It does not use a real subscription, write either real profile, or perform a login.

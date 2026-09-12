@@ -2135,7 +2135,7 @@ function filesIdentical(left, right) {
     && fs.readFileSync(left).equals(fs.readFileSync(right));
 }
 
-commands.artifact = (argv) => {
+commands.artifact = (argv, deps = {}) => {
   const o = parseArgs(argv, {});
   const [id, ...inputs] = o._;
   if (!id) die('usage: keep artifact <card> [--] [<file>...] [-m "note"]');
@@ -2230,7 +2230,8 @@ commands.artifact = (argv) => {
     return results;
   });
 
-  for (const result of stored) console.log(result.destination);
+  if (!deps.quiet) for (const result of stored) console.log(result.destination);
+  return stored;
 };
 
 commands.show = (argv) => {
@@ -3950,6 +3951,44 @@ commands.handoff = async (argv, deps = {}) => {
   try { result = JSON.parse(response.data); } catch {}
   if (response.status !== 200 || !result.ok) die(result.error || `keep serve returned an unexpected response (${response.status})`);
   console.log(`moved session ${result.sessionId} from ${result.sourceAccountId} to ${result.targetAccountId} in pane ${result.pane}`);
+};
+
+commands.transfer = async (argv, deps = {}) => {
+  const o = parseArgs(argv, { account: 'str', context: 'str', cwd: 'str', 'prepare-only': 'bool', 'resolve-session': 'str' });
+  const sourceSessionId = o._[0];
+  if (!sourceSessionId || o._.length !== 1 || !o.account || !o.context) {
+    die('usage: keep transfer <source-session-id> --account <target-id> --context <handoff.md> [--cwd <worktree>] [--prepare-only] [--resolve-session <id>]');
+  }
+  const runner = deps.portable || require('./portable-handoff');
+  const storePackage = deps.storePackage || (async ({ cardId, fileName, content, note }) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-portable-transfer-'));
+    const file = path.join(directory, fileName);
+    try {
+      fs.writeFileSync(file, content, { mode: 0o600 });
+      const stored = commands.artifact([cardId, file, '-m', note], { quiet: true });
+      if (!stored?.[0]?.destination) throw new Error('portable transfer artifact was not stored');
+      return stored[0].destination;
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+  let result;
+  try {
+    result = await runner.run({ sourceSessionId, accountId: o.account, contextFile: o.context, cwd: o.cwd,
+      prepareOnly: Boolean(o['prepare-only']), resolveSessionId: o['resolve-session'] }, {
+      root: ROOT, env: process.env, accounts: deps.accounts || require('./accounts'),
+      sourceFor: deps.sourceFor, taskForSession: deps.taskForSession || taskForSession,
+      nextStep: deps.nextStep || nextStep, taskFile: deps.taskFile || ((task) => taskPath(task.id)), storePackage,
+      gitSnapshot: deps.gitSnapshot,
+      validateResolution: deps.validateResolution,
+      open: deps.open || ((payload) => postOpen(payload, deps.postKeepApi)),
+    });
+  } catch (error) { die(error.message); }
+  if (result.status === 'prepared') {
+    console.log(`portable transfer ${result.requestKey.slice(0, 16)} prepared at ${result.artifactFile}`);
+    return result;
+  }
+  console.log(`portable transfer ${result.requestKey.slice(0, 16)}: ${result.sourceSessionId} -> ${result.destinationSessionId} (${result.targetAccountId})`);
+  console.log(`context package: ${result.artifactFile}`);
+  return result;
 };
 
 function restoreAge(lastSeenAlive, now) {
@@ -6327,6 +6366,9 @@ ${stepUsage()}
   keep accounts default claude|codex <id>
   keep accounts setup <id> --share-from <source-id>
   keep handoff <session-id> --pane <pane-id> --account <target-id>
+  keep transfer <source-session-id> --account <target-id> --context <handoff.md> [--cwd <worktree>] [--prepare-only]
+                         # starts a fresh conversation from a prose-only portable package; source session remains intact
+                         # ambiguous launches require --resolve-session <destination-id>, never a blind second launch
   keep force-restart <session-id> --pane <pane-id> [--recover]    # explicit interruption; never automatic cleanup
   keep review-queue [--limit n] [--min-score n] [--json]   # what deserves review now
   keep review-bundle <id> [--budget n] [--session id] [--force]
@@ -6405,7 +6447,7 @@ module.exports = {
   codexJobText, renderCodexJobs,
   commandUsage, helpText, formatOpenResult, openCommand: commands.open, postOpen, OPEN_MESSAGE_LIMIT, OPEN_MESSAGE_ERROR, LAUNCH_MODEL_RE,
   restoreCommandCli: commands.restore, resumeCommandCli: commands.resume, resumeCommand,
-  accountsCommandCli: commands.accounts, handoffCommandCli: commands.handoff,
+  accountsCommandCli: commands.accounts, handoffCommandCli: commands.handoff, transferCommandCli: commands.transfer,
   hostCommandCli: commands.host, paneCommandCli: commands.pane, attachCommandCli: commands.attach,
   resolveHostPane, renderHostPanes, parseHostSpawn,
 };

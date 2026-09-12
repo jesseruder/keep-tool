@@ -3392,6 +3392,27 @@ test('open uses host panes for both existing sessions and new Claude and Codex l
   }), (error) => error.status === 504 && /never registered its session id/.test(error.message));
 });
 
+test('fresh card open launches in an explicit cwd only when it belongs to the card project', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-cwd-'));
+  try {
+    const project = path.join(root, 'project'), cwd = path.join(project, 'worktree-subdir'), unrelated = path.join(root, 'unrelated');
+    fs.mkdirSync(cwd, { recursive: true }); fs.mkdirSync(unrelated);
+    const host = recordingHost((type) => type === 'spawn' ? { pane: { id: 'pane-cwd' } } : {});
+    const result = await openSession({ taskId: 'card', fresh: true, agent: 'codex', cwd }, {
+      host, loadTask: () => ({ fm: { project, sessions: [] } }), waitForHostAgent: async () => true,
+      waitForHostSessionId: async () => 'codex-cwd-session', linkLaunchedSession: () => true,
+    });
+    assert.equal(result.sessionId, 'codex-cwd-session');
+    assert.equal(host.calls.find((call) => call.type === 'spawn').params.cwd, fs.realpathSync(cwd));
+    await assert.rejects(openSession({ taskId: 'card', agent: 'codex', cwd }, {
+      loadTask: () => ({ fm: { project, sessions: [] } }),
+    }), (error) => error.status === 400 && /fresh card/.test(error.message));
+    await assert.rejects(openSession({ taskId: 'card', fresh: true, agent: 'codex', cwd: unrelated }, {
+      loadTask: () => ({ fm: { project, sessions: [] } }),
+    }), (error) => error.status === 409 && /not part of the card project/.test(error.message));
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('explicit account launches stay pinned when the session is resumed', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-account-'));
   const config = path.join(root, 'config.json');

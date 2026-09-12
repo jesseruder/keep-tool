@@ -3608,6 +3608,12 @@ async function openSession(body, deps = {}) {
   body = body && typeof body === 'object' ? body : {};
   if (body.agent != null && !['claude', 'codex'].includes(body.agent)) throw new InjectionError(400, 'agent must be claude or codex');
   if (body.command != null) throw new InjectionError(400, 'command is not accepted');
+  if (body.cwd != null && (typeof body.cwd !== 'string' || !body.cwd || /[\r\n\0]/.test(body.cwd))) {
+    throw new InjectionError(400, 'cwd must be a directory path');
+  }
+  if (body.cwd != null && (!body.taskId || body.fresh !== true)) {
+    throw new InjectionError(400, 'cwd is accepted only for a fresh card session');
+  }
   if (body.model != null && (typeof body.model !== 'string' || !keep.LAUNCH_MODEL_RE.test(body.model))) {
     throw new InjectionError(400, 'model must be a model id like claude-fable-5-1 or gpt-5.6-sol');
   }
@@ -3663,6 +3669,17 @@ async function openSession(body, deps = {}) {
   project = path.resolve(project.replace(/^~(?=\/|$)/, os.homedir()));
   try { if (!fs.statSync(project).isDirectory()) throw new Error(); }
   catch { throw new InjectionError(400, 'project directory does not exist'); }
+  if (body.cwd != null) {
+    let launchCwd = path.resolve(body.cwd.replace(/^~(?=\/|$)/, os.homedir()));
+    try {
+      launchCwd = fs.realpathSync(launchCwd);
+      if (!fs.statSync(launchCwd).isDirectory()) throw new Error();
+    } catch { throw new InjectionError(400, 'cwd directory does not exist'); }
+    if (!keep.projectMatchesCwd(project, launchCwd)) {
+      throw new InjectionError(409, 'cwd is not part of the card project');
+    }
+    project = launchCwd;
+  }
   if (body.fresh) session = null;
 
   const agent = (session && (session.kind || session.agent)) || body.agent || 'claude';
