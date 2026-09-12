@@ -67,6 +67,11 @@ keep brief
 keep resume
 ```
 
+When a different session takes over an existing card, it runs `keep claim <card>`
+from the card's project first. Routine check-ins and edits record who contributed
+without moving any linked session; creating a card and explicit open handoffs still
+assign the card automatically.
+
 For longer-running work, the important part is recording what should happen next.
 A deployment check can have a scheduled recipe; a frontend task can wait on an API
 task; an experiment can retain its identifier and the criteria for evaluating it.

@@ -45,6 +45,7 @@ test('parseDependency and help expose step-qualified wait-on syntax', () => {
     });
     assert.equal(help.status, 0, help.stderr);
     assert.match(help.stdout, /keep wait-on <card> <upstream>\[#<step>\]/);
+    assert.match(help.stdout, /keep claim <card>/);
     assert.match(help.stdout, /--handoff waiting\|needs-input/);
     assert.match(help.stdout, /--check "recipe"/);
     assert.match(help.stdout, /keep hook session-start\|session-end\|stop\|notification\|lifecycle/);
@@ -193,7 +194,7 @@ test('project matching and project inference canonicalize linked worktree cwd', 
   }
 });
 
-test('checkin links the current session from a linked worktree of the card project', () => {
+test('checkin preserves an unowned card and claim links from a project worktree', () => {
   const f = linkedWorktreeFixture();
   const keepRoot = path.join(f.root, 'registry');
   const configFile = path.join(f.root, 'wt-config.json');
@@ -225,7 +226,25 @@ test('checkin links the current session from a linked worktree of the card proje
 
     assert.equal(result.status, 0, result.stderr);
     assert.doesNotMatch(result.stderr, /was not linked because the current directory is outside the card project/);
-    const task = parseTask(fs.readFileSync(file, 'utf8'), 'worktree-checkin');
+    let task = parseTask(fs.readFileSync(file, 'utf8'), 'worktree-checkin');
+    assert.deepEqual(task.fm.sessions || [], []);
+    assert.match(task.body, new RegExp(`check-in \\(by codex ${sessionId}\\)`));
+
+    const outside = spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'claim', 'worktree-checkin'], {
+      cwd: keepRoot,
+      encoding: 'utf8',
+      env: { ...process.env, KEEP_DIR: keepRoot, KEEP_ALLOW_PUSH: '0', WT_CONFIG: configFile, CODEX_THREAD_ID: sessionId },
+    });
+    assert.notEqual(outside.status, 0);
+    assert.match(outside.stderr, /cannot claim worktree-checkin outside its project/);
+
+    const claimed = spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'claim', 'worktree-checkin'], {
+      cwd: f.worktree,
+      encoding: 'utf8',
+      env: { ...process.env, KEEP_DIR: keepRoot, KEEP_ALLOW_PUSH: '0', WT_CONFIG: configFile, CODEX_THREAD_ID: sessionId },
+    });
+    assert.equal(claimed.status, 0, claimed.stderr);
+    task = parseTask(fs.readFileSync(file, 'utf8'), 'worktree-checkin');
     assert.deepEqual(task.fm.sessions.map((session) => [session.id, session.agent]), [[sessionId, 'codex']]);
   } finally {
     fs.rmSync(f.root, { recursive: true, force: true });
@@ -395,6 +414,93 @@ test('CLI mutations persist a single session owner across cards', () => {
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('ordinary contributions preserve every owner and only an owner check-in satisfies Stop progress', () => {
+  const f = schedulerFixture();
+  const parse = (id) => require('./keep.js').parseTask(f.read(id), id);
+  const envA = { CLAUDE_CODE_SESSION_ID: 'session-a' };
+  const envB = { CODEX_THREAD_ID: 'session-b' };
+  try {
+    assert.equal(f.run(['add', 'Card A', '--status', 'active'], envA).status, 0);
+    assert.equal(f.run(['add', 'Card B', '--status', 'active'], envB).status, 0);
+    assert.equal(f.run(['link', 'card-b', '--session', 'session-d', '--agent', 'claude']).status, 0);
+    const beforeA = parse('card-a').fm.sessions;
+    const beforeB = parse('card-b').fm.sessions;
+    const markerA = path.join(f.root, '.keep', 'checkins', 'session-a');
+    fs.rmSync(markerA, { force: true });
+
+    const foreign = f.run(['checkin', 'card-b', '-m', 'A contributed without taking over.'], envA);
+    assert.equal(foreign.status, 0, foreign.stderr);
+    const unlinked = f.run(['checkin', 'card-b', '-m', 'C contributed without any card.'], {
+      CODEX_THREAD_ID: 'session-c',
+    });
+    assert.equal(unlinked.status, 0, unlinked.stderr);
+    assert.deepEqual(parse('card-a').fm.sessions, beforeA);
+    assert.deepEqual(parse('card-b').fm.sessions, beforeB);
+    assert.equal(fs.existsSync(markerA), false, 'a foreign contribution does not satisfy the owner card marker');
+    assert.equal(fs.existsSync(path.join(f.root, '.keep', 'checkins', 'session-c')), false);
+    assert.match(f.read('card-b'), /check-in \(by claude session-a\)/);
+    assert.match(f.read('card-b'), /check-in \(by codex session-c\)/);
+
+    const own = f.run(['checkin', 'card-a', '-m', 'A progressed its own card.'], envA);
+    assert.equal(own.status, 0, own.stderr);
+    assert.equal(fs.existsSync(markerA), true);
+    const beforeOwnB = parse('card-b').fm.sessions;
+    const ownB = f.run(['checkin', 'card-b', '-m', 'B progressed its own card.'], envB);
+    assert.equal(ownB.status, 0, ownB.stderr);
+    assert.deepEqual(parse('card-b').fm.sessions, beforeOwnB, 'owner order and timestamps are unchanged');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('retitle, plan, allow, checkin, and done preserve ownership while attributing logs', () => {
+  const f = schedulerFixture();
+  const parse = () => require('./keep.js').parseTask(f.read('routine-card'), 'routine-card');
+  const owner = { CLAUDE_CODE_SESSION_ID: 'routine-owner' };
+  const writer = { CODEX_THREAD_ID: 'routine-writer' };
+  try {
+    assert.equal(f.run(['add', 'Routine card', '--status', 'active'], owner).status, 0);
+    assert.equal(f.run(['link', 'routine-card', '--session', 'second-owner', '--agent', 'claude']).status, 0);
+    const sessions = parse().fm.sessions;
+    for (const args of [
+      ['retitle', 'routine-card', 'Retitled card'],
+      ['plan', 'routine-card', '--set', 'First step'],
+      ['plan', 'routine-card', '--start', '1'],
+      ['allow', 'routine-card', '--grant', 'push'],
+      ['checkin', 'routine-card', '-m', 'Routine contribution.'],
+      ['done', 'routine-card', '-m', 'Routine closure.'],
+    ]) {
+      const result = f.run(args, writer);
+      assert.equal(result.status, 0, `${args.join(' ')}: ${result.stderr}`);
+      assert.deepEqual(parse().fm.sessions, sessions, args.join(' '));
+    }
+    const text = f.read('routine-card');
+    for (const heading of ['retitled', 'plan', 'allow', 'check-in', 'done']) {
+      assert.match(text, new RegExp(`${heading} \\(by codex routine-writer\\)`), heading);
+    }
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('claim moves the current session from an archived owner and retains target owners', () => {
+  const f = schedulerFixture();
+  const claimer = { CLAUDE_CODE_SESSION_ID: 'claiming-session' };
+  try {
+    assert.equal(f.run(['add', 'Archived source', '--status', 'active'], claimer).status, 0);
+    assert.equal(f.run(['done', 'archived-source'], claimer).status, 0);
+    assert.equal(f.run(['archive', 'archived-source'], claimer).status, 0);
+    assert.equal(f.run(['add', 'Claim target', '--status', 'active'], { CODEX_THREAD_ID: 'target-owner' }).status, 0);
+
+    const claimed = f.run(['claim', 'claim-target'], claimer);
+    assert.equal(claimed.status, 0, claimed.stderr);
+    assert.match(claimed.stdout, /claimed by current claude session claiming-session/);
+    assert.doesNotMatch(fs.readFileSync(path.join(f.root, 'archive', 'archived-source.md'), 'utf8'), /id: claiming-session/);
+    const target = require('./keep.js').parseTask(f.read('claim-target'), 'claim-target');
+    assert.deepEqual(target.fm.sessions.map((entry) => entry.id), ['target-owner', 'claiming-session']);
+
+    const reviewer = f.run(['claim', 'claim-target'], { CLAUDE_CODE_SESSION_ID: 'reviewer', KEEP_REVIEWER: '1' });
+    assert.notEqual(reviewer.status, 0);
+    assert.match(reviewer.stderr, /reviewer cannot claim/);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
 test('releaseCardSession and linkLaunchedSession hand a card to the launched session', () => {
@@ -915,18 +1021,21 @@ test('both agents can explicitly hand off for input without a recipe edit implyi
   }
 });
 
-test('a later check-in elsewhere moves the resume link but not the scheduler stamp', () => {
+test('a scheduling contributor is recorded without moving either card owner', () => {
   const f = schedulerFixture();
-  const env = { CLAUDE_CODE_SESSION_ID: 'sched-sid' };
   try {
-    assert.equal(f.run(['add', 'Sched one', '--check-after', '+1h', '--check', 'run the probe'], env).status, 0);
-    assert.equal(f.run(['add', 'Other card'], env).status, 0);
-    const moved = f.run(['checkin', 'other-card', '-m', 'Working here now.'], env);
-    assert.equal(moved.status, 0, moved.stderr);
+    assert.equal(f.run(['add', 'Sched one'], { CLAUDE_CODE_SESSION_ID: 'sched-sid' }).status, 0);
+    assert.equal(f.run(['add', 'Other card'], { CODEX_THREAD_ID: 'other-owner' }).status, 0);
+    const scheduled = f.run(['checkin', 'other-card', '-m', 'Schedule this from A.', '--check-after', '+1h', '--check', 'run the probe'], {
+      CLAUDE_CODE_SESSION_ID: 'sched-sid',
+    });
+    assert.equal(scheduled.status, 0, scheduled.stderr);
     const first = f.read('sched-one');
-    assert.doesNotMatch(first, /id: sched-sid/, 'the resume link follows the session to its newest card');
-    assert.match(first, /^scheduled_by: sched-sid$/m, 'the scheduler stamp stays with the scheduled check');
-    assert.match(f.read('other-card'), /id: sched-sid/);
+    assert.match(first, /id: sched-sid/, 'the contributor keeps its original resume link');
+    const other = f.read('other-card');
+    assert.match(other, /id: other-owner/);
+    assert.doesNotMatch(other, /id: sched-sid/);
+    assert.match(other, /^scheduled_by: sched-sid$/m, 'the schedule routes to its writer independently');
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 

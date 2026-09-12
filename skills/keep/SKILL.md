@@ -13,8 +13,9 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
 ## When to act
 
 - **Starting substantive work** (a feature, debugging effort, or other multi-turn task):
-  run `keep list --project <cwd>`, then check in to a matching task or create one with
-  `keep add "title" --status active`. Skip trivial one-shot requests.
+  run `keep list --project <cwd>`, then claim matching existing work with
+  `keep claim <id>` before checking in, or create it with `keep add "title" --status
+  active`. Creating a card claims it automatically. Skip trivial one-shot requests.
 - **Launching an experiment** (A/B test, canary, or anything needing a later check):
   always register it with `keep add "title" --kind experiment --check-after <when>
   --check "<recipe>" --status waiting`. Pass `--experiment-id <id>` when one exists.
@@ -63,6 +64,9 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   session link or changing its status, schedule, tags, or dependencies. Worktree
   paths resolve to their main checkout. Use this instead of `keep checkin --project`.
 - **Status changes or notable progress**: use `keep checkin <id> -m "..." [--status s]`.
+  A check-in records the contributing session in its log and preserves every existing
+  resume link. It does not claim the card; run `keep claim <id>` first when taking over
+  existing work.
 - **Waiting on another card**: record the fact your next step needs with a required
   reason: `keep wait-on <your-card> <upstream> --commit <sha>[,<sha>] -m "why"`
   waits for every SHA on the upstream project's origin default branch (verified by
@@ -268,9 +272,11 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   approval behavior. Older configurations that omit these variables retain the
   legacy permission-bypass defaults; set them explicitly for your intended policy.
   A fresh launch on a card is a handoff: the new session becomes the card's linked session and the session that ran `keep open` is unlinked from that card, so create the card and open it from the same session without worrying about owning it afterwards.
-- The CLI links Claude and Codex session IDs on add/check-in so `keep resume` emits the
-  correct agent-specific resume command. A session belongs to exactly one card;
-  checking in to another card transfers its resume link to that card.
+- The CLI links Claude and Codex session IDs on `add`, explicit `claim`/`link`, and
+  `open` handoffs so `keep resume` emits the correct agent-specific resume command.
+  A session belongs to exactly one card. Routine check-ins, plan edits, retitles, and
+  closures preserve all resume links while attributing their log entries to the
+  contributing session.
 - The parent session owns the Keep check-in for work delegated to subagents. A
   subagent's completion never closes or updates the card by itself.
 - Session completion notices are ephemeral unread-turn signals. Deliberately ending

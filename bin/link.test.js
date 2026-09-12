@@ -137,9 +137,8 @@ test('link transfers the explicit session without using caller identity or chang
     f.commit();
     const wait = f.run(['wait-on', 'detach', 'npm-setup#4', '-m', 'need publishing setup'], { CODEX_THREAD_ID: sid });
     assert.equal(wait.status, 0, wait.stderr);
-    assert.match(wait.stderr, /check-in recorded, but session .* was not linked because the current directory is outside the card project/);
-    assert.equal(wait.stderr.split('was not linked').length, 2, 'wait-on warns exactly once');
-    assert.match(wait.stderr, new RegExp(`keep link detach --session ${sid} --agent codex`));
+    assert.equal(wait.stderr, '');
+    assert.match(f.load('detach').body, new RegExp(`check-in \\(by codex ${sid}\\)`));
     assert.equal(f.loadArchived('credits').fm.sessions[0].id, sid, 'cross-project wait-on must not steal ownership');
     assert.equal(f.load('stale-active').fm.sessions[0].id, sid);
     const before = f.load('detach');
@@ -199,7 +198,7 @@ test('link transfers the explicit session without using caller identity or chang
   } finally { f.cleanup(); }
 });
 
-test('checkin and add warn when their session link is outside the card project', () => {
+test('a cross-project contribution stays unowned while add warns about a skipped auto-claim', () => {
   const f = fixture();
   const sid = 'outside-project-session';
   try {
@@ -209,9 +208,9 @@ test('checkin and add warn when their session link is outside the card project',
     const checked = f.run(['checkin', 'outside-card', '-m', 'Recorded without taking ownership.'], { CODEX_THREAD_ID: sid });
     assert.equal(checked.status, 0, checked.stderr);
     assert.match(f.load('outside-card').body, /Recorded without taking ownership\./);
+    assert.match(f.load('outside-card').body, new RegExp(`check-in \\(by codex ${sid}\\)`));
     assert.deepEqual(f.load('outside-card').fm.sessions || [], []);
-    assert.equal(checked.stderr,
-      `keep: check-in recorded, but session ${sid} was not linked because the current directory is outside the card project (/different/project); run keep from the project or repair explicitly with keep link outside-card --session ${sid} --agent codex\n`);
+    assert.equal(checked.stderr, '');
 
     const added = f.run(['add', 'Outside created', '--project', '/different/project'], { CODEX_THREAD_ID: sid });
     assert.equal(added.status, 0, added.stderr);
@@ -225,6 +224,8 @@ test('checkin and add warn when their session link is outside the card project',
     });
     assert.equal(internal.status, 0, internal.stderr);
     assert.equal(internal.stderr, '');
+    assert.match(f.load('outside-card').body, /— check-in\nInternal update\./,
+      'linkSession:false suppresses contributor attribution as well as ownership');
   } finally { f.cleanup(); }
 });
 

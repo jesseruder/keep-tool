@@ -45,6 +45,7 @@ keep plan <id> [--set "step"… | --add "text" | --insert <n> "text" | --remove 
 keep list [--status s]… [--tag t] [--project p] [--overdue] [--brief] [--all]
 keep show <id>
 keep artifact <card> [--] [<file>...] [-m "note"]
+keep claim <card>
 keep link <card> --session <sid> --agent claude|codex
 keep wait-on <card> <upstream>[#<step>] [<upstream>...] -m "why"
 keep deps [<card>]
@@ -94,6 +95,11 @@ keep review-tick [--force]                               # wake the reviewer (ne
 keep review-stats [--json]                               # last tick, skips, per-day counts
 keep nudge <id> --session <sid> --key <k> -m "..." [--send]  # message a live agent (dry-run default)
 ```
+
+`keep claim <card>` assigns the current Claude or Codex session to an existing card.
+Run it from the card's project when starting or resuming that work. Routine card
+mutations preserve all existing session links and attribute their log entries to the
+contributing session; they do not claim unowned work or move a session from its card.
 
 `keep link` repairs a session's ownership metadata when work was recorded from a
 different project directory. It transfers that explicit session from its old card to
@@ -693,7 +699,7 @@ body, and renders it inside a token budget.
 Two invariants the code enforces:
 
 - **A reviewer entry never claims a card's resume link.** `checkinTask` takes
-  `linkSession: false`, and `recordSession` returns early for a reviewer session
+  `linkSession: false`, and contribution/claim recording returns early for a reviewer session
   (`KEEP_REVIEWER=1`, or a `.keep/reviewer/<id>` marker the daemon can also see).
   This holds for a reviewer `keep done` or `--status` change too.
 - **Reading never advances committed offsets.** `review-bundle` stages pending

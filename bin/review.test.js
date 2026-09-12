@@ -1062,11 +1062,9 @@ test('review-idea accepts more than three distinct ideas in one day', () => {
 
 // ---------- the session-steal regression ----------
 
-// checkinTask -> recordSession -> claimSession hands the card's resume slot to
-// whoever checked in. The cwd gate in recordSession does not protect cards with no
-// `project` (4 live cards here) or cards whose project IS the reviewer's cwd
-// (4 more). A reviewer note must never move that link.
-test('a reviewer note never claims the resume link, while a normal check-in still does', () => {
+// Contributions and reviewer notes preserve resume ownership. Only an explicit
+// claim moves the current session to another card.
+test('reviewer and ordinary notes preserve the resume link until an explicit claim', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-steal-'));
   const cli = path.join(__dirname, 'keep.js');
   const env = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', CLAUDE_CODE_SESSION_ID: 'live-worker-session' };
@@ -1083,13 +1081,13 @@ test('a reviewer note never claims the resume link, while a normal check-in stil
 
     assert.equal(run(['add', 'Alpha owner', '--status', 'active', '-m', 'Owned.']).status, 0);
     assert.equal(run(['add', 'Beta card', '--status', 'active', '-m', 'Unowned.']).status, 0);
-    // reproduce the unprotected shape: no `project`, so recordSession's cwd gate
-    // never engages
+    // Preserve the historically unprotected shape: neither card has a project.
     for (const id of ['alpha-owner', 'beta-card']) {
       const file = path.join(root, 'tasks', `${id}.md`);
       fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace(/^project:.*\n/m, ''));
     }
-    // `keep add` gave the link to the newest card; put it back on alpha
+    // `keep add` gave the link to the newest card; explicitly put it back on alpha.
+    assert.equal(run(['claim', 'alpha-owner']).status, 0);
     assert.equal(run(['checkin', 'alpha-owner', '-m', 'Still mine.']).status, 0);
     assert.match(read('alpha-owner'), /id: live-worker-session/);
 
@@ -1100,8 +1098,13 @@ test('a reviewer note never claims the resume link, while a normal check-in stil
     assert.match(read('beta-card'), /— review \(fable\)/, 'the entry is attributed to the reviewer');
     assert.doesNotMatch(read('beta-card'), /status: review\b/, 'a finding never changes status');
 
-    // the single-owner invariant must still work for ordinary callers
-    assert.equal(run(['checkin', 'beta-card', '-m', 'Taking this over.']).status, 0);
+    // An ordinary contribution still leaves alpha owned.
+    assert.equal(run(['checkin', 'beta-card', '-m', 'Helping without taking over.']).status, 0);
+    assert.match(read('alpha-owner'), /id: live-worker-session/);
+    assert.doesNotMatch(read('beta-card'), /id: live-worker-session/);
+
+    // The explicit claim retains the one-card-per-session invariant.
+    assert.equal(run(['claim', 'beta-card']).status, 0);
     assert.match(read('beta-card'), /id: live-worker-session/);
     assert.doesNotMatch(read('alpha-owner'), /id: live-worker-session/);
 

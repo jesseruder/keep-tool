@@ -399,11 +399,15 @@ function linkLaunchedSession(taskId, session) {
   });
 }
 
-function linkSession(taskId, session) {
+function linkSession(taskId, session, options = {}) {
   return withLock(() => {
     const all = loadAll(true);
-    const task = all.find((entry) => entry.id === taskId && fs.existsSync(taskPath(entry.id)));
+    const task = all.find((entry) => entry.id === taskId
+      && (!options.activeOnly || fs.existsSync(taskPath(entry.id))));
     if (!task) return null;
+    if (options.requireProject && !sessionInTaskProject(task)) {
+      return { linked: false, skipped: 'outside-project', project: task.fm.project || '' };
+    }
     cardUsage.recordOwner(ROOT, session, task.id);
     const previousOwners = claimSession(task, session, all);
     for (const previous of previousOwners) {
@@ -412,7 +416,7 @@ function linkSession(taskId, session) {
     }
     fs.writeFileSync(taskPath(task.id), serializeTask(task));
     // Explicit metadata repair is always local, including from a manual shell.
-    commitAndPush(`keep: link ${task.id}`, ['tasks', 'archive'], { push: false });
+    commitAndPush(`keep: ${options.commitLabel || 'link'} ${task.id}`, ['tasks', 'archive'], { push: false });
     return { linked: session.id, agent: session.agent };
   });
 }
@@ -430,7 +434,7 @@ function isReviewerSession() {
 // The reviewer used to be refused every status change (exit 4, "use a wrong-status
 // finding"). Owner dropped that design on 2026-09-11: the reviewer may make ordinary
 // card changes like any other session, as long as the entry says it was the reviewer
-// and the card's resume link still never moves to it (see recordSession).
+// and the card's resume link still never moves to it.
 // Its name, for log attribution — mirrors review.js's reviewerName(), which cannot be
 // required here without a cycle at load time.
 function reviewerLabel() {
@@ -447,13 +451,17 @@ function reviewerLabel() {
 
 // `review (fable)` headings already mark the reviewer's notes; an ordinary entry it
 // writes gets the same treatment so the owning session and Owner can tell at a glance.
-function attributeHeading(heading) {
+function attributeHeading(heading, author = null) {
   const text = String(heading || '');
-  if (!isReviewerSession() || /^review\b/.test(text) || text.includes('(reviewer ')) return text;
+  if (!isReviewerSession() && (!author || !author.id || !author.agent)) return text;
+  if (/^review\b/.test(text) || text.includes('(reviewer ') || text.includes('(by ')) return text;
   // Headings carry the new status as ` → done`; the attribution belongs to the verb,
   // so `check-in → done` reads `check-in (reviewer fable) → done`.
   const split = /^([^→]*?)(\s*→[\s\S]*)?$/.exec(text);
-  return `${split[1]} (reviewer ${reviewerLabel()})${split[2] || ''}`;
+  const label = isReviewerSession()
+    ? `reviewer ${reviewerLabel()}`
+    : `by ${author.agent} ${author.id}`;
+  return `${split[1]} (${label})${split[2] || ''}`;
 }
 
 // The review ledger counts reviewer actions (acks/notes/ideas/dismisses/nudges) for
@@ -463,8 +471,7 @@ function countReviewerStatusChange(taskId, status) {
   try { require('./review.js').recordReviewerStatusChange(taskId, status); } catch {}
 }
 
-// Curation from another directory must not claim a card, so both the resume link
-// and the scheduler stamp only stick when this session is working in the project.
+// A claim or schedule only belongs to a session working in the card's project.
 // Linked worktrees of the project count as inside it, and both sides are compared
 // by realpath so a symlinked project path still matches.
 function sessionInTaskProject(task) {
@@ -472,10 +479,9 @@ function sessionInTaskProject(task) {
   return projectMatchesCwd(task.fm.project, process.cwd());
 }
 
-// `sessions` is the card's resume link and follows the session to its newest card;
-// a scheduled check has to reach the session that asked for it however many cards
-// that session touched afterwards, so record the scheduler separately. Nothing but
-// a new schedule (or --clear-check-after) moves it.
+// `sessions` is the card's resume ownership. A scheduled check has to reach the
+// session that asked for it even when that session owns another card, so record the
+// scheduler separately. Nothing but a new schedule (or --clear-check-after) moves it.
 function recordScheduler(task, intent = 'waiting') {
   if (isReviewerSession()) return;
   const session = currentSession();
@@ -496,21 +502,41 @@ function clearScheduler(task) {
   for (const field of ['scheduled_by', 'scheduled_at', 'scheduled_for', 'scheduled_intent']) delete task.fm[field];
 }
 
+function recordProgressMarker(task, session) {
+  if (!session || !(task.fm.sessions || []).some((entry) => entry.id === session.id)) return false;
+  try {
+    const dir = path.join(META, 'checkins');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, session.id), nowStamp());
+    return true;
+  } catch { return false; }
+}
+
+// Ordinary mutations are contributions, not ownership transfers. They retain every
+// resume link already on the card and only satisfy the Stop check when the writer is
+// already one of those owners. The returned identity is carried into the log heading
+// so a contribution remains attributable independently of ownership.
+function recordContribution(task) {
+  if (isReviewerSession()) return { linked: false, skipped: 'reviewer', session: null };
+  const session = currentSession();
+  const sid = session && session.id;
+  if (!sid || !/^[A-Za-z0-9_-]+$/.test(sid)) {
+    return { linked: false, skipped: 'no-session', session: null };
+  }
+  const linked = recordProgressMarker(task, session);
+  return { linked, skipped: linked ? null : 'not-owner', session };
+}
+
 function recordSession(task) {
-  // Guards addTask, checkinTask, retitle and done in one place — the reviewer may
-  // legitimately file a follow-up card, and must not claim that one either.
+  // Creating a card claims it for the creating session. Existing-card mutations use
+  // recordContribution instead; only add, claim/link, and open handoffs move links.
+  // The reviewer may legitimately file a follow-up card, but must not claim it.
   if (isReviewerSession()) return { linked: false, skipped: 'reviewer', session: null };
   const session = currentSession();
   const sid = session && session.id;
   if (!sid || !/^[A-Za-z0-9_-]+$/.test(sid)) {
     return { linked: false, skipped: 'no-session', session };
   }
-  // marker for the Stop hook: this session has touched the keep
-  try {
-    const dir = path.join(META, 'checkins');
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, sid), nowStamp());
-  } catch {}
   if (!sessionInTaskProject(task)) {
     return { linked: false, skipped: 'outside-project', session };
   }
@@ -524,6 +550,7 @@ function recordSession(task) {
     // card, so preserve its `updated` timestamp and board position.
     fs.writeFileSync(taskPath(previous.id), serializeTask(previous));
   }
+  recordProgressMarker(task, session);
   return { linked: true, skipped: null, session };
 }
 
@@ -640,8 +667,8 @@ function demoteHeadings(message) {
   return String(message).replace(/^#{1,2}(?=\s)/gm, '###');
 }
 
-function appendLog(task, heading, message) {
-  const entry = `## ${nowStamp().replace('T', ' ')} — ${attributeHeading(heading)}\n${demoteHeadings(message.trim())}\n`;
+function appendLog(task, heading, message, author = null) {
+  const entry = `## ${nowStamp().replace('T', ' ')} — ${attributeHeading(heading, author)}\n${demoteHeadings(message.trim())}\n`;
   const parsed = parsePlan(task.body);
   const rest = parsed.rest ? `${entry}\n${parsed.rest.replace(/^\n+/, '')}` : entry;
   const plan = parsed.steps.length ? renderPlan(parsed.steps) : parsed.present ? parsed.raw : '';
@@ -1499,7 +1526,7 @@ commands.plan = (argv) => {
       if (value.trim() === '') delete steps[position - 1].doneWhen;
       else steps[position - 1].doneWhen = cleanDoneWhen(value);
       setPlan(task, steps);
-      recordSession(task);
+      recordContribution(task);
       saveTask(task);
       commitAndPush(`keep: plan ${id}`);
       printPlan(task);
@@ -1562,9 +1589,10 @@ commands.plan = (argv) => {
     }
 
     setPlan(task, steps);
-    recordSession(task);
+    const contribution = recordContribution(task);
     if (changedStep && (operation === 'done' || operation === 'start')) {
-      appendLog(task, 'plan', `plan → step ${changedStep.n} ${operation === 'done' ? 'done' : 'started'}: ${changedStep.text}`);
+      appendLog(task, 'plan', `plan → step ${changedStep.n} ${operation === 'done' ? 'done' : 'started'}: ${changedStep.text}`,
+        contribution.session);
     }
     saveTask(task);
     commitAndPush(`keep: plan ${id}`);
@@ -1759,15 +1787,15 @@ function checkinTask(id, {
     }
     guardBlocked(task, status, force);
     guardLanding(task, status, commits, force);
-    let sessionResult = null;
+    let contribution = null;
     if (linkSession !== false) {
-      sessionResult = recordSession(task);
+      contribution = recordContribution(task);
       if (!clearCheckAfter && (checkAfter || check || handoff)) recordScheduler(task, handoff || (checkAfter ? 'waiting' : null));
     }
-    appendLog(task, `${heading || 'check-in'}${status ? ` → ${status}` : ''}`, logMessage(message, next, commits));
+    appendLog(task, `${heading || 'check-in'}${status ? ` → ${status}` : ''}`, logMessage(message, next, commits),
+      contribution && contribution.session);
     saveTask(task);
     if (status) countReviewerStatusChange(task.id, status);
-    warnSkippedSessionLink(task, sessionResult, 'check-in recorded');
     if (commit) {
       commitAndPush(`keep: ${commitLabel || 'checkin'} ${id}${status ? ` (${status})` : ''}`, commitLabel === 'review' ? ['tasks', 'reviews'] : undefined);
     }
@@ -1803,8 +1831,8 @@ commands.retitle = (argv) => {
     const task = loadTask(id);
     const oldTitle = task.fm.title;
     task.fm.title = title;
-    recordSession(task);
-    appendLog(task, 'retitled', `Title changed from "${oldTitle}" to "${title}".`);
+    const contribution = recordContribution(task);
+    appendLog(task, 'retitled', `Title changed from "${oldTitle}" to "${title}".`, contribution.session);
     saveTask(task);
     commitAndPush(`keep: retitle ${id}`);
     console.log(fmtTask(task, { brief: true }));
@@ -1852,6 +1880,22 @@ commands.link = (argv) => {
   console.log(`${id} linked to ${o.agent} session ${o.session}`);
 };
 
+commands.claim = (argv) => {
+  if (argv.length !== 1) die('usage: keep claim <card>');
+  if (isReviewerSession()) die('the fleet reviewer cannot claim a card');
+  const session = currentSession();
+  if (!session || !/^[A-Za-z0-9_-]+$/.test(session.id)) {
+    die('keep claim needs a current Claude or Codex session');
+  }
+  const id = argv[0];
+  const linked = linkSession(id, session, { activeOnly: true, requireProject: true, commitLabel: 'claim' });
+  if (!linked) die(`no task "${id}"`);
+  if (linked.skipped === 'outside-project') {
+    die(`cannot claim ${id} outside its project (${linked.project}); run it from the project, or repair metadata explicitly with keep link ${id} --session ${session.id} --agent ${session.agent}`);
+  }
+  console.log(`${id} claimed by current ${session.agent} session ${session.id}`);
+};
+
 commands.done = (argv) => {
   const o = parseArgs(argv, { force: 'bool', next: 'str', commit: 'list' });
   const id = o._[0];
@@ -1864,8 +1908,8 @@ commands.done = (argv) => {
     task.fm.status = 'done';
     task.fm.check_after = '';
     clearScheduler(task);
-    recordSession(task);
-    appendLog(task, 'done', logMessage(message, next, commits));
+    const contribution = recordContribution(task);
+    appendLog(task, 'done', logMessage(message, next, commits), contribution.session);
     saveTask(task);
     countReviewerStatusChange(task.id, 'done');
     commitAndPush(`keep: done ${id}`);
@@ -1975,7 +2019,6 @@ commands['wait-on'] = (argv) => {
         unblock.removeDelivered(dependentId, target, { root: ROOT });
       }
     }
-    // checkinTask already warned if the session link was skipped for this cwd.
     commitAndPush(`keep: wait-on ${dependentId}`);
     console.log(fmtTask(checked));
   });
@@ -2603,10 +2646,10 @@ commands.allow = (argv) => {
     if (o.until) { task.fm.allow_until = parseWhen(o.until); changed.push(`until ${task.fm.allow_until}`); }
     if (o.clear) task.fm.allow_until = '';
     if (!changed.length) die('nothing to change');
-    recordSession(task);
+    const contribution = recordContribution(task);
     // The grant is the authority an unattended agent runs on, so it belongs in
     // the log where the reviewer and the next session can both see who gave it.
-    appendLog(task, 'allow', `${changed.join('; ')} → ${formatAllow(task)}`);
+    appendLog(task, 'allow', `${changed.join('; ')} → ${formatAllow(task)}`, contribution.session);
     saveTask(task);
     commitAndPush(`keep: allow ${id}`);
     console.log(`${id}: ${formatAllow(task)}`);
@@ -4530,6 +4573,7 @@ commands.hook = async (argv) => {
       lines.push(`- ${t.id} (${t.fm.status}): "${clip(t.fm.title)}"${last ? ` — last check-in: ${clip(last)}` : ''}${next ? ` — next: step ${next.n}/${total} ${clip(next.text, 100)}` : ''}`);
     }
     if (here.length > CAP) lines.push(`…and ${here.length - CAP} more (keep list)`);
+    lines.push('Before taking over existing work, run `keep claim <id>`; check-ins record contributions without changing resume ownership.');
   }
   for (const need of cleared) lines.push(`Need cleared: ${need.env} is set in this session, so ${need.task} is ${need.restored || 'unblocked'} again — "${clip(need.text)}".`);
   const needs = openNeeds(here);
@@ -5486,7 +5530,7 @@ function stopHook(input, agent = 'claude') {
     : ' No open Keep card currently matches this project.';
   console.log(JSON.stringify({
     decision: 'block',
-    reason: `This session made substantive changes but never checked into Keep (~/keep work registry).${taskHint}Before finishing: if a listed task covers this work, run \`keep checkin <id> -m "state + next step"\`; otherwise run \`keep add "<title>" --status active -m "<state>"\`. This reminder fires at most once per session per 6h window.`,
+    reason: `This session made substantive changes but never checked into Keep (~/keep work registry).${taskHint}Before finishing: if this session owns a listed task, run \`keep checkin <id> -m "state + next step"\`; if it took over an existing task, run \`keep claim <id>\` before that check-in. Otherwise run \`keep add "<title>" --status active -m "<state>"\`. This reminder fires at most once per session per 6h window.`,
   }));
   return true;
 }
@@ -6324,6 +6368,7 @@ function helpText() {
   keep allow <id> --grant a,b [--until when] | --revoke a,b | --clear
   keep retitle <id> "new title"
   keep project <id> [<path|name>] [-m "reason"]   # show or change project; preserves session links and schedule
+  keep claim <card>                                # claim for the current session; run from the card's project
   keep link <card> --session <sid> --agent claude|codex   # repair ownership metadata without waking or launching
   keep list [--status s]… [--tag t] [--project p] [--overdue] [--brief] [--all]
   keep show <id>
