@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { WebSocketServer } = require('ws');
+const { dashboardDetail, lightweightState } = require('../../bin/dashboard-state');
 
 async function createFixture() {
   const root = path.resolve(__dirname, '../..');
@@ -16,6 +17,8 @@ async function createFixture() {
   let handoffRecoversOnce = false;
   let openDelay = 0, openFailsAfterSpawn = false, reopenFails = false, reviewFailsOnce = false, reviewPartialOnce = false, launchSequence = 0;
   const openRequests = new Map();
+  const detailFailures = new Map();
+  const detailDelays = new Map();
   const sessions = Array.from({ length: 12 }, (_, i) => {
     const id = String.fromCharCode(97 + i);
     return { id, kind: i % 2 ? 'codex' : 'claude', title: `Session ${id.toUpperCase()}`, project: repo,
@@ -91,11 +94,29 @@ async function createFixture() {
         json({ ok: true, revision }); return;
       }
       if (url.pathname.startsWith('/api/')) {
-        record('request', { method: req.method, path: url.pathname, body: input });
+        record('request', { method: req.method, path: url.pathname, query: Object.fromEntries(url.searchParams), body: input });
         // The daemon guards its writes and its detail reads with the header that forces a
         // CORS preflight. The fixture holds every route to that rule so a client that stops
         // sending it fails here instead of 403ing the dashboard against the real server.
         if (req.headers['x-keep'] !== '1') { json({ error: 'missing x-keep header' }, 403); return; }
+        if (url.pathname === '/api/dashboard-detail') {
+          const kind = url.searchParams.get('kind');
+          const id = url.searchParams.get('id');
+          const key = `${kind}:${id}`;
+          const failures = detailFailures.get(key) || 0;
+          if (failures > 0) {
+            detailFailures.set(key, failures - 1);
+            json({ error: 'Fixture detail failure' }, 503);
+            return;
+          }
+          const send = () => {
+            try { json(dashboardDetail(state, kind, id)); }
+            catch (error) { json({ error: error.message }, error.status || 500); }
+          };
+          const delay = detailDelays.get(key) || 0;
+          if (delay) setTimeout(send, delay); else send();
+          return;
+        }
         if (url.pathname === '/api/portable-transfers' && req.method === 'GET') { json({ ok: true, transfers: portableTransfers }); return; }
         if (url.pathname === '/api/portable-transfer-draft' && req.method === 'GET') {
           const source = sessions.find(s => s.id === url.searchParams.get('session'));
@@ -115,7 +136,7 @@ async function createFixture() {
           json({ ok: true, transfer, preview: portablePreviews.get(transfer.id) || '',
             ...(portableInputs.has(transfer.id) ? { inputs: portableInputs.get(transfer.id) } : {}) }); return;
         }
-        if (url.pathname === '/api/state') { json(state); return; }
+        if (url.pathname === '/api/state') { json(url.searchParams.get('summary') === '1' ? lightweightState(state) : state); return; }
         if (url.pathname === '/api/panes/spawn' && req.method === 'POST') {
           const id = `shell-${++launchSequence}`;
           const pane = { id, pid: 700 + launchSequence, alive: true, cwd: input.cwd,
@@ -344,7 +365,19 @@ async function createFixture() {
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   return { url: `http://127.0.0.1:${server.address().port}`, events, state, portableTransfers, update, publish, churn,
-    configure: options => { if ('closeDelay' in options) closeDelay = options.closeDelay; if ('closeFails' in options) closeFails = options.closeFails; if ('layoutFails' in options) layoutFails = options.layoutFails; if ('handoffRecoversOnce' in options) handoffRecoversOnce = options.handoffRecoversOnce; if ('openDelay' in options) openDelay = options.openDelay; if ('openFailsAfterSpawn' in options) openFailsAfterSpawn = options.openFailsAfterSpawn; if ('reopenFails' in options) reopenFails = options.reopenFails; if ('reviewFailsOnce' in options) reviewFailsOnce = options.reviewFailsOnce; if ('reviewPartialOnce' in options) reviewPartialOnce = options.reviewPartialOnce; },
+    configure: options => {
+      if ('closeDelay' in options) closeDelay = options.closeDelay;
+      if ('closeFails' in options) closeFails = options.closeFails;
+      if ('layoutFails' in options) layoutFails = options.layoutFails;
+      if ('handoffRecoversOnce' in options) handoffRecoversOnce = options.handoffRecoversOnce;
+      if ('openDelay' in options) openDelay = options.openDelay;
+      if ('openFailsAfterSpawn' in options) openFailsAfterSpawn = options.openFailsAfterSpawn;
+      if ('reopenFails' in options) reopenFails = options.reopenFails;
+      if ('reviewFailsOnce' in options) reviewFailsOnce = options.reviewFailsOnce;
+      if ('reviewPartialOnce' in options) reviewPartialOnce = options.reviewPartialOnce;
+      if (options.failDetail) detailFailures.set(`${options.failDetail.kind}:${options.failDetail.id}`, options.failDetail.count || 1);
+      if (options.delayDetail) detailDelays.set(`${options.delayDetail.kind}:${options.delayDetail.id}`, options.delayDetail.ms || 0);
+    },
     async close() { clearInterval(timer); for (const c of clients) c.end(); for (const c of sockets.clients) c.terminate(); sockets.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); fs.rmSync(repo, { recursive: true, force: true }); },
   };
 }

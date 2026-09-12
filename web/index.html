@@ -449,6 +449,7 @@ let tagSummary = null;
 const $ = (id) => document.getElementById(id);
 let openTaskId = null;
 let taskDetailRequest = 0;
+const sessionDetails = new Map();
 
 const sessionOpenStates = new Map();
 function sessionOpenButton(payload) {
@@ -1500,11 +1501,66 @@ function renderTaskDetail(t, draft = null) {
   });
 }
 
+function sessionDetailKey(session) {
+  return `${session.id}:${session._detailVersion || ''}`;
+}
+
+function paintSessionDetail(session, entry) {
+  const dialog = $('detail');
+  if (!dialog.open || dialog.dataset.sessionId !== session.id
+      || dialog.dataset.detailVersion !== (session._detailVersion || '')) return;
+  const update = $('sessionAssistant');
+  const status = $('sessionDetailState');
+  if (!update || !status) return;
+  if (entry.status === 'ready') {
+    update.textContent = entry.value?.lastAssistantFull || session.lastAssistant || '';
+    status.replaceChildren();
+  } else if (entry.status === 'error') {
+    status.innerHTML = `<span role="alert">Could not load the full update: ${esc(entry.error)}</span> <button class="btn" id="retrySessionDetail">Retry</button>`;
+    $('retrySessionDetail').addEventListener('click', () => loadSessionDetail(session, true));
+  } else status.textContent = 'Loading full update…';
+}
+
+function loadSessionDetail(session, retry = false) {
+  const key = sessionDetailKey(session);
+  if (retry) sessionDetails.delete(key);
+  let entry = sessionDetails.get(key);
+  if (entry) { paintSessionDetail(session, entry); return entry.promise; }
+  entry = { status: 'loading', value: null, error: '', promise: null };
+  sessionDetails.set(key, entry);
+  paintSessionDetail(session, entry);
+  entry.promise = fetch(`/api/dashboard-detail?kind=session&id=${encodeURIComponent(session.id)}`, { headers: { 'x-keep': '1' } })
+    .then(async (response) => {
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || `request failed (${response.status})`);
+      if (result.version && result.version !== session._detailVersion) {
+        throw new Error('Details changed while loading. Refresh and try again.');
+      }
+      entry = { status: 'ready', value: result.value || null, error: '', promise: null };
+      sessionDetails.set(key, entry);
+      paintSessionDetail(session, entry);
+      return entry.value;
+    })
+    .catch((error) => {
+      entry = { status: 'error', value: null, error: error.message || 'Detail request failed', promise: null };
+      sessionDetails.set(key, entry);
+      paintSessionDetail(session, entry);
+      return null;
+    });
+  return entry.promise;
+}
+
+function reconcileSessionDetails() {
+  const keys = new Set((state.sessions || []).map(sessionDetailKey));
+  for (const key of sessionDetails.keys()) if (!keys.has(key)) sessionDetails.delete(key);
+}
+
 function openSession(id) {
   const s = (state.sessions || []).find((x) => x.id === id);
   if (!s) return;
   openTaskId = null;
   $('detail').dataset.sessionId = id;
+  $('detail').dataset.detailVersion = s._detailVersion || '';
   const isCodex = s.kind === 'codex';
   const cmd = `${s.project ? `cd ${s.project} && ` : ''}${isCodex ? 'codex resume' : 'claude --resume'} ${s.id}`;
   $('detail').innerHTML = `
@@ -1512,7 +1568,7 @@ function openSession(id) {
     <h3>${esc(s.title || s.lastUser || 'Coding session')}</h3>
     <div class="sub">${esc(s.project || 'unknown project')}</div>
     ${isCodex ? '' : '<div id="sessionSummary" class="md summary-card"><span class="empty">summarizing…</span></div>'}
-    ${s.lastAssistant ? `<div class="md"><h2>Last assistant update</h2><div class="runmsg">${esc(s.lastAssistant)}</div></div>` : ''}
+    ${s.lastAssistant ? `<div class="md"><h2>Last assistant update</h2><div class="runmsg" id="sessionAssistant">${esc(s.lastAssistant)}</div><div class="empty" id="sessionDetailState" role="status"></div></div>` : ''}
     <div class="actions session-send">
       <input type="text" id="sessionMessage" maxlength="2000" placeholder="Message this session">
       <button type="button" class="btn" id="sessionSend" title="Types this into the running host pane, as if you typed it in the terminal, and presses Enter.">Send to session</button>
@@ -1564,6 +1620,7 @@ function openSession(id) {
     }
   });
   $('detail').showModal();
+  if (s._detailVersion && !Object.hasOwn(s, 'lastAssistantFull')) void loadSessionDetail(s);
   if (isCodex) return;
   fetch(`/api/sessionsummary?id=${encodeURIComponent(id)}`).then((r) => {
     if (!r.ok) throw new Error(`request failed (${r.status})`);
@@ -1610,6 +1667,7 @@ async function refresh() {
   try {
     const r = await fetch('/api/state?summary=1');
     state = await r.json();
+    reconcileSessionDetails();
     $('stale').style.display = 'none';
     render();
     maybeNotify();
@@ -1618,6 +1676,17 @@ async function refresh() {
       const summary = state.tasks.find((task) => task.id === openTaskId);
       if (summary?._detailVersion && summary._detailVersion !== $('detail').dataset.detailVersion) openTask(openTaskId, taskDraftState());
       else renderRunArea(openTaskId);
+    } else if ($('detail').open && $('detail').dataset.sessionId) {
+      const summary = state.sessions.find((session) => session.id === $('detail').dataset.sessionId);
+      if (summary) {
+        $('detail').querySelector('h3').textContent = summary.title || summary.lastUser || 'Coding session';
+        $('detail').querySelector('.sub').textContent = summary.project || 'unknown project';
+        if (summary._detailVersion !== $('detail').dataset.detailVersion) {
+          $('detail').dataset.detailVersion = summary._detailVersion || '';
+          if ($('sessionAssistant')) $('sessionAssistant').textContent = summary.lastAssistant || '';
+          if (summary._detailVersion && !Object.hasOwn(summary, 'lastAssistantFull')) void loadSessionDetail(summary);
+        }
+      }
     }
   } catch {
     $('stale').style.display = '';

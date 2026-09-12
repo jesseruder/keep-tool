@@ -56,6 +56,24 @@ test('lightweight dashboard state preserves list context and moves opened conten
       lastAssistant: 'Short update', lastAssistantFull: 'Full transcript tail', observation: { evidence: ['large'] },
       runtime: { process: 'details' }, backgroundJobs: [{ id: 'ledger-entry', status: 'completed' }],
       pendingBackground: true, activity: { background: { pending: true } },
+    }, {
+      id: 'old-session', kind: 'claude', title: 'Historical work', baseTitle: 'Historical work', project: '/repo',
+      state: 'exited', stateLabel: 'Exited', exited: true, alive: false, pane: 'old-pane', taskId: 'card',
+      taskStatus: 'review', accountId: 'claude-main', accountLabel: 'Claude Main', gitBranch: 'feature/history',
+      mtime: 120, lastUserAt: 110, attentionAt: 115, lastAssistant: 'Historical preview',
+      lastAssistantFull: 'Historical full transcript tail', lastUser: 'Large user prompt', lastHuman: 'human', size: 999,
+      endedTurn: true, pendingQuestion: null, pendingPlan: null, localCommandPending: false, pendingOther: false,
+      pendingBackground: true, unknownBackgroundJobs: ['unverified-child'], lifecycleAgents: ['child'],
+      lifecycleForeground: { state: 'stopped' }, lifecycleStop: { intent: 'done' }, lifecycleTurnAt: 100,
+      waitingFor: null, toolRunning: false, rateLimit: null, notify: { type: 'complete' }, askedProse: false,
+      activity: { state: 'exited', label: 'Exited', decision: { rule: 'process-exited', alternatives: [{ rule: 'task-review' }] },
+        background: { pending: true, uncertain: ['unverified-child'], scheduled: [], checkAfter: null, dependencies: ['upstream'] } },
+    }],
+    panes: [{ id: 'live-pane', alive: true, cmd: '/bin/zsh', args: ['-lic'], rows: 40, cols: 120 }, {
+      id: 'old-pane', alive: false, pid: 42, cwd: '/repo', title: 'Historical work', exitCode: 0,
+      createdAt: '2026-09-07T12:00:00Z', exitedAt: '2026-09-07T13:00:00Z', cmd: '/bin/zsh', args: ['-lic', 'claude'],
+      rows: 40, cols: 120, attached: 0, visibleAttached: 0, bytes: 123456, inputCount: 1, outputCount: 2,
+      meta: { agent: 'claude', sessionId: 'old-session', project: '/repo', card: 'card', accountId: 'claude-main' },
     }],
     reviewQueue: { counts: { 'needs-decision': 1 }, items: [{
       id: 'finding:card:key', type: 'finding', status: 'needs-decision', title: 'Finding', card: 'card',
@@ -88,6 +106,26 @@ test('lightweight dashboard state preserves list context and moves opened conten
   assert.equal(summary.sessions[0].pendingBackground, true);
   assert.equal(summary.sessions[0].lastAssistant, 'Short update');
   assert.deepEqual(summary.sessions[0].activity, state.sessions[0].activity);
+  assert.equal(summary.sessions[1].lastAssistant, 'Historical preview');
+  assert.equal(summary.sessions[1].lastAssistantFull, undefined);
+  assert.equal(summary.sessions[1].lastUser, 'Large user prompt');
+  assert.equal(summary.sessions[1].lastHuman, undefined);
+  assert.equal(summary.sessions[1].size, undefined);
+  assert.equal(summary.sessions[1].lifecycleForeground, undefined);
+  assert.equal(summary.sessions[1].stateLabel, 'Exited');
+  assert.equal(summary.sessions[1].accountLabel, 'Claude Main');
+  assert.equal(summary.sessions[1].gitBranch, 'feature/history');
+  assert.equal(summary.sessions[1].pendingBackground, true);
+  assert.deepEqual(summary.sessions[1].unknownBackgroundJobs, ['unverified-child']);
+  assert.deepEqual(summary.sessions[1].lifecycleAgents, ['child']);
+  assert.deepEqual(summary.sessions[1].activity, { background: state.sessions[1].activity.background });
+  assert.deepEqual(summary.panes[0], state.panes[0], 'live pane metadata is unchanged');
+  assert.equal(summary.panes[1].cmd, undefined);
+  assert.equal(summary.panes[1].args, undefined);
+  assert.equal(summary.panes[1].rows, undefined);
+  assert.equal(summary.panes[1].bytes, undefined);
+  assert.equal(summary.panes[1].pid, 42);
+  assert.equal(summary.panes[1].meta.sessionId, 'old-session');
   assert.equal(summary.reviewQueue.items[0].body, undefined);
   assert.equal(summary.reviewQueue.items[0].evidence, undefined);
   assert.equal(summary.reviewQueue.items[0].outcome, undefined);
@@ -99,6 +137,17 @@ test('lightweight dashboard state preserves list context and moves opened conten
   assert.deepEqual(dashboardDetail(state, 'session', 'session').value, state.sessions[0]);
   assert.deepEqual(dashboardDetail(state, 'review', 'finding:card:key').value, state.reviewQueue.items[0]);
   assert.equal(dashboardDetail(state, 'task', 'card').version, summary.tasks[0]._detailVersion);
+  assert.equal(dashboardDetail(state, 'session', 'old-session').version, summary.sessions[1]._detailVersion);
+
+  const statusOnly = structuredClone(state.sessions[1]);
+  statusOnly.title = 'Renamed historical work';
+  statusOnly.accountLabel = 'Claude Secondary';
+  statusOnly.activity.decision.at = 999;
+  assert.equal(lightweightState({ sessions: [statusOnly] }).sessions[0]._detailVersion,
+    summary.sessions[1]._detailVersion, 'list-only changes do not invalidate cached transcript detail');
+  statusOnly.lastAssistantFull = 'A newer full transcript tail';
+  assert.notEqual(lightweightState({ sessions: [statusOnly] }).sessions[0]._detailVersion,
+    summary.sessions[1]._detailVersion, 'deferred full text invalidates cached transcript detail');
 });
 
 test('dashboard detail validation and full review-note search stay explicit', () => {

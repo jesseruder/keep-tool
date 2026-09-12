@@ -46,3 +46,21 @@ test('superseded detail requests cannot overwrite a newer version', async () => 
   await oldRequest;
   assert.equal(store.peek('review', 'item', 'new').value.body, 'new detail');
 });
+
+test('a response for a different version becomes a stable retryable error', async () => {
+  const { createDetailStore } = await detailsModule;
+  let calls = 0;
+  const store = createDetailStore(async () => {
+    calls += 1;
+    return { version: calls === 1 ? 'newer' : 'expected', value: { lastAssistantFull: `answer ${calls}` } };
+  });
+
+  await store.ensure('session', 'old', 'expected');
+  assert.equal(store.peek('session', 'old', 'expected').status, 'error');
+  assert.match(store.peek('session', 'old', 'expected').error, /changed while loading/);
+  await store.ensure('session', 'old', 'expected');
+  assert.equal(calls, 1, 'renders after a mismatch do not start a request storm');
+  await store.retry('session', 'old', 'expected');
+  assert.equal(calls, 2);
+  assert.equal(store.peek('session', 'old', 'expected').value.lastAssistantFull, 'answer 2');
+});

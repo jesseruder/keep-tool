@@ -12,11 +12,19 @@ export function createDetailStore(load, onChange = () => {}) {
   function ensure(kind, id, expectedVersion) {
     const key = keyFor(kind, id);
     const current = entries.get(key);
-    if (current?.expectedVersion === expectedVersion && ['loading', 'ready'].includes(current.status)) return current.promise;
+    if (current?.expectedVersion === expectedVersion && ['loading', 'ready', 'error'].includes(current.status)) return current.promise;
     const token = ++serial;
     const entry = { status: 'loading', value: null, error: '', expectedVersion, token, promise: null };
     entry.promise = Promise.resolve().then(() => load(kind, id)).then((result) => {
       if (entries.get(key)?.token !== token) return null;
+      if (result?.version && result.version !== expectedVersion) {
+        entries.set(key, {
+          status: 'error', value: null, error: 'Details changed while loading. Refresh and try again.',
+          expectedVersion, version: result.version, token, promise: null,
+        });
+        onChange();
+        return null;
+      }
       entries.set(key, {
         status: 'ready', value: result?.value || null, error: '',
         expectedVersion, version: result?.version || expectedVersion, token, promise: null,

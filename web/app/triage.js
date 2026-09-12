@@ -351,6 +351,12 @@ function renderStage(ctx, active, focusItem, running, pinned) {
   const key = ctx.itemKey(item);
   const pane = item.pane ? ctx.paneMap().get(item.pane) : null;
   const hasLivePane = Boolean(pane?.alive);
+  const deferredSessionDetail = Boolean(!hasLivePane && session?._detailVersion
+    && !Object.hasOwn(session, 'lastAssistantFull'));
+  const sessionDetail = deferredSessionDetail
+    ? ctx.detail('session', session)
+    : { status: 'ready', value: session, error: '' };
+  if (deferredSessionDetail && sessionDetail.status === 'idle') void ctx.ensureDetail('session', session);
   if (stage.dataset.itemKey !== key || stage.dataset.pane !== (item.pane || '')) {
     ctx.focusDebug?.('stage-replace', { reason: 'selection-or-pane-change', session: item.sessionId || '', pane: item.pane || '', related: stage.dataset.pane || '' });
     ctx.clearElement(stage);
@@ -402,14 +408,22 @@ function renderStage(ctx, active, focusItem, running, pinned) {
       stage.dataset.focusKey = focusKey;
     }
   } else {
+    const transcript = sessionDetail.status === 'ready'
+      ? sessionDetail.value?.lastAssistantFull || session?.lastAssistant || item.detail || 'No transcript tail available.'
+      : session?.lastAssistant || item.detail || 'No transcript tail available.';
+    const detailStatus = sessionDetail.status === 'loading'
+      ? '<p class="muted" role="status">Loading recent conversation…</p>'
+      : sessionDetail.status === 'error'
+        ? `<p role="alert">Could not load recent conversation: ${ctx.esc(sessionDetail.error)} <button class="btn" data-retry-session-detail>Retry</button></p>`
+        : '<p class="muted">no host pane</p>';
     let legacy = terminalHost.querySelector('.legacy');
     if (!legacy) {
-      terminalHost.innerHTML = '<div class="legacy"><pre></pre><p class="muted">no host pane</p></div>';
+      terminalHost.innerHTML = '<div class="legacy"></div>';
       legacy = terminalHost.querySelector('.legacy');
     }
-    const transcript = session?.lastAssistantFull || item.detail || 'No transcript tail available.';
-    const pre = legacy.querySelector('pre');
-    if (pre.textContent !== transcript) pre.textContent = transcript;
+    ctx.patchHTML(legacy, `<pre>${ctx.esc(transcript)}</pre>${detailStatus}`);
+    const retrySessionDetail = legacy.querySelector('[data-retry-session-detail]');
+    if (retrySessionDetail) retrySessionDetail.onclick = () => ctx.retryDetail('session', session);
   }
   if (briefChanged) {
     brief.querySelectorAll('[data-option]').forEach((button) => button.addEventListener('click', () => chooseOption(ctx, item, Number(button.dataset.option))));

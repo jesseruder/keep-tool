@@ -8,7 +8,7 @@ const http = require('node:http');
 const { chromium } = require('@playwright/test');
 const { dashboardDetail, lightweightState } = require('./dashboard-state');
 
-test('isolated browser: legacy dashboard task details load on open and reject stale responses', { skip: process.env.KEEP_BROWSER_TEST !== '1', timeout: 30000 }, async () => {
+test('isolated browser: legacy dashboard loads task and historical session details without clobbering drafts', { skip: process.env.KEEP_BROWSER_TEST !== '1', timeout: 30000 }, async () => {
   const root = path.resolve(__dirname, '..');
   const task = (id, title, body) => ({
     id, body, lastLog: `Latest ${id}`, modelUsage: { total: id.length }, overdue: false,
@@ -17,13 +17,20 @@ test('isolated browser: legacy dashboard task details load on open and reject st
   const first = task('first', 'First card', 'First full history');
   const second = task('second', 'Second card', 'Second full history v1');
   const broken = task('broken', 'Broken card', 'Recovered full history');
+  const oldSession = {
+    id: 'old-session', kind: 'codex', title: 'Historical session', project: '/tmp/dashboard-fixture',
+    state: 'exited', stateLabel: 'Exited', exited: true, endedTurn: true, pane: 'old-pane',
+    lastAssistant: 'Historical preview', lastAssistantFull: 'Historical complete answer '.repeat(80) + 'OLD-V1',
+    mtime: Date.now(), lastUserAt: Date.now(),
+  };
   const state = {
-    generatedAt: 1, tasks: [first, second, broken], sessions: [], attention: [], stalled: [], unblocked: [], alerts: [],
+    generatedAt: 1, tasks: [first, second, broken], sessions: [oldSession], attention: [], stalled: [], unblocked: [], alerts: [],
     notifications: [], landed: {}, runs: [], usage: {}, reviewQueue: { items: [], counts: {} }, scopes: { names: ['work'] },
   };
   const detailGets = [];
   let failBroken = true;
   let delaySecond = false;
+  let delayOldSession = false;
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://fixture');
     if (url.pathname === '/api/events') {
@@ -33,13 +40,16 @@ test('isolated browser: legacy dashboard task details load on open and reject st
       res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(lightweightState(state))); return;
     }
     if (url.pathname === '/api/dashboard-detail') {
+      const kind = url.searchParams.get('kind');
       const id = url.searchParams.get('id');
-      detailGets.push(id);
-      if (id === 'broken' && failBroken) {
+      detailGets.push(kind === 'task' ? id : `${kind}:${id}`);
+      if (kind === 'task' && id === 'broken' && failBroken) {
         failBroken = false; res.writeHead(503, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'fixture unavailable' })); return;
       }
-      const send = () => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(dashboardDetail(state, 'task', id))); };
-      if (id === 'first' || id === 'second' && delaySecond) setTimeout(send, 150); else send();
+      const send = () => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(dashboardDetail(state, kind, id))); };
+      if (kind === 'task' && (id === 'first' || id === 'second' && delaySecond)
+          || kind === 'session' && delayOldSession) setTimeout(send, 150);
+      else send();
       return;
     }
     if (url.pathname === '/api/tasksummary') {
@@ -93,6 +103,27 @@ test('isolated browser: legacy dashboard task details load on open and reject st
     assert.equal(await page.locator('#runExtra').inputValue(), 'Draft run instructions');
     assert.deepEqual(await page.locator('#ciMsg').evaluate((field) => ({ id: document.activeElement.id, start: field.selectionStart, end: field.selectionEnd })),
       { id: 'ciMsg', start: 7, end: 12 }, 'background detail refresh preserves edits, focus, and selection made during the request');
+
+    assert.equal(detailGets.includes('session:old-session'), false, 'historical session detail is not loaded until opened');
+    await page.evaluate(() => openSession('old-session'));
+    await page.getByText('OLD-V1', { exact: false }).waitFor();
+    assert.equal(detailGets.filter((id) => id === 'session:old-session').length, 1);
+    await page.locator('#sessionMessage').fill('Draft message survives detail refresh');
+    await page.locator('#sessionMessage').focus();
+    await page.locator('#sessionMessage').evaluate((field) => field.setSelectionRange(6, 13));
+    oldSession.title = 'Renamed historical session';
+    oldSession.lastAssistant = 'New historical preview';
+    oldSession.lastAssistantFull = 'Updated historical complete answer '.repeat(80) + 'OLD-V2';
+    delayOldSession = true;
+    await page.evaluate(() => refresh());
+    await page.locator('#sessionMessage').fill('Newest unsent draft');
+    await page.locator('#sessionMessage').evaluate((field) => field.setSelectionRange(4, 10));
+    await page.getByText('OLD-V2', { exact: false }).waitFor();
+    assert.equal(await page.locator('#detail h3').textContent(), 'Renamed historical session');
+    assert.equal(await page.locator('#sessionMessage').inputValue(), 'Newest unsent draft');
+    assert.deepEqual(await page.locator('#sessionMessage').evaluate((field) => ({ id: document.activeElement.id, start: field.selectionStart, end: field.selectionEnd })),
+      { id: 'sessionMessage', start: 4, end: 10 }, 'session detail refresh preserves the unsent message, focus, and selection');
+    assert.equal(detailGets.filter((id) => id === 'session:old-session').length, 2);
   } finally {
     await browser.close();
     await new Promise((resolve) => server.close(resolve));

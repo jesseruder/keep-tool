@@ -9,6 +9,13 @@ function detailVersion(value) {
   return crypto.createHash('sha256').update(JSON.stringify(value)).digest('base64url').slice(0, 16);
 }
 
+function sessionDetailVersion(session) {
+  // The desktop clients only defer the complete assistant tail. Keep this key
+  // stable when process observations, account labels, or list status change so
+  // an open historical session does not refetch the same transcript every poll.
+  return detailVersion({ lastAssistantFull: session.lastAssistantFull || '' });
+}
+
 function clipped(value, limit = SUMMARY_TEXT_LIMIT) {
   const text = String(value || '');
   return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
@@ -39,7 +46,49 @@ function sessionSummary(session) {
     backgroundJobs: _backgroundJobs,
     ...summary
   } = session;
-  return { ...summary, _detailVersion: detailVersion(session) };
+  if (session.exited === true || session.state === 'exited') {
+    delete summary.lastAssistantFull;
+    delete summary.lastHuman;
+    delete summary.size;
+    delete summary.lifecycleForeground;
+    delete summary.lifecycleStop;
+    delete summary.lifecycleTurnAt;
+
+    // Status labels and top-level pending flags carry the normal exited-row
+    // state. Retain background detail only when it represents work the user
+    // still needs to see; the full decision trace is diagnostic detail.
+    const background = session.activity?.background;
+    const meaningfulBackground = background && (background.pending
+      || background.checkAfter
+      || background.uncertain?.length
+      || background.scheduled?.length
+      || background.dependencies?.length);
+    if (meaningfulBackground) summary.activity = { background };
+    else delete summary.activity;
+  }
+  return { ...summary, _detailVersion: sessionDetailVersion(session) };
+}
+
+function paneSummary(pane) {
+  if (pane.alive !== false && pane.agentAlive !== false) return pane;
+  const {
+    cmd: _cmd,
+    args: _args,
+    cols: _cols,
+    rows: _rows,
+    attached: _attached,
+    visibleAttached: _visibleAttached,
+    lastInputAt: _lastInputAt,
+    lastOutputAt: _lastOutputAt,
+    lastReadAt: _lastReadAt,
+    inputCount: _inputCount,
+    outputCount: _outputCount,
+    bytes: _bytes,
+    alt: _alt,
+    primary: _primary,
+    ...summary
+  } = pane;
+  return summary;
 }
 
 function reviewItemSummary(item) {
@@ -61,6 +110,7 @@ function lightweightState(state) {
     ...state,
     tasks: (state.tasks || []).map(taskSummary),
     sessions: (state.sessions || []).map(sessionSummary),
+    panes: (state.panes || []).map(paneSummary),
     reviewQueue: state.reviewQueue ? {
       ...state.reviewQueue,
       items: (state.reviewQueue.items || []).map(reviewItemSummary),
@@ -84,7 +134,7 @@ function dashboardDetail(state, kind, id) {
   const rows = kind === 'task' ? state.tasks : kind === 'session' ? state.sessions : state.reviewQueue?.items;
   const value = (rows || []).find((row) => row.id === id);
   if (!value) throw detailError(404, `${kind} detail not found: ${id}`);
-  return { kind, id, version: detailVersion(value), value };
+  return { kind, id, version: kind === 'session' ? sessionDetailVersion(value) : detailVersion(value), value };
 }
 
 function reviewQueueSearch(state, query) {
