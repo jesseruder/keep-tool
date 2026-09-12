@@ -14,7 +14,7 @@ async function createFixture() {
   let revision = 0, ticks = 0, timer;
   let closeDelay = 1200, closeFails = false, layoutFails = false;
   let handoffRecoversOnce = false;
-  let openDelay = 0, openFailsAfterSpawn = false, reopenFails = false, reviewFailsOnce = false, launchSequence = 0;
+  let openDelay = 0, openFailsAfterSpawn = false, reopenFails = false, reviewFailsOnce = false, reviewPartialOnce = false, launchSequence = 0;
   const openRequests = new Map();
   const sessions = Array.from({ length: 12 }, (_, i) => {
     const id = String.fromCharCode(97 + i);
@@ -86,6 +86,7 @@ async function createFixture() {
         if ('openFailsAfterSpawn' in input) openFailsAfterSpawn = Boolean(input.openFailsAfterSpawn);
         if ('reopenFails' in input) reopenFails = Boolean(input.reopenFails);
         if ('reviewFailsOnce' in input) reviewFailsOnce = Boolean(input.reviewFailsOnce);
+        if ('reviewPartialOnce' in input) reviewPartialOnce = Boolean(input.reviewPartialOnce);
         if (input.id && sessions.some(s => s.id === input.id)) update(input.id, input.patch || {});
         json({ ok: true, revision }); return;
       }
@@ -182,6 +183,14 @@ async function createFixture() {
               pane, accountId: account.id, accountLabel: account.label, model: input.model || '', mtime: Date.now(), state: 'running' });
             panes.push({ id: pane, pid: 900 + launchSequence, alive: true, cwd: item.project || repo,
               meta: { agent: input.agent, sessionId: id, accountId: account.id, accountLabel: account.label } });
+            if (reviewPartialOnce) {
+              reviewPartialOnce = false;
+              item.launchState = { state: 'needs-attention', action: input.action, requestId: input.requestId,
+                sessionId: id, agent: input.agent, accountId: input.accountId, ...(input.model ? { model: input.model } : {}),
+                recoverable: false, message: 'Fixture delivery could not be confirmed.' };
+              item.launchError = { message: item.launchState.message, sessionId: id };
+              publish(); json({ error: item.launchState.message, item }, 503); return;
+            }
             publish(); json({ ok: true, sessionId: id, item }); return;
           }
           json({ ok: true, item }); return;
@@ -335,7 +344,7 @@ async function createFixture() {
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   return { url: `http://127.0.0.1:${server.address().port}`, events, state, portableTransfers, update, publish, churn,
-    configure: options => { if ('closeDelay' in options) closeDelay = options.closeDelay; if ('closeFails' in options) closeFails = options.closeFails; if ('layoutFails' in options) layoutFails = options.layoutFails; if ('handoffRecoversOnce' in options) handoffRecoversOnce = options.handoffRecoversOnce; if ('openDelay' in options) openDelay = options.openDelay; if ('openFailsAfterSpawn' in options) openFailsAfterSpawn = options.openFailsAfterSpawn; if ('reopenFails' in options) reopenFails = options.reopenFails; if ('reviewFailsOnce' in options) reviewFailsOnce = options.reviewFailsOnce; },
+    configure: options => { if ('closeDelay' in options) closeDelay = options.closeDelay; if ('closeFails' in options) closeFails = options.closeFails; if ('layoutFails' in options) layoutFails = options.layoutFails; if ('handoffRecoversOnce' in options) handoffRecoversOnce = options.handoffRecoversOnce; if ('openDelay' in options) openDelay = options.openDelay; if ('openFailsAfterSpawn' in options) openFailsAfterSpawn = options.openFailsAfterSpawn; if ('reopenFails' in options) reopenFails = options.reopenFails; if ('reviewFailsOnce' in options) reviewFailsOnce = options.reviewFailsOnce; if ('reviewPartialOnce' in options) reviewPartialOnce = options.reviewPartialOnce; },
     async close() { clearInterval(timer); for (const c of clients) c.end(); for (const c of sockets.clients) c.terminate(); sockets.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); fs.rmSync(repo, { recursive: true, force: true }); },
   };
 }

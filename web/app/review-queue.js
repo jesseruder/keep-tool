@@ -178,7 +178,8 @@ async function submit(ctx, item, action, fields = {}, retry = false, requestIdOv
     const result = await write('/api/review-queue', { id: item.id, action, requestId: request.requestId, ...fields });
     pending.delete(item.id);
     await ctx.reload();
-    if (result?.sessionId) ctx.openReviewSession(result.sessionId);
+    if (result?.sessionId && !surfaceError) ctx.openReviewSession(result.sessionId);
+    return result;
   } catch (error) {
     request.error = error.message;
     request.httpResponse = Number.isFinite(error.status);
@@ -193,7 +194,12 @@ async function submit(ctx, item, action, fields = {}, retry = false, requestIdOv
       if (error.body.item.launchState || request.recovery && !error.body.item.launchState) pending.delete(item.id);
     }
     renderReviewQueue(ctx);
+    if (surfaceError && error.body?.item?.launchState) {
+      pending.delete(item.id);
+      return { partial: true };
+    }
     if (surfaceError) throw error;
+    return null;
   }
 }
 
@@ -206,18 +212,23 @@ function launchFields(launch) {
   } : {};
 }
 
-function chooseLaunch(ctx, item, action) {
+async function chooseLaunch(ctx, item, action) {
   const label = action === 'discuss' ? 'Open discussion' : item.type === 'finding' ? 'Start investigation' : 'Start work';
-  return openSessionChooser(ctx, {
+  let opened = null;
+  await openSessionChooser(ctx, {
     eyebrow: item.type === 'finding' ? 'Finding' : 'Idea', title: label,
     description: 'Choose the account for this new conversation.', project: item.project || item.card || '',
     kinds: ['claude', 'codex'], initialKind: 'claude', confirmLabel: label,
     models: { claude: 'claude-fable-5-1', codex: '' },
-    onSubmit(selection) {
-      return submit(ctx, item, action, { agent: selection.agent, accountId: selection.accountId,
+    async onSubmit(selection) {
+      opened = await submit(ctx, item, action, { agent: selection.agent, accountId: selection.accountId,
         ...(selection.model ? { model: selection.model } : {}) }, false, null, false, true);
     },
   });
+  if (opened?.sessionId) {
+    if (opened.partial) await ctx.reload();
+    ctx.openReviewSession(opened.sessionId);
+  }
 }
 
 function bind(ctx, root, current) {

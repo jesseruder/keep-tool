@@ -160,6 +160,48 @@ test('missing recorded account requires an explicit replacement', async ({ page 
   expect(requests('/api/reopen-session')[0].body).toEqual({ sessionId: session.id, accountId: 'claude-two' });
 });
 
+test('absent recorded account identity never falls back to the provider default', async ({ page }) => {
+  const session = fixture.state.sessions[0];
+  session.state = 'exited'; session.exited = true; session.endedTurn = true;
+  delete session.accountId; delete session.accountLabel;
+  fixture.state.panes[0].alive = false;
+  delete fixture.state.panes[0].meta.accountId; delete fixture.state.panes[0].meta.accountLabel;
+  fixture.publish();
+  await page.locator('[data-mode=fleet]').click();
+  await page.locator(`#fleet [data-reopen="${session.id}"]`).click();
+  await expect(chooser(page).locator('[role=alert]')).toContainText('recorded account identity is unavailable');
+  await expect(chooser(page).locator('[data-launch-account]')).toHaveValue('');
+  await expect(chooser(page).locator('[data-launch-submit]')).toBeDisabled();
+  expect(requests('/api/open')).toHaveLength(0);
+  expect(requests('/api/reopen-session')).toHaveLength(0);
+  await chooser(page).locator('[data-launch-account]').selectOption('claude-two');
+  await chooser(page).locator('[data-launch-submit]').click();
+  await expect(chooser(page)).not.toBeVisible();
+  expect(requests('/api/reopen-session')).toHaveLength(1);
+  expect(requests('/api/reopen-session')[0].body).toEqual({ sessionId: session.id, accountId: 'claude-two' });
+});
+
+test('partial review launch closes the picker and exposes its persisted recovery state', async ({ page }) => {
+  fixture.state.reviewQueue.items.push({ id: 'idea:partial', type: 'idea', card: 'card-partial', title: 'Partial review launch',
+    body: 'A launched conversation whose delivery needs inspection.', project: fixture.state.sessions[0].project,
+    status: 'needs-decision', at: Date.now(), sessions: [] });
+  fixture.state.reviewQueue.counts['needs-decision'] = 1;
+  fixture.configure({ reviewPartialOnce: true }); fixture.publish();
+  await page.locator('[data-mode=review-queue]').click();
+  await page.locator('[data-review-action=start]').click();
+  await chooser(page).locator('[data-launch-account]').selectOption('claude-two');
+  await chooser(page).locator('[data-launch-model]').fill('claude-fable-5-1');
+  await chooser(page).locator('[data-launch-submit]').click();
+  await expect(chooser(page)).not.toBeVisible();
+  await expect(page.locator('[data-review-detail="idea:partial"] .review-action-error')).toContainText('delivery could not be confirmed');
+  await expect(page.locator('[data-review-detail="idea:partial"] [data-review-session]').first()).toBeVisible();
+  await expect(page.locator('[data-review-detail="idea:partial"] [data-review-action]')).toHaveCount(0);
+  const review = requests('/api/review-queue');
+  expect(review).toHaveLength(1);
+  expect(review[0].body).toMatchObject({ id: 'idea:partial', action: 'start', agent: 'claude',
+    accountId: 'claude-two', model: 'claude-fable-5-1' });
+});
+
 test('card fallback and review actions send exact provider account and model choices', async ({ page }) => {
   fixture.state.tasks.push({ id: 'card-fresh', fm: { title: 'Fresh card', project: fixture.state.sessions[0].project, tags: ['personal'] } });
   fixture.state.attention = [{ kind: 'input', taskId: 'card-fresh', title: 'Fresh card', project: fixture.state.sessions[0].project, pri: -1 }];
@@ -193,6 +235,9 @@ test('card fallback and review actions send exact provider account and model cho
   await expect(chooser(page).locator('[data-launch-model]')).toHaveValue('gpt-5.6');
   await chooser(page).locator('[data-launch-submit]').click();
   await expect(chooser(page)).not.toBeVisible();
+  const launchedReview = fixture.state.sessions.find(session => session.id.startsWith('review-'));
+  await expect(page.locator('#stage')).toHaveAttribute('data-pane', launchedReview.pane);
+  await expect(page.locator('#stage .xterm-helper-textarea')).toBeFocused();
   const review = requests('/api/review-queue');
   expect(review).toHaveLength(2);
   expect(review.map(request => ({ ...request.body, requestId: '<stable>' }))).toEqual([

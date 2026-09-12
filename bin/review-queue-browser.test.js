@@ -172,7 +172,6 @@ test('isolated browser: review queue decisions, drafts, notification links, and 
     await evaluate("(()=>{const sort=document.querySelector('[data-review-sort]'); sort.value='newest'; sort.dispatchEvent(new Event('change',{bubbles:true}))})()");
     await evaluate("document.querySelector('[data-review-item=\"idea:partial-start\"]').click(); document.querySelector('[data-review-action=start]').click(); document.querySelector('.session-launch-card').requestSubmit()");
     await wait("document.querySelector('[data-review-detail]')?.dataset.reviewDetail === 'idea:partial-start' && document.querySelector('.review-status')?.textContent === 'In progress' && document.querySelector('[data-review-session=partial-session]')");
-    await evaluate("document.querySelector('.session-launch-dialog [data-launch-cancel]').click()");
     assert.equal(await evaluate("document.querySelectorAll('[data-review-retry], [data-review-recover], [data-review-action]').length"), 0, 'ambiguous partial start offers only its existing conversation');
     await evaluate("document.querySelector('[data-review-filter=\"needs-decision\"]').click()");
     await evaluate("document.querySelector('[data-review-type=finding]').click()");

@@ -28,8 +28,8 @@ export function openSessionChooser(ctx, options) {
   if (modal.open) return false;
   const kinds = (options.kinds || ['shell', 'claude', 'codex']).filter((kind) => labels[kind]);
   const initialKind = kinds.includes(options.initialKind) ? options.initialKind : kinds[0];
-  const recordedAccountMissing = kinds.length === 1 && initialKind !== 'shell' && options.accountId
-    && !accountsFor(ctx, initialKind).some((account) => account.id === options.accountId);
+  const recordedAccountMissing = kinds.length === 1 && initialKind !== 'shell' && options.requireRecordedAccount === true
+    && (!options.accountId || !accountsFor(ctx, initialKind).some((account) => account.id === options.accountId));
   const runId = String(++runSequence);
   const state = {
     kind: initialKind,
@@ -57,7 +57,7 @@ export function openSessionChooser(ctx, options) {
     const modelField = state.kind === 'shell' || options.showModel === false ? ''
       : `<label>Model <span>Optional; blank uses the account default</span><input data-launch-model autocomplete="off" ${state.busy || state.bound ? 'disabled' : ''} value="${ctx.esc(state.models[state.kind] || '')}" placeholder="Account default"></label>`;
     const unavailable = noAccount ? `No configured ${labels[state.kind]} account is available.`
-      : recordedAccountMissing && !state.accountId ? `The recorded account ${options.accountId} is unavailable. Choose another account explicitly or transfer context.` : '';
+      : recordedAccountMissing && !state.accountId ? `${options.accountId ? `The recorded account ${options.accountId}` : 'The recorded account identity'} is unavailable. Choose another account explicitly or transfer context.` : '';
     modal.dataset.launchRun = runId;
     modal.innerHTML = `<form method="dialog" class="session-launch-card">
       <header><div><span class="eyebrow">${ctx.esc(options.eyebrow || 'Session')}</span><h2 id="session-launch-title">${ctx.esc(options.title || 'New session')}</h2><p>${ctx.esc(options.description || '')}</p></div><button class="btn" type="button" data-launch-cancel ${state.busy ? 'disabled' : ''} aria-label="Close">Close</button></header>

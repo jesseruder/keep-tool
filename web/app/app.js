@@ -536,7 +536,7 @@ async function reopenSession({ sessionId, taskId, agent, title, stalePane, proje
     eyebrow: freshCard ? 'Card' : 'Conversation', title: `Reopen ${title || taskId || sessionId || 'session'}`,
     description: freshCard ? 'Start the first conversation for this card.' : 'Resume this conversation without sending a new instruction.',
     project: launchProject, kinds: freshCard ? ['claude', 'codex'] : [provider], initialKind: freshCard ? 'claude' : provider,
-    accountId: currentAccountId, showModel: freshCard, confirmLabel: freshCard ? 'Start conversation' : 'Reopen',
+    accountId: currentAccountId, requireRecordedAccount: !freshCard, showModel: freshCard, confirmLabel: freshCard ? 'Start conversation' : 'Reopen',
     models: freshCard ? { claude: 'claude-fable-5-1', codex: '' } : undefined,
     onTransfer: sessionId ? () => openPortableTransfer(ctx, sessionId) : null,
     async onSubmit(selection) {
@@ -549,7 +549,7 @@ async function reopenSession({ sessionId, taskId, agent, title, stalePane, proje
           : { sessionId, agent: provider, accountId: selection.accountId };
         let result;
         try {
-          result = !freshCard && currentAccountId && selection.accountId !== currentAccountId
+          result = !freshCard && selection.accountId !== currentAccountId
             ? await api.reopenSession({ sessionId, accountId: selection.accountId })
             : await api.openSession(request);
         } catch (error) {
