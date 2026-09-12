@@ -500,7 +500,7 @@ function sessionInTaskProject(task) {
 // scheduler separately. Nothing but a new schedule (or --clear-check-after) moves it.
 function recordScheduler(task, intent = 'waiting') {
   if (isReviewerSession()) return;
-  const session = currentSession();
+  const session = commandSession();
   const sid = session && session.id;
   if (!sid || !/^[A-Za-z0-9_-]+$/.test(sid)) return;
   if (!sessionInTaskProject(task)) return;
@@ -543,7 +543,7 @@ function recordProgressMarker(task, session) {
 // so a contribution remains attributable independently of ownership.
 function recordContribution(task) {
   if (isReviewerSession()) return { linked: false, skipped: 'reviewer', session: null };
-  const session = currentSession();
+  const session = commandSession();
   const sid = session && session.id;
   if (!sid || !/^[A-Za-z0-9_-]+$/.test(sid)) {
     return { linked: false, skipped: 'no-session', session: null };
@@ -557,7 +557,7 @@ function recordSession(task) {
   // recordContribution instead; only add, claim/link, and open handoffs move links.
   // The reviewer may legitimately file a follow-up card, but must not claim it.
   if (isReviewerSession()) return { linked: false, skipped: 'reviewer', session: null };
-  const session = currentSession();
+  const session = commandSession();
   const sid = session && session.id;
   if (!sid || !/^[A-Za-z0-9_-]+$/.test(sid)) {
     return { linked: false, skipped: 'no-session', session };
@@ -1967,7 +1967,7 @@ commands.delegate = async (argv, deps = {}) => {
     die(`${delegation.describe(callerAssignment)} The parent session must register further delegated work.`);
   }
 
-  const parent = currentSession();
+  const parent = commandSession();
   if (!parent || !delegation.SESSION_RE.test(parent.id)) die('keep delegate needs a current Claude or Codex parent session');
   let task;
   try { task = loadTask(o._[0]); } catch { die(`no task "${o._[0]}"`); }
@@ -1996,11 +1996,17 @@ commands.delegate = async (argv, deps = {}) => {
 
   const launch = deps.spawn || spawn;
   process.stderr.write(`keep: delegating ${record.card} step ${record.step.number} (${record.id})\n`);
+  const childEnv = { ...process.env, KEEP_DELEGATION_ID: record.id };
+  // The explicit record carries the parent identity. Leaving ambient session
+  // variables in a cross-agent child lets ordinary Keep commands attribute the
+  // worker's contributions and schedules to its parent before the native client
+  // replaces that variable.
+  for (const name of ['CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID']) delete childEnv[name];
   let child;
   try {
     child = launch(command[0], command.slice(1), {
       cwd: process.cwd(),
-      env: { ...process.env, KEEP_DELEGATION_ID: record.id },
+      env: childEnv,
       stdio: 'inherit',
     });
   } catch (error) {
@@ -2892,7 +2898,7 @@ commands.hold = (argv) => {
   const reason = cleanScalar(o.m, 'reason');
   const until = parseWhen(o.for);
   if (o.task) loadTask(o.task);
-  const session = currentSession();
+  const session = commandSession();
   const hold = {
     id: `hold-${Date.now().toString(36)}`,
     project,
@@ -3043,7 +3049,7 @@ function stepClaim(argv) {
   const duration = o.for || step.defaultHold;
   if (!/^\+\d+[mhdw]$/i.test(duration || '')) die('--for or defaultHold must be a duration such as +45m or +2h');
   if (o.task) loadTask(o.task);
-  const session = currentSession();
+  const session = commandSession();
   const reason = cleanScalar(o.m, 'reason');
   const result = withLock(() => {
     const ledger = stepRegistry.loadLedger(registry.project, name);
@@ -3116,7 +3122,7 @@ function stepClaim(argv) {
 
 function requireStepClaim(project, name) {
   const claim = activeHolds(project, Date.now(), { step: name })[0] || null;
-  const session = currentSession();
+  const session = commandSession();
   if (!session) return claim;
   if (!claim) stepExitFive(`step ${name} on ${project} has no active claim; run keep step claim first`);
   if (!claim.by || claim.by.sessionId !== session.id) stepExitFive(`step ${name} is claimed by ${describeClaim(claim)}`);
@@ -3270,7 +3276,7 @@ async function stepRun(argv) {
     die(`step ${name} has unsupported from value "${step.from}"`);
   }
 
-  const session = currentSession();
+  const session = commandSession();
   const runId = `run-${Date.now().toString(36)}`;
   const logFile = stepRegistry.logPath(registry.project, name, runId);
   const runRecord = {
@@ -3357,7 +3363,7 @@ async function stepRun(argv) {
 }
 
 function releaseStepClaim(project, name, options = {}) {
-  const session = currentSession();
+  const session = commandSession();
   const claims = activeHolds(project, Date.now(), { step: name });
   const claim = options.force
     ? claims[0]
@@ -3445,7 +3451,7 @@ async function finalizeStep(registry, name, step, options = {}) {
       try { gitAt(stepRegistry.expandProject(registry.project), ['merge-base', '--is-ancestor', sha, `origin/${branch}`]); }
       catch { die(`${sha.slice(0, 7)} is not an ancestor of origin/${branch}; landed steps must complete from a landed revision`); }
     }
-    const session = currentSession();
+    const session = commandSession();
     const activeClaim = activeHolds(registry.project, Date.now(), { step: name })[0] || null;
     if (activeClaim && activeClaim.id !== (options.expectedClaimId || '')) {
       stepExitFive(`step ${name}'s claim changed during finalization; reload it before completing the run`);
@@ -3512,7 +3518,7 @@ async function stepDone(argv) {
   const finalized = [...ledger.runs].reverse().find((entry) => entry.finalizedAt
     && (entry.status === 'done' || entry.status === 'failed'));
   const claim = activeHolds(registry.project, Date.now(), { step: name })[0];
-  const session = currentSession();
+  const session = commandSession();
   // the claim is the ownership: a lane someone else holds is theirs to complete
   if (!o.force && session && claim && (!claim.by || claim.by.sessionId !== session.id)) stepExitFive(`step ${name} is claimed by ${describeClaim(claim)}`);
   if (running && !o.force) {
@@ -3536,7 +3542,7 @@ async function stepFail(argv) {
   const ledger = stepRegistry.loadLedger(registry.project, name);
   const running = [...ledger.runs].reverse().find((entry) => entry.status === 'running') || null;
   const initialClaim = activeHolds(registry.project, Date.now(), { step: name })[0] || null;
-  const session = currentSession();
+  const session = commandSession();
   if (!o.force && session && initialClaim
       && (!initialClaim.by || initialClaim.by.sessionId !== session.id)) {
     stepExitFive(`step ${name} is claimed by ${describeClaim(initialClaim)}`);
@@ -3663,7 +3669,7 @@ commands.alert = async (argv) => {
   const level = String(o.level || '');
   if (!['attention', 'urgent'].includes(level)) die('--level must be one of: attention, urgent');
   const reviewer = isReviewerSession();
-  const session = currentSession();
+  const session = commandSession();
   const caller = reviewer ? 'reviewer' : session ? `session:${session.agent}` : 'manual';
   let from = cleanScalar(o.from || (reviewer ? 'reviewer' : 'manual'), 'from');
   if (!reviewer && from === 'reviewer') from = 'manual (claimed reviewer)';
@@ -5449,18 +5455,27 @@ async function releaseSessionPane(input, agent = 'claude', deps = {}) {
   return record;
 }
 
-// A Codex sub-session spawned from a Claude session inherits CLAUDE_CODE_SESSION_ID.
-// Recording the pair lets a review bundle show the parent that verified the
-// handoff — the Codex prompt forbids running tests, so its own transcript never can.
+// A Codex sub-session spawned from a Claude session may inherit the Claude id;
+// explicit delegation launchers strip ambient session variables and carry the
+// same relationship in their durable record. Recording either exact source lets
+// a review bundle show the parent that verified the handoff.
 function recordCodexParent(input) {
   const sid = input && input.session_id;
-  const parent = process.env.CLAUDE_CODE_SESSION_ID;
+  let parent = process.env.CLAUDE_CODE_SESSION_ID;
+  let parentAgent = 'claude';
   const valid = (value) => typeof value === 'string' && /^[A-Za-z0-9_-]+$/.test(value);
+  try {
+    const assigned = delegation.forSession(ROOT, { id: sid, agent: 'codex' }, delegationDependencies());
+    if (assigned.record && assigned.record.parent && assigned.record.parent.agent === 'claude') {
+      parent = assigned.record.parent.id;
+      parentAgent = assigned.record.parent.agent;
+    }
+  } catch {}
   if (!valid(sid) || !valid(parent) || sid === parent) return;
   const dir = path.join(META, 'codex-parents');
   const at = Date.now();
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, `${sid}.json`), JSON.stringify({ at, parent, agent: 'claude', cwd: input.cwd || process.cwd() }));
+  fs.writeFileSync(path.join(dir, `${sid}.json`), JSON.stringify({ at, parent, agent: parentAgent, cwd: input.cwd || process.cwd() }));
   for (const name of fs.readdirSync(dir)) {
     if (!name.endsWith('.json')) continue;
     try { if (fs.statSync(path.join(dir, name)).mtimeMs < at - 30 * 86400e3) fs.unlinkSync(path.join(dir, name)); } catch {}
@@ -5662,7 +5677,8 @@ function stopHook(input, agent = 'claude') {
   // stale. Otherwise valid delegations suppress every ownership/check-in nag and
   // all parent-card auto-continuation, including permission-grant continuation.
   if (assigned.kind === 'active') return;
-  if (assigned.kind === 'stale' || assigned.kind === 'invalid' || assigned.kind === 'pending') {
+  if (assigned.kind === 'stale' || assigned.kind === 'invalid' || assigned.kind === 'pending'
+      || assigned.kind === 'identity-mismatch') {
     if (asked) return;
     const notice = assigned.record
       ? `${assigned.record.id}:${assigned.record.staleAt || assigned.reason || assigned.kind}`

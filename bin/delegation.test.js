@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const test = require('node:test');
 
 const CLI = path.join(__dirname, 'keep.js');
@@ -50,12 +50,30 @@ function editEvidence() {
   return `${JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Edit' }] } })}\n`;
 }
 
+function exited(child) {
+  return new Promise((resolve) => {
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('close', (status, signal) => resolve({ status, signal, stdout, stderr }));
+  });
+}
+
+async function waitUntil(check, timeout = 5000) {
+  const deadline = Date.now() + timeout;
+  while (!check()) {
+    if (Date.now() > deadline) throw new Error('timed out waiting for concurrent workers');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 test('wrapper transports an exact assignment into SessionStart without changing card ownership', () => {
   const f = fixture();
   try {
     const card = f.addPlan();
     const child = [
       "const {spawnSync}=require('node:child_process')",
+      "process.stdout.write(`ambient:${process.env.CODEX_THREAD_ID || 'none'}:${process.env.CLAUDE_CODE_SESSION_ID || 'none'}\\n`)",
       "const r=spawnSync(process.execPath,[process.env.TEST_KEEP_CLI,'hook','session-start'],{encoding:'utf8',env:process.env,input:JSON.stringify({session_id:'worker-session',cwd:process.cwd()})})",
       'process.stdout.write(r.stdout)',
       'process.stderr.write(r.stderr)',
@@ -65,6 +83,7 @@ test('wrapper transports an exact assignment into SessionStart without changing 
       CODEX_THREAD_ID: 'parent-session', TEST_KEEP_CLI: CLI,
     });
     assert.equal(launched.status, 0, launched.stderr);
+    assert.match(launched.stdout, /^ambient:none:none$/m);
     assert.match(launched.stdout, /Explicit delegation: card parent-card step 1/);
     assert.match(launched.stdout, /Parent codex session parent-session owns/);
     assert.doesNotMatch(launched.stdout, /Before taking over existing work/);
@@ -95,6 +114,17 @@ test('prepare/accept and known-session registration bind parallel workers to dis
     });
     assert.equal(accepted.status, 0, accepted.stderr);
     assert.match(accepted.stdout, /as codex session worker-one/);
+    const acceptedFiling = f.run(['add', 'Accepted worker filing', '--file'], {
+      CLAUDE_CODE_SESSION_ID: 'parent-claude', CODEX_THREAD_ID: 'worker-one',
+    });
+    assert.equal(acceptedFiling.status, 0, acceptedFiling.stderr);
+    assert.match(fs.readFileSync(path.join(f.root, 'tasks', 'accepted-worker-filing.md'), 'utf8'), /created \(by codex worker-one\)/);
+    const codexStartup = f.run(['hook', 'codex', 'start'], {
+      CLAUDE_CODE_SESSION_ID: 'parent-claude', CODEX_THREAD_ID: 'worker-one',
+    }, { input: JSON.stringify({ session_id: 'worker-one', cwd: f.root }) });
+    assert.equal(codexStartup.status, 0, codexStartup.stderr);
+    const parentLink = JSON.parse(fs.readFileSync(path.join(f.root, '.keep', 'codex-parents', 'worker-one.json'), 'utf8'));
+    assert.deepEqual({ parent: parentLink.parent, agent: parentLink.agent }, { parent: 'parent-claude', agent: 'claude' });
 
     const registered = f.run(['delegate', card, '--step', '2', '--session', 'worker-two', '--agent', 'codex'], { CODEX_THREAD_ID: 'parent-session' });
     assert.equal(registered.status, 0, registered.stderr);
@@ -104,6 +134,51 @@ test('prepare/accept and known-session registration bind parallel workers to dis
     const self = f.run(['delegate', card, '--step', '1', '--session', 'parent-session', '--agent', 'codex'], { CODEX_THREAD_ID: 'parent-session' });
     assert.equal(self.status, 1);
     assert.match(self.stderr, /worker session must differ from the parent/);
+  } finally { f.cleanup(); }
+});
+
+test('simultaneous accepts bind one worker and every loser observes the winner', async () => {
+  const f = fixture();
+  try {
+    const card = f.addPlan();
+    const prepared = f.run(['delegate', card, '--step', '1', '--prepare'], { CLAUDE_CODE_SESSION_ID: 'parent-claude' });
+    const id = prepared.stdout.match(/prepared delegation ([a-f0-9]{32})/)[1];
+    const barrier = path.join(f.root, 'accept-barrier');
+    const script = [
+      "const fs=require('node:fs')",
+      "const {spawnSync}=require('node:child_process')",
+      "fs.writeFileSync(process.env.READY,'')",
+      "const wait=new Int32Array(new SharedArrayBuffer(4))",
+      "while(!fs.existsSync(process.env.BARRIER)) Atomics.wait(wait,0,0,2)",
+      "const r=spawnSync(process.execPath,[process.env.TEST_KEEP_CLI,'delegate','--accept',process.env.DELEGATION],{encoding:'utf8',env:process.env})",
+      'process.stdout.write(r.stdout)',
+      'process.stderr.write(r.stderr)',
+      'process.exit(r.status)',
+    ].join(';');
+    const children = [];
+    for (let index = 0; index < 6; index += 1) {
+      children.push(spawn(process.execPath, ['-e', script], {
+        cwd: f.root,
+        env: {
+          ...f.env,
+          TEST_KEEP_CLI: CLI,
+          DELEGATION: id,
+          BARRIER: barrier,
+          READY: path.join(f.root, `ready-${index}`),
+          CLAUDE_CODE_SESSION_ID: 'parent-claude',
+          CODEX_THREAD_ID: `worker-${index}`,
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }));
+    }
+    await waitUntil(() => children.every((_child, index) => fs.existsSync(path.join(f.root, `ready-${index}`))));
+    fs.writeFileSync(barrier, 'go');
+    const results = await Promise.all(children.map(exited));
+    const winners = results.filter((result) => result.status === 0);
+    assert.equal(winners.length, 1, results.map((result) => `${result.status}:${result.stderr}`).join('\n'));
+    for (const loser of results.filter((result) => result.status !== 0)) assert.match(loser.stderr, /already bound to/);
+    const record = f.readDelegations().find((entry) => entry.id === id);
+    assert.match(winners[0].stdout, new RegExp(`as codex session ${record.worker.id}$`, 'm'));
   } finally { f.cleanup(); }
 });
 
@@ -138,8 +213,15 @@ test('valid delegation suppresses duplicate add and Stop nags while independent 
 
     const filed = f.run(['add', 'Independent follow-up', '--file'], workerEnv);
     assert.equal(filed.status, 0, filed.stderr);
+    assert.match(fs.readFileSync(path.join(f.root, 'tasks', 'independent-follow-up.md'), 'utf8'), /created \(by claude worker-session\)/);
     const idea = f.run(['add', 'Independent idea', '--kind', 'idea'], workerEnv);
     assert.equal(idea.status, 0, idea.stderr);
+    const scheduled = f.run(['add', 'Independent scheduled', '--file', '--check-after', '+1h', '--check', 'inspect'], workerEnv);
+    assert.equal(scheduled.status, 0, scheduled.stderr);
+    assert.match(fs.readFileSync(path.join(f.root, 'tasks', 'independent-scheduled.md'), 'utf8'), /^scheduled_by: worker-session$/m);
+    const contribution = f.run(['checkin', card, '-m', 'Worker evidence only.'], workerEnv);
+    assert.equal(contribution.status, 0, contribution.stderr);
+    assert.match(fs.readFileSync(path.join(f.root, 'tasks', `${card}.md`), 'utf8'), /check-in \(by claude worker-session\)/);
 
     const transcript = path.join(f.root, 'worker.jsonl');
     fs.writeFileSync(transcript, '');
@@ -175,6 +257,33 @@ test('changed assignment becomes durably stale and Stop asks for reassignment on
     fs.writeFileSync(questionTranscript, `${JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'Parent, should I wait for reassignment?' }] } })}\n`);
     assert.equal(claudeStart(f, 'worker-session', { KEEP_DELEGATION_ID: id, CLAUDE_CODE_SESSION_ID: 'worker-session' }, questionTranscript).status, 0);
     assert.equal(stopInput(f, 'worker-session', questionTranscript).stdout, '');
+  } finally { f.cleanup(); }
+});
+
+test('identity-mismatched Stop gives bounded guidance and never follows the parent card', () => {
+  const f = fixture();
+  try {
+    const card = f.addPlan();
+    const registration = f.run(['delegate', card, '--step', '1', '--session', 'codex-worker', '--agent', 'codex'], { CODEX_THREAD_ID: 'parent-session' });
+    const id = registration.stdout.match(/registered delegation ([a-f0-9]{32})/)[1];
+    const nestedEnv = {
+      KEEP_DELEGATION_ID: id,
+      CODEX_THREAD_ID: 'codex-worker',
+      CLAUDE_CODE_SESSION_ID: 'nested-claude',
+    };
+    const transcript = path.join(f.root, 'nested.jsonl');
+    fs.writeFileSync(transcript, '');
+    const startup = claudeStart(f, 'nested-claude', nestedEnv, transcript);
+    assert.match(startup.stdout, /Delegation identity mismatch/);
+    fs.appendFileSync(transcript, editEvidence().repeat(5));
+    const first = f.run(['hook', 'stop'], nestedEnv, {
+      input: JSON.stringify({ session_id: 'nested-claude', cwd: f.root, transcript_path: transcript }),
+    });
+    assert.match(JSON.parse(first.stdout).reason, /identity mismatch/);
+    const second = f.run(['hook', 'stop'], nestedEnv, {
+      input: JSON.stringify({ session_id: 'nested-claude', cwd: f.root, transcript_path: transcript }),
+    });
+    assert.equal(second.stdout, '');
   } finally { f.cleanup(); }
 });
 

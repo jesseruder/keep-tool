@@ -3,6 +3,7 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 
 const SESSION_RE = /^[A-Za-z0-9_-]+$/;
 const AGENTS = new Set(['claude', 'codex']);
@@ -55,6 +56,68 @@ function write(root, record) {
   return record;
 }
 
+const lockSleep = new Int32Array(new SharedArrayBuffer(4));
+
+function processStartedAt(pid) {
+  try {
+    return execFileSync('ps', ['-p', String(pid), '-o', 'lstart='], {
+      encoding: 'utf8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, LC_ALL: 'C' },
+    }).trim();
+  } catch { return ''; }
+}
+
+function processAlive(pid, startedAt) {
+  if (!Number.isInteger(pid) || pid < 1) return false;
+  if (startedAt) {
+    const actual = processStartedAt(pid);
+    if (actual) return actual === startedAt;
+  }
+  try { process.kill(pid, 0); return true; } catch (error) { return error && error.code === 'EPERM'; }
+}
+
+function withRecordLock(root, id, fn) {
+  const dir = directory(root);
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `${id}.lock`);
+  let fd;
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    try {
+      fd = fs.openSync(file, 'wx', 0o600);
+      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: processStartedAt(process.pid) }));
+      break;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      try {
+        const holder = JSON.parse(fs.readFileSync(file, 'utf8'));
+        if (!processAlive(Number(holder.pid), holder.startedAt)) {
+          fs.unlinkSync(file);
+          continue;
+        }
+      } catch (readError) {
+        try {
+          if (Date.now() - fs.statSync(file).mtimeMs > 30e3) fs.unlinkSync(file);
+        } catch {}
+      }
+      Atomics.wait(lockSleep, 0, 0, 5);
+    }
+  }
+  if (fd == null) throw new Error(`delegation ${id} is busy; retry`);
+  try { return fn(); }
+  finally {
+    try { fs.closeSync(fd); } catch {}
+    try { fs.unlinkSync(file); } catch {}
+  }
+}
+
+function mutate(root, id, change) {
+  return withRecordLock(root, id, () => {
+    const current = read(root, id);
+    if (!current) throw new Error(`unknown delegation ${id}`);
+    const next = change(current) || current;
+    return write(root, next);
+  });
+}
+
 function read(root, id) {
   if (!SESSION_RE.test(String(id || ''))) return null;
   try {
@@ -80,20 +143,20 @@ function create(root, { card, step, parent, now = Date.now() }) {
 
 function bind(root, id, worker, { now = Date.now(), source = 'explicit' } = {}) {
   if (!validSession(worker)) throw new Error('worker session must have an id and agent (claude or codex)');
-  const record = read(root, id);
-  if (!record) throw new Error(`unknown delegation ${id}`);
-  if (record.explicitEndedAt) throw new Error(`delegation ${id} was explicitly ended`);
-  if (record.staleAt) throw new Error(`delegation ${id} is stale: ${record.staleReason || 'the parent assignment changed'}`);
-  if (record.parent.id === worker.id) throw new Error('the worker session must differ from the parent session');
-  if (record.worker && (record.worker.id !== worker.id || record.worker.agent !== worker.agent)) {
-    throw new Error(`delegation ${id} is already bound to ${record.worker.agent} session ${record.worker.id}`);
-  }
-  record.worker = { id: String(worker.id), agent: worker.agent };
-  record.boundAt = record.boundAt || now;
-  record.lastStartedAt = now;
-  record.bindSource = source;
-  delete record.processEndedAt;
-  return write(root, record);
+  return mutate(root, id, (record) => {
+    if (record.explicitEndedAt) throw new Error(`delegation ${id} was explicitly ended`);
+    if (record.staleAt) throw new Error(`delegation ${id} is stale: ${record.staleReason || 'the parent assignment changed'}`);
+    if (record.parent.id === worker.id) throw new Error('the worker session must differ from the parent session');
+    if (record.worker && (record.worker.id !== worker.id || record.worker.agent !== worker.agent)) {
+      throw new Error(`delegation ${id} is already bound to ${record.worker.agent} session ${record.worker.id}`);
+    }
+    record.worker = { id: String(worker.id), agent: worker.agent };
+    record.boundAt = record.boundAt || now;
+    record.lastStartedAt = now;
+    record.bindSource = source;
+    delete record.processEndedAt;
+    return record;
+  });
 }
 
 function registerStart(root, worker, env, dependencies) {
@@ -106,13 +169,20 @@ function registerStart(root, worker, env, dependencies) {
     if (record.worker && (record.worker.id !== worker.id || record.worker.agent !== worker.agent)) {
       return { kind: 'identity-mismatch', record };
     }
-    if (!record.explicitEndedAt && !record.staleAt) record = bind(root, id, worker, { now, source: 'environment' });
+    if (!record.explicitEndedAt && !record.staleAt) {
+      try { record = bind(root, id, worker, { now, source: 'environment' }); }
+      catch { record = read(root, id); }
+    }
   }
   else {
     record = findRawForSession(root, worker.id, worker.agent);
     if (record && record.processEndedAt && !record.explicitEndedAt && !record.staleAt) {
-      record = bind(root, record.id, worker, { now, source: 'resume' });
+      try { record = bind(root, record.id, worker, { now, source: 'resume' }); }
+      catch { record = read(root, record.id); }
     }
+  }
+  if (record && record.worker && (record.worker.id !== worker.id || record.worker.agent !== worker.agent)) {
+    return { kind: 'identity-mismatch', record };
   }
   return state(root, record, dependencies);
 }
@@ -121,16 +191,20 @@ function markProcessEnd(root, worker, now = Date.now()) {
   if (!validSession(worker)) return null;
   const found = findRawForSession(root, worker.id, worker.agent);
   if (!found || found.explicitEndedAt) return found;
-  found.processEndedAt = now;
-  return write(root, found);
+  return mutate(root, found.id, (record) => {
+    if (!record.explicitEndedAt) record.processEndedAt = now;
+    return record;
+  });
 }
 
 function end(root, record, reason = 'explicit', now = Date.now()) {
   if (!record) return null;
-  record.explicitEndedAt = now;
-  record.explicitEndReason = reason;
-  delete record.processEndedAt;
-  return write(root, record);
+  return mutate(root, record.id, (current) => {
+    current.explicitEndedAt = current.explicitEndedAt || now;
+    current.explicitEndReason = current.explicitEndReason || reason;
+    delete current.processEndedAt;
+    return current;
+  });
 }
 
 function records(root) {
@@ -168,10 +242,20 @@ function state(root, record, { loadTask, parsePlan, persist = true, now = Date.n
   if (record.staleAt) return { kind: 'stale', record, reason: record.staleReason };
   const reason = staleReason(record, loadTask, parsePlan);
   if (reason) {
-    record.staleAt = now;
-    record.staleReason = reason;
-    if (persist) write(root, record);
-    return { kind: 'stale', record, reason };
+    if (persist) {
+      record = mutate(root, record.id, (current) => {
+        if (!current.explicitEndedAt && !current.staleAt) {
+          current.staleAt = now;
+          current.staleReason = reason;
+        }
+        return current;
+      });
+      if (record.explicitEndedAt) return { kind: 'ended', record, explicit: true };
+    } else {
+      record.staleAt = now;
+      record.staleReason = reason;
+    }
+    return { kind: 'stale', record, reason: record.staleReason || reason };
   }
   if (record.processEndedAt) return { kind: 'ended', record, explicit: false };
   if (!record.worker) return { kind: 'pending', record };
@@ -206,6 +290,17 @@ function resolveForCommand(root, env, current, dependencies) {
     }
     return fromToken;
   }
+  const candidates = sessionCandidates(env);
+  const bound = candidates.map((candidate) => ({ candidate, status: forSession(root, candidate, dependencies) }))
+    .filter((entry) => entry.status.kind !== 'none');
+  if (bound.length === 1) {
+    const selected = bound[0].status;
+    const record = selected.record;
+    const matches = (candidate, session) => candidate && session && candidate.id === session.id && candidate.agent === session.agent;
+    const unexpected = candidates.filter((candidate) => !matches(candidate, record.worker) && !matches(candidate, record.parent));
+    return unexpected.length ? { kind: 'identity-mismatch', record } : selected;
+  }
+  if (bound.length > 1) return { kind: 'identity-mismatch', record: bound[0].status.record };
   return forSession(root, current, dependencies);
 }
 
@@ -218,7 +313,7 @@ function sessionCandidates(env) {
 }
 
 function acceptSession(record, env) {
-  const candidates = sessionCandidates(env).filter((candidate) => candidate.id !== record.parent.id);
+  const candidates = sessionCandidates(env).filter((candidate) => candidate.id !== record.parent.id || candidate.agent !== record.parent.agent);
   const unique = candidates.filter((candidate, index) => candidates.findIndex((other) => other.id === candidate.id && other.agent === candidate.agent) === index);
   if (unique.length !== 1) {
     throw new Error('keep delegate --accept needs exactly one current worker session distinct from the parent; use parent-side --session <id> --agent claude|codex instead');
