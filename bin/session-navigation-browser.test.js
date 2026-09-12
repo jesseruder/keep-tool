@@ -143,13 +143,13 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     const wait = (condition) => evaluate(`new Promise((resolve,reject)=>{const deadline=Date.now()+5000;const tick=()=>{if(${condition})resolve(true);else if(Date.now()>deadline)reject(new Error('condition timed out'));else setTimeout(tick,30)};tick()})`);
     await call('Page.navigate', { url: `http://127.0.0.1:${server.address().port}/` });
     await wait("document.querySelectorAll('#qlist .qitem').length >= 2");
-    await wait("document.querySelector('#health > span')?.textContent === 'daemon: warning'");
+    await wait("document.querySelector('#health > span')?.textContent === 'daemon' && document.querySelector('#health').getAttribute('aria-label') === 'Daemon warning; show health details'");
     assert.equal(await evaluate("document.querySelector('#health').classList.contains('warning') && !document.querySelector('#health').classList.contains('bad')"), true);
     assert.equal(await evaluate("document.querySelector('#health .pop').textContent.includes('processed 4 runs') && !document.querySelector('#health .pop').textContent.includes('recovered old error')"), true);
     assert.equal(await evaluate("document.querySelector('#health .pop').textContent.includes('last failed attempt 13h ago') && !document.querySelector('#health-injection')"), true);
     state.health = { daemon: { running: true, pid: 321 }, schedulers: [] };
     for (const client of eventClients) client.write('data: changed\n\n');
-    await wait("document.querySelector('#health > span')?.textContent === 'daemon: healthy'");
+    await wait("document.querySelector('#health > span')?.textContent === 'daemon' && document.querySelector('#health').getAttribute('aria-label') === 'Daemon healthy; show health details'");
     const textBaselines = await evaluate(`(() => {
       const row = document.querySelector('#qlist .qitem .p');
       const baseline = (selector) => {

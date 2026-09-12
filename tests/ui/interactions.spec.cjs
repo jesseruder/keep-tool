@@ -117,7 +117,11 @@ test('account handoff sends the explicit destination and confirms refreshed iden
 });
 
 test('account limit groups remain complete and reveal their account details on desktop', async ({ page }) => {
-  for (const width of [1200, 1280, 1440]) {
+  await page.evaluate(() => {
+    document.documentElement.classList.add('desktop');
+    document.querySelector('#soundButton').hidden = false;
+  });
+  for (const width of [900, 1100, 1280, 1500, 1600, 1920]) {
     await page.setViewportSize({ width, height: 950 });
     const groups = page.locator('#meters .meter-group');
     await expect(groups).toHaveCount(4);
@@ -125,6 +129,11 @@ test('account limit groups remain complete and reveal their account details on d
     await expect(page.locator('#meters')).toContainText('Codex week');
     expect(await page.locator('.bar').evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
     expect(await groups.evaluateAll((elements, viewportWidth) => elements.every((element) => {
+      const box = element.getBoundingClientRect();
+      const container = element.parentElement.getBoundingClientRect();
+      return box.width > 0 && box.height > 0 && box.left >= container.left && box.right <= container.right && box.left >= 0 && box.right <= viewportWidth;
+    }), width)).toBe(true);
+    expect(await page.locator('.bar > :not([hidden])').evaluateAll((elements, viewportWidth) => elements.every((element) => {
       const box = element.getBoundingClientRect();
       return box.width > 0 && box.height > 0 && box.left >= 0 && box.right <= viewportWidth;
     }), width)).toBe(true);
@@ -137,6 +146,17 @@ test('account limit groups remain complete and reveal their account details on d
   await codexFiveHour.focus();
   await expect(codexFiveHour.locator('.meter-details')).toContainText(`resets ${new Date(1780000000000).toLocaleString()}`);
   await expect(codexFiveHour.locator('.meter-details')).not.toContainText('1970');
+});
+
+test('daemon status uses its state color while exposing the state to assistive technology', async ({ page }) => {
+  await expect(page.locator('#health > span')).toHaveText('daemon');
+  await expect(page.locator('#health')).toHaveAttribute('aria-label', 'Daemon healthy; show health details');
+  fixture.state.health = { daemon: { running: false }, schedulers: [] };
+  fixture.publish();
+  await expect(page.locator('#health')).toHaveClass(/bad/);
+  await expect(page.locator('#health')).toHaveAttribute('aria-label', 'Daemon offline; show health details');
+  await page.locator('#health').click();
+  await expect(page.locator('#health .pop')).toContainText('keep serve');
 });
 
 test('top bar popovers start after a wrapped meter header', async ({ page }) => {
