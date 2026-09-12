@@ -129,6 +129,96 @@ test('git main checkout, subdirectory, and detached worktree share one repositor
   }
 });
 
+test('MCP servers inherit from the main checkout through a real worktree with scoped precedence', () => {
+  const f = fixture();
+  const worktree = path.join(f.root, 'repo-a-worktree');
+  try {
+    git(f.repoA, 'init', '-q');
+    git(f.repoA, 'config', 'user.name', 'Setup Test');
+    git(f.repoA, 'config', 'user.email', 'setup@example.test');
+    fs.writeFileSync(path.join(f.repoA, 'tracked'), 'one');
+    git(f.repoA, 'add', 'tracked');
+    git(f.repoA, 'commit', '-qm', 'initial');
+    git(f.repoA, 'worktree', 'add', '--detach', worktree, 'HEAD');
+    const nested = path.join(worktree, 'nested');
+    fs.mkdirSync(nested);
+    fs.writeFileSync(path.join(f.home, '.claude.json'), JSON.stringify({
+      mcpServers: {
+        globalOnly: { command: 'global' },
+        mainWins: { command: 'global' },
+        overridden: { command: 'global' },
+      },
+      projects: {
+        [f.repoA]: { mcpServers: {
+          mainOnly: { command: 'main' },
+          mainWins: { command: 'main' },
+          worktreeWins: { command: 'main' },
+          overridden: { command: 'main' },
+        } },
+        [worktree]: { mcpServers: {
+          worktreeOnly: { command: 'worktree' },
+          worktreeWins: { command: 'worktree' },
+          overridden: { command: 'worktree' },
+        } },
+        [nested]: { mcpServers: {
+          exactOnly: { command: 'exact' },
+          overridden: { command: 'exact' },
+        } },
+      },
+    }));
+
+    const servers = setup.effectiveMcpServers(f.source, nested);
+    assert.deepEqual(Object.keys(servers).sort(), [
+      'exactOnly', 'globalOnly', 'mainOnly', 'mainWins', 'overridden', 'worktreeOnly', 'worktreeWins',
+    ]);
+    assert.equal(servers.mainWins.command, 'main');
+    assert.equal(servers.worktreeWins.command, 'worktree');
+    assert.equal(servers.overridden.command, 'exact');
+  } finally {
+    try { git(f.repoA, 'worktree', 'remove', '--force', worktree); } catch {}
+    f.cleanup();
+  }
+});
+
+test('managed MCP config upgrades only an exact legacy generated file', () => {
+  const f = fixture();
+  const worktree = path.join(f.root, 'repo-a-worktree');
+  try {
+    git(f.repoA, 'init', '-q');
+    git(f.repoA, 'config', 'user.name', 'Setup Test');
+    git(f.repoA, 'config', 'user.email', 'setup@example.test');
+    fs.writeFileSync(path.join(f.repoA, 'tracked'), 'one');
+    git(f.repoA, 'add', 'tracked');
+    git(f.repoA, 'commit', '-qm', 'initial');
+    git(f.repoA, 'worktree', 'add', '--detach', worktree, 'HEAD');
+    const nested = path.join(worktree, 'nested');
+    fs.mkdirSync(nested);
+    const stateFile = path.join(f.home, '.claude.json');
+    const state = {
+      mcpServers: { global: { command: 'global' } },
+      projects: { [nested]: { mcpServers: { exact: { command: 'exact' } } } },
+    };
+    fs.writeFileSync(stateFile, JSON.stringify(state));
+    setup.shareSetup(f.source, f.target);
+    const generated = setup.mcpConfigPath(f.targetDir, nested);
+    const legacy = fs.readFileSync(generated, 'utf8');
+
+    state.projects[f.repoA] = { mcpServers: { inherited: { command: 'main' } } };
+    fs.writeFileSync(stateFile, JSON.stringify(state));
+    const upgraded = setup.ensureSharedMemory(f.target, nested);
+    assert.deepEqual(Object.keys(upgraded.mcpServers).sort(), ['exact', 'global', 'inherited']);
+    assert.notEqual(fs.readFileSync(generated, 'utf8'), legacy);
+
+    const conflict = JSON.stringify({ mcpServers: { unrelated: { command: 'changed' } } }, null, 2) + '\n';
+    fs.writeFileSync(generated, conflict);
+    assert.throws(() => setup.ensureSharedMemory(f.target, nested), /managed MCP configuration conflicts/);
+    assert.equal(fs.readFileSync(generated, 'utf8'), conflict);
+  } finally {
+    try { git(f.repoA, 'worktree', 'remove', '--force', worktree); } catch {}
+    f.cleanup();
+  }
+});
+
 test('only explicit builtIn accounts use the sibling Claude state file', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-state-path-'));
   try {

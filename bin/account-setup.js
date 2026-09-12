@@ -95,6 +95,15 @@ function projectEntry(state, cwd) {
   })?.[1] || {};
 }
 
+function mcpServerSets(state, cwd) {
+  const exact = canonical(cwd);
+  const scopes = [...new Set([repositoryRoot(exact), worktreeRoot(exact), exact].map(canonical))];
+  const desired = { ...(state.mcpServers || {}) };
+  for (const scope of scopes) Object.assign(desired, projectEntry(state, scope).mcpServers || {});
+  const legacy = { ...(state.mcpServers || {}), ...(projectEntry(state, exact).mcpServers || {}) };
+  return { desired, legacy };
+}
+
 function sourceState(account, override) {
   const setup = readSetup(account);
   const file = override || setup?.originStateFile || setup?.sourceStateFile || stateFile(account);
@@ -104,13 +113,16 @@ function sourceState(account, override) {
 function effectiveMcpServers(sourceAccount, cwd, options = {}) {
   const managed = readSetup(sourceAccount);
   const state = sourceState(sourceAccount, options.sourceStateFile).value;
-  const desired = { ...(state.mcpServers || {}), ...(projectEntry(state, cwd).mcpServers || {}) };
+  const { desired, legacy } = mcpServerSets(state, cwd);
   if (!managed) return desired;
   const generated = mcpConfigPath(sourceAccount.configDir, cwd);
   if (!fs.existsSync(generated)) return desired;
+  const generatedText = fs.readFileSync(generated, 'utf8');
   const actual = readJSON(generated, {}).mcpServers || {};
-  if (digest(actual) !== digest(desired)) throw new Error(`managed MCP configuration conflicts for ${canonical(cwd)}`);
-  return actual;
+  if (digest(actual) === digest(desired)) return actual;
+  const legacyText = JSON.stringify({ mcpServers: legacy }, null, 2) + '\n';
+  if (generatedText === legacyText) return desired;
+  throw new Error(`managed MCP configuration conflicts for ${canonical(cwd)}`);
 }
 
 function mcpConfigPath(configDir, cwd) {
@@ -295,13 +307,20 @@ function ensureSharedMemory(account, cwd) {
     targetMemory = memoryPath(account.configDir, currentRoot);
   }
 
-  const servers = effectiveMcpServers(sourceAccount, cwd, { sourceStateFile: manifest?.originStateFile || manifest?.sourceStateFile });
+  const sourceStateFile = manifest?.originStateFile || manifest?.sourceStateFile;
+  const servers = effectiveMcpServers(sourceAccount, cwd, { sourceStateFile });
   let mcpConfig = null;
   if (manifest) {
     mcpConfig = mcpConfigPath(account.configDir, cwd);
     const desired = JSON.stringify({ mcpServers: servers }, null, 2) + '\n';
     if (fs.existsSync(mcpConfig)) {
-      if (fs.readFileSync(mcpConfig, 'utf8') !== desired) throw new Error(`managed MCP configuration conflicts for ${canonical(cwd)}`);
+      const actual = fs.readFileSync(mcpConfig, 'utf8');
+      if (actual !== desired) {
+        const state = sourceState(sourceAccount, sourceStateFile).value;
+        const legacy = JSON.stringify({ mcpServers: mcpServerSets(state, cwd).legacy }, null, 2) + '\n';
+        if (actual !== legacy) throw new Error(`managed MCP configuration conflicts for ${canonical(cwd)}`);
+        writeJSON(mcpConfig, { mcpServers: servers });
+      }
     } else writeJSON(mcpConfig, { mcpServers: servers });
   }
   return { memoryDir: targetMemory, autoMemoryDirectory: explicitMemory || targetMemory,
