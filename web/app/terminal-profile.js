@@ -198,9 +198,11 @@ export function createTerminalProfiler(options) {
     requestAnimationFrame: globalThis.requestAnimationFrame?.bind(globalThis) || (() => 0),
     cancelAnimationFrame: globalThis.cancelAnimationFrame?.bind(globalThis) || (() => {}),
     PerformanceObserver: globalThis.PerformanceObserver, AbortController: globalThis.AbortController,
+    randomNonce: () => globalThis.crypto?.randomUUID?.().replaceAll('-', '') || null,
     ...(options.env || {}),
   };
   const pane = options.pane;
+  const claimNonce = env.randomNonce();
   let phase = 'checking';
   let config = null;
   let recorder = null;
@@ -214,15 +216,19 @@ export function createTerminalProfiler(options) {
     env.clearTimeout(expiryTimer);
     options.wrapper.removeEventListener('wheel', claimOnWheel, true);
   };
-  const post = async (body) => {
+  const post = async (body, timeoutMs = 5000) => {
     const controller = env.AbortController ? new env.AbortController() : null;
-    const timeout = env.setTimeout(() => controller?.abort(), 5000);
+    const timeout = env.setTimeout(() => controller?.abort(), timeoutMs);
     try {
       const response = await env.fetch('/api/terminal-profile', {
         method: 'POST', cache: 'no-store', credentials: 'same-origin', signal: controller?.signal,
         headers: { 'content-type': 'application/json', 'x-keep': '1' }, body: JSON.stringify(body),
       });
-      if (!response.ok) throw new Error(`terminal profile request failed (${response.status})`);
+      if (!response.ok) {
+        const error = new Error(`terminal profile request failed (${response.status})`);
+        error.status = response.status;
+        throw error;
+      }
       return response.json();
     } finally { env.clearTimeout(timeout); }
   };
@@ -236,7 +242,7 @@ export function createTerminalProfiler(options) {
     for (const delay of [0, 250, 1000]) {
       if (delay) await new Promise((resolve) => env.setTimeout(resolve, delay));
       try {
-        await post({ action: 'report', pane, runtime, runId: config.runId, report });
+        await post({ action: 'report', pane, runtime, runId: config.runId, claimNonce, report });
         finishStatus('Scroll profile captured');
         phase = 'done';
         return;
@@ -259,18 +265,25 @@ export function createTerminalProfiler(options) {
     recorder = createRecorder({ ...options, runtime, env, onStop: recorderStopped }, config, event);
     options.capture?.(recorder);
     setStatus('Scroll profile recording…');
-    void post({ action: 'start', pane, runtime, runId: config.runId }).then(() => {
-      claimAccepted = true;
-      if (phase === 'claiming') phase = 'recording';
-      void submit();
-    }).catch(() => {
+    void (async () => {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          await post({ action: 'start', pane, runtime, runId: config.runId, claimNonce }, 3000);
+          claimAccepted = true;
+          if (phase === 'claiming') phase = 'recording';
+          void submit();
+          return;
+        } catch (error) {
+          if (error.status) break;
+        }
+      }
       recorder?.stop('error');
       options.capture?.(null);
       recorder = null;
       report = null;
       phase = 'done';
       setStatus(null);
-    });
+    })();
   };
 
   const check = async () => {
@@ -280,7 +293,8 @@ export function createTerminalProfiler(options) {
       const response = await env.fetch(`/api/terminal-profile?${query}`, { cache: 'no-store', credentials: 'same-origin' });
       if (!response.ok || phase !== 'checking') { phase = 'done'; return; }
       const body = await response.json();
-      if (!body.config || body.config.pane !== pane || body.config.runtime !== runtime
+      if (!/^[a-f0-9]{32}$/.test(claimNonce || '') || !body.config
+          || body.config.pane !== pane || body.config.runtime !== runtime
           || body.config.durationMs !== 15000 || !body.config.runId || body.config.expiresAt <= env.wallNow()) {
         phase = 'done'; return;
       }
@@ -302,10 +316,8 @@ export function createTerminalProfiler(options) {
     stop(reason = 'hidden') {
       if (phase === 'done') return;
       if (phase === 'armed' || phase === 'checking') {
-        const armed = phase === 'armed';
         phase = 'done';
         clearEligibility();
-        if (armed) void post({ action: 'cancel', pane, runtime, runId: config.runId }).catch(() => {});
         return;
       }
       recorderStopped(recorder?.stop(reason));

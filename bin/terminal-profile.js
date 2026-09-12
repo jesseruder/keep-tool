@@ -49,6 +49,7 @@ function validateIdentity(body, allowed) {
     throw new TerminalProfileError(400, 'bad terminal profile target');
   }
   if (body.runId != null && !RUN_RE.test(body.runId)) throw new TerminalProfileError(400, 'bad terminal profile run id');
+  if (body.claimNonce != null && !RUN_RE.test(body.claimNonce)) throw new TerminalProfileError(400, 'bad terminal profile claim nonce');
 }
 
 function validateTupleArray(value, key, shape) {
@@ -158,23 +159,31 @@ function createTerminalProfileStore(options = {}) {
         return { ok: true, config: config(active) };
       }
       if (body.action === 'start') {
-        validateIdentity(body, []);
+        validateIdentity(body, ['claimNonce']);
+        if (active?.state === 'recording' && active.runId === body.runId
+            && active.pane === body.pane && active.runtime === body.runtime
+            && active.claimNonce === body.claimNonce) {
+          return { ok: true, active: publicActive(active), duplicate: true };
+        }
         if (!active || active.state !== 'armed' || active.runId !== body.runId
-            || active.pane !== body.pane || active.runtime !== body.runtime) {
+            || active.pane !== body.pane || active.runtime !== body.runtime || !body.claimNonce) {
           throw new TerminalProfileError(409, 'terminal profile is not armed for this client');
         }
         const startedAt = now();
-        active = { ...active, state: 'recording', startedAt, reportBy: startedAt + DURATION_MS + REPORT_GRACE_MS };
+        active = { ...active, state: 'recording', claimNonce: body.claimNonce,
+          startedAt, reportBy: startedAt + DURATION_MS + REPORT_GRACE_MS };
         return { ok: true, active: publicActive(active) };
       }
       if (body.action === 'report') {
-        validateIdentity(body, ['report']);
+        validateIdentity(body, ['claimNonce', 'report']);
         const report = validateReport(body.report);
         if (lastReport?.value?.runId === body.runId && lastReport.value.pane === body.pane) {
+          if (lastReport.claimNonce !== body.claimNonce) throw new TerminalProfileError(409, 'terminal profile claim is owned by another client');
           return { ok: true, report: lastReport.value, duplicate: true };
         }
         if (!active || active.state !== 'recording' || active.runId !== body.runId
-            || active.pane !== body.pane || active.runtime !== body.runtime) {
+            || active.pane !== body.pane || active.runtime !== body.runtime
+            || active.claimNonce !== body.claimNonce) {
           throw new TerminalProfileError(409, 'terminal profile run is not recording');
         }
         if (report.runtime !== active.runtime) throw new TerminalProfileError(400, 'terminal profile runtime mismatch');
@@ -184,13 +193,20 @@ function createTerminalProfileStore(options = {}) {
           armedAt: active.armedAt, serverStartedAt: active.startedAt, receivedAt,
           durationMs: active.durationMs, report,
         };
-        lastReport = { pane: active.pane, expiresAt: receivedAt + REPORT_TTL_MS, value };
+        lastReport = { pane: active.pane, claimNonce: active.claimNonce,
+          expiresAt: receivedAt + REPORT_TTL_MS, value };
         active = null;
         return { ok: true, report: value };
       }
       if (body.action === 'cancel') {
-        validateIdentity(body, []);
-        if (active && active.runId === body.runId && active.pane === body.pane && active.runtime === body.runtime) active = null;
+        validateIdentity(body, ['claimNonce']);
+        if (!body.claimNonce) throw new TerminalProfileError(400, 'terminal profile cancel requires a claim nonce');
+        if (active && active.runId === body.runId && active.pane === body.pane && active.runtime === body.runtime) {
+          if (active.state !== 'recording' || active.claimNonce !== body.claimNonce) {
+            throw new TerminalProfileError(409, 'terminal profile claim is owned by another client');
+          }
+          active = null;
+        }
         return { ok: true };
       }
       throw new TerminalProfileError(400, 'unknown terminal profile action');

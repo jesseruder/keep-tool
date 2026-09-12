@@ -5,11 +5,13 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { createTerminalProfileStore } = require('./terminal-profile');
 
 const source = fs.readFileSync(path.join(__dirname, '../web/app/terminal-profile.js'), 'utf8')
   .replace(/^export /gm, '');
 
-function fixture(config) {
+function fixture(config, options = {}) {
+  const fixtureOptions = options;
   let now = 100;
   let wall = 1000;
   let renderHandler;
@@ -38,12 +40,14 @@ function fixture(config) {
     requestAnimationFrame(fn) { const id = ++nextId; frames.set(id, fn); return id; },
     cancelAnimationFrame(id) { frames.delete(id); },
     PerformanceObserver: null,
-    async fetch(_url, options = {}) {
+    randomNonce: () => 'f'.repeat(32),
+    async fetch(_url, request = {}) {
       fetches += 1;
-      if (!options.method) return { ok: true, json: async () => ({ config }) };
-      const body = JSON.parse(options.body);
+      if (!request.method) return { ok: true, json: async () => ({ config }) };
+      const body = JSON.parse(request.body);
       posts.push(body);
-      return { ok: true, json: async () => ({ ok: true }) };
+      const value = await (fixtureOptions.post?.(body) || { ok: true });
+      return { ok: true, json: async () => value };
     },
   };
   const statuses = [];
@@ -53,7 +57,7 @@ function fixture(config) {
     terminal: { onRender(fn) { renderHandler = fn; return { dispose() { renderDisposals += 1; } }; } },
     status: (value) => statuses.push(value), capture: (value) => captures.push(value), env,
   });
-  const flush = async () => { for (let i = 0; i < 5; i++) await Promise.resolve(); };
+  const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
   return {
     profiler, wrapper, posts, statuses, captures, timers, frames, flush,
     get fetches() { return fetches; }, get renderHandler() { return renderHandler; }, get renderDisposals() { return renderDisposals; },
@@ -80,6 +84,7 @@ test('trusted wheel starts bounded capture and records send, output, parse, rend
   f.wrapper.dispatch('wheel', { isTrusted: true, timeStamp: 95, deltaY: 12.5, deltaMode: 0 });
   await f.flush();
   assert.equal(f.posts[0].action, 'start');
+  assert.equal(f.posts[0].claimNonce, 'f'.repeat(32));
   assert.equal(typeof f.captures[0].inputSent, 'function');
   assert.equal(f.statuses[0], 'Scroll profile recording…');
   f.wrapper.dispatch('wheel', { isTrusted: false, timeStamp: 100, deltaY: 99, deltaMode: 0 });
@@ -109,4 +114,30 @@ test('trusted wheel starts bounded capture and records send, output, parse, rend
   assert.equal(f.renderDisposals, 1);
   assert.equal(f.captures.at(-1), null);
   assert.equal(f.frames.size, 0);
+});
+
+test('a lost start response retries the same owned claim and preserves the capture', async () => {
+  const backend = createTerminalProfileStore({ now: () => 1000, randomRunId: () => 'a'.repeat(32) });
+  const config = backend.act({ action: 'arm', pane: 'pane', runtime: 'desktop', durationMs: 15000 }).config;
+  let loseFirstResponse = true;
+  const f = fixture(config, { post(body) {
+    const value = backend.act(body);
+    if (body.action === 'start' && loseFirstResponse) {
+      loseFirstResponse = false;
+      throw new TypeError('response lost');
+    }
+    return value;
+  } });
+  await f.flush();
+  f.wrapper.dispatch('wheel', { isTrusted: true, timeStamp: 95, deltaY: 4, deltaMode: 0 });
+  await f.flush();
+  const starts = f.posts.filter((body) => body.action === 'start');
+  assert.equal(starts.length, 2);
+  assert.equal(starts[0].claimNonce, starts[1].claimNonce);
+  assert.equal(backend.view('pane', 'desktop').active.state, 'recording');
+  assert.equal(f.profiler.state, 'recording');
+  assert.notEqual(f.captures.at(-1), null, 'tentative samples survive the lost response');
+  f.profiler.stop('hidden');
+  await f.flush();
+  assert.ok(backend.view('pane', 'desktop').report, 'the original claimant can still report');
 });

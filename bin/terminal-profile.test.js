@@ -27,10 +27,17 @@ test('terminal profiles are opt-in, pane/runtime scoped, and atomically claimed'
   assert.equal(store.view('pane', 'web').config, null, 'a browser observer cannot consume a desktop arm');
   assert.equal(store.view('other', 'desktop').config, null, 'another pane cannot see the config');
   assert.equal(store.view('pane', 'desktop').config.runId, armed.config.runId);
-  const started = store.act({ action: 'start', pane: 'pane', runtime: 'desktop', runId: armed.config.runId });
+  const claimNonce = '1'.repeat(32);
+  const started = store.act({ action: 'start', pane: 'pane', runtime: 'desktop', runId: armed.config.runId, claimNonce });
   assert.equal(started.active.state, 'recording');
   assert.equal(store.view('pane', 'desktop').config, null, 'claimed config is no longer offered');
-  assert.throws(() => store.act({ action: 'start', pane: 'pane', runtime: 'desktop', runId: armed.config.runId }), /not armed/);
+  assert.equal(store.act({ action: 'start', pane: 'pane', runtime: 'desktop', runId: armed.config.runId, claimNonce }).duplicate, true);
+  const competing = '2'.repeat(32);
+  assert.throws(() => store.act({ action: 'start', pane: 'pane', runtime: 'desktop', runId: armed.config.runId, claimNonce: competing }), /not armed/);
+  assert.throws(() => store.act({ action: 'cancel', pane: 'pane', runtime: 'desktop', runId: armed.config.runId, claimNonce: competing }), /another client/);
+  assert.equal(store.view('pane', 'desktop').active.state, 'recording', 'a competing client cannot release the winner');
+  assert.equal(store.act({ action: 'cancel', pane: 'pane', runtime: 'desktop', runId: armed.config.runId, claimNonce }).ok, true);
+  assert.equal(store.view('pane', 'desktop').active, null);
 });
 
 test('armed runs and last reports expire without timers or accumulation', () => {
@@ -40,11 +47,14 @@ test('armed runs and last reports expire without timers or accumulation', () => 
   now += ARM_TTL_MS;
   assert.equal(store.view('pane', 'desktop').active, null);
   const config = store.act({ action: 'arm', pane: 'pane', runtime: 'desktop', durationMs: 15000 }).config;
-  store.act({ action: 'start', pane: 'pane', runtime: 'desktop', runId: config.runId });
+  const claimNonce = '3'.repeat(32);
+  store.act({ action: 'start', pane: 'pane', runtime: 'desktop', runId: config.runId, claimNonce });
   now += 100;
-  const saved = store.act({ action: 'report', pane: 'pane', runtime: 'desktop', runId: config.runId, report: emptyReport() });
+  const saved = store.act({ action: 'report', pane: 'pane', runtime: 'desktop', runId: config.runId, claimNonce, report: emptyReport() });
   assert.equal(store.view('pane', 'desktop').report.runId, config.runId);
-  assert.equal(store.act({ action: 'report', pane: 'pane', runtime: 'desktop', runId: config.runId, report: emptyReport() }).duplicate, true);
+  assert.equal(store.act({ action: 'report', pane: 'pane', runtime: 'desktop', runId: config.runId, claimNonce, report: emptyReport() }).duplicate, true);
+  assert.throws(() => store.act({ action: 'report', pane: 'pane', runtime: 'desktop', runId: config.runId,
+    claimNonce: '4'.repeat(32), report: emptyReport() }), /another client/);
   assert.equal(saved.report.report.schema, 'keep-terminal-scroll-v1');
   now += REPORT_TTL_MS;
   assert.equal(store.view('pane', 'desktop').report, null);
@@ -66,6 +76,9 @@ test('request validation fixes duration and bounds action fields', () => {
   assert.throws(() => store.act({ action: 'arm', pane: 'pane', runtime: 'desktop', durationMs: 20000 }), /15000ms/);
   assert.throws(() => store.act({ action: 'arm', pane: 'pane', runtime: 'web', durationMs: 15000 }), /desktop runtime/);
   assert.throws(() => store.act({ action: 'arm', pane: 'pane', runtime: 'desktop', durationMs: 15000, text: 'no' }), /bad terminal profile request/);
+  const config = store.act({ action: 'arm', pane: 'pane', runtime: 'desktop', durationMs: 15000 }).config;
+  assert.throws(() => store.act({ action: 'cancel', pane: 'pane', runtime: 'desktop', runId: config.runId,
+    claimNonce: '5'.repeat(32) }), /another client/, 'an unclaimed arm has no client owner');
 });
 
 test('a saturated client report stays within the bounded request budget', () => {
