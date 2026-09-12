@@ -6443,6 +6443,7 @@ function startWtGcScheduler(options = {}) {
 
 function start(deps = {}) {
   health.record('daemon', { at: Date.now(), pid: process.pid, version: health.VERSION });
+  const terminalProfile = deps.terminalProfile || require('./terminal-profile').createTerminalProfileStore();
   let consoleServer = null;
   let dashboardBuilder = null;
   const shutdown = () => {
@@ -6820,6 +6821,16 @@ function start(deps = {}) {
       const authError = apiRequestAuthError(req, { isLocal, token });
       if (authError) return json(res, authError.status, { error: authError.error });
 
+      if (req.method === 'GET' && url.pathname === '/api/terminal-profile') {
+        try {
+          return json(res, 200, terminalProfile.view(
+            url.searchParams.get('pane'), url.searchParams.get('runtime'),
+          ));
+        } catch (error) {
+          return json(res, error.status || 500, { error: error.message });
+        }
+      }
+
       if (req.method === 'GET' && url.pathname === '/api/ui-debug') {
         return json(res, 200, { events: require('./ui-debug').read() });
       }
@@ -6960,6 +6971,10 @@ function start(deps = {}) {
         let body;
         try { body = await readBody(req); } catch (e) { return json(res, 400, { error: e.message }); }
         try {
+          if (url.pathname === '/api/terminal-profile') {
+            try { return json(res, 200, terminalProfile.act(body)); }
+            catch (error) { return json(res, error.status || 500, { error: error.message }); }
+          }
           if (url.pathname === '/api/restart-daemon') {
             try {
               const result = daemonRestartGate.prepare();

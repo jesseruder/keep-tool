@@ -2,6 +2,7 @@ import { createImagePasteHandler } from './image-paste.js';
 import { getPalette, resolvedTheme, xtermTheme } from './theme.js';
 import { captureFocusIntent } from './focus-intent.js';
 import { createTrackedPixelWheelHandler } from './terminal-scroll.js';
+import { createTerminalProfiler } from './terminal-profile.js';
 
 const encoder = new TextEncoder();
 
@@ -85,6 +86,8 @@ export function mountTerminal(container, pane, options = {}) {
   let userInputUntil = 0;
   let observerGeometry = '';
   let observerFont = null;
+  let profileNote = null;
+  let profileCapture = null;
   const pendingInput = [];
 
   const sendJson = (value) => {
@@ -97,6 +100,20 @@ export function mountTerminal(container, pane, options = {}) {
     const bounds = wrapper.getClientRects()[0];
     return presented && wrapper.isConnected && Boolean(bounds?.width && bounds?.height);
   };
+  const note = () => {
+    const sized = Number.isInteger(paneState?.cols) && Number.isInteger(paneState?.rows);
+    statusNote.textContent = profileNote || (!isPrimary && sized
+      ? `viewing at ${paneState.cols}×${paneState.rows} · click to take control` : '');
+  };
+  const profiler = createTerminalProfiler({
+    pane, terminal, wrapper,
+    runtime: window.__TAURI__ ? 'desktop' : 'web',
+    active: () => !disposed && !exited && !document.hidden && isVisible()
+      && socket?.readyState === WebSocket.OPEN && replayDone,
+    focused: () => document.hasFocus?.() !== false,
+    capture: (value) => { profileCapture = value; },
+    status: (value) => { profileNote = value; note(); },
+  });
   const trackpadWheel = createTrackedPixelWheelHandler(terminal, {
     active: () => !disposed && !document.hidden && presented && isVisible()
       && socket?.readyState === WebSocket.OPEN && replayDone,
@@ -128,11 +145,6 @@ export function mountTerminal(container, pane, options = {}) {
     if (!observing) return;
     observer.disconnect();
     observing = false;
-  };
-  const note = () => {
-    const sized = Number.isInteger(paneState?.cols) && Number.isInteger(paneState?.rows);
-    statusNote.textContent = !isPrimary && sized
-      ? `viewing at ${paneState.cols}×${paneState.rows} · click to take control` : '';
   };
   const scaleObserver = () => {
     const element = terminal.element;
@@ -276,7 +288,10 @@ export function mountTerminal(container, pane, options = {}) {
     replayDone = false;
     const flushInput = () => {
       if (!pendingInput.length || socket?.readyState !== WebSocket.OPEN || !replayDone) return;
-      for (const chunk of pendingInput) socket.send(chunk);
+      for (const chunk of pendingInput) {
+        profileCapture?.inputSent(chunk, socket.bufferedAmount);
+        socket.send(chunk);
+      }
       pendingInput.length = 0;
     };
     const markHealthy = () => {
@@ -295,7 +310,12 @@ export function mountTerminal(container, pane, options = {}) {
     socket.onmessage = (event) => {
       if (disposed || socket !== connection) return;
       if (typeof event.data !== 'string') {
-        terminal.write(new Uint8Array(event.data));
+        const bytes = new Uint8Array(event.data);
+        const capture = profileCapture;
+        if (capture) {
+          const output = capture.outputReceived(bytes.byteLength);
+          terminal.write(bytes, () => capture.outputParsed(output));
+        } else terminal.write(bytes);
         if (replayDone) markHealthy();
         return;
       }
@@ -353,6 +373,7 @@ export function mountTerminal(container, pane, options = {}) {
     };
     socket.onclose = () => {
       if (disposed || socket !== connection || exited || !retryable) return;
+      profiler.stop('error');
       setStatus('reconnecting');
       const delay = Math.min(8000, 250 * (2 ** retry++));
       retryTimer = setTimeout(connect, delay);
@@ -375,7 +396,10 @@ export function mountTerminal(container, pane, options = {}) {
 
   const sendUserBytes = (bytes) => {
     takeControl();
-    if (socket?.readyState === WebSocket.OPEN && replayDone) socket.send(bytes);
+    if (socket?.readyState === WebSocket.OPEN && replayDone) {
+      profileCapture?.inputSent(bytes, socket.bufferedAmount);
+      socket.send(bytes);
+    }
     else pendingInput.push(bytes);
   };
   const sendBytes = (bytes, { user }) => {
@@ -383,6 +407,7 @@ export function mountTerminal(container, pane, options = {}) {
     // Xterm answers terminal queries through onData; unmarked mouse motion can
     // arrive through either callback. Only the host-confirmed primary may reply.
     if (!isPrimary || claimPending || socket?.readyState !== WebSocket.OPEN || !replayDone) return;
+    profileCapture?.inputSent(bytes, socket.bufferedAmount);
     socket.send(JSON.stringify({ t: 'reply', data: base64Bytes(bytes) }));
   };
   const sendInput = (data, options) => sendBytes(encoder.encode(data), options);
@@ -508,6 +533,7 @@ export function mountTerminal(container, pane, options = {}) {
     setTheme(theme) { terminal.options.theme = theme?.mode ? xtermTheme(theme.mode, theme.palette) : theme; },
     show,
     hide() {
+      profiler.stop('hidden');
       presented = false;
       trackpadWheel.cancel();
       reportVisibility();
@@ -519,6 +545,7 @@ export function mountTerminal(container, pane, options = {}) {
       disposeWebgl();
     },
     syncVisibility() {
+      if (document.hidden) profiler.stop('hidden');
       reportVisibility();
       if (isVisible()) show(false);
       else {
@@ -527,6 +554,7 @@ export function mountTerminal(container, pane, options = {}) {
       }
     },
     dispose() {
+      profiler.stop('disposed');
       disposed = true;
       trackpadWheel.cancel();
       clearTimeout(retryTimer);

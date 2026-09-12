@@ -7,7 +7,8 @@ const { Terminal: HeadlessTerminal } = require('@xterm/headless');
 
 const imagePasteSource = fs.readFileSync(path.join(__dirname, '../web/app/image-paste.js'), 'utf8').replace(/^export /gm, '');
 const terminalScrollSource = fs.readFileSync(path.join(__dirname, '../web/app/terminal-scroll.js'), 'utf8').replace(/^export /gm, '');
-const source = imagePasteSource + '\n' + terminalScrollSource + '\n' + fs.readFileSync(path.join(__dirname, '../web/app/terminal.js'), 'utf8')
+const terminalProfileSource = fs.readFileSync(path.join(__dirname, '../web/app/terminal-profile.js'), 'utf8').replace(/^export /gm, '');
+const source = imagePasteSource + '\n' + terminalScrollSource + '\n' + terminalProfileSource + '\n' + fs.readFileSync(path.join(__dirname, '../web/app/terminal.js'), 'utf8')
   .replace(/^import .*;\n/gm, '').replace('export function mountTerminal', 'function mountTerminal');
 
 test('Triage and Watch move one terminal viewer instead of retaining a hidden primary', () => {
