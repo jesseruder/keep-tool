@@ -45,6 +45,34 @@ function retryAfterMs(value, now = Date.now()) {
   return Math.min(delay, MAX_RETRY_AFTER_MS);
 }
 
+function withCacheLock(file, fn) {
+  const lock = `${file}.lock`;
+  const deadline = Date.now() + 5000;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  for (;;) {
+    try {
+      fs.writeFileSync(lock, String(process.pid), { flag: 'wx', mode: 0o600 });
+      break;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      try {
+        if (Date.now() - fs.statSync(lock).mtimeMs > 30e3) {
+          const owner = Number(fs.readFileSync(lock, 'utf8'));
+          let alive = Number.isInteger(owner) && owner > 0;
+          if (alive) {
+            try { process.kill(owner, 0); } catch (cause) { alive = cause.code === 'EPERM'; }
+          }
+          if (!alive) { fs.unlinkSync(lock); continue; }
+        }
+      } catch {}
+      if (Date.now() >= deadline) throw new Error(`usage cache lock timed out: ${lock}`);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+  }
+  try { return fn(); }
+  finally { try { fs.unlinkSync(lock); } catch {} }
+}
+
 function emptySnapshot(agent) {
   return agent === 'claude'
     ? { limits: [], fetchedAt: null }
@@ -341,29 +369,34 @@ function createUsageManager(deps = {}) {
 
   function saveCache(state) {
     if (!cacheFile || state.account.agent !== 'claude') return;
-    let stored = {};
-    try { stored = JSON.parse(fs.readFileSync(cacheFile, 'utf8')); } catch {}
-    if (!stored || typeof stored !== 'object' || Array.isArray(stored)) stored = {};
-    if (!stored.accounts || typeof stored.accounts !== 'object' || Array.isArray(stored.accounts)) stored.accounts = {};
-    stored.version = 2;
-    stored.accounts[state.account.id] = {
-      identity: cacheIdentity(state.account),
-      snapshot: state.snapshot,
-      lastStartedAt: state.lastStartedAt,
-      nextAttemptAt: state.nextAttemptAt,
-      backoffMs: state.backoffMs,
-      failureKind: state.failureKind,
-    };
-    let defaultClaude = null;
-    try { defaultClaude = accountApi.defaultFor('claude', deps.env || process.env); } catch {}
-    if (defaultClaude && defaultClaude.id === state.account.id) stored.claude = state.snapshot;
-    const temp = `${cacheFile}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
     try {
-      fs.writeFileSync(temp, JSON.stringify(stored));
-      fs.renameSync(temp, cacheFile);
-    } catch {
-      try { fs.unlinkSync(temp); } catch {}
-    }
+      withCacheLock(cacheFile, () => {
+        let stored = {};
+        try { stored = JSON.parse(fs.readFileSync(cacheFile, 'utf8')); } catch {}
+        if (!stored || typeof stored !== 'object' || Array.isArray(stored)) stored = {};
+        if (!stored.accounts || typeof stored.accounts !== 'object' || Array.isArray(stored.accounts)) stored.accounts = {};
+        stored.version = 2;
+        stored.accounts[state.account.id] = {
+          identity: cacheIdentity(state.account),
+          snapshot: state.snapshot,
+          lastStartedAt: state.lastStartedAt,
+          nextAttemptAt: state.nextAttemptAt,
+          backoffMs: state.backoffMs,
+          failureKind: state.failureKind,
+        };
+        let defaultClaude = null;
+        try { defaultClaude = accountApi.defaultFor('claude', deps.env || process.env); } catch {}
+        if (defaultClaude && defaultClaude.id === state.account.id) stored.claude = state.snapshot;
+        const temp = `${cacheFile}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
+        try {
+          fs.writeFileSync(temp, JSON.stringify(stored));
+          fs.renameSync(temp, cacheFile);
+        } catch (error) {
+          try { fs.unlinkSync(temp); } catch {}
+          throw error;
+        }
+      });
+    } catch {}
   }
 
   async function refreshAccount(stateAccount) {
@@ -381,12 +414,18 @@ function createUsageManager(deps = {}) {
       if (state.inFlight || now < state.nextAttemptAt) continue;
       state.lastStartedAt = now;
       const generation = ++state.generation;
+      const currentAttempt = () => {
+        sync();
+        return states.get(account.id) === state && state.generation === generation;
+      };
       state.inFlight = new Promise((resolve) => setImmediate(resolve))
         .then(() => performRefresh(state.account, state.snapshot))
         .then((value) => {
+          if (!currentAttempt()) return { account, state, generation, ok: true, stale: true };
+          const completedAt = Number(clock());
           if (value) state.snapshot = value;
           delete state.snapshot.error;
-          state.nextAttemptAt = now + (account.agent === 'claude' ? CLAUDE_REFRESH_MS : CODEX_REFRESH_MS);
+          state.nextAttemptAt = completedAt + (account.agent === 'claude' ? CLAUDE_REFRESH_MS : CODEX_REFRESH_MS);
           if (account.agent === 'claude') {
             state.backoffMs = 0;
             state.failureKind = null;
@@ -394,6 +433,8 @@ function createUsageManager(deps = {}) {
           }
           return { account, state, generation, ok: true };
         }, (error) => {
+          if (!currentAttempt()) return { account, state, generation, ok: false, stale: true, error: shortError(account.agent === 'claude' ? 'Claude' : 'Codex', error) };
+          const completedAt = Number(clock());
           const message = shortError(account.agent === 'claude' ? 'Claude' : 'Codex', error);
           state.snapshot = { ...state.snapshot, error: message };
           if (account.agent === 'claude') {
@@ -401,15 +442,15 @@ function createUsageManager(deps = {}) {
             const sameKind = state.failureKind === (rateLimited ? 'rate-limit' : 'other');
             if (rateLimited) {
               state.backoffMs = Math.min(sameKind && state.backoffMs ? state.backoffMs * 2 : INITIAL_RATE_LIMIT_MS, MAX_RATE_LIMIT_MS);
-              state.nextAttemptAt = now + Math.max(state.backoffMs, retryAfterMs(error.retryAfter, now));
+              state.nextAttemptAt = completedAt + Math.max(state.backoffMs, retryAfterMs(error.retryAfter, completedAt));
               state.failureKind = 'rate-limit';
             } else {
               state.backoffMs = Math.min(sameKind && state.backoffMs ? state.backoffMs * 2 : INITIAL_BACKOFF_MS, MAX_BACKOFF_MS);
-              state.nextAttemptAt = now + CLAUDE_REFRESH_MS + state.backoffMs;
+              state.nextAttemptAt = completedAt + CLAUDE_REFRESH_MS + state.backoffMs;
               state.failureKind = 'other';
             }
             saveCache(state);
-          } else state.nextAttemptAt = now + CODEX_REFRESH_MS;
+          } else state.nextAttemptAt = completedAt + CODEX_REFRESH_MS;
           return { account, state, generation, ok: false, error: message };
         })
         .finally(() => { state.inFlight = null; try { onChange(); } catch {} });
