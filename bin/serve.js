@@ -4028,7 +4028,6 @@ async function openSession(body, deps = {}) {
     }, deps);
     const pane = spawned && spawned.pane && spawned.pane.id;
     if (!pane) throw new Error('terminal host did not return a pane');
-    if (sessionId) accounts.pinSession(sessionId, agent, account.id, { root: deps.root || keep.ROOT, env: deps.env || process.env });
     return { ok: true, created: 'pane', command, pane, sessionId, accountId: account.id, accountLabel: account.label,
       ...(Number.isInteger(spawned.pane.pid) ? { pid: spawned.pane.pid } : {}),
       ...(spawned.pane.createdAt != null ? { createdAt: spawned.pane.createdAt } : {}) };
@@ -4075,7 +4074,6 @@ async function openSession(body, deps = {}) {
   // A new pane has no lock to collide with. The launched agent reads settings.json's
   // model at startup, so it holds only the model key: never start mid-compaction.
   const launch = await withInjectionLock(launchHost, { model: true });
-  if (deps.onLaunched) await deps.onLaunched(launch);
   const handoff = Boolean(body.taskId) && !session;
   let releasePending = handoff && Boolean(body.requester);
   const release = () => {
@@ -4090,9 +4088,16 @@ async function openSession(body, deps = {}) {
     }
   };
 
-  release();
   const target = { pane: launch.pane };
+  let launchPrepared = false;
   try {
+    if (launch.sessionId) {
+      (deps.pinSession || accounts.pinSession)(launch.sessionId, agent, account.id,
+        { root: deps.root || keep.ROOT, env: deps.env || process.env });
+    }
+    if (deps.onLaunched) await deps.onLaunched(launch);
+    launchPrepared = true;
+    release();
     await (deps.waitForHostAgent || waitForHostAgent)(target, agent,
       freshStandalone ? { ...deps, detectPortableSetup: true } : deps);
     launch.settled = true;
@@ -4145,7 +4150,8 @@ async function openSession(body, deps = {}) {
       }
     }
     if (launch.sessionId) {
-      accounts.pinSession(launch.sessionId, agent, account.id, { root: deps.root || keep.ROOT, env: deps.env || process.env });
+      (deps.pinSession || accounts.pinSession)(launch.sessionId, agent, account.id,
+        { root: deps.root || keep.ROOT, env: deps.env || process.env });
     }
   } catch (error) {
     if (error?.extra?.awaitingSetup) error.extra.launch = { pane: launch.pane, sessionId: launch.sessionId, accountId: launch.accountId };
@@ -4161,7 +4167,7 @@ async function openSession(body, deps = {}) {
     }
     throw error;
   } finally {
-    release();
+    if (launchPrepared) release();
   }
 
   if (handoff && launch.sessionId) {
@@ -4290,6 +4296,7 @@ async function inspectReviewQueueLaunch(active, deps = {}) {
   const present = matches.find((pane) => pane.alive !== false && pane.agentAlive !== false);
   if (present) {
     if (present.meta?.agent !== active.agent || present.meta?.accountId !== active.accountId
+        || active.sessionId && present.meta?.sessionId !== active.sessionId
         || active.pane && present.id !== active.pane
         || active.panePid && present.pid !== active.panePid
         || active.paneCreatedAt != null && present.createdAt !== active.paneCreatedAt) {
@@ -4311,20 +4318,17 @@ async function recoverReviewQueueLaunch(active, hooks = {}, deps = {}) {
   await (deps.waitForHostAgent || waitForHostAgent)(target, active.agent, deps);
   const sessionId = active.sessionId || await (deps.waitForHostSessionId || waitForHostSessionId)(active.pane, deps);
   if (!sessionId) throw new InjectionError(409, 'review queue conversation session identity was not verified');
+  await assertReviewQueuePaneBinding({ pane: active.pane, launchId: active.launchId,
+    accountId: active.accountId, agent: active.agent, sessionId,
+    pid: active.panePid, createdAt: active.paneCreatedAt }, deps);
   if (typeof hooks.onSessionReady === 'function' && await hooks.onSessionReady({ ...active, sessionId }) !== true) {
     throw new InjectionError(409, 'review queue launch reservation changed before session registration');
   }
   await withInjectionLockRetry(
     async () => {
-      const pane = await (deps.getPane
-        || (async (paneId) => (await hostRequest('get', { pane: paneId }, deps))?.pane))(active.pane);
-      if (!pane?.alive || pane.agentAlive === false || pane.id !== active.pane
-          || pane.meta?.reviewQueueLaunchId !== active.launchId || pane.meta?.sessionId !== sessionId
-          || pane.meta?.agent !== active.agent || pane.meta?.accountId !== active.accountId
-          || active.panePid && pane.pid !== active.panePid
-          || active.paneCreatedAt != null && pane.createdAt !== active.paneCreatedAt) {
-        throw new InjectionError(409, 'reserved review conversation identity changed before instructions were sent');
-      }
+      await assertReviewQueuePaneBinding({ pane: active.pane, launchId: active.launchId,
+        accountId: active.accountId, agent: active.agent, sessionId,
+        pid: active.panePid, createdAt: active.paneCreatedAt }, deps);
       if (await hooks.onReady() !== true) {
         throw new InjectionError(409, 'review queue launch reservation changed before opening instructions were sent');
       }

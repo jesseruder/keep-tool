@@ -3938,6 +3938,25 @@ test('standalone post-spawn regular errors retain the HTTP existing-pane receipt
   } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
 });
 
+test('standalone post-spawn account pin failures retain the existing-pane receipt for both providers', async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-standalone-pin-error-'));
+  try {
+    for (const [agent, accountId] of [['claude', 'claude/default'], ['codex', 'codex/default']]) {
+      const pane = `${agent}-pin-error-pane`;
+      await assert.rejects(openSession({ fresh: true, cwd, agent, accountId,
+        requestId: `${agent}-pin-error-request` }, {
+        host: recordingHost((type) => type === 'spawn' ? { pane: { id: pane, pid: 63, createdAt: 64 } } : {}),
+        listHostPanes: async () => [], waitForHostAgent: async () => true,
+        waitForHostSessionId: async () => `${agent}-pin-error-session`,
+        pinSession: () => { throw new Error('ENOSPC: account registry write failed'); },
+      }), (error) => error instanceof InjectionError && error.status === 502
+        && error.extra?.code === 'OPEN_EXISTING_PANE' && error.extra.launch.pane === pane
+        && error.extra.launch.agent === agent && error.extra.launch.accountId === accountId
+        && error.extra.launch.recoverable === true);
+    }
+  } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+});
+
 test('review launch rejects unknown explicit accounts and replaced panes before registration or input', async () => {
   assert.throws(() => resolveReviewLaunchSelection({ agent: 'claude', accountId: 'account-that-does-not-exist' }),
     (error) => error.status === 400 && /unknown account/.test(error.message));

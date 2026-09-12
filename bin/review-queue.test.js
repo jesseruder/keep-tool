@@ -492,6 +492,45 @@ test('server recovery distinguishes unavailable, absent, exited, and live host p
   assert.equal(typed, false, 'a lost reservation must prevent opening instructions from being typed');
 });
 
+test('review recovery rejects changed session ids for both providers without persisting or typing', async () => {
+  for (const agent of ['claude', 'codex']) {
+    const active = { sessionId: 'original-session', launchId: `${agent}-launch`, agent,
+      accountId: `${agent}/default`, pane: `${agent}-pane`, panePid: 90, paneCreatedAt: 91,
+      pointer: 'read pointer', action: 'discuss' };
+    const pane = { id: active.pane, alive: true, pid: 90, createdAt: 91,
+      meta: { sessionId: 'replacement-session', reviewQueueLaunchId: active.launchId,
+        agent, accountId: active.accountId } };
+    assert.deepEqual(await inspectReviewQueueLaunch(active, { panes: [pane] }), {
+      state: 'unknown', pane: active.pane, message: 'reserved review conversation identity changed',
+    });
+    let registered = 0; let typed = 0;
+    await assert.rejects(recoverReviewQueueLaunch(active, {
+      onSessionReady: async () => { registered++; return true; }, onReady: async () => true,
+    }, {
+      waitForHostAgent: async () => true, getPane: async () => pane,
+      typeOpeningMessage: async () => { typed++; },
+    }), (error) => error.status === 409 && /pane identity changed/.test(error.message));
+    assert.deepEqual({ registered, typed }, { registered: 0, typed: 0 });
+  }
+});
+
+test('review recovery verifies a newly discovered session before persisting it', async () => {
+  const active = { sessionId: null, launchId: 'pending-codex-launch', agent: 'codex',
+    accountId: 'codex/default', pane: 'pending-codex-pane', panePid: 100, paneCreatedAt: 101,
+    pointer: 'read pointer', action: 'discuss' };
+  let registered = 0; let typed = 0;
+  await assert.rejects(recoverReviewQueueLaunch(active, {
+    onSessionReady: async () => { registered++; return true; }, onReady: async () => true,
+  }, {
+    waitForHostAgent: async () => true, waitForHostSessionId: async () => 'replacement-session',
+    getPane: async () => ({ id: active.pane, alive: true, pid: 200, createdAt: 201,
+      meta: { sessionId: 'replacement-session', reviewQueueLaunchId: 'replacement-launch',
+        agent: 'codex', accountId: active.accountId } }),
+    typeOpeningMessage: async () => { typed++; },
+  }), (error) => error.status === 409 && /pane identity changed/.test(error.message));
+  assert.deepEqual({ registered, typed }, { registered: 0, typed: 0 });
+});
+
 test('Codex review launch freezes account and model and binds the actual registered session', async () => {
   const f = fixture();
   try {
