@@ -69,6 +69,32 @@ test('launching and ambiguous metadata prevent duplicate portable launches', asy
   expect(fixture.events.filter(event => event.event === 'request' && event.path === '/api/transfer-session')).toHaveLength(0);
 });
 
+test('a bound unsent opening survives reload and retries the existing successor once', async ({ page }) => {
+  const transfer = fixture.portableTransfers[0];
+  Object.assign(transfer, { status: 'launching', policyVersion: 2, openingStatus: 'pending', recoverableOpening: true,
+    destinationSessionId: 'bound-successor', destinationPane: 'bound-pane' });
+  fixture.state.sessions.push({ id: 'bound-successor', kind: 'codex', title: 'Bound successor', project: transfer.cwd,
+    taskId: transfer.cardId, pane: transfer.destinationPane, accountId: transfer.targetAccountId, accountLabel: 'Codex Two',
+    portableTransferId: transfer.id, state: 'running', endedTurn: false });
+  fixture.state.panes.push({ id: transfer.destinationPane, pid: 904, createdAt: 'bound-pane-created', alive: true, cwd: transfer.cwd,
+    meta: { agent: 'codex', sessionId: 'bound-successor', accountId: transfer.targetAccountId,
+      accountLabel: 'Codex Two', card: transfer.cardId, portableTransferId: transfer.id } });
+  fixture.publish();
+  await page.reload();
+  await page.locator('#qlist [data-key="running:b"]').click();
+  await expect(page.locator('#stage [data-open-portable="bound-successor"]')).toContainText('Open existing successor');
+  await page.locator('#stage [data-review-portable="portable-one"]').click();
+  const modal = page.locator('.portable-transfer-dialog');
+  await expect(modal).toContainText('saved opening that was not sent');
+  await expect(modal.locator('[data-open-setup]')).toContainText('Open existing successor');
+  await expect(modal.locator('[data-retry-delivery]')).toContainText('Retry delivery');
+  await modal.locator('[data-retry-delivery]').click();
+  await expect(page.locator('#stage')).toHaveAttribute('data-item-key', 'bound-successor');
+  expect(fixture.state.sessions.filter(session => session.id === 'bound-successor')).toHaveLength(1);
+  expect(fixture.state.panes.filter(pane => pane.id === 'bound-pane')).toHaveLength(1);
+  expect(fixture.events.filter(event => event.event === 'request' && event.path === '/api/transfer-session')).toHaveLength(1);
+});
+
 test('desktop prepares, reviews, and launches a Claude source into a chosen account and model', async ({ page }) => {
   fixture.state.sessions.find(session => session.id === 'a').endedTurn = true;
   fixture.publish();

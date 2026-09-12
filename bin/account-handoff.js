@@ -98,9 +98,94 @@ function verifyOwnedGraph(entry, plan) {
 function targetRecordMatches(record, entry, target, pane) {
   const launchStartedAt = Number(entry?.targetLaunchStartedAt);
   const recordStartedAt = Number(record?.startedAt);
-  return Boolean(record && record.accountId === target.id && record.pane === pane.id
+  return Boolean(record && record.accountId === target.id && record.pane === pane.id && record.agent === entry.agent
     && Number.isFinite(launchStartedAt) && Number.isFinite(recordStartedAt)
     && recordStartedAt > launchStartedAt);
+}
+
+function targetLaunchFrom(result, entry, target) {
+  const pane = result?.pane && typeof result.pane === 'object' ? result.pane
+    : { id: result?.pane, pid: result?.pid, createdAt: result?.createdAt };
+  if (pane.id !== entry.pane || !Number.isInteger(pane.pid) || pane.pid <= 0 || pane.createdAt == null) {
+    throw new Error('Target pane launch identity was not verified');
+  }
+  return { pane: pane.id, panePid: pane.pid, paneCreatedAt: pane.createdAt,
+    sessionId: entry.sessionId, accountId: target.id, transactionId: entry.id };
+}
+
+function recordTargetLaunch(entry, result, target, root) {
+  entry.targetLaunch = targetLaunchFrom(result, entry, target);
+  entry.pid = entry.targetLaunch.panePid;
+  delete entry.targetIdentity;
+  writeOne(root, entry);
+}
+
+function targetPaneMatches(binding, inspected, entry, target) {
+  const pane = inspected?.pane;
+  const session = inspected?.session;
+  return Boolean(binding && pane?.alive === true && pane.agentAlive !== false
+    && pane.id === binding.pane && pane.pid === binding.panePid && pane.createdAt === binding.paneCreatedAt
+    && pane.meta?.sessionId === binding.sessionId && pane.meta?.accountId === binding.accountId
+    && pane.meta?.handoffTransactionId === binding.transactionId
+    && binding.pane === entry.pane && binding.sessionId === entry.sessionId
+    && binding.accountId === target.id && binding.transactionId === entry.id
+    && session?.id === entry.sessionId && session.kind === entry.agent);
+}
+
+function targetRolloutMatches(entry, identity) {
+  if (entry.agent !== 'codex') return true;
+  try { return fs.realpathSync(identity?.rolloutFile) === fs.realpathSync(entry.targetTranscript); }
+  catch { return false; }
+}
+
+function targetIdentityMatches(entry, inspected, target) {
+  const identity = inspected?.agentIdentity;
+  return Boolean(targetPaneMatches(entry?.targetIdentity, inspected, entry, target)
+    && identity?.primary === true && identity.pid === entry.targetIdentity.agentPid
+    && identity.pidStart === entry.targetIdentity.agentPidStart
+    && targetRolloutMatches(entry, identity));
+}
+
+function targetIdentityBound(entry, target) {
+  const identity = entry?.targetIdentity;
+  const launch = entry?.targetLaunch;
+  return Boolean(identity && identity.pane === entry.pane && identity.sessionId === entry.sessionId
+    && identity.accountId === target.id && identity.transactionId === entry.id
+    && Number.isInteger(identity.panePid) && identity.panePid > 0 && identity.paneCreatedAt != null
+    && launch?.pane === identity.pane && launch.panePid === identity.panePid
+    && launch.paneCreatedAt === identity.paneCreatedAt && launch.sessionId === identity.sessionId
+    && launch.accountId === identity.accountId && launch.transactionId === identity.transactionId
+    && Number.isInteger(identity.agentPid) && identity.agentPid > 0
+    && typeof identity.agentPidStart === 'string' && identity.agentPidStart
+    && Number.isFinite(Number(identity.sessionStartedAt))
+    && Number(identity.sessionStartedAt) > Number(entry.targetLaunchStartedAt));
+}
+
+async function verifyTargetLaunch(entry, target, record, deps, root) {
+  if (!targetRecordMatches(record, entry, target, { id: entry.pane })) {
+    throw new Error('Target SessionStart identity was not verified');
+  }
+  const inspected = await deps.inspect({ sessionId: entry.sessionId, pane: entry.pane });
+  const identity = inspected?.agentIdentity;
+  if (!targetPaneMatches(entry.targetLaunch, inspected, entry, target)
+      || identity?.primary !== true || !Number.isInteger(identity.pid) || identity.pid <= 0
+      || typeof identity.pidStart !== 'string' || !identity.pidStart
+      || !targetRolloutMatches(entry, identity)) {
+    throw new Error('Target process identity was not verified');
+  }
+  entry.targetIdentity = { ...entry.targetLaunch, agentPid: identity.pid, agentPidStart: identity.pidStart,
+    sessionStartedAt: Number(record.startedAt) };
+  writeOne(root, entry);
+}
+
+function requireTargetIdentity(entry, inspected, target) {
+  if (!targetIdentityMatches(entry, inspected, target)) throw new Error('Target process identity changed before continuation delivery');
+}
+
+function deliveryOptions(entry, source) {
+  return { deliveryId: entry.deliveryId, agent: entry.agent, sourceAccountId: source.id,
+    transactionId: entry.id, sourceStopVerifiedAt: entry.sourceStopVerifiedAt,
+    targetTranscript: entry.targetTranscript, targetIdentity: entry.targetIdentity };
 }
 
 function artifactProvider(agent, deps = {}) {
@@ -306,8 +391,10 @@ async function run(body, deps = {}) {
         if (receipt.sessionId !== session.id || receipt.kind !== session.kind) {
           const error = new Error('Continuation receipt does not belong to this session and provider'); error.status = 409; throw error;
         }
+        if (!targetIdentityBound(current, target)) {
+          const error = new Error('Confirmed continuation is missing its verified target identity'); error.status = 409; throw error;
+        }
         current.deliveredAt = Date.now();
-        if (current.resumeSpec && deps.verifyTargetSpec) await deps.verifyTargetSpec(current, target);
         commitTargetAuthorities(current, target, root);
         Object.assign(current, { status: 'done', phase: 'done', reason: '' }); writeOne(root, current);
         return { ok: true, ...safe(current) };
@@ -319,24 +406,20 @@ async function run(body, deps = {}) {
       current.pid = pane.pid;
       writeOne(root, current);
     }
-    if (current?.status === 'recovery-needed' && pane.alive && pane.meta?.accountId === target.id
-        && pane.meta?.handoffTransactionId === current.id
+    if (current?.status === 'recovery-needed' && pane.alive
         && ['starting-target', 'verifying-target', 'delivering-continuation'].includes(current.phase)) {
       try {
         if (!current.sourceStopVerifiedAt) throw new Error('Source exit was not verified by the handoff transaction; recovery is blocked');
         if (current.phase !== 'delivering-continuation') {
           const record = await deps.waitForAccountRecord(session.id, pane.id, target.id, current.targetLaunchStartedAt);
-          if (!targetRecordMatches(record, current, target, pane)) throw new Error('Target SessionStart identity was not verified');
-        }
+          await verifyTargetLaunch(current, target, record, deps, root);
+        } else requireTargetIdentity(current, inspected, target);
         if (current.resumeSpec && deps.verifyTargetSpec) await deps.verifyTargetSpec(current, target);
         Object.assign(current, { status: 'delivering', phase: 'delivering-continuation', deliveryId: current.deliveryId || crypto.randomUUID() });
         writeOne(root, current);
         if (current.deliveryStartedAt && !current.deliveredAt) throw new Error('Continuation delivery is unconfirmed; it will not be sent twice');
         current.deliveryStartedAt = Date.now(); writeOne(root, current);
-        if (!current.deliveredAt) await deps.continueSession(session.id, CONTINUATION_TEXT, {
-          deliveryId: current.deliveryId, agent, sourceAccountId: source.id, transactionId: current.id,
-          sourceStopVerifiedAt: current.sourceStopVerifiedAt, targetTranscript: current.targetTranscript,
-        });
+        if (!current.deliveredAt) await deps.continueSession(session.id, CONTINUATION_TEXT, deliveryOptions(current, source));
         current.deliveredAt ||= Date.now();
         commitTargetAuthorities(current, target, root);
         Object.assign(current, { status: 'done', phase: 'done', reason: '' }); writeOne(root, current);
@@ -368,19 +451,19 @@ async function run(body, deps = {}) {
         }
         verifyFrozenResumeSpec(current, null, deps);
         Object.assign(current, { status: 'starting', phase: 'starting-target', targetLaunchStartedAt: Date.now() }); writeOne(root, current);
-        const result = await deps.resumeExited(current, target, compatibility.mcpConfig);
+        const result = await deps.resumeExited(current, target, compatibility.mcpConfig, {
+          onLaunched: (launch) => recordTargetLaunch(current, launch, target, root),
+        });
+        if (!current.targetLaunch) recordTargetLaunch(current, result, target, root);
         Object.assign(current, { status: 'verifying', phase: 'verifying-target', pid: result.pid }); writeOne(root, current);
         const record = await deps.waitForAccountRecord(session.id, pane.id, target.id, current.targetLaunchStartedAt);
-        if (!targetRecordMatches(record, current, target, pane)) throw new Error('Target SessionStart identity was not verified');
+        await verifyTargetLaunch(current, target, record, deps, root);
         if (current.resumeSpec && deps.verifyTargetSpec) await deps.verifyTargetSpec(current, target);
         Object.assign(current, { status: 'delivering', phase: 'delivering-continuation', reason: '', result,
           deliveryId: current.deliveryId || crypto.randomUUID() }); writeOne(root, current);
         if (current.deliveryStartedAt && !current.deliveredAt) throw new Error('Continuation delivery is unconfirmed; it will not be sent twice');
         current.deliveryStartedAt = Date.now(); writeOne(root, current);
-        if (!current.deliveredAt) await deps.continueSession(session.id, CONTINUATION_TEXT, {
-          deliveryId: current.deliveryId, agent, sourceAccountId: source.id, transactionId: current.id,
-          sourceStopVerifiedAt: current.sourceStopVerifiedAt, targetTranscript: current.targetTranscript,
-        });
+        if (!current.deliveredAt) await deps.continueSession(session.id, CONTINUATION_TEXT, deliveryOptions(current, source));
         current.deliveredAt ||= Date.now();
         commitTargetAuthorities(current, target, root);
         Object.assign(current, { status: 'done', phase: 'done' }); writeOne(root, current);
@@ -455,7 +538,7 @@ async function run(body, deps = {}) {
       stageTargetAuthority(current, target, root, env);
       Object.assign(current, { status: 'starting', phase: 'starting-target', targetLaunchStartedAt: Date.now() }); writeOne(root, current);
       const result = await baseHost.request(type, { ...params, meta: { ...params.meta, handoffTransactionId: current.id } });
-      if (result?.pane?.pid) { current.pid = result.pane.pid; writeOne(root, current); }
+      recordTargetLaunch(current, result, target, root);
       return result;
     } };
     try {
@@ -466,17 +549,12 @@ async function run(body, deps = {}) {
       });
       Object.assign(current, { status: 'verifying', phase: 'verifying-target', pid: result.pid }); writeOne(root, current);
       const record = await deps.waitForAccountRecord(session.id, pane.id, target.id, current.targetLaunchStartedAt);
-      if (!targetRecordMatches(record, current, target, pane)) {
-        throw new Error('Target SessionStart identity was not verified');
-      }
+      await verifyTargetLaunch(current, target, record, deps, root);
       if (current.resumeSpec && deps.verifyTargetSpec) await deps.verifyTargetSpec(current, target);
       Object.assign(current, { status: 'delivering', phase: 'delivering-continuation', reason: '', result,
         deliveryId: current.deliveryId || crypto.randomUUID() }); writeOne(root, current);
       current.deliveryStartedAt = Date.now(); writeOne(root, current);
-      await deps.continueSession(session.id, CONTINUATION_TEXT, {
-        deliveryId: current.deliveryId, agent, sourceAccountId: source.id, transactionId: current.id,
-        sourceStopVerifiedAt: current.sourceStopVerifiedAt, targetTranscript: current.targetTranscript,
-      });
+      await deps.continueSession(session.id, CONTINUATION_TEXT, deliveryOptions(current, source));
       current.deliveredAt = Date.now();
       commitTargetAuthorities(current, target, root);
       Object.assign(current, { status: 'done', phase: 'done' }); writeOne(root, current);

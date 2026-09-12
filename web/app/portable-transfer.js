@@ -48,7 +48,8 @@ function renderDialog(ctx, state) {
   const modal = ensureDialog();
   const transfer = state.transfer;
   const account = state.draft.accounts.find((a) => a.id === state.accountId);
-  const ambiguous = ['ambiguous', 'launching'].includes(transfer?.status);
+  const recoverableOpening = transfer?.status === 'launching' && transfer?.recoverableOpening === true;
+  const ambiguous = transfer?.status === 'ambiguous' || transfer?.status === 'launching' && !recoverableOpening;
   const awaitingSetup = transfer?.status === 'awaiting-setup';
   const resolutionCandidates = ambiguous ? (ctx.data.sessions || []).filter((session) => {
     const pane = (ctx.data.panes || []).find((candidate) => candidate.meta?.sessionId === session.id
@@ -69,11 +70,12 @@ function renderDialog(ctx, state) {
     ${state.error ? `<p class="portable-transfer-error" role="alert">${ctx.esc(state.error)}</p>` : ''}
     ${state.preview ? `<section class="portable-transfer-preview"><div><h3>Immutable saved package</h3><span>${ctx.esc(transfer?.id?.slice(0, 16) || '')}</span></div><pre tabindex="0">${ctx.esc(state.preview)}</pre></section>` : ''}
     ${awaitingSetup ? `<section class="portable-transfer-resolution"><p role="status">The existing successor is waiting for workspace trust. Open that pane, accept the prompt yourself, then retry delivery here. The saved opening has not been sent.</p><button class="btn" type="button" data-open-setup>Open existing successor</button><button class="btn primary" type="button" data-retry-delivery>Retry delivery</button></section>` : ''}
+    ${recoverableOpening ? '<section class="portable-transfer-resolution"><p role="status">The existing successor has a saved opening that was not sent. Open the existing successor to inspect it, then retry delivery here.</p><button class="btn" type="button" data-open-setup>Open existing successor</button><button class="btn primary" type="button" data-retry-delivery>Retry delivery</button></section>' : ''}
     ${ambiguous ? `<section class="portable-transfer-resolution">${resolutionCandidates.length
     ? `<label>Observed successor<select data-transfer-resolution>${resolutionCandidates.map((session) => `<option value="${ctx.esc(session.id)}">${ctx.esc(session.title || session.id)} · ${ctx.esc(session.accountLabel || session.accountId)}</option>`).join('')}</select></label><button class="btn" type="button" data-resolve-transfer>Bind observed successor</button><small>Validates the saved launch receipt, destination account, and card. It never launches or sends again.</small>`
     : '<p role="status">No compatible existing successor was found. Inspect or finish the destination launch, then reopen this transfer; no duplicate will be started.</p>'}</section>` : ''}
     <footer><span>${ctx.esc(state.draft.sourceAgent)} · ${ctx.esc(state.draft.sourceAccountId || 'unknown source account')}</span>
-      ${state.preview && transfer?.status === 'prepared' ? `${state.savedOnly ? '' : '<button class="btn" type="button" data-refresh-transfer>Prepare new preview</button>'}<button class="btn primary" type="button" data-launch-transfer>Launch reviewed package</button>` : ambiguous || awaitingSetup ? '' : '<button class="btn primary" type="button" data-prepare-transfer>Prepare preview</button>'}
+      ${state.preview && transfer?.status === 'prepared' ? `${state.savedOnly ? '' : '<button class="btn" type="button" data-refresh-transfer>Prepare new preview</button>'}<button class="btn primary" type="button" data-launch-transfer>Launch reviewed package</button>` : ambiguous || awaitingSetup || recoverableOpening ? '' : '<button class="btn primary" type="button" data-prepare-transfer>Prepare preview</button>'}
     </footer></form>`;
   const invalidate = () => { state.transfer = null; state.preview = ''; state.error = ''; renderDialog(ctx, state); };
   modal.querySelector('[data-transfer-account]').onchange = (event) => {
@@ -206,9 +208,12 @@ export function portableTransferControls(ctx, sessionId) {
   if (transfer.status === 'done') return transfer.destinationSessionId
     ? `<button class="btn portable-transfer" data-open-portable="${ctx.esc(transfer.destinationSessionId)}"><span>Open successor</span><small>${ctx.esc(label)} · saved continuation</small></button>`
     : '<span class="portable-transfer-state" role="status">Successor is being indexed…</span>';
-  if (transfer.status === 'awaiting-setup') return `${transfer.destinationSessionId
-    ? `<button class="btn portable-transfer" data-open-portable="${ctx.esc(transfer.destinationSessionId)}"><span>Finish setup in successor…</span><small>${ctx.esc(label)} · opening saved</small></button>`
-    : '<span class="portable-transfer-state" role="status">Successor setup is waiting in its saved pane…</span>'}<button class="btn" data-review-portable="${ctx.esc(transfer.id)}" data-source-session="${ctx.esc(sessionId)}">Retry delivery</button>`;
+  if (transfer.status === 'awaiting-setup' || transfer.status === 'launching' && transfer.recoverableOpening === true) {
+    const setup = transfer.status === 'awaiting-setup';
+    return `${transfer.destinationSessionId
+      ? `<button class="btn portable-transfer" data-open-portable="${ctx.esc(transfer.destinationSessionId)}"><span>${setup ? 'Finish setup in successor…' : 'Open existing successor'}</span><small>${ctx.esc(label)} · opening saved</small></button>`
+      : `<span class="portable-transfer-state" role="status">${setup ? 'Successor setup is waiting' : 'An unsent opening is waiting'} in its saved pane…</span>`}<button class="btn" data-review-portable="${ctx.esc(transfer.id)}" data-source-session="${ctx.esc(sessionId)}">Retry delivery</button>`;
+  }
   if (['launching', 'ambiguous'].includes(transfer.status)) return `<button class="btn portable-transfer" data-review-portable="${ctx.esc(transfer.id)}" data-source-session="${ctx.esc(sessionId)}"><span>${transfer.status === 'launching' ? 'Starting successor…' : 'Resolve transfer…'}</span><small>${ctx.esc(label)} · no duplicate launch</small></button>`;
   if (transfer.status !== 'prepared') return `<span class="portable-transfer-state error" role="alert">Transfer ${ctx.esc(transfer.status || 'unavailable')}</span>`;
   return transfer.policyVersion === 2

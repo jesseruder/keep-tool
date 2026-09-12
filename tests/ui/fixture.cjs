@@ -169,9 +169,12 @@ async function createFixture() {
         if (url.pathname === '/api/transfer-session') {
           const transfer = portableTransfers.find(candidate => candidate.id === input.transferId);
           if (!transfer) { json({ error: 'Unknown prepared transfer' }, 404); return; }
-          if (['launching', 'ambiguous'].includes(transfer.status)) { json({ error: `Transfer is ${transfer.status}`, transfer }, 409); return; }
-          if (transfer.status === 'awaiting-setup') {
+          if (transfer.status === 'ambiguous' || transfer.status === 'launching' && transfer.recoverableOpening !== true) {
+            json({ error: `Transfer is ${transfer.status}`, transfer }, 409); return;
+          }
+          if (transfer.status === 'awaiting-setup' || transfer.status === 'launching' && transfer.recoverableOpening === true) {
             transfer.status = 'done'; transfer.completedAt = Date.now(); transfer.openingStatus = 'delivered';
+            transfer.recoverableOpening = false;
             publish(); json({ ok: true, transfer }); return;
           }
           if (transfer.status !== 'done') {

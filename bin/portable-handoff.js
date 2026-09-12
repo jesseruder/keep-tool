@@ -274,6 +274,18 @@ function deliveryReceipt(transferId, deps = {}) {
     && Number.isFinite(value.deliveredAt) ? value : null;
 }
 
+function openingIntegrity(state) {
+  return Boolean(state?.opening?.version === 1 && typeof state.opening.text === 'string' && state.opening.text
+    && /^[a-f0-9]{64}$/.test(state.opening.digest || '') && digest(state.opening.text) === state.opening.digest);
+}
+
+function recoverableOpening(state) {
+  return Boolean(state?.status === 'launching' && ID.test(state.destinationPane || '')
+    && Number.isInteger(state.destinationPanePid) && state.destinationPanePid > 0
+    && state.destinationPaneCreatedAt != null && openingIntegrity(state) && state.opening.status === 'pending'
+    && !state.opening.deliveryStartedAt);
+}
+
 function safeSummary(state) {
   if (!state || state.version !== 1 || !/^[a-f0-9]{64}$/.test(state.requestKey || '')
       || !ID.test(state.sourceSessionId || '') || !ACCOUNT_ID.test(state.targetAccountId || '')
@@ -297,6 +309,7 @@ function safeSummary(state) {
     ...(state.sourceAgentPid ? { sourceAgentPid: state.sourceAgentPid } : {}),
     ...(state.sourceAgentPidStart ? { sourceAgentPidStart: state.sourceAgentPidStart } : {}),
     ...(state.opening?.status ? { openingStatus: state.opening.status } : {}),
+    ...(recoverableOpening(state) ? { recoverableOpening: true } : {}),
     ...(state.setupKind ? { setupKind: state.setupKind } : {}),
     ...(state.reason ? { reason: state.reason } : {}),
     preparedAt: state.preparedAt,
@@ -444,13 +457,19 @@ function lockTransaction(stateFile) {
 async function launchState(state, stateFile, deps) {
   if (state.status === 'done') return { ...state, repeated: true, stateFile };
   const resumingSetup = state.status === 'awaiting-setup';
-  if (['launching', 'ambiguous'].includes(state.status)) {
+  if (resumingSetup && !openingIntegrity(state)) {
+    throw problem(`portable transfer saved opening integrity cannot be verified (${stateFile})`,
+      'KEEP_PORTABLE_TRANSFER_AMBIGUOUS', 409);
+  }
+  const resumingBoundOpening = recoverableOpening(state);
+  const resumingOpening = resumingSetup || resumingBoundOpening;
+  if (state.status === 'ambiguous' || state.status === 'launching' && !resumingBoundOpening) {
     throw problem(`portable transfer launch is ambiguous; inspect the console, then use the CLI with --resolve-session <id> (${stateFile})`,
       'KEEP_PORTABLE_TRANSFER_AMBIGUOUS', 409);
   }
-  if (!resumingSetup && state.status !== 'prepared') throw problem('portable transfer is not prepared');
-  if (!resumingSetup && !deps.open) throw problem('portable transfer launcher is unavailable', 'KEEP_PORTABLE_TRANSFER_UNAVAILABLE', 503);
-  if (resumingSetup && !deps.resumeOpening) throw problem('portable transfer setup recovery is unavailable', 'KEEP_PORTABLE_TRANSFER_UNAVAILABLE', 503);
+  if (!resumingOpening && state.status !== 'prepared') throw problem('portable transfer is not prepared');
+  if (!resumingOpening && !deps.open) throw problem('portable transfer launcher is unavailable', 'KEEP_PORTABLE_TRANSFER_UNAVAILABLE', 503);
+  if (resumingOpening && !deps.resumeOpening) throw problem('portable transfer opening recovery is unavailable', 'KEEP_PORTABLE_TRANSFER_UNAVAILABLE', 503);
   if (state.policyVersion === DESKTOP_POLICY_VERSION) {
     const inspection = await inspectReady(state.sourceSessionId, deps, { launching: true, transferId: state.requestKey });
     if (state.sourceAgentPid && (!inspection.portableFallback
@@ -479,14 +498,14 @@ async function launchState(state, stateFile, deps) {
     }
   }
   const message = state.opening?.text || openingMessage(state);
-  if (!resumingSetup) {
+  if (!resumingOpening) {
     state = { ...state, status: 'launching', launchStartedAt: Date.now(),
       opening: { version: 1, text: message, digest: digest(message), status: 'pending' } };
     writeJson(stateFile, state);
   }
   let opened = null;
   try {
-    opened = resumingSetup
+    opened = resumingOpening
       ? await deps.resumeOpening(state, message)
       : await deps.open({ taskId: state.cardId, fresh: true, agent: state.targetAgent,
         accountId: state.targetAccountId, cwd: state.cwd, portableSourceSessionId: state.sourceSessionId,

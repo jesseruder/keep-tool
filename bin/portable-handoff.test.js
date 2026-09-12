@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const test = require('node:test');
 const { execFileSync } = require('node:child_process');
 const portable = require('./portable-handoff');
@@ -127,6 +128,68 @@ test('ambiguous launch blocks replay until an explicit destination resolution', 
     const repeated = await portable.run(request, f.deps);
     assert.equal(repeated.repeated, true); assert.equal(calls, 1);
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('a crash after binding a pending opening recovers the same pane exactly once', async () => {
+  const recovered = fixture(), unknown = fixture(), delivering = fixture(), corrupt = fixture();
+  try {
+    const prepare = async (f) => portable.run({ sourceSessionId: 'source-session-1234', accountId: f.target.id,
+      contextText: 'Recover the saved opening.', prepareOnly: true }, f.deps);
+    const stageLaunching = (prepared, opening = {}) => {
+      const state = JSON.parse(fs.readFileSync(prepared.stateFile, 'utf8'));
+      Object.assign(state, { status: 'launching', launchStartedAt: Date.now(),
+        opening: { version: 1, text: 'saved opening',
+          digest: crypto.createHash('sha256').update('saved opening').digest('hex'),
+          status: 'pending', ...opening } });
+      fs.writeFileSync(prepared.stateFile, JSON.stringify(state));
+    };
+
+    const prepared = await prepare(recovered); stageLaunching(prepared);
+    const launch = { pane: 'pane-recovered', pid: 52, createdAt: 'pane-recovered-created',
+      sessionId: 'destination-session-5678', accountId: recovered.target.id };
+    portable.recordLaunch(prepared.requestKey, launch, { root: recovered.root });
+    assert.equal(portable.list(recovered.root)[0].recoverableOpening, true);
+    let opens = 0, resumes = 0;
+    const result = await portable.launchPrepared(prepared.requestKey, { ...recovered.deps, requireDeliveryReceipt: true,
+      open: async () => { opens++; assert.fail('a bound pending opening must never launch a second pane'); },
+      resumeOpening: async (state, message) => {
+        resumes++; assert.equal(state.destinationPane, launch.pane); assert.equal(message, 'saved opening');
+        assert.equal(portable.reserveDelivery(prepared.requestKey, launch, { root: recovered.root }), true);
+        portable.recordDelivery(prepared.requestKey, launch, { root: recovered.root }); return launch;
+      },
+    });
+    assert.equal(result.status, 'done'); assert.equal(opens, 0); assert.equal(resumes, 1);
+
+    const unknownPrepared = await prepare(unknown); stageLaunching(unknownPrepared);
+    await assert.rejects(portable.launchPrepared(unknownPrepared.requestKey, { ...unknown.deps,
+      resumeOpening: async () => assert.fail('an unbound launch cannot be recovered') }),
+    (error) => error.code === 'KEEP_PORTABLE_TRANSFER_AMBIGUOUS');
+
+    const deliveringPrepared = await prepare(delivering); stageLaunching(deliveringPrepared);
+    const deliveringLaunch = { pane: 'pane-delivering', pid: 53, createdAt: 'pane-delivering-created',
+      sessionId: 'destination-session-5678', accountId: delivering.target.id };
+    portable.recordLaunch(deliveringPrepared.requestKey, deliveringLaunch, { root: delivering.root });
+    const deliveringState = JSON.parse(fs.readFileSync(deliveringPrepared.stateFile, 'utf8'));
+    Object.assign(deliveringState.opening, { status: 'delivering', deliveryStartedAt: Date.now() });
+    fs.writeFileSync(deliveringPrepared.stateFile, JSON.stringify(deliveringState));
+    await assert.rejects(portable.launchPrepared(deliveringPrepared.requestKey, { ...delivering.deps,
+      resumeOpening: async () => assert.fail('a delivery-started launch cannot be retried') }),
+    (error) => error.code === 'KEEP_PORTABLE_TRANSFER_AMBIGUOUS');
+
+    const corruptPrepared = await prepare(corrupt); stageLaunching(corruptPrepared);
+    const corruptLaunch = { pane: 'pane-corrupt', pid: 54, createdAt: 'pane-corrupt-created',
+      sessionId: 'destination-session-5678', accountId: corrupt.target.id };
+    portable.recordLaunch(corruptPrepared.requestKey, corruptLaunch, { root: corrupt.root });
+    const corruptState = JSON.parse(fs.readFileSync(corruptPrepared.stateFile, 'utf8'));
+    corruptState.opening.text = 'mutated after binding'; fs.writeFileSync(corruptPrepared.stateFile, JSON.stringify(corruptState));
+    let recoveryCalls = 0;
+    await assert.rejects(portable.launchPrepared(corruptPrepared.requestKey, { ...corrupt.deps,
+      open: async () => { recoveryCalls++; }, resumeOpening: async () => { recoveryCalls++; } }),
+    (error) => error.code === 'KEEP_PORTABLE_TRANSFER_AMBIGUOUS');
+    assert.equal(recoveryCalls, 0); assert.equal(portable.list(corrupt.root)[0].status, 'launching');
+  } finally {
+    for (const f of [recovered, unknown, delivering, corrupt]) fs.rmSync(f.root, { recursive: true, force: true });
+  }
 });
 
 test('portable transfer rejects an unknown target, same account, missing card, and oversized context before storage', async () => {
@@ -353,7 +416,8 @@ test('workspace trust preserves one opening and resumes delivery to the same bou
   try {
     const prepared = await portable.run({ sourceSessionId: 'source-session-1234', accountId: f.target.id,
       contextText: 'Wait through manual trust.', prepareOnly: true }, f.deps);
-    const launch = { pane: 'pane-trust', sessionId: 'destination-session-5678', accountId: f.target.id };
+    const launch = { pane: 'pane-trust', pid: 42, createdAt: 'pane-trust-created',
+      sessionId: 'destination-session-5678', accountId: f.target.id };
     let opens = 0, resumes = 0, savedMessage = '';
     const launchDeps = { ...f.deps, requireDeliveryReceipt: true,
       open: async (payload) => {
@@ -401,7 +465,8 @@ test('setup retry rechecks source readiness before delivering the saved opening'
   try {
     const prepared = await portable.run({ sourceSessionId: 'source-session-1234', accountId: f.target.id,
       contextText: 'Recheck before retry.', prepareOnly: true }, f.deps);
-    const launch = { pane: 'pane-trust', sessionId: 'destination-session-5678', accountId: f.target.id };
+    const launch = { pane: 'pane-trust', pid: 42, createdAt: 'pane-trust-created',
+      sessionId: 'destination-session-5678', accountId: f.target.id };
     const launchDeps = { ...f.deps, requireDeliveryReceipt: true,
       open: async () => {
         portable.recordLaunch(prepared.requestKey, launch, { root: f.root });
