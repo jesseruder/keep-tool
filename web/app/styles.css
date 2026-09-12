@@ -45,10 +45,11 @@ html.desktop .bar { padding-left: 100px; -webkit-user-select: none; }
 .meter.unavailable { align-self: center; }
 .health { margin-left: auto; display: inline-flex; align-items: center; gap: 7px; padding: 5px 9px; border-radius: 5px; color: var(--bar-muted); font-size: 11px; position: relative; white-space: nowrap; cursor: pointer; }
 .health > i { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+.health.warning { color: var(--bar-text); background: color-mix(in srgb, var(--warn) 14%, transparent); } .health.warning > i { background: var(--warn); }
 .health.bad { color: var(--bar-text); background: var(--bad-soft); } .health.bad > i { background: var(--bad); }
 .health .pop { display: none; position: fixed; top: var(--top-bar-height); right: 14px; width: 390px; max-height: 70vh; overflow: auto; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 6px; padding: 10px 12px; box-shadow: var(--shadow); z-index: 20; text-align: left; font-size: 12px; white-space: normal; }
 .health.open .pop { display: block; }
-.health dl { display: grid; grid-template-columns: 110px 1fr; gap: 4px 10px; margin: 7px 0 0; } .health dt { color: var(--muted); font: 11px var(--mono); } .health dd { margin: 0; } .health dd.bad { color: var(--bad); }
+.health dl { display: grid; grid-template-columns: 110px 1fr; gap: 4px 10px; margin: 7px 0 0; } .health dt { color: var(--muted); font: 11px var(--mono); } .health dd { margin: 0; } .health dd.warning { color: var(--warn); } .health dd.bad { color: var(--bad); }
 .health .notify-enable { display: flex; margin: 8px 0 2px; }
 .dockbtn, .themebtn { padding: 5px 9px; display: flex; gap: 6px; align-items: center; border: 1px solid transparent; border-radius: 5px; color: var(--bar-muted); font-size: 11px; white-space: nowrap; }
 .dockbtn:hover, .dockbtn.on, .themebtn:hover { color: var(--bar-text); background: var(--bar-sel); border-color: var(--bar-line); }

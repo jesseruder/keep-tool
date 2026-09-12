@@ -22,7 +22,13 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
   const sessions = ['a', 'b'].map((id) => ({ id, kind: 'claude', title: `Session ${id}`, project: '/tmp/history-fixture', taskId: `card-${id}`, pane: `p${id}`, mtime: Date.now(), state: 'running', endedTurn: false }));
   const panes = sessions.map((s, i) => ({ id: s.pane, pid: 100 + i, alive: true, meta: { agent: 'claude', sessionId: s.id } }));
   const layouts = [{ name: 'Pinned', role: 'pinned', ids: ['pa', 'pb'], cols: 2 }];
-  const state = { sessions, panes, tasks: sessions.map((s) => ({ id: s.taskId, fm: { tags: ['personal'] } })), attention: [], setAside: {}, health: {}, usage: {}, review: { events: [], stats: {} }, limitResume: {} };
+  const state = { sessions, panes, tasks: sessions.map((s) => ({ id: s.taskId, fm: { tags: ['personal'] } })), attention: [], setAside: {}, health: {
+    daemon: { running: true, pid: 321 },
+    schedulers: [
+      { name: 'runs', state: 'ok', displayState: 'ok', detail: 'processed 4 runs', displayDetail: 'processed 4 runs', lastError: 'recovered old error' },
+      { name: 'review', state: 'skipped', displayState: 'warning', displayDetail: '1 failed attempt · last failed attempt 13h ago · latest check skipped 1h ago · timeout <img id="health-injection">' },
+    ],
+  }, usage: {}, review: { events: [], stats: {} }, limitResume: {} };
   sessions.push({ id: 'recent-only', kind: 'claude', title: 'Recent only', project: '/tmp/recent-fixture', state: 'exited', exited: true, endedTurn: true, lastUserAt: Date.now() - 60000, mtime: Date.now() - 60000 });
   let shells = 0;
   const server = http.createServer(async (req, res) => {
@@ -137,6 +143,13 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     const wait = (condition) => evaluate(`new Promise((resolve,reject)=>{const deadline=Date.now()+5000;const tick=()=>{if(${condition})resolve(true);else if(Date.now()>deadline)reject(new Error('condition timed out'));else setTimeout(tick,30)};tick()})`);
     await call('Page.navigate', { url: `http://127.0.0.1:${server.address().port}/` });
     await wait("document.querySelectorAll('#qlist .qitem').length >= 2");
+    await wait("document.querySelector('#health > span')?.textContent === 'daemon: review warning'");
+    assert.equal(await evaluate("document.querySelector('#health').classList.contains('warning') && !document.querySelector('#health').classList.contains('bad')"), true);
+    assert.equal(await evaluate("document.querySelector('#health .pop').textContent.includes('processed 4 runs') && !document.querySelector('#health .pop').textContent.includes('recovered old error')"), true);
+    assert.equal(await evaluate("document.querySelector('#health .pop').textContent.includes('last failed attempt 13h ago') && !document.querySelector('#health-injection')"), true);
+    state.health = { daemon: { running: true, pid: 321 }, schedulers: [] };
+    for (const client of eventClients) client.write('data: changed\n\n');
+    await wait("document.querySelector('#health > span')?.textContent === 'daemon: healthy'");
     const textBaselines = await evaluate(`(() => {
       const row = document.querySelector('#qlist .qitem .p');
       const baseline = (selector) => {

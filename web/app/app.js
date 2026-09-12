@@ -649,12 +649,21 @@ function renderMeters() {
 }
 function renderHealth() {
   const health = data.health || {};
-  const unhealthy = (health.schedulers || []).filter((row) => ['failing', 'silent', 'never'].includes(row.state));
+  const presentation = (row) => {
+    const unresolved = row.state !== 'disabled' && Number(row.consecutiveFailures || 0) > 0 && new Date(row.lastErrorAt || 0).getTime() > new Date(row.lastOkAt || 0).getTime();
+    const displayState = row.displayState || (unresolved && Number(row.consecutiveFailures) < 3 && ['ok', 'skipped'].includes(row.state) ? 'warning' : row.state);
+    const displayDetail = row.displayDetail ?? (unresolved ? row.lastError : row.detail || '');
+    return { displayState, displayDetail };
+  };
+  const rows = (health.schedulers || []).map((row) => ({ ...row, ...presentation(row) }));
+  const unhealthy = rows.filter((row) => ['failing', 'silent', 'never'].includes(row.displayState));
+  const warnings = rows.filter((row) => row.displayState === 'warning');
   const button = document.querySelector('#health');
   button.classList.toggle('bad', !health.daemon?.running || unhealthy.length > 0);
-  button.querySelector(':scope > span').textContent = !health.daemon?.running ? 'daemon: offline' : unhealthy.length ? `daemon: ${unhealthy[0].name} ${unhealthy[0].state}` : 'daemon: healthy';
+  button.classList.toggle('warning', health.daemon?.running && unhealthy.length === 0 && warnings.length > 0);
+  button.querySelector(':scope > span').textContent = !health.daemon?.running ? 'daemon: offline' : unhealthy.length ? `daemon: ${unhealthy[0].name} ${unhealthy[0].displayState}` : warnings.length ? `daemon: ${warnings[0].name} warning` : 'daemon: healthy';
   const enable = notificationPermission() === 'default' ? '<button class="btn notify-enable">Enable notifications</button>' : '';
-  button.querySelector('.pop').innerHTML = `<b>keep serve</b> · pid ${esc(health.daemon?.pid || '—')}${enable}<dl>${(health.schedulers || []).map((row) => `<dt>${esc(row.name)}</dt><dd class="${['failing', 'silent', 'never'].includes(row.state) ? 'bad' : ''}">${esc(row.state)}${row.detail ? ` · ${esc(row.detail)}` : ''}${row.lastError ? ` · ${esc(row.lastError)}` : ''}</dd>`).join('')}</dl>`;
+  button.querySelector('.pop').innerHTML = `<b>keep serve</b> · pid ${esc(health.daemon?.pid || '—')}${enable}<dl>${rows.map((row) => `<dt>${esc(row.name)}</dt><dd class="${['failing', 'silent', 'never'].includes(row.displayState) ? 'bad' : row.displayState === 'warning' ? 'warning' : ''}">${esc(row.displayState)}${row.displayDetail ? ` · ${esc(row.displayDetail)}` : ''}</dd>`).join('')}</dl>`;
   button.querySelector('.notify-enable')?.addEventListener('click', async (event) => {
     event.stopPropagation();
     const permission = await requestPermission();

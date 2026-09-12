@@ -216,6 +216,7 @@ function snapshot(now = Date.now()) {
       daemonStartedAt: daemon.startedAt || null,
     };
     row.state = stateOf(row, now);
+    Object.assign(row, presentationOf(row, now));
     delete row.daemonStartedAt;
     return row;
   });
@@ -270,6 +271,25 @@ function relativeTime(value, now) {
   return at ? `${duration(atMs(now, Date.now()) - at)} ago` : 'never';
 }
 
+function presentationOf(entry, now = Date.now()) {
+  if (entry && entry.state === 'disabled') return { displayState: 'disabled', displayDetail: entry.detail || '' };
+  const failures = Number(entry && entry.consecutiveFailures || 0);
+  const lastErrorAt = atMs(entry && entry.lastErrorAt);
+  const lastOkAt = atMs(entry && entry.lastOkAt);
+  const unresolved = failures > 0 && lastErrorAt > lastOkAt;
+  const displayState = unresolved && failures < 3 && ['ok', 'skipped'].includes(entry.state) ? 'warning' : entry.state;
+
+  if (unresolved) {
+    const attempts = `${failures} failed attempt${failures === 1 ? '' : 's'}`;
+    const parts = [attempts, `last failed attempt ${relativeTime(lastErrorAt, now)}`];
+    if (atMs(entry.lastRunAt) > lastErrorAt) parts.push(`latest check skipped ${relativeTime(entry.lastRunAt, now)}`);
+    if (entry.lastError) parts.push(entry.lastError);
+    return { displayState, displayDetail: parts.join(' · ') };
+  }
+
+  return { displayState, displayDetail: entry.detail || '' };
+}
+
 function reviewSection(value, now = Date.now()) {
   const rows = unhealthyRows(value);
   const daemon = value && value.daemon || {};
@@ -310,18 +330,23 @@ function render(value, now = Date.now()) {
   const status = daemon.running ? `running (pid ${daemon.pid}, uptime ${duration(atMs(now) - atMs(daemon.startedAt))})`
     : daemon.startedAt ? `down (last start ${relativeTime(daemon.startedAt, now)})` : 'down (no start recorded)';
   const rows = [...(value.schedulers || [])].sort((a, b) => {
-    const rank = { failing: 0, silent: 1, never: 2, skipped: 3, ok: 4 };
-    return (rank[a.state] ?? 9) - (rank[b.state] ?? 9) || a.name.localeCompare(b.name);
+    const rank = { failing: 0, silent: 1, never: 2, warning: 3, skipped: 4, ok: 5, disabled: 6 };
+    const aState = a.displayState || presentationOf(a, now).displayState;
+    const bState = b.displayState || presentationOf(b, now).displayState;
+    return (rank[aState] ?? 9) - (rank[bState] ?? 9) || a.name.localeCompare(b.name);
   });
   const values = [['scheduler', 'state', 'last run', 'last ok', 'failures', 'detail']];
-  for (const row of rows) values.push([
-    row.name,
-    row.state,
-    relativeTime(row.lastRunAt, now),
-    relativeTime(row.lastOkAt, now),
-    String(row.consecutiveFailures),
-    row.state === 'failing' ? row.lastError : row.detail || row.lastError || '',
-  ]);
+  for (const row of rows) {
+    const presentation = row.displayState ? row : presentationOf(row, now);
+    values.push([
+      row.name,
+      presentation.displayState,
+      relativeTime(row.lastRunAt, now),
+      relativeTime(row.lastOkAt, now),
+      String(row.consecutiveFailures),
+      presentation.displayDetail || '',
+    ]);
+  }
   const widths = values[0].map((_, index) => Math.max(...values.map((row) => row[index].length)));
   return [`daemon: ${status}`, values.map((row) => row.map((cell, index) => index === row.length - 1 ? cell : cell.padEnd(widths[index])).join('  ').trimEnd()).join('\n')].join('\n\n');
 }
@@ -333,6 +358,7 @@ module.exports = {
   CADENCES,
   record,
   stateOf,
+  presentationOf,
   snapshot,
   attentionItems,
   reviewSection,

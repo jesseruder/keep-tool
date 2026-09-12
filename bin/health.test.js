@@ -57,6 +57,61 @@ test('skipped polls preserve the failure sequence until a real success', () => {
   assert.equal(health.snapshot(5000).schedulers.find((entry) => entry.name === 'review').state, 'failing');
 });
 
+test('snapshot and CLI presentation separate recovered errors from unresolved failures', () => {
+  const { health } = fixture();
+  const now = 20 * 3600e3;
+  health.record('daemon', { at: now - 19 * 3600e3, pid: process.pid });
+
+  health.record('digest', { ok: false, error: 'recovered <old> error', at: now - 15 * 3600e3 });
+  health.record('digest', { ok: true, detail: 'generated digest', at: now - 14 * 3600e3 });
+  let row = health.snapshot(now).schedulers.find((entry) => entry.name === 'digest');
+  assert.equal(row.state, 'ok');
+  assert.equal(row.displayState, 'ok');
+  assert.equal(row.lastError, 'recovered <old> error', 'JSON retains error history');
+  assert.equal(row.displayDetail, 'generated digest');
+  assert.doesNotMatch(health.render({ daemon: { running: true, pid: 1, startedAt: now - 19 * 3600e3 }, schedulers: [row] }, now), /recovered <old> error/);
+
+  health.record('review', { ok: false, error: 'timeout <unsafe>', at: now - 13 * 3600e3 });
+  health.record('review', { skipped: true, at: now - 3600e3 });
+  row = health.snapshot(now).schedulers.find((entry) => entry.name === 'review');
+  assert.equal(row.state, 'skipped', 'health escalation state semantics stay unchanged');
+  assert.equal(row.displayState, 'warning');
+  assert.match(row.displayDetail, /^1 failed attempt · last failed attempt 13h ago · latest check skipped 60m ago · timeout <unsafe>$/);
+  assert.equal(health.attentionItems(health.snapshot(now), now).some((item) => item.id === 'health:review'), false);
+  assert.match(health.render({ daemon: { running: true, pid: 1, startedAt: now - 19 * 3600e3 }, schedulers: [row] }, now), /review\s+warning\s+60m ago\s+never\s+1\s+1 failed attempt/);
+
+  health.record('review', { ok: false, error: 'timeout again', at: now - 5 * 60e3 });
+  row = health.snapshot(now).schedulers.find((entry) => entry.name === 'review');
+  assert.equal(row.displayState, 'warning');
+  assert.match(row.displayDetail, /^2 failed attempts · last failed attempt 5m ago · timeout again$/);
+
+  health.record('review', { ok: false, error: 'timeout final', at: now - 4 * 60e3 });
+  row = health.snapshot(now).schedulers.find((entry) => entry.name === 'review');
+  assert.equal(row.state, 'failing');
+  assert.equal(row.displayState, 'failing');
+  assert.match(row.displayDetail, /^3 failed attempts · last failed attempt 4m ago · timeout final$/);
+  assert.equal(health.attentionItems(health.snapshot(now), now).some((item) => item.id === 'health:review'), true);
+
+  const silent = health.presentationOf({ state: 'silent', consecutiveFailures: 1, lastErrorAt: now - 13 * 3600e3, lastError: 'old timeout' }, now);
+  assert.equal(silent.displayState, 'silent', 'missing ticks retain their more severe state');
+  assert.match(silent.displayDetail, /^1 failed attempt · last failed attempt 13h ago · old timeout$/);
+});
+
+test('normal skipped and disabled rows keep their current detail without historical errors', () => {
+  const { health } = fixture();
+  const now = 10 * 60e3;
+  health.record('daemon', { at: 1, pid: process.pid });
+  health.record('runs', { skipped: true, at: now });
+  health.record('slack', { ok: false, error: 'old token error', at: now - 2 });
+  health.record('slack', { disabled: true, detail: 'not configured' });
+  const snapshot = health.snapshot(now);
+  const skipped = snapshot.schedulers.find((entry) => entry.name === 'runs');
+  const disabled = snapshot.schedulers.find((entry) => entry.name === 'slack');
+  assert.deepEqual([skipped.state, skipped.displayState, skipped.displayDetail], ['skipped', 'skipped', '']);
+  assert.deepEqual([disabled.state, disabled.displayState, disabled.displayDetail], ['disabled', 'disabled', 'not configured']);
+  assert.equal(disabled.lastError, 'old token error');
+});
+
 test('a no-op wt gc success clears an earlier scheduler failure', () => {
   const { root, health } = fixture();
   try {
