@@ -738,7 +738,7 @@ test('handoff adopts a live PTY, rebuilds its screen, and keeps exit detection',
     assert.deepEqual(Object.keys(record.panes[0]).sort(), [
       'alive', 'args', 'buffer', 'cmd', 'coldSnapshot', 'cols', 'createdAt', 'cwd', 'exitCode', 'exitedAt',
       'id', 'inputCount', 'lastInputAt', 'lastOutputAt', 'lastReadAt', 'meta', 'outputCount', 'pid', 'primary',
-      'pty', 'rows', 'screen', 'signal', 'terminalState', 'title',
+      'pty', 'rows', 'screen', 'signal', 'terminalState', 'terminalStateOffset', 'title',
     ]);
 
     active = createHost({ sock, log: null, adopt: record });
@@ -1333,6 +1333,47 @@ test('handoff captures live output and exit that arrive while cold archives are 
     assert.match((await client.request('screen', { pane: live.id })).text, /DURING-HANDOFF/);
   } finally {
     releaseRead();
+    if (client) client.close();
+    await active.close();
+    await first.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('adoption restores terminal state before replaying bytes forwarded after retirement', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-forwarded-tail-'));
+  const sock = path.join(root, 'host.sock');
+  const first = createHost({ sock, log: null });
+  let active = first;
+  let client;
+  try {
+    await first.listen();
+    client = await connect({ sock });
+    const { pane } = await client.request('spawn', {
+      cmd: '/bin/sh', args: ['-c', 'exec sleep 30'], cols: 20, rows: 4,
+    });
+    const internal = first.panes.get(pane.id);
+    internal.pty._onData.fire(Buffer.from('before'));
+    await settledTerminal(internal);
+    const record = await first.handoff();
+    const handed = record.panes[0];
+    assert.equal(handed.terminalStateOffset, handed.screen.length);
+    internal.pty._onData.fire(Buffer.from('after'));
+    assert.equal(handed.terminalStateOffset, handed.screen.length - Buffer.byteLength('after'));
+
+    active = createHost({ sock, log: null, adopt: record });
+    first.finalizeHandoff();
+    await active.listen();
+    client = await connect({ sock });
+    const adopted = await client.request('screen', { pane: pane.id });
+    assert.equal(adopted.text, 'beforeafter');
+    assert.deepEqual(adopted.cursor, { x: 11, y: 0 });
+    active.panes.get(pane.id).pty._onData.fire(Buffer.from('X'));
+    await waitFor(async () => {
+      const screen = await client.request('screen', { pane: pane.id });
+      return screen.text === 'beforeafterX' && screen;
+    }, 'post-adoption byte after forwarded tail');
+  } finally {
     if (client) client.close();
     await active.close();
     await first.close();

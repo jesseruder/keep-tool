@@ -717,7 +717,15 @@ function createHost(options = {}) {
       scheduleFreeze(pane);
     });
     if (!coldSnapshot) {
-      if (record.screen) terminalWrite(pane, record.screen, record.terminalState).catch(() => {});
+      if (record.screen) {
+        const stateOffset = Number.isInteger(record.terminalStateOffset)
+          && record.terminalStateOffset >= 0 && record.terminalStateOffset <= record.screen.length
+          ? record.terminalStateOffset : record.screen.length;
+        terminalWrite(pane, record.screen.subarray(0, stateOffset), record.terminalState).catch(() => {});
+        if (stateOffset < record.screen.length) {
+          terminalWrite(pane, record.screen.subarray(stateOffset)).catch(() => {});
+        }
+      }
       else if (pane.buffer.size) terminalWrite(pane, pane.buffer.contents()).catch(() => {});
       if (!pane.alive) scheduleFreeze(pane);
     }
@@ -1332,6 +1340,10 @@ function createHost(options = {}) {
       for (const pane of panes.values()) {
         const reusableCold = pane.coldSnapshot && !pane.modelDirty;
         const archive = reusableCold ? coldArchives.get(pane) : null;
+        const screen = archive ? archive.screen : Buffer.from(pane.serializer.serialize({
+          scrollback: TERMINAL_SCROLLBACK,
+          excludeAltBuffer: false,
+        }), 'utf8');
         paneRecords.push({
           id: pane.id,
           cmd: pane.cmd,
@@ -1354,11 +1366,9 @@ function createHost(options = {}) {
           pid: pane.pty.pid,
           pty: pane.pty,
           buffer: archive ? archive.buffer : pane.buffer.contents(),
-          screen: archive ? archive.screen : Buffer.from(pane.serializer.serialize({
-            scrollback: TERMINAL_SCROLLBACK,
-            excludeAltBuffer: false,
-          }), 'utf8'),
+          screen,
           terminalState: archive ? archive.terminalState : captureTerminalState(pane.term),
+          terminalStateOffset: screen.length,
           coldSnapshot: reusableCold ? pane.coldSnapshot : null,
           primary: null,
         });
