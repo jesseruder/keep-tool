@@ -562,15 +562,19 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
 
 function read(root, agent, sid, now = Date.now(), staleAfter = 30 * 60e3) {
   try {
-    const state = JSON.parse(fs.readFileSync(path.join(directory(root, agent, sid), 'state.json'), 'utf8'));
+    const dir = directory(root, agent, sid);
+    const state = JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'));
     const jobs = Object.values(state.jobs);
     const open = jobs.filter(j => !TERMINAL.has(j.status) && !['service', 'scheduled'].includes(j.kind));
     const uncertain = open.filter(j => j.kind === 'unknown' || now - (j.lastCorroboratedAt || j.eventAt) > staleAfter || j.evidence === 'transcript-replaced').map(j => j.id);
     if (state.recovering || state.gap) uncertain.push(state.recovering ? 'history-recovery' : 'history-gap');
     let caughtUp = false;
     try { const s = fs.statSync(state.source.file); caughtUp = !state.recovering && state.checkpoint.offset === s.size && state.checkpoint.mtime === s.mtimeMs; } catch {}
+    let unconsumedHooks = 0;
+    try { unconsumedHooks = fs.readdirSync(path.join(dir, 'inbox')).length; } catch {}
     return { pending: open.some(j => !uncertain.includes(j.id)), uncertain, jobs, caughtUp,
       recovering: Boolean(state.recovering), gap: Boolean(state.gap), unresolvedCalls: Object.keys(state.calls || {}).length,
+      unconsumedHooks,
       turnStartedAt: state.turnStartedAt || null, lastReconciledAt: state.lastReconciledAt };
   } catch { return { pending: false, uncertain: ['history-recovery'], jobs: [] }; }
 }

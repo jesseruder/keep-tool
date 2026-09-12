@@ -4564,7 +4564,7 @@ function scanClaudeSessions(options = {}) {
   } catch {}
   const seen = new Set();
   const sessionIds = new Set();
-  const accountAuthority = accounts.authority(keep.ROOT);
+  const accountAuthority = options.accountAuthority || accounts.authority(keep.ROOT);
   const panesBySession = options.hostPanesBySession || hostPanesBySession(options.hostPanes || []);
   const transcriptRows = claudeTranscriptIndex.scan({ fresh: options.dashboard !== true });
   if (typeof options.onTranscriptRows === 'function') options.onTranscriptRows(transcriptRows);
@@ -4667,6 +4667,49 @@ function copySessions(sessions) {
   return (sessions || []).map((session) => ({ ...session }));
 }
 
+function dashboardCodexSessionFor(id, options = {}) {
+  let record = codexDashboardRows.get(id) || null;
+  const authority = options.accountAuthority?.[id] || null;
+  if (authority && (authority.agent !== 'codex' || authority.stagedAccountId)) {
+    codexDashboardRows.delete(id);
+    return null;
+  }
+  const authorityAccountId = authority?.accountId || null;
+  const authorityChanged = Boolean(record)
+    && (record.authorityAccountId || null) !== authorityAccountId;
+  if (!record || authorityChanged || (authorityAccountId && record.accountId !== authorityAccountId)) {
+    const file = codex.findRolloutFile(id);
+    let stat = null;
+    try { stat = file && fs.statSync(file); } catch {}
+    if (!file || !stat) { codexDashboardRows.delete(id); return null; }
+    record = { file, stat, accountId: authorityAccountId, authorityAccountId };
+  } else {
+    try { record.stat = fs.statSync(record.file); }
+    catch { codexDashboardRows.delete(id); return null; }
+  }
+  const pane = options.hostPanesBySession?.get(id);
+  const cached = settledSessionCache.get({ agent: 'codex', id, file: record.file, stat: record.stat,
+    accountId: authorityAccountId || record.accountId || null, pane,
+    independentLive: options.independentLive?.has(id), now: options.now });
+  let session = cached?.session || record.session || null;
+  if (!session) {
+    try { session = codex.sessionFor(id); } catch {}
+  }
+  if (!session) { codexDashboardRows.delete(id); return null; }
+  // A resolver refresh may have crossed an authority commit. Do not publish the
+  // old row's file with the new account's text: re-resolve before exposing it.
+  if (authorityAccountId && session.accountId !== authorityAccountId) {
+    codexDashboardRows.delete(id);
+    return null;
+  }
+  codexDashboardRows.set(id, { file: record.file, stat: record.stat,
+    accountId: session.accountId || authorityAccountId || record.accountId || null,
+    authorityAccountId });
+  options.onSessionSource?.(session, record.file, record.stat);
+  if (cached?.backgroundJobs) options.onSettledHit?.(session, cached.backgroundJobs);
+  return session;
+}
+
 function scanDashboardCodexSessions(options, now) {
   const full = codexDashboardDiscoveryDirty || !codexDashboardRows.size
     || now < codexDashboardFullScanAt || now - codexDashboardFullScanAt >= CODEX_DASHBOARD_FULL_SCAN_MS;
@@ -4678,33 +4721,18 @@ function scanDashboardCodexSessions(options, now) {
       const file = codex.rolloutFileFor(session.id);
       let stat = null;
       try { stat = file && fs.statSync(file); } catch {}
-      if (file && stat) next.set(session.id, { file, stat, accountId: session.accountId || null, session });
+      const authority = options.accountAuthority?.[session.id];
+      if (file && stat) next.set(session.id, { file, stat, accountId: session.accountId || null,
+        authorityAccountId: authority?.accountId || null, session });
     }
     codexDashboardRows = next;
     codexDashboardFullScanAt = now;
     codexDashboardDiscoveryDirty = false;
   }
-  const panesBySession = options.hostPanesBySession || hostPanesBySession(options.hostPanes || []);
   const sessions = [];
-  for (const [id, record] of [...codexDashboardRows]) {
-    let stat;
-    try { stat = fs.statSync(record.file); } catch { codexDashboardRows.delete(id); continue; }
-    let accountId = record.accountId || null;
-    try { accountId = accounts.forSession(id, 'codex', { root: keep.ROOT, allowDiscovery: false })?.id || accountId; } catch {
-      codexDashboardRows.delete(id);
-      continue;
-    }
-    const cached = settledSessionCache.get({ agent: 'codex', id, file: record.file, stat, accountId,
-      pane: panesBySession.get(id), independentLive: options.independentLive?.has(id), now });
-    let session = cached?.session || record.session || null;
-    if (!session) {
-      try { session = codex.sessionFor(id); } catch {}
-    }
-    if (!session) { codexDashboardRows.delete(id); continue; }
-    codexDashboardRows.set(id, { file: record.file, stat, accountId: session.accountId || accountId || null });
-    options.onSessionSource?.(session, record.file, stat);
-    if (cached?.backgroundJobs) options.onSettledHit?.(session, cached.backgroundJobs);
-    sessions.push(session);
+  for (const id of [...codexDashboardRows.keys()]) {
+    const session = dashboardCodexSessionFor(id, { ...options, now });
+    if (session) sessions.push(session);
   }
   return sessions;
 }
@@ -5040,6 +5068,7 @@ function buildState(options = {}) {
     Object.entries(liveLedger.sessions || {}).filter(([, entry]) => entry.source !== 'host'),
   ) }, now);
   const panesBySession = hostPanesBySession(options.hostPanes || []);
+  const dashboardAccountAuthority = workerMode ? accounts.authority(keep.ROOT) : null;
   let cardUsageSummary = null;
   try { cardUsageSummary = cardUsage.snapshot(keep.ROOT); }
   catch (error) {
@@ -5075,6 +5104,7 @@ function buildState(options = {}) {
     hostPanes: options.hostPanes || [],
     hostPanesBySession: panesBySession,
     independentLive,
+    accountAuthority: dashboardAccountAuthority,
     onSessionSource: rememberDashboardSource,
     onSettledHit: (session, jobs) => settledBackgroundJobs.set(`${session.kind}:${session.id}`, jobs),
     ...(options.dashboard === true ? { onTranscriptRows: (rows) => { dashboardTranscriptRows = rows; } } : {}),
@@ -5084,7 +5114,14 @@ function buildState(options = {}) {
   if (Object.prototype.hasOwnProperty.call(options, 'hostPanes')) {
     backfillHostSessions(sessions, options.hostPanes, {
       tasks,
-      codexSessionFor: options.codexSessionFor,
+      codexSessionFor: options.codexSessionFor || (workerMode ? (id) => dashboardCodexSessionFor(id, {
+        accountAuthority: dashboardAccountAuthority,
+        hostPanesBySession: panesBySession,
+        independentLive,
+        now,
+        onSessionSource: rememberDashboardSource,
+        onSettledHit: (session, jobs) => settledBackgroundJobs.set(`${session.kind}:${session.id}`, jobs),
+      }) : undefined),
       claudeSessionFor: options.claudeSessionFor,
       independentLive,
       dashboard: options.dashboard === true,
@@ -5101,7 +5138,10 @@ function buildState(options = {}) {
     });
   }
   for (const session of sessions) {
-    if (session.kind === 'codex') rememberDashboardSource(session, codex.rolloutFileFor(session.id));
+    const key = `${session.kind}:${session.id}`;
+    if (session.kind === 'codex' && !dashboardSourceFiles.has(key)) {
+      rememberDashboardSource(session, codex.rolloutFileFor(session.id));
+    }
   }
   // Current card links win over historical links; task progress stays separate
   // from the live conversation's readiness for another instruction.
@@ -5166,6 +5206,8 @@ function buildState(options = {}) {
         && !independentLive?.has(session.id) && !session.pendingBackground
         && !session.lifecycleForeground && !(session.lifecycleAgents || []).length
         && jobs?.caughtUp === true && jobs.pending === false && !(jobs.uncertain || []).length
+        && jobs.recovering === false && jobs.gap === false
+        && jobs.unresolvedCalls === 0 && jobs.unconsumedHooks === 0
         && (jobs.jobs || []).every((job) => terminal.has(job.status));
       if (!eligible) {
         settledSessionCache.delete(session.kind, session.id);
