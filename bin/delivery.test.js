@@ -4,7 +4,49 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { deliver, userText } = require('./delivery');
+const { deliver, userText, settleObserved, textHash } = require('./delivery');
+
+test('exact Claude /mcp terminal evidence settles only the matching pending delivery', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-mcp-delivery-'));
+  const file = path.join(root, 'transcript'); fs.writeFileSync(file, '');
+  const directory = path.join(root, 'journal');
+  const base = { session: { id: 'session-a', kind: 'claude' }, pane: 'pane-a', text: '/mcp', file, directory,
+    precheck: async () => {}, type: async () => {}, submitDraft: async () => assert.fail(),
+    draftMatches: async () => false, pause: async () => {}, attempts: 1 };
+  try {
+    await assert.rejects(deliver(base), /unconfirmed/);
+    const evidence = { sessionId: 'session-a', pane: 'pane-a', expectedHash: textHash('/mcp'), evidence: 'claude-mcp-menu' };
+    assert.equal(settleObserved(directory, { ...evidence, sessionId: 'session-b' }), false);
+    assert.equal(settleObserved(directory, { ...evidence, pane: 'pane-b' }), false);
+    assert.equal(settleObserved(directory, { ...evidence, expectedHash: textHash('/mcp tools') }), false);
+    assert.equal(settleObserved(directory, { ...evidence, evidence: 'other-menu' }), false);
+    assert.equal(settleObserved(directory, evidence), true);
+    assert.equal((await deliver(base)).recovered, true);
+
+    const normal = { ...base, session: { id: 'normal', kind: 'claude' }, text: 'hello' };
+    await assert.rejects(deliver(normal), /unconfirmed/);
+    assert.equal(settleObserved(directory, {
+      sessionId: 'normal', pane: 'pane-a', expectedHash: textHash('hello'), evidence: 'claude-mcp-menu',
+    }), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('Claude /mcp can settle from terminal evidence during receipt polling', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-mcp-delivery-'));
+  const file = path.join(root, 'transcript'); fs.writeFileSync(file, '');
+  const directory = path.join(root, 'journal');
+  let typed = 0;
+  try {
+    const result = await deliver({ session: { id: 'session-a', kind: 'claude' }, pane: 'pane-a', text: '/mcp', file, directory,
+      precheck: async () => {}, type: async () => { typed++; }, submitDraft: async () => assert.fail(),
+      draftMatches: async () => false, pause: async () => {}, attempts: 1,
+      observe: async () => settleObserved(directory, {
+        sessionId: 'session-a', pane: 'pane-a', expectedHash: textHash('/mcp'), evidence: 'claude-mcp-menu',
+      }) });
+    assert.equal(result.delivery, 'received');
+    assert.equal(typed, 1);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
 
 for (const mode of ['absorbed mid-turn', 'enqueue', 'legacy enqueue', 'attachment', 'different attachment', 'different enqueue', 'remove only', 'before offset']) {
   test(`Claude queued delivery receipt: ${mode}`, async () => {

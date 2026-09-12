@@ -79,7 +79,43 @@ function saveReceipt(directory, entry) {
   fs.renameSync(file + '.tmp', file);
 }
 
-async function deliverAttempt({ session, pane, text, key, file, directory, trace, retainReceipt = false, precheck, type, submitDraft, draftMatches, pause = (ms) => new Promise((r) => setTimeout(r, ms)), attempts = 16 }) {
+function settledJournal(directory, entry) {
+  return path.join(directory, 'settled', hash(entry.sessionId) + '.json');
+}
+
+function matchingSettled(directory, entry) {
+  try {
+    const settled = JSON.parse(fs.readFileSync(settledJournal(directory, entry), 'utf8'));
+    return settled.sessionId === entry.sessionId && settled.pane === entry.pane && settled.hash === entry.hash;
+  } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+}
+
+// Called only after the injection owner positively identifies a terminal-native
+// receipt. Exact journal identity prevents screen evidence from settling another send.
+function settleObserved(directory, { sessionId, pane, expectedHash, evidence }) {
+  if (expectedHash !== hash('/mcp') || evidence !== 'claude-mcp-menu') return false;
+  const journal = path.join(directory, hash(sessionId) + '.json');
+  let entry;
+  try { entry = JSON.parse(fs.readFileSync(journal, 'utf8')); }
+  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+  if (entry.sessionId !== sessionId || entry.kind !== 'claude' || entry.pane !== pane || entry.hash !== expectedHash) return false;
+  const settled = settledJournal(directory, entry);
+  fs.mkdirSync(path.dirname(settled), { recursive: true, mode: 0o700 });
+  const temp = journal + '.observed';
+  fs.writeFileSync(temp, JSON.stringify({ ...entry, terminalEvidence: { type: evidence, at: Date.now() } }), { mode: 0o600 });
+  fs.renameSync(temp, journal);
+  fs.renameSync(journal, settled);
+  return true;
+}
+
+function finish(directory, journal, entry) {
+  saveReceipt(directory, entry);
+  for (const file of [journal, settledJournal(directory, entry)]) {
+    try { fs.unlinkSync(file); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+}
+
+async function deliverAttempt({ session, pane, text, key, file, directory, trace, retainReceipt = false, precheck, type, submitDraft, draftMatches, observe, pause = (ms) => new Promise((r) => setTimeout(r, ms)), attempts = 16 }) {
   let typingError;
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const activeJournal = path.join(directory, hash(session.id) + '.json');
@@ -94,8 +130,7 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
   if (entry) {
     trace('pending-journal-found');
     if (settled || received(entry)) {
-      saveReceipt(directory, entry);
-      fs.unlinkSync(journal);
+      finish(directory, journal, entry);
       if (entry.hash === hash(text)) return { ok: true, delivery: 'received', recovered: true };
       entry = null;
     } else {
@@ -122,9 +157,10 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
       typingError = error;
     }
   }
+  const confirmed = async () => received(entry) || matchingSettled(directory, entry) || Boolean(observe && await observe());
   for (let i = 0; i < attempts; i++) {
     await pause(500);
-    if (received(entry)) { saveReceipt(directory, entry); fs.unlinkSync(journal); return { ok: true, delivery: 'received' }; }
+    if (await confirmed()) { finish(directory, journal, entry); return { ok: true, delivery: 'received' }; }
   }
   // Some TUIs absorb the first Enter while completing a paste. Retry only if
   // the original entire draft is still present, never when it was consumed.
@@ -132,7 +168,7 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
     await submitDraft();
     for (let i = 0; i < attempts; i++) {
       await pause(500);
-      if (received(entry)) { saveReceipt(directory, entry); fs.unlinkSync(journal); return { ok: true, delivery: 'received' }; }
+      if (await confirmed()) { finish(directory, journal, entry); return { ok: true, delivery: 'received' }; }
     }
   }
   if (typingError) throw typingError;
@@ -218,4 +254,5 @@ function reconcile(directory) {
   }
   return settled;
 }
-module.exports = { deliver, received, reconcile, userText, statusForText, acknowledge, pendingForSession };
+module.exports = { deliver, received, reconcile, userText, statusForText, acknowledge, pendingForSession,
+  settleObserved, textHash: hash };

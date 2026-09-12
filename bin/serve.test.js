@@ -91,6 +91,7 @@ const {
   isInjectionBusy,
   withInjectionLock,
   sendToSessionLocked,
+  claudeMcpMenuVisible,
   continueAccountHandoff,
   listPortableTransfers,
   transferSession,
@@ -2940,6 +2941,21 @@ test('typing exit confirms the prompt above a tall Claude slash-command menu', a
   assert.equal(check('──────────────────── my-debug-session ─\n❯ /exit\n──────────────────────────────\n? for shortcuts', '/exit'), true);
   await typeAndSubmit({ pane: 'p' }, '/exit', check, { host, confirmationLines: null, sleep: async () => {} });
   assert.equal(typed, '/exit\r');
+});
+
+test('Claude MCP receipt evidence requires the live menu footer at the bottom', () => {
+  const live = [
+    'Manage MCP servers',
+    '4 servers',
+    '❯ castle  connected',
+    '  jesse   connected',
+    '↑/↓ to navigate · Enter to confirm · Esc to cancel',
+  ].join('\n');
+  assert.equal(claudeMcpMenuVisible(live), true);
+  assert.equal(claudeMcpMenuVisible(live.replace('Manage MCP servers', 'Manage plugins')), false);
+  assert.equal(claudeMcpMenuVisible(live.replace('Esc to cancel', 'Esc to close')), false);
+  assert.equal(claudeMcpMenuVisible(`${live}\n────────────────\n❯`), false,
+    'historical menu text above the active prompt is not current evidence');
 });
 
 test('delivery trace distinguishes screen mismatch from Enter submission without screen text', async () => {

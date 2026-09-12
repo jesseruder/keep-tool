@@ -3269,10 +3269,41 @@ function startAutoCompact() {
   setTimeout(() => { void tick(); }, 60e3).unref();
 }
 
+function claudeMcpMenuVisible(screen) {
+  const lines = stripTerminalAnsi(screen).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const title = lines.lastIndexOf('Manage MCP servers');
+  if (title < 0) return false;
+  const panel = lines.slice(title);
+  const footer = /^↑\/↓(?: to)? navigate · Enter(?: to)? confirm · Esc(?: to)? cancel$/;
+  return panel.some((line) => /^\d+ servers?$/.test(line))
+    && footer.test(panel.at(-1));
+}
+
+async function observeClaudeMcpMenu(session, target, deps = {}) {
+  const bound = (panes) => panes.find((candidate) => candidate.id === target.pane
+    && candidate.alive && candidate.agentAlive !== false
+    && candidate.meta?.sessionId === session.id && candidate.meta?.agent === 'claude');
+  try {
+    if (!bound(await listHostPanes(deps, true))) return false;
+    const screen = await readScreenResult(target, null, false, deps);
+    if (!claudeMcpMenuVisible(screen?.text)) return false;
+    return Boolean(bound(await listHostPanes(deps, true)));
+  } catch { return false; }
+}
+
 async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
   claimInjectionTarget(target);
   const pendingDirectory = deps.deliveryDirectory || path.join(keep.ROOT, '.keep', 'delivery');
   const trace = require('./delivery-trace').recorder(pendingDirectory, session, target.pane);
+  const delivery = require('./delivery');
+  const observeMcp = session.kind === 'claude' && text === '/mcp' ? async () => {
+    if (!await observeClaudeMcpMenu(session, target, deps)) return false;
+    const settled = delivery.settleObserved(pendingDirectory, {
+      sessionId: session.id, pane: target.pane, expectedHash: delivery.textHash(text), evidence: 'claude-mcp-menu',
+    });
+    if (settled) trace('terminal-evidence-confirmed', { evidence: 'claude-mcp-menu' });
+    return settled;
+  } : null;
   const precheck = async () => {
   await precheckSessionTarget(session, target, deps);
   if (opts && opts.compactIfCold && !session.reviewer) {
@@ -3291,10 +3322,14 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
   };
   const confirmation = session.kind === 'codex' ? codexTypedTextVisible : claudeTypedTextVisible;
   try {
-    return await require('./delivery').deliver({
+    // Claude does not transcript /mcp. A previously submitted command can be
+    // recovered only while its native menu is still positively identified.
+    if (observeMcp) await observeMcp();
+    return await delivery.deliver({
       session, pane: target.pane, text, file: (deps.transcriptFileForSession || transcriptFileForSession)(session), directory: pendingDirectory, trace,
       retainReceipt: opts?.retainReceipt === true,
       key: opts?.deliveryKey,
+      observe: observeMcp,
       precheck,
       type: () => typeAndSubmit(target, text, confirmation, { ...deps, deliveryTrace: trace }),
       submitDraft: () => pressTargetKey(target, 'Enter', deps),
@@ -6033,6 +6068,7 @@ module.exports = {
   launchReviewQueueSession, inspectReviewQueueLaunch, recoverReviewQueueLaunch,
   waitForHostAgent, waitForHostSessionId, addHostSessionState,
   sendToSession, sendToResolvedTarget, precheckSessionTarget, InjectionError,
+  claudeMcpMenuVisible,
   resumeAfterLimit,
 };
 
