@@ -168,3 +168,27 @@ test('configured Codex roots keep discovery, titles, authority, and path caches 
     assert.equal(result.afterFile, files['codex-two:shared']);
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
+
+test('dashboard rollout index invalidation observes new and deleted files within its sweep window', () => {
+  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-index-'));
+  try {
+    const dir = codex.recentDateDirs(configDir)[1];
+    fs.mkdirSync(dir, { recursive: true });
+    const now = Date.now();
+    assert.deepEqual(codex.indexedRollouts(configDir, { dashboard: true, now }), []);
+
+    const file = path.join(dir, 'rollout-new.jsonl');
+    writeRollout(file, { id: 'new', cwd: '/new' }, true);
+    assert.deepEqual(codex.indexedRollouts(configDir, { dashboard: true, now: now + 1 }), [],
+      'the test change is inside the normal directory sweep interval');
+    codex.invalidate();
+    assert.deepEqual(codex.indexedRollouts(configDir, { dashboard: true, now: now + 2 }).map((row) => row.file), [file]);
+
+    fs.unlinkSync(file);
+    codex.invalidate();
+    assert.deepEqual(codex.indexedRollouts(configDir, { dashboard: true, now: now + 3 }), []);
+  } finally {
+    codex.invalidate();
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
+});

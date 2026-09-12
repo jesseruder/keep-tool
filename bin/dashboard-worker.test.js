@@ -87,16 +87,29 @@ test('real dashboard build preserves host pane mapping and parent runtime snapsh
   const previousHome = process.env.HOME;
   process.env.HOME = home;
   for (const dir of ['.claude/projects', '.codex/sessions']) fs.mkdirSync(path.join(home, dir), { recursive: true });
+  const projectsRoot = path.join(home, '.claude', 'projects');
+  const projectDir = path.join(projectsRoot, '-tmp-project');
+  fs.mkdirSync(projectDir, { recursive: true });
+  const transcript = path.join(projectDir, 'cached-claude.jsonl');
+  const transcriptText = (answer) => [
+    { type: 'mode', mode: 'normal', sessionId: 'cached-claude' },
+    { type: 'user', sessionId: 'cached-claude', cwd: '/tmp/project', timestamp: new Date().toISOString(), message: { content: 'Run it' } },
+    { type: 'assistant', sessionId: 'cached-claude', cwd: '/tmp/project', timestamp: new Date().toISOString(), message: { stop_reason: 'end_turn', content: [{ type: 'text', text: answer }] } },
+  ].map(JSON.stringify).join('\n') + '\n';
+  fs.writeFileSync(transcript, transcriptText('First!'));
   const worker = createDashboardWorker();
   t.after(() => {
     worker.close();
     process.env.HOME = previousHome;
     fs.rmSync(home, { recursive: true, force: true });
   });
-  const result = await worker.build({
+  const input = {
     hostPanes: [{
       id: 'pane-host-only', alive: true, agentAlive: true, createdAt: new Date().toISOString(),
       meta: { sessionId: 'host-only', agent: 'codex', model: 'gpt-test', project: '/tmp/project' },
+    }, {
+      id: 'pane-cached', alive: true, agentAlive: true, createdAt: new Date().toISOString(),
+      meta: { sessionId: 'cached-claude', agent: 'claude', model: 'claude-test', project: '/tmp/project' },
     }],
     companion: null,
     dashboardRuntime: {
@@ -105,11 +118,22 @@ test('real dashboard build preserves host pane mapping and parent runtime snapsh
       usage: { accounts: {} },
       runs: [{ id: 'parent-run', state: 'running' }],
     },
-  });
+  };
+  const result = await worker.build(input);
   const session = result.state.sessions.find((item) => item.id === 'host-only');
   assert.equal(session.pane, 'pane-host-only');
   assert.equal(session.launchModel, 'gpt-test');
   assert.equal(result.state.panes[0].id, 'pane-host-only');
   assert.equal(result.state.attention.find((item) => item.sessionId === 'host-only')?.pane, 'pane-host-only');
   assert.deepEqual(result.state.runs, [{ id: 'parent-run', state: 'running' }]);
+  const scanned = result.state.sessions.find((item) => item.id === 'cached-claude');
+  assert.equal(scanned.hostOnly, undefined);
+  assert.equal(scanned.pane, 'pane-cached');
+  assert.equal(scanned.launchModel, 'claude-test');
+  assert.equal(scanned.lastAssistant, 'First!');
+
+  fs.writeFileSync(transcript, transcriptText('Later!'));
+  worker.invalidate({ kind: 'claude', root: projectsRoot, name: path.join('-tmp-project', 'cached-claude.jsonl') });
+  const changed = await worker.build(input);
+  assert.equal(changed.state.sessions.find((item) => item.id === 'cached-claude').lastAssistant, 'Later!');
 });
