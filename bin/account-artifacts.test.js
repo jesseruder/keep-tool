@@ -54,8 +54,9 @@ function appendTurn(f, accountId) {
 }
 
 function prepareLedger(f) {
-  const child = 'child';
+  const child = 'child', grandchild = 'grandchild';
   const childFile = path.join(project(f, 'a'), f.sid, 'subagents', `agent-${child}.jsonl`);
+  const grandchildFile = path.join(project(f, 'a'), f.sid, 'subagents', `agent-${child}`, 'subagents', `agent-${grandchild}.jsonl`);
   const at = (value) => new Date(value).toISOString();
   const parentRows = [
     { type: 'user', sessionId: f.sid, timestamp: at(1000), message: { content: 'work' } },
@@ -64,21 +65,28 @@ function prepareLedger(f) {
     { type: 'user', sessionId: f.sid, timestamp: at(1200), message: { content: [
       { type: 'tool_result', tool_use_id: 'spawn', content: `Async agent launched successfully. agentId: ${child}` },
     ] } },
-    { type: 'user', sessionId: f.sid, timestamp: at(1400), message: {
-      content: `<task-notification><task-id>${child}</task-id><status>completed</status></task-notification>`,
-    } },
     { type: 'assistant', sessionId: f.sid, timestamp: at(1500), message: { stop_reason: 'end_turn', content: [] } },
   ];
-  const childRows = [{ type: 'assistant', sessionId: f.sid, timestamp: at(1300),
-    message: { stop_reason: null, content: [{ type: 'text', text: 'child complete' }] } }];
+  const childRows = [
+    { type: 'assistant', sessionId: f.sid, timestamp: at(1250), message: { stop_reason: 'tool_use',
+      content: [{ type: 'tool_use', id: 'spawn-grandchild', name: 'Agent', input: {} }] } },
+    { type: 'user', sessionId: f.sid, timestamp: at(1300), message: { content: [
+      { type: 'tool_result', tool_use_id: 'spawn-grandchild', content: `Async agent launched successfully. agentId: ${grandchild}` },
+    ] } },
+    { type: 'assistant', sessionId: f.sid, timestamp: at(1400), message: { stop_reason: 'end_turn', content: [] } },
+  ];
+  const grandchildRows = [{ type: 'assistant', sessionId: f.sid, timestamp: at(1350),
+    message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'grandchild complete' }] } }];
   fs.writeFileSync(transcript(f, 'a'), parentRows.map(JSON.stringify).join('\n') + '\n');
   fs.writeFileSync(childFile, childRows.map(JSON.stringify).join('\n') + '\n');
+  fs.mkdirSync(path.dirname(grandchildFile), { recursive: true });
+  fs.writeFileSync(grandchildFile, grandchildRows.map(JSON.stringify).join('\n') + '\n');
   const resolveChild = (id, parentFile) => path.join(path.dirname(parentFile), path.basename(parentFile, '.jsonl'),
     'subagents', `agent-${id}.jsonl`);
   const verify = (accountId) => restartLedger.verify({ root: f.root, agent: 'claude', sid: f.sid,
     file: transcript(f, accountId), instance: { id: `pane:${accountId}`, since: 1, live: true }, resolveChild })();
   verify('a');
-  return { child, resolveChild, verify };
+  return { child, grandchild, resolveChild, verify };
 }
 
 function appendCompletedTurn(f, accountId, sequence) {
@@ -115,6 +123,9 @@ test('transaction-bound ledgers follow A to B to C to A with child evidence and 
   const f = fixture();
   try {
     const ledger = prepareLedger(f);
+    const cached = Object.fromEntries(jobs.targets(f.root).map((entry) => [entry.sid, { ...entry }]));
+    assert.equal(cached[f.sid].file, transcript(f, 'a'));
+    assert.match(cached[ledger.child].file, new RegExp(`agent-${ledger.child}\\.jsonl$`));
     artifacts.copyClaudeArtifacts(f.sid, f.records.a, f.records.b, 'tx-ledger-a-b', options(f));
     let interrupted = false;
     assert.throws(() => artifacts.rebindLedger(f.sid, f.records.a, f.records.b, 'tx-ledger-a-b', rebindOptions(f, {
@@ -132,18 +143,30 @@ test('transaction-bound ledgers follow A to B to C to A with child evidence and 
     artifacts.copyClaudeArtifacts(f.sid, f.records.b, f.records.c, 'tx-ledger-b-c', options(f));
     artifacts.rebindLedger(f.sid, f.records.b, f.records.c, 'tx-ledger-b-c', rebindOptions(f));
     ledger.verify('c');
+    for (const id of [f.sid, ledger.child]) {
+      const stale = jobs.sync({ root: f.root, ...cached[id], now: 1700 });
+      assert.equal(stale.gap, false, `${id} cached A poll stays safe after B to C`);
+      assert.match(stale.redirect.file, new RegExp(id === f.sid ? `${f.sid}\\.jsonl$` : `agent-${id}\\.jsonl$`));
+      assert.equal(stale.redirect.file.startsWith(project(f, 'c') + path.sep), true);
+    }
 
     appendCompletedTurn(f, 'c', 2); ledger.verify('c');
     artifacts.copyClaudeArtifacts(f.sid, f.records.c, f.records.a, 'tx-ledger-c-a', options(f));
     artifacts.rebindLedger(f.sid, f.records.c, f.records.a, 'tx-ledger-c-a', rebindOptions(f));
     ledger.verify('a');
+    for (const id of [f.sid, ledger.child]) {
+      const returned = jobs.sync({ root: f.root, ...cached[id], now: 2400 });
+      assert.equal(returned.gap, false, `${id} cached A path is authoritative again after the return hop`);
+      assert.equal(returned.redirect, undefined);
+    }
 
     const parent = JSON.parse(fs.readFileSync(path.join(f.root, '.keep/background-jobs/claude', f.sid, 'state.json')));
     const child = JSON.parse(fs.readFileSync(path.join(f.root, '.keep/background-jobs/claude', ledger.child, 'state.json')));
     assert.equal(parent.gap, false); assert.equal(child.gap, false);
     assert.equal(parent.handoffRebind.transactionId, 'tx-ledger-c-a');
     assert.equal(child.handoffRebind.transactionId, 'tx-ledger-c-a');
-    assert.equal(parent.jobs['job:child'].status, 'completed');
+    assert.equal(parent.jobs['job:child'].status, 'pending');
+    assert.equal(child.jobs['job:grandchild'].status, 'pending');
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 

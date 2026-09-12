@@ -125,7 +125,11 @@ function rebindSource({ root, agent, sid, sourceFile, targetFile, transactionId,
     }
     state.checkpoint = { ...checkpoint, identity: target.identity, offset: target.size, anchor: target.anchor, mtime: target.mtime };
     state.source = { ...state.source, file: target.file };
-    state.handoffRebind = { version: 1, transactionId, sourceStopVerifiedAt, source, target, reboundAt: Date.now() };
+    const priorSources = Array.isArray(prior?.retiredSources) ? prior.retiredSources : prior?.source ? [prior.source] : [];
+    const retained = [...priorSources, source].filter((entry, index, all) => entry?.file !== target.file
+      && all.findLastIndex((candidate) => candidate?.file === entry.file) === index).slice(-128);
+    state.handoffRebind = { version: 1, transactionId, sourceStopVerifiedAt, source, target,
+      retiredSources: retained, reboundAt: Date.now() };
     writeState(snapshot, state);
     return { reused: false, children: Object.keys(state.restart.children || {}) };
   } finally { try { fs.unlinkSync(lock); } catch {} }
@@ -330,8 +334,10 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
     let state = { version: 1, jobs: {}, calls: {}, notices: {}, checkpoint: null, gap: false };
     try { state = JSON.parse(fs.readFileSync(snapshot, 'utf8')); if (state.version !== 1 || !state.jobs || !state.calls || !state.notices) throw Error('invalid ledger'); }
     catch (e) { state = { version: 1, jobs: {}, calls: {}, notices: {}, checkpoint: null, gap: e.code !== 'ENOENT' }; }
-    const formerSource = state.handoffRebind?.source;
-    if (formerSource?.file && path.resolve(file) === formerSource.file) {
+    const retiredSources = Array.isArray(state.handoffRebind?.retiredSources)
+      ? state.handoffRebind.retiredSources.slice(0, 128) : state.handoffRebind?.source ? [state.handoffRebind.source] : [];
+    const formerSource = retiredSources.find((entry) => entry?.file && path.resolve(file) === entry.file);
+    if (formerSource) {
       if (!sameFrozenFile(file, formerSource)) { state.gap = true; writeState(snapshot, state); }
       const currentJobs = Object.values(state.jobs);
       const open = currentJobs.filter(j => !TERMINAL.has(j.status) && !['service', 'scheduled'].includes(j.kind));
@@ -340,7 +346,8 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
       if (state.recovering || state.gap) uncertain.push(state.recovering ? 'history-recovery' : 'history-gap');
       return { pending: open.some(j => !uncertain.includes(j.id)), uncertain,
         jobs: currentJobs.map(j => ({ ...j, confidence: TERMINAL.has(j.status) ? 'observed' : uncertain.includes(j.id) ? 'uncertain' : 'observed' })),
-        recovering: Boolean(state.recovering), gap: Boolean(state.gap), bytesRead: 0, lastReconciledAt: state.lastReconciledAt };
+        recovering: Boolean(state.recovering), gap: Boolean(state.gap), bytesRead: 0, lastReconciledAt: state.lastReconciledAt,
+        redirect: state.source };
     }
     if (state.source?.includeSidechain) includeSidechain = true;
     if ((agent === 'codex' && state.pollVersion !== 2) || state.childStopVersion !== 3) {

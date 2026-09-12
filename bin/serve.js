@@ -5292,6 +5292,9 @@ function start(deps = {}) {
           return require('./codex-lifecycle').inspectChild(id, target.sid);
         },
       });
+      if (result.redirect?.agent === target.agent && result.redirect.sid === target.sid && result.redirect.file) {
+        backgroundTargets.set(`${target.agent}:${target.sid}`, result.redirect);
+      }
       if (jobsChanged(`${target.agent}:${target.sid}`, result)) broadcast();
     } catch (error) { process.stderr.write(`keep jobs: ${error.message}\n`); }
   };
