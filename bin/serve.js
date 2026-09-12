@@ -469,18 +469,15 @@ function transcriptHasInteractiveMarker(file, stat, includeSidechain = false) {
   const cacheKey = `${includeSidechain ? 'all' : 'main'}:${file}`;
   const cached = interactiveMarkerCache.get(cacheKey);
   const sameFile = cached && cached.dev === stat.dev && cached.ino === stat.ino;
-  if (sameFile && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.interactive;
-  if (sameFile && cached.interactive && stat.size > cached.size) {
-    cacheInteractiveMarker(cacheKey, { ...cached, mtimeMs: stat.mtimeMs, size: stat.size });
-    return true;
+  if (sameFile && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    cacheInteractiveMarker(cacheKey, cached);
+    return cached.interactive;
   }
-  const appended = sameFile && !cached.interactive && stat.size > cached.size;
-  const start = appended ? cached.offset : 0;
   const fd = fs.openSync(file, 'r');
   const buffer = Buffer.alloc(64 * 1024);
-  let carry = appended ? cached.carry : Buffer.alloc(0);
-  let discardPartial = appended ? cached.discardPartial : false;
-  let offset = start;
+  let carry = Buffer.alloc(0);
+  let discardPartial = false;
+  let offset = 0;
   let interactive = false;
   try {
     while (true) {
@@ -528,8 +525,7 @@ function transcriptHasInteractiveMarker(file, stat, includeSidechain = false) {
       } catch {}
     }
     cacheInteractiveMarker(cacheKey, {
-      dev: stat.dev, ino: stat.ino, mtimeMs: stat.mtimeMs, size: stat.size, offset,
-      carry: interactive ? Buffer.alloc(0) : Buffer.from(carry), discardPartial, interactive,
+      dev: stat.dev, ino: stat.ino, mtimeMs: stat.mtimeMs, size: stat.size, interactive,
     });
     return interactive;
   } finally {
@@ -540,9 +536,9 @@ function transcriptHasInteractiveMarker(file, stat, includeSidechain = false) {
 function claudeTranscriptIsInteractive(file, info, stat) {
   if (info.interactive) return true;
   // Long transcripts can push the startup marker outside the parsed tail. Scan
-  // ambiguous history incrementally and stop at the first marker. This also
-  // retains a headless transcript after it is explicitly resumed in the TUI and
-  // its resume marker later leaves the tail.
+  // changed ambiguous history from the beginning and stop at the first marker.
+  // This also retains a headless transcript after it is explicitly resumed in
+  // the TUI and its resume marker later leaves the tail.
   if (stat.size <= TAIL_BYTES) return false;
   try { return transcriptHasInteractiveMarker(file, stat); } catch { return false; }
 }

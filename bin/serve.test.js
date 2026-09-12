@@ -4152,7 +4152,7 @@ test('Claude discovery excludes titled headless runs from cold and cached scans 
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
 
-test('long transcript marker scans continue from cached EOF and retain positive evidence across appends', () => {
+test('long transcript marker cache trusts only unchanged file metadata', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-claude-marker-cache-'));
   const file = path.join(dir, 'session.jsonl');
   const filler = (count) => Array.from({ length: count }, (_, index) => JSON.stringify({
@@ -4167,38 +4167,36 @@ test('long transcript marker scans continue from cached EOF and retain positive 
     return bytes;
   };
   try {
-    assert.equal(claudeTranscriptIsInteractive(file, scanTranscript(file), fs.statSync(file)), false);
+    const initialStat = fs.statSync(file);
+    const parsedHeadless = scanTranscript(file);
+    assert.equal(claudeTranscriptIsInteractive(file, parsedHeadless, initialStat), false);
     const afterCold = bytesRead;
-    fs.appendFileSync(file, `${JSON.stringify({ type: 'ai-title', aiTitle: 'Still headless' })}\n`);
-    assert.equal(claudeTranscriptIsInteractive(file, scanTranscript(file), fs.statSync(file)), false);
-    const negativeAppendBytes = bytesRead - afterCold;
-    assert.ok(negativeAppendBytes < 300 * 1024, `negative append reread ${negativeAppendBytes} bytes`);
+    assert.equal(claudeTranscriptIsInteractive(file, parsedHeadless, fs.statSync(file)), false);
+    assert.equal(bytesRead, afterCold, 'unchanged metadata reuses a negative marker scan');
 
-    fs.appendFileSync(file, `${JSON.stringify({ type: 'mode', mode: 'normal' })}\n`);
-    assert.equal(claudeTranscriptIsInteractive(file, scanTranscript(file), fs.statSync(file)), true,
-      'a resumed headless transcript earns TUI evidence');
-    fs.appendFileSync(file, filler(70));
-    assert.equal(claudeTranscriptIsInteractive(file, scanTranscript(file), fs.statSync(file)), true,
-      'the incremental scan finds a resume marker after it leaves the tail');
-    const afterPositive = bytesRead;
-    fs.appendFileSync(file, filler(70));
-    assert.equal(claudeTranscriptIsInteractive(file, scanTranscript(file), fs.statSync(file)), true);
-    assert.ok(bytesRead - afterPositive <= 256 * 1024, 'cached positive evidence avoids rereading old history');
+    fs.writeFileSync(file, `${JSON.stringify({ type: 'mode', mode: 'normal' })}\n${filler(80)}`);
+    let changedAt = new Date(Date.now() + 2000);
+    fs.utimesSync(file, changedAt, changedAt);
+    let stat = fs.statSync(file);
+    assert.equal(stat.ino, initialStat.ino, 'the test exercises same-inode rewrites');
+    assert.equal(claudeTranscriptIsInteractive(file, scanTranscript(file), stat), true);
 
-    const sameSizeReplacement = fs.readFileSync(file, 'utf8').replace('"type":"mode"', '"type":"noop"');
-    fs.writeFileSync(file, sameSizeReplacement);
-    const rewrittenAt = new Date(Date.now() + 2000);
-    fs.utimesSync(file, rewrittenAt, rewrittenAt);
-    assert.equal(claudeTranscriptIsInteractive(file, scanTranscript(file), fs.statSync(file)), false,
-      'a same-inode, same-size rewrite invalidates prior positive evidence');
+    fs.writeFileSync(file, filler(90));
+    changedAt = new Date(changedAt.getTime() + 2000);
+    fs.utimesSync(file, changedAt, changedAt);
+    stat = fs.statSync(file);
+    assert.equal(stat.ino, initialStat.ino);
+    assert.equal(claudeTranscriptIsInteractive(file, scanTranscript(file), stat), false,
+      'a larger headless rewrite replaces cached positive evidence');
 
-    fs.truncateSync(file, 0);
-    fs.appendFileSync(file, filler(70));
-    assert.equal(claudeTranscriptIsInteractive(file, scanTranscript(file), fs.statSync(file)), false,
-      'truncation resets marker history');
-    fs.appendFileSync(file, `${JSON.stringify({ type: 'permission-mode', permissionMode: 'default' })}\n`);
-    assert.equal(claudeTranscriptIsInteractive(file, scanTranscript(file), fs.statSync(file)), true,
-      'new evidence after truncation is discovered');
+    fs.writeFileSync(file, `${JSON.stringify({ type: 'permission-mode', permissionMode: 'default' })}\n${filler(100)}`);
+    changedAt = new Date(changedAt.getTime() + 2000);
+    fs.utimesSync(file, changedAt, changedAt);
+    stat = fs.statSync(file);
+    assert.equal(stat.ino, initialStat.ino);
+    assert.equal(claudeTranscriptIsInteractive(file, scanTranscript(file), stat), true,
+      'a larger rewrite is rescanned from byte zero and finds new prefix evidence');
+
     assert.equal(claudeTranscriptIsInteractive(path.join(dir, 'vanished.jsonl'), { interactive: false }, {
       size: 300 * 1024, dev: 1, ino: 1, mtimeMs: Date.now(),
     }), false, 'a candidate removed after indexing does not fail the dashboard scan');
