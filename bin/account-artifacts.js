@@ -384,4 +384,56 @@ function copyClaudeArtifacts(sessionId, source, target, transactionId, options =
   return { ...publicPlan(plan), copied, reused: copied.length === 0 };
 }
 
-module.exports = { preflight, copyClaudeArtifacts };
+function completedPlan(sessionId, source, target, transactionId, options) {
+  const plan = buildPlan(sessionId, source, target, options);
+  const journal = readJson(journalFile(plan.root, transactionId));
+  validateExistingJournal(plan, journal, transactionId);
+  if (journal.status !== 'complete') throw failure(`artifact transaction ${transactionId} is incomplete`, 'KEEP_ARTIFACT_JOURNAL');
+  const desired = manifestMap(plan.artifacts, 'sourceManifest');
+  const installed = manifestMap(plan.artifacts, 'targetManifest');
+  if (!sameManifestMap(installed, desired)) {
+    throw failure(`completed artifact transaction ${transactionId} no longer matches its target`);
+  }
+  return plan;
+}
+
+// Rebind every ledger in the persisted Claude child graph while the copied
+// target is still quiescent. Staging/launch happens only after this finishes.
+function rebindLedger(sessionId, source, target, transactionId, options = {}) {
+  if (!Number.isFinite(options.sourceStopVerifiedAt) || options.sourceStopVerifiedAt <= 0) {
+    throw failure('verified source stop evidence is required before ledger rebind', 'KEEP_ARTIFACT_LEDGER');
+  }
+  const plan = completedPlan(sessionId, source, target, transactionId, options);
+  const transcript = plan.artifacts.find((entry) => entry.kind === 'transcript');
+  const sessionTree = plan.artifacts.find((entry) => entry.kind === 'session');
+  const rebind = options.rebindSource || require('./background-jobs').rebindSource;
+  const rebound = [], visiting = new Set();
+  function visit(id, sourceFile, targetFile, depth) {
+    if (!/^[A-Za-z0-9_-]+$/.test(id) || depth > 8 || visiting.has(id) || rebound.length >= 128) {
+      throw failure('Claude child ledger graph is unverified', 'KEEP_ARTIFACT_LEDGER');
+    }
+    visiting.add(id);
+    const result = rebind({ root: plan.root, agent: 'claude', sid: id, sourceFile, targetFile, transactionId,
+      sourceStopVerifiedAt: options.sourceStopVerifiedAt });
+    rebound.push({ sessionId: id, reused: result.reused === true });
+    for (const child of result.children || []) {
+      if (!sessionTree?.sourceManifest || !sessionTree?.targetManifest) {
+        throw failure('Claude child artifacts are unavailable', 'KEEP_ARTIFACT_LEDGER');
+      }
+      const childSource = path.join(path.dirname(sourceFile), path.basename(sourceFile, '.jsonl'), 'subagents', `agent-${child}.jsonl`);
+      const relative = path.relative(sessionTree.source, childSource);
+      if (!within(sessionTree.source, childSource) || relative === '' || path.isAbsolute(relative)) {
+        throw failure('Claude child artifact escapes its session tree', 'KEEP_ARTIFACT_ESCAPE');
+      }
+      const childTarget = path.join(sessionTree.target, relative);
+      if (!within(sessionTree.target, childTarget)) throw failure('Claude target child artifact escapes its session tree', 'KEEP_ARTIFACT_ESCAPE');
+      visit(child, childSource, childTarget, depth + 1);
+    }
+    visiting.delete(id);
+  }
+  visit(sessionId, transcript.source, transcript.target, 0);
+  completedPlan(sessionId, source, target, transactionId, options);
+  return { ...publicPlan(plan), rebound };
+}
+
+module.exports = { preflight, copyClaudeArtifacts, rebindLedger };

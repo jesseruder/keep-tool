@@ -201,10 +201,84 @@ test('verified fresh startup bridges the first hooks until a complete transcript
     const snapshot = JSON.parse(fs.readFileSync(path.join(root, '.keep/background-jobs/claude/parent/state.json')));
     assert.equal(snapshot.hookBarrier, 0);
     assert.equal(snapshot.checkpoint.offset, fs.statSync(file).size);
-    assert.equal(snapshot.freshStartup, undefined);
+    assert.equal(snapshot.freshStartup.promptAt, 1000);
+    require('./restart-ledger').verify({ root, agent: 'claude', sid: 'parent', file,
+      instance: { id: 'pane:1:2', since: 1, live: true } })();
+
+    jobs.recordHook(root, 'claude', 'parent', { event: 'SessionStart', entity: 'turn', at: 1000, offset: null,
+      transcriptId, missing: true, freshStart: true });
+    jobs.recordHook(root, 'claude', 'parent', { event: 'UserPromptSubmit', entity: 'turn', at: 1000, offset: null,
+      transcriptId, missing: true });
+    const committedReplay = jobs.sync({ root, agent: 'claude', sid: 'parent', file, now: 1500 });
+    assert.equal(committedReplay.gap, false, 'post-snapshot hook replay remains accepted after the transcript is complete');
     require('./restart-ledger').verify({ root, agent: 'claude', sid: 'parent', file,
       instance: { id: 'pane:1:2', since: 1, live: true } })();
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('transaction rebind preserves evidence, ignores its frozen former source, and rejects mutations', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-jobs-rebind-'));
+  const source = path.join(root, 'source', 'parent.jsonl'), target = path.join(root, 'target', 'parent.jsonl');
+  try {
+    fs.mkdirSync(path.dirname(source)); fs.mkdirSync(path.dirname(target));
+    const transcript = [
+      { type: 'user', sessionId: 'parent', timestamp: new Date(1000).toISOString(), message: { content: 'work' } },
+      { type: 'assistant', sessionId: 'parent', timestamp: new Date(1100).toISOString(), message: { content: [], stop_reason: 'end_turn' } },
+    ].map(JSON.stringify).join('\n') + '\n';
+    fs.writeFileSync(source, transcript); fs.copyFileSync(source, target);
+    jobs.sync({ root, agent: 'claude', sid: 'parent', file: source, now: 1200 });
+    const before = JSON.parse(fs.readFileSync(path.join(root, '.keep/background-jobs/claude/parent/state.json')));
+
+    const rebound = jobs.rebindSource({ root, agent: 'claude', sid: 'parent', sourceFile: source, targetFile: target,
+      transactionId: 'tx-a-b', sourceStopVerifiedAt: 1 });
+    assert.equal(rebound.reused, false);
+    const after = JSON.parse(fs.readFileSync(path.join(root, '.keep/background-jobs/claude/parent/state.json')));
+    assert.deepEqual(after.jobs, before.jobs);
+    assert.deepEqual(after.restart, before.restart);
+    assert.equal(after.source.file, path.resolve(target));
+    assert.notEqual(after.checkpoint.identity, before.checkpoint.identity);
+    assert.equal(jobs.rebindSource({ root, agent: 'claude', sid: 'parent', sourceFile: source, targetFile: target,
+      transactionId: 'tx-a-b', sourceStopVerifiedAt: 1 }).reused, true);
+
+    jobs.recordHook(root, 'claude', 'parent', { event: 'PreToolUse', entity: 'call', at: 1300,
+      offset: fs.statSync(target).size });
+    const inbox = path.join(root, '.keep/background-jobs/claude/parent/inbox');
+    const queued = fs.readdirSync(inbox);
+    const stale = jobs.sync({ root, agent: 'claude', sid: 'parent', file: source, now: 1400 });
+    assert.equal(stale.gap, false);
+    assert.deepEqual(fs.readdirSync(inbox), queued, 'target hook evidence is retained during a stale-source tick');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, '.keep/background-jobs/claude/parent/state.json'))).source.file,
+      path.resolve(target));
+    assert.equal(jobs.sync({ root, agent: 'claude', sid: 'parent', file: target, now: 1500 }).gap, false);
+    assert.deepEqual(fs.readdirSync(inbox), []);
+
+    fs.appendFileSync(source, 'changed after source exit\n');
+    const changed = jobs.sync({ root, agent: 'claude', sid: 'parent', file: source, now: 1600 });
+    assert.equal(changed.gap, true);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, '.keep/background-jobs/claude/parent/state.json'))).source.file,
+      path.resolve(target), 'a changed former source never regains authority');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('ledger rebind refuses divergent copies, hard links, and pre-existing incomplete evidence', () => {
+  for (const mode of ['copy', 'hard-link', 'gap']) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `keep-jobs-rebind-${mode}-`));
+    const source = path.join(root, 'source.jsonl'), target = path.join(root, 'target.jsonl');
+    try {
+      fs.writeFileSync(source, JSON.stringify({ type: 'assistant', sessionId: 'parent', timestamp: new Date(1000).toISOString(),
+        message: { content: [], stop_reason: 'end_turn' } }) + '\n');
+      if (mode === 'hard-link') fs.linkSync(source, target);
+      else fs.copyFileSync(source, target);
+      jobs.sync({ root, agent: 'claude', sid: 'parent', file: source, now: 1100 });
+      if (mode === 'copy') fs.appendFileSync(target, 'divergent\n');
+      else {
+        const snapshot = path.join(root, '.keep/background-jobs/claude/parent/state.json');
+        const state = JSON.parse(fs.readFileSync(snapshot)); state.gap = true; fs.writeFileSync(snapshot, JSON.stringify(state));
+      }
+      assert.throws(() => jobs.rebindSource({ root, agent: 'claude', sid: 'parent', sourceFile: source,
+        targetFile: target, transactionId: 'tx-a-b', sourceStopVerifiedAt: 1 }), /does not match|same physical|incomplete/);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  }
 });
 
 test('missing resume, ungrounded prompt, prior gaps, and transcript read errors stay fail closed', () => {

@@ -44,6 +44,7 @@ function deps(f, overrides = {}) {
       processArgs: 'claude --dangerously-skip-permissions --resume session-123', currentModel: 'claude-opus-4-1' }),
     authPreflight: async () => true,
     compatible: () => ({ ok: true, reasons: [], mcpConfig: path.join(f.base, 'mcp.json') }),
+    rebindLedger: () => ({ rebound: [{ sessionId: f.sid, reused: false }] }),
     host: baseHost,
     restartSession: async (_body, options) => {
       pane.alive = false;
@@ -122,6 +123,19 @@ test('explicit handoff moves one conversation across three-account infrastructur
   const f = fixture();
   try {
     const d = deps(f);
+    let rebound = false;
+    d.rebindLedger = (sessionId, source, target, transactionId, options) => {
+      assert.equal(sessionId, f.sid); assert.equal(source.id, 'one'); assert.equal(target.id, 'two');
+      assert.ok(transactionId); assert.ok(options.sourceStopVerifiedAt);
+      assert.equal(d.pane.alive, false, 'source is stopped before the ledger moves');
+      assert.equal(accounts.forSession(f.sid, 'claude', { root: f.root, env: f.env }).id, 'one',
+        'source authority remains active until rebind completes');
+      assert.equal(fs.existsSync(path.join(f.profiles.two, 'projects', f.projectName, `${f.sid}.jsonl`)), true,
+        'verified artifacts are installed before ledger rebind');
+      rebound = true;
+    };
+    const baseRequest = d.host.request;
+    d.host.request = async (...args) => { assert.equal(rebound, true, 'target starts only after ledger rebind'); return baseRequest(...args); };
     const result = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d);
     assert.equal(result.status, 'done');
     assert.equal(accounts.forSession(f.sid, 'claude', { root: f.root, env: f.env }).id, 'two');

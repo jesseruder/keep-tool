@@ -241,6 +241,8 @@ async function run(body, deps = {}) {
           artifacts.preflight(session.id, source, target, { root, env });
           Object.assign(current, { status: 'copying', phase: 'copying-artifacts' }); writeOne(root, current);
           artifacts.copyClaudeArtifacts(session.id, source, target, current.id, { root, env });
+          (deps.rebindLedger || artifacts.rebindLedger)(session.id, source, target, current.id,
+            { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt });
           accounts.stageSession(session.id, target.id, current.id, { root, env });
         }
         Object.assign(current, { status: 'starting', phase: 'starting-target', targetLaunchStartedAt: Date.now() }); writeOne(root, current);
@@ -302,6 +304,8 @@ async function run(body, deps = {}) {
       if (type !== 'replace-exited') return baseHost.request(type, params);
       Object.assign(current, { status: 'copying', phase: 'copying-artifacts', sourceStopVerifiedAt: Date.now() }); writeOne(root, current);
       artifacts.copyClaudeArtifacts(session.id, source, target, current.id, { root, env });
+      (deps.rebindLedger || artifacts.rebindLedger)(session.id, source, target, current.id,
+        { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt });
       copied = true;
       accounts.stageSession(session.id, target.id, current.id, { root, env });
       Object.assign(current, { status: 'starting', phase: 'starting-target', targetLaunchStartedAt: Date.now() }); writeOne(root, current);

@@ -7,6 +7,8 @@ const os = require('node:os');
 const path = require('node:path');
 const accounts = require('./accounts');
 const artifacts = require('./account-artifacts');
+const jobs = require('./background-jobs');
+const restartLedger = require('./restart-ledger');
 
 function fixture() {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-account-artifacts-'));
@@ -37,6 +39,7 @@ function fixture() {
 function project(f, accountId) { return path.join(f.profiles[accountId], 'projects', f.projectName); }
 function transcript(f, accountId) { return path.join(project(f, accountId), `${f.sid}.jsonl`); }
 function options(f) { return { root: f.root, env: f.env }; }
+function rebindOptions(f, extra = {}) { return { ...options(f), sourceStopVerifiedAt: 1, ...extra }; }
 function appendTurn(f, accountId) {
   const directory = path.join(project(f, accountId), f.sid);
   fs.mkdirSync(path.join(directory, 'tool-results'), { recursive: true });
@@ -48,6 +51,41 @@ function appendTurn(f, accountId) {
   fs.writeFileSync(path.join(f.profiles[accountId], 'file-history', f.sid, `${accountId}.txt`), `history ${accountId}`);
   fs.appendFileSync(transcript(f, accountId), `${JSON.stringify({ account: accountId, tool_result: result })}\n`);
   return result;
+}
+
+function prepareLedger(f) {
+  const child = 'child';
+  const childFile = path.join(project(f, 'a'), f.sid, 'subagents', `agent-${child}.jsonl`);
+  const at = (value) => new Date(value).toISOString();
+  const parentRows = [
+    { type: 'user', sessionId: f.sid, timestamp: at(1000), message: { content: 'work' } },
+    { type: 'assistant', sessionId: f.sid, timestamp: at(1100), message: { stop_reason: 'tool_use',
+      content: [{ type: 'tool_use', id: 'spawn', name: 'Agent', input: {} }] } },
+    { type: 'user', sessionId: f.sid, timestamp: at(1200), message: { content: [
+      { type: 'tool_result', tool_use_id: 'spawn', content: `Async agent launched successfully. agentId: ${child}` },
+    ] } },
+    { type: 'user', sessionId: f.sid, timestamp: at(1400), message: {
+      content: `<task-notification><task-id>${child}</task-id><status>completed</status></task-notification>`,
+    } },
+    { type: 'assistant', sessionId: f.sid, timestamp: at(1500), message: { stop_reason: 'end_turn', content: [] } },
+  ];
+  const childRows = [{ type: 'assistant', sessionId: f.sid, timestamp: at(1300),
+    message: { stop_reason: null, content: [{ type: 'text', text: 'child complete' }] } }];
+  fs.writeFileSync(transcript(f, 'a'), parentRows.map(JSON.stringify).join('\n') + '\n');
+  fs.writeFileSync(childFile, childRows.map(JSON.stringify).join('\n') + '\n');
+  const resolveChild = (id, parentFile) => path.join(path.dirname(parentFile), path.basename(parentFile, '.jsonl'),
+    'subagents', `agent-${id}.jsonl`);
+  const verify = (accountId) => restartLedger.verify({ root: f.root, agent: 'claude', sid: f.sid,
+    file: transcript(f, accountId), instance: { id: `pane:${accountId}`, since: 1, live: true }, resolveChild })();
+  verify('a');
+  return { child, resolveChild, verify };
+}
+
+function appendCompletedTurn(f, accountId, sequence) {
+  fs.appendFileSync(transcript(f, accountId), [
+    { type: 'user', sessionId: f.sid, timestamp: new Date(2000 + sequence * 100).toISOString(), message: { content: `turn ${sequence}` } },
+    { type: 'assistant', sessionId: f.sid, timestamp: new Date(2050 + sequence * 100).toISOString(), message: { content: [], stop_reason: 'end_turn' } },
+  ].map(JSON.stringify).join('\n') + '\n');
 }
 
 test('managed provenance supports A to B to C to A while retaining every source tree', () => {
@@ -70,6 +108,84 @@ test('managed provenance supports A to B to C to A while retaining every source 
     }
     assert.equal(fs.existsSync(transcript(f, 'b')), true, 'B source remains');
     assert.equal(fs.existsSync(transcript(f, 'c')), true, 'C source remains');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('transaction-bound ledgers follow A to B to C to A with child evidence and partial retry', () => {
+  const f = fixture();
+  try {
+    const ledger = prepareLedger(f);
+    artifacts.copyClaudeArtifacts(f.sid, f.records.a, f.records.b, 'tx-ledger-a-b', options(f));
+    let interrupted = false;
+    assert.throws(() => artifacts.rebindLedger(f.sid, f.records.a, f.records.b, 'tx-ledger-a-b', rebindOptions(f, {
+      rebindSource(args) {
+        if (args.sid === ledger.child && !interrupted) { interrupted = true; throw new Error('simulated child rebind crash'); }
+        return jobs.rebindSource(args);
+      },
+    })), /simulated child rebind crash/);
+    const recovered = artifacts.rebindLedger(f.sid, f.records.a, f.records.b, 'tx-ledger-a-b', rebindOptions(f));
+    assert.equal(recovered.rebound.find((entry) => entry.sessionId === f.sid).reused, true);
+    assert.equal(recovered.rebound.find((entry) => entry.sessionId === ledger.child).reused, false);
+    ledger.verify('b');
+
+    appendCompletedTurn(f, 'b', 1); ledger.verify('b');
+    artifacts.copyClaudeArtifacts(f.sid, f.records.b, f.records.c, 'tx-ledger-b-c', options(f));
+    artifacts.rebindLedger(f.sid, f.records.b, f.records.c, 'tx-ledger-b-c', rebindOptions(f));
+    ledger.verify('c');
+
+    appendCompletedTurn(f, 'c', 2); ledger.verify('c');
+    artifacts.copyClaudeArtifacts(f.sid, f.records.c, f.records.a, 'tx-ledger-c-a', options(f));
+    artifacts.rebindLedger(f.sid, f.records.c, f.records.a, 'tx-ledger-c-a', rebindOptions(f));
+    ledger.verify('a');
+
+    const parent = JSON.parse(fs.readFileSync(path.join(f.root, '.keep/background-jobs/claude', f.sid, 'state.json')));
+    const child = JSON.parse(fs.readFileSync(path.join(f.root, '.keep/background-jobs/claude', ledger.child, 'state.json')));
+    assert.equal(parent.gap, false); assert.equal(child.gap, false);
+    assert.equal(parent.handoffRebind.transactionId, 'tx-ledger-c-a');
+    assert.equal(child.handoffRebind.transactionId, 'tx-ledger-c-a');
+    assert.equal(parent.jobs['job:child'].status, 'completed');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('ledger rebind requires the exact completed artifact transaction and quiescent copy', () => {
+  const f = fixture();
+  try {
+    prepareLedger(f);
+    assert.throws(() => artifacts.rebindLedger(f.sid, f.records.a, f.records.b, 'missing-transaction', options(f)),
+      /verified source stop/);
+    assert.throws(() => artifacts.rebindLedger(f.sid, f.records.a, f.records.b, 'missing-transaction', rebindOptions(f)),
+      /conflicts|incomplete/);
+    artifacts.copyClaudeArtifacts(f.sid, f.records.a, f.records.b, 'tx-ledger-a-b', options(f));
+    fs.appendFileSync(transcript(f, 'b'), 'unexpected target mutation\n');
+    assert.throws(() => artifacts.rebindLedger(f.sid, f.records.a, f.records.b, 'tx-ledger-a-b', rebindOptions(f)),
+      /no longer matches/);
+    const sourceState = JSON.parse(fs.readFileSync(path.join(f.root, '.keep/background-jobs/claude', f.sid, 'state.json')));
+    assert.equal(sourceState.source.file, path.resolve(transcript(f, 'a')));
+    assert.equal(sourceState.handoffRebind, undefined);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('a final source flush catches up after copy before a retry rebinds the ledger', () => {
+  const f = fixture();
+  try {
+    const initial = { type: 'assistant', sessionId: f.sid, timestamp: new Date(1000).toISOString(),
+      message: { content: [], stop_reason: 'end_turn' } };
+    fs.writeFileSync(transcript(f, 'a'), JSON.stringify(initial) + '\n');
+    jobs.sync({ root: f.root, agent: 'claude', sid: f.sid, file: transcript(f, 'a'), now: 1100 });
+    const final = { type: 'assistant', sessionId: f.sid, timestamp: new Date(1200).toISOString(),
+      message: { content: [{ type: 'text', text: 'final flush' }], stop_reason: 'end_turn' } };
+    fs.appendFileSync(transcript(f, 'a'), JSON.stringify(final) + '\n');
+    jobs.recordHook(f.root, 'claude', f.sid, { event: 'Stop', entity: 'turn', at: 1250,
+      offset: fs.statSync(transcript(f, 'a')).size });
+    artifacts.copyClaudeArtifacts(f.sid, f.records.a, f.records.b, 'tx-final-flush', options(f));
+
+    assert.throws(() => artifacts.rebindLedger(f.sid, f.records.a, f.records.b, 'tx-final-flush', rebindOptions(f)),
+      /unconsumed hook|not caught up/);
+    const caughtUp = jobs.sync({ root: f.root, agent: 'claude', sid: f.sid, file: transcript(f, 'a'), now: 1300 });
+    assert.equal(caughtUp.recovering, false); assert.equal(caughtUp.gap, false);
+    assert.equal(artifacts.rebindLedger(f.sid, f.records.a, f.records.b, 'tx-final-flush', rebindOptions(f)).rebound[0].reused, false);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(f.root, '.keep/background-jobs/claude', f.sid, 'state.json'))).source.file,
+      path.resolve(transcript(f, 'b')));
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 

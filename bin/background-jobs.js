@@ -17,6 +17,120 @@ function directory(root, agent, sid) {
   return path.join(root, '.keep', 'background-jobs', agent, sid);
 }
 
+function failure(message, code = 'KEEP_LEDGER_REBIND_UNSAFE') {
+  const error = new Error(message); error.code = code; error.status = 409; return error;
+}
+
+function syncDirectory(target) {
+  let fd;
+  try { fd = fs.openSync(target, fs.constants.O_RDONLY); fs.fsyncSync(fd); } catch {}
+  finally { if (fd != null) fs.closeSync(fd); }
+}
+
+function writeState(snapshot, state) {
+  const temp = `${snapshot}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  const fd = fs.openSync(temp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600);
+  try { fs.writeFileSync(fd, JSON.stringify(state)); fs.fsyncSync(fd); }
+  finally { fs.closeSync(fd); }
+  fs.renameSync(temp, snapshot); syncDirectory(path.dirname(snapshot));
+}
+
+function fileEvidence(file, content = false) {
+  const resolved = path.resolve(file);
+  const fd = fs.openSync(resolved, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const before = fs.fstatSync(fd);
+    if (!before.isFile()) throw failure(`ledger transcript is not a regular file: ${resolved}`);
+    const anchorBytes = Buffer.alloc(Math.min(64, before.size));
+    fs.readSync(fd, anchorBytes, 0, anchorBytes.length, before.size - anchorBytes.length);
+    let contentDigest = null;
+    if (content) {
+      const digest = crypto.createHash('sha256'), buffer = Buffer.allocUnsafe(1024 * 1024);
+      let position = 0;
+      while (position < before.size) {
+        const size = fs.readSync(fd, buffer, 0, Math.min(buffer.length, before.size - position), position);
+        if (!size) break;
+        digest.update(buffer.subarray(0, size)); position += size;
+      }
+      if (position !== before.size) throw failure(`ledger transcript changed while reading: ${resolved}`);
+      contentDigest = digest.digest('hex');
+    }
+    const after = fs.fstatSync(fd);
+    for (const field of ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs']) {
+      if (before[field] !== after[field]) throw failure(`ledger transcript changed while reading: ${resolved}`);
+    }
+    return { file: resolved, identity: `${hash(resolved)}:${after.dev}:${after.ino}`, dev: after.dev, ino: after.ino,
+      size: after.size, mtime: after.mtimeMs, ctime: after.ctimeMs, anchor: hash(anchorBytes), ...(contentDigest ? { contentDigest } : {}) };
+  } finally { fs.closeSync(fd); }
+}
+
+function sameFrozenFile(file, evidence) {
+  if (!evidence || path.resolve(file) !== evidence.file) return false;
+  try {
+    const stat = fs.lstatSync(file);
+    return stat.isFile() && !stat.isSymbolicLink() && stat.dev === evidence.dev && stat.ino === evidence.ino && stat.size === evidence.size
+      && stat.mtimeMs === evidence.mtime && stat.ctimeMs === evidence.ctime;
+  } catch { return false; }
+}
+
+// Called only after the handoff artifact transaction has verified an exact copy
+// and the source process has exited. Ordinary sync never invokes this escape
+// hatch: unrelated path/inode changes remain permanent gaps.
+function rebindSource({ root, agent, sid, sourceFile, targetFile, transactionId, sourceStopVerifiedAt }) {
+  if (agent !== 'claude' || !ID.test(sid || '') || !ID.test(transactionId || '')
+      || !Number.isFinite(sourceStopVerifiedAt) || sourceStopVerifiedAt <= 0
+      || !path.isAbsolute(sourceFile || '') || !path.isAbsolute(targetFile || '')
+      || path.resolve(sourceFile) === path.resolve(targetFile)) throw failure('invalid ledger rebind request');
+  const ledgerDir = directory(root, agent, sid), snapshot = path.join(ledgerDir, 'state.json');
+  const lock = path.join(ledgerDir, 'writer.lock');
+  let locked = false;
+  for (let attempt = 0; attempt < 2 && !locked; attempt++) {
+    try { fs.writeFileSync(lock, String(process.pid), { flag: 'wx', mode: 0o600 }); locked = true; }
+    catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      let alive = true;
+      try { process.kill(Number(fs.readFileSync(lock, 'utf8')), 0); } catch (cause) { if (cause.code === 'ESRCH') alive = false; }
+      if (alive) throw failure('job ledger is busy during account handoff', 'KEEP_LEDGER_BUSY');
+      try { fs.unlinkSync(lock); } catch {}
+    }
+  }
+  if (!locked) throw failure('job ledger is busy during account handoff', 'KEEP_LEDGER_BUSY');
+  try {
+    const state = JSON.parse(fs.readFileSync(snapshot, 'utf8'));
+    if (state.version !== 1 || state.restartVersion !== 1 || !state.jobs || !state.calls || !state.restart
+        || state.gap || state.recovering) throw failure('job ledger evidence is incomplete');
+    let entries = [];
+    try { entries = fs.readdirSync(path.join(ledgerDir, 'inbox')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (entries.length) throw failure('job ledger has unconsumed hook evidence');
+    const source = fileEvidence(sourceFile, true), target = fileEvidence(targetFile, true);
+    if (source.dev === target.dev && source.ino === target.ino) {
+      throw failure('handoff transcript source and target are the same physical file');
+    }
+    if (source.size !== target.size || source.contentDigest !== target.contentDigest) {
+      throw failure('handoff transcript copy does not match the stopped source');
+    }
+    const prior = state.handoffRebind;
+    if (prior?.transactionId === transactionId && prior.source?.file === source.file && prior.target?.file === target.file) {
+      if (state.checkpoint?.identity !== target.identity || state.checkpoint.offset !== target.size
+          || state.checkpoint.mtime !== target.mtime || state.checkpoint.anchor !== target.anchor
+          || state.source?.file !== target.file) throw failure('completed ledger rebind no longer matches its target');
+      return { reused: true, children: Object.keys(state.restart.children || {}) };
+    }
+    const checkpoint = state.checkpoint;
+    if (!checkpoint || state.source?.agent !== agent || state.source.sid !== sid || path.resolve(state.source.file || '') !== source.file
+        || checkpoint.identity !== source.identity || checkpoint.offset !== source.size
+        || checkpoint.mtime !== source.mtime || checkpoint.anchor !== source.anchor
+        || (state.hookBarrier != null && checkpoint.offset <= state.hookBarrier)) {
+      throw failure('job ledger is not caught up with the stopped source');
+    }
+    state.checkpoint = { ...checkpoint, identity: target.identity, offset: target.size, anchor: target.anchor, mtime: target.mtime };
+    state.source = { ...state.source, file: target.file };
+    state.handoffRebind = { version: 1, transactionId, sourceStopVerifiedAt, source, target, reboundAt: Date.now() };
+    writeState(snapshot, state);
+    return { reused: false, children: Object.keys(state.restart.children || {}) };
+  } finally { try { fs.unlinkSync(lock); } catch {} }
+}
+
 // Hook processes never edit the shared snapshot. Immutable inbox files survive
 // daemon downtime; consumption and deletion happen only after snapshot commit.
 function recordHook(root, agent, sid, event) {
@@ -216,6 +330,18 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
     let state = { version: 1, jobs: {}, calls: {}, notices: {}, checkpoint: null, gap: false };
     try { state = JSON.parse(fs.readFileSync(snapshot, 'utf8')); if (state.version !== 1 || !state.jobs || !state.calls || !state.notices) throw Error('invalid ledger'); }
     catch (e) { state = { version: 1, jobs: {}, calls: {}, notices: {}, checkpoint: null, gap: e.code !== 'ENOENT' }; }
+    const formerSource = state.handoffRebind?.source;
+    if (formerSource?.file && path.resolve(file) === formerSource.file) {
+      if (!sameFrozenFile(file, formerSource)) { state.gap = true; writeState(snapshot, state); }
+      const currentJobs = Object.values(state.jobs);
+      const open = currentJobs.filter(j => !TERMINAL.has(j.status) && !['service', 'scheduled'].includes(j.kind));
+      const uncertain = open.filter(j => j.kind === 'unknown' || now - (j.lastCorroboratedAt || j.eventAt) > staleAfter
+        || j.evidence === 'transcript-replaced').map(j => j.id);
+      if (state.recovering || state.gap) uncertain.push(state.recovering ? 'history-recovery' : 'history-gap');
+      return { pending: open.some(j => !uncertain.includes(j.id)), uncertain,
+        jobs: currentJobs.map(j => ({ ...j, confidence: TERMINAL.has(j.status) ? 'observed' : uncertain.includes(j.id) ? 'uncertain' : 'observed' })),
+        recovering: Boolean(state.recovering), gap: Boolean(state.gap), bytesRead: 0, lastReconciledAt: state.lastReconciledAt };
+    }
     if (state.source?.includeSidechain) includeSidechain = true;
     if ((agent === 'codex' && state.pollVersion !== 2) || state.childStopVersion !== 3) {
       // Reinterpret old code-mode polls, retaining every unresolved obligation
@@ -269,7 +395,7 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
       state.cronVersion = 1; state.turnVersion = 1;
     }
     const freshBaseEligible = !state.checkpoint && !state.gap && state.hookBarrier == null;
-    let recovering = false, bytesRead = 0, transcriptRead = false;
+    let recovering = false, bytesRead = 0;
     try {
       const fd = fs.openSync(file, 'r');
       try {
@@ -313,7 +439,6 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
         if (start === 0 && bytesRead >= (cp.skip ? budget : Math.max(budget, maxRecord))) { start = bytesRead; cp.skip = true; state.gap = true; }
         cp.offset += start; cp.anchor = anchor(cp.offset); cp.mtime = stat.mtimeMs; state.checkpoint = cp;
         recovering = cp.offset < stat.size;
-        transcriptRead = true;
       } finally { fs.closeSync(fd); }
     } catch { recovering = true; }
     const inbox = path.join(dir, 'inbox');
@@ -354,7 +479,6 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
         }
         // Stop hooks can be blocked. They are not completion evidence.
       }
-      if (transcriptRead && state.freshStartup?.transcriptId === expectedTranscriptId) delete state.freshStartup;
     } catch (error) { if (error.code !== 'ENOENT') state.gap = true; consumed = []; }
     for (const j of Object.values(state.jobs)) {
       if (j.kind === 'scheduled' && !TERMINAL.has(j.status)) {
@@ -433,4 +557,4 @@ function nextTarget(targets, cursor) {
   return targets[Math.floor(cursor / 4) % targets.length];
 }
 
-module.exports = { processInstance, sync, read, targets, recordHook, consume, nextTarget };
+module.exports = { processInstance, sync, read, targets, recordHook, consume, nextTarget, rebindSource };
