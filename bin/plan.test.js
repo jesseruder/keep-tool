@@ -48,6 +48,12 @@ test('command help prints scoped usage and preserves unknown-command errors', ()
     assert.match(planHelp.stdout, /--undo <n>/);
     assert.equal(planHelp.stderr, '');
 
+    const addHelp = f.run(['add', '--help']);
+    assert.equal(addHelp.status, 0, addHelp.stderr);
+    assert.match(addHelp.stdout, /--file\|--claim/);
+    assert.match(addHelp.stdout, /ideas file by default/);
+    assert.match(addHelp.stdout, /mutually exclusive/);
+
     const bundleHelp = f.run(['review-bundle', '-h']);
     assert.equal(bundleHelp.status, 0, bundleHelp.stderr);
     assert.match(bundleHelp.stdout, /keep review-bundle <id> \[--budget n\]/);

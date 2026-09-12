@@ -1005,20 +1005,69 @@ test('scheduling a check records the scheduling session and survives a round-tri
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
-test('both agents can explicitly hand off for input without a recipe edit implying a wait', () => {
+test('recipe edits preserve the scheduling recipient while explicit schedule changes can reassign it', () => {
   for (const agent of ['claude', 'codex']) {
     const f = schedulerFixture();
     const env = agent === 'claude' ? { CLAUDE_CODE_SESSION_ID: 's' } : { CODEX_THREAD_ID: 's' };
+    const other = agent === 'claude' ? { CODEX_THREAD_ID: 'other' } : { CLAUDE_CODE_SESSION_ID: 'other' };
     try {
       assert.equal(f.run(['add', 'Scheduled', '--check-after', '+1h', '--check', 'probe'], env).status, 0);
       assert.equal(f.run(['checkin', 'scheduled', '-m', 'Proposed change', '--handoff', 'needs-input'], env).status, 0);
       assert.match(f.read('scheduled'), /^scheduled_intent: needs-input$/m);
-      assert.equal(f.run(['checkin', 'scheduled', '-m', 'Edit recipe', '--check', 'new probe'], env).status, 0);
-      assert.doesNotMatch(f.read('scheduled'), /^scheduled_intent:/m);
-      assert.equal(f.run(['checkin', 'scheduled', '-m', 'Next poll', '--check-after', '+2h'], env).status, 0);
+      assert.equal(f.run(['checkin', 'scheduled', '-m', 'Edit recipe', '--check', 'new probe'], other).status, 0);
+      assert.match(f.read('scheduled'), /^scheduled_by: s$/m, 'a contributor editing the recipe does not steal delivery');
+      assert.doesNotMatch(f.read('scheduled'), /^scheduled_(?:at|for|intent):/m,
+        'the old turn handoff is invalid after a recipe edit');
+      assert.equal(f.run(['checkin', 'scheduled', '-m', 'Next poll', '--check-after', '+2h'], other).status, 0);
+      assert.match(f.read('scheduled'), /^scheduled_by: other$/m);
       assert.match(f.read('scheduled'), /^scheduled_intent: waiting$/m);
+      assert.equal(f.run(['checkin', 'scheduled', '-m', 'Owner input needed', '--handoff', 'needs-input'], env).status, 0);
+      assert.match(f.read('scheduled'), /^scheduled_by: s$/m);
+      assert.match(f.read('scheduled'), /^scheduled_intent: needs-input$/m);
     } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
   }
+});
+
+test('filed cards preserve the current owner, ideas file by default, and --claim starts an idea', () => {
+  const f = schedulerFixture();
+  const env = { CODEX_THREAD_ID: 'working-session' };
+  const parse = (id) => require('./keep.js').parseTask(f.read(id), id);
+  try {
+    assert.equal(f.run(['add', 'Current task', '--status', 'active'], env).status, 0);
+
+    const followup = f.run(['add', 'Filed follow-up', '--file', '-m', 'Handle after the current task.'], env);
+    assert.equal(followup.status, 0, followup.stderr);
+    assert.deepEqual(parse('current-task').fm.sessions.map((entry) => entry.id), ['working-session']);
+    assert.deepEqual(parse('filed-follow-up').fm.sessions || [], []);
+    assert.match(f.read('filed-follow-up'), /created \(by codex working-session\)/);
+
+    assert.equal(f.run(['add', 'Future idea', '--kind', 'idea', '-m', 'Consider this later.'], env).status, 0);
+    assert.deepEqual(parse('current-task').fm.sessions.map((entry) => entry.id), ['working-session']);
+    assert.deepEqual(parse('future-idea').fm.sessions || [], []);
+    assert.match(f.read('future-idea'), /created \(by codex working-session\)/);
+
+    assert.equal(f.run(['add', 'Idea in progress', '--kind', 'idea', '--claim'], env).status, 0);
+    assert.deepEqual(parse('current-task').fm.sessions || [], []);
+    assert.deepEqual(parse('idea-in-progress').fm.sessions.map((entry) => entry.id), ['working-session']);
+
+    const conflict = f.run(['add', 'Ambiguous', '--file', '--claim'], env);
+    assert.notEqual(conflict.status, 0);
+    assert.match(conflict.stderr, /--file and --claim are mutually exclusive/);
+    assert.equal(fs.existsSync(path.join(f.root, 'tasks', 'ambiguous.md')), false);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('a filed scheduled card records its scheduler without moving ownership', () => {
+  const f = schedulerFixture();
+  const env = { CLAUDE_CODE_SESSION_ID: 'scheduler-session' };
+  const parse = (id) => require('./keep.js').parseTask(f.read(id), id);
+  try {
+    assert.equal(f.run(['add', 'Current task', '--status', 'active'], env).status, 0);
+    assert.equal(f.run(['add', 'Filed check', '--file', '--check-after', '+1h', '--check', 'inspect the result'], env).status, 0);
+    assert.deepEqual(parse('current-task').fm.sessions.map((entry) => entry.id), ['scheduler-session']);
+    assert.deepEqual(parse('filed-check').fm.sessions || [], []);
+    assert.equal(parse('filed-check').fm.scheduled_by, 'scheduler-session');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
 test('a scheduling contributor is recorded without moving either card owner', () => {

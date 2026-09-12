@@ -35,7 +35,7 @@ registry data or credentials to the public source repository.
 ## CLI
 
 ```
-keep add "title" [--kind task|experiment|idea|chore|bug] [--tag t]… [--project p]
+keep add "title" [--kind task|experiment|idea|chore|bug] [--file|--claim] [--tag t]… [--project p]
                  [--plan "step"…] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review]
                  [--check-every +7d] [--probe "cmd"] [--status s] [-m note]
 keep checkin <id> -m "state + next step" [--next "text"] [--commit <sha>]... [--step <n|next>] [--status s] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"] [--clear-check-after] [--handoff waiting|needs-input]
@@ -99,7 +99,22 @@ keep nudge <id> --session <sid> --key <k> -m "..." [--send]  # message a live ag
 `keep claim <card>` assigns the current Claude or Codex session to an existing card.
 Run it from the card's project when starting or resuming that work. Routine card
 mutations preserve all existing session links and attribute their log entries to the
-contributing session; they do not claim unowned work or move a session from its card.
+contributing session as `(by <agent> <full-session-id>)`; they do not claim unowned
+work or move a session from its card. The reviewer uses that attribution for at most
+30 minutes of transcript context preceding the entry. Later unrelated activity from
+the contributor does not requeue the card.
+
+An ordinary `keep add` keeps its historical behavior and claims the new task for the
+creating session. `--file` records follow-up work without moving that session. Ideas
+are filed by default; pass `--claim` when starting an idea immediately. The two flags
+are mutually exclusive. Filing preserves creator attribution, and a filed card with
+`--check-after` still records the creating session as its scheduler. Internal callers
+that pass `linkSession:false` suppress ownership, attribution, and scheduling identity.
+
+Bare `keep needs` is a read-only list. An env-backed need auto-clears only when the
+session-start hook supplies a valid session ID and that session is still linked to the
+card; an env variable in an unrelated session or ordinary shell does not clear it.
+`keep needs <card> --met` remains the explicit manual path.
 
 `keep link` repairs a session's ownership metadata when work was recorded from a
 different project directory. It transfers that explicit session from its old card to

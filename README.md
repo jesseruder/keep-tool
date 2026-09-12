@@ -56,6 +56,16 @@ keep add "Improve checkout errors" --project "$PWD" --status active
 keep open improve-checkout-errors --fresh -m "Inspect checkout validation, improve the error messages, and verify the changes."
 ```
 
+Ordinary task adds claim the creating session for compatibility. Use `--file` for
+a follow-up you are recording without starting; `kind: idea` files this way by
+default, and `--claim` starts an idea immediately. A filed scheduled card still
+remembers which session should receive its eventual check.
+
+Routine updates from a session that does not own the card retain its ownership and
+stamp the log entry with the contributing agent and full session ID. The reviewer can
+use that stamp for a bounded 30-minute slice of preceding transcript context; later
+unrelated contributor activity does not by itself requeue the card.
+
 The bundled Keep skill teaches the agent to record progress and next steps on the
 card. You can watch its terminal in the console and respond when it needs a
 decision. From another terminal, inspect the task or get an overview:

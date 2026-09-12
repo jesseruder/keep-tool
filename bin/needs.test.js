@@ -42,34 +42,53 @@ test('needs round-trips through the card frontmatter', () => {
   assert.deepEqual(again.fm.needs, task.fm.needs);
 });
 
-test('keep needs records a blocker, blocks the card, lists it, and clears it when the env var appears', () => {
-  const { run, card, cleanup } = registry();
+test('keep needs is read-only and only the linked owning session can auto-clear an env need', () => {
+  const { run, card, cleanup, root } = registry();
   try {
+    assert.equal(run(['link', 'gate', '--session', 'owner-session', '--agent', 'claude']).status, 0);
     const add = run(['needs', 'gate', 'E2E_CASTLE_TOKEN for the staging gate', '--env', 'E2E_CASTLE_TOKEN']);
     assert.equal(add.status, 0, add.stderr);
-    assert.match(add.stdout, /gate → blocked, waiting on Owner: E2E_CASTLE_TOKEN for the staging gate \(clears when E2E_CASTLE_TOKEN is set/);
+    assert.match(add.stdout, /gate → blocked, waiting on Owner: E2E_CASTLE_TOKEN for the staging gate \(clears when E2E_CASTLE_TOKEN is set in a linked owning session/);
     let now = card();
     assert.equal(now.fm.status, 'blocked');
     assert.deepEqual(now.fm.needs.map((need) => ({ text: need.text, env: need.env, was: need.was })),
       [{ text: 'E2E_CASTLE_TOKEN for the staging gate', env: 'E2E_CASTLE_TOKEN', was: 'active' }]);
-    assert.match(now.body, /^## \d{4}-\d{2}-\d{2} \d{2}:\d{2} — needs Owner → blocked\nNeeds from Owner: E2E_CASTLE_TOKEN for the staging gate \(clears when E2E_CASTLE_TOKEN is set\)/m);
+    assert.match(now.body, /^## \d{4}-\d{2}-\d{2} \d{2}:\d{2} — needs Owner → blocked\nNeeds from Owner: E2E_CASTLE_TOKEN for the staging gate \(clears when E2E_CASTLE_TOKEN is set in a linked owning session\)/m);
 
     const dupe = run(['needs', 'gate', 'the same token again', '--env', 'E2E_CASTLE_TOKEN']);
     assert.equal(dupe.status, 1);
     assert.match(dupe.stderr, /already records that need \(env E2E_CASTLE_TOKEN\)/);
 
-    const list = run(['needs']);
+    const beforeBytes = fs.readFileSync(path.join(root, 'tasks', 'gate.md'), 'utf8');
+    const beforeHead = spawnSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    const beforeStatus = spawnSync('git', ['-C', root, 'status', '--porcelain'], { encoding: 'utf8' }).stdout;
+    const list = run(['needs'], { E2E_CASTLE_TOKEN: 'present-in-anonymous-shell' });
     assert.equal(list.status, 0, list.stderr);
     assert.match(list.stdout, /^Waiting on Owner \(1\):\n  gate  \d{4}-\d{2}-\d{2} \d{2}:\d{2}  E2E_CASTLE_TOKEN for the staging gate  \[env E2E_CASTLE_TOKEN\]$/m);
+    assert.equal(fs.readFileSync(path.join(root, 'tasks', 'gate.md'), 'utf8'), beforeBytes);
+    assert.equal(spawnSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim(), beforeHead);
+    assert.equal(spawnSync('git', ['-C', root, 'status', '--porcelain'], { encoding: 'utf8' }).stdout, beforeStatus);
 
-    // the env var appearing in a session clears the need and restores the status
-    const hook = run(['hook', 'session-start'], { E2E_CASTLE_TOKEN: 'secret' }, JSON.stringify({ session_id: 'sess-1234-abcd', cwd: os.homedir() + '/castle/castle-sandboxes' }));
+    const unrelated = run(['hook', 'session-start'], { E2E_CASTLE_TOKEN: 'secret' },
+      JSON.stringify({ session_id: 'unrelated-session', cwd: os.homedir() + '/castle/castle-sandboxes' }));
+    assert.equal(unrelated.status, 0, unrelated.stderr);
+    assert.doesNotMatch(unrelated.stdout, /Need cleared:/);
+    assert.equal(card().fm.status, 'blocked');
+
+    const anonymousHook = run(['hook', 'session-start'], { E2E_CASTLE_TOKEN: 'secret' },
+      JSON.stringify({ cwd: os.homedir() + '/castle/castle-sandboxes' }));
+    assert.equal(anonymousHook.status, 0, anonymousHook.stderr);
+    assert.doesNotMatch(anonymousHook.stdout, /Need cleared:/);
+    assert.equal(card().fm.status, 'blocked');
+
+    // The env var appears in the card's owning session, so the need clears.
+    const hook = run(['hook', 'session-start'], { E2E_CASTLE_TOKEN: 'secret' }, JSON.stringify({ session_id: 'owner-session', cwd: os.homedir() + '/castle/castle-sandboxes' }));
     assert.equal(hook.status, 0, hook.stderr);
     assert.match(hook.stdout, /Need cleared: E2E_CASTLE_TOKEN is set in this session, so gate is active again/);
     now = card();
     assert.equal(now.fm.status, 'active');
     assert.equal(now.fm.needs, undefined);
-    assert.match(now.body, /— needs met → active\nMet: E2E_CASTLE_TOKEN for the staging gate \(env E2E_CASTLE_TOKEN\)\nE2E_CASTLE_TOKEN is set in claude session sess-123\./);
+    assert.match(now.body, /— needs met → active\nMet: E2E_CASTLE_TOKEN for the staging gate \(env E2E_CASTLE_TOKEN\)\nE2E_CASTLE_TOKEN is set in claude session owner-se\./);
     assert.doesNotMatch(now.body, /secret/);
     assert.match(run(['needs']).stdout, /^nothing waiting on Owner$/m);
   } finally { cleanup(); }
@@ -122,22 +141,28 @@ test('clearing needs in any order restores the original status, including depend
   } finally { cleanup(); }
 });
 
-test('a session-start sweep clears every satisfied need under one commit and reports the restored card', () => {
+test('a session-start sweep clears the owning card needs under one commit and leaves unrelated cards blocked', () => {
   const { run, card, cleanup, root } = registry();
   try {
     fs.writeFileSync(path.join(root, 'tasks', 'other.md'), '---\ntitle: other\nstatus: active\ntags: [personal]\nproject: ~/castle/castle-sandboxes\ncreated: 2026-09-03\nupdated: 2026-09-03T09:00\n---\n');
+    assert.equal(run(['link', 'gate', '--session', 'sess-3', '--agent', 'claude']).status, 0);
     assert.equal(run(['needs', 'gate', 'E2E token', '--env', 'E2E_CASTLE_TOKEN']).status, 0);
+    assert.equal(run(['needs', 'gate', 'Pollen key for gate', '--env', 'POLLEN_KEY']).status, 0);
     assert.equal(run(['needs', 'other', 'Pollen key', '--env', 'POLLEN_KEY']).status, 0);
     const before = spawnSync('git', ['-C', root, 'rev-list', '--count', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
     const hook = run(['hook', 'session-start'], { E2E_CASTLE_TOKEN: 'a', POLLEN_KEY: 'b' }, JSON.stringify({ session_id: 'sess-3', cwd: os.homedir() + '/castle/castle-sandboxes' }));
     assert.equal(hook.status, 0, hook.stderr);
     const after = spawnSync('git', ['-C', root, 'rev-list', '--count', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
     assert.equal(Number(after) - Number(before), 1, 'one commit for the whole sweep');
-    assert.match(hook.stdout, /Need cleared: E2E_CASTLE_TOKEN is set in this session, so gate is active again/);
-    assert.match(hook.stdout, /Need cleared: POLLEN_KEY is set in this session, so other is active again/);
+    assert.match(hook.stdout, /Need cleared: E2E_CASTLE_TOKEN is set in this session, so gate is still blocked/);
+    assert.match(hook.stdout, /Need cleared: POLLEN_KEY is set in this session, so gate is active again/);
+    assert.doesNotMatch(hook.stdout, /Need cleared: POLLEN_KEY is set in this session, so other/);
     assert.match(hook.stdout, /- gate \(active\):/, 'the project list reflects the restored status');
-    assert.doesNotMatch(hook.stdout, /Waiting on Owner/);
+    assert.match(hook.stdout, /Waiting on Owner[\s\S]*- other: Pollen key/);
     assert.equal(card().fm.status, 'active');
+    const other = keep.parseTask(fs.readFileSync(path.join(root, 'tasks', 'other.md'), 'utf8'), 'other');
+    assert.equal(other.fm.status, 'blocked');
+    assert.equal(other.fm.needs.length, 1);
   } finally { cleanup(); }
 });
 

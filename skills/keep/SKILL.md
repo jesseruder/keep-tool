@@ -15,7 +15,9 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
 - **Starting substantive work** (a feature, debugging effort, or other multi-turn task):
   run `keep list --project <cwd>`, then claim matching existing work with
   `keep claim <id>` before checking in, or create it with `keep add "title" --status
-  active`. Creating a card claims it automatically. Skip trivial one-shot requests.
+  active`. Creating an ordinary task claims it automatically. Use `--file` for a
+  follow-up you are recording without starting; ideas file without claiming by default,
+  and `--claim` starts an idea now. Skip trivial one-shot requests.
 - **Launching an experiment** (A/B test, canary, or anything needing a later check):
   always register it with `keep add "title" --kind experiment --check-after <when>
   --check "<recipe>" --status waiting`. Pass `--experiment-id <id>` when one exists.
@@ -66,7 +68,9 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
 - **Status changes or notable progress**: use `keep checkin <id> -m "..." [--status s]`.
   A check-in records the contributing session in its log and preserves every existing
   resume link. It does not claim the card; run `keep claim <id>` first when taking over
-  existing work.
+  existing work. Non-owner entries are stamped `(by <agent> <full-session-id>)`; the
+  reviewer may use the preceding 30 minutes of that contributor's transcript as
+  context, without changing ownership or requeueing the card for later unrelated work.
 - **Waiting on another card**: record the fact your next step needs with a required
   reason: `keep wait-on <your-card> <upstream> --commit <sha>[,<sha>] -m "why"`
   waits for every SHA on the upstream project's origin default branch (verified by
@@ -153,8 +157,9 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
 - **Blocked on something only Owner can supply** (a secret, an API key, a sign-in, a
   console approval, a live webhook): run `keep needs <card> "<what>" [--env NAME]` and
   stop. The card goes `blocked`, the need shows in `keep needs` and the brief as one
-  waiting-on-Owner block, and it clears by itself when a session starts with that env
-  var set, or when Owner runs `keep needs <card> --met`. Never scrape a token out of
+  waiting-on-Owner block, and it clears by itself when a linked owning session starts
+  with that env var set, or when Owner runs `keep needs <card> --met`. Bare `keep needs`
+  only lists; an unrelated session or shell never clears a need. Never scrape a token out of
   browser state, a signed-in Chrome, or another agent's session to get past such a gate.
 - **Questions about current work**: answer from `keep list`, `keep overdue`, and
   `keep resume`.
@@ -258,7 +263,9 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   are cited and only the land remains, so the daemon closes it with no model call and
   it never reaches Owner's queue; `review` awaits Owner's review of an artifact; `done`
   is finished.
-- Use `kind: idea` for brainstorms. A completed proposal awaiting approval is `review`.
+- Use `kind: idea` for brainstorms. Ideas are filed without moving the current session;
+  pass `--claim` only when you are starting one now. A completed proposal awaiting
+  approval is `review`.
 - Run `keep tags` before adding a tag. Every task must have exactly one scope tag,
   `work` or `personal` (or your configured scope names); `keep add` normally infers it from the project path.
 - Use `keep open <card-id|session-id>` to start or focus an interactive session in a terminal-host pane, visible in the Keep console (`--fresh` starts a new session); `keep restore [--dry]` reopens every session whose agent process is gone (after a host restart or a killed pane). `keep pane ls|show|send|screen|attach` drives panes directly.
@@ -272,13 +279,17 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   approval behavior. Older configurations that omit these variables retain the
   legacy permission-bypass defaults; set them explicitly for your intended policy.
   A fresh launch on a card is a handoff: the new session becomes the card's linked session and the session that ran `keep open` is unlinked from that card, so create the card and open it from the same session without worrying about owning it afterwards.
-- The CLI links Claude and Codex session IDs on `add`, explicit `claim`/`link`, and
+- The CLI links Claude and Codex session IDs on ordinary task `add`, explicit `claim`/`link`, and
   `open` handoffs so `keep resume` emits the correct agent-specific resume command.
   A session belongs to exactly one card. Routine check-ins, plan edits, retitles, and
   closures preserve all resume links while attributing their log entries to the
   contributing session.
 - The parent session owns the Keep check-in for work delegated to subagents. A
-  subagent's completion never closes or updates the card by itself.
+  subagent's completion never closes or updates the card by itself. A delegated worker
+  given an explicit parent card or assigned plan step contributes to that work without
+  claiming the parent or creating a duplicate top-level card. The parent handoff should
+  name the card and step. Unrelated independent follow-up work may be deliberately filed
+  with `keep add "<title>" --file`.
 - Session completion notices are ephemeral unread-turn signals. Deliberately ending
   a session acknowledges only its completion notice; any linked Keep task retains
   its durable `active`, `waiting`, `blocked`, or `review` state.

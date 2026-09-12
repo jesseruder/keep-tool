@@ -501,6 +501,15 @@ function clearScheduler(task) {
   for (const field of ['scheduled_by', 'scheduled_at', 'scheduled_for', 'scheduled_intent']) delete task.fm[field];
 }
 
+// Editing what a scheduled check will do starts a new card revision, so the old
+// turn-scoped handoff is no longer evidence that the scheduling turn is waiting.
+// The delivery recipient is independent: keep routing the eventual check to the
+// session that deliberately scheduled it until a new --check-after/--handoff or
+// --clear-check-after changes that choice.
+function invalidateSchedulerHandoff(task) {
+  for (const field of ['scheduled_at', 'scheduled_for', 'scheduled_intent']) delete task.fm[field];
+}
+
 function recordProgressMarker(task, session) {
   if (!session || !(task.fm.sessions || []).some((entry) => entry.id === session.id)) return false;
   try {
@@ -1244,7 +1253,7 @@ commands.usage = (argv) => {
 function addTask({
   title, kind, tags, project, checkAfter, check, status, note, experimentId, force, beforeSave,
   onPass, checkEvery, probe,
-  withinLock = false, commit = true, linkSession = true,
+  withinLock = false, commit = true, linkSession = true, claim,
 }) {
   title = cleanScalar(title, 'title');
   if (!title) die('a task needs a title');
@@ -1298,12 +1307,18 @@ function addTask({
       if (cleaned) task.fm.probe = cleaned;
     }
     applyCheckPolicy(task, { onPass, checkEvery });
-    const sessionResult = linkSession ? recordSession(task) : null;
-    if (linkSession && (checkAfter || check)) recordScheduler(task);
+    // Session participation and ownership are separate. Internal daemon/reviewer
+    // callers use linkSession:false to suppress both. A user-filed card still
+    // records who created or scheduled it without moving that session's card link.
+    const shouldClaim = claim === undefined ? kind !== 'idea' : Boolean(claim);
+    const sessionResult = linkSession
+      ? (shouldClaim ? recordSession(task) : recordContribution(task))
+      : null;
+    if (linkSession && (checkAfter || check || probe)) recordScheduler(task);
     if (beforeSave) beforeSave(task);
-    if (note) appendLog(task, 'created', note);
+    if (note) appendLog(task, 'created', note, !shouldClaim && sessionResult && sessionResult.session);
     saveTask(task);
-    warnSkippedSessionLink(task, sessionResult, 'card created');
+    if (shouldClaim) warnSkippedSessionLink(task, sessionResult, 'card created');
     if (commit) commitAndPush(`keep: add ${id}`);
     return task;
   };
@@ -1311,9 +1326,10 @@ function addTask({
 }
 
 commands.add = (argv) => {
-  const o = parseArgs(argv, { kind: 'str', tag: 'list', project: 'str', 'check-after': 'str', check: 'str', 'on-pass': 'str', 'check-every': 'str', probe: 'str', status: 'str', 'experiment-id': 'str', plan: 'many', 'done-when': 'list', allow: 'list', until: 'str', autonomous: 'bool', force: 'bool' });
+  const o = parseArgs(argv, { kind: 'str', tag: 'list', project: 'str', 'check-after': 'str', check: 'str', 'on-pass': 'str', 'check-every': 'str', probe: 'str', status: 'str', 'experiment-id': 'str', plan: 'many', 'done-when': 'list', allow: 'list', until: 'str', autonomous: 'bool', file: 'bool', claim: 'bool', force: 'bool' });
   const title = o._.join(' ');
-  if (!title.trim()) die('usage: keep add "title" [--kind k] [--tag t] [--project p] [--plan "step" …] [--done-when "cmd"]… [--allow a,b] [--until when] [--autonomous] [--experiment-id id] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"] [--status s] [--force] [-m note]');
+  if (!title.trim()) die('usage: keep add "title" [--kind k] [--file|--claim] [--tag t] [--project p] [--plan "step" …] [--done-when "cmd"]… [--allow a,b] [--until when] [--autonomous] [--experiment-id id] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"] [--status s] [--force] [-m note]');
+  if (o.file && o.claim) die('--file and --claim are mutually exclusive');
   const plan = splitPlanValues(o.plan || []).map((text) => ({ text: cleanPlanText(text), state: 'todo' }));
   applyDoneWhen(plan, o['done-when']);
   let grants = [];
@@ -1336,6 +1352,7 @@ commands.add = (argv) => {
     checkAfter: o['check-after'], check: o.check, status: o.status, note: o.m,
     onPass: o['on-pass'], checkEvery: o['check-every'], probe: o.probe,
     experimentId: o['experiment-id'], force: o.force,
+    claim: o.claim ? true : o.file ? false : undefined,
     beforeSave: (created) => {
       if (plan.length) setPlan(created, plan);
       if (grants.length) created.fm.allow = grants.map(allow.formatToken);
@@ -1794,7 +1811,8 @@ function checkinTask(id, {
     let contribution = null;
     if (linkSession !== false) {
       contribution = recordContribution(task);
-      if (!clearCheckAfter && (checkAfter || check || handoff)) recordScheduler(task, handoff || (checkAfter ? 'waiting' : null));
+      if (!clearCheckAfter && (checkAfter || handoff)) recordScheduler(task, handoff || 'waiting');
+      else if (!clearCheckAfter && (check !== undefined || probe !== undefined)) invalidateSchedulerHandoff(task);
     }
     appendLog(task, `${heading || 'check-in'}${status ? ` → ${status}` : ''}`, logMessage(message, next, commits),
       contribution && contribution.session);
@@ -2486,7 +2504,7 @@ function addNeed(id, { text, env, withinLock = false, commit = true }) {
     if (task.fm.status !== 'blocked') need.was = task.fm.status;
     task.fm.needs = needs.concat(need);
     task.fm.status = 'blocked';
-    appendLog(task, 'needs Owner → blocked', `Needs from Owner: ${text}${env ? ` (clears when ${env} is set)` : ''}`);
+    appendLog(task, 'needs Owner → blocked', `Needs from Owner: ${text}${env ? ` (clears when ${env} is set in a linked owning session)` : ''}`);
     saveTask(task);
     if (commit) commitAndPush(`keep: needs ${id}`);
     return task;
@@ -2527,14 +2545,24 @@ function meetNeeds(id, { env, text, via, withinLock = false, commit = true }) {
   return withinLock ? meet() : withLock(meet);
 }
 
-// The env var appearing in any session is the signal that Owner supplied it.
-function sweepNeeds(env, where) {
-  const due = openNeeds(loadAll(false)).filter((need) => need.env && String(env[need.env] || '').trim());
-  if (!due.length) return [];
+// A session-start hook may clear an env-backed need only for a card linked to
+// that exact session. Ambient agent variables in another project or an ordinary
+// shell are not evidence that Owner supplied the value to the card's worker.
+function sweepNeeds(env, sessionId, where) {
+  sessionId = String(sessionId || '');
+  if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) return [];
+  if (!openNeeds(loadAll(false)).some((need) => need.env && String(env[need.env] || '').trim())) return [];
   const cleared = [];
   // One lock and one commit for the whole sweep: this runs inside session-start
-  // hooks, where a per-need lock wait would stack five-second timeouts.
+  // hooks, where a per-need lock wait would stack five-second timeouts. Re-read
+  // ownership under that lock so a concurrent claim cannot clear the old card.
   withLock(() => {
+    const due = openNeeds(loadAll(false)).filter((need) => {
+      if (!need.env || !String(env[need.env] || '').trim()) return false;
+      let task;
+      try { task = loadTask(need.task); } catch { return false; }
+      return (task.fm.sessions || []).some((session) => session && session.id === sessionId);
+    });
     for (const need of due) {
       try {
         const out = meetNeeds(need.task, { env: need.env, via: `${need.env} is set in ${where || 'this environment'}.`, withinLock: true, commit: false });
@@ -2556,9 +2584,6 @@ commands.needs = (argv) => {
   const o = parseArgs(argv, { env: 'str', met: 'bool' });
   if (!o._.length) {
     if (o.env || o.met || o.m) die('usage: keep needs [<card> "<secret or action>" [--env NAME] | <card> --met [--env NAME]]');
-    const session = currentSession();
-    const cleared = sweepNeeds(process.env, session ? `${session.agent} session ${session.id.slice(0, 8)}` : 'this shell');
-    for (const need of cleared) console.log(`cleared: ${need.env} is set — ${need.task} ${need.restored ? 'back to ' + need.restored : 'still blocked'}`);
     const needs = openNeeds(loadAll(false));
     if (!needs.length) return console.log('nothing waiting on Owner');
     console.log(`Waiting on Owner (${needs.length}):`);
@@ -2575,7 +2600,7 @@ commands.needs = (argv) => {
   const text = o._.slice(1).join(' ') || o.m;
   if (!text) die('usage: keep needs <card> "<secret or action>" [--env NAME]');
   const task = addNeed(id, { text, env: o.env });
-  console.log(`${id} → blocked, waiting on Owner: ${text}${o.env ? ` (clears when ${o.env} is set in a session, or keep needs ${id} --met --env ${o.env})` : ` (clear with keep needs ${id} --met)`}`);
+  console.log(`${id} → blocked, waiting on Owner: ${text}${o.env ? ` (clears when ${o.env} is set in a linked owning session, or keep needs ${id} --met --env ${o.env})` : ` (clear with keep needs ${id} --met)`}`);
   console.log(fmtTask(task));
 };
 
@@ -4565,7 +4590,9 @@ commands.hook = async (argv) => {
   // is reported cleared and its card listed with the restored status.
   let cleared = [];
   try {
-    cleared = sweepNeeds(process.env, `${input.agent === 'codex' ? 'codex' : 'claude'} session ${String(input.session_id || '').slice(0, 8) || '(unknown)'}`);
+    const sessionId = String(input.session_id || '');
+    cleared = sweepNeeds(process.env, sessionId,
+      `${input.agent === 'codex' ? 'codex' : 'claude'} session ${sessionId.slice(0, 8)}`);
   } catch {}
   const here = openTasksForProject(cwd);
   if (here.length) {
@@ -4579,7 +4606,7 @@ commands.hook = async (argv) => {
     if (here.length > CAP) lines.push(`…and ${here.length - CAP} more (keep list)`);
     lines.push('Before taking over existing work, run `keep claim <id>`; check-ins record contributions without changing resume ownership.');
   }
-  for (const need of cleared) lines.push(`Need cleared: ${need.env} is set in this session, so ${need.task} is ${need.restored || 'unblocked'} again — "${clip(need.text)}".`);
+  for (const need of cleared) lines.push(`Need cleared: ${need.env} is set in this session, so ${need.task} is ${need.restored ? `${need.restored} again` : 'still blocked'} — "${clip(need.text)}".`);
   const needs = openNeeds(here);
   if (needs.length) {
     lines.push('Waiting on Owner (do not work around these; he supplies them):');
@@ -4620,7 +4647,7 @@ commands.hook = async (argv) => {
   } catch {}
   const paragraphs = [];
   if (lines.length) {
-    paragraphs.push(`[keep — work registry]\n${lines.join('\n')}\nCheck in with \`keep checkin <id> -m "..."\` when status changes. Conventions: read the shared keep skill (${path.join(ROOT, 'skills/keep/SKILL.md')}). Card status is not conversation readiness; scheduling a check yields this turn unless you also pass --handoff needs-input.`);
+    paragraphs.push(`[keep — work registry]\n${lines.join('\n')}\nCheck in with \`keep checkin <id> -m "..."\` when status changes. File follow-up work with \`keep add "<title>" --file\`; ideas file without claiming by default, and \`--claim\` starts one now. Delegated workers given a parent card or step contribute to it without claiming it or opening a duplicate card. Conventions: read the shared keep skill (${path.join(ROOT, 'skills/keep/SKILL.md')}). Card status is not conversation readiness; scheduling a check yields this turn unless you also pass --handoff needs-input.`);
   }
   if (nudge) paragraphs.push(nudge);
   if (paragraphs.length) console.log(paragraphs.join('\n\n'));
@@ -6346,11 +6373,13 @@ function helpText() {
   keep doctor              # diagnose this installation
   keep setup hooks         # install Claude hooks and shared agent skills
   keep service install|start|stop|restart|status
-  keep add "title" [--kind task|experiment|idea|chore|bug] [--tag t]… [--project p]
+  keep add "title" [--kind task|experiment|idea|chore|bug] [--file|--claim] [--tag t]… [--project p]
                    [--plan "step" …] [--done-when "cmd"]… [--allow a,b] [--until when]
                    [--autonomous] [--experiment-id id] [--check-after when]
                    [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d]
                    [--probe "cmd"] [--status s] [--force] [-m note]
+                   # --file records follow-up work without moving this session; ideas file by default
+                   # --claim starts an idea now; --file and --claim are mutually exclusive
                    # --autonomous requires both --plan and --allow
   keep checkin <id> -m "state + next step" [--step <n|next>] [--status s] [--experiment-id id]
                     [--next "text"] [--commit sha]… [--check-after when] [--check "recipe"] [--clear-check-after]
@@ -6397,7 +6426,8 @@ function helpText() {
   keep release <hold-id>
   keep holds
   keep needs [<card> "<secret or action>" [--env NAME] | <card> --met [--env NAME|"<text>"]]
-                          # what only Owner can supply; no args lists open needs and clears any whose env var is set here
+                          # what only Owner can supply; no args is a read-only list
+                          # env needs auto-clear only at startup of a linked owning session
 ${stepUsage()}
   keep decide <type> [--card <id>] [--session <sid>] --send "<message>" -m "why"
                          # the reviewer records what it WOULD do; nothing is sent
