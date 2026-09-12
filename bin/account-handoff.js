@@ -4,12 +4,10 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { execFile } = require('node:child_process');
-const { promisify } = require('node:util');
+const { spawn } = require('node:child_process');
 const accounts = require('./accounts');
 const artifacts = require('./account-artifacts');
 
-const execFileAsync = promisify(execFile);
 const active = new Map();
 const CONTINUATION_TEXT = 'Continue the work from the request that hit the account limit.';
 
@@ -46,6 +44,52 @@ function commitTargetAuthority(sessionId, targetAccountId, transactionId, root) 
   return accounts.commitStaged(sessionId, transactionId, { root });
 }
 
+function killOwnedGroup(child) {
+  if (!child?.pid) return;
+  if (process.platform !== 'win32') {
+    try { process.kill(-child.pid, 'SIGKILL'); return; }
+    catch (error) { if (error.code === 'ESRCH') return; }
+  }
+  try { child.kill('SIGKILL'); } catch {}
+}
+
+function loginShellOutput(command, options = {}) {
+  const timeout = Number.isFinite(options.timeout) && options.timeout > 0 ? options.timeout : 15000;
+  const maxBuffer = Number.isFinite(options.maxBuffer) && options.maxBuffer > 0 ? options.maxBuffer : 256 * 1024;
+  return new Promise((resolve, reject) => {
+    const child = spawn('/bin/zsh', ['-lic', `exec ${command}`], {
+      env: options.env || process.env, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const stdout = [];
+    let stdoutBytes = 0, stderrBytes = 0, failure = null, settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer);
+      if (error) reject(error); else resolve(value);
+    };
+    const failAndKill = (error) => {
+      failure ||= error;
+      killOwnedGroup(child);
+    };
+    const timer = setTimeout(() => failAndKill(new Error('Claude auth preflight timed out')), timeout);
+    child.stdout.on('data', (chunk) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > maxBuffer) return failAndKill(new Error('Claude auth preflight output exceeded the limit'));
+      stdout.push(chunk);
+    });
+    child.stderr.on('data', (chunk) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes > maxBuffer) failAndKill(new Error('Claude auth preflight output exceeded the limit'));
+    });
+    child.once('error', (error) => finish(error));
+    child.once('close', (code, signal) => {
+      if (failure) return finish(failure);
+      if (code !== 0) return finish(new Error(`Claude auth preflight exited with ${code ?? signal ?? 'an error'}`));
+      finish(null, Buffer.concat(stdout, stdoutBytes).toString());
+    });
+  });
+}
+
 async function authPreflight(account, deps = {}) {
   if (deps.authPreflight) return deps.authPreflight(account);
   if (account.agent !== 'claude') return false;
@@ -56,9 +100,8 @@ async function authPreflight(account, deps = {}) {
     const command = (deps.profileCommand || require('./agent-launcher').profileCommand)(
       ['claude', 'auth', 'status', '--json'], account,
     );
-    const { stdout } = await execFileAsync('/bin/zsh', ['-lic', `exec ${command}`], {
-      env: deps.env || process.env, timeout: 15000, maxBuffer: 256 * 1024,
-    });
+    const stdout = await loginShellOutput(command, { env: deps.env || process.env,
+      timeout: deps.authTimeoutMs || 15000, maxBuffer: 256 * 1024 });
     // Interactive shell startup may print a banner. Parse Claude's complete
     // output first (current releases pretty-print JSON), then accept a complete
     // JSON suffix after banner text without ever exposing shell output.
@@ -294,4 +337,4 @@ async function run(body, deps = {}) {
   return pending;
 }
 
-module.exports = { run, list, safe, authPreflight, permissionClass, CONTINUATION_TEXT };
+module.exports = { run, list, safe, authPreflight, permissionClass, loginShellOutput, CONTINUATION_TEXT };

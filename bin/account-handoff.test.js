@@ -95,6 +95,29 @@ test('auth preflight resolves Claude in a login shell and reapplies managed cred
   } finally { fs.rmSync(base, { recursive: true, force: true }); }
 });
 
+test('auth preflight kills a login-shell process group when startup exceeds its deadline', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-handoff-auth-timeout-'));
+  let childPid = null;
+  try {
+    const home = path.join(base, 'home'), pidFile = path.join(base, 'startup-child.pid');
+    const configDir = path.join(base, 'claude-secondary');
+    fs.mkdirSync(home); fs.mkdirSync(configDir);
+    fs.writeFileSync(path.join(home, '.zshrc'), `/bin/sleep 30 &\nprint $! > '${pidFile}'\nwait\n`);
+    const account = { id: 'secondary', label: 'Secondary', agent: 'claude', configDir, managed: true, builtIn: false };
+    const env = { ...process.env, HOME: home, ZDOTDIR: home, PATH: '/usr/bin:/bin' };
+    const started = Date.now();
+    assert.equal(await handoff.authPreflight(account, { env, authTimeoutMs: 250 }), false);
+    assert.ok(Date.now() - started < 2000, 'interactive shell startup remains bounded');
+    childPid = Number(fs.readFileSync(pidFile, 'utf8').trim());
+    const alive = () => { try { process.kill(childPid, 0); return true; } catch (error) { if (error.code === 'ESRCH') return false; throw error; } };
+    for (let i = 0; i < 50 && alive(); i++) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(alive(), false, 'the startup descendant is killed with its owned process group');
+  } finally {
+    if (childPid) try { process.kill(childPid, 'SIGKILL'); } catch {}
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
 test('explicit handoff moves one conversation across three-account infrastructure and continues once', async () => {
   const f = fixture();
   try {
