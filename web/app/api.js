@@ -1,7 +1,10 @@
-const WRITE_HEADERS = { 'content-type': 'application/json', 'x-keep': '1' };
+const WRITE_HEADERS = { 'content-type': 'application/json' };
 
+// Read routes that expose session or handoff detail demand the header too — it forces
+// a CORS preflight, so a hostile page cannot reach them. Sending it on every request
+// keeps a newly guarded GET from 403ing the whole dashboard reload.
 async function request(url, options = {}) {
-  const response = await fetch(url, options);
+  const response = await fetch(url, { ...options, headers: { 'x-keep': '1', ...options.headers } });
   const text = await response.text();
   let body = null;
   try { body = text ? JSON.parse(text) : null; } catch {}

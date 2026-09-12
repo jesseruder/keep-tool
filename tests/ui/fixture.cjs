@@ -79,6 +79,10 @@ async function createFixture() {
       }
       if (url.pathname.startsWith('/api/')) {
         record('request', { method: req.method, path: url.pathname, body: input });
+        // The daemon guards its writes and its detail reads with the header that forces a
+        // CORS preflight. The fixture holds every route to that rule so a client that stops
+        // sending it fails here instead of 403ing the dashboard against the real server.
+        if (req.headers['x-keep'] !== '1') { json({ error: 'missing x-keep header' }, 403); return; }
         if (url.pathname === '/api/portable-transfers') { json({ ok: true, transfers: portableTransfers }); return; }
         if (url.pathname === '/api/state') { json(state); return; }
         if (url.pathname === '/api/layouts') {
