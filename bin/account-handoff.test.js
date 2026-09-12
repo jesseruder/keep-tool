@@ -12,7 +12,7 @@ const handoff = require('./account-handoff');
 function fixture() {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-handoff-'));
   const root = path.join(base, 'registry'); fs.mkdirSync(root);
-  const profiles = Object.fromEntries(['one', 'two', 'three', 'codex'].map((id) => [id, path.join(base, id)]));
+  const profiles = Object.fromEntries(['one', 'two', 'three', 'codex', 'codexTwo'].map((id) => [id, path.join(base, id)]));
   for (const value of Object.values(profiles)) fs.mkdirSync(value, { recursive: true });
   const config = path.join(base, 'config.json');
   fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
@@ -20,6 +20,7 @@ function fixture() {
     { id: 'two', label: 'Two', agent: 'claude', configDir: profiles.two },
     { id: 'three', label: 'Three', agent: 'claude', configDir: profiles.three },
     { id: 'codex-work', label: 'Codex', agent: 'codex', configDir: profiles.codex },
+    { id: 'codex-two', label: 'Codex Two', agent: 'codex', configDir: profiles.codexTwo },
   ], defaultAccounts: { claude: 'one', codex: 'codex-work' } }));
   const env = { KEEP_CONFIG: config, KEEP_DIR: root };
   const sid = 'session-123', projectName = '-repo', project = path.join(base, 'repo'); fs.mkdirSync(project);
@@ -34,6 +35,7 @@ function fixture() {
 
 function deps(f, overrides = {}) {
   const pane = { id: 'pane-1', pid: 10, alive: true, cwd: f.project, cols: 80, rows: 24,
+    agentAlive: true,
     meta: { sessionId: f.sid, accountId: 'one', agent: 'claude', model: 'claude-opus-4-1' } };
   let continuations = 0;
   const baseHost = { request: async (type, params) => {
@@ -43,7 +45,8 @@ function deps(f, overrides = {}) {
   } };
   return { root: f.root, env: f.env, pane,
     inspect: async () => ({ session: { id: f.sid, kind: 'claude', project: f.project, endedTurn: true }, pane,
-      processArgs: 'claude --dangerously-skip-permissions --resume session-123', currentModel: 'claude-opus-4-1' }),
+      processArgs: 'claude --dangerously-skip-permissions --resume session-123', currentModel: 'claude-opus-4-1',
+      agentIdentity: { pid: 11, pidStart: 'source-start', primary: true } }),
     authPreflight: async () => true,
     compatible: () => ({ ok: true, reasons: [], mcpConfig: path.join(f.base, 'mcp.json') }),
     rebindLedger: () => ({ rebound: [{ sessionId: f.sid, reused: false }] }),
@@ -58,6 +61,80 @@ function deps(f, overrides = {}) {
     continuations: () => continuations,
     ...overrides,
   };
+}
+
+function codexDeps(f, overrides = {}) {
+  const sid = '11111111-1111-4111-8111-111111111111';
+  const child = '22222222-2222-4222-8222-222222222222';
+  const sourceFile = path.join(f.profiles.codex, 'sessions', `rollout-${sid}.jsonl`);
+  const targetFile = path.join(f.profiles.codexTwo, 'sessions', `rollout-${sid}.jsonl`);
+  const plan = { sessionId: sid, artifacts: [
+    { sessionId: sid, parentSessionId: null, children: [child], interacted: [], source: sourceFile, target: targetFile },
+    { sessionId: child, parentSessionId: sid, children: [], interacted: [],
+      source: path.join(f.profiles.codex, 'sessions', `rollout-${child}.jsonl`),
+      target: path.join(f.profiles.codexTwo, 'sessions', `rollout-${child}.jsonl`) },
+  ] };
+  const argv = ['codex', '--sandbox', 'workspace-write', '--ask-for-approval', 'never', '-m', 'gpt-6-astra',
+    '-c', 'model_reasoning_effort="high"', 'resume', sid];
+  const resumeSpec = { sessionId: sid, cwd: f.project, model: 'gpt-6-astra', effort: 'high', provider: 'openai', argv,
+    digest: 'frozen-policy' };
+  const pane = { id: 'pane-codex', pid: 30, alive: true, agentAlive: true, cwd: f.project, cols: 100, rows: 30,
+    meta: { sessionId: sid, accountId: 'codex-work', agent: 'codex' } };
+  accounts.pinSession(sid, 'codex', 'codex-work', { root: f.root, env: f.env });
+  const events = []; let preflights = 0;
+  const artifactProvider = {
+    preflight: () => { preflights++; return plan; },
+    copyCodexArtifacts: (_sid, source, target, transactionId, options) => {
+      assert.equal(pane.alive, false, 'Codex artifacts copy only after source exit');
+      assert.equal(source.id, 'codex-work'); assert.equal(target.id, 'codex-two');
+      assert.ok(transactionId); assert.ok(options.sourceStopVerifiedAt);
+      events.push('copy'); return plan;
+    },
+    rebindLedger: (_sid, _source, _target, _transactionId, options) => {
+      assert.ok(options.sourceStopVerifiedAt); events.push('rebind');
+      return { rebound: plan.artifacts.map((entry) => ({ sessionId: entry.sessionId })) };
+    },
+  };
+  const base = {
+    root: f.root, env: f.env, pane, plan, sid, child, argv, events, artifactProvider,
+    preflights: () => preflights,
+    inspect: async () => ({ session: { id: sid, kind: 'codex', project: f.project, endedTurn: true }, pane,
+      processArgs: `codex resume ${sid}`, agentIdentity: { pid: 31, pidStart: 'codex-source-start', primary: true } }),
+    authPreflight: async () => true,
+    resumeSpec: () => ({ ...resumeSpec, argv: [...argv] }),
+    compatible: (_source, _target, _cwd, spec) => {
+      assert.deepEqual(spec.argv, argv); return { ok: true, reasons: [], mcpConfig: null };
+    },
+    host: { request: async (type, params) => {
+      assert.equal(type, 'replace-exited');
+      for (const id of [sid, child]) {
+        const authority = accounts.authority(f.root)[id];
+        assert.equal(authority.accountId, 'codex-work'); assert.equal(authority.stagedAccountId, 'codex-two');
+      }
+      events.push('launch'); pane.alive = true; pane.pid = 40;
+      pane.meta = { ...pane.meta, ...params.meta, accountId: 'codex-two' };
+      return { pane };
+    } },
+    restartSession: async (_body, options) => {
+      assert.deepEqual(options.resumeArgv, argv); pane.alive = false;
+      await options.host.request('replace-exited', { meta: { sessionId: sid, accountId: 'codex-two' } });
+      return { ok: true, pane: pane.id, pid: pane.pid };
+    },
+    waitForAccountRecord: async (_sid, _pane, accountId, after) => ({ pane: pane.id, accountId, startedAt: after + 1 }),
+    resumeExited: async () => {
+      events.push('resume-exited'); pane.alive = true; pane.pid = 40;
+      pane.meta = { ...pane.meta, accountId: 'codex-two' };
+      return { ok: true, pane: pane.id, pid: pane.pid };
+    },
+    verifyTargetSpec: async (entry) => { assert.equal(entry.targetTranscript, targetFile); events.push('verify-target'); },
+    continueSession: async (_sid, _text, options) => {
+      assert.equal(options.agent, 'codex'); assert.equal(options.targetTranscript, targetFile);
+      assert.equal(events.at(-1), 'verify-target', 'effective target policy is verified before continuation delivery');
+      events.push('continue');
+    },
+    ...overrides,
+  };
+  return base;
 }
 
 test('auth preflight resolves Claude in a login shell and reapplies managed credential isolation afterward', async () => {
@@ -154,6 +231,77 @@ test('explicit handoff moves one conversation across three-account infrastructur
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test('native Codex handoff preserves exact launch policy and transfers root plus owned child authority', async () => {
+  const f = fixture();
+  try {
+    const d = codexDeps(f);
+    const result = await handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two' }, d);
+    assert.equal(result.status, 'done'); assert.equal(result.agent, 'codex');
+    assert.deepEqual(d.events, ['copy', 'rebind', 'launch', 'verify-target', 'continue']);
+    for (const id of [d.sid, d.child]) {
+      const authority = accounts.authority(f.root)[id];
+      assert.equal(authority.agent, 'codex'); assert.equal(authority.accountId, 'codex-two');
+      assert.equal(authority.stagedAccountId, undefined);
+    }
+    const journal = JSON.parse(fs.readFileSync(path.join(f.root, '.keep', 'account-handoffs', `${d.sid}.json`)));
+    assert.deepEqual(journal.resumeSpec.argv, d.argv);
+    assert.deepEqual(journal.ownedSessionIds, [d.sid, d.child]);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('Codex delivery receipt finishes a partial child-first authority commit without resending', async () => {
+  const f = fixture();
+  try {
+    let sends = 0;
+    const d = codexDeps(f, { continueSession: async () => { sends++; throw new Error('daemon stopped after delivery'); } });
+    await assert.rejects(handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two' }, d), /daemon stopped/);
+    const file = path.join(f.root, '.keep', 'account-handoffs', `${d.sid}.json`);
+    const interrupted = JSON.parse(fs.readFileSync(file, 'utf8'));
+    accounts.commitStaged(d.child, interrupted.id, { root: f.root });
+    d.deliveryStatus = async () => ({ sessionId: d.sid, kind: 'codex', received: true, pending: false });
+    d.verifyTargetSpec = async () => {};
+    const recovered = await handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two' }, d);
+    assert.equal(recovered.status, 'done'); assert.equal(sends, 1);
+    for (const id of [d.child, d.sid]) assert.equal(accounts.authority(f.root)[id].accountId, 'codex-two');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('Codex source policy changes after exit block target launch', async () => {
+  const f = fixture();
+  try {
+    let reads = 0;
+    const d = codexDeps(f, {
+      resumeSpec: (_sid, plan) => ({ sessionId: _sid, cwd: f.project, model: 'gpt-6-astra', effort: 'high', provider: 'openai',
+        argv: ['codex', '--sandbox', 'workspace-write', '--ask-for-approval', 'never', '-m', 'gpt-6-astra',
+          '-c', 'model_reasoning_effort="high"', 'resume', _sid],
+        digest: ++reads === 1 ? 'frozen-policy' : 'changed-policy', plan }),
+      compatible: () => ({ ok: true, reasons: [], mcpConfig: null }),
+    });
+    await assert.rejects(handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two' }, d), /launch settings changed/);
+    assert.equal(d.events.includes('launch'), false);
+    assert.equal(accounts.authority(f.root)[d.sid].accountId, 'codex-work');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('Codex recovery resumes an idempotent copy after the ledger already rebound', async () => {
+  const f = fixture();
+  try {
+    let first = true;
+    const d = codexDeps(f);
+    d.artifactProvider.rebindLedger = (...args) => {
+      d.events.push('rebind');
+      if (first) { first = false; throw new Error('daemon stopped after durable ledger rebind'); }
+      return { rebound: d.plan.artifacts.map((entry) => ({ sessionId: entry.sessionId, reused: true })) };
+    };
+    await assert.rejects(handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two' }, d), /durable ledger rebind/);
+    assert.equal(d.preflights(), 1); assert.equal(d.pane.alive, false);
+    const recovered = await handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two' }, d);
+    assert.equal(recovered.status, 'done');
+    assert.equal(d.preflights(), 1, 'recovery uses the transaction journal after the ledger source moved');
+    assert.deepEqual(d.events, ['copy', 'rebind', 'copy', 'rebind', 'resume-exited', 'verify-target', 'continue']);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test('busy refusal and failed target preflight leave source running and authoritative', async () => {
   const f = fixture();
   try {
@@ -207,6 +355,12 @@ test('portable fallback refuses changed source identity and any transaction that
     await assert.rejects(handoff.abandonForPortable({ sessionId: f.sid, pane: 'pane-1', transactionId: pending.id }, d),
       /identity is no longer intact/);
     d.pane.meta.accountId = 'one';
+    const inspect = d.inspect;
+    d.inspect = async (body) => ({ ...(await inspect(body)),
+      agentIdentity: { pid: 99, pidStart: 'replacement-start', primary: true } });
+    await assert.rejects(handoff.abandonForPortable({ sessionId: f.sid, pane: 'pane-1', transactionId: pending.id }, d),
+      /identity is no longer intact/);
+    d.inspect = inspect;
     const journal = path.join(f.root, '.keep', 'account-handoffs', `${f.sid}.json`);
     const state = JSON.parse(fs.readFileSync(journal, 'utf8'));
     state.sourceStopVerifiedAt = Date.now(); fs.writeFileSync(journal, JSON.stringify(state));
@@ -293,7 +447,7 @@ test('recovery catches up final Claude exit rows without a daemon poll before re
 test('verification failure keeps target transcript updates and recovery does not recopy or relaunch', async () => {
   const f = fixture();
   try {
-    let verify = false, launches = 0;
+    let recordMode = 'missing', launches = 0;
     const d = deps(f, {
       restartSession: async (_body, options) => {
         launches++;
@@ -302,14 +456,21 @@ test('verification failure keeps target transcript updates and recovery does not
         fs.appendFileSync(path.join(f.profiles.two, 'projects', f.projectName, `${f.sid}.jsonl`), '{"type":"assistant","message":{"content":"target update"}}\n');
         return result;
       },
-      waitForAccountRecord: async (_sid, _pane, accountId, after) => verify ? ({ pane: 'pane-1', accountId, startedAt: after + 1 }) : null,
+      waitForAccountRecord: async (_sid, _pane, accountId, after) => {
+        if (recordMode === 'missing') return null;
+        if (recordMode === 'wrong-pane') return { pane: 'replacement-pane', accountId, startedAt: after + 1 };
+        return { pane: 'pane-1', accountId, startedAt: after + 1 };
+      },
     });
     await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /identity was not verified/);
     const journalFile = path.join(f.root, '.keep', 'account-handoffs', `${f.sid}.json`);
     const interrupted = JSON.parse(fs.readFileSync(journalFile, 'utf8'));
     interrupted.status = 'verifying';
     fs.writeFileSync(journalFile, JSON.stringify(interrupted));
-    verify = true;
+    recordMode = 'wrong-pane';
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /identity was not verified/);
+    assert.equal(launches, 1); assert.equal(d.continuations(), 0);
+    recordMode = 'correct';
     const recovered = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d);
     assert.equal(recovered.status, 'done');
     assert.equal(launches, 1);
@@ -365,7 +526,7 @@ test('same-account and cross-provider targets are refused before stopping', asyn
   try {
     const d = deps(f);
     await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'one' }, d), /same/);
-    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'codex-work' }, d), /verified only for Claude/);
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'codex-work' }, d), /same supported provider/);
     assert.equal(d.pane.alive, true);
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });

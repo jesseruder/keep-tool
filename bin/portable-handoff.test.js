@@ -191,6 +191,25 @@ test('desktop launch refuses stale source or package bytes and requires authorit
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test('portable fallback keeps the exact source agent process from preview through launch', async () => {
+  const f = fixture();
+  try {
+    let pid = 41;
+    f.deps.inspectSource = async () => ({
+      session: { endedTurn: true, state: 'needs-input', project: f.cwd, pendingBackground: true,
+        unknownBackgroundJobs: ['history-gap'], backgroundJobs: { jobs: [] } },
+      portableFallback: { sourceAgentPid: pid, sourceAgentPidStart: `started-${pid}` },
+    });
+    const prepared = await portable.run({ sourceSessionId: 'source-session-1234', accountId: f.target.id,
+      contextText: 'Preserve the verified source process.', prepareOnly: true }, f.deps);
+    assert.equal(portable.safeSummary(prepared).sourceAgentPid, 41);
+    pid = 42;
+    await assert.rejects(portable.launchPrepared(prepared.requestKey, f.deps),
+      (error) => error.code === 'KEEP_PORTABLE_TRANSFER_STALE' && /source process changed/.test(error.message));
+    assert.equal(f.opened.length, 0);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test('desktop launch binds the reviewed source account, card fields, and delivered opening receipt', async () => {
   const accountChanged = fixture();
   try {

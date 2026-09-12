@@ -378,6 +378,34 @@ test('transaction rebind preserves evidence, ignores its frozen former source, a
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('Codex transaction rebind preserves restart evidence and remains idempotent', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-jobs-codex-rebind-'));
+  const sid = '11111111-1111-4111-8111-111111111111';
+  const source = path.join(root, 'source', `${sid}.jsonl`), target = path.join(root, 'target', `${sid}.jsonl`);
+  try {
+    fs.mkdirSync(path.dirname(source)); fs.mkdirSync(path.dirname(target));
+    fs.writeFileSync(source, [
+      { timestamp: new Date(1000).toISOString(), type: 'session_meta', payload: { id: sid, cwd: root } },
+      { timestamp: new Date(1100).toISOString(), type: 'event_msg', payload: { type: 'task_complete' } },
+    ].map(JSON.stringify).join('\n') + '\n');
+    fs.copyFileSync(source, target);
+    jobs.sync({ root, agent: 'codex', sid, file: source, now: 1200 });
+    const snapshot = path.join(root, '.keep', 'background-jobs', 'codex', sid, 'state.json');
+    const before = JSON.parse(fs.readFileSync(snapshot));
+    const first = jobs.rebindSource({ root, agent: 'codex', sid, sourceFile: source, targetFile: target,
+      transactionId: 'codex-transfer', sourceStopVerifiedAt: 1 });
+    assert.equal(first.reused, false);
+    const after = JSON.parse(fs.readFileSync(snapshot));
+    assert.deepEqual(after.jobs, before.jobs); assert.deepEqual(after.restart, before.restart);
+    assert.equal(after.source.file, path.resolve(target));
+    assert.equal(jobs.rebindSource({ root, agent: 'codex', sid, sourceFile: source, targetFile: target,
+      transactionId: 'codex-transfer', sourceStopVerifiedAt: 1 }).reused, true);
+    fs.appendFileSync(target, '{}\n');
+    assert.throws(() => jobs.rebindSource({ root, agent: 'codex', sid, sourceFile: source, targetFile: target,
+      transactionId: 'codex-transfer', sourceStopVerifiedAt: 1 }), /does not match|no longer matches/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('ledger rebind refuses divergent copies, hard links, and pre-existing incomplete evidence', () => {
   for (const mode of ['copy', 'hard-link', 'gap']) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), `keep-jobs-rebind-${mode}-`));

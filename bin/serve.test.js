@@ -103,6 +103,7 @@ const {
   portableTransferPreview,
   transferSession,
   resolvePortableTransfer,
+  recoverPortableOpening,
   waitForHostAgent,
   InjectionError,
 } = require('./serve.js');
@@ -3013,6 +3014,60 @@ test('handoff continuation receipts are bound to the staged target transcript', 
   } finally { fs.rmSync(base, { recursive: true, force: true }); }
 });
 
+test('Codex handoff continuation uses only the exact staged target rollout', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-handoff-delivery-'));
+  const root = path.join(base, 'registry'), source = path.join(base, 'source'), target = path.join(base, 'target');
+  const sid = '11111111-1111-4111-8111-111111111111';
+  const sourceFile = path.join(source, 'sessions', `rollout-${sid}.jsonl`);
+  const targetFile = path.join(target, 'sessions', `rollout-${sid}.jsonl`);
+  for (const file of [sourceFile, targetFile]) fs.mkdirSync(path.dirname(file), { recursive: true });
+  const rows = [
+    { type: 'session_meta', payload: { id: sid, cwd: base } },
+    { type: 'event_msg', payload: { type: 'task_complete' } },
+  ].map(JSON.stringify).join('\n') + '\n';
+  fs.writeFileSync(sourceFile, rows); fs.writeFileSync(targetFile, rows); fs.mkdirSync(root);
+  const config = path.join(base, 'config.json');
+  fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+    { id: 'codex-source', label: 'Source', agent: 'codex', configDir: source },
+    { id: 'codex-target', label: 'Target', agent: 'codex', configDir: target },
+  ], defaultAccounts: { codex: 'codex-source' } }));
+  const env = { KEEP_DIR: root, KEEP_CONFIG: config };
+  const accountStore = require('./accounts');
+  accountStore.pinSession(sid, 'codex', 'codex-source', { root, env });
+  accountStore.stageSession(sid, 'codex-target', 'codex-delivery', { root, env });
+  let draft = '';
+  const host = recordingHost((type, params) => {
+    if (type === 'list') return { panes: [{ id: 'pane-codex-target', alive: true,
+      meta: { sessionId: sid, agent: 'codex', accountId: 'codex-target', handoffTransactionId: 'codex-delivery' } }] };
+    if (type === 'screen') return { text: draft ? `› ${draft}` : '› Ask Codex to do anything',
+      cursor: { x: draft.length + 2, y: 0 } };
+    if (type === 'input') {
+      const value = Buffer.from(params.data, 'base64').toString();
+      if (value === '\r') {
+        fs.appendFileSync(targetFile, JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'user',
+          content: [{ type: 'input_text', text: draft }] } }) + '\n');
+        draft = '';
+      } else draft += value;
+    }
+    return {};
+  });
+  try {
+    const message = 'Continue the exact Codex conversation.';
+    const result = await continueAccountHandoff(sid, 'pane-codex-target', 'codex-target', message,
+      'codex-delivery', { agent: 'codex', targetTranscript: targetFile }, {
+        root, env, host, sleep: async () => {}, deliveryDirectory: path.join(root, '.keep', 'delivery'),
+      });
+    assert.equal(result.delivery, 'received');
+    assert.doesNotMatch(fs.readFileSync(sourceFile, 'utf8'), /exact Codex conversation/);
+    assert.match(fs.readFileSync(targetFile, 'utf8'), /exact Codex conversation/);
+    assert.throws(() => continueAccountHandoff(sid, 'pane-codex-target', 'codex-target', message,
+      'wrong-path', { agent: 'codex', targetTranscript: sourceFile }, { root, env, host }), /outside its account/);
+    const symlink = path.join(target, 'sessions', 'alias.jsonl'); fs.symlinkSync(sourceFile, symlink);
+    assert.throws(() => continueAccountHandoff(sid, 'pane-codex-target', 'codex-target', message,
+      'symlink-path', { agent: 'codex', targetTranscript: symlink }, { root, env, host }), /outside its account/);
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
 test('typing exit confirms the prompt above a tall Claude slash-command menu', async () => {
   let typed = '';
   const screen = ['Old assistant advice: Esc to cancel', '────────────────', '❯ /exit', '────────────────', ...Array.from({ length: 40 }, (_, i) => `  /command${i}  Command description`)].join('\n');
@@ -3616,24 +3671,52 @@ test('workspace trust is typed setup only for portable opening waits', async () 
       && error.extra.setupKind === 'workspace-trust');
 });
 
+test('setup recovery rechecks the destination incarnation under the injection lock before typing', async () => {
+  const transferId = 'e'.repeat(64), message = 'Read the package, then WAIT.';
+  const original = { id: 'pane-recovery', pid: 20, createdAt: 100, alive: true,
+    meta: { portableTransferId: transferId, accountId: 'codex-two', card: 'card', sessionId: 'destination-session' } };
+  let pane = original, gets = 0, typed = 0, reserved = 0;
+  const host = { request: async (type) => {
+    assert.equal(type, 'get'); gets++;
+    // The first read adopts the saved pane. The readiness wait then returns,
+    // and the lock-protected read observes that the host reused its id.
+    return { pane };
+  } };
+  const state = { requestKey: transferId, sourceSessionId: 'source-session', destinationPane: original.id,
+    destinationPanePid: original.pid, destinationPaneCreatedAt: original.createdAt,
+    destinationSessionId: 'destination-session', targetAccountId: 'codex-two', targetAgent: 'codex', cardId: 'card',
+    opening: { text: message } };
+  await assert.rejects(recoverPortableOpening(state, message, {
+    onReady: async () => { reserved++; return true; }, onDelivered: async () => true,
+  }, {
+    host,
+    waitForHostAgent: async () => { pane = { ...original, pid: 21, createdAt: 101 }; },
+    typeOpeningMessage: async () => { typed++; },
+  }), /pane identity changed/);
+  assert.equal(gets, 2); assert.equal(reserved, 0); assert.equal(typed, 0);
+});
+
 test('abandoned pre-stop journal authorizes only its still-identical source for ledger metadata fallback', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-portable-abandoned-'));
   const directory = path.join(root, '.keep', 'account-handoffs'); fs.mkdirSync(directory, { recursive: true });
   const id = 'handoff-safe-source';
   fs.writeFileSync(path.join(directory, 'source-session-1234.json'), JSON.stringify({ id, transactionId: id,
     sessionId: 'source-session-1234', pane: 'pane-source', sourceAccountId: 'claude/default',
-    targetAccountId: 'claude-secondary', status: 'failed', phase: 'portable-fallback', portableFallbackAt: 1 }));
+    targetAccountId: 'claude-secondary', status: 'failed', phase: 'portable-fallback', portableFallbackAt: 1,
+    sourceAgentPid: 42, sourceAgentPidStart: 'source-start' }));
   const session = { id: 'source-session-1234', kind: 'claude', accountId: 'claude/default', endedTurn: true,
     pendingBackground: true, unknownBackgroundJobs: ['history-gap'], backgroundJobs: { jobs: [] } };
-  const pane = { id: 'pane-source', alive: true,
+  const pane = { id: 'pane-source', alive: true, agentAlive: true,
     meta: { sessionId: session.id, accountId: session.accountId, agent: 'claude' } };
+  const identity = async () => new Map([[session.id, { pid: 42, pidStart: 'source-start', primary: true }]]);
   try {
-    let inspection = await inspectPortableSource(session.id, {}, { root, inspectState: async () => ({ sessions: [session], panes: [pane], handoffs: [] }) });
+    let inspection = await inspectPortableSource(session.id, {}, { root, liveSessionPids: identity,
+      inspectState: async () => ({ sessions: [session], panes: [pane], handoffs: [] }) });
     assert.equal(inspection.portableFallback.phase, 'portable-fallback');
     assert.equal(require('./portable-handoff').sourceBusyReason(inspection), '');
     inspection = await inspectPortableSource(session.id, {}, { root, inspectState: async () => ({ sessions: [
       { ...session, accountId: 'claude-secondary' },
-    ], panes: [pane], handoffs: [] }) });
+    ], panes: [pane], handoffs: [] }), liveSessionPids: identity });
     assert.equal(inspection.portableFallback, null);
     assert.ok(inspection.nativeHandoff, 'changed identity restores the unresolved handoff refusal');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
@@ -3706,6 +3789,13 @@ test('portable source inspection treats failed native handoff as terminal and fi
   const inspected = await inspectPortableSource('source-session', {}, { inspectState: async () => state, portable, root: '/keep' });
   assert.equal(inspected.nativeHandoff, undefined);
   assert.equal(inspected.portableHandoff.status, 'done');
+});
+
+test('portable source inspection treats an awaiting-setup successor as an active conflict', async () => {
+  const state = { sessions: [{ id: 'source-session', endedTurn: true }], panes: [], handoffs: [] };
+  const portable = { list: () => [{ id: 'f'.repeat(64), sourceSessionId: 'source-session', status: 'awaiting-setup' }] };
+  const inspected = await inspectPortableSource('source-session', {}, { inspectState: async () => state, portable, root: '/keep' });
+  assert.equal(inspected.portableHandoff.status, 'awaiting-setup');
 });
 
 test('ambiguous resolver requires matching account, card, pane transfer marker, and delivered-opening receipt', async () => {

@@ -30,7 +30,7 @@ test('three Claude accounts validate with explicit defaults and safe public meta
     assert.equal(accounts.automationFor('claude', 'reviewer', f.env).id, 'b');
     const state = accounts.publicState(f.env);
     assert.equal(state.accounts.find((entry) => entry.id === 'a').handoffSupported, true);
-    assert.equal(state.accounts.find((entry) => entry.agent === 'codex').handoffSupported, false);
+    assert.equal(state.accounts.find((entry) => entry.agent === 'codex').handoffSupported, true);
     assert.equal(JSON.stringify(state).includes(f.root), false, 'config paths stay private');
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });

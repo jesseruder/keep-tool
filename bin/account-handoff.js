@@ -29,12 +29,14 @@ function portableFallbackCandidate(entry) {
   if (!entry || entry.phase === 'portable-fallback') return false;
   const safePhase = entry.status === 'recovery-needed' && entry.phase === 'stopping-source'
     || entry.status === 'failed' && entry.phase === 'preflight';
-  return Boolean(safePhase && !entry.sourceStopVerifiedAt && !entry.targetLaunchStartedAt
+  return Boolean(safePhase && Number.isInteger(entry.sourceAgentPid) && entry.sourceAgentPid > 0
+    && typeof entry.sourceAgentPidStart === 'string' && entry.sourceAgentPidStart
+    && !entry.sourceStopVerifiedAt && !entry.targetLaunchStartedAt
     && !entry.deliveryStartedAt && !entry.deliveredAt);
 }
 function safe(entry) {
   if (!entry) return null;
-  const keys = ['id', 'transactionId', 'sessionId', 'pane', 'sourceAccountId', 'targetAccountId', 'status', 'phase', 'reason', 'updatedAt'];
+  const keys = ['id', 'transactionId', 'sessionId', 'pane', 'agent', 'sourceAccountId', 'targetAccountId', 'status', 'phase', 'reason', 'updatedAt'];
   return {
     ...Object.fromEntries(keys.filter((key) => entry[key] != null).map((key) => [key, entry[key]])),
     ...(portableFallbackCandidate(entry) ? { portableFallbackAvailable: true } : {}),
@@ -53,6 +55,84 @@ function commitTargetAuthority(sessionId, targetAccountId, transactionId, root) 
   const current = accounts.authority(root)[sessionId];
   if (current?.accountId === targetAccountId && !current.stagedAccountId && current.transactionId === transactionId) return current;
   return accounts.commitStaged(sessionId, transactionId, { root });
+}
+
+function ownedSessionIds(entry) {
+  const ids = Array.isArray(entry?.ownedSessionIds) ? entry.ownedSessionIds : [entry?.sessionId];
+  if (!entry?.sessionId || !ids.includes(entry.sessionId) || ids.length !== new Set(ids).size
+      || ids.some((id) => !/^[A-Za-z0-9_-]+$/.test(String(id || '')))) {
+    throw new Error('Account handoff ownership graph is invalid');
+  }
+  return ids;
+}
+
+function pinSourceAuthority(entry, source, root, env) {
+  for (const sessionId of ownedSessionIds(entry)) accounts.pinSession(sessionId, entry.agent, source.id, { root, env });
+}
+
+function stageTargetAuthority(entry, target, root, env) {
+  for (const sessionId of ownedSessionIds(entry)) accounts.stageSession(sessionId, target.id, entry.id, { root, env });
+}
+
+function commitTargetAuthorities(entry, target, root) {
+  const ids = ownedSessionIds(entry);
+  // The root authority is the public commit point. Commit children first so a
+  // crash cannot expose the target root while an owned child is still staged.
+  for (const sessionId of [...ids.filter((id) => id !== entry.sessionId), entry.sessionId]) {
+    commitTargetAuthority(sessionId, target.id, entry.id, root);
+  }
+}
+
+function clearStagedAuthorities(entry, root) {
+  for (const sessionId of ownedSessionIds(entry)) accounts.clearStaged(sessionId, entry.id, { root });
+}
+
+function verifyOwnedGraph(entry, plan) {
+  if (!entry?.ownedSessionIds || !Array.isArray(plan?.artifacts)
+      || JSON.stringify(plan.artifacts.map((artifact) => artifact.sessionId).sort())
+        !== JSON.stringify([...entry.ownedSessionIds].sort())) {
+    throw new Error('Codex owned conversation graph changed during handoff');
+  }
+}
+
+function targetRecordMatches(record, entry, target, pane) {
+  const launchStartedAt = Number(entry?.targetLaunchStartedAt);
+  const recordStartedAt = Number(record?.startedAt);
+  return Boolean(record && record.accountId === target.id && record.pane === pane.id
+    && Number.isFinite(launchStartedAt) && Number.isFinite(recordStartedAt)
+    && recordStartedAt > launchStartedAt);
+}
+
+function artifactProvider(agent, deps = {}) {
+  if (deps.artifactProvider) return deps.artifactProvider;
+  return agent === 'codex' ? require('./codex-account-artifacts') : artifacts;
+}
+
+function providerCompatibility(agent, source, target, cwd, resumeSpec, deps = {}) {
+  if (deps.compatible) return deps.compatible(source, target, cwd, resumeSpec);
+  return agent === 'codex'
+    ? require('./codex-handoff-support').compatible(source, target, resumeSpec)
+    : require('./account-setup').compatible(source, target, cwd);
+}
+
+function copyProviderArtifacts(provider, agent, ...args) {
+  return agent === 'codex' ? provider.copyCodexArtifacts(...args) : provider.copyClaudeArtifacts(...args);
+}
+
+function resumeSpecFor(sessionId, agent, plan, deps = {}) {
+  if (agent !== 'codex') return null;
+  if (deps.resumeSpec) return deps.resumeSpec(sessionId, plan);
+  const root = plan?.artifacts?.find((entry) => entry.sessionId === sessionId);
+  if (!root?.source) throw new Error('Codex source rollout identity is unavailable');
+  return require('./codex-handoff-support').readResumeSpec(root.source, sessionId);
+}
+
+function verifyFrozenResumeSpec(entry, plan, deps = {}) {
+  if (!entry?.resumeSpec) return;
+  const verified = deps.resumeSpec
+    ? deps.resumeSpec(entry.sessionId, plan || { artifacts: [{ sessionId: entry.sessionId, source: entry.sourceTranscript }] })
+    : require('./codex-handoff-support').readResumeSpec(entry.sourceTranscript, entry.sessionId);
+  if (verified.digest !== entry.resumeSpec.digest) throw new Error('Codex launch settings changed before restart');
 }
 
 function killOwnedGroup(child) {
@@ -103,6 +183,7 @@ function loginShellOutput(command, options = {}) {
 
 async function authPreflight(account, deps = {}) {
   if (deps.authPreflight) return deps.authPreflight(account);
+  if (account.agent === 'codex') return require('./codex-handoff-support').authPreflight(account, deps);
   if (account.agent !== 'claude') return false;
   try {
     // Match the real launch path: the login shell resolves Claude from the
@@ -181,7 +262,7 @@ async function run(body, deps = {}) {
       }
     } else current = null;
     const inspected = await deps.inspect(body);
-    const session = inspected?.session || (current ? { id: body.sessionId, kind: 'claude', project: current.cwd } : null);
+    const session = inspected?.session || (current ? { id: body.sessionId, kind: current.agent || 'claude', project: current.cwd } : null);
     const pane = inspected?.pane;
     if (!session || !pane || pane.id !== body.pane || (pane.meta?.sessionId && pane.meta.sessionId !== body.sessionId)) {
       const error = new Error(current ? 'Interrupted handoff needs the original pane for recovery' : 'Expected a live session in this pane');
@@ -196,18 +277,24 @@ async function run(body, deps = {}) {
       || accounts.defaultFor(session.kind, env);
     const target = accounts.get(body.accountId, env);
     if (!target) { const error = new Error(`unknown account ${body.accountId}`); error.status = 400; throw error; }
-    if (session.kind !== 'claude' || target.agent !== 'claude') {
-      const error = new Error('Cross-profile handoff is currently verified only for Claude sessions'); error.status = 409; throw error;
+    if (!['claude', 'codex'].includes(session.kind) || target.agent !== session.kind) {
+      const error = new Error('Native handoff requires source and destination accounts for the same supported provider'); error.status = 409; throw error;
     }
+    const agent = session.kind;
+    const providerArtifacts = artifactProvider(agent, deps);
+    const sourceIdentity = inspected.agentIdentity?.primary === true && Number.isInteger(inspected.agentIdentity.pid)
+      && inspected.agentIdentity.pid > 0 && typeof inspected.agentIdentity.pidStart === 'string'
+      && inspected.agentIdentity.pidStart ? inspected.agentIdentity : null;
     if (source.id === target.id) { const error = new Error('source and target account are the same'); error.status = 409; throw error; }
     if (current?.deliveryStartedAt && !current.deliveredAt && current.deliveryId && deps.deliveryStatus) {
       const receipt = await deps.deliveryStatus(session.id, CONTINUATION_TEXT, current.deliveryId);
       if (receipt?.received) {
-        if (receipt.sessionId !== session.id || receipt.kind !== 'claude') {
-          const error = new Error('Continuation receipt does not belong to this Claude session'); error.status = 409; throw error;
+        if (receipt.sessionId !== session.id || receipt.kind !== session.kind) {
+          const error = new Error('Continuation receipt does not belong to this session and provider'); error.status = 409; throw error;
         }
         current.deliveredAt = Date.now();
-        commitTargetAuthority(session.id, target.id, current.id, root);
+        if (current.resumeSpec && deps.verifyTargetSpec) await deps.verifyTargetSpec(current, target);
+        commitTargetAuthorities(current, target, root);
         Object.assign(current, { status: 'done', phase: 'done', reason: '' }); writeOne(root, current);
         return { ok: true, ...safe(current) };
       }
@@ -225,15 +312,19 @@ async function run(body, deps = {}) {
         if (!current.sourceStopVerifiedAt) throw new Error('Source exit was not verified by the handoff transaction; recovery is blocked');
         if (current.phase !== 'delivering-continuation') {
           const record = await deps.waitForAccountRecord(session.id, pane.id, target.id, current.targetLaunchStartedAt);
-          if (!record) throw new Error('Target SessionStart identity was not verified');
+          if (!targetRecordMatches(record, current, target, pane)) throw new Error('Target SessionStart identity was not verified');
         }
+        if (current.resumeSpec && deps.verifyTargetSpec) await deps.verifyTargetSpec(current, target);
         Object.assign(current, { status: 'delivering', phase: 'delivering-continuation', deliveryId: current.deliveryId || crypto.randomUUID() });
         writeOne(root, current);
         if (current.deliveryStartedAt && !current.deliveredAt) throw new Error('Continuation delivery is unconfirmed; it will not be sent twice');
         current.deliveryStartedAt = Date.now(); writeOne(root, current);
-        if (!current.deliveredAt) await deps.continueSession(session.id, CONTINUATION_TEXT, { deliveryId: current.deliveryId });
+        if (!current.deliveredAt) await deps.continueSession(session.id, CONTINUATION_TEXT, {
+          deliveryId: current.deliveryId, agent, sourceAccountId: source.id, transactionId: current.id,
+          sourceStopVerifiedAt: current.sourceStopVerifiedAt, targetTranscript: current.targetTranscript,
+        });
         current.deliveredAt ||= Date.now();
-        commitTargetAuthority(session.id, target.id, current.id, root);
+        commitTargetAuthorities(current, target, root);
         Object.assign(current, { status: 'done', phase: 'done', reason: '' }); writeOne(root, current);
         return { ok: true, ...safe(current) };
       } catch (error) {
@@ -244,30 +335,40 @@ async function run(body, deps = {}) {
     if (current?.status === 'recovery-needed' && !pane.alive) {
       try {
         if (!current.sourceStopVerifiedAt) throw new Error('Source exit was not verified by the handoff transaction; recovery is blocked');
-        if (!await authPreflight(target, deps)) throw new Error('Target Claude account is not logged in');
-        const compatibility = (deps.compatible || require('./account-setup').compatible)(source, target, session.project || current.cwd || pane.cwd);
+        if (!await authPreflight(target, deps)) throw new Error(`Target ${agent} account is not logged in`);
+        const compatibility = providerCompatibility(agent, source, target, session.project || current.cwd || pane.cwd,
+          current.resumeSpec, deps);
         if (!compatibility.ok) throw new Error(`Target account setup is incompatible: ${compatibility.reasons.join('; ')}`);
         const targetWasStaged = ['starting-target', 'verifying-target', 'delivering-continuation'].includes(current.phase);
         if (!targetWasStaged) {
-          artifacts.preflight(session.id, source, target, { root, env });
+          if (agent === 'claude') providerArtifacts.preflight(session.id, source, target, { root, env });
           Object.assign(current, { status: 'copying', phase: 'copying-artifacts' }); writeOne(root, current);
-          artifacts.copyClaudeArtifacts(session.id, source, target, current.id, { root, env });
-          (deps.rebindLedger || artifacts.rebindLedger)(session.id, source, target, current.id,
+          const copiedPlan = copyProviderArtifacts(providerArtifacts, agent, session.id, source, target, current.id,
             { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt });
-          accounts.stageSession(session.id, target.id, current.id, { root, env });
+          if (agent === 'codex') verifyOwnedGraph(current, copiedPlan);
+          current.targetTranscript = copiedPlan.artifacts?.find((entry) => entry.sessionId === session.id)?.target;
+          writeOne(root, current);
+          (deps.rebindLedger || providerArtifacts.rebindLedger)(session.id, source, target, current.id,
+            { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt });
+          stageTargetAuthority(current, target, root, env);
         }
+        verifyFrozenResumeSpec(current, null, deps);
         Object.assign(current, { status: 'starting', phase: 'starting-target', targetLaunchStartedAt: Date.now() }); writeOne(root, current);
         const result = await deps.resumeExited(current, target, compatibility.mcpConfig);
         Object.assign(current, { status: 'verifying', phase: 'verifying-target', pid: result.pid }); writeOne(root, current);
         const record = await deps.waitForAccountRecord(session.id, pane.id, target.id, current.targetLaunchStartedAt);
-        if (!record) throw new Error('Target SessionStart identity was not verified');
+        if (!targetRecordMatches(record, current, target, pane)) throw new Error('Target SessionStart identity was not verified');
+        if (current.resumeSpec && deps.verifyTargetSpec) await deps.verifyTargetSpec(current, target);
         Object.assign(current, { status: 'delivering', phase: 'delivering-continuation', reason: '', result,
           deliveryId: current.deliveryId || crypto.randomUUID() }); writeOne(root, current);
         if (current.deliveryStartedAt && !current.deliveredAt) throw new Error('Continuation delivery is unconfirmed; it will not be sent twice');
         current.deliveryStartedAt = Date.now(); writeOne(root, current);
-        if (!current.deliveredAt) await deps.continueSession(session.id, CONTINUATION_TEXT, { deliveryId: current.deliveryId });
+        if (!current.deliveredAt) await deps.continueSession(session.id, CONTINUATION_TEXT, {
+          deliveryId: current.deliveryId, agent, sourceAccountId: source.id, transactionId: current.id,
+          sourceStopVerifiedAt: current.sourceStopVerifiedAt, targetTranscript: current.targetTranscript,
+        });
         current.deliveredAt ||= Date.now();
-        commitTargetAuthority(session.id, target.id, current.id, root);
+        commitTargetAuthorities(current, target, root);
         Object.assign(current, { status: 'done', phase: 'done' }); writeOne(root, current);
         return { ok: true, ...safe(current) };
       } catch (error) {
@@ -277,48 +378,66 @@ async function run(body, deps = {}) {
     }
     if (!pane.alive) { const error = new Error('Interrupted handoff requires explicit recovery'); error.status = 409; throw error; }
     let sourceMcpConfig = null;
-    if ((deps.readSetup || require('./account-setup').readSetup)(source)) {
+    if (agent === 'claude' && (deps.readSetup || require('./account-setup').readSetup)(source)) {
       try { sourceMcpConfig = (deps.ensureSharedMemory || require('./account-setup').ensureSharedMemory)(source, session.project || pane.cwd).mcpConfig; }
       catch (error) { const failure = new Error(`Source account setup is unavailable: ${error.message}`); failure.status = 409; throw failure; }
     }
-    if (permissionClass(inspected.processArgs, { mcpConfig: sourceMcpConfig }) == null) {
+    if (agent === 'claude' && permissionClass(inspected.processArgs, { mcpConfig: sourceMcpConfig }) == null) {
       const error = new Error('Session uses a custom permission configuration that cannot be reproduced safely'); error.status = 409; throw error;
     }
-    if (inspected.currentModel && !require('./keep.js').LAUNCH_MODEL_RE.test(inspected.currentModel)) {
+    if (agent === 'claude' && inspected.currentModel && !require('./keep.js').LAUNCH_MODEL_RE.test(inspected.currentModel)) {
       const error = new Error('Current Claude model cannot be reproduced safely'); error.status = 409; throw error;
     }
     if (!await authPreflight(target, deps)) {
       current ||= { id: crypto.randomUUID(), transactionId: null, sessionId: session.id, pane: pane.id,
-        sourceAccountId: source.id, targetAccountId: target.id };
+        agent, sourceAccountId: source.id, targetAccountId: target.id };
       current.transactionId ||= current.id;
-      Object.assign(current, { status: 'failed', phase: 'preflight', reason: 'Target Claude account is not logged in; source session was left running' });
+      Object.assign(current, { agent, status: 'failed', phase: 'preflight',
+        ...(sourceIdentity ? { sourceAgentPid: sourceIdentity.pid, sourceAgentPidStart: sourceIdentity.pidStart } : {}),
+        reason: `Target ${agent} account is not logged in; source session was left running` });
       writeOne(root, current);
       const error = new Error(current.reason); error.status = 409; error.extra = safe(current); throw error;
     }
-    const compatibility = (deps.compatible || require('./account-setup').compatible)(source, target, session.project || pane.cwd);
+    let artifactPlan;
+    try { artifactPlan = providerArtifacts.preflight(session.id, source, target, { root, env }); }
+    catch (error) { error.status = 409; throw error; }
+    const resumeSpec = resumeSpecFor(session.id, agent, artifactPlan, deps);
+    const compatibility = providerCompatibility(agent, source, target, session.project || pane.cwd, resumeSpec, deps);
     if (!compatibility.ok) {
       const error = new Error(`Target account setup is incompatible: ${compatibility.reasons.join('; ')}`); error.status = 409; throw error;
     }
-    try { artifacts.preflight(session.id, source, target, { root, env }); }
-    catch (error) { error.status = 409; throw error; }
     current ||= { id: crypto.randomUUID(), transactionId: null, sessionId: session.id, pane: pane.id,
-      sourceAccountId: source.id, targetAccountId: target.id };
+      agent, sourceAccountId: source.id, targetAccountId: target.id };
     current.transactionId ||= current.id;
-    accounts.pinSession(session.id, 'claude', source.id, { root, env });
+    current.agent = agent;
+    current.ownedSessionIds = agent === 'codex' ? artifactPlan.artifacts.map((entry) => entry.sessionId) : [session.id];
     Object.assign(current, { status: 'stopping', phase: 'stopping-source', reason: '', cwd: session.project || pane.cwd,
-      pid: pane.pid, cols: pane.cols, rows: pane.rows, model: inspected.currentModel || pane.meta?.model || '',
-      permissionClass: permissionClass(inspected.processArgs, { mcpConfig: sourceMcpConfig }) });
+      pid: pane.pid, cols: pane.cols, rows: pane.rows,
+      ...(sourceIdentity ? { sourceAgentPid: sourceIdentity.pid, sourceAgentPidStart: sourceIdentity.pidStart } : {}),
+      ...(resumeSpec ? {
+        sourceTranscript: artifactPlan.artifacts.find((entry) => entry.sessionId === session.id)?.source,
+        targetTranscript: artifactPlan.artifacts.find((entry) => entry.sessionId === session.id)?.target,
+      } : {}),
+      model: resumeSpec?.model || inspected.currentModel || pane.meta?.model || '',
+      ...(resumeSpec ? { resumeSpec } : {}),
+      ...(agent === 'claude' ? { permissionClass: permissionClass(inspected.processArgs, { mcpConfig: sourceMcpConfig }) } : {}) });
     writeOne(root, current);
+    pinSourceAuthority(current, source, root, env);
     let copied = false;
     const baseHost = deps.host;
     const wrappedHost = { request: async (type, params) => {
       if (type !== 'replace-exited') return baseHost.request(type, params);
       Object.assign(current, { status: 'copying', phase: 'copying-artifacts', sourceStopVerifiedAt: Date.now() }); writeOne(root, current);
-      artifacts.copyClaudeArtifacts(session.id, source, target, current.id, { root, env });
-      (deps.rebindLedger || artifacts.rebindLedger)(session.id, source, target, current.id,
+      const copiedPlan = copyProviderArtifacts(providerArtifacts, agent, session.id, source, target, current.id,
+        { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt });
+      if (agent === 'codex') verifyOwnedGraph(current, copiedPlan);
+      current.targetTranscript = copiedPlan.artifacts?.find((entry) => entry.sessionId === session.id)?.target;
+      writeOne(root, current);
+      verifyFrozenResumeSpec(current, artifactPlan, deps);
+      (deps.rebindLedger || providerArtifacts.rebindLedger)(session.id, source, target, current.id,
         { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt });
       copied = true;
-      accounts.stageSession(session.id, target.id, current.id, { root, env });
+      stageTargetAuthority(current, target, root, env);
       Object.assign(current, { status: 'starting', phase: 'starting-target', targetLaunchStartedAt: Date.now() }); writeOne(root, current);
       const result = await baseHost.request(type, { ...params, meta: { ...params.meta, handoffTransactionId: current.id } });
       if (result?.pane?.pid) { current.pid = result.pane.pid; writeOne(root, current); }
@@ -327,23 +446,27 @@ async function run(body, deps = {}) {
     try {
       const result = await deps.restartSession({ sessionId: session.id, pane: pane.id, pid: pane.pid, mode: 'now' }, {
         ...deps.restartDeps, root, env, host: wrappedHost, resumeAccount: target, resumeMcpConfig: compatibility.mcpConfig,
-        resumeModel: current.model, allowTerminalRateLimit: true,
+        resumeModel: current.model, resumeArgv: current.resumeSpec?.argv, allowTerminalRateLimit: true,
       });
       Object.assign(current, { status: 'verifying', phase: 'verifying-target', pid: result.pid }); writeOne(root, current);
       const record = await deps.waitForAccountRecord(session.id, pane.id, target.id, current.targetLaunchStartedAt);
-      if (!record || record.accountId !== target.id || record.pane !== pane.id || Number(record.startedAt) <= Number(current.targetLaunchStartedAt)) {
+      if (!targetRecordMatches(record, current, target, pane)) {
         throw new Error('Target SessionStart identity was not verified');
       }
+      if (current.resumeSpec && deps.verifyTargetSpec) await deps.verifyTargetSpec(current, target);
       Object.assign(current, { status: 'delivering', phase: 'delivering-continuation', reason: '', result,
         deliveryId: current.deliveryId || crypto.randomUUID() }); writeOne(root, current);
       current.deliveryStartedAt = Date.now(); writeOne(root, current);
-      await deps.continueSession(session.id, CONTINUATION_TEXT, { deliveryId: current.deliveryId });
+      await deps.continueSession(session.id, CONTINUATION_TEXT, {
+        deliveryId: current.deliveryId, agent, sourceAccountId: source.id, transactionId: current.id,
+        sourceStopVerifiedAt: current.sourceStopVerifiedAt, targetTranscript: current.targetTranscript,
+      });
       current.deliveredAt = Date.now();
-      commitTargetAuthority(session.id, target.id, current.id, root);
+      commitTargetAuthorities(current, target, root);
       Object.assign(current, { status: 'done', phase: 'done' }); writeOne(root, current);
       return { ok: true, ...safe(current) };
     } catch (error) {
-      if (!copied) accounts.clearStaged(session.id, current.id, { root });
+      if (!copied) clearStagedAuthorities(current, root);
       Object.assign(current, { status: 'recovery-needed', phase: current.phase || 'stopping-source', reason: error.message }); writeOne(root, current);
       error.status ||= 409; error.extra = safe(current); throw error;
     }
@@ -371,7 +494,8 @@ async function abandonForPortable(body, deps = {}) {
       const error = new Error('This account handoff cannot be safely replaced by a fresh continuation'); error.status = 409; throw error;
     }
     const authority = accounts.authority(root)[body.sessionId];
-    if (authority && (authority.agent !== 'claude' || authority.accountId !== current.sourceAccountId
+    const agent = current.agent || 'claude';
+    if (authority && (authority.agent !== agent || authority.accountId !== current.sourceAccountId
         || authority.stagedAccountId)) {
       const error = new Error('Source account authority changed after the account handoff'); error.status = 409; throw error;
     }
@@ -379,8 +503,11 @@ async function abandonForPortable(body, deps = {}) {
     const session = inspected?.session;
     const pane = inspected?.pane;
     const observedAccount = session?.accountId || pane?.meta?.accountId;
-    if (!session || session.id !== current.sessionId || session.kind !== 'claude'
+    const identity = inspected?.agentIdentity;
+    if (!session || session.id !== current.sessionId || session.kind !== agent
         || !pane || pane.id !== current.pane || pane.alive !== true
+        || pane.agentAlive === false || identity?.primary !== true
+        || identity.pid !== current.sourceAgentPid || identity.pidStart !== current.sourceAgentPidStart
         || pane.meta?.sessionId !== current.sessionId || observedAccount !== current.sourceAccountId
         || pane.meta?.accountId && pane.meta.accountId !== current.sourceAccountId
         || Number.isInteger(current.pid) && pane.pid !== current.pid) {
@@ -397,7 +524,7 @@ async function abandonForPortable(body, deps = {}) {
 function abandonedForPortable(root, sessionId) {
   const entry = readOne(root, sessionId);
   return entry?.status === 'failed' && entry.phase === 'portable-fallback' && entry.portableFallbackAt
-    ? safe(entry) : null;
+    ? { ...safe(entry), sourceAgentPid: entry.sourceAgentPid, sourceAgentPidStart: entry.sourceAgentPidStart } : null;
 }
 
 module.exports = { run, abandonForPortable, abandonedForPortable, list, safe, authPreflight, permissionClass,

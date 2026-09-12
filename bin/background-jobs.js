@@ -79,7 +79,7 @@ function sameFrozenFile(file, evidence) {
 // and the source process has exited. Ordinary sync never invokes this escape
 // hatch: unrelated path/inode changes remain permanent gaps.
 function rebindSource({ root, agent, sid, sourceFile, targetFile, transactionId, sourceStopVerifiedAt }) {
-  if (agent !== 'claude' || !ID.test(sid || '') || !ID.test(transactionId || '')
+  if (!['claude', 'codex'].includes(agent) || !ID.test(sid || '') || !ID.test(transactionId || '')
       || !Number.isFinite(sourceStopVerifiedAt) || sourceStopVerifiedAt <= 0
       || !path.isAbsolute(sourceFile || '') || !path.isAbsolute(targetFile || '')
       || path.resolve(sourceFile) === path.resolve(targetFile)) throw failure('invalid ledger rebind request');

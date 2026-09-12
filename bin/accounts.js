@@ -263,7 +263,7 @@ function publicState(env = process.env) {
     accounts: state.records.map((entry) => ({
       id: entry.id, label: entry.label, agent: entry.agent,
       isDefault: state.defaults[entry.agent] === entry.id,
-      handoffSupported: entry.agent === 'claude',
+      handoffSupported: ['claude', 'codex'].includes(entry.agent),
     })),
     defaults: { ...state.defaults },
     automationAccounts: { ...state.automationAccounts },

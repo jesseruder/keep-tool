@@ -220,6 +220,8 @@ function recordLaunch(transferId, launch, deps = {}) {
   }
   state = { ...state, destinationPane: launch.pane,
     ...(launch.sessionId ? { destinationSessionId: launch.sessionId } : {}),
+    ...(Number.isInteger(launch.pid) && launch.pid > 0 ? { destinationPanePid: launch.pid } : {}),
+    ...(launch.createdAt != null ? { destinationPaneCreatedAt: launch.createdAt } : {}),
     launchBoundAt: Date.now() };
   writeJson(transactionFile(root, transferId), state);
   return state;
@@ -292,6 +294,8 @@ function safeSummary(state) {
     artifactFile: state.artifactFile,
     ...(state.destinationSessionId ? { destinationSessionId: state.destinationSessionId } : {}),
     ...(state.destinationPane ? { destinationPane: state.destinationPane } : {}),
+    ...(state.sourceAgentPid ? { sourceAgentPid: state.sourceAgentPid } : {}),
+    ...(state.sourceAgentPidStart ? { sourceAgentPidStart: state.sourceAgentPidStart } : {}),
     ...(state.opening?.status ? { openingStatus: state.opening.status } : {}),
     ...(state.setupKind ? { setupKind: state.setupKind } : {}),
     ...(state.reason ? { reason: state.reason } : {}),
@@ -448,7 +452,12 @@ async function launchState(state, stateFile, deps) {
   if (!resumingSetup && !deps.open) throw problem('portable transfer launcher is unavailable', 'KEEP_PORTABLE_TRANSFER_UNAVAILABLE', 503);
   if (resumingSetup && !deps.resumeOpening) throw problem('portable transfer setup recovery is unavailable', 'KEEP_PORTABLE_TRANSFER_UNAVAILABLE', 503);
   if (state.policyVersion === DESKTOP_POLICY_VERSION) {
-    await inspectReady(state.sourceSessionId, deps, { launching: true, transferId: state.requestKey });
+    const inspection = await inspectReady(state.sourceSessionId, deps, { launching: true, transferId: state.requestKey });
+    if (state.sourceAgentPid && (!inspection.portableFallback
+        || inspection.portableFallback.sourceAgentPid !== state.sourceAgentPid
+        || inspection.portableFallback.sourceAgentPidStart !== state.sourceAgentPidStart)) {
+      throw problem('portable transfer source process changed after preview', 'KEEP_PORTABLE_TRANSFER_STALE', 409);
+    }
     const source = { ...(deps.sourceFor || defaultSource)(state.sourceSessionId, {
       root: deps.root, env: deps.env || process.env,
     }), id: state.sourceSessionId };
@@ -480,7 +489,8 @@ async function launchState(state, stateFile, deps) {
     opened = resumingSetup
       ? await deps.resumeOpening(state, message)
       : await deps.open({ taskId: state.cardId, fresh: true, agent: state.targetAgent,
-        accountId: state.targetAccountId, cwd: state.cwd, ...(state.model ? { model: state.model } : {}), message });
+        accountId: state.targetAccountId, cwd: state.cwd, portableSourceSessionId: state.sourceSessionId,
+        ...(state.model ? { model: state.model } : {}), message });
     if (!opened || !ID.test(opened.sessionId || '') || opened.sessionId === state.sourceSessionId
         || opened.accountId !== state.targetAccountId) throw problem('destination launch returned incomplete identity');
     const persisted = readJson(stateFile);
@@ -611,8 +621,9 @@ async function run(request, deps = {}) {
   if (!['claude', 'codex'].includes(source.agent) || !source.file) throw problem('source session metadata is incomplete');
   if (source.accountId && source.accountId === target.id) throw problem('source and destination accounts are the same');
   const desktop = request.contextText != null;
+  let inspection = null;
   if (desktop) {
-    await inspectReady(sessionId, deps, { preparing: true });
+    inspection = await inspectReady(sessionId, deps, { preparing: true });
     if (request.model != null && request.model !== ''
         && (typeof request.model !== 'string' || !require('./keep.js').LAUNCH_MODEL_RE.test(request.model))) {
       throw problem('model must be a model id like claude-fable-5-1 or gpt-5.6-sol');
@@ -678,6 +689,10 @@ async function run(request, deps = {}) {
         note: `Portable continuation from ${sessionId} to ${target.id}` });
       state = { version: 1, ...(desktop ? { policyVersion: DESKTOP_POLICY_VERSION } : {}), requestKey, status: 'prepared', sourceSessionId: sessionId, sourceAgent: source.agent,
         sourceAccountId: source.accountId || '', sourceTranscriptDigest: transcript.digest, targetAccountId: target.id,
+        ...(inspection?.portableFallback?.sourceAgentPid ? {
+          sourceAgentPid: inspection.portableFallback.sourceAgentPid,
+          sourceAgentPidStart: inspection.portableFallback.sourceAgentPidStart,
+        } : {}),
         targetAgent: target.agent, ...(desktop && request.model ? { model: request.model } : {}), cardId: task.id, cwd,
         ...(desktop ? { desktopInputs: { accountId: target.id, model: request.model || '', cwd,
           context: redact(context.text).trim() } } : {}),

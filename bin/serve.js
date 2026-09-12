@@ -2832,8 +2832,18 @@ async function restartSession(body, deps = {}) {
     const launchModel = typeof requestedResumeModel === 'string' && keep.LAUNCH_MODEL_RE.test(requestedResumeModel) ? requestedResumeModel : '';
     const modelArgs = launchModel ? (session.kind === 'codex' ? ['-m', launchModel] : ['--model', launchModel]) : [];
     const mcpArgs = session.kind === 'claude' && resumeMcpConfig ? ['--mcp-config', resumeMcpConfig] : [];
-    const argv = [session.kind, ...flags, ...reviewerSpec.flags, ...mcpArgs, ...modelArgs,
-      session.kind === 'codex' ? 'resume' : '--resume', session.id];
+    let argv;
+    if (deps.resumeArgv != null) {
+      if (session.kind !== 'codex' || !Array.isArray(deps.resumeArgv) || deps.resumeArgv.length < 3
+          || deps.resumeArgv.some((value) => typeof value !== 'string' || !value || /[\r\n\0]/.test(value))
+          || deps.resumeArgv[0] !== 'codex' || deps.resumeArgv.at(-2) !== 'resume' || deps.resumeArgv.at(-1) !== session.id) {
+        throw new InjectionError(409, 'Codex resume policy changed before restart');
+      }
+      argv = [...deps.resumeArgv];
+    } else {
+      argv = [session.kind, ...flags, ...reviewerSpec.flags, ...mcpArgs, ...modelArgs,
+        session.kind === 'codex' ? 'resume' : '--resume', session.id];
+    }
     const result = await host('replace-exited', { paneId: pane.id, expectedPid: pane.pid, sessionId: stopped.meta?.sessionId,
       cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`], cwd,
       ...(reviewerSpec.env ? { env: reviewerSpec.env } : {}),
@@ -3786,6 +3796,10 @@ async function openSession(body, deps = {}) {
       || !/^[a-f0-9]{64}$/.test(body.portableTransferId))) {
     throw new InjectionError(400, 'bad portable transfer id');
   }
+  if (body.portableTransferId != null && (typeof body.portableSourceSessionId !== 'string'
+      || !/^[A-Za-z0-9_-]+$/.test(body.portableSourceSessionId))) {
+    throw new InjectionError(400, 'bad portable source session id');
+  }
 
   let project;
   let session;
@@ -3914,7 +3928,9 @@ async function openSession(body, deps = {}) {
     const pane = spawned && spawned.pane && spawned.pane.id;
     if (!pane) throw new Error('terminal host did not return a pane');
     if (sessionId) accounts.pinSession(sessionId, agent, account.id, { root: deps.root || keep.ROOT, env: deps.env || process.env });
-    return { ok: true, created: 'pane', command, pane, sessionId, accountId: account.id, accountLabel: account.label };
+    return { ok: true, created: 'pane', command, pane, sessionId, accountId: account.id, accountLabel: account.label,
+      ...(Number.isInteger(spawned.pane.pid) ? { pid: spawned.pane.pid } : {}),
+      ...(spawned.pane.createdAt != null ? { createdAt: spawned.pane.createdAt } : {}) };
   };
 
   if (session) {
@@ -3979,11 +3995,23 @@ async function openSession(body, deps = {}) {
     await (deps.waitForHostAgent || waitForHostAgent)(target, agent, deps);
     launch.settled = true;
     if (message) {
-      if (deps.onOpeningReady && await deps.onOpeningReady(launch) === false) {
-        throw new InjectionError(409, 'opening-message reservation changed before instructions were sent');
+      if (body.portableTransferId) {
+        launch.sessionId ||= await (deps.waitForHostSessionId || waitForHostSessionId)(launch.pane, deps);
+        if (!launch.sessionId || launch.sessionId === body.portableSourceSessionId) {
+          throw new InjectionError(409, 'portable successor session identity was not verified before instructions were sent');
+        }
       }
       await withInjectionLockRetry(
-        () => (deps.typeOpeningMessage || typeOpeningMessage)(target, agent, message, deps), deps,
+        async () => {
+          if (body.portableTransferId) await assertPortablePaneBinding({
+            pane: launch.pane, transferId: body.portableTransferId, accountId: account.id,
+            cardId: body.taskId || null, sessionId: launch.sessionId, pid: launch.pid, createdAt: launch.createdAt,
+          }, deps);
+          if (deps.onOpeningReady && await deps.onOpeningReady(launch) === false) {
+            throw new InjectionError(409, 'opening-message reservation changed before instructions were sent');
+          }
+          return (deps.typeOpeningMessage || typeOpeningMessage)(target, agent, message, deps);
+        }, deps,
         { pane: target.pane, model: modelCommandText(message) },
       );
       launch.sent = true;
@@ -5160,7 +5188,8 @@ async function inspectAccountHandoff(body, deps = {}) {
   try {
     if (session?.kind === 'claude') currentModel = lastTurnUsage(readTranscriptTail(findSessionFile(session.id)), 'claude').model || '';
   } catch {}
-  return { session, pane, processArgs, currentModel };
+  return { session, pane, processArgs, currentModel,
+    agentIdentity: identity ? { pid: identity.pid, pidStart: identity.pidStart, primary: identity.primary === true } : null };
 }
 
 async function waitForAccountRecord(sessionId, pane, accountId, startedAfter, deps = {}) {
@@ -5185,12 +5214,45 @@ function accountClaudeSession(sessionId, account, file) {
   return claudeSessionFromInfo(sessionId, scanTranscript(file), stat, path.dirname(file), false, Date.now(), account.id);
 }
 
-function continueAccountHandoff(sessionId, pane, accountId, text, deliveryId, deps = {}) {
+function accountCodexSession(sessionId, accountId, file) {
+  const stat = fs.statSync(file);
+  const info = codex.scanRollout(file, { includeHeadless: true });
+  if (!info || info.id !== sessionId) throw new InjectionError(409, 'Target Codex rollout identity was not verified');
+  return { ...info, kind: 'codex', project: info.cwd, accountId, file, mtime: stat.mtimeMs, state: info.endedTurn ? 'waiting' : 'running' };
+}
+
+function continueAccountHandoff(sessionId, pane, accountId, text, deliveryId, options = {}, deps = {}) {
+  if (!options.agent && Object.keys(deps).length === 0
+      && ['root', 'env', 'host', 'deliveryDirectory'].some((key) => Object.hasOwn(options, key))) {
+    deps = options; options = {};
+  }
   const env = deps.env || process.env;
   const target = accounts.get(accountId, env);
-  if (!target || target.agent !== 'claude') throw new InjectionError(409, 'Target account changed before continuation delivery');
-  const file = accountClaudeTranscript(sessionId, target, env);
-  const loadTarget = () => accountClaudeSession(sessionId, target, file);
+  const agent = options.agent || 'claude';
+  if (!target || target.agent !== agent) throw new InjectionError(409, 'Target account changed before continuation delivery');
+  let file;
+  if (agent === 'codex') {
+    if (typeof options.targetTranscript !== 'string' || !path.isAbsolute(options.targetTranscript)
+        || options.targetTranscript.includes('\0')) {
+      throw new InjectionError(409, 'Target Codex rollout path is unavailable');
+    }
+    file = path.resolve(options.targetTranscript);
+    const profileRoot = path.resolve(target.configDir);
+    const relative = path.relative(profileRoot, file);
+    let profileStat, fileStat;
+    try { profileStat = fs.lstatSync(profileRoot); fileStat = fs.lstatSync(file); }
+    catch { throw new InjectionError(409, 'Target Codex rollout is unavailable'); }
+    let physicalRelative;
+    try { physicalRelative = path.relative(fs.realpathSync(profileRoot), fs.realpathSync(file)); }
+    catch { throw new InjectionError(409, 'Target Codex rollout is unavailable'); }
+    if (!profileStat.isDirectory() || profileStat.isSymbolicLink() || !fileStat.isFile() || fileStat.isSymbolicLink()
+        || relative.startsWith(`..${path.sep}`) || relative === '..' || path.isAbsolute(relative)
+        || physicalRelative.startsWith(`..${path.sep}`) || physicalRelative === '..' || path.isAbsolute(physicalRelative)) {
+      throw new InjectionError(409, 'Target Codex rollout path is outside its account');
+    }
+  } else file = accountClaudeTranscript(sessionId, target, env);
+  const loadTarget = () => agent === 'codex' ? accountCodexSession(sessionId, target.id, file)
+    : accountClaudeSession(sessionId, target, file);
   const exactDeps = {
     ...deps, loadCurrentSession: loadTarget, loadDeliverySession: loadTarget,
     transcriptFileForSession: () => file,
@@ -5205,19 +5267,30 @@ async function resumeExitedAccountHandoff(entry, account, mcpConfig, deps = {}) 
   const pane = (await host('get', { pane: entry.pane })).pane;
   if (pane.alive || pane.pid !== entry.pid) throw new InjectionError(409, 'Exited handoff pane changed before recovery');
   if ((await liveSessionPids(deps)).has(entry.sessionId)) throw new InjectionError(409, 'An agent process still owns this conversation');
-  const flags = entry.permissionClass === 'bypass' ? ['--dangerously-skip-permissions'] : [];
-  const modelArgs = entry.model && keep.LAUNCH_MODEL_RE.test(entry.model) ? ['--model', entry.model] : [];
-  const reviewerSpec = reviewerResumeSpec({ id: entry.sessionId }, pane, deps);
-  const argv = ['claude', ...flags, ...reviewerSpec.flags, ...(mcpConfig ? ['--mcp-config', mcpConfig] : []), ...modelArgs, '--resume', entry.sessionId];
+  const agent = entry.agent || 'claude';
+  let argv, reviewerSpec = { env: null };
+  if (agent === 'codex') {
+    argv = entry.resumeSpec?.argv;
+    if (!Array.isArray(argv) || argv.length < 3
+        || argv.some((value) => typeof value !== 'string' || !value || /[\r\n\0]/.test(value))
+        || argv[0] !== 'codex' || argv.at(-2) !== 'resume' || argv.at(-1) !== entry.sessionId) {
+      throw new InjectionError(409, 'Saved Codex resume policy is invalid');
+    }
+  } else {
+    const flags = entry.permissionClass === 'bypass' ? ['--dangerously-skip-permissions'] : [];
+    const modelArgs = entry.model && keep.LAUNCH_MODEL_RE.test(entry.model) ? ['--model', entry.model] : [];
+    reviewerSpec = reviewerResumeSpec({ id: entry.sessionId }, pane, deps);
+    argv = ['claude', ...flags, ...reviewerSpec.flags, ...(mcpConfig ? ['--mcp-config', mcpConfig] : []), ...modelArgs, '--resume', entry.sessionId];
+  }
   const result = await host('replace-exited', {
     paneId: pane.id, expectedPid: entry.pid, sessionId: pane.meta?.sessionId,
     cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`], cwd: entry.cwd,
     ...(reviewerSpec.env ? { env: reviewerSpec.env } : {}),
     cols: entry.cols, rows: entry.rows,
-    meta: { ...pane.meta, agent: 'claude', sessionId: entry.sessionId, accountId: account.id, accountLabel: account.label,
+    meta: { ...pane.meta, agent, sessionId: entry.sessionId, accountId: account.id, accountLabel: account.label,
       handoffTransactionId: entry.id, restartedAt: Date.now() },
   });
-  await waitForHostAgent({ pane: pane.id }, 'claude', deps);
+  await waitForHostAgent({ pane: pane.id }, agent, deps);
   return { ok: true, pane: result.pane.id, pid: result.pane.pid, sessionId: entry.sessionId };
 }
 
@@ -5234,8 +5307,14 @@ async function handoffSession(body, deps = {}) {
     resumeExited: deps.resumeExited || ((entry, account, mcpConfig) => resumeExitedAccountHandoff(entry, account, mcpConfig, deps)),
     waitForAccountRecord: deps.waitForAccountRecord || ((sid, pane, accountId, after) => waitForAccountRecord(sid, pane, accountId, after, deps)),
     continueSession: deps.continueSession || ((sessionId, text, options) => continueAccountHandoff(sessionId, body.pane, body.accountId,
-      text, options?.deliveryId, { ...deps, deliveryDirectory })),
+      text, options?.deliveryId, options, { ...deps, deliveryDirectory })),
     deliveryStatus: deps.deliveryStatus || ((_sessionId, text, deliveryId) => require('./delivery').statusForText(deliveryDirectory, text, deliveryId)),
+    verifyTargetSpec: deps.verifyTargetSpec || (async (entry, target) => {
+      if (!entry.resumeSpec) return true;
+      const verified = require('./codex-handoff-support').readResumeSpec(entry.targetTranscript, entry.sessionId);
+      if (verified.digest !== entry.resumeSpec.digest) throw new InjectionError(409, 'Target Codex resume policy differs from the stopped source');
+      return true;
+    }),
   });
 }
 
@@ -5266,13 +5345,32 @@ async function inspectPortableSource(sessionId, options = {}, deps = {}) {
     .find((entry) => entry.sessionId === sessionId && !['done', 'failed'].includes(entry.status));
   const abandoned = handoff.abandonedForPortable(root, sessionId);
   const abandonedPane = abandoned && (state.panes || []).find((entry) => entry.id === abandoned.pane);
+  let abandonedIdentity = null;
+  if (abandoned) {
+    try { abandonedIdentity = (await (deps.liveSessionPids || liveSessionPids)(deps)).get(sessionId) || null; } catch {}
+  }
   const portableFallback = abandoned && session?.accountId === abandoned.sourceAccountId
     && abandonedPane?.alive === true && abandonedPane.meta?.sessionId === sessionId
-    && abandonedPane.meta?.accountId === abandoned.sourceAccountId ? abandoned : null;
+    && abandonedPane.meta?.accountId === abandoned.sourceAccountId && abandonedPane.agentAlive !== false
+    && abandonedIdentity?.primary === true
+    && (!abandoned.sourceAgentPid || abandonedIdentity.pid === abandoned.sourceAgentPid)
+    && (!abandoned.sourceAgentPidStart || abandonedIdentity.pidStart === abandoned.sourceAgentPidStart) ? abandoned : null;
   if (abandoned && !portableFallback) nativeHandoff ||= abandoned;
   const portableHandoff = listPortableTransfers(deps).find((entry) => entry.sourceSessionId === sessionId
-    && entry.id !== options.transferId && ['launching', 'ambiguous', 'done'].includes(entry.status));
+    && entry.id !== options.transferId && ['launching', 'awaiting-setup', 'ambiguous', 'done'].includes(entry.status));
   return { session, nativeHandoff, portableHandoff, portableFallback, panes: state.panes || [], state };
+}
+
+async function assertPortablePaneBinding(expected, deps = {}) {
+  const pane = (await hostRequest('get', { pane: expected.pane }, deps))?.pane;
+  if (!pane || pane.alive !== true || pane.id !== expected.pane
+      || pane.meta?.portableTransferId !== expected.transferId || pane.meta?.accountId !== expected.accountId
+      || pane.meta?.card !== expected.cardId || pane.meta?.sessionId !== expected.sessionId
+      || expected.pid && pane.pid !== expected.pid
+      || expected.createdAt != null && pane.createdAt !== expected.createdAt) {
+    throw new InjectionError(409, 'portable successor pane identity changed before instructions were sent');
+  }
+  return pane;
 }
 
 async function recoverPortableOpening(state, message, hooks = {}, deps = {}) {
@@ -5291,18 +5389,25 @@ async function recoverPortableOpening(state, message, hooks = {}, deps = {}) {
   const target = { pane: pane.id };
   try {
     await (deps.waitForHostAgent || waitForHostAgent)(target, state.targetAgent, { ...deps, detectPortableSetup: true });
-    if (!hooks.onReady || await hooks.onReady(launch) !== true) {
-      throw new InjectionError(409, 'portable opening reservation changed before instructions were sent');
+    launch.sessionId ||= await (deps.waitForHostSessionId || waitForHostSessionId)(pane.id, deps);
+    if (!launch.sessionId || launch.sessionId === state.sourceSessionId) {
+      throw new InjectionError(409, 'portable successor session identity was not verified before instructions were sent');
     }
     await withInjectionLockRetry(
-      () => (deps.typeOpeningMessage || typeOpeningMessage)(target, state.targetAgent, message, deps), deps,
+      async () => {
+        await assertPortablePaneBinding({ pane: state.destinationPane, transferId: state.requestKey,
+          accountId: state.targetAccountId, cardId: state.cardId, sessionId: launch.sessionId,
+          pid: state.destinationPanePid, createdAt: state.destinationPaneCreatedAt }, deps);
+        if (!hooks.onReady || await hooks.onReady(launch) !== true) {
+          throw new InjectionError(409, 'portable opening reservation changed before instructions were sent');
+        }
+        return (deps.typeOpeningMessage || typeOpeningMessage)(target, state.targetAgent, message, deps);
+      }, deps,
       { pane: pane.id, model: modelCommandText(message) },
     );
     if (!hooks.onDelivered || await hooks.onDelivered(launch) !== true) {
       throw new InjectionError(409, 'portable opening reservation changed after instructions were sent');
     }
-    if (!launch.sessionId) launch.sessionId = await (deps.waitForHostSessionId || waitForHostSessionId)(pane.id, deps);
-    if (!launch.sessionId) throw new InjectionError(504, `${state.targetAgent} in pane ${pane.id} never registered its session id`);
     accounts.pinSession(launch.sessionId, state.targetAgent, state.targetAccountId,
       { root: deps.root || keep.ROOT, env: deps.env || process.env });
     try { (deps.linkLaunchedSession || keep.linkLaunchedSession)(state.cardId, { id: launch.sessionId, agent: state.targetAgent }); }
