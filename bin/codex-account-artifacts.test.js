@@ -210,6 +210,32 @@ test('managed provenance permits a frozen double hop while later target edits ar
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test('managed round trip accepts newly owned source children only when their target paths are empty', () => {
+  const f = fixture();
+  try {
+    artifacts.copyCodexArtifacts(f.sid, f.records.a, f.records.b, 'tx-before-child', options(f));
+    repointLedger(f, 'b');
+    const late = 'late-owned-child';
+    const lateFile = rollout(f.profiles.b, path.join('sessions', '2026', '09', '12',
+      `rollout-2026-09-12T00-00-00-${late}.jsonl`), late, f.sid);
+    writeLedger(f.root, f.sid, targetFor(f, 'b', f.rootFile), null,
+      { [f.child]: 'owned', [f.interacted]: 'interacted', [late]: 'owned' });
+    writeLedger(f.root, late, lateFile, f.sid, {});
+    const returning = { root: f.root, sourceStopVerifiedAt: 456, restartLedger };
+    const lateTarget = path.join(f.profiles.a, path.relative(f.profiles.b, lateFile));
+
+    fs.mkdirSync(path.dirname(lateTarget), { recursive: true });
+    fs.writeFileSync(lateTarget, fs.readFileSync(lateFile, 'utf8').replace('tool output', 'foreign output'));
+    assert.throws(() => artifacts.preflight(f.sid, f.records.b, f.records.a, returning), /unrecognized changes/);
+    fs.rmSync(lateTarget);
+
+    assert.equal(artifacts.preflight(f.sid, f.records.b, f.records.a, returning).disposition, 'managed');
+    const copied = artifacts.copyCodexArtifacts(f.sid, f.records.b, f.records.a, 'tx-after-child', returning);
+    assert.deepEqual(copied.copied, [lateTarget]);
+    assert.deepEqual(fs.readFileSync(lateTarget), fs.readFileSync(lateFile));
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test('missing, ambiguous, and ledger-omitted owned children fail closed', () => {
   const missing = fixture();
   try {

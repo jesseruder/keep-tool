@@ -367,12 +367,30 @@ function currentTargetRecords(plan) {
   return plan.artifacts.map((artifact) => ({ ...manifestRecord(artifact),
     manifest: fs.existsSync(artifact.target) ? fileManifest(artifact.target) : null }));
 }
+function matchesManagedTarget(current, prior) {
+  if (!Array.isArray(prior) || prior.length === 0) return false;
+  const currentById = new Map(current.map((record) => [record.id, record]));
+  const priorById = new Map(prior.map((record) => [record.id, record]));
+  if (currentById.size !== current.length || priorById.size !== prior.length) return false;
+  // A verified source graph may gain owned children after an earlier hop. The
+  // files already recorded for this target must still match byte-for-byte and
+  // keep the same paths and parents; every newly owned file must be absent.
+  for (const record of prior) {
+    const live = currentById.get(record.id);
+    if (!live || live.parent !== record.parent || live.relative !== record.relative
+        || !sameManifest(live.manifest, record.manifest)) return false;
+  }
+  for (const record of current) {
+    if (!priorById.has(record.id) && record.manifest !== null) return false;
+  }
+  return true;
+}
 function targetDisposition(plan) {
   const current = currentTargetRecords(plan);
   const present = current.some((entry) => entry.manifest);
   const provenanceRecord = readProvenance(plan, plan.target);
   if (!present && !provenanceRecord) return 'empty';
-  if (provenanceRecord && sameRecords(current, provenanceRecord.artifacts)) return 'managed';
+  if (provenanceRecord && matchesManagedTarget(current, provenanceRecord.artifacts)) return 'managed';
   throw failure(`target Codex rollouts for ${plan.sessionId} in ${plan.target.id} have unrecognized changes`);
 }
 
