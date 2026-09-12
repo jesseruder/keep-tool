@@ -99,6 +99,48 @@ test('duplicate startup prompts before the first final do not reuse prior comple
   assert.equal(state.restart.finalTextBlocked, true);
 });
 
+test('exact Claude interruption evidence completes only the interrupted foreground turn', () => fixture(({ append, verify }) => {
+  const interrupted = (text = '[Request interrupted by user]', extra = {}) => ({
+    type: 'user', sessionId: 'parent', interruptedMessageId: 'message-one',
+    message: { content: [{ type: 'text', text }] }, ...extra,
+  });
+  append('parent', { type: 'user', sessionId: 'parent', message: { content: 'Start work' } });
+  append('parent', { type: 'assistant', sessionId: 'parent', message: { content: [{ type: 'text', text: 'Working' }], stop_reason: null } });
+  append('parent', interrupted());
+  verify()();
+
+  append('parent', { type: 'user', sessionId: 'parent', message: { content: 'Do something else' } });
+  assert.throws(verify, /not verifiably complete/, 'later human activity starts a new turn');
+  append('parent', interrupted('[Request interrupted by user for tool use]'));
+  verify()();
+  append('parent', { type: 'assistant', sessionId: 'parent', message: { content: [{ type: 'text', text: 'Continuing' }], stop_reason: null } });
+  assert.throws(verify, /not verifiably complete/, 'later assistant activity supersedes the interruption');
+}, 'claude'));
+
+test('inexact Claude interruption text and pending tools remain protected', () => {
+  const { consume } = require('./restart-evidence');
+  const exact = { type: 'user', interruptedMessageId: 'message-one', message: { content: [
+    { type: 'text', text: '[Request interrupted by user]' },
+  ] } };
+  for (const row of [
+    { ...exact, interruptedMessageId: undefined },
+    { ...exact, message: { content: [{ type: 'text', text: 'quoted: [Request interrupted by user]' }] } },
+    { ...exact, message: { content: [{ type: 'text', text: '[Request interrupted by user] trailing' }] } },
+    { ...exact, message: { content: [...exact.message.content, { type: 'text', text: 'extra' }] } },
+  ]) {
+    const state = {};
+    consume(state, row, 'claude');
+    assert.equal(state.restart.completed, false);
+  }
+
+  const state = {};
+  consume(state, { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'busy', name: 'Bash', input: {} }], stop_reason: 'tool_use' } }, 'claude');
+  state.calls = { 'call:busy': { name: 'Bash' } };
+  consume(state, exact, 'claude');
+  assert.equal(state.restart.completed, true);
+  assert.ok(state.calls['call:busy'], 'interruption evidence does not resolve a pending tool call');
+});
+
 test('yielded jobs survive restart and an unrelated completion cannot clear them', () => fixture(({ append, verify }) => {
   append('parent', meta('parent'));
   const call = (id, name, input) => append('parent', row('response_item', { type: 'function_call', call_id: id, name, arguments: JSON.stringify(input) }));
@@ -180,6 +222,21 @@ test('migration retains hook-only children and source replacement evidence', () 
   fs.writeFileSync(file('parent'), JSON.stringify(meta('parent')) + '\n' + JSON.stringify(done()) + '\n');
   assert.throws(verify, /incomplete/);
 }));
+
+test('Claude evidence migration keeps a pruned child ownership edge fail closed', () => fixture(({ root, file, append, verify }) => {
+  append('parent', { sessionId: 'parent', type: 'assistant', message: { content: [], stop_reason: 'end_turn' } });
+  verify()();
+  append('child', { sessionId: 'parent', type: 'user', message: { content: 'Still working' } });
+  const snapshot = path.join(root, '.keep/background-jobs/claude/parent/state.json');
+  const state = JSON.parse(fs.readFileSync(snapshot));
+  state.restartVersion = 1;
+  state.restart.children['child'] = 'owned';
+  assert.equal(Object.values(state.jobs).some(job => job.id === 'child'), false, 'the child tombstone is absent');
+  fs.writeFileSync(snapshot, JSON.stringify(state));
+  assert.throws(verify, /not verifiably complete/);
+  const migrated = JSON.parse(fs.readFileSync(snapshot));
+  assert.equal(migrated.restart.children.child, 'owned');
+}, 'claude'));
 
 test('partial writes recover, replacement fails closed, large records have a separate bound', () => fixture(({ file, append, verify }) => {
   append('parent', meta('parent')); append('parent', done()); verify()();

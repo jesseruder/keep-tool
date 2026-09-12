@@ -2,8 +2,10 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const restartEvidence = require('./restart-evidence');
 const ID = /^[a-zA-Z0-9_-]{1,160}$/;
 const TERMINAL = new Set(['completed', 'failed', 'cancelled']);
+const restartVersion = agent => agent === 'claude' ? 2 : 1;
 const hash = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const text = (v) => typeof v === 'string' ? v : Array.isArray(v) ? v.filter(x => ['text', 'input_text', 'output_text'].includes(x?.type)).map(x => x.text || '').join('\n') : '';
 
@@ -97,7 +99,7 @@ function rebindSource({ root, agent, sid, sourceFile, targetFile, transactionId,
   if (!locked) throw failure('job ledger is busy during account handoff', 'KEEP_LEDGER_BUSY');
   try {
     const state = JSON.parse(fs.readFileSync(snapshot, 'utf8'));
-    if (state.version !== 1 || state.restartVersion !== 1 || !state.jobs || !state.calls || !state.restart
+    if (state.version !== 1 || state.restartVersion !== restartVersion(agent) || !state.jobs || !state.calls || !state.restart
         || state.gap || state.recovering) throw failure('job ledger evidence is incomplete');
     let entries = [];
     try { entries = fs.readdirSync(path.join(ledgerDir, 'inbox')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -151,21 +153,42 @@ function recordHook(root, agent, sid, event) {
 }
 
 function clearReplayObligation(state, id, run) {
-  if (!run) return;
+  if (!run) return false;
   const retired = `superseded_${hash(`${id}:${run}`).slice(0, 24)}`;
+  let cleared = false;
   for (const [key, job] of Object.entries(state.jobs)) {
-    if (key.startsWith('replay:') && job.run === run && (job.id === id || job.id === retired)) delete state.jobs[key];
+    if ((key.startsWith('replay:') || key === `job:${retired}`)
+        && job.run === run && (job.id === id || job.id === retired)) {
+      delete state.jobs[key]; cleared = true;
+    }
   }
+  return cleared;
 }
 
 function update(state, id, kind, status, at, evidence, instance, run = '') {
   if (!ID.test(String(id || ''))) return;
   const key = `job:${id}`, old = state.jobs[key];
   if (!old && Object.keys(state.jobs).length >= 2500) { state.gap = true; return; }
-  if (old && at < old.eventAt) return;
-  if (TERMINAL.has(status) && old?.run) clearReplayObligation(state, id, old.run);
+  const clearedRetained = TERMINAL.has(status) && run && clearReplayObligation(state, id, run);
+  if (old && TERMINAL.has(status) && run && old.run && run !== old.run && clearedRetained) return;
+  const placeholderRun = old?.evidence === 'hook' && old.run?.startsWith('hook:');
+  const correlatedUnlaunched = run && state.calls[`call:${run}`];
+  if (old && TERMINAL.has(status) && run && old.run && run !== old.run && !placeholderRun && !correlatedUnlaunched) return;
+  const correlatedLateCompletion = old && TERMINAL.has(status) && run && (old.run === run || placeholderRun || correlatedUnlaunched);
+  if (old && at < old.eventAt && !correlatedLateCompletion) return;
+  if (TERMINAL.has(status) && !run && old?.run) clearReplayObligation(state, id, old.run);
+  if (old && TERMINAL.has(status) && run && old.run && run !== old.run && !placeholderRun && !TERMINAL.has(old.status)) {
+    // A completion correlated to a reused ID's new launch cannot retire the
+    // unresolved earlier run. Keep the old obligation until its own evidence arrives.
+    const retired = `superseded_${hash(`${id}:${old.run}`).slice(0, 24)}`;
+    state.jobs[`job:${retired}`] = { ...old, id: retired, kind: 'unknown', evidence: 'superseded-unverified' };
+  }
   // Replaying the same launch cannot revive its completed run.
-  if (old && status === 'pending' && old.run === run && run) return;
+  if (old && status === 'pending' && old.run === run && run) {
+    if (old.kind === 'unknown' && kind) old.kind = kind;
+    if (kind === 'agent' && state.restart) state.restart.children[id] = 'owned';
+    return;
+  }
   if (old && status === 'pending' && at <= old.eventAt && TERMINAL.has(old.status)) return;
   const owner = instance && typeof instance === 'object' ? (instance.since && at >= instance.since ? instance.id : null) : instance;
   if (old && status === 'pending' && run && old.run && run !== old.run && (!owner || old.instance !== owner) && !TERMINAL.has(old.status) && kind !== 'agent') {
@@ -176,7 +199,8 @@ function update(state, id, kind, status, at, evidence, instance, run = '') {
   }
   state.jobs[key] = { id: String(id), kind: kind || old?.kind || 'unknown', status,
     startedAt: status === 'pending' && (!old || old.run !== run) ? at : old?.startedAt ?? at,
-    eventAt: at, evidence, instance: status === 'pending' && run !== old?.run ? owner || null : old?.instance || owner || null, run: run || old?.run || '' };
+    eventAt: Math.max(at, old?.eventAt || 0), evidence,
+    instance: status === 'pending' && run !== old?.run ? owner || null : old?.instance || owner || null, run: run || old?.run || '' };
   for (const [retainedKey, retained] of Object.entries(state.jobs)) {
     if (retainedKey.startsWith('replay:') && retained.run && retained.run === state.jobs[`job:${retained.id}`]?.run) delete state.jobs[retainedKey];
   }
@@ -185,17 +209,17 @@ function update(state, id, kind, status, at, evidence, instance, run = '') {
 
 function consume(state, row, agent, classify, instance) {
   if (!row || row.isSidechain) return;
-  require('./restart-evidence').consume(state, row, agent);
+  restartEvidence.consume(state, row, agent);
   const at = Date.parse(row.timestamp || '') || 0;
   const content = row.message?.content;
-  const userTurn = agent === 'claude' ? row.type === 'user' && !row.isCompactSummary
+  const userTurn = agent === 'claude' ? row.type === 'user' && !row.isCompactSummary && !restartEvidence.isClaudeInterruption(row)
     && text(content) && !/^<(system-reminder|command-|local-command|task-notification|bash-)/.test(text(content))
     && (typeof content === 'string' || (Array.isArray(content) && content.some(b => b.type === 'text') && !content.some(b => b.type === 'tool_result')))
     : (row.type === 'event_msg' && ['task_started', 'user_message'].includes(row.payload?.type))
       || (row.type === 'response_item' && row.payload?.type === 'message' && row.payload.role === 'user');
   if (userTurn) state.turnStartedAt = Math.max(state.turnStartedAt || 0, at);
   const start = (id, kind, run) => update(state, id, kind, 'pending', at, 'transcript', instance, run);
-  const finish = (id, status = 'completed') => update(state, id, null, status, at, 'transcript', instance);
+  const finish = (id, status = 'completed', run = '') => update(state, id, null, status, at, 'transcript', instance, run);
   const remember = (id, name, input) => {
     if (!ID.test(id || '')) return;
     // Only classification and target IDs survive; never persist arguments.
@@ -209,6 +233,7 @@ function consume(state, row, agent, classify, instance) {
       : row.type === 'user' ? text(row.message?.content) : '';
     if (typeof notification === 'string' && notification.trimStart().startsWith('<task-notification>')) {
       const id = notification.match(/<task-id>([\w-]+)<\/task-id>/)?.[1];
+      const run = notification.match(/<tool-use-id>([\w-]+)<\/tool-use-id>/)?.[1];
       const status = notification.match(/<status>(completed|failed|killed|stopped|cancelled)<\/status>/)?.[1];
       const legacy = !/<status>|<event>|<summary>Monitor event:/.test(notification);
       const timedOut = /\[Monitor timed out — re-arm if needed\.\]/.test(notification);
@@ -216,7 +241,7 @@ function consume(state, row, agent, classify, instance) {
       if (id && !state.notices[key] && (status || legacy || timedOut)
           && (row.type !== 'queue-operation' || !row.operation || row.operation === 'enqueue')) {
         state.notices[key] = at;
-        finish(id, status === 'failed' ? 'failed' : ['killed', 'stopped', 'cancelled'].includes(status) ? 'cancelled' : 'completed');
+        finish(id, status === 'failed' ? 'failed' : ['killed', 'stopped', 'cancelled'].includes(status) ? 'cancelled' : 'completed', run);
       }
     }
     for (const item of Array.isArray(row.message?.content) ? row.message.content : []) {
@@ -377,7 +402,7 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
     }
     // One cold replay when the evidence contract changes. Do not mix old
     // tombstones/notice deduplication with the new reducer's recovery cursor.
-    if (state.restartVersion !== 1) {
+    if (state.restartVersion !== restartVersion(agent)) {
       let migrationGap = state.gap;
       if (state.checkpoint) {
         let fd;
@@ -392,9 +417,14 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
       }
       const retained = Object.fromEntries(Object.entries(state.jobs).filter(([, j]) => migrationGap || !TERMINAL.has(j.status) || j.kind === 'agent'));
       if (!state.source?.instance?.processScoped) for (const j of Object.values(retained)) j.instance = null;
-      state = { version: 1, restartVersion: 1, jobs: retained, calls: {}, notices: {}, checkpoint: null, gap: migrationGap,
-        restart: { completed: false, children: Object.fromEntries(Object.values(retained).filter(j => j.kind === 'agent').map(j => [j.id, 'owned'])), launches: {}, mapped: {} },
-        cronVersion: 1, turnVersion: 1, pollVersion: agent === 'codex' ? 2 : undefined, childStopVersion: 3 };
+      const priorRestart = state.restart || {};
+      state = { version: 1, restartVersion: restartVersion(agent), jobs: retained, calls: {}, notices: {}, checkpoint: null, gap: migrationGap,
+        restart: { completed: false,
+          children: { ...(priorRestart.children || {}), ...Object.fromEntries(Object.values(retained).filter(j => j.kind === 'agent').map(j => [j.id, 'owned'])) },
+          launches: { ...(priorRestart.launches || {}) }, mapped: { ...(priorRestart.mapped || {}) } },
+        cronVersion: 1, turnVersion: 1, pollVersion: agent === 'codex' ? 2 : undefined, childStopVersion: 3,
+        source: state.source, processEpoch: state.processEpoch, hookBarrier: state.hookBarrier,
+        hookGeneration: state.hookGeneration, freshStartup: state.freshStartup, handoffRebind: state.handoffRebind };
     }
     // New Claude adapter evidence needs one replay; preserve existing job history.
     if (agent === 'claude' && (state.cronVersion !== 1 || state.turnVersion !== 1)) {
@@ -564,4 +594,4 @@ function nextTarget(targets, cursor) {
   return targets[Math.floor(cursor / 4) % targets.length];
 }
 
-module.exports = { processInstance, sync, read, targets, recordHook, consume, nextTarget, rebindSource };
+module.exports = { restartVersion, processInstance, sync, read, targets, recordHook, consume, nextTarget, rebindSource };

@@ -3,6 +3,16 @@
 // tool arguments. UI readiness is deliberately not a source of completion proof.
 const ID = /^[a-z0-9_-]{1,160}$/i;
 const CHILD_CALL = /(?:^|[._])(?:spawn_agent|spawn_agents|followup_task|send_input)$/;
+const CLAUDE_INTERRUPTION_MESSAGES = new Set([
+  '[Request interrupted by user]',
+  '[Request interrupted by user for tool use]',
+]);
+function isClaudeInterruption(row) {
+  const content = row?.message?.content;
+  return row?.type === 'user' && typeof row.interruptedMessageId === 'string' && row.interruptedMessageId.length > 0
+    && Array.isArray(content) && content.length === 1 && content[0]?.type === 'text'
+    && CLAUDE_INTERRUPTION_MESSAGES.has(content[0].text);
+}
 function consume(state, row, agent) {
   const s = state.restart ||= { completed: false, children: {}, launches: {}, mapped: {} };
   const at = Date.parse(row.timestamp || '') || 0;
@@ -16,6 +26,7 @@ function consume(state, row, agent) {
     if (row.type === 'user') s.finalTextAt = 0;
     if (row.type === 'user' && !row.isCompactSummary) {
       s.rateLimitTerminal = false;
+      if (isClaudeInterruption(row)) { s.completed = true; return; }
       const t = typeof content === 'string' ? content : '';
       if (!/^<(?:system-reminder|task-notification|command-|local-command|bash-)/.test(t)) s.completed = false;
       const human = typeof content === 'string' ? t && !t.startsWith('<')
@@ -79,4 +90,4 @@ function consume(state, row, agent) {
   if (item?.type === 'CollabAgentToolCall' && /spawn|send/i.test(item.tool || '')) state.gap = true;
   if (Object.keys(s.children).length > 128 || Object.keys(s.launches).length > 10000 || Object.keys(s.mapped).length > 10000) state.gap = true;
 }
-module.exports = { consume };
+module.exports = { consume, isClaudeInterruption };

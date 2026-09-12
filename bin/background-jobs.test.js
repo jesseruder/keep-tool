@@ -28,6 +28,94 @@ const launch = (append, id = 'j', call = 'call') => {
 };
 const done = (append, id = 'j', status = 'completed') => append({ type: 'user', message: { content: `<task-notification><task-id>${id}</task-id><status>${status}</status></task-notification>` } });
 
+test('Claude task completion stays bound to its launch across asynchronous timestamp order', () => fixture(({ append, sync }) => {
+  const toolUse = { type: 'assistant', timestamp: '2026-09-11T01:54:55.613Z', message: { content: [
+    { type: 'tool_use', id: 'run-one', name: 'Bash', input: { command: 'SECRET', run_in_background: true } },
+  ] } };
+  const launched = { type: 'user', timestamp: '2026-09-11T01:54:55.789Z', message: { content: [
+    { type: 'tool_result', tool_use_id: 'run-one', content: 'Command running in background with ID: task-one.' },
+  ] } };
+  const completed = '<task-notification><task-id>task-one</task-id><tool-use-id>run-one</tool-use-id><status>completed</status></task-notification>';
+
+  append(toolUse);
+  append({ type: 'queue-operation', operation: 'enqueue', timestamp: '2026-09-11T01:54:55.738Z', content: completed });
+  append(launched);
+  append({ type: 'attachment', timestamp: '2026-09-11T01:54:55.738Z', attachment: { type: 'queued_command', prompt: completed } });
+  let result = sync();
+  assert.equal(result.jobs.find(job => job.id === 'task-one').status, 'completed', 'early notification prevents its delayed launch result from reviving work');
+
+  append({ type: 'assistant', message: { content: [
+    { type: 'tool_use', id: 'run-two', name: 'Bash', input: { command: 'SECRET', run_in_background: true } },
+  ] } });
+  append({ type: 'user', message: { content: [
+    { type: 'tool_result', tool_use_id: 'run-two', content: 'Command running in background with ID: task-two.' },
+  ] } });
+  append({ type: 'attachment', timestamp: '2026-09-11T01:54:55.738Z', attachment: { type: 'queued_command', prompt:
+    '<task-notification><task-id>task-two</task-id><tool-use-id>run-two</tool-use-id><status>completed</status></task-notification>' } });
+  result = sync();
+  assert.equal(result.jobs.find(job => job.id === 'task-two').status, 'completed', 'a physically later matching notification wins despite its older producer timestamp');
+}));
+
+test('a completion for a reused task ID preserves an unresolved different launch', () => fixture(({ append, sync }) => {
+  launch(append, 'reused', 'old-run'); sync();
+  append({ type: 'assistant', message: { content: [
+    { type: 'tool_use', id: 'new-run', name: 'Bash', input: { command: 'SECRET', run_in_background: true } },
+  ] } });
+  append({ type: 'user', message: { content:
+    '<task-notification><task-id>reused</task-id><tool-use-id>new-run</tool-use-id><status>completed</status></task-notification>' } });
+  const result = sync();
+  assert.equal(result.jobs.find(job => job.id === 'reused').status, 'completed');
+  assert.ok(result.jobs.some(job => job.id.startsWith('superseded_') && job.run === 'old-run' && job.status === 'pending'));
+  append({ type: 'user', message: { content: [
+    { type: 'tool_result', tool_use_id: 'new-run', content: 'Command running in background with ID: reused.' },
+  ] } });
+  append({ type: 'user', message: { content:
+    '<task-notification><task-id>reused</task-id><tool-use-id>old-run</tool-use-id><status>completed</status></task-notification>' } });
+  const settled = sync();
+  assert.equal(settled.pending, false);
+  assert.equal(settled.jobs.some(job => job.id.startsWith('superseded_')), false, 'the old run resolves only its retained obligation');
+}));
+
+test('a late old-run completion clears its superseded obligation without completing the current run', () => fixture(({ append, sync }) => {
+  const first = { id: 'pane:10:11', processScoped: true, live: true };
+  const second = { id: 'pane:10:12', processScoped: true, live: true };
+  sync({ instance: first });
+  launch(append, 'reused', 'old-run'); sync({ instance: first });
+  sync({ instance: second });
+  launch(append, 'reused', 'new-run'); sync({ instance: second });
+  append({ type: 'user', message: { content:
+    '<task-notification><task-id>reused</task-id><tool-use-id>old-run</tool-use-id><status>completed</status></task-notification>' } });
+  let result = sync({ instance: second });
+  assert.equal(result.jobs.find(job => job.id === 'reused').run, 'new-run');
+  assert.equal(result.jobs.find(job => job.id === 'reused').status, 'pending');
+  assert.equal(result.jobs.some(job => job.id.startsWith('superseded_')), false);
+  append({ type: 'user', message: { content:
+    '<task-notification><task-id>reused</task-id><tool-use-id>new-run</tool-use-id><status>completed</status></task-notification>' } });
+  result = sync({ instance: second });
+  assert.equal(result.pending, false);
+}));
+
+test('hook-first Agent completion retains child ownership without inventing a superseded run', () => fixture(({ root, append, sync }) => {
+  jobs.recordHook(root, 'claude', 'parent', { event: 'SubagentStart', entity: 'child-one', at: 200000, offset: 0 });
+  sync();
+  append({ type: 'assistant', timestamp: new Date(199000).toISOString(), message: { content: [
+    { type: 'tool_use', id: 'agent-run', name: 'Agent', input: { prompt: 'SECRET', run_in_background: true } },
+  ] } });
+  append({ type: 'queue-operation', operation: 'enqueue', timestamp: new Date(199500).toISOString(), content:
+    '<task-notification><task-id>child-one</task-id><tool-use-id>agent-run</tool-use-id><status>completed</status></task-notification>' });
+  append({ type: 'user', timestamp: new Date(201000).toISOString(), message: { content: [
+    { type: 'tool_result', tool_use_id: 'agent-run', content: 'Async agent launched successfully. agentId: child-one' },
+  ] } });
+  const result = sync();
+  const state = JSON.parse(fs.readFileSync(path.join(root, '.keep/background-jobs/claude/parent/state.json')));
+  assert.equal(result.pending, false);
+  assert.equal(result.jobs.length, 1);
+  assert.equal(result.jobs[0].kind, 'agent');
+  assert.equal(result.jobs[0].status, 'completed');
+  assert.equal(result.jobs.some(job => job.id.startsWith('superseded_')), false);
+  assert.equal(state.restart.children['child-one'], 'owned');
+}));
+
 test('child evidence migration rebuilds temporal state while preserving graph obligations', () => fixture(({ root, append, sync }) => {
   const timestamp = '2026-09-09T12:00:00.000Z';
   append({ type: 'user', timestamp, message: { content: 'Review' } });
@@ -81,6 +169,36 @@ test('existing Claude ledgers replay once to recover a turn outside the tail', (
   assert.ok(sync().bytesRead > 0);
   assert.equal(jobs.read(root, 'claude', 'parent').turnStartedAt, start);
   assert.equal(sync().bytesRead, 0);
+}));
+
+test('restart evidence upgrade replays history without clearing an inherited gap', () => fixture(({ root, append, sync }) => {
+  append({ sessionId: 'parent', type: 'assistant', message: { content: [], stop_reason: 'end_turn' } });
+  sync();
+  const snapshot = path.join(root, '.keep/background-jobs/claude/parent/state.json');
+  const old = JSON.parse(fs.readFileSync(snapshot));
+  old.restartVersion = 1;
+  old.gap = true;
+  old.hookBarrier = 0;
+  old.hookGeneration = 7;
+  old.processEpoch = { id: 'pane:old', from: 0, identity: 'old' };
+  old.restart.children['hook-only-child'] = 'owned';
+  old.restart.launches['unmapped-launch'] = true;
+  old.restart.mapped['mapped-launch'] = 'hook-only-child';
+  fs.writeFileSync(snapshot, JSON.stringify(old));
+  const result = sync();
+  const current = JSON.parse(fs.readFileSync(snapshot));
+  assert.equal(current.restartVersion, jobs.restartVersion('claude'));
+  assert.equal(result.recovering, false);
+  assert.equal(result.gap, true);
+  assert.equal(current.restart.completed, true, 'the replay still refreshes reducer evidence');
+  assert.equal(current.hookBarrier, 0);
+  assert.equal(current.hookGeneration, 7);
+  assert.deepEqual(current.processEpoch, old.processEpoch);
+  assert.equal(current.restart.children['hook-only-child'], 'owned');
+  assert.equal(current.restart.launches['unmapped-launch'], true);
+  assert.equal(current.restart.mapped['mapped-launch'], 'hook-only-child');
+  assert.throws(() => require('./restart-ledger').verify({ root, agent: 'claude', sid: 'parent', file: path.join(root, 'session.jsonl'),
+    instance: { id: 'pane:1:2', since: 1, live: true } }), /incomplete/);
 }));
 
 test('turn migration replays completion notices for pruned historical jobs', () => fixture(({ root, append, sync }) => {

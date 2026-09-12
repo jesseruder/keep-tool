@@ -451,17 +451,7 @@ function rateLimitInfo(j, text) {
   };
 }
 
-const CLAUDE_INTERRUPTION_MESSAGES = new Set([
-  '[Request interrupted by user]',
-  '[Request interrupted by user for tool use]',
-]);
-
-function isClaudeInterruption(j) {
-  const content = j?.message?.content;
-  return j?.type === 'user' && typeof j.interruptedMessageId === 'string' && j.interruptedMessageId.length > 0
-    && Array.isArray(content) && content.length === 1 && content[0]?.type === 'text'
-    && CLAUDE_INTERRUPTION_MESSAGES.has(content[0].text);
-}
+const { isClaudeInterruption } = require('./restart-evidence');
 
 function scanTranscript(file, options = {}) {
   const text = options.full ? fs.readFileSync(file, 'utf8') : readTranscriptTail(file);

@@ -27,7 +27,7 @@ function verify({ root, agent, sid, file, instance, resolveChild, budget = 4 * 1
     if (result.uncertain?.includes('ledger-busy') || result.recovering) throw new Recovering('Waiting for job ledger recovery');
     const snapshot = path.join(root, '.keep', 'background-jobs', agent, id, 'state.json');
     const state = JSON.parse(fs.readFileSync(snapshot, 'utf8'));
-    if (state.restartVersion !== 1 || state.gap || !state.restart) throw Error('Job ledger evidence is incomplete');
+    if (state.restartVersion !== jobs.restartVersion(agent) || state.gap || !state.restart) throw Error('Job ledger evidence is incomplete');
     const stat = fs.statSync(source), cp = state.checkpoint;
     if (!cp || cp.identity !== `${digest(path.resolve(source))}:${stat.dev}:${stat.ino}` || cp.offset !== stat.size || cp.mtime !== stat.mtimeMs) throw new Recovering('Waiting for job ledger recovery');
     if (state.hookBarrier != null && cp.offset <= state.hookBarrier) throw new Recovering('Waiting for hook activity to reach the job ledger');
