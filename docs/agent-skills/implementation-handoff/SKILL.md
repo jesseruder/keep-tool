@@ -51,6 +51,10 @@ Resolve the account before launching:
   `keep codex --account <id> context --json` for its watchdog. Never reconstruct a
   legacy plugin state path or inherit another account's broker endpoint.
 
+Run context and every lifecycle command from the same intended worktree. Capture
+the returned `workspace` along with the account so a later shell directory change
+cannot redirect status, results, or cancellation to another project's jobs.
+
 Choose fresh versus resume yourself. Check
 `keep codex --account <id> task-resume-candidate --json`. Resume only when that
 account's candidate continues the same work; otherwise start fresh with the scoped
