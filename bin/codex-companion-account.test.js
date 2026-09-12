@@ -128,3 +128,32 @@ test('namespace manifest refuses an identity mismatch', () => {
     assert.throws(() => companion.ensureNamespace(namespace), /namespace identity changed/);
   } finally { f.cleanup(); }
 });
+
+test('namespace manifest refreshes mutable policy without changing account identity', () => {
+  const f = fixture();
+  try {
+    const original = { ...f.records[0], builtIn: true, managed: false };
+    const changed = { ...original, builtIn: false, managed: true };
+    const first = companion.ensureNamespace(companion.namespaceFor(original, { root: f.root }));
+    const second = companion.ensureNamespace(companion.namespaceFor(changed, { root: f.root }));
+    assert.equal(first.pluginData, second.pluginData);
+    const saved = JSON.parse(fs.readFileSync(path.join(second.pluginData, 'account.json')));
+    assert.deepEqual({ builtIn: saved.builtIn, managed: saved.managed }, { builtIn: false, managed: true });
+  } finally { f.cleanup(); }
+});
+
+test('legacy environment binds saved state and clears inherited account and broker routing', () => {
+  const env = companion.environmentForNamespace({ legacy: true, pluginData: '/saved/legacy-plugin' }, { env: {
+    CLAUDE_PLUGIN_DATA: '/delegated/account-plugin', CODEX_HOME: '/delegated/codex-home',
+    KEEP_AGENT_ACCOUNT_ID: 'codex-secondary', KEEP_PANE: 'pane', KEEP_CODEX_CLIENT_TOKEN: 'token',
+    CODEX_COMPANION_APP_SERVER_ENDPOINT: 'unix:/delegated.sock',
+    CODEX_COMPANION_APP_SERVER_PID_FILE: '/delegated.pid', CODEX_COMPANION_APP_SERVER_LOG_FILE: '/delegated.log',
+    CODEX_COMPANION_SESSION_ID: 'parent-session',
+  } });
+  assert.equal(env.CLAUDE_PLUGIN_DATA, '/saved/legacy-plugin');
+  assert.equal(env.CODEX_HOME, '/delegated/codex-home', 'legacy cleanup does not guess a credential profile');
+  assert.equal(env.CODEX_COMPANION_SESSION_ID, 'parent-session');
+  for (const key of [...companion.BROKER_ENV, 'KEEP_PANE', 'KEEP_CODEX_CLIENT_TOKEN', 'KEEP_AGENT_ACCOUNT_ID']) {
+    assert.equal(env[key], undefined, key);
+  }
+});

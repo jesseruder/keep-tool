@@ -367,6 +367,34 @@ test('multi-account jobs retain their exact namespace for reporting and cancella
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('legacy job cancellation cannot inherit a delegated account state or broker', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-jobs-legacy-'));
+  try {
+    const pluginData = path.join(root, 'legacy-plugin');
+    const stateRoot = path.join(pluginData, 'state');
+    const workspace = path.join(stateRoot, 'workspace');
+    fs.mkdirSync(workspace, { recursive: true });
+    fs.writeFileSync(path.join(workspace, 'state.json'), JSON.stringify({ jobs: [{
+      id: 'legacy-dead', pid: 909, status: 'running', workspaceRoot: root, updatedAt: NOW,
+    }] }));
+    let cancellation;
+    await codexJobs.reap({ deps: {
+      codexStateRoots: [{ stateRoot, pluginData, legacy: true }], now: NOW, psOutput: '',
+      companionScript: '/fake/codex-companion.mjs', processAlive: () => false,
+      env: { CLAUDE_PLUGIN_DATA: '/delegated/plugin', KEEP_AGENT_ACCOUNT_ID: 'codex-secondary',
+        KEEP_PANE: 'delegated-pane', KEEP_CODEX_CLIENT_TOKEN: 'delegated-token',
+        CODEX_COMPANION_APP_SERVER_ENDPOINT: 'unix:/delegated.sock' },
+      cancel: async (id, details) => { cancellation = { id, details }; },
+    } });
+    assert.equal(cancellation.id, 'legacy-dead');
+    assert.equal(cancellation.details.env.CLAUDE_PLUGIN_DATA, pluginData);
+    assert.equal(cancellation.details.env.CODEX_COMPANION_APP_SERVER_ENDPOINT, undefined);
+    assert.equal(cancellation.details.env.KEEP_AGENT_ACCOUNT_ID, undefined);
+    assert.equal(cancellation.details.env.KEEP_PANE, undefined);
+    assert.equal(cancellation.details.env.KEEP_CODEX_CLIENT_TOKEN, undefined);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('keep codex command is wired and rejects an unknown account before companion lookup', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-account-cli-'));
   try {

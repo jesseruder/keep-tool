@@ -53,6 +53,18 @@ function manifestFor(namespace) {
     configDir: namespace.configDir, builtIn: namespace.builtIn, managed: namespace.managed };
 }
 
+function sameManifestIdentity(current, expected) {
+  return current?.version === expected.version && current.accountId === expected.accountId
+    && current.agent === expected.agent && current.configDir === expected.configDir;
+}
+
+function writeManifest(file, value, io) {
+  io.mkdirSync(path.dirname(file), { recursive: true });
+  const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  io.writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  io.renameSync(temp, file);
+}
+
 function ensureNamespace(namespace, options = {}) {
   const io = options.fs || fs;
   const file = path.join(namespace.pluginData, MANIFEST);
@@ -60,15 +72,10 @@ function ensureNamespace(namespace, options = {}) {
   let current = null;
   try { current = JSON.parse(io.readFileSync(file, 'utf8')); }
   catch (error) { if (error.code !== 'ENOENT') throw new Error(`Codex companion account namespace is unreadable: ${file}`); }
-  if (current && JSON.stringify(current) !== JSON.stringify(expected)) {
+  if (current && !sameManifestIdentity(current, expected)) {
     throw new Error(`Codex companion account namespace identity changed: ${namespace.accountId}`);
   }
-  if (!current) {
-    io.mkdirSync(namespace.pluginData, { recursive: true });
-    const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
-    io.writeFileSync(temp, `${JSON.stringify(expected, null, 2)}\n`, { mode: 0o600 });
-    io.renameSync(temp, file);
-  }
+  if (!current || JSON.stringify(current) !== JSON.stringify(expected)) writeManifest(file, expected, io);
   return namespace;
 }
 
@@ -140,7 +147,12 @@ function companionEnvironment(account, namespace, options = {}) {
 }
 
 function environmentForNamespace(namespace, options = {}) {
-  if (!namespace?.accountId || !namespace.configDir || !namespace.pluginData) return { ...(options.baseEnv || options.env || process.env) };
+  if (!namespace?.accountId || !namespace.configDir) {
+    const env = { ...(options.baseEnv || options.env || process.env) };
+    for (const key of [...BROKER_ENV, 'KEEP_PANE', 'KEEP_CODEX_CLIENT_TOKEN', 'KEEP_AGENT_ACCOUNT_ID']) delete env[key];
+    if (namespace?.pluginData) env.CLAUDE_PLUGIN_DATA = namespace.pluginData;
+    return env;
+  }
   const account = { id: namespace.accountId, agent: 'codex', configDir: namespace.configDir,
     builtIn: namespace.builtIn === true, managed: namespace.managed === true };
   return companionEnvironment(account, namespace, options);
