@@ -36,7 +36,7 @@ test.afterEach(async () => { await fixture.close(); });
 test('exited conversation text loads only when opened and refreshes by stable content version', async ({ page }) => {
   const first = 'Historical full answer '.repeat(80) + 'FIRST-END';
   const old = markExited('k', first);
-  fixture.configure({ delayDetail: { kind: 'session', id: 'k', ms: 80 } });
+  fixture.configure({ delayDetail: { kind: 'session', id: 'k', ms: 500 } });
   await page.goto(`${fixture.url}/app`);
   await expect(page.locator('#stage')).toHaveAttribute('data-item-key', 'a');
   await expect(page.locator('#stage .term-state')).toHaveText('live');
