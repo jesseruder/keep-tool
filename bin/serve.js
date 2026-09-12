@@ -4021,8 +4021,19 @@ async function openSession(body, deps = {}) {
         });
       }
       if (sessionId && agent === 'codex') {
-        (deps.pinSession || accounts.pinSession)(sessionId, agent, account.id,
-          { root: deps.root || keep.ROOT, env: deps.env || process.env });
+        let authority;
+        try {
+          authority = (deps.accountForSession || accounts.forSession)(sessionId, agent, {
+            root: deps.root || keep.ROOT, env: deps.env || process.env, allowDiscovery: false,
+          });
+        } catch (error) { throw new InjectionError(409, error.message); }
+        if (authority && authority.id !== account.id) {
+          throw new InjectionError(409, `session ${sessionId.slice(0, 8)} is pinned to account ${authority.id}`);
+        }
+        if (!authority) {
+          (deps.pinSession || accounts.pinSession)(sessionId, agent, account.id,
+            { root: deps.root || keep.ROOT, env: deps.env || process.env });
+        }
       }
       return { ok: true, existing: true, focus: 'console', pane: existing.id,
         sessionId, accountId: account.id, accountLabel: account.label,

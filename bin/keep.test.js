@@ -1013,9 +1013,11 @@ test('Codex SessionStart pins a daemon-launched session only after exact pane an
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-open-pin-'));
   const config = path.join(root, 'accounts.json');
   const configDir = path.join(root, 'codex-secondary');
-  fs.mkdirSync(configDir);
+  const targetConfigDir = path.join(root, 'codex-target');
+  fs.mkdirSync(configDir); fs.mkdirSync(targetConfigDir);
   fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
     { id: 'codex-secondary', label: 'Codex secondary', agent: 'codex', configDir },
+    { id: 'codex-target', label: 'Codex target', agent: 'codex', configDir: targetConfigDir },
   ], defaultAccounts: { codex: 'codex-secondary' } }));
   const env = { KEEP_DIR: root, KEEP_CONFIG: config, KEEP_PANE: 'pane-open',
     KEEP_AGENT_ACCOUNT_ID: 'codex-secondary' };
@@ -1055,6 +1057,21 @@ test('Codex SessionStart pins a daemon-launched session only after exact pane an
     assert.equal(unowned.bound, false);
     assert.deepEqual(patches, []);
     assert.equal(fs.existsSync(path.join(root, '.keep', 'session-accounts', 'unowned-session.json')), false);
+
+    const accountStore = require('./accounts');
+    accountStore.pinSession('handoff-session', 'codex', 'codex-secondary', { root, env });
+    accountStore.stageSession('handoff-session', 'codex-target', 'handoff-transaction', { root, env });
+    const handoffAuthority = path.join(root, '.keep', 'session-accounts', 'handoff-session.json');
+    const handoffBytes = fs.readFileSync(handoffAuthority, 'utf8');
+    pane.meta = { ...pane.meta, sessionId: 'handoff-session', accountId: 'codex-target',
+      restartedAt: 5678, handoffTransactionId: 'handoff-transaction' };
+    const targetEnv = { ...env, KEEP_AGENT_ACCOUNT_ID: 'codex-target' };
+    const resumed = await recordSessionPane({ session_id: 'handoff-session', cwd: root }, 'codex', {
+      root, env: targetEnv, connectHost, codexOwnsPane: async () => true,
+    });
+    assert.equal(resumed.bound, true);
+    assert.equal(fs.readFileSync(handoffAuthority, 'utf8'), handoffBytes,
+      'a restarted handoff target leaves staged transaction authority untouched');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

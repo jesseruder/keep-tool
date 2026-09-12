@@ -5119,7 +5119,8 @@ async function recordSessionPane(input, agent = 'claude', deps = {}) {
       client = await connectHost({ timeoutMs: deps.timeoutMs == null ? 500 : deps.timeoutMs });
       const current = await client.request('get', { pane }, { timeoutMs });
       const paneMeta = current?.pane?.meta || {};
-      const launchedCodex = agent === 'codex' && paneMeta.openRequestId != null;
+      const launchedCodex = agent === 'codex' && paneMeta.openRequestId != null
+        && !paneMeta.sessionId && !paneMeta.restartedAt && !paneMeta.handoffTransactionId;
       if (launchedCodex) {
         const validRequest = typeof paneMeta.openRequestId === 'string'
           && /^[A-Za-z0-9_-]{1,128}$/.test(paneMeta.openRequestId);
@@ -5129,8 +5130,15 @@ async function recordSessionPane(input, agent = 'claude', deps = {}) {
             || path.resolve(paneMeta.project || '') !== path.resolve(cwd)) break;
         const ownsPane = await (deps.codexOwnsPane || require('./codex-pane').ownsPane)(sid, current.pane, deps);
         if (!ownsPane) throw new Error('Codex SessionStart did not own its launched host pane');
-        (deps.pinSession || require('./accounts').pinSession)(sid, 'codex', accountId,
-          { root: deps.root || ROOT, env });
+        const accountStore = require('./accounts');
+        const authority = (deps.accountForSession || accountStore.forSession)(sid, 'codex', {
+          root: deps.root || ROOT, env, allowDiscovery: false,
+        });
+        if (authority && authority.id !== accountId) throw new Error('Codex SessionStart account authority changed');
+        if (!authority) {
+          (deps.pinSession || accountStore.pinSession)(sid, 'codex', accountId,
+            { root: deps.root || ROOT, env });
+        }
       }
       const owner = current && current.pane && current.pane.meta && current.pane.meta.sessionId;
       if (owner && owner !== sid) {

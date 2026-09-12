@@ -3839,10 +3839,12 @@ test('standalone fresh agent launch uses the selected profile and one request id
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-standalone-open-'));
   try {
     const cwd = path.join(root, 'project'), configDir = path.join(root, 'codex-secondary');
-    fs.mkdirSync(cwd); fs.mkdirSync(configDir);
+    const targetConfigDir = path.join(root, 'codex-target');
+    fs.mkdirSync(cwd); fs.mkdirSync(configDir); fs.mkdirSync(targetConfigDir);
     const config = path.join(root, 'accounts.json');
     fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
       { id: 'codex-secondary', label: 'Codex secondary', agent: 'codex', configDir },
+      { id: 'codex-target', label: 'Codex target', agent: 'codex', configDir: targetConfigDir },
     ], defaultAccounts: { codex: 'codex-secondary' } }));
     const env = { KEEP_DIR: root, KEEP_CONFIG: config };
     let releaseSpawn;
@@ -3882,6 +3884,20 @@ test('standalone fresh agent launch uses the selected profile and one request id
     assert.equal('pendingRegistration' in rebound, false); assert.equal(spawns, 1);
     assert.equal(JSON.parse(fs.readFileSync(path.join(root, '.keep', 'session-accounts',
       'actual-standalone-session.json'), 'utf8')).accountId, 'codex-secondary');
+    const authorityFile = path.join(root, '.keep', 'session-accounts', 'actual-standalone-session.json');
+    const withProvenance = { ...JSON.parse(fs.readFileSync(authorityFile, 'utf8')),
+      transactionId: 'completed-transfer', updatedAt: 1234 };
+    fs.writeFileSync(authorityFile, JSON.stringify(withProvenance, null, 2) + '\n');
+    const settledBytes = fs.readFileSync(authorityFile, 'utf8');
+    await openSession(body, deps);
+    assert.equal(fs.readFileSync(authorityFile, 'utf8'), settledBytes,
+      'a retry validates settled authority without rewriting transaction provenance');
+
+    fs.writeFileSync(authorityFile, JSON.stringify({ ...withProvenance, stagedAccountId: 'codex-target' }, null, 2) + '\n');
+    const stagedBytes = fs.readFileSync(authorityFile, 'utf8');
+    await assert.rejects(openSession(body, deps),
+      (error) => error.status === 409 && /unfinished account handoff/.test(error.message));
+    assert.equal(fs.readFileSync(authorityFile, 'utf8'), stagedBytes, 'a retry leaves staged authority byte-for-byte intact');
 
     existingPanes = [{ id: 'strict-standalone-pane', alive: true, agentAlive: true,
       meta: { ...spawn.meta, openRequestId: 'strict-standalone-request', sessionId: null } }];
