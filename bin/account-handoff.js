@@ -135,6 +135,20 @@ function verifyFrozenResumeSpec(entry, plan, deps = {}) {
   if (verified.digest !== entry.resumeSpec.digest) throw new Error('Codex launch settings changed before restart');
 }
 
+function codexResumeCwd(resumeSpec) {
+  const cwd = resumeSpec?.cwd;
+  let available = typeof cwd === 'string' && cwd.length > 0 && !cwd.includes('\0') && path.isAbsolute(cwd);
+  if (available) {
+    try { available = fs.statSync(cwd).isDirectory(); } catch { available = false; }
+  }
+  if (!available) {
+    const error = new Error('Codex latest working directory is unavailable; source session was left running');
+    error.status = 409;
+    throw error;
+  }
+  return cwd;
+}
+
 function killOwnedGroup(child) {
   if (!child?.pid) return;
   if (process.platform !== 'win32') {
@@ -402,7 +416,8 @@ async function run(body, deps = {}) {
     try { artifactPlan = providerArtifacts.preflight(session.id, source, target, { root, env }); }
     catch (error) { error.status = 409; throw error; }
     const resumeSpec = resumeSpecFor(session.id, agent, artifactPlan, deps);
-    const compatibility = providerCompatibility(agent, source, target, session.project || pane.cwd, resumeSpec, deps);
+    const resumeCwd = agent === 'codex' ? codexResumeCwd(resumeSpec) : session.project || pane.cwd;
+    const compatibility = providerCompatibility(agent, source, target, resumeCwd, resumeSpec, deps);
     if (!compatibility.ok) {
       const error = new Error(`Target account setup is incompatible: ${compatibility.reasons.join('; ')}`); error.status = 409; throw error;
     }
@@ -411,7 +426,7 @@ async function run(body, deps = {}) {
     current.transactionId ||= current.id;
     current.agent = agent;
     current.ownedSessionIds = agent === 'codex' ? artifactPlan.artifacts.map((entry) => entry.sessionId) : [session.id];
-    Object.assign(current, { status: 'stopping', phase: 'stopping-source', reason: '', cwd: session.project || pane.cwd,
+    Object.assign(current, { status: 'stopping', phase: 'stopping-source', reason: '', cwd: resumeCwd,
       pid: pane.pid, cols: pane.cols, rows: pane.rows,
       ...(sourceIdentity ? { sourceAgentPid: sourceIdentity.pid, sourceAgentPidStart: sourceIdentity.pidStart } : {}),
       ...(resumeSpec ? {
@@ -446,7 +461,8 @@ async function run(body, deps = {}) {
     try {
       const result = await deps.restartSession({ sessionId: session.id, pane: pane.id, pid: pane.pid, mode: 'now' }, {
         ...deps.restartDeps, root, env, host: wrappedHost, resumeAccount: target, resumeMcpConfig: compatibility.mcpConfig,
-        resumeModel: current.model, resumeArgv: current.resumeSpec?.argv, allowTerminalRateLimit: true,
+        resumeModel: current.model, resumeArgv: current.resumeSpec?.argv, resumeCwd: current.resumeSpec ? current.cwd : null,
+        allowTerminalRateLimit: true,
       });
       Object.assign(current, { status: 'verifying', phase: 'verifying-target', pid: result.pid }); writeOne(root, current);
       const record = await deps.waitForAccountRecord(session.id, pane.id, target.id, current.targetLaunchStartedAt);

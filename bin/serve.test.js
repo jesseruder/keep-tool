@@ -96,6 +96,7 @@ const {
   sendToSessionLocked,
   claudeMcpMenuVisible,
   continueAccountHandoff,
+  resumeExitedAccountHandoff,
   listPortableTransfers,
   inspectPortableSource,
   portableTransferDraft,
@@ -3065,6 +3066,32 @@ test('Codex handoff continuation uses only the exact staged target rollout', asy
     const symlink = path.join(target, 'sessions', 'alias.jsonl'); fs.symlinkSync(sourceFile, symlink);
     assert.throws(() => continueAccountHandoff(sid, 'pane-codex-target', 'codex-target', message,
       'symlink-path', { agent: 'codex', targetTranscript: symlink }, { root, env, host }), /outside its account/);
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
+test('exited Codex handoff recovery launches in the frozen latest turn cwd', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-handoff-cwd-'));
+  const cwd = path.join(base, 'latest-turn-worktree'); fs.mkdirSync(cwd);
+  const sid = '11111111-1111-4111-8111-111111111111';
+  const account = { id: 'codex-target', label: 'Codex Target', agent: 'codex', configDir: path.join(base, 'profile') };
+  fs.mkdirSync(account.configDir);
+  const pane = { id: 'pane-codex-cwd', pid: 10, alive: false, cols: 100, rows: 30,
+    meta: { sessionId: sid, agent: 'codex', accountId: 'codex-source' } };
+  let replacement = null;
+  const host = recordingHost((type, params) => {
+    if (type === 'get') return { pane };
+    assert.equal(type, 'replace-exited'); replacement = params;
+    return { pane: { ...pane, pid: 20, alive: true } };
+  });
+  try {
+    const result = await resumeExitedAccountHandoff({ id: 'tx-cwd', sessionId: sid, pane: pane.id, pid: pane.pid,
+      agent: 'codex', cwd, cols: pane.cols, rows: pane.rows,
+      resumeSpec: { argv: ['codex', '--sandbox', 'workspace-write', 'resume', sid] } }, account, null, {
+      host, agentProcessRows: async () => [],
+      waitForHostAgent: async (target, agent) => { assert.deepEqual(target, { pane: pane.id }); assert.equal(agent, 'codex'); },
+    });
+    assert.equal(result.pid, 20); assert.equal(replacement.cwd, cwd);
+    assert.equal(replacement.meta.handoffTransactionId, 'tx-cwd');
   } finally { fs.rmSync(base, { recursive: true, force: true }); }
 });
 

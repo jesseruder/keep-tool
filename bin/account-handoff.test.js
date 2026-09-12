@@ -235,6 +235,14 @@ test('native Codex handoff preserves exact launch policy and transfers root plus
   const f = fixture();
   try {
     const d = codexDeps(f);
+    const latestCwd = path.join(f.project, 'latest-turn-worktree'); fs.mkdirSync(latestCwd);
+    const readResumeSpec = d.resumeSpec;
+    d.resumeSpec = (...args) => ({ ...readResumeSpec(...args), cwd: latestCwd });
+    const restartSession = d.restartSession;
+    d.restartSession = (body, options) => {
+      assert.equal(options.resumeCwd, latestCwd, 'the latest turn cwd is passed through the normal guarded restart');
+      return restartSession(body, options);
+    };
     const result = await handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two' }, d);
     assert.equal(result.status, 'done'); assert.equal(result.agent, 'codex');
     assert.deepEqual(d.events, ['copy', 'rebind', 'launch', 'verify-target', 'continue']);
@@ -245,7 +253,23 @@ test('native Codex handoff preserves exact launch policy and transfers root plus
     }
     const journal = JSON.parse(fs.readFileSync(path.join(f.root, '.keep', 'account-handoffs', `${d.sid}.json`)));
     assert.deepEqual(journal.resumeSpec.argv, d.argv);
+    assert.equal(journal.cwd, latestCwd);
+    assert.equal(journal.resumeSpec.cwd, latestCwd);
     assert.deepEqual(journal.ownedSessionIds, [d.sid, d.child]);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('Codex handoff rejects an unavailable latest turn cwd before stopping the source', async () => {
+  const f = fixture();
+  try {
+    const d = codexDeps(f);
+    const readResumeSpec = d.resumeSpec;
+    d.resumeSpec = (...args) => ({ ...readResumeSpec(...args), cwd: path.join(f.base, 'missing-worktree') });
+    d.restartSession = async () => assert.fail('invalid latest cwd must be rejected before source exit');
+    await assert.rejects(handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two' }, d),
+      (error) => error.status === 409 && /latest working directory is unavailable/.test(error.message));
+    assert.equal(d.pane.alive, true); assert.deepEqual(d.events, []);
+    assert.equal(accounts.authority(f.root)[d.sid].accountId, 'codex-work');
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 

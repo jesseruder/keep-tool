@@ -2720,6 +2720,16 @@ function reviewerResumeSpec(session, pane, deps = {}) {
   };
 }
 
+function validatedCodexResumeCwd(agent, value) {
+  let available = agent === 'codex' && typeof value === 'string' && value.length > 0
+    && !value.includes('\0') && path.isAbsolute(value);
+  if (available) {
+    try { available = fs.statSync(value).isDirectory(); } catch { available = false; }
+  }
+  if (!available) throw new InjectionError(409, 'Saved Codex working directory is unavailable');
+  return value;
+}
+
 async function restartSession(body, deps = {}) {
   const host = (type, params) => hostRequest(type, params, deps);
   let exitInputStarted = false;
@@ -2740,7 +2750,8 @@ async function restartSession(body, deps = {}) {
       if (/^Waiting |^Pause session-local scheduled jobs/.test(reason)) throw transient(reason);
       throw new InjectionError(409, reason);
     }
-    const cwd = session.project || pane.cwd;
+    const cwd = deps.resumeCwd == null ? session.project || pane.cwd
+      : validatedCodexResumeCwd(session.kind, deps.resumeCwd);
     if (!cwd || !fs.statSync(cwd).isDirectory()) throw Error('Session directory is unavailable');
     let account = deps.resumeAccount || null;
     if (!account) {
@@ -5268,6 +5279,7 @@ async function resumeExitedAccountHandoff(entry, account, mcpConfig, deps = {}) 
   if (pane.alive || pane.pid !== entry.pid) throw new InjectionError(409, 'Exited handoff pane changed before recovery');
   if ((await liveSessionPids(deps)).has(entry.sessionId)) throw new InjectionError(409, 'An agent process still owns this conversation');
   const agent = entry.agent || 'claude';
+  const cwd = agent === 'codex' ? validatedCodexResumeCwd(agent, entry.cwd) : entry.cwd;
   let argv, reviewerSpec = { env: null };
   if (agent === 'codex') {
     argv = entry.resumeSpec?.argv;
@@ -5284,13 +5296,13 @@ async function resumeExitedAccountHandoff(entry, account, mcpConfig, deps = {}) 
   }
   const result = await host('replace-exited', {
     paneId: pane.id, expectedPid: entry.pid, sessionId: pane.meta?.sessionId,
-    cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`], cwd: entry.cwd,
+    cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`], cwd,
     ...(reviewerSpec.env ? { env: reviewerSpec.env } : {}),
     cols: entry.cols, rows: entry.rows,
     meta: { ...pane.meta, agent, sessionId: entry.sessionId, accountId: account.id, accountLabel: account.label,
       handoffTransactionId: entry.id, restartedAt: Date.now() },
   });
-  await waitForHostAgent({ pane: pane.id }, agent, deps);
+  await (deps.waitForHostAgent || waitForHostAgent)({ pane: pane.id }, agent, deps);
   return { ok: true, pane: result.pane.id, pid: result.pane.pid, sessionId: entry.sessionId };
 }
 
