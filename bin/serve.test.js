@@ -17,6 +17,7 @@ const STATE_FIXTURE_SETUP = "require('./bin/summarize').getSummary = () => ({ te
 const codex = require('./codex.js');
 const {
   scanTranscript,
+  claudeTranscriptIsInteractive,
   stallAliveIds,
   transcriptActivityMs,
   sessionNeedsInput,
@@ -4071,6 +4072,140 @@ test('API state uses the Claude lookup for an alive Claude host session', async 
   assert.equal(state.sessions[0].kind, 'claude');
   assert.equal(state.sessions[0].pane, 'pane-claude-old');
   assert.equal(state.sessions[0].hostOnly, true);
+});
+
+test('Claude discovery excludes titled headless runs from cold and cached scans but host backfill can restore one', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-claude-discovery-'));
+  try {
+    const keepRoot = path.join(home, 'keep');
+    const projectDir = path.join(home, '.claude', 'projects', '-test-project');
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.mkdirSync(keepRoot, { recursive: true });
+    const at = new Date().toISOString();
+    const user = (id, text) => ({
+      type: 'user', sessionId: id, uuid: `${id}-user`, cwd: '/test/project', gitBranch: 'main',
+      isSidechain: false, timestamp: at, message: { role: 'user', content: text },
+    });
+    const assistant = (id, text) => ({
+      type: 'assistant', sessionId: id, uuid: `${id}-assistant`, parentUuid: `${id}-user`,
+      isSidechain: false, timestamp: at,
+      message: { role: 'assistant', model: 'claude-haiku-4-5-20251001', stop_reason: 'end_turn', content: [{ type: 'text', text }] },
+    });
+    const headless = (id) => [
+      user(id, 'Classify this batch'),
+      { type: 'last-prompt', sessionId: id, lastPrompt: 'Classify this batch' },
+      { type: 'atis-latch', sessionId: id, atis: true },
+      { type: 'attachment', sessionId: id, timestamp: at, attachment: { type: 'directory', path: '/test/project' } },
+      assistant(id, 'classified'),
+      { type: 'ai-title', sessionId: id, aiTitle: 'Batch classifier' },
+    ];
+    const filler = Array.from({ length: 70 }, (_, index) => ({
+      type: 'file-history-snapshot', sessionId: 'filler', snapshot: `${index}:${'x'.repeat(5000)}`,
+    }));
+    const write = (id, rows) => fs.writeFileSync(path.join(projectDir, `${id}.jsonl`), `${rows.map(JSON.stringify).join('\n')}\n`);
+    write('titled-headless', headless('titled-headless'));
+    write('long-interactive', [
+      null,
+      { type: 'mode', mode: 'normal', sessionId: 'long-interactive' },
+      { type: 'permission-mode', permissionMode: 'default', sessionId: 'long-interactive' },
+      ...filler, user('long-interactive', 'Continue the conversation'), assistant('long-interactive', 'done'),
+      { type: 'ai-title', sessionId: 'long-interactive', aiTitle: 'Long interactive conversation' },
+    ]);
+    write('resumed-headless', [
+      ...headless('resumed-headless'), ...filler,
+      { type: 'mode', mode: 'normal', sessionId: 'resumed-headless' },
+      { type: 'permission-mode', permissionMode: 'default', sessionId: 'resumed-headless' },
+      user('resumed-headless', 'Resume this history'), assistant('resumed-headless', 'resumed'),
+    ]);
+    const headlessFile = path.join(projectDir, 'titled-headless.jsonl');
+    const script = `
+      ${STATE_FIXTURE_SETUP}
+      const fs = require('node:fs');
+      const serve = require('./bin/serve.js');
+      const target = ${JSON.stringify(headlessFile)};
+      const realOpen = fs.openSync;
+      let targetOpens = 0;
+      fs.openSync = (...args) => { if (args[0] === target) targetOpens += 1; return realOpen(...args); };
+      const ids = (sessions) => sessions.map((session) => session.id).sort();
+      const first = serve.scanSessions({ dashboard: true, readOnly: true });
+      const afterFirst = targetOpens;
+      const second = serve.scanSessions({ dashboard: true, readOnly: true });
+      const afterSecond = targetOpens;
+      const hosted = second.slice();
+      const added = serve.backfillHostSessions(hosted, [{
+        id: 'pane-headless', alive: true,
+        meta: { agent: 'claude', sessionId: 'titled-headless', project: '/test/project' },
+      }]);
+      process.stdout.write(JSON.stringify({ first: ids(first), second: ids(second), afterFirst, afterSecond,
+        hosted: added.map((session) => ({ id: session.id, hostOnly: session.hostOnly, title: session.title })) }));
+    `;
+    const child = spawnSync(process.execPath, ['-e', script], {
+      cwd: path.join(__dirname, '..'), env: { ...process.env, HOME: home, KEEP_DIR: keepRoot, KEEP_CONFIG: '' }, encoding: 'utf8', timeout: 10000,
+    });
+    assert.equal(child.status, 0, child.stderr);
+    const result = JSON.parse(child.stdout);
+    assert.deepEqual(result.first, ['long-interactive', 'resumed-headless']);
+    assert.deepEqual(result.second, result.first, 'cached parsed info applies the same discovery filter');
+    assert.ok(result.afterFirst > 0);
+    assert.equal(result.afterSecond, result.afterFirst, 'the unchanged headless transcript is not reparsed');
+    assert.deepEqual(result.hosted, [{ id: 'titled-headless', hostOnly: true, title: 'Batch classifier' }]);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test('long transcript marker scans continue from cached EOF and retain positive evidence across appends', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-claude-marker-cache-'));
+  const file = path.join(dir, 'session.jsonl');
+  const filler = (count) => Array.from({ length: count }, (_, index) => JSON.stringify({
+    type: 'file-history-snapshot', index, snapshot: 'x'.repeat(5000),
+  })).join('\n') + '\n';
+  fs.writeFileSync(file, filler(70));
+  const realRead = fs.readSync;
+  let bytesRead = 0;
+  fs.readSync = (...args) => {
+    const bytes = realRead(...args);
+    bytesRead += bytes;
+    return bytes;
+  };
+  try {
+    assert.equal(claudeTranscriptIsInteractive(file, scanTranscript(file), fs.statSync(file)), false);
+    const afterCold = bytesRead;
+    fs.appendFileSync(file, `${JSON.stringify({ type: 'ai-title', aiTitle: 'Still headless' })}\n`);
+    assert.equal(claudeTranscriptIsInteractive(file, scanTranscript(file), fs.statSync(file)), false);
+    const negativeAppendBytes = bytesRead - afterCold;
+    assert.ok(negativeAppendBytes < 300 * 1024, `negative append reread ${negativeAppendBytes} bytes`);
+
+    fs.appendFileSync(file, `${JSON.stringify({ type: 'mode', mode: 'normal' })}\n`);
+    assert.equal(claudeTranscriptIsInteractive(file, scanTranscript(file), fs.statSync(file)), true,
+      'a resumed headless transcript earns TUI evidence');
+    fs.appendFileSync(file, filler(70));
+    assert.equal(claudeTranscriptIsInteractive(file, scanTranscript(file), fs.statSync(file)), true,
+      'the incremental scan finds a resume marker after it leaves the tail');
+    const afterPositive = bytesRead;
+    fs.appendFileSync(file, filler(70));
+    assert.equal(claudeTranscriptIsInteractive(file, scanTranscript(file), fs.statSync(file)), true);
+    assert.ok(bytesRead - afterPositive <= 256 * 1024, 'cached positive evidence avoids rereading old history');
+
+    const sameSizeReplacement = fs.readFileSync(file, 'utf8').replace('"type":"mode"', '"type":"noop"');
+    fs.writeFileSync(file, sameSizeReplacement);
+    const rewrittenAt = new Date(Date.now() + 2000);
+    fs.utimesSync(file, rewrittenAt, rewrittenAt);
+    assert.equal(claudeTranscriptIsInteractive(file, scanTranscript(file), fs.statSync(file)), false,
+      'a same-inode, same-size rewrite invalidates prior positive evidence');
+
+    fs.truncateSync(file, 0);
+    fs.appendFileSync(file, filler(70));
+    assert.equal(claudeTranscriptIsInteractive(file, scanTranscript(file), fs.statSync(file)), false,
+      'truncation resets marker history');
+    fs.appendFileSync(file, `${JSON.stringify({ type: 'permission-mode', permissionMode: 'default' })}\n`);
+    assert.equal(claudeTranscriptIsInteractive(file, scanTranscript(file), fs.statSync(file)), true,
+      'new evidence after truncation is discovered');
+    assert.equal(claudeTranscriptIsInteractive(path.join(dir, 'vanished.jsonl'), { interactive: false }, {
+      size: 300 * 1024, dev: 1, ino: 1, mtimeMs: Date.now(),
+    }), false, 'a candidate removed after indexing does not fail the dashboard scan');
+  } finally {
+    fs.readSync = realRead;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('dashboard Claude resolver reuses one indexed snapshot and preserves account authority rules', () => {

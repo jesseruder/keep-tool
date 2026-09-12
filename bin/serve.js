@@ -453,6 +453,100 @@ function rateLimitInfo(j, text) {
 
 const { isClaudeInterruption } = require('./restart-evidence');
 
+const interactiveMarkerCache = new Map();
+const INTERACTIVE_MARKER_CACHE_MAX = 2048;
+const INTERACTIVE_MARKER_LINE_MAX = 64 * 1024;
+
+function cacheInteractiveMarker(key, value) {
+  if (interactiveMarkerCache.has(key)) interactiveMarkerCache.delete(key);
+  interactiveMarkerCache.set(key, value);
+  if (interactiveMarkerCache.size > INTERACTIVE_MARKER_CACHE_MAX) {
+    interactiveMarkerCache.delete(interactiveMarkerCache.keys().next().value);
+  }
+}
+
+function transcriptHasInteractiveMarker(file, stat, includeSidechain = false) {
+  const cacheKey = `${includeSidechain ? 'all' : 'main'}:${file}`;
+  const cached = interactiveMarkerCache.get(cacheKey);
+  const sameFile = cached && cached.dev === stat.dev && cached.ino === stat.ino;
+  if (sameFile && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.interactive;
+  if (sameFile && cached.interactive && stat.size > cached.size) {
+    cacheInteractiveMarker(cacheKey, { ...cached, mtimeMs: stat.mtimeMs, size: stat.size });
+    return true;
+  }
+  const appended = sameFile && !cached.interactive && stat.size > cached.size;
+  const start = appended ? cached.offset : 0;
+  const fd = fs.openSync(file, 'r');
+  const buffer = Buffer.alloc(64 * 1024);
+  let carry = appended ? cached.carry : Buffer.alloc(0);
+  let discardPartial = appended ? cached.discardPartial : false;
+  let offset = start;
+  let interactive = false;
+  try {
+    while (true) {
+      const bytes = fs.readSync(fd, buffer, 0, buffer.length, offset);
+      if (!bytes) break;
+      offset += bytes;
+      const chunk = buffer.subarray(0, bytes);
+      let lineStart = 0;
+      for (let i = 0; i < chunk.length; i++) {
+        if (chunk[i] !== 10) continue;
+        if (discardPartial) {
+          discardPartial = false;
+          carry = Buffer.alloc(0);
+          lineStart = i + 1;
+          continue;
+        }
+        const suffix = chunk.subarray(lineStart, i);
+        const line = carry.length ? Buffer.concat([carry, suffix]) : suffix;
+        let record;
+        try { record = JSON.parse(line.toString('utf8')); } catch { lineStart = i + 1; carry = Buffer.alloc(0); continue; }
+        lineStart = i + 1;
+        carry = Buffer.alloc(0);
+        if (record?.isSidechain && !includeSidechain) continue;
+        if (record?.type === 'mode' || record?.type === 'permission-mode') {
+          interactive = true;
+          break;
+        }
+      }
+      if (interactive) break;
+      const suffix = chunk.subarray(lineStart);
+      if (!discardPartial && suffix.length) {
+        if (carry.length + suffix.length <= INTERACTIVE_MARKER_LINE_MAX) {
+          carry = carry.length ? Buffer.concat([carry, suffix]) : Buffer.from(suffix);
+        } else {
+          carry = Buffer.alloc(0);
+          discardPartial = true;
+        }
+      }
+    }
+    if (!interactive && !discardPartial && carry.length) {
+      try {
+        const record = JSON.parse(carry.toString('utf8'));
+        interactive = (!record?.isSidechain || includeSidechain)
+          && (record?.type === 'mode' || record?.type === 'permission-mode');
+      } catch {}
+    }
+    cacheInteractiveMarker(cacheKey, {
+      dev: stat.dev, ino: stat.ino, mtimeMs: stat.mtimeMs, size: stat.size, offset,
+      carry: interactive ? Buffer.alloc(0) : Buffer.from(carry), discardPartial, interactive,
+    });
+    return interactive;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function claudeTranscriptIsInteractive(file, info, stat) {
+  if (info.interactive) return true;
+  // Long transcripts can push the startup marker outside the parsed tail. Scan
+  // ambiguous history incrementally and stop at the first marker. This also
+  // retains a headless transcript after it is explicitly resumed in the TUI and
+  // its resume marker later leaves the tail.
+  if (stat.size <= TAIL_BYTES) return false;
+  try { return transcriptHasInteractiveMarker(file, stat); } catch { return false; }
+}
+
 function scanTranscript(file, options = {}) {
   const text = options.full ? fs.readFileSync(file, 'utf8') : readTranscriptTail(file);
   const out = { title: '', cwd: '', gitBranch: '', lastUser: '', lastHuman: '', lastUserAt: null, lastAssistant: '', lastTs: '' };
@@ -4163,9 +4257,11 @@ function scanClaudeSessions(options = {}) {
       try { info = scanTranscript(file); } catch { continue; }
       scanCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, info });
     }
-    // headless `claude -p` spawns (batch jobs from any project) have no TUI
-    // records and never earn a title — they're pipeline noise, not sessions
-    if (!info.title && !info.interactive) continue;
+    // AI titles are now written to headless `claude -p` transcripts too. Only
+    // TUI record types distinguish a conversation from a batch invocation.
+    // Explicitly hosted headless history is restored below by host backfill,
+    // whose exact session lookup intentionally does not apply this filter.
+    if (!claudeTranscriptIsInteractive(file, info, stat)) continue;
     // Claude can append untimestamped housekeeping records (ai-title, mode,
     // bridge-session) when an old session is merely reopened or inspected. Those
     // writes are not conversation activity and must not resurrect the session.
@@ -6261,6 +6357,7 @@ module.exports = {
   startWtGcScheduler,
   buildWhoSnapshot,
   scanTranscript,
+  claudeTranscriptIsInteractive,
   claudeSessionFromInfo,
   sessionBackgroundPending,
   stallAliveIds,
