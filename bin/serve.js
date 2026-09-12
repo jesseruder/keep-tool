@@ -2387,7 +2387,9 @@ async function liveSessionPids(deps = {}) {
           } catch { entry.mtime = -Infinity; }
         }
         entries.sort((a, b) => b.mtime - a.mtime || a.path.localeCompare(b.path));
-        entries.forEach((entry, index) => setLiveSession(live, entry.id, row, 'rollout', { primary: index === 0 }));
+        entries.forEach((entry, index) => setLiveSession(live, entry.id, row, 'rollout', {
+          primary: index === 0, rolloutFile: entry.path,
+        }));
       }
     } catch {}
   }
@@ -2861,7 +2863,8 @@ async function restartSession(body, deps = {}) {
       cols: pane.cols, rows: pane.rows, meta: { ...pane.meta, agent: session.kind, sessionId: session.id,
         accountId: account.id, accountLabel: account.label, restartedAt: Date.now() } });
     await (deps.waitForHostAgent || waitForHostAgent)({ pane: pane.id }, session.kind, deps);
-    return { ok: true, sessionId: session.id, pane: result.pane.id, pid: result.pane.pid };
+    return { ok: true, sessionId: session.id, pane: result.pane.id, pid: result.pane.pid,
+      createdAt: result.pane.createdAt };
   }, { pane: body.pane, session: body.sessionId, model: true });
 }
 
@@ -3460,8 +3463,14 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
       key: opts?.deliveryKey,
       observe: observeMcp,
       precheck,
-      type: () => typeAndSubmit(target, text, confirmation, { ...deps, deliveryTrace: trace }),
-      submitDraft: () => pressTargetKey(target, 'Enter', deps),
+      type: async () => {
+        if (opts?.beforeType) await opts.beforeType();
+        return typeAndSubmit(target, text, confirmation, { ...deps, deliveryTrace: trace });
+      },
+      submitDraft: async () => {
+        if (opts?.beforeType) await opts.beforeType();
+        return pressTargetKey(target, 'Enter', deps);
+      },
       draftMatches: async () => {
         const current = deps.loadDeliverySession ? deps.loadDeliverySession(session.id)
           : session.kind === 'claude' ? claudeSessionFor(session.id) : codex.sessionFor(session.id);
@@ -5193,14 +5202,16 @@ async function inspectAccountHandoff(body, deps = {}) {
   const session = state.sessions.find((entry) => entry.id === body.sessionId);
   const pane = panes.find((entry) => entry.id === body.pane);
   const rows = await agentProcessRows(deps);
-  const identity = (await liveSessionPids({ ...deps, agentProcessRows: async () => rows })).get(body.sessionId);
+  const identity = (await liveSessionPids({ ...deps, agentProcessRows: async () => rows,
+    codexRolloutOnly: session?.kind === 'codex' })).get(body.sessionId);
   const processArgs = identity ? rows.find((entry) => entry.pid === identity.pid)?.args || '' : '';
   let currentModel = '';
   try {
     if (session?.kind === 'claude') currentModel = lastTurnUsage(readTranscriptTail(findSessionFile(session.id)), 'claude').model || '';
   } catch {}
   return { session, pane, processArgs, currentModel,
-    agentIdentity: identity ? { pid: identity.pid, pidStart: identity.pidStart, primary: identity.primary === true } : null };
+    agentIdentity: identity ? { pid: identity.pid, pidStart: identity.pidStart, primary: identity.primary === true,
+      ...(identity.rolloutFile ? { rolloutFile: identity.rolloutFile } : {}) } : null };
 }
 
 async function waitForAccountRecord(sessionId, pane, accountId, startedAfter, deps = {}) {
@@ -5230,6 +5241,64 @@ function accountCodexSession(sessionId, accountId, file) {
   const info = codex.scanRollout(file, { includeHeadless: true });
   if (!info || info.id !== sessionId) throw new InjectionError(409, 'Target Codex rollout identity was not verified');
   return { ...info, kind: 'codex', project: info.cwd, accountId, file, mtime: stat.mtimeMs, state: info.endedTurn ? 'waiting' : 'running' };
+}
+
+async function verifyAccountHandoffTarget(sessionId, paneId, accountId, agent, targetTranscript, options, deps = {}) {
+  const expected = options?.targetIdentity;
+  const validStamp = (value) => typeof value === 'string' ? value.length > 0 : Number.isFinite(value);
+  if (!expected || expected.sessionId !== sessionId || expected.pane !== paneId || expected.accountId !== accountId
+      || expected.transactionId !== options.transactionId
+      || !Number.isInteger(expected.panePid) || expected.panePid <= 0 || !validStamp(expected.paneCreatedAt)
+      || !Number.isInteger(expected.agentPid) || expected.agentPid <= 0
+      || typeof expected.agentPidStart !== 'string' || !expected.agentPidStart
+      || !validStamp(expected.sessionStartedAt)
+      || !Number.isFinite(options.sourceStopVerifiedAt) || options.sourceStopVerifiedAt <= 0) {
+    throw new InjectionError(409, 'Native handoff destination identity is incomplete; nothing was sent');
+  }
+  const assertPane = (pane) => {
+    if (!pane?.alive || pane.agentAlive === false || pane.id !== expected.pane || pane.pid !== expected.panePid
+        || pane.createdAt !== expected.paneCreatedAt || pane.meta?.sessionId !== expected.sessionId
+        || pane.meta?.agent !== agent || pane.meta?.accountId !== expected.accountId
+        || pane.meta?.handoffTransactionId !== expected.transactionId) {
+      throw new InjectionError(409, 'Native handoff destination pane identity changed; nothing was sent');
+    }
+  };
+  const currentPane = async () => {
+    const panes = await listHostPanes(deps, true);
+    const pane = panes?.find((candidate) => candidate.id === expected.pane);
+    assertPane(pane);
+    return pane;
+  };
+  const currentAgent = async () => {
+    const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
+    const live = await (deps.liveSessionPids || liveSessionPids)({ ...deps, agentProcessRows: async () => rows,
+      codexRolloutOnly: agent === 'codex' });
+    const identity = live.get(sessionId);
+    if (!identity?.primary || identity.agent !== agent || identity.pid !== expected.agentPid
+        || identity.pidStart !== expected.agentPidStart) {
+      throw new InjectionError(409, 'Native handoff destination agent identity changed; nothing was sent');
+    }
+    if (agent === 'codex') {
+      let actual, wanted;
+      try { actual = fs.realpathSync(identity.rolloutFile); wanted = fs.realpathSync(targetTranscript); }
+      catch { throw new InjectionError(409, 'Native handoff destination rollout ownership is unavailable; nothing was sent'); }
+      if (identity.source !== 'rollout' || actual !== wanted) {
+        throw new InjectionError(409, 'Native handoff destination rollout ownership changed; nothing was sent');
+      }
+    }
+  };
+  const currentRecord = () => {
+    const record = (deps.readPaneRecord || readPaneRecord)(sessionId, deps);
+    if (!record || record.pane !== expected.pane || record.accountId !== expected.accountId
+        || record.startedAt !== expected.sessionStartedAt) {
+      throw new InjectionError(409, 'Native handoff destination SessionStart identity changed; nothing was sent');
+    }
+  };
+  await currentPane(); currentRecord(); await currentAgent();
+  // Re-read both host and process identity after the other proofs. This runs in
+  // the delivery type callback under the injection lock, immediately before the
+  // first byte or an already typed draft's Enter is sent.
+  await currentPane(); await currentAgent(); currentRecord();
 }
 
 function continueAccountHandoff(sessionId, pane, accountId, text, deliveryId, options = {}, deps = {}) {
@@ -5269,7 +5338,8 @@ function continueAccountHandoff(sessionId, pane, accountId, text, deliveryId, op
     transcriptFileForSession: () => file,
   };
   exactDeps.sendToResolvedTarget = (session, resolved, message) => sendToResolvedTarget(session, resolved, message,
-    { retainReceipt: true, deliveryKey: deliveryId }, exactDeps);
+    { retainReceipt: true, deliveryKey: deliveryId,
+      beforeType: () => verifyAccountHandoffTarget(sessionId, pane, accountId, agent, file, options, exactDeps) }, exactDeps);
   return sendToSessionLocked({ sessionId, pane, text }, exactDeps);
 }
 
@@ -5302,8 +5372,11 @@ async function resumeExitedAccountHandoff(entry, account, mcpConfig, deps = {}) 
     meta: { ...pane.meta, agent, sessionId: entry.sessionId, accountId: account.id, accountLabel: account.label,
       handoffTransactionId: entry.id, restartedAt: Date.now() },
   });
+  const launched = { ok: true, pane: result.pane.id, pid: result.pane.pid,
+    createdAt: result.pane.createdAt, sessionId: entry.sessionId };
+  if (deps.onLaunched) await deps.onLaunched(launched);
   await (deps.waitForHostAgent || waitForHostAgent)({ pane: pane.id }, agent, deps);
-  return { ok: true, pane: result.pane.id, pid: result.pane.pid, sessionId: entry.sessionId };
+  return launched;
 }
 
 async function handoffSession(body, deps = {}) {
@@ -5316,7 +5389,8 @@ async function handoffSession(body, deps = {}) {
     host: deps.host || { request: (type, params) => hostRequest(type, params, deps) },
     restartSession: deps.restartSession || restartSession,
     restartDeps: deps.restartDeps || deps,
-    resumeExited: deps.resumeExited || ((entry, account, mcpConfig) => resumeExitedAccountHandoff(entry, account, mcpConfig, deps)),
+    resumeExited: deps.resumeExited || ((entry, account, mcpConfig, hooks = {}) => resumeExitedAccountHandoff(entry, account, mcpConfig,
+      { ...deps, ...hooks })),
     waitForAccountRecord: deps.waitForAccountRecord || ((sid, pane, accountId, after) => waitForAccountRecord(sid, pane, accountId, after, deps)),
     continueSession: deps.continueSession || ((sessionId, text, options) => continueAccountHandoff(sessionId, body.pane, body.accountId,
       text, options?.deliveryId, options, { ...deps, deliveryDirectory })),

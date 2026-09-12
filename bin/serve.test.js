@@ -2986,12 +2986,15 @@ test('handoff continuation receipts are bound to the staged target transcript', 
   const env = { KEEP_DIR: root, KEEP_CONFIG: config };
   const accountStore = require('./accounts');
   accountStore.pinSession(sid, 'claude', 'source', { root, env });
-  accountStore.stageSession(sid, 'target', 'tx-delivery', { root, env });
+  accountStore.stageSession(sid, 'target', 'tx-handoff', { root, env });
   const message = 'Continue from the limit.';
+  const targetIdentity = { pane: 'pane-target', panePid: 40, paneCreatedAt: 100, sessionId: sid,
+    accountId: 'target', transactionId: 'tx-handoff', agentPid: 41, agentPidStart: 'agent-start', sessionStartedAt: 200 };
   let draft = '';
   const host = recordingHost((type, params) => {
     if (type === 'list') return { panes: [{ id: 'pane-target', alive: true,
-      meta: { sessionId: sid, agent: 'claude', accountId: 'target', handoffTransactionId: 'tx-delivery' } }] };
+      agentAlive: true, pid: 40, createdAt: 100,
+      meta: { sessionId: sid, agent: 'claude', accountId: 'target', handoffTransactionId: 'tx-handoff' } }] };
     if (type === 'screen') return { text: `────────────────────\n❯ ${draft}`, cursor: { x: draft.length + 2, y: 1 } };
     if (type === 'input') {
       const value = Buffer.from(params.data, 'base64').toString();
@@ -3005,7 +3008,12 @@ test('handoff continuation receipts are bound to the staged target transcript', 
   });
   try {
     const result = await continueAccountHandoff(sid, 'pane-target', 'target', message, 'tx-delivery', {
+      agent: 'claude', transactionId: 'tx-handoff', sourceStopVerifiedAt: 1, targetIdentity,
+    }, {
       root, env, host, sleep: async () => {}, deliveryDirectory: path.join(root, '.keep', 'delivery'),
+      readPaneRecord: () => ({ pane: 'pane-target', accountId: 'target', startedAt: 200 }),
+      agentProcessRows: async () => [], liveSessionPids: async () => new Map([[sid,
+        { agent: 'claude', primary: true, pid: 41, pidStart: 'agent-start' }]]),
     });
     assert.equal(result.delivery, 'received');
     assert.deepEqual(require('./delivery').statusForText(path.join(root, '.keep', 'delivery'), message, 'tx-delivery'),
@@ -3036,9 +3044,13 @@ test('Codex handoff continuation uses only the exact staged target rollout', asy
   const accountStore = require('./accounts');
   accountStore.pinSession(sid, 'codex', 'codex-source', { root, env });
   accountStore.stageSession(sid, 'codex-target', 'codex-delivery', { root, env });
+  const targetIdentity = { pane: 'pane-codex-target', panePid: 50, paneCreatedAt: 300, sessionId: sid,
+    accountId: 'codex-target', transactionId: 'codex-delivery', agentPid: 51,
+    agentPidStart: 'codex-agent-start', sessionStartedAt: 400 };
   let draft = '';
   const host = recordingHost((type, params) => {
     if (type === 'list') return { panes: [{ id: 'pane-codex-target', alive: true,
+      agentAlive: true, pid: 50, createdAt: 300,
       meta: { sessionId: sid, agent: 'codex', accountId: 'codex-target', handoffTransactionId: 'codex-delivery' } }] };
     if (type === 'screen') return { text: draft ? `› ${draft}` : '› Ask Codex to do anything',
       cursor: { x: draft.length + 2, y: 0 } };
@@ -3055,8 +3067,15 @@ test('Codex handoff continuation uses only the exact staged target rollout', asy
   try {
     const message = 'Continue the exact Codex conversation.';
     const result = await continueAccountHandoff(sid, 'pane-codex-target', 'codex-target', message,
-      'codex-delivery', { agent: 'codex', targetTranscript: targetFile }, {
+      'codex-delivery', { agent: 'codex', targetTranscript: targetFile, transactionId: 'codex-delivery',
+        sourceStopVerifiedAt: 1, targetIdentity }, {
         root, env, host, sleep: async () => {}, deliveryDirectory: path.join(root, '.keep', 'delivery'),
+        readPaneRecord: () => ({ pane: 'pane-codex-target', accountId: 'codex-target', startedAt: 400 }),
+        agentProcessRows: async () => [], liveSessionPids: async (liveDeps) => {
+          assert.equal(liveDeps.codexRolloutOnly, true);
+          return new Map([[sid, { agent: 'codex', primary: true, pid: 51, pidStart: 'codex-agent-start',
+            source: 'rollout', rolloutFile: targetFile }]]);
+        },
       });
     assert.equal(result.delivery, 'received');
     assert.doesNotMatch(fs.readFileSync(sourceFile, 'utf8'), /exact Codex conversation/);
@@ -3069,29 +3088,134 @@ test('Codex handoff continuation uses only the exact staged target rollout', asy
   } finally { fs.rmSync(base, { recursive: true, force: true }); }
 });
 
+test('native handoff continuation refuses destination identity changes immediately before injection', async (t) => {
+  const cases = [
+    {
+      name: 'replacement pane after readiness',
+      onScreen(state) { state.pane.pid = 999; state.pane.createdAt = 301; },
+    },
+    {
+      name: 'account changes while agent proof waits',
+      async onLive(state, call) {
+        if (call === 1) {
+          await Promise.resolve();
+          state.pane.meta.accountId = 'other-account';
+        }
+      },
+    },
+    {
+      name: 'transaction changes while agent proof waits',
+      async onLive(state, call) {
+        if (call === 1) {
+          await Promise.resolve();
+          state.pane.meta.handoffTransactionId = 'other-transaction';
+        }
+      },
+    },
+    {
+      name: 'primary agent process is replaced',
+      agentIdentity: { agent: 'codex', primary: true, pid: 999, pidStart: 'replacement-start', source: 'rollout' },
+    },
+    {
+      name: 'primary agent owns another rollout',
+      wrongRollout: true,
+    },
+    {
+      name: 'SessionStart record belongs to another incarnation',
+      paneRecord: { pane: 'pane-guard', accountId: 'target', startedAt: 401 },
+    },
+    {
+      name: 'saved destination identity is incomplete',
+      omitIdentityField: 'agentPidStart',
+    },
+  ];
+
+  for (const scenario of cases) await t.test(scenario.name, async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-native-handoff-guard-'));
+    const root = path.join(base, 'registry'), source = path.join(base, 'source'), target = path.join(base, 'target');
+    const sid = '11111111-1111-4111-8111-111111111111';
+    const targetFile = path.join(target, 'sessions', `rollout-${sid}.jsonl`);
+    fs.mkdirSync(path.dirname(targetFile), { recursive: true }); fs.mkdirSync(source); fs.mkdirSync(root);
+    fs.writeFileSync(targetFile, [
+      { type: 'session_meta', payload: { id: sid, cwd: base } },
+      { type: 'event_msg', payload: { type: 'task_complete' } },
+    ].map(JSON.stringify).join('\n') + '\n');
+    if (scenario.wrongRollout) fs.writeFileSync(path.join(source, 'foreign-rollout.jsonl'), fs.readFileSync(targetFile));
+    const config = path.join(base, 'config.json');
+    fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+      { id: 'source', label: 'Source', agent: 'codex', configDir: source },
+      { id: 'target', label: 'Target', agent: 'codex', configDir: target },
+    ], defaultAccounts: { codex: 'source' } }));
+    const env = { KEEP_DIR: root, KEEP_CONFIG: config };
+    const accountStore = require('./accounts');
+    accountStore.pinSession(sid, 'codex', 'source', { root, env });
+    accountStore.stageSession(sid, 'target', 'tx-guard', { root, env });
+    const state = { pane: { id: 'pane-guard', alive: true, agentAlive: true, pid: 50, createdAt: 300,
+      meta: { sessionId: sid, agent: 'codex', accountId: 'target', handoffTransactionId: 'tx-guard' } } };
+    const targetIdentity = { pane: 'pane-guard', panePid: 50, paneCreatedAt: 300, sessionId: sid,
+      accountId: 'target', transactionId: 'tx-guard', agentPid: 51,
+      agentPidStart: 'agent-start', sessionStartedAt: 400 };
+    if (scenario.omitIdentityField) delete targetIdentity[scenario.omitIdentityField];
+    let screenCalls = 0, liveCalls = 0, inputCalls = 0;
+    const host = recordingHost((type) => {
+      if (type === 'list') return { panes: [{ ...state.pane, meta: { ...state.pane.meta } }] };
+      if (type === 'screen') {
+        screenCalls++;
+        if (screenCalls === 1) scenario.onScreen?.(state);
+        return { text: '› Ask Codex to do anything', cursor: { x: 2, y: 0 } };
+      }
+      if (type === 'input') inputCalls++;
+      return {};
+    });
+    try {
+      await assert.rejects(continueAccountHandoff(sid, 'pane-guard', 'target', 'Do not send this.',
+        `delivery-${scenario.name}`, { agent: 'codex', targetTranscript: targetFile,
+          transactionId: 'tx-guard', sourceStopVerifiedAt: 1, targetIdentity }, {
+          root, env, host, sleep: async () => {}, deliveryDirectory: path.join(root, '.keep', 'delivery'),
+          readPaneRecord: () => scenario.paneRecord || { pane: 'pane-guard', accountId: 'target', startedAt: 400 },
+          agentProcessRows: async () => [],
+          liveSessionPids: async (liveDeps) => {
+            assert.equal(isInjectionBusy(), true, 'identity proof must run under the real injection lock');
+            assert.equal(liveDeps.codexRolloutOnly, true);
+            liveCalls++;
+            await scenario.onLive?.(state, liveCalls);
+            return new Map([[sid, scenario.agentIdentity
+              || { agent: 'codex', primary: true, pid: 51, pidStart: 'agent-start', source: 'rollout',
+                rolloutFile: scenario.wrongRollout ? path.join(source, 'foreign-rollout.jsonl') : targetFile }]]);
+          },
+        }), /destination (?:identity is incomplete|(?:pane|agent|rollout ownership|SessionStart) (?:identity )?changed)/);
+      assert.equal(inputCalls, 0, 'the destination must not receive text or Enter');
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
+  });
+});
+
 test('exited Codex handoff recovery launches in the frozen latest turn cwd', async () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-handoff-cwd-'));
   const cwd = path.join(base, 'latest-turn-worktree'); fs.mkdirSync(cwd);
   const sid = '11111111-1111-4111-8111-111111111111';
   const account = { id: 'codex-target', label: 'Codex Target', agent: 'codex', configDir: path.join(base, 'profile') };
   fs.mkdirSync(account.configDir);
-  const pane = { id: 'pane-codex-cwd', pid: 10, alive: false, cols: 100, rows: 30,
+  const pane = { id: 'pane-codex-cwd', pid: 10, createdAt: 100, alive: false, cols: 100, rows: 30,
     meta: { sessionId: sid, agent: 'codex', accountId: 'codex-source' } };
-  let replacement = null;
+  let replacement = null; const events = [];
   const host = recordingHost((type, params) => {
     if (type === 'get') return { pane };
     assert.equal(type, 'replace-exited'); replacement = params;
-    return { pane: { ...pane, pid: 20, alive: true } };
+    return { pane: { ...pane, pid: 20, createdAt: 200, alive: true } };
   });
   try {
     const result = await resumeExitedAccountHandoff({ id: 'tx-cwd', sessionId: sid, pane: pane.id, pid: pane.pid,
       agent: 'codex', cwd, cols: pane.cols, rows: pane.rows,
       resumeSpec: { argv: ['codex', '--sandbox', 'workspace-write', 'resume', sid] } }, account, null, {
       host, agentProcessRows: async () => [],
-      waitForHostAgent: async (target, agent) => { assert.deepEqual(target, { pane: pane.id }); assert.equal(agent, 'codex'); },
+      onLaunched: async (launch) => { events.push(['launched', launch]); },
+      waitForHostAgent: async (target, agent) => {
+        events.push(['ready']); assert.deepEqual(target, { pane: pane.id }); assert.equal(agent, 'codex');
+      },
     });
-    assert.equal(result.pid, 20); assert.equal(replacement.cwd, cwd);
+    assert.equal(result.pid, 20); assert.equal(result.createdAt, 200); assert.equal(replacement.cwd, cwd);
     assert.equal(replacement.meta.handoffTransactionId, 'tx-cwd');
+    assert.deepEqual(events, [['launched', { ok: true, pane: pane.id, pid: 20, createdAt: 200, sessionId: sid }], ['ready']]);
   } finally { fs.rmSync(base, { recursive: true, force: true }); }
 });
 
@@ -3388,7 +3512,19 @@ test('live process discovery keeps argv, Claude child environment, and Codex rol
   assert.deepEqual({ pid: live.get('fresh-claude').pid, source: live.get('fresh-claude').source }, { pid: 10, source: 'child-env' });
   assert.deepEqual({ pid: live.get('flagged-codex').pid, source: live.get('flagged-codex').source }, { pid: 30, source: 'argv' });
   assert.equal(live.get('22222222-2222-4222-8222-222222222222').primary, true);
+  assert.equal(live.get('22222222-2222-4222-8222-222222222222').rolloutFile, newRollout);
   assert.equal(live.get('11111111-1111-4111-8111-111111111111').primary, false);
+  const rolloutOnly = await liveSessionPids({
+    agentProcessRows: async () => rows,
+    psEnv: async () => '',
+    lsof: async () => `p20\nn${newRollout}\n`,
+    statMtime: async () => 200,
+    codexRolloutOnly: true,
+  });
+  assert.equal(rolloutOnly.has('flagged-codex'), false);
+  assert.deepEqual({ source: rolloutOnly.get('22222222-2222-4222-8222-222222222222').source,
+    rolloutFile: rolloutOnly.get('22222222-2222-4222-8222-222222222222').rolloutFile },
+  { source: 'rollout', rolloutFile: newRollout });
 });
 
 test('live session tick merges direct host bindings without pane-record backfill', async () => {
