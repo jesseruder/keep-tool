@@ -20,14 +20,19 @@ test('startup context points both agents at the shared skill without duplicating
     assert.doesNotMatch(r.stdout, /Conventions: \/keep|run its check recipe/);
   } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 });
-test('agent-facing scheduling contract is present in skill, README, and CLI help', () => {
+test('agent-facing scheduling contract is present in skill, README, and CLI help', (t) => {
+  const keepRoot = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'keep-guidance-help-'));
+  fs.mkdirSync(path.join(keepRoot, 'tasks'));
+  t.after(() => fs.rmSync(keepRoot, { recursive: true, force: true }));
   for (const file of ['skills/keep/SKILL.md', 'README.md', 'docs/session-reliability.md']) {
     const text = fs.readFileSync(path.join(root, file), 'utf8');
     assert.match(text, /--handoff needs-input/, file);
     assert.match(text, /turn-scoped/, file);
   }
   for (const args of [['help'], ['checkin', '--help']]) {
-    const r = spawnSync(process.execPath, [path.join(root, 'bin/keep.js'), ...args], { encoding: 'utf8' });
+    const r = spawnSync(process.execPath, [path.join(root, 'bin/keep.js'), ...args], {
+      encoding: 'utf8', env: { ...process.env, KEEP_DIR: keepRoot },
+    });
     assert.equal(r.status, 0, r.stderr);
     assert.match(r.stdout, /--handoff waiting\|needs-input/);
     assert.match(r.stdout, /--check "recipe"/);

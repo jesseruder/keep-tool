@@ -16,7 +16,7 @@ function fixture(run, failSpawn = false) {
     writeFileSync(file, value) { files.set(file, value); },
     renameSync(from, to) { files.set(to, files.get(from)); files.delete(from); },
   };
-  const context = vm.createContext({ module: { exports: {} }, process: { pid: 123, env: { CLAUDE_CODE_SESSION_ID: 'parent', CODEX_THREAD_ID: 'parent', KEEP_TASK: 'unrelated-card', ANTHROPIC_API_KEY: 'test-key' }, stderr: { write() {} } }, setTimeout: () => 1, clearTimeout() {},
+  const context = vm.createContext({ module: { exports: {} }, process: { pid: 123, env: { KEEP_DIR: '/unrelated-keep-registry', CLAUDE_CODE_SESSION_ID: 'parent', CODEX_THREAD_ID: 'parent', KEEP_TASK: 'unrelated-card', ANTHROPIC_API_KEY: 'test-key' }, stderr: { write() {} } }, setTimeout: () => 1, clearTimeout() {},
     require: name => name === 'fs' ? fakeFs : name === './keep.js' ? { ROOT: '/unrelated-keep-checkout' } : name === 'child_process' ? {
       spawn(cmd, args, options) {
         if (failSpawn) throw Error('spawn failed');
