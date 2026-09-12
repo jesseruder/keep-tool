@@ -94,7 +94,12 @@ const {
   claudeMcpMenuVisible,
   continueAccountHandoff,
   listPortableTransfers,
+  inspectPortableSource,
+  portableTransferDraft,
+  preparePortableTransfer,
+  portableTransferPreview,
   transferSession,
+  resolvePortableTransfer,
   InjectionError,
 } = require('./serve.js');
 const { createScreenHistoryCache } = require('./screen-history.js');
@@ -3458,6 +3463,69 @@ test('portable transfer API lists safe records and launches only an existing tra
   });
   await assert.rejects(transferSession({ transferId: '../bad' }, { portable }),
     (error) => error.status === 400 && /invalid/.test(error.message));
+});
+
+test('desktop portable APIs accept bounded text and ids without browser-controlled read paths', async () => {
+  const id = 'b'.repeat(64);
+  const safe = { id, status: 'prepared', policyVersion: 2, sourceSessionId: 'source-session-1234', sourceAgent: 'claude',
+    sourceAccountId: 'claude/default', targetAccountId: 'codex-secondary', targetAgent: 'codex', cardId: 'card', cwd: '/worktree' };
+  const calls = [];
+  const portable = {
+    draft: async (request) => { calls.push(['draft', request]); return { sourceSessionId: request.sourceSessionId }; },
+    run: async (request) => { calls.push(['prepare', request]); return { requestKey: id }; },
+    readPreview: (transferId, deps) => { calls.push(['preview', transferId, deps.root]); return { transfer: safe, preview: '# saved package' }; },
+  };
+  assert.deepEqual(await portableTransferDraft({ sourceSessionId: 'source-session-1234' }, {
+    root: '/keep', portable, accounts: {}, inspectSource: async () => {},
+  }), { ok: true, draft: { sourceSessionId: 'source-session-1234' } });
+  const prepared = await preparePortableTransfer({ sourceSessionId: 'source-session-1234', accountId: 'codex-secondary',
+    model: 'gpt-5.6-sol', cwd: '/worktree', context: 'Continue only after Jesse asks.' }, {
+    root: '/keep', portable, accounts: {}, inspectSource: async () => {}, storePackage: async () => {},
+  });
+  assert.equal(prepared.preview, '# saved package');
+  assert.deepEqual(calls.find(([kind]) => kind === 'prepare')[1], { sourceSessionId: 'source-session-1234',
+    accountId: 'codex-secondary', model: 'gpt-5.6-sol', cwd: '/worktree', contextText: 'Continue only after Jesse asks.', prepareOnly: true });
+  assert.deepEqual(portableTransferPreview({ transferId: id }, { root: '/keep', portable }),
+    { ok: true, transfer: safe, preview: '# saved package' });
+  for (const forbidden of ['contextFile', 'artifactFile', 'transcriptFile']) {
+    await assert.rejects(preparePortableTransfer({ sourceSessionId: 'source-session-1234', accountId: 'codex-secondary',
+      context: 'bounded', [forbidden]: '/etc/passwd' }, { portable }),
+    (error) => error.status === 400 && /unsupported fields/.test(error.message));
+  }
+  await assert.rejects(preparePortableTransfer({ sourceSessionId: 'source-session-1234', accountId: 'codex-secondary',
+    context: 'x'.repeat(512 * 1024 + 1) }, { portable }), (error) => error.status === 400 && /too large/.test(error.message));
+});
+
+test('portable source inspection treats failed native handoff as terminal and finds committed portable successors', async () => {
+  const state = { sessions: [{ id: 'source-session', endedTurn: true }], panes: [],
+    handoffs: [{ sessionId: 'source-session', status: 'failed' }] };
+  const portable = { list: () => [{ id: 'c'.repeat(64), sourceSessionId: 'source-session', status: 'done' }] };
+  const inspected = await inspectPortableSource('source-session', {}, { inspectState: async () => state, portable, root: '/keep' });
+  assert.equal(inspected.nativeHandoff, undefined);
+  assert.equal(inspected.portableHandoff.status, 'done');
+});
+
+test('ambiguous resolver requires matching account, card, pane transfer marker, and delivered-opening receipt', async () => {
+  const id = 'd'.repeat(64);
+  const transfer = { version: 1, requestKey: id, status: 'ambiguous', sourceSessionId: 'source-session',
+    targetAccountId: 'codex-two', targetAgent: 'codex', cardId: 'card-source', launchStartedAt: 100 };
+  const session = { id: 'destination-session', accountId: 'codex-two', taskId: 'card-source' };
+  const pane = { id: 'destination-pane', meta: { sessionId: session.id, portableTransferId: id } };
+  let receipt = { pane: pane.id, deliveredAt: 101 };
+  const portable = {
+    list: () => [], safeSummary: (value) => value,
+    deliveryReceipt: () => receipt,
+    resolvePrepared: async (transferId, destinationSessionId, deps) => {
+      assert.equal(transferId, id); assert.equal(destinationSessionId, session.id);
+      if (!await deps.validateResolution(destinationSessionId, transfer)) throw Object.assign(new Error('destination mismatch'), { status: 409 });
+      return { ...transfer, status: 'done', destinationSessionId };
+    },
+  };
+  const deps = { root: '/keep', portable, accounts: {}, inspectSource: async () => {}, storePackage: async () => {},
+    inspectState: async () => ({ sessions: [session], panes: [pane], handoffs: [] }) };
+  assert.equal((await resolvePortableTransfer({ transferId: id, destinationSessionId: session.id }, deps)).transfer.status, 'done');
+  receipt = null;
+  await assert.rejects(resolvePortableTransfer({ transferId: id, destinationSessionId: session.id }, deps), /destination mismatch/);
 });
 
 test('explicit account launches stay pinned when the session is resumed', async () => {

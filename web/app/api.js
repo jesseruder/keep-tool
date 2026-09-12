@@ -52,6 +52,11 @@ export function getState() {
 export const getLayouts = () => request('/api/layouts');
 export const getSessionSummary = (id) => request(`/api/sessionsummary?id=${encodeURIComponent(id)}`);
 export const getPortableTransfers = () => request('/api/portable-transfers');
+export const getPortableTransferDraft = (sessionId) => request(`/api/portable-transfer-draft?session=${encodeURIComponent(sessionId)}`);
+export const getPortableTransferPreview = (transferId) => request(`/api/portable-transfer-preview?id=${encodeURIComponent(transferId)}`);
+export const preparePortableTransfer = (body) => write('/api/portable-transfers', body);
+export const launchPortableTransfer = (transferId) => write('/api/transfer-session', { transferId });
+export const resolvePortableTransfer = (transferId, destinationSessionId) => write('/api/resolve-portable-transfer', { transferId, destinationSessionId });
 
 export function write(url, body, method = 'POST') {
   return request(url, { method, headers: WRITE_HEADERS, body: JSON.stringify(body || {}) });

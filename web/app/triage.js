@@ -362,12 +362,15 @@ function renderStage(ctx, active, focusItem, running, pinned) {
   const reopen = hasLivePane || pendingHandoff ? '' : '<button class="btn" data-reopen>Reopen</button>';
   ctx.patchHTML(stage.querySelector('.shead'), `<div class="session-heading"><h2>${ctx.esc(title)}</h2><div class="meta mono">${ctx.projectHTML(item.project || session?.project || '', true)}${item.taskId ? `<span>${ctx.esc(item.taskId)}</span>${ctx.tagsHTML(task)}` : ''}${accountLabelHTML(ctx, session, pane)}</div>${task ? modelUsageHTML(task.modelUsage) : ''}</div><div class="acts"><button class="btn" data-pin ${item.pane ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}${dependencyWait}${item.sessionId || waitingItem ? '<button class="btn" data-snooze>Snooze 1h</button><button class="btn" data-dismiss><kbd>x</kbd> Dismiss</button>' : ''}${closable ? '<button class="btn" data-close-session>Close</button>' : ''}</div>`);
   const brief = stage.querySelector('.brief');
-  if ((closable || pendingHandoff) && !session?.reviewer) {
+  if (item.sessionId && !session?.reviewer) {
     const actions = stage.querySelector('.shead .acts');
     let portable = actions.querySelector('.portable-transfer-controls');
     if (!portable) { portable = document.createElement('div'); portable.className = 'portable-transfer-controls'; actions.append(portable); }
     ctx.patchHTML(portable, portableTransferControls(ctx, item.sessionId));
     installPortableTransferControls(portable, ctx);
+  }
+  if ((closable || pendingHandoff) && !session?.reviewer) {
+    const actions = stage.querySelector('.shead .acts');
     let accounts = actions.querySelector('.account-controls');
     if (!accounts) { accounts = document.createElement('div'); accounts.className = 'account-controls'; actions.append(accounts); }
     ctx.patchHTML(accounts, handoffControls(ctx, item.sessionId, item.pane));

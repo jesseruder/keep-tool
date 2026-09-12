@@ -6448,6 +6448,7 @@ module.exports = {
   commandUsage, helpText, formatOpenResult, openCommand: commands.open, postOpen, OPEN_MESSAGE_LIMIT, OPEN_MESSAGE_ERROR, LAUNCH_MODEL_RE,
   restoreCommandCli: commands.restore, resumeCommandCli: commands.resume, resumeCommand,
   accountsCommandCli: commands.accounts, handoffCommandCli: commands.handoff, transferCommandCli: commands.transfer,
+  artifactCommandCli: commands.artifact,
   hostCommandCli: commands.host, paneCommandCli: commands.pane, attachCommandCli: commands.attach,
   resolveHostPane, renderHostPanes, parseHostSpawn,
 };

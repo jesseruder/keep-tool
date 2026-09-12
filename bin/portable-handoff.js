@@ -9,8 +9,11 @@ const { execFileSync } = require('node:child_process');
 const ID = /^[A-Za-z0-9_-]{8,160}$/;
 const ACCOUNT_ID = /^(?:[a-z0-9][a-z0-9_-]{0,63}|(?:claude|codex)\/default)$/;
 const CONTEXT_LIMIT = 512 * 1024;
+const PREVIEW_LIMIT = 768 * 1024;
 const TRANSCRIPT_TAIL = 1024 * 1024;
 const EXCERPT_LIMIT = 64 * 1024;
+const DESKTOP_POLICY_VERSION = 2;
+const CLAUDE_DEFAULT_MODEL = 'claude-fable-5-1';
 
 function problem(message, code = 'KEEP_PORTABLE_TRANSFER', status = 400) {
   const error = new Error(message); error.code = code; error.status = status; return error;
@@ -147,8 +150,7 @@ function defaultGitSnapshot(cwd) {
   const result = { cwd, available: false, top: '', commonDir: '', head: '', branch: '', status: '' };
   try {
     result.top = path.resolve(run(['rev-parse', '--show-toplevel']));
-    const common = run(['rev-parse', '--git-common-dir']);
-    result.commonDir = path.resolve(result.top, common);
+    result.commonDir = path.resolve(run(['rev-parse', '--path-format=absolute', '--git-common-dir']));
     result.head = run(['rev-parse', 'HEAD']);
     result.branch = run(['rev-parse', '--abbrev-ref', 'HEAD']);
     result.status = run(['status', '--short', '--untracked-files=normal']).slice(0, 64 * 1024);
@@ -158,12 +160,33 @@ function defaultGitSnapshot(cwd) {
 }
 
 function transactionFile(root, key) { return path.join(root, '.keep', 'portable-transfers', `${key}.json`); }
+function deliveryFile(root, key) { return path.join(root, '.keep', 'portable-transfers', `${key}.delivery.json`); }
+function sourceLockFile(root, sessionId) { return path.join(root, '.keep', 'portable-transfers', `.source-${digest(sessionId)}.json`); }
 function readJson(file) { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (error) { if (error.code === 'ENOENT') return null; throw error; } }
 function writeJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(temp, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
   fs.renameSync(temp, file);
+}
+
+function recordDelivery(transferId, launch, deps = {}) {
+  if (!/^[a-f0-9]{64}$/.test(transferId || '') || !ID.test(launch?.pane || '')) throw problem('portable transfer delivery receipt is invalid');
+  const root = path.resolve(deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep'));
+  const state = readJson(transactionFile(root, transferId));
+  if (!safeSummary(state) || state.requestKey !== transferId || state.status !== 'launching') {
+    throw problem('portable transfer delivery receipt has no active launch', 'KEEP_PORTABLE_TRANSFER_RECEIPT', 409);
+  }
+  const receipt = { version: 1, transferId, pane: launch.pane, deliveredAt: Date.now() };
+  writeJson(deliveryFile(root, transferId), receipt);
+  return receipt;
+}
+
+function deliveryReceipt(transferId, deps = {}) {
+  if (!/^[a-f0-9]{64}$/.test(transferId || '')) return null;
+  const root = path.resolve(deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep'));
+  const value = readJson(deliveryFile(root, transferId));
+  return value?.version === 1 && value.transferId === transferId && ID.test(value.pane || '') && Number.isFinite(value.deliveredAt) ? value : null;
 }
 
 function safeSummary(state) {
@@ -179,6 +202,8 @@ function safeSummary(state) {
     sourceAccountId: state.sourceAccountId || '',
     targetAccountId: state.targetAccountId,
     targetAgent: state.targetAgent,
+    ...(state.model ? { model: state.model } : {}),
+    ...(state.policyVersion ? { policyVersion: state.policyVersion } : {}),
     cardId: state.cardId,
     cwd: state.cwd,
     artifactFile: state.artifactFile,
@@ -187,6 +212,92 @@ function safeSummary(state) {
     preparedAt: state.preparedAt,
     ...(state.completedAt ? { completedAt: state.completedAt } : {}),
     ...(state.resolvedAt ? { completedAt: state.resolvedAt } : {}),
+  };
+}
+
+function modelCompatible(agent, model) {
+  if (!model) return true;
+  if (agent === 'claude') return !/^(?:gpt-|o\d|codex(?:[-_.:]|$))/i.test(model);
+  return !/^(?:claude-|opus(?:[-_.:]|$)|sonnet(?:[-_.:]|$)|haiku(?:[-_.:]|$)|fable(?:[-_.:]|$))/i.test(model);
+}
+
+function sourceBusyReason(inspection) {
+  const session = inspection?.session;
+  if (!session) return 'source session activity could not be verified';
+  if (inspection.nativeHandoff) return 'source has an unresolved account handoff';
+  if (inspection.portableHandoff) return 'source has another unresolved portable transfer';
+  if (session.toolRunning) return 'a source tool is still running';
+  if (session.pendingOther) return 'the source has an unfinished tool call';
+  if (session.pendingBackground || session.unknownBackgroundJobs?.length) return 'the source has unfinished background work';
+  if (session.observation?.foreground?.state === 'active' || session.observation?.foreground?.hook?.state === 'running') {
+    return 'the source foreground turn is still running';
+  }
+  if (session.endedTurn === true || session.exited === true || session.state === 'exited') return '';
+  return 'the source turn has not ended';
+}
+
+async function inspectReady(sourceSessionId, deps, options = {}) {
+  if (!deps.inspectSource) throw problem('portable transfer source inspection is unavailable', 'KEEP_PORTABLE_TRANSFER_UNAVAILABLE', 503);
+  const inspection = await deps.inspectSource(sourceSessionId, options);
+  const reason = sourceBusyReason(inspection);
+  if (reason) throw problem(`portable transfer is unavailable: ${reason}`, 'KEEP_PORTABLE_TRANSFER_SOURCE_BUSY', 409);
+  return inspection;
+}
+
+function contextValue(request) {
+  if (request.contextText != null) {
+    if (typeof request.contextText !== 'string') throw problem('continuation context must be text');
+    const bytes = Buffer.byteLength(request.contextText);
+    if (!request.contextText.trim()) throw problem('continuation context is empty');
+    if (bytes > CONTEXT_LIMIT) throw problem('continuation context is too large');
+    return { file: '', text: request.contextText, digest: digest(request.contextText) };
+  }
+  return stableFile(request.contextFile, CONTEXT_LIMIT);
+}
+
+function snapshotDigest(transcript, git, facts = {}) {
+  return digest(JSON.stringify({ transcript: transcript.digest, size: transcript.size,
+    git: git.available ? { top: git.top, commonDir: git.commonDir, head: git.head, branch: git.branch, status: git.status } : null,
+    sourceAgent: facts.sourceAgent || '', sourceAccountId: facts.sourceAccountId || '', cardId: facts.cardId || '',
+    cardTitle: facts.cardTitle || '', cardStatus: facts.cardStatus || '', nextStep: facts.nextStep || '',
+  }));
+}
+
+function snapshotFacts(source, task, nextStep) {
+  return { sourceAgent: source.agent, sourceAccountId: source.accountId || '', cardId: task.id,
+    cardTitle: task.fm?.title || task.title || '', cardStatus: task.fm?.status || '',
+    nextStep: typeof nextStep === 'string' ? nextStep : nextStep?.text || '' };
+}
+
+function defaultContinuation(task, nextStep) {
+  const step = typeof nextStep === 'string' ? nextStep : nextStep?.text;
+  return [`Continue card ${task.id}${task.fm?.title ? ` (${task.fm.title})` : ''}.`,
+    step ? `After you are asked to resume: ${step}` : 'After you are asked to resume, review the card and determine the next unfinished step.',
+  ].join('\n\n');
+}
+
+async function draft(request, deps = {}) {
+  const root = path.resolve(deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep'));
+  const env = deps.env || process.env;
+  const sessionId = String(request?.sourceSessionId || '');
+  if (!ID.test(sessionId)) throw problem('source session id is invalid');
+  const inspection = await inspectReady(sessionId, deps, { preparing: true });
+  const source = { ...(deps.sourceFor || defaultSource)(sessionId, { root, env }), id: sessionId };
+  const task = (deps.taskForSession || (() => require('./keep.js').taskForSession(sessionId)))(sessionId);
+  if (!task?.id) throw problem('Link this session to a task before transferring', 'KEEP_PORTABLE_TRANSFER_CARD', 409);
+  const accounts = deps.accounts || require('./accounts');
+  const choices = accounts.list(env).filter((account) => !source.accountId || account.id !== source.accountId)
+    .map(({ id, label, agent }) => ({ id, label, agent }));
+  if (!choices.length) throw problem('no distinct destination account is configured', 'KEEP_PORTABLE_TRANSFER_ACCOUNT', 409);
+  const preferred = choices.find((account) => account.agent === source.agent) || choices[0];
+  const nextStep = deps.nextStep ? deps.nextStep(task) : require('./keep.js').nextStep(task);
+  return {
+    sourceSessionId: sessionId, sourceAgent: source.agent, sourceAccountId: source.accountId || '',
+    cardId: task.id, cardTitle: task.fm?.title || task.title || '', cwd: source.cwd || inspection?.session?.project || task.fm?.project || '',
+    accounts: choices, accountId: preferred.id,
+    model: preferred.agent === 'claude' ? CLAUDE_DEFAULT_MODEL : '',
+    context: defaultContinuation(task, nextStep),
+    pausePolicy: 'The successor must read this package, the card, and the worktree; acknowledge that it is ready, then WAIT. It must not implement, push, deploy, or spawn subagents until a new instruction arrives from Jesse or the user. Automated card and Stop-hook reminders do not resume it.',
   };
 }
 
@@ -236,11 +347,31 @@ async function launchState(state, stateFile, deps) {
   }
   if (state.status !== 'prepared') throw problem('portable transfer is not prepared');
   if (!deps.open) throw problem('portable transfer launcher is unavailable', 'KEEP_PORTABLE_TRANSFER_UNAVAILABLE', 503);
+  if (state.policyVersion === DESKTOP_POLICY_VERSION) {
+    await inspectReady(state.sourceSessionId, deps, { launching: true, transferId: state.requestKey });
+    const source = { ...(deps.sourceFor || defaultSource)(state.sourceSessionId, {
+      root: deps.root, env: deps.env || process.env,
+    }), id: state.sourceSessionId };
+    const transcript = transcriptSnapshot(source.file);
+    const git = (deps.gitSnapshot || defaultGitSnapshot)(state.cwd);
+    const task = (deps.taskForSession || (() => require('./keep.js').taskForSession(state.sourceSessionId)))(state.sourceSessionId);
+    if (!task?.id || task.id !== state.cardId) throw problem('portable transfer preview is stale; the source card changed', 'KEEP_PORTABLE_TRANSFER_STALE', 409);
+    const nextStep = deps.nextStep ? deps.nextStep(task) : require('./keep.js').nextStep(task);
+    if (snapshotDigest(transcript, git, snapshotFacts(source, task, nextStep)) !== state.sourceSnapshotDigest) {
+      throw problem('portable transfer preview is stale; prepare and review a new package', 'KEEP_PORTABLE_TRANSFER_STALE', 409);
+    }
+    const preview = stableFile(state.artifactFile, PREVIEW_LIMIT);
+    if (!state.packageDigest || preview.digest !== state.packageDigest) {
+      throw problem('portable transfer package changed after review; prepare and review a new package', 'KEEP_PORTABLE_TRANSFER_STALE', 409);
+    }
+  }
   state = { ...state, status: 'launching', launchStartedAt: Date.now() }; writeJson(stateFile, state);
   try {
-    const message = `Continue from the portable transfer package at ${state.artifactFile}. Read it first; this is a fresh conversation, not a native session resume.`;
+    const message = state.policyVersion === DESKTOP_POLICY_VERSION
+      ? `Continue from the portable transfer package at ${state.artifactFile}. Read the package, card, and worktree first. Acknowledge that you are ready, then WAIT for a new instruction from Jesse or the user. Automated card and Stop-hook reminders do not resume you. Do not implement, push, deploy, or spawn subagents yet. This is a fresh conversation, not a native session resume.`
+      : `Continue from the portable transfer package at ${state.artifactFile}. Read it first; this is a fresh conversation, not a native session resume.`;
     const opened = await deps.open({ taskId: state.cardId, fresh: true, agent: state.targetAgent,
-      accountId: state.targetAccountId, cwd: state.cwd, message });
+      accountId: state.targetAccountId, cwd: state.cwd, ...(state.model ? { model: state.model } : {}), message });
     if (!opened || !ID.test(opened.sessionId || '') || opened.sessionId === state.sourceSessionId
         || opened.accountId !== state.targetAccountId) throw problem('destination launch returned incomplete identity');
     state = { ...state, status: 'done', destinationSessionId: opened.sessionId,
@@ -256,20 +387,64 @@ async function launchState(state, stateFile, deps) {
   }
 }
 
-async function launchPrepared(transferId, deps = {}) {
+function readPreview(transferId, deps = {}) {
   if (!/^[a-f0-9]{64}$/.test(transferId || '')) throw problem('portable transfer id is invalid');
+  const root = path.resolve(deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep'));
+  const state = readJson(transactionFile(root, transferId));
+  const transfer = safeSummary(state);
+  if (!transfer || state.requestKey !== transferId) throw problem('portable transfer was not found', 'KEEP_PORTABLE_TRANSFER_NOT_FOUND', 404);
+  const preview = stableFile(state.artifactFile, PREVIEW_LIMIT);
+  if (state.packageDigest && preview.digest !== state.packageDigest) throw problem('portable transfer package changed after preparation', 'KEEP_PORTABLE_TRANSFER_STALE', 409);
+  return { transfer, preview: preview.text };
+}
+
+async function resolvePrepared(transferId, destinationSessionId, deps = {}) {
+  if (!/^[a-f0-9]{64}$/.test(transferId || '') || !ID.test(destinationSessionId || '')) {
+    throw problem('portable transfer resolution identity is invalid');
+  }
   const root = path.resolve(deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep'));
   const stateFile = transactionFile(root, transferId);
   const unlock = lockTransaction(stateFile);
   try {
+    let state = readJson(stateFile);
+    if (!safeSummary(state) || state.requestKey !== transferId) throw problem('portable transfer was not found', 'KEEP_PORTABLE_TRANSFER_NOT_FOUND', 404);
+    if (state.status === 'done') return { ...state, repeated: true, stateFile };
+    if (!['launching', 'ambiguous'].includes(state.status)) throw problem('there is no ambiguous portable launch to resolve', 'KEEP_PORTABLE_TRANSFER_RESOLUTION', 409);
+    if (destinationSessionId === state.sourceSessionId) throw problem('resolved destination session id is invalid');
+    if (!deps.validateResolution || !await deps.validateResolution(destinationSessionId, state)) {
+      throw problem('destination session does not match the requested account, card, and launch', 'KEEP_PORTABLE_TRANSFER_RESOLUTION', 409);
+    }
+    state = { ...state, status: 'done', destinationSessionId, resolvedAt: Date.now() };
+    writeJson(stateFile, state);
+    return { ...state, stateFile };
+  } finally { unlock(); }
+}
+
+async function launchPrepared(transferId, deps = {}) {
+  if (!/^[a-f0-9]{64}$/.test(transferId || '')) throw problem('portable transfer id is invalid');
+  const root = path.resolve(deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep'));
+  const stateFile = transactionFile(root, transferId);
+  const initial = readJson(stateFile);
+  if (!safeSummary(initial) || initial.requestKey !== transferId) throw problem('portable transfer was not found', 'KEEP_PORTABLE_TRANSFER_NOT_FOUND', 404);
+  const unlockSource = initial.policyVersion === DESKTOP_POLICY_VERSION ? lockTransaction(sourceLockFile(root, initial.sourceSessionId)) : () => {};
+  let unlock = () => {};
+  try {
+    unlock = lockTransaction(stateFile);
     const state = readJson(stateFile);
     const safe = safeSummary(state);
     if (!safe || state.requestKey !== transferId) throw problem('portable transfer was not found', 'KEEP_PORTABLE_TRANSFER_NOT_FOUND', 404);
+    if (state.policyVersion === DESKTOP_POLICY_VERSION) {
+      const conflict = list(root).find((candidate) => candidate.policyVersion === DESKTOP_POLICY_VERSION
+        && candidate.sourceSessionId === state.sourceSessionId && candidate.id !== transferId
+        && ['launching', 'ambiguous', 'done'].includes(candidate.status));
+      if (conflict) throw problem(`source already has a ${conflict.status} portable successor; open or resolve that transfer`,
+        'KEEP_PORTABLE_TRANSFER_SOURCE_USED', 409);
+    }
     const account = (deps.accounts || require('./accounts')).get(state.targetAccountId, deps.env || process.env);
     if (!account || account.agent !== state.targetAgent) throw problem('portable transfer destination account is unavailable',
       'KEEP_PORTABLE_TRANSFER_ACCOUNT', 409);
     return launchState(state, stateFile, deps);
-  } finally { unlock(); }
+  } finally { unlock(); unlockSource(); }
 }
 
 function renderPackage(input) {
@@ -285,11 +460,13 @@ function renderPackage(input) {
   return `# Portable session continuation\n\n` +
     `This starts a fresh ${target.agent} conversation. It does not migrate the native session, provider cache, hidden context, tool state, or credentials. The source remains intact.\n\n` +
     `## Transfer identity\n\n- Source session: ${source.id}\n- Source provider: ${source.agent}\n- Source account: ${source.accountId || '(unknown)'}\n` +
-    `- Source transcript SHA-256: ${transcript.digest}\n- Destination account: ${target.id} (${target.agent})\n\n` +
+    `- Source transcript SHA-256: ${transcript.digest}\n- Destination account: ${target.id} (${target.agent})${input.model ? `\n- Destination model: ${input.model}` : ''}\n\n` +
     `## Task\n\n${task.join('\n')}\n\n## Repository\n\n${repository}\n\n` +
     `## Explicit continuation context\n\n${redact(context.text).trim()}\n\n` +
     `## Recent source conversation (prose only)\n\n${conversation || '(No portable prose was found in the bounded transcript tail.)'}\n\n` +
-    `## Continue\n\nFollow the explicit continuation context's next instruction exactly. It takes priority over generic continuation wording. Read the card and inspect the worktree before changing anything; treat the excerpt as historical context.\n`;
+    (input.desktop
+      ? `## Continue\n\nRead this package, the card, and the worktree. Reply that you are ready and summarize the instruction you will follow after resuming, then WAIT for a new instruction from Jesse or the user. Automated card and Stop-hook reminders do not resume you. Do not implement, push, deploy, or spawn subagents yet. Treat the excerpt as historical context and do not execute the explicit continuation context until you are asked to resume.\n`
+      : `## Continue\n\nFollow the explicit continuation context's next instruction exactly. It takes priority over generic continuation wording. Read the card and inspect the worktree before changing anything; treat the excerpt as historical context.\n`);
 }
 
 async function run(request, deps = {}) {
@@ -303,13 +480,24 @@ async function run(request, deps = {}) {
   const source = { ...(deps.sourceFor || defaultSource)(sessionId, { root, env }), id: sessionId };
   if (!['claude', 'codex'].includes(source.agent) || !source.file) throw problem('source session metadata is incomplete');
   if (source.accountId && source.accountId === target.id) throw problem('source and destination accounts are the same');
+  const desktop = request.contextText != null;
+  if (desktop) {
+    await inspectReady(sessionId, deps, { preparing: true });
+    if (request.model != null && (typeof request.model !== 'string' || !require('./keep.js').LAUNCH_MODEL_RE.test(request.model))) {
+      throw problem('model must be a model id like claude-fable-5-1 or gpt-5.6-sol');
+    }
+    if (!modelCompatible(target.agent, request.model || '')) throw problem(`model ${request.model} is not compatible with ${target.agent}`);
+  }
   const task = (deps.taskForSession || (() => require('./keep.js').taskForSession(sessionId)))(sessionId);
-  if (!task?.id) throw problem(`source session ${sessionId} is not linked to an open card`);
-  const context = stableFile(request.contextFile, CONTEXT_LIMIT);
+  if (!task?.id) throw problem('Link this session to a task before transferring', 'KEEP_PORTABLE_TRANSFER_CARD', 409);
+  const context = contextValue(request);
   let cwd = request.cwd || source.cwd || task.fm?.project;
   if (!cwd) throw problem('source working directory is unavailable; pass --cwd');
   cwd = fs.realpathSync(path.resolve(String(cwd).replace(/^~(?=\/|$)/, os.homedir())));
   if (!fs.statSync(cwd).isDirectory()) throw problem('transfer cwd is not a directory');
+  if (desktop && !require('./keep.js').projectMatchesCwd(task.fm?.project || '', cwd)) {
+    throw problem('transfer cwd is not part of the card project', 'KEEP_PORTABLE_TRANSFER_CWD', 409);
+  }
   const transcript = transcriptSnapshot(source.file);
   const conversation = extractConversation(source.agent, transcript.text);
   const git = (deps.gitSnapshot || defaultGitSnapshot)(cwd);
@@ -318,8 +506,10 @@ async function run(request, deps = {}) {
   // The source transcript can append lifecycle rows merely because this command
   // is run from that session. Keep the request identity stable and freeze the
   // exact transcript digest only in the first prepared package/state record.
-  const requestKey = digest(JSON.stringify({ version: 1, sourceSessionId: sessionId,
-    targetAccountId: target.id, contextDigest: context.digest, cwd, cardId: task.id }));
+  const sourceSnapshotDigest = snapshotDigest(transcript, git, snapshotFacts(source, task, nextStep));
+  const requestKey = digest(JSON.stringify({ version: desktop ? DESKTOP_POLICY_VERSION : 1, sourceSessionId: sessionId,
+    targetAccountId: target.id, model: desktop ? request.model || '' : undefined,
+    contextDigest: context.digest, cwd, cardId: task.id, sourceSnapshotDigest: desktop ? sourceSnapshotDigest : undefined }));
   const stateFile = transactionFile(root, requestKey);
   const unlock = lockTransaction(stateFile);
   try {
@@ -345,16 +535,17 @@ async function run(request, deps = {}) {
       throw problem(`portable transfer launch is ambiguous; inspect the console, then rerun with --resolve-session <id> (${stateFile})`,
         'KEEP_PORTABLE_TRANSFER_AMBIGUOUS', 409);
     }
-    const content = renderPackage({ source, target, card: task, cwd, context, transcript, conversation, git, nextStep, taskFile });
+    const content = renderPackage({ source, target, model: desktop ? request.model || '' : '', card: task, cwd, context, transcript, conversation, git, nextStep, taskFile, desktop });
     const fileName = `portable-transfer-${requestKey.slice(0, 16)}.md`;
     if (!state) {
       if (!deps.storePackage) throw problem('portable transfer artifact storage is unavailable');
       const artifactFile = await deps.storePackage({ cardId: task.id, fileName, content,
         note: `Portable continuation from ${sessionId} to ${target.id}` });
-      state = { version: 1, requestKey, status: 'prepared', sourceSessionId: sessionId, sourceAgent: source.agent,
+      state = { version: 1, ...(desktop ? { policyVersion: DESKTOP_POLICY_VERSION } : {}), requestKey, status: 'prepared', sourceSessionId: sessionId, sourceAgent: source.agent,
         sourceAccountId: source.accountId || '', sourceTranscriptDigest: transcript.digest, targetAccountId: target.id,
-        targetAgent: target.agent, cardId: task.id, cwd, contextFile: context.file, contextDigest: context.digest,
-        artifactFile: path.resolve(artifactFile), preparedAt: Date.now() };
+        targetAgent: target.agent, ...(desktop && request.model ? { model: request.model } : {}), cardId: task.id, cwd,
+        ...(context.file ? { contextFile: context.file } : {}), contextDigest: context.digest, sourceSnapshotDigest,
+        packageDigest: digest(content), artifactFile: path.resolve(artifactFile), preparedAt: Date.now() };
       writeJson(stateFile, state);
     }
     if (request.prepareOnly) return { ...state, stateFile };
@@ -362,4 +553,5 @@ async function run(request, deps = {}) {
   } finally { unlock(); }
 }
 
-module.exports = { run, launchPrepared, list, safeSummary, extractConversation, renderPackage, defaultGitSnapshot, transactionFile };
+module.exports = { run, draft, launchPrepared, resolvePrepared, readPreview, list, safeSummary, sourceBusyReason,
+  recordDelivery, deliveryReceipt, extractConversation, renderPackage, defaultGitSnapshot, transactionFile, CLAUDE_DEFAULT_MODEL, CONTEXT_LIMIT };

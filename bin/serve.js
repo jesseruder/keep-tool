@@ -3662,6 +3662,10 @@ async function openSession(body, deps = {}) {
   if (body.requester != null && (typeof body.requester !== 'string' || !/^[A-Za-z0-9_-]+$/.test(body.requester))) {
     throw new InjectionError(400, 'bad requester session id');
   }
+  if (body.portableTransferId != null && (typeof body.portableTransferId !== 'string'
+      || !/^[a-f0-9]{64}$/.test(body.portableTransferId))) {
+    throw new InjectionError(400, 'bad portable transfer id');
+  }
 
   let project;
   let session;
@@ -3783,6 +3787,7 @@ async function openSession(body, deps = {}) {
         project,
         card: body.taskId || null,
         requester: body.requester || null,
+        ...(body.portableTransferId ? { portableTransferId: body.portableTransferId } : {}),
         launchedAt,
       },
     }, deps);
@@ -4943,16 +4948,110 @@ function listPortableTransfers(deps = {}) {
   return (deps.portable || require('./portable-handoff')).list(deps.root || keep.ROOT);
 }
 
+async function inspectPortableSource(sessionId, options = {}, deps = {}) {
+  let state;
+  if (deps.inspectState) state = await deps.inspectState();
+  else {
+    const panes = await listHostPanes(deps, true);
+    if (!panes) throw new InjectionError(503, 'terminal host is unavailable; source activity cannot be verified');
+    state = await addHostSessionState(await buildState({ hostPanes: panes }), { ...deps, panes });
+  }
+  const session = state.sessions?.find((entry) => entry.id === sessionId);
+  const nativeHandoff = (state.handoffs || require('./account-handoff').list(deps.root || keep.ROOT))
+    .find((entry) => entry.sessionId === sessionId && !['done', 'failed'].includes(entry.status));
+  const portableHandoff = listPortableTransfers(deps).find((entry) => entry.sourceSessionId === sessionId
+    && entry.id !== options.transferId && ['launching', 'ambiguous', 'done'].includes(entry.status));
+  return { session, nativeHandoff, portableHandoff, panes: state.panes || [], state };
+}
+
+function portableDeps(deps = {}) {
+  const root = deps.root || keep.ROOT;
+  const portable = deps.portable || require('./portable-handoff');
+  const storePackage = deps.storePackage || (async ({ cardId, fileName, content, note }) => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-portable-transfer-'));
+    const file = path.join(directory, fileName);
+    try {
+      fs.writeFileSync(file, content, { mode: 0o600 });
+      const stored = keep.artifactCommandCli([cardId, file, '-m', note], { quiet: true });
+      if (!stored?.[0]?.destination) throw new Error('portable transfer artifact was not stored');
+      return stored[0].destination;
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+  return {
+    ...deps, root, accounts: deps.accounts || accounts,
+    taskForSession: deps.taskForSession || keep.taskForSession,
+    nextStep: deps.nextStep || keep.nextStep,
+    taskFile: deps.taskFile || ((task) => path.join(root, 'tasks', `${task.id}.md`)),
+    storePackage,
+    inspectSource: deps.inspectSource || ((sessionId, options) => inspectPortableSource(sessionId, options, deps)),
+    open: deps.open || ((payload) => openSession(payload, deps)),
+  };
+}
+
+async function portableTransferDraft(query, deps = {}) {
+  const sourceSessionId = String(query?.get ? query.get('session') : query?.sourceSessionId || '');
+  return { ok: true, draft: await (deps.portable || require('./portable-handoff')).draft({ sourceSessionId }, portableDeps(deps)) };
+}
+
+async function preparePortableTransfer(body, deps = {}) {
+  const keys = Object.keys(body || {});
+  if (keys.some((key) => !['sourceSessionId', 'accountId', 'model', 'context', 'cwd'].includes(key))) {
+    throw new InjectionError(400, 'portable transfer preparation contains unsupported fields');
+  }
+  if (typeof body?.sourceSessionId !== 'string' || typeof body?.accountId !== 'string'
+      || typeof body?.context !== 'string' || Buffer.byteLength(body.context) > require('./portable-handoff').CONTEXT_LIMIT
+      || body.model != null && typeof body.model !== 'string'
+      || body.cwd != null && (typeof body.cwd !== 'string' || Buffer.byteLength(body.cwd) > 4096)) {
+    throw new InjectionError(400, 'portable transfer preparation is invalid or too large');
+  }
+  const portable = deps.portable || require('./portable-handoff');
+  const result = await portable.run({ sourceSessionId: body.sourceSessionId, accountId: body.accountId,
+    model: body.model || '', contextText: body.context, ...(body.cwd ? { cwd: body.cwd } : {}), prepareOnly: true }, portableDeps(deps));
+  const preview = portable.readPreview(result.requestKey, { root: deps.root || keep.ROOT });
+  return { ok: true, ...preview };
+}
+
+function portableTransferPreview(query, deps = {}) {
+  const transferId = String(query?.get ? query.get('id') : query?.transferId || '');
+  return { ok: true, ...(deps.portable || require('./portable-handoff')).readPreview(transferId, { root: deps.root || keep.ROOT }) };
+}
+
 async function transferSession(body, deps = {}) {
   if (!body || typeof body.transferId !== 'string' || !/^[a-f0-9]{64}$/.test(body.transferId)) {
     throw new InjectionError(400, 'portable transfer id is invalid');
   }
   const portable = deps.portable || require('./portable-handoff');
   const result = await portable.launchPrepared(body.transferId, {
-    ...deps,
-    root: deps.root || keep.ROOT,
-    accounts: deps.accounts || accounts,
-    open: deps.open || ((payload) => openSession(payload, deps)),
+    ...portableDeps(deps),
+    open: deps.open || ((payload) => openSession({ ...payload, portableTransferId: body.transferId }, {
+      ...deps,
+      onOpeningDelivered: async (launch) => {
+        portable.recordDelivery(body.transferId, launch, { root: deps.root || keep.ROOT });
+        return deps.onOpeningDelivered ? deps.onOpeningDelivered(launch) : true;
+      },
+    })),
+  });
+  const transfer = portable.safeSummary(result);
+  if (!transfer) throw new InjectionError(500, 'portable transfer result is invalid');
+  return { ok: true, transfer };
+}
+
+async function resolvePortableTransfer(body, deps = {}) {
+  if (!body || typeof body.transferId !== 'string' || typeof body.destinationSessionId !== 'string') {
+    throw new InjectionError(400, 'portable transfer resolution is invalid');
+  }
+  const portable = deps.portable || require('./portable-handoff');
+  const result = await portable.resolvePrepared(body.transferId, body.destinationSessionId, {
+    ...portableDeps(deps),
+    validateResolution: deps.validateResolution || (async (sessionId, transfer) => {
+      const inspection = await inspectPortableSource(transfer.sourceSessionId, { transferId: transfer.requestKey }, deps);
+      const session = inspection.state.sessions?.find((entry) => entry.id === sessionId);
+      const pane = inspection.panes.find((entry) => entry.meta?.sessionId === sessionId);
+      const receipt = portable.deliveryReceipt(transfer.requestKey, { root: deps.root || keep.ROOT });
+      return Boolean(session && session.accountId === transfer.targetAccountId && session.taskId === transfer.cardId
+        && pane?.meta?.portableTransferId === transfer.requestKey && receipt?.pane === pane.id
+        && receipt.deliveredAt >= Number(transfer.launchStartedAt || 0));
+    }),
   });
   const transfer = portable.safeSummary(result);
   if (!transfer) throw new InjectionError(500, 'portable transfer result is invalid');
@@ -5611,6 +5710,18 @@ function start(deps = {}) {
         catch (error) { return json(res, error.status || 500, { error: error.message }); }
       }
 
+      if (req.method === 'GET' && url.pathname === '/api/portable-transfer-draft') {
+        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
+        try { return json(res, 200, await portableTransferDraft(url.searchParams)); }
+        catch (error) { return json(res, error.status || 500, { error: error.message }); }
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/portable-transfer-preview') {
+        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
+        try { return json(res, 200, portableTransferPreview(url.searchParams)); }
+        catch (error) { return json(res, error.status || 500, { error: error.message }); }
+      }
+
       if (req.method === 'GET' && url.pathname === '/api/restore-plan') {
         if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
         try { return json(res, 200, await restorePlan(url.searchParams)); }
@@ -5850,6 +5961,24 @@ function start(deps = {}) {
               return json(res, error.status || 500, { error: error.message });
             }
           }
+          if (url.pathname === '/api/portable-transfers') {
+            try {
+              const result = await preparePortableTransfer(body);
+              broadcast();
+              return json(res, 200, result);
+            } catch (error) {
+              return json(res, error.status || 500, { error: error.message });
+            }
+          }
+          if (url.pathname === '/api/resolve-portable-transfer') {
+            try {
+              const result = await resolvePortableTransfer(body);
+              broadcast();
+              return json(res, 200, result);
+            } catch (error) {
+              return json(res, error.status || 500, { error: error.message });
+            }
+          }
           if (url.pathname === '/api/close-idle' || url.pathname === '/api/close-session') {
             try {
               const result = url.pathname === '/api/close-session'
@@ -6064,7 +6193,8 @@ module.exports = {
   annotatePaneAgents,
   readPaneRecord, sessionProjectFromTranscript, openSession,
   inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, continueAccountHandoff, handoffSession,
-  listPortableTransfers, transferSession,
+  listPortableTransfers, inspectPortableSource, portableTransferDraft, preparePortableTransfer,
+  portableTransferPreview, transferSession, resolvePortableTransfer,
   launchReviewQueueSession, inspectReviewQueueLaunch, recoverReviewQueueLaunch,
   waitForHostAgent, waitForHostSessionId, addHostSessionState,
   sendToSession, sendToResolvedTarget, precheckSessionTarget, InjectionError,

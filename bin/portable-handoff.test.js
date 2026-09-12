@@ -30,7 +30,7 @@ function fixture() {
   const deps = {
     root,
     env: { KEEP_DIR: root },
-    accounts: { get: (id) => id === target.id ? target : null },
+    accounts: { get: (id) => id === target.id ? target : null, list: () => [target] },
     sourceFor: () => ({ agent: 'codex', accountId: 'codex/default', cwd, file: transcript, title: 'Source' }),
     taskForSession: () => task,
     nextStep: () => ({ state: 'doing', text: 'Validate the fresh destination and wait.' }),
@@ -42,6 +42,7 @@ function fixture() {
       const file = path.join(directory, fileName); fs.writeFileSync(file, content); stored.push({ cardId, file, content }); return file;
     },
     open: async (payload) => { opened.push(payload); return { sessionId: 'destination-session-5678', pane: 'pane-destination', accountId: target.id }; },
+    inspectSource: async () => ({ session: { endedTurn: true, state: 'needs-input', project: cwd } }),
   };
   return { root, cwd, context, transcript, task, target, stored, opened, deps };
 }
@@ -133,11 +134,124 @@ test('portable transfer rejects an unknown target, same account, missing card, a
     await assert.rejects(portable.run({ ...base, accountId: 'missing-account' }, f.deps), /unknown destination/);
     await assert.rejects(portable.run(base, { ...f.deps,
       sourceFor: () => ({ agent: 'codex', accountId: f.target.id, cwd: f.cwd, file: f.transcript }) }), /same/);
-    await assert.rejects(portable.run(base, { ...f.deps, taskForSession: () => null }), /not linked/);
+    await assert.rejects(portable.run(base, { ...f.deps, taskForSession: () => null }), /Link this session/);
     fs.writeFileSync(f.context, Buffer.alloc(512 * 1024 + 1));
     await assert.rejects(portable.run(base, f.deps), /too large/);
     assert.equal(f.stored.length, 0);
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('desktop draft and immutable preview include the pause contract and exact destination model', async () => {
+  const f = fixture();
+  try {
+    const draft = await portable.draft({ sourceSessionId: 'source-session-1234' }, f.deps);
+    assert.equal(draft.accountId, f.target.id);
+    assert.equal(draft.context.includes('After you are asked to resume'), true);
+    assert.match(draft.pausePolicy, /Automated card and Stop-hook reminders do not resume/);
+    const prepared = await portable.run({ sourceSessionId: 'source-session-1234', accountId: f.target.id,
+      model: 'gpt-5.6-sol', contextText: 'After Jesse asks, finish validation.', prepareOnly: true }, f.deps);
+    assert.equal(prepared.policyVersion, 2);
+    assert.equal(prepared.model, 'gpt-5.6-sol');
+    const preview = portable.readPreview(prepared.requestKey, { root: f.root });
+    assert.equal(preview.transfer.id, prepared.requestKey);
+    assert.match(preview.preview, /After Jesse asks, finish validation/);
+    assert.match(preview.preview, /then WAIT for a new instruction from Jesse or the user/);
+    assert.doesNotMatch(preview.preview, /Follow the explicit continuation context's next instruction exactly/);
+    await assert.rejects(portable.run({ sourceSessionId: 'source-session-1234', accountId: f.target.id,
+      model: 'claude-fable-5-1', contextText: 'wrong provider', prepareOnly: true }, f.deps), /not compatible with codex/);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('desktop launch refuses stale source or package bytes and requires authoritative readiness inspection', async () => {
+  const f = fixture();
+  try {
+    const request = { sourceSessionId: 'source-session-1234', accountId: f.target.id,
+      contextText: 'Review this exact draft.', prepareOnly: true };
+    await assert.rejects(portable.run(request, { ...f.deps, inspectSource: undefined }), /inspection is unavailable/);
+    const staleSource = await portable.run(request, f.deps);
+    fs.appendFileSync(f.transcript, `${JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: 'new work' } })}\n`);
+    await assert.rejects(portable.launchPrepared(staleSource.requestKey, f.deps),
+      (error) => error.code === 'KEEP_PORTABLE_TRANSFER_STALE');
+
+    fs.writeFileSync(f.transcript, fs.readFileSync(f.transcript, 'utf8').replace(/\{"type":"event_msg"[^\n]+new work[^\n]+\}\n$/, ''));
+    const fresh = await portable.run({ ...request, contextText: 'Second exact draft.' }, f.deps);
+    fs.appendFileSync(fresh.artifactFile, '\nmutated after review\n');
+    await assert.rejects(portable.launchPrepared(fresh.requestKey, f.deps),
+      (error) => error.code === 'KEEP_PORTABLE_TRANSFER_STALE');
+    await assert.rejects(portable.launchPrepared(staleSource.requestKey, {
+      ...f.deps, inspectSource: async () => ({ session: { endedTurn: false, toolRunning: true } }),
+    }), (error) => error.code === 'KEEP_PORTABLE_TRANSFER_SOURCE_BUSY');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('desktop launch binds the reviewed source account, card fields, and delivered opening receipt', async () => {
+  const accountChanged = fixture();
+  try {
+    const prepared = await portable.run({ sourceSessionId: 'source-session-1234', accountId: accountChanged.target.id,
+      contextText: 'Review the source identity.', prepareOnly: true }, accountChanged.deps);
+    accountChanged.deps.sourceFor = () => ({ agent: 'codex', accountId: 'codex/other', cwd: accountChanged.cwd,
+      file: accountChanged.transcript, title: 'Source' });
+    await assert.rejects(portable.launchPrepared(prepared.requestKey, accountChanged.deps),
+      (error) => error.code === 'KEEP_PORTABLE_TRANSFER_STALE');
+  } finally { fs.rmSync(accountChanged.root, { recursive: true, force: true }); }
+
+  const cardChanged = fixture();
+  try {
+    const prepared = await portable.run({ sourceSessionId: 'source-session-1234', accountId: cardChanged.target.id,
+      contextText: 'Review the card identity.', prepareOnly: true }, cardChanged.deps);
+    cardChanged.task.fm.status = 'paused';
+    await assert.rejects(portable.launchPrepared(prepared.requestKey, cardChanged.deps),
+      (error) => error.code === 'KEEP_PORTABLE_TRANSFER_STALE');
+  } finally { fs.rmSync(cardChanged.root, { recursive: true, force: true }); }
+
+  const delivered = fixture();
+  try {
+    const prepared = await portable.run({ sourceSessionId: 'source-session-1234', accountId: delivered.target.id,
+      contextText: 'Record opening delivery.', prepareOnly: true }, delivered.deps);
+    delivered.deps.open = async () => {
+      portable.recordDelivery(prepared.requestKey, { pane: 'pane-delivered' }, { root: delivered.root });
+      throw new Error('response lost after opening delivery');
+    };
+    await assert.rejects(portable.launchPrepared(prepared.requestKey, delivered.deps),
+      (error) => error.code === 'KEEP_PORTABLE_TRANSFER_AMBIGUOUS');
+    assert.deepEqual(portable.deliveryReceipt(prepared.requestKey, { root: delivered.root }),
+      { version: 1, transferId: prepared.requestKey, pane: 'pane-delivered',
+        deliveredAt: portable.deliveryReceipt(prepared.requestKey, { root: delivered.root }).deliveredAt });
+  } finally { fs.rmSync(delivered.root, { recursive: true, force: true }); }
+});
+
+test('source-scoped desktop lock prevents different reviewed drafts from launching two successors', async () => {
+  const f = fixture();
+  try {
+    const first = await portable.run({ sourceSessionId: 'source-session-1234', accountId: f.target.id,
+      model: 'gpt-5.6-sol', contextText: 'First reviewed draft.', prepareOnly: true }, f.deps);
+    const second = await portable.run({ sourceSessionId: 'source-session-1234', accountId: f.target.id,
+      model: 'gpt-5.6-terra', contextText: 'Second reviewed draft.', prepareOnly: true }, f.deps);
+    assert.notEqual(first.requestKey, second.requestKey);
+    let release;
+    f.deps.open = async (payload) => {
+      f.opened.push(payload);
+      await new Promise(resolve => { release = resolve; });
+      return { sessionId: 'destination-session-5678', pane: 'pane-destination', accountId: f.target.id };
+    };
+    const launching = portable.launchPrepared(first.requestKey, f.deps);
+    while (!release) await new Promise(resolve => setImmediate(resolve));
+    await assert.rejects(portable.launchPrepared(second.requestKey, f.deps),
+      (error) => ['KEEP_PORTABLE_TRANSFER_BUSY', 'KEEP_PORTABLE_TRANSFER_SOURCE_USED'].includes(error.code));
+    release();
+    assert.equal((await launching).status, 'done');
+    await assert.rejects(portable.launchPrepared(second.requestKey, f.deps),
+      (error) => error.code === 'KEEP_PORTABLE_TRANSFER_SOURCE_USED');
+    assert.equal(f.opened.length, 1);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('desktop source safety rejects foreground, background, native, and portable conflicts', () => {
+  assert.match(portable.sourceBusyReason({ session: { endedTurn: true, observation: { foreground: { state: 'active' } } } }), /foreground/);
+  assert.match(portable.sourceBusyReason({ session: { endedTurn: true, pendingBackground: true } }), /background/);
+  assert.match(portable.sourceBusyReason({ session: { endedTurn: true }, nativeHandoff: {} }), /account handoff/);
+  assert.match(portable.sourceBusyReason({ session: { endedTurn: true }, portableHandoff: {} }), /portable transfer/);
+  assert.equal(portable.sourceBusyReason({ session: { endedTurn: true, state: 'needs-input' } }), '');
 });
 
 test('transfer CLI passes the explicit account, context, cwd, and prepare-only contract', async (t) => {

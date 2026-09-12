@@ -37,6 +37,8 @@ async function createFixture() {
   const portableTransfers = [{ id: 'portable-one', status: 'prepared', sourceSessionId: 'b', sourceAgent: 'codex',
     sourceAccountId: 'codex-main', targetAccountId: 'codex-two', targetAgent: 'codex', cardId: 'card-b', cwd: repo,
     artifactFile: '/private/fixture/saved-context.md', preparedAt: Date.now() }];
+  const portablePreviews = new Map([['portable-one', '# Existing CLI portable package\n']]);
+  let portableSequence = 0;
   const state = { sessions, panes, tasks: sessions.map(s => ({ id: s.taskId, fm: { tags: ['personal'] } })), attention: [],
     accounts, handoffs: [], setAside: {}, health: { daemon: { running: true } }, usage: { accounts: usageAccounts,
       claude: { limits: [{ label: 'legacy claude', percent: 99 }] }, codex: { windows: [{ label: 'legacy codex', percent: 99 }] } }, review: { events: [], stats: {} }, limitResume: {} };
@@ -85,7 +87,24 @@ async function createFixture() {
         // CORS preflight. The fixture holds every route to that rule so a client that stops
         // sending it fails here instead of 403ing the dashboard against the real server.
         if (req.headers['x-keep'] !== '1') { json({ error: 'missing x-keep header' }, 403); return; }
-        if (url.pathname === '/api/portable-transfers') { json({ ok: true, transfers: portableTransfers }); return; }
+        if (url.pathname === '/api/portable-transfers' && req.method === 'GET') { json({ ok: true, transfers: portableTransfers }); return; }
+        if (url.pathname === '/api/portable-transfer-draft' && req.method === 'GET') {
+          const source = sessions.find(s => s.id === url.searchParams.get('session'));
+          if (!source) { json({ error: 'source session was not found' }, 404); return; }
+          if (!source.endedTurn && !source.exited) { json({ error: 'portable transfer is unavailable: the source turn has not ended' }, 409); return; }
+          const choices = accounts.filter(account => account.id !== source.accountId).map(({ id, label, agent }) => ({ id, label, agent }));
+          const preferred = choices.find(account => account.agent === source.kind) || choices[0];
+          json({ ok: true, draft: { sourceSessionId: source.id, sourceAgent: source.kind, sourceAccountId: source.accountId,
+            cardId: source.taskId, cardTitle: `Card ${source.id.toUpperCase()}`, cwd: repo, accounts: choices,
+            accountId: preferred.id, model: preferred.agent === 'claude' ? 'claude-fable-5-1' : '',
+            context: `Continue card ${source.taskId}.\n\nAfter you are asked to resume: verify the fixture.`,
+            pausePolicy: 'Read the package, card, and worktree; acknowledge ready, then WAIT for Jesse or the user. Automated reminders do not resume it.' } }); return;
+        }
+        if (url.pathname === '/api/portable-transfer-preview' && req.method === 'GET') {
+          const transfer = portableTransfers.find(candidate => candidate.id === url.searchParams.get('id'));
+          if (!transfer) { json({ error: 'Unknown portable transfer' }, 404); return; }
+          json({ ok: true, transfer, preview: portablePreviews.get(transfer.id) || '' }); return;
+        }
         if (url.pathname === '/api/state') { json(state); return; }
         if (url.pathname === '/api/layouts') {
           if (req.method === 'PUT') { if (layoutFails) { json({ error: 'Fixture layout failure' }, 500); return; } layouts = input.layouts; }
@@ -139,14 +158,42 @@ async function createFixture() {
           if (transfer.status !== 'done') {
             transfer.status = 'done'; transfer.completedAt = Date.now();
             transfer.destinationSessionId = 'portable-successor'; transfer.destinationPane = 'portable-pane';
-            sessions.push({ id: transfer.destinationSessionId, kind: 'codex', title: 'Portable successor', project: repo,
-              taskId: 'card-b', pane: transfer.destinationPane, accountId: 'codex-two', accountLabel: 'Codex Two',
-              mtime: Date.now(), lastUserAt: Date.now(), state: 'running', endedTurn: false });
+            const target = accounts.find(account => account.id === transfer.targetAccountId);
+            sessions.push({ id: transfer.destinationSessionId, kind: transfer.targetAgent, title: 'Portable successor', project: repo,
+              taskId: transfer.cardId, pane: transfer.destinationPane, accountId: transfer.targetAccountId, accountLabel: target?.label,
+              portableTransferId: transfer.id, openingDelivered: true, mtime: Date.now(), lastUserAt: Date.now(), state: 'running', endedTurn: false });
             panes.push({ id: transfer.destinationPane, pid: 999, alive: true, cwd: repo,
-              meta: { agent: 'codex', sessionId: transfer.destinationSessionId, accountId: 'codex-two', accountLabel: 'Codex Two' } });
+              meta: { agent: transfer.targetAgent, sessionId: transfer.destinationSessionId, accountId: transfer.targetAccountId,
+                accountLabel: target?.label, portableTransferId: transfer.id } });
             publish();
           }
           json({ ok: true, transfer }); return;
+        }
+        if (url.pathname === '/api/portable-transfers' && req.method === 'POST') {
+          const source = sessions.find(s => s.id === input.sourceSessionId);
+          const account = accounts.find(a => a.id === input.accountId);
+          if (!source || !source.endedTurn || !account || account.id === source.accountId || typeof input.context !== 'string') {
+            json({ error: 'Unsafe fixture portable preparation' }, 409); return;
+          }
+          const id = (++portableSequence).toString(16).padStart(64, '0');
+          const transfer = { id, status: 'prepared', policyVersion: 2, sourceSessionId: source.id, sourceAgent: source.kind,
+            sourceAccountId: source.accountId, targetAccountId: account.id, targetAgent: account.agent,
+            ...(input.model ? { model: input.model } : {}), cardId: source.taskId, cwd: input.cwd || repo,
+            artifactFile: `/private/fixture/${id}.md`, preparedAt: Date.now() };
+          const preview = `# Portable session continuation\n\n- Source session: ${source.id}\n- Destination account: ${account.id} (${account.agent})\n${input.model ? `- Destination model: ${input.model}\n` : ''}- Launch cwd: ${input.cwd || repo}\n\n## Explicit continuation context\n\n${input.context}\n\n## Continue\n\nAcknowledge ready, then WAIT for Jesse or the user. Automated reminders do not resume you.`;
+          portableTransfers.push(transfer); portablePreviews.set(id, preview); publish();
+          json({ ok: true, transfer, preview }); return;
+        }
+        if (url.pathname === '/api/resolve-portable-transfer' && req.method === 'POST') {
+          const transfer = portableTransfers.find(candidate => candidate.id === input.transferId);
+          const successor = sessions.find(s => s.id === input.destinationSessionId);
+          if (!transfer || !['launching', 'ambiguous'].includes(transfer.status) || !successor
+              || successor.accountId !== transfer.targetAccountId || successor.taskId !== transfer.cardId
+              || successor.portableTransferId !== transfer.id || successor.openingDelivered !== true) {
+            json({ error: 'No compatible existing successor with a delivered opening message was found' }, 409); return;
+          }
+          transfer.status = 'done'; transfer.destinationSessionId = successor.id; transfer.destinationPane = successor.pane;
+          publish(); json({ ok: true, transfer }); return;
         }
         if (url.pathname === '/api/setaside') { if (input.kind === 'clear') delete state.setAside[input.key]; else state.setAside[input.key] = { kind: input.kind, at: Date.now() }; json({ ok: true }); publish(); return; }
         // Unsupported actions fail visibly instead of accidentally invoking real services.
