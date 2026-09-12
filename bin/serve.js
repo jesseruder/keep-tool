@@ -46,7 +46,11 @@ const WEB_ROOT = path.join(__dirname, '..', 'web');
 const SESSION_WINDOW_MS = 48 * 3600e3; // ignore transcripts older than this
 const claudeProjectRoots = accounts.projectRoots();
 const claudeTranscriptIndex = require('./transcript-index').createMultiRootTranscriptIndex(claudeProjectRoots);
-const { compactState, wantsCompactState, createJobChangeTracker } = require('./dashboard-state');
+const {
+  compactState, wantsCompactState, createJobChangeTracker,
+  wantsLightweightState, lightweightState, dashboardDetail, reviewQueueSearch,
+} = require('./dashboard-state');
+const { createDashboardWorker } = require('./dashboard-worker');
 const execFileAsync = promisify(execFile);
 const ATTENTION_KINDS = new Set(['question', 'plan', 'permission', 'complete', 'input', 'review', 'blocked', 'overdue', 'unblocked', 'health', 'stalled']);
 const CODEX_DIALOG_MARKERS = [
@@ -270,7 +274,7 @@ async function sessionSummarySnapshot(deps = {}) {
   if (!live.length) return { sessions: [], panes };
   // Use the same marker-enriched classification as Triage. Raw transcript
   // lookups omit permission notifications that can arrive in the middle of a turn.
-  const state = (deps.buildState || buildState)({ hostPanes: panes, dashboard: true });
+  const state = await (deps.dashboardBuild || deps.buildState || buildState)({ hostPanes: panes, dashboard: true });
   return { sessions: state.sessions, panes };
 }
 const WEEKLY_INSTRUCTION = "Summarize what this solo developer completed in the last week. Group related work into 3-6 themed bullets and note anything notable that shipped. Be specific; output only the summary.";
@@ -768,7 +772,7 @@ function sessionBackgroundPending(info) {
     try {
       // Notifications can be absent even after the child has finished. Consult
       // its actual final turn; unknown/missing children remain conservatively pending.
-      const state = scanTranscript(child, { includeSidechain: true });
+      const state = scanChildTranscript(child);
       // The child's previous completed turn cannot finish a newly resumed run.
       if (info.agentResumedAt?.[id] && !(state.attentionAt >= info.agentResumedAt[id])) return true;
       return !state.explicitEndTurn || state.pendingOther || state.pendingBackground;
@@ -4058,7 +4062,14 @@ async function recoverReviewQueueLaunch(active, hooks = {}, deps = {}) {
   }
   return { sessionId: active.sessionId, pane: active.pane, sent: true };
 }
-const scanCache = new Map(); // file -> { mtimeMs, size, info }
+const scanCache = require('./stat-parse-cache').createStatParseCache({
+  maxEntries: 1024,
+  maxBytes: 64 * 1024 * 1024,
+});
+const childScanCache = require('./stat-parse-cache').createStatParseCache({
+  maxEntries: 1024,
+  maxBytes: 64 * 1024 * 1024,
+});
 const claudeSessionPathCache = new Map(); // session id -> transcript file
 const backgroundTargets = new Map();
 const claudeSessionParseCache = new Map(); // file -> { mtimeMs, size, info }
@@ -4067,6 +4078,18 @@ let sessionSnapshot = [];
 let sessionSnapshotAt = 0;
 let lastDashboardSessionScan = 0;
 let lastStalledSessionScan = 0;
+
+function scanChildTranscript(file) {
+  try {
+    const stat = fs.statSync(file);
+    return childScanCache.get(file, stat,
+      () => scanTranscript(file, { includeSidechain: true }),
+      (value) => Buffer.byteLength(JSON.stringify(value)));
+  } catch (error) {
+    childScanCache.delete(file);
+    throw error;
+  }
+}
 
 function cacheClaudeSessionLookup(cache, key, value) {
   if (cache.has(key)) cache.delete(key);
@@ -4081,7 +4104,7 @@ function claudeSessionFromInfo(id, info, stat, dir, reviewer, now, accountId = n
   const lifecycle = require('./session-lifecycle');
   const lifecycleEvents = lifecycle.read(keep.ROOT, id, now);
   const lifecycleAgents = info.backgroundParentFile ? lifecycle.pendingAgents(lifecycleEvents,
-    info.backgroundParentFile, (file) => scanTranscript(file, { includeSidechain: true }), now, info.completedAgents) : [];
+    info.backgroundParentFile, scanChildTranscript, now, info.completedAgents) : [];
   return {
     id,
     kind: 'claude',
@@ -4246,13 +4269,10 @@ function scanClaudeSessions(options = {}) {
     if (spawned.has(id) || now - stat.mtimeMs > SESSION_WINDOW_MS) continue;
     seen.add(file);
     let info;
-    const cached = scanCache.get(file);
-    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-      info = cached.info;
-    } else {
-      try { info = scanTranscript(file); } catch { continue; }
-      scanCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, info });
-    }
+    try {
+      info = scanCache.get(file, stat, () => scanTranscript(file),
+        (value) => Buffer.byteLength(JSON.stringify(value)));
+    } catch { continue; }
     // AI titles are now written to headless `claude -p` transcripts too. Only
     // TUI record types distinguish a conversation from a batch invocation.
     // Explicitly hosted headless history is restored below by host backfill,
@@ -4284,7 +4304,7 @@ function scanClaudeSessions(options = {}) {
     } catch {}
     sessions.push(session);
   }
-  for (const key of scanCache.keys()) if (!seen.has(key)) scanCache.delete(key);
+  scanCache.retain(seen);
   if (!readOnly) try {
     for (const f of fs.readdirSync(attentionDir)) {
       if (!f.endsWith('.json')) continue;
@@ -4340,7 +4360,7 @@ function scanSessions(options = {}) {
   const attentionDir = path.join(keep.ROOT, '.keep', 'attention');
   const sessions = scanClaudeSessions(options);
   let codexSessions = [];
-  try { codexSessions = codex.scan(); } catch {}
+  try { codexSessions = codex.scan({ dashboard: options.dashboard === true }); } catch {}
   attachCodexMarkers(codexSessions, attentionDir, now, options);
   sessions.push(...codexSessions);
   titles.applyLiveTitles(sessions, { cachedOnly: true });
@@ -4349,6 +4369,11 @@ function scanSessions(options = {}) {
   sessionSnapshotAt = now;
   if (options.dashboard === true) lastDashboardSessionScan = now;
   return copySessions(sessionSnapshot);
+}
+
+function invalidateDashboardSources(change = {}) {
+  if (change.kind === 'claude') claudeTranscriptIndex.invalidate(change.root, change.name);
+  else if (change.kind === 'codex') codex.invalidate();
 }
 
 function normalizedProject(value) {
@@ -4629,9 +4654,22 @@ function ensureDigest() {
   return md === null ? null : { date: today, md };
 }
 
+function dashboardSummary(options, target, key, input, instruction, summaryOptions = {}) {
+  if (options.dashboardWorker === true) {
+    options.collectSummaryRequests?.push({ target, key, input, instruction, options: summaryOptions });
+    return summarize.peekSummary(key)?.text || null;
+  }
+  return summarize.getSummary(key, input, instruction, onChange, summaryOptions).text;
+}
+
 function buildState(options = {}) {
+  const workerMode = options.dashboardWorker === true;
   let cardUsageSummary = null;
-  try { cardUsageSummary = cardUsage.snapshot(keep.ROOT); } catch (error) { health.record('card-usage', { ok: false, error }); }
+  try { cardUsageSummary = cardUsage.snapshot(keep.ROOT); }
+  catch (error) {
+    if (workerMode) options.collectHealthErrors?.push({ name: 'card-usage', message: error.message });
+    else health.record('card-usage', { ok: false, error });
+  }
   const tasks = keep.loadAll(false).map((t) => ({
     id: t.id,
     fm: t.fm,
@@ -4643,6 +4681,7 @@ function buildState(options = {}) {
   let dashboardTranscriptRows = null;
   const sessions = scanSessions({
     dashboard: options.dashboard === true,
+    readOnly: workerMode,
     ...(options.dashboard === true ? { onTranscriptRows: (rows) => { dashboardTranscriptRows = rows; } } : {}),
   });
   // scanSessions just reconciled this exact index snapshot synchronously. Reuse
@@ -4673,7 +4712,11 @@ function buildState(options = {}) {
     s.taskId = byId[s.id] || null;
     s.taskStatus = taskById.get(s.taskId)?.fm.status || null;
   }
-  titles.applyLiveTitles(sessions, { onChange, taskFor: (session) => taskById.get(session.taskId) });
+  titles.applyLiveTitles(sessions, {
+    onChange,
+    cachedOnly: workerMode,
+    taskFor: (session) => taskById.get(session.taskId),
+  });
   applySessionLiveness(sessions, liveLedger, options.hostPanes || [], now);
   const dependencyCache = new Map();
   const liveHostedSessions = new Set((options.hostPanes || []).filter((pane) => pane.alive && pane.agentAlive !== false).map((pane) => pane.meta?.sessionId));
@@ -4683,9 +4726,11 @@ function buildState(options = {}) {
       const file = session.kind === 'claude' ? claudeSessionPathCache.get(session.id) : codex.rolloutFileFor(session.id);
       if (file) {
         const hosted = options.hostPanes.find(p => p.id === session.runtime?.paneId);
-        backgroundTargets.set(`${session.kind}:${session.id}`, { agent: session.kind, sid: session.id, file,
+        const target = { agent: session.kind, sid: session.id, file,
           instance: { id: require('./background-jobs').processInstance(hosted),
-            processScoped: true, live: session.runtime?.state === 'live' ? true : session.runtime?.state === 'exited' ? false : null } });
+            processScoped: true, live: session.runtime?.state === 'live' ? true : session.runtime?.state === 'exited' ? false : null } };
+        if (workerMode) options.collectBackgroundTargets?.push(target);
+        else backgroundTargets.set(`${session.kind}:${session.id}`, target);
         const jobs = require('./background-jobs').read(keep.ROOT, session.kind, session.id, now);
         session.backgroundJobs = jobs;
         session.pendingBackground = jobs.pending || (!jobs.caughtUp && session.pendingBackground);
@@ -4701,7 +4746,7 @@ function buildState(options = {}) {
     session.observation = require('./session-model').normalize(session, { task, dependencies: dependencyCache.get(task?.id) || [], live: liveHostedSessions.has(session.id) });
     session.state = session.activity.state;
     session.stateLabel = session.activity.label;
-    require('./session-debug').record(session, now);
+    if (!workerMode) require('./session-debug').record(session, now);
   }
   const stalledItems = stalled.readCurrent({ root: keep.ROOT });
   const stalledSessionIds = new Set(stalledItems.filter((item) => item.kind === 'session').map((item) => item.id));
@@ -4730,7 +4775,7 @@ function buildState(options = {}) {
       since: record.lastAttemptAt || record.resolvedAt || record.createdAt,
     });
   }
-  const healthSnapshot = health.snapshot(now);
+  const healthSnapshot = options.dashboardRuntime?.health || health.snapshot(now);
   attention.push(...health.attentionItems(healthSnapshot, now).map((item) => ({
     ...item,
     pri: / failing:|restarting:/.test(item.text) ? 0 : 1,
@@ -4751,10 +4796,11 @@ function buildState(options = {}) {
     const key = attentionAckKey(item);
     return !ackNames.has(attentionAckName(key));
   });
-  const setAsideState = applySetAside(setAsideCandidates(visibleAttention, sessions));
-  if (setAsideState.changed) onChange();
+  const setAsideState = applySetAside(setAsideCandidates(visibleAttention, sessions), { write: !workerMode });
+  if (setAsideState.changed && !workerMode) onChange();
   let digest = null;
-  try { digest = ensureDigest(); } catch (e) { process.stderr.write(`keep serve: digest failed: ${e.message}\n`); }
+  if (workerMode) digest = options.dashboardRuntime?.digest || null;
+  else try { digest = ensureDigest(); } catch (e) { process.stderr.write(`keep serve: digest failed: ${e.message}\n`); }
   const alertMeta = alerts.loadMeta(keep.ROOT);
   const state = {
     generatedAt: Date.now(),
@@ -4777,7 +4823,7 @@ function buildState(options = {}) {
     slack: slack.dashboardState(),
     health: healthSnapshot,
     runs: runs.listRuns(),
-    usage: usage.getUsage(),
+    usage: options.dashboardRuntime?.usage || usage.getUsage(),
     reviewQueue: reviewQueue.snapshot({ loadTasks: () => allTasks, now }),
   };
   Object.assign(state, accounts.publicState(), {
@@ -4798,7 +4844,7 @@ function buildState(options = {}) {
     if (accountId) { session.accountId = accountId; session.accountLabel = accountLabels.get(accountId) || accountId; }
   }
   try {
-    if (digest) digest.summary = summarize.getSummary(`digest-${digest.date}`, digest.md, DIGEST_INSTRUCTION, onChange).text;
+    if (digest) digest.summary = dashboardSummary(options, ['digest', 'summary'], `digest-${digest.date}`, digest.md, DIGEST_INSTRUCTION);
   } catch {}
   try {
     const input = tasks
@@ -4808,13 +4854,13 @@ function buildState(options = {}) {
         const logs = [...t.body.matchAll(/^## .*\n([^\n]+)/gm)].slice(0, 3).map((m) => m[1].trim()).filter(Boolean);
         return `Title: ${t.fm.title}\nStatus: ${t.fm.status}\nLatest logs:\n${logs.length ? logs.map((l) => `- ${l}`).join('\n') : '- (none)'}`;
       }).join('\n\n');
-    if (input) state.resumeSummary = summarize.getSummary('resume', input, RESUME_INSTRUCTION, onChange).text;
+    if (input) state.resumeSummary = dashboardSummary(options, ['resumeSummary'], 'resume', input, RESUME_INSTRUCTION);
   } catch {}
   try {
     const review = tasks.filter((t) => t.fm.status === 'review').sort((a, b) => a.id.localeCompare(b.id));
     if (review.length) {
       const input = review.map((t) => `Title: ${t.fm.title}\nLatest log: ${t.lastLog || '(none)'}`).join('\n\n');
-      state.reviewSummary = summarize.getSummary('review', input, REVIEW_INSTRUCTION, onChange).text;
+      state.reviewSummary = dashboardSummary(options, ['reviewSummary'], 'review', input, REVIEW_INSTRUCTION);
     }
   } catch {}
   try {
@@ -4825,7 +4871,7 @@ function buildState(options = {}) {
       .filter((t) => t.fm.status === 'done' && t.fm.updated >= weekAgo)
       .sort((a, b) => a.id.localeCompare(b.id));
     const input = weekly.map((t) => `- ${t.fm.title} (${keep.lastLogLine(t)})`).join('\n');
-    if (input) state.weeklySummary = summarize.getSummary(`weekly-${weekAgo.slice(0, 10)}`, input, WEEKLY_INSTRUCTION, onChange).text;
+    if (input) state.weeklySummary = dashboardSummary(options, ['weeklySummary'], `weekly-${weekAgo.slice(0, 10)}`, input, WEEKLY_INSTRUCTION);
   } catch {}
   try {
     state.reviewUsage = review.reviewerUsage();
@@ -4866,6 +4912,54 @@ function buildState(options = {}) {
   } catch {
     state.review = { events: [], stats: {} };
   }
+  return state;
+}
+
+function dashboardRuntimeSnapshot() {
+  let digest = null;
+  try { digest = ensureDigest(); }
+  catch (error) { process.stderr.write(`keep serve: digest failed: ${error.message}\n`); }
+  return { digest, health: health.snapshot(), usage: usage.getUsage() };
+}
+
+function setPath(object, pathParts, value) {
+  let target = object;
+  for (const part of pathParts.slice(0, -1)) {
+    if (!target?.[part]) return;
+    target = target[part];
+  }
+  target[pathParts.at(-1)] = value;
+}
+
+function finalizeDashboardWorkerResult(result) {
+  const state = result.state;
+  for (const item of result.healthErrors || []) health.record(item.name, { ok: false, error: item.message });
+  for (const target of result.backgroundTargets || []) {
+    if (target?.agent && target?.sid && target?.file) backgroundTargets.set(`${target.agent}:${target.sid}`, target);
+  }
+
+  const taskById = new Map((state.tasks || []).map((task) => [task.id, task]));
+  titles.applyLiveTitles(state.sessions, { onChange, taskFor: (session) => taskById.get(session.taskId) });
+  const sessionById = new Map((state.sessions || []).map((session) => [session.id, session]));
+  for (const item of state.attention || []) {
+    const session = sessionById.get(item.sessionId);
+    const current = session && sessionAttentionItem(session, Date.now());
+    if (current && current.kind === item.kind) {
+      item.title = current.title;
+      item.detail = current.detail;
+    }
+  }
+  const setAsideState = applySetAside(setAsideCandidates(state.attention || [], state.sessions || []));
+  state.setAside = setAsideState.value.items;
+  if (setAsideState.changed) onChange();
+  for (const request of result.summaryRequests || []) {
+    const value = summarize.getSummary(request.key, request.input, request.instruction, onChange, request.options).text;
+    setPath(state, request.target, value);
+  }
+  state.generatedAt = Date.now();
+  sessionSnapshot = copySessions(state.sessions);
+  sessionSnapshotAt = state.generatedAt;
+  lastDashboardSessionScan = state.generatedAt;
   return state;
 }
 
@@ -5569,6 +5663,7 @@ function startWtGcScheduler(options = {}) {
 function start(deps = {}) {
   health.record('daemon', { at: Date.now(), pid: process.pid, version: health.VERSION });
   let consoleServer = null;
+  let dashboardBuilder = null;
   const shutdown = () => {
     if (inFlightSwap) {
       const action = shutdownSettingsRepair(inFlightSwap, readClaudeSettingsModel());
@@ -5583,6 +5678,7 @@ function start(deps = {}) {
         }
       }
     }
+    dashboardBuilder?.close();
     consoleServer?.close();
     process.exit(0);
   };
@@ -5606,6 +5702,14 @@ function start(deps = {}) {
   onChange = broadcast;
   // A focus request (mobile 'Open on Mac') is a named SSE event the console acts on.
   onFocus = (sessionId) => { for (const res of clients) res.write(`event: focus\ndata: ${sessionId}\n\n`); };
+  dashboardBuilder = deps.dashboardWorker || createDashboardWorker({
+    prepare: (input) => ({ ...input, dashboardRuntime: dashboardRuntimeSnapshot() }),
+    finalize: finalizeDashboardWorkerResult,
+  });
+  const dashboardBuild = (options) => dashboardBuilder.build({
+    hostPanes: options.hostPanes || [],
+    companion: options.companion || null,
+  });
 
   const watch = (target, opts, invalidate) => {
     try {
@@ -5615,27 +5719,35 @@ function start(deps = {}) {
       process.stderr.write(`keep serve: cannot watch ${target} (${e.message}); relying on client polling\n`);
     }
   };
-  watch(keep.TASKS);
+  watch(keep.TASKS, null, (name) => dashboardBuilder.invalidate({ kind: 'tasks', name }));
   // Watch the directory so ledger creation and atomic read-state renames are seen.
   try {
     const inboxWatch = fs.watch(path.join(keep.ROOT, '.keep'), (_event, name) => {
-      if (!name || ['alerts.jsonl', 'notifications.json', 'quiet.json'].includes(String(name))) broadcast();
+      if (!name || ['alerts.jsonl', 'notifications.json', 'quiet.json'].includes(String(name))) {
+        dashboardBuilder.invalidate({ kind: 'runtime', name });
+        broadcast();
+      }
     });
     inboxWatch.on('error', () => {});
   } catch {} // The console's periodic refresh also covers inbox changes.
-  watch(path.join(keep.ROOT, 'digests'));
+  watch(path.join(keep.ROOT, 'digests'), null, (name) => dashboardBuilder.invalidate({ kind: 'digests', name }));
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'attention'), { recursive: true }); } catch {}
-  watch(path.join(keep.ROOT, '.keep', 'attention'));
+  watch(path.join(keep.ROOT, '.keep', 'attention'), null, (name) => dashboardBuilder.invalidate({ kind: 'attention', name }));
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'unblocked'), { recursive: true }); } catch {}
-  watch(path.join(keep.ROOT, '.keep', 'unblocked'));
+  watch(path.join(keep.ROOT, '.keep', 'unblocked'), null, (name) => dashboardBuilder.invalidate({ kind: 'unblocked', name }));
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'review'), { recursive: true }); } catch {}
-  watch(path.join(keep.ROOT, '.keep', 'review'));
+  watch(path.join(keep.ROOT, '.keep', 'review'), null, (name) => dashboardBuilder.invalidate({ kind: 'review', name }));
   for (const entry of claudeProjectRoots) {
-    watch(entry.root, { recursive: true }, (name) => claudeTranscriptIndex.invalidate(entry.root, name));
+    watch(entry.root, { recursive: true }, (name) => {
+      claudeTranscriptIndex.invalidate(entry.root, name);
+      dashboardBuilder.invalidate({ kind: 'claude', root: entry.root, name });
+    });
   }
-  watch(path.join(os.homedir(), '.codex', 'sessions'), { recursive: true });
+  watch(path.join(os.homedir(), '.codex', 'sessions'), { recursive: true },
+    (name) => dashboardBuilder.invalidate({ kind: 'codex', name }));
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'lifecycle'), { recursive: true }); } catch {}
-  watch(path.join(keep.ROOT, '.keep', 'lifecycle'), { recursive: true });
+  watch(path.join(keep.ROOT, '.keep', 'lifecycle'), { recursive: true },
+    (name) => dashboardBuilder.invalidate({ kind: 'lifecycle', name }));
 
   const jobLedger = require('./background-jobs');
   for (const target of jobLedger.targets(keep.ROOT)) backgroundTargets.set(`${target.agent}:${target.sid}`, target);
@@ -5653,7 +5765,7 @@ function start(deps = {}) {
         inspectAgent: (id) => {
           if (target.agent === 'claude') {
             if (!/^[a-zA-Z0-9_-]{1,160}$/.test(id)) return null;
-            const child = scanTranscript(path.join(path.dirname(target.file), path.basename(target.file, '.jsonl'), 'subagents', `agent-${id}.jsonl`), { includeSidechain: true });
+            const child = scanChildTranscript(path.join(path.dirname(target.file), path.basename(target.file, '.jsonl'), 'subagents', `agent-${id}.jsonl`));
             return { at: child.attentionAt || 0, done: child.explicitEndTurn && !child.pendingOther && !child.pendingBackground };
           }
           return require('./codex-lifecycle').inspectChild(id, target.sid);
@@ -5662,7 +5774,10 @@ function start(deps = {}) {
       if (result.redirect?.agent === target.agent && result.redirect.sid === target.sid && result.redirect.file) {
         backgroundTargets.set(`${target.agent}:${target.sid}`, result.redirect);
       }
-      if (jobsChanged(`${target.agent}:${target.sid}`, result)) broadcast();
+      if (jobsChanged(`${target.agent}:${target.sid}`, result)) {
+        dashboardBuilder.invalidate({ kind: 'background-jobs', name: `${target.agent}:${target.sid}` });
+        broadcast();
+      }
     } catch (error) { process.stderr.write(`keep jobs: ${error.message}\n`); }
   };
   setInterval(jobTick, 500).unref();
@@ -5672,7 +5787,7 @@ function start(deps = {}) {
   runs.setDeliverer(deliverCheckToThread);
   summarize.setOnChange(broadcast);
   require('./session-summary').startScheduler({
-    snapshot: sessionSummarySnapshot,
+    snapshot: () => sessionSummarySnapshot({ ...deps, dashboardBuild }),
     prepare: prepareSessionSummary,
     onError: (error) => process.stderr.write(`keep session summaries: ${error.message}\n`),
   });
@@ -5904,6 +6019,20 @@ function start(deps = {}) {
         if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
         try { return json(res, 200, { ok: true, transfers: listPortableTransfers() }); }
         catch (error) { return json(res, error.status || 500, { error: error.message }); }
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/dashboard-detail') {
+        const state = dashboardBuilder.latest();
+        if (!state) return json(res, 503, { error: 'dashboard state is still loading' });
+        try { return json(res, 200, dashboardDetail(state, url.searchParams.get('kind'), url.searchParams.get('id'))); }
+        catch (error) { return json(res, error.status === 400 || error.status === 404 ? error.status : 500, { error: error.message }); }
+      }
+
+      if (req.method === 'GET' && url.pathname === '/api/dashboard-review-search') {
+        const state = dashboardBuilder.latest();
+        if (!state) return json(res, 503, { error: 'dashboard state is still loading' });
+        try { return json(res, 200, reviewQueueSearch(state, url.searchParams.get('q') || '')); }
+        catch (error) { return json(res, error.status === 400 || error.status === 404 ? error.status : 500, { error: error.message }); }
       }
 
       if (req.method === 'GET' && url.pathname === '/api/portable-transfer-draft') {
@@ -6243,12 +6372,12 @@ function start(deps = {}) {
           inspectLaunch: (active) => inspectReviewQueueLaunch(active),
         });
         const companion = await companionSnapshot(deps);
-        const state = buildState({ hostPanes: panes, dashboard: true, companion });
-        const enriched = await addHostSessionState(state, { ...deps, panes });
+        const enriched = await dashboardBuild({ hostPanes: panes, companion });
         let responseState;
         try {
           responseState = mobileView
             ? projectMobileState(enriched, mobileView, url.searchParams.get('id') || '')
+            : wantsLightweightState(url) ? lightweightState(enriched)
             : wantsCompactState(req, url) ? compactState(enriched) : enriched;
         } catch (error) {
           if (error.status === 400) return json(res, 400, { error: error.message });
@@ -6344,6 +6473,7 @@ module.exports = {
   applyHostedExitState,
   closeExitedCodexShell,
   scanSessions,
+  invalidateDashboardSources,
   stalledSessionSnapshot,
   buildState,
   applySessionLiveness,

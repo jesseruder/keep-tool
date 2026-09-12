@@ -14,6 +14,10 @@ const stepRegistry = require('./steps.js');
 const allow = require('./allow.js');
 const cardUsage = require('./card-usage.js');
 const { readTranscriptTail, textOf } = require('./transcripts.js');
+const taskParseCache = require('./stat-parse-cache').createStatParseCache({
+  maxEntries: 2048,
+  maxBytes: 32 * 1024 * 1024,
+});
 
 const ROOT = process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
 const TASKS = path.join(ROOT, 'tasks');
@@ -268,9 +272,13 @@ function loadAll(includeArchive) {
     if (!fs.existsSync(dir)) continue;
     for (const f of fs.readdirSync(dir)) {
       if (!f.endsWith('.md')) continue;
+      const file = path.join(dir, f);
       try {
-        tasks.push(parseTask(fs.readFileSync(path.join(dir, f), 'utf8'), f.slice(0, -3)));
+        const stat = fs.statSync(file);
+        tasks.push(taskParseCache.get(file, stat,
+          () => parseTask(fs.readFileSync(file, 'utf8'), f.slice(0, -3)), stat.size));
       } catch (e) {
+        if (e.code === 'ENOENT') taskParseCache.delete(file);
         // warn once per file+error — a long-running server calls loadAll constantly
         const key = `${f}:${e.message}`;
         if (!warnedFiles.has(key)) {

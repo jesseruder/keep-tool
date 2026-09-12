@@ -10,12 +10,18 @@ const sessionStatus = require('./session-status.js');
 const SESSION_WINDOW_MS = 48 * 3600e3;
 const TAIL_BYTES = 256 * 1024;
 const HEAD_BYTES = 256 * 1024;
-const scanCache = new Map(); // file -> { mtimeMs, size, info }
+const scanCache = require('./stat-parse-cache').createStatParseCache({
+  maxEntries: 1024,
+  maxBytes: 64 * 1024 * 1024,
+});
 const sessionPathCache = new Map(); // session id -> { file, accountId, configDir }
 const sessionParseCache = new Map(); // file -> { mtimeMs, size, info }
 const questionCache = new Map(); // incremental question lifecycle, independent of the text tail
 const SESSION_LOOKUP_CACHE_LIMIT = 300;
 const indexCache = new Map(); // index file -> { mtimeMs, size, titles }
+const rolloutDirectoryCache = new Map();
+const RECENT_DISCOVERY_MS = 5000;
+const HISTORY_DISCOVERY_MS = 60000;
 let rolloutFiles = new Map(); // session id -> { file, accountId, configDir }, replaced after each scan
 
 function cacheSessionLookup(cache, key, value) {
@@ -49,6 +55,43 @@ function recentDateDirs(configDir = path.join(os.homedir(), '.codex')) {
     dirs.push(path.join(configDir, 'sessions', year, month, day));
   }
   return dirs;
+}
+
+function indexedRollouts(configDir, options = {}) {
+  const now = options.now || Date.now();
+  const rows = [];
+  const seenDirs = new Set();
+  for (const [index, dir] of recentDateDirs(configDir).entries()) {
+    seenDirs.add(dir);
+    const directoryTtl = index <= 2 ? RECENT_DISCOVERY_MS : HISTORY_DISCOVERY_MS;
+    let cached = rolloutDirectoryCache.get(dir);
+    if (!options.dashboard || !cached || now - cached.at >= directoryTtl || now < cached.at) {
+      let names;
+      try { names = fs.readdirSync(dir).filter((name) => /^rollout-.*\.jsonl$/.test(name)); }
+      catch { rolloutDirectoryCache.delete(dir); continue; }
+      const priorFiles = cached?.files || new Map();
+      const present = new Set(names);
+      for (const name of priorFiles.keys()) if (!present.has(name)) priorFiles.delete(name);
+      cached = { at: now, names, files: priorFiles };
+      rolloutDirectoryCache.set(dir, cached);
+    }
+    for (const name of cached.names) {
+      const file = path.join(dir, name);
+      let entry = cached.files.get(name);
+      const fileTtl = entry && now - entry.stat.mtimeMs <= SESSION_WINDOW_MS
+        ? RECENT_DISCOVERY_MS : HISTORY_DISCOVERY_MS;
+      if (!options.dashboard || !entry || now - entry.at >= fileTtl || now < entry.at) {
+        try { entry = { stat: fs.statSync(file), at: now }; cached.files.set(name, entry); }
+        catch { cached.files.delete(name); continue; }
+      }
+      if (entry.stat.isFile()) rows.push({ file, stat: entry.stat });
+    }
+  }
+  // Configured roots can be removed while the daemon remains alive.
+  for (const dir of rolloutDirectoryCache.keys()) {
+    if (dir.startsWith(configDir + path.sep) && !seenDirs.has(dir)) rolloutDirectoryCache.delete(dir);
+  }
+  return rows;
 }
 
 function readTail(file) {
@@ -306,50 +349,41 @@ function sessionFromRollout(info, stat, title, now, accountId) {
   };
 }
 
-function scan() {
+function scan(options = {}) {
   const candidatesById = new Map();
   const nextRolloutFiles = new Map();
   const now = Date.now();
   const seen = new Set();
-  for (const root of configuredRoots()) {
-    const titles = loadTitles(root.configDir);
-    for (const dir of recentDateDirs(root.configDir)) {
-      let files;
-      try { files = fs.readdirSync(dir).filter((name) => /^rollout-.*\.jsonl$/.test(name)); } catch { continue; }
-      for (const name of files) {
-        const file = path.join(dir, name);
-        let stat;
-        try { stat = fs.statSync(file); } catch { continue; }
-        if (!stat.isFile() || now - stat.mtimeMs > SESSION_WINDOW_MS) continue;
-        seen.add(file);
-        let info;
-        const cached = scanCache.get(file);
-        if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
-          info = cached.info;
-        } else {
-          try { info = scanRollout(file); } catch { continue; }
-          scanCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, info });
-        }
-        if (!info) continue;
-        const title = titles.get(info.id) || '';
-        if (title.startsWith('Codex Companion Task:')) continue;
-        const candidate = { file, accountId: root.accountId, configDir: root.configDir,
-          session: sessionFromRollout(info, stat, title, now, root.accountId) };
-        const list = candidatesById.get(info.id) || [];
-        list.push(candidate);
-        candidatesById.set(info.id, list);
-      }
+  const root = process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
+  const accountAuthority = require('./accounts.js').authority(root);
+  for (const accountRoot of configuredRoots()) {
+    const titles = loadTitles(accountRoot.configDir);
+    for (const { file, stat } of indexedRollouts(accountRoot.configDir, { dashboard: options.dashboard === true, now })) {
+      if (!stat.isFile() || now - stat.mtimeMs > SESSION_WINDOW_MS) continue;
+      seen.add(file);
+      let info;
+      try {
+        info = scanCache.get(file, stat, () => scanRollout(file),
+          (value) => Buffer.byteLength(JSON.stringify(value)));
+      } catch { continue; }
+      if (!info) continue;
+      const title = titles.get(info.id) || '';
+      if (title.startsWith('Codex Companion Task:')) continue;
+      const candidate = { file, accountId: accountRoot.accountId, configDir: accountRoot.configDir,
+        session: sessionFromRollout(info, stat, title, now, accountRoot.accountId) };
+      const list = candidatesById.get(info.id) || [];
+      list.push(candidate);
+      candidatesById.set(info.id, list);
     }
   }
-  for (const file of scanCache.keys()) if (!seen.has(file)) scanCache.delete(file);
+  scanCache.retain(seen);
   const sessions = [];
   for (const [id, candidates] of candidatesById) {
-    let pinned = null;
-    try { pinned = require('./accounts.js').forSession(id, 'codex', {
-      root: process.env.KEEP_DIR || path.join(os.homedir(), 'keep'), allowDiscovery: false,
-    }); } catch { continue; }
-    const eligible = pinned ? candidates.filter((entry) => entry.accountId === pinned.id) : candidates;
-    if (!pinned && new Set(eligible.map((entry) => entry.accountId)).size > 1) continue;
+    const authority = accountAuthority[id];
+    if (authority && (authority.agent !== 'codex' || authority.stagedAccountId)) continue;
+    const pinnedId = authority?.accountId || null;
+    const eligible = pinnedId ? candidates.filter((entry) => entry.accountId === pinnedId) : candidates;
+    if (!pinnedId && new Set(eligible.map((entry) => entry.accountId)).size > 1) continue;
     eligible.sort((a, b) => b.session.mtime - a.session.mtime);
     const chosen = eligible[0];
     if (!chosen) continue;
@@ -359,6 +393,14 @@ function scan() {
   rolloutFiles = nextRolloutFiles;
   sessions.sort((a, b) => b.mtime - a.mtime);
   return sessions;
+}
+
+function invalidate() {
+  // Watcher invalidation makes a queued dashboard refresh observe changes
+  // immediately; bounded sweeps remain the fallback for dropped events.
+  scanCache.clear();
+  sessionParseCache.clear();
+  rolloutDirectoryCache.clear();
 }
 
 // Locate a rollout by session id without reading any file: the id is embedded in
@@ -456,4 +498,4 @@ function sessionFor(sessionId) {
   return sessionFromRollout(info, stat, loadTitles(record.configDir).get(info.id) || '', Date.now(), record.accountId);
 }
 
-module.exports = { scan, scanRollout, sessionFor, rolloutFileFor, findRolloutFile, readTail, recentText, readSessionMeta, sessionMetaFor, isChildSession, configuredRoots, recentDateDirs };
+module.exports = { scan, invalidate, scanRollout, sessionFor, rolloutFileFor, findRolloutFile, readTail, recentText, readSessionMeta, sessionMetaFor, isChildSession, configuredRoots, recentDateDirs, indexedRollouts };
