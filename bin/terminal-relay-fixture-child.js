@@ -1,9 +1,17 @@
 #!/usr/bin/env node
 'use strict';
 
-const mode = process.argv[2];
+const mode = process.argv[2] || process.env.KEEP_RELAY_FIXTURE_MODE;
 
-if (mode === 'host') {
+if (mode === 'silent-relay') {
+  const sockets = new Set();
+  process.on('message', (message, socket) => {
+    if (message?.type === 'init') process.send?.({ type: 'ready' });
+    else if (message?.type === 'upgrade' && socket) sockets.add(socket);
+    else if (message?.type === 'shutdown') process.exit(0);
+  });
+  process.once('disconnect', () => process.exit(0));
+} else if (mode === 'host') {
   const fs = require('node:fs');
   const net = require('node:net');
   const sock = process.argv[3];

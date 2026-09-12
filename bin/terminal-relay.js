@@ -30,6 +30,12 @@ function drainBuffered(socket, first) {
     : chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
 }
 
+function clearScheduled(handle) {
+  if (!handle) return;
+  clearTimeout(handle);
+  clearImmediate(handle);
+}
+
 function createTerminalRelay(options = {}) {
   const spawn = options.fork || fork;
   const workerPath = options.workerPath || path.join(__dirname, 'terminal-relay-worker.js');
@@ -37,6 +43,7 @@ function createTerminalRelay(options = {}) {
   const startupTimeoutMs = options.startupTimeoutMs || DEFAULT_STARTUP_TIMEOUT_MS;
   const transferTimeoutMs = options.transferTimeoutMs || DEFAULT_TRANSFER_TIMEOUT_MS;
   const log = options.log || ((message) => process.stderr.write(`${message}\n`));
+  const afterSend = options.afterSend || (() => {});
   const pending = [];
   const transfers = new Map();
   let child = null;
@@ -48,14 +55,14 @@ function createTerminalRelay(options = {}) {
 
   const totalQueued = () => pending.length + transfers.size;
   const closeEntry = (entry, status = 503, reason = 'Service Unavailable') => {
-    clearTimeout(entry.timer);
+    clearScheduled(entry.timer);
     entry.socket.off('error', entry.onSocketError);
     entry.socket.off('close', entry.onSocketClose);
     httpError(entry.socket, status, reason);
   };
   const clearChild = (failedChild, why) => {
     if (child !== failedChild) return;
-    clearTimeout(startupTimer);
+    clearScheduled(startupTimer);
     startupTimer = null;
     child = null;
     ready = false;
@@ -70,7 +77,7 @@ function createTerminalRelay(options = {}) {
     if (!ready || !child || sending || pending.length === 0) return;
     const activeChild = child;
     const entry = pending.shift();
-    clearTimeout(entry.timer);
+    clearScheduled(entry.timer);
     if (entry.socket.destroyed) {
       flush();
       return;
@@ -95,9 +102,14 @@ function createTerminalRelay(options = {}) {
     };
     transfers.set(entry.id, entry);
     entry.timer = setTimeout(() => {
-      if (!transfers.delete(entry.id)) return;
-      log('[keep terminal relay] socket transfer acknowledgment timed out; replacing worker');
-      try { activeChild.kill('SIGKILL'); } catch {}
+      // Timers run before child-process IPC callbacks. If the parent event loop was
+      // stalled past this deadline, give the poll phase one turn to drain an ACK that
+      // the healthy worker already sent before treating it as a child failure.
+      entry.timer = setImmediate(() => {
+        if (!transfers.delete(entry.id)) return;
+        log('[keep terminal relay] socket transfer acknowledgment timed out; replacing worker');
+        try { activeChild.kill('SIGKILL'); } catch {}
+      });
     }, transferTimeoutMs);
     entry.timer.unref?.();
     try {
@@ -107,7 +119,7 @@ function createTerminalRelay(options = {}) {
           transfers.delete(entry.id);
           closeEntry(entry);
           log(`[keep terminal relay] socket transfer failed: ${error.message}`);
-        }
+        } else afterSend('upgrade', entry.id);
         flush();
       });
     } catch (error) {
@@ -138,14 +150,14 @@ function createTerminalRelay(options = {}) {
       if (child !== spawned || !message) return;
       if (message.type === 'ready') {
         ready = true;
-        clearTimeout(startupTimer);
+        clearScheduled(startupTimer);
         startupTimer = null;
         flush();
       } else if (message.type === 'accepted' || message.type === 'rejected') {
         const entry = transfers.get(message.id);
         if (!entry) return;
         transfers.delete(message.id);
-        clearTimeout(entry.timer);
+        clearScheduled(entry.timer);
         if (message.type === 'rejected') {
           log(`[keep terminal relay] worker rejected an upgrade: ${message.error || 'unknown error'}`);
           entry.socket.destroy();
@@ -157,10 +169,12 @@ function createTerminalRelay(options = {}) {
       clearChild(spawned, `worker exited (${signal || code})`);
     });
     startupTimer = setTimeout(() => {
-      if (child !== spawned || ready) return;
-      log('[keep terminal relay] worker startup timed out');
-      try { spawned.kill('SIGKILL'); } catch {}
-      clearChild(spawned, 'worker startup failed');
+      startupTimer = setImmediate(() => {
+        if (child !== spawned || ready) return;
+        log('[keep terminal relay] worker startup timed out');
+        try { spawned.kill('SIGKILL'); } catch {}
+        clearChild(spawned, 'worker startup failed');
+      });
     }, startupTimeoutMs);
     startupTimer.unref?.();
     spawned.send({
@@ -169,7 +183,7 @@ function createTerminalRelay(options = {}) {
       hostConnectTimeoutMs: options.hostConnectTimeoutMs,
       readyDelayMs: options.readyDelayMs || 0,
     }, (error) => {
-      if (!error) return;
+      if (!error) { afterSend('init'); return; }
       log(`[keep terminal relay] worker initialization failed: ${error.message}`);
       try { spawned.kill('SIGKILL'); } catch {}
     });
@@ -202,18 +216,20 @@ function createTerminalRelay(options = {}) {
         const index = pending.indexOf(entry);
         if (index < 0) return;
         pending.splice(index, 1);
-        clearTimeout(entry.timer);
+        clearScheduled(entry.timer);
       };
       entry.onSocketError = dropQueued;
       entry.onSocketClose = dropQueued;
       socket.once('error', entry.onSocketError);
       socket.once('close', entry.onSocketClose);
       entry.timer = setTimeout(() => {
-        const index = pending.indexOf(entry);
-        if (index < 0) return;
-        pending.splice(index, 1);
-        closeEntry(entry);
-        log('[keep terminal relay] queued upgrade timed out');
+        entry.timer = setImmediate(() => {
+          const index = pending.indexOf(entry);
+          if (index < 0) return;
+          pending.splice(index, 1);
+          closeEntry(entry);
+          log('[keep terminal relay] queued upgrade timed out');
+        });
       }, startupTimeoutMs);
       entry.timer.unref?.();
       pending.push(entry);
@@ -225,7 +241,7 @@ function createTerminalRelay(options = {}) {
     close() {
       if (closing) return;
       closing = true;
-      clearTimeout(startupTimer);
+      clearScheduled(startupTimer);
       for (const entry of pending.splice(0)) closeEntry(entry);
       for (const entry of transfers.values()) closeEntry(entry);
       transfers.clear();

@@ -46,11 +46,6 @@ async function fixture(options = {}) {
   const host = fork(CHILD, ['host', sock], { stdio: ['ignore', 'inherit', 'inherit', 'ipc'] });
   await waitMessage(host, (message) => message?.type === 'ready', 'fixture host');
   const server = http.createServer();
-  const serverSockets = new Set();
-  server.on('connection', (socket) => {
-    serverSockets.add(socket);
-    socket.once('close', () => serverSockets.delete(socket));
-  });
   const installed = keepConsole.install({
     server, root, hostSock: sock, token: 'secret',
     isLocal: options.isLocal || (() => true),
@@ -66,10 +61,10 @@ async function fixture(options = {}) {
     origin: `http://127.0.0.1:${port}`,
     async close() {
       installed.close();
-      for (const socket of serverSockets) socket.destroy();
-      // Node can no longer count sockets transferred to another process, so stopping
-      // accepts is synchronous but its close callback is not a useful teardown signal.
-      server.close();
+      const serverClosed = new Promise((resolve) => server.close(resolve));
+      // A deliberately SIGKILLed relay cannot report its transferred sockets closing
+      // to the parent HTTP server. server.close() still stops accepts synchronously.
+      await Promise.race([serverClosed, new Promise((resolve) => setTimeout(resolve, 250))]);
       const hostExit = host.exitCode == null && host.signalCode == null ? once(host, 'exit') : Promise.resolve();
       if (host.connected) host.disconnect();
       await Promise.race([hostExit, new Promise((resolve) => setTimeout(resolve, 1000))]);
@@ -87,6 +82,11 @@ function collect(ws) {
 
 function waitFrame(frames, predicate, description, timeout = 5000) {
   return waitFor(() => frames.find(predicate), description, timeout).then(() => frames.find(predicate));
+}
+
+function stall(ms) {
+  const started = Date.now();
+  while (Date.now() - started < ms) { /* intentional parent event-loop stall */ }
 }
 
 function maskedFrame(payload) {
@@ -199,4 +199,87 @@ test('upgrade head and bytes buffered during delayed startup preserve order', as
   const socketClosed = new Promise((resolve) => socket.once('close', resolve));
   socket.destroy();
   await socketClosed;
+});
+
+test('a late parent ACK callback does not kill a healthy relay or its viewers', async (t) => {
+  let upgradeSends = 0;
+  let stalled = false;
+  const f = await fixture({
+    relayOptions: {
+      transferTimeoutMs: 25,
+      afterSend(type) {
+        if (type !== 'upgrade' || ++upgradeSends !== 2) return;
+        stalled = true;
+        stall(100);
+      },
+    },
+  });
+  t.after(() => f.close());
+  const base = `ws://127.0.0.1:${f.port}/ws/pane/relay-pane`;
+  const first = new WebSocket(`${base}?viewer=ack-first`, { origin: f.origin });
+  const firstFrames = collect(first);
+  t.after(() => first.terminate());
+  await once(first, 'open');
+  await waitFrame(firstFrames, (frame) => !frame.binary && JSON.parse(frame.data).t === 'attached', 'first viewer');
+  const relayPid = f.installed.relay.pid();
+
+  const second = new WebSocket(`${base}?viewer=ack-second`, { origin: f.origin });
+  const secondFrames = collect(second);
+  t.after(() => second.terminate());
+  await once(second, 'open');
+  await waitFrame(secondFrames, (frame) => !frame.binary && JSON.parse(frame.data).t === 'attached', 'second viewer');
+  await new Promise((resolve) => setTimeout(resolve, 40));
+
+  assert.equal(stalled, true);
+  assert.equal(f.installed.relay.pid(), relayPid);
+  assert.equal(first.readyState, WebSocket.OPEN, 'the existing viewer survives the delayed parent ACK');
+});
+
+test('late parent processing of ready does not expire startup or its queued upgrade', async (t) => {
+  let stalled = false;
+  const f = await fixture({
+    relayOptions: {
+      startupTimeoutMs: 25,
+      afterSend(type) {
+        if (type !== 'init' || stalled) return;
+        stalled = true;
+        stall(100);
+      },
+    },
+  });
+  t.after(() => f.close());
+  const ws = new WebSocket(`ws://127.0.0.1:${f.port}/ws/pane/relay-pane?viewer=ready-lag`, {
+    origin: f.origin,
+  });
+  const frames = collect(ws);
+  t.after(() => ws.terminate());
+  await once(ws, 'open');
+  await waitFrame(frames, (frame) => !frame.binary && JSON.parse(frame.data).t === 'attached', 'startup attach');
+
+  assert.equal(stalled, true);
+  assert.ok(f.installed.relay.pid());
+});
+
+test('a worker that never acknowledges a transfer is still killed', async (t) => {
+  const logs = [];
+  const f = await fixture({
+    relayOptions: {
+      workerPath: CHILD,
+      workerEnv: { KEEP_RELAY_FIXTURE_MODE: 'silent-relay' },
+      transferTimeoutMs: 25,
+      log: (message) => logs.push(message),
+    },
+  });
+  t.after(() => f.close());
+  const ws = new WebSocket(`ws://127.0.0.1:${f.port}/ws/pane/relay-pane?viewer=no-ack`, {
+    origin: f.origin,
+  });
+  const failed = once(ws, 'error');
+  await waitFor(() => f.installed.relay.pid(), 'silent relay start');
+  const relayPid = f.installed.relay.pid();
+  await failed;
+  await waitFor(() => f.installed.relay.pid() === null, 'silent relay termination');
+
+  assert.ok(logs.some((message) => message.includes('acknowledgment timed out')));
+  assert.throws(() => process.kill(relayPid, 0));
 });
