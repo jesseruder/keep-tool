@@ -2306,6 +2306,27 @@ function setLiveSession(map, id, row, source, extra = {}) {
   });
 }
 
+function agentIdentityOwnsPane(identity, pane, rows) {
+  if (!identity || !pane?.alive || !Number.isInteger(pane.pid) || pane.pid <= 0
+      || !Number.isInteger(identity.pid) || identity.pid <= 0
+      || typeof identity.pidStart !== 'string' || !identity.pidStart
+      || !['claude', 'codex'].includes(identity.agent) || !Array.isArray(rows)) return false;
+  const byPid = new Map(rows.filter((row) => Number.isInteger(row?.pid)).map((row) => [row.pid, row]));
+  let row = byPid.get(identity.pid);
+  if (!row || row.pidStart !== identity.pidStart || row.agent !== identity.agent) return false;
+  const seen = new Set();
+  while (row && !seen.has(row.pid)) {
+    if (row.pid === pane.pid) return true;
+    seen.add(row.pid);
+    row = byPid.get(row.ppid);
+    // A nested agent can inherit the outer pane's environment and open files,
+    // but its conversation does not own the outer TUI input box.
+    const command = String(row?.args || '').trim().split(/\s+/)[0];
+    if (row && /(?:^|\/)(?:codex|claude)$/.test(command)) return false;
+  }
+  return false;
+}
+
 async function liveSessionPids(deps = {}) {
   const live = new Map();
   let rows = [];
@@ -5204,6 +5225,7 @@ async function inspectAccountHandoff(body, deps = {}) {
   const rows = await agentProcessRows(deps);
   const identity = (await liveSessionPids({ ...deps, agentProcessRows: async () => rows,
     codexRolloutOnly: session?.kind === 'codex' })).get(body.sessionId);
+  const ownsPane = agentIdentityOwnsPane(identity, pane, rows);
   const processArgs = identity ? rows.find((entry) => entry.pid === identity.pid)?.args || '' : '';
   let currentModel = '';
   try {
@@ -5211,7 +5233,7 @@ async function inspectAccountHandoff(body, deps = {}) {
   } catch {}
   return { session, pane, processArgs, currentModel,
     agentIdentity: identity ? { pid: identity.pid, pidStart: identity.pidStart, primary: identity.primary === true,
-      ...(identity.rolloutFile ? { rolloutFile: identity.rolloutFile } : {}) } : null };
+      ownsPane, ...(identity.rolloutFile ? { rolloutFile: identity.rolloutFile } : {}) } : null };
 }
 
 async function waitForAccountRecord(sessionId, pane, accountId, startedAfter, deps = {}) {
@@ -5251,6 +5273,7 @@ async function verifyAccountHandoffTarget(sessionId, paneId, accountId, agent, t
       || !Number.isInteger(expected.panePid) || expected.panePid <= 0 || !validStamp(expected.paneCreatedAt)
       || !Number.isInteger(expected.agentPid) || expected.agentPid <= 0
       || typeof expected.agentPidStart !== 'string' || !expected.agentPidStart
+      || expected.ownsPane !== true
       || !validStamp(expected.sessionStartedAt)
       || !Number.isFinite(options.sourceStopVerifiedAt) || options.sourceStopVerifiedAt <= 0) {
     throw new InjectionError(409, 'Native handoff destination identity is incomplete; nothing was sent');
@@ -5269,13 +5292,13 @@ async function verifyAccountHandoffTarget(sessionId, paneId, accountId, agent, t
     assertPane(pane);
     return pane;
   };
-  const currentAgent = async () => {
+  const currentAgent = async (pane) => {
     const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
     const live = await (deps.liveSessionPids || liveSessionPids)({ ...deps, agentProcessRows: async () => rows,
       codexRolloutOnly: agent === 'codex' });
     const identity = live.get(sessionId);
     if (!identity?.primary || identity.agent !== agent || identity.pid !== expected.agentPid
-        || identity.pidStart !== expected.agentPidStart) {
+        || identity.pidStart !== expected.agentPidStart || !agentIdentityOwnsPane(identity, pane, rows)) {
       throw new InjectionError(409, 'Native handoff destination agent identity changed; nothing was sent');
     }
     if (agent === 'codex') {
@@ -5294,11 +5317,11 @@ async function verifyAccountHandoffTarget(sessionId, paneId, accountId, agent, t
       throw new InjectionError(409, 'Native handoff destination SessionStart identity changed; nothing was sent');
     }
   };
-  await currentPane(); currentRecord(); await currentAgent();
+  const pane = await currentPane(); currentRecord(); await currentAgent(pane);
   // Re-read both host and process identity after the other proofs. This runs in
   // the delivery type callback under the injection lock, immediately before the
   // first byte or an already typed draft's Enter is sent.
-  await currentPane(); await currentAgent(); currentRecord();
+  const finalPane = await currentPane(); await currentAgent(finalPane); currentRecord();
 }
 
 function continueAccountHandoff(sessionId, pane, accountId, text, deliveryId, options = {}, deps = {}) {
@@ -5432,13 +5455,20 @@ async function inspectPortableSource(sessionId, options = {}, deps = {}) {
   const abandoned = handoff.abandonedForPortable(root, sessionId);
   const abandonedPane = abandoned && (state.panes || []).find((entry) => entry.id === abandoned.pane);
   let abandonedIdentity = null;
+  let abandonedOwnsPane = false;
   if (abandoned) {
-    try { abandonedIdentity = (await (deps.liveSessionPids || liveSessionPids)(deps)).get(sessionId) || null; } catch {}
+    try {
+      const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
+      abandonedIdentity = (await (deps.liveSessionPids || liveSessionPids)({ ...deps,
+        agentProcessRows: async () => rows, codexRolloutOnly: session?.kind === 'codex' })).get(sessionId) || null;
+      abandonedOwnsPane = agentIdentityOwnsPane(abandonedIdentity, abandonedPane, rows);
+    } catch {}
   }
-  const portableFallback = abandoned && session?.accountId === abandoned.sourceAccountId
+  const portableFallback = abandoned && abandoned.sourceOwnsPane === true
+    && session?.accountId === abandoned.sourceAccountId
     && abandonedPane?.alive === true && abandonedPane.meta?.sessionId === sessionId
     && abandonedPane.meta?.accountId === abandoned.sourceAccountId && abandonedPane.agentAlive !== false
-    && abandonedIdentity?.primary === true
+    && abandonedIdentity?.primary === true && abandonedOwnsPane
     && (!abandoned.sourceAgentPid || abandonedIdentity.pid === abandoned.sourceAgentPid)
     && (!abandoned.sourceAgentPidStart || abandonedIdentity.pidStart === abandoned.sourceAgentPidStart) ? abandoned : null;
   if (abandoned && !portableFallback) nativeHandoff ||= abandoned;

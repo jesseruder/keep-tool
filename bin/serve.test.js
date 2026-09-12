@@ -2989,7 +2989,8 @@ test('handoff continuation receipts are bound to the staged target transcript', 
   accountStore.stageSession(sid, 'target', 'tx-handoff', { root, env });
   const message = 'Continue from the limit.';
   const targetIdentity = { pane: 'pane-target', panePid: 40, paneCreatedAt: 100, sessionId: sid,
-    accountId: 'target', transactionId: 'tx-handoff', agentPid: 41, agentPidStart: 'agent-start', sessionStartedAt: 200 };
+    accountId: 'target', transactionId: 'tx-handoff', agentPid: 41, agentPidStart: 'agent-start',
+    ownsPane: true, sessionStartedAt: 200 };
   let draft = '';
   const host = recordingHost((type, params) => {
     if (type === 'list') return { panes: [{ id: 'pane-target', alive: true,
@@ -3012,7 +3013,10 @@ test('handoff continuation receipts are bound to the staged target transcript', 
     }, {
       root, env, host, sleep: async () => {}, deliveryDirectory: path.join(root, '.keep', 'delivery'),
       readPaneRecord: () => ({ pane: 'pane-target', accountId: 'target', startedAt: 200 }),
-      agentProcessRows: async () => [], liveSessionPids: async () => new Map([[sid,
+      agentProcessRows: async () => [
+        { pid: 40, ppid: 1, pidStart: 'pane-start', args: '/bin/zsh -l' },
+        { pid: 41, ppid: 40, pidStart: 'agent-start', args: '/bin/claude', agent: 'claude', interactive: true },
+      ], liveSessionPids: async () => new Map([[sid,
         { agent: 'claude', primary: true, pid: 41, pidStart: 'agent-start' }]]),
     });
     assert.equal(result.delivery, 'received');
@@ -3046,7 +3050,7 @@ test('Codex handoff continuation uses only the exact staged target rollout', asy
   accountStore.stageSession(sid, 'codex-target', 'codex-delivery', { root, env });
   const targetIdentity = { pane: 'pane-codex-target', panePid: 50, paneCreatedAt: 300, sessionId: sid,
     accountId: 'codex-target', transactionId: 'codex-delivery', agentPid: 51,
-    agentPidStart: 'codex-agent-start', sessionStartedAt: 400 };
+    agentPidStart: 'codex-agent-start', ownsPane: true, sessionStartedAt: 400 };
   let draft = '';
   const host = recordingHost((type, params) => {
     if (type === 'list') return { panes: [{ id: 'pane-codex-target', alive: true,
@@ -3071,7 +3075,11 @@ test('Codex handoff continuation uses only the exact staged target rollout', asy
         sourceStopVerifiedAt: 1, targetIdentity }, {
         root, env, host, sleep: async () => {}, deliveryDirectory: path.join(root, '.keep', 'delivery'),
         readPaneRecord: () => ({ pane: 'pane-codex-target', accountId: 'codex-target', startedAt: 400 }),
-        agentProcessRows: async () => [], liveSessionPids: async (liveDeps) => {
+        agentProcessRows: async () => [
+          { pid: 50, ppid: 1, pidStart: 'pane-start', args: '/bin/zsh -l' },
+          { pid: 52, ppid: 50, pidStart: 'wrapper-start', args: '/bin/sh keep-codex-cli /bin/codex' },
+          { pid: 51, ppid: 52, pidStart: 'codex-agent-start', args: '/bin/codex', agent: 'codex', interactive: true },
+        ], liveSessionPids: async (liveDeps) => {
           assert.equal(liveDeps.codexRolloutOnly, true);
           return new Map([[sid, { agent: 'codex', primary: true, pid: 51, pidStart: 'codex-agent-start',
             source: 'rollout', rolloutFile: targetFile }]]);
@@ -3128,6 +3136,26 @@ test('native handoff continuation refuses destination identity changes immediate
       name: 'saved destination identity is incomplete',
       omitIdentityField: 'agentPidStart',
     },
+    {
+      name: 'rollout-owning process belongs to an external TUI',
+      processTree: 'external',
+    },
+    {
+      name: 'rollout-owning process is nested under another Codex agent',
+      processTree: 'nested-codex',
+    },
+    {
+      name: 'rollout-owning process is nested under a Claude agent',
+      processTree: 'nested-claude',
+    },
+    {
+      name: 'rollout-owning process is missing from the process snapshot',
+      processTree: 'missing',
+    },
+    {
+      name: 'rollout-owning process has cyclic ancestry',
+      processTree: 'cyclic',
+    },
   ];
 
   for (const scenario of cases) await t.test(scenario.name, async () => {
@@ -3154,8 +3182,26 @@ test('native handoff continuation refuses destination identity changes immediate
       meta: { sessionId: sid, agent: 'codex', accountId: 'target', handoffTransactionId: 'tx-guard' } } };
     const targetIdentity = { pane: 'pane-guard', panePid: 50, paneCreatedAt: 300, sessionId: sid,
       accountId: 'target', transactionId: 'tx-guard', agentPid: 51,
-      agentPidStart: 'agent-start', sessionStartedAt: 400 };
+      agentPidStart: 'agent-start', ownsPane: true, sessionStartedAt: 400 };
     if (scenario.omitIdentityField) delete targetIdentity[scenario.omitIdentityField];
+    const paneRow = { pid: 50, ppid: 1, pidStart: 'pane-start', args: '/bin/zsh -l' };
+    const identityRow = { pid: 51, ppid: 52, pidStart: 'agent-start', args: '/bin/codex',
+      agent: 'codex', interactive: true };
+    const otherPaneAgent = { pid: 60, ppid: 50, pidStart: 'other-agent-start', args: '/bin/codex',
+      agent: 'codex', interactive: true };
+    const processRows = scenario.processTree === 'external'
+      ? [paneRow, otherPaneAgent, { ...identityRow, ppid: 90 },
+        { pid: 90, ppid: 1, pidStart: 'external-start', args: '/bin/zsh -l' }]
+      : scenario.processTree === 'nested-codex'
+        ? [paneRow, identityRow, { pid: 52, ppid: 50, pidStart: 'outer-start', args: '/bin/codex', agent: 'codex', interactive: true }]
+        : scenario.processTree === 'nested-claude'
+          ? [paneRow, identityRow, { pid: 52, ppid: 50, pidStart: 'outer-start', args: '/bin/claude', agent: 'claude', interactive: true }]
+          : scenario.processTree === 'missing'
+            ? [paneRow, otherPaneAgent]
+            : scenario.processTree === 'cyclic'
+              ? [paneRow, otherPaneAgent, identityRow,
+                { pid: 52, ppid: 51, pidStart: 'cycle-start', args: '/bin/sh wrapper' }]
+              : [paneRow, identityRow, { pid: 52, ppid: 50, pidStart: 'wrapper-start', args: '/bin/sh keep-codex-cli /bin/codex' }];
     let screenCalls = 0, liveCalls = 0, inputCalls = 0;
     const host = recordingHost((type) => {
       if (type === 'list') return { panes: [{ ...state.pane, meta: { ...state.pane.meta } }] };
@@ -3173,7 +3219,7 @@ test('native handoff continuation refuses destination identity changes immediate
           transactionId: 'tx-guard', sourceStopVerifiedAt: 1, targetIdentity }, {
           root, env, host, sleep: async () => {}, deliveryDirectory: path.join(root, '.keep', 'delivery'),
           readPaneRecord: () => scenario.paneRecord || { pane: 'pane-guard', accountId: 'target', startedAt: 400 },
-          agentProcessRows: async () => [],
+          agentProcessRows: async () => processRows,
           liveSessionPids: async (liveDeps) => {
             assert.equal(isInjectionBusy(), true, 'identity proof must run under the real injection lock');
             assert.equal(liveDeps.codexRolloutOnly, true);
@@ -3866,20 +3912,32 @@ test('abandoned pre-stop journal authorizes only its still-identical source for 
   fs.writeFileSync(path.join(directory, 'source-session-1234.json'), JSON.stringify({ id, transactionId: id,
     sessionId: 'source-session-1234', pane: 'pane-source', sourceAccountId: 'claude/default',
     targetAccountId: 'claude-secondary', status: 'failed', phase: 'portable-fallback', portableFallbackAt: 1,
-    sourceAgentPid: 42, sourceAgentPidStart: 'source-start' }));
+    sourceAgentPid: 42, sourceAgentPidStart: 'source-start', sourceOwnsPane: true }));
   const session = { id: 'source-session-1234', kind: 'claude', accountId: 'claude/default', endedTurn: true,
     pendingBackground: true, unknownBackgroundJobs: ['history-gap'], backgroundJobs: { jobs: [] } };
-  const pane = { id: 'pane-source', alive: true, agentAlive: true,
+  const pane = { id: 'pane-source', pid: 40, alive: true, agentAlive: true,
     meta: { sessionId: session.id, accountId: session.accountId, agent: 'claude' } };
-  const identity = async () => new Map([[session.id, { pid: 42, pidStart: 'source-start', primary: true }]]);
+  const identity = async () => new Map([[session.id,
+    { pid: 42, pidStart: 'source-start', agent: 'claude', primary: true }]]);
+  const ownedRows = [
+    { pid: 40, ppid: 1, pidStart: 'pane-start', args: '/bin/zsh -l' },
+    { pid: 42, ppid: 40, pidStart: 'source-start', args: '/bin/claude', agent: 'claude', interactive: true },
+  ];
   try {
     let inspection = await inspectPortableSource(session.id, {}, { root, liveSessionPids: identity,
+      agentProcessRows: async () => ownedRows,
       inspectState: async () => ({ sessions: [session], panes: [pane], handoffs: [] }) });
     assert.equal(inspection.portableFallback.phase, 'portable-fallback');
     assert.equal(require('./portable-handoff').sourceBusyReason(inspection), '');
+    inspection = await inspectPortableSource(session.id, {}, { root, liveSessionPids: identity,
+      agentProcessRows: async () => [ownedRows[0], { ...ownedRows[1], ppid: 99 },
+        { pid: 99, ppid: 1, pidStart: 'external-start', args: '/bin/zsh -l' }],
+      inspectState: async () => ({ sessions: [session], panes: [pane], handoffs: [] }) });
+    assert.equal(inspection.portableFallback, null, 'an external same-session agent cannot lend source proof');
+    assert.ok(inspection.nativeHandoff);
     inspection = await inspectPortableSource(session.id, {}, { root, inspectState: async () => ({ sessions: [
       { ...session, accountId: 'claude-secondary' },
-    ], panes: [pane], handoffs: [] }), liveSessionPids: identity });
+    ], panes: [pane], handoffs: [] }), liveSessionPids: identity, agentProcessRows: async () => ownedRows });
     assert.equal(inspection.portableFallback, null);
     assert.ok(inspection.nativeHandoff, 'changed identity restores the unresolved handoff refusal');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
