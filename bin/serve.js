@@ -975,6 +975,30 @@ function lastTurnUsage(lines, kind) {
   return result;
 }
 
+// Claude writes quota and API failures as synthetic assistant records. They can
+// carry usage and therefore legitimately remain the newest accounting record, but
+// their model is not a launch setting. Keep model selection separate from usage
+// accounting. Preserve malformed genuine values so the handoff's existing model
+// validator still fails closed instead of falling back past them. A synthetic-only
+// tail returns an invalid sentinel so the handoff is refused rather than trusting
+// launch metadata that an in-session model switch may have made stale.
+function lastClaudeHandoffModel(lines) {
+  const records = Array.isArray(lines) ? lines : String(lines || '').split(/\r?\n/);
+  let model = '';
+  let sawSynthetic = false;
+  for (const line of records) {
+    let record;
+    try { record = typeof line === 'string' ? JSON.parse(line) : line; } catch { continue; }
+    if (!record || record.type !== 'assistant' || record.isSidechain || !record.message) continue;
+    const candidate = typeof record.message.model === 'string' ? record.message.model : '<unknown>';
+    if (record.isApiErrorMessage || candidate === '<synthetic>') { sawSynthetic = true; continue; }
+    if (!record.message.usage) continue;
+    model = candidate || '<unknown>';
+  }
+  if (model || !sawSynthetic) return model;
+  return '<unknown>';
+}
+
 function lastContextTokens(lines, kind) {
   return lastTurnUsage(lines, kind).contextTokens;
 }
@@ -5689,7 +5713,9 @@ async function inspectAccountHandoff(body, deps = {}) {
   const processArgs = identity ? rows.find((entry) => entry.pid === identity.pid)?.args || '' : '';
   let currentModel = '';
   try {
-    if (session?.kind === 'claude') currentModel = lastTurnUsage(readTranscriptTail(findSessionFile(session.id)), 'claude').model || '';
+    if (session?.kind === 'claude') {
+      currentModel = lastClaudeHandoffModel(readTranscriptTail(findSessionFile(session.id)));
+    }
   } catch {}
   return { session, pane, processArgs, currentModel,
     agentIdentity: identity ? { pid: identity.pid, pidStart: identity.pidStart, primary: identity.primary === true,
@@ -7328,6 +7354,7 @@ module.exports = {
   deliverCheckToThread,
   shouldCompactFirst,
   lastTurnUsage,
+  lastClaudeHandoffModel,
   lastContextTokens,
   compactRefusal,
   compactCommand,

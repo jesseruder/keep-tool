@@ -213,6 +213,21 @@ test('auth preflight kills a login-shell process group when startup exceeds its 
   }
 });
 
+test('handoff refuses an unresolved synthetic-only Claude model before stopping the source', async () => {
+  const f = fixture();
+  try {
+    const d = deps(f);
+    const inspected = await d.inspect();
+    d.inspect = async () => ({ ...inspected, currentModel: '<unknown>' });
+    await assert.rejects(
+      handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d),
+      /Current Claude model cannot be reproduced safely/,
+    );
+    assert.equal(d.pane.alive, true, 'model uncertainty is resolved before stopping the source');
+    assert.equal(d.continuations(), 0);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test('explicit handoff moves one conversation across three-account infrastructure and continues once', async () => {
   const f = fixture();
   try {

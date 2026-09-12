@@ -25,6 +25,7 @@ const {
   sessionAttentionItem,
   shouldCompactFirst,
   lastTurnUsage,
+  lastClaudeHandoffModel,
   lastContextTokens,
   autoCompactIdleMs,
   autoCompactCandidates,
@@ -1521,6 +1522,37 @@ test('last turn usage takes the last non-sidechain Claude model and context', ()
     contextTokens: 510,
     model: 'claude-fable-5-1',
   });
+});
+
+test('handoff model selection retains the last real Claude model across synthetic errors', () => {
+  const real = { type: 'assistant', message: { model: 'claude-fable-5-1[1m]', usage: {
+    input_tokens: 400, cache_creation_input_tokens: 50, cache_read_input_tokens: 60,
+  } } };
+  const weeklyLimit = {
+    type: 'assistant',
+    isApiErrorMessage: true,
+    error: 'rate_limit',
+    apiErrorStatus: 429,
+    message: { model: '<synthetic>', usage: { input_tokens: 0 }, content: [{
+      type: 'text', text: "You've reached your Fable 5.1 limit.",
+    }] },
+  };
+  const transcript = [real, weeklyLimit].map(JSON.stringify);
+  assert.equal(lastTurnUsage(transcript, 'claude').model, '<synthetic>',
+    'the newest usage record remains authoritative for accounting');
+  assert.equal(lastClaudeHandoffModel(transcript), 'claude-fable-5-1[1m]');
+  assert.equal(lastClaudeHandoffModel([weeklyLimit]), '<unknown>',
+    'a synthetic-only tail fails closed instead of guessing a model');
+  assert.equal(lastClaudeHandoffModel([{ ...weeklyLimit,
+    message: { model: '<synthetic>', content: weeklyLimit.message.content },
+  }]), '<unknown>', 'synthetic API errors without usage are still model-unknown');
+  assert.equal(lastClaudeHandoffModel([]), '', 'an empty tail keeps the prior no-transcript behavior');
+  assert.equal(lastClaudeHandoffModel([{ ...weeklyLimit,
+    message: { ...weeklyLimit.message, model: 'claude-opus-5-1' },
+  }]), '<unknown>', 'an API error is synthetic even when its model field looks valid');
+  assert.equal(lastClaudeHandoffModel([real, { type: 'assistant', message: {
+    model: '<invalid>', usage: { input_tokens: 10 },
+  } }]), '<invalid>', 'a malformed genuine model remains visible to fail-closed validation');
 });
 
 test('Claude compact boundaries replace stale assistant context until the next assistant turn', () => {
