@@ -98,9 +98,9 @@ test('Watch Close hides the pane immediately', async ({ page }) => {
 });
 
 test('account handoff sends the explicit destination and confirms refreshed identity', async ({ page }) => {
-  await expect(page.locator('#meters')).toContainText('Claude Main 5h');
-  await expect(page.locator('#meters')).toContainText('Claude Two 5h');
-  await expect(page.locator('#meters')).toContainText('Codex Main 5h');
+  await expect(page.locator('#meters')).toContainText('Claude 5h');
+  await expect(page.locator('#meters')).toContainText('Claude week');
+  await expect(page.locator('#meters')).toContainText('Codex 5h');
   await expect(page.locator('#meters')).not.toContainText('legacy');
   await expect(page.locator('#stage .account-label')).toHaveText('Claude Main');
   await page.locator('#stage .account-handoff > summary').click();
@@ -114,6 +114,25 @@ test('account handoff sends the explicit destination and confirms refreshed iden
   const requests = fixture.events.filter(event => event.event === 'request' && event.path === '/api/handoff-session');
   expect(requests).toHaveLength(1);
   expect(requests[0].body).toEqual({ sessionId: 'a', pane: 'pa', accountId: 'claude-two' });
+});
+
+test('account limit groups remain complete and reveal their account details on desktop', async ({ page }) => {
+  for (const width of [1280, 1440]) {
+    await page.setViewportSize({ width, height: 950 });
+    const groups = page.locator('#meters .meter-group');
+    await expect(groups).toHaveCount(4);
+    await expect(page.locator('#meters')).toContainText('Claude 5h');
+    await expect(page.locator('#meters')).toContainText('Codex week');
+    expect(await page.locator('.bar').evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+    expect(await groups.evaluateAll((elements, viewportWidth) => elements.every((element) => {
+      const box = element.getBoundingClientRect();
+      return box.width > 0 && box.height > 0 && box.left >= 0 && box.right <= viewportWidth;
+    }), width)).toBe(true);
+  }
+  await page.locator('#meters .meter-group').first().focus();
+  await expect(page.locator('#meters .meter-group').first().locator('.meter-details')).toBeVisible();
+  await expect(page.locator('#meters .meter-group').first().locator('.meter-details')).toContainText('Claude Main: 10%');
+  await expect(page.locator('#meters .meter-group').first().locator('.meter-details')).toContainText('Claude Two: 11%');
 });
 
 test('interrupted account handoff exposes retry and never claims an unverified resume', async ({ page }) => {

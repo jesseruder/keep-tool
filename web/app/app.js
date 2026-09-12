@@ -610,20 +610,39 @@ function clearElement(element) {
 
 function renderMeters() {
   const accountUsage = Object.values(data.usage?.accounts || {});
-  const meters = ['claude', 'codex'].flatMap((agent) => {
+  const groups = new Map();
+  for (const agent of ['claude', 'codex']) {
     const configured = accountUsage.filter((account) => account.agent === agent);
-    if (configured.length > 1) return configured.flatMap((account) => {
+    const sources = configured.length ? configured : [{
+      id: agent,
+      label: agent === 'claude' ? 'Claude' : 'Codex',
+      agent,
+      ...(data.usage?.[agent] || {}),
+    }];
+    for (const account of sources) {
       const values = agent === 'claude' ? account.limits || [] : account.windows || [];
-      return values.map((value) => ({ ...value, label: `${account.label || account.id} ${value.label}` }));
+      for (const value of values) {
+        const window = value.label || 'usage';
+        const key = `${agent}:${window}`;
+        const group = groups.get(key) || {
+          label: `${agent === 'claude' ? 'Claude' : 'Codex'} ${window}`,
+          readings: [],
+        };
+        group.readings.push({ account: account.label || account.id, ...value });
+        groups.set(key, group);
+      }
+    }
+  }
+  document.querySelector('#meters').innerHTML = [...groups.values()].map((group) => {
+    const details = group.readings.map((reading) => {
+      const percent = Math.max(0, Math.min(100, Number(reading.percent) || 0));
+      const reset = reading.resetsAt && Number.isFinite(Date.parse(reading.resetsAt))
+        ? ` · resets ${new Date(reading.resetsAt).toLocaleString()}` : '';
+      return { ...reading, percent, detail: `${reading.account}: ${Math.round(percent)}%${reset}` };
     });
-    const legacy = data.usage?.[agent];
-    const values = agent === 'claude' ? legacy?.limits || [] : legacy?.windows || [];
-    return values.map((value) => ({ ...value, label: agent === 'codex' ? `Codex ${value.label}` : value.label }));
-  });
-  document.querySelector('#meters').innerHTML = meters.map((meter) => {
-    const percent = Math.max(0, Math.min(100, Number(meter.percent) || 0));
-    return `<span class="meter" title="${meter.resetsAt ? `resets ${esc(new Date(meter.resetsAt).toLocaleString())}` : ''}"><span class="meter-label">${esc(meter.label)}</span><i><b class="${percent >= 75 ? 'warn' : ''}" style="width:${percent}%"></b></i><span>${Math.round(percent)}%</span></span>`;
-  }).join('') || '<span class="meter">usage unavailable</span>';
+    const description = `${group.label}. ${details.map((reading) => reading.detail).join('. ')}`;
+    return `<span class="meter-group" tabindex="0" role="group" aria-label="${esc(description)}"><span class="meter-label">${esc(group.label)}</span><span class="meter-readings">${details.map((reading) => `<span class="meter"><i><b class="${reading.percent >= 75 ? 'warn' : ''}" style="width:${reading.percent}%"></b></i><span>${Math.round(reading.percent)}%</span></span>`).join('')}</span><span class="meter-details" role="tooltip">${details.map((reading) => `<span>${esc(reading.detail)}</span>`).join('')}</span></span>`;
+  }).join('') || '<span class="meter unavailable">usage unavailable</span>';
 }
 function renderHealth() {
   const health = data.health || {};

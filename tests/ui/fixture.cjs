@@ -30,8 +30,10 @@ async function createFixture() {
     { id: 'codex-main', agent: 'codex', label: 'Codex Main', isDefault: true, handoffSupported: false },
     { id: 'codex-two', agent: 'codex', label: 'Codex Two', isDefault: false, handoffSupported: false },
   ];
-  const usageAccounts = Object.fromEntries(accounts.map((account, index) => [account.id, { ...account,
-    ...(account.agent === 'claude' ? { limits: [{ label: '5h', percent: 10 + index }] } : { windows: [{ label: '5h', percent: 10 + index }] }) }]));
+  const usageAccounts = Object.fromEntries(accounts.filter((account) => account.id !== 'claude-unsupported').map((account, index) => [account.id, { ...account,
+    ...(account.agent === 'claude'
+      ? { limits: [{ label: '5h', percent: 10 + index }, { label: 'week', percent: 30 + index }] }
+      : { windows: [{ label: '5h', percent: 10 + index }, { label: 'week', percent: 30 + index }] }) }]));
   const portableTransfers = [{ id: 'portable-one', status: 'prepared', sourceSessionId: 'b', sourceAgent: 'codex',
     sourceAccountId: 'codex-main', targetAccountId: 'codex-two', targetAgent: 'codex', cardId: 'card-b', cwd: repo,
     artifactFile: '/private/fixture/saved-context.md', preparedAt: Date.now() }];
