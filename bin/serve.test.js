@@ -667,6 +667,87 @@ test('background completions absorbed as attachments or queued records clear wai
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('Claude interruption rows settle only the foreground turn', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-interrupted-turn-'));
+  const file = path.join(dir, 'session.jsonl');
+  const timestamp = (seconds) => new Date(seconds * 1000).toISOString();
+  const interruption = (text = '[Request interrupted by user]', extra = {}) => JSON.stringify({
+    type: 'user', timestamp: timestamp(3), interruptedMessageId: 'msg_interrupted',
+    message: { role: 'user', content: [{ type: 'text', text }] }, ...extra,
+  });
+  try {
+    const prior = [
+      JSON.stringify({ type: 'user', timestamp: timestamp(1), message: { role: 'user', content: 'Do the work' } }),
+      JSON.stringify({ type: 'assistant', timestamp: timestamp(2), message: { content: [{ type: 'text', text: 'Working.' }], stop_reason: null } }),
+    ];
+    fs.writeFileSync(file, prior.concat(interruption()).join('\n') + '\n');
+    let info = scanTranscript(file);
+    assert.equal(info.endedTurn, true);
+    assert.equal(info.explicitEndTurn, false, 'an interruption is not an assistant end_turn');
+    assert.equal(info.lastUser, 'Do the work');
+    assert.equal(info.lastHuman, 'Do the work');
+    assert.equal(info.turnStartedAt, 1000);
+    assert.equal(require('./session-restart').refusal({ id: 's', ...info }, {
+      alive: true, meta: { sessionId: 's', agent: 'claude' },
+    }), null);
+
+    fs.writeFileSync(file, prior.concat(interruption('[Request interrupted by user for tool use]')).join('\n') + '\n');
+    assert.equal(scanTranscript(file).endedTurn, true, 'the installed tool-use interruption shape is terminal too');
+
+    for (const row of [
+      interruption('[Request interrupted by user]', { interruptedMessageId: undefined }),
+      interruption('quoted: [Request interrupted by user]'),
+      interruption('[Request interrupted by user] trailing'),
+    ]) {
+      fs.writeFileSync(file, prior.concat(row).join('\n') + '\n');
+      assert.equal(scanTranscript(file).endedTurn, false, 'ordinary or inexact user content starts a turn');
+    }
+
+    fs.writeFileSync(file, prior.concat(interruption(), JSON.stringify({
+      type: 'user', timestamp: timestamp(4), message: { role: 'user', content: 'Do something else' },
+    })).join('\n') + '\n');
+    assert.equal(scanTranscript(file).endedTurn, false, 'new user activity supersedes an interruption');
+
+    fs.writeFileSync(file, prior.concat(interruption(), JSON.stringify({
+      type: 'assistant', timestamp: timestamp(4), message: { content: [{
+        type: 'tool_use', id: 'later-tool', name: 'Bash', input: { command: 'true' },
+      }], stop_reason: 'tool_use' },
+    })).join('\n') + '\n');
+    assert.equal(scanTranscript(file).endedTurn, false, 'new assistant activity supersedes an interruption');
+
+    fs.writeFileSync(file, [
+      JSON.stringify({ type: 'assistant', timestamp: timestamp(1), message: { content: [{
+        type: 'tool_use', id: 'tool-1', name: 'Bash', input: { command: 'sleep 10' },
+      }], stop_reason: 'tool_use' } }),
+      interruption(),
+    ].join('\n') + '\n');
+    info = scanTranscript(file);
+    assert.equal(info.endedTurn, false);
+    assert.equal(info.toolRunning, true);
+    assert.match(require('./session-restart').refusal({ id: 's', ...info }, {
+      alive: true, meta: { sessionId: 's', agent: 'claude' },
+    }), /turn and background work/);
+
+    fs.writeFileSync(file, [
+      JSON.stringify({ type: 'assistant', timestamp: timestamp(1), message: { content: [{
+        type: 'tool_use', id: 'tool-1', name: 'Bash', input: { command: 'sleep 10', run_in_background: true },
+      }], stop_reason: 'tool_use' } }),
+      JSON.stringify({ type: 'user', timestamp: timestamp(2), message: { content: [{
+        type: 'tool_result', tool_use_id: 'tool-1', content: 'Command running in background with ID: job-1.',
+      }] } }),
+      interruption(),
+    ].join('\n') + '\n');
+    info = scanTranscript(file);
+    assert.equal(info.endedTurn, true);
+    assert.equal(info.pendingBackground, true);
+    assert.match(require('./session-restart').refusal({ id: 's', ...info }, {
+      alive: true, meta: { sessionId: 's', agent: 'claude' },
+    }), /turn and background work/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('monitor events keep a wait live until an explicit completion or successful stop', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-monitor-'));
   const file = path.join(dir, 'session.jsonl');

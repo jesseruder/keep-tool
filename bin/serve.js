@@ -451,6 +451,18 @@ function rateLimitInfo(j, text) {
   };
 }
 
+const CLAUDE_INTERRUPTION_MESSAGES = new Set([
+  '[Request interrupted by user]',
+  '[Request interrupted by user for tool use]',
+]);
+
+function isClaudeInterruption(j) {
+  const content = j?.message?.content;
+  return j?.type === 'user' && typeof j.interruptedMessageId === 'string' && j.interruptedMessageId.length > 0
+    && Array.isArray(content) && content.length === 1 && content[0]?.type === 'text'
+    && CLAUDE_INTERRUPTION_MESSAGES.has(content[0].text);
+}
+
 function scanTranscript(file, options = {}) {
   const text = options.full ? fs.readFileSync(file, 'utf8') : readTranscriptTail(file);
   const out = { title: '', cwd: '', gitBranch: '', lastUser: '', lastHuman: '', lastUserAt: null, lastAssistant: '', lastTs: '' };
@@ -509,6 +521,18 @@ function scanTranscript(file, options = {}) {
     if ((['user', 'assistant'].includes(j.type) || (j.type === 'attachment' && j.attachment?.type === 'queued_command'))
         && Number.isFinite(Date.parse(j.timestamp))) out.attentionAt = Date.parse(j.timestamp);
     if (j.type === 'user' && j.message) {
+      const interrupted = isClaudeInterruption(j);
+      if (interrupted) {
+        // Claude records a human cancellation as a synthetic user row even
+        // though its foreground turn is over. Keep independently observed
+        // tool and background obligations; only settle the foreground.
+        out.exited = false;
+        out.rateLimit = null;
+        lastRealEvent = 'interrupted';
+        lastStopReason = null;
+        exitCommand = false;
+        continue;
+      }
       if (Array.isArray(j.message.content)) {
         for (const item of j.message.content) {
           if (!item || item.type !== 'tool_result' || !item.tool_use_id) continue;
@@ -636,8 +660,8 @@ function scanTranscript(file, options = {}) {
   }
   out.pendingOther = [...pending.values()].some((p) => !['AskUserQuestion', 'ExitPlanMode'].includes(p.name));
   out.toolRunning = lastAssistantToolIds.some((id) => pending.has(id));
-  out.endedTurn = lastRealEvent === 'assistant' && pending.size === 0
-    && (lastStopReason === 'end_turn' || (lastStopReason === null && lastAssistantHadText));
+  out.endedTurn = pending.size === 0 && (lastRealEvent === 'interrupted'
+    || (lastRealEvent === 'assistant' && (lastStopReason === 'end_turn' || (lastStopReason === null && lastAssistantHadText))));
   out.explicitEndTurn = out.endedTurn && lastStopReason === 'end_turn';
   // Local slash commands may finish on screen before Claude flushes stdout to
   // its transcript. This is only permission to inspect the terminal, not idle proof.
