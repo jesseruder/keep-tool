@@ -45,8 +45,12 @@ function fixture(options = {}) {
     get(id) { return options.accounts?.[id] === null ? null : (options.accounts?.[id] || ACCOUNTS[id] || null); },
     forSession(id, agent, opts) {
       authorityCalls.push({ id, agent, opts });
-      if (options.authorityError) throw options.authorityError;
-      return options.authority === undefined ? ACCOUNTS.secondary : options.authority;
+      if (opts.allowDiscovery === false) {
+        if (options.authorityError) throw options.authorityError;
+        return options.authority === undefined ? ACCOUNTS.secondary : options.authority;
+      }
+      if (options.discoveryError) throw options.discoveryError;
+      return options.discoveredAuthority === undefined ? ACCOUNTS.secondary : options.discoveredAuthority;
     },
   };
   const usage = {
@@ -168,6 +172,28 @@ test('implicit reviewer rejects staged and conflicting durable authority', async
   const conflictingResult = await reviewBudgetCommandCli([], conflicting.deps);
   assert.equal(conflictingResult.code, 8);
   assert.match(conflictingResult.reason, /conflicts with durable authority primary/);
+});
+
+test('legacy reviewer account discovery must be unique, present, and match the state row', async () => {
+  const unique = fixture({ authority: null, discoveredAuthority: ACCOUNTS.secondary });
+  const uniqueResult = await reviewBudgetCommandCli([], unique.deps);
+  assert.equal(uniqueResult.code, 0);
+  assert.deepEqual(unique.authorityCalls.map(({ opts }) => opts.allowDiscovery), [false, true]);
+
+  const ambiguous = fixture({ authority: null, discoveryError: new Error('session exists in multiple accounts without authority') });
+  const ambiguousResult = await reviewBudgetCommandCli([], ambiguous.deps);
+  assert.equal(ambiguousResult.code, 8);
+  assert.match(ambiguousResult.reason, /exists in multiple accounts/);
+
+  const missing = fixture({ authority: null, discoveredAuthority: null });
+  const missingResult = await reviewBudgetCommandCli([], missing.deps);
+  assert.equal(missingResult.code, 8);
+  assert.match(missingResult.reason, /no durable or uniquely discovered account authority/);
+
+  const mismatch = fixture({ authority: null, discoveredAuthority: ACCOUNTS.primary });
+  const mismatchResult = await reviewBudgetCommandCli([], mismatch.deps);
+  assert.equal(mismatchResult.code, 8);
+  assert.match(mismatchResult.reason, /conflicts with discovered authority primary/);
 });
 
 test('selected reviewer without an account usage snapshot is unknown, never the primary compatibility view', async () => {

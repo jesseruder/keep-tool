@@ -5686,6 +5686,7 @@ async function resolveReviewBudgetTarget(options = {}, deps = {}) {
     return { model, error: `reviewer account ${accountIds[0]} is not an available Claude account` };
   }
   let authority;
+  let authoritySource = 'durable';
   try {
     authority = accountStore.forSession(reviewer.id, 'claude', {
       root: deps.root || ROOT,
@@ -5695,8 +5696,23 @@ async function resolveReviewBudgetTarget(options = {}, deps = {}) {
   } catch (error) {
     return { model, error: `reviewer account authority is unavailable: ${error.message}` };
   }
-  if (authority && authority.id !== account.id) {
-    return { model, error: `reviewer account conflicts with durable authority ${authority.id}` };
+  if (!authority) {
+    authoritySource = 'discovered';
+    try {
+      authority = accountStore.forSession(reviewer.id, 'claude', {
+        root: deps.root || ROOT,
+        env: deps.env || process.env,
+        allowDiscovery: true,
+      });
+    } catch (error) {
+      return { model, error: `reviewer account discovery is unavailable: ${error.message}` };
+    }
+    if (!authority) {
+      return { model, error: `reviewer ${reviewer.id} has no durable or uniquely discovered account authority` };
+    }
+  }
+  if (authority.id !== account.id) {
+    return { model, error: `reviewer account conflicts with ${authoritySource} authority ${authority.id}` };
   }
   return { model, accountId: account.id };
 }

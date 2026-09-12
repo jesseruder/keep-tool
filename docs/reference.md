@@ -682,11 +682,11 @@ Switching models means restarting the session: the model is fixed at launch, and
 governor reads it from the `.keep/reviewer/<id>` marker written at startup.
 
 `keep review-budget` checks the account and model of the active fleet reviewer. It
-validates that account against the session's durable authority and never inherits an
-unrelated caller's account. Use `--account <claude-id>` for a deterministic account
-check; `--model` overrides the active reviewer model. Exit codes are 0 for available,
-6 for the weekly ceiling, 7 for the short window, and 8 when identity or usage is
-unavailable.
+validates that account against the session's durable authority, or uniquely discovered
+legacy transcript ownership, and never inherits an unrelated caller's account. Use
+`--account <claude-id>` for a deterministic account check; `--model` overrides the
+active reviewer model. Exit codes are 0 for available, 6 for the weekly ceiling, 7 for
+the short window, and 8 when identity or usage is unavailable.
 
 The console's Fleet reviewer header has a **Restart** button beside `Tick now` and
 `Stats`. It uses the same `/api/restart-session` machinery as a pinned pane in Watch,
