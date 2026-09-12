@@ -3932,7 +3932,7 @@ commands.accounts = (argv, deps = {}) => {
     const target = accountStore.get(id), source = accountStore.get(o['share-from']);
     if (!target || !source) die('unknown source or target account');
     const result = require('./account-setup').shareSetup(source, target);
-    console.log(`shared Claude setup from ${source.id} to ${target.id} (${result.sharedEntries.length} shared entries)`);
+    console.log(`shared ${source.agent === 'codex' ? 'Codex capabilities' : 'Claude setup'} from ${source.id} to ${target.id} (${result.sharedEntries.length} shared entries)`);
     return;
   }
   die('usage: keep accounts list|add|default|setup');

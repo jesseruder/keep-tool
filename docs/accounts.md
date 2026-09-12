@@ -4,6 +4,8 @@ Keep can launch any number of Claude or Codex profiles in one workspace. Each co
 
 Account configuration contains only an id, label, provider, and config directory. Keep never stores or copies login credentials. With no account configuration, `claude/default` and `codex/default` preserve the existing native CLI behavior.
 
+When you add a Codex profile, Keep immediately adopts the current default Codex profile's shared capabilities. Each later launch refreshes those managed values before Codex starts. See [shared account setup](account-setup.md) for the exact boundary and override behavior.
+
 ## Add a Claude subscription
 
 Choose a new, empty config directory. Setup must run before login because it creates the profile directory and shares compatible settings, skills, rules, commands, and repository memory without linking account state or credentials.
@@ -70,6 +72,18 @@ Before stopping the source, Keep verifies the target login, compatible shared se
 Source artifacts stay as a backup because tool-result records can contain absolute paths. Durable authority prevents their stale duplicate from being discovered or resumed. If a failure occurs after source exit, ordinary open/restart/restore stays blocked. Retry the same command or the same dashboard action to recover the journaled transaction. Keep does not automatically switch accounts, switch back later, or retry a different target.
 
 Codex profiles can be configured, selected for new sessions, attributed, and kept sticky across restarts. Cross-profile Codex conversation handoff is reported as unsupported until its storage and resume behavior has equivalent end-to-end proof.
+
+Add and authenticate a Codex profile separately:
+
+```sh
+keep accounts add codex-secondary \
+  --agent codex \
+  --label "Codex secondary" \
+  --config-dir "$HOME/.codex-secondary"
+CODEX_HOME="$HOME/.codex-secondary" codex login
+```
+
+The add command shares capabilities before the first launch. It does not copy `auth.json`, provider selection, models, projects, history, or runtime state. To change the capability source explicitly, use `keep accounts setup codex-secondary --share-from codex/default` before customizing managed values.
 
 ## Start a portable continuation
 

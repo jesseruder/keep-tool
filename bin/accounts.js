@@ -296,6 +296,12 @@ function add(entry, env = process.env) {
   config.defaultAccounts = { ...(config.defaultAccounts || {}) };
   if (!config.defaultAccounts[entry.agent]) config.defaultAccounts[entry.agent] = builtIn(entry.agent).id;
   validated(env, config);
+  if (entry.agent === 'codex') {
+    const source = defaultFor('codex', env);
+    require('./codex-setup').shareSetup(source, {
+      id: entry.id, label: entry.label, agent: entry.agent, configDir: expand(entry.configDir), builtIn: false, managed: true,
+    });
+  }
   writeConfig(config, env);
   return get(entry.id, env);
 }

@@ -243,6 +243,9 @@ function populate(stage, sourceAccount, sourceDir, sourceStateFile) {
 }
 
 function shareSetup(sourceAccount, targetAccount, options = {}) {
+  if (sourceAccount?.agent === 'codex' || targetAccount?.agent === 'codex') {
+    return require('./codex-setup').shareSetup(sourceAccount, targetAccount, options);
+  }
   const { source, target } = assertAccounts(sourceAccount, targetAccount);
   validateSettings(source);
   if (fs.existsSync(target)) {

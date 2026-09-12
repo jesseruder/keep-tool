@@ -64,10 +64,29 @@ function profileEnvironment(agent, profile, source = process.env) {
   return env;
 }
 
+function prepareProfile(agent, profile, options = {}) {
+  if (agent !== 'codex' || !profile || profile.builtIn) return { ok: true, managed: false };
+  const setup = options.setup || require('./codex-setup');
+  if (setup.readSetup(profile)) return setup.refresh(profile);
+  const accountStore = options.accounts || require('./accounts');
+  let source = accountStore.defaultFor('codex', options.env || process.env);
+  if (source.id === profile.id) {
+    source = accountStore.list(options.env || process.env).find((entry) => entry.agent === 'codex' && entry.builtIn && entry.id !== profile.id);
+  }
+  if (!source) throw new Error(`no source Codex profile is available for ${profile.id}`);
+  return setup.shareSetup(source, profile);
+}
+
 function launch(agent, executable, args, profile = null) {
   if (!['codex', 'claude'].includes(agent) || !executable) {
     process.stderr.write('usage: keep-{codex,claude}-cli <agent executable> [args...]\n');
     process.exitCode = 64;
+    return;
+  }
+  try { prepareProfile(agent, profile); }
+  catch (error) {
+    process.stderr.write(`keep launcher: ${error.message}\n`);
+    process.exitCode = 78;
     return;
   }
   const token = crypto.randomUUID();
@@ -117,4 +136,4 @@ if (require.main === module) {
     } else launch(agent, process.argv[5], process.argv.slice(6), profile);
   } else launch(process.argv[2], process.argv[3], process.argv.slice(4));
 }
-module.exports = { command, profileCommand, profileEnvironment };
+module.exports = { command, profileCommand, profileEnvironment, prepareProfile };

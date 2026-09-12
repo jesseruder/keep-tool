@@ -1,4 +1,6 @@
-# Shared Claude account setup
+# Shared account setup
+
+## Claude
 
 `keep accounts setup <target> --share-from <source>` prepares a separate Claude profile for the same work environment. The target keeps its own Claude login and account state while sharing the source profile's instructions and workspace memory.
 
@@ -17,3 +19,13 @@ The generated MCP file is managed conservatively. If its contents differ from th
 Compatibility is direction-independent. A managed profile traces MCP and memory back to its original native profile, so a third profile can be prepared from a second one without losing integrations. Transfers back to the native profile use its native MCP configuration and therefore return no supplemental `mcpConfig`; transfers into a managed profile return its validated `.keep-mcp.json`. Profiles with different effective settings, MCP definitions, or repository memory are refused.
 
 Initial setup is staged in a private sibling directory and renamed into place only after all links and generated files succeed. A failed setup leaves an absent target absent, or restores a pre-existing empty target, so the same command can be retried safely.
+
+## Codex
+
+Adding a nondefault Codex account automatically shares capabilities from the current default Codex account. `keep accounts setup <target> --share-from <source>` performs the same operation explicitly, and the profile launcher refreshes a managed target before every launch.
+
+Keep merges only Codex capability tables: `features`, `plugins`, `mcp_servers`, `apps`, `marketplaces`, `hooks`, and `experimental_hooks`. It links shared `AGENTS.md`, `hooks.json`, local skills, and agent definitions. Exact immutable plugin cache versions are made available without copying plugin runtime state: static code and assets link to the source, JSON metadata is private and rebased for the target home, and plugin `SKILL.md` files are materialized because Codex discovery requires regular files. Local marketplace paths are rebased into the target home; external runtime marketplaces retain their shared external path.
+
+The target keeps its own `auth.json`, model and provider routing, service tier, projects, shell policy, desktop preferences, history, and plugin app-server or install-staging state. MCP server environment and header fields are capability definitions and remain in the private mode-0600 target config. Keep never prints their values in conflict errors or stores them in its manifest; the manifest records hashes.
+
+Sync is a field-level three-way merge. A value Keep previously managed follows source updates. Changing or deleting a managed value in the target makes it an account-local override. Later refreshes preserve that override. If source and target change the same recorded field between refreshes to different values, launch stops and reports only the dotted config path. Resolve the field intentionally, then rerun setup or launch. Existing custom fields at first adoption remain overrides, while equal values become managed.
