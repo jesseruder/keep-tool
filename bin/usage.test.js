@@ -10,6 +10,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { EventEmitter } = require('node:events');
 const test = require('node:test');
 const health = require('./health.js');
 const {
@@ -18,6 +19,7 @@ const {
   createUsageManager,
   claudeCredentialService,
   claudeToken,
+  fetchClaudeUsage,
 } = require('./usage.js');
 
 function settleRefresh() {
@@ -168,6 +170,26 @@ test('Linux credentials are read only from the selected config directory', async
   assert.deepEqual(reads, [[path.join(account.configDir, '.credentials.json'), 'utf8']]);
 });
 
+test('Claude HTTP 429 carries Retry-After into cooldown handling', async () => {
+  const account = accountFixture().list()[0];
+  const fakeHttps = { get: (_url, _options, callback) => {
+    const request = new EventEmitter();
+    request.setTimeout = () => {};
+    request.destroy = (error) => request.emit('error', error);
+    const response = new EventEmitter();
+    response.statusCode = 429;
+    response.headers = { 'retry-after': '1200' };
+    response.setEncoding = () => {};
+    setImmediate(() => { callback(response); setImmediate(() => response.emit('end')); });
+    return request;
+  } };
+  await assert.rejects(fetchClaudeUsage(account, {
+    platform: 'linux',
+    fs: { readFileSync: () => JSON.stringify({ claudeAiOauth: { accessToken: 'fixture-token' } }) },
+    https: fakeHttps,
+  }), (error) => error.code === 429 && error.retryAfter === '1200');
+});
+
 test('account refresh failures have separate cooldowns, snapshots, and default compatibility view', async () => {
   const fixture = accountFixture();
   const manager = createUsageManager({ accounts: fixture });
@@ -187,9 +209,9 @@ test('account refresh failures have separate cooldowns, snapshots, and default c
   assert.deepEqual(view.claude, { limits: [{ label: 'week', percent: 11 }], fetchedAt: firstAt });
 
   calls.length = 0;
-  manager.requestRefresh(firstAt + 61e3, async (account) => {
+  manager.requestRefresh(firstAt + 5 * 60e3 + 1, async (account) => {
     calls.push(account.id);
-    return { limits: [{ label: 'week', percent: 50 }], fetchedAt: firstAt + 61e3 };
+    return { limits: [{ label: 'week', percent: 50 }], fetchedAt: firstAt + 5 * 60e3 + 1 };
   });
   await settleRefresh();
   assert.deepEqual(calls.sort(), ['claude-default'.replace('-', '/'), 'claude-spare'].sort(),
@@ -219,7 +241,7 @@ test('cached account errors do not inflate usage health between real retries', a
   const firstAt = 10 ** 12;
   let secondaryFails = true;
   const refresh = async (account) => {
-    if (account.id === 'claude-secondary' && secondaryFails) throw Object.assign(new Error('limited'), { code: 429 });
+    if (account.id === 'claude-secondary' && secondaryFails) throw Object.assign(new Error('limited'), { code: 429, retryAfter: '1800' });
     return { limits: [{ label: 'week', percent: account.id === 'claude/default' ? 20 : 40 }], fetchedAt: firstAt };
   };
 
@@ -229,11 +251,11 @@ test('cached account errors do not inflate usage health between real retries', a
     name: 'usage', options: { ok: false, error: 'Secondary: HTTP 429' }, streak: 1,
   });
   assert.equal(manager._view().accounts['claude-secondary'].error, 'HTTP 429', 'rate limit remains visible in the cached account view');
-  assert.equal(manager._states.get('claude-secondary').backoffMs, 4 * 60e3);
+  assert.equal(manager._states.get('claude-secondary').backoffMs, 10 * 60e3);
 
-  manager.requestRefresh(firstAt + 61e3, refresh);
+  manager.requestRefresh(firstAt + 5 * 60e3 + 1, refresh);
   await settleRefresh();
-  manager.requestRefresh(firstAt + 122e3, refresh);
+  manager.requestRefresh(firstAt + 10 * 60e3 + 2, refresh);
   await settleRefresh();
   assert.equal(records.filter((entry) => entry.options.ok === false).length, 1, 'healthy account refreshes do not recount a cached failure');
   assert.deepEqual(records.slice(-2).map((entry) => ({ options: entry.options, streak: entry.streak })), [
@@ -241,15 +263,15 @@ test('cached account errors do not inflate usage health between real retries', a
     { options: { ok: true, skipped: true, detail: 'waiting for failed account retry' }, streak: 1 },
   ]);
 
-  manager.requestRefresh(firstAt + 5 * 60e3 + 1, refresh);
+  manager.requestRefresh(firstAt + 30 * 60e3 + 1, refresh);
   await settleRefresh();
   assert.deepEqual(records.at(-1), {
     name: 'usage', options: { ok: false, error: 'Secondary: HTTP 429' }, streak: 2,
   });
-  assert.equal(manager._states.get('claude-secondary').backoffMs, 8 * 60e3, 'real retry failures retain exponential backoff');
+  assert.equal(manager._states.get('claude-secondary').backoffMs, 20 * 60e3, 'real retry failures retain exponential backoff');
 
   secondaryFails = false;
-  manager.requestRefresh(firstAt + 14 * 60e3 + 2, refresh);
+  manager.requestRefresh(firstAt + 60 * 60e3 + 2, refresh);
   await settleRefresh();
   assert.deepEqual(records.at(-1), { name: 'usage', options: { ok: true }, streak: 0 });
   assert.equal(manager._view().accounts['claude-secondary'].error, undefined);
@@ -319,8 +341,8 @@ test('a delayed batch cannot reapply a failure after that account recovers', asy
   assert.equal(manager._view().accounts['claude-fast'].error, 'HTTP 429');
   assert.equal(records.length, 0, 'the original batch remains pending on the slow account');
 
-  manager.requestRefresh(firstAt + 5 * 60e3 + 1, async (account) => ({
-    limits: [{ label: 'week', percent: account.id === 'claude-fast' ? 25 : 50 }], fetchedAt: firstAt + 5 * 60e3 + 1,
+  manager.requestRefresh(firstAt + 10 * 60e3 + 1, async (account) => ({
+    limits: [{ label: 'week', percent: account.id === 'claude-fast' ? 25 : 50 }], fetchedAt: firstAt + 10 * 60e3 + 1,
   }));
   await settleRefresh();
   assert.equal(manager._view().accounts['claude-fast'].error, undefined);
@@ -330,6 +352,128 @@ test('a delayed batch cannot reapply a failure after that account recovers', asy
   await settleRefresh();
   assert.equal(records.some((entry) => entry.options.ok === false), false);
   assert.deepEqual(records.at(-1), { name: 'usage', options: { ok: true } });
+});
+
+test('successful Claude cache preserves the five-minute cadence across restart', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-usage-success-cache-'));
+  const file = path.join(dir, 'usage-cache.json');
+  const fixture = accountFixture();
+  let now = 10 ** 12;
+  try {
+    const writer = createUsageManager({ accounts: fixture, now: () => now });
+    writer.setCacheFile(file);
+    writer.requestRefresh(now, async (account) => ({
+      limits: [{ label: 'week', percent: account.id.length }], fetchedAt: now,
+    }));
+    await settleRefresh();
+    const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(stored.version, 2);
+    assert.equal(stored.claude.limits[0].percent, 'claude/default'.length, 'flat default snapshot remains available to budget consumers');
+    assert.doesNotMatch(fs.readFileSync(file, 'utf8'), /accessToken|Authorization|Bearer/);
+
+    now += 4 * 60e3;
+    const reader = createUsageManager({ accounts: fixture, now: () => now });
+    reader.setCacheFile(file);
+    let calls = 0;
+    assert.equal(reader.requestRefresh(now, async () => { calls += 1; }), false);
+    assert.equal(calls, 0, 'a fresh successful snapshot is not fetched immediately after restart');
+    assert.equal(reader._view().accounts['claude/default'].limits[0].percent, 'claude/default'.length);
+
+    now += 60e3 + 1;
+    assert.equal(reader.requestRefresh(now, async () => { calls += 1; return { limits: [], fetchedAt: now }; }), true);
+    await settleRefresh();
+    assert.equal(calls, fixture.list().length);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('rate-limit cooldown and empty error snapshot survive restart', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-usage-failure-cache-'));
+  const file = path.join(dir, 'usage-cache.json');
+  const records = [{ id: 'claude-secondary', label: 'Secondary', agent: 'claude', configDir: '/profiles/secondary' }];
+  const fixture = { list: () => records, defaultFor: () => records[0] };
+  let now = 10 ** 12;
+  try {
+    const writer = createUsageManager({ accounts: fixture, now: () => now });
+    writer.setCacheFile(file);
+    writer.requestRefresh(now, async () => { throw Object.assign(new Error('limited'), { code: 429, retryAfter: '1200' }); });
+    await settleRefresh();
+    const stored = JSON.parse(fs.readFileSync(file, 'utf8')).accounts['claude-secondary'];
+    assert.equal(stored.snapshot.error, 'HTTP 429');
+    assert.deepEqual(stored.snapshot.limits, []);
+    assert.equal(stored.backoffMs, 10 * 60e3, 'Retry-After does not shorten exponential fallback');
+    assert.equal(stored.nextAttemptAt, now + 20 * 60e3, 'delta-seconds Retry-After extends the cooldown');
+    assert.deepEqual(Object.keys(stored.identity).sort(), ['agent', 'configDir', 'credentialService']);
+
+    now += 15 * 60e3;
+    const reader = createUsageManager({ accounts: fixture, now: () => now });
+    reader.setCacheFile(file);
+    let calls = 0;
+    assert.equal(reader._view().accounts['claude-secondary'].error, 'HTTP 429');
+    assert.equal(reader.requestRefresh(now, async () => { calls += 1; }), false);
+    assert.equal(calls, 0);
+
+    now += 5 * 60e3 + 1;
+    assert.equal(reader.requestRefresh(now, async () => {
+      calls += 1;
+      return { limits: [{ label: 'week', percent: 31 }], fetchedAt: now };
+    }), true);
+    await settleRefresh();
+    assert.equal(calls, 1);
+    assert.equal(reader._view().accounts['claude-secondary'].error, undefined);
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).accounts['claude-secondary'].backoffMs, 0);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('HTTP-date Retry-After is honored per account and bounded', async () => {
+  const records = [
+    { id: 'claude-date', label: 'Date', agent: 'claude', configDir: '/profiles/date' },
+    { id: 'claude-short', label: 'Short', agent: 'claude', configDir: '/profiles/short' },
+  ];
+  const fixture = { list: () => records, defaultFor: () => records[0] };
+  const now = Date.parse('2030-01-01T00:00:00Z');
+  const manager = createUsageManager({ accounts: fixture, now: () => now });
+  manager.requestRefresh(now, async (account) => {
+    const retryAfter = account.id === 'claude-date'
+      ? new Date(now + 2 * 60 * 60e3).toUTCString()
+      : '60';
+    throw Object.assign(new Error('limited'), { code: 429, retryAfter });
+  });
+  await settleRefresh();
+  assert.equal(manager._states.get('claude-date').nextAttemptAt, now + 2 * 60 * 60e3, 'valid server cooldowns may exceed the exponential cap');
+  assert.equal(manager._states.get('claude-short').nextAttemptAt, now + 10 * 60e3, 'short server advice cannot reduce exponential cooldown');
+});
+
+test('legacy and corrupt caches migrate safely while identity prevents account crossover', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-usage-legacy-cache-'));
+  const file = path.join(dir, 'usage-cache.json');
+  const now = 10 ** 12;
+  const original = [{ id: 'claude-shared', label: 'Original', agent: 'claude', configDir: '/profiles/original' }];
+  const originalApi = { list: () => original, defaultFor: () => original[0] };
+  try {
+    fs.writeFileSync(file, JSON.stringify({ accounts: { 'claude-shared': {
+      limits: [{ label: 'week', percent: 41 }], fetchedAt: now,
+    } } }));
+    let manager = createUsageManager({ accounts: originalApi, now: () => now + 4 * 60e3 });
+    manager.setCacheFile(file);
+    assert.equal(manager._view().accounts['claude-shared'].limits[0].percent, 41, 'legacy snapshot remains readable');
+    assert.equal(manager.requestRefresh(now + 4 * 60e3, async () => { throw new Error('fresh cache'); }), false);
+
+    manager.requestRefresh(now + 5 * 60e3 + 1, async () => ({ limits: [{ label: 'week', percent: 42 }], fetchedAt: now + 5 * 60e3 + 1 }));
+    await settleRefresh();
+    const replacement = [{ id: 'claude-shared', label: 'Replacement', agent: 'claude', configDir: '/profiles/replacement' }];
+    const replacementApi = { list: () => replacement, defaultFor: () => replacement[0] };
+    manager = createUsageManager({ accounts: replacementApi, now: () => now + 6 * 60e3 });
+    manager.setCacheFile(file);
+    assert.deepEqual(manager._view().accounts['claude-shared'].limits, [], 'v2 cache is bound to credential identity');
+    assert.equal(manager.requestRefresh(now + 6 * 60e3, async () => ({ limits: [], fetchedAt: now })), true);
+    await settleRefresh();
+
+    fs.writeFileSync(file, '{not json');
+    manager = createUsageManager({ accounts: originalApi, now: () => now });
+    manager.setCacheFile(file);
+    assert.equal(manager.requestRefresh(now, async () => ({ limits: [], fetchedAt: now })), true, 'corrupt cache cannot create a permanent cooldown');
+    await settleRefresh();
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('disk cache keeps Claude snapshots keyed by account', async () => {
@@ -348,8 +492,6 @@ test('disk cache keeps Claude snapshots keyed by account', async () => {
 
     const reader = createUsageManager({ accounts: fixture });
     reader.setCacheFile(file);
-    for (const account of fixture.list()) {
-      assert.equal(reader._view().accounts[account.id].limits[0].percent, account.id.length);
-    }
+    for (const account of fixture.list()) assert.equal(reader._view().accounts[account.id].limits[0].percent, account.id.length);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

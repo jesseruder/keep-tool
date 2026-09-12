@@ -11,8 +11,13 @@ const { execFile } = require('child_process');
 const health = require('./health.js');
 const accounts = require('./accounts.js');
 
-const CLAUDE_REFRESH_MS = 60e3;
+const CLAUDE_REFRESH_MS = 5 * 60e3;
 const CODEX_REFRESH_MS = 5 * 60e3;
+const INITIAL_BACKOFF_MS = 4 * 60e3;
+const MAX_BACKOFF_MS = 29 * 60e3;
+const INITIAL_RATE_LIMIT_MS = 10 * 60e3;
+const MAX_RATE_LIMIT_MS = 60 * 60e3;
+const MAX_RETRY_AFTER_MS = 24 * 60 * 60e3;
 const TAIL_BYTES = 256 * 1024;
 
 function shortError(source, error) {
@@ -29,6 +34,15 @@ function codedError(code) {
   const error = new Error(String(code));
   error.code = code;
   return error;
+}
+
+function retryAfterMs(value, now = Date.now()) {
+  const header = Array.isArray(value) ? value[0] : value;
+  if (header == null || String(header).trim() === '') return 0;
+  const seconds = Number(header);
+  let delay = Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : Date.parse(String(header)) - now;
+  if (!Number.isFinite(delay) || delay <= 0) return 0;
+  return Math.min(delay, MAX_RETRY_AFTER_MS);
 }
 
 function emptySnapshot(agent) {
@@ -102,7 +116,11 @@ async function fetchClaudeUsage(account, deps = {}) {
         if (data.length > 1024 * 1024) req.destroy(codedError('response'));
       });
       res.on('end', () => {
-        if (res.statusCode !== 200) return reject(codedError(res.statusCode || 'response'));
+        if (res.statusCode !== 200) {
+          const error = codedError(res.statusCode || 'response');
+          if (res.statusCode === 429) error.retryAfter = res.headers && res.headers['retry-after'];
+          return reject(error);
+        }
         resolve(data);
       });
     });
@@ -222,12 +240,34 @@ function scanCodexAccount(account, deps = {}) {
 function createUsageManager(deps = {}) {
   const accountApi = deps.accounts || accounts;
   const healthApi = deps.health || health;
+  const clock = deps.now || Date.now;
   const states = new Map();
   let onChange = () => {};
   let cacheFile = null;
   let configurationRemovedFailure = false;
 
   function configured() { return accountApi.list(deps.env || process.env); }
+
+  function cacheIdentity(account) {
+    const configDir = path.resolve(String(account.configDir || path.join(os.homedir(), '.claude'))).normalize('NFC');
+    return {
+      agent: account.agent,
+      configDir,
+      credentialService: account.agent === 'claude' ? claudeCredentialService(account, deps.env || process.env) : null,
+    };
+  }
+
+  function sameIdentity(left, right) {
+    return left && right && left.agent === right.agent && left.configDir === right.configDir
+      && left.credentialService === right.credentialService;
+  }
+
+  function initialState(account) {
+    return {
+      account, snapshot: emptySnapshot(account.agent), lastStartedAt: 0, nextAttemptAt: 0,
+      backoffMs: 0, failureKind: null, generation: 0, inFlight: null,
+    };
+  }
 
   function sync() {
     const current = configured();
@@ -239,9 +279,9 @@ function createUsageManager(deps = {}) {
     }
     for (const account of current) {
       const prior = states.get(account.id);
-      if (!prior || prior.account.agent !== account.agent || prior.account.configDir !== account.configDir) {
+      if (!prior || !sameIdentity(cacheIdentity(prior.account), cacheIdentity(account))) {
         if (prior && prior.snapshot.error) configurationRemovedFailure = true;
-        states.set(account.id, { account, snapshot: emptySnapshot(account.agent), lastStartedAt: 0, backoffMs: 0, generation: 0, inFlight: null });
+        states.set(account.id, initialState(account));
       } else prior.account = account;
     }
     return current;
@@ -278,18 +318,52 @@ function createUsageManager(deps = {}) {
     for (const [id, state] of states) {
       if (state.account.agent !== 'claude') continue;
       let value = accountCache[id];
-      if (!value && defaultClaude && id === defaultClaude.id) value = cached.claude;
-      if (value && Array.isArray(value.limits) && value.limits.length && !state.snapshot.fetchedAt) {
-        state.snapshot = { limits: value.limits, fetchedAt: value.fetchedAt || null };
-      }
+      if (!value && !cached.version && defaultClaude && id === defaultClaude.id) value = cached.claude;
+      const legacy = value && !value.snapshot;
+      const snapshot = legacy ? value : value && value.snapshot;
+      if (!snapshot || !Array.isArray(snapshot.limits)) continue;
+      if (!legacy && !sameIdentity(value.identity, cacheIdentity(state.account))) continue;
+      state.snapshot = {
+        limits: snapshot.limits,
+        fetchedAt: Number.isFinite(Number(snapshot.fetchedAt)) ? Number(snapshot.fetchedAt) : null,
+        ...(typeof snapshot.error === 'string' && snapshot.error ? { error: snapshot.error } : {}),
+      };
+      const now = clock();
+      const storedNext = Number(value && value.nextAttemptAt);
+      const legacyNext = state.snapshot.fetchedAt ? state.snapshot.fetchedAt + CLAUDE_REFRESH_MS : 0;
+      const nextAttemptAt = Number.isFinite(storedNext) && storedNext > 0 ? storedNext : legacyNext;
+      state.nextAttemptAt = Math.max(0, Math.min(nextAttemptAt, now + MAX_RETRY_AFTER_MS));
+      state.lastStartedAt = Number.isFinite(Number(value && value.lastStartedAt)) ? Number(value.lastStartedAt) : 0;
+      state.backoffMs = Math.max(0, Math.min(Number(value && value.backoffMs) || 0, MAX_RATE_LIMIT_MS));
+      state.failureKind = ['rate-limit', 'other'].includes(value && value.failureKind) ? value.failureKind : null;
     }
   }
 
-  function saveCache() {
-    if (!cacheFile) return;
-    const stored = { accounts: {} };
-    for (const [id, state] of states) if (state.account.agent === 'claude') stored.accounts[id] = state.snapshot;
-    try { fs.writeFileSync(cacheFile, JSON.stringify(stored)); } catch {}
+  function saveCache(state) {
+    if (!cacheFile || state.account.agent !== 'claude') return;
+    let stored = {};
+    try { stored = JSON.parse(fs.readFileSync(cacheFile, 'utf8')); } catch {}
+    if (!stored || typeof stored !== 'object' || Array.isArray(stored)) stored = {};
+    if (!stored.accounts || typeof stored.accounts !== 'object' || Array.isArray(stored.accounts)) stored.accounts = {};
+    stored.version = 2;
+    stored.accounts[state.account.id] = {
+      identity: cacheIdentity(state.account),
+      snapshot: state.snapshot,
+      lastStartedAt: state.lastStartedAt,
+      nextAttemptAt: state.nextAttemptAt,
+      backoffMs: state.backoffMs,
+      failureKind: state.failureKind,
+    };
+    let defaultClaude = null;
+    try { defaultClaude = accountApi.defaultFor('claude', deps.env || process.env); } catch {}
+    if (defaultClaude && defaultClaude.id === state.account.id) stored.claude = state.snapshot;
+    const temp = `${cacheFile}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
+    try {
+      fs.writeFileSync(temp, JSON.stringify(stored));
+      fs.renameSync(temp, cacheFile);
+    } catch {
+      try { fs.unlinkSync(temp); } catch {}
+    }
   }
 
   async function refreshAccount(stateAccount) {
@@ -298,13 +372,13 @@ function createUsageManager(deps = {}) {
       : Promise.resolve().then(() => scanCodexAccount(stateAccount, deps));
   }
 
-  function requestRefresh(now = Date.now(), performRefresh = refreshAccount) {
+  function requestRefresh(now = clock(), performRefresh = refreshAccount) {
+    now = Number.isFinite(Number(now)) ? Number(now) : clock();
     const current = sync();
     const started = [];
     for (const account of current) {
       const state = states.get(account.id);
-      const interval = account.agent === 'claude' ? CLAUDE_REFRESH_MS + state.backoffMs : CODEX_REFRESH_MS;
-      if (state.inFlight || now - state.lastStartedAt < interval) continue;
+      if (state.inFlight || now < state.nextAttemptAt) continue;
       state.lastStartedAt = now;
       const generation = ++state.generation;
       state.inFlight = new Promise((resolve) => setImmediate(resolve))
@@ -312,12 +386,30 @@ function createUsageManager(deps = {}) {
         .then((value) => {
           if (value) state.snapshot = value;
           delete state.snapshot.error;
-          if (account.agent === 'claude') { state.backoffMs = 0; saveCache(); }
+          state.nextAttemptAt = now + (account.agent === 'claude' ? CLAUDE_REFRESH_MS : CODEX_REFRESH_MS);
+          if (account.agent === 'claude') {
+            state.backoffMs = 0;
+            state.failureKind = null;
+            saveCache(state);
+          }
           return { account, state, generation, ok: true };
         }, (error) => {
           const message = shortError(account.agent === 'claude' ? 'Claude' : 'Codex', error);
           state.snapshot = { ...state.snapshot, error: message };
-          if (account.agent === 'claude') state.backoffMs = Math.min(state.backoffMs ? state.backoffMs * 2 : 4 * 60e3, 29 * 60e3);
+          if (account.agent === 'claude') {
+            const rateLimited = error && error.code === 429;
+            const sameKind = state.failureKind === (rateLimited ? 'rate-limit' : 'other');
+            if (rateLimited) {
+              state.backoffMs = Math.min(sameKind && state.backoffMs ? state.backoffMs * 2 : INITIAL_RATE_LIMIT_MS, MAX_RATE_LIMIT_MS);
+              state.nextAttemptAt = now + Math.max(state.backoffMs, retryAfterMs(error.retryAfter, now));
+              state.failureKind = 'rate-limit';
+            } else {
+              state.backoffMs = Math.min(sameKind && state.backoffMs ? state.backoffMs * 2 : INITIAL_BACKOFF_MS, MAX_BACKOFF_MS);
+              state.nextAttemptAt = now + CLAUDE_REFRESH_MS + state.backoffMs;
+              state.failureKind = 'other';
+            }
+            saveCache(state);
+          } else state.nextAttemptAt = now + CODEX_REFRESH_MS;
           return { account, state, generation, ok: false, error: message };
         })
         .finally(() => { state.inFlight = null; try { onChange(); } catch {} });
