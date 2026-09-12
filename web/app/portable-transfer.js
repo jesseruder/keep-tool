@@ -26,15 +26,28 @@ function ensureDialog() {
 function accountOptions(state, esc) {
   return state.draft.accounts.map((a) => `<option value="${esc(a.id)}" ${a.id === state.accountId ? 'selected' : ''}>${esc(a.label)} · ${esc(a.agent)}</option>`).join('');
 }
+function applySavedInputs(state, saved, fallbackTransfer) {
+  const inputs = saved?.inputs;
+  state.transfer = saved?.transfer || state.transfer;
+  state.preview = saved?.preview || state.preview;
+  state.accountId = inputs?.accountId ?? fallbackTransfer?.targetAccountId ?? state.accountId;
+  state.model = inputs && Object.hasOwn(inputs, 'model') ? inputs.model : fallbackTransfer?.model || '';
+  state.cwd = inputs?.cwd ?? fallbackTransfer?.cwd ?? state.cwd;
+  if (inputs && Object.hasOwn(inputs, 'context')) state.context = inputs.context;
+}
 
 function renderDialog(ctx, state) {
   const modal = ensureDialog();
   const transfer = state.transfer;
   const account = state.draft.accounts.find((a) => a.id === state.accountId);
   const ambiguous = ['ambiguous', 'launching'].includes(transfer?.status);
-  const resolutionCandidates = ambiguous ? (ctx.data.sessions || []).filter((session) => session.id !== transfer.sourceSessionId
-    && session.accountId === transfer.targetAccountId && session.taskId === transfer.cardId
-    && (ctx.data.panes || []).some((pane) => pane.meta?.sessionId === session.id && pane.meta?.portableTransferId === transfer.id)) : [];
+  const resolutionCandidates = ambiguous ? (ctx.data.sessions || []).filter((session) => {
+    const pane = (ctx.data.panes || []).find((candidate) => candidate.meta?.sessionId === session.id
+      && candidate.meta?.portableTransferId === transfer.id);
+    return session.id !== transfer.sourceSessionId && session.accountId === transfer.targetAccountId
+      && pane?.meta?.accountId === transfer.targetAccountId
+      && (session.taskId === transfer.cardId || !session.taskId && pane.meta?.card === transfer.cardId);
+  }) : [];
   modal.innerHTML = `<form method="dialog" class="portable-transfer-card">
     <header><div><p class="eyebrow">Portable continuation</p><h2 id="portable-transfer-title">Transfer ${ctx.esc(state.draft.cardTitle || state.draft.cardId)}</h2><p>Start a fresh conversation from a reviewed, saved context package. The source session stays intact.</p></div><button class="btn" value="cancel" aria-label="Close transfer">✕</button></header>
     <div class="portable-transfer-fields">
@@ -83,7 +96,7 @@ function renderDialog(ctx, state) {
     button.disabled = true; modal.querySelectorAll('input, select, textarea').forEach((field) => { field.disabled = true; }); state.error = '';
     try {
       const result = await api.preparePortableTransfer(request);
-      state.transfer = result.transfer; state.preview = result.preview; renderDialog(ctx, state);
+      applySavedInputs(state, result, result.transfer); state.savedOnly = false; renderDialog(ctx, state);
     } catch (error) { state.error = error.message; renderDialog(ctx, state); }
   });
   modal.querySelector('[data-launch-transfer]')?.addEventListener('click', async (event) => {
@@ -97,7 +110,7 @@ function renderDialog(ctx, state) {
         ctx.openReviewSession(state.transfer.destinationSessionId);
       } else renderDialog(ctx, state);
     } catch (error) {
-      try { const current = await api.getPortableTransferPreview(transferId); state.transfer = current.transfer; state.preview = current.preview; } catch {}
+      try { applySavedInputs(state, await api.getPortableTransferPreview(transferId), state.transfer); } catch {}
       state.error = error.message; renderDialog(ctx, state);
     }
   });
@@ -128,15 +141,18 @@ async function openTransfer(ctx, sessionId, transfer) {
         accounts: (ctx.data.accounts || []).filter((account) => account.id !== transfer.sourceAccountId),
         accountId: transfer.targetAccountId, model: transfer.model || '', context: 'Saved in the immutable package below.',
         pausePolicy: 'The successor reads the package, card, and worktree, acknowledges readiness, then waits for Jesse or the user. Automated reminders do not resume it.' };
-      state = { draft, accountId: transfer?.targetAccountId || draft.accountId, model: transfer?.model || draft.model || '', cwd: transfer?.cwd || draft.cwd || '',
-        context: draft.context || '', modelEdited: false, savedOnly: !result?.draft,
+      const inputs = saved?.inputs;
+      state = { draft, accountId: inputs?.accountId ?? transfer?.targetAccountId ?? draft.accountId,
+        model: inputs && Object.hasOwn(inputs, 'model') ? inputs.model : transfer?.model || draft.model || '',
+        cwd: inputs?.cwd ?? transfer?.cwd ?? draft.cwd ?? '',
+        context: inputs && Object.hasOwn(inputs, 'context') ? inputs.context : draft.context || '',
+        modelEdited: false, savedOnly: !result?.draft,
         transfer: saved?.transfer || null, preview: saved?.preview || '', error: '' };
       drafts.set(sessionId, state);
     }
     if (transfer?.policyVersion === 2 && state.transfer?.id !== transfer.id) {
       const result = await api.getPortableTransferPreview(transfer.id);
-      state.transfer = result.transfer; state.preview = result.preview;
-      state.accountId = transfer.targetAccountId; state.model = transfer.model || '';
+      applySavedInputs(state, result, transfer);
     }
     renderDialog(ctx, state);
     const modal = ensureDialog(); if (!modal.open) modal.showModal();

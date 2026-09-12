@@ -12,6 +12,7 @@ const CONTEXT_LIMIT = 512 * 1024;
 const PREVIEW_LIMIT = 768 * 1024;
 const TRANSCRIPT_TAIL = 1024 * 1024;
 const EXCERPT_LIMIT = 64 * 1024;
+const GIT_CAPTURE_LIMIT = 8 * 1024 * 1024;
 const DESKTOP_POLICY_VERSION = 2;
 const CLAUDE_DEFAULT_MODEL = 'claude-fable-5-1';
 
@@ -144,18 +145,47 @@ function defaultSource(sessionId, options = {}) {
 }
 
 function defaultGitSnapshot(cwd) {
-  const run = (args) => execFileSync('git', ['-C', cwd, ...args], {
-    encoding: 'utf8', timeout: 10000, maxBuffer: 256 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
-  }).trim();
-  const result = { cwd, available: false, top: '', commonDir: '', head: '', branch: '', status: '' };
+  const execute = (args, options = {}) => execFileSync('git', ['-C', options.cwd || cwd, ...args], {
+    encoding: Object.hasOwn(options, 'encoding') ? options.encoding : 'utf8',
+    timeout: 10000, maxBuffer: options.maxBuffer || 256 * 1024,
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  const run = (args) => execute(args).trim();
+  const result = { cwd, available: false, top: '', commonDir: '', head: '', branch: '', status: '', contentDigest: '' };
   try {
     result.top = path.resolve(run(['rev-parse', '--show-toplevel']));
     result.commonDir = path.resolve(run(['rev-parse', '--path-format=absolute', '--git-common-dir']));
     result.head = run(['rev-parse', 'HEAD']);
     result.branch = run(['rev-parse', '--abbrev-ref', 'HEAD']);
-    result.status = run(['status', '--short', '--untracked-files=normal']).slice(0, 64 * 1024);
+    result.status = execute(['status', '--short', '--untracked-files=all'], { cwd: result.top }).trim().slice(0, 64 * 1024);
+    const indexDiff = execute(['diff', '--cached', '--binary', '--no-ext-diff', 'HEAD', '--'], {
+      cwd: result.top, encoding: null, maxBuffer: GIT_CAPTURE_LIMIT + 1,
+    });
+    const worktreeDiff = execute(['diff', '--binary', '--no-ext-diff', '--'], {
+      cwd: result.top, encoding: null, maxBuffer: GIT_CAPTURE_LIMIT + 1,
+    });
+    const untracked = execute(['ls-files', '--others', '--exclude-standard', '-z'], {
+      cwd: result.top, encoding: null, maxBuffer: 1024 * 1024,
+    });
+    let captured = indexDiff.length + worktreeDiff.length + untracked.length;
+    if (captured > GIT_CAPTURE_LIMIT) throw new Error('git worktree snapshot exceeds the portable transfer bound');
+    const hash = crypto.createHash('sha256').update('index\0').update(indexDiff)
+      .update('\0worktree\0').update(worktreeDiff).update('\0untracked\0');
+    const names = untracked.toString('binary').split('\0');
+    for (const rawName of names) {
+      if (!rawName) continue;
+      const nameBytes = Buffer.from(rawName, 'binary');
+      const name = nameBytes.toString('utf8');
+      if (!Buffer.from(name).equals(nameBytes)) throw new Error('git path is not valid UTF-8');
+      const file = path.resolve(result.top, name);
+      if (!file.startsWith(`${result.top}${path.sep}`)) throw new Error('git path escaped the worktree');
+      const snapshot = stableFile(file, GIT_CAPTURE_LIMIT - captured);
+      captured += snapshot.stat.size;
+      hash.update(nameBytes).update('\0').update(String(snapshot.stat.size)).update('\0').update(snapshot.digest).update('\0');
+    }
+    result.contentDigest = hash.digest('hex');
     result.available = true;
-  } catch {}
+  } catch (error) { result.error = String(error?.message || error).slice(0, 300); }
   return result;
 }
 
@@ -257,7 +287,8 @@ function contextValue(request) {
 
 function snapshotDigest(transcript, git, facts = {}) {
   return digest(JSON.stringify({ transcript: transcript.digest, size: transcript.size,
-    git: git.available ? { top: git.top, commonDir: git.commonDir, head: git.head, branch: git.branch, status: git.status } : null,
+    git: git.available ? { top: git.top, commonDir: git.commonDir, head: git.head, branch: git.branch,
+      status: git.status, contentDigest: git.contentDigest || '' } : null,
     sourceAgent: facts.sourceAgent || '', sourceAccountId: facts.sourceAccountId || '', cardId: facts.cardId || '',
     cardTitle: facts.cardTitle || '', cardStatus: facts.cardStatus || '', nextStep: facts.nextStep || '',
   }));
@@ -354,6 +385,10 @@ async function launchState(state, stateFile, deps) {
     }), id: state.sourceSessionId };
     const transcript = transcriptSnapshot(source.file);
     const git = (deps.gitSnapshot || defaultGitSnapshot)(state.cwd);
+    if (!git.available || !git.contentDigest) {
+      throw problem(`portable transfer cannot verify the worktree snapshot${git.error ? `: ${git.error}` : ''}`,
+        'KEEP_PORTABLE_TRANSFER_GIT', 409);
+    }
     const task = (deps.taskForSession || (() => require('./keep.js').taskForSession(state.sourceSessionId)))(state.sourceSessionId);
     if (!task?.id || task.id !== state.cardId) throw problem('portable transfer preview is stale; the source card changed', 'KEEP_PORTABLE_TRANSFER_STALE', 409);
     const nextStep = deps.nextStep ? deps.nextStep(task) : require('./keep.js').nextStep(task);
@@ -395,7 +430,12 @@ function readPreview(transferId, deps = {}) {
   if (!transfer || state.requestKey !== transferId) throw problem('portable transfer was not found', 'KEEP_PORTABLE_TRANSFER_NOT_FOUND', 404);
   const preview = stableFile(state.artifactFile, PREVIEW_LIMIT);
   if (state.packageDigest && preview.digest !== state.packageDigest) throw problem('portable transfer package changed after preparation', 'KEEP_PORTABLE_TRANSFER_STALE', 409);
-  return { transfer, preview: preview.text };
+  const inputs = state.policyVersion === DESKTOP_POLICY_VERSION && state.desktopInputs
+    && state.desktopInputs.accountId === state.targetAccountId && state.desktopInputs.cwd === state.cwd
+    && typeof state.desktopInputs.model === 'string' && typeof state.desktopInputs.context === 'string'
+    && Buffer.byteLength(state.desktopInputs.context) <= CONTEXT_LIMIT
+    ? state.desktopInputs : null;
+  return { transfer, preview: preview.text, ...(inputs ? { inputs } : {}) };
 }
 
 async function resolvePrepared(transferId, destinationSessionId, deps = {}) {
@@ -443,7 +483,7 @@ async function launchPrepared(transferId, deps = {}) {
     const account = (deps.accounts || require('./accounts')).get(state.targetAccountId, deps.env || process.env);
     if (!account || account.agent !== state.targetAgent) throw problem('portable transfer destination account is unavailable',
       'KEEP_PORTABLE_TRANSFER_ACCOUNT', 409);
-    return launchState(state, stateFile, deps);
+    return await launchState(state, stateFile, deps);
   } finally { unlock(); unlockSource(); }
 }
 
@@ -483,7 +523,8 @@ async function run(request, deps = {}) {
   const desktop = request.contextText != null;
   if (desktop) {
     await inspectReady(sessionId, deps, { preparing: true });
-    if (request.model != null && (typeof request.model !== 'string' || !require('./keep.js').LAUNCH_MODEL_RE.test(request.model))) {
+    if (request.model != null && request.model !== ''
+        && (typeof request.model !== 'string' || !require('./keep.js').LAUNCH_MODEL_RE.test(request.model))) {
       throw problem('model must be a model id like claude-fable-5-1 or gpt-5.6-sol');
     }
     if (!modelCompatible(target.agent, request.model || '')) throw problem(`model ${request.model} is not compatible with ${target.agent}`);
@@ -501,6 +542,10 @@ async function run(request, deps = {}) {
   const transcript = transcriptSnapshot(source.file);
   const conversation = extractConversation(source.agent, transcript.text);
   const git = (deps.gitSnapshot || defaultGitSnapshot)(cwd);
+  if (desktop && (!git.available || !git.contentDigest)) {
+    throw problem(`portable transfer cannot capture the worktree snapshot${git.error ? `: ${git.error}` : ''}`,
+      'KEEP_PORTABLE_TRANSFER_GIT', 409);
+  }
   const taskFile = deps.taskFile ? deps.taskFile(task) : path.join(root, 'tasks', `${task.id}.md`);
   const nextStep = deps.nextStep ? deps.nextStep(task) : '';
   // The source transcript can append lifecycle rows merely because this command
@@ -544,12 +589,14 @@ async function run(request, deps = {}) {
       state = { version: 1, ...(desktop ? { policyVersion: DESKTOP_POLICY_VERSION } : {}), requestKey, status: 'prepared', sourceSessionId: sessionId, sourceAgent: source.agent,
         sourceAccountId: source.accountId || '', sourceTranscriptDigest: transcript.digest, targetAccountId: target.id,
         targetAgent: target.agent, ...(desktop && request.model ? { model: request.model } : {}), cardId: task.id, cwd,
+        ...(desktop ? { desktopInputs: { accountId: target.id, model: request.model || '', cwd,
+          context: redact(context.text).trim() } } : {}),
         ...(context.file ? { contextFile: context.file } : {}), contextDigest: context.digest, sourceSnapshotDigest,
         packageDigest: digest(content), artifactFile: path.resolve(artifactFile), preparedAt: Date.now() };
       writeJson(stateFile, state);
     }
     if (request.prepareOnly) return { ...state, stateFile };
-    return launchState(state, stateFile, deps);
+    return await launchState(state, stateFile, deps);
   } finally { unlock(); }
 }
 

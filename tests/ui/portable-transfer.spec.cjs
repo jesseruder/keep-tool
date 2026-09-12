@@ -101,15 +101,42 @@ test('editing reviewed settings invalidates launch and settled-source errors are
   await expect(modal.locator('[data-prepare-transfer]')).toBeVisible();
 });
 
+test('reloaded preview preserves custom context and a blank destination model when only cwd is edited', async ({ page }) => {
+  fixture.state.sessions.find(session => session.id === 'a').endedTurn = true;
+  fixture.publish();
+  await page.locator('#stage [data-new-portable-transfer="a"]').click();
+  let modal = page.locator('.portable-transfer-dialog');
+  await modal.locator('[data-transfer-account]').selectOption('codex-two');
+  await modal.locator('[data-transfer-context]').fill('My saved instruction survives a browser reload.');
+  await modal.locator('[data-prepare-transfer]').click();
+  await page.reload();
+  await expect(page.locator('#stage')).toHaveAttribute('data-item-key', 'a');
+  await page.locator('#stage [data-review-portable]').click();
+  modal = page.locator('.portable-transfer-dialog');
+  await expect(modal.locator('[data-transfer-account]')).toHaveValue('codex-two');
+  await expect(modal.locator('[data-transfer-model]')).toHaveValue('');
+  await expect(modal.locator('[data-transfer-context]')).toHaveValue('My saved instruction survives a browser reload.');
+  const savedCwd = await modal.locator('[data-transfer-cwd]').inputValue();
+  await modal.locator('[data-transfer-cwd]').fill(`${savedCwd}/.`);
+  await modal.locator('[data-transfer-cwd]').press('Tab');
+  await modal.locator('[data-prepare-transfer]').click();
+  const prepares = fixture.events.filter(event => event.event === 'request'
+    && event.path === '/api/portable-transfers' && event.method === 'POST');
+  expect(prepares).toHaveLength(2);
+  expect(prepares[1].body).toEqual(expect.objectContaining({
+    accountId: 'codex-two', model: '', context: 'My saved instruction survives a browser reload.',
+  }));
+});
+
 test('ambiguous transfer reopens from saved preview and binds an observed receipt without relaunching', async ({ page }) => {
   const transfer = fixture.portableTransfers[0];
   Object.assign(transfer, { status: 'ambiguous', policyVersion: 2 });
   fixture.state.sessions.push({ id: 'observed-successor', kind: 'codex', title: 'Observed successor', project: transfer.cwd,
-    taskId: transfer.cardId, pane: 'observed-pane', accountId: transfer.targetAccountId, accountLabel: 'Codex Two',
+    pane: 'observed-pane', accountId: transfer.targetAccountId, accountLabel: 'Codex Two',
     portableTransferId: transfer.id, openingDelivered: true, state: 'running', endedTurn: false });
   fixture.state.panes.push({ id: 'observed-pane', pid: 901, alive: true, cwd: transfer.cwd,
     meta: { agent: 'codex', sessionId: 'observed-successor', accountId: transfer.targetAccountId,
-      accountLabel: 'Codex Two', portableTransferId: transfer.id } });
+      accountLabel: 'Codex Two', card: transfer.cardId, portableTransferId: transfer.id } });
   fixture.publish();
   await page.locator('#qlist [data-key="running:b"]').click();
   await page.locator('#stage [data-review-portable="portable-one"]').click();

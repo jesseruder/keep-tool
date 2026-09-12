@@ -38,6 +38,7 @@ async function createFixture() {
     sourceAccountId: 'codex-main', targetAccountId: 'codex-two', targetAgent: 'codex', cardId: 'card-b', cwd: repo,
     artifactFile: '/private/fixture/saved-context.md', preparedAt: Date.now() }];
   const portablePreviews = new Map([['portable-one', '# Existing CLI portable package\n']]);
+  const portableInputs = new Map();
   let portableSequence = 0;
   const state = { sessions, panes, tasks: sessions.map(s => ({ id: s.taskId, fm: { tags: ['personal'] } })), attention: [],
     accounts, handoffs: [], setAside: {}, health: { daemon: { running: true } }, usage: { accounts: usageAccounts,
@@ -103,7 +104,8 @@ async function createFixture() {
         if (url.pathname === '/api/portable-transfer-preview' && req.method === 'GET') {
           const transfer = portableTransfers.find(candidate => candidate.id === url.searchParams.get('id'));
           if (!transfer) { json({ error: 'Unknown portable transfer' }, 404); return; }
-          json({ ok: true, transfer, preview: portablePreviews.get(transfer.id) || '' }); return;
+          json({ ok: true, transfer, preview: portablePreviews.get(transfer.id) || '',
+            ...(portableInputs.has(transfer.id) ? { inputs: portableInputs.get(transfer.id) } : {}) }); return;
         }
         if (url.pathname === '/api/state') { json(state); return; }
         if (url.pathname === '/api/layouts') {
@@ -181,14 +183,17 @@ async function createFixture() {
             ...(input.model ? { model: input.model } : {}), cardId: source.taskId, cwd: input.cwd || repo,
             artifactFile: `/private/fixture/${id}.md`, preparedAt: Date.now() };
           const preview = `# Portable session continuation\n\n- Source session: ${source.id}\n- Destination account: ${account.id} (${account.agent})\n${input.model ? `- Destination model: ${input.model}\n` : ''}- Launch cwd: ${input.cwd || repo}\n\n## Explicit continuation context\n\n${input.context}\n\n## Continue\n\nAcknowledge ready, then WAIT for Jesse or the user. Automated reminders do not resume you.`;
-          portableTransfers.push(transfer); portablePreviews.set(id, preview); publish();
-          json({ ok: true, transfer, preview }); return;
+          const reviewedInputs = { accountId: account.id, model: input.model || '', cwd: input.cwd || repo, context: input.context };
+          portableTransfers.push(transfer); portablePreviews.set(id, preview); portableInputs.set(id, reviewedInputs); publish();
+          json({ ok: true, transfer, preview, inputs: reviewedInputs }); return;
         }
         if (url.pathname === '/api/resolve-portable-transfer' && req.method === 'POST') {
           const transfer = portableTransfers.find(candidate => candidate.id === input.transferId);
           const successor = sessions.find(s => s.id === input.destinationSessionId);
+          const successorPane = panes.find(p => p.meta?.sessionId === successor?.id);
           if (!transfer || !['launching', 'ambiguous'].includes(transfer.status) || !successor
-              || successor.accountId !== transfer.targetAccountId || successor.taskId !== transfer.cardId
+              || successor.accountId !== transfer.targetAccountId
+              || successor.taskId !== transfer.cardId && (!successor.taskId && successorPane?.meta?.card !== transfer.cardId)
               || successor.portableTransferId !== transfer.id || successor.openingDelivered !== true) {
             json({ error: 'No compatible existing successor with a delivered opening message was found' }, 409); return;
           }

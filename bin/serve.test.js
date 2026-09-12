@@ -3496,6 +3496,35 @@ test('desktop portable APIs accept bounded text and ids without browser-controll
     context: 'x'.repeat(512 * 1024 + 1) }, { portable }), (error) => error.status === 400 && /too large/.test(error.message));
 });
 
+test('desktop prepare API accepts an omitted model through the real portable implementation', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-portable-api-'));
+  const cwd = path.join(root, 'worktree');
+  const transcript = path.join(root, 'source.jsonl');
+  fs.mkdirSync(cwd);
+  fs.writeFileSync(transcript, `${JSON.stringify({ type: 'event_msg',
+    payload: { type: 'user_message', message: 'Prepare this from the browser.' } })}\n`);
+  const account = { id: 'codex-secondary', label: 'Codex secondary', agent: 'codex' };
+  try {
+    const prepared = await preparePortableTransfer({ sourceSessionId: 'source-session-1234',
+      accountId: account.id, context: 'Wait for Jesse before continuing.' }, {
+      root, accounts: { get: (id) => id === account.id ? account : null, list: () => [account] },
+      sourceFor: () => ({ agent: 'claude', accountId: 'claude/default', cwd, file: transcript }),
+      taskForSession: () => ({ id: 'portable-card', fm: { title: 'Portable card', status: 'active', project: cwd } }),
+      nextStep: () => ({ text: 'Run the focused tests.' }),
+      taskFile: () => path.join(root, 'tasks', 'portable-card.md'),
+      gitSnapshot: () => ({ available: true, cwd, top: cwd, commonDir: path.join(root, '.git'),
+        head: '0123456789abcdef', branch: 'wt/portable', status: '', contentDigest: 'git-content-v1' }),
+      inspectSource: async () => ({ session: { endedTurn: true, project: cwd } }),
+      storePackage: async ({ fileName, content }) => {
+        const file = path.join(root, fileName); fs.writeFileSync(file, content); return file;
+      },
+    });
+    assert.equal(prepared.transfer.model, undefined);
+    assert.equal(prepared.inputs.model, '');
+    assert.equal(prepared.inputs.context, 'Wait for Jesse before continuing.');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('portable source inspection treats failed native handoff as terminal and finds committed portable successors', async () => {
   const state = { sessions: [{ id: 'source-session', endedTurn: true }], panes: [],
     handoffs: [{ sessionId: 'source-session', status: 'failed' }] };
@@ -3510,7 +3539,7 @@ test('ambiguous resolver requires matching account, card, pane transfer marker, 
   const transfer = { version: 1, requestKey: id, status: 'ambiguous', sourceSessionId: 'source-session',
     targetAccountId: 'codex-two', targetAgent: 'codex', cardId: 'card-source', launchStartedAt: 100 };
   const session = { id: 'destination-session', accountId: 'codex-two', taskId: 'card-source' };
-  const pane = { id: 'destination-pane', meta: { sessionId: session.id, portableTransferId: id } };
+  const pane = { id: 'destination-pane', meta: { sessionId: session.id, accountId: 'codex-two', portableTransferId: id } };
   let receipt = { pane: pane.id, deliveredAt: 101 };
   const portable = {
     list: () => [], safeSummary: (value) => value,
@@ -3524,6 +3553,17 @@ test('ambiguous resolver requires matching account, card, pane transfer marker, 
   const deps = { root: '/keep', portable, accounts: {}, inspectSource: async () => {}, storePackage: async () => {},
     inspectState: async () => ({ sessions: [session], panes: [pane], handoffs: [] }) };
   assert.equal((await resolvePortableTransfer({ transferId: id, destinationSessionId: session.id }, deps)).transfer.status, 'done');
+  delete session.taskId;
+  pane.meta.card = 'card-source';
+  let linked;
+  assert.equal((await resolvePortableTransfer({ transferId: id, destinationSessionId: session.id }, {
+    ...deps, taskForSession: () => null,
+    linkLaunchedSession: (cardId, linkedSession) => { linked = { cardId, linkedSession }; return { linked: linkedSession.id }; },
+  })).transfer.status, 'done');
+  assert.deepEqual(linked, { cardId: 'card-source', linkedSession: { id: session.id, agent: 'codex' } });
+  await assert.rejects(resolvePortableTransfer({ transferId: id, destinationSessionId: session.id }, {
+    ...deps, taskForSession: () => ({ id: 'other-card' }), linkLaunchedSession: () => assert.fail('must not relink conflict'),
+  }), /destination mismatch/);
   receipt = null;
   await assert.rejects(resolvePortableTransfer({ transferId: id, destinationSessionId: session.id }, deps), /destination mismatch/);
 });

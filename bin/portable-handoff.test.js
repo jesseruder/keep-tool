@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const { execFileSync } = require('node:child_process');
 const portable = require('./portable-handoff');
 
 function fixture() {
@@ -36,7 +37,8 @@ function fixture() {
     nextStep: () => ({ state: 'doing', text: 'Validate the fresh destination and wait.' }),
     taskFile: () => path.join(root, 'tasks', `${task.id}.md`),
     gitSnapshot: () => ({ available: true, cwd, top: cwd, commonDir: path.join(root, '.git'),
-      head: '0123456789abcdef', branch: 'wt/portable', status: ' M bin/portable-handoff.js' }),
+      head: '0123456789abcdef', branch: 'wt/portable', status: ' M bin/portable-handoff.js',
+      contentDigest: 'git-content-v1' }),
     storePackage: ({ cardId, fileName, content }) => {
       const directory = path.join(root, '.keep', 'artifacts', cardId); fs.mkdirSync(directory, { recursive: true });
       const file = path.join(directory, fileName); fs.writeFileSync(file, content); stored.push({ cardId, file, content }); return file;
@@ -154,6 +156,8 @@ test('desktop draft and immutable preview include the pause contract and exact d
     assert.equal(prepared.model, 'gpt-5.6-sol');
     const preview = portable.readPreview(prepared.requestKey, { root: f.root });
     assert.equal(preview.transfer.id, prepared.requestKey);
+    assert.deepEqual(preview.inputs, { accountId: f.target.id, model: 'gpt-5.6-sol', cwd: f.cwd,
+      context: 'After Jesse asks, finish validation.' });
     assert.match(preview.preview, /After Jesse asks, finish validation/);
     assert.match(preview.preview, /then WAIT for a new instruction from Jesse or the user/);
     assert.doesNotMatch(preview.preview, /Follow the explicit continuation context's next instruction exactly/);
@@ -168,6 +172,9 @@ test('desktop launch refuses stale source or package bytes and requires authorit
     const request = { sourceSessionId: 'source-session-1234', accountId: f.target.id,
       contextText: 'Review this exact draft.', prepareOnly: true };
     await assert.rejects(portable.run(request, { ...f.deps, inspectSource: undefined }), /inspection is unavailable/);
+    await assert.rejects(portable.run(request, { ...f.deps,
+      gitSnapshot: () => ({ available: false, error: 'capture exceeded bound' }) }),
+    (error) => error.code === 'KEEP_PORTABLE_TRANSFER_GIT');
     const staleSource = await portable.run(request, f.deps);
     fs.appendFileSync(f.transcript, `${JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: 'new work' } })}\n`);
     await assert.rejects(portable.launchPrepared(staleSource.requestKey, f.deps),
@@ -246,12 +253,89 @@ test('source-scoped desktop lock prevents different reviewed drafts from launchi
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test('source-scoped desktop lock remains held while asynchronous readiness inspection is pending', async () => {
+  const f = fixture();
+  try {
+    const first = await portable.run({ sourceSessionId: 'source-session-1234', accountId: f.target.id,
+      model: 'gpt-5.6-sol', contextText: 'First reviewed draft.', prepareOnly: true }, f.deps);
+    const second = await portable.run({ sourceSessionId: 'source-session-1234', accountId: f.target.id,
+      model: 'gpt-5.6-terra', contextText: 'Second reviewed draft.', prepareOnly: true }, f.deps);
+    let enterInspection;
+    const inspectionEntered = new Promise((resolve) => { enterInspection = resolve; });
+    let releaseInspection;
+    const inspectionReleased = new Promise((resolve) => { releaseInspection = resolve; });
+    let inspections = 0;
+    f.deps.inspectSource = async () => {
+      inspections++;
+      if (inspections === 1) {
+        enterInspection();
+        await inspectionReleased;
+      }
+      return { session: { endedTurn: true, state: 'needs-input', project: f.cwd } };
+    };
+
+    const launching = portable.launchPrepared(first.requestKey, f.deps);
+    await inspectionEntered;
+    await assert.rejects(portable.launchPrepared(second.requestKey, f.deps),
+      (error) => error.code === 'KEEP_PORTABLE_TRANSFER_BUSY');
+    releaseInspection();
+    assert.equal((await launching).status, 'done');
+    assert.equal(inspections, 1, 'the competing draft never passes the source lock to inspect or launch');
+    assert.equal(f.opened.length, 1);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('direct run keeps its transaction lock through asynchronous destination opening', async () => {
+  const f = fixture();
+  try {
+    const request = { sourceSessionId: 'source-session-1234', accountId: f.target.id,
+      contextFile: f.context, cwd: f.cwd };
+    await portable.run({ ...request, prepareOnly: true }, f.deps);
+    let release;
+    f.deps.open = async () => {
+      await new Promise((resolve) => { release = resolve; });
+      return { sessionId: 'destination-session-5678', pane: 'pane-destination', accountId: f.target.id };
+    };
+    const launching = portable.run(request, f.deps);
+    while (!release) await new Promise((resolve) => setImmediate(resolve));
+    await assert.rejects(portable.run(request, f.deps),
+      (error) => error.code === 'KEEP_PORTABLE_TRANSFER_BUSY');
+    release();
+    assert.equal((await launching).status, 'done');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test('desktop source safety rejects foreground, background, native, and portable conflicts', () => {
   assert.match(portable.sourceBusyReason({ session: { endedTurn: true, observation: { foreground: { state: 'active' } } } }), /foreground/);
   assert.match(portable.sourceBusyReason({ session: { endedTurn: true, pendingBackground: true } }), /background/);
   assert.match(portable.sourceBusyReason({ session: { endedTurn: true }, nativeHandoff: {} }), /account handoff/);
   assert.match(portable.sourceBusyReason({ session: { endedTurn: true }, portableHandoff: {} }), /portable transfer/);
   assert.equal(portable.sourceBusyReason({ session: { endedTurn: true, state: 'needs-input' } }), '');
+});
+
+test('git freshness digest changes when the contents of an already-dirty file change', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-portable-git-'));
+  try {
+    const git = (...args) => execFileSync('git', ['-C', root, ...args], { stdio: 'ignore' });
+    git('init'); git('config', 'user.email', 'portable@example.invalid'); git('config', 'user.name', 'Portable Test');
+    fs.writeFileSync(path.join(root, 'tracked.txt'), 'base\n'); git('add', 'tracked.txt'); git('commit', '-m', 'base');
+    const nested = path.join(root, 'nested'); fs.mkdirSync(nested);
+    fs.writeFileSync(path.join(root, 'tracked.txt'), 'first dirty value\n');
+    fs.writeFileSync(path.join(root, 'untracked.txt'), 'first untracked value\n');
+    const first = portable.defaultGitSnapshot(nested);
+    fs.writeFileSync(path.join(root, 'tracked.txt'), 'second dirty value\n');
+    const second = portable.defaultGitSnapshot(nested);
+    assert.equal(first.available, true);
+    assert.equal(second.available, true);
+    assert.equal(first.status, second.status, 'porcelain status alone cannot observe this edit');
+    assert.notEqual(first.contentDigest, second.contentDigest);
+    fs.writeFileSync(path.join(root, 'tracked.txt'), 'first staged value\n'); git('add', 'tracked.txt');
+    const firstIndex = portable.defaultGitSnapshot(nested);
+    fs.writeFileSync(path.join(root, 'tracked.txt'), 'second staged value\n'); git('add', 'tracked.txt');
+    const secondIndex = portable.defaultGitSnapshot(nested);
+    assert.equal(firstIndex.status, secondIndex.status);
+    assert.notEqual(firstIndex.contentDigest, secondIndex.contentDigest);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('transfer CLI passes the explicit account, context, cwd, and prepare-only contract', async (t) => {

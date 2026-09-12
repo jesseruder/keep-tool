@@ -5048,9 +5048,19 @@ async function resolvePortableTransfer(body, deps = {}) {
       const session = inspection.state.sessions?.find((entry) => entry.id === sessionId);
       const pane = inspection.panes.find((entry) => entry.meta?.sessionId === sessionId);
       const receipt = portable.deliveryReceipt(transfer.requestKey, { root: deps.root || keep.ROOT });
-      return Boolean(session && session.accountId === transfer.targetAccountId && session.taskId === transfer.cardId
-        && pane?.meta?.portableTransferId === transfer.requestKey && receipt?.pane === pane.id
-        && receipt.deliveredAt >= Number(transfer.launchStartedAt || 0));
+      if (!session || session.accountId !== transfer.targetAccountId || !pane
+          || pane.meta?.accountId !== transfer.targetAccountId
+          || pane.meta?.portableTransferId !== transfer.requestKey || receipt?.pane !== pane.id
+          || receipt.deliveredAt < Number(transfer.launchStartedAt || 0)) return false;
+      if (session.taskId && session.taskId !== transfer.cardId) return false;
+      if (session.taskId === transfer.cardId) return true;
+      if (pane.meta?.card !== transfer.cardId) return false;
+      const owner = (deps.taskForSession || keep.taskForSession)(sessionId);
+      if (owner?.id && owner.id !== transfer.cardId) return false;
+      if (owner?.id === transfer.cardId) return true;
+      return Boolean((deps.linkLaunchedSession || keep.linkLaunchedSession)(
+        transfer.cardId, { id: sessionId, agent: transfer.targetAgent },
+      ));
     }),
   });
   const transfer = portable.safeSummary(result);
