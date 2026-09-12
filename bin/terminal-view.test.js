@@ -6,7 +6,8 @@ const vm = require('node:vm');
 const { Terminal: HeadlessTerminal } = require('@xterm/headless');
 
 const imagePasteSource = fs.readFileSync(path.join(__dirname, '../web/app/image-paste.js'), 'utf8').replace(/^export /gm, '');
-const source = imagePasteSource + '\n' + fs.readFileSync(path.join(__dirname, '../web/app/terminal.js'), 'utf8')
+const terminalScrollSource = fs.readFileSync(path.join(__dirname, '../web/app/terminal-scroll.js'), 'utf8').replace(/^export /gm, '');
+const source = imagePasteSource + '\n' + terminalScrollSource + '\n' + fs.readFileSync(path.join(__dirname, '../web/app/terminal.js'), 'utf8')
   .replace(/^import .*;\n/gm, '').replace('export function mountTerminal', 'function mountTerminal');
 
 test('Triage and Watch move one terminal viewer instead of retaining a hidden primary', () => {
@@ -77,6 +78,8 @@ function fixture(options = {}) {
     }
     loadAddon() {}
     attachCustomKeyEventHandler(handler) { this.keyHandler = handler; }
+    attachCustomWheelEventHandler(handler) { this.wheelHandler = handler; }
+    onBinary(handler) { this.binaryHandler = handler; return { dispose() {} }; }
     focus() {}
   }
   class WebSocket {
@@ -108,6 +111,11 @@ function fixture(options = {}) {
     captureFocusIntent: () => () => true,
     setTimeout(fn) { timers.set(++timerId, fn); return timerId; },
     clearTimeout(id) { timers.delete(id); },
+    WheelEvent: class WheelEvent {
+      static DOM_DELTA_PIXEL = 0;
+      static DOM_DELTA_LINE = 1;
+      constructor(type, init) { this.type = type; Object.assign(this, init); }
+    },
     requestAnimationFrame: () => 1, cancelAnimationFrame() {},
   });
   vm.runInContext(source, context);
@@ -177,6 +185,23 @@ test('snapshot parses at its original size before fit or user input', async () =
     assert.ok(f.socket.sent[1] instanceof Uint8Array);
     const buffer = f.terminal.buffer.active;
     assert.equal(buffer.getLine(buffer.baseY + buffer.cursorY).translateToString(true), '› prompt');
+  } finally { f.mounted.dispose(); }
+});
+
+test('legacy mouse binary input preserves observer ownership and reaches the PTY byte-exactly after interaction', async () => {
+  const f = fixture();
+  try {
+    f.message({ t: 'replay-end' });
+    await f.drain();
+    f.socket.sent.length = 0;
+    f.message({ t: 'pane', pane: { id: 'pane', primary: 'another-viewer', cols: 80, rows: 30 } });
+    f.terminal.binaryHandler(`\x1b[M${String.fromCharCode(0xe1)}#$`);
+    assert.equal(f.socket.sent.length, 0, 'unmarked legacy motion from an observer cannot take control or reply');
+
+    f.mounted.element.dispatch('wheel');
+    f.terminal.binaryHandler(`\x1b[M${String.fromCharCode(0xe1)}#$`);
+    assert.equal(JSON.parse(f.socket.sent[0]).t, 'primary');
+    assert.deepEqual([...f.socket.sent[1]], [0x1b, 0x5b, 0x4d, 0xe1, 0x23, 0x24]);
   } finally { f.mounted.dispose(); }
 });
 

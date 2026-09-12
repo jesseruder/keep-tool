@@ -1,6 +1,7 @@
 import { createImagePasteHandler } from './image-paste.js';
 import { getPalette, resolvedTheme, xtermTheme } from './theme.js';
 import { captureFocusIntent } from './focus-intent.js';
+import { createTrackedPixelWheelHandler } from './terminal-scroll.js';
 
 const encoder = new TextEncoder();
 
@@ -94,6 +95,11 @@ export function mountTerminal(container, pane, options = {}) {
     const bounds = wrapper.getClientRects()[0];
     return presented && wrapper.isConnected && Boolean(bounds?.width && bounds?.height);
   };
+  const trackpadWheel = createTrackedPixelWheelHandler(terminal, {
+    active: () => !disposed && !document.hidden && presented && isVisible()
+      && socket?.readyState === WebSocket.OPEN && replayDone,
+  });
+  terminal.attachCustomWheelEventHandler(trackpadWheel.handle);
   const disposeWebgl = () => {
     webglContextLoss?.dispose();
     webglContextLoss = null;
@@ -254,6 +260,7 @@ export function mountTerminal(container, pane, options = {}) {
   };
   const connect = () => {
     if (disposed || exited || !retryable) return;
+    trackpadWheel.cancel();
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const focused = (!connectedOnce && Boolean(options.focus)) || wrapper.contains(document.activeElement);
     // The upgrade query is the attach handshake. This mount's viewer id is stable
@@ -364,22 +371,29 @@ export function mountTerminal(container, pane, options = {}) {
     if (previous && previous.readyState < WebSocket.CLOSING) previous.close();
   });
 
-  const sendInput = (data, { user }) => {
-    const bytes = encoder.encode(data);
-    if (user) {
-      takeControl();
-      if (socket?.readyState === WebSocket.OPEN && replayDone) socket.send(bytes);
-      else pendingInput.push(bytes);
-      return;
-    }
-    // xterm answers CSI 6n, OSC 11, and CSI ?u queries through onData. Only the
-    // host-confirmed primary may answer, or observers produce duplicate replies.
+  const sendUserBytes = (bytes) => {
+    takeControl();
+    if (socket?.readyState === WebSocket.OPEN && replayDone) socket.send(bytes);
+    else pendingInput.push(bytes);
+  };
+  const sendBytes = (bytes, { user }) => {
+    if (user) return sendUserBytes(bytes);
+    // Xterm answers terminal queries through onData; unmarked mouse motion can
+    // arrive through either callback. Only the host-confirmed primary may reply.
     if (!isPrimary || claimPending || socket?.readyState !== WebSocket.OPEN || !replayDone) return;
     socket.send(JSON.stringify({ t: 'reply', data: base64Bytes(bytes) }));
   };
+  const sendInput = (data, options) => sendBytes(encoder.encode(data), options);
   terminal.onData((data) => sendInput(data, { user: performance.now() <= userInputUntil }));
+  // Legacy mouse reports arrive through onBinary because their coordinate bytes
+  // are not UTF-8. Preserve each byte when forwarding them to the PTY.
+  terminal.onBinary((data) => sendBytes(
+    Uint8Array.from(data, char => char.charCodeAt(0) & 0xff),
+    { user: performance.now() <= userInputUntil },
+  ));
   terminal.attachCustomKeyEventHandler((event) => {
     if (event.type !== 'keydown') return true;
+    trackpadWheel.cancel();
     userInputUntil = performance.now() + 50;
     // Shift+Enter (and Cmd+Enter) insert a newline in Claude Code and Codex: send
     // the Option+Enter sequence, since xterm would otherwise send a bare CR.
@@ -425,7 +439,10 @@ export function mountTerminal(container, pane, options = {}) {
   terminal.textarea?.addEventListener('input', markInsertedInput, true);
   // Pointer and focus reports are terminal input, so count them as typing before xterm handles them.
   for (const type of ['pointerdown', 'pointerup', 'wheel', 'focusin', 'focusout']) {
-    wrapper.addEventListener(type, () => { userInputUntil = performance.now() + 250; }, true);
+    wrapper.addEventListener(type, () => {
+      if (type === 'pointerdown' || type === 'pointerup') trackpadWheel.cancel();
+      userInputUntil = performance.now() + 250;
+    }, true);
   }
 
   const findInput = wrapper.querySelector('.findbar input');
@@ -485,6 +502,7 @@ export function mountTerminal(container, pane, options = {}) {
     show,
     hide() {
       presented = false;
+      trackpadWheel.cancel();
       reportVisibility();
       showFocus = false;
       clearTimeout(resizeTimer);
@@ -503,6 +521,7 @@ export function mountTerminal(container, pane, options = {}) {
     },
     dispose() {
       disposed = true;
+      trackpadWheel.cancel();
       clearTimeout(retryTimer);
       clearTimeout(resizeTimer);
       cancelAnimationFrame(showFrame);
