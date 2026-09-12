@@ -32,6 +32,9 @@ async function createFixture() {
   ];
   const usageAccounts = Object.fromEntries(accounts.map((account, index) => [account.id, { ...account,
     ...(account.agent === 'claude' ? { limits: [{ label: '5h', percent: 10 + index }] } : { windows: [{ label: '5h', percent: 10 + index }] }) }]));
+  const portableTransfers = [{ id: 'portable-one', status: 'prepared', sourceSessionId: 'b', sourceAgent: 'codex',
+    sourceAccountId: 'codex-main', targetAccountId: 'codex-two', targetAgent: 'codex', cardId: 'card-b', cwd: repo,
+    artifactFile: '/private/fixture/saved-context.md', preparedAt: Date.now() }];
   const state = { sessions, panes, tasks: sessions.map(s => ({ id: s.taskId, fm: { tags: ['personal'] } })), attention: [],
     accounts, handoffs: [], setAside: {}, health: { daemon: { running: true } }, usage: { accounts: usageAccounts,
       claude: { limits: [{ label: 'legacy claude', percent: 99 }] }, codex: { windows: [{ label: 'legacy codex', percent: 99 }] } }, review: { events: [], stats: {} }, limitResume: {} };
@@ -76,6 +79,7 @@ async function createFixture() {
       }
       if (url.pathname.startsWith('/api/')) {
         record('request', { method: req.method, path: url.pathname, body: input });
+        if (url.pathname === '/api/portable-transfers') { json({ ok: true, transfers: portableTransfers }); return; }
         if (url.pathname === '/api/state') { json(state); return; }
         if (url.pathname === '/api/layouts') {
           if (req.method === 'PUT') { if (layoutFails) { json({ error: 'Fixture layout failure' }, 500); return; } layouts = input.layouts; }
@@ -122,6 +126,22 @@ async function createFixture() {
           publish(); json({ ok: true, transactionId: transaction.id, sessionId: session.id, pane: pane.id,
             sourceAccountId: transaction.sourceAccountId, targetAccountId: account.id, status: 'done' }); return;
         }
+        if (url.pathname === '/api/transfer-session') {
+          const transfer = portableTransfers.find(candidate => candidate.id === input.transferId);
+          if (!transfer) { json({ error: 'Unknown prepared transfer' }, 404); return; }
+          if (['launching', 'ambiguous'].includes(transfer.status)) { json({ error: `Transfer is ${transfer.status}`, transfer }, 409); return; }
+          if (transfer.status !== 'done') {
+            transfer.status = 'done'; transfer.completedAt = Date.now();
+            transfer.destinationSessionId = 'portable-successor'; transfer.destinationPane = 'portable-pane';
+            sessions.push({ id: transfer.destinationSessionId, kind: 'codex', title: 'Portable successor', project: repo,
+              taskId: 'card-b', pane: transfer.destinationPane, accountId: 'codex-two', accountLabel: 'Codex Two',
+              mtime: Date.now(), lastUserAt: Date.now(), state: 'running', endedTurn: false });
+            panes.push({ id: transfer.destinationPane, pid: 999, alive: true, cwd: repo,
+              meta: { agent: 'codex', sessionId: transfer.destinationSessionId, accountId: 'codex-two', accountLabel: 'Codex Two' } });
+            publish();
+          }
+          json({ ok: true, transfer }); return;
+        }
         if (url.pathname === '/api/setaside') { if (input.kind === 'clear') delete state.setAside[input.key]; else state.setAside[input.key] = { kind: input.kind, at: Date.now() }; json({ ok: true }); publish(); return; }
         // Unsupported actions fail visibly instead of accidentally invoking real services.
         json({ error: `Unsupported fixture endpoint: ${url.pathname}` }, 404); return;
@@ -158,7 +178,7 @@ async function createFixture() {
     });
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  return { url: `http://127.0.0.1:${server.address().port}`, events, state, update, publish, churn,
+  return { url: `http://127.0.0.1:${server.address().port}`, events, state, portableTransfers, update, publish, churn,
     configure: options => { if ('closeDelay' in options) closeDelay = options.closeDelay; if ('closeFails' in options) closeFails = options.closeFails; if ('layoutFails' in options) layoutFails = options.layoutFails; if ('handoffRecoversOnce' in options) handoffRecoversOnce = options.handoffRecoversOnce; },
     async close() { clearInterval(timer); for (const c of clients) c.end(); for (const c of sockets.clients) c.terminate(); sockets.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); fs.rmSync(repo, { recursive: true, force: true }); },
   };

@@ -3,6 +3,7 @@ import * as api from './api.js';
 import { closeSession } from './close-session.js';
 import { restartControls, installRestartControls } from './restart-session.js';
 import { accountLabelHTML, handoffControls, installHandoffControls, hasPendingHandoff } from './account-controls.js';
+import { portableTransferControls, installPortableTransferControls } from './portable-transfer.js';
 import { sessionLabel, sessionExplanation, backgroundLabel } from './status.js';
 import { retainSelection, selectionIndex } from './selection.js';
 
@@ -363,6 +364,10 @@ function renderStage(ctx, active, focusItem, running, pinned) {
   const brief = stage.querySelector('.brief');
   if ((closable || pendingHandoff) && !session?.reviewer) {
     const actions = stage.querySelector('.shead .acts');
+    let portable = actions.querySelector('.portable-transfer-controls');
+    if (!portable) { portable = document.createElement('div'); portable.className = 'portable-transfer-controls'; actions.append(portable); }
+    ctx.patchHTML(portable, portableTransferControls(ctx, item.sessionId));
+    installPortableTransferControls(portable, ctx);
     let accounts = actions.querySelector('.account-controls');
     if (!accounts) { accounts = document.createElement('div'); accounts.className = 'account-controls'; actions.append(accounts); }
     ctx.patchHTML(accounts, handoffControls(ctx, item.sessionId, item.pane));

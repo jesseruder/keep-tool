@@ -1,6 +1,7 @@
 import * as api from './api.js';
 import { sessionExplanation } from './status.js';
 import { accountLabelHTML, handoffControls, installHandoffControls, hasPendingHandoff } from './account-controls.js';
+import { portableTransferControls, installPortableTransferControls } from './portable-transfer.js';
 
 const SHELL_PROJECT_KEY = 'keep.console.shellProject';
 
@@ -120,6 +121,10 @@ function renderGrid(ctx, layout) {
     if (closeButton) closeButton.onclick = () => closeSession(ctx, pane.meta.sessionId, pane.id, closeButton);
     if ((closable || pendingHandoff) && !entity.session?.reviewer) {
       const header = element.querySelector('.ph');
+      let portable = header.querySelector('.portable-transfer-controls');
+      if (!portable) { portable = document.createElement('div'); portable.className = 'portable-transfer-controls'; header.append(portable); }
+      ctx.patchHTML(portable, portableTransferControls(ctx, pane.meta.sessionId));
+      installPortableTransferControls(portable, ctx);
       let accounts = header.querySelector('.account-controls');
       if (!accounts) { accounts = document.createElement('div'); accounts.className = 'account-controls'; header.append(accounts); }
       ctx.patchHTML(accounts, handoffControls(ctx, pane.meta.sessionId, pane.id));

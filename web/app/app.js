@@ -96,7 +96,7 @@ try { historyStorage = localStorage; } catch {}
 const sessionHistory = createSessionHistory(historyStorage);
 let historyControls;
 let historyRestored = false;
-let data = { tasks: [], sessions: [], attention: [], setAside: {}, panes: [], health: {}, usage: {}, reviewUsage: null, review: { events: [], stats: {} }, reviewQueue: { items: [], counts: {} }, limitResume: {} };
+let data = { tasks: [], sessions: [], attention: [], setAside: {}, panes: [], portableTransfers: [], health: {}, usage: {}, reviewUsage: null, review: { events: [], stats: {} }, reviewQueue: { items: [], counts: {} }, limitResume: {} };
 const terminals = new Map();
 const THEME_LABELS = { system: 'Auto', light: 'Light', dark: 'Dark' };
 function renderPalettePicker({ mode, palette }) {
@@ -745,13 +745,14 @@ async function reload() {
   const generation = ++reloadGeneration;
   const revision = layoutRevision;
   try {
-    const [nextData, nextLayouts] = await Promise.all([
+    const [nextData, nextLayouts, portable] = await Promise.all([
       api.getState(),
       layoutSavesPending ? null : api.getLayouts(),
+      api.getPortableTransfers(),
     ]);
     if (generation < appliedReloadGeneration) return;
     appliedReloadGeneration = generation;
-    data = nextData;
+    data = { ...nextData, portableTransfers: portable?.transfers || [] };
     for (const [id, pending] of spawnedPanes) {
       if ((data.panes || []).some((candidate) => candidate.id === id)) spawnedPanes.delete(id);
       else if (generation <= pending.throughGeneration) data.panes = [...(data.panes || []), pending.pane];

@@ -156,6 +156,13 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .account-menu .btn small { color: var(--faint); font-size: 10px; }
 .handoff-status, .handoff-error { align-self: center; color: var(--muted); font-size: 11px; white-space: nowrap; }
 .handoff-error { color: var(--bad); }
+.portable-transfer-controls { display: inline-flex; align-items: center; }
+.portable-transfer { flex-direction: column; align-items: flex-start; gap: 1px; text-align: left; line-height: 1.15; }
+.portable-transfer small { color: var(--faint); font-size: 9px; }
+.portable-transfer-state { align-self: center; color: var(--muted); font-size: 11px; }
+.portable-transfer-state.error { color: var(--bad); }
+.wpane .portable-transfer { padding: 2px 4px; }
+.wpane .portable-transfer small { display: none; }
 .reviewer-state { color: var(--ok); }
 .review-pop { display: none; position: absolute; top: 34px; right: 0; width: 340px; max-height: 65vh; overflow: auto; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 6px; padding: 10px 12px; box-shadow: var(--shadow); z-index: 20; font-size: 12px; }
 .shead .acts.open .review-pop { display: block; }

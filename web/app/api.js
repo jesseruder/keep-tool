@@ -48,6 +48,7 @@ export function getState() {
 }
 export const getLayouts = () => request('/api/layouts');
 export const getSessionSummary = (id) => request(`/api/sessionsummary?id=${encodeURIComponent(id)}`);
+export const getPortableTransfers = () => request('/api/portable-transfers');
 
 export function write(url, body, method = 'POST') {
   return request(url, { method, headers: WRITE_HEADERS, body: JSON.stringify(body || {}) });
