@@ -183,6 +183,8 @@ function detectStalledCodexJobs(jobs, now = Date.now(), options = {}) {
       out.push({
         kind: 'codex-job',
         id: String(job.id || ''),
+        ...(job.accountId ? { accountId: job.accountId } : {}),
+        ...(job.companionStateRoot ? { stateRoot: job.companionStateRoot } : {}),
         summary: String(job.summary || job.title || ''),
         idleMs,
         logBytes,
@@ -198,6 +200,8 @@ function detectStalledCodexJobs(jobs, now = Date.now(), options = {}) {
     out.push({
       kind: 'codex-job',
       id: String(job.id || ''),
+      ...(job.accountId ? { accountId: job.accountId } : {}),
+      ...(job.companionStateRoot ? { stateRoot: job.companionStateRoot } : {}),
       summary: String(job.summary || job.title || ''),
       idleMs,
       logBytes,
@@ -303,25 +307,29 @@ async function readCodexStateFile(file, deps = {}) {
 }
 
 async function readCodexStateJobs(options = {}, deps = {}) {
-  const stateRoot = options.codexStateRoot || CODEX_STATE_ROOT;
-  let dirs;
-  try { dirs = fs.readdirSync(stateRoot, { withFileTypes: true }); }
-  catch (error) {
-    return { jobs: [], readable: false, missing: Boolean(error && error.code === 'ENOENT') };
-  }
+  const inventory = require('./codex-companion-account.js').inventoryStateRoots(options);
   const jobs = [];
-  let readable = true;
-  for (const entry of dirs) {
-    if (!entry.isDirectory()) continue;
-    const file = path.join(stateRoot, entry.name, 'state.json');
-    const result = await readCodexStateFile(file, deps);
-    if (!result.readable) readable = false;
-    for (const job of result.jobs) {
-      if (!['queued', 'running'].includes(job.status)) continue;
-      jobs.push({ ...job, status: 'running' });
+  let readable = inventory.readable !== false;
+  let foundRoot = false;
+  for (const source of inventory.roots) {
+    let dirs;
+    try { dirs = fs.readdirSync(source.stateRoot, { withFileTypes: true }); foundRoot = true; }
+    catch (error) { if (error.code !== 'ENOENT') readable = false; continue; }
+    for (const entry of dirs) {
+      if (!entry.isDirectory()) continue;
+      const file = path.join(source.stateRoot, entry.name, 'state.json');
+      const result = await readCodexStateFile(file, deps);
+      if (!result.readable) readable = false;
+      for (const job of result.jobs) {
+        if (!['queued', 'running'].includes(job.status)) continue;
+        jobs.push({ ...job, status: 'running', accountId: source.accountId || null,
+          companionStateRoot: source.stateRoot, companionPluginData: source.pluginData || null,
+          companionConfigDir: source.configDir || null, companionBuiltIn: source.builtIn === true,
+          companionManaged: source.managed === true });
+      }
     }
   }
-  return { jobs, readable, missing: false };
+  return { jobs, readable, missing: !foundRoot };
 }
 
 function companionScript(options = {}) {
@@ -424,6 +432,7 @@ function enrichRunLogs(runs, options = {}) {
 function itemKey(item) {
   if (item.kind === 'run') return `run:${item.runId}`;
   if (item.kind === 'orphan-shell') return `orphan-shell:${item.pid}`;
+  if (item.kind === 'codex-job') return `codex-job:${item.stateRoot || ''}:${item.accountId || ''}:${item.id}`;
   return `${item.kind}:${item.id}`;
 }
 
@@ -485,8 +494,10 @@ async function sweep(options = {}) {
   const brokers = options.brokers || await (deps.listBrokers || codexBrokers.list)(brokerDeps);
   let detected = [
     ...brokers.filter(codexBrokers.isReapable).map((item) => ({
-      kind: 'codex-broker', id: item.stateDir || String(item.pid), pid: item.pid,
-      stateDir: item.stateDir, cwd: item.cwd, status: item.state, reason: item.reason,
+      kind: 'codex-broker', id: item.stateDir
+        ? `${item.accountId || 'legacy'}:${item.stateDir}` : String(item.pid), pid: item.pid,
+      stateDir: item.stateDir, accountId: item.accountId || null,
+      cwd: item.cwd, status: item.state, reason: item.reason,
     })),
     ...detectStalledSessions(sessions, now, { ...options, observations }),
     ...detectStalledRuns(runs, now, options),
@@ -589,9 +600,9 @@ function attentionItems(items) {
     else if (item.kind === 'run') text = `Stalled run: ${item.taskId} log idle ${duration(item.idleMs)}`;
     else if (item.kind === 'orphan-agent') text = `Orphan ${item.agent} pid ${item.pid}: ${item.reason}; keep codex-jobs --reap`;
     else if (item.kind === 'codex-broker') text = `Codex broker ${item.pid ?? item.stateDir} for ${item.cwd || '(unknown)'}: ${item.reason}`;
-    else if (item.kind === 'codex-job' && item.status === 'dead' && item.reason === 'worker gone') text = `Dead Codex job ${item.id}: worker process gone (record still running); keep codex-jobs --reap`;
-    else if (item.kind === 'codex-job' && item.status === 'dead') text = `Dead Codex job ${item.id} (log ${bytes(item.logBytes)}, ${duration(item.idleMs)})`;
-    else if (item.kind === 'codex-job') text = `Stalled Codex job ${item.id} (${duration(item.idleMs)} idle)`;
+    else if (item.kind === 'codex-job' && item.status === 'dead' && item.reason === 'worker gone') text = `Dead Codex job ${item.id}${item.accountId ? ` for ${item.accountId}` : ''}: worker process gone (record still running); keep codex-jobs --reap`;
+    else if (item.kind === 'codex-job' && item.status === 'dead') text = `Dead Codex job ${item.id}${item.accountId ? ` for ${item.accountId}` : ''} (log ${bytes(item.logBytes)}, ${duration(item.idleMs)})`;
+    else if (item.kind === 'codex-job') text = `Stalled Codex job ${item.id}${item.accountId ? ` for ${item.accountId}` : ''} (${duration(item.idleMs)} idle)`;
     else text = `Orphan Codex poller pid ${item.pid} (${duration(item.idleMs)})`;
     return {
       id: `stalled:${item.kind}:${stableId}`,

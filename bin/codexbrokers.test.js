@@ -533,3 +533,30 @@ test('plugin SessionEnd sweep bounds aggregate identity checks across many works
   assert.equal(removed.length, 3);
   assert.ok(elapsed < 3000, 'deadline allows at most one final 500ms identity check');
 });
+
+test('discovery inventories brokers from every persisted account namespace', async (t) => {
+  const root = fs.mkdtempSync('/tmp/keep-codex-brokers-accounts-');
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const roots = [];
+  const rows = [];
+  for (const [index, accountId] of ['codex-primary', 'codex-secondary'].entries()) {
+    const stateRoot = path.join(root, accountId, 'state');
+    const stateDir = path.join(stateRoot, 'same-workspace-name');
+    const sessionDir = path.join(root, `cxc-${accountId}`);
+    const pid = 801 + index;
+    const endpoint = `unix:${sessionDir}/broker.sock`;
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.mkdirSync(sessionDir);
+    fs.writeFileSync(path.join(stateDir, 'broker.json'), JSON.stringify({
+      pid, endpoint, cwd: root, sessionDir, pidFile: path.join(sessionDir, 'broker.pid'),
+      logFile: path.join(sessionDir, 'broker.log'),
+    }));
+    fs.writeFileSync(path.join(stateDir, 'state.json'), JSON.stringify({ jobs: [] }));
+    roots.push({ accountId, stateRoot, pluginData: path.dirname(stateRoot), configDir: path.join(root, `${accountId}-home`) });
+    rows.push(`${pid} 1 00:10 node /plugin/app-server-broker.mjs serve --endpoint ${endpoint} --cwd ${root} --pid-file ${sessionDir}/broker.pid`);
+  }
+  const found = await brokers.discover({ codexStateRoots: roots, psOutput: rows.join('\n'), now: NOW });
+  assert.deepEqual(found.map((item) => item.accountId).sort(), ['codex-primary', 'codex-secondary']);
+  assert.deepEqual(found.map((item) => item.stateRoot).sort(), roots.map((item) => item.stateRoot).sort());
+  assert.ok(found.every((item) => item.recordFound && item.processFound));
+});

@@ -328,3 +328,55 @@ test('keep codex-jobs --json exits zero against a temporary registry', () => {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('multi-account jobs retain their exact namespace for reporting and cancellation', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-jobs-accounts-'));
+  try {
+    const roots = ['old-profile', 'new-profile'].map((name, index) => {
+      const pluginData = path.join(root, name);
+      const stateRoot = path.join(pluginData, 'state');
+      const workspace = path.join(stateRoot, 'workspace');
+      const configDir = path.join(root, `${name}-home`);
+      fs.mkdirSync(workspace, { recursive: true });
+      fs.mkdirSync(configDir);
+      fs.writeFileSync(path.join(workspace, 'state.json'), JSON.stringify({ jobs: [{
+        id: 'same-job-id', pid: 701 + index, status: 'running', workspaceRoot: root,
+        updatedAt: NOW, createdAt: NOW, summary: name,
+      }] }));
+      return { accountId: 'codex-secondary', stateRoot, pluginData, configDir, managed: true };
+    });
+    const cancelled = [];
+    const result = await codexJobs.reap({ deps: {
+      codexStateRoots: roots, now: NOW, psOutput: '', companionScript: '/fake/codex-companion.mjs',
+      env: { KEEP_AGENT_ACCOUNT_ID: 'claude-secondary', OPENAI_API_KEY: 'must-be-removed' },
+      processAlive: () => false,
+      cancel: async (id, details) => cancelled.push({ id, details }),
+    } });
+    assert.deepEqual(cancelled.map((item) => item.id), ['same-job-id', 'same-job-id']);
+    assert.deepEqual(cancelled.map((item) => item.details.accountId), ['codex-secondary', 'codex-secondary']);
+    assert.deepEqual(cancelled.map((item) => item.details.env.CLAUDE_PLUGIN_DATA).sort(),
+      roots.map((item) => item.pluginData).sort(), 'each duplicate id must cancel through its own saved namespace');
+    assert.deepEqual(cancelled.map((item) => item.details.env.CODEX_HOME).sort(),
+      roots.map((item) => item.configDir).sort());
+    assert.ok(cancelled.every((item) => item.details.env.OPENAI_API_KEY == null));
+    assert.deepEqual(result.cancelled, ['same-job-id', 'same-job-id']);
+
+    const report = await codexJobs.list({ codexStateRoots: roots, now: NOW, psOutput: '', processAlive: () => false });
+    assert.deepEqual(report.jobs.map((item) => item.stateRoot).sort(), roots.map((item) => item.stateRoot).sort());
+    assert.ok(report.jobs.every((item) => item.accountId === 'codex-secondary'));
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('keep codex command is wired and rejects an unknown account before companion lookup', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-account-cli-'));
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'));
+    const result = spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'codex',
+      '--account', 'missing', 'context', '--json'], {
+      env: { ...process.env, KEEP_DIR: root }, encoding: 'utf8',
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /unknown account missing/);
+    assert.match(require('./keep.js').commandUsage('codex'), /task-resume-candidate/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

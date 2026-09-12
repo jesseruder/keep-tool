@@ -7,6 +7,7 @@ const fs = require('fs');
 const net = require('net');
 const path = require('path');
 const stalled = require('./stalled.js');
+const companionAccounts = require('./codex-companion-account.js');
 const { REAP_STALL_MS } = require('./codexjobs.js');
 
 const BROKER_IDLE_MS = 6 * 3600e3;
@@ -58,24 +59,27 @@ function isReapable(item) {
 
 async function discover(deps = {}) {
   const io = deps.fs || fs;
-  const root = deps.codexStateRoot || stalled.CODEX_STATE_ROOT;
+  const inventory = companionAccounts.inventoryStateRoots({ ...deps, fs: io });
   const now = nowOf(deps);
-  let entries = [];
-  let recordsKnown = true;
-  try { entries = io.readdirSync(root, { withFileTypes: true }); }
-  catch (error) { recordsKnown = error.code === 'ENOENT'; }
+  let recordsKnown = inventory.readable !== false;
   const records = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const statePath = path.join(root, entry.name);
-    const recordFile = path.join(statePath, 'broker.json');
-    const record = readRecord(recordFile, io);
-    if (!record) {
-      if (io.existsSync(recordFile)) recordsKnown = false;
-      continue;
+  for (const namespace of inventory.roots) {
+    let entries = [];
+    try { entries = io.readdirSync(namespace.stateRoot, { withFileTypes: true }); }
+    catch (error) { if (error.code !== 'ENOENT') recordsKnown = false; continue; }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const statePath = path.join(namespace.stateRoot, entry.name);
+      const recordFile = path.join(statePath, 'broker.json');
+      const record = readRecord(recordFile, io);
+      if (!record) {
+        if (io.existsSync(recordFile)) recordsKnown = false;
+        continue;
+      }
+      const jobs = await stalled.readCodexStateFile(path.join(statePath, 'state.json'), { ...deps, allowMissingState: true });
+      records.push({ record, recordFile, stateDir: entry.name, stateRoot: namespace.stateRoot,
+        accountId: namespace.accountId || null, jobs });
     }
-    const jobs = await stalled.readCodexStateFile(path.join(statePath, 'state.json'), { ...deps, allowMissingState: true });
-    records.push({ record, recordFile, stateDir: entry.name, jobs });
   }
   let output = '';
   let psKnown = true;
@@ -101,6 +105,7 @@ async function discover(deps = {}) {
     if (!lastActivityMs && row) lastActivityMs = now - stalled.elapsedMs(row.etime);
     const runningJobs = (source.jobs?.jobs || []).filter((job) => protectsBroker(job, allProcesses, now, deps)).length;
     const item = { pid: row?.pid ?? record.pid ?? null, endpoint, cwd, stateDir: source.stateDir ?? null,
+      stateRoot: source.stateRoot ?? null, accountId: source.accountId ?? null,
       sessionId: record.sessionId ?? null, recordFound: Boolean(source.record), processFound: Boolean(row),
       lastActivityMs, runningJobs, etime: row?.etime ?? null,
       recordFile: source.recordFile, pidFile, logFile, sessionDir };
@@ -174,16 +179,19 @@ function removeRecord(item, io) {
 
 function checkOrphanRecord(item, deps, io) {
   if (item.state !== 'orphan') return;
-  const root = deps.codexStateRoot || stalled.CODEX_STATE_ROOT;
-  let entries;
-  try { entries = io.readdirSync(root, { withFileTypes: true }); }
-  catch (error) { if (error.code === 'ENOENT') return; throw error; }
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const file = path.join(root, entry.name, 'broker.json');
-    const record = readRecord(file, io);
-    if (record?.endpoint === item.endpoint) throw new Error('broker record appeared');
-    if (!record && io.existsSync(file)) throw new Error('broker record unreadable');
+  const inventory = companionAccounts.inventoryStateRoots({ ...deps, fs: io });
+  if (inventory.readable === false) throw new Error('broker record inventory is incomplete');
+  for (const namespace of inventory.roots) {
+    let entries;
+    try { entries = io.readdirSync(namespace.stateRoot, { withFileTypes: true }); }
+    catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const file = path.join(namespace.stateRoot, entry.name, 'broker.json');
+      const record = readRecord(file, io);
+      if (record?.endpoint === item.endpoint) throw new Error('broker record appeared');
+      if (!record && io.existsSync(file)) throw new Error('broker record unreadable');
+    }
   }
 }
 

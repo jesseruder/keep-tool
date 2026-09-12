@@ -3600,12 +3600,13 @@ function renderCodexJobs(result) {
   if (result.discovery === 'partial') lines.push('Codex companion discovery is partial.');
   const rows = result.jobs.map((job) => [
     codexJobText(job.id),
+    codexJobText(job.accountId || 'legacy'),
     codexJobText(job.reason ? `${job.state} (${job.reason})` : job.state),
     codexJobDuration(job.idleMs),
     codexJobBytes(job.logBytes),
     codexJobText(job.summary).replace(/\s+/g, ' ').slice(0, 60),
   ]);
-  const headings = ['id', 'state', 'idle', 'log size', 'summary'];
+  const headings = ['id', 'account', 'state', 'idle', 'log size', 'summary'];
   const widths = headings.map((heading, index) => Math.max(heading.length, ...rows.map((row) => row[index].length)));
   lines.push(headings.map((heading, index) => heading.padEnd(widths[index])).join('  '));
   for (const row of rows) lines.push(row.map((value, index) => value.padEnd(widths[index])).join('  '));
@@ -3616,9 +3617,10 @@ function renderCodexJobs(result) {
     lines.push(`orphan ${codexJobText(agent.agent)} pid ${agent.pid}: ${codexJobText(agent.reason)} (${codexJobText(agent.cwd)})`);
   }
   if (result.orphanAgents?.known === false) lines.push(`Orphan agent discovery unavailable: ${codexJobText(result.orphanAgents.reason)}`);
-  lines.push('', 'brokers', 'pid  age  state  reason  cwd');
+  lines.push('', 'brokers', 'pid  account  age  state  reason  cwd');
   for (const broker of result.brokers || []) {
-    lines.push([broker.pid ?? '-', broker.etime ?? '-', broker.state, broker.reason, broker.cwd ?? '-'].map(codexJobText).join('  '));
+    lines.push([broker.pid ?? '-', broker.accountId || 'legacy', broker.etime ?? '-', broker.state,
+      broker.reason, broker.cwd ?? '-'].map(codexJobText).join('  '));
   }
   return lines.join('\n');
 }
@@ -3647,6 +3649,13 @@ commands['codex-jobs'] = async (argv) => {
   result.brokers = await codexBrokers.list();
   if (o.json) return process.stdout.write(JSON.stringify(result, null, 2) + '\n');
   console.log(renderCodexJobs(result));
+};
+
+commands.codex = async (argv) => {
+  try {
+    const result = await require('./codex-companion-account.js').run(argv, { root: ROOT, env: process.env });
+    if (result.code) process.exitCode = result.code;
+  } catch (error) { die(error.message || String(error)); }
 };
 
 commands.standup = async (argv) => {
@@ -6333,6 +6342,9 @@ ${stepUsage()}
   keep stalled [--json]
   keep codex-jobs [--json] [--reap] [--dry]
     List companion jobs and brokers; --reap cleans stale jobs, pollers, and brokers.
+  keep codex [--account <codex-id>] context [--json]
+  keep codex [--account <codex-id>] <task|task-resume-candidate|status|result|cancel> [args]
+    Run the installed Codex companion with isolated account state and credentials.
   keep standup [--since "YYYY-MM-DD HH:MM"|ISO] [--dry] [--show]
   keep ideas [--dry] [--model <m>]
   keep landed [--dry] [--only <id>]
@@ -6453,6 +6465,7 @@ module.exports = {
   taskForSession, deployCommand, deployEntry, recordDeploy, redactCommand,
   stepMatchForInput, guardStepCommand, recordStepRun, codexToolInput, codexExitCode,
   codexJobText, renderCodexJobs,
+  codexCommandCli: commands.codex,
   commandUsage, helpText, formatOpenResult, openCommand: commands.open, postOpen, OPEN_MESSAGE_LIMIT, OPEN_MESSAGE_ERROR, LAUNCH_MODEL_RE,
   restoreCommandCli: commands.restore, resumeCommandCli: commands.resume, resumeCommand,
   accountsCommandCli: commands.accounts, handoffCommandCli: commands.handoff, transferCommandCli: commands.transfer,

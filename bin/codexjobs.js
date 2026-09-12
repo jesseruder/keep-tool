@@ -1,6 +1,7 @@
 'use strict';
 
 const stalled = require('./stalled.js');
+const companionAccounts = require('./codex-companion-account.js');
 
 const REAP_STALL_MS = 20 * 60e3;
 const ACTION_TIMEOUT_MS = 10e3;
@@ -14,6 +15,10 @@ function idleMs(job, now) {
   const logMtime = stalled.timeMs(job.logMtime ?? job.logMtimeMs);
   const lastActivity = Math.max(updatedAt, logMtime);
   return lastActivity ? Math.max(0, now - lastActivity) : 0;
+}
+
+function sourceKey(job) {
+  return `${job.companionStateRoot || job.stateRoot || ''}\0${job.accountId || ''}\0${job.id}`;
 }
 
 async function inspect(deps = {}, only) {
@@ -41,6 +46,8 @@ async function inspect(deps = {}, only) {
     })[0];
     return {
       id: String(job.id),
+      accountId: job.accountId || null,
+      stateRoot: job.companionStateRoot || null,
       sessionId: typeof job.sessionId === 'string' ? job.sessionId : null,
       pid: Number.isInteger(Number(job.pid)) && Number(job.pid) > 0 ? Number(job.pid) : null,
       state: finding ? finding.status : 'running',
@@ -66,7 +73,7 @@ async function inspect(deps = {}, only) {
   const discoveryState = !discovery.known ? 'unknown' : discovery.complete === true ? 'ok' : 'partial';
   return {
     report: { discovery: discoveryState, jobs, orphans },
-    workspaceById: new Map(discovery.jobs.map((job) => [String(job.id), job.workspaceRoot])),
+    sourceByJob: new Map(discovery.jobs.map((job) => [sourceKey(job), job])),
   };
 }
 
@@ -76,12 +83,17 @@ async function list(deps = {}) {
   return report;
 }
 
-async function cancelJob(id, cwd, script, deps) {
-  if (deps.cancel) return deps.cancel(id, { cwd, timeout: ACTION_TIMEOUT_MS, script });
-  return stalled.execFileOutput(process.execPath, [script, 'cancel', id], {
+async function cancelJob(job, cwd, script, deps) {
+  const env = job.companionPluginData ? companionAccounts.environmentForNamespace({
+    accountId: job.accountId, configDir: job.companionConfigDir,
+    pluginData: job.companionPluginData, builtIn: job.companionBuiltIn, managed: job.companionManaged,
+  }, { env: deps.env || process.env }) : deps.env || process.env;
+  if (deps.cancel) return deps.cancel(job.id, { cwd, timeout: ACTION_TIMEOUT_MS, script, env, accountId: job.accountId });
+  return stalled.execFileOutput(process.execPath, [script, 'cancel', job.id], {
     cwd,
     encoding: 'utf8',
     timeout: ACTION_TIMEOUT_MS,
+    env,
   }, deps);
 }
 
@@ -145,9 +157,9 @@ async function revalidateOrphan(orphan, deps, only) {
 
 async function reap({ dry = false, only, deps = {} } = {}) {
   const snapshot = deps.list
-    ? { report: await deps.list(deps), workspaceById: new Map() }
+    ? { report: await deps.list(deps), sourceByJob: new Map() }
     : await inspect(deps, only);
-  const { report, workspaceById } = snapshot;
+  const { report, sourceByJob } = snapshot;
   const result = { cancelled: [], killed: [], skipped: [] };
   if (deps.includeAgents) {
     const agents = await require('./orphan-agents').reap({ dry, only: only?.agents, deps: deps.agentDeps });
@@ -192,7 +204,8 @@ async function reap({ dry = false, only, deps = {} } = {}) {
     }
     if (!dry) {
       try {
-        await cancelJob(job.id, workspaceById.get(job.id) || deps.cwd || process.cwd(), script, deps);
+        const source = sourceByJob.get(sourceKey(job)) || job;
+        await cancelJob(source, source.workspaceRoot || deps.cwd || process.cwd(), script, deps);
       } catch (error) {
         result.skipped.push({ id: job.id, why: `cancel failed: ${error.message || error}` });
         continue;

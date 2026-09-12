@@ -269,6 +269,26 @@ test('missing companion state is unknown rather than an empty successful discove
   assert.deepEqual(await stalled.discoverCodexJobs({ codexStateRoot: stateRoot }), { jobs: [], known: false });
 });
 
+test('companion state inventory keeps account and namespace identity on jobs', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-stalled-codex-accounts-'));
+  try {
+    const sources = ['codex-primary', 'codex-secondary'].map((accountId) => {
+      const stateRoot = path.join(root, accountId, 'state');
+      const workspace = path.join(stateRoot, 'workspace');
+      fs.mkdirSync(workspace, { recursive: true });
+      fs.writeFileSync(path.join(workspace, 'state.json'), JSON.stringify({ jobs: [{
+        id: `${accountId}-job`, status: 'running', updatedAt: Date.now(),
+      }] }));
+      return { accountId, stateRoot, pluginData: path.dirname(stateRoot), configDir: path.join(root, `${accountId}-home`) };
+    });
+    const result = await stalled.readCodexStateJobs({ codexStateRoots: sources });
+    assert.equal(result.readable, true);
+    assert.equal(result.missing, false);
+    assert.deepEqual(result.jobs.map((job) => [job.accountId, job.companionStateRoot]),
+      sources.map((source) => [source.accountId, source.stateRoot]));
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('fallback companion status and ps use injected asynchronous execFile calls', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-stalled-async-'));
   const stateRoot = path.join(root, 'companion-state');
