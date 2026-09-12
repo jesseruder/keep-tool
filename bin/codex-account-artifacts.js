@@ -91,20 +91,34 @@ function readMeta(file) {
   try {
     const before = fs.fstatSync(fd);
     if (!before.isFile()) throw failure(`Codex rollout is not a regular file: ${file}`);
-    const length = Math.min(before.size, MAX_META_BYTES);
-    const buffer = Buffer.alloc(length);
-    fs.readSync(fd, buffer, 0, length, 0);
-    const after = fs.fstatSync(fd);
-    for (const key of ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs']) {
-      if (before[key] !== after[key]) throw failure(`Codex rollout changed while reading metadata: ${file}`,
-        'KEEP_CODEX_ARTIFACT_SOURCE_CHANGED');
+    const chunks = [];
+    let position = 0, newline = false;
+    while (position < before.size && position < MAX_META_BYTES && !newline) {
+      const length = Math.min(4096, before.size - position, MAX_META_BYTES - position);
+      const buffer = Buffer.allocUnsafe(length);
+      const read = fs.readSync(fd, buffer, 0, length, position);
+      if (!read) break;
+      const end = buffer.subarray(0, read).indexOf(10);
+      chunks.push(buffer.subarray(0, end < 0 ? read : end));
+      position += end < 0 ? read : end + 1;
+      newline = end >= 0;
     }
-    const newline = buffer.indexOf(10);
-    if (newline < 0 && before.size > buffer.length) {
+    if (!newline && before.size > position) {
       throw failure(`Codex rollout metadata exceeds ${MAX_META_BYTES} bytes: ${file}`, 'KEEP_CODEX_ARTIFACT_SCAN');
     }
+    const buffer = Buffer.concat(chunks);
+    const expected = newline ? Buffer.concat([buffer, Buffer.from('\n')]) : buffer;
+    const verify = Buffer.alloc(expected.length);
+    const verified = fs.readSync(fd, verify, 0, verify.length, 0);
+    const after = fs.fstatSync(fd);
+    if (!after.isFile() || before.dev !== after.dev || before.ino !== after.ino
+        || verified !== expected.length || !verify.equals(expected)
+        || !newline && before.size !== after.size) {
+      throw failure(`Codex rollout changed while reading metadata: ${file}`,
+        'KEEP_CODEX_ARTIFACT_SOURCE_CHANGED');
+    }
     let row;
-    try { row = JSON.parse(buffer.subarray(0, newline < 0 ? buffer.length : newline).toString('utf8')); }
+    try { row = JSON.parse(buffer.toString('utf8')); }
     catch { throw failure(`Codex rollout has invalid session metadata: ${file}`, 'KEEP_CODEX_ARTIFACT_SCAN'); }
     if (row?.type !== 'session_meta' || !row.payload) {
       throw failure(`Codex rollout is missing session metadata: ${file}`, 'KEEP_CODEX_ARTIFACT_SCAN');
@@ -116,7 +130,7 @@ function readMeta(file) {
       'KEEP_CODEX_ARTIFACT_SCAN');
     const child = Boolean(parent || row.payload.originator === 'Claude Code'
       || row.payload.thread_source === 'subagent' || row.payload.source?.subagent);
-    return { id, parent, child, meta: row.payload };
+    return { value: { id, parent, child, meta: row.payload }, bytes: expected.length };
   } finally { fs.closeSync(fd); }
 }
 
@@ -143,13 +157,13 @@ function scanProfile(profile, options = {}) {
     }
     if (!stat.isFile()) throw failure(`Codex rollout tree contains an unsupported entry: ${target}`);
     if (!path.basename(target).startsWith('rollout-') || !target.endsWith('.jsonl')) return;
-    readBytes += Math.min(stat.size, MAX_META_BYTES);
+    const parsed = readMeta(target);
+    readBytes += parsed.bytes;
     if (readBytes > byteLimit) {
       throw failure(`Codex rollout scan is incomplete after ${byteLimit} metadata bytes`,
         'KEEP_CODEX_ARTIFACT_SCAN');
     }
-    const parsed = readMeta(target);
-    const entry = { ...parsed, file: target, relative };
+    const entry = { ...parsed.value, file: target, relative };
     result.entries.push(entry);
     const matches = result.byId.get(entry.id) || [];
     matches.push(entry); result.byId.set(entry.id, matches);
@@ -255,7 +269,7 @@ function verifyRestart(root, rootId, index, options = {}, stopped = false) {
     if (matches[0]) return matches[0].file;
     const file = (options.resolveChild || require('./codex').findRolloutFile)(id);
     if (!file) throw failure(`Codex child rollout ${id} is missing`, 'KEEP_CODEX_ARTIFACT_SOURCE');
-    const parsed = { ...readMeta(file), file: path.resolve(file), relative: '' };
+    const parsed = { ...readMeta(file).value, file: path.resolve(file), relative: '' };
     externallyResolved.set(id, parsed);
     return parsed.file;
   };

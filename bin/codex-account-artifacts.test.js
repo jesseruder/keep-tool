@@ -281,9 +281,33 @@ test('profile overlap and incomplete bounded scans fail closed', () => {
       { id: 'nested', agent: 'codex', configDir: path.join(f.profiles.a, 'nested') }, options(f)), /unavailable|overlap/);
     assert.throws(() => artifacts.preflight(f.sid, f.records.a, f.records.b,
       { ...options(f), maxScanEntries: 1 }), (error) => error.code === 'KEEP_CODEX_ARTIFACT_SCAN');
+    fs.appendFileSync(f.interactedFile, 'x'.repeat(1024 * 1024));
+    assert.equal(artifacts.preflight(f.sid, f.records.a, f.records.b,
+      { ...options(f), maxScanBytes: 4096 }).sessionId, f.sid,
+    'large rollout bodies do not consume the first-line metadata budget');
     assert.throws(() => artifacts.preflight(f.sid, f.records.a, f.records.b,
       { ...options(f), maxScanBytes: 1 }), (error) => error.code === 'KEEP_CODEX_ARTIFACT_SCAN');
     assert.throws(() => artifacts.preflight(f.sid, f.records.a, f.records.b,
       { ...options(f), maxScanDepth: 0 }), (error) => error.code === 'KEEP_CODEX_ARTIFACT_SCAN');
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('unrelated active rollouts may append while their immutable metadata line is scanned', (t) => {
+  const f = fixture();
+  try {
+    const originalRead = fs.readSync;
+    const active = fs.statSync(f.interactedFile);
+    let appended = false;
+    t.mock.method(fs, 'readSync', function (fd, ...args) {
+      const read = originalRead.call(fs, fd, ...args);
+      const stat = fs.fstatSync(fd);
+      if (!appended && stat.dev === active.dev && stat.ino === active.ino) {
+        appended = true;
+        fs.appendFileSync(f.interactedFile, 'active unrelated turn\n');
+      }
+      return read;
+    });
+    assert.equal(artifacts.preflight(f.sid, f.records.a, f.records.b, options(f)).sessionId, f.sid);
+    assert.equal(appended, true);
+  } finally { t.mock.restoreAll(); fs.rmSync(f.base, { recursive: true, force: true }); }
 });
