@@ -3899,6 +3899,31 @@ test('standalone post-spawn setup failure exposes and reuses the exact existing 
   } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
 });
 
+test('standalone post-spawn regular errors retain the HTTP existing-pane receipt', async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-standalone-http-error-'));
+  try {
+    const host = recordingHost((type) => type === 'spawn'
+      ? { pane: { id: 'http-error-pane', pid: 61, createdAt: 62 } }
+      : {});
+    await assert.rejects(openSession({ fresh: true, cwd, agent: 'claude',
+      accountId: 'claude/default', requestId: 'http-error-request' }, {
+      host, listHostPanes: async () => [],
+      waitForHostAgent: async () => { throw new Error('host observation failed'); },
+    }), (error) => {
+      assert.equal(error instanceof InjectionError, true, 'the /api/open route serializes InjectionError details');
+      assert.equal(error.status, 502);
+      assert.equal(error.message, 'host observation failed');
+      assert.equal(error.extra.code, 'OPEN_EXISTING_PANE');
+      assert.match(error.extra.launch.sessionId, /^[A-Za-z0-9_-]+$/);
+      assert.deepEqual({ ...error.extra.launch, sessionId: '<assigned>' }, {
+        pane: 'http-error-pane', sessionId: '<assigned>', accountId: 'claude/default',
+        agent: 'claude', recoverable: true,
+      });
+      return true;
+    });
+  } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+});
+
 test('portable transfer API lists safe records and launches only an existing transfer id', async () => {
   const id = 'a'.repeat(64);
   const safe = { id, status: 'prepared', sourceSessionId: 'source-session-1234', sourceAgent: 'codex',

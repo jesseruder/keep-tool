@@ -4139,9 +4139,14 @@ async function openSession(body, deps = {}) {
   } catch (error) {
     if (error?.extra?.awaitingSetup) error.extra.launch = { pane: launch.pane, sessionId: launch.sessionId, accountId: launch.accountId };
     if (freshStandalone) {
-      error.extra = { ...(error.extra || {}), code: 'OPEN_EXISTING_PANE',
+      const extra = { ...(error.extra || {}), code: 'OPEN_EXISTING_PANE',
         launch: { pane: launch.pane, sessionId: launch.sessionId || null, accountId: account.id,
           agent, recoverable: true } };
+      if (!(error instanceof InjectionError)) {
+        throw new InjectionError(Number(error?.status) || 502,
+          String(error?.message || error).slice(0, 500), extra);
+      }
+      error.extra = extra;
     }
     throw error;
   } finally {
