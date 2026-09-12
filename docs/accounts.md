@@ -8,7 +8,7 @@ When you add a Codex profile, Keep immediately adopts the current default Codex 
 
 ## Choose an account in the desktop app
 
-The project rail and Watch launch controls open a **New session** chooser. Select **Plain shell**, **Claude Code**, or **Codex**. Agent sessions include an account selector and an optional model override for that launch. Fresh Claude sessions prefill Fable 5.1; clearing the model uses the account default. Plain shells keep their normal shell configuration. These choices do not change global account or model settings.
+The project rail and Watch launch controls open a **New session** chooser. Select **Plain shell**, **Claude Code**, or **Codex**, and edit the launch directory when you want to work somewhere other than the current project. The directory must be an absolute path to an existing directory. Agent sessions include an account selector and an optional model override for that launch. Fresh Claude sessions prefill Fable 5.1; clearing the model uses the account default. Plain shells keep their normal shell configuration. These choices do not change global account or model settings.
 
 **Reopen** in Fleet, Triage, and Watch shows the conversation's recorded account. Keeping it resumes normally. Choosing another account of the same provider performs a verified native transfer and opens the conversation without sending an instruction to continue working. The source may first reopen on its recorded account so Keep can verify and transfer it safely. If native transfer is unavailable, **Transfer context…** offers the separate, explicit fresh-conversation workflow below.
 

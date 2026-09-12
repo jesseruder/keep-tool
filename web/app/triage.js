@@ -130,11 +130,12 @@ function renderRail(ctx, items) {
     button.blur();
     try {
       await ctx.newSession(shell.path, shell.name, async (pane, selection) => {
+        const project = ctx.projectOf(selection.cwd);
         const title = ctx.entityForPane(pane.id).title;
         const pinned = await ctx.pinPane(pane.id, title);
         if (!pinned) {
           ctx.refresh();
-          ctx.toast(`${selection.kind === 'shell' ? 'Shell' : selection.kind === 'claude' ? 'Claude Code' : 'Codex'} opened in ${shell.name}, but pinning failed; it is listed in Watch`);
+          ctx.toast(`${selection.kind === 'shell' ? 'Shell' : selection.kind === 'claude' ? 'Claude Code' : 'Codex'} opened in ${project.name}, but pinning failed; it is listed in Watch`);
           return;
         }
         // Creating a session is explicit navigation, including from waiting-only
@@ -149,7 +150,7 @@ function renderRail(ctx, items) {
         ctx.state.focused = true;
         ctx.state.focusPane = pane.id;
         ctx.refresh();
-        ctx.toast(`${selection.kind === 'shell' ? 'Shell' : selection.kind === 'claude' ? 'Claude Code' : 'Codex'} opened in ${shell.name}`);
+        ctx.toast(`${selection.kind === 'shell' ? 'Shell' : selection.kind === 'claude' ? 'Claude Code' : 'Codex'} opened in ${project.name}`);
       });
     } finally { button.disabled = false; }
   });

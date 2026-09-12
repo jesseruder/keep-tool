@@ -495,20 +495,23 @@ async function newSession(cwd, name, onOpened) {
   let boundPane = null;
   let openedPane = null;
   await openSessionChooser(ctx, {
-    title: 'New session', description: 'Choose what to open in this project.', project: cwd,
+    title: 'New session', description: 'Choose what to open and where.', project: cwd,
+    directory: cwd, editableDirectory: true,
     kinds: ['shell', 'claude', 'codex'], initialKind: 'shell', confirmLabel: 'Open session',
     models: { claude: 'claude-fable-5-1', codex: '' },
     async onSubmit(selection) {
       state.pendingFocus = true;
       try {
         let pane;
-        try { pane = await startChosenSession(cwd, name, selection, requestId); }
+        const launchCwd = selection.cwd;
+        const launchName = projectOf(launchCwd).name || name;
+        try { pane = await startChosenSession(launchCwd, launchName, selection, requestId); }
         catch (error) {
           const launch = error?.body?.code === 'OPEN_EXISTING_PANE' ? error.body.launch : null;
           if (!launch?.pane) throw error;
           await reload();
           pane = paneMap().get(launch.pane) || { id: launch.pane,
-            meta: { agent: launch.agent, accountId: launch.accountId, project: cwd } };
+            meta: { agent: launch.agent, accountId: launch.accountId, project: launchCwd } };
           if (boundPane !== pane.id) { await onOpened(pane, selection); boundPane = pane.id; openedPane = pane.id; }
           const boundError = new Error(`${error.message} The existing pane is open for inspection; retry resumes setup without creating another.`);
           boundError.body = error.body;

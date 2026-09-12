@@ -230,7 +230,7 @@ export function installWatchControls(ctx) {
         await ctx.saveLayouts();
         await ctx.reload();
         const kind = selection.kind === 'shell' ? 'Shell' : selection.kind === 'claude' ? 'Claude Code' : 'Codex';
-        ctx.toast(`${kind} opened in ${ctx.projectOf(cwd).name}`);
+        ctx.toast(`${kind} opened in ${ctx.projectOf(selection.cwd).name}`);
       });
     } finally { button.disabled = false; }
   });

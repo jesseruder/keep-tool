@@ -24,7 +24,7 @@ test('rail chooser cancels without spawning and freezes one explicit agent launc
   await page.locator('#rail [data-shell]').click();
   await expect(chooser(page)).toBeVisible();
   await expect(chooser(page).locator('[data-launch-kind]')).toHaveValue('shell');
-  await expect(chooser(page)).toContainText(fixture.state.sessions[0].project);
+  await expect(chooser(page).locator('[data-launch-directory]')).toHaveValue(fixture.state.sessions[0].project);
   await chooser(page).locator('[data-launch-cancel]').last().click();
   await expect(chooser(page)).not.toBeVisible();
   expect(requests('/api/panes/spawn')).toHaveLength(0);
@@ -32,7 +32,10 @@ test('rail chooser cancels without spawning and freezes one explicit agent launc
 
   fixture.configure({ openDelay: 350 });
   await page.locator('#rail [data-shell]').click();
+  const directory = `${fixture.state.sessions[0].project}/edited-worktree`;
+  await chooser(page).locator('[data-launch-directory]').fill(directory);
   await chooser(page).locator('[data-launch-kind]').selectOption('claude');
+  await expect(chooser(page).locator('[data-launch-directory]')).toHaveValue(directory);
   await expect(chooser(page).locator('[data-launch-model]')).toHaveValue('claude-fable-5-1');
   await chooser(page).locator('[data-launch-account]').selectOption('claude-two');
   await chooser(page).locator('[data-launch-model]').fill('claude-sonnet-4-5');
@@ -40,12 +43,13 @@ test('rail chooser cancels without spawning and freezes one explicit agent launc
   await expect(chooser(page).locator('[data-launch-kind]')).toBeDisabled();
   await expect(chooser(page).locator('[data-launch-account]')).toBeDisabled();
   await expect(chooser(page).locator('[data-launch-model]')).toBeDisabled();
+  await expect(chooser(page).locator('[data-launch-directory]')).toBeDisabled();
   await expect(chooser(page).locator('[data-launch-cancel]').last()).toBeDisabled();
   await page.keyboard.press('Escape');
   await expect(chooser(page)).toBeVisible();
   await expect(chooser(page)).not.toBeVisible();
   expect(requests('/api/open')).toHaveLength(1);
-  expect(requests('/api/open')[0].body).toMatchObject({ fresh: true, cwd: fixture.state.sessions[0].project,
+  expect(requests('/api/open')[0].body).toMatchObject({ fresh: true, cwd: directory,
     agent: 'claude', accountId: 'claude-two', model: 'claude-sonnet-4-5' });
   expect(typeof requests('/api/open')[0].body.requestId).toBe('string');
   expect(requests('/api/panes/spawn')).toHaveLength(0);
@@ -56,10 +60,14 @@ test('post-spawn setup error focuses its saved pane and retry cannot duplicate i
   await page.locator('#rail [data-shell]').click();
   await chooser(page).locator('[data-launch-kind]').selectOption('codex');
   await chooser(page).locator('[data-launch-account]').selectOption('codex-two');
+  const directory = `${fixture.state.sessions[0].project}/recoverable-worktree`;
+  await chooser(page).locator('[data-launch-directory]').fill(`  ${directory}  `);
   await chooser(page).locator('[data-launch-submit]').click();
   await expect(chooser(page).locator('[role=alert]')).toContainText('existing pane is open for inspection');
   await expect(chooser(page).locator('[data-launch-kind]')).toBeDisabled();
   await expect(chooser(page).locator('[data-launch-account]')).toBeDisabled();
+  await expect(chooser(page).locator('[data-launch-directory]')).toBeDisabled();
+  await expect(chooser(page).locator('[data-launch-directory]')).toHaveValue(directory);
   await expect(chooser(page).locator('[data-launch-submit]')).toHaveText('Resume setup');
   expect(requests('/api/open')).toHaveLength(1);
   const requestId = requests('/api/open')[0].body.requestId;
@@ -71,6 +79,7 @@ test('post-spawn setup error focuses its saved pane and retry cannot duplicate i
   await expect(chooser(page)).not.toBeVisible();
   expect(requests('/api/open')).toHaveLength(2);
   expect(requests('/api/open').map(request => request.body.requestId)).toEqual([requestId, requestId]);
+  expect(requests('/api/open').map(request => request.body.cwd)).toEqual([directory, directory]);
   expect(fixture.state.sessions.filter(session => session.id.startsWith('opened-'))).toHaveLength(1);
 });
 
@@ -79,11 +88,22 @@ test('Watch new session keeps the selected project and Plain shell option', asyn
   const project = await page.locator('#shellProject').inputValue();
   await page.locator('#spawnShell').click();
   await expect(chooser(page).locator('[data-launch-kind]')).toHaveValue('shell');
-  await expect(chooser(page)).toContainText(project);
+  await expect(chooser(page).locator('[data-launch-directory]')).toHaveValue(project);
+  await chooser(page).locator('[data-launch-directory]').fill('   ');
+  await chooser(page).locator('[data-launch-submit]').click();
+  await expect(chooser(page).locator('[role=alert]')).toContainText('Directory is required');
+  await expect(chooser(page).locator('[data-launch-directory]')).toBeFocused();
+  expect(requests('/api/panes/spawn')).toHaveLength(0);
+  const directory = `${project}/alternate-shell-project`;
+  await chooser(page).locator('[data-launch-directory]').fill(directory);
+  await chooser(page).locator('[data-launch-kind]').selectOption('codex');
+  await expect(chooser(page).locator('[data-launch-directory]')).toHaveValue(directory);
+  await chooser(page).locator('[data-launch-kind]').selectOption('shell');
+  await expect(chooser(page).locator('[data-launch-directory]')).toHaveValue(directory);
   await chooser(page).locator('[data-launch-submit]').click();
   await expect(chooser(page)).not.toBeVisible();
   expect(requests('/api/panes/spawn')).toHaveLength(1);
-  expect(requests('/api/panes/spawn')[0].body.cwd).toBe(project);
+  expect(requests('/api/panes/spawn')[0].body).toEqual({ cwd: directory, name: 'alternate-shell-project' });
   await expect(page.locator('.wpane[data-pane^="shell-"]')).toBeVisible();
 });
 
@@ -97,6 +117,7 @@ test('Triage and Watch Reopen share the recorded-account chooser', async ({ page
   await page.locator('#stage [data-reopen]').click();
   await expect(chooser(page).locator('[data-launch-account]')).toHaveValue('claude-main');
   await expect(chooser(page).locator('[data-launch-model]')).toHaveCount(0);
+  await expect(chooser(page).locator('[data-launch-directory]')).toHaveCount(0);
   await chooser(page).locator('[data-launch-cancel]').last().click();
   expect(requests('/api/open')).toHaveLength(0);
 
@@ -189,6 +210,7 @@ test('partial review launch closes the picker and exposes its persisted recovery
   fixture.configure({ reviewPartialOnce: true }); fixture.publish();
   await page.locator('[data-mode=review-queue]').click();
   await page.locator('[data-review-action=start]').click();
+  await expect(chooser(page).locator('[data-launch-directory]')).toHaveCount(0);
   await chooser(page).locator('[data-launch-account]').selectOption('claude-two');
   await chooser(page).locator('[data-launch-model]').fill('claude-fable-5-1');
   await chooser(page).locator('[data-launch-submit]').click();

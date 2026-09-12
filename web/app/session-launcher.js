@@ -34,6 +34,7 @@ export function openSessionChooser(ctx, options) {
   const state = {
     kind: initialKind,
     accountId: recordedAccountMissing ? '' : preferredAccount(ctx, initialKind, options.accountId),
+    directory: String(options.directory ?? options.project ?? ''),
     models: {
       claude: options.models?.claude ?? (options.agent === 'claude' ? options.model || '' : ''),
       codex: options.models?.codex ?? (options.agent === 'codex' ? options.model || '' : ''),
@@ -56,12 +57,15 @@ export function openSessionChooser(ctx, options) {
     }).join('')}</select></label>`;
     const modelField = state.kind === 'shell' || options.showModel === false ? ''
       : `<label>Model <span>Optional; blank uses the account default</span><input data-launch-model autocomplete="off" ${state.busy || state.bound ? 'disabled' : ''} value="${ctx.esc(state.models[state.kind] || '')}" placeholder="Account default"></label>`;
+    const projectField = options.editableDirectory
+      ? `<label class="wide">Directory <span>Absolute path to an existing directory</span><input data-launch-directory autocomplete="off" spellcheck="false" ${state.busy || state.bound ? 'disabled' : ''} value="${ctx.esc(state.directory)}" placeholder="/absolute/path/to/project"></label>`
+      : `<div class="session-launch-value wide"><span>Project</span><strong class="mono">${ctx.esc(options.project || 'Unknown project')}</strong></div>`;
     const unavailable = noAccount ? `No configured ${labels[state.kind]} account is available.`
       : recordedAccountMissing && !state.accountId ? `${options.accountId ? `The recorded account ${options.accountId}` : 'The recorded account identity'} is unavailable. Choose another account explicitly or transfer context.` : '';
     modal.dataset.launchRun = runId;
     modal.innerHTML = `<form method="dialog" class="session-launch-card">
       <header><div><span class="eyebrow">${ctx.esc(options.eyebrow || 'Session')}</span><h2 id="session-launch-title">${ctx.esc(options.title || 'New session')}</h2><p>${ctx.esc(options.description || '')}</p></div><button class="btn" type="button" data-launch-cancel ${state.busy ? 'disabled' : ''} aria-label="Close">Close</button></header>
-      <div class="session-launch-fields">${providerField}${accountField}${modelField}<div class="session-launch-value wide"><span>Project</span><strong class="mono">${ctx.esc(options.project || 'Unknown project')}</strong></div></div>
+      <div class="session-launch-fields">${providerField}${accountField}${modelField}${projectField}</div>
       ${unavailable ? `<p class="session-launch-error" role="alert">${ctx.esc(unavailable)}</p>` : state.error ? `<p class="session-launch-error" role="alert">${ctx.esc(state.error)}</p>` : ''}
       <footer>${options.onTransfer ? `<button class="btn" type="button" data-launch-transfer ${state.busy || state.bound ? 'disabled' : ''}>Transfer context…</button>` : '<span></span>'}<button class="btn" type="button" data-launch-cancel ${state.busy ? 'disabled' : ''}>Cancel</button><button class="btn primary" type="submit" data-launch-submit ${state.busy || noAccount || !state.accountId && state.kind !== 'shell' ? 'disabled' : ''}>${ctx.esc(state.busy ? 'Opening…' : state.bound ? 'Resume setup' : options.confirmLabel || 'Open')}</button></footer>
     </form>`;
@@ -76,16 +80,25 @@ export function openSessionChooser(ctx, options) {
       if (wasEmpty) render();
     });
     modal.querySelector('[data-launch-model]')?.addEventListener('input', (event) => { state.models[state.kind] = event.target.value; });
+    modal.querySelector('[data-launch-directory]')?.addEventListener('input', (event) => { state.directory = event.target.value; });
     modal.querySelectorAll('[data-launch-cancel]').forEach((button) => button.addEventListener('click', () => { if (!state.busy) modal.close(); }));
     modal.querySelector('[data-launch-transfer]')?.addEventListener('click', () => { if (!state.busy) { modal.close(); options.onTransfer(); } });
     modal.querySelector('form').addEventListener('submit', async (event) => {
       event.preventDefault();
       if (state.busy || noAccount) return;
+      const directory = state.directory.trim();
+      if (options.editableDirectory && !directory) {
+        state.error = 'Directory is required.'; render();
+        queueMicrotask(() => modal.querySelector('[data-launch-directory]')?.focus());
+        return;
+      }
+      if (options.editableDirectory) state.directory = directory;
       state.busy = true; state.error = ''; render();
       try {
         await options.onSubmit({ kind: state.kind, agent: state.kind === 'shell' ? null : state.kind,
           accountId: state.kind === 'shell' ? null : state.accountId,
-          model: state.kind === 'shell' ? '' : String(state.models[state.kind] || '').trim() });
+          model: state.kind === 'shell' ? '' : String(state.models[state.kind] || '').trim(),
+          ...(options.editableDirectory ? { cwd: directory } : {}) });
         if (modal.open && modal.dataset.launchRun === runId) modal.close();
       } catch (error) {
         if (!modal.open || modal.dataset.launchRun !== runId) return;
