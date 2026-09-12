@@ -117,6 +117,7 @@ async function fixture(options = {}) {
   const server = http.createServer();
   const installed = keepConsole.install({
     server,
+    relayMode: 'inline',
     root,
     token: options.token || 'secret',
     isLocal: options.isLocal || (() => true),

@@ -5476,6 +5476,7 @@ function startWtGcScheduler(options = {}) {
 
 function start(deps = {}) {
   health.record('daemon', { at: Date.now(), pid: process.pid, version: health.VERSION });
+  let consoleServer = null;
   const shutdown = () => {
     if (inFlightSwap) {
       const action = shutdownSettingsRepair(inFlightSwap, readClaudeSettingsModel());
@@ -5490,6 +5491,7 @@ function start(deps = {}) {
         }
       }
     }
+    consoleServer?.close();
     process.exit(0);
   };
   process.on('SIGTERM', shutdown);
@@ -6184,10 +6186,12 @@ function start(deps = {}) {
     }
   });
 
-  keepConsole.install({
+  consoleServer = keepConsole.install({
     server,
     hostClient: () => require('./hostclient.js').connect({ timeoutMs: HOST_CONNECT_TIMEOUT_MS }),
     hostRequest,
+    hostSock: require('./hostclient.js').socketPath(),
+    hostConnectTimeoutMs: HOST_CONNECT_TIMEOUT_MS,
     isLocal,
     token,
     root: keep.ROOT,
