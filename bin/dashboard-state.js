@@ -36,6 +36,7 @@ function sessionSummary(session) {
   const {
     observation: _observation,
     runtime: _runtime,
+    backgroundJobs: _backgroundJobs,
     ...summary
   } = session;
   return { ...summary, _detailVersion: detailVersion(session) };

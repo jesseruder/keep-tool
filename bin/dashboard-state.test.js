@@ -54,7 +54,8 @@ test('lightweight dashboard state preserves list context and moves opened conten
     sessions: [{
       id: 'session', title: 'Live work', state: 'waiting', stateLabel: 'Waiting', taskId: 'card',
       lastAssistant: 'Short update', lastAssistantFull: 'Full transcript tail', observation: { evidence: ['large'] },
-      runtime: { process: 'details' }, activity: { background: { pending: true } },
+      runtime: { process: 'details' }, backgroundJobs: [{ id: 'ledger-entry', status: 'completed' }],
+      pendingBackground: true, activity: { background: { pending: true } },
     }],
     reviewQueue: { counts: { 'needs-decision': 1 }, items: [{
       id: 'finding:card:key', type: 'finding', status: 'needs-decision', title: 'Finding', card: 'card',
@@ -83,6 +84,8 @@ test('lightweight dashboard state preserves list context and moves opened conten
   assert.equal(summary.sessions[0].lastAssistantFull, 'Full transcript tail');
   assert.equal(summary.sessions[0].observation, undefined);
   assert.equal(summary.sessions[0].runtime, undefined);
+  assert.equal(summary.sessions[0].backgroundJobs, undefined);
+  assert.equal(summary.sessions[0].pendingBackground, true);
   assert.equal(summary.sessions[0].lastAssistant, 'Short update');
   assert.deepEqual(summary.sessions[0].activity, state.sessions[0].activity);
   assert.equal(summary.reviewQueue.items[0].body, undefined);

@@ -17,14 +17,16 @@ test('isolated browser: review queue decisions, drafts, notification links, and 
   const eventClients = new Set();
   const detailGets = [];
   const reviewSearches = [];
+  let failReviewSearch = true;
   const now = Date.now();
-  const idea = { id: 'idea:card-idea', type: 'idea', card: 'card-idea', title: 'Searchable workflow idea', body: 'Make the owner decision flow concise.', project: '/tmp/middle-project', status: 'needs-decision', at: now - 1000, sessions: [] };
+  const idea = { id: 'idea:card-idea', type: 'idea', card: 'card-idea', title: 'Searchable workflow idea', body: 'Make the owner decision flow concise. Shared refresh term.', project: '/tmp/middle-project', status: 'needs-decision', at: now - 1000, sessions: [] };
   const finding = { id: 'finding:card-find:key-one', type: 'finding', card: 'card-find', title: 'Protect retry idempotency', body: 'A lost response must not launch twice.', evidence: 'Observed in the launch boundary.', severity: 'high', project: '/tmp/review-fixture', status: 'needs-decision', at: now, sessions: [] };
   const siblingFinding = { ...finding, id: 'finding:card-find:key-two', title: 'A second finding on the same card', severity: 'low', at: now + 500 };
   const partial = { id: 'idea:partial-start', type: 'idea', card: 'partial-start', title: 'Partial start failure', body: 'The pane exists but delivery is ambiguous.', project: '/tmp/z-project', status: 'needs-decision', at: now - 250, sessions: [] };
-  const lost = { id: 'idea:lost-response', type: 'idea', card: 'lost-response', title: 'Lost response discussion', body: 'Retry the same request safely.', project: '/tmp/a-project', status: 'needs-decision', at: now - 750, sessions: [] };
+  const lost = { id: 'idea:lost-response', type: 'idea', card: 'lost-response', title: 'Lost response discussion', body: 'Retry the same request safely. Shared refresh term.', project: '/tmp/a-project', status: 'needs-decision', at: now - 750, sessions: [] };
   const later = { id: 'idea:later', type: 'idea', card: 'later', title: 'Deferred idea', body: 'Not due.', project: '/tmp/review-fixture', status: 'needs-decision', deferredUntil: new Date(now + 86400e3).toISOString(), at: now - 2000, sessions: [] };
   const state = {
+    generatedAt: 1,
     sessions: [], panes: [], tasks: [], attention: [], notifications: [{ id: 'notice-find', at: now, text: finding.title, from: 'Reviewer', caller: 'reviewer', card: finding.card, findingKey: 'key-one', read: false }, { id: 'notice-ambiguous', at: now - 1, text: 'Finding without a durable key', from: 'Reviewer', caller: 'reviewer', card: finding.card, read: false }],
     setAside: {}, health: {}, usage: {}, review: { events: [], stats: {} }, limitResume: {},
     reviewQueue: { items: [idea, finding, partial, siblingFinding, lost, later], counts: { 'needs-decision': 5, 'in-progress': 0, resolved: 0 } },
@@ -43,6 +45,7 @@ test('isolated browser: review queue decisions, drafts, notification links, and 
     if (url.pathname === '/api/dashboard-review-search') {
       const q = url.searchParams.get('q') || '';
       reviewSearches.push(q);
+      if (failReviewSearch) { res.writeHead(503, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'fixture search unavailable' })); return; }
       res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(reviewQueueSearch(state, q)));
       return;
     }
@@ -197,9 +200,29 @@ test('isolated browser: review queue decisions, drafts, notification links, and 
     assert.equal(lost.sessions.length, 1, 'Discuss opens only one fresh conversation and leaves the item pending');
     await evaluate("document.querySelector('[data-mode=review-queue]').click()");
     await evaluate("const input=document.querySelector('[data-review-search]'); input.value='same request safely'; input.dispatchEvent(new Event('input',{bubbles:true}))");
+    await wait("document.querySelector('[data-review-search-retry]')?.textContent === 'Retry'");
+    await evaluate("new Promise(resolve => setTimeout(resolve, 180))");
+    assert.equal(reviewSearches.filter((value) => value === 'same request safely').length, 1, 'a failed search stays stable until explicit retry');
+    failReviewSearch = false;
+    await evaluate("document.querySelector('[data-review-search-retry]').click()");
     await wait("document.querySelectorAll('[data-review-item]').length === 1");
     assert.equal(await evaluate("document.querySelector('[data-review-item]').dataset.reviewItem"), 'idea:lost-response', 'search includes text omitted from the summary payload');
     assert.ok(reviewSearches.includes('same request safely'));
+    assert.equal(reviewSearches.filter((value) => value === 'same request safely').length, 2, 'Retry makes exactly one new request');
+    await evaluate("(()=>{const search=document.querySelector('[data-review-search]'); search.value='shared refresh term'; search.dispatchEvent(new Event('input',{bubbles:true}))})()");
+    await wait("document.querySelectorAll('[data-review-item]').length === 2");
+    await evaluate("(()=>{document.querySelector('[data-review-item=\"idea:card-idea\"]').click(); document.querySelector('[data-review-action=dismiss]').click(); const draft=document.querySelector('[data-review-form=dismiss] textarea'); draft.value='Keep this draft during refresh'; draft.dispatchEvent(new Event('input',{bubbles:true})); draft.focus()})()");
+    const refreshSearchCount = reviewSearches.filter((value) => value === 'shared refresh term').length;
+    state.generatedAt += 1;
+    for (const client of eventClients) client.write('data: changed\n\n');
+    await new Promise((resolve, reject) => {
+      const deadline = Date.now() + 5000;
+      const poll = () => reviewSearches.filter((value) => value === 'shared refresh term').length > refreshSearchCount
+        ? resolve() : Date.now() > deadline ? reject(new Error('review search did not revalidate')) : setTimeout(poll, 30);
+      poll();
+    });
+    await wait("document.querySelector('[data-review-form=dismiss] textarea')?.value === 'Keep this draft during refresh'");
+    assert.equal(await evaluate("document.activeElement === document.querySelector('[data-review-form=dismiss] textarea')"), true, 'search revalidation preserves the selected row, draft, and focus');
     await evaluate("document.querySelector('[data-review-search]').value=''; document.querySelector('[data-review-search]').dispatchEvent(new Event('input',{bubbles:true})); document.querySelector('[data-review-action=dismiss]').click(); const area=document.querySelector('[data-review-form=dismiss] textarea'); area.value='Duplicate of active work'; area.dispatchEvent(new Event('input',{bubbles:true})); area.focus()");
     for (const client of eventClients) client.write('data: changed\n\n');
     await wait("document.querySelector('[data-review-form=dismiss] textarea')?.value === 'Duplicate of active work'");

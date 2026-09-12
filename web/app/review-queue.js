@@ -62,7 +62,7 @@ function launchStateHTML(ctx, item) {
 function visibleItems(ctx) {
   const needle = query.trim().toLowerCase();
   ensureSearch(ctx, needle);
-  const matches = needle && searchState.query === needle && searchState.status === 'ready' ? searchState.ids : null;
+  const matches = needle && searchState.query === needle && ['ready', 'refreshing', 'error'].includes(searchState.status) ? searchState.ids : null;
   return allItems(ctx).filter((item) => item.type === type && item.status === status && (status !== 'needs-decision' || showLater || !isLater(item))
     && (!needle || matches?.has(item.id)))
     .sort(compareItems);
@@ -71,16 +71,17 @@ function visibleItems(ctx) {
 function ensureSearch(ctx, needle) {
   if (!needle) return;
   const version = ctx.data.generatedAt || null;
-  if (searchState.query === needle && searchState.version === version && ['loading', 'ready'].includes(searchState.status)) return;
+  if (searchState.query === needle && searchState.version === version && ['loading', 'refreshing', 'ready', 'error'].includes(searchState.status)) return;
   const token = ++searchSerial;
-  searchState = { query: needle, version, status: 'loading', ids: new Set(), error: '' };
+  const retained = searchState.query === needle ? searchState.ids : new Set();
+  searchState = { query: needle, version, status: retained.size ? 'refreshing' : 'loading', ids: retained, error: '' };
   searchDashboardReviews(needle).then((result) => {
     if (token !== searchSerial || query.trim().toLowerCase() !== needle) return;
     searchState = { query: needle, version, status: 'ready', ids: new Set(result?.ids || []), error: '' };
     renderReviewQueue(ctx);
   }, (error) => {
     if (token !== searchSerial || query.trim().toLowerCase() !== needle) return;
-    searchState = { query: needle, version, status: 'error', ids: new Set(), error: error?.message || 'Search failed' };
+    searchState = { query: needle, version, status: 'error', ids: retained, error: error?.message || 'Search failed' };
     renderReviewQueue(ctx);
   });
 }

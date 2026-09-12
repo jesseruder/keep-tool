@@ -73,12 +73,22 @@ test('isolated browser: legacy dashboard task details load on open and reject st
 
     await page.evaluate(() => openTask('second'));
     await page.getByText('Second full history v1').waitFor();
+    await page.locator('#ciMsg').fill('Draft check-in survives refresh');
+    await page.locator('#ciStatus').selectOption('waiting');
+    await page.locator('#runExtra').fill('Draft run instructions');
+    await page.locator('#ciMsg').focus();
+    await page.locator('#ciMsg').evaluate((field) => field.setSelectionRange(6, 14));
     second.body = 'Second full history v2';
     second.fm.updated = '2026-09-07T12:01:00Z';
     state.generatedAt += 1;
     await page.evaluate(() => refresh());
     await page.getByText('Second full history v2').waitFor();
     assert.equal(await page.locator('#detail details.recipe pre').textContent(), 'verify second', 'check recipe is rehydrated with refreshed detail');
+    assert.equal(await page.locator('#ciMsg').inputValue(), 'Draft check-in survives refresh');
+    assert.equal(await page.locator('#ciStatus').inputValue(), 'waiting');
+    assert.equal(await page.locator('#runExtra').inputValue(), 'Draft run instructions');
+    assert.deepEqual(await page.locator('#ciMsg').evaluate((field) => ({ id: document.activeElement.id, start: field.selectionStart, end: field.selectionEnd })),
+      { id: 'ciMsg', start: 6, end: 14 }, 'background detail refresh preserves focus and selection');
   } finally {
     await browser.close();
     await new Promise((resolve) => server.close(resolve));
