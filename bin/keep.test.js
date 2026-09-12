@@ -1009,6 +1009,55 @@ test('recordSessionPane writes a host-only record and binds both agent kinds to 
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('Codex SessionStart pins a daemon-launched session only after exact pane and account verification', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-open-pin-'));
+  const config = path.join(root, 'accounts.json');
+  const configDir = path.join(root, 'codex-secondary');
+  fs.mkdirSync(configDir);
+  fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+    { id: 'codex-secondary', label: 'Codex secondary', agent: 'codex', configDir },
+  ], defaultAccounts: { codex: 'codex-secondary' } }));
+  const env = { KEEP_DIR: root, KEEP_CONFIG: config, KEEP_PANE: 'pane-open',
+    KEEP_AGENT_ACCOUNT_ID: 'codex-secondary' };
+  const pane = { id: 'pane-open', alive: true, pid: 81, meta: { agent: 'codex', accountId: 'codex-secondary',
+    openRequestId: 'open-request', launchedAt: 1234, project: root, sessionId: null } };
+  const patches = [];
+  const connectHost = async () => ({
+    async request(type, params) {
+      if (type === 'get') return { pane };
+      patches.push(params.patch); pane.meta = { ...pane.meta, ...params.patch }; return {};
+    },
+    close() {},
+  });
+  try {
+    const bound = await recordSessionPane({ session_id: 'deferred-session', cwd: root }, 'codex', {
+      root, env, connectHost, codexOwnsPane: async () => true,
+    });
+    assert.equal(bound.bound, true);
+    assert.deepEqual(patches, [{ sessionId: 'deferred-session', agent: 'codex', project: root }]);
+    const authority = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'session-accounts', 'deferred-session.json')));
+    assert.deepEqual({ sessionId: authority.sessionId, agent: authority.agent, accountId: authority.accountId },
+      { sessionId: 'deferred-session', agent: 'codex', accountId: 'codex-secondary' });
+
+    pane.meta = { ...pane.meta, sessionId: null, accountId: 'codex/default' };
+    patches.length = 0;
+    const rejected = await recordSessionPane({ session_id: 'wrong-account-session', cwd: root }, 'codex', {
+      root, env, connectHost, codexOwnsPane: async () => true,
+    });
+    assert.equal(rejected.bound, false);
+    assert.deepEqual(patches, []);
+    assert.equal(fs.existsSync(path.join(root, '.keep', 'session-accounts', 'wrong-account-session.json')), false);
+
+    pane.meta = { ...pane.meta, sessionId: null, accountId: 'codex-secondary' };
+    const unowned = await recordSessionPane({ session_id: 'unowned-session', cwd: root }, 'codex', {
+      root, env, connectHost, attempts: 1, codexOwnsPane: async () => false,
+    });
+    assert.equal(unowned.bound, false);
+    assert.deepEqual(patches, []);
+    assert.equal(fs.existsSync(path.join(root, '.keep', 'session-accounts', 'unowned-session.json')), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('recordSessionPane leaves a pane that another session already owns and retries a flaky host', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-pane-owner-'));
   try {

@@ -5118,6 +5118,20 @@ async function recordSessionPane(input, agent = 'claude', deps = {}) {
     try {
       client = await connectHost({ timeoutMs: deps.timeoutMs == null ? 500 : deps.timeoutMs });
       const current = await client.request('get', { pane }, { timeoutMs });
+      const paneMeta = current?.pane?.meta || {};
+      const launchedCodex = agent === 'codex' && paneMeta.openRequestId != null;
+      if (launchedCodex) {
+        const validRequest = typeof paneMeta.openRequestId === 'string'
+          && /^[A-Za-z0-9_-]{1,128}$/.test(paneMeta.openRequestId);
+        if (!accountId || current.pane?.alive !== true || paneMeta.agent !== 'codex'
+            || paneMeta.accountId !== accountId || !validRequest
+            || !Number.isFinite(Number(paneMeta.launchedAt))
+            || path.resolve(paneMeta.project || '') !== path.resolve(cwd)) break;
+        const ownsPane = await (deps.codexOwnsPane || require('./codex-pane').ownsPane)(sid, current.pane, deps);
+        if (!ownsPane) throw new Error('Codex SessionStart did not own its launched host pane');
+        (deps.pinSession || require('./accounts').pinSession)(sid, 'codex', accountId,
+          { root: deps.root || ROOT, env });
+      }
       const owner = current && current.pane && current.pane.meta && current.pane.meta.sessionId;
       if (owner && owner !== sid) {
         let released = false;

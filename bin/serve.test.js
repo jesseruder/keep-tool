@@ -3847,17 +3847,17 @@ test('standalone fresh agent launch uses the selected profile and one request id
     const env = { KEEP_DIR: root, KEEP_CONFIG: config };
     let releaseSpawn;
     const spawnGate = new Promise((resolve) => { releaseSpawn = resolve; });
-    let spawns = 0;
-    const host = recordingHost(async (type) => {
+    let spawns = 0; let spawnedMeta;
+    const host = recordingHost(async (type, params) => {
+      if (type === 'get') return { pane: { id: 'standalone-pane', pid: 41, createdAt: 42, alive: true, meta: spawnedMeta } };
       if (type !== 'spawn') return {};
-      spawns++; await spawnGate;
+      spawns++; spawnedMeta = params.meta; await spawnGate;
       return { pane: { id: 'standalone-pane', pid: 41, createdAt: 42 } };
     });
     const body = { fresh: true, cwd, agent: 'codex', accountId: 'codex-secondary',
       model: 'gpt-5.6-sol', requestId: 'standalone-request' };
     let existingPanes = [];
     const deps = { root, env, host, listHostPanes: async () => existingPanes, waitForHostAgent: async () => true,
-      readHostSessionId: async () => null,
       waitForHostSessionId: async () => assert.fail('message-less standalone Codex must not wait for a first-turn session id') };
     const first = openSession(body, deps);
     await new Promise((resolve) => setImmediate(resolve));
@@ -3880,6 +3880,8 @@ test('standalone fresh agent launch uses the selected profile and one request id
     const rebound = await openSession(body, deps);
     assert.equal(rebound.existing, true); assert.equal(rebound.sessionId, 'actual-standalone-session');
     assert.equal('pendingRegistration' in rebound, false); assert.equal(spawns, 1);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, '.keep', 'session-accounts',
+      'actual-standalone-session.json'), 'utf8')).accountId, 'codex-secondary');
 
     existingPanes = [{ id: 'strict-standalone-pane', alive: true, agentAlive: true,
       meta: { ...spawn.meta, openRequestId: 'strict-standalone-request', sessionId: null } }];
@@ -3894,6 +3896,43 @@ test('standalone fresh agent launch uses the selected profile and one request id
     }), (error) => error.status === 504 && /never registered its session id/.test(error.message));
     assert.equal(spawns, 2);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('standalone pending registration refuses unreadable, dead, and changed launch panes without respawning', async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-standalone-pending-guard-'));
+  try {
+    for (const mode of ['unreadable', 'dead', 'wrong-account']) {
+      let spawns = 0; let meta;
+      const pane = { id: `${mode}-pane`, pid: 71, createdAt: 72 };
+      const host = recordingHost((type, params) => {
+        if (type === 'spawn') { spawns++; meta = params.meta; return { pane }; }
+        if (type === 'get' && mode === 'unreadable') throw new Error('host read failed');
+        if (type === 'get') return { pane: { ...pane, alive: mode !== 'dead',
+          meta: { ...meta, ...(mode === 'wrong-account' ? { accountId: 'codex/other' } : {}) } } };
+        return {};
+      });
+      const body = { fresh: true, cwd, agent: 'codex', accountId: 'codex/default', requestId: `${mode}-request` };
+      await assert.rejects(openSession(body, {
+        host, listHostPanes: async () => [], waitForHostAgent: async () => true,
+      }), (error) => error instanceof InjectionError
+        && [409, 503].includes(error.status) && error.extra?.code === 'OPEN_EXISTING_PANE'
+        && error.extra.launch.pane === pane.id && error.extra.launch.recoverable === true);
+      assert.equal(spawns, 1, mode);
+
+      if (mode === 'dead') {
+        await assert.rejects(openSession(body, {
+          host, listHostPanes: async () => [{ ...pane, alive: false, agentAlive: false, meta }],
+          waitForHostAgent: async () => assert.fail('must not wait on or replace a dead receipt pane'),
+        }), (error) => error.status === 409 && error.extra?.code === 'OPEN_EXISTING_PANE');
+      } else if (mode === 'unreadable') {
+        await assert.rejects(openSession(body, {
+          host, listHostPanes: async () => null,
+          waitForHostAgent: async () => assert.fail('must not respawn without an authoritative pane inventory'),
+        }), (error) => error.status === 503 && /identity cannot be verified/.test(error.message));
+      }
+      assert.equal(spawns, 1, `${mode} retry`);
+    }
+  } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
 });
 
 test('standalone request id refuses to launch when existing panes cannot be inventoried', async () => {
@@ -3969,7 +4008,7 @@ test('standalone post-spawn account pin failures retain the existing-pane receip
         requestId: `${agent}-pin-error-request` }, {
         host: recordingHost((type) => type === 'spawn' ? { pane: { id: pane, pid: 63, createdAt: 64 } } : {}),
         listHostPanes: async () => [], waitForHostAgent: async () => true,
-        readHostSessionId: async () => `${agent}-pin-error-session`,
+        verifyFreshOpenPane: async () => `${agent}-pin-error-session`,
         waitForHostSessionId: async () => `${agent}-pin-error-session`,
         pinSession: () => { throw new Error('ENOSPC: account registry write failed'); },
       }), (error) => error instanceof InjectionError && error.status === 502

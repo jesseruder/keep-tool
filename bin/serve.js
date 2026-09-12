@@ -3797,6 +3797,31 @@ async function readHostSessionId(pane, deps = {}) {
   } catch { return null; }
 }
 
+async function verifyFreshOpenPane(launch, expected, deps = {}) {
+  let result;
+  try { result = await hostRequest('get', { pane: launch.pane }, deps); }
+  catch {
+    throw new InjectionError(503, `host pane ${launch.pane} could not be verified after ${expected.agent} opened`);
+  }
+  const pane = result?.pane;
+  const meta = pane?.meta || {};
+  if (!pane || pane.id !== launch.pane || pane.alive !== true
+      || Number.isInteger(launch.pid) && pane.pid !== launch.pid
+      || launch.createdAt != null && pane.createdAt !== launch.createdAt
+      || meta.agent !== expected.agent || meta.accountId !== expected.accountId
+      || meta.openRequestId !== expected.requestId || meta.launchedAt !== expected.launchedAt
+      || path.resolve(meta.project || '') !== expected.project
+      || (meta.model || '') !== expected.model) {
+    throw new InjectionError(409, `host pane ${launch.pane} changed before its session registration was verified`);
+  }
+  const sessionId = meta.sessionId;
+  if (sessionId == null || sessionId === '') return null;
+  if (typeof sessionId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(sessionId)) {
+    throw new InjectionError(409, `host pane ${launch.pane} has an invalid session registration`);
+  }
+  return sessionId;
+}
+
 async function waitForHostSessionId(pane, deps = {}) {
   const now = deps.now || Date.now;
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
@@ -3964,7 +3989,7 @@ async function openSession(body, deps = {}) {
     account = body.accountId == null ? accounts.defaultFor(agent, deps.env || process.env) : accounts.get(body.accountId, deps.env || process.env);
     if (!account || account.agent !== agent) throw new InjectionError(400, `account ${body.accountId || '?'} is not a ${agent} account`);
   }
-  const allowPendingRegistration = freshStandalone && agent === 'codex' && !message
+  const allowPendingRegistration = freshStandalone && agent === 'codex' && !message && Boolean(body.requestId)
     && !body.portableTransferId && !body.reviewQueueLaunchId
     && !deps.onSessionReady && !deps.onOpeningReady && !deps.onOpeningDelivered;
   if (freshStandalone && body.requestId) {
@@ -3972,17 +3997,33 @@ async function openSession(body, deps = {}) {
     if (!Array.isArray(panes)) {
       throw new InjectionError(503, 'terminal host is unavailable; open request identity cannot be verified');
     }
-    const matches = (panes || []).filter((entry) => entry?.alive !== false
-      && entry.meta?.openRequestId === body.requestId);
-    if (matches.length > 1) throw new InjectionError(409, 'open request matches multiple live panes');
+    const matches = (panes || []).filter((entry) => entry?.meta?.openRequestId === body.requestId);
+    if (matches.length > 1) throw new InjectionError(409, 'open request matches multiple host panes');
     if (matches.length === 1) {
       const existing = matches[0];
       if (existing.meta?.agent !== agent || existing.meta?.accountId !== account.id
           || path.resolve(existing.meta?.project || '') !== project
-          || (existing.meta?.model || '') !== launchModel) {
+          || (existing.meta?.model || '') !== launchModel
+          || !Number.isFinite(Number(existing.meta?.launchedAt))) {
         throw new InjectionError(409, 'open request was already used for a different launch');
       }
-      const sessionId = existing.meta?.sessionId || null;
+      const registeredId = existing.meta?.sessionId;
+      if (registeredId != null && registeredId !== ''
+          && (typeof registeredId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(registeredId))) {
+        throw new InjectionError(409, 'open request has an invalid session registration');
+      }
+      const sessionId = registeredId || null;
+      if (agent === 'codex' && (existing.alive !== true || existing.agentAlive === false)
+          && (sessionId || allowPendingRegistration)) {
+        throw new InjectionError(409, `existing host pane ${existing.id} is no longer running the requested Codex session`, {
+          code: 'OPEN_EXISTING_PANE', launch: { pane: existing.id, sessionId,
+            accountId: account.id, agent, recoverable: true },
+        });
+      }
+      if (sessionId && agent === 'codex') {
+        (deps.pinSession || accounts.pinSession)(sessionId, agent, account.id,
+          { root: deps.root || keep.ROOT, env: deps.env || process.env });
+      }
       return { ok: true, existing: true, focus: 'console', pane: existing.id,
         sessionId, accountId: account.id, accountLabel: account.label,
         agent, recoverable: existing.agentAlive === false,
@@ -4113,7 +4154,9 @@ async function openSession(body, deps = {}) {
       freshStandalone ? { ...deps, detectPortableSetup: true } : deps);
     launch.settled = true;
     if (!launch.sessionId && allowPendingRegistration) {
-      launch.sessionId = await (deps.readHostSessionId || readHostSessionId)(launch.pane, deps);
+      launch.sessionId = await (deps.verifyFreshOpenPane || verifyFreshOpenPane)(launch, {
+        agent, accountId: account.id, requestId: body.requestId, launchedAt, project, model: launchModel,
+      }, deps);
       if (!launch.sessionId) launch.pendingRegistration = true;
     } else if (!launch.sessionId && (handoff || freshStandalone || deps.onSessionReady)) {
       launch.sessionId = await (deps.waitForHostSessionId || waitForHostSessionId)(launch.pane, deps);
