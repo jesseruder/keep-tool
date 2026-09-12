@@ -5621,26 +5621,121 @@ function buildDigest(options = {}) {
   return lines.join('\n').replace(/\n{3,}/g, '\n\n');
 }
 
-commands['review-budget'] = async (argv) => {
-  const o = parseArgs(argv, { json: 'bool', model: 'str' });
-  const review = require('./review.js');
-  const model = o.model || review.reviewerModel();
-  const usage = require('./usage.js');
-  // The daemon points usage.js at this cache at startup; a short-lived CLI has to
-  // do it itself, or every reading looks like "no snapshot".
-  usage.setCacheFile(path.join(ROOT, '.keep', 'usage-cache.json'));
-  usage.getUsage(); // kicks off a refresh off the call stack
-  for (let i = 0; i < 20 && !usage.getUsage().claude.fetchedAt; i += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 150));
+async function resolveReviewBudgetTarget(options = {}, deps = {}) {
+  const review = deps.review || require('./review.js');
+  const accountStore = deps.accounts || require('./accounts.js');
+  const explicitAccount = Object.prototype.hasOwnProperty.call(options, 'account');
+  let state = null;
+  let stateError = '';
+  try {
+    const response = await (deps.getKeepApi || getKeepApi)('/api/state', 3000);
+    if (!response || response.status !== 200) {
+      stateError = `Keep state returned ${response && response.status ? response.status : 'no response'}`;
+    } else {
+      state = JSON.parse(response.data);
+      if (!state || !Array.isArray(state.sessions)) stateError = 'Keep state has no session inventory';
+    }
+  } catch (error) {
+    stateError = `Keep state is unavailable: ${error.message}`;
   }
-  const verdict = review.classifyBudget(usage.getUsage(), model);
-  if (o.json) console.log(JSON.stringify({ model, ...verdict }, null, 2));
+
+  let reviewer = null;
+  if (!stateError) {
+    try {
+      let attempts;
+      try { attempts = (deps.loadReviewMeta || review.loadMeta)().bootstrapAttempts; } catch {}
+      reviewer = (deps.findReviewerSession || review.findReviewerSession)(state.sessions, attempts);
+    } catch (error) {
+      stateError = `reviewer identity is unavailable: ${error.message}`;
+    }
+  }
+  let marker = {};
+  if (reviewer) {
+    try { marker = (deps.readReviewerMarker || review.readReviewerMarker)(reviewer.id) || {}; } catch {}
+  }
+  const model = options.model || marker.model || review.reviewerModel();
+
+  if (explicitAccount) {
+    let account = null;
+    try { account = accountStore.get(options.account, deps.env || process.env); } catch (error) {
+      return { model, error: `account configuration is unavailable: ${error.message}` };
+    }
+    if (!account || account.agent !== 'claude') {
+      return { model, error: `account ${options.account || '(empty)'} is not a configured Claude account` };
+    }
+    return { model, accountId: account.id };
+  }
+
+  if (stateError) return { model, error: stateError };
+  if (!reviewer) return { model, error: 'no active fleet reviewer session is registered' };
+  const rows = state.sessions.filter((session) => session && session.id === reviewer.id && session.exited !== true);
+  const accountIds = [...new Set(rows.map((session) => session.accountId).filter(Boolean))];
+  if (accountIds.length !== 1 || rows.some((session) => !session.accountId)) {
+    return {
+      model,
+      error: accountIds.length > 1
+        ? `reviewer ${reviewer.id} has conflicting account identities`
+        : `reviewer ${reviewer.id} has no verified account identity`,
+    };
+  }
+  let account = null;
+  try { account = accountStore.get(accountIds[0], deps.env || process.env); } catch (error) {
+    return { model, error: `account configuration is unavailable: ${error.message}` };
+  }
+  if (!account || account.agent !== 'claude') {
+    return { model, error: `reviewer account ${accountIds[0]} is not an available Claude account` };
+  }
+  let authority;
+  try {
+    authority = accountStore.forSession(reviewer.id, 'claude', {
+      root: deps.root || ROOT,
+      env: deps.env || process.env,
+      allowDiscovery: false,
+    });
+  } catch (error) {
+    return { model, error: `reviewer account authority is unavailable: ${error.message}` };
+  }
+  if (authority && authority.id !== account.id) {
+    return { model, error: `reviewer account conflicts with durable authority ${authority.id}` };
+  }
+  return { model, accountId: account.id };
+}
+
+async function reviewBudgetCommand(argv, deps = {}) {
+  const o = parseArgs(argv, { json: 'bool', model: 'str', account: 'str' });
+  if (o._.length) die('usage: keep review-budget [--json] [--model m] [--account claude-id]');
+  const review = deps.review || require('./review.js');
+  const target = await resolveReviewBudgetTarget(o, { ...deps, review });
+  const usage = deps.usage || require('./usage.js');
+  let verdict;
+  if (target.error) {
+    verdict = { code: 8, reason: target.error };
+  } else {
+    // The daemon points usage.js at this cache at startup; a short-lived CLI has to
+    // do it itself, or every reading looks like "no snapshot". Wait only for the
+    // selected reviewer's snapshot; the primary compatibility view may be unrelated.
+    usage.setCacheFile(path.join(deps.root || ROOT, '.keep', 'usage-cache.json'));
+    usage.getUsage(); // kicks off a refresh off the call stack
+    for (let i = 0; i < 20 && !usage.getUsage().accounts?.[target.accountId]?.fetchedAt; i += 1) {
+      await (deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(150);
+    }
+    verdict = review.reviewBudget(target.model, usage.getUsage(), target.accountId);
+  }
+  const output = { ...verdict, model: target.model, ...(target.accountId ? { accountId: target.accountId } : {}) };
+  const log = deps.log || console.log;
+  if (o.json) log(JSON.stringify(output, null, 2));
   else {
     const label = verdict.code === 0 ? 'ok' : verdict.code === 6 ? 'STOP (weekly)' : verdict.code === 7 ? 'pause (short window)' : 'unknown';
-    console.log(`${label}: ${verdict.reason}${verdict.resetsAt ? `  resets ${verdict.resetsAt}` : ''}`);
+    log(`${label}: ${verdict.reason}${verdict.resetsAt ? `  resets ${verdict.resetsAt}` : ''}${target.accountId ? `  account ${target.accountId}` : ''}`);
   }
-  if (verdict.code) process.exit(verdict.code);
-};
+  if (verdict.code) {
+    if (deps.exit) deps.exit(verdict.code);
+    else process.exit(verdict.code);
+  }
+  return output;
+}
+
+commands['review-budget'] = reviewBudgetCommand;
 
 commands['review-tick'] = async (argv) => {
   const o = parseArgs(argv, { force: 'bool' });
@@ -6510,7 +6605,8 @@ ${stepUsage()}
                          # fixed, confirmed-deferred, incorrect, superseded, unresolved; list when status omitted
   keep review-land --file <path> | keep review-land -
                          # land one JSON review tick under one lock and commit
-  keep review-budget [--json] [--model m]  # may the reviewer spend right now?
+  keep review-budget [--json] [--model m] [--account claude-id]
+                         # may the active reviewer account spend right now?
   keep review-tick [--force]               # wake the reviewer now (needs keep serve)
   keep usage <card> [--json]     Forward-only model token usage
   keep review-stats [--json]               # last tick, skips, per-day counts
@@ -6572,6 +6668,7 @@ module.exports = {
   restoreCommandCli: commands.restore, resumeCommandCli: commands.resume, resumeCommand,
   accountsCommandCli: commands.accounts, handoffCommandCli: commands.handoff, transferCommandCli: commands.transfer,
   artifactCommandCli: commands.artifact,
+  resolveReviewBudgetTarget, reviewBudgetCommandCli: commands['review-budget'],
   hostCommandCli: commands.host, paneCommandCli: commands.pane, attachCommandCli: commands.attach,
   resolveHostPane, renderHostPanes, parseHostSpawn,
 };

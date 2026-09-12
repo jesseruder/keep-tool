@@ -90,7 +90,8 @@ keep review-note <id> --kind k --subject s -m "finding"  # attributed reviewer f
 keep review-idea "<title>" -m "<body>" [--cards a,b,c]   # fleet-wide workflow suggestion
 keep review-ack <id> [-m note]                           # reviewed, nothing to flag
 keep review-dismiss <id> <key> [-m why]                  # never raise this one again
-keep review-budget [--json] [--model m]                  # may the reviewer spend right now?
+keep review-budget [--json] [--model m] [--account claude-id]
+                                                            # active reviewer account budget, or an explicit Claude account
 keep review-tick [--force]                               # wake the reviewer (needs keep serve)
 keep review-stats [--json]                               # last tick, skips, per-day counts
 keep nudge <id> --session <sid> --key <k> -m "..." [--send]  # message a live agent (dry-run default)
@@ -679,6 +680,13 @@ limit by label prefix) and for the `review (fable)` heading findings land under.
 
 Switching models means restarting the session: the model is fixed at launch, and the
 governor reads it from the `.keep/reviewer/<id>` marker written at startup.
+
+`keep review-budget` checks the account and model of the active fleet reviewer. It
+validates that account against the session's durable authority and never inherits an
+unrelated caller's account. Use `--account <claude-id>` for a deterministic account
+check; `--model` overrides the active reviewer model. Exit codes are 0 for available,
+6 for the weekly ceiling, 7 for the short window, and 8 when identity or usage is
+unavailable.
 
 The console's Fleet reviewer header has a **Restart** button beside `Tick now` and
 `Stats`. It uses the same `/api/restart-session` machinery as a pinned pane in Watch,
