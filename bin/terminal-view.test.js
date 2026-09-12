@@ -197,7 +197,9 @@ test('healthy output chunks do not rewrite live status but recover after an erro
   const f = fixture();
   try {
     const state = f.mounted.element.querySelector('.term-state');
+    const status = f.mounted.element.querySelector('.term-status');
     let writes = 0;
+    let errorRemovals = 0;
     let value = state.textContent;
     Object.defineProperty(state, 'textContent', {
       configurable: true,
@@ -208,19 +210,29 @@ test('healthy output chunks do not rewrite live status but recover after an erro
     await f.drain();
     assert.equal(state.textContent, 'live');
     writes = 0;
+    const remove = status.classList.remove;
+    status.classList.remove = (name) => {
+      if (name === 'error') errorRemovals++;
+      remove(name);
+    };
 
     for (let i = 0; i < 100; i++) {
       f.socket.onmessage({ data: new TextEncoder().encode(String(i)).buffer });
     }
     await f.drain();
     assert.equal(writes, 0, 'steady healthy output leaves the live status alone');
-    assert.match(f.terminal.buffer.active.getLine(0).translateToString(), /0123456789/, 'all output still reaches xterm');
+    const buffer = f.terminal.buffer.active;
+    const output = Array.from({ length: buffer.length }, (_, i) => buffer.getLine(i).translateToString(true)).join('');
+    assert.equal(output, Array.from({ length: 100 }, (_, i) => String(i)).join(''), 'all output still reaches xterm');
+    assert.equal(errorRemovals, 0, 'steady healthy output does not remove an absent error class');
 
     f.message({ t: 'error', message: 'temporary terminal error' });
     assert.equal(state.textContent, 'temporary terminal error');
+    assert.equal(status.classList.contains('error'), true);
     f.socket.onmessage({ data: new TextEncoder().encode(' recovered').buffer });
     assert.equal(state.textContent, 'live');
-    assert.equal(state.classList.contains('error'), false);
+    assert.equal(status.classList.contains('error'), false);
+    assert.equal(errorRemovals, 1);
   } finally { f.mounted.dispose(); }
 });
 
