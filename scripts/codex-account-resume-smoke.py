@@ -85,12 +85,13 @@ def sqlite_snapshot(profile):
     }
 
 
-def configure(profile, port):
+def configure(profile, port, conflicting_defaults=False):
     profile.mkdir()
     (profile / "config.toml").write_text(
-        'model="gpt-5.6-sol"\n'
+        f'model="{"gpt-5.5" if conflicting_defaults else "gpt-5.6-sol"}"\n'
         'model_provider="fixture"\n'
-        'model_reasoning_effort="low"\n'
+        f'model_reasoning_effort="{"high" if conflicting_defaults else "low"}"\n'
+        f'sandbox_mode="{"read-only" if conflicting_defaults else "workspace-write"}"\n'
         '[model_providers.fixture]\n'
         'name="fixture"\n'
         f'base_url="http://127.0.0.1:{port}/v1"\n'
@@ -101,9 +102,9 @@ def configure(profile, port):
     )
 
 
-def run_codex(binary, project, clean_env, profile, token, args):
+def run_codex(binary, project, clean_env, profile, token, args, global_args=()):
     result = subprocess.run(
-        [binary, "exec", *args, "--skip-git-repo-check", "--json"],
+        [binary, *global_args, "exec", *args, "--skip-git-repo-check", "--json"],
         cwd=project,
         env={**clean_env, "CODEX_HOME": str(profile), "KEEP_TEST_TOKEN": token},
         capture_output=True,
@@ -114,6 +115,40 @@ def run_codex(binary, project, clean_env, profile, token, args):
     if result.returncode:
         raise RuntimeError((result.stderr + result.stdout)[-2000:])
     return [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+
+
+def read_resume_spec(repo, rollout, sid):
+    script = "process.stdout.write(JSON.stringify(require(process.argv[1]).readResumeSpec(process.argv[2], process.argv[3])))"
+    result = subprocess.run(
+        ["node", "-e", script, str(repo / "bin" / "codex-handoff-support.js"), str(rollout), sid],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode:
+        raise RuntimeError((result.stderr + result.stdout)[-2000:])
+    return json.loads(result.stdout)
+
+
+def run_resume(binary, project, clean_env, profile, token, spec, prompt):
+    argv = spec["argv"][1:]
+    resume_index = argv.index("resume")
+    return run_codex(
+        binary, project, clean_env, profile, token,
+        [*argv[resume_index:], prompt], argv[:resume_index],
+    )
+
+
+def latest_turn_context(rollout):
+    contexts = [
+        row["payload"] for row in (
+            json.loads(line) for line in rollout.read_text(encoding="utf-8").splitlines() if line
+        )
+        if row.get("type") == "turn_context"
+    ]
+    assert contexts
+    return contexts[-1]
 
 
 def transfer(repo, registry, sid, source_id, source, target_id, target, transaction):
@@ -198,8 +233,8 @@ def main():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     repo = pathlib.Path(__file__).resolve().parents[1]
     profiles = {name: root / name for name in ["source", "target", "archived", "unused"]}
-    for profile in profiles.values():
-        configure(profile, server.server_port)
+    for name, profile in profiles.items():
+        configure(profile, server.server_port, conflicting_defaults=name == "target")
     clean_env = {
         key: value for key, value in os.environ.items()
         if not key.startswith(("OPENAI_", "CODEX_", "KEEP_", "ANTHROPIC_", "CLAUDE_"))
@@ -210,6 +245,9 @@ def main():
         first = run_codex(
             args.codex_bin, project, clean_env, profiles["source"], "fixture-source",
             ["Remember FIXTURE_USER_SOURCE"],
+            ["--sandbox", "workspace-write", "--ask-for-approval", "never",
+             "-c", 'approvals_reviewer="user"', "-m", "gpt-5.6-sol",
+             "-c", 'model_reasoning_effort="medium"'],
         )
         sid = next(row["thread_id"] for row in first if row.get("type") == "thread.started")
         source_rollouts = list((profiles["source"] / "sessions").rglob(f"*-{sid}.jsonl"))
@@ -232,6 +270,17 @@ def main():
         source_blob = source_rollout.read_bytes()
         source_digest = sha256(source_rollout)
         assert any(profiles["source"].glob("state*.sqlite"))
+        policy_fields = [
+            "sandbox_policy", "permission_profile", "active_permission_profile",
+            "approval_policy", "approvals_reviewer", "model", "effort", "cwd", "workspace_roots",
+        ]
+        source_context = latest_turn_context(source_rollout)
+        assert source_context["sandbox_policy"]["type"] == "workspace-write"
+        assert source_context["approval_policy"] == "never"
+        assert source_context.get("approvals_reviewer", "user") == "user"
+        assert source_context["model"] == "gpt-5.6-sol"
+        assert source_context["effort"] == "medium"
+        assert source_context["cwd"] == str(project.resolve())
 
         registry_one = root / "registry-one"
         registry_one.mkdir()
@@ -245,10 +294,14 @@ def main():
         assert not (profiles["target"] / "auth.json").exists()
         assert first_copy["copied"]["artifacts"][0]["sessionId"] == sid
 
+        first_resume_spec = read_resume_spec(repo, target_rollout, sid)
+        assert first_resume_spec["cwd"] == str(project.resolve())
+        assert first_resume_spec["model"] == "gpt-5.6-sol"
+        assert first_resume_spec["effort"] == "medium"
         before = len(FixtureHandler.requests)
-        second = run_codex(
+        second = run_resume(
             args.codex_bin, project, clean_env, profiles["target"], "fixture-target",
-            ["resume", sid, "Continue with FIXTURE_USER_TARGET"],
+            first_resume_spec, "Continue with FIXTURE_USER_TARGET",
         )
         target_requests = FixtureHandler.requests[before:]
         target_payload = json.dumps(target_requests)
@@ -259,6 +312,11 @@ def main():
         source_preserved_until_return = source_rollout.read_bytes() == source_blob
         assert source_preserved_until_return
         assert target_rollout.stat().st_size > len(source_blob)
+        target_context = latest_turn_context(target_rollout)
+        assert all(target_context.get(field) == source_context.get(field) for field in policy_fields), {
+            field: [source_context.get(field), target_context.get(field)]
+            for field in policy_fields if source_context.get(field) != target_context.get(field)
+        }
         if args.context_proof:
             assert b"FIXTURE_TOOL_CONTEXT" in source_blob
             assert b"FIXTURE_COMPACTION_CONTEXT" in source_blob
@@ -278,10 +336,12 @@ def main():
             assert b"FIXTURE_COMPACTION_CONTEXT" in target_blob
         assert second_copy["copied"]["artifacts"][0]["sessionId"] == sid
 
+        second_resume_spec = read_resume_spec(repo, source_rollout, sid)
+        assert second_resume_spec["argv"] == first_resume_spec["argv"]
         before = len(FixtureHandler.requests)
-        third = run_codex(
+        third = run_resume(
             args.codex_bin, project, clean_env, profiles["source"], "fixture-source-return",
-            ["resume", sid, "Continue with FIXTURE_USER_SOURCE_RETURN"],
+            second_resume_spec, "Continue with FIXTURE_USER_SOURCE_RETURN",
         )
         source_return_requests = FixtureHandler.requests[before:]
         source_return_payload = json.dumps(source_return_requests)
@@ -294,6 +354,11 @@ def main():
         target_unchanged_after_return = target_rollout.read_bytes() == target_blob
         assert target_unchanged_after_return
         assert source_rollout.stat().st_size > len(target_blob)
+        source_return_context = latest_turn_context(source_rollout)
+        assert all(source_return_context.get(field) == source_context.get(field) for field in policy_fields), {
+            field: [source_context.get(field), source_return_context.get(field)]
+            for field in policy_fields if source_context.get(field) != source_return_context.get(field)
+        }
 
         archived_rollout = profiles["archived"] / "archived_sessions" / source_rollout.name
         archived_rollout.parent.mkdir()
@@ -305,6 +370,7 @@ def main():
             "sameThreadAfterSourceTargetSource": True,
             "priorUserAndAssistantRetained": True,
             "targetCredentialsIsolated": True,
+            "effectiveResumePolicyPreserved": True,
             "sourcePreservedUntilReturn": source_preserved_until_return and source_digest == hashlib.sha256(source_blob).hexdigest(),
             "sourceDatabasePreservedByReturnCopy": source_database_preserved,
             "targetUnchangedAfterReturn": target_unchanged_after_return,
