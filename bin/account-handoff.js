@@ -50,10 +50,24 @@ async function authPreflight(account, deps = {}) {
   if (deps.authPreflight) return deps.authPreflight(account);
   if (account.agent !== 'claude') return false;
   try {
-    const { stdout } = await execFileAsync('claude', ['auth', 'status', '--json'], {
-      env: accounts.envFor(account, process.env), timeout: 15000, maxBuffer: 256 * 1024,
+    // Match the real launch path: the login shell resolves Claude from the
+    // user's configured PATH, then the profile launcher applies account
+    // isolation after shell startup so rc files cannot reintroduce credentials.
+    const command = (deps.profileCommand || require('./agent-launcher').profileCommand)(
+      ['claude', 'auth', 'status', '--json'], account,
+    );
+    const { stdout } = await execFileAsync('/bin/zsh', ['-lic', `exec ${command}`], {
+      env: deps.env || process.env, timeout: 15000, maxBuffer: 256 * 1024,
     });
-    const value = JSON.parse(stdout);
+    // Interactive shell startup may print a banner. Claude's JSON is compact,
+    // so select the last parseable object without ever exposing shell output.
+    let value = null;
+    for (const line of String(stdout).trim().split(/\r?\n/).reverse()) {
+      try {
+        const candidate = JSON.parse(line);
+        if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) { value = candidate; break; }
+      } catch {}
+    }
     const reported = value && typeof value.configDirectory === 'string' ? path.resolve(value.configDirectory) : null;
     return value && value.loggedIn === true && (!reported || reported === path.resolve(account.configDir));
   } catch { return false; }

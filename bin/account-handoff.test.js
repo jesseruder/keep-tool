@@ -57,6 +57,42 @@ function deps(f, overrides = {}) {
   };
 }
 
+test('auth preflight resolves Claude in a login shell and reapplies managed credential isolation afterward', async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-handoff-auth-'));
+  try {
+    const home = path.join(base, 'home'), fakeBin = path.join(base, 'login-bin');
+    const configDir = path.join(base, 'claude-secondary'), capture = path.join(base, 'capture.json');
+    for (const dir of [home, fakeBin, configDir]) fs.mkdirSync(dir, { recursive: true });
+    const fakeClaude = path.join(fakeBin, 'claude');
+    fs.writeFileSync(fakeClaude, `#!${process.execPath}\n` +
+      `const fs=require('node:fs');\n` +
+      `fs.writeFileSync(process.env.AUTH_CAPTURE, JSON.stringify({path:process.env.PATH,configDir:process.env.CLAUDE_CONFIG_DIR,` +
+      `secureDir:process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR,apiKey:process.env.ANTHROPIC_API_KEY,` +
+      `oauth:process.env.CLAUDE_CODE_OAUTH_TOKEN,baseUrl:process.env.ANTHROPIC_BASE_URL}));\n` +
+      `process.stdout.write(JSON.stringify({loggedIn:true,configDirectory:process.env.CLAUDE_CONFIG_DIR}));\n`, { mode: 0o755 });
+    const shellQuote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
+    fs.writeFileSync(path.join(home, '.zshrc'), [
+      `export PATH=${shellQuote(`${fakeBin}:/usr/bin:/bin`)}`,
+      'export ANTHROPIC_API_KEY=rc-api-key',
+      'export CLAUDE_CODE_OAUTH_TOKEN=rc-oauth',
+      'export ANTHROPIC_BASE_URL=https://rc.invalid',
+      'export CLAUDE_CONFIG_DIR=/wrong/from/rc',
+      'echo startup-banner',
+    ].join('\n') + '\n');
+    const account = { id: 'secondary', label: 'Secondary', agent: 'claude', configDir, managed: true, builtIn: false };
+    const env = { ...process.env, HOME: home, ZDOTDIR: home, PATH: '/usr/bin:/bin', AUTH_CAPTURE: capture,
+      ANTHROPIC_API_KEY: 'inherited-api-key', CLAUDE_CODE_OAUTH_TOKEN: 'inherited-oauth', ANTHROPIC_BASE_URL: 'https://inherited.invalid' };
+    assert.equal(await handoff.authPreflight(account, { env }), true);
+    const seen = JSON.parse(fs.readFileSync(capture, 'utf8'));
+    assert.equal(seen.path.startsWith(`${fakeBin}:`), true, 'the login shell supplied Claude on a sparse daemon PATH');
+    assert.equal(seen.configDir, configDir);
+    assert.equal(seen.secureDir, configDir);
+    assert.equal(seen.apiKey, undefined);
+    assert.equal(seen.oauth, undefined);
+    assert.equal(seen.baseUrl, undefined);
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});
+
 test('explicit handoff moves one conversation across three-account infrastructure and continues once', async () => {
   const f = fixture();
   try {
