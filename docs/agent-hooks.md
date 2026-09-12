@@ -45,6 +45,15 @@ completion when an interactive client returns to the shell. It does not replace
 start/tool/attention hooks. The version-specific broker patch under `patches/` is
 optional and never applied by installation.
 
+`keep delegate <card> --step <n> -- <command...>` passes `KEEP_DELEGATION_ID` through
+the child environment. The Claude and Codex SessionStart adapters bind that pending
+record to `input.session_id`, which is authoritative even when the process inherited a
+different parent agent's session variable. Codex returns assignment context through the
+SessionStart `hookSpecificOutput.additionalContext` field. SessionEnd marks the binding
+as process-ended so a later start of the same native session can resume it. Tools that
+cannot carry the environment use the explicit `--prepare`/`--accept` handshake or the
+parent-side known-session registration documented in `keep help delegate`.
+
 Inside a Keep terminal (`KEEP_PANE` is set), the wrapper defaults Codex to
 `tui.animations=false` and `tui.whimsy=false`. Composer sparkles can overwrite
 the screen cells Keep uses to verify a typed reminder, leaving it unsubmitted.

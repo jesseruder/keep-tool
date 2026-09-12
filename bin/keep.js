@@ -13,6 +13,7 @@ const { execFileSync, spawn } = require('child_process');
 const stepRegistry = require('./steps.js');
 const allow = require('./allow.js');
 const cardUsage = require('./card-usage.js');
+const delegation = require('./delegation.js');
 const { readTranscriptTail, textOf } = require('./transcripts.js');
 const taskParseCache = require('./stat-parse-cache').createStatParseCache({
   maxEntries: 2048,
@@ -337,6 +338,22 @@ function currentSession() {
     return { id: process.env.CLAUDE_CODE_SESSION_ID, agent: 'claude' };
   }
   return null;
+}
+
+function delegationDependencies() {
+  return { loadTask, parsePlan };
+}
+
+function currentDelegation() {
+  return delegation.resolveForCommand(ROOT, process.env, currentSession(), delegationDependencies());
+}
+
+function commandSession() {
+  const assigned = currentDelegation();
+  if (!['pending', 'identity-mismatch', 'none'].includes(assigned.kind) && assigned.record && assigned.record.worker) {
+    return assigned.record.worker;
+  }
+  return currentSession();
 }
 
 function resumeCommand(session, env = process.env) {
@@ -1331,6 +1348,13 @@ commands.add = (argv) => {
   const title = o._.join(' ');
   if (!title.trim()) die('usage: keep add "title" [--kind k] [--file|--claim] [--tag t] [--project p] [--plan "step" …] [--done-when "cmd"]… [--allow a,b] [--until when] [--autonomous] [--experiment-id id] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"] [--status s] [--force] [-m note]');
   if (o.file && o.claim) die('--file and --claim are mutually exclusive');
+  const filesOnly = o.file || (!o.claim && o.kind === 'idea');
+  if (!filesOnly) {
+    const assigned = currentDelegation();
+    if (['active', 'stale', 'pending', 'invalid', 'identity-mismatch'].includes(assigned.kind)) {
+      die(`${delegation.describe(assigned)} To start independent work deliberately, end the delegation or file it with --file.`);
+    }
+  }
   const plan = splitPlanValues(o.plan || []).map((text) => ({ text: cleanPlanText(text), state: 'todo' }));
   applyDoneWhen(plan, o['done-when']);
   let grants = [];
@@ -1889,6 +1913,112 @@ commands.project = (argv) => {
   });
 };
 
+commands.delegate = async (argv, deps = {}) => {
+  const separator = argv.indexOf('--');
+  const optionArgs = separator < 0 ? argv : argv.slice(0, separator);
+  const command = separator < 0 ? [] : argv.slice(separator + 1);
+  const o = parseArgs(optionArgs, {
+    step: 'str', prepare: 'bool', session: 'str', agent: 'str', accept: 'str', end: 'bool',
+  });
+
+  if (o.end) {
+    if (o._.length || command.length || o.step || o.prepare || o.session || o.agent || o.accept) {
+      die('usage: keep delegate --end');
+    }
+    const assigned = currentDelegation();
+    if (['pending', 'invalid', 'identity-mismatch'].includes(assigned.kind)) die(delegation.describe(assigned));
+    if (!assigned.record || assigned.explicit) die('the current session has no delegation to end');
+    delegation.end(ROOT, assigned.record, 'worker ended delegation');
+    console.log(`ended delegation ${assigned.record.id} for ${assigned.record.card} step ${assigned.record.step.number}`);
+    return;
+  }
+
+  if (o.accept) {
+    if (o._.length || command.length || o.step || o.prepare || o.session || o.agent) {
+      die('usage: keep delegate --accept <delegation-id>');
+    }
+    const pending = delegation.read(ROOT, o.accept);
+    if (!pending) die(`unknown delegation ${o.accept}`);
+    const pendingState = delegation.state(ROOT, pending, delegationDependencies());
+    if (pendingState.kind === 'stale') die(delegation.describe(pendingState));
+    let worker;
+    try { worker = delegation.acceptSession(pending, process.env); }
+    catch (error) { die(error.message); }
+    let bound;
+    try { bound = delegation.bind(ROOT, pending.id, worker, { source: 'accept' }); }
+    catch (error) { die(error.message); }
+    console.log(`accepted delegation ${bound.id}: ${bound.card} step ${bound.step.number} as ${worker.agent} session ${worker.id}`);
+    return;
+  }
+
+  if (o._.length !== 1 || !o.step) {
+    die('usage: keep delegate <card> --step <n> [--prepare | --session <sid> --agent claude|codex | -- <command...>]');
+  }
+  if (!command.length && separator >= 0) die('keep delegate needs a command after --');
+  const modes = Number(Boolean(o.prepare)) + Number(Boolean(o.session || o.agent)) + Number(Boolean(command.length));
+  if (modes !== 1 || Boolean(o.session) !== Boolean(o.agent)) {
+    die('choose one delegation transport: --prepare, --session <sid> --agent claude|codex, or -- <command...>');
+  }
+  if (o.agent && !['claude', 'codex'].includes(o.agent)) die('agent must be claude or codex');
+  if (o.session && !delegation.SESSION_RE.test(o.session)) die('session id must contain only letters, digits, _ or -');
+
+  const callerAssignment = currentDelegation();
+  if (['active', 'stale', 'pending', 'invalid', 'identity-mismatch'].includes(callerAssignment.kind)) {
+    die(`${delegation.describe(callerAssignment)} The parent session must register further delegated work.`);
+  }
+
+  const parent = currentSession();
+  if (!parent || !delegation.SESSION_RE.test(parent.id)) die('keep delegate needs a current Claude or Codex parent session');
+  let task;
+  try { task = loadTask(o._[0]); } catch { die(`no task "${o._[0]}"`); }
+  let step;
+  try { step = delegation.snapshot(task, o.step, parsePlan); }
+  catch (error) { die(error.message); }
+  let record;
+  try { record = delegation.create(ROOT, { card: task.id, step, parent }); }
+  catch (error) { die(error.message); }
+
+  if (o.prepare) {
+    console.log(`prepared delegation ${record.id}: ${record.card} step ${record.step.number}`);
+    console.log(`worker accepts with: keep delegate --accept ${record.id}`);
+    return;
+  }
+  if (o.session) {
+    let bound;
+    try { bound = delegation.bind(ROOT, record.id, { id: o.session, agent: o.agent }, { source: 'registered' }); }
+    catch (error) {
+      delegation.end(ROOT, record, `binding failed: ${error.message}`);
+      die(error.message);
+    }
+    console.log(`registered delegation ${bound.id}: ${bound.card} step ${bound.step.number} to ${o.agent} session ${o.session}`);
+    return;
+  }
+
+  const launch = deps.spawn || spawn;
+  process.stderr.write(`keep: delegating ${record.card} step ${record.step.number} (${record.id})\n`);
+  let child;
+  try {
+    child = launch(command[0], command.slice(1), {
+      cwd: process.cwd(),
+      env: { ...process.env, KEEP_DELEGATION_ID: record.id },
+      stdio: 'inherit',
+    });
+  } catch (error) {
+    delegation.end(ROOT, record, `launch failed: ${error.message}`);
+    die(`could not launch delegated command: ${error.message}`);
+  }
+  const result = await new Promise((resolve) => {
+    child.once('error', (error) => resolve({ error }));
+    child.once('exit', (code, signal) => resolve({ code, signal }));
+  });
+  if (result.error) {
+    delegation.end(ROOT, record, `launch failed: ${result.error.message}`);
+    die(`could not launch delegated command: ${result.error.message}`);
+  }
+  if (result.signal) process.exitCode = 1;
+  else if (result.code) process.exitCode = result.code;
+};
+
 commands.link = (argv) => {
   const o = parseArgs(argv, { session: 'str', agent: 'str' });
   const id = o._[0];
@@ -1906,7 +2036,9 @@ commands.link = (argv) => {
 commands.claim = (argv) => {
   if (argv.length !== 1) die('usage: keep claim <card>');
   if (isReviewerSession()) die('the fleet reviewer cannot claim a card');
-  const session = currentSession();
+  const assigned = currentDelegation();
+  if (['pending', 'invalid', 'identity-mismatch'].includes(assigned.kind)) die(delegation.describe(assigned));
+  const session = commandSession();
   if (!session || !/^[A-Za-z0-9_-]+$/.test(session.id)) {
     die('keep claim needs a current Claude or Codex session');
   }
@@ -1915,6 +2047,9 @@ commands.claim = (argv) => {
   if (!linked) die(`no task "${id}"`);
   if (linked.skipped === 'outside-project') {
     die(`cannot claim ${id} outside its project (${linked.project}); run it from the project, or repair metadata explicitly with keep link ${id} --session ${session.id} --agent ${session.agent}`);
+  }
+  if ((assigned.kind === 'active' || assigned.kind === 'stale' || (assigned.kind === 'ended' && !assigned.explicit)) && assigned.record) {
+    delegation.end(ROOT, assigned.record, `claimed ${id}`);
   }
   console.log(`${id} claimed by current ${session.agent} session ${session.id}`);
 };
@@ -4315,12 +4450,17 @@ function codexHook(kind, input) {
     // Codex's SessionStart payload carries session_id and cwd like Claude's; the
     // hook binds the inherited host pane to the ID it just assigned.
     const pending = recordSessionPane(input, 'codex');
+    let delegationStatus = { kind: 'none' };
+    try {
+      delegationStatus = delegation.registerStart(ROOT, { id: input.session_id, agent: 'codex' }, process.env, delegationDependencies());
+    } catch {}
     recordCodexParent(input);
     if (codexStopState(input)) initializeStopCheck(input);
-    return pending;
+    return Promise.resolve(pending).then(() => ({ delegationStatus }));
   }
   if (kind === 'end') {
     clearCompletionMarker(input, 'codex');
+    try { delegation.markProcessEnd(ROOT, { id: input.session_id, agent: 'codex' }); } catch {}
     return;
   }
   if (kind === 'client-end') {
@@ -4464,8 +4604,17 @@ commands.hook = async (argv) => {
     // which blocks the tool call the way the Claude pre-bash hook does.
     try {
       if (codexInputValid) {
-        const blocked = await codexHook(argv[1], input);
-        if (argv[1] === 'stop' && blocked === true) return;
+        const result = await codexHook(argv[1], input);
+        if (argv[1] === 'stop' && result === true) return;
+        if (argv[1] === 'start' && result && delegation.describe(result.delegationStatus)) {
+          console.log(JSON.stringify({
+            hookSpecificOutput: {
+              hookEventName: 'SessionStart',
+              additionalContext: delegation.describe(result.delegationStatus),
+            },
+          }));
+          return;
+        }
       }
     } catch (error) {
       if (error && error.hookDeny) {
@@ -4515,6 +4664,7 @@ commands.hook = async (argv) => {
     // task state and unresolved permission/question markers remain untouched.
     try { clearCompletionMarker(input, 'claude'); } catch {}
     try { await releaseSessionPane(input); } catch {}
+    try { delegation.markProcessEnd(ROOT, { id: input.session_id, agent: 'claude' }); } catch {}
     // A reviewer that exits is tombstoned, not deleted: the scheduler must stop
     // ticking a dead pane, but a later `claude --resume` of this session (which
     // lacks KEEP_REVIEWER in its env) still needs the marker to keep its identity -
@@ -4576,11 +4726,17 @@ commands.hook = async (argv) => {
   // transcript's current end on every startup/resume hook instead.
   try { registerReviewerSession(input); } catch {}
   try { await recordSessionPane(input); } catch {}
+  let delegationStatus = { kind: 'none' };
+  try {
+    delegationStatus = delegation.registerStart(ROOT, { id: input.session_id, agent: 'claude' }, process.env, delegationDependencies());
+  } catch {}
   try { initializeStopCheck(input); } catch {}
   const cwd = input.cwd || process.cwd();
   const CAP = 10;
   const clip = (s, n = 160) => { s = String(s ?? ''); return s.length > n ? s.slice(0, n) + '…' : s; };
   const lines = [];
+  const delegationText = delegation.describe(delegationStatus);
+  if (delegationText) lines.push(delegationText);
   const overdue = loadAll(false).filter(isOverdue);
   if (overdue.length) {
     lines.push(`Overdue checks (${overdue.length}):`);
@@ -4605,7 +4761,7 @@ commands.hook = async (argv) => {
       lines.push(`- ${t.id} (${t.fm.status}): "${clip(t.fm.title)}"${last ? ` — last check-in: ${clip(last)}` : ''}${next ? ` — next: step ${next.n}/${total} ${clip(next.text, 100)}` : ''}`);
     }
     if (here.length > CAP) lines.push(`…and ${here.length - CAP} more (keep list)`);
-    lines.push('Before taking over existing work, run `keep claim <id>`; check-ins record contributions without changing resume ownership.');
+    if (!delegationText) lines.push('Before taking over existing work, run `keep claim <id>`; check-ins record contributions without changing resume ownership.');
   }
   for (const need of cleared) lines.push(`Need cleared: ${need.env} is set in this session, so ${need.task} is ${need.restored ? `${need.restored} again` : 'still blocked'} — "${clip(need.text)}".`);
   const needs = openNeeds(here);
@@ -4648,7 +4804,12 @@ commands.hook = async (argv) => {
   } catch {}
   const paragraphs = [];
   if (lines.length) {
-    paragraphs.push(`[keep — work registry]\n${lines.join('\n')}\nCheck in with \`keep checkin <id> -m "..."\` when status changes. File follow-up work with \`keep add "<title>" --file\`; ideas file without claiming by default, and \`--claim\` starts one now. Delegated workers given a parent card or step contribute to it without claiming it or opening a duplicate card. Conventions: read the shared keep skill (${path.join(ROOT, 'skills/keep/SKILL.md')}). Card status is not conversation readiness; scheduling a check yields this turn unless you also pass --handoff needs-input.`);
+    const workflow = delegationStatus.kind === 'active'
+      ? 'Return progress and evidence to the parent session; the parent owns Keep check-ins for this assignment.'
+      : delegationText
+        ? 'Ask the parent to refresh or reassign this delegation before continuing.'
+        : 'Check in with `keep checkin <id> -m "..."` when status changes. File follow-up work with `keep add "<title>" --file`; ideas file without claiming by default, and `--claim` starts one now.';
+    paragraphs.push(`[keep — work registry]\n${lines.join('\n')}\n${workflow} Delegated workers given a parent card or step contribute to it without claiming it or opening a duplicate card. Conventions: read the shared keep skill (${path.join(ROOT, 'skills/keep/SKILL.md')}). Card status is not conversation readiness; scheduling a check yields this turn unless you also pass --handoff needs-input.`);
   }
   if (nudge) paragraphs.push(nudge);
   if (paragraphs.length) console.log(paragraphs.join('\n\n'));
@@ -4699,6 +4860,7 @@ function normalizeStopEvidence(state, offset = 0) {
       at: state.authorized.at || '',
     };
   }
+  if (state && typeof state.delegationNotice === 'string') normalized.delegationNotice = state.delegationNotice;
   return normalized;
 }
 
@@ -5437,10 +5599,12 @@ function stopHook(input, agent = 'claude') {
     const preservedStart = state.startedAt;
     const preservedContinued = state.continued;
     const preservedAuthorized = state.authorized;
+    const preservedDelegationNotice = state.delegationNotice;
     state = emptyStopEvidence();
     if (preservedStart) state.startedAt = preservedStart;
     if (preservedContinued) state.continued = preservedContinued;
     if (preservedAuthorized) state.authorized = preservedAuthorized;
+    if (preservedDelegationNotice) state.delegationNotice = preservedDelegationNotice;
   }
   // A stale check-in still marks a boundary: edits before it were accounted
   // for. Restart the count from here so a resumed session is judged only on
@@ -5449,10 +5613,12 @@ function stopHook(input, agent = 'claude') {
     const preservedStart = state.startedAt;
     const preservedContinued = state.continued;
     const preservedAuthorized = state.authorized;
+    const preservedDelegationNotice = state.delegationNotice;
     state = emptyStopEvidence(size);
     if (preservedStart) state.startedAt = preservedStart;
     if (preservedContinued) state.continued = preservedContinued;
     if (preservedAuthorized) state.authorized = preservedAuthorized;
+    if (preservedDelegationNotice) state.delegationNotice = preservedDelegationNotice;
     state.checkinReset = checkinMt;
     fs.writeFileSync(stateFile, JSON.stringify(state));
   }
@@ -5491,6 +5657,22 @@ function stopHook(input, agent = 'claude') {
   // 30% of those got a bare "yes" from Owner. If the card already grants every
   // action the question is about, the answer is on the card, not in his inbox.
   const asked = stopAskedQuestion(transcriptState);
+  const assigned = delegation.resolveForCommand(ROOT, process.env, { id: sid, agent }, delegationDependencies());
+  // A human question remains a handoff even when the worker's assignment went
+  // stale. Otherwise valid delegations suppress every ownership/check-in nag and
+  // all parent-card auto-continuation, including permission-grant continuation.
+  if (assigned.kind === 'active') return;
+  if (assigned.kind === 'stale' || assigned.kind === 'invalid' || assigned.kind === 'pending') {
+    if (asked) return;
+    const notice = assigned.record
+      ? `${assigned.record.id}:${assigned.record.staleAt || assigned.reason || assigned.kind}`
+      : `${assigned.kind}:${assigned.id || ''}`;
+    if (state.delegationNotice === notice) return;
+    state.delegationNotice = notice;
+    fs.writeFileSync(stateFile, JSON.stringify(state));
+    console.log(JSON.stringify({ decision: 'block', reason: `[keep] ${delegation.describe(assigned)}` }));
+    return true;
+  }
   const grantCheck = asked && task ? allow.coversStop(task, transcriptState.lastAssistant) : null;
   const preauthorized = Boolean(grantCheck && grantCheck.covered);
 
@@ -6575,6 +6757,11 @@ ${stepUsage()}
                          # --model applies to the launched process only (never settings.json);
                          # -m waits for the agent's prompt and types the message;
                          # --fresh on a card links the new session and unlinks the caller's
+  keep delegate <card> --step <n> -- <command> [args]
+  keep delegate <card> --step <n> --prepare
+  keep delegate <card> --step <n> --session <sid> --agent claude|codex
+  keep delegate --accept <delegation-id> | --end
+                         # explicit worker assignment; parent retains card ownership, check-ins and permissions
   keep pane ls [--json] | show <pane> [--json]
   keep pane new [--cwd dir] [--name n] [--meta key=value]... [--cols n --rows n] -- <cmd> [args]
   keep pane send <pane> [--no-enter] [--] <text...> | resize <pane> <cols>x<rows>
@@ -6683,6 +6870,7 @@ module.exports = {
   commandUsage, helpText, formatOpenResult, openCommand: commands.open, postOpen, OPEN_MESSAGE_LIMIT, OPEN_MESSAGE_ERROR, LAUNCH_MODEL_RE,
   restoreCommandCli: commands.restore, resumeCommandCli: commands.resume, resumeCommand,
   accountsCommandCli: commands.accounts, handoffCommandCli: commands.handoff, transferCommandCli: commands.transfer,
+  delegateCommandCli: commands.delegate,
   artifactCommandCli: commands.artifact,
   resolveReviewBudgetTarget, reviewBudgetCommandCli: commands['review-budget'],
   hostCommandCli: commands.host, paneCommandCli: commands.pane, attachCommandCli: commands.attach,

@@ -284,12 +284,19 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   A session belongs to exactly one card. Routine check-ins, plan edits, retitles, and
   closures preserve all resume links while attributing their log entries to the
   contributing session.
-- The parent session owns the Keep check-in for work delegated to subagents. A
-  subagent's completion never closes or updates the card by itself. A delegated worker
-  given an explicit parent card or assigned plan step contributes to that work without
-  claiming the parent or creating a duplicate top-level card. The parent handoff should
-  name the card and step. Unrelated independent follow-up work may be deliberately filed
-  with `keep add "<title>" --file`.
+- The parent session owns the Keep check-in for work delegated to another agent. Register
+  the exact assignment with `keep delegate <card> --step <n> -- <command...>`. If the
+  launcher cannot carry environment variables, run `--prepare` and give the printed
+  `keep delegate --accept <id>` command to the worker, or register a known worker with
+  `--session <id> --agent claude|codex`. The assignment snapshots that exact plan
+  position and text; a changed, reordered, deleted, or completed step becomes stale and
+  must be reassigned rather than silently following the new step at position `n`.
+  The worker contributes without claiming the parent card, creating a duplicate top-level
+  card, advancing the parent's plan, or inheriting the parent's permissions. Return the
+  result and evidence to the parent. `keep delegate --end` deliberately leaves the
+  assignment; a successful explicit `keep claim` also leaves it. A resumed worker keeps
+  a still-valid assignment. Unrelated follow-up work may be deliberately filed with
+  `keep add "<title>" --file`; ideas continue to file without claiming by default.
 - Session completion notices are ephemeral unread-turn signals. Deliberately ending
   a session acknowledges only its completion notice; any linked Keep task retains
   its durable `active`, `waiting`, `blocked`, or `review` state.

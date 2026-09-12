@@ -105,6 +105,26 @@ work or move a session from its card. The reviewer uses that attribution for at 
 30 minutes of transcript context preceding the entry. Later unrelated activity from
 the contributor does not requeue the card.
 
+`keep delegate <card> --step <n> -- <command...>` records an explicit worker
+assignment and launches the command with its delegation id. The record lives only in
+`.keep/delegations/`; it does not alter the card's owner, status, schedule, plan, or
+permissions. SessionStart binds the id to the native child session from the hook input.
+For launchers that cannot preserve environment variables, use `--prepare` and have the
+worker run the printed `keep delegate --accept <id>` command first. A parent that already
+knows the native worker id can use `--session <id> --agent claude|codex` instead.
+
+Every record includes the parent session and an exact snapshot of the assigned plan
+position, text, acceptance criterion, and fingerprint. Keep never infers delegation from
+a title, current step, project, or inherited parent session id. If that position is
+changed, reordered, removed, completed, or its card closes, startup and Stop report a
+stale assignment and tell the worker to request reassignment. A SessionEnd tombstone is
+reactivated when the same native session resumes; `keep delegate --end` is explicit and
+never reactivates. An ordinary `keep add` is refused while an assignment is active or
+stale, with parent context, while `--file` and default-filed ideas remain available.
+A successful explicit `keep claim` ends the delegation after the claim succeeds; a
+failed claim leaves it intact. Delegated workers do not auto-run parent plan steps or
+consume permissions granted on the parent card. The parent records progress in Keep.
+
 An ordinary `keep add` keeps its historical behavior and claims the new task for the
 creating session. `--file` records follow-up work without moving that session. Ideas
 are filed by default; pass `--claim` when starting an idea immediately. The two flags
