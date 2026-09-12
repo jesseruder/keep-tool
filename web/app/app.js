@@ -90,7 +90,7 @@ const state = {
   layouts: [{ name: 'Pinned', ids: [], cols: 0, role: 'pinned' }], layout: 0, editing: false, pickFilter: '', currentActions: {},
   ensureSelectedVisible: true, focusPane: null, pendingFocus: false, currentItem: null,
   focusMode: restoredFocus,
-  historyTarget: null,
+  historyTarget: null, paneTarget: null,
 };
 const topBar = document.querySelector('.bar');
 const syncTopBarHeight = () => document.documentElement.style.setProperty('--top-bar-height', `${topBar.getBoundingClientRect().height}px`);
@@ -246,6 +246,12 @@ function matchesTriageFilter(item) {
 function triageVisible(item) { return (item.kind === 'pinned' || !state.dismissed.has(itemKey(item))) && matchesTriageFilter(item); }
 function retainedSelectionItem(item) {
   if (isClosingSession(item?.sessionId, item?.pane)) return null;
+  if (state.paneTarget?.pane === item?.pane) {
+    const pane = paneMap().get(item.pane);
+    if (!pane?.alive || !matchesTriageFilter(state.paneTarget)) { state.paneTarget = null; return null; }
+    const entity = entityForPane(item.pane);
+    return { ...state.paneTarget, project: entity.project, title: entity.title, state: entity.state };
+  }
   const session = sessionFor(item);
   if (state.historyTarget?.sessionId && state.historyTarget.sessionId === item?.sessionId && matchesTriageFilter(item)) return session
     ? sessionItem('recent', session) : { ...state.historyTarget, kind: 'recent', pane: null, state: 'exited' };
@@ -855,6 +861,7 @@ function navigateHistory(entry, focus = true) {
   state.mode = watch ? 'watch' : 'triage';
   if (watch) { state.layout = layout; state.editing = false; }
   state.filter = null;
+  state.paneTarget = null;
   if (state.focusMode) toggleFocus(false, false);
   state.historyTarget = { ...entry, kind: 'recent', state: 'exited', pane: null };
   state.currentItem = session ? sessionItem('recent', session) : state.historyTarget;
@@ -884,6 +891,19 @@ const ctx = {
     }
     navigateHistory({ sessionId, view: 'triage' });
     refresh();
+  },
+  openReviewPane(paneId) {
+    const pane = paneMap().get(paneId);
+    if (!pane?.alive) { toast('The saved successor pane is no longer available'); return false; }
+    const entity = entityForPane(paneId);
+    const item = { kind: 'running', pane: paneId, project: entity.project, title: entity.title, state: entity.state };
+    state.mode = 'triage'; state.filter = null;
+    if (state.focusMode) toggleFocus(false, false);
+    state.paneTarget = item; state.currentItem = item; state.selectedKey = triageKey(item);
+    state.ensureSelectedVisible = true; state.focused = false; state.focusPane = paneId;
+    try { localStorage.setItem('keep-mode', state.mode); } catch {}
+    refresh();
+    return true;
   },
   openReviewCard(cardId) {
     const session = data.sessions.find((candidate) => candidate.taskId === cardId && !candidate.reviewer);

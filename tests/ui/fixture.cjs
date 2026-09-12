@@ -238,7 +238,7 @@ async function createFixture() {
       client.pane = pane.id;
       const attached = { ...pane, cols: 100, rows: 30, primary: url.searchParams.get('primary') === '1' ? url.searchParams.get('viewer') : null };
       client.send(JSON.stringify({ t: 'attached', pane: attached }));
-      client.send(Buffer.from(`\x1b[2J\x1b[HFAKE SESSION ${pane.meta.sessionId.toUpperCase()}\r\nfixture> `));
+      client.send(Buffer.from(`\x1b[2J\x1b[HFAKE SESSION ${(pane.meta.sessionId || pane.id).toUpperCase()}\r\nfixture> `));
       client.send(JSON.stringify({ t: 'replay-end' }));
       client.on('message', (bytes, binary) => {
         if (binary) { record('input', { pane: pane.id, text: bytes.toString() }); client.send(bytes); return; }

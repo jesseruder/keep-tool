@@ -36,6 +36,14 @@ function applySavedInputs(state, saved, fallbackTransfer) {
   if (inputs && Object.hasOwn(inputs, 'context')) state.context = inputs.context;
 }
 
+function openExistingSuccessor(ctx, transfer) {
+  if (transfer.destinationSessionId) { ctx.openReviewSession(transfer.destinationSessionId); return true; }
+  const pane = transfer.destinationPane && ctx.paneMap().get(transfer.destinationPane);
+  if (!pane?.alive || pane.meta?.portableTransferId !== transfer.id
+      || pane.meta?.accountId !== transfer.targetAccountId || pane.meta?.card !== transfer.cardId) return false;
+  return ctx.openReviewPane(transfer.destinationPane) === true;
+}
+
 function renderDialog(ctx, state) {
   const modal = ensureDialog();
   const transfer = state.transfer;
@@ -123,8 +131,8 @@ function renderDialog(ctx, state) {
     state.transfer = null; state.preview = ''; state.error = ''; renderDialog(ctx, state);
   });
   modal.querySelector('[data-open-setup]')?.addEventListener('click', () => {
-    if (transfer.destinationSessionId) { modal.close(); ctx.openReviewSession(transfer.destinationSessionId); }
-    else { state.error = 'The successor is still registering its session id; reopen this transfer shortly.'; renderDialog(ctx, state); }
+    if (openExistingSuccessor(ctx, transfer)) modal.close();
+    else { state.error = 'The saved successor pane is no longer available or its identity changed.'; renderDialog(ctx, state); }
   });
   modal.querySelector('[data-retry-delivery]')?.addEventListener('click', async (event) => {
     event.currentTarget.disabled = true; state.error = '';

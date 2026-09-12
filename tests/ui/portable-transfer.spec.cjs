@@ -216,3 +216,26 @@ test('trust-blocked transfer foregrounds and retries the existing successor afte
   expect(fixture.state.sessions.filter(session => session.id === 'trust-successor')).toHaveLength(1);
   expect(fixture.events.filter(event => event.event === 'request' && event.path === '/api/transfer-session')).toHaveLength(1);
 });
+
+test('trust-blocked Codex successor opens its saved pane before a session id exists', async ({ page }) => {
+  const transfer = fixture.portableTransfers[0];
+  Object.assign(transfer, { status: 'awaiting-setup', policyVersion: 2, openingStatus: 'pending',
+    setupKind: 'workspace-trust', destinationSessionId: null, destinationPane: 'unregistered-trust-pane' });
+  fixture.state.panes.push({ id: transfer.destinationPane, pid: 903, alive: true, cwd: transfer.cwd,
+    meta: { agent: 'codex', accountId: transfer.targetAccountId, card: transfer.cardId,
+      portableTransferId: transfer.id, title: 'Codex workspace trust' } });
+  fixture.publish();
+
+  await page.locator('#qlist [data-key="running:b"]').click();
+  await page.locator('#stage [data-review-portable="portable-one"]').click();
+  const modal = page.locator('.portable-transfer-dialog');
+  await expect(modal).toContainText('waiting for workspace trust');
+  await modal.locator('[data-open-setup]').click();
+
+  await expect(modal).not.toBeVisible();
+  await expect(page.locator('#stage')).toHaveAttribute('data-item-key', 'unregistered-trust-pane');
+  await expect(page.locator('#stage')).toHaveAttribute('data-pane', 'unregistered-trust-pane');
+  await expect(page.locator('#stage')).toContainText('Codex workspace trust');
+  await expect(page.locator('#stage .xterm-helper-textarea')).toBeFocused();
+  expect(fixture.events.filter(event => event.event === 'request' && event.path === '/api/transfer-session')).toHaveLength(0);
+});
