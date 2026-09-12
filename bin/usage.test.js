@@ -199,6 +199,139 @@ test('account refresh failures have separate cooldowns, snapshots, and default c
   assert.equal(view.accounts['claude/default'].limits[0].percent, 50);
 });
 
+test('cached account errors do not inflate usage health between real retries', async () => {
+  const configured = [
+    { id: 'claude/default', label: 'Primary', agent: 'claude', configDir: '/profiles/default', builtIn: true },
+    { id: 'claude-secondary', label: 'Secondary', agent: 'claude', configDir: '/profiles/secondary' },
+  ];
+  const accountApi = {
+    list: () => configured,
+    defaultFor: () => configured[0],
+  };
+  let streak = 0;
+  const records = [];
+  const healthApi = { record: (name, options) => {
+    if (options.ok === false) streak += 1;
+    else if (!options.skipped) streak = 0;
+    records.push({ name, options, streak });
+  } };
+  const manager = createUsageManager({ accounts: accountApi, health: healthApi });
+  const firstAt = 10 ** 12;
+  let secondaryFails = true;
+  const refresh = async (account) => {
+    if (account.id === 'claude-secondary' && secondaryFails) throw Object.assign(new Error('limited'), { code: 429 });
+    return { limits: [{ label: 'week', percent: account.id === 'claude/default' ? 20 : 40 }], fetchedAt: firstAt };
+  };
+
+  manager.requestRefresh(firstAt, refresh);
+  await settleRefresh();
+  assert.deepEqual(records.at(-1), {
+    name: 'usage', options: { ok: false, error: 'Secondary: HTTP 429' }, streak: 1,
+  });
+  assert.equal(manager._view().accounts['claude-secondary'].error, 'HTTP 429', 'rate limit remains visible in the cached account view');
+  assert.equal(manager._states.get('claude-secondary').backoffMs, 4 * 60e3);
+
+  manager.requestRefresh(firstAt + 61e3, refresh);
+  await settleRefresh();
+  manager.requestRefresh(firstAt + 122e3, refresh);
+  await settleRefresh();
+  assert.equal(records.filter((entry) => entry.options.ok === false).length, 1, 'healthy account refreshes do not recount a cached failure');
+  assert.deepEqual(records.slice(-2).map((entry) => ({ options: entry.options, streak: entry.streak })), [
+    { options: { ok: true, skipped: true, detail: 'waiting for failed account retry' }, streak: 1 },
+    { options: { ok: true, skipped: true, detail: 'waiting for failed account retry' }, streak: 1 },
+  ]);
+
+  manager.requestRefresh(firstAt + 5 * 60e3 + 1, refresh);
+  await settleRefresh();
+  assert.deepEqual(records.at(-1), {
+    name: 'usage', options: { ok: false, error: 'Secondary: HTTP 429' }, streak: 2,
+  });
+  assert.equal(manager._states.get('claude-secondary').backoffMs, 8 * 60e3, 'real retry failures retain exponential backoff');
+
+  secondaryFails = false;
+  manager.requestRefresh(firstAt + 14 * 60e3 + 2, refresh);
+  await settleRefresh();
+  assert.deepEqual(records.at(-1), { name: 'usage', options: { ok: true }, streak: 0 });
+  assert.equal(manager._view().accounts['claude-secondary'].error, undefined);
+  assert.equal(manager._states.get('claude-secondary').backoffMs, 0);
+});
+
+test('failures from accounts removed during refresh do not create stale health alerts', async () => {
+  const configured = [
+    { id: 'claude/default', label: 'Primary', agent: 'claude', configDir: '/profiles/default', builtIn: true },
+    { id: 'claude-retired', label: 'Retired', agent: 'claude', configDir: '/profiles/retired' },
+  ];
+  const accountApi = { list: () => configured, defaultFor: () => configured[0] };
+  const records = [];
+  const manager = createUsageManager({ accounts: accountApi, health: { record: (name, options) => records.push({ name, options }) } });
+  let rejectRetired;
+  manager.requestRefresh(10 ** 12, async (account) => {
+    if (account.id === 'claude-retired') return new Promise((_resolve, reject) => { rejectRetired = reject; });
+    return { limits: [{ label: 'week', percent: 10 }], fetchedAt: 10 ** 12 };
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  configured.pop();
+  manager._view();
+  rejectRetired(Object.assign(new Error('limited'), { code: 429 }));
+  await settleRefresh();
+  assert.deepEqual(records, [{ name: 'usage', options: { ok: true } }]);
+  assert.equal(manager._states.has('claude-retired'), false);
+});
+
+test('removing a cached failing account clears health without waiting for another refresh', async () => {
+  const configured = [
+    { id: 'claude/default', label: 'Primary', agent: 'claude', configDir: '/profiles/default', builtIn: true },
+    { id: 'claude-retired', label: 'Retired', agent: 'claude', configDir: '/profiles/retired' },
+  ];
+  const accountApi = { list: () => configured, defaultFor: () => configured[0] };
+  const records = [];
+  const manager = createUsageManager({ accounts: accountApi, health: { record: (name, options) => records.push({ name, options }) } });
+  const firstAt = 10 ** 12;
+  manager.requestRefresh(firstAt, async (account) => {
+    if (account.id === 'claude-retired') throw Object.assign(new Error('limited'), { code: 429 });
+    return { limits: [{ label: 'week', percent: 10 }], fetchedAt: firstAt };
+  });
+  await settleRefresh();
+  assert.deepEqual(records.at(-1), { name: 'usage', options: { ok: false, error: 'Retired: HTTP 429' } });
+
+  configured.pop();
+  assert.equal(manager.requestRefresh(firstAt + 1000, async () => { throw new Error('not due'); }), false);
+  assert.deepEqual(records.at(-1), { name: 'usage', options: { ok: true } });
+  assert.equal(manager._states.has('claude-retired'), false);
+});
+
+test('a delayed batch cannot reapply a failure after that account recovers', async () => {
+  const configured = [
+    { id: 'claude-fast', label: 'Fast', agent: 'claude', configDir: '/profiles/fast' },
+    { id: 'claude-slow', label: 'Slow', agent: 'claude', configDir: '/profiles/slow' },
+  ];
+  const accountApi = { list: () => configured, defaultFor: () => configured[0] };
+  const records = [];
+  const manager = createUsageManager({ accounts: accountApi, health: { record: (name, options) => records.push({ name, options }) } });
+  const firstAt = 10 ** 12;
+  let resolveSlow;
+  manager.requestRefresh(firstAt, async (account) => {
+    if (account.id === 'claude-fast') throw Object.assign(new Error('limited'), { code: 429 });
+    return new Promise((resolve) => { resolveSlow = resolve; });
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(manager._view().accounts['claude-fast'].error, 'HTTP 429');
+  assert.equal(records.length, 0, 'the original batch remains pending on the slow account');
+
+  manager.requestRefresh(firstAt + 5 * 60e3 + 1, async (account) => ({
+    limits: [{ label: 'week', percent: account.id === 'claude-fast' ? 25 : 50 }], fetchedAt: firstAt + 5 * 60e3 + 1,
+  }));
+  await settleRefresh();
+  assert.equal(manager._view().accounts['claude-fast'].error, undefined);
+  assert.deepEqual(records, [{ name: 'usage', options: { ok: true } }]);
+
+  resolveSlow({ limits: [{ label: 'week', percent: 50 }], fetchedAt: firstAt });
+  await settleRefresh();
+  assert.equal(records.some((entry) => entry.options.ok === false), false);
+  assert.deepEqual(records.at(-1), { name: 'usage', options: { ok: true } });
+});
+
 test('disk cache keeps Claude snapshots keyed by account', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-usage-cache-'));
   const file = path.join(dir, 'usage.json');

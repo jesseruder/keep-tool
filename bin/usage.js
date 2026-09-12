@@ -221,20 +221,27 @@ function scanCodexAccount(account, deps = {}) {
 
 function createUsageManager(deps = {}) {
   const accountApi = deps.accounts || accounts;
+  const healthApi = deps.health || health;
   const states = new Map();
   let onChange = () => {};
   let cacheFile = null;
+  let configurationRemovedFailure = false;
 
   function configured() { return accountApi.list(deps.env || process.env); }
 
   function sync() {
     const current = configured();
     const ids = new Set(current.map((account) => account.id));
-    for (const id of states.keys()) if (!ids.has(id)) states.delete(id);
+    for (const [id, state] of states) {
+      if (ids.has(id)) continue;
+      if (state.snapshot.error) configurationRemovedFailure = true;
+      states.delete(id);
+    }
     for (const account of current) {
       const prior = states.get(account.id);
       if (!prior || prior.account.agent !== account.agent || prior.account.configDir !== account.configDir) {
-        states.set(account.id, { account, snapshot: emptySnapshot(account.agent), lastStartedAt: 0, backoffMs: 0, inFlight: null });
+        if (prior && prior.snapshot.error) configurationRemovedFailure = true;
+        states.set(account.id, { account, snapshot: emptySnapshot(account.agent), lastStartedAt: 0, backoffMs: 0, generation: 0, inFlight: null });
       } else prior.account = account;
     }
     return current;
@@ -299,27 +306,53 @@ function createUsageManager(deps = {}) {
       const interval = account.agent === 'claude' ? CLAUDE_REFRESH_MS + state.backoffMs : CODEX_REFRESH_MS;
       if (state.inFlight || now - state.lastStartedAt < interval) continue;
       state.lastStartedAt = now;
+      const generation = ++state.generation;
       state.inFlight = new Promise((resolve) => setImmediate(resolve))
         .then(() => performRefresh(state.account, state.snapshot))
         .then((value) => {
           if (value) state.snapshot = value;
           delete state.snapshot.error;
           if (account.agent === 'claude') { state.backoffMs = 0; saveCache(); }
+          return { account, state, generation, ok: true };
         }, (error) => {
-          state.snapshot = { ...state.snapshot, error: shortError(account.agent === 'claude' ? 'Claude' : 'Codex', error) };
+          const message = shortError(account.agent === 'claude' ? 'Claude' : 'Codex', error);
+          state.snapshot = { ...state.snapshot, error: message };
           if (account.agent === 'claude') state.backoffMs = Math.min(state.backoffMs ? state.backoffMs * 2 : 4 * 60e3, 29 * 60e3);
+          return { account, state, generation, ok: false, error: message };
         })
         .finally(() => { state.inFlight = null; try { onChange(); } catch {} });
-      started.push(state.inFlight);
+      started.push({ account, state, generation, promise: state.inFlight });
     }
     if (started.length) {
-      Promise.allSettled(started).then(() => {
-        const errors = Object.values(view().accounts).map((entry) => entry.error).filter(Boolean);
-        health.record('usage', errors.length ? { ok: false, error: errors.join('; ') } : { ok: true });
+      Promise.allSettled(started.map((attempt) => attempt.promise)).then((results) => {
+        sync();
+        const outcomes = results.map((result, index) => result.status === 'fulfilled' ? result.value : {
+          ...started[index], ok: false,
+          error: shortError(started[index].account.agent === 'claude' ? 'Claude' : 'Codex', result.reason),
+        });
+        const failures = outcomes.filter((outcome) => !outcome.ok
+          && states.get(outcome.account.id) === outcome.state
+          && outcome.state.generation === outcome.generation);
+        if (failures.length) {
+          const error = failures.map((outcome) => `${outcome.account.label || outcome.account.id}: ${outcome.error}`).join('; ');
+          healthApi.record('usage', { ok: false, error });
+          return;
+        }
+        const cachedErrors = [...states.values()].filter((state) => state.snapshot.error);
+        if (!cachedErrors.length) configurationRemovedFailure = false;
+        healthApi.record('usage', cachedErrors.length
+          ? { ok: true, skipped: true, detail: 'waiting for failed account retry' }
+          : { ok: true });
       });
       return true;
     }
-    if (![...states.values()].some((state) => state.inFlight)) health.record('usage', { ok: true, skipped: true, detail: 'nothing due' });
+    if (![...states.values()].some((state) => state.inFlight)) {
+      const cachedErrors = [...states.values()].some((state) => state.snapshot.error);
+      if (configurationRemovedFailure && !cachedErrors) {
+        configurationRemovedFailure = false;
+        healthApi.record('usage', { ok: true });
+      } else healthApi.record('usage', { ok: true, skipped: true, detail: 'nothing due' });
+    }
     return false;
   }
 
