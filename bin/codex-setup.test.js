@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 const toml = require('@iarna/toml');
 const setup = require('./codex-setup');
 const launcher = require('./agent-launcher');
@@ -64,8 +65,9 @@ function fixture() {
     command: 'node', args: [path.join(plugin, 'scripts', 'launch.mjs')], env: { CODEX_HOME: sourceDir,
       NODE_REPL_TRUSTED_SERVICES: JSON.stringify([{ path: path.join(plugin, 'scripts', 'launch.mjs') }]) },
   } } }));
-  fs.writeFileSync(path.join(plugin, 'scripts', 'launch.mjs'), 'process.exit(0)\n');
+  fs.writeFileSync(path.join(plugin, 'scripts', 'launch.mjs'), "import fs from 'node:fs'; import path from 'node:path'; fs.writeFileSync(path.join(import.meta.dirname, '..', 'extension-host-config.json'), 'target runtime');\n");
   fs.writeFileSync(path.join(plugin, 'skills', 'sample', 'SKILL.md'), '---\nname: sample\ndescription: sample skill\n---\n');
+  fs.symlinkSync('1.2.3', path.join(sourceDir, 'plugins', 'cache', 'bundled', 'sample', 'latest'));
   return { root, sourceDir, targetDir, externalMarketplace, localMarketplace, source, target, sourceConfig,
     cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
 }
@@ -137,11 +139,86 @@ test('skills, instructions, local marketplaces and exact plugin versions are por
     assert.equal(metadata.mcpServers.sample.env.CODEX_HOME, f.targetDir);
     assert.equal(JSON.parse(metadata.mcpServers.sample.env.NODE_REPL_TRUSTED_SERVICES)[0].path,
       path.join(targetPlugin, 'scripts', 'launch.mjs'));
-    assert.equal(fs.lstatSync(path.join(targetPlugin, 'scripts', 'launch.mjs')).isSymbolicLink(), true);
+    assert.equal(fs.lstatSync(path.join(targetPlugin, 'scripts', 'launch.mjs')).isSymbolicLink(), false);
     assert.equal(fs.lstatSync(path.join(targetPlugin, 'skills', 'sample', 'SKILL.md')).isSymbolicLink(), false,
       'Codex plugin discovery requires materialized SKILL.md files');
     assert.equal(fs.existsSync(path.join(f.targetDir, 'plugins', '.plugin-appserver')), false);
     assert.equal(fs.existsSync(path.join(f.targetDir, 'plugins', '.remote-plugin-install-staging')), false);
+    assert.equal(fs.realpathSync(path.join(f.targetDir, 'plugins', 'cache', 'bundled', 'sample', 'latest')), fs.realpathSync(targetPlugin));
+    const ran = spawnSync(process.execPath, [path.join(targetPlugin, 'scripts', 'launch.mjs')], { encoding: 'utf8' });
+    assert.equal(ran.status, 0, ran.stderr);
+    assert.equal(fs.existsSync(path.join(targetPlugin, 'extension-host-config.json')), true);
+    assert.equal(fs.existsSync(path.join(f.sourceDir, 'plugins', 'cache', 'bundled', 'sample', '1.2.3', 'extension-host-config.json')), false);
+
+    const sourcePlugin2 = path.join(f.sourceDir, 'plugins', 'cache', 'bundled', 'sample', '2.0.0');
+    fs.cpSync(path.join(f.sourceDir, 'plugins', 'cache', 'bundled', 'sample', '1.2.3'), sourcePlugin2, { recursive: true });
+    fs.unlinkSync(path.join(f.sourceDir, 'plugins', 'cache', 'bundled', 'sample', 'latest'));
+    fs.symlinkSync('2.0.0', path.join(f.sourceDir, 'plugins', 'cache', 'bundled', 'sample', 'latest'));
+    setup.refresh(f.target);
+    assert.equal(fs.realpathSync(path.join(f.targetDir, 'plugins', 'cache', 'bundled', 'sample', 'latest')),
+      fs.realpathSync(path.join(f.targetDir, 'plugins', 'cache', 'bundled', 'sample', '2.0.0')));
+  } finally { f.cleanup(); }
+});
+
+test('managed same-version plugin metadata refreshes, preserves target edits, and publishes through a stage', () => {
+  const f = fixture();
+  const version = path.join('bundled', 'sample', '1.2.3');
+  const sourceMetadata = path.join(f.sourceDir, 'plugins', 'cache', version, '.mcp.json');
+  const targetMetadata = path.join(f.targetDir, 'plugins', 'cache', version, '.mcp.json');
+  try {
+    assert.throws(() => setup.shareSetup(f.source, f.target, { beforePluginCommit() { throw new Error('staged failure'); } }), /staged failure/);
+    assert.equal(fs.existsSync(path.dirname(targetMetadata)), false);
+    assert.equal(fs.readdirSync(path.join(f.targetDir, 'plugins', 'cache', 'bundled', 'sample')).some((name) => name.includes('.keep-stage-')), false);
+
+    setup.shareSetup(f.source, f.target);
+    const changed = JSON.parse(fs.readFileSync(sourceMetadata));
+    changed.mcpServers.sample.args.push(path.join(f.sourceDir, 'updated.js'));
+    fs.writeFileSync(sourceMetadata, JSON.stringify(changed));
+    setup.refresh(f.target);
+    assert.equal(JSON.parse(fs.readFileSync(targetMetadata)).mcpServers.sample.args.at(-1), path.join(f.targetDir, 'updated.js'));
+
+    const overridden = JSON.parse(fs.readFileSync(targetMetadata));
+    overridden.mcpServers.sample.env.LOCAL_ONLY = 'yes';
+    fs.writeFileSync(targetMetadata, JSON.stringify(overridden));
+    setup.refresh(f.target);
+    assert.equal(JSON.parse(fs.readFileSync(targetMetadata)).mcpServers.sample.env.LOCAL_ONLY, 'yes');
+  } finally { f.cleanup(); }
+});
+
+test('symlinked source metadata and skills become rebased regular files', () => {
+  const f = fixture();
+  const plugin = path.join(f.sourceDir, 'plugins', 'cache', 'bundled', 'sample', '1.2.3');
+  try {
+    const metadata = path.join(f.root, 'source-metadata.json');
+    fs.renameSync(path.join(plugin, '.mcp.json'), metadata);
+    fs.symlinkSync(metadata, path.join(plugin, '.mcp.json'));
+    const skill = path.join(f.root, 'source-skill.md');
+    fs.renameSync(path.join(plugin, 'skills', 'sample', 'SKILL.md'), skill);
+    fs.symlinkSync(skill, path.join(plugin, 'skills', 'sample', 'SKILL.md'));
+    setup.shareSetup(f.source, f.target);
+    const targetPlugin = path.join(f.targetDir, 'plugins', 'cache', 'bundled', 'sample', '1.2.3');
+    assert.equal(fs.lstatSync(path.join(targetPlugin, '.mcp.json')).isSymbolicLink(), false);
+    assert.equal(fs.lstatSync(path.join(targetPlugin, 'skills', 'sample', 'SKILL.md')).isSymbolicLink(), false);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(targetPlugin, '.mcp.json'))).mcpServers.sample.env.CODEX_HOME, f.targetDir);
+  } finally { f.cleanup(); }
+});
+
+test('invalid critical plugin metadata and concurrent target config edits fail before publication', () => {
+  const f = fixture();
+  const sourcePlugin = path.join(f.sourceDir, 'plugins', 'cache', 'bundled', 'sample', '1.2.3');
+  const targetPlugin = path.join(f.targetDir, 'plugins', 'cache', 'bundled', 'sample', '1.2.3');
+  try {
+    fs.writeFileSync(path.join(sourcePlugin, '.mcp.json'), '{ invalid');
+    assert.throws(() => setup.shareSetup(f.source, f.target), /invalid JSON/);
+    assert.equal(fs.existsSync(targetPlugin), false);
+    fs.writeFileSync(path.join(sourcePlugin, '.mcp.json'), '{}');
+
+    assert.throws(() => setup.shareSetup(f.source, f.target, { beforeConfigCommit() {
+      const config = toml.parse(fs.readFileSync(path.join(f.targetDir, 'config.toml'), 'utf8'));
+      config.model = 'concurrent-model-change';
+      writeToml(path.join(f.targetDir, 'config.toml'), config);
+    } }), /config changed during capability sync/);
+    assert.equal(toml.parse(fs.readFileSync(path.join(f.targetDir, 'config.toml'), 'utf8')).model, 'concurrent-model-change');
   } finally { f.cleanup(); }
 });
 

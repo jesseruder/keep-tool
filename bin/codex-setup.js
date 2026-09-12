@@ -3,6 +3,7 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
+const { isDeepStrictEqual } = require('node:util');
 const toml = require('@iarna/toml');
 
 const MANIFEST = '.keep-codex-capabilities.json';
@@ -241,8 +242,13 @@ function syncMarketplaceAssets(sourceConfig, sourceDir, targetDir, previous = {}
   return assets;
 }
 
-function rewriteJsonMetadata(source, destination, sourceDir, targetDir) {
-  const value = readJSON(source);
+function rewriteJsonMetadata(source, destination, sourceDir, targetDir, strict = false) {
+  let value;
+  try { value = readJSON(source); }
+  catch (error) {
+    if (strict) throw error;
+    return fs.copyFileSync(source, destination);
+  }
   function rebaseMetadata(child) {
     if (typeof child === 'string') {
       const rebased = rebaseString(child, sourceDir, targetDir);
@@ -259,25 +265,32 @@ function rewriteJsonMetadata(source, destination, sourceDir, targetDir) {
   writeJSON(destination, rebaseMetadata(value));
 }
 
-function materializePluginTree(source, target, sourceDir, targetDir) {
+const GENERATED_PLUGIN_FILES = new Set(['extension-host-config.json']);
+
+function materializePluginTree(source, target, sourceDir, targetDir, relative = '') {
   fs.mkdirSync(target, { recursive: true, mode: 0o700 });
-  for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
-    const from = path.join(source, entry.name), to = path.join(target, entry.name);
-    if (entry.isDirectory()) materializePluginTree(from, to, sourceDir, targetDir);
-    else if (entry.isFile() && entry.name.endsWith('.json')) rewriteJsonMetadata(from, to, sourceDir, targetDir);
-    else if (entry.isFile() && entry.name === 'SKILL.md') {
-      if (pathExists(to) && fs.lstatSync(to).isSymbolicLink()) fs.unlinkSync(to);
-      fs.copyFileSync(from, to);
+  for (const name of fs.readdirSync(source)) {
+    const childRelative = relative ? path.join(relative, name) : name;
+    if (GENERATED_PLUGIN_FILES.has(childRelative)) continue;
+    const from = path.join(source, name), to = path.join(target, name);
+    const stat = fs.statSync(from);
+    if (stat.isDirectory()) materializePluginTree(from, to, sourceDir, targetDir, childRelative);
+    else if (stat.isFile() && name.endsWith('.json')) {
+      const strict = name === '.mcp.json' || childRelative === path.join('.codex-plugin', 'plugin.json');
+      rewriteJsonMetadata(from, to, sourceDir, targetDir, strict);
     }
-    else if (!pathExists(to)) fs.symlinkSync(canonical(from), to);
+    else if (stat.isFile()) {
+      fs.copyFileSync(from, to);
+      fs.chmodSync(to, stat.mode & 0o777);
+    }
   }
 }
 
-function pluginVersions(configDir) {
+function pluginPackages(configDir) {
   const root = path.join(configDir, 'plugins', 'cache');
-  const result = [];
+  const versions = [], aliases = [];
   let marketplaces = [];
-  try { marketplaces = fs.readdirSync(root); } catch { return result; }
+  try { marketplaces = fs.readdirSync(root); } catch { return { versions, aliases }; }
   for (const marketplace of marketplaces) {
     const marketRoot = path.join(root, marketplace);
     if (!fs.statSync(marketRoot).isDirectory()) continue;
@@ -286,25 +299,156 @@ function pluginVersions(configDir) {
       if (!fs.statSync(pluginRoot).isDirectory()) continue;
       for (const version of fs.readdirSync(pluginRoot)) {
         const versionRoot = path.join(pluginRoot, version);
-        if (fs.statSync(versionRoot).isDirectory() && pathExists(path.join(versionRoot, '.codex-plugin', 'plugin.json'))) {
-          result.push({ relative: path.join(marketplace, plugin, version), source: versionRoot });
+        const relative = path.join(marketplace, plugin, version);
+        if (fs.lstatSync(versionRoot).isSymbolicLink()) {
+          const resolved = canonical(versionRoot);
+          if (resolved.startsWith(canonical(pluginRoot) + path.sep)) {
+            aliases.push({ relative, version: path.basename(resolved) });
+          }
+        } else if (fs.statSync(versionRoot).isDirectory() && pathExists(path.join(versionRoot, '.codex-plugin', 'plugin.json'))) {
+          versions.push({ relative, source: versionRoot });
         }
       }
     }
   }
+  return { versions, aliases };
+}
+
+function filesIn(root) {
+  const result = new Map();
+  function visit(directory, prefix = '') {
+    for (const name of fs.readdirSync(directory)) {
+      const relative = prefix ? path.join(prefix, name) : name;
+      const file = path.join(directory, name);
+      const stat = fs.statSync(file);
+      if (stat.isDirectory()) visit(file, relative);
+      else if (stat.isFile()) result.set(relative, file);
+    }
+  }
+  visit(root);
   return result;
 }
 
-function syncPlugins(sourceDir, targetDir, previous = []) {
-  const managed = [];
-  for (const entry of pluginVersions(sourceDir)) {
-    const destination = path.join(targetDir, 'plugins', 'cache', entry.relative);
-    const wasManaged = previous.includes(entry.relative);
-    if (pathExists(destination) && !wasManaged) continue;
-    if (!pathExists(destination)) materializePluginTree(entry.source, destination, sourceDir, targetDir);
-    managed.push(entry.relative);
+function fileDigest(file) {
+  if (!file || !pathExists(file)) return 'missing';
+  return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
+function publishFile(source, target) {
+  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+  const temporary = `${target}.${process.pid}.${Date.now()}.tmp`;
+  fs.copyFileSync(source, temporary);
+  fs.chmodSync(temporary, fs.statSync(source).mode & 0o777);
+  fs.renameSync(temporary, target);
+}
+
+function syncPluginVersion(entry, destination, sourceDir, targetDir, previous, options) {
+  const parent = path.dirname(destination);
+  fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+  const stage = fs.mkdtempSync(path.join(parent, `.${path.basename(destination)}.keep-stage-`));
+  try {
+    materializePluginTree(entry.source, stage, sourceDir, targetDir);
+    options.beforePluginCommit?.(stage, destination);
+    const desired = filesIn(stage);
+    if (!pathExists(destination)) {
+      const records = Object.fromEntries([...desired].map(([relative, file]) => [relative,
+        { sourceHash: fileDigest(file), targetHash: fileDigest(file), managed: true }]));
+      fs.renameSync(stage, destination);
+      return records;
+    }
+    if (!previous) return null;
+    const targetFiles = filesIn(destination);
+    const keys = new Set([...desired.keys(), ...targetFiles.keys(), ...Object.keys(previous)]);
+    const decisions = new Map(), conflicts = [];
+    for (const relative of [...keys].sort()) {
+      if (GENERATED_PLUGIN_FILES.has(relative) && !desired.has(relative)) continue;
+      const sourceHash = fileDigest(desired.get(relative));
+      const targetHash = fileDigest(targetFiles.get(relative));
+      const prior = previous[relative];
+      let managed = false;
+      if (!prior) {
+        managed = sourceHash !== 'missing' && (targetHash === 'missing' || sourceHash === targetHash);
+      } else {
+        const sourceChanged = sourceHash !== prior.sourceHash;
+        const targetChanged = targetHash !== prior.targetHash;
+        managed = prior.managed === true;
+        if (sourceChanged && targetChanged && sourceHash !== targetHash) conflicts.push(relative);
+        else if (managed && targetChanged && !sourceChanged) managed = false;
+        else if (sourceChanged && targetChanged && sourceHash === targetHash) managed = true;
+      }
+      decisions.set(relative, { sourceHash, targetHash, managed, prior });
+    }
+    if (conflicts.length) throw new Error(`Codex plugin sync conflicts at ${entry.relative}/${conflicts.join(`, ${entry.relative}/`)}`);
+    for (const [relative, decision] of decisions) {
+      const desiredFile = desired.get(relative), targetFile = path.join(destination, relative);
+      const sourceChanged = !decision.prior || decision.sourceHash !== decision.prior.sourceHash;
+      const targetChanged = !decision.prior || decision.targetHash !== decision.prior.targetHash;
+      if (decision.managed && decision.sourceHash !== decision.targetHash && (!targetChanged || !decision.prior)) {
+        if (desiredFile) publishFile(desiredFile, targetFile);
+        else if (pathExists(targetFile)) fs.unlinkSync(targetFile);
+      } else if (decision.managed && sourceChanged && !targetChanged) {
+        if (desiredFile) publishFile(desiredFile, targetFile);
+        else if (pathExists(targetFile)) fs.unlinkSync(targetFile);
+      }
+    }
+    for (const [relative, decision] of decisions) decision.targetHash = fileDigest(path.join(destination, relative));
+    return Object.fromEntries([...decisions].map(([relative, { sourceHash, targetHash, managed }]) =>
+      [relative, { sourceHash, targetHash, managed }]));
+  } finally {
+    fs.rmSync(stage, { recursive: true, force: true });
   }
-  return managed;
+}
+
+function linkValue(file, pluginRoot) {
+  try {
+    if (!fs.lstatSync(file).isSymbolicLink()) return null;
+    const resolved = path.resolve(path.dirname(file), fs.readlinkSync(file));
+    return resolved.startsWith(pluginRoot + path.sep) ? path.basename(resolved) : `external:${resolved}`;
+  } catch { return null; }
+}
+
+function publishAlias(file, version) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+  fs.symlinkSync(version, temporary);
+  fs.renameSync(temporary, file);
+}
+
+function syncPluginAliases(entries, targetDir, previous = {}) {
+  const records = {};
+  for (const entry of entries) {
+    const file = path.join(targetDir, 'plugins', 'cache', entry.relative);
+    const pluginRoot = path.dirname(file);
+    const target = linkValue(file, pluginRoot);
+    const prior = previous[entry.relative];
+    let managed = false;
+    if (!prior) {
+      if (!pathExists(file)) { publishAlias(file, entry.version); managed = true; }
+      else managed = target === entry.version;
+    } else {
+      const sourceChanged = entry.version !== prior.sourceTarget;
+      const targetChanged = target !== prior.targetTarget;
+      managed = prior.managed === true;
+      if (sourceChanged && targetChanged && entry.version !== target) {
+        throw new Error(`Codex plugin sync conflicts at ${entry.relative}`);
+      }
+      if (managed && sourceChanged && !targetChanged) publishAlias(file, entry.version);
+      else if (managed && targetChanged && !sourceChanged) managed = false;
+    }
+    records[entry.relative] = { sourceTarget: entry.version, targetTarget: linkValue(file, pluginRoot), managed };
+  }
+  return records;
+}
+
+function syncPlugins(sourceDir, targetDir, previous = {}, options = {}) {
+  const packages = pluginPackages(sourceDir);
+  const pluginFiles = {}, versions = [];
+  for (const entry of packages.versions) {
+    const destination = path.join(targetDir, 'plugins', 'cache', entry.relative);
+    const records = syncPluginVersion(entry, destination, sourceDir, targetDir, previous[entry.relative], options);
+    if (records) { pluginFiles[entry.relative] = records; versions.push(entry.relative); }
+  }
+  return { versions, pluginFiles, aliases: syncPluginAliases(packages.aliases, targetDir, options.previousAliases) };
 }
 
 function assertAccounts(sourceAccount, targetAccount) {
@@ -326,7 +470,7 @@ function readSetup(account) {
   return value?.version === 1 ? value : null;
 }
 
-function shareSetup(sourceAccount, targetAccount) {
+function shareSetup(sourceAccount, targetAccount, options = {}) {
   const { source, target } = assertAccounts(sourceAccount, targetAccount);
   fs.mkdirSync(target, { recursive: true, mode: 0o700 });
   const manifestFile = path.join(target, MANIFEST);
@@ -335,17 +479,23 @@ function shareSetup(sourceAccount, targetAccount) {
     throw new Error('target Codex profile is already managed from a different source');
   }
   const sourceConfig = readToml(path.join(source, 'config.toml'));
-  const targetConfig = readToml(path.join(target, 'config.toml'));
+  const targetConfigFile = path.join(target, 'config.toml');
+  const targetConfigHash = fileDigest(targetConfigFile);
+  const targetConfig = readToml(targetConfigFile);
   const merged = mergeConfig(sourceConfig, targetConfig, previous?.config, source, target);
   const assets = { ...syncSimpleAssets(source, target, previous?.assets),
     ...syncMarketplaceAssets(sourceConfig, source, target, previous?.assets) };
-  const pluginVersions = syncPlugins(source, target, previous?.pluginVersions);
-  writeToml(path.join(target, 'config.toml'), merged.config);
+  const legacyPlugins = previous?.pluginFiles || {};
+  const plugins = syncPlugins(source, target, legacyPlugins, { ...options, previousAliases: previous?.pluginAliases });
+  options.beforeConfigCommit?.();
+  if (fileDigest(targetConfigFile) !== targetConfigHash) throw new Error('target Codex config changed during capability sync');
+  if (!isDeepStrictEqual(merged.config, targetConfig)) writeToml(targetConfigFile, merged.config);
   const manifest = { version: 1, sourceAccountId: sourceAccount.id, sourceConfigDir: source,
-    config: merged.records, assets, pluginVersions, updatedAt: new Date().toISOString() };
+    config: merged.records, assets, pluginVersions: plugins.versions, pluginFiles: plugins.pluginFiles,
+    pluginAliases: plugins.aliases, updatedAt: new Date().toISOString() };
   writeJSON(manifestFile, manifest);
   return { ok: true, idempotent: Boolean(previous), targetConfigDir: target,
-    sharedEntries: [...Object.keys(assets), ...pluginVersions.map((entry) => path.join('plugins/cache', entry))] };
+    sharedEntries: [...Object.keys(assets), ...plugins.versions.map((entry) => path.join('plugins/cache', entry))] };
 }
 
 function refresh(account, options = {}) {
