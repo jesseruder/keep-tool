@@ -467,10 +467,21 @@ function allowedTarget(artifact, record) {
 }
 function stageArtifact(artifact, record) {
   if (fs.existsSync(record.stage)) {
-    if (!sameManifest(fileManifest(record.stage), record.manifest)) {
+    if (sameManifest(fileManifest(record.stage), record.manifest)) return;
+    // copyFileSync may leave a partial file when the daemon exits. Only the
+    // transaction's never-verified, never-published reservation is disposable.
+    const stat = fs.lstatSync(record.stage);
+    const target = fs.existsSync(artifact.target) ? fileManifest(artifact.target) : null;
+    if (record.phase !== 'planned' || !stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1
+        || fs.existsSync(record.backup) || !sameManifest(target, record.before)) {
       throw failure(`staged Codex rollout changed: ${record.stage}`, 'KEEP_CODEX_ARTIFACT_JOURNAL');
     }
-    return;
+    if (!sameManifest(fileManifest(artifact.source), record.manifest)) {
+      throw failure(`source Codex rollout changed before restaging: ${artifact.source}`,
+        'KEEP_CODEX_ARTIFACT_SOURCE_CHANGED');
+    }
+    fs.unlinkSync(record.stage);
+    syncDirectory(path.dirname(record.stage));
   }
   fs.mkdirSync(path.dirname(record.stage), { recursive: true, mode: 0o700 });
   fs.copyFileSync(artifact.source, record.stage, fs.constants.COPYFILE_EXCL);

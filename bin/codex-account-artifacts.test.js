@@ -194,6 +194,58 @@ test('an interrupted publish resumes from its frozen stage and refuses later sou
   } finally { t.mock.restoreAll(); fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test('partial unpublished copy is recreated only while the frozen source and target are intact', (t) => {
+  for (const mutation of ['none', 'source', 'target', 'hardlink']) {
+    const f = fixture();
+    try {
+      const originalCopy = fs.copyFileSync;
+      let stage;
+      t.mock.method(fs, 'copyFileSync', function (from, to, flags) {
+        if (!stage && from === f.rootFile) {
+          stage = to;
+          fs.writeFileSync(to, 'partial copy');
+          throw new Error('simulated copy crash');
+        }
+        return originalCopy.call(fs, from, to, flags);
+      });
+      assert.throws(() => artifacts.copyCodexArtifacts(f.sid, f.records.a, f.records.b, 'tx-partial', options(f)), /simulated copy crash/);
+      t.mock.restoreAll();
+      const target = targetFor(f, 'b', f.rootFile);
+      assert.equal(fs.existsSync(target), false);
+      if (mutation === 'source') fs.appendFileSync(f.rootFile, 'source advanced\n');
+      if (mutation === 'target') fs.writeFileSync(target, 'foreign target');
+      if (mutation === 'hardlink') fs.linkSync(stage, path.join(f.base, 'other-owner'));
+      if (mutation !== 'none') {
+        assert.throws(() => artifacts.copyCodexArtifacts(f.sid, f.records.a, f.records.b, 'tx-partial', options(f)));
+        assert.equal(fs.readFileSync(stage, 'utf8'), 'partial copy');
+        if (mutation === 'target') assert.equal(fs.readFileSync(target, 'utf8'), 'foreign target');
+      } else {
+        const result = artifacts.copyCodexArtifacts(f.sid, f.records.a, f.records.b, 'tx-partial', options(f));
+        assert.equal(result.copied.length, 3);
+        for (const entry of result.artifacts) assert.deepEqual(fs.readFileSync(entry.target), fs.readFileSync(entry.source));
+        assert.equal(fs.existsSync(stage), false);
+      }
+    } finally { t.mock.restoreAll(); fs.rmSync(f.base, { recursive: true, force: true }); }
+  }
+});
+
+test('a previously verified staging file cannot be silently recreated after modification', (t) => {
+  const f = fixture();
+  try {
+    const rename = fs.renameSync;
+    let stage;
+    t.mock.method(fs, 'renameSync', function (from, to) {
+      if (String(from).includes('.keep-stage-')) { stage = from; throw new Error('simulated publish crash'); }
+      return rename.call(fs, from, to);
+    });
+    assert.throws(() => artifacts.copyCodexArtifacts(f.sid, f.records.a, f.records.b, 'tx-verified', options(f)), /simulated publish crash/);
+    t.mock.restoreAll();
+    fs.writeFileSync(stage, 'unexpected edit');
+    assert.throws(() => artifacts.copyCodexArtifacts(f.sid, f.records.a, f.records.b, 'tx-verified', options(f)), /staged Codex rollout changed/);
+    assert.equal(fs.readFileSync(stage, 'utf8'), 'unexpected edit');
+  } finally { t.mock.restoreAll(); fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test('managed provenance permits a frozen double hop while later target edits are rejected', () => {
   const f = fixture();
   try {
