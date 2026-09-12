@@ -37,7 +37,7 @@ function portableFallbackCandidate(entry) {
 }
 function safe(entry) {
   if (!entry) return null;
-  const keys = ['id', 'transactionId', 'sessionId', 'pane', 'agent', 'sourceAccountId', 'targetAccountId', 'status', 'phase', 'reason', 'updatedAt'];
+  const keys = ['id', 'transactionId', 'sessionId', 'pane', 'agent', 'sourceAccountId', 'targetAccountId', 'intent', 'status', 'phase', 'reason', 'updatedAt'];
   return {
     ...Object.fromEntries(keys.filter((key) => entry[key] != null).map((key) => [key, entry[key]])),
     ...(portableFallbackCandidate(entry) ? { portableFallbackAvailable: true } : {}),
@@ -190,6 +190,17 @@ function deliveryOptions(entry, source) {
   return { deliveryId: entry.deliveryId, agent: entry.agent, sourceAccountId: source.id,
     transactionId: entry.id, sourceStopVerifiedAt: entry.sourceStopVerifiedAt,
     targetTranscript: entry.targetTranscript, targetIdentity: entry.targetIdentity };
+}
+
+function finishOpenOnly(entry, target, root, result) {
+  if (!targetIdentityBound(entry, target)) throw new Error('Opened target is missing its verified process identity');
+  Object.assign(entry, { status: 'verifying', phase: 'opening-target', reason: '',
+    openedAt: entry.openedAt || Date.now(), ...(result ? { result } : {}) });
+  writeOne(root, entry);
+  commitTargetAuthorities(entry, target, root);
+  Object.assign(entry, { status: 'done', phase: 'done' });
+  writeOne(root, entry);
+  return { ok: true, ...safe(entry) };
 }
 
 function artifactProvider(agent, deps = {}) {
@@ -347,15 +358,24 @@ async function run(body, deps = {}) {
       || !accounts.ID_RE.test(String(body?.accountId || ''))) {
     const error = new Error('Expected exact session, pane and target account'); error.status = 400; throw error;
   }
+  const requestedIntent = body.intent == null ? null : body.intent;
+  if (requestedIntent != null && !['continue', 'open-only'].includes(requestedIntent)) {
+    const error = new Error('Account handoff intent must be continue or open-only'); error.status = 400; throw error;
+  }
   if (active.has(body.sessionId)) {
     const running = active.get(body.sessionId);
-    if (running.pane !== body.pane || running.accountId !== body.accountId) {
+    if (running.pane !== body.pane || running.accountId !== body.accountId
+        || requestedIntent != null && running.intent !== requestedIntent) {
       const error = new Error('A different account handoff is already running for this session'); error.status = 409; throw error;
     }
     return running.promise;
   }
   const pending = (async () => {
     let current = readOne(root, body.sessionId);
+    if (current && requestedIntent != null && (current.intent || 'continue') !== requestedIntent) {
+      const error = new Error('A different account handoff intent is already recorded for this session'); error.status = 409; throw error;
+    }
+    if (current) current.intent ||= 'continue';
     if (current?.status === 'done' && current.pane === body.pane && current.targetAccountId === body.accountId) {
       return { ok: true, ...safe(current) };
     }
@@ -388,7 +408,9 @@ async function run(body, deps = {}) {
     const sourceIdentity = inspected.agentIdentity?.primary === true && Number.isInteger(inspected.agentIdentity.pid)
       && inspected.agentIdentity.pid > 0 && typeof inspected.agentIdentity.pidStart === 'string'
       && inspected.agentIdentity.pidStart && inspected.agentIdentity.ownsPane === true ? inspected.agentIdentity : null;
+    const intent = current?.intent || requestedIntent || 'continue';
     if (source.id === target.id) { const error = new Error('source and target account are the same'); error.status = 409; throw error; }
+    if (current?.openedAt && intent === 'open-only') return finishOpenOnly(current, target, root);
     if (current?.deliveryStartedAt && !current.deliveredAt && current.deliveryId && deps.deliveryStatus) {
       const receipt = await deps.deliveryStatus(session.id, CONTINUATION_TEXT, current.deliveryId);
       if (receipt?.received) {
@@ -419,6 +441,7 @@ async function run(body, deps = {}) {
           await verifyTargetLaunch(current, target, record, deps, root);
         } else requireTargetIdentity(current, inspected, target);
         if (current.resumeSpec && deps.verifyTargetSpec) await deps.verifyTargetSpec(current, target);
+        if (intent === 'open-only') return finishOpenOnly(current, target, root);
         Object.assign(current, { status: 'delivering', phase: 'delivering-continuation', deliveryId: current.deliveryId || crypto.randomUUID() });
         writeOne(root, current);
         if (current.deliveryStartedAt && !current.deliveredAt) throw new Error('Continuation delivery is unconfirmed; it will not be sent twice');
@@ -463,6 +486,7 @@ async function run(body, deps = {}) {
         const record = await deps.waitForAccountRecord(session.id, pane.id, target.id, current.targetLaunchStartedAt);
         await verifyTargetLaunch(current, target, record, deps, root);
         if (current.resumeSpec && deps.verifyTargetSpec) await deps.verifyTargetSpec(current, target);
+        if (intent === 'open-only') return finishOpenOnly(current, target, root, result);
         Object.assign(current, { status: 'delivering', phase: 'delivering-continuation', reason: '', result,
           deliveryId: current.deliveryId || crypto.randomUUID() }); writeOne(root, current);
         if (current.deliveryStartedAt && !current.deliveredAt) throw new Error('Continuation delivery is unconfirmed; it will not be sent twice');
@@ -493,7 +517,7 @@ async function run(body, deps = {}) {
       current ||= { id: crypto.randomUUID(), transactionId: null, sessionId: session.id, pane: pane.id,
         agent, sourceAccountId: source.id, targetAccountId: target.id };
       current.transactionId ||= current.id;
-      Object.assign(current, { agent, status: 'failed', phase: 'preflight',
+      Object.assign(current, { agent, intent, status: 'failed', phase: 'preflight',
         ...(sourceIdentity ? { sourceAgentPid: sourceIdentity.pid, sourceAgentPidStart: sourceIdentity.pidStart,
           sourceOwnsPane: true } : {}),
         reason: `Target ${agent} account is not logged in; source session was left running` });
@@ -513,6 +537,7 @@ async function run(body, deps = {}) {
       agent, sourceAccountId: source.id, targetAccountId: target.id };
     current.transactionId ||= current.id;
     current.agent = agent;
+    current.intent = intent;
     current.ownedSessionIds = agent === 'codex' ? artifactPlan.artifacts.map((entry) => entry.sessionId) : [session.id];
     Object.assign(current, { status: 'stopping', phase: 'stopping-source', reason: '', cwd: resumeCwd,
       pid: pane.pid, cols: pane.cols, rows: pane.rows,
@@ -557,6 +582,7 @@ async function run(body, deps = {}) {
       const record = await deps.waitForAccountRecord(session.id, pane.id, target.id, current.targetLaunchStartedAt);
       await verifyTargetLaunch(current, target, record, deps, root);
       if (current.resumeSpec && deps.verifyTargetSpec) await deps.verifyTargetSpec(current, target);
+      if (intent === 'open-only') return finishOpenOnly(current, target, root, result);
       Object.assign(current, { status: 'delivering', phase: 'delivering-continuation', reason: '', result,
         deliveryId: current.deliveryId || crypto.randomUUID() }); writeOne(root, current);
       current.deliveryStartedAt = Date.now(); writeOne(root, current);
@@ -571,7 +597,8 @@ async function run(body, deps = {}) {
       error.status ||= 409; error.extra = safe(current); throw error;
     }
   })().finally(() => active.delete(body.sessionId));
-  active.set(body.sessionId, { pane: body.pane, accountId: body.accountId, promise: pending });
+  active.set(body.sessionId, { pane: body.pane, accountId: body.accountId,
+    intent: requestedIntent || readOne(root, body.sessionId)?.intent || 'continue', promise: pending });
   return pending;
 }
 

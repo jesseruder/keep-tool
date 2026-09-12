@@ -278,6 +278,48 @@ test('native Codex handoff preserves exact launch policy and transfers root plus
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test('open-only Codex handoff verifies the target and commits authority without typing a continuation', async () => {
+  const f = fixture();
+  try {
+    const d = codexDeps(f, { continueSession: async () => assert.fail('open-only must not type into the target') });
+    const result = await handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two', intent: 'open-only' }, d);
+    assert.equal(result.status, 'done'); assert.equal(result.intent, 'open-only');
+    assert.deepEqual(d.events, ['copy', 'rebind', 'launch', 'verify-target']);
+    const journal = JSON.parse(fs.readFileSync(path.join(f.root, '.keep', 'account-handoffs', `${d.sid}.json`)));
+    assert.equal(journal.intent, 'open-only'); assert.ok(journal.openedAt);
+    assert.equal(journal.deliveryStartedAt, undefined); assert.equal(journal.deliveryId, undefined);
+    for (const id of [d.sid, d.child]) assert.equal(accounts.authority(f.root)[id].accountId, 'codex-two');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('open-only recovery finalizes a durably verified opening without launch or input', async () => {
+  const f = fixture();
+  try {
+    const d = codexDeps(f, { verifyTargetSpec: async () => { throw new Error('pause before opened marker'); } });
+    await assert.rejects(handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two', intent: 'open-only' }, d),
+      /pause before opened marker/);
+    const file = path.join(f.root, '.keep', 'account-handoffs', `${d.sid}.json`);
+    const interrupted = JSON.parse(fs.readFileSync(file, 'utf8'));
+    interrupted.openedAt = Date.now(); interrupted.phase = 'opening-target'; interrupted.status = 'recovery-needed';
+    fs.writeFileSync(file, JSON.stringify(interrupted));
+    d.resumeExited = async () => assert.fail('verified opening must not relaunch');
+    d.continueSession = async () => assert.fail('verified opening must not type');
+    const recovered = await handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two', intent: 'open-only' }, d);
+    assert.equal(recovered.status, 'done'); assert.equal(recovered.intent, 'open-only');
+    assert.equal(accounts.authority(f.root)[d.sid].accountId, 'codex-two');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('handoff intent is immutable across retries', async () => {
+  const f = fixture();
+  try {
+    const d = codexDeps(f, { verifyTargetSpec: async () => { throw new Error('pause after launch'); } });
+    await assert.rejects(handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two', intent: 'open-only' }, d));
+    await assert.rejects(handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two', intent: 'continue' }, d),
+      (error) => error.status === 409 && /different account handoff intent/.test(error.message));
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test('Codex handoff rejects an unavailable latest turn cwd before stopping the source', async () => {
   const f = fixture();
   try {
