@@ -5,11 +5,14 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
+const { EventEmitter } = require('node:events');
+const { PassThrough } = require('node:stream');
 const test = require('node:test');
 const {
   parseClassification, fleetContext, computeSuspects, foldThreads, buildPrompt,
-  messageForPrompt, messageBody, parseClaudeCapabilities, classifierArgs, slackCardId, cardTitle,
+  messageForPrompt, messageBody, parseClaudeCapabilities, classifierArgs, classify, slackCardId, cardTitle,
 } = require('./slack.js');
+const { profileEnvironment } = require('./agent-launcher.js');
 
 test('classifier argv follows capabilities from fixture help text', (t) => {
   const previousDisabledPlugins = process.env.KEEP_HEADLESS_DISABLED_PLUGINS;
@@ -52,6 +55,57 @@ test('classifier argv follows capabilities from fixture help text', (t) => {
     }),
     /cannot disable tools for the headless model; refusing to run/,
   );
+});
+
+test('classifier selects the Slack automation account and isolates its spawned environment', async () => {
+  const secondary = { id: 'claude-secondary', label: 'Claude Secondary', agent: 'claude',
+    configDir: '/profiles/claude-secondary', managed: true };
+  const purposes = [];
+  const accountApi = {
+    automationFor(agent, purpose) {
+      assert.equal(agent, 'claude');
+      purposes.push(purpose);
+      return secondary;
+    },
+    envFor(account, base) { return profileEnvironment('claude', account, base); },
+  };
+  let launched;
+  const fakeSpawn = (file, args, options) => {
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = () => {};
+    launched = { file, args, options };
+    queueMicrotask(() => { child.stdout.write('{"result":"[]"}'); child.emit('close', 0); });
+    return child;
+  };
+  const inherited = {
+    PATH: '/bin', KEEP_RUN: 'old', CLAUDE_CONFIG_DIR: '/profiles/default',
+    CLAUDE_CODE_SESSION_ID: 'interactive-session', KEEP_SESSION_ID: 'keep-session', KEEP_TASK: 'current-card',
+    ANTHROPIC_API_KEY: 'wrong-api-key', ANTHROPIC_AUTH_TOKEN: 'wrong-auth-token',
+    CLAUDE_CODE_OAUTH_TOKEN: 'wrong-oauth-token', ANTHROPIC_BASE_URL: 'https://wrong.example',
+  };
+
+  const result = await classify('classify fixture', 'haiku', {
+    env: inherited, accountApi, spawn: fakeSpawn, claudeBin: () => '/fake/claude',
+    randomUUID: () => 'classifier-session', markSpawned: () => {},
+    capabilities: { permissionModeDefault: true, toolsFlag: true, disallowedToolsFlag: '' },
+  });
+
+  assert.equal(result, '{"result":"[]"}');
+  assert.deepEqual(purposes, ['slack']);
+  assert.equal(launched.file, '/fake/claude');
+  assert.equal(launched.options.env.KEEP_RUN, '1');
+  assert.equal(launched.options.env.KEEP_AGENT_ACCOUNT_ID, 'claude-secondary');
+  assert.equal(launched.options.env.CLAUDE_CONFIG_DIR, '/profiles/claude-secondary');
+  assert.equal(launched.options.env.CLAUDE_SECURESTORAGE_CONFIG_DIR, '/profiles/claude-secondary');
+  for (const key of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN',
+    'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_SESSION_ID', 'KEEP_SESSION_ID', 'KEEP_TASK']) {
+    assert.equal(launched.options.env[key], undefined, key);
+  }
+  assert.deepEqual(launched.args.slice(0, 8), [
+    '-p', 'classify fixture', '--session-id', 'classifier-session', '--model', 'haiku', '--output-format', 'json',
+  ]);
 });
 
 test('Slack bug ids and titles are deterministic and sanitized', () => {

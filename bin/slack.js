@@ -555,16 +555,19 @@ function markSpawned(sessionId) {
   } catch {}
 }
 
-function classify(prompt, model) {
+function classify(prompt, model, deps = {}) {
   return new Promise((resolve, reject) => {
-    const sessionId = crypto.randomUUID();
-    const env = { ...process.env, KEEP_RUN: '1' };
-    delete env.CLAUDE_CODE_SESSION_ID;
+    const sessionId = (deps.randomUUID || crypto.randomUUID)();
+    const inheritedEnv = deps.env || process.env;
+    const selected = (deps.automationEnv || summarize.automationEnv)('slack', inheritedEnv, deps.accountApi);
+    const env = { ...selected.env };
+    for (const key of ['CLAUDE_CODE_SESSION_ID', 'CLAUDE_PROJECT_DIR', 'CLAUDECODE',
+      'CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'KEEP_SESSION_ID', 'KEEP_TASK', 'OLDPWD']) delete env[key];
     let child;
     try {
-      const args = classifierArgs(prompt, model, sessionId);
-      markSpawned(sessionId);
-      child = spawn(claudeBin(), args, {
+      const args = classifierArgs(prompt, model, sessionId, deps.capabilities);
+      (deps.markSpawned || markSpawned)(sessionId);
+      child = (deps.spawn || spawn)((deps.claudeBin || claudeBin)(), args, {
         cwd: keep.ROOT, env, stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch (error) { reject(error); return; }
@@ -1219,6 +1222,7 @@ module.exports = {
   safeUntrusted,
   parseClaudeCapabilities,
   classifierArgs,
+  classify,
   markSpawned,
   slackCardId,
   cardTitle,
