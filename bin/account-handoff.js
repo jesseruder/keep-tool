@@ -372,18 +372,22 @@ async function run(body, deps = {}) {
   }
   const pending = (async () => {
     let current = readOne(root, body.sessionId);
-    if (current && requestedIntent != null && (current.intent || 'continue') !== requestedIntent) {
-      const error = new Error('A different account handoff intent is already recorded for this session'); error.status = 409; throw error;
+    const sameTransfer = current?.pane === body.pane && current.targetAccountId === body.accountId;
+    const resumable = current && (['stopping', 'copying', 'staged', 'starting', 'verifying', 'delivering', 'recovery-needed'].includes(current.status)
+      || current.status === 'failed' && current.phase === 'preflight');
+    if (sameTransfer && (resumable || current.status === 'done')
+        && requestedIntent != null && (current.intent || 'continue') !== requestedIntent) {
+      const error = new Error('A different account handoff intent is already recorded for this transfer'); error.status = 409; throw error;
     }
-    if (current) current.intent ||= 'continue';
-    if (current?.status === 'done' && current.pane === body.pane && current.targetAccountId === body.accountId) {
+    if (sameTransfer && (resumable || current.status === 'done')) current.intent ||= 'continue';
+    if (sameTransfer && current?.status === 'done') {
       return { ok: true, ...safe(current) };
     }
     if (current && ['stopping', 'copying', 'staged', 'starting', 'verifying', 'delivering', 'recovery-needed'].includes(current.status)) {
       if (current.pane !== body.pane || current.targetAccountId !== body.accountId) {
         const error = new Error('A different account handoff is already pending for this session'); error.status = 409; throw error;
       }
-    } else current = null;
+    } else if (!(sameTransfer && current?.status === 'failed' && current.phase === 'preflight')) current = null;
     const inspected = await deps.inspect(body);
     const session = inspected?.session || (current ? { id: body.sessionId, kind: current.agent || 'claude', project: current.cwd } : null);
     const pane = inspected?.pane;

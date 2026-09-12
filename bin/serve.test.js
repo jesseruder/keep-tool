@@ -84,6 +84,7 @@ const {
   writeToShellPane,
   stripTerminalAnsi,
   openSession,
+  reopenSessionOnAccount,
   addHostSessionState,
   backfillHostSessions,
   createDashboardClaudeSessionResolver,
@@ -3833,6 +3834,71 @@ test('fresh card open launches in an explicit cwd only when it belongs to the ca
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('standalone fresh agent launch uses the selected profile and one request id creates one pane', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-standalone-open-'));
+  try {
+    const cwd = path.join(root, 'project'), configDir = path.join(root, 'codex-secondary');
+    fs.mkdirSync(cwd); fs.mkdirSync(configDir);
+    const config = path.join(root, 'accounts.json');
+    fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+      { id: 'codex-secondary', label: 'Codex secondary', agent: 'codex', configDir },
+    ], defaultAccounts: { codex: 'codex-secondary' } }));
+    const env = { KEEP_DIR: root, KEEP_CONFIG: config };
+    let releaseSpawn;
+    const spawnGate = new Promise((resolve) => { releaseSpawn = resolve; });
+    let spawns = 0;
+    const host = recordingHost(async (type) => {
+      if (type !== 'spawn') return {};
+      spawns++; await spawnGate;
+      return { pane: { id: 'standalone-pane', pid: 41, createdAt: 42 } };
+    });
+    const body = { fresh: true, cwd, agent: 'codex', accountId: 'codex-secondary',
+      model: 'gpt-5.6-sol', requestId: 'standalone-request' };
+    const deps = { root, env, host, listHostPanes: async () => [], waitForHostAgent: async () => true,
+      waitForHostSessionId: async () => 'actual-standalone-session' };
+    const first = openSession(body, deps);
+    await new Promise((resolve) => setImmediate(resolve));
+    const second = openSession(body, deps);
+    await assert.rejects(openSession({ ...body, model: 'gpt-6-astra' }, deps),
+      (error) => error.status === 409 && /different selection/.test(error.message));
+    releaseSpawn();
+    const [opened, joined] = await Promise.all([first, second]);
+    assert.equal(spawns, 1); assert.equal(opened.pane, 'standalone-pane');
+    assert.equal(joined.sessionId, 'actual-standalone-session');
+    const spawn = host.calls.find((call) => call.type === 'spawn').params;
+    assert.equal(spawn.cwd, fs.realpathSync(cwd)); assert.equal(spawn.meta.card, null);
+    assert.equal(spawn.meta.openRequestId, 'standalone-request'); assert.equal(spawn.meta.model, 'gpt-5.6-sol');
+    const encoded = /'--profile' '([^']+)'/.exec(spawn.args[1])?.[1];
+    assert.equal(JSON.parse(Buffer.from(encoded, 'base64url')).id, 'codex-secondary');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('standalone post-spawn setup failure exposes and reuses the exact existing pane', async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-standalone-setup-'));
+  try {
+    const pane = { id: 'setup-pane', pid: 51, createdAt: 52, alive: true, agentAlive: false,
+      meta: { agent: 'claude', accountId: 'claude/default', accountLabel: 'Claude (default)', sessionId: null,
+        project: fs.realpathSync(cwd), openRequestId: 'setup-request', launchedAt: 1 } };
+    let spawns = 0;
+    const host = recordingHost((type) => {
+      if (type === 'spawn') { spawns++; return { pane }; }
+      return {};
+    });
+    const body = { fresh: true, cwd, agent: 'claude', accountId: 'claude/default', requestId: 'setup-request' };
+    await assert.rejects(openSession(body, {
+      host, listHostPanes: async () => [], waitForHostAgent: async (_target, _agent, options) => {
+        assert.equal(options.detectPortableSetup, true);
+        throw new InjectionError(409, 'workspace setup required', { awaitingSetup: true });
+      },
+    }), (error) => error.extra?.code === 'OPEN_EXISTING_PANE'
+      && error.extra.launch.pane === 'setup-pane' && error.extra.launch.recoverable === true);
+    const reused = await openSession(body, {
+      host, listHostPanes: async () => [pane], waitForHostAgent: async () => assert.fail('must not wait on a duplicate'),
+    });
+    assert.equal(reused.existing, true); assert.equal(reused.pane, 'setup-pane'); assert.equal(spawns, 1);
+  } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+});
+
 test('portable transfer API lists safe records and launches only an existing transfer id', async () => {
   const id = 'a'.repeat(64);
   const safe = { id, status: 'prepared', sourceSessionId: 'source-session-1234', sourceAgent: 'codex',
@@ -4153,6 +4219,66 @@ test('explicit account launches stay pinned when the session is resumed', async 
     await assert.rejects(openSession({ sessionId: sid }, {
       ...common, scanSessions: () => [{ id: sid, project: os.tmpdir(), kind: 'claude' }],
     }), /retry the explicit handoff/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('different-account reopen serializes source opening and starts one open-only handoff', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-reopen-account-'));
+  try {
+    const sourceDir = path.join(root, 'source'), targetDir = path.join(root, 'target'), thirdDir = path.join(root, 'third');
+    for (const dir of [sourceDir, targetDir, thirdDir]) fs.mkdirSync(dir);
+    const config = path.join(root, 'accounts.json');
+    fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+      { id: 'source', label: 'Source', agent: 'claude', configDir: sourceDir },
+      { id: 'target', label: 'Target', agent: 'claude', configDir: targetDir },
+      { id: 'third', label: 'Third', agent: 'claude', configDir: thirdDir },
+    ], defaultAccounts: { claude: 'source' } }));
+    const env = { KEEP_DIR: root, KEEP_CONFIG: config };
+    const session = { id: 'reopen-session', kind: 'claude', project: os.tmpdir(), accountId: 'source' };
+    require('./accounts').pinSession(session.id, 'claude', 'source', { root, env });
+    let releaseOpen;
+    const gate = new Promise((resolve) => { releaseOpen = resolve; });
+    let opens = 0; let handoffs = 0;
+    const deps = {
+      root, env, resolveSessionId: () => session, listHostPanes: async () => [],
+      openSession: async (body) => { opens++; assert.equal(body.accountId, 'source'); await gate; return { pane: 'source-pane' }; },
+      handoffSession: async (body) => { handoffs++; assert.deepEqual(body, {
+        sessionId: session.id, pane: 'source-pane', accountId: 'target', intent: 'open-only',
+      }); return { ok: true, status: 'done', pane: body.pane, intent: body.intent }; },
+    };
+    const first = reopenSessionOnAccount({ sessionId: session.id, accountId: 'target' }, deps);
+    await new Promise((resolve) => setImmediate(resolve));
+    const joined = reopenSessionOnAccount({ sessionId: session.id, accountId: 'target' }, deps);
+    await assert.rejects(reopenSessionOnAccount({ sessionId: session.id, accountId: 'third' }, deps),
+      (error) => error.status === 409 && /different account reopen/.test(error.message));
+    releaseOpen();
+    const [result, repeated] = await Promise.all([first, joined]);
+    assert.equal(result.intent, 'open-only'); assert.equal(repeated.status, 'done');
+    assert.equal(opens, 1); assert.equal(handoffs, 1);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('different-account reopen exposes an existing incomplete source pane instead of launching again', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-reopen-setup-'));
+  try {
+    const sourceDir = path.join(root, 'source'), targetDir = path.join(root, 'target');
+    fs.mkdirSync(sourceDir); fs.mkdirSync(targetDir);
+    const config = path.join(root, 'accounts.json');
+    fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+      { id: 'source', label: 'Source', agent: 'claude', configDir: sourceDir },
+      { id: 'target', label: 'Target', agent: 'claude', configDir: targetDir },
+    ], defaultAccounts: { claude: 'source' } }));
+    const env = { KEEP_DIR: root, KEEP_CONFIG: config };
+    const session = { id: 'setup-reopen-session', kind: 'claude', project: os.tmpdir(), accountId: 'source' };
+    require('./accounts').pinSession(session.id, 'claude', 'source', { root, env });
+    await assert.rejects(reopenSessionOnAccount({ sessionId: session.id, accountId: 'target' }, {
+      root, env, resolveSessionId: () => session,
+      listHostPanes: async () => [{ id: 'incomplete-pane', alive: true, agentAlive: false,
+        meta: { sessionId: session.id, accountId: 'source', agent: 'claude' } }],
+      openSession: async () => assert.fail('must not launch over an incomplete existing pane'),
+      handoffSession: async () => assert.fail('must not hand off until source setup is complete'),
+    }), (error) => error.status === 409 && error.extra?.code === 'OPEN_EXISTING_PANE'
+      && error.extra.launch.pane === 'incomplete-pane');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

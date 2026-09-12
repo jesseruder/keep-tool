@@ -41,7 +41,7 @@ function deps(f, overrides = {}) {
   const baseHost = { request: async (type, params) => {
     assert.equal(type, 'replace-exited');
     pane.alive = true; pane.pid = 20; pane.createdAt = 'target-pane';
-    pane.meta = { ...pane.meta, ...params.meta, accountId: 'two' };
+    pane.meta = { ...pane.meta, ...params.meta, accountId: params.meta.accountId || 'two' };
     return { pane };
   } };
   return { root: f.root, env: f.env, pane,
@@ -61,7 +61,7 @@ function deps(f, overrides = {}) {
     waitForAccountRecord: async (_sid, _pane, accountId, after) => ({ pane: 'pane-1', accountId, agent: 'claude', startedAt: after + 1 }),
     resumeExited: async (_entry, _target, _mcpConfig, hooks = {}) => {
       pane.alive = true; pane.pid = 20; pane.createdAt = 'target-pane';
-      pane.meta = { ...pane.meta, accountId: 'two', handoffTransactionId: _entry.id };
+      pane.meta = { ...pane.meta, accountId: _target.id, handoffTransactionId: _entry.id };
       const launch = { ok: true, pane: 'pane-1', pid: 20, createdAt: pane.createdAt };
       await hooks.onLaunched?.(launch); return launch;
     },
@@ -317,6 +317,33 @@ test('handoff intent is immutable across retries', async () => {
     await assert.rejects(handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two', intent: 'open-only' }, d));
     await assert.rejects(handoff.run({ sessionId: d.sid, pane: d.pane.id, accountId: 'codex-two', intent: 'continue' }, d),
       (error) => error.status === 409 && /different account handoff intent/.test(error.message));
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('a completed transfer does not impose its intent on a later transfer to another account', async () => {
+  const f = fixture();
+  try {
+    const d = deps(f);
+    await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d);
+    const continued = d.continuations();
+    const reopened = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'three', intent: 'open-only' }, d);
+    assert.equal(reopened.status, 'done'); assert.equal(reopened.intent, 'open-only');
+    assert.equal(d.continuations(), continued, 'the later open-only transfer sends no continuation');
+    assert.equal(accounts.forSession(f.sid, 'claude', { root: f.root, env: f.env }).id, 'three');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('failed open-only preflight keeps its intent when retry omits the field', async () => {
+  const f = fixture();
+  try {
+    let loggedIn = false;
+    const d = deps(f, { authPreflight: async () => loggedIn,
+      continueSession: async () => assert.fail('open-only retry must not type a continuation') });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two', intent: 'open-only' }, d), /not logged in/);
+    assert.equal(handoff.list(f.root)[0].intent, 'open-only');
+    loggedIn = true;
+    const retried = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d);
+    assert.equal(retried.status, 'done'); assert.equal(retried.intent, 'open-only');
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 

@@ -52,6 +52,8 @@ function fixture() {
     findingOutcomes: () => findings,
     archivedIds: new Set(['idea-archived']),
     withLock: (fn) => fn(),
+    resolveLaunchSelection: async (body) => ({ agent: body.agent || 'claude',
+      accountId: body.accountId || 'claude/default', model: body.model || '' }),
   };
   return { root, tasks, findings, deps, cleanup: () => fs.rmSync(root, { recursive: true, force: true }) };
 }
@@ -438,12 +440,15 @@ test('serve launcher suppresses card linking for Discuss and preserves it for St
   const link = () => ({ linked: true });
   const captures = [];
   const openSession = async (body, deps) => { captures.push({ body, deps }); return { sessionId: 's' }; };
-  const base = { taskId: 'card-one', message: 'pointer', sessionId: 'reserved', onLaunched: () => {} };
+  const base = { taskId: 'card-one', message: 'pointer', sessionId: 'reserved', launchId: 'launch-one',
+    agent: 'claude', accountId: 'claude/default', model: '', onLaunched: () => {} };
   await launchReviewQueueSession({ ...base, action: 'discuss' }, { openSession, linkLaunchedSession: link, loadTask: () => ({}) });
   await launchReviewQueueSession({ ...base, action: 'start' }, { openSession, linkLaunchedSession: link, loadTask: () => ({}) });
   assert.deepEqual(captures.map((capture) => capture.body), [
-    { taskId: 'card-one', fresh: true, agent: 'claude', message: 'pointer' },
-    { taskId: 'card-one', fresh: true, agent: 'claude', message: 'pointer' },
+    { taskId: 'card-one', fresh: true, agent: 'claude', accountId: 'claude/default',
+      message: 'pointer', reviewQueueLaunchId: 'launch-one' },
+    { taskId: 'card-one', fresh: true, agent: 'claude', accountId: 'claude/default',
+      message: 'pointer', reviewQueueLaunchId: 'launch-one' },
   ]);
   assert.equal(captures[0].deps.randomUUID(), 'reserved');
   assert.equal(captures[0].deps.linkLaunchedSession(), null);
@@ -451,23 +456,28 @@ test('serve launcher suppresses card linking for Discuss and preserves it for St
 });
 
 test('server recovery distinguishes unavailable, absent, exited, and live host panes and types once', async () => {
-  const active = { sessionId: 'reserved', pane: 'pane-live', pointer: 'read pointer', action: 'discuss' };
+  const active = { sessionId: 'reserved', launchId: 'launch-one', agent: 'claude', accountId: 'claude/default',
+    pane: 'pane-live', pointer: 'read pointer', action: 'discuss' };
+  const meta = { sessionId: 'reserved', reviewQueueLaunchId: 'launch-one', agent: 'claude', accountId: 'claude/default' };
   assert.deepEqual(await inspectReviewQueueLaunch(active, { panes: null }), {
     state: 'unknown', message: 'terminal host is unavailable; launch state cannot be reconciled safely',
   });
   assert.deepEqual(await inspectReviewQueueLaunch(active, { panes: [] }), { state: 'absent' });
-  assert.deepEqual(await inspectReviewQueueLaunch(active, { panes: [{ id: 'old', alive: false, meta: { sessionId: 'reserved' } }] }), { state: 'absent' });
-  assert.deepEqual(await inspectReviewQueueLaunch(active, { panes: [{ id: 'shell', alive: true, agentAlive: false, meta: { sessionId: 'reserved' } }] }), {
+  assert.deepEqual(await inspectReviewQueueLaunch(active, { panes: [{ id: 'old', alive: false, meta }] }), { state: 'absent' });
+  assert.deepEqual(await inspectReviewQueueLaunch(active, { panes: [{ id: 'shell', alive: true, agentAlive: false, meta }] }), {
     state: 'unknown', pane: 'shell', message: 'reserved pane exists, but agent liveness needs another host observation',
   });
-  assert.deepEqual(await inspectReviewQueueLaunch({ ...active, pane: 'shell' }, { panes: [{ id: 'shell', alive: true, agentAlive: false, meta: { sessionId: 'reserved' } }] }), { state: 'absent' });
-  assert.deepEqual(await inspectReviewQueueLaunch(active, { panes: [{ id: 'live', alive: true, meta: { sessionId: 'reserved' } }] }), { state: 'present', pane: 'live' });
+  assert.deepEqual(await inspectReviewQueueLaunch({ ...active, pane: 'shell' }, { panes: [{ id: 'shell', alive: true, agentAlive: false, meta }] }), { state: 'absent' });
+  assert.deepEqual(await inspectReviewQueueLaunch(active, { panes: [{ id: 'pane-live', alive: true, meta }] }), {
+    state: 'present', pane: 'pane-live', sessionId: 'reserved',
+  });
   const events = [];
   await recoverReviewQueueLaunch(active, {
     onReady: () => { events.push('ready'); return true; },
     onDelivered: () => { events.push('delivered'); return true; },
   }, {
     waitForHostAgent: async () => events.push('wait'),
+    getPane: async () => ({ id: 'pane-live', alive: true, meta }),
     typeOpeningMessage: async (target, agent, message) => events.push({ target, agent, message }),
   });
   assert.deepEqual(events, [
@@ -476,7 +486,114 @@ test('server recovery distinguishes unavailable, absent, exited, and live host p
   let typed = false;
   await assert.rejects(recoverReviewQueueLaunch(active, { onReady: () => false }, {
     waitForHostAgent: async () => {},
+    getPane: async () => ({ id: 'pane-live', alive: true, meta }),
     typeOpeningMessage: async () => { typed = true; },
   }), (error) => error.status === 409 && /reservation changed before/.test(error.message));
   assert.equal(typed, false, 'a lost reservation must prevent opening instructions from being typed');
+});
+
+test('Codex review launch freezes account and model and binds the actual registered session', async () => {
+  const f = fixture();
+  try {
+    const launches = [];
+    const result = await queue.act({ id: 'idea:idea-one', action: 'discuss', requestId: 'codex-choice',
+      agent: 'codex', accountId: 'codex-secondary', model: 'gpt-5.6-sol' }, {
+      ...f.deps,
+      resolveLaunchSelection: async (body) => ({ agent: body.agent, accountId: body.accountId, model: body.model }),
+      randomUUID: () => 'codex-launch-marker',
+      launch: async (request) => {
+        launches.push(request);
+        assert.equal(request.sessionId, null, 'Codex assigns its real session id after launch');
+        await request.onLaunched({ pane: 'codex-pane', pid: 40, createdAt: 50, sessionId: null });
+        assert.equal(await request.onSessionReady({ pane: 'codex-pane', sessionId: 'actual-codex-session' }), true);
+        await request.onReady(); await request.onDelivered();
+        return { pane: 'codex-pane', sessionId: 'actual-codex-session' };
+      },
+    });
+    assert.equal(result.sessionId, 'actual-codex-session');
+    assert.equal(launches[0].launchId, 'codex-launch-marker');
+    assert.deepEqual({ agent: launches[0].agent, accountId: launches[0].accountId, model: launches[0].model },
+      { agent: 'codex', accountId: 'codex-secondary', model: 'gpt-5.6-sol' });
+    const saved = queue.loadStore(f.root).items['idea:idea-one'];
+    assert.equal(saved.requests['codex-choice'].sessionId, 'actual-codex-session');
+    assert.deepEqual(saved.sessions.map((entry) => entry.id), ['actual-codex-session']);
+  } finally { f.cleanup(); }
+});
+
+test('review launch validates selection before mutation and request retries cannot change it', async () => {
+  const f = fixture();
+  try {
+    let launches = 0;
+    await assert.rejects(queue.act({ id: 'idea:idea-one', action: 'start', requestId: 'bad-account',
+      agent: 'codex', accountId: 'missing' }, {
+      ...f.deps, resolveLaunchSelection: async () => { throw new queue.QueueError(400, 'unknown account'); },
+      launch: async () => { launches++; },
+    }), (error) => error.status === 400 && /unknown account/.test(error.message));
+    assert.equal(queue.loadStore(f.root).items['idea:idea-one'], undefined);
+
+    await queue.act({ id: 'idea:idea-one', action: 'discuss', requestId: 'fixed-choice',
+      agent: 'claude', accountId: 'claude/default', model: 'claude-fable-5-1' }, {
+      ...f.deps, launch: async (request) => {
+        launches++; await request.onLaunched({ pane: 'choice-pane', sessionId: request.sessionId });
+        return { sessionId: request.sessionId };
+      },
+    });
+    await assert.rejects(queue.act({ id: 'idea:idea-one', action: 'discuss', requestId: 'fixed-choice',
+      agent: 'claude', accountId: 'claude/default', model: 'claude-opus-4-1' }, f.deps),
+    (error) => error.status === 409 && /different review queue account or model/.test(error.message));
+    assert.equal(launches, 1);
+  } finally { f.cleanup(); }
+});
+
+test('Codex response-loss recovery discovers the actual session by immutable launch marker without relaunching', async () => {
+  const f = fixture();
+  const body = { id: 'idea:idea-one', action: 'discuss', requestId: 'codex-recovery',
+    agent: 'codex', accountId: 'codex-secondary', model: 'gpt-5.6-sol' };
+  try {
+    let launches = 0; let recoveries = 0;
+    await assert.rejects(queue.act(body, {
+      ...f.deps, randomUUID: () => 'codex-recovery-marker', launch: async (request) => {
+        launches++; await request.onLaunched({ pane: 'surviving-codex-pane', pid: 70, createdAt: 80, sessionId: null });
+        throw new Error('daemon stopped before Codex SessionStart');
+      },
+    }), /daemon stopped/);
+    const pending = queue.loadStore(f.root).items['idea:idea-one'].activeLaunch;
+    assert.equal(pending.launchId, 'codex-recovery-marker'); assert.equal(pending.sessionId, null);
+    assert.deepEqual({ agent: pending.agent, accountId: pending.accountId, model: pending.model },
+      { agent: 'codex', accountId: 'codex-secondary', model: 'gpt-5.6-sol' });
+
+    const recovered = await queue.act({ id: body.id, action: body.action, requestId: body.requestId }, {
+      ...f.deps,
+      resolveLaunchSelection: async () => assert.fail('saved selection must survive changed or unavailable defaults'),
+      inspectLaunch: async (active) => {
+        assert.equal(active.launchId, 'codex-recovery-marker');
+        return { state: 'present', pane: 'surviving-codex-pane', sessionId: 'actual-after-restart' };
+      },
+      recoverLaunch: async (active, hooks) => {
+        recoveries++; assert.equal(active.sessionId, 'actual-after-restart');
+        assert.equal(await hooks.onSessionReady({ sessionId: active.sessionId }), true);
+        assert.equal(await hooks.onReady(), true); assert.equal(await hooks.onDelivered(), true);
+        return { sessionId: active.sessionId };
+      },
+      launch: async () => { launches++; assert.fail('recovery must not launch another pane'); },
+    });
+    assert.equal(recovered.sessionId, 'actual-after-restart'); assert.equal(launches, 1); assert.equal(recoveries, 1);
+  } finally { f.cleanup(); }
+});
+
+test('legacy pending launch without a verified account selection refuses recovery without launching', async () => {
+  const f = fixture();
+  try {
+    queue.saveStore({ version: 1, items: { 'idea:idea-one': {
+      requests: { legacy: { state: 'unknown', action: 'discuss', sessionId: 'legacy-session' } },
+      activeLaunch: { requestId: 'legacy', action: 'discuss', card: 'idea-one', sessionId: 'legacy-session',
+        pane: 'legacy-pane', phase: 'spawned', error: 'daemon stopped' },
+    } } }, f.root);
+    let inspected = 0; let launched = 0;
+    await assert.rejects(queue.act({ id: 'idea:idea-one', action: 'discuss', requestId: 'legacy' }, {
+      ...f.deps, inspectLaunch: async () => { inspected++; }, launch: async () => { launched++; },
+    }), (error) => error.status === 409 && /no verified account selection/.test(error.message));
+    assert.equal(inspected, 0); assert.equal(launched, 0);
+    assert.equal(queue.loadStore(f.root).items['idea:idea-one'].activeLaunch.pane, 'legacy-pane');
+  } finally { f.cleanup(); }
 });

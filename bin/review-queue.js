@@ -173,6 +173,9 @@ function publicItem(source, meta = {}, now = Date.now()) {
       sessionId: active.sessionId,
       action: active.action,
       requestId: active.requestId,
+      ...(active.agent ? { agent: active.agent } : {}),
+      ...(active.accountId ? { accountId: active.accountId } : {}),
+      ...(active.model ? { model: active.model } : {}),
       recoverable: Boolean(active.error && (!active.phase || ['reserved', 'spawned'].includes(active.phase))),
       at: active.at,
       ...(active.error ? { message: active.error } : {}),
@@ -198,7 +201,7 @@ function snapshot(options = {}) {
 
 function validateRequest(body, now) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw new QueueError(400, 'bad review queue request');
-  const allowed = new Set(['id', 'action', 'requestId', 'until', 'reason']);
+  const allowed = new Set(['id', 'action', 'requestId', 'until', 'reason', 'agent', 'accountId', 'model']);
   if (Object.keys(body).some((key) => !allowed.has(key))) throw new QueueError(400, 'bad review queue request');
   if (typeof body.id !== 'string' || !/^(?:idea:[a-z0-9][a-z0-9-]*|finding:[a-z0-9][a-z0-9-]*:[A-Za-z0-9_-]+)$/.test(body.id)) {
     throw new QueueError(400, 'bad review queue item id');
@@ -215,6 +218,26 @@ function validateRequest(body, now) {
     if (typeof body.reason !== 'string' || !body.reason.trim()) throw new QueueError(400, 'dismiss needs a reason');
     if (body.reason.length > 2000) throw new QueueError(400, 'dismiss reason is limited to 2000 characters');
   } else if (body.reason != null) throw new QueueError(400, 'reason is only valid for dismiss');
+  const launch = ['discuss', 'start'].includes(body.action);
+  if (!launch && (body.agent != null || body.accountId != null || body.model != null)) {
+    throw new QueueError(400, 'agent, account and model are only valid for launch actions');
+  }
+  if (body.agent != null && !['claude', 'codex'].includes(body.agent)) throw new QueueError(400, 'bad review queue agent');
+  if (body.accountId != null && (typeof body.accountId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/.test(body.accountId))) {
+    throw new QueueError(400, 'bad review queue account');
+  }
+  if (body.model != null && (typeof body.model !== 'string' || !keep.LAUNCH_MODEL_RE.test(body.model))) {
+    throw new QueueError(400, 'bad review queue model');
+  }
+}
+
+function sameLaunchSelection(record, selection) {
+  return Boolean(record && selection && ['claude', 'codex'].includes(record.agent)
+    && typeof record.accountId === 'string' && record.accountId
+    && typeof record.model === 'string' && ['claude', 'codex'].includes(selection.agent)
+    && typeof selection.accountId === 'string' && selection.accountId
+    && typeof selection.model === 'string' && record.agent === selection.agent
+    && record.accountId === selection.accountId && (record.model || '') === (selection.model || ''));
 }
 
 function relatedContext(source, sources) {
@@ -320,8 +343,29 @@ async function act(body, deps = {}) {
   let initialMeta = itemMeta(loadStore(root, { strict: true }), body.id);
   let existingItem = publicItem(source, initialMeta, at);
   const initialRequest = initialMeta.requests?.[requestId];
+  const launchActions = ['discuss', 'start'].includes(body.action);
+  const savedSelection = initialRequest && initialRequest.action === body.action ? initialRequest
+    : initialMeta.activeLaunch?.requestId === requestId ? initialMeta.activeLaunch : null;
+  const omittedSelection = body.agent == null && body.accountId == null && body.model == null;
+  if (launchActions && omittedSelection && initialMeta.activeLaunch?.requestId === requestId && !sameLaunchSelection(savedSelection, savedSelection)) {
+    throw new QueueError(409, 'saved review queue launch has no verified account selection; open the existing pane to inspect it');
+  }
+  const selection = launchActions ? omittedSelection && sameLaunchSelection(savedSelection, savedSelection)
+    ? { agent: savedSelection.agent, accountId: savedSelection.accountId, model: savedSelection.model || '' }
+    : await (deps.resolveLaunchSelection || (async (value) => ({
+      agent: value.agent || 'claude', accountId: value.accountId || null, model: value.model || '',
+    })))(body)
+    : null;
+  if (launchActions && (!selection || !['claude', 'codex'].includes(selection.agent)
+      || typeof selection.accountId !== 'string' || !selection.accountId
+      || typeof selection.model !== 'string')) {
+    throw new QueueError(400, 'review queue launch selection is invalid');
+  }
   if (initialRequest && initialRequest.action !== body.action) {
     throw new QueueError(409, 'request id was already used for a different review queue action', { item: existingItem });
+  }
+  if (initialRequest && launchActions && !sameLaunchSelection(initialRequest, selection)) {
+    throw new QueueError(409, 'request id was already used with a different review queue account or model', { item: existingItem });
   }
   if (initialRequest?.state === 'complete') {
     return { ok: true, ...(initialRequest.sessionId ? { sessionId: initialRequest.sessionId } : {}), item: existingItem };
@@ -333,12 +377,14 @@ async function act(body, deps = {}) {
   }
   const finishActive = (active) => updateStore(root, withLock, (store) => {
     const meta = itemMeta(store, body.id);
-    if (meta.activeLaunch?.sessionId !== active.sessionId) return false;
+    if (meta.activeLaunch?.requestId !== active.requestId) return false;
+    const bound = meta.activeLaunch;
+    if (!bound.sessionId) return false;
     const fresh = findSource(body.id, options).source;
     const requests = { ...(meta.requests || {}) };
-    requests[active.requestId] = { ...requests[active.requestId], state: 'complete', action: active.action, sessionId: active.sessionId };
+    requests[active.requestId] = { ...requests[active.requestId], state: 'complete', action: active.action, sessionId: bound.sessionId };
     const sessions = Array.isArray(meta.sessions) ? [...meta.sessions] : [];
-    if (!sessions.some((entry) => entry.id === active.sessionId)) sessions.push({ id: active.sessionId, action: active.action, at: active.at });
+    if (!sessions.some((entry) => entry.id === bound.sessionId)) sessions.push({ id: bound.sessionId, action: active.action, at: active.at });
     store.items[body.id] = {
       ...meta, requests, sessions, activeLaunch: null, launchError: null,
       ...(fresh.sourceResolved
@@ -347,9 +393,11 @@ async function act(body, deps = {}) {
     };
     return true;
   });
-  const launchActions = ['discuss', 'start'].includes(body.action);
   if (launchActions && initialMeta.activeLaunch) {
     const active = initialMeta.activeLaunch;
+    if (!sameLaunchSelection(active, selection)) {
+      throw new QueueError(409, 'review queue conversation is reserved for a different account or model', { item: existingItem });
+    }
     if (source.sourceResolved) {
       if (!finishActive(active)) throw new QueueError(409, 'review queue launch state changed during resolution; refresh and try again');
       const item = snapshot({ ...options, now }).items.find((entry) => entry.id === body.id);
@@ -378,7 +426,7 @@ async function act(body, deps = {}) {
       const message = inspection?.message || 'terminal host is unavailable; launch state cannot be reconciled safely';
       updateStore(root, withLock, (store) => {
         const meta = itemMeta(store, body.id);
-        if (meta.activeLaunch?.sessionId !== active.sessionId) return;
+        if (meta.activeLaunch?.requestId !== active.requestId) return;
         store.items[body.id] = {
           ...meta,
           activeLaunch: { ...meta.activeLaunch, ...(inspection?.pane ? { pane: inspection.pane } : {}), error: message },
@@ -390,7 +438,7 @@ async function act(body, deps = {}) {
     if (inspection.state === 'absent') {
       updateStore(root, withLock, (store) => {
         const meta = itemMeta(store, body.id);
-        if (meta.activeLaunch?.sessionId !== active.sessionId) return;
+        if (meta.activeLaunch?.requestId !== active.requestId) return;
         const requests = { ...(meta.requests || {}) };
         requests[active.requestId] = { ...requests[active.requestId], state: 'failed', status: 502, error: 'reserved conversation is no longer present in the terminal host' };
         store.items[body.id] = {
@@ -408,11 +456,12 @@ async function act(body, deps = {}) {
       const pane = inspection.pane;
       updateStore(root, withLock, (store) => {
         const meta = itemMeta(store, body.id);
-        if (meta.activeLaunch?.sessionId !== active.sessionId) return;
+        if (meta.activeLaunch?.requestId !== active.requestId) return;
+        const sessionId = inspection.sessionId || meta.activeLaunch.sessionId;
         const sessions = Array.isArray(meta.sessions) ? [...meta.sessions] : [];
-        if (!sessions.some((entry) => entry.id === active.sessionId)) sessions.push({ id: active.sessionId, action: active.action, at: active.at });
+        if (sessionId && !sessions.some((entry) => entry.id === sessionId)) sessions.push({ id: sessionId, action: active.action, at: active.at });
         store.items[body.id] = {
-          ...meta, sessions, activeLaunch: { ...meta.activeLaunch, pane },
+          ...meta, sessions, activeLaunch: { ...meta.activeLaunch, pane, ...(sessionId ? { sessionId } : {}) },
           ...(active.action === 'start' ? { status: 'in-progress', deferredUntil: null } : {}),
         };
       });
@@ -420,7 +469,7 @@ async function act(body, deps = {}) {
       if (recoverable && deps.recoverLaunch) {
         const claimed = updateStore(root, withLock, (store) => {
           const meta = itemMeta(store, body.id);
-          if (meta.activeLaunch?.sessionId !== active.sessionId) return false;
+          if (meta.activeLaunch?.requestId !== active.requestId) return false;
           if (meta.activeLaunch.recoveryOwner === ownerId) return false;
           store.items[body.id] = {
             ...meta,
@@ -438,13 +487,24 @@ async function act(body, deps = {}) {
           recoveryPhase = phase;
           return updateStore(root, withLock, (store) => {
             const meta = itemMeta(store, body.id);
-            if (meta.activeLaunch?.sessionId !== active.sessionId || meta.activeLaunch.recoveryOwner !== ownerId) return false;
+            if (meta.activeLaunch?.requestId !== active.requestId || meta.activeLaunch.recoveryOwner !== ownerId) return false;
             store.items[body.id] = { ...meta, activeLaunch: { ...meta.activeLaunch, phase, error: null } };
             return true;
           });
         };
+        const recordRecoveredSession = (launch) => updateStore(root, withLock, (store) => {
+          const meta = itemMeta(store, body.id);
+          if (meta.activeLaunch?.requestId !== active.requestId || meta.activeLaunch.recoveryOwner !== ownerId
+              || !launch?.sessionId || !/^[A-Za-z0-9_-]+$/.test(launch.sessionId)) return false;
+          const requests = { ...(meta.requests || {}) };
+          requests[active.requestId] = { ...requests[active.requestId], sessionId: launch.sessionId };
+          store.items[body.id] = { ...meta, requests,
+            activeLaunch: { ...meta.activeLaunch, sessionId: launch.sessionId, error: null } };
+          return true;
+        });
         try {
-          await deps.recoverLaunch({ ...active, pane }, {
+          const recovered = await deps.recoverLaunch({ ...active, pane, ...(inspection.sessionId ? { sessionId: inspection.sessionId } : {}) }, {
+            onSessionReady: recordRecoveredSession,
             onReady: () => recordRecoveryPhase('ready'),
             onDelivered: () => recordRecoveryPhase('delivered'),
           });
@@ -453,12 +513,12 @@ async function act(body, deps = {}) {
           }
           if (!finishActive(active)) throw new QueueError(409, 'review queue launch state changed during recovery; refresh and try again');
           const item = snapshot({ ...options, now }).items.find((entry) => entry.id === body.id);
-          return { ok: true, sessionId: active.sessionId, item };
+          return { ok: true, sessionId: recovered?.sessionId || inspection.sessionId || active.sessionId, item };
         } catch (error) {
           const message = String(error.message || error).slice(0, 500);
           updateStore(root, withLock, (store) => {
             const meta = itemMeta(store, body.id);
-            if (meta.activeLaunch?.sessionId !== active.sessionId) return;
+            if (meta.activeLaunch?.requestId !== active.requestId) return;
             store.items[body.id] = {
               ...meta,
               activeLaunch: { ...meta.activeLaunch, phase: recoveryPhase, error: message, recoveryOwner: null },
@@ -474,7 +534,7 @@ async function act(body, deps = {}) {
         : 'the reserved conversation exists, but opening instructions could not be recovered automatically';
       updateStore(root, withLock, (store) => {
         const meta = itemMeta(store, body.id);
-        if (meta.activeLaunch?.sessionId !== active.sessionId) return;
+        if (meta.activeLaunch?.requestId !== active.requestId) return;
         store.items[body.id] = {
           ...meta, activeLaunch: { ...meta.activeLaunch, error: message },
           launchError: { message, at, sessionId: active.sessionId },
@@ -552,16 +612,17 @@ async function act(body, deps = {}) {
       throw new QueueError(409, 'review item is already in progress', { item: current });
     }
     if (active) throw new QueueError(409, 'review queue launch state changed; refresh while Keep reconciles the reserved conversation', { item: current });
-    const sessionId = (deps.randomUUID || crypto.randomUUID)();
-    requests[requestId] = { state: 'launching', action: body.action, sessionId, at };
+    const launchId = (deps.randomUUID || crypto.randomUUID)();
+    const sessionId = selection.agent === 'claude' ? launchId : null;
+    requests[requestId] = { state: 'launching', action: body.action, launchId, sessionId, at, ...selection };
     store.items[body.id] = {
       ...meta, requests, activeLaunch: {
-        requestId, action: body.action, card: source.card, sessionId, at,
+        requestId, action: body.action, card: source.card, launchId, sessionId, at, ...selection,
         phase: 'reserved', ownerId, previousStatus: current.status,
       },
       launchError: null, at,
     };
-    return { sessionId };
+    return { launchId, sessionId };
   });
 
   if (reservation.replay) {
@@ -589,18 +650,33 @@ async function act(body, deps = {}) {
       if (meta.activeLaunch?.requestId !== requestId) throw new QueueError(409, 'review queue launch reservation changed');
       const fresh = findSource(body.id, options).source;
       const sessions = Array.isArray(meta.sessions) ? [...meta.sessions] : [];
-      if (!sessions.some((entry) => entry.id === reservation.sessionId)) {
-        sessions.push({ id: reservation.sessionId, action: body.action, at });
+      if (launch.sessionId && !sessions.some((entry) => entry.id === launch.sessionId)) {
+        sessions.push({ id: launch.sessionId, action: body.action, at });
       }
       store.items[body.id] = {
         ...meta, sessions,
-        activeLaunch: { ...meta.activeLaunch, pane: launch.pane, phase: 'spawned', error: null },
+        activeLaunch: { ...meta.activeLaunch, pane: launch.pane,
+          ...(Number.isInteger(launch.pid) ? { panePid: launch.pid } : {}),
+          ...(launch.createdAt != null ? { paneCreatedAt: launch.createdAt } : {}),
+          ...(launch.sessionId ? { sessionId: launch.sessionId } : {}), phase: 'spawned', error: null },
         ...(fresh.sourceResolved
           ? { status: 'resolved', deferredUntil: null }
           : body.action === 'start' ? { status: 'in-progress', deferredUntil: null } : {}),
       };
     });
   };
+  const onSessionReady = (launch) => updateStore(root, withLock, (store) => {
+    const meta = itemMeta(store, body.id);
+    if (meta.activeLaunch?.requestId !== requestId || !launch?.sessionId
+        || !/^[A-Za-z0-9_-]+$/.test(launch.sessionId)) return false;
+    const requests = { ...(meta.requests || {}) };
+    requests[requestId] = { ...requests[requestId], sessionId: launch.sessionId };
+    const sessions = Array.isArray(meta.sessions) ? [...meta.sessions] : [];
+    if (!sessions.some((entry) => entry.id === launch.sessionId)) sessions.push({ id: launch.sessionId, action: body.action, at });
+    store.items[body.id] = { ...meta, requests, sessions,
+      activeLaunch: { ...meta.activeLaunch, sessionId: launch.sessionId, error: null } };
+    return true;
+  });
   const onReady = () => recordPhase('ready');
   const onDelivered = () => recordPhase('delivered');
 
@@ -615,15 +691,18 @@ async function act(body, deps = {}) {
     const launch = await deps.launch({
       taskId: source.card,
       fresh: true,
-      agent: 'claude',
+      ...selection,
       message: pointer,
       sessionId: reservation.sessionId,
+      launchId: reservation.launchId,
       action: body.action,
       onLaunched,
+      onSessionReady,
       onReady,
       onDelivered,
     });
     const sessionId = launch.sessionId || reservation.sessionId;
+    if (!sessionId) throw new QueueError(502, 'review queue conversation did not register a session id');
     updateStore(root, withLock, (store) => {
       const meta = itemMeta(store, body.id);
       if (meta.activeLaunch?.requestId !== requestId) throw new QueueError(409, 'review queue launch reservation changed after conversation opened');
@@ -651,11 +730,12 @@ async function act(body, deps = {}) {
       const pane = active?.pane || observedLaunch?.pane;
       const requests = { ...(meta.requests || {}) };
       requests[requestId] = { ...requests[requestId], state: 'unknown', status, error: failure, pane };
-      partialSessionId = pane ? reservation.sessionId : undefined;
+      partialSessionId = pane ? active?.sessionId || observedLaunch?.sessionId || reservation.sessionId || undefined : undefined;
       store.items[body.id] = {
         ...meta, requests,
         activeLaunch: {
-          ...(active || { requestId, action: body.action, sessionId: reservation.sessionId, at, ownerId }),
+          ...(active || { requestId, action: body.action, launchId: reservation.launchId,
+            sessionId: reservation.sessionId, at, ownerId, ...selection }),
           ...(pane ? { pane } : {}), phase: observedPhase, error: failure,
         },
         launchError: { message: failure, at: now(), sessionId: partialSessionId || null },
@@ -679,7 +759,8 @@ async function reconcile(deps = {}) {
   const results = [];
   for (const active of pending) {
     try {
-      results.push(await act({ id: active.id, action: active.action, requestId: active.requestId }, deps));
+      results.push(await act({ id: active.id, action: active.action, requestId: active.requestId,
+        agent: active.agent, accountId: active.accountId, ...(active.model ? { model: active.model } : {}) }, deps));
     } catch (error) {
       results.push({ ok: false, id: active.id, status: error.status || 500, error });
     }

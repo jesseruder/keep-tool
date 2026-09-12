@@ -3824,15 +3824,18 @@ function shellQuoteArg(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
+const freshOpenOperations = new Map();
+
 async function openSession(body, deps = {}) {
   body = body && typeof body === 'object' ? body : {};
+  const freshStandalone = body.fresh === true && !body.taskId && !body.sessionId;
   if (body.agent != null && !['claude', 'codex'].includes(body.agent)) throw new InjectionError(400, 'agent must be claude or codex');
   if (body.command != null) throw new InjectionError(400, 'command is not accepted');
   if (body.cwd != null && (typeof body.cwd !== 'string' || !body.cwd || /[\r\n\0]/.test(body.cwd))) {
     throw new InjectionError(400, 'cwd must be a directory path');
   }
-  if (body.cwd != null && (!body.taskId || body.fresh !== true)) {
-    throw new InjectionError(400, 'cwd is accepted only for a fresh card session');
+  if (body.cwd != null && body.fresh !== true) {
+    throw new InjectionError(400, 'cwd is accepted only for a fresh card or standalone agent session');
   }
   if (body.model != null && (typeof body.model !== 'string' || !keep.LAUNCH_MODEL_RE.test(body.model))) {
     throw new InjectionError(400, 'model must be a model id like claude-fable-5-1 or gpt-5.6-sol');
@@ -3854,6 +3857,25 @@ async function openSession(body, deps = {}) {
   if (body.portableTransferId != null && (typeof body.portableSourceSessionId !== 'string'
       || !/^[A-Za-z0-9_-]+$/.test(body.portableSourceSessionId))) {
     throw new InjectionError(400, 'bad portable source session id');
+  }
+  if (body.reviewQueueLaunchId != null && (typeof body.reviewQueueLaunchId !== 'string'
+      || !/^[A-Za-z0-9_-]{1,128}$/.test(body.reviewQueueLaunchId))) {
+    throw new InjectionError(400, 'bad review queue launch id');
+  }
+  if (body.requestId != null && (typeof body.requestId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(body.requestId))) {
+    throw new InjectionError(400, 'bad open request id');
+  }
+  if (freshStandalone && body.requestId && !deps.freshOpenClaimed) {
+    const identity = JSON.stringify({ cwd: body.cwd, agent: body.agent, accountId: body.accountId, model: body.model || '' });
+    const running = freshOpenOperations.get(body.requestId);
+    if (running) {
+      if (running.identity !== identity) throw new InjectionError(409, 'open request is already launching a different selection');
+      return running.promise;
+    }
+    const promise = openSession(body, { ...deps, freshOpenClaimed: true });
+    freshOpenOperations.set(body.requestId, { identity, promise });
+    try { return await promise; }
+    finally { if (freshOpenOperations.get(body.requestId)?.promise === promise) freshOpenOperations.delete(body.requestId); }
   }
 
   let project;
@@ -3891,6 +3913,8 @@ async function openSession(body, deps = {}) {
       project = transcript.project;
       if (project && !session) session = { id: body.sessionId, agent: transcript.agent };
     }
+  } else if (body.fresh === true && body.cwd) {
+    project = body.cwd;
   }
 
   if (typeof project !== 'string' || !project) throw new InjectionError(400, `no project for ${body.taskId ? `task ${body.taskId}` : `session ${body.sessionId || '?'}`}`);
@@ -3903,7 +3927,7 @@ async function openSession(body, deps = {}) {
       launchCwd = fs.realpathSync(launchCwd);
       if (!fs.statSync(launchCwd).isDirectory()) throw new Error();
     } catch { throw new InjectionError(400, 'cwd directory does not exist'); }
-    if (!keep.projectMatchesCwd(project, launchCwd)) {
+    if (body.taskId && !keep.projectMatchesCwd(project, launchCwd)) {
       throw new InjectionError(409, 'cwd is not part of the card project');
     }
     project = launchCwd;
@@ -3933,6 +3957,23 @@ async function openSession(body, deps = {}) {
   } else {
     account = body.accountId == null ? accounts.defaultFor(agent, deps.env || process.env) : accounts.get(body.accountId, deps.env || process.env);
     if (!account || account.agent !== agent) throw new InjectionError(400, `account ${body.accountId || '?'} is not a ${agent} account`);
+  }
+  if (freshStandalone && body.requestId) {
+    const panes = await (deps.listHostPanes || listHostPanes)(deps, true);
+    const matches = (panes || []).filter((entry) => entry?.alive !== false
+      && entry.meta?.openRequestId === body.requestId);
+    if (matches.length > 1) throw new InjectionError(409, 'open request matches multiple live panes');
+    if (matches.length === 1) {
+      const existing = matches[0];
+      if (existing.meta?.agent !== agent || existing.meta?.accountId !== account.id
+          || path.resolve(existing.meta?.project || '') !== project
+          || (existing.meta?.model || '') !== launchModel) {
+        throw new InjectionError(409, 'open request was already used for a different launch');
+      }
+      return { ok: true, existing: true, focus: 'console', pane: existing.id,
+        sessionId: existing.meta?.sessionId || null, accountId: account.id, accountLabel: account.label,
+        agent, recoverable: existing.agentAlive === false };
+    }
   }
   let accountMcpConfig = '';
   if (agent === 'claude' && require('./account-setup').readSetup(account)) {
@@ -3977,6 +4018,8 @@ async function openSession(body, deps = {}) {
         card: body.taskId || null,
         requester: body.requester || null,
         ...(body.portableTransferId ? { portableTransferId: body.portableTransferId } : {}),
+        ...(body.reviewQueueLaunchId ? { reviewQueueLaunchId: body.reviewQueueLaunchId } : {}),
+        ...(freshStandalone && body.requestId ? { openRequestId: body.requestId } : {}),
         launchedAt,
       },
     }, deps);
@@ -4047,8 +4090,18 @@ async function openSession(body, deps = {}) {
   release();
   const target = { pane: launch.pane };
   try {
-    await (deps.waitForHostAgent || waitForHostAgent)(target, agent, deps);
+    await (deps.waitForHostAgent || waitForHostAgent)(target, agent,
+      freshStandalone ? { ...deps, detectPortableSetup: true } : deps);
     launch.settled = true;
+    if (!launch.sessionId && (handoff || body.fresh && !body.taskId || deps.onSessionReady)) {
+      launch.sessionId = await (deps.waitForHostSessionId || waitForHostSessionId)(launch.pane, deps);
+      if (!launch.sessionId) {
+        throw new InjectionError(504, `${agent} started in host pane ${launch.pane} but never registered its session id`);
+      }
+    }
+    if (launch.sessionId && deps.onSessionReady && await deps.onSessionReady(launch) === false) {
+      throw new InjectionError(409, 'session launch reservation changed before opening instructions were sent');
+    }
     if (message) {
       if (body.portableTransferId) {
         launch.sessionId ||= await (deps.waitForHostSessionId || waitForHostSessionId)(launch.pane, deps);
@@ -4085,6 +4138,11 @@ async function openSession(body, deps = {}) {
     }
   } catch (error) {
     if (error?.extra?.awaitingSetup) error.extra.launch = { pane: launch.pane, sessionId: launch.sessionId, accountId: launch.accountId };
+    if (freshStandalone) {
+      error.extra = { ...(error.extra || {}), code: 'OPEN_EXISTING_PANE',
+        launch: { pane: launch.pane, sessionId: launch.sessionId || null, accountId: account.id,
+          agent, recoverable: true } };
+    }
     throw error;
   } finally {
     release();
@@ -4103,18 +4161,96 @@ async function openSession(body, deps = {}) {
   return launch;
 }
 
+const reopenOperations = new Map();
+
+async function reopenSessionOnAccount(body, deps = {}) {
+  body = body && typeof body === 'object' ? body : {};
+  if (Object.keys(body).some((key) => !['sessionId', 'accountId'].includes(key))
+      || typeof body.sessionId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(body.sessionId)
+      || !accounts.ID_RE.test(String(body.accountId || ''))) {
+    throw new InjectionError(400, 'Expected exact session and target account');
+  }
+  const root = deps.root || keep.ROOT;
+  const env = deps.env || process.env;
+  const session = (deps.resolveSessionId || resolveSessionId)(body.sessionId, deps);
+  const agent = session.kind || session.agent;
+  if (!['claude', 'codex'].includes(agent)) throw new InjectionError(409, 'Session provider does not support native account reopen');
+  const target = accounts.get(body.accountId, env);
+  if (!target || target.agent !== agent) throw new InjectionError(400, `account ${body.accountId} is not a ${agent} account`);
+  const running = reopenOperations.get(session.id);
+  if (running) {
+    if (running.accountId !== target.id) throw new InjectionError(409, 'A different account reopen is already running for this session');
+    return running.promise;
+  }
+  const promise = (async () => {
+    const handoffs = require('./account-handoff').list(root);
+    const recorded = handoffs.find((entry) => entry.sessionId === session.id);
+    if (recorded && !['done', 'failed'].includes(recorded.status)) {
+      if (recorded.targetAccountId !== target.id || recorded.intent !== 'open-only') {
+        throw new InjectionError(409, 'A different account handoff is already pending for this session');
+      }
+      return (deps.handoffSession || handoffSession)({ sessionId: session.id, pane: recorded.pane,
+        accountId: target.id, intent: 'open-only' }, deps);
+    }
+    if (recorded?.status === 'done' && recorded.targetAccountId === target.id && recorded.intent === 'open-only') {
+      return (deps.openSession || openSession)({ sessionId: session.id, accountId: target.id }, deps);
+    }
+    let source;
+    try { source = accounts.forSession(session.id, agent, { root, env }); }
+    catch (error) { throw new InjectionError(409, error.message); }
+    source ||= session.accountId ? accounts.get(session.accountId, env) : accounts.defaultFor(agent, env);
+    if (!source || source.agent !== agent) throw new InjectionError(409, 'Recorded source account is unavailable');
+    if (source.id === target.id) return (deps.openSession || openSession)({ sessionId: session.id, accountId: target.id }, deps);
+
+    const panes = await (deps.listHostPanes || listHostPanes)(deps, true);
+    const competing = (panes || []).filter((pane) => pane?.alive !== false && pane.meta?.sessionId === session.id);
+    if (competing.length > 1) throw new InjectionError(409, 'Multiple live panes own this session; close the competing session before reopening it');
+    if (competing[0]?.agentAlive === false) {
+      throw new InjectionError(409, 'The source pane exists but its agent setup is incomplete; open that pane and finish setup', {
+        code: 'OPEN_EXISTING_PANE', launch: { pane: competing[0].id, sessionId: session.id,
+          accountId: source.id, agent, recoverable: true },
+      });
+    }
+    const opened = await (deps.openSession || openSession)({ sessionId: session.id, accountId: source.id }, deps);
+    if (!opened?.pane) throw new InjectionError(502, 'Source session did not open in a verified pane');
+    return (deps.handoffSession || handoffSession)({ sessionId: session.id, pane: opened.pane,
+      accountId: target.id, intent: 'open-only' }, deps);
+  })();
+  reopenOperations.set(session.id, { accountId: target.id, promise });
+  try { return await promise; }
+  finally { if (reopenOperations.get(session.id)?.promise === promise) reopenOperations.delete(session.id); }
+}
+
+function resolveReviewLaunchSelection(body, deps = {}) {
+  const env = deps.env || process.env;
+  let account = body.accountId ? accounts.get(body.accountId, env) : null;
+  const agent = body.agent || account?.agent || 'claude';
+  if (!['claude', 'codex'].includes(agent)) throw new reviewQueue.QueueError(400, 'review queue agent is invalid');
+  account ||= accounts.defaultFor(agent, env);
+  if (!account || account.agent !== agent) {
+    throw new reviewQueue.QueueError(400, `account ${body.accountId || '?'} is not a ${agent} account`);
+  }
+  const model = body.model || '';
+  if (model && !keep.LAUNCH_MODEL_RE.test(model)) throw new reviewQueue.QueueError(400, 'review queue model is invalid');
+  return { agent, accountId: account.id, model };
+}
+
 async function launchReviewQueueSession(request, deps = {}) {
   const open = deps.openSession || openSession;
   return open({
     taskId: request.taskId,
     fresh: true,
-    agent: 'claude',
+    agent: request.agent,
+    accountId: request.accountId,
+    ...(request.model ? { model: request.model } : {}),
     message: request.message,
+    reviewQueueLaunchId: request.launchId,
   }, {
     ...deps,
     loadTask: deps.loadTask || keep.loadTaskAnywhere,
     randomUUID: () => request.sessionId,
     onLaunched: request.onLaunched,
+    onSessionReady: request.onSessionReady,
     onOpeningReady: request.onReady,
     onOpeningDelivered: request.onDelivered,
     // A discussion is an advisory conversation. It must not take the parent
@@ -4130,9 +4266,19 @@ async function inspectReviewQueueLaunch(active, deps = {}) {
   try { panes = Object.prototype.hasOwnProperty.call(deps, 'panes') ? deps.panes : await listHostPanes({}, true); }
   catch (error) { return { state: 'unknown', message: `terminal host lookup failed: ${error.message}` }; }
   if (!Array.isArray(panes)) return { state: 'unknown', message: 'terminal host is unavailable; launch state cannot be reconciled safely' };
-  const matches = panes.filter((pane) => pane?.meta?.sessionId === active.sessionId);
+  const matches = panes.filter((pane) => pane?.meta?.reviewQueueLaunchId === active.launchId
+    || active.sessionId && pane?.meta?.sessionId === active.sessionId);
+  if (matches.length > 1) return { state: 'unknown', message: 'multiple terminal panes match the reserved review conversation' };
   const present = matches.find((pane) => pane.alive !== false && pane.agentAlive !== false);
-  if (present) return { state: 'present', pane: present.id };
+  if (present) {
+    if (present.meta?.agent !== active.agent || present.meta?.accountId !== active.accountId
+        || active.pane && present.id !== active.pane
+        || active.panePid && present.pid !== active.panePid
+        || active.paneCreatedAt != null && present.createdAt !== active.paneCreatedAt) {
+      return { state: 'unknown', pane: present.id, message: 'reserved review conversation identity changed' };
+    }
+    return { state: 'present', pane: present.id, sessionId: present.meta?.sessionId || active.sessionId || null };
+  }
   const shell = matches.find((pane) => pane.alive !== false && pane.agentAlive === false);
   if (shell && active.pane !== shell.id) {
     return { state: 'unknown', pane: shell.id, message: 'reserved pane exists, but agent liveness needs another host observation' };
@@ -4144,21 +4290,37 @@ async function recoverReviewQueueLaunch(active, hooks = {}, deps = {}) {
   if (!active?.pane || !active.pointer) throw new InjectionError(409, 'reserved conversation has no recoverable pane or opening-message pointer');
   if (typeof hooks.onReady !== 'function') throw new InjectionError(409, 'review queue recovery has no reservation readiness gate');
   const target = { pane: active.pane };
-  await (deps.waitForHostAgent || waitForHostAgent)(target, 'claude', deps);
-  if (await hooks.onReady() !== true) {
-    throw new InjectionError(409, 'review queue launch reservation changed before opening instructions were sent');
+  await (deps.waitForHostAgent || waitForHostAgent)(target, active.agent, deps);
+  const sessionId = active.sessionId || await (deps.waitForHostSessionId || waitForHostSessionId)(active.pane, deps);
+  if (!sessionId) throw new InjectionError(409, 'review queue conversation session identity was not verified');
+  if (typeof hooks.onSessionReady === 'function' && await hooks.onSessionReady({ ...active, sessionId }) !== true) {
+    throw new InjectionError(409, 'review queue launch reservation changed before session registration');
   }
   await withInjectionLockRetry(
-    () => (deps.typeOpeningMessage || typeOpeningMessage)(target, 'claude', active.pointer, deps), deps, { pane: target.pane },
+    async () => {
+      const pane = await (deps.getPane
+        || (async (paneId) => (await hostRequest('get', { pane: paneId }, deps))?.pane))(active.pane);
+      if (!pane?.alive || pane.agentAlive === false || pane.id !== active.pane
+          || pane.meta?.reviewQueueLaunchId !== active.launchId || pane.meta?.sessionId !== sessionId
+          || pane.meta?.agent !== active.agent || pane.meta?.accountId !== active.accountId
+          || active.panePid && pane.pid !== active.panePid
+          || active.paneCreatedAt != null && pane.createdAt !== active.paneCreatedAt) {
+        throw new InjectionError(409, 'reserved review conversation identity changed before instructions were sent');
+      }
+      if (await hooks.onReady() !== true) {
+        throw new InjectionError(409, 'review queue launch reservation changed before opening instructions were sent');
+      }
+      return (deps.typeOpeningMessage || typeOpeningMessage)(target, active.agent, active.pointer, deps);
+    }, deps, { pane: target.pane },
   );
   if (typeof hooks.onDelivered === 'function' && await hooks.onDelivered() !== true) {
     throw new InjectionError(409, 'review queue launch reservation changed after opening instructions were sent');
   }
   if (active.action === 'start' && active.card) {
-    try { (deps.linkLaunchedSession || keep.linkLaunchedSession)(active.card, { id: active.sessionId, agent: 'claude' }); }
-    catch (error) { process.stderr.write(`keep serve: could not link recovered review queue session ${active.sessionId.slice(0, 8)} to ${active.card}: ${error.message}\n`); }
+    try { (deps.linkLaunchedSession || keep.linkLaunchedSession)(active.card, { id: sessionId, agent: active.agent }); }
+    catch (error) { process.stderr.write(`keep serve: could not link recovered review queue session ${sessionId.slice(0, 8)} to ${active.card}: ${error.message}\n`); }
   }
-  return { sessionId: active.sessionId, pane: active.pane, sent: true };
+  return { sessionId, pane: active.pane, sent: true };
 }
 const scanCache = require('./stat-parse-cache').createStatParseCache({
   maxEntries: 1024,
@@ -6525,6 +6687,7 @@ function start(deps = {}) {
           if (url.pathname === '/api/review-queue') {
             try {
               const result = await reviewQueue.act(body, {
+                resolveLaunchSelection: (selection) => resolveReviewLaunchSelection(selection),
                 launch: (request) => launchReviewQueueSession(request),
                 inspectLaunch: (active) => inspectReviewQueueLaunch(active),
                 recoverLaunch: (active, hooks) => recoverReviewQueueLaunch(active, hooks),
@@ -6536,6 +6699,16 @@ function start(deps = {}) {
                 return json(res, error.status, { error: error.message, ...error.extra });
               }
               return json(res, 502, { error: String(error && error.message || error).slice(0, 500) });
+            }
+          }
+          if (url.pathname === '/api/reopen-session') {
+            try {
+              const result = await reopenSessionOnAccount(body);
+              broadcast();
+              return json(res, 200, result);
+            } catch (error) {
+              if (error instanceof InjectionError) return json(res, error.status, { error: error.message, ...error.extra });
+              return json(res, Number(error.status) || 502, { error: String(error && error.message || error).slice(0, 500), ...error.extra });
             }
           }
           if (url.pathname === '/api/add') {
@@ -6912,12 +7085,12 @@ module.exports = {
   resolveSessionId, screenSession, screenHistorySession, sendSessionKeys, shellPaneTarget, stripTerminalAnsi, writeToShellPane,
   agentProcessRows, liveSessionPids, liveSessionTick, restorePlan,
   annotatePaneAgents,
-  readPaneRecord, sessionProjectFromTranscript, openSession,
+  readPaneRecord, sessionProjectFromTranscript, openSession, reopenSessionOnAccount,
   inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, continueAccountHandoff, handoffSession,
   abandonAccountHandoff,
   listPortableTransfers, inspectPortableSource, portableTransferDraft, preparePortableTransfer,
   portableTransferPreview, transferSession, resolvePortableTransfer, recoverPortableOpening,
-  launchReviewQueueSession, inspectReviewQueueLaunch, recoverReviewQueueLaunch,
+  resolveReviewLaunchSelection, launchReviewQueueSession, inspectReviewQueueLaunch, recoverReviewQueueLaunch,
   waitForHostAgent, waitForHostSessionId, addHostSessionState,
   sendToSession, sendToResolvedTarget, precheckSessionTarget, InjectionError,
   claudeMcpMenuVisible,
