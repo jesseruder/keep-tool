@@ -59,14 +59,17 @@ async function authPreflight(account, deps = {}) {
     const { stdout } = await execFileAsync('/bin/zsh', ['-lic', `exec ${command}`], {
       env: deps.env || process.env, timeout: 15000, maxBuffer: 256 * 1024,
     });
-    // Interactive shell startup may print a banner. Claude's JSON is compact,
-    // so select the last parseable object without ever exposing shell output.
+    // Interactive shell startup may print a banner. Parse Claude's complete
+    // output first (current releases pretty-print JSON), then accept a complete
+    // JSON suffix after banner text without ever exposing shell output.
     let value = null;
-    for (const line of String(stdout).trim().split(/\r?\n/).reverse()) {
-      try {
-        const candidate = JSON.parse(line);
-        if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) { value = candidate; break; }
-      } catch {}
+    const output = String(stdout).trim();
+    const starts = [0];
+    for (let i = output.indexOf('{'); i >= 0; i = output.indexOf('{', i + 1)) if (i) starts.push(i);
+    for (const start of starts) {
+      try { value = JSON.parse(output.slice(start)); } catch { continue; }
+      if (value && typeof value === 'object' && !Array.isArray(value)) break;
+      value = null;
     }
     const reported = value && typeof value.configDirectory === 'string' ? path.resolve(value.configDirectory) : null;
     return value && value.loggedIn === true && (!reported || reported === path.resolve(account.configDir));

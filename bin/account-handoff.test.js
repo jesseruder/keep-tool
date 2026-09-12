@@ -69,7 +69,9 @@ test('auth preflight resolves Claude in a login shell and reapplies managed cred
       `fs.writeFileSync(process.env.AUTH_CAPTURE, JSON.stringify({path:process.env.PATH,configDir:process.env.CLAUDE_CONFIG_DIR,` +
       `secureDir:process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR,apiKey:process.env.ANTHROPIC_API_KEY,` +
       `oauth:process.env.CLAUDE_CODE_OAUTH_TOKEN,baseUrl:process.env.ANTHROPIC_BASE_URL}));\n` +
-      `process.stdout.write(JSON.stringify({loggedIn:true,configDirectory:process.env.CLAUDE_CONFIG_DIR}));\n`, { mode: 0o755 });
+      `process.stdout.write(JSON.stringify({loggedIn:true,authMethod:'claude.ai',apiProvider:'firstParty',` +
+      `configDirectory:process.env.CLAUDE_CONFIG_DIR,projectsDirectory:process.env.CLAUDE_CONFIG_DIR+'/projects',` +
+      `organizationId:'synthetic',subscriptionType:'synthetic',email:'synthetic@example.invalid'},null,2));\n`, { mode: 0o755 });
     const shellQuote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
     fs.writeFileSync(path.join(home, '.zshrc'), [
       `export PATH=${shellQuote(`${fakeBin}:/usr/bin:/bin`)}`,
