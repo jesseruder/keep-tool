@@ -92,6 +92,11 @@ export function openSessionChooser(ctx, options) {
         queueMicrotask(() => modal.querySelector('[data-launch-directory]')?.focus());
         return;
       }
+      if (options.editableDirectory && !directory.startsWith('/')) {
+        state.error = 'Directory must be an absolute path.'; render();
+        queueMicrotask(() => modal.querySelector('[data-launch-directory]')?.focus());
+        return;
+      }
       if (options.editableDirectory) state.directory = directory;
       state.busy = true; state.error = ''; render();
       try {

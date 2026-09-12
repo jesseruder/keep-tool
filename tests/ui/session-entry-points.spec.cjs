@@ -94,6 +94,12 @@ test('Watch new session keeps the selected project and Plain shell option', asyn
   await expect(chooser(page).locator('[role=alert]')).toContainText('Directory is required');
   await expect(chooser(page).locator('[data-launch-directory]')).toBeFocused();
   expect(requests('/api/panes/spawn')).toHaveLength(0);
+  await chooser(page).locator('[data-launch-directory]').fill('relative/project');
+  await chooser(page).locator('[data-launch-submit]').click();
+  await expect(chooser(page).locator('[role=alert]')).toContainText('Directory must be an absolute path');
+  await expect(chooser(page).locator('[data-launch-directory]')).toHaveValue('relative/project');
+  await expect(chooser(page).locator('[data-launch-directory]')).toBeFocused();
+  expect(requests('/api/panes/spawn')).toHaveLength(0);
   const directory = `${project}/alternate-shell-project`;
   await chooser(page).locator('[data-launch-directory]').fill(directory);
   await chooser(page).locator('[data-launch-kind]').selectOption('codex');
