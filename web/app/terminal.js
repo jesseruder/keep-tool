@@ -5,6 +5,7 @@ import { createTrackedPixelWheelHandler } from './terminal-scroll.js';
 import { createTerminalProfiler } from './terminal-profile.js';
 
 const encoder = new TextEncoder();
+const MAX_RENDERER_TRIAL_TTL = 24 * 60 * 60 * 1000;
 
 function base64Bytes(bytes) {
   let binary = '';
@@ -59,6 +60,8 @@ export function mountTerminal(container, pane, options = {}) {
   let socket;
   let webglAddon;
   let webglContextLoss;
+  let domRendererTrialExpiresAt = null;
+  let rendererTrialTimer;
   let disposed = false;
   let exited = false;
   let exitReported = false;
@@ -102,8 +105,11 @@ export function mountTerminal(container, pane, options = {}) {
   };
   const note = () => {
     const sized = Number.isInteger(paneState?.cols) && Number.isInteger(paneState?.rows);
-    statusNote.textContent = profileNote || (!isPrimary && sized
-      ? `viewing at ${paneState.cols}×${paneState.rows} · click to take control` : '');
+    const observerNote = !isPrimary && sized
+      ? `viewing at ${paneState.cols}×${paneState.rows} · click to take control` : '';
+    statusNote.textContent = profileNote || [
+      domRendererTrialExpiresAt == null ? '' : 'Standard rendering trial', observerNote,
+    ].filter(Boolean).join(' · ');
   };
   const profiler = createTerminalProfiler({
     pane, terminal, wrapper,
@@ -127,7 +133,7 @@ export function mountTerminal(container, pane, options = {}) {
     observerGeometry = '';
   };
   const loadWebgl = () => {
-    if (disposed || webglAddon || !isVisible()) return;
+    if (disposed || domRendererTrialExpiresAt != null || webglAddon || !isVisible()) return;
     let addon;
     try {
       addon = new window.WebglAddon.WebglAddon();
@@ -140,6 +146,50 @@ export function mountTerminal(container, pane, options = {}) {
         if (!disposed && isVisible()) scaleObserver();
       });
     } catch { addon?.dispose(); }
+  };
+  const rendererTrialExpiry = (next) => {
+    const trial = next?.meta?.terminalRendererTrial;
+    const now = Date.now();
+    if (!window.__TAURI__ || trial?.mode !== 'dom' || trial.runtime !== 'desktop'
+        || typeof next.meta?.sessionId !== 'string' || !next.meta.sessionId
+        || trial.sessionId !== next.meta.sessionId || !Number.isFinite(trial.expiresAt)
+        || trial.expiresAt <= now || trial.expiresAt - now > MAX_RENDERER_TRIAL_TTL) return null;
+    return trial.expiresAt;
+  };
+  const finishRendererTrial = () => {
+    clearTimeout(rendererTrialTimer);
+    rendererTrialTimer = null;
+    domRendererTrialExpiresAt = null;
+    note();
+    if (!isVisible()) return;
+    loadWebgl();
+    if (!isPrimary) scaleObserver();
+  };
+  const expireRendererTrialIfNeeded = () => {
+    if (domRendererTrialExpiresAt == null || domRendererTrialExpiresAt > Date.now()) return false;
+    finishRendererTrial();
+    return true;
+  };
+  const syncRendererTrial = (next) => {
+    const expiresAt = rendererTrialExpiry(next);
+    if (expiresAt === domRendererTrialExpiresAt) return;
+    clearTimeout(rendererTrialTimer);
+    rendererTrialTimer = null;
+    const wasActive = domRendererTrialExpiresAt != null;
+    domRendererTrialExpiresAt = expiresAt;
+    if (expiresAt != null) {
+      disposeWebgl();
+      const expire = () => {
+        if (disposed || domRendererTrialExpiresAt !== expiresAt) return;
+        const remaining = expiresAt - Date.now();
+        if (remaining > 0) {
+          rendererTrialTimer = setTimeout(expire, remaining);
+          return;
+        }
+        finishRendererTrial();
+      };
+      rendererTrialTimer = setTimeout(expire, expiresAt - Date.now());
+    } else if (wasActive && isVisible()) loadWebgl();
   };
   const stopObserving = () => {
     if (!observing) return;
@@ -191,6 +241,7 @@ export function mountTerminal(container, pane, options = {}) {
   const setPaneState = (next) => {
     if (!next || next.id !== pane) return;
     paneState = next;
+    syncRendererTrial(next);
     const primary = next.primary === viewer;
     if (primary) claimPending = false;
     const controlling = primary || claimPending;
@@ -502,6 +553,7 @@ export function mountTerminal(container, pane, options = {}) {
 
   const show = (focus = false) => {
     presented = true;
+    expireRendererTrialIfNeeded();
     reportVisibility();
     showFocus = showFocus || focus;
     if (focus) {
@@ -546,6 +598,7 @@ export function mountTerminal(container, pane, options = {}) {
     },
     syncVisibility() {
       if (document.hidden) profiler.stop('hidden');
+      expireRendererTrialIfNeeded();
       reportVisibility();
       if (isVisible()) show(false);
       else {
@@ -559,6 +612,8 @@ export function mountTerminal(container, pane, options = {}) {
       trackpadWheel.cancel();
       clearTimeout(retryTimer);
       clearTimeout(resizeTimer);
+      clearTimeout(rendererTrialTimer);
+      rendererTrialTimer = null;
       cancelAnimationFrame(showFrame);
       stopObserving();
       disposeWebgl();

@@ -71,7 +71,7 @@ function fixture(options = {}) {
     addEventListener(type, listener) { this.listeners.set(type, listener); }
     dispatch(type, event = {}) { this.listeners.get(type)?.({ stopPropagation() {}, ...event }); }
   }
-  let terminal, fits = 0, exits = 0;
+  let terminal, fits = 0, exits = 0, webglLoads = 0, webglDisposals = 0;
   class Terminal extends HeadlessTerminal {
     constructor(options) { super(options); terminal = this; this.textarea = new Element(); this.visualElement = new Element(); }
     get element() { return this.visualElement; }
@@ -99,7 +99,14 @@ function fixture(options = {}) {
     close() { this.readyState = 3; }
   }
   const timers = new Map();
+  const timerDelays = new Map();
   let timerId = 0;
+  const frames = new Map();
+  let frameId = 0;
+  let now = options.now ?? 1_000_000;
+  class FakeDate extends Date {
+    static now() { return now; }
+  }
   const context = vm.createContext({
     TextEncoder, Uint8Array, URLSearchParams, WebSocket, devicePixelRatio: 2,
     document: { createElement: () => new Element(), activeElement: null },
@@ -107,6 +114,12 @@ function fixture(options = {}) {
       Terminal,
       FitAddon: { FitAddon: class { fit() { fits++; terminal.resize(80, 30); } } },
       SearchAddon: { SearchAddon: class {} },
+      WebglAddon: { WebglAddon: class {
+        constructor() { webglLoads++; }
+        onContextLoss() { return { dispose() {} }; }
+        dispose() { webglDisposals++; }
+      } },
+      ...(options.desktop ? { __TAURI__: {} } : {}),
     },
     ResizeObserver: class { observe() {} disconnect() {} },
     sessionStorage: { getItem: () => 'viewer' },
@@ -115,14 +128,16 @@ function fixture(options = {}) {
     getComputedStyle: () => ({ paddingLeft: '8', paddingRight: '8', paddingTop: '8', paddingBottom: '0' }),
     resolvedTheme() {}, getPalette() {}, xtermTheme: () => ({}),
     captureFocusIntent: () => () => true,
-    setTimeout(fn) { timers.set(++timerId, fn); return timerId; },
-    clearTimeout(id) { timers.delete(id); },
+    Date: FakeDate,
+    setTimeout(fn, delay) { timers.set(++timerId, fn); timerDelays.set(timerId, delay); return timerId; },
+    clearTimeout(id) { timers.delete(id); timerDelays.delete(id); },
     WheelEvent: class WheelEvent {
       static DOM_DELTA_PIXEL = 0;
       static DOM_DELTA_LINE = 1;
       constructor(type, init) { this.type = type; Object.assign(this, init); }
     },
-    requestAnimationFrame: () => 1, cancelAnimationFrame() {},
+    requestAnimationFrame(fn) { frames.set(++frameId, fn); return frameId; },
+    cancelAnimationFrame(id) { frames.delete(id); },
   });
   vm.runInContext(source, context);
   const mounted = context.mountTerminal(new Element(), 'pane', { focus: true, onExit: () => { exits++; } });
@@ -131,15 +146,125 @@ function fixture(options = {}) {
   socket.onopen();
   message({
     t: 'attached',
-    pane: { id: 'pane', primary: 'viewer', cols: 80, rows: 50 },
+    pane: { id: 'pane', primary: 'viewer', cols: 80, rows: 50, ...options.pane },
     ...(options.history ? { history: options.history } : {}),
   });
   const drain = () => new Promise((resolve) => terminal.write('', resolve));
   return {
-    mounted, terminal, socket, message, drain, timers,
+    mounted, terminal, socket, message, drain, timers, timerDelays,
+    runFrames() {
+      const pending = [...frames.values()];
+      frames.clear();
+      for (const fn of pending) fn();
+    },
+    setNow(value) { now = value; },
     get fits() { return fits; }, get exits() { return exits; },
+    get webglLoads() { return webglLoads; }, get webglDisposals() { return webglDisposals; },
   };
 }
+
+function rendererTrial(sessionId, expiresAt, overrides = {}) {
+  return { mode: 'dom', runtime: 'desktop', sessionId, expiresAt, ...overrides };
+}
+
+test('renderer trials are ignored by web and for malformed, mismatched, expired, or overlong desktop metadata', () => {
+  const now = 1_000_000;
+  const cases = [
+    { desktop: false, trial: rendererTrial('session', now + 1_000) },
+    { desktop: true, trial: rendererTrial('session', now + 1_000, { mode: 'canvas' }) },
+    { desktop: true, trial: rendererTrial('session', now + 1_000, { runtime: 'web' }) },
+    { desktop: true, trial: rendererTrial('other', now + 1_000) },
+    { desktop: true, trial: rendererTrial('session', now) },
+    { desktop: true, trial: rendererTrial('session', now + 24 * 60 * 60 * 1_000 + 1) },
+    { desktop: true, trial: rendererTrial('session', 'soon') },
+  ];
+  for (const item of cases) {
+    const f = fixture({
+      desktop: item.desktop, now,
+      pane: { meta: { sessionId: 'session', terminalRendererTrial: item.trial } },
+    });
+    try {
+      f.runFrames();
+      assert.equal(f.webglLoads, 1, JSON.stringify(item));
+    } finally { f.mounted.dispose(); }
+  }
+});
+
+test('a valid desktop renderer trial switches the existing terminal and clears immediately', async () => {
+  const now = 1_000_000;
+  const activePane = {
+    id: 'pane', primary: 'viewer', cols: 80, rows: 50,
+    meta: { sessionId: 'session', terminalRendererTrial: rendererTrial('session', now + 10_000) },
+  };
+  const f = fixture({ desktop: true, now, pane: activePane });
+  try {
+    f.runFrames();
+    assert.equal(f.webglLoads, 0);
+    assert.equal(f.mounted.element.querySelector('.term-note').textContent, 'Standard rendering trial');
+    f.socket.onmessage({ data: new TextEncoder().encode('retained output').buffer });
+    await f.drain();
+    const sameTerminal = f.terminal;
+
+    f.message({ t: 'pane', pane: { ...activePane, meta: { sessionId: 'session' } } });
+    assert.equal(f.webglLoads, 1, 'clearing metadata restores the normal renderer immediately');
+    assert.equal(f.mounted.terminal, sameTerminal);
+    assert.equal(f.terminal.buffer.active.getLine(0).translateToString(true), 'retained output');
+  } finally { f.mounted.dispose(); }
+});
+
+test('renderer trial expiry stays on DOM while hidden and restores WebGL on show', () => {
+  const now = 1_000_000;
+  const expiresAt = now + 10_000;
+  const f = fixture({
+    desktop: true, now,
+    pane: { meta: { sessionId: 'session', terminalRendererTrial: rendererTrial('session', expiresAt) } },
+  });
+  try {
+    f.runFrames();
+    assert.equal(f.webglLoads, 0);
+    const expiryTimer = [...f.timerDelays].find(([, delay]) => delay === 10_000)?.[0];
+    assert.ok(expiryTimer, 'finite expiry is scheduled');
+    f.mounted.hide();
+    f.setNow(expiresAt);
+    f.mounted.show();
+    assert.equal(f.timers.has(expiryTimer), false, 'show clears an expiry delayed by background sleep');
+    f.runFrames();
+    assert.equal(f.webglLoads, 1);
+  } finally { f.mounted.dispose(); }
+});
+
+test('observer renderer changes neither claim control nor resize the PTY and dispose cancels expiry', async () => {
+  const now = 1_000_000;
+  const activePane = {
+    id: 'pane', primary: 'other', cols: 90, rows: 40,
+    meta: { sessionId: 'session', terminalRendererTrial: rendererTrial('session', now + 10_000) },
+  };
+  const f = fixture({ desktop: true, now, pane: activePane });
+  f.message({ t: 'replay-end' });
+  await f.drain();
+  f.socket.sent.length = 0;
+  f.message({ t: 'pane', pane: { ...activePane, meta: { sessionId: 'session' } } });
+  assert.equal(f.webglLoads, 1);
+  assert.deepEqual(f.socket.sent, []);
+
+  f.message({ t: 'pane', pane: activePane });
+  const expiryTimer = [...f.timerDelays].find(([, delay]) => delay === 10_000)?.[0];
+  assert.ok(expiryTimer);
+  f.setNow(now + 10_000);
+  f.timers.get(expiryTimer)();
+  assert.equal(f.webglLoads, 2, 'visible observer restores its normal renderer at expiry');
+  assert.deepEqual(f.socket.sent, [], 'renderer expiry neither claims nor resizes the PTY');
+
+  const laterPane = {
+    ...activePane,
+    meta: { sessionId: 'session', terminalRendererTrial: rendererTrial('session', now + 30_000) },
+  };
+  f.message({ t: 'pane', pane: laterPane });
+  const laterTimer = [...f.timerDelays].find(([, delay]) => delay === 20_000)?.[0];
+  assert.ok(laterTimer);
+  f.mounted.dispose();
+  assert.equal(f.timers.has(laterTimer), false);
+});
 
 test('cached terminal visibility reports hide, show and reattachment', () => {
   const f = fixture();
