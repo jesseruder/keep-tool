@@ -126,3 +126,63 @@ test('bundle shows bounded contributor evidence and later unrelated activity doe
     fs.rmSync(base, { recursive: true, force: true });
   }
 });
+
+test('scoped contributor bundles cannot advance a log batch past omitted evidence', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-contributor-scope-'));
+  const root = path.join(base, 'keep');
+  const home = path.join(base, 'home');
+  const project = path.join(home, '.claude', 'projects', '-synthetic');
+  const ids = ['contributor-session-a', 'contributor-session-b'];
+  const cli = path.join(__dirname, 'keep.js');
+  const env = { ...process.env, HOME: home, KEEP_DIR: root, KEEP_NO_PUSH: '1', KEEP_ALERT_CHANNELS: 'none' };
+  for (const key of ['KEEP_CONFIG', 'CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID']) delete env[key];
+  const run = (args) => spawnSync(process.execPath, [cli, ...args], { cwd: root, env, encoding: 'utf8' });
+  try {
+    for (const dir of ['tasks', 'archive', 'digests']) fs.mkdirSync(path.join(root, dir), { recursive: true });
+    fs.mkdirSync(project, { recursive: true });
+    spawnSync('git', ['init', '-q', root], { env });
+    spawnSync('git', ['-C', root, 'config', 'user.name', 'Keep Test'], { env });
+    spawnSync('git', ['-C', root, 'config', 'user.email', 'keep@example.test'], { env });
+    const now = new Date();
+    now.setSeconds(0, 0);
+    const stamp = require('./keep.js').stampOf(now).replace('T', ' ');
+    const rowAt = new Date(now.getTime() - 2 * 60e3).toISOString();
+    fs.writeFileSync(path.join(root, 'tasks', 'scoped-card.md'), [
+      '---', 'title: Scoped card', 'status: active', `created: ${stamp.slice(0, 10)}`, `updated: ${stamp.replace(' ', 'T')}`, '---',
+      `## ${stamp} — check-in (by claude ${ids[1]})`, 'B contribution.', '',
+      `## ${stamp} — check-in (by claude ${ids[0]})`, 'A contribution.', '',
+    ].join('\n'));
+    ids.forEach((id, index) => fs.writeFileSync(path.join(project, `${id}.jsonl`), `${JSON.stringify({
+      type: 'assistant', timestamp: rowAt,
+      message: { content: [{ type: 'text', text: `CONTRIBUTOR_${index === 0 ? 'A' : 'B'}_ONLY` }] },
+    })}\n`));
+
+    const stateFile = path.join(root, '.keep', 'review', 'scoped-card.json');
+    const scoped = run(['review-bundle', 'scoped-card', '--session', ids[0]]);
+    assert.equal(scoped.status, 1, scoped.stderr);
+    assert.match(scoped.stderr, /would omit contributor context/);
+    assert.match(scoped.stderr, /remove --session.*--raw/);
+    assert.equal(fs.existsSync(stateFile), false, 'refusal stages no bundle or log watermark');
+
+    const unknown = run(['review-bundle', 'scoped-card', '--session', 'not-in-this-batch', '--raw']);
+    assert.equal(unknown.status, 1, unknown.stderr);
+    assert.match(unknown.stderr, /neither a linked owner nor an attributed contributor/);
+    assert.equal(fs.existsSync(stateFile), false);
+
+    const raw = run(['review-bundle', 'scoped-card', '--session', ids[0], '--raw']);
+    assert.equal(raw.status, 0, raw.stderr);
+    assert.match(raw.stdout, /CONTRIBUTOR_A_ONLY/);
+    assert.doesNotMatch(raw.stdout, /CONTRIBUTOR_B_ONLY/);
+    assert.equal(fs.existsSync(stateFile), false, 'raw contributor inspection does not stage the card log frontier');
+
+    const complete = run(['review-bundle', 'scoped-card']);
+    assert.equal(complete.status, 0, complete.stderr);
+    assert.match(complete.stdout, /CONTRIBUTOR_A_ONLY/);
+    assert.match(complete.stdout, /CONTRIBUTOR_B_ONLY/);
+    const staged = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    assert.deepEqual(staged.pendingLog, { stamp, count: 2 });
+    assert.deepEqual(staged.sessions, {}, 'contributor evidence never creates transcript offsets');
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});

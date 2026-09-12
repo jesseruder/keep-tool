@@ -1382,8 +1382,23 @@ function buildBundle(taskId, opts = {}) {
 
   const sessions = sessionsForTask(task, excluded)
     .filter((s) => !opts.session || s.id === opts.session);
-  const contributors = contributorSessionsForEntries(logEntriesForReview, sessions, excluded)
+  const contributorCandidates = contributorSessionsForEntries(logEntriesForReview, sessions, excluded);
+  const contributors = contributorCandidates
     .filter((s) => !opts.session || s.id === opts.session);
+  if (opts.session && contributorCandidates.length) {
+    const requested = String(opts.session);
+    const known = sessions.some((session) => session.id === requested)
+      || contributorCandidates.some((session) => session.id === requested);
+    if (!known) {
+      throw new keep.KeepError(`session ${requested} is neither a linked owner nor an attributed contributor in this log batch`);
+    }
+    const omitted = contributorCandidates.filter((session) => session.id !== requested);
+    if (!opts.raw && omitted.length) {
+      throw new keep.KeepError(
+        `--session ${requested} would omit contributor context for ${omitted.map((session) => session.id).join(', ')} while advancing the card log watermark — remove --session for a reviewable bundle, or add --raw for a read-only scoped transcript`,
+      );
+    }
+  }
   const perSession = [];
   const perContributor = [];
   let newBytes = 0;
