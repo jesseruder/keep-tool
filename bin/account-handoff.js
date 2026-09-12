@@ -25,10 +25,21 @@ function writeOne(root, entry) {
   fs.writeFileSync(tmp, JSON.stringify(entry, null, 2) + '\n', { mode: 0o600 });
   fs.renameSync(tmp, file);
 }
+function portableFallbackCandidate(entry) {
+  if (!entry || entry.phase === 'portable-fallback') return false;
+  const safePhase = entry.status === 'recovery-needed' && entry.phase === 'stopping-source'
+    || entry.status === 'failed' && entry.phase === 'preflight';
+  return Boolean(safePhase && !entry.sourceStopVerifiedAt && !entry.targetLaunchStartedAt
+    && !entry.deliveryStartedAt && !entry.deliveredAt);
+}
 function safe(entry) {
   if (!entry) return null;
   const keys = ['id', 'transactionId', 'sessionId', 'pane', 'sourceAccountId', 'targetAccountId', 'status', 'phase', 'reason', 'updatedAt'];
-  return Object.fromEntries(keys.filter((key) => entry[key] != null).map((key) => [key, entry[key]]));
+  return {
+    ...Object.fromEntries(keys.filter((key) => entry[key] != null).map((key) => [key, entry[key]])),
+    ...(portableFallbackCandidate(entry) ? { portableFallbackAvailable: true } : {}),
+    ...(entry.phase === 'portable-fallback' && entry.portableFallbackAt ? { portableFallbackAt: entry.portableFallbackAt } : {}),
+  };
 }
 function list(root) {
   let names;
@@ -341,4 +352,53 @@ async function run(body, deps = {}) {
   return pending;
 }
 
-module.exports = { run, list, safe, authPreflight, permissionClass, loginShellOutput, CONTINUATION_TEXT };
+async function abandonForPortable(body, deps = {}) {
+  const root = deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
+  const env = deps.env || process.env;
+  if (!/^[A-Za-z0-9_-]+$/.test(String(body?.sessionId || ''))
+      || !/^[A-Za-z0-9_-]+$/.test(String(body?.pane || ''))
+      || !/^[A-Za-z0-9_-]+$/.test(String(body?.transactionId || ''))) {
+    const error = new Error('Expected exact session, pane and handoff transaction'); error.status = 400; throw error;
+  }
+  if (active.has(body.sessionId)) {
+    const error = new Error('The account handoff is still running'); error.status = 409; throw error;
+  }
+  active.set(body.sessionId, { pane: body.pane, accountId: 'portable-fallback', promise: null });
+  try {
+    const current = readOne(root, body.sessionId);
+    if (!current || current.id !== body.transactionId || current.transactionId !== body.transactionId
+        || current.sessionId !== body.sessionId || current.pane !== body.pane || !portableFallbackCandidate(current)) {
+      const error = new Error('This account handoff cannot be safely replaced by a fresh continuation'); error.status = 409; throw error;
+    }
+    const authority = accounts.authority(root)[body.sessionId];
+    if (authority && (authority.agent !== 'claude' || authority.accountId !== current.sourceAccountId
+        || authority.stagedAccountId)) {
+      const error = new Error('Source account authority changed after the account handoff'); error.status = 409; throw error;
+    }
+    const inspected = await deps.inspect(body);
+    const session = inspected?.session;
+    const pane = inspected?.pane;
+    const observedAccount = session?.accountId || pane?.meta?.accountId;
+    if (!session || session.id !== current.sessionId || session.kind !== 'claude'
+        || !pane || pane.id !== current.pane || pane.alive !== true
+        || pane.meta?.sessionId !== current.sessionId || observedAccount !== current.sourceAccountId
+        || pane.meta?.accountId && pane.meta.accountId !== current.sourceAccountId
+        || Number.isInteger(current.pid) && pane.pid !== current.pid) {
+      const error = new Error('The original source session identity is no longer intact'); error.status = 409; throw error;
+    }
+    Object.assign(current, { status: 'failed', phase: 'portable-fallback',
+      reason: 'Native account handoff was abandoned before the source stopped; use a fresh portable continuation',
+      portableFallbackAt: Date.now() });
+    writeOne(root, current);
+    return { ok: true, ...safe(current) };
+  } finally { active.delete(body.sessionId); }
+}
+
+function abandonedForPortable(root, sessionId) {
+  const entry = readOne(root, sessionId);
+  return entry?.status === 'failed' && entry.phase === 'portable-fallback' && entry.portableFallbackAt
+    ? safe(entry) : null;
+}
+
+module.exports = { run, abandonForPortable, abandonedForPortable, list, safe, authPreflight, permissionClass,
+  loginShellOutput, CONTINUATION_TEXT };

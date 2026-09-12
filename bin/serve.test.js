@@ -103,6 +103,7 @@ const {
   portableTransferPreview,
   transferSession,
   resolvePortableTransfer,
+  waitForHostAgent,
   InjectionError,
 } = require('./serve.js');
 const { createScreenHistoryCache } = require('./screen-history.js');
@@ -3547,6 +3548,95 @@ test('portable transfer API lists safe records and launches only an existing tra
   });
   await assert.rejects(transferSession({ transferId: '../bad' }, { portable }),
     (error) => error.status === 400 && /invalid/.test(error.message));
+});
+
+test('portable transfer keeps a trust-blocked opening bound and retries through the same real openSession pane', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-portable-trust-'));
+  const config = path.join(root, 'accounts.json'), secondary = path.join(root, 'secondary');
+  fs.mkdirSync(secondary);
+  fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+    { id: 'claude/default', label: 'Primary', agent: 'claude', configDir: path.join(os.homedir(), '.claude'), useDefaultConfig: true },
+    { id: 'claude-secondary', label: 'Secondary', agent: 'claude', configDir: secondary },
+  ], defaultAccounts: { claude: 'claude/default' } }));
+  const env = { KEEP_DIR: root, KEEP_CONFIG: config };
+  const project = fs.realpathSync(root), transcript = path.join(root, 'source.jsonl');
+  fs.writeFileSync(transcript, `${JSON.stringify({ type: 'user', message: { content: 'Prepare a portable continuation.' } })}\n`);
+  const task = { id: 'portable-card', fm: { title: 'Portable trust', status: 'active', project, sessions: [] } };
+  const portable = require('./portable-handoff');
+  const accountStore = require('./accounts');
+  const common = {
+    root, env, accounts: accountStore,
+    sourceFor: () => ({ agent: 'claude', accountId: 'claude/default', cwd: project, file: transcript }),
+    taskForSession: () => task, nextStep: () => ({ text: 'Wait after setup.' }), taskFile: () => path.join(root, 'card.md'),
+    gitSnapshot: () => ({ available: true, cwd: project, top: project, commonDir: root, head: 'abc', branch: 'test', status: '', contentDigest: 'clean' }),
+    inspectSource: async () => ({ session: { endedTurn: true, state: 'needs-input', project } }),
+    storePackage: async ({ fileName, content }) => { const file = path.join(root, fileName); fs.writeFileSync(file, content); return file; },
+    loadTask: () => task, randomUUID: () => '44444444-4444-4444-8444-444444444444', linkLaunchedSession: () => true,
+  };
+  let screen = 'Do you trust the contents of this directory?', pane = null, spawns = 0, typed = [];
+  const host = { request: async (type, params) => {
+    if (type === 'spawn') {
+      spawns++; pane = { id: 'pane-portable-trust', alive: true, meta: params.meta }; return { pane };
+    }
+    if (type === 'screen') return { text: screen };
+    if (type === 'get') return { pane };
+    throw new Error(`unexpected host request ${type}`);
+  } };
+  try {
+    const prepared = await portable.run({ sourceSessionId: 'source-session-1234', accountId: 'claude-secondary',
+      contextText: 'Preserve this opening through trust.', prepareOnly: true }, common);
+    const first = await transferSession({ transferId: prepared.requestKey }, { ...common, host,
+      typeOpeningMessage: async (...args) => typed.push(args) });
+    assert.equal(first.transfer.status, 'awaiting-setup');
+    assert.equal(first.transfer.destinationPane, 'pane-portable-trust');
+    assert.equal(first.transfer.destinationSessionId, '44444444-4444-4444-8444-444444444444');
+    assert.equal(spawns, 1); assert.equal(typed.length, 0);
+    screen = '────────────────────\n❯';
+    const second = await transferSession({ transferId: prepared.requestKey }, { ...common, host,
+      typeOpeningMessage: async (...args) => typed.push(args) });
+    assert.equal(second.transfer.status, 'done');
+    assert.equal(spawns, 1, 'retry adopts the metadata-bound pane instead of spawning');
+    assert.equal(typed.length, 1);
+    assert.equal(typed[0][0].pane, 'pane-portable-trust');
+    assert.match(typed[0][2], /Acknowledge that you are ready, then WAIT/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('workspace trust is typed setup only for portable opening waits', async () => {
+  let now = 0;
+  const host = { request: async (type) => {
+    assert.equal(type, 'screen'); return { text: 'Do you trust the contents of this directory?' };
+  } };
+  const clock = { host, now: () => now, sleep: async (ms) => { now += ms; } };
+  await assert.rejects(waitForHostAgent({ pane: 'pane-trust' }, 'codex', clock),
+    (error) => error.status === 504 && /never showed an empty prompt/.test(error.message));
+  now = 0;
+  await assert.rejects(waitForHostAgent({ pane: 'pane-trust' }, 'codex', { ...clock, detectPortableSetup: true }),
+    (error) => error.status === 409 && error.code === 'KEEP_PORTABLE_TRANSFER_AWAITING_SETUP'
+      && error.extra.setupKind === 'workspace-trust');
+});
+
+test('abandoned pre-stop journal authorizes only its still-identical source for ledger metadata fallback', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-portable-abandoned-'));
+  const directory = path.join(root, '.keep', 'account-handoffs'); fs.mkdirSync(directory, { recursive: true });
+  const id = 'handoff-safe-source';
+  fs.writeFileSync(path.join(directory, 'source-session-1234.json'), JSON.stringify({ id, transactionId: id,
+    sessionId: 'source-session-1234', pane: 'pane-source', sourceAccountId: 'claude/default',
+    targetAccountId: 'claude-secondary', status: 'failed', phase: 'portable-fallback', portableFallbackAt: 1 }));
+  const session = { id: 'source-session-1234', kind: 'claude', accountId: 'claude/default', endedTurn: true,
+    pendingBackground: true, unknownBackgroundJobs: ['history-gap'], backgroundJobs: { jobs: [] } };
+  const pane = { id: 'pane-source', alive: true,
+    meta: { sessionId: session.id, accountId: session.accountId, agent: 'claude' } };
+  try {
+    let inspection = await inspectPortableSource(session.id, {}, { root, inspectState: async () => ({ sessions: [session], panes: [pane], handoffs: [] }) });
+    assert.equal(inspection.portableFallback.phase, 'portable-fallback');
+    assert.equal(require('./portable-handoff').sourceBusyReason(inspection), '');
+    inspection = await inspectPortableSource(session.id, {}, { root, inspectState: async () => ({ sessions: [
+      { ...session, accountId: 'claude-secondary' },
+    ], panes: [pane], handoffs: [] }) });
+    assert.equal(inspection.portableFallback, null);
+    assert.ok(inspection.nativeHandoff, 'changed identity restores the unresolved handoff refusal');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('desktop portable APIs accept bounded text and ids without browser-controlled read paths', async () => {

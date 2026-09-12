@@ -216,14 +216,17 @@ test('desktop launch binds the reviewed source account, card fields, and deliver
     const prepared = await portable.run({ sourceSessionId: 'source-session-1234', accountId: delivered.target.id,
       contextText: 'Record opening delivery.', prepareOnly: true }, delivered.deps);
     delivered.deps.open = async () => {
-      portable.recordDelivery(prepared.requestKey, { pane: 'pane-delivered' }, { root: delivered.root });
+      const launch = { pane: 'pane-delivered', sessionId: 'destination-session-5678', accountId: delivered.target.id };
+      portable.recordLaunch(prepared.requestKey, launch, { root: delivered.root });
+      assert.equal(portable.reserveDelivery(prepared.requestKey, launch, { root: delivered.root }), true);
+      portable.recordDelivery(prepared.requestKey, launch, { root: delivered.root });
       throw new Error('response lost after opening delivery');
     };
     await assert.rejects(portable.launchPrepared(prepared.requestKey, delivered.deps),
       (error) => error.code === 'KEEP_PORTABLE_TRANSFER_AMBIGUOUS');
-    assert.deepEqual(portable.deliveryReceipt(prepared.requestKey, { root: delivered.root }),
-      { version: 1, transferId: prepared.requestKey, pane: 'pane-delivered',
-        deliveredAt: portable.deliveryReceipt(prepared.requestKey, { root: delivered.root }).deliveredAt });
+    const receipt = portable.deliveryReceipt(prepared.requestKey, { root: delivered.root });
+    assert.deepEqual(receipt, { version: 2, transferId: prepared.requestKey, pane: 'pane-delivered',
+      sessionId: 'destination-session-5678', openingDigest: receipt.openingDigest, deliveredAt: receipt.deliveredAt });
   } finally { fs.rmSync(delivered.root, { recursive: true, force: true }); }
 });
 
@@ -311,6 +314,87 @@ test('desktop source safety rejects foreground, background, native, and portable
   assert.match(portable.sourceBusyReason({ session: { endedTurn: true }, nativeHandoff: {} }), /account handoff/);
   assert.match(portable.sourceBusyReason({ session: { endedTurn: true }, portableHandoff: {} }), /portable transfer/);
   assert.equal(portable.sourceBusyReason({ session: { endedTurn: true, state: 'needs-input' } }), '');
+});
+
+test('portable fallback ignores only named ledger metadata and still blocks concrete obligations', () => {
+  const base = { portableFallback: { phase: 'portable-fallback' }, session: { endedTurn: true, state: 'needs-input',
+    pendingBackground: true, unknownBackgroundJobs: ['history-gap'], backgroundJobs: { jobs: [] } } };
+  assert.equal(portable.sourceBusyReason(base), '');
+  assert.equal(portable.sourceBusyReason({ ...base, session: { ...base.session, unknownBackgroundJobs: ['job-unknown'] } }),
+    'the source has unfinished background work');
+  assert.equal(portable.sourceBusyReason({ ...base, session: { ...base.session, backgroundJobs: { jobs: [
+    { id: 'job-real', kind: 'agent', status: 'pending' },
+  ] } } }), 'the source has unfinished background work');
+  assert.equal(portable.sourceBusyReason({ ...base, session: { ...base.session, unknownBackgroundJobs: [] } }),
+    'the source has unfinished background work');
+});
+
+test('workspace trust preserves one opening and resumes delivery to the same bound pane', async () => {
+  const f = fixture();
+  try {
+    const prepared = await portable.run({ sourceSessionId: 'source-session-1234', accountId: f.target.id,
+      contextText: 'Wait through manual trust.', prepareOnly: true }, f.deps);
+    const launch = { pane: 'pane-trust', sessionId: 'destination-session-5678', accountId: f.target.id };
+    let opens = 0, resumes = 0, savedMessage = '';
+    const launchDeps = { ...f.deps, requireDeliveryReceipt: true,
+      open: async (payload) => {
+        opens++; savedMessage = payload.message;
+        portable.recordLaunch(prepared.requestKey, launch, { root: f.root });
+        const error = new Error('codex is awaiting workspace trust');
+        error.extra = { awaitingSetup: true, setupKind: 'workspace-trust', launch };
+        throw error;
+      },
+      resumeOpening: async (state, message) => {
+        resumes++;
+        assert.equal(state.destinationPane, launch.pane);
+        assert.equal(message, savedMessage, 'retry uses the exact durable opening text');
+        if (resumes === 1) {
+          const error = new Error('codex is still awaiting workspace trust');
+          error.extra = { awaitingSetup: true, setupKind: 'workspace-trust', launch };
+          throw error;
+        }
+        assert.equal(portable.reserveDelivery(prepared.requestKey, launch, { root: f.root }), true);
+        portable.recordDelivery(prepared.requestKey, launch, { root: f.root });
+        return launch;
+      },
+    };
+    const awaiting = await portable.launchPrepared(prepared.requestKey, launchDeps);
+    assert.equal(awaiting.status, 'awaiting-setup');
+    assert.equal(awaiting.destinationPane, launch.pane);
+    assert.equal(awaiting.opening.status, 'pending');
+    assert.equal(opens, 1);
+    const stillAwaiting = await portable.launchPrepared(prepared.requestKey, launchDeps);
+    assert.equal(stillAwaiting.status, 'awaiting-setup');
+    assert.equal(stillAwaiting.opening.status, 'pending');
+    const done = await portable.launchPrepared(prepared.requestKey, launchDeps);
+    assert.equal(done.status, 'done');
+    assert.equal(done.destinationSessionId, launch.sessionId);
+    assert.equal(opens, 1, 'setup recovery never spawns another successor');
+    assert.equal(resumes, 2);
+    const receipt = portable.deliveryReceipt(prepared.requestKey, { root: f.root });
+    assert.equal(receipt.pane, launch.pane);
+    assert.equal(receipt.openingDigest, done.opening.digest);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('setup retry rechecks source readiness before delivering the saved opening', async () => {
+  const f = fixture();
+  try {
+    const prepared = await portable.run({ sourceSessionId: 'source-session-1234', accountId: f.target.id,
+      contextText: 'Recheck before retry.', prepareOnly: true }, f.deps);
+    const launch = { pane: 'pane-trust', sessionId: 'destination-session-5678', accountId: f.target.id };
+    const launchDeps = { ...f.deps, requireDeliveryReceipt: true,
+      open: async () => {
+        portable.recordLaunch(prepared.requestKey, launch, { root: f.root });
+        const error = new Error('awaiting trust'); error.extra = { awaitingSetup: true, launch }; throw error;
+      },
+      resumeOpening: async () => assert.fail('changed source must block before delivery'),
+    };
+    assert.equal((await portable.launchPrepared(prepared.requestKey, launchDeps)).status, 'awaiting-setup');
+    launchDeps.inspectSource = async () => ({ session: { endedTurn: true, pendingOther: true } });
+    await assert.rejects(portable.launchPrepared(prepared.requestKey, launchDeps),
+      (error) => error.code === 'KEEP_PORTABLE_TRANSFER_SOURCE_BUSY');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
 test('git freshness digest changes when the contents of an already-dirty file change', () => {

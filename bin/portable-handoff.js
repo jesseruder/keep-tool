@@ -200,14 +200,66 @@ function writeJson(file, value) {
   fs.renameSync(temp, file);
 }
 
+function openingMessage(state) {
+  return state.policyVersion === DESKTOP_POLICY_VERSION
+    ? `Continue from the portable transfer package at ${state.artifactFile}. Read the package, card, and worktree first. Acknowledge that you are ready, then WAIT for a new instruction from Jesse or the user. Automated card and Stop-hook reminders do not resume you. Do not implement, push, deploy, or spawn subagents yet. This is a fresh conversation, not a native session resume.`
+    : `Continue from the portable transfer package at ${state.artifactFile}. Read it first; this is a fresh conversation, not a native session resume.`;
+}
+
+function recordLaunch(transferId, launch, deps = {}) {
+  if (!/^[a-f0-9]{64}$/.test(transferId || '') || !ID.test(launch?.pane || '')
+      || launch.sessionId != null && !ID.test(launch.sessionId || '')) {
+    throw problem('portable transfer launch identity is invalid');
+  }
+  const root = path.resolve(deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep'));
+  let state = readJson(transactionFile(root, transferId));
+  if (!safeSummary(state) || state.requestKey !== transferId || state.status !== 'launching'
+      || !state.opening || state.opening.status !== 'pending'
+      || launch.accountId !== state.targetAccountId || launch.sessionId === state.sourceSessionId) {
+    throw problem('portable transfer launch reservation changed', 'KEEP_PORTABLE_TRANSFER_RECEIPT', 409);
+  }
+  state = { ...state, destinationPane: launch.pane,
+    ...(launch.sessionId ? { destinationSessionId: launch.sessionId } : {}),
+    launchBoundAt: Date.now() };
+  writeJson(transactionFile(root, transferId), state);
+  return state;
+}
+
+function reserveDelivery(transferId, launch, deps = {}) {
+  if (!/^[a-f0-9]{64}$/.test(transferId || '') || !ID.test(launch?.pane || '')) return false;
+  const root = path.resolve(deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep'));
+  let state = readJson(transactionFile(root, transferId));
+  if (!safeSummary(state) || state.requestKey !== transferId || !['launching', 'awaiting-setup'].includes(state.status)
+      || state.destinationPane !== launch.pane || state.opening?.status !== 'pending' || state.opening.deliveryStartedAt
+      || launch.sessionId && state.destinationSessionId && launch.sessionId !== state.destinationSessionId) return false;
+  state = { ...state, status: 'launching', reason: '', opening: { ...state.opening, status: 'delivering', deliveryStartedAt: Date.now() } };
+  writeJson(transactionFile(root, transferId), state);
+  return true;
+}
+
+function markAwaitingSetup(transferId, launch, error, deps = {}) {
+  const root = path.resolve(deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep'));
+  let state = readJson(transactionFile(root, transferId));
+  if (!safeSummary(state) || state.requestKey !== transferId || !['launching', 'awaiting-setup'].includes(state.status)
+      || !state.destinationPane || launch?.pane && state.destinationPane !== launch.pane
+      || state.opening?.status !== 'pending' || state.opening.deliveryStartedAt) return null;
+  state = { ...state, status: 'awaiting-setup', setupKind: error?.extra?.setupKind || 'workspace-trust',
+    reason: String(error?.message || 'Destination is awaiting workspace setup').slice(0, 500) };
+  writeJson(transactionFile(root, transferId), state);
+  return state;
+}
+
 function recordDelivery(transferId, launch, deps = {}) {
   if (!/^[a-f0-9]{64}$/.test(transferId || '') || !ID.test(launch?.pane || '')) throw problem('portable transfer delivery receipt is invalid');
   const root = path.resolve(deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep'));
   const state = readJson(transactionFile(root, transferId));
-  if (!safeSummary(state) || state.requestKey !== transferId || state.status !== 'launching') {
+  if (!safeSummary(state) || state.requestKey !== transferId || state.status !== 'launching'
+      || state.destinationPane !== launch.pane || state.opening?.status !== 'delivering'
+      || !state.opening.deliveryStartedAt) {
     throw problem('portable transfer delivery receipt has no active launch', 'KEEP_PORTABLE_TRANSFER_RECEIPT', 409);
   }
-  const receipt = { version: 1, transferId, pane: launch.pane, deliveredAt: Date.now() };
+  const receipt = { version: 2, transferId, pane: launch.pane, openingDigest: state.opening.digest,
+    ...(launch.sessionId ? { sessionId: launch.sessionId } : {}), deliveredAt: Date.now() };
   writeJson(deliveryFile(root, transferId), receipt);
   return receipt;
 }
@@ -216,14 +268,15 @@ function deliveryReceipt(transferId, deps = {}) {
   if (!/^[a-f0-9]{64}$/.test(transferId || '')) return null;
   const root = path.resolve(deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep'));
   const value = readJson(deliveryFile(root, transferId));
-  return value?.version === 1 && value.transferId === transferId && ID.test(value.pane || '') && Number.isFinite(value.deliveredAt) ? value : null;
+  return [1, 2].includes(value?.version) && value.transferId === transferId && ID.test(value.pane || '')
+    && Number.isFinite(value.deliveredAt) ? value : null;
 }
 
 function safeSummary(state) {
   if (!state || state.version !== 1 || !/^[a-f0-9]{64}$/.test(state.requestKey || '')
       || !ID.test(state.sourceSessionId || '') || !ACCOUNT_ID.test(state.targetAccountId || '')
       || !['claude', 'codex'].includes(state.targetAgent)
-      || !['prepared', 'launching', 'ambiguous', 'done'].includes(state.status)) return null;
+      || !['prepared', 'launching', 'awaiting-setup', 'ambiguous', 'done'].includes(state.status)) return null;
   return {
     id: state.requestKey,
     status: state.status,
@@ -239,6 +292,9 @@ function safeSummary(state) {
     artifactFile: state.artifactFile,
     ...(state.destinationSessionId ? { destinationSessionId: state.destinationSessionId } : {}),
     ...(state.destinationPane ? { destinationPane: state.destinationPane } : {}),
+    ...(state.opening?.status ? { openingStatus: state.opening.status } : {}),
+    ...(state.setupKind ? { setupKind: state.setupKind } : {}),
+    ...(state.reason ? { reason: state.reason } : {}),
     preparedAt: state.preparedAt,
     ...(state.completedAt ? { completedAt: state.completedAt } : {}),
     ...(state.resolvedAt ? { completedAt: state.resolvedAt } : {}),
@@ -258,7 +314,18 @@ function sourceBusyReason(inspection) {
   if (inspection.portableHandoff) return 'source has another unresolved portable transfer';
   if (session.toolRunning) return 'a source tool is still running';
   if (session.pendingOther) return 'the source has an unfinished tool call';
-  if (session.pendingBackground || session.unknownBackgroundJobs?.length) return 'the source has unfinished background work';
+  const fallback = inspection.portableFallback;
+  if (fallback) {
+    const unknown = Array.isArray(session.unknownBackgroundJobs) ? session.unknownBackgroundJobs : ['malformed-history-evidence'];
+    const metadataOnly = unknown.every((entry) => typeof entry === 'string'
+      && ['history-gap', 'history-recovery'].includes(entry));
+    const jobs = session.backgroundJobs?.jobs == null ? [] : session.backgroundJobs.jobs;
+    const concrete = !Array.isArray(jobs)
+      || jobs.some((job) => !['completed', 'failed', 'cancelled'].includes(job?.status));
+    if (concrete || !metadataOnly || session.pendingBackground && unknown.length === 0) {
+      return 'the source has unfinished background work';
+    }
+  } else if (session.pendingBackground || session.unknownBackgroundJobs?.length) return 'the source has unfinished background work';
   if (session.observation?.foreground?.state === 'active' || session.observation?.foreground?.hook?.state === 'running') {
     return 'the source foreground turn is still running';
   }
@@ -372,12 +439,14 @@ function lockTransaction(stateFile) {
 
 async function launchState(state, stateFile, deps) {
   if (state.status === 'done') return { ...state, repeated: true, stateFile };
+  const resumingSetup = state.status === 'awaiting-setup';
   if (['launching', 'ambiguous'].includes(state.status)) {
     throw problem(`portable transfer launch is ambiguous; inspect the console, then use the CLI with --resolve-session <id> (${stateFile})`,
       'KEEP_PORTABLE_TRANSFER_AMBIGUOUS', 409);
   }
-  if (state.status !== 'prepared') throw problem('portable transfer is not prepared');
-  if (!deps.open) throw problem('portable transfer launcher is unavailable', 'KEEP_PORTABLE_TRANSFER_UNAVAILABLE', 503);
+  if (!resumingSetup && state.status !== 'prepared') throw problem('portable transfer is not prepared');
+  if (!resumingSetup && !deps.open) throw problem('portable transfer launcher is unavailable', 'KEEP_PORTABLE_TRANSFER_UNAVAILABLE', 503);
+  if (resumingSetup && !deps.resumeOpening) throw problem('portable transfer setup recovery is unavailable', 'KEEP_PORTABLE_TRANSFER_UNAVAILABLE', 503);
   if (state.policyVersion === DESKTOP_POLICY_VERSION) {
     await inspectReady(state.sourceSessionId, deps, { launching: true, transferId: state.requestKey });
     const source = { ...(deps.sourceFor || defaultSource)(state.sourceSessionId, {
@@ -400,21 +469,42 @@ async function launchState(state, stateFile, deps) {
       throw problem('portable transfer package changed after review; prepare and review a new package', 'KEEP_PORTABLE_TRANSFER_STALE', 409);
     }
   }
-  state = { ...state, status: 'launching', launchStartedAt: Date.now() }; writeJson(stateFile, state);
+  const message = state.opening?.text || openingMessage(state);
+  if (!resumingSetup) {
+    state = { ...state, status: 'launching', launchStartedAt: Date.now(),
+      opening: { version: 1, text: message, digest: digest(message), status: 'pending' } };
+    writeJson(stateFile, state);
+  }
+  let opened = null;
   try {
-    const message = state.policyVersion === DESKTOP_POLICY_VERSION
-      ? `Continue from the portable transfer package at ${state.artifactFile}. Read the package, card, and worktree first. Acknowledge that you are ready, then WAIT for a new instruction from Jesse or the user. Automated card and Stop-hook reminders do not resume you. Do not implement, push, deploy, or spawn subagents yet. This is a fresh conversation, not a native session resume.`
-      : `Continue from the portable transfer package at ${state.artifactFile}. Read it first; this is a fresh conversation, not a native session resume.`;
-    const opened = await deps.open({ taskId: state.cardId, fresh: true, agent: state.targetAgent,
-      accountId: state.targetAccountId, cwd: state.cwd, ...(state.model ? { model: state.model } : {}), message });
+    opened = resumingSetup
+      ? await deps.resumeOpening(state, message)
+      : await deps.open({ taskId: state.cardId, fresh: true, agent: state.targetAgent,
+        accountId: state.targetAccountId, cwd: state.cwd, ...(state.model ? { model: state.model } : {}), message });
     if (!opened || !ID.test(opened.sessionId || '') || opened.sessionId === state.sourceSessionId
         || opened.accountId !== state.targetAccountId) throw problem('destination launch returned incomplete identity');
-    state = { ...state, status: 'done', destinationSessionId: opened.sessionId,
-      destinationPane: opened.pane || '', completedAt: Date.now() };
+    const persisted = readJson(stateFile);
+    const receipt = deliveryReceipt(state.requestKey, { root: deps.root });
+    if (state.policyVersion === DESKTOP_POLICY_VERSION && deps.requireDeliveryReceipt === true
+        && (!persisted || persisted.destinationPane !== opened.pane
+        || persisted.opening?.status !== 'delivering' || !receipt || receipt.version !== 2
+        || receipt.pane !== opened.pane || receipt.openingDigest !== persisted.opening.digest
+        || persisted.destinationSessionId && persisted.destinationSessionId !== opened.sessionId
+        || receipt.sessionId && receipt.sessionId !== opened.sessionId
+        || receipt.deliveredAt < persisted.opening.deliveryStartedAt)) {
+      throw problem('destination opening message has no matching delivery receipt', 'KEEP_PORTABLE_TRANSFER_RECEIPT', 409);
+    }
+    state = { ...persisted, status: 'done', destinationSessionId: opened.sessionId,
+      destinationPane: opened.pane, opening: { ...persisted.opening, status: 'delivered', deliveredAt: receipt?.deliveredAt || Date.now() },
+      completedAt: Date.now(), reason: '' };
     writeJson(stateFile, state);
     return { ...state, stateFile };
   } catch (error) {
-    state = { ...state, status: 'ambiguous', reason: String(error?.message || error).slice(0, 500), updatedAt: Date.now() };
+    if (state.policyVersion === DESKTOP_POLICY_VERSION && error?.extra?.awaitingSetup) {
+      const waiting = markAwaitingSetup(state.requestKey, opened || error.extra.launch, error, { root: deps.root });
+      if (waiting) return { ...waiting, stateFile };
+    }
+    state = { ...(readJson(stateFile) || state), status: 'ambiguous', reason: String(error?.message || error).slice(0, 500), updatedAt: Date.now() };
     writeJson(stateFile, state);
     const wrapped = problem(`destination launch is ambiguous; inspect the console before resolving or retrying (${stateFile})`,
       'KEEP_PORTABLE_TRANSFER_AMBIGUOUS', 409);
@@ -476,7 +566,7 @@ async function launchPrepared(transferId, deps = {}) {
     if (state.policyVersion === DESKTOP_POLICY_VERSION) {
       const conflict = list(root).find((candidate) => candidate.policyVersion === DESKTOP_POLICY_VERSION
         && candidate.sourceSessionId === state.sourceSessionId && candidate.id !== transferId
-        && ['launching', 'ambiguous', 'done'].includes(candidate.status));
+        && ['launching', 'awaiting-setup', 'ambiguous', 'done'].includes(candidate.status));
       if (conflict) throw problem(`source already has a ${conflict.status} portable successor; open or resolve that transfer`,
         'KEEP_PORTABLE_TRANSFER_SOURCE_USED', 409);
     }
@@ -601,4 +691,5 @@ async function run(request, deps = {}) {
 }
 
 module.exports = { run, draft, launchPrepared, resolvePrepared, readPreview, list, safeSummary, sourceBusyReason,
-  recordDelivery, deliveryReceipt, extractConversation, renderPackage, defaultGitSnapshot, transactionFile, CLAUDE_DEFAULT_MODEL, CONTEXT_LIMIT };
+  recordLaunch, reserveDelivery, markAwaitingSetup, recordDelivery, deliveryReceipt, openingMessage,
+  extractConversation, renderPackage, defaultGitSnapshot, transactionFile, CLAUDE_DEFAULT_MODEL, CONTEXT_LIMIT };

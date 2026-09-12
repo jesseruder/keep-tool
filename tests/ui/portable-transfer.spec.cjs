@@ -149,3 +149,50 @@ test('ambiguous transfer reopens from saved preview and binds an observed receip
   expect(fixture.events.filter(event => event.event === 'request' && event.path === '/api/transfer-session')).toHaveLength(0);
   expect(fixture.events.filter(event => event.event === 'request' && event.path === '/api/resolve-portable-transfer')).toHaveLength(1);
 });
+
+test('an intact pre-stop native failure offers an explicit fresh continuation and preserves the source', async ({ page }) => {
+  const source = fixture.state.sessions.find(session => session.id === 'a');
+  source.endedTurn = true;
+  fixture.state.handoffs.push({ id: 'handoff-safe-fallback', transactionId: 'handoff-safe-fallback',
+    sessionId: 'a', pane: 'pa', sourceAccountId: 'claude-main', targetAccountId: 'claude-two',
+    status: 'recovery-needed', phase: 'stopping-source', reason: 'Job ledger evidence is incomplete',
+    portableFallbackAvailable: true });
+  fixture.publish();
+  const fallback = page.locator('#stage [data-portable-fallback="handoff-safe-fallback"]');
+  await expect(fallback).toHaveText('Start fresh continuation');
+  await fallback.click();
+  await expect(page.locator('.portable-transfer-dialog')).toBeVisible();
+  await expect(page.locator('.portable-transfer-dialog')).toContainText('source session stays intact');
+  expect(source.accountId).toBe('claude-main');
+  expect(fixture.state.panes.find(pane => pane.id === 'pa').alive).toBe(true);
+  const abandon = fixture.events.find(event => event.event === 'request' && event.path === '/api/abandon-account-handoff');
+  expect(abandon.body).toEqual({ sessionId: 'a', pane: 'pa', transactionId: 'handoff-safe-fallback' });
+});
+
+test('trust-blocked transfer foregrounds and retries the existing successor after reload', async ({ page }) => {
+  const transfer = fixture.portableTransfers[0];
+  Object.assign(transfer, { status: 'awaiting-setup', policyVersion: 2, openingStatus: 'pending',
+    setupKind: 'workspace-trust', destinationSessionId: 'trust-successor', destinationPane: 'trust-pane' });
+  fixture.state.sessions.push({ id: 'trust-successor', kind: 'codex', title: 'Trust successor', project: transfer.cwd,
+    taskId: transfer.cardId, pane: 'trust-pane', accountId: transfer.targetAccountId, accountLabel: 'Codex Two',
+    portableTransferId: transfer.id, state: 'running', endedTurn: false });
+  fixture.state.panes.push({ id: 'trust-pane', pid: 902, alive: true, cwd: transfer.cwd,
+    meta: { agent: 'codex', sessionId: 'trust-successor', accountId: transfer.targetAccountId,
+      accountLabel: 'Codex Two', card: transfer.cardId, portableTransferId: transfer.id } });
+  fixture.publish();
+  await page.locator('#qlist [data-key="running:b"]').click();
+  await page.reload();
+  await page.locator('#qlist [data-key="running:b"]').click();
+  await expect(page.locator('#stage [data-open-portable="trust-successor"]')).toContainText('Finish setup');
+  await page.locator('#stage [data-open-portable="trust-successor"]').click();
+  await expect(page.locator('#stage')).toHaveAttribute('data-item-key', 'trust-successor');
+
+  await page.locator('#qlist [data-key="running:b"]').click();
+  await page.locator('#stage [data-review-portable="portable-one"]').click();
+  const modal = page.locator('.portable-transfer-dialog');
+  await expect(modal).toContainText('accept the prompt yourself');
+  await modal.locator('[data-retry-delivery]').click();
+  await expect(page.locator('#stage')).toHaveAttribute('data-item-key', 'trust-successor');
+  expect(fixture.state.sessions.filter(session => session.id === 'trust-successor')).toHaveLength(1);
+  expect(fixture.events.filter(event => event.event === 'request' && event.path === '/api/transfer-session')).toHaveLength(1);
+});

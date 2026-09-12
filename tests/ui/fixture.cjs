@@ -153,10 +153,27 @@ async function createFixture() {
           publish(); json({ ok: true, transactionId: transaction.id, sessionId: session.id, pane: pane.id,
             sourceAccountId: transaction.sourceAccountId, targetAccountId: account.id, status: 'done' }); return;
         }
+        if (url.pathname === '/api/abandon-account-handoff') {
+          const session = sessions.find(s => s.id === input.sessionId && s.pane === input.pane);
+          const pane = panes.find(p => p.id === input.pane && p.meta.sessionId === input.sessionId);
+          const transaction = state.handoffs.find(h => h.id === input.transactionId && h.sessionId === input.sessionId
+            && h.pane === input.pane && h.portableFallbackAvailable === true);
+          if (!session || !pane?.alive || !transaction || session.accountId !== transaction.sourceAccountId
+              || pane.meta.accountId !== transaction.sourceAccountId) {
+            json({ error: 'Fixture source identity changed' }, 409); return;
+          }
+          Object.assign(transaction, { status: 'failed', phase: 'portable-fallback', portableFallbackAvailable: false,
+            portableFallbackAt: Date.now(), reason: 'Use a fresh portable continuation' });
+          publish(); json({ ok: true, ...transaction }); return;
+        }
         if (url.pathname === '/api/transfer-session') {
           const transfer = portableTransfers.find(candidate => candidate.id === input.transferId);
           if (!transfer) { json({ error: 'Unknown prepared transfer' }, 404); return; }
           if (['launching', 'ambiguous'].includes(transfer.status)) { json({ error: `Transfer is ${transfer.status}`, transfer }, 409); return; }
+          if (transfer.status === 'awaiting-setup') {
+            transfer.status = 'done'; transfer.completedAt = Date.now(); transfer.openingStatus = 'delivered';
+            publish(); json({ ok: true, transfer }); return;
+          }
           if (transfer.status !== 'done') {
             transfer.status = 'done'; transfer.completedAt = Date.now();
             transfer.destinationSessionId = 'portable-successor'; transfer.destinationPane = 'portable-pane';

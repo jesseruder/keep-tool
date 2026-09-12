@@ -179,6 +179,42 @@ test('actual restart busy refusal leaves source live and does not copy artifacts
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test('explicit portable fallback abandons only a verified pre-stop transaction with the source intact', async () => {
+  const f = fixture();
+  try {
+    const d = deps(f, { restartSession: async () => { throw new Error('Waiting for job ledger recovery'); } });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /job ledger recovery/);
+    const pending = handoff.list(f.root)[0];
+    assert.equal(pending.portableFallbackAvailable, true);
+    const abandoned = await handoff.abandonForPortable({ sessionId: f.sid, pane: 'pane-1', transactionId: pending.id }, d);
+    assert.equal(abandoned.status, 'failed');
+    assert.equal(abandoned.phase, 'portable-fallback');
+    assert.ok(abandoned.portableFallbackAt);
+    assert.equal(d.pane.alive, true);
+    assert.equal(accounts.forSession(f.sid, 'claude', { root: f.root, env: f.env }).id, 'one');
+    await assert.rejects(handoff.abandonForPortable({ sessionId: f.sid, pane: 'pane-1', transactionId: pending.id }, d),
+      /cannot be safely replaced/);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('portable fallback refuses changed source identity and any transaction that reached stop or launch', async () => {
+  const f = fixture();
+  try {
+    const d = deps(f, { restartSession: async () => { throw new Error('Waiting for job ledger recovery'); } });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d));
+    const pending = handoff.list(f.root)[0];
+    d.pane.meta.accountId = 'two';
+    await assert.rejects(handoff.abandonForPortable({ sessionId: f.sid, pane: 'pane-1', transactionId: pending.id }, d),
+      /identity is no longer intact/);
+    d.pane.meta.accountId = 'one';
+    const journal = path.join(f.root, '.keep', 'account-handoffs', `${f.sid}.json`);
+    const state = JSON.parse(fs.readFileSync(journal, 'utf8'));
+    state.sourceStopVerifiedAt = Date.now(); fs.writeFileSync(journal, JSON.stringify(state));
+    await assert.rejects(handoff.abandonForPortable({ sessionId: f.sid, pane: 'pane-1', transactionId: pending.id }, d),
+      /cannot be safely replaced/);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test('copy-before-launch failure is recoverable without a duplicate owner or duplicate continuation', async () => {
   const f = fixture();
   try {

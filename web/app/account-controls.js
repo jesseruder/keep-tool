@@ -1,4 +1,5 @@
 import { write } from './api.js';
+import { openPortableTransfer } from './portable-transfer.js';
 
 function accountFor(ctx, session, pane) {
   const id = session?.accountId || pane?.meta?.accountId;
@@ -59,8 +60,11 @@ export function handoffControls(ctx, sessionId, paneId) {
   const handoff = latestHandoff(ctx, sessionId);
   const target = targetFor(ctx, handoff);
   const targetLabel = target?.label || handoff?.targetAccountId || 'another account';
+  const fallback = handoff?.portableFallbackAvailable && handoff.pane === paneId && pane?.alive === true
+    && current?.id === handoff.sourceAccountId
+    ? `<button class="btn" data-portable-fallback="${ctx.esc(handoff.id || handoff.transactionId || '')}">Start fresh continuation</button>` : '';
   if (handoff?.status === 'recovery-needed') {
-    return `<span class="handoff-error" role="alert" title="${ctx.esc(handoff.reason || '')}">Transfer interrupted</span><button class="btn" data-handoff-account="${ctx.esc(handoff.targetAccountId || '')}">Retry</button>`;
+    return `<span class="handoff-error" role="alert" title="${ctx.esc(handoff.reason || '')}">Transfer interrupted</span><button class="btn" data-handoff-account="${ctx.esc(handoff.targetAccountId || '')}">Retry</button>${fallback}`;
   }
   if (handoff?.status === 'done' && current?.id !== handoff.targetAccountId) {
     return `<span class="handoff-status" role="status">Verifying transfer to ${ctx.esc(targetLabel)}…</span>`;
@@ -76,7 +80,7 @@ export function handoffControls(ctx, sessionId, paneId) {
   const destinations = handoffDestinations(ctx, session, pane);
   if (!current || !destinations.length) return error;
   const chooser = `<details class="account-handoff"><summary class="btn">Continue on another account</summary><div class="account-menu">${destinations.map((account) => { const hint = usageHint(ctx, account); return `<button class="btn" data-handoff-account="${ctx.esc(account.id)}"><span>${ctx.esc(account.label || account.id)}</span>${hint ? `<small>${ctx.esc(hint)}</small>` : ''}</button>`; }).join('')}</div></details>`;
-  return `${error}${chooser}`;
+  return `${error}${fallback}${chooser}`;
 }
 
 function confirmedAccount(ctx, sessionId, paneId) {
@@ -86,6 +90,18 @@ function confirmedAccount(ctx, sessionId, paneId) {
 }
 
 export function installHandoffControls(container, ctx, sessionId, pane) {
+  container.querySelectorAll('[data-portable-fallback]').forEach((button) => {
+    button.onclick = async () => {
+      if (button.disabled) return;
+      button.disabled = true;
+      try {
+        await write('/api/abandon-account-handoff', { sessionId, pane, transactionId: button.dataset.portableFallback });
+        await ctx.reload();
+        openPortableTransfer(ctx, sessionId);
+      } catch (error) { ctx.toast(`Fresh continuation unavailable: ${error.body?.reason || error.message}`); }
+      finally { button.disabled = false; }
+    };
+  });
   container.querySelectorAll('[data-handoff-account]').forEach((button) => {
     button.onclick = async () => {
       if (button.disabled) return;

@@ -6,7 +6,7 @@ let dialog;
 function latestTransfer(ctx, sessionId) {
   return (ctx.data.portableTransfers || []).filter((t) => t.sourceSessionId === sessionId)
     .sort((a, b) => {
-      const priority = (t) => t.status === 'done' ? 3 : ['launching', 'ambiguous'].includes(t.status) ? 2 : 1;
+      const priority = (t) => t.status === 'done' ? 3 : ['launching', 'awaiting-setup', 'ambiguous'].includes(t.status) ? 2 : 1;
       return priority(b) - priority(a) || Number(b.preparedAt) - Number(a.preparedAt);
     })[0];
 }
@@ -41,6 +41,7 @@ function renderDialog(ctx, state) {
   const transfer = state.transfer;
   const account = state.draft.accounts.find((a) => a.id === state.accountId);
   const ambiguous = ['ambiguous', 'launching'].includes(transfer?.status);
+  const awaitingSetup = transfer?.status === 'awaiting-setup';
   const resolutionCandidates = ambiguous ? (ctx.data.sessions || []).filter((session) => {
     const pane = (ctx.data.panes || []).find((candidate) => candidate.meta?.sessionId === session.id
       && candidate.meta?.portableTransferId === transfer.id);
@@ -59,11 +60,12 @@ function renderDialog(ctx, state) {
     <aside class="portable-transfer-pause" role="note"><b>The successor pauses before work</b><span>${ctx.esc(state.draft.pausePolicy)}</span></aside>
     ${state.error ? `<p class="portable-transfer-error" role="alert">${ctx.esc(state.error)}</p>` : ''}
     ${state.preview ? `<section class="portable-transfer-preview"><div><h3>Immutable saved package</h3><span>${ctx.esc(transfer?.id?.slice(0, 16) || '')}</span></div><pre tabindex="0">${ctx.esc(state.preview)}</pre></section>` : ''}
+    ${awaitingSetup ? `<section class="portable-transfer-resolution"><p role="status">The existing successor is waiting for workspace trust. Open that pane, accept the prompt yourself, then retry delivery here. The saved opening has not been sent.</p><button class="btn" type="button" data-open-setup>Open existing successor</button><button class="btn primary" type="button" data-retry-delivery>Retry delivery</button></section>` : ''}
     ${ambiguous ? `<section class="portable-transfer-resolution">${resolutionCandidates.length
     ? `<label>Observed successor<select data-transfer-resolution>${resolutionCandidates.map((session) => `<option value="${ctx.esc(session.id)}">${ctx.esc(session.title || session.id)} · ${ctx.esc(session.accountLabel || session.accountId)}</option>`).join('')}</select></label><button class="btn" type="button" data-resolve-transfer>Bind observed successor</button><small>Validates the saved launch receipt, destination account, and card. It never launches or sends again.</small>`
     : '<p role="status">No compatible existing successor was found. Inspect or finish the destination launch, then reopen this transfer; no duplicate will be started.</p>'}</section>` : ''}
     <footer><span>${ctx.esc(state.draft.sourceAgent)} · ${ctx.esc(state.draft.sourceAccountId || 'unknown source account')}</span>
-      ${state.preview && transfer?.status === 'prepared' ? `${state.savedOnly ? '' : '<button class="btn" type="button" data-refresh-transfer>Prepare new preview</button>'}<button class="btn primary" type="button" data-launch-transfer>Launch reviewed package</button>` : ambiguous ? '' : '<button class="btn primary" type="button" data-prepare-transfer>Prepare preview</button>'}
+      ${state.preview && transfer?.status === 'prepared' ? `${state.savedOnly ? '' : '<button class="btn" type="button" data-refresh-transfer>Prepare new preview</button>'}<button class="btn primary" type="button" data-launch-transfer>Launch reviewed package</button>` : ambiguous || awaitingSetup ? '' : '<button class="btn primary" type="button" data-prepare-transfer>Prepare preview</button>'}
     </footer></form>`;
   const invalidate = () => { state.transfer = null; state.preview = ''; state.error = ''; renderDialog(ctx, state); };
   modal.querySelector('[data-transfer-account]').onchange = (event) => {
@@ -106,7 +108,10 @@ function renderDialog(ctx, state) {
       const result = await api.launchPortableTransfer(transferId);
       state.transfer = result.transfer; await ctx.reload();
       if (state.transfer?.destinationSessionId) {
-        modal.close(); ctx.toast('Opened the reviewed continuation; the original session is preserved');
+        modal.close();
+        ctx.toast(state.transfer.status === 'awaiting-setup'
+          ? 'Accept workspace trust in the existing successor, then return to retry delivery'
+          : 'Opened the reviewed continuation; the original session is preserved');
         ctx.openReviewSession(state.transfer.destinationSessionId);
       } else renderDialog(ctx, state);
     } catch (error) {
@@ -116,6 +121,19 @@ function renderDialog(ctx, state) {
   });
   modal.querySelector('[data-refresh-transfer]')?.addEventListener('click', () => {
     state.transfer = null; state.preview = ''; state.error = ''; renderDialog(ctx, state);
+  });
+  modal.querySelector('[data-open-setup]')?.addEventListener('click', () => {
+    if (transfer.destinationSessionId) { modal.close(); ctx.openReviewSession(transfer.destinationSessionId); }
+    else { state.error = 'The successor is still registering its session id; reopen this transfer shortly.'; renderDialog(ctx, state); }
+  });
+  modal.querySelector('[data-retry-delivery]')?.addEventListener('click', async (event) => {
+    event.currentTarget.disabled = true; state.error = '';
+    try {
+      const result = await api.launchPortableTransfer(transfer.id);
+      state.transfer = result.transfer; await ctx.reload();
+      if (state.transfer.destinationSessionId) { modal.close(); ctx.openReviewSession(state.transfer.destinationSessionId); }
+      else renderDialog(ctx, state);
+    } catch (error) { state.error = error.message; renderDialog(ctx, state); }
   });
   modal.querySelector('[data-resolve-transfer]')?.addEventListener('click', async (event) => {
     const id = modal.querySelector('[data-transfer-resolution]').value;
@@ -127,7 +145,7 @@ function renderDialog(ctx, state) {
   });
 }
 
-async function openTransfer(ctx, sessionId, transfer) {
+export async function openPortableTransfer(ctx, sessionId, transfer) {
   let state = drafts.get(sessionId);
   try {
     if (!state) {
@@ -180,6 +198,9 @@ export function portableTransferControls(ctx, sessionId) {
   if (transfer.status === 'done') return transfer.destinationSessionId
     ? `<button class="btn portable-transfer" data-open-portable="${ctx.esc(transfer.destinationSessionId)}"><span>Open successor</span><small>${ctx.esc(label)} · saved continuation</small></button>`
     : '<span class="portable-transfer-state" role="status">Successor is being indexed…</span>';
+  if (transfer.status === 'awaiting-setup') return `${transfer.destinationSessionId
+    ? `<button class="btn portable-transfer" data-open-portable="${ctx.esc(transfer.destinationSessionId)}"><span>Finish setup in successor…</span><small>${ctx.esc(label)} · opening saved</small></button>`
+    : '<span class="portable-transfer-state" role="status">Successor setup is waiting in its saved pane…</span>'}<button class="btn" data-review-portable="${ctx.esc(transfer.id)}" data-source-session="${ctx.esc(sessionId)}">Retry delivery</button>`;
   if (['launching', 'ambiguous'].includes(transfer.status)) return `<button class="btn portable-transfer" data-review-portable="${ctx.esc(transfer.id)}" data-source-session="${ctx.esc(sessionId)}"><span>${transfer.status === 'launching' ? 'Starting successor…' : 'Resolve transfer…'}</span><small>${ctx.esc(label)} · no duplicate launch</small></button>`;
   if (transfer.status !== 'prepared') return `<span class="portable-transfer-state error" role="alert">Transfer ${ctx.esc(transfer.status || 'unavailable')}</span>`;
   return transfer.policyVersion === 2
@@ -188,9 +209,9 @@ export function portableTransferControls(ctx, sessionId) {
 }
 
 export function installPortableTransferControls(container, ctx) {
-  container.querySelectorAll('[data-new-portable-transfer]').forEach((b) => { b.onclick = () => openTransfer(ctx, b.dataset.newPortableTransfer); });
+  container.querySelectorAll('[data-new-portable-transfer]').forEach((b) => { b.onclick = () => openPortableTransfer(ctx, b.dataset.newPortableTransfer); });
   container.querySelectorAll('[data-review-portable]').forEach((b) => {
-    b.onclick = () => openTransfer(ctx, b.dataset.sourceSession, (ctx.data.portableTransfers || []).find((t) => t.id === b.dataset.reviewPortable));
+    b.onclick = () => openPortableTransfer(ctx, b.dataset.sourceSession, (ctx.data.portableTransfers || []).find((t) => t.id === b.dataset.reviewPortable));
   });
   container.querySelectorAll('[data-portable-transfer]').forEach((b) => { b.onclick = () => launchLegacy(ctx, b); });
   container.querySelectorAll('[data-open-portable]').forEach((b) => { b.onclick = () => ctx.openReviewSession(b.dataset.openPortable); });

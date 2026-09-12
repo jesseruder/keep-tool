@@ -3704,6 +3704,18 @@ async function waitForHostAgent(target, agent, deps = {}) {
   while (now() < deadline) {
     try { screen = await readScreen(target, 30, false, deps); } catch { screen = ''; }
     if (agentPromptVisible(agent, screen)) return true;
+    if (deps.detectPortableSetup === true) {
+      const plain = stripTerminalAnsi(screen);
+      const setupKind = plain.includes('Do you trust the contents of this directory?')
+        || plain.includes('Do you trust the files in this folder?') ? 'workspace-trust' : '';
+      if (setupKind) {
+        const error = new InjectionError(409, `${agent} is awaiting workspace trust in pane ${target.pane}; accept it there, then retry delivery`, {
+          awaitingSetup: true, setupKind, screenTail: screenTail(screen),
+        });
+        error.code = 'KEEP_PORTABLE_TRANSFER_AWAITING_SETUP';
+        throw error;
+      }
+    }
     await sleep(Math.min(500, Math.max(0, deadline - now())));
   }
   throw new InjectionError(504, `${agent} session in ${target.pane} never showed an empty prompt; message not sent`, {
@@ -3988,6 +4000,9 @@ async function openSession(body, deps = {}) {
     if (launch.sessionId) {
       accounts.pinSession(launch.sessionId, agent, account.id, { root: deps.root || keep.ROOT, env: deps.env || process.env });
     }
+  } catch (error) {
+    if (error?.extra?.awaitingSetup) error.extra.launch = { pane: launch.pane, sessionId: launch.sessionId, accountId: launch.accountId };
+    throw error;
   } finally {
     release();
   }
@@ -5224,6 +5239,14 @@ async function handoffSession(body, deps = {}) {
   });
 }
 
+async function abandonAccountHandoff(body, deps = {}) {
+  const root = deps.root || keep.ROOT;
+  return require('./account-handoff').abandonForPortable(body, {
+    ...deps, root,
+    inspect: deps.inspect || ((request) => inspectAccountHandoff(request, deps)),
+  });
+}
+
 function listPortableTransfers(deps = {}) {
   return (deps.portable || require('./portable-handoff')).list(deps.root || keep.ROOT);
 }
@@ -5237,11 +5260,58 @@ async function inspectPortableSource(sessionId, options = {}, deps = {}) {
     state = await addHostSessionState(await buildState({ hostPanes: panes }), { ...deps, panes });
   }
   const session = state.sessions?.find((entry) => entry.id === sessionId);
-  const nativeHandoff = (state.handoffs || require('./account-handoff').list(deps.root || keep.ROOT))
+  const handoff = require('./account-handoff');
+  const root = deps.root || keep.ROOT;
+  let nativeHandoff = (state.handoffs || handoff.list(root))
     .find((entry) => entry.sessionId === sessionId && !['done', 'failed'].includes(entry.status));
+  const abandoned = handoff.abandonedForPortable(root, sessionId);
+  const abandonedPane = abandoned && (state.panes || []).find((entry) => entry.id === abandoned.pane);
+  const portableFallback = abandoned && session?.accountId === abandoned.sourceAccountId
+    && abandonedPane?.alive === true && abandonedPane.meta?.sessionId === sessionId
+    && abandonedPane.meta?.accountId === abandoned.sourceAccountId ? abandoned : null;
+  if (abandoned && !portableFallback) nativeHandoff ||= abandoned;
   const portableHandoff = listPortableTransfers(deps).find((entry) => entry.sourceSessionId === sessionId
     && entry.id !== options.transferId && ['launching', 'ambiguous', 'done'].includes(entry.status));
-  return { session, nativeHandoff, portableHandoff, panes: state.panes || [], state };
+  return { session, nativeHandoff, portableHandoff, portableFallback, panes: state.panes || [], state };
+}
+
+async function recoverPortableOpening(state, message, hooks = {}, deps = {}) {
+  if (!state?.destinationPane || !state.opening || state.opening.text !== message) {
+    throw new InjectionError(409, 'portable transfer has no recoverable opening reservation');
+  }
+  const result = await hostRequest('get', { pane: state.destinationPane }, deps);
+  const pane = result?.pane;
+  if (!pane || pane.alive !== true || pane.id !== state.destinationPane
+      || pane.meta?.portableTransferId !== state.requestKey || pane.meta?.accountId !== state.targetAccountId
+      || pane.meta?.card !== state.cardId || state.destinationSessionId && pane.meta?.sessionId !== state.destinationSessionId) {
+    throw new InjectionError(409, 'the saved portable successor pane identity changed');
+  }
+  const launch = { pane: pane.id, sessionId: state.destinationSessionId || pane.meta?.sessionId || null,
+    accountId: state.targetAccountId };
+  const target = { pane: pane.id };
+  try {
+    await (deps.waitForHostAgent || waitForHostAgent)(target, state.targetAgent, { ...deps, detectPortableSetup: true });
+    if (!hooks.onReady || await hooks.onReady(launch) !== true) {
+      throw new InjectionError(409, 'portable opening reservation changed before instructions were sent');
+    }
+    await withInjectionLockRetry(
+      () => (deps.typeOpeningMessage || typeOpeningMessage)(target, state.targetAgent, message, deps), deps,
+      { pane: pane.id, model: modelCommandText(message) },
+    );
+    if (!hooks.onDelivered || await hooks.onDelivered(launch) !== true) {
+      throw new InjectionError(409, 'portable opening reservation changed after instructions were sent');
+    }
+    if (!launch.sessionId) launch.sessionId = await (deps.waitForHostSessionId || waitForHostSessionId)(pane.id, deps);
+    if (!launch.sessionId) throw new InjectionError(504, `${state.targetAgent} in pane ${pane.id} never registered its session id`);
+    accounts.pinSession(launch.sessionId, state.targetAgent, state.targetAccountId,
+      { root: deps.root || keep.ROOT, env: deps.env || process.env });
+    try { (deps.linkLaunchedSession || keep.linkLaunchedSession)(state.cardId, { id: launch.sessionId, agent: state.targetAgent }); }
+    catch (error) { process.stderr.write(`keep serve: could not link recovered portable session ${launch.sessionId.slice(0, 8)} to ${state.cardId}: ${error.message}\n`); }
+    return launch;
+  } catch (error) {
+    if (error?.extra?.awaitingSetup) error.extra.launch = launch;
+    throw error;
+  }
 }
 
 function portableDeps(deps = {}) {
@@ -5301,14 +5371,27 @@ async function transferSession(body, deps = {}) {
     throw new InjectionError(400, 'portable transfer id is invalid');
   }
   const portable = deps.portable || require('./portable-handoff');
+  const hooks = {
+    onLaunched: async (launch) => {
+      portable.recordLaunch(body.transferId, launch, { root: deps.root || keep.ROOT });
+      return deps.onLaunched ? deps.onLaunched(launch) : true;
+    },
+    onReady: async (launch) => portable.reserveDelivery(body.transferId, launch, { root: deps.root || keep.ROOT }),
+    onDelivered: async (launch) => {
+      portable.recordDelivery(body.transferId, launch, { root: deps.root || keep.ROOT });
+      return deps.onOpeningDelivered ? deps.onOpeningDelivered(launch) : true;
+    },
+  };
   const result = await portable.launchPrepared(body.transferId, {
     ...portableDeps(deps),
+    requireDeliveryReceipt: true,
+    resumeOpening: deps.resumeOpening || ((state, message) => recoverPortableOpening(state, message, hooks, deps)),
     open: deps.open || ((payload) => openSession({ ...payload, portableTransferId: body.transferId }, {
       ...deps,
-      onOpeningDelivered: async (launch) => {
-        portable.recordDelivery(body.transferId, launch, { root: deps.root || keep.ROOT });
-        return deps.onOpeningDelivered ? deps.onOpeningDelivered(launch) : true;
-      },
+      detectPortableSetup: true,
+      onLaunched: hooks.onLaunched,
+      onOpeningReady: hooks.onReady,
+      onOpeningDelivered: hooks.onDelivered,
     })),
   });
   const transfer = portable.safeSummary(result);
@@ -5331,7 +5414,8 @@ async function resolvePortableTransfer(body, deps = {}) {
       if (!session || session.accountId !== transfer.targetAccountId || !pane
           || pane.meta?.accountId !== transfer.targetAccountId
           || pane.meta?.portableTransferId !== transfer.requestKey || receipt?.pane !== pane.id
-          || receipt.deliveredAt < Number(transfer.launchStartedAt || 0)) return false;
+          || receipt.deliveredAt < Number(transfer.launchStartedAt || 0)
+          || transfer.policyVersion === 2 && (receipt.version !== 2 || receipt.openingDigest !== transfer.opening?.digest)) return false;
       if (session.taskId && session.taskId !== transfer.cardId) return false;
       if (session.taskId === transfer.cardId) return true;
       if (pane.meta?.card !== transfer.cardId) return false;
@@ -6292,6 +6376,15 @@ function start(deps = {}) {
               return json(res, error.status || 500, { error: error.message, ...(error.extra || {}) });
             }
           }
+          if (url.pathname === '/api/abandon-account-handoff') {
+            try {
+              const result = await abandonAccountHandoff(body);
+              broadcast();
+              return json(res, 200, result);
+            } catch (error) {
+              return json(res, error.status || 500, { error: error.message, ...(error.extra || {}) });
+            }
+          }
           if (url.pathname === '/api/transfer-session') {
             try {
               const result = await transferSession(body);
@@ -6538,8 +6631,9 @@ module.exports = {
   annotatePaneAgents,
   readPaneRecord, sessionProjectFromTranscript, openSession,
   inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, continueAccountHandoff, handoffSession,
+  abandonAccountHandoff,
   listPortableTransfers, inspectPortableSource, portableTransferDraft, preparePortableTransfer,
-  portableTransferPreview, transferSession, resolvePortableTransfer,
+  portableTransferPreview, transferSession, resolvePortableTransfer, recoverPortableOpening,
   launchReviewQueueSession, inspectReviewQueueLaunch, recoverReviewQueueLaunch,
   waitForHostAgent, waitForHostSessionId, addHostSessionState,
   sendToSession, sendToResolvedTarget, precheckSessionTarget, InjectionError,

@@ -3,9 +3,10 @@ const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), path = require('node:path'), vm = require('node:vm');
 const writes = [];
 const source = fs.readFileSync(path.join(__dirname, '../web/app/account-controls.js'), 'utf8')
-  .replace(/^import .*;\n/m, '')
+  .replace(/^import .*;\n/gm, '')
   .replaceAll('export function', 'function');
-const context = vm.createContext({ write: async (url, body) => { writes.push({ url, body }); return { status: 'done' }; } });
+const context = vm.createContext({ write: async (url, body) => { writes.push({ url, body }); return { status: 'done' }; },
+  openPortableTransfer() {} });
 vm.runInContext(source, context);
 
 function fixture(overrides = {}) {

@@ -59,6 +59,7 @@ export const getPortableTransferPreview = (transferId) => request(`/api/portable
 export const preparePortableTransfer = (body) => write('/api/portable-transfers', body);
 export const launchPortableTransfer = (transferId) => write('/api/transfer-session', { transferId });
 export const resolvePortableTransfer = (transferId, destinationSessionId) => write('/api/resolve-portable-transfer', { transferId, destinationSessionId });
+export const abandonAccountHandoff = (sessionId, pane, transactionId) => write('/api/abandon-account-handoff', { sessionId, pane, transactionId });
 
 export function write(url, body, method = 'POST') {
   return request(url, { method, headers: WRITE_HEADERS, body: JSON.stringify(body || {}) });
