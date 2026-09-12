@@ -27,8 +27,8 @@ async function createFixture() {
     { id: 'claude-main', agent: 'claude', label: 'Claude Main', isDefault: true, handoffSupported: true },
     { id: 'claude-two', agent: 'claude', label: 'Claude Two', isDefault: false, handoffSupported: true },
     { id: 'claude-unsupported', agent: 'claude', label: 'Claude Unsupported', isDefault: false, handoffSupported: false },
-    { id: 'codex-main', agent: 'codex', label: 'Codex Main', isDefault: true, handoffSupported: false },
-    { id: 'codex-two', agent: 'codex', label: 'Codex Two', isDefault: false, handoffSupported: false },
+    { id: 'codex-main', agent: 'codex', label: 'Codex Main', isDefault: true, handoffSupported: true },
+    { id: 'codex-two', agent: 'codex', label: 'Codex Two', isDefault: false, handoffSupported: true },
   ];
   const usageAccounts = Object.fromEntries(accounts.filter((account) => account.id !== 'claude-unsupported').map((account, index) => [account.id, { ...account,
     ...(account.agent === 'claude'

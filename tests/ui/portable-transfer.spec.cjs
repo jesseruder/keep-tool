@@ -10,6 +10,26 @@ test.beforeEach(async ({ page }) => {
 });
 test.afterEach(async () => { await fixture.close(); });
 
+test('native Codex transfer keeps the session id and the portable action remains distinct', async ({ page }) => {
+  await page.locator('#qlist [data-key="running:b"]').click();
+  await expect(page.locator('#stage .account-label')).toHaveText('Codex Main');
+  await expect(page.locator('#stage [data-portable-transfer="portable-one"]')).toContainText('fresh conversation');
+  const chooser = page.locator('#stage .account-handoff > summary');
+  await expect(chooser).toHaveText('Continue on another account');
+  await expect(chooser).toHaveAttribute('title', 'Continue this Codex conversation on another account');
+  await chooser.click();
+  await expect(page.locator('#stage [data-handoff-account="codex-two"]')).toBeVisible();
+  await expect(page.locator('#stage .account-menu')).not.toContainText('Claude');
+  await page.locator('#stage [data-handoff-account="codex-two"]').click();
+  await expect(page.locator('#toast')).toContainText('Continued on Codex Two');
+  await expect(page.locator('#stage')).toHaveAttribute('data-item-key', 'b');
+  await expect(page.locator('#stage')).toHaveAttribute('data-pane', 'pb');
+  await expect(page.locator('#stage .account-label')).toHaveText('Codex Two');
+  const requests = fixture.events.filter(event => event.event === 'request' && event.path === '/api/handoff-session');
+  expect(requests).toHaveLength(1);
+  expect(requests[0].body).toEqual({ sessionId: 'b', pane: 'pb', accountId: 'codex-two' });
+});
+
 test('prepared Codex transfer starts a fresh successor, focuses it, and preserves the source', async ({ page }) => {
   await expect(page.locator('#stage [data-portable-transfer]')).toHaveCount(0);
   await page.locator('#qlist [data-key="running:b"]').click();

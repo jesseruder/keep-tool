@@ -61,17 +61,21 @@ Specifying `--account` while resuming an existing session does not move it. Keep
 
 ## Transfer a limited session
 
-Use the dashboard action or the CLI with the exact session and pane:
+Native handoff moves an existing conversation between two accounts for the same provider. Use **Continue on another account** in the dashboard or the CLI with the exact session and pane:
 
 ```sh
 keep handoff <session-id> --pane <pane-id> --account claude-secondary
 ```
 
-Before stopping the source, Keep verifies the target login, compatible shared settings and MCP definitions, a reproducible permission class and model, an idle or terminal rate-limited turn, and the absence of unresolved tools, background commands, child agents, drafts, questions, or permission dialogs. It then exits the source gracefully, copies only the complete conversation artifacts, resumes the same session id under the target profile, verifies a fresh SessionStart hook from that profile, changes durable authority, and sends one continuation instruction.
+Before stopping the source, Keep verifies the target login, compatible provider settings, a reproducible permission class, model, reasoning effort, approval policy, reviewer, and working directory, an idle or terminal rate-limited turn, and the absence of unresolved tools, background commands, child agents, drafts, questions, or permission dialogs. Only after every preflight succeeds does Keep exit the source gracefully. It copies the verified conversation artifacts, resumes the same session id under the target profile, changes durable authority, and sends one continuation instruction.
 
 Source artifacts stay as a backup because tool-result records can contain absolute paths. Durable authority prevents their stale duplicate from being discovered or resumed. If a failure occurs after source exit, ordinary open/restart/restore stays blocked. Retry the same command or the same dashboard action to recover the journaled transaction. Keep does not automatically switch accounts, switch back later, or retry a different target.
 
-Codex profiles can be configured, selected for new sessions, attributed, and kept sticky across restarts. Cross-profile Codex conversation handoff is reported as unsupported until its storage and resume behavior has equivalent end-to-end proof.
+For Claude, the native copy includes the main project history and verified child/file-history artifacts, and the resumed profile must emit a fresh SessionStart hook.
+
+For Codex, the native copy includes only the root rollout and recursively owned child rollouts from `sessions` or `archived_sessions`. Interacted conversations owned by another root are recorded but are not copied or rebound. Keep does not copy `auth.json`, `config.toml`, SQLite databases, history indexes, cache, or any other profile state. The destination keeps its own login and database. The source and destination must use compatible provider endpoints and protocol settings; target-local credential environment names may differ.
+
+Codex resumes with the latest effective model, reasoning effort, working directory, standard sandbox policy, approval policy, and approval reviewer recorded in the source rollout, even when the destination profile has different defaults. Named or custom permission profiles, multiple workspace roots, unsupported policy fields, symlinked or incomplete rollout trees, ambiguous or unrelated target rollouts, missing owned children, and child sessions selected as roots fail closed before source exit. An archived root must be unarchived in its source account first. A target artifact can be replaced only when the same durable transfer provenance proves its exact prior bytes, which permits a verified transfer back without treating an unrelated matching file as safe.
 
 Add and authenticate a Codex profile separately:
 
@@ -120,7 +124,9 @@ keep transfer <source-session-id> \
 
 ## Disposable CLI resume proof
 
-`python3 scripts/account-resume-smoke.py` runs the installed Claude CLI against a local mock API with temporary source and target profiles. It uses a random session, copies the temporary project history, resumes under the second profile, and verifies that the same session id and prior user/assistant context reach the resumed request. It does not use a real subscription, write either real profile, or perform a login.
+`python3 scripts/account-resume-smoke.py` runs the installed Claude CLI against a local mock API with temporary source and target profiles. It uses a random session, copies the temporary project history, resumes under the second profile, and verifies that the same session id and prior user/assistant context reach the resumed request.
+
+`python3 scripts/codex-account-resume-smoke.py --context-proof` performs the corresponding installed Codex CLI proof from source to target and back to the original source profile. It verifies the same thread id, appended-turn continuity despite the original profile's existing SQLite index, target-local credentials, exact rollout bytes before resume, unchanged profile databases during copy, effective model and permission settings on both resumed turns, archived-root refusal, and unchanged synthetic tool-output and compaction records. Both scripts use temporary profiles and a local mock API; they do not use a real subscription, write a real profile, or perform a login.
 
 The deterministic handoff tests also cover tool results, subagent and file-history artifacts, compact-boundary rows, preserved source paths, and multi-hop transfers. The installed CLI was separately exercised against the same kind of local mock with a real `Read` tool round trip and with `/compact`; the resumed requests retained the historical tool exchange or generated compaction summary as appropriate.
 

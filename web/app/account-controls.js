@@ -79,7 +79,8 @@ export function handoffControls(ctx, sessionId, paneId) {
     ? `<span class="handoff-error" role="alert" title="${ctx.esc(handoff.reason || '')}">Transfer failed</span>` : '';
   const destinations = handoffDestinations(ctx, session, pane);
   if (!current || !destinations.length) return error;
-  const chooser = `<details class="account-handoff"><summary class="btn">Continue on another account</summary><div class="account-menu">${destinations.map((account) => { const hint = usageHint(ctx, account); return `<button class="btn" data-handoff-account="${ctx.esc(account.id)}"><span>${ctx.esc(account.label || account.id)}</span>${hint ? `<small>${ctx.esc(hint)}</small>` : ''}</button>`; }).join('')}</div></details>`;
+  const provider = current.agent === 'codex' ? 'Codex' : 'Claude';
+  const chooser = `<details class="account-handoff"><summary class="btn" title="Continue this ${provider} conversation on another account">Continue on another account</summary><div class="account-menu">${destinations.map((account) => { const hint = usageHint(ctx, account); const label = account.label || account.id; return `<button class="btn" data-handoff-account="${ctx.esc(account.id)}" title="Continue this conversation on ${ctx.esc(label)}"><span>${ctx.esc(label)}</span>${hint ? `<small>${ctx.esc(hint)}</small>` : ''}</button>`; }).join('')}</div></details>`;
   return `${error}${fallback}${chooser}`;
 }
 
