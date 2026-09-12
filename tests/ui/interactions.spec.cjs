@@ -133,6 +133,9 @@ test('account limit groups remain complete and reveal their account details on d
   await expect(page.locator('#meters .meter-group').first().locator('.meter-details')).toBeVisible();
   await expect(page.locator('#meters .meter-group').first().locator('.meter-details')).toContainText('Claude Main: 10%');
   await expect(page.locator('#meters .meter-group').first().locator('.meter-details')).toContainText('Claude Two: 11%');
+  const codexFiveHour = page.locator('#meters .meter-group').filter({ hasText: 'Codex 5h' }).first();
+  await codexFiveHour.focus();
+  await expect(codexFiveHour.locator('.meter-details')).toContainText(`resets ${new Date(1780000000000).toLocaleString()}`);
 });
 
 test('interrupted account handoff exposes retry and never claims an unverified resume', async ({ page }) => {

@@ -636,8 +636,8 @@ function renderMeters() {
   document.querySelector('#meters').innerHTML = [...groups.values()].map((group) => {
     const details = group.readings.map((reading) => {
       const percent = Math.max(0, Math.min(100, Number(reading.percent) || 0));
-      const reset = reading.resetsAt && Number.isFinite(Date.parse(reading.resetsAt))
-        ? ` · resets ${new Date(reading.resetsAt).toLocaleString()}` : '';
+      const resetAt = new Date(reading.resetsAt).getTime();
+      const reset = Number.isFinite(resetAt) ? ` · resets ${new Date(resetAt).toLocaleString()}` : '';
       return { ...reading, percent, detail: `${reading.account}: ${Math.round(percent)}%${reset}` };
     });
     const description = `${group.label}. ${details.map((reading) => reading.detail).join('. ')}`;
