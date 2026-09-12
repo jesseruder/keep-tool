@@ -662,7 +662,7 @@ function renderHealth() {
   const button = document.querySelector('#health');
   button.classList.toggle('bad', !health.daemon?.running || unhealthy.length > 0);
   button.classList.toggle('warning', health.daemon?.running && unhealthy.length === 0 && warnings.length > 0);
-  button.querySelector(':scope > span').textContent = !health.daemon?.running ? 'daemon: offline' : unhealthy.length ? `daemon: ${unhealthy[0].name} ${unhealthy[0].displayState}` : warnings.length ? `daemon: ${warnings[0].name} warning` : 'daemon: healthy';
+  button.querySelector(':scope > span').textContent = !health.daemon?.running ? 'daemon: offline' : unhealthy.length ? `daemon: ${unhealthy[0].displayState}` : warnings.length ? 'daemon: warning' : 'daemon: healthy';
   const enable = notificationPermission() === 'default' ? '<button class="btn notify-enable">Enable notifications</button>' : '';
   button.querySelector('.pop').innerHTML = `<b>keep serve</b> · pid ${esc(health.daemon?.pid || '—')}${enable}<dl>${rows.map((row) => `<dt>${esc(row.name)}</dt><dd class="${['failing', 'silent', 'never'].includes(row.displayState) ? 'bad' : row.displayState === 'warning' ? 'warning' : ''}">${esc(row.displayState)}${row.displayDetail ? ` · ${esc(row.displayDetail)}` : ''}</dd>`).join('')}</dl>`;
   button.querySelector('.notify-enable')?.addEventListener('click', async (event) => {
