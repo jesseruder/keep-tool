@@ -118,6 +118,127 @@ function executableText(segment) {
     .replace(assignments, '');
 }
 
+// ---------- normalized commands ----------
+//
+// `git push` can be spelled `/usr/bin/git push`, `git pu\sh`, `env -i git push`,
+// `sudo -u root git push`, or `bash -lc "git push"`, and every one of those runs
+// a push. Anything that decides "did this turn release something" or "was this a
+// commit" has to see the same command behind all of those spellings, so the
+// normalization lives here beside the segmenter rather than in each caller.
+
+const SHELL_RE = /^(?:ba|z|da|k|a)?sh$/;
+
+function commandBasename(token) {
+  const text = String(token || '');
+  const slash = text.lastIndexOf('/');
+  return slash === -1 ? text : text.slice(slash + 1);
+}
+
+// Quote-aware split into tokens, with quoting and backslash escapes removed:
+// `git "push"` and `git pu\sh` both become ['git', 'push'].
+function commandTokens(text) {
+  const tokens = [];
+  let current = '';
+  let quote = '';
+  let started = false;
+  const push = () => { if (started) tokens.push(current); current = ''; started = false; };
+  const value = String(text || '');
+  for (let i = 0; i < value.length; i += 1) {
+    const ch = value[i];
+    if (ch === '\\' && i + 1 < value.length && quote !== "'") { current += value[i + 1]; started = true; i += 1; continue; }
+    if (quote) {
+      if (ch === quote) { quote = ''; continue; }
+      current += ch; started = true; continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; started = true; continue; }
+    if (/\s/.test(ch)) { push(); continue; }
+    current += ch; started = true;
+  }
+  push();
+  return tokens;
+}
+
+// Drop the wrappers that stand between the shell and the real executable.
+function stripCommandWrappers(input) {
+  let tokens = input.slice();
+  for (let guard = 0; guard < 8 && tokens.length; guard += 1) {
+    const head = commandBasename(tokens[0]);
+    if (head === 'env') {
+      tokens = tokens.slice(1);
+      while (tokens.length && (/^-/.test(tokens[0]) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0]))) tokens = tokens.slice(1);
+      continue;
+    }
+    if (head === 'sudo' || head === 'doas') {
+      tokens = tokens.slice(1);
+      while (tokens.length && /^-/.test(tokens[0])) {
+        const flag = tokens[0];
+        tokens = tokens.slice(1);
+        // These take a value; the rest are plain switches.
+        if (/^-[uUgpCDRTh]$/.test(flag) && tokens.length) tokens = tokens.slice(1);
+      }
+      continue;
+    }
+    if (['time', 'nohup', 'exec', 'command', 'nice', 'stdbuf', 'setsid'].includes(head)) {
+      tokens = tokens.slice(1);
+      while (tokens.length && /^-/.test(tokens[0])) tokens = tokens.slice(1);
+      continue;
+    }
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) { tokens = tokens.slice(1); continue; }
+    break;
+  }
+  return tokens;
+}
+
+// Every executable command a string runs, normalized, recursing through
+// `sh -c "…"` wrappers. Order is the order they would run in.
+function normalizedCommands(command, depth = 0) {
+  const out = [];
+  if (depth > 4) return out;
+  for (const segment of commandSegments(command)) {
+    const tokens = stripCommandWrappers(commandTokens(segment.text));
+    if (!tokens.length) continue;
+    const head = commandBasename(tokens[0]);
+    if (SHELL_RE.test(head) && tokens.slice(1).some((token) => /^-[a-z]*c$/i.test(token))) {
+      // The script is the last argument; anything after it is $0 and positional.
+      out.push(...normalizedCommands(tokens[tokens.length - 1], depth + 1));
+      continue;
+    }
+    out.push([head, ...tokens.slice(1)].join(' '));
+  }
+  return out;
+}
+
+// An argv array, as Codex's shell and exec_command tools spell a command.
+function normalizedCommandsFromArgv(argv) {
+  if (typeof argv === 'string') return normalizedCommands(argv);
+  if (!Array.isArray(argv) || !argv.length) return [];
+  const tokens = argv.map((token) => String(token == null ? '' : token)).filter((token) => token !== '');
+  if (!tokens.length) return [];
+  const head = commandBasename(tokens[0]);
+  if (SHELL_RE.test(head) && tokens.slice(1).some((token) => /^-[a-z]*c$/i.test(token))) {
+    return normalizedCommands(tokens[tokens.length - 1]);
+  }
+  // Already split by whoever built the argv, so re-joining and re-splitting it
+  // would only give a token containing a space or a quote the chance to be read
+  // as two. The wrappers still come off.
+  const stripped = stripCommandWrappers(tokens);
+  if (!stripped.length) return [];
+  return [[commandBasename(stripped[0]), ...stripped.slice(1)].join(' ')];
+}
+
+const GIT_RELEASE_RE = /^git(?:\s+-\S+(?:\s+\S+)?)*\s+(?:commit|push)\b/;
+const GIT_COMMIT_RE = /^git(?:\s+-\S+(?:\s+\S+)?)*\s+commit\b/;
+
+// True when the string, however spelled, actually runs one of these — as an
+// executable, not as an argument to `rg` or inside a here-doc.
+function runsGitWrite(command) {
+  return normalizedCommands(command).some((text) => GIT_RELEASE_RE.test(text));
+}
+
+function runsGitCommit(command) {
+  return normalizedCommands(command).some((text) => GIT_COMMIT_RE.test(text));
+}
+
 function fingerprintRegex(fingerprint) {
   const words = String(fingerprint).trim().split(/\s+/).map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
   const rest = words.slice(1);
@@ -605,6 +726,13 @@ module.exports = {
   stepFingerprints,
   commandSegments,
   executableText,
+  commandTokens,
+  commandBasename,
+  stripCommandWrappers,
+  normalizedCommands,
+  normalizedCommandsFromArgv,
+  runsGitWrite,
+  runsGitCommit,
   matchStepCommand,
   cdTargets,
   compoundAfter,

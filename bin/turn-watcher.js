@@ -192,6 +192,26 @@ function inProgress(lastAssistant) {
   return IN_PROGRESS_RE.test(tail(lastAssistant));
 }
 
+// Compatibility spellings exist for every character these patterns look for:
+// fullwidth ｄｅｐｌｏｙ is `deploy` after NFKC, and a gate that misses it is a
+// gate somebody can walk around. Matching always happens on the folded form.
+function normalizeForMatch(text) {
+  try { return String(text == null ? '' : text).normalize('NFKC').toLowerCase(); }
+  catch { return String(text == null ? '' : text).toLowerCase(); }
+}
+
+// The pre-signals read a tail because how a turn *ended* is what they decide.
+// A carve-out asks a different question — did anything in this turn mean Owner
+// has to see it — so it reads all of it, however long the closing prose ran.
+function explicitPauseAnywhere(text) {
+  return EXPLICIT_PAUSE_RE.test(normalizeForMatch(text));
+}
+
+function askedAnywhere(text) {
+  const folded = normalizeForMatch(text);
+  return Boolean(askedQuestion(folded) || askedForAction(folded));
+}
+
 // A card whose scheduled check this very session booked is not a stalled turn:
 // the session deliberately handed the next move to the scheduler.
 function waitingOnCheck(card, sessionId) {
@@ -1310,6 +1330,7 @@ function stats(options = {}) {
 module.exports = {
   VERDICTS, SELF_CHECK_MESSAGE, SYSTEM_PROMPT, INSTRUCTION, TIMEOUT_MS, MAX_CONTEXT_BYTES,
   askedQuestion, askedForAction, stopHint, namesNextStep, claimsDone, explicitPause, inProgress, waitingOnCheck,
+  normalizeForMatch, explicitPauseAnywhere, askedAnywhere,
   signalsFor, ruleVerdict, selectTurns, turnsForReplay, turnFor, buildContext, invocationFor,
   firstJsonObject, parseVerdict, runModel, spawnRunner, judge, writeVerdict, setDecisionId, decisionTypeFor,
   normalizeContinue, isAllowedContinueMessage, canonicalContinueMessage, withoutQuoted,

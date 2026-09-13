@@ -749,3 +749,285 @@ test('the Stop hook counts Codex edits, commits and pushes', () => {
   assert.equal(claude.commits, 1);
   assert.equal(claude.bashGitWrites, 1);
 });
+
+// ---------- the recheck: unknown settings, abandoned reservations, whole inputs ----------
+
+test('a git command named inside an argument is not evidence of a release', () => {
+  // The Stop hook decides whether a session owes Keep a check-in. Searching for
+  // the words is not doing the thing, however commit-shaped the output looks.
+  const searched = keepApi.scanStopEvidence(keepApi.emptyStopEvidence(), jsonl([
+    { type: 'response_item', payload: { type: 'function_call', name: 'shell', call_id: 'a1',
+      arguments: JSON.stringify({ command: ['bash', '-lc', 'rg "git commit" README.md'] }) } },
+    { type: 'response_item', payload: { type: 'function_call_output', call_id: 'a1',
+      output: 'README.md:12: run git commit -am wip\n[main 1a2b3c4] fix the parser' } },
+    { type: 'response_item', payload: { type: 'function_call', name: 'shell', call_id: 'a2',
+      arguments: JSON.stringify({ command: ['bash', '-lc', 'echo "git push" >> NOTES.md'] }) } },
+  ]));
+  assert.equal(searched.commits, 0, 'a search is not a commit');
+  assert.equal(searched.pushes, 0);
+  assert.equal(searched.bashGitWrites, 0);
+
+  // An object-valued `arguments` is the same call, spelled the other way.
+  const objectArgs = keepApi.scanStopEvidence(keepApi.emptyStopEvidence(), jsonl([
+    { type: 'response_item', payload: { type: 'function_call', name: 'shell', call_id: 'o1',
+      arguments: { command: ['bash', '-lc', 'git commit -am "real work"'] } } },
+    { type: 'response_item', payload: { type: 'function_call_output', call_id: 'o1',
+      output: '[main abc1234] real work\n 1 file changed' } },
+    { type: 'response_item', payload: { type: 'function_call', name: 'exec_command', call_id: 'o2',
+      arguments: { cmd: 'git push origin HEAD:master' } } },
+  ]));
+  assert.equal(objectArgs.commits, 1);
+  assert.equal(objectArgs.pushes, 1);
+  assert.equal(objectArgs.bashGitWrites, 2);
+
+  // And the wrappers a push can hide behind are all seen through.
+  for (const command of [
+    ['bash', '-lc', 'env -i git push'],
+    ['bash', '-lc', 'sudo -u root git push'],
+    ['bash', '-lc', 'npm test && git push'],
+    ['/usr/bin/git', 'push'],
+    ['bash', '-lc', 'git "push"'],
+  ]) {
+    const state = keepApi.scanStopEvidence(keepApi.emptyStopEvidence(), jsonl([
+      { type: 'response_item', payload: { type: 'function_call', name: 'shell', call_id: 'w1',
+        arguments: JSON.stringify({ command }) } },
+    ]));
+    assert.equal(state.pushes, 1, command.join(' '));
+  }
+});
+
+test('an unknown setting turns everything off rather than being ignored', (t) => {
+  sandbox(t);
+  // The reviewer's case: a typo in a limit read as "no opinion" would raise the
+  // cap the author was trying to lower, while leaving `live` standing.
+  const typo = live.normalizeConfig({ live: { continue: true }, maxPerHoru: 1 });
+  assert.deepEqual(live.liveTypes(typo), []);
+  assert.equal(typo.invalid, true);
+  assert.equal(typo.maxPerHour, 12, 'and nothing of the typo is honoured');
+
+  for (const bad of [
+    { live: { continue: true }, maxPerSessionsPer10m: 1 },
+    { live: { continue: true }, minConfidenc: 0.99 },
+    { live: { continue: true }, comment: 'why this is on' },
+    { continue: true },
+    { live: { continue: true }, invalid: false },
+  ]) assert.deepEqual(live.liveTypes(live.normalizeConfig(bad)), [], JSON.stringify(bad));
+
+  // But a config this module itself produced round-trips: `invalid` is its own
+  // report on a file it read, not a setting, so saving one back is not a typo.
+  live.saveConfig({ live: { continue: true, 'needs-input': false, drift: false }, maxPerHour: 4 });
+  const loaded = live.loadConfig();
+  assert.equal(loaded.invalid, false);
+  live.saveConfig({ ...loaded, live: { ...loaded.live, drift: true } });
+  const again = live.loadConfig();
+  assert.deepEqual(live.liveTypes(again), ['continue', 'drift']);
+  assert.equal(again.maxPerHour, 4, 'the rest of the file survives the round trip');
+});
+
+test('a reservation nobody finished stops holding a slot', (t) => {
+  const dir = sandbox(t);
+  const turn = indexTurn(dir);
+  const config = allLive();
+  const now = Date.now();
+  const db = () => turnIndex.open();
+
+  // The daemon died between reserving and sending. Six minutes later the row is
+  // abandoned: it blocks neither its own turn nor anything else.
+  assert.equal(live.reserve(turn, config, 'continue', { now: now - 6 * 60e3 }).ok, true);
+  assert.equal(live.rateLimit(turn, config, { now }), null, 'the turn itself is free again');
+  const other = indexTurn(dir, { id: 'stale111-2222-3333-4444-555555555555' });
+  assert.equal(live.rateLimit(other, allLive({ maxPerHour: 1 }), { now }), null, 'and it spends no fleet budget');
+
+  // Fresh ones still hold, both ways.
+  assert.equal(live.reserve(other, config, 'continue', { now: now - 60e3 }).ok, true);
+  assert.match(live.rateLimit(other, config, { now }), /already been delivered/);
+  assert.match(live.rateLimit(turn, allLive({ maxPerHour: 1 }), { now }), /last hour/);
+
+  // The abandoned row does not stand in the way of a real retry of the same turn.
+  assert.equal(live.reserve(turn, allLive({ maxPerHour: 5 }), 'continue', { now }).ok, true);
+  assert.equal(db().prepare('SELECT COUNT(*) AS n FROM deliveries WHERE turn_id = ?').get(turn.id).n, 1);
+
+  // A row that did send is permanent, however old.
+  live.confirmReservation(turn, now - 10 * 3600e3);
+  db().prepare('UPDATE deliveries SET reserved_at = ? WHERE turn_id = ?').run(now - 10 * 3600e3, turn.id);
+  assert.match(live.rateLimit(turn, config, { now }), /already been delivered/);
+
+  // And the sweep clears only the abandoned ones.
+  const third = indexTurn(dir, { id: 'sweep111-2222-3333-4444-555555555555' });
+  assert.equal(live.reserve(third, allLive({ maxPerHour: 9 }), 'continue', { now: now - 9 * 60e3 }).ok, true);
+  assert.equal(db().prepare('SELECT COUNT(*) AS n FROM deliveries').get().n, 3);
+  assert.equal(live.sweepReservations({ now }), 1, 'one abandoned row swept');
+  assert.equal(live.sweepReservations({ now }), 0, 'and nothing else to sweep');
+  const left = db().prepare('SELECT turn_id, sent_at FROM deliveries ORDER BY turn_id').all();
+  assert.equal(left.length, 2);
+  assert.equal(left.some((row) => row.turn_id === third.id), false, 'the abandoned one is gone');
+});
+
+test('the release carve-out reads the whole tool input, not the truncated copy', (t) => {
+  const dir = sandbox(t);
+  // 500 characters of harmless work, then the push — which is exactly the part
+  // the `command` column drops.
+  const long = `npm test -- --filter ${'x'.repeat(560)} && git push`;
+  assert.ok(long.length > 500);
+  const turn = indexTurn(dir, { tools: [{ name: 'Bash', input: { command: long, description: 'run the suite' } }] });
+  const db = turnIndex.open();
+  const stored = db.prepare("SELECT command FROM messages WHERE turn_id = ? AND kind = 'tool_use'").get(turn.id).command;
+  assert.equal(stored.length, 500, 'the display copy is truncated');
+  assert.equal(stored.includes('git push'), false, 'and the push is not in it');
+
+  const commands = live.turnCommands(turn);
+  assert.ok(commands.includes('git push'), `normalized: ${JSON.stringify(commands)}`);
+  assert.match(live.releaseCarveOut(commands, keepApi, turn), /git commit or push/);
+});
+
+test('a command named in an argument is not a command the turn ran', (t) => {
+  const dir = sandbox(t);
+  const turn = indexTurn(dir, { tools: [
+    { name: 'Bash', input: { command: 'rg "git commit" README.md docs/' } },
+    { name: 'Bash', input: { command: 'echo "remember to git push" >> NOTES.md' } },
+    { name: 'Read', input: { file_path: '/tmp/live-project/git-push-notes.md' } },
+  ] });
+  const commands = live.turnCommands(turn);
+  assert.deepEqual(commands, ['rg git commit README.md docs/', 'echo remember to git push >> NOTES.md']);
+  assert.equal(live.releaseCarveOut(commands, keepApi, turn), null, 'searching for it is not doing it');
+
+  // Every spelling of the real thing, on the other hand, is seen.
+  for (const command of [
+    '/usr/bin/git push',
+    'git pu\\sh',
+    'env -i git push',
+    'sudo -u root git push',
+    'bash -lc "git push"',
+    'zsh -lc "git push"',
+    'npm test && git push',
+    'git "push"',
+    'git commit -am wip',
+  ]) {
+    assert.match(live.releaseCarveOut([command], keepApi, null), /git commit or push/, command);
+  }
+});
+
+test('a Codex argv command is read from the full input, whichever way it is spelled', (t) => {
+  const dir = sandbox(t);
+  const id = '0199dddd-1111-2222-3333-444444444444';
+  const file = path.join(dir, `rollout-2026-09-13T02-00-00-${id}.jsonl`);
+  const long = `pytest -k ${'y'.repeat(560)} && git push origin HEAD:master`;
+  fs.writeFileSync(file, jsonl([
+    { type: 'session_meta', timestamp: '2026-09-13T02:00:00.000Z', payload: { id, cwd: '/tmp/live-project', source: 'cli' } },
+    { type: 'response_item', timestamp: '2026-09-13T02:00:01.000Z', payload: {
+      type: 'message', role: 'user', content: [{ type: 'input_text', text: 'ship it' }] } },
+    // An object-valued `arguments`, and an argv array rather than a string.
+    { type: 'response_item', timestamp: '2026-09-13T02:00:02.000Z', payload: {
+      type: 'function_call', name: 'shell', call_id: 's1', arguments: { command: ['bash', '-lc', long] } } },
+    { type: 'response_item', timestamp: '2026-09-13T02:00:03.000Z', payload: { type: 'agent_message', text: 'Pushed.' } },
+    { type: 'event_msg', timestamp: '2026-09-13T02:00:04.000Z', payload: { type: 'task_complete' } },
+  ]));
+  assert.equal(turnIndex.ingestFile(file).ok, true);
+  const turn = watcher.turnFor(id, 1);
+  const commands = live.turnCommands(turn);
+  assert.ok(commands.includes('git push origin HEAD:master'), JSON.stringify(commands));
+  assert.match(live.releaseCarveOut(commands, keepApi, turn), /git commit or push/);
+});
+
+test('a tool input too long for the index to record is never cleared', (t) => {
+  const dir = sandbox(t);
+  // Past the tool cap, so neither copy is whole: the index has the first couple
+  // of kilobytes and the tail — where a trailing push would sit — is gone.
+  const huge = `node scripts/build.js --flags ${'z'.repeat(4000)}`;
+  const turn = indexTurn(dir, { tools: [{ name: 'Bash', input: { command: huge } }] });
+  const commands = live.turnCommands(turn);
+  assert.ok(commands.includes(live.UNREADABLE_COMMAND), JSON.stringify(commands.map((c) => c.slice(0, 40))));
+  assert.match(live.releaseCarveOut(commands, keepApi, turn), /too long for the index to record/);
+});
+
+test('the indexer records a commit only from the call that ran one', (t) => {
+  const dir = sandbox(t);
+  // Commit-shaped text in the output of a command that is not a commit is a
+  // README being printed, not a release.
+  const at = (s) => new Date(Date.UTC(2026, 8, 13, 3, 0, s)).toISOString();
+  const id = 'prov1111-2222-3333-4444-555555555555';
+  const file = path.join(dir, `${id}.jsonl`);
+  fs.writeFileSync(file, jsonl([
+    { type: 'user', sessionId: id, cwd: '/tmp/live-project', timestamp: at(0), message: { role: 'user', content: 'read the docs' } },
+    { type: 'assistant', sessionId: id, cwd: '/tmp/live-project', timestamp: at(1), message: { role: 'assistant', content: [
+      { type: 'tool_use', id: 'cat1', name: 'Bash', input: { command: 'cat README.md' } }] } },
+    { type: 'user', sessionId: id, cwd: '/tmp/live-project', timestamp: at(2), message: { role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 'cat1', content: 'Example:\n[main 1a2b3c4] fix the parser\n 2 files changed' }] } },
+    { type: 'assistant', sessionId: id, cwd: '/tmp/live-project', timestamp: at(3),
+      message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: "Read it. Next, I'll patch." }] } },
+  ]));
+  assert.equal(turnIndex.ingestFile(file, { agent: 'claude' }).ok, true);
+  assert.deepEqual(JSON.parse(watcher.turnFor(id, 1).commits || '[]'), [], 'no git command, no commit');
+
+  // The same output behind a real commit is a commit.
+  fs.appendFileSync(file, jsonl([
+    { type: 'user', sessionId: id, cwd: '/tmp/live-project', timestamp: at(10), message: { role: 'user', content: 'now commit it' } },
+    { type: 'assistant', sessionId: id, cwd: '/tmp/live-project', timestamp: at(11), message: { role: 'assistant', content: [
+      { type: 'tool_use', id: 'c1', name: 'Bash', input: { command: 'git commit -am "fix the parser"' } }] } },
+    { type: 'user', sessionId: id, cwd: '/tmp/live-project', timestamp: at(12), message: { role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 'c1', content: '[main 9f8e7d6] fix the parser\n 2 files changed' }] } },
+    { type: 'assistant', sessionId: id, cwd: '/tmp/live-project', timestamp: at(13),
+      message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'Committed.' }] } },
+  ]));
+  assert.equal(turnIndex.ingestFile(file, { agent: 'claude' }).ok, true);
+  const committed = watcher.turnFor(id, 2);
+  assert.deepEqual(JSON.parse(committed.commits || '[]'), ['9f8e7d6']);
+  assert.match(live.releaseCarveOut([], keepApi, committed), /produced a commit/);
+});
+
+test('a carve-out phrase survives being buried in a long turn, or written in lookalikes', (t) => {
+  sandbox(t);
+  const filler = 'Then I re-read the migration notes and the index plan one more time. '.repeat(12);
+
+  // The pause is the first sentence of a 900-character turn: a tail-only read
+  // would never see it.
+  const buried = `I will wait for you to confirm before I touch anything else. ${filler}`;
+  assert.ok(buried.length > 700);
+  assert.equal(watcher.explicitPause(buried), false, 'the tail alone does not show it');
+  assert.equal(watcher.explicitPauseAnywhere(buried), true);
+  assert.match(live.pausedCarveOut(buried, watcher), /paused itself/);
+  assert.equal(live.pausedCarveOut(`${filler}I will keep going.`, watcher), null);
+
+  // A single sentence longer than the tail window, with the pause at its start.
+  const oneSentence = `I will wait for your confirmation before ${'doing any more of this '.repeat(40)}work`;
+  assert.ok(oneSentence.length > 700);
+  assert.match(live.pausedCarveOut(oneSentence, watcher), /paused itself/);
+
+  // Fullwidth letters fold to the same word the risky-question list is written in.
+  const fullwidth = 'Should I \uff44\uff45\uff50\uff4c\uff4f\uff59 this now?';
+  assert.match(live.riskyQuestionCarveOut(fullwidth, watcher), /irreversible, production-facing/);
+  assert.match(live.riskyQuestionCarveOut(`Should I \uff44\uff45\uff4c\uff45\uff54\uff45 the old column? ${filler}`, watcher),
+    /irreversible, production-facing/);
+  assert.equal(live.riskyQuestionCarveOut('Should I run the tests now?', watcher), null);
+});
+
+test('the delivered text is the canonical form of the text that was approved', (t) => {
+  sandbox(t);
+  // Composed and decomposed spellings of the same message must not be two
+  // different messages: the sent bytes are the NFC form, always.
+  const nfd = 'continue the cafe\u0301 migration';
+  const nfc = nfd.normalize('NFC');
+  assert.notEqual(nfd, nfc);
+  assert.equal(live.safeDeliveryText(`[keep watcher] ${nfd}`), `[keep watcher] ${nfc}`);
+  assert.equal(live.safeDeliveryText(`[keep watcher] ${nfc}`), `[keep watcher] ${nfc}`);
+
+  // A character that is only a control or a separator once folded is refused too.
+  for (const point of ['\u00a0', '\u2007', '\u202f', '\u3000', '\u180e', '\u2061']) {
+    assert.equal(live.safeDeliveryText(`[keep watcher] a${point}b`), null, JSON.stringify(point));
+  }
+  // Ordinary text, including fullwidth letters, still goes through.
+  assert.equal(live.safeDeliveryText('[keep watcher] \uff41\uff42 ok'), '[keep watcher] \uff41\uff42 ok');
+});
+
+test('a turn buried under a pause is never delivered, whatever the verdict said', async (t) => {
+  const dir = sandbox(t);
+  const filler = 'Then I re-read the migration notes and the index plan one more time. '.repeat(12);
+  const turn = indexTurn(dir, { assistant: `I will wait for you to confirm before I touch anything else. ${filler}` });
+  const send = fakeSend();
+  const result = await live.maybeDeliver(turn, verdict(), {
+    config: allLive(), session: READY_SESSION, card: ACTIVE_CARD, send,
+  });
+  assert.equal(result.delivered, false);
+  assert.match(result.reason, /paused itself/);
+  assert.equal(send.calls.length, 0);
+});

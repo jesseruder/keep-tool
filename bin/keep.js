@@ -5021,16 +5021,19 @@ const APPLY_PATCH_FILE_RE = /^\*\*\* (?:Add|Update|Delete) File:/gm;
 // Codex's half of scanStopEvidence. Kept separate so the Claude path above is
 // untouched: it is the one the Stop hook has always run, and a regression there
 // would silently stop enforcing check-ins for the whole fleet.
-function codexShellCommand(raw) {
-  if (!raw) return '';
-  try {
-    const parsed = JSON.parse(raw);
-    const value = parsed && (parsed.command !== undefined ? parsed.command : parsed.cmd);
-    if (Array.isArray(value)) {
-      return value.length > 2 && /^(?:ba)?sh$/.test(String(value[0])) ? String(value.at(-1)) : value.join(' ');
-    }
-    return String(value || '');
-  } catch { return String(raw); }
+// Codex spells a tool's input as a JSON string or as an object, and the command
+// inside it as `command` or `cmd`, a string or an argv array. All of those run
+// the same thing, so all of them normalize to the same list here.
+function codexCommands(payload) {
+  const raw = payload.arguments !== undefined ? payload.arguments : payload.input;
+  let value = raw;
+  if (typeof raw === 'string') {
+    try { value = JSON.parse(raw); } catch { return stepRegistry.normalizedCommands(raw); }
+  }
+  if (!value || typeof value !== 'object') return stepRegistry.normalizedCommands(String(value || ''));
+  const command = value.command !== undefined ? value.command : value.cmd;
+  if (command === undefined) return [];
+  return stepRegistry.normalizedCommandsFromArgv(command);
 }
 
 function scanCodexStopEvidence(next, payload) {
@@ -5046,14 +5049,20 @@ function scanCodexStopEvidence(next, payload) {
       next.edits += files || 1;
       return;
     }
-    const command = codexShellCommand(raw);
-    if (!command) return;
-    if (looksLikeGitWrite(command)) next.bashGitWrites++;
-    if (/(?:^|[;&|]\s*)\s*(?:sudo\s+)?git\s+(?:-\S+(?:\s+[^-\s]\S*)?\s+)*push\b/.test(command)) next.pushes++;
+    const commands = codexCommands(payload);
+    if (!commands.length) return;
+    let committed = false;
+    for (const command of commands) {
+      // `git commit` at an executable position only: `rg "git commit" README.md`
+      // is a search, not a commit.
+      if (/^git(?:\s+-\S+(?:\s+\S+)?)*\s+(?:commit|push)\b/.test(command)) next.bashGitWrites++;
+      if (/^git(?:\s+-\S+(?:\s+\S+)?)*\s+push\b/.test(command)) next.pushes++;
+      if (/^git(?:\s+-\S+(?:\s+\S+)?)*\s+commit\b/.test(command)) committed = true;
+    }
     // Remember which call was a commit, so its output can be believed below. A
     // transcript is untrusted text: a README or a test fixture containing
     // "[main abc1234] …" must not read as a commit that never happened.
-    if (typeof payload.call_id === 'string' && /\bgit\b[\s\S]*\bcommit\b/.test(command)) {
+    if (committed && typeof payload.call_id === 'string') {
       next.codexCommitCalls = [...(next.codexCommitCalls || []), payload.call_id].slice(-64);
     }
     return;
@@ -5252,7 +5261,12 @@ function redactCommand(command) {
 // garmin tablet update; text inside grep, echo, or comments never counts.
 function deployCommand(command) {
   for (const segment of stepRegistry.commandSegments(command)) {
-    const text = stepRegistry.executableText(segment.text);
+    // Normalized so a quoted or path-qualified spelling is the same release:
+    // `heroku "container:release"` and `/usr/local/bin/heroku container:release`
+    // both deploy. Falls back to the raw executable text if normalization finds
+    // nothing, so no previously recognised spelling is lost.
+    const text = stepRegistry.normalizedCommands(segment.text)[0]
+      || stepRegistry.executableText(segment.text);
     let m = text.match(/^git\s+(?:-C\s+(\S+)\s+)?(?:-c\s+\S+\s+)*push(?:\s+(.*))?$/);
     if (m) {
       const tokens = (m[2] || '').split(/\s+/).filter(Boolean);

@@ -488,11 +488,14 @@ decisions at 90% agreement, the same bar `keep decisions stats` shows. The
 refusal says exactly what is missing ("26 more graded (4/30)", "agreement 50%
 below 90%"), and `--force` overrules it deliberately rather than by accident.
 
-**A malformed switch file reads as entirely off**, not partly on: an unknown key,
-a non-boolean flag, a `minConfidence` outside `(0, 1]`, or a limit that is not a
-non-negative integer disables everything and says why under `KEEP_DEBUG`. A live
-flag standing beside a threshold that could not be parsed is precisely the
-configuration that must not be half-honoured.
+**A malformed switch file reads as entirely off**, not partly on: an unrecognised
+key at either level, a non-boolean flag, a `minConfidence` outside `(0, 1]`, or a
+limit that is not a non-negative integer disables everything and says why under
+`KEEP_DEBUG`. A live flag standing beside a threshold that could not be parsed is
+precisely the configuration that must not be half-honoured — and a misspelled
+limit (`maxPerHoru: 1`) read as "no opinion, use the default" would *raise* the
+cap its author was trying to lower, so it is refused rather than ignored. Those
+four keys, and the three verdict types inside `live`, are the whole vocabulary.
 
 ### What has to be true to deliver
 
@@ -528,25 +531,42 @@ all count; the never-chain rule below depends on that.
 
 **The text is validated, not sanitised.** Anything outside plain printable
 characters — a control character, a newline, an escape sequence, a zero-width or
-bidi override — means **nothing is delivered** (`reason: 'unsafe-text'`). A
-carriage return inside the message would erase the `[keep watcher] ` prefix and
-submit whatever followed it, and a message that had to be rewritten is not the
-message Owner graded. Only runs of spaces are collapsed, and the whole text is
-capped at 1000 characters.
+bidi override, any Unicode format or separator character, any space that is not a
+plain one — means **nothing is delivered** (`reason: 'unsafe-text'`). A carriage
+return inside the message would erase the `[keep watcher] ` prefix and submit
+whatever followed it, and a message that had to be rewritten is not the message
+Owner graded. The check runs against the text **and its NFKC form**, so a
+lookalike cannot smuggle a control character past it. The message is normalized
+to **NFC once**, and that same canonical form is what both the check and the send
+use, so a decomposed and a composed spelling are one message rather than two.
+Only runs of spaces are collapsed, and the whole text is capped at 1000
+characters.
 
-**Everything is re-checked twice more before the characters land.** The gates
+**Everything is re-checked four times before the characters land.** The gates
 above were decided from a snapshot taken before a model call that takes minutes,
 so immediately before handing the text to the transport the switch file is
 re-read, the session is re-fetched with the same read the injection path uses,
-and the turn is re-checked as the session's latest; then the transport runs those
-same checks **once more inside the injection lock**, which is the only place
-where "nothing has changed" can still be true when the keystrokes arrive. Either
-one failing aborts with a `moved-on:` reason and gives the rate-limit slot back.
+and the turn is re-checked as the session's latest. The transport then runs those
+same checks three more times **inside the injection lock**: on entering it, again
+after the pane precheck and immediately before the first character is typed, and
+once more after the typing is confirmed on screen and before Enter. Resolving a
+target and typing 200 characters at a time is not instant, so a switch turned
+off, a session that moved on, or a human who started typing in between has to be
+able to stop this at whichever point it reaches. Any of them failing aborts with
+a `moved-on:` reason and gives the rate-limit slot back — and an abort that lands
+after the text is already in the input box **clears the draft** (Escape, the same
+dismissal the draft guard uses) rather than leaving a half-delivered message for
+Owner to find.
 
 **The slot is reserved before the send, not counted.** A `deliveries` row
 (`turn_id` primary key) is claimed inside one `BEGIN IMMEDIATE` alongside the
 rate-limit count, so two daemon workers racing the last slot cannot both decide
 there is room; a failed precondition or a failed send deletes the reservation.
+A reservation whose send never happened at all — the daemon was killed between
+the two — stops counting after **five minutes**: past that it blocks neither its
+own turn nor anyone else's budget, and the next tick sweeps it away. A row that
+did send is permanent, however old, because "never twice for the same turn" has
+no expiry.
 
 ### Carve-outs
 
@@ -554,10 +574,13 @@ Deterministic, exported, and each one a test. Never deliver when:
 
 Unlike the pre-signals, which read the last 600 characters because how a turn
 *ended* is what they are for, these read the **whole turn** — every assistant
-message of it, sentence by sentence. A pause or a risky question announced before
-a wall of closing prose still counts.
+message of it, and every character of it. A pause or a risky question announced
+before a wall of closing prose still counts, including when the announcing
+sentence is itself longer than the pre-signals' window. Matching happens on the
+**NFKC form**, so fullwidth `ｄｅｐｌｏｙ` is the same word as `deploy`.
 
-- the turn paused itself (`explicitPause`), anywhere in it;
+- the turn paused itself, anywhere in it (`explicitPauseAnywhere`, the whole-text
+  form of the `explicitPause` pre-signal);
 - any sentence of the turn that is asking about something irreversible or
   production-facing — production, prod, live users, deploy, rollout, canary,
   delete, drop, rotate, secret, token, credential, first time, irreversible, or
@@ -569,10 +592,18 @@ a wall of closing prose still counts.
   archive-aware on purpose, so a done card is found and refused rather than
   reading as "no card". Shadow verdicts still record for any session;
 - the turn ran a `git commit`/`git push` or a deploy, or recorded a commit. A
-  session that just released gets Owner, not a nudge. Commands are parsed the way
-  keep.js's own deploy provenance parses them, so `env git push`, `git "push"`,
-  `sudo git push` and `npm test && git push` are all seen, in both the Claude and
-  Codex spellings (`command` and `cmd`);
+  session that just released gets Owner, not a nudge. Commands come from the
+  **full tool input** — the `command` column is a 500-character display copy, and
+  a long command with `&& git push` at the end loses exactly the part this gate
+  exists to see — and are normalized by the shared parser in `bin/steps.js`, so
+  `/usr/bin/git push`, `git pu\sh`, `git "push"`, `env -i git push`,
+  `sudo -u root git push`, `bash -lc "git push"` and `npm test && git push` are
+  all the same push, in both the Claude and Codex spellings (`command`/`cmd`, a
+  string or an argv array, `arguments` as an object or as a JSON string). The
+  same parser decides commit provenance in the index and in the Stop hook, so
+  `rg "git commit" README.md` is a search rather than a release. A tool input too
+  long for the index to record in full cannot be cleared either: the dropped tail
+  is where a trailing push would sit, so the turn is carved out on that alone;
 - the turn was opened by an automated message (`keep` opener). **One delivered
   message must be answered by a human before another can be sent**, or a
   `continue` would produce an ended turn that the watcher continues again,

@@ -767,8 +767,17 @@ function insertTurn(handle, sessionId, n, turn) {
 function refreshTurn(handle, turnId, { ended, stopReason } = {}) {
   if (!turnId) return;
   const rows = statement(handle, 
-    'SELECT ts, role, kind, text, tool_name, files, command, stop_reason FROM messages WHERE turn_id = ? ORDER BY seq',
+    'SELECT ts, role, kind, text, tool_name, tool_id, files, command, stop_reason FROM messages WHERE turn_id = ? ORDER BY seq',
   ).all(turnId);
+  // Which tool calls actually ran a git commit. A sha is read only out of one of
+  // their results: transcripts are full of commit-shaped text — a README, a test
+  // fixture, a pasted log — and a commit the turn did not make would carry a
+  // whole turn past the watcher's release carve-out.
+  const commitCalls = new Set();
+  for (const row of rows) {
+    if (row.kind !== 'tool_use' || !row.tool_id || !row.command) continue;
+    try { if (require('./steps.js').runsGitCommit(row.command)) commitCalls.add(row.tool_id); } catch {}
+  }
   const assistant = [];
   const tools = [];
   const files = [];
@@ -790,7 +799,7 @@ function refreshTurn(handle, turnId, { ended, stopReason } = {}) {
     }
     files.push(...parseJsonArray(row.files));
     if (row.stop_reason) seenStop = row.stop_reason;
-    const haystack = row.role === 'tool' ? row.text : row.command;
+    const haystack = row.role === 'tool' && row.tool_id && commitCalls.has(row.tool_id) ? row.text : null;
     if (haystack) for (const match of String(haystack).matchAll(COMMIT_RE)) commits.push(match[1]);
   }
   const existing = statement(handle, 'SELECT ended, stop_reason, ended_at FROM turns WHERE id = ?').get(turnId);

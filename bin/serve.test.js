@@ -3443,6 +3443,83 @@ test('typing exit confirms the prompt above a tall Claude slash-command menu', a
   assert.equal(typed, '/exit\r');
 });
 
+test('an abort between typing and Enter clears the draft instead of submitting it', async () => {
+  // The watcher's precondition is checked once more after the text is in the box.
+  // Failing it there must leave the session exactly as it was found: no Enter,
+  // and no half-typed message for Owner to discover and delete.
+  const inputs = [];
+  const host = recordingHost(async (type, params) => {
+    if (type === 'screen') return { text: '> continue the migration' };
+    if (type === 'input') inputs.push(Buffer.from(params.data, 'base64').toString());
+    return {};
+  });
+  const seen = [];
+  const events = [];
+  await assert.rejects(typeAndSubmit({ pane: 'p' }, 'continue the migration', (s, t) => s.includes(t), {
+    host, sleep: async () => {}, deliveryTrace: (stage, fields) => events.push({ stage, ...fields }),
+    beforeEnter: async (target) => { seen.push(target && target.pane); throw new Error('moved-on: continue was switched off'); },
+  }), /moved-on: continue was switched off/);
+  assert.deepEqual(seen, ['p'], 'the hook is handed the pane it would type into');
+  assert.equal(inputs.includes('\r'), false, 'Enter is never pressed');
+  assert.equal(inputs[inputs.length - 1], '\x1b', 'and the typed draft is cleared');
+  assert.ok(events.some((e) => e.stage === 'enter-aborted' && e.cleared === true));
+  assert.equal(events.some((e) => e.stage === 'enter-sent'), false);
+
+  // A hook that passes changes nothing about the normal path.
+  inputs.length = 0;
+  await typeAndSubmit({ pane: 'p' }, 'continue the migration', (s, t) => s.includes(t), {
+    host, sleep: async () => {}, beforeEnter: async () => {},
+  });
+  assert.equal(inputs[inputs.length - 1], '\r');
+});
+
+test('the watcher transport checks its precondition before typing and again before Enter', async () => {
+  const { watcherSend } = require('./serve');
+  const attempt = async (answers) => {
+    const asked = [];
+    const typed = [];
+    let locked = 0;
+    const precondition = async () => { asked.push('asked'); return answers[asked.length - 1] || null; };
+    const result = await watcherSend({ sessionId: 's1', pane: 'p1', text: '[keep watcher] continue', precondition }, {
+      withInjectionLock: (fn) => { locked += 1; return fn(); },
+      // Stands in for sendToSession: runs the hooks exactly where the real one
+      // does — beforeType before the first character, beforeEnter after the
+      // typing is confirmed.
+      sendToSession: async (body, _hint, opts, deps) => {
+        await opts.beforeType();
+        typed.push(body.text);
+        await deps.beforeEnter({ pane: body.pane });
+        return { ok: true, sent: body.text };
+      },
+    }).catch((error) => ({ error: error.message }));
+    return { asked: asked.length, typed, locked, result };
+  };
+
+  const clean = await attempt([]);
+  assert.equal(clean.asked, 3, 'entering the lock, before typing, and before Enter');
+  assert.deepEqual(clean.typed, ['[keep watcher] continue']);
+  assert.equal(clean.locked, 1, 'all of it inside one injection lock');
+  assert.deepEqual(clean.result, { ok: true, sent: '[keep watcher] continue' });
+
+  // Switched off between the verdict and the lock: nothing is typed at all.
+  const early = await attempt(['moved-on: continue was switched off']);
+  assert.equal(early.asked, 1);
+  assert.deepEqual(early.typed, [], 'not a character');
+  assert.match(early.result.error, /switched off/);
+
+  // Owner started typing after the precheck but before the first character.
+  const midway = await attempt([null, 'moved-on: the session has already started another turn']);
+  assert.equal(midway.asked, 2);
+  assert.deepEqual(midway.typed, []);
+  assert.match(midway.result.error, /already started another turn/);
+
+  // And after the text is in the box: typeAndSubmit is the one that clears it.
+  const late = await attempt([null, null, 'moved-on: a question is on screen']);
+  assert.equal(late.asked, 3);
+  assert.deepEqual(late.typed, ['[keep watcher] continue']);
+  assert.match(late.result.error, /a question is on screen/);
+});
+
 test('Claude MCP receipt evidence requires the live menu footer at the bottom', () => {
   const live = [
     'Manage MCP servers',

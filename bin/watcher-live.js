@@ -27,6 +27,11 @@ const HOUR_MS = 3600e3;
 // The transcript can be written a moment after the turn's last timestamp; only a
 // write past this grace means the session has moved on since the turn ended.
 const FRESHNESS_GRACE_MS = 2000;
+// A reservation is taken, then the send happens. If the daemon dies in between,
+// the row is left claiming a slot nothing will ever fill. Past this age an unsent
+// reservation is abandoned: it stops blocking its turn, stops counting toward
+// either rate window, and the next tick deletes it.
+const RESERVATION_TTL_MS = 5 * 60e3;
 // Delivered messages are prefixed so the indexer files them as `keep` openers.
 // A watcher message must never be counted as one of Owner's nudges: the nudge
 // rate is the number this whole project is trying to move.
@@ -55,10 +60,18 @@ function allOff(reason) {
 // from must not be partially honoured: one bad field and the whole config reads
 // as off, rather than leaving a stale `live` flag standing beside a threshold
 // that could not be parsed.
+const CONFIG_KEYS = new Set(['live', 'maxPerSessionPer10m', 'maxPerHour', 'minConfidence']);
+
 function normalizeConfig(value) {
   if (value === null || value === undefined) return allOff();
   if (typeof value !== 'object' || Array.isArray(value)) return allOff('config is not an object');
   const raw = value;
+  // A misspelled key is not a key this file gets to ignore. `maxPerHoru: 1` read
+  // as "no opinion, use the default 12" would silently raise the cap the author
+  // was trying to lower, so an unrecognised setting turns everything off.
+  for (const key of Object.keys(raw)) {
+    if (!CONFIG_KEYS.has(key)) return allOff(`${key} is not a setting this file understands`);
+  }
   if (raw.live !== undefined) {
     if (!raw.live || typeof raw.live !== 'object' || Array.isArray(raw.live)) return allOff('live is not an object');
     for (const [key, flag] of Object.entries(raw.live)) {
@@ -99,7 +112,13 @@ function loadConfig(root) {
 function saveConfig(config, root) {
   const file = configFile(root);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const { invalid: _invalid, ...value } = normalizeConfig(config);
+  // `invalid` is this module's report on a config it read, not a setting, so a
+  // caller round-tripping loadConfig() through saveConfig() must not trip the
+  // unknown-key check with it.
+  const input = config && typeof config === 'object' && !Array.isArray(config)
+    ? Object.fromEntries(Object.entries(config).filter(([key]) => key !== 'invalid'))
+    : config;
+  const { invalid: _invalid, ...value } = normalizeConfig(input);
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
   fs.renameSync(tmp, file);
@@ -119,11 +138,24 @@ function debug(message) {
 // refused outright and nothing is delivered, because a message that needed
 // rewriting is not the message Owner graded.
 const UNSAFE_TEXT_RE = new RegExp('[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff]');
+// Anything Unicode itself calls a control, a format character, or a line or
+// paragraph separator, plus every space that is not a plain one. Checked against
+// the compatibility form too, so a lookalike cannot smuggle one in.
+const UNSAFE_CLASS_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+const ODD_SPACE_RE = new RegExp('[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]');
 
 function safeDeliveryText(text) {
-  const value = String(text == null ? '' : text);
+  // NFC first, and the same canonical form is what gets sent, so a receipt hash
+  // of the delivered text matches the text this approved.
+  let value = String(text == null ? '' : text);
+  try { value = value.normalize('NFC'); } catch {}
   if (!value) return null;
-  if (UNSAFE_TEXT_RE.test(value)) return null;
+  const folded = (() => { try { return value.normalize('NFKC'); } catch { return value; } })();
+  for (const candidate of [value, folded]) {
+    if (UNSAFE_TEXT_RE.test(candidate)) return null;
+    if (UNSAFE_CLASS_RE.test(candidate)) return null;
+    if (ODD_SPACE_RE.test(candidate)) return null;
+  }
   // Runs of spaces are the one thing worth repairing: they change nothing about
   // what the message says or where it ends.
   const collapsed = value.replace(/ {2,}/g, ' ').trim();
@@ -182,10 +214,10 @@ function turnText(turn) {
 
 function pausedCarveOut(turnOrText, watcher) {
   const text = typeof turnOrText === 'string' ? turnOrText : turnText(turnOrText);
-  // Sentence by sentence: `explicitPause` looks at a tail, and a pause announced
-  // before 700 characters of closing prose is still a pause.
-  const said = text.split(/(?<=[.!?])\s+|\n+/).some((sentence) => watcher.explicitPause(sentence));
-  return said ? 'the session paused itself and is waiting on Owner' : null;
+  // Whole text, not a tail and not a sentence at a time: `explicitPause` clips to
+  // the last 600 characters of whatever it is handed, so a 700-character sentence
+  // would hide its own opening.
+  return watcher.explicitPauseAnywhere(text) ? 'the session paused itself and is waiting on Owner' : null;
 }
 
 function riskyQuestionCarveOut(turnOrText, watcher) {
@@ -195,8 +227,9 @@ function riskyQuestionCarveOut(turnOrText, watcher) {
   // checks." ends looking like a plan and is still a production question.
   for (const sentence of text.split(/(?<=[.!?])\s+|\n+/)) {
     if (!sentence.trim()) continue;
-    if (!watcher.askedQuestion(sentence) && !watcher.askedForAction(sentence)) continue;
-    if (RISKY_QUESTION_RE.test(sentence)) {
+    if (!watcher.askedAnywhere(sentence)) continue;
+    // Folded first: a fullwidth ｄｅｐｌｏｙ is the same question as `deploy`.
+    if (RISKY_QUESTION_RE.test(watcher.normalizeForMatch(sentence))) {
       return 'the turn asks about something irreversible, production-facing, or a secret';
     }
   }
@@ -228,20 +261,27 @@ function releaseCarveOut(commands, keepApi, turn) {
   const steps = requireSteps();
   for (const command of commands || []) {
     if (!command) continue;
+    if (command === UNREADABLE_COMMAND) return 'the turn ran a command too long for the index to record in full';
     if (keepApi.looksLikeGitWrite(command)) return 'the turn ran a git commit or push';
+    if (steps) {
+      // The normalizer sees `/usr/bin/git push`, `git pu\sh`, `env -i git push`,
+      // `sudo -u root git push` and `bash -lc "git push"` as the same push.
+      try { if (steps.runsGitWrite(command)) return 'the turn ran a git commit or push'; } catch {}
+      try {
+        for (const normalized of steps.normalizedCommands(command)) {
+          if (keepApi.deployCommand(normalized)) return 'the turn ran a deploy';
+        }
+      } catch {}
+    }
     try { if (keepApi.deployCommand(command)) return 'the turn ran a deploy'; } catch {}
-    if (!steps) continue;
-    try {
-      for (const segment of steps.commandSegments(command)) {
-        // executableText drops `env`/`sudo` prefixes but keeps quoting, and
-        // `git "push"` runs a push exactly like `git push` does.
-        const text = steps.executableText(segment.text).replace(/["']/g, '');
-        if (/^git\s+(?:-\S+(?:\s+\S+)?\s+)*(?:commit|push)\b/.test(text)) return 'the turn ran a git commit or push';
-      }
-    } catch {}
   }
   return null;
 }
+
+// Not a command anything runs: a marker `turnCommands` emits for a tool input
+// the index could not record in full, so the release carve-out refuses instead
+// of clearing a turn on a command it only half saw.
+const UNREADABLE_COMMAND = '\u0000keep-watcher-unreadable-command';
 
 function requireSteps() {
   try { return require('./steps.js'); } catch { return null; }
@@ -300,17 +340,23 @@ function sessionReady(session) {
 function rateLimit(turn, config, deps = {}) {
   const handle = (deps.turnIndex || require('./turn-index.js')).open(deps.db);
   const now = Number.isFinite(deps.now) ? deps.now : Date.now();
+  const live = now - RESERVATION_TTL_MS;
+  // Counted rows are the ones that actually mean something: a send that happened,
+  // or a reservation young enough that its send might still be happening.
+  const COUNTS = '(sent_at IS NOT NULL OR reserved_at >= ?)';
   if (turn.delivered_at) return 'this turn has already been delivered';
-  if (handle.prepare('SELECT 1 AS hit FROM deliveries WHERE turn_id = ?').get(turn.id)) {
+  if (handle.prepare(`SELECT 1 AS hit FROM deliveries WHERE turn_id = ? AND ${COUNTS}`).get(turn.id, live)) {
     return 'this turn has already been delivered';
   }
   const perSession = handle.prepare(
-    'SELECT COUNT(*) AS n FROM deliveries WHERE session_id = ? AND reserved_at >= ?',
-  ).get(turn.session_id, now - SESSION_WINDOW_MS).n;
+    `SELECT COUNT(*) AS n FROM deliveries WHERE session_id = ? AND reserved_at >= ? AND ${COUNTS}`,
+  ).get(turn.session_id, now - SESSION_WINDOW_MS, live).n;
   if (perSession >= config.maxPerSessionPer10m) {
     return `this session already had ${perSession} in the last 10 minutes`;
   }
-  const perHour = handle.prepare('SELECT COUNT(*) AS n FROM deliveries WHERE reserved_at >= ?').get(now - HOUR_MS).n;
+  const perHour = handle.prepare(
+    `SELECT COUNT(*) AS n FROM deliveries WHERE reserved_at >= ? AND ${COUNTS}`,
+  ).get(now - HOUR_MS, live).n;
   if (perHour >= config.maxPerHour) return `the fleet already had ${perHour} in the last hour`;
   return null;
 }
@@ -325,6 +371,10 @@ function reserve(turn, config, type, deps = {}) {
   try {
     const blocked = rateLimit(turn, config, { ...deps, now });
     if (blocked) { handle.exec('ROLLBACK'); return { ok: false, reason: blocked }; }
+    // turn_id is the primary key, so an abandoned row for this turn has to go
+    // before the new reservation can take its place.
+    handle.prepare('DELETE FROM deliveries WHERE turn_id = ? AND sent_at IS NULL AND reserved_at < ?')
+      .run(turn.id, now - RESERVATION_TTL_MS);
     handle.prepare('INSERT INTO deliveries (turn_id, session_id, type, reserved_at) VALUES (?, ?, ?, ?)')
       .run(turn.id, turn.session_id, type, now);
     handle.exec('COMMIT');
@@ -345,6 +395,19 @@ function releaseReservation(turn, deps = {}) {
   } catch {}
 }
 
+// Called once per tick: the rate limits already ignore abandoned reservations,
+// but leaving them in the table forever makes every later count read rows that
+// can never matter.
+function sweepReservations(deps = {}) {
+  try {
+    const handle = (deps.turnIndex || require('./turn-index.js')).open(deps.db);
+    const now = Number.isFinite(deps.now) ? deps.now : Date.now();
+    const result = handle.prepare('DELETE FROM deliveries WHERE sent_at IS NULL AND reserved_at < ?')
+      .run(now - RESERVATION_TTL_MS);
+    return Number(result && result.changes) || 0;
+  } catch { return 0; }
+}
+
 function confirmReservation(turn, at, deps = {}) {
   try {
     (deps.turnIndex || require('./turn-index.js')).open(deps.db)
@@ -354,12 +417,59 @@ function confirmReservation(turn, at, deps = {}) {
 
 // ---------- delivery ----------
 
+// The `command` column is a 500-character display copy, so a long command with
+// `&& git push` at the end loses exactly the part the release carve-out exists to
+// see. The tool_use row's `text` is the full input, so parse that and normalize
+// it; the column is only a fallback for a row too long even for `text`.
 function turnCommands(turn, deps = {}) {
+  const steps = requireSteps();
+  const out = [];
+  let rows = [];
   try {
     const handle = (deps.turnIndex || require('./turn-index.js')).open(deps.db);
-    return handle.prepare("SELECT command FROM messages WHERE turn_id = ? AND command IS NOT NULL AND command != ''")
-      .all(turn.id).map((row) => row.command);
+    rows = handle.prepare(
+      "SELECT text, command FROM messages WHERE turn_id = ? AND kind = 'tool_use'",
+    ).all(turn.id);
   } catch { return []; }
+  for (const row of rows) {
+    const found = commandsFromToolInput(row.text, steps);
+    if (found.length) { out.push(...found); continue; }
+    // Parsed, but it runs nothing — a Read, an Edit, a Write.
+    if (parsedToolInput(row.text)) continue;
+    // Not a shell tool, so there is no command in it to judge either way.
+    if (!row.command) continue;
+    // A shell row whose JSON does not parse is a truncated one: the index kept
+    // the first couple of kilobytes and dropped the rest — which is exactly
+    // where a trailing `&& git push` sits. Neither copy can clear this turn, so
+    // nothing does.
+    out.push(row.command, UNREADABLE_COMMAND);
+  }
+  return out;
+}
+
+function parsedToolInput(text) {
+  if (typeof text !== 'string' || !text) return null;
+  try {
+    const value = JSON.parse(text);
+    return value && typeof value === 'object' ? value : null;
+  } catch { return null; }
+}
+
+// Codex spells a tool's arguments as a JSON string inside the call, and its shell
+// tools spell the command itself as an argv array under `command` or `cmd`.
+function commandsFromToolInput(text, steps) {
+  let input = parsedToolInput(text);
+  if (!input) return [];
+  if (typeof input.arguments === 'string') input = parsedToolInput(input.arguments) || input;
+  else if (input.arguments && typeof input.arguments === 'object') input = input.arguments;
+  const value = input.command !== undefined ? input.command : input.cmd;
+  if (value === undefined || value === null) return [];
+  if (!steps) return typeof value === 'string' ? [value] : [];
+  try {
+    const found = steps.normalizedCommandsFromArgv(value);
+    if (found.length) return found;
+  } catch {}
+  return typeof value === 'string' ? [value] : [];
 }
 
 function markDelivered(turn, at, deps = {}) {
@@ -496,6 +606,7 @@ module.exports = {
   TYPES, DEFAULTS, DELIVERY_PREFIX, RISKY_QUESTION_RE, SESSION_WINDOW_MS, HOUR_MS,
   configFile, loadConfig, saveConfig, normalizeConfig, liveTypes, describeConfig,
   graduationCheck, decisionTypeFor, safeDeliveryText, turnText, assistantMessages, cardFor,
+  sweepReservations, RESERVATION_TTL_MS, UNREADABLE_COMMAND,
   pausedCarveOut, riskyQuestionCarveOut, cardCarveOut, releaseCarveOut, chainCarveOut, carveOut,
   freshness, sessionReady, rateLimit, reserve, releaseReservation, confirmReservation, revalidate,
   turnCommands, markDelivered, maybeDeliver,

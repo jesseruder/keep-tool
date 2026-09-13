@@ -1548,6 +1548,20 @@ function chunkForTyping(text, max) {
   return chunks;
 }
 
+// Escape clears a non-empty Claude/Codex input box. Only ever called when the
+// message was typed and confirmed on screen, so the box is not empty and this
+// cannot be the Escape that opens rewind.
+async function discardTypedDraft(target, deps = {}) {
+  try {
+    await pressTargetKey(target, 'Escape', deps);
+    return true;
+  } catch (error) {
+    const write = deps.stderr || process.stderr.write.bind(process.stderr);
+    write(`keep serve: could not clear an aborted draft on pane ${(target && target.pane) || 'unknown'}: ${String((error && error.message) || error)}\n`);
+    return false;
+  }
+}
+
 async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
   const read = deps.readScreen || ((t, lines, scrollback) => readScreen(t, lines, scrollback, deps));
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
@@ -1573,7 +1587,21 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
       screenTail: screenTail(confirmation),
     });
   }
-  if (deps.beforeEnter) await deps.beforeEnter();
+  if (deps.beforeEnter) {
+    try {
+      await deps.beforeEnter(target);
+    } catch (error) {
+      // The text is in the box and Enter has not been pressed. An abort here has
+      // to leave the session as it was found, so clear the draft before the
+      // refusal goes out; a draft nobody typed is worse than no message at all.
+      const cleared = await discardTypedDraft(target, deps);
+      deps.deliveryTrace?.('enter-aborted', { cleared });
+      if (!cleared && error && typeof error === 'object') {
+        error.draftLeftOnScreen = true;
+      }
+      throw error;
+    }
+  }
   deps.deliveryTrace?.('enter-start');
   await pressTargetKey(target, 'Enter', deps);
   deps.deliveryTrace?.('enter-sent');
@@ -3649,6 +3677,27 @@ async function sendToSession(body, targetHint, opts, deps = {}) {
   const session = (deps.loadCurrentSession || loadCurrentSession)(body.sessionId);
   const target = claimInjectionTarget(await resolveSessionTarget(session, body.pane ? { expectedPane: body.pane } : targetHint, deps));
   return (deps.sendToResolvedTarget || sendToResolvedTarget)(session, target, text, opts, deps);
+}
+
+// The watcher's transport: the only way a verdict becomes keystrokes. The same
+// precondition is checked three times inside the injection lock — on entering it,
+// again after the pane precheck and immediately before the first character, and
+// once more after the typing is confirmed and before Enter. Resolving a target
+// and typing 200 characters at a time is not instant, so a switch turned off, a
+// session that moved on, or a human who started typing in between has to stop
+// this at whichever of the three it reaches — and typeAndSubmit clears the draft
+// when the abort lands after the text is already in the box.
+function watcherSend({ sessionId, pane, text, precondition }, deps = {}) {
+  const lock = deps.withInjectionLock || withInjectionLock;
+  const send = deps.sendToSession || sendToSession;
+  return lock(async () => {
+    const guard = async () => {
+      const movedOn = precondition ? await precondition() : null;
+      if (movedOn) throw new InjectionError(409, movedOn);
+    };
+    await guard();
+    return send({ sessionId, pane, text }, undefined, { beforeType: guard }, { ...(deps.sendDeps || {}), beforeEnter: guard });
+  }, { session: sessionId, pane, model: modelCommandText(text) });
 }
 
 // A typed /model rewrites settings.json, which a running compaction restores
@@ -7127,6 +7176,9 @@ function start(deps = {}) {
     watcherRunning = true;
     try {
       const live = require('./watcher-live.js');
+      // Reservations whose send never happened stop counting after five minutes;
+      // this is what stops the table growing a row per crash forever.
+      live.sweepReservations();
       // The snapshot the dashboard just built: whether the session is mid-turn,
       // has a question on screen, or has exited is exactly what decides delivery.
       // A stale snapshot would be deciding from a session that has moved on, so
@@ -7146,11 +7198,7 @@ function start(deps = {}) {
           // The precondition runs inside the injection lock, immediately before
           // the characters are typed: the mutex is the only place where "nothing
           // has changed" can still be true when the keystrokes land.
-          send: ({ sessionId, pane, text, precondition }) => withInjectionLock(async () => {
-            const movedOn = precondition ? await precondition() : null;
-            if (movedOn) throw new Error(movedOn);
-            return sendToSession({ sessionId, pane, text });
-          }, { session: sessionId, pane, model: modelCommandText(text) }),
+          send: (payload) => watcherSend(payload),
         }),
       });
       health.record('watcher', {
@@ -7901,6 +7949,8 @@ module.exports = {
   writeTarget,
   pressTargetKey,
   typeAndSubmit,
+  discardTypedDraft,
+  watcherSend,
   resolveSessionTarget,
   resolveSessionId, screenSession, screenHistorySession, sendSessionKeys, shellPaneTarget, stripTerminalAnsi, writeToShellPane,
   agentProcessRows, liveSessionPids, liveSessionTick, restorePlan,
