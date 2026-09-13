@@ -6722,10 +6722,14 @@ function start(deps = {}) {
   });
   dashboardPublisher = createDashboardPublisher({
     prepare: async () => {
+      // Fence before every source read. A mutation that completes while panes,
+      // review launch state, or companion jobs are being collected invalidates
+      // this running pass and forces a follow-up carrying the newer fence.
+      const capturedMutationFence = mutationFence();
       const panes = await listHostPanes(deps);
       await reviewQueue.reconcile({ inspectLaunch: (active) => inspectReviewQueueLaunch(active) });
       const companion = await companionSnapshot(deps);
-      return { hostPanes: panes, companion, mutationFence: mutationFence() };
+      return { hostPanes: panes, companion, mutationFence: capturedMutationFence };
     },
     build: async (input) => ({
       state: await dashboardBuild(input),

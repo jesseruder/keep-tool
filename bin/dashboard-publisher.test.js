@@ -66,3 +66,32 @@ test('an invalidation during a running build queues only one follow-up refresh',
     assert.ok(publications[1].version > publications[0].version);
   } finally { publisher.close(); }
 });
+
+test('a mutation during source collection publishes the old fence before a forced fresh pass', async () => {
+  let fence = 'epoch:0';
+  let releaseFirstPrepare;
+  let prepares = 0;
+  const publications = [];
+  const publisher = createDashboardPublisher({
+    warmup: false, debounceMs: 0, cadenceMs: 60e3,
+    prepare: async () => {
+      const capturedFence = fence;
+      prepares += 1;
+      if (prepares === 1) await new Promise((resolve) => { releaseFirstPrepare = resolve; });
+      return { mutationFence: capturedFence };
+    },
+    build: async (input) => ({
+      state: { generatedAt: Date.now() }, portableTransfers: [], mutationFence: input.mutationFence,
+    }),
+    publish: (value) => publications.push(value),
+  });
+  try {
+    publisher.invalidate();
+    while (!releaseFirstPrepare) await tick();
+    fence = 'epoch:1';
+    publisher.invalidate();
+    releaseFirstPrepare();
+    while (publications.length < 2) await tick();
+    assert.deepEqual(publications.map((value) => value.mutationFence), ['epoch:0', 'epoch:1']);
+  } finally { publisher.close(); }
+});
