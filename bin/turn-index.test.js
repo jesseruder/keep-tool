@@ -910,6 +910,85 @@ test('a forced re-ingest keeps the verdicts on turns that did not move', (t) => 
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM turn_verdicts_kept').get().n, 0);
 });
 
+test('a verdict is dropped when the assistant side of its turn changed', (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, `${SESSION}.jsonl`);
+  const at = (m, s) => new Date(Date.UTC(2026, 8, 12, 0, m, s)).toISOString();
+  const conversation = (answer) => [
+    { type: 'user', sessionId: SESSION, cwd: '/tmp/demo-project', timestamp: at(0, 0),
+      message: { role: 'user', content: 'which cap should we use' } },
+    { type: 'assistant', sessionId: SESSION, cwd: '/tmp/demo-project', timestamp: at(0, 5),
+      message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: answer }] } },
+  ];
+  fs.writeFileSync(file, jsonl(conversation('I would put the cap on the reader.')));
+  assert.equal(turnIndex.ingestFile(file, { agent: 'claude' }).ok, true);
+
+  const db = turnIndex.open();
+  const judge = () => db.prepare(`UPDATE turns SET verdict = 'continue', verdict_message = 'yes, do that',
+      state_line = 'proposed the reader cap', verdict_at = 5000, decision_id = 'd-1' WHERE session_id = ?`).run(SESSION);
+  judge();
+  db.prepare("UPDATE sessions SET state_line = 'proposed the reader cap', last_verdict = 'continue', last_verdict_at = 5000 WHERE id = ?").run(SESSION);
+
+  // Same opener, different answer: the verdict judged advice that is no longer
+  // what the session said, so it must not be re-attached.
+  fs.writeFileSync(file, jsonl(conversation('Actually the cap belongs on the writer.')));
+  assert.equal(turnIndex.ingestFile(file, { agent: 'claude', force: true }).ok, true);
+
+  const after = turnIndex.turnsForSession(SESSION);
+  assert.equal(after.length, 1);
+  assert.equal(after[0].verdict, null, 'a changed assistant side drops the verdict');
+  assert.equal(after[0].decision_id, null);
+  // And the denormalized session copy stops describing a verdict that is gone.
+  const session = turnIndex.sessionRow(SESSION);
+  assert.equal(session.state_line, null);
+  assert.equal(session.last_verdict, null);
+  assert.equal(session.last_verdict_at, null);
+
+  // An unchanged re-ingest keeps both the verdict and the session copy.
+  judge();
+  db.prepare("UPDATE sessions SET state_line = 'proposed the reader cap', last_verdict = 'continue', last_verdict_at = 5000 WHERE id = ?").run(SESSION);
+  assert.equal(turnIndex.ingestFile(file, { agent: 'claude', force: true }).ok, true);
+  assert.equal(turnIndex.turnsForSession(SESSION)[0].verdict, 'continue');
+  assert.equal(turnIndex.sessionRow(SESSION).state_line, 'proposed the reader cap');
+});
+
+test('a capped re-ingest restores verdicts only once the file is fully read', (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, `${SESSION}.jsonl`);
+  const filler = 'y'.repeat(3000);
+  const records = [];
+  for (let i = 0; i < 12; i += 1) {
+    const at = (s) => new Date(Date.UTC(2026, 8, 12, 0, i, s)).toISOString();
+    records.push({ type: 'user', sessionId: SESSION, cwd: '/tmp/demo-project', timestamp: at(0),
+      message: { role: 'user', content: `task ${i}` } });
+    records.push({ type: 'assistant', sessionId: SESSION, cwd: '/tmp/demo-project', timestamp: at(5),
+      message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: `done ${i}. ${filler}` }] } });
+  }
+  fs.writeFileSync(file, jsonl(records));
+  assert.equal(turnIndex.ingestFile(file, { agent: 'claude' }).ok, true);
+
+  const db = turnIndex.open();
+  db.prepare("UPDATE turns SET verdict = 'quiet', state_line = 'judged', verdict_at = 7000 WHERE session_id = ?").run(SESSION);
+  const judged = db.prepare('SELECT COUNT(*) AS n FROM turns WHERE verdict IS NOT NULL').get().n;
+  assert.equal(judged, 12);
+
+  // Force a re-ingest small enough that it takes several passes.
+  let result = turnIndex.ingestFile(file, { agent: 'claude', force: true, maxBytes: 8 * 1024 });
+  assert.equal(result.partial, true, 'the fixture must need more than one pass');
+  let guard = 0;
+  while (result.partial && (guard += 1) < 200) {
+    // Mid-way, nothing has been restored and the verdicts are still parked.
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM turns WHERE verdict IS NOT NULL').get().n, 0,
+      'a half-built turn is not compared against its parked verdict');
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM turn_verdicts_kept').get().n, 12);
+    result = turnIndex.ingestFile(file, { agent: 'claude', maxBytes: 8 * 1024 });
+  }
+  assert.equal(result.partial, false);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM turns WHERE verdict IS NOT NULL').get().n, 12,
+    'every verdict comes back on the final pass');
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM turn_verdicts_kept').get().n, 0);
+});
+
 test('a verdict is dropped when the turn it described no longer exists', (t) => {
   const dir = tempDir(t);
   const file = path.join(dir, `${SESSION}.jsonl`);

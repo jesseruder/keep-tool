@@ -51,6 +51,18 @@ that changed no row returns `{ skipped: 'lost-race' }` and records nothing —
 recording a decision for a verdict that was never stored is precisely the orphan
 this prevents.
 
+The claim is **not** released by that write. It covers the whole sequence —
+verdict, ledger entry, `decision_id` pointer — because a forced concurrent judge
+claiming in the gap between the verdict and the pointer would have recorded a
+second decision. `judge()` releases it in a `finally`, once the pointer is on.
+
+The ledger is the crash-recovery guard behind that. `decisions.record` with a
+`turn` key returns the **existing unjudged entry** for that turn instead of
+appending, checked under the same lock as the append. So a crash between
+recording and attaching leaves an orphan that the next run adopts rather than
+duplicates. A *judged* entry is never reused: Owner's verdict was about that
+exact message, and a fresh judgment deserves its own row.
+
 **One decision per turn, ever.** The verdict columns are written first, the
 ledger entry second, the `decision_id` pointer last. A crash between the first
 two leaves a turn with a verdict and no decision — which a rerun repairs — rather
@@ -129,6 +141,7 @@ produced, and each one is a test case:
 | `Remaining: none.` / `Remaining: -` / `No next step is required.` | `namesNextStep` — a header with nothing left in it is not a plan |
 | `Only then I realized the fixture was stale.` | `namesNextStep` — past tense is a recollection, not an intention |
 | `I'll be available if you need anything.` | `namesNextStep` — a future-tense auxiliary with no action verb is a sign-off |
+| `I'll check back if you need anything.` / `I'll look forward to your reply.` | `namesNextStep` — politeness borrows the same verbs a plan uses, so sign-off clauses are stripped first |
 | `I made no further changes, as requested.` | `claimsDone` — a denial of having acted is not a claim of being finished |
 | `I changed nothing else outside the requested file.` | `claimsDone` — same |
 | `The test waits until you tell the mock server to respond.` | `explicitPause` — someone else's waiting is not the session's own pause |
@@ -249,13 +262,20 @@ this. Version 5 adds `turns(session_id, verdict_at)`. Version 6 adds
 
 A forced re-ingest or a truncation reset rebuilds a session's turn rows, which
 would otherwise erase every verdict and orphan the ledger decisions pointing at
-them. `turn_verdicts_kept` parks them across the rebuild: a parked verdict comes
-back onto a turn with the **same number and the same opener text**, and is
-dropped otherwise, because a verdict about a turn whose boundaries moved would
-put Owner's decision against text he never saw. A capped re-ingest takes several
-passes, so the restore runs on each one and the leftovers are released only when
-the file is fully read. Prune drops parked verdicts outright — there the session
-is going for good.
+them. `turn_verdicts_kept` parks them across the rebuild. A parked verdict comes back
+only onto a turn with the **same number, the same opener text, and the same
+assistant side** — a SHA-1 of `last_assistant` plus `tool_count`, stored with the
+verdict (schema v7). A verdict judges what the session said and did, so if either
+changed it is a judgment about something else; and a verdict about a turn whose
+boundaries moved would put Owner's decision against text he never saw.
+
+The restore runs **only on the final pass** of a file. A capped re-ingest rebuilds
+a turn's assistant side over several passes, so comparing it half-built would drop
+every verdict for the wrong reason. Whatever does not come back is gone, so the
+session's denormalized `state_line` / `last_verdict` / `last_verdict_at` are
+recomputed from the judged turns that remain — cleared when none do — rather than
+left describing a verdict that no longer exists. Prune drops parked verdicts
+outright: there the session is going for good.
 
 ## Replay
 
@@ -295,6 +315,11 @@ are written against those cases:
    `continue` counts as agreement here **only if the proposed message actually
    carries the approval** (`yes`, `ok`, `go ahead`, `do it`) — a bare "continue"
    does not. Eight of eight inspected misses in the second replay were this shape.
+   When that equivalence grants agreement, the per-verdict table and the confusion
+   matrix count the sample where the *prediction* landed; the original expectation
+   is kept on the sample (flagged `equivalent`) and in the per-rule table. Counting
+   it as `needs-input.correct` while the prediction sat in the `continue` column
+   let `needs-input` precision exceed 1.
 7. **Nudge or affirmative** → `continue`. `isNudge`, plus "ok let's", "go
    ahead", "do it", "proceed", "ship it", "run it", "keep going until…".
    "anything else?" stays a nudge. This is where a nudge lands after a *working*
@@ -303,7 +328,10 @@ are written against those cases:
    Owner actually wrote (after quoted lines are stripped).
 9. **Any other question** → `quiet` (rule `new-question`). With nothing pending,
    Owner asking something is him opening a new topic, not the session failing to
-   unblock itself.
+   unblock itself. A question is asking rather than correcting however many
+   redirect words it happens to contain, so rules 3 and 8 are skipped for one:
+   "why is this not in the docs?" and "instead of JSON, would YAML work?" are
+   questions, not drift.
 10. **Anything else** → `quiet`. A substantive new instruction is Owner working,
     not Owner correcting.
 

@@ -90,16 +90,16 @@ function record({ type, card, session, turn, why, message, reviewer, now = Date.
     throw new DecisionError('--send "<the exact message you would deliver>" is required, so Owner judges the action and not a summary');
   }
   if (card) keep.loadTask(card); // fail loudly on a card that does not exist
+  const turnKey = turn ? clip(turn, 200) : '';
   const entry = {
     id: `d-${now.toString(36)}${Math.random().toString(36).slice(2, 6)}`,
     at: now,
     type,
     card: card || '',
     session: session || '',
-    // Optional, and only the turn watcher sets it: "<session id>#<turn number>",
-    // so a duplicate entry for one turn is detectable after the fact. Older
-    // entries simply do not carry it.
-    ...(turn ? { turn: clip(turn, 200) } : {}),
+    // Optional, and only the turn watcher sets it: "<session id>#<turn number>".
+    // It is also the deduplication key below. Older entries do not carry it.
+    ...(turnKey ? { turn: turnKey } : {}),
     why: reason,
     message: would,
     reviewer: reviewer || '',
@@ -107,8 +107,22 @@ function record({ type, card, session, turn, why, message, reviewer, now = Date.
     verdictAt: null,
     note: '',
   };
-  keep.withLock(() => save([...load(), entry]));
-  return entry;
+  // One entry per turn. The writer's own guard is the index's decision_id, but a
+  // crash between recording here and attaching the pointer there would leave an
+  // orphan that a rerun then duplicated — so the key is checked under the same
+  // lock as the append. A judged entry is never reused: Owner's verdict is about
+  // that exact message, and a fresh judgment deserves its own row.
+  let stored = entry;
+  keep.withLock(() => {
+    const decisions = load();
+    const existing = turnKey
+      ? decisions.find((candidate) => candidate && candidate.turn === turnKey && !candidate.verdict)
+      : null;
+    if (existing) { stored = existing; return; }
+    decisions.push(entry);
+    save(decisions);
+  });
+  return stored;
 }
 
 function judge(id, verdict, note) {

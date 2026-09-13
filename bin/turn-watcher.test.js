@@ -187,6 +187,12 @@ test('the pre-signals reject the false positives the live index produced', () =>
   assert.equal(watcher.namesNextStep("I'll be available if you need anything."), false);
   assert.equal(watcher.namesNextStep("I'll be around."), false);
   assert.equal(watcher.namesNextStep("I'll rerun the suite."), true, 'an action verb still fires');
+  // Politeness borrows the same verbs a plan uses.
+  assert.equal(watcher.namesNextStep("I'll check back if you need anything."), false);
+  assert.equal(watcher.namesNextStep("I'll look forward to your reply."), false);
+  assert.equal(watcher.namesNextStep("Let me know if you want the docs too."), false);
+  assert.equal(watcher.namesNextStep("I'll run the suite. Let me know if you want more."), true,
+    'a real plan survives a sign-off after it');
   // A header whose only item is a dash is an empty header.
   assert.equal(watcher.namesNextStep('Remaining: -'), false);
   assert.equal(watcher.namesNextStep('Remaining: —'), false);
@@ -647,6 +653,73 @@ test('two judges racing on one turn produce one decision and one verdict', async
   assert.equal(row.judging_at, null, 'the claim is released by the write');
 });
 
+test('the claim is held until the decision pointer is on, so a forced racer cannot double it', async (t) => {
+  const dir = sandbox(t);
+  writeCard('kt-gap', { sessions: [{ id: SESSION, agent: 'claude', at: '2026-09-12T00:00' }] });
+  indexTurns(dir, [['go', "Fixed it. Next, I'll run the suite."]]);
+  const turn = watcher.turnFor(SESSION, 1);
+  const decisions = require('./decisions.js');
+  const db = turnIndex.open();
+
+  // The gap that used to exist: the verdict is written, the ledger entry and the
+  // pointer are not yet. A forced concurrent judge must still be locked out.
+  let racer = null;
+  const deps = {
+    invocation: (text) => ({ bin: 'fake', args: [text], options: {}, cleanup: () => {} }),
+    run: async () => ({ code: 0, stdout: '{"verdict":"continue","reason":"first","message":"run the suite","state_line":"first","confidence":0.8}', stderr: '', timedOut: false }),
+    decisions: {
+      record: (entry) => {
+        // Inside the window: verdict written, decision_id not yet attached.
+        assert.equal(db.prepare('SELECT verdict FROM turns WHERE id = ?').get(turn.id).verdict, 'continue');
+        assert.equal(db.prepare('SELECT decision_id FROM turns WHERE id = ?').get(turn.id).decision_id, null);
+        racer = watcher.judge(watcher.turnFor(SESSION, 1), {
+          ...fakeDeps('{"verdict":"quiet","reason":"racer","message":"","state_line":"racer","confidence":0.9}'),
+          force: true,
+        });
+        return decisions.record(entry);
+      },
+    },
+  };
+  const first = await watcher.judge(turn, deps);
+  const second = await racer;
+
+  assert.equal(second.skipped, 'claimed', 'the claim covers the ledger write and the pointer, not just the verdict');
+  assert.equal(decisions.loadSafe().length, 1);
+  const row = db.prepare('SELECT * FROM turns WHERE id = ?').get(turn.id);
+  assert.equal(row.decision_id, first.decisionId);
+  assert.equal(row.judging_at, null, 'and is released once the pointer is on');
+});
+
+test('a crash between the ledger entry and the pointer leaves one decision after a rerun', async (t) => {
+  const dir = sandbox(t);
+  writeCard('kt-crash', { sessions: [{ id: SESSION, agent: 'claude', at: '2026-09-12T00:00' }] });
+  indexTurns(dir, [['go', "Fixed it. Next, I'll run the suite."]]);
+  const turn = watcher.turnFor(SESSION, 1);
+  const decisions = require('./decisions.js');
+  const db = turnIndex.open();
+  const answer = '{"verdict":"continue","reason":"r","message":"run the suite","state_line":"s","confidence":0.5}';
+
+  const first = await watcher.judge(turn, fakeDeps(answer));
+  assert.equal(decisions.loadSafe().length, 1);
+
+  // The crash: the entry is in the ledger, the pointer never landed.
+  db.prepare('UPDATE turns SET decision_id = NULL WHERE id = ?').run(turn.id);
+
+  const repaired = await watcher.judge(watcher.turnFor(SESSION, 1), { ...fakeDeps(answer), force: true });
+  const ledger = decisions.loadSafe();
+  assert.equal(ledger.length, 1, 'the rerun adopts the orphan instead of adding a second');
+  assert.equal(ledger[0].id, first.decisionId);
+  assert.equal(repaired.decisionId, first.decisionId);
+  assert.equal(db.prepare('SELECT decision_id FROM turns WHERE id = ?').get(turn.id).decision_id, first.decisionId);
+
+  // A judged entry is never reused: Owner's verdict was about that message.
+  decisions.judge(first.decisionId, 'agree');
+  db.prepare('UPDATE turns SET decision_id = NULL WHERE id = ?').run(turn.id);
+  const afterVerdict = await watcher.judge(watcher.turnFor(SESSION, 1), { ...fakeDeps(answer), force: true });
+  assert.equal(decisions.loadSafe().length, 2);
+  assert.notEqual(afterVerdict.decisionId, first.decisionId);
+});
+
 test('an expired claim can be retaken, a live one cannot', async (t) => {
   const dir = sandbox(t);
   indexTurns(dir, [['go', "Fixed it. Next, I'll run the suite."]]);
@@ -925,6 +998,16 @@ test('replay ground truth follows the rules in order, one case each', (t) => {
   // 7. Anything else is a new instruction, which is Owner working, not nudging.
   assert.equal(truth(told, 'now write the docs for the new endpoint').expected, 'quiet');
   assert.equal(truth(told, 'add a test for the empty case').expected, 'quiet');
+
+  // A question is asking, not correcting, however many redirect words it holds.
+  for (const text of ['why is this not in the docs?', 'instead of JSON, would YAML work?',
+    "don't we already have a cap for that?"]) {
+    assert.equal(truth(told, text).rule, 'new-question', text);
+    assert.equal(truth(told, text).expected, 'quiet', text);
+  }
+  // The statement forms still read as corrections.
+  assert.equal(truth(told, 'do it instead in staging').rule, 'approval-with-correction');
+  assert.equal(truth(told, "that's not in the docs").rule, 'approval-with-correction');
 });
 
 test('a request only Owner can act on makes the reply an answer, not a nudge', (t) => {
@@ -989,6 +1072,51 @@ test('a nudge after a turn that only recommended is an approval, not a restart',
   assert.equal(watcher.scoreOne(proposed, next, { verdict: 'continue', message: 'continue' }).agreed, false,
     'a bare restart did not carry the approval');
   assert.equal(watcher.scoreOne(proposed, next, { verdict: 'drift', message: 'no' }).agreed, false);
+
+  // Equivalence must not corrupt the verdict table: counting this as
+  // needs-input.correct while the prediction sits in the continue column let
+  // needs-input precision exceed 1.
+  const carried = watcher.scoreOne(proposed, next, { verdict: 'continue', message: 'yes, do that' });
+  assert.equal(carried.expected, 'needs-input', 'the sample still reports what Owner did');
+  assert.equal(carried.scoredExpected, 'continue', 'the tables count it where the prediction landed');
+  assert.equal(carried.equivalent, true);
+  const plain = watcher.scoreOne(proposed, next, { verdict: 'needs-input', message: 'yes, do that' });
+  assert.equal(plain.scoredExpected, 'needs-input');
+  assert.equal(plain.equivalent, false);
+});
+
+test('the verdict table stays internally consistent when equivalence grants agreement', async (t) => {
+  const dir = sandbox(t);
+  // Three zero-tool proposal turns, each followed by an approval: the shape that
+  // used to push needs-input precision above 1.
+  indexTurns(dir, [
+    ['which cap should we use', 'I would put it on the reader.'],
+    ["ok let's do that", 'I would also add a test.'],
+    ["ok let's do that", 'And I would document it.'],
+    ["ok let's do that", 'Done thinking.'],
+  ]);
+  const judge = async (turn) => {
+    const value = { verdict: 'continue', message: 'yes, do that', confidence: 0.8 };
+    watcher.writeVerdict(turn, { ...value, reason: 'r', stateLine: `s${turn.n}`, model: 'fake:replay' }, { replay: true });
+    return value;
+  };
+  const result = await watcher.replay({ sinceMs: 0, limit: 50, judge, save: false });
+  assert.ok(result.total >= 3);
+
+  for (const row of result.rows) {
+    assert.ok(row.correct <= row.predicted, `${row.verdict}: correct ${row.correct} <= predicted ${row.predicted}`);
+    assert.ok(row.correct <= row.expected, `${row.verdict}: correct ${row.correct} <= expected ${row.expected}`);
+    if (row.precision != null) assert.ok(row.precision <= 1, `${row.verdict} precision ${row.precision}`);
+    if (row.recall != null) assert.ok(row.recall <= 1, `${row.verdict} recall ${row.recall}`);
+  }
+  // Every scored sample lands in exactly one confusion cell.
+  const cells = Object.values(result.confusion).reduce(
+    (sum, row) => sum + Object.values(row).reduce((inner, n) => inner + n, 0), 0);
+  assert.equal(cells, result.total);
+  // The samples still say what Owner actually did, and flag the equivalence.
+  assert.ok(result.samples.some((row) => row.expected === 'needs-input' && row.actual === 'continue' && row.equivalent));
+  // The per-rule table keys on the rule, not on the substituted verdict.
+  assert.ok(result.rules.some((row) => row.rule === 'approval'));
 });
 
 test('scoring gives half credit where quiet was the harmless answer', (t) => {

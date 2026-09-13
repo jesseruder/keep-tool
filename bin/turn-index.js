@@ -16,7 +16,7 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 
 // Text caps. Transcripts contain whole files and 100k-line build logs; the index
 // exists to find and count turns, not to be a second copy of the corpus.
@@ -184,6 +184,9 @@ const MIGRATIONS = [
        decision_id TEXT, card_id TEXT, kept_at INTEGER,
        PRIMARY KEY (session_id, n))`,
   ] },
+  // A verdict judges what the session said and did, so the assistant side is
+  // part of the turn's identity for the purpose of keeping one across a rebuild.
+  { version: 7, statements: ['ALTER TABLE turn_verdicts_kept ADD COLUMN shape TEXT'] },
 ];
 
 function migrate(handle) {
@@ -545,35 +548,73 @@ function clearSession(handle, sessionId, { keepVerdicts = false } = {}) {
   statement(handle, 'DELETE FROM turns WHERE session_id = ?').run(sessionId);
 }
 
-function parkVerdicts(handle, sessionId) {
-  const columns = KEPT_VERDICT_COLUMNS.join(', ');
-  statement(handle, `INSERT OR REPLACE INTO turn_verdicts_kept (session_id, n, opener_text, ${columns}, kept_at)
-    SELECT session_id, n, opener_text, ${columns}, ? FROM turns
-    WHERE session_id = ? AND verdict IS NOT NULL`).run(Date.now(), sessionId);
+// The turn's identity for the purpose of keeping a verdict: what the session
+// said and how much it did. A verdict is a judgment about that, so if either
+// changes the judgment no longer applies.
+function turnShape(lastAssistant, toolCount) {
+  return crypto.createHash('sha1')
+    .update(`${lastAssistant == null ? '' : lastAssistant} ${Number(toolCount) || 0}`).digest('hex');
 }
 
-// A parked verdict only comes back onto a turn with the same number AND the same
-// opener text. A different opener at that number means the turn boundaries moved,
-// and a verdict about a turn that no longer exists is worse than no verdict.
+function parkVerdicts(handle, sessionId) {
+  const columns = KEPT_VERDICT_COLUMNS.join(', ');
+  const rows = statement(handle,
+    `SELECT n, opener_text, last_assistant, tool_count, ${columns} FROM turns
+     WHERE session_id = ? AND verdict IS NOT NULL`).all(sessionId);
+  const at = Date.now();
+  for (const row of rows) {
+    statement(handle, `INSERT OR REPLACE INTO turn_verdicts_kept
+      (session_id, n, opener_text, shape, ${columns}, kept_at)
+      VALUES (?, ?, ?, ?, ${KEPT_VERDICT_COLUMNS.map(() => '?').join(', ')}, ?)`).run(
+      sessionId, row.n, row.opener_text, turnShape(row.last_assistant, row.tool_count),
+      ...KEPT_VERDICT_COLUMNS.map((column) => row[column]), at);
+  }
+}
+
+// A parked verdict only comes back onto a turn with the same number, the same
+// opener text AND the same assistant side. Any of those changing means the turn
+// is not the one that was judged, and a verdict about a turn that no longer
+// exists is worse than no verdict.
+//
+// Only ever called on the final pass of a file: a capped re-ingest rebuilds the
+// assistant side over several passes, so a mid-way turn has not finished being
+// itself yet and would fail the comparison for the wrong reason.
 function restoreVerdicts(handle, sessionId) {
   const rows = statement(handle, 'SELECT * FROM turn_verdicts_kept WHERE session_id = ?').all(sessionId);
   if (!rows.length) return 0;
   const assignments = KEPT_VERDICT_COLUMNS.map((column) => `${column} = ?`).join(', ');
   let restored = 0;
   for (const row of rows) {
-    const result = statement(handle, `UPDATE turns SET ${assignments}
-      WHERE session_id = ? AND n = ? AND opener_text IS ?`).run(
-      ...KEPT_VERDICT_COLUMNS.map((column) => row[column]), sessionId, row.n, row.opener_text);
-    if (Number(result.changes)) {
-      restored += 1;
-      statement(handle, 'DELETE FROM turn_verdicts_kept WHERE session_id = ? AND n = ?').run(sessionId, row.n);
-    }
+    const turn = statement(handle,
+      'SELECT id, opener_text, last_assistant, tool_count FROM turns WHERE session_id = ? AND n = ?')
+      .get(sessionId, row.n);
+    if (!turn || turn.opener_text !== row.opener_text) continue;
+    if (turnShape(turn.last_assistant, turn.tool_count) !== row.shape) continue;
+    statement(handle, `UPDATE turns SET ${assignments} WHERE id = ?`)
+      .run(...KEPT_VERDICT_COLUMNS.map((column) => row[column]), turn.id);
+    restored += 1;
   }
   return restored;
 }
 
 function dropParkedVerdicts(handle, sessionId) {
   statement(handle, 'DELETE FROM turn_verdicts_kept WHERE session_id = ?').run(sessionId);
+}
+
+function hasParkedVerdicts(handle, sessionId) {
+  return Boolean(statement(handle, 'SELECT 1 AS hit FROM turn_verdicts_kept WHERE session_id = ? LIMIT 1').get(sessionId));
+}
+
+// The dashboard reads these three columns, so a dropped verdict must not leave
+// them describing a turn that is no longer in the table.
+function refreshSessionVerdictState(handle, sessionId) {
+  const newest = statement(handle,
+    `SELECT state_line, verdict, verdict_at FROM turns
+     WHERE session_id = ? AND verdict IS NOT NULL
+     ORDER BY COALESCE(verdict_at, 0) DESC, n DESC LIMIT 1`).get(sessionId);
+  statement(handle, 'UPDATE sessions SET state_line = ?, last_verdict = ?, last_verdict_at = ? WHERE id = ?')
+    .run(newest ? newest.state_line : null, newest ? newest.verdict : null,
+      newest ? newest.verdict_at : null, sessionId);
 }
 
 function earliest(a, b) {
@@ -1081,12 +1122,15 @@ function applyPass(handle, file, agent, stat, plan) {
     turnIds.forEach((id, index) => refreshTurn(handle, id, {
       ended: context.newTurns[index].ended, stopReason: context.newTurns[index].stopReason,
     }));
-    if (context.sessionId) {
-      // Verdicts parked by a reset come back onto the rebuilt rows. A capped
-      // re-ingest takes several passes, so this runs on each of them and only
-      // gives up the leftovers once the file is fully read.
+    // Verdicts parked by a reset come back onto the rebuilt rows, but only once
+    // the file is fully read: a capped re-ingest rebuilds a turn's assistant side
+    // over several passes, and comparing it half-built would drop every verdict.
+    if (context.sessionId && !partial && hasParkedVerdicts(handle, context.sessionId)) {
       restoreVerdicts(handle, context.sessionId);
-      if (!partial) dropParkedVerdicts(handle, context.sessionId);
+      dropParkedVerdicts(handle, context.sessionId);
+      // Whatever did not come back is gone, so the session's denormalized copy
+      // has to be recomputed from what is actually left.
+      refreshSessionVerdictState(handle, context.sessionId);
     }
 
     statement(handle, `INSERT INTO ingest_state (file, session_id, "offset", size, mtime, seq, open_turn, head_sha, updated_at)

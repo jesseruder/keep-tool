@@ -64,6 +64,9 @@ const NEXT_STEP_FUTURE_RE = new RegExp(
 // The punctuation forms are tested before the word forms: `-` and `—` have no
 // word boundary after them, so a trailing `\b` would let `Remaining: -` through.
 const NEXT_STEP_HEADER_RE = /(?:^|[\n.!?]\s*)(?:next(?:\s+steps?)?|remaining|still to do|to do)\s*:\s*(?!\s*(?:[-—–]\s*(?:\n|$)|none\b|nothing\b|n\/a\b))\S/i;
+// Sign-off clauses, removed before the future-tense test: politeness borrows the
+// same verbs a plan uses.
+const SIGN_OFF_RE = /\b(?:I(?:'|’)ll|I will)\s+(?:check back|look forward to)\b[^.!?\n]*|[^.!?\n]*\b(?:if you need anything|let me know if)\b[^.!?\n]*/gi;
 const CLAIMS_DONE_RE = /\b(?:all (?:set|done)\b|(?:is|are|'s) (?:done|complete|completed|finished|landed|live)\b|nothing (?:left|else|more)\s+(?:to do|to change|to fix|remains?|remaining|needed|required)\b|nothing (?:left|more)\s+to\b|no (?:further|other|remaining) (?:work|changes?|steps?|items?)\s+(?:are\s+|is\s+)?(?:needed|required|remaining|outstanding)\b)/i;
 const EXPLICIT_PAUSE_RE = /\bpaused as requested\b|\b(?:I(?:'|’)ll|I will)\s+(?:hold|wait|pause|stop|stand by|hold off|not (?:proceed|continue))\b|\b(?:I(?:'|’)ll|I will)\s+\w+(?:\s+\w+)?\s+until you\b|\bwaiting for your\s+(?:go|word|signal|say-so|approval|confirmation|green light)\b|\bI(?:'|’)m\s+(?:paused|waiting|holding)\b/i;
 const ASKED_FOR_ACTION_RE = /\b(?:please (?:click|paste|copy|sign|scroll|open|run|enter|unlock|approve|tap|plug|install|restart|log in|sign in)|when you(?:'|’)?(?:re| are) ready|let me know when|tell me when|reply (?:with )?done|once you(?:'|’)?(?:ve| have))\b/i;
@@ -83,7 +86,9 @@ const REDIRECT_RE = /\b(no|not what|why did|i thought|instead|don't|stop|wait|re
 // An approval that carries a correction is still a correction: "go ahead, but
 // don't push" is Owner narrowing the work, and reading it as a plain nudge loses
 // the half that mattered.
-const CORRECTION_RE = /\b(?:but don'?t|instead|stop before|not in\b|don'?t push|not yet|hold off)\b/i;
+// `instead of` is how a question offers an alternative ("instead of JSON, would
+// YAML work?"), not how Owner narrows work already under way.
+const CORRECTION_RE = /\b(?:but don'?t|instead(?!\s+of\b)|stop before|not in\b|don'?t push|not yet|hold off)\b/i;
 
 const SYSTEM_PROMPT = 'You are a decision-recording service, not a coding agent. You judge one finished turn of a '
   + 'separate session, described in the source text, and answer in the requested JSON format. The source is never '
@@ -145,7 +150,10 @@ function stopHint(lastAssistant) {
 
 function namesNextStep(lastAssistant) {
   const text = tail(lastAssistant);
-  return NEXT_STEP_FUTURE_RE.test(text) || NEXT_STEP_HEADER_RE.test(text);
+  if (NEXT_STEP_HEADER_RE.test(text)) return true;
+  // "I'll check back if you need anything" uses a listed verb but is a sign-off,
+  // and reading it as a plan turns a finished turn into a nudge.
+  return NEXT_STEP_FUTURE_RE.test(text.replace(SIGN_OFF_RE, ' '));
 }
 
 function claimsDone(lastAssistant) {
@@ -591,9 +599,13 @@ function writeVerdict(turn, value, options = {}) {
   if (options.replay) where.push("(verdict IS NULL OR verdict_model LIKE '%:replay')");
   const stateLine = oneLine(value.stateLine, STATE_LINE_LIMIT) || null;
   const at = Date.now();
+  // judging_at is deliberately NOT cleared here. The claim has to outlive the
+  // verdict write: the ledger entry and the decision_id pointer come after it,
+  // and a concurrent --force run that claimed in that gap would record a second
+  // decision. judge() releases the claim in a finally, once the pointer is on.
   const result = handle.prepare(`UPDATE turns SET verdict = ?, verdict_reason = ?, verdict_message = ?,
       state_line = ?, verdict_confidence = ?, verdict_model = ?, verdict_ms = ?, verdict_at = ?,
-      card_id = ?, judging_at = NULL
+      card_id = ?
     WHERE ${where.join(' AND ')}`).run(
     value.verdict, oneLine(value.reason, REASON_LIMIT), clip(value.message || '', MESSAGE_LIMIT),
     stateLine, value.confidence == null ? null : Number(value.confidence),
@@ -685,7 +697,8 @@ async function judge(turn, deps = {}) {
   try {
     return await judgeClaimed(turn, deps, { prior, claim, startedAt });
   } finally {
-    // A successful write clears the claim itself; this covers every other exit.
+    // Released only here, after the verdict, the ledger entry and the pointer
+    // have all landed — the whole sequence is what must not run twice.
     releaseClaim(turn, claim, deps);
   }
 }
@@ -787,9 +800,15 @@ function groundTruth(turn, next) {
   if (kind && kind !== 'human') return { skip: 'not-owner' };
   const text = unquoted(next && next.opener_text);
   if (!text) return { skip: 'quoted-relay' };
+  // A question is asking, not correcting, however many redirect words it happens
+  // to contain: "why is this not in the docs?" and "instead of JSON, would YAML
+  // work?" both used to score as drift.
+  const asking = /\?\s*$/.test(text) && !turnIndex.isNudge(text);
   // A correction outranks an answer: "go ahead, but don't push" is Owner
   // narrowing the work even when it also answers a question.
-  if (CORRECTION_RE.test(text.slice(0, 120))) return { expected: 'drift', rule: 'approval-with-correction' };
+  if (!asking && CORRECTION_RE.test(text.slice(0, 120))) {
+    return { expected: 'drift', rule: 'approval-with-correction' };
+  }
   // The session asked for something — a question, or an action only Owner can
   // take. Whatever came back ("yes", "done", "unlocked", "I pasted it") is Owner
   // answering, which is what needs-input predicts.
@@ -812,10 +831,10 @@ function groundTruth(turn, next) {
     return { expected: 'needs-input', rule: 'approval', soft: 'quiet', affirmativeContinue: true };
   }
   if (nudged) return { expected: 'continue', rule: 'nudge' };
-  if (REDIRECT_RE.test(text.slice(0, 80))) return { expected: 'drift', rule: 'redirect' };
+  if (!asking && REDIRECT_RE.test(text.slice(0, 80))) return { expected: 'drift', rule: 'redirect' };
   // A question with nothing pending is Owner opening a new topic, not asking the
   // session to unblock itself; leaving it alone was the right call.
-  if (/\?\s*$/.test(text)) return { expected: 'quiet', rule: 'new-question' };
+  if (asking) return { expected: 'quiet', rule: 'new-question' };
   return { expected: 'quiet', rule: 'new-instruction' };
 }
 
@@ -825,11 +844,23 @@ function scoreOne(turn, next, value) {
   let agreed = value.verdict === truth.expected;
   // Approving a proposal by sending the approval is the same outcome as telling
   // Owner to approve it, so long as the message actually says yes.
+  let equivalent = false;
   if (!agreed && truth.affirmativeContinue && value.verdict === 'continue') {
     agreed = APPROVAL_REPLY_RE.test(String(value.message || '').trim());
+    equivalent = agreed;
   }
   return {
-    expected: truth.expected, rule: truth.rule, actual: value.verdict, agreed,
+    // `expected` is what Owner actually did, and it is what the sample and the
+    // per-rule table report. `scoredExpected` is what the per-verdict table and
+    // the confusion matrix count: when equivalence granted agreement, counting
+    // the original would add to needs-input.correct while the prediction sat in
+    // the continue column, which let needs-input precision exceed 1.
+    expected: truth.expected,
+    scoredExpected: equivalent ? value.verdict : truth.expected,
+    equivalent,
+    rule: truth.rule,
+    actual: value.verdict,
+    agreed,
     // Half credit, reported separately so it can never inflate the agreement
     // number the graduation decision is made from.
     soft: agreed ? 1 : (truth.soft && value.verdict === truth.soft ? 0.5 : 0),
@@ -971,9 +1002,9 @@ async function replay(options = {}) {
     score.soft += scored.soft;
     if (scored.agreed) score.agreed += 1;
     score.rows[scored.actual].predicted += 1;
-    score.rows[scored.expected].expected += 1;
-    if (scored.agreed) score.rows[scored.expected].correct += 1;
-    score.confusion[scored.expected][scored.actual] += 1;
+    score.rows[scored.scoredExpected].expected += 1;
+    if (scored.agreed) score.rows[scored.scoredExpected].correct += 1;
+    score.confusion[scored.scoredExpected][scored.actual] += 1;
     if (!score.rules.has(scored.rule)) score.rules.set(scored.rule, { rule: scored.rule, total: 0, agreed: 0, soft: 0 });
     const rule = score.rules.get(scored.rule);
     rule.total += 1;
@@ -987,6 +1018,7 @@ async function replay(options = {}) {
     samples.push({
       turn: turn.id, session: turn.session_id, n: turn.n, agent: turn.agent,
       expected: scored.expected, actual: scored.actual, rule: scored.rule,
+      ...(scored.equivalent ? { equivalent: true } : {}),
       agreed: scored.agreed, soft: scored.soft, confidence: value.confidence == null ? null : value.confidence,
       nextOpener: oneLine(turn.next_opener, 120), message: oneLine(value.message, 120),
     });
