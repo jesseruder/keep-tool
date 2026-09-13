@@ -3457,6 +3457,7 @@ test('an abort between typing and Enter clears the draft instead of submitting i
   const events = [];
   await assert.rejects(typeAndSubmit({ pane: 'p' }, 'continue the migration', (s, t) => s.includes(t), {
     host, sleep: async () => {}, deliveryTrace: (stage, fields) => events.push({ stage, ...fields }),
+    discardDraftOnAbort: true,
     beforeEnter: async (target) => { seen.push(target && target.pane); throw new Error('moved-on: continue was switched off'); },
   }), /moved-on: continue was switched off/);
   assert.deepEqual(seen, ['p'], 'the hook is handed the pane it would type into');

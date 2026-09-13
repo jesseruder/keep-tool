@@ -1591,12 +1591,14 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
     try {
       await deps.beforeEnter(target);
     } catch (error) {
-      // The text is in the box and Enter has not been pressed. An abort here has
-      // to leave the session as it was found, so clear the draft before the
-      // refusal goes out; a draft nobody typed is worse than no message at all.
-      const cleared = await discardTypedDraft(target, deps);
+      // The text is in the box and Enter has not been pressed. Callers that
+      // typed on nobody's behalf (the watcher) ask for the draft to be cleared,
+      // because a draft nobody typed is worse than no message at all. Session
+      // cleanup keeps its typed /exit on screen, as it always has, so Owner can
+      // see what was about to happen.
+      const cleared = deps.discardDraftOnAbort ? await discardTypedDraft(target, deps) : false;
       deps.deliveryTrace?.('enter-aborted', { cleared });
-      if (!cleared && error && typeof error === 'object') {
+      if (deps.discardDraftOnAbort && !cleared && error && typeof error === 'object') {
         error.draftLeftOnScreen = true;
       }
       throw error;
@@ -3696,7 +3698,8 @@ function watcherSend({ sessionId, pane, text, precondition }, deps = {}) {
       if (movedOn) throw new InjectionError(409, movedOn);
     };
     await guard();
-    return send({ sessionId, pane, text }, undefined, { beforeType: guard }, { ...(deps.sendDeps || {}), beforeEnter: guard });
+    return send({ sessionId, pane, text }, undefined, { beforeType: guard },
+      { ...(deps.sendDeps || {}), beforeEnter: guard, discardDraftOnAbort: true });
   }, { session: sessionId, pane, model: modelCommandText(text) });
 }
 
