@@ -319,6 +319,113 @@ test('the answer is parsed out of whatever prose the model wraps it in', () => {
   assert.equal(long.confidence, 1, 'confidence is clamped to 0..1');
 });
 
+test('a continue may only ever say continue or the self-check text', (t) => {
+  sandbox(t);
+  assert.equal(watcher.isAllowedContinueMessage('continue'), true);
+  assert.equal(watcher.isAllowedContinueMessage('  Continue  '), true);
+  assert.equal(watcher.isAllowedContinueMessage(watcher.SELF_CHECK_MESSAGE), true);
+  assert.equal(watcher.isAllowedContinueMessage('go ahead and investigate the frame pauses'), false);
+  assert.equal(watcher.isAllowedContinueMessage(''), false);
+
+  const rule = (verdict, message) => ({ verdict, message, reason: 'r' });
+  const model = (message) => ({ verdict: 'continue', message, reason: 'model reason', confidence: 0.9 });
+
+  // The rules also said continue, so the rules' own message stands in.
+  const substituted = watcher.normalizeContinue(model('go ahead and investigate the 25-61ms frame pauses'),
+    rule('continue', 'continue'));
+  assert.equal(substituted.verdict, 'continue');
+  assert.equal(substituted.message, 'continue');
+  assert.match(substituted.reason, /\[message normalized\]/);
+
+  const selfCheck = watcher.normalizeContinue(model('can you dig into that 53ms offset'),
+    rule('continue', watcher.SELF_CHECK_MESSAGE));
+  assert.equal(selfCheck.message, watcher.SELF_CHECK_MESSAGE);
+
+  // The rules said nothing was needed, so the model was proposing work. That is
+  // a question for Owner, never a message to the session.
+  const downgraded = watcher.normalizeContinue(model('yes, start building that prototype'), rule('quiet', ''));
+  assert.equal(downgraded.verdict, 'needs-input');
+  assert.equal(downgraded.message, 'yes, start building that prototype', 'kept as the proposed reply');
+  assert.match(downgraded.reason, /\[invented task; downgraded to a proposal\]/);
+
+  // An already-legal continue is untouched, and other verdicts are never touched.
+  const legal = model('continue');
+  assert.equal(watcher.normalizeContinue(legal, rule('quiet', '')), legal);
+  const drift = { verdict: 'drift', message: 'no, revert that', reason: 'r' };
+  assert.equal(watcher.normalizeContinue(drift, rule('quiet', '')), drift);
+});
+
+test('an invented task never survives judging, whatever the model says', async (t) => {
+  const dir = sandbox(t);
+  writeCard('kt-invent', { sessions: [{ id: SESSION, agent: 'claude', at: '2026-09-12T00:00' }] });
+  // Two turns: one where the rules agree work is pending, one where they do not.
+  indexTurns(dir, [
+    ['fix the parser', "Fixed. Next, I'll run the suite."],
+    ['which is faster', 'Both are similar; the reader cap is simpler.'],
+  ]);
+  const recorded = [];
+  const decisions = { record: (entry) => { recorded.push(entry); return { id: `d-${recorded.length}` }; } };
+  const invented = '{"verdict":"continue","reason":"model reason","message":"go ahead and investigate the 25-61ms frame pauses","state_line":"s","confidence":0.9}';
+
+  const named = await watcher.judge(watcher.turnFor(SESSION, 1), fakeDeps(invented, { decisions }));
+  assert.equal(named.verdict, 'continue');
+  assert.equal(named.message, 'continue', 'the invented task is replaced by the rules message');
+  assert.equal(recorded[0].message, 'continue');
+
+  const proposal = await watcher.judge(watcher.turnFor(SESSION, 2), fakeDeps(invented, { decisions }));
+  assert.equal(proposal.verdict, 'needs-input', 'nothing was pending, so this is a proposal for Owner');
+  assert.equal(proposal.message, 'go ahead and investigate the 25-61ms frame pauses');
+  assert.equal(recorded[1].type, 'answer');
+
+  // The stored rows carry the invariant too.
+  const rows = turnIndex.open()
+    .prepare("SELECT verdict, verdict_message FROM turns WHERE verdict = 'continue'").all();
+  assert.equal(rows.every((row) => watcher.isAllowedContinueMessage(row.verdict_message)), true);
+});
+
+test('a request only Owner can act on is a rule-level needs-input too', (t) => {
+  sandbox(t);
+  const signals = watcher.signalsFor({ last_assistant: 'Please unlock the phone so adb can see it.', session_id: SESSION }, null);
+  assert.equal(signals.askedForAction, true);
+  assert.equal(signals.askedQuestion, false, 'proseRequest does not see this one');
+  assert.equal(watcher.ruleVerdict(signals).verdict, 'needs-input');
+
+  // A card grant can preauthorize an action the session wants to take; it cannot
+  // unlock a phone, so this rule is not gated on preauthorization.
+  assert.equal(watcher.ruleVerdict({ ...signals, preauthorized: true }).verdict, 'needs-input');
+  // An ordinary turn is unaffected.
+  const plain = watcher.signalsFor({ last_assistant: "Fixed it. Next, I'll run the suite.", session_id: SESSION }, null);
+  assert.equal(plain.askedForAction, false);
+  assert.equal(watcher.ruleVerdict(plain).verdict, 'continue');
+});
+
+test('the prompt hash travels with every number it produced', async (t) => {
+  const dir = sandbox(t);
+  assert.match(watcher.PROMPT_HASH, /^[0-9a-f]{8}$/);
+  assert.equal(watcher.watcherModelTag(), `${watcher.watcherModel()}@${watcher.PROMPT_HASH}`);
+
+  indexTurns(dir, [['a', "Fixed. Next, I'll run the suite."], ['continue', 'Done.']]);
+  await watcher.judge(watcher.turnFor(SESSION, 1), fakeDeps(
+    '{"verdict":"continue","reason":"r","message":"continue","state_line":"s","confidence":0.8}',
+    { decisions: { record: () => ({ id: 'd-1' }) } },
+  ));
+  const row = turnIndex.open().prepare('SELECT verdict_model FROM turns WHERE verdict IS NOT NULL').get();
+  assert.equal(row.verdict_model, watcher.watcherModelTag());
+  // The replay suffix still parses, so replay/live separation is unaffected.
+  assert.equal(`${watcher.watcherModelTag()}:replay`.endsWith(':replay'), true);
+
+  const judge = async (turn) => {
+    const value = { verdict: 'quiet', message: '', confidence: 0.5 };
+    watcher.writeVerdict(turn, { ...value, reason: 'r', stateLine: 's', model: `${watcher.watcherModelTag()}:replay` }, { replay: true });
+    return value;
+  };
+  const result = await watcher.replay({ sinceMs: 0, limit: 10, judge });
+  assert.equal(result.promptHash, watcher.PROMPT_HASH);
+  assert.equal(result.model, watcher.watcherModel());
+  const saved = JSON.parse(fs.readFileSync(result.savedTo, 'utf8'));
+  assert.equal(saved.promptHash, watcher.PROMPT_HASH, 'and is persisted with the scoreboard');
+});
+
 test('a failing model retries once and then falls back to the rules', async (t) => {
   const dir = sandbox(t);
   indexTurns(dir, [['do the thing', "Done. Next, I'll write the docs."]]);
@@ -350,13 +457,13 @@ test('judge writes the verdict, records a shadow decision, and sends nothing', a
   const turn = watcher.turnFor(SESSION, 1);
 
   const recorded = [];
-  const deps = fakeDeps('{"verdict":"continue","reason":"it named the next step","message":"run the suite","state_line":"fixed the parser; running the suite next","confidence":0.82}', {
+  const deps = fakeDeps('{"verdict":"continue","reason":"it named the next step","message":"continue","state_line":"fixed the parser; running the suite next","confidence":0.82}', {
     decisions: { record: (entry) => { recorded.push(entry); return { id: 'd-abc' }; } },
   });
   const result = await watcher.judge(turn, deps);
 
   assert.equal(result.verdict, 'continue');
-  assert.equal(result.message, 'run the suite');
+  assert.equal(result.message, 'continue');
   assert.equal(result.decisionId, 'd-abc');
   assert.equal(deps.run.calls.length, 1);
 
@@ -365,14 +472,14 @@ test('judge writes the verdict, records a shadow decision, and sends nothing', a
   assert.equal(recorded[0].card, 'kt-judge');
   assert.equal(recorded[0].session, SESSION);
   assert.equal(recorded[0].reviewer, 'watcher');
-  assert.equal(recorded[0].message, 'run the suite', 'the ledger carries the verbatim message, not a summary');
+  assert.equal(recorded[0].message, 'continue', 'the ledger carries the verbatim message, not a summary');
 
   const row = turnIndex.open().prepare('SELECT * FROM turns WHERE id = ?').get(turn.id);
   assert.equal(row.verdict, 'continue');
-  assert.equal(row.verdict_message, 'run the suite');
+  assert.equal(row.verdict_message, 'continue');
   assert.equal(row.state_line, 'fixed the parser; running the suite next');
   assert.equal(row.verdict_confidence, 0.82);
-  assert.equal(row.verdict_model, watcher.watcherModel());
+  assert.equal(row.verdict_model, watcher.watcherModelTag());
   assert.equal(row.decision_id, 'd-abc');
   assert.equal(row.card_id, 'kt-judge');
   assert.ok(Number.isFinite(row.verdict_at));
@@ -391,7 +498,7 @@ test('each verdict maps to the decision type it belongs to, and quiet records no
   ]);
 
   const cases = [
-    ['continue', 'run it', 'continue'],
+    ['continue', 'continue', 'continue'],
     ['needs-input', 'yes, go ahead', 'answer'],
     ['needs-input', '', 'escalate'],
     ['drift', "no, that's the wrong table", 'drift'],
@@ -523,7 +630,7 @@ test('a live verdict is never overwritten by the daemon or by a replay', async (
   const row = turnIndex.open().prepare('SELECT * FROM turns WHERE id = ?').get(turn.id);
   assert.equal(row.verdict, 'continue');
   assert.equal(row.state_line, 'live state');
-  assert.equal(row.verdict_model, watcher.watcherModel());
+  assert.equal(row.verdict_model, watcher.watcherModelTag());
   assert.equal(row.decision_id, 'd-live', 'and the decision pointer is never blanked');
 
   // An earlier replay verdict, by contrast, is fair game to re-run.

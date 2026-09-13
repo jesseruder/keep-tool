@@ -102,6 +102,16 @@ const INSTRUCTION = [
   'Answer with ONE JSON object and nothing else:',
   '{"verdict":"continue|needs-input|drift|quiet","reason":"<=200 chars","message":"the exact text Owner would type, empty string for quiet","state_line":"<=120 chars, present tense: what the session just did and its next step","confidence":0..1}',
   '',
+  // Ahead of the definitions on purpose. The third replay round showed the model
+  // inventing work inside continue messages ("go ahead and investigate the
+  // 25-61ms frame pauses") on turns where Owner had asked for nothing. That is
+  // the one class that must never reach live delivery, so the constraint on the
+  // message comes before the model has decided anything.
+  'Before anything else:',
+  `- A \`continue\` message is either exactly \`continue\` (the session named its own next step and stopped) or the fixed self-check text (the session reported the requested work complete). It never names a task the session did not name itself. If you would have to invent the next task, the verdict is quiet or needs-input, not continue. The fixed self-check text is: ${SELF_CHECK_MESSAGE}`,
+  '- Quiet is the default when the turn ends without a question, an explicit offer (`should I…`, `want me to…`, `I can also…`, `say the word and I\'ll…`), or a completion report. An opinion or recommendation given in answer to Owner\'s question is not an offer.',
+  '- If SIGNALS include claimsDone, or the turn states the requested work is finished, landed, or done, the verdict is continue with the self-check message and confidence at least 0.7, unless the turn itself shows pushed commits, a Keep check-in, and a reproduced verification, in which case quiet.',
+  '',
   'What each verdict means:',
   '- continue: the session stopped with work still obviously in front of it — it named its own next step, or claimed to be done in a way worth checking. `message` is what Owner would type to restart it.',
   '- needs-input: only Owner can unblock this — a secret, a physical device, a first-of-its-kind production write, a deliberate pause, or a real question of preference. If the answer is already obvious from the card or the turn, put that answer in `message`; otherwise leave `message` empty.',
@@ -109,8 +119,6 @@ const INSTRUCTION = [
   '- quiet: nothing to do — the session is mid-work, it is waiting on a scheduled check, or the turn was answering a question Owner had just asked.',
   '',
   'Rules:',
-  '- A completion report — the session says it is done, landed, or finished, and names no next step — is `continue` with the self-check message, unless the turn already shows pushed commits, a Keep check-in, and a verification that reproduced the original symptom; in that case it is `quiet`.',
-  '- A turn that only answers Owner\'s question, with no proposal and no next action, is `quiet`. A turn that ends with a recommendation, an offer ("I can also…", "want me to…", "should I…"), or a numbered plan is never `quiet`: it is `needs-input` with the reply you would give (usually "yes, do that") when the proposed action is reversible and inside the card\'s scope; `continue` when the session already named its own next step and no approval is needed; `needs-input` with an empty message when only Owner can decide.',
   '- Set confidence honestly. A `continue` below 0.7 will never be sent, so a low number costs nothing and an inflated one costs trust.',
   '- A deterministic rule pass already ran; its answer is given as RULE VERDICT. Agree with it unless the evidence says otherwise, and if you disagree your `reason` must say what the rule missed.',
   '- `message` is delivered verbatim if Owner approves it, so write it the way Owner types: lowercase, imperative, no greeting, no sign-off, no markdown.',
@@ -179,6 +187,7 @@ function signalsFor(turn, card, options = {}) {
   const lastAssistant = turn.last_assistant || '';
   return {
     askedQuestion: askedQuestion(lastAssistant),
+    askedForAction: askedForAction(lastAssistant),
     stopHint: stopHint(lastAssistant),
     namesNextStep: namesNextStep(lastAssistant),
     claimsDone: claimsDone(lastAssistant),
@@ -194,6 +203,11 @@ function signalsFor(turn, card, options = {}) {
 function ruleVerdict(signals) {
   if (signals.askedQuestion && !signals.preauthorized) {
     return { verdict: 'needs-input', reason: 'the turn ends on a question for Owner', message: '' };
+  }
+  // A card grant can preauthorize an action the session wants to take; it cannot
+  // unlock a phone or paste a token, so this one is not gated on it.
+  if (signals.askedForAction) {
+    return { verdict: 'needs-input', reason: 'the turn asks Owner to do something only he can do', message: '' };
   }
   if (signals.explicitPause) {
     return { verdict: 'needs-input', reason: 'the session says it is paused until Owner says otherwise', message: '' };
@@ -398,6 +412,15 @@ function watcherModel(env = process.env) {
   return env.KEEP_WATCHER_MODEL || DEFAULT_MODEL;
 }
 
+// Which prompt produced a number. Every replay round so far changed the prompt,
+// and comparing scoreboards across rounds without knowing that is how a prompt
+// regression hides behind a model change.
+const PROMPT_HASH = crypto.createHash('sha1').update(`${SYSTEM_PROMPT}\n${INSTRUCTION}`).digest('hex').slice(0, 8);
+
+function watcherModelTag(env = process.env) {
+  return `${watcherModel(env)}@${PROMPT_HASH}`;
+}
+
 // Same isolation as summarize.js: a configured automation account, no tools, no
 // MCP, no session persistence, no slash commands, and a scratch working
 // directory so the model cannot see this repository.
@@ -525,6 +548,35 @@ function parseVerdict(stdout) {
   };
 }
 
+// The only two things a `continue` may ever say. Everything else is the watcher
+// inventing work for a session that did not ask for any.
+function isAllowedContinueMessage(message) {
+  const text = String(message == null ? '' : message).trim();
+  return text.toLowerCase() === 'continue' || text === SELF_CHECK_MESSAGE;
+}
+
+// The prompt forbids an invented task; this makes it true even when the model
+// ignores the prompt, because "go ahead and investigate the 25-61ms frame
+// pauses" is the one class that must never be deliverable. If the rules also
+// said continue, the rules' own message stands in; otherwise the model was
+// proposing something, so it becomes a proposal for Owner instead of a message
+// to the session.
+function normalizeContinue(value, rule) {
+  if (!value || value.verdict !== 'continue' || isAllowedContinueMessage(value.message)) return value;
+  if (rule && rule.verdict === 'continue') {
+    return {
+      ...value,
+      message: isAllowedContinueMessage(rule.message) ? rule.message : 'continue',
+      reason: oneLine(`${value.reason} [message normalized]`, REASON_LIMIT),
+    };
+  }
+  return {
+    ...value,
+    verdict: 'needs-input',
+    reason: oneLine(`${value.reason} [invented task; downgraded to a proposal]`, REASON_LIMIT),
+  };
+}
+
 // One retry, then the rule verdict. A watcher that blocks on a flaky model is
 // worse than one that falls back to the rules and says so.
 async function runModel(contextText, deps = {}) {
@@ -541,7 +593,7 @@ async function runModel(contextText, deps = {}) {
     finally { try { invocation.cleanup && invocation.cleanup(); } catch {} }
     if (result && result.code === 0 && !result.timedOut) {
       const parsed = parseVerdict(result.stdout);
-      if (parsed) return { ok: true, value: parsed, model: watcherModel(env) };
+      if (parsed) return { ok: true, value: parsed, model: watcherModelTag(env) };
     }
     why = result && result.timedOut ? 'timed out'
       : result && result.code !== 0 ? `exited ${result.code}` : 'unparseable answer';
@@ -719,6 +771,7 @@ async function judgeClaimed(turn, deps, { prior, claim, startedAt }) {
     value.message = context.rule.message || 'continue';
     value.reason = oneLine(`${value.reason} [message supplied by the rules]`, REASON_LIMIT);
   }
+  value = normalizeContinue(value, context.rule);
   value.ms = Date.now() - startedAt;
   value.cardId = cardId;
   // Replays are scored automatically against what Owner actually typed, so they
@@ -1023,7 +1076,7 @@ async function replay(options = {}) {
       nextOpener: oneLine(turn.next_opener, 120), message: oneLine(value.message, 120),
     });
   }
-  const result = { ...finishScore(score), samples };
+  const result = { ...finishScore(score), model: watcherModel(options.env), promptHash: PROMPT_HASH, samples };
   if (options.save !== false) result.savedTo = saveReplay(result);
   return result;
 }
@@ -1110,6 +1163,7 @@ module.exports = {
   askedQuestion, askedForAction, stopHint, namesNextStep, claimsDone, explicitPause, inProgress, waitingOnCheck,
   signalsFor, ruleVerdict, selectTurns, turnsForReplay, turnFor, buildContext, invocationFor,
   firstJsonObject, parseVerdict, runModel, spawnRunner, judge, writeVerdict, setDecisionId, decisionTypeFor,
+  normalizeContinue, isAllowedContinueMessage, watcherModelTag, PROMPT_HASH,
   tick, enabled, replay, groundTruth, scoreOne, unquoted, confidenceBand, BANDS, BAND_LABELS,
   saveReplay, latestReplay, replayDir, listVerdicts, stateLines, stats, watcherModel,
 };

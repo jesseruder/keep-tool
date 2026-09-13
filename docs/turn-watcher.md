@@ -125,6 +125,7 @@ not decided by prose 3 KB back.
 | signal | what it means |
 | --- | --- |
 | `askedQuestion` | `session-status.proseRequest` — the turn ends on a question or a direct request |
+| `askedForAction` | "please unlock", "let me know when", "reply done", "once you've…" — something only Owner can physically do |
 | `stopHint` | `conversation-intent.stopHint` — `needs-input`, `waiting`, or `unknown` |
 | `namesNextStep` | "next, I…", "I'll now run…", "remaining:", "next step" |
 | `claimsDone` | "all done", "is complete", "nothing left", "no further" |
@@ -159,6 +160,9 @@ or `—` counts as empty; `claimsDone` requires a completion continuation
 The rule chain, most specific first:
 
 1. `askedQuestion && !preauthorized` → **needs-input**
+1b. `askedForAction` → **needs-input**, and deliberately *not* gated on
+   `preauthorized`: a card grant can preauthorize an action the session wants to
+   take, but it cannot unlock a phone or paste a token.
 2. `explicitPause` → **needs-input**
 3. `waitingOnCheck || inProgress || stopHint === 'waiting'` → **quiet** (the
    session handed the next move to the scheduler or to a job it started, not to
@@ -209,6 +213,11 @@ You are reviewing one finished turn of an autonomous coding session and deciding
 Answer with ONE JSON object and nothing else:
 {"verdict":"continue|needs-input|drift|quiet","reason":"<=200 chars","message":"the exact text Owner would type, empty string for quiet","state_line":"<=120 chars, present tense: what the session just did and its next step","confidence":0..1}
 
+Before anything else:
+- A `continue` message is either exactly `continue` (the session named its own next step and stopped) or the fixed self-check text (the session reported the requested work complete). It never names a task the session did not name itself. If you would have to invent the next task, the verdict is quiet or needs-input, not continue. The fixed self-check text is: Before you stop: are all commits pushed, is the card checked in with the next step, did you reproduce the original symptom after the fix, and is anything you listed as remaining actually done? If everything is done, say so in one line.
+- Quiet is the default when the turn ends without a question, an explicit offer (`should I…`, `want me to…`, `I can also…`, `say the word and I'll…`), or a completion report. An opinion or recommendation given in answer to Owner's question is not an offer.
+- If SIGNALS include claimsDone, or the turn states the requested work is finished, landed, or done, the verdict is continue with the self-check message and confidence at least 0.7, unless the turn itself shows pushed commits, a Keep check-in, and a reproduced verification, in which case quiet.
+
 What each verdict means:
 - continue: the session stopped with work still obviously in front of it — it named its own next step, or claimed to be done in a way worth checking. `message` is what Owner would type to restart it.
 - needs-input: only Owner can unblock this — a secret, a physical device, a first-of-its-kind production write, a deliberate pause, or a real question of preference. If the answer is already obvious from the card or the turn, put that answer in `message`; otherwise leave `message` empty.
@@ -216,8 +225,6 @@ What each verdict means:
 - quiet: nothing to do — the session is mid-work, it is waiting on a scheduled check, or the turn was answering a question Owner had just asked.
 
 Rules:
-- A completion report — the session says it is done, landed, or finished, and names no next step — is `continue` with the self-check message, unless the turn already shows pushed commits, a Keep check-in, and a verification that reproduced the original symptom; in that case it is `quiet`.
-- A turn that only answers Owner's question, with no proposal and no next action, is `quiet`. A turn that ends with a recommendation, an offer ("I can also…", "want me to…", "should I…"), or a numbered plan is never `quiet`: it is `needs-input` with the reply you would give (usually "yes, do that") when the proposed action is reversible and inside the card's scope; `continue` when the session already named its own next step and no approval is needed; `needs-input` with an empty message when only Owner can decide.
 - Set confidence honestly. A `continue` below 0.7 will never be sent, so a low number costs nothing and an inflated one costs trust.
 - A deterministic rule pass already ran; its answer is given as RULE VERDICT. Agree with it unless the evidence says otherwise, and if you disagree your `reason` must say what the rule missed.
 - `message` is delivered verbatim if Owner approves it, so write it the way Owner types: lowercase, imperative, no greeting, no sign-off, no markdown.
@@ -232,6 +239,18 @@ failure retries once and then falls back to the rule verdict with
 `model unavailable: <why>` in the reason and `verdict_model` = `rules`.
 Timeout: 120 s.
 
+**A `continue` message is enforced, not merely requested.** It may only ever be
+exactly `continue` or the self-check text. The third replay round showed the
+model inventing work inside continue messages — "go ahead and investigate the
+25-61ms frame pauses", "yes, start building that prototype" — on turns where
+Owner had asked for nothing, and an invented task is the one class that must
+never become deliverable. So after parsing: if the rules also said `continue`,
+their own message stands in and the reason gains `[message normalized]`;
+otherwise the model was proposing work, so the verdict is downgraded to
+`needs-input` with its message kept as the proposed reply and
+`[invented task; downgraded to a proposal]` in the reason. The invariant holds
+whatever the model does with the rule.
+
 A `continue` or `drift` that comes back with an empty `message` borrows the
 deterministic one and says so in the reason (`[message supplied by the rules]`).
 The ledger refuses an acting decision with no message — correctly, since Owner
@@ -243,6 +262,12 @@ whole group gets `SIGTERM`, then `SIGKILL` 5 seconds later, and the promise
 resolves on that escalation whether or not `close` ever arrives. Signalling only
 the leader and then waiting for `close` let a CLI that ignores `SIGTERM` pin a
 concurrency slot for the life of the daemon and leave its helpers running.
+
+`verdict_model` carries the prompt as well as the model —
+`claude-sonnet-5@<8 hex>`, the SHA-1 of the system prompt plus the instruction —
+and each replay scoreboard records the same `promptHash`. Every replay round so
+far changed the prompt, and comparing scoreboards across rounds without knowing
+that is how a prompt regression hides behind a model change.
 
 Model: `KEEP_WATCHER_MODEL`, default `claude-sonnet-5`. The automation account is
 `accounts.automationFor('claude', 'watcher')`, which falls back to the default
@@ -344,11 +369,10 @@ scored never costs a verdict. The scoreboard reports `skipped` with its reasons.
 `askedQuestion` is `session-status.proseRequest`, which sees a question or a
 "please provide" but not "please unlock the phone" or "let me know when the
 deploy finishes". Widening it would change attention behaviour for the whole
-fleet, so the watcher keeps its own `askedForAction` signal for the physical asks
-and rule 4 fires on either. `askedForAction` is scorer-local on purpose: it is
-deliberately **not** in `signalsFor` or the rule chain, so the RULE VERDICT the
-model is shown stays identical between replay rounds and the measurement is not
-confounded by a changed prompt.
+fleet, so the watcher keeps its own `askedForAction` signal for the physical
+asks. It was scorer-local while the replay rounds were running, so a changed
+prompt could not confound the measurement; now that they are done it is in
+`signalsFor` and the rule chain as well, and the scorer's rule 4 fires on either.
 
 ### Confidence bands
 
