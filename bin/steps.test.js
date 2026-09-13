@@ -887,3 +887,73 @@ test('a release is read off the argv, never off an argv joined into a string', (
   assert.deepEqual(steps.stripGitGlobals(['-C', '/tmp', 'push']), ['push']);
   assert.deepEqual(steps.commandTokens('git pu\\\nsh'), ['git', 'push']);
 });
+
+test('a shell running a script file names the script, and the awkward spellings land right', () => {
+  const steps = require('./steps.js');
+  const verdict = (value) => {
+    const found = steps.releaseOf(value);
+    return found.push ? 'push' : found.commit ? 'commit' : 'none';
+  };
+  const commands = (value) => steps.releaseOf(value).commands;
+
+  // A shell with no -c is running a file, and that file is the command. Deploy
+  // fingerprints are written against exactly that path, so a shell that swallows
+  // it makes every one of them miss.
+  assert.deepEqual(commands('bash ./run_android.sh'), ['./run_android.sh']);
+  assert.deepEqual(commands('sh deploy.sh'), ['deploy.sh']);
+  assert.deepEqual(commands(['bash', './run_android.sh']), ['./run_android.sh']);
+  assert.deepEqual(commands(['bash', '-l', 'deploy.sh', 'prod']), ['deploy.sh prod']);
+  assert.deepEqual(commands('bash -lc "./run_android.sh --release"'), ['./run_android.sh --release']);
+  // And the executable keeps the path it was written with, for the same reason.
+  assert.deepEqual(commands('/usr/local/bin/heroku pipelines:promote -a app'),
+    ['/usr/local/bin/heroku pipelines:promote -a app']);
+
+  // A `c` anywhere in a flag group still means "the script is an argument".
+  for (const flags of ['-ce', '-xc', '-lce', '-lc', '-c']) {
+    assert.equal(verdict(['bash', flags, 'git push']), 'push', flags);
+  }
+  assert.equal(steps.shellScriptArgument(['bash', '-xc', 'git push']), 'git push');
+  assert.deepEqual(steps.shellFileArgument(['bash', '-l', 'deploy.sh', 'prod']), ['deploy.sh', 'prod']);
+  assert.equal(steps.shellFileArgument(['bash', '-lc', 'git push']), null);
+
+  // `env -S` hands env a string to split, so the command is inside it.
+  assert.equal(verdict(['env', '-S', 'git push']), 'push');
+  assert.equal(verdict(['env', '--split-string=git push']), 'push');
+  assert.equal(verdict('env -S "git push"'), 'push');
+  assert.equal(verdict(['env', '-S', 'nice -n 5 git push']), 'push');
+  assert.equal(verdict(['env', '-S', 'echo git push']), 'none');
+
+  // Empty elements are arguments, not absences: dropping one shifts every option
+  // onto the wrong value.
+  assert.equal(verdict(['git', '-C', '', 'push']), 'push');
+  assert.deepEqual(commands(['git', '-C', '', 'push']), ["git -C '' push"]);
+  assert.equal(verdict(['git', '-C', '', 'status']), 'none');
+
+  // git's own inert modes.
+  assert.equal(verdict(['git', '--help', 'push']), 'none');
+  assert.equal(verdict(['git', '--version', 'push']), 'none');
+  assert.equal(verdict('git --help push'), 'none');
+  assert.equal(verdict(['git', '-C', '/tmp', '--help', 'push']), 'none');
+
+  // Option arity on commit: the value of -m is a message, whatever it spells.
+  assert.equal(verdict(['git', 'commit', '-m', '--help']), 'commit');
+  assert.equal(verdict(['git', 'commit', '-m', '--dry-run']), 'commit');
+  assert.equal(verdict(['git', 'commit', '--message', '--dry-run']), 'commit');
+  assert.equal(verdict(['git', 'commit', '--dry-run']), 'none');
+  assert.equal(verdict(['git', 'commit', '--help']), 'none');
+  assert.equal(verdict(['git', 'commit', '-am', 'wip', '--dry-run']), 'none');
+  // And everything after `--` is a path.
+  assert.equal(verdict(['git', 'commit', '-m', 'wip', '--', '--dry-run']), 'commit');
+  assert.equal(steps.commitIsInert(['-m', '--help']), false);
+  assert.equal(steps.commitIsInert(['--', '--help']), false);
+  assert.equal(steps.commitIsInert(['--help']), true);
+
+  // An argv handed straight to execve names a program in its first element. An
+  // empty name, or an assignment, is not the name of any program — though a
+  // shell reading the same words would run one.
+  assert.equal(verdict(['FOO=bar', 'git', 'push']), 'none');
+  assert.equal(verdict(['', 'git', 'push']), 'none');
+  assert.deepEqual(commands(['FOO=bar', 'git', 'push']), []);
+  assert.equal(verdict('FOO=bar git push'), 'push');
+  assert.equal(verdict(['bash', '-lc', 'FOO=bar git push']), 'push');
+});

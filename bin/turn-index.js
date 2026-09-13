@@ -16,7 +16,7 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 12;
 
 // Text caps. Transcripts contain whole files and 100k-line build logs; the index
 // exists to find and count turns, not to be a second copy of the corpus.
@@ -226,6 +226,10 @@ const MIGRATIONS = [
   // so an abort from a previous attempt cannot free the slot a live one is
   // sending under (bin/watcher-live.js).
   { version: 11, statements: ['ALTER TABLE deliveries ADD COLUMN token TEXT'] },
+  // Why an attempt ended without a confirmed send. The row keeps its slot when
+  // that happened after the first character was typed, and this says what
+  // happened (bin/watcher-live.js).
+  { version: 12, statements: ['ALTER TABLE deliveries ADD COLUMN error TEXT'] },
 ];
 
 function migrate(handle) {

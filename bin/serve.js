@@ -1556,29 +1556,84 @@ function chunkForTyping(text, max) {
   return chunks;
 }
 
-// The input box's current draft as plain text: ANSI stripped, every run of
-// whitespace collapsed. A wrapped line, a re-render and the text as it was typed
-// all have to read the same, or "is this still only our message" is unanswerable.
-function draftRegionText(screen, kind) {
+// The bottom of Claude's input box. Its rules span the pane, and the box is the
+// only thing on screen drawn with them below a prompt glyph.
+const BOX_RULE_RE = /^\s*[─━]{3,}/;
+
+// The whole draft, from the prompt glyph that opens the input box down to the
+// rule that closes it — blank lines and further glyphs included, because both
+// are things a person can type into a multi-line draft and neither ends it.
+// Reading only as far as the first blank line is what let
+// `❯ ours` / blank / `theirs` / rule compare as exactly ours.
+//
+// Returns null when the box cannot be read with confidence, which every caller
+// treats as "not ours": refusing is always safe, and clearing or submitting a
+// box this could not parse is not.
+function draftRegionLines(screen, kind) {
   const lines = stripTerminalAnsi(String(screen || '')).split(/\r?\n/);
   const prompt = kind === 'codex' ? /^\s*›(?:\s|$)/ : /^\s*❯(?:\s|$)/;
-  let start = -1;
-  lines.forEach((line, index) => { if (prompt.test(line)) start = index; });
-  if (start < 0) return null;
-  const draft = [lines[start].replace(prompt, '')];
-  for (let i = start + 1; i < lines.length; i += 1) {
-    if (!lines[i].trim() || /^\s*[─━]/.test(lines[i])) break;
-    draft.push(lines[i]);
+  // The bottom of the box, found from the bottom of the screen: the input box is
+  // the last one there, and an echoed prompt above it belongs to a turn that is
+  // already over. Claude closes its box with a rule. Codex has none, so its
+  // composer is read as everything above the last blank-separated block, which is
+  // the status line under it.
+  let end = -1;
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    if (kind !== 'codex' && BOX_RULE_RE.test(lines[i]) && lines.slice(0, i).some((line) => prompt.test(line))) {
+      end = i;
+      break;
+    }
+    if (prompt.test(lines[i])) { end = codexComposerEnd(lines, i, kind); break; }
   }
-  return draft.join(' ').replace(/\s+/g, ' ').trim();
+  if (end === -1) return null;
+  // The top of the box: the *first* glyph line inside it, so a second glyph typed
+  // into a draft is content rather than the start of a new one.
+  let start = -1;
+  for (let i = end - 1; i >= 0; i -= 1) {
+    if (BOX_RULE_RE.test(lines[i])) break;
+    if (prompt.test(lines[i])) start = i;
+  }
+  if (start === -1) return null;
+  const region = lines.slice(start, end);
+  region[0] = region[0].replace(prompt, '');
+  return { lines: region, width: Math.max(0, ...lines.map((line) => line.length)) };
+}
+
+// Where a Codex composer ends: above the last blank-separated block on screen,
+// which is its status line. With no blank line below the glyph there is no status
+// line either, and the composer runs to the bottom.
+function codexComposerEnd(lines, promptLine, kind) {
+  if (kind !== 'codex') return lines.length;
+  for (let i = lines.length - 1; i > promptLine; i -= 1) {
+    if (!lines[i].trim()) return i;
+  }
+  return lines.length;
+}
+
+// The draft as one string. A line the terminal wrapped mid-word has to join
+// back into that word: the pane's width is the widest line on screen, and a line
+// that reached it was cut rather than ended (the host trims trailing spaces, so a
+// line that ended on one is shorter than the pane).
+function draftRegionText(screen, kind) {
+  const region = draftRegionLines(screen, kind);
+  if (!region) return null;
+  let out = '';
+  region.lines.forEach((line, index) => {
+    if (index === 0) { out = line; return; }
+    const previous = region.lines[index - 1];
+    const rendered = index === 1 ? previous.length + 2 : previous.length; // the glyph and its space
+    out += (region.width && rendered >= region.width ? '' : ' ') + line;
+  });
+  return canonicalText(out);
 }
 
 // True only when the box holds exactly the message that was typed and nothing
 // else. Containment is not enough: Owner typing while the watcher types leaves a
-// box that contains our message and says something neither of us meant.
+// box that contains our message and says something neither of us meant. Compared
+// in NFC, because a terminal may echo back the other spelling of the same text.
 function draftIsExactly(screen, text, kind) {
   const draft = draftRegionText(screen, kind);
-  return draft !== null && draft === String(text || '').replace(/\s+/g, ' ').trim();
+  return draft !== null && draft === canonicalText(text);
 }
 
 // Escape clears a non-empty Claude/Codex input box — but only ever *our* draft.
@@ -1602,11 +1657,32 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
   }
   try {
     await pressTargetKey(target, 'Escape', deps);
-    return { cleared: true, reason: null };
   } catch (error) {
     write(`keep serve: could not clear an aborted draft on pane ${pane}: ${String((error && error.message) || error)}\n`);
     return { cleared: false, reason: 'escape failed' };
   }
+  // Escape is a keystroke, not a guarantee. Read the box back: "cleared" is a
+  // claim about the session, so it is only made when the box is actually empty.
+  let after = '';
+  try {
+    after = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false);
+  } catch (error) {
+    write(`keep serve: could not confirm the cleared draft on pane ${pane}: ${String((error && error.message) || error)}\n`);
+    return { cleared: false, reason: 'unconfirmed clear' };
+  }
+  if (draftRegionText(after, kind) !== '') {
+    write(`keep serve: the draft on pane ${pane} is still there after Escape\n`);
+    return { cleared: false, reason: 'still there' };
+  }
+  return { cleared: true, reason: null };
+}
+
+// Marks a failure as one that happened with characters already written to the
+// pane. Read by bin/watcher-live.js, which may only give a delivery slot back
+// when nothing was typed: an unconfirmed send is still a send.
+function typedAlready(error) {
+  if (error && typeof error === 'object') error.typingStarted = true;
+  return error;
 }
 
 async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
@@ -1630,29 +1706,9 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
     deps.deliveryTrace?.('screen-confirmation', { matched: confirmed });
   }
   if (!confirmed) {
-    throw new InjectionError(409, 'message was typed but could not be confirmed; Enter was not pressed', {
+    throw typedAlready(new InjectionError(409, 'message was typed but could not be confirmed; Enter was not pressed', {
       screenTail: screenTail(confirmation),
-    });
-  }
-  // Confirmation above asks whether the typed text is visible; this asks whether
-  // it is the *only* thing in the box. Owner can start typing at any point after
-  // the precheck, and pressing Enter on his half-written line plus our message
-  // sends something neither of us wrote. Callers that type unprompted (the
-  // watcher) demand exactness; a human-initiated send keeps the older, looser
-  // check it has always had.
-  if (deps.requireExactDraft) {
-    let exactScreen = '';
-    try {
-      exactScreen = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false);
-    } catch { exactScreen = ''; }
-    if (!draftIsExactly(exactScreen, text, deps.draftKind)) {
-      deps.deliveryTrace?.('draft-not-exact');
-      // Nothing is pressed and nothing is cleared: the box holds text this did
-      // not write, and touching it is not this code's decision to make.
-      throw new InjectionError(409, 'the input box no longer holds only the typed message; Enter was not pressed', {
-        screenTail: screenTail(exactScreen), draftLeftOnScreen: true,
-      });
-    }
+    }));
   }
   if (deps.beforeEnter) {
     try {
@@ -1671,7 +1727,27 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
         error.draftLeftOnScreen = true;
         error.draftReason = discard.reason;
       }
-      throw error;
+      throw typedAlready(error);
+    }
+  }
+  // Last of all, and deliberately after beforeEnter rather than before it:
+  // confirmation above asks whether the typed text is visible, this asks whether
+  // it is the *only* thing in the box, and every millisecond between the two is
+  // one in which Owner can start typing. Callers that type unprompted (the
+  // watcher) demand exactness; a human-initiated send keeps the older, looser
+  // check it has always had.
+  if (deps.requireExactDraft) {
+    let exactScreen = '';
+    try {
+      exactScreen = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false);
+    } catch { exactScreen = ''; }
+    if (!draftIsExactly(exactScreen, text, deps.draftKind)) {
+      deps.deliveryTrace?.('draft-not-exact');
+      // Nothing is pressed and nothing is cleared: the box holds text this did
+      // not write, and touching it is not this code's decision to make.
+      throw typedAlready(new InjectionError(409, 'the input box no longer holds only the typed message; Enter was not pressed', {
+        screenTail: screenTail(exactScreen), draftLeftOnScreen: true,
+      }));
     }
   }
   deps.deliveryTrace?.('enter-start');
@@ -3660,7 +3736,16 @@ async function observeClaudeMcpMenu(session, target, deps = {}) {
 async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
   claimInjectionTarget(target);
   const pendingDirectory = deps.deliveryDirectory || path.join(keep.ROOT, '.keep', 'delivery');
-  const trace = require('./delivery-trace').recorder(pendingDirectory, session, target.pane);
+  const record = require('./delivery-trace').recorder(pendingDirectory, session, target.pane);
+  // Whether a single character of this message has been written to the pane. A
+  // caller that has to decide "could this have arrived?" cannot tell that from
+  // the message of a failure, and guessing wrong either types twice or silently
+  // spends a slot.
+  let typingStarted = false;
+  const trace = (stage, fields) => {
+    if (stage === 'write-start' || stage === 'enter-start') typingStarted = true;
+    return record(stage, fields);
+  };
   const delivery = require('./delivery');
   const observeMcp = session.kind === 'claude' && text === '/mcp' ? async () => {
     if (!await observeClaudeMcpMenu(session, target, deps)) return false;
@@ -3724,8 +3809,11 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
       },
     });
   } catch (error) {
-    if (error instanceof InjectionError) throw error;
-    throw new InjectionError(409, error.message);
+    const failure = error instanceof InjectionError ? error : new InjectionError(409, error.message);
+    // Read by bin/watcher-live.js: a reservation may only be given back when
+    // nothing was typed.
+    failure.typingStarted = typingStarted || Boolean(error && error.typingStarted);
+    throw failure;
   }
 }
 

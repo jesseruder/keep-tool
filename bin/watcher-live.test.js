@@ -885,31 +885,45 @@ test('a reservation belongs to the attempt that took it', (t) => {
   assert.equal(live.rateLimit(sameSession, config, { now: now + 11 * 60e3 }), null);
 });
 
-test('the release carve-out reads the whole tool input, not the truncated copy', (t) => {
+test('the release carve-out judges the tool input, or refuses to judge at all', (t) => {
   const dir = sandbox(t);
-  // Long enough that the JSON wrapper is dropped, so the command column is the
-  // only copy left — and it has to be a copy of the whole command, tail included.
-  const long = `npm test -- --filter ${'x'.repeat(2400)} && git push`;
+  // Short enough to keep as JSON: judged exactly as it was written.
+  const turn = indexTurn(dir, { tools: [{ name: 'Bash', input: { command: 'npm test && git push', description: 'run the suite' } }] });
+  assert.deepEqual(live.turnCommands(turn), ['npm test && git push']);
+  assert.match(live.releaseCarveOut(live.turnCommands(turn), keepApi, turn), /git commit or push/);
+
+  // Too long, so the JSON wrapper is gone. The command column survives, but for
+  // an argv it is a *joined* copy — and judging a joined argv is what turns an
+  // argument into a command. So a truncated input is not judged: it is refused.
+  const long = `npm test -- --filter ${'x'.repeat(2400)} && echo done`;
   assert.ok(long.length > turnIndex.TOOL_CAP);
-  assert.ok(long.length < turnIndex.COMMAND_CAP);
-  const turn = indexTurn(dir, { tools: [{ name: 'Bash', input: { command: long, description: 'run the suite' } }] });
+  const big = indexTurn(dir, {
+    id: 'trunc111-2222-3333-4444-555555555555',
+    tools: [{ name: 'Bash', input: { command: long, description: 'run the suite' } }],
+  });
   const db = turnIndex.open();
-  const stored = db.prepare("SELECT text, command FROM messages WHERE turn_id = ? AND kind = 'tool_use'").get(turn.id);
-  assert.equal(stored.command, long, 'the command column keeps all of it');
-  assert.equal(stored.text.length, turnIndex.TOOL_CAP, 'while the JSON wrapper was truncated');
+  const stored = db.prepare("SELECT text, command FROM messages WHERE turn_id = ? AND kind = 'tool_use'").get(big.id);
+  assert.equal(stored.text.length, turnIndex.TOOL_CAP, 'the JSON wrapper was truncated');
+  assert.equal(stored.command, long, 'while the column keeps the command itself');
+  assert.deepEqual(live.turnCommands(big), [live.UNREADABLE_COMMAND]);
+  assert.equal(live.releaseCarveOut(live.turnCommands(big), keepApi, big), live.UNREADABLE_REASON);
 
-  const commands = live.turnCommands(turn);
-  assert.deepEqual(commands, [long], 'the command is judged as it was written');
-  assert.equal(commands.includes(live.UNREADABLE_COMMAND), false, 'a truncated wrapper is not an unreadable command');
-  assert.match(live.releaseCarveOut(commands, keepApi, turn), /git commit or push/);
-
-  // A short command beside a very long description is not unreadable either.
+  // A long `description` truncates the wrapper just the same, and is refused for
+  // the same reason: what ran cannot be read back.
   const described = indexTurn(dir, {
     id: 'descr111-2222-3333-4444-555555555555',
     tools: [{ name: 'Bash', input: { command: 'npm test', description: 'w'.repeat(3000) } }],
   });
-  assert.deepEqual(live.turnCommands(described), ['npm test']);
-  assert.equal(live.releaseCarveOut(live.turnCommands(described), keepApi, described), null);
+  assert.deepEqual(live.turnCommands(described), [live.UNREADABLE_COMMAND]);
+  assert.equal(live.releaseCarveOut(live.turnCommands(described), keepApi, described), live.UNREADABLE_REASON);
+
+  // A tool that runs no command at all is not a command that could not be read.
+  const read = indexTurn(dir, {
+    id: 'reads111-2222-3333-4444-555555555555',
+    tools: [{ name: 'Read', input: { file_path: '/tmp/live-project/notes.md' } }],
+  });
+  assert.deepEqual(live.turnCommands(read), []);
+  assert.equal(live.releaseCarveOut(live.turnCommands(read), keepApi, read), null);
 });
 
 test('a command named in an argument is not a command the turn ran', (t) => {
@@ -989,8 +1003,8 @@ test('a Codex argv command is read from the full input, whichever way it is spel
     'the argv is judged as an argv');
   assert.match(live.releaseCarveOut(live.turnCommands(turn), keepApi, turn), /git commit or push/);
 
-  // Too long to keep as JSON: the command column is the copy that is left, and
-  // it still carries the whole script.
+  // Too long to keep as JSON. The column holds the argv *joined* into one string,
+  // which is not what ran and is never judged as if it were.
   const big = '0199eeee-1111-2222-3333-444444444444';
   const bigFile = path.join(dir, `rollout-2026-09-13T02-30-00-${big}.jsonl`);
   fs.writeFileSync(bigFile, rollout([
@@ -999,22 +1013,19 @@ test('a Codex argv command is read from the full input, whichever way it is spel
   ]).replaceAll(id, big));
   assert.equal(turnIndex.ingestFile(bigFile).ok, true);
   const bigTurn = watcher.turnFor(big, 1);
-  assert.deepEqual(live.turnCommands(bigTurn), [long]);
-  assert.match(live.releaseCarveOut(live.turnCommands(bigTurn), keepApi, bigTurn), /git commit or push/);
+  assert.deepEqual(live.turnCommands(bigTurn), [live.UNREADABLE_COMMAND]);
+  assert.equal(live.releaseCarveOut(live.turnCommands(bigTurn), keepApi, bigTurn), live.UNREADABLE_REASON);
 });
 
 test('a tool input too long for the index to record is never cleared', (t) => {
   const dir = sandbox(t);
-  // Past the command cap itself, so the tail — where a trailing push would sit —
-  // is gone from the only copy there is.
+  // Past the command cap as well, so not even the column holds the tail where a
+  // trailing push would sit.
   const huge = `node scripts/build.js --flags ${'z'.repeat(turnIndex.COMMAND_CAP)}`;
   const turn = indexTurn(dir, { tools: [{ name: 'Bash', input: { command: huge } }] });
-  const commands = live.turnCommands(turn);
-  assert.equal(commands.length, 2);
-  assert.equal(commands[0].length, turnIndex.COMMAND_CAP, 'what there is of it');
-  assert.equal(commands[1], live.UNREADABLE_COMMAND);
-  assert.equal(live.releaseCarveOut(commands, keepApi, turn), live.UNREADABLE_REASON);
-  assert.match(live.UNREADABLE_REASON, /command longer than the index records/);
+  assert.deepEqual(live.turnCommands(turn), [live.UNREADABLE_COMMAND]);
+  assert.equal(live.releaseCarveOut(live.turnCommands(turn), keepApi, turn), live.UNREADABLE_REASON);
+  assert.match(live.UNREADABLE_REASON, /could not record in full/);
 });
 
 test('the indexer records a commit only from the call that ran one', (t) => {
@@ -1190,4 +1201,54 @@ test('the message reaches the session as the exact bytes that were approved', as
   assert.equal(send.calls[0].text, `[keep watcher] ${nfd}`, 'byte for byte, including the composition');
   assert.equal(result.text, `[keep watcher] ${nfd}`);
   assert.equal(Buffer.from(send.calls[0].text, 'utf8').length, Buffer.from(`[keep watcher] ${nfd}`, 'utf8').length);
+});
+
+test('a send that may have arrived keeps its slot; one that cannot have gives it back', async (t) => {
+  const dir = sandbox(t);
+  const config = allLive();
+  const rows = () => turnIndex.open().prepare('SELECT turn_id, sent_at, error, token FROM deliveries').all();
+  const base = { config, session: READY_SESSION, card: ACTIVE_CARD };
+
+  // The transport refused before writing a character — the pane was busy, the
+  // switch had flipped. Nothing can have arrived, so the slot goes back and the
+  // turn can be tried again.
+  const early = indexTurn(dir);
+  const refused = await live.maybeDeliver(early, verdict(), {
+    ...base, send: async () => { throw new Error('another sender holds the injection lock'); },
+  });
+  assert.equal(refused.delivered, false);
+  assert.match(refused.reason, /delivery failed: another sender/);
+  assert.equal(refused.reservationKept, false);
+  assert.deepEqual(rows(), [], 'the reservation is gone');
+  assert.equal(live.rateLimit(early, config, {}), null, 'and the turn is free to try again');
+
+  // The transport typed, then lost the receipt. Nobody can prove the message did
+  // not arrive, so the row stays — spent, unsent, and saying why.
+  const typed = indexTurn(dir, { id: 'kept1111-2222-3333-4444-555555555555' });
+  const unconfirmed = await live.maybeDeliver(typed, verdict(), {
+    ...base,
+    send: async () => {
+      const error = new Error('Delivery unconfirmed');
+      error.typingStarted = true;
+      throw error;
+    },
+  });
+  assert.equal(unconfirmed.delivered, false);
+  assert.equal(unconfirmed.typingStarted, true);
+  assert.equal(unconfirmed.reservationKept, true);
+  const kept = rows();
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0].turn_id, typed.id);
+  assert.equal(kept[0].sent_at, null, 'never confirmed');
+  assert.equal(kept[0].error, 'Delivery unconfirmed');
+  assert.match(live.rateLimit(typed, config, {}), /already been delivered/, 'and never tried again');
+
+  // The slot it spent is a real one: the session has had its message for the
+  // next ten minutes, whether or not anyone can prove it.
+  const next = secondTurn(dir, 'kept1111-2222-3333-4444-555555555555');
+  assert.match(live.rateLimit(next, config, {}), /last 10 minutes/);
+
+  // An error recorded under another attempt's token changes nothing.
+  assert.equal(live.recordReservationError(typed, 'someone else', { token: 'not-the-token' }), 0);
+  assert.equal(rows()[0].error, 'Delivery unconfirmed');
 });

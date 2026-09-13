@@ -563,28 +563,50 @@ a `moved-on:` reason and gives the rate-limit slot back.
 to ask only whether the typed text was *visible*; a watcher send asks whether it
 is all that is there. Owner can start typing at any moment after the precheck, and
 Enter on his half-written line plus this message sends something neither of them
-wrote — so the draft region is read back (ANSI stripped, whitespace collapsed) and
-compared for equality. A mismatch refuses without pressing Enter **and without
-pressing anything else**: text this did not write is not this code's to erase.
+wrote — so the draft region is read back and compared for equality. This is the
+**last thing before Enter**, after the precondition hook rather than before it,
+because every millisecond between the two is one he can type in. A mismatch
+refuses without pressing Enter **and without pressing anything else**: text this
+did not write is not this code's to erase.
 
-**An abort after typing clears the draft — only when the draft is still ours.**
-Escape (the dismissal the draft guard uses) goes out when the box holds exactly
-what was typed, which is the ordinary case; if Owner has typed into it since, the
-box is his, the message is left where it is, and the refusal carries
-`draftLeftOnScreen` with the reason `mixed draft`. Clearing is opt-in per caller:
-session cleanup keeps its typed `/exit` on screen, as it always has.
+**The draft region is the whole input box.** From the prompt glyph that opens it
+down to the rule that closes it — blank lines included, and a second `❯` inside
+it is something someone typed rather than the start of a new box. (Reading only
+as far as the first blank line is what let `❯ ours` / blank / `theirs` / rule
+compare as exactly ours.) Codex draws no closing rule, so its composer is read as
+everything above the last blank-separated block, which is the status line under
+it. The text is compared after ANSI stripping, **NFC** (a terminal may echo back
+the other spelling of the same characters) and whitespace collapsing — except
+that a line which filled the pane exactly was *cut*, not ended, so it joins the
+next one with no space and a mid-word wrap still matches. A box that cannot be
+parsed at all is never treated as ours.
+
+**An abort after typing clears the draft — only when the draft is still ours, and
+only if it actually went.** Escape (the dismissal the draft guard uses) goes out
+when the box holds exactly what was typed, which is the ordinary case; then the
+box is read *again*, and "cleared" is claimed only when it is genuinely empty. If
+Owner has typed into it since, the box is his, the message is left where it is,
+and the refusal carries `draftLeftOnScreen` with a reason — `mixed draft`,
+`still there`, `escape failed`, `unreadable screen`. Clearing is opt-in per
+caller: session cleanup keeps its typed `/exit` on screen, as it always has.
 
 **The slot is reserved before the send, not counted.** A `deliveries` row
 (`turn_id` primary key) is claimed inside one `BEGIN IMMEDIATE` alongside the
 rate-limit count, so two daemon workers racing the last slot cannot both decide
 there is room, and every row counts toward both windows whether or not its send
-was ever confirmed. A failed precondition or a failed send gives the row back —
-but only to the attempt that took it: each reservation carries a random token,
-and `releaseReservation` deletes nothing without it, so a slow abort from an
-earlier attempt cannot free the slot a live one is sending under. Nothing else
-reclaims a reservation. If the daemon dies between the Enter and the confirmation
-nobody can tell whether the message landed, and freeing that capacity early is the
-one mistake here that types twice into a live session.
+was ever confirmed. A failure gives the row back only when it
+**provably happened before a character was typed** — the precondition refused, the
+text was unsafe, the session was not ready, the pane was busy. Once any character
+has gone out, an unconfirmed send is still a send: the row stays, `sent_at` stays
+null, and the failure is written to `deliveries.error` as the only record that
+something may have reached that session. Every transport failure carries
+`typingStarted` for exactly this decision, so it is never inferred from the text
+of an error message.
+
+Even a release only ever takes back **its own** row: each reservation carries a
+random token, and `releaseReservation` and `recordReservationError` do nothing
+without it, so a slow abort from an earlier attempt cannot free the slot a live
+one is sending under. Nothing else reclaims a reservation.
 
 ### Carve-outs
 
@@ -614,22 +636,31 @@ sentence is itself longer than the pre-signals' window. Matching happens on the
   **full tool input**, in the shape they were written: a shell string is read as a
   shell string and an argv array as an argv array, because joining an argv back
   into a string is exactly what makes `["printf","%s","example; git push"]` read
-  as a push it never ran. `bin/steps.js` is the one parser — it strips the
-  wrappers with their own option arities (`env -u FOO`, `nice -n 5`,
-  `sudo -u root`, `timeout 60`, `nohup`, `command`, `exec`), takes the script of a
-  `sh -c` from the *first* argument after the `-c` (the ones after it are `$0` and
-  positionals), reads git's subcommand past its global options (`-C`, `-c`,
-  `--git-dir=`), joins a backslash-newline inside a word, and knows that
-  `git commit --dry-run` writes nothing. So `/usr/bin/git push`, `git pu\sh`,
-  `git "push"`, `env -i git push`, `bash -lc "git push" label` and
-  `npm test && git push` are all the same push, while `rg "git commit" README.md`
-  and `["git","commit --help"]` are not one — in both the Claude and Codex
+  as a push it never ran. `bin/steps.js` is the one parser. It strips the
+  wrappers with their own option arities (`env -i`, `env -u FOO`, `nice -n 5`,
+  `sudo -u root`, `timeout 60`, `nohup`, `command`, `exec`) and splits the string
+  of an `env -S`; takes the script of a `sh -c` from the *first* argument after
+  the flag — any flag group with a `c` in it, so `-lc`, `-ce` and `-xc` all count
+  — since the arguments after it are `$0` and positionals; treats a shell with no
+  `-c` as running the script *file* it names, which is the command a deploy
+  fingerprint is written against; reads git's subcommand past its global options
+  (`-C`, `-c`, `--git-dir=`) and honours `git commit`'s own option arity, so
+  `-m --help` is a message and everything after `--` is a path; keeps empty argv
+  elements as the arguments they are (`["git","-C","","push"]` is a push); joins a
+  backslash-newline inside a word; and knows that `git commit --dry-run`,
+  `git commit --help`, `git --help …` and `git --version …` all write nothing. An
+  argv handed straight to execve names a program in its first element, so an empty
+  one — or an assignment, which only a shell would read — is not a command at all.
+  So `/usr/bin/git push`, `git pu\sh`, `git "push"`, `env -i git push`,
+  `bash -lc "git push" label` and `npm test && git push` are all the same push,
+  while `rg "git commit" README.md`, `["git","commit --help"]` and
+  `["printf","%s","example; git push"]` are not — in both the Claude and Codex
   spellings (`command`/`cmd`, string or argv, `arguments` as an object or as a
   JSON string). The same parser decides commit provenance in the index and in the
-  Stop hook. A command longer than the 4 KiB the index records cannot be cleared
-  at all: the dropped tail is where a trailing push would sit, so the turn is
-  carved out on that alone (a long `description` beside a short command is not
-  that, and does not carve anything out);
+  Stop hook. **An input the index could not record in full is never judged from
+  the `command` column**, which flattens an argv into a string: a joined argv is
+  what turns an argument into a command, so a truncated input carves the turn out
+  instead (`the turn ran a command the index could not record in full`);
 - the turn was opened by an automated message (`keep` opener). **One delivered
   message must be answered by a human before another can be sent**, or a
   `continue` would produce an ended turn that the watcher continues again,

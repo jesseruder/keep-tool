@@ -109,15 +109,16 @@ Three paths feed it:
 
 ## Schema
 
-`PRAGMA user_version` carries the schema version (currently 11). Each entry in
+`PRAGMA user_version` carries the schema version (currently 12). Each entry in
 `MIGRATIONS` brings the database from version n-1 to n and runs exactly once, so
 a fresh database is built by running all of them in order and an existing one
 only runs what it is missing. Version 2 adds `ingest_state.head_sha`; existing
 rows acquire a fingerprint on their next pass rather than being re-ingested.
 Version 3 adds the `sessions(cwd)` index the project cache reads. Versions 4-8
 are the watcher's verdict columns, its claim and the denormalized session state
-(see `docs/turn-watcher.md`); 9-11 are the live delivery path's `delivered_at`,
-its `deliveries` table, and the ownership token on a reservation.
+(see `docs/turn-watcher.md`); 9-12 are the live delivery path's `delivered_at`,
+its `deliveries` table, and the ownership token and failure note on a
+reservation.
 
 ### `sessions`
 
@@ -182,10 +183,11 @@ One row per text block, tool call, or tool result, with `UNIQUE(session_id, seq)
   results and serialized tool inputs.
 - `files` is a JSON array extracted from `Edit`/`Write`/`Read`/`MultiEdit`/
   `NotebookEdit` inputs, from `apply_patch` bodies, and from obvious path tokens
-  in shell commands. `command` holds a shell tool's command up to 4 KiB — the
-  whole command, not a preview of one, because it is the copy the watcher's
-  release carve-out falls back to when the serialized input was truncated, and a
-  `&& git push` 600 characters in is exactly what a preview drops. `stop_reason`, `tokens_in`, and `tokens_out` come from the Claude
+  in shell commands. `command` holds a shell tool's command up to 4 KiB. It is a
+  flattened copy — an argv array is joined into it — so it is what `keep turns
+  show` prints and what commit provenance falls back to, and never what decides
+  whether a turn released something: that reads the serialized input itself, or
+  refuses (see "Carve-outs" in `docs/turn-watcher.md`). `stop_reason`, `tokens_in`, and `tokens_out` come from the Claude
   assistant record they were parsed from and sit on its first row.
 
 ### `turns`

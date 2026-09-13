@@ -185,25 +185,39 @@ const WRAPPERS = new Set([...Object.keys(WRAPPER_VALUE_FLAGS), 'nohup', 'time', 
 // Wrappers that take a positional argument of their own before the command.
 const WRAPPER_POSITIONALS = { timeout: 1 };
 
-function stripCommandWrappers(input) {
+// `env -S "<string>"` hands the string to env to split as a shell word list, so
+// the command is inside it rather than after it.
+const ENV_SPLIT_RE = /^(?:-S|--split-string)(?:=(.*))?$/s;
+
+function stripCommandWrappers(input, { fromShell = true } = {}) {
   let tokens = Array.isArray(input) ? input.slice().map((token) => String(token == null ? '' : token))
     : commandTokens(input);
   for (let guard = 0; guard < 8 && tokens.length; guard += 1) {
-    // `FOO=bar git push` runs a push with an assignment in front of it.
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) { tokens = tokens.slice(1); continue; }
+    // `FOO=bar git push` runs a push with an assignment in front of it — but only
+    // a shell reads it that way. Handed straight to execve, `FOO=bar` is the name
+    // of a program, and there is no such program.
+    if (fromShell && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) { tokens = tokens.slice(1); continue; }
     const head = commandBasename(tokens[0]);
     if (!WRAPPERS.has(head)) break;
     const values = WRAPPER_VALUE_FLAGS[head] || new Set();
     let rest = tokens.slice(1);
+    let split = null;
     while (rest.length) {
       const token = rest[0];
       if (token === '--') { rest = rest.slice(1); break; }
       if (head === 'env' && /^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) { rest = rest.slice(1); continue; }
       if (!/^-./.test(token)) break;
+      const envSplit = head === 'env' ? ENV_SPLIT_RE.exec(token) : null;
       rest = rest.slice(1);
+      if (envSplit) {
+        if (envSplit[1] !== undefined) split = envSplit[1];
+        else if (rest.length) { split = rest[0]; rest = rest.slice(1); }
+        continue;
+      }
       if (token.includes('=')) continue; // --unset=FOO carries its own value
       if (values.has(token) && rest.length) rest = rest.slice(1);
     }
+    if (split !== null) { tokens = [...commandTokens(split), ...rest]; continue; }
     for (let i = 0; i < (WRAPPER_POSITIONALS[head] || 0) && rest.length; i += 1) rest = rest.slice(1);
     // A wrapper with nothing after it runs nothing; keep what was there.
     if (!rest.length) break;
@@ -215,6 +229,10 @@ function stripCommandWrappers(input) {
 // `bash -lc "git push" label` runs the script and passes `label` as $0, so the
 // script is the FIRST argument after the -c, not the last. A shell with no -c is
 // running a file this cannot read, which is not a release anything can see.
+// A `c` anywhere in a short-flag group means the script comes as an argument:
+// `-lc`, `-ce`, `-xc` and `-lce` are all `sh -c` with other switches along.
+const SHELL_C_FLAG_RE = /^-[a-z]*c[a-z]*$/i;
+
 function shellScriptArgument(tokens) {
   let seenC = false;
   let afterDash = false;
@@ -227,7 +245,22 @@ function shellScriptArgument(tokens) {
     }
     if (token === '--') return null;
     if (!/^-./.test(token)) return null;
-    if (/^-[a-z]*c$/i.test(token)) { seenC = true; continue; }
+    if (SHELL_C_FLAG_RE.test(token)) { seenC = true; continue; }
+  }
+  return null;
+}
+
+// A shell with no `-c` is running a file. That file is the command — the deploy
+// fingerprints are written against exactly that path (`./run_android.sh`), and a
+// shell that hides it makes them all miss.
+function shellFileArgument(tokens) {
+  for (let i = 1; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (token === '--') return tokens.slice(i + 1).length ? tokens.slice(i + 1) : null;
+    // A -c takes an inline script instead; that is shellScriptArgument's answer,
+    // not this one's.
+    if (SHELL_C_FLAG_RE.test(token)) return null;
+    if (!/^-./.test(token)) return tokens.slice(i);
   }
   return null;
 }
@@ -235,6 +268,27 @@ function shellScriptArgument(tokens) {
 // git's own global options, which sit before the subcommand.
 const GIT_GLOBAL_VALUE_FLAGS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace',
   '--exec-path', '--config-env', '--super-prefix']);
+// `git --help push` prints a manual page and `git --version push` prints a
+// version; neither pushes anything.
+const GIT_INERT_GLOBAL_RE = /^(?:--help|-h|--version)$/;
+// The options `git commit` takes a separate value for. Without the arity,
+// `git commit -m --help` reads as a commit that was only asking for help.
+const COMMIT_VALUE_FLAGS = new Set(['-m', '--message', '-F', '--file', '-C', '--reuse-message',
+  '-c', '--reedit-message', '--author', '--date', '--cleanup', '--fixup', '--squash',
+  '-t', '--template', '--trailer', '--pathspec-from-file']);
+
+// True when this `git commit` writes nothing: asked for help, or a dry run.
+// Everything after `--` is a path, whatever it looks like.
+function commitIsInert(args) {
+  for (let i = 0; i < args.length; i += 1) {
+    const token = args[i];
+    if (token === '--') return false;
+    if (!/^-./.test(token)) continue;
+    if (token === '--dry-run' || token === '--help' || token === '-h') return true;
+    if (!token.includes('=') && COMMIT_VALUE_FLAGS.has(token)) i += 1;
+  }
+  return false;
+}
 
 function stripGitGlobals(argv) {
   let tokens = argv.slice();
@@ -264,27 +318,41 @@ const NO_RELEASE = Object.freeze({ push: false, commit: false, commands: Object.
 // normalized command strings inside it (for the deploy fingerprints, which are
 // written as strings). Recurses into `sh -c "…"` and into every segment of a
 // shell string, so a chained or wrapped release is the same release.
-function releaseFromArgv(argv, depth = 0) {
-  if (depth > 4) return { push: false, commit: false, commands: [] };
+function releaseFromArgv(argv, depth = 0, fromShell = false) {
+  const none = { push: false, commit: false, commands: [] };
+  if (depth > 4) return none;
   if (typeof argv === 'string') return releaseFromCommand(argv, depth);
-  if (!Array.isArray(argv) || !argv.length) return { push: false, commit: false, commands: [] };
-  const raw = argv.map((token) => String(token == null ? '' : token)).filter((token) => token !== '');
-  const tokens = stripCommandWrappers(raw);
-  if (!tokens.length) return { push: false, commit: false, commands: [] };
+  if (!Array.isArray(argv) || !argv.length) return none;
+  // Empty elements are positional arguments, not absences: `["git","-C","","push"]`
+  // is a push of the working directory. Dropping them would shift every option
+  // onto the wrong value.
+  const raw = argv.map((token) => String(token == null ? '' : token));
+  // An argv handed straight to execve names a program in its first element. An
+  // empty name, or an assignment, is not the name of any program.
+  if (!fromShell && (raw[0] === '' || /^[A-Za-z_][A-Za-z0-9_]*=/.test(raw[0]))) return none;
+  const tokens = stripCommandWrappers(raw, { fromShell });
+  if (!tokens.length || tokens[0] === '') return none;
   const head = commandBasename(tokens[0]);
   if (SHELL_BASENAMES.has(head)) {
     const script = shellScriptArgument(tokens);
-    return script === null ? { push: false, commit: false, commands: [] } : releaseFromCommand(script, depth + 1);
+    if (script !== null) return releaseFromCommand(script, depth + 1);
+    const invoked = shellFileArgument(tokens);
+    return invoked && invoked.length ? { push: false, commit: false, commands: [quoteArgv(invoked)] } : none;
   }
-  const command = quoteArgv([head, ...tokens.slice(1)]);
+  // The executable is kept as it was written, path and all: a deploy step's
+  // fingerprint may be `./run_android.sh`, which a basename would never match.
+  // The basename decides what this *is*; the literal text is what it reads as.
+  const command = quoteArgv(tokens);
   if (head !== 'git') return { push: false, commit: false, commands: [command] };
-  const rest = stripGitGlobals(tokens.slice(1));
+  const args = tokens.slice(1);
+  const rest = stripGitGlobals(args);
+  if (args.slice(0, args.length - rest.length).some((token) => GIT_INERT_GLOBAL_RE.test(token))) {
+    return { push: false, commit: false, commands: [command] };
+  }
   const sub = rest[0];
-  // `git commit --dry-run` writes nothing, and `git commit --help` is a manual
-  // page. A push is left alone: over-reading one only holds a message back.
-  const inert = rest.slice(1).some((token) => token === '--dry-run' || token === '--help' || token === '-h');
+  // A push is left alone: over-reading one only holds a message back.
   if (sub === 'push') return { push: true, commit: false, commands: [command] };
-  if (sub === 'commit') return { push: false, commit: !inert, commands: [command] };
+  if (sub === 'commit') return { push: false, commit: !commitIsInert(rest.slice(1)), commands: [command] };
   return { push: false, commit: false, commands: [command] };
 }
 
@@ -295,7 +363,7 @@ function releaseFromCommand(command, depth = 0) {
   for (const segment of commandSegments(command)) {
     const tokens = commandTokens(segment.text);
     if (!tokens.length) continue;
-    const found = releaseFromArgv(tokens, depth + 1);
+    const found = releaseFromArgv(tokens, depth + 1, true);
     out.push = out.push || found.push;
     out.commit = out.commit || found.commit;
     out.commands.push(...found.commands);
@@ -306,7 +374,7 @@ function releaseFromCommand(command, depth = 0) {
 // Either spelling — Claude writes a shell string, Codex an argv array.
 function releaseOf(value) {
   if (value == null) return NO_RELEASE;
-  return Array.isArray(value) ? releaseFromArgv(value) : releaseFromCommand(String(value));
+  return Array.isArray(value) ? releaseFromArgv(value, 0, false) : releaseFromCommand(String(value));
 }
 
 // True when the value, however spelled, actually runs one of these — as an
@@ -821,6 +889,8 @@ module.exports = {
   commandBasename,
   stripCommandWrappers,
   shellScriptArgument,
+  shellFileArgument,
+  commitIsInert,
   stripGitGlobals,
   quoteArgv,
   releaseFromArgv,

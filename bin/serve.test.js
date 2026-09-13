@@ -3463,13 +3463,17 @@ function draftHarness(screen) {
 }
 
 const MESSAGE = '[keep watcher] continue the migration';
-const BOX = (draft) => `───────────────────────────\n❯ ${draft}\n───────────────────────────`;
+const RULE = '─'.repeat(46);
+const BOX = (...draft) => [RULE, `❯ ${draft[0]}`, ...draft.slice(1), RULE, '? for shortcuts'].join('\n');
+// Escape empties a real input box, so a harness whose box never empties is a
+// harness that cannot tell "cleared" from "still there".
+const CLEARABLE = (...draft) => (inputs) => (inputs.includes('\x1b') ? BOX('') : BOX(...draft));
 
 test('an abort after typing clears only a draft that is still ours', async () => {
   // The watcher's precondition is checked once more after the text is in the box.
   // Failing it there must leave the session as it was found: no Enter, and no
   // half-typed message for Owner to discover and delete.
-  const clean = draftHarness(BOX(MESSAGE));
+  const clean = draftHarness(CLEARABLE(MESSAGE));
   await assert.rejects(typeAndSubmit({ pane: 'p' }, MESSAGE, (s, t) => s.includes(t), {
     ...clean.deps, discardDraftOnAbort: true,
     beforeEnter: async (target) => {
@@ -3482,9 +3486,19 @@ test('an abort after typing clears only a draft that is still ours', async () =>
   assert.ok(clean.events.some((e) => e.stage === 'enter-aborted' && e.cleared === true));
   assert.equal(clean.events.some((e) => e.stage === 'enter-sent'), false);
 
+  // Escape is a keystroke, not a guarantee: a box that still holds the draft
+  // afterwards is not a cleared box, whatever was pressed.
+  const stubborn = draftHarness(BOX(MESSAGE));
+  const stuck = await typeAndSubmit({ pane: 'p' }, MESSAGE, (s, t) => s.includes(t), {
+    ...stubborn.deps, discardDraftOnAbort: true,
+    beforeEnter: async () => { throw new Error('moved-on: mid-turn'); },
+  }).then(() => null, (e) => e);
+  assert.equal(stuck.draftLeftOnScreen, true);
+  assert.equal(stuck.draftReason, 'still there');
+
   // Owner started typing into the same box. Escape would erase his words too, so
   // the box is not touched at all and the refusal says so.
-  const mixed = draftHarness(BOX(`${MESSAGE} and also check the migration`));
+  const mixed = draftHarness(CLEARABLE(`${MESSAGE} and also check the migration`));
   const error = await typeAndSubmit({ pane: 'p' }, MESSAGE, (s, t) => s.includes(t), {
     ...mixed.deps, discardDraftOnAbort: true,
     beforeEnter: async () => { throw new Error('moved-on: a question is on screen'); },
@@ -3496,9 +3510,20 @@ test('an abort after typing clears only a draft that is still ours', async () =>
   assert.equal(mixed.inputs.includes('\r'), false);
   assert.ok(mixed.events.some((e) => e.stage === 'enter-aborted' && e.cleared === false && e.reason === 'mixed draft'));
 
+  // The same, with his line below a blank one. Reading only to the first blank
+  // line is what used to make this box look like exactly ours.
+  const multiline = draftHarness(CLEARABLE(MESSAGE, '', 'and also check the migration'));
+  const buried = await typeAndSubmit({ pane: 'p' }, MESSAGE, (s, t) => s.includes(t), {
+    ...multiline.deps, discardDraftOnAbort: true, requireExactDraft: true,
+    beforeEnter: async () => { throw new Error('moved-on: a question is on screen'); },
+  }).then(() => null, (e) => e);
+  assert.equal(buried.draftReason, 'mixed draft');
+  assert.equal(multiline.inputs.includes('\x1b'), false);
+  assert.equal(multiline.inputs.includes('\r'), false, 'and Enter is not pressed');
+
   // A caller that did not ask for the draft to be cleared still never gets one
   // cleared: session cleanup keeps its typed /exit on screen.
-  const kept = draftHarness(BOX(MESSAGE));
+  const kept = draftHarness(CLEARABLE(MESSAGE));
   await assert.rejects(typeAndSubmit({ pane: 'p' }, MESSAGE, (s, t) => s.includes(t), {
     ...kept.deps, beforeEnter: async () => { throw new Error('moved-on: mid-turn'); },
   }), /mid-turn/);
@@ -3517,23 +3542,39 @@ test('a box holding more than the typed message is not submitted', async () => {
   // Owner types while the watcher types, it is visible and the line reads as
   // something neither of them wrote — so exactness is what decides, not
   // containment, and a mismatch touches nothing at all.
-  const mixed = draftHarness(BOX(`${MESSAGE} rm -rf build`));
-  const error = await typeAndSubmit({ pane: 'p' }, MESSAGE, (s, t) => s.includes(t), {
-    ...mixed.deps, requireExactDraft: true, discardDraftOnAbort: true,
-    beforeEnter: async () => { throw new Error('the hook should never be reached'); },
-  }).then(() => null, (e) => e);
-  assert.match(error.message, /no longer holds only the typed message/);
-  assert.equal(error.status, 409);
-  assert.equal(mixed.inputs.includes('\r'), false, 'Enter is never pressed');
-  assert.equal(mixed.inputs.includes('\x1b'), false, 'and nothing is erased either');
-  assert.ok(mixed.events.some((e) => e.stage === 'draft-not-exact'));
+  for (const draft of [
+    [`${MESSAGE} rm -rf build`],
+    [MESSAGE, '', 'rm -rf build'],
+    [MESSAGE, 'rm -rf build'],
+    ['rm -rf build', `❯ ${MESSAGE}`],
+  ]) {
+    const mixed = draftHarness(BOX(...draft));
+    let reached = false;
+    const error = await typeAndSubmit({ pane: 'p' }, MESSAGE, (s, t) => s.includes(t), {
+      ...mixed.deps, requireExactDraft: true, discardDraftOnAbort: true,
+      beforeEnter: async () => { reached = true; },
+    }).then(() => null, (e) => e);
+    assert.match(error.message, /no longer holds only the typed message/, JSON.stringify(draft));
+    assert.equal(error.status, 409);
+    assert.equal(reached, true, 'the check is the last thing before Enter, not the first');
+    assert.equal(mixed.inputs.includes('\r'), false, 'Enter is never pressed');
+    assert.equal(mixed.inputs.includes('\x1b'), false, 'and nothing is erased either');
+    assert.ok(mixed.events.some((e) => e.stage === 'draft-not-exact'));
+  }
 
-  // Wrapped across lines, re-indented, or re-rendered is still exactly ours.
-  const wrapped = draftHarness(`───────────\n❯ [keep watcher] continue\n   the migration\n───────────`);
-  await typeAndSubmit({ pane: 'p' }, MESSAGE, (s, t) => s.includes(t.slice(0, 10)), {
+  // Wrapped across lines is still exactly ours — including a wrap that lands
+  // mid-word, which the pane renders with no space to join on.
+  const { draftRegionText } = require('./serve');
+  const wrapped = draftHarness(BOX('[keep watcher] conti', 'nue the migration'));
+  assert.equal(draftRegionText(BOX('[keep watcher] conti', 'nue the migration'), 'claude'),
+    '[keep watcher] conti nue the migration', 'a short line ended where it says it did');
+  const full = `❯ ${MESSAGE}`.padEnd(RULE.length, 'x');
+  const midWord = [RULE, full, 'and then some', RULE].join('\n');
+  assert.equal(draftRegionText(midWord, 'claude'), `${full.replace(/^❯ /, '')}and then some`,
+    'a line that filled the pane was cut, not ended');
+  await assert.rejects(typeAndSubmit({ pane: 'p' }, MESSAGE, (s, t) => s.includes(t.slice(0, 10)), {
     ...wrapped.deps, requireExactDraft: true,
-  });
-  assert.equal(wrapped.inputs[wrapped.inputs.length - 1], '\r');
+  }), /no longer holds only the typed message/);
 
   // An empty box, or one whose prompt cannot be found, is not ours to submit.
   const gone = draftHarness('the session scrolled away');
@@ -3543,12 +3584,30 @@ test('a box holding more than the typed message is not submitted', async () => {
   assert.equal(gone.inputs.includes('\r'), false);
 });
 
-test('the draft region reads through ANSI, wrapping and the box rules', () => {
+test('the draft region is the whole input box, however it is rendered', () => {
   const { draftRegionText, draftIsExactly } = require('./serve');
+  // Everything between the glyph and the rule, blank lines and all.
   assert.equal(draftRegionText(BOX('hello there'), 'claude'), 'hello there');
-  assert.equal(draftRegionText(`\x1b[2m───\x1b[0m\n❯ \x1b[1mhello\x1b[0m there\n───`, 'claude'), 'hello there');
-  assert.equal(draftRegionText('› ask me anything', 'codex'), 'ask me anything');
+  assert.equal(draftRegionText(BOX('hello', '', 'there'), 'claude'), 'hello there');
+  assert.equal(draftRegionText(BOX('hello', '❯ there'), 'claude'), 'hello ❯ there',
+    'a glyph inside the box is something someone typed, not a new box');
+  assert.equal(draftRegionText(`❯ an old turn\nsome output\n${BOX('hello')}`, 'claude'), 'hello',
+    'and an echoed prompt above the box belongs to a turn that is over');
+  assert.equal(draftRegionText(`\x1b[2m${RULE}\x1b[0m\n❯ \x1b[1mhello\x1b[0m there\n${RULE}`, 'claude'), 'hello there');
+  assert.equal(draftRegionText(BOX(''), 'claude'), '');
   assert.equal(draftRegionText('no prompt here', 'claude'), null);
+
+  // Codex has no rule under its composer; the status line below the last blank
+  // line is what ends it.
+  assert.equal(draftRegionText('› ask me anything', 'codex'), 'ask me anything');
+  assert.equal(draftRegionText('› typed text\n\n  ⏎ send', 'codex'), 'typed text');
+  assert.equal(draftRegionText('› ours\n\ntheirs\n\n  ⏎ send', 'codex'), 'ours theirs');
+
+  // Compared in NFC: a terminal may echo back the other spelling of the same text.
+  const nfd = 'continue on cafe\u0301-menu.tsx';
+  assert.notEqual(nfd, nfd.normalize('NFC'));
+  assert.equal(draftIsExactly(BOX(nfd.normalize('NFC')), nfd, 'claude'), true);
+  assert.equal(draftIsExactly(BOX(nfd), nfd.normalize('NFC'), 'claude'), true);
   assert.equal(draftIsExactly(BOX('hello   there'), 'hello there', 'claude'), true);
   assert.equal(draftIsExactly(BOX('hello there and more'), 'hello there', 'claude'), false);
   assert.equal(draftIsExactly('no prompt here', 'hello there', 'claude'), false);
@@ -6025,4 +6084,29 @@ test('restarting the fleet reviewer keeps its identity, its launch env, and its 
     assert.equal(review.pickReviewer(sessions, { rev: refreshed }, Date.now())?.id, 'rev');
     fs.rmSync(keepRoot, { recursive: true, force: true });
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('every refusal after the first character says so', async () => {
+  // A caller that has to decide whether a message may already have arrived
+  // cannot tell that from the text of a failure.
+  const unconfirmed = draftHarness('the pane shows something else entirely');
+  const blind = await typeAndSubmit({ pane: 'p' }, MESSAGE, () => false, {
+    ...unconfirmed.deps,
+  }).then(() => null, (e) => e);
+  assert.match(blind.message, /could not be confirmed/);
+  assert.equal(blind.typingStarted, true);
+  assert.ok(unconfirmed.inputs.length > 0, 'because the characters did go out');
+
+  const aborted = draftHarness(CLEARABLE(MESSAGE));
+  const late = await typeAndSubmit({ pane: 'p' }, MESSAGE, (s, t) => s.includes(t), {
+    ...aborted.deps, discardDraftOnAbort: true,
+    beforeEnter: async () => { throw new Error('moved-on: continue was switched off'); },
+  }).then(() => null, (e) => e);
+  assert.equal(late.typingStarted, true, 'even when the draft was cleared again');
+
+  const mixed = draftHarness(BOX(`${MESSAGE} and more`));
+  const exact = await typeAndSubmit({ pane: 'p' }, MESSAGE, (s, t) => s.includes(t), {
+    ...mixed.deps, requireExactDraft: true, beforeEnter: async () => {},
+  }).then(() => null, (e) => e);
+  assert.equal(exact.typingStarted, true);
 });

@@ -287,12 +287,12 @@ function releaseCarveOut(commands, keepApi, turn) {
   return null;
 }
 
-// Not a command anything runs: a marker `turnCommands` emits when the command
-// *itself* was longer than the index records, so the carve-out refuses rather
-// than clearing a turn on a command it only half saw. A merely truncated JSON
-// wrapper never produces it — the command column is its own, longer copy.
+// Not a command anything runs: a marker `turnCommands` emits when a tool input
+// was too long for the index to keep, so the carve-out refuses rather than
+// clearing a turn on a command it only half saw — or on a joined copy of an argv,
+// which is not what ran.
 const UNREADABLE_COMMAND = '\u0000keep-watcher-unreadable-command';
-const UNREADABLE_REASON = 'the turn ran a command longer than the index records in full';
+const UNREADABLE_REASON = 'the turn ran a command the index could not record in full';
 
 function requireSteps() {
   try { return require('./steps.js'); } catch { return null; }
@@ -415,6 +415,18 @@ function releaseReservation(turn, deps = {}) {
   } catch { return 0; }
 }
 
+// A reservation that outlived its attempt keeps its slot and says why. The row
+// is the only record that something may have been typed into that session.
+function recordReservationError(turn, message, deps = {}) {
+  if (!deps.token) return 0;
+  try {
+    const result = (deps.turnIndex || require('./turn-index.js')).open(deps.db)
+      .prepare('UPDATE deliveries SET error = ? WHERE turn_id = ? AND token = ? AND sent_at IS NULL')
+      .run(String(message || '').slice(0, 500), turn.id, deps.token);
+    return Number(result && result.changes) || 0;
+  } catch { return 0; }
+}
+
 function confirmReservation(turn, at, deps = {}) {
   try {
     (deps.turnIndex || require('./turn-index.js')).open(deps.db)
@@ -437,7 +449,6 @@ function turnCommands(turn, deps = {}) {
       "SELECT text, command FROM messages WHERE turn_id = ? AND kind = 'tool_use'",
     ).all(turn.id);
   } catch { return []; }
-  const cap = Number(index.COMMAND_CAP) || 0;
   for (const row of rows) {
     // The stored input, in the shape it was recorded in — a string or an argv
     // array. `undefined` means the JSON itself was truncated, which is not the
@@ -447,12 +458,12 @@ function turnCommands(turn, deps = {}) {
       if (ran !== null && ran !== '') out.push(ran);
       continue;
     }
-    // The JSON went, but the command column is its own and much longer copy.
+    // The JSON went. The command column is still there, but for an argv it is a
+    // *joined* copy, and judging a joined argv is what turns an argument into a
+    // command — the one thing this must never do. So a truncated input is not
+    // read at all: it is the marker, and the marker carves the turn out.
     if (!row.command) continue;
-    out.push(row.command);
-    // Only when the command itself reached the cap is there something this
-    // genuinely cannot see; a long `description` beside a short command is not.
-    if (cap && row.command.length >= cap) out.push(UNREADABLE_COMMAND);
+    out.push(UNREADABLE_COMMAND);
   }
   return out;
 }
@@ -533,8 +544,17 @@ async function maybeDeliver(turn, verdict, deps = {}) {
       precondition: () => revalidate(turn, deps),
     });
   } catch (error) {
-    releaseReservation(turn, owned);
-    return { delivered: false, reason: `delivery failed: ${error.message}`, error: error.message };
+    // A slot may only be given back when nothing was typed. Once characters have
+    // gone to the pane nobody can prove the message did not arrive — an
+    // unconfirmed send is still a send — and handing that capacity back is how a
+    // session gets told the same thing twice.
+    const typed = Boolean(error && error.typingStarted);
+    if (typed) recordReservationError(turn, error.message, owned);
+    else releaseReservation(turn, owned);
+    return {
+      delivered: false, reason: `delivery failed: ${error.message}`, error: error.message,
+      typingStarted: typed, reservationKept: typed,
+    };
   }
   const at = Number.isFinite(deps.now) ? deps.now : Date.now();
   markDelivered(turn, at, deps);
@@ -592,7 +612,7 @@ module.exports = {
   TYPES, DEFAULTS, DELIVERY_PREFIX, RISKY_QUESTION_RE, SESSION_WINDOW_MS, HOUR_MS,
   configFile, loadConfig, saveConfig, normalizeConfig, liveTypes, describeConfig,
   graduationCheck, decisionTypeFor, safeDeliveryText, turnText, assistantMessages, cardFor,
-  UNREADABLE_COMMAND, UNREADABLE_REASON,
+  UNREADABLE_COMMAND, UNREADABLE_REASON, recordReservationError,
   pausedCarveOut, riskyQuestionCarveOut, cardCarveOut, releaseCarveOut, chainCarveOut, carveOut,
   freshness, sessionReady, rateLimit, reserve, releaseReservation, confirmReservation, revalidate,
   turnCommands, markDelivered, maybeDeliver,
