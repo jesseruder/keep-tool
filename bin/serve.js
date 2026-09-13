@@ -4443,7 +4443,10 @@ async function recoverReviewQueueLaunch(active, hooks = {}, deps = {}) {
   return { sessionId, pane: active.pane, sent: true };
 }
 const scanCache = require('./stat-parse-cache').createStatParseCache({
-  maxEntries: 1024,
+  // The byte budget is the useful bound here. A busy fleet can have several
+  // thousand small recent transcripts; a lower entry cap makes a stable scan
+  // order evict the tail before the next pass reaches it and reparses every file.
+  maxEntries: 16384,
   maxBytes: 64 * 1024 * 1024,
 });
 const childScanCache = require('./stat-parse-cache').createStatParseCache({
@@ -4677,14 +4680,19 @@ function scanClaudeSessions(options = {}) {
     }) : null;
     let info;
     if (!cached) try {
-      info = scanCache.get(file, stat, () => scanTranscript(file),
-        (value) => Buffer.byteLength(JSON.stringify(value)));
+      info = scanCache.get(file, stat, () => {
+        const parsed = scanTranscript(file);
+        // Most recent files in a large fleet are headless task transcripts.
+        // Cache their negative classification as null instead of retaining the
+        // much larger parse result solely to discard it below on every scan.
+        return claudeTranscriptIsInteractive(file, parsed, stat) ? parsed : null;
+      }, (value) => Buffer.byteLength(JSON.stringify(value)));
     } catch { continue; }
     // AI titles are now written to headless `claude -p` transcripts too. Only
     // TUI record types distinguish a conversation from a batch invocation.
     // Explicitly hosted headless history is restored below by host backfill,
     // whose exact session lookup intentionally does not apply this filter.
-    if (!cached && !claudeTranscriptIsInteractive(file, info, stat)) continue;
+    if (!cached && !info) continue;
     // Claude can append untimestamped housekeeping records (ai-title, mode,
     // bridge-session) when an old session is merely reopened or inspected. Those
     // writes are not conversation activity and must not resurrect the session.
@@ -4900,26 +4908,35 @@ function writeLiveSessionLedger(ledger, deps = {}) {
 // session rather than a project-tree walk.
 function liveTurnIndexSessions(deps = {}) {
   const ledger = readLiveSessionLedger(deps);
+  const now = (deps.now || Date.now)();
+  const liveCutoff = now - (deps.liveWindowMs ?? 10 * 60e3);
   const wanted = new Map();
   for (const [id, entry] of Object.entries(ledger.sessions || {})) {
-    if (!entry || !/^[A-Za-z0-9_-]+$/.test(id)) continue;
+    if (!entry || !/^[A-Za-z0-9_-]+$/.test(id)
+        || !Number.isFinite(Number(entry.lastSeenAlive)) || Number(entry.lastSeenAlive) < liveCutoff) continue;
     wanted.set(id, { id, agent: entry.agent === 'codex' ? 'codex' : 'claude' });
   }
   // A reviewer may be idle enough to have left the live ledger, and its turns are
   // exactly the ones the fleet wants measured.
   try {
-    for (const id of fs.readdirSync(path.join(keep.ROOT, '.keep', 'reviewer'))) {
+    const reviewerIds = deps.reviewerIds || fs.readdirSync(path.join(keep.ROOT, '.keep', 'reviewer'));
+    for (const id of reviewerIds) {
       if (/^[A-Za-z0-9_-]+$/.test(id) && !wanted.has(id)) wanted.set(id, { id, agent: 'claude' });
     }
   } catch {}
   if (!wanted.size) return [];
   const claudeFiles = new Map();
-  try { for (const row of claudeTranscriptIndex.scan()) claudeFiles.set(row.id, row.file); } catch {}
+  try {
+    const rows = deps.claudeTranscriptRows || claudeTranscriptIndex.scan();
+    for (const row of rows) claudeFiles.set(row.id, row.file);
+  } catch {}
   const sessions = [];
   for (const entry of wanted.values()) {
     let file = null;
     if (entry.agent === 'codex') {
-      try { file = codex.rolloutFileFor(entry.id) || codex.findRolloutFile(entry.id); } catch {}
+      try {
+        file = (deps.codexRolloutFile || ((id) => codex.rolloutFileFor(id) || codex.findRolloutFile(id)))(entry.id);
+      } catch {}
     } else file = claudeFiles.get(entry.id) || null;
     if (file) sessions.push({ ...entry, file });
   }
@@ -4952,7 +4969,22 @@ async function liveSessionTick(deps = {}) {
     };
     const records = paneRecordEntries(deps);
     let scanned = [];
-    try { scanned = await (deps.scanSessions || scanSessions)(); } catch {}
+    if (deps.scanSessions) {
+      try { scanned = await deps.scanSessions(); } catch {}
+    } else {
+      // This tick starts during daemon boot. Resolve only processes we just
+      // observed instead of synchronously parsing the entire recent fleet on
+      // the request loop while the dashboard worker performs the same scan.
+      for (const [id, entry] of live) {
+        try {
+          const lookup = entry.agent === 'codex'
+            ? deps.codexSessionFor || codex.sessionFor
+            : deps.claudeSessionFor || claudeSessionFor;
+          const session = lookup(id);
+          if (session) scanned.push(session);
+        } catch {}
+      }
+    }
     const scannedById = new Map(scanned.map((session) => [session.id, session]));
     const exitedIds = new Set(scanned.filter((session) => session && session.exited).map((session) => session.id));
     for (const id of exitedIds) delete ledger.sessions[id];

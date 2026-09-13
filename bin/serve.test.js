@@ -46,6 +46,7 @@ const {
   shutdownSettingsRepair,
   liveSessionPids,
   liveSessionTick,
+  liveTurnIndexSessions,
   restorePlan,
   sessionProjectFromTranscript,
   readClaudeSettingsModel,
@@ -3685,6 +3686,55 @@ test('live session tick merges direct host bindings without pane-record backfill
   assert.deepEqual(host.calls.map((call) => call.type), ['list']);
 });
 
+test('live session tick resolves only observed processes instead of scanning recent fleet history', async () => {
+  const now = 9000;
+  const lookedUp = [];
+  let written;
+  const result = await liveSessionTick({
+    now: () => now,
+    ledger: { sessions: {
+      historical: { agent: 'claude', project: '/old', lastSeenAlive: now - 1000 },
+    } },
+    liveSessionPids: async () => new Map([
+      ['live-claude', { pid: 41, agent: 'claude', project: '/claude', source: 'argv', primary: true }],
+      ['live-codex', { pid: 42, agent: 'codex', project: '/codex', source: 'argv', primary: true }],
+    ]),
+    host: recordingHost((type) => type === 'list' ? { panes: [] } : {}),
+    paneRecords: new Map(),
+    claudeSessionFor: (id) => { lookedUp.push(['claude', id]); return { id, kind: 'claude' }; },
+    codexSessionFor: (id) => { lookedUp.push(['codex', id]); return { id, kind: 'codex' }; },
+    writeLedger: (value) => { written = value; },
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(lookedUp, [['claude', 'live-claude'], ['codex', 'live-codex']]);
+  assert.equal(written.sessions.historical.project, '/old', 'recent restore history remains in the ledger without a parse');
+});
+
+test('live turn indexing ignores stale ledger history while retaining recent gone sessions and reviewers', () => {
+  const now = Date.parse('2026-09-13T12:00:00Z');
+  const codexLookups = [];
+  const sessions = liveTurnIndexSessions({
+    now: () => now,
+    ledger: { sessions: {
+      'recent-codex': { agent: 'codex', lastSeenAlive: now - 60e3 },
+      'recent-gone': { agent: 'claude', lastSeenAlive: now - 9 * 60e3 },
+      'stale-codex': { agent: 'codex', lastSeenAlive: now - 11 * 60e3 },
+    } },
+    reviewerIds: ['reviewer'],
+    claudeTranscriptRows: [
+      { id: 'recent-gone', file: '/transcripts/recent-gone.jsonl' },
+      { id: 'reviewer', file: '/transcripts/reviewer.jsonl' },
+    ],
+    codexRolloutFile: (id) => { codexLookups.push(id); return `/rollouts/${id}.jsonl`; },
+  });
+  assert.deepEqual(sessions, [
+    { id: 'recent-codex', agent: 'codex', file: '/rollouts/recent-codex.jsonl' },
+    { id: 'recent-gone', agent: 'claude', file: '/transcripts/recent-gone.jsonl' },
+    { id: 'reviewer', agent: 'claude', file: '/transcripts/reviewer.jsonl' },
+  ]);
+  assert.deepEqual(codexLookups, ['recent-codex'], 'stale Codex history never starts a directory walk');
+});
+
 test('pane process liveness distinguishes an empty parent shell from an agent subtree', () => {
   const { annotatePaneAgents } = require('./serve');
   const panes = [1, 2, 3, 4].map((pid) => ({ id: `p${pid}`, pid, alive: true, meta: { agent: 'codex', sessionId: `s${pid}` } }));
@@ -5071,6 +5121,53 @@ test('Claude discovery excludes titled headless runs from cold and cached scans 
     assert.ok(result.afterFirst > 0);
     assert.equal(result.afterSecond, result.afterFirst, 'the unchanged headless transcript is not reparsed');
     assert.deepEqual(result.hosted, [{ id: 'titled-headless', hostOnly: true, title: 'Batch classifier' }]);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test('Claude fleet scans retain more than 1024 small transcripts across steady refreshes', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-claude-fleet-cache-'));
+  try {
+    const keepRoot = path.join(home, 'keep');
+    const projectDir = path.join(home, '.claude', 'projects', '-test-project');
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.mkdirSync(keepRoot, { recursive: true });
+    const at = new Date().toISOString();
+    for (let index = 0; index < 1100; index += 1) {
+      const id = `fleet-${String(index).padStart(4, '0')}`;
+      fs.writeFileSync(path.join(projectDir, `${id}.jsonl`), `${[
+        { type: 'mode', mode: 'normal', sessionId: id },
+        { type: 'user', sessionId: id, cwd: '/test/project', timestamp: at,
+          message: { role: 'user', content: 'Inspect the fleet' } },
+        { type: 'assistant', sessionId: id, timestamp: at,
+          message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'Done' }] } },
+      ].map(JSON.stringify).join('\n')}\n`);
+    }
+    const script = `
+      ${STATE_FIXTURE_SETUP}
+      const fs = require('node:fs');
+      const projectDir = ${JSON.stringify(projectDir)};
+      const realOpen = fs.openSync;
+      let transcriptOpens = 0;
+      fs.openSync = (...args) => {
+        if (String(args[0]).startsWith(projectDir) && String(args[0]).endsWith('.jsonl')) transcriptOpens += 1;
+        return realOpen(...args);
+      };
+      const serve = require('./bin/serve.js');
+      const first = serve.scanSessions({ dashboard: true, readOnly: true });
+      const afterFirst = transcriptOpens;
+      const second = serve.scanSessions({ dashboard: true, readOnly: true });
+      process.stdout.write(JSON.stringify({ first: first.length, second: second.length,
+        afterFirst, secondOpens: transcriptOpens - afterFirst }));
+    `;
+    const child = spawnSync(process.execPath, ['-e', script], {
+      cwd: path.join(__dirname, '..'), env: { ...process.env, HOME: home, KEEP_DIR: keepRoot, KEEP_CONFIG: '' },
+      encoding: 'utf8', timeout: 30000,
+    });
+    assert.equal(child.status, 0, child.stderr);
+    const result = JSON.parse(child.stdout);
+    assert.deepEqual([result.first, result.second], [1100, 1100]);
+    assert.ok(result.afterFirst >= 1100, 'the cold scan parses every transcript');
+    assert.equal(result.secondOpens, 0, 'the unchanged steady scan reparses no transcripts');
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
 
