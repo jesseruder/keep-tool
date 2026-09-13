@@ -26,6 +26,7 @@ registry data or credentials to the public source repository.
 - `bin/landed.js` — default-branch commit detection, card annotation, and scheduling
 - `bin/lint.js` — deterministic card hygiene checks and their cached result
 - `bin/turn-index.js` — SQLite index of agent turns, its incremental ingest, and its queries
+- `bin/turn-watcher.js` — shadow judgment of ended turns: what Owner would have typed next
 - `.keep/` — machine state (lock, markers, reviewer state), gitignored
 - `.keep/turns.sqlite` — the turn index; a derived cache, safe to delete and rebuild
 - `.keep/artifacts/` — committed per-card durable artifacts, force-added like `.keep/handoffs/`
@@ -92,6 +93,11 @@ keep turns stats [--since when] [--json]                     # turns, human/[kee
 keep turns ingest <file> [--agent claude|codex] [--force]    # index one transcript now
 keep turns backfill [--since when] [--roots dir,dir] [--json] # walk every transcript root (default 14 days)
 keep turns prune [--older-than when] [--dry] [--json]        # drop indexed sessions idle > 120 days
+
+keep watcher run <session-id|card-id> [--turn n] [--dry] [--json]   # what would Owner type next? recorded, never sent
+keep watcher ls [--since when] [--verdict v] [--limit n] [--json]   # verdicts, confidence, state lines
+keep watcher replay [--since when] [--limit n] [--agent a] [--json] # score verdicts against what Owner actually typed
+keep watcher stats [--since when] [--json]                          # verdict counts and shadow agreement rate
 
 keep review-queue [--limit n] [--min-score n] [--json]   # what deserves review now
 keep review-bundle <id> [--budget n] [--raw]             # evidence delta since last review
@@ -207,6 +213,15 @@ left to the daemon rather than made an agent's problem. Indexed sessions idle fo
 more than 120 days are pruned by the daemon once a day, or by `keep turns prune`.
 The database is a derived cache and can be deleted at any time.
 See [turn index](turn-index.md).
+
+`keep watcher` runs on top of that index in shadow mode: after an interactive
+turn ends it decides what you would have typed next — `continue`, `needs-input`,
+`drift` or `quiet` — and records it **without sending anything**. A `continue`,
+`answer`, `escalate` or `drift` verdict becomes a shadow entry you mark with
+`keep decisions agree|disagree|edit`; `quiet` records nothing. `--dry` prints the
+model input and the rule-only verdict for free, and `keep watcher replay` scores
+verdicts against what you actually typed next in history. The daemon tick is off
+unless `KEEP_WATCHER=1`. See [turn watcher](turn-watcher.md).
 
 Mutations auto-commit. Manual terminal use also pushes best-effort in the background;
 Claude and Codex sessions leave commits local unless `KEEP_ALLOW_PUSH=1` is explicitly

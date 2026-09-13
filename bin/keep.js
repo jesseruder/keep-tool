@@ -6002,6 +6002,118 @@ commands.turns = (argv) => {
   return sub(argv.slice(1));
 };
 
+// ---------- turn watcher (shadow) ----------
+
+function watcherSessionsFor(id) {
+  let task = null;
+  try { task = loadTaskAnywhere(id); } catch {}
+  if (task) {
+    const linked = (task.fm.sessions || []).map((entry) => entry && entry.id).filter(Boolean);
+    if (!linked.length) die(`card ${id} has no linked sessions`);
+    return linked;
+  }
+  if (!require('./turn-index.js').sessionRow(id)) die(`no card or indexed session "${id}"`);
+  return [id];
+}
+
+async function watcherRun(argv) {
+  const watcher = require('./turn-watcher.js');
+  const o = parseArgs(argv, { turn: 'str', dry: 'bool', json: 'bool' });
+  const id = o._[0];
+  if (!id) die('usage: keep watcher run <session-id|card-id> [--turn n] [--dry]');
+  const n = turnsIndexNumber(o.turn, '--turn');
+  const out = [];
+  for (const sessionId of watcherSessionsFor(id)) {
+    const turn = watcher.turnFor(sessionId, n);
+    if (!turn) { out.push({ session: sessionId, error: 'no indexed turn' }); continue; }
+    if (o.dry) {
+      // --dry is the whole point of shadow mode's shadow mode: see exactly what
+      // the model would be shown, and what the rules alone would say, for free.
+      const context = watcher.buildContext(turn);
+      out.push({ session: sessionId, turn: turn.n, dry: true, rule: context.rule, signals: context.signals, context: context.text });
+      continue;
+    }
+    out.push(await watcher.judge(turn));
+  }
+  if (o.json) return console.log(JSON.stringify(out, null, 2));
+  for (const entry of out) {
+    if (entry.error) { console.log(`${entry.session}: ${entry.error}`); continue; }
+    if (entry.dry) {
+      console.log(`${entry.session} turn ${entry.turn} — rule verdict: ${entry.rule.verdict} (${entry.rule.reason})`);
+      if (entry.rule.message) console.log(`  would type: ${entry.rule.message}`);
+      console.log(`--- context (${Buffer.byteLength(entry.context)} bytes, not sent) ---\n${entry.context}`);
+      continue;
+    }
+    console.log(`${String(entry.session).slice(0, 8)} turn ${entry.n}: ${entry.verdict}`
+      + `${entry.confidence == null ? '' : ` (${Math.round(entry.confidence * 100)}%)`} — ${entry.reason}`);
+    if (entry.stateLine) console.log(`  state: ${entry.stateLine}`);
+    if (entry.message) console.log(`  would type: ${entry.message}`);
+    console.log(`  recorded, not sent${entry.decisionId ? ` — keep decisions agree|disagree|edit ${entry.decisionId}` : ''}`);
+  }
+}
+
+function watcherLs(argv) {
+  const watcher = require('./turn-watcher.js');
+  const o = parseArgs(argv, { since: 'str', verdict: 'str', limit: 'str', json: 'bool' });
+  if (o.verdict && !watcher.VERDICTS.includes(o.verdict)) die(`--verdict must be one of: ${watcher.VERDICTS.join(', ')}`);
+  const rows = watcher.listVerdicts({
+    sinceMs: turnsSince(o.since), verdict: o.verdict || null,
+    limit: turnsIndexNumber(o.limit, '--limit') || 50,
+  });
+  if (o.json) return console.log(JSON.stringify(rows, null, 2));
+  if (!rows.length) return console.log('no verdicts');
+  for (const row of rows) {
+    console.log(`${turnsStamp(row.verdict_at)}  ${String(row.session_id).slice(0, 8)}  ${String(row.n).padStart(4)}  `
+      + `${String(row.verdict).padEnd(11)} ${row.verdict_confidence == null ? '  - ' : `${Math.round(row.verdict_confidence * 100)}%`.padStart(4)}  `
+      + `${turnsClip(row.state_line, 70).padEnd(70)} | ${turnsClip(row.verdict_message, 80)}`);
+  }
+}
+
+async function watcherReplay(argv) {
+  const watcher = require('./turn-watcher.js');
+  const o = parseArgs(argv, { since: 'str', limit: 'str', agent: 'str', json: 'bool' });
+  if (o.agent && !['claude', 'codex'].includes(o.agent)) die('--agent must be claude or codex');
+  const result = await watcher.replay({
+    sinceMs: turnsSince(o.since), limit: turnsIndexNumber(o.limit, '--limit') || 100, agent: o.agent || null,
+  });
+  if (o.json) return console.log(JSON.stringify(result, null, 2));
+  if (!result.total) return console.log('no historical turns with a following human message to score against');
+  const pct = (value) => (value == null ? '   -' : `${Math.round(value * 100)}%`.padStart(4));
+  console.log(`${result.total} turns scored against what Owner actually typed next — `
+    + `${pct(result.agreement)} agreement\n`);
+  console.log(`${'verdict'.padEnd(12)}${'precision'.padStart(10)}${'recall'.padStart(8)}${'predicted'.padStart(10)}${'expected'.padStart(9)}`);
+  for (const row of result.rows) {
+    console.log(`${row.verdict.padEnd(12)}${pct(row.precision).padStart(10)}${pct(row.recall).padStart(8)}`
+      + `${String(row.predicted).padStart(10)}${String(row.expected).padStart(9)}`);
+  }
+  console.log(`\nconfusion (rows = what Owner did, columns = what the watcher said)`);
+  console.log(`${''.padEnd(12)}${watcher.VERDICTS.map((verdict) => verdict.padStart(12)).join('')}`);
+  for (const expected of watcher.VERDICTS) {
+    console.log(`${expected.padEnd(12)}${watcher.VERDICTS.map((actual) => String(result.confusion[expected][actual]).padStart(12)).join('')}`);
+  }
+}
+
+function watcherStats(argv) {
+  const watcher = require('./turn-watcher.js');
+  const o = parseArgs(argv, { since: 'str', json: 'bool' });
+  const result = watcher.stats({ sinceMs: turnsSince(o.since) });
+  if (o.json) return console.log(JSON.stringify(result, null, 2));
+  console.log(`since ${new Date(result.since).toISOString().slice(0, 16).replace('T', ' ')} — ${result.total} verdicts`);
+  for (const row of result.rows) {
+    console.log(`  ${row.verdict.padEnd(12)} ${String(row.turns).padStart(6)}${row.replays ? ` (${row.replays} replay)` : ''}`);
+  }
+  console.log('');
+  console.log(require('./decisions.js').renderStats(result.ledger));
+}
+
+const WATCHER_SUBCOMMANDS = { run: watcherRun, ls: watcherLs, replay: watcherReplay, stats: watcherStats };
+
+commands.watcher = async (argv) => {
+  const sub = WATCHER_SUBCOMMANDS[argv[0]];
+  if (!sub) die('usage: keep watcher run|ls|replay|stats (see keep help watcher)');
+  return sub(argv.slice(1));
+};
+
 commands.digest = () => {
   const md = buildDigest();
   const file = path.join(ROOT, 'digests', `${nowStamp().slice(0, 10)}.md`);
@@ -7083,6 +7195,16 @@ ${stepUsage()}
   keep turns prune [--older-than when] [--dry] [--json]
                          # drop indexed sessions last active before then (default: 120 days);
                          # the daemon runs this once a day with the same default
+
+  keep watcher run <session-id|card-id> [--turn n] [--dry] [--json]
+                         # judge one ended turn: what would Owner have typed next? Recorded, never sent.
+                         # --dry prints the context and the rule-only verdict without calling a model
+  keep watcher ls [--since when] [--verdict continue|needs-input|drift|quiet] [--limit n] [--json]
+  keep watcher replay [--since when] [--limit n] [--agent claude|codex] [--json]
+                         # re-judge history and score each verdict against what Owner actually typed
+  keep watcher stats [--since when] [--json]
+                         # verdict counts plus the shadow-decision agreement rate per type
+                         # the daemon tick is off unless KEEP_WATCHER=1
 
   keep hook session-start|session-end|stop|notification|lifecycle|pre-bash|post-bash
                          # Claude context, enforcement, notifications and observation-only lifecycle records

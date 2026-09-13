@@ -16,7 +16,7 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 // Text caps. Transcripts contain whole files and 100k-line build logs; the index
 // exists to find and count turns, not to be a second copy of the corpus.
@@ -136,6 +136,19 @@ const MIGRATIONS = [
   // Looking a directory up among sessions already indexed is what keeps the
   // worktree-to-main-checkout git call from running once per hook process.
   { version: 3, statements: ['CREATE INDEX IF NOT EXISTS sessions_cwd ON sessions(cwd)'] },
+  // What the turn watcher writes back (bin/turn-watcher.js). The verdict columns
+  // themselves were reserved from version 1; these carry the message Owner would
+  // have typed, how sure the model was, which model said so, and the shadow
+  // decision it produced.
+  { version: 4, statements: [
+    'ALTER TABLE turns ADD COLUMN verdict_message TEXT',
+    'ALTER TABLE turns ADD COLUMN verdict_confidence REAL',
+    'ALTER TABLE turns ADD COLUMN verdict_model TEXT',
+    'ALTER TABLE turns ADD COLUMN verdict_ms INTEGER',
+    'ALTER TABLE turns ADD COLUMN decision_id TEXT',
+    'ALTER TABLE turns ADD COLUMN card_id TEXT',
+    'CREATE INDEX IF NOT EXISTS turns_verdict ON turns(ended, verdict_at)',
+  ] },
 ];
 
 function migrate(handle) {

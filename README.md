@@ -108,6 +108,11 @@ configuration and available agent sessions, Keep can:
   was said, and how many turns were spent only restarting a stalled agent —
   without re-reading gigabytes of transcripts. See
   [turn index](docs/turn-index.md).
+- Judge each finished turn in shadow mode: decide whether you would have typed
+  "continue", answered a question, redirected the session, or done nothing — and
+  record that decision **without sending it**, so you can measure whether you
+  agree before any of it goes live. Off by default. See
+  [turn watcher](docs/turn-watcher.md).
 
 Scheduling, model access, and launch permissions are separate controls. Model-backed
 checks and reviews use your Claude account; Keep is not a model service. Optional

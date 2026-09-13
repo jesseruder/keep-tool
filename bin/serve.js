@@ -48,10 +48,13 @@ const SESSION_WINDOW_MS = 48 * 3600e3; // ignore transcripts older than this
 const TURN_INDEX_BUDGET_MS = 150; // how long one turn-index tick may hold the event loop
 const TURN_INDEX_BUDGET_BYTES = 8 * 1024 * 1024;
 const TURN_INDEX_PRUNE_LIMIT = 200; // sessions dropped per daily sweep; it resumes next tick
+const WATCHER_TURNS_PER_TICK = 5;
+const WATCHER_CONCURRENCY = 2;
+const WATCHER_WINDOW_MS = 2 * 3600e3; // a turn older than this is history, not a live decision
 const claudeProjectRoots = accounts.projectRoots();
 const claudeTranscriptIndex = require('./transcript-index').createMultiRootTranscriptIndex(claudeProjectRoots);
 const {
-  compactState, wantsCompactState, createJobChangeTracker,
+  compactState, wantsCompactState, createJobChangeTracker, attachStateLines,
   wantsLightweightState, lightweightState, dashboardDetail, reviewQueueSearch,
 } = require('./dashboard-state');
 const { createDashboardWorker } = require('./dashboard-worker');
@@ -5400,6 +5403,7 @@ function buildState(options = {}) {
   if (workerMode) digest = options.dashboardRuntime?.digest || null;
   else try { digest = ensureDigest(); } catch (e) { process.stderr.write(`keep serve: digest failed: ${e.message}\n`); }
   const alertMeta = alerts.loadMeta(keep.ROOT);
+  attachStateLines(sessions);
   const state = {
     generatedAt: Date.now(),
     scopes: { ...require('./preferences').scopes(), home: os.homedir() },
@@ -6960,8 +6964,42 @@ function start(deps = {}) {
       turnIndexRunning = false;
     }
   };
-  setInterval(turnIndexTick, 30e3).unref();
-  setTimeout(turnIndexTick, 10e3).unref();
+  // The watcher judges turns the tick above just indexed, so it runs after it.
+  // Shadow mode still spends tokens: it stays off until Owner sets KEEP_WATCHER=1.
+  let watcherRunning = false;
+  let watcherDisabledRecorded = false;
+  const watcherTick = async () => {
+    if (watcherRunning) return;
+    const watcher = require('./turn-watcher.js');
+    if (!watcher.enabled()) {
+      // Say so once, not every 30 seconds: health.record rewrites the whole file.
+      if (!watcherDisabledRecorded) {
+        watcherDisabledRecorded = true;
+        health.record('watcher', { disabled: true, detail: 'KEEP_WATCHER is not 1' });
+      }
+      return;
+    }
+    watcherDisabledRecorded = false;
+    watcherRunning = true;
+    try {
+      const result = await watcher.tick({
+        limit: WATCHER_TURNS_PER_TICK, concurrency: WATCHER_CONCURRENCY, windowMs: WATCHER_WINDOW_MS,
+      });
+      health.record('watcher', {
+        ok: result.failures === 0, cadenceMs: 30e3,
+        detail: `${result.judged} judged, ${result.failures} model failures, ${result.ms} ms`,
+        ...(result.failures ? { error: new Error(`${result.failures} watcher model failures`) } : {}),
+      });
+      if (result.judged) broadcast();
+    } catch (error) {
+      health.record('watcher', { ok: false, cadenceMs: 30e3, error });
+    } finally {
+      watcherRunning = false;
+    }
+  };
+  const turnTicks = () => { turnIndexTick(); watcherTick(); };
+  setInterval(turnTicks, 30e3).unref();
+  setTimeout(turnTicks, 10e3).unref();
   // Drip-fold fleet transcripts for the weekly attribution: ~750MB of history on a
   // cold start, folded 24MB at a time so no state build ever blocks on it.
   // Every pass is synchronous work on this event loop, and what it produces is a

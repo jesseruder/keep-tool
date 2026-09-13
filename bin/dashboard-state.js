@@ -39,6 +39,26 @@ function taskSummary(task) {
   };
 }
 
+// The turn watcher's one-line "what this session just did and what is next".
+// One bounded query per state build, and entirely optional: an index that is
+// missing, locked, or has never been written leaves the fields absent.
+function attachStateLines(sessions, deps = {}) {
+  const rows = Array.isArray(sessions) ? sessions : [];
+  if (!rows.length) return rows;
+  let lines;
+  try {
+    const watcher = deps.watcher || require('./turn-watcher.js');
+    lines = watcher.stateLines(rows.map((session) => session && session.id));
+  } catch { return rows; }
+  for (const session of rows) {
+    const found = session && lines.get(session.id);
+    if (!found) continue;
+    if (found.stateLine) session.stateLine = found.stateLine;
+    if (found.lastVerdict) session.lastVerdict = found.lastVerdict;
+  }
+  return rows;
+}
+
 function sessionSummary(session) {
   const {
     observation: _observation,
@@ -192,6 +212,7 @@ function createJobChangeTracker() {
   };
 }
 module.exports = {
+  attachStateLines,
   compactState,
   wantsCompactState,
   lightweightState,

@@ -25,6 +25,7 @@ const TYPES = {
   close: 'a card is finished and should close',
   status: "a card's status is wrong and should change",
   unblock: 'a dependency is satisfied and the waiter should be told',
+  drift: "the session is heading away from the card's goal or a stated constraint and should be told",
   escalate: 'this genuinely needs Owner',
 };
 const VERDICTS = ['agree', 'disagree', 'edit'];
