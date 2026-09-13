@@ -9,7 +9,7 @@ function focusIdentity(element) {
   for (const name of ['renderer', 'restart', 'handoffAccount', 'portableTransfer', 'portableFallback']) {
     if (element.dataset[name] != null) return `[data-${name.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)}="${CSS.escape(element.dataset[name])}"]`;
   }
-  return ['closeSession', 'snooze', 'dismiss', 'waitDependency', 'reopen', 'kill', 'removePane']
+  return ['pin', 'unpin', 'closeSession', 'snooze', 'dismiss', 'waitDependency', 'reopen', 'kill', 'removePane']
     .find((name) => element.dataset[name] != null);
 }
 

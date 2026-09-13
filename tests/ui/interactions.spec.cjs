@@ -108,7 +108,7 @@ test('Watch Close hides the pane immediately', async ({ page }) => {
 test('renderer choice persists while the Actions menu survives polling and keyboard dismissal', async ({ page }) => {
   const stage = page.locator('#stage');
   const menu = stage.locator('.session-actions');
-  await expect(stage.locator('.primary-actions [data-pin]')).toBeVisible();
+  await expect(menu.locator('[data-pin]')).toHaveCount(1);
   await expect(stage.locator('.acts > [data-close-session]')).toHaveCount(0);
 
   await menu.locator(':scope > summary').click();

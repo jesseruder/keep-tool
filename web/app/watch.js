@@ -110,7 +110,7 @@ function renderGrid(ctx, layout) {
       element = document.createElement('div');
       element.className = 'wpane';
       element.dataset.pane = pane.id;
-      element.innerHTML = `<div class="ph"><div class="session-heading"></div><span class="pane-state"></span><div class="pane-primary-actions"></div>${actionsMenuHTML()}</div><div class="pane-terminal"></div>`;
+      element.innerHTML = `<div class="ph"><div class="session-heading"></div><span class="pane-state"></span>${actionsMenuHTML()}</div><div class="pane-terminal"></div>`;
     }
     const shell = pane.meta?.agent === 'shell';
     const closable = pane.alive && ['claude', 'codex'].includes(pane.meta?.agent) && pane.meta?.sessionId;
@@ -118,12 +118,11 @@ function renderGrid(ctx, layout) {
     const exitedAgent = pane.alive === false && ['claude', 'codex'].includes(pane.meta?.agent);
     ctx.patchHTML(element.querySelector('.ph .session-heading'), `<b>${ctx.esc(entity.title)}</b><div class="meta">${ctx.projectHTML(entity.project)}${entity.taskId ? `<span class="proj">${ctx.esc(entity.taskId)}</span>${ctx.tagsHTML(ctx.taskFor(entity))}` : ''}${accountLabelHTML(ctx, entity.session, pane)}</div>`);
     ctx.patchHTML(element.querySelector('.pane-state'), `<span class="st"><i class="${ctx.esc(entity.state)}"></i>${ctx.esc(entity.stateLabel || entity.state)}</span>`);
-    ctx.patchHTML(element.querySelector('.pane-primary-actions'), '<button data-unpin title="Unpin from Watch" aria-label="Unpin from Watch">✕</button>');
     const portable = (closable || pendingHandoff) && !entity.session?.reviewer ? portableTransferControls(ctx, pane.meta.sessionId) : '';
     const handoff = (closable || pendingHandoff) && !entity.session?.reviewer ? handoffControls(ctx, pane.meta.sessionId, pane.id) : '';
     const restart = closable && !pendingHandoff && !entity.session?.reviewer ? restartControls(ctx, pane.meta.sessionId) : '';
     const menu = element.querySelector('.session-actions');
-    patchActionsMenu(ctx, menu, `${closable ? '<button class="btn" data-close-session>Close session</button>' : ''}${shell ? `<button class="btn" data-kill>${pane.alive ? 'Kill shell' : 'Remove shell'}</button>` : ''}${exitedAgent && !pendingHandoff ? '<button class="btn" data-reopen>Reopen</button><button class="btn" data-remove-pane>Remove pane</button>' : ''}<div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><span class="restart-controls">${restart}</span>${rendererControlsHTML(ctx, pane.id, pane)}`);
+    patchActionsMenu(ctx, menu, `<button class="btn" data-unpin>Unpin from Watch</button>${closable ? '<button class="btn" data-close-session>Close session</button>' : ''}${shell ? `<button class="btn" data-kill>${pane.alive ? 'Kill shell' : 'Remove shell'}</button>` : ''}${exitedAgent && !pendingHandoff ? '<button class="btn" data-reopen>Reopen</button><button class="btn" data-remove-pane>Remove pane</button>' : ''}<div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><span class="restart-controls">${restart}</span>${rendererControlsHTML(ctx, pane.id, pane)}`);
     installActionsMenu(menu, ctx, pane.id);
     if (portable) installPortableTransferControls(menu.querySelector('.portable-transfer-controls'), ctx);
     if (handoff) installHandoffControls(menu.querySelector('.account-controls'), ctx, pane.meta.sessionId, pane.id);

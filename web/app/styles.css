@@ -150,7 +150,6 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .shead h2 { margin: 0; flex: 1 1 240px; min-width: 0; font-size: 15px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .shead .meta { color: var(--muted); font-size: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; } .shead .meta a { color: var(--info); text-decoration: none; }
 .shead .acts { margin-left: auto; display: flex; gap: 6px; position: relative; }
-.primary-actions { display: flex; gap: 6px; }
 .shead .acts .btn { border-color: var(--line); color: var(--muted); }
 .shead .acts .btn:hover:not(:disabled) { border-color: var(--line); color: var(--text); }
 .shead .acts kbd { display: none; }
@@ -296,7 +295,6 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .wpane .ph .st i.idle, .fleet .st i.idle { background: var(--faint); }
 .wpane .ph .st i.needs-input, .fleet .st i.needs-input { background: var(--accent); }
 .wpane .ph button { color: var(--faint); padding: 2px 4px; } .wpane .ph button:hover { color: var(--text); }
-.wpane .ph .pane-primary-actions { display: flex; }
 .wpane .ph .session-actions-pop .btn { padding: 6px 8px; }
 .wpane .account-handoff > summary { color: var(--faint); padding: 2px 4px; }
 .wempty { grid-column: 1 / -1; display: flex; align-items: center; justify-content: center; color: var(--muted); background: var(--bg); text-align: center; line-height: 1.7; }

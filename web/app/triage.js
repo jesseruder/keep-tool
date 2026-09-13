@@ -362,7 +362,7 @@ function renderStage(ctx, active, focusItem, running, pinned) {
   if (stage.dataset.itemKey !== key || stage.dataset.pane !== (item.pane || '')) {
     ctx.focusDebug?.('stage-replace', { reason: 'selection-or-pane-change', session: item.sessionId || '', pane: item.pane || '', related: stage.dataset.pane || '' });
     ctx.clearElement(stage);
-    ctx.patchHTML(stage, `<div class="shead"><div class="session-heading"></div><div class="acts"><div class="primary-actions"></div>${actionsMenuHTML()}</div></div><div class="brief"></div><div class="stage-terminal"></div>`);
+    ctx.patchHTML(stage, `<div class="shead"><div class="session-heading"></div><div class="acts">${actionsMenuHTML()}</div></div><div class="brief"></div><div class="stage-terminal"></div>`);
     stage.dataset.itemKey = key;
     stage.dataset.pane = item.pane || '';
     stage.dataset.focusKey = '';
@@ -376,13 +376,12 @@ function renderStage(ctx, active, focusItem, running, pinned) {
   const reopen = hasLivePane || pendingHandoff ? '' : '<button class="btn" data-reopen>Reopen</button>';
   const heading = stage.querySelector('.shead .session-heading');
   ctx.patchHTML(heading, `<h2>${ctx.esc(title)}</h2><div class="meta mono">${ctx.projectHTML(item.project || session?.project || '', true)}${item.taskId ? `<span>${ctx.esc(item.taskId)}</span>${ctx.tagsHTML(task)}` : ''}${accountLabelHTML(ctx, session, pane)}</div>${task ? modelUsageHTML(task.modelUsage) : ''}`);
-  ctx.patchHTML(stage.querySelector('.primary-actions'), `<button class="btn" data-pin ${item.pane ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>`);
   const brief = stage.querySelector('.brief');
   const portable = item.sessionId && !session?.reviewer ? portableTransferControls(ctx, item.sessionId) : '';
   const handoff = (closable || pendingHandoff) && !session?.reviewer ? handoffControls(ctx, item.sessionId, item.pane) : '';
   const restart = closable && !pendingHandoff && !session?.reviewer ? restartControls(ctx, item.sessionId) : '';
   const menu = stage.querySelector('.session-actions');
-  patchActionsMenu(ctx, menu, `${reopen}${dependencyWait}${item.sessionId || waitingItem ? '<button class="btn" data-snooze>Snooze 1h</button><button class="btn" data-dismiss><kbd>x</kbd> Dismiss</button>' : ''}${closable ? '<button class="btn" data-close-session>Close session</button>' : ''}<div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><span class="restart-controls">${restart}</span>${hasLivePane ? rendererControlsHTML(ctx, item.pane, pane) : ''}`);
+  patchActionsMenu(ctx, menu, `<button class="btn" data-pin ${item.pane ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}${dependencyWait}${item.sessionId || waitingItem ? '<button class="btn" data-snooze>Snooze 1h</button><button class="btn" data-dismiss><kbd>x</kbd> Dismiss</button>' : ''}${closable ? '<button class="btn" data-close-session>Close session</button>' : ''}<div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><span class="restart-controls">${restart}</span>${hasLivePane ? rendererControlsHTML(ctx, item.pane, pane) : ''}`);
   installActionsMenu(menu, ctx, item.pane);
   if (portable) installPortableTransferControls(menu.querySelector('.portable-transfer-controls'), ctx);
   if (handoff) installHandoffControls(menu.querySelector('.account-controls'), ctx, item.sessionId, item.pane);
