@@ -498,4 +498,4 @@ function sessionFor(sessionId) {
   return sessionFromRollout(info, stat, loadTitles(record.configDir).get(info.id) || '', Date.now(), record.accountId);
 }
 
-module.exports = { scan, invalidate, scanRollout, sessionFor, rolloutFileFor, findRolloutFile, readTail, recentText, readSessionMeta, sessionMetaFor, isChildSession, configuredRoots, recentDateDirs, indexedRollouts };
+module.exports = { scan, invalidate, scanRollout, sessionFor, rolloutFileFor, findRolloutFile, readTail, recentText, readSessionMeta, sessionMetaFor, isChildSession, isHeadlessSession, configuredRoots, recentDateDirs, indexedRollouts };

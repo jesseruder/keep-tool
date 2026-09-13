@@ -22,4 +22,7 @@ fi
 # found is on it, launchd's default PATH has no node at all.
 NODE_DIR="$(dirname "$NODE")"
 case ":$PATH:" in *":$NODE_DIR:"*) ;; *) PATH="$NODE_DIR:$PATH"; export PATH ;; esac
-exec "$NODE" "$DIR/keep.js" "$@"
+# The turn index uses node:sqlite, still experimental in Node 22 (package.json
+# requires >= 22, which is also where --disable-warning landed). Without this every
+# CLI call and every hook would print an ExperimentalWarning to stderr.
+exec "$NODE" --disable-warning=ExperimentalWarning "$DIR/keep.js" "$@"

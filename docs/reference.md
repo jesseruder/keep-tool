@@ -25,7 +25,9 @@ registry data or credentials to the public source repository.
 - `bin/ideas.js` — daily fleet-wide Fable ideas evidence, generation, and scheduling
 - `bin/landed.js` — default-branch commit detection, card annotation, and scheduling
 - `bin/lint.js` — deterministic card hygiene checks and their cached result
+- `bin/turn-index.js` — SQLite index of agent turns, its incremental ingest, and its queries
 - `.keep/` — machine state (lock, markers, reviewer state), gitignored
+- `.keep/turns.sqlite` — the turn index; a derived cache, safe to delete and rebuild
 - `.keep/artifacts/` — committed per-card durable artifacts, force-added like `.keep/handoffs/`
 - `.keep/holds/` — quiet-window ledgers, one JSON file per hold
 - `.keep/unblocked/` — pending and delivered cross-card unblock records
@@ -83,6 +85,12 @@ keep compact <sid>     # compact a live Claude or Codex session (needs keep serv
 keep resume            # post-restart: active tasks + agent-aware resume commands
 keep sync              # pull --rebase + push
 keep hook session-start  # used by the Claude Code SessionStart hook
+
+keep turns show <session-id|card-id> [--last N] [--json]     # indexed turns for a session or card
+keep turns search "<query>" [--since when] [--project p] [--agent claude|codex] [--limit n] [--json]
+keep turns stats [--since when] [--json]                     # turns, human/[keep] openers, bare nudges
+keep turns ingest <file> [--agent claude|codex] [--force]    # index one transcript now
+keep turns backfill [--since when] [--roots dir,dir] [--json] # walk every transcript root (default 14 days)
 
 keep review-queue [--limit n] [--min-score n] [--json]   # what deserves review now
 keep review-bundle <id> [--budget n] [--raw]             # evidence delta since last review
@@ -185,6 +193,15 @@ cite a commit already on the upstream's origin default branch. Hints identify th
 narrower wait to use while preserving existing fact targets. Stale or missing daemon session evidence does not prove that
 a linked session is gone. Reviewer bundle headers include bounded, card-specific cached
 lint findings as advisory evidence.
+
+`keep turns` reads the turn index, a SQLite summary of Claude Code and Codex CLI
+transcripts kept in `.keep/turns.sqlite`. Stop hooks and the daemon feed it
+incrementally (byte offsets, so the cost is the delta, not the transcript);
+`keep turns backfill` seeds it from history. `show` accepts a session id or a
+card id, `search` is FTS5 over indexed messages, and `stats` reports turns,
+human and `[keep]` openers, and bare nudge openers per agent and session kind.
+`--since` reads backwards here: `+7d` means the last seven days. The database is
+a derived cache and can be deleted at any time. See [turn index](turn-index.md).
 
 Mutations auto-commit. Manual terminal use also pushes best-effort in the background;
 Claude and Codex sessions leave commits local unless `KEEP_ALLOW_PUSH=1` is explicitly

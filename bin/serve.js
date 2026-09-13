@@ -4889,6 +4889,37 @@ function writeLiveSessionLedger(ledger, deps = {}) {
   fs.renameSync(tmp, file);
 }
 
+// Which transcripts the turn index should re-read on this tick. Files come from
+// the caches the daemon already maintains, so the sweep costs a map lookup per
+// session rather than a project-tree walk.
+function liveTurnIndexSessions(deps = {}) {
+  const ledger = readLiveSessionLedger(deps);
+  const wanted = new Map();
+  for (const [id, entry] of Object.entries(ledger.sessions || {})) {
+    if (!entry || !/^[A-Za-z0-9_-]+$/.test(id)) continue;
+    wanted.set(id, { id, agent: entry.agent === 'codex' ? 'codex' : 'claude' });
+  }
+  // A reviewer may be idle enough to have left the live ledger, and its turns are
+  // exactly the ones the fleet wants measured.
+  try {
+    for (const id of fs.readdirSync(path.join(keep.ROOT, '.keep', 'reviewer'))) {
+      if (/^[A-Za-z0-9_-]+$/.test(id) && !wanted.has(id)) wanted.set(id, { id, agent: 'claude' });
+    }
+  } catch {}
+  if (!wanted.size) return [];
+  const claudeFiles = new Map();
+  try { for (const row of claudeTranscriptIndex.scan()) claudeFiles.set(row.id, row.file); } catch {}
+  const sessions = [];
+  for (const entry of wanted.values()) {
+    let file = null;
+    if (entry.agent === 'codex') {
+      try { file = codex.rolloutFileFor(entry.id) || codex.findRolloutFile(entry.id); } catch {}
+    } else file = claudeFiles.get(entry.id) || null;
+    if (file) sessions.push({ ...entry, file });
+  }
+  return sessions;
+}
+
 async function liveSessionTick(deps = {}) {
   if (liveSessionTickInFlight) return { skipped: true };
   liveSessionTickInFlight = true;
@@ -6893,6 +6924,24 @@ function start(deps = {}) {
   };
   setInterval(stalledTick, 60e3).unref();
   setTimeout(stalledTick, 5e3).unref();
+  // Stop hooks feed the turn index, but a session can run for hours without
+  // stopping and an agent that never loaded the hooks would be missing entirely.
+  // Bounded and round-robin: one tick never sweeps more than 64 transcripts.
+  let turnIndexRunning = false;
+  const turnIndexTick = () => {
+    if (turnIndexRunning) return;
+    turnIndexRunning = true;
+    try {
+      const result = require('./turn-index.js').ingestSessionsFromLiveState(liveTurnIndexSessions(), { limit: 64 });
+      health.record('turn-index', { ok: true, cadenceMs: 30e3, detail: `${result.ingested} indexed, ${result.skipped} skipped` });
+    } catch (error) {
+      health.record('turn-index', { ok: false, cadenceMs: 30e3, error });
+    } finally {
+      turnIndexRunning = false;
+    }
+  };
+  setInterval(turnIndexTick, 30e3).unref();
+  setTimeout(turnIndexTick, 10e3).unref();
   // Drip-fold fleet transcripts for the weekly attribution: ~750MB of history on a
   // cold start, folded 24MB at a time so no state build ever blocks on it.
   // Every pass is synchronous work on this event loop, and what it produces is a
@@ -7499,6 +7548,7 @@ module.exports = {
   scanSessions,
   invalidateDashboardSources,
   stalledSessionSnapshot,
+  liveTurnIndexSessions,
   buildState,
   applySessionLiveness,
   backfillHostSessions,

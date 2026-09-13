@@ -103,6 +103,11 @@ configuration and available agent sessions, Keep can:
 - Compact supported sessions when enabled, reconcile parent and child session
   activity, and check process ownership and outstanding jobs before automated
   session cleanup or restart.
+- Index agent turns into a local SQLite database as sessions run, so
+  `keep turns show|search|stats` can answer what a session did, where a phrase
+  was said, and how many turns were spent only restarting a stalled agent —
+  without re-reading gigabytes of transcripts. See
+  [turn index](docs/turn-index.md).
 
 Scheduling, model access, and launch permissions are separate controls. Model-backed
 checks and reviews use your Claude account; Keep is not a model service. Optional
