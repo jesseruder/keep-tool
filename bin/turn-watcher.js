@@ -66,6 +66,7 @@ const NEXT_STEP_FUTURE_RE = new RegExp(
 const NEXT_STEP_HEADER_RE = /(?:^|[\n.!?]\s*)(?:next(?:\s+steps?)?|remaining|still to do|to do)\s*:\s*(?!\s*(?:[-—–]\s*(?:\n|$)|none\b|nothing\b|n\/a\b))\S/i;
 const CLAIMS_DONE_RE = /\b(?:all (?:set|done)\b|(?:is|are|'s) (?:done|complete|completed|finished|landed|live)\b|nothing (?:left|else|more)\s+(?:to do|to change|to fix|remains?|remaining|needed|required)\b|nothing (?:left|more)\s+to\b|no (?:further|other|remaining) (?:work|changes?|steps?|items?)\s+(?:are\s+|is\s+)?(?:needed|required|remaining|outstanding)\b)/i;
 const EXPLICIT_PAUSE_RE = /\bpaused as requested\b|\b(?:I(?:'|’)ll|I will)\s+(?:hold|wait|pause|stop|stand by|hold off|not (?:proceed|continue))\b|\b(?:I(?:'|’)ll|I will)\s+\w+(?:\s+\w+)?\s+until you\b|\bwaiting for your\s+(?:go|word|signal|say-so|approval|confirmation|green light)\b|\bI(?:'|’)m\s+(?:paused|waiting|holding)\b/i;
+const ASKED_FOR_ACTION_RE = /\b(?:please (?:click|paste|copy|sign|scroll|open|run|enter|unlock|approve|tap|plug|install|restart|log in|sign in)|when you(?:'|’)?(?:re| are) ready|let me know when|tell me when|reply (?:with )?done|once you(?:'|’)?(?:ve| have))\b/i;
 // Work the session handed to something that is still running. Not a completion
 // claim and not a stall: the next move belongs to the job, not to Owner.
 const IN_PROGRESS_RE = /\b(?:is in progress|are in progress|still (?:in progress|running|building|deploying)|until it (?:returns|finishes|completes)|will report (?:back )?when|will update (?:you )?when|report back when)\b/i;
@@ -73,8 +74,11 @@ const IN_PROGRESS_RE = /\b(?:is in progress|are in progress|still (?:in progress
 // not an agent's prose, so they are deliberately loose about punctuation and
 // capitalisation — he types in lower case and rarely finishes a sentence.
 const AFFIRMATIVE_RE = /^(?:(?:ok|okay|yes|yep|y|sure|alright|right)\b[,.!\s]*)?(?:let'?s\b|do that\b|go ahead\b|go\b|do it\b|start\b|build\b|implement\b|figure that out\b|proceed\b|keep going\b|continue\b|run it\b|ship it\b|land it\b|push\b)|^(?:ok|okay|yes|yep|y|sure|alright)\s*[.!]?\s*$/i;
-// Owner pushing back on the premise, or asking a question of his own.
-const PREMISE_CHALLENGE_RE = /^(?:i'?m confused|i don'?t think|do you think|why (?:would|did|are|is)|isn'?t|wouldn'?t|shouldn'?t|what about|are you sure|hmm)\b/i;
+// Owner pushing back on the premise — explicit starters only. Any other question
+// is him opening a new topic, which is not the session's to unblock.
+const PREMISE_CHALLENGE_RE = /^(?:i'?m confused|i don'?t think|do you think that'?s|are you sure|isn'?t|wouldn'?t|shouldn'?t|why (?:did|would) you|that'?s not|i thought)/i;
+// What counts as the watcher having carried Owner's approval itself.
+const APPROVAL_REPLY_RE = /^(?:yes|ok|okay|go ahead|do it)\b/i;
 const REDIRECT_RE = /\b(no|not what|why did|i thought|instead|don't|stop|wait|revert)\b/i;
 // An approval that carries a correction is still a correction: "go ahead, but
 // don't push" is Owner narrowing the work, and reading it as a plain nudge loses
@@ -101,7 +105,7 @@ const INSTRUCTION = [
   '',
   'Rules:',
   '- A completion report — the session says it is done, landed, or finished, and names no next step — is `continue` with the self-check message, unless the turn already shows pushed commits, a Keep check-in, and a verification that reproduced the original symptom; in that case it is `quiet`.',
-  '- When Owner\'s opening message was a question and the turn answers it, that is `quiet`. When the turn ends by proposing something and asking for a go-ahead, it is `continue` with a short affirmative only if the proposal is reversible and inside the card\'s scope; otherwise it is `needs-input` with the answer you would propose.',
+  '- A turn that only answers Owner\'s question, with no proposal and no next action, is `quiet`. A turn that ends with a recommendation, an offer ("I can also…", "want me to…", "should I…"), or a numbered plan is never `quiet`: it is `needs-input` with the reply you would give (usually "yes, do that") when the proposed action is reversible and inside the card\'s scope; `continue` when the session already named its own next step and no approval is needed; `needs-input` with an empty message when only Owner can decide.',
   '- Set confidence honestly. A `continue` below 0.7 will never be sent, so a low number costs nothing and an inflated one costs trust.',
   '- A deterministic rule pass already ran; its answer is given as RULE VERDICT. Agree with it unless the evidence says otherwise, and if you disagree your `reason` must say what the rule missed.',
   '- `message` is delivered verbatim if Owner approves it, so write it the way Owner types: lowercase, imperative, no greeting, no sign-off, no markdown.',
@@ -124,6 +128,15 @@ function tail(text, chars = TAIL_CHARS) {
 
 function askedQuestion(lastAssistant) {
   return require('./session-status').proseRequest(lastAssistant);
+}
+
+// A request for something only Owner can physically do. proseRequest catches a
+// question or a "please provide"; it does not catch "please unlock the phone" or
+// "let me know when the deploy finishes", and widening it would change attention
+// behaviour for the whole fleet. So this lives here, and is used by the replay
+// scorer: after a turn like this, Owner's "done" is an answer, not a nudge.
+function askedForAction(lastAssistant) {
+  return ASKED_FOR_ACTION_RE.test(tail(lastAssistant));
 }
 
 function stopHint(lastAssistant) {
@@ -774,28 +787,47 @@ function groundTruth(turn, next) {
   if (kind && kind !== 'human') return { skip: 'not-owner' };
   const text = unquoted(next && next.opener_text);
   if (!text) return { skip: 'quoted-relay' };
-  // The session asked for something. Whatever came back — "yes", "done",
-  // "unlocked", "I pasted it" — is Owner answering, which is what needs-input
-  // predicts. Reading "done" as a nudge was the single biggest scorer defect.
-  if (askedQuestion(turn.last_assistant)) return { expected: 'needs-input', rule: 'answered-a-question' };
-  const head = text.slice(0, 80);
-  // Owner pushing back on the premise, or opening a question of his own, wanted a
-  // conversation. `quiet` at least left him alone, so it gets half credit.
-  if (PREMISE_CHALLENGE_RE.test(text) || (/\?\s*$/.test(text) && !turnIndex.isNudge(text))) {
+  // A correction outranks an answer: "go ahead, but don't push" is Owner
+  // narrowing the work even when it also answers a question.
+  if (CORRECTION_RE.test(text.slice(0, 120))) return { expected: 'drift', rule: 'approval-with-correction' };
+  // The session asked for something — a question, or an action only Owner can
+  // take. Whatever came back ("yes", "done", "unlocked", "I pasted it") is Owner
+  // answering, which is what needs-input predicts.
+  if (askedQuestion(turn.last_assistant) || askedForAction(turn.last_assistant)) {
+    return { expected: 'needs-input', rule: 'answered-a-question' };
+  }
+  // Owner pushing back on the premise wanted a conversation. `quiet` at least
+  // left him alone, so it gets half credit.
+  if (PREMISE_CHALLENGE_RE.test(text.slice(0, 60))) {
     return { expected: 'needs-input', rule: 'premise-challenge', soft: 'quiet' };
   }
-  // Checked before the nudge rule, so an approval carrying a correction is not
-  // read as plain approval.
-  if (CORRECTION_RE.test(text.slice(0, 120))) return { expected: 'drift', rule: 'approval-with-correction' };
-  if (turnIndex.isNudge(text) || AFFIRMATIVE_RE.test(text)) return { expected: 'continue', rule: 'nudge' };
-  if (REDIRECT_RE.test(head)) return { expected: 'drift', rule: 'redirect' };
+  const nudged = turnIndex.isNudge(text) || AFFIRMATIVE_RE.test(text);
+  // A turn that ran no tools and named no next step did not stop mid-work: it
+  // answered or recommended, and Owner's "ok let's do that" is approving a
+  // proposal, not restarting a stalled session. Eight of eight inspected misses
+  // in the second replay were this shape. `quiet` left the proposal on the table,
+  // which is half right; `continue` is right only if it carried the approval.
+  const working = Number(turn.tool_count || 0) > 0 || namesNextStep(turn.last_assistant);
+  if (!working && turn.opener_kind === 'human' && nudged) {
+    return { expected: 'needs-input', rule: 'approval', soft: 'quiet', affirmativeContinue: true };
+  }
+  if (nudged) return { expected: 'continue', rule: 'nudge' };
+  if (REDIRECT_RE.test(text.slice(0, 80))) return { expected: 'drift', rule: 'redirect' };
+  // A question with nothing pending is Owner opening a new topic, not asking the
+  // session to unblock itself; leaving it alone was the right call.
+  if (/\?\s*$/.test(text)) return { expected: 'quiet', rule: 'new-question' };
   return { expected: 'quiet', rule: 'new-instruction' };
 }
 
 function scoreOne(turn, next, value) {
   const truth = groundTruth(turn, next);
   if (truth.skip) return truth;
-  const agreed = value.verdict === truth.expected;
+  let agreed = value.verdict === truth.expected;
+  // Approving a proposal by sending the approval is the same outcome as telling
+  // Owner to approve it, so long as the message actually says yes.
+  if (!agreed && truth.affirmativeContinue && value.verdict === 'continue') {
+    agreed = APPROVAL_REPLY_RE.test(String(value.message || '').trim());
+  }
   return {
     expected: truth.expected, rule: truth.rule, actual: value.verdict, agreed,
     // Half credit, reported separately so it can never inflate the agreement
@@ -827,7 +859,11 @@ function emptyScore() {
     bands[band] = { band, label: BAND_LABELS[band], total: 0, agreed: 0, verdicts: {} };
     for (const verdict of VERDICTS) bands[band].verdicts[verdict] = { predicted: 0, correct: 0 };
   }
-  return { rows, confusion, bands, total: 0, agreed: 0, soft: 0, skipped: { total: 0, reasons: {} } };
+  return {
+    rows, confusion, bands, total: 0, agreed: 0, soft: 0,
+    // Which ground-truth rule is driving the misses, without dumping samples.
+    rules: new Map(), skipped: { total: 0, reasons: {} },
+  };
 }
 
 function finishScore(score) {
@@ -848,6 +884,9 @@ function finishScore(score) {
     }
     return { ...row, verdicts, agreement: row.total ? row.agreed / row.total : null };
   });
+  const rules = [...score.rules.values()]
+    .map((row) => ({ ...row, agreement: row.total ? row.agreed / row.total : null }))
+    .sort((a, b) => b.total - a.total || a.rule.localeCompare(b.rule));
   return {
     total: score.total,
     agreed: score.agreed,
@@ -856,6 +895,7 @@ function finishScore(score) {
     softAgreement: score.total ? score.soft / score.total : null,
     rows,
     bands,
+    rules,
     confusion: score.confusion,
     skipped: score.skipped,
   };
@@ -934,6 +974,11 @@ async function replay(options = {}) {
     score.rows[scored.expected].expected += 1;
     if (scored.agreed) score.rows[scored.expected].correct += 1;
     score.confusion[scored.expected][scored.actual] += 1;
+    if (!score.rules.has(scored.rule)) score.rules.set(scored.rule, { rule: scored.rule, total: 0, agreed: 0, soft: 0 });
+    const rule = score.rules.get(scored.rule);
+    rule.total += 1;
+    rule.soft += scored.soft;
+    if (scored.agreed) rule.agreed += 1;
     const band = score.bands[confidenceBand(value.confidence)];
     band.total += 1;
     if (scored.agreed) band.agreed += 1;
@@ -1030,7 +1075,7 @@ function stats(options = {}) {
 
 module.exports = {
   VERDICTS, SELF_CHECK_MESSAGE, SYSTEM_PROMPT, INSTRUCTION, TIMEOUT_MS, MAX_CONTEXT_BYTES,
-  askedQuestion, stopHint, namesNextStep, claimsDone, explicitPause, inProgress, waitingOnCheck,
+  askedQuestion, askedForAction, stopHint, namesNextStep, claimsDone, explicitPause, inProgress, waitingOnCheck,
   signalsFor, ruleVerdict, selectTurns, turnsForReplay, turnFor, buildContext, invocationFor,
   firstJsonObject, parseVerdict, runModel, spawnRunner, judge, writeVerdict, setDecisionId, decisionTypeFor,
   tick, enabled, replay, groundTruth, scoreOne, unquoted, confidenceBand, BANDS, BAND_LABELS,

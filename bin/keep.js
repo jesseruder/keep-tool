@@ -6113,6 +6113,14 @@ function renderScoreboard(result, watcher) {
     lines.push(`${band.label.padEnd(12)}${String(band.total).padStart(7)}${watcherPct(band.agreement).padStart(7)}`
       + `${String(cont.predicted).padStart(10)}${watcherPct(cont.precision).padStart(12)}`);
   }
+  // Which ground-truth rule is driving the misses, without reading samples.
+  if (result.rules && result.rules.length) {
+    lines.push('', `${'ground truth rule'.padEnd(26)}${'turns'.padStart(7)}${'agree'.padStart(7)}${'rate'.padStart(7)}`);
+    for (const rule of result.rules) {
+      lines.push(`${rule.rule.padEnd(26)}${String(rule.total).padStart(7)}${String(rule.agreed).padStart(7)}`
+        + `${watcherPct(rule.agreement).padStart(7)}`);
+    }
+  }
   lines.push('', 'confusion (rows = what Owner did, columns = what the watcher said)');
   lines.push(`${''.padEnd(12)}${watcher.VERDICTS.map((verdict) => verdict.padStart(12)).join('')}`);
   for (const expected of watcher.VERDICTS) {

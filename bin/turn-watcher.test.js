@@ -842,6 +842,15 @@ test('replay scores each verdict against what Owner actually typed next', async 
   assert.equal(result.skipped.total, 0);
   assert.ok(Array.isArray(result.bands) && result.bands.length === watcher.BANDS.length);
 
+  // Per-rule agreement says which ground-truth rule is driving the misses.
+  assert.ok(Array.isArray(result.rules) && result.rules.length);
+  assert.equal(result.rules.reduce((sum, row) => sum + row.total, 0), result.total);
+  assert.equal(result.rules.reduce((sum, row) => sum + row.agreed, 0), result.agreed);
+  for (const row of result.rules) {
+    assert.equal(typeof row.rule, 'string');
+    assert.equal(row.agreement, row.agreed / row.total);
+  }
+
   // The replay never writes decisions, and it marks its rows as replays.
   const models = turnIndex.open().prepare('SELECT verdict_model FROM turns WHERE verdict IS NOT NULL').all();
   assert.ok(models.length >= 4);
@@ -851,9 +860,11 @@ test('replay scores each verdict against what Owner actually typed next', async 
 
 test('replay ground truth follows the rules in order, one case each', (t) => {
   sandbox(t);
-  const asked = { last_assistant: 'Should I delete the old flag?' };
-  const physical = { last_assistant: 'I need you to unlock the phone so adb can see it.' };
-  const told = { last_assistant: "Parser built. Next, I'll wire the CLI." };
+  const asked = { last_assistant: 'Should I delete the old flag?', tool_count: 3, opener_kind: 'human' };
+  const physical = { last_assistant: 'I need you to unlock the phone so adb can see it.', tool_count: 2, opener_kind: 'human' };
+  // A working turn: it ran tools and named its own next step, so a following
+  // nudge is a restart rather than an approval.
+  const told = { last_assistant: "Parser built. Next, I'll wire the CLI.", tool_count: 4, opener_kind: 'human' };
   const truth = (turn, text, kind = 'human') => watcher.groundTruth(turn, { opener_text: text, opener_kind: kind });
 
   // 1. Only Owner is ground truth.
@@ -877,14 +888,18 @@ test('replay ground truth follows the rules in order, one case each', (t) => {
   assert.equal(truth(physical, 'i gave access').expected, 'needs-input');
   assert.equal(truth(physical, 'pasted').expected, 'needs-input');
 
-  // 4. A premise challenge or an open question wanted a conversation.
+  // 4. A premise challenge wanted a conversation — explicit starters only.
   for (const text of ["i'm confused, why is it doing that", "i don't think that's right",
-    'do you think that matters?', 'why would it need the flag', "isn't that the old path",
-    'are you sure about the migration', 'hmm that seems wrong', 'what about the other card']) {
+    "do you think that's right?", "isn't that the old path", 'are you sure about the migration',
+    'why did you touch the config', "that's not what the card says", 'i thought we agreed on the other one']) {
     assert.equal(truth(told, text).expected, 'needs-input', text);
     assert.equal(truth(told, text).rule, 'premise-challenge', text);
   }
-  assert.equal(truth(told, 'should the docs mention the cap?').expected, 'needs-input', 'a trailing ? is a question');
+  // 4b. Any other question, with nothing pending, is Owner opening a new topic.
+  const fresh = truth(told, 'should the docs mention the cap?');
+  assert.equal(fresh.expected, 'quiet');
+  assert.equal(fresh.rule, 'new-question');
+  assert.equal(truth(told, 'what about the other card?').rule, 'new-question');
   assert.equal(truth(told, 'anything else?').expected, 'continue', 'except the ones that are just nudges');
 
   // 5. Nudges and affirmatives.
@@ -910,6 +925,70 @@ test('replay ground truth follows the rules in order, one case each', (t) => {
   // 7. Anything else is a new instruction, which is Owner working, not nudging.
   assert.equal(truth(told, 'now write the docs for the new endpoint').expected, 'quiet');
   assert.equal(truth(told, 'add a test for the empty case').expected, 'quiet');
+});
+
+test('a request only Owner can act on makes the reply an answer, not a nudge', (t) => {
+  sandbox(t);
+  // proseRequest does not see these, and widening it would change attention for
+  // the whole fleet, so the watcher keeps its own signal.
+  for (const text of ['Please unlock the phone so adb can see it.', 'Please paste the token here.',
+    'Let me know when the deploy finishes.', "Tell me when you're ready.",
+    'Reply done once the migration has run.', "Once you've approved it I will continue.",
+    'Please sign in to the console first.', "I'll retry when you're ready."]) {
+    assert.equal(watcher.askedForAction(text), true, `expected an action request: ${text}`);
+  }
+  for (const text of ['The test waits until you tell the mock server to respond.',
+    'I fixed the parser and ran the suite.', 'Please note that the cap is 4 KiB.']) {
+    assert.equal(watcher.askedForAction(text), false, `not an action request: ${text}`);
+  }
+
+  const asked = { last_assistant: 'Please unlock the phone so adb can see it.', tool_count: 2, opener_kind: 'human' };
+  const truth = (text) => watcher.groundTruth(asked, { opener_text: text, opener_kind: 'human' });
+  // This is the case that used to fall through to the nudge rule.
+  for (const reply of ['done', 'unlocked', 'ok', 'ready', "it's happening now", 'pasted']) {
+    assert.equal(truth(reply).expected, 'needs-input', reply);
+    assert.equal(truth(reply).rule, 'answered-a-question', reply);
+  }
+  // A correction still outranks the answer.
+  assert.equal(truth("done, but don't push yet").expected, 'drift');
+});
+
+test('a nudge after a turn that only recommended is an approval, not a restart', (t) => {
+  sandbox(t);
+  // No tools, no named next step, opened by Owner: the session answered or
+  // proposed. Eight of eight inspected misses in the second replay were this.
+  const proposed = { last_assistant: 'Both would work. I would put the cap on the reader.', tool_count: 0, opener_kind: 'human' };
+  const worked = { last_assistant: 'Cap added and the suite is green.', tool_count: 6, opener_kind: 'human' };
+  const named = { last_assistant: "No tools needed. Next, I'll add the cap.", tool_count: 0, opener_kind: 'human' };
+  const truth = (turn, text) => watcher.groundTruth(turn, { opener_text: text, opener_kind: 'human' });
+
+  for (const reply of ["ok let's do that", 'continue', "ok let's build that", 'go ahead', 'do it']) {
+    const row = truth(proposed, reply);
+    assert.equal(row.expected, 'needs-input', reply);
+    assert.equal(row.rule, 'approval', reply);
+    assert.equal(row.soft, 'quiet', reply);
+  }
+  // A nudge after real work is still a restart.
+  assert.equal(truth(worked, "ok let's do that").rule, 'nudge');
+  assert.equal(truth(worked, "ok let's do that").expected, 'continue');
+  // …and so is one after the session named its own next step.
+  assert.equal(truth(named, 'continue').rule, 'nudge');
+  // A keep-opened turn is not a proposal Owner made room for.
+  assert.equal(watcher.groundTruth({ ...proposed, opener_kind: 'keep' },
+    { opener_text: 'continue', opener_kind: 'human' }).rule, 'nudge');
+
+  // Scoring: needs-input agrees, quiet is half right, continue only counts when
+  // the watcher actually carried the approval.
+  const next = { opener_text: "ok let's do that", opener_kind: 'human' };
+  assert.equal(watcher.scoreOne(proposed, next, { verdict: 'needs-input', message: 'yes, do that' }).agreed, true);
+  const soft = watcher.scoreOne(proposed, next, { verdict: 'quiet', message: '' });
+  assert.equal(soft.agreed, false);
+  assert.equal(soft.soft, 0.5);
+  assert.equal(watcher.scoreOne(proposed, next, { verdict: 'continue', message: 'yes, do that' }).agreed, true);
+  assert.equal(watcher.scoreOne(proposed, next, { verdict: 'continue', message: 'ok go' }).agreed, true);
+  assert.equal(watcher.scoreOne(proposed, next, { verdict: 'continue', message: 'continue' }).agreed, false,
+    'a bare restart did not carry the approval');
+  assert.equal(watcher.scoreOne(proposed, next, { verdict: 'drift', message: 'no' }).agreed, false);
 });
 
 test('scoring gives half credit where quiet was the harmless answer', (t) => {
@@ -1014,6 +1093,7 @@ test('the scoreboard reports agreement by confidence band and is kept on disk', 
   assert.equal(saved.total, 3);
   assert.ok(Number.isFinite(saved.at));
   assert.ok(Array.isArray(saved.bands));
+  assert.ok(Array.isArray(saved.rules) && saved.rules.length, 'the per-rule table is persisted too');
 
   const latest = watcher.latestReplay();
   assert.equal(latest.file, result.savedTo);

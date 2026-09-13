@@ -204,7 +204,7 @@ What each verdict means:
 
 Rules:
 - A completion report — the session says it is done, landed, or finished, and names no next step — is `continue` with the self-check message, unless the turn already shows pushed commits, a Keep check-in, and a verification that reproduced the original symptom; in that case it is `quiet`.
-- When Owner's opening message was a question and the turn answers it, that is `quiet`. When the turn ends by proposing something and asking for a go-ahead, it is `continue` with a short affirmative only if the proposal is reversible and inside the card's scope; otherwise it is `needs-input` with the answer you would propose.
+- A turn that only answers Owner's question, with no proposal and no next action, is `quiet`. A turn that ends with a recommendation, an offer ("I can also…", "want me to…", "should I…"), or a numbered plan is never `quiet`: it is `needs-input` with the reply you would give (usually "yes, do that") when the proposed action is reversible and inside the card's scope; `continue` when the session already named its own next step and no approval is needed; `needs-input` with an empty message when only Owner can decide.
 - Set confidence honestly. A `continue` below 0.7 will never be sent, so a low number costs nothing and an inflated one costs trust.
 - A deterministic rule pass already ran; its answer is given as RULE VERDICT. Agree with it unless the evidence says otherwise, and if you disagree your `reason` must say what the rule missed.
 - `message` is delivered verbatim if Owner approves it, so write it the way Owner types: lowercase, imperative, no greeting, no sign-off, no markdown.
@@ -275,37 +275,52 @@ are written against those cases:
 2. **Quoted relay** → skip. Lines starting with `>` are stripped first; if
    nothing is left, Owner was relaying another session's output, which says
    nothing about what he wanted done here.
-3. **The session asked** → `needs-input`. If `askedQuestion` is true, whatever
-   came back is Owner answering — "yes", but also "done", "unlocked", "ready",
-   "it's happening now", "i gave access", "pasted". Reading those as nudges was
-   the single biggest scorer defect.
-4. **Premise challenge or open question** → `needs-input`. `i'm confused`,
-   `i don't think`, `why would`, `isn't`, `are you sure`, `hmm`, `what about`, or
-   any message ending in `?` that is not itself a nudge. Owner wanted a
-   conversation, so `continue` is a miss — but `quiet` at least left him alone,
-   so it earns **half credit in a separate `soft` column**, never in the
-   agreement number.
-5. **Approval carrying a correction** → `drift`. "go ahead, but don't push",
+3. **Approval carrying a correction** → `drift`. "go ahead, but don't push",
    "do it instead in staging", "sure, proceed, but stop before deployment": Owner
-   narrowing the work is not Owner waving it through, and reading it as a plain
-   nudge loses the half that mattered. Checked in the first 120 characters,
-   before the nudge rule.
-6. **Nudge or affirmative** → `continue`. `isNudge`, plus "ok let's", "go
+   narrowing the work is not Owner waving it through. Checked in the first 120
+   characters, and **before** the answer rules — a correction outranks an answer.
+4. **The session asked** → `needs-input`. If `askedQuestion` **or**
+   `askedForAction` is true, whatever came back is Owner answering — "yes", but
+   also "done", "unlocked", "ready", "it's happening now", "pasted". Reading
+   those as nudges was the single biggest scorer defect.
+5. **Premise challenge** → `needs-input`, with `quiet` as **half credit in a
+   separate `soft` column** (never in the agreement number). Explicit starters
+   only, in the first 60 characters: `i'm confused`, `i don't think`,
+   `do you think that's`, `are you sure`, `isn't`, `wouldn't`, `shouldn't`,
+   `why did/would you`, `that's not`, `i thought`.
+6. **Conversational approval** → `needs-input` (rule `approval`), with `quiet` as
+   half credit. A turn that ran **no tools**, named **no next step**, and was
+   opened by Owner did not stop mid-work: it answered or recommended, so his
+   "ok let's do that" is approving a proposal, not restarting a stalled session.
+   `continue` counts as agreement here **only if the proposed message actually
+   carries the approval** (`yes`, `ok`, `go ahead`, `do it`) — a bare "continue"
+   does not. Eight of eight inspected misses in the second replay were this shape.
+7. **Nudge or affirmative** → `continue`. `isNudge`, plus "ok let's", "go
    ahead", "do it", "proceed", "ship it", "run it", "keep going until…".
-   "anything else?" stays a nudge.
-7. **Redirect** → `drift`. The redirect words, in the first 80 characters of what
+   "anything else?" stays a nudge. This is where a nudge lands after a *working*
+   turn (tools ran, or the session named its next step).
+8. **Redirect** → `drift`. The redirect words, in the first 80 characters of what
    Owner actually wrote (after quoted lines are stripped).
-8. **Anything else** → `quiet`. A substantive new instruction is Owner working,
-   not Owner correcting.
+9. **Any other question** → `quiet` (rule `new-question`). With nothing pending,
+   Owner asking something is him opening a new topic, not the session failing to
+   unblock itself.
+10. **Anything else** → `quiet`. A substantive new instruction is Owner working,
+    not Owner correcting.
+
+The scoreboard reports **agreement per ground-truth rule**, so a bad rule is
+visible without reading samples — which is how rules 4 and 6 were found.
 
 Ground truth is evaluated **before** the model call, so a turn that cannot be
 scored never costs a verdict. The scoreboard reports `skipped` with its reasons.
 
-Rule 3 is only as strong as `askedQuestion`, which is
-`session-status.proseRequest`. A bare imperative it does not recognise
-("Unlock the phone and I will retry.") still lets a following "done" fall
-through to rule 5. Widening that regex changes fleet-wide attention behaviour, so
-it is left alone and the residual case is a test.
+`askedQuestion` is `session-status.proseRequest`, which sees a question or a
+"please provide" but not "please unlock the phone" or "let me know when the
+deploy finishes". Widening it would change attention behaviour for the whole
+fleet, so the watcher keeps its own `askedForAction` signal for the physical asks
+and rule 4 fires on either. `askedForAction` is scorer-local on purpose: it is
+deliberately **not** in `signalsFor` or the rule chain, so the RULE VERDICT the
+model is shown stays identical between replay rounds and the measurement is not
+confounded by a changed prompt.
 
 ### Confidence bands
 
