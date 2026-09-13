@@ -52,7 +52,8 @@ function tokenMatches(candidate, expected) {
 }
 
 function authorized(req, deps) {
-  return (deps.isLocal(req.socket.remoteAddress) && localHost(req.headers.host))
+  return tokenMatches(req.headers['x-keep-proxy-token'], deps.internalToken)
+    || (deps.isLocal(req.socket.remoteAddress) && localHost(req.headers.host))
     || tokenMatches(req.headers['x-keep-token'], deps.token);
 }
 
@@ -188,6 +189,7 @@ function install(input) {
     hostClient: input.hostClient,
     hostRequest: input.hostRequest,
     token: input.token || '',
+    internalToken: input.internalToken || '',
     killGraceMs: input.killGraceMs == null ? 2000 : Math.max(0, Number(input.killGraceMs) || 0),
     isLocal: input.isLocal || ((addr) => addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1'),
   };
@@ -377,4 +379,6 @@ function install(input) {
   };
 }
 
-module.exports = { install, validateLayouts, readLayouts, writeLayouts, sameOrigin, authorized };
+module.exports = {
+  VENDOR, install, validateLayouts, readLayouts, writeLayouts, sameOrigin, authorized, staticPath, serveFile,
+};

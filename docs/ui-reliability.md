@@ -1,5 +1,35 @@
 # Desktop interaction QA
 
+## Request isolation
+
+`keep serve` gives the public TCP listener to a supervised child process. That
+process serves `/`, `/app`, allowlisted `/vendor` files, SSE, terminal WebSocket
+upgrades, layouts, portable-transfer summaries, and every `/api/state` projection
+from its last completed publication. The daemon keeps action ordering, injection
+locks, restart admission, and every authoritative mutation behind a mode-0600 Unix
+socket. The frontend authenticates the real public peer and Host before forwarding
+a request, strips forwarded identity headers, and uses a private per-process token
+for the Unix hop. It never retries writes.
+
+State production runs on invalidation and a 30-second cadence. Refreshes coalesce
+to one active build and one follow-up; a failed build leaves the last valid state in
+place. Before the first real publication, cached routes return bounded `503` loading
+responses. Successful writes receive a daemon-epoch mutation fence. State and
+portable-transfer reads wait silently for a publication carrying that fence, which
+keeps immediate post-action reloads coherent without making ordinary reads depend
+on the daemon event loop. `x-keep-state-generated-at`, `x-keep-state-version`, and
+`x-keep-mutation-fence` expose the publication age and boundary.
+
+The focused isolation test deliberately blocks the daemon fixture for 10.5 seconds:
+
+```sh
+node --require ./scripts/test-env.cjs --test bin/ui-request-worker.test.js
+```
+
+It requires cached state, root/app/vendor assets, layouts, portable transfers, and
+an SSE heartbeat to respond in under one second. The same test covers one-shot
+action proxying and frontend-worker replacement with retained-state republish.
+
 Keep Desktop loads the web console in a Tauri WebKit window. Test the production
 frontend against the isolated backend in `tests/ui/fixture.cjs`: it creates a
 disposable temporary project, 12 fake sessions, and WebSocket terminals that echo

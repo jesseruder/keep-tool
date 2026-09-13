@@ -9,7 +9,7 @@
   "scripts": {
     "desktop:dev": "npm --prefix desktop run dev",
     "desktop:build": "npm --prefix desktop run build",
-    "test": "node --require ./scripts/test-env.cjs --test bin/*.test.js",
+    "test": "node --require ./scripts/test-env.cjs --test bin/*.test.js web/app/*.test.js",
     "postinstall": "chmod +x node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null || true",
     "check:public": "node scripts/check-public.cjs",
     "prepack": "npm run check:public",

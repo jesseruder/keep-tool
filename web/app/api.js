@@ -1,10 +1,38 @@
 const WRITE_HEADERS = { 'content-type': 'application/json' };
+const STATE_MUTATIONS = new Set([
+  '/api/abandon-account-handoff', '/api/ack', '/api/add', '/api/answer', '/api/checkin',
+  '/api/close-idle', '/api/close-session', '/api/compact', '/api/decisions/judge',
+  '/api/handoff-session', '/api/notifications', '/api/open', '/api/panes/spawn',
+  '/api/portable-transfers', '/api/reopen-session', '/api/resolve-portable-transfer',
+  '/api/restart-daemon', '/api/restart-session', '/api/review-queue', '/api/reviewtick',
+  '/api/run', '/api/send', '/api/setaside', '/api/stop', '/api/transfer-session',
+]);
+let stateAfterMutation = '';
+let observedMutationFence = '';
+
+function rememberMutationFence(fence) {
+  const [epoch, sequenceText] = String(fence || '').split(':');
+  const sequence = Number(sequenceText);
+  if (!epoch || !Number.isSafeInteger(sequence)) return;
+  const [currentEpoch, currentSequenceText] = observedMutationFence.split(':');
+  const currentSequence = Number(currentSequenceText);
+  if (epoch !== currentEpoch || !Number.isSafeInteger(currentSequence) || sequence > currentSequence) {
+    observedMutationFence = `${epoch}:${sequence}`;
+    stateAfterMutation = observedMutationFence;
+  }
+}
 
 // Read routes that expose session or handoff detail demand the header too — it forces
 // a CORS preflight, so a hostile page cannot reach them. Sending it on every request
 // keeps a newly guarded GET from 403ing the whole dashboard reload.
 async function request(url, options = {}) {
-  const response = await fetch(url, { ...options, headers: { 'x-keep': '1', ...options.headers } });
+  const pathname = new URL(url, location.origin).pathname;
+  const requiredFence = stateAfterMutation;
+  const headers = { 'x-keep': '1', ...options.headers };
+  if ((pathname === '/api/state' || pathname === '/api/portable-transfers') && requiredFence) {
+    headers['x-keep-after-mutation'] = requiredFence;
+  }
+  const response = await fetch(url, { ...options, headers });
   const text = await response.text();
   let body = null;
   try { body = text ? JSON.parse(text) : null; } catch {}
@@ -14,6 +42,32 @@ async function request(url, options = {}) {
     error.body = body;
     throw error;
   }
+  const fence = response.headers.get('x-keep-mutation-fence') || '';
+  if (pathname === '/api/state' || pathname === '/api/portable-transfers') {
+    const [publishedEpoch, publishedSequenceText] = fence.split(':');
+    const latestRequired = observedMutationFence;
+    const [requiredEpoch, requiredSequenceText] = latestRequired.split(':');
+    const publishedSequence = Number(publishedSequenceText);
+    const requiredSequence = Number(requiredSequenceText);
+    const [sentEpoch] = requiredFence.split(':');
+    const restarted = Boolean(requiredFence && sentEpoch === requiredEpoch && publishedEpoch && publishedEpoch !== requiredEpoch);
+    const satisfied = !latestRequired || restarted
+      || (publishedEpoch === requiredEpoch && Number.isSafeInteger(publishedSequence)
+        && Number.isSafeInteger(requiredSequence) && publishedSequence >= requiredSequence);
+    if (!satisfied) {
+      const error = new Error('dashboard state refresh is pending');
+      error.status = 503;
+      error.body = { error: error.message };
+      throw error;
+    }
+    if (restarted) observedMutationFence = fence;
+    if (pathname === '/api/state' && (!stateAfterMutation || stateAfterMutation === latestRequired || restarted)) {
+      stateAfterMutation = '';
+    }
+  }
+  else if ((options.method || 'GET') !== 'GET'
+      && (STATE_MUTATIONS.has(pathname) || /^\/api\/panes\/[^/]+\/(?:kill|remove)$/.test(pathname))
+      && fence) rememberMutationFence(fence);
   return body;
 }
 
@@ -21,9 +75,22 @@ let stateRequest;
 let queuedStateRequest;
 
 async function fetchState() {
+  return freshRequest('/api/state?summary=1');
+}
+
+async function freshRequest(url) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10000);
-  try { return await request('/api/state?summary=1', { signal: controller.signal }); }
+  try {
+    while (true) {
+      try { return await request(url, { signal: controller.signal }); }
+      catch (error) {
+        if (controller.signal.aborted || error.status !== 503
+            || error.body?.error !== 'dashboard state refresh is pending') throw error;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+  }
   catch (error) {
     if (controller.signal.aborted) throw new Error('State refresh timed out after 10 seconds');
     throw error;
@@ -55,7 +122,7 @@ export const getDashboardDetail = (kind, id) => request(`/api/dashboard-detail?k
 export const searchDashboardReviews = (query) => request(`/api/dashboard-review-search?q=${encodeURIComponent(query)}`);
 export const getPendingDecisions = (sessionId) => request(`/api/decisions?session=${encodeURIComponent(sessionId)}&pending=1`);
 export const judgeDecision = (id, verdict, message) => write('/api/decisions/judge', { id, verdict, message });
-export const getPortableTransfers = () => request('/api/portable-transfers');
+export const getPortableTransfers = () => freshRequest('/api/portable-transfers');
 export const getPortableTransferDraft = (sessionId) => request(`/api/portable-transfer-draft?session=${encodeURIComponent(sessionId)}`);
 export const getPortableTransferPreview = (transferId) => request(`/api/portable-transfer-preview?id=${encodeURIComponent(transferId)}`);
 export const preparePortableTransfer = (body) => write('/api/portable-transfers', body);

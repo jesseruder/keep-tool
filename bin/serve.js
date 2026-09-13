@@ -58,6 +58,8 @@ const {
   wantsLightweightState, lightweightState, dashboardDetail, reviewQueueSearch,
 } = require('./dashboard-state');
 const { createDashboardWorker } = require('./dashboard-worker');
+const { createDashboardPublisher } = require('./dashboard-publisher');
+const { createUiRequestWorker } = require('./ui-request-worker');
 const execFileAsync = promisify(execFile);
 const ATTENTION_KINDS = new Set(['question', 'plan', 'permission', 'complete', 'input', 'review', 'blocked', 'overdue', 'unblocked', 'health', 'stalled']);
 const CODEX_DIALOG_MARKERS = [
@@ -6668,6 +6670,15 @@ function start(deps = {}) {
   const terminalProfile = deps.terminalProfile || require('./terminal-profile').createTerminalProfileStore();
   let consoleServer = null;
   let dashboardBuilder = null;
+  let dashboardPublisher = null;
+  let uiWorker = null;
+  let backendServer = null;
+  let backendSock = null;
+  let retainedPublication = null;
+  let announced = false;
+  const mutationEpoch = crypto.randomBytes(12).toString('hex');
+  let mutationSequence = 0;
+  const mutationFence = () => `${mutationEpoch}:${mutationSequence}`;
   const shutdown = () => {
     if (inFlightSwap) {
       const action = shutdownSettingsRepair(inFlightSwap, readClaudeSettingsModel());
@@ -6682,8 +6693,12 @@ function start(deps = {}) {
         }
       }
     }
+    dashboardPublisher?.close();
     dashboardBuilder?.close();
+    uiWorker?.close();
     consoleServer?.close();
+    backendServer?.close();
+    try { if (backendSock) fs.unlinkSync(backendSock); } catch {}
     process.exit(0);
   };
   process.on('SIGTERM', shutdown);
@@ -6694,18 +6709,6 @@ function start(deps = {}) {
     if (fs.statSync(logFile).size > 5 * 1024 * 1024) fs.truncateSync(logFile);
   } catch {}
 
-  const clients = new Set();
-  let pending = null;
-  const broadcast = () => {
-    if (pending) return;
-    pending = setTimeout(() => {
-      pending = null;
-      for (const res of clients) res.write('data: change\n\n');
-    }, 1500);
-  };
-  onChange = broadcast;
-  // A focus request (mobile 'Open on Mac') is a named SSE event the console acts on.
-  onFocus = (sessionId) => { for (const res of clients) res.write(`event: focus\ndata: ${sessionId}\n\n`); };
   dashboardBuilder = deps.dashboardWorker || createDashboardWorker({
     prepare: (input) => ({ ...input, dashboardRuntime: dashboardRuntimeSnapshot() }),
     finalize: finalizeDashboardWorkerResult,
@@ -6717,17 +6720,28 @@ function start(deps = {}) {
     hostPanes: options.hostPanes || [],
     companion: options.companion || null,
   });
-  // Fill the worker's parser caches during daemon startup. The first real
-  // request with the same host snapshot coalesces with this build.
-  setImmediate(async () => {
-    try {
+  dashboardPublisher = createDashboardPublisher({
+    prepare: async () => {
       const panes = await listHostPanes(deps);
+      await reviewQueue.reconcile({ inspectLaunch: (active) => inspectReviewQueueLaunch(active) });
       const companion = await companionSnapshot(deps);
-      await dashboardBuild({ hostPanes: panes, companion });
-    } catch (error) {
-      process.stderr.write(`keep serve: dashboard warmup failed: ${error.message}\n`);
-    }
+      return { hostPanes: panes, companion, mutationFence: mutationFence() };
+    },
+    build: async (input) => ({
+      state: await dashboardBuild(input),
+      portableTransfers: listPortableTransfers(),
+      mutationFence: input.mutationFence,
+    }),
+    publish: (publication) => {
+      retainedPublication = publication;
+      uiWorker?.publish(publication);
+    },
+    onError: (error) => process.stderr.write(`keep serve: dashboard refresh failed; retaining published state: ${error.message}\n`),
   });
+  const broadcast = () => dashboardPublisher.invalidate();
+  onChange = broadcast;
+  // A focus request (mobile 'Open on Mac') is a named SSE event the console acts on.
+  onFocus = (sessionId) => uiWorker?.event({ type: 'focus', data: sessionId });
 
   const watch = (target, opts, invalidate) => {
     try {
@@ -6737,43 +6751,46 @@ function start(deps = {}) {
       process.stderr.write(`keep serve: cannot watch ${target} (${e.message}); relying on client polling\n`);
     }
   };
-  watch(keep.TASKS, null, (name) => dashboardBuilder.invalidate({ kind: 'tasks', name }));
+  watch(keep.TASKS, null, (name) => { dashboardBuilder.invalidate({ kind: 'tasks', name }); dashboardPublisher.invalidate(); });
   // Watch the directory so ledger creation and atomic read-state renames are seen.
   try {
     const inboxWatch = fs.watch(path.join(keep.ROOT, '.keep'), (_event, name) => {
       if (!name || ['alerts.jsonl', 'notifications.json', 'quiet.json'].includes(String(name))) {
         dashboardBuilder.invalidate({ kind: 'runtime', name });
+        dashboardPublisher.invalidate();
         broadcast();
       }
     });
     inboxWatch.on('error', () => {});
   } catch {} // The console's periodic refresh also covers inbox changes.
-  watch(path.join(keep.ROOT, 'digests'), null, (name) => dashboardBuilder.invalidate({ kind: 'digests', name }));
+  watch(path.join(keep.ROOT, 'digests'), null, (name) => { dashboardBuilder.invalidate({ kind: 'digests', name }); dashboardPublisher.invalidate(); });
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'attention'), { recursive: true }); } catch {}
-  watch(path.join(keep.ROOT, '.keep', 'attention'), null, (name) => dashboardBuilder.invalidate({ kind: 'attention', name }));
+  watch(path.join(keep.ROOT, '.keep', 'attention'), null, (name) => { dashboardBuilder.invalidate({ kind: 'attention', name }); dashboardPublisher.invalidate(); });
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'unblocked'), { recursive: true }); } catch {}
-  watch(path.join(keep.ROOT, '.keep', 'unblocked'), null, (name) => dashboardBuilder.invalidate({ kind: 'unblocked', name }));
+  watch(path.join(keep.ROOT, '.keep', 'unblocked'), null, (name) => { dashboardBuilder.invalidate({ kind: 'unblocked', name }); dashboardPublisher.invalidate(); });
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'review'), { recursive: true }); } catch {}
-  watch(path.join(keep.ROOT, '.keep', 'review'), null, (name) => dashboardBuilder.invalidate({ kind: 'review', name }));
+  watch(path.join(keep.ROOT, '.keep', 'review'), null, (name) => { dashboardBuilder.invalidate({ kind: 'review', name }); dashboardPublisher.invalidate(); });
   for (const entry of claudeProjectRoots) {
     watch(entry.root, { recursive: true }, (name) => {
       claudeTranscriptIndex.invalidate(entry.root, name);
       if (name) backgroundJobScheduler?.wakeFile(path.join(entry.root, String(name)));
       dashboardBuilder.invalidate({ kind: 'claude', root: entry.root, name });
+      dashboardPublisher.invalidate();
     });
   }
   for (const sessionsRoot of new Set(codex.configuredRoots().map((entry) => path.join(entry.configDir, 'sessions')))) {
     watch(sessionsRoot, { recursive: true }, (name) => {
       if (name) backgroundJobScheduler?.wakeFile(path.join(sessionsRoot, String(name)));
       dashboardBuilder.invalidate({ kind: 'codex', root: sessionsRoot, name });
+      dashboardPublisher.invalidate();
     });
   }
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'lifecycle'), { recursive: true }); } catch {}
   watch(path.join(keep.ROOT, '.keep', 'lifecycle'), { recursive: true },
-    (name) => dashboardBuilder.invalidate({ kind: 'lifecycle', name }));
+    (name) => { dashboardBuilder.invalidate({ kind: 'lifecycle', name }); dashboardPublisher.invalidate(); });
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'session-accounts'), { recursive: true }); } catch {}
   watch(path.join(keep.ROOT, '.keep', 'session-accounts'), null,
-    (name) => dashboardBuilder.invalidate({ kind: 'accounts', name }));
+    (name) => { dashboardBuilder.invalidate({ kind: 'accounts', name }); dashboardPublisher.invalidate(); });
   try { fs.mkdirSync(path.join(keep.ROOT, '.keep', 'background-jobs'), { recursive: true }); } catch {}
   // Only immutable hook inbox writes wake a parked ledger here. sync() itself
   // atomically rewrites state.json, and waking on that write would immediately
@@ -6783,6 +6800,7 @@ function start(deps = {}) {
       if (!backgroundJobScheduler?.wakeInbox(name)) return;
       const key = String(name).split(/[\\/]+/).slice(0, 2).join(':');
       dashboardBuilder.invalidate({ kind: 'background-jobs', name: key });
+      dashboardPublisher.invalidate();
       broadcast();
     });
     jobsWatch.on('error', () => {});
@@ -6814,6 +6832,7 @@ function start(deps = {}) {
       }
       if (jobsChanged(key, result)) {
         dashboardBuilder.invalidate({ kind: 'background-jobs', name: key });
+        dashboardPublisher.invalidate();
         broadcast();
       }
     } catch (error) { process.stderr.write(`keep jobs: ${error.message}\n`); }
@@ -7109,7 +7128,7 @@ function start(deps = {}) {
     try {
       const url = new URL(req.url, 'http://localhost');
 
-      const authError = apiRequestAuthError(req, { isLocal, token });
+      const authError = apiRequestAuthError(req, { isLocal, token, internalToken: backendToken });
       if (authError) return json(res, authError.status, { error: authError.error });
 
       if (req.method === 'GET' && url.pathname === '/api/terminal-profile') {
@@ -7588,14 +7607,7 @@ function start(deps = {}) {
         const body = JSON.stringify(responseState);
         await sendStateJson(req, res, body);
       } else if (url.pathname === '/api/events') {
-        res.writeHead(200, {
-          'content-type': 'text/event-stream',
-          'cache-control': 'no-cache',
-          connection: 'keep-alive',
-        });
-        res.write('data: hello\n\n');
-        clients.add(res);
-        req.on('close', () => clients.delete(res));
+        return json(res, 503, { error: 'events are served by the frontend worker' });
       } else {
         res.writeHead(404);
         res.end('not found');
@@ -7609,6 +7621,7 @@ function start(deps = {}) {
     }
   });
 
+  const backendToken = crypto.randomBytes(32).toString('hex');
   consoleServer = keepConsole.install({
     server,
     hostClient: () => require('./hostclient.js').connect({ timeoutMs: HOST_CONNECT_TIMEOUT_MS }),
@@ -7617,11 +7630,59 @@ function start(deps = {}) {
     hostConnectTimeoutMs: HOST_CONNECT_TIMEOUT_MS,
     isLocal,
     token,
+    internalToken: backendToken,
     root: keep.ROOT,
   });
+  // This listener runs before both the console and daemon route handlers. A
+  // successful authoritative request receives a core-owned fence only after its
+  // mutation has completed, at writeHead. Dashboard builds capture the fence in
+  // prepare(), so an older in-flight build can never satisfy a post-write reload.
+  server.prependListener('request', (req, res) => {
+    if (req.method === 'GET' || req.method === 'HEAD') return;
+    const writeHead = res.writeHead;
+    let fenced = false;
+    res.writeHead = function fencedWriteHead(status, ...args) {
+      if (!fenced && status >= 200 && status < 300) {
+        fenced = true;
+        mutationSequence += 1;
+        res.setHeader('x-keep-mutation-fence', mutationFence());
+        dashboardPublisher.invalidate();
+      }
+      return writeHead.call(this, status, ...args);
+    };
+  });
 
-  server.listen(PORT, process.env.KEEP_HOST || '127.0.0.1', () => {
-    console.log(`keep serve — http://localhost:${PORT}`);
+  backendServer = server;
+  // Unix-domain socket paths are limited to roughly 100 bytes on macOS. Keep the
+  // endpoint short; the random backend credential and mode 0600 provide the trust boundary.
+  backendSock = path.join('/tmp', `keep-ui-${process.getuid?.() ?? 'user'}-${process.pid}.sock`);
+  try { fs.unlinkSync(backendSock); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  server.listen(backendSock, () => {
+    try { fs.chmodSync(backendSock, 0o600); } catch (error) {
+      process.stderr.write(`keep serve: cannot protect UI backend socket: ${error.message}\n`);
+      shutdown();
+      return;
+    }
+    uiWorker = createUiRequestWorker({
+      workerOptions: {
+        root: keep.ROOT,
+        token,
+        backendToken,
+        backendSock,
+        hostSock: require('./hostclient.js').socketPath(),
+        hostConnectTimeoutMs: HOST_CONNECT_TIMEOUT_MS,
+        webRoot: WEB_ROOT,
+        modulesRoot: path.join(__dirname, '..', 'node_modules'),
+        port: PORT,
+        host: process.env.KEEP_HOST || '127.0.0.1',
+      },
+      onPublished: () => {
+        if (announced) return;
+        announced = true;
+        console.log(`keep serve — http://localhost:${PORT}`);
+      },
+    });
+    if (retainedPublication) uiWorker.publish(retainedPublication);
   });
 }
 

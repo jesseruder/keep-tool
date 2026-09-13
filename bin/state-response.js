@@ -55,6 +55,7 @@ async function sendStateJson(req, res, body, options = {}) {
     'cache-control': 'no-store',
     vary: 'Accept-Encoding',
     etag,
+    ...(options.headers || {}),
   };
   if (etagMatches(req.headers['if-none-match'], etag)) {
     res.writeHead(304, headers);

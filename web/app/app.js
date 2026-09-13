@@ -872,11 +872,11 @@ async function reload() {
   const generation = ++reloadGeneration;
   const revision = layoutRevision;
   try {
-    const [nextData, nextLayouts, portable] = await Promise.all([
-      api.getState(),
-      layoutSavesPending ? null : api.getLayouts(),
-      api.getPortableTransfers(),
-    ]);
+    const layoutsRequest = layoutSavesPending ? Promise.resolve(null) : api.getLayouts();
+    // State carries the post-mutation publication fence. Fetch portable metadata
+    // after it so one reload cannot combine a newer state with an older transfer cache.
+    const nextData = await api.getState();
+    const [nextLayouts, portable] = await Promise.all([layoutsRequest, api.getPortableTransfers()]);
     if (generation < appliedReloadGeneration) return;
     appliedReloadGeneration = generation;
     data = { ...nextData, portableTransfers: portable?.transfers || [] };

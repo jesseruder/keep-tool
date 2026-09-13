@@ -26,7 +26,7 @@ function request(port, pathname, options = {}) {
       res.on('end', () => {
         let body;
         try { body = JSON.parse(text); } catch { body = text; }
-        resolve({ status: res.statusCode, body });
+        resolve({ status: res.statusCode, headers: res.headers, body });
       });
     });
     req.on('error', reject);
@@ -74,8 +74,14 @@ test('real dashboard routes use the worker snapshot across full, lightweight, mo
   });
   let stderr = '';
   child.stderr.on('data', (chunk) => { stderr += chunk; });
-  t.after(() => {
+  t.after(async () => {
+    const exited = child.exitCode == null
+      ? new Promise((resolve) => child.once('exit', resolve)) : Promise.resolve();
     child.kill('SIGTERM');
+    await exited;
+    // The public listener is a supervised child and closes after its daemon IPC
+    // disconnects. Give that bounded cleanup a turn before removing its fake HOME.
+    await new Promise((resolve) => setTimeout(resolve, 100));
     fs.rmSync(root, { recursive: true, force: true });
     fs.rmSync(home, { recursive: true, force: true });
   });
@@ -112,5 +118,23 @@ test('real dashboard routes use the worker snapshot across full, lightweight, mo
 
   assert.equal((await request(port, '/api/state?view=needs')).status, 200);
   assert.equal((await request(port, '/api/dashboard-review-search?q=route')).status, 200);
+
+  const changed = await request(port, '/api/ui-debug', {
+    method: 'POST', headers: { 'x-keep': '1' }, body: { events: [{ event: 'fence-test', at: Date.now() }] },
+  });
+  assert.equal(changed.status, 200, JSON.stringify(changed.body));
+  const fence = changed.headers['x-keep-mutation-fence'];
+  assert.match(fence, /^[a-f0-9]{24}:1$/);
+  assert.equal((await request(port, '/api/state', { headers: { 'x-keep-after-mutation': fence } })).status, 503,
+    'the pre-write cached snapshot cannot satisfy an immediate strict reload');
+  let refreshed;
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    refreshed = await request(port, '/api/state', { headers: { 'x-keep-after-mutation': fence } });
+    if (refreshed.status === 200) break;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(refreshed?.status, 200);
+  assert.equal(refreshed.headers['x-keep-mutation-fence'], fence);
   assert.equal((await request(port, '/api/notifications', { method: 'POST', body: {} })).status, 403);
 });
