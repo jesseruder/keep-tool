@@ -703,6 +703,7 @@ function writeVerdict(turn, value, options = {}) {
   }
   writeSessionState(handle, turn.session_id, {
     stateLine, verdict: value.verdict, at, replay: options.replay === true || isReplayModel(value.model),
+    confidence: value.confidence == null ? null : Number(value.confidence),
   });
   return changes;
 }
@@ -710,17 +711,19 @@ function writeVerdict(turn, value, options = {}) {
 // The newest verdict, denormalized onto the session for the dashboard. A replay
 // may fill a state line that was never written, but must never replace what a
 // live verdict said — a replay is a measurement, not an observation of now.
-function writeSessionState(handle, sessionId, { stateLine, verdict, at, replay }) {
+function writeSessionState(handle, sessionId, { stateLine, verdict, at, replay, confidence }) {
   if (!sessionId) return;
   if (replay) {
-    handle.prepare(`UPDATE sessions SET state_line = ?, last_verdict = ?, last_verdict_at = ?
+    handle.prepare(`UPDATE sessions SET state_line = ?, last_verdict = ?, last_verdict_at = ?,
+        last_verdict_confidence = ?
       WHERE id = ? AND (state_line IS NULL OR state_line = '') AND last_verdict IS NULL`)
-      .run(stateLine, verdict, at, sessionId);
+      .run(stateLine, verdict, at, confidence, sessionId);
     return;
   }
-  handle.prepare(`UPDATE sessions SET state_line = ?, last_verdict = ?, last_verdict_at = ?
+  handle.prepare(`UPDATE sessions SET state_line = ?, last_verdict = ?, last_verdict_at = ?,
+      last_verdict_confidence = ?
     WHERE id = ? AND (last_verdict_at IS NULL OR last_verdict_at <= ?)`)
-    .run(stateLine, verdict, at, sessionId, at);
+    .run(stateLine, verdict, at, confidence, sessionId, at);
 }
 
 function setDecisionId(turn, decisionId, options = {}) {
@@ -1141,13 +1144,101 @@ function stateLines(sessionIds, options = {}) {
     // this costs one indexed lookup per displayed session. Ranking each session's
     // verdict history here made a dashboard state build proportional to how long
     // the sessions had been running.
-    rows = handle.prepare(`SELECT id, state_line, last_verdict FROM sessions
+    rows = handle.prepare(`SELECT id, state_line, last_verdict, last_verdict_at, last_verdict_confidence
+      FROM sessions
       WHERE id IN (${placeholders}) AND (state_line IS NOT NULL OR last_verdict IS NOT NULL)`).all(...ids);
   } catch { return result; }
   for (const row of rows) {
-    result.set(row.id, { stateLine: row.state_line || '', lastVerdict: row.last_verdict || '' });
+    result.set(row.id, {
+      stateLine: row.state_line || '',
+      lastVerdict: row.last_verdict || '',
+      lastVerdictAt: Number.isFinite(row.last_verdict_at) ? row.last_verdict_at : null,
+      confidence: Number.isFinite(row.last_verdict_confidence) ? row.last_verdict_confidence : null,
+    });
   }
   return result;
+}
+
+// ---------- the console's view of the shadow ledger ----------
+
+// Read once per state build at most. The ledger is small, but the dashboard
+// rebuilds often and both the per-session pending decision and the summary line
+// come from the same file.
+let ledgerCache = { at: 0, entries: [] };
+const LEDGER_TTL_MS = 1000;
+
+function watcherLedger(deps = {}) {
+  if (typeof deps.entries !== 'undefined') return deps.entries;
+  const now = Date.now();
+  if (now - ledgerCache.at < LEDGER_TTL_MS) return ledgerCache.entries;
+  let entries = [];
+  try {
+    entries = (deps.decisions || require('./decisions.js')).loadSafe()
+      .filter((entry) => entry && entry.reviewer === 'watcher');
+  } catch { entries = []; }
+  ledgerCache = { at: now, entries };
+  return entries;
+}
+
+function forgetLedger() {
+  ledgerCache = { at: 0, entries: [] };
+}
+
+function pendingDecisionFor(entry) {
+  return {
+    id: entry.id, type: entry.type, message: entry.message || '',
+    createdAt: Number(entry.at) || null, turn: entry.turn || '', card: entry.card || '',
+  };
+}
+
+// The newest unjudged shadow decision for each of the named sessions, so the
+// console can offer agree/disagree/edit without a second fetch.
+function pendingDecisions(sessionIds, deps = {}) {
+  const wanted = new Set((sessionIds || []).filter((id) => typeof id === 'string' && id));
+  const result = new Map();
+  if (!wanted.size) return result;
+  for (const entry of watcherLedger(deps)) {
+    if (entry.verdict || !wanted.has(entry.session)) continue;
+    const prior = result.get(entry.session);
+    if (!prior || Number(entry.at || 0) >= Number(prior.createdAt || 0)) {
+      result.set(entry.session, pendingDecisionFor(entry));
+    }
+  }
+  return result;
+}
+
+function pendingDecisionsForSession(sessionId, deps = {}) {
+  return watcherLedger(deps)
+    .filter((entry) => entry && !entry.verdict && entry.session === sessionId)
+    .sort((a, b) => Number(b.at || 0) - Number(a.at || 0))
+    .map(pendingDecisionFor);
+}
+
+// One line's worth of graduation progress: how many verdicts are waiting on
+// Owner, and the agreement rate per decision type so far.
+function shadowSummary(deps = {}) {
+  const decisions = deps.decisions || require('./decisions.js');
+  const entries = watcherLedger(deps);
+  const stats = decisions.stats(entries);
+  return {
+    pending: stats.totals.pending,
+    judged: stats.totals.judged,
+    agree: stats.totals.agree,
+    graduation: stats.graduation,
+    types: stats.rows.filter((row) => row.judged || row.pending)
+      .map((row) => ({ type: row.type, judged: row.judged, agree: row.agree, rate: row.rate, ready: row.ready })),
+  };
+}
+
+// Records Owner's verdict and hands back the type's new numbers, so the console
+// can show the graduation progress it just moved without another round trip.
+function judgeDecision(id, verdict, note, deps = {}) {
+  const decisions = deps.decisions || require('./decisions.js');
+  const entry = decisions.judge(id, verdict, note);
+  forgetLedger();
+  const stats = decisions.stats(decisions.loadSafe().filter((row) => row && row.reviewer === 'watcher'));
+  const row = stats.rows.find((candidate) => candidate.type === entry.type) || null;
+  return { entry, stats: row, totals: stats.totals };
 }
 
 function stats(options = {}) {
@@ -1197,4 +1288,5 @@ module.exports = {
   watcherModelTag, PROMPT_HASH,
   tick, enabled, replay, groundTruth, scoreOne, unquoted, confidenceBand, BANDS, BAND_LABELS,
   saveReplay, latestReplay, replayDir, listVerdicts, stateLines, stats, watcherModel,
+  pendingDecisions, pendingDecisionsForSession, shadowSummary, judgeDecision, forgetLedger,
 };

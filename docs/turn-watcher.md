@@ -436,6 +436,33 @@ line that was never written but never replaces a live one. A missing, locked or
 never-written index leaves the fields absent rather than failing the state. No UI
 change yet — step 3 renders it.
 
+## Grading from the console
+
+The console's brief panel shows the watcher's **state line** where it used to
+show a generated summary of recent work. Beneath it sits the verdict chip and, if
+the verdict produced a shadow decision Owner has not marked yet, three buttons:
+
+- **Agree** records straight away — agreement needs no explanation.
+- **Disagree** and **Edit** open a single-line input, because `decisions.judge`
+  refuses a bare rejection ("the reviewer reads these back"). Edit prefills with
+  the message that was proposed, so Owner can send what he would have typed
+  instead; the graded message itself is preserved on the entry, and his text
+  lands in the note.
+- `a` and `d` are shortcuts for the first two, guarded the same way as every
+  other plain key: not while typing, not while a terminal has the keyboard.
+
+Both go through `POST /api/decisions/judge`, which calls `decisions.judge` under
+the registry lock exactly as `keep decisions` does, so the console and the CLI
+cannot both write the ledger at once. The response carries the type's new
+numbers, so the toast can say "continue 12/14 agree" without another round trip.
+`GET /api/decisions?session=<id>&pending=1` lists a session's unjudged decisions;
+the newest one already rides along in the state payload as
+`session.pendingDecision`, so the common case needs no fetch at all.
+
+The fleet strip carries one line of graduation progress — how many verdicts are
+waiting on Owner, and the agreement rate per type — so the numbers that decide
+whether a type goes live are visible without the CLI.
+
 ## Accepted trade-offs
 
 Known, deliberate, and reviewed. Each is a case where the fix costs more than the

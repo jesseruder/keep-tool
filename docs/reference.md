@@ -214,6 +214,15 @@ more than 120 days are pruned by the daemon once a day, or by `keep turns prune`
 The database is a derived cache and can be deleted at any time.
 See [turn index](turn-index.md).
 
+The console reads two endpoints for shadow decisions:
+`GET /api/decisions?session=<id>&pending=1` lists a session's unjudged shadow
+decisions (`id`, `type`, `message`, `createdAt`, `turn`), and
+`POST /api/decisions/judge` with `{ id, verdict: agree|disagree|edit, message? }`
+records your verdict through the same registry lock `keep decisions` uses and
+returns that type's updated agreement numbers. The newest pending decision for a
+session already rides along in `/api/state` as `session.pendingDecision`, beside
+`session.stateLine`, `session.lastVerdict` and `session.verdictConfidence`.
+
 `keep watcher` runs on top of that index in shadow mode: after an interactive
 turn ends it decides what you would have typed next — `continue`, `needs-input`,
 `drift` or `quiet` — and records it **without sending anything**. A `continue`,

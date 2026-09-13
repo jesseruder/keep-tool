@@ -7,6 +7,7 @@ import { portableTransferControls, installPortableTransferControls } from './por
 import { sessionLabel, sessionExplanation, backgroundLabel } from './status.js';
 import { retainSelection, selectionIndex } from './selection.js';
 import { actionsMenuHTML, installActionsMenu, patchActionsMenu, rendererControlsHTML } from './session-actions.js';
+import { stateLineHTML, installGrading } from './state-line.js';
 
 const summaryCache = new Map(); // session id -> { text, fetchedAt, mtime, fresh }
 const summaryInflight = new Map();
@@ -277,12 +278,16 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
 }
 
 function briefHTML(ctx, item, session) {
-  if (item.sessionId) fetchSessionSummary(ctx, item, session);
-  const summary = item.sessionId
-    ? summaryCache.get(item.sessionId)?.text || 'Summarizing recent work…'
-    : item.detail || 'No session transcript available.';
+  // The watcher's state line is the summary when there is one. Only fall back to
+  // the Haiku summarizer for sessions it has not judged yet, and never spend a
+  // model call on a session that already has a state line.
+  const hasStateLine = typeof session?.stateLine === 'string' && session.stateLine.trim();
+  if (item.sessionId && !hasStateLine) fetchSessionSummary(ctx, item, session);
   const cached = summaryCache.get(item.sessionId);
-  const updating = cached?.text && (cached.fresh === false || cached.mtime !== session?.mtime);
+  const fallback = item.sessionId
+    ? cached?.text || 'No state line yet'
+    : item.detail || 'No session transcript available.';
+  const updating = !hasStateLine && cached?.text && (cached.fresh === false || cached.mtime !== session?.mtime);
   let actions = '';
   if (item.kind === 'question') {
     const options = Array.isArray(item.options) ? item.options : [];
@@ -291,7 +296,7 @@ function briefHTML(ctx, item, session) {
   if (item.kind === 'rateLimit') {
     actions = '<div class="opts"><button class="opt" data-continue><span class="n">1</span><span>Continue</span></button><button class="opt" data-leave><span class="n">2</span><span>Leave parked</span></button></div>';
   }
-  return `<div class="summary">${ctx.esc(summary)}</div>${updating ? '<div class="summary-updating" role="status">Updating summary…</div>' : ''}${actions}`;
+  return `${stateLineHTML(ctx, session, fallback)}${updating ? '<div class="summary-updating" role="status">Updating summary…</div>' : ''}${actions}`;
 }
 
 async function sendReply(ctx, item, text) {
@@ -387,6 +392,7 @@ function renderStage(ctx, active, focusItem, running, pinned) {
   if (handoff) installHandoffControls(menu.querySelector('.account-controls'), ctx, item.sessionId, item.pane);
   if (restart) installRestartControls(menu.querySelector('.restart-controls'), ctx, item.sessionId, item.pane);
   const briefChanged = ctx.patchHTML(brief, briefHTML(ctx, item, session));
+  installGrading(brief, ctx, session);
   const terminalHost = stage.querySelector('.stage-terminal');
   if (hasLivePane) {
     const focusKey = `${key}:${item.pane}`;

@@ -16,7 +16,7 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 
 // Text caps. Transcripts contain whole files and 100k-line build logs; the index
 // exists to find and count turns, not to be a second copy of the corpus.
@@ -187,6 +187,15 @@ const MIGRATIONS = [
   // A verdict judges what the session said and did, so the assistant side is
   // part of the turn's identity for the purpose of keeping one across a rebuild.
   { version: 7, statements: ['ALTER TABLE turn_verdicts_kept ADD COLUMN shape TEXT'] },
+  // The console shows the verdict's confidence beside the state line, and the
+  // dashboard read must stay one row per session.
+  { version: 8, statements: [
+    'ALTER TABLE sessions ADD COLUMN last_verdict_confidence REAL',
+    `UPDATE sessions SET last_verdict_confidence = (
+       SELECT t.verdict_confidence FROM turns t WHERE t.session_id = sessions.id AND t.verdict IS NOT NULL
+       ORDER BY COALESCE(t.verdict_at, 0) DESC, t.n DESC LIMIT 1)
+     WHERE last_verdict IS NOT NULL`,
+  ] },
 ];
 
 function migrate(handle) {
@@ -617,12 +626,13 @@ function hasParkedVerdicts(handle, sessionId) {
 // them describing a turn that is no longer in the table.
 function refreshSessionVerdictState(handle, sessionId) {
   const newest = statement(handle,
-    `SELECT state_line, verdict, verdict_at FROM turns
+    `SELECT state_line, verdict, verdict_at, verdict_confidence FROM turns
      WHERE session_id = ? AND verdict IS NOT NULL
      ORDER BY COALESCE(verdict_at, 0) DESC, n DESC LIMIT 1`).get(sessionId);
-  statement(handle, 'UPDATE sessions SET state_line = ?, last_verdict = ?, last_verdict_at = ? WHERE id = ?')
+  statement(handle, `UPDATE sessions SET state_line = ?, last_verdict = ?, last_verdict_at = ?,
+      last_verdict_confidence = ? WHERE id = ?`)
     .run(newest ? newest.state_line : null, newest ? newest.verdict : null,
-      newest ? newest.verdict_at : null, sessionId);
+      newest ? newest.verdict_at : null, newest ? newest.verdict_confidence : null, sessionId);
 }
 
 function earliest(a, b) {

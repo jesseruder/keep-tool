@@ -46,17 +46,35 @@ function attachStateLines(sessions, deps = {}) {
   const rows = Array.isArray(sessions) ? sessions : [];
   if (!rows.length) return rows;
   let lines;
+  let pending = new Map();
+  const ids = rows.map((session) => session && session.id);
   try {
     const watcher = deps.watcher || require('./turn-watcher.js');
-    lines = watcher.stateLines(rows.map((session) => session && session.id));
+    lines = watcher.stateLines(ids);
+    // The common case — grading the verdict on the selected session — must not
+    // need a second fetch, so the pending decision rides along with the state.
+    try { pending = watcher.pendingDecisions(ids); } catch {}
   } catch { return rows; }
   for (const session of rows) {
-    const found = session && lines.get(session.id);
-    if (!found) continue;
-    if (found.stateLine) session.stateLine = found.stateLine;
-    if (found.lastVerdict) session.lastVerdict = found.lastVerdict;
+    if (!session) continue;
+    const found = lines.get(session.id);
+    if (found) {
+      if (found.stateLine) session.stateLine = found.stateLine;
+      if (found.lastVerdict) session.lastVerdict = found.lastVerdict;
+      if (found.lastVerdictAt) session.lastVerdictAt = found.lastVerdictAt;
+      if (found.confidence != null) session.verdictConfidence = found.confidence;
+    }
+    const decision = pending.get(session.id);
+    if (decision) session.pendingDecision = { id: decision.id, type: decision.type, message: decision.message };
   }
   return rows;
+}
+
+// One line of graduation progress for the console's fleet strip. Absent rather
+// than fatal when the watcher has never run.
+function shadowDecisionSummary(deps = {}) {
+  try { return (deps.watcher || require('./turn-watcher.js')).shadowSummary(); }
+  catch { return null; }
 }
 
 function sessionSummary(session) {
@@ -213,6 +231,7 @@ function createJobChangeTracker() {
 }
 module.exports = {
   attachStateLines,
+  shadowDecisionSummary,
   compactState,
   wantsCompactState,
   lightweightState,

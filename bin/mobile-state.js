@@ -15,7 +15,9 @@ const TASK_FRONTMATTER_FIELDS = ['title', 'status', 'project', 'tags', 'next', '
 const SESSION_SUMMARY_FIELDS = [
   'id', 'kind', 'agent', 'project', 'title', 'taskId', 'taskStatus', 'mtime', 'lastUserAt',
   'state', 'stateLabel', 'endedTurn', 'alive', 'exited', 'pane', 'rateLimit', 'reviewer',
-  'gitBranch', 'stalled',
+  // The watcher's one-line "what this session just did and what is next", and the
+  // verdict it came from. `pick` drops them when the watcher has not run.
+  'gitBranch', 'stalled', 'stateLine', 'lastVerdict',
 ];
 const SESSION_DETAIL_FIELDS = [
   ...SESSION_SUMMARY_FIELDS, 'lastAssistant', 'lastAssistantFull', 'pendingQuestion', 'pendingPlan', 'waitingFor',

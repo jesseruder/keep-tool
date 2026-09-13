@@ -189,3 +189,48 @@ test('job reconciliation notifies for meaningful changes, including child-only c
   result.gap = true;
   assert.equal(changed('s', result), true);
 });
+
+test('the state payload carries the watcher state line, verdict and pending decision', () => {
+  const { attachStateLines, shadowDecisionSummary } = require('./dashboard-state');
+  const sessions = [{ id: 'judged' }, { id: 'unjudged' }];
+  const watcher = {
+    stateLines: (ids) => {
+      assert.deepEqual(ids, ['judged', 'unjudged']);
+      return new Map([['judged', {
+        stateLine: 'fixed the parser; running the suite next',
+        lastVerdict: 'continue', lastVerdictAt: 1234, confidence: 0.82,
+      }]]);
+    },
+    pendingDecisions: () => new Map([['judged', { id: 'd-1', type: 'continue', message: 'run the suite' }]]),
+    shadowSummary: () => ({ pending: 2, judged: 5, agree: 4, types: [] }),
+  };
+  attachStateLines(sessions, { watcher });
+  assert.equal(sessions[0].stateLine, 'fixed the parser; running the suite next');
+  assert.equal(sessions[0].lastVerdict, 'continue');
+  assert.equal(sessions[0].lastVerdictAt, 1234);
+  assert.equal(sessions[0].verdictConfidence, 0.82);
+  assert.deepEqual(sessions[0].pendingDecision, { id: 'd-1', type: 'continue', message: 'run the suite' });
+  // A session the watcher has not judged gains nothing, so the console falls back
+  // to the summarizer rather than showing an empty panel.
+  assert.equal(sessions[1].stateLine, undefined);
+  assert.equal(sessions[1].pendingDecision, undefined);
+  assert.equal(shadowDecisionSummary({ watcher }).pending, 2);
+});
+
+test('a watcher that has never run leaves the state untouched rather than failing it', () => {
+  const { attachStateLines, shadowDecisionSummary } = require('./dashboard-state');
+  const broken = { stateLines: () => { throw new Error('no index'); } };
+  const sessions = [{ id: 'a' }];
+  assert.equal(attachStateLines(sessions, { watcher: broken }), sessions);
+  assert.equal(sessions[0].stateLine, undefined);
+  assert.equal(shadowDecisionSummary({ watcher: { shadowSummary: () => { throw new Error('nope'); } } }), null);
+  // A ledger failure must not lose the state line beside it.
+  const partial = {
+    stateLines: () => new Map([['a', { stateLine: 'still here', lastVerdict: 'quiet' }]]),
+    pendingDecisions: () => { throw new Error('ledger unreadable'); },
+  };
+  const rows = [{ id: 'a' }];
+  attachStateLines(rows, { watcher: partial });
+  assert.equal(rows[0].stateLine, 'still here');
+  assert.equal(rows[0].pendingDecision, undefined);
+});

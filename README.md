@@ -68,7 +68,12 @@ unrelated contributor activity does not by itself requeue the card.
 
 The bundled Keep skill teaches the agent to record progress and next steps on the
 card. You can watch its terminal in the console and respond when it needs a
-decision. From another terminal, inspect the task or get an overview:
+decision. Each session's panel leads with the turn watcher's one-line state —
+what it just did and what it is about to do — next to the shadow verdict for that
+turn; where the watcher recorded a decision you have not marked yet, Agree /
+Disagree / Edit sit under it (or the `a` and `d` keys), so judging its suggestions
+never means leaving the console. From another terminal, inspect the task or get an
+overview:
 
 ```sh
 keep show improve-checkout-errors

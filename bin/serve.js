@@ -54,7 +54,7 @@ const WATCHER_WINDOW_MS = 2 * 3600e3; // a turn older than this is history, not 
 const claudeProjectRoots = accounts.projectRoots();
 const claudeTranscriptIndex = require('./transcript-index').createMultiRootTranscriptIndex(claudeProjectRoots);
 const {
-  compactState, wantsCompactState, createJobChangeTracker, attachStateLines,
+  compactState, wantsCompactState, createJobChangeTracker, attachStateLines, shadowDecisionSummary,
   wantsLightweightState, lightweightState, dashboardDetail, reviewQueueSearch,
 } = require('./dashboard-state');
 const { createDashboardWorker } = require('./dashboard-worker');
@@ -5406,6 +5406,7 @@ function buildState(options = {}) {
   attachStateLines(sessions);
   const state = {
     generatedAt: Date.now(),
+    shadowDecisions: shadowDecisionSummary(),
     scopes: { ...require('./preferences').scopes(), home: os.homedir() },
     projectCatalog: require('./preferences').projectCatalog(),
     restarts: require('./session-restart').read(path.join(keep.ROOT, '.keep', 'session-restarts.json')),
@@ -7176,6 +7177,18 @@ function start(deps = {}) {
         return json(res, 200, { text: result.text, fresh: result.fresh });
       }
 
+      // Shadow decisions the watcher recorded and Owner has not graded yet. The
+      // state payload already carries the newest one per session; this is for the
+      // edit flow and for refreshing after a grade.
+      if (req.method === 'GET' && url.pathname === '/api/decisions') {
+        const session = url.searchParams.get('session') || '';
+        if (!/^[A-Za-z0-9_-]+$/.test(session)) return json(res, 400, { error: 'bad session id' });
+        if (url.searchParams.get('pending') !== '1') return json(res, 400, { error: 'only pending=1 is supported' });
+        return json(res, 200, {
+          decisions: require('./turn-watcher.js').pendingDecisionsForSession(session),
+        });
+      }
+
       if (req.method === 'GET' && url.pathname === '/api/sessiontail') {
         const id = url.searchParams.get('id') || '';
         if (!/^[A-Za-z0-9-]+$/.test(id)) return json(res, 400, { error: 'bad session id' });
@@ -7284,6 +7297,26 @@ function start(deps = {}) {
               experimentId: body.experimentId,
             });
             return json(res, 200, { ok: true, id: task.id });
+          }
+          // Owner grading a shadow verdict from the console. decisions.judge
+          // takes the registry lock, exactly as `keep decisions` does, so the
+          // console and the CLI cannot both write the ledger at once.
+          if (url.pathname === '/api/decisions/judge') {
+            const watcher = require('./turn-watcher.js');
+            const decisions = require('./decisions.js');
+            if (!body || typeof body.id !== 'string' || !body.id) return json(res, 400, { error: 'a decision id is required' });
+            if (!decisions.VERDICTS.includes(body.verdict)) {
+              return json(res, 400, { error: `verdict must be one of: ${decisions.VERDICTS.join(', ')}` });
+            }
+            try {
+              const result = watcher.judgeDecision(body.id, body.verdict, body.message);
+              broadcast();
+              return json(res, 200, { ok: true, id: result.entry.id, type: result.entry.type,
+                verdict: result.entry.verdict, stats: result.stats, totals: result.totals });
+            } catch (error) {
+              if (error instanceof decisions.DecisionError) return json(res, 400, { error: error.message });
+              throw error;
+            }
           }
           if (url.pathname === '/api/checkin') {
             keep.checkinTask(body.id, {

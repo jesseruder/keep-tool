@@ -1379,6 +1379,74 @@ test('the scoreboard reports agreement by confidence band and is kept on disk', 
   assert.equal(summary.bands.find((row) => row.band === 'low').total, 1);
 });
 
+test('the console reads pending decisions per session and grades them', async (t) => {
+  const dir = sandbox(t);
+  writeCard('kt-console', { sessions: [{ id: SESSION, agent: 'claude', at: '2026-09-12T00:00' }] });
+  indexTurns(dir, [
+    ['a', "Fixed it. Next, I'll run the suite."],
+    ['b', "Ran it. Next, I'll write the docs."],
+  ]);
+  const decisions = require('./decisions.js');
+  watcher.forgetLedger();
+
+  const first = await watcher.judge(watcher.turnFor(SESSION, 1), fakeDeps(
+    '{"verdict":"continue","reason":"r1","message":"continue","state_line":"first state","confidence":0.7}'));
+  const second = await watcher.judge(watcher.turnFor(SESSION, 2), fakeDeps(
+    '{"verdict":"continue","reason":"r2","message":"continue","state_line":"second state","confidence":0.9}'));
+  watcher.forgetLedger();
+
+  // Per-session listing, newest first, for the edit flow and refreshes.
+  const pendingList = watcher.pendingDecisionsForSession(SESSION);
+  assert.equal(pendingList.length, 2);
+  assert.equal(pendingList[0].id, second.decisionId, 'newest first');
+  assert.equal(pendingList[0].turn, `${SESSION}#2`);
+  assert.equal(pendingList[0].message, 'continue');
+  assert.equal(watcher.pendingDecisionsForSession('someone-else').length, 0, 'filtered by session');
+
+  // The one that rides along with the state payload is the newest.
+  const map = watcher.pendingDecisions([SESSION, 'absent']);
+  assert.equal(map.get(SESSION).id, second.decisionId);
+  assert.equal(map.has('absent'), false);
+  assert.equal(watcher.pendingDecisions([]).size, 0);
+
+  // The state line the console shows, and its confidence, come from sessions.
+  const lines = watcher.stateLines([SESSION]);
+  assert.equal(lines.get(SESSION).stateLine, 'second state');
+  assert.equal(lines.get(SESSION).lastVerdict, 'continue');
+  assert.equal(lines.get(SESSION).confidence, 0.9);
+  assert.ok(Number.isFinite(lines.get(SESSION).lastVerdictAt));
+
+  // Grading returns the type's new numbers so the console can show progress.
+  const graded = watcher.judgeDecision(first.decisionId, 'agree');
+  assert.equal(graded.entry.verdict, 'agree');
+  assert.equal(graded.stats.type, 'continue');
+  assert.equal(graded.stats.judged, 1);
+  assert.equal(graded.stats.agree, 1);
+  assert.equal(decisions.loadSafe().find((row) => row.id === first.decisionId).verdict, 'agree');
+
+  // A judged decision leaves the pending list.
+  watcher.forgetLedger();
+  assert.deepEqual(watcher.pendingDecisionsForSession(SESSION).map((row) => row.id), [second.decisionId]);
+
+  // Disagree and edit carry Owner's reason; the ledger refuses a bare rejection.
+  assert.throws(() => watcher.judgeDecision(second.decisionId, 'disagree'), /why/);
+  const edited = watcher.judgeDecision(second.decisionId, 'edit', 'push first');
+  assert.equal(edited.entry.verdict, 'edit');
+  assert.equal(edited.entry.note, 'push first');
+  assert.equal(edited.entry.message, 'continue', 'the graded message is preserved');
+
+  // And the one-line summary the fleet strip shows.
+  watcher.forgetLedger();
+  const summary = watcher.shadowSummary();
+  assert.equal(summary.pending, 0);
+  assert.equal(summary.judged, 2);
+  assert.equal(summary.agree, 1);
+  const continueRow = summary.types.find((row) => row.type === 'continue');
+  assert.equal(continueRow.judged, 2);
+  assert.equal(continueRow.agree, 1);
+  assert.equal(continueRow.ready, false, 'two marks is not graduation');
+});
+
 // ---------- reporting and the dashboard ----------
 
 test('listVerdicts, stats and stateLines read back what was judged', async (t) => {

@@ -1,5 +1,6 @@
 import { sessionLabel } from './status.js';
 import { closeSession } from './close-session.js';
+import { shadowSummaryHTML } from './state-line.js';
 const FILTER_KEY = 'keep.console.fleet.filter';
 let filter = '';
 try { filter = sessionStorage.getItem(FILTER_KEY) || ''; } catch {}
@@ -74,7 +75,7 @@ export function renderFleet(ctx) {
 
   const root = document.querySelector('#fleet');
   if (!root.querySelector('.fleetbar')) {
-    root.innerHTML = `<div class="fleetbar"><input type="search" aria-label="Filter fleet" placeholder="Filter title, session, card, project, or branch" value="${ctx.esc(filter)}"><span></span></div><div class="fleet-results"></div>`;
+    root.innerHTML = `<div class="fleetbar"><input type="search" aria-label="Filter fleet" placeholder="Filter title, session, card, project, or branch" value="${ctx.esc(filter)}"><span></span><span class="fleet-shadow"></span></div><div class="fleet-results"></div>`;
     const input = root.querySelector('.fleetbar input');
     input.addEventListener('input', () => {
       filter = input.value;
@@ -83,6 +84,8 @@ export function renderFleet(ctx) {
     });
   }
   root.querySelector('.fleetbar span').textContent = `${visible.length} of ${rows.length}`;
+  // Graduation progress, so Owner can see it without `keep decisions stats`.
+  ctx.patchHTML(root.querySelector('.fleet-shadow'), shadowSummaryHTML(ctx.data.shadowDecisions, ctx.esc));
   const results = root.querySelector('.fleet-results');
   const changed = ctx.patchHTML(results, table);
   if (changed) {
