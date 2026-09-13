@@ -551,30 +551,36 @@ function clearSession(handle, sessionId, { keepVerdicts = false } = {}) {
 // The turn's identity for the purpose of keeping a verdict: what the session
 // said and how much it did. A verdict is a judgment about that, so if either
 // changes the judgment no longer applies.
-function turnShape(lastAssistant, toolCount) {
-  return crypto.createHash('sha1')
-    .update(`${lastAssistant == null ? '' : lastAssistant} ${Number(toolCount) || 0}`).digest('hex');
+// Everything the judge was shown about the turn, in one digest: if any of it
+// changed, the parked verdict is a judgment about a turn that no longer exists.
+// `tools`, `files` and `commits` matter as much as the prose — a turn that ran
+// the same number of tools but different ones did different work.
+const SHAPE_FIELDS = ['last_assistant', 'tool_count', 'tools', 'files', 'commits', 'stop_reason'];
+
+function turnShape(turn) {
+  const parts = SHAPE_FIELDS.map((field) => (turn && turn[field] == null ? '' : String(turn[field])));
+  return crypto.createHash('sha1').update(parts.join(' ')).digest('hex');
 }
 
 function parkVerdicts(handle, sessionId) {
   const columns = KEPT_VERDICT_COLUMNS.join(', ');
   const rows = statement(handle,
-    `SELECT n, opener_text, last_assistant, tool_count, ${columns} FROM turns
+    `SELECT n, opener_text, ${SHAPE_FIELDS.join(', ')}, ${columns} FROM turns
      WHERE session_id = ? AND verdict IS NOT NULL`).all(sessionId);
   const at = Date.now();
   for (const row of rows) {
     statement(handle, `INSERT OR REPLACE INTO turn_verdicts_kept
       (session_id, n, opener_text, shape, ${columns}, kept_at)
       VALUES (?, ?, ?, ?, ${KEPT_VERDICT_COLUMNS.map(() => '?').join(', ')}, ?)`).run(
-      sessionId, row.n, row.opener_text, turnShape(row.last_assistant, row.tool_count),
+      sessionId, row.n, row.opener_text, turnShape(row),
       ...KEPT_VERDICT_COLUMNS.map((column) => row[column]), at);
   }
 }
 
 // A parked verdict only comes back onto a turn with the same number, the same
-// opener text AND the same assistant side. Any of those changing means the turn
-// is not the one that was judged, and a verdict about a turn that no longer
-// exists is worse than no verdict.
+// opener text AND the same shape (everything the judge was shown). Any of those
+// changing means the turn is not the one that was judged, and a verdict about a
+// turn that no longer exists is worse than no verdict.
 //
 // Only ever called on the final pass of a file: a capped re-ingest rebuilds the
 // assistant side over several passes, so a mid-way turn has not finished being
@@ -586,10 +592,12 @@ function restoreVerdicts(handle, sessionId) {
   let restored = 0;
   for (const row of rows) {
     const turn = statement(handle,
-      'SELECT id, opener_text, last_assistant, tool_count FROM turns WHERE session_id = ? AND n = ?')
+      `SELECT id, opener_text, ${SHAPE_FIELDS.join(', ')} FROM turns WHERE session_id = ? AND n = ?`)
       .get(sessionId, row.n);
     if (!turn || turn.opener_text !== row.opener_text) continue;
-    if (turnShape(turn.last_assistant, turn.tool_count) !== row.shape) continue;
+    // A null shape is a verdict parked by a pre-v7 build; it cannot be compared,
+    // so it is dropped rather than restored onto a turn that may have changed.
+    if (!row.shape || turnShape(turn) !== row.shape) continue;
     statement(handle, `UPDATE turns SET ${assignments} WHERE id = ?`)
       .run(...KEPT_VERDICT_COLUMNS.map((column) => row[column]), turn.id);
     restored += 1;

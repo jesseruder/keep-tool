@@ -327,6 +327,25 @@ test('a continue may only ever say continue or the self-check text', (t) => {
   assert.equal(watcher.isAllowedContinueMessage('go ahead and investigate the frame pauses'), false);
   assert.equal(watcher.isAllowedContinueMessage(''), false);
 
+  // The agreement rate is per message, so the accepted forms are canonicalized:
+  // "Continue." and "continue" must not read as two different asks.
+  for (const spelling of ['continue', 'Continue', 'Continue.', 'CONTINUE!', '  continue.  ', 'continue..']) {
+    assert.equal(watcher.canonicalContinueMessage(spelling), 'continue', spelling);
+  }
+  assert.equal(watcher.canonicalContinueMessage(`  ${watcher.SELF_CHECK_MESSAGE.replace(/ /g, '  ')}  `),
+    watcher.SELF_CHECK_MESSAGE, 'the self-check is matched after whitespace normalization');
+  assert.equal(watcher.canonicalContinueMessage('continue with the migration'), null);
+  assert.equal(watcher.canonicalContinueMessage(''), null);
+
+  const respelled = watcher.normalizeContinue(
+    { verdict: 'continue', message: 'Continue.', reason: 'r' }, { verdict: 'quiet', message: '' });
+  assert.equal(respelled.verdict, 'continue', 'a legal message is never a downgrade');
+  assert.equal(respelled.message, 'continue');
+  assert.equal(respelled.reason, 'r', 'and canonicalizing is not worth a note in the reason');
+  assert.equal(watcher.normalizeContinue(
+    { verdict: 'continue', message: `${watcher.SELF_CHECK_MESSAGE}\n`, reason: 'r' },
+    { verdict: 'quiet', message: '' }).message, watcher.SELF_CHECK_MESSAGE);
+
   const rule = (verdict, message) => ({ verdict, message, reason: 'r' });
   const model = (message) => ({ verdict: 'continue', message, reason: 'model reason', confidence: 0.9 });
 
@@ -1131,6 +1150,23 @@ test('a request only Owner can act on makes the reply an answer, not a nudge', (
     'I fixed the parser and ran the suite.', 'Please note that the cap is 4 KiB.']) {
     assert.equal(watcher.askedForAction(text), false, `not an action request: ${text}`);
   }
+
+  // A session quoting a README is not asking Owner to run anything.
+  for (const text of [
+    'The README says "please run npm install." No action is needed.',
+    'The docs say “please unlock the device” before flashing; ours is already unlocked.',
+    "The help text reads 'please sign in first' but we use a token.",
+    'The setup step is:\n```\n# please run npm install\n```\nAlready done here.',
+    'The error string is `please restart the daemon`, which we handle automatically.',
+    '> please paste the token\n\nThat was the old instruction; it is in the env now.',
+  ]) assert.equal(watcher.askedForAction(text), false, `quoted, not asked: ${text}`);
+
+  // Quoting something else does not disarm a real request beside it.
+  assert.equal(watcher.askedForAction('The README says "run npm install". Please run it and tell me when it finishes.'), true);
+  // Apostrophes must not open a quoted span and swallow the request.
+  assert.equal(watcher.askedForAction("It won't work yet. Please unlock the phone and I'll retry."), true);
+  assert.equal(watcher.withoutQuoted('a "b" c').trim(), 'a   c');
+  assert.equal(watcher.withoutQuoted("don't stop won't"), "don't stop won't", 'apostrophes are left alone');
 
   const asked = { last_assistant: 'Please unlock the phone so adb can see it.', tool_count: 2, opener_kind: 'human' };
   const truth = (text) => watcher.groundTruth(asked, { opener_text: text, opener_kind: 'human' });

@@ -125,7 +125,7 @@ not decided by prose 3 KB back.
 | signal | what it means |
 | --- | --- |
 | `askedQuestion` | `session-status.proseRequest` — the turn ends on a question or a direct request |
-| `askedForAction` | "please unlock", "let me know when", "reply done", "once you've…" — something only Owner can physically do |
+| `askedForAction` | "please unlock", "let me know when", "reply done", "once you've…" — something only Owner can physically do. Quoted text and fenced code are stripped first, so a session quoting a README ("the docs say \"please run npm install\"") is not asking for anything |
 | `stopHint` | `conversation-intent.stopHint` — `needs-input`, `waiting`, or `unknown` |
 | `namesNextStep` | "next, I…", "I'll now run…", "remaining:", "next step" |
 | `claimsDone` | "all done", "is complete", "nothing left", "no further" |
@@ -251,6 +251,12 @@ otherwise the model was proposing work, so the verdict is downgraded to
 `[invented task; downgraded to a proposal]` in the reason. The invariant holds
 whatever the model does with the rule.
 
+The two legal messages are also **canonicalized**: any case or trailing
+punctuation of "continue" is stored as exactly `continue`, and the self-check is
+matched after whitespace normalization and stored as the canonical text. The
+agreement rate is per message, so "Continue." and "continue" must not read as two
+different things Owner was asked to approve.
+
 A `continue` or `drift` that comes back with an empty `message` borrows the
 deterministic one and says so in the reason (`[message supplied by the rules]`).
 The ledger refuses an acting decision with no message — correctly, since Owner
@@ -289,10 +295,13 @@ A forced re-ingest or a truncation reset rebuilds a session's turn rows, which
 would otherwise erase every verdict and orphan the ledger decisions pointing at
 them. `turn_verdicts_kept` parks them across the rebuild. A parked verdict comes back
 only onto a turn with the **same number, the same opener text, and the same
-assistant side** — a SHA-1 of `last_assistant` plus `tool_count`, stored with the
-verdict (schema v7). A verdict judges what the session said and did, so if either
-changed it is a judgment about something else; and a verdict about a turn whose
-boundaries moved would put Owner's decision against text he never saw.
+shape** — a SHA-1 over everything the judge was shown about the turn
+(`last_assistant`, `tool_count`, `tools`, `files`, `commits`, `stop_reason`),
+stored with the verdict (schema v7). A verdict judges what the session said and
+did, so if any of that changed it is a judgment about something else — a turn
+that ran the same *number* of tools but different ones did different work. A
+verdict about a turn whose boundaries moved would put Owner's decision against
+text he never saw.
 
 The restore runs **only on the final pass** of a file. A capped re-ingest rebuilds
 a turn's assistant side over several passes, so comparing it half-built would drop
@@ -426,6 +435,24 @@ backfills the columns once from that history. A replay verdict may fill a state
 line that was never written but never replaces a live one. A missing, locked or
 never-written index leaves the fields absent rather than failing the state. No UI
 change yet — step 3 renders it.
+
+## Accepted trade-offs
+
+Known, deliberate, and reviewed. Each is a case where the fix costs more than the
+bug.
+
+- **A crash between recording a ledger entry and attaching its `decision_id`,
+  followed by Owner judging that orphan before the rerun, yields a second
+  decision for the turn.** The rerun reuses only *unjudged* entries, on purpose:
+  a judged entry's message is the exact text Owner graded, and silently
+  re-pointing a fresh verdict at it would attribute his verdict to a message he
+  never saw. Two entries sharing a `turn` key, one judged and one not, is the
+  honest record of what happened, and the key makes the pair findable.
+- **Parked verdicts from a v6 re-ingest interrupted before the v7 migration have
+  a null `shape` and are dropped rather than restored.** A null shape cannot be
+  compared, so restoring would risk re-attaching a verdict to a turn that
+  changed. It fails safe, and the window is tiny: the parking table is empty
+  outside an active re-ingest.
 
 ## Turning it on
 

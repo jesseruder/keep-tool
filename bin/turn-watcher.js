@@ -149,7 +149,23 @@ function askedQuestion(lastAssistant) {
 // behaviour for the whole fleet. So this lives here, and is used by the replay
 // scorer: after a turn like this, Owner's "done" is an answer, not a nudge.
 function askedForAction(lastAssistant) {
-  return ASKED_FOR_ACTION_RE.test(tail(lastAssistant));
+  return ASKED_FOR_ACTION_RE.test(tail(withoutQuoted(lastAssistant)));
+}
+
+// A session quoting a README ("the docs say \"please run npm install\"") is not
+// asking Owner to run anything. proseRequest already drops fenced code and block
+// quotes for the same reason; this drops inline quotation as well. Single quotes
+// are only treated as a quote when they bracket a span — otherwise every
+// apostrophe would open one.
+function withoutQuoted(text) {
+  return String(text == null ? '' : text)
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`[^`\n]*`/g, ' ')
+    .replace(/^\s*>.*$/gm, ' ')
+    .replace(/"[^"\n]*"/g, ' ')
+    .replace(/“[^”\n]*”/g, ' ')
+    .replace(/(^|[\s([{])'[^'\n]*'(?=$|[\s).,;:!?\]}])/g, '$1 ')
+    .replace(/(^|[\s([{])‘[^’\n]*’(?=$|[\s).,;:!?\]}])/g, '$1 ');
 }
 
 function stopHint(lastAssistant) {
@@ -548,11 +564,20 @@ function parseVerdict(stdout) {
   };
 }
 
-// The only two things a `continue` may ever say. Everything else is the watcher
-// inventing work for a session that did not ask for any.
-function isAllowedContinueMessage(message) {
+// The only two things a `continue` may ever say, in their canonical spelling.
+// Everything else is the watcher inventing work for a session that did not ask
+// for any. Returns the stored form, or null when the message is neither: the
+// agreement rate is per message, so "Continue." and "continue" must not count as
+// two different things Owner was asked to approve.
+function canonicalContinueMessage(message) {
   const text = String(message == null ? '' : message).trim();
-  return text.toLowerCase() === 'continue' || text === SELF_CHECK_MESSAGE;
+  if (/^continue\s*[.!]*$/i.test(text)) return 'continue';
+  const flatten = (value) => String(value).replace(/\s+/g, ' ').trim();
+  return flatten(text) === flatten(SELF_CHECK_MESSAGE) ? SELF_CHECK_MESSAGE : null;
+}
+
+function isAllowedContinueMessage(message) {
+  return canonicalContinueMessage(message) !== null;
 }
 
 // The prompt forbids an invented task; this makes it true even when the model
@@ -562,11 +587,16 @@ function isAllowedContinueMessage(message) {
 // proposing something, so it becomes a proposal for Owner instead of a message
 // to the session.
 function normalizeContinue(value, rule) {
-  if (!value || value.verdict !== 'continue' || isAllowedContinueMessage(value.message)) return value;
+  if (!value || value.verdict !== 'continue') return value;
+  const canonical = canonicalContinueMessage(value.message);
+  if (canonical !== null) {
+    // Already one of the two, but perhaps spelled differently.
+    return canonical === value.message ? value : { ...value, message: canonical };
+  }
   if (rule && rule.verdict === 'continue') {
     return {
       ...value,
-      message: isAllowedContinueMessage(rule.message) ? rule.message : 'continue',
+      message: canonicalContinueMessage(rule.message) || 'continue',
       reason: oneLine(`${value.reason} [message normalized]`, REASON_LIMIT),
     };
   }
@@ -1163,7 +1193,8 @@ module.exports = {
   askedQuestion, askedForAction, stopHint, namesNextStep, claimsDone, explicitPause, inProgress, waitingOnCheck,
   signalsFor, ruleVerdict, selectTurns, turnsForReplay, turnFor, buildContext, invocationFor,
   firstJsonObject, parseVerdict, runModel, spawnRunner, judge, writeVerdict, setDecisionId, decisionTypeFor,
-  normalizeContinue, isAllowedContinueMessage, watcherModelTag, PROMPT_HASH,
+  normalizeContinue, isAllowedContinueMessage, canonicalContinueMessage, withoutQuoted,
+  watcherModelTag, PROMPT_HASH,
   tick, enabled, replay, groundTruth, scoreOne, unquoted, confidenceBand, BANDS, BAND_LABELS,
   saveReplay, latestReplay, replayDir, listVerdicts, stateLines, stats, watcherModel,
 };

@@ -952,6 +952,46 @@ test('a verdict is dropped when the assistant side of its turn changed', (t) => 
   assert.equal(turnIndex.sessionRow(SESSION).state_line, 'proposed the reader cap');
 });
 
+test('a verdict is dropped when the tools the turn ran changed', (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, `${SESSION}.jsonl`);
+  const at = (s) => new Date(Date.UTC(2026, 8, 12, 0, 0, s)).toISOString();
+  // Same prose, same number of tool calls, different tools: the judge was shown
+  // the tool list, so this is not the turn it judged.
+  const conversation = (toolName, filePath) => [
+    { type: 'user', sessionId: SESSION, cwd: '/tmp/demo-project', timestamp: at(0),
+      message: { role: 'user', content: 'look at the cap' } },
+    { type: 'assistant', sessionId: SESSION, cwd: '/tmp/demo-project', timestamp: at(5),
+      message: { role: 'assistant', stop_reason: 'end_turn', content: [
+        { type: 'text', text: 'Had a look.' },
+        { type: 'tool_use', id: 't1', name: toolName, input: { file_path: filePath } },
+      ] } },
+  ];
+  fs.writeFileSync(file, jsonl(conversation('Read', '/tmp/demo-project/a.js')));
+  assert.equal(turnIndex.ingestFile(file, { agent: 'claude' }).ok, true);
+
+  const db = turnIndex.open();
+  const before = turnIndex.turnsForSession(SESSION)[0];
+  assert.equal(before.tool_count, 1);
+  assert.equal(before.last_assistant, 'Had a look.');
+  const judge = () => db.prepare(`UPDATE turns SET verdict = 'quiet', state_line = 'looked at the cap',
+    verdict_at = 9000 WHERE session_id = ?`).run(SESSION);
+  judge();
+
+  fs.writeFileSync(file, jsonl(conversation('Write', '/tmp/demo-project/a.js')));
+  assert.equal(turnIndex.ingestFile(file, { agent: 'claude', force: true }).ok, true);
+  const after = turnIndex.turnsForSession(SESSION)[0];
+  assert.equal(after.tool_count, 1, 'same count');
+  assert.equal(after.last_assistant, 'Had a look.', 'same prose');
+  assert.notDeepEqual(JSON.parse(after.tools), JSON.parse(before.tools), 'different tools');
+  assert.equal(after.verdict, null, 'so the verdict does not come back');
+
+  // The same turn re-ingested unchanged still keeps it.
+  judge();
+  assert.equal(turnIndex.ingestFile(file, { agent: 'claude', force: true }).ok, true);
+  assert.equal(turnIndex.turnsForSession(SESSION)[0].verdict, 'quiet');
+});
+
 test('a capped re-ingest restores verdicts only once the file is fully read', (t) => {
   const dir = tempDir(t);
   const file = path.join(dir, `${SESSION}.jsonl`);
