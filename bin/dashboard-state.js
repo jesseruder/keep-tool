@@ -65,7 +65,10 @@ function attachStateLines(sessions, deps = {}) {
       if (found.confidence != null) session.verdictConfidence = found.confidence;
     }
     const decision = pending.get(session.id);
-    if (decision) session.pendingDecision = { id: decision.id, type: decision.type, message: decision.message };
+    if (decision) {
+      session.pendingDecision = { id: decision.id, type: decision.type, message: decision.message };
+      if (decision.delivered) session.pendingDecision.delivered = true;
+    }
   }
   return rows;
 }

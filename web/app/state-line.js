@@ -39,8 +39,12 @@ export function verdictChipHTML(session, esc) {
   const verdict = session?.lastVerdict;
   if (!VERDICTS.includes(verdict)) return '';
   const confidence = confidenceText(session?.verdictConfidence);
+  // A delivered verdict was not merely proposed: it is already in the session's
+  // terminal, so the chip has to say so before Owner grades it.
+  const sent = session?.pendingDecision?.delivered
+    ? '<span class="sent-mark" title="delivered to the session">sent</span>' : '';
   return `<span class="verdict-chip ${verdictTone(verdict)}" data-verdict="${esc(verdict)}">${esc(verdict)}`
-    + `${confidence ? `<span class="n">${esc(confidence)}</span>` : ''}</span>`;
+    + `${confidence ? `<span class="n">${esc(confidence)}</span>` : ''}${sent}</span>`;
 }
 
 // Agree needs no reason; disagree and edit do, because decisions.record refuses a
@@ -78,8 +82,11 @@ export function shadowSummaryHTML(summary, esc) {
     .map((row) => `${esc(row.type)} ${row.agree}/${row.judged}${row.ready ? ' ✓' : ''}`)
     .join(' · ');
   const pending = `${summary.pending} awaiting you`;
+  const live = (summary.live || []).filter((row) => row.sent)
+    .map((row) => `${esc(row.type)} ${row.sent}`).join(' · ');
   return `<span class="shadow-summary" title="Shadow decisions: agree at ${Math.round((summary.graduation?.rate || 0.9) * 100)}% over ${summary.graduation?.min || 30} marks a type ready">`
-    + `shadow ${esc(pending)}${rates ? ` · ${esc(rates)}` : ''}</span>`;
+    + `shadow ${esc(pending)}${rates ? ` · ${esc(rates)}` : ''}`
+    + `${live ? `<span class="shadow-live"> · live ${live}</span>` : ''}</span>`;
 }
 
 function setBusy(root, busy) {

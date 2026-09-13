@@ -125,6 +125,22 @@ function record({ type, card, session, turn, why, message, reviewer, now = Date.
   return stored;
 }
 
+// A decision that was actually delivered to the session. It stays pending: Owner
+// still grades what was sent, and that grade is what keeps the type live.
+function markDelivered(id, at = Date.now()) {
+  let updated = null;
+  keep.withLock(() => {
+    const decisions = load();
+    const entry = decisions.find((candidate) => candidate.id === id);
+    if (!entry || entry.delivered) return;
+    entry.delivered = true;
+    entry.deliveredAt = at;
+    updated = entry;
+    save(decisions);
+  });
+  return updated;
+}
+
 function judge(id, verdict, note) {
   if (!VERDICTS.includes(verdict)) throw new DecisionError(`verdict must be one of: ${VERDICTS.join(', ')}`);
   // A disagreement with no reason teaches the reviewer nothing, and reading back
@@ -211,5 +227,5 @@ function formatDecision(entry, { verbose = false } = {}) {
 
 module.exports = {
   DecisionError, TYPES, VERDICTS, GRADUATION,
-  load, loadSafe, save, record, judge, stats, renderStats, formatDecision,
+  load, loadSafe, save, record, judge, markDelivered, stats, renderStats, formatDecision,
 };

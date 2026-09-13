@@ -275,7 +275,9 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .verdict-grade-form { display: flex; gap: 6px; align-items: center; flex: 1 1 220px; }
 .verdict-grade-form[hidden] { display: none; }
 .verdict-grade-form input { flex: 1; min-width: 140px; }
+.verdict-chip .sent-mark { color: var(--ok); text-transform: none; letter-spacing: 0; }
 .fleet-shadow { color: var(--muted); font: 11px var(--mono); }
+.shadow-live { color: var(--ok); }
 .opts { display: flex; flex-wrap: wrap; gap: 6px; }
 .opt { display: inline-flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 5px; border: 1px solid var(--line-2); background: var(--panel-2); text-align: left; }
 .opt:hover, .opt.rec { border-color: var(--accent); } .opt .n { font: 500 11px/1 var(--mono); color: var(--accent); } .opt .d { color: var(--muted); font-size: 12px; }

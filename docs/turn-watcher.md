@@ -463,6 +463,86 @@ The fleet strip carries one line of graduation progress — how many verdicts ar
 waiting on Owner, and the agreement rate per type — so the numbers that decide
 whether a type goes live are visible without the CLI.
 
+## Going live
+
+Everything above records what Owner would have typed and sends nothing. The live
+path delivers it for real, and it is **off by default, per verdict type**:
+
+```
+keep watcher live                      # what is live right now
+keep watcher live continue             # turn one type on
+keep watcher live on                   # continue, needs-input and drift
+keep watcher live off                  # stop every delivery, immediately
+```
+
+The switch is `watch/watcher.json` in the registry, beside the reviewer's
+`nudge.json`:
+
+```json
+{ "live": { "continue": false, "needs-input": false, "drift": false },
+  "maxPerSessionPer10m": 1, "maxPerHour": 12, "minConfidence": 0.7 }
+```
+
+**A type cannot be turned on until its own record earns it** — 30 graded shadow
+decisions at 90% agreement, the same bar `keep decisions stats` shows. The
+refusal says exactly what is missing ("26 more graded (4/30)", "agreement 50%
+below 90%"), and `--force` overrules it deliberately rather than by accident. A
+malformed switch file reads as all-off: a typo must never widen delivery.
+
+### What has to be true to deliver
+
+Delivery happens **only in the daemon**, after the watcher writes a live verdict.
+A hook runs inside the agent's own process as it tries to stop; the daemon sees
+the finished turn with the whole session snapshot in hand. Every one of these
+must hold:
+
+- the verdict type is live, and the verdict is `continue`, `drift`, or a
+  `needs-input` that actually proposed an answer (an escalation has no message
+  to send, and inventing one is the opposite of what it means);
+- confidence is at or above `minConfidence` (0.7 by default — the prompt tells
+  the model a `continue` below 0.7 is never sent);
+- the session is an agent session the daemon can see, not exited, not the
+  reviewer, has ended its turn, has no question, plan or permission prompt on
+  screen, and no tool still running;
+- the turn is still the session's latest: no newer turn in the index, and no
+  transcript bytes written more than 2 s after the turn ended — a verdict is
+  about the turn as it ended, and anything since means it would be answering
+  something the watcher never read;
+- no carve-out fired (below);
+- the rate limits allow it: at most one per session per 10 minutes, 12 per hour
+  fleet-wide, and **never twice for the same turn**.
+
+The message is sent through the same guarded path the console's `POST /api/send`
+uses, so target resolution, the send precheck and the injection mutex all apply.
+Its text is `[keep watcher] ` plus the verbatim message, which makes the indexer
+file it as a **`keep` opener rather than a human one** — the nudge rate is the
+number this whole project is trying to move, and a watcher message must never be
+counted as one of Owner's.
+
+### Carve-outs
+
+Deterministic, exported, and each one a test. Never deliver when:
+
+- the turn paused itself (`explicitPause`);
+- the turn asks about anything irreversible or production-facing — production,
+  prod, live users, deploy, rollout, canary, delete, drop, rotate, secret, token,
+  credential, first time, irreversible, or money;
+- the card is not `active`, or sets `autocontinue: off`;
+- the turn ran a `git commit`/`git push` or a deploy. A session that just
+  released gets Owner, not a nudge;
+- the turn was opened by an automated message (`keep` opener). **One delivered
+  message must be answered by a human before another can be sent**, or a
+  `continue` would produce an ended turn that the watcher continues again,
+  forever.
+
+### Afterwards
+
+`turns.delivered_at` records the delivery; the ledger entry gains
+`delivered: true` and `deliveredAt` and **stays pending**, because Owner still
+grades what was actually sent — and that grade is what keeps the type live.
+`keep watcher stats` reports deliveries and their agreement separately from
+shadow decisions, and the console's verdict chip carries a "sent" mark.
+
 ## Accepted trade-offs
 
 Known, deliberate, and reviewed. Each is a case where the fix costs more than the

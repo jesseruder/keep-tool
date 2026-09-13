@@ -98,6 +98,7 @@ keep watcher run <session-id|card-id> [--turn n] [--dry] [--json]   # what would
 keep watcher ls [--since when] [--verdict v] [--limit n] [--json]   # verdicts, confidence, state lines
 keep watcher replay [--since when] [--limit n] [--agent a] [--json] # score verdicts against what Owner actually typed
 keep watcher stats [--since when] [--json]                          # verdict counts and shadow agreement rate
+keep watcher live [on|off|<type,type>] [--force] [--json]           # which verdict types are delivered for real
 
 keep review-queue [--limit n] [--min-score n] [--json]   # what deserves review now
 keep review-bundle <id> [--budget n] [--raw]             # evidence delta since last review
@@ -232,7 +233,15 @@ turn ends it decides what you would have typed next — `continue`, `needs-input
 `keep decisions agree|disagree|edit`; `quiet` records nothing. `--dry` prints the
 model input and the rule-only verdict for free, and `keep watcher replay` scores
 verdicts against what you actually typed next in history. The daemon tick is off
-unless `KEEP_WATCHER=1`. See [turn watcher](turn-watcher.md).
+unless `KEEP_WATCHER=1`.
+
+`keep watcher live` is the switch that lets a verdict actually reach a running
+agent — off by default, per verdict type, and refused for a type until 30 of its
+shadow decisions are graded at 90% (`--force` overrules). Delivery happens only
+in the daemon, only while the turn is still the session's latest, never after a
+commit, push or deploy in that turn, never twice for the same turn, and at most
+once per session per 10 minutes. `keep watcher live off` stops everything
+immediately. See [turn watcher](turn-watcher.md).
 
 Mutations auto-commit. Manual terminal use also pushes best-effort in the background;
 Claude and Codex sessions leave commits local unless `KEEP_ALLOW_PUSH=1` is explicitly

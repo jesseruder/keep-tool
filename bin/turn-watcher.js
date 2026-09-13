@@ -254,6 +254,7 @@ const TURN_COLUMNS = `t.id AS id, t.session_id AS session_id, t.n AS n, t.starte
   t.ended_at AS ended_at, t.opener_kind AS opener_kind, t.opener_text AS opener_text,
   t.last_assistant AS last_assistant, t.tool_count AS tool_count, t.tools AS tools, t.files AS files,
   t.commits AS commits, t.stop_reason AS stop_reason, t.verdict AS verdict, t.state_line AS state_line,
+  t.delivered_at AS delivered_at,
   s.agent AS agent, s.kind AS session_kind, s.project AS project, s.card_id AS session_card`;
 
 function selectTurns(options = {}) {
@@ -851,12 +852,20 @@ async function tick(options = {}) {
   let judged = 0;
   let failures = 0;
   const queue = turns.slice();
+  let delivered = 0;
   const worker = async () => {
     for (let next = queue.shift(); next; next = queue.shift()) {
       try {
         const result = await (options.judge || judge)(next, options);
         judged += 1;
         if (result && typeof result.model === 'string' && result.model.startsWith('rules')) failures += 1;
+        // Live delivery, if Owner has turned this verdict type on. Daemon only —
+        // a hook must never reach into a running agent — and never fatal: a
+        // delivery problem loses a message, not the verdict it came from.
+        if (result && !result.skipped && typeof options.deliver === 'function') {
+          const sent = await options.deliver(next, result, options);
+          if (sent && sent.delivered) delivered += 1;
+        }
       } catch (error) {
         failures += 1;
         if (process.env.KEEP_DEBUG) process.stderr.write(`keep watcher: ${error.message}\n`);
@@ -864,7 +873,7 @@ async function tick(options = {}) {
     }
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, queue.length) }, worker));
-  return { judged, failures, ms: Date.now() - startedAt, considered: turns.length };
+  return { judged, failures, delivered, ms: Date.now() - startedAt, considered: turns.length };
 }
 
 // ---------- replay ----------
@@ -1188,6 +1197,7 @@ function pendingDecisionFor(entry) {
   return {
     id: entry.id, type: entry.type, message: entry.message || '',
     createdAt: Number(entry.at) || null, turn: entry.turn || '', card: entry.card || '',
+    ...(entry.delivered ? { delivered: true, deliveredAt: entry.deliveredAt || null } : {}),
   };
 }
 
@@ -1220,6 +1230,11 @@ function shadowSummary(deps = {}) {
   const decisions = deps.decisions || require('./decisions.js');
   const entries = watcherLedger(deps);
   const stats = decisions.stats(entries);
+  const sent = new Map();
+  for (const entry of entries) {
+    if (!entry.delivered) continue;
+    sent.set(entry.type, (sent.get(entry.type) || 0) + 1);
+  }
   return {
     pending: stats.totals.pending,
     judged: stats.totals.judged,
@@ -1227,6 +1242,9 @@ function shadowSummary(deps = {}) {
     graduation: stats.graduation,
     types: stats.rows.filter((row) => row.judged || row.pending)
       .map((row) => ({ type: row.type, judged: row.judged, agree: row.agree, rate: row.rate, ready: row.ready })),
+    // What actually reached a session, so the strip can show the live path
+    // beside the shadow one.
+    live: [...sent.entries()].map(([type, count]) => ({ type, sent: count })),
   };
 }
 
@@ -1268,13 +1286,23 @@ function stats(options = {}) {
     return { band, label: BAND_LABELS[band], total: cells.reduce((sum, row) => sum + row.n, 0), verdicts };
   });
   let ledger = { rows: [], totals: { pending: 0, judged: 0, agree: 0 } };
+  // Deliveries are reported apart from shadow decisions: the question "do you
+  // agree with what it would have said" and "do you agree with what it did say"
+  // are different questions, and mixing them would hide the second.
+  let delivered = { total: 0, rows: [] };
   try {
     const decisions = options.decisions || require('./decisions.js');
     const all = decisions.loadSafe().filter((entry) => entry.reviewer === 'watcher' && Number(entry.at || 0) >= since);
-    ledger = decisions.stats(all);
+    ledger = decisions.stats(all.filter((entry) => !entry.delivered));
+    const sent = all.filter((entry) => entry.delivered);
+    delivered = {
+      total: sent.length,
+      rows: decisions.stats(sent).rows.filter((row) => row.judged || row.pending),
+    };
   } catch {}
   return {
-    since, rows, bands, total: rows.reduce((sum, row) => sum + row.turns, 0), ledger,
+    since, rows, bands, total: rows.reduce((sum, row) => sum + row.turns, 0), ledger, delivered,
+    live: (options.liveConfig || require('./watcher-live.js').loadConfig()),
     replay: options.replay === false ? null : latestReplay(),
   };
 }

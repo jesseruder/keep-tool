@@ -16,7 +16,7 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 
 // Text caps. Transcripts contain whole files and 100k-line build logs; the index
 // exists to find and count turns, not to be a second copy of the corpus.
@@ -195,6 +195,13 @@ const MIGRATIONS = [
        SELECT t.verdict_confidence FROM turns t WHERE t.session_id = sessions.id AND t.verdict IS NOT NULL
        ORDER BY COALESCE(t.verdict_at, 0) DESC, t.n DESC LIMIT 1)
      WHERE last_verdict IS NOT NULL`,
+  ] },
+  // When a live verdict was actually delivered into the session
+  // (bin/watcher-live.js). Also the "never twice for the same turn" guard and
+  // the window both rate limits are counted over.
+  { version: 9, statements: [
+    'ALTER TABLE turns ADD COLUMN delivered_at INTEGER',
+    'CREATE INDEX IF NOT EXISTS turns_delivered ON turns(delivered_at)',
   ] },
 ];
 

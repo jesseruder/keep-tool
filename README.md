@@ -116,7 +116,10 @@ configuration and available agent sessions, Keep can:
 - Judge each finished turn in shadow mode: decide whether you would have typed
   "continue", answered a question, redirected the session, or done nothing — and
   record that decision **without sending it**, so you can measure whether you
-  agree before any of it goes live. Off by default. See
+  agree before any of it goes live. Once a verdict type has earned it — 30 of its
+  decisions graded at 90% agreement — `keep watcher live <type>` lets the daemon
+  deliver that one for real, bounded by rate limits and carve-outs and revocable
+  instantly with `keep watcher live off`. Off by default. See
   [turn watcher](docs/turn-watcher.md).
 
 Scheduling, model access, and launch permissions are separate controls. Model-backed

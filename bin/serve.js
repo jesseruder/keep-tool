@@ -7126,12 +7126,26 @@ function start(deps = {}) {
     watcherDisabledRecorded = false;
     watcherRunning = true;
     try {
+      const live = require('./watcher-live.js');
+      // The snapshot the dashboard just built: whether the session is mid-turn,
+      // has a question on screen, or has exited is exactly what decides delivery.
+      // A stale snapshot would be deciding from a session that has moved on, so
+      // rescan rather than trust one older than the tick interval.
+      const sessions = Date.now() - sessionSnapshotAt < 30e3 && sessionSnapshot.length
+        ? sessionSnapshot : scanSessions();
       const result = await watcher.tick({
         limit: WATCHER_TURNS_PER_TICK, concurrency: WATCHER_CONCURRENCY, windowMs: WATCHER_WINDOW_MS,
+        // The live path exists only here. It uses the same guarded send the
+        // console's POST /api/send uses, so target resolution, the precheck and
+        // the injection mutex all apply to a watcher message too.
+        deliver: (turn, verdict) => live.maybeDeliver(turn, verdict, {
+          session: sessions.find((candidate) => candidate.id === turn.session_id),
+          send: ({ sessionId, pane, text }) => sendToSessionLocked({ sessionId, pane, text }),
+        }),
       });
       health.record('watcher', {
         ok: result.failures === 0, cadenceMs: 30e3,
-        detail: `${result.judged} judged, ${result.failures} model failures, ${result.ms} ms`,
+        detail: `${result.judged} judged, ${result.delivered} delivered, ${result.failures} model failures, ${result.ms} ms`,
         ...(result.failures ? { error: new Error(`${result.failures} watcher model failures`) } : {}),
       });
       if (result.judged) broadcast();

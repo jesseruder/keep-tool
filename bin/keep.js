@@ -5007,6 +5007,49 @@ function looksLikeGitWrite(command) {
   return String(command || '').split('\n').some((line) => GIT_WRITE_RE.test(line));
 }
 
+// `git commit` prints the new sha in brackets, and Codex hands the shell's
+// output back as a function_call_output.
+const CODEX_COMMIT_RE = /\[[^\]\s]+(?:\s+\(root-commit\))?\s+[0-9a-f]{7,40}\]/;
+const APPLY_PATCH_FILE_RE = /^\*\*\* (?:Add|Update|Delete) File:/gm;
+
+// Codex's half of scanStopEvidence. Kept separate so the Claude path above is
+// untouched: it is the one the Stop hook has always run, and a regression there
+// would silently stop enforcing check-ins for the whole fleet.
+function scanCodexStopEvidence(next, payload) {
+  const type = payload.type;
+  if (type === 'function_call' || type === 'custom_tool_call') {
+    const name = String(payload.name || '');
+    const raw = typeof payload.arguments === 'string' ? payload.arguments
+      : typeof payload.input === 'string' ? payload.input : '';
+    if (/apply_patch/.test(name) || /^\*\*\* Begin Patch/m.test(raw)) {
+      // One edit per file the patch touches, matching how the Claude path counts
+      // an Edit/Write per file rather than per tool call.
+      const files = (raw.match(APPLY_PATCH_FILE_RE) || []).length;
+      next.edits += files || 1;
+      return;
+    }
+    let command = '';
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        const value = parsed && parsed.command;
+        command = Array.isArray(value)
+          ? (value.length > 2 && /^(?:ba)?sh$/.test(String(value[0])) ? String(value.at(-1)) : value.join(' '))
+          : String(value || '');
+      } catch { command = raw; }
+    }
+    if (!command) return;
+    if (looksLikeGitWrite(command)) next.bashGitWrites++;
+    if (/(?:^|[;&|]\s*)\s*(?:sudo\s+)?git\s+(?:-\S+(?:\s+[^-\s]\S*)?\s+)*push\b/.test(command)) next.pushes++;
+    return;
+  }
+  if (type === 'function_call_output' || type === 'custom_tool_call_output') {
+    const output = typeof payload.output === 'string' ? payload.output
+      : payload.output == null ? '' : JSON.stringify(payload.output);
+    if (CODEX_COMMIT_RE.test(output)) next.commits++;
+  }
+}
+
 function scanStopEvidence(state, chunk) {
   const next = normalizeStopEvidence(state);
   const lines = `${next.partial}${chunk}`.split('\n');
@@ -5025,6 +5068,10 @@ function scanStopEvidence(state, chunk) {
         if (typeof command === 'string' && looksLikeGitWrite(command)) next.bashGitWrites++;
       }
     }
+    // A Codex rollout carries none of the Claude record shapes below, so until
+    // this existed every Codex session showed zero edits and zero commits and the
+    // "never checked into Keep" reminder could not fire for one at all.
+    if (record.type === 'response_item' && record.payload) scanCodexStopEvidence(next, record.payload);
     const editedAttachment = Boolean(record && record.type === 'attachment' &&
       record.attachment && record.attachment.type === 'edited_text_file');
     if (next.awaitingAgentAttachment) {
@@ -6233,6 +6280,14 @@ function watcherStats(argv) {
         + watcher.VERDICTS.map((verdict) => String(band.verdicts[verdict]).padStart(12)).join(''));
     }
   }
+  console.log(`\ndelivery: ${require('./watcher-live.js').describeConfig(result.live)}`);
+  if (result.delivered?.total) {
+    console.log(`\n${result.delivered.total} delivered live:`);
+    for (const row of result.delivered.rows) {
+      const rate = row.judged ? `${row.agree}/${row.judged} agree` : 'none graded yet';
+      console.log(`  ${row.type.padEnd(12)} ${String(row.judged + row.pending).padStart(4)} sent · ${rate}`);
+    }
+  }
   console.log('');
   console.log(require('./decisions.js').renderStats(result.ledger));
   if (result.replay) {
@@ -6242,11 +6297,50 @@ function watcherStats(argv) {
   }
 }
 
-const WATCHER_SUBCOMMANDS = { run: watcherRun, ls: watcherLs, replay: watcherReplay, stats: watcherStats };
+// The only switch that lets a watcher verdict reach a running agent. Per type,
+// off by default, and a type cannot be turned on until its own shadow record
+// says it has earned it — `--force` exists so Owner can overrule that, loudly.
+function watcherLive(argv) {
+  const live = require('./watcher-live.js');
+  const watcher = require('./turn-watcher.js');
+  const o = parseArgs(argv, { force: 'bool', json: 'bool' });
+  const arg = o._[0];
+  const config = live.loadConfig();
+  if (arg) {
+    const wanted = arg === 'on' ? live.TYPES
+      : arg === 'off' ? []
+        : arg.split(',').map((type) => type.trim()).filter(Boolean);
+    const unknown = wanted.filter((type) => !live.TYPES.includes(type));
+    if (unknown.length) die(`unknown verdict type${unknown.length === 1 ? '' : 's'}: ${unknown.join(', ')}\nvalid: ${live.TYPES.join(', ')}`);
+    if (!o.force) {
+      const stats = watcher.stats({ sinceMs: 0 }).ledger;
+      const refusals = wanted.map((type) => live.graduationCheck(type, stats)).filter((check) => !check.ok);
+      if (refusals.length) {
+        die(`${refusals.map((check) => check.reason).join('\n')}\n`
+          + 'Grade more with `keep decisions` (or the console), or pass --force to overrule.');
+      }
+    }
+    const next = { ...config, live: Object.fromEntries(live.TYPES.map((type) => [type, wanted.includes(type)])) };
+    live.saveConfig(next);
+    // Best effort: this is the riskiest switch in the system, so when the
+    // registry is a git repo the change belongs in its history — but a registry
+    // that is not one must still be able to turn delivery off.
+    try { withLock(() => commitAndPush(`keep: watcher live ${wanted.length ? wanted.join(',') : 'off'}`, ['watch'])); }
+    catch (error) { process.stderr.write(`keep: switch saved but not committed: ${error.message.split('\n')[0]}\n`); }
+  }
+  const current = live.loadConfig();
+  if (o.json) return console.log(JSON.stringify(current, null, 2));
+  console.log(`watcher delivery: ${live.describeConfig(current)}`);
+  if (live.liveTypes(current).length) console.log('turn everything off instantly with: keep watcher live off');
+}
+
+const WATCHER_SUBCOMMANDS = {
+  run: watcherRun, ls: watcherLs, replay: watcherReplay, stats: watcherStats, live: watcherLive,
+};
 
 commands.watcher = async (argv) => {
   const sub = WATCHER_SUBCOMMANDS[argv[0]];
-  if (!sub) die('usage: keep watcher run|ls|replay|stats (see keep help watcher)');
+  if (!sub) die('usage: keep watcher run|ls|replay|stats|live (see keep help watcher)');
   return sub(argv.slice(1));
 };
 
@@ -7343,6 +7437,11 @@ ${stepUsage()}
   keep watcher stats [--since when] [--json]
                          # verdict counts plus the shadow-decision agreement rate per type
                          # the daemon tick is off unless KEEP_WATCHER=1
+  keep watcher live [on|off|<type,type>] [--force] [--json]
+                         # which verdict types are delivered to the session for real
+                         # types: continue, needs-input, drift; off by default
+                         # a type is refused until 30 of its decisions are graded at 90% (--force overrules)
+                         # keep watcher live off stops every delivery immediately
 
   keep hook session-start|session-end|stop|notification|lifecycle|pre-bash|post-bash
                          # Claude context, enforcement, notifications and observation-only lifecycle records
