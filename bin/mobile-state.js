@@ -17,7 +17,7 @@ const SESSION_SUMMARY_FIELDS = [
   'state', 'stateLabel', 'endedTurn', 'alive', 'exited', 'pane', 'rateLimit', 'reviewer',
   // The watcher's one-line "what this session just did and what is next", and the
   // verdict it came from. `pick` drops them when the watcher has not run.
-  'gitBranch', 'stalled', 'stateLine', 'lastVerdict',
+  'gitBranch', 'stalled', 'stateLine', 'lastVerdict', 'lastVerdictAt', 'verdictConfidence', 'pendingDecision',
 ];
 const SESSION_DETAIL_FIELDS = [
   ...SESSION_SUMMARY_FIELDS, 'lastAssistant', 'lastAssistantFull', 'pendingQuestion', 'pendingPlan', 'waitingFor',

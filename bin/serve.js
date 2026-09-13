@@ -7308,6 +7308,14 @@ function start(deps = {}) {
             if (!decisions.VERDICTS.includes(body.verdict)) {
               return json(res, 400, { error: `verdict must be one of: ${decisions.VERDICTS.join(', ')}` });
             }
+            // The ledger's reason is read back by the reviewer; an object coerced to
+            // "[object Object]" would corrupt it, so only a real string gets through.
+            if (body.message !== undefined && typeof body.message !== 'string') {
+              return json(res, 400, { error: 'message must be a string' });
+            }
+            if (body.verdict !== 'agree' && !(typeof body.message === 'string' && body.message.trim())) {
+              return json(res, 400, { error: `${body.verdict} needs a non-empty message` });
+            }
             try {
               const result = watcher.judgeDecision(body.id, body.verdict, body.message);
               broadcast();
