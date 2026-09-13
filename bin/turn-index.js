@@ -16,7 +16,7 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 // Text caps. Transcripts contain whole files and 100k-line build logs; the index
 // exists to find and count turns, not to be a second copy of the corpus.
@@ -149,6 +149,9 @@ const MIGRATIONS = [
     'ALTER TABLE turns ADD COLUMN card_id TEXT',
     'CREATE INDEX IF NOT EXISTS turns_verdict ON turns(ended, verdict_at)',
   ] },
+  // The dashboard asks for the newest verdict of each of a handful of sessions
+  // on every state build; without this it scans every judged turn they have.
+  { version: 5, statements: ['CREATE INDEX IF NOT EXISTS turns_session_verdict ON turns(session_id, verdict_at)'] },
 ];
 
 function migrate(handle) {

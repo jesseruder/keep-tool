@@ -6033,7 +6033,9 @@ async function watcherRun(argv) {
       out.push({ session: sessionId, turn: turn.n, dry: true, rule: context.rule, signals: context.signals, context: context.text });
       continue;
     }
-    out.push(await watcher.judge(turn));
+    // An explicit `keep watcher run` is a deliberate re-judge, so it may replace
+    // an existing verdict — but never the decision Owner may already have marked.
+    out.push(await watcher.judge(turn, { force: true }));
   }
   if (o.json) return console.log(JSON.stringify(out, null, 2));
   for (const entry of out) {
@@ -6048,7 +6050,8 @@ async function watcherRun(argv) {
       + `${entry.confidence == null ? '' : ` (${Math.round(entry.confidence * 100)}%)`} — ${entry.reason}`);
     if (entry.stateLine) console.log(`  state: ${entry.stateLine}`);
     if (entry.message) console.log(`  would type: ${entry.message}`);
-    console.log(`  recorded, not sent${entry.decisionId ? ` — keep decisions agree|disagree|edit ${entry.decisionId}` : ''}`);
+    const reused = entry.reusedDecision ? ' (verdict refreshed; the existing decision is kept, one per turn)' : '';
+    console.log(`  recorded, not sent${entry.decisionId ? ` — keep decisions agree|disagree|edit ${entry.decisionId}` : ''}${reused}`);
   }
 }
 

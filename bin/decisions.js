@@ -77,7 +77,7 @@ function clip(value, max) {
   return String(value == null ? '' : value).replace(/\s+/g, ' ').trim().slice(0, max);
 }
 
-function record({ type, card, session, why, message, reviewer, now = Date.now() }) {
+function record({ type, card, session, turn, why, message, reviewer, now = Date.now() }) {
   if (!TYPES[type]) {
     throw new DecisionError(`--type must be one of: ${Object.keys(TYPES).join(', ')}`);
   }
@@ -96,6 +96,10 @@ function record({ type, card, session, why, message, reviewer, now = Date.now() 
     type,
     card: card || '',
     session: session || '',
+    // Optional, and only the turn watcher sets it: "<session id>#<turn number>",
+    // so a duplicate entry for one turn is detectable after the fact. Older
+    // entries simply do not carry it.
+    ...(turn ? { turn: clip(turn, 200) } : {}),
     why: reason,
     message: would,
     reviewer: reviewer || '',
