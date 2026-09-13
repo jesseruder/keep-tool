@@ -118,15 +118,17 @@ function executableText(segment) {
     .replace(assignments, '');
 }
 
-// ---------- normalized commands ----------
+// ---------- what a command actually runs ----------
 //
-// `git push` can be spelled `/usr/bin/git push`, `git pu\sh`, `env -i git push`,
-// `sudo -u root git push`, or `bash -lc "git push"`, and every one of those runs
-// a push. Anything that decides "did this turn release something" or "was this a
-// commit" has to see the same command behind all of those spellings, so the
-// normalization lives here beside the segmenter rather than in each caller.
+// `git push` can be spelled `/usr/bin/git push`, `git pu\sh`, `env -u FOO git
+// push`, `nice -n 5 git push`, `sudo -u root git push`, or `bash -lc "git push"`,
+// and every one of those runs a push. `printf %s 'example; git push'` runs none.
+// Telling those apart is the difference between a carve-out that holds and one
+// somebody walks around, so it happens here, once, on the argv — never on an
+// argv joined back into a string, because joining is exactly what lets an
+// argument read as a command.
 
-const SHELL_RE = /^(?:ba|z|da|k|a)?sh$/;
+const SHELL_BASENAMES = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'ash']);
 
 function commandBasename(token) {
   const text = String(token || '');
@@ -135,7 +137,8 @@ function commandBasename(token) {
 }
 
 // Quote-aware split into tokens, with quoting and backslash escapes removed:
-// `git "push"` and `git pu\sh` both become ['git', 'push'].
+// `git "push"` and `git pu\sh` both become ['git', 'push']. A backslash before a
+// newline is a line continuation — it joins the word rather than escaping one.
 function commandTokens(text) {
   const tokens = [];
   let current = '';
@@ -145,7 +148,13 @@ function commandTokens(text) {
   const value = String(text || '');
   for (let i = 0; i < value.length; i += 1) {
     const ch = value[i];
-    if (ch === '\\' && i + 1 < value.length && quote !== "'") { current += value[i + 1]; started = true; i += 1; continue; }
+    if (ch === '\\' && i + 1 < value.length && quote !== "'") {
+      const next = value[i + 1];
+      i += 1;
+      // `git pu\<newline>sh` is one word, and the word is `push`.
+      if (next === '\n') continue;
+      current += next; started = true; continue;
+    }
     if (quote) {
       if (ch === quote) { quote = ''; continue; }
       current += ch; started = true; continue;
@@ -158,85 +167,167 @@ function commandTokens(text) {
   return tokens;
 }
 
-// Drop the wrappers that stand between the shell and the real executable.
+// The wrappers that stand between the shell and the real executable, and the
+// options each of them takes a *value* for. Without the arity, `env -u FOO git
+// push` reads as running FOO and `nice -n 5 git push` as running 5 — which is to
+// say, as not a push at all.
+const WRAPPER_VALUE_FLAGS = {
+  env: new Set(['-u', '--unset', '-C', '--chdir', '-S', '--split-string']),
+  sudo: new Set(['-u', '--user', '-g', '--group', '-U', '--other-user', '-p', '--prompt',
+    '-C', '--close-from', '-D', '--chdir', '-R', '--chroot', '-T', '--command-timeout', '-h', '--host']),
+  doas: new Set(['-u', '-C']),
+  nice: new Set(['-n', '--adjustment']),
+  ionice: new Set(['-c', '-n', '-p']),
+  stdbuf: new Set(['-i', '-o', '-e']),
+  timeout: new Set(['-s', '--signal', '-k', '--kill-after']),
+};
+const WRAPPERS = new Set([...Object.keys(WRAPPER_VALUE_FLAGS), 'nohup', 'time', 'command', 'exec', 'setsid']);
+// Wrappers that take a positional argument of their own before the command.
+const WRAPPER_POSITIONALS = { timeout: 1 };
+
 function stripCommandWrappers(input) {
-  let tokens = input.slice();
+  let tokens = Array.isArray(input) ? input.slice().map((token) => String(token == null ? '' : token))
+    : commandTokens(input);
   for (let guard = 0; guard < 8 && tokens.length; guard += 1) {
-    const head = commandBasename(tokens[0]);
-    if (head === 'env') {
-      tokens = tokens.slice(1);
-      while (tokens.length && (/^-/.test(tokens[0]) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0]))) tokens = tokens.slice(1);
-      continue;
-    }
-    if (head === 'sudo' || head === 'doas') {
-      tokens = tokens.slice(1);
-      while (tokens.length && /^-/.test(tokens[0])) {
-        const flag = tokens[0];
-        tokens = tokens.slice(1);
-        // These take a value; the rest are plain switches.
-        if (/^-[uUgpCDRTh]$/.test(flag) && tokens.length) tokens = tokens.slice(1);
-      }
-      continue;
-    }
-    if (['time', 'nohup', 'exec', 'command', 'nice', 'stdbuf', 'setsid'].includes(head)) {
-      tokens = tokens.slice(1);
-      while (tokens.length && /^-/.test(tokens[0])) tokens = tokens.slice(1);
-      continue;
-    }
+    // `FOO=bar git push` runs a push with an assignment in front of it.
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) { tokens = tokens.slice(1); continue; }
-    break;
+    const head = commandBasename(tokens[0]);
+    if (!WRAPPERS.has(head)) break;
+    const values = WRAPPER_VALUE_FLAGS[head] || new Set();
+    let rest = tokens.slice(1);
+    while (rest.length) {
+      const token = rest[0];
+      if (token === '--') { rest = rest.slice(1); break; }
+      if (head === 'env' && /^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) { rest = rest.slice(1); continue; }
+      if (!/^-./.test(token)) break;
+      rest = rest.slice(1);
+      if (token.includes('=')) continue; // --unset=FOO carries its own value
+      if (values.has(token) && rest.length) rest = rest.slice(1);
+    }
+    for (let i = 0; i < (WRAPPER_POSITIONALS[head] || 0) && rest.length; i += 1) rest = rest.slice(1);
+    // A wrapper with nothing after it runs nothing; keep what was there.
+    if (!rest.length) break;
+    tokens = rest;
   }
   return tokens;
 }
 
-// Every executable command a string runs, normalized, recursing through
-// `sh -c "…"` wrappers. Order is the order they would run in.
-function normalizedCommands(command, depth = 0) {
-  const out = [];
-  if (depth > 4) return out;
-  for (const segment of commandSegments(command)) {
-    const tokens = stripCommandWrappers(commandTokens(segment.text));
-    if (!tokens.length) continue;
-    const head = commandBasename(tokens[0]);
-    if (SHELL_RE.test(head) && tokens.slice(1).some((token) => /^-[a-z]*c$/i.test(token))) {
-      // The script is the last argument; anything after it is $0 and positional.
-      out.push(...normalizedCommands(tokens[tokens.length - 1], depth + 1));
+// `bash -lc "git push" label` runs the script and passes `label` as $0, so the
+// script is the FIRST argument after the -c, not the last. A shell with no -c is
+// running a file this cannot read, which is not a release anything can see.
+function shellScriptArgument(tokens) {
+  let seenC = false;
+  let afterDash = false;
+  for (let i = 1; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (seenC) {
+      if (!afterDash && token === '--') { afterDash = true; continue; }
+      if (afterDash || !/^-./.test(token)) return token;
       continue;
     }
-    out.push([head, ...tokens.slice(1)].join(' '));
+    if (token === '--') return null;
+    if (!/^-./.test(token)) return null;
+    if (/^-[a-z]*c$/i.test(token)) { seenC = true; continue; }
+  }
+  return null;
+}
+
+// git's own global options, which sit before the subcommand.
+const GIT_GLOBAL_VALUE_FLAGS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace',
+  '--exec-path', '--config-env', '--super-prefix']);
+
+function stripGitGlobals(argv) {
+  let tokens = argv.slice();
+  while (tokens.length) {
+    const token = tokens[0];
+    if (token === '--') { tokens = tokens.slice(1); break; }
+    if (!/^-./.test(token)) break;
+    tokens = tokens.slice(1);
+    if (!token.includes('=') && GIT_GLOBAL_VALUE_FLAGS.has(token) && tokens.length) tokens = tokens.slice(1);
+  }
+  return tokens;
+}
+
+const SAFE_TOKEN_RE = /^[A-Za-z0-9_@%+=:,./-]+$/;
+
+// One display spelling for an argv, quoted so that reading it back can never
+// turn an argument into a command.
+function quoteArgv(tokens) {
+  return tokens
+    .map((token) => (SAFE_TOKEN_RE.test(token) ? token : `'${String(token).replace(/'/g, "'\\''")}'`))
+    .join(' ');
+}
+
+const NO_RELEASE = Object.freeze({ push: false, commit: false, commands: Object.freeze([]) });
+
+// What an argv array runs: whether it is a push, whether it is a commit, and the
+// normalized command strings inside it (for the deploy fingerprints, which are
+// written as strings). Recurses into `sh -c "…"` and into every segment of a
+// shell string, so a chained or wrapped release is the same release.
+function releaseFromArgv(argv, depth = 0) {
+  if (depth > 4) return { push: false, commit: false, commands: [] };
+  if (typeof argv === 'string') return releaseFromCommand(argv, depth);
+  if (!Array.isArray(argv) || !argv.length) return { push: false, commit: false, commands: [] };
+  const raw = argv.map((token) => String(token == null ? '' : token)).filter((token) => token !== '');
+  const tokens = stripCommandWrappers(raw);
+  if (!tokens.length) return { push: false, commit: false, commands: [] };
+  const head = commandBasename(tokens[0]);
+  if (SHELL_BASENAMES.has(head)) {
+    const script = shellScriptArgument(tokens);
+    return script === null ? { push: false, commit: false, commands: [] } : releaseFromCommand(script, depth + 1);
+  }
+  const command = quoteArgv([head, ...tokens.slice(1)]);
+  if (head !== 'git') return { push: false, commit: false, commands: [command] };
+  const rest = stripGitGlobals(tokens.slice(1));
+  const sub = rest[0];
+  // `git commit --dry-run` writes nothing, and `git commit --help` is a manual
+  // page. A push is left alone: over-reading one only holds a message back.
+  const inert = rest.slice(1).some((token) => token === '--dry-run' || token === '--help' || token === '-h');
+  if (sub === 'push') return { push: true, commit: false, commands: [command] };
+  if (sub === 'commit') return { push: false, commit: !inert, commands: [command] };
+  return { push: false, commit: false, commands: [command] };
+}
+
+// A shell string: every segment of it, each read as its own argv.
+function releaseFromCommand(command, depth = 0) {
+  const out = { push: false, commit: false, commands: [] };
+  if (depth > 4) return out;
+  for (const segment of commandSegments(command)) {
+    const tokens = commandTokens(segment.text);
+    if (!tokens.length) continue;
+    const found = releaseFromArgv(tokens, depth + 1);
+    out.push = out.push || found.push;
+    out.commit = out.commit || found.commit;
+    out.commands.push(...found.commands);
   }
   return out;
 }
 
-// An argv array, as Codex's shell and exec_command tools spell a command.
-function normalizedCommandsFromArgv(argv) {
-  if (typeof argv === 'string') return normalizedCommands(argv);
-  if (!Array.isArray(argv) || !argv.length) return [];
-  const tokens = argv.map((token) => String(token == null ? '' : token)).filter((token) => token !== '');
-  if (!tokens.length) return [];
-  const head = commandBasename(tokens[0]);
-  if (SHELL_RE.test(head) && tokens.slice(1).some((token) => /^-[a-z]*c$/i.test(token))) {
-    return normalizedCommands(tokens[tokens.length - 1]);
-  }
-  // Already split by whoever built the argv, so re-joining and re-splitting it
-  // would only give a token containing a space or a quote the chance to be read
-  // as two. The wrappers still come off.
-  const stripped = stripCommandWrappers(tokens);
-  if (!stripped.length) return [];
-  return [[commandBasename(stripped[0]), ...stripped.slice(1)].join(' ')];
+// Either spelling — Claude writes a shell string, Codex an argv array.
+function releaseOf(value) {
+  if (value == null) return NO_RELEASE;
+  return Array.isArray(value) ? releaseFromArgv(value) : releaseFromCommand(String(value));
 }
 
-const GIT_RELEASE_RE = /^git(?:\s+-\S+(?:\s+\S+)?)*\s+(?:commit|push)\b/;
-const GIT_COMMIT_RE = /^git(?:\s+-\S+(?:\s+\S+)?)*\s+commit\b/;
-
-// True when the string, however spelled, actually runs one of these — as an
+// True when the value, however spelled, actually runs one of these — as an
 // executable, not as an argument to `rg` or inside a here-doc.
-function runsGitWrite(command) {
-  return normalizedCommands(command).some((text) => GIT_RELEASE_RE.test(text));
+function runsGitWrite(value) {
+  const found = releaseOf(value);
+  return found.push || found.commit;
 }
 
-function runsGitCommit(command) {
-  return normalizedCommands(command).some((text) => GIT_COMMIT_RE.test(text));
+function runsGitCommit(value) {
+  return releaseOf(value).commit;
+}
+
+// The normalized, quoted commands a value runs, in the order they would run.
+function normalizedCommands(value) {
+  return releaseOf(value).commands;
+}
+
+// Kept as its own name because the callers that have an argv should say so.
+function normalizedCommandsFromArgv(value) {
+  return releaseOf(value).commands;
 }
 
 function fingerprintRegex(fingerprint) {
@@ -729,6 +820,12 @@ module.exports = {
   commandTokens,
   commandBasename,
   stripCommandWrappers,
+  shellScriptArgument,
+  stripGitGlobals,
+  quoteArgv,
+  releaseFromArgv,
+  releaseFromCommand,
+  releaseOf,
   normalizedCommands,
   normalizedCommandsFromArgv,
   runsGitWrite,

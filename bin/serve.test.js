@@ -3443,35 +3443,115 @@ test('typing exit confirms the prompt above a tall Claude slash-command menu', a
   assert.equal(typed, '/exit\r');
 });
 
-test('an abort between typing and Enter clears the draft instead of submitting it', async () => {
-  // The watcher's precondition is checked once more after the text is in the box.
-  // Failing it there must leave the session exactly as it was found: no Enter,
-  // and no half-typed message for Owner to discover and delete.
+// One harness for the three ways typing into a live pane can go wrong after the
+// text is in the box. `screen` is whatever the pane shows when it is read back.
+function draftHarness(screen) {
   const inputs = [];
+  const events = [];
   const host = recordingHost(async (type, params) => {
-    if (type === 'screen') return { text: '> continue the migration' };
+    if (type === 'screen') return { text: typeof screen === 'function' ? screen(inputs) : screen };
     if (type === 'input') inputs.push(Buffer.from(params.data, 'base64').toString());
     return {};
   });
-  const seen = [];
-  const events = [];
-  await assert.rejects(typeAndSubmit({ pane: 'p' }, 'continue the migration', (s, t) => s.includes(t), {
-    host, sleep: async () => {}, deliveryTrace: (stage, fields) => events.push({ stage, ...fields }),
-    discardDraftOnAbort: true,
-    beforeEnter: async (target) => { seen.push(target && target.pane); throw new Error('moved-on: continue was switched off'); },
-  }), /moved-on: continue was switched off/);
-  assert.deepEqual(seen, ['p'], 'the hook is handed the pane it would type into');
-  assert.equal(inputs.includes('\r'), false, 'Enter is never pressed');
-  assert.equal(inputs[inputs.length - 1], '\x1b', 'and the typed draft is cleared');
-  assert.ok(events.some((e) => e.stage === 'enter-aborted' && e.cleared === true));
-  assert.equal(events.some((e) => e.stage === 'enter-sent'), false);
+  return {
+    inputs, events, host,
+    deps: {
+      host, sleep: async () => {}, draftKind: 'claude',
+      deliveryTrace: (stage, fields) => events.push({ stage, ...fields }),
+    },
+  };
+}
 
-  // A hook that passes changes nothing about the normal path.
-  inputs.length = 0;
-  await typeAndSubmit({ pane: 'p' }, 'continue the migration', (s, t) => s.includes(t), {
-    host, sleep: async () => {}, beforeEnter: async () => {},
+const MESSAGE = '[keep watcher] continue the migration';
+const BOX = (draft) => `───────────────────────────\n❯ ${draft}\n───────────────────────────`;
+
+test('an abort after typing clears only a draft that is still ours', async () => {
+  // The watcher's precondition is checked once more after the text is in the box.
+  // Failing it there must leave the session as it was found: no Enter, and no
+  // half-typed message for Owner to discover and delete.
+  const clean = draftHarness(BOX(MESSAGE));
+  await assert.rejects(typeAndSubmit({ pane: 'p' }, MESSAGE, (s, t) => s.includes(t), {
+    ...clean.deps, discardDraftOnAbort: true,
+    beforeEnter: async (target) => {
+      assert.equal(target && target.pane, 'p', 'the hook is handed the pane it would type into');
+      throw new Error('moved-on: continue was switched off');
+    },
+  }), /moved-on: continue was switched off/);
+  assert.equal(clean.inputs.includes('\r'), false, 'Enter is never pressed');
+  assert.equal(clean.inputs[clean.inputs.length - 1], '\x1b', 'and the typed draft is cleared');
+  assert.ok(clean.events.some((e) => e.stage === 'enter-aborted' && e.cleared === true));
+  assert.equal(clean.events.some((e) => e.stage === 'enter-sent'), false);
+
+  // Owner started typing into the same box. Escape would erase his words too, so
+  // the box is not touched at all and the refusal says so.
+  const mixed = draftHarness(BOX(`${MESSAGE} and also check the migration`));
+  const error = await typeAndSubmit({ pane: 'p' }, MESSAGE, (s, t) => s.includes(t), {
+    ...mixed.deps, discardDraftOnAbort: true,
+    beforeEnter: async () => { throw new Error('moved-on: a question is on screen'); },
+  }).then(() => null, (e) => e);
+  assert.match(error.message, /a question is on screen/);
+  assert.equal(error.draftLeftOnScreen, true);
+  assert.equal(error.draftReason, 'mixed draft');
+  assert.equal(mixed.inputs.includes('\x1b'), false, "Owner's text is never erased");
+  assert.equal(mixed.inputs.includes('\r'), false);
+  assert.ok(mixed.events.some((e) => e.stage === 'enter-aborted' && e.cleared === false && e.reason === 'mixed draft'));
+
+  // A caller that did not ask for the draft to be cleared still never gets one
+  // cleared: session cleanup keeps its typed /exit on screen.
+  const kept = draftHarness(BOX(MESSAGE));
+  await assert.rejects(typeAndSubmit({ pane: 'p' }, MESSAGE, (s, t) => s.includes(t), {
+    ...kept.deps, beforeEnter: async () => { throw new Error('moved-on: mid-turn'); },
+  }), /mid-turn/);
+  assert.equal(kept.inputs.includes('\x1b'), false);
+
+  // And a hook that passes changes nothing about the normal path.
+  const fine = draftHarness(BOX(MESSAGE));
+  await typeAndSubmit({ pane: 'p' }, MESSAGE, (s, t) => s.includes(t), {
+    ...fine.deps, discardDraftOnAbort: true, requireExactDraft: true, beforeEnter: async () => {},
   });
-  assert.equal(inputs[inputs.length - 1], '\r');
+  assert.equal(fine.inputs[fine.inputs.length - 1], '\r');
+});
+
+test('a box holding more than the typed message is not submitted', async () => {
+  // The old confirmation only asked whether the typed text was *visible*. If
+  // Owner types while the watcher types, it is visible and the line reads as
+  // something neither of them wrote — so exactness is what decides, not
+  // containment, and a mismatch touches nothing at all.
+  const mixed = draftHarness(BOX(`${MESSAGE} rm -rf build`));
+  const error = await typeAndSubmit({ pane: 'p' }, MESSAGE, (s, t) => s.includes(t), {
+    ...mixed.deps, requireExactDraft: true, discardDraftOnAbort: true,
+    beforeEnter: async () => { throw new Error('the hook should never be reached'); },
+  }).then(() => null, (e) => e);
+  assert.match(error.message, /no longer holds only the typed message/);
+  assert.equal(error.status, 409);
+  assert.equal(mixed.inputs.includes('\r'), false, 'Enter is never pressed');
+  assert.equal(mixed.inputs.includes('\x1b'), false, 'and nothing is erased either');
+  assert.ok(mixed.events.some((e) => e.stage === 'draft-not-exact'));
+
+  // Wrapped across lines, re-indented, or re-rendered is still exactly ours.
+  const wrapped = draftHarness(`───────────\n❯ [keep watcher] continue\n   the migration\n───────────`);
+  await typeAndSubmit({ pane: 'p' }, MESSAGE, (s, t) => s.includes(t.slice(0, 10)), {
+    ...wrapped.deps, requireExactDraft: true,
+  });
+  assert.equal(wrapped.inputs[wrapped.inputs.length - 1], '\r');
+
+  // An empty box, or one whose prompt cannot be found, is not ours to submit.
+  const gone = draftHarness('the session scrolled away');
+  await assert.rejects(typeAndSubmit({ pane: 'p' }, MESSAGE, () => true, {
+    ...gone.deps, requireExactDraft: true,
+  }), /no longer holds only the typed message/);
+  assert.equal(gone.inputs.includes('\r'), false);
+});
+
+test('the draft region reads through ANSI, wrapping and the box rules', () => {
+  const { draftRegionText, draftIsExactly } = require('./serve');
+  assert.equal(draftRegionText(BOX('hello there'), 'claude'), 'hello there');
+  assert.equal(draftRegionText(`\x1b[2m───\x1b[0m\n❯ \x1b[1mhello\x1b[0m there\n───`, 'claude'), 'hello there');
+  assert.equal(draftRegionText('› ask me anything', 'codex'), 'ask me anything');
+  assert.equal(draftRegionText('no prompt here', 'claude'), null);
+  assert.equal(draftIsExactly(BOX('hello   there'), 'hello there', 'claude'), true);
+  assert.equal(draftIsExactly(BOX('hello there and more'), 'hello there', 'claude'), false);
+  assert.equal(draftIsExactly('no prompt here', 'hello there', 'claude'), false);
 });
 
 test('the watcher transport checks its precondition before typing and again before Enter', async () => {

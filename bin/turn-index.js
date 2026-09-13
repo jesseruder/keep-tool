@@ -16,7 +16,7 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-const SCHEMA_VERSION = 10;
+const SCHEMA_VERSION = 11;
 
 // Text caps. Transcripts contain whole files and 100k-line build logs; the index
 // exists to find and count turns, not to be a second copy of the corpus.
@@ -24,7 +24,10 @@ const TEXT_CAP = 16 * 1024;
 const TOOL_CAP = 2 * 1024;
 const OPENER_CAP = 2 * 1024;
 const LAST_ASSISTANT_CAP = 4 * 1024;
-const COMMAND_CAP = 500;
+// The command column is what the release carve-out reads when a tool input was
+// too long to keep as JSON, so it holds the command itself rather than a preview
+// of one: a `&& git push` 600 characters in is exactly what a preview drops.
+const COMMAND_CAP = 4096;
 
 const CHUNK_BYTES = 1024 * 1024;
 const MAX_LINE_BYTES = 32 * 1024 * 1024; // a line longer than this is abandoned
@@ -219,6 +222,10 @@ const MIGRATIONS = [
     'CREATE INDEX IF NOT EXISTS deliveries_session ON deliveries(session_id, reserved_at)',
     'CREATE INDEX IF NOT EXISTS deliveries_reserved ON deliveries(reserved_at)',
   ] },
+  // Who holds a reservation. Only the attempt that took a row may give it back,
+  // so an abort from a previous attempt cannot free the slot a live one is
+  // sending under (bin/watcher-live.js).
+  { version: 11, statements: ['ALTER TABLE deliveries ADD COLUMN token TEXT'] },
 ];
 
 function migrate(handle) {
@@ -764,6 +771,23 @@ function insertTurn(handle, sessionId, n, turn) {
 
 // Turn rows are derived, never accumulated: recomputing from the turn's own
 // messages is what keeps a turn that spans several ingest passes correct.
+// What a recorded tool_use actually ran, read back out of the stored input.
+// `undefined` means the input could not be read at all (it was truncated), which
+// is different from a tool that ran no command.
+function toolInputCommand(text) {
+  if (typeof text !== 'string' || !text) return undefined;
+  let input;
+  try { input = JSON.parse(text); } catch { return undefined; }
+  if (!input || typeof input !== 'object') return undefined;
+  if (typeof input.arguments === 'string') {
+    try { input = JSON.parse(input.arguments) || input; } catch { /* keep the outer object */ }
+  } else if (input.arguments && typeof input.arguments === 'object') {
+    input = input.arguments;
+  }
+  const value = input.command !== undefined ? input.command : input.cmd;
+  return value === undefined ? null : value;
+}
+
 function refreshTurn(handle, turnId, { ended, stopReason } = {}) {
   if (!turnId) return;
   const rows = statement(handle, 
@@ -775,8 +799,14 @@ function refreshTurn(handle, turnId, { ended, stopReason } = {}) {
   // whole turn past the watcher's release carve-out.
   const commitCalls = new Set();
   for (const row of rows) {
-    if (row.kind !== 'tool_use' || !row.tool_id || !row.command) continue;
-    try { if (require('./steps.js').runsGitCommit(row.command)) commitCalls.add(row.tool_id); } catch {}
+    if (row.kind !== 'tool_use' || !row.tool_id) continue;
+    // The full input, so an argv array is read as an argv array: `["git","commit
+    // --help"]` runs no commit, and joining it into a string is what would say it
+    // did. The column is the fallback for an input too long to have been kept.
+    const ran = toolInputCommand(row.text);
+    const candidate = ran === undefined ? row.command : ran;
+    if (candidate === undefined || candidate === null || candidate === '') continue;
+    try { if (require('./steps.js').runsGitCommit(candidate)) commitCalls.add(row.tool_id); } catch {}
   }
   const assistant = [];
   const tools = [];
@@ -1532,5 +1562,6 @@ function stats(options = {}) {
 module.exports = {
   open, close, databaseFile, ingestFile, ingestSessionsFromLiveState, backfill, prune, pruneCandidates,
   search, turnsForSession, sessionRow, stats, isNudge, normalizeProject,
-  SCHEMA_VERSION, TEXT_CAP, TOOL_CAP, NUDGE_RE, DEFAULT_PRUNE_DAYS,
+  SCHEMA_VERSION, TEXT_CAP, TOOL_CAP, COMMAND_CAP, NUDGE_RE, DEFAULT_PRUNE_DAYS,
+  toolInputCommand,
 };

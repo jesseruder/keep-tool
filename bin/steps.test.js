@@ -802,3 +802,88 @@ test('the codex pre-tool hook blocks a gated command and the post-tool hook reco
     assert.match(out.stderr, /exit status is unknown; not recorded/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+// ---------- what a command actually runs ----------
+
+test('a release is read off the argv, never off an argv joined into a string', () => {
+  const steps = require('./steps.js');
+  const verdict = (value) => {
+    const found = steps.releaseOf(value);
+    return found.push ? 'push' : found.commit ? 'commit' : 'none';
+  };
+
+  // Every spelling of the same push. The wrappers are the interesting half: an
+  // option that takes a value hides the command behind it from anything that
+  // only skips leading dashes.
+  for (const value of [
+    'git push',
+    '/usr/bin/git push',
+    'git pu\\sh',
+    'git "push"',
+    'git pu\\\nsh origin main',
+    'env -i git push',
+    'env -u FOO git push',
+    'env FOO=bar -u BAZ git push',
+    'nice -n 5 git push',
+    'nice -5 git push',
+    'nohup git push',
+    'timeout 60 git push',
+    'sudo -u root git push',
+    'sudo -E -n git push',
+    'doas git push',
+    'FOO=bar git push',
+    'bash -lc "git push"',
+    'zsh -lc "git push"',
+    'sh -c "git push"',
+    'npm test && git push',
+    'cd /tmp; git push',
+    ['git', 'push'],
+    ['bash', '-c', 'git push', 'label'],
+    ['bash', '-l', '-c', 'git push'],
+    ['env', 'bash', '-c', 'git push'],
+    ['env', '-u', 'FOO', 'git', 'push'],
+    ['nice', '-n', '5', 'git', 'push'],
+    ['sudo', '-u', 'root', 'git', 'push'],
+    ['git', '-C', '/tmp/a b', 'push'],
+    ['git', '-c', 'user.name=x', 'push'],
+    ['git', '--git-dir=/tmp/g', 'push'],
+    ['/usr/local/bin/git', 'push', 'origin', 'HEAD:master'],
+  ]) assert.equal(verdict(value), 'push', JSON.stringify(value));
+
+  for (const value of ['git commit -am wip', ['git', 'commit', '-m', 'a b c'], 'bash -lc "git commit -am wip"']) {
+    assert.equal(verdict(value), 'commit', JSON.stringify(value));
+  }
+
+  // And every one of these runs no such thing. `printf %s "example; git push"`
+  // is the case that decides the design: joining the argv back into a string is
+  // exactly what would turn that argument into a command.
+  for (const value of [
+    ['printf', '%s', 'example; git push'],
+    ['echo', 'git push'],
+    ['git', 'commit --help'],
+    ['bash', '-c', 'echo hello', 'git commit'],
+    ['bash', 'deploy.sh'],
+    'rg "git commit" README.md',
+    'echo "remember to git push" >> NOTES.md',
+    'git commit --dry-run',
+    'git commit --help',
+    ['git', 'commit', '--dry-run'],
+    'git status',
+    'git log --oneline -5',
+    'cat <<EOF\ngit push\nEOF',
+  ]) assert.equal(verdict(value), 'none', JSON.stringify(value));
+
+  // The normalized form is quoted, so reading it back cannot promote an argument
+  // to a command.
+  assert.deepEqual(steps.normalizedCommands('rg "git commit" README.md'), ["rg 'git commit' README.md"]);
+  assert.deepEqual(steps.releaseOf(['printf', '%s', 'example; git push']).commands, ["printf %s 'example; git push'"]);
+  assert.equal(steps.releaseOf(["rg 'git commit' README.md"]).push, false, 'and re-reading it changes nothing');
+
+  // The pieces, each on their own.
+  assert.deepEqual(steps.stripCommandWrappers(['env', '-u', 'FOO', 'git', 'push']), ['git', 'push']);
+  assert.deepEqual(steps.stripCommandWrappers(['sudo', '--', 'git', 'push']), ['git', 'push']);
+  assert.equal(steps.shellScriptArgument(['bash', '-lc', 'git push', '$0']), 'git push');
+  assert.equal(steps.shellScriptArgument(['bash', 'script.sh']), null);
+  assert.deepEqual(steps.stripGitGlobals(['-C', '/tmp', 'push']), ['push']);
+  assert.deepEqual(steps.commandTokens('git pu\\\nsh'), ['git', 'push']);
+});

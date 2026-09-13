@@ -5024,16 +5024,15 @@ const APPLY_PATCH_FILE_RE = /^\*\*\* (?:Add|Update|Delete) File:/gm;
 // Codex spells a tool's input as a JSON string or as an object, and the command
 // inside it as `command` or `cmd`, a string or an argv array. All of those run
 // the same thing, so all of them normalize to the same list here.
-function codexCommands(payload) {
+function codexCommand(payload) {
   const raw = payload.arguments !== undefined ? payload.arguments : payload.input;
   let value = raw;
   if (typeof raw === 'string') {
-    try { value = JSON.parse(raw); } catch { return stepRegistry.normalizedCommands(raw); }
+    try { value = JSON.parse(raw); } catch { return raw; }
   }
-  if (!value || typeof value !== 'object') return stepRegistry.normalizedCommands(String(value || ''));
+  if (!value || typeof value !== 'object') return String(value || '');
   const command = value.command !== undefined ? value.command : value.cmd;
-  if (command === undefined) return [];
-  return stepRegistry.normalizedCommandsFromArgv(command);
+  return command === undefined ? null : command;
 }
 
 function scanCodexStopEvidence(next, payload) {
@@ -5049,16 +5048,15 @@ function scanCodexStopEvidence(next, payload) {
       next.edits += files || 1;
       return;
     }
-    const commands = codexCommands(payload);
-    if (!commands.length) return;
-    let committed = false;
-    for (const command of commands) {
-      // `git commit` at an executable position only: `rg "git commit" README.md`
-      // is a search, not a commit.
-      if (/^git(?:\s+-\S+(?:\s+\S+)?)*\s+(?:commit|push)\b/.test(command)) next.bashGitWrites++;
-      if (/^git(?:\s+-\S+(?:\s+\S+)?)*\s+push\b/.test(command)) next.pushes++;
-      if (/^git(?:\s+-\S+(?:\s+\S+)?)*\s+commit\b/.test(command)) committed = true;
-    }
+    const command = codexCommand(payload);
+    if (command === null || command === undefined || command === '') return;
+    // At an executable position only, and read in the shape it was written:
+    // `rg "git commit" README.md` is a search, and `["git","commit --help"]` is a
+    // manual page.
+    const ran = stepRegistry.releaseOf(command);
+    if (ran.push) { next.pushes++; next.bashGitWrites++; }
+    if (ran.commit) next.bashGitWrites++;
+    const committed = ran.commit;
     // Remember which call was a commit, so its output can be believed below. A
     // transcript is untrusted text: a README or a test fixture containing
     // "[main abc1234] …" must not read as a commit that never happened.

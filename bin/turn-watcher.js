@@ -152,6 +152,14 @@ function askedForAction(lastAssistant) {
   return ASKED_FOR_ACTION_RE.test(tail(withoutQuoted(lastAssistant)));
 }
 
+// The same question asked of the whole text. The pre-signal above reads a tail
+// because how a turn *ended* is what it decides; a carve-out asks whether
+// anything in the turn means Owner has to see it, and "Please run the production
+// deploy" followed by 700 characters of explanation is still that.
+function askedForActionAnywhere(text) {
+  return ASKED_FOR_ACTION_RE.test(withoutQuoted(text));
+}
+
 // A session quoting a README ("the docs say \"please run npm install\"") is not
 // asking Owner to run anything. proseRequest already drops fenced code and block
 // quotes for the same reason; this drops inline quotation as well. Single quotes
@@ -209,7 +217,11 @@ function explicitPauseAnywhere(text) {
 
 function askedAnywhere(text) {
   const folded = normalizeForMatch(text);
-  return Boolean(askedQuestion(folded) || askedForAction(folded));
+  // askedForActionAnywhere, not askedForAction: the tail clip belongs to the
+  // rule verdict's pre-signals, and clipping here would hide a request made at
+  // the start of a long sentence. proseRequest already reads all of what it is
+  // given.
+  return Boolean(askedQuestion(folded) || askedForActionAnywhere(folded));
 }
 
 // A card whose scheduled check this very session booked is not a stalled turn:
@@ -1330,7 +1342,7 @@ function stats(options = {}) {
 module.exports = {
   VERDICTS, SELF_CHECK_MESSAGE, SYSTEM_PROMPT, INSTRUCTION, TIMEOUT_MS, MAX_CONTEXT_BYTES,
   askedQuestion, askedForAction, stopHint, namesNextStep, claimsDone, explicitPause, inProgress, waitingOnCheck,
-  normalizeForMatch, explicitPauseAnywhere, askedAnywhere,
+  normalizeForMatch, explicitPauseAnywhere, askedAnywhere, askedForActionAnywhere,
   signalsFor, ruleVerdict, selectTurns, turnsForReplay, turnFor, buildContext, invocationFor,
   firstJsonObject, parseVerdict, runModel, spawnRunner, judge, writeVerdict, setDecisionId, decisionTypeFor,
   normalizeContinue, isAllowedContinueMessage, canonicalContinueMessage, withoutQuoted,

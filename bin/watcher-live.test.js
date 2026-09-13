@@ -68,6 +68,19 @@ function indexTurn(dir, {
   return watcher.turnFor(id, 1);
 }
 
+// A second ended turn of the same session, for the per-session budget.
+function secondTurn(dir, id = SESSION) {
+  const at = (s) => new Date(Date.UTC(2026, 8, 13, 0, 2, s)).toISOString();
+  const file = path.join(dir, `${id}.jsonl`);
+  fs.appendFileSync(file, jsonl([
+    { type: 'user', sessionId: id, cwd: '/tmp/live-project', timestamp: at(0), message: { role: 'user', content: 'next thing' } },
+    { type: 'assistant', sessionId: id, cwd: '/tmp/live-project', timestamp: at(5),
+      message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: "Done. Next, I'll check." }] } },
+  ]));
+  assert.equal(turnIndex.ingestFile(file, { agent: 'claude' }).ok, true);
+  return watcher.turnFor(id, 2);
+}
+
 const ACTIVE_CARD = { id: 'k1', fm: { status: 'active' } };
 const READY_SESSION = { id: SESSION, kind: 'claude', endedTurn: true, state: 'idle', pane: 'p1' };
 
@@ -824,60 +837,79 @@ test('an unknown setting turns everything off rather than being ignored', (t) =>
   assert.equal(again.maxPerHour, 4, 'the rest of the file survives the round trip');
 });
 
-test('a reservation nobody finished stops holding a slot', (t) => {
+test('a reservation belongs to the attempt that took it', (t) => {
   const dir = sandbox(t);
   const turn = indexTurn(dir);
   const config = allLive();
   const now = Date.now();
-  const db = () => turnIndex.open();
+  const rows = () => turnIndex.open().prepare('SELECT turn_id, token, sent_at FROM deliveries').all();
 
-  // The daemon died between reserving and sending. Six minutes later the row is
-  // abandoned: it blocks neither its own turn nor anything else.
-  assert.equal(live.reserve(turn, config, 'continue', { now: now - 6 * 60e3 }).ok, true);
-  assert.equal(live.rateLimit(turn, config, { now }), null, 'the turn itself is free again');
+  // Nobody but the holder may give a reservation back. An attempt that aborted
+  // minutes ago must not delete the row a later attempt is sending under, or two
+  // messages go out under one slot.
+  const first = live.reserve(turn, config, 'continue', { now: now - 6 * 60e3 });
+  assert.equal(first.ok, true);
+  assert.match(String(first.token), /^[0-9a-f]{32}$/);
+  assert.equal(live.releaseReservation(turn, { token: 'not-the-token' }), 0, 'a stranger deletes nothing');
+  assert.equal(live.releaseReservation(turn, {}), 0, 'and neither does nobody');
+  assert.equal(rows().length, 1);
+
+  // The holder can, and then the turn is free to be tried again.
+  assert.equal(live.releaseReservation(turn, { token: first.token }), 1);
+  assert.equal(rows().length, 0);
+  const second = live.reserve(turn, config, 'continue', { now });
+  assert.equal(second.ok, true);
+  assert.notEqual(second.token, first.token);
+  // The first attempt, finally getting round to its abort, must not take the
+  // second attempt's row with it.
+  assert.equal(live.releaseReservation(turn, { token: first.token }), 0);
+  assert.deepEqual(rows().map((row) => row.token), [second.token]);
+
+  // An unconfirmed row that expired still counts: nobody can tell whether its
+  // Enter landed, and freeing the slot early is the mistake that types twice.
+  turnIndex.open().prepare('UPDATE deliveries SET reserved_at = ? WHERE turn_id = ?')
+    .run(now - 6 * 60e3, turn.id);
+  assert.equal(rows()[0].sent_at, null, 'still unconfirmed');
+  const sameSession = secondTurn(dir);
+  assert.match(live.rateLimit(sameSession, config, { now }), /last 10 minutes/,
+    'an expired unsent row still spends the session budget');
   const other = indexTurn(dir, { id: 'stale111-2222-3333-4444-555555555555' });
-  assert.equal(live.rateLimit(other, allLive({ maxPerHour: 1 }), { now }), null, 'and it spends no fleet budget');
+  assert.match(live.rateLimit(other, allLive({ maxPerHour: 1 }), { now }), /last hour/,
+    'and the fleet budget');
+  // Its own turn stays blocked whatever its age: the verdict for it already exists.
+  assert.match(live.rateLimit(turn, allLive({ maxPerSessionPer10m: 9, maxPerHour: 9 }), { now }),
+    /already been delivered/);
+  assert.equal(live.reserve(turn, allLive({ maxPerSessionPer10m: 9, maxPerHour: 9 }), 'continue', { now }).ok, false);
 
-  // Fresh ones still hold, both ways.
-  assert.equal(live.reserve(other, config, 'continue', { now: now - 60e3 }).ok, true);
-  assert.match(live.rateLimit(other, config, { now }), /already been delivered/);
-  assert.match(live.rateLimit(turn, allLive({ maxPerHour: 1 }), { now }), /last hour/);
-
-  // The abandoned row does not stand in the way of a real retry of the same turn.
-  assert.equal(live.reserve(turn, allLive({ maxPerHour: 5 }), 'continue', { now }).ok, true);
-  assert.equal(db().prepare('SELECT COUNT(*) AS n FROM deliveries WHERE turn_id = ?').get(turn.id).n, 1);
-
-  // A row that did send is permanent, however old.
-  live.confirmReservation(turn, now - 10 * 3600e3);
-  db().prepare('UPDATE deliveries SET reserved_at = ? WHERE turn_id = ?').run(now - 10 * 3600e3, turn.id);
-  assert.match(live.rateLimit(turn, config, { now }), /already been delivered/);
-
-  // And the sweep clears only the abandoned ones.
-  const third = indexTurn(dir, { id: 'sweep111-2222-3333-4444-555555555555' });
-  assert.equal(live.reserve(third, allLive({ maxPerHour: 9 }), 'continue', { now: now - 9 * 60e3 }).ok, true);
-  assert.equal(db().prepare('SELECT COUNT(*) AS n FROM deliveries').get().n, 3);
-  assert.equal(live.sweepReservations({ now }), 1, 'one abandoned row swept');
-  assert.equal(live.sweepReservations({ now }), 0, 'and nothing else to sweep');
-  const left = db().prepare('SELECT turn_id, sent_at FROM deliveries ORDER BY turn_id').all();
-  assert.equal(left.length, 2);
-  assert.equal(left.some((row) => row.turn_id === third.id), false, 'the abandoned one is gone');
+  // And the ten-minute window still lapses on its own.
+  assert.equal(live.rateLimit(sameSession, config, { now: now + 11 * 60e3 }), null);
 });
 
 test('the release carve-out reads the whole tool input, not the truncated copy', (t) => {
   const dir = sandbox(t);
-  // 500 characters of harmless work, then the push — which is exactly the part
-  // the `command` column drops.
-  const long = `npm test -- --filter ${'x'.repeat(560)} && git push`;
-  assert.ok(long.length > 500);
+  // Long enough that the JSON wrapper is dropped, so the command column is the
+  // only copy left — and it has to be a copy of the whole command, tail included.
+  const long = `npm test -- --filter ${'x'.repeat(2400)} && git push`;
+  assert.ok(long.length > turnIndex.TOOL_CAP);
+  assert.ok(long.length < turnIndex.COMMAND_CAP);
   const turn = indexTurn(dir, { tools: [{ name: 'Bash', input: { command: long, description: 'run the suite' } }] });
   const db = turnIndex.open();
-  const stored = db.prepare("SELECT command FROM messages WHERE turn_id = ? AND kind = 'tool_use'").get(turn.id).command;
-  assert.equal(stored.length, 500, 'the display copy is truncated');
-  assert.equal(stored.includes('git push'), false, 'and the push is not in it');
+  const stored = db.prepare("SELECT text, command FROM messages WHERE turn_id = ? AND kind = 'tool_use'").get(turn.id);
+  assert.equal(stored.command, long, 'the command column keeps all of it');
+  assert.equal(stored.text.length, turnIndex.TOOL_CAP, 'while the JSON wrapper was truncated');
 
   const commands = live.turnCommands(turn);
-  assert.ok(commands.includes('git push'), `normalized: ${JSON.stringify(commands)}`);
+  assert.deepEqual(commands, [long], 'the command is judged as it was written');
+  assert.equal(commands.includes(live.UNREADABLE_COMMAND), false, 'a truncated wrapper is not an unreadable command');
   assert.match(live.releaseCarveOut(commands, keepApi, turn), /git commit or push/);
+
+  // A short command beside a very long description is not unreadable either.
+  const described = indexTurn(dir, {
+    id: 'descr111-2222-3333-4444-555555555555',
+    tools: [{ name: 'Bash', input: { command: 'npm test', description: 'w'.repeat(3000) } }],
+  });
+  assert.deepEqual(live.turnCommands(described), ['npm test']);
+  assert.equal(live.releaseCarveOut(live.turnCommands(described), keepApi, described), null);
 });
 
 test('a command named in an argument is not a command the turn ran', (t) => {
@@ -888,56 +920,101 @@ test('a command named in an argument is not a command the turn ran', (t) => {
     { name: 'Read', input: { file_path: '/tmp/live-project/git-push-notes.md' } },
   ] });
   const commands = live.turnCommands(turn);
-  assert.deepEqual(commands, ['rg git commit README.md docs/', 'echo remember to git push >> NOTES.md']);
+  assert.deepEqual(commands, ['rg "git commit" README.md docs/', 'echo "remember to git push" >> NOTES.md'],
+    'handed on as written, and judged in that shape');
   assert.equal(live.releaseCarveOut(commands, keepApi, turn), null, 'searching for it is not doing it');
 
-  // Every spelling of the real thing, on the other hand, is seen.
+  // Every spelling of the real thing, on the other hand, is seen — as a shell
+  // string and as the argv array Codex writes.
   for (const command of [
     '/usr/bin/git push',
     'git pu\\sh',
     'env -i git push',
+    'env -u FOO git push',
+    'nice -n 5 git push',
     'sudo -u root git push',
+    'sudo -E -n git push',
     'bash -lc "git push"',
     'zsh -lc "git push"',
     'npm test && git push',
     'git "push"',
     'git commit -am wip',
+    'timeout 60 git push',
+    'FOO=bar git push',
+    ['bash', '-c', 'git push', 'label'],
+    ['env', 'bash', '-c', 'git push'],
+    ['git', '-C', '/tmp/a b', 'push'],
+    ['nice', '-n', '5', 'git', 'push'],
   ]) {
-    assert.match(live.releaseCarveOut([command], keepApi, null), /git commit or push/, command);
+    assert.match(live.releaseCarveOut([command], keepApi, null), /git commit or push/, JSON.stringify(command));
   }
+
+  // And every one of these runs nothing of the sort.
+  for (const command of [
+    ['bash', '-c', 'echo hello', 'git commit'],
+    ['printf', '%s', 'example; git push'],
+    ['git', 'commit --help'],
+    'git commit --dry-run',
+    'rg "git commit" README.md',
+  ]) {
+    assert.equal(live.releaseCarveOut([command], keepApi, null), null, JSON.stringify(command));
+  }
+
+  // A line continuation inside the word is still the word.
+  assert.match(live.releaseCarveOut(['git pu\\\nsh origin main'], keepApi, null), /git commit or push/);
 });
 
 test('a Codex argv command is read from the full input, whichever way it is spelled', (t) => {
   const dir = sandbox(t);
   const id = '0199dddd-1111-2222-3333-444444444444';
   const file = path.join(dir, `rollout-2026-09-13T02-00-00-${id}.jsonl`);
-  const long = `pytest -k ${'y'.repeat(560)} && git push origin HEAD:master`;
-  fs.writeFileSync(file, jsonl([
+  const long = `pytest -k ${'y'.repeat(2400)} && git push origin HEAD:master`;
+  const rollout = (calls) => jsonl([
     { type: 'session_meta', timestamp: '2026-09-13T02:00:00.000Z', payload: { id, cwd: '/tmp/live-project', source: 'cli' } },
     { type: 'response_item', timestamp: '2026-09-13T02:00:01.000Z', payload: {
       type: 'message', role: 'user', content: [{ type: 'input_text', text: 'ship it' }] } },
-    // An object-valued `arguments`, and an argv array rather than a string.
-    { type: 'response_item', timestamp: '2026-09-13T02:00:02.000Z', payload: {
-      type: 'function_call', name: 'shell', call_id: 's1', arguments: { command: ['bash', '-lc', long] } } },
+    ...calls,
     { type: 'response_item', timestamp: '2026-09-13T02:00:03.000Z', payload: { type: 'agent_message', text: 'Pushed.' } },
     { type: 'event_msg', timestamp: '2026-09-13T02:00:04.000Z', payload: { type: 'task_complete' } },
+  ]);
+  // An object-valued `arguments`, and an argv array rather than a string.
+  fs.writeFileSync(file, rollout([
+    { type: 'response_item', timestamp: '2026-09-13T02:00:02.000Z', payload: {
+      type: 'function_call', name: 'shell', call_id: 's1',
+      arguments: { command: ['bash', '-lc', 'git push origin HEAD:master'] } } },
   ]));
   assert.equal(turnIndex.ingestFile(file).ok, true);
   const turn = watcher.turnFor(id, 1);
-  const commands = live.turnCommands(turn);
-  assert.ok(commands.includes('git push origin HEAD:master'), JSON.stringify(commands));
-  assert.match(live.releaseCarveOut(commands, keepApi, turn), /git commit or push/);
+  assert.deepEqual(live.turnCommands(turn), [['bash', '-lc', 'git push origin HEAD:master']],
+    'the argv is judged as an argv');
+  assert.match(live.releaseCarveOut(live.turnCommands(turn), keepApi, turn), /git commit or push/);
+
+  // Too long to keep as JSON: the command column is the copy that is left, and
+  // it still carries the whole script.
+  const big = '0199eeee-1111-2222-3333-444444444444';
+  const bigFile = path.join(dir, `rollout-2026-09-13T02-30-00-${big}.jsonl`);
+  fs.writeFileSync(bigFile, rollout([
+    { type: 'response_item', timestamp: '2026-09-13T02:00:02.000Z', payload: {
+      type: 'function_call', name: 'shell', call_id: 's2', arguments: { command: ['bash', '-lc', long] } } },
+  ]).replaceAll(id, big));
+  assert.equal(turnIndex.ingestFile(bigFile).ok, true);
+  const bigTurn = watcher.turnFor(big, 1);
+  assert.deepEqual(live.turnCommands(bigTurn), [long]);
+  assert.match(live.releaseCarveOut(live.turnCommands(bigTurn), keepApi, bigTurn), /git commit or push/);
 });
 
 test('a tool input too long for the index to record is never cleared', (t) => {
   const dir = sandbox(t);
-  // Past the tool cap, so neither copy is whole: the index has the first couple
-  // of kilobytes and the tail — where a trailing push would sit — is gone.
-  const huge = `node scripts/build.js --flags ${'z'.repeat(4000)}`;
+  // Past the command cap itself, so the tail — where a trailing push would sit —
+  // is gone from the only copy there is.
+  const huge = `node scripts/build.js --flags ${'z'.repeat(turnIndex.COMMAND_CAP)}`;
   const turn = indexTurn(dir, { tools: [{ name: 'Bash', input: { command: huge } }] });
   const commands = live.turnCommands(turn);
-  assert.ok(commands.includes(live.UNREADABLE_COMMAND), JSON.stringify(commands.map((c) => c.slice(0, 40))));
-  assert.match(live.releaseCarveOut(commands, keepApi, turn), /too long for the index to record/);
+  assert.equal(commands.length, 2);
+  assert.equal(commands[0].length, turnIndex.COMMAND_CAP, 'what there is of it');
+  assert.equal(commands[1], live.UNREADABLE_COMMAND);
+  assert.equal(live.releaseCarveOut(commands, keepApi, turn), live.UNREADABLE_REASON);
+  assert.match(live.UNREADABLE_REASON, /command longer than the index records/);
 });
 
 test('the indexer records a commit only from the call that ran one', (t) => {
@@ -1001,14 +1078,15 @@ test('a carve-out phrase survives being buried in a long turn, or written in loo
   assert.equal(live.riskyQuestionCarveOut('Should I run the tests now?', watcher), null);
 });
 
-test('the delivered text is the canonical form of the text that was approved', (t) => {
+test('the delivered text is the message as written, byte for byte', (t) => {
   sandbox(t);
-  // Composed and decomposed spellings of the same message must not be two
-  // different messages: the sent bytes are the NFC form, always.
-  const nfd = 'continue the cafe\u0301 migration';
+  // A decomposed filename pasted out of a transcript has to arrive as itself: a
+  // message rewritten into an equivalent form is not the message that was
+  // graded, and on a case-sensitive filesystem it may not even name the file.
+  const nfd = 'continue on cafe\u0301-menu.tsx';
   const nfc = nfd.normalize('NFC');
   assert.notEqual(nfd, nfc);
-  assert.equal(live.safeDeliveryText(`[keep watcher] ${nfd}`), `[keep watcher] ${nfc}`);
+  assert.equal(live.safeDeliveryText(`[keep watcher] ${nfd}`), `[keep watcher] ${nfd}`);
   assert.equal(live.safeDeliveryText(`[keep watcher] ${nfc}`), `[keep watcher] ${nfc}`);
 
   // A character that is only a control or a separator once folded is refused too.
@@ -1030,4 +1108,86 @@ test('a turn buried under a pause is never delivered, whatever the verdict said'
   assert.equal(result.delivered, false);
   assert.match(result.reason, /paused itself/);
   assert.equal(send.calls.length, 0);
+});
+
+test('a request buried at the start of a long sentence still carves the turn out', (t) => {
+  sandbox(t);
+  // askedForAction reads a tail, because what a turn *ended* with is what the
+  // rule verdict is about. A carve-out is the other question, and "Please run the
+  // production deploy" does not stop being that after 700 more characters.
+  const long = `Please run the production deploy after ${'you finish reviewing the migration notes and the index plan, '.repeat(14)}`;
+  assert.ok(long.length > 700);
+  assert.equal(watcher.askedForAction(long), false, 'the tail alone does not show it');
+  assert.equal(watcher.askedForActionAnywhere(long), true);
+  assert.equal(watcher.askedAnywhere(long), true);
+  assert.match(live.riskyQuestionCarveOut(long, watcher), /irreversible, production-facing/);
+
+  // Still quoted text is still not a request.
+  assert.equal(watcher.askedForActionAnywhere(`The runbook says "please run the deploy" ${'and then some. '.repeat(60)}`), false);
+});
+
+test('an argv commit is counted, and a commit named in an argument is not', (t) => {
+  const dir = sandbox(t);
+  const rollout = (id, calls) => {
+    const file = path.join(dir, `rollout-2026-09-13T04-00-00-${id}.jsonl`);
+    fs.writeFileSync(file, jsonl([
+      { type: 'session_meta', timestamp: '2026-09-13T04:00:00.000Z', payload: { id, cwd: '/tmp/live-project', source: 'cli' } },
+      { type: 'response_item', timestamp: '2026-09-13T04:00:01.000Z', payload: {
+        type: 'message', role: 'user', content: [{ type: 'input_text', text: 'do the thing' }] } },
+      ...calls,
+      { type: 'response_item', timestamp: '2026-09-13T04:00:05.000Z', payload: { type: 'agent_message', text: 'Done.' } },
+      { type: 'event_msg', timestamp: '2026-09-13T04:00:06.000Z', payload: { type: 'task_complete' } },
+    ]));
+    assert.equal(turnIndex.ingestFile(file).ok, true);
+    return watcher.turnFor(id, 1);
+  };
+
+  // A real commit, spelled as an argv array, with the sha in its own output.
+  const real = rollout('0199f111-1111-2222-3333-444444444444', [
+    { type: 'response_item', timestamp: '2026-09-13T04:00:02.000Z', payload: {
+      type: 'function_call', name: 'shell', call_id: 'r1',
+      arguments: { command: ['bash', '-lc', 'git commit -am "fix the parser"'] } } },
+    { type: 'response_item', timestamp: '2026-09-13T04:00:03.000Z', payload: {
+      type: 'function_call_output', call_id: 'r1', output: '[main 5c6d7e8] fix the parser\n 2 files changed' } },
+  ]);
+  assert.deepEqual(JSON.parse(real.commits || '[]'), ['5c6d7e8']);
+  assert.match(live.releaseCarveOut([], keepApi, real), /produced a commit/);
+
+  // The same commit-shaped output behind an argv that names a commit without
+  // running one. Joining that argv into a string is what would count it.
+  const named = rollout('0199f222-1111-2222-3333-444444444444', [
+    { type: 'response_item', timestamp: '2026-09-13T04:00:02.000Z', payload: {
+      type: 'function_call', name: 'shell', call_id: 'n1',
+      arguments: { command: ['rg', 'git commit', 'README.md'] } } },
+    { type: 'response_item', timestamp: '2026-09-13T04:00:03.000Z', payload: {
+      type: 'function_call_output', call_id: 'n1', output: 'README.md:12: [main 5c6d7e8] fix the parser' } },
+  ]);
+  assert.deepEqual(JSON.parse(named.commits || '[]'), [], 'naming a commit is not making one');
+  assert.equal(live.releaseCarveOut(live.turnCommands(named), keepApi, named), null);
+
+  // And `git commit --dry-run` writes nothing, so its output is nothing either.
+  const dry = rollout('0199f333-1111-2222-3333-444444444444', [
+    { type: 'response_item', timestamp: '2026-09-13T04:00:02.000Z', payload: {
+      type: 'function_call', name: 'shell', call_id: 'd1',
+      arguments: { command: ['git', 'commit', '--dry-run'] } } },
+    { type: 'response_item', timestamp: '2026-09-13T04:00:03.000Z', payload: {
+      type: 'function_call_output', call_id: 'd1', output: '[main 5c6d7e8] would commit' } },
+  ]);
+  assert.deepEqual(JSON.parse(dry.commits || '[]'), []);
+});
+
+test('the message reaches the session as the exact bytes that were approved', async (t) => {
+  const dir = sandbox(t);
+  // A decomposed filename, the way it arrives pasted out of a transcript.
+  const nfd = 'continue on cafe\u0301-menu.tsx';
+  assert.notEqual(nfd, nfd.normalize('NFC'));
+  const send = fakeSend();
+  const result = await live.maybeDeliver(indexTurn(dir), verdict({ message: nfd }), {
+    config: allLive(), session: READY_SESSION, card: ACTIVE_CARD, send,
+  });
+  assert.equal(result.delivered, true);
+  assert.equal(send.calls.length, 1);
+  assert.equal(send.calls[0].text, `[keep watcher] ${nfd}`, 'byte for byte, including the composition');
+  assert.equal(result.text, `[keep watcher] ${nfd}`);
+  assert.equal(Buffer.from(send.calls[0].text, 'utf8').length, Buffer.from(`[keep watcher] ${nfd}`, 'utf8').length);
 });

@@ -536,11 +536,15 @@ plain one — means **nothing is delivered** (`reason: 'unsafe-text'`). A carria
 return inside the message would erase the `[keep watcher] ` prefix and submit
 whatever followed it, and a message that had to be rewritten is not the message
 Owner graded. The check runs against the text **and its NFKC form**, so a
-lookalike cannot smuggle a control character past it. The message is normalized
-to **NFC once**, and that same canonical form is what both the check and the send
-use, so a decomposed and a composed spelling are one message rather than two.
-Only runs of spaces are collapsed, and the whole text is capped at 1000
-characters.
+lookalike cannot smuggle a control character past it.
+
+**What is delivered is the message as written**, byte for byte. Unicode
+normalization is a rewrite like any other: a decomposed filename pasted out of a
+transcript has to arrive as itself, and on a case-sensitive filesystem an NFC
+copy of it may not name the same file. NFC is used only where two spellings have
+to *compare* equal — the receipt hash and the delivered-text check, where the
+terminal may echo back the other form. Only runs of spaces are collapsed, and the
+whole text is capped at 1000 characters.
 
 **Everything is re-checked four times before the characters land.** The gates
 above were decided from a snapshot taken before a model call that takes minutes,
@@ -553,20 +557,34 @@ once more after the typing is confirmed on screen and before Enter. Resolving a
 target and typing 200 characters at a time is not instant, so a switch turned
 off, a session that moved on, or a human who started typing in between has to be
 able to stop this at whichever point it reaches. Any of them failing aborts with
-a `moved-on:` reason and gives the rate-limit slot back — and an abort that lands
-after the text is already in the input box **clears the draft** (Escape, the same
-dismissal the draft guard uses) rather than leaving a half-delivered message for
-Owner to find.
+a `moved-on:` reason and gives the rate-limit slot back.
+
+**The box has to hold exactly the message, and nothing else.** Confirmation used
+to ask only whether the typed text was *visible*; a watcher send asks whether it
+is all that is there. Owner can start typing at any moment after the precheck, and
+Enter on his half-written line plus this message sends something neither of them
+wrote — so the draft region is read back (ANSI stripped, whitespace collapsed) and
+compared for equality. A mismatch refuses without pressing Enter **and without
+pressing anything else**: text this did not write is not this code's to erase.
+
+**An abort after typing clears the draft — only when the draft is still ours.**
+Escape (the dismissal the draft guard uses) goes out when the box holds exactly
+what was typed, which is the ordinary case; if Owner has typed into it since, the
+box is his, the message is left where it is, and the refusal carries
+`draftLeftOnScreen` with the reason `mixed draft`. Clearing is opt-in per caller:
+session cleanup keeps its typed `/exit` on screen, as it always has.
 
 **The slot is reserved before the send, not counted.** A `deliveries` row
 (`turn_id` primary key) is claimed inside one `BEGIN IMMEDIATE` alongside the
 rate-limit count, so two daemon workers racing the last slot cannot both decide
-there is room; a failed precondition or a failed send deletes the reservation.
-A reservation whose send never happened at all — the daemon was killed between
-the two — stops counting after **five minutes**: past that it blocks neither its
-own turn nor anyone else's budget, and the next tick sweeps it away. A row that
-did send is permanent, however old, because "never twice for the same turn" has
-no expiry.
+there is room, and every row counts toward both windows whether or not its send
+was ever confirmed. A failed precondition or a failed send gives the row back —
+but only to the attempt that took it: each reservation carries a random token,
+and `releaseReservation` deletes nothing without it, so a slow abort from an
+earlier attempt cannot free the slot a live one is sending under. Nothing else
+reclaims a reservation. If the daemon dies between the Enter and the confirmation
+nobody can tell whether the message landed, and freeing that capacity early is the
+one mistake here that types twice into a live session.
 
 ### Carve-outs
 
@@ -593,17 +611,25 @@ sentence is itself longer than the pre-signals' window. Matching happens on the
   reading as "no card". Shadow verdicts still record for any session;
 - the turn ran a `git commit`/`git push` or a deploy, or recorded a commit. A
   session that just released gets Owner, not a nudge. Commands come from the
-  **full tool input** — the `command` column is a 500-character display copy, and
-  a long command with `&& git push` at the end loses exactly the part this gate
-  exists to see — and are normalized by the shared parser in `bin/steps.js`, so
-  `/usr/bin/git push`, `git pu\sh`, `git "push"`, `env -i git push`,
-  `sudo -u root git push`, `bash -lc "git push"` and `npm test && git push` are
-  all the same push, in both the Claude and Codex spellings (`command`/`cmd`, a
-  string or an argv array, `arguments` as an object or as a JSON string). The
-  same parser decides commit provenance in the index and in the Stop hook, so
-  `rg "git commit" README.md` is a search rather than a release. A tool input too
-  long for the index to record in full cannot be cleared either: the dropped tail
-  is where a trailing push would sit, so the turn is carved out on that alone;
+  **full tool input**, in the shape they were written: a shell string is read as a
+  shell string and an argv array as an argv array, because joining an argv back
+  into a string is exactly what makes `["printf","%s","example; git push"]` read
+  as a push it never ran. `bin/steps.js` is the one parser — it strips the
+  wrappers with their own option arities (`env -u FOO`, `nice -n 5`,
+  `sudo -u root`, `timeout 60`, `nohup`, `command`, `exec`), takes the script of a
+  `sh -c` from the *first* argument after the `-c` (the ones after it are `$0` and
+  positionals), reads git's subcommand past its global options (`-C`, `-c`,
+  `--git-dir=`), joins a backslash-newline inside a word, and knows that
+  `git commit --dry-run` writes nothing. So `/usr/bin/git push`, `git pu\sh`,
+  `git "push"`, `env -i git push`, `bash -lc "git push" label` and
+  `npm test && git push` are all the same push, while `rg "git commit" README.md`
+  and `["git","commit --help"]` are not one — in both the Claude and Codex
+  spellings (`command`/`cmd`, string or argv, `arguments` as an object or as a
+  JSON string). The same parser decides commit provenance in the index and in the
+  Stop hook. A command longer than the 4 KiB the index records cannot be cleared
+  at all: the dropped tail is where a trailing push would sit, so the turn is
+  carved out on that alone (a long `description` beside a short command is not
+  that, and does not carve anything out);
 - the turn was opened by an automated message (`keep` opener). **One delivered
   message must be answered by a human before another can be sent**, or a
   `continue` would produce an ended turn that the watcher continues again,
@@ -630,6 +656,15 @@ bug.
   re-pointing a fresh verdict at it would attribute his verdict to a message he
   never saw. Two entries sharing a `turn` key, one judged and one not, is the
   honest record of what happened, and the key makes the pair findable.
+- **A commit-shaped output from a compound command whose commit did nothing is
+  counted as a commit.** `git commit --dry-run; cat fixture` runs two things in
+  one call, and the index records the call as a commit call because one segment
+  of it was a commit — so commit-shaped text in the other segment's output is
+  believed. The evidence this feeds is the check-in reminder, which errs towards
+  reminding, and the delivery carve-out reads the commands themselves and is
+  conservative without it. Splitting provenance per segment would mean tracking
+  which segment produced which bytes of a merged stdout, which the transcript
+  does not record.
 - **Parked verdicts from a v6 re-ingest interrupted before the v7 migration have
   a null `shape` and are dropped rather than restored.** A null shape cannot be
   compared, so restoring would risk re-attaching a verdict to a turn that

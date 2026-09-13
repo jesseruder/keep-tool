@@ -28,9 +28,12 @@ const HOUR_MS = 3600e3;
 // write past this grace means the session has moved on since the turn ended.
 const FRESHNESS_GRACE_MS = 2000;
 // A reservation is taken, then the send happens. If the daemon dies in between,
-// the row is left claiming a slot nothing will ever fill. Past this age an unsent
-// reservation is abandoned: it stops blocking its turn, stops counting toward
-// either rate window, and the next tick deletes it.
+// nobody can tell whether the Enter landed — so an unconfirmed row past this age
+// is *not* reclaimed: it keeps counting toward both rate windows, because
+// freeing capacity for a message that may well have been delivered is the one
+// mistake here that types twice into a live session. What expiry does change is
+// ownership: past it, the attempt that took the row is presumed gone, and a
+// later attempt at the same turn may replace it.
 const RESERVATION_TTL_MS = 5 * 60e3;
 // Delivered messages are prefixed so the indexer files them as `keep` openers.
 // A watcher message must never be counted as one of Owner's nudges: the nudge
@@ -145,10 +148,11 @@ const UNSAFE_CLASS_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
 const ODD_SPACE_RE = new RegExp('[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]');
 
 function safeDeliveryText(text) {
-  // NFC first, and the same canonical form is what gets sent, so a receipt hash
-  // of the delivered text matches the text this approved.
-  let value = String(text == null ? '' : text);
-  try { value = value.normalize('NFC'); } catch {}
+  // The message is delivered as written. Rewriting it — even into an equivalent
+  // canonical form — would type something other than the bytes Owner graded, and
+  // a decomposed filename pasted out of a transcript has to arrive as itself.
+  // NFC belongs to comparison (the receipt hash), not to what is typed.
+  const value = String(text == null ? '' : text);
   if (!value) return null;
   const folded = (() => { try { return value.normalize('NFKC'); } catch { return value; } })();
   for (const candidate of [value, folded]) {
@@ -250,8 +254,11 @@ function cardCarveOut(card) {
 
 // A session that just pushed or deployed inside this turn gets Owner, not an
 // automated nudge: the next thing after a release is a decision, every time.
-// Parsed the way keep.js's own deploy provenance parses it, so `env git push`,
-// `git "push"`, a chained `npm test && git push` and `sudo` are all seen.
+// Every command the turn ran, each judged on the shape it was recorded in: a
+// string as a shell string, an argv array as an argv array. bin/steps.js decides
+// what any of them actually runs, so `env -u FOO git push`, `nice -n 5 git push`
+// and `bash -lc "git push" label` are the same push, while
+// `["printf","%s","example; git push"]` is not one.
 function releaseCarveOut(commands, keepApi, turn) {
   if (turn) {
     let commits = [];
@@ -260,28 +267,32 @@ function releaseCarveOut(commands, keepApi, turn) {
   }
   const steps = requireSteps();
   for (const command of commands || []) {
-    if (!command) continue;
-    if (command === UNREADABLE_COMMAND) return 'the turn ran a command too long for the index to record in full';
-    if (keepApi.looksLikeGitWrite(command)) return 'the turn ran a git commit or push';
+    if (command === UNREADABLE_COMMAND) return UNREADABLE_REASON;
+    if (!command || (Array.isArray(command) && !command.length)) continue;
     if (steps) {
-      // The normalizer sees `/usr/bin/git push`, `git pu\sh`, `env -i git push`,
-      // `sudo -u root git push` and `bash -lc "git push"` as the same push.
-      try { if (steps.runsGitWrite(command)) return 'the turn ran a git commit or push'; } catch {}
-      try {
-        for (const normalized of steps.normalizedCommands(command)) {
-          if (keepApi.deployCommand(normalized)) return 'the turn ran a deploy';
-        }
-      } catch {}
+      let found = null;
+      try { found = steps.releaseOf(command); } catch {}
+      if (found && (found.push || found.commit)) return 'the turn ran a git commit or push';
+      for (const normalized of (found && found.commands) || []) {
+        try { if (keepApi.deployCommand(normalized)) return 'the turn ran a deploy'; } catch {}
+      }
+      continue;
     }
-    try { if (keepApi.deployCommand(command)) return 'the turn ran a deploy'; } catch {}
+    // No parser at all: fall back to the blunt line test rather than clearing it.
+    if (typeof command === 'string') {
+      try { if (keepApi.looksLikeGitWrite(command)) return 'the turn ran a git commit or push'; } catch {}
+      try { if (keepApi.deployCommand(command)) return 'the turn ran a deploy'; } catch {}
+    }
   }
   return null;
 }
 
-// Not a command anything runs: a marker `turnCommands` emits for a tool input
-// the index could not record in full, so the release carve-out refuses instead
-// of clearing a turn on a command it only half saw.
+// Not a command anything runs: a marker `turnCommands` emits when the command
+// *itself* was longer than the index records, so the carve-out refuses rather
+// than clearing a turn on a command it only half saw. A merely truncated JSON
+// wrapper never produces it — the command column is its own, longer copy.
 const UNREADABLE_COMMAND = '\u0000keep-watcher-unreadable-command';
+const UNREADABLE_REASON = 'the turn ran a command longer than the index records in full';
 
 function requireSteps() {
   try { return require('./steps.js'); } catch { return null; }
@@ -340,23 +351,21 @@ function sessionReady(session) {
 function rateLimit(turn, config, deps = {}) {
   const handle = (deps.turnIndex || require('./turn-index.js')).open(deps.db);
   const now = Number.isFinite(deps.now) ? deps.now : Date.now();
-  const live = now - RESERVATION_TTL_MS;
-  // Counted rows are the ones that actually mean something: a send that happened,
-  // or a reservation young enough that its send might still be happening.
-  const COUNTS = '(sent_at IS NOT NULL OR reserved_at >= ?)';
+  // Every row counts, sent or not, however old. A reservation whose send was
+  // never confirmed is an attempt that may have reached the session anyway, and
+  // an unconfirmed row is the only record of it.
   if (turn.delivered_at) return 'this turn has already been delivered';
-  if (handle.prepare(`SELECT 1 AS hit FROM deliveries WHERE turn_id = ? AND ${COUNTS}`).get(turn.id, live)) {
+  if (handle.prepare('SELECT 1 AS hit FROM deliveries WHERE turn_id = ?').get(turn.id)) {
     return 'this turn has already been delivered';
   }
   const perSession = handle.prepare(
-    `SELECT COUNT(*) AS n FROM deliveries WHERE session_id = ? AND reserved_at >= ? AND ${COUNTS}`,
-  ).get(turn.session_id, now - SESSION_WINDOW_MS, live).n;
+    'SELECT COUNT(*) AS n FROM deliveries WHERE session_id = ? AND reserved_at >= ?',
+  ).get(turn.session_id, now - SESSION_WINDOW_MS).n;
   if (perSession >= config.maxPerSessionPer10m) {
     return `this session already had ${perSession} in the last 10 minutes`;
   }
-  const perHour = handle.prepare(
-    `SELECT COUNT(*) AS n FROM deliveries WHERE reserved_at >= ? AND ${COUNTS}`,
-  ).get(now - HOUR_MS, live).n;
+  const perHour = handle.prepare('SELECT COUNT(*) AS n FROM deliveries WHERE reserved_at >= ?')
+    .get(now - HOUR_MS).n;
   if (perHour >= config.maxPerHour) return `the fleet already had ${perHour} in the last hour`;
   return null;
 }
@@ -367,18 +376,18 @@ function rateLimit(turn, config, deps = {}) {
 function reserve(turn, config, type, deps = {}) {
   const handle = (deps.turnIndex || require('./turn-index.js')).open(deps.db);
   const now = Number.isFinite(deps.now) ? deps.now : Date.now();
+  // Whose reservation this is. Only the attempt holding the token may give the
+  // row back, so a slow abort from a previous attempt cannot delete the row a
+  // later one is currently sending under.
+  const token = reservationToken();
   handle.exec('BEGIN IMMEDIATE');
   try {
     const blocked = rateLimit(turn, config, { ...deps, now });
     if (blocked) { handle.exec('ROLLBACK'); return { ok: false, reason: blocked }; }
-    // turn_id is the primary key, so an abandoned row for this turn has to go
-    // before the new reservation can take its place.
-    handle.prepare('DELETE FROM deliveries WHERE turn_id = ? AND sent_at IS NULL AND reserved_at < ?')
-      .run(turn.id, now - RESERVATION_TTL_MS);
-    handle.prepare('INSERT INTO deliveries (turn_id, session_id, type, reserved_at) VALUES (?, ?, ?, ?)')
-      .run(turn.id, turn.session_id, type, now);
+    handle.prepare('INSERT INTO deliveries (turn_id, session_id, type, reserved_at, token) VALUES (?, ?, ?, ?, ?)')
+      .run(turn.id, turn.session_id, type, now, token);
     handle.exec('COMMIT');
-    return { ok: true, at: now };
+    return { ok: true, at: now, token };
   } catch (error) {
     try { handle.exec('ROLLBACK'); } catch {}
     // A UNIQUE violation is another worker holding this exact turn.
@@ -387,23 +396,21 @@ function reserve(turn, config, type, deps = {}) {
   }
 }
 
-// A reservation that never became a send must not spend a slot.
-function releaseReservation(turn, deps = {}) {
-  try {
-    (deps.turnIndex || require('./turn-index.js')).open(deps.db)
-      .prepare('DELETE FROM deliveries WHERE turn_id = ? AND sent_at IS NULL').run(turn.id);
-  } catch {}
+function reservationToken() {
+  return require('node:crypto').randomBytes(16).toString('hex');
 }
 
-// Called once per tick: the rate limits already ignore abandoned reservations,
-// but leaving them in the table forever makes every later count read rows that
-// can never matter.
-function sweepReservations(deps = {}) {
+// A reservation that never became a send gives its slot back — but only its own.
+// Without the token an attempt that aborted minutes ago would delete the row a
+// live attempt at the same turn is holding, and two messages could be typed
+// under one slot.
+function releaseReservation(turn, deps = {}) {
+  const token = deps.token;
+  if (!token) return 0;
   try {
-    const handle = (deps.turnIndex || require('./turn-index.js')).open(deps.db);
-    const now = Number.isFinite(deps.now) ? deps.now : Date.now();
-    const result = handle.prepare('DELETE FROM deliveries WHERE sent_at IS NULL AND reserved_at < ?')
-      .run(now - RESERVATION_TTL_MS);
+    const result = (deps.turnIndex || require('./turn-index.js')).open(deps.db)
+      .prepare('DELETE FROM deliveries WHERE turn_id = ? AND token = ? AND sent_at IS NULL')
+      .run(turn.id, token);
     return Number(result && result.changes) || 0;
   } catch { return 0; }
 }
@@ -422,54 +429,32 @@ function confirmReservation(turn, at, deps = {}) {
 // see. The tool_use row's `text` is the full input, so parse that and normalize
 // it; the column is only a fallback for a row too long even for `text`.
 function turnCommands(turn, deps = {}) {
-  const steps = requireSteps();
+  const index = deps.turnIndex || require('./turn-index.js');
   const out = [];
   let rows = [];
   try {
-    const handle = (deps.turnIndex || require('./turn-index.js')).open(deps.db);
-    rows = handle.prepare(
+    rows = index.open(deps.db).prepare(
       "SELECT text, command FROM messages WHERE turn_id = ? AND kind = 'tool_use'",
     ).all(turn.id);
   } catch { return []; }
+  const cap = Number(index.COMMAND_CAP) || 0;
   for (const row of rows) {
-    const found = commandsFromToolInput(row.text, steps);
-    if (found.length) { out.push(...found); continue; }
-    // Parsed, but it runs nothing — a Read, an Edit, a Write.
-    if (parsedToolInput(row.text)) continue;
-    // Not a shell tool, so there is no command in it to judge either way.
+    // The stored input, in the shape it was recorded in — a string or an argv
+    // array. `undefined` means the JSON itself was truncated, which is not the
+    // same as a tool that ran no command.
+    const ran = index.toolInputCommand(row.text);
+    if (ran !== undefined) {
+      if (ran !== null && ran !== '') out.push(ran);
+      continue;
+    }
+    // The JSON went, but the command column is its own and much longer copy.
     if (!row.command) continue;
-    // A shell row whose JSON does not parse is a truncated one: the index kept
-    // the first couple of kilobytes and dropped the rest — which is exactly
-    // where a trailing `&& git push` sits. Neither copy can clear this turn, so
-    // nothing does.
-    out.push(row.command, UNREADABLE_COMMAND);
+    out.push(row.command);
+    // Only when the command itself reached the cap is there something this
+    // genuinely cannot see; a long `description` beside a short command is not.
+    if (cap && row.command.length >= cap) out.push(UNREADABLE_COMMAND);
   }
   return out;
-}
-
-function parsedToolInput(text) {
-  if (typeof text !== 'string' || !text) return null;
-  try {
-    const value = JSON.parse(text);
-    return value && typeof value === 'object' ? value : null;
-  } catch { return null; }
-}
-
-// Codex spells a tool's arguments as a JSON string inside the call, and its shell
-// tools spell the command itself as an argv array under `command` or `cmd`.
-function commandsFromToolInput(text, steps) {
-  let input = parsedToolInput(text);
-  if (!input) return [];
-  if (typeof input.arguments === 'string') input = parsedToolInput(input.arguments) || input;
-  else if (input.arguments && typeof input.arguments === 'object') input = input.arguments;
-  const value = input.command !== undefined ? input.command : input.cmd;
-  if (value === undefined || value === null) return [];
-  if (!steps) return typeof value === 'string' ? [value] : [];
-  try {
-    const found = steps.normalizedCommandsFromArgv(value);
-    if (found.length) return found;
-  } catch {}
-  return typeof value === 'string' ? [value] : [];
 }
 
 function markDelivered(turn, at, deps = {}) {
@@ -535,19 +520,20 @@ async function maybeDeliver(turn, verdict, deps = {}) {
 
   const claim = reserve(turn, config, type, deps);
   if (!claim.ok) return skip(claim.reason);
+  const owned = { ...deps, token: claim.token };
 
   try {
     // Everything above was decided from a snapshot taken before a model call that
     // takes minutes. Check it all again now, and once more inside the injection
     // lock, immediately before the characters are typed.
     const movedOn = await revalidate(turn, deps);
-    if (movedOn) { releaseReservation(turn, deps); return skip(movedOn); }
+    if (movedOn) { releaseReservation(turn, owned); return skip(movedOn); }
     await send({
       sessionId: turn.session_id, pane: session.pane, text,
       precondition: () => revalidate(turn, deps),
     });
   } catch (error) {
-    releaseReservation(turn, deps);
+    releaseReservation(turn, owned);
     return { delivered: false, reason: `delivery failed: ${error.message}`, error: error.message };
   }
   const at = Number.isFinite(deps.now) ? deps.now : Date.now();
@@ -606,7 +592,7 @@ module.exports = {
   TYPES, DEFAULTS, DELIVERY_PREFIX, RISKY_QUESTION_RE, SESSION_WINDOW_MS, HOUR_MS,
   configFile, loadConfig, saveConfig, normalizeConfig, liveTypes, describeConfig,
   graduationCheck, decisionTypeFor, safeDeliveryText, turnText, assistantMessages, cardFor,
-  sweepReservations, RESERVATION_TTL_MS, UNREADABLE_COMMAND,
+  UNREADABLE_COMMAND, UNREADABLE_REASON,
   pausedCarveOut, riskyQuestionCarveOut, cardCarveOut, releaseCarveOut, chainCarveOut, carveOut,
   freshness, sessionReady, rateLimit, reserve, releaseReservation, confirmReservation, revalidate,
   turnCommands, markDelivered, maybeDeliver,

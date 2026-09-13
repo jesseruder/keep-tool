@@ -2,7 +2,15 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const normalize = (text) => String(text || '').replace(/\s+/g, ' ').trim();
+// Comparison only. NFC here means a message typed in one Unicode spelling and
+// echoed back in the other still matches its own receipt; nothing typed is ever
+// rewritten (see safeDeliveryText in bin/watcher-live.js).
+const normalize = (text) => {
+  const value = String(text || '');
+  let form = value;
+  try { form = value.normalize('NFC'); } catch {}
+  return form.replace(/\s+/g, ' ').trim();
+};
 const hash = (text) => crypto.createHash('sha256').update(normalize(text)).digest('hex');
 const receiptId = (text, key) => key ? hash('key:' + key) : hash(text);
 

@@ -973,6 +973,14 @@ function normalizedText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
+// Comparison only, and never applied to text on its way to a terminal: a message
+// typed in one Unicode spelling and echoed back in the other is the same message,
+// so the receipt has to see it that way.
+function canonicalText(value) {
+  const text = normalizedText(value);
+  try { return text.normalize('NFC'); } catch { return text; }
+}
+
 function shouldCompactFirst(values, thresholds) {
   const idleMs = values && values.idleMs;
   const contextTokens = values && values.contextTokens;
@@ -1548,17 +1556,56 @@ function chunkForTyping(text, max) {
   return chunks;
 }
 
-// Escape clears a non-empty Claude/Codex input box. Only ever called when the
-// message was typed and confirmed on screen, so the box is not empty and this
-// cannot be the Escape that opens rewind.
-async function discardTypedDraft(target, deps = {}) {
+// The input box's current draft as plain text: ANSI stripped, every run of
+// whitespace collapsed. A wrapped line, a re-render and the text as it was typed
+// all have to read the same, or "is this still only our message" is unanswerable.
+function draftRegionText(screen, kind) {
+  const lines = stripTerminalAnsi(String(screen || '')).split(/\r?\n/);
+  const prompt = kind === 'codex' ? /^\s*›(?:\s|$)/ : /^\s*❯(?:\s|$)/;
+  let start = -1;
+  lines.forEach((line, index) => { if (prompt.test(line)) start = index; });
+  if (start < 0) return null;
+  const draft = [lines[start].replace(prompt, '')];
+  for (let i = start + 1; i < lines.length; i += 1) {
+    if (!lines[i].trim() || /^\s*[─━]/.test(lines[i])) break;
+    draft.push(lines[i]);
+  }
+  return draft.join(' ').replace(/\s+/g, ' ').trim();
+}
+
+// True only when the box holds exactly the message that was typed and nothing
+// else. Containment is not enough: Owner typing while the watcher types leaves a
+// box that contains our message and says something neither of us meant.
+function draftIsExactly(screen, text, kind) {
+  const draft = draftRegionText(screen, kind);
+  return draft !== null && draft === String(text || '').replace(/\s+/g, ' ').trim();
+}
+
+// Escape clears a non-empty Claude/Codex input box — but only ever *our* draft.
+// If Owner has typed into the pane since, the box is his now: erasing it would
+// destroy text nobody asked us to touch, so the draft is left exactly as found
+// and the caller is told why.
+async function discardTypedDraft(target, text, kind, deps = {}) {
+  const read = deps.readScreen || ((t, lines, scrollback) => readScreen(t, lines, scrollback, deps));
+  const write = deps.stderr || process.stderr.write.bind(process.stderr);
+  const pane = (target && target.pane) || 'unknown';
+  let screen = '';
+  try {
+    screen = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false);
+  } catch (error) {
+    write(`keep serve: could not read pane ${pane} to clear an aborted draft: ${String((error && error.message) || error)}\n`);
+    return { cleared: false, reason: 'unreadable screen' };
+  }
+  if (!draftIsExactly(screen, text, kind)) {
+    write(`keep serve: left an aborted draft on pane ${pane}: the input box no longer holds only the typed message\n`);
+    return { cleared: false, reason: 'mixed draft' };
+  }
   try {
     await pressTargetKey(target, 'Escape', deps);
-    return true;
+    return { cleared: true, reason: null };
   } catch (error) {
-    const write = deps.stderr || process.stderr.write.bind(process.stderr);
-    write(`keep serve: could not clear an aborted draft on pane ${(target && target.pane) || 'unknown'}: ${String((error && error.message) || error)}\n`);
-    return false;
+    write(`keep serve: could not clear an aborted draft on pane ${pane}: ${String((error && error.message) || error)}\n`);
+    return { cleared: false, reason: 'escape failed' };
   }
 }
 
@@ -1587,6 +1634,26 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
       screenTail: screenTail(confirmation),
     });
   }
+  // Confirmation above asks whether the typed text is visible; this asks whether
+  // it is the *only* thing in the box. Owner can start typing at any point after
+  // the precheck, and pressing Enter on his half-written line plus our message
+  // sends something neither of us wrote. Callers that type unprompted (the
+  // watcher) demand exactness; a human-initiated send keeps the older, looser
+  // check it has always had.
+  if (deps.requireExactDraft) {
+    let exactScreen = '';
+    try {
+      exactScreen = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false);
+    } catch { exactScreen = ''; }
+    if (!draftIsExactly(exactScreen, text, deps.draftKind)) {
+      deps.deliveryTrace?.('draft-not-exact');
+      // Nothing is pressed and nothing is cleared: the box holds text this did
+      // not write, and touching it is not this code's decision to make.
+      throw new InjectionError(409, 'the input box no longer holds only the typed message; Enter was not pressed', {
+        screenTail: screenTail(exactScreen), draftLeftOnScreen: true,
+      });
+    }
+  }
   if (deps.beforeEnter) {
     try {
       await deps.beforeEnter(target);
@@ -1596,10 +1663,13 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
       // because a draft nobody typed is worse than no message at all. Session
       // cleanup keeps its typed /exit on screen, as it always has, so Owner can
       // see what was about to happen.
-      const cleared = deps.discardDraftOnAbort ? await discardTypedDraft(target, deps) : false;
-      deps.deliveryTrace?.('enter-aborted', { cleared });
-      if (deps.discardDraftOnAbort && !cleared && error && typeof error === 'object') {
+      const discard = deps.discardDraftOnAbort
+        ? await discardTypedDraft(target, text, deps.draftKind, deps)
+        : { cleared: false, reason: 'not requested' };
+      deps.deliveryTrace?.('enter-aborted', { cleared: discard.cleared, reason: discard.reason });
+      if (deps.discardDraftOnAbort && !discard.cleared && error && typeof error === 'object') {
         error.draftLeftOnScreen = true;
+        error.draftReason = discard.reason;
       }
       throw error;
     }
@@ -1630,7 +1700,7 @@ function appendedBytes(file, offset) {
 }
 
 function deliveredMatches(content, text) {
-  return normalizedText(content) === normalizedText(text);
+  return canonicalText(content) === canonicalText(text);
 }
 
 function compactRefusal(screen) {
@@ -3629,7 +3699,7 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
       precheck,
       type: async () => {
         if (opts?.beforeType) await opts.beforeType();
-        return typeAndSubmit(target, text, confirmation, { ...deps, deliveryTrace: trace });
+        return typeAndSubmit(target, text, confirmation, { ...deps, deliveryTrace: trace, draftKind: session.kind });
       },
       submitDraft: async () => {
         if (opts?.beforeType) await opts.beforeType();
@@ -3699,7 +3769,7 @@ function watcherSend({ sessionId, pane, text, precondition }, deps = {}) {
     };
     await guard();
     return send({ sessionId, pane, text }, undefined, { beforeType: guard },
-      { ...(deps.sendDeps || {}), beforeEnter: guard, discardDraftOnAbort: true });
+      { ...(deps.sendDeps || {}), beforeEnter: guard, discardDraftOnAbort: true, requireExactDraft: true });
   }, { session: sessionId, pane, model: modelCommandText(text) });
 }
 
@@ -7179,9 +7249,6 @@ function start(deps = {}) {
     watcherRunning = true;
     try {
       const live = require('./watcher-live.js');
-      // Reservations whose send never happened stop counting after five minutes;
-      // this is what stops the table growing a row per crash forever.
-      live.sweepReservations();
       // The snapshot the dashboard just built: whether the session is mid-turn,
       // has a question on screen, or has exited is exactly what decides delivery.
       // A stale snapshot would be deciding from a session that has moved on, so
@@ -7953,6 +8020,8 @@ module.exports = {
   pressTargetKey,
   typeAndSubmit,
   discardTypedDraft,
+  draftRegionText,
+  draftIsExactly,
   watcherSend,
   resolveSessionTarget,
   resolveSessionId, screenSession, screenHistorySession, sendSessionKeys, shellPaneTarget, stripTerminalAnsi, writeToShellPane,
