@@ -3815,6 +3815,7 @@ test('open uses host panes for both existing sessions and new Claude and Codex l
     randomUUID: () => '33333333-3333-4333-8333-333333333333',
     loadTask: () => ({ fm: { project, sessions: [] } }),
     waitForHostAgent: async () => true,
+    trustProject: () => true,
     typeOpeningMessage: async () => {},
     releaseCardSession: () => true,
     linkLaunchedSession: () => true,
@@ -3998,6 +3999,64 @@ test('standalone request id refuses to launch when existing panes cannot be inve
   } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
 });
 
+test('fresh standalone Claude without an opening message returns immediately after spawning', async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-standalone-claude-fast-open-'));
+  try {
+    const pinned = [];
+    const host = recordingHost((type) => type === 'spawn'
+      ? { pane: { id: 'claude-fast-pane', pid: 45, createdAt: 46 } }
+      : {});
+    const result = await openSession({ fresh: true, cwd, agent: 'claude',
+      accountId: 'claude/default', requestId: 'claude-fast-request' }, {
+      host,
+      listHostPanes: async () => [],
+      waitForHostAgent: async () => assert.fail('must not wait'),
+      trustProject: () => true,
+      pinSession: (...args) => pinned.push(args),
+    });
+    assert.equal(result.pane, 'claude-fast-pane');
+    assert.match(result.sessionId, /^[A-Za-z0-9_-]+$/);
+    assert.equal(result.settled, false);
+    assert.equal(pinned.length, 1);
+    assert.equal(pinned[0][0], result.sessionId);
+  } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('Claude launches pre-trust only projects that bypass permission prompts', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-project-trust-'));
+  const cwd = path.join(root, 'project'), configDir = path.join(root, 'claude');
+  try {
+    fs.mkdirSync(cwd); fs.mkdirSync(configDir);
+    const config = path.join(root, 'accounts.json');
+    fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+      { id: 'claude-test', label: 'Claude test', agent: 'claude', configDir },
+    ], defaultAccounts: { claude: 'claude-test' } }));
+    const env = { KEEP_DIR: root, KEEP_CONFIG: config };
+    const trusted = [];
+    let spawns = 0;
+    const host = recordingHost((type) => type === 'spawn'
+      ? { pane: { id: `trust-pane-${++spawns}`, pid: spawns, createdAt: spawns } }
+      : {});
+    const deps = {
+      root, env, host, listHostPanes: async () => [], waitForHostAgent: async () => true,
+      verifyFreshOpenPane: async () => null, pinSession: () => {},
+      trustProject: (...args) => { trusted.push(args); return true; },
+    };
+
+    await openSession({ fresh: true, cwd, agent: 'claude', accountId: 'claude-test',
+      requestId: 'trust-claude-request' }, { ...deps, claudeFlags: '--dangerously-skip-permissions' });
+    assert.deepEqual(trusted, [[require('./accounts').get('claude-test', env), fs.realpathSync(cwd)]]);
+
+    await openSession({ fresh: true, cwd, agent: 'codex', accountId: 'codex/default',
+      requestId: 'trust-codex-request' }, deps);
+    assert.equal(trusted.length, 1);
+
+    await openSession({ fresh: true, cwd, agent: 'claude', accountId: 'claude-test',
+      requestId: 'trust-normal-flags-request' }, { ...deps, claudeFlags: '' });
+    assert.equal(trusted.length, 1);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('standalone post-spawn setup failure exposes and reuses the exact existing pane', async () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-standalone-setup-'));
   try {
@@ -4009,12 +4068,13 @@ test('standalone post-spawn setup failure exposes and reuses the exact existing 
       if (type === 'spawn') { spawns++; return { pane }; }
       return {};
     });
-    const body = { fresh: true, cwd, agent: 'claude', accountId: 'claude/default', requestId: 'setup-request' };
+    const body = { fresh: true, cwd, agent: 'claude', accountId: 'claude/default', requestId: 'setup-request', message: 'begin' };
     await assert.rejects(openSession(body, {
       host, listHostPanes: async () => [], waitForHostAgent: async (_target, _agent, options) => {
         assert.equal(options.detectPortableSetup, true);
         throw new InjectionError(409, 'workspace setup required', { awaitingSetup: true });
       },
+      trustProject: () => true,
     }), (error) => error.extra?.code === 'OPEN_EXISTING_PANE'
       && error.extra.launch.pane === 'setup-pane' && error.extra.launch.recoverable === true);
     const reused = await openSession(body, {
@@ -4031,8 +4091,9 @@ test('standalone post-spawn regular errors retain the HTTP existing-pane receipt
       ? { pane: { id: 'http-error-pane', pid: 61, createdAt: 62 } }
       : {});
     await assert.rejects(openSession({ fresh: true, cwd, agent: 'claude',
-      accountId: 'claude/default', requestId: 'http-error-request' }, {
+      accountId: 'claude/default', requestId: 'http-error-request', message: 'begin' }, {
       host, listHostPanes: async () => [],
+      trustProject: () => true,
       waitForHostAgent: async () => { throw new Error('host observation failed'); },
     }), (error) => {
       assert.equal(error instanceof InjectionError, true, 'the /api/open route serializes InjectionError details');
@@ -4058,6 +4119,7 @@ test('standalone post-spawn account pin failures retain the existing-pane receip
         requestId: `${agent}-pin-error-request` }, {
         host: recordingHost((type) => type === 'spawn' ? { pane: { id: pane, pid: 63, createdAt: 64 } } : {}),
         listHostPanes: async () => [], waitForHostAgent: async () => true,
+        trustProject: () => true,
         verifyFreshOpenPane: async () => `${agent}-pin-error-session`,
         waitForHostSessionId: async () => `${agent}-pin-error-session`,
         pinSession: () => { throw new Error('ENOSPC: account registry write failed'); },
@@ -4092,6 +4154,7 @@ test('review launch rejects unknown explicit accounts and replaced panes before 
     let registered = 0; let ready = 0; let typed = 0; let linked = 0;
     const base = { root, env, host, loadTask: () => ({ fm: { project: cwd } }),
       waitForHostAgent: async () => true, waitForHostSessionId: async () => 'actual-review-session',
+      trustProject: () => true,
       onSessionReady: async () => { registered++; return true; },
       onOpeningReady: async () => { ready++; return true; },
       typeOpeningMessage: async () => { typed++; }, linkLaunchedSession: () => { linked++; } };
@@ -4215,14 +4278,20 @@ test('portable transfer keeps a trust-blocked opening bound and retries through 
 
 test('workspace trust is typed setup only for portable opening waits', async () => {
   let now = 0;
+  let screen = 'Do you trust the contents of this directory?';
   const host = { request: async (type) => {
-    assert.equal(type, 'screen'); return { text: 'Do you trust the contents of this directory?' };
+    assert.equal(type, 'screen'); return { text: screen };
   } };
   const clock = { host, now: () => now, sleep: async (ms) => { now += ms; } };
   await assert.rejects(waitForHostAgent({ pane: 'pane-trust' }, 'codex', clock),
     (error) => error.status === 504 && /never showed an empty prompt/.test(error.message));
   now = 0;
   await assert.rejects(waitForHostAgent({ pane: 'pane-trust' }, 'codex', { ...clock, detectPortableSetup: true }),
+    (error) => error.status === 409 && error.code === 'KEEP_PORTABLE_TRANSFER_AWAITING_SETUP'
+      && error.extra.setupKind === 'workspace-trust');
+  now = 0;
+  screen = 'Accessing workspace: /project\nQuick safety check: Is this a project you created or one you trust?\nNo, exit\nYes, I trust this folder';
+  await assert.rejects(waitForHostAgent({ pane: 'pane-trust' }, 'claude', { ...clock, detectPortableSetup: true }),
     (error) => error.status === 409 && error.code === 'KEEP_PORTABLE_TRANSFER_AWAITING_SETUP'
       && error.extra.setupKind === 'workspace-trust');
 });
@@ -4538,7 +4607,7 @@ test('explicit account launches stay pinned when the session is resumed', async 
     return JSON.parse(Buffer.from(encoded, 'base64url')).id;
   };
   try {
-    const common = { root, env, host, waitForHostAgent: async () => true };
+    const common = { root, env, host, waitForHostAgent: async () => true, trustProject: () => true };
     await openSession({ taskId: 'card', fresh: true, agent: 'claude', accountId: 'claude-secondary' }, {
       ...common, randomUUID: () => sid, loadTask: () => ({ fm: { project: os.tmpdir(), sessions: [] } }),
     });
@@ -4642,6 +4711,7 @@ test('opening an auto-closed done card resumes the same Claude and Codex session
       resolveSessionTarget: async () => null,
       liveSessionPids: async () => new Map(),
       waitForHostAgent: async () => true,
+      trustProject: () => true,
     });
     assert.equal(result.sessionId, id);
     assert.equal(result.command, expected);
@@ -5236,6 +5306,7 @@ test('a host request timeout releases the injection lock', async () => {
   await assert.rejects(openSession({ taskId: 'card', fresh: true }, {
     host,
     hostRequestTimeoutMs: 5,
+    trustProject: () => true,
     loadTask: () => ({ fm: { project: os.tmpdir(), sessions: [] } }),
   }), /host request timed out \(spawn\)/);
   assert.equal(isInjectionBusy(), false);
@@ -5486,6 +5557,7 @@ test('open types the complete handoff file pointer into a fresh session', async 
     loadTask: () => ({ fm: { project: os.tmpdir(), sessions: [] } }),
     randomUUID: () => 'handoff-session',
     waitForHostAgent: async () => true,
+    trustProject: () => true,
     typeOpeningMessage: async (target, agent, text) => typed.push({ target, agent, text }),
     linkLaunchedSession: () => true,
   });
@@ -5498,6 +5570,7 @@ test('open types the complete handoff file pointer into a fresh session', async 
     loadTask: () => ({ fm: { project: os.tmpdir(), sessions: [] } }),
     randomUUID: () => 'rejected-session',
     waitForHostAgent: async () => true,
+    trustProject: () => true,
     onOpeningReady: async () => false,
     typeOpeningMessage: async (...args) => rejected.push(args),
   }), (error) => error.status === 409 && /reservation changed before/.test(error.message));
@@ -5536,6 +5609,7 @@ test('open --model rides the launched command line and the pane meta, never sett
     randomUUID: () => '44444444-4444-4444-8444-444444444444',
     loadTask: () => ({ fm: { project, sessions: [] } }),
     waitForHostAgent: async () => true,
+    trustProject: () => true,
     linkLaunchedSession: () => true,
   });
   assert.equal(claude.command, 'claude --dangerously-skip-permissions --model claude-fable-5-1 --session-id 44444444-4444-4444-8444-444444444444');

@@ -66,6 +66,12 @@ const CODEX_DIALOG_MARKERS = [
   'Do you trust the contents of this directory?',
   'Press enter to continue',
 ];
+const CLAUDE_TRUST_MARKERS = [
+  'Do you trust the contents of this directory?',
+  'Do you trust the files in this folder?',
+  'Yes, I trust this folder',
+  'Quick safety check',
+];
 // Claude Code renders an AI prompt suggestion on the `❯` line only while the input box
 // is empty; typing any character hides it. The host trims trailing whitespace from screen
 // lines, so a space cannot tell a draft from a lagging re-render — a visible character can:
@@ -3802,8 +3808,7 @@ async function waitForHostAgent(target, agent, deps = {}) {
     if (agentPromptVisible(agent, screen)) return true;
     if (deps.detectPortableSetup === true) {
       const plain = stripTerminalAnsi(screen);
-      const setupKind = plain.includes('Do you trust the contents of this directory?')
-        || plain.includes('Do you trust the files in this folder?') ? 'workspace-trust' : '';
+      const setupKind = CLAUDE_TRUST_MARKERS.some((marker) => plain.includes(marker)) ? 'workspace-trust' : '';
       if (setupKind) {
         const error = new InjectionError(409, `${agent} is awaiting workspace trust in pane ${target.pane}; accept it there, then retry delivery`, {
           awaitingSetup: true, setupKind, screenTail: screenTail(screen),
@@ -4022,6 +4027,9 @@ async function openSession(body, deps = {}) {
   const allowPendingRegistration = freshStandalone && agent === 'codex' && !message && Boolean(body.requestId)
     && !body.portableTransferId && !body.reviewQueueLaunchId
     && !deps.onSessionReady && !deps.onOpeningReady && !deps.onOpeningDelivered;
+  const deferReadiness = freshStandalone && agent === 'claude' && !message
+    && !body.portableTransferId && !body.reviewQueueLaunchId
+    && !deps.onSessionReady && !deps.onOpeningReady && !deps.onOpeningDelivered;
   if (freshStandalone && body.requestId) {
     const panes = await (deps.listHostPanes || listHostPanes)(deps, true);
     if (!Array.isArray(panes)) {
@@ -4096,6 +4104,15 @@ async function openSession(body, deps = {}) {
       : ['claude', ...claudeFlagArgs, ...(accountMcpConfig ? ['--mcp-config', accountMcpConfig] : []), ...(launchModel ? ['--model', launchModel] : []),
         ...(sessionId ? [session ? '--resume' : '--session-id', sessionId] : [])];
     const command = argv.join(' ');
+    // A launch that bypasses permission prompts has already crossed the boundary the
+    // trust dialog guards; launches with the normal approval flags keep the dialog.
+    if (agent === 'claude' && claudeFlagArgs.includes('--dangerously-skip-permissions')) {
+      try { (deps.trustProject || require('./account-setup').trustProject)(account, project); }
+      catch (error) {
+        const detail = String(error?.message || error).replace(/[\r\n]+/g, ' ');
+        process.stderr.write(`keep serve: could not pre-trust ${project} for ${account.id}: ${detail}\n`);
+      }
+    }
     const spawned = await hostRequest('spawn', {
       cmd: '/bin/zsh',
       args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`],
@@ -4191,9 +4208,15 @@ async function openSession(body, deps = {}) {
     if (deps.onLaunched) await deps.onLaunched(launch);
     launchPrepared = true;
     release();
-    await (deps.waitForHostAgent || waitForHostAgent)(target, agent,
-      freshStandalone ? { ...deps, detectPortableSetup: true } : deps);
-    launch.settled = true;
+    if (deferReadiness) {
+      // The console shows the pane immediately while Claude boots or displays its trust
+      // dialog; openRequestId pane metadata still dedupes a retry of the same request.
+      launch.settled = false;
+    } else {
+      await (deps.waitForHostAgent || waitForHostAgent)(target, agent,
+        freshStandalone ? { ...deps, detectPortableSetup: true } : deps);
+      launch.settled = true;
+    }
     if (!launch.sessionId && allowPendingRegistration) {
       launch.sessionId = await (deps.verifyFreshOpenPane || verifyFreshOpenPane)(launch, {
         agent, accountId: account.id, requestId: body.requestId, launchedAt, project, model: launchModel,
@@ -4247,7 +4270,7 @@ async function openSession(body, deps = {}) {
         throw new InjectionError(504, `${agent} started in host pane ${launch.pane} but never registered its session id`);
       }
     }
-    if (launch.sessionId) {
+    if (launch.sessionId && !deferReadiness) {
       (deps.pinSession || accounts.pinSession)(launch.sessionId, agent, account.id,
         { root: deps.root || keep.ROOT, env: deps.env || process.env });
     }

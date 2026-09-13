@@ -239,6 +239,10 @@ Environment variables override configuration. `KEEP_CONFIG` selects another file
 An explicit `KEEP_DIR` without `KEEP_CONFIG` selects an isolated registry without
 loading the default configuration. Model settings name models available to your
 Claude installation; `keep doctor` checks executables, not model entitlements.
+When `KEEP_OPEN_CLAUDE_FLAGS` includes `--dangerously-skip-permissions`, Keep marks
+the launch directory as trusted in that account's `.claude.json` before starting
+Claude so the workspace trust dialog does not block unattended launches. With the
+normal approval flags, the dialog still appears in the pane.
 
 Starting the daemon enables the automation schedulers. Model-backed work uses your
 agent account. Scheduled recipes run in agents, and the reviewer is an ordinary

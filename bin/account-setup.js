@@ -23,6 +23,34 @@ function stateFile(account) {
   return path.join(account.configDir, '.claude.json');
 }
 
+function trustProject(account, cwd) {
+  const file = stateFile(account);
+  const state = readJSON(file, {});
+  if (!state || typeof state !== 'object' || Array.isArray(state)) {
+    throw new Error(`invalid JSON object in ${file}`);
+  }
+  const project = fs.realpathSync(cwd);
+  const projects = state.projects && typeof state.projects === 'object' && !Array.isArray(state.projects)
+    ? state.projects : {};
+  const entry = projects[project] && typeof projects[project] === 'object' && !Array.isArray(projects[project])
+    ? projects[project] : {};
+  if (entry.hasTrustDialogAccepted === true) return false;
+  state.projects = { ...projects, [project]: { ...entry, hasTrustDialogAccepted: true } };
+
+  const directory = path.dirname(file);
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const temporary = path.join(directory,
+    `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`);
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(state, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+    fs.renameSync(temporary, file);
+  } catch (error) {
+    try { fs.unlinkSync(temporary); } catch {}
+    throw error;
+  }
+  return true;
+}
+
 function readJSON(file, fallback) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch (error) { if (error.code === 'ENOENT' && fallback !== undefined) return fallback; throw new Error(`invalid JSON in ${file}`); }
@@ -369,4 +397,4 @@ function compatible(sourceAccount, targetAccount, cwd) {
 }
 
 module.exports = { MANIFEST, shareSetup, readSetup, ensureSharedMemory, compatible, effectiveMcpServers,
-  projectKey, repositoryRoot, stateFile, mcpConfigPath };
+  projectKey, repositoryRoot, stateFile, trustProject, mcpConfigPath };

@@ -256,6 +256,72 @@ test('only explicit builtIn accounts use the sibling Claude state file', () => {
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('trustProject creates missing Claude state with the canonical project key', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-project-trust-create-'));
+  const cwd = path.join(root, 'project'), configDir = path.join(root, 'claude');
+  const account = { id: 'claude-test', agent: 'claude', configDir, builtIn: false };
+  try {
+    fs.mkdirSync(cwd);
+    assert.equal(setup.trustProject(account, cwd), true);
+    const file = path.join(configDir, '.claude.json');
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), {
+      projects: { [fs.realpathSync(cwd)]: { hasTrustDialogAccepted: true } },
+    });
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('trustProject preserves existing state and other project entries', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-project-trust-preserve-'));
+  const cwd = path.join(root, 'project'), configDir = path.join(root, 'claude');
+  const account = { id: 'claude-test', agent: 'claude', configDir, builtIn: false };
+  const file = path.join(configDir, '.claude.json');
+  try {
+    fs.mkdirSync(cwd); fs.mkdirSync(configDir);
+    fs.writeFileSync(file, JSON.stringify({ theme: 'dark', projects: {
+      '/other/project': { hasTrustDialogAccepted: false, note: 'keep' },
+      [fs.realpathSync(cwd)]: { mcpServers: { local: { command: 'local' } } },
+    } }));
+    assert.equal(setup.trustProject(account, cwd), true);
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), {
+      theme: 'dark', projects: {
+        '/other/project': { hasTrustDialogAccepted: false, note: 'keep' },
+        [fs.realpathSync(cwd)]: {
+          mcpServers: { local: { command: 'local' } }, hasTrustDialogAccepted: true,
+        },
+      },
+    });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('trustProject leaves an already trusted state file byte-for-byte unchanged', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-project-trust-idempotent-'));
+  const cwd = path.join(root, 'project'), configDir = path.join(root, 'claude');
+  const account = { id: 'claude-test', agent: 'claude', configDir, builtIn: false };
+  const file = path.join(configDir, '.claude.json');
+  try {
+    fs.mkdirSync(cwd); fs.mkdirSync(configDir);
+    const original = `{\n  "projects": {\n    "${fs.realpathSync(cwd)}": { "hasTrustDialogAccepted": true }\n  }\n}`;
+    fs.writeFileSync(file, original);
+    assert.equal(setup.trustProject(account, cwd), false);
+    assert.equal(fs.readFileSync(file, 'utf8'), original);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('trustProject rejects invalid JSON without overwriting it', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-project-trust-invalid-'));
+  const cwd = path.join(root, 'project'), configDir = path.join(root, 'claude');
+  const account = { id: 'claude-test', agent: 'claude', configDir, builtIn: false };
+  const file = path.join(configDir, '.claude.json');
+  try {
+    fs.mkdirSync(cwd); fs.mkdirSync(configDir);
+    const original = '{ not valid JSON';
+    fs.writeFileSync(file, original);
+    assert.throws(() => setup.trustProject(account, cwd), /invalid JSON/);
+    assert.equal(fs.readFileSync(file, 'utf8'), original);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('compatibility is symmetric across three shared profiles and rejects an unrelated profile', () => {
   const f = fixture();
   const third = { id: 'claude-third', label: 'Third', agent: 'claude', configDir: path.join(f.home, '.claude-third'), builtIn: false };
