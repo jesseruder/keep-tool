@@ -45,6 +45,9 @@ const PORT = parseInt(process.env.KEEP_PORT || '7777', 10);
 const { PROJECTS_DIR, TAIL_BYTES, textOf, readTranscriptTail, findSessionFile } = transcripts;
 const WEB_ROOT = path.join(__dirname, '..', 'web');
 const SESSION_WINDOW_MS = 48 * 3600e3; // ignore transcripts older than this
+const TURN_INDEX_BUDGET_MS = 150; // how long one turn-index tick may hold the event loop
+const TURN_INDEX_BUDGET_BYTES = 8 * 1024 * 1024;
+const TURN_INDEX_PRUNE_LIMIT = 200; // sessions dropped per daily sweep; it resumes next tick
 const claudeProjectRoots = accounts.projectRoots();
 const claudeTranscriptIndex = require('./transcript-index').createMultiRootTranscriptIndex(claudeProjectRoots);
 const {
@@ -6926,14 +6929,31 @@ function start(deps = {}) {
   setTimeout(stalledTick, 5e3).unref();
   // Stop hooks feed the turn index, but a session can run for hours without
   // stopping and an agent that never loaded the hooks would be missing entirely.
-  // Bounded and round-robin: one tick never sweeps more than 64 transcripts.
+  // The bound is wall time and bytes, not files: this runs on the daemon's event
+  // loop, so what must stay small is how long one tick blocks it. The round-robin
+  // cursor lives in the module, so the next tick resumes where this one stopped.
   let turnIndexRunning = false;
+  let lastTurnIndexPruneAt = 0;
   const turnIndexTick = () => {
     if (turnIndexRunning) return;
     turnIndexRunning = true;
     try {
-      const result = require('./turn-index.js').ingestSessionsFromLiveState(liveTurnIndexSessions(), { limit: 64 });
-      health.record('turn-index', { ok: true, cadenceMs: 30e3, detail: `${result.ingested} indexed, ${result.skipped} skipped` });
+      const turnIndex = require('./turn-index.js');
+      const result = turnIndex.ingestSessionsFromLiveState(liveTurnIndexSessions(), {
+        budgetMs: TURN_INDEX_BUDGET_MS, maxBytes: TURN_INDEX_BUDGET_BYTES, busyTimeoutMs: 250,
+      });
+      let detail = `${result.files} files, ${result.bytes} bytes, ${result.ms} ms`
+        + `${result.partial ? ', more pending' : ''}${result.skipped ? `, ${result.skipped} skipped` : ''}`;
+      // Retention is a once-a-day sweep, not tick work; it rides along here so it
+      // needs no second timer and shows up in the same health row.
+      if (Date.now() - lastTurnIndexPruneAt >= 86400e3) {
+        const pruned = turnIndex.prune({ busyTimeoutMs: 250, limit: TURN_INDEX_PRUNE_LIMIT });
+        // A sweep that hit its limit keeps the clock unset so the next tick
+        // continues it; only a finished sweep counts as today's prune.
+        if (!pruned.more) lastTurnIndexPruneAt = Date.now();
+        if (pruned.sessions) detail += `; pruned ${pruned.sessions} sessions${pruned.more ? ', more to go' : ''}`;
+      }
+      health.record('turn-index', { ok: true, cadenceMs: 30e3, detail });
     } catch (error) {
       health.record('turn-index', { ok: false, cadenceMs: 30e3, error });
     } finally {

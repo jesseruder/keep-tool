@@ -352,3 +352,355 @@ test('live-state ingestion uses each session file and tolerates unresolvable one
   assert.equal(result.skipped, 1);
   assert.equal(turnIndex.turnsForSession(SESSION).length, 3);
 });
+
+test('a byte cap turns a big cold read into partial passes that still land every turn', (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, `${SESSION}.jsonl`);
+  const filler = 'y'.repeat(3000);
+  const records = [];
+  for (let i = 0; i < 40; i += 1) {
+    const at = (n) => new Date(Date.UTC(2026, 8, 10, 0, i, n)).toISOString();
+    records.push(claudeUser(`Task ${i}`, { timestamp: at(0) }));
+    records.push({
+      type: 'assistant', sessionId: SESSION, cwd: '/tmp/demo-project', timestamp: at(1),
+      message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: `Done ${i}. ${filler}` }] },
+    });
+  }
+  fs.writeFileSync(file, jsonl(records));
+  const size = fs.statSync(file).size;
+  assert.ok(size > 64 * 1024, 'the fixture must be bigger than the cap under test');
+
+  const first = turnIndex.ingestFile(file, { agent: 'claude', maxBytes: 16 * 1024 });
+  assert.equal(first.ok, true);
+  assert.equal(first.partial, true, 'a capped pass reports that there is more to read');
+  assert.ok(first.bytes < size, 'the cap really stopped short of the whole file');
+  assert.ok(first.turns < 40);
+
+  let guard = 0;
+  let result = first;
+  while (result.partial && (guard += 1) < 500) {
+    result = turnIndex.ingestFile(file, { agent: 'claude', maxBytes: 16 * 1024 });
+  }
+  assert.equal(result.partial, false);
+
+  // Capped passes must produce exactly what one uncapped pass would have.
+  const turns = turnIndex.turnsForSession(SESSION, { last: 100 });
+  assert.equal(turns.length, 40);
+  assert.deepEqual(turns.map((turn) => turn.n), records.filter((row) => row.type === 'user').map((_, i) => i + 1));
+  assert.equal(turns[0].last_assistant.startsWith('Done 0.'), true);
+  assert.equal(turns[39].last_assistant.startsWith('Done 39.'), true);
+  assert.equal(turns.every((turn) => turn.ended === 1), true);
+  assert.equal(turnIndex.open().prepare('SELECT COUNT(*) AS n FROM messages').get().n, 80);
+});
+
+test('a single line longer than the cap still completes rather than stalling', (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, `${SESSION}.jsonl`);
+  fs.writeFileSync(file, jsonl([
+    claudeUser('Read the enormous log', { timestamp: '2026-09-10T00:00:00.000Z' }),
+    {
+      type: 'assistant', sessionId: SESSION, cwd: '/tmp/demo-project', timestamp: '2026-09-10T00:00:01.000Z',
+      message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'z'.repeat(200000) }] },
+    },
+  ]));
+  // A 1 KiB budget against a 200 KB record: dropping it would lose a real message.
+  let result = turnIndex.ingestFile(file, { agent: 'claude', maxBytes: 1024 });
+  let guard = 0;
+  while (result.partial && (guard += 1) < 20) result = turnIndex.ingestFile(file, { agent: 'claude', maxBytes: 1024 });
+  assert.equal(result.partial, false);
+  assert.equal(turnIndex.open().prepare('SELECT COUNT(*) AS n FROM messages').get().n, 2);
+});
+
+test('a held write lock is skipped quietly instead of making a hook wait', (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, `${SESSION}.jsonl`);
+  fs.writeFileSync(file, jsonl(claudeRecords()));
+  turnIndex.ingestFile(file, { agent: 'claude' });
+
+  // A second connection holding the write lock is exactly what a hook races with.
+  const { DatabaseSync } = require('node:sqlite');
+  const blocker = new DatabaseSync(process.env.KEEP_TURN_INDEX_DB);
+  blocker.exec('PRAGMA busy_timeout = 0');
+  blocker.exec('BEGIN IMMEDIATE');
+  blocker.exec("INSERT INTO sessions (id, agent, kind) VALUES ('blocker', 'claude', 'interactive')");
+  try {
+    fs.appendFileSync(file, jsonl([claudeUser('one more', { timestamp: '2026-09-10T00:05:00.000Z' })]));
+    const startedAt = Date.now();
+    const result = turnIndex.ingestFile(file, { agent: 'claude', busyTimeoutMs: 50, maxBytes: 4 * 1024 * 1024 });
+    const elapsed = Date.now() - startedAt;
+    assert.equal(result.ok, false);
+    assert.equal(result.skipped, 'busy', 'a locked database is skipped quietly, never thrown');
+    assert.ok(elapsed < 2000, `a hook must not wait on the lock (waited ${elapsed} ms)`);
+  } finally {
+    blocker.exec('ROLLBACK');
+    blocker.close();
+  }
+  // The delta is not lost: the next pass picks it up.
+  const after = turnIndex.ingestFile(file, { agent: 'claude' });
+  assert.equal(after.ok, true);
+  assert.equal(after.messages, 1);
+});
+
+test('a subagent transcript is its own session and never overwrites its parent', (t) => {
+  const dir = tempDir(t);
+  const project = path.join(dir, '-Users-demo-project');
+  const subagents = path.join(project, SESSION, 'subagents');
+  fs.mkdirSync(subagents, { recursive: true });
+  const parentFile = path.join(project, `${SESSION}.jsonl`);
+  fs.writeFileSync(parentFile, jsonl(claudeRecords()));
+  assert.equal(turnIndex.ingestFile(parentFile, { agent: 'claude' }).ok, true);
+  const parentBefore = turnIndex.sessionRow(SESSION);
+  assert.equal(parentBefore.kind, 'interactive');
+  assert.equal(parentBefore.file, parentFile);
+  const parentTurns = turnIndex.turnsForSession(SESSION).length;
+
+  // Real subagent records carry the PARENT uuid in sessionId, their own identity
+  // in agentId, and isSidechain on every line.
+  const agentFile = path.join(subagents, 'agent-abc123.jsonl');
+  const sub = (extra) => ({
+    isSidechain: true, agentId: 'abc123', sessionId: SESSION, cwd: '/tmp/demo-project', ...extra,
+  });
+  fs.writeFileSync(agentFile, jsonl([
+    sub({ type: 'user', timestamp: '2026-09-10T00:10:00.000Z', message: { role: 'user', content: 'Investigate the flake' } }),
+    sub({ type: 'assistant', timestamp: '2026-09-10T00:10:05.000Z', message: {
+      role: 'assistant', stop_reason: 'tool_use', content: [
+        { type: 'text', text: 'Looking.' },
+        { type: 'tool_use', id: 's1', name: 'Read', input: { file_path: '/tmp/demo-project/a.js' } },
+      ] } }),
+    sub({ type: 'user', timestamp: '2026-09-10T00:10:06.000Z', message: {
+      role: 'user', content: [{ type: 'tool_result', tool_use_id: 's1', content: 'ok' }] } }),
+    sub({ type: 'assistant', timestamp: '2026-09-10T00:10:09.000Z', message: {
+      role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'It is a load flake.' }] } }),
+  ]));
+  const result = turnIndex.ingestFile(agentFile, { agent: 'claude' });
+  assert.equal(result.ok, true);
+  assert.equal(result.sessionId, 'abc123', 'identity comes from agentId, not the parent uuid');
+
+  const child = turnIndex.sessionRow('abc123');
+  assert.equal(child.kind, 'subagent');
+  assert.equal(child.parent_id, SESSION);
+  assert.equal(child.file, agentFile);
+  const childTurns = turnIndex.turnsForSession('abc123');
+  assert.equal(childTurns.length, 1, 'sidechain records in a subagent file ARE the conversation');
+  assert.equal(childTurns[0].tool_count, 1);
+  assert.equal(childTurns[0].last_assistant, 'It is a load flake.');
+
+  const parentAfter = turnIndex.sessionRow(SESSION);
+  assert.equal(parentAfter.kind, 'interactive', 'the parent is not relabelled by its subagent');
+  assert.equal(parentAfter.file, parentFile, 'the parent row still points at the parent transcript');
+  assert.equal(turnIndex.turnsForSession(SESSION).length, parentTurns);
+
+  // A reset of the subagent file must reach only the subagent's own rows.
+  fs.writeFileSync(agentFile, jsonl([
+    sub({ type: 'user', timestamp: '2026-09-10T00:11:00.000Z', message: { role: 'user', content: 'Start over' } }),
+  ]));
+  assert.equal(turnIndex.ingestFile(agentFile, { agent: 'claude' }).ok, true);
+  assert.equal(turnIndex.turnsForSession('abc123').length, 1);
+  assert.equal(turnIndex.turnsForSession(SESSION).length, parentTurns, 'the parent keeps every turn it had');
+  assert.equal(
+    turnIndex.open().prepare('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?').get(SESSION).n, 11,
+  );
+});
+
+test('a rewritten file is re-indexed even when it never shrinks', (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, `${SESSION}.jsonl`);
+  fs.writeFileSync(file, jsonl([
+    claudeUser('First conversation about caching', { timestamp: '2026-09-10T00:00:00.000Z' }),
+    { type: 'assistant', sessionId: SESSION, cwd: '/tmp/demo-project', timestamp: '2026-09-10T00:00:05.000Z',
+      message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'Cached it.' }] } },
+  ]));
+  assert.equal(turnIndex.ingestFile(file, { agent: 'claude' }).ok, true);
+  assert.equal(turnIndex.search('caching').length, 1);
+
+  // Different bytes, and the file never shrinks: the offset alone cannot tell
+  // this apart from an ordinary append.
+  const replacement = jsonl([
+    claudeUser('Second conversation about batching', { timestamp: '2026-09-10T01:00:00.000Z' }),
+    { type: 'assistant', sessionId: SESSION, cwd: '/tmp/demo-project', timestamp: '2026-09-10T01:00:05.000Z',
+      message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'Batched it, and then some.' }] } },
+  ]);
+  assert.ok(Buffer.byteLength(replacement) >= fs.statSync(file).size,
+    'the rewrite must not shrink the file, or truncation detection would catch it instead');
+  fs.writeFileSync(file, replacement);
+
+  const result = turnIndex.ingestFile(file, { agent: 'claude' });
+  assert.equal(result.ok, true);
+  assert.equal(result.reset, true, 'a changed head fingerprint resets the file');
+  assert.equal(turnIndex.search('caching').length, 0, 'the replaced conversation is gone');
+  assert.equal(turnIndex.search('batching').length, 1);
+  assert.equal(turnIndex.turnsForSession(SESSION).length, 1);
+  assert.equal(turnIndex.open().prepare('SELECT COUNT(*) AS n FROM messages').get().n, 2);
+});
+
+test('appending to a transcript smaller than the fingerprint window is not a rewrite', (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, `${SESSION}.jsonl`);
+  fs.writeFileSync(file, jsonl([claudeUser('tiny', { timestamp: '2026-09-10T00:00:00.000Z' })]));
+  assert.ok(fs.statSync(file).size < 4096, 'the fixture must be smaller than the fingerprint window');
+  assert.equal(turnIndex.ingestFile(file, { agent: 'claude' }).ok, true);
+  fs.appendFileSync(file, jsonl([claudeUser('second', { timestamp: '2026-09-10T00:01:00.000Z' })]));
+  const result = turnIndex.ingestFile(file, { agent: 'claude' });
+  assert.equal(result.reset, undefined, 'growing past the hashed prefix is an append, not a replacement');
+  assert.equal(result.messages, 1);
+  assert.equal(turnIndex.turnsForSession(SESSION).length, 2);
+});
+
+test('the daemon sweep is bounded by time and bytes and resumes where it stopped', (t) => {
+  const dir = tempDir(t);
+  const sessions = [];
+  for (let i = 0; i < 6; i += 1) {
+    const id = `feed${i}-2222-3333-4444-555555555555`;
+    const file = path.join(dir, `${id}.jsonl`);
+    fs.writeFileSync(file, jsonl([
+      { type: 'user', sessionId: id, cwd: '/tmp/demo-project', timestamp: '2026-09-10T00:00:00.000Z',
+        message: { role: 'user', content: `Work on ${i}` } },
+      { type: 'assistant', sessionId: id, cwd: '/tmp/demo-project', timestamp: '2026-09-10T00:00:05.000Z',
+        message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: `Did ${i}.` }] } },
+    ]));
+    sessions.push({ id, agent: 'claude', file });
+  }
+  const indexed = () => turnIndex.open().prepare('SELECT COUNT(DISTINCT session_id) AS n FROM messages').get().n;
+
+  // A zero-millisecond budget stops before the first file rather than running away.
+  const none = turnIndex.ingestSessionsFromLiveState(sessions, { budgetMs: 0 });
+  assert.equal(none.files, 0);
+  assert.equal(none.partial, true);
+  assert.equal(indexed(), 0);
+
+  // A byte budget smaller than one file still makes progress, one file per tick.
+  const firstTick = turnIndex.ingestSessionsFromLiveState(sessions, { maxBytes: 1 });
+  assert.equal(firstTick.files, 1);
+  assert.equal(firstTick.partial, true);
+  assert.equal(indexed(), 1);
+  const secondTick = turnIndex.ingestSessionsFromLiveState(sessions, { maxBytes: 1 });
+  assert.equal(secondTick.files, 1);
+  assert.equal(indexed(), 2, 'the round-robin cursor moved on rather than redoing the first file');
+
+  const rest = turnIndex.ingestSessionsFromLiveState(sessions);
+  assert.equal(rest.partial, false);
+  assert.equal(indexed(), 6);
+  assert.ok(rest.ms >= 0 && rest.bytes > 0, 'the tick reports what it cost for the health row');
+});
+
+test('prune drops sessions last active before the cutoff and leaves the rest whole', (t) => {
+  const dir = tempDir(t);
+  const oldFile = path.join(dir, `${SESSION}.jsonl`);
+  fs.writeFileSync(oldFile, jsonl(claudeRecords()));
+  turnIndex.ingestFile(oldFile, { agent: 'claude' });
+
+  const freshId = 'aaaa1111-2222-3333-4444-555555555555';
+  const freshFile = path.join(dir, `${freshId}.jsonl`);
+  const now = new Date().toISOString();
+  fs.writeFileSync(freshFile, jsonl([
+    { type: 'user', sessionId: freshId, cwd: '/tmp/demo-project', timestamp: now,
+      message: { role: 'user', content: 'Still working on the parser' } },
+    { type: 'assistant', sessionId: freshId, cwd: '/tmp/demo-project', timestamp: now,
+      message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'Parsed.' }] } },
+  ]));
+  turnIndex.ingestFile(freshFile, { agent: 'claude' });
+
+  const db = turnIndex.open();
+  const cutoff = Date.parse('2026-09-11T00:00:00.000Z'); // after the fixture, before now
+
+  const dry = turnIndex.prune({ cutoff, dry: true });
+  assert.equal(dry.dry, true);
+  assert.equal(dry.sessions, 1);
+  assert.equal(dry.messages, 11);
+  assert.equal(dry.files, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 13, 'a dry run deletes nothing');
+
+  const pruned = turnIndex.prune({ cutoff });
+  assert.equal(pruned.sessions, 1);
+  assert.equal(turnIndex.sessionRow(SESSION), null);
+  assert.equal(turnIndex.sessionRow(freshId).id, freshId);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 2);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM turns').get().n, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM ingest_state').get().n, 1);
+  // The FTS shadow has to shrink with the real table, or search returns ghosts.
+  assert.equal(turnIndex.search('flaky').length, 0);
+  assert.equal(turnIndex.search('parser').length, 1);
+
+  // A pruned file is simply re-indexed from zero if it is still on disk.
+  const again = turnIndex.ingestFile(oldFile, { agent: 'claude' });
+  assert.equal(again.ok, true);
+  assert.equal(again.messages, 11);
+
+  // Nothing old enough is a no-op, not an error.
+  assert.deepEqual(turnIndex.prune({ cutoff: 0 }),
+    { cutoff: 0, sessions: 0, messages: 0, turns: 0, files: 0, more: false });
+});
+
+test('a bounded prune drops its limit and says there is more to do', (t) => {
+  const dir = tempDir(t);
+  for (let i = 0; i < 5; i += 1) {
+    const id = `stale${i}-2222-3333-4444-555555555555`;
+    const file = path.join(dir, `${id}.jsonl`);
+    fs.writeFileSync(file, jsonl([
+      { type: 'user', sessionId: id, cwd: '/tmp/demo-project', timestamp: `2026-08-0${i + 1}T00:00:00.000Z`,
+        message: { role: 'user', content: `Old work ${i}` } },
+    ]));
+    turnIndex.ingestFile(file, { agent: 'claude' });
+  }
+  const cutoff = Date.parse('2026-09-01T00:00:00.000Z');
+  const db = turnIndex.open();
+  const remaining = () => db.prepare('SELECT COUNT(*) AS n FROM sessions').get().n;
+
+  // The daemon prunes on its event loop, so a huge first sweep must come in bites.
+  const firstSweep = turnIndex.prune({ cutoff, limit: 2 });
+  assert.equal(firstSweep.sessions, 2);
+  assert.equal(firstSweep.more, true);
+  assert.equal(remaining(), 3);
+  assert.equal(turnIndex.sessionRow('stale0-2222-3333-4444-555555555555'), null, 'the oldest go first');
+  assert.ok(turnIndex.sessionRow('stale4-2222-3333-4444-555555555555'));
+
+  let guard = 0;
+  let sweep = firstSweep;
+  while (sweep.more && (guard += 1) < 10) sweep = turnIndex.prune({ cutoff, limit: 2 });
+  assert.equal(sweep.more, false);
+  assert.equal(remaining(), 0);
+});
+
+test('a working directory is folded onto its main checkout at most once, ever', (t) => {
+  const dir = tempDir(t);
+  // Every hook is a fresh process, so an in-process memo would not stop this git
+  // subprocess from running on every single turn.
+  const wt = require('./wt.js');
+  const original = wt.isLinkedWorktree;
+  let calls = 0;
+  wt.isLinkedWorktree = () => { calls += 1; return false; };
+  t.after(() => { wt.isLinkedWorktree = original; });
+
+  const write = (id, text, at) => {
+    const file = path.join(dir, `${id}.jsonl`);
+    fs.appendFileSync(file, jsonl([
+      { type: 'user', sessionId: id, cwd: '/tmp/shared-project', timestamp: at,
+        message: { role: 'user', content: text } },
+    ]));
+    return file;
+  };
+
+  const one = write('proj1111-2222-3333-4444-555555555555', 'first', '2026-09-10T00:00:00.000Z');
+  assert.equal(turnIndex.ingestFile(one, { agent: 'claude' }).ok, true);
+  assert.equal(calls, 1);
+
+  // A later pass on the same session must not resolve it again.
+  write('proj1111-2222-3333-4444-555555555555', 'second', '2026-09-10T00:01:00.000Z');
+  assert.equal(turnIndex.ingestFile(one, { agent: 'claude' }).ok, true);
+  assert.equal(calls, 1);
+
+  // Nor must a different session in the same directory.
+  const two = write('proj2222-2222-3333-4444-555555555555', 'elsewhere', '2026-09-10T00:02:00.000Z');
+  assert.equal(turnIndex.ingestFile(two, { agent: 'claude' }).ok, true);
+  assert.equal(calls, 1, 'the answer for a directory is cached in the index itself');
+  assert.equal(turnIndex.sessionRow('proj2222-2222-3333-4444-555555555555').project, '/tmp/shared-project');
+});
+
+test('the database carries its schema version, fingerprint column and journal limit', (t) => {
+  tempDir(t);
+  const db = turnIndex.open();
+  assert.equal(db.prepare('PRAGMA user_version').get().user_version, turnIndex.SCHEMA_VERSION);
+  const columns = db.prepare('PRAGMA table_info(ingest_state)').all().map((row) => row.name);
+  assert.ok(columns.includes('head_sha'), 'migration 2 adds the fingerprint column to a fresh database too');
+  assert.equal(Object.values(db.prepare('PRAGMA journal_size_limit').get())[0], 64 * 1024 * 1024);
+});

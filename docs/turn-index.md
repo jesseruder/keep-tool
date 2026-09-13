@@ -23,14 +23,52 @@ The database is a derived cache: deleting it costs a backfill, nothing more.
 Every transcript file keeps a byte offset in `ingest_state`. A pass reads only
 the bytes appended since the last one, parses whole lines, and leaves a partial
 trailing line for next time. The cost is proportional to the delta, not to the
-file — on a synthetic 31 MB transcript, indexing one appended turn takes about
-1.2 ms (median of 20, max 3.7 ms), while a cold full pass runs at ~15 MB/s.
+file.
 
-If a file shrinks (`size < offset`) the session's rows are dropped and it is
-re-read from zero. Each file's pass runs inside one `BEGIN IMMEDIATE`
-transaction; with WAL and `busy_timeout=5000` the hooks, the daemon, and a
-backfill can run at once, and a pass that still cannot get the lock returns
-`{ skipped: 'busy' }` rather than failing its caller.
+A pass has three phases, and only the third holds the write lock:
+
+1. read `ingest_state` and decide what to read (no transaction — WAL readers
+   never block a writer);
+2. read and parse the delta into memory, capped at `maxBytes`;
+3. `BEGIN IMMEDIATE`, re-check that nobody else advanced the offset while we
+   parsed (if they did, this pass is simply dropped as `skipped: 'raced'`), then
+   insert and commit.
+
+Two knobs keep a caller from waiting:
+
+- `busyTimeoutMs` — how long to wait for the write lock. Hooks pass 250 ms and
+  treat `{ skipped: 'busy' }` as success: the delta is still on disk and the next
+  pass will take it. Backfill uses the 5 s default.
+- `maxBytes` — how much of a pending delta one pass may take. Hooks pass 512 KiB,
+  so a session with no prior index state cannot make an agent wait behind a
+  hundred-megabyte transcript. The result then carries `partial: true` and the
+  daemon (or the next hook) continues from the recorded offset. A single line
+  longer than the cap still completes, because dropping a 5 MB tool result would
+  lose a real record rather than defer it.
+
+Measured on a synthetic 31 MB transcript, with a fresh process per hook (which is
+how production pays it):
+
+| case | cost |
+| --- | --- |
+| one appended turn, session already indexed | median 22 ms, max 31 ms |
+| 5.2 MB backlog, no prior index state | 45 ms for one 512 KiB bite, `partial` |
+| first hook ever: new database, new directory | 150 ms |
+
+The first-hook figure is the one-time floor: creating the database and its schema
+(~28 ms) plus one `git` subprocess (~110 ms) to fold a worktree onto the main
+checkout its cards are filed under. That fold is cached in the index itself —
+`sessions.project` for the same `cwd` — so it runs at most once per directory
+across the whole fleet, not once per hook. An in-process memo could not do this:
+every hook is a new process.
+
+A file is reset (its session's rows dropped, re-read from zero) when it shrinks
+(`size < offset`), when `--force` is given, or when the SHA-1 of its head no
+longer matches the one recorded in `ingest_state`. The fingerprint covers the
+first 4 KiB, or the whole file if it is shorter, and the covered length is stored
+with the digest — otherwise every append to a short transcript would look like a
+replacement. It exists because a rewritten file can keep its size, so the offset
+alone cannot prove the bytes behind it are still the same bytes.
 
 Three paths feed it:
 
@@ -41,18 +79,26 @@ Three paths feed it:
    headless rollouts, which are indexed too.
 2. **The daemon** — `keep serve` runs a `turnIndexTick` every 30s over the live
    session ledger plus any reviewer marker, resolving each file from the caches
-   it already maintains. Bounded at 64 files per tick and round-robin, so a large
-   fleet is swept over several ticks instead of one long one. Health is recorded
-   under `turn-index`.
+   it already maintains. The bound is wall time and bytes, not file count, because
+   this runs on the daemon's event loop: a tick stops after 150 ms or 8 MiB,
+   whichever comes first, with any one file capped at 1 MiB so it cannot blow the
+   time budget on its own. The round-robin cursor survives the tick, so the next
+   one resumes where this one stopped. Files, bytes and milliseconds are recorded
+   in the `turn-index` health detail.
 3. **`keep turns backfill`** — walks every Claude project root (all configured
-   accounts, plus `subagents/` subdirectories) and every `~/.codex/sessions`
+   accounts, plus both `subagents/` layouts) and every `~/.codex/sessions`
    date directory, ingesting files whose mtime is at or after `--since`
-   (default: 14 days ago). Files are streamed, never read whole.
+   (default: 14 days ago). Files are streamed, never read whole; backfill is the
+   one caller that loops on `partial` until a file is finished.
 
 ## Schema
 
-`PRAGMA user_version` carries the schema version (currently 1); a future change
-bumps it and adds migration statements.
+`PRAGMA user_version` carries the schema version (currently 3). Each entry in
+`MIGRATIONS` brings the database from version n-1 to n and runs exactly once, so
+a fresh database is built by running all of them in order and an existing one
+only runs what it is missing. Version 2 adds `ingest_state.head_sha`; existing
+rows acquire a fingerprint on their next pass rather than being re-ingested.
+Version 3 adds the `sessions(cwd)` index the project cache reads.
 
 ### `sessions`
 
@@ -80,6 +126,27 @@ neither the opening prompt nor the Codex `session_meta`:
 - **Codex** — `thread_source: 'subagent'` or `codex.isChildSession(meta)` is
   `subagent`; `codex.isHeadlessSession(meta)` is `headless`; otherwise
   `interactive`.
+
+### Subagent transcripts
+
+Claude writes a subagent's conversation to its own file, at either
+`<project>/subagents/agent-<id>.jsonl` or
+`<project>/<parent-session>/subagents/agent-<id>.jsonl`. Both layouts exist on
+disk and both are walked.
+
+Those records are shaped to trap a naive reader: every one carries
+`isSidechain: true`, `sessionId` holds the **parent's** uuid, and the subagent's
+own identity is in `agentId`. So in a subagent file the two identities are read
+from opposite fields — `agentId` (or the filename with its `agent-` prefix
+stripped, which is the same value) becomes `sessions.id`, and `sessionId` becomes
+`parent_id`. Taking `sessionId` as the identity instead would file the subagent's
+messages under its parent, repoint the parent's row at the subagent's file,
+relabel the parent `subagent`, and — on a reset — delete the parent's rows. Every
+session-scoped delete is keyed on the subagent's own id for that last reason.
+
+Sidechain records are therefore skipped in a parent's own file, where they are
+someone else's conversation, and ingested in a subagent file, where they are the
+conversation.
 
 ### `messages`
 
@@ -138,6 +205,7 @@ keep turns search "<query>" [--since when] [--project p] [--agent claude|codex] 
 keep turns stats [--since when] [--json]
 keep turns ingest <file> [--agent claude|codex] [--force]
 keep turns backfill [--since when] [--roots dir,dir] [--force] [--json]
+keep turns prune [--older-than when] [--dry] [--json]
 ```
 
 `show` takes either a session id or a card id; a card resolves to every session
@@ -151,12 +219,34 @@ is a bare restart (`continue`, `keep going`, `go ahead`, `proceed`, `what's
 next`, `check again`, `done`, …). The nudge count is the number the turn watcher
 is meant to reduce, and the reason this index exists.
 
+## Retention
+
+The index is a derived cache over transcripts Claude and Codex keep forever, so
+without a cutoff it grows for the life of the machine. `keep turns prune` drops
+every indexed session whose last activity is older than **120 days** — its
+messages, its turns, its FTS rows, and its `ingest_state` entries — and the
+daemon calls it with that same default at most once a day, reporting what it
+dropped in the `turn-index` health detail. `--older-than` takes the same
+backward-looking `when` as `--since`, and `--dry` reports what would go without
+touching anything. The daemon's sweep is bounded (200 sessions, oldest first) so
+a first prune after a large backfill does not block its event loop; while the
+result says `more`, the next tick continues rather than waiting a day.
+
+A pruned file that is still on disk is simply re-indexed from zero the next time
+something ingests it, since its `ingest_state` row went with it. Sessions with no
+timestamp at all are never pruned: an unknown age is not an old age.
+`PRAGMA journal_size_limit` caps the WAL at 64 MiB so a backfill does not leave
+the write-ahead log at whatever size it grew to.
+
 ## Deliberate limits
 
 - Sidechain records written inline into a parent Claude transcript are skipped.
   They are a subagent's conversation, not the parent's turn, and counting them
   would inflate both message counts and tool counts. Subagent transcripts that
   Claude writes as their own file are indexed as `subagent` sessions.
+- A pass that loses the race — another hook or the daemon advanced the offset
+  while this one was parsing — is dropped rather than retried. The pass that won
+  indexed the same bytes, so there is nothing to redo.
 - Codex writes each user and assistant message twice (`event_msg` and
   `response_item`); only `response_item` rows are indexed, so counts stay honest.
   `event_msg` is read for `task_complete` alone.

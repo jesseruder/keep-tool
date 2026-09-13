@@ -91,6 +91,7 @@ keep turns search "<query>" [--since when] [--project p] [--agent claude|codex] 
 keep turns stats [--since when] [--json]                     # turns, human/[keep] openers, bare nudges
 keep turns ingest <file> [--agent claude|codex] [--force]    # index one transcript now
 keep turns backfill [--since when] [--roots dir,dir] [--json] # walk every transcript root (default 14 days)
+keep turns prune [--older-than when] [--dry] [--json]        # drop indexed sessions idle > 120 days
 
 keep review-queue [--limit n] [--min-score n] [--json]   # what deserves review now
 keep review-bundle <id> [--budget n] [--raw]             # evidence delta since last review
@@ -200,8 +201,12 @@ incrementally (byte offsets, so the cost is the delta, not the transcript);
 `keep turns backfill` seeds it from history. `show` accepts a session id or a
 card id, `search` is FTS5 over indexed messages, and `stats` reports turns,
 human and `[keep]` openers, and bare nudge openers per agent and session kind.
-`--since` reads backwards here: `+7d` means the last seven days. The database is
-a derived cache and can be deleted at any time. See [turn index](turn-index.md).
+`--since` reads backwards here: `+7d` means the last seven days. Hooks index at
+most 512 KiB per turn and wait at most 250 ms for the write lock, so a backlog is
+left to the daemon rather than made an agent's problem. Indexed sessions idle for
+more than 120 days are pruned by the daemon once a day, or by `keep turns prune`.
+The database is a derived cache and can be deleted at any time.
+See [turn index](turn-index.md).
 
 Mutations auto-commit. Manual terminal use also pushes best-effort in the background;
 Claude and Codex sessions leave commits local unless `KEEP_ALLOW_PUSH=1` is explicitly

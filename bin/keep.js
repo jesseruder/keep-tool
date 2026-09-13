@@ -5827,12 +5827,22 @@ function stopHook(input, agent = 'claude') {
 
 // ---------- turn index ----------
 
-// Bookkeeping must never fail an agent's turn: every error here is swallowed and
-// only KEEP_DEBUG makes it visible. The ingest itself is an offset delta, so the
-// cost is proportional to what the turn just appended, not to the transcript.
+// Bookkeeping must never fail an agent's turn, and must never make it wait:
+// every error here is swallowed (only KEEP_DEBUG makes it visible), the write
+// lock is given a quarter second rather than five, and a cold read of a session
+// with no prior index state is capped so the agent is not held behind a
+// hundred-megabyte transcript. Whatever the cap leaves is the daemon's problem.
+// Measured on a synthetic 31 MB transcript with no prior index state: 512 KiB is
+// ~22 ms typical and ~74 ms worst case, while a normal turn's delta is a few KiB
+// and costs under 2 ms. A session with a real backlog is drained by the daemon.
+const HOOK_INGEST_BUSY_MS = 250;
+const HOOK_INGEST_MAX_BYTES = 512 * 1024;
+
 function indexTurns(input, agent) {
   try {
-    require('./turn-index.js').ingestFile(input && input.transcript_path, { agent });
+    require('./turn-index.js').ingestFile(input && input.transcript_path, {
+      agent, busyTimeoutMs: HOOK_INGEST_BUSY_MS, maxBytes: HOOK_INGEST_MAX_BYTES,
+    });
   } catch (error) {
     if (process.env.KEEP_DEBUG) process.stderr.write(`keep: turn index failed: ${(error && error.message) || error}\n`);
   }
@@ -5970,11 +5980,25 @@ function turnsBackfill(argv) {
     + `${summary.turns} turns, ${summary.skipped} skipped in ${summary.seconds}s`);
 }
 
-const TURNS_SUBCOMMANDS = { show: turnsShow, search: turnsSearch, stats: turnsStats, ingest: turnsIngest, backfill: turnsBackfill };
+function turnsPrune(argv) {
+  const turnIndex = require('./turn-index.js');
+  const o = parseArgs(argv, { 'older-than': 'str', dry: 'bool', json: 'bool' });
+  const cutoff = turnsSince(o['older-than'], turnIndex.DEFAULT_PRUNE_DAYS);
+  const result = turnIndex.prune({ cutoff, dry: o.dry === true });
+  if (o.json) return console.log(JSON.stringify(result, null, 2));
+  console.log(`${o.dry ? 'would drop' : 'dropped'} ${result.sessions} sessions, ${result.messages} messages, `
+    + `${result.turns} turns, ${result.files} ingest records last active before `
+    + `${new Date(result.cutoff).toISOString().slice(0, 10)}`);
+}
+
+const TURNS_SUBCOMMANDS = {
+  show: turnsShow, search: turnsSearch, stats: turnsStats,
+  ingest: turnsIngest, backfill: turnsBackfill, prune: turnsPrune,
+};
 
 commands.turns = (argv) => {
   const sub = TURNS_SUBCOMMANDS[argv[0]];
-  if (!sub) die('usage: keep turns show|search|stats|ingest|backfill (see keep help turns)');
+  if (!sub) die('usage: keep turns show|search|stats|ingest|backfill|prune (see keep help turns)');
   return sub(argv.slice(1));
 };
 
@@ -7056,6 +7080,9 @@ ${stepUsage()}
   keep turns backfill [--since when] [--roots dir,dir] [--force] [--json]
                          # walk every Claude project root and Codex rollout dir (default: last 14 days)
                          # --since +7d means the last 7 days; a date means from that date
+  keep turns prune [--older-than when] [--dry] [--json]
+                         # drop indexed sessions last active before then (default: 120 days);
+                         # the daemon runs this once a day with the same default
 
   keep hook session-start|session-end|stop|notification|lifecycle|pre-bash|post-bash
                          # Claude context, enforcement, notifications and observation-only lifecycle records

@@ -14,8 +14,9 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 3;
 
 // Text caps. Transcripts contain whole files and 100k-line build logs; the index
 // exists to find and count turns, not to be a second copy of the corpus.
@@ -29,6 +30,14 @@ const CHUNK_BYTES = 1024 * 1024;
 const MAX_LINE_BYTES = 32 * 1024 * 1024; // a line longer than this is abandoned
 const DEFAULT_BACKFILL_DAYS = 14;
 const MARKER_TTL_MS = 30e3;
+
+// One pass never parses more than this, so no caller can be surprised by a
+// multi-hundred-megabyte cold read. Whatever is left comes back as partial.
+const DEFAULT_MAX_BYTES = 32 * 1024 * 1024;
+const DEFAULT_BUSY_TIMEOUT_MS = 5000;
+const HEAD_FINGERPRINT_BYTES = 4096;
+const JOURNAL_SIZE_LIMIT = 64 * 1024 * 1024;
+const DEFAULT_PRUNE_DAYS = 120;
 
 // A "nudge" is a turn Owner spent only to restart an agent that stopped early.
 // This is the metric the turn watcher is meant to drive down.
@@ -51,6 +60,7 @@ const SHELL_TOOLS = new Set(['Bash', 'BashOutput', 'shell', 'local_shell', 'cont
 
 let db = null;
 let dbPath = null;
+let busyTimeoutMs = null;
 let markerCache = { at: 0, spawned: new Set(), reviewer: new Set() };
 let liveCursor = 0;
 
@@ -115,12 +125,28 @@ const SCHEMA = [
    END`,
 ];
 
+// Each entry brings the database from version n-1 to n and runs exactly once, so
+// a fresh database is built by running all of them in order.
+const MIGRATIONS = [
+  { version: 1, statements: SCHEMA },
+  // A file can be replaced in place without ever shrinking (a rewritten rollout,
+  // a restored backup). A fingerprint of the head catches that; existing rows
+  // simply acquire one on their next pass rather than being re-ingested.
+  { version: 2, statements: ['ALTER TABLE ingest_state ADD COLUMN head_sha TEXT'] },
+  // Looking a directory up among sessions already indexed is what keeps the
+  // worktree-to-main-checkout git call from running once per hook process.
+  { version: 3, statements: ['CREATE INDEX IF NOT EXISTS sessions_cwd ON sessions(cwd)'] },
+];
+
 function migrate(handle) {
   const current = Number(handle.prepare('PRAGMA user_version').get().user_version || 0);
   if (current >= SCHEMA_VERSION) return;
   handle.exec('BEGIN IMMEDIATE');
   try {
-    for (const sql of SCHEMA) handle.exec(sql);
+    for (const step of MIGRATIONS) {
+      if (step.version <= current) continue;
+      for (const sql of step.statements) handle.exec(sql);
+    }
     handle.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     handle.exec('COMMIT');
   } catch (error) {
@@ -136,12 +162,24 @@ function open(file = databaseFile()) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const handle = new DatabaseSync(file);
   handle.exec('PRAGMA journal_mode = WAL');
-  handle.exec('PRAGMA busy_timeout = 5000');
   handle.exec('PRAGMA synchronous = NORMAL');
+  // Without a limit the WAL keeps whatever a backfill grew it to, forever.
+  handle.exec(`PRAGMA journal_size_limit = ${JOURNAL_SIZE_LIMIT}`);
+  busyTimeoutMs = null;
+  setBusyTimeout(handle, DEFAULT_BUSY_TIMEOUT_MS);
   migrate(handle);
   db = handle;
   dbPath = file;
   return db;
+}
+
+// A hook waits at most a quarter second for the lock; a backfill can afford five
+// seconds. The pragma is per connection, so it is re-applied when it changes.
+function setBusyTimeout(handle, ms) {
+  const value = Number.isFinite(ms) && ms >= 0 ? Math.floor(ms) : DEFAULT_BUSY_TIMEOUT_MS;
+  if (busyTimeoutMs === value) return;
+  handle.exec(`PRAGMA busy_timeout = ${value}`);
+  busyTimeoutMs = value;
 }
 
 function close() {
@@ -149,6 +187,7 @@ function close() {
   try { db.close(); } catch {}
   db = null;
   dbPath = null;
+  busyTimeoutMs = null;
 }
 
 // Backfill runs millions of inserts; re-preparing each one dominates the cost.
@@ -353,8 +392,12 @@ function opensTurn(kind) {
 
 // Reads whole lines from [from, to) and returns how many bytes of complete lines
 // were consumed, so a partial trailing line is simply re-read next pass.
-function readLines(file, from, to, onLine) {
+// maxBytes stops the read at the first chunk boundary past the budget; a single
+// line longer than the budget still completes, because dropping a 5 MB tool
+// result would lose a real record rather than defer it.
+function readLines(file, from, to, maxBytes, onLine) {
   if (to <= from) return 0;
+  const budget = Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : Infinity;
   const fd = fs.openSync(file, 'r');
   const chunk = Buffer.alloc(CHUNK_BYTES);
   let leftover = Buffer.alloc(0);
@@ -362,7 +405,10 @@ function readLines(file, from, to, onLine) {
   let position = from;
   try {
     while (position < to) {
-      const want = Math.min(CHUNK_BYTES, to - position);
+      // Never read past the budget in one go, or the cap would only bite at chunk
+      // granularity. consumed < budget here, so the read size stays positive and
+      // an over-long line keeps getting fed until its newline arrives.
+      const want = Math.min(CHUNK_BYTES, to - position, Math.max(budget - consumed, 1));
       const got = fs.readSync(fd, chunk, 0, want, position);
       if (!got) break;
       position += got;
@@ -379,6 +425,7 @@ function readLines(file, from, to, onLine) {
       }
       leftover = buffer.subarray(start);
       if (leftover.length > MAX_LINE_BYTES) { consumed += leftover.length; leftover = Buffer.alloc(0); }
+      if (consumed >= budget) break; // consumed is 0 until a line completes, so progress is guaranteed
     }
   } finally {
     fs.closeSync(fd);
@@ -390,9 +437,39 @@ function readLines(file, from, to, onLine) {
 
 function loadIngestState(handle, file) {
   const row = statement(handle, 'SELECT * FROM ingest_state WHERE file = ?').get(file);
-  return row || { file, session_id: null, offset: 0, size: 0, mtime: 0, seq: 0, open_turn: null };
+  return row || { file, session_id: null, offset: 0, size: 0, mtime: 0, seq: 0, open_turn: null, head_sha: null };
 }
 
+// Identity of the file's opening bytes. A transcript that is rewritten in place
+// rather than appended to keeps its size but not its head.
+//
+// The covered length is stored with the digest, because a file smaller than the
+// window grows its own head: without recording how many bytes were hashed, every
+// append to a short transcript would look like a replacement.
+function headFingerprint(file, bytes) {
+  const length = Math.min(Number(bytes) || 0, HEAD_FINGERPRINT_BYTES);
+  if (!length) return null;
+  const buffer = Buffer.alloc(length);
+  const fd = fs.openSync(file, 'r');
+  let got = 0;
+  try { got = fs.readSync(fd, buffer, 0, length, 0); } finally { fs.closeSync(fd); }
+  if (got < length) return null;
+  return `${length}:${crypto.createHash('sha1').update(buffer).digest('hex')}`;
+}
+
+// True when the bytes the stored fingerprint covered are no longer those bytes.
+function headReplaced(file, stat, stored) {
+  if (!stored) return false;
+  const length = Number(String(stored).split(':')[0]);
+  if (!Number.isFinite(length) || length <= 0) return false;
+  if (stat.size < length) return true;
+  let current = null;
+  try { current = headFingerprint(file, length); } catch {}
+  return current !== stored;
+}
+
+// Always scoped to one session id. A subagent file resetting must never reach
+// into its parent's rows, which is exactly what a wrong id here would do.
 function clearSession(handle, sessionId) {
   if (!sessionId) return;
   statement(handle, 'DELETE FROM messages WHERE session_id = ?').run(sessionId);
@@ -409,13 +486,35 @@ function latest(a, b) {
   return values.length ? Math.max(...values) : null;
 }
 
+// Folding a worktree onto its main checkout costs a git subprocess (~110 ms), and
+// a hook is a fresh process every turn, so an in-process memo alone would pay it
+// on every single Stop. The answer is the same for every session in a directory
+// and never changes, so the index itself is the cache: the call happens once per
+// directory across the whole fleet, not once per hook.
+function projectForCwd(handle, cwd) {
+  if (!cwd) return '';
+  const known = statement(handle,
+    "SELECT project FROM sessions WHERE cwd = ? AND project IS NOT NULL AND project != '' LIMIT 1").get(cwd);
+  if (known && known.project) return known.project;
+  // A directory already recorded as some session's project is a main checkout,
+  // so it canonicalizes to itself and needs no git call either.
+  const normalized = normalizeProject(cwd);
+  if (statement(handle, 'SELECT 1 AS hit FROM sessions WHERE project = ? LIMIT 1').get(normalized)) return normalized;
+  return canonicalProject(cwd);
+}
+
+function resolveSessionProject(session, existing) {
+  if (existing && existing.project) return existing.project;
+  return (typeof session.project === 'function' ? session.project() : session.project) || '';
+}
+
 function upsertSession(handle, session) {
   const existing = statement(handle, 'SELECT * FROM sessions WHERE id = ?').get(session.id);
   if (!existing) {
     statement(handle, `INSERT INTO sessions
       (id, agent, kind, cwd, project, account_id, file, parent_id, started_at, last_at, title, card_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-      session.id, session.agent, session.kind, session.cwd || '', session.project || '',
+      session.id, session.agent, session.kind, session.cwd || '', resolveSessionProject(session, null),
       session.accountId || null, session.file, session.parentId || null,
       session.startedAt == null ? null : session.startedAt, session.lastAt == null ? null : session.lastAt,
       session.title || null, session.cardId || null);
@@ -424,7 +523,7 @@ function upsertSession(handle, session) {
   statement(handle, `UPDATE sessions SET agent = ?, kind = ?, cwd = ?, project = ?, account_id = ?, file = ?,
       parent_id = ?, started_at = ?, last_at = ?, title = ?, card_id = ? WHERE id = ?`).run(
     session.agent, session.kind, session.cwd || existing.cwd || '',
-    session.project || existing.project || '', session.accountId || existing.account_id || null,
+    resolveSessionProject(session, existing), session.accountId || existing.account_id || null,
     session.file, session.parentId || existing.parent_id || null,
     earliest(existing.started_at, session.startedAt), latest(existing.last_at, session.lastAt),
     session.title || existing.title || null, session.cardId || existing.card_id || null, session.id);
@@ -445,11 +544,14 @@ function insertMessage(handle, row) {
   }
 }
 
-function openTurnRow(handle, sessionId, startedAt, openerKind, openerText) {
+function lastTurnNumber(handle, sessionId) {
   const last = statement(handle, 'SELECT MAX(n) AS n FROM turns WHERE session_id = ?').get(sessionId);
-  const n = Number(last && last.n ? last.n : 0) + 1;
+  return Number(last && last.n ? last.n : 0);
+}
+
+function insertTurn(handle, sessionId, n, turn) {
   statement(handle, `INSERT INTO turns (session_id, n, started_at, opener_kind, opener_text, tool_count, ended)
-    VALUES (?, ?, ?, ?, ?, 0, 0)`).run(sessionId, n, startedAt, openerKind, cap(openerText, OPENER_CAP));
+    VALUES (?, ?, ?, ?, ?, 0, 0)`).run(sessionId, n, turn.startedAt, turn.openerKind, turn.openerText);
   return statement(handle, 'SELECT id FROM turns WHERE session_id = ? AND n = ?').get(sessionId, n).id;
 }
 
@@ -510,17 +612,23 @@ function codexSessionKind(meta, sessionId) {
   return 'interactive';
 }
 
-// One parser state machine, fed line by line, shared by both agents. It emits
-// message rows and opens/closes turns; everything durable goes straight to SQLite.
+// One parser state machine, fed line by line, shared by both agents. It writes
+// nothing: rows and turns accumulate in memory so the SQLite transaction that
+// applies them is as short as possible, which is what keeps a Stop hook cheap.
 function createIngestContext(handle, file, agent, state, options) {
   return {
     handle,
     file,
     agent,
+    subagent: isSubagentFile(file) && agent === 'claude',
     sessionId: state.session_id || null,
     idFromName: false,
     seq: Number(state.seq || 0),
-    turnId: state.open_turn || null,
+    // -1 means the turn already open from a previous pass (state.open_turn).
+    turnRef: -1,
+    carried: { ended: false, stopReason: null, touched: false },
+    rows: [],
+    newTurns: [],
     cwd: '',
     parentId: null,
     title: null,
@@ -532,10 +640,16 @@ function createIngestContext(handle, file, agent, state, options) {
     cardId: options.cardId || null,
     messages: 0,
     turns: 0,
-    touchedTurns: new Set(),
   };
 }
 
+// Claude files subagent transcripts as <project>/subagents/agent-<id>.jsonl and
+// <project>/<parent-session>/subagents/agent-<id>.jsonl.
+function isSubagentFile(file) {
+  return path.resolve(file).split(path.sep).includes('subagents');
+}
+
+// Runs inside the apply transaction, where the prior session row is visible.
 function ensureSession(context) {
   if (!context.sessionId) return false;
   if (context.kind) return true;
@@ -550,39 +664,55 @@ function ensureSession(context) {
 }
 
 function emit(context, row) {
-  if (!context.sessionId) return;
-  row.sessionId = context.sessionId;
   row.seq = context.seq++;
-  row.turnId = context.turnId;
-  insertMessage(context.handle, row);
+  row.turnRef = context.turnRef;
+  if (context.turnRef === -1) context.carried.touched = true;
+  context.rows.push(row);
   context.messages += 1;
-  if (row.turnId) context.touchedTurns.add(row.turnId);
   if (Number.isFinite(row.ts)) {
     context.startedAt = context.startedAt == null ? row.ts : Math.min(context.startedAt, row.ts);
     context.lastAt = context.lastAt == null ? row.ts : Math.max(context.lastAt, row.ts);
   }
 }
 
+function currentTurn(context) {
+  return context.turnRef === -1 ? context.carried : context.newTurns[context.turnRef];
+}
+
 function startTurn(context, ts, kind, text) {
-  if (context.turnId) {
-    refreshTurn(context.handle, context.turnId, { ended: true });
-    context.touchedTurns.delete(context.turnId);
-  }
-  context.turnId = openTurnRow(context.handle, context.sessionId, ts, kind, text);
+  const previous = currentTurn(context);
+  if (previous) previous.ended = true; // the next opener closes whatever was open
+  context.newTurns.push({
+    startedAt: ts, openerKind: kind, openerText: cap(text, OPENER_CAP), ended: false, stopReason: null,
+  });
+  context.turnRef = context.newTurns.length - 1;
   context.turns += 1;
-  context.touchedTurns.add(context.turnId);
 }
 
 function endTurn(context, stopReason) {
-  if (!context.turnId) return;
-  refreshTurn(context.handle, context.turnId, { ended: true, stopReason });
-  context.touchedTurns.delete(context.turnId);
+  const turn = currentTurn(context);
+  if (!turn) return;
+  turn.ended = true;
+  turn.stopReason = stopReason || turn.stopReason;
+  if (context.turnRef === -1) context.carried.touched = true;
 }
 
 function handleClaudeLine(context, record) {
-  // The records' own id outranks the filename guess, which is only there so a
-  // resumed pass that starts past the first line still knows whose rows these are.
-  if (typeof record.sessionId === 'string' && record.sessionId && (!context.sessionId || context.idFromName)) {
+  // In a subagent file every record carries the PARENT's uuid in sessionId and
+  // the subagent's own identity in agentId. Taking sessionId here would file the
+  // subagent's messages under its parent and, worse, point the parent's row at
+  // the subagent's file — so the two identities are read from opposite fields.
+  if (context.subagent) {
+    if (typeof record.agentId === 'string' && record.agentId && (!context.sessionId || context.idFromName)) {
+      context.sessionId = record.agentId;
+      context.idFromName = false;
+    }
+    if (typeof record.sessionId === 'string' && record.sessionId && !context.parentId) {
+      context.parentId = record.sessionId;
+    }
+  } else if (typeof record.sessionId === 'string' && record.sessionId && (!context.sessionId || context.idFromName)) {
+    // The records' own id outranks the filename guess, which is only there so a
+    // resumed pass that starts past the first line still knows whose rows these are.
     context.sessionId = record.sessionId;
     context.idFromName = false;
   }
@@ -590,10 +720,10 @@ function handleClaudeLine(context, record) {
   if (record.type === 'summary' && typeof record.summary === 'string' && !context.title) context.title = record.summary;
   if (record.type === 'ai-title' && typeof record.title === 'string' && !context.title) context.title = record.title;
   if (record.type !== 'user' && record.type !== 'assistant') return;
-  // Sidechain records are a subagent's conversation written into the parent's
-  // file. They are not the parent's turns, and Keep indexes subagent transcripts
-  // only where Claude writes them as their own file.
-  if (record.isSidechain) return;
+  // In a parent's own file a sidechain record is a subagent's conversation, not
+  // the parent's turn. In a subagent file every record is sidechain and those
+  // records ARE the conversation.
+  if (record.isSidechain && !context.subagent) return;
   const ts = tsOf(record);
   const message = record.message || {};
   const content = message.content;
@@ -602,7 +732,6 @@ function handleClaudeLine(context, record) {
     const blocks = Array.isArray(content) ? content : [];
     const results = blocks.filter((block) => block && block.type === 'tool_result');
     if (results.length) {
-      if (!ensureSession(context)) return;
       for (const block of results) {
         emit(context, {
           ts, role: 'tool', kind: 'tool_result', text: cap(toolResultText(block), TOOL_CAP),
@@ -615,13 +744,11 @@ function handleClaudeLine(context, record) {
     if (!text) return;
     const kind = claudeUserKind(record, text);
     if (kind === 'human' && !context.firstHuman) context.firstHuman = text;
-    if (!ensureSession(context)) return;
     if (opensTurn(kind)) startTurn(context, ts, kind, text);
     emit(context, { ts, role: 'user', kind, text: cap(text, TEXT_CAP) });
     return;
   }
 
-  if (!ensureSession(context)) return;
   const blocks = Array.isArray(content) ? content : [];
   const usage = message.usage || {};
   const tokensIn = Number.isFinite(usage.input_tokens) ? usage.input_tokens : null;
@@ -671,7 +798,7 @@ function handleCodexLine(context, record) {
     // Codex writes each user and assistant message twice (event_msg and
     // response_item); indexing only response_item keeps counts honest.
     if (payload.type === 'task_complete' || payload.type === 'turn_aborted') {
-      if (ensureSession(context)) endTurn(context, payload.type === 'turn_aborted' ? 'aborted' : 'task_complete');
+      endTurn(context, payload.type === 'turn_aborted' ? 'aborted' : 'task_complete');
     }
     return;
   }
@@ -682,19 +809,17 @@ function handleCodexLine(context, record) {
     if (!text) return;
     const kind = codexUserKind(text);
     if (kind === 'human' && !context.firstHuman) context.firstHuman = text;
-    if (!ensureSession(context)) return;
     if (opensTurn(kind)) startTurn(context, ts, kind, text);
     emit(context, { ts, role: 'user', kind, text: cap(text, TEXT_CAP) });
     return;
   }
   if (payload.type === 'agent_message' || (payload.type === 'message' && payload.role === 'assistant')) {
     const text = codexText(payload).trim();
-    if (!text || !ensureSession(context)) return;
+    if (!text) return;
     emit(context, { ts, role: 'assistant', kind: 'text', text: cap(text, TEXT_CAP) });
     return;
   }
   if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
-    if (!ensureSession(context)) return;
     const name = String(payload.name || '');
     const { input, raw } = parseToolInput(payload);
     const command = SHELL_TOOLS.has(name) ? cap(shellCommand(input), COMMAND_CAP) : null;
@@ -706,7 +831,6 @@ function handleCodexLine(context, record) {
     return;
   }
   if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
-    if (!ensureSession(context)) return;
     const output = payload.output;
     const text = typeof output === 'string' ? output : JSON.stringify(output == null ? '' : output);
     emit(context, {
@@ -716,6 +840,9 @@ function handleCodexLine(context, record) {
   }
 }
 
+// One pass over one file: at most `maxBytes` of appended transcript, waiting at
+// most `busyTimeoutMs` for the write lock. `partial: true` means there is more
+// to read and some later pass (the daemon tick, the next hook) should come back.
 function ingestFile(file, options = {}) {
   if (!file || typeof file !== 'string') return { ok: false, skipped: 'no-file' };
   let stat;
@@ -728,7 +855,8 @@ function ingestFile(file, options = {}) {
     return { ok: false, skipped: 'open-failed' };
   }
   try {
-    return ingestWithinTransaction(handle, file, agent, stat, options);
+    setBusyTimeout(handle, options.busyTimeoutMs);
+    return ingestPass(handle, file, agent, stat, options);
   } catch (error) {
     try { handle.exec('ROLLBACK'); } catch {}
     if (isBusy(error)) { debug(`busy: ${file}`); return { ok: false, skipped: 'busy' }; }
@@ -737,24 +865,30 @@ function ingestFile(file, options = {}) {
   }
 }
 
-function ingestWithinTransaction(handle, file, agent, stat, options) {
-  handle.exec('BEGIN IMMEDIATE');
-  let state = loadIngestState(handle, file);
-  let from = Number(state.offset || 0);
-  const truncated = stat.size < from;
-  if (options.force || truncated) {
-    clearSession(handle, state.session_id);
-    statement(handle, 'DELETE FROM ingest_state WHERE file = ?').run(file);
-    state = loadIngestState(handle, file);
-    from = 0;
-  }
-  if (from === stat.size && Number(state.mtime || 0) === Math.floor(stat.mtimeMs)) {
-    handle.exec('COMMIT');
-    return { ok: true, skipped: 'unchanged', file, sessionId: state.session_id, messages: 0, turns: 0 };
+function emptyIngestState(file) {
+  return { file, session_id: null, offset: 0, size: 0, mtime: 0, seq: 0, open_turn: null, head_sha: null };
+}
+
+function ingestPass(handle, file, agent, stat, options) {
+  // Phase 1: decide what to read. Reads outside a transaction; WAL readers never
+  // block a writer, and nothing here is worth holding the write lock for.
+  const state = loadIngestState(handle, file);
+  const expected = { offset: Number(state.offset || 0), seq: Number(state.seq || 0) };
+  let headSha = null;
+  try { headSha = headFingerprint(file, stat.size); } catch {}
+  // A rewritten file can keep its size, so the offset alone cannot prove the
+  // bytes behind it are still the same bytes.
+  const replaced = headReplaced(file, stat, state.head_sha);
+  const reset = options.force === true || stat.size < expected.offset || replaced;
+  const from = reset ? 0 : expected.offset;
+  if (!reset && from === stat.size && Number(state.mtime || 0) === Math.floor(stat.mtimeMs)
+      && state.head_sha === headSha) {
+    return { ok: true, skipped: 'unchanged', file, sessionId: state.session_id, messages: 0, turns: 0, bytes: 0 };
   }
 
-  const context = createIngestContext(handle, file, agent, state, options);
-  const handler = agent === 'codex' ? handleCodexLine : handleClaudeLine;
+  // Phase 2: read and parse into memory. The expensive part, and no lock is held.
+  const maxBytes = Number.isFinite(options.maxBytes) && options.maxBytes > 0 ? options.maxBytes : DEFAULT_MAX_BYTES;
+  const context = createIngestContext(handle, file, agent, reset ? emptyIngestState(file) : state, options);
   // A Codex rollout's identity lives only in its first line; a resumed pass must
   // not lose it, so the ingest state carries the session id forward, and the
   // filename stands in until a record says otherwise.
@@ -762,35 +896,82 @@ function ingestWithinTransaction(handle, file, agent, stat, options) {
     context.sessionId = sessionIdFromName(file, agent);
     context.idFromName = Boolean(context.sessionId);
   }
-  const consumed = readLines(file, from, stat.size, (line) => {
+  const handler = agent === 'codex' ? handleCodexLine : handleClaudeLine;
+  const consumed = readLines(file, from, stat.size, maxBytes, (line) => {
     let record;
     try { record = JSON.parse(line); } catch { return; }
     if (!record || typeof record !== 'object') return;
     try { handler(context, record); } catch (error) { debug(`record skipped: ${error.message}`); }
   });
+  const partial = from + consumed < stat.size;
+  // Advancing past rows we cannot file would lose them permanently.
+  if (!context.sessionId && context.rows.length) return { ok: false, skipped: 'no-session', file };
 
-  if (context.sessionId) {
-    ensureSession(context);
-    upsertSession(handle, {
-      id: context.sessionId, agent, kind: context.kind || 'interactive', cwd: context.cwd,
-      project: canonicalProject(context.cwd), accountId: accountIdFor(file), file,
-      parentId: context.parentId, startedAt: context.startedAt, lastAt: context.lastAt,
-      title: context.title, cardId: context.cardId,
-    });
-    for (const turnId of context.touchedTurns) refreshTurn(handle, turnId);
+  // Phase 3: write. Only inserts and updates happen under the lock.
+  return applyPass(handle, file, agent, stat, {
+    context, expected, reset, from, consumed, partial, headSha,
+    carriedTurnId: reset ? null : state.open_turn || null,
+  });
+}
+
+function applyPass(handle, file, agent, stat, plan) {
+  const { context, expected, reset, from, consumed, partial, headSha } = plan;
+  handle.exec('BEGIN IMMEDIATE');
+  try {
+    // Another hook or the daemon tick may have ingested this same delta while we
+    // were parsing it. Its pass is as good as ours; ours is simply dropped.
+    const current = loadIngestState(handle, file);
+    if (Number(current.offset || 0) !== expected.offset || Number(current.seq || 0) !== expected.seq) {
+      handle.exec('ROLLBACK');
+      return { ok: false, skipped: 'raced', file };
+    }
+    if (reset) clearSession(handle, current.session_id);
+
+    if (context.sessionId) {
+      ensureSession(context);
+      upsertSession(handle, {
+        id: context.sessionId, agent, kind: context.kind || 'interactive', cwd: context.cwd,
+        project: () => projectForCwd(handle, context.cwd), accountId: accountIdFor(file), file,
+        parentId: context.parentId, startedAt: context.startedAt, lastAt: context.lastAt,
+        title: context.title, cardId: context.cardId,
+      });
+    }
+
+    let carriedTurnId = plan.carriedTurnId;
+    if (carriedTurnId) {
+      const row = statement(handle, 'SELECT session_id FROM turns WHERE id = ?').get(carriedTurnId);
+      if (!row || row.session_id !== context.sessionId) carriedTurnId = null;
+    }
+    let n = context.sessionId ? lastTurnNumber(handle, context.sessionId) : 0;
+    const turnIds = context.newTurns.map((turn) => insertTurn(handle, context.sessionId, ++n, turn));
+    const turnIdFor = (ref) => (ref === -1 ? carriedTurnId : turnIds[ref]);
+
+    for (const row of context.rows) {
+      insertMessage(handle, { ...row, sessionId: context.sessionId, turnId: turnIdFor(row.turnRef) });
+    }
+    if (carriedTurnId && (context.carried.touched || context.carried.ended)) {
+      refreshTurn(handle, carriedTurnId, { ended: context.carried.ended, stopReason: context.carried.stopReason });
+    }
+    turnIds.forEach((id, index) => refreshTurn(handle, id, {
+      ended: context.newTurns[index].ended, stopReason: context.newTurns[index].stopReason,
+    }));
+
+    statement(handle, `INSERT INTO ingest_state (file, session_id, "offset", size, mtime, seq, open_turn, head_sha, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(file) DO UPDATE SET session_id = excluded.session_id, "offset" = excluded."offset",
+        size = excluded.size, mtime = excluded.mtime, seq = excluded.seq,
+        open_turn = excluded.open_turn, head_sha = excluded.head_sha, updated_at = excluded.updated_at`).run(
+      file, context.sessionId, from + consumed, stat.size, Math.floor(stat.mtimeMs),
+      context.seq, turnIdFor(context.turnRef), headSha, Date.now());
+    handle.exec('COMMIT');
+  } catch (error) {
+    try { handle.exec('ROLLBACK'); } catch {}
+    throw error;
   }
-
-  statement(handle, `INSERT INTO ingest_state (file, session_id, "offset", size, mtime, seq, open_turn, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(file) DO UPDATE SET session_id = excluded.session_id, "offset" = excluded."offset",
-      size = excluded.size, mtime = excluded.mtime, seq = excluded.seq,
-      open_turn = excluded.open_turn, updated_at = excluded.updated_at`).run(
-    file, context.sessionId, from + consumed, stat.size, Math.floor(stat.mtimeMs),
-    context.seq, context.turnId, Date.now());
-  handle.exec('COMMIT');
   return {
     ok: true, file, agent, sessionId: context.sessionId, kind: context.kind,
-    messages: context.messages, turns: context.turns, bytes: consumed,
+    messages: context.messages, turns: context.turns, bytes: consumed, partial,
+    ...(reset ? { reset: true } : {}),
   };
 }
 
@@ -798,6 +979,12 @@ function ingestWithinTransaction(handle, file, agent, stat, options) {
 // rollout-<stamp>-<thread-id>.jsonl, so an id is available before the first line.
 function sessionIdFromName(file, agent) {
   const base = path.basename(file, '.jsonl');
+  // agent-<id>.jsonl names a subagent by its agentId; strip the prefix so the
+  // filename and the records' own agentId field resolve to the same identity.
+  if (agent === 'claude' && isSubagentFile(file) && base.startsWith('agent-')) {
+    const id = base.slice('agent-'.length);
+    return /^[A-Za-z0-9_-]+$/.test(id) ? id : null;
+  }
   if (agent === 'claude') return /^[A-Za-z0-9_-]+$/.test(base) ? base : null;
   const match = base.match(/-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
   return match ? match[1] : null;
@@ -815,32 +1002,59 @@ function resolveSessionFile(session) {
   } catch { return null; }
 }
 
-// The daemon sweeps live sessions on a timer. Bounded and round-robin so one
-// tick never walks the whole fleet, and never throws into the daemon loop.
+// The daemon sweeps live sessions on a timer. The bound that matters is time and
+// bytes, not file count: one tick of a busy fleet must not become a long
+// synchronous stall in the daemon's event loop. The round-robin cursor survives
+// the tick, so whatever the budget cut off is where the next tick starts.
 function ingestSessionsFromLiveState(sessions, options = {}) {
   const list = Array.isArray(sessions) ? sessions.filter(Boolean) : [];
-  const limit = Number.isInteger(options.limit) && options.limit > 0 ? options.limit : 64;
+  const budgetMs = Number.isFinite(options.budgetMs) && options.budgetMs >= 0 ? options.budgetMs : 150;
+  const byteBudget = Number.isFinite(options.maxBytes) && options.maxBytes > 0 ? options.maxBytes : 8 * 1024 * 1024;
+  const busy = Number.isFinite(options.busyTimeoutMs) ? options.busyTimeoutMs : 250;
+  // The clock can only be checked between files, so one file must not be able to
+  // blow the wall-clock budget on its own: ~1 MiB is under 100 ms of parsing.
+  const perFile = Number.isFinite(options.perFileMaxBytes) && options.perFileMaxBytes > 0
+    ? options.perFileMaxBytes : 1024 * 1024;
+  const startedAt = Date.now();
   const results = [];
-  if (!list.length) return { ingested: 0, skipped: 0, results };
-  const start = liveCursor % list.length;
   let skipped = 0;
-  for (let i = 0; i < Math.min(limit, list.length); i += 1) {
-    const session = list[(start + i) % list.length];
+  let bytes = 0;
+  let files = 0;
+  let partial = false;
+  if (!list.length) return { ingested: 0, skipped: 0, files: 0, bytes: 0, ms: 0, partial: false, results };
+  const start = liveCursor % list.length;
+  let index = 0;
+  for (; index < list.length; index += 1) {
+    if (Date.now() - startedAt >= budgetMs || bytes >= byteBudget) { partial = true; break; }
+    const session = list[(start + index) % list.length];
     const file = resolveSessionFile(session);
     if (!file) { skipped += 1; continue; }
     const agent = session.agent || (session.kind === 'codex' ? 'codex' : 'claude');
-    const result = ingestFile(file, { agent, cardId: session.cardId || null });
+    const result = ingestFile(file, {
+      agent, cardId: session.cardId || null, busyTimeoutMs: busy,
+      maxBytes: Math.min(Math.max(byteBudget - bytes, 64 * 1024), perFile),
+    });
+    files += 1;
+    bytes += result.bytes || 0;
     if (!result.ok) skipped += 1;
+    if (result.partial) partial = true;
     results.push(result);
   }
-  liveCursor = (start + Math.min(limit, list.length)) % list.length;
-  return { ingested: results.filter((row) => row.ok).length, skipped, results };
+  liveCursor = (start + index) % list.length;
+  return {
+    ingested: results.filter((row) => row.ok).length, skipped, files, bytes,
+    ms: Date.now() - startedAt, partial, results,
+  };
 }
 
 function claudeBackfillDirs() {
   const dirs = [];
   let roots = [];
   try { roots = require('./accounts.js').projectRoots().map((entry) => entry.root); } catch {}
+  const addSubagents = (dir) => {
+    const nested = path.join(dir, 'subagents');
+    try { if (fs.statSync(nested).isDirectory()) dirs.push(nested); } catch {}
+  };
   for (const root of roots) {
     let names;
     try { names = fs.readdirSync(root, { withFileTypes: true }); } catch { continue; }
@@ -848,9 +1062,15 @@ function claudeBackfillDirs() {
       if (!entry.isDirectory()) continue;
       const dir = path.join(root, entry.name);
       dirs.push(dir);
-      // Newer Claude builds file subagent transcripts in their own subdirectory.
-      const nested = path.join(dir, 'subagents');
-      try { if (fs.statSync(nested).isDirectory()) dirs.push(nested); } catch {}
+      // Claude files subagents either directly under the project
+      // (<project>/subagents) or under the parent session
+      // (<project>/<parent-session>/subagents); both shapes exist on disk.
+      addSubagents(dir);
+      let children;
+      try { children = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+      for (const child of children) {
+        if (child.isDirectory() && child.name !== 'subagents') addSubagents(path.join(dir, child.name));
+      }
     }
   }
   return dirs;
@@ -897,8 +1117,17 @@ function backfill(options = {}) {
       try { stat = fs.statSync(file); } catch { continue; }
       if (stat.mtimeMs < since) continue;
       const agent = target.agent || agentForFile(file);
-      const result = ingestFile(file, { agent, force: options.force === true });
+      // A pass is byte-capped, so a 300 MB rollout takes several; backfill is the
+      // one caller that should finish a file before moving on.
+      let result = ingestFile(file, { agent, force: options.force === true });
       summary.files += 1;
+      let guard = 0;
+      while (result.ok && result.partial && (guard += 1) < 10000) {
+        if (result.sessionId) summary.sessions.add(result.sessionId);
+        summary.messages += result.messages || 0;
+        summary.turns += result.turns || 0;
+        result = ingestFile(file, { agent });
+      }
       if (result.ok) {
         if (result.sessionId) summary.sessions.add(result.sessionId);
         summary.messages += result.messages || 0;
@@ -909,6 +1138,51 @@ function backfill(options = {}) {
   }
   summary.seconds = Math.round((Date.now() - startedAt) / 100) / 10;
   return { ...summary, sessions: summary.sessions.size };
+}
+
+// ---------- retention ----------
+
+// The index is a derived cache over transcripts Claude and Codex keep forever;
+// without a cutoff it grows for the life of the machine. Sessions with no
+// timestamp at all are never pruned — an unknown age is not an old age.
+function prune(options = {}) {
+  const handle = open(options.db || databaseFile());
+  const olderThanMs = Number.isFinite(options.olderThanMs) && options.olderThanMs > 0
+    ? options.olderThanMs : DEFAULT_PRUNE_DAYS * 86400e3;
+  const cutoff = Number.isFinite(options.cutoff) ? options.cutoff : Date.now() - olderThanMs;
+  // The daemon prunes on its event loop, so a first sweep after a big backfill
+  // must not delete tens of thousands of sessions in one go; it passes a limit
+  // and comes back next tick while `more` is set. Oldest first.
+  const limit = Number.isInteger(options.limit) && options.limit > 0 ? options.limit : -1;
+  const doomed = statement(handle,
+    `SELECT id FROM sessions WHERE COALESCE(last_at, started_at) IS NOT NULL
+       AND COALESCE(last_at, started_at) < ?
+     ORDER BY COALESCE(last_at, started_at) LIMIT ?`).all(cutoff, limit).map((row) => row.id);
+  const counts = { cutoff, sessions: doomed.length, messages: 0, turns: 0, files: 0, more: limit > 0 && doomed.length === limit };
+  if (!doomed.length) return counts;
+  const countIn = (sql, id) => Number(statement(handle, sql).get(id).n || 0);
+  for (const id of doomed) {
+    counts.messages += countIn('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?', id);
+    counts.turns += countIn('SELECT COUNT(*) AS n FROM turns WHERE session_id = ?', id);
+    counts.files += countIn('SELECT COUNT(*) AS n FROM ingest_state WHERE session_id = ?', id);
+  }
+  if (options.dry === true) return { ...counts, dry: true };
+  setBusyTimeout(handle, options.busyTimeoutMs);
+  handle.exec('BEGIN IMMEDIATE');
+  try {
+    for (const id of doomed) {
+      // The messages delete fires the FTS delete trigger, so the shadow table
+      // shrinks with the real one.
+      clearSession(handle, id);
+      statement(handle, 'DELETE FROM ingest_state WHERE session_id = ?').run(id);
+      statement(handle, 'DELETE FROM sessions WHERE id = ?').run(id);
+    }
+    handle.exec('COMMIT');
+  } catch (error) {
+    try { handle.exec('ROLLBACK'); } catch {}
+    throw error;
+  }
+  return counts;
 }
 
 // ---------- queries ----------
@@ -994,7 +1268,7 @@ function stats(options = {}) {
 }
 
 module.exports = {
-  open, close, databaseFile, ingestFile, ingestSessionsFromLiveState, backfill,
+  open, close, databaseFile, ingestFile, ingestSessionsFromLiveState, backfill, prune,
   search, turnsForSession, sessionRow, stats, isNudge, normalizeProject,
-  SCHEMA_VERSION, TEXT_CAP, TOOL_CAP, NUDGE_RE,
+  SCHEMA_VERSION, TEXT_CAP, TOOL_CAP, NUDGE_RE, DEFAULT_PRUNE_DAYS,
 };
