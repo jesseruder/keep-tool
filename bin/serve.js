@@ -4908,35 +4908,26 @@ function writeLiveSessionLedger(ledger, deps = {}) {
 // session rather than a project-tree walk.
 function liveTurnIndexSessions(deps = {}) {
   const ledger = readLiveSessionLedger(deps);
-  const now = (deps.now || Date.now)();
-  const liveCutoff = now - (deps.liveWindowMs ?? 10 * 60e3);
   const wanted = new Map();
   for (const [id, entry] of Object.entries(ledger.sessions || {})) {
-    if (!entry || !/^[A-Za-z0-9_-]+$/.test(id)
-        || !Number.isFinite(Number(entry.lastSeenAlive)) || Number(entry.lastSeenAlive) < liveCutoff) continue;
+    if (!entry || !/^[A-Za-z0-9_-]+$/.test(id)) continue;
     wanted.set(id, { id, agent: entry.agent === 'codex' ? 'codex' : 'claude' });
   }
   // A reviewer may be idle enough to have left the live ledger, and its turns are
   // exactly the ones the fleet wants measured.
   try {
-    const reviewerIds = deps.reviewerIds || fs.readdirSync(path.join(keep.ROOT, '.keep', 'reviewer'));
-    for (const id of reviewerIds) {
+    for (const id of fs.readdirSync(path.join(keep.ROOT, '.keep', 'reviewer'))) {
       if (/^[A-Za-z0-9_-]+$/.test(id) && !wanted.has(id)) wanted.set(id, { id, agent: 'claude' });
     }
   } catch {}
   if (!wanted.size) return [];
   const claudeFiles = new Map();
-  try {
-    const rows = deps.claudeTranscriptRows || claudeTranscriptIndex.scan();
-    for (const row of rows) claudeFiles.set(row.id, row.file);
-  } catch {}
+  try { for (const row of claudeTranscriptIndex.scan()) claudeFiles.set(row.id, row.file); } catch {}
   const sessions = [];
   for (const entry of wanted.values()) {
     let file = null;
     if (entry.agent === 'codex') {
-      try {
-        file = (deps.codexRolloutFile || ((id) => codex.rolloutFileFor(id) || codex.findRolloutFile(id)))(entry.id);
-      } catch {}
+      try { file = codex.rolloutFileFor(entry.id) || codex.findRolloutFile(entry.id); } catch {}
     } else file = claudeFiles.get(entry.id) || null;
     if (file) sessions.push({ ...entry, file });
   }
@@ -4969,22 +4960,7 @@ async function liveSessionTick(deps = {}) {
     };
     const records = paneRecordEntries(deps);
     let scanned = [];
-    if (deps.scanSessions) {
-      try { scanned = await deps.scanSessions(); } catch {}
-    } else {
-      // This tick starts during daemon boot. Resolve only processes we just
-      // observed instead of synchronously parsing the entire recent fleet on
-      // the request loop while the dashboard worker performs the same scan.
-      for (const [id, entry] of live) {
-        try {
-          const lookup = entry.agent === 'codex'
-            ? deps.codexSessionFor || codex.sessionFor
-            : deps.claudeSessionFor || claudeSessionFor;
-          const session = lookup(id);
-          if (session) scanned.push(session);
-        } catch {}
-      }
-    }
+    try { scanned = await (deps.scanSessions || scanSessions)(); } catch {}
     const scannedById = new Map(scanned.map((session) => [session.id, session]));
     const exitedIds = new Set(scanned.filter((session) => session && session.exited).map((session) => session.id));
     for (const id of exitedIds) delete ledger.sessions[id];

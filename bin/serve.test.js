@@ -46,7 +46,6 @@ const {
   shutdownSettingsRepair,
   liveSessionPids,
   liveSessionTick,
-  liveTurnIndexSessions,
   restorePlan,
   sessionProjectFromTranscript,
   readClaudeSettingsModel,
@@ -3684,55 +3683,6 @@ test('live session tick merges direct host bindings without pane-record backfill
     pid: 42, agent: 'codex', project: '/host-project', source: 'host', primary: true, lastSeenAlive: 9000,
   });
   assert.deepEqual(host.calls.map((call) => call.type), ['list']);
-});
-
-test('live session tick resolves only observed processes instead of scanning recent fleet history', async () => {
-  const now = 9000;
-  const lookedUp = [];
-  let written;
-  const result = await liveSessionTick({
-    now: () => now,
-    ledger: { sessions: {
-      historical: { agent: 'claude', project: '/old', lastSeenAlive: now - 1000 },
-    } },
-    liveSessionPids: async () => new Map([
-      ['live-claude', { pid: 41, agent: 'claude', project: '/claude', source: 'argv', primary: true }],
-      ['live-codex', { pid: 42, agent: 'codex', project: '/codex', source: 'argv', primary: true }],
-    ]),
-    host: recordingHost((type) => type === 'list' ? { panes: [] } : {}),
-    paneRecords: new Map(),
-    claudeSessionFor: (id) => { lookedUp.push(['claude', id]); return { id, kind: 'claude' }; },
-    codexSessionFor: (id) => { lookedUp.push(['codex', id]); return { id, kind: 'codex' }; },
-    writeLedger: (value) => { written = value; },
-  });
-  assert.equal(result.ok, true);
-  assert.deepEqual(lookedUp, [['claude', 'live-claude'], ['codex', 'live-codex']]);
-  assert.equal(written.sessions.historical.project, '/old', 'recent restore history remains in the ledger without a parse');
-});
-
-test('live turn indexing ignores stale ledger history while retaining recent gone sessions and reviewers', () => {
-  const now = Date.parse('2026-09-13T12:00:00Z');
-  const codexLookups = [];
-  const sessions = liveTurnIndexSessions({
-    now: () => now,
-    ledger: { sessions: {
-      'recent-codex': { agent: 'codex', lastSeenAlive: now - 60e3 },
-      'recent-gone': { agent: 'claude', lastSeenAlive: now - 9 * 60e3 },
-      'stale-codex': { agent: 'codex', lastSeenAlive: now - 11 * 60e3 },
-    } },
-    reviewerIds: ['reviewer'],
-    claudeTranscriptRows: [
-      { id: 'recent-gone', file: '/transcripts/recent-gone.jsonl' },
-      { id: 'reviewer', file: '/transcripts/reviewer.jsonl' },
-    ],
-    codexRolloutFile: (id) => { codexLookups.push(id); return `/rollouts/${id}.jsonl`; },
-  });
-  assert.deepEqual(sessions, [
-    { id: 'recent-codex', agent: 'codex', file: '/rollouts/recent-codex.jsonl' },
-    { id: 'recent-gone', agent: 'claude', file: '/transcripts/recent-gone.jsonl' },
-    { id: 'reviewer', agent: 'claude', file: '/transcripts/reviewer.jsonl' },
-  ]);
-  assert.deepEqual(codexLookups, ['recent-codex'], 'stale Codex history never starts a directory walk');
 });
 
 test('pane process liveness distinguishes an empty parent shell from an agent subtree', () => {
