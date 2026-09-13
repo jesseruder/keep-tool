@@ -486,8 +486,13 @@ The switch is `watch/watcher.json` in the registry, beside the reviewer's
 **A type cannot be turned on until its own record earns it** — 30 graded shadow
 decisions at 90% agreement, the same bar `keep decisions stats` shows. The
 refusal says exactly what is missing ("26 more graded (4/30)", "agreement 50%
-below 90%"), and `--force` overrules it deliberately rather than by accident. A
-malformed switch file reads as all-off: a typo must never widen delivery.
+below 90%"), and `--force` overrules it deliberately rather than by accident.
+
+**A malformed switch file reads as entirely off**, not partly on: an unknown key,
+a non-boolean flag, a `minConfidence` outside `(0, 1]`, or a limit that is not a
+non-negative integer disables everything and says why under `KEEP_DEBUG`. A live
+flag standing beside a threshold that could not be parsed is precisely the
+configuration that must not be half-honoured.
 
 ### What has to be true to deliver
 
@@ -517,19 +522,57 @@ uses, so target resolution, the send precheck and the injection mutex all apply.
 Its text is `[keep watcher] ` plus the verbatim message, which makes the indexer
 file it as a **`keep` opener rather than a human one** — the nudge rate is the
 number this whole project is trying to move, and a watcher message must never be
-counted as one of Owner's.
+counted as one of Owner's. The indexer's keep-opener test is
+`^\[keep(?:\s[\w-]+)?\]`, so `[keep]`, `[keep watcher]` and `[keep coordination]`
+all count; the never-chain rule below depends on that.
+
+**The text is validated, not sanitised.** Anything outside plain printable
+characters — a control character, a newline, an escape sequence, a zero-width or
+bidi override — means **nothing is delivered** (`reason: 'unsafe-text'`). A
+carriage return inside the message would erase the `[keep watcher] ` prefix and
+submit whatever followed it, and a message that had to be rewritten is not the
+message Owner graded. Only runs of spaces are collapsed, and the whole text is
+capped at 1000 characters.
+
+**Everything is re-checked twice more before the characters land.** The gates
+above were decided from a snapshot taken before a model call that takes minutes,
+so immediately before handing the text to the transport the switch file is
+re-read, the session is re-fetched with the same read the injection path uses,
+and the turn is re-checked as the session's latest; then the transport runs those
+same checks **once more inside the injection lock**, which is the only place
+where "nothing has changed" can still be true when the keystrokes arrive. Either
+one failing aborts with a `moved-on:` reason and gives the rate-limit slot back.
+
+**The slot is reserved before the send, not counted.** A `deliveries` row
+(`turn_id` primary key) is claimed inside one `BEGIN IMMEDIATE` alongside the
+rate-limit count, so two daemon workers racing the last slot cannot both decide
+there is room; a failed precondition or a failed send deletes the reservation.
 
 ### Carve-outs
 
 Deterministic, exported, and each one a test. Never deliver when:
 
-- the turn paused itself (`explicitPause`);
-- the turn asks about anything irreversible or production-facing — production,
-  prod, live users, deploy, rollout, canary, delete, drop, rotate, secret, token,
-  credential, first time, irreversible, or money;
-- the card is not `active`, or sets `autocontinue: off`;
-- the turn ran a `git commit`/`git push` or a deploy. A session that just
-  released gets Owner, not a nudge;
+Unlike the pre-signals, which read the last 600 characters because how a turn
+*ended* is what they are for, these read the **whole turn** — every assistant
+message of it, sentence by sentence. A pause or a risky question announced before
+a wall of closing prose still counts.
+
+- the turn paused itself (`explicitPause`), anywhere in it;
+- any sentence of the turn that is asking about something irreversible or
+  production-facing — production, prod, live users, deploy, rollout, canary,
+  delete, drop, rotate, secret, token, credential, first time, irreversible, or
+  money. "Should I deploy to production? Next, I can run the checks." ends
+  looking like a plan and is still a production question;
+- **there is no active card.** Live delivery requires one whose status is exactly
+  `active` and whose `autocontinue` is not `off`. A session with no card, or with
+  only a card that has since closed, gets nothing — the card lookup is
+  archive-aware on purpose, so a done card is found and refused rather than
+  reading as "no card". Shadow verdicts still record for any session;
+- the turn ran a `git commit`/`git push` or a deploy, or recorded a commit. A
+  session that just released gets Owner, not a nudge. Commands are parsed the way
+  keep.js's own deploy provenance parses them, so `env git push`, `git "push"`,
+  `sudo git push` and `npm test && git push` are all seen, in both the Claude and
+  Codex spellings (`command` and `cmd`);
 - the turn was opened by an automated message (`keep` opener). **One delivered
   message must be answered by a human before another can be sent**, or a
   `continue` would produce an ended turn that the watcher continues again,
@@ -537,7 +580,8 @@ Deterministic, exported, and each one a test. Never deliver when:
 
 ### Afterwards
 
-`turns.delivered_at` records the delivery; the ledger entry gains
+`turns.delivered_at` and the `deliveries` row record the delivery; the ledger
+entry gains
 `delivered: true` and `deliveredAt` and **stays pending**, because Owner still
 grades what was actually sent — and that grade is what keeps the type live.
 `keep watcher stats` reports deliveries and their agreement separately from

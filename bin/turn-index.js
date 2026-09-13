@@ -16,7 +16,7 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 
 // Text caps. Transcripts contain whole files and 100k-line build logs; the index
 // exists to find and count turns, not to be a second copy of the corpus.
@@ -50,6 +50,12 @@ const CODEX_PREAMBLE_RE = /^(?:<(?:recommended_plugins|available_plugins|environ
 // It is Keep talking to the agent, not Owner, so it must never read as a human
 // turn — nor, later, as evidence of what Owner would have typed.
 const HOOK_PROMPT_RE = /^<hook_prompt\b/i;
+// Keep speaking to the agent, in any of its voices: `[keep]` from the hooks,
+// `[keep watcher]` from live delivery, `[keep coordination]` and whatever comes
+// next. This is load-bearing for the watcher's never-chain rule — an automated
+// message that read as human would let the watcher answer itself forever — and
+// for the nudge metric, which must only ever count what Owner typed.
+const KEEP_OPENER_RE = /^\[keep(?:\s[\w-]+)?\]/;
 // Keep's own headless runs (`keep runs`, the Slack classifier, tab naming, the
 // brief) and Owner's `claude -p` batch jobs all open with a system-style "You are
 // …" prompt; a person opening a conversation that way is rare enough to accept.
@@ -60,7 +66,7 @@ const PATH_TOKEN_RE = /(?:^|[\s='"(])((?:~|\.{0,2})?\/?[\w.@+-]*\/[\w./@+-]*\.[A
 const APPLY_PATCH_RE = /^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm;
 
 const FILE_TOOLS = new Set(['Edit', 'Write', 'Read', 'MultiEdit', 'NotebookEdit', 'NotebookRead']);
-const SHELL_TOOLS = new Set(['Bash', 'BashOutput', 'shell', 'local_shell', 'container.exec']);
+const SHELL_TOOLS = new Set(['Bash', 'BashOutput', 'shell', 'local_shell', 'container.exec', 'exec_command']);
 
 let db = null;
 let dbPath = null;
@@ -202,6 +208,16 @@ const MIGRATIONS = [
   { version: 9, statements: [
     'ALTER TABLE turns ADD COLUMN delivered_at INTEGER',
     'CREATE INDEX IF NOT EXISTS turns_delivered ON turns(delivered_at)',
+  ] },
+  // A delivery is reserved before it is sent, so two daemon workers racing at the
+  // last slot cannot both decide there is room. turn_id is the primary key, which
+  // is also the "never twice for the same turn" guard.
+  { version: 10, statements: [
+    `CREATE TABLE IF NOT EXISTS deliveries (
+       turn_id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, type TEXT,
+       reserved_at INTEGER NOT NULL, sent_at INTEGER)`,
+    'CREATE INDEX IF NOT EXISTS deliveries_session ON deliveries(session_id, reserved_at)',
+    'CREATE INDEX IF NOT EXISTS deliveries_reserved ON deliveries(reserved_at)',
   ] },
 ];
 
@@ -406,7 +422,10 @@ function toolResultText(block) {
 
 function shellCommand(input) {
   if (!input || typeof input !== 'object') return '';
-  const value = input.command;
+  // `cmd` is what Codex's exec_command tool uses; `command` is the shell tool's.
+  // A command the index does not record is a command the watcher's release
+  // carve-out cannot see, so both spellings have to land here.
+  const value = input.command !== undefined ? input.command : input.cmd;
   if (typeof value === 'string') return value;
   if (!Array.isArray(value)) return '';
   // Codex's shell tool spells a command as ["bash", "-lc", "<script>"].
@@ -451,14 +470,14 @@ function parseToolInput(payload) {
 function claudeUserKind(record, text) {
   if (record.isMeta) return 'meta';
   if (CLAUDE_COMMAND_RE.test(text)) return 'command';
-  if (/^\[keep\]/.test(text) || HOOK_PROMPT_RE.test(text)) return 'keep';
+  if (KEEP_OPENER_RE.test(text) || HOOK_PROMPT_RE.test(text)) return 'keep';
   if (CLAUDE_WRAPPER_RE.test(text)) return 'preamble';
   return 'human';
 }
 
 function codexUserKind(text) {
   if (CODEX_PREAMBLE_RE.test(text)) return 'preamble';
-  if (/^\[keep\]/.test(text) || HOOK_PROMPT_RE.test(text)) return 'keep';
+  if (KEEP_OPENER_RE.test(text) || HOOK_PROMPT_RE.test(text)) return 'keep';
   if (/^<(?:command-name|local-command|bash-input)\b/.test(text)) return 'command';
   return 'human';
 }

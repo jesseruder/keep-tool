@@ -46,20 +46,49 @@ function configFile(root) {
   return path.join(registryRoot(root), 'watch', 'watcher.json');
 }
 
+function allOff(reason) {
+  if (reason) debug(`delivery disabled: ${reason}`);
+  return { live: Object.fromEntries(TYPES.map((type) => [type, false])), ...DEFAULTS, invalid: Boolean(reason) };
+}
+
+// Fails closed, all of it. A file this decides "may I type into a live session"
+// from must not be partially honoured: one bad field and the whole config reads
+// as off, rather than leaving a stale `live` flag standing beside a threshold
+// that could not be parsed.
 function normalizeConfig(value) {
-  const raw = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  if (value === null || value === undefined) return allOff();
+  if (typeof value !== 'object' || Array.isArray(value)) return allOff('config is not an object');
+  const raw = value;
+  if (raw.live !== undefined) {
+    if (!raw.live || typeof raw.live !== 'object' || Array.isArray(raw.live)) return allOff('live is not an object');
+    for (const [key, flag] of Object.entries(raw.live)) {
+      if (typeof flag !== 'boolean') return allOff(`live.${key} is not a boolean`);
+      if (!TYPES.includes(key)) return allOff(`live.${key} is not a verdict type`);
+    }
+  }
   const live = {};
-  for (const type of TYPES) live[type] = Boolean(raw.live && raw.live[type] === true);
-  const positive = (candidate, fallback) => (Number.isFinite(candidate) && candidate >= 0 ? candidate : fallback);
-  return {
-    live,
-    maxPerSessionPer10m: positive(Number(raw.maxPerSessionPer10m), DEFAULTS.maxPerSessionPer10m),
-    maxPerHour: positive(Number(raw.maxPerHour), DEFAULTS.maxPerHour),
-    // A malformed or missing threshold must not widen delivery, so it falls back
-    // to the default rather than to zero.
-    minConfidence: Number.isFinite(Number(raw.minConfidence)) && Number(raw.minConfidence) > 0
-      ? Number(raw.minConfidence) : DEFAULTS.minConfidence,
+  for (const type of TYPES) live[type] = raw.live ? raw.live[type] === true : false;
+
+  const limit = (name, fallback) => {
+    if (raw[name] === undefined) return fallback;
+    const candidate = raw[name];
+    if (typeof candidate !== 'number' || !Number.isInteger(candidate) || candidate < 0) return null;
+    return candidate;
   };
+  const perSession = limit('maxPerSessionPer10m', DEFAULTS.maxPerSessionPer10m);
+  if (perSession === null) return allOff('maxPerSessionPer10m is not a non-negative integer');
+  const perHour = limit('maxPerHour', DEFAULTS.maxPerHour);
+  if (perHour === null) return allOff('maxPerHour is not a non-negative integer');
+
+  let minConfidence = DEFAULTS.minConfidence;
+  if (raw.minConfidence !== undefined) {
+    if (typeof raw.minConfidence !== 'number' || !Number.isFinite(raw.minConfidence)
+        || raw.minConfidence <= 0 || raw.minConfidence > 1) {
+      return allOff('minConfidence is not a number in (0, 1]');
+    }
+    minConfidence = raw.minConfidence;
+  }
+  return { live, maxPerSessionPer10m: perSession, maxPerHour: perHour, minConfidence, invalid: false };
 }
 
 function loadConfig(root) {
@@ -70,11 +99,36 @@ function loadConfig(root) {
 function saveConfig(config, root) {
   const file = configFile(root);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const value = normalizeConfig(config);
+  const { invalid: _invalid, ...value } = normalizeConfig(config);
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
   fs.renameSync(tmp, file);
-  return value;
+  return loadConfig(root);
+}
+
+function debug(message) {
+  if (process.env.KEEP_DEBUG) process.stderr.write(`keep watcher-live: ${message}\n`);
+}
+
+// ---------- the delivered text ----------
+
+// Everything here ends up typed into somebody's terminal. A carriage return in
+// the middle of a message erases the `[keep watcher] ` prefix and submits
+// whatever follows it; an escape sequence can do considerably worse. So the text
+// is not sanitised, it is *validated*: anything outside plain printable text is
+// refused outright and nothing is delivered, because a message that needed
+// rewriting is not the message Owner graded.
+const UNSAFE_TEXT_RE = new RegExp('[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\u2066-\u206f\ufeff]');
+
+function safeDeliveryText(text) {
+  const value = String(text == null ? '' : text);
+  if (!value) return null;
+  if (UNSAFE_TEXT_RE.test(value)) return null;
+  // Runs of spaces are the one thing worth repairing: they change nothing about
+  // what the message says or where it ends.
+  const collapsed = value.replace(/ {2,}/g, ' ').trim();
+  if (!collapsed || collapsed.length > 1000) return null;
+  return collapsed;
 }
 
 function liveTypes(config) {
@@ -118,33 +172,79 @@ function decisionTypeFor(verdictType) {
 
 // Each returns a short reason string, or null when it does not apply. Pure and
 // exported so every one of them is a test rather than a hope.
-function pausedCarveOut(lastAssistant, watcher) {
-  return watcher.explicitPause(lastAssistant) ? 'the session paused itself and is waiting on Owner' : null;
+// The pre-signals read only the last 600 characters, because how a turn *ended*
+// is what they are for. A carve-out is a different question — did anything in
+// this turn mean Owner has to see it — so these read the whole turn.
+function turnText(turn) {
+  const parts = [turn.assistant_text, turn.last_assistant, ...(turn.assistantMessages || [])];
+  return [...new Set(parts.filter((part) => typeof part === 'string' && part))].join('\n\n');
 }
 
-function riskyQuestionCarveOut(lastAssistant, watcher) {
-  if (!watcher.askedQuestion(lastAssistant) && !watcher.askedForAction(lastAssistant)) return null;
-  const text = watcher.withoutQuoted(lastAssistant);
-  return RISKY_QUESTION_RE.test(text)
-    ? 'the turn asks about something irreversible, production-facing, or a secret' : null;
+function pausedCarveOut(turnOrText, watcher) {
+  const text = typeof turnOrText === 'string' ? turnOrText : turnText(turnOrText);
+  // Sentence by sentence: `explicitPause` looks at a tail, and a pause announced
+  // before 700 characters of closing prose is still a pause.
+  const said = text.split(/(?<=[.!?])\s+|\n+/).some((sentence) => watcher.explicitPause(sentence));
+  return said ? 'the session paused itself and is waiting on Owner' : null;
 }
 
+function riskyQuestionCarveOut(turnOrText, watcher) {
+  const text = watcher.withoutQuoted(typeof turnOrText === 'string' ? turnOrText : turnText(turnOrText));
+  // A risky word anywhere in a sentence that is asking is enough, wherever in the
+  // turn that sentence sits. "Should I deploy to production? Next, I can run the
+  // checks." ends looking like a plan and is still a production question.
+  for (const sentence of text.split(/(?<=[.!?])\s+|\n+/)) {
+    if (!sentence.trim()) continue;
+    if (!watcher.askedQuestion(sentence) && !watcher.askedForAction(sentence)) continue;
+    if (RISKY_QUESTION_RE.test(sentence)) {
+      return 'the turn asks about something irreversible, production-facing, or a secret';
+    }
+  }
+  return null;
+}
+
+// Live delivery requires a card that is actually active. `taskForSession` hides
+// done cards, so a session whose only card had just closed used to resolve to
+// "no card" and sail past this gate — the exact moment a stray "continue" is
+// least wanted. Shadow verdicts are unaffected; they record for any session.
 function cardCarveOut(card) {
-  if (!card) return null; // no card is not by itself a reason to stay quiet
-  if (card.fm?.status !== 'active') return `card ${card.id} is ${card.fm?.status || 'unknown'}, not active`;
+  if (!card) return 'live delivery needs an active card, and this session has none';
+  const status = card.fm?.status || 'unknown';
+  if (status !== 'active') return `card ${card.id} is ${status}, not active`;
   if (String(card.fm?.autocontinue || '').toLowerCase() === 'off') return `card ${card.id} sets autocontinue: off`;
   return null;
 }
 
 // A session that just pushed or deployed inside this turn gets Owner, not an
 // automated nudge: the next thing after a release is a decision, every time.
-function releaseCarveOut(commands, keepApi) {
+// Parsed the way keep.js's own deploy provenance parses it, so `env git push`,
+// `git "push"`, a chained `npm test && git push` and `sudo` are all seen.
+function releaseCarveOut(commands, keepApi, turn) {
+  if (turn) {
+    let commits = [];
+    try { commits = JSON.parse(turn.commits || '[]'); } catch {}
+    if (Array.isArray(commits) && commits.length) return 'the turn produced a commit';
+  }
+  const steps = requireSteps();
   for (const command of commands || []) {
     if (!command) continue;
     if (keepApi.looksLikeGitWrite(command)) return 'the turn ran a git commit or push';
     try { if (keepApi.deployCommand(command)) return 'the turn ran a deploy'; } catch {}
+    if (!steps) continue;
+    try {
+      for (const segment of steps.commandSegments(command)) {
+        // executableText drops `env`/`sudo` prefixes but keeps quoting, and
+        // `git "push"` runs a push exactly like `git push` does.
+        const text = steps.executableText(segment.text).replace(/["']/g, '');
+        if (/^git\s+(?:-\S+(?:\s+\S+)?\s+)*(?:commit|push)\b/.test(text)) return 'the turn ran a git commit or push';
+      }
+    } catch {}
   }
   return null;
+}
+
+function requireSteps() {
+  try { return require('./steps.js'); } catch { return null; }
 }
 
 // One automated message must be answered by a human before another can be sent.
@@ -155,10 +255,10 @@ function chainCarveOut(openerKind) {
 }
 
 function carveOut({ turn, card, commands, watcher, keepApi }) {
-  return pausedCarveOut(turn.last_assistant, watcher)
-    || riskyQuestionCarveOut(turn.last_assistant, watcher)
+  return pausedCarveOut(turn, watcher)
+    || riskyQuestionCarveOut(turn, watcher)
     || cardCarveOut(card)
-    || releaseCarveOut(commands, keepApi)
+    || releaseCarveOut(commands, keepApi, turn)
     || chainCarveOut(turn.opener_kind);
 }
 
@@ -195,19 +295,61 @@ function sessionReady(session) {
   return null;
 }
 
+// Read-only view of the limits, for a caller that wants to know before it spends
+// anything. `reserve` is what actually decides.
 function rateLimit(turn, config, deps = {}) {
   const handle = (deps.turnIndex || require('./turn-index.js')).open(deps.db);
   const now = Number.isFinite(deps.now) ? deps.now : Date.now();
   if (turn.delivered_at) return 'this turn has already been delivered';
+  if (handle.prepare('SELECT 1 AS hit FROM deliveries WHERE turn_id = ?').get(turn.id)) {
+    return 'this turn has already been delivered';
+  }
   const perSession = handle.prepare(
-    'SELECT COUNT(*) AS n FROM turns WHERE session_id = ? AND delivered_at >= ?',
+    'SELECT COUNT(*) AS n FROM deliveries WHERE session_id = ? AND reserved_at >= ?',
   ).get(turn.session_id, now - SESSION_WINDOW_MS).n;
   if (perSession >= config.maxPerSessionPer10m) {
     return `this session already had ${perSession} in the last 10 minutes`;
   }
-  const perHour = handle.prepare('SELECT COUNT(*) AS n FROM turns WHERE delivered_at >= ?').get(now - HOUR_MS).n;
+  const perHour = handle.prepare('SELECT COUNT(*) AS n FROM deliveries WHERE reserved_at >= ?').get(now - HOUR_MS).n;
   if (perHour >= config.maxPerHour) return `the fleet already had ${perHour} in the last hour`;
   return null;
+}
+
+// Counting and then sending is two steps, and two daemon workers racing at the
+// last slot both counted room. The count and the claim happen in one immediate
+// transaction instead, so exactly one of them gets it.
+function reserve(turn, config, type, deps = {}) {
+  const handle = (deps.turnIndex || require('./turn-index.js')).open(deps.db);
+  const now = Number.isFinite(deps.now) ? deps.now : Date.now();
+  handle.exec('BEGIN IMMEDIATE');
+  try {
+    const blocked = rateLimit(turn, config, { ...deps, now });
+    if (blocked) { handle.exec('ROLLBACK'); return { ok: false, reason: blocked }; }
+    handle.prepare('INSERT INTO deliveries (turn_id, session_id, type, reserved_at) VALUES (?, ?, ?, ?)')
+      .run(turn.id, turn.session_id, type, now);
+    handle.exec('COMMIT');
+    return { ok: true, at: now };
+  } catch (error) {
+    try { handle.exec('ROLLBACK'); } catch {}
+    // A UNIQUE violation is another worker holding this exact turn.
+    if (/UNIQUE/i.test(String(error && error.message))) return { ok: false, reason: 'this turn has already been delivered' };
+    return { ok: false, reason: `could not reserve: ${error.message}` };
+  }
+}
+
+// A reservation that never became a send must not spend a slot.
+function releaseReservation(turn, deps = {}) {
+  try {
+    (deps.turnIndex || require('./turn-index.js')).open(deps.db)
+      .prepare('DELETE FROM deliveries WHERE turn_id = ? AND sent_at IS NULL').run(turn.id);
+  } catch {}
+}
+
+function confirmReservation(turn, at, deps = {}) {
+  try {
+    (deps.turnIndex || require('./turn-index.js')).open(deps.db)
+      .prepare('UPDATE deliveries SET sent_at = ? WHERE turn_id = ?').run(at, turn.id);
+  } catch {}
 }
 
 // ---------- delivery ----------
@@ -233,6 +375,14 @@ async function maybeDeliver(turn, verdict, deps = {}) {
   const keepApi = deps.keep || require('./keep.js');
   const config = deps.config || loadConfig(deps.root);
   const skip = (reason) => ({ delivered: false, reason });
+  // In production nothing pins the config, so revalidate() re-reads the switch
+  // from disk immediately before sending: turning it off has to take effect
+  // between a verdict and its delivery, which is minutes apart.
+  deps = {
+    ...deps,
+    verdictType: verdict && verdict.verdict,
+    reloadConfig: deps.reloadConfig !== undefined ? deps.reloadConfig : (deps.config ? false : undefined),
+  };
 
   if (!verdict || verdict.skipped) return skip('no verdict');
   if (watcher.isReplayModel ? watcher.isReplayModel(verdict.model) : String(verdict.model || '').endsWith(':replay')) {
@@ -254,25 +404,45 @@ async function maybeDeliver(turn, verdict, deps = {}) {
   if (notReady) return skip(notReady);
 
   const card = deps.card !== undefined ? deps.card : cardFor(turn, keepApi);
-  const carved = carveOut({ turn, card, commands: turnCommands(turn, deps), watcher, keepApi });
+  const carved = carveOut({
+    turn: { ...turn, assistantMessages: assistantMessages(turn, deps) },
+    card, commands: turnCommands(turn, deps), watcher, keepApi,
+  });
   if (carved) return skip(carved);
 
   const stale = freshness(turn, deps);
   if (stale) return skip(stale);
 
-  const limited = rateLimit(turn, config, deps);
-  if (limited) return skip(limited);
+  // Refuse rather than rewrite. A carriage return in the message would erase the
+  // `[keep watcher] ` prefix and submit whatever followed it, so the whole text
+  // — prefix included — has to be plain printable characters or nothing is sent.
+  const text = safeDeliveryText(`${DELIVERY_PREFIX}${message}`);
+  if (!text) return skip('unsafe-text');
+  if (!text.startsWith(DELIVERY_PREFIX)) return skip('unsafe-text');
 
-  const text = `${DELIVERY_PREFIX}${message}`;
   const send = deps.send;
   if (typeof send !== 'function') return skip('no delivery transport');
+
+  const claim = reserve(turn, config, type, deps);
+  if (!claim.ok) return skip(claim.reason);
+
   try {
-    await send({ sessionId: turn.session_id, pane: session.pane, text });
+    // Everything above was decided from a snapshot taken before a model call that
+    // takes minutes. Check it all again now, and once more inside the injection
+    // lock, immediately before the characters are typed.
+    const movedOn = await revalidate(turn, deps);
+    if (movedOn) { releaseReservation(turn, deps); return skip(movedOn); }
+    await send({
+      sessionId: turn.session_id, pane: session.pane, text,
+      precondition: () => revalidate(turn, deps),
+    });
   } catch (error) {
+    releaseReservation(turn, deps);
     return { delivered: false, reason: `delivery failed: ${error.message}`, error: error.message };
   }
   const at = Number.isFinite(deps.now) ? deps.now : Date.now();
   markDelivered(turn, at, deps);
+  confirmReservation(turn, at, deps);
   // The decision stays pending: Owner still grades what was sent, and that grade
   // is what keeps the type live.
   if (verdict.decisionId) {
@@ -281,14 +451,52 @@ async function maybeDeliver(turn, verdict, deps = {}) {
   return { delivered: true, text, at, sessionId: turn.session_id };
 }
 
+// The last-moment check, run twice: once before handing the text to the
+// transport, and again by the transport inside the injection lock. Returns a
+// reason when the world has moved since the verdict, or null when it has not.
+async function revalidate(turn, deps = {}) {
+  const config = deps.reloadConfig === false ? deps.config : loadConfig(deps.root);
+  const type = deps.verdictType;
+  if (config && type && !config.live[type]) return `moved-on: ${type} was switched off`;
+  if (typeof deps.freshSession === 'function') {
+    let session = null;
+    try { session = await deps.freshSession(turn.session_id); }
+    catch (error) { return `moved-on: could not re-read the session (${error.message})`; }
+    const notReady = sessionReady(session);
+    if (notReady) return `moved-on: ${notReady}`;
+  }
+  const stale = freshness(turn, deps);
+  return stale ? `moved-on: ${stale}` : null;
+}
+
+// Every assistant message of the turn, so a carve-out sees what the turn said
+// rather than only how it ended.
+function assistantMessages(turn, deps = {}) {
+  try {
+    const handle = (deps.turnIndex || require('./turn-index.js')).open(deps.db);
+    return handle.prepare(
+      "SELECT text FROM messages WHERE turn_id = ? AND role = 'assistant' AND kind = 'text' AND text IS NOT NULL",
+    ).all(turn.id).map((row) => row.text);
+  } catch { return []; }
+}
+
+// Deliberately archive-aware: a session whose only card is done must resolve to
+// that done card, so the inactive-card gate can refuse it. `taskForSession`
+// filters done cards out, which turned "closed card" into "no card".
 function cardFor(turn, keepApi) {
-  try { return keepApi.taskForSession(turn.session_id) || null; } catch { return null; }
+  try {
+    for (const task of keepApi.loadAll(true)) {
+      if ((task.fm.sessions || []).some((entry) => entry && entry.id === turn.session_id)) return task;
+    }
+  } catch {}
+  return null;
 }
 
 module.exports = {
   TYPES, DEFAULTS, DELIVERY_PREFIX, RISKY_QUESTION_RE, SESSION_WINDOW_MS, HOUR_MS,
   configFile, loadConfig, saveConfig, normalizeConfig, liveTypes, describeConfig,
-  graduationCheck, decisionTypeFor,
+  graduationCheck, decisionTypeFor, safeDeliveryText, turnText, assistantMessages, cardFor,
   pausedCarveOut, riskyQuestionCarveOut, cardCarveOut, releaseCarveOut, chainCarveOut, carveOut,
-  freshness, sessionReady, rateLimit, turnCommands, markDelivered, maybeDeliver,
+  freshness, sessionReady, rateLimit, reserve, releaseReservation, confirmReservation, revalidate,
+  turnCommands, markDelivered, maybeDeliver,
 };

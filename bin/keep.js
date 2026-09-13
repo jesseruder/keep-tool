@@ -4955,6 +4955,9 @@ function emptyStopEvidence(offset = 0) {
     pushes: 0,
     bashGitWrites: 0,
     agentToolIds: [],
+    // Codex call_ids whose command was a git commit; only their outputs may be
+    // read as a commit (bin/keep.js scanCodexStopEvidence).
+    codexCommitCalls: [],
     awaitingAgentAttachment: false,
     partial: '',
   };
@@ -4967,6 +4970,9 @@ function normalizeStopEvidence(state, offset = 0) {
   }
   if (state && Array.isArray(state.agentToolIds)) {
     normalized.agentToolIds = state.agentToolIds.filter((id) => typeof id === 'string').slice(-20);
+  }
+  if (state && Array.isArray(state.codexCommitCalls)) {
+    normalized.codexCommitCalls = state.codexCommitCalls.filter((id) => typeof id === 'string').slice(-64);
   }
   normalized.awaitingAgentAttachment = Boolean(state && state.awaitingAgentAttachment);
   if (state && typeof state.partial === 'string') normalized.partial = state.partial;
@@ -5015,6 +5021,18 @@ const APPLY_PATCH_FILE_RE = /^\*\*\* (?:Add|Update|Delete) File:/gm;
 // Codex's half of scanStopEvidence. Kept separate so the Claude path above is
 // untouched: it is the one the Stop hook has always run, and a regression there
 // would silently stop enforcing check-ins for the whole fleet.
+function codexShellCommand(raw) {
+  if (!raw) return '';
+  try {
+    const parsed = JSON.parse(raw);
+    const value = parsed && (parsed.command !== undefined ? parsed.command : parsed.cmd);
+    if (Array.isArray(value)) {
+      return value.length > 2 && /^(?:ba)?sh$/.test(String(value[0])) ? String(value.at(-1)) : value.join(' ');
+    }
+    return String(value || '');
+  } catch { return String(raw); }
+}
+
 function scanCodexStopEvidence(next, payload) {
   const type = payload.type;
   if (type === 'function_call' || type === 'custom_tool_call') {
@@ -5028,22 +5046,24 @@ function scanCodexStopEvidence(next, payload) {
       next.edits += files || 1;
       return;
     }
-    let command = '';
-    if (raw) {
-      try {
-        const parsed = JSON.parse(raw);
-        const value = parsed && parsed.command;
-        command = Array.isArray(value)
-          ? (value.length > 2 && /^(?:ba)?sh$/.test(String(value[0])) ? String(value.at(-1)) : value.join(' '))
-          : String(value || '');
-      } catch { command = raw; }
-    }
+    const command = codexShellCommand(raw);
     if (!command) return;
     if (looksLikeGitWrite(command)) next.bashGitWrites++;
     if (/(?:^|[;&|]\s*)\s*(?:sudo\s+)?git\s+(?:-\S+(?:\s+[^-\s]\S*)?\s+)*push\b/.test(command)) next.pushes++;
+    // Remember which call was a commit, so its output can be believed below. A
+    // transcript is untrusted text: a README or a test fixture containing
+    // "[main abc1234] …" must not read as a commit that never happened.
+    if (typeof payload.call_id === 'string' && /\bgit\b[\s\S]*\bcommit\b/.test(command)) {
+      next.codexCommitCalls = [...(next.codexCommitCalls || []), payload.call_id].slice(-64);
+    }
     return;
   }
   if (type === 'function_call_output' || type === 'custom_tool_call_output') {
+    const calls = next.codexCommitCalls || [];
+    // A pass boundary can lose the map, which only ever under-counts: the worst
+    // case is a missed reminder, never an invented commit.
+    if (typeof payload.call_id !== 'string' || !calls.includes(payload.call_id)) return;
+    next.codexCommitCalls = calls.filter((id) => id !== payload.call_id);
     const output = typeof payload.output === 'string' ? payload.output
       : payload.output == null ? '' : JSON.stringify(payload.output);
     if (CODEX_COMMIT_RE.test(output)) next.commits++;

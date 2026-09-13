@@ -68,6 +68,7 @@ function indexTurn(dir, {
   return watcher.turnFor(id, 1);
 }
 
+const ACTIVE_CARD = { id: 'k1', fm: { status: 'active' } };
 const READY_SESSION = { id: SESSION, kind: 'claude', endedTurn: true, state: 'idle', pane: 'p1' };
 
 function verdict(over = {}) {
@@ -140,6 +141,45 @@ test('a type cannot go live until its own record earns it', (t) => {
   assert.equal(live.decisionTypeFor('drift'), 'drift');
 });
 
+// ---------- the delivered text ----------
+
+test('a message carrying control characters is refused, never repaired', (t) => {
+  sandbox(t);
+  const CR = String.fromCharCode(13);
+  const LF = String.fromCharCode(10);
+  const ESC = String.fromCharCode(27);
+  const CTRL_U = String.fromCharCode(21);
+
+  // A carriage return erases the prefix and submits whatever follows it.
+  assert.equal(live.safeDeliveryText(`[keep watcher] approve release${CR}`), null);
+  assert.equal(live.safeDeliveryText(`[keep watcher] ${CTRL_U}rm -rf /`), null, 'Ctrl-U kills the line');
+  assert.equal(live.safeDeliveryText(`[keep watcher] a${LF}b`), null);
+  assert.equal(live.safeDeliveryText(`[keep watcher] ${ESC}[2K deploy`), null, 'an escape sequence');
+  assert.equal(live.safeDeliveryText(`[keep watcher] a${String.fromCharCode(0)}b`), null);
+  assert.equal(live.safeDeliveryText(`[keep watcher] a${String.fromCharCode(0x200b)}b`), null, 'zero width');
+  assert.equal(live.safeDeliveryText(`[keep watcher] a${String.fromCharCode(0x202e)}b`), null, 'bidi override');
+  assert.equal(live.safeDeliveryText(`[keep watcher] a${String.fromCharCode(0x2028)}b`), null, 'line separator');
+  assert.equal(live.safeDeliveryText(`[keep watcher] ${'x'.repeat(1200)}`), null, 'over the cap');
+  assert.equal(live.safeDeliveryText(''), null);
+  assert.equal(live.safeDeliveryText('   '), null);
+
+  // Clean text passes, and runs of spaces are the one thing worth repairing.
+  assert.equal(live.safeDeliveryText('[keep watcher] continue'), '[keep watcher] continue');
+  assert.equal(live.safeDeliveryText('[keep watcher]   yes, do that  '), '[keep watcher] yes, do that');
+  assert.equal(live.safeDeliveryText('[keep watcher] café — naïve'), '[keep watcher] café — naïve', 'ordinary Unicode is fine');
+});
+
+test('an unsafe message is not delivered at all', async (t) => {
+  const dir = sandbox(t);
+  const send = fakeSend();
+  const result = await live.maybeDeliver(indexTurn(dir), verdict({ verdict: 'drift', message: `revert that${String.fromCharCode(13)}rm -rf /` }), {
+    config: allLive(), session: READY_SESSION, card: ACTIVE_CARD, send,
+  });
+  assert.equal(result.delivered, false);
+  assert.equal(result.reason, 'unsafe-text');
+  assert.equal(send.calls.length, 0);
+});
+
 // ---------- carve-outs ----------
 
 test('every carve-out keeps a message from being sent', (t) => {
@@ -164,7 +204,11 @@ test('every carve-out keeps a message from being sent', (t) => {
   // A quoted mention does not trigger it either.
   assert.equal(live.riskyQuestionCarveOut('The README says "run deploy.sh". Should I add a test?', watcher), null);
 
-  assert.equal(live.cardCarveOut(null), null, 'no card is not a reason to stay quiet');
+  // Live delivery requires an active card. A session with none — or with only a
+  // card that has since closed — is exactly when a stray "continue" is worst.
+  assert.match(live.cardCarveOut(null), /needs an active card/);
+  assert.match(live.cardCarveOut({ id: 'k1', fm: { status: 'done' } }), /is done, not active/);
+  assert.match(live.cardCarveOut({ id: 'k1', fm: { status: 'deferred' } }), /is deferred, not active/);
   assert.match(live.cardCarveOut({ id: 'k1', fm: { status: 'review' } }), /not active/);
   assert.match(live.cardCarveOut({ id: 'k1', fm: { status: 'active', autocontinue: 'off' } }), /autocontinue: off/);
   assert.equal(live.cardCarveOut({ id: 'k1', fm: { status: 'active' } }), null);
@@ -177,6 +221,33 @@ test('every carve-out keeps a message from being sent', (t) => {
 
   assert.match(live.chainCarveOut('keep'), /automated message/);
   assert.equal(live.chainCarveOut('human'), null);
+
+  // A carve-out reads the whole turn, not the last 600 characters: a pause or a
+  // risky question announced before a wall of closing prose still counts.
+  const buried = (lead) => ({ assistant_text: `${lead}\n\n${'Then I tidied the imports. '.repeat(40)}`, opener_kind: 'human' });
+  assert.match(live.pausedCarveOut(buried('I will hold here until you tell me to proceed.'), watcher), /paused/);
+  assert.match(live.riskyQuestionCarveOut(buried('Should I deploy this to production?'), watcher), /irreversible|production/);
+  // A risky question in an earlier assistant record of the same turn.
+  assert.match(live.riskyQuestionCarveOut({
+    last_assistant: 'Tidied the imports.', assistantMessages: ['Should I rotate the token first?', 'Tidied the imports.'],
+  }, watcher), /irreversible|production/);
+  // And one that ends looking like a plan.
+  assert.match(live.riskyQuestionCarveOut({
+    assistant_text: 'Should I deploy to production? Next, I can run the checks.', opener_kind: 'human',
+  }, watcher), /irreversible|production/);
+  // A risky word in a sentence that is not asking anything is still not a gate.
+  assert.equal(live.riskyQuestionCarveOut({ assistant_text: 'I read the deploy script. Should I add a test?' }, watcher), null);
+
+  // Release detection parses commands the way keep.js's deploy provenance does.
+  for (const command of [
+    'git push origin HEAD:master', 'env git push', 'sudo git push', 'git "push"',
+    'npm test && git push origin HEAD:master', 'git commit -am wip; npm test',
+    'git -C /tmp/x commit -m x',
+  ]) assert.notEqual(live.releaseCarveOut([command], keepApi), null, command);
+  assert.equal(live.releaseCarveOut(['git status', 'rg push bin/'], keepApi), null);
+  // A commit recorded on the turn row is a release signal on its own.
+  assert.match(live.releaseCarveOut([], keepApi, { commits: '["1a2b3c4"]' }), /produced a commit/);
+  assert.equal(live.releaseCarveOut([], keepApi, { commits: '[]' }), null);
 
   // And the combined gate picks whichever fired.
   assert.match(live.carveOut({
@@ -236,14 +307,17 @@ test('rate limits hold per session, per hour, and forever per turn', (t) => {
   const now = Date.now();
   assert.equal(live.rateLimit(turn, config, { now }), null);
 
-  // The same turn is never delivered twice, however long ago it was.
+  // The same turn is never delivered twice, however long ago it was: the
+  // reservation row is the primary key on turn_id.
+  assert.equal(live.reserve(turn, config, 'continue', { now: now - 5 * 3600e3 }).ok, true);
   live.markDelivered(turn, now - 5 * 3600e3);
   const delivered = watcher.turnFor(SESSION, 1);
   assert.match(live.rateLimit(delivered, config, { now }), /already been delivered/);
+  assert.equal(live.reserve(delivered, config, 'continue', { now }).ok, false, 'and it cannot be reserved again');
 
   // One per session per 10 minutes: a second turn of the same session is held.
   const db = turnIndex.open();
-  db.prepare('UPDATE turns SET delivered_at = ? WHERE session_id = ?').run(now - 60e3, SESSION);
+  db.prepare('UPDATE deliveries SET reserved_at = ? WHERE session_id = ?').run(now - 60e3, SESSION);
   const file = path.join(dir, `${SESSION}.jsonl`);
   const at = (s) => new Date(Date.UTC(2026, 8, 13, 0, 2, s)).toISOString();
   fs.appendFileSync(file, jsonl([
@@ -274,7 +348,7 @@ test('delivery sends the prefixed message once, and records it on both sides', a
   const send = fakeSend();
   const marked = [];
   const result = await live.maybeDeliver(turn, verdict({ decisionId: 'd-1' }), {
-    config: allLive(), session: READY_SESSION, card: { id: 'k1', fm: { status: 'active' } },
+    config: allLive(), session: READY_SESSION, card: ACTIVE_CARD,
     send, decisions: { markDelivered: (id, at) => marked.push({ id, at }) },
   });
 
@@ -293,7 +367,7 @@ test('delivery sends the prefixed message once, and records it on both sides', a
 
   // Never twice for the same turn.
   const again = await live.maybeDeliver(watcher.turnFor(SESSION, 1), verdict(), {
-    config: allLive(), session: READY_SESSION, card: null, send,
+    config: allLive(), session: READY_SESSION, card: ACTIVE_CARD, send,
   });
   assert.equal(again.delivered, false);
   assert.match(again.reason, /already been delivered/);
@@ -303,7 +377,7 @@ test('delivery sends the prefixed message once, and records it on both sides', a
 test('every gate refuses delivery on its own, and none of them sends', async (t) => {
   const dir = sandbox(t);
   const base = {
-    config: allLive(), session: READY_SESSION, card: { id: 'k1', fm: { status: 'active' } },
+    config: allLive(), session: READY_SESSION, card: ACTIVE_CARD,
   };
   const attempt = async (over, turnOver) => {
     const send = fakeSend();
@@ -337,11 +411,172 @@ test('every gate refuses delivery on its own, and none of them sends', async (t)
   assert.equal(send.calls[0].text, '[keep watcher] yes, do that');
 });
 
+test('the world is re-checked after the model call and again inside the lock', async (t) => {
+  const dir = sandbox(t);
+  const base = { config: allLive(), session: READY_SESSION, card: ACTIVE_CARD };
+
+  // Owner typed while the model was thinking: a newer turn exists by the time
+  // delivery is attempted.
+  const moved = indexTurn(dir, { id: 'moved111-2222-3333-4444-555555555555' });
+  const movedFile = path.join(dir, 'moved111-2222-3333-4444-555555555555.jsonl');
+  const at = (s) => new Date(Date.UTC(2026, 8, 13, 0, 5, s)).toISOString();
+  fs.appendFileSync(movedFile, jsonl([
+    { type: 'user', sessionId: 'moved111-2222-3333-4444-555555555555', cwd: '/tmp/live-project', timestamp: at(0),
+      message: { role: 'user', content: 'actually do the other thing' } },
+    { type: 'assistant', sessionId: 'moved111-2222-3333-4444-555555555555', cwd: '/tmp/live-project', timestamp: at(5),
+      message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'ok' }] } },
+  ]));
+  turnIndex.ingestFile(movedFile, { agent: 'claude' });
+  const humanArrived = fakeSend();
+  const blocked = await live.maybeDeliver(moved, verdict(), { ...base, send: humanArrived });
+  assert.equal(blocked.delivered, false);
+  assert.match(blocked.reason, /already started another turn/);
+  assert.equal(humanArrived.calls.length, 0);
+  // And the slot it reserved was handed back.
+  assert.equal(turnIndex.open().prepare('SELECT COUNT(*) AS n FROM deliveries').get().n, 0);
+
+  // The switch was turned off between the verdict and the send.
+  const turn = indexTurn(dir, { id: 'offff111-2222-3333-4444-555555555555' });
+  live.saveConfig({ live: { continue: false, 'needs-input': false, drift: false } });
+  const switchedOff = fakeSend();
+  // The initial gates ran against the on-config; revalidate re-reads the file,
+  // which is what `keep watcher live off` changes.
+  const off = await live.maybeDeliver(turn, verdict(), {
+    ...base, send: switchedOff, reloadConfig: true,
+  });
+  assert.equal(off.delivered, false);
+  assert.match(off.reason, /moved-on: continue was switched off/);
+  assert.equal(switchedOff.calls.length, 0);
+  assert.equal(turnIndex.open().prepare('SELECT COUNT(*) AS n FROM deliveries').get().n, 0, 'and no slot was spent');
+
+  // A session that changed after the snapshot is caught by the fresh read.
+  live.saveConfig({ live: { continue: true, 'needs-input': false, drift: false } });
+  const stale = indexTurn(dir, { id: 'stale111-2222-3333-4444-555555555555' });
+  const staleSend = fakeSend();
+  const refused = await live.maybeDeliver(stale, verdict(), {
+    ...base, send: staleSend,
+    freshSession: async () => ({ ...READY_SESSION, pendingQuestion: { question: 'which one?' } }),
+  });
+  assert.equal(refused.delivered, false);
+  assert.match(refused.reason, /moved-on:.*question/);
+  assert.equal(staleSend.calls.length, 0);
+
+  // The precondition is handed to the transport and runs inside its lock.
+  const ok = indexTurn(dir, { id: 'lockk111-2222-3333-4444-555555555555' });
+  let preconditionRan = 0;
+  const locking = async ({ precondition }) => { preconditionRan += 1; assert.equal(await precondition(), null); };
+  locking.calls = [];
+  const delivered = await live.maybeDeliver(ok, verdict(), {
+    ...base, send: locking, freshSession: async () => READY_SESSION,
+  });
+  assert.equal(delivered.delivered, true);
+  assert.equal(preconditionRan, 1, 'the transport re-checks once more before typing');
+
+  // And a precondition that fails inside the lock aborts the send.
+  const late = indexTurn(dir, { id: 'latee111-2222-3333-4444-555555555555' });
+  const aborting = async ({ precondition }) => {
+    const movedOn = await precondition();
+    if (movedOn) throw new Error(movedOn);
+  };
+  let sessionState = READY_SESSION;
+  const abortResult = await live.maybeDeliver(late, verdict(), {
+    ...base, send: aborting,
+    freshSession: async () => { const value = sessionState; sessionState = { ...READY_SESSION, endedTurn: false }; return value; },
+  });
+  assert.equal(abortResult.delivered, false);
+  assert.match(abortResult.reason, /delivery failed: moved-on:.*mid-turn/);
+  assert.equal(turnIndex.open().prepare('SELECT delivered_at FROM turns WHERE id = ?').get(late.id).delivered_at, null);
+});
+
+test('two deliveries racing the last slot produce exactly one send', async (t) => {
+  const dir = sandbox(t);
+  const first = indexTurn(dir, { id: 'race1111-2222-3333-4444-555555555555' });
+  const second = indexTurn(dir, { id: 'race2222-2222-3333-4444-555555555555' });
+  // One slot left in the fleet's hour.
+  const config = allLive({ maxPerHour: 1 });
+  const send = fakeSend();
+  const base = {
+    config, card: ACTIVE_CARD, send,
+    session: { ...READY_SESSION }, freshSession: async () => READY_SESSION,
+  };
+  const [a, b] = await Promise.all([
+    live.maybeDeliver(first, verdict(), { ...base, session: { ...READY_SESSION, id: first.session_id } }),
+    live.maybeDeliver(second, verdict(), { ...base, session: { ...READY_SESSION, id: second.session_id } }),
+  ]);
+  const winners = [a, b].filter((result) => result.delivered);
+  const losers = [a, b].filter((result) => !result.delivered);
+  assert.equal(winners.length, 1, 'the reservation is what decides, not the count');
+  assert.equal(send.calls.length, 1);
+  assert.match(losers[0].reason, /last hour/);
+  assert.equal(turnIndex.open().prepare('SELECT COUNT(*) AS n FROM deliveries WHERE sent_at IS NOT NULL').get().n, 1);
+});
+
+test('a malformed switch file turns everything off rather than part of it', (t) => {
+  sandbox(t);
+  // The shape the review called out: a live flag beside an unparseable threshold.
+  assert.deepEqual(live.liveTypes(live.normalizeConfig({ live: { continue: true }, minConfidence: [0.1] })), []);
+  for (const bad of [
+    { live: { continue: true }, minConfidence: 0 },
+    { live: { continue: true }, minConfidence: 1.5 },
+    { live: { continue: true }, minConfidence: '0.8' },
+    { live: { continue: true }, maxPerHour: -1 },
+    { live: { continue: true }, maxPerHour: 2.5 },
+    { live: { continue: true }, maxPerSessionPer10m: null },
+    { live: { continue: 'true' } },
+    { live: { continue: true, bogus: true } },
+    { live: [true] },
+    { live: 'on' },
+    [1, 2, 3],
+    'on',
+  ]) assert.deepEqual(live.liveTypes(live.normalizeConfig(bad)), [], JSON.stringify(bad));
+  assert.equal(live.normalizeConfig({ live: { continue: true }, minConfidence: [0.1] }).invalid, true);
+
+  // A well-formed one still works, including at the edges of the ranges.
+  assert.deepEqual(live.liveTypes(live.normalizeConfig({ live: { continue: true }, minConfidence: 1, maxPerHour: 0 })), ['continue']);
+});
+
+test('a card that has closed is found, so the inactive-card gate can refuse it', (t) => {
+  sandbox(t);
+  const write = (id, status, dir = 'tasks') => {
+    fs.mkdirSync(path.join(REGISTRY, dir), { recursive: true });
+    fs.writeFileSync(path.join(REGISTRY, dir, `${id}.md`), [
+      '---', `id: ${id}`, 'title: Live delivery', `status: ${status}`, 'kind: task',
+      'created: 2026-09-13T00:00', 'updated: 2026-09-13T00:00', 'sessions:',
+      `  - id: ${SESSION}`, '    agent: claude', '    at: 2026-09-13T00:00', '---', '', '## Log', '',
+    ].join('\n'));
+  };
+  const turn = { session_id: SESSION };
+
+  write('live-done', 'done');
+  const done = live.cardFor(turn, keepApi);
+  assert.equal(done?.id, 'live-done', 'a done card is still the session\'s card');
+  assert.match(live.cardCarveOut(done), /is done, not active/);
+  fs.rmSync(path.join(REGISTRY, 'tasks', 'live-done.md'));
+
+  write('live-defer', 'deferred');
+  assert.match(live.cardCarveOut(live.cardFor(turn, keepApi)), /is deferred, not active/);
+  fs.rmSync(path.join(REGISTRY, 'tasks', 'live-defer.md'));
+
+  // An archived card counts too.
+  write('live-arch', 'done', 'archive');
+  assert.equal(live.cardFor(turn, keepApi)?.id, 'live-arch');
+  fs.rmSync(path.join(REGISTRY, 'archive', 'live-arch.md'));
+
+  assert.equal(live.cardFor(turn, keepApi), null, 'no card at all');
+  assert.match(live.cardCarveOut(null), /needs an active card/);
+
+  write('live-active', 'active');
+  const active = live.cardFor(turn, keepApi);
+  assert.equal(active?.id, 'live-active');
+  assert.equal(live.cardCarveOut(active), null);
+  fs.rmSync(path.join(REGISTRY, 'tasks', 'live-active.md'));
+});
+
 test('a delivery failure is reported, not thrown, and marks nothing', async (t) => {
   const dir = sandbox(t);
   const turn = indexTurn(dir);
   const result = await live.maybeDeliver(turn, verdict(), {
-    config: allLive(), session: READY_SESSION, card: null,
+    config: allLive(), session: READY_SESSION, card: ACTIVE_CARD,
     send: async () => { throw new Error('session is gone'); },
   });
   assert.equal(result.delivered, false);
@@ -377,6 +612,67 @@ test('the daemon tick delivers through the injected transport and counts it', as
 
 // ---------- Codex evidence in the Stop hook ----------
 
+test('a watcher-delivered message is a keep opener, so it can never chain', (t) => {
+  const dir = sandbox(t);
+  const id = 'chain111-2222-3333-4444-555555555555';
+  const file = path.join(dir, `${id}.jsonl`);
+  const at = (m, s) => new Date(Date.UTC(2026, 8, 13, 1, m, s)).toISOString();
+  fs.writeFileSync(file, jsonl([
+    { type: 'user', sessionId: id, cwd: '/tmp/live-project', timestamp: at(0, 0), message: { role: 'user', content: 'fix the parser' } },
+    { type: 'assistant', sessionId: id, cwd: '/tmp/live-project', timestamp: at(0, 5),
+      message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: "Fixed. Next, I'll run the suite." }] } },
+    // Exactly what live delivery types into the session.
+    { type: 'user', sessionId: id, cwd: '/tmp/live-project', timestamp: at(1, 0), message: { role: 'user', content: '[keep watcher] continue' } },
+    { type: 'assistant', sessionId: id, cwd: '/tmp/live-project', timestamp: at(1, 5),
+      message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: "Suite is green. Next, I'll write docs." }] } },
+  ]));
+  assert.equal(turnIndex.ingestFile(file, { agent: 'claude' }).ok, true);
+
+  const turns = turnIndex.turnsForSession(id);
+  assert.deepEqual(turns.map((row) => row.opener_kind), ['human', 'keep'],
+    'the watcher\'s own prefix must not read as Owner typing');
+  // And that is what stops the watcher answering itself forever.
+  assert.match(live.chainCarveOut(turns[1].opener_kind), /automated message/);
+
+  // Every voice Keep speaks in counts, and a lookalike does not.
+  const kinds = ['[keep] check in first', '[keep watcher] continue', '[keep coordination] hold',
+    '[keeper] not us', '[keep watcher extra] no'];
+  const seen = kinds.map((text) => {
+    const each = `k${kinds.indexOf(text)}1111-2222-3333-4444-555555555555`;
+    const path2 = path.join(dir, `${each}.jsonl`);
+    fs.writeFileSync(path2, jsonl([
+      { type: 'user', sessionId: each, cwd: '/tmp/live-project', timestamp: at(2, 0), message: { role: 'user', content: text } },
+      { type: 'assistant', sessionId: each, cwd: '/tmp/live-project', timestamp: at(2, 5),
+        message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'ok' }] } },
+    ]));
+    turnIndex.ingestFile(path2, { agent: 'claude' });
+    return turnIndex.turnsForSession(each)[0].opener_kind;
+  });
+  assert.deepEqual(seen, ['keep', 'keep', 'keep', 'human', 'human']);
+});
+
+test('a Codex exec_command is indexed as a command the release gate can see', (t) => {
+  const dir = sandbox(t);
+  const id = '0199cccc-1111-2222-3333-444444444444';
+  const file = path.join(dir, `rollout-2026-09-13T01-00-00-${id}.jsonl`);
+  fs.writeFileSync(file, jsonl([
+    { type: 'session_meta', timestamp: '2026-09-13T01:00:00.000Z', payload: { id, cwd: '/tmp/live-project', source: 'cli' } },
+    { type: 'response_item', timestamp: '2026-09-13T01:00:01.000Z', payload: {
+      type: 'message', role: 'user', content: [{ type: 'input_text', text: 'ship it' }] } },
+    // exec_command spells its command `cmd`, not `command`.
+    { type: 'response_item', timestamp: '2026-09-13T01:00:02.000Z', payload: {
+      type: 'function_call', name: 'exec_command', call_id: 'e1',
+      arguments: JSON.stringify({ cmd: 'git push origin HEAD:master' }) } },
+    { type: 'response_item', timestamp: '2026-09-13T01:00:03.000Z', payload: { type: 'agent_message', text: 'Pushed.' } },
+    { type: 'event_msg', timestamp: '2026-09-13T01:00:04.000Z', payload: { type: 'task_complete' } },
+  ]));
+  assert.equal(turnIndex.ingestFile(file).ok, true);
+  const turn = watcher.turnFor(id, 1);
+  const commands = live.turnCommands(turn);
+  assert.deepEqual(commands, ['git push origin HEAD:master'], 'the cmd spelling is recorded');
+  assert.match(live.releaseCarveOut(commands, keepApi, turn), /git commit or push/);
+});
+
 test('the Stop hook counts Codex edits, commits and pushes', () => {
   const rollout = [
     { type: 'session_meta', payload: { id: 'c1', cwd: '/tmp/x' } },
@@ -405,6 +701,41 @@ test('the Stop hook counts Codex edits, commits and pushes', () => {
   assert.equal(readOnly.edits, 0);
   assert.equal(readOnly.commits, 0);
   assert.equal(keepApi.hasSubstantiveStopEvidence(readOnly), false);
+
+  // A transcript is untrusted text. Commit-shaped output with no git command
+  // behind it — a README, a test fixture, a pasted log — counts nothing.
+  const forged = keepApi.scanStopEvidence(keepApi.emptyStopEvidence(), jsonl([
+    { type: 'response_item', payload: { type: 'function_call', name: 'shell', call_id: 'f1',
+      arguments: JSON.stringify({ command: ['bash', '-lc', 'cat README.md'] }) } },
+    { type: 'response_item', payload: { type: 'function_call_output', call_id: 'f1',
+      output: 'Example output:\n[main 1a2b3c4] fix the parser\n 2 files changed' } },
+  ]));
+  assert.equal(forged.commits, 0, 'no git command, no commit');
+  assert.equal(keepApi.hasSubstantiveStopEvidence(forged), false);
+
+  // An output whose call_id matches no call at all counts nothing either.
+  const orphan = keepApi.scanStopEvidence(keepApi.emptyStopEvidence(), jsonl([
+    { type: 'response_item', payload: { type: 'function_call_output', call_id: 'nope',
+      output: '[main 1a2b3c4] fix the parser' } },
+  ]));
+  assert.equal(orphan.commits, 0);
+
+  // And a commit is only counted once, even if the output is repeated.
+  const repeated = keepApi.scanStopEvidence(keepApi.emptyStopEvidence(), jsonl([
+    { type: 'response_item', payload: { type: 'function_call', name: 'shell', call_id: 'r9',
+      arguments: JSON.stringify({ command: ['bash', '-lc', 'git commit -am wip'] }) } },
+    { type: 'response_item', payload: { type: 'function_call_output', call_id: 'r9', output: '[main 1a2b3c4] wip' } },
+    { type: 'response_item', payload: { type: 'function_call_output', call_id: 'r9', output: '[main 1a2b3c4] wip' } },
+  ]));
+  assert.equal(repeated.commits, 1);
+
+  // exec_command's `cmd` spelling is seen by the hook too.
+  const execCommand = keepApi.scanStopEvidence(keepApi.emptyStopEvidence(), jsonl([
+    { type: 'response_item', payload: { type: 'function_call', name: 'exec_command', call_id: 'x1',
+      arguments: JSON.stringify({ cmd: 'git push origin HEAD:master' }) } },
+  ]));
+  assert.equal(execCommand.pushes, 1);
+  assert.equal(execCommand.bashGitWrites, 1);
 
   // The Claude path is unchanged.
   const claude = keepApi.scanStopEvidence(keepApi.emptyStopEvidence(), jsonl([

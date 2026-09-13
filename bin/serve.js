@@ -7140,7 +7140,17 @@ function start(deps = {}) {
         // the injection mutex all apply to a watcher message too.
         deliver: (turn, verdict) => live.maybeDeliver(turn, verdict, {
           session: sessions.find((candidate) => candidate.id === turn.session_id),
-          send: ({ sessionId, pane, text }) => sendToSessionLocked({ sessionId, pane, text }),
+          // Re-read the session the same way the injection path does, so the
+          // last-moment check is against what is actually on screen now.
+          freshSession: (id) => loadCurrentSession(id),
+          // The precondition runs inside the injection lock, immediately before
+          // the characters are typed: the mutex is the only place where "nothing
+          // has changed" can still be true when the keystrokes land.
+          send: ({ sessionId, pane, text, precondition }) => withInjectionLock(async () => {
+            const movedOn = precondition ? await precondition() : null;
+            if (movedOn) throw new Error(movedOn);
+            return sendToSession({ sessionId, pane, text });
+          }, { session: sessionId, pane, model: modelCommandText(text) }),
         }),
       });
       health.record('watcher', {
