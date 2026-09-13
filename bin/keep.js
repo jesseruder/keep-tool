@@ -5275,7 +5275,10 @@ function deployCommand(command) {
       const src = (args[1] || 'HEAD').replace(/^\+/, '');
       if (src.startsWith(':')) continue; // a deletion, not a release
       const ref = src.includes(':') ? src.split(':')[0] : src;
-      return { kind: 'heroku', target: `heroku (remote ${remote})`, ref: ref || 'HEAD', dir: m[1] || '' };
+      // Normalized argv is shell-quoted before it is re-read here, so a `~` dir
+      // arrives as '~/x'; the record wants the path, not the quoting.
+      const dir = (m[1] || '').replace(/^(['"])(.*)\1$/, '$2');
+      return { kind: 'heroku', target: `heroku (remote ${remote})`, ref: ref || 'HEAD', dir };
     }
     if (/^heroku\s+container:(?:push|release)(?=\s|$)/.test(text)) {
       const app = (text.match(/\s(?:-a|--app)[\s=]+(\S+)/) || [])[1];
