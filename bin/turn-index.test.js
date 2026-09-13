@@ -671,11 +671,12 @@ test('a working directory is folded onto its main checkout at most once, ever', 
   wt.isLinkedWorktree = () => { calls += 1; return false; };
   t.after(() => { wt.isLinkedWorktree = original; });
 
+  const shared = path.join(dir, 'shared-project');
+  fs.mkdirSync(shared);
   const write = (id, text, at) => {
     const file = path.join(dir, `${id}.jsonl`);
     fs.appendFileSync(file, jsonl([
-      { type: 'user', sessionId: id, cwd: '/tmp/shared-project', timestamp: at,
-        message: { role: 'user', content: text } },
+      { type: 'user', sessionId: id, cwd: shared, timestamp: at, message: { role: 'user', content: text } },
     ]));
     return file;
   };
@@ -693,7 +694,140 @@ test('a working directory is folded onto its main checkout at most once, ever', 
   const two = write('proj2222-2222-3333-4444-555555555555', 'elsewhere', '2026-09-10T00:02:00.000Z');
   assert.equal(turnIndex.ingestFile(two, { agent: 'claude' }).ok, true);
   assert.equal(calls, 1, 'the answer for a directory is cached in the index itself');
-  assert.equal(turnIndex.sessionRow('proj2222-2222-3333-4444-555555555555').project, '/tmp/shared-project');
+  assert.equal(turnIndex.sessionRow('proj2222-2222-3333-4444-555555555555').project, shared);
+
+  // A transcript whose working directory is gone (a recycled worktree) keeps its
+  // historical answer: there is nothing better to compute, and paying 110 ms per
+  // file to rediscover that would make backfill over old history far slower.
+  fs.rmSync(shared, { recursive: true, force: true });
+  const three = write('proj3333-2222-3333-4444-555555555555', 'after the worktree went away', '2026-09-10T00:03:00.000Z');
+  assert.equal(turnIndex.ingestFile(three, { agent: 'claude' }).ok, true);
+  assert.equal(calls, 1);
+  assert.equal(turnIndex.sessionRow('proj3333-2222-3333-4444-555555555555').project, shared);
+});
+
+test('a session that changes directory is re-resolved and does not poison the cache', (t) => {
+  const dir = tempDir(t);
+  const from = path.join(dir, 'worktree-a');
+  const to = path.join(dir, 'worktree-b');
+  fs.mkdirSync(from);
+  fs.mkdirSync(to);
+  const wt = require('./wt.js');
+  const original = wt.isLinkedWorktree;
+  wt.isLinkedWorktree = () => false; // every directory canonicalizes to itself
+  t.after(() => { wt.isLinkedWorktree = original; });
+
+  const id = 'moved111-2222-3333-4444-555555555555';
+  const file = path.join(dir, `${id}.jsonl`);
+  const line = (cwd, text, at) => ({
+    type: 'user', sessionId: id, cwd, timestamp: at, message: { role: 'user', content: text },
+  });
+  fs.writeFileSync(file, jsonl([line(from, 'start here', '2026-09-10T00:00:00.000Z')]));
+  assert.equal(turnIndex.ingestFile(file, { agent: 'claude' }).ok, true);
+  assert.equal(turnIndex.sessionRow(id).project, from);
+
+  // The session moves. Keeping the old project would leave a (new cwd, old
+  // project) row, which is exactly what later sessions read as the cache.
+  fs.appendFileSync(file, jsonl([line(to, 'moved over', '2026-09-10T00:05:00.000Z')]));
+  assert.equal(turnIndex.ingestFile(file, { agent: 'claude' }).ok, true);
+  const moved = turnIndex.sessionRow(id);
+  assert.equal(moved.cwd, to);
+  assert.equal(moved.project, to, 'a changed working directory is re-resolved, not carried over');
+
+  const laterId = 'later111-2222-3333-4444-555555555555';
+  const laterFile = path.join(dir, `${laterId}.jsonl`);
+  fs.writeFileSync(laterFile, jsonl([{
+    type: 'user', sessionId: laterId, cwd: to, timestamp: '2026-09-10T01:00:00.000Z',
+    message: { role: 'user', content: 'fresh session in the new directory' },
+  }]));
+  assert.equal(turnIndex.ingestFile(laterFile, { agent: 'claude' }).ok, true);
+  assert.equal(turnIndex.sessionRow(laterId).project, to, 'the cache was not poisoned by the move');
+});
+
+test('a cached project whose checkout is gone is recomputed, not trusted', (t) => {
+  const dir = tempDir(t);
+  const cwd = path.join(dir, 'live-worktree');
+  fs.mkdirSync(cwd);
+  const wt = require('./wt.js');
+  const original = wt.isLinkedWorktree;
+  let calls = 0;
+  wt.isLinkedWorktree = () => { calls += 1; return false; };
+  t.after(() => { wt.isLinkedWorktree = original; });
+
+  // A path can be deleted and reused by a different repository. Seed the row the
+  // old repository left behind, pointing at a checkout that is no longer there.
+  const db = turnIndex.open();
+  db.prepare('INSERT INTO sessions (id, agent, kind, cwd, project, last_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run('gone1111-2222-3333-4444-555555555555', 'claude', 'interactive', cwd,
+      path.join(dir, 'deleted-main-checkout'), Date.parse('2026-09-01T00:00:00.000Z'));
+
+  const id = 'reuse111-2222-3333-4444-555555555555';
+  const file = path.join(dir, `${id}.jsonl`);
+  fs.writeFileSync(file, jsonl([{
+    type: 'user', sessionId: id, cwd, timestamp: '2026-09-10T00:00:00.000Z',
+    message: { role: 'user', content: 'new repo, same path' },
+  }]));
+  assert.equal(turnIndex.ingestFile(file, { agent: 'claude' }).ok, true);
+  assert.equal(calls, 1, 'a cached answer naming a missing checkout is not trusted');
+  assert.equal(turnIndex.sessionRow(id).project, cwd);
+});
+
+test('prune re-checks the cutoff under the lock, so a session that woke up survives', (t) => {
+  const dir = tempDir(t);
+  const ids = [];
+  for (let i = 0; i < 3; i += 1) {
+    const id = `race${i}-2222-3333-4444-555555555555`;
+    const file = path.join(dir, `${id}.jsonl`);
+    fs.writeFileSync(file, jsonl([
+      { type: 'user', sessionId: id, cwd: '/tmp/demo-project', timestamp: `2026-08-0${i + 1}T00:00:00.000Z`,
+        message: { role: 'user', content: `Old work ${i}` } },
+      { type: 'assistant', sessionId: id, cwd: '/tmp/demo-project', timestamp: `2026-08-0${i + 1}T00:00:05.000Z`,
+        message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: `Done ${i}.` }] } },
+    ]));
+    turnIndex.ingestFile(file, { agent: 'claude' });
+    ids.push(id);
+  }
+  const cutoff = Date.parse('2026-09-01T00:00:00.000Z');
+  const candidates = turnIndex.pruneCandidates({ cutoff });
+  assert.deepEqual(candidates, ids, 'oldest first');
+
+  // Between selection and deletion, a turn lands on the first candidate.
+  const db = turnIndex.open();
+  db.prepare('UPDATE sessions SET last_at = ? WHERE id = ?').run(Date.now(), ids[0]);
+
+  const result = turnIndex.prune({ cutoff, candidates });
+  assert.equal(result.sessions, 2, 'the revived session is not counted');
+  assert.equal(result.messages, 4, 'counts report what actually went, not what was planned');
+  assert.equal(result.turns, 2);
+  assert.ok(turnIndex.sessionRow(ids[0]), 'the revived session survives its own prune batch');
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?').get(ids[0]).n, 2,
+    'and keeps every row it had');
+  assert.equal(turnIndex.sessionRow(ids[1]), null);
+  assert.equal(turnIndex.sessionRow(ids[2]), null);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM messages').get().n, 2);
+});
+
+test('the caller-supplied busy timeout is in force for schema creation, not just ingest', (t) => {
+  const dir = tempDir(t);
+  const pragma = (handle) => Number(Object.values(handle.prepare('PRAGMA busy_timeout').get())[0]);
+
+  // Creating the schema takes the write lock, so a hook that specified a quarter
+  // second must not sit on the default five while migrations run.
+  const handle = turnIndex.open(process.env.KEEP_TURN_INDEX_DB, { busyTimeoutMs: 250 });
+  assert.equal(pragma(handle), 250);
+  assert.equal(handle.prepare('PRAGMA user_version').get().user_version, turnIndex.SCHEMA_VERSION,
+    'the schema really was created under that timeout');
+
+  // And a fresh connection made by ingestFile itself carries the option through.
+  turnIndex.close();
+  const file = path.join(dir, `${SESSION}.jsonl`);
+  fs.writeFileSync(file, jsonl(claudeRecords()));
+  assert.equal(turnIndex.ingestFile(file, { agent: 'claude', busyTimeoutMs: 250 }).ok, true);
+  assert.equal(pragma(turnIndex.open()), 250);
+
+  // A caller that asks for nothing still gets the patient default.
+  turnIndex.close();
+  assert.equal(pragma(turnIndex.open()), 5000);
 });
 
 test('the database carries its schema version, fingerprint column and journal limit', (t) => {

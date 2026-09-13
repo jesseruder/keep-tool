@@ -155,19 +155,31 @@ function migrate(handle) {
   }
 }
 
-function open(file = databaseFile()) {
-  if (db && dbPath === file) return db;
+function open(file = databaseFile(), options = {}) {
+  if (db && dbPath === file) {
+    if (options.busyTimeoutMs != null) setBusyTimeout(db, options.busyTimeoutMs);
+    return db;
+  }
   if (db) close();
   const { DatabaseSync } = require('node:sqlite');
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const handle = new DatabaseSync(file);
-  handle.exec('PRAGMA journal_mode = WAL');
-  handle.exec('PRAGMA synchronous = NORMAL');
-  // Without a limit the WAL keeps whatever a backfill grew it to, forever.
-  handle.exec(`PRAGMA journal_size_limit = ${JOURNAL_SIZE_LIMIT}`);
-  busyTimeoutMs = null;
-  setBusyTimeout(handle, DEFAULT_BUSY_TIMEOUT_MS);
-  migrate(handle);
+  try {
+    handle.exec('PRAGMA journal_mode = WAL');
+    handle.exec('PRAGMA synchronous = NORMAL');
+    // Without a limit the WAL keeps whatever a backfill grew it to, forever.
+    handle.exec(`PRAGMA journal_size_limit = ${JOURNAL_SIZE_LIMIT}`);
+    busyTimeoutMs = null;
+    // The caller's timeout has to be in force for migrate() too: schema creation
+    // takes the write lock, and a hook racing another process's migration must
+    // give up in its own quarter second rather than the five-second default.
+    setBusyTimeout(handle, options.busyTimeoutMs == null ? DEFAULT_BUSY_TIMEOUT_MS : options.busyTimeoutMs);
+    migrate(handle);
+  } catch (error) {
+    try { handle.close(); } catch {}
+    busyTimeoutMs = null;
+    throw error;
+  }
   db = handle;
   dbPath = file;
   return db;
@@ -491,21 +503,43 @@ function latest(a, b) {
 // on every single Stop. The answer is the same for every session in a directory
 // and never changes, so the index itself is the cache: the call happens once per
 // directory across the whole fleet, not once per hook.
+function directoryExists(value) {
+  if (!value) return false;
+  try { return fs.statSync(String(value).replace(/^~(?=\/|$)/, os.homedir())).isDirectory(); } catch { return false; }
+}
+
 function projectForCwd(handle, cwd) {
   if (!cwd) return '';
+  // Take the most recent session in this exact directory, not an arbitrary one:
+  // a path can be deleted and reused by a different repository, and the newest
+  // answer is the only one that could still be right.
   const known = statement(handle,
-    "SELECT project FROM sessions WHERE cwd = ? AND project IS NOT NULL AND project != '' LIMIT 1").get(cwd);
-  if (known && known.project) return known.project;
+    `SELECT project FROM sessions WHERE cwd = ? AND project IS NOT NULL AND project != ''
+     ORDER BY COALESCE(last_at, started_at, 0) DESC LIMIT 1`).get(cwd);
+  // A cached answer is only trusted while the checkout it names is still there.
+  // The stat costs microseconds; the git call it saves costs ~110 ms. When the
+  // working directory itself is gone (a recycled worktree, a deleted repo) there
+  // is nothing better to compute, so the historical answer stands.
+  if (known && known.project && (directoryExists(known.project) || !directoryExists(cwd))) return known.project;
   // A directory already recorded as some session's project is a main checkout,
   // so it canonicalizes to itself and needs no git call either.
   const normalized = normalizeProject(cwd);
-  if (statement(handle, 'SELECT 1 AS hit FROM sessions WHERE project = ? LIMIT 1').get(normalized)) return normalized;
+  if (directoryExists(normalized)
+      && statement(handle, 'SELECT 1 AS hit FROM sessions WHERE project = ? LIMIT 1').get(normalized)) {
+    return normalized;
+  }
   return canonicalProject(cwd);
 }
 
 function resolveSessionProject(session, existing) {
-  if (existing && existing.project) return existing.project;
-  return (typeof session.project === 'function' ? session.project() : session.project) || '';
+  const cwd = session.cwd || '';
+  // A session that moved directories must be re-resolved. Keeping the old
+  // project would leave a (new cwd, old project) row behind, and that row is
+  // exactly what projectForCwd reads for every later session in that directory.
+  const moved = Boolean(existing && cwd && existing.cwd && existing.cwd !== cwd);
+  if (existing && existing.project && !moved) return existing.project;
+  const computed = typeof session.project === 'function' ? session.project() : session.project;
+  return computed || (existing && existing.project) || '';
 }
 
 function upsertSession(handle, session) {
@@ -850,12 +884,16 @@ function ingestFile(file, options = {}) {
   if (!stat.isFile()) return { ok: false, skipped: 'not-a-file' };
   const agent = options.agent === 'codex' || options.agent === 'claude' ? options.agent : agentForFile(file);
   let handle;
-  try { handle = open(options.db || databaseFile()); } catch (error) {
+  try {
+    handle = open(options.db || databaseFile(), { busyTimeoutMs: options.busyTimeoutMs });
+  } catch (error) {
+    // Creating the schema takes the write lock, so a first-ever hook can lose
+    // that race too; it is a skip like any other, not a failure.
+    if (isBusy(error)) { debug(`busy opening ${file}`); return { ok: false, skipped: 'busy' }; }
     debug(`open failed: ${error.message}`);
     return { ok: false, skipped: 'open-failed' };
   }
   try {
-    setBusyTimeout(handle, options.busyTimeoutMs);
     return ingestPass(handle, file, agent, stat, options);
   } catch (error) {
     try { handle.exec('ROLLBACK'); } catch {}
@@ -1145,37 +1183,68 @@ function backfill(options = {}) {
 // The index is a derived cache over transcripts Claude and Codex keep forever;
 // without a cutoff it grows for the life of the machine. Sessions with no
 // timestamp at all are never pruned — an unknown age is not an old age.
-function prune(options = {}) {
-  const handle = open(options.db || databaseFile());
+function pruneCutoff(options = {}) {
+  if (Number.isFinite(options.cutoff)) return options.cutoff;
   const olderThanMs = Number.isFinite(options.olderThanMs) && options.olderThanMs > 0
     ? options.olderThanMs : DEFAULT_PRUNE_DAYS * 86400e3;
-  const cutoff = Number.isFinite(options.cutoff) ? options.cutoff : Date.now() - olderThanMs;
+  return Date.now() - olderThanMs;
+}
+
+// Which sessions are stale right now. Exposed so a caller can look before it
+// deletes; prune re-checks each one under the write lock regardless.
+function pruneCandidates(options = {}) {
+  const handle = open(options.db || databaseFile());
   // The daemon prunes on its event loop, so a first sweep after a big backfill
   // must not delete tens of thousands of sessions in one go; it passes a limit
   // and comes back next tick while `more` is set. Oldest first.
   const limit = Number.isInteger(options.limit) && options.limit > 0 ? options.limit : -1;
-  const doomed = statement(handle,
+  return statement(handle,
     `SELECT id FROM sessions WHERE COALESCE(last_at, started_at) IS NOT NULL
        AND COALESCE(last_at, started_at) < ?
-     ORDER BY COALESCE(last_at, started_at) LIMIT ?`).all(cutoff, limit).map((row) => row.id);
-  const counts = { cutoff, sessions: doomed.length, messages: 0, turns: 0, files: 0, more: limit > 0 && doomed.length === limit };
-  if (!doomed.length) return counts;
+     ORDER BY COALESCE(last_at, started_at) LIMIT ?`).all(pruneCutoff(options), limit).map((row) => row.id);
+}
+
+function prune(options = {}) {
+  const handle = open(options.db || databaseFile());
+  const cutoff = pruneCutoff(options);
+  const limit = Number.isInteger(options.limit) && options.limit > 0 ? options.limit : -1;
+  const chosen = Array.isArray(options.candidates) ? options.candidates.filter(Boolean) : null;
+  const candidates = chosen || pruneCandidates({ ...options, cutoff });
   const countIn = (sql, id) => Number(statement(handle, sql).get(id).n || 0);
-  for (const id of doomed) {
-    counts.messages += countIn('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?', id);
-    counts.turns += countIn('SELECT COUNT(*) AS n FROM turns WHERE session_id = ?', id);
-    counts.files += countIn('SELECT COUNT(*) AS n FROM ingest_state WHERE session_id = ?', id);
+  const counts = {
+    cutoff, sessions: 0, messages: 0, turns: 0, files: 0,
+    more: !chosen && limit > 0 && candidates.length === limit,
+  };
+  if (!candidates.length) return options.dry === true ? { ...counts, dry: true } : counts;
+  if (options.dry === true) {
+    for (const id of candidates) {
+      counts.sessions += 1;
+      counts.messages += countIn('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?', id);
+      counts.turns += countIn('SELECT COUNT(*) AS n FROM turns WHERE session_id = ?', id);
+      counts.files += countIn('SELECT COUNT(*) AS n FROM ingest_state WHERE session_id = ?', id);
+    }
+    return { ...counts, dry: true };
   }
-  if (options.dry === true) return { ...counts, dry: true };
   setBusyTimeout(handle, options.busyTimeoutMs);
   handle.exec('BEGIN IMMEDIATE');
   try {
-    for (const id of doomed) {
+    for (const id of candidates) {
+      // Selection happened outside the lock, so a session may have received a
+      // turn since. The cutoff is re-checked here, in the same statement that
+      // deletes: only a session that is still stale loses its rows, and the
+      // counts report what actually went rather than what was planned.
+      const deleted = statement(handle,
+        `DELETE FROM sessions WHERE id = ? AND COALESCE(last_at, started_at) IS NOT NULL
+           AND COALESCE(last_at, started_at) < ?`).run(id, cutoff);
+      if (!Number(deleted.changes)) continue;
+      counts.sessions += 1;
+      counts.messages += countIn('SELECT COUNT(*) AS n FROM messages WHERE session_id = ?', id);
+      counts.turns += countIn('SELECT COUNT(*) AS n FROM turns WHERE session_id = ?', id);
+      counts.files += countIn('SELECT COUNT(*) AS n FROM ingest_state WHERE session_id = ?', id);
       // The messages delete fires the FTS delete trigger, so the shadow table
       // shrinks with the real one.
       clearSession(handle, id);
       statement(handle, 'DELETE FROM ingest_state WHERE session_id = ?').run(id);
-      statement(handle, 'DELETE FROM sessions WHERE id = ?').run(id);
     }
     handle.exec('COMMIT');
   } catch (error) {
@@ -1268,7 +1337,7 @@ function stats(options = {}) {
 }
 
 module.exports = {
-  open, close, databaseFile, ingestFile, ingestSessionsFromLiveState, backfill, prune,
+  open, close, databaseFile, ingestFile, ingestSessionsFromLiveState, backfill, prune, pruneCandidates,
   search, turnsForSession, sessionRow, stats, isNudge, normalizeProject,
   SCHEMA_VERSION, TEXT_CAP, TOOL_CAP, NUDGE_RE, DEFAULT_PRUNE_DAYS,
 };

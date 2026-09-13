@@ -62,6 +62,22 @@ checkout its cards are filed under. That fold is cached in the index itself —
 across the whole fleet, not once per hook. An in-process memo could not do this:
 every hook is a new process.
 
+`busyTimeoutMs` applies from the moment the connection opens, migrations
+included: creating the schema takes the write lock, so a first-ever hook can lose
+that race too, and it should give up in its own quarter second rather than the
+patient default. That case returns `{ skipped: 'busy' }` like any other.
+
+The project cache is only as good as its invalidation, so it has two rules. A
+cached answer is taken from the **most recent** session in that exact directory
+and trusted only while the checkout it names still exists on disk — a path can be
+deleted and reused by a different repository, and a `statSync` costs microseconds
+against the 110 ms it protects. And when a session's own `cwd` changes, its
+project is recomputed rather than carried forward: leaving a (new `cwd`, old
+project) row behind would poison the cache for every later session in that
+directory. The one deliberate exception is a working directory that no longer
+exists at all (a recycled worktree): there is nothing better to compute, so the
+historical answer stands rather than making backfill pay `git` per old file.
+
 A file is reset (its session's rows dropped, re-read from zero) when it shrinks
 (`size < offset`), when `--force` is given, or when the SHA-1 of its head no
 longer matches the one recorded in `ingest_state`. The fingerprint covers the
@@ -232,6 +248,14 @@ touching anything. The daemon's sweep is bounded (200 sessions, oldest first) so
 a first prune after a large backfill does not block its event loop; while the
 result says `more`, the next tick continues rather than waiting a day.
 
+Candidates are chosen outside the write lock, so each one is re-checked against
+the cutoff inside the transaction, in the same statement that deletes it: a
+session that received a turn in that window is no longer stale and keeps every
+row it had. Only a session whose own delete changed a row loses its messages,
+turns and `ingest_state`, and the reported counts are what actually went rather
+than what was planned. `pruneCandidates()` exposes that selection so a caller can
+look before it deletes.
+
 A pruned file that is still on disk is simply re-indexed from zero the next time
 something ingests it, since its `ingest_state` row went with it. Sessions with no
 timestamp at all are never pruned: an unknown age is not an old age.
@@ -255,3 +279,29 @@ the write-ahead log at whatever size it grew to.
 - `card_id` is filled only when a caller supplies it (the daemon passes it for
   sessions it already knows); `keep turns show <card>` resolves the link from the
   card's own frontmatter instead.
+
+## Accepted trade-offs
+
+These are known, deliberate, and reviewed. Each is a case where the cheap fix
+costs more than the bug.
+
+- **A single JSONL line longer than `maxBytes` is still read whole.** The cap
+  stops the pass at the first chunk boundary past the budget but never abandons a
+  line in progress, so one pathological record can overshoot its budget. The
+  alternative is dropping a record, which is strictly worse: an index that
+  silently loses messages is not trustworthy for counting turns. In practice the
+  case barely arises — Claude tool results are capped by the harness and Codex
+  truncates command output — so multi-megabyte lines are rare rather than routine.
+- **The daemon tick's 150 ms is a soft target, not a guarantee.** One file may
+  wait up to 250 ms for the write lock, and the daily prune runs after ingestion
+  in batches of 200 sessions, so a tick can exceed its budget. Both overruns are
+  bounded and infrequent, and tightening them would mean either abandoning work
+  mid-file or adding a second timer and a worker — complexity out of proportion
+  to a background sweep that runs every 30 seconds.
+- **A file rewritten with the same first 4 KiB and a larger size is not
+  detected.** The head fingerprint catches a replaced file whose head changed;
+  it cannot catch one whose head is byte-identical and which then grew. Agent
+  transcripts are append-only in practice — compaction appends a summary rather
+  than rewriting history — so the undetected shape is one neither Claude nor
+  Codex produces. Hashing the whole file on every pass would cost more than the
+  incremental read it guards.
