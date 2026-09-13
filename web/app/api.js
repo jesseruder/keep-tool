@@ -16,7 +16,8 @@ function rememberMutationFence(fence, observedAtStart) {
   if (!epoch || !Number.isSafeInteger(sequence)) return;
   const [currentEpoch, currentSequenceText] = observedMutationFence.split(':');
   const currentSequence = Number(currentSequenceText);
-  const mayChangeEpoch = !observedMutationFence || observedMutationFence === observedAtStart;
+  const [observedEpochAtStart] = String(observedAtStart || '').split(':');
+  const mayChangeEpoch = !observedMutationFence || currentEpoch === observedEpochAtStart;
   if ((epoch === currentEpoch && (!Number.isSafeInteger(currentSequence) || sequence > currentSequence))
       || (epoch !== currentEpoch && mayChangeEpoch)) {
     observedMutationFence = `${epoch}:${sequence}`;

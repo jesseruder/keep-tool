@@ -148,3 +148,45 @@ test('a delayed write response from a retired daemon epoch cannot erase a newer 
   await api.getState();
   assert.equal(calls.at(-1).headers['x-keep-after-mutation'], 'new:1');
 });
+
+test('a restart write response can supersede a concurrent sequence advance from the old epoch', async () => {
+  const calls = [];
+  let releaseOldWrite;
+  let releaseNewWrite;
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), headers: { ...(options.headers || {}) }, method: options.method || 'GET' });
+    if (String(url) === '/api/send') return new Promise((resolve) => {
+      releaseOldWrite = () => resolve(reply({ ok: true }, 'old:1'));
+    });
+    if (String(url) === '/api/answer') return new Promise((resolve) => {
+      releaseNewWrite = () => resolve(reply({ ok: true }, 'new:1'));
+    });
+    return reply({ marker: 'new' }, 'new:1');
+  };
+  const api = await import(`./api.js?restart-writes=${Date.now()}`);
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), headers: { ...(options.headers || {}) }, method: options.method || 'GET' });
+    if ((options.method || 'GET') === 'GET') return reply({ marker: 'old' }, 'old:0');
+    throw new Error(`unexpected request ${url}`);
+  };
+  await api.getState();
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), headers: { ...(options.headers || {}) }, method: options.method || 'GET' });
+    if (String(url) === '/api/send') return new Promise((resolve) => {
+      releaseOldWrite = () => resolve(reply({ ok: true }, 'old:1'));
+    });
+    if (String(url) === '/api/answer') return new Promise((resolve) => {
+      releaseNewWrite = () => resolve(reply({ ok: true }, 'new:1'));
+    });
+    return reply({ marker: 'new' }, 'new:1');
+  };
+  const oldWrite = api.send('session', 'old daemon');
+  const newWrite = api.answer('session', 'yes', 'New daemon');
+  while (!releaseOldWrite || !releaseNewWrite) await new Promise((resolve) => setImmediate(resolve));
+  releaseOldWrite();
+  await oldWrite;
+  releaseNewWrite();
+  await newWrite;
+  await api.getState();
+  assert.equal(calls.at(-1).headers['x-keep-after-mutation'], 'new:1');
+});
