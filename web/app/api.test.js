@@ -121,3 +121,30 @@ test('a portable read started before a write cannot return old data after state 
   assert.deepEqual(await portable, { ok: true, transfers: [{ id: 'new' }] });
   assert.equal(portableReads, 2);
 });
+
+test('a delayed write response from a retired daemon epoch cannot erase a newer pending write', async () => {
+  const calls = [];
+  let releaseOldWrite;
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), headers: { ...(options.headers || {}) }, method: options.method || 'GET' });
+    if (String(url) === '/api/send') return new Promise((resolve) => {
+      releaseOldWrite = () => resolve(reply({ ok: true }, 'old:1'));
+    });
+    if (String(url) === '/api/answer') return reply({ ok: true }, 'new:1');
+    if (String(url).startsWith('/api/state')) {
+      const count = calls.filter((call) => call.url.startsWith('/api/state')).length;
+      return reply({ marker: count === 1 ? 'old' : 'new' }, count === 1 ? 'old:0' : count === 2 ? 'new:0' : 'new:1');
+    }
+    throw new Error(`unexpected request ${url}`);
+  };
+  const api = await import(`./api.js?retired=${Date.now()}`);
+  await api.getState();
+  const oldWrite = api.send('session', 'old daemon');
+  while (!releaseOldWrite) await new Promise((resolve) => setImmediate(resolve));
+  await api.getState();
+  await api.answer('session', 'yes', 'New daemon');
+  releaseOldWrite();
+  await oldWrite;
+  await api.getState();
+  assert.equal(calls.at(-1).headers['x-keep-after-mutation'], 'new:1');
+});

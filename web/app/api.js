@@ -10,13 +10,15 @@ const STATE_MUTATIONS = new Set([
 let stateAfterMutation = '';
 let observedMutationFence = '';
 
-function rememberMutationFence(fence) {
+function rememberMutationFence(fence, observedAtStart) {
   const [epoch, sequenceText] = String(fence || '').split(':');
   const sequence = Number(sequenceText);
   if (!epoch || !Number.isSafeInteger(sequence)) return;
   const [currentEpoch, currentSequenceText] = observedMutationFence.split(':');
   const currentSequence = Number(currentSequenceText);
-  if (epoch !== currentEpoch || !Number.isSafeInteger(currentSequence) || sequence > currentSequence) {
+  const mayChangeEpoch = !observedMutationFence || observedMutationFence === observedAtStart;
+  if ((epoch === currentEpoch && (!Number.isSafeInteger(currentSequence) || sequence > currentSequence))
+      || (epoch !== currentEpoch && mayChangeEpoch)) {
     observedMutationFence = `${epoch}:${sequence}`;
     stateAfterMutation = observedMutationFence;
   }
@@ -70,7 +72,7 @@ async function request(url, options = {}) {
   }
   else if ((options.method || 'GET') !== 'GET'
       && (STATE_MUTATIONS.has(pathname) || /^\/api\/panes\/[^/]+\/(?:kill|remove)$/.test(pathname))
-      && fence) rememberMutationFence(fence);
+      && fence) rememberMutationFence(fence, observedFenceAtStart);
   return body;
 }
 
