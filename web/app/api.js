@@ -28,6 +28,7 @@ function rememberMutationFence(fence) {
 async function request(url, options = {}) {
   const pathname = new URL(url, location.origin).pathname;
   const requiredFence = stateAfterMutation;
+  const observedFenceAtStart = observedMutationFence;
   const headers = { 'x-keep': '1', ...options.headers };
   if ((pathname === '/api/state' || pathname === '/api/portable-transfers') && requiredFence) {
     headers['x-keep-after-mutation'] = requiredFence;
@@ -50,7 +51,9 @@ async function request(url, options = {}) {
     const publishedSequence = Number(publishedSequenceText);
     const requiredSequence = Number(requiredSequenceText);
     const [sentEpoch] = requiredFence.split(':');
-    const restarted = Boolean(requiredFence && sentEpoch === requiredEpoch && publishedEpoch && publishedEpoch !== requiredEpoch);
+    const restarted = Boolean(publishedEpoch && publishedEpoch !== requiredEpoch
+      && observedMutationFence === observedFenceAtStart
+      && (!requiredFence || sentEpoch === requiredEpoch));
     const satisfied = !latestRequired || restarted
       || (publishedEpoch === requiredEpoch && Number.isSafeInteger(publishedSequence)
         && Number.isSafeInteger(requiredSequence) && publishedSequence >= requiredSequence);
@@ -60,7 +63,7 @@ async function request(url, options = {}) {
       error.body = { error: error.message };
       throw error;
     }
-    if (restarted) observedMutationFence = fence;
+    if (!observedMutationFence || restarted) observedMutationFence = fence;
     if (pathname === '/api/state' && (!stateAfterMutation || stateAfterMutation === latestRequired || restarted)) {
       stateAfterMutation = '';
     }

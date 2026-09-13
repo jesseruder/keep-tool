@@ -49,6 +49,13 @@ test('fresh reads preserve the newest concurrent mutation fence and accept a res
   await api.getState();
   assert.equal(calls.at(-1).headers['x-keep-after-mutation'], undefined,
     'the restart response clears the obsolete epoch fence');
+
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), headers: { ...(options.headers || {}) }, method: options.method || 'GET' });
+    return reply({ marker: 'ordinary-restart' }, 'newer:0');
+  };
+  assert.deepEqual(await api.getState(), { marker: 'ordinary-restart' },
+    'a daemon restart is accepted after the prior mutation fence was already satisfied');
 });
 
 test('portable metadata waits on the same post-write fence as dashboard state', async () => {
