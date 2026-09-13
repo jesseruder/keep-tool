@@ -150,6 +150,7 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .shead h2 { margin: 0; flex: 1 1 240px; min-width: 0; font-size: 15px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .shead .meta { color: var(--muted); font-size: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; } .shead .meta a { color: var(--info); text-decoration: none; }
 .shead .acts { margin-left: auto; display: flex; gap: 6px; position: relative; }
+.primary-actions { display: flex; gap: 6px; }
 .shead .acts .btn { border-color: var(--line); color: var(--muted); }
 .shead .acts .btn:hover:not(:disabled) { border-color: var(--line); color: var(--text); }
 .shead .acts kbd { display: none; }
@@ -161,6 +162,25 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .account-menu { position: absolute; top: calc(100% + 5px); right: 0; min-width: 190px; padding: 6px; display: flex; flex-direction: column; gap: 4px; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 6px; box-shadow: var(--shadow); z-index: 25; }
 .account-menu .btn { justify-content: space-between; width: 100%; }
 .account-menu .btn small { color: var(--faint); font-size: 10px; }
+.session-actions { position: relative; }
+.session-actions > summary { list-style: none; cursor: pointer; white-space: nowrap; }
+.session-actions > summary::-webkit-details-marker { display: none; }
+.session-actions > summary::after { content: '▾'; margin-left: 6px; color: var(--faint); font-size: 9px; }
+.session-actions[open] > summary { color: var(--text); background: var(--sel); }
+.session-actions-pop { position: absolute; top: calc(100% + 5px); right: 0; z-index: 30; width: 230px; padding: 6px; border: 1px solid var(--line-2); border-radius: 6px; background: var(--panel-2); box-shadow: var(--shadow); }
+.session-actions-content { display: flex; flex-direction: column; gap: 4px; }
+.session-actions-content > .btn, .session-actions-content > div > .btn,
+.session-actions-content .account-handoff > summary { width: 100%; justify-content: space-between; padding: 6px 8px; text-align: left; }
+.session-actions-content .portable-transfer-controls, .session-actions-content .account-controls,
+.session-actions-content .restart-controls { display: contents; }
+.session-actions-content .account-menu { position: static; min-width: 0; margin-top: 4px; box-shadow: none; }
+.session-actions-content .handoff-status, .session-actions-content .handoff-error,
+.session-actions-content .restart-reason, .session-actions-content .portable-transfer-state { padding: 4px 8px; white-space: normal; }
+.session-actions-label { margin: 4px 8px 1px; padding-top: 7px; border-top: 1px solid var(--line); color: var(--faint); font: 500 10px var(--mono); text-transform: uppercase; letter-spacing: .06em; }
+.renderer-options { display: flex; flex-direction: column; gap: 3px; }
+.renderer-choice { justify-content: space-between; width: 100%; padding: 6px 8px; text-align: left; }
+.renderer-choice.selected { color: var(--text); background: var(--sel); }
+.renderer-check { color: var(--accent); }
 .handoff-status, .handoff-error { align-self: center; color: var(--muted); font-size: 11px; white-space: nowrap; }
 .handoff-error { color: var(--bad); }
 .session-launch-dialog { width: min(560px, calc(100vw - 32px)); max-width: none; padding: 0; border: 1px solid var(--line-2); border-radius: 10px; background: var(--panel); color: var(--text); box-shadow: var(--shadow); }
@@ -270,12 +290,14 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .wedit .row { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-radius: 5px; background: var(--panel-2); font-size: 12px; } .wedit .row b { font-weight: 500; overflow: hidden; text-overflow: ellipsis; flex: 1; white-space: nowrap; } .wedit .row .st { color: var(--muted); font: 11px var(--mono); } .wedit .row button { color: var(--muted); padding: 2px 5px; } .wedit .row button.add { color: var(--info); } .wedit .pick { max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; } .wedit .danger { color: var(--bad); } .wedit .muted { color: var(--muted); }
 .wgrid { flex: 1; min-height: 0; display: grid; grid-auto-rows: minmax(0, 1fr); gap: 1px; background: var(--line); padding: 1px; }
 .wpane { display: flex; flex-direction: column; min-height: 0; min-width: 0; background: var(--bg); }
-.wpane .ph { display: flex; align-items: center; gap: 10px; padding: 6px 12px; background: var(--panel); border-bottom: 1px solid var(--line); font-size: 12px; } .wpane .ph b { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .wpane .ph .proj { color: var(--muted); font: 11px var(--mono); overflow: hidden; text-overflow: ellipsis; } .wpane .ph .st { margin-left: auto; display: flex; gap: 6px; align-items: center; color: var(--muted); font-size: 11px; white-space: nowrap; }
+.wpane .ph { display: flex; align-items: center; gap: 10px; padding: 6px 12px; background: var(--panel); border-bottom: 1px solid var(--line); font-size: 12px; } .wpane .ph b { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .wpane .ph .proj { color: var(--muted); font: 11px var(--mono); overflow: hidden; text-overflow: ellipsis; } .wpane .ph .pane-state { margin-left: auto; } .wpane .ph .st { display: flex; gap: 6px; align-items: center; color: var(--muted); font-size: 11px; white-space: nowrap; }
 .wpane .ph .st i, .fleet .st i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; background: var(--faint); } .wpane .ph .st i.running, .fleet .st i.running { background: var(--ok); } .wpane .ph .st i.idle, .wpane .ph .st i.waiting, .fleet .st i.idle, .fleet .st i.waiting { background: var(--warn); } .wpane .ph .st i.limit, .fleet .st i.limit { background: var(--violet); }
 .wpane .ph .st i.exited, .fleet .st i.exited { background: var(--faint); }
 .wpane .ph .st i.idle, .fleet .st i.idle { background: var(--faint); }
 .wpane .ph .st i.needs-input, .fleet .st i.needs-input { background: var(--accent); }
 .wpane .ph button { color: var(--faint); padding: 2px 4px; } .wpane .ph button:hover { color: var(--text); }
+.wpane .ph .pane-primary-actions { display: flex; }
+.wpane .ph .session-actions-pop .btn { padding: 6px 8px; }
 .wpane .account-handoff > summary { color: var(--faint); padding: 2px 4px; }
 .wempty { grid-column: 1 / -1; display: flex; align-items: center; justify-content: center; color: var(--muted); background: var(--bg); text-align: center; line-height: 1.7; }
 

@@ -18,7 +18,7 @@ const fixtureHtml = `<!doctype html>
 <script>
   const terminal = new Terminal({ cols: 40, rows: 5, scrollback: 100 });
   terminal.open(document.getElementById('terminal'));
-  const webgl = new WebglAddon.WebglAddon();
+  let webgl = new WebglAddon.WebglAddon();
   terminal.loadAddon(webgl);
   const write = data => new Promise(resolve => terminal.write(data, resolve));
   window.fixture = {
@@ -29,16 +29,31 @@ const fixtureHtml = `<!doctype html>
       const before = terminal.buffer.active.getLine(terminal.buffer.active.baseY + terminal.buffer.active.cursorY)
         .translateToString(true);
       webgl.dispose();
+      terminal.refresh(0, terminal.rows - 1);
       await new Promise(requestAnimationFrame);
       await write(' after switch');
       await new Promise(requestAnimationFrame);
+      const standardText = terminal.element.querySelector('.xterm-rows')?.textContent || '';
+      webgl = new WebglAddon.WebglAddon();
+      terminal.loadAddon(webgl);
+      terminal.refresh(0, terminal.rows - 1);
+      await write(' and back');
+      await new Promise(requestAnimationFrame);
+      const screen = terminal.element.querySelector('.xterm-screen').getBoundingClientRect();
+      const canvases = [...terminal.element.querySelectorAll('canvas')].map(canvas => ({
+        width: canvas.width, height: canvas.height,
+        cssWidth: canvas.getBoundingClientRect().width,
+        cssHeight: canvas.getBoundingClientRect().height,
+      }));
       return {
         before,
         after: terminal.buffer.active.getLine(terminal.buffer.active.baseY + terminal.buffer.active.cursorY)
           .translateToString(true),
         bufferLength: terminal.buffer.active.length,
-        domText: terminal.element.querySelector('.xterm-rows')?.textContent || '',
-        canvases: terminal.element.querySelectorAll('canvas').length,
+        standardText,
+        screen: { width: screen.width, height: screen.height },
+        canvases,
+        devicePixelRatio,
       };
     },
   };
@@ -70,19 +85,26 @@ async function listen(instance) {
 
 const browserTest = process.env.KEEP_BROWSER_TEST ? test : test.skip;
 
-browserTest('disposing the WebGL addon restores DOM rendering without replacing terminal state in WebKit', async () => {
+browserTest('WebKit switches renderers both ways without losing state or high-DPR geometry', async () => {
   const instance = server();
   const url = await listen(instance);
   const browser = await webkit.launch({ headless: true });
   try {
-    const page = await browser.newPage();
+    const context = await browser.newContext({ deviceScaleFactor: 2 });
+    const page = await context.newPage();
     await page.goto(url);
     const result = await page.evaluate(() => window.fixture.prepare());
     assert.equal(result.before, 'before switch');
-    assert.equal(result.after, 'before switch after switch');
+    assert.equal(result.after, 'before switch after switch and back');
     assert.ok(result.bufferLength > 5, 'scrollback survives the renderer switch');
-    assert.match(result.domText, /before switch after switch/);
-    assert.equal(result.canvases, 0, 'the disposed WebGL canvas is removed');
+    assert.match(result.standardText, /before switch after switch/);
+    assert.equal(result.devicePixelRatio, 2);
+    assert.ok(result.canvases.length > 0, 'switching back installs GPU canvases');
+    assert.ok(result.canvases.every(canvas => canvas.width >= canvas.cssWidth * 1.9
+      && canvas.height >= canvas.cssHeight * 1.9), 'GPU canvases cover their CSS geometry at high pixel density');
+    assert.ok(result.canvases.some(canvas => canvas.cssWidth >= result.screen.width * 0.9
+      && canvas.cssHeight >= result.screen.height * 0.9), 'a GPU canvas covers the terminal screen');
+    await context.close();
   } finally {
     await browser.close();
     await new Promise(resolve => instance.close(resolve));

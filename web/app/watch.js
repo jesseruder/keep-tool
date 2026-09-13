@@ -2,6 +2,7 @@ import * as api from './api.js';
 import { sessionExplanation } from './status.js';
 import { accountLabelHTML, handoffControls, installHandoffControls, hasPendingHandoff } from './account-controls.js';
 import { portableTransferControls, installPortableTransferControls } from './portable-transfer.js';
+import { actionsMenuHTML, installActionsMenu, patchActionsMenu, rendererControlsHTML } from './session-actions.js';
 
 const SHELL_PROJECT_KEY = 'keep.console.shellProject';
 
@@ -109,34 +110,27 @@ function renderGrid(ctx, layout) {
       element = document.createElement('div');
       element.className = 'wpane';
       element.dataset.pane = pane.id;
-      element.innerHTML = '<div class="ph"></div><div class="pane-terminal"></div>';
+      element.innerHTML = `<div class="ph"><div class="session-heading"></div><span class="pane-state"></span><div class="pane-primary-actions"></div>${actionsMenuHTML()}</div><div class="pane-terminal"></div>`;
     }
     const shell = pane.meta?.agent === 'shell';
     const closable = pane.alive && ['claude', 'codex'].includes(pane.meta?.agent) && pane.meta?.sessionId;
     const pendingHandoff = hasPendingHandoff(ctx, pane.meta?.sessionId, pane.id);
     const exitedAgent = pane.alive === false && ['claude', 'codex'].includes(pane.meta?.agent);
-    ctx.patchHTML(element.querySelector('.ph'), `<div class="session-heading"><b>${ctx.esc(entity.title)}</b><div class="meta">${ctx.projectHTML(entity.project)}${entity.taskId ? `<span class="proj">${ctx.esc(entity.taskId)}</span>${ctx.tagsHTML(ctx.taskFor(entity))}` : ''}${accountLabelHTML(ctx, entity.session, pane)}</div></div><span class="st"><i class="${ctx.esc(entity.state)}"></i>${ctx.esc(entity.stateLabel || entity.state)}</span><button data-unpin title="unpin">✕</button>${closable ? '<button data-close-session>Close</button>' : ''}${shell ? `<button data-kill title="${pane.alive ? 'kill' : 'remove'}">${pane.alive ? '■' : '⌫'}</button>` : ''}${exitedAgent && !pendingHandoff ? '<button data-reopen title="reopen">Reopen</button><button data-remove-pane title="remove">Remove</button>' : ''}`);
+    ctx.patchHTML(element.querySelector('.ph .session-heading'), `<b>${ctx.esc(entity.title)}</b><div class="meta">${ctx.projectHTML(entity.project)}${entity.taskId ? `<span class="proj">${ctx.esc(entity.taskId)}</span>${ctx.tagsHTML(ctx.taskFor(entity))}` : ''}${accountLabelHTML(ctx, entity.session, pane)}</div>`);
+    ctx.patchHTML(element.querySelector('.pane-state'), `<span class="st"><i class="${ctx.esc(entity.state)}"></i>${ctx.esc(entity.stateLabel || entity.state)}</span>`);
+    ctx.patchHTML(element.querySelector('.pane-primary-actions'), '<button data-unpin title="Unpin from Watch" aria-label="Unpin from Watch">✕</button>');
+    const portable = (closable || pendingHandoff) && !entity.session?.reviewer ? portableTransferControls(ctx, pane.meta.sessionId) : '';
+    const handoff = (closable || pendingHandoff) && !entity.session?.reviewer ? handoffControls(ctx, pane.meta.sessionId, pane.id) : '';
+    const restart = closable && !pendingHandoff && !entity.session?.reviewer ? restartControls(ctx, pane.meta.sessionId) : '';
+    const menu = element.querySelector('.session-actions');
+    patchActionsMenu(ctx, menu, `${closable ? '<button class="btn" data-close-session>Close session</button>' : ''}${shell ? `<button class="btn" data-kill>${pane.alive ? 'Kill shell' : 'Remove shell'}</button>` : ''}${exitedAgent && !pendingHandoff ? '<button class="btn" data-reopen>Reopen</button><button class="btn" data-remove-pane>Remove pane</button>' : ''}<div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><span class="restart-controls">${restart}</span>${rendererControlsHTML(ctx, pane.id, pane)}`);
+    installActionsMenu(menu, ctx, pane.id);
+    if (portable) installPortableTransferControls(menu.querySelector('.portable-transfer-controls'), ctx);
+    if (handoff) installHandoffControls(menu.querySelector('.account-controls'), ctx, pane.meta.sessionId, pane.id);
+    if (restart) installRestartControls(menu.querySelector('.restart-controls'), ctx, pane.meta.sessionId, pane.id);
     retained.add(element);
     const closeButton = element.querySelector('[data-close-session]');
     if (closeButton) closeButton.onclick = () => closeSession(ctx, pane.meta.sessionId, pane.id, closeButton);
-    if ((closable || pendingHandoff) && !entity.session?.reviewer) {
-      const header = element.querySelector('.ph');
-      let portable = header.querySelector('.portable-transfer-controls');
-      if (!portable) { portable = document.createElement('div'); portable.className = 'portable-transfer-controls'; header.append(portable); }
-      ctx.patchHTML(portable, portableTransferControls(ctx, pane.meta.sessionId));
-      installPortableTransferControls(portable, ctx);
-      let accounts = header.querySelector('.account-controls');
-      if (!accounts) { accounts = document.createElement('div'); accounts.className = 'account-controls'; header.append(accounts); }
-      ctx.patchHTML(accounts, handoffControls(ctx, pane.meta.sessionId, pane.id));
-      installHandoffControls(accounts, ctx, pane.meta.sessionId, pane.id);
-    }
-    if (closable && !pendingHandoff && !entity.session?.reviewer) {
-      const header = element.querySelector('.ph');
-      let controls = header.querySelector('.restart-controls');
-      if (!controls) { controls = document.createElement('span'); controls.className = 'restart-controls'; header.append(controls); }
-      ctx.patchHTML(controls, restartControls(ctx, pane.meta.sessionId));
-      installRestartControls(controls, ctx, pane.meta.sessionId, pane.id);
-    }
     if (element !== cursor) grid.insertBefore(element, cursor);
     cursor = element.nextElementSibling;
     const focus = ctx.state.focusPane === pane.id;

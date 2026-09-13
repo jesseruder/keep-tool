@@ -8,7 +8,8 @@ const { Terminal: HeadlessTerminal } = require('@xterm/headless');
 const imagePasteSource = fs.readFileSync(path.join(__dirname, '../web/app/image-paste.js'), 'utf8').replace(/^export /gm, '');
 const terminalScrollSource = fs.readFileSync(path.join(__dirname, '../web/app/terminal-scroll.js'), 'utf8').replace(/^export /gm, '');
 const terminalProfileSource = fs.readFileSync(path.join(__dirname, '../web/app/terminal-profile.js'), 'utf8').replace(/^export /gm, '');
-const source = imagePasteSource + '\n' + terminalScrollSource + '\n' + terminalProfileSource + '\n' + fs.readFileSync(path.join(__dirname, '../web/app/terminal.js'), 'utf8')
+const terminalRendererSource = fs.readFileSync(path.join(__dirname, '../web/app/terminal-renderer.js'), 'utf8').replace(/^export /gm, '');
+const source = imagePasteSource + '\n' + terminalScrollSource + '\n' + terminalProfileSource + '\n' + terminalRendererSource + '\n' + fs.readFileSync(path.join(__dirname, '../web/app/terminal.js'), 'utf8')
   .replace(/^import .*;\n/gm, '').replace('export function mountTerminal', 'function mountTerminal');
 
 test('Triage and Watch move one terminal viewer instead of retaining a hidden primary', () => {
@@ -71,7 +72,7 @@ function fixture(options = {}) {
     addEventListener(type, listener) { this.listeners.set(type, listener); }
     dispatch(type, event = {}) { this.listeners.get(type)?.({ stopPropagation() {}, ...event }); }
   }
-  let terminal, fits = 0, exits = 0, webglLoads = 0, webglDisposals = 0;
+  let terminal, fits = 0, exits = 0, refreshes = 0, webglLoads = 0, webglDisposals = 0;
   class Terminal extends HeadlessTerminal {
     constructor(options) { super(options); terminal = this; this.textarea = new Element(); this.visualElement = new Element(); }
     get element() { return this.visualElement; }
@@ -86,6 +87,7 @@ function fixture(options = {}) {
     attachCustomKeyEventHandler(handler) { this.keyHandler = handler; }
     attachCustomWheelEventHandler(handler) { this.wheelHandler = handler; }
     onBinary(handler) { this.binaryHandler = handler; return { dispose() {} }; }
+    refresh() { refreshes++; }
     focus() {}
   }
   class WebSocket {
@@ -107,6 +109,11 @@ function fixture(options = {}) {
   class FakeDate extends Date {
     static now() { return now; }
   }
+  const storage = options.storage || new Map();
+  const localStorage = {
+    getItem: (key) => storage.has(key) ? storage.get(key) : null,
+    setItem: (key, value) => storage.set(key, String(value)),
+  };
   const context = vm.createContext({
     TextEncoder, Uint8Array, URLSearchParams, WebSocket, devicePixelRatio: 2,
     document: { createElement: () => new Element(), activeElement: null },
@@ -122,7 +129,7 @@ function fixture(options = {}) {
       ...(options.desktop ? { __TAURI__: {} } : {}),
     },
     ResizeObserver: class { observe() {} disconnect() {} },
-    sessionStorage: { getItem: () => 'viewer' },
+    sessionStorage: { getItem: () => 'viewer' }, localStorage,
     location: { protocol: 'http:', host: 'localhost' },
     performance: { now: () => 1 },
     getComputedStyle: () => ({ paddingLeft: '8', paddingRight: '8', paddingTop: '8', paddingBottom: '0' }),
@@ -159,7 +166,8 @@ function fixture(options = {}) {
     },
     setNow(value) { now = value; },
     get fits() { return fits; }, get exits() { return exits; },
-    get webglLoads() { return webglLoads; }, get webglDisposals() { return webglDisposals; },
+    storage, setPreference: context.setTerminalRendererPreference,
+    get refreshes() { return refreshes; }, get webglLoads() { return webglLoads; }, get webglDisposals() { return webglDisposals; },
   };
 }
 
@@ -209,6 +217,47 @@ test('a valid desktop renderer trial switches the existing terminal and clears i
     assert.equal(f.webglLoads, 1, 'clearing metadata restores the normal renderer immediately');
     assert.equal(f.mounted.terminal, sameTerminal);
     assert.equal(f.terminal.buffer.active.getLine(0).translateToString(true), 'retained output');
+  } finally { f.mounted.dispose(); }
+});
+
+test('an explicit renderer preference switches both ways, preserves history, and survives remount', async () => {
+  const storage = new Map();
+  const f = fixture({ storage });
+  try {
+    f.runFrames();
+    f.message({ t: 'replay-end' });
+    await f.drain();
+    f.socket.onmessage({ data: new TextEncoder().encode('retained output').buffer });
+    await f.drain();
+    f.setPreference('pane', 'dom', { getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value) });
+    f.mounted.setRenderer('dom');
+    assert.equal(f.webglDisposals, 1);
+    assert.equal(f.terminal.buffer.active.getLine(0).translateToString(true), 'retained output');
+    assert.ok(f.refreshes > 0, 'the DOM renderer repaints existing rows');
+    f.setPreference('pane', 'webgl', { getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value) });
+    f.mounted.setRenderer('webgl');
+    assert.equal(f.webglLoads, 2);
+    assert.equal(f.terminal.buffer.active.getLine(0).translateToString(true), 'retained output');
+  } finally { f.mounted.dispose(); }
+
+  const reloaded = fixture({ storage });
+  try {
+    reloaded.runFrames();
+    assert.equal(reloaded.webglLoads, 1, 'the saved GPU preference is restored on remount');
+  } finally { reloaded.mounted.dispose(); }
+});
+
+test('an explicit GPU preference overrides an active Standard renderer trial', () => {
+  const now = 1_000_000;
+  const storage = new Map([['keep.console.terminalRenderer:pane', 'webgl']]);
+  const f = fixture({
+    desktop: true, now, storage,
+    pane: { meta: { sessionId: 'session', terminalRendererTrial: rendererTrial('session', now + 10_000) } },
+  });
+  try {
+    f.runFrames();
+    assert.equal(f.webglLoads, 1);
+    assert.equal(f.webglDisposals, 0);
   } finally { f.mounted.dispose(); }
 });
 

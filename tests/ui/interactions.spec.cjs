@@ -30,6 +30,11 @@ async function selected(page, id) {
   await expect(page.locator('#stage')).toHaveAttribute('data-item-key', id);
   await expect(page.locator('#stage')).toHaveAttribute('data-pane', `p${id}`);
 }
+async function openActions(root) {
+  const menu = root.locator('.session-actions');
+  if (await menu.getAttribute('open') === null) await menu.locator(':scope > summary').click();
+  return menu;
+}
 test('pressed session keeps its identity when rows reorder before release', async ({ page }) => {
   await down(page, '#qlist [data-key="running:b"] .t');
   await updateDuringPress(page, () => fixture.update('b', { state: 'waiting', title: 'Session B updated' }));
@@ -66,6 +71,7 @@ test('rapid switching routes typing to the last clicked session during updates',
 });
 test('Close disappears before slow response and stays hidden through stale updates', async ({ page }) => {
   fixture.configure({ closeDelay: 1800 });
+  await openActions(page.locator('#stage'));
   await page.locator('#stage [data-close-session]').click();
   await expect(page.locator('#qlist [data-key="running:a"]')).toHaveCount(0, { timeout: 100 });
   await expect(page.locator('#qlist [data-key="pinned:a"]')).toHaveCount(0);
@@ -81,6 +87,7 @@ test('Close disappears before slow response and stays hidden through stale updat
 });
 test('failed Close restores session and pin without stealing a newer selection', async ({ page }) => {
   fixture.configure({ closeDelay: 900, closeFails: true });
+  await openActions(page.locator('#stage'));
   await page.locator('#stage [data-close-session]').click();
   await expect(page.locator('#qlist [data-key="running:a"]')).toHaveCount(0, { timeout: 100 });
   await page.locator('#qlist [data-key="running:c"]').click();
@@ -92,9 +99,46 @@ test('failed Close restores session and pin without stealing a newer selection',
 });
 test('Watch Close hides the pane immediately', async ({ page }) => {
   await page.locator('[data-mode="watch"]').click();
+  await page.locator('.wpane[data-pane="pa"] .session-actions > summary').click();
   await page.locator('.wpane[data-pane="pa"] [data-close-session]').click();
   await expect(page.locator('.wpane[data-pane="pa"]')).toHaveCount(0, { timeout: 100 });
   await expect(page.locator('.wpane[data-pane="pb"]')).toBeVisible();
+});
+
+test('renderer choice persists while the Actions menu survives polling and keyboard dismissal', async ({ page }) => {
+  const stage = page.locator('#stage');
+  const menu = stage.locator('.session-actions');
+  await expect(stage.locator('.primary-actions [data-pin]')).toBeVisible();
+  await expect(stage.locator('.acts > [data-close-session]')).toHaveCount(0);
+
+  await menu.locator(':scope > summary').click();
+  await expect(menu).toHaveAttribute('open', '');
+  await expect(menu.locator('[data-renderer="webgl"]')).toHaveAttribute('aria-pressed', 'true');
+  await menu.locator('[data-renderer="dom"]').click();
+  await expect(menu).toHaveAttribute('open', '');
+  await expect(menu.locator('[data-renderer="dom"]')).toBeFocused();
+  await expect(menu.locator('[data-renderer="dom"]')).toHaveAttribute('aria-pressed', 'true');
+  expect(await page.evaluate(() => localStorage.getItem('keep.console.terminalRenderer:pa'))).toBe('dom');
+
+  fixture.update('a', { title: 'Session A updated during polling' });
+  await expect(stage.locator('h2')).toHaveText('Session A updated during polling');
+  await expect(menu).toHaveAttribute('open', '');
+  await expect(menu.locator('[data-renderer="dom"]')).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(menu).not.toHaveAttribute('open', '');
+  await expect(menu.locator(':scope > summary')).toBeFocused();
+
+  await page.reload();
+  await expect(page.locator('#stage .term-state')).toHaveText('live');
+  const restored = page.locator('#stage .session-actions');
+  await restored.locator(':scope > summary').click();
+  await expect(restored.locator('[data-renderer="dom"]')).toHaveAttribute('aria-pressed', 'true');
+  await restored.locator('[data-renderer="webgl"]').click();
+  await expect(restored.locator('[data-renderer="webgl"]')).toHaveAttribute('aria-pressed', 'true');
+  expect(await page.evaluate(() => localStorage.getItem('keep.console.terminalRenderer:pa'))).toBe('webgl');
+
+  await page.locator('#stage .session-heading h2').click();
+  await expect(restored).not.toHaveAttribute('open', '');
 });
 
 test('account handoff sends the explicit destination and confirms refreshed identity', async ({ page }) => {
@@ -103,6 +147,7 @@ test('account handoff sends the explicit destination and confirms refreshed iden
   await expect(page.locator('#meters')).toContainText('Codex 5h');
   await expect(page.locator('#meters')).not.toContainText('legacy');
   await expect(page.locator('#stage .account-label')).toHaveText('Claude Main');
+  await openActions(page.locator('#stage'));
   await page.locator('#stage .account-handoff > summary').click();
   await expect(page.locator('#stage [data-handoff-account="claude-two"]')).toBeVisible();
   await expect(page.locator('#stage [data-handoff-account="claude-two"] small')).toHaveText('5h 11%');
@@ -184,6 +229,7 @@ test('top bar popovers start after a wrapped meter header', async ({ page }) => 
 
 test('interrupted account handoff exposes retry and never claims an unverified resume', async ({ page }) => {
   fixture.configure({ handoffRecoversOnce: true });
+  await openActions(page.locator('#stage'));
   await page.locator('#stage .account-handoff > summary').click();
   await page.locator('#stage [data-handoff-account="claude-two"]').click();
   await expect(page.locator('#toast')).toContainText('Transfer needs recovery');
@@ -201,6 +247,7 @@ test('Watch can retry an interrupted handoff after its target pane exits', async
   fixture.configure({ handoffRecoversOnce: true });
   await page.locator('[data-mode="watch"]').click();
   const pane = page.locator('.wpane[data-pane="pa"]');
+  await openActions(pane);
   await pane.locator('.account-handoff > summary').click();
   await pane.locator('[data-handoff-account="claude-two"]').click();
   await expect(pane.locator('.handoff-error')).toHaveText('Transfer interrupted');
@@ -214,6 +261,7 @@ test('open-only recovery is labeled as a reopen and never as continuation', asyn
   fixture.state.handoffs.push({ id: 'open-only-recovery', sessionId: 'a', pane: 'pa', sourceAccountId: 'claude-main',
     targetAccountId: 'claude-two', intent: 'open-only', status: 'recovery-needed', phase: 'launching', reason: 'Fixture interruption' });
   fixture.publish();
+  await openActions(page.locator('#stage'));
   await expect(page.locator('#stage .handoff-error')).toHaveText('Reopen interrupted');
   await page.locator('#stage [data-handoff-account="claude-two"]').click();
   await expect(page.locator('#toast')).toContainText('Opened on Claude Two');
@@ -241,6 +289,7 @@ test('pressed waiting row still opens that session after the request is answered
 
 test('closed process is not reported as close failure when unpinning fails', async ({ page }) => {
   fixture.configure({ closeDelay: 100, layoutFails: true });
+  await openActions(page.locator('#stage'));
   await page.locator('#stage [data-close-session]').click();
   await expect(page.locator('#toast')).toContainText('Session closed, but unpinning failed');
   await expect(page.locator('#qlist [data-key="running:a"]')).toHaveCount(0);
