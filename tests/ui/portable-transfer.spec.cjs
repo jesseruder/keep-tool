@@ -9,9 +9,18 @@ test.beforeEach(async ({ page }) => {
   await expect(page.locator('#stage')).toHaveAttribute('data-item-key', 'a');
 });
 test.afterEach(async () => { await fixture.close(); });
+async function openStageActions(page) {
+  const menu = page.locator('#stage .session-actions');
+  if (await menu.getAttribute('open') === null) await menu.locator(':scope > summary').click();
+}
+async function clickStageAction(page, selector) {
+  await openStageActions(page);
+  await page.locator(`#stage ${selector}`).click();
+}
 
 test('native Codex transfer keeps the session id and the portable action remains distinct', async ({ page }) => {
   await page.locator('#qlist [data-key="running:b"]').click();
+  await openStageActions(page);
   await expect(page.locator('#stage .account-label')).toHaveText('Codex Main');
   await expect(page.locator('#stage [data-portable-transfer="portable-one"]')).toContainText('fresh conversation');
   const chooser = page.locator('#stage .account-handoff > summary');
@@ -38,7 +47,7 @@ test('prepared Codex transfer starts a fresh successor, focuses it, and preserve
   await expect(transfer).toContainText('fresh conversation with saved context');
   await expect(page.locator('#stage')).not.toContainText('/private/fixture');
 
-  await transfer.click();
+  await clickStageAction(page, '[data-portable-transfer="portable-one"]');
   await expect(page.locator('#toast')).toContainText('fresh conversation with the saved context');
   await expect(page.locator('#stage')).toHaveAttribute('data-item-key', 'portable-successor');
   await expect(page.locator('#stage')).toHaveAttribute('data-pane', 'portable-pane');
@@ -50,7 +59,7 @@ test('prepared Codex transfer starts a fresh successor, focuses it, and preserve
 
   await page.locator('#qlist [data-key="running:b"]').click();
   await expect(page.locator('#stage [data-open-portable="portable-successor"]')).toContainText('Open successor');
-  await page.locator('#stage [data-open-portable="portable-successor"]').click();
+  await clickStageAction(page, '[data-open-portable="portable-successor"]');
   await expect(page.locator('#stage')).toHaveAttribute('data-item-key', 'portable-successor');
 });
 
@@ -60,7 +69,7 @@ test('launching and ambiguous metadata prevent duplicate portable launches', asy
   fixture.publish();
   await page.locator('#qlist [data-key="running:b"]').click();
   await expect(page.locator('#stage .portable-transfer')).toContainText('Starting successor');
-  await page.locator('#stage .portable-transfer').click();
+  await clickStageAction(page, '.portable-transfer');
   await expect(page.locator('.portable-transfer-dialog')).toContainText('No compatible existing successor was found');
   await page.keyboard.press('Escape');
   fixture.portableTransfers[0].status = 'ambiguous';
@@ -83,7 +92,7 @@ test('a bound unsent opening survives reload and retries the existing successor 
   await page.reload();
   await page.locator('#qlist [data-key="running:b"]').click();
   await expect(page.locator('#stage [data-open-portable="bound-successor"]')).toContainText('Open existing successor');
-  await page.locator('#stage [data-review-portable="portable-one"]').click();
+  await clickStageAction(page, '[data-review-portable="portable-one"]');
   const modal = page.locator('.portable-transfer-dialog');
   await expect(modal).toContainText('saved opening that was not sent');
   await expect(modal.locator('[data-open-setup]')).toContainText('Open existing successor');
@@ -98,7 +107,7 @@ test('a bound unsent opening survives reload and retries the existing successor 
 test('desktop prepares, reviews, and launches a Claude source into a chosen account and model', async ({ page }) => {
   fixture.state.sessions.find(session => session.id === 'a').endedTurn = true;
   fixture.publish();
-  await page.locator('#stage [data-new-portable-transfer="a"]').click();
+  await clickStageAction(page, '[data-new-portable-transfer="a"]');
   const modal = page.locator('.portable-transfer-dialog');
   await expect(modal).toBeVisible();
   await expect(modal.locator('[data-transfer-account]')).toBeFocused();
@@ -132,12 +141,12 @@ test('desktop prepares, reviews, and launches a Claude source into a chosen acco
 });
 
 test('editing reviewed settings invalidates launch and settled-source errors are actionable', async ({ page }) => {
-  await page.locator('#stage [data-new-portable-transfer="a"]').click();
+  await clickStageAction(page, '[data-new-portable-transfer="a"]');
   await expect(page.locator('#toast')).toContainText('source turn has not ended');
 
   fixture.state.sessions.find(session => session.id === 'a').endedTurn = true;
   fixture.publish();
-  await page.locator('#stage [data-new-portable-transfer="a"]').click();
+  await clickStageAction(page, '[data-new-portable-transfer="a"]');
   const modal = page.locator('.portable-transfer-dialog');
   await modal.locator('[data-prepare-transfer]').click();
   await expect(modal.locator('[data-launch-transfer]')).toBeEnabled();
@@ -150,14 +159,14 @@ test('editing reviewed settings invalidates launch and settled-source errors are
 test('reloaded preview preserves custom context and a blank destination model when only cwd is edited', async ({ page }) => {
   fixture.state.sessions.find(session => session.id === 'a').endedTurn = true;
   fixture.publish();
-  await page.locator('#stage [data-new-portable-transfer="a"]').click();
+  await clickStageAction(page, '[data-new-portable-transfer="a"]');
   let modal = page.locator('.portable-transfer-dialog');
   await modal.locator('[data-transfer-account]').selectOption('codex-two');
   await modal.locator('[data-transfer-context]').fill('My saved instruction survives a browser reload.');
   await modal.locator('[data-prepare-transfer]').click();
   await page.reload();
   await expect(page.locator('#stage')).toHaveAttribute('data-item-key', 'a');
-  await page.locator('#stage [data-review-portable]').click();
+  await clickStageAction(page, '[data-review-portable]');
   modal = page.locator('.portable-transfer-dialog');
   await expect(modal.locator('[data-transfer-account]')).toHaveValue('codex-two');
   await expect(modal.locator('[data-transfer-model]')).toHaveValue('');
@@ -185,7 +194,7 @@ test('ambiguous transfer reopens from saved preview and binds an observed receip
       accountLabel: 'Codex Two', card: transfer.cardId, portableTransferId: transfer.id } });
   fixture.publish();
   await page.locator('#qlist [data-key="running:b"]').click();
-  await page.locator('#stage [data-review-portable="portable-one"]').click();
+  await clickStageAction(page, '[data-review-portable="portable-one"]');
   const modal = page.locator('.portable-transfer-dialog');
   await expect(modal.locator('.portable-transfer-preview')).toContainText('Existing CLI portable package');
   await expect(modal.locator('[data-transfer-resolution]')).toContainText('Observed successor');
@@ -206,7 +215,7 @@ test('an intact pre-stop native failure offers an explicit fresh continuation an
   fixture.publish();
   const fallback = page.locator('#stage [data-portable-fallback="handoff-safe-fallback"]');
   await expect(fallback).toHaveText('Start fresh continuation');
-  await fallback.click();
+  await clickStageAction(page, '[data-portable-fallback="handoff-safe-fallback"]');
   await expect(page.locator('.portable-transfer-dialog')).toBeVisible();
   await expect(page.locator('.portable-transfer-dialog')).toContainText('source session stays intact');
   expect(source.accountId).toBe('claude-main');
@@ -230,11 +239,11 @@ test('trust-blocked transfer foregrounds and retries the existing successor afte
   await page.reload();
   await page.locator('#qlist [data-key="running:b"]').click();
   await expect(page.locator('#stage [data-open-portable="trust-successor"]')).toContainText('Finish setup');
-  await page.locator('#stage [data-open-portable="trust-successor"]').click();
+  await clickStageAction(page, '[data-open-portable="trust-successor"]');
   await expect(page.locator('#stage')).toHaveAttribute('data-item-key', 'trust-successor');
 
   await page.locator('#qlist [data-key="running:b"]').click();
-  await page.locator('#stage [data-review-portable="portable-one"]').click();
+  await clickStageAction(page, '[data-review-portable="portable-one"]');
   const modal = page.locator('.portable-transfer-dialog');
   await expect(modal).toContainText('accept the prompt yourself');
   await modal.locator('[data-retry-delivery]').click();
@@ -253,7 +262,7 @@ test('trust-blocked Codex successor opens its saved pane before a session id exi
   fixture.publish();
 
   await page.locator('#qlist [data-key="running:b"]').click();
-  await page.locator('#stage [data-review-portable="portable-one"]').click();
+  await clickStageAction(page, '[data-review-portable="portable-one"]');
   const modal = page.locator('.portable-transfer-dialog');
   await expect(modal).toContainText('waiting for workspace trust');
   await modal.locator('[data-open-setup]').click();
