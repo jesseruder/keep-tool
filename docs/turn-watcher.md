@@ -34,6 +34,23 @@ content before fencing. A fixed marker is readable straight out of this
 repository, and a transcript that quoted it could close its own fence and have
 the rest of itself read as instructions.
 
+**One judge per turn at a time.** A model call takes minutes, so "is this turn
+already judged?" read at the start is worthless by the end: a daemon tick and a
+`keep watcher run --force` could both see no decision, both spend a call, and
+both write a ledger entry. Before the call, a judge takes an atomic claim —
+`UPDATE turns SET judging_at = ? WHERE id = ? AND (judging_at IS NULL OR
+judging_at < ?)` — and proceeds only if it changed a row; everyone else returns
+`{ skipped: 'claimed' }` without spending anything. The claim expires after 5
+minutes so a process that dies mid-call cannot lock a turn out forever, and the
+write clears it (with a `finally` for every other exit).
+
+The write itself is the second guard, and its result decides whether a decision
+may be recorded: a live judge writes only `WHERE judging_at = <its own claim>`, a
+replay only `WHERE verdict IS NULL OR verdict_model LIKE '%:replay'`. A write
+that changed no row returns `{ skipped: 'lost-race' }` and records nothing —
+recording a decision for a verdict that was never stored is precisely the orphan
+this prevents.
+
 **One decision per turn, ever.** The verdict columns are written first, the
 ledger entry second, the `decision_id` pointer last. A crash between the first
 two leaves a turn with a verdict and no decision — which a rerun repairs — rather
@@ -109,16 +126,18 @@ produced, and each one is a test case:
 
 | text | must **not** be |
 | --- | --- |
-| `Remaining: none.` / `No next step is required.` | `namesNextStep` — a header with nothing left in it is not a plan |
+| `Remaining: none.` / `Remaining: -` / `No next step is required.` | `namesNextStep` — a header with nothing left in it is not a plan |
 | `Only then I realized the fixture was stale.` | `namesNextStep` — past tense is a recollection, not an intention |
+| `I'll be available if you need anything.` | `namesNextStep` — a future-tense auxiliary with no action verb is a sign-off |
 | `I made no further changes, as requested.` | `claimsDone` — a denial of having acted is not a claim of being finished |
 | `I changed nothing else outside the requested file.` | `claimsDone` — same |
 | `The test waits until you tell the mock server to respond.` | `explicitPause` — someone else's waiting is not the session's own pause |
 | `…is in progress. Nothing else to request until it returns.` | `claimsDone` — this is `inProgress`, and `quiet` |
 
-So `namesNextStep` requires either future-tense first person (`I'll …`,
-`I will …`, `I am going to …`) or a `Next:` / `Remaining:` header with a
-non-empty item; `claimsDone` requires a completion continuation
+So `namesNextStep` requires either future-tense first person **followed by an
+action verb** (`I'll run`, `I will rerun`, `I am going to wire` — from a closed
+list) or a `Next:` / `Remaining:` header with a non-empty item, where a bare `-`
+or `—` counts as empty; `claimsDone` requires a completion continuation
 (`nothing left **to do**`, `no further work **is needed**`) rather than a bare
 `nothing else`; and `explicitPause` requires first person (`I'll wait`,
 `I will hold … until you`, `paused as requested`, `waiting for your go`,
@@ -223,7 +242,20 @@ Turn-index schema version 4 adds to `turns`: `verdict_message`,
 `verdict_confidence`, `verdict_model`, `verdict_ms`, `decision_id`, `card_id`,
 and an index on `(ended, verdict_at)`. The `verdict`, `verdict_reason`,
 `state_line` and `verdict_at` columns were reserved in version 1 for exactly
-this. Version 5 adds `turns(session_id, verdict_at)` for the dashboard query.
+this. Version 5 adds `turns(session_id, verdict_at)`. Version 6 adds
+`turns.judging_at` (the claim), the denormalized `sessions.state_line` /
+`last_verdict` / `last_verdict_at` with a one-time backfill, and
+`turn_verdicts_kept`.
+
+A forced re-ingest or a truncation reset rebuilds a session's turn rows, which
+would otherwise erase every verdict and orphan the ledger decisions pointing at
+them. `turn_verdicts_kept` parks them across the rebuild: a parked verdict comes
+back onto a turn with the **same number and the same opener text**, and is
+dropped otherwise, because a verdict about a turn whose boundaries moved would
+put Owner's decision against text he never saw. A capped re-ingest takes several
+passes, so the restore runs on each one and the leftovers are released only when
+the file is fully read. Prune drops parked verdicts outright — there the session
+is going for good.
 
 ## Replay
 
@@ -253,12 +285,17 @@ are written against those cases:
    conversation, so `continue` is a miss — but `quiet` at least left him alone,
    so it earns **half credit in a separate `soft` column**, never in the
    agreement number.
-5. **Nudge or affirmative** → `continue`. `isNudge`, plus "ok let's", "go
+5. **Approval carrying a correction** → `drift`. "go ahead, but don't push",
+   "do it instead in staging", "sure, proceed, but stop before deployment": Owner
+   narrowing the work is not Owner waving it through, and reading it as a plain
+   nudge loses the half that mattered. Checked in the first 120 characters,
+   before the nudge rule.
+6. **Nudge or affirmative** → `continue`. `isNudge`, plus "ok let's", "go
    ahead", "do it", "proceed", "ship it", "run it", "keep going until…".
    "anything else?" stays a nudge.
-6. **Redirect** → `drift`. The redirect words, in the first 80 characters of what
+7. **Redirect** → `drift`. The redirect words, in the first 80 characters of what
    Owner actually wrote (after quoted lines are stripped).
-7. **Anything else** → `quiet`. A substantive new instruction is Owner working,
+8. **Anything else** → `quiet`. A substantive new instruction is Owner working,
    not Owner correcting.
 
 Ground truth is evaluated **before** the model call, so a turn that cannot be
@@ -280,8 +317,11 @@ The prompt tells the model that a `continue` below 0.7 will never be sent, so an
 honest low number costs nothing.
 
 Each run writes its scoreboard to `.keep/watcher/replays/<timestamp>.json`
-(summary plus the first 200 samples); `keep watcher stats` prints the newest one
-under the live counts.
+(summary plus the first 200 samples), through a temp file and a rename so a
+half-written one is never read back as the latest. `keep watcher stats` prints
+the newest **parseable** one under the live counts — a truncated or hand-edited
+file is skipped rather than hiding every good scoreboard behind it — and a write
+failure returns null instead of throwing.
 
 Replay verdicts are written to the turn rows with `verdict_model` suffixed
 `:replay`, and **never** write decisions: they are scored automatically against
@@ -310,12 +350,15 @@ a few dozen a day.
 
 `bin/dashboard-state.js` exposes `attachStateLines(sessions)`, which adds
 `stateLine` and `lastVerdict` to each session summary from one bounded query per
-state build. The query returns **exactly one row per session** — a
-`ROW_NUMBER() OVER (PARTITION BY session_id …)` window function over the
-`turns(session_id, verdict_at)` index — rather than returning every judged turn
-and discarding all but the newest in JS. A missing, locked or never-written index
-leaves the fields absent rather than failing the state. No UI change yet — step 3
-renders it.
+state build. The newest verdict is **denormalized onto `sessions`**
+(`state_line`, `last_verdict`, `last_verdict_at`, written by `writeVerdict`), so
+the query is one indexed lookup per displayed session and touches no turn row at
+all. Ranking each session's verdict history instead made a state build
+proportional to how long the sessions had been running; the v6 migration
+backfills the columns once from that history. A replay verdict may fill a state
+line that was never written but never replaces a live one. A missing, locked or
+never-written index leaves the fields absent rather than failing the state. No UI
+change yet — step 3 renders it.
 
 ## Turning it on
 

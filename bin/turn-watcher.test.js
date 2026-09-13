@@ -183,6 +183,15 @@ test('the pre-signals reject the false positives the live index produced', () =>
     'The handler blocks until you send the signal.',
   ]) assert.equal(watcher.explicitPause(text), false, `should not be an explicit pause: ${text}`);
 
+  // A future-tense auxiliary with no action verb after it is a sign-off.
+  assert.equal(watcher.namesNextStep("I'll be available if you need anything."), false);
+  assert.equal(watcher.namesNextStep("I'll be around."), false);
+  assert.equal(watcher.namesNextStep("I'll rerun the suite."), true, 'an action verb still fires');
+  // A header whose only item is a dash is an empty header.
+  assert.equal(watcher.namesNextStep('Remaining: -'), false);
+  assert.equal(watcher.namesNextStep('Remaining: —'), false);
+  assert.equal(watcher.namesNextStep('Remaining: - wire the CLI'), true, 'a dashed list item is still an item');
+
   // Observed on the live index: a session waiting on its own job read as done.
   const running = 'The rerun with the transport cause surfaced is in progress. Nothing else to request until it returns.';
   assert.equal(watcher.inProgress(running), true);
@@ -597,6 +606,136 @@ test('a runner that exits normally is not killed and reports its output', async 
   assert.equal(result.stdout, 'hello');
 });
 
+test('two judges racing on one turn produce one decision and one verdict', async (t) => {
+  const dir = sandbox(t);
+  writeCard('kt-race', { sessions: [{ id: SESSION, agent: 'claude', at: '2026-09-12T00:00' }] });
+  indexTurns(dir, [['go', "Fixed it. Next, I'll run the suite."]]);
+  const decisions = require('./decisions.js');
+
+  // Both judges load the turn before either has written anything — the window
+  // that used to let both spend a model call and both record a decision.
+  const first = watcher.turnFor(SESSION, 1);
+  const second = watcher.turnFor(SESSION, 1);
+
+  let releaseFirst;
+  const held = new Promise((resolve) => { releaseFirst = resolve; });
+  const slowDeps = {
+    invocation: (text) => ({ bin: 'fake', args: [text], options: {}, cleanup: () => {} }),
+    run: async () => {
+      await held;
+      return { code: 0, stdout: '{"verdict":"continue","reason":"slow","message":"run the suite","state_line":"slow state","confidence":0.8}', stderr: '', timedOut: false };
+    },
+  };
+  const fastDeps = fakeDeps('{"verdict":"quiet","reason":"fast","message":"","state_line":"fast state","confidence":0.9}', { force: true });
+
+  const slow = watcher.judge(first, slowDeps);
+  // The second judge runs to completion while the first is still in its call.
+  const fastResult = await watcher.judge(second, fastDeps);
+  releaseFirst();
+  const slowResult = await slow;
+
+  const winner = fastResult.skipped ? slowResult : fastResult;
+  const loser = fastResult.skipped ? fastResult : slowResult;
+  assert.equal(loser.skipped, 'claimed', 'the second judge never spends a model call');
+  assert.ok(winner.decisionId, 'the winner recorded its decision');
+  assert.equal(fastDeps.run.calls.length + (loser === slowResult ? 0 : 1) >= 1, true);
+
+  assert.equal(decisions.loadSafe().length, 1, 'exactly one ledger entry for the turn');
+  const row = turnIndex.open().prepare('SELECT * FROM turns WHERE id = ?').get(first.id);
+  assert.equal(row.decision_id, winner.decisionId);
+  assert.equal(row.verdict, winner.verdict);
+  assert.equal(row.judging_at, null, 'the claim is released by the write');
+});
+
+test('an expired claim can be retaken, a live one cannot', async (t) => {
+  const dir = sandbox(t);
+  indexTurns(dir, [['go', "Fixed it. Next, I'll run the suite."]]);
+  const turn = watcher.turnFor(SESSION, 1);
+  const db = turnIndex.open();
+
+  // Somebody is judging it right now.
+  db.prepare('UPDATE turns SET judging_at = ? WHERE id = ?').run(Date.now(), turn.id);
+  const deps = fakeDeps('{"verdict":"quiet","reason":"r","message":"","state_line":"s","confidence":1}');
+  assert.equal((await watcher.judge(turn, { ...deps, force: true })).skipped, 'claimed');
+  assert.equal(deps.run.calls.length, 0);
+
+  // A judge that died mid-call must not lock the turn out forever.
+  db.prepare('UPDATE turns SET judging_at = ? WHERE id = ?').run(Date.now() - 10 * 60e3, turn.id);
+  const retaken = await watcher.judge(turn, { ...fakeDeps('{"verdict":"quiet","reason":"r","message":"","state_line":"after expiry","confidence":1}'), force: true });
+  assert.equal(retaken.skipped, undefined);
+  assert.equal(retaken.stateLine, 'after expiry');
+});
+
+test('a replay that started before a live verdict cannot overwrite it', async (t) => {
+  const dir = sandbox(t);
+  indexTurns(dir, [['go', "Fixed it. Next, I'll run the suite."]]);
+  const stale = watcher.turnFor(SESSION, 1);
+
+  // The live verdict lands while the replay is still thinking, and the replay's
+  // claim has expired, so only the conditional write stands between them.
+  await watcher.judge(watcher.turnFor(SESSION, 1), fakeDeps(
+    '{"verdict":"continue","reason":"live","message":"run the suite","state_line":"live state","confidence":0.6}',
+    { decisions: { record: () => ({ id: 'd-live' }) } },
+  ));
+
+  const late = watcher.writeVerdict(stale, {
+    verdict: 'quiet', reason: 'stale replay', message: '', stateLine: 'replay state',
+    confidence: 0.9, model: 'fake:replay',
+  }, { replay: true });
+  assert.equal(late, 0, 'the replay write changed nothing');
+
+  const row = turnIndex.open().prepare('SELECT * FROM turns WHERE id = ?').get(stale.id);
+  assert.equal(row.verdict, 'continue');
+  assert.equal(row.state_line, 'live state');
+  assert.equal(row.decision_id, 'd-live');
+  // And the denormalized session copy is the live one too.
+  assert.equal(watcher.stateLines([SESSION]).get(SESSION).stateLine, 'live state');
+});
+
+test('a replay fills an empty session state line but never replaces a live one', async (t) => {
+  const dir = sandbox(t);
+  indexTurns(dir, [['a', 'One.'], ['b', 'Two.']]);
+  const first = watcher.turnFor(SESSION, 1);
+  watcher.writeVerdict(first, { verdict: 'quiet', reason: 'r', message: '', stateLine: 'from a replay', confidence: 0.5, model: 'fake:replay' }, { replay: true });
+  assert.equal(watcher.stateLines([SESSION]).get(SESSION).stateLine, 'from a replay');
+
+  await watcher.judge(watcher.turnFor(SESSION, 2), fakeDeps(
+    '{"verdict":"continue","reason":"live","message":"go on","state_line":"from a live judge","confidence":0.8}',
+    { decisions: { record: () => ({ id: 'd-1' }) } },
+  ));
+  assert.equal(watcher.stateLines([SESSION]).get(SESSION).stateLine, 'from a live judge');
+
+  // A later replay must not talk over it.
+  watcher.writeVerdict(first, { verdict: 'quiet', reason: 'r', message: '', stateLine: 'replay again', confidence: 0.5, model: 'fake:replay' }, { replay: true });
+  assert.equal(watcher.stateLines([SESSION]).get(SESSION).stateLine, 'from a live judge');
+});
+
+test('a saved scoreboard survives a bad write and an unreadable neighbour', (t) => {
+  const dir = sandbox(t);
+  const good = watcher.saveReplay({ total: 3, agreed: 2, samples: [] });
+  assert.ok(good && fs.existsSync(good));
+  assert.equal(watcher.latestReplay().total, 3);
+
+  // A truncated or hand-edited file must not hide every good scoreboard.
+  const later = path.join(watcher.replayDir(), '2099-01-01T00-00-00-000Z.json');
+  fs.writeFileSync(later, '{"total": 9, "not json');
+  const found = watcher.latestReplay();
+  assert.equal(found.total, 3, 'the newest parseable scoreboard wins');
+  assert.equal(found.file, good);
+
+  // A write failure returns null rather than throwing: debug() exists now.
+  const replays = watcher.replayDir();
+  fs.rmSync(replays, { recursive: true, force: true });
+  fs.writeFileSync(replays, 'not a directory');
+  try {
+    assert.equal(watcher.saveReplay({ total: 1, samples: [] }), null);
+    assert.equal(watcher.latestReplay(), null);
+  } finally {
+    fs.rmSync(replays, { force: true });
+  }
+  assert.ok(dir);
+});
+
 test('drift is a real decision type the ledger accepts', (t) => {
   sandbox(t);
   const decisions = require('./decisions.js');
@@ -755,6 +894,14 @@ test('replay ground truth follows the rules in order, one case each', (t) => {
     assert.equal(truth(told, text).expected, 'continue', text);
   }
 
+  // 5b. An approval that carries a correction is a correction. Owner narrowing
+  // the work is not Owner waving it through.
+  assert.equal(truth(told, "go ahead, but don't push").expected, 'drift');
+  assert.equal(truth(told, 'do it instead in staging').expected, 'drift');
+  assert.equal(truth(told, 'sure, proceed, but stop before deployment').expected, 'drift');
+  assert.equal(truth(told, "yes let's do that").expected, 'continue', 'a plain approval is still a nudge');
+  assert.equal(truth(told, "go ahead, but don't push").rule, 'approval-with-correction');
+
   // 6. Redirects, in the first 80 characters of what Owner actually wrote.
   assert.equal(truth(told, "no, that's the wrong flag").expected, 'drift');
   assert.equal(truth(told, 'revert that and start from the card').expected, 'drift');
@@ -910,17 +1057,27 @@ test('listVerdicts, stats and stateLines read back what was judged', async (t) =
   assert.equal(lines.has('unknown-session'), false);
   assert.equal(watcher.stateLines([]).size, 0);
 
-  // A long session must contribute exactly one row, not its whole history.
+  // The dashboard reads the denormalized session columns and never looks at a
+  // turn: a session with a state line but no turns at all still resolves, which
+  // it could not do if the query ranked verdict history.
   const db = turnIndex.open();
-  const many = 'many1111-2222-3333-4444-555555555555';
-  db.prepare("INSERT INTO sessions (id, agent, kind) VALUES (?, 'claude', 'interactive')").run(many);
+  const noTurns = 'flat1111-2222-3333-4444-555555555555';
+  db.prepare(`INSERT INTO sessions (id, agent, kind, state_line, last_verdict, last_verdict_at)
+    VALUES (?, 'claude', 'interactive', 'denormalized only', 'continue', 99)`).run(noTurns);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM turns WHERE session_id = ?').get(noTurns).n, 0);
+  const flat = watcher.stateLines([noTurns]);
+  assert.equal(flat.get(noTurns).stateLine, 'denormalized only');
+  assert.equal(flat.get(noTurns).lastVerdict, 'continue');
+
+  // Conversely, judged turns whose session columns were never written do not
+  // appear — proof the read does not fall back to scanning turns.
+  const hidden = 'hide1111-2222-3333-4444-555555555555';
+  db.prepare("INSERT INTO sessions (id, agent, kind) VALUES (?, 'claude', 'interactive')").run(hidden);
   for (let n = 1; n <= 40; n += 1) {
     db.prepare(`INSERT INTO turns (session_id, n, ended, verdict, state_line, verdict_at)
-      VALUES (?, ?, 1, 'quiet', ?, ?)`).run(many, n, `state ${n}`, 1000 + n);
+      VALUES (?, ?, 1, 'quiet', ?, ?)`).run(hidden, n, `state ${n}`, 1000 + n);
   }
-  const one = watcher.stateLines([many, SESSION]);
-  assert.equal(one.size, 2);
-  assert.equal(one.get(many).stateLine, 'state 40', 'the newest verdict wins, chosen in SQL');
+  assert.equal(watcher.stateLines([hidden]).size, 0, 'no per-session history scan');
 
   const sessions = [{ id: SESSION }, { id: 'other' }];
   require('./dashboard-state.js').attachStateLines(sessions);

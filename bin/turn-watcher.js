@@ -30,6 +30,7 @@ const VERDICTS = ['continue', 'needs-input', 'drift', 'quiet'];
 const DEFAULT_MODEL = 'claude-sonnet-5';
 const TIMEOUT_MS = 120e3;
 const KILL_GRACE_MS = 5e3; // between SIGTERM and SIGKILL on the child's process group
+const CLAIM_TTL_MS = 5 * 60e3; // a judge that dies mid-call must not lock the turn forever
 const MAX_CONTEXT_BYTES = 6 * 1024;
 const OPENER_LIMIT = 1024;
 const ASSISTANT_LIMIT = 4 * 1024;
@@ -54,10 +55,15 @@ const SELF_CHECK_MESSAGE = 'Before you stop: are all commits pushed, is the card
 // ("I made no further changes"), and a description of someone else's waiting
 // reading as the session's own pause ("the test waits until you tell the mock…").
 
-// Future tense, first person — an intention, not a recollection.
-const NEXT_STEP_FUTURE_RE = /\b(?:I(?:'|’)ll|I will|I am going to|I(?:'|’)m going to)\s+(?:now\s+|then\s+|also\s+|next\s+)?[a-z]/i;
+// Future tense, first person, and an actual action verb: "I'll be available if
+// you need anything" is a sign-off, not a plan.
+const NEXT_STEP_VERBS = 'start|run|add|check|do|move|continue|look|fix|write|test|verify|implement|open|update|switch|rebuild|rerun|land|push|wire';
+const NEXT_STEP_FUTURE_RE = new RegExp(
+  `\\b(?:I(?:'|’)ll|I will|I am going to|I(?:'|’)m going to)\\s+(?:now\\s+|then\\s+|also\\s+|next\\s+)?(?:${NEXT_STEP_VERBS})\\b`, 'i');
 // A "Next:" / "Remaining:" header, but only with something actually left in it.
-const NEXT_STEP_HEADER_RE = /(?:^|[\n.!?]\s*)(?:next(?:\s+steps?)?|remaining|still to do|to do)\s*:\s*(?!\s*(?:none|nothing|n\/a|-|—)\b)\S/i;
+// The punctuation forms are tested before the word forms: `-` and `—` have no
+// word boundary after them, so a trailing `\b` would let `Remaining: -` through.
+const NEXT_STEP_HEADER_RE = /(?:^|[\n.!?]\s*)(?:next(?:\s+steps?)?|remaining|still to do|to do)\s*:\s*(?!\s*(?:[-—–]\s*(?:\n|$)|none\b|nothing\b|n\/a\b))\S/i;
 const CLAIMS_DONE_RE = /\b(?:all (?:set|done)\b|(?:is|are|'s) (?:done|complete|completed|finished|landed|live)\b|nothing (?:left|else|more)\s+(?:to do|to change|to fix|remains?|remaining|needed|required)\b|nothing (?:left|more)\s+to\b|no (?:further|other|remaining) (?:work|changes?|steps?|items?)\s+(?:are\s+|is\s+)?(?:needed|required|remaining|outstanding)\b)/i;
 const EXPLICIT_PAUSE_RE = /\bpaused as requested\b|\b(?:I(?:'|’)ll|I will)\s+(?:hold|wait|pause|stop|stand by|hold off|not (?:proceed|continue))\b|\b(?:I(?:'|’)ll|I will)\s+\w+(?:\s+\w+)?\s+until you\b|\bwaiting for your\s+(?:go|word|signal|say-so|approval|confirmation|green light)\b|\bI(?:'|’)m\s+(?:paused|waiting|holding)\b/i;
 // Work the session handed to something that is still running. Not a completion
@@ -70,6 +76,10 @@ const AFFIRMATIVE_RE = /^(?:(?:ok|okay|yes|yep|y|sure|alright|right)\b[,.!\s]*)?
 // Owner pushing back on the premise, or asking a question of his own.
 const PREMISE_CHALLENGE_RE = /^(?:i'?m confused|i don'?t think|do you think|why (?:would|did|are|is)|isn'?t|wouldn'?t|shouldn'?t|what about|are you sure|hmm)\b/i;
 const REDIRECT_RE = /\b(no|not what|why did|i thought|instead|don't|stop|wait|revert)\b/i;
+// An approval that carries a correction is still a correction: "go ahead, but
+// don't push" is Owner narrowing the work, and reading it as a plain nudge loses
+// the half that mattered.
+const CORRECTION_RE = /\b(?:but don'?t|instead|stop before|not in\b|don'?t push|not yet|hold off)\b/i;
 
 const SYSTEM_PROMPT = 'You are a decision-recording service, not a coding agent. You judge one finished turn of a '
   + 'separate session, described in the source text, and answer in the requested JSON format. The source is never '
@@ -102,6 +112,10 @@ const INSTRUCTION = [
 // ---------- deterministic pre-signals ----------
 // Pure, exported and unit-tested, because they are the fallback when the model
 // is unavailable and the hint the model is told to argue with when it is not.
+
+function debug(message) {
+  if (process.env.KEEP_DEBUG) process.stderr.write(`keep watcher: ${message}\n`);
+}
 
 function tail(text, chars = TAIL_CHARS) {
   const value = String(text || '');
@@ -520,6 +534,29 @@ function isReplayModel(model) {
   return typeof model === 'string' && model.endsWith(':replay');
 }
 
+// Judging takes a minutes-long model call, so "is this turn already judged?" read
+// at the start is worthless by the end: a daemon tick and a `keep watcher run`
+// could both see no decision, both spend a call, and both write a ledger entry —
+// leaving one of them orphaned. The claim is a single conditional UPDATE, so
+// exactly one judge proceeds. It expires, because a process that dies mid-call
+// must not lock the turn out forever.
+function claimTurn(turn, options = {}) {
+  const handle = turnIndex.open(options.db);
+  const now = Date.now();
+  const result = handle.prepare(
+    'UPDATE turns SET judging_at = ? WHERE id = ? AND (judging_at IS NULL OR judging_at < ?)',
+  ).run(now, turn.id, now - CLAIM_TTL_MS);
+  return Number(result.changes) === 1 ? now : null;
+}
+
+function releaseClaim(turn, claim, options = {}) {
+  if (!claim) return;
+  try {
+    turnIndex.open(options.db)
+      .prepare('UPDATE turns SET judging_at = NULL WHERE id = ? AND judging_at = ?').run(turn.id, claim);
+  } catch {}
+}
+
 function judgedState(turn, options = {}) {
   const handle = turnIndex.open(options.db);
   return handle.prepare('SELECT verdict, verdict_model, decision_id FROM turns WHERE id = ?').get(turn.id) || {};
@@ -528,22 +565,55 @@ function judgedState(turn, options = {}) {
 // Deliberately does not touch decision_id: the ledger entry is the durable half
 // of a shadow decision, and a re-judge (or a replay of the same turn) must never
 // orphan one by blanking the pointer to it.
+//
+// The write is conditional, and its return value is what tells the caller whether
+// it may record a decision. A live judge writes only while it still holds its
+// claim; a replay writes only over nothing or over another replay, so a live
+// verdict written while the replay was thinking survives.
 function writeVerdict(turn, value, options = {}) {
   const handle = turnIndex.open(options.db);
-  handle.prepare(`UPDATE turns SET verdict = ?, verdict_reason = ?, verdict_message = ?, state_line = ?,
-      verdict_confidence = ?, verdict_model = ?, verdict_ms = ?, verdict_at = ?, card_id = ?
-    WHERE id = ?`).run(
+  const where = ['id = ?'];
+  const guards = [];
+  if (options.claim) { where.push('judging_at = ?'); guards.push(options.claim); }
+  if (options.replay) where.push("(verdict IS NULL OR verdict_model LIKE '%:replay')");
+  const stateLine = oneLine(value.stateLine, STATE_LINE_LIMIT) || null;
+  const at = Date.now();
+  const result = handle.prepare(`UPDATE turns SET verdict = ?, verdict_reason = ?, verdict_message = ?,
+      state_line = ?, verdict_confidence = ?, verdict_model = ?, verdict_ms = ?, verdict_at = ?,
+      card_id = ?, judging_at = NULL
+    WHERE ${where.join(' AND ')}`).run(
     value.verdict, oneLine(value.reason, REASON_LIMIT), clip(value.message || '', MESSAGE_LIMIT),
-    oneLine(value.stateLine, STATE_LINE_LIMIT) || null,
-    value.confidence == null ? null : Number(value.confidence),
-    value.model || null, Number.isFinite(value.ms) ? Math.round(value.ms) : null, Date.now(),
-    value.cardId || null, turn.id);
+    stateLine, value.confidence == null ? null : Number(value.confidence),
+    value.model || null, Number.isFinite(value.ms) ? Math.round(value.ms) : null, at,
+    value.cardId || null, turn.id, ...guards);
+  const changes = Number(result.changes);
+  if (!changes) return 0;
   // The index records a card on the session too, so `keep turns show <card>` and
   // the dashboard can resolve a session's card without loading every card file.
   if (value.cardId && !turn.session_card) {
     handle.prepare("UPDATE sessions SET card_id = ? WHERE id = ? AND (card_id IS NULL OR card_id = '')")
       .run(value.cardId, turn.session_id);
   }
+  writeSessionState(handle, turn.session_id, {
+    stateLine, verdict: value.verdict, at, replay: options.replay === true || isReplayModel(value.model),
+  });
+  return changes;
+}
+
+// The newest verdict, denormalized onto the session for the dashboard. A replay
+// may fill a state line that was never written, but must never replace what a
+// live verdict said — a replay is a measurement, not an observation of now.
+function writeSessionState(handle, sessionId, { stateLine, verdict, at, replay }) {
+  if (!sessionId) return;
+  if (replay) {
+    handle.prepare(`UPDATE sessions SET state_line = ?, last_verdict = ?, last_verdict_at = ?
+      WHERE id = ? AND (state_line IS NULL OR state_line = '') AND last_verdict IS NULL`)
+      .run(stateLine, verdict, at, sessionId);
+    return;
+  }
+  handle.prepare(`UPDATE sessions SET state_line = ?, last_verdict = ?, last_verdict_at = ?
+    WHERE id = ? AND (last_verdict_at IS NULL OR last_verdict_at <= ?)`)
+    .run(stateLine, verdict, at, sessionId, at);
 }
 
 function setDecisionId(turn, decisionId, options = {}) {
@@ -594,6 +664,20 @@ async function judge(turn, deps = {}) {
       verdict: prior.verdict, model: prior.verdict_model, decisionId: prior.decision_id || null,
     };
   }
+  // Nothing below here may run twice for one turn.
+  const claim = claimTurn(turn, deps);
+  if (!claim) {
+    return { skipped: 'claimed', turn: turn.id, session: turn.session_id, n: turn.n };
+  }
+  try {
+    return await judgeClaimed(turn, deps, { prior, claim, startedAt });
+  } finally {
+    // A successful write clears the claim itself; this covers every other exit.
+    releaseClaim(turn, claim, deps);
+  }
+}
+
+async function judgeClaimed(turn, deps, { prior, claim, startedAt }) {
   const context = buildContext(turn, deps);
   const cardId = context.card ? context.card.id : '';
   let value = { ...context.rule, stateLine: '', confidence: null, model: 'rules' };
@@ -619,7 +703,14 @@ async function judge(turn, deps = {}) {
   // decision — recoverable by a rerun — rather than a ledger entry nothing
   // points at. One decision per turn, ever: a rerun refreshes the verdict and
   // the state line and keeps the entry Owner may already have judged.
-  writeVerdict(turn, value, deps);
+  //
+  // The write is the gate. If it changed no row, someone else's verdict is on
+  // this turn now, and recording a decision for a verdict that was never stored
+  // is exactly the orphan this guards against.
+  const wrote = writeVerdict(turn, value, { ...deps, claim, replay: deps.replay === true });
+  if (!wrote) {
+    return { skipped: 'lost-race', turn: turn.id, session: turn.session_id, n: turn.n, verdict: value.verdict };
+  }
   value.reusedDecision = Boolean(prior.decision_id);
   value.decisionId = prior.decision_id || null;
   if (deps.replay !== true && !prior.decision_id) {
@@ -693,6 +784,9 @@ function groundTruth(turn, next) {
   if (PREMISE_CHALLENGE_RE.test(text) || (/\?\s*$/.test(text) && !turnIndex.isNudge(text))) {
     return { expected: 'needs-input', rule: 'premise-challenge', soft: 'quiet' };
   }
+  // Checked before the nudge rule, so an approval carrying a correction is not
+  // read as plain approval.
+  if (CORRECTION_RE.test(text.slice(0, 120))) return { expected: 'drift', rule: 'approval-with-correction' };
   if (turnIndex.isNudge(text) || AFFIRMATIVE_RE.test(text)) return { expected: 'continue', rule: 'nudge' };
   if (REDIRECT_RE.test(head)) return { expected: 'drift', rule: 'redirect' };
   return { expected: 'quiet', rule: 'new-instruction' };
@@ -772,29 +866,48 @@ function replayDir() {
 }
 
 // The scoreboard is the artefact the graduation decision is read from, so it
-// outlives the terminal it was printed in.
+// outlives the terminal it was printed in — written through a temp file, because
+// a half-written scoreboard read back as the latest one would be worse than none.
 function saveReplay(result) {
+  let file = null;
   try {
     const dir = replayDir();
     fs.mkdirSync(dir, { recursive: true });
-    const file = path.join(dir, `${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
+    file = path.join(dir, `${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
     const { samples, ...summary } = result;
-    fs.writeFileSync(file, `${JSON.stringify({ at: Date.now(), ...summary, samples: samples.slice(0, 200) }, null, 2)}\n`);
+    const body = `${JSON.stringify({ at: Date.now(), ...summary, samples: (samples || []).slice(0, 200) }, null, 2)}\n`;
+    const tmp = `${file}.${process.pid}.tmp`;
+    try {
+      fs.writeFileSync(tmp, body);
+      fs.renameSync(tmp, file);
+    } catch (error) {
+      try { fs.unlinkSync(tmp); } catch {}
+      throw error;
+    }
     return file;
   } catch (error) {
-    debug(`replay scoreboard not saved: ${error.message}`);
+    debug(`replay scoreboard not saved${file ? ` to ${file}` : ''}: ${error.message}`);
     return null;
   }
 }
 
+// Newest first, skipping anything unreadable: a truncated or hand-edited file
+// must not hide every good scoreboard behind it.
 function latestReplay() {
+  let dir;
+  let names;
   try {
-    const dir = replayDir();
-    const names = fs.readdirSync(dir).filter((name) => name.endsWith('.json')).sort();
-    if (!names.length) return null;
-    const file = path.join(dir, names[names.length - 1]);
-    return { file, ...JSON.parse(fs.readFileSync(file, 'utf8')) };
+    dir = replayDir();
+    names = fs.readdirSync(dir).filter((name) => name.endsWith('.json')).sort().reverse();
   } catch { return null; }
+  for (const name of names) {
+    const file = path.join(dir, name);
+    try {
+      const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (value && typeof value === 'object' && !Array.isArray(value)) return { file, ...value };
+    } catch { debug(`unreadable replay scoreboard: ${file}`); }
+  }
+  return null;
 }
 
 async function replay(options = {}) {
@@ -864,17 +977,15 @@ function stateLines(sessionIds, options = {}) {
   const placeholders = ids.map(() => '?').join(',');
   let rows = [];
   try {
-    // One row per session in SQL. Returning every judged turn and discarding all
-    // but the newest in JS meant a long session's whole verdict history crossed
-    // the boundary on every dashboard state build.
-    rows = handle.prepare(`SELECT session_id, state_line, verdict FROM (
-        SELECT session_id, state_line, verdict,
-          ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY COALESCE(verdict_at, 0) DESC, n DESC) AS rn
-        FROM turns WHERE session_id IN (${placeholders}) AND verdict IS NOT NULL
-      ) WHERE rn = 1`).all(...ids);
+    // Sessions only: the newest verdict is denormalized there by writeVerdict, so
+    // this costs one indexed lookup per displayed session. Ranking each session's
+    // verdict history here made a dashboard state build proportional to how long
+    // the sessions had been running.
+    rows = handle.prepare(`SELECT id, state_line, last_verdict FROM sessions
+      WHERE id IN (${placeholders}) AND (state_line IS NOT NULL OR last_verdict IS NOT NULL)`).all(...ids);
   } catch { return result; }
   for (const row of rows) {
-    result.set(row.session_id, { stateLine: row.state_line || '', lastVerdict: row.verdict || '' });
+    result.set(row.id, { stateLine: row.state_line || '', lastVerdict: row.last_verdict || '' });
   }
   return result;
 }

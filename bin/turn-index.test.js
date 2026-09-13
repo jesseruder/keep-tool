@@ -874,6 +874,67 @@ test('hook output delivered as a user message is Keep talking, not Owner', (t) =
   assert.equal(summary.totals.keepOpeners, 2);
 });
 
+test('a forced re-ingest keeps the verdicts on turns that did not move', (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, `${SESSION}.jsonl`);
+  fs.writeFileSync(file, jsonl(claudeRecords()));
+  assert.equal(turnIndex.ingestFile(file, { agent: 'claude' }).ok, true);
+
+  // Judge every turn, the way the watcher would.
+  const db = turnIndex.open();
+  const judge = (n, verdict, message) => db.prepare(`UPDATE turns SET verdict = ?, verdict_reason = ?,
+      verdict_message = ?, state_line = ?, verdict_confidence = ?, verdict_model = ?, verdict_ms = ?,
+      verdict_at = ?, decision_id = ?, card_id = ? WHERE session_id = ? AND n = ?`)
+    .run(verdict, `reason ${n}`, message, `state ${n}`, 0.5, 'fake-model', 42, 1000 + n, `d-${n}`, 'kt-1', SESSION, n);
+  const turnsBefore = turnIndex.turnsForSession(SESSION);
+  assert.equal(turnsBefore.length, 3);
+  for (const turn of turnsBefore) judge(turn.n, 'continue', `message ${turn.n}`);
+
+  // A forced re-ingest rebuilds every turn row from the same transcript.
+  const again = turnIndex.ingestFile(file, { agent: 'claude', force: true });
+  assert.equal(again.ok, true);
+  assert.equal(again.turns, 3);
+
+  const after = turnIndex.turnsForSession(SESSION);
+  assert.equal(after.length, 3);
+  for (const turn of after) {
+    assert.equal(turn.verdict, 'continue', `turn ${turn.n} kept its verdict`);
+    assert.equal(turn.verdict_message, `message ${turn.n}`);
+    assert.equal(turn.state_line, `state ${turn.n}`);
+    assert.equal(turn.decision_id, `d-${turn.n}`, 'and still points at its ledger entry');
+    assert.equal(turn.verdict_model, 'fake-model');
+    assert.equal(turn.verdict_confidence, 0.5);
+    assert.equal(turn.verdict_at, 1000 + turn.n);
+  }
+  // The parking table is emptied once the file is fully read.
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM turn_verdicts_kept').get().n, 0);
+});
+
+test('a verdict is dropped when the turn it described no longer exists', (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, `${SESSION}.jsonl`);
+  fs.writeFileSync(file, jsonl(claudeRecords()));
+  turnIndex.ingestFile(file, { agent: 'claude' });
+  const db = turnIndex.open();
+  db.prepare("UPDATE turns SET verdict = 'continue', verdict_message = 'keep going', verdict_at = 1 WHERE session_id = ?")
+    .run(SESSION);
+
+  // The transcript is rewritten with different openers, so turn 2 is no longer
+  // the turn that was judged. A verdict about a turn that moved is worse than
+  // none: it would put Owner's decision against text he never saw.
+  const rewritten = claudeRecords().map((record) => {
+    if (record.type !== 'user' || typeof record.message.content !== 'string') return record;
+    return { ...record, message: { ...record.message, content: `${record.message.content} (rewritten)` } };
+  });
+  fs.writeFileSync(file, jsonl(rewritten));
+  assert.equal(turnIndex.ingestFile(file, { agent: 'claude', force: true }).ok, true);
+
+  const after = turnIndex.turnsForSession(SESSION);
+  assert.ok(after.length >= 1);
+  assert.equal(after.every((turn) => turn.verdict === null), true, 'moved turns lose their verdicts');
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM turn_verdicts_kept').get().n, 0, 'and nothing is left parked');
+});
+
 test('the database carries its schema version, fingerprint column and journal limit', (t) => {
   tempDir(t);
   const db = turnIndex.open();

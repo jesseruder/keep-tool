@@ -16,7 +16,7 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 // Text caps. Transcripts contain whole files and 100k-line build logs; the index
 // exists to find and count turns, not to be a second copy of the corpus.
@@ -156,6 +156,34 @@ const MIGRATIONS = [
   // The dashboard asks for the newest verdict of each of a handful of sessions
   // on every state build; without this it scans every judged turn they have.
   { version: 5, statements: ['CREATE INDEX IF NOT EXISTS turns_session_verdict ON turns(session_id, verdict_at)'] },
+  { version: 6, statements: [
+    // An atomic claim, so two judges cannot both spend a model call on one turn
+    // and both write a decision (bin/turn-watcher.js).
+    'ALTER TABLE turns ADD COLUMN judging_at INTEGER',
+    // The newest verdict, denormalized onto the session. The dashboard asks for
+    // it on every state build; ranking each session's verdict history to answer
+    // that was work proportional to history rather than to what is displayed.
+    'ALTER TABLE sessions ADD COLUMN state_line TEXT',
+    'ALTER TABLE sessions ADD COLUMN last_verdict TEXT',
+    'ALTER TABLE sessions ADD COLUMN last_verdict_at INTEGER',
+    // One-time backfill of the above from the history that already exists.
+    `UPDATE sessions SET
+       state_line = (SELECT t.state_line FROM turns t WHERE t.session_id = sessions.id AND t.verdict IS NOT NULL
+                     ORDER BY COALESCE(t.verdict_at, 0) DESC, t.n DESC LIMIT 1),
+       last_verdict = (SELECT t.verdict FROM turns t WHERE t.session_id = sessions.id AND t.verdict IS NOT NULL
+                       ORDER BY COALESCE(t.verdict_at, 0) DESC, t.n DESC LIMIT 1),
+       last_verdict_at = (SELECT COALESCE(t.verdict_at, 0) FROM turns t WHERE t.session_id = sessions.id AND t.verdict IS NOT NULL
+                          ORDER BY COALESCE(t.verdict_at, 0) DESC, t.n DESC LIMIT 1)
+     WHERE EXISTS (SELECT 1 FROM turns t WHERE t.session_id = sessions.id AND t.verdict IS NOT NULL)`,
+    // A forced re-ingest recreates turn rows, which would otherwise erase every
+    // verdict and orphan its ledger decision. Verdicts wait here in between.
+    `CREATE TABLE IF NOT EXISTS turn_verdicts_kept (
+       session_id TEXT NOT NULL, n INTEGER NOT NULL, opener_text TEXT,
+       verdict TEXT, verdict_reason TEXT, verdict_message TEXT, state_line TEXT,
+       verdict_confidence REAL, verdict_model TEXT, verdict_ms INTEGER, verdict_at INTEGER,
+       decision_id TEXT, card_id TEXT, kept_at INTEGER,
+       PRIMARY KEY (session_id, n))`,
+  ] },
 ];
 
 function migrate(handle) {
@@ -500,12 +528,52 @@ function headReplaced(file, stat, stored) {
   return current !== stored;
 }
 
+const KEPT_VERDICT_COLUMNS = ['verdict', 'verdict_reason', 'verdict_message', 'state_line',
+  'verdict_confidence', 'verdict_model', 'verdict_ms', 'verdict_at', 'decision_id', 'card_id'];
+
 // Always scoped to one session id. A subagent file resetting must never reach
 // into its parent's rows, which is exactly what a wrong id here would do.
-function clearSession(handle, sessionId) {
+//
+// `keepVerdicts` is for a re-ingest, where the turns are about to be rebuilt
+// from the same transcript: the watcher's verdicts (and the ledger decisions
+// they point at) are parked so the rebuilt rows can take them back. Prune passes
+// it false, because there the session is going for good.
+function clearSession(handle, sessionId, { keepVerdicts = false } = {}) {
   if (!sessionId) return;
+  if (keepVerdicts) parkVerdicts(handle, sessionId);
   statement(handle, 'DELETE FROM messages WHERE session_id = ?').run(sessionId);
   statement(handle, 'DELETE FROM turns WHERE session_id = ?').run(sessionId);
+}
+
+function parkVerdicts(handle, sessionId) {
+  const columns = KEPT_VERDICT_COLUMNS.join(', ');
+  statement(handle, `INSERT OR REPLACE INTO turn_verdicts_kept (session_id, n, opener_text, ${columns}, kept_at)
+    SELECT session_id, n, opener_text, ${columns}, ? FROM turns
+    WHERE session_id = ? AND verdict IS NOT NULL`).run(Date.now(), sessionId);
+}
+
+// A parked verdict only comes back onto a turn with the same number AND the same
+// opener text. A different opener at that number means the turn boundaries moved,
+// and a verdict about a turn that no longer exists is worse than no verdict.
+function restoreVerdicts(handle, sessionId) {
+  const rows = statement(handle, 'SELECT * FROM turn_verdicts_kept WHERE session_id = ?').all(sessionId);
+  if (!rows.length) return 0;
+  const assignments = KEPT_VERDICT_COLUMNS.map((column) => `${column} = ?`).join(', ');
+  let restored = 0;
+  for (const row of rows) {
+    const result = statement(handle, `UPDATE turns SET ${assignments}
+      WHERE session_id = ? AND n = ? AND opener_text IS ?`).run(
+      ...KEPT_VERDICT_COLUMNS.map((column) => row[column]), sessionId, row.n, row.opener_text);
+    if (Number(result.changes)) {
+      restored += 1;
+      statement(handle, 'DELETE FROM turn_verdicts_kept WHERE session_id = ? AND n = ?').run(sessionId, row.n);
+    }
+  }
+  return restored;
+}
+
+function dropParkedVerdicts(handle, sessionId) {
+  statement(handle, 'DELETE FROM turn_verdicts_kept WHERE session_id = ?').run(sessionId);
 }
 
 function earliest(a, b) {
@@ -983,7 +1051,7 @@ function applyPass(handle, file, agent, stat, plan) {
       handle.exec('ROLLBACK');
       return { ok: false, skipped: 'raced', file };
     }
-    if (reset) clearSession(handle, current.session_id);
+    if (reset) clearSession(handle, current.session_id, { keepVerdicts: true });
 
     if (context.sessionId) {
       ensureSession(context);
@@ -1013,6 +1081,13 @@ function applyPass(handle, file, agent, stat, plan) {
     turnIds.forEach((id, index) => refreshTurn(handle, id, {
       ended: context.newTurns[index].ended, stopReason: context.newTurns[index].stopReason,
     }));
+    if (context.sessionId) {
+      // Verdicts parked by a reset come back onto the rebuilt rows. A capped
+      // re-ingest takes several passes, so this runs on each of them and only
+      // gives up the leftovers once the file is fully read.
+      restoreVerdicts(handle, context.sessionId);
+      if (!partial) dropParkedVerdicts(handle, context.sessionId);
+    }
 
     statement(handle, `INSERT INTO ingest_state (file, session_id, "offset", size, mtime, seq, open_turn, head_sha, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1264,6 +1339,7 @@ function prune(options = {}) {
       // The messages delete fires the FTS delete trigger, so the shadow table
       // shrinks with the real one.
       clearSession(handle, id);
+      dropParkedVerdicts(handle, id); // the session is going for good, not being rebuilt
       statement(handle, 'DELETE FROM ingest_state WHERE session_id = ?').run(id);
     }
     handle.exec('COMMIT');
