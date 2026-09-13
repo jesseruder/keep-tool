@@ -830,6 +830,50 @@ test('the caller-supplied busy timeout is in force for schema creation, not just
   assert.equal(pragma(turnIndex.open()), 5000);
 });
 
+test('hook output delivered as a user message is Keep talking, not Owner', (t) => {
+  const dir = tempDir(t);
+  // Codex delivers hook output as a user message wrapped in <hook_prompt …>.
+  const codexFile = path.join(dir, `rollout-2026-09-12T01-00-00-${CODEX_SESSION}.jsonl`);
+  const codexLine = (text, at) => ({ type: 'response_item', timestamp: at, payload: {
+    type: 'message', role: 'user', content: [{ type: 'input_text', text }] } });
+  fs.writeFileSync(codexFile, jsonl([
+    { type: 'session_meta', timestamp: '2026-09-12T01:00:00.000Z', payload: {
+      id: CODEX_SESSION, cwd: '/tmp/demo-project', timestamp: '2026-09-12T01:00:00.000Z', source: 'cli' } },
+    codexLine('Port the reload guard', '2026-09-12T01:00:01.000Z'),
+    { type: 'response_item', timestamp: '2026-09-12T01:00:02.000Z', payload: { type: 'agent_message', text: 'Ported.' } },
+    codexLine('<hook_prompt hook_run_id="stop:14:abc">[keep] Your card kt-1 has a next step.</hook_prompt>',
+      '2026-09-12T01:00:03.000Z'),
+    { type: 'response_item', timestamp: '2026-09-12T01:00:04.000Z', payload: { type: 'agent_message', text: 'Continuing.' } },
+  ]));
+  assert.equal(turnIndex.ingestFile(codexFile).ok, true);
+
+  const db = turnIndex.open();
+  const kinds = db.prepare("SELECT kind FROM messages WHERE session_id = ? AND role = 'user' ORDER BY seq")
+    .all(CODEX_SESSION).map((row) => row.kind);
+  assert.deepEqual(kinds, ['human', 'keep'], 'the hook message is keep, not a second human turn');
+  const turns = turnIndex.turnsForSession(CODEX_SESSION);
+  assert.deepEqual(turns.map((turn) => turn.opener_kind), ['human', 'keep']);
+
+  // Claude wraps it the same way when a hook injects context.
+  const claudeFile = path.join(dir, `${SESSION}.jsonl`);
+  fs.writeFileSync(claudeFile, jsonl([
+    claudeUser('Fix the flaky test', { timestamp: '2026-09-12T02:00:00.000Z' }),
+    claudeUser('<hook_prompt hook_run_id="stop:2:xyz">[keep] check in first</hook_prompt>',
+      { timestamp: '2026-09-12T02:00:10.000Z' }),
+  ]));
+  assert.equal(turnIndex.ingestFile(claudeFile, { agent: 'claude' }).ok, true);
+  assert.deepEqual(
+    db.prepare("SELECT kind FROM messages WHERE session_id = ? AND role = 'user' ORDER BY seq").all(SESSION)
+      .map((row) => row.kind),
+    ['human', 'keep'],
+  );
+
+  // And it is not counted as a human opener anywhere the stats look.
+  const summary = turnIndex.stats({ since: 0 });
+  assert.equal(summary.totals.humanOpeners, 2);
+  assert.equal(summary.totals.keepOpeners, 2);
+});
+
 test('the database carries its schema version, fingerprint column and journal limit', (t) => {
   tempDir(t);
   const db = turnIndex.open();

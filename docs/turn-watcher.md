@@ -184,6 +184,9 @@ What each verdict means:
 - quiet: nothing to do — the session is mid-work, it is waiting on a scheduled check, or the turn was answering a question Owner had just asked.
 
 Rules:
+- A completion report — the session says it is done, landed, or finished, and names no next step — is `continue` with the self-check message, unless the turn already shows pushed commits, a Keep check-in, and a verification that reproduced the original symptom; in that case it is `quiet`.
+- When Owner's opening message was a question and the turn answers it, that is `quiet`. When the turn ends by proposing something and asking for a go-ahead, it is `continue` with a short affirmative only if the proposal is reversible and inside the card's scope; otherwise it is `needs-input` with the answer you would propose.
+- Set confidence honestly. A `continue` below 0.7 will never be sent, so a low number costs nothing and an inflated one costs trust.
 - A deterministic rule pass already ran; its answer is given as RULE VERDICT. Agree with it unless the evidence says otherwise, and if you disagree your `reason` must say what the rule missed.
 - `message` is delivered verbatim if Owner approves it, so write it the way Owner types: lowercase, imperative, no greeting, no sign-off, no markdown.
 - Never invent a fact that is not in the input. If there is no card, do not assume one.
@@ -228,14 +231,57 @@ this. Version 5 adds `turns(session_id, verdict_at)` for the dashboard query.
 each verdict against what he actually typed next. Only turns with a following
 **human** opener can be scored — a turn with no reply carries no signal.
 
-Ground truth from the next opener:
+Ground truth from the next opener, applied **in this order**. The first run over
+60 real Codex turns scored 37/60, and reading the 23 disagreements showed most of
+them were defects in this mapping rather than in the watcher — so the rules below
+are written against those cases:
 
-| next opener | expected |
-| --- | --- |
-| a bare nudge (`turn-index.isNudge`: "continue", "keep going", "what's next"…) | `continue` |
-| an affirmative ("yes", "ok", "go ahead"…) **after** `askedQuestion` | `needs-input`, and the proposed `message` must itself be affirmative |
-| a redirect ("no", "not what", "why did", "instead", "revert"…) in the first 80 chars | `drift` |
-| anything else | `quiet` |
+1. **Not Owner** → skip. An opener of kind `keep`, `command` or `hook` is Keep's
+   own machinery talking, not Owner. (Codex delivers hook output as a user
+   message, `<hook_prompt hook_run_id="stop:14:…">[keep] …`; the indexer now
+   classifies that as `keep` for exactly this reason.)
+2. **Quoted relay** → skip. Lines starting with `>` are stripped first; if
+   nothing is left, Owner was relaying another session's output, which says
+   nothing about what he wanted done here.
+3. **The session asked** → `needs-input`. If `askedQuestion` is true, whatever
+   came back is Owner answering — "yes", but also "done", "unlocked", "ready",
+   "it's happening now", "i gave access", "pasted". Reading those as nudges was
+   the single biggest scorer defect.
+4. **Premise challenge or open question** → `needs-input`. `i'm confused`,
+   `i don't think`, `why would`, `isn't`, `are you sure`, `hmm`, `what about`, or
+   any message ending in `?` that is not itself a nudge. Owner wanted a
+   conversation, so `continue` is a miss — but `quiet` at least left him alone,
+   so it earns **half credit in a separate `soft` column**, never in the
+   agreement number.
+5. **Nudge or affirmative** → `continue`. `isNudge`, plus "ok let's", "go
+   ahead", "do it", "proceed", "ship it", "run it", "keep going until…".
+   "anything else?" stays a nudge.
+6. **Redirect** → `drift`. The redirect words, in the first 80 characters of what
+   Owner actually wrote (after quoted lines are stripped).
+7. **Anything else** → `quiet`. A substantive new instruction is Owner working,
+   not Owner correcting.
+
+Ground truth is evaluated **before** the model call, so a turn that cannot be
+scored never costs a verdict. The scoreboard reports `skipped` with its reasons.
+
+Rule 3 is only as strong as `askedQuestion`, which is
+`session-status.proseRequest`. A bare imperative it does not recognise
+("Unlock the phone and I will retry.") still lets a following "done" fall
+through to rule 5. Widening that regex changes fleet-wide attention behaviour, so
+it is left alone and the residual case is a test.
+
+### Confidence bands
+
+The scoreboard groups every scored turn by the model's own confidence —
+`>= 0.7`, `0.5–0.7`, `< 0.5` — and reports agreement and **continue precision**
+per band. The graduation question is not "is the watcher right on average" but
+"is a high-confidence `continue` safe to send", and only this table answers it.
+The prompt tells the model that a `continue` below 0.7 will never be sent, so an
+honest low number costs nothing.
+
+Each run writes its scoreboard to `.keep/watcher/replays/<timestamp>.json`
+(summary plus the first 200 samples); `keep watcher stats` prints the newest one
+under the live counts.
 
 Replay verdicts are written to the turn rows with `verdict_model` suffixed
 `:replay`, and **never** write decisions: they are scored automatically against

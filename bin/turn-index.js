@@ -46,6 +46,10 @@ const NUDGE_RE = /^(ok |yes |please )?(continue|keep going|go ahead|go on|procee
 const CLAUDE_COMMAND_RE = /^<(?:command-name|command-message|command-args|local-command|bash-input|bash-stdout|bash-stderr)\b/;
 const CLAUDE_WRAPPER_RE = /^<(?:system-reminder|task-notification|cross-session-message|user-prompt-submit-hook)\b/;
 const CODEX_PREAMBLE_RE = /^(?:<(?:recommended_plugins|available_plugins|environment_context|user_instructions|permissions|collaboration_mode|turn_aborted|system-reminder|task-notification|cross-session-message)\b|# AGENTS\.md instructions)/;
+// Codex delivers hook output as a user message: `<hook_prompt hook_run_id="stop:14:…">[keep] Your card …`.
+// It is Keep talking to the agent, not Owner, so it must never read as a human
+// turn — nor, later, as evidence of what Owner would have typed.
+const HOOK_PROMPT_RE = /^<hook_prompt\b/i;
 // Keep's own headless runs (`keep runs`, the Slack classifier, tab naming, the
 // brief) and Owner's `claude -p` batch jobs all open with a system-style "You are
 // …" prompt; a person opening a conversation that way is rare enough to accept.
@@ -400,14 +404,14 @@ function parseToolInput(payload) {
 function claudeUserKind(record, text) {
   if (record.isMeta) return 'meta';
   if (CLAUDE_COMMAND_RE.test(text)) return 'command';
-  if (/^\[keep\]/.test(text)) return 'keep';
+  if (/^\[keep\]/.test(text) || HOOK_PROMPT_RE.test(text)) return 'keep';
   if (CLAUDE_WRAPPER_RE.test(text)) return 'preamble';
   return 'human';
 }
 
 function codexUserKind(text) {
   if (CODEX_PREAMBLE_RE.test(text)) return 'preamble';
-  if (/^\[keep\]/.test(text)) return 'keep';
+  if (/^\[keep\]/.test(text) || HOOK_PROMPT_RE.test(text)) return 'keep';
   if (/^<(?:command-name|local-command|bash-input)\b/.test(text)) return 'command';
   return 'human';
 }

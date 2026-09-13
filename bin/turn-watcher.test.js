@@ -34,6 +34,7 @@ function sandbox(t) {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(path.join(REGISTRY, 'tasks'), { recursive: true, force: true });
     fs.rmSync(path.join(REGISTRY, '.keep', 'decisions.json'), { force: true });
+    fs.rmSync(path.join(REGISTRY, '.keep', 'watcher'), { recursive: true, force: true });
   });
   return dir;
 }
@@ -697,6 +698,11 @@ test('replay scores each verdict against what Owner actually typed next', async 
   assert.equal(result.confusion.continue.continue, 1);
   assert.equal(result.confusion.drift.drift, 1);
 
+  // Bands, half credit and skip reasons all come back with the scoreboard.
+  assert.equal(result.softAgreement, 1);
+  assert.equal(result.skipped.total, 0);
+  assert.ok(Array.isArray(result.bands) && result.bands.length === watcher.BANDS.length);
+
   // The replay never writes decisions, and it marks its rows as replays.
   const models = turnIndex.open().prepare('SELECT verdict_model FROM turns WHERE verdict IS NOT NULL').all();
   assert.ok(models.length >= 4);
@@ -704,26 +710,175 @@ test('replay scores each verdict against what Owner actually typed next', async 
   assert.equal(turnIndex.open().prepare('SELECT COUNT(*) AS n FROM turns WHERE decision_id IS NOT NULL').get().n, 0);
 });
 
-test('replay ground truth reads the next opener the way Owner meant it', (t) => {
+test('replay ground truth follows the rules in order, one case each', (t) => {
   sandbox(t);
   const asked = { last_assistant: 'Should I delete the old flag?' };
+  const physical = { last_assistant: 'I need you to unlock the phone so adb can see it.' };
   const told = { last_assistant: "Parser built. Next, I'll wire the CLI." };
+  const truth = (turn, text, kind = 'human') => watcher.groundTruth(turn, { opener_text: text, opener_kind: kind });
 
-  assert.equal(watcher.expectedVerdict(told, 'continue'), 'continue');
-  assert.equal(watcher.expectedVerdict(told, 'keep going'), 'continue');
-  assert.equal(watcher.expectedVerdict(asked, 'yes'), 'needs-input');
-  assert.equal(watcher.expectedVerdict(asked, 'go ahead'), 'continue', 'a bare go-ahead reads as a nudge first');
-  assert.equal(watcher.expectedVerdict(told, 'yes'), 'quiet', 'an affirmative without a question is not an answer');
-  assert.equal(watcher.expectedVerdict(told, "no, that's the wrong flag"), 'drift');
-  assert.equal(watcher.expectedVerdict(told, 'why did you touch the config?'), 'drift');
-  assert.equal(watcher.expectedVerdict(told, 'now write the docs for the new endpoint'), 'quiet');
-  assert.equal(watcher.expectedVerdict(told, ''), 'quiet');
+  // 1. Only Owner is ground truth.
+  assert.equal(truth(told, '[keep] Your card kt-1 has a next step.', 'keep').skip, 'not-owner');
+  assert.equal(truth(told, '/clear', 'command').skip, 'not-owner');
+  assert.equal(truth(told, 'anything', 'hook').skip, 'not-owner');
 
-  // An escalation with no proposed answer does not count as answering.
-  assert.equal(watcher.scoreOne(asked, 'yes', { verdict: 'needs-input', message: 'yes, delete it' }).agreed, true);
-  assert.equal(watcher.scoreOne(asked, 'yes', { verdict: 'needs-input', message: '' }).agreed, false);
-  assert.equal(watcher.scoreOne(asked, 'yes', { verdict: 'needs-input', message: 'no, keep it' }).agreed, false);
-  assert.equal(watcher.scoreOne(told, 'continue', { verdict: 'quiet', message: '' }).agreed, false);
+  // 2. A relay of someone else's output says nothing about what Owner wanted.
+  assert.equal(truth(told, '> the other session says the build is green\n> and the tests pass').skip, 'quoted-relay');
+  assert.equal(truth(told, '   ').skip, 'quoted-relay');
+  // Quoting plus an actual instruction is still an instruction.
+  assert.equal(truth(told, '> they said it is green\nnow do the same here').expected, 'quiet');
+
+  // 3. The session asked; anything back is Owner answering. This was the biggest
+  // scorer defect in the first real replay.
+  assert.equal(truth(asked, 'yes').expected, 'needs-input');
+  assert.equal(truth(asked, 'go ahead').expected, 'needs-input', 'an approval after a question is an answer, not a nudge');
+  assert.equal(truth(physical, 'done').expected, 'needs-input');
+  assert.equal(truth(physical, 'unlocked').expected, 'needs-input');
+  assert.equal(truth(physical, "it's happening now").expected, 'needs-input');
+  assert.equal(truth(physical, 'i gave access').expected, 'needs-input');
+  assert.equal(truth(physical, 'pasted').expected, 'needs-input');
+
+  // 4. A premise challenge or an open question wanted a conversation.
+  for (const text of ["i'm confused, why is it doing that", "i don't think that's right",
+    'do you think that matters?', 'why would it need the flag', "isn't that the old path",
+    'are you sure about the migration', 'hmm that seems wrong', 'what about the other card']) {
+    assert.equal(truth(told, text).expected, 'needs-input', text);
+    assert.equal(truth(told, text).rule, 'premise-challenge', text);
+  }
+  assert.equal(truth(told, 'should the docs mention the cap?').expected, 'needs-input', 'a trailing ? is a question');
+  assert.equal(truth(told, 'anything else?').expected, 'continue', 'except the ones that are just nudges');
+
+  // 5. Nudges and affirmatives.
+  for (const text of ['continue', 'keep going', "ok let's do that", 'go ahead', 'do it', 'yes',
+    'sure, proceed', 'alright build it', 'ship it', 'run it', 'keep going until the suite is green',
+    'anything else to do?']) {
+    assert.equal(truth(told, text).expected, 'continue', text);
+  }
+
+  // 6. Redirects, in the first 80 characters of what Owner actually wrote.
+  assert.equal(truth(told, "no, that's the wrong flag").expected, 'drift');
+  assert.equal(truth(told, 'revert that and start from the card').expected, 'drift');
+  assert.equal(truth(told, `${'x'.repeat(90)} revert that`).expected, 'quiet', 'a redirect word 90 chars in is prose');
+
+  // 7. Anything else is a new instruction, which is Owner working, not nudging.
+  assert.equal(truth(told, 'now write the docs for the new endpoint').expected, 'quiet');
+  assert.equal(truth(told, 'add a test for the empty case').expected, 'quiet');
+});
+
+test('scoring gives half credit where quiet was the harmless answer', (t) => {
+  sandbox(t);
+  const told = { last_assistant: "Parser built. Next, I'll wire the CLI." };
+  const next = (text) => ({ opener_text: text, opener_kind: 'human' });
+
+  const challenged = watcher.scoreOne(told, next("i'm confused, why did you do that"), { verdict: 'quiet', message: '' });
+  assert.equal(challenged.expected, 'needs-input');
+  assert.equal(challenged.agreed, false, 'quiet is not agreement');
+  assert.equal(challenged.soft, 0.5, 'but leaving Owner alone was half right');
+
+  const pushed = watcher.scoreOne(told, next("i'm confused, why did you do that"), { verdict: 'continue', message: 'continue' });
+  assert.equal(pushed.soft, 0, 'nudging a session Owner is arguing with earns nothing');
+
+  const right = watcher.scoreOne(told, next('continue'), { verdict: 'continue', message: 'continue' });
+  assert.equal(right.agreed, true);
+  assert.equal(right.soft, 1);
+
+  // A needs-input prediction now agrees on the verdict alone: "done" after a
+  // physical ask is Owner answering, and no proposed message could match it.
+  const answered = watcher.scoreOne({ last_assistant: 'I need you to unlock the phone so adb can see it.' },
+    next('done'), { verdict: 'needs-input', message: '' });
+  assert.equal(answered.agreed, true);
+
+  // Rule 3 is only as good as askedQuestion. A bare imperative ask that
+  // session-status.proseRequest does not recognise leaves "done" falling through
+  // to the nudge rule — the residual form of the defect, documented rather than
+  // fixed here, because widening proseRequest changes fleet-wide attention.
+  const missed = watcher.scoreOne({ last_assistant: 'Unlock the phone and I will retry.' }, next('done'),
+    { verdict: 'needs-input', message: '' });
+  assert.equal(missed.expected, 'continue');
+
+  assert.equal(watcher.unquoted('> quoted\nreal line\n> more'), 'real line');
+  assert.equal(watcher.unquoted('> only quoted'), '');
+  assert.equal(watcher.confidenceBand(0.9), 'high');
+  assert.equal(watcher.confidenceBand(0.6), 'mid');
+  assert.equal(watcher.confidenceBand(0.2), 'low');
+  assert.equal(watcher.confidenceBand(null), 'unknown');
+});
+
+test('replay skips what it cannot score and never spends a model call on it', async (t) => {
+  const dir = sandbox(t);
+  indexTurns(dir, [
+    ['build the parser', "Parser built. Next, I'll wire the CLI."],
+    ['> the other session says it is green\n> and the tests pass', 'Read it.'],
+    ['[keep] Your card kt-1 has a next step.', 'Continuing.'],
+    ['now write the docs', 'Docs written.'],
+  ]);
+  const judged = [];
+  const judge = async (turn) => {
+    judged.push(turn.n);
+    watcher.writeVerdict(turn, { verdict: 'quiet', reason: 'r', message: '', stateLine: 's', confidence: 0.9, model: 'fake:replay' });
+    return { verdict: 'quiet', message: '', confidence: 0.9 };
+  };
+
+  const result = await watcher.replay({ sinceMs: 0, limit: 50, judge, save: false });
+  // Turn 1's opener is a quoted relay; turn 2's is a keep hook message. Neither
+  // says anything about what Owner wanted, so neither is worth a model call.
+  assert.equal(result.skipped.total, 2);
+  assert.deepEqual(result.skipped.reasons, { 'quoted-relay': 1, 'not-owner': 1 });
+  assert.deepEqual(judged.sort(), [3], 'only the scorable turn was judged');
+  assert.equal(result.total, 1);
+  assert.equal(result.samples[0].expected, 'quiet');
+});
+
+test('the scoreboard reports agreement by confidence band and is kept on disk', async (t) => {
+  const dir = sandbox(t);
+  indexTurns(dir, [
+    ['a', "Built it. Next, I'll wire the CLI."],  // turn 1, next opener is a nudge
+    ['continue', "Wired. Next, I'll write docs."], // turn 2, next opener is a nudge
+    ['keep going', 'Docs written.'],               // turn 3, next opener is a new task
+    ['now add a test for the empty case', 'Added.'],
+  ]);
+  // A confident continue that is right, a hesitant continue that is wrong.
+  const answers = { 1: [0.9, 'continue'], 2: [0.4, 'continue'], 3: [0.8, 'continue'] };
+  const judge = async (turn) => {
+    const [confidence, verdict] = answers[turn.n] || [0.6, 'quiet'];
+    const value = { verdict, message: verdict === 'quiet' ? '' : 'continue', confidence };
+    watcher.writeVerdict(turn, { ...value, reason: 'r', stateLine: `state ${turn.n}`, model: 'fake:replay' });
+    return value;
+  };
+
+  const result = await watcher.replay({ sinceMs: 0, limit: 50, judge });
+  assert.equal(result.total, 3);
+  const band = (name) => result.bands.find((row) => row.band === name);
+  // Turn 1 (0.9) was a real nudge; turn 3 (0.8) pushed a session Owner was
+  // giving fresh work to. That is the number the graduation decision needs:
+  // confident is not the same as safe.
+  assert.equal(band('high').total, 2);
+  assert.equal(band('high').agreed, 1);
+  assert.equal(band('high').verdicts.continue.precision, 0.5);
+  // The hesitant continue happened to be right, so a low band is not "wrong".
+  assert.equal(band('low').total, 1);
+  assert.equal(band('low').agreed, 1);
+  assert.equal(band('low').verdicts.continue.precision, 1);
+  assert.equal(band('mid').total, 0);
+
+  // The scoreboard is the artefact the graduation decision is read from.
+  assert.ok(result.savedTo && fs.existsSync(result.savedTo));
+  const saved = JSON.parse(fs.readFileSync(result.savedTo, 'utf8'));
+  assert.equal(saved.total, 3);
+  assert.ok(Number.isFinite(saved.at));
+  assert.ok(Array.isArray(saved.bands));
+
+  const latest = watcher.latestReplay();
+  assert.equal(latest.file, result.savedTo);
+  assert.equal(latest.total, 3);
+
+  // And `keep watcher stats` surfaces it alongside the live bands.
+  const summary = watcher.stats({ sinceMs: 0 });
+  assert.equal(summary.replay.total, 3);
+  const liveHigh = summary.bands.find((row) => row.band === 'high');
+  assert.equal(liveHigh.total, 2);
+  assert.equal(liveHigh.verdicts.continue, 2);
+  assert.equal(summary.bands.find((row) => row.band === 'low').total, 1);
 });
 
 // ---------- reporting and the dashboard ----------

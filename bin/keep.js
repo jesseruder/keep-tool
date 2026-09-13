@@ -6080,20 +6080,45 @@ async function watcherReplay(argv) {
     sinceMs: turnsSince(o.since), limit: turnsIndexNumber(o.limit, '--limit') || 100, agent: o.agent || null,
   });
   if (o.json) return console.log(JSON.stringify(result, null, 2));
-  if (!result.total) return console.log('no historical turns with a following human message to score against');
-  const pct = (value) => (value == null ? '   -' : `${Math.round(value * 100)}%`.padStart(4));
-  console.log(`${result.total} turns scored against what Owner actually typed next — `
-    + `${pct(result.agreement)} agreement\n`);
-  console.log(`${'verdict'.padEnd(12)}${'precision'.padStart(10)}${'recall'.padStart(8)}${'predicted'.padStart(10)}${'expected'.padStart(9)}`);
+  if (!result.total) return console.log(`no scorable turns (${watcherSkips(result)})`);
+  console.log(renderScoreboard(result, watcher));
+  if (result.savedTo) console.log(`\nscoreboard saved to ${result.savedTo}`);
+}
+
+function watcherPct(value) {
+  return value == null ? '   -' : `${Math.round(value * 100)}%`.padStart(4);
+}
+
+function watcherSkips(result) {
+  const skipped = (result && result.skipped) || { total: 0, reasons: {} };
+  const reasons = Object.entries(skipped.reasons || {}).map(([name, n]) => `${n} ${name}`).join(', ');
+  return `${skipped.total} skipped${reasons ? `: ${reasons}` : ''}`;
+}
+
+function renderScoreboard(result, watcher) {
+  const lines = [`${result.total} turns scored against what Owner actually typed next — `
+    + `${watcherPct(result.agreement)} agreement (${watcherPct(result.softAgreement)} with half credit`
+    + ` where quiet was harmless); ${watcherSkips(result)}`, ''];
+  lines.push(`${'verdict'.padEnd(12)}${'precision'.padStart(10)}${'recall'.padStart(8)}${'predicted'.padStart(10)}${'expected'.padStart(9)}`);
   for (const row of result.rows) {
-    console.log(`${row.verdict.padEnd(12)}${pct(row.precision).padStart(10)}${pct(row.recall).padStart(8)}`
+    lines.push(`${row.verdict.padEnd(12)}${watcherPct(row.precision).padStart(10)}${watcherPct(row.recall).padStart(8)}`
       + `${String(row.predicted).padStart(10)}${String(row.expected).padStart(9)}`);
   }
-  console.log(`\nconfusion (rows = what Owner did, columns = what the watcher said)`);
-  console.log(`${''.padEnd(12)}${watcher.VERDICTS.map((verdict) => verdict.padStart(12)).join('')}`);
-  for (const expected of watcher.VERDICTS) {
-    console.log(`${expected.padEnd(12)}${watcher.VERDICTS.map((actual) => String(result.confusion[expected][actual]).padStart(12)).join('')}`);
+  // The graduation question is not "is the watcher right on average" but "is a
+  // high-confidence continue safe to send", so the bands carry continue precision.
+  lines.push('', `${'confidence'.padEnd(12)}${'turns'.padStart(7)}${'agree'.padStart(7)}${'continue'.padStart(10)}${'continue ok'.padStart(12)}`);
+  for (const band of result.bands) {
+    if (!band.total) continue;
+    const cont = band.verdicts.continue;
+    lines.push(`${band.label.padEnd(12)}${String(band.total).padStart(7)}${watcherPct(band.agreement).padStart(7)}`
+      + `${String(cont.predicted).padStart(10)}${watcherPct(cont.precision).padStart(12)}`);
   }
+  lines.push('', 'confusion (rows = what Owner did, columns = what the watcher said)');
+  lines.push(`${''.padEnd(12)}${watcher.VERDICTS.map((verdict) => verdict.padStart(12)).join('')}`);
+  for (const expected of watcher.VERDICTS) {
+    lines.push(`${expected.padEnd(12)}${watcher.VERDICTS.map((actual) => String(result.confusion[expected][actual]).padStart(12)).join('')}`);
+  }
+  return lines.join('\n');
 }
 
 function watcherStats(argv) {
@@ -6105,8 +6130,21 @@ function watcherStats(argv) {
   for (const row of result.rows) {
     console.log(`  ${row.verdict.padEnd(12)} ${String(row.turns).padStart(6)}${row.replays ? ` (${row.replays} replay)` : ''}`);
   }
+  if (result.total) {
+    console.log(`\n${'confidence'.padEnd(12)}${'turns'.padStart(7)}${watcher.VERDICTS.map((v) => v.padStart(12)).join('')}`);
+    for (const band of result.bands) {
+      if (!band.total) continue;
+      console.log(`${band.label.padEnd(12)}${String(band.total).padStart(7)}`
+        + watcher.VERDICTS.map((verdict) => String(band.verdicts[verdict]).padStart(12)).join(''));
+    }
+  }
   console.log('');
   console.log(require('./decisions.js').renderStats(result.ledger));
+  if (result.replay) {
+    const when = new Date(result.replay.at || 0).toISOString().slice(0, 16).replace('T', ' ');
+    console.log(`\nlast replay (${when}, ${path.basename(result.replay.file)}):\n`);
+    console.log(renderScoreboard(result.replay, watcher));
+  }
 }
 
 const WATCHER_SUBCOMMANDS = { run: watcherRun, ls: watcherLs, replay: watcherReplay, stats: watcherStats };

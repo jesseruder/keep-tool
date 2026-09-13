@@ -63,8 +63,12 @@ const EXPLICIT_PAUSE_RE = /\bpaused as requested\b|\b(?:I(?:'|’)ll|I will)\s+(
 // Work the session handed to something that is still running. Not a completion
 // claim and not a stall: the next move belongs to the job, not to Owner.
 const IN_PROGRESS_RE = /\b(?:is in progress|are in progress|still (?:in progress|running|building|deploying)|until it (?:returns|finishes|completes)|will report (?:back )?when|will update (?:you )?when|report back when)\b/i;
-// Replay ground truth: what Owner actually typed next.
-const AFFIRMATIVE_RE = /^(yes|y|ok|okay|yep|sure|go ahead|do it)\b/i;
+// Replay ground truth: what Owner actually typed next. These read his replies,
+// not an agent's prose, so they are deliberately loose about punctuation and
+// capitalisation — he types in lower case and rarely finishes a sentence.
+const AFFIRMATIVE_RE = /^(?:(?:ok|okay|yes|yep|y|sure|alright|right)\b[,.!\s]*)?(?:let'?s\b|do that\b|go ahead\b|go\b|do it\b|start\b|build\b|implement\b|figure that out\b|proceed\b|keep going\b|continue\b|run it\b|ship it\b|land it\b|push\b)|^(?:ok|okay|yes|yep|y|sure|alright)\s*[.!]?\s*$/i;
+// Owner pushing back on the premise, or asking a question of his own.
+const PREMISE_CHALLENGE_RE = /^(?:i'?m confused|i don'?t think|do you think|why (?:would|did|are|is)|isn'?t|wouldn'?t|shouldn'?t|what about|are you sure|hmm)\b/i;
 const REDIRECT_RE = /\b(no|not what|why did|i thought|instead|don't|stop|wait|revert)\b/i;
 
 const SYSTEM_PROMPT = 'You are a decision-recording service, not a coding agent. You judge one finished turn of a '
@@ -86,6 +90,9 @@ const INSTRUCTION = [
   '- quiet: nothing to do — the session is mid-work, it is waiting on a scheduled check, or the turn was answering a question Owner had just asked.',
   '',
   'Rules:',
+  '- A completion report — the session says it is done, landed, or finished, and names no next step — is `continue` with the self-check message, unless the turn already shows pushed commits, a Keep check-in, and a verification that reproduced the original symptom; in that case it is `quiet`.',
+  '- When Owner\'s opening message was a question and the turn answers it, that is `quiet`. When the turn ends by proposing something and asking for a go-ahead, it is `continue` with a short affirmative only if the proposal is reversible and inside the card\'s scope; otherwise it is `needs-input` with the answer you would propose.',
+  '- Set confidence honestly. A `continue` below 0.7 will never be sent, so a low number costs nothing and an inflated one costs trust.',
   '- A deterministic rule pass already ran; its answer is given as RULE VERDICT. Agree with it unless the evidence says otherwise, and if you disagree your `reason` must say what the rule missed.',
   '- `message` is delivered verbatim if Owner approves it, so write it the way Owner types: lowercase, imperative, no greeting, no sign-off, no markdown.',
   '- Never invent a fact that is not in the input. If there is no card, do not assume one.',
@@ -204,13 +211,14 @@ function turnsForReplay(options = {}) {
   const params = [windowStart(options.sinceMs)];
   if (options.agent) { where.push('s.agent = ?'); params.push(options.agent); }
   params.push(limit);
-  // Only turns Owner actually answered can be scored: the next opener is the
-  // ground truth, so a turn without one carries no signal either way.
+  // Only turns with a following opener can be scored: that opener is the ground
+  // truth. Whether it was Owner speaking is decided in groundTruth rather than
+  // here, so the scoreboard can report how many turns dropped out and why.
   return handle.prepare(`SELECT ${TURN_COLUMNS}, next.opener_text AS next_opener, next.opener_kind AS next_kind
     FROM turns t
     JOIN sessions s ON s.id = t.session_id
     JOIN turns next ON next.session_id = t.session_id AND next.n = t.n + 1
-    WHERE ${where.join(' AND ')} AND next.opener_kind = 'human' AND next.opener_text IS NOT NULL
+    WHERE ${where.join(' AND ')} AND next.opener_text IS NOT NULL
     ORDER BY COALESCE(t.ended_at, t.started_at, 0) DESC LIMIT ?`).all(...params);
 }
 
@@ -658,25 +666,59 @@ async function tick(options = {}) {
 
 // ---------- replay ----------
 
-// What Owner actually typed next, as a verdict label. This is the ground truth
-// the scoreboard is measured against.
-function expectedVerdict(turn, nextOpener) {
-  const text = String(nextOpener || '').trim();
-  if (!text) return 'quiet';
-  if (turnIndex.isNudge(text)) return 'continue';
-  if (AFFIRMATIVE_RE.test(text) && askedQuestion(turn.last_assistant)) return 'needs-input';
-  if (REDIRECT_RE.test(text.slice(0, 80))) return 'drift';
-  return 'quiet';
+// Owner quoting another session's output back at an agent is a relay, not an
+// instruction; the quoted lines say nothing about what he wanted done here.
+function unquoted(text) {
+  return String(text || '').split('\n').filter((line) => !/^\s*>/.test(line)).join('\n').trim();
 }
 
-// An affirmative answer is only "agreed with" when the proposed answer is itself
-// affirmative; an escalation with no message did not answer anything.
-function scoreOne(turn, nextOpener, value) {
-  const expected = expectedVerdict(turn, nextOpener);
-  let agreed = value.verdict === expected;
-  if (agreed && expected === 'needs-input') agreed = AFFIRMATIVE_RE.test(String(value.message || '').trim());
-  return { expected, actual: value.verdict, agreed };
+// What Owner actually typed next, as a verdict label. This is the ground truth
+// the scoreboard is measured against, and the first replay over 60 real Codex
+// turns showed most of the disagreements were defects in here rather than in the
+// watcher: a reply to a question read as a nudge, a quoted relay read as an
+// instruction, a premise challenge read as approval.
+function groundTruth(turn, next) {
+  const kind = next && next.opener_kind;
+  // Keep's own hook output and slash commands are not Owner speaking.
+  if (kind && kind !== 'human') return { skip: 'not-owner' };
+  const text = unquoted(next && next.opener_text);
+  if (!text) return { skip: 'quoted-relay' };
+  // The session asked for something. Whatever came back — "yes", "done",
+  // "unlocked", "I pasted it" — is Owner answering, which is what needs-input
+  // predicts. Reading "done" as a nudge was the single biggest scorer defect.
+  if (askedQuestion(turn.last_assistant)) return { expected: 'needs-input', rule: 'answered-a-question' };
+  const head = text.slice(0, 80);
+  // Owner pushing back on the premise, or opening a question of his own, wanted a
+  // conversation. `quiet` at least left him alone, so it gets half credit.
+  if (PREMISE_CHALLENGE_RE.test(text) || (/\?\s*$/.test(text) && !turnIndex.isNudge(text))) {
+    return { expected: 'needs-input', rule: 'premise-challenge', soft: 'quiet' };
+  }
+  if (turnIndex.isNudge(text) || AFFIRMATIVE_RE.test(text)) return { expected: 'continue', rule: 'nudge' };
+  if (REDIRECT_RE.test(head)) return { expected: 'drift', rule: 'redirect' };
+  return { expected: 'quiet', rule: 'new-instruction' };
 }
+
+function scoreOne(turn, next, value) {
+  const truth = groundTruth(turn, next);
+  if (truth.skip) return truth;
+  const agreed = value.verdict === truth.expected;
+  return {
+    expected: truth.expected, rule: truth.rule, actual: value.verdict, agreed,
+    // Half credit, reported separately so it can never inflate the agreement
+    // number the graduation decision is made from.
+    soft: agreed ? 1 : (truth.soft && value.verdict === truth.soft ? 0.5 : 0),
+  };
+}
+
+function confidenceBand(confidence) {
+  if (!Number.isFinite(confidence)) return 'unknown';
+  if (confidence < 0.5) return 'low';
+  if (confidence < 0.7) return 'mid';
+  return 'high';
+}
+
+const BANDS = ['high', 'mid', 'low', 'unknown'];
+const BAND_LABELS = { high: '>= 0.7', mid: '0.5 - 0.7', low: '< 0.5', unknown: 'none given' };
 
 function emptyScore() {
   const rows = {};
@@ -686,7 +728,12 @@ function emptyScore() {
     confusion[expected] = {};
     for (const actual of VERDICTS) confusion[expected][actual] = 0;
   }
-  return { rows, confusion, total: 0, agreed: 0 };
+  const bands = {};
+  for (const band of BANDS) {
+    bands[band] = { band, label: BAND_LABELS[band], total: 0, agreed: 0, verdicts: {} };
+    for (const verdict of VERDICTS) bands[band].verdicts[verdict] = { predicted: 0, correct: 0 };
+  }
+  return { rows, confusion, bands, total: 0, agreed: 0, soft: 0, skipped: { total: 0, reasons: {} } };
 }
 
 function finishScore(score) {
@@ -698,36 +745,97 @@ function finishScore(score) {
       recall: row.expected ? row.correct / row.expected : null,
     };
   });
+  const bands = BANDS.map((band) => {
+    const row = score.bands[band];
+    const verdicts = {};
+    for (const verdict of VERDICTS) {
+      const cell = row.verdicts[verdict];
+      verdicts[verdict] = { ...cell, precision: cell.predicted ? cell.correct / cell.predicted : null };
+    }
+    return { ...row, verdicts, agreement: row.total ? row.agreed / row.total : null };
+  });
   return {
     total: score.total,
     agreed: score.agreed,
     agreement: score.total ? score.agreed / score.total : null,
+    // Strict agreement plus half credit where `quiet` was the harmless answer.
+    softAgreement: score.total ? score.soft / score.total : null,
     rows,
+    bands,
     confusion: score.confusion,
+    skipped: score.skipped,
   };
+}
+
+function replayDir() {
+  return path.join(require('./keep.js').META, 'watcher', 'replays');
+}
+
+// The scoreboard is the artefact the graduation decision is read from, so it
+// outlives the terminal it was printed in.
+function saveReplay(result) {
+  try {
+    const dir = replayDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${new Date().toISOString().replace(/[:.]/g, '-')}.json`);
+    const { samples, ...summary } = result;
+    fs.writeFileSync(file, `${JSON.stringify({ at: Date.now(), ...summary, samples: samples.slice(0, 200) }, null, 2)}\n`);
+    return file;
+  } catch (error) {
+    debug(`replay scoreboard not saved: ${error.message}`);
+    return null;
+  }
+}
+
+function latestReplay() {
+  try {
+    const dir = replayDir();
+    const names = fs.readdirSync(dir).filter((name) => name.endsWith('.json')).sort();
+    if (!names.length) return null;
+    const file = path.join(dir, names[names.length - 1]);
+    return { file, ...JSON.parse(fs.readFileSync(file, 'utf8')) };
+  } catch { return null; }
 }
 
 async function replay(options = {}) {
   const turns = (options.turnsForReplay || turnsForReplay)(options);
   const score = emptyScore();
   const samples = [];
+  const skip = (reason) => {
+    score.skipped.total += 1;
+    score.skipped.reasons[reason] = (score.skipped.reasons[reason] || 0) + 1;
+  };
   for (const turn of turns) {
+    const next = { opener_text: turn.next_opener, opener_kind: turn.next_kind };
+    // Check the ground truth before spending a model call on a turn that cannot
+    // be scored either way.
+    const truth = groundTruth(turn, next);
+    if (truth.skip) { skip(truth.skip); continue; }
     const value = await (options.judge || judge)(turn, { ...options, replay: true });
-    if (value && value.skipped) continue; // a live verdict is not a replay's to score over
-    const scored = scoreOne(turn, turn.next_opener, value);
+    if (value && value.skipped) { skip(value.skipped); continue; }
+    const scored = scoreOne(turn, next, value);
     score.total += 1;
+    score.soft += scored.soft;
     if (scored.agreed) score.agreed += 1;
     score.rows[scored.actual].predicted += 1;
     score.rows[scored.expected].expected += 1;
     if (scored.agreed) score.rows[scored.expected].correct += 1;
     score.confusion[scored.expected][scored.actual] += 1;
+    const band = score.bands[confidenceBand(value.confidence)];
+    band.total += 1;
+    if (scored.agreed) band.agreed += 1;
+    band.verdicts[scored.actual].predicted += 1;
+    if (scored.agreed) band.verdicts[scored.actual].correct += 1;
     samples.push({
       turn: turn.id, session: turn.session_id, n: turn.n, agent: turn.agent,
-      expected: scored.expected, actual: scored.actual, agreed: scored.agreed,
+      expected: scored.expected, actual: scored.actual, rule: scored.rule,
+      agreed: scored.agreed, soft: scored.soft, confidence: value.confidence == null ? null : value.confidence,
       nextOpener: oneLine(turn.next_opener, 120), message: oneLine(value.message, 120),
     });
   }
-  return { ...finishScore(score), samples };
+  const result = { ...finishScore(score), samples };
+  if (options.save !== false) result.savedTo = saveReplay(result);
+  return result;
 }
 
 // ---------- reporting ----------
@@ -781,13 +889,32 @@ function stats(options = {}) {
     const row = counts.find((entry) => entry.verdict === verdict);
     return { verdict, turns: row ? row.n : 0, replays: row ? Number(row.replays || 0) : 0 };
   });
+  // Bucketed in SQL: the question this answers is whether a high-confidence
+  // `continue` is safe to send, and that must not require pulling every row.
+  const banded = handle.prepare(`SELECT CASE
+        WHEN verdict_confidence IS NULL THEN 'unknown'
+        WHEN verdict_confidence < 0.5 THEN 'low'
+        WHEN verdict_confidence < 0.7 THEN 'mid'
+        ELSE 'high' END AS band,
+      verdict, COUNT(*) AS n
+    FROM turns WHERE verdict IS NOT NULL AND COALESCE(verdict_at, 0) >= ?
+    GROUP BY band, verdict`).all(since);
+  const bands = BANDS.map((band) => {
+    const cells = banded.filter((row) => row.band === band);
+    const verdicts = {};
+    for (const verdict of VERDICTS) verdicts[verdict] = (cells.find((row) => row.verdict === verdict) || {}).n || 0;
+    return { band, label: BAND_LABELS[band], total: cells.reduce((sum, row) => sum + row.n, 0), verdicts };
+  });
   let ledger = { rows: [], totals: { pending: 0, judged: 0, agree: 0 } };
   try {
     const decisions = options.decisions || require('./decisions.js');
     const all = decisions.loadSafe().filter((entry) => entry.reviewer === 'watcher' && Number(entry.at || 0) >= since);
     ledger = decisions.stats(all);
   } catch {}
-  return { since, rows, total: rows.reduce((sum, row) => sum + row.turns, 0), ledger };
+  return {
+    since, rows, bands, total: rows.reduce((sum, row) => sum + row.turns, 0), ledger,
+    replay: options.replay === false ? null : latestReplay(),
+  };
 }
 
 module.exports = {
@@ -795,5 +922,6 @@ module.exports = {
   askedQuestion, stopHint, namesNextStep, claimsDone, explicitPause, inProgress, waitingOnCheck,
   signalsFor, ruleVerdict, selectTurns, turnsForReplay, turnFor, buildContext, invocationFor,
   firstJsonObject, parseVerdict, runModel, spawnRunner, judge, writeVerdict, setDecisionId, decisionTypeFor,
-  tick, enabled, replay, expectedVerdict, scoreOne, listVerdicts, stateLines, stats, watcherModel,
+  tick, enabled, replay, groundTruth, scoreOne, unquoted, confidenceBand, BANDS, BAND_LABELS,
+  saveReplay, latestReplay, replayDir, listVerdicts, stateLines, stats, watcherModel,
 };
