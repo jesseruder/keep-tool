@@ -315,6 +315,21 @@ test('observer renderer changes neither claim control nor resize the PTY and dis
   assert.equal(f.timers.has(laterTimer), false);
 });
 
+test('an observer can choose either renderer without claiming or resizing the PTY', async () => {
+  const f = fixture({ pane: { primary: 'other' } });
+  try {
+    f.runFrames();
+    f.message({ t: 'replay-end' });
+    await f.drain();
+    f.socket.sent.length = 0;
+    f.mounted.setRenderer('dom');
+    f.mounted.setRenderer('webgl');
+    assert.equal(f.webglDisposals, 1);
+    assert.equal(f.webglLoads, 2);
+    assert.deepEqual(f.socket.sent, []);
+  } finally { f.mounted.dispose(); }
+});
+
 test('cached terminal visibility reports hide, show and reattachment', () => {
   const f = fixture();
   assert.equal(f.socket.visibility.at(-1), true);
