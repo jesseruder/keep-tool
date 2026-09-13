@@ -23,32 +23,90 @@ function stateFile(account) {
   return path.join(account.configDir, '.claude.json');
 }
 
-function trustProject(account, cwd) {
-  const file = stateFile(account);
-  const state = readJSON(file, {});
-  if (!state || typeof state !== 'object' || Array.isArray(state)) {
-    throw new Error(`invalid JSON object in ${file}`);
-  }
-  const project = fs.realpathSync(cwd);
-  const projects = state.projects && typeof state.projects === 'object' && !Array.isArray(state.projects)
-    ? state.projects : {};
-  const entry = projects[project] && typeof projects[project] === 'object' && !Array.isArray(projects[project])
-    ? projects[project] : {};
-  if (entry.hasTrustDialogAccepted === true) return false;
-  state.projects = { ...projects, [project]: { ...entry, hasTrustDialogAccepted: true } };
+function sleepSync(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
 
-  const directory = path.dirname(file);
-  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const temporary = path.join(directory,
-    `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`);
+function fileIdentity(file) {
   try {
-    fs.writeFileSync(temporary, JSON.stringify(state, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
-    fs.renameSync(temporary, file);
+    const stat = fs.statSync(file);
+    return { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino };
   } catch (error) {
-    try { fs.unlinkSync(temporary); } catch {}
+    if (error.code === 'ENOENT') return null;
     throw error;
   }
-  return true;
+}
+
+function sameFileIdentity(before, after) {
+  if (!before || !after) return before === after;
+  return before.mtimeMs === after.mtimeMs && before.size === after.size && before.ino === after.ino;
+}
+
+function acquireStateLock(file, timeoutMs) {
+  const lock = `${file}.lock`;
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      fs.mkdirSync(lock);
+      return lock;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    }
+
+    try {
+      if (Date.now() - fs.statSync(lock).mtimeMs > 10_000) {
+        fs.rmSync(lock, { recursive: true, force: true });
+        continue;
+      }
+    } catch (error) {
+      if (error.code === 'ENOENT') continue;
+      throw error;
+    }
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error(`claude state file is locked: ${file}`);
+    sleepSync(Math.min(50, remaining));
+  }
+}
+
+function trustProject(account, cwd, options = {}) {
+  const file = stateFile(account);
+  const directory = path.dirname(file);
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const lock = acquireStateLock(file, options.lockTimeoutMs ?? 2_000);
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const before = fileIdentity(file);
+      const state = readJSON(file, {});
+      if (!state || typeof state !== 'object' || Array.isArray(state)) {
+        throw new Error(`invalid JSON object in ${file}`);
+      }
+      const project = fs.realpathSync(cwd);
+      const projects = state.projects && typeof state.projects === 'object' && !Array.isArray(state.projects)
+        ? state.projects : {};
+      const entry = projects[project] && typeof projects[project] === 'object' && !Array.isArray(projects[project])
+        ? projects[project] : {};
+      if (entry.hasTrustDialogAccepted === true) return false;
+      state.projects = { ...projects, [project]: { ...entry, hasTrustDialogAccepted: true } };
+
+      const temporary = `${file}.tmp.${process.pid}.${crypto.randomBytes(8).toString('hex')}`;
+      try {
+        fs.writeFileSync(temporary, JSON.stringify(state, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+        if (!sameFileIdentity(before, fileIdentity(file))) {
+          fs.unlinkSync(temporary);
+          continue;
+        }
+        fs.renameSync(temporary, file);
+        return true;
+      } catch (error) {
+        try { fs.unlinkSync(temporary); } catch {}
+        throw error;
+      }
+    }
+    throw new Error(`claude state file changed while updating: ${file}`);
+  } finally {
+    fs.rmSync(lock, { recursive: true, force: true });
+  }
 }
 
 function readJSON(file, fallback) {

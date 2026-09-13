@@ -319,6 +319,42 @@ test('trustProject rejects invalid JSON without overwriting it', () => {
     fs.writeFileSync(file, original);
     assert.throws(() => setup.trustProject(account, cwd), /invalid JSON/);
     assert.equal(fs.readFileSync(file, 'utf8'), original);
+    assert.equal(fs.existsSync(`${file}.lock`), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('trustProject removes a stale Claude state lock and removes its lock after success', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-project-trust-stale-lock-'));
+  const cwd = path.join(root, 'project'), configDir = path.join(root, 'claude');
+  const account = { id: 'claude-test', agent: 'claude', configDir, builtIn: false };
+  const file = path.join(configDir, '.claude.json'), lock = `${file}.lock`;
+  try {
+    fs.mkdirSync(cwd); fs.mkdirSync(configDir); fs.mkdirSync(lock);
+    const stale = new Date(Date.now() - 20_000);
+    fs.utimesSync(lock, stale, stale);
+    assert.equal(setup.trustProject(account, cwd), true);
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).projects[fs.realpathSync(cwd)].hasTrustDialogAccepted, true);
+    assert.equal(fs.existsSync(lock), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('trustProject times out on a fresh Claude state lock without changing state', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-project-trust-fresh-lock-'));
+  const cwd = path.join(root, 'project'), configDir = path.join(root, 'claude');
+  const account = { id: 'claude-test', agent: 'claude', configDir, builtIn: false };
+  const file = path.join(configDir, '.claude.json'), lock = `${file}.lock`;
+  try {
+    fs.mkdirSync(cwd); fs.mkdirSync(configDir);
+    const original = JSON.stringify({ theme: 'dark' });
+    fs.writeFileSync(file, original);
+    fs.mkdirSync(lock);
+    const started = Date.now();
+    assert.throws(() => setup.trustProject(account, cwd, { lockTimeoutMs: 200 }),
+      new RegExp(`claude state file is locked: ${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.ok(Date.now() - started >= 150);
+    assert.ok(Date.now() - started < 1_000);
+    assert.equal(fs.readFileSync(file, 'utf8'), original);
+    assert.equal(fs.existsSync(lock), true);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
