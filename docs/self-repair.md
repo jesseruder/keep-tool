@@ -292,11 +292,21 @@ asks whether that card's fix has landed.
 `keep reviewed` records, which say a patch was reviewed, not that one was pushed.
 What `keep land` leaves is a check-in on the card — `Landed <branch> onto <default>`
 with the pushed sha in that entry's `commits:` field — and that entry is the land
-record. Three things have to line up, because the session being gated can write
-check-ins of its own: the entry matches that whole line and not looser prose about
-landing something, the card carries a clean `keep reviewed` record (a repair card
-holds no `--allow` grants, so its land can only have gone the reviewed-patch way),
-and the cited sha is an ancestor of `origin/<default>` in the live checkout.
+record. Four things have to line up, because the session being gated writes its own
+check-ins and a line of prose is not evidence:
+
+1. the entry matches that whole line, not looser prose about landing something
+2. the card carries a clean `keep reviewed` record — a repair card holds no
+   `--allow` grants, so its land can only have gone the reviewed-patch way
+3. the cited sha is an ancestor of `origin/<default>` in the live checkout
+4. that commit's `git patch-id --stable` is one the review record covers — the
+   rebase `wt land` does before it pushes changes the sha and not the patch, which
+   is the reason `keep reviewed` records patch-ids in the first place
+
+The cost of 2 and 4 is one case this does not recognise: a land Owner authorized
+with an explicit `--allow land` grant instead of a reviewed patch. Owner is by
+definition present for that one, and the restart falls back to being his.
+
 It never fetches: this runs in front of every
 Bash call the session makes, so a network round trip would stall the whole repair,
 and the refs are already fresh — the landed sweep and the `git-pull` scheduler keep
@@ -315,7 +325,8 @@ write in the live checkout. Nothing may ride along with the two either — an
 environment assignment (`GIT_CONFIG_*` can move the remote or point `core.hooksPath`
 at a script), a node flag (`-r`, `--eval`), a wrapper such as `env -C`, a second
 `-C`, or `--git-dir`/`--work-tree`, which pair another repository with the live
-working tree. A session whose card cannot be resolved, whose card has
+working tree. What sits in front of a shell sits in front of everything the shell
+runs, so an assignment does not lose its meaning inside `bash -c '…'`. A session whose card cannot be resolved, whose card has
 no land check-in, or whose predicate throws is refused exactly as it was before.
 
 **The card is not closed automatically**, the fix is not landed without a recorded
