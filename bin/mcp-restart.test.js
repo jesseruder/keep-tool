@@ -29,6 +29,18 @@ test('MCP admission requires exact audited config, pinned code, ownership and a 
     assert.throws(check, /background/);
     fs.writeFileSync(configFile, JSON.stringify({ mcpServers: { example: server } }));
     fs.appendFileSync(command, '# changed'); assert.throws(check, /background/);
+    // Force admits the now-unaudited leaf helper only when the session's own
+    // --mcp-config names it; never a child with children, without a captured
+    // identity, with another command, or when the launch config is unknown.
+    const launched = { ...parent, args: `/test/claude --mcp-config ${configFile} --resume abc` };
+    const forced = (rows = [launched, child], owner = launched) => inspect({ root, agent: 'claude', parent: owner, rows, force: true });
+    assert.equal(forced().length, 1, 'force admits an unaudited launch helper');
+    assert.equal(forced([launched, { ...child, args: `/other/python3.12 ${command}` }]).length, 1, 'any single absolute interpreter prefix');
+    assert.throws(() => forced([launched, { ...child, args: '/usr/bin/anything --unknown' }]), /background/);
+    assert.throws(() => forced([launched, { ...child, args: `/usr/bin/env python3 ${command}` }]), /background/);
+    assert.throws(() => forced([launched, child, { pid: 3, ppid: 2 }]), /background/);
+    assert.throws(() => forced([launched, { ...child, pidStart: null }]), /background/);
+    assert.throws(() => forced([parent, child], parent), /background/, 'no launch config, no forced admission');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 test('orphan detection follows captured identity after reparenting, never kills or mistakes a reused PID', () => {

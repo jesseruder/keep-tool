@@ -32,7 +32,22 @@ function approved(root, agent, child) {
     });
   } catch { return false; }
 }
-function inspect({ root, agent, sessionId, parent, rows }) {
+// Servers the session was launched with: the stdio entries of the --mcp-config
+// file on its own argv. A forced restart trusts only those, and only as leaves.
+function launchServers(parent) {
+  const match = /(?:^|\s)--mcp-config(?:=|\s+)["']?([^\s"']+)["']?(?=\s|$)/.exec(parent.args || '');
+  if (!match || !path.isAbsolute(match[1])) return [];
+  try {
+    return Object.values(JSON.parse(fs.readFileSync(match[1], 'utf8')).mcpServers || {})
+      .filter(server => server && ['stdio', undefined].includes(server.type) && path.isAbsolute(server.command || ''))
+      .map(server => [server.command, ...(server.args || [])].join(' '));
+  } catch { return []; }
+}
+function launchHelper(parent, child) {
+  return launchServers(parent).some(argv => child.args === argv
+    || child.args.endsWith(` ${argv}`) && /^\/\S+$/.test(child.args.slice(0, -argv.length - 1)));
+}
+function inspect({ root, agent, sessionId, parent, rows, force = false }) {
   const executable = parent.args.split(/\s+/)[0];
   const runtime = agent === 'codex' && executable.startsWith('/') ? path.join(path.dirname(executable), 'codex-code-mode-host') : null;
   const pinCache = new Map(); // One fresh inspection only; never across exit checks.
@@ -41,8 +56,12 @@ function inspect({ root, agent, sessionId, parent, rows }) {
       const tree = require('./runtime-restart').match({ root, agent, sessionId, parent, child, rows, pinCache });
       if (tree) return tree;
     }
+    // A forced restart admits an unaudited leaf helper only when it is one of the
+    // MCP servers the session was launched with (audit pins go stale); a child
+    // with children of its own, no captured identity, or any other command is
+    // still treated as live background work.
     if (!child.pidStart || rows.some(p => p.ppid === child.pid)
-      || !(runtime && child.args === runtime) && !approved(root, agent, child)) throw Error('Local background processes are still present');
+      || !(runtime && child.args === runtime) && !approved(root, agent, child) && !(force && launchHelper(parent, child))) throw Error('Local background processes are still present');
     return [{ pid: child.pid, ppid: child.ppid, pidStart: child.pidStart, args: child.args }];
   }).sort((a, b) => a.pid - b.pid);
 }
