@@ -29,10 +29,13 @@ const {
   lastClaudeHandoffModel,
   lastContextTokens,
   autoCompactIdleMs,
+  autoCompactPolicy,
   autoCompactCandidates,
   autoCompactOutcome,
   autoCompactTick,
   compactSession,
+  compactRequestTelemetry,
+  hasCompactionMarker,
   compactSwapPlan,
   ensureCompactionRestored,
   afterCompactAction,
@@ -40,6 +43,7 @@ const {
   compactScreenConfirmed,
   modelSwitchConfirmed,
   modelSwitchDialogVisible,
+  codexTypedTextVisible,
   pendingCompactSwaps,
   readPendingCompactSwap,
   sweepPendingCompactSwaps,
@@ -1597,7 +1601,7 @@ test('last context size comes from the newest usage-bearing transcript record', 
     },
   })];
   assert.equal(lastContextTokens(claude, 'claude'), 510);
-  assert.equal(lastContextTokens(codex, 'codex'), 29301);
+  assert.equal(lastContextTokens(codex, 'codex'), 18293, 'Codex input_tokens already includes cached tokens');
   assert.equal(lastContextTokens([], 'claude'), 0);
 });
 
@@ -1616,7 +1620,80 @@ test('last turn usage takes the last non-sidechain Claude model and context', ()
   assert.deepEqual(lastTurnUsage(records, 'claude'), {
     contextTokens: 510,
     model: 'claude-fable-5-1',
+    usageAt: null,
+    cacheTtlMs: null,
   });
+});
+
+test('last turn usage tracks cache age, inferred Claude TTL, and the current Codex model', () => {
+  const at = '2026-09-01T11:00:00.000Z';
+  const claude = lastTurnUsage([{
+    type: 'assistant', timestamp: at, message: { model: 'claude-fable-5-1', usage: {
+      input_tokens: 20, cache_read_input_tokens: 100000, cache_creation_input_tokens: 10,
+      cache_creation: { ephemeral_1h_input_tokens: 10, ephemeral_5m_input_tokens: 0 },
+    } },
+  }], 'claude');
+  assert.equal(claude.usageAt, Date.parse(at));
+  assert.equal(claude.cacheTtlMs, 60 * 60e3);
+
+  const codex = lastTurnUsage([
+    { type: 'turn_context', payload: { model: 'gpt-5.6-sol' } },
+    { type: 'event_msg', payload: { type: 'thread_settings_applied', thread_settings: { model: 'gpt-6-astra' } } },
+    { type: 'token_usage_record', timestamp: at, payload: { usage: { input_tokens: 180000, cached_input_tokens: 170000 } } },
+    { type: 'event_msg', timestamp: '2026-09-01T11:01:00.000Z', payload: {
+      type: 'token_count', info: { last_token_usage: { input_tokens: 12, cached_input_tokens: 11 } },
+    } },
+  ], 'codex');
+  assert.deepEqual(codex, {
+    contextTokens: 180000, model: 'gpt-6-astra', usageAt: Date.parse(at), cacheTtlMs: null,
+  });
+  const afterCompact = lastTurnUsage([
+    { type: 'turn_context', payload: { model: 'gpt-6-astra' } },
+    { type: 'token_usage_record', timestamp: at, payload: { usage: { input_tokens: 180000 } } },
+    { type: 'compacted', timestamp: '2026-09-01T11:01:00Z', payload: {
+      compaction_response_id: 'compact', latest_token_usage_record: { response_id: 'compact', usage: { input_tokens: 180000 } },
+    } },
+    { type: 'event_msg', timestamp: '2026-09-01T11:01:01Z', payload: {
+      type: 'token_count', info: { last_token_usage: { input_tokens: 180000 } },
+    } },
+  ], 'codex');
+  assert.equal(afterCompact.contextTokens, 0, 'compaction request usage is not the replacement context');
+  const switchedWithoutUse = lastTurnUsage([
+    { type: 'turn_context', payload: { model: 'gpt-5.6-sol' } },
+    { type: 'token_usage_record', timestamp: at, payload: { usage: { input_tokens: 180000 } } },
+    { type: 'event_msg', payload: { type: 'thread_settings_applied', thread_settings: { model: 'gpt-6-astra' } } },
+  ], 'codex');
+  assert.equal(switchedWithoutUse.model, 'gpt-6-astra');
+  assert.equal(switchedWithoutUse.usageAt, null, 'usage from the previous model cannot establish Astra cache age');
+});
+
+test('compaction telemetry matches Codex response usage and deduplicates Claude streaming rows', () => {
+  const submittedAt = Date.parse('2026-09-01T12:00:00Z');
+  const codexUsage = { input_tokens: 210000, cached_input_tokens: 205000, output_tokens: 900 };
+  const codex = compactRequestTelemetry([
+    { timestamp: '2026-09-01T12:01:00Z', type: 'compacted', payload: {
+      compaction_response_id: 'response-good',
+      latest_token_usage_record: { response_id: 'response-good', usage: codexUsage },
+    } },
+  ].map(JSON.stringify).join('\n'), 'codex', submittedAt);
+  assert.deepEqual(codex.usage, codexUsage);
+  const mismatched = compactRequestTelemetry(JSON.stringify({ timestamp: '2026-09-01T12:01:00Z', type: 'compacted',
+    payload: { compaction_response_id: 'expected', latest_token_usage_record: { response_id: 'other', usage: codexUsage } } }),
+  'codex', submittedAt);
+  assert.equal(mismatched.usage, null);
+  const row = { timestamp: '2026-09-01T12:01:00Z', type: 'assistant', requestId: 'req-1',
+    message: { id: 'msg-1', usage: { input_tokens: 10, cache_read_input_tokens: 120000, output_tokens: 500 } } };
+  const boundary = { timestamp: '2026-09-01T12:02:00Z', type: 'system', subtype: 'compact_boundary',
+    compactMetadata: { preTokens: 140000, postTokens: 15000, durationMs: 120000 } };
+  const claude = compactRequestTelemetry([row, row, boundary].map(JSON.stringify).join('\n'), 'claude', submittedAt);
+  assert.equal(claude.usage.cache_read_input_tokens, 120000);
+  assert.deepEqual(claude.compactMetadata, boundary.compactMetadata);
+  assert.equal(compactRequestTelemetry(JSON.stringify(boundary), 'claude', submittedAt).usage, null);
+  assert.equal(hasCompactionMarker(JSON.stringify({ type: 'message', text: 'ContextCompaction' }), 'codex'), false);
+  assert.equal(hasCompactionMarker(JSON.stringify({ type: 'compacted', payload: {} }), 'codex'), true);
+  assert.equal(hasCompactionMarker(JSON.stringify({ type: 'event_msg', payload: {
+    type: 'item_completed', item: { type: 'ContextCompaction' },
+  } }), 'codex'), true);
 });
 
 test('handoff model selection retains the last real Claude model across synthetic errors', () => {
@@ -1665,20 +1742,44 @@ test('Claude compact boundaries replace stale assistant context until the next a
   assert.deepEqual(lastTurnUsage([assistant(300000), boundary], 'claude'), {
     contextTokens: 17000,
     model: 'claude-fable-5-1',
+    usageAt: null,
+    cacheTtlMs: null,
   });
   assert.deepEqual(lastTurnUsage([assistant(300000), { ...boundary, compactMetadata: undefined }], 'claude'), {
     contextTokens: 0,
     model: 'claude-fable-5-1',
+    usageAt: null,
+    cacheTtlMs: null,
   });
   assert.deepEqual(lastTurnUsage([assistant(340000), boundary, assistant(50000)], 'claude'), {
     contextTokens: 50000,
     model: 'claude-fable-5-1',
+    usageAt: null,
+    cacheTtlMs: null,
   });
 });
 
-test('auto-compact candidates are cold, large, safe Claude sessions ordered by context size', () => {
+test('rewritten Claude transcripts keep compacted context despite preserved historical assistant rows', () => {
+  const boundaryAt = '2026-09-01T12:00:00Z';
+  const result = lastTurnUsage([
+    { type: 'system', subtype: 'compact_boundary', timestamp: boundaryAt,
+      compactMetadata: { postTokens: 17000 } },
+    { type: 'assistant', timestamp: '2026-09-01T11:30:00Z', message: {
+      model: 'claude-fable-5-1', usage: { input_tokens: 300000 },
+    } },
+  ], 'claude');
+  assert.equal(result.contextTokens, 17000);
+  assert.equal(result.model, 'claude-fable-5-1');
+  assert.equal(result.usageAt, Date.parse(boundaryAt));
+});
+
+test('auto-compact candidates schedule warm Claude and Codex Astra before cold fallbacks', () => {
   const now = Date.parse('2026-09-01T12:00:00Z');
-  const opts = { ttlMs: 60 * 60e3, maxIdleMs: 1440 * 60e3, minTokens: 100000, models: ['fable'] };
+  const opts = {
+    ttlMs: 0, maxIdleMs: 1440 * 60e3, minTokens: 100000, models: ['fable'],
+    claudeTtlMs: 60 * 60e3, claudeTargetMs: 50 * 60e3, claudeFallbackModel: 'opus',
+    codexTtlMs: 30 * 60e3, codexTargetMs: 20 * 60e3, codexFallbackModel: 'gpt-5.6-sol',
+  };
   const session = (id, idleMin, contextTokens, extra = {}) => ({
     id,
     kind: 'claude',
@@ -1686,29 +1787,30 @@ test('auto-compact candidates are cold, large, safe Claude sessions ordered by c
     endedTurn: true,
     contextTokens,
     model: 'claude-fable-5-1',
+    usageAt: now - idleMin * 60e3,
     ...extra,
   });
-  const large = session('large', 60, 140000);
+  const large = session('large', 55, 140000);
   const larger = session('larger', 61, 220000);
   const oldStamp = { mtime: large.mtime - 1 };
   const candidates = autoCompactCandidates([
     large,
     larger,
-    session('still-warm', 59, 300000),
+    session('too-fresh', 49, 300000),
     session('too-old', 1441, 300000),
     session('small', 120, 99999),
     session('question', 120, 300000, { pendingQuestion: { question: 'Which?' } }),
     session('background', 120, 300000, { pendingBackground: true }),
     session('turning', 120, 300000, { endedTurn: false }),
     session('exited', 120, 300000, { exited: true }),
-    session('codex', 120, 300000, { kind: 'codex' }),
+    session('codex-sol', 120, 300000, { kind: 'codex', model: 'gpt-5.6-sol' }),
     session('opus', 120, 300000, { model: 'claude-opus-5' }),
     session('no-model', 120, 300000, { model: '' }),
   ], { large: oldStamp }, now, opts);
 
-  assert.deepEqual(candidates.map((candidate) => candidate.session.id), ['larger', 'large']);
-  assert.equal(candidates[1].idleMs, 60 * 60e3);
-  assert.equal(candidates[1].contextTokens, 140000);
+  assert.deepEqual(candidates.map((candidate) => candidate.session.id), ['large', 'larger']);
+  assert.equal(candidates[0].path, 'warm-current');
+  assert.equal(candidates[1].path, 'cold-fallback');
   assert.deepEqual(autoCompactCandidates([large], { large: { mtime: large.mtime } }, now, opts), []);
   assert.deepEqual(autoCompactCandidates([large], { large: oldStamp }, now, opts).map((candidate) => candidate.session.id), ['large']);
   const opus = session('opus', 120, 300000, { model: 'claude-opus-5' });
@@ -1717,6 +1819,28 @@ test('auto-compact candidates are cold, large, safe Claude sessions ordered by c
     autoCompactCandidates([opus], {}, now, { ...opts, models: ['fable', 'opus'] }).map((candidate) => candidate.session.id),
     ['opus'],
   );
+  const astra = session('codex-astra', 22, 180000, { kind: 'codex', model: 'gpt-6-astra' });
+  assert.deepEqual(autoCompactCandidates([astra], {}, now, opts).map((candidate) => ({
+    id: candidate.session.id, path: candidate.path, target: candidate.targetModel,
+  })), [{ id: 'codex-astra', path: 'warm-current', target: 'gpt-6-astra' }]);
+});
+
+test('auto-compact uses a four-minute target for five-minute Claude caches and retries warm failures only when cold', () => {
+  const now = Date.parse('2026-09-01T12:00:00Z');
+  const opts = {
+    ttlMs: 0, maxIdleMs: 24 * 60 * 60e3, minTokens: 100000, models: ['fable'],
+    claudeTtlMs: 60 * 60e3, claudeTargetMs: 50 * 60e3, claudeFallbackModel: 'opus',
+  };
+  const base = { id: 'short-cache', kind: 'claude', endedTurn: true, mtime: now - 10 * 60e3,
+    model: 'claude-fable-5-1', contextTokens: 150000, cacheTtlMs: 5 * 60e3 };
+  assert.equal(autoCompactCandidates([{ ...base, usageAt: now - 3.9 * 60e3 }], {}, now, opts).length, 0);
+  const warm = autoCompactCandidates([{ ...base, usageAt: now - 4.1 * 60e3 }], {}, now, opts)[0];
+  assert.equal(warm.path, 'warm-current');
+  assert.equal(warm.targetAgeMs, 4 * 60e3);
+  const coldSession = { ...base, usageAt: now - 6 * 60e3 };
+  const failedWarm = { mtime: base.mtime, path: 'warm-current', result: 'error', attemptStage: 'submitted' };
+  assert.equal(autoCompactCandidates([coldSession], { [base.id]: failedWarm }, now, opts)[0].path, 'cold-fallback');
+  assert.equal(autoCompactCandidates([coldSession], { [base.id]: { ...failedWarm, result: 'timeout' } }, now, opts).length, 0);
 });
 
 function assertAutoCompactHealthRecovered(outcome) {
@@ -1767,7 +1891,7 @@ test('auto-compact tick filters dead panes before reading context or spending a 
     },
     sessionLastTurn: (session) => {
       reads.push(session.id);
-      return { contextTokens: session.id === 'live' ? 140000 : 428000, model: 'claude-fable-5-1' };
+      return { contextTokens: session.id === 'live' ? 140000 : 428000, model: 'claude-fable-5-1', usageAt: Date.now() - 2 * 60 * 60e3 };
     },
     writeAutoCompactDecision: (stamp) => decisions.push(stamp),
     logAutoCompactDecision: () => {},
@@ -1781,6 +1905,38 @@ test('auto-compact tick filters dead panes before reading context or spending a 
   assert.deepEqual(idleOutcome, { ok: true, detail: 'no eligible sessions' });
   assertAutoCompactHealthRecovered(idleOutcome);
   assert.equal(decisions.length, 1);
+});
+
+test('auto-compact tick dispatches Codex Astra with a fresh warm policy and records telemetry', async (t) => {
+  const prior = process.env.KEEP_AUTO_COMPACT;
+  process.env.KEEP_AUTO_COMPACT = 'on';
+  t.after(() => prior === undefined ? delete process.env.KEEP_AUTO_COMPACT : process.env.KEEP_AUTO_COMPACT = prior);
+  const now = Date.now();
+  const session = { id: 'astra-live', kind: 'codex', endedTurn: true, mtime: now - 22 * 60e3 };
+  const decisions = [];
+  const policies = [];
+  const turn = { contextTokens: 180000, model: 'gpt-6-astra', usageAt: now - 22 * 60e3 };
+  const outcome = await autoCompactTick({
+    sweepPendingCompactSwaps: async () => ({ checked: 0 }), gcAutoCompactStamps: () => {},
+    readAutoCompactStamps: () => ({}), scanSessions: () => [session],
+    listHostPanes: async () => [{ alive: true, meta: { sessionId: session.id } }],
+    sessionLastTurn: () => turn, withInjectionLock: async (fn) => fn(),
+    loadCurrentSession: () => session, resolveSessionTarget: async () => ({ pane: 'pane-astra' }),
+    readScreen: async () => '› Ask Codex to do anything',
+    compactSession: async (_session, _target, _instruction, deps) => {
+      policies.push(deps.compactionPolicy);
+      return { compacted: true, originalModel: 'gpt-6-astra', compactionModel: 'gpt-6-astra',
+        compactionUsage: { input_tokens: 180000 }, attemptStage: 'submitted' };
+    },
+    writeAutoCompactDecision: (stamp) => decisions.push(stamp), logAutoCompactDecision: () => {},
+  });
+  assert.equal(outcome.detail, 'compacted');
+  assert.equal(policies[0].path, 'warm-current');
+  assert.equal(policies[0].originalModel, 'gpt-6-astra');
+  assert.equal(policies[0].targetModel, 'gpt-6-astra');
+  assert.equal(decisions[0].cacheAgeMs >= 20 * 60e3, true);
+  assert.deepEqual(decisions[0].compactionUsage, { input_tokens: 180000 });
+  assert.equal(decisions[0].attemptStage, 'submitted');
 });
 
 test('auto-compact resolve-time pane exit is stamped and skipped, while other resolve errors fail', async (t) => {
@@ -1800,7 +1956,7 @@ test('auto-compact resolve-time pane exit is stamped and skipped, while other re
     readAutoCompactStamps: () => stamps,
     scanSessions: () => [session],
     listHostPanes: async () => [{ alive: true, meta: { sessionId: session.id } }],
-    sessionLastTurn: () => ({ contextTokens: 140000, model: 'claude-fable-5-1' }),
+    sessionLastTurn: () => ({ contextTokens: 140000, model: 'claude-fable-5-1', usageAt: Date.now() - 2 * 60 * 60e3 }),
     withInjectionLock: async (fn) => fn(),
     loadCurrentSession: () => session,
     resolveSessionTarget: async () => { resolves++; throw failure; },
@@ -2051,6 +2207,29 @@ test('pending compact swaps return parsed records with their source files', () =
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('pending swap sweep routes old Codex records away from Claude repair and never expires them', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-restore-route-test-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'codex-session.swap.json');
+  fs.writeFileSync(file, `${JSON.stringify({
+    kind: 'codex', version: 1, sessionId: 'codex-session', at: 1,
+    original: { model: 'gpt-6-astra', effort: 'high' },
+    fallback: { model: 'gpt-5.6-sol', effort: 'medium' },
+    configBefore: { model: { present: false, value: null }, effort: { present: false, value: null } },
+    configFile: path.join(dir, 'config.toml'),
+  })}\n`);
+  let claudeReads = 0;
+  const summary = await sweepPendingCompactSwaps({
+    dir, now: () => Date.parse('2026-09-01T12:00:00Z'),
+    scanSessions: () => [{ id: 'codex-session', kind: 'codex', endedTurn: false }],
+    withInjectionLock: async (fn) => fn(),
+    readClaudeSettingsModel: () => { claudeReads++; return { ok: true, present: false, value: '' }; },
+  });
+  assert.deepEqual(summary, { checked: 1, restored: 0, dropped: 0, skipped: 1, repairedSettings: 0 });
+  assert.equal(claudeReads, 0);
+  assert.equal(fs.existsSync(file), true);
 });
 
 test('pending swap sweep restores an idle Claude session and its settings model', async () => {
@@ -2639,6 +2818,74 @@ test('compact session accepts screen completion without transcript growth and re
     else process.env.KEEP_COMPACT_TIMEOUT_MS = priorTimeout;
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('Codex compact uses the marker path and warm Claude bypasses the Opus swap', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-policy-test-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const priorTimeout = process.env.KEEP_COMPACT_TIMEOUT_MS;
+  process.env.KEEP_COMPACT_TIMEOUT_MS = '200';
+  t.after(() => priorTimeout === undefined ? delete process.env.KEEP_COMPACT_TIMEOUT_MS
+    : process.env.KEEP_COMPACT_TIMEOUT_MS = priorTimeout);
+  const codexFile = path.join(root, 'codex.jsonl');
+  fs.writeFileSync(codexFile, '{}\n');
+  const codexCalls = [];
+  const codex = await compactSession({ id: 'codex-marker', kind: 'codex' }, { pane: 'pane:codex' }, 'Keep decisions.', {
+    dir: path.join(root, 'compact'), compactPollMs: 1,
+    compactionPolicy: { path: 'warm-current', originalModel: 'gpt-6-astra', targetModel: 'gpt-6-astra' },
+    sessionLastTurn: () => ({ model: 'gpt-6-astra' }), transcriptFileForSession: () => codexFile,
+    readScreen: async () => '› Ask Codex to do anything',
+    typeAndSubmit: async (_target, command, confirmation) => {
+      codexCalls.push({ command, confirmation });
+      setTimeout(() => fs.appendFileSync(codexFile, `${JSON.stringify({ timestamp: new Date(Date.now() + 10).toISOString(),
+        type: 'event_msg', payload: { type: 'item_completed', item: { type: 'ContextCompaction' } } })}\n`), 1);
+    },
+  });
+  assert.equal(codex.compacted, true);
+  assert.equal(codexCalls[0].command, '/compact Keep decisions.');
+  assert.equal(codexCalls[0].confirmation, codexTypedTextVisible);
+
+  const claudeFile = path.join(root, 'claude.jsonl');
+  fs.writeFileSync(claudeFile, '{}\n');
+  const claudeCalls = [];
+  process.env.KEEP_COMPACT_TIMEOUT_MS = '0';
+  const claude = await compactSession({ id: 'claude-warm', kind: 'claude' }, { pane: 'pane:claude' }, null, {
+    dir: path.join(root, 'compact'),
+    compactionPolicy: { path: 'warm-current', originalModel: 'claude-fable-5-1', targetModel: 'claude-fable-5-1' },
+    sessionLastTurn: () => ({ model: 'claude-fable-5-1' }), transcriptFileForSession: () => claudeFile,
+    readScreen: async () => '❯', typeAndSubmit: async (_target, command) => claudeCalls.push(command),
+  });
+  assert.equal(claude.reason, 'timeout');
+  assert.deepEqual(claudeCalls, ['/compact']);
+  assert.equal(claude.compactionPath, 'warm-current');
+});
+
+test('cold Codex compaction invokes the fallback transaction seam and forwards restore failure', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-fallback-integration-test-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const transcript = path.join(root, 'codex.jsonl');
+  fs.writeFileSync(transcript, '{}\n');
+  const previous = process.env.KEEP_COMPACT_TIMEOUT_MS;
+  process.env.KEEP_COMPACT_TIMEOUT_MS = '0';
+  t.after(() => previous === undefined ? delete process.env.KEEP_COMPACT_TIMEOUT_MS
+    : process.env.KEEP_COMPACT_TIMEOUT_MS = previous);
+  const calls = [];
+  let seamCalls = 0;
+  const result = await compactSession({ id: 'codex-cold', kind: 'codex' }, { pane: 'pane:codex' }, null, {
+    dir: path.join(root, 'compact'), transcriptFileForSession: () => transcript,
+    sessionLastTurn: () => ({ model: 'gpt-6-astra' }), readScreen: async () => '› Ask Codex to do anything',
+    typeAndSubmit: async (_target, command) => calls.push(command),
+    compactionPolicy: { path: 'cold-fallback', originalModel: 'gpt-6-astra', targetModel: 'gpt-5.6-sol' },
+    compactCodexFallback: async (_session, _target, _instruction, deps) => {
+      seamCalls++;
+      const compacted = await deps.compactCurrentModel();
+      return { ...compacted, restoreUnconfirmed: true, reason: 'model restore unconfirmed' };
+    },
+  });
+  assert.equal(seamCalls, 1);
+  assert.deepEqual(calls, ['/compact']);
+  assert.equal(result.restoreUnconfirmed, true);
+  assert.equal(autoCompactOutcome(result), 'restore-unconfirmed');
 });
 
 test('screen-confirmed compaction records a marker flushed by the model restore', async () => {

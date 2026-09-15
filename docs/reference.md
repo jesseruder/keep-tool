@@ -862,9 +862,12 @@ flush the marker for diagnostics. The gate is configured by `KEEP_CACHE_TTL_MIN`
 240000). Run compaction directly with `keep compact <sid>` or
 `POST /api/compact { "sessionId": "<sid>" }`.
 
-Claude compactions whose transcript model matches `KEEP_AUTO_COMPACT_MODELS` (a
+Cold Claude compactions whose transcript model matches `KEEP_AUTO_COMPACT_MODELS` (a
 comma-separated family list, default `fable`) first switch the session to
 `KEEP_COMPACT_VIA_MODEL` (default `opus`; set it to `off` to disable the swap).
+Auto-compact skips that switch when it can submit before the current model's prompt
+cache expires. Direct `keep compact` calls and compact-before-deliver retain the
+existing swap behavior.
 Prompt caches are per model, so the Opus summary is uncached regardless of timing,
 while this avoids spending scarce Fable quota on summarization. Typed `/model`
 commands also persist the saved default in Claude's `settings.json`, so Keep records
@@ -881,14 +884,37 @@ may need a manual fix. Direct `keep compact <sid>` calls and compact-before-deli
 use this swap too; on startup, a `PENDING MODEL SWAP` line reports each retained swap
 file for manual inspection.
 
-Auto-compact now targets large Claude sessions only after their prompt cache is cold:
-from `KEEP_CACHE_TTL_MIN` (default 60) through
-`KEEP_AUTO_COMPACT_MAX_IDLE_MIN` (default 1440), with no lead-window setting. Set
+Auto-compact targets large eligible Claude sessions and Codex sessions running exactly
+`gpt-6-astra`. Claude eligibility still follows `KEEP_AUTO_COMPACT_MODELS` (default
+`fable`); that setting does not opt other Codex models in. It measures cache age from
+the last model-usage record rather than the transcript file timestamp. For Claude it
+uses the cache-creation metadata to infer a five-minute or one-hour lifetime (mixed
+metadata uses five minutes), falling back to `KEEP_AUTO_COMPACT_CLAUDE_TTL_MIN`, then
+`KEEP_CACHE_TTL_MIN` (default 60). For Codex the default lifetime is 30 minutes.
+
+The daemon first tries the current model while its cache should still be warm: minute
+4 for a five-minute Claude cache, minute 50 for a one-hour Claude cache, and minute 20
+for Codex. Configure these with `KEEP_AUTO_COMPACT_CLAUDE_TARGET_MIN` and
+`KEEP_AUTO_COMPACT_CODEX_TARGET_MIN`; configure the Codex lifetime with
+`KEEP_AUTO_COMPACT_CODEX_TTL_MIN`. Warm attempts are prioritized by approaching cache
+deadline. Once the deadline passes, Claude uses its existing Opus swap and Codex uses
+`KEEP_AUTO_COMPACT_CODEX_FALLBACK_MODEL` (default `gpt-5.6-sol`), with durable model and
+reasoning-effort restoration. Busy locks, visible questions, background work, active
+turns, exited sessions, and missing live panes remain ineligible.
+
+Set
 `KEEP_AUTO_COMPACT=off|dry|on` (default `off`); the context gate is
 `KEEP_AUTO_COMPACT_MIN_TOKENS` (default 100000). Decisions are stamped once per idle
 period in `.keep/compact/<sessionId>.json` and appended to
-`.keep/compact/_log.jsonl`, including the model used for the swap or `null` when none
-ran. A compacted session is not re-compacted until it grows past the token floor again.
+`.keep/compact/_log.jsonl`. Each record includes cache age and lifetime, original and
+compaction models, the warm or fallback path, attempt stage, and request-level usage
+when the transcript exposes it. Codex usage is accepted only when the compacted record's
+`latest_token_usage_record.response_id` matches its `compaction_response_id`; Claude
+streaming duplicates are deduplicated by request and message ID. Missing usage is
+recorded as `null`, while Claude's compact-boundary pre/post token counts and duration
+are retained separately. A compacted session is not re-compacted until it grows past
+the token floor again. A busy or precheck failure remains retryable; a submitted timeout
+is stamped so the daemon cannot start a duplicate compaction.
 Run `dry` for a day and review that log before enabling `on`.
 
 ## wt — worktrees

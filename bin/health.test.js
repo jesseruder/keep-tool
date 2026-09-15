@@ -211,7 +211,7 @@ test('brief text includes one daemon line when a scheduler is unhealthy', () => 
     },
   });
   assert.match(value.text, /Daemon: auto-compact failing since .+ \(host pane mismatch\)/);
-  assert.equal(health.CADENCES['auto-compact'].cadenceMs, 2 * 60e3);
+  assert.equal(health.CADENCES['auto-compact'].cadenceMs, 30e3);
 });
 
 test('wrapTick records thrown ticks and remains callable', async () => {

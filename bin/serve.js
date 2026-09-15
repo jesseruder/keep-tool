@@ -18,6 +18,7 @@ const titles = require('./titles.js');
 const usage = require('./usage.js');
 const cardUsage = require('./card-usage.js');
 const codex = require('./codex.js');
+const codexCompact = require('./codex-compact.js');
 const transcripts = require('./transcripts.js');
 const accounts = require('./accounts.js');
 const review = require('./review.js');
@@ -1006,29 +1007,98 @@ function afterCompactAction(result) {
 
 function lastTurnUsage(lines, kind) {
   const records = Array.isArray(lines) ? lines : String(lines || '').split(/\r?\n/);
-  let result = { contextTokens: 0, model: '' };
+  let result = { contextTokens: 0, model: '', usageAt: null, cacheTtlMs: null };
   let sawClaudeUsage = false;
+  let codexModel = '';
+  let codexUsageResult = null;
+  let codexTokenCountResult = null;
+  const latestBoundary = kind === 'claude' ? records.map((line) => {
+    try { return typeof line === 'string' ? JSON.parse(line) : line; } catch { return null; }
+  }).filter((record) => record?.type === 'system' && record.subtype === 'compact_boundary'
+    && Number.isFinite(Date.parse(record.timestamp))).at(-1) : null;
+  const boundaryAt = latestBoundary ? Date.parse(latestBoundary.timestamp) : null;
+  let boundaryModelAt = -Infinity;
+  if (latestBoundary) {
+    result.contextTokens = Number(latestBoundary.compactMetadata?.postTokens) || 0;
+    result.usageAt = boundaryAt;
+  }
   for (const line of records) {
     let record;
     try { record = typeof line === 'string' ? JSON.parse(line) : line; } catch { continue; }
     if (kind === 'claude' && record && !record.isSidechain && record.type === 'assistant'
         && record.message && record.message.usage) {
+      const recordAt = Date.parse(record.timestamp);
+      if (boundaryAt && (!Number.isFinite(recordAt) || recordAt <= boundaryAt)) {
+        if (Number.isFinite(recordAt) && recordAt >= boundaryModelAt) {
+          result.model = String(record.message.model || '');
+          boundaryModelAt = recordAt;
+        }
+        continue;
+      }
       const usage = record.message.usage;
       let contextTokens = Number(usage.input_tokens || 0) + Number(usage.cache_creation_input_tokens || 0)
         + Number(usage.cache_read_input_tokens || 0);
       if (!Number.isFinite(contextTokens)) contextTokens = 0;
-      result = { contextTokens, model: String(record.message.model || '') };
+      const cacheCreation = usage.cache_creation || {};
+      const hasFiveMinute = Number(cacheCreation.ephemeral_5m_input_tokens || 0) > 0;
+      const hasOneHour = Number(cacheCreation.ephemeral_1h_input_tokens || 0) > 0;
+      result = {
+        contextTokens,
+        model: String(record.message.model || ''),
+        usageAt: Date.parse(record.timestamp) || null,
+        cacheTtlMs: hasFiveMinute ? 5 * 60e3 : hasOneHour ? 60 * 60e3 : null,
+      };
       sawClaudeUsage = true;
-    } else if (kind === 'claude' && sawClaudeUsage && record && record.type === 'system'
+    } else if (kind === 'claude' && !latestBoundary && sawClaudeUsage && record && record.type === 'system'
         && record.subtype === 'compact_boundary') {
       result.contextTokens = Number(record.compactMetadata && record.compactMetadata.postTokens) || 0;
+    } else if (kind === 'codex' && record && record.type === 'session_meta') {
+      codexModel = String(record.payload?.base_instructions?.provenance?.model || codexModel);
+    } else if (kind === 'codex' && record && record.type === 'turn_context') {
+      codexModel = String(record.payload?.model || codexModel);
+    } else if (kind === 'codex' && record && record.type === 'event_msg'
+        && record.payload?.type === 'thread_settings_applied') {
+      codexModel = String(record.payload.thread_settings?.model || codexModel);
+    } else if (kind === 'codex' && record?.type === 'token_usage_record' && record.payload?.usage) {
+      const usage = record.payload.usage;
+      const contextTokens = Number(usage.input_tokens || 0);
+      if (Number.isFinite(contextTokens) && contextTokens > 0) {
+        codexUsageResult = {
+          contextTokens,
+          model: codexModel,
+          usageAt: Date.parse(record.timestamp) || null,
+          cacheTtlMs: null,
+        };
+      }
+    } else if (kind === 'codex' && record?.type === 'compacted') {
+      // The matched usage in this row is the cost of producing the summary, not
+      // the smaller context after replacement. Hold at zero until a later real
+      // request supplies the new context; bookkeeping token_count rows can lag.
+      codexUsageResult = {
+        contextTokens: 0,
+        model: codexModel,
+        usageAt: Date.parse(record.timestamp) || null,
+        cacheTtlMs: null,
+      };
     } else if (kind === 'codex' && record && record.type === 'event_msg' && record.payload
         && record.payload.type === 'token_count' && record.payload.info && record.payload.info.last_token_usage) {
       const usage = record.payload.info.last_token_usage;
-      let contextTokens = Number(usage.input_tokens || 0) + Number(usage.cached_input_tokens || 0);
+      // Codex input_tokens already includes cached_input_tokens.
+      let contextTokens = Number(usage.input_tokens || 0);
       if (!Number.isFinite(contextTokens)) contextTokens = 0;
-      result = { contextTokens, model: '' };
+      codexTokenCountResult = {
+        contextTokens,
+        model: codexModel,
+        usageAt: Date.parse(record.timestamp) || null,
+        cacheTtlMs: null,
+      };
     }
+  }
+  if (kind === 'codex') {
+    result = codexUsageResult || codexTokenCountResult || result;
+    if (codexModel && result.model && codexModel !== result.model) {
+      result = { ...result, model: codexModel, usageAt: null };
+    } else if (codexModel) result.model = codexModel;
   }
   return result;
 }
@@ -1814,13 +1884,49 @@ function compactCommand(instruction) {
 }
 
 function hasCompactionMarker(text, kind) {
-  if (kind === 'codex') return String(text || '').includes('ContextCompaction');
   for (const line of String(text || '').split(/\r?\n/)) {
     let record;
     try { record = JSON.parse(line); } catch { continue; }
+    if (kind === 'codex' && (record?.type === 'compacted'
+        || (record?.type === 'event_msg' && record.payload?.type === 'item_completed'
+          && record.payload.item?.type === 'ContextCompaction'))) return true;
     if (record && record.type === 'system' && record.subtype === 'compact_boundary') return true;
   }
   return false;
+}
+
+function compactRequestTelemetry(text, kind, submittedAt) {
+  const records = String(text || '').split(/\r?\n/).map((line) => {
+    try { return JSON.parse(line); } catch { return null; }
+  }).filter(Boolean);
+  if (kind === 'codex') {
+    const compacted = records.filter((record) => record.type === 'compacted'
+      && (!submittedAt || Date.parse(record.timestamp) >= submittedAt)).at(-1);
+    const payload = compacted && compacted.payload;
+    const latest = payload && payload.latest_token_usage_record;
+    const usage = latest && latest.response_id === payload.compaction_response_id ? latest.usage : null;
+    return { usage: usage || null, compactMetadata: null };
+  }
+  const boundary = records.filter((record) => record.type === 'system'
+    && record.subtype === 'compact_boundary'
+    && (!submittedAt || Date.parse(record.timestamp) >= submittedAt)).at(-1);
+  const seen = new Set();
+  const usages = [];
+  for (const record of records) {
+    if (record.type !== 'assistant' || !record.message?.usage) continue;
+    if (submittedAt && Date.parse(record.timestamp) < submittedAt) continue;
+    if (boundary && Date.parse(record.timestamp) > Date.parse(boundary.timestamp)) continue;
+    const identity = record.requestId ? `request:${record.requestId}`
+      : record.message.id ? `message:${record.message.id}` : '';
+    if (!identity || seen.has(identity)) continue;
+    seen.add(identity);
+    usages.push(record.message.usage);
+  }
+  if (!usages.length) return { usage: null, compactMetadata: boundary?.compactMetadata || null };
+  const fields = ['input_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens', 'output_tokens'];
+  const usage = Object.fromEntries(fields.map((field) => [field,
+    usages.reduce((sum, item) => sum + (Number(item[field]) || 0), 0)]));
+  return { usage, compactMetadata: boundary?.compactMetadata || null };
 }
 
 function envNumber(name, fallback) {
@@ -2112,7 +2218,7 @@ async function sweepPendingCompactSwaps(deps = {}) {
     };
     // Settings are process-global. Repair them even when the owning session has
     // exited, disappeared, or cannot safely receive a command this tick.
-    const settingsRecord = records.filter((record) => !record.error)
+    const settingsRecord = records.filter((record) => !record.error && !codexCompact.isCodexCompactSwap(record))
       .sort((a, b) => compactSwapRecordAt(b) - compactSwapRecordAt(a))[0];
     if (settingsRecord && !inFlightSwap) {
       const sid = String(settingsRecord.sessionId || 'unknown').slice(0, 8);
@@ -2149,6 +2255,29 @@ async function sweepPendingCompactSwaps(deps = {}) {
     for (const record of records) {
       const sid = String(record.sessionId || 'unknown').slice(0, 8);
       const session = byId.get(record.sessionId);
+      if (codexCompact.isCodexCompactSwap(record)) {
+        try {
+          const recovered = await lock(() => codexCompact.recoverCodexCompactSwap(record, {
+            ...deps,
+            session,
+            dir,
+            scanSessions: scan,
+            resolveSessionTarget: async (current) => claimInjectionTarget(await resolve(current, null, deps)),
+            readScreen: read,
+            typeAndSubmit: submit,
+            pressTargetKey,
+            codexSendPrecheck,
+            codexTypedTextVisible,
+            transcriptFileForSession,
+          }), { session: record.sessionId, model: true });
+          if (recovered.restored) summary.restored += 1;
+          else summary.skipped += 1;
+        } catch (e) {
+          summary.skipped += 1;
+          process.stderr.write(`keep serve: CODEX MODEL RESTORE UNCONFIRMED for session ${sid}: ${String(e && e.message || e)}\n`);
+        }
+        continue;
+      }
       const stale = now() - compactSwapRecordAt(record) > envNumber('KEEP_COMPACT_SWAP_MAX_AGE_MIN', 24 * 60) * 60e3;
       if (stale) {
         try { fs.unlinkSync(record.file); } catch (e) {
@@ -2273,7 +2402,24 @@ async function compactSession(session, target, instruction, deps = {}) {
   const leave = daemonRestartGate.enter();
   try {
     return await (deps.withInjectionLock || withInjectionLock)(
-      () => compactSessionTransaction(session, target, instruction, deps),
+      () => {
+        const policy = deps.compactionPolicy || null;
+        const compactCodexFallback = deps.compactCodexFallback || codexCompact.compactCodexFallback;
+        if (session?.kind === 'codex' && policy?.path === 'cold-fallback') {
+          return compactCodexFallback(session, target, instruction, {
+            ...deps,
+            dir: deps.dir || autoCompactDir(),
+            readScreen: deps.readScreen || ((t, lines, scrollback) => readScreen(t, lines, scrollback, deps)),
+            typeAndSubmit: deps.typeAndSubmit || typeAndSubmit,
+            pressTargetKey: deps.pressTargetKey || pressTargetKey,
+            codexSendPrecheck,
+            codexTypedTextVisible,
+            transcriptFileForSession: deps.transcriptFileForSession || transcriptFileForSession,
+            compactCurrentModel: () => compactSessionTransaction(session, target, instruction, deps),
+          });
+        }
+        return compactSessionTransaction(session, target, instruction, deps);
+      },
       { pane: isHostTarget(target) ? target.pane : null, model: true },
     );
   }
@@ -2285,15 +2431,19 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
   process.stderr.write(`keep serve: compacting ${session && session.kind || 'unknown'} session ${sid}\n`);
   const dir = deps.dir || autoCompactDir();
   const lastTurn = (deps.sessionLastTurn || sessionLastTurn)(session);
-  const pendingRecord = readPendingCompactSwap(session && session.id, dir);
+  const policy = deps.compactionPolicy || null;
+  const pendingRecordValue = session?.kind === 'claude' ? readPendingCompactSwap(session && session.id, dir) : null;
+  const pendingRecord = codexCompact.isCodexCompactSwap(pendingRecordValue) ? null : pendingRecordValue;
   const configuredVia = envString('KEEP_COMPACT_VIA_MODEL', 'opus');
-  const settingsSnapshot = session && session.kind === 'claude'
+  const settingsSnapshot = session && session.kind === 'claude' && policy?.path !== 'warm-current'
     ? (deps.readClaudeSettingsModel || readClaudeSettingsModel)() : { ok: true, present: false, value: '' };
   let swap = null;
   let via = null;
   let pendingSwapFile = '';
   const pendingVia = pendingRecord && String(pendingRecord.switchModel || configuredVia).trim();
-  if (pendingRecord && compactModelContainsFamily(lastTurn.model, pendingVia)) {
+  if (session?.kind !== 'claude') {
+    // Codex switching has its own durable transaction.
+  } else if (pendingRecord && compactModelContainsFamily(lastTurn.model, pendingVia)) {
     swap = {
       switchCommand: null,
       restoreCommand: pendingRecord.restoreCommand,
@@ -2304,12 +2454,14 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
     pendingSwapFile = pendingRecord.file;
     via = pendingVia;
     process.stderr.write(`keep serve: ${sid} is still on ${via} from an interrupted compaction; restoring "${swap.restoreCommand}" afterwards\n`);
+  } else if (policy?.path === 'warm-current') {
+    // Spend the still-live cache on the current Claude model.
   } else if (!settingsSnapshot.ok) {
     process.stderr.write(`keep serve: skipping model swap for ${sid}: cannot read settings.json (${settingsSnapshot.error})\n`);
   } else {
     let settingsModel = settingsSnapshot.present ? settingsSnapshot.value : '';
     let settingsPresent = settingsSnapshot.present;
-    const records = pendingCompactSwaps(dir).filter((record) => !record.error)
+    const records = pendingCompactSwaps(dir).filter((record) => !record.error && !codexCompact.isCodexCompactSwap(record))
       .sort((a, b) => compactSwapRecordAt(b) - compactSwapRecordAt(a));
     if (compactModelBase(settingsModel) === compactModelBase(configuredVia) && records.length) {
       settingsModel = records[0].settingsModelBefore;
@@ -2330,10 +2482,13 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
   let result;
   let compactDiagnostic;
   let compactWatch;
+  let transcriptFile = '';
+  let submittedAt = null;
   inFlightSwap = swap ? { ...swap, switchModel: via } : null;
   try {
     const file = (deps.transcriptFileForSession || transcriptFileForSession)(session);
     if (!file) throw new Error('session transcript is unavailable');
+    transcriptFile = file;
 
     if (swap && swap.switchCommand) {
       pendingSwapFile = writePendingCompactSwap(session, swap, dir);
@@ -2351,6 +2506,12 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
       }
     }
 
+    if (!result && policy?.path === 'warm-current'
+        && Number.isFinite(policy.cacheUsageAt) && Number.isFinite(policy.cacheTtlMs)
+        && Date.now() >= policy.cacheUsageAt + policy.cacheTtlMs) {
+      result = { compacted: false, reason: 'warm cache deadline passed before submit', via };
+    }
+
     if (!result) {
       const started = Date.now();
       const initialStat = fs.statSync(file);
@@ -2360,6 +2521,7 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
       compactDiagnostic.start(initialStat, offset);
       const confirmation = session.kind === 'codex' ? codexTypedTextVisible : claudeTypedTextVisible;
       await (deps.typeAndSubmit || typeAndSubmit)(target, compactCommand(instruction), confirmation, deps);
+      submittedAt = Date.now();
       compactDiagnostic.submitted();
 
       const timeoutMs = envNumber('KEEP_COMPACT_TIMEOUT_MS', 240000);
@@ -2467,6 +2629,20 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
     compactDiagnostic?.finish(diagnosticStage);
     inFlightSwap = null;
   }
+  const originalModel = String(policy?.originalModel || lastTurn.model || '');
+  const compactionModel = String(policy?.targetModel || (swap ? via : originalModel) || '');
+  let telemetry = { usage: null, compactMetadata: null };
+  if (submittedAt && transcriptFile) {
+    try { telemetry = compactRequestTelemetry(readTranscriptTail(transcriptFile), session.kind, submittedAt); } catch {}
+  }
+  result.originalModel = originalModel;
+  result.compactionModel = compactionModel;
+  result.compactionPath = policy?.path || (swap ? 'manual-swap' : 'manual-current');
+  result.compactionUsage = telemetry.usage;
+  result.compactMetadata = telemetry.compactMetadata;
+  result.attemptStage = submittedAt ? 'submitted' : 'pre-submit';
+  result.submissionCacheAgeMs = submittedAt && Number.isFinite(policy?.cacheUsageAt)
+    ? submittedAt - policy.cacheUsageAt : null;
   return result;
 }
 
@@ -3486,7 +3662,7 @@ function sessionContextTokens(session) {
 }
 
 function autoCompactIdleMs(session, stamps, now, opts) {
-  if (!session || session.kind !== 'claude') return null; // Automated Codex compaction is not proven yet.
+  if (!session || !['claude', 'codex'].includes(session.kind)) return null;
   // Fleet reviewers have a separate context-pressure policy that preserves patterns.
   if (session.reviewer) return null;
   if (session.exited || session.endedTurn === false) return null; // Never interrupt an assistant turn in progress.
@@ -3494,10 +3670,46 @@ function autoCompactIdleMs(session, stamps, now, opts) {
   // `waiting` is Claude Code's idle_prompt: the turn ended and Owner has not typed, which is exactly the idle state targeted here.
   if (session.notify && ['permission', 'question'].includes(session.notify.type)) return null; // Owner must answer a real prompt first.
   const idleMs = now - Number(session.mtime);
-  if (!Number.isFinite(idleMs) || idleMs < opts.ttlMs || idleMs > opts.maxIdleMs) return null; // Cold, but not abandoned.
-  const stamp = stamps instanceof Map ? stamps.get(session.id) : stamps && stamps[session.id];
-  if (stamp && stamp.mtime === session.mtime) return null; // One attempt per unchanged idle period, regardless of outcome.
+  const minIdleMs = Number.isFinite(opts.minIdleMs) ? opts.minIdleMs : opts.ttlMs;
+  if (!Number.isFinite(idleMs) || idleMs < minIdleMs || idleMs > opts.maxIdleMs) return null;
   return idleMs;
+}
+
+function autoCompactPolicy(session, now, opts) {
+  const model = String(session?.model || '').trim().toLowerCase();
+  const models = Array.isArray(opts.models) ? opts.models : [];
+  if (session?.kind === 'claude') {
+    if (!model || !models.some((family) => {
+      const needle = String(family).trim().toLowerCase();
+      return needle && model.includes(needle);
+    })) return null;
+  } else if (session?.kind === 'codex') {
+    if (model !== 'gpt-6-astra') return null;
+  } else return null;
+  const usageAt = session.usageAt;
+  if (!Number.isFinite(usageAt) || usageAt <= 0) return null;
+  const fallbackTtlMs = session.kind === 'codex'
+    ? (opts.codexTtlMs ?? 30 * 60e3) : (opts.claudeTtlMs ?? opts.ttlMs);
+  const cacheTtlMs = session.kind === 'claude' && Number.isFinite(session.cacheTtlMs)
+    ? session.cacheTtlMs : fallbackTtlMs;
+  const leadMs = cacheTtlMs <= 5 * 60e3 ? 60e3 : 10 * 60e3;
+  const configuredTarget = session.kind === 'codex'
+    ? (opts.codexTargetMs ?? cacheTtlMs - leadMs)
+    : (opts.claudeTargetMs ?? cacheTtlMs - leadMs);
+  const targetAgeMs = Math.min(configuredTarget, Math.max(0, cacheTtlMs - leadMs));
+  const cacheAgeMs = now - usageAt;
+  if (!Number.isFinite(cacheAgeMs) || cacheAgeMs < targetAgeMs) return null;
+  const warm = cacheAgeMs < cacheTtlMs;
+  return {
+    path: warm ? 'warm-current' : 'cold-fallback',
+    originalModel: model,
+    targetModel: warm ? model
+      : session.kind === 'claude' ? (opts.claudeFallbackModel || 'opus')
+        : (opts.codexFallbackModel || 'gpt-5.6-sol'),
+    cacheAgeMs,
+    cacheTtlMs,
+    targetAgeMs,
+  };
 }
 
 function autoCompactCandidates(sessions, stamps, now, opts) {
@@ -3505,17 +3717,22 @@ function autoCompactCandidates(sessions, stamps, now, opts) {
   for (const session of sessions || []) {
     const idleMs = autoCompactIdleMs(session, stamps, now, opts);
     if (idleMs === null) continue;
-    const model = String(session.model || '').toLowerCase();
-    const models = Array.isArray(opts.models) ? opts.models : [];
-    if (!model || !models.some((family) => {
-      const needle = String(family).toLowerCase();
-      return needle && model.includes(needle);
-    })) continue;
+    const policy = autoCompactPolicy(session, now, opts);
+    if (!policy) continue;
     const contextTokens = Number(session.contextTokens);
     if (!Number.isFinite(contextTokens) || contextTokens < opts.minTokens) continue; // Avoid lossy work on small contexts.
-    candidates.push({ session, idleMs, contextTokens });
+    const stamp = stamps instanceof Map ? stamps.get(session.id) : stamps && stamps[session.id];
+    if (stamp && stamp.mtime === session.mtime) {
+      const warmCanFallBack = stamp.path === 'warm-current' && policy.path === 'cold-fallback'
+        && !['would', 'compacted', 'timeout', 'in-progress'].includes(stamp.result);
+      if (!warmCanFallBack) continue;
+    }
+    candidates.push({ session, idleMs, contextTokens, ...policy });
   }
-  return candidates.sort((a, b) => b.contextTokens - a.contextTokens);
+  return candidates.sort((a, b) =>
+    Number(a.path !== 'warm-current') - Number(b.path !== 'warm-current')
+      || (a.session.usageAt + a.cacheTtlMs) - (b.session.usageAt + b.cacheTtlMs)
+      || b.contextTokens - a.contextTokens);
 }
 
 function autoCompactDir() {
@@ -3581,17 +3798,19 @@ function logAutoCompactDecision(candidate, stamp) {
   const idle = Math.round(candidate.idleMs / 60e3);
   const context = Math.round(candidate.contextTokens / 1000);
   const model = normalizedText(stamp.model);
-  const via = normalizedText(stamp.via) || 'none';
+  const compactionModel = normalizedText(stamp.compactionModel) || 'unknown';
+  const cacheAge = Math.round(Number(stamp.cacheAgeMs || 0) / 60e3);
+  const pathName = normalizedText(stamp.path) || 'unknown';
   if (stamp.result === 'skipped') {
     process.stderr.write(`keep serve: auto-compact skipped ${sid}: ${normalizedText(stamp.reason).slice(0, 300)}\n`);
     return;
   }
   if (stamp.result === 'would') {
-    process.stderr.write(`keep serve: auto-compact would compact ${sid} ${title} idle ${idle}m ctx ${context}k model ${model} via ${via}\n`);
+    process.stderr.write(`keep serve: auto-compact would compact ${sid} ${title} idle ${idle}m cache ${cacheAge}m ctx ${context}k model ${model} path ${pathName} on ${compactionModel}\n`);
     return;
   }
   const detail = stamp.reason ? `: ${normalizedText(stamp.reason).slice(0, 300)}` : '';
-  process.stderr.write(`keep serve: auto-compact ${stamp.result} ${sid} ${title} idle ${idle}m ctx ${context}k model ${model} via ${via}${detail}\n`);
+  process.stderr.write(`keep serve: auto-compact ${stamp.result} ${sid} ${title} idle ${idle}m cache ${cacheAge}m ctx ${context}k model ${model} path ${pathName} on ${compactionModel}${detail}\n`);
 }
 
 function autoCompactOutcome(compacted) {
@@ -3617,10 +3836,17 @@ async function autoCompactTick(deps = {}) {
   if (!['dry', 'on'].includes(mode)) return { ok: true, detail: 'nothing due' };
   const now = Date.now();
   const opts = {
-    ttlMs: envNumber('KEEP_CACHE_TTL_MIN', 60) * 60e3,
+    minIdleMs: 0,
+    ttlMs: 0,
     maxIdleMs: envNumber('KEEP_AUTO_COMPACT_MAX_IDLE_MIN', 1440) * 60e3,
     minTokens: envNumber('KEEP_AUTO_COMPACT_MIN_TOKENS', 100000),
     models: compactModelFamilies(),
+    claudeTtlMs: envNumber('KEEP_AUTO_COMPACT_CLAUDE_TTL_MIN', envNumber('KEEP_CACHE_TTL_MIN', 60)) * 60e3,
+    claudeTargetMs: envNumber('KEEP_AUTO_COMPACT_CLAUDE_TARGET_MIN', 50) * 60e3,
+    claudeFallbackModel: envString('KEEP_COMPACT_VIA_MODEL', 'opus'),
+    codexTtlMs: envNumber('KEEP_AUTO_COMPACT_CODEX_TTL_MIN', 30) * 60e3,
+    codexTargetMs: envNumber('KEEP_AUTO_COMPACT_CODEX_TARGET_MIN', 20) * 60e3,
+    codexFallbackModel: envString('KEEP_AUTO_COMPACT_CODEX_FALLBACK_MODEL', 'gpt-5.6-sol'),
   };
   (deps.gcAutoCompactStamps || gcAutoCompactStamps)(now);
   const stamps = (deps.readAutoCompactStamps || readAutoCompactStamps)();
@@ -3647,6 +3873,7 @@ async function autoCompactTick(deps = {}) {
   let reason = '';
   let ms;
   let via = null;
+  let compactedResult = null;
   if (mode === 'on') {
     const started = Date.now();
     let phase = 'lock';
@@ -3654,27 +3881,42 @@ async function autoCompactTick(deps = {}) {
       const compacted = await (deps.withInjectionLock || withInjectionLock)(async () => {
         phase = 'resolve';
         const session = (deps.loadCurrentSession || loadCurrentSession)(candidate.session.id);
-        if (session.mtime !== candidate.session.mtime || autoCompactIdleMs(session, stamps, Date.now(), opts) === null) {
+        const freshNow = Date.now();
+        const freshTurn = (deps.sessionLastTurn || sessionLastTurn)(session);
+        const freshCandidate = autoCompactCandidates([{ ...session, ...freshTurn }], stamps, freshNow, opts)[0];
+        if (session.mtime !== candidate.session.mtime || !freshCandidate
+            || freshCandidate.path !== candidate.path || freshCandidate.originalModel !== candidate.originalModel) {
           phase = 'eligibility';
-          throw new InjectionError(409, 'session changed or left the eligible cold idle window');
+          throw new InjectionError(409, 'session changed or left the eligible compaction window');
         }
         const target = await (deps.resolveSessionTarget || resolveSessionTarget)(session, null);
         // A busy pane is another sender, not a busy session: stay in the lock phase.
         phase = 'lock';
         claimInjectionTarget(target);
         phase = 'precheck';
-        await precheckSessionTarget(session, target);
+        await precheckSessionTarget(session, target, deps);
         phase = 'compact';
-        return compactSession(session, target);
+        return (deps.compactSession || compactSession)(session, target, null, {
+          ...deps,
+          compactionPolicy: {
+            path: freshCandidate.path,
+            originalModel: freshCandidate.originalModel,
+            targetModel: freshCandidate.targetModel,
+            cacheUsageAt: freshCandidate.session.usageAt,
+            cacheTtlMs: freshCandidate.cacheTtlMs,
+            cacheAgeMs: freshCandidate.cacheAgeMs,
+          },
+        });
       }, { session: candidate.session.id, model: true });
       via = compacted.via || null;
       reason = String(compacted.reason || '');
       result = autoCompactOutcome(compacted);
+      compactedResult = compacted;
     } catch (e) {
       reason = String(e && e.message || e);
       // Another sender held the lock: the session itself was fine, so do not spend
       // its one attempt for this idle period. The next tick retries within the window.
-      if (phase === 'lock') {
+      if (phase === 'lock' || phase === 'precheck' || phase === 'eligibility') {
         process.stderr.write(`keep serve: auto-compact skipped ${String(candidate.session.id).slice(0, 8)} this tick: ${reason}\n`);
         return { ok: true, detail: 'nothing due' };
       }
@@ -3693,10 +3935,19 @@ async function autoCompactTick(deps = {}) {
     idleMs: candidate.idleMs,
     contextTokens: candidate.contextTokens,
     model: String(candidate.session.model || ''),
+    originalModel: String(compactedResult?.originalModel || candidate.originalModel || candidate.session.model || ''),
+    compactionModel: String(compactedResult?.compactionModel || candidate.targetModel || ''),
+    path: candidate.path,
+    cacheAgeMs: compactedResult?.submissionCacheAgeMs ?? candidate.cacheAgeMs,
+    cacheTtlMs: candidate.cacheTtlMs,
+    targetAgeMs: candidate.targetAgeMs,
     via,
     mode,
     result,
   };
+  stamp.attemptStage = compactedResult?.attemptStage || (mode === 'dry' ? 'planned' : 'pre-submit');
+  stamp.compactionUsage = compactedResult?.compactionUsage || null;
+  stamp.compactMetadata = compactedResult?.compactMetadata || null;
   if (Number.isFinite(ms)) stamp.ms = ms;
   if (reason) stamp.reason = reason.slice(0, 500);
   let decisionError = null;
@@ -3731,8 +3982,8 @@ function startAutoCompact() {
     }
     finally { running = false; }
   };
-  setInterval(() => { void tick(); }, 2 * 60e3).unref();
-  setTimeout(() => { void tick(); }, 60e3).unref();
+  setInterval(() => { void tick(); }, 30e3).unref();
+  setTimeout(() => { void tick(); }, 15e3).unref();
 }
 
 function claudeMcpMenuVisible(screen) {
@@ -8207,10 +8458,13 @@ module.exports = {
   sendToSessionLocked,
   startAutoCompact,
   autoCompactIdleMs,
+  autoCompactPolicy,
   autoCompactCandidates,
   autoCompactOutcome,
   autoCompactTick,
   compactSession,
+  compactRequestTelemetry,
+  hasCompactionMarker,
   compactSwapPlan,
   ensureCompactionRestored,
   afterCompactAction,

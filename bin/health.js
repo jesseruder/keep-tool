@@ -31,7 +31,7 @@ const CADENCES = Object.freeze({
   discord: { cadenceMs: 15 * 60e3 },
   landed: { cadenceMs: 30 * 60e3 },
   'wt-gc': { cadenceMs: DAY_MS },
-  'auto-compact': { cadenceMs: 2 * 60e3 },
+  'auto-compact': { cadenceMs: 30e3 },
   'limit-resume': { cadenceMs: 60e3 },
   usage: { onDemand: true },
   'fleet-usage': { cadenceMs: 5 * 60e3 },
