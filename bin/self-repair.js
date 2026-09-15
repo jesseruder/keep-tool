@@ -813,6 +813,24 @@ function onOriginDefault(repo, sha) {
   } catch { return false; }
 }
 
+// `git patch-id --stable` over one commit in the live checkout. The same value
+// bin/reviews.js records per reviewed commit, and the reason it records it: the
+// sha that lands is not the sha that was reviewed, because `wt land` rebases
+// first, and the patch is what says they are the same change. A merge or an empty
+// commit has no patch and answers ''.
+function patchIdOf(repo, sha) {
+  const child = require('child_process');
+  const run = (args, input) => child.execFileSync('git', ['-C', repo, '--no-optional-locks', ...args], {
+    encoding: 'utf8', timeout: 10e3, maxBuffer: 64 << 20,
+    ...(input === undefined ? { stdio: ['ignore', 'pipe', 'pipe'] } : { input, stdio: ['pipe', 'pipe', 'pipe'] }),
+  });
+  try {
+    const patch = run(['diff-tree', '-p', '--no-color', sha]);
+    if (!patch.trim()) return '';
+    return (run(['patch-id', '--stable'], patch).trim().split(/\s+/)[0] || '');
+  } catch { return ''; }
+}
+
 // Is this card's fix on origin/<default> in the live checkout? Deliberately no
 // fetch: this runs inside a pre-bash hook, where a network call would hang the
 // agent's every Bash command, and the refs are already fresh — the landed sweep
@@ -829,20 +847,42 @@ function landedFor(cardId, root = keep.ROOT, options = {}) {
   catch (error) { return { landed: false, sha: '', why: `${id} could not be read: ${clip(error && error.message || error, 120)}` }; }
   const shas = landedShas(task);
   if (!shas.length) return { landed: false, sha: '', why: `${id} carries no \`keep land\` check-in citing a commit` };
-  // Corroboration the session cannot write with a check-in: a repair card carries
-  // no `--allow` grants (an agent session cannot set them), so its land can only
-  // have gone through the reviewed-patch path, which needs a clean record. A card
-  // with no such record did not land, whatever its log says.
+  // Corroboration, because the session this gates writes its own check-ins and a
+  // line of prose is not evidence. A repair card carries no `--allow` grants (an
+  // agent session cannot set them), so its land can only have gone through the
+  // reviewed-patch path, and that path leaves a clean `keep reviewed` record whose
+  // commits carry patch-ids. The commit on master has to BE one of those patches.
   const records = (options.readRecords || ((value) => require('./reviews.js').readRecords(value, root)))(id);
-  if (!(Array.isArray(records) && records.some((record) => record && record.verdict === 'clean'))) {
+  const clean = (Array.isArray(records) ? records : []).filter((record) => record && record.verdict === 'clean');
+  if (!clean.length) {
     return { landed: false, sha: shas[0], why: `${id} has no clean \`keep reviewed\` record, so nothing landed through \`keep land\`` };
+  }
+  const reviewed = new Set();
+  for (const record of clean) {
+    for (const commit of record.commits || []) {
+      if (commit && commit.patchId) reviewed.add(String(commit.patchId));
+      if (commit && commit.sha) reviewed.add(String(commit.sha));
+    }
   }
   const checkouts = options.checkouts || mainCheckouts();
   const isAncestor = options.isAncestor || onOriginDefault;
+  const patchId = options.patchIdOf || patchIdOf;
+  let onMaster = '';
   for (const sha of shas) {
     for (const checkout of checkouts) {
-      if (isAncestor(checkout, sha)) return { landed: true, sha, why: '' };
+      if (!isAncestor(checkout, sha)) continue;
+      onMaster = onMaster || sha;
+      // The rebase `wt land` does before it pushes changes the sha and not the
+      // patch, which is exactly what patch-id is for.
+      if (reviewed.has(sha) || reviewed.has(patchId(checkout, sha))) return { landed: true, sha, why: '' };
     }
+  }
+  if (onMaster) {
+    return {
+      landed: false,
+      sha: onMaster,
+      why: `${onMaster.slice(0, 7)} is on origin's default branch but is not a patch ${id}'s review record covers`,
+    };
   }
   return {
     landed: false,

@@ -1600,27 +1600,39 @@ function makeRepo() {
   git('config', 'user.email', 'keep@example.test');
   fs.writeFileSync(path.join(repo, 'a.txt'), 'one\n');
   git('add', '-A');
-  git('commit', '--quiet', '-m', 'first');
-  const landedSha = git('rev-parse', 'HEAD');
+  git('commit', '--quiet', '-m', 'base');
+  // The landed commit has a parent: a root commit has no patch, and no patch-id.
   fs.writeFileSync(path.join(repo, 'a.txt'), 'two\n');
-  git('commit', '--quiet', '-am', 'second');
+  git('commit', '--quiet', '-am', 'the fix');
+  const landedSha = git('rev-parse', 'HEAD');
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'three\n');
+  git('commit', '--quiet', '-am', 'still local');
   const localSha = git('rev-parse', 'HEAD');
   // origin/master is where the land pushed to; the second commit is still local.
   git('update-ref', 'refs/remotes/origin/master', landedSha);
-  return { repo, landedSha, localSha };
+  const patchIdOf = (sha) => {
+    const patch = require('node:child_process').spawnSync('git', ['-C', repo, 'diff-tree', '-p', '--no-color', sha], { encoding: 'utf8' }).stdout;
+    const out = require('node:child_process').spawnSync('git', ['-C', repo, 'patch-id', '--stable'], { input: patch, encoding: 'utf8' }).stdout;
+    return out.trim().split(/\s+/)[0] || '';
+  };
+  return { repo, landedSha, localSha, landedPatch: patchIdOf(landedSha), localPatch: patchIdOf(localSha) };
 }
 
-function writeReview(root, id, verdict = 'clean') {
+function writeReview(root, id, commits, verdict = 'clean') {
   const dir = path.join(root, '.keep', 'reviews');
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify([
-    { id: 'rev-abc', at: '2026-09-15T11:00:00.000Z', by: 'codex sol', verdict, commits: [] },
+    {
+      id: 'rev-abc', at: '2026-09-15T11:00:00.000Z', by: 'codex sol', verdict,
+      commits: (Array.isArray(commits) ? commits : [commits]).filter(Boolean)
+        .map((patchId) => ({ sha: 'f'.repeat(40), patchId, subject: 'the fix' })),
+    },
   ]) + '\n');
 }
 
 test('landedFor answers from the keep land check-in and the live checkout refs', () => {
   const root = makeRoot();
-  const { repo, landedSha, localSha } = makeRepo();
+  const { repo, landedSha, localSha, landedPatch, localPatch } = makeRepo();
   try {
     const checkouts = [repo];
     const landedEntry = (sha) => [
@@ -1630,21 +1642,21 @@ test('landedFor answers from the keep land check-in and the live checkout refs',
     ].join('\n');
 
     writeCard(root, 'repair-landed', landedEntry(landedSha));
-    writeReview(root, 'repair-landed');
+    writeReview(root, 'repair-landed', landedPatch);
     const yes = selfRepair.landedFor('repair-landed', root, { checkouts });
     assert.equal(yes.landed, true);
     assert.equal(yes.sha, landedSha);
 
     // Pushed nowhere: the sha is real, but it is not on origin/master.
     writeCard(root, 'repair-local', landedEntry(localSha));
-    writeReview(root, 'repair-local');
+    writeReview(root, 'repair-local', localPatch);
     const notYet = selfRepair.landedFor('repair-local', root, { checkouts });
     assert.equal(notYet.landed, false);
     assert.match(notYet.why, /is not on origin's default branch/);
 
     // A sha this checkout has never heard of is not a land either.
     writeCard(root, 'repair-unknown', landedEntry('deadbee1deadbee2deadbee3deadbee4deadbee5'));
-    writeReview(root, 'repair-unknown');
+    writeReview(root, 'repair-unknown', landedPatch);
     assert.equal(selfRepair.landedFor('repair-unknown', root, { checkouts }).landed, false);
 
     // Every other check-in on the card, however much it talks about landing. The
@@ -1667,10 +1679,16 @@ test('landedFor answers from the keep land check-in and the live checkout refs',
     const unreviewed = selfRepair.landedFor('repair-unreviewed', root, { checkouts });
     assert.equal(unreviewed.landed, false);
     assert.match(unreviewed.why, /no clean `keep reviewed` record/);
-    writeReview(root, 'repair-unreviewed', 'findings');
+    writeReview(root, 'repair-unreviewed', landedPatch, 'findings');
     assert.equal(selfRepair.landedFor('repair-unreviewed', root, { checkouts }).landed, false,
       'a findings record is not authority for a land either');
-    writeReview(root, 'repair-unreviewed', 'clean');
+    // A clean record over some other patch is not this land: the record exists
+    // before the land, so a check-in naming an unrelated old commit must not pass.
+    writeReview(root, 'repair-unreviewed', localPatch, 'clean');
+    const mismatched = selfRepair.landedFor('repair-unreviewed', root, { checkouts });
+    assert.equal(mismatched.landed, false);
+    assert.match(mismatched.why, /not a patch .* review record covers/);
+    writeReview(root, 'repair-unreviewed', landedPatch, 'clean');
     assert.equal(selfRepair.landedFor('repair-unreviewed', root, { checkouts }).landed, true);
 
     // The land is found wherever it sits in the log, not only at the top.
@@ -1680,7 +1698,7 @@ test('landedFor answers from the keep land check-in and the live checkout refs',
       '',
       landedEntry(landedSha),
     ].join('\n'));
-    writeReview(root, 'repair-older');
+    writeReview(root, 'repair-older', landedPatch);
     assert.equal(selfRepair.landedFor('repair-older', root, { checkouts }).landed, true);
 
     // No card, a card that is not there, and a card id nobody can parse.
