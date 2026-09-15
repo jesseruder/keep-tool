@@ -27,6 +27,7 @@ const who = require('./who.js');
 const steps = require('./steps.js');
 const alerts = require('./alerts.js');
 const notifications = require('./notifications.js');
+const reminders = require('./reminders.js');
 const slack = require('./slack.js');
 const discord = require('./discord.js');
 const standup = require('./standup.js');
@@ -1304,7 +1305,7 @@ const URGENT_DASHBOARD_MUTATIONS = new Set([
   '/api/abandon-account-handoff', '/api/ack', '/api/add', '/api/answer', '/api/checkin',
   '/api/close-idle', '/api/close-session', '/api/compact', '/api/decisions/judge',
   '/api/handoff-session', '/api/notifications', '/api/open', '/api/panes/spawn',
-  '/api/portable-transfers', '/api/reopen-session', '/api/resolve-portable-transfer',
+  '/api/portable-transfers', '/api/reminders', '/api/reopen-session', '/api/resolve-portable-transfer',
   '/api/restart-daemon', '/api/restart-session', '/api/review-queue', '/api/reviewtick',
   '/api/run', '/api/send', '/api/setaside', '/api/transfer-session',
 ]);
@@ -6171,6 +6172,7 @@ function buildState(options = {}) {
     unblocked,
     digest,
     notifications: notifications.snapshot(keep.ROOT),
+    reminders: reminders.snapshot(),
     alerts: alerts.readAlerts({ root: keep.ROOT, all: true, limit: 10 }),
     brief: alertMeta.lastBriefText ? { at: alertMeta.lastBriefAt || null, text: alertMeta.lastBriefText } : null,
     standup: standup.dashboardState(),
@@ -8344,6 +8346,13 @@ function start(deps = {}) {
           if (url.pathname === '/api/notifications') {
             let result;
             try { result = notifications.update(keep.ROOT, body); }
+            catch (error) { return json(res, 400, { error: error.message }); }
+            broadcast();
+            return json(res, 200, result);
+          }
+          if (url.pathname === '/api/reminders') {
+            let result;
+            try { result = reminders.update(body); }
             catch (error) { return json(res, 400, { error: error.message }); }
             broadcast();
             return json(res, 200, result);

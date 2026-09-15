@@ -30,6 +30,29 @@ export function installNotifications({
       await reload();
     } catch (error) { toast(`Could not update notifications: ${error.message}`); }
   };
+  const reminderSection = panel.querySelector('.notification-reminders');
+  let reminderSignature = '';
+  function renderReminders() {
+    const rows = Array.isArray(data.reminders) ? data.reminders : [];
+    reminderSection.hidden = !rows.length;
+    const next = JSON.stringify(rows);
+    if (next === reminderSignature) return;
+    reminderSignature = next;
+    reminderSection.querySelector('.reminder-list').innerHTML = rows.map((reminder) =>
+      `<label class="reminder-toggle" title="${esc(reminder.message)}"><input type="checkbox" role="switch" data-reminder="${esc(reminder.title)}" ${reminder.enabled ? 'checked' : ''}><b>${esc(reminder.title)}</b><span>${esc(reminder.schedule)}</span></label>`).join('');
+  }
+  reminderSection.addEventListener('change', async (event) => {
+    const input = event.target.closest('[data-reminder]');
+    if (!input) return;
+    input.disabled = true;
+    try {
+      await write('/api/reminders', { title: input.dataset.reminder, enabled: input.checked });
+      await reload();
+    } catch (error) {
+      input.checked = !input.checked;
+      toast(`Could not update reminder: ${error.message}`);
+    } finally { input.disabled = false; }
+  });
   function render() {
     button.querySelector('.notification-count').textContent = unread() || '';
     button.setAttribute('aria-label', `Notifications${unread() ? `, ${unread()} unread` : ''}`);
@@ -49,6 +72,7 @@ export function installNotifications({
     permissionButton.hidden = permission === 'granted' || permission === 'unsupported';
     permissionButton.textContent = permission === 'denied' ? 'Notifications disabled in system settings' : 'Enable desktop notifications';
     permissionButton.disabled = permission === 'denied';
+    renderReminders();
     const visible = entries().filter((entry) => filter !== 'unread' || !entry.read || entry.id === selected);
     const selectedEntry = visible.find((entry) => entry.id === selected);
     const selectedTask = selectedEntry?.card ? (data.tasks || []).find((task) => task.id === selectedEntry.card) : null;

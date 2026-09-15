@@ -9,6 +9,7 @@ const http = require('node:http');
 const { spawn } = require('node:child_process');
 const WebSocket = require('ws');
 const notifications = require('./notifications');
+const reminders = require('./reminders');
 const { appendAlert } = require('./alerts');
 const { dashboardDetail, lightweightState } = require('./dashboard-state');
 
@@ -30,6 +31,8 @@ test('isolated browser: alert inbox, read persistence, card links and desktop cl
   appendAlert(alert, inboxRoot);
   appendAlert({ ...alert, id: 'a-two', at: Date.now() - 1000, text: 'Deferred result', deferred: true }, inboxRoot);
   appendAlert({ ...alert, id: 'a-idea', at: Date.now() - 3600000, text: 'Reviewer idea: Preserve <card> notes — a truncated proposal that must not repeat', caller: 'reviewer-idea', card: 'idea-one' }, inboxRoot);
+  const reminderEnv = { KEEP_REMINDERS_CONFIG: path.join(profile, 'reminders.config.json'), KEEP_REMINDERS_STATE: path.join(profile, 'reminders-state.json') };
+  fs.writeFileSync(reminderEnv.KEEP_REMINDERS_CONFIG, JSON.stringify({ reminders: [{ title: 'Stretch', message: 'Neck stretch', type: 'interval', everyMinutes: 30 }] }));
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://fixture');
     if (req.method === 'POST') posts.push(url.pathname);
@@ -39,7 +42,14 @@ test('isolated browser: alert inbox, read persistence, card links and desktop cl
       req.on('end', () => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(notifications.update(inboxRoot, JSON.parse(body)))); });
       return;
     }
+    if (url.pathname === '/api/reminders') {
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(reminders.update(JSON.parse(body), reminderEnv))); });
+      return;
+    }
     state.notifications = notifications.snapshot(inboxRoot);
+    state.reminders = reminders.snapshot(reminderEnv);
     if (url.pathname === '/api/events') { res.writeHead(200, { 'content-type': 'text/event-stream' }); res.write(': ready\n\n'); eventClients.add(res); req.on('close', () => eventClients.delete(res)); return; }
     if (url.pathname === '/api/dashboard-detail') {
       detailGets.push(`${url.searchParams.get('kind')}:${url.searchParams.get('id')}`);
@@ -111,6 +121,11 @@ test('isolated browser: alert inbox, read persistence, card links and desktop cl
     await call('Input.dispatchMouseEvent', { type: 'mousePressed', x: 1200, y: 800, button: 'left', clickCount: 1 });
     await call('Input.dispatchMouseEvent', { type: 'mouseReleased', x: 1200, y: 800, button: 'left', clickCount: 1 });
     assert.ok(await evaluate("document.querySelector('#notificationsPanel').open"), 'empty space inside keeps the panel open');
+    await wait("document.querySelector('[data-reminder=Stretch]')?.checked === true");
+    await evaluate("document.querySelector('[data-reminder=Stretch]').click()");
+    await wait("document.querySelector('[data-reminder=Stretch]').checked === false && !document.querySelector('[data-reminder=Stretch]').disabled");
+    assert.deepEqual(JSON.parse(fs.readFileSync(reminderEnv.KEEP_REMINDERS_STATE, 'utf8')), { disabled: ['Stretch'] }, 'the switch writes the daemon state file');
+    assert.ok(await evaluate("document.querySelector('#notificationsPanel').open"), 'flipping a reminder keeps the panel open');
     assert.equal(await evaluate("document.querySelector('.notification-text').textContent"), '<img src=x onerror=alert(1)> Reviewer finding');
     assert.equal(await evaluate("document.querySelectorAll('.notification-list img').length"), 0, 'alert text is escaped');
     assert.equal(await evaluate("document.querySelector('[data-id=a-idea] .notification-text').textContent"), 'Reviewer idea: Preserve <card> notes — a truncated proposal that must not repeat', 'collapsed reviewer ideas preserve their proposal preview');
