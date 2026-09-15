@@ -50,8 +50,10 @@ const TURN_INDEX_BUDGET_MS = 150; // how long one turn-index tick may hold the e
 const TURN_INDEX_BUDGET_BYTES = 8 * 1024 * 1024;
 const TURN_INDEX_PRUNE_LIMIT = 200; // sessions dropped per daily sweep; it resumes next tick
 // The live ledger keeps a week of sightings; only sessions seen alive recently can
-// still be writing turns. The live tick refreshes sightings every two minutes.
-const TURN_INDEX_LIVE_WINDOW_MS = 30 * 60e3;
+// still be writing turns. The live tick refreshes sightings every two minutes. Two
+// hours also leaves a session that stopped with a backlog ~240 ticks (1 MiB per file
+// each) to finish being indexed.
+const TURN_INDEX_LIVE_WINDOW_MS = 2 * 3600e3;
 const TURN_INDEX_ROLLOUT_MISS_MS = 10 * 60e3; // how long a failed codex rollout lookup is trusted
 const WATCHER_TURNS_PER_TICK = 5;
 const WATCHER_CONCURRENCY = 2;
@@ -5241,16 +5243,12 @@ function liveTurnIndexSessions(deps = {}) {
   const ledger = readLiveSessionLedger(deps);
   const now = (deps.now || Date.now)();
   const wanted = new Map();
-  const stale = new Map();
   for (const [id, entry] of Object.entries(ledger.sessions || {})) {
     if (!entry || !/^[A-Za-z0-9_-]+$/.test(id)) continue;
     const agent = entry.agent === 'codex' ? 'codex' : 'claude';
     // Week-old sightings would each cost a rollout walk here: hundreds of headless
     // codex runs blocked the event loop for tens of seconds per tick.
-    if (!Number.isFinite(entry.lastSeenAlive) || now - entry.lastSeenAlive > TURN_INDEX_LIVE_WINDOW_MS) {
-      stale.set(id, { id, agent });
-      continue;
-    }
+    if (!Number.isFinite(entry.lastSeenAlive) || now - entry.lastSeenAlive > TURN_INDEX_LIVE_WINDOW_MS) continue;
     wanted.set(id, { id, agent });
   }
   // A reviewer may be idle enough to have left the live ledger, and its turns are
@@ -5260,9 +5258,8 @@ function liveTurnIndexSessions(deps = {}) {
       if (/^[A-Za-z0-9_-]+$/.test(id) && !wanted.has(id)) wanted.set(id, { id, agent: 'claude' });
     }
   } catch {}
-  // Stale ids keep their cached path so a backlog can still be finished without a walk.
-  for (const id of turnIndexRolloutLookups.keys()) if (!wanted.has(id) && !stale.has(id)) turnIndexRolloutLookups.delete(id);
-  if (!wanted.size && !stale.size) return [];
+  for (const id of turnIndexRolloutLookups.keys()) if (!wanted.has(id)) turnIndexRolloutLookups.delete(id);
+  if (!wanted.size) return [];
   const claudeFiles = new Map();
   try { for (const row of (deps.scanClaudeTranscripts || (() => claudeTranscriptIndex.scan()))()) claudeFiles.set(row.id, row.file); } catch {}
   const rolloutFileFor = deps.rolloutFileFor || codex.rolloutFileFor;
@@ -5282,32 +5279,6 @@ function liveTurnIndexSessions(deps = {}) {
       }
     } else file = claudeFiles.get(entry.id) || null;
     if (file) sessions.push({ ...entry, file });
-  }
-  // A session no longer seen alive may have stopped with turns still unread (or the
-  // daemon was down). Keep it while its transcript is unfinished, using only paths
-  // that are already known: this never walks the codex date directories.
-  // The index's own ingest rows know each transcript path, so a backlog survives a
-  // daemon restart; a cached path only matters for a session never ingested at all.
-  const staleEntries = [];
-  for (const entry of stale.values()) {
-    if (wanted.has(entry.id)) continue;
-    let file = null;
-    if (entry.agent === 'codex') {
-      try { file = rolloutFileFor(entry.id); } catch {}
-      file ||= turnIndexRolloutLookups.get(entry.id)?.file || null;
-    } else file = claudeFiles.get(entry.id) || null;
-    staleEntries.push({ ...entry, sessionId: entry.id, file });
-  }
-  if (staleEntries.length) {
-    let unfinished = new Map();
-    try {
-      unfinished = (deps.unfinishedSessionFiles
-        || ((entries) => require('./turn-index.js').unfinishedSessionFiles(entries, { busyTimeoutMs: 250 })))(staleEntries);
-    } catch {}
-    for (const entry of staleEntries) {
-      const file = unfinished.get(entry.id);
-      if (file) sessions.push({ id: entry.id, agent: entry.agent, file });
-    }
   }
   return sessions;
 }
@@ -7143,6 +7114,7 @@ function start(deps = {}) {
     companion: options.companion || null,
   });
   const publishedPanes = { panes: null, at: 0, epoch: 0 };
+  let lastPaneEpoch = 0;
   dashboardPublisher = createDashboardPublisher({
     prepare: async () => {
       // Fence before every source read. A mutation that completes while panes,
@@ -7150,7 +7122,11 @@ function start(deps = {}) {
       // this running pass and forces a follow-up carrying the newer fence.
       const capturedMutationFence = mutationFence();
       const paneEpoch = publishedPanes.epoch;
-      const panes = hostPanesForPublish(await listHostPanes(deps), publishedPanes, Date.now(), paneEpoch);
+      // After a mutation, skip listHostPanes' one-second cache: a lookup that began
+      // before the mutation may have filled it with the panes the mutation changed.
+      const freshPanes = paneEpoch !== lastPaneEpoch;
+      lastPaneEpoch = paneEpoch;
+      const panes = hostPanesForPublish(await listHostPanes(deps, freshPanes), publishedPanes, Date.now(), paneEpoch);
       await reviewQueue.reconcile({ inspectLaunch: (active) => inspectReviewQueueLaunch(active) });
       const companion = await companionSnapshot(deps);
       return { hostPanes: panes, companion, mutationFence: capturedMutationFence };

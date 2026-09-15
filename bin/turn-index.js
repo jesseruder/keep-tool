@@ -1311,70 +1311,6 @@ function ingestSessionsFromLiveState(sessions, options = {}) {
   };
 }
 
-const UNREAD_LINE_PROBE_BYTES = 64 * 1024;
-
-// Whether the bytes past `offset` hold at least one complete line. An unterminated
-// tail (a writer that died mid-line) cannot be ingested until more bytes arrive.
-function hasUnreadLine(file, offset, size) {
-  if (size - offset > UNREAD_LINE_PROBE_BYTES) return true;
-  const buffer = Buffer.alloc(size - offset);
-  let fd;
-  try {
-    fd = fs.openSync(file, 'r');
-    fs.readSync(fd, buffer, 0, buffer.length, offset);
-  } catch { return false; } finally {
-    if (fd !== undefined) try { fs.closeSync(fd); } catch {}
-  }
-  return buffer.includes(10);
-}
-
-function transcriptUnfinished(file, row) {
-  let stat;
-  try { stat = fs.statSync(file); } catch { return false; }
-  if (!stat.isFile()) return false;
-  if (!row) return stat.size > 0;
-  const offset = Number(row.offset || 0);
-  // Truncated, or changed since the last pass (including a same-size rewrite that moved
-  // mtime): ingestion's own reset and fingerprint checks decide what to reread.
-  if (stat.size < offset) return true;
-  if (stat.size !== Number(row.size) || Math.floor(stat.mtimeMs) !== Number(row.mtime)) return true;
-  return stat.size > offset && hasUnreadLine(file, offset, stat.size);
-}
-
-// Sessions whose transcripts the index has not finished. The daemon's live sweep drops
-// a session once it is no longer seen alive; one that stopped with unread turns (or
-// while the daemon was down) still needs ticks. Paths come from the index's own ingest
-// rows, so this survives a restart; entry.file covers a session never ingested at all.
-// One stat and one lookup per file, no directory walks; a busy database reports nothing.
-function unfinishedSessionFiles(entries, options = {}) {
-  const unfinished = new Map();
-  const list = (entries || []).filter((entry) => entry && typeof entry.sessionId === 'string' && entry.sessionId);
-  if (!list.length) return unfinished;
-  let handle;
-  try { handle = open(options.db || databaseFile(), { busyTimeoutMs: options.busyTimeoutMs ?? 250 }); }
-  catch { return unfinished; }
-  let byFile;
-  let bySession;
-  try {
-    byFile = handle.prepare('SELECT file, "offset" AS offset, size, mtime FROM ingest_state WHERE file = ?');
-    bySession = handle.prepare('SELECT file, "offset" AS offset, size, mtime FROM ingest_state WHERE session_id = ?');
-  } catch { return unfinished; }
-  for (const entry of list) {
-    let rows;
-    try {
-      rows = bySession.all(entry.sessionId);
-      if (entry.file && !rows.some((row) => row.file === entry.file)) rows.push(byFile.get(entry.file) || { file: entry.file, missing: true });
-    } catch { return unfinished; }
-    for (const row of rows) {
-      if (transcriptUnfinished(row.file, row.missing ? null : row)) {
-        unfinished.set(entry.sessionId, row.file);
-        break;
-      }
-    }
-  }
-  return unfinished;
-}
-
 function claudeBackfillDirs() {
   const dirs = [];
   let roots = [];
@@ -1628,7 +1564,7 @@ function stats(options = {}) {
 }
 
 module.exports = {
-  open, close, databaseFile, ingestFile, ingestSessionsFromLiveState, unfinishedSessionFiles, backfill, prune, pruneCandidates,
+  open, close, databaseFile, ingestFile, ingestSessionsFromLiveState, backfill, prune, pruneCandidates,
   search, turnsForSession, sessionRow, stats, isNudge, normalizeProject,
   SCHEMA_VERSION, TEXT_CAP, TOOL_CAP, COMMAND_CAP, NUDGE_RE, DEFAULT_PRUNE_DAYS,
   toolInputCommand,

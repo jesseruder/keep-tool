@@ -1141,17 +1141,6 @@ test('turn index reads only recently alive sessions and caches codex rollout wal
     ledger.sessions.fresh.lastSeenAlive = now;
     ids();
     assert.deepEqual(walks, ['found', 'missing', 'missing'], 'a miss is retried after its window');
-    const withBacklog = liveTurnIndexSessions({
-      ...deps,
-      unfinishedSessionFiles: (entries) => new Map(entries
-        .filter((entry) => entry.file === '/claude/stale.jsonl' || entry.id === 'oldCodex')
-        .map((entry) => [entry.id, entry.id === 'oldCodex' ? '/codex/old-from-index.jsonl' : entry.file])),
-    });
-    assert.ok(withBacklog.some((session) => session.id === 'oldCodex' && session.file === '/codex/old-from-index.jsonl'),
-      'a stale codex backlog is found through the index even with no cached path');
-    assert.ok(withBacklog.some((session) => session.id === 'stale'), 'a stale session with unread turns stays in the sweep');
-    assert.ok(!withBacklog.some((session) => session.id === 'unstamped'), 'a finished stale session does not');
-    assert.deepEqual(walks, ['found', 'missing', 'missing'], 'stale sessions never trigger a rollout walk');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

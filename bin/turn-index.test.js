@@ -266,33 +266,6 @@ test('ingest is incremental, idempotent, and resets after truncation', (t) => {
   assert.equal(turnIndex.search('flaky').length, 1);
 });
 
-test('unfinishedSessionFiles reports sessions whose transcripts still have unread lines', (t) => {
-  const dir = tempDir(t);
-  const file = path.join(dir, `${SESSION}.jsonl`);
-  const records = claudeRecords();
-  fs.writeFileSync(file, jsonl(records.slice(0, 6)));
-  const ids = (entries) => [...turnIndex.unfinishedSessionFiles(entries).keys()];
-  assert.deepEqual(ids([{ sessionId: SESSION, file }]), [SESSION], 'a never-indexed transcript with a known path is unfinished');
-  assert.deepEqual(ids([{ sessionId: SESSION }]), [], 'with no path and no ingest row there is nothing to check');
-  assert.deepEqual(ids([{ sessionId: SESSION, file: path.join(dir, 'missing.jsonl') }]), []);
-
-  turnIndex.ingestFile(file, { agent: 'claude' });
-  assert.deepEqual(ids([{ sessionId: SESSION }]), [], 'a fully read transcript is finished, found by session id alone');
-
-  fs.appendFileSync(file, '{"type":"user","sessionId":"');
-  turnIndex.ingestFile(file, { agent: 'claude' });
-  assert.deepEqual(ids([{ sessionId: SESSION }]), [], 'an unterminated tail waits for more bytes instead of rereading forever');
-
-  fs.appendFileSync(file, '"}\n' + jsonl(records.slice(6)));
-  assert.deepEqual(ids([{ sessionId: SESSION }]), [SESSION], 'new bytes make it unfinished again');
-  turnIndex.ingestFile(file, { agent: 'claude' });
-  assert.deepEqual(ids([{ sessionId: SESSION }]), []);
-
-  fs.writeFileSync(file, jsonl(records.slice(0, 2)));
-  assert.deepEqual(ids([{ sessionId: SESSION }]), [SESSION], 'a truncated transcript is unfinished so ingestion can reset it');
-  assert.deepEqual(ids([]), []);
-});
-
 test('search finds indexed text and stats count nudges', (t) => {
   const dir = tempDir(t);
   const claudeFile = path.join(dir, `${SESSION}.jsonl`);
