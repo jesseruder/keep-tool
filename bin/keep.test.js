@@ -415,7 +415,7 @@ test('session-start prints the wt nudge from a default repository main checkout'
     const result = spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'hook', 'session-start'], {
       input: JSON.stringify({ session_id: 'wt-nudge-session', cwd: f.main }),
       encoding: 'utf8',
-      env: { ...process.env, KEEP_DIR: keepRoot, WT_CONFIG: configFile },
+      env: { ...process.env, KEEP_DIR: keepRoot, WT_CONFIG: configFile, CLAUDE_CODE_ENTRYPOINT: 'cli', KEEP_RUN: '' },
     });
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /^\[wt — worktrees\]/);

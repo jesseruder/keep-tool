@@ -27,6 +27,11 @@ test('classifier argv follows capabilities from fixture help text', (t) => {
     '--permission-mode <mode> (choices: "default", "plan")',
   ].join('\n'));
   const modernArgs = classifierArgs('prompt', 'haiku', 'session', modern);
+  for (const flag of ['--safe-mode', '--strict-mcp-config', '--disable-slash-commands', '--no-session-persistence']) {
+    assert.ok(modernArgs.includes(flag), flag);
+  }
+  assert.match(modernArgs[modernArgs.indexOf('--system-prompt') + 1], /classification service, not a coding agent/);
+  assert.equal(modernArgs[modernArgs.indexOf('--mcp-config') + 1], '{"mcpServers":{}}');
   assert.deepEqual(modernArgs.slice(-8, -6), ['--permission-mode', 'default']);
   assert.deepEqual(modernArgs.slice(-6, -4), ['--tools', '']);
   assert.equal(modernArgs.at(-4), '--disallowed-tools');

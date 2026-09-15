@@ -4824,12 +4824,6 @@ commands.hook = async (argv) => {
   const lines = [];
   const delegationText = delegation.describe(delegationStatus);
   if (delegationText) lines.push(delegationText);
-  const overdue = loadAll(false).filter(isOverdue);
-  if (overdue.length) {
-    lines.push(`Overdue checks (${overdue.length}):`);
-    for (const t of overdue.slice(0, CAP)) lines.push(`- ${t.id}: "${clip(t.fm.title)}" — check was due ${t.fm.check_after.replace('T', ' ')}${t.fm.check ? '; daemon handles due delivery; inspect before duplicating it (keep show ' + t.id + ')' : ''}`);
-    if (overdue.length > CAP) lines.push(`…and ${overdue.length - CAP} more (keep overdue)`);
-  }
   // Sweep before the snapshot below, so a need this session's env just cleared
   // is reported cleared and its card listed with the restored status.
   let cleared = [];
@@ -4838,6 +4832,18 @@ commands.hook = async (argv) => {
     cleared = sweepNeeds(process.env, sessionId,
       `${input.agent === 'codex' ? 'codex' : 'claude'} session ${sessionId.slice(0, 8)}`);
   } catch {}
+  // The context below is guidance for a session someone drives. Headless runs
+  // (claude -p, the Agent SDK, Keep's own runs) pay for it on every call and
+  // never act on it; a delegated headless worker still needs its assignment.
+  if (isHeadlessSessionEnv(process.env) && !delegationText) return;
+  const allOverdue = loadAll(false).filter(isOverdue);
+  const overdue = allOverdue.filter((t) => projectMatchesCwd(t.fm.project, cwd));
+  if (overdue.length) {
+    lines.push(`Overdue checks (${overdue.length}):`);
+    for (const t of overdue.slice(0, CAP)) lines.push(`- ${t.id}: "${clip(t.fm.title)}" — check was due ${t.fm.check_after.replace('T', ' ')}${t.fm.check ? '; daemon handles due delivery; inspect before duplicating it (keep show ' + t.id + ')' : ''}`);
+    if (overdue.length > CAP) lines.push(`…and ${overdue.length - CAP} more (keep overdue)`);
+  }
+  if (allOverdue.length > overdue.length) lines.push(`${allOverdue.length - overdue.length} overdue check(s) in other projects (keep overdue)`);
   const here = openTasksForProject(cwd);
   if (here.length) {
     lines.push(`Keep tasks in this project:`);
@@ -5032,6 +5038,12 @@ function projectMatchesCwd(project, cwd) {
   let resolvedCwd = path.resolve(String(canonicalCwd(cwd)).replace(/^~/, os.homedir()));
   try { resolvedCwd = fs.realpathSync(resolvedCwd); } catch {}
   return resolvedCwd === resolvedProject || resolvedCwd.startsWith(`${resolvedProject}${path.sep}`);
+}
+
+// Claude Code exports its entrypoint to hooks: `cli` interactively, `sdk-cli`
+// under -p, `sdk-ts`/`sdk-py` from the Agent SDK. KEEP_RUN marks Keep's own runs.
+function isHeadlessSessionEnv(env) {
+  return Boolean(env.KEEP_RUN) || /^sdk/.test(String(env.CLAUDE_CODE_ENTRYPOINT || ''));
 }
 
 function openTasksForProject(cwd) {
