@@ -4252,6 +4252,32 @@ commands.health = (argv) => {
   else console.log(health.render(value));
 };
 
+// Whether the session a self-repair entry recorded is still running: true, false,
+// or null for "the host could not be asked". Matched by session id as well as pane
+// id, because an in-place restart moves a live session to a new pane. Never dies:
+// no host is an answer here, not an error.
+async function repairSessionAlive(entry, deps = {}) {
+  if (!entry || (!entry.pane && !entry.sessionId)) return false;
+  let client;
+  try { client = await (deps.connectHost || require('./hostclient.js').connect)({ sock: deps.sock }); }
+  catch { return null; }
+  try {
+    const { panes } = await client.request('list');
+    // An empty list is a host that told us nothing useful, not a host with no panes.
+    if (!Array.isArray(panes) || !panes.length) return null;
+    const match = panes.find((pane) => pane && (pane.id === entry.pane
+      || (entry.sessionId && pane.meta && pane.meta.sessionId === entry.sessionId)));
+    return Boolean(match && match.alive);
+  } catch { return null; }
+  finally { try { client.close(); } catch {} }
+}
+
+function describeResetWait(entry) {
+  const selfRepair = require('./self-repair.js');
+  const left = selfRepair.LEGACY_RUN_TTL_MS - (Date.now() - (Number(entry && entry.lastAttemptAt) || 0));
+  return left > 0 ? `${Math.ceil(left / 60000)}m` : 'a moment';
+}
+
 commands['self-repair'] = async (argv) => {
   const o = parseArgs(argv, { json: 'bool', dry: 'bool', reset: 'str', disable: 'bool', enable: 'bool' });
   if (o._.length) die('usage: keep self-repair [--dry] [--json] [--reset <signature>] [--disable|--enable]');
@@ -4263,9 +4289,22 @@ commands['self-repair'] = async (argv) => {
     return console.log(`self-repair ${config.enabled ? 'enabled' : 'disabled'} in ${selfRepair.configFile(ROOT)}`);
   }
   if (o.reset) {
-    const result = selfRepair.reset(o.reset, { root: ROOT });
-    if (o.json) return process.stdout.write(JSON.stringify({ signature: o.reset, ...result }, null, 2) + '\n');
+    // Ask the host whether the recorded session is still running before clearing
+    // anything: a reset over a live repair agent takes its KEEP_REPAIR marker away
+    // and lets the next tick open a second card on the same fault.
+    const entry = selfRepair.loadState(ROOT).signatures[o.reset];
+    const sessionAlive = await repairSessionAlive(entry);
+    const result = selfRepair.reset(o.reset, { root: ROOT, sessionAlive });
+    if (o.json) return process.stdout.write(JSON.stringify({ signature: o.reset, sessionAlive, ...result }, null, 2) + '\n');
     if (!result.found) return console.log(`no such signature: ${o.reset}`);
+    if (result.reason === 'session-alive') {
+      return console.log(`${o.reset} still has a repair session running (${entry.sessionId ? `session ${String(entry.sessionId).slice(0, 8)}, ` : ''}pane ${entry.pane || '?'})`
+        + `\nwait for it, or close the pane (keep pane kill ${entry.pane || '<pane>'}), then reset`);
+    }
+    if (result.reason === 'unverified') {
+      return console.log(`${o.reset} has a repair session that could not be confirmed either way (pane ${entry.pane || '?'})`
+        + `\nthe terminal host could not be reached; check the pane, then reset — or wait ${describeResetWait(entry)}`);
+    }
     if (!result.cleared) {
       return console.log(`${o.reset} has a live repair card (${result.cardId}${result.status ? `, ${result.status}` : ''}) with a confirmed session`
         + `\none repair card per signature — let it finish, or close the card if it is not going to`);

@@ -7742,20 +7742,31 @@ function start(deps = {}) {
     // another. `meta.repair` and not just `meta.card`: a lost-response pane was
     // spawned by this scheduler so it carries the flag, while Owner's own session
     // on the card does not and must never be adopted as the repair agent.
-    findCardPane: async (cardId) => {
+    findCardPane: async (cardId, sessionId) => {
       const panes = await listHostPanes({}, true);
-      if (!Array.isArray(panes)) return null;
+      // An empty list is a host that has told us nothing useful — a host still
+      // starting, a list that raced a restart — not a host with no panes. Treating
+      // it as "no agent anywhere" is how a live session gets a second one.
+      if (!Array.isArray(panes) || !panes.length) return null;
       const match = panes.find((pane) => pane && pane.alive && pane.agentAlive !== false
-        && pane.meta && pane.meta.card === cardId && pane.meta.repair === true);
+        && pane.meta && pane.meta.repair === true
+        && (pane.meta.card === cardId || (sessionId && pane.meta.sessionId === sessionId)));
       return match ? { pane: match.id, sessionId: match.meta.sessionId || null } : null;
     },
     // A recorded launch whose pane has since exited is not a launch any more. Null
     // means "could not tell" — the caller leaves the entry alone rather than
     // relaunching into a host it cannot see.
-    paneAlive: async (paneId) => {
+    //
+    // Matched by session id as well as pane id: an in-place restart or an account
+    // handoff replaces the pane, and between the agent stopping and
+    // `replace-exited` the old pane id is dead while the session is very much
+    // alive. Finding it under its new pane is what stops that window from looking
+    // like an exit.
+    paneAlive: async (paneId, sessionId) => {
       const panes = await listHostPanes({}, true);
-      if (!Array.isArray(panes)) return null;
-      const match = panes.find((pane) => pane && pane.id === paneId);
+      if (!Array.isArray(panes) || !panes.length) return null;
+      const match = panes.find((pane) => pane
+        && (pane.id === paneId || (sessionId && pane.meta && pane.meta.sessionId === sessionId)));
       return Boolean(match && match.alive && match.agentAlive !== false);
     },
   });

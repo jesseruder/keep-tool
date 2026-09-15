@@ -303,6 +303,10 @@ function harness(options = {}) {
     // no terminal host sees, and neither may make anything happen on its own.
     findCardPane: options.findCardPane || (async () => null),
     paneAlive: options.paneAlive || (async () => null),
+    // The harness's cards live in `calls`, not on disk, so the real loader would
+    // report every one of them closed and the sweep would never look at anything.
+    loadTask: options.loadTask || ((id) => (calls.cards.some((card) => card.draft.id === id)
+      ? { id, fm: { status: 'active' } } : null)),
     accountId: () => options.accountId || 'claude-repair',
     worktreePath: (name) => `/tmp/wt/keep-tool/${name}`,
     openSession: async (body, openDeps) => {
@@ -839,7 +843,7 @@ test('only a pane this scheduler spawned is adopted, never a session Owner opene
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('a recorded pane that has exited is relaunched, and --reset can clear what is stuck', async () => {
+test('a session that is only briefly gone is not relaunched over', async () => {
   const root = makeRoot();
   try {
     const snapshot = snapshotOf([
@@ -854,29 +858,223 @@ test('a recorded pane that has exited is relaunched, and --reset can clear what 
     // A host that cannot be reached says null, and null is not "gone".
     const unknown = await selfRepair.tick({ ...deps, paneAlive: async () => null, now: NOW + 60e3 });
     assert.equal(unknown.relaunching, undefined);
-    assert.equal(selfRepair.loadState(root).signatures[sig].pane, 'pane-1');
+    assert.equal(selfRepair.loadState(root).signatures[sig].deadSince, undefined);
 
-    // The agent exited without landing. The signature must not stay wedged on it.
+    // An in-place restart or a handoff leaves the pane dead between the agent
+    // stopping and replace-exited. One dead observation only starts the clock.
     const dead = { ...deps, paneAlive: async () => false };
-    const swept = await selfRepair.tick({ ...dead, now: NOW + 2 * 60e3 });
+    const first = await selfRepair.tick({ ...dead, now: NOW + 2 * 60e3 });
+    assert.equal(first.relaunching, undefined, 'one dead reading is a restart window, not an exit');
+    assert.equal(selfRepair.loadState(root).signatures[sig].deadSince, NOW + 2 * 60e3);
+    assert.equal(calls.runs.length, 1);
+
+    // Still inside the grace window: still nothing.
+    const soon = await selfRepair.tick({ ...dead, now: NOW + 8 * 60e3 });
+    assert.equal(soon.relaunching, undefined);
+    assert.equal(calls.runs.length, 1);
+
+    // The restart finished and the session is back. The clock is cleared, and the
+    // session keeps its recorded id, so KEEP_REPAIR stays armed for it throughout.
+    await selfRepair.tick({ ...deps, paneAlive: async () => true, now: NOW + 9 * 60e3 });
+    assert.equal(selfRepair.loadState(root).signatures[sig].deadSince, undefined);
+    assert.equal(selfRepair.loadState(root).signatures[sig].sessionId, '11111111-0000-4000-8000-000000000000');
+    assert.equal(calls.runs.length, 1, 'no second agent for a session that was only restarting');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a session that stays gone past the grace window is relaunched, keeping its marker until then', async () => {
+  const root = makeRoot();
+  try {
+    const snapshot = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const config = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 };
+    const { deps, calls } = harness({ root, snapshot, config });
+    const opened = await selfRepair.tick(deps);
+    const sig = opened.opened[0].sig;
+
+    const dead = { ...deps, paneAlive: async () => false };
+    await selfRepair.tick({ ...dead, now: NOW + 60e3 });
+    const swept = await selfRepair.tick({ ...dead, now: NOW + 60e3 + selfRepair.PANE_DEAD_GRACE_MS });
     assert.equal(swept.relaunching.length, 1);
     assert.equal(swept.relaunching[0].pane, 'pane-1');
-    assert.match(calls.checkins.find((entry) => /exited without landing/.test(entry.message)).message,
-      /The repair session in pane pane-1 exited without landing; relaunching \(attempt 2 of 3\)/);
-    // …and the same tick relaunches it onto the card it already has.
+    assert.match(calls.checkins.find((entry) => /has been gone for/.test(entry.message)).message,
+      /The repair session in pane pane-1 has been gone for 10m without landing; relaunching \(session 2 of 3\)/);
+
+    // The same tick relaunches onto the card it already has, and only then does the
+    // recorded session change — so the old one never lost its KEEP_REPAIR marker.
     assert.equal(swept.resumed.length, 1);
     assert.equal(calls.runs.length, 2);
     assert.equal(calls.cards.length, 1, 'still one card for the signature');
-    assert.equal(selfRepair.loadState(root).signatures[sig].pane, 'pane-2');
+    const entry = selfRepair.loadState(root).signatures[sig];
+    assert.equal(entry.pane, 'pane-2');
+    assert.equal(entry.relaunchDue, undefined);
+    assert.equal(entry.deadSince, undefined);
+    assert.equal(entry.attempts, 2);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
 
-    // --reset refuses while the card is live and its launch was confirmed…
-    const live = selfRepair.reset(sig, { root, now: NOW, loadTask: () => ({ fm: { status: 'active' } }) });
-    assert.equal(live.cleared, false);
-    assert.equal(live.status, 'active');
-    // …but a card that is done is not a live card, whatever the entry says.
-    const done = selfRepair.reset(sig, { root, now: NOW, loadTask: () => ({ fm: { status: 'done' } }) });
+test('a pane that dies every time gets exactly MAX_LAUNCH_ATTEMPTS sessions, not one per tick', async () => {
+  const root = makeRoot();
+  try {
+    const snapshot = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const config = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 };
+    // Every launch works and every pane is then found dead: before the cap counted
+    // successful relaunches this handed out a new session every tick forever,
+    // checking in "attempt 7 of 3".
+    const { deps, calls } = harness({ root, snapshot, config, paneAlive: async () => false });
+    let at = NOW;
+    await selfRepair.tick({ ...deps, now: at });
+    for (let tick = 0; tick < 12; tick += 1) {
+      at += selfRepair.PANE_DEAD_GRACE_MS + 60e3;
+      await selfRepair.tick({ ...deps, now: at });
+    }
+    assert.equal(calls.runs.length, selfRepair.MAX_LAUNCH_ATTEMPTS, 'three sessions, then it stops');
+    assert.equal(calls.cards.length, 1, 'and one card throughout');
+    const sig = Object.keys(selfRepair.loadState(root).signatures)[0];
+    const entry = selfRepair.loadState(root).signatures[sig];
+    assert.equal(entry.attempts, selfRepair.MAX_LAUNCH_ATTEMPTS);
+    assert.equal(entry.launchGaveUp, true);
+    assert.match(calls.checkins.find((row) => /will not open another/.test(row.message)).message,
+      /That was repair session 3 of 3 for this signature\. Self-repair will not open another/);
+    assert.match(calls.checkins.at(-1).message, /keep self-repair --reset sched:unblock:/);
+    const last = await selfRepair.tick({ ...deps, now: at + 60 * 60e3 });
+    assert.match(last.skipped[0].why, /has had 3 repair sessions and none landed/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the sweep leaves alone a signature that stopped firing or whose card is closed', async () => {
+  const root = makeRoot();
+  try {
+    const failing = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const healed = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 0, lastOkAt: NOW + 60e3, lastError: 'unblock is broken' },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const config = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 };
+    const { deps, calls } = harness({ root, snapshot: failing, config, paneAlive: async () => false });
+    const opened = await selfRepair.tick(deps);
+    const sig = opened.opened[0].sig;
+    const checkins = calls.checkins.length;
+
+    // The symptom cleared. Whatever happened to the pane, this belongs to the
+    // resolve path now — relaunching an agent at a fault that is gone is noise.
+    let at = NOW + 60e3;
+    for (let tick = 0; tick < 3; tick += 1) {
+      at += selfRepair.PANE_DEAD_GRACE_MS;
+      const quiet = await selfRepair.tick({ ...deps, snapshot: () => healed, now: at });
+      assert.equal(quiet.relaunching, undefined);
+    }
+    assert.equal(calls.runs.length, 1);
+
+    // Still failing, but somebody closed the card: not this scheduler's to relaunch.
+    const closed = { ...deps, loadTask: () => ({ fm: { status: 'done' } }) };
+    await selfRepair.tick({ ...closed, now: at + selfRepair.PANE_DEAD_GRACE_MS });
+    const still = await selfRepair.tick({ ...closed, now: at + 2 * selfRepair.PANE_DEAD_GRACE_MS + 60e3 });
+    assert.equal(still.relaunching, undefined);
+    assert.equal(calls.runs.length, 1);
+    assert.equal(calls.checkins.length, checkins, 'and it says nothing about a card it is not going to touch');
+    assert.equal(selfRepair.loadState(root).signatures[sig].relaunchDue, undefined);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a relaunch that throws spends its attempt instead of retrying every tick', async () => {
+  const root = makeRoot();
+  try {
+    const snapshot = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const config = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 };
+    const { deps, calls } = harness({ root, snapshot, config });
+    // The daemon dies during the worktree build, so nothing is ever recorded.
+    deps.spawnWorktree = () => Promise.reject(new Error('daemon died mid-build'));
+    const opened = await selfRepair.tick(deps);
+    const sig = opened.opened[0].sig;
+    assert.equal(selfRepair.loadState(root).signatures[sig].attempts, 1);
+
+    // Every resume throws too. The attempt has to be spent before the call, or
+    // lastAttemptAt stays 0 and this runs again on every tick, forever.
+    let at = NOW;
+    for (let tick = 0; tick < 6; tick += 1) {
+      at += 20 * 60e3;
+      await selfRepair.tick({ ...deps, now: at });
+    }
+    const entry = selfRepair.loadState(root).signatures[sig];
+    assert.equal(entry.attempts, selfRepair.MAX_LAUNCH_ATTEMPTS);
+    assert.equal(entry.launchGaveUp, true);
+    assert.equal(entry.lastAttemptAt > 0, true, 'the backoff clock is set even when the launch throws');
+    assert.equal(calls.cards.length, 1);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('--reset refuses over a live session, and never drops its record when it refuses', () => {
+  const root = makeRoot();
+  try {
+    const entry = () => selfRepair.loadState(root).signatures['sched:unblock:abcd1234'];
+    const seed = (extra) => selfRepair.mutateState((state) => {
+      state.signatures['sched:unblock:abcd1234'] = {
+        cardId: 'a-repair-card', sessionId: 'agent-session', pane: 'pane-1',
+        openedAt: NOW, attempts: 1, lastAttemptAt: NOW, ...extra,
+      };
+    }, { root, now: NOW });
+    const open = () => ({ fm: { status: 'active' } });
+
+    // The host says the session is running. Clearing would take KEEP_REPAIR away
+    // from a live agent and let the next tick open a second card on the fault.
+    seed({ launchError: 'could not confirm' });
+    const alive = selfRepair.reset('sched:unblock:abcd1234', { root, now: NOW, loadTask: open, sessionAlive: true });
+    assert.equal(alive.cleared, false);
+    assert.equal(alive.reason, 'session-alive');
+    assert.equal(entry().sessionId, 'agent-session', 'a refused reset never drops the record');
+    assert.equal(entry().pane, 'pane-1');
+
+    // The host could not be asked and the launch was never confirmed: inside the
+    // window where the pane is plausibly up, refuse rather than guess.
+    const unsure = selfRepair.reset('sched:unblock:abcd1234', { root, now: NOW + 60e3, loadTask: open, sessionAlive: null });
+    assert.equal(unsure.cleared, false);
+    assert.equal(unsure.reason, 'unverified');
+    assert.equal(entry().sessionId, 'agent-session');
+
+    // Past that window, an unconfirmed launch clears.
+    const stale = selfRepair.reset('sched:unblock:abcd1234',
+      { root, now: NOW + selfRepair.LEGACY_RUN_TTL_MS + 60e3, loadTask: open, sessionAlive: null });
+    assert.equal(stale.cleared, true);
+
+    // A confirmed session on an open card is refused for the card, not the pane…
+    seed({});
+    const card = selfRepair.reset('sched:unblock:abcd1234', { root, now: NOW, loadTask: open, sessionAlive: false });
+    assert.equal(card.cleared, false);
+    assert.equal(card.reason, 'card-open');
+    assert.equal(entry().sessionId, 'agent-session');
+    // …and clears once that card is closed and the pane is confirmed gone.
+    const done = selfRepair.reset('sched:unblock:abcd1234',
+      { root, now: NOW, loadTask: () => ({ fm: { status: 'done' } }), sessionAlive: false });
     assert.equal(done.cleared, true);
-    assert.equal(selfRepair.loadState(root).signatures[sig].cardId, undefined);
+    assert.equal(entry().cardId, undefined);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a corrupt state file says so instead of silently losing every open card', () => {
+  const root = makeRoot();
+  selfRepair._resetWarnings();
+  try {
+    fs.mkdirSync(selfRepair.stateDir(root), { recursive: true });
+    fs.writeFileSync(selfRepair.stateFile(root), '{ "signatures": { truncated');
+    const logged = [];
+    const state = selfRepair.loadState(root, (line) => logged.push(line));
+    assert.deepEqual(state, { signatures: {}, day: '', openedToday: 0 });
+    assert.match(logged.join(''), /state\.json is unreadable/);
+    assert.match(logged.join(''), /KEEP_REPAIR marker for any live repair session are lost/);
+    // Once per path, not once per tick.
+    selfRepair.loadState(root, (line) => logged.push(line));
+    assert.equal(logged.length, 1);
+    // A missing file is not corruption and says nothing.
+    fs.rmSync(selfRepair.stateFile(root));
+    selfRepair.loadState(root, (line) => logged.push(line));
+    assert.equal(logged.length, 1);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -918,7 +1116,7 @@ test('a launch that keeps failing gives up instead of retrying forever', async (
     assert.equal(entry.attempts, selfRepair.MAX_LAUNCH_ATTEMPTS);
     assert.equal(entry.launchGaveUp, true);
     const last = await selfRepair.tick({ ...deps, now: at + 60 * 60e3 });
-    assert.match(last.skipped[0].why, /launch failed 3 times; resume it by hand/);
+    assert.match(last.skipped[0].why, /has had 3 repair sessions and none landed; it will not get another/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
