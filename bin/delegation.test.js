@@ -464,7 +464,11 @@ test('an explicitly ended delegation lets a Codex worker of the owning Claude se
       assert.equal(result.status, 0, result.stderr);
       const file = path.join(f.root, 'tasks', `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.md`);
       assert.equal(fs.existsSync(file), true, file);
+      assert.match(fs.readFileSync(file, 'utf8'), new RegExp(`Created after an explicitly ended delegation as independent of ${card}`));
     }
+    // Neither card is later mistaken for an abandoned handoff shadow.
+    const later = require('./lint.js').lint({ root: f.root, rule: 'handoff-shadow', now: Date.now() + 7 * 3600e3 });
+    assert.deepEqual(later.findings, []);
   } finally { f.cleanup(); }
 });
 

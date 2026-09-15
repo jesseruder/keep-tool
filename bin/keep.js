@@ -1398,17 +1398,18 @@ commands.add = (argv) => {
   // plan step of the card their parent Claude session owned, so the same refusal
   // fires on the implicit relationship the codex SessionStart hook recorded.
   // `keep delegate --end` is the documented way to start independent work, so an
-  // explicitly ended delegation skips it: the codex-parents record outlives the end.
-  const shadow = !filesOnly && !(assigned.kind === 'ended' && assigned.explicit) ? shadowOwner() : null;
-  if (shadow && !o.force) {
+  // explicitly ended delegation passes too: the codex-parents record outlives the end.
+  const shadow = filesOnly ? null : shadowOwner();
+  const endedDelegation = assigned.kind === 'ended' && assigned.explicit;
+  if (shadow && !o.force && !endedDelegation) {
     die(`this Codex session was started by claude ${shadow.parentId.slice(0, 8)}, which owns ${shadow.owned.id} ("${shadow.owned.fm.title}").\n`
       + `  Contribute there with keep checkin ${shadow.owned.id} -m "..." (no claim needed), or have the parent register the step with keep delegate ${shadow.owned.id} --step <n> --prepare.\n`
       + '  File deliberately independent work with --file, or pass --force to create a top-level card anyway.');
   }
-  // A forced card must not look abandoned: the lint rule flags a worker's card with
-  // no log entries, so record the deliberate decision as its created entry.
+  // A card that passed deliberately must not look abandoned: the lint rule flags a
+  // worker's card with no log entries, so record the decision as its created entry.
   const forcedNote = shadow && !o.m
-    ? `Created with --force as independent of ${shadow.owned.id}, the card this worker's parent claude ${shadow.parentId.slice(0, 8)} owns.`
+    ? `Created ${o.force ? 'with --force' : 'after an explicitly ended delegation'} as independent of ${shadow.owned.id}, the card this worker's parent claude ${shadow.parentId.slice(0, 8)} owns.`
     : undefined;
   const plan = splitPlanValues(o.plan || []).map((text) => ({ text: cleanPlanText(text), state: 'todo' }));
   applyDoneWhen(plan, o['done-when']);
