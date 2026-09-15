@@ -6081,18 +6081,30 @@ function repairExecutable(tokens) {
   if (head === 'keep.js') return { head: 'keep', tokens: ['keep', ...tokens.slice(1)], script: tokens[0] };
   if (head === 'serve.js') return { head: 'serve.js', tokens };
   if (!NODE_BINARIES.has(head)) return { head, tokens };
+  // node's script is its first operand — but a value in flag position can carry
+  // any name (`-r /tmp/keep.js`), and modelling node's option arity to tell them
+  // apart is exactly the kind of parse this guard should not be betting on. So
+  // when the reading is not unambiguous, `node-keep` refuses outright instead of
+  // picking one: two files named keep.js/serve.js, or the operand being neither
+  // while one of them is named somewhere else alongside a daemon subcommand.
   const index = tokens.findIndex((token, position) => position > 0 && !token.startsWith('-'));
-  const mentioned = tokens.some((token, position) => position > 0
+  const mentions = tokens.filter((token, position) => position > 0
     && NODE_SCRIPTS.has(stepRegistry.commandBasename(token)));
-  if (index === -1) return { head: mentioned ? 'node-keep' : head, tokens };
-  const script = tokens[index];
-  const name = stepRegistry.commandBasename(script);
-  const interpreter = tokens.slice(1, index);
-  if (name === 'keep.js') return { head: 'keep', tokens: ['keep', ...tokens.slice(index + 1)], script, interpreter };
-  if (name === 'serve.js') return { head: 'serve.js', tokens, script, interpreter };
-  // node is running something else, with keep.js or serve.js named somewhere in
-  // its arguments. Nobody spells either command that way.
-  if (mentioned) return { head: 'node-keep', tokens, script, interpreter };
+  const reaching = tokens.some((token, position) => position > 0
+    && (token === 'restart-daemon' || token === 'service'
+      || stepRegistry.commandBasename(token) === 'serve.js'));
+  const script = index === -1 ? '' : tokens[index];
+  const interpreter = index === -1 ? tokens.slice(1) : tokens.slice(1, index);
+  const ambiguous = { head: 'node-keep', tokens, script, interpreter };
+  if (mentions.length > 1) return ambiguous;
+  if (index !== -1) {
+    const name = stepRegistry.commandBasename(script);
+    if (name === 'keep.js') return { head: 'keep', tokens: ['keep', ...tokens.slice(index + 1)], script, interpreter };
+    if (name === 'serve.js') return { head: 'serve.js', tokens, script, interpreter };
+  }
+  // `node -e '…' bin/keep.js` reads a file and is ordinary diagnosis; the same
+  // command with `restart-daemon` in it is not.
+  if (mentions.length && reaching) return ambiguous;
   return { head, tokens };
 }
 
@@ -6249,46 +6261,41 @@ function repairDenial(invocation) {
   return '';
 }
 
-// The two commands a repair session gets back once its fix is on origin/master,
-// and only these two. `pull --ff-only` cannot merge, cannot rebase and cannot
-// resolve anything: if the live checkout has diverged it fails, which is exactly
-// the outcome a repair session should get. `git -C ~/keep-tool merge`, `reset`,
-// `checkout`, a bare `git pull`, `keep service`, `launchctl` and the HTTP restart
-// are all still refused — landing a fix does not make the live checkout writable.
-const REPAIR_PULL_SHAPES = [['pull', '--ff-only'], ['pull', '--ff-only', 'origin', 'master']];
+// The two commands a repair session gets back once its fix is on origin/master —
+// matched against the WHOLE command, not against one invocation inside it.
+//
+// Everything else in this guard parses a command line without being a shell, and
+// that is the right trade for a refusal: a spelling it reads differently from zsh
+// is at worst an over-refusal. An allowance cannot be built on it. Each round of
+// review found another spelling that parses one way here and runs another way
+// there — a preload named keep.js in flag position, `bash --rcfile /tmp/x -ic
+// '<command>'`, an `export GIT_CONFIG_*` in an earlier segment that the guard
+// waves through and the shell keeps. So the allowance does not inspect a parse at
+// all: the command a repair session types comes from the recipe, and the recipe's
+// exact text is what is recognised. One command, no operators, no wrappers, no
+// assignments, no substitutions, because none of those fit these patterns.
+//
+// `pull --ff-only` cannot merge, cannot rebase and cannot resolve anything: if the
+// live checkout has diverged it fails, which is the right outcome here. Everything
+// else stays refused — landing a fix does not make the live checkout writable.
+function repairCheckoutSpellings() {
+  return ['~/keep-tool', '$HOME/keep-tool', '${HOME}/keep-tool', ...repairMainCheckouts()];
+}
 
-function repairAfterLand(invocation) {
-  const { head, cwd } = invocation;
-  const args = invocation.tokens.slice(1);
-  // Nothing may ride along. The refusal did not have to care what surrounded a
-  // command it was refusing anyway; an allowance does, and every one of these
-  // turns one of the two commands into a different one.
-  if ((invocation.assignments || []).length) return false;
-  if ((invocation.interpreter || []).length) return false;
-  if (invocation.wrapped) return false;
-  // `node ~/keep-tool/bin/keep.js restart-daemon` is already rewritten to this by
-  // repairExecutable, so both spellings land here — but only for the real keep.js:
-  // the rewrite matches on the basename, and /tmp/keep.js has that too. Exactly
-  // the one argument: a flag nobody has read is not part of the allowance.
-  if (head === 'keep') {
-    if (invocation.script && !underMainCheckout(repairResolvePath(invocation.script, cwd))) return false;
-    return args.length === 1 && args[0] === 'restart-daemon';
-  }
-  if (head !== 'git') return false;
-  // `--git-dir` and `--work-tree` are independent: together they point a pull from
-  // one repository's config and branch at another one's working tree, which is not
-  // "pull the landed fix" by any reading. Only `-C`, and only one of them.
-  if (args.some((token) => /^--(?:work-tree|git-dir)(?:=|$)/.test(token))) return false;
-  if (args.filter((token) => token === '-C').length > 1) return false;
-  if (!repairGitTargets(args, cwd).every(underMainCheckout)) return false;
-  // Whatever named the directory is not part of the shape — `-C ~/keep-tool`
-  // before the subcommand, or a `cd` that put it there, are the same command.
-  const rest = [];
-  for (let i = 0; i < args.length; i += 1) {
-    if (args[i] === '-C') { i += 1; continue; }
-    rest.push(args[i]);
-  }
-  return REPAIR_PULL_SHAPES.some((shape) => shape.length === rest.length && shape.every((token, index) => token === rest[index]));
+function repairEscape(value) { return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// The exact command, or '' — collapsing runs of whitespace is the only normalizing
+// done, because a shell does that too and nothing else here is ambiguous.
+function repairAllowedCommand(command) {
+  const text = String(command || '').trim().replace(/[ \t]+/g, ' ');
+  if (!text || /[\n\r]/.test(text)) return '';
+  const checkout = repairCheckoutSpellings().map(repairEscape).join('|');
+  const patterns = [
+    /^keep restart-daemon$/,
+    new RegExp(`^(?:node )?(?:${checkout})/bin/keep\\.js restart-daemon$`),
+    new RegExp(`^git -C (?:${checkout}) pull --ff-only(?: origin master)?$`),
+  ];
+  return patterns.some((pattern) => pattern.test(text)) ? text : '';
 }
 
 function guardRepairCommand(input, env = process.env, deps = {}) {
@@ -6315,12 +6322,13 @@ function guardRepairCommand(input, env = process.env, deps = {}) {
     return fix;
   };
   let note = '';
+  const allowable = repairAllowedCommand(command);
   for (const invocation of repairInvocations(command, 0, typeof input.cwd === 'string' ? input.cwd : '')) {
     const why = repairDenial(invocation);
     if (!why) continue;
     // An unresolvable card, an unreadable one, a card with no land record and a
     // predicate that threw all read the same here: refuse, as before the land.
-    const landed = repairAfterLand(invocation) ? landedFix() : null;
+    const landed = allowable ? landedFix() : null;
     if (!landed) return { deny: true, reason: `keep guard: ${why} — ${REPAIR_RULE}` };
     note = `keep: repair session may restart: ${landed.cardId}'s fix ${landed.sha.slice(0, 7)} is on origin/master`;
   }
@@ -8585,7 +8593,7 @@ module.exports = {
   projectMatchesCwd, looksLikeGitWrite, normalizeProjectPath, resolveProjectArg, activeHolds,
   openNeeds, addNeed, meetNeeds, sweepNeeds,
   taskForSession, newestTaskForSession, readCodexParent, deployCommand, deployEntry, recordDeploy, redactCommand,
-  stepMatchForInput, guardStepCommand, guardResumeCommand, guardRepairCommand, repairAfterLand,
+  stepMatchForInput, guardStepCommand, guardResumeCommand, guardRepairCommand, repairAllowedCommand,
   repairInvocations, rawClaudeResume,
   recordStepRun, codexToolInput, codexExitCode,
   codexJobText, renderCodexJobs,

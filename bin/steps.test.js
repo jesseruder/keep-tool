@@ -1086,6 +1086,7 @@ test('the pre-bash guard keeps a self-repair run off the daemon and out of the m
     // a decoy in flag position used to look like the script.
     `node -r /tmp/preload.cjs ${main}/bin/keep.js restart-daemon`,
     `node --require=/tmp/keep.js ${main}/bin/keep.js restart-daemon`,
+    `node -r /tmp/keep.js ${main}/bin/keep.js restart-daemon`,
     `node --require=/tmp/serve.js ${main}/bin/serve.js`,
     // env's options stop at its command operand: this `-C` is git's.
     'env git -C ~/keep-tool config guard.recheck value',
@@ -1126,6 +1127,9 @@ test('the pre-bash guard keeps a self-repair run off the daemon and out of the m
     'git commit -am "self-repair: fix the tick"',
     'git push origin HEAD',
     'node --test --require ./scripts/test-env.cjs bin/runs.test.js',
+    // Reading keep-tool's own source through node is diagnosis, not the daemon.
+    'node -e "console.log(1)" bin/keep.js',
+    `node -e "console.log(1)" ${main}/bin/keep.js`,
     'node --test --require ./scripts/test-env.cjs bin/serve.test.js',
     'wt ls',
   ]) assert.equal(denied(command), false, command);
@@ -1179,10 +1183,10 @@ test('once the repair card\'s fix is on origin/master the session may pull the l
     `git -C ${main} pull --ff-only`,
     'git -C ~/keep-tool pull --ff-only',
     'git -C $HOME/keep-tool pull --ff-only',
+    'git -C ${HOME}/keep-tool pull --ff-only',
     `git -C ${main} pull --ff-only origin master`,
-    `cd ${main} && git pull --ff-only`,
-    // The pair the recipe's last step runs, in one command.
-    `git -C ${main} pull --ff-only && keep restart-daemon`,
+    // Written the way the recipe writes it, whitespace and all.
+    `git  -C ${main}   pull --ff-only`,
   ]) assert.equal(decide(command).deny, false, command);
 
   // Everything else stays refused: landing a fix does not make the live checkout
@@ -1219,14 +1223,23 @@ test('once the repair card\'s fix is on origin/master the session may pull the l
     `git -C ${main} -C bin pull --ff-only`,
     `git -C ${main} -c core.hooksPath=/tmp/hooks pull --ff-only`,
     `node --require=/tmp/keep.js ${main}/bin/keep.js restart-daemon`,
+    `node -r /tmp/keep.js ${main}/bin/keep.js restart-daemon`,
     `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.url GIT_CONFIG_VALUE_0=/tmp/other bash -c 'git -C ${main} pull --ff-only'`,
     `NODE_OPTIONS=--require=/tmp/preload.cjs bash -c 'keep restart-daemon'`,
     `env git -C ${main} pull --ff-only`,
+    // The allowance is the whole command, so nothing can be attached to it: no
+    // second command, no shell of its own (whose startup files run code), no
+    // `export` in an earlier segment that this guard waves through and the shell
+    // keeps, and no `cd` standing in for the -C.
+    `git -C ${main} pull --ff-only && keep restart-daemon`,
+    `cd ${main} && git pull --ff-only`,
+    `bash --rcfile /tmp/repair.rc -ic 'git -C ${main} pull --ff-only'`,
+    `bash -c 'keep restart-daemon'`,
+    'export GIT_CONFIG_COUNT=1; keep restart-daemon',
+    `export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.url GIT_CONFIG_VALUE_0=/tmp/other; git -C ${main} pull --ff-only`,
+    'keep restart-daemon --force',
+    'keep restart-daemon; keep service restart',
   ]) assert.equal(decide(command).deny, true, command);
-
-  // …but the plain pair still passes through a shell, which is how a recipe step
-  // written as one command reaches the guard.
-  assert.equal(decide(`bash -c 'git -C ${main} pull --ff-only && keep restart-daemon'`).deny, false);
 
   // One line to stderr, naming the card and the sha that made it allowable.
   assert.equal(decide('keep restart-daemon').note,
@@ -1242,7 +1255,7 @@ test('once the repair card\'s fix is on origin/master the session may pull the l
 
   // Asked at most once per command, and not at all when nothing is refused.
   asked.length = 0;
-  decide(`git -C ${main} pull --ff-only && keep restart-daemon`);
+  decide(`git -C ${main} pull --ff-only`);
   assert.deepEqual(asked, ['repair-run']);
   asked.length = 0;
   decide('keep health --json');
