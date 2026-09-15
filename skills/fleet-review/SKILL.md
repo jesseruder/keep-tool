@@ -292,10 +292,34 @@ Everything else is a card. A finding is not an alert. Repeating an alert is neve
 useful: the key dedupes it, and what he has not acted on comes back in the morning
 brief. If `keep alert` refuses (budget, dedupe), leave it — the card and the brief carry it.
 
+## Lint owns bookkeeping
+
+Each card's bundle carries a `KEEP_LINT_FINDINGS` block: the deterministic hygiene
+facts `keep lint` already computed. **That block is already in Owner's brief.** Do not
+re-report any of it as a finding — `review-land` refuses a note a lint rule already
+covers, naming the rule, and lands the rest of the tick without it.
+
+Lint owns: missing or unresolvable projects, `landing` with no cited sha, `blocked`
+with no need or dependency, daemon schedulers failing or silent, dirty or diverged
+checkouts, gated steps with pending commits, stale active cards, uncited commits,
+`/tmp` citations, duplicate titles, scope tags, deploy provenance.
+
+Your job is judgment, and only judgment: drift from what the card actually asked for,
+claims made without verification, an approach that is not going to work, two cards
+contradicting each other, a risky or irreversible operation. That is what a model is
+for, and it is what the bookkeeping was crowding out.
+
+`kind: other` is for judgment that fits no other kind. It is never for bookkeeping. If
+a note's subject is a bare sha, a `/tmp` path, `<card>:no-project` or
+`<card>:closing-checkin`, it is bookkeeping: lint has it, or lint should, and the fix
+is a lint rule rather than a finding every tick.
+
 ## Daemon health
 
-Every bundle header carries a `daemon health` line. When it shows a scheduler failing or
-silent, file ONE `daemon-health` finding at severity `med` on the `keep-fleet-reviewer`
+Every bundle header carries a `daemon health` line. Lint files the deterministic part
+of this (see "Lint owns bookkeeping"): only add a `daemon-health` finding when you have
+judgment to add that the lint row does not — what is actually breaking, and why. When
+you do, file ONE at severity `med` on the `keep-fleet-reviewer`
 card (or the fleet candidate) with the error text and one concrete next action, once per
 distinct error; the dedupe key handles repeats. If the failing scheduler is review tick
 delivery itself, also run

@@ -44,7 +44,9 @@ const MAX_BUDGET_TOKENS = 20000;
 const DEFAULT_TOTAL_BUDGET_TOKENS = parseInt(process.env.KEEP_REVIEW_TOTAL_BUDGET || '40000', 10);
 const MIN_BATCH_BUNDLE_TOKENS = 1500;
 const CHARS_PER_TOKEN = 4; // no tokenizer dependency; this repo has zero deps
-const MAX_CACHED_LINT_CHARS = 1800;
+// Ten rows of rule + text + fix, so a card whose whole hygiene story is already in
+// lint can show all of it rather than the first four lines of it.
+const MAX_CACHED_LINT_CHARS = 3000;
 
 const STATE_VERSION = 1;
 
@@ -1261,12 +1263,15 @@ function cachedLintSection(taskId, root = keep.ROOT) {
   let snapshot;
   try { snapshot = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'lint.json'), 'utf8')); }
   catch { return []; }
+  // Ten, not five: lint now owns the bookkeeping classes outright, so the reviewer
+  // has to be able to see the whole of what it must not re-report for this card.
   const findings = Array.isArray(snapshot && snapshot.findings)
-    ? snapshot.findings.filter((item) => item && item.id === taskId).slice(0, 5) : [];
+    ? snapshot.findings.filter((item) => item && item.id === taskId).slice(0, 10) : [];
   if (!findings.length) return [];
   const lines = [
     '<<<KEEP_LINT_FINDINGS',
-    `cached keep lint findings for this card (advisory snapshot ${lintField(snapshot.at, 40) || 'time unknown'}; verify against current facts):`,
+    `cached keep lint findings for this card (advisory snapshot ${lintField(snapshot.at, 40) || 'time unknown'}; verify against current facts).`
+    + ' These are already in Owner\'s brief: do not re-report any of them as a finding - review-land refuses a note a lint rule already covers.',
   ];
   for (const item of findings) {
     const row = `- [${lintField(item.severity, 12) || '?'}] ${lintField(item.rule, 80) || 'unknown'} · ${lintField(item.text, 220)} · fix: ${lintField(item.fix, 220)}`;
@@ -3105,6 +3110,52 @@ function normalizeLandDocument(document) {
   };
 }
 
+// What lint already answers, and the rule that answers it. A reviewer note in one of
+// these classes on a card that already carries the matching lint finding is a model
+// call spent restating a free, deterministic fact - and it arrives in Owner's brief
+// twice. Kept as a small table so the overlap is visible rather than inferred.
+const LINT_COVERED_KINDS = {
+  'wrong-status': ['landing-uncited', 'blocked-no-need', 'stale-active', 'done-not-archived', 'check-no-result', 'waiting-no-trigger'],
+  'stale-checkin': ['stale-active', 'check-no-result'],
+  'daemon-health': ['daemon-health'],
+  'env-hygiene': ['daemon-health', 'checkout-drift'],
+  'deploy-provenance': ['deploy-provenance'],
+  'step-pending': ['step-run-pending'],
+};
+const BARE_SHA_SUBJECT_RE = /^[0-9a-f]{7,40}$/i;
+const TMP_SUBJECT_RE = /^(?:\/private)?\/(?:tmp|var\/folders)\//;
+
+// `other` is for judgment that fits no kind. These four shapes are the mechanical
+// ones the reviewer kept filing under it.
+function lintCoveringRules(note) {
+  const kind = String((note && note.kind) || '');
+  if (LINT_COVERED_KINDS[kind]) return LINT_COVERED_KINDS[kind];
+  if (kind !== 'other') return [];
+  const subject = String((note && note.subject) || '').trim();
+  if (/:no-project$/.test(subject)) return ['missing-project'];
+  if (/:closing-checkin$/.test(subject)) return ['stale-active', 'review-no-next', 'check-no-result'];
+  if (BARE_SHA_SUBJECT_RE.test(subject)) return ['uncited-commits', 'deploy-provenance'];
+  if (TMP_SUBJECT_RE.test(subject)) return ['tmp-artifact'];
+  return [];
+}
+
+function cachedLintFindings(taskId, root = keep.ROOT) {
+  try {
+    const snapshot = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'lint.json'), 'utf8'));
+    return Array.isArray(snapshot && snapshot.findings)
+      ? snapshot.findings.filter((item) => item && item.id === taskId) : [];
+  } catch { return []; }
+}
+
+// The lint rule that already covers this note, or null. Pure: the caller supplies
+// the card's cached lint findings.
+function lintCoverage(note, findings) {
+  const rules = lintCoveringRules(note);
+  if (!rules.length) return null;
+  const hit = (findings || []).find((item) => item && rules.includes(item.rule));
+  return hit ? hit.rule : null;
+}
+
 function validateReviewLand(document) {
   const problems = [];
   if (!document || typeof document !== 'object' || Array.isArray(document)) {
@@ -3239,6 +3290,8 @@ async function reviewLand(document) {
   // signal, "I looked and it was fine" is a count.
   const ackLines = [];
   const counts = { reviewed: 0, findings: 0, clean: 0, ideas: 0 };
+  // One read of .keep/lint.json per card in the document, whatever the tick's size.
+  const lintCache = new Map();
 
   keep.withLock(() => {
     for (const entry of entries) {
@@ -3253,6 +3306,12 @@ async function reviewLand(document) {
           counts.clean += 1;
           detail = 'reviewed with no findings';
         } else if (entry.type === 'note') {
+          // Refused per item, not per document: the rest of the tick still lands.
+          const covered = lintCoverage(item, lintCache.get(item.id) || lintCache.set(item.id, cachedLintFindings(item.id)).get(item.id));
+          if (covered) {
+            throw new keep.KeepError(`already a lint finding: ${covered}; do not re-report it`
+              + ' - the KEEP_LINT_FINDINGS block is already in Owner\'s brief. Findings are for judgment, not bookkeeping.');
+          }
           const out = recordReviewNote(item.id, {
             kind: item.kind, subject: item.subject, severity: item.severity, bundle: item.bundle,
             message: item.message, suggestStatus: item.suggestStatus,
@@ -4436,6 +4495,10 @@ module.exports = {
   reviewAck,
   reviewDismiss,
   validateReviewLand,
+  lintCoverage,
+  lintCoveringRules,
+  cachedLintFindings,
+  LINT_COVERED_KINDS,
   reviewLand,
   scoreTask,
   isReviewerIdeaTask,

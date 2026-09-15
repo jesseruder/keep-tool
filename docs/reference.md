@@ -209,7 +209,12 @@ session, scheduled check recipe, or log activity in 24 hours. It also flags whol
 cite a commit already on the upstream's origin default branch. Hints identify the
 narrower wait to use while preserving existing fact targets. Stale or missing daemon session evidence does not prove that
 a linked session is gone. Reviewer bundle headers include bounded, card-specific cached
-lint findings as advisory evidence.
+lint findings as advisory evidence — up to ten rows, each naming its rule. Lint owns
+those classes outright: `review-land` refuses a note whose kind is
+`wrong-status`, `stale-checkin`, `daemon-health`, `env-hygiene`, `deploy-provenance` or
+`step-pending` (or `other` with a `:no-project` / `:closing-checkin` subject, a bare sha
+or a `/tmp` path) when the same card already carries a lint finding from a rule that
+covers it. The refusal names the rule and is per item: the rest of the tick still lands.
 
 `keep turns` reads the turn index, a SQLite summary of Claude Code and Codex CLI
 transcripts kept in `.keep/turns.sqlite`. Stop hooks and the daemon feed it

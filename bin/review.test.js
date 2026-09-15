@@ -2109,7 +2109,7 @@ test('review bundle header includes bounded card-specific cached lint findings i
     const lintEnd = md.indexOf('KEEP_LINT_FINDINGS>>>', lintStart);
     const metadataAt = md.indexOf('generated:', lintEnd);
     assert.ok(warningAt >= 0 && lintStart > warningAt && lintEnd > lintStart && metadataAt > lintEnd);
-    assert.ok(md.slice(lintStart, lintEnd).length <= 1800, 'cached lint context has a hard character bound');
+    assert.ok(md.slice(lintStart, lintEnd).length <= 3000, 'cached lint context has a hard character bound');
     assert.ok((md.match(/<<<KEEP_LINT_FINDINGS/g) || []).length === 1, 'cached text cannot inject a second fence');
     assert.match(md.slice(lintStart, lintEnd), /unsatisfiable-wait/);
     assert.doesNotMatch(md, /MUST NOT APPEAR/);
@@ -2937,4 +2937,79 @@ test('driftWake sends one tick per turn and records it in the day counters', asy
   assert.equal(stats.cadence.mode, 'events');
   assert.equal(stats.cadence.lastDriftCard, 'drifting-card');
   assert.ok(Number.isFinite(stats.cadence.lastDriftWakeAt));
+});
+
+// ---------- lint owns bookkeeping ----------
+
+test('the kind-to-rule table only covers a note lint actually answered for that card', () => {
+  const { lintCoverage, lintCoveringRules } = require('./review.js');
+  const lint = (rule) => [{ id: 'card-a', rule, severity: 'med', text: 't', fix: 'f' }];
+
+  assert.equal(lintCoverage({ kind: 'daemon-health', subject: 'review' }, lint('daemon-health')), 'daemon-health');
+  assert.equal(lintCoverage({ kind: 'wrong-status', subject: 'card-a' }, lint('landing-uncited')), 'landing-uncited');
+  assert.equal(lintCoverage({ kind: 'stale-checkin', subject: 'card-a' }, lint('stale-active')), 'stale-active');
+  assert.equal(lintCoverage({ kind: 'env-hygiene', subject: 'the host' }, lint('checkout-drift')), 'checkout-drift');
+  assert.equal(lintCoverage({ kind: 'step-pending', subject: 'terraform' }, lint('step-run-pending')), 'step-run-pending');
+
+  // `other`, by the four mechanical subject shapes.
+  assert.equal(lintCoverage({ kind: 'other', subject: 'card-a:no-project' }, lint('missing-project')), 'missing-project');
+  assert.equal(lintCoverage({ kind: 'other', subject: 'release-x:closing-checkin' }, lint('stale-active')), 'stale-active');
+  assert.equal(lintCoverage({ kind: 'other', subject: '81aee6c' }, lint('uncited-commits')), 'uncited-commits');
+  assert.equal(lintCoverage({ kind: 'other', subject: '/tmp/keep-force-restart/restart.cjs' }, lint('tmp-artifact')), 'tmp-artifact');
+
+  // Judgment is never covered, and neither is a covered kind lint stayed quiet about.
+  assert.equal(lintCoverage({ kind: 'scope-creep', subject: 'bin/serve.js' }, lint('daemon-health')), null);
+  assert.equal(lintCoverage({ kind: 'unverified-claim', subject: 'src/foo.ts' }, lint('stale-active')), null);
+  assert.equal(lintCoverage({ kind: 'other', subject: 'Review selector excludes real cards' }, lint('missing-project')), null);
+  assert.equal(lintCoverage({ kind: 'wrong-status', subject: 'card-a' }, []), null, 'no lint finding, no refusal');
+  assert.equal(lintCoverage({ kind: 'wrong-status', subject: 'card-a' }, lint('tmp-artifact')), null, 'a different rule does not count');
+  assert.deepEqual(lintCoveringRules({ kind: 'no-tests', subject: 'x' }), []);
+});
+
+test('review-land refuses a note lint already covers and lands the rest of the tick', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-lint-land-'));
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'reviews'), { recursive: true });
+    fs.mkdirSync(path.join(root, '.keep'), { recursive: true });
+    for (const args of [['init', '-q', '-b', 'main'], ['config', 'user.name', 'Keep Test'], ['config', 'user.email', 'keep@example.test']]) {
+      spawnSync('git', ['-C', root, ...args], { encoding: 'utf8' });
+    }
+    for (const id of ['bookkept-card', 'judged-card']) {
+      fs.writeFileSync(path.join(root, 'tasks', `${id}.md`), [
+        '---', `title: ${id}`, 'status: active', 'created: 2026-09-10', 'updated: 2026-09-10T12:00', '---', '',
+      ].join('\n'));
+    }
+    fs.writeFileSync(path.join(root, '.keep', 'lint.json'), JSON.stringify({
+      at: '2026-09-14T09:00:00.000Z',
+      findings: [{ id: 'bookkept-card', rule: 'missing-project', severity: 'med', text: 'no project', fix: 'keep project ...' }],
+    }));
+    // Real bundles, so the only thing that can refuse the first note is lint coverage.
+    const script = `
+      const review = require('./bin/review.js');
+      const bundleOf = (id) => review.buildBundle(id, { force: true }).md.match(/bundle: ([a-z0-9]+)/)[1];
+      review.reviewLand({ notes: [
+        { id: 'bookkept-card', bundle: bundleOf('bookkept-card'), kind: 'other', subject: 'bookkept-card:no-project',
+          severity: 'low', basis: 'observed', evidence: 'card frontmatter', checked: 'read the card',
+          message: 'this card has no project assigned' },
+        { id: 'judged-card', bundle: bundleOf('judged-card'), kind: 'scope-creep', subject: 'bin/serve.js',
+          severity: 'med', basis: 'observed', evidence: 'commit 3b08d08 touches bin/serve.js', checked: 'read the diff',
+          message: 'the card asked for a test fix and the session rewrote the injection path' },
+      ] }).then((out) => process.stdout.write(JSON.stringify(out)));
+    `;
+    const child = spawnSync(process.execPath, ['-e', script], {
+      cwd: path.join(__dirname, '..'),
+      env: { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', KEEP_REVIEWER: '1', KEEP_REVIEWER_NAME: 'fixture' },
+      encoding: 'utf8',
+    });
+    assert.equal(child.status, 0, child.stderr);
+    const out = JSON.parse(child.stdout);
+    const refused = out.results.find((result) => result.target === 'bookkept-card');
+    const landed = out.results.find((result) => result.target === 'judged-card');
+    assert.equal(refused.ok, false);
+    assert.match(refused.detail, /already a lint finding: missing-project; do not re-report/);
+    assert.equal(landed.ok, true, 'the rest of the tick still lands');
+    assert.equal(out.failed, 1);
+    assert.equal(out.counts.findings, 1);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
