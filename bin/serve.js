@@ -136,7 +136,7 @@ function writeSetAside(value, root = keep.ROOT) {
 }
 
 function setAsideEntryValid(entry) {
-  return entry && ['dismiss', 'snooze', 'dependency'].includes(entry.kind)
+  return entry && ['dismiss', 'snooze', 'dependency', 'running'].includes(entry.kind)
     && Number.isFinite(entry.at)
     && (typeof entry.since === 'number' || typeof entry.since === 'string')
     && (entry.kind === 'snooze' ? Number.isFinite(entry.until) : entry.until === null)
@@ -201,6 +201,12 @@ function applySetAside(attention, options = {}) {
       continue;
     }
     const item = current.get(key);
+    // "Mark running" overrides a misread status until the session gets a new
+    // message; a newer attention event or a gone session also clears it below.
+    if (entry.kind === 'running' && Number.isFinite(item?.lastUserAt) && item.lastUserAt > entry.at) {
+      changed = true;
+      continue;
+    }
     if (entry.kind === 'dependency' && (!item || item.taskId !== entry.taskId
         || JSON.stringify(item.dependencies) !== JSON.stringify(entry.dependencies)
         || (Number.isFinite(item.lastUserAt) && item.lastUserAt > entry.at))) {
@@ -227,7 +233,7 @@ function parseSetAsideRequest(body) {
   }
   const keys = Object.keys(body);
   const allowed = body.kind === 'snooze' ? ['key', 'kind', 'minutes'] : ['key', 'kind'];
-  if (!['dismiss', 'snooze', 'dependency', 'clear'].includes(body.kind)
+  if (!['dismiss', 'snooze', 'dependency', 'running', 'clear'].includes(body.kind)
       || typeof body.key !== 'string' || !body.key.trim() || body.key.length > 4096
       || keys.some((key) => !allowed.includes(key))
       || (body.kind !== 'snooze' && keys.length !== 2)

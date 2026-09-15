@@ -90,7 +90,7 @@ try {
 } catch {}
 const state = {
   mode: restoredMode, selected: 0, selectedKey: null, filter: null, focused: false, dock: restoredDock, collapsed: restoredCollapsed,
-  dismissed: new Set(), showDismissed: false, showRunning: restoredRunning, showRecent: restoredRecent, sent: new Set(),
+  dismissed: new Set(), markedRunning: new Set(), showDismissed: false, showRunning: restoredRunning, showRecent: restoredRecent, sent: new Set(),
   layouts: [{ name: 'Pinned', ids: [], cols: 0, role: 'pinned' }], layout: 0, editing: false, pickFilter: '', currentActions: {},
   ensureSelectedVisible: true, focusPane: null, pendingFocus: false, currentItem: null,
   focusMode: restoredFocus,
@@ -209,7 +209,8 @@ function sessionItem(kind, session, pane = session.pane) {
 }
 function runningItems() {
   const sessions = (data.sessions || [])
-    .filter((session) => ['running', 'waiting'].includes(session.state) && !session.reviewer && !isClosingSession(session.id, session.pane));
+    .filter((session) => (['running', 'waiting'].includes(session.state) || state.markedRunning.has(session.id))
+      && !session.reviewer && !isClosingSession(session.id, session.pane));
   const tasks = new Map((data.tasks || []).map((task) => [task.id, task]));
   const panes = paneMap();
   const createdAt = (session) => {
@@ -247,7 +248,9 @@ function recentItems() {
 function matchesTriageFilter(item) {
   return !state.filter || projectOf(item.project).key === state.filter;
 }
-function triageVisible(item) { return (item.kind === 'pinned' || !state.dismissed.has(itemKey(item))) && matchesTriageFilter(item); }
+function triageVisible(item) {
+  return (item.kind === 'pinned' || (item.kind === 'running' && isMarkedRunning(item)) || !state.dismissed.has(itemKey(item))) && matchesTriageFilter(item);
+}
 function retainedSelectionItem(item) {
   if (isClosingSession(item?.sessionId, item?.pane)) return null;
   if (state.paneTarget?.pane === item?.pane) {
@@ -328,13 +331,19 @@ function toast(message, action) {
     element.remove();
   };
 }
+// state.dismissed hides an item from Waiting on you; state.markedRunning is the
+// subset set aside with "Mark running", which still lists under Running & waiting.
 function deriveDismissed() {
   state.dismissed = new Set(Object.keys(data.setAside || {}));
+  state.markedRunning = new Set(Object.entries(data.setAside || {}).filter(([, entry]) => entry?.kind === 'running').map(([key]) => key));
   for (const [key, entry] of optimisticSetAside) {
     if (entry) state.dismissed.add(key);
     else state.dismissed.delete(key);
+    if (entry?.kind === 'running') state.markedRunning.add(key);
+    else state.markedRunning.delete(key);
   }
 }
+function isMarkedRunning(item) { return state.markedRunning.has(itemKey(item)); }
 function setAsideFor(item) {
   const key = itemKey(item);
   return optimisticSetAside.has(key) ? optimisticSetAside.get(key) : data.setAside?.[key] || null;
@@ -347,11 +356,14 @@ async function setAside(item, kind = 'dismiss', minutes) {
     kind, until: kind === 'snooze' ? now + (minutes || 60) * 60e3 : null, at: now, since: item.since,
   });
   state.dismissed.add(key);
+  if (kind === 'running') state.markedRunning.add(key);
   state.focused = false;
   refresh();
   try {
     await api.setAside(key, kind, minutes);
-    toast(kind === 'dependency' ? 'Waiting for dependency. New messages or changed dependencies bring it back.' : kind === 'snooze' ? 'Snoozed for 1 hour.' : 'Dismissed. Restore it from the collapsed row.', { label: 'Undo', run: () => restore(key) });
+    toast(kind === 'dependency' ? 'Waiting for dependency. New messages or changed dependencies bring it back.'
+      : kind === 'running' ? 'Moved to Running & waiting. A new message or a new turn brings it back.'
+      : kind === 'snooze' ? 'Snoozed for 1 hour.' : 'Dismissed. Restore it from the collapsed row.', { label: 'Undo', run: () => restore(key) });
   } catch (error) {
     optimisticSetAside.delete(key);
     deriveDismissed();
@@ -363,6 +375,7 @@ function dismiss(item) { return setAside(item, 'dismiss'); }
 async function restore(key) {
   optimisticSetAside.set(key, null);
   state.dismissed.delete(key);
+  state.markedRunning.delete(key);
   state.showDismissed = false;
   refresh();
   try {
@@ -964,7 +977,7 @@ function navigateHistory(entry, focus = true) {
 const ctx = {
   state, get data() { return data; }, closingSessions, isClosingSession, beginClose, esc, rel, projectOf, projectIcon, projectHTML, tagsHTML, knownProjects,
   queueItems, runningItems, pinnedItems, recentItems, triageItems, toggleCollapsed, toggleRunning, toggleRecent, setSelected,
-  itemKey, triageKey, eventKey, sessionFor, taskFor, paneMap, entityForPane, kindLabel, limitResumeFor, toast, dismiss, restore, setAside, setAsideFor,
+  itemKey, triageKey, eventKey, sessionFor, taskFor, paneMap, entityForPane, kindLabel, limitResumeFor, toast, dismiss, restore, setAside, setAsideFor, isMarkedRunning,
   pinPane, startShell, newSession, reopenSession, removePane, isPanePinned, knownPaneCount, saveLayouts, dropPane, mount, patchHTML, clearElement, refresh, reload,
   scheduleTerminalFit, setTerminalRenderer, setMode, setDock, toggleFocus, focusTerminal, focusDebug, retainedSelectionItem,
   detail(kind, item) { return item ? detailStore.peek(kind, item.id, item._detailVersion) : { status: 'idle', value: null, error: '' }; },

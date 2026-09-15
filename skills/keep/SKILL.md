@@ -308,7 +308,8 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   poll continues; hooks are observations, not proof that background work completed.
   Keep tracks Claude CronCreate/CronDelete as process-scoped scheduled jobs; for
   durable checks that must survive session closure, use `--check-after` plus `--check`.
-- Dismiss and snooze only hide a session from attention lists; they do not stop its
+- Dismiss, snooze, and Mark running only hide a session from attention lists (Mark
+  running lists it under Running & waiting until its next message or turn); they do not stop its
   process or cancel its card's checks. Explicit Close tries graceful exit then forces
   closure if needed. Restart resumes the conversation and is more conservative:
   it requires verified idle input and no unresolved background work. Do not use

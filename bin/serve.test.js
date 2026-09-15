@@ -623,6 +623,26 @@ test('dependency acknowledgement persists without a timer and clears on new work
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('mark running persists without a timer and clears on a new message, newer event, or gone session', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-setaside-running-'));
+  try {
+    const session = { id: 'background-session', mtime: 900, lastUserAt: 800 };
+    const question = { kind: 'input', sessionId: session.id, since: 1000 };
+    const candidates = (changes = {}, attention = [question]) => setAsideCandidates(attention.map((item) => ({ ...item })), [{ ...session, ...changes }]);
+    assert.deepEqual(updateSetAside({ key: session.id, kind: 'running' }, candidates(), { root, now: 2000 }), {
+      kind: 'running', until: null, at: 2000, since: 1000,
+    });
+    const store = readSetAside(root);
+    const remaining = (items) => applySetAside(items, { store, now: 30 * 86400e3, write: false }).value.items;
+    assert.deepEqual(Object.keys(remaining(candidates())), [session.id], 'survives reload and a long background job');
+    assert.deepEqual(remaining(candidates({ lastUserAt: 2500 })), {}, 'a new message clears it');
+    assert.deepEqual(remaining(candidates({}, [{ ...question, since: 3000 }])), {}, 'a newer turn clears it');
+    assert.deepEqual(remaining([]), {}, 'a gone session clears it');
+    assert.deepEqual(parseSetAsideRequest({ key: 'one', kind: 'running' }), { key: 'one', kind: 'running', minutes: null });
+    assert.throws(() => parseSetAsideRequest({ key: 'one', kind: 'running', minutes: 60 }), (error) => error.status === 400);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('set-aside requests validate kinds, keys, minutes, fields, and current attention', () => {
   assert.deepEqual(parseSetAsideRequest({ key: 'one', kind: 'snooze' }), { key: 'one', kind: 'snooze', minutes: 60 });
   assert.deepEqual(parseSetAsideRequest({ key: 'one', kind: 'snooze', minutes: 1440 }), { key: 'one', kind: 'snooze', minutes: 1440 });

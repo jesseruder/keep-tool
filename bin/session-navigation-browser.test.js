@@ -333,6 +333,24 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     state.attention = [{ ...attention(sessions[1]), pane: 'pb' }];
     for (const client of eventClients) client.write('data: changed\n\n');
     await wait("document.querySelector('#qlist [data-key=\"waiting:b\"]')");
+    // Mark running moves a misread idle session from Waiting on you into Running & waiting.
+    sessions[1].state = 'idle';
+    for (const client of eventClients) client.write('data: changed\n\n');
+    await wait("!document.querySelector('#qlist [data-key=\"running:b\"]')");
+    await evaluate("document.querySelector('#qlist [data-key=\"waiting:b\"]').click()");
+    await wait("document.querySelector('#stage [data-mark-running]')");
+    await evaluate("document.querySelector('#stage [data-mark-running]').click()");
+    await wait("!document.querySelector('#qlist [data-key=\"waiting:b\"]') && document.querySelector('#qlist [data-key=\"running:b\"]')?.textContent.includes('marked running')");
+    assert.equal(state.setAside.b.kind, 'running');
+    assert.equal(await evaluate("document.querySelector('[data-dismiss-toggle]')"), null, 'marked running is not listed as dismissed');
+    await evaluate("document.querySelector('#qlist [data-key=\"running:b\"]').click()");
+    await wait("document.querySelector('#stage [data-unmark-running]')");
+    await evaluate("document.querySelector('#stage [data-unmark-running]').click()");
+    await wait("document.querySelector('#qlist [data-key=\"waiting:b\"]') && !document.querySelector('#qlist [data-key=\"running:b\"]')");
+    assert.equal(state.setAside.b, undefined);
+    sessions[1].state = 'running';
+    for (const client of eventClients) client.write('data: changed\n\n');
+    await wait("document.querySelector('#qlist [data-key=\"running:b\"]')");
     await evaluate("document.querySelector('#qlist [data-key=\"running:a\"]').click()");
     await evaluate("for (const label of ['Running & waiting', 'Pinned', 'Recent']) { const button = [...document.querySelectorAll('#qlist .qtoggle')].find(el => el.textContent.includes(label)); if (button?.textContent.includes('▾')) button.click(); }");
     await wait("document.querySelector('#qlist [data-key=\"recent:a\"]')");
