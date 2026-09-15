@@ -3244,30 +3244,25 @@ function reviewerResumeSpec(session, pane, deps = {}) {
 
 // KEEP_REPAIR marks a session as a daemon self-repair agent, and `keep hook
 // pre-bash` refuses the restart and the live-checkout writes for anything that
-// carries it. The marker has to survive a restart, a force-restart, an account
-// handoff and a plain `keep resume`, so it is derived from a durable fact — the
-// card's `self-repair` tag — rather than from whatever the first launch passed.
-// A launch with no card behind it is not a repair session and gets nothing.
+// carries it. The first launch gets the marker from deps.launchEnv; a restart, a
+// force-restart, an account handoff or a plain reopen has only a session id, so it
+// asks the self-repair state whether that id is one the scheduler launched.
+//
+// Deliberately the launched session and nothing else. The repair CARD is not the
+// test: Owner opening his own session on one to look at the fix would inherit a
+// refusal on `keep restart-daemon`, which is exactly the restart he is there to do.
 function repairEnvFor(context, deps = {}) {
-  const tagged = (task) => Boolean(task && task.fm && (task.fm.tags || []).includes('self-repair'));
-  const loadTask = deps.loadTask || keep.loadTask;
+  const sessionId = context && context.sessionId;
+  if (!sessionId) return {};
   try {
-    if (context && context.taskId) {
-      let task;
-      try { task = loadTask(context.taskId); } catch { task = null; }
-      return tagged(task) ? { KEEP_REPAIR: '1' } : {};
-    }
-    if (context && context.sessionId) {
-      const task = (deps.loadAll || keep.loadAll)(true)
-        .find((candidate) => (candidate.fm.sessions || []).some((entry) => entry.id === context.sessionId));
-      return tagged(task) ? { KEEP_REPAIR: '1' } : {};
-    }
+    const isRepairSession = deps.isRepairSession || require('./self-repair.js').isRepairSession;
+    return isRepairSession(sessionId, deps.root || keep.ROOT) ? { KEEP_REPAIR: '1' } : {};
   } catch (error) {
-    // A registry that cannot be read must not stop a restart. It fails open on the
-    // marker, which is the same state as before this existed.
-    process.stderr.write(`keep serve: could not check the self-repair tag: ${String(error && error.message || error)}\n`);
+    // Unreadable state must not stop a restart. It fails open on the marker, which
+    // is the same state as before this existed.
+    process.stderr.write(`keep serve: could not check the self-repair session record: ${String(error && error.message || error)}\n`);
+    return {};
   }
-  return {};
 }
 
 function validatedCodexResumeCwd(agent, value) {
@@ -4746,7 +4741,9 @@ async function openSession(body, deps = {}) {
     const spawned = await hostRequest('spawn', {
       cmd: '/bin/zsh',
       args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`],
-      env: require('./agent-launcher').launcherEnv({ ...repairEnvFor({ taskId: body.taskId, sessionId }, deps), ...deps.launchEnv }),
+      // A resume of a recorded repair session re-earns the marker; a fresh launch
+      // carries it in deps.launchEnv, which the scheduler passes.
+      env: require('./agent-launcher').launcherEnv({ ...repairEnvFor({ sessionId }, deps), ...deps.launchEnv }),
       cwd: project,
       cols: 200,
       rows: 50,
@@ -7732,9 +7729,27 @@ function start(deps = {}) {
     onChange: broadcast,
     // The repair agent is an ordinary interactive session in the terminal host,
     // not a headless run that dies at the end of its turn. self-repair.js takes
-    // openSession through deps rather than requiring serve.js, which would be a
-    // cycle.
+    // these through deps rather than requiring serve.js, which would be a cycle.
     openSession: (body, openDeps) => openSession(body, openDeps),
+    // The spawn response can be lost after the pane is up — a host timeout, a
+    // daemon that died between the two. The host itself is the authority on
+    // whether this card already has an agent, so ask it before opening another.
+    findCardPane: async (cardId) => {
+      const panes = await listHostPanes({}, true);
+      if (!Array.isArray(panes)) return null;
+      const match = panes.find((pane) => pane && pane.alive && pane.agentAlive !== false
+        && pane.meta && pane.meta.card === cardId);
+      return match ? { pane: match.id, sessionId: match.meta.sessionId || null } : null;
+    },
+    // A recorded launch whose pane has since exited is not a launch any more. Null
+    // means "could not tell" — the caller leaves the entry alone rather than
+    // relaunching into a host it cannot see.
+    paneAlive: async (paneId) => {
+      const panes = await listHostPanes({}, true);
+      if (!Array.isArray(panes)) return null;
+      const match = panes.find((pane) => pane && pane.id === paneId);
+      return Boolean(match && match.alive && match.agentAlive !== false);
+    },
   });
   slack.startScheduler({ onChange: broadcast });
   discord.startScheduler({ onChange: broadcast });

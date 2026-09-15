@@ -4267,7 +4267,8 @@ commands['self-repair'] = async (argv) => {
     if (o.json) return process.stdout.write(JSON.stringify({ signature: o.reset, ...result }, null, 2) + '\n');
     if (!result.found) return console.log(`no such signature: ${o.reset}`);
     if (!result.cleared) {
-      return console.log(`${o.reset} still has an open card (${result.cardId}); close it first — one repair card per signature`);
+      return console.log(`${o.reset} has a live repair card (${result.cardId}${result.status ? `, ${result.status}` : ''}) with a confirmed session`
+        + `\none repair card per signature — let it finish, or close the card if it is not going to`);
     }
     return console.log(`cleared ${o.reset}; the next tick may open a fresh card for it`);
   }

@@ -4575,41 +4575,41 @@ test('an internal launchEnv reaches the pane shell, and a request body can never
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('KEEP_REPAIR comes from the card self-repair tag, so a restart cannot clear it', async () => {
-  const repair = { fm: { tags: ['personal', 'self-repair'], sessions: [{ id: 'repair-session', agent: 'claude' }] } };
-  const plain = { fm: { tags: ['personal'], sessions: [{ id: 'plain-session', agent: 'claude' }] } };
-  const loadTask = (id) => (id === 'repair-card' ? repair : id === 'plain-card' ? plain : null);
-  const loadAll = () => [repair, plain];
+test('KEEP_REPAIR follows the launched repair session, not the card it works on', async () => {
+  const isRepairSession = (id) => id === 'repair-session';
 
-  // By card, which is what an open on a card has.
-  assert.deepEqual(repairEnvFor({ taskId: 'repair-card' }, { loadTask }), { KEEP_REPAIR: '1' });
-  assert.deepEqual(repairEnvFor({ taskId: 'plain-card' }, { loadTask }), {});
-  // By session, which is all a restart, a force-restart or a handoff has.
-  assert.deepEqual(repairEnvFor({ sessionId: 'repair-session' }, { loadTask, loadAll }), { KEEP_REPAIR: '1' });
-  assert.deepEqual(repairEnvFor({ sessionId: 'plain-session' }, { loadTask, loadAll }), {});
-  // Nothing to go on, and a registry that cannot be read, both mark nothing.
-  assert.deepEqual(repairEnvFor({}, { loadTask, loadAll }), {});
-  assert.deepEqual(repairEnvFor({ taskId: 'gone' }, { loadTask: () => { throw new Error('no card'); } }), {});
+  // A restart, a force-restart or a handoff has only a session id, and the repair
+  // state is what says whether that id is the agent Keep launched.
+  assert.deepEqual(repairEnvFor({ sessionId: 'repair-session' }, { isRepairSession }), { KEEP_REPAIR: '1' });
+  // Owner's own session on the same repair card is not the repair agent: marking
+  // it would refuse him the `keep restart-daemon` the card exists to ask for.
+  assert.deepEqual(repairEnvFor({ sessionId: 'owners-session' }, { isRepairSession }), {});
+  // No session to identify, and unreadable state, both mark nothing.
+  assert.deepEqual(repairEnvFor({ taskId: 'repair-card' }, { isRepairSession }), {});
+  assert.deepEqual(repairEnvFor({}, { isRepairSession }), {});
+  assert.deepEqual(repairEnvFor({ sessionId: 'repair-session' },
+    { isRepairSession: () => { throw new Error('state is unreadable'); } }), {});
 
-  // …and it reaches the pane on an ordinary open, with no launchEnv passed at all.
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-repair-tag-'));
+  // …and a resume of a recorded repair session re-earns it at the pane.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-repair-session-'));
   try {
     const project = path.join(root, 'project');
     fs.mkdirSync(project, { recursive: true });
-    const spawnEnv = async (taskId) => {
-      const host = recordingHost((type) => type === 'spawn' ? { pane: { id: `pane-${taskId}` } } : {});
-      await openSession({ taskId, fresh: true, agent: 'claude' }, {
+    const spawnEnv = async (sessionId) => {
+      const host = recordingHost((type) => type === 'spawn' ? { pane: { id: `pane-${sessionId}` } } : {});
+      await openSession({ taskId: 'card', fresh: true, agent: 'claude' }, {
         host,
-        loadTask: () => ({ fm: { ...(taskId === 'repair-card' ? repair.fm : plain.fm), project, sessions: [] } }),
-        randomUUID: () => '55555555-5555-4555-8555-555555555555',
+        isRepairSession,
+        loadTask: () => ({ fm: { project, sessions: [] } }),
+        randomUUID: () => sessionId,
         waitForHostAgent: async () => true,
         trustProject: () => true,
         linkLaunchedSession: () => true,
       });
       return host.calls.find((call) => call.type === 'spawn').params.env;
     };
-    assert.equal((await spawnEnv('repair-card')).KEEP_REPAIR, '1');
-    assert.equal('KEEP_REPAIR' in await spawnEnv('plain-card'), false);
+    assert.equal((await spawnEnv('repair-session')).KEEP_REPAIR, '1');
+    assert.equal('KEEP_REPAIR' in await spawnEnv('owners-session'), false);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

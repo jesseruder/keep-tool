@@ -299,6 +299,10 @@ function harness(options = {}) {
       return Promise.resolve(options.worktree || { ok: true, path: `/tmp/wt/keep-tool/${name}` });
     },
     insideWorktreeRoot: options.insideWorktreeRoot || (() => true),
+    // No host by default: both answer "could not tell", which is what a daemon with
+    // no terminal host sees, and neither may make anything happen on its own.
+    findCardPane: options.findCardPane || (async () => null),
+    paneAlive: options.paneAlive || (async () => null),
     accountId: () => options.accountId || 'claude-repair',
     worktreePath: (name) => `/tmp/wt/keep-tool/${name}`,
     openSession: async (body, openDeps) => {
@@ -465,7 +469,7 @@ test('a worktree that cannot be created leaves the card and skips the launch', a
     assert.equal(result.opened[0].launched, false);
     assert.equal(calls.runs.length, 0, 'no agent is launched without a worktree');
     assert.match(calls.checkins.at(-1).message, /Could not create the worktree/);
-    assert.match(calls.checkins.at(-1).message, /keep resume/);
+    assert.match(calls.checkins.at(-1).message, /a manual `keep open` on it/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -594,11 +598,33 @@ test('keep self-repair prints state, dry-runs, and toggles the config', () => {
     assert.match(cli('--dry').stdout, /self-repair is disabled/);
     assert.equal(cli('--enable').status, 0);
 
-    // --reset refuses while the card is open: one repair card per signature is
+    // --reset refuses while the card is live: one repair card per signature is
     // the invariant the whole scheduler rests on.
+    fs.writeFileSync(path.join(root, 'tasks', 'a-repair-card.md'), [
+      '---', 'title: Daemon self-repair: review', 'status: active', 'kind: task',
+      'tags: [personal, self-repair]', 'created: 2026-09-15', 'updated: 2026-09-15T12:00', '---', '',
+    ].join('\n'));
     const refused = cli('--reset', 'sched:review:abcd1234');
-    assert.match(refused.stdout, /still has an open card \(a-repair-card\); close it first/);
+    assert.match(refused.stdout, /has a live repair card \(a-repair-card, active\) with a confirmed session/);
     assert.equal(selfRepair.loadState(root).signatures['sched:review:abcd1234'].cardId, 'a-repair-card');
+
+    // A card that has been closed is not a live card, so the signature can clear
+    // rather than needing state.json edited by hand.
+    fs.writeFileSync(path.join(root, 'tasks', 'a-repair-card.md'), [
+      '---', 'title: Daemon self-repair: review', 'status: done', 'kind: task',
+      'tags: [personal, self-repair]', 'created: 2026-09-15', 'updated: 2026-09-15T12:00', '---', '',
+    ].join('\n'));
+    assert.match(cli('--reset', 'sched:review:abcd1234').stdout, /cleared sched:review:abcd1234/);
+    selfRepair.mutateState((state) => {
+      state.signatures['sched:review:abcd1234'] = {
+        firstSeenAt: NOW, cardId: 'a-repair-card', sessionId: 'aaaaaaaa-0000-4000-8000-000000000000',
+        pane: 'pane-7', openedAt: NOW, attempts: 1,
+      };
+    }, { root, now: NOW });
+    fs.writeFileSync(path.join(root, 'tasks', 'a-repair-card.md'), [
+      '---', 'title: Daemon self-repair: review', 'status: active', 'kind: task',
+      'tags: [personal, self-repair]', 'created: 2026-09-15', 'updated: 2026-09-15T12:00', '---', '',
+    ].join('\n'));
 
     // Once it has resolved, --reset clears the cooldown and keeps the card as the
     // link the next one cites.
@@ -688,7 +714,7 @@ test('a session that cannot be opened is said on the card, and the next tick tri
     assert.equal(opened.opened[0].launched, false);
     assert.equal(opened.opened[0].sessionId, null);
     assert.match(calls.checkins.at(-1).message, /the repair session could not be opened: terminal host is unavailable/);
-    assert.match(calls.checkins.at(-1).message, /keep resume repair-card-1/);
+    assert.match(calls.checkins.at(-1).message, /Open it by hand with `keep open repair-card-1`/);
 
     // Nothing is running, so the card must not read as launched.
     const entry = selfRepair.loadState(root).signatures[opened.opened[0].sig];
@@ -722,7 +748,8 @@ test('an open that fails with a pane attached counts as launched and is never re
     const note = calls.checkins.at(-1);
     assert.match(note.message, /opened in pane pane-orphan \(session abcd1234\)/);
     assert.match(note.message, /could not be confirmed: the pane stopped echoing/);
-    assert.match(note.message, /do not resume this card by hand/);
+    assert.match(note.message, /Look at that pane before doing anything/);
+    assert.match(note.message, /keep self-repair --reset sched:unblock:/);
 
     const sig = opened.opened[0].sig;
     const entry = selfRepair.loadState(root).signatures[sig];
@@ -736,14 +763,98 @@ test('an open that fails with a pane attached counts as launched and is never re
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('an entry an older keep-tool wrote still reads as launched', () => {
+test('a legacy runId blocks while the old run could still be alive, then stops', () => {
   const config = { ...selfRepair.DEFAULT_CONFIG };
   // Before repairs were sessions the launch was recorded as runId. An upgraded
-  // daemon that read this as "never launched" would put a second agent on it.
-  const old = { cardId: 'a-repair-card', runId: 'run-1', lastAttemptAt: 0 };
-  assert.match(selfRepair.resumeBlocker(old, config, NOW), /already open for this signature \(session run-1\)/);
-  assert.equal(selfRepair.resumeBlocker({ cardId: 'a-repair-card', lastAttemptAt: 0 }, config, NOW), '',
-    'and an entry with none of the three is still resumable');
+  // daemon that read a fresh one as "never launched" would put a second agent on
+  // it — but those runs were killed at budgetMin, capped at 90 minutes, so an old
+  // entry is certainly dead and must not hold its signature open forever.
+  const old = (age) => ({ cardId: 'a-repair-card', runId: 'run-1', lastAttemptAt: NOW - age });
+  assert.match(selfRepair.resumeBlocker(old(60 * 60e3), config, NOW), /already open for this signature \(run run-1\)/);
+  assert.equal(selfRepair.resumeBlocker(old(91 * 60e3), config, NOW), '',
+    'past the old wall-clock cap the run is dead and the signature resumes');
+  assert.equal(selfRepair.LEGACY_RUN_TTL_MS, selfRepair.MAX_BUDGET_MIN * 60e3);
+  // A session or a pane still blocks whatever its age: those are not killed.
+  assert.match(selfRepair.resumeBlocker({ cardId: 'c', pane: 'pane-9', lastAttemptAt: 0 }, config, NOW),
+    /already open for this signature \(session pane-9\)/);
+  assert.equal(selfRepair.resumeBlocker({ cardId: 'c', lastAttemptAt: 0 }, config, NOW), '');
+});
+
+test('a card that already has a live pane is never given a second session', async () => {
+  const root = makeRoot();
+  try {
+    const snapshot = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const config = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 };
+    const { deps, calls } = harness({ root, snapshot, config });
+    // The spawn response was lost after the pane came up. The host still knows.
+    deps.findCardPane = async (cardId) => ({ pane: `pane-of-${cardId}`, sessionId: 'eeee1111-0000-4000-8000-000000000000' });
+
+    const opened = await selfRepair.tick(deps);
+    assert.equal(opened.opened[0].launched, true);
+    assert.equal(calls.runs.length, 0, 'the host said there is already an agent, so none was opened');
+    assert.match(calls.checkins.at(-1).message, /Found the repair session already running in pane pane-of-repair-card-1 \(session eeee1111\)/);
+    const entry = selfRepair.loadState(root).signatures[opened.opened[0].sig];
+    assert.equal(entry.pane, 'pane-of-repair-card-1');
+    assert.equal(entry.sessionId, 'eeee1111-0000-4000-8000-000000000000');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a recorded pane that has exited is relaunched, and --reset can clear what is stuck', async () => {
+  const root = makeRoot();
+  try {
+    const snapshot = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const config = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 };
+    const { deps, calls } = harness({ root, snapshot, config });
+    const opened = await selfRepair.tick(deps);
+    const sig = opened.opened[0].sig;
+    assert.equal(selfRepair.loadState(root).signatures[sig].pane, 'pane-1');
+
+    // A host that cannot be reached says null, and null is not "gone".
+    const unknown = await selfRepair.tick({ ...deps, paneAlive: async () => null, now: NOW + 60e3 });
+    assert.equal(unknown.relaunching, undefined);
+    assert.equal(selfRepair.loadState(root).signatures[sig].pane, 'pane-1');
+
+    // The agent exited without landing. The signature must not stay wedged on it.
+    const dead = { ...deps, paneAlive: async () => false };
+    const swept = await selfRepair.tick({ ...dead, now: NOW + 2 * 60e3 });
+    assert.equal(swept.relaunching.length, 1);
+    assert.equal(swept.relaunching[0].pane, 'pane-1');
+    assert.match(calls.checkins.find((entry) => /exited without landing/.test(entry.message)).message,
+      /The repair session in pane pane-1 exited without landing; relaunching \(attempt 2 of 3\)/);
+    // …and the same tick relaunches it onto the card it already has.
+    assert.equal(swept.resumed.length, 1);
+    assert.equal(calls.runs.length, 2);
+    assert.equal(calls.cards.length, 1, 'still one card for the signature');
+    assert.equal(selfRepair.loadState(root).signatures[sig].pane, 'pane-2');
+
+    // --reset refuses while the card is live and its launch was confirmed…
+    const live = selfRepair.reset(sig, { root, now: NOW, loadTask: () => ({ fm: { status: 'active' } }) });
+    assert.equal(live.cleared, false);
+    assert.equal(live.status, 'active');
+    // …but a card that is done is not a live card, whatever the entry says.
+    const done = selfRepair.reset(sig, { root, now: NOW, loadTask: () => ({ fm: { status: 'done' } }) });
+    assert.equal(done.cleared, true);
+    assert.equal(selfRepair.loadState(root).signatures[sig].cardId, undefined);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('only the session Keep launched is marked as the repair agent', () => {
+  const root = makeRoot();
+  try {
+    selfRepair.mutateState((state) => {
+      state.signatures['sched:unblock:abcd1234'] = { cardId: 'a-repair-card', sessionId: 'agent-session', pane: 'pane-1' };
+    }, { root, now: NOW });
+    assert.equal(selfRepair.isRepairSession('agent-session', root), true);
+    // Owner's own session on the repair card is not the repair agent: marking it
+    // would refuse him the `keep restart-daemon` the card exists to ask him for.
+    assert.equal(selfRepair.isRepairSession('owners-session', root), false);
+    assert.equal(selfRepair.isRepairSession('', root), false);
+    assert.equal(selfRepair.isRepairSession(undefined, root), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('a launch that keeps failing gives up instead of retrying forever', async () => {

@@ -50,6 +50,10 @@ const MAX_LAUNCH_ATTEMPTS = 3;
 const RESUME_BACKOFF_MS = 15 * MINUTE_MS;
 // Advisory only: the recipe asks the session to check in rather than run past it.
 const MAX_BUDGET_MIN = 90;
+// How long a `runId` from the pre-session code still counts as launched. Those
+// runs were killed at budgetMin, which was capped at MAX_BUDGET_MIN, so past that
+// the run is dead whatever the entry says.
+const LEGACY_RUN_TTL_MS = MAX_BUDGET_MIN * MINUTE_MS;
 const REPO = 'keep-tool';
 
 const ZERO_IS_MEANINGFUL = new Set(['maxPerDay', 'restartsPerHour']);
@@ -649,8 +653,8 @@ function buildRecipe(context) {
     'Hard constraints:',
     '- Never edit, commit, or run git writes in ~/keep-tool: that is the live daemon checkout. Only this worktree.',
     '- Never restart the daemon. `keep restart-daemon`, `keep service`, and `launchctl` are refused for you',
-    '  (this card carries the `self-repair` tag, so every launch of this session sets KEEP_REPAIR=1 and the',
-    '  pre-bash guard blocks them — a restart or a handoff does not clear it). Owner restarts the daemon.',
+    '  (KEEP_REPAIR=1 is set for you and the pre-bash guard blocks them; Keep recorded this session as the repair',
+    '  agent, so a restart, a force-restart or a handoff re-sets it). Owner restarts the daemon.',
     '- Never `git push --force` and never `wt land`; landing goes through `keep land`, which enforces the review record.',
     '- Fix this signature\'s root cause and nothing else. A broad refactor cannot be reviewed from here.',
     `- Aim to finish within ${config.budgetMin} minutes; check in on the card if it will take longer.`,
@@ -676,10 +680,25 @@ function defaultDeps(deps) {
     accountId: deps.accountId || repairAccountId,
     worktreePath: deps.worktreePath || ((name) => worktreePath(name)),
     findRecipe: deps.findRecipe || ((cardId) => findRecipeArtifact(cardId, deps.root || keep.ROOT)),
+    // Both wired from serve.js, which owns the host client. Without a host there is
+    // nothing to ask, and both answer "I could not tell" rather than "no".
+    findCardPane: deps.findCardPane || (async () => null),
+    paneAlive: deps.paneAlive || (async () => null),
     insideWorktreeRoot: deps.insideWorktreeRoot || ((candidate) => require('./runs.js').insideWorktreeRoot(candidate)),
     setPlan: deps.setPlan || ((task, steps) => keep.setPlan(task, steps)),
     onChange: deps.onChange || (() => {}),
   };
+}
+
+// Whether this session id is one THIS scheduler launched. The guard that refuses
+// `keep restart-daemon` keys on it, so it has to be the launched agent and only
+// that: Owner opening his own session on a repair card is not a repair agent, and
+// refusing his restart would be a bug he has to read this file to explain.
+// serve.js calls this; nothing here requires serve.js, which keeps the cycle away.
+function isRepairSession(sessionId, root = keep.ROOT) {
+  if (!sessionId || typeof sessionId !== 'string') return false;
+  const entries = loadState(root).signatures;
+  return Object.values(entries).some((entry) => entry && entry.sessionId === sessionId);
 }
 
 // The recipe artifact for a card, when state does not have it: a daemon that died
@@ -690,7 +709,10 @@ function findRecipeArtifact(cardId, root = keep.ROOT) {
   const directory = path.join(root, '.keep', 'artifacts', cardId);
   try {
     const names = fs.readdirSync(directory).filter((name) => /^recipe.*\.md$/i.test(name)).sort();
-    return names.length ? path.join(directory, names[0]) : '';
+    // An exact recipe.md is the one this scheduler wrote; a recipe-2.md is what the
+    // artifact store renamed a second copy to, and the first one is still the right one.
+    const exact = names.find((name) => name === 'recipe.md');
+    return exact ? path.join(directory, exact) : names.length ? path.join(directory, names[0]) : '';
   } catch { return ''; }
 }
 
@@ -733,13 +755,13 @@ function openingMessage(context) {
   ].join('\n');
 }
 
-function launchNote(candidate, cardId, worktree, opened, config, artifacts) {
+function launchNote(candidate, cardId, worktree, opened, config, artifacts, model) {
   const sessionId = opened && opened.sessionId ? String(opened.sessionId) : '';
   return [
     `Self-repair launched for ${candidate.sig}.`,
     `Worktree: ${worktree} (branch wt/${worktreeName(candidate.sig)}).`,
     `Session: ${sessionId ? sessionId.slice(0, 8) : 'unknown'} in pane ${(opened && opened.pane) || 'unknown'};`
-      + ` account purpose: repair; model: ${config.model}; aim: ${config.budgetMin}m.`,
+      + ` account purpose: repair; model: ${model || config.model}; aim: ${config.budgetMin}m.`,
     artifacts.length ? `Evidence: ${artifacts.join(', ')}.` : 'Evidence: none stored.',
     'The agent may not restart the daemon; Owner does that after the fix lands.',
   ].join('\n');
@@ -815,7 +837,7 @@ async function launchRepair(candidate, cardId, artifacts, context) {
   if (!created || !created.ok) {
     deps.checkin(cardId, {
       heading: 'self-repair',
-      message: `Could not create the worktree ${REPO}/${name}: ${created && created.error || 'unknown error'}. No agent was launched; the card stands for a human or a manual \`keep resume\`.`,
+      message: `Could not create the worktree ${REPO}/${name}: ${created && created.error || 'unknown error'}. No agent was launched; the card stands for a human or a manual \`keep open\` on it.`,
       linkSession: false,
       commitLabel: SELF_NAME,
     });
@@ -835,6 +857,28 @@ async function launchRepair(candidate, cardId, artifacts, context) {
     return { cardId, artifacts, launched: false, worktreeError: `${created.path} is not inside the worktree root` };
   }
 
+  // The host is the authority on whether this card already has an agent. A spawn
+  // response lost after the pane came up — a host timeout, a daemon that died
+  // between the two — leaves state saying "not launched" about a live agent, and
+  // opening a second one is the failure this whole scheduler is built to avoid.
+  let existing = null;
+  try { existing = await deps.findCardPane(cardId); }
+  catch (error) { deps.write(`keep self-repair: could not ask the host about ${cardId}: ${clip(error && error.message || error, 200)}\n`); }
+  if (existing && existing.pane) {
+    deps.checkin(cardId, {
+      heading: 'self-repair',
+      message: `Found the repair session already running in pane ${existing.pane}`
+        + `${existing.sessionId ? ` (session ${String(existing.sessionId).slice(0, 8)})` : ''};`
+        + ' no second session was opened.',
+      linkSession: false,
+      commitLabel: SELF_NAME,
+    });
+    return {
+      cardId, artifacts, worktree: created.path, launched: true,
+      sessionId: existing.sessionId || null, pane: existing.pane, reused: true,
+    };
+  }
+
   // A resume after a crash may have lost the recipe path without losing the file.
   const recipePath = recipe || deps.findRecipe(cardId);
 
@@ -843,6 +887,9 @@ async function launchRepair(candidate, cardId, artifacts, context) {
   // ends when its turn ends, which killed the first live repair mid-review, with
   // no `keep reviewed` record and nothing landed. Card check-ins, the turn watcher
   // and the fleet reviewer track this one instead.
+  // Resolved once, so the check-in names the model the session actually got rather
+  // than the configured one a bad KEEP_REPAIR_MODEL would have been ignored for.
+  const model = launchModel(config, process.env, deps.write);
   let opened = null;
   try {
     opened = await deps.openSession({
@@ -851,7 +898,7 @@ async function launchRepair(candidate, cardId, artifacts, context) {
       cwd: created.path,
       agent: 'claude',
       accountId: deps.accountId(),
-      model: launchModel(config, process.env, deps.write),
+      model,
       message: openingMessage({ candidate, cardId, worktree: created.path, recipe: recipePath }),
     }, { launchEnv: { KEEP_REPAIR: '1' } });
   } catch (error) {
@@ -865,7 +912,8 @@ async function launchRepair(candidate, cardId, artifacts, context) {
         heading: 'self-repair',
         message: `A repair session opened in pane ${started.pane}${started.sessionId ? ` (session ${String(started.sessionId).slice(0, 8)})` : ''},`
           + ` but the launch could not be confirmed: ${clip(error && error.message || error, 300)}.`
-          + ` It is running — do not resume this card by hand; look at the pane. The recipe is on this card.`,
+          + ` Look at that pane before doing anything: it is probably running. If it has already exited,`
+          + ` the next tick relaunches it; \`keep self-repair --reset ${candidate.sig}\` forces that now.`,
         linkSession: false,
         commitLabel: SELF_NAME,
       });
@@ -878,7 +926,7 @@ async function launchRepair(candidate, cardId, artifacts, context) {
     }
     deps.checkin(cardId, {
       heading: 'self-repair',
-      message: `Worktree ${created.path} is ready but the repair session could not be opened: ${clip(error && error.message || error, 300)}. Resume it by hand with \`keep resume ${cardId}\`.`,
+      message: `Worktree ${created.path} is ready but the repair session could not be opened: ${clip(error && error.message || error, 300)}. Open it by hand with \`keep open ${cardId}\`.`,
       linkSession: false,
       commitLabel: SELF_NAME,
     });
@@ -887,7 +935,7 @@ async function launchRepair(candidate, cardId, artifacts, context) {
 
   deps.checkin(cardId, {
     heading: 'self-repair',
-    message: launchNote(candidate, cardId, created.path, opened, config, artifacts),
+    message: launchNote(candidate, cardId, created.path, opened, config, artifacts, model),
     linkSession: false,
     commitLabel: SELF_NAME,
   });
@@ -903,12 +951,17 @@ async function launchRepair(candidate, cardId, artifacts, context) {
 
 // Why a reserved-but-unlaunched card is not resumed on this tick, or '' if it is.
 // A pane with no session id registered yet still blocks: an agent is running in
-// it, and a second one on the same fault is worse than a missing id. `runId` is
-// the pre-session spelling — an entry written by an older keep-tool must not read
-// as never launched and get a second agent on the first tick after an upgrade.
+// it, and a second one on the same fault is worse than a missing id.
 function resumeBlocker(entry, config, now) {
-  const launched = entry.sessionId || entry.pane || entry.runId;
+  const launched = entry.sessionId || entry.pane;
   if (launched) return `card ${entry.cardId} is already open for this signature (session ${String(launched).slice(0, 8)})`;
+  // `runId` is the pre-session spelling, from a headless run. Those were killed at
+  // budgetMin, capped at 90 minutes, so after that the run is certainly dead and
+  // the entry is not launched — otherwise a card opened by the old code wedges its
+  // signature forever. Inside the window it still blocks: the run may be working.
+  if (entry.runId && now - (Number(entry.lastAttemptAt) || 0) < LEGACY_RUN_TTL_MS) {
+    return `card ${entry.cardId} is already open for this signature (run ${entry.runId})`;
+  }
   if (!config.launch) return `card ${entry.cardId} is already open for this signature; launching is off`;
   if (entry.launchGaveUp) return `card ${entry.cardId} is open but its launch failed ${MAX_LAUNCH_ATTEMPTS} times; resume it by hand`;
   const since = now - (Number(entry.lastAttemptAt) || 0);
@@ -1012,7 +1065,40 @@ async function tick(input = {}) {
     }
   }
 
-  // Opening. A signature with a reserved card but no run id is a launch that did
+  // Liveness. A recorded launch is only a launch while its pane is still running:
+  // an agent that exited without landing would otherwise hold its signature open
+  // forever, which is the same wedge a stale runId used to be. A pane that is gone
+  // clears the session so the resume path below relaunches — attempts is kept, so
+  // this still gives up after MAX_LAUNCH_ATTEMPTS rather than looping.
+  for (const [sig, entry] of Object.entries(loadState(root).signatures)) {
+    if (!entry || !entry.cardId || entry.resolvedAt || !entry.pane) continue;
+    let alive;
+    try { alive = await deps.paneAlive(entry.pane); }
+    catch (error) { result.errors.push(`pane ${entry.pane}: ${clip(error && error.message || error, 200)}`); continue; }
+    // null is "could not tell" — no host, or a host that did not answer. Leave it.
+    if (alive !== false) continue;
+    const attempts = Number(entry.attempts || 0);
+    mutateState((value) => {
+      const fresh = value.signatures[sig];
+      if (!fresh || fresh.pane !== entry.pane) return;
+      fresh.sessionId = null;
+      fresh.pane = null;
+      fresh.lastAttemptAt = 0;
+    }, { root, now, write: deps.write });
+    try {
+      deps.checkin(entry.cardId, {
+        heading: 'self-repair',
+        message: `The repair session in pane ${entry.pane} exited without landing;`
+          + ` relaunching (attempt ${attempts + 1} of ${MAX_LAUNCH_ATTEMPTS}).`,
+        linkSession: false,
+        commitLabel: SELF_NAME,
+      });
+    } catch (error) { result.errors.push(`checkin ${entry.cardId}: ${clip(error && error.message || error, 200)}`); }
+    result.relaunching = [...(result.relaunching || []), { sig, cardId: entry.cardId, pane: entry.pane }];
+    deps.write(`keep self-repair: pane ${entry.pane} for ${entry.cardId} is gone; the next launch will relaunch it\n`);
+  }
+
+  // Opening. A signature with a reserved card but no session is a launch that did
   // not finish — the daemon died during the worktree build, or the build failed.
   // It resumes that launch rather than opening a second card.
   let openedToday = Number(state.openedToday || 0);
@@ -1037,6 +1123,8 @@ async function tick(input = {}) {
             fresh.sessionId = resumed.sessionId || null;
             fresh.pane = resumed.pane || null;
             fresh.worktree = resumed.worktree || null;
+            if (resumed.launchError) fresh.launchError = clip(resumed.launchError, 300);
+            else delete fresh.launchError;
           } else if (attempts >= MAX_LAUNCH_ATTEMPTS) fresh.launchGaveUp = true;
         }, { root, now, write: deps.write });
         result.resumed.push({ sig: candidate.sig, cardId: entry.cardId, sessionId: resumed.sessionId || null, launched: resumed.launched });
@@ -1134,6 +1222,8 @@ async function tick(input = {}) {
       fresh.sessionId = launched.sessionId || null;
       fresh.pane = launched.pane || null;
       fresh.worktree = launched.worktree || null;
+      if (launched.launchError) fresh.launchError = clip(launched.launchError, 300);
+      else delete fresh.launchError;
     }, { root, now, write: deps.write });
     result.opened.push({ sig: candidate.sig, cardId: card.cardId, sessionId: launched.sessionId || null, worktree: launched.worktree || null, launched: Boolean(launched.launched) });
     deps.write(`keep self-repair: opened ${card.cardId} for ${candidate.sig}${launched.launched ? ` (session ${String(launched.sessionId || launched.pane || '?').slice(0, 8)})` : ''}\n`);
@@ -1256,11 +1346,23 @@ function renderDry(value) {
 function reset(sig, options = {}) {
   const root = options.root || keep.ROOT;
   const now = Number.isFinite(options.now) ? options.now : Date.now();
+  // An archived card is not in tasks/, so loadTask throws and it reads as closed,
+  // which is what it is.
+  const loadTask = options.loadTask || ((id) => { try { return keep.loadTask(id, root); } catch { return null; } });
   return mutateState((state) => {
     const entry = state.signatures[sig];
     if (!entry) return { found: false, cleared: false };
     if (entry.cardId && !entry.resolvedAt && !entry.cooldownUntil) {
-      return { found: true, cleared: false, cardId: entry.cardId };
+      // A card that is done or archived is not an open card, whatever the entry
+      // says, and a launch that was never confirmed left nothing to collide with.
+      // Refusing those was how a signature got stuck with no way out but editing
+      // state.json by hand.
+      const task = loadTask(entry.cardId);
+      const status = task && task.fm && task.fm.status;
+      const closed = !task || ['done', 'archived'].includes(String(status || ''));
+      if (!closed && !entry.launchError) {
+        return { found: true, cleared: false, cardId: entry.cardId, status: status || null };
+      }
     }
     // The card stays on the record, as the link the next one cites.
     if (entry.cardId) entry.previousCardId = entry.cardId;
@@ -1275,6 +1377,7 @@ function reset(sig, options = {}) {
     delete entry.worktree;
     delete entry.artifacts;
     delete entry.launchGaveUp;
+    delete entry.launchError;
     delete entry.attempts;
     delete entry.firstSeenAt;
     entry.ticks = 0;
@@ -1289,7 +1392,7 @@ module.exports = {
   normalizeError, signatureHash, signatures, signatureClear, deliveryRowOf,
   readTail, readLogExcerpt, scrubBlock, redactSecrets, collectEvidence, stageEvidence, deliveryEvidence,
   cardTitle, symptomNote, buildRecipe, openingMessage, repairAccountId,
-  findRecipeArtifact, launchModel,
+  findRecipeArtifact, launchModel, isRepairSession, LEGACY_RUN_TTL_MS,
   worktreeName, worktreePath, spawnWorktree, worktreeReady,
   createRepairCard, launchRepair, resumeBlocker, EXCLUDED, MAX_LAUNCH_ATTEMPTS, RESUME_BACKOFF_MS,
   tick, startScheduler, status, renderStatus, dryRun, renderDry, reset,
