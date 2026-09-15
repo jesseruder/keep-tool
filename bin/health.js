@@ -369,6 +369,7 @@ module.exports = {
   FILE,
   VERSION,
   CADENCES,
+  RETIRED,
   record,
   stateOf,
   presentationOf,

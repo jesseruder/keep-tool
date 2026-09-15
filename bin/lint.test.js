@@ -742,6 +742,7 @@ test('daemon-health folds every failing scheduler into one finding', () => {
       ideas: { consecutiveFailures: 0, lastOkAt: now - 3 * 86400e3 },
       slack: { consecutiveFailures: 1, lastOkAt: now - 60e3 },
       discord: { disabled: true, consecutiveFailures: 99 },
+      'review-questions': { consecutiveFailures: 40, lastError: 'retired scheduler' },
     }));
     const findings = lint({ root, rule: 'daemon-health', now }).findings;
     assert.equal(findings.length, 1, 'one finding for the whole daemon, not one per card');
@@ -750,6 +751,7 @@ test('daemon-health folds every failing scheduler into one finding', () => {
     assert.match(findings[0].text, /\+1 more \(review\)/);
     assert.equal(findings[0].text.includes('slack'), false, 'one failure is not a failing scheduler');
     assert.equal(findings[0].text.includes('discord'), false, 'a disabled scheduler is not a failure');
+    assert.equal(findings[0].text.includes('review-questions'), false, 'a retired scheduler is nobody\'s problem');
 
     fs.writeFileSync(path.join(root, '.keep', 'health.json'), JSON.stringify({ review: { consecutiveFailures: 0, lastOkAt: now - 60e3 } }));
     assert.deepEqual(lint({ root, rule: 'daemon-health', now }).findings, []);

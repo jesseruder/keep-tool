@@ -640,8 +640,10 @@ function daemonHealth(_task, ctx) {
   catch { return []; }
   if (!store || typeof store !== 'object') return [];
   const problems = [];
+  // A retired scheduler's row lingers from an older daemon and is nobody's problem.
+  const retired = (() => { try { return require('./health.js').RETIRED; } catch { return new Set(); } })();
   for (const [name, entry] of Object.entries(store)) {
-    if (name === 'daemon' || !entry || typeof entry !== 'object' || entry.disabled === true) continue;
+    if (name === 'daemon' || retired.has(name) || !entry || typeof entry !== 'object' || entry.disabled === true) continue;
     const failures = Number(entry.consecutiveFailures || 0);
     const lastOkAt = Number(entry.lastOkAt || 0);
     if (failures >= 3) {
