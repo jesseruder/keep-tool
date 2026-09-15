@@ -883,7 +883,8 @@ Keep opens at most one scheduler session per card per local day and three per sc
 tick. That bookkeeping is persisted to `.keep/runs/scheduler-state.json`, so a daemon
 restart does not hand every card a second pane. It opens none at all while the `checks`
 automation account's weekly or 5h window is exhausted: that records one `check deferred`
-check-in per card per day (at most three cards a tick; the rest are logged only),
+check-in per card per day (at most three *written* notices a tick; a card already
+noticed today costs nothing, and the rest are logged only),
 changes neither the status nor the schedule, and leaves the card overdue for the tick
 after the reset. An *unreadable* usage snapshot is not treated as no budget — that would
 stop every card on the board. `KEEP_CHECK_MODEL`, when set, is both the model the opened
@@ -895,19 +896,32 @@ Sessions Keep opens this way are marked `ephemeral: check` on their host pane. A
 the same scheduler tick closes such a pane once its session has ended its turn and the
 card carries a check-in from that session since the launch, or after 60 minutes with no
 check-in at all. A session mid-turn is never closed. The close runs through the
-automatic-retirement path: an unsent draft, a modal prompt, a pending question,
-unverified background work, or a session that changed under the sweep all refuse the
-close outright — the pane is left alone and reconsidered next tick, never signalled
-anyway — and the signals that do follow a successful `/exit` are guarded by pid, session
-id and input/output counts. A pane the sweep closed is then removed from the terminal
-host so a dead one is not re-decided every minute. Restarting such a pane, or moving it
-to another account, drops the `ephemeral` mark: it becomes an ordinary session that
-nothing reaps.
+unattended-retirement path with `{ automatic: true, ephemeral: true, idleMs: 0 }`: every
+automatic guard applies — an unsent draft, a modal prompt, a pending question, unverified
+background work, a viewer who attached, recent pane input or output, a pinned pane, a
+session that changed under the sweep, or a pane that stopped carrying `ephemeral` all
+refuse the close outright, and the pane is left alone and reconsidered next tick rather
+than signalled anyway. `ephemeral` only excuses the card's own `check_after`, `needs` and
+`depends_on` from pinning the pane (the session Keep opened is the one that just re-armed
+that schedule), and `idleMs: 0` is what lets a pane that has just finished its check close
+now instead of in eight hours. The signals that do follow a successful `/exit` are guarded
+by pid, session id and input/output counts. A pane the sweep closed is then removed from
+the terminal host so a dead one is not re-decided every minute; if the host refuses to
+remove it — usually because it is alive again — the pane is not reported closed and its
+card is left exactly as it was. Restarting such a pane, or moving it to another account,
+drops the `ephemeral` mark: it becomes an ordinary session that nothing reaps.
 
-If a scheduler-opened session is reaped without having written anything to its card,
-Keep clears the delivery stamp, records one `check session <id8> ended without recording
-a result` check-in, and grants that card one extra open for the day, so a crashed session
-can never make a check disappear until tomorrow.
+An older terminal host that does not advertise `guardedKill` refuses the guarded signals,
+so a check pane that will not exit gracefully on such a host is never force-closed and
+accumulates. That is deliberate — an unguarded kill is how the wrong process dies — and
+the fix is to restart the host, not to drop the guard.
+
+If a scheduler-opened session is reaped without having written anything to its card, and
+the delivery stamp on that card is still the one that session wrote, Keep clears the
+stamp, records one `check session <id8> ended without recording a result` check-in, and
+grants that card one extra open for the day, so a crashed session can never make a check
+disappear until tomorrow. If the card was rescheduled and re-delivered to somebody else
+in the meantime, that newer stamp stands and nothing is released.
 
 If transcript verification shows that a scheduled-check prompt arrived truncated,
 Keep still stamps it as delivered to avoid typing the prompt twice, then adds a

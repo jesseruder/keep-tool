@@ -3531,6 +3531,12 @@ async function closeIdleSession(body, deps = {}) {
       return plan;
     };
     await checkDonePolicy(state);
+    // The check sweep may only close panes that are still its own. A restart or an
+    // account handoff drops `meta.ephemeral`, so a pane adopted between the sweep's
+    // decision and this close belongs to whoever adopted it, not to the scheduler.
+    if (deps.closePolicy?.ephemeral && !pane?.meta?.ephemeral) {
+      throw new InjectionError(409, 'Pane is no longer a scheduler-opened check session');
+    }
     const cleanupSession = deps.allowTerminalRateLimit && session.kind === 'claude' && session.rateLimit
       ? { ...session, endedTurn: true, rateLimit: null } : session;
     const reason = require('./session-cleanup').refusal(cleanupSession, pane, pinned, Date.now(), deps.closePolicy);
@@ -3632,6 +3638,9 @@ async function closeIdleSession(body, deps = {}) {
       if (deps.closePolicy?.automatic) {
         currentPane = (await listHostPanes(deps, true))?.find((p) => p.id === pane.id);
         if (!currentPane?.alive || currentPane.attached !== 0 || currentPane.meta?.sessionId !== session.id) throw new InjectionError(409, 'Session acquired a viewer or changed during cleanup');
+        if (deps.closePolicy?.ephemeral && !currentPane.meta?.ephemeral) {
+          throw new InjectionError(409, 'Pane stopped being a scheduler-opened check session during cleanup');
+        }
         if (expectedInputCount !== null && currentPane.inputCount !== expectedInputCount) {
           throw new InjectionError(409, 'Session received unexpected input during cleanup');
         }
@@ -3653,7 +3662,10 @@ async function closeIdleSession(body, deps = {}) {
       return currentPane;
     };
     await unchanged();
-    if (deps.closePolicy?.done) {
+    // The input/output counts a caller needs to guard its own SIGTERM/SIGKILL. Produced
+    // for automatic retirement, and for the check sweep, which passes protectInput and
+    // protectOutput to manual-close and cannot enforce either without them.
+    if (deps.closePolicy?.done || deps.closePolicy?.ephemeral) {
       authorizedPane = (await listHostPanes(deps, true))?.find((candidate) => candidate.id === pane.id);
       if (!authorizedPane || !Number.isInteger(authorizedPane.inputCount)) {
         throw new InjectionError(409, 'Pane input activity could not be verified');
@@ -7167,6 +7179,41 @@ async function deliverCheckToThread(task, deps = {}) {
     : null;
 }
 
+// Closing a pane the check scheduler opened, on the automatic-retirement path rather
+// than the Close button's. Nobody asked for this close, so a refusal from
+// closeIdleSession — an unsent draft, a modal prompt, a pending question, unverified
+// background work, a viewer who attached, recent pane input or output, a session that
+// changed under the sweep, a pane that stopped being the scheduler's — is final:
+// `requireGraceful` re-throws it and the caller leaves the pane for the next tick
+// rather than signalling it anyway. The signals that do follow a successful /exit are
+// guarded by pid, session id and input/output counts, so a pane that came back to life
+// between the steps is never killed.
+async function closeEphemeralPane(pane, sessionId, deps = {}) {
+  const host = deps.hostRequest || hostRequest;
+  const lock = deps.withInjectionLock || withInjectionLock;
+  const capabilities = await host('hello');
+  const result = await lock(() => (deps.manualClose || require('./manual-close').manualClose)(
+    { pane: pane.id, sessionId }, {
+      requireGraceful: true,
+      requireSignalGuard: true,
+      signalGuarded: capabilities.guardedKill === true,
+      protectInput: true,
+      protectOutput: true,
+      getPane: async (id) => (await host('get', { pane: id })).pane,
+      // `ephemeral` says only that Keep opened this pane for one recipe, so the card's
+      // own schedule does not pin it; `automatic` keeps every unattended-retirement
+      // guard, and `idleMs: 0` is what lets a pane that just finished its check close
+      // now instead of in eight hours.
+      graceful: (request) => (deps.closeIdleSession || closeIdleSession)(request, {
+        closePolicy: { automatic: true, ephemeral: true, idleMs: 0 },
+        withInjectionLock: (fn) => fn(),
+      }),
+      signal: (id, signal, guard) => host('guarded-kill', { pane: id, signal, ...guard }),
+    }), { pane: pane.id, session: sessionId });
+  (deps.onChange || (() => {}))();
+  return result;
+}
+
 // The scheduler's opener, used by every caller that opens a session on a card the
 // scheduler would otherwise have opened one for.
 function openCheckSession(body, openDeps) {
@@ -7192,7 +7239,16 @@ async function runCheckNow(taskId, deps = {}) {
   // writes the same TTL'd delivery stamp, so the tick a minute later does not put a
   // second agent on the card, and runs.js's per-card in-flight guard covers two
   // verifies racing each other.
-  const { opened } = await runs.openFreshCheckSession(task, { enforce: false, open: deps.open || openCheckSession });
+  const outcome = await runs.openFreshCheckSession(task, { enforce: false, open: deps.open || openCheckSession });
+  // Joining an open that was already in flight can return that open's refusal — the
+  // per-tick cap, the account budget. Saying ok with a null session would report a
+  // check that is not running.
+  if (outcome.skipped) {
+    throw new InjectionError(409, outcome.reason
+      ? `check not opened (${outcome.skipped}): ${outcome.reason}`
+      : `check not opened (${outcome.skipped})`);
+  }
+  const { opened } = outcome;
   return { ok: true, delivered: 'session', sessionId: (opened && opened.sessionId) || null,
     pane: (opened && opened.pane) || null, kind: 'claude' };
 }
@@ -7678,34 +7734,7 @@ function start(deps = {}) {
   runs.setEphemeralHost({
     listPanes: () => listHostPanes({}, true),
     sessions: () => scanSessions(),
-    // The automatic-retirement path, not the Close button's. Nobody asked for this
-    // close, so a refusal from closeIdleSession — an unsent draft, a modal prompt, a
-    // pending question, unverified background work, a session that changed under the
-    // sweep — is final: `requireGraceful` re-throws it and the pane is left alone for
-    // the next tick rather than being signalled anyway. The signals that do follow a
-    // successful /exit are guarded by pid, session, and input/output counts, so a pane
-    // that came back to life between the steps is never killed.
-    closePane: async (pane, sessionId) => {
-      const hostCapabilities = await hostRequest('hello');
-      const result = await withInjectionLock(() => require('./manual-close').manualClose(
-        { pane: pane.id, sessionId }, {
-          requireGraceful: true,
-          requireSignalGuard: true,
-          signalGuarded: hostCapabilities.guardedKill === true,
-          protectInput: true,
-          protectOutput: true,
-          getPane: async (id) => (await hostRequest('get', { pane: id })).pane,
-          // `ephemeral` says only that Keep opened this pane for one recipe, so the
-          // card's own schedule does not pin it. Every state guard still applies.
-          graceful: (request) => closeIdleSession(request, {
-            closePolicy: { ephemeral: true, idleMs: 0 },
-            withInjectionLock: (fn) => fn(),
-          }),
-          signal: (id, signal, guard) => hostRequest('guarded-kill', { pane: id, signal, ...guard }),
-        }), { pane: pane.id, session: sessionId });
-      broadcast();
-      return result;
-    },
+    closePane: (pane, sessionId) => closeEphemeralPane(pane, sessionId, { onChange: broadcast }),
     // A closed pane still sits in the host's list. Forget it, or the sweep re-decides
     // about a dead pane on every tick and the `runs` health row never reports idle.
     removePane: (pane) => hostRequest('remove', { pane: pane.id }),
@@ -8827,7 +8856,7 @@ module.exports = {
   agentProcessRows, liveSessionPids, liveSessionTick, restorePlan,
   annotatePaneAgents,
   readPaneRecord, sessionProjectFromTranscript, openSession, reopenSessionOnAccount,
-  runCheckNow, runTaskNow, taskRunMessage, adoptedPaneMeta,
+  runCheckNow, runTaskNow, taskRunMessage, adoptedPaneMeta, closeEphemeralPane,
   inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, continueAccountHandoff, handoffSession,
   abandonAccountHandoff,
   listPortableTransfers, inspectPortableSource, portableTerminalRateLimitEvidence,

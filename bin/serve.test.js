@@ -4630,6 +4630,96 @@ test('a check run goes to the card thread if one is open, and otherwise opens a 
     /has no check recipe/);
 });
 
+test('the check sweep close composition refuses rather than kills, and guards its signals', async () => {
+  const { closeEphemeralPane } = require('./serve.js');
+  const pane = { id: 'pane-check', meta: { ephemeral: 'check', sessionId: 'check-sid', agent: 'claude' } };
+
+  // What the host would report for a pane that is up and has not moved.
+  const livePane = (over = {}) => ({
+    id: 'pane-check', alive: true, pid: 4242, attached: 0, inputCount: 3, outputCount: 9,
+    meta: { ephemeral: 'check', sessionId: 'check-sid', agent: 'claude' }, ...over,
+  });
+
+  const fakeHost = (over = {}) => {
+    const calls = [];
+    const state = { alive: true, ...over };
+    const request = async (type, params) => {
+      calls.push({ type, params });
+      if (type === 'hello') return { guardedKill: true };
+      if (type === 'get') return { pane: livePane({ alive: state.alive }) };
+      if (type === 'guarded-kill') { state.alive = false; return { ok: true }; }
+      return { ok: true };
+    };
+    return { calls, request, state };
+  };
+
+  // A refusal from closeIdleSession is the guard doing its job. Nobody asked for this
+  // close, so nothing is signalled and the error reaches the sweep, which leaves the pane.
+  const refusing = fakeHost();
+  await assert.rejects(closeEphemeralPane(pane, 'check-sid', {
+    hostRequest: refusing.request,
+    withInjectionLock: (fn) => fn(),
+    closeIdleSession: async () => { throw new InjectionError(409, 'the session input box has a draft'); },
+  }), /draft/);
+  assert.deepEqual(refusing.calls.filter((call) => ['kill', 'guarded-kill'].includes(call.type)), [],
+    'a refused graceful close never reaches a signal');
+
+  // A graceful close that works needs no signal at all.
+  const graceful = fakeHost();
+  const quiet = await closeEphemeralPane(pane, 'check-sid', {
+    hostRequest: graceful.request,
+    withInjectionLock: (fn) => fn(),
+    // What closeIdleSession returns on this path: the counts the caller needs to guard
+    // any signal it goes on to send.
+    closeIdleSession: async () => { graceful.state.alive = false; return { ok: true, expectedInputCount: 3, expectedOutputCount: 9 }; },
+  });
+  assert.equal(quiet.closed, true);
+  assert.equal(quiet.forced, false);
+  assert.deepEqual(graceful.calls.filter((call) => call.type === 'guarded-kill'), []);
+
+  // When /exit leaves the pane alive, the signals that follow carry the identity guard,
+  // so a pane that came back to life between the steps cannot be killed by mistake.
+  const stubborn = fakeHost();
+  let signals = 0;
+  const stubbornRequest = async (type, params) => {
+    if (type === 'guarded-kill') {
+      signals += 1;
+      stubborn.calls.push({ type, params });
+      if (signals >= 1) stubborn.state.alive = false;
+      return { ok: true };
+    }
+    return stubborn.request(type, params);
+  };
+  const forced = await closeEphemeralPane(pane, 'check-sid', {
+    hostRequest: stubbornRequest,
+    withInjectionLock: (fn) => fn(),
+    closeIdleSession: async () => ({ ok: true, expectedInputCount: 3, expectedOutputCount: 9 }),
+  });
+  assert.equal(forced.closed, true);
+  const kill = stubborn.calls.find((call) => call.type === 'guarded-kill');
+  assert.equal(kill.params.signal, 'SIGTERM', 'SIGTERM before SIGKILL');
+  assert.equal(kill.params.expectedPid, 4242);
+  assert.equal(kill.params.expectedSessionId, 'check-sid');
+  assert.equal(kill.params.expectedInputCount, 3);
+  assert.equal(kill.params.expectedOutputCount, 9);
+
+  // And the policy handed to closeIdleSession is the unattended one, not the Close
+  // button's: every automatic guard, plus the ephemeral escape for the card's own
+  // schedule, plus an idle window of zero so a finished check closes now.
+  let policy = null;
+  const policyHost = fakeHost();
+  await closeEphemeralPane(pane, 'check-sid', {
+    hostRequest: policyHost.request,
+    withInjectionLock: (fn) => fn(),
+    closeIdleSession: async (_request, options) => {
+      policy = options.closePolicy;
+      policyHost.state.alive = false;
+      return { ok: true, expectedInputCount: 3, expectedOutputCount: 9 };
+    },
+  });
+  assert.deepEqual(policy, { automatic: true, ephemeral: true, idleMs: 0 });
+});
+
 test('a restarted or handed-off pane stops being the check scheduler\'s to reap', () => {
   const { adoptedPaneMeta } = require('./serve.js');
   const opened = { ephemeral: 'check', card: 'some-card', sessionId: 'sid', agent: 'claude',

@@ -33,7 +33,7 @@ const {
   MAX_FRESH_OPENS_PER_TICK, MAX_DEFERRAL_NOTICES_PER_TICK, EPHEMERAL_IDLE_MS,
   FRESH_OPEN_STAMP_TTL_MS, readDeliveryStamp, writeDeliveryStamp, stampExpired,
   checkinFromSessionAt, openFreshCheckSession, freshOpenRefusal, resetTickAllowance,
-  loadSchedulerState, releaseUnfinishedCheck,
+  loadSchedulerState, releaseUnfinishedCheck, readRawDeliveryStamp,
 } = require('./runs.js');
 
 const card = (over = {}) => ({
@@ -448,6 +448,30 @@ test('a tick that defers many cards logs them all and writes only a few', () => 
   } finally { _resetSchedulerState(); }
 });
 
+// The quota is three check-ins a tick, not three cards considered: a card that was
+// already noticed today writes nothing, so it must not spend another card's turn.
+test('cards already noticed today do not consume the tick quota', () => {
+  _resetSchedulerState();
+  try {
+    const landed = [];
+    const deps = { checkinTask: (id) => landed.push(id) };
+    const cardFor = (id) => { const t = card(); t.id = id; return t; };
+    // Yesterday's tick already noticed these two.
+    assert.equal(noteBudgetDeferral(cardFor('old-a'), 'weekly usage at 97%', '2026-09-11', deps), true);
+    assert.equal(noteBudgetDeferral(cardFor('old-b'), 'weekly usage at 97%', '2026-09-11', deps), true);
+    landed.length = 0;
+
+    // Now a tick walks old-a, old-b and four fresh cards, spending the quota the way
+    // schedulerTick does — only a written notice advances it.
+    let notices = 0;
+    for (const id of ['old-a', 'old-b', 'new-a', 'new-b', 'new-c', 'new-d']) {
+      if (noteBudgetDeferral(cardFor(id), 'weekly usage at 97%', '2026-09-11',
+        { ...deps, quiet: notices >= MAX_DEFERRAL_NOTICES_PER_TICK })) notices += 1;
+    }
+    assert.deepEqual(landed, ['new-a', 'new-b', 'new-c'], 'the two silent cards cost nobody a turn');
+  } finally { _resetSchedulerState(); }
+});
+
 test('the per-day and per-tick allowances survive a restart, and verify ignores them', async () => {
   _resetSchedulerState();
   try {
@@ -592,6 +616,42 @@ test('a check-in counts only when that session wrote it', () => {
   assert.equal(checkinFromSessionAt(withLog('## Plan\n- [ ] step'), 'mine', launchedAt), 0);
 });
 
+// A check that finishes inside the minute it was asked for is the normal case for a
+// fast recipe, and it used to be reaped as "no result" and re-opened. An entry that
+// names this session is proof of its author, so it counts from the launch minute.
+test('a session that signs its check-in is credited from the launch minute', () => {
+  const sessionId = '9f1c2d3e-4b5a-4c6d-8e7f-0a1b2c3d4e5f';
+  const launchedAt = Date.parse('2026-09-11T12:00') + 20e3; // opened 20 seconds in
+  const task = card({ sessions: [], task: { body: '' } });
+  const signed = {
+    ...task,
+    body: `## 2026-09-11 12:00 — check-in (by claude ${sessionId}) → review
+Gates held; nothing to ramp.`,
+  };
+  assert.equal(checkinFromSessionAt(signed, sessionId, launchedAt), Date.parse('2026-09-11T12:00'));
+
+  // The pane is therefore closed as finished, not released as a dead session.
+  const pane = ephemeralPane({ meta: { card: 'some-card', sessionId, launchedAt } });
+  const decision = reapEphemeralPane({
+    pane, session: { id: sessionId, endedTurn: true, mtime: launchedAt + 30e3 },
+    checkedInAt: checkinFromSessionAt(signed, sessionId, launchedAt), now: launchedAt + 60e3,
+  });
+  assert.equal(decision.reap, true);
+  assert.equal(decision.checkedIn, true);
+  assert.match(decision.reason, /recorded on the card/);
+
+  // Another session's signature in the same minute still does not count, and neither
+  // does an unattributed entry: only the signed one earns the launch minute.
+  const other = { ...task, body: '## 2026-09-11 12:00 — check-in (by claude 00000000-0000-4000-8000-000000000000) → review\nTheirs.' };
+  assert.equal(checkinFromSessionAt(other, sessionId, launchedAt), 0);
+  const unsigned = { ...task, fm: { ...task.fm, sessions: [{ id: sessionId, agent: 'claude' }] },
+    body: '## 2026-09-11 12:00 — check-in → review\nUnsigned, same minute.' };
+  assert.equal(checkinFromSessionAt(unsigned, sessionId, launchedAt), 0);
+  assert.equal(
+    checkinFromSessionAt({ ...unsigned, body: '## 2026-09-11 12:01 — check-in → review\nUnsigned, next minute.' }, sessionId, launchedAt),
+    Date.parse('2026-09-11T12:01'));
+});
+
 test('the sweep only ever touches panes this scheduler opened', async () => {
   const closed = [];
   const panes = [
@@ -670,13 +730,31 @@ test('a closed pane is removed from the host, and a dead one is removed without 
   } finally { _resetSchedulerState(); }
 });
 
+test('a pane that will not be forgotten leaves its card exactly as it was', async () => {
+  _resetSchedulerState();
+  try {
+    const released = [];
+    const now = 1_000_000 + 5 * 3600e3;
+    const result = await sweepEphemeralPanes({
+      listPanes: async () => [ephemeralPane({ meta: { card: 'some-card', sessionId: 'sid' } })],
+      sessions: async () => [{ id: 'sid', endedTurn: true, mtime: 1_000_000 }],
+      closePane: async () => {},
+      // The usual reason a host refuses to forget a pane is that it is alive again.
+      removePane: async () => { throw new Error('pane is running'); },
+      checkinTask: (id) => released.push(id),
+    }, now);
+    assert.deepEqual(result, [], 'the pane is not reported closed');
+    assert.deepEqual(released, [], 'and its card keeps its stamp and its allowance');
+  } finally { _resetSchedulerState(); }
+});
+
 test('a session reaped without a result releases the card instead of burying the check', () => {
   _resetSchedulerState();
   try {
     const landed = [];
     // Pretend the card was opened and stamped earlier today.
     const task = card();
-    writeDeliveryStamp(task, { sessionId: 'dead-sid', kind: 'claude', ttlMs: FRESH_OPEN_STAMP_TTL_MS });
+    writeDeliveryStamp(task, { sessionId: 'deadsession1234', kind: 'claude', ttlMs: FRESH_OPEN_STAMP_TTL_MS });
     loadSchedulerState().opened.set('some-card', '2026-09-11');
 
     assert.equal(releaseUnfinishedCheck('some-card', 'deadsession1234', '2026-09-11',
@@ -690,8 +768,34 @@ test('a session reaped without a result releases the card instead of burying the
 
     // Only one extra open a day: a card whose sessions keep dying does not loop.
     loadSchedulerState().opened.set('some-card', '2026-09-11');
+    writeDeliveryStamp(task, { sessionId: 'deadsession1234', kind: 'claude', ttlMs: FRESH_OPEN_STAMP_TTL_MS });
     assert.equal(releaseUnfinishedCheck('some-card', 'deadsession1234', '2026-09-11', { checkinTask: () => {} }), false);
     assert.equal(loadSchedulerState().opened.get('some-card'), '2026-09-11');
+  } finally { _resetSchedulerState(); }
+});
+
+// Between the open and the reap the card may have been rescheduled and re-delivered —
+// to a thread, or to a later session. Clearing that stamp would put a second agent on a
+// check somebody else is already running.
+test('a reaped session releases only the stamp it wrote', () => {
+  _resetSchedulerState();
+  try {
+    const task = card();
+    const landed = [];
+    const deps = { checkinTask: (id, payload) => landed.push([id, payload]) };
+    writeDeliveryStamp(task, { sessionId: 'someone-else', kind: 'claude' });
+    loadSchedulerState().opened.set('some-card', '2026-09-11');
+
+    assert.equal(releaseUnfinishedCheck('some-card', 'the-dead-session', '2026-09-11', deps), false);
+    assert.equal(readRawDeliveryStamp('some-card').sessionId, 'someone-else', 'the newer delivery stands');
+    assert.equal(loadSchedulerState().opened.get('some-card'), '2026-09-11', 'and no extra open is granted');
+    assert.deepEqual(landed, [], 'nor is a card note written about somebody else\'s check');
+
+    // Its own stamp it may clear.
+    writeDeliveryStamp(task, { sessionId: 'the-dead-session', kind: 'claude', ttlMs: FRESH_OPEN_STAMP_TTL_MS });
+    assert.equal(releaseUnfinishedCheck('some-card', 'the-dead-session', '2026-09-11', deps), true);
+    assert.equal(readRawDeliveryStamp('some-card'), null);
+    assert.equal(landed.length, 1);
   } finally { _resetSchedulerState(); }
 });
 
@@ -739,6 +843,52 @@ test('due checks open one fresh session per card per day, three per tick', () =>
     assert.equal(first.length, 3, 'the per-tick cap holds the fourth card back');
     assert.equal(all.length, 4, 'the next tick picks up the card the cap skipped');
     assert.equal(new Set(all).size, 4, 'and no card is opened twice the same day');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The bookkeeping that stops a card being opened or noticed twice is only worth
+// anything if it survives the restart that used to reset it.
+test('the per-day allowances are read back from disk by a fresh process', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-runs-state-'));
+  try {
+    const stateFile = path.join(root, '.keep', 'runs', 'scheduler-state.json');
+    fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+    const read = (contents) => {
+      fs.writeFileSync(stateFile, contents);
+      const script = `
+        const runs = require(${JSON.stringify(require.resolve('./runs.js'))});
+        const state = runs.loadSchedulerState();
+        process.stdout.write(JSON.stringify({
+          opened: Object.fromEntries(state.opened),
+          budgetNotice: Object.fromEntries(state.budgetNotice),
+          reopened: Object.fromEntries(state.reopened),
+        }));
+      `;
+      return JSON.parse(execFileSync(process.execPath, ['-e', script], {
+        encoding: 'utf8', env: { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1' },
+      }));
+    };
+
+    assert.deepEqual(read(JSON.stringify({
+      opened: { 'card-a': '2026-09-11' },
+      budgetNotice: { 'card-b': '2026-09-11' },
+      reopened: { 'card-a': '2026-09-11' },
+    })), {
+      opened: { 'card-a': '2026-09-11' },
+      budgetNotice: { 'card-b': '2026-09-11' },
+      reopened: { 'card-a': '2026-09-11' },
+    });
+
+    // Bookkeeping, not a record: a file that cannot be parsed, or one written by a
+    // future shape, degrades to empty rather than taking the scheduler down with it.
+    const empty = { opened: {}, budgetNotice: {}, reopened: {} };
+    assert.deepEqual(read('{"opened":{"card-a":'), empty, 'truncated JSON');
+    assert.deepEqual(read('not json at all'), empty);
+    assert.deepEqual(read('[]'), empty, 'an array is not a state file');
+    assert.deepEqual(read(JSON.stringify({ opened: { 'card-a': 7, 'card-b': null }, budgetNotice: 'nope' })),
+      empty, 'entries that are not id -> day strings are dropped');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

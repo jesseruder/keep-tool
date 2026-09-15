@@ -234,6 +234,10 @@ function stampExpired(stamp, now = Date.now()) {
   return !at || now - at >= ttl;
 }
 
+function readRawDeliveryStamp(taskId) {
+  try { return JSON.parse(fs.readFileSync(deliveryStampFile(taskId), 'utf8')); } catch { return null; }
+}
+
 function removeDeliveryStamp(taskId) {
   const file = deliveryStampFile(taskId);
   if (!fs.existsSync(file)) return true;
@@ -522,26 +526,31 @@ function stampMs(stamp) {
 // an entry naming a session names its author, and an unattributed entry belongs to the
 // card's own owning session, which for a pane this scheduler opened is that pane's.
 //
-// Log stamps are minute-resolution, so only entries from a LATER minute than the launch
-// count: an entry stamped in the launch minute may have been written a moment before the
-// pane came up. Conservative in the safe direction — the pane closes late, never early,
-// because a miss only falls back to the 60-minute idle rule.
+// Log stamps are minute-resolution, which matters differently for the two cases. An
+// entry that NAMES this session is proof whoever wrote it was this session, so it counts
+// from the launch minute — a fast check that finishes in the same minute it was asked
+// for is exactly the case that must not read as "no result". An UNATTRIBUTED entry is
+// only inferred to be ours, so it counts from the next minute: one stamped in the launch
+// minute may have been written a moment before the pane came up. A miss there falls back
+// to the 60-minute idle rule, so the pane closes late, never early.
 function checkinFromSessionAt(task, sessionId, since) {
   if (!task || !sessionId) return 0;
   let entries = [];
   try { entries = require('./review.js').logEntries(task.body); } catch { return 0; }
   const owns = Array.isArray(task.fm && task.fm.sessions)
     && task.fm.sessions.some((entry) => entry && entry.id === sessionId);
-  const from = Math.floor(Number(since || 0) / 60e3) * 60e3 + 60e3;
+  const launchMinute = Math.floor(Number(since || 0) / 60e3) * 60e3;
   let latest = 0;
   for (const entry of entries) {
     const split = /^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}) — ([\s\S]*)$/.exec(entry.heading || '');
     if (!split) continue;
     const at = stampMs(split[1]);
-    if (!at || at < from) continue;
+    if (!at) continue;
     const attributed = /\(by (?:claude|codex) ([A-Za-z0-9_-]+)\)/.exec(split[2]);
     const mine = attributed ? attributed[1] === sessionId : (owns && !/\(reviewer /.test(split[2]));
-    if (mine && at > latest) latest = at;
+    if (!mine) continue;
+    if (at < (attributed ? launchMinute : launchMinute + 60e3)) continue;
+    if (at > latest) latest = at;
   }
   return latest;
 }
@@ -556,7 +565,11 @@ function reapEphemeralPane({ pane, session, checkedInAt = 0, now = Date.now() } 
   const meta = (pane && pane.meta) || {};
   if (!meta.ephemeral) return { reap: false, reason: 'not a scheduler-opened pane' };
   const launchedAt = Number(meta.launchedAt) || 0;
-  const checkedIn = Boolean(launchedAt && checkedInAt > launchedAt);
+  // Compared by minute, because a card log stamp has no seconds: a session opened at
+  // 12:00:20 that checked in at 12:00 did check in after its launch. checkinFromSessionAt
+  // has already decided which entries are in window, so anything it returns counts.
+  const checkedIn = Boolean(launchedAt && checkedInAt > 0
+    && checkedInAt >= Math.floor(launchedAt / 60e3) * 60e3);
   if (pane.alive === false || (session && session.exited)) {
     return { reap: true, checkedIn, reason: 'the agent has exited' };
   }
@@ -578,6 +591,16 @@ function reapEphemeralPane({ pane, session, checkedInAt = 0, now = Date.now() } 
 // silently skipped until someone notices.
 function releaseUnfinishedCheck(cardId, sessionId, today = keep.nowStamp().slice(0, 10), deps = keep) {
   if (!cardId) return false;
+  // Only this session's own stamp. Between the open and the reap the card may have been
+  // rescheduled and re-delivered — to a thread, or to a later session — and clearing
+  // that stamp would put a second agent on a check somebody else is already running.
+  // Read raw, by id: this needs no card and must not take readDeliveryStamp's side
+  // effect of deleting a stamp it considers stale.
+  const stamp = readRawDeliveryStamp(cardId);
+  if (stamp && stamp.sessionId !== sessionId) {
+    process.stderr.write(`keep runs: ${cardId} was re-delivered to ${String(stamp.sessionId || 'another session').slice(0, 8)} while ${String(sessionId).slice(0, 8)} was open; its stamp stands\n`);
+    return false;
+  }
   removeDeliveryStamp(cardId);
   const reopened = grantReopen(cardId, today);
   const short = String(sessionId || '').slice(0, 8) || 'unknown';
@@ -627,18 +650,24 @@ async function sweepEphemeralPanes(host = ephemeralHost, now = Date.now()) {
       // is closed through the guarded automatic path, which refuses rather than kills
       // when the session still has a draft, a question, or unverified work.
       if (pane.alive !== false) await host.closePane(pane, sessionId);
-      closed.push(pane.id);
-      process.stderr.write(`keep runs: closed the ${label}: ${decision.reason}\n`);
     } catch (e) {
       // Left alone and retried next tick: a refusal here is the guard doing its job.
       process.stderr.write(`keep runs: left the ${label} open: ${e.message}\n`);
       continue;
     }
-    // Forget the pane so a dead one is not re-closed on every tick from now on.
+    // Forget the pane so a dead one is not re-closed on every tick from now on. A host
+    // that refuses — the usual reason is that the pane is alive again — means this pane
+    // is not finished after all, so it is not reported closed and the card keeps its
+    // stamp and its allowance.
     if (host.removePane) {
       try { await host.removePane(pane); }
-      catch (e) { process.stderr.write(`keep runs: could not remove the ${label}: ${e.message}\n`); }
+      catch (e) {
+        process.stderr.write(`keep runs: could not remove the ${label}, so its card is left as it was: ${e.message}\n`);
+        continue;
+      }
     }
+    closed.push(pane.id);
+    process.stderr.write(`keep runs: closed the ${label}: ${decision.reason}\n`);
     if (!decision.checkedIn) releaseUnfinishedCheck(pane.meta.card, sessionId, today, host.checkinTask ? host : keep);
   }
   return closed;
@@ -922,8 +951,11 @@ async function schedulerTick() {
         const outcome = await openFreshCheckSession(t, { today, accountId: checksAccount });
         if (outcome.skipped === 'budget') {
           // Every deferral is logged; only the first few a tick are written to a card.
-          noteBudgetDeferral(t, outcome.reason, today, { ...keep, quiet: deferralNotices >= MAX_DEFERRAL_NOTICES_PER_TICK });
-          deferralNotices += 1;
+          // The quota counts check-ins that were actually written — a card that was
+          // already noticed today costs nothing, so it must not spend another card's turn.
+          if (noteBudgetDeferral(t, outcome.reason, today, { ...keep, quiet: deferralNotices >= MAX_DEFERRAL_NOTICES_PER_TICK })) {
+            deferralNotices += 1;
+          }
           continue;
         }
         if (outcome.skipped) continue;
@@ -971,7 +1003,7 @@ module.exports = {
   retryPending, startScheduler, schedulerTick, setOnChange, setDeliverer, setOpener, setEphemeralHost,
   openFreshCheckSession, checksAccountId, checkBudget, budgetDeferralReason, noteBudgetDeferral,
   freshOpenRefusal, resetTickAllowance, loadSchedulerState, releaseUnfinishedCheck,
-  readDeliveryStamp, writeDeliveryStamp, stampExpired, checkinFromSessionAt,
+  readDeliveryStamp, writeDeliveryStamp, readRawDeliveryStamp, stampExpired, checkinFromSessionAt,
   reapEphemeralPane, sweepEphemeralPanes, MAX_FRESH_OPENS_PER_TICK, MAX_DEFERRAL_NOTICES_PER_TICK,
   EPHEMERAL_IDLE_MS, FRESH_OPEN_STAMP_TTL_MS,
   checkDeliveryMessage, checkDeliveryKey, planDueCard, deliveryWarning,
