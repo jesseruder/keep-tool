@@ -71,10 +71,13 @@ test('auth preflight fails closed without exposing auth output', async () => {
   assert.equal(await support.authPreflight(account, { runAuthStatus: async () => { throw new Error('secret'); } }), false);
   assert.equal(await support.authPreflight({ agent: 'claude', configDir: '/profile' }, { runAuthStatus: async () => true }), false);
 });
-test('auth subprocess accepts stderr status and bounds hung or excessive output', async () => {
+test('auth subprocess accepts stderr status and bounds hung or excessive output', async (t) => {
   const account = { agent: 'codex', configDir: '/profile' };
-  assert.equal(await support.authPreflight(account, { profileCommand: () => "/bin/sh -c 'printf \"Logged in using ChatGPT\\n\" >&2'" }), true);
-  assert.equal(await support.authPreflight(account, { profileCommand: () => "/bin/sh -c 'printf \"Logged in using ChatGPT\\n\"; exit 1'" }), false);
-  assert.equal(await support.authPreflight(account, { profileCommand: () => '/bin/sleep 5', timeoutMs: 100 }), false);
-  assert.equal(await support.authPreflight(account, { profileCommand: () => '/usr/bin/yes Logged-in', timeoutMs: 3000 }), false);
+  // The preflight runs through `zsh -lic`; an empty ZDOTDIR keeps the operator's
+  // login profile, which can take ~15s under load, out of the deadlines below.
+  const env = { ...process.env, ZDOTDIR: temp(t) };
+  assert.equal(await support.authPreflight(account, { env, profileCommand: () => "/bin/sh -c 'printf \"Logged in using ChatGPT\\n\" >&2'" }), true);
+  assert.equal(await support.authPreflight(account, { env, profileCommand: () => "/bin/sh -c 'printf \"Logged in using ChatGPT\\n\"; exit 1'" }), false);
+  assert.equal(await support.authPreflight(account, { env, profileCommand: () => '/bin/sleep 5', timeoutMs: 100 }), false);
+  assert.equal(await support.authPreflight(account, { env, profileCommand: () => '/usr/bin/yes Logged-in', timeoutMs: 3000 }), false);
 });
