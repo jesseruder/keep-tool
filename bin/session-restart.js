@@ -10,16 +10,22 @@ function isReviewer(session, pane) {
   return Boolean(session?.reviewer || pane?.meta?.reviewer);
 }
 
-function refusal(session, pane, queued = false) {
+function refusal(session, pane, queued = false, options = {}) {
+  const force = options.force === true;
   if (!session || !pane?.alive || pane.meta?.sessionId !== session.id || !['claude', 'codex'].includes(pane.meta?.agent)) return 'Session is not live in its original pane';
   // The fleet reviewer restarts like any other session: its pane keeps meta.reviewer,
   // and bin/serve.js rebuilds its launch flags and env on the resume, so the marker,
   // the model and the tick address all survive. Every guard below except the viewer
   // check still applies.
   if (session.activity?.background?.scheduled?.length || session.backgroundJobs?.jobs?.some(j => j.kind === 'scheduled' && j.status === 'pending')) return 'Pause session-local scheduled jobs before restarting';
-  if (session.endedTurn !== true || session.toolRunning || session.pendingBackground || session.waitingFor || session.rateLimit
-      || session.unknownBackgroundJobs?.length || session.lifecycleAgents?.length
-      || session.backgroundJobs?.jobs?.some(j => j.status === 'pending')
+  // A forced restart discards only uncertain background evidence (a gapped job
+  // ledger, stale pending entries, unknown or lifecycle agent work). A turn that
+  // has not ended, a live tool, a rate limit, a running/waiting foreground
+  // lifecycle and session-local scheduled jobs still refuse.
+  if (session.endedTurn !== true || session.toolRunning || session.rateLimit
+      || (!force && (session.pendingBackground || session.waitingFor
+        || session.unknownBackgroundJobs?.length || session.lifecycleAgents?.length
+        || session.backgroundJobs?.jobs?.some(j => j.status === 'pending')))
       || session.lifecycleForeground?.state === 'running' || session.lifecycleForeground?.state === 'waiting') return 'Waiting for the turn and background work to finish';
   if (session.pendingQuestion || session.pendingPlan
       || ['permission', 'question'].includes(session.notify?.type)

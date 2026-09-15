@@ -145,6 +145,29 @@ test('restart readiness protects active work, decisions, and viewed queued panes
   assert.equal(refusal({ ...session, backgroundJobs: { jobs: [{ kind: 'scheduled', status: 'cancelled' }] } }, pane), null);
 });
 
+test('an explicit force discards uncertain background evidence but never an unfinished turn', () => {
+  const session = { id: 's', state: 'idle', endedTurn: true };
+  const pane = { alive: true, attached: 0, meta: { sessionId: 's', agent: 'codex' } };
+  const forced = { force: true };
+  for (const patch of [{ unknownBackgroundJobs: ['job'] }, { lifecycleAgents: ['agent'] }, { pendingBackground: true },
+    { waitingFor: 'lock' }, { backgroundJobs: { jobs: [{ kind: 'agent', status: 'pending' }] } }]) {
+    assert.ok(refusal({ ...session, ...patch }, pane), 'uncertain evidence refuses without force');
+    assert.equal(refusal({ ...session, ...patch }, pane, false, forced), null);
+    assert.equal(require('./session-cleanup').refusal({ ...session, ...patch, kind: 'codex', mtime: Date.now() }, pane,
+      new Set(), Date.now(), { manual: true, restart: true, force: true }), null);
+  }
+  for (const patch of [{ endedTurn: false }, { toolRunning: true }, { rateLimit: { until: 1 } },
+    { lifecycleForeground: { state: 'running' } }, { lifecycleForeground: { state: 'waiting' } },
+    { backgroundJobs: { jobs: [{ kind: 'scheduled', status: 'pending' }] } }, { pendingQuestion: {} },
+    { notify: { type: 'permission' } }]) {
+    assert.ok(refusal({ ...session, ...patch }, pane, false, forced), 'force never clears a live turn or a pending decision');
+    assert.ok(require('./session-cleanup').refusal({ ...session, ...patch, kind: 'codex', mtime: Date.now() }, pane,
+      new Set(), Date.now(), { manual: true, restart: true, force: true }));
+  }
+  assert.ok(refusal(session, { ...pane, alive: false }, false, forced), 'force never relaxes the pane check');
+  assert.ok(refusal(session, { ...pane, attached: 1 }, true, forced), 'force never relaxes the viewer check');
+});
+
 test('fresh Claude --session-id processes retain verifiable identity while idle', async () => {
   const { liveSessionPids } = require('./serve');
   const live = await liveSessionPids({ agentProcessRows: async () => [{ pid: 21, ppid: 1, agent: 'claude', interactive: true,

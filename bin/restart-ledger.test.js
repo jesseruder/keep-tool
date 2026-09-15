@@ -272,3 +272,19 @@ test('terminal Claude quota errors are allowed only by explicit handoff proof an
     message: { content: [], stop_reason: null } });
   assert.throws(() => verify({ allowTerminalRateLimit: true }), /calls|complete/);
 }, 'claude'));
+
+test('a forced restart accepts a gapped ledger with a dead pending agent while source changes still abort', () => fixture(({ root, append, verify }) => {
+  append('parent', { sessionId: 'parent', type: 'assistant', message: { content: [{ type: 'tool_use', id: 'spawn', name: 'Agent', input: {} }] } });
+  append('parent', { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'spawn', content: 'Async agent launched successfully. agentId: child' }] } });
+  append('parent', { type: 'assistant', sessionId: 'parent', message: { content: [], stop_reason: 'end_turn' } });
+  assert.throws(verify, /identity|ENOENT|complete/, 'a dead child transcript refuses an ordinary restart');
+  const snapshot = path.join(root, '.keep/background-jobs/claude/parent/state.json');
+  const state = JSON.parse(fs.readFileSync(snapshot)); state.gap = true; fs.writeFileSync(snapshot, JSON.stringify(state));
+  assert.throws(verify, /incomplete/);
+  assert.equal(jobs.read(root, 'claude', 'parent').jobs.some((job) => job.id === 'child' && job.status === 'pending'), true);
+  const proof = verify({ force: true });
+  proof();
+  assert.equal(JSON.parse(fs.readFileSync(snapshot)).gap, true, 'force does not launder the gap away');
+  append('parent', { type: 'user', sessionId: 'parent', message: { content: 'More work' } });
+  assert.throws(proof, /source changed during restart/);
+}, 'claude'));

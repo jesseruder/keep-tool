@@ -78,7 +78,7 @@ function sameFrozenFile(file, evidence) {
 // Called only after the handoff artifact transaction has verified an exact copy
 // and the source process has exited. Ordinary sync never invokes this escape
 // hatch: unrelated path/inode changes remain permanent gaps.
-function rebindSource({ root, agent, sid, sourceFile, targetFile, transactionId, sourceStopVerifiedAt }) {
+function rebindSource({ root, agent, sid, sourceFile, targetFile, transactionId, sourceStopVerifiedAt, force = false }) {
   if (!['claude', 'codex'].includes(agent) || !ID.test(sid || '') || !ID.test(transactionId || '')
       || !Number.isFinite(sourceStopVerifiedAt) || sourceStopVerifiedAt <= 0
       || !path.isAbsolute(sourceFile || '') || !path.isAbsolute(targetFile || '')
@@ -99,8 +99,13 @@ function rebindSource({ root, agent, sid, sourceFile, targetFile, transactionId,
   if (!locked) throw failure('job ledger is busy during account handoff', 'KEEP_LEDGER_BUSY');
   try {
     const state = JSON.parse(fs.readFileSync(snapshot, 'utf8'));
-    if (state.version !== 1 || state.restartVersion !== restartVersion(agent) || !state.jobs || !state.calls || !state.restart
-        || state.gap || state.recovering) throw failure('job ledger evidence is incomplete');
+    // A forced handoff tolerates a gapped ledger and a missing restart record --
+    // the same evidence restart-ledger.verify skips under force -- and carries the
+    // gap into the rebound state; it then reports no children, so the caller
+    // rebinds the root alone. The writer lock, the state version, an in-flight
+    // recovery and unconsumed hook evidence still hold.
+    if (state.version !== 1 || state.restartVersion !== restartVersion(agent) || !state.jobs || !state.calls
+        || (!force && (!state.restart || state.gap)) || state.recovering) throw failure('job ledger evidence is incomplete');
     let entries = [];
     try { entries = fs.readdirSync(path.join(ledgerDir, 'inbox')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     if (entries.length) throw failure('job ledger has unconsumed hook evidence');
@@ -116,7 +121,7 @@ function rebindSource({ root, agent, sid, sourceFile, targetFile, transactionId,
       if (state.checkpoint?.identity !== target.identity || state.checkpoint.offset !== target.size
           || state.checkpoint.mtime !== target.mtime || state.checkpoint.anchor !== target.anchor
           || state.source?.file !== target.file) throw failure('completed ledger rebind no longer matches its target');
-      return { reused: true, children: Object.keys(state.restart.children || {}) };
+      return { reused: true, children: force ? [] : Object.keys(state.restart?.children || {}) };
     }
     const checkpoint = state.checkpoint;
     if (!checkpoint || state.source?.agent !== agent || state.source.sid !== sid || path.resolve(state.source.file || '') !== source.file
@@ -133,7 +138,8 @@ function rebindSource({ root, agent, sid, sourceFile, targetFile, transactionId,
     state.handoffRebind = { version: 1, transactionId, sourceStopVerifiedAt, source, target,
       retiredSources: retained, reboundAt: Date.now() };
     writeState(snapshot, state);
-    return { reused: false, children: Object.keys(state.restart.children || {}) };
+    // Under force the child graph is unverified evidence, so it is never reported.
+    return { reused: false, children: force ? [] : Object.keys(state.restart?.children || {}) };
   } finally { try { fs.unlinkSync(lock); } catch {} }
 }
 

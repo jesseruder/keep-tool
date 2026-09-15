@@ -630,7 +630,8 @@ function rebindLedger(sessionId, source, target, transactionId, options = {}) {
     let result;
     try {
       result = rebind({ root: plan.root, agent: 'codex', sid: id, sourceFile: artifact.source,
-        targetFile: artifact.target, transactionId, sourceStopVerifiedAt: options.sourceStopVerifiedAt });
+        targetFile: artifact.target, transactionId, sourceStopVerifiedAt: options.sourceStopVerifiedAt,
+        force: options.force === true });
     } catch (error) {
       throw failure(`Codex ledger rebind is unavailable for ${id}: ${error.message}`,
         'KEEP_CODEX_ARTIFACT_LEDGER');
@@ -641,10 +642,16 @@ function rebindLedger(sessionId, source, target, transactionId, options = {}) {
       throw failure(`Codex ledger rebind returned an unverified child for ${id}`,
         'KEEP_CODEX_ARTIFACT_LEDGER');
     }
-    for (const child of artifact.children) if (!returned.includes(child)) {
-      throw failure(`Codex ledger rebind omitted owned child ${child}`, 'KEEP_CODEX_ARTIFACT_LEDGER');
+    // A forced rebind reads no restart record, so it reports no owned children
+    // and the graph below stays unverified; rebind the root only, exactly as the
+    // Claude path and restart-ledger.verify do.
+    if (options.force !== true) {
+      for (const child of artifact.children) if (!returned.includes(child)) {
+        throw failure(`Codex ledger rebind omitted owned child ${child}`, 'KEEP_CODEX_ARTIFACT_LEDGER');
+      }
     }
     rebound.push({ sessionId: id, reused: result?.reused === true });
+    if (options.force === true) return;
     for (const child of artifact.children) visit(child);
   }
   visit(sessionId);

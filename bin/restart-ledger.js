@@ -13,7 +13,7 @@ const evidenceKey = state => digest(JSON.stringify({ jobs: state.jobs, calls: st
 // A proof is bound to the exact files and process instance observed here. It
 // does not authorize exit by itself: the caller still checks live descendants,
 // current foreground state, viewers and the actual input prompt before typing.
-function verify({ root, agent, sid, file, instance, resolveChild, budget = 4 * 1024 * 1024, allowTerminalRateLimit = false }) {
+function verify({ root, agent, sid, file, instance, resolveChild, budget = 4 * 1024 * 1024, allowTerminalRateLimit = false, force = false }) {
   const snapshots = new Map(), visiting = new Set();
   let remaining = budget;
   const load = (id, source, parentSource) => {
@@ -27,7 +27,10 @@ function verify({ root, agent, sid, file, instance, resolveChild, budget = 4 * 1
     if (result.uncertain?.includes('ledger-busy') || result.recovering) throw new Recovering('Waiting for job ledger recovery');
     const snapshot = path.join(root, '.keep', 'background-jobs', agent, id, 'state.json');
     const state = JSON.parse(fs.readFileSync(snapshot, 'utf8'));
-    if (state.restartVersion !== jobs.restartVersion(agent) || state.gap || !state.restart) throw Error('Job ledger evidence is incomplete');
+    // A forced restart accepts a gapped or restart-record-less ledger. The
+    // snapshot is still loaded and pinned below, so a source or hook change
+    // during the restart still aborts it.
+    if (state.restartVersion !== jobs.restartVersion(agent) || (!force && (state.gap || !state.restart))) throw Error('Job ledger evidence is incomplete');
     const stat = fs.statSync(source), cp = state.checkpoint;
     if (!cp || cp.identity !== `${digest(path.resolve(source))}:${stat.dev}:${stat.ino}` || cp.offset !== stat.size || cp.mtime !== stat.mtimeMs) throw new Recovering('Waiting for job ledger recovery');
     if (state.hookBarrier != null && cp.offset <= state.hookBarrier) throw new Recovering('Waiting for hook activity to reach the job ledger');
@@ -49,8 +52,12 @@ function verify({ root, agent, sid, file, instance, resolveChild, budget = 4 * 1
     if (depth > 8 || snapshots.size >= 128 || visiting.has(id)) throw Error('Job ledger child graph is unverified');
     visiting.add(id);
     const state = load(id, source, parentSource), s = state.restart;
-    if (agent === 'codex' && (s.id !== id || (parent && s.parent !== parent))) throw Error('Child job ledger ownership is unverified');
-    if (agent === 'claude' && !parent && s.id !== id) throw Error('Job ledger session identity is unverified');
+    if (agent === 'codex' && s && (s.id !== id || (parent && s.parent !== parent))) throw Error('Child job ledger ownership is unverified');
+    if (agent === 'claude' && !parent && s && s.id !== id) throw Error('Job ledger session identity is unverified');
+    // Under force the ledger's own completion record, its unresolved jobs and
+    // the whole child graph are uncertain evidence and are skipped; the caller
+    // still proves the turn ended and no tool is running.
+    if (force) { visiting.delete(id); return; }
     // Old Claude child transcripts omit stop_reason. Require both their current
     // final text and a later, explicit parent completion observation. Neither
     // alone suffices; every child job/hook and source race is still checked.

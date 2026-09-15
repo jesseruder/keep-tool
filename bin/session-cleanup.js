@@ -17,7 +17,7 @@ function cardsForSession(tasks, sessionId) {
 function refusal(session, pane, pinned, now = Date.now(), options = {}) {
   if (!session || !pane || !pane.alive || pane.meta?.sessionId !== session.id || pane.meta?.agent !== session.kind) return 'No matching live agent pane';
   if (options.restart) {
-    const reason = require('./session-restart').refusal(session, pane);
+    const reason = require('./session-restart').refusal(session, pane, false, { force: options.force === true });
     return reason || (!Number.isFinite(session.mtime) ? 'Session activity time is unknown' : null);
   }
   if (session.reviewer) return 'Fleet reviewer is protected';

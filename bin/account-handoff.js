@@ -37,7 +37,7 @@ function portableFallbackCandidate(entry) {
 }
 function safe(entry) {
   if (!entry) return null;
-  const keys = ['id', 'transactionId', 'sessionId', 'pane', 'agent', 'sourceAccountId', 'targetAccountId', 'intent', 'status', 'phase', 'reason', 'updatedAt'];
+  const keys = ['id', 'transactionId', 'sessionId', 'pane', 'agent', 'sourceAccountId', 'targetAccountId', 'intent', 'force', 'status', 'phase', 'reason', 'updatedAt'];
   return {
     ...Object.fromEntries(keys.filter((key) => entry[key] != null).map((key) => [key, entry[key]])),
     ...(portableFallbackCandidate(entry) ? { portableFallbackAvailable: true } : {}),
@@ -364,6 +364,12 @@ async function run(body, deps = {}) {
       || !accounts.ID_RE.test(String(body?.accountId || ''))) {
     const error = new Error('Expected exact session, pane and target account'); error.status = 400; throw error;
   }
+  if (body.force !== undefined && typeof body.force !== 'boolean') {
+    const error = new Error('Account handoff force must be a boolean'); error.status = 400; throw error;
+  }
+  // Force only tells the stop path to ignore uncertain background-job evidence;
+  // a session that is genuinely mid-turn is still refused downstream.
+  const force = body.force === true;
   const requestedIntent = body.intent == null ? null : body.intent;
   if (requestedIntent != null && !['continue', 'open-only'].includes(requestedIntent)) {
     const error = new Error('Account handoff intent must be continue or open-only'); error.status = 400; throw error;
@@ -401,6 +407,7 @@ async function run(body, deps = {}) {
       const error = new Error(current ? 'Interrupted handoff needs the original pane for recovery' : 'Expected a live session in this pane');
       error.status = 409; throw error;
     }
+    if (current && force) current.force = true;
     if (current && current.status !== 'recovery-needed') {
       Object.assign(current, { status: 'recovery-needed', reason: `Handoff interrupted during ${current.phase || 'an unknown phase'}` });
       writeOne(root, current);
@@ -483,7 +490,7 @@ async function run(body, deps = {}) {
           current.targetTranscript = copiedPlan.artifacts?.find((entry) => entry.sessionId === session.id)?.target;
           writeOne(root, current);
           (deps.rebindLedger || providerArtifacts.rebindLedger)(session.id, source, target, current.id,
-            { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt });
+            { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt, force: current.force === true });
           stageTargetAuthority(current, target, root, env);
         }
         verifyFrozenResumeSpec(current, null, deps);
@@ -558,7 +565,7 @@ async function run(body, deps = {}) {
     current.intent = intent;
     current.ownedSessionIds = agent === 'codex' ? artifactPlan.artifacts.map((entry) => entry.sessionId) : [session.id];
     Object.assign(current, { status: 'stopping', phase: 'stopping-source', reason: '', cwd: resumeCwd,
-      pid: pane.pid, cols: pane.cols, rows: pane.rows,
+      pid: pane.pid, cols: pane.cols, rows: pane.rows, ...(force ? { force: true } : {}),
       ...(sourceIdentity ? { sourceAgentPid: sourceIdentity.pid, sourceAgentPidStart: sourceIdentity.pidStart,
         sourceOwnsPane: true } : {}),
       ...(resumeSpec ? {
@@ -582,7 +589,7 @@ async function run(body, deps = {}) {
       writeOne(root, current);
       verifyFrozenResumeSpec(current, artifactPlan, deps);
       (deps.rebindLedger || providerArtifacts.rebindLedger)(session.id, source, target, current.id,
-        { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt });
+        { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt, force });
       copied = true;
       stageTargetAuthority(current, target, root, env);
       Object.assign(current, { status: 'starting', phase: 'starting-target', targetLaunchStartedAt: Date.now() }); writeOne(root, current);
@@ -591,7 +598,8 @@ async function run(body, deps = {}) {
       return result;
     } };
     try {
-      const result = await deps.restartSession({ sessionId: session.id, pane: pane.id, pid: pane.pid, mode: 'now' }, {
+      const result = await deps.restartSession({ sessionId: session.id, pane: pane.id, pid: pane.pid, mode: 'now',
+        ...(force ? { force: true } : {}) }, {
         ...deps.restartDeps, root, env, host: wrappedHost, resumeAccount: target, resumeMcpConfig: compatibility.mcpConfig,
         resumeModel: current.model, resumeArgv: current.resumeSpec?.argv, resumeCwd: current.resumeSpec ? current.cwd : null,
         allowTerminalRateLimit: true,

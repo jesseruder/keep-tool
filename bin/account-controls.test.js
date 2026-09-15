@@ -75,6 +75,12 @@ test('pending, failed, recovery, and done transactions describe only verified st
   assert.match(render('failed', { reason: '<unsafe>' }), /&lt;unsafe&gt;/);
   assert.match(render('recovery-needed', { reason: 'stopped' }), /Transfer interrupted/);
   assert.match(render('recovery-needed'), /data-handoff-account="claude-two"/);
+  // Force transfer is offered only for the uncertain background-job refusal.
+  assert.doesNotMatch(render('recovery-needed', { reason: 'stopped' }), /Force transfer/);
+  const forceable = render('recovery-needed', { reason: 'Waiting for the turn and background work to finish' });
+  assert.match(forceable, /data-handoff-force="1"/);
+  assert.match(forceable, /Force transfer/);
+  assert.match(forceable, /a session mid-turn is still refused/);
   assert.match(render('done'), /Verifying transfer to Claude Two/);
   assert.doesNotMatch(render('done'), /Continued on/);
 

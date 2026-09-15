@@ -65,7 +65,11 @@ export function handoffControls(ctx, sessionId, paneId) {
     && current?.id === handoff.sourceAccountId
     ? `<button class="btn" data-portable-fallback="${ctx.esc(handoff.id || handoff.transactionId || '')}">Start fresh continuation</button>` : '';
   if (handoff?.status === 'recovery-needed') {
-    return `<span class="handoff-error" role="alert" title="${ctx.esc(handoff.reason || '')}">${openOnly ? 'Reopen interrupted' : 'Transfer interrupted'}</span><button class="btn" data-handoff-account="${ctx.esc(handoff.targetAccountId || '')}">Retry</button>${fallback}`;
+    // Only the background-job refusal is forceable; every other interruption
+    // reason needs the ordinary retry.
+    const forceable = String(handoff.reason || '').startsWith('Waiting for the turn and background work')
+      ? `<button class="btn" data-handoff-account="${ctx.esc(handoff.targetAccountId || '')}" data-handoff-force="1" title="Ignore uncertain background-job evidence and transfer now; a session mid-turn is still refused">Force transfer</button>` : '';
+    return `<span class="handoff-error" role="alert" title="${ctx.esc(handoff.reason || '')}">${openOnly ? 'Reopen interrupted' : 'Transfer interrupted'}</span><button class="btn" data-handoff-account="${ctx.esc(handoff.targetAccountId || '')}">Retry</button>${forceable}${fallback}`;
   }
   if (handoff?.status === 'done' && current?.id !== handoff.targetAccountId) {
     return `<span class="handoff-status" role="status">Verifying ${openOnly ? 'reopen on' : 'transfer to'} ${ctx.esc(targetLabel)}…</span>`;
@@ -114,7 +118,8 @@ export function installHandoffControls(container, ctx, sessionId, pane) {
       buttons.forEach((candidate) => { candidate.disabled = true; });
       button.blur();
       try {
-        const result = await write('/api/handoff-session', { sessionId, pane, accountId });
+        const force = button.dataset.handoffForce === '1';
+        const result = await write('/api/handoff-session', { sessionId, pane, accountId, ...(force ? { force: true } : {}) });
         const responseOpenOnly = result.intent === 'open-only' || openOnly;
         if (result.status === 'recovery-needed') {
           ctx.toast(`${responseOpenOnly ? 'Reopen' : 'Transfer'} needs recovery: ${result.reason || 'retry when the session is safe'}`);

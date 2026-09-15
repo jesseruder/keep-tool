@@ -819,3 +819,29 @@ test('a concurrent request for another target is rejected instead of joining the
     await first;
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
+
+test('an explicit force reaches the stop path, the ledger rebind and the recorded transaction', async () => {
+  const f = fixture();
+  try {
+    const d = deps(f);
+    let restartBody = null, rebindForce = null;
+    const baseRestart = d.restartSession;
+    d.restartSession = async (body, options) => { restartBody = body; return baseRestart(body, options); };
+    d.rebindLedger = (_sessionId, _source, _target, _transactionId, options) => { rebindForce = options.force; };
+    const result = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two', force: true }, d);
+    assert.equal(restartBody.force, true);
+    assert.equal(rebindForce, true);
+    assert.equal(result.force, true);
+    assert.equal(handoff.list(f.root)[0].force, true);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('a non-boolean force is rejected before anything is inspected', async () => {
+  const f = fixture();
+  try {
+    const d = deps(f, { inspect: async () => assert.fail('must not inspect'),
+      restartSession: async () => assert.fail('must not stop source') });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two', force: 'yes' }, d),
+      (error) => error.status === 400 && /force must be a boolean/.test(error.message));
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});

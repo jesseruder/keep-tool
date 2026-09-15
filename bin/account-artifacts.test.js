@@ -170,6 +170,44 @@ test('transaction-bound ledgers follow A to B to C to A with child evidence and 
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test('a forced rebind moves the root past a gapped ledger and leaves a transcript-less child alone', () => {
+  const f = fixture();
+  try {
+    const child = 'child';
+    fs.writeFileSync(transcript(f, 'a'), [
+      { type: 'user', sessionId: f.sid, timestamp: new Date(1000).toISOString(), message: { content: 'work' } },
+      { type: 'assistant', sessionId: f.sid, timestamp: new Date(1100).toISOString(), message: { stop_reason: 'tool_use',
+        content: [{ type: 'tool_use', id: 'spawn', name: 'Agent', input: {} }] } },
+      { type: 'user', sessionId: f.sid, timestamp: new Date(1200).toISOString(), message: { content: [
+        { type: 'tool_result', tool_use_id: 'spawn', content: `Async agent launched successfully. agentId: ${child}` },
+      ] } },
+      { type: 'assistant', sessionId: f.sid, timestamp: new Date(1500).toISOString(), message: { stop_reason: 'end_turn', content: [] } },
+    ].map(JSON.stringify).join('\n') + '\n');
+    jobs.sync({ root: f.root, agent: 'claude', sid: f.sid, file: transcript(f, 'a'), now: 1600 });
+    const snapshot = path.join(f.root, '.keep/background-jobs/claude', f.sid, 'state.json');
+    const state = JSON.parse(fs.readFileSync(snapshot));
+    assert.equal(state.jobs[`job:${child}`].status, 'pending');
+    assert.equal(state.restart.children[child], 'owned');
+    assert.equal(fs.existsSync(path.join(project(f, 'a'), f.sid, 'subagents', `agent-${child}.jsonl`)), false,
+      'the stale child has no transcript on either side');
+    state.gap = true; fs.writeFileSync(snapshot, JSON.stringify(state));
+    artifacts.copyClaudeArtifacts(f.sid, f.records.a, f.records.b, 'tx-force', options(f));
+    assert.throws(() => artifacts.rebindLedger(f.sid, f.records.a, f.records.b, 'tx-force', rebindOptions(f)),
+      /unavailable|incomplete/);
+    const rebound = artifacts.rebindLedger(f.sid, f.records.a, f.records.b, 'tx-force', rebindOptions(f, { force: true }));
+    assert.deepEqual(rebound.rebound.map((entry) => entry.sessionId), [f.sid], 'only the root ledger is rebound');
+    const after = JSON.parse(fs.readFileSync(snapshot));
+    assert.equal(after.source.file, path.resolve(transcript(f, 'b')));
+    assert.equal(after.gap, true);
+    assert.equal(after.jobs[`job:${child}`].status, 'pending', 'the stale child job is left exactly as it was');
+    assert.equal(fs.existsSync(path.join(f.root, '.keep/background-jobs/claude', child)), false,
+      'no ledger is invented for the dead child');
+    // A retry of the same forced transaction is idempotent, not a second stranding.
+    assert.deepEqual(artifacts.rebindLedger(f.sid, f.records.a, f.records.b, 'tx-force',
+      rebindOptions(f, { force: true })).rebound, [{ sessionId: f.sid, reused: true }]);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test('ledger rebind requires the exact completed artifact transaction and quiescent copy', () => {
   const f = fixture();
   try {

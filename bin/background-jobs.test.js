@@ -480,6 +480,37 @@ test('ledger rebind refuses divergent copies, hard links, and pre-existing incom
   }
 });
 
+test('a forced rebind accepts a gapped, restart-record-less ledger and reports no children', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-jobs-rebind-force-'));
+  const source = path.join(root, 'source.jsonl'), target = path.join(root, 'target.jsonl');
+  try {
+    fs.writeFileSync(source, JSON.stringify({ type: 'assistant', sessionId: 'parent', timestamp: new Date(1000).toISOString(),
+      message: { content: [], stop_reason: 'end_turn' } }) + '\n');
+    fs.copyFileSync(source, target);
+    jobs.sync({ root, agent: 'claude', sid: 'parent', file: source, now: 1100 });
+    const snapshot = path.join(root, '.keep/background-jobs/claude/parent/state.json');
+    const state = JSON.parse(fs.readFileSync(snapshot));
+    state.gap = true; delete state.restart; fs.writeFileSync(snapshot, JSON.stringify(state));
+    const request = { root, agent: 'claude', sid: 'parent', sourceFile: source, targetFile: target,
+      transactionId: 'tx-force', sourceStopVerifiedAt: 1 };
+    assert.throws(() => jobs.rebindSource(request), /incomplete/);
+    const rebound = jobs.rebindSource({ ...request, force: true });
+    assert.equal(rebound.reused, false);
+    assert.deepEqual(rebound.children, [], 'a forced rebind claims no verified child graph');
+    const after = JSON.parse(fs.readFileSync(snapshot));
+    assert.equal(after.source.file, path.resolve(target));
+    assert.equal(after.gap, true, 'the gap survives the rebind');
+    assert.equal(jobs.rebindSource({ ...request, force: true }).reused, true);
+    // A present restart record with children is still not reported under force.
+    const withChildren = JSON.parse(fs.readFileSync(snapshot));
+    withChildren.restart = { id: 'parent', children: { child: 'owned' }, launches: {}, mapped: {} };
+    fs.writeFileSync(snapshot, JSON.stringify(withChildren));
+    assert.deepEqual(jobs.rebindSource({ ...request, force: true }).children, [], 'force never reports the child graph');
+    fs.appendFileSync(target, 'divergent\n');
+    assert.throws(() => jobs.rebindSource({ ...request, force: true }), /does not match|no longer matches/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('missing resume, ungrounded prompt, prior gaps, and transcript read errors stay fail closed', () => {
   const lifecycle = require('./session-lifecycle');
   const scenarios = [

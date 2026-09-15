@@ -413,7 +413,7 @@ function catchUpStoppedLedger(plan, sessionId, transactionId, options) {
     && before.handoffRebind.target?.file === path.resolve(transcript.target)
     && before.source?.file === path.resolve(transcript.target);
   if (alreadyRebound) return () => {};
-  if (!before || before.version !== 1 || before.gap || before.source?.agent !== 'claude'
+  if (!before || before.version !== 1 || (before.gap && options.force !== true) || before.source?.agent !== 'claude'
       || before.source.sid !== sessionId || path.resolve(before.source.file || '') !== path.resolve(transcript.source)) {
     throw failure('job ledger source evidence is unavailable for stopped-session recovery', 'KEEP_ARTIFACT_LEDGER');
   }
@@ -432,7 +432,7 @@ function catchUpStoppedLedger(plan, sessionId, transactionId, options) {
   for (let pass = 0; pass < 8; pass++) {
     try {
       const unchanged = ledger.verify({ root: plan.root, agent: 'claude', sid: sessionId,
-        file: transcript.source, instance, resolveChild, allowTerminalRateLimit: true });
+        file: transcript.source, instance, resolveChild, allowTerminalRateLimit: true, force: options.force === true });
       unchanged();
       return unchanged;
     } catch (error) {
@@ -464,8 +464,13 @@ function rebindLedger(sessionId, source, target, transactionId, options = {}) {
     }
     visiting.add(id);
     const result = rebind({ root: plan.root, agent: 'claude', sid: id, sourceFile, targetFile, transactionId,
-      sourceStopVerifiedAt: options.sourceStopVerifiedAt });
+      sourceStopVerifiedAt: options.sourceStopVerifiedAt, force: options.force === true });
     rebound.push({ sessionId: id, reused: result.reused === true });
+    // Under force the persisted child graph is exactly the evidence
+    // restart-ledger.verify refused to trust, and a stale entry can name a child
+    // with no transcript on either side. Rebind the root and leave child ledgers
+    // untouched rather than stranding a half-rebound transaction.
+    if (options.force === true) { visiting.delete(id); return; }
     for (const child of result.children || []) {
       if (!sessionTree?.sourceManifest || !sessionTree?.targetManifest) {
         throw failure('Claude child artifacts are unavailable', 'KEEP_ARTIFACT_LEDGER');

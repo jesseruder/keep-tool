@@ -2838,6 +2838,9 @@ function validatedCodexResumeCwd(agent, value) {
 
 async function restartSession(body, deps = {}) {
   const host = (type, params) => hostRequest(type, params, deps);
+  // An explicit force discards uncertain background-job evidence only; the turn,
+  // tool and process identity checks below stay exactly as strict.
+  const force = body.force === true;
   let exitInputStarted = false;
   const transient = (reason) => body.mode === 'idle' && !exitInputStarted
     ? new (require('./session-restart').RestartDeferred)(reason) : new InjectionError(409, reason);
@@ -2850,7 +2853,7 @@ async function restartSession(body, deps = {}) {
     const terminalLimit = deps.allowTerminalRateLimit === true && session?.kind === 'claude' && session.rateLimit && !session.pendingBackground
       && !session.toolRunning && !session.pendingQuestion && !session.pendingPlan && !(session.unknownBackgroundJobs || []).length;
     const restartSessionState = terminalLimit ? { ...session, endedTurn: true, rateLimit: null } : session;
-    const reason = require('./session-restart').refusal(restartSessionState, pane, body.mode === 'idle');
+    const reason = require('./session-restart').refusal(restartSessionState, pane, body.mode === 'idle', { force });
     if (pane.pid !== body.pid) throw new InjectionError(409, 'Session process changed');
     if (reason) {
       if (/^Waiting |^Pause session-local scheduled jobs/.test(reason)) throw transient(reason);
@@ -2886,7 +2889,7 @@ async function restartSession(body, deps = {}) {
     let childProof;
     try {
       childProof = ledger.verify({ root: deps.root || keep.ROOT, agent: session.kind, sid: session.id, file,
-        allowTerminalRateLimit: terminalLimit,
+        allowTerminalRateLimit: terminalLimit, force,
         instance: { id: require('./background-jobs').processInstance(pane, originalIdentity.pid), processScoped: true, live: true }, resolveChild });
     } catch (error) {
       if (error instanceof ledger.Recovering) throw transient(error.message);
@@ -2914,7 +2917,7 @@ async function restartSession(body, deps = {}) {
     await checkChildren();
     try {
       await (deps.closeIdleSession || closeIdleSession)(body, { ...deps, allowTerminalRateLimit: terminalLimit,
-        restartProof: childProof, closePolicy: { manual: true, restart: true }, withInjectionLock: (fn) => fn(), beforeClose: checkChildren,
+        restartProof: childProof, closePolicy: { manual: true, restart: true, force }, withInjectionLock: (fn) => fn(), beforeClose: checkChildren,
         beforeExitInput: () => { exitInputStarted = true; },
       });
     } catch (error) {
@@ -3110,7 +3113,9 @@ async function closeIdleSession(body, deps = {}) {
     if (!fresh || typeof fresh.endedTurn !== 'boolean' || !Number.isFinite(fresh.mtime)) throw new InjectionError(409, 'Session activity could not be verified');
     const freshEnded = fresh.endedTurn === true || (deps.allowTerminalRateLimit && fresh.rateLimit && !fresh.pendingBackground
       && !fresh.toolRunning && !fresh.pendingQuestion && !fresh.pendingPlan && !(fresh.unknownBackgroundJobs || []).length);
-    if (fresh.mtime !== session.mtime || !freshEnded || fresh.pendingBackground || fresh.toolRunning) throw new InjectionError(409, 'Session changed during cleanup; nothing closed');
+    // A forced restart already accepted uncertain background evidence upstream;
+    // the transcript's turn, tool and mtime checks still have to agree.
+    if (fresh.mtime !== session.mtime || !freshEnded || (!deps.closePolicy?.force && fresh.pendingBackground) || fresh.toolRunning) throw new InjectionError(409, 'Session changed during cleanup; nothing closed');
     let verifyCodexChildren = null;
     let automaticProcessIdentity = null;
     let automaticProcessRows = null;
@@ -3174,8 +3179,9 @@ async function closeIdleSession(body, deps = {}) {
       if (!latest || typeof latest.endedTurn !== 'boolean' || !Number.isFinite(latest.mtime)) throw new InjectionError(409, 'Session activity could not be verified');
       const latestEnded = latest.endedTurn === true || (deps.allowTerminalRateLimit && latest.rateLimit && !latest.pendingBackground
         && !latest.toolRunning && !latest.pendingQuestion && !latest.pendingPlan && !(latest.unknownBackgroundJobs || []).length);
-      if (latest.mtime !== session.mtime || !latestEnded || latest.pendingBackground
-          || latest.unknownBackgroundJobs?.length || latest.toolRunning || latest.pendingQuestion || latest.pendingPlan) {
+      if (latest.mtime !== session.mtime || !latestEnded
+          || (!deps.closePolicy?.force && (latest.pendingBackground || latest.unknownBackgroundJobs?.length))
+          || latest.toolRunning || latest.pendingQuestion || latest.pendingPlan) {
         throw new InjectionError(409, 'Session changed during cleanup; nothing closed');
       }
       if (deps.closePolicy?.automatic) {
