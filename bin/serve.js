@@ -3242,6 +3242,34 @@ function reviewerResumeSpec(session, pane, deps = {}) {
   };
 }
 
+// KEEP_REPAIR marks a session as a daemon self-repair agent, and `keep hook
+// pre-bash` refuses the restart and the live-checkout writes for anything that
+// carries it. The marker has to survive a restart, a force-restart, an account
+// handoff and a plain `keep resume`, so it is derived from a durable fact — the
+// card's `self-repair` tag — rather than from whatever the first launch passed.
+// A launch with no card behind it is not a repair session and gets nothing.
+function repairEnvFor(context, deps = {}) {
+  const tagged = (task) => Boolean(task && task.fm && (task.fm.tags || []).includes('self-repair'));
+  const loadTask = deps.loadTask || keep.loadTask;
+  try {
+    if (context && context.taskId) {
+      let task;
+      try { task = loadTask(context.taskId); } catch { task = null; }
+      return tagged(task) ? { KEEP_REPAIR: '1' } : {};
+    }
+    if (context && context.sessionId) {
+      const task = (deps.loadAll || keep.loadAll)(true)
+        .find((candidate) => (candidate.fm.sessions || []).some((entry) => entry.id === context.sessionId));
+      return tagged(task) ? { KEEP_REPAIR: '1' } : {};
+    }
+  } catch (error) {
+    // A registry that cannot be read must not stop a restart. It fails open on the
+    // marker, which is the same state as before this existed.
+    process.stderr.write(`keep serve: could not check the self-repair tag: ${String(error && error.message || error)}\n`);
+  }
+  return {};
+}
+
 function validatedCodexResumeCwd(agent, value) {
   let available = agent === 'codex' && typeof value === 'string' && value.length > 0
     && !value.includes('\0') && path.isAbsolute(value);
@@ -3382,7 +3410,7 @@ async function restartSession(body, deps = {}) {
     }
     const result = await host('replace-exited', { paneId: pane.id, expectedPid: pane.pid, sessionId: stopped.meta?.sessionId,
       cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`], cwd,
-      env: require('./agent-launcher').launcherEnv(reviewerSpec.env),
+      env: require('./agent-launcher').launcherEnv({ ...repairEnvFor({ sessionId: session.id }, deps), ...reviewerSpec.env }),
       cols: pane.cols, rows: pane.rows, meta: { ...pane.meta, agent: session.kind, sessionId: session.id,
         accountId: account.id, accountLabel: account.label, restartedAt: Date.now() } });
     await (deps.waitForHostAgent || waitForHostAgent)({ pane: pane.id }, session.kind, deps);
@@ -3465,7 +3493,7 @@ async function forceRestartSession(entry, save, deps = {}) {
         }
         const result = await host('replace-exited', { paneId: job.pane, expectedPid, sessionId: stopped.meta?.sessionId,
           cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`], cwd: original.cwd,
-          env: require('./agent-launcher').launcherEnv(reviewerSpec.env),
+          env: require('./agent-launcher').launcherEnv({ ...repairEnvFor({ sessionId: job.sessionId }, deps), ...reviewerSpec.env }),
           cols: original.cols, rows: original.rows, meta: { ...original.meta, accountId: account.id, accountLabel: account.label,
             forceRestartToken: job.token, restartedAt: Date.now() } });
         return { ok: true, pane: result.pane.id, pid: result.pane.pid, sessionId: job.sessionId };
@@ -4718,7 +4746,7 @@ async function openSession(body, deps = {}) {
     const spawned = await hostRequest('spawn', {
       cmd: '/bin/zsh',
       args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`],
-      env: require('./agent-launcher').launcherEnv(deps.launchEnv),
+      env: require('./agent-launcher').launcherEnv({ ...repairEnvFor({ taskId: body.taskId, sessionId }, deps), ...deps.launchEnv }),
       cwd: project,
       cols: 200,
       rows: 50,
@@ -4888,6 +4916,15 @@ async function openSession(body, deps = {}) {
           String(error?.message || error).slice(0, 500), extra);
       }
       error.extra = extra;
+    } else {
+      // The pane is up and an agent is running in it. Everything that throws from
+      // here on — the readiness wait, the opening message, a reservation check —
+      // leaves that agent alive, so the caller has to be able to tell "nothing
+      // started" from "it started and I could not confirm the rest". Without this
+      // a caller that retries on failure opens a second agent on the same work.
+      const started = { pane: launch.pane, sessionId: launch.sessionId || null, accountId: account.id, agent };
+      if (error instanceof InjectionError) error.extra = { ...(error.extra || {}), launch: started };
+      else if (error && typeof error === 'object') error.launch ||= started;
     }
     throw error;
   } finally {
@@ -6582,7 +6619,7 @@ async function resumeExitedAccountHandoff(entry, account, mcpConfig, deps = {}) 
   const result = await host('replace-exited', {
     paneId: pane.id, expectedPid: entry.pid, sessionId: pane.meta?.sessionId,
     cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`], cwd,
-    env: require('./agent-launcher').launcherEnv(reviewerSpec.env),
+    env: require('./agent-launcher').launcherEnv({ ...repairEnvFor({ sessionId: entry.sessionId }, deps), ...reviewerSpec.env }),
     cols: entry.cols, rows: entry.rows,
     meta: { ...pane.meta, agent, sessionId: entry.sessionId, accountId: account.id, accountLabel: account.label,
       handoffTransactionId: entry.id, restartedAt: Date.now() },
@@ -8509,6 +8546,7 @@ function start(deps = {}) {
 }
 
 module.exports = {
+  repairEnvFor,
   messageWatcherDashboardState,
   prepareSessionSummary, sessionSummarySnapshot, associateDashboardSessionFiles,
   start,

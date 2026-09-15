@@ -698,6 +698,54 @@ test('a session that cannot be opened is said on the card, and the next tick tri
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('an open that fails with a pane attached counts as launched and is never retried', async () => {
+  const root = makeRoot();
+  try {
+    const snapshot = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const config = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 };
+    const { deps, calls } = harness({ root, snapshot, config });
+    // openSession spawned the pane and then failed to confirm the opening message.
+    // The agent is alive in pane-orphan; treating this as "not launched" would put
+    // a second agent on the same fault fifteen minutes later.
+    deps.openSession = async (body, openDeps) => {
+      calls.runs.push({ body, openDeps });
+      const error = new Error('the pane stopped echoing');
+      error.extra = { launch: { pane: 'pane-orphan', sessionId: 'abcd1234-0000-4000-8000-000000000000', agent: 'claude' } };
+      throw error;
+    };
+
+    const opened = await selfRepair.tick(deps);
+    assert.equal(opened.opened[0].launched, true, 'a pane means an agent is running');
+    assert.equal(opened.opened[0].sessionId, 'abcd1234-0000-4000-8000-000000000000');
+    const note = calls.checkins.at(-1);
+    assert.match(note.message, /opened in pane pane-orphan \(session abcd1234\)/);
+    assert.match(note.message, /could not be confirmed: the pane stopped echoing/);
+    assert.match(note.message, /do not resume this card by hand/);
+
+    const sig = opened.opened[0].sig;
+    const entry = selfRepair.loadState(root).signatures[sig];
+    assert.equal(entry.pane, 'pane-orphan');
+    assert.notEqual(selfRepair.resumeBlocker(entry, config, NOW + 60 * 60e3), '');
+
+    // Later ticks leave it alone: one agent per fault, whatever the launch returned.
+    const later = await selfRepair.tick({ ...deps, now: NOW + 60 * 60e3 });
+    assert.deepEqual([later.opened, later.resumed], [[], []]);
+    assert.equal(calls.runs.length, 1, 'no second pane');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('an entry an older keep-tool wrote still reads as launched', () => {
+  const config = { ...selfRepair.DEFAULT_CONFIG };
+  // Before repairs were sessions the launch was recorded as runId. An upgraded
+  // daemon that read this as "never launched" would put a second agent on it.
+  const old = { cardId: 'a-repair-card', runId: 'run-1', lastAttemptAt: 0 };
+  assert.match(selfRepair.resumeBlocker(old, config, NOW), /already open for this signature \(session run-1\)/);
+  assert.equal(selfRepair.resumeBlocker({ cardId: 'a-repair-card', lastAttemptAt: 0 }, config, NOW), '',
+    'and an entry with none of the three is still resumable');
+});
+
 test('a launch that keeps failing gives up instead of retrying forever', async () => {
   const root = makeRoot();
   try {
@@ -829,6 +877,82 @@ test('evidence is redacted before it is committed with the registry', () => {
     assert.equal(selfRepair.symptomNote(candidate).includes('xoxb-88aa11bb22cc33dd44ee'), false);
     assert.equal(selfRepair.buildRecipe({ candidate, cardId: 'c', worktree: '/w', branch: 'b' })
       .includes('xoxb-88aa11bb22cc33dd44ee'), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the recipe cites evidence by absolute path, and a lost recipe path is found again', async () => {
+  const root = makeRoot();
+  try {
+    const snapshot = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const config = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 };
+    const { deps, calls } = harness({ root, snapshot, config });
+    await selfRepair.tick(deps);
+
+    // The agent reads this with the worktree as its cwd, where `.keep/artifacts/...`
+    // resolves to nothing. Absolute, or it is not a citation.
+    const recipe = calls.artifactText.get('recipe.md');
+    assert.match(recipe, new RegExp(`- ${root.replace(/[.*+?^$()|[\\]\\\\]/g, '\\\\$&')}/\\.keep/artifacts/repair-card-1/health-row\\.json`));
+    assert.equal(/^- \.keep\//m.test(recipe), false, 'no keep-relative path survives into the recipe');
+    // …while the card and the state keep the short spelling.
+    assert.match(calls.checkins.at(-1).message, /Evidence: \.keep\/artifacts\/repair-card-1\/health-row\.json/);
+
+    // A daemon that died between reserving the card and recording the path left
+    // the file behind; the resume finds it rather than saying it was never stored.
+    const stored = path.join(root, '.keep', 'artifacts', 'repair-card-1', 'recipe.md');
+    fs.mkdirSync(path.dirname(stored), { recursive: true });
+    fs.writeFileSync(stored, recipe);
+    assert.equal(selfRepair.findRecipeArtifact('repair-card-1', root), stored);
+    assert.equal(selfRepair.findRecipeArtifact('no-such-card', root), '');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a junk KEEP_REPAIR_MODEL is ignored loudly instead of failing the launch', () => {
+  const config = { ...selfRepair.DEFAULT_CONFIG, model: 'opus' };
+  const logged = [];
+  const write = (line) => logged.push(line);
+  assert.equal(selfRepair.launchModel(config, {}, write), 'opus');
+  assert.equal(selfRepair.launchModel(config, { KEEP_REPAIR_MODEL: 'claude-fable-5-1' }, write), 'claude-fable-5-1');
+  assert.deepEqual(logged, [], 'a model id passes through silently');
+  // A value the claude CLI would reject must not reach it: the worktree is already
+  // built by then, so the launch would fail for a typo in an env var.
+  assert.equal(selfRepair.launchModel(config, { KEEP_REPAIR_MODEL: 'opus --dangerously' }, write), 'opus');
+  assert.match(logged.join(''), /ignoring KEEP_REPAIR_MODEL="opus --dangerously": not a model id; using opus/);
+});
+
+test('the attempt counter belongs to one card, not to the signature forever', async () => {
+  const root = makeRoot();
+  try {
+    const failing = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const healed = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 0, lastOkAt: NOW + 60e3, lastError: 'unblock is broken' },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const config = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 };
+    const { deps } = harness({ root, snapshot: failing, config, worktree: { ok: false, error: 'worktree exists' } });
+
+    // Two failed launches, then the symptom clears on its own.
+    await selfRepair.tick(deps);
+    await selfRepair.tick({ ...deps, now: NOW + 20 * 60e3 });
+    const sig = Object.keys(selfRepair.loadState(root).signatures)[0];
+    assert.equal(selfRepair.loadState(root).signatures[sig].attempts, 2);
+
+    await selfRepair.tick({ ...deps, snapshot: () => healed, now: NOW + 25 * 60e3 });
+    await selfRepair.tick({ ...deps, snapshot: () => healed, now: NOW + 95 * 60e3 });
+    const resolved = selfRepair.loadState(root).signatures[sig];
+    assert.ok(resolved.resolvedAt);
+    assert.equal(resolved.attempts, undefined, 'a recurrence must not start one try from giving up');
+    assert.equal(resolved.launchGaveUp, undefined);
+
+    // …and --reset clears it too.
+    selfRepair.mutateState((state) => { state.signatures[sig].attempts = 3; state.signatures[sig].launchGaveUp = true; },
+      { root, now: NOW });
+    selfRepair.reset(sig, { root, now: NOW });
+    const after = selfRepair.loadState(root).signatures[sig];
+    assert.equal(after.attempts, undefined);
+    assert.equal(after.launchGaveUp, undefined);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

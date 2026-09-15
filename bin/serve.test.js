@@ -92,6 +92,7 @@ const {
   writeToShellPane,
   stripTerminalAnsi,
   openSession,
+  repairEnvFor,
   reopenSessionOnAccount,
   resolveReviewLaunchSelection,
   addHostSessionState,
@@ -4571,6 +4572,73 @@ test('an internal launchEnv reaches the pane shell, and a request body can never
       }), (error) => error.status === 400 && /env is not accepted/.test(error.message));
     }
     assert.equal(host.calls.filter((call) => call.type === 'spawn').length, 1);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('KEEP_REPAIR comes from the card self-repair tag, so a restart cannot clear it', async () => {
+  const repair = { fm: { tags: ['personal', 'self-repair'], sessions: [{ id: 'repair-session', agent: 'claude' }] } };
+  const plain = { fm: { tags: ['personal'], sessions: [{ id: 'plain-session', agent: 'claude' }] } };
+  const loadTask = (id) => (id === 'repair-card' ? repair : id === 'plain-card' ? plain : null);
+  const loadAll = () => [repair, plain];
+
+  // By card, which is what an open on a card has.
+  assert.deepEqual(repairEnvFor({ taskId: 'repair-card' }, { loadTask }), { KEEP_REPAIR: '1' });
+  assert.deepEqual(repairEnvFor({ taskId: 'plain-card' }, { loadTask }), {});
+  // By session, which is all a restart, a force-restart or a handoff has.
+  assert.deepEqual(repairEnvFor({ sessionId: 'repair-session' }, { loadTask, loadAll }), { KEEP_REPAIR: '1' });
+  assert.deepEqual(repairEnvFor({ sessionId: 'plain-session' }, { loadTask, loadAll }), {});
+  // Nothing to go on, and a registry that cannot be read, both mark nothing.
+  assert.deepEqual(repairEnvFor({}, { loadTask, loadAll }), {});
+  assert.deepEqual(repairEnvFor({ taskId: 'gone' }, { loadTask: () => { throw new Error('no card'); } }), {});
+
+  // …and it reaches the pane on an ordinary open, with no launchEnv passed at all.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-repair-tag-'));
+  try {
+    const project = path.join(root, 'project');
+    fs.mkdirSync(project, { recursive: true });
+    const spawnEnv = async (taskId) => {
+      const host = recordingHost((type) => type === 'spawn' ? { pane: { id: `pane-${taskId}` } } : {});
+      await openSession({ taskId, fresh: true, agent: 'claude' }, {
+        host,
+        loadTask: () => ({ fm: { ...(taskId === 'repair-card' ? repair.fm : plain.fm), project, sessions: [] } }),
+        randomUUID: () => '55555555-5555-4555-8555-555555555555',
+        waitForHostAgent: async () => true,
+        trustProject: () => true,
+        linkLaunchedSession: () => true,
+      });
+      return host.calls.find((call) => call.type === 'spawn').params.env;
+    };
+    assert.equal((await spawnEnv('repair-card')).KEEP_REPAIR, '1');
+    assert.equal('KEEP_REPAIR' in await spawnEnv('plain-card'), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a card open that fails after the pane is up says which pane is running', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-orphan-'));
+  try {
+    const project = path.join(root, 'project');
+    fs.mkdirSync(project, { recursive: true });
+    const host = recordingHost((type) => type === 'spawn' ? { pane: { id: 'pane-orphan' } } : {});
+    // Everything after the spawn leaves the agent alive. A caller told only
+    // "it failed" would launch a second agent onto the same card.
+    await assert.rejects(openSession({ taskId: 'card', fresh: true, agent: 'claude', message: 'begin' }, {
+      host,
+      loadTask: () => ({ fm: { project, sessions: [] } }),
+      randomUUID: () => '66666666-6666-4666-8666-666666666666',
+      waitForHostAgent: async () => true,
+      trustProject: () => true,
+      typeOpeningMessage: async () => { throw new Error('the pane stopped echoing'); },
+    }), (error) => {
+      assert.equal(error.launch.pane, 'pane-orphan');
+      assert.equal(error.launch.sessionId, '66666666-6666-4666-8666-666666666666');
+      assert.equal(error.launch.agent, 'claude');
+      return true;
+    });
+
+    // A failure before the spawn carries no pane: nothing started, safe to retry.
+    await assert.rejects(openSession({ taskId: 'card', fresh: true, agent: 'claude', cwd: path.join(root, 'gone') }, {
+      host, loadTask: () => ({ fm: { project, sessions: [] } }),
+    }), (error) => error.launch === undefined && (error.extra || {}).launch === undefined);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

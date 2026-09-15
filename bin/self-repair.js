@@ -632,9 +632,9 @@ function buildRecipe(context) {
     '   The review runs in the background, but you must WAIT for its result before you do anything else, and',
     '   YOUR TURN MUST NOT END WHILE THE REVIEW IS STILL PENDING. Nothing will wake you up: this session is not',
     '   headless, but a promise to "check the result later" still ends the repair with nothing landed.',
-    '   So poll it in the foreground: `keep codex --account codex/default status --json`, in a shell `while`',
-    '   loop with `sleep 30`, until that job is no longer running. Then read it:',
-    '   keep codex --account codex/default result <job-id>',
+    '   So poll it in the foreground. `status --json` lists the running jobs, so wait for yours to leave that list:',
+    "   until ! keep codex --account codex/default status --json | grep -q '\"<job-id>\"'; do sleep 30; done",
+    '   then read it: keep codex --account codex/default result <job-id>',
     '   Record what it said:',
     `   keep reviewed ${cardId} --commit origin/master..HEAD --verdict clean --by "codex sol" --job <job-id>`,
     `5. Land only if Keep allows it: keep allow ${cardId} land, and if that exits 0, keep land ${cardId}.`,
@@ -647,7 +647,8 @@ function buildRecipe(context) {
     'Hard constraints:',
     '- Never edit, commit, or run git writes in ~/keep-tool: that is the live daemon checkout. Only this worktree.',
     '- Never restart the daemon. `keep restart-daemon`, `keep service`, and `launchctl` are refused for you',
-    '  (KEEP_REPAIR=1 is set in your environment and the pre-bash guard blocks them). Owner restarts it.',
+    '  (this card carries the `self-repair` tag, so every launch of this session sets KEEP_REPAIR=1 and the',
+    '  pre-bash guard blocks them — a restart or a handoff does not clear it). Owner restarts the daemon.',
     '- Never `git push --force` and never `wt land`; landing goes through `keep land`, which enforces the review record.',
     '- Fix this signature\'s root cause and nothing else. A broad refactor cannot be reviewed from here.',
     `- Aim to finish within ${config.budgetMin} minutes; check in on the card if it will take longer.`,
@@ -672,10 +673,34 @@ function defaultDeps(deps) {
     openSession: deps.openSession || (() => { throw new Error('no openSession was wired into the self-repair scheduler'); }),
     accountId: deps.accountId || repairAccountId,
     worktreePath: deps.worktreePath || ((name) => worktreePath(name)),
+    findRecipe: deps.findRecipe || ((cardId) => findRecipeArtifact(cardId, deps.root || keep.ROOT)),
     insideWorktreeRoot: deps.insideWorktreeRoot || ((candidate) => require('./runs.js').insideWorktreeRoot(candidate)),
     setPlan: deps.setPlan || ((task, steps) => keep.setPlan(task, steps)),
     onChange: deps.onChange || (() => {}),
   };
+}
+
+// The recipe artifact for a card, when state does not have it: a daemon that died
+// between reserving the card and recording the path still stored the file, and a
+// resume that fell back to "the recipe could not be stored" would throw away a
+// perfectly good one.
+function findRecipeArtifact(cardId, root = keep.ROOT) {
+  const directory = path.join(root, '.keep', 'artifacts', cardId);
+  try {
+    const names = fs.readdirSync(directory).filter((name) => /^recipe.*\.md$/i.test(name)).sort();
+    return names.length ? path.join(directory, names[0]) : '';
+  } catch { return ''; }
+}
+
+// KEEP_REPAIR_MODEL is a per-daemon override typed by a person. A value the CLI
+// will reject would fail the launch after the worktree is built, so it is checked
+// here and ignored — loudly — rather than passed through.
+function launchModel(config, env = process.env, write = process.stderr.write.bind(process.stderr)) {
+  const override = env.KEEP_REPAIR_MODEL;
+  if (!override) return config.model;
+  if (keep.LAUNCH_MODEL_RE.test(override)) return override;
+  write(`keep self-repair: ignoring KEEP_REPAIR_MODEL="${clip(override, 80)}": not a model id; using ${config.model}\n`);
+  return config.model;
 }
 
 // The repair session spends against a real Claude account, so it has to name one.
@@ -749,9 +774,15 @@ function createRepairCard(candidate, snapshot, context) {
     return stored.map((entry) => entry.destination || '').filter(Boolean);
   };
 
+  // Two spellings of the same files. The card's check-in and the state entry get
+  // the short path relative to ~/keep; the recipe gets absolute ones, because it
+  // is read by an agent whose cwd is the worktree, where a relative Keep path
+  // resolves to nothing.
+  let stored = [];
   let artifacts = [];
   try {
-    artifacts = store(evidence.files, 'evidence').map((file) => path.relative(root, file));
+    stored = store(evidence.files, 'evidence');
+    artifacts = stored.map((file) => path.relative(root, file));
   } catch (error) {
     deps.write(`keep self-repair: could not attach evidence to ${cardId}: ${clip(error && error.message || error, 200)}\n`);
   }
@@ -764,7 +795,7 @@ function createRepairCard(candidate, snapshot, context) {
   try {
     const name = worktreeName(candidate.sig);
     const text = buildRecipe({
-      candidate, cardId, worktree: deps.worktreePath(name), branch: `wt/${name}`, artifacts, config,
+      candidate, cardId, worktree: deps.worktreePath(name), branch: `wt/${name}`, artifacts: stored, config,
     });
     recipe = store([{ name: 'recipe.md', text: `${text}\n` }], 'recipe')[0] || '';
   } catch (error) {
@@ -802,6 +833,9 @@ async function launchRepair(candidate, cardId, artifacts, context) {
     return { cardId, artifacts, launched: false, worktreeError: `${created.path} is not inside the worktree root` };
   }
 
+  // A resume after a crash may have lost the recipe path without losing the file.
+  const recipePath = recipe || deps.findRecipe(cardId);
+
   // An ordinary interactive session in the terminal host, opened on the card the
   // same way the console's "Start work" does — not a headless run. A headless run
   // ends when its turn ends, which killed the first live repair mid-review, with
@@ -815,10 +849,31 @@ async function launchRepair(candidate, cardId, artifacts, context) {
       cwd: created.path,
       agent: 'claude',
       accountId: deps.accountId(),
-      model: process.env.KEEP_REPAIR_MODEL || config.model,
-      message: openingMessage({ candidate, cardId, worktree: created.path, recipe }),
+      model: launchModel(config, process.env, deps.write),
+      message: openingMessage({ candidate, cardId, worktree: created.path, recipe: recipePath }),
     }, { launchEnv: { KEEP_REPAIR: '1' } });
   } catch (error) {
+    // openSession attaches the pane to anything it throws after the spawn. A pane
+    // means an agent IS running: saying "not launched" here would make the resume
+    // path open a second one on the same fault fifteen minutes later, and again
+    // after that. Only a failure before the spawn is safe to retry.
+    const started = (error && error.extra && error.extra.launch) || (error && error.launch) || null;
+    if (started && started.pane) {
+      deps.checkin(cardId, {
+        heading: 'self-repair',
+        message: `A repair session opened in pane ${started.pane}${started.sessionId ? ` (session ${String(started.sessionId).slice(0, 8)})` : ''},`
+          + ` but the launch could not be confirmed: ${clip(error && error.message || error, 300)}.`
+          + ` It is running — do not resume this card by hand; look at the pane. The recipe is on this card.`,
+        linkSession: false,
+        commitLabel: SELF_NAME,
+      });
+      return {
+        cardId, artifacts, worktree: created.path, launched: true,
+        sessionId: started.sessionId || null,
+        pane: started.pane,
+        launchError: String(error && error.message || error),
+      };
+    }
     deps.checkin(cardId, {
       heading: 'self-repair',
       message: `Worktree ${created.path} is ready but the repair session could not be opened: ${clip(error && error.message || error, 300)}. Resume it by hand with \`keep resume ${cardId}\`.`,
@@ -834,8 +889,9 @@ async function launchRepair(candidate, cardId, artifacts, context) {
     linkSession: false,
     commitLabel: SELF_NAME,
   });
-  // A pane with no session id still counts as launched: re-launching would put a
-  // second agent on one fault, which is the one thing this scheduler must not do.
+  // A pane with no session id still counts as launched — and so does a launch that
+  // threw after the spawn, above. Anything that leaves an agent running must read
+  // as launched: a second agent on one fault is the one thing this must not do.
   return {
     cardId, artifacts, worktree: created.path, launched: true,
     sessionId: (opened && opened.sessionId) || null,
@@ -845,9 +901,11 @@ async function launchRepair(candidate, cardId, artifacts, context) {
 
 // Why a reserved-but-unlaunched card is not resumed on this tick, or '' if it is.
 // A pane with no session id registered yet still blocks: an agent is running in
-// it, and a second one on the same fault is worse than a missing id.
+// it, and a second one on the same fault is worse than a missing id. `runId` is
+// the pre-session spelling — an entry written by an older keep-tool must not read
+// as never launched and get a second agent on the first tick after an upgrade.
 function resumeBlocker(entry, config, now) {
-  const launched = entry.sessionId || entry.pane;
+  const launched = entry.sessionId || entry.pane || entry.runId;
   if (launched) return `card ${entry.cardId} is already open for this signature (session ${String(launched).slice(0, 8)})`;
   if (!config.launch) return `card ${entry.cardId} is already open for this signature; launching is off`;
   if (entry.launchGaveUp) return `card ${entry.cardId} is open but its launch failed ${MAX_LAUNCH_ATTEMPTS} times; resume it by hand`;
@@ -938,6 +996,11 @@ async function tick(input = {}) {
         // sighting so it has to survive minAgeMin again before it opens a card.
         delete fresh.firstSeenAt;
         delete fresh.artifacts;
+        // The attempt counter belongs to one card's launch, not to the signature
+        // for all time: carrying it across a resolve would let a recurrence give
+        // up on its very first try because two earlier cards had a bad worktree.
+        delete fresh.attempts;
+        delete fresh.launchGaveUp;
         fresh.ticks = 0;
       }, { root, now, write: deps.write });
       result.resolved.push(sig);
@@ -1210,6 +1273,7 @@ function reset(sig, options = {}) {
     delete entry.worktree;
     delete entry.artifacts;
     delete entry.launchGaveUp;
+    delete entry.attempts;
     delete entry.firstSeenAt;
     entry.ticks = 0;
     return { found: true, cleared: true, previousCardId: entry.previousCardId || null };
@@ -1223,6 +1287,7 @@ module.exports = {
   normalizeError, signatureHash, signatures, signatureClear, deliveryRowOf,
   readTail, readLogExcerpt, scrubBlock, redactSecrets, collectEvidence, stageEvidence, deliveryEvidence,
   cardTitle, symptomNote, buildRecipe, openingMessage, repairAccountId,
+  findRecipeArtifact, launchModel,
   worktreeName, worktreePath, spawnWorktree, worktreeReady,
   createRepairCard, launchRepair, resumeBlocker, EXCLUDED, MAX_LAUNCH_ATTEMPTS, RESUME_BACKOFF_MS,
   tick, startScheduler, status, renderStatus, dryRun, renderDry, reset,
