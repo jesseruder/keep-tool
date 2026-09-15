@@ -1311,6 +1311,30 @@ function ingestSessionsFromLiveState(sessions, options = {}) {
   };
 }
 
+// Transcripts the index has not read to the end. The daemon's live sweep drops a
+// session once it is no longer seen alive; one that stopped with unread turns still
+// needs ticks. Only paths the caller already knows are checked: one stat and one row
+// lookup each, and a busy database reports nothing rather than blocking.
+function unfinishedFiles(files, options = {}) {
+  const list = [...new Set((files || []).filter((file) => typeof file === 'string' && file))];
+  const unfinished = new Set();
+  if (!list.length) return unfinished;
+  let handle;
+  try { handle = open(options.db || databaseFile(), { busyTimeoutMs: options.busyTimeoutMs ?? 250 }); }
+  catch { return unfinished; }
+  let row;
+  try { row = handle.prepare('SELECT "offset" AS offset FROM ingest_state WHERE file = ?'); }
+  catch { return unfinished; }
+  for (const file of list) {
+    let size;
+    try { size = fs.statSync(file).size; } catch { continue; }
+    let offset;
+    try { offset = Number(row.get(file)?.offset || 0); } catch { return unfinished; }
+    if (size > offset) unfinished.add(file);
+  }
+  return unfinished;
+}
+
 function claudeBackfillDirs() {
   const dirs = [];
   let roots = [];
@@ -1564,7 +1588,7 @@ function stats(options = {}) {
 }
 
 module.exports = {
-  open, close, databaseFile, ingestFile, ingestSessionsFromLiveState, backfill, prune, pruneCandidates,
+  open, close, databaseFile, ingestFile, ingestSessionsFromLiveState, unfinishedFiles, backfill, prune, pruneCandidates,
   search, turnsForSession, sessionRow, stats, isNudge, normalizeProject,
   SCHEMA_VERSION, TEXT_CAP, TOOL_CAP, COMMAND_CAP, NUDGE_RE, DEFAULT_PRUNE_DAYS,
   toolInputCommand,

@@ -266,6 +266,20 @@ test('ingest is incremental, idempotent, and resets after truncation', (t) => {
   assert.equal(turnIndex.search('flaky').length, 1);
 });
 
+test('unfinishedFiles reports transcripts with bytes the index has not read', (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, `${SESSION}.jsonl`);
+  const missing = path.join(dir, 'missing.jsonl');
+  const records = claudeRecords();
+  fs.writeFileSync(file, jsonl(records.slice(0, 6)));
+  assert.deepEqual([...turnIndex.unfinishedFiles([file, missing])], [file], 'a never-indexed transcript is unfinished');
+  turnIndex.ingestFile(file, { agent: 'claude' });
+  assert.deepEqual([...turnIndex.unfinishedFiles([file])], [], 'a fully read transcript is finished');
+  fs.appendFileSync(file, jsonl(records.slice(6)));
+  assert.deepEqual([...turnIndex.unfinishedFiles([file])], [file], 'new turns make it unfinished again');
+  assert.deepEqual([...turnIndex.unfinishedFiles([])], []);
+});
+
 test('search finds indexed text and stats count nudges', (t) => {
   const dir = tempDir(t);
   const claudeFile = path.join(dir, `${SESSION}.jsonl`);

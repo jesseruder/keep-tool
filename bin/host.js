@@ -421,6 +421,11 @@ function createHost(options = {}) {
   // re-attach under the same viewer ids moments later. Keep that viewer primary for a
   // grace period so the terminal neither drops to a scaled observer nor gets resized
   // by whichever viewer claims first; a viewer that never returns hands off as before.
+  const clearPrimaryGrace = (pane) => {
+    if (!pane.primaryGraceTimer) return;
+    clearTimeout(pane.primaryGraceTimer);
+    pane.primaryGraceTimer = null;
+  };
   const holdPrimary = (pane, viewer) => {
     if (pane.primaryGraceTimer) clearTimeout(pane.primaryGraceTimer);
     pane.primaryGraceTimer = setTimeout(() => {
@@ -979,9 +984,14 @@ function createHost(options = {}) {
           connection.viewers.set(pane.id, viewer);
           connection.pendingAttach.set(pane.id, pending);
           if (attachment.primary && pane.primary === null) setPrimary(pane, viewer);
-          if (pane.primary === viewer && pane.primaryGraceTimer) {
-            clearTimeout(pane.primaryGraceTimer);
-            pane.primaryGraceTimer = null;
+          if (pane.primary === viewer) {
+            // The viewer came back while still holding primary (see holdPrimary). It owns
+            // the pane again, ordinary resizes included, whether or not it has focus.
+            attachment.primary = true;
+            if (pane.primaryGraceTimer) {
+              clearTimeout(pane.primaryGraceTimer);
+              pane.primaryGraceTimer = null;
+            }
           }
         } catch (error) {
           detachPane(connection, pane);
@@ -1411,7 +1421,10 @@ function createHost(options = {}) {
         // endpoint (server.close() leaves the socket file behind) and clear the
         // flags so requests flow again; the bootstrap keeps us while `serving` is true.
         dropAllConnections();
-        for (const pane of panes.values()) setPrimary(pane, null);
+        for (const pane of panes.values()) {
+          clearPrimaryGrace(pane);
+          setPrimary(pane, null);
+        }
         await serverClosed.catch(() => {});
         listening = false;
         try { unlink(sock); } catch {}
@@ -1427,6 +1440,9 @@ function createHost(options = {}) {
       for (const pane of panes.values()) {
         pane.handoffRecord = record.panes.find((candidate) => candidate.id === pane.id);
       }
+      // A grace timer would keep this retired core's panes alive and could emit a
+      // primary change from it; the adopting core starts with no primary anyway.
+      for (const pane of panes.values()) clearPrimaryGrace(pane);
       retired = true;
       dropAllConnections();
       await serverClosed;
@@ -1471,6 +1487,7 @@ function createHost(options = {}) {
         await Promise.all(survivors.map((pane) => pane.exit));
       }
 
+      for (const pane of panes.values()) clearPrimaryGrace(pane);
       for (const connection of connections) {
         detachConnection(connection);
         connection.socket.destroy();

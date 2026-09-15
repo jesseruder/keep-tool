@@ -5236,12 +5236,17 @@ function liveTurnIndexSessions(deps = {}) {
   const ledger = readLiveSessionLedger(deps);
   const now = (deps.now || Date.now)();
   const wanted = new Map();
+  const stale = new Map();
   for (const [id, entry] of Object.entries(ledger.sessions || {})) {
     if (!entry || !/^[A-Za-z0-9_-]+$/.test(id)) continue;
+    const agent = entry.agent === 'codex' ? 'codex' : 'claude';
     // Week-old sightings would each cost a rollout walk here: hundreds of headless
     // codex runs blocked the event loop for tens of seconds per tick.
-    if (!Number.isFinite(entry.lastSeenAlive) || now - entry.lastSeenAlive > TURN_INDEX_LIVE_WINDOW_MS) continue;
-    wanted.set(id, { id, agent: entry.agent === 'codex' ? 'codex' : 'claude' });
+    if (!Number.isFinite(entry.lastSeenAlive) || now - entry.lastSeenAlive > TURN_INDEX_LIVE_WINDOW_MS) {
+      stale.set(id, { id, agent });
+      continue;
+    }
+    wanted.set(id, { id, agent });
   }
   // A reviewer may be idle enough to have left the live ledger, and its turns are
   // exactly the ones the fleet wants measured.
@@ -5250,8 +5255,9 @@ function liveTurnIndexSessions(deps = {}) {
       if (/^[A-Za-z0-9_-]+$/.test(id) && !wanted.has(id)) wanted.set(id, { id, agent: 'claude' });
     }
   } catch {}
-  for (const id of turnIndexRolloutLookups.keys()) if (!wanted.has(id)) turnIndexRolloutLookups.delete(id);
-  if (!wanted.size) return [];
+  // Stale ids keep their cached path so a backlog can still be finished without a walk.
+  for (const id of turnIndexRolloutLookups.keys()) if (!wanted.has(id) && !stale.has(id)) turnIndexRolloutLookups.delete(id);
+  if (!wanted.size && !stale.size) return [];
   const claudeFiles = new Map();
   try { for (const row of (deps.scanClaudeTranscripts || (() => claudeTranscriptIndex.scan()))()) claudeFiles.set(row.id, row.file); } catch {}
   const rolloutFileFor = deps.rolloutFileFor || codex.rolloutFileFor;
@@ -5271,6 +5277,27 @@ function liveTurnIndexSessions(deps = {}) {
       }
     } else file = claudeFiles.get(entry.id) || null;
     if (file) sessions.push({ ...entry, file });
+  }
+  // A session no longer seen alive may have stopped with turns still unread (or the
+  // daemon was down). Keep it while its transcript is unfinished, using only paths
+  // that are already known: this never walks the codex date directories.
+  const staleCandidates = [];
+  for (const entry of stale.values()) {
+    if (wanted.has(entry.id)) continue;
+    let file = null;
+    if (entry.agent === 'codex') {
+      try { file = rolloutFileFor(entry.id); } catch {}
+      file ||= turnIndexRolloutLookups.get(entry.id)?.file || null;
+    } else file = claudeFiles.get(entry.id) || null;
+    if (file) staleCandidates.push({ ...entry, file });
+  }
+  if (staleCandidates.length) {
+    let unfinished = new Set();
+    try {
+      unfinished = (deps.unfinishedFiles || ((files) => require('./turn-index.js').unfinishedFiles(files, { busyTimeoutMs: 250 })))(
+        staleCandidates.map((candidate) => candidate.file));
+    } catch {}
+    for (const candidate of staleCandidates) if (unfinished.has(candidate.file)) sessions.push(candidate);
   }
   return sessions;
 }
@@ -8134,8 +8161,13 @@ function start(deps = {}) {
         // rebuild throttle only then. Read-only POSTs arrive every few seconds.
         let pathname = '';
         try { pathname = new URL(req.url, 'http://localhost').pathname; } catch {}
-        if (urgentDashboardMutation(pathname)) dashboardPublisher.refresh();
-        else dashboardPublisher.invalidate();
+        if (urgentDashboardMutation(pathname)) {
+          // A mutation may have changed panes (kill, remove, open). A remembered pane
+          // list predates it and must not be republished under the post-mutation fence.
+          publishedPanes.panes = null;
+          publishedPanes.at = 0;
+          dashboardPublisher.refresh();
+        } else dashboardPublisher.invalidate();
       }
       return writeHead.call(this, status, ...args);
     };

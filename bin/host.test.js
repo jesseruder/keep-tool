@@ -861,6 +861,8 @@ test('a viewer whose connection drops without detaching keeps primary while it r
       assert.equal(events.filter((event) => event.type === 'resized').length, resizedBefore,
         'a same-size claim leaves the PTY alone');
       assert.equal((await client.request('get', { pane: pane.id })).pane.primary, 'stage', 'the returned viewer keeps primary');
+      const grown = await back.request('resize', { pane: pane.id, cols: 130, rows: 40 });
+      assert.equal(grown.applied, true, 'a viewer that reconnected unfocused can still resize its pane');
 
       back.close();
       await new Promise((resolve) => setTimeout(resolve, 450));
@@ -873,6 +875,31 @@ test('a viewer whose connection drops without detaching keeps primary while it r
       if (back) back.close();
     }
   });
+});
+
+test('a host handoff cancels primary grace timers', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-grace-handoff-'));
+  const sock = path.join(root, 'host.sock');
+  const host = createHost({ sock, log: null, primaryReconnectGraceMs: 60e3 });
+  let record;
+  try {
+    await host.listen();
+    const client = await connect({ sock });
+    const bridge = await connect({ sock });
+    const { pane } = await client.request('spawn', { cmd: '/bin/sh', args: ['-c', 'cat'] });
+    await bridge.attach(pane.id, { replay: false, viewer: 'stage', primary: true }, () => {});
+    bridge.close();
+    await waitFor(async () => host.panes.get(pane.id).primaryGraceTimer, 'grace timer armed');
+    const disconnected = new Promise((resolve) => client.onDisconnect(resolve));
+    record = await host.handoff();
+    await disconnected;
+    assert.equal(host.panes.get(pane.id).primaryGraceTimer, null, 'the retired core holds no grace timer');
+    host.finalizeHandoff();
+  } finally {
+    for (const entry of record?.panes || []) { try { entry.pty.kill('SIGKILL'); } catch {} }
+    if (!record) await host.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('automatic input is accepted only from the attached primary and never claims an owner-less pane', async () => {
