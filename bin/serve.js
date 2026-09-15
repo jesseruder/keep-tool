@@ -3104,7 +3104,9 @@ async function closeIdleSession(body, deps = {}) {
       const owner = current.sessions.find((s) => s.id === session.id);
       const task = current.tasks.find((t) => t.id === owner?.taskId);
       const fm = task?.fm || task || {};
-      if ((!deps.closePolicy?.manual && fm.check_after) || fm.needs?.length || (!deps.closePolicy?.restart && fm.depends_on?.length)) throw new InjectionError(409, 'Task has a scheduled check, need, or dependency; leave the session open');
+      // A restart or account transfer resumes the same session, so an open need or
+      // dependency on its card is no reason to keep the old process alive.
+      if ((!deps.closePolicy?.manual && fm.check_after) || (!deps.closePolicy?.restart && (fm.needs?.length || fm.depends_on?.length))) throw new InjectionError(409, 'Task has a scheduled check, need, or dependency; leave the session open');
       // Explicit Close retires the process, not its durable scheduled recipes.
       // The scheduler falls back to a headless run when the owner is closed.
       if (!deps.closePolicy?.manual && current.tasks.some((t) => { const f = t.fm || t; return f.check_after && (f.scheduled_by === session.id || f.sessions?.some((s) => s.id === session.id)); })) throw new InjectionError(409, 'Session owns a scheduled check on another card');
