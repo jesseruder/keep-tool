@@ -1069,6 +1069,13 @@ test('the pre-bash guard keeps a self-repair run off the daemon and out of the m
     `cd ${main} && git commit -am wip`,
     `cd ${main}/bin && git commit -am wip`,
     `cd ~/keep-tool && git pull`,
+    // The two commands the land opens up are refused while nothing has landed —
+    // and here nothing resolves the session to a card at all.
+    `git -C ${main} pull --ff-only`,
+    'git -C ~/keep-tool pull --ff-only',
+    // `$HOME` is the same checkout wearing another name.
+    'git -C $HOME/keep-tool add -A',
+    'git -C ${HOME}/keep-tool commit -am wip',
     // Force pushes, however spelled.
     'git push --force origin HEAD:master',
     'git push --force-with-lease',
@@ -1112,7 +1119,9 @@ test('the pre-bash guard keeps a self-repair run off the daemon and out of the m
 
   const reason = decide('keep restart-daemon').reason;
   assert.match(reason, /keep guard: `keep restart-daemon` restarts the daemon you were launched to repair/);
-  assert.match(reason, /leave the restart to Owner — step 4 of the repair card says so/);
+  assert.match(reason, /until the card's fix is landed with `keep land`/);
+  assert.match(reason, /`git -C ~\/keep-tool pull --ff-only` and `keep restart-daemon` are yours/);
+  assert.match(reason, /step 4 of the repair card says so/);
 
   // End to end through the hook: exit 2 is the deny, and ordinary work passes.
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-repair-guard-'));
@@ -1128,4 +1137,78 @@ test('the pre-bash guard keeps a self-repair run off the daemon and out of the m
     assert.equal(hook('keep land some-card').status, 0);
     assert.equal(hook('keep restart-daemon', { KEEP_REPAIR: '' }).status, 0, 'only a repair run is guarded');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('once the repair card\'s fix is on origin/master the session may pull the live checkout and restart', () => {
+  const keep = require('./keep.js');
+  const main = path.join(os.homedir(), 'keep-tool');
+  const worktree = path.join(os.homedir(), 'wt', 'keep-tool', 'self-repair-abcd1234');
+  const repair = { KEEP_REPAIR: '1' };
+  const asked = [];
+  // The predicate itself is self-repair.test.js's; what is under test here is
+  // which commands it is allowed to open, and which stay shut whatever it says.
+  const landed = {
+    cardForSession: (sessionId) => { asked.push(sessionId); return sessionId === 'repair-run' ? 'daemon-self-repair-1' : ''; },
+    landedFor: (cardId) => ({ landed: cardId === 'daemon-self-repair-1', sha: 'de82cfd0f1a2b3c4d5e6', why: '' }),
+  };
+  const decide = (command, deps = landed, sessionId = 'repair-run') => keep.guardRepairCommand(
+    { session_id: sessionId, tool_name: 'Bash', cwd: worktree, tool_input: { command } }, repair, deps);
+
+  for (const command of [
+    'keep restart-daemon',
+    `node ${main}/bin/keep.js restart-daemon`,
+    `${main}/bin/keep.js restart-daemon`,
+    `git -C ${main} pull --ff-only`,
+    'git -C ~/keep-tool pull --ff-only',
+    'git -C $HOME/keep-tool pull --ff-only',
+    `git -C ${main} pull --ff-only origin master`,
+    `git --git-dir=${main}/.git pull --ff-only`,
+    `cd ${main} && git pull --ff-only`,
+    // The pair the recipe's last step runs, in one command.
+    `git -C ${main} pull --ff-only && keep restart-daemon`,
+  ]) assert.equal(decide(command).deny, false, command);
+
+  // Everything else stays refused: landing a fix does not make the live checkout
+  // writable, and it opens no other way to restart the daemon.
+  for (const command of [
+    'keep service restart',
+    'launchctl kickstart -k gui/501/com.jesse.keep',
+    `node ${main}/bin/serve.js`,
+    'curl -X POST http://127.0.0.1:8765/api/restart-daemon',
+    `git -C ${main} pull`,
+    `git -C ${main} pull --rebase --ff-only`,
+    `git -C ${main} pull --ff-only origin HEAD`,
+    `git -C ${main} merge origin/master`,
+    `git -C ${main} reset --hard origin/master`,
+    `git -C ${main} checkout master`,
+    `cd ${main} && git pull`,
+    'git push --force origin HEAD:master',
+    'wt land',
+  ]) assert.equal(decide(command).deny, true, command);
+
+  // One line to stderr, naming the card and the sha that made it allowable.
+  assert.equal(decide('keep restart-daemon').note,
+    "keep: repair session may restart: daemon-self-repair-1's fix de82cfd is on origin/master");
+  assert.equal(decide(`git -C ${main} log -1`).note, undefined, 'nothing refused, nothing to say');
+
+  // A session the repair state does not know, a card that cannot be read, and a
+  // predicate that throws are all refused exactly as before the land.
+  assert.equal(decide('keep restart-daemon', landed, 'someone-elses-session').deny, true);
+  assert.equal(decide('keep restart-daemon', { ...landed, landedFor: () => ({ landed: false, sha: '', why: 'no land record' }) }).deny, true);
+  assert.equal(decide('keep restart-daemon', { ...landed, landedFor: () => { throw new Error('state is unreadable'); } }).deny, true);
+  assert.equal(decide('keep restart-daemon', { cardForSession: () => { throw new Error('nope'); }, landedFor: () => ({ landed: true, sha: 'abc1234' }) }).deny, true);
+
+  // Asked at most once per command, and not at all when nothing is refused.
+  asked.length = 0;
+  decide(`git -C ${main} pull --ff-only && keep restart-daemon`);
+  assert.deepEqual(asked, ['repair-run']);
+  asked.length = 0;
+  decide('keep health --json');
+  assert.deepEqual(asked, []);
+
+  // The session id can come from the hook payload or from the environment.
+  const fromEnv = keep.guardRepairCommand(
+    { tool_name: 'Bash', cwd: worktree, tool_input: { command: 'keep restart-daemon' } },
+    { KEEP_REPAIR: '1', CLAUDE_CODE_SESSION_ID: 'repair-run' }, landed);
+  assert.equal(fromEnv.deny, false);
 });

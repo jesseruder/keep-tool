@@ -5238,7 +5238,13 @@ commands.hook = async (argv) => {
     // self-repair run reaching for the daemon it was launched to fix
     try {
       let decision = guardResumeCommand(input);
-      if (!decision.deny) decision = guardRepairCommand(input);
+      if (!decision.deny) {
+        const repair = guardRepairCommand(input);
+        // Said here and not by the caller: a later guard replaces `decision`, and
+        // the one line saying why the restart was let through would go with it.
+        if (repair.note) process.stderr.write(`${repair.note}\n`);
+        decision = repair;
+      }
       if (!decision.deny) decision = guardStepCommand(input);
       if (decision.deny) {
         process.stderr.write(`${decision.reason}\n`);
@@ -6002,15 +6008,23 @@ function guardResumeCommand(input, env = process.env) {
 
 // A self-repair session is a bypassPermissions agent Keep launched by itself, in
 // its own worktree, to fix the daemon it is running inside. Three things it must
-// never do: restart that daemon (Owner's call — and a restart mid-fix throws away
-// the evidence the card was opened with), touch the live ~/keep-tool checkout the
-// daemon runs from, or get a commit onto master without the review record.
+// not do while the fix is still in its worktree: restart that daemon (a restart
+// mid-fix throws away the evidence the card was opened with), touch the live
+// ~/keep-tool checkout the daemon runs from, or get a commit onto master without
+// the review record.
 // KEEP_REPAIR=1 is set on the pane at every launch of a session whose card carries
 // the `self-repair` tag — the open, a restart, a force-restart, an account handoff
 // — so the marker survives all of them, and this is silent in every other session.
-const REPAIR_RULE = 'this is a Keep self-repair session (KEEP_REPAIR=1): fix the daemon in your own worktree, '
-  + 'land through `keep land <card>` after a recorded review, and leave the restart to Owner — '
-  + 'step 4 of the repair card says so';
+//
+// The restart is gated, not forbidden. The reason to refuse it is that the fix is
+// not on master yet; once `keep land` has put it there, the session that wrote it
+// is the right process to pull it into the live checkout and restart into it, and
+// handing those two commands to Owner only stalls the repair. So exactly two
+// commands open up after the land, and nothing else does: see repairAfterLand().
+const REPAIR_RULE = 'this is a Keep self-repair session (KEEP_REPAIR=1): fix the daemon in your own worktree and '
+  + 'land through `keep land <card>` after a recorded review. The daemon is off limits until the card\'s fix is '
+  + 'landed with `keep land`; after that, `git -C ~/keep-tool pull --ff-only` and `keep restart-daemon` are yours '
+  + '— step 4 of the repair card says so';
 const GIT_VALUE_FLAGS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env']);
 // The diagnosing agent has every reason to read the live checkout — that is where
 // the daemon's code and history are. It has none to write to it.
@@ -6027,7 +6041,13 @@ function repairMainCheckouts() {
 }
 
 function repairResolvePath(value, cwd) {
-  const raw = String(value || '').replace(/^~(?=\/|$)/, os.homedir());
+  const raw = String(value || '')
+    .replace(/^~(?=\/|$)/, os.homedir())
+    // `$HOME/keep-tool` is the live checkout under another name. The tokenizer does
+    // not expand it, so without this the guard resolved it against the worktree,
+    // found nothing under ~/keep-tool, and let `git -C $HOME/keep-tool add -A`
+    // straight through.
+    .replace(/^\$(?:HOME(?![A-Za-z0-9_])|\{HOME\})/, os.homedir());
   if (!raw) return '';
   const absolute = path.resolve(cwd || process.cwd(), raw).replace(/\/\.git$/, '');
   try { return fs.realpathSync(absolute); } catch { return absolute; }
@@ -6097,6 +6117,18 @@ function gitSubcommand(args) {
   return '';
 }
 
+// Which directory a git invocation acts on: whatever `-C`/`--work-tree`/`--git-dir`
+// named last, else the directory a `cd` earlier in the command left it in.
+function repairGitDirectory(args, cwd) {
+  let targeted = '';
+  for (let i = 0; i < args.length; i += 1) {
+    const equals = /^--(?:work-tree|git-dir)=(.*)$/.exec(args[i]);
+    if (equals) { targeted = repairResolvePath(equals[1], cwd); continue; }
+    if (['-C', '--work-tree', '--git-dir'].includes(args[i]) && args[i + 1]) targeted = repairResolvePath(args[i + 1], cwd);
+  }
+  return targeted || cwd;
+}
+
 function repairDenial(invocation) {
   const { head, cwd } = invocation;
   const args = invocation.tokens.slice(1);
@@ -6112,13 +6144,7 @@ function repairDenial(invocation) {
     return `that POSTs ${RESTART_ENDPOINT}, which restarts the daemon you were launched to repair`;
   }
   if (head !== 'git') return '';
-  let targeted = '';
-  for (let i = 0; i < args.length; i += 1) {
-    const equals = /^--(?:work-tree|git-dir)=(.*)$/.exec(args[i]);
-    if (equals) { targeted = repairResolvePath(equals[1], cwd); continue; }
-    if (['-C', '--work-tree', '--git-dir'].includes(args[i]) && args[i + 1]) targeted = repairResolvePath(args[i + 1], cwd);
-  }
-  const directory = targeted || cwd;
+  const directory = repairGitDirectory(args, cwd);
   const subcommand = gitSubcommand(args);
   if (underMainCheckout(directory) && !GIT_READ_ONLY.has(subcommand)) {
     return `that runs \`git ${subcommand || '(no subcommand)'}\` in ${directory}, the live keep-tool checkout this daemon runs from`
@@ -6141,16 +6167,68 @@ function repairDenial(invocation) {
   return '';
 }
 
-function guardRepairCommand(input, env = process.env) {
+// The two commands a repair session gets back once its fix is on origin/master,
+// and only these two. `pull --ff-only` cannot merge, cannot rebase and cannot
+// resolve anything: if the live checkout has diverged it fails, which is exactly
+// the outcome a repair session should get. `git -C ~/keep-tool merge`, `reset`,
+// `checkout`, a bare `git pull`, `keep service`, `launchctl` and the HTTP restart
+// are all still refused — landing a fix does not make the live checkout writable.
+const REPAIR_PULL_SHAPES = [['pull', '--ff-only'], ['pull', '--ff-only', 'origin', 'master']];
+
+function repairAfterLand(invocation) {
+  const { head, cwd } = invocation;
+  const args = invocation.tokens.slice(1);
+  // `node ~/keep-tool/bin/keep.js restart-daemon` is already rewritten to this by
+  // repairExecutable, so both spellings land here. Exactly the one argument: a
+  // flag nobody has read is not part of the allowance.
+  if (head === 'keep') return args.length === 1 && args[0] === 'restart-daemon';
+  if (head !== 'git') return false;
+  if (!underMainCheckout(repairGitDirectory(args, cwd))) return false;
+  // Whatever named the directory is not part of the shape — `-C ~/keep-tool`
+  // before the subcommand, or a `cd` that put it there, are the same command.
+  const rest = [];
+  for (let i = 0; i < args.length; i += 1) {
+    if (['-C', '--work-tree', '--git-dir'].includes(args[i])) { i += 1; continue; }
+    if (/^--(?:work-tree|git-dir)=/.test(args[i])) continue;
+    rest.push(args[i]);
+  }
+  return REPAIR_PULL_SHAPES.some((shape) => shape.length === rest.length && shape.every((token, index) => token === rest[index]));
+}
+
+function guardRepairCommand(input, env = process.env, deps = {}) {
   if (!env || env.KEEP_REPAIR !== '1') return { deny: false, reason: '' };
   if (!input || input.tool_name !== 'Bash') return { deny: false, reason: '' };
   const command = input.tool_input && input.tool_input.command;
   if (!command) return { deny: false, reason: '' };
+  // Asked at most once per command, and only when something is about to be
+  // refused: this runs in front of every Bash call the session makes, and it
+  // reads a card and shells out to git to answer.
+  let fix;
+  const landedFix = () => {
+    if (fix !== undefined) return fix;
+    fix = null;
+    try {
+      const repair = deps.selfRepair || require('./self-repair.js');
+      const sessionId = (input && typeof input.session_id === 'string' && input.session_id)
+        || env.CLAUDE_CODE_SESSION_ID || '';
+      const cardId = (deps.cardForSession || repair.cardForSession)(sessionId, ROOT);
+      if (!cardId) return fix;
+      const answer = (deps.landedFor || repair.landedFor)(cardId, ROOT);
+      if (answer && answer.landed) fix = { cardId, sha: String(answer.sha || '') };
+    } catch { fix = null; }
+    return fix;
+  };
+  let note = '';
   for (const invocation of repairInvocations(command, 0, typeof input.cwd === 'string' ? input.cwd : '')) {
     const why = repairDenial(invocation);
-    if (why) return { deny: true, reason: `keep guard: ${why} — ${REPAIR_RULE}` };
+    if (!why) continue;
+    // An unresolvable card, an unreadable one, a card with no land record and a
+    // predicate that threw all read the same here: refuse, as before the land.
+    const landed = repairAfterLand(invocation) ? landedFix() : null;
+    if (!landed) return { deny: true, reason: `keep guard: ${why} — ${REPAIR_RULE}` };
+    note = `keep: repair session may restart: ${landed.cardId}'s fix ${landed.sha.slice(0, 7)} is on origin/master`;
   }
-  return { deny: false, reason: '' };
+  return { deny: false, reason: '', ...(note ? { note } : {}) };
 }
 
 const STEP_FAILURE_RE = /(?:^|\n)\s*(?:Error:|Error \[|╷|Build '[^']*' errored|Some builds didn't complete|FAILED|Terraform encountered an error)/;
@@ -8411,7 +8489,8 @@ module.exports = {
   projectMatchesCwd, looksLikeGitWrite, normalizeProjectPath, resolveProjectArg, activeHolds,
   openNeeds, addNeed, meetNeeds, sweepNeeds,
   taskForSession, newestTaskForSession, readCodexParent, deployCommand, deployEntry, recordDeploy, redactCommand,
-  stepMatchForInput, guardStepCommand, guardResumeCommand, guardRepairCommand, repairInvocations, rawClaudeResume,
+  stepMatchForInput, guardStepCommand, guardResumeCommand, guardRepairCommand, repairAfterLand,
+  repairInvocations, rawClaudeResume,
   recordStepRun, codexToolInput, codexExitCode,
   codexJobText, renderCodexJobs,
   codexCommandCli: commands.codex,
