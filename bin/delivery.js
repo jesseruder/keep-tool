@@ -290,26 +290,38 @@ function pendingForSession(directory, sessionId) {
 
 // Call under the daemon's injection lock, just like normal delivery recovery.
 // Corrupt/unreadable attempts remain for the health watchdog to report.
-function reconcile(directory) {
+//
+// deliverAttempt expires a stale journal only when the next send to that session
+// arrives. On 2026-09-13 a reviewer journal whose typing failed was stranded when the
+// reviewer moved to a new session: nothing ever sent to the old one again, and the
+// delivery watchdog failed 2454 consecutive sweeps over a message that never reached
+// the pane. An old entry with no `typedAt` is exactly the case deliverAttempt would
+// delete and retype anyway, so the sweep drops it here without typing anything; a
+// later send still passes precheck, which refuses a non-empty input box. An entry
+// that did reach the pane is left alone: only the send path can check the screen.
+function reconcile(directory, { now = Date.now(), staleJournalMs = STALE_JOURNAL_MS } = {}) {
   let files;
   try { files = fs.readdirSync(directory).filter(name => name.endsWith('.json')); }
   catch (error) { if (error.code === 'ENOENT') return []; throw error; }
   const settled = [];
   for (const name of files) {
     try {
-      const entry = JSON.parse(fs.readFileSync(path.join(directory, name), 'utf8'));
+      const journal = path.join(directory, name);
+      const entry = JSON.parse(fs.readFileSync(journal, 'utf8'));
       if (name !== hash(entry.sessionId) + '.json') continue;
-      if (received(entry)) {
-        // Keep successful evidence available to the owning retry loop, including
-        // sendPlain callers without retainReceipt. Otherwise a late success
-        // followed by this sweep would make the next retry type it again.
-        saveReceipt(directory, entry);
-        if (entry.retainReceipt) fs.unlinkSync(path.join(directory, name));
-        else {
-          fs.mkdirSync(path.join(directory, 'settled'), { recursive: true, mode: 0o700 });
-          fs.renameSync(path.join(directory, name), path.join(directory, 'settled', name));
-        }
-      } else continue;
+      if (!received(entry)) {
+        if (!(Number(entry.typedAt) > 0) && journalAgeMs(journal, entry, now) >= staleJournalMs) fs.unlinkSync(journal);
+        continue;
+      }
+      // Keep successful evidence available to the owning retry loop, including
+      // sendPlain callers without retainReceipt. Otherwise a late success
+      // followed by this sweep would make the next retry type it again.
+      saveReceipt(directory, entry);
+      if (entry.retainReceipt) fs.unlinkSync(journal);
+      else {
+        fs.mkdirSync(path.join(directory, 'settled'), { recursive: true, mode: 0o700 });
+        fs.renameSync(journal, path.join(directory, 'settled', name));
+      }
       settled.push(entry.sessionId);
     } catch {} // Read-only health inspection still exposes the unresolved record.
   }

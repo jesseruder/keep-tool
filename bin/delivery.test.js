@@ -358,6 +358,34 @@ test('an entry whose typing failed is retyped, not assumed delivered', async () 
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+// The delivery incident of 2026-09-13: typing into the reviewer pane failed, the
+// reviewer moved to a new session, and no send ever reached the old one again - so
+// the expiry above never ran and the watchdog reported the entry for two days.
+test('the reconcile sweep expires an old never-typed journal nobody sends to again', async () => {
+  const { reconcile } = require('./delivery');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-sweep-'));
+  const file = path.join(dir, 'transcript'); fs.writeFileSync(file, '');
+  const directory = path.join(dir, 'journal');
+  const send = (session, type) => deliver({ session: { id: session, kind: 'claude' }, pane: 'p', text: 'the tick', file, directory,
+    precheck: async () => {}, type, submitDraft: async () => assert.fail('unexpected Enter'),
+    draftMatches: async () => false, pause: async () => {}, attempts: 1 });
+  const journalFor = (session) => path.join(directory, textHash(session) + '.json');
+  try {
+    await assert.rejects(send('failed', async () => { throw new Error('pane went away'); }), /pane went away/);
+    await assert.rejects(send('typed', async () => {}), /no matching transcript receipt/);
+    const hour = 60 * 60e3;
+
+    // Young entries may still be in flight; neither is touched.
+    assert.deepEqual(reconcile(directory), []);
+    assert.equal(fs.existsSync(journalFor('failed')), true);
+
+    // Old: the never-typed entry goes, the typed one stays for the screen-aware send path.
+    assert.deepEqual(reconcile(directory, { now: Date.now() + hour }), []);
+    assert.equal(fs.existsSync(journalFor('failed')), false, 'nothing reached the pane, so nothing is left to confirm');
+    assert.equal(fs.existsSync(journalFor('typed')), true, 'text on the pane is never expired blind');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('text typed but never submitted still counts as having reached the pane', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-noenter-'));
   const file = path.join(dir, 'transcript'); fs.writeFileSync(file, '');
