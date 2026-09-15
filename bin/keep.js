@@ -4252,6 +4252,33 @@ commands.health = (argv) => {
   else console.log(health.render(value));
 };
 
+commands['self-repair'] = async (argv) => {
+  const o = parseArgs(argv, { json: 'bool', dry: 'bool', reset: 'str', disable: 'bool', enable: 'bool' });
+  if (o._.length) die('usage: keep self-repair [--dry] [--json] [--reset <signature>] [--disable|--enable]');
+  if (o.disable && o.enable) die('pass either --disable or --enable, not both');
+  const selfRepair = require('./self-repair.js');
+  if (o.disable || o.enable) {
+    const config = selfRepair.saveConfig({ enabled: Boolean(o.enable) });
+    if (o.json) return process.stdout.write(JSON.stringify(config, null, 2) + '\n');
+    return console.log(`self-repair ${config.enabled ? 'enabled' : 'disabled'} in ${selfRepair.configFile(ROOT)}`);
+  }
+  if (o.reset) {
+    const result = selfRepair.reset(o.reset, { root: ROOT });
+    if (o.json) return process.stdout.write(JSON.stringify({ signature: o.reset, ...result }, null, 2) + '\n');
+    return console.log(result.found
+      ? `cleared ${o.reset}; the next tick may open a fresh card for it`
+      : `no such signature: ${o.reset}`);
+  }
+  if (o.dry) {
+    const value = await selfRepair.dryRun({ root: ROOT });
+    if (o.json) return process.stdout.write(JSON.stringify(value, null, 2) + '\n');
+    return console.log(selfRepair.renderDry(value));
+  }
+  const value = selfRepair.status({ root: ROOT });
+  if (o.json) return process.stdout.write(JSON.stringify(value, null, 2) + '\n');
+  console.log(selfRepair.renderStatus(value));
+};
+
 commands.stalled = (argv) => {
   const o = parseArgs(argv, { json: 'bool' });
   if (o._.length) die('usage: keep stalled [--json]');
@@ -8024,6 +8051,11 @@ ${stepUsage()}
   keep lint [--json] [--rule <name>] [--fix-hints]
   keep brief [--send]
   keep health [--json]
+  keep self-repair [--dry] [--json] [--reset <signature>] [--disable|--enable]
+                         # what the daemon has opened on itself: open signatures, their cards,
+                         #   cooldowns and today's count against the daily cap
+                         # --dry prints what the next tick would open and why, writing nothing
+                         # --reset <signature> clears one signature's cooldown and resolution
   keep stalled [--json]
   keep codex-jobs [--json] [--reap] [--dry]
     List companion jobs and brokers; --reap cleans stale jobs, pollers, and brokers.

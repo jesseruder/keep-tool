@@ -492,3 +492,71 @@ test('--dry explains what the next tick would do, and --reset clears a cooldown'
     assert.match(selfRepair.renderStatus(value), /self-repair: enabled/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+// ---------- the scheduler and the CLI ----------
+
+test('the scheduler ticks on its own cadence and records a row that can read as silent', async () => {
+  const ticks = [];
+  const scheduler = selfRepair.startScheduler({
+    config: { ...selfRepair.DEFAULT_CONFIG, enabled: false },
+    record: (name, payload) => ticks.push({ name, payload }),
+    write: () => {},
+  });
+  try {
+    await scheduler.tick();
+    assert.equal(ticks.length, 1);
+    assert.equal(ticks[0].name, 'self-repair');
+    // self-repair is not in health.CADENCES, so the row must carry its own.
+    assert.equal(ticks[0].payload.cadenceMs, selfRepair.CADENCE_MS);
+    assert.equal(require('./health.js').CADENCES['self-repair'], undefined);
+    assert.equal(selfRepair.CADENCE_MS, 5 * 60e3);
+  } finally {
+    clearInterval(scheduler.timer);
+    clearTimeout(scheduler.first);
+  }
+});
+
+test('keep self-repair prints state, dry-runs, and toggles the config', () => {
+  const { spawnSync } = require('node:child_process');
+  const root = makeRoot();
+  fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+  const cli = (...args) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'self-repair', ...args], {
+    encoding: 'utf8', env: { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1' },
+  });
+  try {
+    const bare = cli();
+    assert.equal(bare.status, 0, bare.stderr);
+    assert.match(bare.stdout, /self-repair: enabled/);
+    assert.match(bare.stdout, /no signatures tracked/);
+
+    selfRepair.mutateState((state) => {
+      state.signatures['sched:review:abcd1234'] = {
+        firstSeenAt: NOW, cardId: 'a-repair-card', runId: 'run-1',
+        worktree: '/Users/x/wt/keep-tool/self-repair-abcd1234', openedAt: NOW, attempts: 1,
+      };
+      state.day = '2026-09-15';
+      state.openedToday = 1;
+    }, { root, now: NOW });
+    const open = cli();
+    assert.match(open.stdout, /open \(1\)/);
+    assert.match(open.stdout, /sched:review:abcd1234 — card a-repair-card, run run-1/);
+
+    const json = cli('--json');
+    assert.equal(JSON.parse(json.stdout).open[0].cardId, 'a-repair-card');
+
+    const off = cli('--disable');
+    assert.equal(off.status, 0, off.stderr);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'watch', 'self-repair.json'), 'utf8')).enabled, false);
+    assert.match(cli('--dry').stdout, /self-repair is disabled/);
+    assert.equal(cli('--enable').status, 0);
+
+    const reset = cli('--reset', 'sched:review:abcd1234');
+    assert.match(reset.stdout, /cleared sched:review:abcd1234/);
+    assert.equal(selfRepair.loadState(root).signatures['sched:review:abcd1234'].cardId, undefined);
+    assert.match(cli('--reset', 'sched:nope:00000000').stdout, /no such signature/);
+
+    const both = cli('--disable', '--enable');
+    assert.equal(both.status, 1);
+    assert.match(both.stderr, /either --disable or --enable/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

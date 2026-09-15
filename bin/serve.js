@@ -7366,6 +7366,12 @@ function start(deps = {}) {
   if (process.env.KEEP_WT_GC === '0') {
     health.record('wt-gc', { disabled: true, detail: 'KEEP_WT_GC=0' });
   } else startWtGcScheduler({ onChange: broadcast });
+  // The daemon watching itself: a failure signature that keeps coming back gets
+  // one card, one worktree and one agent. It never restarts this process — that
+  // stays Owner's, and `keep hook pre-bash` refuses it from inside the run.
+  if (process.env.KEEP_SELF_REPAIR === '0') {
+    health.record('self-repair', { disabled: true, detail: 'KEEP_SELF_REPAIR=0', cadenceMs: require('./self-repair.js').CADENCE_MS });
+  } else require('./self-repair.js').startScheduler({ onChange: broadcast });
   slack.startScheduler({ onChange: broadcast });
   discord.startScheduler({ onChange: broadcast });
   const configuredLiveTickMs = Number(process.env.KEEP_LIVE_TICK_MS);
