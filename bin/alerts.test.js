@@ -282,6 +282,30 @@ test('the brief lists shadow decisions last', () => {
   assert.doesNotMatch(brief.text, /d-2/);
 });
 
+test('the brief shows open self-repair cards on the daemon line', () => {
+  const now = Date.parse('2026-09-15T12:00:00');
+  const repairs = ['daemon-self-repair-review', 'daemon-self-repair-runs'].map((id) => ({
+    id, fm: { title: id, status: 'active', tags: ['personal', 'self-repair'] }, body: '',
+  }));
+  const health = {
+    daemon: { startedAt: now - 3600e3 },
+    schedulers: [{ name: 'review', state: 'failing', lastError: 'tick failed', lastErrorAt: now - 60e3 }],
+  };
+
+  const withProblem = buildBrief({ tasks: repairs, health, now });
+  assert.match(withProblem.text, /Daemon: review failing since .* — Self-repair: 2 open \(daemon-self-repair-review, daemon-self-repair-runs\)/);
+  assert.match(withProblem.spoken, /Self-repair: 2 open/);
+
+  // A repair card outlives the failure that opened it; it still gets a line, but
+  // it never becomes the spoken headline on its own.
+  const healed = buildBrief({ tasks: repairs, health: { daemon: {}, schedulers: [] }, now });
+  assert.match(healed.text, /^Self-repair: 2 open \(daemon-self-repair-review, daemon-self-repair-runs\)$/m);
+  assert.match(healed.spoken, /Nothing needs attention\./);
+
+  // Nothing open, nothing said.
+  assert.doesNotMatch(buildBrief({ tasks: [], health, now }).text, /Self-repair/);
+});
+
 test('a shadow decision never wins the spoken line', () => {
   const brief = buildBrief({
     tasks: [],

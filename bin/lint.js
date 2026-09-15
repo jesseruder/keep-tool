@@ -673,9 +673,36 @@ function daemonHealth(_task, ctx) {
   if (!problems.length) return [];
   problems.sort((a, b) => a.name.localeCompare(b.name));
   const [first] = problems;
+  // Still one finding — but if the daemon already opened a repair card for one of
+  // these rows, say which, so the reviewer stops re-reporting work in flight.
+  const cards = repairCardsByScheduler(ctx);
+  const covered = problems.map((problem) => cards.get(problem.name)).find(Boolean);
   return [finding('daemon-health', { id: `daemon:${first.name}` }, 'med',
-    `${first.name}: ${first.why}${problems.length > 1 ? `; +${problems.length - 1} more (${problems.slice(1).map((p) => p.name).join(', ')})` : ''}`,
-    'keep health, then fix or disable the failing scheduler')];
+    `${first.name}: ${first.why}${problems.length > 1 ? `; +${problems.length - 1} more (${problems.slice(1).map((p) => p.name).join(', ')})` : ''}`
+      + `${covered ? `; repair card: ${covered}` : ''}`,
+    covered ? `keep show ${covered}` : 'keep health, then fix or disable the failing scheduler')];
+}
+
+// Which failing scheduler each open self-repair card covers, from the repair
+// scheduler's own state. A card that was closed, or a signature that resolved,
+// covers nothing.
+function repairCardsByScheduler(ctx) {
+  const out = new Map();
+  let state;
+  try { state = JSON.parse(fs.readFileSync(path.join(ctx.root, '.keep', 'self-repair', 'state.json'), 'utf8')); }
+  catch { return out; }
+  const signatures = state && state.signatures && typeof state.signatures === 'object' && !Array.isArray(state.signatures)
+    ? state.signatures : {};
+  const open = new Set((ctx.tasks || [])
+    .filter((task) => task && task.fm && task.fm.status !== 'done' && (task.fm.tags || []).includes('self-repair'))
+    .map((task) => task.id));
+  for (const [sig, entry] of Object.entries(signatures)) {
+    if (!entry || typeof entry !== 'object' || !entry.cardId || entry.resolvedAt) continue;
+    if (!open.has(entry.cardId)) continue;
+    const name = sig.startsWith('sched:') ? sig.slice('sched:'.length, sig.lastIndexOf(':')) : String(sig).split(':')[0];
+    if (name && !out.has(name)) out.set(name, entry.cardId);
+  }
+  return out;
 }
 
 // Local refs only: no fetch, no network, no waiting. A dirty or diverged main

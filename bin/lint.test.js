@@ -762,6 +762,38 @@ test('daemon-health folds every failing scheduler into one finding', () => {
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('daemon-health names the open self-repair card covering a failing row', () => {
+  const root = makeRoot();
+  const now = Date.parse('2026-09-15T12:00:00');
+  try {
+    fs.mkdirSync(path.join(root, '.keep', 'self-repair'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.keep', 'health.json'), JSON.stringify({
+      daemon: { startedAt: now - 3600e3 },
+      review: { consecutiveFailures: 7, lastError: 'tick failed', lastOkAt: now - 60e3 },
+    }));
+    const writeState = (value) => fs.writeFileSync(path.join(root, '.keep', 'self-repair', 'state.json'), JSON.stringify(value));
+
+    // No card yet: the finding is exactly what it always was.
+    writeState({ signatures: {} });
+    const bare = lint({ root, rule: 'daemon-health', now }).findings;
+    assert.equal(bare.length, 1);
+    assert.equal(bare[0].text.includes('repair card'), false);
+
+    writeCard(root, 'daemon-self-repair-review', { status: 'active', tags: ['personal', 'self-repair'] });
+    writeState({ signatures: { 'sched:review:abcd1234': { firstSeenAt: now - 7200e3, cardId: 'daemon-self-repair-review' } } });
+    const covered = lint({ root, rule: 'daemon-health', now }).findings;
+    assert.equal(covered.length, 1, 'still one finding for the whole daemon');
+    assert.match(covered[0].text, /review: 7 consecutive failures.*; repair card: daemon-self-repair-review$/);
+    assert.match(covered[0].fix, /keep show daemon-self-repair-review/);
+
+    // A resolved signature, or a closed card, covers nothing.
+    writeState({ signatures: { 'sched:review:abcd1234': { cardId: 'daemon-self-repair-review', resolvedAt: now } } });
+    assert.equal(lint({ root, rule: 'daemon-health', now }).findings[0].text.includes('repair card'), false);
+    writeState({ signatures: { 'sched:review:abcd1234': { cardId: 'gone-card' } } });
+    assert.equal(lint({ root, rule: 'daemon-health', now }).findings[0].text.includes('repair card'), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('checkout-drift reports a dirty or diverged checkout once per project', () => {
   const root = makeRoot();
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-lint-drift-'));

@@ -446,9 +446,19 @@ function buildBrief(input) {
   const daemonProblem = daemonProblems[0];
   const daemonSince = daemonProblem && (daemonProblem.lastErrorAt || daemonProblem.lastRunAt
     || input.health.daemon && input.health.daemon.startedAt);
+  // Cards the daemon opened on itself. They belong with the daemon line: seeing
+  // "review failing" without "and an agent is already on it" is what made Owner
+  // go and look every morning.
+  const repairCards = (input.tasks || []).filter((task) => task && task.fm
+    && task.fm.status !== 'done' && (task.fm.tags || []).includes('self-repair'));
+  const repairLine = repairCards.length
+    ? `Self-repair: ${repairCards.length} open (${repairCards.slice(0, 3).map((task) => task.id).join(', ')}`
+      + `${repairCards.length > 3 ? `, +${repairCards.length - 3} more` : ''})`
+    : '';
   const daemonLine = daemonProblem
     ? `Daemon: ${daemonProblem.name} ${daemonProblem.state} since ${daemonSince ? new Date(Number(daemonSince)).toLocaleString() : 'unknown'}`
       + ` (${oneLine(daemonProblem.lastError || 'no recent tick', 100)})${daemonProblems.length > 1 ? `; +${daemonProblems.length - 1} more` : ''}`
+      + `${repairLine ? ` — ${repairLine}` : ''}`
     : '';
 
   // Shadow decisions are the reviewer's judgment awaiting a verdict. They are
@@ -468,7 +478,11 @@ function buildBrief(input) {
   ];
   const sections = [];
   const add = (title, rows) => { if (rows.length) sections.push(`${title} (${rows.length})\n${rows.map((row) => `- ${row}`).join('\n')}`); };
+  // With no failing scheduler there is no daemon line to carry it, but an open
+  // repair card still costs an agent and Owner still has to restart afterwards.
+  // It gets its own line and deliberately never wins the spoken one.
   if (daemonLine) sections.push(daemonLine);
+  else if (repairLine) sections.push(repairLine);
   add('Review', reviewCards.slice(0, 8).map((task) => `${oneLine(task.fm.title, 100)}${nonReviewLog(task) ? ` — ${nonReviewLog(task)}` : ''}`));
   add('Waiting on you', needs.map((need) => `${oneLine(need.task, 50)} — ${oneLine(need.text, 90)}${need.env ? ` [env ${oneLine(need.env, 30)}]` : ''}`));
   add('Overdue', overdue.map((task) => `${oneLine(task.fm.title, 110)} — ${task.fm.check_after}`));
