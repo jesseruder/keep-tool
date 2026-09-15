@@ -232,6 +232,9 @@ function stripCommandWrappers(input, { fromShell = true } = {}) {
 // A `c` anywhere in a short-flag group means the script comes as an argument:
 // `-lc`, `-ce`, `-xc` and `-lce` are all `sh -c` with other switches along.
 const SHELL_C_FLAG_RE = /^-[a-z]*c[a-z]*$/i;
+// Shell options that consume the next token: `bash -o errexit ./run_android.sh`
+// runs the script, not `errexit`, and `bash -O extglob -c 'git push'` pushes.
+const SHELL_VALUE_FLAG_RE = /^(?:[-+][oO]|--rcfile|--init-file)$/;
 
 function shellScriptArgument(tokens) {
   let seenC = false;
@@ -240,10 +243,12 @@ function shellScriptArgument(tokens) {
     const token = tokens[i];
     if (seenC) {
       if (!afterDash && token === '--') { afterDash = true; continue; }
+      if (!afterDash && SHELL_VALUE_FLAG_RE.test(token)) { i += 1; continue; }
       if (afterDash || !/^-./.test(token)) return token;
       continue;
     }
     if (token === '--') return null;
+    if (SHELL_VALUE_FLAG_RE.test(token)) { i += 1; continue; }
     if (!/^-./.test(token)) return null;
     if (SHELL_C_FLAG_RE.test(token)) { seenC = true; continue; }
   }
@@ -260,6 +265,7 @@ function shellFileArgument(tokens) {
     // A -c takes an inline script instead; that is shellScriptArgument's answer,
     // not this one's.
     if (SHELL_C_FLAG_RE.test(token)) return null;
+    if (SHELL_VALUE_FLAG_RE.test(token)) { i += 1; continue; }
     if (!/^-./.test(token)) return tokens.slice(i);
   }
   return null;

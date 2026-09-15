@@ -3572,6 +3572,16 @@ test('a box holding more than the typed message is not submitted', async () => {
   const midWord = [RULE, full, 'and then some', RULE].join('\n');
   assert.equal(draftRegionText(midWord, 'claude'), `${full.replace(/^❯ /, '')}and then some`,
     'a line that filled the pane was cut, not ended');
+  // The composer indents the continuation of a cut line under the glyph; that
+  // indent belongs to the renderer, and the word joins back without it.
+  const cutWord = `❯ ${MESSAGE} example-regression-`.padEnd(RULE.length, 'x').slice(0, RULE.length);
+  const indented = [RULE, cutWord, '  208 done', RULE].join('\n');
+  assert.equal(draftRegionText(indented, 'claude'), `${cutWord.replace(/^❯ /, '')}208 done`);
+  const codexCut = `› ${'y'.repeat(60)}example-regression-`;
+  const codexIndented = [codexCut, '  208', '', '  ⏎ send'].join('\n');
+  assert.equal(draftRegionText(codexIndented, 'codex'), `${codexCut.replace(/^› /, '')}208`);
+  assert.equal(draftRegionText(BOX('short line', '  indented soft wrap'), 'claude'), 'short line indented soft wrap',
+    'a soft wrap keeps its space');
   await assert.rejects(typeAndSubmit({ pane: 'p' }, MESSAGE, (s, t) => s.includes(t.slice(0, 10)), {
     ...wrapped.deps, requireExactDraft: true,
   }), /no longer holds only the typed message/);

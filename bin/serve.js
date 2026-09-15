@@ -1622,7 +1622,12 @@ function draftRegionText(screen, kind) {
     if (index === 0) { out = line; return; }
     const previous = region.lines[index - 1];
     const rendered = index === 1 ? previous.length + 2 : previous.length; // the glyph and its space
-    out += (region.width && rendered >= region.width ? '' : ' ') + line;
+    // A composer indents the continuation of a cut line under the glyph. That
+    // indent is the renderer's, not the message's, so it goes when the word is
+    // joined back together; a soft-wrapped line keeps it, and canonicalText folds
+    // it into the one space the wrap replaced.
+    if (region.width && rendered >= region.width) out += line.replace(/^ {1,2}/, '');
+    else out += ` ${line}`;
   });
   return canonicalText(out);
 }

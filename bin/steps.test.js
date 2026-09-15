@@ -915,6 +915,15 @@ test('a shell running a script file names the script, and the awkward spellings 
   assert.equal(steps.shellScriptArgument(['bash', '-xc', 'git push']), 'git push');
   assert.deepEqual(steps.shellFileArgument(['bash', '-l', 'deploy.sh', 'prod']), ['deploy.sh', 'prod']);
   assert.equal(steps.shellFileArgument(['bash', '-lc', 'git push']), null);
+  // Options that take a value do not turn the value into the script.
+  assert.deepEqual(steps.shellFileArgument(['bash', '-O', 'extglob', './run_android.sh']), ['./run_android.sh']);
+  assert.deepEqual(steps.shellFileArgument(['bash', '-o', 'errexit', './run_android.sh']), ['./run_android.sh']);
+  assert.deepEqual(steps.shellFileArgument(['zsh', '+o', 'nomatch', '--', './run_android.sh']), ['./run_android.sh']);
+  assert.equal(steps.shellFileArgument(['bash', '-o', 'errexit']), null);
+  assert.equal(steps.shellScriptArgument(['bash', '-o', 'errexit', '-c', 'git push']), 'git push');
+  assert.equal(steps.shellScriptArgument(['bash', '-c', '-o', 'errexit', 'git push']), 'git push');
+  assert.equal(verdict(['bash', '-O', 'extglob', '-c', 'git push']), 'push');
+  assert.deepEqual(steps.releaseFromArgv(['bash', '-o', 'errexit', './run_android.sh']).commands, ['./run_android.sh']);
 
   // `env -S` hands env a string to split, so the command is inside it.
   assert.equal(verdict(['env', '-S', 'git push']), 'push');
