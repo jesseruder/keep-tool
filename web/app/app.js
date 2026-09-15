@@ -926,18 +926,44 @@ async function refreshProjectChoices() {
 }
 
 let reloadRetry;
+// A daemon restart refuses connections, then answers "still loading" until its first
+// build: roughly 10-30s. The console keeps showing the last good state and the header
+// says "reconnecting", so only a fetch failure that outlasts that window is toasted.
+// Anything thrown while applying fetched state is a real bug and still toasts at once.
+const REFRESH_FAILURE_TOAST_MS = 60e3;
+let refreshFailingSince = 0;
+let refreshFailures = 0;
+let refreshFailureToasted = false;
+let refreshMarkedReconnecting = false;
+function transientRefreshError(error) {
+  const status = Number(error?.status);
+  return !status || status === 502 || status === 503 || status === 504;
+}
+function refreshRecovered() {
+  refreshFailingSince = 0;
+  refreshFailures = 0;
+  refreshFailureToasted = false;
+  if (refreshMarkedReconnecting) {
+    refreshMarkedReconnecting = false;
+    const label = document.querySelector('#connection');
+    if (label?.dataset.status === 'reconnecting') label.dataset.status = 'live';
+  }
+}
 let pendingNotificationKey = null;
 let pendingReviewNavigation = null;
 async function reload() {
   clearTimeout(reloadRetry);
   const generation = ++reloadGeneration;
   const revision = layoutRevision;
+  let fetched = false;
   try {
     const layoutsRequest = layoutSavesPending ? Promise.resolve(null) : api.getLayouts();
     // State carries the post-mutation publication fence. Fetch portable metadata
     // after it so one reload cannot combine a newer state with an older transfer cache.
     const nextData = await api.getState();
     const [nextLayouts, portable] = await Promise.all([layoutsRequest, api.getPortableTransfers()]);
+    fetched = true;
+    refreshRecovered();
     if (generation < appliedReloadGeneration) return;
     appliedReloadGeneration = generation;
     data = { ...nextData, portableTransfers: portable?.transfers || [] };
@@ -987,8 +1013,24 @@ async function reload() {
     }
   } catch (error) {
     if (generation >= appliedReloadGeneration) {
-      toast(`State refresh failed: ${error.message}`);
-      reloadRetry = setTimeout(reload, 1500);
+      const now = Date.now();
+      if (!fetched && transientRefreshError(error)) {
+        if (!refreshFailingSince) refreshFailingSince = now;
+        refreshFailures += 1;
+        const label = document.querySelector('#connection');
+        if (label && label.dataset.status !== 'reconnecting') {
+          label.dataset.status = 'reconnecting';
+          refreshMarkedReconnecting = true;
+        }
+        if (!refreshFailureToasted && now - refreshFailingSince >= REFRESH_FAILURE_TOAST_MS) {
+          refreshFailureToasted = true;
+          toast(`State refresh failed: ${error.message}`);
+        }
+        reloadRetry = setTimeout(reload, Math.min(5000, 1500 * refreshFailures));
+      } else {
+        toast(`State refresh failed: ${error.message}`);
+        reloadRetry = setTimeout(reload, 1500);
+      }
     }
   }
 }

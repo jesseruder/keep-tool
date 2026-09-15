@@ -47,6 +47,61 @@ test('startup subscribes despite a failed request, retries, and refreshes on rec
   assert.equal(label.dataset.status, 'live');
 });
 
+test('a daemon restart retries quietly; only a long outage or a real error toasts', async () => {
+  let retry, clock = 1_000_000, failure = null;
+  const toasts = [];
+  const label = { dataset: { status: 'live' } };
+  const context = vm.createContext({
+    Date: { now: () => clock },
+    document: { querySelector: () => label },
+    api: {
+      subscribe() {},
+      getState() { return failure ? Promise.reject(failure) : Promise.resolve({ panes: [] }); },
+      getLayouts: async () => [],
+      getPortableTransfers: async () => ({ transfers: [] }),
+    },
+    detailStore: { reconcile() {} },
+    setTimeout(fn) { retry = fn; return 1; }, clearTimeout() { retry = null; },
+    reloadGeneration: 0, appliedReloadGeneration: 0, layoutRevision: 0, layoutSavesPending: 0,
+    closingSessions: { reconcile() {} },
+    data: {}, optimisticSetAside: new Map(), pruneSetAsideOverrides() {}, droppedPanes: new Set(), spawnedPanes: new Map(),
+    historyRestored: false, sessionHistory: {}, state: { mode: 'triage', focusMode: false },
+    deriveDismissed() {}, applyLayouts() {}, applyStateEffects() {}, toast(message) { toasts.push(message); },
+    refreshProjectChoices() {}, refresh() {}, installNotificationClicks() {}, selectAttention() {}, focusSession() {}, acknowledgeNotificationClick() {},
+  });
+  const reloadStart = app.indexOf('let reloadRetry;');
+  vm.runInContext(app.slice(reloadStart, app.indexOf('\nconst ctx =', reloadStart)), context);
+  const reload = () => vm.runInContext('reload()', context);
+
+  failure = Object.assign(Error('dashboard state is still loading'), { status: 503 });
+  await reload();
+  assert.deepEqual(toasts, [], 'a restarting daemon does not toast');
+  assert.equal(label.dataset.status, 'reconnecting');
+  assert.equal(typeof retry, 'function');
+  clock += 20e3;
+  failure = TypeError('Failed to fetch');
+  await retry();
+  assert.deepEqual(toasts, [], 'twenty seconds of refused connections stays quiet');
+  failure = null;
+  await retry();
+  assert.equal(label.dataset.status, 'live', 'recovery clears the reconnecting state');
+  assert.equal(retry, null);
+
+  failure = TypeError('Failed to fetch');
+  await reload();
+  clock += 61e3;
+  await retry();
+  assert.equal(toasts.length, 1, 'an outage past a minute toasts once');
+  await retry();
+  assert.equal(toasts.length, 1);
+  failure = null;
+  await retry();
+
+  failure = Object.assign(Error('internal error'), { status: 500 });
+  await reload();
+  assert.equal(toasts.length, 2, 'a real server error toasts immediately');
+});
+
 test('Cmd+Enter reaches a focused terminal without moving focus or cancelling input', () => {
   let handler, focusChanges = 0, cancelled = 0;
   class Element {
