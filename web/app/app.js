@@ -165,6 +165,21 @@ const optimisticSetAside = new Map();
 // Set-aside writes for one key go out in click order, so a quick Mark running then
 // Unmark (or Undo) cannot land server-side as clear-before-set.
 const setAsideWrites = new Map();
+// A reload whose state request went out before a set-aside write finished can return
+// a snapshot without it. Keep each optimistic entry until a reload started after its
+// write settled: key -> { token, settledAt: reloadGeneration when the write returned }.
+const setAsideSettles = new Map();
+function beginSetAsideWrite(key) {
+  const token = {};
+  setAsideSettles.set(key, { token, settledAt: null });
+  return token;
+}
+function settleSetAsideWrite(key, token) {
+  const current = setAsideSettles.get(key);
+  if (current?.token !== token) return false;
+  current.settledAt = reloadGeneration;
+  return true;
+}
 function queueSetAsideWrite(key, write) {
   const next = (setAsideWrites.get(key) || Promise.resolve()).catch(() => {}).then(write);
   setAsideWrites.set(key, next);
@@ -361,6 +376,7 @@ async function setAside(item, kind = 'dismiss', minutes) {
   if (state.historyTarget?.sessionId === item.sessionId) state.historyTarget = null;
   const key = itemKey(item);
   const now = Date.now();
+  const token = beginSetAsideWrite(key);
   optimisticSetAside.set(key, {
     kind, until: kind === 'snooze' ? now + (minutes || 60) * 60e3 : null, at: now, since: item.since,
   });
@@ -370,11 +386,16 @@ async function setAside(item, kind = 'dismiss', minutes) {
   refresh();
   try {
     await queueSetAsideWrite(key, () => api.setAside(key, kind, minutes));
+    settleSetAsideWrite(key, token);
     toast(kind === 'dependency' ? 'Waiting for dependency. New messages or changed dependencies bring it back.'
       : kind === 'running' ? 'Moved to Running & waiting. A new message or a new turn brings it back.'
       : kind === 'snooze' ? 'Snoozed for 1 hour.' : 'Dismissed. Restore it from the collapsed row.', { label: 'Undo', run: () => restore(key) });
   } catch (error) {
-    optimisticSetAside.delete(key);
+    // A newer click on this key owns the optimistic entry; only roll back our own.
+    if (setAsideSettles.get(key)?.token === token) {
+      setAsideSettles.delete(key);
+      optimisticSetAside.delete(key);
+    }
     deriveDismissed();
     refresh();
     toast(`Could not set aside: ${error.message}`);
@@ -382,6 +403,7 @@ async function setAside(item, kind = 'dismiss', minutes) {
 }
 function dismiss(item) { return setAside(item, 'dismiss'); }
 async function restore(key) {
+  const token = beginSetAsideWrite(key);
   optimisticSetAside.set(key, null);
   state.dismissed.delete(key);
   state.markedRunning.delete(key);
@@ -389,9 +411,13 @@ async function restore(key) {
   refresh();
   try {
     await queueSetAsideWrite(key, () => api.setAside(key, 'clear'));
+    settleSetAsideWrite(key, token);
     toast('Back in the queue.');
   } catch (error) {
-    optimisticSetAside.delete(key);
+    if (setAsideSettles.get(key)?.token === token) {
+      setAsideSettles.delete(key);
+      optimisticSetAside.delete(key);
+    }
     deriveDismissed();
     refresh();
     toast(`Could not restore: ${error.message}`);
@@ -910,7 +936,14 @@ async function reload() {
     }
     closingSessions.reconcile(data);
     void refreshProjectChoices();
-    optimisticSetAside.clear();
+    // Drop an optimistic set-aside only once this reload started after its write
+    // returned; the fenced state then already reflects it. Pending writes stay optimistic.
+    for (const [key, settle] of [...setAsideSettles]) {
+      if (settle.settledAt === null || settle.settledAt >= generation) continue;
+      setAsideSettles.delete(key);
+      optimisticSetAside.delete(key);
+    }
+    for (const key of [...optimisticSetAside.keys()]) if (!setAsideSettles.has(key)) optimisticSetAside.delete(key);
     deriveDismissed();
     for (const pane of [...droppedPanes]) {
       if ((data.panes || []).some((candidate) => candidate.id === pane)) {

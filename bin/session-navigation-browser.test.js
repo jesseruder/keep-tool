@@ -339,7 +339,20 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     await wait("!document.querySelector('#qlist [data-key=\"running:b\"]')");
     await evaluate("document.querySelector('#qlist [data-key=\"waiting:b\"]').click()");
     await wait("document.querySelector('#stage [data-mark-running]')");
+    // A reload whose state request went out before the write must not undo the mark.
+    holdNextState = true;
+    for (const client of eventClients) client.write('data: changed\n\n');
+    const staleDeadline = Date.now() + 2000;
+    while (!releaseHeldState && Date.now() < staleDeadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.ok(releaseHeldState, 'fixture must hold the pre-write state request');
     await evaluate("document.querySelector('#stage [data-mark-running]').click()");
+    await wait("!document.querySelector('#qlist [data-key=\"waiting:b\"]') && document.querySelector('#qlist [data-key=\"running:b\"]')?.textContent.includes('marked running')");
+    releaseHeldState();
+    await wait("document.querySelector('#health .pop')?.textContent.includes('held-state-applied')");
+    assert.ok(await evaluate("!document.querySelector('#qlist [data-key=\"waiting:b\"]') && document.querySelector('#qlist [data-key=\"running:b\"]')?.textContent.includes('marked running')"),
+      'a reload that predates the write keeps the optimistic mark');
+    for (const client of eventClients) client.write('data: changed\n\n');
+    await wait("!document.querySelector('#health .pop')?.textContent.includes('held-state-applied')");
     await wait("!document.querySelector('#qlist [data-key=\"waiting:b\"]') && document.querySelector('#qlist [data-key=\"running:b\"]')?.textContent.includes('marked running')");
     assert.equal(state.setAside.b.kind, 'running');
     assert.equal(await evaluate("document.querySelector('[data-dismiss-toggle]')"), null, 'marked running is not listed as dismissed');
