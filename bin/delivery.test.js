@@ -281,3 +281,39 @@ test('an unconfirmed journal with no createdAt still expires on its file age', a
     assert.equal(typed, 2);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+// Expiry must not become a way to send a message twice. A stale entry whose text and
+// pane match, with the draft gone from the box, most likely DID land — `received`
+// cannot see a message whose session resumed onto a new transcript.
+test('an expired journal for the same message on the same pane is never retyped', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-assumed-'));
+  const file = path.join(dir, 'transcript'); fs.writeFileSync(file, '');
+  const directory = path.join(dir, 'journal');
+  let typed = 0;
+  const base = { session: { id: 's', kind: 'claude' }, pane: 'p', text: 'the same tick', file, directory,
+    precheck: async () => {}, type: async () => { typed += 1; }, submitDraft: async () => assert.fail('unexpected Enter'),
+    draftMatches: async () => false, pause: async () => {}, attempts: 1, staleJournalMs: 15 * 60e3 };
+  try {
+    await assert.rejects(deliver(base), /unconfirmed/);
+    const journal = path.join(directory, fs.readdirSync(directory).find((name) => name.endsWith('.json')));
+    const entry = JSON.parse(fs.readFileSync(journal, 'utf8'));
+    fs.writeFileSync(journal, JSON.stringify({ ...entry, createdAt: Date.now() - 60 * 60e3 }));
+
+    const result = await deliver(base);
+    assert.deepEqual(result, { ok: true, delivery: 'assumed-delivered', expired: true });
+    assert.equal(typed, 1, 'the text was typed once, ever');
+    assert.equal(fs.existsSync(journal), false, 'and the session is no longer wedged');
+
+    // With the session unwedged, the next different message goes through normally.
+    await assert.rejects(deliver({ ...base, text: 'the next tick' }), /no matching transcript receipt/);
+    assert.equal(typed, 2);
+
+    // A different pane is not the same delivery, so it is not assumed: the message
+    // was aimed somewhere else and has to be typed where it is wanted now.
+    const second = path.join(directory, fs.readdirSync(directory).find((name) => name.endsWith('.json')));
+    const stale = JSON.parse(fs.readFileSync(second, 'utf8'));
+    fs.writeFileSync(second, JSON.stringify({ ...stale, createdAt: Date.now() - 60 * 60e3 }));
+    await assert.rejects(deliver({ ...base, text: 'the next tick', pane: 'other-pane' }), /no matching transcript receipt/);
+    assert.equal(typed, 3, 'a pane change still retypes');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

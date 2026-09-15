@@ -167,7 +167,17 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
         if (draftPresent || ageMs < staleJournalMs) {
           throw new Error('Previous delivery is unconfirmed; no message was retyped. Inspect the session draft/transcript before retrying.');
         }
-        trace('pending-journal-expired', { ageMs });
+        // Same text, same pane, and the draft is gone from the box: the likeliest
+        // reading is that it WAS submitted and `received` cannot see it - a session
+        // that resumed writes to a new transcript, so the journal's file/offset can
+        // point at a path that will never gain another line. Retyping there sends the
+        // message twice. Expire it without typing: unproven delivery beats a duplicate.
+        const assumedDelivered = sameMessage && samePane;
+        trace('pending-journal-expired', { ageMs, assumedDelivered });
+        if (assumedDelivered) {
+          finish(directory, journal, entry);
+          return { ok: true, delivery: 'assumed-delivered', expired: true };
+        }
         try { fs.unlinkSync(journal); } catch (error) { if (error.code !== 'ENOENT') throw error; }
         entry = null;
       } else {
