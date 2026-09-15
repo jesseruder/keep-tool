@@ -631,6 +631,7 @@ function recordObservationDecision(turn, observation, message, deps = {}) {
       message,
       reviewer: 'watcher',
       promptHash: watcher.PROMPT_HASH,
+      deferredReason: deps.deferredReason || '',
     });
     return entry.id;
   } catch (error) {
@@ -652,29 +653,39 @@ async function maybeDeliverObservation(turn, observation, deps = {}) {
   const text = safeDeliveryText(observationMessage(turn, observation));
   if (!text || !text.startsWith(DELIVERY_PREFIX)) return skip('unsafe-text');
 
-  // The gates that decide whether this turn could ever be nudged come before the
-  // shadow record, not after it. A decision Owner grades is a decision that
-  // would have been acted on; recording one for a reviewer session, or for a
-  // turn a carve-out already rules out, asks him to grade something that was
-  // never going to happen and drags the agreement rate with it.
+  // Two kinds of reason not to deliver, and they are graded differently.
+  //
+  // Permanent ones are about who is being judged or what the turn did: a
+  // reviewer is never nudged, and a turn that pushed, paused, or asked Owner
+  // something irreversible is his either way. Recording those would ask him to
+  // grade a message that was never going to be sent, so nothing is recorded.
   const session = deps.session;
-  const notReady = sessionReady(session); // excludes the reviewer, among everything else
-  if (notReady) return skip(notReady);
-
-  const card = deps.card !== undefined ? deps.card : cardFor(turn, keepApi);
+  if (session && session.reviewer) return skip('the reviewer is not auto-continued');
+  if (session && session.kind && session.kind !== 'claude' && session.kind !== 'codex') {
+    return skip('not an agent session');
+  }
   const commands = deps.commands || turnCommands(turn, deps);
-  const carved = carveOut({
-    turn: { ...turn, assistantMessages: assistantMessages(turn, deps) },
-    card, commands, watcher, keepApi,
-  });
-  if (carved) return skip(carved);
+  const enriched = { ...turn, assistantMessages: assistantMessages(turn, deps) };
+  const permanent = pausedCarveOut(enriched, watcher)
+    || riskyQuestionCarveOut(enriched, watcher)
+    || releaseCarveOut(commands, keepApi, turn)
+    || chainCarveOut(turn.opener_kind);
+  if (permanent) return skip(permanent);
 
   const capped = observationCap(turn, deps);
   if (capped) return skip(capped);
 
-  const decisionId = recordObservationDecision(turn, observation, text, deps);
-  const shadow = { decisionId, text };
+  // Transient ones are about the moment: the session is mid-turn, it has exited
+  // since, its card is not active right now. None of that makes the observation
+  // wrong, and grading only the turns whose author happened to be idle would
+  // graduate this type on a sample that is not the fleet. Recorded, and tagged
+  // with what stopped it.
+  const card = deps.card !== undefined ? deps.card : cardFor(turn, keepApi);
+  const deferredReason = sessionReady(session) || cardCarveOut(card) || '';
+  const decisionId = recordObservationDecision(turn, observation, text, { ...deps, deferredReason });
+  const shadow = { decisionId, text, ...(deferredReason ? { deferredReason } : {}) };
   if (!config.live[OBSERVATION_TYPE]) return skip(`${OBSERVATION_TYPE} is not live`, shadow);
+  if (deferredReason) return skip(deferredReason, shadow);
 
   const stale = freshness(turn, deps);
   if (stale) return skip(stale, shadow);

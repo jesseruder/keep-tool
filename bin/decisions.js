@@ -80,7 +80,7 @@ function clip(value, max) {
   return String(value == null ? '' : value).replace(/\s+/g, ' ').trim().slice(0, max);
 }
 
-function record({ type, card, session, turn, why, message, reviewer, promptHash, now = Date.now() }) {
+function record({ type, card, session, turn, why, message, reviewer, promptHash, deferredReason, now = Date.now() }) {
   if (!TYPES[type]) {
     throw new DecisionError(`--type must be one of: ${Object.keys(TYPES).join(', ')}`);
   }
@@ -110,6 +110,10 @@ function record({ type, card, session, turn, why, message, reviewer, promptHash,
     // as much as a model, so a grade given on one prompt must not graduate a
     // different one. Older rows carry no hash and count only under "unknown".
     ...(promptHash ? { promptHash: String(promptHash).slice(0, 40) } : {}),
+    // Why nothing was delivered, when the reason was about the moment rather
+    // than about the judgment. Owner still grades the judgment; this says he is
+    // grading something that was correct but arrived while the session was busy.
+    ...(deferredReason ? { deferredReason: clip(deferredReason, 200) } : {}),
     verdict: null,
     verdictAt: null,
     note: '',

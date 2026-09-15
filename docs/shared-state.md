@@ -137,11 +137,16 @@ record like every other type: `keep watcher live resource` after 30 decisions at
 **on the current judge prompt** — grades given on an older prompt still show in
 `keep decisions stats`, under their own hash, but do not graduate the new one.
 
-The record comes after the gates, not before them: a turn the reviewer check or a
-carve-out already rules out is never put in front of Owner to grade, because a
-decision he grades is one that would have been acted on. One session may add at
-most three resource observations to the ledger per hour, so an afternoon spent in
-one declared resource cannot fill the grading queue with the same sentence.
+Two kinds of reason not to deliver, graded differently. A reviewer session, or a
+turn that pushed, paused, or asked Owner something irreversible, is never nudged
+whatever happens — nothing is recorded for those, because a decision Owner grades
+should be one that would have been acted on. A session that is merely mid-turn,
+has exited since, or is on a card that is not active right now *is* recorded, with
+a `deferredReason` saying what stopped it: grading only the turns whose author
+happened to be idle would graduate the type on a sample that is not the fleet.
+One session may add at most three resource observations to the ledger per hour, so
+an afternoon spent in one declared resource cannot fill the grading queue with the
+same sentence.
 
 The message:
 

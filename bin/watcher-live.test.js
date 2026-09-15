@@ -1362,7 +1362,7 @@ test('an observation is skipped when a verdict already reserved the turn', async
   assert.ok(result.decisionId, 'the shadow decision is still recorded for grading');
 });
 
-test('nothing is recorded for a turn the gates already rule out', async (t) => {
+test('nothing is recorded for a turn that was never going to be nudged', async (t) => {
   const dir = sandbox(t);
   t.after(forgetDeclarations);
   declare();
@@ -1370,12 +1370,13 @@ test('nothing is recorded for a turn the gates already rule out', async (t) => {
   const config = live.normalizeConfig({ live: { resource: true } });
   const before = require('./decisions.js').loadSafe().length;
 
-  // A reviewer session, and a turn the release carve-out rules out. Neither
-  // would ever be nudged, so neither becomes something for Owner to grade.
+  // A reviewer session, and a turn the release carve-out rules out. Neither is
+  // ever nudged, so neither becomes something for Owner to grade.
   const reviewer = await live.maybeDeliverObservation(turn, watcher.observationFor(turn), {
     config, session: { ...READY_SESSION, reviewer: true }, card: ACTIVE_CARD, send: fakeSend(),
   });
   assert.equal(reviewer.decisionId, undefined);
+  assert.match(reviewer.reason, /reviewer/);
   const carved = await live.maybeDeliverObservation(turn, watcher.observationFor(turn), {
     config, session: READY_SESSION, card: ACTIVE_CARD, send: fakeSend(),
     commands: ['terraform apply', 'git push origin HEAD'],
@@ -1384,6 +1385,47 @@ test('nothing is recorded for a turn the gates already rule out', async (t) => {
   assert.match(carved.reason, /commit or push/);
   assert.equal(carved.decisionId, undefined);
   assert.equal(require('./decisions.js').loadSafe().length, before, 'the ledger did not grow');
+});
+
+test('a session that was merely busy still produces grading data, tagged with why', async (t) => {
+  const dir = sandbox(t);
+  t.after(forgetDeclarations);
+  declare();
+  const turn = terraformTurn(dir);
+  const config = live.normalizeConfig({ live: { resource: true } });
+  const ledger = () => require('./decisions.js').loadSafe();
+
+  // Exited, mid-turn, no card: all reasons about the moment, not about whether
+  // the observation was right. Grading only idle authors would graduate this
+  // type on a sample that is not the fleet.
+  let first = null;
+  for (const [session, card, expected] of [
+    [{ ...READY_SESSION, exited: true, state: 'exited' }, ACTIVE_CARD, /exited/],
+    [{ ...READY_SESSION, endedTurn: false }, ACTIVE_CARD, /mid-turn/],
+    [undefined, ACTIVE_CARD, /does not see this session/],
+    [READY_SESSION, null, /needs an active card/],
+  ]) {
+    const send = fakeSend();
+    const result = await live.maybeDeliverObservation(turn, watcher.observationFor(turn), {
+      config, session, card, send,
+    });
+    assert.equal(result.delivered, false);
+    assert.match(result.reason, expected);
+    assert.ok(result.decisionId, `recorded despite ${result.reason}`);
+    assert.match(result.deferredReason, expected);
+    assert.deepEqual(send.calls, [], 'recorded, not sent');
+    const entry = ledger().find((row) => row.id === result.decisionId);
+    assert.equal(entry.type, 'resource');
+    if (!first) {
+      first = entry;
+      assert.match(entry.deferredReason, expected);
+    }
+    // Still one row for this turn: a re-judge reuses the row Owner may already
+    // be looking at, and keeps the reason it was first recorded with.
+    assert.equal(entry.id, first.id);
+    assert.equal(entry.deferredReason, first.deferredReason);
+    assert.equal(ledger().filter((row) => row.type === 'resource').length, 1);
+  }
 });
 
 test('a session gets at most three resource observations an hour on the ledger', async (t) => {
@@ -1427,7 +1469,7 @@ test('a session gets at most three resource observations an hour on the ledger',
   assert.ok(later.decisionId);
 });
 
-test('an observation never reaches the reviewer or a session that is not ready', async (t) => {
+test('an observation is never delivered to the reviewer or to a session that is not ready', async (t) => {
   const dir = sandbox(t);
   t.after(forgetDeclarations);
   declare();
