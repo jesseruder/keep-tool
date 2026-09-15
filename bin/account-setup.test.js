@@ -484,3 +484,35 @@ test('staged failure rolls back and the same setup can be retried', () => {
     assert.equal(setup.shareSetup(f.source, f.target).ok, true);
   } finally { f.cleanup(); }
 });
+
+test('a handoff target missing a Keep hook the source has is refused by name', () => {
+  const f = fixture();
+  const keepBin = "'/opt/keep/bin/keep'";
+  const hooked = {
+    ...JSON.parse(fs.readFileSync(path.join(f.sourceDir, 'settings.json'), 'utf8')),
+    hooks: {
+      SessionStart: [{ matcher: '', hooks: [{ type: 'command', command: `${keepBin} hook session-start` }] }],
+      PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: `${keepBin} hook pre-bash` }] }],
+    },
+  };
+  fs.writeFileSync(path.join(f.sourceDir, 'settings.json'), JSON.stringify(hooked));
+  const unguarded = { id: 'claude-bare', label: 'Bare', agent: 'claude', configDir: path.join(f.home, '.claude-bare'), builtIn: false };
+  try {
+    // A shared setup links settings.json, so the target carries the same hooks.
+    setup.shareSetup(f.source, f.target);
+    const shared = setup.compatible(f.source, f.target, f.repoA);
+    assert.equal(shared.ok, true, shared.reasons.join(', '));
+
+    // An account assembled by hand: the portable settings match, the hooks do not.
+    fs.mkdirSync(unguarded.configDir, { recursive: true });
+    const { hooks, ...portable } = hooked;
+    fs.writeFileSync(path.join(unguarded.configDir, 'settings.json'), JSON.stringify(portable));
+    fs.copyFileSync(path.join(f.sourceDir, 'settings.local.json'), path.join(unguarded.configDir, 'settings.local.json'));
+    const verdict = setup.compatible(f.source, unguarded, f.repoA);
+    assert.equal(verdict.ok, false);
+    assert.ok(verdict.reasons.includes('target account is missing Keep hooks: session-start, pre-bash'),
+      verdict.reasons.join(', '));
+    assert.equal(verdict.reasons.includes('portable Claude settings differ'), false,
+      'hooks stay out of the portable digest');
+  } finally { f.cleanup(); }
+});

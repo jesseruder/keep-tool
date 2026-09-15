@@ -183,7 +183,10 @@ to create a host-owned reviewer pane for review ticks. The terminal attaches to 
 pane; the reviewer also appears in the console. Both agent skills are bundled; the reviewer
 registers through its Claude SessionStart hook. Existing hook settings and skills
 are preserved: setup backs up settings and refuses to replace another skill.
-See [agent integration](docs/agent-hooks.md) for Codex event adapters.
+`keep setup hooks` installs the hooks into every managed Claude account's
+`settings.json`, not only `~/.claude`; `--account <id>` limits it to one, and
+Codex accounts are never touched. `keep doctor` reports the missing hooks per
+account. See [agent integration](docs/agent-hooks.md) for Codex event adapters.
 
 `keep init` creates an empty registry at `~/keep`; use `--dir /path/to/private-data`
 to choose another location. It refuses nonempty directories. It does not configure

@@ -81,14 +81,17 @@ function init(args) {
   console.log(`Created private registry: ${root}\nConfiguration: ${file}\nNext: keep setup hooks, then keep doctor. No remote was configured.`);
 }
 
+const HOOK_EVENTS = {
+  SessionStart: ['session-start', ''], SessionEnd: ['session-end', ''],
+  Stop: ['stop', ''], Notification: ['notification', ''],
+  PreToolUse: ['pre-bash', 'Bash'], PostToolUse: ['post-bash', 'Bash'],
+};
+const HOOK_ACTIONS = Object.values(HOOK_EVENTS).map(([action]) => action);
+
 function mergeHooks(settings, command) {
   const next = structuredClone(settings);
   next.hooks ||= {};
-  const events = {
-    SessionStart: ['session-start', ''], SessionEnd: ['session-end', ''],
-    Stop: ['stop', ''], Notification: ['notification', ''],
-    PreToolUse: ['pre-bash', 'Bash'], PostToolUse: ['post-bash', 'Bash'],
-  };
+  const events = HOOK_EVENTS;
   for (const [event, [action, matcher]] of Object.entries(events)) {
     const entries = next.hooks[event] ||= [];
     const hookCommand = `${command} hook ${action}`;
@@ -99,10 +102,61 @@ function mergeHooks(settings, command) {
   return next;
 }
 
-function installHooks() {
-  const settingsFile = path.join(os.homedir(), '.claude', 'settings.json');
-  const existing = fs.existsSync(settingsFile) ? fs.readFileSync(settingsFile, 'utf8') : null;
+// Which of Keep's six hook commands a settings file does not carry. A missing or
+// unreadable file carries none: an automation account with no settings.json is
+// exactly the unguarded case this reports.
+function missingHooks(settingsFile) {
+  let text = '';
+  try { text = fs.readFileSync(settingsFile, 'utf8'); } catch {}
+  return HOOK_ACTIONS.filter((action) => !text.includes(` hook ${action}`));
+}
+
+// Every Claude settings.json the hooks belong in: the default config directory
+// first, then each managed Claude account that keeps its own. Codex accounts have
+// their own adapter commands and are never touched here.
+function hookTargets(env = process.env) {
+  const home = path.join(os.homedir(), '.claude');
+  const resolve = (value) => { try { return canonicalPath(value); } catch { return path.resolve(value); } };
+  const seen = new Set([resolve(home)]);
+  const targets = [{ id: 'claude/default', dir: home, file: path.join(home, 'settings.json') }];
+  let accounts = [];
+  try { accounts = require('./accounts').list(env); } catch { accounts = []; }
+  for (const account of accounts) {
+    if (account.agent !== 'claude') continue;
+    const dir = resolve(account.configDir);
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    targets.push({ id: account.id, dir: account.configDir, file: path.join(account.configDir, 'settings.json') });
+  }
+  return targets;
+}
+
+// Merges the hooks into one settings file, leaving an untouched file byte-for-byte
+// alone: a managed account whose settings.json is a symlink to the source already
+// has whatever the source has.
+function writeHooks(file, command) {
+  const existing = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+  const next = JSON.stringify(mergeHooks(existing ? JSON.parse(existing) : {}, command), null, 2) + '\n';
+  if (existing === next) return false;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  if (existing !== null) fs.copyFileSync(file, `${file}.keep-backup-${Date.now()}`, fs.constants.COPYFILE_EXCL);
+  fs.writeFileSync(file, next, { mode: 0o600 });
+  return true;
+}
+
+function installHooks(args = []) {
+  const opts = options(args, ['--account']);
   const command = `KEEP_CONFIG=${quote(config.configFile())} ${quote(path.join(SOURCE, 'bin', 'keep'))}`;
+  const targets = hookTargets();
+  if (opts.account) {
+    const target = targets.find((entry) => entry.id === opts.account);
+    if (!target) throw new Error(`no managed Claude account named ${opts.account}`);
+    const changed = writeHooks(target.file, command);
+    console.log(`${changed ? 'Installed' : 'Already installed'}: Keep hooks for ${target.id} (${target.file})`);
+    return;
+  }
+  const settingsFile = targets[0].file;
+  const existing = fs.existsSync(settingsFile) ? fs.readFileSync(settingsFile, 'utf8') : null;
   const next = mergeHooks(existing ? JSON.parse(existing) : {}, command);
   // Preflight every destination before changing any settings or skill links.
   const links = [];
@@ -122,6 +176,12 @@ function installHooks() {
   for (const { dest, source } of links) { fs.mkdirSync(path.dirname(dest), { recursive: true }); fs.symlinkSync(source, dest); }
   fs.writeFileSync(settingsFile, newText, { mode: 0o600 });
   console.log('Installed Claude hooks and shared Claude/Codex skills. Restart agent sessions to load them.');
+  // A managed automation account without the hooks has no restart guard and no
+  // raw-resume guard, and nothing else installs them there.
+  for (const target of targets.slice(1)) {
+    const changed = writeHooks(target.file, command);
+    console.log(`${changed ? 'Installed' : 'Already installed'}: Keep hooks for ${target.id} (${target.file})`);
+  }
   console.log('Codex event hooks are version-dependent; see docs/agent-hooks.md for the adapter commands.');
 }
 
@@ -249,7 +309,18 @@ function doctor(root) {
   check('Claude CLI (reviewer and scheduled checks)', () => spawnSync('claude', ['--version'], { timeout: 10000 }).status === 0);
   check('Codex CLI', () => spawnSync('codex', ['--version'], { timeout: 10000 }).status === 0, false);
   check('terminal dependencies', () => { require('node-pty'); require('ws'); return true; });
-  check('Claude Keep hooks', () => fs.readFileSync(path.join(os.homedir(), '.claude', 'settings.json'), 'utf8').includes(' hook session-start'));
+  // Per account: the restart guard and the raw-resume guard live in the hooks, so
+  // an automation account without them runs unguarded.
+  const unguarded = [];
+  for (const target of hookTargets()) {
+    check(`Claude Keep hooks (${target.id})`, () => {
+      const missing = missingHooks(target.file);
+      if (missing.length) unguarded.push(`${target.id} is missing ${missing.join(', ')}`);
+      return missing.length === 0;
+    });
+  }
+  for (const line of unguarded) console.log(`  ${line}`);
+  if (unguarded.length) console.log('  fix: keep setup hooks');
   check('fleet-review skill', () => fs.existsSync(path.join(os.homedir(), '.claude', 'skills', 'fleet-review', 'SKILL.md')));
   console.log('Model access and external integrations require their own live checks; doctor does not call models or send notifications.');
   if (failed) process.exitCode = 1;
@@ -257,5 +328,6 @@ function doctor(root) {
 
 module.exports = {
   init, installHooks, service, doctor, mergeHooks, servicePlist, quote, canonicalPath, insideSource,
+  HOOK_ACTIONS, missingHooks, hookTargets,
   shell, shellBlock, applyShellBlock, SHELL_START, SHELL_END,
 };

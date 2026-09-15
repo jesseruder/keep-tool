@@ -485,6 +485,16 @@ function digest(value) {
   return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 }
 
+// comparableSettings strips hooks on purpose — they name an absolute keep path and
+// are not portable state. They are still the restart guard and the raw-resume
+// guard, so a handoff must not put a session in an account that lacks one the
+// source has; that is its own reason rather than a settings difference.
+function keepHookActions(configDir) {
+  let text = '';
+  try { text = fs.readFileSync(path.join(configDir, 'settings.json'), 'utf8'); } catch {}
+  return require('./setup').HOOK_ACTIONS.filter((action) => text.includes(` hook ${action}`));
+}
+
 function compatible(sourceAccount, targetAccount, cwd) {
   const reasons = [];
   let source, target;
@@ -496,6 +506,9 @@ function compatible(sourceAccount, targetAccount, cwd) {
   if (digest(comparableSettings(sourceAccount.configDir)) !== digest(comparableSettings(targetAccount.configDir))) {
     reasons.push('portable Claude settings differ');
   }
+  const targetHooks = keepHookActions(targetAccount.configDir);
+  const missingHooks = keepHookActions(sourceAccount.configDir).filter((action) => !targetHooks.includes(action));
+  if (missingHooks.length) reasons.push(`target account is missing Keep hooks: ${missingHooks.join(', ')}`);
   if (digest(source.mcpServers) !== digest(target.mcpServers)) reasons.push('effective MCP servers differ');
   if (canonical(source.memoryDir) !== canonical(target.memoryDir)) reasons.push('project memory differs');
   return { ok: reasons.length === 0, reasons, mcpConfig: target.mcpConfig,

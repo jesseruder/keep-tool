@@ -99,6 +99,7 @@ keep slack mode log|cards|alerts
 keep verify <id>       # run a check recipe now (needs keep serve)
 keep compact <sid>     # compact a live Claude or Codex session (needs keep serve)
 keep resume [--raw]    # post-restart: active tasks + keep open commands (--raw prints the bare CLI form)
+keep setup hooks [--account <id>]  # install the Keep hooks in every managed Claude account
 keep setup --shell [--write]   # the zsh claude() that routes resumes through keep open
 keep sync              # pull --rebase + push
 keep hook session-start  # used by the Claude Code SessionStart hook
@@ -173,6 +174,19 @@ card; an env variable in an unrelated session or ordinary shell does not clear i
 different project directory. It transfers that explicit session from its old card to
 the named card and does not launch, wake, or message the session. The target card's
 status, schedule, activity timestamp, and body are preserved.
+
+`keep setup hooks` merges Keep's six hook commands — `session-start`,
+`session-end`, `stop`, `notification`, `pre-bash`, `post-bash` — into
+`~/.claude/settings.json` and into the `settings.json` of every managed Claude
+account from the accounts configuration, printing one line per account. A managed
+account whose settings file is a symlink to the source already carries them and is
+left byte-for-byte alone; a file it does change is backed up first. `--account <id>`
+limits the run to one account and skips the shared skill links. Codex accounts keep
+their own version-dependent adapters and are never touched. `keep doctor` reports
+the hooks each account is missing, with `keep setup hooks` as the fix: an account
+without them has no restart guard and no raw-resume guard. For the same reason, an
+account handoff refuses a target missing a hook the source has ("target account is
+missing Keep hooks: …") even though hooks stay out of the portable settings digest.
 
 Claude subagent lifecycle tracking uses `keep hook lifecycle` for both
 `SubagentStart` and `SubagentStop` in Claude's user settings. These observation-only

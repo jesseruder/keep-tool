@@ -260,6 +260,12 @@ The refusal names the rule and points at step 4 of the repair card. The guard is
 keyed to `KEEP_REPAIR=1`, which every launch of a session the repair state records
 as its agent sets, so no other session on the card sees it and no restart clears it.
 
+The guard is a `keep hook pre-bash` hook, so it only exists where that hook is
+installed: a repair session running in a managed automation account whose
+`settings.json` has no Keep hooks is unguarded, restart refusal and raw-resume
+refusal both. `keep setup hooks` installs them in every managed Claude account, and
+`keep doctor` names any account still missing them.
+
 **The card is not closed automatically**, the fix is not landed without a recorded
 review, and `--allow` grants cannot be set from an agent session, so the repair
 card carries none.

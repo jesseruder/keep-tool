@@ -8142,7 +8142,9 @@ function helpText() {
 
   keep init [--dir path]   # create a separate private registry
   keep doctor              # diagnose this installation
-  keep setup hooks         # install Claude hooks and shared agent skills
+  keep setup hooks [--account <id>]
+                           # install Claude hooks and shared agent skills, in every
+                           # managed Claude account (--account limits it to one)
   keep setup --shell [--write]
                            # print (or write to ~/.zshrc) a zsh claude() that routes
                            # --resume/-r/--continue/-c through keep open; KEEP_RAW_CLAUDE=1 bypasses
@@ -8430,8 +8432,10 @@ commands.init = (args) => require('./setup').init(args);
 commands.doctor = () => require('./setup').doctor(ROOT);
 commands.setup = (args) => {
   if (args.includes('--shell')) return require('./setup').shell(args);
-  if (args.length !== 1 || args[0] !== 'hooks') throw new KeepError('usage: keep setup hooks | keep setup --shell [--write]');
-  return require('./setup').installHooks();
+  if (args[0] !== 'hooks' || (args.length !== 1 && (args.length !== 3 || args[1] !== '--account'))) {
+    throw new KeepError('usage: keep setup hooks [--account <id>] | keep setup --shell [--write]');
+  }
+  return require('./setup').installHooks(args.slice(1));
 };
 commands.service = (args) => require('./setup').service(args, ROOT);
 

@@ -222,3 +222,78 @@ test('keep setup --shell prints the guard, --write is idempotent, and a non-resu
     assert.equal(seen.launcher, null, 'KEEP_LAUNCHER is unset before exec, so it reaches nothing downstream');
   } finally { fs.rmSync(base, { recursive: true, force: true }); }
 });
+
+// A managed automation account without the Keep hooks has no restart guard and no
+// raw-resume guard, and nothing but `keep setup hooks` installs them there.
+function hooksFixture() {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-setup-hooks-'));
+  const home = path.join(base, 'home');
+  const automation = path.join(home, '.claude-automation');
+  const codex = path.join(home, '.codex-alt');
+  for (const dir of [home, automation, codex]) fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(base, 'config.json');
+  fs.writeFileSync(file, JSON.stringify({
+    version: 1,
+    dataDir: path.join(base, 'registry'),
+    accounts: [
+      { id: 'claude/default', label: 'Claude (default)', agent: 'claude', configDir: path.join(home, '.claude'), useDefaultConfig: true },
+      { id: 'automation', label: 'Automation', agent: 'claude', configDir: automation },
+      { id: 'codex/default', label: 'Codex (default)', agent: 'codex', configDir: path.join(home, '.codex') },
+      { id: 'codex-alt', label: 'Codex alt', agent: 'codex', configDir: codex },
+    ],
+    defaultAccounts: { claude: 'claude/default', codex: 'codex/default' },
+  }, null, 2) + '\n');
+  const prior = { HOME: process.env.HOME, KEEP_CONFIG: process.env.KEEP_CONFIG, KEEP_DIR: process.env.KEEP_DIR };
+  process.env.HOME = home;
+  process.env.KEEP_CONFIG = file;
+  delete process.env.KEEP_DIR;
+  return {
+    base, home, automation, codex,
+    defaultSettings: path.join(home, '.claude', 'settings.json'),
+    accountSettings: path.join(automation, 'settings.json'),
+    cleanup: () => {
+      for (const [key, value] of Object.entries(prior)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      fs.rmSync(base, { recursive: true, force: true });
+    },
+  };
+}
+
+test('keep setup hooks installs the guard in every managed Claude account and never in a Codex one', () => {
+  const f = hooksFixture();
+  try {
+    assert.deepEqual(setup.hookTargets().map((target) => target.id), ['claude/default', 'automation']);
+    assert.deepEqual(setup.missingHooks(f.accountSettings), setup.HOOK_ACTIONS);
+
+    setup.installHooks();
+    for (const file of [f.defaultSettings, f.accountSettings]) {
+      assert.deepEqual(setup.missingHooks(file), [], file);
+      assert.match(fs.readFileSync(file, 'utf8'), / hook pre-bash/);
+    }
+    assert.equal(fs.existsSync(path.join(f.codex, 'settings.json')), false, 'Codex accounts keep their own adapters');
+    assert.equal(fs.existsSync(path.join(f.home, '.codex', 'settings.json')), false);
+
+    // A second run changes nothing and leaves no backup behind.
+    const before = fs.readFileSync(f.accountSettings, 'utf8');
+    setup.installHooks();
+    assert.equal(fs.readFileSync(f.accountSettings, 'utf8'), before);
+    assert.deepEqual(fs.readdirSync(f.automation).filter((name) => name.includes('keep-backup')), []);
+  } finally { f.cleanup(); }
+});
+
+test('keep setup hooks --account installs into that account alone', () => {
+  const f = hooksFixture();
+  try {
+    fs.writeFileSync(f.accountSettings, JSON.stringify({ enabledPlugins: { example: true } }, null, 2) + '\n');
+    setup.installHooks(['--account', 'automation']);
+    assert.deepEqual(setup.missingHooks(f.accountSettings), []);
+    assert.equal(JSON.parse(fs.readFileSync(f.accountSettings, 'utf8')).enabledPlugins.example, true);
+    assert.equal(fs.readdirSync(f.automation).filter((name) => name.includes('keep-backup')).length, 1,
+      'the replaced settings file is backed up');
+    assert.equal(fs.existsSync(f.defaultSettings), false, '--account touches nothing else');
+    assert.equal(fs.existsSync(path.join(f.home, '.claude', 'skills')), false);
+    assert.throws(() => setup.installHooks(['--account', 'codex-alt']), /no managed Claude account/);
+  } finally { f.cleanup(); }
+});
