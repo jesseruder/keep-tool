@@ -22,6 +22,13 @@ const FETCH_INTERVAL_MS = 10 * 60e3;
 const CHECKIN_LIMIT = 10;
 const SHADOW_LIMIT = 8;
 const DEFAULT_INTERVAL_MIN = 30;
+// `wt land` rebases a worktree branch onto origin/<default> before pushing, so a
+// cited sha is almost never the sha that lands. The patch is the same one, and
+// `git patch-id --stable` is what says so. The scan looks one day either side of
+// the check-in that cited the commit and stops at 300 commits.
+const REBASE_WINDOW_MS = 86400e3;
+const REBASE_SCAN_LIMIT = 300;
+const PATCH_MAX_BUFFER = 256 * 1024 * 1024;
 const FIRST_RUN_MS = 2 * 60e3;
 const MODEL_TIMEOUT_MS = 120e3;
 const SHADOW_TIMEOUT_MS = 90e3;
@@ -198,11 +205,12 @@ function repoFor(task) {
   } catch { return null; }
 }
 
-function git(repo, args, timeout = 10e3) {
+function git(repo, args, timeout = 10e3, options = {}) {
   return childProcess.execFileSync('git', ['-C', repo, '--no-optional-locks', ...args], {
     encoding: 'utf8',
     timeout,
     stdio: ['ignore', 'pipe', 'pipe'],
+    ...options,
   });
 }
 
@@ -256,6 +264,89 @@ function isOnDefault(repo, sha, branch) {
     git(repo, ['merge-base', '--is-ancestor', sha, `refs/remotes/origin/${branch}`]);
     return true;
   } catch { return false; }
+}
+
+// ---------- rebased citations ----------
+
+function patchCaches() {
+  return { patchIds: new Map(), indexes: new Map() };
+}
+
+function commitExists(repo, sha) {
+  try { git(repo, ['cat-file', '-e', `${sha}^{commit}`]); return true; }
+  catch { return false; }
+}
+
+// A worktree commit is visible from the card's repo: linked worktrees share the
+// main checkout's object store. A merge (or an empty commit) has no single patch,
+// so it has no identity to match on and is skipped.
+function citedPatchId(repo, sha, cache) {
+  const key = `${repo} ${sha}`;
+  if (cache.has(key)) return cache.get(key);
+  let id = '';
+  try {
+    const deps = require('./reviews.js').gitDeps(repo);
+    if (deps.parents(sha).length <= 1) id = deps.patchId(sha);
+  } catch {}
+  cache.set(key, id);
+  return id;
+}
+
+// patch-id → sha for the default branch's recent commits. One `git log -p` and
+// one `git patch-id` per repository per sweep: patch-id reads a stream of
+// patches and names the commit each one came from, and merges contribute none.
+function defaultPatchIndex(repo, branch, sinceMs, cache) {
+  const prior = cache.get(repo);
+  // An index built from an earlier point covers everything a later one would:
+  // both take the newest REBASE_SCAN_LIMIT commits of a nested set.
+  if (prior && prior.branch === branch && prior.sinceMs <= sinceMs) return prior.index;
+  const index = new Map();
+  try {
+    const log = git(repo, [
+      'log', '--no-color', '--format=commit %H', '-p', '-n', String(REBASE_SCAN_LIMIT),
+      `--since=${new Date(sinceMs).toISOString()}`, `refs/remotes/origin/${branch}`,
+    ], 30e3, { maxBuffer: PATCH_MAX_BUFFER });
+    if (log.trim()) {
+      const out = git(repo, ['patch-id', '--stable'], 30e3, {
+        input: log, stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: PATCH_MAX_BUFFER,
+      });
+      for (const line of out.split('\n')) {
+        const [id, sha] = line.trim().split(/\s+/);
+        if (id && sha && !index.has(id)) index.set(id, sha);
+      }
+    }
+  } catch {}
+  cache.set(repo, { branch, sinceMs, index });
+  return index;
+}
+
+// The sha on the default branch carrying the same patch as `citation.sha`, or
+// null. Never the citation itself: a cited sha already on the branch takes the
+// direct path.
+function rebasedSha(repo, branch, citation, caches, now) {
+  if (!commitExists(repo, citation.sha)) return null;
+  const id = citedPatchId(repo, citation.sha, caches.patchIds);
+  if (!id) return null;
+  const stamp = stampMs(citation.entryStamp) || now;
+  const landedSha = defaultPatchIndex(repo, branch, stamp - REBASE_WINDOW_MS, caches.indexes).get(id);
+  return landedSha && !sameSha(landedSha, citation.sha) ? landedSha : null;
+}
+
+// The landed record for a citation, or null when it has not landed. A rebased
+// citation records the sha that landed and keeps the cited spelling as an alias,
+// so provenance resolves for either one.
+function landedRecord(repo, branch, citation, caches, now, allowRebase = true) {
+  if (isOnDefault(repo, citation.sha, branch)) {
+    return { sha: citation.sha, branch, landedAt: now, entryStamp: citation.entryStamp };
+  }
+  if (!allowRebase) return null;
+  const sha = rebasedSha(repo, branch, citation, caches, now);
+  if (!sha) return null;
+  return { sha, citedSha: citation.sha, branch, landedAt: now, entryStamp: citation.entryStamp };
+}
+
+function recordShas(records) {
+  return (records || []).flatMap((record) => [record.sha, record.citedSha].filter(Boolean));
 }
 
 function nextStepIsLanding(text) {
@@ -445,8 +536,15 @@ function stampMs(stamp) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function messageFor(shas, branch, closed) {
-  const message = `${shas.join(', ')} ${shas.length === 1 ? 'is' : 'are'} on origin/${branch}`;
+function messageFor(items, branch, closed) {
+  const records = (items || []).map((item) => (typeof item === 'string' ? { sha: item } : item));
+  const parts = [];
+  const direct = records.filter((record) => !record.citedSha).map((record) => record.sha);
+  if (direct.length) parts.push(`${direct.join(', ')} ${direct.length === 1 ? 'is' : 'are'} on origin/${branch}`);
+  for (const record of records.filter((item) => item.citedSha)) {
+    parts.push(`cited ${record.citedSha.slice(0, 7)} landed as ${record.sha.slice(0, 7)} (same patch) on origin/${branch}`);
+  }
+  const message = parts.join('; ');
   return closed ? `${message}; the card was waiting only on the land, closing` : message;
 }
 
@@ -514,13 +612,15 @@ function rulesDecision(entry, task, policy, now) {
   };
 }
 
-function closeContext(task, entries, repo, branch, fetchOk, policy, now) {
+function closeContext(task, entries, repo, branch, fetchOk, policy, now, caches = patchCaches()) {
   const entry = newestPolicyEntry(entries, policy);
   if (!fetchOk || !entry) return null;
   if (task.fm.status !== 'review' && task.fm.status !== 'landing') return null;
-  const shas = citedShas([entry]).map((item) => item.sha);
-  if (!shas.length || !shas.every((sha) => isOnDefault(repo, sha, branch))) return null;
-  return { entry, shas, rules: rulesDecision(entry, task, policy, now) };
+  const citations = citedShas([entry]);
+  if (!citations.length) return null;
+  const items = citations.map((citation) => landedRecord(repo, branch, citation, caches, now));
+  if (items.some((item) => !item)) return null;
+  return { entry, items, shas: items.map((item) => item.sha), rules: rulesDecision(entry, task, policy, now) };
 }
 
 function closeDecision(task, entries, records, fetchOk = true, policy = 'narrow', now = Date.now()) {
@@ -529,7 +629,9 @@ function closeDecision(task, entries, records, fetchOk = true, policy = 'narrow'
   if (!entry) return false;
   const newestShas = citedShas([entry]).map((item) => item.sha);
   if (!newestShas.length) return false;
-  const landed = records.map((record) => record.sha);
+  // A rebased citation is recorded as the sha that landed, with the cited
+  // spelling alongside it: either one resolves the citation.
+  const landed = recordShas(records);
   if (!newestShas.every((sha) => landed.some((recorded) => sameSha(sha, recorded)))) return false;
   return rulesDecision(entry, task, policy, now).wouldClose;
 }
@@ -559,6 +661,9 @@ async function sweep({ now = Date.now(), dry = false, only } = {}) {
   const fetchFailures = [];
   const failedRepos = new Set();
   const fetchResults = new Map();
+  // patch-id work is memoized for the whole sweep: once per (repo, sha), and one
+  // default-branch index per repository.
+  const caches = patchCaches();
   const landed = [];
   const decisions = [];
   const priorDecisions = latestDecisions();
@@ -632,15 +737,22 @@ async function sweep({ now = Date.now(), dry = false, only } = {}) {
     }
 
     const existing = loadRecords(task.id);
-    const recorded = existing.map((record) => record.sha).concat(daemonRecordedShas(entries));
+    const recorded = recordShas(existing).concat(daemonRecordedShas(entries));
     const fresh = [];
     for (const citation of citedShas(entries)) {
-      if (recorded.some((sha) => sameSha(sha, citation.sha)) || !isOnDefault(repo, citation.sha, branch)) continue;
-      fresh.push({ sha: citation.sha, branch, landedAt: now, entryStamp: citation.entryStamp });
+      if (recorded.some((sha) => sameSha(sha, citation.sha))) continue;
+      // Patch-id matching costs two git calls per repository, so it stays off
+      // when the fetch failed and origin's ref is only as good as the last one.
+      const record = landedRecord(repo, branch, citation, caches, now, fetchOk);
+      if (!record) continue;
+      const known = recorded.some((sha) => sameSha(sha, record.sha));
       recorded.push(citation.sha);
+      if (known) continue;
+      fresh.push(record);
+      if (record.citedSha) recorded.push(record.sha);
     }
 
-    const context = closeContext(task, entries, repo, branch, fetchOk, config.policy, now);
+    const context = closeContext(task, entries, repo, branch, fetchOk, config.policy, now, caches);
     const prior = context && priorDecisions.get(task.id);
     const alreadyJudged = Boolean(prior && prior.entryKey === entryKey(context && context.entry) && prior.policy === config.policy);
     let modelDecision = null;
@@ -675,9 +787,12 @@ async function sweep({ now = Date.now(), dry = false, only } = {}) {
 
     if (dry) {
       if (fresh.length) {
+        const matched = fresh.filter((record) => record.citedSha)
+          .map(({ sha, citedSha }) => ({ sha, citedSha }));
         landed.push({
           id: task.id,
           shas: fresh.map((record) => record.sha),
+          ...(matched.length ? { matched } : {}),
           closed: Boolean(context && context.rules.wouldClose),
         });
       }
@@ -691,15 +806,16 @@ async function sweep({ now = Date.now(), dry = false, only } = {}) {
       const currentConfig = loadConfig();
       const currentRecords = loadRecords(task.id);
       const currentEntries = review.stampedLogEntries(currentTask.body);
-      const currentContext = closeContext(currentTask, currentEntries, repo, branch, fetchOk, currentConfig.policy, now);
+      const currentContext = closeContext(currentTask, currentEntries, repo, branch, fetchOk, currentConfig.policy, now, caches);
       // A judge or dry-mode flip during the unlocked model call invalidates the
       // judgement as surely as a policy flip: record and let the next sweep judge
       // under the new config rather than close on the rules alone.
       const configChanged = currentConfig.policy !== config.policy ||
         currentConfig.judge !== config.judge || currentConfig.closeDry !== config.closeDry;
       if (context && !configChanged && (!currentContext || entryKey(currentContext.entry) !== entryKey(context.entry))) return;
-      const already = currentRecords.map((record) => record.sha).concat(daemonRecordedShas(currentEntries));
-      const pending = fresh.filter((record) => !already.some((sha) => sameSha(sha, record.sha)));
+      const already = recordShas(currentRecords).concat(daemonRecordedShas(currentEntries));
+      const pending = fresh.filter((record) => !already.some((sha) =>
+        sameSha(sha, record.sha) || (record.citedSha && sameSha(sha, record.citedSha))));
       const currentRules = currentContext && currentContext.rules;
       const sameJudgement = context && currentContext && !configChanged &&
         entryKey(currentContext.entry) === entryKey(context.entry);
@@ -804,19 +920,27 @@ async function sweep({ now = Date.now(), dry = false, only } = {}) {
 
       if ((!pending.length && !closed) || checkins >= CHECKIN_LIMIT) return;
       const records = currentRecords.concat(pending);
-      const shas = pending.length ? pending.map((record) => record.sha) : currentContext.shas;
+      const items = pending.length ? pending : currentContext.items;
+      const shas = items.map((record) => record.sha);
+      const matched = items.filter((record) => record.citedSha)
+        .map(({ sha, citedSha }) => ({ sha, citedSha }));
       keep.checkinTask(task.id, {
         heading: 'landed (daemon)',
         linkSession: false,
         commitLabel: 'landed',
-        message: messageFor(shas, branch, closed),
+        message: messageFor(items, branch, closed),
         status: closed ? 'done' : undefined,
         withinLock: true,
         commit: false,
       });
       if (pending.length) writeJsonAtomic(cardFile(task.id), records);
       keep.commitAndPush(`keep: landed ${task.id}${closed ? ' (done)' : ''}`);
-      action = { id: task.id, shas, closed, ...(recordInstead && wouldClose ? { wouldClose: true } : {}) };
+      action = {
+        id: task.id, shas,
+        ...(matched.length ? { matched } : {}),
+        closed,
+        ...(recordInstead && wouldClose ? { wouldClose: true } : {}),
+      };
     });
     if (action) {
       landed.push(action);
@@ -862,6 +986,7 @@ function dashboardState() {
     const id = name.slice(0, -5);
     const records = loadRecords(id).map((record) => ({
       sha: record.sha,
+      ...(record.citedSha ? { citedSha: record.citedSha } : {}),
       branch: record.branch,
       landedAt: record.landedAt,
     }));
@@ -961,6 +1086,10 @@ module.exports = {
   fetchDefault,
   originEvidenceUsable,
   isOnDefault,
+  REBASE_SCAN_LIMIT,
+  REBASE_WINDOW_MS,
+  patchCaches,
+  landedRecord,
   nextStepIsLanding,
   otherPendingStep,
   rulesDecision,

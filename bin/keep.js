@@ -4506,6 +4506,9 @@ commands.landed = async (argv) => {
   for (const action of result.landed) {
     const close = action.closed ? '; closed' : action.wouldClose ? '; would close' : '';
     console.log(`${o.dry ? 'DRY RUN: ' : ''}${action.id}: ${action.shas.join(', ')} landed${close}`);
+    for (const match of action.matched || []) {
+      console.log(`  cited ${match.citedSha.slice(0, 7)} landed as ${match.sha.slice(0, 7)} (same patch)`);
+    }
   }
 };
 

@@ -1674,3 +1674,101 @@ test('a fixed landing decision can close without a newly recorded sha', () => {
   assert.equal(decision.wouldClose, true);
   assert.equal(decision.fixed, true);
 });
+
+test('sweep matches a rebased citation by patch-id and records the cited sha as an alias', () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-landed-rebase-'));
+  const origin = path.join(temp, 'origin.git');
+  const repo = path.join(temp, 'project');
+  const root = path.join(temp, 'registry');
+  const env = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', TZ: 'UTC' };
+  for (const key of ['CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID']) delete env[key];
+  try {
+    runGit(['init', '-q', '--bare', '--initial-branch=main', origin], { env });
+    runGit(['init', '-q', '--initial-branch=main', repo], { env });
+    configureGit(repo, env);
+    const commit = (file, body, message) => {
+      fs.writeFileSync(path.join(repo, file), body);
+      runGit(['-C', repo, 'add', file], { env });
+      runGit(['-C', repo, 'commit', '-q', '-m', message], { env });
+      return runGit(['-C', repo, 'rev-parse', 'HEAD'], { env });
+    };
+    const baseSha = commit('base.txt', 'base\n', 'base');
+    runGit(['-C', repo, 'remote', 'add', 'origin', origin], { env });
+    runGit(['-C', repo, 'push', '-q', '-u', 'origin', 'main'], { env });
+    runGit(['-C', repo, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main'], { env });
+    commit('shared.txt', 'shared\n', 'shared');
+
+    // A merge whose diff against its first parent is exactly the patch of a
+    // commit that did land. A merge has no single patch, so it must not match.
+    runGit(['-C', repo, 'switch', '-q', '-c', 'wt/merge', baseSha], { env });
+    runGit(['-C', repo, 'merge', '-q', '--no-ff', '-m', 'merge main', 'main'], { env });
+    const mergeSha = runGit(['-C', repo, 'rev-parse', 'HEAD'], { env });
+
+    // The worktree commit, made before `shared` reached main, and the different
+    // sha the same patch got once `wt land` rebased it.
+    runGit(['-C', repo, 'switch', '-q', '-c', 'wt/feature', baseSha], { env });
+    const featureSha = commit('feature.txt', 'feature\n', 'feature: the work');
+    runGit(['-C', repo, 'switch', '-q', 'main'], { env });
+    runGit(['-C', repo, 'cherry-pick', featureSha], { env });
+    const landedSha = runGit(['-C', repo, 'rev-parse', 'HEAD'], { env });
+    runGit(['-C', repo, 'push', '-q', 'origin', 'main'], { env });
+    assert.notEqual(featureSha, landedSha);
+
+    // A branch commit that never landed anywhere.
+    runGit(['-C', repo, 'switch', '-q', '-c', 'wt/stray', 'main'], { env });
+    const straySha = commit('stray.txt', 'stray\n', 'stray');
+    runGit(['-C', repo, 'switch', '-q', 'main'], { env });
+
+    initRegistry(root, env);
+    const now = Date.now();
+    const stamp = new Date(now).toISOString().slice(0, 16).replace('T', ' ');
+    const next = 'Next: Owner review';
+    writeTask(root, 'rebased', { status: 'review', project: repo, sha: featureSha, next, stamp });
+    writeTask(root, 'rebased-landing', { status: 'landing', project: repo, sha: featureSha, next, stamp });
+    writeTask(root, 'unrelated', { status: 'review', project: repo, sha: straySha, next, stamp });
+    writeTask(root, 'merged', { status: 'review', project: repo, sha: mergeSha, next, stamp });
+    runGit(['-C', root, 'add', 'tasks'], { env });
+    runGit(['-C', root, 'commit', '-q', '-m', 'fixtures'], { env });
+
+    const mapping = `cited ${featureSha.slice(0, 7)} landed as ${landedSha.slice(0, 7)} \\(same patch\\)`;
+    const beforeDry = taskSnapshot(root);
+    const cli = spawnSync(path.join(__dirname, 'keep'), ['landed', '--dry'], { cwd: root, env, encoding: 'utf8' });
+    assert.equal(cli.status, 0, cli.stderr);
+    assert.match(cli.stdout, new RegExp(`DRY RUN: rebased: ${landedSha} landed`));
+    assert.match(cli.stdout, new RegExp(mapping));
+    assert.doesNotMatch(cli.stdout, /unrelated:|merged:/);
+    assert.deepEqual(taskSnapshot(root), beforeDry);
+    assert.equal(fs.existsSync(path.join(root, '.keep', 'landed')), false);
+
+    const result = runSweep(env, now);
+    assert.equal(result.checked, 4);
+    assert.deepEqual(result.landed.map((item) => item.id).sort(), ['rebased', 'rebased-landing']);
+    const rebased = result.landed.find((item) => item.id === 'rebased');
+    assert.deepEqual(rebased.shas, [landedSha]);
+    assert.deepEqual(rebased.matched, [{ sha: landedSha, citedSha: featureSha }]);
+    assert.equal(rebased.closed, false);
+    assert.equal(result.landed.find((item) => item.id === 'rebased-landing').closed, true);
+
+    const records = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'landed', 'rebased.json'), 'utf8'));
+    assert.deepEqual(records.map(({ sha, citedSha, branch }) => ({ sha, citedSha, branch })), [
+      { sha: landedSha, citedSha: featureSha, branch: 'main' },
+    ]);
+
+    const annotated = fs.readFileSync(path.join(root, 'tasks', 'rebased.md'), 'utf8');
+    assert.match(annotated, /— landed \(daemon\)\n/);
+    assert.match(annotated, new RegExp(`${mapping} on origin/main`));
+    assert.match(annotated, /^status: review$/m);
+    const landing = fs.readFileSync(path.join(root, 'tasks', 'rebased-landing.md'), 'utf8');
+    assert.match(landing, /^status: done$/m);
+    assert.match(landing, new RegExp(mapping));
+    assert.match(landing, /the card was waiting only on the land, closing/);
+    assert.doesNotMatch(fs.readFileSync(path.join(root, 'tasks', 'unrelated.md'), 'utf8'), /landed \(daemon\)/);
+    assert.doesNotMatch(fs.readFileSync(path.join(root, 'tasks', 'merged.md'), 'utf8'), /landed \(daemon\)/);
+
+    const beforeSecond = taskSnapshot(root);
+    assert.deepEqual(runSweep(env, now + 1000).landed, []);
+    assert.deepEqual(taskSnapshot(root), beforeSecond);
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});

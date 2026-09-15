@@ -562,6 +562,16 @@ actions without changing cards or local state; `--only <id>` restricts the sweep
 one card. The daemon runs every 30 minutes by default (`KEEP_LANDED_MIN`). Ending
 check-ins should cite full commit shas and finish with an unambiguous `Next:` line.
 
+A cited sha that never reaches the default branch is matched by patch. `wt land`
+rebases a worktree branch onto `origin/<default>` before pushing, so the sha a
+check-in cites is not the sha that lands. When the cited commit is still in the
+repository's object store, the sweep compares its `git patch-id --stable` against the
+default branch's commits from a day before the check-in (at most 300), and on a match
+records the landed sha with the cited one as an alias — the check-in then reads
+`cited <cited> landed as <landed> (same patch)`, and either spelling resolves the
+citation. Merges and empty commits have no single patch and are never matched, and
+the comparison is skipped entirely when the fetch failed.
+
 ## Reviewed commits and the implicit land grant
 
 `keep allow <card> <action>` answers from the grants Owner wrote on the card. `land`
