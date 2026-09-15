@@ -26,6 +26,7 @@ const {
   sessionAttentionItem,
   shouldCompactFirst,
   lastTurnUsage,
+  sessionLastTurn,
   lastClaudeHandoffModel,
   lastContextTokens,
   autoCompactIdleMs,
@@ -1667,6 +1668,28 @@ test('last turn usage tracks cache age, inferred Claude TTL, and the current Cod
   assert.equal(switchedWithoutUse.usageAt, null, 'usage from the previous model cannot establish Astra cache age');
 });
 
+test('session last turn resolves Codex settings beyond the 256 KiB activity tail', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-codex-long-settings-test-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, 'rollout.jsonl');
+  const usageAt = '2026-09-01T11:00:00.000Z';
+  fs.writeFileSync(file, [
+    JSON.stringify({ type: 'turn_context', payload: { model: 'gpt-6-astra', effort: 'high' } }),
+    JSON.stringify({ type: 'response_item', payload: { output: 'x'.repeat(300 * 1024) } }),
+    JSON.stringify({ type: 'token_usage_record', timestamp: usageAt, payload: {
+      usage: { input_tokens: 180000, cached_input_tokens: 170000 },
+    } }),
+  ].join('\n'));
+  assert.deepEqual(sessionLastTurn({ id: 'long-rollout', kind: 'codex' }, {
+    transcriptFileForSession: () => file,
+  }), {
+    contextTokens: 180000,
+    model: 'gpt-6-astra',
+    usageAt: Date.parse(usageAt),
+    cacheTtlMs: null,
+  });
+});
+
 test('compaction telemetry matches Codex response usage and deduplicates Claude streaming rows', () => {
   const submittedAt = Date.parse('2026-09-01T12:00:00Z');
   const codexUsage = { input_tokens: 210000, cached_input_tokens: 205000, output_tokens: 900 };
@@ -2830,6 +2853,7 @@ test('Codex compact uses the marker path and warm Claude bypasses the Opus swap'
   const codexFile = path.join(root, 'codex.jsonl');
   fs.writeFileSync(codexFile, '{}\n');
   const codexCalls = [];
+  const compactUsage = { input_tokens: 210000, cached_input_tokens: 205000, output_tokens: 800 };
   const codex = await compactSession({ id: 'codex-marker', kind: 'codex' }, { pane: 'pane:codex' }, 'Keep decisions.', {
     dir: path.join(root, 'compact'), compactPollMs: 1,
     compactionPolicy: { path: 'warm-current', originalModel: 'gpt-6-astra', targetModel: 'gpt-6-astra' },
@@ -2838,12 +2862,16 @@ test('Codex compact uses the marker path and warm Claude bypasses the Opus swap'
     typeAndSubmit: async (_target, command, confirmation) => {
       codexCalls.push({ command, confirmation });
       setTimeout(() => fs.appendFileSync(codexFile, `${JSON.stringify({ timestamp: new Date(Date.now() + 10).toISOString(),
-        type: 'event_msg', payload: { type: 'item_completed', item: { type: 'ContextCompaction' } } })}\n`), 1);
+        type: 'compacted', payload: { replacement_history: ['x'.repeat(300 * 1024)],
+          compaction_response_id: 'compact-response', latest_token_usage_record: {
+            response_id: 'compact-response', usage: compactUsage,
+          } } })}\n`), 1);
     },
   });
   assert.equal(codex.compacted, true);
   assert.equal(codexCalls[0].command, '/compact Keep decisions.');
   assert.equal(codexCalls[0].confirmation, codexTypedTextVisible);
+  assert.deepEqual(codex.compactionUsage, compactUsage, 'telemetry uses the full watched record beyond the 256 KiB tail');
 
   const claudeFile = path.join(root, 'claude.jsonl');
   fs.writeFileSync(claudeFile, '{}\n');

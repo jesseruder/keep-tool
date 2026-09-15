@@ -2633,7 +2633,11 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
   const compactionModel = String(policy?.targetModel || (swap ? via : originalModel) || '');
   let telemetry = { usage: null, compactMetadata: null };
   if (submittedAt && transcriptFile) {
-    try { telemetry = compactRequestTelemetry(readTranscriptTail(transcriptFile), session.kind, submittedAt); } catch {}
+    try {
+      const telemetryText = session.kind === 'codex' && compactWatch?.appended
+        ? compactWatch.appended : readTranscriptTail(transcriptFile);
+      telemetry = compactRequestTelemetry(telemetryText, session.kind, submittedAt);
+    } catch {}
   }
   result.originalModel = originalModel;
   result.compactionModel = compactionModel;
@@ -3650,10 +3654,17 @@ async function precheckSessionTarget(session, target, deps = {}) {
   else await probeSuggestion(target, screen, deps);
 }
 
-function sessionLastTurn(session) {
-  const file = transcriptFileForSession(session);
+function sessionLastTurn(session, deps = {}) {
+  const file = (deps.transcriptFileForSession || transcriptFileForSession)(session);
   if (!file) return { contextTokens: 0, model: '' };
-  try { return lastTurnUsage(readTranscriptTail(file), session.kind); }
+  try {
+    const result = lastTurnUsage(readTranscriptTail(file), session.kind);
+    if (session.kind === 'codex' && !result.model) {
+      const settings = codexCompact.readRolloutSettings(file, deps);
+      if (settings?.model) result.model = settings.model;
+    }
+    return result;
+  }
   catch { return { contextTokens: 0, model: '' }; }
 }
 
@@ -8484,6 +8495,7 @@ module.exports = {
   deliverCheckToThread,
   shouldCompactFirst,
   lastTurnUsage,
+  sessionLastTurn,
   lastClaudeHandoffModel,
   lastContextTokens,
   compactRefusal,

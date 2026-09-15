@@ -522,6 +522,7 @@ module.exports = {
   isCodexCompactSwap,
   validCodexCompactSwap,
   parseEffectiveSettings,
+  readRolloutSettings,
   sessionFiles,
   menuRows,
   selectCodexModel,
