@@ -30,6 +30,8 @@ const {
   cardFingerprint, finalizePayload, pendingCheckin, landFinalCheckin, NO_RESULT,
   parseVerdict, probePayload, startProbe, probeDue, escalateProbeFailure,
   isTransientStartError, MAX_CONCURRENT_PROBES, _resetSchedulerState,
+  budgetDeferralReason, noteBudgetDeferral, reapEphemeralPane, sweepEphemeralPanes,
+  MAX_FRESH_OPENS_PER_TICK, EPHEMERAL_IDLE_MS,
 } = require('./runs.js');
 
 const card = (over = {}) => ({
@@ -209,12 +211,12 @@ test('a delivery stamp only suppresses the exact schedule it records', () => {
   assert.equal(planDueCard(task, {}), 'deliver');
 });
 
-test('a due card falls back to headless only after exceeding the deferral cap', () => {
+test('a due card opens its own session only after exceeding the deferral cap', () => {
   const task = card();
   assert.equal(planDueCard(task, { deferrals: { count: 12 }, maxDeferrals: 12 }), 'deliver');
   assert.equal(
     planDueCard(task, { deferrals: { count: 13 }, maxDeferrals: 12 }),
-    'headless-after-deferrals',
+    'open-after-deferrals',
   );
 });
 
@@ -669,36 +671,236 @@ test('a transient start refusal is either cap: per-task or global', () => {
   assert.equal(isTransientStartError(new Error('claude binary not found (set KEEP_CLAUDE)')), false);
 });
 
-test('a per-task run collision does not burn the day escalation budget', () => {
+test('a transient open refusal does not burn the day escalation budget', async () => {
   _resetSchedulerState();
   try {
     const task = probeCard({ check: 'diagnose the recorder' });
     const result = { ok: false, code: 3, ms: 120, output: '2 segments missing', timedOut: false };
-    const started = [];
-    const collide = () => { throw new Error(`a run is already active for ${task.id}`); };
-    const record = (...args) => { started.push(args); };
+    const opened = [];
+    const collide = async () => { throw new Error(`a run is already active for ${task.id}`); };
+    const record = async (body) => { opened.push(body); return { ok: true, sessionId: 'sess-1', pane: 'p1' }; };
 
-    // The card's own earlier run is still finishing: transient, so tomorrow is not the
+    // Something else is already opening on this card: transient, so tomorrow is not the
     // next chance — this is what the 'runs active' substring test got wrong.
-    assert.match(String(escalateProbeFailure(task, result, { today: '2026-09-11', start: collide })), /already active/);
-    assert.equal(started.length, 0);
+    assert.match(String(await escalateProbeFailure(task, result, { today: '2026-09-11', open: collide })), /already active/);
+    assert.equal(opened.length, 0);
 
-    assert.equal(escalateProbeFailure(task, result, { today: '2026-09-11', start: record }), null);
-    assert.equal(started.length, 1, 'a later failed probe on the same day still escalates');
-    assert.equal(started[0][1], 'check');
-    assert.deepEqual(started[0][3].probe, result, 'the run is told what the probe saw');
+    assert.equal(await escalateProbeFailure(task, result, { today: '2026-09-11', open: record, accountId: 'checks-acct' }), null);
+    assert.equal(opened.length, 1, 'a later failed probe on the same day still escalates');
+    assert.equal(opened[0].taskId, task.id);
+    assert.equal(opened[0].fresh, true, 'a check never resumes whatever that card last used');
+    assert.equal(opened[0].agent, 'claude');
+    assert.equal(opened[0].accountId, 'checks-acct');
+    assert.match(opened[0].message, /deterministic probe just failed \(exit 3, tail: 2 segments missing\)/);
+    assert.match(opened[0].message, /diagnose the recorder/, 'and the recipe still follows it');
+    assert.ok(opened[0].message.length <= 2000);
 
-    // One headless attempt per card per day, once one actually started.
-    assert.equal(escalateProbeFailure(task, result, { today: '2026-09-11', start: record }), null);
-    assert.equal(started.length, 1);
-    assert.equal(escalateProbeFailure(task, result, { today: '2026-09-12', start: record }), null);
-    assert.equal(started.length, 2, 'tomorrow is a fresh attempt');
+    // One scheduler-opened session per card per day, once one actually opened.
+    assert.equal(await escalateProbeFailure(task, result, { today: '2026-09-11', open: record }), null);
+    assert.equal(opened.length, 1);
+    assert.equal(await escalateProbeFailure(task, result, { today: '2026-09-12', open: record }), null);
+    assert.equal(opened.length, 2, 'tomorrow is a fresh attempt');
 
     // A real failure is not transient: it costs the day.
     _resetSchedulerState();
-    const broken = () => { throw new Error('project dir /gone does not exist'); };
-    assert.match(String(escalateProbeFailure(task, result, { today: '2026-09-11', start: broken })), /does not exist/);
-    assert.equal(escalateProbeFailure(task, result, { today: '2026-09-11', start: record }), null);
-    assert.equal(started.length, 2, 'no retry after a permanent failure until tomorrow');
+    const broken = async () => { throw new Error('project directory does not exist'); };
+    assert.match(String(await escalateProbeFailure(task, result, { today: '2026-09-11', open: broken })), /does not exist/);
+    assert.equal(await escalateProbeFailure(task, result, { today: '2026-09-11', open: record }), null);
+    assert.equal(opened.length, 2, 'no retry after a permanent failure until tomorrow');
   } finally { _resetSchedulerState(); }
+});
+
+test('a probe escalation clips a shouting probe tail instead of losing the recipe', () => {
+  const message = checkDeliveryMessage(probeCard(), {
+    probe: { code: 124, timedOut: true, output: 'x'.repeat(4000) },
+  });
+  assert.ok(message.length <= 2000);
+  assert.match(message, /^The deterministic probe just failed \(exit 124, timed out, tail: x{300}…\)\./);
+  assert.match(message, /keep checkin some-card/);
+  assert.ok(message.endsWith('Full card: keep show some-card.'));
+  assert.equal(/deterministic probe/.test(checkDeliveryMessage(probeCard())), false);
+});
+
+test('a recurring card is told to re-arm itself, and still fits', () => {
+  const message = checkDeliveryMessage(card({ check_on_pass: 'rearm', check_every: '+7d' }));
+  assert.match(message, /This card re-arms: if every gate holds, check in with --check-after \+7d and the status unchanged/);
+  assert.match(message, /if not, record the failure and the status it deserves/);
+  assert.ok(message.length <= 2000);
+  assert.ok(message.endsWith('Full card: keep show some-card.'));
+
+  const wide = checkDeliveryMessage(card({
+    check_on_pass: 'rearm', check_every: '+7d', check: 'inspect the rollout '.repeat(300),
+  }));
+  assert.ok(wide.length <= 2000);
+  assert.match(wide, /recipe truncated; full text on the card/);
+  assert.match(wide, /This card re-arms/, 'the re-arm sentence is never what gets crowded out');
+  assert.ok(wide.endsWith('Full card: keep show some-card.'));
+
+  assert.doesNotMatch(checkDeliveryMessage(card()), /re-arms/);
+});
+
+// ---------- budget deferral ----------
+
+test('only an exhausted window defers a check; an unreadable snapshot does not', () => {
+  assert.equal(budgetDeferralReason({ code: 0 }), null);
+  assert.equal(budgetDeferralReason({ code: 6, reason: 'weekly usage at 97%' }), 'weekly usage at 97%');
+  assert.equal(budgetDeferralReason({ code: 7, reason: '5h window at 99%' }), '5h window at 99%');
+  // Code 8 is "I could not read the snapshot". Treating that as no budget would stop
+  // every check on the board the first time the usage file went stale.
+  assert.equal(budgetDeferralReason({ code: 8, reason: 'usage snapshot is stale' }), null);
+  assert.equal(budgetDeferralReason(null), null);
+});
+
+test('a deferred check records itself once a day and leaves the card overdue', () => {
+  _resetSchedulerState();
+  try {
+    const task = card();
+    const landed = [];
+    const deps = { checkinTask: (id, payload) => landed.push([id, payload]) };
+    assert.equal(noteBudgetDeferral(task, 'weekly usage at 97%', '2026-09-11', deps), true);
+    assert.equal(noteBudgetDeferral(task, 'weekly usage at 97%', '2026-09-11', deps), false, 'once a day');
+    assert.equal(landed.length, 1);
+    assert.equal(landed[0][0], 'some-card');
+    assert.equal(landed[0][1].message, 'check deferred: weekly usage at 97%; will retry after the limit resets');
+    assert.equal('status' in landed[0][1], false, 'the card keeps its status');
+    assert.equal('clearCheckAfter' in landed[0][1], false, 'and stays overdue for the next tick');
+    assert.equal(noteBudgetDeferral(task, 'weekly usage at 97%', '2026-09-12', deps), true, 'tomorrow is a fresh notice');
+    assert.equal(landed.length, 2);
+  } finally { _resetSchedulerState(); }
+});
+
+// ---------- reaping scheduler-opened panes ----------
+
+const ephemeralPane = ({ meta, ...over } = {}) => ({
+  id: 'pane-1', alive: true, ...over,
+  meta: { ephemeral: 'check', card: 'some-card', sessionId: 'sess-1', launchedAt: 1_000_000, ...meta },
+});
+
+test('a scheduler-opened pane is never closed mid-turn', () => {
+  const now = 1_000_000 + 5 * 60e3;
+  const mid = reapEphemeralPane({
+    pane: ephemeralPane(), session: { id: 'sess-1', endedTurn: false, mtime: now }, checkedInAt: now, now,
+  });
+  assert.equal(mid.reap, false);
+  assert.equal(mid.reason, 'mid-turn');
+  // Even hours later: an interactive session exists precisely so a long turn survives.
+  assert.equal(reapEphemeralPane({
+    pane: ephemeralPane(), session: { id: 'sess-1', endedTurn: false, mtime: 1_000_000 },
+    checkedInAt: 0, now: 1_000_000 + 5 * 3600e3,
+  }).reap, false);
+});
+
+test('a scheduler-opened pane is closed once its check is on the card', () => {
+  const now = 1_000_000 + 5 * 60e3;
+  const done = reapEphemeralPane({
+    pane: ephemeralPane(), session: { id: 'sess-1', endedTurn: true, mtime: now },
+    checkedInAt: 1_000_000 + 60e3, now,
+  });
+  assert.equal(done.reap, true);
+  assert.match(done.reason, /recorded on the card/);
+
+  // Ended its turn but said nothing on the card yet: give it the idle window first.
+  assert.equal(reapEphemeralPane({
+    pane: ephemeralPane(), session: { id: 'sess-1', endedTurn: true, mtime: now }, checkedInAt: 0, now,
+  }).reap, false);
+});
+
+test('a scheduler-opened pane that goes quiet or exits is swept at the idle window', () => {
+  const launchedAt = 1_000_000;
+  const stale = reapEphemeralPane({
+    pane: ephemeralPane(), session: { id: 'sess-1', endedTurn: true, mtime: launchedAt },
+    checkedInAt: 0, now: launchedAt + EPHEMERAL_IDLE_MS,
+  });
+  assert.equal(stale.reap, true);
+  assert.match(stale.reason, /idle 60 min with no check-in/);
+  assert.equal(reapEphemeralPane({
+    pane: ephemeralPane(), session: { id: 'sess-1', endedTurn: true, mtime: launchedAt },
+    checkedInAt: 0, now: launchedAt + EPHEMERAL_IDLE_MS - 1,
+  }).reap, false);
+
+  assert.equal(reapEphemeralPane({ pane: ephemeralPane({ alive: false }), now: launchedAt }).reap, true);
+  assert.equal(reapEphemeralPane({
+    pane: ephemeralPane(), session: { id: 'sess-1', exited: true }, now: launchedAt,
+  }).reap, true);
+});
+
+test('the sweep only ever touches panes this scheduler opened', async () => {
+  const closed = [];
+  const panes = [
+    { id: 'owner-pane', alive: true, meta: { card: 'some-card', sessionId: 'owner' } },
+    ephemeralPane({ id: 'ready', meta: { card: null, sessionId: 'ready-sid' } }),
+    ephemeralPane({ id: 'busy', meta: { card: null, sessionId: 'busy-sid' } }),
+    ephemeralPane({ id: 'unregistered', meta: { card: null, sessionId: null } }),
+  ];
+  const now = 1_000_000 + 5 * 3600e3;
+  const result = await sweepEphemeralPanes({
+    listPanes: async () => panes,
+    sessions: async () => [
+      { id: 'owner', endedTurn: true, mtime: 1 },
+      { id: 'ready-sid', endedTurn: true, mtime: 1_000_000 },
+      { id: 'busy-sid', endedTurn: false, mtime: 1_000_000 },
+    ],
+    closePane: async (pane, sessionId) => { closed.push([pane.id, sessionId]); },
+  }, now);
+  assert.deepEqual(result, ['ready']);
+  assert.deepEqual(closed, [['ready', 'ready-sid']]);
+
+  // A host that cannot answer is not a host with nothing running.
+  assert.deepEqual(await sweepEphemeralPanes({
+    listPanes: async () => { throw new Error('host is restarting'); },
+    closePane: async () => { throw new Error('must not close'); },
+  }, now), []);
+  assert.deepEqual(await sweepEphemeralPanes({
+    listPanes: async () => null, closePane: async () => { throw new Error('must not close'); },
+  }, now), []);
+  assert.deepEqual(await sweepEphemeralPanes(null, now), []);
+});
+
+// ---------- the scheduler opens sessions instead of running headless ----------
+
+test('due checks open one fresh session per card per day, three per tick', () => {
+  assert.equal(MAX_FRESH_OPENS_PER_TICK, 3);
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-runs-open-'));
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+    for (const n of [1, 2, 3, 4]) {
+      fs.writeFileSync(path.join(root, 'tasks', `due-${n}.md`), [
+        '---',
+        `title: Due card ${n}`,
+        'status: waiting',
+        'kind: task',
+        'tags: [personal]',
+        'check_after: 2020-01-01T00:00',
+        'check: |',
+        '  Confirm the recorder is still green.',
+        'created: 2020-01-01T00:00',
+        'updated: 2020-01-01T00:00',
+        '---',
+        '',
+        'Context.',
+        '',
+      ].join('\n'));
+    }
+    const script = `
+      const runs = require(${JSON.stringify(require.resolve('./runs.js'))});
+      const opened = [];
+      runs.setOpener(async (body) => { opened.push(body.taskId); return { ok: true, sessionId: 'sid-' + opened.length, pane: 'p' }; });
+      (async () => {
+        await runs.schedulerTick();
+        const first = opened.slice();
+        await runs.schedulerTick();
+        process.stdout.write(JSON.stringify({ first, all: opened }));
+      })();
+    `;
+    const output = execFileSync(process.execPath, ['-e', script], {
+      encoding: 'utf8',
+      env: { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', KEEP_NO_COMMIT: '1' },
+    });
+    const { first, all } = JSON.parse(output);
+    assert.equal(first.length, 3, 'the per-tick cap holds the fourth card back');
+    assert.equal(all.length, 4, 'the next tick picks up the card the cap skipped');
+    assert.equal(new Set(all).size, 4, 'and no card is opened twice the same day');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

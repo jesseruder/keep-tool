@@ -4592,6 +4592,55 @@ test('an internal launchEnv reaches the pane shell, and a request body can never
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('an internal launchMeta marks the pane, and a request body can never set one', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-launch-meta-'));
+  try {
+    const project = path.join(root, 'project');
+    fs.mkdirSync(project, { recursive: true });
+    const host = recordingHost((type) => type === 'spawn' ? { pane: { id: 'pane-check' } } : {});
+    // The check scheduler's launch: its sweep finds the pane again by meta.ephemeral,
+    // so the mark has to survive onto the spawn.
+    await openSession({ taskId: 'card', fresh: true, agent: 'claude', cwd: project }, {
+      host,
+      loadTask: () => ({ fm: { project, sessions: [] } }),
+      randomUUID: () => '55555555-5555-4555-8555-555555555555',
+      waitForHostAgent: async () => true,
+      trustProject: () => true,
+      linkLaunchedSession: () => true,
+      launchMeta: { ephemeral: 'check' },
+    });
+    const meta = host.calls.find((call) => call.type === 'spawn').params.meta;
+    assert.equal(meta.ephemeral, 'check');
+    assert.equal(meta.card, 'card', 'and the card link is untouched');
+    assert.equal(meta.agent, 'claude');
+
+    // Identity is never up for grabs: a launchMeta that names an agent, an account or
+    // a session loses to the values openSession resolved.
+    const liarHost = recordingHost((type) => type === 'spawn' ? { pane: { id: 'pane-liar' } } : {});
+    await openSession({ taskId: 'card', fresh: true, agent: 'claude', cwd: project }, {
+      host: liarHost,
+      loadTask: () => ({ fm: { project, sessions: [] } }),
+      randomUUID: () => '66666666-6666-4666-8666-666666666666',
+      waitForHostAgent: async () => true,
+      trustProject: () => true,
+      linkLaunchedSession: () => true,
+      launchMeta: { agent: 'codex', sessionId: 'not-mine', card: 'other-card', repair: true, launchedAt: 1 },
+    });
+    const liarMeta = liarHost.calls.find((call) => call.type === 'spawn').params.meta;
+    assert.equal(liarMeta.agent, 'claude');
+    assert.equal(liarMeta.sessionId, '66666666-6666-4666-8666-666666666666');
+    assert.equal(liarMeta.card, 'card');
+    assert.equal(liarMeta.repair, undefined, 'the repair flag is the scheduler\'s, not a caller\'s');
+    assert.notEqual(liarMeta.launchedAt, 1);
+
+    // Over HTTP it is refused: pane meta is what the dedupe, the repair guard and the
+    // sweep all key on, so a caller that could write it could make a pane lie.
+    await assert.rejects(openSession({ taskId: 'card', fresh: true, agent: 'claude', launchMeta: { ephemeral: 'check' } }, {
+      host, loadTask: () => ({ fm: { project, sessions: [] } }),
+    }), (error) => error.status === 400 && /launch meta is not accepted/.test(error.message));
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('KEEP_REPAIR follows the launched repair session, not the card it works on', async () => {
   const isRepairSession = (id) => id === 'repair-session';
 

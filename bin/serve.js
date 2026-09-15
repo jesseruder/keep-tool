@@ -4512,6 +4512,19 @@ function shellQuoteArg(value) {
 
 const freshOpenOperations = new Map();
 
+// Pane metadata openSession resolves for itself. `repair` and the transfer ids are the
+// sharp ones: the self-repair scheduler adopts a pane by `meta.repair`, so an
+// annotation that could set it could hand a stray pane the repair agent's identity.
+const RESERVED_LAUNCH_META = new Set([
+  'agent', 'accountId', 'accountLabel', 'sessionId', 'model', 'project', 'card', 'repair',
+  'requester', 'portableTransferId', 'reviewQueueLaunchId', 'openRequestId', 'launchedAt',
+]);
+
+function annotationMeta(launchMeta) {
+  if (!launchMeta || typeof launchMeta !== 'object') return {};
+  return Object.fromEntries(Object.entries(launchMeta).filter(([key]) => !RESERVED_LAUNCH_META.has(key)));
+}
+
 async function openSession(body, deps = {}) {
   body = body && typeof body === 'object' ? body : {};
   const freshStandalone = body.fresh === true && !body.taskId && !body.sessionId;
@@ -4522,6 +4535,12 @@ async function openSession(body, deps = {}) {
   // that could name environment variables would hand any caller the guard's off
   // switch, and the auth tokens of whichever account the pane runs as.
   if (body.launchEnv != null || body.env != null) throw new InjectionError(400, 'env is not accepted');
+  // `deps.launchMeta` is the same kind of internal seam for pane metadata — the check
+  // scheduler stamps `ephemeral: 'check'` so its own sweep can find the pane again.
+  // Never settable over HTTP: pane meta is what the dedupe, the repair guard and the
+  // sweep all key on, so a caller that could write it could make a pane lie about
+  // whose it is.
+  if (body.launchMeta != null) throw new InjectionError(400, 'launch meta is not accepted');
   if (body.cwd != null && (typeof body.cwd !== 'string' || !body.cwd || /[\r\n\0]/.test(body.cwd))) {
     throw new InjectionError(400, 'cwd must be a directory path');
   }
@@ -4748,6 +4767,10 @@ async function openSession(body, deps = {}) {
       cols: 200,
       rows: 50,
       meta: {
+        // An internal launchMeta may annotate a pane, never claim to be a different
+        // agent, account, card or scheduler: every key this block owns is stripped out
+        // of it, and it is spread first so the resolved values win regardless.
+        ...annotationMeta(deps.launchMeta),
         agent,
         accountId: account.id,
         accountLabel: account.label,
@@ -7604,6 +7627,25 @@ function start(deps = {}) {
   runs.setOnChange(broadcast);
   runs.setNotifier(notifyTaskSession); // before recover(), which can finalize immediately
   runs.setDeliverer(deliverCheckToThread);
+  // A due check that no live thread took opens an ordinary interactive session on its
+  // card — the same thing self-repair does, and for the same reason: a headless run
+  // dies at the end of its turn, has no memory, and cannot be looked at.
+  runs.setOpener((body, openDeps) => openSession(body, { ...openDeps, launchMeta: { ephemeral: 'check' } }));
+  runs.setEphemeralHost({
+    listPanes: () => listHostPanes({}, true),
+    sessions: () => scanSessions(),
+    // Exactly the console Close button's path (/api/close-session): try /exit, then
+    // SIGTERM, then SIGKILL, each behind manual-close's identity and activity guards.
+    closePane: async (pane, sessionId) => {
+      const result = await require('./manual-close').manualClose({ pane: pane.id, sessionId }, {
+        getPane: async (id) => (await hostRequest('get', { pane: id })).pane,
+        graceful: (request) => closeIdleSession(request, { closePolicy: { manual: true } }),
+        signal: (id, signal) => hostRequest('kill', { pane: id, signal }),
+      });
+      broadcast();
+      return result;
+    },
+  });
   summarize.setOnChange(broadcast);
   require('./session-summary').startScheduler({
     snapshot: () => sessionSummarySnapshot({ ...deps, dashboardBuild }),
