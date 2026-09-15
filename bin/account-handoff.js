@@ -258,6 +258,8 @@ function killOwnedGroup(child) {
   try { child.kill('SIGKILL'); } catch {}
 }
 
+const AUTH_PREFLIGHT_TIMEOUT_MS = 45000;
+
 function loginShellOutput(command, options = {}) {
   const timeout = Number.isFinite(options.timeout) && options.timeout > 0 ? options.timeout : 15000;
   const maxBuffer = Number.isFinite(options.maxBuffer) && options.maxBuffer > 0 ? options.maxBuffer : 256 * 1024;
@@ -306,8 +308,10 @@ async function authPreflight(account, deps = {}) {
     const command = (deps.profileCommand || require('./agent-launcher').profileCommand)(
       ['claude', 'auth', 'status', '--json'], account,
     );
+    // An interactive login shell can take 15s or more to start under load (nvm
+    // init dominates), so give the check room; a logged-out CLI still answers fast.
     const stdout = await loginShellOutput(command, { env: deps.env || process.env,
-      timeout: deps.authTimeoutMs || 15000, maxBuffer: 256 * 1024 });
+      timeout: deps.authTimeoutMs || AUTH_PREFLIGHT_TIMEOUT_MS, maxBuffer: 256 * 1024 });
     // Interactive shell startup may print a banner. Parse Claude's complete
     // output first (current releases pretty-print JSON), then accept a complete
     // JSON suffix after banner text without ever exposing shell output.
