@@ -226,12 +226,15 @@ function insideWorktreeRoot(candidate, wt = require('./wt.js')) {
   } catch { return false; }
 }
 
-function runCwd(task, kind, opts) {
+function runCwd(task, kind, opts, wt) {
   const requested = opts && opts.cwd;
-  // Only a task run, and only inside the worktree root; anything else is ignored
-  // rather than refused, so a stale option cannot stop a scheduled check.
-  if (kind === 'task' && requested && insideWorktreeRoot(requested)) return path.resolve(requested);
-  return expandProject(task.fm.project) || keep.ROOT;
+  if (!requested) return expandProject(task.fm.project) || keep.ROOT;
+  // Refused, never quietly ignored. Falling back to the card's project sent a
+  // self-repair agent — whose card's project is ~/keep-tool — at the live daemon
+  // checkout the moment the worktree path was wrong.
+  if (kind !== 'task') throw new keep.KeepError(`only a task run may be given a cwd (this is a ${kind})`);
+  if (!insideWorktreeRoot(requested, wt || require('./wt.js'))) throw new keep.KeepError(`run cwd ${requested} is not inside the worktree root`);
+  return path.resolve(requested);
 }
 
 function runBudgetMs(kind, opts) {

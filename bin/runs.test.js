@@ -140,12 +140,17 @@ test('a run may be pointed at a worktree, with a model and a capped budget', () 
     assert.equal(insideWorktreeRoot(wtRoot, wt), false, 'the root itself is not a worktree');
     assert.equal(insideWorktreeRoot(path.join(wtRoot, 'does-not-exist'), wt), false);
 
-    // The project is still the default, and a cwd outside the worktree root is
-    // ignored rather than refused: a stale option must not stop a run.
+    // With no cwd the card's project is still the default.
     const task = { fm: { project: elsewhere } };
-    assert.equal(runCwd(task, 'task', undefined), elsewhere);
-    assert.equal(runCwd(task, 'check', { cwd: worktree }), elsewhere, 'only a task run may be relocated');
-    assert.equal(runCwd(task, 'task', { cwd: path.join(elsewhere, 'nope') }), elsewhere);
+    assert.equal(runCwd(task, 'task', undefined, wt), elsewhere);
+    assert.equal(runCwd(task, 'task', { cwd: worktree }, wt), worktree);
+
+    // A cwd that is not a worktree is REFUSED, never quietly ignored: falling
+    // back to the card's project pointed a self-repair run, whose card's project
+    // is ~/keep-tool, straight at the live daemon checkout.
+    assert.throws(() => runCwd(task, 'task', { cwd: elsewhere }, wt), /not inside the worktree root/);
+    assert.throws(() => runCwd(task, 'task', { cwd: path.join(os.homedir(), 'keep-tool') }, wt), /not inside the worktree root/);
+    assert.throws(() => runCwd(task, 'check', { cwd: worktree }, wt), /only a task run may be given a cwd/);
 
     assert.equal(runBudgetMs('check', { budgetMin: 600 }), 15 * 60e3, 'a check keeps its own budget');
     assert.equal(runBudgetMs('task', undefined), 60 * 60e3);
