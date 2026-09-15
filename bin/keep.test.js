@@ -899,6 +899,38 @@ test('pane record writes are atomic', () => {
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('verify says where the check went, and never reports a headless run', async () => {
+  const { verifyCommand } = require('./keep.js');
+  const calls = [];
+  const lines = [];
+  const run = (payload) => {
+    lines.length = 0;
+    return verifyCommand(['some-card'], {
+      log: (line) => lines.push(line),
+      postKeepApi: async (url, body) => {
+        calls.push({ url, body });
+        return { status: 200, data: JSON.stringify(payload) };
+      },
+    });
+  };
+
+  await run({ ok: true, delivered: 'thread', sessionId: '1234567890ab', kind: 'codex' });
+  assert.deepEqual(calls[0], { url: '/api/run', body: { id: 'some-card', kind: 'check' } });
+  assert.equal(lines[0], "verify delivered into this card's open codex session 12345678");
+  assert.match(lines[1], /lands as a check-in/);
+
+  await run({ ok: true, delivered: 'session', sessionId: 'abcdefghijkl', pane: 'pane-7' });
+  assert.equal(lines[0], 'verify opened a fresh session abcdefgh in pane pane-7 on this card');
+
+  // A card with no recipe is refused by the daemon, and the CLI says so rather than
+  // pretending something started.
+  await assert.rejects(verifyCommand(['some-card'], {
+    log: () => {},
+    postKeepApi: async () => ({ status: 400, data: JSON.stringify({ error: 'some-card has no check recipe' }) }),
+  }), /has no check recipe/);
+  await assert.rejects(verifyCommand([], { postKeepApi: async () => assert.fail('no id, no request') }), /usage: keep verify/);
+});
+
 test('open CLI posts card or session identity and formats one-line results', async () => {
   const { openCommand, formatOpenResult } = require('./keep.js');
   const calls = [];

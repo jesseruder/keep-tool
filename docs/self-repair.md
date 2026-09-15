@@ -27,8 +27,9 @@ returns candidates.
 
 Retired schedulers, disabled rows, on-demand schedulers (`usage`, `digest`) and
 the `self-repair` row itself never produce a signature. Nor do `runs`, `lint` and
-`git-pull`: `runs` fails when one of the headless runs other schedulers start
-fails to start, which is usually queue congestion rather than a bug, and `lint`
+`git-pull`: `runs` fails on delivery and on the sessions the check scheduler opens —
+a busy thread, a terminal host that is not up, a card that will not load — which is
+congestion rather than a bug in this process, and `lint`
 and `git-pull` fail on registry and checkout state (a malformed card, a dirty or
 diverged checkout), which is Owner's to fix rather than a daemon bug. A `delivery`
 row carrying a live incident gets the `delivery:` signature rather than a second
@@ -194,20 +195,22 @@ openSession({ taskId, fresh: true, cwd: <worktree>, agent: 'claude',
   { launchEnv: { KEEP_REPAIR: '1' } })
 ```
 
-It used to be a headless `runs.startRun`, and that was wrong in one specific way:
-a headless run terminates at the end of its turn. The first live repair diagnosed
-and fixed its fault, then ended its turn saying a background poll would fetch the
-review result — the poll died with the run, no `keep reviewed` record was written,
-and nothing landed. An interactive session is tracked by the machinery that
-already exists: card check-ins, the turn watcher, the fleet reviewer. There is no
-verdict to parse and no wall-clock kill.
+It used to be a headless run (`runs.startRun`, since deleted), and that was wrong in
+one specific way: a headless run terminates at the end of its turn. The first live
+repair diagnosed and fixed its fault, then ended its turn saying a background poll
+would fetch the review result — the poll died with the run, no `keep reviewed` record
+was written, and nothing landed. An interactive session is tracked by the machinery
+that already exists: card check-ins, the turn watcher, the fleet reviewer. There is no
+verdict to parse and no wall-clock kill. Every other agent Keep starts, scheduled
+checks included, works the same way now.
 
 `taskId` + `fresh` + `cwd` makes `openSession` check the cwd against the card's
 project, so a card can never point a `--dangerously-skip-permissions` agent
 anywhere on disk. The card's project is `~/keep-tool` and the cwd is a worktree
 under `~/wt/keep-tool/`; `keep.projectMatchesCwd` resolves a linked worktree to its
 main checkout, so that matches. `self-repair.js` also refuses any cwd outside the
-configured worktree root before it calls `openSession` at all, and says so on the
+configured worktree root (`insideWorktreeRoot`, which lives here) before it calls
+`openSession` at all, and says so on the
 card rather than throwing inside the daemon loop.
 
 `KEEP_REPAIR=1` marks **the launched session and nothing else**. The first launch

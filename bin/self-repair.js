@@ -28,10 +28,11 @@ const DAY_MS = 24 * HOUR_MS;
 // health.CADENCES, and a row with no cadence can never read as silent.
 const SELF_NAME = 'self-repair';
 // Rows whose failures a daemon fix cannot address, so a repair card on them
-// repairs nothing. `runs` fails on the headless runs other schedulers start, and
-// the queue it reports on is congestion rather than a bug. `lint` and `git-pull`
-// fail on registry and checkout state (a malformed card, a dirty or diverged
-// checkout), which is Owner's to fix, not the daemon's.
+// repairs nothing. `runs` fails on delivery and on the sessions the check scheduler
+// opens — congestion, a busy thread, a terminal host that is not up — rather than on
+// a bug in this process. `lint` and `git-pull` fail on registry and checkout state (a
+// malformed card, a dirty or diverged checkout), which is Owner's to fix, not the
+// daemon's.
 const EXCLUDED = new Set(['runs', 'lint', 'git-pull']);
 const CADENCE_MS = 5 * MINUTE_MS;
 const FIRST_RUN_MS = 90e3;
@@ -576,6 +577,19 @@ function worktreePath(name, wt = require('./wt.js')) {
   return path.resolve(root, REPO, name);
 }
 
+// The last gate before a bypassPermissions agent starts: a repair agent only ever
+// runs in a worktree. An arbitrary cwd would let a card point that agent anywhere on
+// the disk — the card's own project is ~/keep-tool, the live daemon checkout.
+function insideWorktreeRoot(candidate, wt = require('./wt.js')) {
+  try {
+    const configured = String(wt.loadConfig().worktreeRoot || '~/wt').replace(/^~(?=\/|$)/, require('os').homedir());
+    const root = fs.realpathSync(path.resolve(configured));
+    const target = fs.realpathSync(path.resolve(candidate));
+    const relative = path.relative(root, target);
+    return relative !== '' && !relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative);
+  } catch { return false; }
+}
+
 // A directory is only a worktree worth reusing once `wt new` finished with it:
 // a checkout plus either its install marker or its installed dependencies. A tree
 // abandoned half-built by a daemon that died mid-create has the .git file and
@@ -714,7 +728,7 @@ function defaultDeps(deps) {
     // A card that will not load reads as closed, which is what an archived or
     // deleted one is. The sweep and reset() both ask this.
     loadTask: deps.loadTask || ((id) => { try { return keep.loadTask(id, deps.root || keep.ROOT); } catch { return null; } }),
-    insideWorktreeRoot: deps.insideWorktreeRoot || ((candidate) => require('./runs.js').insideWorktreeRoot(candidate)),
+    insideWorktreeRoot: deps.insideWorktreeRoot || ((candidate) => insideWorktreeRoot(candidate)),
     setPlan: deps.setPlan || ((task, steps) => keep.setPlan(task, steps)),
     onChange: deps.onChange || (() => {}),
   };
@@ -874,9 +888,9 @@ async function launchRepair(candidate, cardId, artifacts, context) {
     return { cardId, artifacts, launched: false, worktreeError: created && created.error };
   }
 
-  // The last gate before a bypassPermissions agent starts. runs.js refuses a cwd
-  // outside the worktree root too, but a refusal there would be a thrown error
-  // from inside the daemon loop; this one says so on the card.
+  // The last gate before a bypassPermissions agent starts. insideWorktreeRoot is the
+  // predicate; the check is repeated here so the refusal says so on the card instead
+  // of throwing from inside the daemon loop.
   if (!deps.insideWorktreeRoot(created.path)) {
     deps.checkin(cardId, {
       heading: 'self-repair',
@@ -1539,7 +1553,7 @@ module.exports = {
   readTail, readLogExcerpt, scrubBlock, redactSecrets, collectEvidence, stageEvidence, deliveryEvidence,
   cardTitle, symptomNote, buildRecipe, openingMessage, repairAccountId,
   findRecipeArtifact, launchModel, isRepairSession, LEGACY_RUN_TTL_MS, PANE_DEAD_GRACE_MS,
-  worktreeName, worktreePath, spawnWorktree, worktreeReady,
+  worktreeName, worktreePath, insideWorktreeRoot, spawnWorktree, worktreeReady,
   createRepairCard, launchRepair, resumeBlocker, EXCLUDED, MAX_LAUNCH_ATTEMPTS, RESUME_BACKOFF_MS,
   tick, startScheduler, status, renderStatus, dryRun, renderDry, reset,
   _resetWarnings,

@@ -29,25 +29,26 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   add both flags to an existing card with `keep checkin <id> --check-after <when>
   --check "<recipe>"`. `when` is `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`, `+12h`, `+3d`,
   `+2w`, or `tomorrow`.
-  This is a scheduler, not a reminder: when the time arrives, `keep serve` runs the
-  recipe itself as an unattended headless Claude session and lands the outcome on the
-  card as a check-in. If the session that scheduled it is still open — even if it has
-  been idle for hours — and not mid-turn or waiting on Owner when the time comes, the
-  recipe is sent into that thread instead, and that thread is expected
-  to run it and check in (`--clear-check-after`, or `--check-after` to reschedule). It
-  runs headless only when no linked session is open, or when one stays busy through the
-  deferral limit. Headless Keep runs disable the Codex plugin by default; set
-  `KEEP_HEADLESS_DISABLED_PLUGINS` to a comma-separated plugin list, or empty to opt out.
+  This is a scheduler, not a reminder: when the time arrives, `keep serve` delivers the
+  recipe to an agent that runs it and lands the outcome on the card as a check-in. If the
+  session that scheduled it is still open — even if it has been idle for hours — and not
+  mid-turn or waiting on Owner when the time comes, the recipe is sent into that thread,
+  and that thread is expected to run it and check in (`--clear-check-after`, or
+  `--check-after` to reschedule). Otherwise Keep opens a fresh interactive Claude session
+  on the card and types the same instruction into it — nothing runs headless. At most one
+  such session per card per day, and none while the checks account's usage window is
+  exhausted (the card records a `check deferred` note and stays overdue).
   `--check-after` on its own, with no `--check` and no `--probe`, schedules nothing
   — it only makes the card show up in `keep overdue`. Run one early with
   `keep verify <id>`.
   Say what a pass means, so a green check does not sit in Owner's review queue with
   nothing to decide: `--on-pass done` closes the card, `--on-pass rearm --check-every
   +7d` keeps it waiting and re-arms the check from now (minimum `+10m`; `--check-every`
-  alone implies `rearm`), and the default is Owner review. A check run must end its
-  final message with `VERDICT: PASS|FAIL|UNSURE — <one sentence>`; that line is parsed
-  and decides the card, so anything but PASS goes to review. Recurring checks always run
-  headless — they are never delivered into a thread.
+  alone implies `rearm`), and the default is Owner review. Whoever runs the check records
+  the outcome itself with `keep checkin`; the delivered message spells out what this
+  card's declaration means, so a `done` card is told to close itself and a `rearm` card is
+  told to re-arm with `--check-after <check_every>`. Recurring checks are never delivered
+  into a thread — they always go to a session Keep opens.
   `--probe "<cmd>"` is better than a recipe whenever the check is really a shell
   assertion: a read-only one-liner whose exit code decides the card with no model
   session at all. Use absolute paths (`/opt/homebrew/bin/...`) — the daemon's shell may
@@ -55,7 +56,7 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   `--check` recipe when the card has one, and otherwise lands for Owner review. Run it
   by hand any time with `keep probe <id>` (exit 1 = failed; it lands no check-in).
   The daemon polls due recipes every minute (not every ten minutes); busy sessions
-  retain approximately two hours of default deferral before headless fallback.
+  retain approximately two hours of default deferral before Keep opens a session instead.
   Scheduling with `--check-after` records a turn-scoped waiting handoff for the
   scheduling session. If you also need Owner's decision, add `--handoff needs-input`
   to `keep checkin`; use `--handoff waiting` to explicitly yield to an existing
@@ -280,12 +281,12 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
 - If a Stop reminder names your next step, continue with it. If you need Owner, end
   your turn with a question — the reminder does not repeat for that step.
 - Write a `check` recipe so that a stranger could run it — usually the thread that
-  scheduled it gets it first, but if that thread is closed a headless session with no
-  memory of this conversation runs it instead. Name the
+  scheduled it gets it first, but if that thread is closed a fresh session with no memory
+  of this conversation runs it instead. Name the
   system, the exact query or command, and the threshold that decides the outcome.
   "Check if the experiment worked" yields a useless verdict; "run query 1488 on Redash
-  #109; if either arm has <500 exposures, it is still ramping" does not. Keep it inside
-  the 15-minute run budget, and keep it read-only — a check reports, it does not fix.
+  #109; if either arm has <500 exposures, it is still ramping" does not. Keep it short,
+  and keep it read-only — a check reports, it does not fix.
 - Keep status honest: `active` is ready for an agent to continue; `waiting` requires
   `--check-after` or an unresolved dependency recorded by `keep wait-on`; `blocked`
   needs a person or decision; `landing` means the work is finished and its commits

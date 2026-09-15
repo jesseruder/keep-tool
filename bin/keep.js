@@ -4567,20 +4567,26 @@ commands.discord = async (argv) => {
   die('usage: keep discord poll [--dry] | keep discord status');
 };
 
-commands.verify = async (argv) => {
+commands.verify = async (argv, deps = {}) => {
   const o = parseArgs(argv, {});
   const id = o._[0];
   if (!id) die('usage: keep verify <id>');
   let response;
   try {
-    response = await postKeepApi('/api/run', { id, kind: 'check' });
+    response = await (deps.postKeepApi || postKeepApi)('/api/run', { id, kind: 'check' });
   } catch {
     die('keep serve isn\'t running (start it or use the dashboard)');
   }
   let result = {};
   try { result = JSON.parse(response.data); } catch {}
-  if (response.status === 200 && result.ok && result.runId) {
-    console.log(`verify started: ${result.runId} (result will land as a check-in in the dashboard review column)`);
+  if (response.status === 200 && result.ok) {
+    // Nothing runs headless: the recipe is delivered into a session, which records the
+    // outcome as a check-in on the card the way any other check does.
+    const where = result.sessionId ? ` ${String(result.sessionId).slice(0, 8)}` : '';
+    (deps.log || console.log)(result.delivered === 'thread'
+      ? `verify delivered into this card's open ${result.kind || 'claude'} session${where}`
+      : `verify opened a fresh session${where}${result.pane ? ` in pane ${result.pane}` : ''} on this card`);
+    (deps.log || console.log)('the result lands as a check-in (dashboard review column)');
     return;
   }
   die(result.error || `keep serve returned an unexpected response (${response.status})`);
@@ -5645,7 +5651,8 @@ function projectMatchesCwd(project, cwd) {
 }
 
 // Claude Code exports its entrypoint to hooks: `cli` interactively, `sdk-cli`
-// under -p, `sdk-ts`/`sdk-py` from the Agent SDK. KEEP_RUN marks Keep's own runs.
+// under -p, `sdk-ts`/`sdk-py` from the Agent SDK. KEEP_RUN marks Keep's own headless
+// generators (summarize.js: the ideas sweep, standup, Slack classification).
 function isHeadlessSessionEnv(env) {
   return Boolean(env.KEEP_RUN) || /^sdk/.test(String(env.CLAUDE_CODE_ENTRYPOINT || ''));
 }
@@ -6538,7 +6545,7 @@ function codexStopState(input) {
 
 function stopHook(input, agent = 'claude') {
   if (input.stop_hook_active) return; // never double-block
-  if (process.env.KEEP_RUN) return; // keep's own headless runs check themselves in
+  if (process.env.KEEP_RUN) return; // Keep's own headless generators (ideas, standup, Slack) land their own records
   if (isReviewerSession()) return; // the reviewer writes no code; nagging it is noise
   const sid = input.session_id;
   if (!sid || !/^[A-Za-z0-9_-]+$/.test(sid)) return;
@@ -8260,7 +8267,7 @@ ${stepUsage()}
   keep discord poll [--dry]
   keep discord status
   keep probe <id>      # run this card's probe now (exit 1 = failed); no check-in, no daemon
-  keep verify <id>     # run this task's check recipe now (needs keep serve)
+  keep verify <id>     # run this task's check recipe now, in its thread or a fresh session (needs keep serve)
   keep compact <sid>   # compact a live Claude or Codex session (needs keep serve)
   keep open <card-id|session-id> [--fresh] [--agent claude|codex] [--model <id>] [-m "opening message" | --message-file <path>]
                          # --model applies to the launched process only (never settings.json);
@@ -8411,7 +8418,8 @@ module.exports = {
   recordStepRun, codexToolInput, codexExitCode,
   codexJobText, renderCodexJobs,
   codexCommandCli: commands.codex,
-  commandUsage, helpText, formatOpenResult, openCommand: commands.open, postOpen, OPEN_MESSAGE_LIMIT, OPEN_MESSAGE_ERROR, LAUNCH_MODEL_RE,
+  commandUsage, helpText, formatOpenResult, openCommand: commands.open, verifyCommand: commands.verify,
+  postOpen, OPEN_MESSAGE_LIMIT, OPEN_MESSAGE_ERROR, LAUNCH_MODEL_RE,
   restoreCommandCli: commands.restore, resumeCommandCli: commands.resume, resumeCommand,
   accountsCommandCli: commands.accounts, handoffCommandCli: commands.handoff, transferCommandCli: commands.transfer,
   delegateCommandCli: commands.delegate,

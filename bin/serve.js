@@ -1306,7 +1306,7 @@ const URGENT_DASHBOARD_MUTATIONS = new Set([
   '/api/handoff-session', '/api/notifications', '/api/open', '/api/panes/spawn',
   '/api/portable-transfers', '/api/reopen-session', '/api/resolve-portable-transfer',
   '/api/restart-daemon', '/api/restart-session', '/api/review-queue', '/api/reviewtick',
-  '/api/run', '/api/send', '/api/setaside', '/api/stop', '/api/transfer-session',
+  '/api/run', '/api/send', '/api/setaside', '/api/transfer-session',
 ]);
 function urgentDashboardMutation(pathname) {
   return URGENT_DASHBOARD_MUTATIONS.has(pathname) || /^\/api\/panes\/[^/]+\/(?:kill|remove)$/.test(pathname);
@@ -6151,7 +6151,6 @@ function buildState(options = {}) {
     limitResume: limitresume.dashboardState(keep.ROOT),
     slack: messageWatcherDashboardState(),
     health: healthSnapshot,
-    runs: options.dashboardRuntime?.runs || runs.listRuns(),
     usage: options.dashboardRuntime?.usage || usage.getUsage(),
     reviewQueue: reviewQueue.snapshot({ loadTasks: () => allTasks, now }),
   };
@@ -6250,7 +6249,7 @@ function dashboardRuntimeSnapshot() {
   let digest = null;
   try { digest = ensureDigest(); }
   catch (error) { process.stderr.write(`keep serve: digest failed: ${error.message}\n`); }
-  return { digest, health: health.snapshot(), usage: usage.getUsage(), runs: runs.listRuns() };
+  return { digest, health: health.snapshot(), usage: usage.getUsage() };
 }
 
 function setPath(object, pathParts, value) {
@@ -6275,7 +6274,6 @@ function finalizeDashboardWorkerResult(result) {
 
   const taskById = new Map((state.tasks || []).map((task) => [task.id, task]));
   titles.applyLiveTitles(state.sessions, { onChange, taskFor: (session) => taskById.get(session.taskId) });
-  state.runs = runs.listRuns();
   for (const session of state.sessions || []) require('./session-debug').record(session, Date.now());
   const sessionById = new Map((state.sessions || []).map((session) => [session.id, session]));
   for (const item of state.attention || []) {
@@ -6425,7 +6423,6 @@ function buildWhoSnapshot(project) {
   return who.fleetSnapshot(project, {
     tasks,
     sessions,
-    runs: runs.listRuns(),
     holds,
     deviceHolds: true,
     steps: steps.status(project, { tasks, holds: keep.activeHolds(project) }),
@@ -7096,21 +7093,6 @@ function excludedSessionIds() {
   return excluded;
 }
 
-function notifyTaskSession(taskId, text) {
-  let task;
-  try { task = keep.loadTask(taskId); } catch { return; }
-  const target = pickNotifyTarget(
-    (task.fm.sessions || []).map((s) => s && s.id),
-    scanSessions(),
-    excludedSessionIds(),
-  );
-  if (!target) return;
-  withInjectionLock(() => sendToSession({ sessionId: target.id, text }), { session: target.id }).catch((e) => {
-    // the card already carries the result; a busy or unreachable terminal is not a failure
-    process.stderr.write(`keep runs: could not notify ${target.id.slice(0, 8)} about ${taskId}: ${e.message}\n`);
-  });
-}
-
 // A card's `sessions` link follows its session to whatever card that session touched
 // last, so the thread that scheduled a check is often no longer linked here. It is
 // still the thread that wants the check, so it leads the candidate list.
@@ -7168,6 +7150,49 @@ async function deliverCheckToThread(task, deps = {}) {
   return busy > 0
     ? { deferred: true, reason: 'linked thread is mid-turn or waiting on Owner' }
     : null;
+}
+
+// The scheduler's opener, used by every caller that opens a session on a card the
+// scheduler would otherwise have opened one for.
+function openCheckSession(body, openDeps) {
+  return openSession(body, { ...openDeps, launchMeta: { ephemeral: 'check' } });
+}
+
+// `keep verify <id>` and the console's "Run check now": run a card's check recipe now
+// instead of waiting for its schedule. The linked thread gets it if one is open — it
+// has the context the recipe may assume — and otherwise Keep opens a fresh session on
+// the card, exactly as the scheduler does when the check comes due. Nothing runs
+// headless, so there is no run id to report: what comes back is a session.
+async function runCheckNow(taskId, deps = {}) {
+  const task = (deps.loadTask || keep.loadTask)(taskId);
+  if (!task.fm.check) throw new keep.KeepError(`${taskId} has no check recipe`);
+  let delivery = null;
+  try { delivery = await (deps.deliverCheckToThread || deliverCheckToThread)(task); }
+  catch (error) { delivery = { deferred: true, reason: String(error && error.message || error) }; }
+  if (delivery && !delivery.deferred && delivery.sessionId) {
+    return { ok: true, delivered: 'thread', sessionId: delivery.sessionId, kind: delivery.kind || 'claude' };
+  }
+  const { opened } = await runs.openFreshCheckSession(task, { open: deps.open || openCheckSession });
+  return { ok: true, delivered: 'session', sessionId: (opened && opened.sessionId) || null,
+    pane: (opened && opened.pane) || null, kind: 'claude' };
+}
+
+// The console's "Run agent" button. A pointer, not a brief: the session reads the card
+// itself rather than working from a copy of it that was already stale when it was typed.
+function taskRunMessage(taskId, prompt) {
+  const instructions = String(prompt || '').replace(/\s+/g, ' ').trim();
+  const head = `[keep] Work on card ${taskId}: keep show ${taskId}.`;
+  if (!instructions) return head;
+  const room = keep.OPEN_MESSAGE_LIMIT - head.length - ' Operator instructions: '.length - 1;
+  return `${head} Operator instructions: ${instructions.length > room ? `${instructions.slice(0, room)}…` : instructions}`;
+}
+
+async function runTaskNow(taskId, prompt, deps = {}) {
+  (deps.loadTask || keep.loadTask)(taskId); // refuse an unknown card before opening anything
+  const opened = await (deps.open || openSession)({
+    taskId, fresh: true, agent: 'claude', message: taskRunMessage(taskId, prompt),
+  }, {});
+  return { ok: true, sessionId: (opened && opened.sessionId) || null, pane: (opened && opened.pane) || null };
 }
 
 async function deliverUnblockToThread(task, text) {
@@ -7625,12 +7650,11 @@ function start(deps = {}) {
   setInterval(jobTick, 500).unref();
 
   runs.setOnChange(broadcast);
-  runs.setNotifier(notifyTaskSession); // before recover(), which can finalize immediately
   runs.setDeliverer(deliverCheckToThread);
   // A due check that no live thread took opens an ordinary interactive session on its
   // card — the same thing self-repair does, and for the same reason: a headless run
   // dies at the end of its turn, has no memory, and cannot be looked at.
-  runs.setOpener((body, openDeps) => openSession(body, { ...openDeps, launchMeta: { ephemeral: 'check' } }));
+  runs.setOpener(openCheckSession);
   runs.setEphemeralHost({
     listPanes: () => listHostPanes({}, true),
     sessions: () => scanSessions(),
@@ -7654,7 +7678,6 @@ function start(deps = {}) {
   });
   usage.setOnChange(broadcast);
   usage.setCacheFile(path.join(keep.ROOT, '.keep', 'usage-cache.json'));
-  runs.recover(); // surface any orphaned run logs from a prior crash/restart
   runs.startScheduler();
   require('./delivery-health').startScheduler({ root: keep.ROOT, onChange: broadcast,
     // Global on purpose: reconcile reads every session's pending delivery record, so no
@@ -7838,7 +7861,7 @@ function start(deps = {}) {
       const ledger = readLiveSessionLedger();
       const aliveIds = stallAliveIds(ledger, now);
       const result = await stalled.sweep({
-        root: keep.ROOT, sessions: stalledSessionSnapshot(), runs: runs.listRuns(), includeAgents: true,
+        root: keep.ROOT, sessions: stalledSessionSnapshot(), includeAgents: true,
         ...(aliveIds ? { aliveIds } : {}),
       });
       health.record('stalled', { ok: true, cadenceMs: 60e3, detail: result.detail });
@@ -8394,8 +8417,15 @@ function start(deps = {}) {
             catch (error) { return json(res, 400, { error: error.message }); }
           }
           if (url.pathname === '/api/run') {
-            const run = runs.startRun(body.id, body.kind === 'check' ? 'check' : 'task', body.prompt);
-            return json(res, 200, { ok: true, runId: run.id });
+            try {
+              const result = body.kind === 'check' ? await runCheckNow(body.id) : await runTaskNow(body.id, body.prompt);
+              broadcast();
+              return json(res, 200, result);
+            } catch (e) {
+              if (e instanceof InjectionError) return json(res, e.status, { error: e.message, ...e.extra });
+              if (e instanceof keep.KeepError) return json(res, 400, { error: e.message });
+              return json(res, 502, { error: String(e && e.message || e).slice(0, 500) });
+            }
           }
           if (url.pathname === '/api/focus') {
             const sessionId = String(body && body.sessionId || '');
@@ -8512,20 +8542,11 @@ function start(deps = {}) {
               return json(res, 502, { error: String(e && e.message || e).slice(0, 500) });
             }
           }
-          if (url.pathname === '/api/stop') {
-            runs.stopRun(body.id);
-            return json(res, 200, { ok: true });
-          }
           return json(res, 404, { error: 'not found' });
         } catch (e) {
           if (e instanceof keep.KeepError) return json(res, 400, { error: e.message });
           throw e;
         }
-      }
-
-      if (url.pathname === '/api/rundiff') {
-        const diff = runs.readDiff(url.searchParams.get('id') || '');
-        return json(res, diff === null ? 404 : 200, diff === null ? { error: 'no diff' } : { diff });
       }
 
       if (url.pathname === '/api/panes') {
@@ -8766,6 +8787,7 @@ module.exports = {
   agentProcessRows, liveSessionPids, liveSessionTick, restorePlan,
   annotatePaneAgents,
   readPaneRecord, sessionProjectFromTranscript, openSession, reopenSessionOnAccount,
+  runCheckNow, runTaskNow, taskRunMessage,
   inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, continueAccountHandoff, handoffSession,
   abandonAccountHandoff,
   listPortableTransfers, inspectPortableSource, portableTerminalRateLimitEvidence,

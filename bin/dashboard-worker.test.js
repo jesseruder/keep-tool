@@ -128,8 +128,7 @@ test('real dashboard build preserves host pane mapping and parent runtime snapsh
     dashboardRuntime: {
       digest: null,
       health: { daemon: {}, schedulers: [] },
-      usage: { accounts: {} },
-      runs: [{ id: 'parent-run', state: 'running' }],
+      usage: { accounts: { 'parent-account': { agent: 'claude' } } },
     },
   };
   const result = await worker.build(input);
@@ -138,7 +137,8 @@ test('real dashboard build preserves host pane mapping and parent runtime snapsh
   assert.equal(session.launchModel, 'gpt-test');
   assert.equal(result.state.panes[0].id, 'pane-host-only');
   assert.equal(result.state.attention.find((item) => item.sessionId === 'host-only')?.pane, 'pane-host-only');
-  assert.deepEqual(result.state.runs, [{ id: 'parent-run', state: 'running' }]);
+  assert.deepEqual(result.state.usage.accounts, { 'parent-account': { agent: 'claude' } },
+    'the parent process runtime snapshot reaches the worker build');
   const scanned = result.state.sessions.find((item) => item.id === 'cached-claude');
   assert.equal(scanned.hostOnly, undefined);
   assert.equal(scanned.pane, 'pane-cached');

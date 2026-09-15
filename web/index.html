@@ -267,21 +267,7 @@
     padding: .5rem; margin: .35rem 0 0; white-space: pre-wrap; max-height: 12rem; overflow: auto;
   }
 
-  /* runs */
-  .runline { display: flex; gap: .45rem; align-items: baseline; font-size: .78rem; margin-top: .3rem; color: var(--muted); }
-  .spin {
-    width: 9px; height: 9px; border-radius: 50%; flex: none; align-self: center;
-    border: 2px solid var(--accent); border-top-color: transparent; animation: rot 1s linear infinite;
-  }
-  @keyframes rot { to { transform: rotate(360deg); } }
-  @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
-  #runArea { border-top: 1px solid var(--line); margin-top: .8rem; padding-top: .6rem; }
   .runmsg { font-size: .82rem; color: var(--muted); white-space: pre-wrap; margin: .4rem 0; }
-  .diffpre {
-    font-family: ui-monospace, Menlo, monospace; font-size: .72rem; background: var(--code);
-    border: 1px solid var(--line); border-radius: 6px; padding: .6rem; overflow-x: auto;
-    max-height: 40vh; overflow-y: auto; white-space: pre;
-  }
   #toast {
     position: fixed; bottom: 1rem; left: 50%; transform: translateX(-50%);
     background: var(--ink); color: var(--paper); border-radius: 8px; padding: .5rem 1rem;
@@ -351,7 +337,7 @@
   <span class="date" id="date"></span>
   <span class="spacer"></span>
   <span class="stale" id="stale">disconnected — retrying</span>
-  <button class="btn quiet" id="notifBtn" title="browser notifications for finished runs, overdue checks, and new review items">🔔</button>
+  <button class="btn quiet" id="notifBtn" title="browser notifications for overdue checks and new review items">🔔</button>
   <button class="btn" id="addBtn" title="Create a new task on the board">+ add</button>
   <div class="usage-strip" id="usage" aria-label="Usage limits"></div>
 </header>
@@ -436,7 +422,7 @@ window.modelUsageHTML = modelUsageHTML;
 'use strict';
 const COLS = ['active', 'review', 'landing', 'blocked', 'waiting', 'inbox'];
 const STALE_DAYS = 7;
-let state = { tasks: [], sessions: [], attention: [], stalled: [], unblocked: [], alerts: [], brief: null, standup: null, landed: {}, slack: null, health: null, digest: null, runs: [], usage: {}, reviewUsage: null };
+let state = { tasks: [], sessions: [], attention: [], stalled: [], unblocked: [], alerts: [], brief: null, standup: null, landed: {}, slack: null, health: null, digest: null, usage: {}, reviewUsage: null };
 let tagFilter = null;
 let scopeFilter = localStorage.keepScope || null;
 const scopeNames = () => state.scopes?.names || ['work', 'personal'];
@@ -503,9 +489,6 @@ function toast(msg) {
   toastTimer = setTimeout(() => { $('toast').style.display = 'none'; }, 3500);
 }
 
-function runFor(taskId) {
-  return (state.runs || []).find((r) => r.taskId === taskId);
-}
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const experimentChip = (id) => id ? `<span class="experiment-chip">🧪 ${esc(id)}</span>` : '';
 
@@ -1034,8 +1017,6 @@ function render() {
             ${liveTaskIds.has(t.id) ? '<span class="live">● live</span>' : ''}
           </div>
           ${t.lastLog ? `<div class="last">${esc(t.lastLog)}</div>` : ''}
-          ${(() => { const r = runFor(t.id); return r && r.status === 'running'
-            ? `<div class="runline"><span class="spin"></span><span>${esc(r.lastText || 'agent starting…')}</span></div>` : ''; })()}
         </div>`;
       }).join('') || '<div class="empty">—</div>'}
     </div>`;
@@ -1343,15 +1324,10 @@ function renderNotifBtn() {
 }
 function maybeNotify() {
   const cur = {
-    runs: new Map((state.runs || []).map((r) => [r.id, r.status])),
     overdue: new Set(state.tasks.filter((t) => t.overdue).map((t) => t.id)),
     review: new Set(state.tasks.filter((t) => t.fm.status === 'review').map((t) => t.id)),
   };
   if (notifPrev && notifOn() && document.hidden && Notification.permission === 'granted') {
-    for (const [id, st] of cur.runs) {
-      const old = notifPrev.runs.get(id);
-      if (old === 'running' && st !== 'running') new Notification(`keep — run ${st}`, { body: id });
-    }
     for (const id of cur.overdue) if (!notifPrev.overdue.has(id)) new Notification('keep — check overdue', { body: id });
     for (const id of cur.review) if (!notifPrev.review.has(id)) new Notification('keep — needs your review', { body: id });
   }
@@ -1463,11 +1439,10 @@ function renderTaskDetail(t, draft = null) {
       </select>
       <button class="btn" id="ciSend" title="Save your note above as a check-in on this task (and change status if you picked one). You are writing this — no agent runs.">Check in</button>
       <span class="spacer" style="flex:1"></span>
-      ${t.fm.check ? '<button class="btn" id="runCheck" title="Spawn an agent to run this task&apos;s check recipe now — read-only verification (e.g. is it shipped?). The verdict lands as a check-in.">Run check now</button>' : ''}
-      ${t.fm.project ? '<button class="btn" id="runTask" title="Spawn an agent to actually do this task in its project. It makes changes; the diff lands in review for you to inspect.">Run agent</button>' : ''}
+      ${t.fm.check ? '<button class="btn" id="runCheck" title="Run this task&apos;s check recipe now — read-only verification (e.g. is it shipped?). It goes to this card&apos;s open session if there is one, otherwise a fresh session opens on the card. The outcome lands as a check-in.">Run check now</button>' : ''}
+      ${t.fm.project ? '<button class="btn" id="runTask" title="Open a session on this task in its project to actually do the work. You can watch it in the console.">Run agent</button>' : ''}
     </div>
-    ${t.fm.project ? '<div class="actions"><input type="text" id="runExtra" style="flex:1" placeholder="Optional instructions for the agent run (default: work from the task log)"></div>' : ''}
-    <div id="runArea"></div>
+    ${t.fm.project ? '<div class="actions"><input type="text" id="runExtra" style="flex:1" placeholder="Optional instructions for the session (default: work from the card)"></div>' : ''}
     <div class="md">${md(t.body || '')}</div>`;
 
   $('ciSend').addEventListener('click', async () => {
@@ -1479,16 +1454,21 @@ function renderTaskDetail(t, draft = null) {
     } catch (e) { toast(e.message); }
   });
   if ($('runCheck')) $('runCheck').addEventListener('click', async () => {
-    try { await post('/api/run', { id, kind: 'check' }); toast('check run started'); refresh(); }
-    catch (e) { toast(e.message); }
+    try {
+      const r = await post('/api/run', { id, kind: 'check' });
+      toast(r.delivered === 'thread' ? 'check sent to this card\'s session' : 'check session opened');
+      refresh();
+    } catch (e) { toast(e.message); }
   });
   if ($('runTask')) $('runTask').addEventListener('click', async () => {
-    try { await post('/api/run', { id, kind: 'task', prompt: $('runExtra').value || undefined }); toast('agent run started'); refresh(); }
-    catch (e) { toast(e.message); }
+    try {
+      await post('/api/run', { id, kind: 'task', prompt: $('runExtra').value || undefined });
+      toast('session opened on this card');
+      refresh();
+    } catch (e) { toast(e.message); }
   });
   restoreTaskDraft(draft);
 
-  renderRunArea(id);
   if (!$('detail').open) $('detail').showModal();
   fetch(`/api/tasksummary?id=${encodeURIComponent(id)}`).then((r) => {
     if (!r.ok) throw new Error(`request failed (${r.status})`);
@@ -1639,34 +1619,6 @@ function openSession(id) {
   });
 }
 
-async function renderRunArea(taskId) {
-  const area = $('runArea');
-  if (!area) return;
-  const r = runFor(taskId);
-  if (!r) { area.innerHTML = ''; return; }
-  const dur = Math.round(((r.endedAt || Date.now()) - r.startedAt) / 60e3);
-  area.innerHTML = `
-    <div class="runline">
-      ${r.status === 'running' ? '<span class="spin"></span>' : ''}
-      <b>${esc(r.kind)} run — ${esc(r.status)}</b>
-      <span>${dur}m${r.costUsd != null ? ` · $${r.costUsd.toFixed(2)}` : ''}</span>
-      ${r.status === 'running' ? `<button class="btn quiet" id="stopRun" title="Stop this running agent (kills the process; the task is marked blocked)">Stop</button>` : ''}
-      ${r.diffStat ? `<button class="btn quiet" id="viewDiff" title="Show the file changes this agent run made">View diff</button>` : ''}
-    </div>
-    <div class="runmsg">${esc(r.status === 'running' ? (r.lastText || 'starting…') : (r.resultText || r.lastText || ''))}</div>
-    <div id="diffHolder"></div>`;
-  if ($('stopRun')) $('stopRun').addEventListener('click', async () => {
-    try { await post('/api/stop', { id: taskId }); toast('stopping run'); } catch (e) { toast(e.message); }
-  });
-  if ($('viewDiff')) $('viewDiff').addEventListener('click', async () => {
-    try {
-      const resp = await fetch(`/api/rundiff?id=${encodeURIComponent(r.id)}`);
-      const j = await resp.json();
-      $('diffHolder').innerHTML = `<div class="diffpre">${esc(j.diff || j.error || '')}</div>`;
-    } catch (e) { toast(e.message); }
-  });
-}
-
 async function refresh() {
   try {
     const r = await fetch('/api/state?summary=1');
@@ -1679,7 +1631,6 @@ async function refresh() {
     if ($('detail').open && openTaskId) {
       const summary = state.tasks.find((task) => task.id === openTaskId);
       if (summary?._detailVersion && summary._detailVersion !== $('detail').dataset.detailVersion) openTask(openTaskId, taskDraftState());
-      else renderRunArea(openTaskId);
     } else if ($('detail').open && $('detail').dataset.sessionId) {
       const summary = state.sessions.find((session) => session.id === $('detail').dataset.sessionId);
       if (summary) {

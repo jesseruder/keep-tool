@@ -96,7 +96,7 @@ keep landed decisions [--disagree]
 keep slack poll [--dry]
 keep slack status
 keep slack mode log|cards|alerts
-keep verify <id>       # run a check recipe now (needs keep serve)
+keep verify <id>       # run a check recipe now, in its thread or a fresh session (needs keep serve)
 keep compact <sid>     # compact a live Claude or Codex session (needs keep serve)
 keep resume [--raw]    # post-restart: active tasks + keep open commands (--raw prints the bare CLI form)
 keep setup hooks [--account <id>]  # install the Keep hooks in every managed Claude account
@@ -550,13 +550,18 @@ runs. An exhausted window (budget code 6 or 7) is recorded as a healthy skip; a 
 that cannot be read at all (code 8) is recorded as a **failure**, so `consecutiveFailures`
 climbs and the brief shows it rather than the sweep dying silently behind a green row.
 
+The ideas sweep, standup and Slack classification are the only model calls Keep still
+makes headless (they are one-shot generators, not agents). They disable
+`codex@openai-codex` by default; set `KEEP_HEADLESS_DISABLED_PLUGINS` to a
+comma-separated plugin list, or empty to opt out.
+
 ## Daemon self-repair
 
 When a daemon failure signature persists — a scheduler failing repeatedly on the
 same normalized error, more than three daemon starts in an hour across two ticks,
 a delivery incident unchanged for half an hour — Keep opens one card per signature
 with the health record and a log excerpt attached, creates a fresh `keep-tool`
-worktree out of process, and launches one headless repair agent there. At most two
+worktree out of process, and opens one interactive repair session there. At most two
 cards a day, one open card per signature, a 24-hour cooldown after each resolves.
 
 The daemon restart stays manual: `keep hook pre-bash` refuses `keep
@@ -848,35 +853,45 @@ apply is the reason the flag exists.
 Long messages injected into sessions are typed in paced chunks and, for Claude
 sessions, verified against the transcript after submit; truncated delivery is logged.
 
-## Scheduled checks and runs
+## Scheduled checks
 
-When a scheduled check becomes due, Keep first sends its recipe into the most recent
-eligible linked Claude or Codex thread. A successful delivery is recorded in
-`.keep/runs/<taskId>.delivered.json` for that exact `check_after`, so daemon restarts do
-not redeliver it; the thread must check in with `--clear-check-after` or reschedule it.
-An open linked thread remains eligible even after hours of inactivity. A thread that
-is mid-turn or waiting on the owner defers the check for 120 scheduler ticks (about two hours) by default
-(`KEEP_DELIVER_MAX_DEFERRALS`) before a headless run takes over; if no linked pane is
-open, Keep falls back to headless immediately.
-Headless Keep runs disable `codex@openai-codex` by default; set
-`KEEP_HEADLESS_DISABLED_PLUGINS` to a comma-separated plugin list, or empty to opt out.
+Nothing in Keep runs a model headless. When a scheduled check becomes due, Keep first
+sends its recipe into the most recent eligible linked Claude or Codex thread; when there
+is none, it opens a fresh interactive Claude session on the card and types the same
+instruction into it. A successful delivery — to a thread or to a session Keep opened — is
+recorded in `.keep/runs/<taskId>.delivered.json` for that exact `check_after`, so daemon
+restarts do not redeliver it; the recipient must check in with `--clear-check-after` or
+reschedule it. An open linked thread remains eligible even after hours of inactivity. A
+thread that is mid-turn or waiting on the owner defers the check for 120 scheduler ticks
+(about two hours) by default (`KEEP_DELIVER_MAX_DEFERRALS`) before Keep opens a session
+instead; if no linked pane is open, Keep opens one immediately.
+
+Keep opens at most one scheduler session per card per local day and three per scheduler
+tick. It opens none at all while the `checks` automation account's weekly or 5h window is
+exhausted: that records one `check deferred` check-in per card per day, changes neither
+the status nor the schedule, and leaves the card overdue for the tick after the reset. An
+*unreadable* usage snapshot is not treated as no budget — that would stop every card on
+the board.
+
+Sessions Keep opens this way are marked `ephemeral: check` on their host pane. A sweep in
+the same scheduler tick closes such a pane once its session has ended its turn and the
+card carries a newer check-in, or after 60 minutes with no check-in at all. A session
+mid-turn is never closed.
 
 If transcript verification shows that a scheduled-check prompt arrived truncated,
 Keep still stamps it as delivered to avoid typing the prompt twice, then adds a
 `delivery warning` check-in naming the session and received/expected character counts;
 the full recipe remains available through `keep show <id>`.
 
-If a headless check or task changes its card's status, its finalizer records the result without overriding that status or clearing the scheduled check.
-
-A check run must end its final message with `VERDICT: PASS|FAIL|UNSURE — <one sentence>`;
-the last such line decides the card. What a PASS means is the card's own declaration,
-`check_on_pass`: `done` closes the card, `rearm` keeps it `waiting` and re-arms
-`check_after` to now plus `check_every` (relative grammar, minimum `+10m`, set with
+The session that runs a check records the outcome itself with `keep checkin`, so what a
+PASS means is a matter of what the card told it. `check_on_pass`: `done` means check in
+with `--status done --clear-check-after`, `rearm` means check in with `--check-after
+<check_every>` and the status unchanged (relative grammar, minimum `+10m`, set with
 `--check-every`, which implies `--on-pass rearm`), and `review` — or no declaration at
-all, which is every older card — sends it to Owner review and clears the schedule. FAIL,
-UNSURE and a missing verdict always go to review. A `rearm` card whose `check_every` is
-missing or unparsable falls back to review with a note saying so. Re-arming is measured
-from now, not from the missed date, so a daemon outage cannot queue a catch-up storm.
+all, which is every older card — means Owner review with the schedule cleared. The
+delivered message spells the card's own declaration out. Re-arming from a relative
+interval is measured from now, not from the missed date, so a daemon outage cannot queue
+a catch-up storm.
 
 A card may also carry a `probe`: a one-line read-only shell command (≤ 400 chars) run
 with `$SHELL -c` in the card's project, `KEEP_PROBE=1`, and a `KEEP_PROBE_TIMEOUT_MS`
@@ -884,16 +899,17 @@ with `$SHELL -c` in the card's project, `KEEP_PROBE=1`, and a `KEEP_PROBE_TIMEOU
 asynchronously instead of spending a model session: exit 0 lands a `probe result`
 check-in and applies the on-pass action directly, and a non-zero exit or timeout
 escalates to the check recipe (the run is told what the probe saw) or, if the card has
-no recipe, lands the failure for Owner review. The same schedule is not re-probed more
-often than every ten minutes, and a card whose fingerprint changed while the probe ran
-keeps its status and schedule. Run one by hand with `keep probe <id>` — same execution
-semantics, no check-in, no daemon, exit 1 when it fails.
+no recipe, lands the failure for Owner review. An escalation opens a session on the card
+and its message begins with what the probe already saw (exit code and a 300-character
+output tail) so the recipe starts from the failure. The same schedule is not re-probed
+more often than every ten minutes, and a card whose fingerprint changed while the probe
+ran keeps its status and schedule. Run one by hand with `keep probe <id>` — same
+execution semantics, no check-in, no daemon, exit 1 when it fails.
 
 Cards that skip thread delivery entirely: anything with a `probe`, and any recurring
-(`check_on_pass: rearm`) recipe card. Both go straight to the daemon, because neither
-needs the scheduling thread's context and a thread cannot be relied on to re-arm an
-interval by hand. A card declaring `on-pass: done` that is delivered to a thread is told
-it may close the card itself with `--status done --clear-check-after`.
+(`check_on_pass: rearm`) recipe card. Both go straight to a session Keep opens, because
+neither needs the scheduling thread's context and a thread cannot be relied on to re-arm
+an interval by hand.
 
 Before delivering to a cold, large thread, Keep runs `/compact` and waits for its
 transcript marker or Claude Code's on-screen completion line and returned prompt.
@@ -1068,7 +1084,7 @@ Two invariants the code enforces:
   offsets; only `review-note` / `review-ack` promote them, so a crashed tick re-reads
   its evidence instead of silently skipping it.
 - A registered reviewer remains eligible in the `recent` state after more than an hour idle; the existing running and mid-turn guards still apply.
-- Log entries written by headless runs count as weak evidence, and cards with no non-reviewer, non-spawned linked session have their evidence score halved.
+- Log entries written by Keep's own headless generators count as weak evidence, and cards with no non-reviewer, non-spawned linked session have their evidence score halved.
 - Each tick includes at most one card per numeric-suffix-stripped title stem, leaving sibling cohort cards eligible for later ticks.
 - `KEEP_REVIEW_TICK_LIMIT` controls the per-tick candidate limit and defaults to 5.
 - `KEEP_REVIEW_CADENCE` chooses when the reviewer is woken. `events` (the default)

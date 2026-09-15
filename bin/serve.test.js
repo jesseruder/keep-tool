@@ -4592,6 +4592,67 @@ test('an internal launchEnv reaches the pane shell, and a request body can never
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('a check run goes to the card thread if one is open, and otherwise opens a session', async () => {
+  const { runCheckNow } = require('./serve.js');
+  const task = { id: 'some-card', fm: { title: 'card', check: 'confirm the recorder is green', check_after: '2020-01-01T00:00' }, body: '' };
+
+  const delivered = await runCheckNow('some-card', {
+    loadTask: () => task,
+    deliverCheckToThread: async () => ({ sessionId: 'thread-session', kind: 'codex' }),
+    open: () => assert.fail('a live thread is never bypassed'),
+  });
+  assert.deepEqual(delivered, { ok: true, delivered: 'thread', sessionId: 'thread-session', kind: 'codex' });
+
+  // No thread, a busy thread, or a deliverer that throws: all open a session instead.
+  for (const deliver of [
+    async () => null,
+    async () => ({ deferred: true, reason: 'linked thread is mid-turn' }),
+    async () => { throw new Error('host is restarting'); },
+  ]) {
+    const opens = [];
+    const opened = await runCheckNow('some-card', {
+      loadTask: () => task,
+      deliverCheckToThread: deliver,
+      open: async (body) => { opens.push(body); return { ok: true, sessionId: 'fresh-session', pane: 'pane-9' }; },
+    });
+    assert.deepEqual(opened, { ok: true, delivered: 'session', sessionId: 'fresh-session', pane: 'pane-9', kind: 'claude' });
+    assert.equal(opens.length, 1);
+    assert.equal(opens[0].taskId, 'some-card');
+    assert.equal(opens[0].fresh, true);
+    assert.match(opens[0].message, /confirm the recorder is green/);
+    require('./runs.js')._resetSchedulerState(); // the per-day cap is module state
+  }
+
+  await assert.rejects(runCheckNow('some-card', { loadTask: () => ({ id: 'some-card', fm: {} }) }),
+    /has no check recipe/);
+});
+
+test('a task run opens a session pointed at the card, not a copy of it', async () => {
+  const { runTaskNow, taskRunMessage } = require('./serve.js');
+  const opens = [];
+  const result = await runTaskNow('some-card', '  Rerun the seed sweep  ', {
+    loadTask: () => ({ id: 'some-card', fm: {} }),
+    open: async (body) => { opens.push(body); return { ok: true, sessionId: 'task-session', pane: 'pane-3' }; },
+  });
+  assert.deepEqual(result, { ok: true, sessionId: 'task-session', pane: 'pane-3' });
+  assert.equal(opens[0].taskId, 'some-card');
+  assert.equal(opens[0].fresh, true);
+  assert.equal(opens[0].message, '[keep] Work on card some-card: keep show some-card. Operator instructions: Rerun the seed sweep');
+
+  assert.equal(taskRunMessage('some-card'), '[keep] Work on card some-card: keep show some-card.');
+  assert.equal(taskRunMessage('some-card', '   '), '[keep] Work on card some-card: keep show some-card.');
+  // A pasted essay is clipped, never sent over the open-message limit.
+  const long = taskRunMessage('some-card', 'x'.repeat(5000));
+  assert.ok(long.length <= require('./keep.js').OPEN_MESSAGE_LIMIT, `message was ${long.length} chars`);
+  assert.ok(long.endsWith('…'));
+
+  // An unknown card is refused before anything is opened.
+  await assert.rejects(runTaskNow('gone', '', {
+    loadTask: () => { throw new (require('./keep.js').KeepError)('no such task gone'); },
+    open: async () => assert.fail('nothing is opened for a card that does not exist'),
+  }), /no such task gone/);
+});
+
 test('an internal launchMeta marks the pane, and a request body can never set one', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-launch-meta-'));
   try {

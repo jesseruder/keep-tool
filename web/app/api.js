@@ -5,7 +5,7 @@ const STATE_MUTATIONS = new Set([
   '/api/handoff-session', '/api/notifications', '/api/open', '/api/panes/spawn',
   '/api/portable-transfers', '/api/reopen-session', '/api/resolve-portable-transfer',
   '/api/restart-daemon', '/api/restart-session', '/api/review-queue', '/api/reviewtick',
-  '/api/run', '/api/send', '/api/setaside', '/api/stop', '/api/transfer-session',
+  '/api/run', '/api/send', '/api/setaside', '/api/transfer-session',
 ]);
 let stateAfterMutation = '';
 let observedMutationFence = '';
