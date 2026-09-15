@@ -141,6 +141,28 @@ test('same-inode rewrite at the same size is detected, with prior totals retaine
   fs.writeFileSync(f.file, JSON.stringify(claude('bbb', 20)) + '\n');
   assert.equal(f.collect().cards.a.calls, 2);
 });
+test('a fully read file with unchanged size and mtime is not reopened', t => {
+  const f = fixture(t); f.collect(); f.append(claude('one', 10));
+  assert.equal(f.collect().cards.a.calls, 1);
+  const openSync = fs.openSync; let opened = 0;
+  fs.openSync = (file, ...rest) => { if (file === f.file) opened++; return openSync(file, ...rest); };
+  t.after(() => { fs.openSync = openSync; });
+  assert.equal(f.collect().cards.a.calls, 1);
+  assert.equal(opened, 0);
+  const later = new Date(fs.statSync(f.file).mtimeMs + 5000);
+  fs.utimesSync(f.file, later, later);
+  f.collect();
+  assert.equal(opened, 1, 'a changed mtime re-checks the anchor');
+});
+test('collect attributes from a supplied owners snapshot without reading owners.json', t => {
+  const f = fixture(t);
+  assert.equal(usage.initialize(f.root, () => f.tasks, start), true);
+  assert.equal(usage.initialize(f.root, () => { throw new Error('cards loaded'); }, start), false);
+  f.append(claude('one', 10));
+  fs.writeFileSync(path.join(f.root, '.keep/card-usage/owners.json'), 'corrupt');
+  const owners = { 'claude:s': [{ at: start, card: 'b' }] };
+  assert.equal(usage.collect(f.root, [], { now: start, files: f.files, owners }).cards.b.calls, 1);
+});
 test('a record larger than the pass budget makes forward progress', t => {
   const f = fixture(t); f.collect(); f.append(claude('large', 10), claude('next', 20));
   assert.equal(f.collect({ budget: 10 }).cards.a.calls, 2);

@@ -183,25 +183,33 @@ function anchor(file, offset) {
   try { fs.readSync(fd, buf, 0, size, offset - size); } finally { fs.closeSync(fd); }
   return digest(buf);
 }
+// The only step that reads cards or writes owners.json, so the only one that needs
+// Keep's lock. `tasks` may be a function, loaded only when a ledger must be created.
+function initialize(root, tasks, now = Date.now()) {
+  const file = path.join(dir(root), 'ledger.json');
+  if (fs.existsSync(file)) return false;
+  if (fs.existsSync(path.join(dir(root), 'summary.json')) || fs.existsSync(path.join(dir(root), 'initialized.json'))) {
+    throw new Error('card usage ledger is missing; restore it from backup instead of resetting totals');
+  }
+  const ownersFile = path.join(dir(root), 'owners.json');
+  const owners = read(ownersFile, {});
+  const ledger = { version: 1, since: now, cursors: {}, sessions: {}, facts: {}, excluded: {}, issues: {} };
+  // Baseline existing links once. Never use today's link to rewrite history.
+  for (const t of typeof tasks === 'function' ? tasks() : tasks) for (const s of t.fm.sessions || []) {
+    const id = key(s.agent, s.id);
+    if (!owners[id]) owners[id] = [{ at: now, card: t.id }];
+  }
+  write(ownersFile, owners);
+  write(file, ledger); // durable cutoff before scanning; crash can't move it
+  return true;
+}
 function collect(root, tasks, options = {}) {
   const file = path.join(dir(root), 'ledger.json');
   const now = options.now ?? Date.now();
-  let ledger = read(file, null);
-  const ownersFile = path.join(dir(root), 'owners.json');
-  const owners = read(ownersFile, {});
-  if (!ledger) {
-    if (fs.existsSync(path.join(dir(root), 'summary.json')) || fs.existsSync(path.join(dir(root), 'initialized.json'))) {
-      throw new Error('card usage ledger is missing; restore it from backup instead of resetting totals');
-    }
-    ledger = { version: 1, since: now, cursors: {}, sessions: {}, facts: {}, excluded: {}, issues: {} };
-    // Baseline existing links once. Never use today's link to rewrite history.
-    for (const t of tasks) for (const s of t.fm.sessions || []) {
-      const id = key(s.agent, s.id);
-      if (!owners[id]) owners[id] = [{ at: now, card: t.id }];
-    }
-    write(ownersFile, owners);
-    write(file, ledger); // durable cutoff before scanning; crash can't move it
-  }
+  initialize(root, tasks, now);
+  const ledger = read(file, null);
+  if (!ledger) throw new Error('card usage ledger is missing; restore it from backup instead of resetting totals');
+  const owners = options.owners || read(path.join(dir(root), 'owners.json'), {});
   if (ledger.version !== 1) throw new Error('unsupported card usage ledger version');
   if (!fs.existsSync(path.join(dir(root), 'initialized.json'))) write(path.join(dir(root), 'initialized.json'), { since: ledger.since });
   ledger.excluded ||= {};
@@ -218,11 +226,17 @@ function collect(root, tasks, options = {}) {
     try { stat = fs.statSync(source.file); } catch (e) { if (e.code === 'ENOENT') continue; throw e; }
     let c = ledger.cursors[source.file];
     if (!c && stat.mtimeMs < ledger.since) continue;
-    const rewritten = c?.anchor && c.offset <= stat.size && anchor(source.file, c.offset) !== c.anchor;
     const authorityChanged = c?.accountBlocked && accountAllows(c, authority);
+    // A fully read file with the same inode, size and mtime cannot have been rewritten;
+    // skipping its anchor read avoids reopening thousands of idle transcripts each pass.
+    if (c && !authorityChanged && c.ino === String(stat.ino) && c.offset === stat.size
+      && c.size === stat.size && c.mtimeMs === stat.mtimeMs) continue;
+    const rewritten = c?.anchor && c.offset <= stat.size && anchor(source.file, c.offset) !== c.anchor;
     if (!c || c.ino !== String(stat.ino) || c.offset > stat.size || rewritten || authorityChanged) {
       c = ledger.cursors[source.file] = { ...source, ino: String(stat.ino), offset: 0 };
     }
+    c.size = stat.size;
+    c.mtimeMs = stat.mtimeMs;
     if (c.offset === stat.size) continue;
     if (budget <= 0) { pending = true; backlog = true; continue; }
     let size = Math.min(stat.size - c.offset, budget);
@@ -294,9 +308,17 @@ function forCard(summary, id) {
   return { since: summary.since, updatedAt: summary.updatedAt, pending: summary.pending, issues: summary.issues,
     ...(Object.hasOwn(summary.cards, id) ? summary.cards[id] : { ...empty(), calls: 0, models: {} }) };
 }
-module.exports = { recordOwner, ownerAt, normalize, fold, collect, snapshot, forCard, summarize, discover };
+module.exports = { recordOwner, ownerAt, normalize, fold, initialize, collect, snapshot, forCard, summarize, discover };
 if (require.main === module) {
   const keep = require('./keep.js');
-  try { keep.withLock(() => collect(keep.ROOT, keep.loadAll(true))); }
+  // Hold Keep's lock only to seed and snapshot owners. The scan reads transcripts and
+  // writes card-usage's own files for seconds; under the lock it starved every command.
+  try {
+    const owners = keep.withLock(() => {
+      initialize(keep.ROOT, () => keep.loadAll(true));
+      return read(path.join(dir(keep.ROOT), 'owners.json'), {});
+    });
+    collect(keep.ROOT, [], { owners });
+  }
   catch (e) { process.stderr.write(`card usage: ${e.message}\n`); process.exitCode = 1; }
 }
