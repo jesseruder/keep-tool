@@ -3961,6 +3961,8 @@ const FALLBACK_TICK_MS = parseInt(process.env.KEEP_REVIEW_FALLBACK_TICK_MIN || '
 const SWEEP_RETRY_MS = 10 * 60e3;
 const DEFAULT_SWEEP_CLOCK = { hour: 7, minute: 45, invalid: false };
 const MAX_DRIFT_TURN_KEYS = 200;
+const MAX_PENDING_DRIFTS = 20;
+const DRIFT_PENDING_TTL_MS = 2 * 3600e3;
 const DRIFT_SESSION_TTL_MS = 24 * 3600e3;
 const REVIEW_COMPACT_MIN_TOKENS = parseInt(process.env.KEEP_REVIEW_COMPACT_TOKENS || '200000', 10);
 const REVIEW_COMPACT_IDLE_MS = 2 * 60e3;
@@ -4102,6 +4104,44 @@ function driftGate(meta, detail, now = Date.now(), gapMs = DRIFT_GAP_MS) {
     lastAt: Number(sessions[detail.sessionId]),
     now,
   };
+}
+
+// A drift that lands while the reviewer is mid-turn, over budget or not yet running
+// is the most valuable wake there is, and dropping it loses the fleet's one real
+// signal to timing. Park it instead, one row per session, and retry from the
+// per-minute checker. Only reasons about the REVIEWER's availability are parked:
+// "already sent for this turn" and the per-session gap are deliberate answers.
+const DRIFT_RETRYABLE_RE = /mid-turn|unavailable|budget|no live reviewer|has exited/;
+
+function driftRetryable(why) {
+  return DRIFT_RETRYABLE_RE.test(String(why || ''));
+}
+
+function recordPendingDrift(meta, detail, now = Date.now(), why = '') {
+  const state = meta.drift = meta.drift && typeof meta.drift === 'object' ? meta.drift : {};
+  const rows = Array.isArray(state.pending) ? state.pending : [];
+  const prior = rows.find((row) => row && row.sessionId === detail.sessionId && row.turn === detail.turn);
+  const kept = rows.filter((row) => row && row.sessionId !== detail.sessionId);
+  // The original arrival time survives a retry, so a reviewer that stays busy cannot
+  // keep a stale drift alive past its two hours.
+  kept.push({ ...detail, at: prior && Number.isFinite(Number(prior.at)) ? Number(prior.at) : now, why: String(why).slice(0, 200) });
+  state.pending = kept.slice(-MAX_PENDING_DRIFTS);
+  return meta;
+}
+
+function clearPendingDrift(meta, sessionId) {
+  const state = meta && meta.drift;
+  if (!state || !Array.isArray(state.pending)) return meta;
+  state.pending = state.pending.filter((row) => row && row.sessionId !== sessionId);
+  return meta;
+}
+
+// Parked drifts still worth sending. Anything older than the TTL is stale advice
+// about a turn the session has long since moved past.
+function duePendingDrifts(meta, now = Date.now(), ttlMs = DRIFT_PENDING_TTL_MS) {
+  const pending = ((meta && meta.drift) || {}).pending;
+  if (!Array.isArray(pending)) return [];
+  return pending.filter((row) => row && Number.isFinite(Number(row.at)) && now - Number(row.at) < ttlMs);
 }
 
 function recordDriftWake(meta, detail, now = Date.now()) {
@@ -4270,8 +4310,15 @@ async function reviewTick(deps, opts) {
   // would kill the server; the residual race only affects lastSkip/lastTickAt.
   if (!decision.send) {
     // recorded so review-stats can tell "quiet fleet" from "dead scheduler"
-    try { const fresh = loadMeta(); fresh.lastSkip = { at: now, why: decision.why, trigger }; saveMeta(fresh); } catch {}
-    return { sent: false, why: decision.why, budget, model, ranked: queue.ranked.length, trigger };
+    const parked = Boolean(detail) && driftRetryable(decision.why);
+    try {
+      const fresh = loadMeta();
+      fresh.lastSkip = { at: now, why: decision.why, trigger };
+      if (parked) recordPendingDrift(fresh, detail, now, decision.why);
+      else if (detail) clearPendingDrift(fresh, detail.sessionId);
+      saveMeta(fresh);
+    } catch {}
+    return { sent: false, why: decision.why, budget, model, ranked: queue.ranked.length, trigger, parked };
   }
 
   const text = detail
@@ -4300,12 +4347,15 @@ async function reviewTick(deps, opts) {
   if (detail) {
     bumpDay(fresh, 'driftWakes');
     recordDriftWake(fresh, detail, now);
+    clearPendingDrift(fresh, detail.sessionId);
   }
   if (trigger === 'sweep') fresh.sweepTick = { ...(fresh.sweepTick || {}), day: localDay(now), lastSentAt: now };
   saveMeta(fresh);
-  // A drift wake carries no sweep clause, so it must not consume the day's sweep.
-  if (queue.sweepDue && !detail) markFleetSweep();
-  return { sent: true, sessionId: reviewer.id, model, text, ranked: queue.ranked.length, trigger };
+  // Only a message that actually carried the sweep clause consumes the day's sweep.
+  // A drift wake never carries it, and an early fallback tick must not burn it either.
+  const carriedSweep = queue.sweepDue && !detail && text.includes('cross-workstream fleet sweep');
+  if (carriedSweep) markFleetSweep();
+  return { sent: true, sessionId: reviewer.id, model, text, ranked: queue.ranked.length, trigger, carriedSweep };
 }
 
 // The watcher saw an agent drift from its card. That is exactly the judgment the
@@ -4409,8 +4459,19 @@ async function reviewerCompactTick(deps) {
 // Health bookkeeping for one tick, shared by the scheduler and the forced tick behind
 // `keep review-tick`: a manual wake that reaches the pane is the same proof of the
 // injection path as a scheduled one, so it clears a failing streak the same way.
+// The cadence silence detection has to measure against. In events mode the reviewer
+// legitimately hears nothing for hours, so the 10-minute default in health.CADENCES
+// would read every quiet afternoon as a dead scheduler; the fallback interval is the
+// longest the reviewer may go without SOMETHING being evaluated.
+function reviewCadenceMs() {
+  return cadenceMode() === 'clock' ? TICK_MS : FALLBACK_TICK_MS;
+}
+
 function recordTickOutcome(result, record = health.record) {
-  record('review', { ok: true, skipped: !result.sent, detail: result.sent ? `sent ${result.ranked} cards` : 'nothing due' });
+  record('review', {
+    ok: true, skipped: !result.sent, cadenceMs: reviewCadenceMs(),
+    detail: result.sent ? `sent ${result.ranked} cards` : 'nothing due',
+  });
   if (result.sent) process.stderr.write('keep review: woke reviewer ' + result.sessionId + ' for ' + result.ranked + ' card(s)\n');
   else if (result.why && !/nothing ranked|last tick|no live reviewer/.test(result.why)) {
     process.stderr.write('keep review: no tick (' + result.why + ')\n');
@@ -4420,8 +4481,8 @@ function recordTickOutcome(result, record = health.record) {
 function recordTickError(e, record = health.record) {
   // Another sender holding the injection lock is a skip, not a failure; a modal or
   // an unresolvable pane is the real thing and must count.
-  if (/injection is busy/i.test(String(e && e.message || e))) record('review', { ok: true, skipped: true, detail: 'injection busy' });
-  else record('review', { ok: false, error: e });
+  if (/injection is busy/i.test(String(e && e.message || e))) record('review', { ok: true, skipped: true, cadenceMs: reviewCadenceMs(), detail: 'injection busy' });
+  else record('review', { ok: false, cadenceMs: reviewCadenceMs(), error: e });
   process.stderr.write('keep review: tick failed: ' + (e && e.message || e) + '\n');
 }
 
@@ -4434,10 +4495,82 @@ function recordSweepAttempt(now, sent) {
   } catch {}
 }
 
+// KEEP_WATCHER=1 says the watcher tick is enabled, not that it works: a broken model,
+// an empty turn index or a crashed helper all produce no verdicts at all, and keying
+// the fallback on the switch would leave the reviewer with nothing but the daily
+// sweep. Ask the index what it has actually recorded instead.
+function latestVerdictAt(deps = {}) {
+  if (typeof deps.lastVerdictAt === 'function') return Number(deps.lastVerdictAt()) || 0;
+  try {
+    const [row] = require('./turn-watcher.js').listVerdicts({ limit: 1 });
+    return row ? Number(row.verdict_at) || 0 : 0;
+  } catch { return 0; }
+}
+
+function fallbackDecision({ lastVerdictAt, lastTickAt, now, windowMs = FALLBACK_TICK_MS }) {
+  const verdictAt = Number(lastVerdictAt);
+  if (Number.isFinite(verdictAt) && verdictAt > 0 && now - verdictAt < windowMs) {
+    return { send: false, why: 'watcher active' };
+  }
+  const tickAt = Number(lastTickAt);
+  if (Number.isFinite(tickAt) && tickAt > 0 && now - tickAt < windowMs) {
+    return { send: false, why: 'last tick is inside the fallback window' };
+  }
+  return { send: true, why: 'watcher silent' };
+}
+
+async function fallbackIfSilent(deps, now = Date.now()) {
+  const decision = fallbackDecision({
+    lastVerdictAt: latestVerdictAt(deps), lastTickAt: loadMeta().lastTickAt, now,
+  });
+  if (!decision.send) {
+    health.record('review', { ok: true, skipped: true, cadenceMs: reviewCadenceMs(), detail: decision.why });
+    return { sent: false, why: decision.why };
+  }
+  const result = await reviewTick(deps, { trigger: 'fallback' });
+  recordTickOutcome(result);
+  return result;
+}
+
+async function sweepIfDue(deps, clock, now = Date.now()) {
+  if (!sweepTickDue(loadMeta(), now, clock)) return false;
+  try {
+    const result = await reviewTick(deps, { trigger: 'sweep', sweepDue: true });
+    recordSweepAttempt(now, result.sent);
+    recordTickOutcome(result);
+  } catch (error) {
+    recordSweepAttempt(now, false);
+    recordTickError(error);
+  }
+  return true;
+}
+
+// Drifts parked while the reviewer was busy. At most three a minute, oldest first, so
+// a reviewer coming back from an hour of work is not handed twenty messages at once.
+async function retryPendingDrifts(deps, now = Date.now()) {
+  const pending = duePendingDrifts(loadMeta(), now).sort((a, b) => Number(a.at) - Number(b.at));
+  const expired = ((loadMeta().drift || {}).pending || []).length - pending.length;
+  if (expired > 0) {
+    try { const meta = loadMeta(); meta.drift.pending = duePendingDrifts(meta, now); saveMeta(meta); } catch {}
+  }
+  const sent = [];
+  for (const row of pending.slice(0, 3)) {
+    const result = await reviewTick(deps, { trigger: 'drift', drift: row });
+    recordTickOutcome(result);
+    if (result.sent) sent.push(row.sessionId);
+    else if (!result.parked) {
+      // A refusal that is not about availability (already sent, inside the gap) is a
+      // real answer about this drift; it will not become sendable by waiting.
+      try { const meta = loadMeta(); clearPendingDrift(meta, row.sessionId); saveMeta(meta); } catch {}
+    }
+  }
+  return sent;
+}
+
 function startScheduler(deps) {
   const mode = cadenceMode();
   const clock = sweepClock();
-  const watcherLive = process.env.KEEP_WATCHER === '1';
+  const effective = clock.invalid ? DEFAULT_SWEEP_CLOCK : clock;
   const run = (options) => {
     reviewTick(deps, options).then(recordTickOutcome).catch(recordTickError);
   };
@@ -4446,34 +4579,23 @@ function startScheduler(deps) {
     setInterval(run, TICK_MS).unref();
     setTimeout(run, 45e3).unref(); // first pass shortly after boot, after runs.js
   } else {
-    // Without the watcher there is no drift signal at all, so the reviewer would
-    // only ever hear from the daily sweep. Keep a slow clock under it.
-    process.stderr.write(`keep review: cadence events - drift wakes plus the daily sweep at ${String(clock.hour).padStart(2, '0')}:${String(clock.minute).padStart(2, '0')}`
-      + (clock.invalid ? ' (invalid KEEP_REVIEW_SWEEP_AT; using the default)' : '')
-      + (watcherLive ? '' : `; KEEP_WATCHER is not 1, so a fallback tick runs every ${Math.round(FALLBACK_TICK_MS / 60e3)} min`) + '\n');
-    let sweeping = false;
-    const sweep = async () => {
-      if (sweeping) return;
-      const now = Date.now();
-      if (!sweepTickDue(loadMeta(), now, clock)) {
-        // health.record treats a skip as a heartbeat: it moves lastRunAt so the row
-        // does not read as a silent scheduler, without clearing a failing streak.
-        health.record('review', { ok: true, skipped: true, detail: 'events cadence; no sweep due' });
-        return;
-      }
-      sweeping = true;
+    process.stderr.write('keep review: cadence events - drift wakes plus the daily sweep at '
+      + `${String(effective.hour).padStart(2, '0')}:${String(effective.minute).padStart(2, '0')}`
+      + (clock.invalid ? ` (KEEP_REVIEW_SWEEP_AT=${JSON.stringify(clock.configured)} is unusable; using the default)` : '')
+      + `; a fallback tick runs when the watcher has produced no verdict for ${Math.round(FALLBACK_TICK_MS / 60e3)} min\n`);
+    let running = false;
+    const minute = async () => {
+      if (running) return;
+      running = true;
       try {
-        const result = await reviewTick(deps, { trigger: 'sweep', sweepDue: true });
-        recordSweepAttempt(now, result.sent);
-        recordTickOutcome(result);
-      } catch (error) {
-        recordSweepAttempt(now, false);
-        recordTickError(error);
-      } finally { sweeping = false; }
+        await retryPendingDrifts(deps);
+        if (await sweepIfDue(deps, clock)) return;
+        await fallbackIfSilent(deps);
+      } catch (error) { recordTickError(error); }
+      finally { running = false; }
     };
-    setInterval(() => { void sweep(); }, 60e3).unref();
-    setTimeout(() => { void sweep(); }, 45e3).unref();
-    if (!watcherLive) setInterval(run, FALLBACK_TICK_MS).unref();
+    setInterval(() => { void minute(); }, 60e3).unref();
+    setTimeout(() => { void minute(); }, 45e3).unref();
   }
   let compactInFlight = false;
   const compact = () => {
@@ -4626,6 +4748,18 @@ module.exports = {
   nextSweepAt,
   driftGate,
   recordDriftWake,
+  recordPendingDrift,
+  clearPendingDrift,
+  duePendingDrifts,
+  driftRetryable,
+  retryPendingDrifts,
+  latestVerdictAt,
+  fallbackDecision,
+  fallbackIfSilent,
+  sweepIfDue,
+  reviewCadenceMs,
+  DRIFT_PENDING_TTL_MS,
+  MAX_PENDING_DRIFTS,
   driftWake,
   DRIFT_GAP_MS,
   FALLBACK_TICK_MS,

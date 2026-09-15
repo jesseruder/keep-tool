@@ -846,9 +846,16 @@ Two invariants the code enforces:
   and is sent at most once per turn (the last 200 turn keys live in
   `.keep/review/_meta.json`, so a daemon restart cannot repeat one). The daily sweep
   runs at local `KEEP_REVIEW_SWEEP_AT` (default `07:45`, after the ideas sweep), carries
-  the ranked queue plus the sweep clause, and retries every 10 minutes until noon. With
-  `KEEP_WATCHER` off there is no drift signal, so a fallback tick runs every
-  `KEEP_REVIEW_FALLBACK_TICK_MIN` (default 120) minutes; the daemon logs the active mode
+  the ranked queue plus the sweep clause, and retries every 10 minutes until noon. A
+  drift that arrives while the reviewer is mid-turn, over budget or not yet running is
+  parked in `.keep/review/_meta.json` (one per session, 20 at most) and retried from the
+  per-minute checker until it is sent or two hours old — a refusal about the drift
+  itself, such as the per-turn dedupe, is not retried. A fallback tick covers a watcher
+  that records nothing: `KEEP_WATCHER=1` says the tick is enabled, not that its model
+  works, so the fallback asks the turn index for the newest `verdict_at` and sends only
+  when no verdict and no tick has landed within `KEEP_REVIEW_FALLBACK_TICK_MIN`
+  (default 120) minutes. That interval is also the `review` row's health cadence in
+  events mode, so a genuinely silent reviewer still goes red. The daemon logs the active mode
   and why at startup. An unparseable `KEEP_REVIEW_SWEEP_AT`, or one at or after 12:00
   (the retry window closes at noon), falls back to `07:45` and warns rather than removing
   the sweep. `POST /api/reviewtick` and `keep review-tick --force` work in both

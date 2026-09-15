@@ -3133,3 +3133,99 @@ test('a stale lint snapshot, or one older than the card, refuses nothing', () =>
     assert.equal(lintCoverage(note, snapshot, now - 5 * 60e3), null, 'a check-in newer than lint does not');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('a drift that arrives while the reviewer is busy is parked and retried', async () => {
+  const cadence = require('./review.js');
+  let reviewer = { id: 'reviewer-1', state: 'idle', endedTurn: false };
+  const sent = [];
+  const deps = {
+    sessions: () => [],
+    findReviewer: () => reviewer,
+    reviewBudget: () => ({ code: 0, reason: 'within budget' }),
+    send: async (sessionId, text) => { sent.push(text); },
+  };
+  const event = { sessionId: 'sess-busy', turn: 3, cardId: 'busy-card', stateLine: 'off the card', reason: 'scope' };
+
+  const refused = await cadence.driftWake(deps, event);
+  assert.equal(refused.sent, false);
+  assert.match(refused.why, /mid-turn/);
+  assert.equal(refused.parked, true, 'a mid-turn reviewer is a timing problem, not an answer');
+  assert.equal(cadence.duePendingDrifts(cadence.loadMeta()).length, 1);
+  assert.equal(sent.length, 0);
+
+  // Still busy: it stays parked, and its arrival time is not refreshed.
+  const parkedAt = cadence.duePendingDrifts(cadence.loadMeta())[0].at;
+  assert.deepEqual(await cadence.retryPendingDrifts(deps), []);
+  assert.equal(cadence.duePendingDrifts(cadence.loadMeta())[0].at, parkedAt, 'a busy reviewer cannot keep a stale drift alive');
+
+  // The reviewer finishes its turn: the parked drift goes out and is cleared.
+  reviewer = { id: 'reviewer-1', state: 'idle', endedTurn: true };
+  assert.deepEqual(await cadence.retryPendingDrifts(deps), ['sess-busy']);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /drift on busy-card/);
+  assert.deepEqual(cadence.duePendingDrifts(cadence.loadMeta()), [], 'a sent drift is no longer pending');
+
+  // A parked drift older than the TTL is stale advice about a turn long since past.
+  const old = cadence.recordPendingDrift({}, event, Date.now() - 3 * 3600e3, 'reviewer is mid-turn');
+  assert.deepEqual(cadence.duePendingDrifts(old), []);
+  assert.equal(old.drift.pending.length, 1, 'the row is still there, it is just not due');
+
+  // One row per session, bounded.
+  let meta = {};
+  for (let i = 0; i < cadence.MAX_PENDING_DRIFTS + 10; i += 1) {
+    meta = cadence.recordPendingDrift(meta, { sessionId: `s-${i}`, turn: 1 }, Date.now(), 'reviewer is mid-turn');
+  }
+  assert.equal(meta.drift.pending.length, cadence.MAX_PENDING_DRIFTS);
+  meta = cadence.recordPendingDrift(meta, { sessionId: 's-1', turn: 9 }, Date.now(), 'reviewer is mid-turn');
+  assert.equal(meta.drift.pending.filter((row) => row.sessionId === 's-1').length, 1);
+
+  // A refusal that is an answer about this drift, not about the reviewer, is not parked.
+  assert.equal(cadence.driftRetryable('reviewer is mid-turn'), true);
+  assert.equal(cadence.driftRetryable('budget: weekly exhausted'), true);
+  assert.equal(cadence.driftRetryable('no live reviewer session registered'), true);
+  assert.equal(cadence.driftRetryable('drift already sent for this turn'), false);
+  assert.equal(cadence.driftRetryable('drift gap: last drift wake for this session 5 min ago'), false);
+});
+
+test('the fallback tick asks whether the watcher is producing verdicts, not whether it is on', () => {
+  const { fallbackDecision, latestVerdictAt, FALLBACK_TICK_MS } = require('./review.js');
+  const now = Date.parse('2026-09-14T12:00:00Z');
+
+  // A watcher that is enabled but broken records no verdicts at all; that is exactly
+  // when the reviewer most needs the fallback, and keying on KEEP_WATCHER missed it.
+  assert.deepEqual(fallbackDecision({ lastVerdictAt: 0, lastTickAt: 0, now }), { send: true, why: 'watcher silent' });
+  assert.deepEqual(fallbackDecision({ lastVerdictAt: now - 5 * 3600e3, lastTickAt: 0, now }), { send: true, why: 'watcher silent' });
+  assert.deepEqual(fallbackDecision({ lastVerdictAt: now - 30 * 60e3, lastTickAt: 0, now }), { send: false, why: 'watcher active' });
+  assert.equal(fallbackDecision({ lastVerdictAt: now - FALLBACK_TICK_MS + 1, lastTickAt: 0, now }).send, false);
+  assert.equal(fallbackDecision({ lastVerdictAt: now - FALLBACK_TICK_MS - 1, lastTickAt: 0, now }).send, true);
+
+  // And a tick that already went out inside the window is itself proof of life.
+  assert.match(fallbackDecision({ lastVerdictAt: 0, lastTickAt: now - 30 * 60e3, now }).why, /inside the fallback window/);
+
+  assert.equal(latestVerdictAt({ lastVerdictAt: () => 1234 }), 1234);
+  assert.equal(latestVerdictAt({ lastVerdictAt: () => null }), 0);
+  assert.equal(typeof latestVerdictAt({}), 'number', 'a missing or unreadable index is silence, not a crash');
+});
+
+test('a silent reviewer in events mode still goes red, at the cadence it actually runs', () => {
+  const cadence = require('./review.js');
+  const health = require('./health.js');
+  assert.equal(cadence.reviewCadenceMs(), cadence.FALLBACK_TICK_MS, 'events mode measures against the fallback interval');
+
+  // The row records the cadence it really runs at, so silence detection matches it.
+  const recorded = [];
+  cadence.recordTickOutcome({ sent: false, why: 'nothing ranked' }, (name, options) => recorded.push({ name, ...options }));
+  assert.equal(recorded[0].cadenceMs, cadence.FALLBACK_TICK_MS);
+  cadence.recordTickError(new Error('pane is gone'), (name, options) => recorded.push({ name, ...options }));
+  assert.equal(recorded[1].cadenceMs, cadence.FALLBACK_TICK_MS);
+
+  const now = Date.parse('2026-09-14T12:00:00Z');
+  const row = (lastRunAt) => ({
+    name: 'review', cadenceMs: cadence.FALLBACK_TICK_MS,
+    daemonStartedAt: now - 24 * 3600e3, lastRunAt, lastOkAt: lastRunAt,
+  });
+  assert.equal(health.stateOf(row(now - 60e3), now), 'ok');
+  assert.equal(health.stateOf(row(now - 3 * 3600e3), now), 'ok', 'one fallback interval of quiet is normal');
+  assert.equal(health.stateOf(row(now - 8 * 3600e3), now), 'silent', 'but a reviewer nothing has evaluated all day is not');
+  assert.equal(health.stateOf({ ...row(now - 60e3), consecutiveFailures: 3 }, now), 'failing');
+});
