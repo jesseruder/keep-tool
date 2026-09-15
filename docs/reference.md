@@ -178,10 +178,16 @@ status, schedule, activity timestamp, and body are preserved.
 `keep setup hooks` merges Keep's six hook commands — `session-start`,
 `session-end`, `stop`, `notification`, `pre-bash`, `post-bash` — into
 `~/.claude/settings.json` and into the `settings.json` of every managed Claude
-account from the accounts configuration, printing one line per account. A managed
-account whose settings file is a symlink to the source already carries them and is
-left byte-for-byte alone; a file it does change is backed up first. `--account <id>`
-limits the run to one account and skips the shared skill links. Codex accounts keep
+account from the accounts configuration, printing one line per account. Every
+account's settings file is parsed before any of them is written, so an unreadable one
+names its account and stops the run rather than leaving the fan-out half done. A
+Keep hook command for the same action under a different spelling — an older checkout
+path, a moved `KEEP_CONFIG` — is rewritten in place rather than left beside the new
+one. A managed account whose settings file is a symlink to the source already carries
+the hooks and is left byte-for-byte alone; a file it does change is backed up first.
+`--account <id>` limits the run to one account and skips the shared skill links; it
+accepts any Claude account id, including one whose config directory is the default
+`~/.claude`. Codex accounts keep
 their own version-dependent adapters and are never touched. `keep doctor` reports
 the hooks each account is missing, with `keep setup hooks` as the fix: an account
 without them has no restart guard and no raw-resume guard. For the same reason, an
@@ -580,11 +586,22 @@ A cited sha that never reaches the default branch is matched by patch. `wt land`
 rebases a worktree branch onto `origin/<default>` before pushing, so the sha a
 check-in cites is not the sha that lands. When the cited commit is still in the
 repository's object store, the sweep compares its `git patch-id --stable` against the
-default branch's commits from a day before the check-in (at most 300), and on a match
-records the landed sha with the cited one as an alias — the check-in then reads
-`cited <cited> landed as <landed> (same patch)`, and either spelling resolves the
-citation. Merges and empty commits have no single patch and are never matched, and
-the comparison is skipped entirely when the fetch failed.
+default branch's commits, and on a match records the landed sha with the cited one as
+an alias — the check-in then reads `cited <cited> landed as <landed> (same patch)`,
+and either spelling resolves the citation. A citation matches only a commit that
+reached the branch **no more than a day before the check-in that cites it**: an
+identical diff further back is older work, not this card's commit under a new sha.
+The patch-id index is built once per repository per sweep, from the oldest window any
+of that sweep's citations needs and at most 300 commits, and every lookup is filtered
+by the citing check-in's own window. Merges and empty commits have no single patch and
+are never matched, the comparison is skipped entirely when the fetch failed, and an
+unmatched citation is retried every six hours and given up on a week after its
+check-in; what has been tried, and what matched, is remembered per card under
+`.keep/landed/<id>.json` so no sweep derives the same patch-id twice.
+
+Patch-id cannot see a revert: a patch that landed and was then reverted still counts
+as landed, so a card closed on that evidence while a revert is in flight has to be
+reopened by hand.
 
 ## Reviewed commits and the implicit land grant
 
