@@ -545,14 +545,16 @@ async function compactCodexFallback(session, target, instruction, deps = {}) {
   } catch (error) {
     result = { compacted: false, reason: String(error.message || error), via: fallback.model };
   }
+  const restorePreparation = prepareRestoreConfig(record, deps);
+  if (restorePreparation.ok) record = restorePreparation.record;
   record.phase = 'restore-pending';
   try { record = writeSwapRecord(file, record, deps); } catch {}
   const uncertain = !result.compacted && /timeout|in[ -]?progress|submitted|unconfirmed/i.test(String(result.reason || ''));
   if (uncertain) {
-    const prepared = prepareRestoreConfig(record, deps);
-    if (prepared.ok) repairPreparedConfig(prepared.record, deps);
+    if (restorePreparation.ok) repairPreparedConfig(record, deps);
     return restoreResult(result, 'model restore deferred until Codex is confirmed idle');
   }
+  if (!restorePreparation.ok) return restoreResult(result, restorePreparation.reason);
   const restored = await restoreTransaction(record, target, deps);
   if (!restored.restored) return restoreResult(result, restored.reason);
   return result;

@@ -192,6 +192,21 @@ test('fallback compaction switches to Sol once, compacts once, and restores Astr
   assert.deepEqual(config.features, { hooks: true });
 });
 
+test('original Astra medium restores an account default with a different effort', async (t) => {
+  const f = fixture(t, { originalEffort: 'medium' });
+  const ui = uiDriver(f.configFile, { currentEffort: 'medium' });
+  const result = await compact.compactCodexFallback(f.session, {}, null, common(f, ui, {
+    compactCurrentModel: async () => ({ compacted: true }),
+  }));
+  assert.equal(result.compacted, true);
+  assert.equal(result.restoreUnconfirmed, undefined);
+  assert.equal(fs.existsSync(path.join(f.dir, `${SID}.swap.json`)), false);
+  const config = toml.parse(fs.readFileSync(f.configFile, 'utf8'));
+  assert.equal(config.model, 'saved-default');
+  assert.equal(config.model_reasoning_effort, 'low');
+  assert.equal(ui.screen().includes('gpt-6-astra medium · Workspace'), true);
+});
+
 test('restores Astra max through the visible Advanced Reasoning submenu', async (t) => {
   const f = fixture(t, { originalEffort: 'max' });
   const ui = uiDriver(f.configFile, { currentEffort: 'max' });
