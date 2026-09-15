@@ -71,7 +71,6 @@ test('rapid switching routes typing to the last clicked session during updates',
 });
 test('Close disappears before slow response and stays hidden through stale updates', async ({ page }) => {
   fixture.configure({ closeDelay: 1800 });
-  await openActions(page.locator('#stage'));
   await page.locator('#stage [data-close-session]').click();
   await expect(page.locator('#qlist [data-key="running:a"]')).toHaveCount(0, { timeout: 100 });
   await expect(page.locator('#qlist [data-key="pinned:a"]')).toHaveCount(0);
@@ -87,7 +86,6 @@ test('Close disappears before slow response and stays hidden through stale updat
 });
 test('failed Close restores session and pin without stealing a newer selection', async ({ page }) => {
   fixture.configure({ closeDelay: 900, closeFails: true });
-  await openActions(page.locator('#stage'));
   await page.locator('#stage [data-close-session]').click();
   await expect(page.locator('#qlist [data-key="running:a"]')).toHaveCount(0, { timeout: 100 });
   await page.locator('#qlist [data-key="running:c"]').click();
@@ -109,7 +107,8 @@ test('renderer choice persists while the Actions menu survives polling and keybo
   const stage = page.locator('#stage');
   const menu = stage.locator('.session-actions');
   await expect(menu.locator('[data-pin]')).toHaveCount(1);
-  await expect(stage.locator('.acts > [data-close-session]')).toHaveCount(0);
+  await expect(stage.locator('.acts > .quick-actions > [data-close-session]')).toHaveCount(1);
+  await expect(menu.locator('[data-close-session], [data-dismiss], [data-snooze]')).toHaveCount(0);
 
   await menu.locator(':scope > summary').click();
   await expect(menu).toHaveAttribute('open', '');
@@ -289,7 +288,6 @@ test('pressed waiting row still opens that session after the request is answered
 
 test('closed process is not reported as close failure when unpinning fails', async ({ page }) => {
   fixture.configure({ closeDelay: 100, layoutFails: true });
-  await openActions(page.locator('#stage'));
   await page.locator('#stage [data-close-session]').click();
   await expect(page.locator('#toast')).toContainText('Session closed, but unpinning failed');
   await expect(page.locator('#qlist [data-key="running:a"]')).toHaveCount(0);

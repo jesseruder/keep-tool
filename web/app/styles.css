@@ -153,6 +153,7 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .shead .acts .btn { border-color: var(--line); color: var(--muted); }
 .shead .acts .btn:hover:not(:disabled) { border-color: var(--line); color: var(--text); }
 .shead .acts kbd { display: none; }
+.shead .acts .quick-actions { display: contents; }
 .account-label { color: var(--info); white-space: nowrap; }
 .account-controls { display: inline-flex; align-items: center; gap: 6px; position: relative; }
 .account-handoff { position: relative; }

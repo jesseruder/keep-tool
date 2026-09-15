@@ -94,7 +94,7 @@ test('a missing shell selection is not fabricated as an empty history row', () =
 
 test('Close follows Dismiss and acts immediately without a confirmation', () => {
   const triage = fs.readFileSync(path.join(__dirname, '../web/app/triage.js'), 'utf8');
-  const header = triage.split('\n').find((line) => line.includes('patchActionsMenu(ctx, menu'));
+  const header = triage.split('\n').find((line) => line.includes("querySelector('.quick-actions')"));
   assert.ok(header.indexOf('data-close-session') > header.indexOf('data-dismiss'));
   const close = fs.readFileSync(path.join(__dirname, '../web/app/close-session.js'), 'utf8');
   assert.doesNotMatch(close, /confirmAction|window.confirm/);
