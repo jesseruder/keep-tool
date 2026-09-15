@@ -593,6 +593,27 @@ function observationMessage(turn, observation) {
     + ` keep note ${project} --scope ${row.name} -m "<what is true now>" --for ${row.noteFor || '+2h'}`;
 }
 
+// How many observations one session may put in front of Owner in an hour. The
+// shared delivery windows bound what is *sent*; nothing bounded what was
+// *recorded*, so a session working through a declared resource all afternoon
+// could fill the grading queue with the same nudge. This turn's own row is not
+// counted, so re-judging a turn stays idempotent.
+const OBSERVATION_PER_SESSION_PER_HOUR = 3;
+
+function observationCap(turn, deps = {}) {
+  const decisions = deps.decisions || require('./decisions.js');
+  const now = Number.isFinite(deps.now) ? deps.now : Date.now();
+  let rows = [];
+  try { rows = decisions.loadSafe(); } catch { return null; }
+  const own = `${turn.session_id}#${turn.n}#${OBSERVATION_TYPE}`;
+  const recent = rows.filter((row) => row && row.type === OBSERVATION_TYPE
+    && row.session === turn.session_id && row.turn !== own
+    && Number(row.at || 0) >= now - HOUR_MS);
+  return recent.length >= OBSERVATION_PER_SESSION_PER_HOUR
+    ? `this session already had ${recent.length} resource observations in the last hour`
+    : null;
+}
+
 // Recorded whether or not anything is delivered: shadow mode is how this type
 // earns its way live, and Owner grades the exact text that would have been sent.
 // A distinct turn key from the verdict's `<sid>#<n>`, so the observation sits
@@ -631,13 +652,14 @@ async function maybeDeliverObservation(turn, observation, deps = {}) {
   const text = safeDeliveryText(observationMessage(turn, observation));
   if (!text || !text.startsWith(DELIVERY_PREFIX)) return skip('unsafe-text');
 
-  const decisionId = recordObservationDecision(turn, observation, text, deps);
-  const shadow = { decisionId, text };
-  if (!config.live[OBSERVATION_TYPE]) return skip(`${OBSERVATION_TYPE} is not live`, shadow);
-
+  // The gates that decide whether this turn could ever be nudged come before the
+  // shadow record, not after it. A decision Owner grades is a decision that
+  // would have been acted on; recording one for a reviewer session, or for a
+  // turn a carve-out already rules out, asks him to grade something that was
+  // never going to happen and drags the agreement rate with it.
   const session = deps.session;
   const notReady = sessionReady(session); // excludes the reviewer, among everything else
-  if (notReady) return skip(notReady, shadow);
+  if (notReady) return skip(notReady);
 
   const card = deps.card !== undefined ? deps.card : cardFor(turn, keepApi);
   const commands = deps.commands || turnCommands(turn, deps);
@@ -645,7 +667,14 @@ async function maybeDeliverObservation(turn, observation, deps = {}) {
     turn: { ...turn, assistantMessages: assistantMessages(turn, deps) },
     card, commands, watcher, keepApi,
   });
-  if (carved) return skip(carved, shadow);
+  if (carved) return skip(carved);
+
+  const capped = observationCap(turn, deps);
+  if (capped) return skip(capped);
+
+  const decisionId = recordObservationDecision(turn, observation, text, deps);
+  const shadow = { decisionId, text };
+  if (!config.live[OBSERVATION_TYPE]) return skip(`${OBSERVATION_TYPE} is not live`, shadow);
 
   const stale = freshness(turn, deps);
   if (stale) return skip(stale, shadow);
@@ -732,5 +761,6 @@ module.exports = {
   pausedCarveOut, riskyQuestionCarveOut, cardCarveOut, releaseCarveOut, chainCarveOut, carveOut,
   freshness, sessionReady, rateLimit, reserve, releaseReservation, confirmReservation, revalidate,
   turnCommands, markDelivered, maybeDeliver,
-  OBSERVATION_TYPE, observationMessage, recordObservationDecision, maybeDeliverObservation,
+  OBSERVATION_TYPE, OBSERVATION_PER_SESSION_PER_HOUR, observationMessage,
+  recordObservationDecision, observationCap, maybeDeliverObservation,
 };

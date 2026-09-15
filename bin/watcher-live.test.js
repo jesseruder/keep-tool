@@ -1362,6 +1362,71 @@ test('an observation is skipped when a verdict already reserved the turn', async
   assert.ok(result.decisionId, 'the shadow decision is still recorded for grading');
 });
 
+test('nothing is recorded for a turn the gates already rule out', async (t) => {
+  const dir = sandbox(t);
+  t.after(forgetDeclarations);
+  declare();
+  const turn = terraformTurn(dir);
+  const config = live.normalizeConfig({ live: { resource: true } });
+  const before = require('./decisions.js').loadSafe().length;
+
+  // A reviewer session, and a turn the release carve-out rules out. Neither
+  // would ever be nudged, so neither becomes something for Owner to grade.
+  const reviewer = await live.maybeDeliverObservation(turn, watcher.observationFor(turn), {
+    config, session: { ...READY_SESSION, reviewer: true }, card: ACTIVE_CARD, send: fakeSend(),
+  });
+  assert.equal(reviewer.decisionId, undefined);
+  const carved = await live.maybeDeliverObservation(turn, watcher.observationFor(turn), {
+    config, session: READY_SESSION, card: ACTIVE_CARD, send: fakeSend(),
+    commands: ['terraform apply', 'git push origin HEAD'],
+  });
+  assert.equal(carved.delivered, false);
+  assert.match(carved.reason, /commit or push/);
+  assert.equal(carved.decisionId, undefined);
+  assert.equal(require('./decisions.js').loadSafe().length, before, 'the ledger did not grow');
+});
+
+test('a session gets at most three resource observations an hour on the ledger', async (t) => {
+  const dir = sandbox(t);
+  t.after(forgetDeclarations);
+  declare();
+  indexTurn(dir);
+  const now = Date.now();
+  const fake = (n) => ({
+    id: `turn-${n}`, session_id: SESSION, n, project: '/tmp/live-project',
+    opener_kind: 'human', last_assistant: 'Applied it.', files: '[]', commits: '[]',
+  });
+  const observation = [{ name: 'staging', evidence: 'command terraform apply', noteFor: '+2h' }];
+  const run = (n) => live.maybeDeliverObservation(fake(n), observation, {
+    // Shadow: the record is the only thing under test here.
+    config: live.normalizeConfig({}), session: READY_SESSION, card: ACTIVE_CARD,
+    commands: [], now, send: fakeSend(),
+  });
+
+  const recorded = [];
+  for (let n = 1; n <= live.OBSERVATION_PER_SESSION_PER_HOUR; n += 1) {
+    const result = await run(n);
+    assert.ok(result.decisionId, `observation ${n} recorded`);
+    recorded.push(result.decisionId);
+  }
+  assert.equal(new Set(recorded).size, live.OBSERVATION_PER_SESSION_PER_HOUR);
+
+  const over = await run(live.OBSERVATION_PER_SESSION_PER_HOUR + 1);
+  assert.equal(over.decisionId, undefined);
+  assert.match(over.reason, /already had 3 resource observations in the last hour/);
+
+  // Re-judging a turn that is already on the ledger is not a fourth observation.
+  const again = await run(1);
+  assert.equal(again.decisionId, recorded[0], 'the same turn keeps its own row');
+
+  // An hour later there is room again.
+  const later = await live.maybeDeliverObservation(fake(9), observation, {
+    config: live.normalizeConfig({}), session: READY_SESSION, card: ACTIVE_CARD,
+    commands: [], now: now + live.HOUR_MS + 1, send: fakeSend(),
+  });
+  assert.ok(later.decisionId);
+});
+
 test('an observation never reaches the reviewer or a session that is not ready', async (t) => {
   const dir = sandbox(t);
   t.after(forgetDeclarations);

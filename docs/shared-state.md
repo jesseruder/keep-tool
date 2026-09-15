@@ -133,7 +133,15 @@ already claimed is skipped and says why.
 
 Off by default. In shadow mode it records a decision of type `resource` carrying the
 exact text that would have been sent, so it earns its way live on its own graded
-record like every other type: `keep watcher live resource` after 30 decisions at 90%.
+record like every other type: `keep watcher live resource` after 30 decisions at 90%
+**on the current judge prompt** — grades given on an older prompt still show in
+`keep decisions stats`, under their own hash, but do not graduate the new one.
+
+The record comes after the gates, not before them: a turn the reviewer check or a
+carve-out already rules out is never put in front of Owner to grade, because a
+decision he grades is one that would have been acted on. One session may add at
+most three resource observations to the ledger per hour, so an afternoon spent in
+one declared resource cannot fill the grading queue with the same sentence.
 
 The message:
 
