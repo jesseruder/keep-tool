@@ -192,7 +192,14 @@ See [scenario testing](session-scenarios.md) for seeds and failure replay.
 
 `keep lint` runs advisory daily hygiene checks including `malformed-card`, scope tags,
 review next steps, waiting triggers, uncited commits, stale active work, old done cards,
-duplicate titles, `tmp-artifact` citations, and `handoff-shadow` cards — a Codex worker's
+duplicate titles, `tmp-artifact` citations, `missing-project` (an open card whose project
+is empty or does not resolve to a directory), `landing-uncited` (status `landing` with no
+cited sha), `blocked-no-need` (status `blocked` with neither an open need nor a
+dependency), `daemon-health` (one finding for every scheduler in `.keep/health.json` with
+3+ consecutive failures or no successful run in 24h), `checkout-drift` (per project of an
+open card: a dirty tree or a branch ahead of/behind its upstream, from local refs with no
+fetch), `step-run-pending` (a gated step with landed commits its last run missed for over
+24h), and `handoff-shadow` cards — a Codex worker's
 card older than six hours with no check-ins, opened instead of checking in on the card
 its parent Claude session held. It always exits successfully when findings exist, writes the latest
 result to `.keep/lint.json`, and supports one-rule runs plus JSON output and fix hints.

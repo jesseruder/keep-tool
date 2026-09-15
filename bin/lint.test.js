@@ -89,6 +89,10 @@ test('lint finds every hygiene rule while leaving a clean card alone', () => {
     writeCard(root, 'missing-card', { title: 'No scope', tags: ['misc'], project: '/work/project' });
     writeCard(root, 'duplicate-a', { title: 'Same title!' });
     writeCard(root, 'duplicate-b', { title: 'same, title.' });
+    writeCard(root, 'landing-card', { title: 'On its way to origin', status: 'landing', project: repo });
+    writeCard(root, 'blocked-card', { title: 'Blocked on nothing', status: 'blocked', project: repo });
+    writeCard(root, 'no-project-card', { title: 'Open with no project', status: 'active' },
+      `## ${recent.replace('T', ' ')} — check-in\nWorking.\n`);
     writeCard(root, 'clean-card', { title: 'Clean unique card', check_after: new Date(now + 86400e3).toISOString().slice(0, 16) });
     fs.writeFileSync(path.join(root, 'tasks', 'broken.md'), 'not frontmatter\n');
 
@@ -97,11 +101,12 @@ test('lint finds every hygiene rule while leaving a clean card alone', () => {
     for (const rule of [
       'malformed-card', 'scope-mismatch', 'review-no-next', 'waiting-no-trigger', 'uncited-commits',
       'stale-active', 'done-not-archived', 'missing-scope', 'duplicate-title', 'tmp-artifact',
+      'missing-project', 'landing-uncited', 'blocked-no-need',
     ]) assert.ok(rules.has(rule), rule);
     assert.equal(result.findings.filter((item) => item.rule === 'duplicate-title').length, 2);
     assert.equal(result.findings.filter((item) => item.rule === 'uncited-commits').length, 1);
     assert.equal(result.findings.some((item) => item.id === 'clean-card'), false);
-    assert.equal(result.checked, 11);
+    assert.equal(result.checked, 14);
     const rank = { med: 0, low: 1 };
     const severities = result.findings.map((item) => item.severity);
     assert.deepEqual(severities, [...severities].sort((a, b) => rank[a] - rank[b]));
@@ -675,5 +680,144 @@ test('handoff-shadow ignores a malformed codex-parents record', () => {
     fs.mkdirSync(path.join(root, '.keep', 'codex-parents'), { recursive: true });
     fs.writeFileSync(path.join(root, '.keep', 'codex-parents', 'worker-1.json'), '{ truncated');
     assert.deepEqual(lint({ root, rule: 'handoff-shadow' }).findings, []);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('missing-project only flags open cards whose project does not resolve', () => {
+  const root = makeRoot();
+  const real = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-lint-project-'));
+  try {
+    writeCard(root, 'none-open', { status: 'active' });
+    writeCard(root, 'none-inbox', { status: 'inbox' });
+    writeCard(root, 'none-done', { status: 'done' });
+    writeCard(root, 'gone-dir', { status: 'review', project: path.join(real, 'not-here') });
+    writeCard(root, 'real-dir', { status: 'landing', project: real });
+    const findings = lint({ root, rule: 'missing-project' }).findings;
+    assert.deepEqual(findings.map((item) => item.id).sort(), ['gone-dir', 'none-open']);
+    assert.match(findings.find((item) => item.id === 'none-open').text, /has no project/);
+    assert.match(findings.find((item) => item.id === 'gone-dir').text, /is not a directory/);
+    assert.match(findings[0].fix, /^keep project /);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(real, { recursive: true, force: true });
+  }
+});
+
+test('landing-uncited wants a sha on the card, from either citation shape', () => {
+  const root = makeRoot();
+  try {
+    writeCard(root, 'bare', { status: 'landing' });
+    writeCard(root, 'prose-sha', { status: 'landing' }, '## 2026-09-10 09:00 — check-in\nPushed 3b08d08 to origin.\n');
+    writeCard(root, 'field-sha', { status: 'landing' }, '## 2026-09-10 09:00 — check-in\nDone.\ncommits: 3b08d08\n');
+    writeCard(root, 'not-landing', { status: 'review' });
+    const findings = lint({ root, rule: 'landing-uncited' }).findings;
+    assert.deepEqual(findings.map((item) => item.id), ['bare']);
+    assert.match(findings[0].fix, /keep checkin bare --commit <sha>/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('blocked-no-need accepts a need or a dependency as the way out', () => {
+  const root = makeRoot();
+  try {
+    writeCard(root, 'upstream', { status: 'active' });
+    writeCard(root, 'stuck', { status: 'blocked' });
+    writeCard(root, 'has-need', { status: 'blocked', needs: [{ text: 'an API token', at: '2026-09-10T09:00' }] });
+    writeCard(root, 'has-dependency', { status: 'blocked', depends_on: ['upstream'] });
+    writeCard(root, 'not-blocked', { status: 'waiting' });
+    const findings = lint({ root, rule: 'blocked-no-need' }).findings;
+    assert.deepEqual(findings.map((item) => item.id), ['stuck']);
+    assert.match(findings[0].fix, /keep needs stuck/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('daemon-health folds every failing scheduler into one finding', () => {
+  const root = makeRoot();
+  const now = Date.parse('2026-09-14T12:00:00');
+  try {
+    writeCard(root, 'any-card', { status: 'active' });
+    fs.mkdirSync(path.join(root, '.keep'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.keep', 'health.json'), JSON.stringify({
+      daemon: { startedAt: now - 3600e3 },
+      review: { consecutiveFailures: 133, lastError: 'Previous delivery is unconfirmed', lastOkAt: now - 60e3 },
+      ideas: { consecutiveFailures: 0, lastOkAt: now - 3 * 86400e3 },
+      slack: { consecutiveFailures: 1, lastOkAt: now - 60e3 },
+      discord: { disabled: true, consecutiveFailures: 99 },
+    }));
+    const findings = lint({ root, rule: 'daemon-health', now }).findings;
+    assert.equal(findings.length, 1, 'one finding for the whole daemon, not one per card');
+    assert.equal(findings[0].id, 'daemon:ideas');
+    assert.match(findings[0].text, /ideas: no successful run in 72h/);
+    assert.match(findings[0].text, /\+1 more \(review\)/);
+    assert.equal(findings[0].text.includes('slack'), false, 'one failure is not a failing scheduler');
+    assert.equal(findings[0].text.includes('discord'), false, 'a disabled scheduler is not a failure');
+
+    fs.writeFileSync(path.join(root, '.keep', 'health.json'), JSON.stringify({ review: { consecutiveFailures: 0, lastOkAt: now - 60e3 } }));
+    assert.deepEqual(lint({ root, rule: 'daemon-health', now }).findings, []);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('checkout-drift reports a dirty or diverged checkout once per project', () => {
+  const root = makeRoot();
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-lint-drift-'));
+  try {
+    git(repo, ['init', '-b', 'main']);
+    git(repo, ['config', 'user.name', 'Keep Test']);
+    git(repo, ['config', 'user.email', 'keep@example.test']);
+    fs.writeFileSync(path.join(repo, 'work.txt'), 'work\n');
+    git(repo, ['add', 'work.txt']);
+    git(repo, ['commit', '-m', 'first']);
+    writeCard(root, 'card-one', { status: 'active', project: repo });
+    writeCard(root, 'card-two', { status: 'review', project: repo });
+    writeCard(root, 'done-card', { status: 'done', project: repo });
+
+    assert.deepEqual(lint({ root, rule: 'checkout-drift' }).findings, [], 'a clean checkout says nothing');
+
+    fs.writeFileSync(path.join(repo, 'work.txt'), 'changed\n');
+    const dirty = lint({ root, rule: 'checkout-drift' }).findings;
+    assert.equal(dirty.length, 1, 'one finding per project, not per card');
+    assert.equal(dirty[0].id, 'card-one');
+    assert.match(dirty[0].text, /1 uncommitted file/);
+    assert.match(dirty[0].fix, /commit or stash/);
+
+    // Ahead of an upstream, using local refs only.
+    git(repo, ['checkout', '-q', '-b', 'feature']);
+    git(repo, ['config', 'branch.feature.remote', '.']);
+    git(repo, ['config', 'branch.feature.merge', 'refs/heads/main']);
+    fs.writeFileSync(path.join(repo, 'work.txt'), 'work\n');
+    fs.writeFileSync(path.join(repo, 'more.txt'), 'more\n');
+    git(repo, ['add', '.']);
+    git(repo, ['commit', '-m', 'second']);
+    const ahead = lint({ root, rule: 'checkout-drift' }).findings;
+    assert.equal(ahead.length, 1);
+    assert.match(ahead[0].text, /1 ahead of its upstream/);
+
+    // A repo git cannot read at all is skipped, never guessed at.
+    assert.deepEqual(lint({ root, rule: 'checkout-drift', checkoutState: () => null }).findings, []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('step-run-pending waits a day before naming a gated step', () => {
+  const root = makeRoot();
+  const now = Date.parse('2026-09-14T12:00:00');
+  const rows = (endedAt, pending = 2) => [{
+    name: 'terraform', project: '~/castle/castle-sandboxes', git: { available: true },
+    pending: Array.from({ length: pending }, (_, i) => ({ sha: `abc123${i}` })),
+    lastDone: { sha: 'deadbee', endedAt },
+  }];
+  try {
+    writeCard(root, 'any-card', { status: 'active' });
+    assert.deepEqual(lint({ root, now, rule: 'step-run-pending', stepRows: () => rows('2026-09-14T09:00', 0) }).findings, [],
+      'nothing pending, nothing to say');
+    assert.deepEqual(lint({ root, now, rule: 'step-run-pending', stepRows: () => rows('2026-09-14T09:00') }).findings, [],
+      'three hours is not stale');
+    const findings = lint({ root, now, rule: 'step-run-pending', stepRows: () => rows('2026-09-12T09:00') }).findings;
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0].id, 'step:castle-sandboxes:terraform');
+    assert.match(findings[0].text, /2 landed commits touch terraform/);
+    assert.match(findings[0].text, /51h ago/);
+    assert.deepEqual(lint({ root, now, rule: 'step-run-pending', stepRows: () => [] }).findings, []);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

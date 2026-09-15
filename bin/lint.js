@@ -14,6 +14,7 @@ const cardUsage = require('./card-usage.js');
 const os = require('os');
 
 const DAY_MS = 86400e3;
+const tilde = review.tilde;
 const RULE_NAMES = [
   'malformed-card',
   'scope-mismatch',
@@ -31,7 +32,16 @@ const RULE_NAMES = [
   'deploy-provenance',
   'tmp-artifact',
   'handoff-shadow',
+  // Bookkeeping the fleet reviewer was re-deriving from a model call every tick.
+  // Deterministic facts belong here, where they cost nothing and never drift.
+  'missing-project',
+  'landing-uncited',
+  'blocked-no-need',
+  'daemon-health',
+  'checkout-drift',
+  'step-run-pending',
 ];
+const OPEN_STATUSES = ['active', 'review', 'landing', 'blocked', 'waiting'];
 const SEVERITY_ORDER = { med: 0, low: 1 };
 
 function atMs(value) {
@@ -582,6 +592,141 @@ function handoffShadow(task, ctx) {
   return [];
 }
 
+// ---------- bookkeeping the reviewer used to pay a model to notice ----------
+
+// Without a project nothing resolves: no repo, no commits, no steps, no scope. It
+// was the reviewer's most repeated `other` subject (`<card>:no-project`).
+function missingProject(task, ctx) {
+  if (!OPEN_STATUSES.includes(task.fm.status)) return [];
+  const project = String(task.fm.project || '').trim();
+  const fix = `keep project ${task.id} <path> -m "..."`;
+  if (!project) {
+    return [finding('missing-project', task, 'med',
+      'open card has no project, so its commits, steps and scope cannot be resolved', fix)];
+  }
+  if (ctx.projectDir(project)) return [];
+  return [finding('missing-project', task, 'med', `project ${project} is not a directory on this host`, fix)];
+}
+
+// `landing` means "the work is done and on its way to origin". Without a sha on the
+// card there is nothing to check against origin, and the card's own claim is unfalsifiable.
+function landingUncited(task, _ctx) {
+  if (task.fm.status !== 'landing') return [];
+  if (allCitedShas(task).length) return [];
+  return [finding('landing-uncited', task, 'med',
+    'landing card cites no commit, so nothing can confirm what is landing',
+    `keep checkin ${task.id} --commit <sha> -m "..."`)];
+}
+
+// `blocked` with nothing recorded to unblock it is a status nobody can act on, and
+// nothing will ever move it back: needs and dependencies are the two things that do.
+function blockedNoNeed(task, ctx) {
+  if (task.fm.status !== 'blocked') return [];
+  if (ctx.openNeeds(task).length) return [];
+  const dependencies = (task.fm.depends_on || []).filter((entry) => !keep.parseDependency(entry).invalid);
+  if (dependencies.length) return [];
+  return [finding('blocked-no-need', task, 'med',
+    'blocked card records no open need and no dependency, so nothing can unblock it',
+    `keep needs ${task.id} "<what>" or keep checkin ${task.id} --status active -m "..."`)];
+}
+
+const HEALTH_SILENT_MS = 24 * 3600e3;
+
+// One finding for the whole daemon, not one per card: `daemon-health` was 8 of the
+// last 105 reviewer findings, each of them a re-reading of this same file.
+function daemonHealth(_task, ctx) {
+  let store;
+  try { store = JSON.parse(fs.readFileSync(path.join(ctx.root, '.keep', 'health.json'), 'utf8')); }
+  catch { return []; }
+  if (!store || typeof store !== 'object') return [];
+  const problems = [];
+  for (const [name, entry] of Object.entries(store)) {
+    if (name === 'daemon' || !entry || typeof entry !== 'object' || entry.disabled === true) continue;
+    const failures = Number(entry.consecutiveFailures || 0);
+    const lastOkAt = Number(entry.lastOkAt || 0);
+    if (failures >= 3) {
+      problems.push({ name, why: `${failures} consecutive failures: ${String(entry.lastError || 'no error recorded').slice(0, 120)}` });
+    } else if (lastOkAt && ctx.now - lastOkAt > HEALTH_SILENT_MS) {
+      problems.push({ name, why: `no successful run in ${Math.floor((ctx.now - lastOkAt) / 3600e3)}h` });
+    }
+  }
+  if (!problems.length) return [];
+  problems.sort((a, b) => a.name.localeCompare(b.name));
+  const [first] = problems;
+  return [finding('daemon-health', { id: `daemon:${first.name}` }, 'med',
+    `${first.name}: ${first.why}${problems.length > 1 ? `; +${problems.length - 1} more (${problems.slice(1).map((p) => p.name).join(', ')})` : ''}`,
+    'keep health, then fix or disable the failing scheduler')];
+}
+
+// Local refs only: no fetch, no network, no waiting. A dirty or diverged main
+// checkout is the "hygiene" lens the reviewer was spending a model call on.
+function checkoutState(repo) {
+  let text;
+  try {
+    text = execFileSync('git', ['-C', repo, '--no-optional-locks', 'status', '-sb', '--porcelain=v2', '--branch'], {
+      encoding: 'utf8', timeout: 5e3, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch { return null; }
+  let ahead = 0, behind = 0, dirty = 0, branch = '';
+  for (const line of text.split('\n')) {
+    if (line.startsWith('# branch.head ')) { branch = line.slice('# branch.head '.length).trim(); continue; }
+    if (line.startsWith('# branch.ab ')) {
+      const match = line.match(/\+(\d+)\s+-(\d+)/);
+      if (match) { ahead = Number(match[1]); behind = Number(match[2]); }
+      continue;
+    }
+    if (/^[12u] /.test(line)) dirty += 1;
+  }
+  return { branch, ahead, behind, dirty };
+}
+
+function checkoutDrift(_task, ctx) {
+  const out = [];
+  const seen = new Set();
+  for (const task of ctx.tasks) {
+    if (!OPEN_STATUSES.includes(task.fm.status)) continue;
+    const repo = ctx.repoFor(task);
+    if (!repo || seen.has(repo)) continue;
+    seen.add(repo);
+    const state = ctx.checkoutState(repo);
+    if (!state) continue;
+    const bits = [];
+    if (state.dirty) bits.push(`${state.dirty} uncommitted file${state.dirty === 1 ? '' : 's'}`);
+    if (state.ahead) bits.push(`${state.ahead} ahead of its upstream`);
+    if (state.behind) bits.push(`${state.behind} behind its upstream`);
+    if (!bits.length) continue;
+    out.push(finding('checkout-drift', task, 'low',
+      `${tilde(repo)} on ${state.branch || 'a detached HEAD'}: ${bits.join(', ')}`,
+      state.dirty ? `commit or stash the work in ${tilde(repo)}` : `git -C ${tilde(repo)} pull --ff-only (or push what is ahead)`));
+    if (out.length >= 10) break;
+  }
+  return out;
+}
+
+// A gated step (an AMI bake, a Terraform apply) whose paths have landed commits the
+// last run did not include, left that way for a day. The ledger and the step registry
+// answer this without a model; `keep steps` renders the same rows.
+function stepRunPending(_task, ctx) {
+  const rows = ctx.stepRows();
+  const out = [];
+  for (const row of rows) {
+    if (!row || !row.pending || !row.pending.length || !row.git || !row.git.available) continue;
+    const lastAt = atMs(String((row.lastDone && (row.lastDone.endedAt || row.lastDone.finalizedAt)) || '').replace(' ', 'T'));
+    const age = Number.isFinite(lastAt) ? ctx.now - lastAt : Infinity;
+    if (age < DAY_MS) continue;
+    out.push(finding('step-run-pending', { id: `step:${path.basename(String(row.project || 'project'))}:${row.name}` }, 'med',
+      `${row.pending.length} landed commit${row.pending.length === 1 ? '' : 's'} touch ${row.name} in ${tilde(row.project)}`
+      + `, and the last run was ${Number.isFinite(lastAt) ? `${Math.floor(age / 3600e3)}h ago` : 'never recorded'}`,
+      `keep steps ${row.project}, then keep step claim ${row.project} ${row.name} -m "..."`));
+    if (out.length >= 10) break;
+  }
+  return out;
+}
+
+// Fleet-level rules answer once for the whole registry, not once per card, so lint
+// calls them with no task. Everything else stays (task, ctx).
+for (const rule of [daemonHealth, checkoutDrift, stepRunPending]) rule.fleet = true;
+
 const RULES = {
   'malformed-card': malformedCard,
   'scope-mismatch': scopeMismatch,
@@ -599,6 +744,12 @@ const RULES = {
   'deploy-provenance': deployProvenance,
   'tmp-artifact': tmpArtifact,
   'handoff-shadow': handoffShadow,
+  'missing-project': missingProject,
+  'landing-uncited': landingUncited,
+  'blocked-no-need': blockedNoNeed,
+  'daemon-health': daemonHealth,
+  'checkout-drift': checkoutDrift,
+  'step-run-pending': stepRunPending,
 };
 
 function git(repo, args) {
@@ -656,6 +807,7 @@ function lint(options = {}) {
     if (title) titles.set(title, [...(titles.get(title) || []), task]);
   }
   const commitCache = new Map();
+  let stepRows = null;
   // Read once per run, and only if a rule asks: most runs never touch it.
   let owners;
   const ctx = {
@@ -682,12 +834,44 @@ function lint(options = {}) {
       if (!commitCache.has(repo)) commitCache.set(repo, logCommits(repo));
       return commitCache.get(repo);
     },
+    openNeeds: (task) => keep.openNeeds([task]),
+    projectDir(project) {
+      const expanded = String(project || '').replace(/^~(?=\/|$)/, os.homedir());
+      if (!expanded) return null;
+      try { return fs.statSync(path.resolve(expanded)).isDirectory() ? path.resolve(expanded) : null; }
+      catch { return null; }
+    },
+    checkoutState: options.checkoutState || checkoutState,
+    stepRows() {
+      if (stepRows) return stepRows;
+      stepRows = [];
+      if (options.stepRows) { stepRows = options.stepRows() || []; return stepRows; }
+      // steps.js resolves its registry and ledger from KEEP_DIR, so a lint run
+      // against some other root must not read the operator's real steps.
+      if (root !== keep.ROOT) return stepRows;
+      try {
+        const steps = require('./steps.js');
+        for (const entry of steps.registeredSteps(root)) {
+          try {
+            const snapshot = steps.status(entry.project, { now: ctx.now });
+            if (snapshot && Array.isArray(snapshot.steps)) stepRows.push(...snapshot.steps);
+          } catch {}
+        }
+      } catch {}
+      return stepRows;
+    },
   };
   const disabled = loadDisabled(root);
   const findings = [];
   const selectedRules = options.rule ? [options.rule] : RULE_NAMES;
   for (const name of selectedRules) {
     if (!RULES[name] || disabled.has(name)) continue;
+    // A fleet rule answers for the whole registry once: daemon health and checkout
+    // state are not per-card facts, and repeating them per card would drown the cap.
+    if (RULES[name].fleet) {
+      try { findings.push(...RULES[name](null, ctx)); } catch {}
+      continue;
+    }
     for (const task of tasks) {
       if (task.parseError && name !== 'malformed-card') continue;
       findings.push(...RULES[name](task, ctx));
