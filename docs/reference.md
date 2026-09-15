@@ -213,8 +213,15 @@ lint findings as advisory evidence — up to ten rows, each naming its rule. Lin
 those classes outright: `review-land` refuses a note whose kind is
 `wrong-status`, `stale-checkin`, `daemon-health`, `env-hygiene`, `deploy-provenance` or
 `step-pending` (or `other` with a `:no-project` / `:closing-checkin` subject, a bare sha
-or a `/tmp` path) when the same card already carries a lint finding from a rule that
-covers it. The refusal names the rule and is per item: the rest of the tick still lands.
+or a `/tmp` path) when a lint finding from a rule that covers it is already on record —
+matched on the same card, or fleet-wide for the rules that answer for the registry
+(`daemon-health`, `checkout-drift`, `step-run-pending`, which file under `daemon:<name>`,
+`repo:<project>` and `step:<project>:<step>`). Nothing is refused on a `.keep/lint.json`
+older than an hour, or on a card whose newest check-in is newer than the snapshot: lint
+has not seen what the reviewer is describing, so its silence proves nothing. The refusal
+names the rule and is per item: the rest of the tick still lands.
+`missing-project`, `landing-uncited` and `blocked-no-need` are capped at five findings
+each so bookkeeping cannot crowd the 60-finding total.
 
 `keep turns` reads the turn index, a SQLite summary of Claude Code and Codex CLI
 transcripts kept in `.keep/turns.sqlite`. Stop hooks and the daemon feed it

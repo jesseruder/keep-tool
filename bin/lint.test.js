@@ -741,6 +741,8 @@ test('daemon-health folds every failing scheduler into one finding', () => {
       review: { consecutiveFailures: 133, lastError: 'Previous delivery is unconfirmed', lastOkAt: now - 60e3 },
       ideas: { consecutiveFailures: 0, lastOkAt: now - 3 * 86400e3 },
       slack: { consecutiveFailures: 1, lastOkAt: now - 60e3 },
+      usage: { consecutiveFailures: 0, lastOkAt: now - 5 * 86400e3 },
+      'wt-gc': { consecutiveFailures: 0, lastOkAt: now - 30 * 3600e3 },
       discord: { disabled: true, consecutiveFailures: 99 },
       'review-questions': { consecutiveFailures: 40, lastError: 'retired scheduler' },
     }));
@@ -752,6 +754,8 @@ test('daemon-health folds every failing scheduler into one finding', () => {
     assert.equal(findings[0].text.includes('slack'), false, 'one failure is not a failing scheduler');
     assert.equal(findings[0].text.includes('discord'), false, 'a disabled scheduler is not a failure');
     assert.equal(findings[0].text.includes('review-questions'), false, 'a retired scheduler is nobody\'s problem');
+    assert.equal(findings[0].text.includes('usage'), false, 'an on-demand scheduler has no cadence to be late against');
+    assert.equal(findings[0].text.includes('wt-gc'), false, '30h is not late for a daily scheduler');
 
     fs.writeFileSync(path.join(root, '.keep', 'health.json'), JSON.stringify({ review: { consecutiveFailures: 0, lastOkAt: now - 60e3 } }));
     assert.deepEqual(lint({ root, rule: 'daemon-health', now }).findings, []);
@@ -777,7 +781,8 @@ test('checkout-drift reports a dirty or diverged checkout once per project', () 
     fs.writeFileSync(path.join(repo, 'work.txt'), 'changed\n');
     const dirty = lint({ root, rule: 'checkout-drift' }).findings;
     assert.equal(dirty.length, 1, 'one finding per project, not per card');
-    assert.equal(dirty[0].id, 'card-one');
+    assert.match(dirty[0].id, /^repo:/, 'a checkout is not any one card\'s fault');
+    assert.equal(dirty[0].id.includes('card-one'), false);
     assert.match(dirty[0].text, /1 uncommitted file/);
     assert.match(dirty[0].fix, /commit or stash/);
 
@@ -821,5 +826,56 @@ test('step-run-pending waits a day before naming a gated step', () => {
     assert.match(findings[0].text, /2 landed commits touch terraform/);
     assert.match(findings[0].text, /51h ago/);
     assert.deepEqual(lint({ root, now, rule: 'step-run-pending', stepRows: () => [] }).findings, []);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('daemon-health goes quiet for a daily scheduler until two of its own cadences pass', () => {
+  const root = makeRoot();
+  const now = Date.parse('2026-09-14T12:00:00');
+  const write = (store) => {
+    fs.mkdirSync(path.join(root, '.keep'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.keep', 'health.json'), JSON.stringify(store));
+  };
+  try {
+    writeCard(root, 'any-card', { status: 'active' });
+    // `brief` is daily: 30h late is normal, 60h is not.
+    write({ brief: { consecutiveFailures: 0, lastOkAt: now - 30 * 3600e3 } });
+    assert.deepEqual(lint({ root, rule: 'daemon-health', now }).findings, []);
+    write({ brief: { consecutiveFailures: 0, lastOkAt: now - 60 * 3600e3 } });
+    assert.match(lint({ root, rule: 'daemon-health', now }).findings[0].text, /brief: no successful run in 60h/);
+    // `usage` is on demand: it is never late, however long it has been.
+    write({ usage: { consecutiveFailures: 0, lastOkAt: now - 30 * 86400e3 } });
+    assert.deepEqual(lint({ root, rule: 'daemon-health', now }).findings, []);
+    // Consecutive failures still count for both.
+    write({ usage: { consecutiveFailures: 4, lastError: 'token expired', lastOkAt: now - 60e3 } });
+    assert.match(lint({ root, rule: 'daemon-health', now }).findings[0].text, /usage: 4 consecutive failures: token expired/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the bookkeeping rules are capped at five each so they cannot fill the brief', () => {
+  const root = makeRoot();
+  try {
+    for (let i = 0; i < 9; i += 1) {
+      writeCard(root, `landing-${i}`, { status: 'landing', project: '/definitely/not/here' });
+      writeCard(root, `blocked-${i}`, { status: 'blocked', project: '/definitely/not/here' });
+    }
+    const result = lint({ root });
+    for (const [rule, found] of [['missing-project', 18], ['landing-uncited', 9], ['blocked-no-need', 9]]) {
+      assert.equal(result.findings.filter((item) => item.rule === rule).length, 5, rule);
+      assert.equal(result.byRule[rule], found, `${rule} still counts everything it found`);
+    }
+    assert.ok(result.findings.length <= 60);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a relative project is unresolvable, not resolved against the daemon cwd', () => {
+  const root = makeRoot();
+  try {
+    writeCard(root, 'relative-project', { status: 'active', project: 'bin' });
+    writeCard(root, 'dot-project', { status: 'active', project: './bin' });
+    writeCard(root, 'home-project', { status: 'active', project: '~' });
+    const findings = lint({ root, rule: 'missing-project' }).findings;
+    assert.deepEqual(findings.map((item) => item.id).sort(), ['dot-project', 'relative-project']);
+    for (const item of findings) assert.match(item.text, /is not a directory on this host/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

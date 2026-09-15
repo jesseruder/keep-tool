@@ -42,6 +42,11 @@ const RULE_NAMES = [
   'step-run-pending',
 ];
 const OPEN_STATUSES = ['active', 'review', 'landing', 'blocked', 'waiting'];
+// Every open card can trip the three status/project rules at once, and ten each would
+// be thirty of the forty slots - the bookkeeping rules crowding out the ones that
+// found something specific. Five each, and a little more room overall.
+const RULE_CAPS = { 'missing-project': 5, 'landing-uncited': 5, 'blocked-no-need': 5 };
+const TOTAL_CAP = 60;
 const SEVERITY_ORDER = { med: 0, low: 1 };
 
 function atMs(value) {
@@ -641,14 +646,25 @@ function daemonHealth(_task, ctx) {
   if (!store || typeof store !== 'object') return [];
   const problems = [];
   // A retired scheduler's row lingers from an older daemon and is nobody's problem.
-  const retired = (() => { try { return require('./health.js').RETIRED; } catch { return new Set(); } })();
+  const health = (() => { try { return require('./health.js'); } catch { return { RETIRED: new Set(), CADENCES: {} }; } })();
+  const retired = health.RETIRED || new Set();
+  const cadences = health.CADENCES || {};
   for (const [name, entry] of Object.entries(store)) {
     if (name === 'daemon' || retired.has(name) || !entry || typeof entry !== 'object' || entry.disabled === true) continue;
     const failures = Number(entry.consecutiveFailures || 0);
     const lastOkAt = Number(entry.lastOkAt || 0);
     if (failures >= 3) {
       problems.push({ name, why: `${failures} consecutive failures: ${String(entry.lastError || 'no error recorded').slice(0, 120)}` });
-    } else if (lastOkAt && ctx.now - lastOkAt > HEALTH_SILENT_MS) {
+      continue;
+    }
+    const cadence = cadences[name] || {};
+    // An on-demand scheduler (digest, usage) has no cadence to be late against: it
+    // runs when something asks, and "no successful run in 24h" is its normal state.
+    if (cadence.onDemand) continue;
+    // A daily one legitimately goes a day between runs, so 24h alone makes it flap
+    // every morning before it has run. Give every row two of its own cadences.
+    const silentMs = Math.max(HEALTH_SILENT_MS, 2 * Number(cadence.cadenceMs || entry.cadenceMs || 0));
+    if (lastOkAt && ctx.now - lastOkAt > silentMs) {
       problems.push({ name, why: `no successful run in ${Math.floor((ctx.now - lastOkAt) / 3600e3)}h` });
     }
   }
@@ -697,7 +713,9 @@ function checkoutDrift(_task, ctx) {
     if (state.ahead) bits.push(`${state.ahead} ahead of its upstream`);
     if (state.behind) bits.push(`${state.behind} behind its upstream`);
     if (!bits.length) continue;
-    out.push(finding('checkout-drift', task, 'low',
+    // A checkout is not any one card's fault - the first open card that happened to
+    // name this project is an arbitrary place to hang it, and reads as an accusation.
+    out.push(finding('checkout-drift', { id: `repo:${tilde(repo)}` }, 'low',
       `${tilde(repo)} on ${state.branch || 'a detached HEAD'}: ${bits.join(', ')}`,
       state.dirty ? `commit or stash the work in ${tilde(repo)}` : `git -C ${tilde(repo)} pull --ff-only (or push what is ahead)`));
     if (out.length >= 10) break;
@@ -838,9 +856,12 @@ function lint(options = {}) {
     },
     openNeeds: (task) => keep.openNeeds([task]),
     projectDir(project) {
-      const expanded = String(project || '').replace(/^~(?=\/|$)/, os.homedir());
-      if (!expanded) return null;
-      try { return fs.statSync(path.resolve(expanded)).isDirectory() ? path.resolve(expanded) : null; }
+      const raw = String(project || '').trim();
+      // A relative project would be resolved against whatever directory the daemon
+      // happens to be running in, which is not a fact about the card. Unresolvable.
+      if (!raw || !(raw.startsWith('/') || /^~(?:\/|$)/.test(raw))) return null;
+      const expanded = path.resolve(raw.replace(/^~(?=\/|$)/, os.homedir()));
+      try { return fs.statSync(expanded).isDirectory() ? expanded : null; }
       catch { return null; }
     },
     checkoutState: options.checkoutState || checkoutState,
@@ -887,12 +908,12 @@ function lint(options = {}) {
   const capped = findings.filter((item) => {
     const n = (perRule.get(item.rule) || 0) + 1;
     perRule.set(item.rule, n);
-    return n <= 10;
+    return n <= (RULE_CAPS[item.rule] || 10);
   });
   const result = {
     at: new Date(ctx.now).toISOString(),
     checked: tasks.length,
-    findings: capped.slice(0, options.rule ? 10 : 40),
+    findings: capped.slice(0, options.rule ? 10 : TOTAL_CAP),
     byRule: Object.fromEntries(perRule),
     persisted: true,
   };

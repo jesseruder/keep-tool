@@ -3139,20 +3139,54 @@ function lintCoveringRules(note) {
   return [];
 }
 
-function cachedLintFindings(taskId, root = keep.ROOT) {
-  try {
-    const snapshot = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'lint.json'), 'utf8'));
-    return Array.isArray(snapshot && snapshot.findings)
-      ? snapshot.findings.filter((item) => item && item.id === taskId) : [];
-  } catch { return []; }
+// Rules that answer for the whole registry rather than for a card, and so file under
+// a synthetic id (daemon:<name>, repo:<project>, step:<project>:<step>). A card-scoped
+// lookup can never match one, which would have made the daemon-health, env-hygiene and
+// step-pending refusals dead code.
+const LINT_FLEET_RULES = new Set(['daemon-health', 'checkout-drift', 'step-run-pending']);
+// Lint runs daily; an older snapshot describes a fleet that has moved on. Refusing a
+// finding on stale evidence rejects real judgment, while refusing nothing costs at
+// most one duplicate, so the refusal simply switches off.
+const LINT_SNAPSHOT_MAX_AGE_MS = 60 * 60e3;
+
+function newestEntryAt(task) {
+  let newest = 0;
+  for (const entry of stampedLogEntries((task && task.body) || '')) {
+    const at = Date.parse(String(entry.stamp).replace(' ', 'T'));
+    if (Number.isFinite(at) && at > newest) newest = at;
+  }
+  return newest;
 }
 
-// The lint rule that already covers this note, or null. Pure: the caller supplies
-// the card's cached lint findings.
-function lintCoverage(note, findings) {
+// What a refusal may be based on: this card's rows plus the fleet rows, or null when
+// the snapshot is too old to refuse on at all.
+function cachedLintFindings(taskId, root = keep.ROOT, now = Date.now()) {
+  let snapshot;
+  try { snapshot = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'lint.json'), 'utf8')); }
+  catch { return null; }
+  const at = Date.parse(String((snapshot && snapshot.at) || ''));
+  if (!Number.isFinite(at) || now - at > LINT_SNAPSHOT_MAX_AGE_MS) return null;
+  const findings = Array.isArray(snapshot && snapshot.findings) ? snapshot.findings : [];
+  return {
+    at,
+    card: findings.filter((item) => item && item.id === taskId),
+    fleet: findings.filter((item) => item && LINT_FLEET_RULES.has(item.rule)),
+  };
+}
+
+// The lint rule that already covers this note, or null. Pure: the caller supplies the
+// snapshot (or, for a card-only check, a plain array of findings) and when the card
+// last changed - a check-in newer than the snapshot means lint has not seen the card
+// the reviewer is describing, so its silence proves nothing.
+function lintCoverage(note, snapshot, cardChangedAt) {
   const rules = lintCoveringRules(note);
-  if (!rules.length) return null;
-  const hit = (findings || []).find((item) => item && rules.includes(item.rule));
+  if (!rules.length || !snapshot) return null;
+  const legacy = Array.isArray(snapshot);
+  const card = legacy ? snapshot : (snapshot.card || []);
+  const fleet = legacy ? snapshot.filter((item) => item && LINT_FLEET_RULES.has(item.rule)) : (snapshot.fleet || []);
+  if (!legacy && snapshot.at && Number(cardChangedAt) > snapshot.at) return null;
+  const matches = (item) => item && rules.includes(item.rule);
+  const hit = card.find(matches) || fleet.find(matches);
   return hit ? hit.rule : null;
 }
 
@@ -3290,8 +3324,17 @@ async function reviewLand(document) {
   // signal, "I looked and it was fine" is a count.
   const ackLines = [];
   const counts = { reviewed: 0, findings: 0, clean: 0, ideas: 0 };
-  // One read of .keep/lint.json per card in the document, whatever the tick's size.
+  // One read of .keep/lint.json, and one card load, per card in the document.
   const lintCache = new Map();
+  const cardChangedAt = new Map();
+  const changedAt = (id) => {
+    if (!cardChangedAt.has(id)) {
+      let at = 0;
+      try { at = newestEntryAt(keep.loadTask(id)); } catch {}
+      cardChangedAt.set(id, at);
+    }
+    return cardChangedAt.get(id);
+  };
 
   keep.withLock(() => {
     for (const entry of entries) {
@@ -3307,7 +3350,8 @@ async function reviewLand(document) {
           detail = 'reviewed with no findings';
         } else if (entry.type === 'note') {
           // Refused per item, not per document: the rest of the tick still lands.
-          const covered = lintCoverage(item, lintCache.get(item.id) || lintCache.set(item.id, cachedLintFindings(item.id)).get(item.id));
+          if (!lintCache.has(item.id)) lintCache.set(item.id, cachedLintFindings(item.id));
+          const covered = lintCoverage(item, lintCache.get(item.id), changedAt(item.id));
           if (covered) {
             throw new keep.KeepError(`already a lint finding: ${covered}; do not re-report it`
               + ' - the KEEP_LINT_FINDINGS block is already in Owner\'s brief. Findings are for judgment, not bookkeeping.');
@@ -4549,7 +4593,10 @@ module.exports = {
   lintCoverage,
   lintCoveringRules,
   cachedLintFindings,
+  newestEntryAt,
   LINT_COVERED_KINDS,
+  LINT_FLEET_RULES,
+  LINT_SNAPSHOT_MAX_AGE_MS,
   reviewLand,
   scoreTask,
   isReviewerIdeaTask,

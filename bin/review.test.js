@@ -2829,7 +2829,9 @@ test('the sweep clock opens a window, retries every ten minutes and closes at no
   const attempted = { sweepTick: { lastAttemptAt: at(8, 0) } };
   assert.equal(cadence.sweepTickDue(attempted, at(8, 5), clock), false, 'a refused attempt waits ten minutes');
   assert.equal(cadence.sweepTickDue(attempted, at(8, 10), clock), true);
-  assert.equal(cadence.sweepTickDue({}, at(9, 0), { ...clock, invalid: true }), false);
+  // An invalid clock falls back to the default rather than removing the sweep;
+  // see 'a misconfigured sweep time falls back rather than removing the sweep'.
+  assert.equal(cadence.sweepTickDue({}, at(9, 0), { ...clock, invalid: true }), true);
   assert.equal(cadence.nextSweepAt(at(9, 0), clock), new Date(2026, 8, 15, 7, 45).getTime(), 'past today, the next one is tomorrow');
 });
 
@@ -2981,7 +2983,7 @@ test('review-land refuses a note lint already covers and lands the rest of the t
       ].join('\n'));
     }
     fs.writeFileSync(path.join(root, '.keep', 'lint.json'), JSON.stringify({
-      at: '2026-09-14T09:00:00.000Z',
+      at: new Date().toISOString(),
       findings: [{ id: 'bookkept-card', rule: 'missing-project', severity: 'med', text: 'no project', fix: 'keep project ...' }],
     }));
     // Real bundles, so the only thing that can refuse the first note is lint coverage.
@@ -3063,4 +3065,71 @@ test('a misconfigured sweep time falls back rather than removing the sweep', () 
   assert.deepEqual(sweepClock('00:00'), { hour: 0, minute: 0, invalid: false });
   assert.deepEqual(sweepClock('11:59'), { hour: 11, minute: 59, invalid: false });
   assert.equal(sweepTickDue({}, at(11, 59), sweepClock('11:59')), true);
+});
+
+test('the refusal matches fleet rules by rule, never by card id', () => {
+  const { lintCoverage, cachedLintFindings, LINT_FLEET_RULES } = require('./review.js');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-lint-fleet-'));
+  try {
+    fs.mkdirSync(path.join(root, '.keep'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.keep', 'lint.json'), JSON.stringify({
+      at: new Date().toISOString(),
+      findings: [
+        // Fleet rules file under synthetic ids; no card ever matches one.
+        { id: 'daemon:review', rule: 'daemon-health', severity: 'med', text: 'failing', fix: 'f' },
+        { id: 'repo:~/keep-tool', rule: 'checkout-drift', severity: 'low', text: 'dirty', fix: 'f' },
+        { id: 'step:castle-sandboxes:terraform', rule: 'step-run-pending', severity: 'med', text: 'pending', fix: 'f' },
+        { id: 'card-a', rule: 'stale-active', severity: 'med', text: 'stale', fix: 'f' },
+      ],
+    }));
+    const snapshot = cachedLintFindings('card-a', root);
+    assert.equal(snapshot.card.length, 1, 'only card-a rows are card-scoped');
+    assert.deepEqual([...LINT_FLEET_RULES].sort(), ['checkout-drift', 'daemon-health', 'step-run-pending']);
+
+    assert.equal(lintCoverage({ kind: 'daemon-health', subject: 'review' }, snapshot), 'daemon-health');
+    assert.equal(lintCoverage({ kind: 'step-pending', subject: 'terraform' }, snapshot), 'step-run-pending');
+    // env-hygiene is covered by two fleet rules; either row is a real answer.
+    assert.ok(['daemon-health', 'checkout-drift'].includes(lintCoverage({ kind: 'env-hygiene', subject: 'the host' }, snapshot)));
+    assert.equal(lintCoverage({ kind: 'stale-checkin', subject: 'card-a' }, snapshot), 'stale-active');
+    // A fleet row is fleet-wide, so a note on any card matches it.
+    const other = cachedLintFindings('card-z', root);
+    assert.equal(other.card.length, 0);
+    assert.equal(lintCoverage({ kind: 'daemon-health', subject: 'review' }, other), 'daemon-health');
+    assert.equal(lintCoverage({ kind: 'stale-checkin', subject: 'card-z' }, other), null, 'a card rule still needs that card');
+    assert.equal(lintCoverage({ kind: 'scope-creep', subject: 'bin/serve.js' }, snapshot), null);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a stale lint snapshot, or one older than the card, refuses nothing', () => {
+  const { lintCoverage, cachedLintFindings } = require('./review.js');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-lint-stale-'));
+  const now = Date.parse('2026-09-14T12:00:00.000Z');
+  const write = (at) => {
+    fs.mkdirSync(path.join(root, '.keep'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.keep', 'lint.json'), JSON.stringify({
+      at, findings: [{ id: 'card-a', rule: 'stale-active', severity: 'med', text: 'stale', fix: 'f' }],
+    }));
+  };
+  const note = { kind: 'stale-checkin', subject: 'card-a' };
+  try {
+    write(new Date(now - 30 * 60e3).toISOString());
+    const fresh = cachedLintFindings('card-a', root, now);
+    assert.equal(lintCoverage(note, fresh), 'stale-active', 'a fresh snapshot refuses');
+
+    // Older than an hour: lint is describing a fleet that has moved on, and refusing
+    // a real finding on stale evidence is worse than letting a duplicate through.
+    write(new Date(now - 61 * 60e3).toISOString());
+    assert.equal(cachedLintFindings('card-a', root, now), null);
+    assert.equal(lintCoverage(note, null), null);
+    write('not a date');
+    assert.equal(cachedLintFindings('card-a', root, now), null);
+    assert.equal(cachedLintFindings('card-a', path.join(root, 'nowhere'), now), null);
+
+    // A check-in newer than the snapshot means lint never saw the card being
+    // described, so its silence — or its finding — proves nothing.
+    write(new Date(now - 30 * 60e3).toISOString());
+    const snapshot = cachedLintFindings('card-a', root, now);
+    assert.equal(lintCoverage(note, snapshot, now - 45 * 60e3), 'stale-active', 'a check-in older than lint still refuses');
+    assert.equal(lintCoverage(note, snapshot, now - 5 * 60e3), null, 'a check-in newer than lint does not');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
