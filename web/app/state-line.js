@@ -12,10 +12,12 @@
 
 import { judgeDecision } from './api.js';
 
-const VERDICTS = ['continue', 'needs-input', 'drift', 'quiet'];
+const VERDICTS = ['continue', 'needs-input', 'drift', 'quiet', 'resource'];
 // drift is the only emphasised one: it is the watcher saying the session went
 // the wrong way. quiet is the common, uninteresting answer, so it is subdued.
-const VERDICT_TONE = { continue: 'ok', 'needs-input': 'warn', drift: 'bad', quiet: 'faint' };
+// resource is the deterministic observation that a turn changed a declared
+// shared resource and left no state note — worth noticing, never an accusation.
+const VERDICT_TONE = { continue: 'ok', 'needs-input': 'warn', drift: 'bad', quiet: 'faint', resource: 'warn' };
 
 export function verdictTone(verdict) {
   return VERDICT_TONE[verdict] || 'faint';

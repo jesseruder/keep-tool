@@ -27,6 +27,9 @@ const TYPES = {
   unblock: 'a dependency is satisfied and the waiter should be told',
   drift: "the session is heading away from the card's goal or a stated constraint and should be told",
   escalate: 'this genuinely needs Owner',
+  // Not a judgment about where the session is going — a deterministic
+  // observation that it changed a declared shared resource and told nobody.
+  resource: 'a turn touched a declared shared resource and left no state note',
 };
 const VERDICTS = ['agree', 'disagree', 'edit'];
 

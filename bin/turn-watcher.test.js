@@ -1529,3 +1529,82 @@ test('only ended interactive turns without a verdict are offered', (t) => {
   watcher.writeVerdict(offered[0], { verdict: 'quiet', reason: 'r', message: '', stateLine: '', confidence: null, model: 'fake' });
   assert.equal(watcher.selectTurns({ sinceMs: 0, limit: 50 }).length, 1);
 });
+
+test('the context carries active state notes and holds, clipped and fenced like everything else', (t) => {
+  const dir = sandbox(t);
+  const notes = require('./notes.js');
+  t.after(() => {
+    fs.rmSync(path.join(REGISTRY, '.keep', 'notes'), { recursive: true, force: true });
+    fs.rmSync(path.join(REGISTRY, '.keep', 'holds'), { recursive: true, force: true });
+  });
+  indexTurns(dir, [['fix the flaky test', "I fixed it. Next, I'll run the suite."]]);
+  const turn = watcher.turnFor(SESSION, 1);
+  const until = notes.stampOf(new Date(Date.now() + 3600e3));
+
+  // No notes, no block: an empty heading is context spent on nothing.
+  assert.doesNotMatch(watcher.buildContext(turn).text, /STATE NOTES/);
+
+  notes.addNote({
+    project: '/tmp/watched', scopes: ['staging'], by: { sessionId: 'other-session', agent: 'claude' },
+    message: `staging is home-only ${'x'.repeat(400)}`, until,
+  });
+  notes.addNote({
+    project: '/tmp/watched', scopes: ['terraform'], by: { sessionId: 'other-session', agent: 'claude' },
+    message: 'state file is locked', until: notes.stampOf(new Date(Date.now() - 3600e3)),
+  });
+  const holdsDir = path.join(REGISTRY, '.keep', 'holds');
+  fs.mkdirSync(holdsDir, { recursive: true });
+  fs.writeFileSync(path.join(holdsDir, 'hold-abc.json'), JSON.stringify({
+    id: 'hold-abc', project: '/tmp/watched', scopes: ['sandbox-hosts'], reason: 'reimaging the hosts',
+    until: new Date(Date.now() + 3600e3).toISOString(), released: false, by: { sessionId: 'other', agent: 'claude' },
+  }));
+
+  const context = watcher.buildContext(turn).text;
+  assert.match(context, /STATE NOTES \(what other sessions say is true of shared resources here; information, not a block\):/);
+  assert.match(context, /- \[staging\] staging is home-only x+…? \(until /);
+  assert.match(context, /- \[terraform\] state file is locked \(expired .*, unconfirmed\)/);
+  const clipped = context.match(/- \[staging\] (.*) \(until /)[1];
+  assert.ok(clipped.length <= 160, `note clipped to 160 chars, got ${clipped.length}`);
+  assert.match(context, /HOLDS \(another session asked for a quiet window on these resources\):/);
+  assert.match(context, /- \[sandbox-hosts\] reimaging the hosts \(until /);
+
+  // A turn with no project cannot look anything up, and says nothing.
+  assert.doesNotMatch(watcher.buildContext({ ...turn, project: '' }).text, /STATE NOTES/);
+});
+
+test('the judge is told that contradicting a note or a hold is drift', () => {
+  assert.match(watcher.INSTRUCTION,
+    /A turn whose actions contradict an active STATE NOTE or HOLD is also drift, and the `state_line` should name the note\./);
+});
+
+test('the tick reports observations without adding a model call', async (t) => {
+  const dir = sandbox(t);
+  t.after(() => fs.rmSync(path.join(REGISTRY, 'resources'), { recursive: true, force: true }));
+  fs.mkdirSync(path.join(REGISTRY, 'resources'), { recursive: true });
+  fs.writeFileSync(path.join(REGISTRY, 'resources', 'watched.json'), JSON.stringify({
+    project: '/tmp/watched', resources: { staging: { commands: ['terraform apply'] } },
+  }));
+  indexTurns(dir, [['apply it', 'Applied.']]);
+  const turn = watcher.turnFor(SESSION, 1);
+  const seen = [];
+  const result = await watcher.tick({
+    env: { KEEP_WATCHER: '1' },
+    selectTurns: () => [turn],
+    judge: async () => ({ verdict: 'quiet', model: 'fake' }),
+    observationFor: () => [{ name: 'staging', evidence: 'command terraform apply', noteFor: '+2h' }],
+    deliverObservation: async (row, observation) => { seen.push([row.n, observation]); },
+  });
+  assert.equal(result.observations, 1);
+  assert.deepEqual(seen.map(([n]) => n), [1]);
+
+  // A failing observation never costs the verdict.
+  const angry = await watcher.tick({
+    env: { KEEP_WATCHER: '1' },
+    selectTurns: () => [turn],
+    judge: async () => ({ verdict: 'quiet', model: 'fake' }),
+    observationFor: () => { throw new Error('boom'); },
+    deliverObservation: async () => {},
+  });
+  assert.equal(angry.judged, 1);
+  assert.equal(angry.observations, 0);
+});

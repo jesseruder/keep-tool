@@ -16,7 +16,12 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const TYPES = ['continue', 'needs-input', 'drift'];
+// `resource` is not a verdict the judge can return: it is the deterministic
+// observation that a turn touched a declared shared resource and said nothing
+// about it. It shares this file because it shares every gate — the switch, the
+// session check, the carve-outs, the per-turn reservation and the rate windows.
+const TYPES = ['continue', 'needs-input', 'drift', 'resource'];
+const OBSERVATION_TYPE = 'resource';
 const DEFAULTS = Object.freeze({
   maxPerSessionPer10m: 1,
   maxPerHour: 12,
@@ -201,6 +206,7 @@ function graduationCheck(type, stats) {
 function decisionTypeFor(verdictType) {
   if (verdictType === 'continue') return 'continue';
   if (verdictType === 'drift') return 'drift';
+  if (verdictType === OBSERVATION_TYPE) return OBSERVATION_TYPE;
   return 'answer'; // needs-input only ever delivers when it proposed an answer
 }
 
@@ -567,6 +573,109 @@ async function maybeDeliver(turn, verdict, deps = {}) {
   return { delivered: true, text, at, sessionId: turn.session_id };
 }
 
+// ---------- the resource observation ----------
+
+// One resource per message. A turn that touched three of them has one thing to
+// say about the first, and a message listing all three is a message nobody acts
+// on; the rest are still in the decision's reason.
+function observationMessage(turn, observation) {
+  const row = (observation || [])[0];
+  if (!row) return '';
+  const project = path.basename(String((turn && turn.project) || '')) || 'this project';
+  const evidence = String(row.evidence || '').slice(0, 80);
+  return `${DELIVERY_PREFIX}this turn touched ${row.name} (${evidence}) and left no state note.`
+    + ` If it changed how ${row.name} behaves for other sessions, run:`
+    + ` keep note ${project} --scope ${row.name} -m "<what is true now>" --for ${row.noteFor || '+2h'}`;
+}
+
+// Recorded whether or not anything is delivered: shadow mode is how this type
+// earns its way live, and Owner grades the exact text that would have been sent.
+// A distinct turn key from the verdict's `<sid>#<n>`, so the observation sits
+// beside the verdict's decision rather than deduplicating against it.
+function recordObservationDecision(turn, observation, message, deps = {}) {
+  const decisions = deps.decisions || require('./decisions.js');
+  try {
+    const entry = decisions.record({
+      type: OBSERVATION_TYPE,
+      card: '',
+      session: turn.session_id,
+      turn: `${turn.session_id}#${turn.n}#${OBSERVATION_TYPE}`,
+      why: `the turn touched ${observation.map((row) => row.name).join(', ')} and wrote no state note`,
+      message,
+      reviewer: 'watcher',
+    });
+    return entry.id;
+  } catch (error) {
+    debug(`observation not recorded: ${error.message}`);
+    return null;
+  }
+}
+
+// Same gates as a verdict, minus the confidence one: there is no model here and
+// nothing to be unsure about — either the declared matcher fired or it did not.
+// The reservation is per turn across every type, so an observation on a turn
+// another type already claimed is skipped and says so.
+async function maybeDeliverObservation(turn, observation, deps = {}) {
+  const skip = (reason, extra) => ({ delivered: false, reason, ...extra });
+  if (!Array.isArray(observation) || !observation.length) return skip('no observation');
+  const watcher = deps.watcher || require('./turn-watcher.js');
+  const keepApi = deps.keep || require('./keep.js');
+  const config = deps.config || loadConfig(deps.root);
+  const text = safeDeliveryText(observationMessage(turn, observation));
+  if (!text || !text.startsWith(DELIVERY_PREFIX)) return skip('unsafe-text');
+
+  const decisionId = recordObservationDecision(turn, observation, text, deps);
+  const shadow = { decisionId, text };
+  if (!config.live[OBSERVATION_TYPE]) return skip(`${OBSERVATION_TYPE} is not live`, shadow);
+
+  const session = deps.session;
+  const notReady = sessionReady(session); // excludes the reviewer, among everything else
+  if (notReady) return skip(notReady, shadow);
+
+  const card = deps.card !== undefined ? deps.card : cardFor(turn, keepApi);
+  const commands = deps.commands || turnCommands(turn, deps);
+  const carved = carveOut({
+    turn: { ...turn, assistantMessages: assistantMessages(turn, deps) },
+    card, commands, watcher, keepApi,
+  });
+  if (carved) return skip(carved, shadow);
+
+  const stale = freshness(turn, deps);
+  if (stale) return skip(stale, shadow);
+
+  const send = deps.send;
+  if (typeof send !== 'function') return skip('no delivery transport', shadow);
+
+  const owned = { ...deps, verdictType: OBSERVATION_TYPE, reloadConfig: deps.config ? false : undefined };
+  const claim = reserve(turn, config, OBSERVATION_TYPE, owned);
+  if (!claim.ok) {
+    debug(`observation skipped: ${claim.reason}`);
+    return skip(claim.reason, shadow);
+  }
+  const held = { ...owned, token: claim.token };
+  try {
+    const movedOn = await revalidate(turn, owned);
+    if (movedOn) { releaseReservation(turn, held); return skip(movedOn, shadow); }
+    await send({
+      sessionId: turn.session_id, pane: session.pane, text,
+      precondition: () => revalidate(turn, owned),
+    });
+  } catch (error) {
+    const typed = Boolean(error && error.typingStarted);
+    if (typed) recordReservationError(turn, error.message, held);
+    else releaseReservation(turn, held);
+    return { delivered: false, reason: `delivery failed: ${error.message}`, error: error.message,
+      typingStarted: typed, reservationKept: typed, ...shadow };
+  }
+  const at = Number.isFinite(deps.now) ? deps.now : Date.now();
+  markDelivered(turn, at, deps);
+  confirmReservation(turn, at, deps);
+  if (decisionId) {
+    try { (deps.decisions || require('./decisions.js')).markDelivered(decisionId, at); } catch {}
+  }
+  return { delivered: true, text, at, sessionId: turn.session_id, decisionId };
+}
+
 // The last-moment check, run twice: once before handing the text to the
 // transport, and again by the transport inside the injection lock. Returns a
 // reason when the world has moved since the verdict, or null when it has not.
@@ -616,4 +725,5 @@ module.exports = {
   pausedCarveOut, riskyQuestionCarveOut, cardCarveOut, releaseCarveOut, chainCarveOut, carveOut,
   freshness, sessionReady, rateLimit, reserve, releaseReservation, confirmReservation, revalidate,
   turnCommands, markDelivered, maybeDeliver,
+  OBSERVATION_TYPE, observationMessage, recordObservationDecision, maybeDeliverObservation,
 };

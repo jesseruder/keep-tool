@@ -7480,6 +7480,20 @@ function start(deps = {}) {
           }
           return outcome;
         },
+        // The same transport and the same gates, minus the confidence one: this
+        // is a rule match, not a judgment. Off by default like every other type.
+        deliverObservation: async (turn, observation) => {
+          try {
+            return await live.maybeDeliverObservation(turn, observation, {
+              session: sessions.find((candidate) => candidate.id === turn.session_id),
+              freshSession: (id) => loadCurrentSession(id),
+              send: (payload) => watcherSend(payload),
+            });
+          } catch (error) {
+            process.stderr.write(`keep watcher: observation failed: ${error && error.message || error}\n`);
+            return null;
+          }
+        },
       });
       health.record('watcher', {
         ok: result.failures === 0, cadenceMs: 30e3,

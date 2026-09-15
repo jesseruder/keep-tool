@@ -115,7 +115,7 @@ const INSTRUCTION = [
   'What each verdict means:',
   '- continue: the session stopped with work still obviously in front of it — it named its own next step, or claimed to be done in a way worth checking. `message` is what Owner would type to restart it.',
   '- needs-input: only Owner can unblock this — a secret, a physical device, a first-of-its-kind production write, a deliberate pause, or a real question of preference. If the answer is already obvious from the card or the turn, put that answer in `message`; otherwise leave `message` empty.',
-  '- drift: the turn contradicts the card\'s goal, a constraint stated on the card, or a tool result the session misread. `message` is what Owner would type to redirect it.',
+  '- drift: the turn contradicts the card\'s goal, a constraint stated on the card, or a tool result the session misread. `message` is what Owner would type to redirect it. A turn whose actions contradict an active STATE NOTE or HOLD is also drift, and the `state_line` should name the note.',
   '- quiet: nothing to do — the session is mid-work, it is waiting on a scheduled check, or the turn was answering a question Owner had just asked.',
   '',
   'Rules:',
@@ -385,6 +385,44 @@ function cardBlock(card) {
   return lines;
 }
 
+// What other sessions have said is true of the shared resources in this project,
+// and what they have asked others to wait for. Both are agent-written, so both go
+// through the same one-line clipping as everything else in the context; neither
+// is an instruction to the judge, and a note is explicitly not a block.
+const CONTEXT_NOTE_LIMIT = 160;
+const CONTEXT_NOTES = 5;
+const CONTEXT_HOLDS = 3;
+
+function stateNoteBlock(turn, deps = {}) {
+  const project = turn && turn.project;
+  if (!project) return [];
+  let rows = { active: [], expired: [] };
+  try { rows = (deps.notes || require('./notes.js')).activeNotes(project); } catch { return []; }
+  const lines = [];
+  for (const note of rows.active.slice(0, CONTEXT_NOTES)) {
+    lines.push(`  - [${(note.scopes || []).join(', ') || 'unscoped'}] ${oneLine(note.message, CONTEXT_NOTE_LIMIT)}`
+      + ` (until ${note.until})`);
+  }
+  for (const note of rows.expired.slice(0, Math.max(0, CONTEXT_NOTES - lines.length))) {
+    lines.push(`  - [${(note.scopes || []).join(', ') || 'unscoped'}] ${oneLine(note.message, CONTEXT_NOTE_LIMIT)}`
+      + ` (expired ${note.until}, unconfirmed)`);
+  }
+  if (!lines.length) return [];
+  return [`STATE NOTES (what other sessions say is true of shared resources here; information, not a block):\n${lines.join('\n')}`];
+}
+
+function holdBlock(turn, deps = {}) {
+  const project = turn && turn.project;
+  if (!project) return [];
+  let holds = [];
+  try { holds = (deps.keep || require('./keep.js')).activeHolds(project, Date.now(), { devices: true }); } catch { return []; }
+  if (!holds.length) return [];
+  const scopes = require('./hold-scopes.js');
+  const lines = holds.slice(0, CONTEXT_HOLDS).map((hold) =>
+    `  - [${scopes.label(hold)}] ${oneLine(hold.reason, CONTEXT_NOTE_LIMIT)} (until ${hold.until})`);
+  return [`HOLDS (another session asked for a quiet window on these resources):\n${lines.join('\n')}`];
+}
+
 function turnBlock(turn) {
   const tools = jsonList(turn.tools);
   const files = jsonList(turn.files);
@@ -414,6 +452,8 @@ function buildContext(turn, deps = {}) {
   const previous = previousStateLine(turn, deps);
   const sections = [
     ...cardBlock(card),
+    ...stateNoteBlock(turn, deps),
+    ...holdBlock(turn, deps),
     turnBlock(turn),
     ...(previous ? [`PREVIOUS TURN STATE: ${oneLine(previous, STATE_LINE_LIMIT)}`] : []),
     ...signalBlock(signals, rule),
@@ -865,6 +905,36 @@ async function judgeClaimed(turn, deps, { prior, claim, startedAt }) {
   return { ...value, turn: turn.id, session: turn.session_id, n: turn.n, context: context.text, signals: context.signals };
 }
 
+// ---------- the resource observation ----------
+
+// Rule-based, no model call, a few milliseconds: read the project's declarations,
+// match the turn's commands, files and deploys against them, and drop anything
+// this session already wrote a note about. A project with no declarations returns
+// nothing at all, which is the answer for almost every turn in the fleet.
+function observationFor(turn, deps = {}) {
+  if (!turn || !turn.project) return [];
+  let resources;
+  let declarations;
+  try {
+    resources = deps.resources || require('./resources.js');
+    declarations = resources.loadResources(turn.project);
+  } catch { return []; }
+  if (!declarations) return [];
+  const live = deps.live || require('./watcher-live.js');
+  const commands = deps.commands || live.turnCommands(turn, deps);
+  const keepApi = deps.keep || require('./keep.js');
+  const deploys = [];
+  for (const command of resources.normalizeCommands(commands)) {
+    try {
+      const deploy = keepApi.deployCommand(command);
+      if (deploy) deploys.push(deploy);
+    } catch {}
+  }
+  let notes = [];
+  try { notes = (deps.notes || require('./notes.js')).activeNotes(turn.project).active; } catch {}
+  return resources.observe(turn, { commands, files: jsonList(turn.files), deploys, declarations, notes });
+}
+
 // ---------- daemon tick ----------
 
 // Off unless KEEP_WATCHER=1. Shadow mode still spends tokens, and the daemon
@@ -885,6 +955,7 @@ async function tick(options = {}) {
   let failures = 0;
   const queue = turns.slice();
   let delivered = 0;
+  let observations = 0;
   const worker = async () => {
     for (let next = queue.shift(); next; next = queue.shift()) {
       try {
@@ -898,6 +969,21 @@ async function tick(options = {}) {
           const sent = await options.deliver(next, result, options);
           if (sent && sent.delivered) delivered += 1;
         }
+        // The observation is not a verdict and does not depend on one: it is a
+        // deterministic fact about the turn's own commands. It runs after the
+        // verdict so the per-turn reservation is decided in a stable order, and
+        // it is never fatal — the verdict stands whatever happens here.
+        if (result && !result.skipped && typeof options.deliverObservation === 'function') {
+          try {
+            const touched = (options.observationFor || observationFor)(next, options);
+            if (touched.length) {
+              observations += 1;
+              await options.deliverObservation(next, touched, options);
+            }
+          } catch (error) {
+            if (process.env.KEEP_DEBUG) process.stderr.write(`keep watcher: observation failed: ${error.message}\n`);
+          }
+        }
       } catch (error) {
         failures += 1;
         if (process.env.KEEP_DEBUG) process.stderr.write(`keep watcher: ${error.message}\n`);
@@ -905,7 +991,7 @@ async function tick(options = {}) {
     }
   };
   await Promise.all(Array.from({ length: Math.min(concurrency, queue.length) }, worker));
-  return { judged, failures, delivered, ms: Date.now() - startedAt, considered: turns.length };
+  return { judged, failures, delivered, observations, ms: Date.now() - startedAt, considered: turns.length };
 }
 
 // ---------- replay ----------
@@ -1345,6 +1431,7 @@ module.exports = {
   normalizeForMatch, explicitPauseAnywhere, askedAnywhere, askedForActionAnywhere,
   signalsFor, ruleVerdict, selectTurns, turnsForReplay, turnFor, buildContext, invocationFor,
   firstJsonObject, parseVerdict, runModel, spawnRunner, judge, writeVerdict, setDecisionId, decisionTypeFor,
+  stateNoteBlock, holdBlock, observationFor,
   normalizeContinue, isAllowedContinueMessage, canonicalContinueMessage, withoutQuoted,
   watcherModelTag, PROMPT_HASH,
   tick, enabled, replay, groundTruth, scoreOne, unquoted, confidenceBand, BANDS, BAND_LABELS,

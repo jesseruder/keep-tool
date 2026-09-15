@@ -104,7 +104,7 @@ function fakeSend() {
 test('the live switch round-trips, defaults to off, and survives a damaged file', (t) => {
   sandbox(t);
   const off = live.loadConfig();
-  assert.deepEqual(off.live, { continue: false, 'needs-input': false, drift: false }, 'off by default');
+  assert.deepEqual(off.live, { continue: false, 'needs-input': false, drift: false, resource: false }, 'off by default');
   assert.equal(off.minConfidence, 0.7);
   assert.equal(off.maxPerSessionPer10m, 1);
   assert.equal(off.maxPerHour, 12);
@@ -1251,4 +1251,144 @@ test('a send that may have arrived keeps its slot; one that cannot have gives it
   // An error recorded under another attempt's token changes nothing.
   assert.equal(live.recordReservationError(typed, 'someone else', { token: 'not-the-token' }), 0);
   assert.equal(rows()[0].error, 'Delivery unconfirmed');
+});
+
+// ---------- the resource observation ----------
+
+function declare(resourcesMap = { staging: { title: 'staging sandbox', commands: ['terraform apply'], noteFor: '+2h' } }) {
+  fs.mkdirSync(path.join(REGISTRY, 'resources'), { recursive: true });
+  fs.writeFileSync(path.join(REGISTRY, 'resources', 'live-project.json'),
+    JSON.stringify({ project: '/tmp/live-project', resources: resourcesMap }, null, 2));
+}
+
+function forgetDeclarations() {
+  fs.rmSync(path.join(REGISTRY, 'resources'), { recursive: true, force: true });
+  fs.rmSync(path.join(REGISTRY, '.keep', 'notes'), { recursive: true, force: true });
+}
+
+function terraformTurn(dir) {
+  return indexTurn(dir, { tools: [{ name: 'Bash', input: { command: 'terraform apply -auto-approve' } }] });
+}
+
+test('a turn that touched a declared resource and said nothing produces an observation', (t) => {
+  const dir = sandbox(t);
+  t.after(forgetDeclarations);
+  declare();
+  const turn = terraformTurn(dir);
+  const observation = watcher.observationFor(turn);
+  assert.deepEqual(observation.map((row) => row.name), ['staging']);
+  assert.match(observation[0].evidence, /^command terraform apply -auto-approve$/);
+
+  // A turn that wrote a note about it says nothing more.
+  const quiet = watcher.observationFor(turn, {
+    commands: ['terraform apply -auto-approve', 'keep note live-project --scope staging -m "x" --for +2h'],
+  });
+  assert.deepEqual(quiet, []);
+
+  // No declarations at all: the whole feature is silent.
+  forgetDeclarations();
+  assert.deepEqual(watcher.observationFor(turn), []);
+});
+
+test('an observation records a shadow decision and sends nothing while the type is off', async (t) => {
+  const dir = sandbox(t);
+  t.after(forgetDeclarations);
+  declare();
+  const turn = terraformTurn(dir);
+  const send = fakeSend();
+  const result = await live.maybeDeliverObservation(turn, watcher.observationFor(turn), {
+    config: live.normalizeConfig({}), session: READY_SESSION, card: ACTIVE_CARD, send,
+  });
+  assert.equal(result.delivered, false);
+  assert.equal(result.reason, 'resource is not live');
+  assert.deepEqual(send.calls, []);
+  assert.match(result.text, /^\[keep watcher\] this turn touched staging \(command terraform apply -auto-approve\) and left no state note\. If it changed how staging behaves for other sessions, run: keep note live-project --scope staging -m "<what is true now>" --for \+2h$/);
+  const decisions = require('./decisions.js').loadSafe();
+  const entry = decisions.find((row) => row.id === result.decisionId);
+  assert.equal(entry.type, 'resource');
+  assert.equal(entry.message, result.text, 'Owner grades the exact text that would have been sent');
+  assert.equal(entry.turn, `${SESSION}#1#resource`);
+  assert.equal(entry.delivered, undefined);
+
+  // The verdict's own decision for the same turn is a different row.
+  const again = await live.maybeDeliverObservation(turn, watcher.observationFor(turn), {
+    config: live.normalizeConfig({}), session: READY_SESSION, card: ACTIVE_CARD, send,
+  });
+  assert.equal(again.decisionId, result.decisionId, 'one observation decision per turn');
+});
+
+test('an observation delivers once the type is live, and marks its decision sent', async (t) => {
+  const dir = sandbox(t);
+  t.after(forgetDeclarations);
+  declare();
+  const turn = terraformTurn(dir);
+  const send = fakeSend();
+  const config = live.normalizeConfig({ live: { resource: true } });
+  const result = await live.maybeDeliverObservation(turn, watcher.observationFor(turn), {
+    config, session: READY_SESSION, card: ACTIVE_CARD, send,
+  });
+  assert.equal(result.delivered, true, result.reason);
+  assert.equal(send.calls.length, 1);
+  assert.equal(send.calls[0].sessionId, SESSION);
+  assert.match(send.calls[0].text, /^\[keep watcher\] this turn touched staging/);
+  const entry = require('./decisions.js').loadSafe().find((row) => row.id === result.decisionId);
+  assert.equal(entry.delivered, true);
+
+  // The reservation is per turn across every type, so nothing else may follow it.
+  const second = await live.maybeDeliverObservation(turn, watcher.observationFor(turn), {
+    config, session: READY_SESSION, card: ACTIVE_CARD, send: fakeSend(),
+  });
+  assert.equal(second.delivered, false);
+  assert.match(second.reason, /already been delivered/);
+});
+
+test('an observation is skipped when a verdict already reserved the turn', async (t) => {
+  const dir = sandbox(t);
+  t.after(forgetDeclarations);
+  declare();
+  const turn = terraformTurn(dir);
+  const config = live.normalizeConfig({ live: { continue: true, resource: true } });
+  const first = await live.maybeDeliver(turn, verdict(), {
+    config, session: READY_SESSION, card: ACTIVE_CARD, send: fakeSend(),
+  });
+  assert.equal(first.delivered, true, first.reason);
+  const send = fakeSend();
+  const result = await live.maybeDeliverObservation(turn, watcher.observationFor(turn), {
+    config, session: READY_SESSION, card: ACTIVE_CARD, send,
+  });
+  assert.equal(result.delivered, false);
+  assert.match(result.reason, /already been delivered/);
+  assert.deepEqual(send.calls, [], 'the turn already spent its one reservation');
+  assert.ok(result.decisionId, 'the shadow decision is still recorded for grading');
+});
+
+test('an observation never reaches the reviewer or a session that is not ready', async (t) => {
+  const dir = sandbox(t);
+  t.after(forgetDeclarations);
+  declare();
+  const turn = terraformTurn(dir);
+  const config = live.normalizeConfig({ live: { resource: true } });
+  for (const [session, expected] of [
+    [{ ...READY_SESSION, reviewer: true }, /reviewer/],
+    [{ ...READY_SESSION, endedTurn: false }, /mid-turn/],
+    [undefined, /does not see this session/],
+  ]) {
+    const send = fakeSend();
+    const result = await live.maybeDeliverObservation(turn, watcher.observationFor(turn), {
+      config, session, card: ACTIVE_CARD, send,
+    });
+    assert.equal(result.delivered, false);
+    assert.match(result.reason, expected);
+    assert.deepEqual(send.calls, []);
+  }
+});
+
+test('resource is a live type with its own graduation record', () => {
+  assert.ok(live.TYPES.includes('resource'));
+  assert.equal(live.decisionTypeFor('resource'), 'resource');
+  assert.equal(require('./decisions.js').TYPES.resource,
+    'a turn touched a declared shared resource and left no state note');
+  // The config file accepts the key; an unknown one still fails closed.
+  assert.equal(live.normalizeConfig({ live: { resource: true } }).live.resource, true);
+  assert.equal(live.normalizeConfig({ live: { resources: true } }).invalid, true);
 });
