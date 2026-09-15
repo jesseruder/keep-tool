@@ -289,7 +289,10 @@ and an index on `(ended, verdict_at)`. The `verdict`, `verdict_reason`,
 this. Version 5 adds `turns(session_id, verdict_at)`. Version 6 adds
 `turns.judging_at` (the claim), the denormalized `sessions.state_line` /
 `last_verdict` / `last_verdict_at` with a one-time backfill, and
-`turn_verdicts_kept`.
+`turn_verdicts_kept`. Version 13 adds `turns.attention_rule`, `attention_state`,
+`attention_confidence` and `attention_needs_input` — the console's own answer,
+recorded beside the verdict for comparison (below) — and the same four on
+`turn_verdicts_kept`, so a restored verdict is not left paired with nothing.
 
 A forced re-ingest or a truncation reset rebuilds a session's turn rows, which
 would otherwise erase every verdict and orphan the ledger decisions pointing at
@@ -435,6 +438,90 @@ backfills the columns once from that history. A replay verdict may fill a state
 line that was never written but never replaces a live one. A missing, locked or
 never-written index leaves the fields absent rather than failing the state. No UI
 change yet — step 3 renders it.
+
+## Attention comparison
+
+The console's **"Waiting on you"** bucket is decided by `activity()` in
+`bin/session-status.js`: an ordered list of rules over independent facts, first
+match wins. Most of those rules are **observed** — a permission prompt is on
+screen, an AskUserQuestion is pending, a plan is waiting for approval, a hook
+says so, a rate limit is in force. Three are **inferred** from prose and are the
+ones suspected of filling the bucket with sessions that did not need anything:
+
+- `prose-request` — the turn ended with something that reads like a question.
+- `conversation-wait` — the turn ended saying it is waiting on something.
+- `conversation-ready` — an interactive session ended a turn, so it is "ready
+  for the next instruction".
+
+The watcher already answers a neighbouring question per turn (`needs-input` vs
+`continue`/`quiet`). This section is the **measurement of whether the model beats
+those three rules**. It is not an override and it changes nothing about what the
+console shows.
+
+### What is recorded
+
+Every turn the daemon judges gets the state machine's answer written next to the
+verdict, in the same `UPDATE` (`writeVerdict`, `bin/turn-watcher.js`):
+
+| column | value |
+| --- | --- |
+| `attention_rule` | the winning rule name, e.g. `prose-request` |
+| `attention_state` | the state it produced: `needs-input`, `waiting`, `running`, … |
+| `attention_confidence` | `observed`, `inferred` or `uncertain` |
+| `attention_needs_input` | 1 if that put the session in "Waiting on you", else 0 |
+
+The daemon supplies the answer, because the daemon is the only place that has
+session objects: `bin/serve.js` passes `attentionFor(sessionId)` into
+`watcher.tick`, which looks the session up in the snapshot `buildState` just
+produced and reuses the `activity` already computed on it. **No second transcript
+scan**, and the same call the console's own buckets came from. It is read as late
+as the verdict is stamped — the model call takes minutes, and the question is
+what the console would be showing now.
+
+Failing to compute it never costs the verdict. A resolver that throws, is absent,
+or hands back something unrecognizable stores four nulls; a turn with no record
+is simply not comparable and is left out of the report rather than counted as a
+miss. `keep watcher run` re-judges without a resolver, so it **clears** the four
+columns: a fresh verdict paired with a record taken at some other moment would be
+a wrong data point, and no data point is better than a wrong one.
+
+### Reading it
+
+```
+keep watcher compare [--since when] [--limit n] [--only disagreements|all] [--json]
+```
+
+Two 2×2 tables — state machine needs-input yes/no against model needs-input
+yes/no — then the same table restricted to the three inferred rules, which is the
+real question. `needs-input` is the model saying yes; `continue` and `quiet` are
+it saying no. **`drift` is excluded**: it says the turn went the wrong way, which
+is an answer to a different question, so it is counted apart rather than forced
+into a cell. Then a per-rule breakdown, and the disagreement list (default
+`--only disagreements`, 40 newest) with each turn's rule, verdict, clipped
+reason, the last 200 characters of its final assistant text, and a
+`keep turns show <session>` pointer to the whole turn.
+
+The two disagreement directions, **`missed` first**:
+
+- **`missed`** — the model wants Owner and the rules did not say so. This is the
+  expensive one: a session that needs an answer and is not in the bucket is
+  invisible until someone goes looking.
+- **`noise`** — the rules asked for Owner and the model says nothing was needed.
+  This is the cheap one, and the one the inferred rules are suspected of.
+
+A high `noise` rate concentrated on `prose-request`, `conversation-wait` and
+`conversation-ready`, with `missed` near zero, is the case for letting the model
+speak. The reverse is the case for leaving the rules alone.
+
+### The rule, when this graduates
+
+If the model ever does get to act on this, it may override **only those three
+inferred rules** — `prose-request`, `conversation-wait`, `conversation-ready`.
+It may never override an observed one. A permission prompt, a pending question, a
+plan awaiting approval, a hook state or a rate limit is a fact on screen, not a
+guess, and a model that can talk Keep out of showing Owner a permission prompt is
+a model that can lose him a session. Today it overrides nothing: this records and
+reports, and that is all.
 
 ## Grading from the console
 

@@ -109,7 +109,7 @@ Three paths feed it:
 
 ## Schema
 
-`PRAGMA user_version` carries the schema version (currently 12). Each entry in
+`PRAGMA user_version` carries the schema version (currently 13). Each entry in
 `MIGRATIONS` brings the database from version n-1 to n and runs exactly once, so
 a fresh database is built by running all of them in order and an existing one
 only runs what it is missing. Version 2 adds `ingest_state.head_sha`; existing
@@ -118,7 +118,9 @@ Version 3 adds the `sessions(cwd)` index the project cache reads. Versions 4-8
 are the watcher's verdict columns, its claim and the denormalized session state
 (see `docs/turn-watcher.md`); 9-12 are the live delivery path's `delivered_at`,
 its `deliveries` table, and the ownership token and failure note on a
-reservation.
+reservation. Version 13 adds the four `attention_*` columns — the console's own
+"does this need Owner" answer, recorded beside each verdict so the two can be
+compared (`keep watcher compare`).
 
 ### `sessions`
 
@@ -210,7 +212,9 @@ turn's assistant text concatenated (16 KiB), `last_assistant` its final block
 in brackets, read out of the turn's tool results and commands.
 
 `verdict`, `verdict_reason`, `state_line` and `verdict_at` are reserved for the
-turn watcher and are left null here.
+turn watcher and are left null here. So are the four `attention_*` columns, which
+the watcher fills with the console's own answer for the same session at the
+moment it wrote the verdict (see `docs/turn-watcher.md`).
 
 ### `messages_fts`
 
