@@ -6052,6 +6052,7 @@ function buildWhoSnapshot(project) {
     holds,
     deviceHolds: true,
     steps: steps.status(project, { tasks, holds: keep.activeHolds(project) }),
+    notes: require('./notes.js').activeNotes(project),
     git: who.gitSnapshot(project),
     now: Date.now(),
   });
@@ -6821,6 +6822,41 @@ async function deliverUnblockToThread(task, text) {
     : null;
 }
 
+// A state note reaches the sibling sessions in the same checkout as information.
+// Not a gate, not a question, and never a reason to stop: the text says so, and
+// nothing here waits for an answer. Reviewer and spawned sessions are excluded
+// the same way every other automated delivery excludes them, and a session that
+// is mid-turn or holding a prompt is simply skipped — the note is still on the
+// card, in `keep notes`, and in the next session-start block.
+async function announceStateNote(id, event, deps = {}) {
+  const notes = deps.notes || require('./notes.js');
+  const note = notes.findNote(id);
+  if (!note) return { error: `no state note "${id}"` };
+  const text = notes.announcementFor(note, event);
+  const author = String((note.by && note.by.sessionId) || '');
+  const ledger = (deps.liveSessionsInCheckout || review.liveSessionsInCheckout)(
+    note.project, author ? [author] : [], Date.now(),
+  );
+  const { candidates, busy } = pickDeliveryCandidates(
+    (ledger.sessions || []).map((session) => session.id),
+    (deps.scanSessions || scanSessions)(),
+    deps.excluded || excludedSessionIds(),
+  );
+  const send = deps.send || ((sessionId) => withInjectionLock(() => sendToSession({ sessionId, text }), { session: sessionId }));
+  const sent = [];
+  const failed = [];
+  for (const candidate of candidates) {
+    if (candidate.reviewer) continue; // the reviewer writes no code; it has nothing to coordinate
+    try {
+      await send(candidate.id, text);
+      sent.push(candidate.id);
+    } catch (error) {
+      failed.push({ sessionId: candidate.id, reason: String((error && error.message) || error) });
+    }
+  }
+  return { id: note.id, event, text, sent, failed, busy, available: ledger.available !== false };
+}
+
 function sendReviewerMessage(sessionId, text, opts) {
   return sendToSession(
     { sessionId, text },
@@ -7218,6 +7254,13 @@ function start(deps = {}) {
   unblock.startScheduler({
     onChange: broadcast,
     deps: { deliver: deliverUnblockToThread },
+  });
+  // One nag per expired state note, and only to its own author. Nothing else in
+  // the system reads an expired note as a reason to stop.
+  require('./notes.js').startScheduler({
+    onChange: broadcast,
+    sessions: () => scanSessions(),
+    send: (sessionId, text) => withInjectionLock(() => sendToSession({ sessionId, text }), { session: sessionId }),
   });
   startAutoCompact();
   const restarts = require('./session-restart').createManager({
@@ -7778,6 +7821,16 @@ function start(deps = {}) {
               throw error;
             }
           }
+          if (url.pathname === '/api/notes/announce') {
+            if (!body || typeof body.id !== 'string' || !/^note-[a-z0-9]+$/.test(body.id)) {
+              return json(res, 400, { error: 'a state note id is required' });
+            }
+            const event = ['create', 'extend', 'clear'].includes(body.event) ? body.event : 'create';
+            const result = await announceStateNote(body.id, event);
+            if (result.error) return json(res, 404, result);
+            broadcast();
+            return json(res, 200, result);
+          }
           if (url.pathname === '/api/checkin') {
             keep.checkinTask(body.id, {
               message: body.message, status: body.status,
@@ -8136,6 +8189,7 @@ module.exports = {
   deliveredMatches,
   exactDraft,
   driftWakeFromVerdict,
+  announceStateNote,
   closeDraftVisible,
   codexTypedTextVisible,
   claudeTypedTextVisible,

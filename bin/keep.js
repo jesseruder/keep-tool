@@ -2675,6 +2675,7 @@ async function whoSnapshot(project) {
     holds,
     deviceHolds: true,
     steps: stepRegistry.status(project, { tasks, holds: activeHolds(project) }),
+    notes: require('./notes.js').activeNotes(project),
     git: who.gitSnapshot(project),
     now: Date.now(),
   });
@@ -3126,6 +3127,118 @@ commands.resources = (argv) => {
   }
   if (o.json) return console.log(JSON.stringify({ project: registry.project, resources: registry.resources }, null, 2));
   console.log(renderResourceRegistry(registry));
+};
+
+// ---------- state notes ----------
+
+const NOTE_USAGE = [
+  '  keep note <project> --scope <resource> [--scope ...] -m "what is true now" --for +2h [--task <card>]',
+  '  keep note --extend <id> --for +2h',
+  '  keep note --clear <id> [-m why]',
+].join('\n');
+
+// A note is information, so the daemon carries it to the siblings who need it and
+// a daemon that is down costs the broadcast, never the note. Same shape as
+// notifyStepWaiters: best effort, one line on failure, exit 0.
+async function announceNote(note, event) {
+  try {
+    const response = await postKeepApi('/api/notes/announce', { id: note.id, event }, 5e3);
+    if (response.status < 200 || response.status >= 300) throw new Error(`HTTP ${response.status}`);
+    let sent = 0;
+    try { sent = (JSON.parse(response.data).sent || []).length; } catch {}
+    if (sent) console.log(`told ${sent} sibling session${sent === 1 ? '' : 's'} in this project`);
+  } catch (error) {
+    console.log(`not broadcast (${error.message}); the note is recorded and shows at session start`);
+  }
+}
+
+function noteScopes(project, requested) {
+  const scopes = require('./hold-scopes').parse(requested);
+  if (!scopes.length) die(`a note needs at least one --scope\n${NOTE_USAGE}`);
+  const resources = require('./resources.js');
+  const declarations = resources.loadResources(project);
+  const declared = declarations ? resources.declaredNames(declarations) : [];
+  if (!declared.length) return scopes; // nothing declared: the label rules are all there is
+  const unknown = scopes.filter((scope) => !declared.includes(scope));
+  if (unknown.length) {
+    die(`${unknown.join(', ')} ${unknown.length === 1 ? 'is not a resource' : 'are not resources'} declared on ${declarations.project}`
+      + `\ndeclared here: ${declared.join(', ')}`
+      + `\ndeclare another with: keep resources ${path.basename(declarations.project)} --add <name> --command <re>`);
+  }
+  return scopes;
+}
+
+commands.note = async (argv) => {
+  const notes = require('./notes.js');
+  const o = parseArgs(argv, { scope: 'list', for: 'str', task: 'str', extend: 'str', clear: 'str', json: 'bool' });
+
+  if (o.extend !== undefined) {
+    if (!o.for || !/^\+\d+[mhdw]$/i.test(o.for)) die('usage: keep note --extend <id> --for +2h');
+    const existing = notes.findNote(o.extend);
+    if (!existing) die(`no state note "${o.extend}"`);
+    if (existing.cleared) die(`${existing.id} was cleared at ${existing.cleared}`);
+    const note = notes.extendNote(o.extend, parseWhen(o.for));
+    console.log(`${note.id}: extended until ${note.until}`);
+    return announceNote(note, 'extend');
+  }
+
+  if (o.clear !== undefined) {
+    const existing = notes.findNote(o.clear);
+    if (!existing) die(`no state note "${o.clear}"`);
+    if (existing.cleared) return console.log(`${existing.id} was already cleared at ${existing.cleared}`);
+    const note = notes.clearNote(o.clear, o.m ? cleanScalar(o.m, 'reason') : '');
+    console.log(`${note.id}: cleared`);
+    return announceNote(note, 'clear');
+  }
+
+  if (o._.length !== 1 || !o.m || !o.for) die(NOTE_USAGE);
+  if (!/^\+\d+[mhdw]$/i.test(o.for)) die('--for must be a duration such as +15m, +2h, or +1d');
+  const project = resolveProjectArg(o._[0]);
+  const scopes = noteScopes(project, o.scope);
+  const message = cleanScalar(o.m, 'message');
+  if (o.task) loadTask(o.task);
+  const session = commandSession();
+  const note = notes.addNote({
+    project,
+    scopes,
+    by: { sessionId: session ? session.id : '', agent: session ? session.agent : 'manual' },
+    task: o.task || '',
+    message,
+    until: parseWhen(o.for),
+  });
+  if (o.task) {
+    checkinTask(o.task, {
+      heading: 'state note',
+      message: `State note on ${project} [${scopes.join(', ')}] until ${note.until}: ${note.message}`,
+    });
+  }
+  console.log(`${note.id}: ${project} [${scopes.join(', ')}] until ${note.until} — ${note.message}`);
+  console.log('Information only; nothing is blocked by a note. Clear it early with keep note --clear ' + note.id + '.');
+  return announceNote(note, 'create');
+};
+
+commands.notes = (argv) => {
+  const notes = require('./notes.js');
+  const o = parseArgs(argv, { all: 'bool', json: 'bool', scope: 'list' });
+  if (o._.length > 1) die('usage: keep notes [<project>] [--all] [--json]');
+  const project = o._.length ? resolveProjectArg(o._[0]) : '';
+  const scopes = require('./hold-scopes').parse(o.scope);
+  const { active, expired } = notes.activeNotes(project, Date.now(), scopes.length ? { scope: scopes } : {});
+  const cleared = o.all
+    ? notes.allNotes().filter((note) => note.cleared && Date.now() - Date.parse(note.cleared) <= 24 * 3600e3
+      && (!project || normalizeProjectPath(note.project) === normalizeProjectPath(project)))
+    : [];
+  if (o.json) return console.log(JSON.stringify({ active, expired: o.all ? expired : [], cleared }, null, 2));
+  if (!active.length && !(o.all && (expired.length || cleared.length))) {
+    return console.log(project ? `no state notes on ${project}` : 'no state notes');
+  }
+  for (const note of active) console.log(`${note.id}  ${note.project}  ${notes.describeNote(note)}`);
+  if (o.all) {
+    for (const note of expired) console.log(`${note.id}  ${note.project}  ${notes.describeNote(note)}  [expired, unconfirmed]`);
+    for (const note of cleared) console.log(`${note.id}  ${note.project}  ${notes.describeNote(note)}  [cleared ${note.cleared}]`);
+  } else if (expired.length) {
+    console.log(`${expired.length} expired, unconfirmed (keep notes --all)`);
+  }
 };
 
 function stepConfig(project, name) {
@@ -3831,6 +3944,7 @@ function briefSnapshot(now = Date.now()) {
     alerts: alerts.readAlerts({ root: ROOT, all: true }),
     findings: alerts.loadReviewFindings(ROOT, now),
     holds,
+    notes: require('./notes.js').activeNotes(null, now),
     steps: stepSnapshots,
     unblocked: require('./unblock.js').readRecords({ root: ROOT }).filter((record) => !record.deliveredAt),
     health: require('./health.js').snapshot(now),

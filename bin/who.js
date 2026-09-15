@@ -58,6 +58,12 @@ function fleetSnapshot(project, input) {
   const sourceRuns = Array.isArray(data.runs) ? data.runs : [];
   const sourceHolds = Array.isArray(data.holds) ? data.holds : [];
   const sourceSteps = data.steps && Array.isArray(data.steps.steps) ? data.steps.steps : [];
+  // State notes arrive already split into active and expired-unconfirmed by
+  // notes.activeNotes; this module does no expiry of its own.
+  const sourceNotes = data.notes && typeof data.notes === 'object'
+    ? { active: Array.isArray(data.notes.active) ? data.notes.active : [],
+      expired: Array.isArray(data.notes.expired) ? data.notes.expired : [] }
+    : { active: [], expired: [] };
 
   const tasks = allTasks.filter((task) => OPEN_STATUSES.has(task.fm && task.fm.status)
     && normalizeProject(task.fm && task.fm.project) === normalized);
@@ -124,6 +130,7 @@ function fleetSnapshot(project, input) {
     scheduled,
     runs,
     holds,
+    notes: sourceNotes,
     steps: sourceSteps,
     git: data.git && data.git.available !== false ? data.git : { available: false },
   };
@@ -167,6 +174,22 @@ function renderWho(snapshot) {
     const by = hold.by || {};
     const elsewhere = normalizeProject(hold.project) === snapshot.project ? '' : ` · from ${hold.project}`;
     out.push(`  - ${hold.id} · scope: ${require('./hold-scopes').label(hold)}${elsewhere} · until ${hold.until} · ${by.agent || 'manual'} ${String(by.sessionId || '').slice(0, 8) || '(no session)'} · ${hold.reason}`);
+  }
+
+  // Notes sit right after holds and say plainly that they are not one: a reader
+  // who sees them beside a hold must not read them as a second kind of wait.
+  const notes = snapshot.notes || { active: [], expired: [] };
+  out.push('state notes (information only; nothing is blocked):');
+  if (!notes.active.length && !notes.expired.length) out.push('  (none)');
+  for (const note of notes.active) {
+    const by = note.by || {};
+    out.push(`  - ${note.id} · scope: ${(note.scopes || []).join(', ') || 'unscoped'} · until ${note.until}`
+      + ` · ${by.agent || 'manual'} ${String(by.sessionId || '').slice(0, 8) || '(no session)'} · ${note.message}`);
+  }
+  for (const note of notes.expired) {
+    const by = note.by || {};
+    out.push(`  - ${note.id} · scope: ${(note.scopes || []).join(', ') || 'unscoped'} · expired ${note.until}, unconfirmed`
+      + ` · ${by.agent || 'manual'} ${String(by.sessionId || '').slice(0, 8) || '(no session)'} · ${note.message}`);
   }
 
   out.push('steps:');

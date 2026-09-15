@@ -1609,6 +1609,23 @@ function buildBundle(taskId, opts = {}) {
     const by = hold.by || {};
     headerLines.push(`HOLDS: ${hold.id} on ${hold.project} until ${hold.until} by ${by.agent || 'manual'} session ${String(by.sessionId || '').slice(0, 8) || '(none)'} — ${clip(hold.reason, 300)}`);
   }
+  // State notes are agent-written too, and they say what is currently true of a
+  // shared resource — the context a finding about "why did staging behave like
+  // that" needs. Nothing here is a constraint the session broke by acting.
+  const stateNotes = task.fm.project
+    ? require('./notes.js').activeNotes(task.fm.project, Date.now())
+    : { active: [], expired: [] };
+  if (stateNotes.active.length || stateNotes.expired.length) headerLines.push('');
+  for (const note of stateNotes.active) {
+    const by = note.by || {};
+    headerLines.push(`STATE NOTE: ${note.id} [${(note.scopes || []).join(', ') || 'unscoped'}] on ${note.project}`
+      + ` until ${note.until} by ${by.agent || 'manual'} session ${String(by.sessionId || '').slice(0, 8) || '(none)'}`
+      + ` — ${lintField(note.message, 300)} (information only; nothing is blocked by a note)`);
+  }
+  for (const note of stateNotes.expired) {
+    headerLines.push(`STATE NOTE (expired, unconfirmed): ${note.id} [${(note.scopes || []).join(', ') || 'unscoped'}]`
+      + ` on ${note.project} since ${note.until} — ${lintField(note.message, 300)}`);
+  }
   const pendingProbe = probes.combineProbes(perSession.filter(p => p.missing || p.error || p.delta?.read).map(p => ({
     id: p.session.id,
     probe: p.delta && !p.delta.skipped ? probes.scanProbes(p.delta.lines, p.session.agent) : null,

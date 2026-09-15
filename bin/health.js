@@ -26,6 +26,7 @@ const CADENCES = Object.freeze({
   runs: { cadenceMs: 60e3 },
   delivery: { cadenceMs: 60e3 },
   unblock: { cadenceMs: 60e3 },
+  notes: { cadenceMs: 60e3 },
   slack: { cadenceMs: 15 * 60e3 },
   discord: { cadenceMs: 15 * 60e3 },
   landed: { cadenceMs: 30 * 60e3 },

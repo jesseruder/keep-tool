@@ -428,6 +428,11 @@ function buildBrief(input) {
     && Number(finding.at || 0) >= now - DAY_MS).sort((a, b) => Number(a.at || 0) - Number(b.at || 0)).slice(0, 6);
   const hygiene = (input.hygiene || []).filter((finding) => finding && finding.rule && finding.id);
   const holds = (input.holds || []).filter((hold) => hold && !hold.released && Date.parse(hold.until) > now);
+  // State notes are not holds and never win the spoken line: they are what is
+  // true right now, listed so Owner can see which ones nobody confirmed.
+  const noteRows = input.notes && typeof input.notes === 'object' ? input.notes : { active: [], expired: [] };
+  const activeNotes = Array.isArray(noteRows.active) ? noteRows.active : [];
+  const expiredNotes = Array.isArray(noteRows.expired) ? noteRows.expired : [];
   const needs = (input.tasks || []).flatMap((task) => task && task.fm && task.fm.status !== 'done' && Array.isArray(task.fm.needs)
     ? task.fm.needs.filter((need) => need && need.text).map((need) => ({ ...need, task: task.id })) : [])
     .sort((a, b) => String(a.at || '').localeCompare(String(b.at || '')));
@@ -487,6 +492,12 @@ function buildBrief(input) {
   add('Holds and pending steps', [
     ...holds.map((hold) => `hold ${oneLine(hold.project, 70)} until ${oneLine(hold.until, 25)} — ${oneLine(hold.reason, 70)}`),
     ...pendingSteps.map((step) => `step ${oneLine(step.project, 55)} / ${oneLine(step.title || step.name, 65)} — ${step.pending.length} pending commit${step.pending.length === 1 ? '' : 's'}`),
+  ]);
+  add('State notes', [
+    ...activeNotes.map((note) => `${oneLine((note.scopes || []).join(', ') || 'unscoped', 40)} on ${oneLine(note.project, 50)}`
+      + ` until ${oneLine(note.until, 25)} — ${oneLine(note.message, 90)}`),
+    ...expiredNotes.map((note) => `${oneLine((note.scopes || []).join(', ') || 'unscoped', 40)} on ${oneLine(note.project, 50)}`
+      + ` — expired, unconfirmed since ${oneLine(note.until, 25)} — ${oneLine(note.message, 70)}`),
   ]);
   add('Unblocked, nobody told', unblocked.map((record) =>
     `${oneLine(record.dependent, 70)} — ${oneLine(record.upstream, 70)} is done${record.gaveUp ? ` (${oneLine(record.gaveUp, 30)})` : ''}`));
