@@ -123,7 +123,15 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   `spend` (`keep allow <card> spend --amount 12` against a `spend:<dollars>` ceiling).
   A granted action needs no message to Owner — do it, and say you did in the check-in.
   Only Owner grants: `keep allow <card> --grant push,review --until +7d`. Never grant
-  on your own card, and never read a grant as covering more than it names.
+  on your own card, and never read a grant as covering more than it names — `--grant`
+  and `--until` are refused inside an agent session.
+  After an independent review of your commits, record it:
+  `keep reviewed <card> --commit origin/<default>..HEAD --verdict clean|findings --by "codex sol" --job <job-id>`.
+  `keep allow <card> land` then answers 0 when the reviewed patches are exactly what
+  would land — every commit in `origin/<default>..HEAD` covered by a clean record whose
+  patch-id matches, from a clean `wt/` worktree, with the card not opted out.
+  `keep land <card>` does the land: it re-checks that, runs `wt land`, and cites the
+  landed sha. Keep-tool's own main checkout and daemon restart stay manual.
 - **When you need Owner and the card does not grant it**: first do everything on the
   card that does not depend on him, then end your turn with the question. The Keep
   console shows every session's final turn in Waiting on you, and his reply arrives in

@@ -55,6 +55,11 @@ keep link <card> --session <sid> --agent claude|codex
 keep wait-on <card> <upstream>[#<step>] [<upstream>...] -m "why"
 keep deps [<card>]
 keep done <id> [-m note] [--next "text"] [--commit <sha>]...
+keep allow <id> [<action> [--amount n]] [--quiet] [--json]
+keep allow <id> --grant a,b [--until when] | --revoke a,b | --clear [--as-owner]
+keep reviewed <card> --commit <sha|range>... --verdict clean|findings [--by who] [--job id] [--evidence "..."] [-m "..."]
+keep reviews <card> [--json]
+keep land <card> [--dry-run] [--json]
 keep tag <id> +a -b
 keep tags
 keep overdue [--brief]
@@ -92,7 +97,8 @@ keep slack status
 keep slack mode log|cards|alerts
 keep verify <id>       # run a check recipe now (needs keep serve)
 keep compact <sid>     # compact a live Claude or Codex session (needs keep serve)
-keep resume            # post-restart: active tasks + agent-aware resume commands
+keep resume [--raw]    # post-restart: active tasks + keep open commands (--raw prints the bare CLI form)
+keep setup --shell [--write]   # the zsh claude() that routes resumes through keep open
 keep sync              # pull --rebase + push
 keep hook session-start  # used by the Claude Code SessionStart hook
 
@@ -536,6 +542,80 @@ them with `keep landed decisions [--disagree]`. `keep landed policy narrow|broad
 actions without changing cards or local state; `--only <id>` restricts the sweep to
 one card. The daemon runs every 30 minutes by default (`KEEP_LANDED_MIN`). Ending
 check-ins should cite full commit shas and finish with an unambiguous `Next:` line.
+
+## Reviewed commits and the implicit land grant
+
+`keep allow <card> <action>` answers from the grants Owner wrote on the card. `land`
+is the one action it can also answer from evidence — a record that an independent
+review saw exactly the patches that are about to reach the default branch.
+
+```sh
+keep reviewed <card> --commit origin/master..HEAD --verdict clean --by "codex sol" --job job_abc
+keep reviewed <card> --commit <sha>,<sha> --verdict findings --evidence "two real findings" -m "..."
+keep reviews <card> [--json]
+```
+
+Run it from the worktree that holds the commits. A range (`origin/master..HEAD`) or a
+comma-separated list of shas both work; an unknown sha, or a cwd that is not a git
+repository, is refused. Each record goes to `.keep/reviews/<card>.json` as
+`{id, at, by, job, verdict, evidence, commits: [{sha, patchId, subject}], bySession, message}`
+and the card gets a `code-review` log entry (never a heading starting with the bare
+word `review`, which the fleet reviewer's own notes own). `--by` starts with `codex`,
+`opus`, `claude` or `human` and may carry any suffix; `--evidence` is scrubbed and
+capped at 500 characters.
+
+The key is `git patch-id --stable`, not the sha: `wt land` rebases onto
+`origin/<default>` before it pushes, so the landed sha is never the reviewed one, while
+the patch is the same patch.
+
+`keep allow <card> land` then exits 0 with `why: reviewed clean: <n> commit(s) by <by>
+at <time> (record <id>)` when **all** of:
+
+| condition | why it fails |
+| --- | --- |
+| auto-land is not opted out | the card's `auto_land: off`, or `watch/autoland.json` `{"enabled": false}` or listing the card in `optOut` |
+| the cwd is a linked `wt/` worktree with a clean tree | not a worktree, a non-`wt/` branch, a detached HEAD, or uncommitted changes |
+| every commit in `origin/<default>..HEAD` has a `clean` record whose patch-id matches | a commit with no record, or one whose newest record is `findings` |
+| that record is not an agent self-attestation | `by` is not `human…` and the record carries neither `--job` nor `--evidence` |
+
+Anything else exits 3 and prints the condition that failed. `--json` adds `implicit:
+true` and the `record` that carried the decision. `watch/autoland.json` is
+`{"enabled": true, "optOut": ["<card>"]}` and is treated as enabled when absent: the
+opt-out is the deliberate act, and `auto_land: off` on a card is a **string**, because
+frontmatter keys Keep does not know are dropped on rewrite unless they are strings.
+
+`keep land <card>` runs that check and, on a 0, runs `wt land` in-process and cites the
+landed sha in a check-in naming the record. On a 3 it prints the `why` and lands
+nothing. `--dry-run` stops before the land. It never fast-forwards keep-tool's main
+checkout and never restarts the daemon: those stay manual.
+
+Writing grants is Owner's: `keep allow <card> --grant`/`--until` is refused inside an
+agent session (`CLAUDE_CODE_SESSION_ID` or a Codex session marker) unless `--as-owner`
+is passed with `KEEP_OWNER=1` in the environment. `--revoke` and `--clear` stay open,
+since they only ever reduce authority.
+
+## Resuming a session
+
+Resume through `keep open <session-id>`, always. A raw `claude --resume` outside the
+host starts a session with no pane binding, no account, no `--mcp-config`, no model and
+no permissions flags, and lets ambient credentials into it; on 2026-09-09 a by-hand
+resume that dropped `--dangerously-skip-permissions` left the resumed session denying
+its own work.
+
+`keep hook pre-bash` denies a Bash command that invokes `claude` or `clauded` with
+`--resume`, `-r`, `--continue` or `-c` unless the environment has `KEEP_PANE` (which the
+host's own launcher always sets) or `KEEP_RAW_CLAUDE` set to bypass it. Plain `claude`
+with no resume flag is untouched, and a mention inside `echo` or `grep` is not an
+invocation.
+
+`keep setup --shell` prints a zsh `claude()` that does the same for Owner's own typing;
+`keep setup --shell --write` installs it in `~/.zshrc` between
+`# >>> keep shell >>>` / `# <<< keep shell <<<` markers, replacing the block if it is
+already there. It calls `command claude`, so the `clauded` alias expands to the function
+and is guarded too, and `--dangerously-skip-permissions` passes straight through.
+
+`keep resume` prints `keep open <id>` for every session; `keep resume --raw` prints the
+bare `claude --resume` / `codex resume` form for a human who knows what it gives up.
 
 ## Slack watch
 
