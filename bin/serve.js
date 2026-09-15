@@ -4494,6 +4494,11 @@ async function openSession(body, deps = {}) {
   const freshStandalone = body.fresh === true && !body.taskId && !body.sessionId;
   if (body.agent != null && !['claude', 'codex'].includes(body.agent)) throw new InjectionError(400, 'agent must be claude or codex');
   if (body.command != null) throw new InjectionError(400, 'command is not accepted');
+  // `deps.launchEnv` is an internal seam — the self-repair scheduler sets
+  // KEEP_REPAIR=1 on the pane it opens. It is never settable over HTTP: a body
+  // that could name environment variables would hand any caller the guard's off
+  // switch, and the auth tokens of whichever account the pane runs as.
+  if (body.launchEnv != null || body.env != null) throw new InjectionError(400, 'env is not accepted');
   if (body.cwd != null && (typeof body.cwd !== 'string' || !body.cwd || /[\r\n\0]/.test(body.cwd))) {
     throw new InjectionError(400, 'cwd must be a directory path');
   }
@@ -4713,7 +4718,7 @@ async function openSession(body, deps = {}) {
     const spawned = await hostRequest('spawn', {
       cmd: '/bin/zsh',
       args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`],
-      env: require('./agent-launcher').launcherEnv(),
+      env: require('./agent-launcher').launcherEnv(deps.launchEnv),
       cwd: project,
       cols: 200,
       rows: 50,
@@ -7686,7 +7691,14 @@ function start(deps = {}) {
   // stays Owner's, and `keep hook pre-bash` refuses it from inside the run.
   if (process.env.KEEP_SELF_REPAIR === '0') {
     health.record('self-repair', { disabled: true, detail: 'KEEP_SELF_REPAIR=0', cadenceMs: require('./self-repair.js').CADENCE_MS });
-  } else require('./self-repair.js').startScheduler({ onChange: broadcast });
+  } else require('./self-repair.js').startScheduler({
+    onChange: broadcast,
+    // The repair agent is an ordinary interactive session in the terminal host,
+    // not a headless run that dies at the end of its turn. self-repair.js takes
+    // openSession through deps rather than requiring serve.js, which would be a
+    // cycle.
+    openSession: (body, openDeps) => openSession(body, openDeps),
+  });
   slack.startScheduler({ onChange: broadcast });
   discord.startScheduler({ onChange: broadcast });
   const configuredLiveTickMs = Number(process.env.KEEP_LIVE_TICK_MS);

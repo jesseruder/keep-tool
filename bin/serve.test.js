@@ -4542,6 +4542,38 @@ test('fresh card open launches in an explicit cwd only when it belongs to the ca
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('an internal launchEnv reaches the pane shell, and a request body can never set one', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-launch-env-'));
+  try {
+    const project = path.join(root, 'project');
+    fs.mkdirSync(project, { recursive: true });
+    const host = recordingHost((type) => type === 'spawn' ? { pane: { id: 'pane-repair' } } : {});
+    // The self-repair scheduler's launch: the pre-bash guard keys on KEEP_REPAIR=1,
+    // so the session is only guarded if the variable actually reaches the shell.
+    await openSession({ taskId: 'card', fresh: true, agent: 'claude', cwd: project }, {
+      host,
+      loadTask: () => ({ fm: { project, sessions: [] } }),
+      randomUUID: () => '44444444-4444-4444-8444-444444444444',
+      waitForHostAgent: async () => true,
+      trustProject: () => true,
+      linkLaunchedSession: () => true,
+      launchEnv: { KEEP_REPAIR: '1' },
+    });
+    const spawned = host.calls.find((call) => call.type === 'spawn');
+    assert.equal(spawned.params.env.KEEP_REPAIR, '1');
+    assert.equal(spawned.params.env.KEEP_LAUNCHER, '1', 'and the launcher marker still rides along');
+
+    // Over HTTP it is refused: a body that could name environment variables would
+    // hand any caller the guard's off switch and the pane account's credentials.
+    for (const extra of [{ launchEnv: { KEEP_REPAIR: '1' } }, { env: { KEEP_REPAIR: '1' } }]) {
+      await assert.rejects(openSession({ taskId: 'card', fresh: true, agent: 'claude', ...extra }, {
+        host, loadTask: () => ({ fm: { project, sessions: [] } }),
+      }), (error) => error.status === 400 && /env is not accepted/.test(error.message));
+    }
+    assert.equal(host.calls.filter((call) => call.type === 'spawn').length, 1);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('standalone fresh agent launch uses the selected profile and one request id creates one pane', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-standalone-open-'));
   try {
