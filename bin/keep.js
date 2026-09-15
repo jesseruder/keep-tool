@@ -3032,6 +3032,102 @@ commands.holds = (argv) => {
   }
 };
 
+// ---------- declared shared resources ----------
+
+const RESOURCE_USAGE = [
+  '  keep resources <project>',
+  '  keep resources <project> --add <name> [--title t] [--command <re>]… [--path <glob>]… [--deploy <kind:target>]… [--note-for +2h]',
+  '  keep resources <project> --remove <name>',
+  '  keep resources --check <project> "<command>"',
+].join('\n');
+
+function renderResourceRegistry(registry) {
+  const resources = require('./resources.js');
+  const names = Object.keys(registry.resources || {}).sort();
+  const lines = [`Shared resources declared on ${registry.project}:`];
+  if (!names.length) lines.push('  (none)');
+  for (const name of names) {
+    const declaration = registry.resources[name] || {};
+    lines.push(`  ${name}${declaration.title ? ` — ${declaration.title}` : ''}`
+      + `  · note for ${resources.noteForOf(declaration)}`);
+    for (const pattern of declaration.commands || []) lines.push(`      command: ${pattern}`);
+    for (const pattern of declaration.paths || []) lines.push(`      path:    ${pattern}`);
+    for (const pattern of declaration.deploys || []) lines.push(`      deploy:  ${pattern}`);
+  }
+  lines.push(`Write a state note when you change one: keep note ${path.basename(registry.project)} --scope <name> -m "..." --for +2h`);
+  return lines.join('\n');
+}
+
+commands.resources = (argv) => {
+  const resources = require('./resources.js');
+  const o = parseArgs(argv, {
+    add: 'str', remove: 'str', title: 'str', command: 'list', path: 'list', deploy: 'list',
+    'note-for': 'str', check: 'str', json: 'bool',
+  });
+
+  // --check reads: which declarations does this command touch? Nothing is
+  // written and nothing is judged; it exists so a declaration can be tested by
+  // hand before a watcher observation is the first thing that reads it.
+  if (o.check !== undefined) {
+    const project = resolveProjectArg(o.check);
+    const command = o._.join(' ').trim();
+    if (!command) die(RESOURCE_USAGE);
+    const registry = resources.loadResources(project);
+    if (!registry) die(`no resources registry for ${project}`);
+    const touched = resources.touchedResources({ commands: [command], files: [], deploys: deployCommand(command) ? [deployCommand(command)] : [] }, registry);
+    if (o.json) return console.log(JSON.stringify({ project: registry.project, command, touched }, null, 2));
+    if (!touched.length) return console.log(`no declared resource matches: ${command}`);
+    for (const line of resources.describeTouched(touched)) console.log(line);
+    return;
+  }
+
+  if (o._.length !== 1) die(RESOURCE_USAGE);
+  const project = resolveProjectArg(o._[0]);
+
+  if (o.add !== undefined && o.remove !== undefined) die('pass one of --add or --remove');
+
+  if (o.remove !== undefined) {
+    const registry = resources.loadResources(project);
+    if (!registry || !registry.resources[o.remove]) die(`no resource "${o.remove}" declared on ${project}`);
+    const next = { ...registry.resources };
+    delete next[o.remove];
+    resources.saveResources(registry.project, next);
+    return console.log(`removed ${o.remove} from ${registry.project}`);
+  }
+
+  if (o.add !== undefined) {
+    const name = String(o.add);
+    if (!resources.validName(name)) {
+      die(`"${name}" is not a resource label — use lowercase letters, digits, "-" and ":" (e.g. staging, sandbox-hosts)`);
+    }
+    for (const pattern of o.command || []) {
+      try { new RegExp(pattern, 'i'); }
+      catch (error) { die(`--command ${pattern} is not a valid regex: ${error.message}`); }
+    }
+    if (o['note-for'] && !/^\+\d+[mhdw]$/i.test(o['note-for'])) {
+      die('--note-for must be a duration such as +2h');
+    }
+    const registry = resources.loadResources(project);
+    const declaration = { ...(registry && registry.resources[name]) || {} };
+    if (o.title) declaration.title = cleanScalar(o.title, 'title');
+    if (o.command) declaration.commands = [...new Set([...(declaration.commands || []), ...o.command])];
+    if (o.path) declaration.paths = [...new Set([...(declaration.paths || []), ...o.path])];
+    if (o.deploy) declaration.deploys = [...new Set([...(declaration.deploys || []), ...o.deploy])];
+    if (o['note-for']) declaration.noteFor = o['note-for'];
+    const next = { ...(registry && registry.resources) || {}, [name]: declaration };
+    const saved = resources.saveResources(registry ? registry.project : project, next);
+    return console.log(`${name} declared on ${saved.project} (${saved.file})`);
+  }
+
+  const registry = resources.loadResources(project);
+  if (!registry) {
+    if (o.json) return console.log(JSON.stringify({ project: normalizeProjectPath(project), resources: {} }, null, 2));
+    return console.log(`no shared resources declared on ${project} — declare one with:\n${RESOURCE_USAGE.split('\n')[1]}`);
+  }
+  if (o.json) return console.log(JSON.stringify({ project: registry.project, resources: registry.resources }, null, 2));
+  console.log(renderResourceRegistry(registry));
+};
+
 function stepConfig(project, name) {
   if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(String(name || ''))) die(`invalid step name "${name}"`);
   const registry = stepRegistry.loadSteps(project);
@@ -4926,6 +5022,26 @@ commands.hook = async (argv) => {
     for (const row of stepSnapshot.steps.slice(0, CAP)) lines.push(`${row.line} Before touching those paths: keep steps ${path.basename(stepSnapshot.project)}.`);
     if (stepSnapshot.steps.length > CAP) lines.push(`…and ${stepSnapshot.steps.length - CAP} more (keep steps ${path.basename(stepSnapshot.project)})`);
   }
+  // Declared shared resources and the state notes on them. Both are information,
+  // not permission: nothing here blocks anything, and a scoped hold is still the
+  // only thing that asks anyone to wait.
+  try {
+    const declarations = require('./resources.js').loadResources(stepProject);
+    const names = declarations ? require('./resources.js').declaredNames(declarations) : [];
+    if (names.length) {
+      lines.push(`Shared resources declared here: ${names.join(', ')} (keep resources ${path.basename(declarations.project)}).`
+        + ' When you change how one behaves for other sessions, say so: keep note <project> --scope <name> -m "..." --for +2h.');
+    }
+  } catch {}
+  try {
+    const notes = require('./notes.js').activeNotes(stepProject);
+    if (notes.active.length || notes.expired.length) {
+      lines.push('State notes on this project:');
+      for (const note of notes.active.slice(0, CAP)) lines.push(`- ${require('./notes.js').describeNote(note)}`);
+      for (const note of notes.expired.slice(0, CAP)) lines.push(`- ${require('./notes.js').describeNote(note)} [expired, unconfirmed]`);
+      lines.push('Notes are information only; nothing is blocked by one (keep notes).');
+    }
+  } catch {}
   let nudge = '';
   try {
     const wt = require('./wt.js');
@@ -7358,6 +7474,17 @@ function helpText() {
     device:<serial> names shared hardware and shows in every project (who, session start).
   keep release <hold-id>
   keep holds
+  keep resources <project> [--json]
+  keep resources <project> --add <name> [--title t] [--command <re>]… [--path <glob>]… [--deploy <kind:target>]… [--note-for +2h]
+  keep resources <project> --remove <name>
+  keep resources --check <project> "<command>"
+                          # named shared resources a project declares; names are hold/note scopes
+                          # matchers are regexes (commands), globs (paths), <kind>:<target> (deploys). Advisory.
+  keep note <project> --scope <resource> [--scope ...] -m "what is true now" --for +2h [--task <card>]
+  keep note --extend <id> --for +2h | --clear <id> [-m why]
+                          # expiring, non-blocking statement about shared state; broadcast to siblings
+  keep notes [<project>] [--all] [--json]
+                          # active notes; --all adds recently expired and cleared ones
   keep needs [<card> "<secret or action>" [--env NAME] | <card> --met [--env NAME|"<text>"]]
                           # what only Owner can supply; no args is a read-only list
                           # env needs auto-clear only at startup of a linked owning session
