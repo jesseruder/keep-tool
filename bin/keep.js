@@ -4265,9 +4265,11 @@ commands['self-repair'] = async (argv) => {
   if (o.reset) {
     const result = selfRepair.reset(o.reset, { root: ROOT });
     if (o.json) return process.stdout.write(JSON.stringify({ signature: o.reset, ...result }, null, 2) + '\n');
-    return console.log(result.found
-      ? `cleared ${o.reset}; the next tick may open a fresh card for it`
-      : `no such signature: ${o.reset}`);
+    if (!result.found) return console.log(`no such signature: ${o.reset}`);
+    if (!result.cleared) {
+      return console.log(`${o.reset} still has an open card (${result.cardId}); close it first — one repair card per signature`);
+    }
+    return console.log(`cleared ${o.reset}; the next tick may open a fresh card for it`);
   }
   if (o.dry) {
     const value = await selfRepair.dryRun({ root: ROOT });
@@ -5954,6 +5956,12 @@ const REPAIR_RULE = 'this is a Keep self-repair run (KEEP_REPAIR=1): fix the dae
   + 'land through `keep land <card>` after a recorded review, and leave the restart to Owner — '
   + 'step 4 of the repair card says so';
 const GIT_VALUE_FLAGS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env']);
+// The diagnosing agent has every reason to read the live checkout — that is where
+// the daemon's code and history are. It has none to write to it.
+const GIT_READ_ONLY = new Set(['log', 'status', 'diff', 'show', 'rev-parse']);
+const NODE_BINARIES = new Set(['node', 'nodejs']);
+const FETCHERS = new Set(['curl', 'wget', 'fetch']);
+const RESTART_ENDPOINT = '/api/restart-daemon';
 
 function repairMainCheckouts() {
   const base = path.join(os.homedir(), 'keep-tool');
@@ -5967,6 +5975,32 @@ function repairResolvePath(value, cwd) {
   if (!raw) return '';
   const absolute = path.resolve(cwd || process.cwd(), raw).replace(/\/\.git$/, '');
   try { return fs.realpathSync(absolute); } catch { return absolute; }
+}
+
+// Containment, not equality: ~/keep-tool/bin is the live checkout too, and an
+// exact match let `git -C ~/keep-tool/bin commit` straight through.
+function underMainCheckout(candidate) {
+  if (!candidate) return false;
+  for (const root of repairMainCheckouts()) {
+    if (candidate === root || candidate.startsWith(root + path.sep)) return true;
+  }
+  return false;
+}
+
+// `node ~/keep-tool/bin/keep.js restart-daemon` is `keep restart-daemon`, and a
+// shebang invocation of the same file is too. Rewrite both to the plain spelling
+// so one rule covers every way of saying it.
+function repairExecutable(tokens) {
+  const head = stepRegistry.commandBasename(tokens[0]);
+  if (head === 'keep.js') return { head: 'keep', tokens: ['keep', ...tokens.slice(1)] };
+  if (head === 'serve.js') return { head: 'serve.js', tokens };
+  if (!NODE_BINARIES.has(head)) return { head, tokens };
+  const script = tokens.slice(1).find((token) => !token.startsWith('-'));
+  if (!script) return { head, tokens };
+  const name = stepRegistry.commandBasename(script);
+  if (name === 'keep.js') return { head: 'keep', tokens: ['keep', ...tokens.slice(tokens.indexOf(script) + 1)] };
+  if (name === 'serve.js') return { head: 'serve.js', tokens };
+  return { head, tokens };
 }
 
 // Every real invocation in a command, however it is wrapped, with the directory
@@ -5992,7 +6026,8 @@ function repairInvocations(value, depth = 0, cwd = '') {
       if (script !== null) out.push(...repairInvocations(script, depth + 1, current));
       continue;
     }
-    out.push({ head, tokens: stripped, cwd: current });
+    const resolved = repairExecutable(stripped);
+    out.push({ head: resolved.head, tokens: resolved.tokens, cwd: current });
   }
   return out;
 }
@@ -6011,26 +6046,35 @@ function repairDenial(invocation) {
   const args = invocation.tokens.slice(1);
   const first = args.find((token) => !token.startsWith('-')) || '';
   if (head === 'launchctl') return "`launchctl` controls the daemon's launchd job";
+  if (head === 'serve.js') return 'that starts a second keep daemon';
   if (head === 'keep' && first === 'restart-daemon') return '`keep restart-daemon` restarts the daemon you were launched to repair';
   if (head === 'keep' && first === 'service') return "`keep service` installs, starts or stops the daemon's launchd job";
   if (head === 'wt' && first === 'land') return '`wt land` pushes without a review record';
+  // The HTTP spelling of the same restart. Only a fetcher counts: grepping the
+  // endpoint out of the source is exactly what a diagnosing agent should do.
+  if (FETCHERS.has(head) && invocation.tokens.some((token) => String(token).includes(RESTART_ENDPOINT))) {
+    return `that POSTs ${RESTART_ENDPOINT}, which restarts the daemon you were launched to repair`;
+  }
   if (head !== 'git') return '';
-  const checkouts = repairMainCheckouts();
   let targeted = '';
   for (let i = 0; i < args.length; i += 1) {
     const equals = /^--(?:work-tree|git-dir)=(.*)$/.exec(args[i]);
     if (equals) { targeted = repairResolvePath(equals[1], cwd); continue; }
     if (['-C', '--work-tree', '--git-dir'].includes(args[i]) && args[i + 1]) targeted = repairResolvePath(args[i + 1], cwd);
   }
-  // An explicitly targeted main checkout is refused outright; reaching it by
-  // `cd` is refused only for a write, so reading its log stays possible.
-  if (targeted && checkouts.has(targeted)) return `that runs git in ${targeted}, the live keep-tool checkout this daemon runs from`;
-  if (!targeted && cwd && checkouts.has(cwd) && stepRegistry.runsGitWrite(invocation.tokens)) {
-    return `that writes to ${cwd}, the live keep-tool checkout this daemon runs from`;
+  const directory = targeted || cwd;
+  const subcommand = gitSubcommand(args);
+  if (underMainCheckout(directory) && !GIT_READ_ONLY.has(subcommand)) {
+    return `that runs \`git ${subcommand || '(no subcommand)'}\` in ${directory}, the live keep-tool checkout this daemon runs from`
+      + ` (reading it with ${[...GIT_READ_ONLY].join(', ')} is fine)`;
   }
-  if (gitSubcommand(args) === 'push'
-    && args.some((token) => token === '--force' || token === '-f' || token.startsWith('--force-with-lease'))) {
-    return 'a force push rewrites shared history';
+  if (subcommand === 'push') {
+    if (args.some((token) => token === '--force' || token === '-f' || token.startsWith('--force-with-lease'))) {
+      return 'a force push rewrites shared history';
+    }
+    // `git push origin +HEAD:master` is a force push spelled as a refspec.
+    const after = args.slice(args.indexOf('push') + 1).filter((token) => !token.startsWith('-'));
+    if (after.some((token) => token.startsWith('+'))) return 'a leading + in a refspec is a force push';
   }
   return '';
 }

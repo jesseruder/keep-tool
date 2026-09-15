@@ -1051,12 +1051,25 @@ test('the pre-bash guard keeps a self-repair run off the daemon and out of the m
     'keep service restart',
     'launchctl kickstart -k gui/501/com.jesse.keep',
     '/bin/launchctl unload ~/Library/LaunchAgents/com.jesse.keep.plist',
+    // The same restart wearing other clothes: a node wrapper, a shebang run, the
+    // HTTP endpoint, a second daemon.
+    `node ${main}/bin/keep.js restart-daemon`,
+    `${main}/bin/keep.js restart-daemon`,
+    `node ${main}/bin/serve.js`,
+    'curl -X POST -H "x-keep: 1" http://127.0.0.1:8765/api/restart-daemon',
+    'wget --post-data="" http://localhost:8765/api/restart-daemon',
+    // Writes to the live checkout, at the root and below it, targeted or by cd.
     `git -C ${main} commit -am wip`,
-    `git -C ~/keep-tool status`,
+    `git -C ${main}/bin commit -am wip`,
+    `git -C ~/keep-tool add -A`,
     `git --work-tree=${main} add -A`,
     `cd ${main} && git commit -am wip`,
+    `cd ${main}/bin && git commit -am wip`,
+    `cd ~/keep-tool && git pull`,
+    // Force pushes, however spelled.
     'git push --force origin HEAD:master',
     'git push --force-with-lease',
+    'git push origin +HEAD:master',
     'wt land',
     '~/bin/wt land --no-push',
     `bash -lc "keep restart-daemon"`,
@@ -1073,10 +1086,19 @@ test('the pre-bash guard keeps a self-repair run off the daemon and out of the m
     'keep health --json',
     'echo "keep restart-daemon"',
     'grep -rn "launchctl" bin',
+    // Reading the endpoint out of the source is exactly what diagnosis looks like.
+    'grep -rn "/api/restart-daemon" bin',
+    // …and so is reading the live checkout's code and history.
+    `git -C ${main} log -1`,
+    `git -C ${main} status`,
+    `git -C ${main} diff HEAD~1`,
+    `git -C ${main} show 590fe6f`,
+    `git -C ${main} rev-parse HEAD`,
+    `cd ${main} && git log -1`,
     'git commit -am "self-repair: fix the tick"',
     'git push origin HEAD',
-    `cd ${main} && git log -1`,
     'node --test --require ./scripts/test-env.cjs bin/runs.test.js',
+    'node --test --require ./scripts/test-env.cjs bin/serve.test.js',
     'wt ls',
   ]) assert.equal(denied(command), false, command);
 
