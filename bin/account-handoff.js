@@ -342,8 +342,10 @@ function permissionClass(args, options = {}) {
     /(?:^|\s)--model(?:=|\s+)["']?[A-Za-z0-9][A-Za-z0-9._:/-]*["']?(?=\s|$)/g,
     new RegExp(`(?:^|\\s)--settings(?:=|\\s+)(?:'${reviewerSettings}'|"${reviewerSettings}"|${reviewerSettings})(?=\\s|$)`, 'g'),
   ];
-  if (options.mcpConfig) {
-    const mcp = String(options.mcpConfig).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const mcpConfigs = (Array.isArray(options.mcpConfig) ? options.mcpConfig : [options.mcpConfig])
+    .filter((value) => typeof value === 'string' && value);
+  for (const candidate of mcpConfigs) {
+    const mcp = candidate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     allowed.push(new RegExp(`(?:^|\\s)--mcp-config(?:=|\\s+)(?:'${mcp}'|"${mcp}"|${mcp})(?=\\s|$)`, 'g'));
   }
   for (const pattern of allowed) consume(pattern);
@@ -506,12 +508,20 @@ async function run(body, deps = {}) {
       }
     }
     if (!pane.alive) { const error = new Error('Interrupted handoff requires explicit recovery'); error.status = 409; throw error; }
-    let sourceMcpConfig = null;
+    const sourceMcpConfigs = [];
     if (agent === 'claude' && (deps.readSetup || require('./account-setup').readSetup)(source)) {
-      try { sourceMcpConfig = (deps.ensureSharedMemory || require('./account-setup').ensureSharedMemory)(source, session.project || pane.cwd).mcpConfig; }
-      catch (error) { const failure = new Error(`Source account setup is unavailable: ${error.message}`); failure.status = 409; throw failure; }
+      const ensureSharedMemory = deps.ensureSharedMemory || require('./account-setup').ensureSharedMemory;
+      try {
+        sourceMcpConfigs.push(ensureSharedMemory(source, session.project || pane.cwd).mcpConfig);
+        // A session can move into a worktree after launch, so its argv still carries the
+        // managed MCP path keyed by the pane's launch cwd rather than the current project.
+        // It goes through the same check, so only a verified managed file is accepted.
+        if (typeof pane.cwd === 'string' && pane.cwd && pane.cwd !== session.project) {
+          sourceMcpConfigs.push(ensureSharedMemory(source, pane.cwd).mcpConfig);
+        }
+      } catch (error) { const failure = new Error(`Source account setup is unavailable: ${error.message}`); failure.status = 409; throw failure; }
     }
-    if (agent === 'claude' && permissionClass(inspected.processArgs, { mcpConfig: sourceMcpConfig }) == null) {
+    if (agent === 'claude' && permissionClass(inspected.processArgs, { mcpConfig: sourceMcpConfigs }) == null) {
       const error = new Error('Session uses a custom permission configuration that cannot be reproduced safely'); error.status = 409; throw error;
     }
     if (agent === 'claude' && inspected.currentModel && !require('./keep.js').LAUNCH_MODEL_RE.test(inspected.currentModel)) {
@@ -553,7 +563,7 @@ async function run(body, deps = {}) {
       } : {}),
       model: resumeSpec?.model || inspected.currentModel || pane.meta?.model || '',
       ...(resumeSpec ? { resumeSpec } : {}),
-      ...(agent === 'claude' ? { permissionClass: permissionClass(inspected.processArgs, { mcpConfig: sourceMcpConfig }) } : {}) });
+      ...(agent === 'claude' ? { permissionClass: permissionClass(inspected.processArgs, { mcpConfig: sourceMcpConfigs }) } : {}) });
     writeOne(root, current);
     pinSourceAuthority(current, source, root, env);
     let copied = false;

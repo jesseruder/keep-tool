@@ -749,6 +749,60 @@ test('custom settings, tool aliases, and restricted mode are refused before sour
     assert.equal(result.status, 'done', 'the exact generated reviewer settings are reproducible');
     assert.equal(handoff.permissionClass(`claude --mcp-config '${path.join(f.base, 'managed mcp.json')}' --resume ${f.sid}`,
       { mcpConfig: path.join(f.base, 'managed mcp.json') }), 'restricted', 'the exact generated managed MCP path is reproducible');
+    const candidates = [path.join(f.base, 'project mcp.json'), path.join(f.base, 'launch mcp.json')];
+    for (const candidate of candidates) {
+      assert.equal(handoff.permissionClass(`claude --mcp-config '${candidate}' --resume ${f.sid}`, { mcpConfig: candidates }),
+        'restricted', 'either managed MCP candidate is reproducible');
+    }
+    assert.equal(handoff.permissionClass(`claude --mcp-config '${path.join(f.base, 'other mcp.json')}' --resume ${f.sid}`,
+      { mcpConfig: candidates }), null, 'an unrelated MCP path is still refused');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('a session that moved out of its launch directory keeps its managed MCP configuration', async () => {
+  const f = fixture();
+  try {
+    const setup = require('./account-setup');
+    const worktree = path.join(f.base, 'worktree'); fs.mkdirSync(worktree);
+    const launchMcpConfig = setup.mcpConfigPath(f.profiles.one, f.project);
+    const verified = [];
+    const d = deps(f, {
+      readSetup: () => ({ version: 1 }),
+      ensureSharedMemory: (_source, cwd) => {
+        verified.push(cwd);
+        return { mcpConfig: setup.mcpConfigPath(f.profiles.one, cwd) };
+      },
+    });
+    d.inspect = async () => ({ session: { id: f.sid, kind: 'claude', project: worktree, endedTurn: true }, pane: d.pane,
+      processArgs: `claude --mcp-config ${launchMcpConfig} --resume ${f.sid}`, currentModel: 'claude-opus-4-1',
+      agentIdentity: d.pane.meta.accountId === 'two'
+        ? { pid: 21, pidStart: 'target-start', primary: true, ownsPane: true }
+        : { pid: 11, pidStart: 'source-start', primary: true, ownsPane: true } });
+    const result = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d);
+    assert.equal(result.status, 'done', 'the managed MCP path keyed by the launch cwd is reproducible');
+    assert.deepEqual(verified, [worktree, f.project], 'both candidates are verified as managed configurations');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('a conflicting managed MCP configuration at the launch cwd is refused before source exit', async () => {
+  const f = fixture();
+  try {
+    const setup = require('./account-setup');
+    const worktree = path.join(f.base, 'worktree'); fs.mkdirSync(worktree);
+    const launchMcpConfig = setup.mcpConfigPath(f.profiles.one, f.project);
+    const d = deps(f, {
+      readSetup: () => ({ version: 1 }),
+      ensureSharedMemory: (_source, cwd) => {
+        if (cwd === f.project) throw new Error(`managed MCP configuration conflicts for ${cwd}`);
+        return { mcpConfig: setup.mcpConfigPath(f.profiles.one, cwd) };
+      },
+    });
+    d.inspect = async () => ({ session: { id: f.sid, kind: 'claude', project: worktree, endedTurn: true }, pane: d.pane,
+      processArgs: `claude --mcp-config ${launchMcpConfig} --resume ${f.sid}`, currentModel: 'claude-opus-4-1' });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d),
+      /Source account setup is unavailable: managed MCP configuration conflicts/);
+    assert.equal(d.pane.alive, true, 'the source session is left running');
+    assert.equal(accounts.forSession(f.sid, 'claude', { root: f.root, env: f.env }).id, 'one');
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
