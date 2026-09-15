@@ -24,10 +24,14 @@ const SHADOW_LIMIT = 8;
 const DEFAULT_INTERVAL_MIN = 30;
 // `wt land` rebases a worktree branch onto origin/<default> before pushing, so a
 // cited sha is almost never the sha that lands. The patch is the same one, and
-// `git patch-id --stable` is what says so. The scan looks one day either side of
-// the check-in that cited the commit and stops at 300 commits.
+// `git patch-id --stable` is what says so. A citation matches only a commit that
+// reached the branch within a day before the check-in that cited it, the scan
+// stops at 300 commits, and a citation that does not match is retried every six
+// hours and given up on a week after its check-in.
 const REBASE_WINDOW_MS = 86400e3;
 const REBASE_SCAN_LIMIT = 300;
+const REBASE_RETRY_MS = 6 * 3600e3;
+const REBASE_GIVE_UP_MS = 7 * 86400e3;
 const PATCH_MAX_BUFFER = 256 * 1024 * 1024;
 const FIRST_RUN_MS = 2 * 60e3;
 const MODEL_TIMEOUT_MS = 120e3;
@@ -143,9 +147,26 @@ function loadState() {
   return state;
 }
 
-function loadRecords(id) {
-  const records = readJson(cardFile(id), []);
-  return Array.isArray(records) ? records.filter((record) => record && typeof record.sha === 'string') : [];
+// A card's local landed evidence: the records, plus the patch-id attempts that
+// keep an unmatched citation from being derived again every half hour. Older
+// registries hold a bare array of records, which is still what a card with
+// nothing to remember is written as.
+function loadCard(id) {
+  const value = readJson(cardFile(id), []);
+  const clean = (records) => (Array.isArray(records) ? records : [])
+    .filter((record) => record && typeof record.sha === 'string');
+  if (Array.isArray(value)) return { records: clean(value), attempts: {} };
+  if (!value || typeof value !== 'object') return { records: [], attempts: {} };
+  const attempts = value.attempts && typeof value.attempts === 'object' && !Array.isArray(value.attempts)
+    ? value.attempts : {};
+  return { records: clean(value.records), attempts };
+}
+
+function loadRecords(id) { return loadCard(id).records; }
+
+function saveCard(id, records, attempts) {
+  const remembered = attempts && Object.keys(attempts).length ? attempts : null;
+  writeJsonAtomic(cardFile(id), remembered ? { version: 2, records, attempts: remembered } : records);
 }
 
 function isReviewEntry(entry) {
@@ -269,7 +290,7 @@ function isOnDefault(repo, sha, branch) {
 // ---------- rebased citations ----------
 
 function patchCaches() {
-  return { patchIds: new Map(), indexes: new Map() };
+  return { patchIds: new Map(), indexes: new Map(), since: new Map() };
 }
 
 function commitExists(repo, sha) {
@@ -277,72 +298,154 @@ function commitExists(repo, sha) {
   catch { return false; }
 }
 
+// The window a citation may match in. A commit that reached the branch more than
+// a day before the check-in that cites it is older work that happens to carry the
+// same diff, not this card's commit under a new sha.
+function citationSince(citation, now) {
+  return (stampMs(citation.entryStamp) || now) - REBASE_WINDOW_MS;
+}
+
 // A worktree commit is visible from the card's repo: linked worktrees share the
 // main checkout's object store. A merge (or an empty commit) has no single patch,
 // so it has no identity to match on and is skipped.
 function citedPatchId(repo, sha, cache) {
-  const key = `${repo} ${sha}`;
+  const key = `${repo}@${sha}`;
   if (cache.has(key)) return cache.get(key);
   let id = '';
   try {
-    const deps = require('./reviews.js').gitDeps(repo);
-    if (deps.parents(sha).length <= 1) id = deps.patchId(sha);
+    const parents = git(repo, ['log', '-1', '--format=%P', sha]).trim().split(/\s+/).filter(Boolean);
+    if (parents.length <= 1) {
+      const patch = git(repo, ['diff-tree', '-p', '--no-color', sha], 10e3, { maxBuffer: PATCH_MAX_BUFFER });
+      if (patch.trim()) {
+        const out = git(repo, ['patch-id', '--stable'], 10e3, {
+          input: patch, stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: PATCH_MAX_BUFFER,
+        });
+        id = out.trim().split(/\s+/)[0] || '';
+      }
+    }
   } catch {}
   cache.set(key, id);
   return id;
 }
 
-// patch-id → sha for the default branch's recent commits. One `git log -p` and
-// one `git patch-id` per repository per sweep: patch-id reads a stream of
-// patches and names the commit each one came from, and merges contribute none.
-function defaultPatchIndex(repo, branch, sinceMs, cache) {
-  const prior = cache.get(repo);
-  // An index built from an earlier point covers everything a later one would:
-  // both take the newest REBASE_SCAN_LIMIT commits of a nested set.
+// patch-id -> { sha, at } for the default branch's recent commits, built once per
+// repository per sweep from the oldest window any of this sweep's citations could
+// need (caches.since, filled in before the first lookup). The index is therefore
+// usually wider than one citation's window, so every lookup filters by commit
+// time; it is never rebuilt for a narrower one. Three git calls: `git log -p`
+// streamed into `git patch-id`, which names the commit each patch came from and
+// emits nothing for merges, plus one cheap pass for the commit times.
+function defaultPatchIndex(repo, branch, caches, fallbackSince) {
+  const sinceMs = Math.min(caches.since.get(repo) ?? fallbackSince, fallbackSince);
+  const prior = caches.indexes.get(repo);
   if (prior && prior.branch === branch && prior.sinceMs <= sinceMs) return prior.index;
   const index = new Map();
+  const range = ['-n', String(REBASE_SCAN_LIMIT), `--since=${new Date(sinceMs).toISOString()}`,
+    `refs/remotes/origin/${branch}`];
   try {
-    const log = git(repo, [
-      'log', '--no-color', '--format=commit %H', '-p', '-n', String(REBASE_SCAN_LIMIT),
-      `--since=${new Date(sinceMs).toISOString()}`, `refs/remotes/origin/${branch}`,
-    ], 30e3, { maxBuffer: PATCH_MAX_BUFFER });
+    const at = new Map();
+    for (const line of git(repo, ['log', '--no-color', '--format=%H %ct', ...range], 30e3).split('\n')) {
+      const [sha, seconds] = line.trim().split(/\s+/);
+      if (sha && seconds) at.set(sha, Number(seconds) * 1000);
+    }
+    const log = git(repo, ['log', '--no-color', '--format=commit %H', '-p', ...range], 30e3,
+      { maxBuffer: PATCH_MAX_BUFFER });
     if (log.trim()) {
       const out = git(repo, ['patch-id', '--stable'], 30e3, {
         input: log, stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: PATCH_MAX_BUFFER,
       });
       for (const line of out.split('\n')) {
         const [id, sha] = line.trim().split(/\s+/);
-        if (id && sha && !index.has(id)) index.set(id, sha);
+        // A commit whose time did not come back stays unmatchable rather than
+        // matching outside every window.
+        if (id && sha && !index.has(id)) index.set(id, { sha, at: at.get(sha) ?? 0 });
       }
     }
   } catch {}
-  cache.set(repo, { branch, sinceMs, index });
+  caches.indexes.set(repo, { branch, sinceMs, index });
   return index;
 }
 
-// The sha on the default branch carrying the same patch as `citation.sha`, or
-// null. Never the citation itself: a cited sha already on the branch takes the
-// direct path.
-function rebasedSha(repo, branch, citation, caches, now) {
-  if (!commitExists(repo, citation.sha)) return null;
-  const id = citedPatchId(repo, citation.sha, caches.patchIds);
-  if (!id) return null;
-  const stamp = stampMs(citation.entryStamp) || now;
-  const landedSha = defaultPatchIndex(repo, branch, stamp - REBASE_WINDOW_MS, caches.indexes).get(id);
-  return landedSha && !sameSha(landedSha, citation.sha) ? landedSha : null;
+// The sha on the default branch carrying the same patch as the citation, inside
+// the citation's own window. Never the citation itself: a cited sha already on
+// the branch takes the direct path.
+function rebasedSha(repo, branch, citation, patchId, caches, now) {
+  const windowStart = citationSince(citation, now);
+  const hit = defaultPatchIndex(repo, branch, caches, windowStart).get(patchId);
+  if (!hit || !(hit.at >= windowStart) || sameSha(hit.sha, citation.sha)) return null;
+  return hit.sha;
+}
+
+// An attempt or alias remembered for this citation, matched by prefix so the
+// short and long spellings of one sha share an entry.
+function attemptFor(attempts, sha) {
+  if (attempts && Object.hasOwn(attempts, sha)) return attempts[sha];
+  for (const [key, value] of Object.entries(attempts || {})) if (sameSha(key, sha)) return value;
+  return null;
+}
+
+// Whether the patch-id path is worth walking again. An unmatched citation is
+// retried every REBASE_RETRY_MS rather than every sweep, and given up on a week
+// after the check-in that cited it: by then the commit either landed or will not.
+function shouldTryRebase(prior, citation, now) {
+  if (now - (stampMs(citation.entryStamp) || now) > REBASE_GIVE_UP_MS) return false;
+  if (!prior) return true;
+  const last = Number(prior.lastTriedAt);
+  if (!Number.isFinite(last)) return true;
+  return !(now - last >= 0 && now - last < REBASE_RETRY_MS);
 }
 
 // The landed record for a citation, or null when it has not landed. A rebased
 // citation records the sha that landed and keeps the cited spelling as an alias,
 // so provenance resolves for either one.
-function landedRecord(repo, branch, citation, caches, now, allowRebase = true) {
+//
+// `attempts` is the card's remembered patch-id work, including the aliases its
+// records already hold; `onAttempt` records a fresh one. Between them nothing
+// here is derived twice in a sweep, or again in the next one.
+function landedRecord(repo, branch, citation, caches, now, options = {}) {
+  const alias = (sha) => ({ sha, citedSha: citation.sha, branch, landedAt: now, entryStamp: citation.entryStamp });
   if (isOnDefault(repo, citation.sha, branch)) {
     return { sha: citation.sha, branch, landedAt: now, entryStamp: citation.entryStamp };
   }
-  if (!allowRebase) return null;
-  const sha = rebasedSha(repo, branch, citation, caches, now);
-  if (!sha) return null;
-  return { sha, citedSha: citation.sha, branch, landedAt: now, entryStamp: citation.entryStamp };
+  if (options.allowRebase === false) return null;
+  const prior = attemptFor(options.attempts, citation.sha);
+  if (prior && prior.landedSha && isOnDefault(repo, prior.landedSha, branch)) return alias(prior.landedSha);
+  if (!shouldTryRebase(prior, citation, now)) return null;
+  const patchId = (prior && prior.patchId)
+    || (commitExists(repo, citation.sha) ? citedPatchId(repo, citation.sha, caches.patchIds) : '');
+  const sha = patchId ? rebasedSha(repo, branch, citation, patchId, caches, now) : null;
+  if (options.onAttempt) {
+    options.onAttempt(citation.sha, {
+      patchId,
+      lastTriedAt: now,
+      tries: (Number(prior && prior.tries) || 0) + 1,
+      ...(sha ? { landedSha: sha } : {}),
+    });
+  }
+  return sha ? alias(sha) : null;
+}
+
+// A card's remembered patch-id work, with the aliases its records already carry
+// folded in: a citation whose landed sha is recorded is answered from the record
+// rather than derived again. Only the stored half is ever written back.
+function aliasView(card) {
+  const view = { ...card.attempts };
+  for (const record of card.records) {
+    if (!record.citedSha) continue;
+    view[record.citedSha] = { ...(view[record.citedSha] || {}), landedSha: record.sha };
+  }
+  return view;
+}
+
+// Attempts for citations the card no longer makes are dropped: a rewritten
+// check-in must not leave its shas remembered forever.
+function liveAttempts(attempts, entries) {
+  const cited = citedShas(entries).map((citation) => citation.sha);
+  const kept = {};
+  for (const [sha, value] of Object.entries(attempts || {})) {
+    if (cited.some((citation) => sameSha(citation, sha))) kept[sha] = value;
+  }
+  return kept;
 }
 
 function recordShas(records) {
@@ -612,13 +715,15 @@ function rulesDecision(entry, task, policy, now) {
   };
 }
 
-function closeContext(task, entries, repo, branch, fetchOk, policy, now, caches = patchCaches()) {
+function closeContext(task, entries, repo, branch, fetchOk, policy, now, caches = patchCaches(), attempts = {}) {
   const entry = newestPolicyEntry(entries, policy);
   if (!fetchOk || !entry) return null;
   if (task.fm.status !== 'review' && task.fm.status !== 'landing') return null;
   const citations = citedShas([entry]);
   if (!citations.length) return null;
-  const items = citations.map((citation) => landedRecord(repo, branch, citation, caches, now));
+  // No onAttempt: the close gate reads the sweep's remembered work rather than
+  // spending its own, so a citation is never derived twice for one card.
+  const items = citations.map((citation) => landedRecord(repo, branch, citation, caches, now, { attempts }));
   if (items.some((item) => !item)) return null;
   return { entry, items, shas: items.map((item) => item.sha), rules: rulesDecision(entry, task, policy, now) };
 }
@@ -716,6 +821,10 @@ async function sweep({ now = Date.now(), dry = false, only } = {}) {
     });
   }
 
+  // The oldest window any citation could need, per repository, before the first
+  // lookup: the patch-id index is built once from it, and a card swept later
+  // never finds a narrower index already cached and rebuilds it.
+  const prepared = [];
   for (const task of tasks) {
     if (!OPEN_STATUSES.has(task.fm.status)) continue;
     const entries = review.stampedLogEntries(task.body);
@@ -725,6 +834,15 @@ async function sweep({ now = Date.now(), dry = false, only } = {}) {
     if (!repo) continue;
     const branch = defaultBranch(repo);
     if (!branch) continue;
+    prepared.push({ task, entries, repo, branch });
+    for (const citation of citedShas(entries)) {
+      const since = citationSince(citation, now);
+      const prior = caches.since.get(repo);
+      if (prior === undefined || since < prior) caches.since.set(repo, since);
+    }
+  }
+
+  for (const { task, entries, repo, branch } of prepared) {
     if (!fetchResults.has(repo)) fetchResults.set(repo, fetchDefault(repo, branch, state, now));
     const failure = fetchResults.get(repo);
     const fetchOk = !failure;
@@ -736,23 +854,34 @@ async function sweep({ now = Date.now(), dry = false, only } = {}) {
       if (!dry) persistState(state, now);
     }
 
-    const existing = loadRecords(task.id);
+    const card = loadCard(task.id);
+    const existing = card.records;
     const recorded = recordShas(existing).concat(daemonRecordedShas(entries));
+    // What this card already knows about its citations: the attempts it stored,
+    // plus the aliases its records carry. attemptUpdates is the part worth
+    // writing back.
+    const attempts = aliasView(card);
+    const attemptUpdates = {};
+    const onAttempt = (sha, value) => { attempts[sha] = value; attemptUpdates[sha] = value; };
     const fresh = [];
     for (const citation of citedShas(entries)) {
       if (recorded.some((sha) => sameSha(sha, citation.sha))) continue;
-      // Patch-id matching costs two git calls per repository, so it stays off
-      // when the fetch failed and origin's ref is only as good as the last one.
-      const record = landedRecord(repo, branch, citation, caches, now, fetchOk);
+      // Patch-id matching costs git calls the stale-ref path does not, so it
+      // stays off when the fetch failed and origin's ref is only as good as the
+      // last successful one.
+      const record = landedRecord(repo, branch, citation, caches, now,
+        { allowRebase: fetchOk, attempts, onAttempt });
       if (!record) continue;
       const known = recorded.some((sha) => sameSha(sha, record.sha));
       recorded.push(citation.sha);
+      // An alias for a sha another citation already recorded adds no record, but
+      // onAttempt has stored the match, so it is never derived again.
       if (known) continue;
       fresh.push(record);
       if (record.citedSha) recorded.push(record.sha);
     }
 
-    const context = closeContext(task, entries, repo, branch, fetchOk, config.policy, now, caches);
+    const context = closeContext(task, entries, repo, branch, fetchOk, config.policy, now, caches, attempts);
     const prior = context && priorDecisions.get(task.id);
     const alreadyJudged = Boolean(prior && prior.entryKey === entryKey(context && context.entry) && prior.policy === config.policy);
     let modelDecision = null;
@@ -804,9 +933,18 @@ async function sweep({ now = Date.now(), dry = false, only } = {}) {
       const currentTask = keep.loadTask(task.id);
       if (!OPEN_STATUSES.has(currentTask.fm.status)) return;
       const currentConfig = loadConfig();
-      const currentRecords = loadRecords(task.id);
+      const currentCard = loadCard(task.id);
+      const currentRecords = currentCard.records;
       const currentEntries = review.stampedLogEntries(currentTask.body);
-      const currentContext = closeContext(currentTask, currentEntries, repo, branch, fetchOk, currentConfig.policy, now, caches);
+      // Remembered before anything below can return: the whole point of the
+      // attempts map is that a citation which did not match is not derived again
+      // on the next sweep, whatever this one decides.
+      const nextAttempts = liveAttempts({ ...currentCard.attempts, ...attemptUpdates }, currentEntries);
+      if (JSON.stringify(nextAttempts) !== JSON.stringify(currentCard.attempts)) {
+        saveCard(task.id, currentRecords, nextAttempts);
+      }
+      const currentContext = closeContext(currentTask, currentEntries, repo, branch, fetchOk, currentConfig.policy, now,
+        caches, aliasView({ records: currentRecords, attempts: nextAttempts }));
       // A judge or dry-mode flip during the unlocked model call invalidates the
       // judgement as surely as a policy flip: record and let the next sweep judge
       // under the new config rather than close on the rules alone.
@@ -933,7 +1071,7 @@ async function sweep({ now = Date.now(), dry = false, only } = {}) {
         withinLock: true,
         commit: false,
       });
-      if (pending.length) writeJsonAtomic(cardFile(task.id), records);
+      if (pending.length) saveCard(task.id, records, nextAttempts);
       keep.commitAndPush(`keep: landed ${task.id}${closed ? ' (done)' : ''}`);
       action = {
         id: task.id, shas,
@@ -1088,8 +1226,11 @@ module.exports = {
   isOnDefault,
   REBASE_SCAN_LIMIT,
   REBASE_WINDOW_MS,
+  REBASE_RETRY_MS,
+  REBASE_GIVE_UP_MS,
   patchCaches,
   landedRecord,
+  loadCard,
   nextStepIsLanding,
   otherPendingStep,
   rulesDecision,

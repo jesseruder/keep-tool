@@ -1749,10 +1749,13 @@ test('sweep matches a rebased citation by patch-id and records the cited sha as 
     assert.equal(rebased.closed, false);
     assert.equal(result.landed.find((item) => item.id === 'rebased-landing').closed, true);
 
-    const records = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'landed', 'rebased.json'), 'utf8'));
-    assert.deepEqual(records.map(({ sha, citedSha, branch }) => ({ sha, citedSha, branch })), [
+    const card = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'landed', 'rebased.json'), 'utf8'));
+    assert.deepEqual(card.records.map(({ sha, citedSha, branch }) => ({ sha, citedSha, branch })), [
       { sha: landedSha, citedSha: featureSha, branch: 'main' },
     ]);
+    // The match is remembered, so the next sweep answers from it.
+    assert.equal(card.attempts[featureSha].landedSha, landedSha);
+    assert.equal(card.attempts[featureSha].tries, 1);
 
     const annotated = fs.readFileSync(path.join(root, 'tasks', 'rebased.md'), 'utf8');
     assert.match(annotated, /— landed \(daemon\)\n/);
@@ -1768,6 +1771,133 @@ test('sweep matches a rebased citation by patch-id and records the cited sha as 
     const beforeSecond = taskSnapshot(root);
     assert.deepEqual(runSweep(env, now + 1000).landed, []);
     assert.deepEqual(taskSnapshot(root), beforeSecond);
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test('a citation matches only inside its own window, whatever the shared index covers', () => {
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-landed-window-'));
+  const origin = path.join(temp, 'origin.git');
+  const repo = path.join(temp, 'project');
+  const root = path.join(temp, 'registry');
+  const env = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', TZ: 'UTC' };
+  for (const key of ['CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID']) delete env[key];
+  const now = Date.now();
+  const day = 86400e3;
+  const at = (offset) => new Date(now - offset).toISOString();
+  const stampAt = (offset) => new Date(now - offset).toISOString().slice(0, 16).replace('T', ' ');
+  try {
+    runGit(['init', '-q', '--bare', '--initial-branch=main', origin], { env });
+    runGit(['init', '-q', '--initial-branch=main', repo], { env });
+    configureGit(repo, env);
+    const commit = (file, body, message, offset) => {
+      fs.writeFileSync(path.join(repo, file), body);
+      runGit(['-C', repo, 'add', file], { env });
+      runGit(['-C', repo, 'commit', '-q', '-m', message],
+        { env: { ...env, GIT_AUTHOR_DATE: at(offset), GIT_COMMITTER_DATE: at(offset) } });
+      return runGit(['-C', repo, 'rev-parse', 'HEAD'], { env });
+    };
+    const baseSha = commit('base.txt', 'base\n', 'base', 10 * day);
+    runGit(['-C', repo, 'remote', 'add', 'origin', origin], { env });
+    runGit(['-C', repo, 'push', '-q', '-u', 'origin', 'main'], { env });
+    runGit(['-C', repo, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main'], { env });
+
+    // The old card's worktree commit, and the sha its patch got on main three days ago.
+    runGit(['-C', repo, 'switch', '-q', '-c', 'wt/old', baseSha], { env });
+    const oldSha = commit('same.txt', 'same\n', 'old: the work', 4 * day);
+    runGit(['-C', repo, 'switch', '-q', 'main'], { env });
+    runGit(['-C', repo, 'cherry-pick', oldSha], { env: { ...env, GIT_COMMITTER_DATE: at(3 * day) } });
+    const landedSha = runGit(['-C', repo, 'rev-parse', 'HEAD'], { env });
+    runGit(['-C', repo, 'push', '-q', 'origin', 'main'], { env });
+
+    // A brand-new branch commit with the same diff and nothing to do with it.
+    runGit(['-C', repo, 'switch', '-q', '-c', 'wt/new', baseSha], { env });
+    const newSha = commit('same.txt', 'same\n', 'new: unrelated work with the same diff', 0);
+    runGit(['-C', repo, 'switch', '-q', 'main'], { env });
+    assert.notEqual(oldSha, newSha);
+    assert.notEqual(oldSha, landedSha);
+
+    initRegistry(root, env);
+    // "older" sorts first, so it warms the index before "recent" is swept.
+    writeTask(root, 'older', {
+      status: 'review', project: repo, sha: oldSha, next: 'Next: Owner review', stamp: stampAt(3 * day),
+    });
+    writeTask(root, 'recent', {
+      status: 'review', project: repo, sha: newSha, next: 'Next: Owner review', stamp: stampAt(0),
+    });
+    runGit(['-C', root, 'add', 'tasks'], { env });
+    runGit(['-C', root, 'commit', '-q', '-m', 'fixtures'], { env });
+
+    const result = runSweep(env, now);
+    assert.deepEqual(result.landed.map((item) => item.id), ['older']);
+    assert.deepEqual(result.landed[0].matched, [{ sha: landedSha, citedSha: oldSha }]);
+    assert.doesNotMatch(fs.readFileSync(path.join(root, 'tasks', 'recent.md'), 'utf8'), /landed \(daemon\)/);
+    // The patch was found; the window is what refused it.
+    const recent = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'landed', 'recent.json'), 'utf8'));
+    assert.equal(recent.attempts[newSha].landedSha, undefined);
+    assert.ok(recent.attempts[newSha].patchId);
+    const older = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'landed', 'older.json'), 'utf8'));
+    assert.equal(older.attempts[oldSha].patchId, recent.attempts[newSha].patchId, 'the same patch, either way');
+  } finally {
+    fs.rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test('an unmatched citation is retried on a schedule, not every sweep, and given up on after a week', () => {
+  const { temp, repo, root, env } = landedFixture('keep-landed-retry-');
+  const now = Date.now();
+  const stamp = new Date(now).toISOString().slice(0, 16).replace('T', ' ');
+  // Count the patch-id work by counting the git calls the repository sees.
+  const calls = path.join(temp, 'git-calls');
+  const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+  const shim = path.join(temp, 'bin');
+  fs.mkdirSync(shim);
+  fs.writeFileSync(path.join(shim, 'git'), [
+    '#!/bin/sh',
+    `for a in "$@"; do case "$a" in patch-id) echo patch-id >> ${JSON.stringify(calls)};; esac; done`,
+    `exec ${JSON.stringify(realGit)} "$@"`,
+    '',
+  ].join('\n'), { mode: 0o755 });
+  const counted = { ...env, PATH: `${shim}:${process.env.PATH}` };
+  const patchIdCalls = () => {
+    try { return fs.readFileSync(calls, 'utf8').trim().split('\n').filter(Boolean).length; }
+    catch { return 0; }
+  };
+  try {
+    runGit(['-C', repo, 'switch', '-q', '-c', 'wt/stray'], { env });
+    fs.writeFileSync(path.join(repo, 'stray.txt'), 'stray\n');
+    runGit(['-C', repo, 'add', 'stray.txt'], { env });
+    runGit(['-C', repo, 'commit', '-q', '-m', 'stray'], { env });
+    const straySha = runGit(['-C', repo, 'rev-parse', 'HEAD'], { env });
+    runGit(['-C', repo, 'switch', '-q', 'main'], { env });
+    writeTask(root, 'stray-card', { status: 'review', project: repo, sha: straySha, next: 'Next: Owner review', stamp });
+    runGit(['-C', root, 'add', 'tasks'], { env });
+    runGit(['-C', root, 'commit', '-q', '-m', 'fixtures'], { env });
+
+    runSweep(counted, now);
+    // Two: the cited commit's own patch-id, and the one pass over the branch.
+    const first = patchIdCalls();
+    assert.equal(first, 2);
+    const attempts = () => JSON.parse(fs.readFileSync(path.join(root, '.keep', 'landed', 'stray-card.json'), 'utf8')).attempts;
+    assert.equal(attempts()[straySha].tries, 1);
+    assert.equal(attempts()[straySha].landedSha, undefined);
+
+    // Half an hour later: nothing is derived again.
+    runSweep(counted, now + 30 * 60e3);
+    assert.equal(patchIdCalls(), first, 'a sweep inside the retry window spends nothing');
+    assert.equal(attempts()[straySha].tries, 1);
+
+    // Past the retry window the citation is tried again — the branch index is
+    // rebuilt, but the cited commit's patch-id comes from the card.
+    runSweep(counted, now + 7 * 3600e3);
+    assert.equal(attempts()[straySha].tries, 2);
+    assert.equal(patchIdCalls(), first + 1, 'the remembered patch-id is not derived twice');
+
+    // A week after the check-in it is given up on.
+    const before = attempts();
+    runSweep(counted, now + 8 * 86400e3);
+    assert.deepEqual(attempts(), before, 'no further attempts after the give-up window');
   } finally {
     fs.rmSync(temp, { recursive: true, force: true });
   }
