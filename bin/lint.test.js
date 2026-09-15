@@ -879,3 +879,65 @@ test('a relative project is unresolvable, not resolved against the daemon cwd', 
     for (const item of findings) assert.match(item.text, /is not a directory on this host/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('the daemon refreshes the lint snapshot on a clock, in a child process', async () => {
+  const lintTool = require('./lint.js');
+  const root = makeRoot();
+  try {
+    const calls = [];
+    const execFile = (bin, args, opts, callback) => {
+      calls.push({ bin, args, timeout: opts.timeout, dir: opts.env.KEEP_DIR });
+      setImmediate(() => callback(null, JSON.stringify({ findings: [{ rule: 'stale-active' }, { rule: 'missing-project' }] }), ''));
+    };
+    const recorded = [];
+    const record = (name, value) => recorded.push({ name, ...value });
+
+    const scheduler = lintTool.startScheduler({ execFile, record, root });
+    clearInterval(scheduler.timer);
+    clearTimeout(scheduler.initial);
+    await scheduler.run();
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].bin, process.execPath, 'a child process, never lint() on the daemon loop');
+    assert.deepEqual(calls[0].args.slice(-2), ['lint', '--json']);
+    assert.equal(calls[0].timeout, lintTool.LINT_TIMEOUT_MS);
+    assert.equal(calls[0].dir, root);
+    assert.deepEqual(recorded, [{ name: 'lint', ok: true, cadenceMs: lintTool.LINT_EVERY_MS, detail: '2 finding(s)' }]);
+    assert.equal(require('./health.js').CADENCES.lint.cadenceMs, 30 * 60e3, 'silence detection knows the cadence');
+
+    // A failing child is a health failure, with the child's own words, bounded.
+    const failing = lintTool.startScheduler({ record, root, execFile: (bin, args, opts, callback) => {
+      setImmediate(() => callback(new Error('timed out'), '', 'fatal: not a git repository\n'));
+    } });
+    clearInterval(failing.timer);
+    clearTimeout(failing.initial);
+    await failing.run();
+    assert.equal(recorded[1].ok, false);
+    assert.match(String(recorded[1].error.message), /not a git repository/);
+
+    // One at a time: a slow lint must not be started again on the next interval.
+    let release;
+    const slow = lintTool.startScheduler({ record, root, execFile: (bin, args, opts, callback) => { release = () => callback(null, '{}', ''); } });
+    clearInterval(slow.timer);
+    clearTimeout(slow.initial);
+    const first = slow.run();
+    assert.deepEqual(await slow.run(), { skipped: 'in progress' });
+    release();
+    await first;
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('snapshotAgeMs reads the snapshot stamp, not the file mtime', () => {
+  const lintTool = require('./lint.js');
+  const root = makeRoot();
+  const now = Date.parse('2026-09-14T12:00:00.000Z');
+  try {
+    assert.equal(lintTool.snapshotAgeMs(root, now), Infinity, 'no snapshot is infinitely old');
+    fs.mkdirSync(path.join(root, '.keep'), { recursive: true });
+    const write = (at) => fs.writeFileSync(path.join(root, '.keep', 'lint.json'), JSON.stringify({ at, findings: [] }));
+    write(new Date(now - 10 * 60e3).toISOString());
+    assert.equal(lintTool.snapshotAgeMs(root, now), 10 * 60e3);
+    write('not a date');
+    assert.equal(lintTool.snapshotAgeMs(root, now), Infinity);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

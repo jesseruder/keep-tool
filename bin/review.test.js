@@ -3229,3 +3229,76 @@ test('a silent reviewer in events mode still goes red, at the cadence it actuall
   assert.equal(health.stateOf(row(now - 8 * 3600e3), now), 'silent', 'but a reviewer nothing has evaluated all day is not');
   assert.equal(health.stateOf({ ...row(now - 60e3), consecutiveFailures: 3 }, now), 'failing');
 });
+
+test('a tick refreshes the lint snapshot before waking the reviewer', async () => {
+  const cadence = require('./review.js');
+  const lintTool = require('./lint.js');
+  let refreshes = 0;
+  let ageMs = 4 * 3600e3;
+  const sent = [];
+  const deps = {
+    sessions: () => [],
+    findReviewer: () => ({ id: 'reviewer-1', state: 'idle', endedTurn: true }),
+    reviewBudget: () => ({ code: 0, reason: 'within budget' }),
+    send: async (id, text) => { sent.push(text); },
+    lintSnapshotAgeMs: () => ageMs,
+    refreshLint: async () => { refreshes += 1; ageMs = 0; return { ok: true }; },
+  };
+
+  // A stale snapshot is refreshed before the reviewer is told to read a bundle.
+  assert.deepEqual(await cadence.refreshLintSnapshot(deps), { ok: true, ageMs: 4 * 3600e3 });
+  assert.equal(refreshes, 1);
+
+  // Fresher than the lint scheduler's own interval: nothing to do.
+  ageMs = 60e3;
+  const skipped = await cadence.refreshLintSnapshot(deps);
+  assert.equal(skipped.skipped, true);
+  assert.equal(refreshes, 1);
+
+  // A failing refresh is never fatal — an old snapshot beats no tick.
+  ageMs = 4 * 3600e3;
+  const failing = await cadence.refreshLintSnapshot({
+    lintSnapshotAgeMs: () => ageMs,
+    refreshLint: async () => { throw new Error('git is wedged'); },
+  });
+  assert.equal(failing.ok, false);
+  assert.match(String(failing.error.message), /git is wedged/);
+
+  // And a real drift wake goes through that same path before it types anything.
+  ageMs = 4 * 3600e3;
+  refreshes = 0;
+  const woken = await cadence.driftWake(deps, { sessionId: 'sess-lint', turn: 1, cardId: 'c', stateLine: 's', reason: 'r' });
+  assert.equal(woken.sent, true);
+  assert.equal(refreshes, 1, 'the bundle the reviewer is about to build reads a current snapshot');
+  assert.equal(sent.length, 1);
+  assert.ok(lintTool.LINT_EVERY_MS > 0);
+});
+
+test('a stale lint block tells the reviewer the refusal is off, not on', () => {
+  const { cachedLintSection } = require('./review.js');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-lint-header-'));
+  const now = Date.parse('2026-09-14T12:00:00.000Z');
+  const write = (at) => {
+    fs.mkdirSync(path.join(root, '.keep'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.keep', 'lint.json'), JSON.stringify({
+      at, findings: [{ id: 'card-a', rule: 'stale-active', severity: 'med', text: 'stale', fix: 'keep checkin' }],
+    }));
+  };
+  try {
+    write(new Date(now - 10 * 60e3).toISOString());
+    const fresh = cachedLintSection('card-a', root, now).join('\n');
+    assert.match(fresh, /review-land refuses a note a lint rule already covers/);
+    assert.equal(fresh.includes('will not refuse'), false);
+
+    // Older than the refusal window: promising a refusal would make the reviewer stay
+    // quiet about a real finding for a reason that is not true.
+    write(new Date(now - 5 * 3600e3).toISOString());
+    const stale = cachedLintSection('card-a', root, now).join('\n');
+    assert.match(stale, /This lint snapshot is 300 minutes old; review-land will not refuse against it/);
+    assert.equal(stale.includes('review-land refuses a note'), false);
+    assert.match(stale, /stale-active/, 'the findings are still shown');
+
+    write('not a date');
+    assert.match(cachedLintSection('card-a', root, now).join('\n'), /of unknown age; review-land will not refuse/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

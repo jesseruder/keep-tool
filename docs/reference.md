@@ -203,6 +203,12 @@ fetch), `step-run-pending` (a gated step with landed commits its last run missed
 card older than six hours with no check-ins, opened instead of checking in on the card
 its parent Claude session held. It always exits successfully when findings exist, writes the latest
 result to `.keep/lint.json`, and supports one-rule runs plus JSON output and fix hints.
+The daemon refreshes that file every `KEEP_LINT_EVERY_MIN` (default 30) minutes by
+spawning `keep lint --json` as a child process with a 90s timeout — never on its own
+loop, because `checkout-drift` shells out to git per project — and records the outcome
+as the `lint` scheduler in `keep health`. A review tick refreshes it once more before
+waking the reviewer when it is older than that interval: the bundle splices the snapshot
+in and `review-land` judges against the same file, so a stale one makes both inert.
 The brief refreshes findings older than 20 hours and shows the first five.
 The `unsatisfiable-wait` rule flags unresolved waits whose upstream has no live linked
 session, scheduled check recipe, or log activity in 24 hours. It also flags whole-card or step waits whose reason or recent downstream check-ins
@@ -218,7 +224,9 @@ matched on the same card, or fleet-wide for the rules that answer for the regist
 (`daemon-health`, `checkout-drift`, `step-run-pending`, which file under `daemon:<name>`,
 `repo:<project>` and `step:<project>:<step>`). Nothing is refused on a `.keep/lint.json`
 older than an hour, or on a card whose newest check-in is newer than the snapshot: lint
-has not seen what the reviewer is describing, so its silence proves nothing. The refusal
+has not seen what the reviewer is describing, so its silence proves nothing. When the
+snapshot is too old to refuse against, the bundle's `KEEP_LINT_FINDINGS` header says so
+rather than claiming a refusal that will not happen. The refusal
 names the rule and is per item: the rest of the tick still lands.
 `missing-project`, `landing-uncited` and `blocked-no-need` are capped at five findings
 each so bookkeeping cannot crowd the 60-finding total.

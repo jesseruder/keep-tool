@@ -922,10 +922,78 @@ function lint(options = {}) {
   return result;
 }
 
+// ---------- keeping the persisted snapshot fresh ----------
+
+// Two readers depend on `.keep/lint.json` being current: the reviewer bundle splices
+// it in, and review-land refuses a note a lint rule already covers. Until the daemon
+// ran lint itself, the only writers were a hand-run `keep lint` and the 08:00 brief's
+// 20-hour fallback, so the file was a day old for most of the day and the refusal
+// could never fire.
+const LINT_EVERY_MS = Math.max(1, parseInt(process.env.KEEP_LINT_EVERY_MIN || '30', 10) || 30) * 60e3;
+const LINT_TIMEOUT_MS = 90e3;
+
+function snapshotAgeMs(root = keep.ROOT, now = Date.now()) {
+  try {
+    const snapshot = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'lint.json'), 'utf8'));
+    const at = Date.parse(String((snapshot && snapshot.at) || ''));
+    return Number.isFinite(at) ? Math.max(0, now - at) : Infinity;
+  } catch { return Infinity; }
+}
+
+// A child process, never lint() on the daemon's own loop: checkout-drift shells out to
+// git once per project, and one slow repo would stall every other scheduler. A child
+// also means a hung git can be timed out instead of taking the daemon with it.
+function runLintChild(options = {}) {
+  const execFile = options.execFile || require('child_process').execFile;
+  const root = options.root || keep.ROOT;
+  return new Promise((resolve) => {
+    execFile(process.execPath, [path.join(__dirname, 'keep.js'), 'lint', '--json'], {
+      env: { ...process.env, KEEP_DIR: root },
+      timeout: Number(options.timeoutMs) || LINT_TIMEOUT_MS,
+      maxBuffer: 4 * 1024 * 1024,
+    }, (error, stdout, stderr) => {
+      if (error) {
+        resolve({ ok: false, error: new Error(String(stderr || error.message || error).replace(/\s+/g, ' ').trim().slice(0, 300)) });
+        return;
+      }
+      let findings = null;
+      try { findings = JSON.parse(String(stdout || '')).findings; } catch {}
+      resolve({ ok: true, findings: Array.isArray(findings) ? findings.length : null });
+    });
+  });
+}
+
+function startScheduler(options = {}) {
+  const record = options.record || ((name, value) => require('./health.js').record(name, value));
+  let running = false;
+  const run = async () => {
+    if (running) return { skipped: 'in progress' };
+    running = true;
+    try {
+      const result = await runLintChild(options);
+      record('lint', result.ok
+        ? { ok: true, cadenceMs: LINT_EVERY_MS, detail: result.findings == null ? 'refreshed' : `${result.findings} finding(s)` }
+        : { ok: false, cadenceMs: LINT_EVERY_MS, error: result.error });
+      if (result.ok && options.onChange) options.onChange();
+      return result;
+    } finally { running = false; }
+  };
+  const timer = setInterval(() => { void run(); }, LINT_EVERY_MS);
+  const initial = setTimeout(() => { void run(); }, 20e3);
+  timer.unref();
+  initial.unref();
+  return { run, timer, initial };
+}
+
 module.exports = {
   RULE_NAMES,
   RULES,
   lint,
+  LINT_EVERY_MS,
+  LINT_TIMEOUT_MS,
+  snapshotAgeMs,
+  runLintChild,
+  startScheduler,
   loadDisabled,
   loadTasks,
   normalizedTitle,

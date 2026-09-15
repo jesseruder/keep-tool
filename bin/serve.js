@@ -7306,6 +7306,10 @@ function start(deps = {}) {
   startBriefScheduler({ onChange: broadcast });
   standup.startScheduler({ onChange: broadcast });
   ideas.startScheduler({ onChange: broadcast });
+  // Deterministic hygiene, refreshed on a clock: the reviewer bundle splices the
+  // persisted snapshot in and review-land refuses notes against it, so a day-old
+  // file is the same as no lint at all.
+  require('./lint.js').startScheduler({ onChange: broadcast });
   landed.startScheduler({ onChange: broadcast });
   if (process.env.KEEP_WT_GC === '0') {
     health.record('wt-gc', { disabled: true, detail: 'KEEP_WT_GC=0' });

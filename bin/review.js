@@ -1259,7 +1259,7 @@ function lintField(value, limit) {
 // Lint is intentionally run outside review-bundle. The persisted snapshot is
 // presentation context only: keep it bounded, card-specific, and inside the
 // bundle's untrusted-data envelope.
-function cachedLintSection(taskId, root = keep.ROOT) {
+function cachedLintSection(taskId, root = keep.ROOT, now = Date.now()) {
   let snapshot;
   try { snapshot = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'lint.json'), 'utf8')); }
   catch { return []; }
@@ -1268,10 +1268,19 @@ function cachedLintSection(taskId, root = keep.ROOT) {
   const findings = Array.isArray(snapshot && snapshot.findings)
     ? snapshot.findings.filter((item) => item && item.id === taskId).slice(0, 10) : [];
   if (!findings.length) return [];
+  // The header must describe the same snapshot review-land will judge against. On a
+  // stale one nothing is refused, so promising a refusal would be a lie the reviewer
+  // would act on - it would stay silent about a real finding for no reason.
+  const at = Date.parse(String((snapshot && snapshot.at) || ''));
+  const ageMs = Number.isFinite(at) ? Math.max(0, now - at) : Infinity;
+  const fresh = ageMs <= LINT_SNAPSHOT_MAX_AGE_MS;
   const lines = [
     '<<<KEEP_LINT_FINDINGS',
     `cached keep lint findings for this card (advisory snapshot ${lintField(snapshot.at, 40) || 'time unknown'}; verify against current facts).`
-    + ' These are already in Owner\'s brief: do not re-report any of them as a finding - review-land refuses a note a lint rule already covers.',
+    + (fresh
+      ? ' These are already in Owner\'s brief: do not re-report any of them as a finding - review-land refuses a note a lint rule already covers.'
+      : ` This lint snapshot is ${Number.isFinite(ageMs) ? Math.round(ageMs / 60e3) + ' minutes old' : 'of unknown age'}; review-land will not refuse against it.`
+        + ' Still do not re-report bookkeeping: check the facts yourself and spend the tick on judgment.'),
   ];
   for (const item of findings) {
     const row = `- [${lintField(item.severity, 12) || '?'}] ${lintField(item.rule, 80) || 'unknown'} · ${lintField(item.text, 220)} · fix: ${lintField(item.fix, 220)}`;
@@ -4276,6 +4285,18 @@ function gcReviewerMarkers(sessionIds) {
   }
 }
 
+// Refresh `.keep/lint.json` when it is older than the lint scheduler's own interval,
+// through the same child-process path the scheduler uses. Injectable, because a test
+// must never spawn a real lint over the operator's registry.
+async function refreshLintSnapshot(deps = {}, now = Date.now()) {
+  const lint = (() => { try { return require('./lint.js'); } catch { return null; } })();
+  if (!lint) return { ok: false, why: 'lint is unavailable' };
+  const age = (deps.lintSnapshotAgeMs || lint.snapshotAgeMs)(keep.ROOT, now);
+  if (age <= lint.LINT_EVERY_MS) return { ok: true, skipped: true, ageMs: age };
+  try { return { ...await (deps.refreshLint || lint.runLintChild)(), ageMs: age }; }
+  catch (error) { return { ok: false, ageMs: age, error }; }
+}
+
 async function reviewTick(deps, opts) {
   const options = opts || {};
   const trigger = options.trigger || 'clock';
@@ -4320,6 +4341,13 @@ async function reviewTick(deps, opts) {
     } catch {}
     return { sent: false, why: decision.why, budget, model, ranked: queue.ranked.length, trigger, parked };
   }
+
+  // The reviewer is about to run review-bundle, which splices the persisted lint
+  // snapshot in, and review-land will judge its notes against that same file. A stale
+  // one makes the bundle advisory-only and the refusal inert, so refresh it first -
+  // bounded by the child's own timeout, and never fatal: an old snapshot is still
+  // better than no tick.
+  await refreshLintSnapshot(deps);
 
   const text = detail
     ? driftTickMessage(detail, queue.ranked)
@@ -4715,6 +4743,8 @@ module.exports = {
   lintCoverage,
   lintCoveringRules,
   cachedLintFindings,
+  cachedLintSection,
+  refreshLintSnapshot,
   newestEntryAt,
   LINT_COVERED_KINDS,
   LINT_FLEET_RULES,

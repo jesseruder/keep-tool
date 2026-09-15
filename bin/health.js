@@ -35,6 +35,7 @@ const CADENCES = Object.freeze({
   usage: { onDemand: true },
   'fleet-usage': { cadenceMs: 5 * 60e3 },
   'card-usage': { cadenceMs: 30e3 },
+  lint: { cadenceMs: 30 * 60e3 },
   'git-pull': { cadenceMs: 30 * 60e3 },
   digest: { onDemand: true },
   brief: { cadenceMs: DAY_MS, daily: true, hour: 8, minute: 0, windowMs: 2 * HOUR_MS },
