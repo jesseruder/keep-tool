@@ -72,7 +72,11 @@ function uiDriver(configFile, options = {}) {
     return 'unexpected';
   };
   const deps = {
-    readScreen: async () => screens(),
+    readScreen: async () => {
+      const value = screens();
+      if (state === 'autocomplete' && options.autocompleteTransient) state = 'models';
+      return value;
+    },
     codexSendPrecheck(screen) {
       if (!screen.includes('Ask Codex to do anything')) throw new Error('not idle');
     },
@@ -139,6 +143,7 @@ function common(f, ui, extra = {}) {
     dir: f.dir,
     transcriptFileForSession: () => f.transcript,
     configuredRoots: () => [{ accountId: 'work', configDir: f.configDir }],
+    autocompleteSettleMs: 0,
     ...extra,
   };
 }
@@ -196,6 +201,16 @@ test('restores Astra max through the visible Advanced Reasoning submenu', async 
   assert.equal(result.compacted, true);
   assert.equal(ui.screen().includes('gpt-6-astra max · Workspace'), true);
   assert.equal(ui.keys.filter((key) => key === 'Enter').length, 7);
+});
+
+test('does not send a stale extra Enter when autocomplete advances asynchronously', async (t) => {
+  const f = fixture(t);
+  const ui = uiDriver(f.configFile, { autocompleteTransient: true });
+  const result = await compact.compactCodexFallback(f.session, {}, null, common(f, ui, {
+    compactCurrentModel: async () => ({ compacted: true }),
+  }));
+  assert.equal(result.compacted, true);
+  assert.equal(ui.keys.filter((key) => key === 'Enter').length, 4);
 });
 
 test('writes the tagged durable record before any UI mutation', async (t) => {
@@ -367,7 +382,8 @@ test('recovery skips busy sessions and preserves active records regardless of ag
   fs.mkdirSync(f.dir, { recursive: true });
   const file = path.join(f.dir, `${SID}.swap.json`);
   const record = compact.writeSwapRecord(file, {
-    kind: 'codex', version: 1, sessionId: SID, at: 1, phase: 'switched',
+    kind: 'codex', version: 1, sessionId: SID, accountId: 'work', at: 1, phase: 'switched',
+    transcriptFile: f.transcript,
     original: { model: 'gpt-6-astra', effort: 'high' },
     fallback: { model: 'gpt-5.6-sol', effort: 'medium' },
     configFile: f.configFile,
@@ -380,6 +396,90 @@ test('recovery skips busy sessions and preserves active records regardless of ag
   assert.equal(result.skipped, true);
   assert.equal(fs.existsSync(file), true);
   assert.deepEqual(ui.submits, []);
+});
+
+test('recovery repairs trusted account config while pane restoration is busy, exited, or missing', async (t) => {
+  const f = fixture(t);
+  const states = [
+    { ...f.session, endedTurn: false, state: 'running' },
+    { ...f.session, exited: true, endedTurn: true },
+    null,
+  ];
+  for (const [index, session] of states.entries()) {
+    const config = toml.parse(fs.readFileSync(f.configFile, 'utf8'));
+    config.model = 'gpt-5.6-sol'; config.model_reasoning_effort = 'medium';
+    fs.writeFileSync(f.configFile, toml.stringify(config));
+    const file = path.join(f.dir, `${SID}.swap.json`);
+    const record = compact.writeSwapRecord(file, {
+      kind: 'codex', version: 1, sessionId: SID, accountId: 'work', at: 1, phase: 'switched',
+      transcriptFile: f.transcript, configFile: f.configFile,
+      original: { model: 'gpt-6-astra', effort: 'high' },
+      fallback: { model: 'gpt-5.6-sol', effort: 'medium' },
+      configBefore: { model: { present: true, value: 'saved-default' }, effort: { present: true, value: 'low' } },
+    });
+    const ui = uiDriver(f.configFile, { currentModel: 'gpt-5.6-sol', currentEffort: 'medium' });
+    const result = await compact.recoverCodexCompactSwap(record, common(f, ui,
+      session ? { session, target: {} } : {}));
+    assert.equal(result.skipped, true, `state ${index}`);
+    assert.equal(result.configChanged, true, `state ${index}`);
+    const repaired = toml.parse(fs.readFileSync(f.configFile, 'utf8'));
+    assert.equal(repaired.model, 'saved-default');
+    assert.equal(repaired.model_reasoning_effort, 'low');
+    assert.equal(fs.existsSync(file), true);
+    assert.deepEqual(ui.submits, []);
+  }
+});
+
+test('pre-menu config intent survives a crash after the restore menu changed config', async (t) => {
+  const f = fixture(t, { config: { model: 'gpt-6-astra', model_reasoning_effort: 'high', theme: 'dark' } });
+  const file = path.join(f.dir, `${SID}.swap.json`);
+  const record = compact.writeSwapRecord(file, {
+    kind: 'codex', version: 1, sessionId: SID, accountId: 'work', at: 1, phase: 'restore-pending',
+    transcriptFile: f.transcript, configFile: f.configFile,
+    original: { model: 'gpt-6-astra', effort: 'high' },
+    fallback: { model: 'gpt-5.6-sol', effort: 'medium' },
+    configBefore: { model: { present: true, value: 'saved-default' }, effort: { present: true, value: 'low' } },
+    restoreConfigDesired: {
+      model: { present: true, value: 'saved-default' }, effort: { present: true, value: 'low' },
+    },
+  });
+  const ui = uiDriver(f.configFile);
+  const result = await compact.recoverCodexCompactSwap(record, common(f, ui));
+  assert.equal(result.skipped, true);
+  const repaired = toml.parse(fs.readFileSync(f.configFile, 'utf8'));
+  assert.equal(repaired.model, 'saved-default');
+  assert.equal(repaired.model_reasoning_effort, 'low');
+  assert.equal(fs.existsSync(file), true);
+});
+
+test('a later human config edit refreshes the journal before recovery opens the menu', async (t) => {
+  const f = fixture(t, { config: { model: 'human-later', model_reasoning_effort: 'medium', theme: 'dark' } });
+  const file = path.join(f.dir, `${SID}.swap.json`);
+  let record = compact.writeSwapRecord(file, {
+    kind: 'codex', version: 1, sessionId: SID, accountId: 'work', at: 1, phase: 'restore-pending',
+    transcriptFile: f.transcript, configFile: f.configFile,
+    original: { model: 'gpt-6-astra', effort: 'high' },
+    fallback: { model: 'gpt-5.6-sol', effort: 'medium' },
+    configBefore: { model: { present: true, value: 'saved-default' }, effort: { present: true, value: 'low' } },
+    restoreConfigDesired: {
+      model: { present: true, value: 'saved-default' }, effort: { present: true, value: 'low' },
+    },
+  });
+  let ui = uiDriver(f.configFile, { currentModel: 'gpt-5.6-sol', currentEffort: 'medium' });
+  let result = await compact.recoverCodexCompactSwap(record, common(f, ui));
+  assert.equal(result.skipped, true);
+  record = { ...JSON.parse(fs.readFileSync(file, 'utf8')), file };
+  assert.equal(record.restoreConfigDesired.model.value, 'human-later');
+  let config = toml.parse(fs.readFileSync(f.configFile, 'utf8'));
+  assert.equal(config.model, 'human-later');
+  assert.equal(config.model_reasoning_effort, 'low');
+
+  ui = uiDriver(f.configFile, { currentModel: 'gpt-5.6-sol', currentEffort: 'medium' });
+  result = await compact.recoverCodexCompactSwap(record, common(f, ui, { session: f.session, target: {} }));
+  assert.equal(result.restored, true);
+  config = toml.parse(fs.readFileSync(f.configFile, 'utf8'));
+  assert.equal(config.model, 'human-later');
+  assert.equal(config.model_reasoning_effort, 'low');
 });
 
 test('recovery requires positive ended-turn evidence and current account authority', async (t) => {
@@ -405,14 +505,20 @@ test('recovery requires positive ended-turn evidence and current account authori
   fs.mkdirSync(path.dirname(movedTranscript), { recursive: true });
   fs.copyFileSync(f.transcript, movedTranscript);
   ui = uiDriver(f.configFile, { currentModel: 'gpt-5.6-sol', currentEffort: 'medium' });
+  const fallbackConfig = toml.parse(fs.readFileSync(f.configFile, 'utf8'));
+  fallbackConfig.model = 'gpt-5.6-sol'; fallbackConfig.model_reasoning_effort = 'medium';
+  fs.writeFileSync(f.configFile, toml.stringify(fallbackConfig));
   result = await compact.recoverCodexCompactSwap(record, {
     ...common(f, ui, { session: { ...f.session, accountId: 'new-work' }, target: {} }),
     transcriptFileForSession: () => movedTranscript,
     configuredRoots: () => [{ accountId: 'new-work', configDir: movedRoot }],
   });
   assert.equal(result.skipped, true);
-  assert.match(result.reason, /account authority/);
+  assert.match(result.reason, /account (?:authority|path)/);
   assert.deepEqual(ui.submits, []);
+  const untouched = toml.parse(fs.readFileSync(f.configFile, 'utf8'));
+  assert.equal(untouched.model, 'gpt-5.6-sol');
+  assert.equal(untouched.model_reasoning_effort, 'medium');
 });
 
 test('idle recovery restores once and clears the record without compacting', async (t) => {
@@ -422,7 +528,8 @@ test('idle recovery restores once and clears the record without compacting', asy
   fs.writeFileSync(f.configFile, toml.stringify(changed));
   const file = path.join(f.dir, `${SID}.swap.json`);
   const record = compact.writeSwapRecord(file, {
-    kind: 'codex', version: 1, sessionId: SID, at: 1, phase: 'switched',
+    kind: 'codex', version: 1, sessionId: SID, accountId: 'work', at: 1, phase: 'switched',
+    transcriptFile: f.transcript,
     original: { model: 'gpt-6-astra', effort: 'high' },
     fallback: { model: 'gpt-5.6-sol', effort: 'medium' },
     configFile: f.configFile,

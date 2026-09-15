@@ -72,11 +72,13 @@ function isCodexCompactSwap(record) {
 
 function validCodexCompactSwap(record) {
   return isCodexCompactSwap(record) && validSessionId(record.sessionId)
+    && typeof record.accountId === 'string' && record.accountId.length > 0
     && typeof record.configFile === 'string' && path.isAbsolute(record.configFile)
-    && (!record.transcriptFile || (typeof record.transcriptFile === 'string' && path.isAbsolute(record.transcriptFile)))
+    && typeof record.transcriptFile === 'string' && path.isAbsolute(record.transcriptFile)
     && typeof record.original?.model === 'string' && VALID_EFFORTS.has(record.original?.effort)
     && typeof record.fallback?.model === 'string' && VALID_EFFORTS.has(record.fallback?.effort)
-    && record.configBefore && typeof record.configBefore === 'object';
+    && validConfigSnapshot(record.configBefore)
+    && (record.restoreConfigDesired === undefined || validConfigSnapshot(record.restoreConfigDesired));
 }
 
 function parseEffectiveSettings(contents) {
@@ -149,6 +151,37 @@ function sessionFiles(session, deps = {}) {
   return { transcript: path.resolve(transcript), configFile: path.join(path.resolve(configDir), 'config.toml') };
 }
 
+function validateRecordAuthority(record, session, deps = {}) {
+  const expectedSwap = path.join(deps.dir || compactDir(), `${record.sessionId}.swap.json`);
+  if (typeof record.file !== 'string' || path.resolve(record.file) !== path.resolve(expectedSwap)) {
+    return { ok: false, reason: 'swap record path is not trusted' };
+  }
+  let roots;
+  try { roots = (deps.configuredRoots || require('./codex').configuredRoots)(); }
+  catch (error) { return { ok: false, reason: String(error.message || error) }; }
+  const matches = (roots || []).filter((entry) => entry?.accountId === record.accountId
+    && typeof entry.configDir === 'string' && path.isAbsolute(entry.configDir)
+    && path.resolve(record.configFile) === path.join(path.resolve(entry.configDir), 'config.toml')
+    && inside(entry.configDir, record.transcriptFile)
+    && /^(?:sessions|archived_sessions)[\\/]/.test(path.relative(path.resolve(entry.configDir), path.resolve(record.transcriptFile))));
+  if (matches.length !== 1) return { ok: false, reason: 'swap record account path is no longer configured' };
+  let pinned = null;
+  try {
+    const lookup = deps.accountForSession || require('./accounts').forSession;
+    pinned = lookup(record.sessionId, 'codex', {
+      root: deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep'), allowDiscovery: false,
+    });
+  } catch (error) { return { ok: false, reason: String(error.message || error) }; }
+  if (pinned && (pinned.id !== record.accountId
+      || path.resolve(pinned.configDir) !== path.resolve(matches[0].configDir))) {
+    return { ok: false, reason: 'swap record no longer matches session account authority' };
+  }
+  if (session && session.accountId !== record.accountId) {
+    return { ok: false, reason: 'swap record no longer matches the live session account' };
+  }
+  return { ok: true, configDir: path.resolve(matches[0].configDir) };
+}
+
 function readConfig(file, deps = {}) {
   const io = deps.fs || fs;
   try {
@@ -166,6 +199,14 @@ function configSnapshot(config) {
     model: snapshotField(config, 'model'),
     effort: snapshotField(config, 'model_reasoning_effort'),
   };
+}
+
+function validConfigSnapshot(value) {
+  return value && typeof value === 'object' && ['model', 'effort'].every((key) => {
+    const field = value[key];
+    return field && typeof field === 'object' && typeof field.present === 'boolean'
+      && (field.present ? typeof field.value === 'string' : field.value === null);
+  });
 }
 
 function setField(config, key, field) {
@@ -322,6 +363,16 @@ async function selectCodexModel(target, model, effort, deps = {}) {
     return text.includes('/model choose what model and reasoning effort to use') || text.includes('Select Model and Effort');
   }, 'Codex /model autocomplete or model menu', deps);
   if (!normalized(screen).includes('Select Model and Effort')) {
+    // The first Enter can asynchronously advance from autocomplete to the model
+    // picker after the screen capture. Require autocomplete to remain stable
+    // before sending the second Enter, or it may confirm the current model row.
+    await sleep(deps.autocompleteSettleMs ?? 300, deps);
+    screen = await readScreen(target, deps);
+  }
+  if (!normalized(screen).includes('Select Model and Effort')) {
+    if (!normalized(screen).includes('/model choose what model and reasoning effort to use')) {
+      throw fail('Codex /model autocomplete changed unexpectedly');
+    }
     await deps.pressTargetKey(target, 'Enter', deps);
     screen = await waitForScreen(target, (value) => normalized(value).includes('Select Model and Effort'), 'Codex model menu', deps);
   }
@@ -354,17 +405,60 @@ async function confirmRestoreIdle(target, deps = {}) {
   return screen;
 }
 
-function repairConfigWithoutSession(record, deps = {}) {
+function prepareRestoreConfig(record, deps = {}) {
   const before = readConfig(record.configFile, deps);
-  if (!before.ok) return { confirmed: false, changed: false, reason: before.error };
+  if (!before.ok) return { ok: false, record, reason: before.error };
+  if (validConfigSnapshot(record.restoreConfigDesired)) {
+    const desired = structuredClone(record.restoreConfigDesired);
+    let changed = false;
+    for (const [name, key] of [['model', 'model'], ['effort', 'model_reasoning_effort']]) {
+      const current = snapshotField(before.value, key);
+      const knownTransactionValue = (current.present && (current.value === record.original[name]
+        || current.value === record.fallback[name])) || sameField(current, desired[name]?.value, desired[name]?.present);
+      if (!knownTransactionValue) {
+        desired[name] = current;
+        changed = true;
+      }
+    }
+    if (!changed) return { ok: true, record };
+    const refreshed = { ...record, restoreConfigDesired: desired, restorePreparedAt: now(deps) };
+    try { return { ok: true, record: writeSwapRecord(record.file, refreshed, deps) }; }
+    catch (error) { return { ok: false, record, reason: String(error.message || error) }; }
+  }
+  // A legacy record that already reached/passed restore may contain the session's
+  // original Astra values because the menu overwrote config.toml. Without a
+  // pre-menu journal those values cannot be distinguished from a human edit.
+  if (['restore-pending', 'session-restored'].includes(record.phase)
+      && ((before.value.model === record.original.model
+        && !sameField(record.configBefore.model, record.original.model))
+        || (before.value.model_reasoning_effort === record.original.effort
+          && !sameField(record.configBefore.effort, record.original.effort)))) {
+    return { ok: false, record, reason: 'pre-restore config intent is unavailable' };
+  }
   const desired = desiredConfigAfterRestore(record, before.value);
-  return restoreConfigCas(record, desired, deps, record.fallback);
+  if (!validConfigSnapshot(desired)) return { ok: false, record, reason: 'restore config intent is invalid' };
+  const prepared = { ...record, restoreConfigDesired: desired, restorePreparedAt: now(deps) };
+  try { return { ok: true, record: writeSwapRecord(record.file, prepared, deps) }; }
+  catch (error) { return { ok: false, record, reason: String(error.message || error) }; }
+}
+
+function repairPreparedConfig(record, deps = {}) {
+  if (!validConfigSnapshot(record.restoreConfigDesired)) {
+    return { confirmed: false, changed: false, reason: 'restore config intent is unavailable' };
+  }
+  const original = restoreConfigCas(record, record.restoreConfigDesired, deps, record.original);
+  const fallback = restoreConfigCas(record, record.restoreConfigDesired, deps, record.fallback);
+  return {
+    confirmed: original.confirmed && fallback.confirmed,
+    changed: original.changed || fallback.changed,
+    reason: original.reason || fallback.reason,
+  };
 }
 
 async function restoreTransaction(record, target, deps = {}) {
-  const before = readConfig(record.configFile, deps);
-  if (!before.ok) return { restored: false, reason: before.error };
-  const desired = desiredConfigAfterRestore(record, before.value);
+  const prepared = prepareRestoreConfig(record, deps);
+  if (!prepared.ok) return { restored: false, record: prepared.record, reason: prepared.reason };
+  record = prepared.record;
   try {
     await confirmRestoreIdle(target, deps);
     await selectCodexModel(target, record.original.model, record.original.effort, deps);
@@ -372,16 +466,15 @@ async function restoreTransaction(record, target, deps = {}) {
     // /model persists account defaults before confirmation reaches us. Repair
     // fields still equal to the fallback values even when session restore is
     // unconfirmed; the durable record remains for a later idle retry.
-    const restoredValue = restoreConfigCas(record, desired, deps, record.original);
-    const fallbackValue = restoreConfigCas(record, desired, deps, record.fallback);
-    return { restored: false, configChanged: restoredValue.changed || fallbackValue.changed,
+    const repaired = repairPreparedConfig(record, deps);
+    return { restored: false, record, configChanged: repaired.changed,
       reason: String(error.message || error) };
   }
   record.phase = 'session-restored';
   record.lastAttemptAt = now(deps);
   try { writeSwapRecord(record.file, record, deps); }
   catch (error) { return { restored: false, reason: String(error.message || error) }; }
-  const config = restoreConfigCas(record, desired, deps);
+  const config = repairPreparedConfig(record, deps);
   if (!config.confirmed) return { restored: false, reason: config.reason };
   try { (deps.fs || fs).unlinkSync(record.file); }
   catch (error) { if (error.code !== 'ENOENT') return { restored: false, reason: String(error.message || error) }; }
@@ -389,7 +482,8 @@ async function restoreTransaction(record, target, deps = {}) {
 }
 
 async function compactCodexFallback(session, target, instruction, deps = {}) {
-  if (session?.kind !== 'codex' || !validSessionId(session.id)) {
+  if (session?.kind !== 'codex' || !validSessionId(session.id)
+      || typeof session.accountId !== 'string' || !session.accountId) {
     return { compacted: false, reason: 'invalid Codex session for fallback compaction' };
   }
   if (typeof deps.compactCurrentModel !== 'function') {
@@ -455,7 +549,8 @@ async function compactCodexFallback(session, target, instruction, deps = {}) {
   try { record = writeSwapRecord(file, record, deps); } catch {}
   const uncertain = !result.compacted && /timeout|in[ -]?progress|submitted|unconfirmed/i.test(String(result.reason || ''));
   if (uncertain) {
-    repairConfigWithoutSession(record, deps);
+    const prepared = prepareRestoreConfig(record, deps);
+    if (prepared.ok) repairPreparedConfig(prepared.record, deps);
     return restoreResult(result, 'model restore deferred until Codex is confirmed idle');
   }
   const restored = await restoreTransaction(record, target, deps);
@@ -472,12 +567,22 @@ function recoveryBusy(session) {
 
 async function recoverCodexCompactSwap(record, deps = {}) {
   if (!validCodexCompactSwap(record)) return { restored: false, skipped: true, reason: 'invalid Codex swap record' };
+  const trusted = validateRecordAuthority(record, null, deps);
+  if (!trusted.ok) return { restored: false, skipped: true, reason: trusted.reason };
+  const prepared = prepareRestoreConfig(record, deps);
+  if (!prepared.ok) return { restored: false, skipped: true, reason: prepared.reason };
+  record = prepared.record;
+  const configRepair = repairPreparedConfig(record, deps);
   let session = deps.session;
   if (!session && typeof deps.loadCurrentSession === 'function') session = await deps.loadCurrentSession(record.sessionId);
   if (!session && typeof deps.scanSessions === 'function') {
     session = (await deps.scanSessions()).find((candidate) => candidate.id === record.sessionId);
   }
-  if (recoveryBusy(session)) return { restored: false, skipped: true, reason: 'session is not safely idle' };
+  if (recoveryBusy(session)) return { restored: false, skipped: true, configChanged: configRepair.changed,
+    reason: 'session is not safely idle' };
+  const liveAuthority = validateRecordAuthority(record, session, deps);
+  if (!liveAuthority.ok) return { restored: false, skipped: true, configChanged: configRepair.changed,
+    reason: liveAuthority.reason };
   let files;
   try { files = sessionFiles(session, deps); }
   catch (error) { return { restored: false, skipped: true, reason: String(error.message || error) }; }
@@ -528,5 +633,8 @@ module.exports = {
   selectCodexModel,
   restoreConfigCas,
   desiredConfigAfterRestore,
+  prepareRestoreConfig,
+  repairPreparedConfig,
+  validateRecordAuthority,
   writeSwapRecord,
 };
