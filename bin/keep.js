@@ -3170,7 +3170,7 @@ function noteScopes(project, requested) {
 
 commands.note = async (argv) => {
   const notes = require('./notes.js');
-  const o = parseArgs(argv, { scope: 'list', for: 'str', task: 'str', extend: 'str', clear: 'str', json: 'bool' });
+  const o = parseArgs(argv, { scope: 'list', for: 'str', task: 'str', extend: 'str', clear: 'str' });
 
   if (o.extend !== undefined) {
     if (!o.for || !/^\+\d+[mhdw]$/i.test(o.for)) die('usage: keep note --extend <id> --for +2h');
