@@ -3136,6 +3136,9 @@ test('a stale lint snapshot, or one older than the card, refuses nothing', () =>
 
 test('a drift that arrives while the reviewer is busy is parked and retried', async () => {
   const cadence = require('./review.js');
+  // These scheduler tests share one _meta.json for the whole file; start from a
+  // known state so parked drifts cannot leak between them.
+  cadence.mutateMeta((meta) => { meta.drift = {}; meta.fallback = {}; meta.sweepTick = {}; delete meta.lastTickAt; });
   let reviewer = { id: 'reviewer-1', state: 'idle', endedTurn: false };
   const sent = [];
   const deps = {
@@ -3301,4 +3304,122 @@ test('a stale lint block tells the reviewer the refusal is off, not on', () => {
     write('not a date');
     assert.match(cachedLintSection('card-a', root, now).join('\n'), /of unknown age; review-land will not refuse/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a minute with nothing due costs nothing: no tick, no health record', async () => {
+  const cadence = require('./review.js');
+  const health = require('./health.js');
+  // These scheduler tests share one _meta.json for the whole file; start from a
+  // known state so parked drifts cannot leak between them.
+  cadence.mutateMeta((meta) => { meta.drift = {}; meta.fallback = {}; meta.sweepTick = {}; delete meta.lastTickAt; });
+  const original = health.record;
+  const records = [];
+  health.record = (name, value) => { records.push({ name, ...value }); };
+  let queueScans = 0;
+  const deps = {
+    sessions: () => { queueScans += 1; return []; },
+    findReviewer: () => ({ id: 'reviewer-1', state: 'idle', endedTurn: true }),
+    reviewBudget: () => ({ code: 0, reason: 'within budget' }),
+    send: async () => assert.fail('nothing should be sent'),
+    lastVerdictAt: () => Date.now() - 5 * 3600e3, // the watcher has been silent all afternoon
+    lintSnapshotAgeMs: () => 0,
+    refreshLint: async () => ({ ok: true }),
+  };
+  // Outside the sweep window, so only the fallback can fire — and it may fire once.
+  const afternoon = new Date(2026, 8, 14, 15, 0).getTime();
+  try {
+    await cadence.minuteTick(deps, cadence.sweepClock('07:45'), afternoon);
+    const afterFirst = records.length;
+    const scansAfterFirst = queueScans;
+
+    for (let i = 1; i <= 10; i += 1) {
+      await cadence.minuteTick(deps, cadence.sweepClock('07:45'), afternoon + i * 60e3);
+    }
+    assert.equal(records.length, afterFirst, 'ten quiet minutes record nothing');
+    assert.equal(queueScans, scansAfterFirst, 'and never scan the queue again');
+
+    // Once the fallback interval elapses it is evaluated again, exactly once.
+    const later = afternoon + (Math.round(cadence.FALLBACK_TICK_MS / 60e3) + 1) * 60e3;
+    await cadence.minuteTick(deps, cadence.sweepClock('07:45'), later);
+    assert.ok(records.length > afterFirst, 'the interval elapsing is an evaluation');
+    const afterSecond = records.length;
+    await cadence.minuteTick(deps, cadence.sweepClock('07:45'), later + 60e3);
+    assert.equal(records.length, afterSecond, 'and then it is quiet again');
+  } finally { health.record = original; }
+});
+
+test('one failing stage of the minute loop does not cost the fleet the others', async () => {
+  const cadence = require('./review.js');
+  const health = require('./health.js');
+  // These scheduler tests share one _meta.json for the whole file; start from a
+  // known state so parked drifts cannot leak between them.
+  cadence.mutateMeta((meta) => { meta.drift = {}; meta.fallback = {}; meta.sweepTick = {}; delete meta.lastTickAt; });
+  const original = health.record;
+  health.record = () => {};
+  const sent = [];
+  let reviewer = { id: 'reviewer-1', state: 'idle', endedTurn: true };
+  const deps = {
+    sessions: () => [],
+    findReviewer: () => reviewer,
+    reviewBudget: () => ({ code: 0, reason: 'within budget' }),
+    lastVerdictAt: () => 0,
+    lintSnapshotAgeMs: () => 0,
+    refreshLint: async () => ({ ok: true }),
+    send: async (id, text) => {
+      if (/drift on/.test(text)) throw new Error('injection is busy');
+      sent.push(text);
+    },
+  };
+  try {
+    // Park a drift, then run a minute in which retrying it throws.
+    reviewer = { id: 'reviewer-1', state: 'idle', endedTurn: false };
+    await cadence.driftWake(deps, { sessionId: 'sess-fail', turn: 1, cardId: 'c', stateLine: 's', reason: 'r' });
+    assert.equal(cadence.duePendingDrifts(cadence.loadMeta()).length, 1);
+    reviewer = { id: 'reviewer-1', state: 'idle', endedTurn: true };
+
+    const morning = new Date(2026, 8, 14, 8, 0).getTime();
+    const result = await cadence.minuteTick(deps, cadence.sweepClock('07:45'), morning);
+    assert.equal(result.swept, true, 'the daily sweep still ran after the drift retry threw');
+    assert.equal(sent.length, 1);
+    assert.match(sent[0], /review tick - candidates/);
+  } finally { health.record = original; }
+});
+
+test('a live drift wake and a parked retry cannot clobber each other in _meta.json', async () => {
+  const cadence = require('./review.js');
+  const health = require('./health.js');
+  // These scheduler tests share one _meta.json for the whole file; start from a
+  // known state so parked drifts cannot leak between them.
+  cadence.mutateMeta((meta) => { meta.drift = {}; meta.fallback = {}; meta.sweepTick = {}; delete meta.lastTickAt; });
+  const original = health.record;
+  health.record = () => {};
+  let reviewer = { id: 'reviewer-1', state: 'idle', endedTurn: false };
+  const deps = {
+    sessions: () => [],
+    findReviewer: () => reviewer,
+    reviewBudget: () => ({ code: 0, reason: 'within budget' }),
+    lintSnapshotAgeMs: () => 0,
+    refreshLint: async () => ({ ok: true }),
+    send: async () => {},
+  };
+  try {
+    // One drift parked while the reviewer is busy.
+    await cadence.driftWake(deps, { sessionId: 'sess-a', turn: 1, cardId: 'card-a', stateLine: 's', reason: 'r' });
+    assert.equal(cadence.duePendingDrifts(cadence.loadMeta()).length, 1);
+
+    // A second live wake lands while the retry is in flight — the daemon does not
+    // await the live one, so these really do interleave.
+    const retry = cadence.retryPendingDrifts(deps);
+    const live = cadence.driftWake(deps, { sessionId: 'sess-b', turn: 2, cardId: 'card-b', stateLine: 's', reason: 'r' });
+    await Promise.all([retry, live]);
+
+    const pending = cadence.duePendingDrifts(cadence.loadMeta());
+    assert.deepEqual(pending.map((row) => row.sessionId).sort(), ['sess-a', 'sess-b'],
+      'neither write dropped the other session');
+
+    // Both go out once the reviewer is free, and both are then cleared.
+    reviewer = { id: 'reviewer-1', state: 'idle', endedTurn: true };
+    assert.deepEqual((await cadence.retryPendingDrifts(deps)).sort(), ['sess-a', 'sess-b']);
+    assert.deepEqual(cadence.duePendingDrifts(cadence.loadMeta()), []);
+  } finally { health.record = original; }
 });

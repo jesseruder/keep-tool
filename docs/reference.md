@@ -862,8 +862,10 @@ Two invariants the code enforces:
   that records nothing: `KEEP_WATCHER=1` says the tick is enabled, not that its model
   works, so the fallback asks the turn index for the newest `verdict_at` and sends only
   when no verdict and no tick has landed within `KEEP_REVIEW_FALLBACK_TICK_MIN`
-  (default 120) minutes. That interval is also the `review` row's health cadence in
-  events mode, so a genuinely silent reviewer still goes red. The daemon logs the active mode
+  (default 120) minutes. Its own attempt stamp lives in `.keep/review/_meta.json`, so a
+  quiet fleet costs one evaluation per interval rather than a queue scan a minute, and a
+  minute with nothing due records no health at all. That interval is also the `review`
+  row's health cadence in events mode, so a genuinely silent reviewer still goes red. The daemon logs the active mode
   and why at startup. An unparseable `KEEP_REVIEW_SWEEP_AT`, or one at or after 12:00
   (the retry window closes at noon), falls back to `07:45` and warns rather than removing
   the sweep. `POST /api/reviewtick` and `keep review-tick --force` work in both

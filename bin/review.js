@@ -3425,6 +3425,20 @@ function saveMeta(meta) {
   return meta;
 }
 
+// The one way to change _meta.json. The live drift wake is deliberately not awaited,
+// so it runs interleaved with the minute loop's retries, and both mutate the same
+// read-modify-write state (pending drifts, the day counters, the sweep stamp). This
+// is atomic ONLY because it is synchronous end to end: `fn` must never await, and must
+// never be handed a meta object loaded before the call.
+function mutateMeta(fn) {
+  try {
+    const meta = loadMeta();
+    const result = fn(meta);
+    saveMeta(meta);
+    return result === undefined ? meta : result;
+  } catch { return null; }
+}
+
 // Per-day activity counters, so review-stats can distinguish a quiet fleet from a
 // dead scheduler. Mutates the passed meta; the caller saves.
 function bumpDay(meta, field) {
@@ -4332,13 +4346,11 @@ async function reviewTick(deps, opts) {
   if (!decision.send) {
     // recorded so review-stats can tell "quiet fleet" from "dead scheduler"
     const parked = Boolean(detail) && driftRetryable(decision.why);
-    try {
-      const fresh = loadMeta();
+    mutateMeta((fresh) => {
       fresh.lastSkip = { at: now, why: decision.why, trigger };
       if (parked) recordPendingDrift(fresh, detail, now, decision.why);
       else if (detail) clearPendingDrift(fresh, detail.sessionId);
-      saveMeta(fresh);
-    } catch {}
+    });
     return { sent: false, why: decision.why, budget, model, ranked: queue.ranked.length, trigger, parked };
   }
 
@@ -4359,26 +4371,26 @@ async function reviewTick(deps, opts) {
     title: detail ? 'drift wake' : 'tick',
     detail: detail ? `drift on ${detail.cardId || 'an unlinked session'}` : `read ${queue.ranked.length} card(s)`,
   });
-  const fresh = loadMeta();
-  fresh.lastTickAt = now;
-  fresh.lastTickTasks = queue.ranked.map((r) => r.task);
-  if (reviewer.bootstrap) {
-    // Count the attempt. A real reviewer answers by producing a transcript, which
-    // ends bootstrap for good; a marker that keeps needing it is aimed at the wrong
-    // pane, so give up rather than keep typing into a stranger's session.
-    fresh.bootstrapAttempts = fresh.bootstrapAttempts || {};
-    fresh.bootstrapAttempts[reviewer.id] = (fresh.bootstrapAttempts[reviewer.id] || 0) + 1;
-  } else if (fresh.bootstrapAttempts) {
-    delete fresh.bootstrapAttempts[reviewer.id];
-  }
-  bumpDay(fresh, 'ticks');
-  if (detail) {
-    bumpDay(fresh, 'driftWakes');
-    recordDriftWake(fresh, detail, now);
-    clearPendingDrift(fresh, detail.sessionId);
-  }
-  if (trigger === 'sweep') fresh.sweepTick = { ...(fresh.sweepTick || {}), day: localDay(now), lastSentAt: now };
-  saveMeta(fresh);
+  mutateMeta((fresh) => {
+    fresh.lastTickAt = now;
+    fresh.lastTickTasks = queue.ranked.map((r) => r.task);
+    if (reviewer.bootstrap) {
+      // Count the attempt. A real reviewer answers by producing a transcript, which
+      // ends bootstrap for good; a marker that keeps needing it is aimed at the wrong
+      // pane, so give up rather than keep typing into a stranger's session.
+      fresh.bootstrapAttempts = fresh.bootstrapAttempts || {};
+      fresh.bootstrapAttempts[reviewer.id] = (fresh.bootstrapAttempts[reviewer.id] || 0) + 1;
+    } else if (fresh.bootstrapAttempts) {
+      delete fresh.bootstrapAttempts[reviewer.id];
+    }
+    bumpDay(fresh, 'ticks');
+    if (detail) {
+      bumpDay(fresh, 'driftWakes');
+      recordDriftWake(fresh, detail, now);
+      clearPendingDrift(fresh, detail.sessionId);
+    }
+    if (trigger === 'sweep') fresh.sweepTick = { ...(fresh.sweepTick || {}), day: localDay(now), lastSentAt: now };
+  });
   // Only a message that actually carried the sweep clause consumes the day's sweep.
   // A drift wake never carries it, and an early fallback tick must not burn it either.
   const carriedSweep = queue.sweepDue && !detail && text.includes('cross-workstream fleet sweep');
@@ -4515,12 +4527,14 @@ function recordTickError(e, record = health.record) {
 }
 
 function recordSweepAttempt(now, sent) {
-  try {
-    const meta = loadMeta();
+  mutateMeta((meta) => {
     meta.sweepTick = { ...(meta.sweepTick || {}), lastAttemptAt: Number(now) };
     if (sent) meta.sweepTick.day = localDay(now);
-    saveMeta(meta);
-  } catch {}
+  });
+}
+
+function recordFallbackAttempt(now) {
+  mutateMeta((meta) => { meta.fallback = { ...(meta.fallback || {}), lastAttemptAt: Number(now) }; });
 }
 
 // KEEP_WATCHER=1 says the watcher tick is enabled, not that it works: a broken model,
@@ -4548,16 +4562,26 @@ function fallbackDecision({ lastVerdictAt, lastTickAt, now, windowMs = FALLBACK_
 }
 
 async function fallbackIfSilent(deps, now = Date.now()) {
-  const decision = fallbackDecision({
-    lastVerdictAt: latestVerdictAt(deps), lastTickAt: loadMeta().lastTickAt, now,
-  });
+  // lastTickAt only advances on a SEND, so a silent watcher and an empty queue used to
+  // mean a full reviewTick - and its whole reviewQueue scan - every sixty seconds.
+  // The attempt stamp is what the interval is really measured from.
+  const meta = loadMeta();
+  const attemptedAt = Number((meta.fallback || {}).lastAttemptAt);
+  if (Number.isFinite(attemptedAt) && attemptedAt > 0 && now - attemptedAt < FALLBACK_TICK_MS) {
+    return { evaluated: false, why: 'fallback interval has not elapsed' };
+  }
+  recordFallbackAttempt(now);
+  const decision = fallbackDecision({ lastVerdictAt: latestVerdictAt(deps), lastTickAt: meta.lastTickAt, now });
   if (!decision.send) {
+    // Recorded only now that something was actually evaluated. A bare minute pass
+    // records nothing at all: a per-minute skip moves lastRunAt forever, which pins
+    // health.stateOf at "skipped" and makes the row un-silenceable.
     health.record('review', { ok: true, skipped: true, cadenceMs: reviewCadenceMs(), detail: decision.why });
-    return { sent: false, why: decision.why };
+    return { evaluated: true, sent: false, why: decision.why };
   }
   const result = await reviewTick(deps, { trigger: 'fallback' });
   recordTickOutcome(result);
-  return result;
+  return { evaluated: true, ...result };
 }
 
 async function sweepIfDue(deps, clock, now = Date.now()) {
@@ -4595,6 +4619,26 @@ async function retryPendingDrifts(deps, now = Date.now()) {
   return sent;
 }
 
+// One pass of the events-mode checker. Each stage is independent: a send that throws
+// in one must not cost the fleet its daily sweep, which is what a single try/catch
+// around all three did. Exported so the "nothing due costs nothing" property is
+// testable without timers.
+async function minuteTick(deps, clock = sweepClock(), now = Date.now()) {
+  const stage = async (name, fn) => {
+    try { return await fn(); }
+    catch (error) {
+      recordTickError(error);
+      process.stderr.write(`keep review: ${name} failed: ${(error && error.message) || error}\n`);
+      return null;
+    }
+  };
+  const drifts = await stage('pending drift retry', () => retryPendingDrifts(deps, now));
+  const swept = await stage('daily sweep', () => sweepIfDue(deps, clock, now));
+  // The sweep is itself a tick; a fallback in the same minute would be a second one.
+  const fallback = swept ? null : await stage('fallback tick', () => fallbackIfSilent(deps, now));
+  return { drifts: drifts || [], swept: Boolean(swept), fallback };
+}
+
 function startScheduler(deps) {
   const mode = cadenceMode();
   const clock = sweepClock();
@@ -4615,11 +4659,7 @@ function startScheduler(deps) {
     const minute = async () => {
       if (running) return;
       running = true;
-      try {
-        await retryPendingDrifts(deps);
-        if (await sweepIfDue(deps, clock)) return;
-        await fallbackIfSilent(deps);
-      } catch (error) { recordTickError(error); }
+      try { await minuteTick(deps, clock); }
       finally { running = false; }
     };
     setInterval(() => { void minute(); }, 60e3).unref();
@@ -4787,6 +4827,8 @@ module.exports = {
   fallbackDecision,
   fallbackIfSilent,
   sweepIfDue,
+  minuteTick,
+  mutateMeta,
   reviewCadenceMs,
   DRIFT_PENDING_TTL_MS,
   MAX_PENDING_DRIFTS,
