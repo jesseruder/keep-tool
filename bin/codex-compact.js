@@ -38,6 +38,14 @@ function readScreen(target, deps) {
   return deps.readScreen(target, 40, false);
 }
 
+function pressKey(target, key, deps) {
+  const arrows = { ArrowUp: '\x1b[A', ArrowDown: '\x1b[B' };
+  if (Object.prototype.hasOwnProperty.call(arrows, key) && typeof deps.writeTarget === 'function') {
+    return deps.writeTarget(target, arrows[key], deps);
+  }
+  return deps.pressTargetKey(target, key, deps);
+}
+
 function validSessionId(value) { return /^[A-Za-z0-9_-]+$/.test(String(value || '')); }
 function snapshotField(config, key) {
   return Object.prototype.hasOwnProperty.call(config, key)
@@ -305,9 +313,17 @@ function menuRows(screen, kind) {
     const line = normalized(raw);
     const match = line.match(/^([›>•]?)\s*(\d+)\.\s+(.+?)\s*$/);
     if (!match) continue;
-    let label = match[3].replace(/\s+\((?:current|default)\)\s*$/i, '').trim();
-    if (kind === 'model' && !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(label)) continue;
-    if (kind === 'effort') label = label.replace(/\s+\(default\)\s*$/i, '').trim();
+    let label = match[3].trim();
+    if (kind === 'model') {
+      const choice = label.match(/^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\s+\((?:current|default)\))?(?:\s+.*)?$/i);
+      if (!choice) continue;
+      label = choice[1];
+    }
+    if (kind === 'effort') {
+      const choice = label.match(/^(More reasoning…|Extra high|Medium|Low|High)(?:\s+\(default\))?(?:\s+.*)?$/i);
+      if (!choice) continue;
+      label = choice[1];
+    }
     if (kind === 'advanced') {
       const choice = label.match(/^(Max|Ultra)(?:\s|$)/i);
       if (!choice) continue;
@@ -328,14 +344,14 @@ async function chooseVisibleRow(target, screen, title, label, kind, deps = {}) {
   const to = rows.indexOf(wanted[0]);
   if (from < 0 || to < 0) throw fail(`${label} menu position is unknown`);
   const key = to > from ? 'ArrowDown' : 'ArrowUp';
-  for (let index = 0; index < Math.abs(to - from); index += 1) await deps.pressTargetKey(target, key, deps);
+  for (let index = 0; index < Math.abs(to - from); index += 1) await pressKey(target, key, deps);
   const confirmed = await waitForScreen(target, (value) => {
     const entries = menuRows(value, kind);
     return normalized(value).includes(title)
       && entries.filter((row) => row.selected).length === 1
       && entries.some((row) => row.selected && row.label.toLowerCase() === label.toLowerCase());
   }, `${label} menu selection`, deps);
-  await deps.pressTargetKey(target, 'Enter', deps);
+  await pressKey(target, 'Enter', deps);
   return confirmed;
 }
 
@@ -373,7 +389,7 @@ async function selectCodexModel(target, model, effort, deps = {}) {
     if (!normalized(screen).includes('/model choose what model and reasoning effort to use')) {
       throw fail('Codex /model autocomplete changed unexpectedly');
     }
-    await deps.pressTargetKey(target, 'Enter', deps);
+    await pressKey(target, 'Enter', deps);
     screen = await waitForScreen(target, (value) => normalized(value).includes('Select Model and Effort'), 'Codex model menu', deps);
   }
   await chooseVisibleRow(target, screen, 'Select Model and Effort', model, 'model', deps);
@@ -546,7 +562,8 @@ async function compactCodexFallback(session, target, instruction, deps = {}) {
     result = { compacted: false, reason: String(error.message || error), via: fallback.model };
   }
   const restorePreparation = prepareRestoreConfig(record, deps);
-  if (restorePreparation.ok) record = restorePreparation.record;
+  if (!restorePreparation.ok) return restoreResult(result, restorePreparation.reason);
+  record = restorePreparation.record;
   record.phase = 'restore-pending';
   try { record = writeSwapRecord(file, record, deps); } catch {}
   const uncertain = !result.compacted && /timeout|in[ -]?progress|submitted|unconfirmed/i.test(String(result.reason || ''));
@@ -554,7 +571,6 @@ async function compactCodexFallback(session, target, instruction, deps = {}) {
     if (restorePreparation.ok) repairPreparedConfig(record, deps);
     return restoreResult(result, 'model restore deferred until Codex is confirmed idle');
   }
-  if (!restorePreparation.ok) return restoreResult(result, restorePreparation.reason);
   const restored = await restoreTransaction(record, target, deps);
   if (!restored.restored) return restoreResult(result, restored.reason);
   return result;
@@ -608,7 +624,7 @@ async function recoverCodexCompactSwap(record, deps = {}) {
       || text.includes('Select Model and Effort') || text.includes('Select Reasoning Level for')
       || text.includes('Advanced Reasoning');
     if (!modelUi) break;
-    await deps.pressTargetKey(target, 'Escape', deps);
+    await pressKey(target, 'Escape', deps);
     try {
       await sleep(deps.menuPollMs ?? 100, deps);
       screen = await readScreen(target, deps);

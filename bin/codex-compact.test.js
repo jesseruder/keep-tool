@@ -166,6 +166,14 @@ test('menu parser requires exact visible numbered rows', () => {
   assert.deepEqual(compact.menuRows(effortScreen('gpt-6-astra', 3), 'effort').at(3),
     { selected: true, number: 4, label: 'Extra high' });
   assert.deepEqual(compact.menuRows(advancedScreen(0), 'advanced').map((row) => row.label), ['Max', 'Ultra']);
+  const wide = [
+    'Select Model and Effort',
+    '› 1. gpt-6-astra (current)  Our most capable model for complex, demanding work.',
+    '  2. gpt-5.6-sol            Reliable agentic workhorse for everyday tasks.',
+  ].join('\n');
+  assert.deepEqual(compact.menuRows(wide, 'model').map((row) => row.label), ['gpt-6-astra', 'gpt-5.6-sol']);
+  assert.deepEqual(compact.menuRows('› 1. Low (default)  Quick answers\n  2. Medium  Balanced reasoning', 'effort')
+    .map((row) => row.label), ['Low', 'Medium']);
 });
 
 test('fallback compaction switches to Sol once, compacts once, and restores Astra plus account defaults', async (t) => {
@@ -199,7 +207,7 @@ test('original Astra medium restores an account default with a different effort'
     compactCurrentModel: async () => ({ compacted: true }),
   }));
   assert.equal(result.compacted, true);
-  assert.equal(result.restoreUnconfirmed, undefined);
+  assert.equal(result.restoreUnconfirmed, undefined, JSON.stringify(result));
   assert.equal(fs.existsSync(path.join(f.dir, `${SID}.swap.json`)), false);
   const config = toml.parse(fs.readFileSync(f.configFile, 'utf8'));
   assert.equal(config.model, 'saved-default');
@@ -221,11 +229,19 @@ test('restores Astra max through the visible Advanced Reasoning submenu', async 
 test('does not send a stale extra Enter when autocomplete advances asynchronously', async (t) => {
   const f = fixture(t);
   const ui = uiDriver(f.configFile, { autocompleteTransient: true });
+  const rawKeys = [];
   const result = await compact.compactCodexFallback(f.session, {}, null, common(f, ui, {
     compactCurrentModel: async () => ({ compacted: true }),
+    async writeTarget(target, value) {
+      rawKeys.push(value);
+      const key = value === '\x1b[A' ? 'ArrowUp' : value === '\x1b[B' ? 'ArrowDown' : value;
+      return ui.deps.pressTargetKey(target, key);
+    },
   }));
   assert.equal(result.compacted, true);
   assert.equal(ui.keys.filter((key) => key === 'Enter').length, 4);
+  assert.equal(rawKeys.includes('\x1b[B'), true);
+  assert.equal(rawKeys.includes('\x1b[A'), true);
 });
 
 test('writes the tagged durable record before any UI mutation', async (t) => {
@@ -332,6 +348,28 @@ test('timeout leaves the live session pending, repairs config, and does not open
   const config = toml.parse(fs.readFileSync(f.configFile, 'utf8'));
   assert.equal(config.model, 'saved-default');
   assert.equal(config.model_reasoning_effort, 'low');
+});
+
+test('failed restore-intent journal keeps the earlier phase recoverable for matching efforts', async (t) => {
+  const f = fixture(t, { originalEffort: 'medium' });
+  let ui = uiDriver(f.configFile, { currentEffort: 'medium' });
+  const result = await compact.compactCodexFallback(f.session, {}, null, common(f, ui, {
+    compactCurrentModel: async () => {
+      fs.writeFileSync(f.configFile, 'invalid = [\n');
+      return { compacted: true };
+    },
+  }));
+  assert.equal(result.restoreUnconfirmed, true);
+  const file = path.join(f.dir, `${SID}.swap.json`);
+  let record = { ...JSON.parse(fs.readFileSync(file, 'utf8')), file };
+  assert.equal(record.phase, 'compacting');
+  assert.equal(record.restoreConfigDesired, undefined);
+
+  fs.writeFileSync(f.configFile, toml.stringify({ model: 'gpt-5.6-sol', model_reasoning_effort: 'medium' }));
+  ui = uiDriver(f.configFile, { currentModel: 'gpt-5.6-sol', currentEffort: 'medium' });
+  const recovered = await compact.recoverCodexCompactSwap(record, common(f, ui, { session: f.session, target: {} }));
+  assert.equal(recovered.restored, true);
+  assert.equal(fs.existsSync(file), false);
 });
 
 test('new human config values win the compare-and-swap restore', async (t) => {
@@ -491,7 +529,7 @@ test('a later human config edit refreshes the journal before recovery opens the 
 
   ui = uiDriver(f.configFile, { currentModel: 'gpt-5.6-sol', currentEffort: 'medium' });
   result = await compact.recoverCodexCompactSwap(record, common(f, ui, { session: f.session, target: {} }));
-  assert.equal(result.restored, true);
+  assert.equal(result.restored, true, JSON.stringify(result));
   config = toml.parse(fs.readFileSync(f.configFile, 'utf8'));
   assert.equal(config.model, 'human-later');
   assert.equal(config.model_reasoning_effort, 'low');
