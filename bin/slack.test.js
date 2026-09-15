@@ -37,6 +37,10 @@ test('classifier argv follows capabilities from fixture help text', (t) => {
   assert.equal(modernArgs.at(-4), '--disallowed-tools');
   assert.match(modernArgs.at(-3), /Bash/);
   assert.match(modernArgs.at(-3), /WebFetch/);
+  // Claude Code warns on deny rules for removed tools; the warnings bury real errors.
+  for (const removed of ['LS', 'MultiEdit', 'NotebookRead', 'TodoRead']) {
+    assert.equal(modernArgs.at(-3).split(',').includes(removed), false, removed);
+  }
   assert.deepEqual(modernArgs.slice(-2), [
     '--settings',
     JSON.stringify({ enabledPlugins: { 'codex@openai-codex': false } }),

@@ -36,9 +36,8 @@ const RELATED_TYPES = new Set(['card', 'commit', 'step', 'hold']);
 const DEFAULT_SUSPECT_WINDOW_MIN = 90;
 const CLAUDE_BUILTIN_TOOLS = [
   'Agent', 'AskUserQuestion', 'Bash', 'Edit', 'EnterPlanMode', 'ExitPlanMode', 'Glob', 'Grep',
-  'KillShell', 'LS', 'MultiEdit', 'NotebookEdit', 'NotebookRead', 'Read', 'Skill', 'Task',
-  'TaskCreate', 'TaskGet', 'TaskList', 'TaskOutput', 'TaskStop', 'TaskUpdate', 'TodoRead',
-  'TodoWrite', 'WebFetch', 'WebSearch', 'Write',
+  'KillShell', 'NotebookEdit', 'Read', 'Skill', 'Task', 'TaskCreate', 'TaskGet', 'TaskList',
+  'TaskOutput', 'TaskStop', 'TaskUpdate', 'TodoWrite', 'WebFetch', 'WebSearch', 'Write',
 ];
 
 function readJson(file, fallback) {
