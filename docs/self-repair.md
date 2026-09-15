@@ -8,9 +8,9 @@ it. Self-repair is that loop, automated, with the one dangerous step left out.
 
 When a failure signature persists, Keep opens **one card per signature** with the
 health record and a log excerpt attached, creates a fresh `keep-tool` worktree out
-of process, and launches one headless repair agent there with a root-cause recipe.
-It never restarts the daemon. The agent lands a reviewed fix, or leaves the card
-in review with its branch named, and Owner restarts.
+of process, and opens one repair session there, pointed at a root-cause recipe
+stored on the card. It never restarts the daemon. The agent lands a reviewed fix,
+or leaves the card in review with its branch named, and Owner restarts.
 
 ## What counts as a signature
 
@@ -27,9 +27,9 @@ returns candidates.
 
 Retired schedulers, disabled rows, on-demand schedulers (`usage`, `digest`) and
 the `self-repair` row itself never produce a signature. Nor do `runs`, `lint` and
-`git-pull`: `runs` fails when a headless run fails to start — including this
-scheduler's own repair run, which would let it feed on itself — and `lint` and
-`git-pull` fail on registry and checkout state (a malformed card, a dirty or
+`git-pull`: `runs` fails when one of the headless runs other schedulers start
+fails to start, which is usually queue congestion rather than a bug, and `lint`
+and `git-pull` fail on registry and checkout state (a malformed card, a dirty or
 diverged checkout), which is Owner's to fix rather than a daemon bug. A `delivery`
 row carrying a live incident gets the `delivery:` signature rather than a second
 `sched:` one.
@@ -51,8 +51,9 @@ produces one card instead of one per tick, so it is tested directly in
 - After a signature resolves, `cooldownHours` (24) before it may open another.
 - A signature that recurs after the cooldown opens a new card whose note links the
   previous one.
-- The repair run's wall-clock budget is `budgetMin` (60), capped at 90 whatever
-  the config says.
+- `budgetMin` (60, capped at 90 whatever the config says) is **advisory**: the
+  recipe asks the session to aim for it and to check in if the work will take
+  longer. Nothing kills a repair session on a clock.
 
 ## Resolution
 
@@ -74,10 +75,15 @@ which is rewritten whole on every `record()` and would lose it:
 
 ```json
 { "signatures": { "<sig>": { "firstSeenAt": 0, "lastSeenAt": 0, "cardId": "",
-  "openedAt": 0, "runId": "", "worktree": "", "attempts": 1, "lastAttemptAt": 0,
-  "okSinceAt": 0, "resolvedAt": 0, "cooldownUntil": 0, "previousCardId": "" } },
+  "openedAt": 0, "sessionId": "", "pane": "", "worktree": "", "artifacts": [],
+  "recipe": "", "attempts": 1, "lastAttemptAt": 0, "okSinceAt": 0,
+  "resolvedAt": 0, "cooldownUntil": 0, "previousCardId": "" } },
   "day": "2026-09-15", "openedToday": 0 }
 ```
+
+`sessionId` (or, if the host never registered one, `pane`) is what marks a
+signature as launched. A reserved card with neither is a launch that did not
+finish, and the next tick resumes it.
 
 Every change goes through one synchronous read-modify-write helper — atomic only
 because nothing inside it awaits, the same constraint as `review.js`'s
@@ -118,7 +124,10 @@ Evidence is attached as artifacts under `.keep/artifacts/<card>/`: the failing
 health row with the `daemon` row, the whole health snapshot, the last 80 serve.log
 lines mentioning the scheduler or its error (or the last 40 if none match), and,
 for a delivery incident, the inspection result, the matching journal, and the tail
-of `diagnostics/events.jsonl`. Each excerpt is scrubbed line by line, **redacted**
+of `diagnostics/events.jsonl`. The recipe is stored alongside them as `recipe.md`,
+after the evidence so it can cite it — the session's opening message is capped at
+2000 characters and the recipe is several times that, so the session is pointed at
+the file rather than told its contents. Each excerpt is scrubbed line by line, **redacted**
 and clipped to 64 KB, and staged inside `.keep` so nothing on the card ever cites
 `/tmp`. Redaction matters because evidence is committed and pushed with `~/keep`:
 URL credentials, `Bearer`/`Basic` headers, `*_TOKEN=`/`*_SECRET=`/`*_KEY=` values,
@@ -129,30 +138,60 @@ secret. The known cost: a classic 40-hex GitHub token looks exactly like a sha a
 is kept too. serve.log should never carry one; if a line does, treat the token as
 burned and rotate it, and file the log line that leaked it.
 
-A check-in records the launch: run id, worktree path, account purpose and model,
-so Owner can see what was spent.
+A check-in records the launch: session id and pane, worktree path, account purpose
+and model, so Owner can see what was spent.
 
-## The repair run
+## The repair session
 
-`runs.startRun(cardId, 'task', recipe, { cwd, purpose: 'repair', model,
-budgetMin })`. The `cwd` option only relocates a **task** run and only into the
-configured worktree root — otherwise a card could point a `bypassPermissions`
-agent anywhere on disk. The run spends against the `repair` automation purpose,
-which falls back through `automationAccounts.claude` to the default, so nothing
-needs configuring for it to work.
+It is an **ordinary interactive session in the terminal host**, opened on the card
+the same way the console's "Start work" does:
+
+```js
+openSession({ taskId, fresh: true, cwd: <worktree>, agent: 'claude',
+  accountId: <repair automation account>, model, message: <pointer to recipe.md> },
+  { launchEnv: { KEEP_REPAIR: '1' } })
+```
+
+It used to be a headless `runs.startRun`, and that was wrong in one specific way:
+a headless run terminates at the end of its turn. The first live repair diagnosed
+and fixed its fault, then ended its turn saying a background poll would fetch the
+review result — the poll died with the run, no `keep reviewed` record was written,
+and nothing landed. An interactive session is tracked by the machinery that
+already exists: card check-ins, the turn watcher, the fleet reviewer. There is no
+verdict to parse and no wall-clock kill.
+
+`taskId` + `fresh` + `cwd` makes `openSession` check the cwd against the card's
+project, so a card can never point a `--dangerously-skip-permissions` agent
+anywhere on disk. The card's project is `~/keep-tool` and the cwd is a worktree
+under `~/wt/keep-tool/`; `keep.projectMatchesCwd` resolves a linked worktree to its
+main checkout, so that matches. `self-repair.js` also refuses any cwd outside the
+configured worktree root before it calls `openSession` at all, and says so on the
+card rather than throwing inside the daemon loop.
+
+`deps.launchEnv` is how `KEEP_REPAIR=1` reaches the pane, and it is internal only:
+an `env` or `launchEnv` key in an HTTP request body is refused with 400. The
+variable rides the pane's environment through `/bin/zsh -lic` into
+`agent-launcher`, which strips only its own `KEEP_LAUNCHER` marker, so the guard
+below sees it in the agent's own Bash calls.
+
+The session spends against the `repair` automation purpose, which falls back
+through `automationAccounts.claude` to the default, so nothing needs configuring
+for it to work.
 
 The recipe frames the card log and the artifacts as data, not instructions, and
 names the constraints: work only in the worktree, never edit or commit in
-`~/keep-tool`, never restart the daemon, review through `keep codex` and record it
-with `keep reviewed`, land only through `keep allow` + `keep land`, and end with a
-`VERDICT: PASS|FAIL|UNSURE` line.
+`~/keep-tool`, never restart the daemon, review through `keep codex` — **waiting
+for the result in the foreground, never ending a turn with the review pending** —
+record it with `keep reviewed`, land only through `keep allow` + `keep land`, and
+finish with a `keep checkin --status review` naming the commit and the restart
+Owner still has to do.
 
 ## What is not automated, and why
 
 **The restart stays gated.** The agent can make the fix; it cannot decide that
 this is a good moment to drop every live session's daemon. A restart mid-repair
 also destroys the running state that produced the evidence. So `keep hook
-pre-bash` refuses, for any command in a run with `KEEP_REPAIR=1`:
+pre-bash` refuses, for any command in a session with `KEEP_REPAIR=1`:
 
 - `keep restart-daemon`, `keep service`, `launchctl` — including the node-wrapper
   and shebang spellings (`node ~/keep-tool/bin/keep.js restart-daemon`), starting a
@@ -166,7 +205,7 @@ pre-bash` refuses, for any command in a run with `KEEP_REPAIR=1`:
   goes through `keep land`, which enforces the review record
 
 The refusal names the rule and points at step 4 of the repair card. The guard is
-keyed to the environment variable `runs.js` sets for repair runs, so no other
+keyed to the environment variable the repair launch puts on the pane, so no other
 session sees it.
 
 **The card is not closed automatically**, the fix is not landed without a recorded
