@@ -1628,14 +1628,23 @@ test('last turn usage takes the last non-sidechain Claude model and context', ()
 
 test('last turn usage tracks cache age, inferred Claude TTL, and the current Codex model', () => {
   const at = '2026-09-01T11:00:00.000Z';
-  const claude = lastTurnUsage([{
-    type: 'assistant', timestamp: at, message: { model: 'claude-fable-5-1', usage: {
-      input_tokens: 20, cache_read_input_tokens: 100000, cache_creation_input_tokens: 10,
-      cache_creation: { ephemeral_1h_input_tokens: 10, ephemeral_5m_input_tokens: 0 },
-    } },
-  }], 'claude');
-  assert.equal(claude.usageAt, Date.parse(at));
-  assert.equal(claude.cacheTtlMs, 60 * 60e3);
+  const fullHitAt = '2026-09-01T11:01:00.000Z';
+  const claude = lastTurnUsage([
+    {
+      type: 'assistant', timestamp: at, message: { model: 'claude-fable-5-1', usage: {
+        input_tokens: 20, cache_read_input_tokens: 100000, cache_creation_input_tokens: 10,
+        cache_creation: { ephemeral_1h_input_tokens: 0, ephemeral_5m_input_tokens: 10 },
+      } },
+    },
+    {
+      type: 'assistant', timestamp: fullHitAt, message: { model: 'claude-fable-5-1', usage: {
+        input_tokens: 20, cache_read_input_tokens: 100010, cache_creation_input_tokens: 0,
+        cache_creation: { ephemeral_1h_input_tokens: 0, ephemeral_5m_input_tokens: 0 },
+      } },
+    },
+  ], 'claude');
+  assert.equal(claude.usageAt, Date.parse(fullHitAt));
+  assert.equal(claude.cacheTtlMs, 5 * 60e3, 'a full cache hit retains the applicable inferred TTL');
 
   const codex = lastTurnUsage([
     { type: 'turn_context', payload: { model: 'gpt-5.6-sol' } },
@@ -1666,6 +1675,13 @@ test('last turn usage tracks cache age, inferred Claude TTL, and the current Cod
   ], 'codex');
   assert.equal(switchedWithoutUse.model, 'gpt-6-astra');
   assert.equal(switchedWithoutUse.usageAt, null, 'usage from the previous model cannot establish Astra cache age');
+  const unattributedBeforeSwitch = lastTurnUsage([
+    { type: 'token_usage_record', timestamp: at, payload: { usage: { input_tokens: 180000 } } },
+    { type: 'event_msg', payload: { type: 'thread_settings_applied', thread_settings: { model: 'gpt-6-astra' } } },
+  ], 'codex');
+  assert.equal(unattributedBeforeSwitch.model, 'gpt-6-astra');
+  assert.equal(unattributedBeforeSwitch.usageAt, null,
+    'usage without a model cannot establish cache age after later settings are applied');
 });
 
 test('session last turn resolves Codex settings beyond the 256 KiB activity tail', (t) => {
@@ -1960,6 +1976,42 @@ test('auto-compact tick dispatches Codex Astra with a fresh warm policy and reco
   assert.equal(decisions[0].cacheAgeMs >= 20 * 60e3, true);
   assert.deepEqual(decisions[0].compactionUsage, { input_tokens: 180000 });
   assert.equal(decisions[0].attemptStage, 'submitted');
+});
+
+test('auto-compact tick continues after a retryable precheck failure', async (t) => {
+  const prior = process.env.KEEP_AUTO_COMPACT;
+  process.env.KEEP_AUTO_COMPACT = 'on';
+  t.after(() => prior === undefined ? delete process.env.KEEP_AUTO_COMPACT : process.env.KEEP_AUTO_COMPACT = prior);
+  const now = Date.now();
+  const sessions = [
+    { id: 'blocked', kind: 'codex', endedTurn: true, mtime: now - 25 * 60e3 },
+    { id: 'ready', kind: 'codex', endedTurn: true, mtime: now - 22 * 60e3 },
+  ];
+  const decisions = [];
+  const compacted = [];
+  const outcome = await autoCompactTick({
+    sweepPendingCompactSwaps: async () => ({ checked: 0 }), gcAutoCompactStamps: () => {},
+    readAutoCompactStamps: () => ({}), scanSessions: () => sessions,
+    listHostPanes: async () => sessions.map((session) => ({ alive: true, meta: { sessionId: session.id } })),
+    sessionLastTurn: (session) => ({
+      contextTokens: 180000, model: 'gpt-6-astra',
+      usageAt: now - (session.id === 'blocked' ? 25 : 22) * 60e3,
+    }),
+    withInjectionLock: async (fn) => fn(),
+    loadCurrentSession: (id) => sessions.find((session) => session.id === id),
+    resolveSessionTarget: async (session) => ({ pane: `pane-${session.id}` }),
+    readScreen: async (target) => target.pane === 'pane-blocked'
+      ? 'Would you like to run the following command?'
+      : '› Ask Codex to do anything',
+    compactSession: async (session) => {
+      compacted.push(session.id);
+      return { compacted: true, originalModel: 'gpt-6-astra', compactionModel: 'gpt-6-astra' };
+    },
+    writeAutoCompactDecision: (stamp) => decisions.push(stamp), logAutoCompactDecision: () => {},
+  });
+  assert.equal(outcome.detail, 'compacted');
+  assert.deepEqual(compacted, ['ready']);
+  assert.deepEqual(decisions.map((stamp) => stamp.sessionId), ['ready']);
 });
 
 test('auto-compact resolve-time pane exit is stamped and skipped, while other resolve errors fail', async (t) => {

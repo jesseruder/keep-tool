@@ -1009,6 +1009,8 @@ function lastTurnUsage(lines, kind) {
   const records = Array.isArray(lines) ? lines : String(lines || '').split(/\r?\n/);
   let result = { contextTokens: 0, model: '', usageAt: null, cacheTtlMs: null };
   let sawClaudeUsage = false;
+  let claudeCacheTtlMs = null;
+  let claudeCacheTtlModel = '';
   let codexModel = '';
   let codexUsageResult = null;
   let codexTokenCountResult = null;
@@ -1042,11 +1044,20 @@ function lastTurnUsage(lines, kind) {
       const cacheCreation = usage.cache_creation || {};
       const hasFiveMinute = Number(cacheCreation.ephemeral_5m_input_tokens || 0) > 0;
       const hasOneHour = Number(cacheCreation.ephemeral_1h_input_tokens || 0) > 0;
+      const model = String(record.message.model || '');
+      const inferredTtlMs = hasFiveMinute ? 5 * 60e3 : hasOneHour ? 60 * 60e3 : null;
+      if (inferredTtlMs) {
+        claudeCacheTtlMs = inferredTtlMs;
+        claudeCacheTtlModel = model;
+      } else if (claudeCacheTtlModel !== model) {
+        claudeCacheTtlMs = null;
+        claudeCacheTtlModel = model;
+      }
       result = {
         contextTokens,
-        model: String(record.message.model || ''),
+        model,
         usageAt: Date.parse(record.timestamp) || null,
-        cacheTtlMs: hasFiveMinute ? 5 * 60e3 : hasOneHour ? 60 * 60e3 : null,
+        cacheTtlMs: claudeCacheTtlMs,
       };
       sawClaudeUsage = true;
     } else if (kind === 'claude' && !latestBoundary && sawClaudeUsage && record && record.type === 'system'
@@ -1096,7 +1107,7 @@ function lastTurnUsage(lines, kind) {
   }
   if (kind === 'codex') {
     result = codexUsageResult || codexTokenCountResult || result;
-    if (codexModel && result.model && codexModel !== result.model) {
+    if (codexModel && result.usageAt && codexModel !== result.model) {
       result = { ...result, model: codexModel, usageAt: null };
     } else if (codexModel) result.model = codexModel;
   }
@@ -3875,7 +3886,7 @@ async function autoCompactTick(deps = {}) {
     now,
     opts,
   );
-  const candidate = candidates[0];
+  let candidate = candidates[0];
   // A completed scan is healthy even when it has no candidates. Health treats
   // `nothing due` as an unattempted tick and preserves any prior failure.
   if (!candidate) return { ok: true, detail: 'no eligible sessions' };
@@ -3886,57 +3897,67 @@ async function autoCompactTick(deps = {}) {
   let via = null;
   let compactedResult = null;
   if (mode === 'on') {
-    const started = Date.now();
-    let phase = 'lock';
-    try {
-      const compacted = await (deps.withInjectionLock || withInjectionLock)(async () => {
-        phase = 'resolve';
-        const session = (deps.loadCurrentSession || loadCurrentSession)(candidate.session.id);
-        const freshNow = Date.now();
-        const freshTurn = (deps.sessionLastTurn || sessionLastTurn)(session);
-        const freshCandidate = autoCompactCandidates([{ ...session, ...freshTurn }], stamps, freshNow, opts)[0];
-        if (session.mtime !== candidate.session.mtime || !freshCandidate
-            || freshCandidate.path !== candidate.path || freshCandidate.originalModel !== candidate.originalModel) {
-          phase = 'eligibility';
-          throw new InjectionError(409, 'session changed or left the eligible compaction window');
+    let attempted = false;
+    for (const nextCandidate of candidates) {
+      candidate = nextCandidate;
+      result = 'error';
+      reason = '';
+      via = null;
+      compactedResult = null;
+      const started = Date.now();
+      let phase = 'lock';
+      try {
+        const compacted = await (deps.withInjectionLock || withInjectionLock)(async () => {
+          phase = 'resolve';
+          const session = (deps.loadCurrentSession || loadCurrentSession)(candidate.session.id);
+          const freshNow = Date.now();
+          const freshTurn = (deps.sessionLastTurn || sessionLastTurn)(session);
+          const freshCandidate = autoCompactCandidates([{ ...session, ...freshTurn }], stamps, freshNow, opts)[0];
+          if (session.mtime !== candidate.session.mtime || !freshCandidate
+              || freshCandidate.path !== candidate.path || freshCandidate.originalModel !== candidate.originalModel) {
+            phase = 'eligibility';
+            throw new InjectionError(409, 'session changed or left the eligible compaction window');
+          }
+          const target = await (deps.resolveSessionTarget || resolveSessionTarget)(session, null);
+          // A busy pane is another sender, not a busy session: stay in the lock phase.
+          phase = 'lock';
+          claimInjectionTarget(target);
+          phase = 'precheck';
+          await precheckSessionTarget(session, target, deps);
+          phase = 'compact';
+          return (deps.compactSession || compactSession)(session, target, null, {
+            ...deps,
+            compactionPolicy: {
+              path: freshCandidate.path,
+              originalModel: freshCandidate.originalModel,
+              targetModel: freshCandidate.targetModel,
+              cacheUsageAt: freshCandidate.session.usageAt,
+              cacheTtlMs: freshCandidate.cacheTtlMs,
+              cacheAgeMs: freshCandidate.cacheAgeMs,
+            },
+          });
+        }, { session: candidate.session.id, model: true });
+        via = compacted.via || null;
+        reason = String(compacted.reason || '');
+        result = autoCompactOutcome(compacted);
+        compactedResult = compacted;
+      } catch (e) {
+        reason = String(e && e.message || e);
+        // Retryable contention and precheck failures do not spend the idle period.
+        // Try another candidate so one blocked pane cannot starve the fleet.
+        if (phase === 'lock' || phase === 'precheck' || phase === 'eligibility') {
+          process.stderr.write(`keep serve: auto-compact skipped ${String(candidate.session.id).slice(0, 8)} this tick: ${reason}\n`);
+          continue;
         }
-        const target = await (deps.resolveSessionTarget || resolveSessionTarget)(session, null);
-        // A busy pane is another sender, not a busy session: stay in the lock phase.
-        phase = 'lock';
-        claimInjectionTarget(target);
-        phase = 'precheck';
-        await precheckSessionTarget(session, target, deps);
-        phase = 'compact';
-        return (deps.compactSession || compactSession)(session, target, null, {
-          ...deps,
-          compactionPolicy: {
-            path: freshCandidate.path,
-            originalModel: freshCandidate.originalModel,
-            targetModel: freshCandidate.targetModel,
-            cacheUsageAt: freshCandidate.session.usageAt,
-            cacheTtlMs: freshCandidate.cacheTtlMs,
-            cacheAgeMs: freshCandidate.cacheAgeMs,
-          },
-        });
-      }, { session: candidate.session.id, model: true });
-      via = compacted.via || null;
-      reason = String(compacted.reason || '');
-      result = autoCompactOutcome(compacted);
-      compactedResult = compacted;
-    } catch (e) {
-      reason = String(e && e.message || e);
-      // Another sender held the lock: the session itself was fine, so do not spend
-      // its one attempt for this idle period. The next tick retries within the window.
-      if (phase === 'lock' || phase === 'precheck' || phase === 'eligibility') {
-        process.stderr.write(`keep serve: auto-compact skipped ${String(candidate.session.id).slice(0, 8)} this tick: ${reason}\n`);
-        return { ok: true, detail: 'nothing due' };
+        if (phase === 'resolve' && e instanceof InjectionError && e.status === 404 && e.extra.notLive) result = 'skipped';
+        else if (phase === 'resolve') result = 'unmatched';
+        else result = 'error';
       }
-      if (phase === 'resolve' && e instanceof InjectionError && e.status === 404 && e.extra.notLive) result = 'skipped';
-      else if (phase === 'precheck' || phase === 'eligibility') result = 'busy';
-      else if (phase === 'resolve') result = 'unmatched';
-      else result = 'error';
+      ms = Date.now() - started;
+      attempted = true;
+      break;
     }
-    ms = Date.now() - started;
+    if (!attempted) return { ok: true, detail: 'nothing due' };
   }
 
   const stamp = {
