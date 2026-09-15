@@ -262,7 +262,7 @@ function triageVisible(item) {
 }
 function retainedSelectionItem(item) {
   if (isClosingSession(item?.sessionId, item?.pane)) return null;
-  if (state.paneTarget?.pane === item?.pane) {
+  if (state.paneTarget && state.paneTarget.pane === item?.pane) {
     const pane = paneMap().get(item.pane);
     if (!pane?.alive || !matchesTriageFilter(state.paneTarget)) { state.paneTarget = null; return null; }
     const entity = entityForPane(item.pane);
