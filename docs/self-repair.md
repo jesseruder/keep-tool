@@ -94,8 +94,11 @@ its signature forever.
 Each tick checks the recorded pane against the host. A pane that has exited clears
 `sessionId`/`pane` and checks in once, so the resume path relaunches it — still
 capped at three attempts. And before it opens anything, a launch asks the host
-whether the card already has a live pane, so a spawn response lost after the pane
-came up does not become a second agent.
+whether the card already has a live pane **that this scheduler spawned** — the
+launch stamps `repair: true` into the pane meta, alongside `card` — so a spawn
+response lost after the pane came up does not become a second agent, while a
+session Owner or a reviewer opened on the same card is never mistaken for the
+repair agent and adopted as one.
 
 `--reset` refuses only while the card is genuinely live: a card that is `done` or
 `archived`, or an entry whose launch was never confirmed, clears.

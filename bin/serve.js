@@ -4757,6 +4757,11 @@ async function openSession(body, deps = {}) {
         ...(launchModel ? { model: launchModel } : {}),
         project,
         card: body.taskId || null,
+        // Marks the pane as the self-repair scheduler's own agent, not merely a
+        // session on its card. Owner's "Start work" on a repair card, and a
+        // reviewer's discuss session on it, both carry `card` and must never be
+        // mistaken for the repair agent — by the scheduler's dedupe or anything else.
+        ...(deps.launchEnv && deps.launchEnv.KEEP_REPAIR === '1' ? { repair: true } : {}),
         requester: body.requester || null,
         ...(body.portableTransferId ? { portableTransferId: body.portableTransferId } : {}),
         ...(body.reviewQueueLaunchId ? { reviewQueueLaunchId: body.reviewQueueLaunchId } : {}),
@@ -7733,12 +7738,15 @@ function start(deps = {}) {
     openSession: (body, openDeps) => openSession(body, openDeps),
     // The spawn response can be lost after the pane is up — a host timeout, a
     // daemon that died between the two. The host itself is the authority on
-    // whether this card already has an agent, so ask it before opening another.
+    // whether this card already has a repair agent, so ask it before opening
+    // another. `meta.repair` and not just `meta.card`: a lost-response pane was
+    // spawned by this scheduler so it carries the flag, while Owner's own session
+    // on the card does not and must never be adopted as the repair agent.
     findCardPane: async (cardId) => {
       const panes = await listHostPanes({}, true);
       if (!Array.isArray(panes)) return null;
       const match = panes.find((pane) => pane && pane.alive && pane.agentAlive !== false
-        && pane.meta && pane.meta.card === cardId);
+        && pane.meta && pane.meta.card === cardId && pane.meta.repair === true);
       return match ? { pane: match.id, sessionId: match.meta.sessionId || null } : null;
     },
     // A recorded launch whose pane has since exited is not a launch any more. Null

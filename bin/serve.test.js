@@ -4563,6 +4563,23 @@ test('an internal launchEnv reaches the pane shell, and a request body can never
     const spawned = host.calls.find((call) => call.type === 'spawn');
     assert.equal(spawned.params.env.KEEP_REPAIR, '1');
     assert.equal(spawned.params.env.KEEP_LAUNCHER, '1', 'and the launcher marker still rides along');
+    // The pane is marked as the scheduler's own agent, not merely a session on its
+    // card, so nothing later mistakes Owner's session on that card for the agent.
+    assert.equal(spawned.params.meta.repair, true);
+
+    // A plain open on the same card carries the card and not the flag.
+    const plainHost = recordingHost((type) => type === 'spawn' ? { pane: { id: 'pane-plain' } } : {});
+    await openSession({ taskId: 'card', fresh: true, agent: 'claude', cwd: project }, {
+      host: plainHost,
+      loadTask: () => ({ fm: { project, sessions: [] } }),
+      randomUUID: () => '77777777-7777-4777-8777-777777777777',
+      waitForHostAgent: async () => true,
+      trustProject: () => true,
+      linkLaunchedSession: () => true,
+    });
+    const plainMeta = plainHost.calls.find((call) => call.type === 'spawn').params.meta;
+    assert.equal(plainMeta.card, 'card');
+    assert.equal('repair' in plainMeta, false);
 
     // Over HTTP it is refused: a body that could name environment variables would
     // hand any caller the guard's off switch and the pane account's credentials.

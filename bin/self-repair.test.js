@@ -801,6 +801,44 @@ test('a card that already has a live pane is never given a second session', asyn
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('only a pane this scheduler spawned is adopted, never a session Owner opened', async () => {
+  const root = makeRoot();
+  try {
+    const snapshot = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const config = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 };
+    // serve.js's findCardPane requires meta.repair as well as meta.card. Run the
+    // same matcher here over both kinds of pane on the card.
+    const matcher = (panes) => async (cardId) => {
+      const match = panes.find((pane) => pane.alive && pane.meta.card === cardId && pane.meta.repair === true);
+      return match ? { pane: match.id, sessionId: match.meta.sessionId || null } : null;
+    };
+    // Owner opened his own session on the repair card to look at the fix. Adopting
+    // it would record it as the repair agent, and from then on it would carry
+    // KEEP_REPAIR and be refused the `keep restart-daemon` it is there to run.
+    const owners = [{ id: 'pane-owner', alive: true, meta: { card: 'repair-card-1', sessionId: 'owners-session' } }];
+    const plain = harness({ root, snapshot, config, findCardPane: matcher(owners) });
+    const first = await selfRepair.tick(plain.deps);
+    assert.equal(plain.calls.runs.length, 1, 'a session that is not the repair agent is not adopted');
+    assert.equal(first.opened[0].launched, true);
+    assert.match(plain.calls.checkins.at(-1).message, /Session: 11111111 in pane pane-1/);
+
+    // The same card, but the pane carries the flag: that one is this scheduler's,
+    // spawned by a launch whose spawn response was lost.
+    const mine = [...owners, { id: 'pane-repair', alive: true, meta: { card: 'repair-card-1', repair: true, sessionId: 'ffff2222-0000-4000-8000-000000000000' } }];
+    const second = makeRoot();
+    try {
+      const reused = harness({ root: second, snapshot, config, findCardPane: matcher(mine) });
+      const result = await selfRepair.tick(reused.deps);
+      assert.equal(reused.calls.runs.length, 0);
+      assert.equal(result.opened[0].launched, true);
+      assert.equal(result.opened[0].sessionId, 'ffff2222-0000-4000-8000-000000000000');
+      assert.match(reused.calls.checkins.at(-1).message, /Found the repair session already running in pane pane-repair/);
+    } finally { fs.rmSync(second, { recursive: true, force: true }); }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('a recorded pane that has exited is relaunched, and --reset can clear what is stuck', async () => {
   const root = makeRoot();
   try {
