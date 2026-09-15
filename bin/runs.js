@@ -155,6 +155,11 @@ function checkDeliveryMessage(task, opts = {}) {
   const recipe = String(fm.check || '').replace(/\s+/g, ' ').trim();
   const probeSentence = probeFailureSentence(opts && opts.probe);
   const rearm = fm.check_on_pass === 'rearm';
+  // Validated with the same parser onPassOutcome uses, so the message never tells a
+  // session to pass `--check-after next tuesday` to a flag that cannot read it. The
+  // whole field is clipped too: `check_every` is card text like any other.
+  const every = clip(String(fm.check_every || '').replace(/\s+/g, ' '), 40);
+  const rearmEvery = every && keep.relativeDurationMs(every) != null ? every : '';
   // Reserve room for handoff guidance and the full card ID — and for the on-pass and
   // probe sentences, so a long recipe cannot push `Full card:` past the 2000-char cap.
   const recipeLimit = Math.max(200, 900
@@ -164,9 +169,10 @@ function checkDeliveryMessage(task, opts = {}) {
   const clipped = recipe.length > recipeLimit;
   const shownRecipe = clipped ? `${recipe.slice(0, recipeLimit - 1)}…` : recipe;
   const title = String(fm.title || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+  const scheduledFor = clip(String(fm.check_after || '').replace(/\s+/g, ' '), 40) || '(unspecified)';
   const message = [
     probeSentence,
-    `[keep] scheduled check due for ${task.id} ("${title}"), scheduled for ${fm.check_after || '(unspecified)'}.`,
+    `[keep] scheduled check due for ${task.id} ("${title}"), scheduled for ${scheduledFor}.`,
     `This is the reminder you scheduled; run the recipe now in this session: ${shownRecipe}`,
     clipped ? '(recipe truncated; full text on the card)' : '',
     `Do only the read-only check; report any required changes rather than performing them.`,
@@ -178,7 +184,9 @@ function checkDeliveryMessage(task, opts = {}) {
       ? 'This card declares on-pass: done — if every gate holds, check in with --status done --clear-check-after.'
       : '',
     rearm
-      ? `This card re-arms: if every gate holds, check in with --check-after ${fm.check_every || '<the card\'s check_every>'} and the status unchanged; if not, record the failure and the status it deserves.`
+      ? (rearmEvery
+        ? `This card re-arms: if every gate holds, check in with --check-after ${rearmEvery} and the status unchanged; if not, record the failure and the status it deserves.`
+        : 'This card re-arms, but its check_every is unreadable: if every gate holds, re-arm with --check-after <a valid interval like +7d> and the status unchanged; if not, record the failure and the status it deserves.')
       : '',
     `Full card: keep show ${task.id}.`,
   ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
@@ -211,16 +219,42 @@ function deliveryStampFile(taskId) {
   return path.join(RUNS_DIR, `${taskId}.delivered.json`);
 }
 
-function readDeliveryStamp(task) {
+// A thread delivery is answered by a session Owner can see and talk to, so its stamp
+// stands until the schedule moves. A session Keep opened by itself has nobody watching
+// it: if it dies before checking in, the stamp would suppress the card's check forever.
+// So a fresh-open stamp carries a TTL, after which the card simply comes due again.
+const FRESH_OPEN_STAMP_TTL_MS = 2 * 3600e3;
+
+function stampExpired(stamp, now = Date.now()) {
+  const ttl = Number(stamp && stamp.ttlMs);
+  if (!Number.isFinite(ttl) || ttl <= 0) return false;
+  const at = stampMs(stamp.at);
+  // A stamp whose own timestamp is unreadable has no measurable life left; treat it as
+  // expired rather than as immortal.
+  return !at || now - at >= ttl;
+}
+
+function removeDeliveryStamp(taskId) {
+  const file = deliveryStampFile(taskId);
+  if (!fs.existsSync(file)) return true;
+  try { fs.unlinkSync(file); return true; }
+  catch (e) {
+    process.stderr.write(`keep runs: could not remove the delivery stamp for ${taskId}: ${e.message}\n`);
+    return false;
+  }
+}
+
+function readDeliveryStamp(task, now = Date.now()) {
   const file = deliveryStampFile(task.id);
   let stamp = null;
   try { stamp = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
-  if (stamp && (stamp.checkAfter === task.fm.check_after || (stamp.truncated && !stamp.warningLanded))) return stamp;
-  if (fs.existsSync(file)) {
-    try { fs.unlinkSync(file); } catch (e) {
-      process.stderr.write(`keep runs: could not remove stale delivery stamp for ${task.id}: ${e.message}\n`);
-    }
+  const live = stamp && !stampExpired(stamp, now)
+    && (stamp.checkAfter === task.fm.check_after || (stamp.truncated && !stamp.warningLanded));
+  if (live) return stamp;
+  if (stamp && stampExpired(stamp, now)) {
+    process.stderr.write(`keep runs: the check session stamp for ${task.id} expired without a result; the card is due again\n`);
   }
+  removeDeliveryStamp(task.id);
   return null;
 }
 
@@ -234,6 +268,7 @@ function writeDeliveryStamp(task, delivery) {
     kind: delivery.kind,
     checkAfter: delivery.checkAfter !== undefined ? delivery.checkAfter : task.fm.check_after,
     at: keep.nowStamp(),
+    ...(Number(delivery.ttlMs) > 0 ? { ttlMs: Number(delivery.ttlMs) } : {}),
     ...(delivery.truncated ? {
       truncated: true,
       received: delivery.received,
@@ -269,10 +304,85 @@ function landDeliveryWarning(task, delivery) {
 
 // One scheduler-opened session per card per local day, and at most three per tick: a
 // daemon that was down all night finds every card due at once, and three panes is
-// already a lot of windows to come back to.
+// already a lot of windows to come back to. A tick that defers many cards on budget
+// logs them all but writes at most three check-ins, so a limit reset does not arrive
+// as fifty commits.
 const MAX_FRESH_OPENS_PER_TICK = 3;
-const openedToday = new Map(); // taskId -> YYYY-MM-DD
-const budgetNoticeDay = new Map(); // taskId -> YYYY-MM-DD
+const MAX_DEFERRAL_NOTICES_PER_TICK = 3;
+// The model a scheduled check runs as. Unset means the launched session takes the model
+// in settings.json, and the budget is classified against the reviewer's model as a
+// proxy. Set it and BOTH move together — the pane is launched with it and the budget is
+// read for it, so the window Keep checks is the window Keep spends.
+const CHECK_MODEL = process.env.KEEP_CHECK_MODEL || '';
+const SCHEDULER_STATE_FILE = path.join(RUNS_DIR, 'scheduler-state.json');
+
+// Per-card, per-day bookkeeping. Persisted, because it was all that stopped a card
+// from being re-opened or re-noticed, and a daemon restart reset it: an afternoon of
+// restarts used to mean an afternoon of duplicate panes and duplicate check-ins.
+let schedulerState = null;
+
+function dayRecord(value) {
+  const out = new Map();
+  if (value && typeof value === 'object') {
+    for (const [id, day] of Object.entries(value)) {
+      if (typeof id === 'string' && typeof day === 'string') out.set(id, day);
+    }
+  }
+  return out;
+}
+
+function loadSchedulerState() {
+  if (schedulerState) return schedulerState;
+  let parsed = null;
+  try { parsed = JSON.parse(fs.readFileSync(SCHEDULER_STATE_FILE, 'utf8')); } catch {}
+  schedulerState = {
+    opened: dayRecord(parsed && parsed.opened),
+    budgetNotice: dayRecord(parsed && parsed.budgetNotice),
+    reopened: dayRecord(parsed && parsed.reopened),
+  };
+  return schedulerState;
+}
+
+// Written whole, atomically, and pruned to today: this file is bookkeeping, not a log,
+// and a registry that has been running for a year should not carry a year of card ids.
+function saveSchedulerState(today = keep.nowStamp().slice(0, 10)) {
+  const state = loadSchedulerState();
+  const prune = (map) => {
+    for (const [id, day] of map) if (day !== today) map.delete(id);
+    return Object.fromEntries(map);
+  };
+  const payload = { opened: prune(state.opened), budgetNotice: prune(state.budgetNotice), reopened: prune(state.reopened) };
+  const tmp = `${SCHEDULER_STATE_FILE}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.mkdirSync(RUNS_DIR, { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n');
+    fs.renameSync(tmp, SCHEDULER_STATE_FILE);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch {}
+    process.stderr.write(`keep runs: could not persist scheduler state: ${e.message}\n`);
+  }
+}
+
+function markDay(bucket, taskId, today) {
+  loadSchedulerState()[bucket].set(taskId, today);
+  saveSchedulerState(today);
+}
+
+function markedToday(bucket, taskId, today) {
+  return loadSchedulerState()[bucket].get(taskId) === today;
+}
+
+// After a reaped session ended without recording anything, the card gets exactly one
+// more chance today. Without this the per-day cap and a crashed session together mean
+// a card that is simply never checked.
+function grantReopen(taskId, today) {
+  const state = loadSchedulerState();
+  if (state.reopened.get(taskId) === today) return false;
+  state.reopened.set(taskId, today);
+  state.opened.delete(taskId);
+  saveSchedulerState(today);
+  return true;
+}
 
 // The account a scheduled check spends against. Undefined lets openSession pick the
 // default, which is what a single-account install wants anyway.
@@ -284,7 +394,7 @@ function checksAccountId(env = process.env) {
 function checkBudget(accountId, deps = {}) {
   const read = deps.reviewBudget
     || ((model, snapshot, id) => require('./review.js').reviewBudget(model, snapshot, id));
-  try { return read(process.env.KEEP_CHECK_MODEL || undefined, undefined, accountId); }
+  try { return read(CHECK_MODEL || undefined, undefined, accountId); }
   catch (e) { return { code: 8, reason: String(e && e.message || e) }; }
 }
 
@@ -299,9 +409,10 @@ function budgetDeferralReason(verdict) {
 // One line and one check-in per card per day, and no status or schedule change: the
 // card stays overdue, so the next tick after the reset picks it straight back up.
 function noteBudgetDeferral(task, reason, today, deps = keep) {
-  if (budgetNoticeDay.get(task.id) === today) return false;
-  budgetNoticeDay.set(task.id, today);
   process.stderr.write(`keep runs: check for ${task.id} deferred: ${reason}\n`);
+  if (markedToday('budgetNotice', task.id, today)) return false;
+  if (deps.quiet) return false;
+  markDay('budgetNotice', task.id, today);
   try {
     deps.checkinTask(task.id, {
       heading: 'check deferred',
@@ -315,32 +426,74 @@ function noteBudgetDeferral(task, reason, today, deps = keep) {
   return true;
 }
 
+// How many sessions this tick has opened. Module state, not a tick-local counter,
+// because a probe escalation runs from an async probe callback that may land between
+// ticks and must spend from the same allowance.
+let freshOpensThisTick = 0;
+function resetTickAllowance() { freshOpensThisTick = 0; }
+
+// Everything that can refuse an open before one is attempted, in one place so the
+// scheduler path and the probe-escalation path cannot drift apart.
+function freshOpenRefusal(task, today, accountId, deps = {}) {
+  if (markedToday('opened', task.id, today)) return { skipped: 'opened-today' };
+  if (freshOpensThisTick >= MAX_FRESH_OPENS_PER_TICK) return { skipped: 'tick-cap' };
+  const denial = budgetDeferralReason((deps.checkBudget || checkBudget)(accountId));
+  if (denial) return { skipped: 'budget', reason: denial };
+  return null;
+}
+
+// Two manual verifies, or a verify racing a scheduler tick, must not put two agents on
+// one card. Same shape as serve.js's freshOpenOperations: the second caller waits for
+// and returns the first result instead of opening anything.
+const openInFlight = new Map(); // taskId -> promise
+
 // A due check that no live thread took opens a fresh interactive session on the card
 // and types the same instruction a thread would have got. openSession links the session
 // to the card, so from here on the delivery stamp, planDueCard('skip-delivered') and
 // the deferral machinery all treat it as the linked thread.
-async function openFreshCheckSession(task, opts = {}) {
+function openFreshCheckSession(task, opts = {}) {
+  const running = openInFlight.get(task.id);
+  if (running) return running;
+  const promise = openFreshCheckSessionOnce(task, opts)
+    .finally(() => { if (openInFlight.get(task.id) === promise) openInFlight.delete(task.id); });
+  openInFlight.set(task.id, promise);
+  return promise;
+}
+
+async function openFreshCheckSessionOnce(task, opts = {}) {
   const today = opts.today || keep.nowStamp().slice(0, 10);
   const accountId = opts.accountId !== undefined ? opts.accountId : checksAccountId();
   const open = opts.open || openSession;
+  // `keep verify` is Owner asking for this check now. It never spends the scheduler's
+  // one-per-day allowance and is never refused for it, but it does write the same
+  // TTL'd stamp, so the tick a minute later does not open a second pane on the card.
+  const enforce = opts.enforce !== false;
+  if (enforce) {
+    const refusal = (opts.refusal || freshOpenRefusal)(task, today, accountId);
+    if (refusal) return { ...refusal, errors: [] };
+  }
   const opened = await open({
     taskId: task.id,
     fresh: true,
     agent: 'claude',
     ...(accountId ? { accountId } : {}),
+    ...(CHECK_MODEL ? { model: CHECK_MODEL } : {}),
     message: checkDeliveryMessage(task, { probe: opts.probe }),
   }, {});
-  openedToday.set(task.id, today);
+  freshOpensThisTick += 1;
+  if (enforce) markDay('opened', task.id, today);
   const delivery = {
     sessionId: (opened && opened.sessionId) || '',
     kind: 'claude',
     checkAfter: task.fm.check_after,
+    ttlMs: FRESH_OPEN_STAMP_TTL_MS,
   };
   return { opened, delivery, errors: stampFreshOpen(task, delivery) };
 }
 
-// Stamp the opened session exactly as a thread delivery is stamped, so a daemon
-// restart does not open a second session for the same `check_after`.
+// Stamp the opened session the way a thread delivery is stamped, so a daemon restart
+// does not open a second session for the same `check_after` — but with a TTL, because
+// unlike a thread this session has nobody to notice that it died.
 function stampFreshOpen(task, delivery) {
   const errors = [];
   try {
@@ -363,27 +516,82 @@ function stampMs(stamp) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+// When this session last wrote to this card. `fm.updated` would answer for any writer —
+// the reviewer, a probe landing, Owner — so a card that moved for an unrelated reason
+// used to read as "the check is recorded". Entries are matched by attribution instead:
+// an entry naming a session names its author, and an unattributed entry belongs to the
+// card's own owning session, which for a pane this scheduler opened is that pane's.
+//
+// Log stamps are minute-resolution, so only entries from a LATER minute than the launch
+// count: an entry stamped in the launch minute may have been written a moment before the
+// pane came up. Conservative in the safe direction — the pane closes late, never early,
+// because a miss only falls back to the 60-minute idle rule.
+function checkinFromSessionAt(task, sessionId, since) {
+  if (!task || !sessionId) return 0;
+  let entries = [];
+  try { entries = require('./review.js').logEntries(task.body); } catch { return 0; }
+  const owns = Array.isArray(task.fm && task.fm.sessions)
+    && task.fm.sessions.some((entry) => entry && entry.id === sessionId);
+  const from = Math.floor(Number(since || 0) / 60e3) * 60e3 + 60e3;
+  let latest = 0;
+  for (const entry of entries) {
+    const split = /^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}) — ([\s\S]*)$/.exec(entry.heading || '');
+    if (!split) continue;
+    const at = stampMs(split[1]);
+    if (!at || at < from) continue;
+    const attributed = /\(by (?:claude|codex) ([A-Za-z0-9_-]+)\)/.exec(split[2]);
+    const mine = attributed ? attributed[1] === sessionId : (owns && !/\(reviewer /.test(split[2]));
+    if (mine && at > latest) latest = at;
+  }
+  return latest;
+}
+
 // Whether a pane this scheduler opened has finished with its card. Pure so the policy
-// can be tested without a host: the sweep only supplies the pane, the session summary
-// the console already computes, and when the card was last written.
+// can be tested without a host: the sweep supplies the pane, the session summary the
+// console already computes, and when that session last wrote to the card.
 //
 // The one rule that is never traded away: a session mid-turn is never closed. An
 // interactive session is the point — it may still be finishing the check.
 function reapEphemeralPane({ pane, session, checkedInAt = 0, now = Date.now() } = {}, idleMs = EPHEMERAL_IDLE_MS) {
   const meta = (pane && pane.meta) || {};
   if (!meta.ephemeral) return { reap: false, reason: 'not a scheduler-opened pane' };
-  if (pane.alive === false || (session && session.exited)) return { reap: true, reason: 'the agent has exited' };
-  const ended = session ? session.endedTurn === true : null;
-  if (session && session.endedTurn === false) return { reap: false, reason: 'mid-turn' };
   const launchedAt = Number(meta.launchedAt) || 0;
-  if (ended && launchedAt && checkedInAt > launchedAt) {
-    return { reap: true, reason: 'the check is recorded on the card and the turn has ended' };
+  const checkedIn = Boolean(launchedAt && checkedInAt > launchedAt);
+  if (pane.alive === false || (session && session.exited)) {
+    return { reap: true, checkedIn, reason: 'the agent has exited' };
+  }
+  if (session && session.endedTurn === false) return { reap: false, checkedIn, reason: 'mid-turn' };
+  const ended = session ? session.endedTurn === true : null;
+  if (ended && checkedIn) {
+    return { reap: true, checkedIn: true, reason: 'the check is recorded on the card and the turn has ended' };
   }
   const idleSince = Math.max(launchedAt, Number(session && session.mtime) || 0);
   if (idleSince && now - idleSince >= idleMs) {
-    return { reap: true, reason: `idle ${Math.round((now - idleSince) / 60e3)} min with no check-in` };
+    return { reap: true, checkedIn, reason: `idle ${Math.round((now - idleSince) / 60e3)} min with no check-in` };
   }
-  return { reap: false, reason: ended === null ? 'turn state unknown' : 'waiting for the check-in' };
+  return { reap: false, checkedIn, reason: ended === null ? 'turn state unknown' : 'waiting for the check-in' };
+}
+
+// A session that was closed without ever recording anything leaves the card exactly as
+// it was — except for the stamp that says it was delivered. Clear that, say so once on
+// the card, and give the card one more open today: the alternative is a check that is
+// silently skipped until someone notices.
+function releaseUnfinishedCheck(cardId, sessionId, today = keep.nowStamp().slice(0, 10), deps = keep) {
+  if (!cardId) return false;
+  removeDeliveryStamp(cardId);
+  const reopened = grantReopen(cardId, today);
+  const short = String(sessionId || '').slice(0, 8) || 'unknown';
+  try {
+    deps.checkinTask(cardId, {
+      heading: 'check session ended',
+      message: `check session ${short} ended without recording a result; the check will be re-opened on the next tick`,
+      linkSession: false,
+      commitLabel: 'check',
+    });
+  } catch (e) {
+    process.stderr.write(`keep runs: could not record the unfinished check session for ${cardId}: ${e.message}\n`);
+  }
+  return reopened;
 }
 
 // Ask the host for every pane this scheduler opened, and close the ones that are done.
@@ -402,24 +610,36 @@ async function sweepEphemeralPanes(host = ephemeralHost, now = Date.now()) {
   if (!ephemeral.length) return [];
   let sessions = [];
   try { sessions = (host.sessions ? await host.sessions() : []) || []; } catch {}
-  const byId = new Map(sessions.filter((s) => s && s.id).map((s) => [s.id, s]));
+  const byId = new Map(sessions.filter((entry) => entry && entry.id).map((entry) => [entry.id, entry]));
+  const today = keep.nowStamp().slice(0, 10);
   const closed = [];
   for (const pane of ephemeral) {
     const sessionId = pane.meta.sessionId || null;
     if (!sessionId) continue; // nothing to close against; the pane keeps its own record
-    let checkedInAt = 0;
-    if (pane.meta.card) {
-      try { checkedInAt = stampMs(keep.loadTask(pane.meta.card).fm.updated); } catch {}
-    }
+    let card = null;
+    if (pane.meta.card) { try { card = keep.loadTask(pane.meta.card); } catch {} }
+    const checkedInAt = checkinFromSessionAt(card, sessionId, Number(pane.meta.launchedAt) || 0);
     const decision = reapEphemeralPane({ pane, session: byId.get(sessionId), checkedInAt, now });
     if (!decision.reap) continue;
+    const label = `${pane.meta.ephemeral} session pane ${pane.id} for ${pane.meta.card || 'no card'}`;
     try {
-      await host.closePane(pane, sessionId);
+      // A pane that is already dead needs no graceful close, only removal; a live one
+      // is closed through the guarded automatic path, which refuses rather than kills
+      // when the session still has a draft, a question, or unverified work.
+      if (pane.alive !== false) await host.closePane(pane, sessionId);
       closed.push(pane.id);
-      process.stderr.write(`keep runs: closed the ${pane.meta.ephemeral} session pane ${pane.id} for ${pane.meta.card || 'no card'}: ${decision.reason}\n`);
+      process.stderr.write(`keep runs: closed the ${label}: ${decision.reason}\n`);
     } catch (e) {
-      process.stderr.write(`keep runs: could not close the ${pane.meta.ephemeral} session pane ${pane.id}: ${e.message}\n`);
+      // Left alone and retried next tick: a refusal here is the guard doing its job.
+      process.stderr.write(`keep runs: left the ${label} open: ${e.message}\n`);
+      continue;
     }
+    // Forget the pane so a dead one is not re-closed on every tick from now on.
+    if (host.removePane) {
+      try { await host.removePane(pane); }
+      catch (e) { process.stderr.write(`keep runs: could not remove the ${label}: ${e.message}\n`); }
+    }
+    if (!decision.checkedIn) releaseUnfinishedCheck(pane.meta.card, sessionId, today, host.checkinTask ? host : keep);
   }
   return closed;
 }
@@ -540,13 +760,19 @@ function landProbeResult(task, result) {
 // a fresh session on the card rather than borrowing one.
 async function escalateProbeFailure(task, result, opts = {}) {
   const today = opts.today || keep.nowStamp().slice(0, 10);
-  if (openedToday.get(task.id) === today) return null;
   try {
-    const { errors } = await openFreshCheckSession(task, { ...opts, today, probe: result });
+    // Same allowance as the scheduler path — the per-day open, the per-tick cap and the
+    // budget. A probe failing every ten minutes must not be a way around any of them.
+    const outcome = await openFreshCheckSession(task, { ...opts, today, probe: result });
+    if (outcome.skipped) {
+      if (outcome.skipped === 'budget') noteBudgetDeferral(task, outcome.reason, today);
+      else process.stderr.write(`keep runs: probe escalation for ${task.id} held back (${outcome.skipped})\n`);
+      return null;
+    }
     process.stderr.write(`keep runs: probe failed for ${task.id} (exit ${result.code}); opened a check session\n`);
-    return errors[0] || null;
+    return outcome.errors[0] || null;
   } catch (e) {
-    if (!isTransientStartError(e)) openedToday.set(task.id, today);
+    if (!isTransientStartError(e)) markDay('opened', task.id, today);
     process.stderr.write(`keep runs: probe escalation for ${task.id} could not open a session: ${e.message}\n`);
     return e;
   }
@@ -596,8 +822,9 @@ async function schedulerTick() {
   tickInFlight = true;
   const tickErrors = [];
   let didWork = false;
-  let freshOpens = 0;
+  let deferralNotices = 0;
   const checksAccount = checksAccountId();
+  resetTickAllowance();
   try {
     try {
       didWork = fs.existsSync(RUNS_DIR) && fs.readdirSync(RUNS_DIR).some((file) => file.endsWith('.pending.json'));
@@ -689,19 +916,23 @@ async function schedulerTick() {
       if (pendingDelivery) continue;
 
       // Nothing headless is left: the check now runs in a fresh interactive session
-      // opened on the card. One per card per local day, three per tick.
-      if (openedToday.get(t.id) === today) continue;
-      if (freshOpens >= MAX_FRESH_OPENS_PER_TICK) continue;
-      const denial = budgetDeferralReason(checkBudget(checksAccount));
-      if (denial) { noteBudgetDeferral(t, denial, today); continue; }
+      // opened on the card. One per card per local day, three per tick, none without
+      // budget — freshOpenRefusal holds all three rules.
       try {
-        const { delivery, errors } = await openFreshCheckSession(t, { today, accountId: checksAccount });
-        freshOpens += 1;
+        const outcome = await openFreshCheckSession(t, { today, accountId: checksAccount });
+        if (outcome.skipped === 'budget') {
+          // Every deferral is logged; only the first few a tick are written to a card.
+          noteBudgetDeferral(t, outcome.reason, today, { ...keep, quiet: deferralNotices >= MAX_DEFERRAL_NOTICES_PER_TICK });
+          deferralNotices += 1;
+          continue;
+        }
+        if (outcome.skipped) continue;
+        const { delivery, errors } = outcome;
         process.stderr.write(`keep runs: opened a check session for ${t.id}${delivery.sessionId ? ` (session ${String(delivery.sessionId).slice(0, 8)})` : ''}\n`);
         tickErrors.push(...errors);
         onChange();
       } catch (e) {
-        if (!isTransientStartError(e)) openedToday.set(t.id, today);
+        if (!isTransientStartError(e)) markDay('opened', t.id, today);
         if (!isTransientStartError(e)) tickErrors.push(e);
         process.stderr.write(`keep runs: could not open a check session for ${t.id}: ${e.message}\n`);
       }
@@ -721,8 +952,10 @@ async function schedulerTick() {
 // Test seam only: the per-day escalation budget and the probe bookkeeping are module
 // state, and a unit test has to start from a known one and leave none behind.
 function _resetSchedulerState() {
-  openedToday.clear();
-  budgetNoticeDay.clear();
+  schedulerState = { opened: new Map(), budgetNotice: new Map(), reopened: new Map() };
+  try { fs.unlinkSync(SCHEDULER_STATE_FILE); } catch {}
+  openInFlight.clear();
+  resetTickAllowance();
   deferrals.clear();
   probesInFlight.clear();
   probedAt.clear();
@@ -737,7 +970,10 @@ function startScheduler() {
 module.exports = {
   retryPending, startScheduler, schedulerTick, setOnChange, setDeliverer, setOpener, setEphemeralHost,
   openFreshCheckSession, checksAccountId, checkBudget, budgetDeferralReason, noteBudgetDeferral,
-  reapEphemeralPane, sweepEphemeralPanes, MAX_FRESH_OPENS_PER_TICK, EPHEMERAL_IDLE_MS,
+  freshOpenRefusal, resetTickAllowance, loadSchedulerState, releaseUnfinishedCheck,
+  readDeliveryStamp, writeDeliveryStamp, stampExpired, checkinFromSessionAt,
+  reapEphemeralPane, sweepEphemeralPanes, MAX_FRESH_OPENS_PER_TICK, MAX_DEFERRAL_NOTICES_PER_TICK,
+  EPHEMERAL_IDLE_MS, FRESH_OPEN_STAMP_TTL_MS,
   checkDeliveryMessage, checkDeliveryKey, planDueCard, deliveryWarning,
   cardFingerprint, pendingCheckin, onPassOutcome,
   probePayload, startProbe, startDueProbe, probeDue, landProbeResult, escalateProbeFailure,

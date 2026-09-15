@@ -30,7 +30,10 @@ const {
   probePayload, startProbe, probeDue, escalateProbeFailure,
   isTransientStartError, MAX_CONCURRENT_PROBES, _resetSchedulerState,
   budgetDeferralReason, noteBudgetDeferral, reapEphemeralPane, sweepEphemeralPanes,
-  MAX_FRESH_OPENS_PER_TICK, EPHEMERAL_IDLE_MS,
+  MAX_FRESH_OPENS_PER_TICK, MAX_DEFERRAL_NOTICES_PER_TICK, EPHEMERAL_IDLE_MS,
+  FRESH_OPEN_STAMP_TTL_MS, readDeliveryStamp, writeDeliveryStamp, stampExpired,
+  checkinFromSessionAt, openFreshCheckSession, freshOpenRefusal, resetTickAllowance,
+  loadSchedulerState, releaseUnfinishedCheck,
 } = require('./runs.js');
 
 const card = (over = {}) => ({
@@ -282,6 +285,42 @@ test('a transient open refusal does not burn the day escalation budget', async (
   } finally { _resetSchedulerState(); }
 });
 
+test('a probe escalation spends from the same allowance as the scheduler', async () => {
+  _resetSchedulerState();
+  try {
+    const task = probeCard({ check: 'diagnose the recorder' });
+    const result = { ok: false, code: 3, ms: 120, output: '2 segments missing', timedOut: false };
+    const opened = [];
+    const open = async (body) => { opened.push(body.taskId); return { ok: true, sessionId: 'sid', pane: 'p' }; };
+    const budget = { code: 0 };
+    const refusal = (t, today, accountId) => freshOpenRefusal(t, today, accountId, { checkBudget: () => budget });
+
+    // The tick's three opens are already spent: a failing probe does not make a fourth.
+    resetTickAllowance();
+    for (let n = 0; n < MAX_FRESH_OPENS_PER_TICK; n += 1) {
+      const filler = card({ task: { id: `filler-${n}` } });
+      filler.id = `filler-${n}`;
+      await openFreshCheckSession(filler, { today: '2026-09-11', open, refusal });
+    }
+    assert.equal(await escalateProbeFailure(task, result, { today: '2026-09-11', open, refusal }), null);
+    assert.equal(opened.length, MAX_FRESH_OPENS_PER_TICK, 'the escalation is held back by the per-tick cap');
+
+    // And an exhausted window defers it the same way, with the same card note.
+    resetTickAllowance();
+    budget.code = 7;
+    budget.reason = '5h window at 99%';
+    const landed = [];
+    assert.equal(await escalateProbeFailure(task, result, {
+      today: '2026-09-11', open, refusal, checkinTask: (id, payload) => landed.push([id, payload]),
+    }), null);
+    assert.equal(opened.length, MAX_FRESH_OPENS_PER_TICK, 'no session is opened without budget');
+
+    budget.code = 0;
+    assert.equal(await escalateProbeFailure(task, result, { today: '2026-09-11', open, refusal }), null);
+    assert.deepEqual(opened.at(-1), task.id, 'and it opens once the allowance is back');
+  } finally { _resetSchedulerState(); }
+});
+
 test('a probe escalation clips a shouting probe tail instead of losing the recipe', () => {
   const message = checkDeliveryMessage(probeCard(), {
     probe: { code: 124, timedOut: true, output: 'x'.repeat(4000) },
@@ -311,6 +350,54 @@ test('a recurring card is told to re-arm itself, and still fits', () => {
   assert.doesNotMatch(checkDeliveryMessage(card()), /re-arms/);
 });
 
+test('an unreadable check_every asks for a valid interval instead of quoting garbage', () => {
+  for (const fm of [{ check_on_pass: 'rearm' }, { check_on_pass: 'rearm', check_every: 'next tuesday' }]) {
+    const message = checkDeliveryMessage(card(fm));
+    assert.match(message, /its check_every is unreadable/);
+    assert.match(message, /--check-after <a valid interval like \+7d>/);
+    assert.doesNotMatch(message, /next tuesday/, 'the unusable value is never handed to the flag');
+    assert.ok(message.length <= 2000);
+    assert.ok(message.endsWith('Full card: keep show some-card.'));
+  }
+});
+
+test('card text can never crowd the card id out of the message', () => {
+  const message = checkDeliveryMessage(card({
+    title: 'T'.repeat(4000),
+    check_after: 'A'.repeat(4000),
+    check_on_pass: 'rearm',
+    check_every: '+7d' + 'B'.repeat(4000),
+    check: 'inspect '.repeat(2000),
+  }), { probe: { code: 1, output: 'C'.repeat(9000) } });
+  assert.ok(message.length <= 2000);
+  assert.ok(message.endsWith('Full card: keep show some-card.'));
+  assert.match(message, /This card re-arms, but its check_every is unreadable/);
+});
+
+// ---------- delivery stamps ----------
+
+test('a stamp for a session Keep opened expires; a thread delivery stamp does not', () => {
+  const task = card();
+  const at = Date.parse('2026-09-11T12:00');
+  assert.equal(FRESH_OPEN_STAMP_TTL_MS, 2 * 3600e3);
+  assert.equal(stampExpired({ at: '2026-09-11T12:00' }), false, 'no ttl, no expiry');
+  assert.equal(stampExpired({ at: '2026-09-11T12:00', ttlMs: FRESH_OPEN_STAMP_TTL_MS }, at + FRESH_OPEN_STAMP_TTL_MS - 1), false);
+  assert.equal(stampExpired({ at: '2026-09-11T12:00', ttlMs: FRESH_OPEN_STAMP_TTL_MS }, at + FRESH_OPEN_STAMP_TTL_MS), true);
+  // A stamp with no readable time of its own has no measurable life left.
+  assert.equal(stampExpired({ at: 'whenever', ttlMs: FRESH_OPEN_STAMP_TTL_MS }), true);
+
+  writeDeliveryStamp(task, { sessionId: 'thread-sid', kind: 'claude' });
+  assert.equal(readDeliveryStamp(task, at + 10 * 3600e3).sessionId, 'thread-sid');
+
+  writeDeliveryStamp(task, { sessionId: 'opened-sid', kind: 'claude', ttlMs: FRESH_OPEN_STAMP_TTL_MS });
+  const live = readDeliveryStamp(task, Date.now());
+  assert.equal(live.sessionId, 'opened-sid');
+  assert.equal(live.ttlMs, FRESH_OPEN_STAMP_TTL_MS);
+  // A session that died without checking in must not suppress the card forever.
+  assert.equal(readDeliveryStamp(task, Date.now() + FRESH_OPEN_STAMP_TTL_MS), null);
+  assert.equal(readDeliveryStamp(task, Date.now()), null, 'and the expired stamp is gone from disk');
+});
+
 // ---------- budget deferral ----------
 
 test('only an exhausted window defers a check; an unreadable snapshot does not', () => {
@@ -338,6 +425,87 @@ test('a deferred check records itself once a day and leaves the card overdue', (
     assert.equal('clearCheckAfter' in landed[0][1], false, 'and stays overdue for the next tick');
     assert.equal(noteBudgetDeferral(task, 'weekly usage at 97%', '2026-09-12', deps), true, 'tomorrow is a fresh notice');
     assert.equal(landed.length, 2);
+  } finally { _resetSchedulerState(); }
+});
+
+test('a tick that defers many cards logs them all and writes only a few', () => {
+  _resetSchedulerState();
+  try {
+    assert.equal(MAX_DEFERRAL_NOTICES_PER_TICK, 3);
+    const landed = [];
+    const deps = { checkinTask: (id) => landed.push(id) };
+    // What the tick does once it has written its quota: log, do not commit.
+    for (let n = 0; n < 8; n += 1) {
+      const task = card({ task: { id: `card-${n}` } });
+      task.id = `card-${n}`;
+      noteBudgetDeferral(task, 'weekly usage at 97%', '2026-09-11', { ...deps, quiet: n >= MAX_DEFERRAL_NOTICES_PER_TICK });
+    }
+    assert.deepEqual(landed, ['card-0', 'card-1', 'card-2']);
+    // A quieted card was never marked, so a later tick may still record it.
+    const later = card({ task: { id: 'card-7' } });
+    later.id = 'card-7';
+    assert.equal(noteBudgetDeferral(later, 'weekly usage at 97%', '2026-09-11', deps), true);
+  } finally { _resetSchedulerState(); }
+});
+
+test('the per-day and per-tick allowances survive a restart, and verify ignores them', async () => {
+  _resetSchedulerState();
+  try {
+    const task = card();
+    const open = async () => ({ ok: true, sessionId: 'sid-1', pane: 'p1' });
+    const budget = { code: 0 };
+    const refusal = (t, today, accountId) => freshOpenRefusal(t, today, accountId, { checkBudget: () => budget });
+
+    assert.equal((await openFreshCheckSession(task, { today: '2026-09-11', open, refusal })).skipped, undefined);
+    assert.equal((await openFreshCheckSession(task, { today: '2026-09-11', open, refusal })).skipped, 'opened-today');
+    // The allowance lives on disk, so a restarted daemon does not re-open the card.
+    assert.equal(loadSchedulerState().opened.get('some-card'), '2026-09-11');
+
+    // `keep verify` is Owner asking now: never refused, never counted.
+    const manual = await openFreshCheckSession(task, { today: '2026-09-11', open, refusal, enforce: false });
+    assert.equal(manual.skipped, undefined);
+    assert.equal(manual.delivery.ttlMs, FRESH_OPEN_STAMP_TTL_MS, 'and it still writes the TTL stamp');
+
+    // The budget refuses before anything is opened, and names its reason.
+    _resetSchedulerState();
+    budget.code = 6;
+    budget.reason = 'weekly usage at 97%';
+    const denied = await openFreshCheckSession(task, { today: '2026-09-11', open, refusal });
+    assert.equal(denied.skipped, 'budget');
+    assert.equal(denied.reason, 'weekly usage at 97%');
+
+    // The per-tick cap is module state so a probe escalation spends from it too.
+    budget.code = 0;
+    resetTickAllowance();
+    for (let n = 0; n < MAX_FRESH_OPENS_PER_TICK; n += 1) {
+      const other = card({ task: { id: `tick-${n}` } });
+      other.id = `tick-${n}`;
+      assert.equal((await openFreshCheckSession(other, { today: '2026-09-11', open, refusal })).skipped, undefined);
+    }
+    const overflow = card({ task: { id: 'tick-overflow' } });
+    overflow.id = 'tick-overflow';
+    assert.equal((await openFreshCheckSession(overflow, { today: '2026-09-11', open, refusal })).skipped, 'tick-cap');
+    resetTickAllowance();
+    assert.equal((await openFreshCheckSession(overflow, { today: '2026-09-11', open, refusal })).skipped, undefined);
+  } finally { _resetSchedulerState(); }
+});
+
+test('two opens racing on one card put one agent on it, not two', async () => {
+  _resetSchedulerState();
+  try {
+    const task = card();
+    let opens = 0;
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const open = async () => { opens += 1; await gate; return { ok: true, sessionId: 'sid-race', pane: 'p1' }; };
+    const refusal = (t, today, accountId) => freshOpenRefusal(t, today, accountId, { checkBudget: () => ({ code: 0 }) });
+    const first = openFreshCheckSession(task, { today: '2026-09-11', open, refusal });
+    const second = openFreshCheckSession(task, { today: '2026-09-11', open, refusal, enforce: false });
+    release();
+    const [a, b] = await Promise.all([first, second]);
+    assert.equal(opens, 1, 'the second caller waits for the first instead of opening a pane');
+    assert.equal(a, b, 'and gets the same result back');
+    assert.equal(a.opened.sessionId, 'sid-race');
   } finally { _resetSchedulerState(); }
 });
 
@@ -396,6 +564,34 @@ test('a scheduler-opened pane that goes quiet or exits is swept at the idle wind
   }).reap, true);
 });
 
+test('a check-in counts only when that session wrote it', () => {
+  const launchedAt = Date.parse('2026-09-11T12:00');
+  const task = card({
+    sessions: [{ id: 'mine', agent: 'claude', at: '2026-09-11T12:00' }],
+    task: { body: '' },
+  });
+  const withLog = (...entries) => ({ ...task, body: entries.join('\n\n') });
+
+  // The owning session's own entries carry no attribution: an unattributed entry on a
+  // card this pane owns is this pane's.
+  assert.equal(
+    checkinFromSessionAt(withLog('## 2026-09-11 12:05 — check-in → review\nGates held.'), 'mine', launchedAt),
+    Date.parse('2026-09-11T12:05'));
+  // Anyone else's entry is not this session's check-in, however recent.
+  assert.equal(checkinFromSessionAt(withLog('## 2026-09-11 12:05 — check-in (by claude other) → review\nNot mine.'), 'mine', launchedAt), 0);
+  assert.equal(checkinFromSessionAt(withLog('## 2026-09-11 12:05 — review (reviewer fable)\nA finding.'), 'mine', launchedAt), 0);
+  // A named entry that names this session counts even when the card link has moved.
+  assert.equal(
+    checkinFromSessionAt({ ...withLog('## 2026-09-11 12:05 — check-in (by claude mine) → review\nMine.'), fm: { ...task.fm, sessions: [] } }, 'mine', launchedAt),
+    Date.parse('2026-09-11T12:05'));
+  // Log stamps are minute-resolution, so an entry from the launch minute does not count:
+  // it may well have been written a moment before the pane came up.
+  assert.equal(checkinFromSessionAt(withLog('## 2026-09-11 12:00 — check-in → review\nEarlier.'), 'mine', launchedAt), 0);
+  assert.equal(checkinFromSessionAt(withLog('## 2026-09-11 11:00 — check-in → review\nOlder.'), 'mine', launchedAt), 0);
+  assert.equal(checkinFromSessionAt(null, 'mine', launchedAt), 0);
+  assert.equal(checkinFromSessionAt(withLog('## Plan\n- [ ] step'), 'mine', launchedAt), 0);
+});
+
 test('the sweep only ever touches panes this scheduler opened', async () => {
   const closed = [];
   const panes = [
@@ -426,6 +622,77 @@ test('the sweep only ever touches panes this scheduler opened', async () => {
     listPanes: async () => null, closePane: async () => { throw new Error('must not close'); },
   }, now), []);
   assert.deepEqual(await sweepEphemeralPanes(null, now), []);
+});
+
+test('a pane that refuses to close gracefully is left alone, not forgotten and not killed', async () => {
+  _resetSchedulerState();
+  try {
+    const removed = [];
+    const landed = [];
+    const now = 1_000_000 + 5 * 3600e3;
+    const result = await sweepEphemeralPanes({
+      listPanes: async () => [ephemeralPane({ meta: { card: null, sessionId: 'sid' } })],
+      sessions: async () => [{ id: 'sid', endedTurn: true, mtime: 1_000_000 }],
+      // This is what closeIdleSession does when the session still has an unsent draft,
+      // a modal prompt, or unverified background work. The sweep must respect it.
+      closePane: async () => { throw new Error('Unsent draft in the input box'); },
+      removePane: async (pane) => { removed.push(pane.id); },
+      checkinTask: (id) => landed.push(id),
+    }, now);
+    assert.deepEqual(result, [], 'nothing was closed');
+    assert.deepEqual(removed, [], 'and the pane is still there for the next tick to reconsider');
+    assert.deepEqual(landed, []);
+  } finally { _resetSchedulerState(); }
+});
+
+test('a closed pane is removed from the host, and a dead one is removed without a close', async () => {
+  _resetSchedulerState();
+  try {
+    const closed = [];
+    const removed = [];
+    const released = [];
+    const now = 1_000_000 + 5 * 3600e3;
+    const host = {
+      listPanes: async () => [
+        ephemeralPane({ id: 'finished', meta: { card: null, sessionId: 'finished-sid' } }),
+        ephemeralPane({ id: 'dead', alive: false, meta: { card: null, sessionId: 'dead-sid' } }),
+      ],
+      sessions: async () => [{ id: 'finished-sid', endedTurn: true, mtime: 1_000_000 }],
+      closePane: async (pane, sessionId) => { closed.push([pane.id, sessionId]); },
+      removePane: async (pane) => { removed.push(pane.id); },
+      checkinTask: (id, payload) => released.push([id, payload.heading]),
+    };
+    assert.deepEqual(await sweepEphemeralPanes(host, now), ['finished', 'dead']);
+    assert.deepEqual(closed, [['finished', 'finished-sid']], 'a dead pane is never asked to /exit');
+    assert.deepEqual(removed, ['finished', 'dead'], 'both are forgotten so the next tick has nothing to decide');
+    // Neither pane is linked to a card here, so there is nothing to release.
+    assert.deepEqual(released, []);
+  } finally { _resetSchedulerState(); }
+});
+
+test('a session reaped without a result releases the card instead of burying the check', () => {
+  _resetSchedulerState();
+  try {
+    const landed = [];
+    // Pretend the card was opened and stamped earlier today.
+    const task = card();
+    writeDeliveryStamp(task, { sessionId: 'dead-sid', kind: 'claude', ttlMs: FRESH_OPEN_STAMP_TTL_MS });
+    loadSchedulerState().opened.set('some-card', '2026-09-11');
+
+    assert.equal(releaseUnfinishedCheck('some-card', 'deadsession1234', '2026-09-11',
+      { checkinTask: (id, payload) => landed.push([id, payload]) }), true);
+    assert.equal(readDeliveryStamp(task, Date.now()), null, 'the stamp no longer suppresses the card');
+    assert.equal(loadSchedulerState().opened.has('some-card'), false, 'and the card may be opened again today');
+    assert.equal(landed.length, 1);
+    assert.equal(landed[0][1].message,
+      'check session deadsess ended without recording a result; the check will be re-opened on the next tick');
+    assert.equal('status' in landed[0][1], false, 'the card keeps whatever status it had');
+
+    // Only one extra open a day: a card whose sessions keep dying does not loop.
+    loadSchedulerState().opened.set('some-card', '2026-09-11');
+    assert.equal(releaseUnfinishedCheck('some-card', 'deadsession1234', '2026-09-11', { checkinTask: () => {} }), false);
+    assert.equal(loadSchedulerState().opened.get('some-card'), '2026-09-11');
+  } finally { _resetSchedulerState(); }
 });
 
 // ---------- the scheduler opens sessions instead of running headless ----------
@@ -472,6 +739,67 @@ test('due checks open one fresh session per card per day, three per tick', () =>
     assert.equal(first.length, 3, 'the per-tick cap holds the fourth card back');
     assert.equal(all.length, 4, 'the next tick picks up the card the cap skipped');
     assert.equal(new Set(all).size, 4, 'and no card is opened twice the same day');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The failure this whole TTL-and-release design exists for: a session Keep opened dies
+// without writing anything, and the delivery stamp it left behind suppresses the card's
+// check until its `check_after` changes — which nothing is left to change.
+test('a check session that dies without a result is reopened on a later tick', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-runs-reopen-'));
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'tasks', 'due-card.md'), [
+      '---', 'title: Due card', 'status: waiting', 'kind: task', 'tags: [personal]',
+      'check_after: 2020-01-01T00:00', 'check: |', '  Confirm the recorder is still green.',
+      'created: 2020-01-01T00:00', 'updated: 2020-01-01T00:00', '---', '', 'Context.', '',
+    ].join('\n'));
+    const script = `
+      const fs = require('fs');
+      const runs = require(${JSON.stringify(require.resolve('./runs.js'))});
+      const keep = require(${JSON.stringify(require.resolve('./keep.js'))});
+      const opened = [];
+      let pane = null;
+      runs.setOpener(async (body) => {
+        const sessionId = 'sid-' + (opened.length + 1);
+        opened.push(sessionId);
+        pane = { id: 'pane-' + sessionId, alive: true,
+          meta: { ephemeral: 'check', card: body.taskId, sessionId, launchedAt: Date.now() } };
+        return { ok: true, sessionId, pane: pane.id };
+      });
+      const removed = [];
+      runs.setEphemeralHost({
+        listPanes: async () => (pane ? [pane] : []),
+        sessions: async () => [],
+        closePane: async () => {},
+        removePane: async (p) => { removed.push(p.id); pane = null; },
+      });
+      (async () => {
+        await runs.schedulerTick();                       // opens a session
+        const afterOpen = opened.slice();
+        await runs.schedulerTick();                       // stamped: nothing to do
+        const afterStamp = opened.slice();
+        pane.alive = false;                               // the agent dies, saying nothing
+        await runs.schedulerTick();                       // the sweep reaps and releases
+        const afterReap = opened.slice();
+        await runs.schedulerTick();                       // the card is due again
+        process.stdout.write(JSON.stringify({ afterOpen, afterStamp, afterReap, opened, removed,
+          body: keep.loadTask('due-card').body }));
+      })();
+    `;
+    const output = execFileSync(process.execPath, ['-e', script], {
+      encoding: 'utf8',
+      env: { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1' },
+    });
+    const state = JSON.parse(output);
+    assert.deepEqual(state.afterOpen, ['sid-1']);
+    assert.deepEqual(state.afterStamp, ['sid-1'], 'the stamp stops the next tick opening a second pane');
+    assert.deepEqual(state.afterReap, ['sid-1'], 'reaping itself opens nothing');
+    assert.deepEqual(state.removed, ['pane-sid-1'], 'the dead pane is forgotten');
+    assert.deepEqual(state.opened, ['sid-1', 'sid-2'], 'and the very next tick opens a second session');
+    assert.match(state.body, /check session sid-1 ended without recording a result/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
