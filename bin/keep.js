@@ -4267,6 +4267,11 @@ async function repairSessionAlive(entry, deps = {}) {
     if (!Array.isArray(panes) || !panes.length) return null;
     const match = panes.find((pane) => pane && (pane.id === entry.pane
       || (entry.sessionId && pane.meta && pane.meta.sessionId === entry.sessionId)));
+    // `alive` only, not `agentAlive`: that annotation is added by the daemon when it
+    // lists panes, and a plain CLI client never sees it. So this errs conservative —
+    // a pane whose agent has died but whose shell is up still reads as alive, and
+    // the reset is refused. Refusing a reset Owner can repeat is the cheap mistake;
+    // clearing the record out from under a running repair agent is not.
     return Boolean(match && match.alive);
   } catch { return null; }
   finally { try { client.close(); } catch {} }
@@ -4306,7 +4311,10 @@ commands['self-repair'] = async (argv) => {
         + `\nthe terminal host could not be reached; check the pane, then reset — or wait ${describeResetWait(entry)}`);
     }
     if (!result.cleared) {
-      return console.log(`${o.reset} has a live repair card (${result.cardId}${result.status ? `, ${result.status}` : ''}) with a confirmed session`
+      // `launched` distinguishes a real session from a legacy runId-only entry,
+      // which has no session at all and must not be described as having one.
+      const what = result.launched ? 'a confirmed session' : 'a legacy run record';
+      return console.log(`${o.reset} has a live repair card (${result.cardId}${result.status ? `, ${result.status}` : ''}) with ${what}`
         + `\none repair card per signature — let it finish, or close the card if it is not going to`);
     }
     return console.log(`cleared ${o.reset}; the next tick may open a fresh card for it`);

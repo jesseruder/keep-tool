@@ -900,6 +900,10 @@ test('a session that stays gone past the grace window is relaunched, keeping its
     assert.equal(swept.relaunching[0].pane, 'pane-1');
     assert.match(calls.checkins.find((entry) => /has been gone for/.test(entry.message)).message,
       /The repair session in pane pane-1 has been gone for 10m without landing; relaunching \(session 2 of 3\)/);
+    // The sweep clears the backoff without pretending the entry was never launched:
+    // zeroing lastAttemptAt made --reset read an unconfirmed launch as ancient and
+    // clear it, which is the guard it was added for.
+    assert.equal(swept.relaunching[0].sig, sig);
 
     // The same tick relaunches onto the card it already has, and only then does the
     // recorded session change — so the old one never lost its KEEP_REPAIR marker.
@@ -911,6 +915,181 @@ test('a session that stays gone past the grace window is relaunched, keeping its
     assert.equal(entry.relaunchDue, undefined);
     assert.equal(entry.deadSince, undefined);
     assert.equal(entry.attempts, 2);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a session that comes back after the sweep gave up on it is not launched over', async () => {
+  const root = makeRoot();
+  try {
+    const snapshot = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const config = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 };
+    const { deps, calls } = harness({ root, snapshot, config });
+    const opened = await selfRepair.tick(deps);
+    const sig = opened.opened[0].sig;
+
+    // A long restart: the pane reads dead past the grace window, so the sweep sets
+    // relaunchDue — and the relaunch it triggers fails to start, so the flag stays.
+    const dead = { ...deps, paneAlive: async () => false };
+    await selfRepair.tick({ ...dead, now: NOW + 60e3 });
+    const at = NOW + 60e3 + selfRepair.PANE_DEAD_GRACE_MS;
+    const stuck = { ...dead, now: at, spawnWorktree: () => Promise.reject(new Error('daemon died mid-build')) };
+    await selfRepair.tick(stuck);
+    assert.equal(selfRepair.loadState(root).signatures[sig].relaunchDue, true);
+    assert.equal(selfRepair.loadState(root).signatures[sig].attempts, 2);
+    assert.equal(calls.runs.length, 1);
+
+    // Then the restart finishes and the session is back. The flag has to go, or the
+    // next tick spends the last attempt launching over an agent that is working.
+    await selfRepair.tick({ ...deps, paneAlive: async () => true, now: at + 20 * 60e3 });
+    const entry = selfRepair.loadState(root).signatures[sig];
+    assert.equal(entry.relaunchDue, undefined);
+    assert.equal(entry.deadSince, undefined);
+    assert.equal(entry.attempts, 2, 'no attempt spent on a session that was alive all along');
+    assert.match(selfRepair.resumeBlocker(entry, config, at + 20 * 60e3), /already open for this signature/);
+    assert.equal(calls.runs.length, 1);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the relaunch flags never outlive the launch they belong to', async () => {
+  const root = makeRoot();
+  try {
+    const failing = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const healed = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 0, lastOkAt: NOW + 60e3, lastError: 'unblock is broken' },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const config = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 };
+    const { deps } = harness({ root, snapshot: failing, config });
+    const opened = await selfRepair.tick(deps);
+    const sig = opened.opened[0].sig;
+    // A fresh launch clears them even when nothing set them, so the open path and
+    // the resume path leave the entry in the same shape.
+    assert.equal(selfRepair.loadState(root).signatures[sig].relaunchDue, undefined);
+    assert.equal(selfRepair.loadState(root).signatures[sig].deadSince, undefined);
+
+    // Leave both set, resolve the signature, and let it come back with a new card.
+    selfRepair.mutateState((state) => {
+      state.signatures[sig].relaunchDue = true;
+      state.signatures[sig].deadSince = NOW;
+    }, { root, now: NOW });
+    await selfRepair.tick({ ...deps, snapshot: () => healed, now: NOW + 2 * 60e3 });
+    await selfRepair.tick({ ...deps, snapshot: () => healed, now: NOW + 70 * 60e3 });
+    const after = NOW + 70 * 60e3 + 25 * 3600e3;
+    failing.schedulers[0].lastErrorAt = after;
+    // The recurrence's launch fails, so only the reservation itself can have
+    // cleared them — the post-launch write never runs. Reserving the new card is
+    // where the previous launch's flags have to go, or the fresh card starts with
+    // its debounce already expired and relaunches the moment it is created.
+    const reopened = await selfRepair.tick({
+      ...deps, snapshot: () => failing, now: after,
+      spawnWorktree: () => Promise.reject(new Error('daemon died mid-build')),
+    });
+    assert.equal(reopened.opened.length, 1, 'a fresh card for the recurrence');
+    assert.equal(reopened.opened[0].launched, false);
+    const fresh = selfRepair.loadState(root).signatures[sig];
+    assert.equal(fresh.relaunchDue, undefined, 'the new card starts with a clean debounce');
+    assert.equal(fresh.deadSince, undefined);
+
+    // …and --reset clears them too, rather than leaking them into the next card.
+    selfRepair.mutateState((state) => {
+      state.signatures[sig].relaunchDue = true;
+      state.signatures[sig].deadSince = NOW;
+      state.signatures[sig].launchGaveUp = true;
+    }, { root, now: NOW });
+    selfRepair.reset(sig, { root, now: after, loadTask: () => ({ fm: { status: 'active' } }), sessionAlive: false });
+    const cleared = selfRepair.loadState(root).signatures[sig];
+    assert.equal(cleared.relaunchDue, undefined);
+    assert.equal(cleared.deadSince, undefined);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the sweep clears the backoff without erasing that the card was ever launched', async () => {
+  const root = makeRoot();
+  try {
+    const snapshot = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const config = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 };
+    // openSession fails with a pane attached, so the entry carries launchError —
+    // the state --reset reads to decide whether an unconfirmed launch might be up.
+    const { deps } = harness({ root, snapshot, config, paneAlive: async () => false });
+    deps.openSession = async () => {
+      const error = new Error('the pane stopped echoing');
+      error.extra = { launch: { pane: 'pane-orphan', sessionId: 'abcd1234-0000-4000-8000-000000000000' } };
+      throw error;
+    };
+    const opened = await selfRepair.tick(deps);
+    const sig = opened.opened[0].sig;
+    assert.notEqual(selfRepair.loadState(root).signatures[sig].launchError, undefined);
+
+    await selfRepair.tick({ ...deps, now: NOW + 60e3 });
+    const at = NOW + 60e3 + selfRepair.PANE_DEAD_GRACE_MS;
+    // Launching off, so the sweep's write is what stands: this is also the state a
+    // daemon that died between the sweep and the relaunch would leave behind.
+    const frozen = { ...deps, config: { ...config, launch: false }, now: at };
+    const swept = await selfRepair.tick(frozen);
+    assert.equal(swept.relaunching.length, 1);
+    const entry = selfRepair.loadState(root).signatures[sig];
+    assert.equal(entry.relaunchDue, true);
+    // Old enough to clear the resume backoff…
+    assert.equal(at - entry.lastAttemptAt >= selfRepair.RESUME_BACKOFF_MS, true);
+    // …and no older, so the unverified-reset guard still sees a recent launch.
+    // Zeroing it made the entry look as though it had never been launched at all.
+    assert.equal(at - entry.lastAttemptAt < selfRepair.LEGACY_RUN_TTL_MS, true);
+    assert.equal(selfRepair.reset(sig, { root, now: at, loadTask: () => ({ fm: { status: 'active' } }), sessionAlive: null }).reason,
+      'unverified');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the status listing says why a row is not doing anything', () => {
+  const rows = (entry) => selfRepair.renderStatus({
+    config: selfRepair.DEFAULT_CONFIG, day: '2026-09-15', openedToday: 1,
+    open: [{ sig: 'sched:unblock:abcd1234', cardId: 'a-repair-card', openedAt: NOW, attempts: 3, ...entry }],
+    cooling: [], resolved: [],
+  });
+  assert.match(rows({ launchGaveUp: true }), /— gave up after 3 sessions \(--reset to start over\)/);
+  assert.match(rows({ relaunchDue: true }), /— relaunch due/);
+  assert.match(rows({ deadSince: NOW }), /— pane unseen since 2026-09-15 12:00/);
+  // A row that is simply working says none of it.
+  assert.doesNotMatch(rows({ sessionId: 'abcd1234-0000', pane: 'pane-1' }), /gave up|relaunch due|pane unseen/);
+});
+
+test('--reset works after a give-up, which is exactly what the card told Owner to do', () => {
+  const root = makeRoot();
+  try {
+    const seed = (extra) => selfRepair.mutateState((state) => {
+      state.signatures['sched:unblock:abcd1234'] = {
+        cardId: 'a-repair-card', sessionId: 'agent-session', pane: 'pane-1',
+        openedAt: NOW, attempts: 3, lastAttemptAt: NOW, launchGaveUp: true, ...extra,
+      };
+    }, { root, now: NOW });
+    const open = () => ({ fm: { status: 'active' } });
+
+    // The give-up check-in says to run this. Refusing it for `card-open` left Owner
+    // with no way out but editing state.json.
+    seed({});
+    const done = selfRepair.reset('sched:unblock:abcd1234', { root, now: NOW, loadTask: open, sessionAlive: false });
+    assert.equal(done.cleared, true);
+
+    // …but a session that is still running still outranks it.
+    seed({});
+    const alive = selfRepair.reset('sched:unblock:abcd1234', { root, now: NOW, loadTask: open, sessionAlive: true });
+    assert.equal(alive.cleared, false);
+    assert.equal(alive.reason, 'session-alive');
+
+    // A legacy runId-only entry has no session, and the refusal must not claim one.
+    selfRepair.mutateState((state) => {
+      state.signatures['sched:unblock:abcd1234'] = {
+        cardId: 'a-repair-card', runId: 'run-1', openedAt: NOW, attempts: 1, lastAttemptAt: NOW,
+      };
+    }, { root, now: NOW });
+    const legacy = selfRepair.reset('sched:unblock:abcd1234', { root, now: NOW, loadTask: open, sessionAlive: false });
+    assert.equal(legacy.cleared, false);
+    assert.equal(legacy.reason, 'card-open');
+    assert.equal(legacy.launched, false, 'so the CLI can say "a legacy run record", not "a confirmed session"');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -938,10 +1117,10 @@ test('a pane that dies every time gets exactly MAX_LAUNCH_ATTEMPTS sessions, not
     assert.equal(entry.attempts, selfRepair.MAX_LAUNCH_ATTEMPTS);
     assert.equal(entry.launchGaveUp, true);
     assert.match(calls.checkins.find((row) => /will not open another/.test(row.message)).message,
-      /That was repair session 3 of 3 for this signature\. Self-repair will not open another/);
+      /That was attempt 3 of 3 for this signature\. Self-repair will not open another/);
     assert.match(calls.checkins.at(-1).message, /keep self-repair --reset sched:unblock:/);
     const last = await selfRepair.tick({ ...deps, now: at + 60 * 60e3 });
-    assert.match(last.skipped[0].why, /has had 3 repair sessions and none landed/);
+    assert.match(last.skipped[0].why, /has used its 3 attempts and nothing landed/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -1116,7 +1295,7 @@ test('a launch that keeps failing gives up instead of retrying forever', async (
     assert.equal(entry.attempts, selfRepair.MAX_LAUNCH_ATTEMPTS);
     assert.equal(entry.launchGaveUp, true);
     const last = await selfRepair.tick({ ...deps, now: at + 60 * 60e3 });
-    assert.match(last.skipped[0].why, /has had 3 repair sessions and none landed; it will not get another/);
+    assert.match(last.skipped[0].why, /has used its 3 attempts and nothing landed; it will not get another/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

@@ -989,7 +989,7 @@ function resumeBlocker(entry, config, now) {
   // getting a fresh session every tick, "attempt 7 of 3", because only a *failed*
   // relaunch counted.
   if (entry.launchGaveUp) {
-    return `card ${entry.cardId} has had ${MAX_LAUNCH_ATTEMPTS} repair sessions and none landed;`
+    return `card ${entry.cardId} has used its ${MAX_LAUNCH_ATTEMPTS} attempts and nothing landed;`
       + ' it will not get another (keep self-repair --reset to start over)';
   }
   const launched = entry.sessionId || entry.pane;
@@ -1132,10 +1132,16 @@ async function tick(input = {}) {
     // null is "could not tell" — no host, an empty list, a host that did not answer.
     if (alive === null || alive === undefined) continue;
     if (alive) {
-      if (entry.deadSince) {
+      // Both flags, not just the clock. A session that came back from a restart
+      // after the sweep had already decided it was gone would otherwise stay
+      // relaunchDue and be launched over on the next tick, spending an attempt on
+      // an agent that is sitting right there working.
+      if (entry.deadSince || entry.relaunchDue) {
         mutateState((value) => {
           const fresh = value.signatures[sig];
-          if (fresh) delete fresh.deadSince;
+          if (!fresh) return;
+          delete fresh.deadSince;
+          delete fresh.relaunchDue;
         }, { root, now, write: deps.write });
       }
       continue;
@@ -1155,7 +1161,10 @@ async function tick(input = {}) {
       const fresh = value.signatures[sig];
       if (!fresh) return;
       fresh.relaunchDue = true;
-      fresh.lastAttemptAt = 0;
+      // Old enough to clear the resume backoff, and no older. Zeroing it made the
+      // entry look like it had never been launched, which is exactly the state
+      // `--reset` reads to decide whether an unconfirmed launch might still be up.
+      fresh.lastAttemptAt = now - RESUME_BACKOFF_MS;
     }, { root, now, write: deps.write });
     try {
       deps.checkin(entry.cardId, {
@@ -1221,7 +1230,7 @@ async function tick(input = {}) {
           try {
             deps.checkin(entry.cardId, {
               heading: 'self-repair',
-              message: `That was repair session ${MAX_LAUNCH_ATTEMPTS} of ${MAX_LAUNCH_ATTEMPTS} for this signature.`
+              message: `That was attempt ${MAX_LAUNCH_ATTEMPTS} of ${MAX_LAUNCH_ATTEMPTS} for this signature.`
                 + ' Self-repair will not open another, however this one ends.'
                 + ` Owner: \`keep self-repair --reset ${candidate.sig}\` when it is safe to start over.`,
               linkSession: false,
@@ -1263,6 +1272,11 @@ async function tick(input = {}) {
       delete fresh.cooldownUntil;
       delete fresh.okSinceAt;
       delete fresh.launchGaveUp;
+      // A new card starts with a clean debounce: these belong to the launch that
+      // has just been replaced, and carrying them over pre-expires the grace
+      // window for a session that does not exist yet.
+      delete fresh.relaunchDue;
+      delete fresh.deadSince;
       value.openedToday = Number(value.openedToday || 0) + 1;
       value.day = localDay(now);
     }, { root, now, write: deps.write });
@@ -1322,6 +1336,8 @@ async function tick(input = {}) {
       fresh.sessionId = launched.sessionId || null;
       fresh.pane = launched.pane || null;
       fresh.worktree = launched.worktree || null;
+      delete fresh.relaunchDue;
+      delete fresh.deadSince;
       if (launched.launchError) fresh.launchError = clip(launched.launchError, 300);
       else delete fresh.launchError;
     }, { root, now, write: deps.write });
@@ -1394,10 +1410,18 @@ function renderStatus(value) {
     lines.push('', `${title} (${rows.length})`);
     for (const row of rows) lines.push(`  ${render(row)}`);
   };
+  // The three states that explain why a row is not doing anything: `keep
+  // self-repair` is where Owner looks when a repair card has gone quiet, and a row
+  // that has given up looks exactly like one that is working unless it says so.
+  const state = (row) => (row.launchGaveUp
+    ? ` — gave up after ${row.attempts || MAX_LAUNCH_ATTEMPTS} sessions (--reset to start over)`
+    : row.relaunchDue ? ' — relaunch due'
+      : row.deadSince ? ` — pane unseen since ${stamp(row.deadSince)}`
+        : '');
   section('open', value.open, (row) => `${row.sig} — card ${row.cardId}`
     + `${row.sessionId ? `, session ${String(row.sessionId).slice(0, 8)}` : ''}${row.pane ? ` in pane ${row.pane}` : ''}`
     + `${row.worktree ? `, ${row.worktree}` : ''}`
-    + `, opened ${stamp(row.openedAt)}, ${row.attempts || 1} attempt(s)`);
+    + `, opened ${stamp(row.openedAt)}, ${row.attempts || 1} attempt(s)${state(row)}`);
   section('cooling down', value.cooling, (row) => `${row.sig} — card ${row.cardId || '(none)'}, until ${stamp(row.cooldownUntil)}`);
   section('watching', value.resolved, (row) => `${row.sig} — first seen ${stamp(row.firstSeenAt)}`
     + `${row.cardId ? `, last card ${row.cardId}` : ''}${row.resolvedAt ? `, resolved ${stamp(row.resolvedAt)}` : ''}`);
@@ -1474,10 +1498,14 @@ function reset(sig, options = {}) {
         return { found: true, cleared: false, cardId: entry.cardId, status: status || null, reason: 'unverified' };
       }
       // A card that is done or archived is not an open card, whatever the entry
-      // says. Refusing those was how a signature got stuck with no way out but
-      // editing state.json by hand.
-      if (!closed && !entry.launchError) {
-        return { found: true, cleared: false, cardId: entry.cardId, status: status || null, reason: 'card-open' };
+      // says. Neither is one this scheduler has already given up on: the give-up
+      // check-in tells Owner to run exactly this command, so refusing here left
+      // him with no way out but editing state.json by hand.
+      if (!closed && !entry.launchError && !entry.launchGaveUp) {
+        return {
+          found: true, cleared: false, cardId: entry.cardId, status: status || null, reason: 'card-open',
+          launched: Boolean(recorded),
+        };
       }
     }
     // The card stays on the record, as the link the next one cites.
@@ -1494,6 +1522,8 @@ function reset(sig, options = {}) {
     delete entry.artifacts;
     delete entry.launchGaveUp;
     delete entry.launchError;
+    delete entry.relaunchDue;
+    delete entry.deadSince;
     delete entry.attempts;
     delete entry.firstSeenAt;
     entry.ticks = 0;
