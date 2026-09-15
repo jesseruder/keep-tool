@@ -18,6 +18,9 @@ const summarize = require('./summarize.js');
 const RUNS_DIR = path.join(keep.ROOT, '.keep', 'runs');
 const CHECK_BUDGET_MS = (parseInt(process.env.KEEP_CHECK_BUDGET_MIN || '15', 10)) * 60e3;
 const TASK_BUDGET_MS = (parseInt(process.env.KEEP_TASK_BUDGET_MIN || '60', 10)) * 60e3;
+// A caller may shorten or lengthen a task run's budget, but never past this: an
+// unattended agent nobody is watching does not get an open-ended afternoon.
+const MAX_TASK_BUDGET_MIN = 90;
 // Poll more often without shortening the default ~two-hour busy-thread grace.
 const parsedMaxDeferrals = parseInt(process.env.KEEP_DELIVER_MAX_DEFERRALS || '120', 10);
 const MAX_DELIVER_DEFERRALS = Number.isFinite(parsedMaxDeferrals) && parsedMaxDeferrals >= 0
@@ -188,19 +191,54 @@ function killGroup(child, signal) {
   }
 }
 
-function headlessRunArgs(prompt, sessionId) {
+function headlessRunArgs(prompt, sessionId, model) {
   return [
     '-p', prompt,
     '--session-id', sessionId,
     '--output-format', 'stream-json',
     '--verbose',
     '--permission-mode', 'bypassPermissions',
+    ...(model ? ['--model', String(model)] : []),
     ...summarize.headlessSettingsArgs(),
   ];
 }
 
-function headlessRunEnvironment(kind, inheritedEnv = process.env, accountApi) {
-  return summarize.automationEnv(kind === 'check' ? 'checks' : 'runs', inheritedEnv, accountApi);
+// `purpose` names the automation account the run spends against. It defaults to
+// the kind's own purpose, so every existing caller is unchanged; a self-repair
+// run passes 'repair', which also marks the environment so `keep hook pre-bash`
+// can refuse the daemon restart from inside it.
+function headlessRunEnvironment(kind, inheritedEnv = process.env, accountApi, purpose) {
+  const selected = summarize.automationEnv(purpose || (kind === 'check' ? 'checks' : 'runs'), inheritedEnv, accountApi);
+  if (purpose === 'repair') selected.env.KEEP_REPAIR = '1';
+  return selected;
+}
+
+// A run normally works in its card's project. A self-repair run works in a fresh
+// worktree instead — but only a worktree: an arbitrary cwd from a caller would
+// let a card point a bypassPermissions agent anywhere on the disk.
+function insideWorktreeRoot(candidate, wt = require('./wt.js')) {
+  try {
+    const configured = String(wt.loadConfig().worktreeRoot || '~/wt').replace(/^~(?=\/|$)/, os.homedir());
+    const root = fs.realpathSync(path.resolve(configured));
+    const target = fs.realpathSync(path.resolve(candidate));
+    const relative = path.relative(root, target);
+    return relative !== '' && !relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative);
+  } catch { return false; }
+}
+
+function runCwd(task, kind, opts) {
+  const requested = opts && opts.cwd;
+  // Only a task run, and only inside the worktree root; anything else is ignored
+  // rather than refused, so a stale option cannot stop a scheduled check.
+  if (kind === 'task' && requested && insideWorktreeRoot(requested)) return path.resolve(requested);
+  return expandProject(task.fm.project) || keep.ROOT;
+}
+
+function runBudgetMs(kind, opts) {
+  if (kind === 'check') return CHECK_BUDGET_MS;
+  const requested = Number(opts && opts.budgetMin);
+  if (!Number.isFinite(requested) || requested <= 0) return TASK_BUDGET_MS;
+  return Math.min(MAX_TASK_BUDGET_MIN, requested) * 60e3;
 }
 
 function startRun(taskId, kind, extra, opts) {
@@ -208,7 +246,7 @@ function startRun(taskId, kind, extra, opts) {
   if (active.size >= MAX_CONCURRENT) throw new keep.KeepError(`already ${MAX_CONCURRENT} runs active`);
   const task = keep.loadTask(taskId);
   if (kind === 'check' && !task.fm.check) throw new keep.KeepError(`${taskId} has no check recipe`);
-  const cwd = expandProject(task.fm.project) || keep.ROOT;
+  const cwd = runCwd(task, kind, opts);
   if (!fs.existsSync(cwd)) throw new keep.KeepError(`project dir ${cwd} does not exist`);
 
   fs.mkdirSync(RUNS_DIR, { recursive: true });
@@ -217,7 +255,8 @@ function startRun(taskId, kind, extra, opts) {
   const logFile = path.join(RUNS_DIR, `${id}.jsonl`);
   const bin = claudeBin();
   const prompt = buildPrompt(task, kind, extra, opts);
-  const selectedAccount = headlessRunEnvironment(kind);
+  const model = opts && opts.model ? String(opts.model) : '';
+  const selectedAccount = headlessRunEnvironment(kind, process.env, undefined, opts && opts.purpose);
   const env = selectedAccount.env; // KEEP_RUN exempts the run from Stop-hook enforcement
   delete env.CLAUDE_CODE_SESSION_ID; // the run is its own session, not ours
   let baseSha = null;
@@ -230,12 +269,14 @@ function startRun(taskId, kind, extra, opts) {
     fs.writeFileSync(path.join(dir, sessionId), '');
   } catch {}
 
-  const child = spawn(bin, headlessRunArgs(prompt, sessionId), {
+  const child = spawn(bin, headlessRunArgs(prompt, sessionId, model), {
     cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
   });
 
   const run = {
     id, taskId, kind, cwd, accountId: selectedAccount.account.id,
+    purpose: (opts && opts.purpose) || '',
+    model,
     startStatus: task.fm.status,
     startCardFingerprint: cardFingerprint(task),
     pid: child.pid,
@@ -300,7 +341,7 @@ function startRun(taskId, kind, extra, opts) {
     run.status = 'killed';
     killGroup(child, 'SIGTERM');
     run.killTimer = setTimeout(() => killGroup(child, 'SIGKILL'), 10e3);
-  }, kind === 'check' ? CHECK_BUDGET_MS : TASK_BUDGET_MS);
+  }, runBudgetMs(kind, opts));
 
   child.on('error', (e) => {
     writeLog(`[spawn error] ${e.message}\n`);
@@ -1018,7 +1059,7 @@ function startScheduler() {
 module.exports = {
   startRun, stopRun, listRuns, readDiff, recover, retryPending, startScheduler, setOnChange, setNotifier, setDeliverer,
   buildPrompt, headlessRunArgs, checkDeliveryMessage, checkDeliveryKey, planDueCard, deliveryWarning,
-  headlessRunEnvironment,
+  headlessRunEnvironment, insideWorktreeRoot, runCwd, runBudgetMs, MAX_TASK_BUDGET_MIN,
   cardFingerprint, finalizePayload, pendingCheckin, landFinalCheckin, NO_RESULT,
   parseVerdict, verdictOutcome, onPassOutcome, probePayload, startProbe, startDueProbe, probeDue,
   landProbeResult, escalateProbeFailure, isTransientStartError, MAX_CONCURRENT_PROBES,

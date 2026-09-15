@@ -117,6 +117,50 @@ test('checks and task runs use their stable configured automation accounts', () 
   assert.deepEqual(selected, ['checks', 'runs']);
   assert.equal(check.env.KEEP_AGENT_ACCOUNT_ID, 'checks-account');
   assert.equal(task.env.KEEP_AGENT_ACCOUNT_ID, 'runs-account');
+
+  // A named purpose overrides the kind's default, and `repair` also marks the
+  // environment so the pre-bash guard can refuse a daemon restart from inside it.
+  const repair = headlessRunEnvironment('task', { PATH: '/bin' }, accountApi, 'repair');
+  assert.deepEqual(selected.at(-1), 'repair');
+  assert.equal(repair.env.KEEP_AGENT_ACCOUNT_ID, 'repair-account');
+  assert.equal(repair.env.KEEP_REPAIR, '1');
+  assert.equal(task.env.KEEP_REPAIR, undefined, 'an ordinary run is not a repair run');
+});
+
+test('a run may be pointed at a worktree, with a model and a capped budget', () => {
+  const { insideWorktreeRoot, runCwd, runBudgetMs, MAX_TASK_BUDGET_MIN } = require('./runs.js');
+  const wtRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-runs-wt-'));
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-runs-other-'));
+  try {
+    const worktree = path.join(wtRoot, 'keep-tool', 'self-repair-abcd1234');
+    fs.mkdirSync(worktree, { recursive: true });
+    const wt = { loadConfig: () => ({ worktreeRoot: wtRoot }) };
+    assert.equal(insideWorktreeRoot(worktree, wt), true);
+    assert.equal(insideWorktreeRoot(elsewhere, wt), false, 'an arbitrary cwd is not a worktree');
+    assert.equal(insideWorktreeRoot(wtRoot, wt), false, 'the root itself is not a worktree');
+    assert.equal(insideWorktreeRoot(path.join(wtRoot, 'does-not-exist'), wt), false);
+
+    // The project is still the default, and a cwd outside the worktree root is
+    // ignored rather than refused: a stale option must not stop a run.
+    const task = { fm: { project: elsewhere } };
+    assert.equal(runCwd(task, 'task', undefined), elsewhere);
+    assert.equal(runCwd(task, 'check', { cwd: worktree }), elsewhere, 'only a task run may be relocated');
+    assert.equal(runCwd(task, 'task', { cwd: path.join(elsewhere, 'nope') }), elsewhere);
+
+    assert.equal(runBudgetMs('check', { budgetMin: 600 }), 15 * 60e3, 'a check keeps its own budget');
+    assert.equal(runBudgetMs('task', undefined), 60 * 60e3);
+    assert.equal(runBudgetMs('task', { budgetMin: 30 }), 30 * 60e3);
+    assert.equal(runBudgetMs('task', { budgetMin: 600 }), MAX_TASK_BUDGET_MIN * 60e3);
+    assert.equal(runBudgetMs('task', { budgetMin: 'soon' }), 60 * 60e3);
+
+    // The model reaches the argv only when one is asked for.
+    assert.equal(headlessRunArgs('p', 's').includes('--model'), false);
+    const args = headlessRunArgs('p', 's', 'opus');
+    assert.equal(args[args.indexOf('--model') + 1], 'opus');
+  } finally {
+    fs.rmSync(wtRoot, { recursive: true, force: true });
+    fs.rmSync(elsewhere, { recursive: true, force: true });
+  }
 });
 
 test('a headless fallback explains that the linked thread is gone', () => {
