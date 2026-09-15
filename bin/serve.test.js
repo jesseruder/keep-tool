@@ -1074,6 +1074,40 @@ test('live ledger sightings and host panes keep Claude sessions alive; Codex sta
   assert.deepEqual(sessions.map((s) => [s.state, s.alive]), [['running', true], ['running', true], ['running', null]]);
 });
 
+test('turn index reads only recently alive sessions and caches codex rollout walks', () => {
+  const { liveTurnIndexSessions } = require('./serve');
+  let now = Date.parse('2026-09-14T12:00:00Z');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-turn-index-live-'));
+  const walks = [];
+  const ledger = { sessions: {
+    fresh: { agent: 'claude', lastSeenAlive: now - 60e3 },
+    stale: { agent: 'claude', lastSeenAlive: now - 2 * 86400e3 },
+    unstamped: { agent: 'claude' },
+    found: { agent: 'codex', lastSeenAlive: now - 5 * 60e3 },
+    missing: { agent: 'codex', lastSeenAlive: now - 5 * 60e3 },
+    oldCodex: { agent: 'codex', lastSeenAlive: now - 3 * 86400e3 },
+  } };
+  const deps = {
+    root, ledger, now: () => now,
+    scanClaudeTranscripts: () => ['fresh', 'stale', 'unstamped'].map((id) => ({ id, file: `/claude/${id}.jsonl` })),
+    rolloutFileFor: () => null,
+    findRolloutFile: (id) => { walks.push(id); return id === 'found' ? '/codex/found.jsonl' : null; },
+  };
+  try {
+    const ids = () => liveTurnIndexSessions(deps).map((s) => `${s.id}:${s.file}`);
+    assert.deepEqual(ids(), ['fresh:/claude/fresh.jsonl', 'found:/codex/found.jsonl']);
+    assert.deepEqual(walks, ['found', 'missing'], 'week-old ledger sightings are never walked');
+    now += 60e3;
+    assert.deepEqual(ids(), ['fresh:/claude/fresh.jsonl', 'found:/codex/found.jsonl']);
+    assert.deepEqual(walks, ['found', 'missing'], 'found paths and recent misses are cached');
+    now += 10 * 60e3;
+    ledger.sessions.missing.lastSeenAlive = now;
+    ledger.sessions.fresh.lastSeenAlive = now;
+    ids();
+    assert.deepEqual(walks, ['found', 'missing', 'missing'], 'a miss is retried after its window');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('successful SendMessage resumes restore background work after completion', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-agent-resume-'));
   const file = path.join(dir, 'session.jsonl');

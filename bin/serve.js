@@ -49,6 +49,10 @@ const SESSION_WINDOW_MS = 48 * 3600e3; // ignore transcripts older than this
 const TURN_INDEX_BUDGET_MS = 150; // how long one turn-index tick may hold the event loop
 const TURN_INDEX_BUDGET_BYTES = 8 * 1024 * 1024;
 const TURN_INDEX_PRUNE_LIMIT = 200; // sessions dropped per daily sweep; it resumes next tick
+// The live ledger keeps a week of sightings; only sessions seen alive recently can
+// still be writing turns. The live tick refreshes sightings every two minutes.
+const TURN_INDEX_LIVE_WINDOW_MS = 30 * 60e3;
+const TURN_INDEX_ROLLOUT_MISS_MS = 10 * 60e3; // how long a failed codex rollout lookup is trusted
 const WATCHER_TURNS_PER_TICK = 5;
 const WATCHER_CONCURRENCY = 2;
 const WATCHER_WINDOW_MS = 2 * 3600e3; // a turn older than this is history, not a live decision
@@ -4967,28 +4971,46 @@ function writeLiveSessionLedger(ledger, deps = {}) {
 // Which transcripts the turn index should re-read on this tick. Files come from
 // the caches the daemon already maintains, so the sweep costs a map lookup per
 // session rather than a project-tree walk.
+// A codex rollout missing from the scan cache costs a walk of ~90 dated directories
+// (60-180ms, synchronous). Found paths never move; misses are retried after a while.
+const turnIndexRolloutLookups = new Map();
 function liveTurnIndexSessions(deps = {}) {
   const ledger = readLiveSessionLedger(deps);
+  const now = (deps.now || Date.now)();
   const wanted = new Map();
   for (const [id, entry] of Object.entries(ledger.sessions || {})) {
     if (!entry || !/^[A-Za-z0-9_-]+$/.test(id)) continue;
+    // Week-old sightings would each cost a rollout walk here: hundreds of headless
+    // codex runs blocked the event loop for tens of seconds per tick.
+    if (!Number.isFinite(entry.lastSeenAlive) || now - entry.lastSeenAlive > TURN_INDEX_LIVE_WINDOW_MS) continue;
     wanted.set(id, { id, agent: entry.agent === 'codex' ? 'codex' : 'claude' });
   }
   // A reviewer may be idle enough to have left the live ledger, and its turns are
   // exactly the ones the fleet wants measured.
   try {
-    for (const id of fs.readdirSync(path.join(keep.ROOT, '.keep', 'reviewer'))) {
+    for (const id of fs.readdirSync(path.join(deps.root || keep.ROOT, '.keep', 'reviewer'))) {
       if (/^[A-Za-z0-9_-]+$/.test(id) && !wanted.has(id)) wanted.set(id, { id, agent: 'claude' });
     }
   } catch {}
+  for (const id of turnIndexRolloutLookups.keys()) if (!wanted.has(id)) turnIndexRolloutLookups.delete(id);
   if (!wanted.size) return [];
   const claudeFiles = new Map();
-  try { for (const row of claudeTranscriptIndex.scan()) claudeFiles.set(row.id, row.file); } catch {}
+  try { for (const row of (deps.scanClaudeTranscripts || (() => claudeTranscriptIndex.scan()))()) claudeFiles.set(row.id, row.file); } catch {}
+  const rolloutFileFor = deps.rolloutFileFor || codex.rolloutFileFor;
+  const findRolloutFile = deps.findRolloutFile || codex.findRolloutFile;
   const sessions = [];
   for (const entry of wanted.values()) {
     let file = null;
     if (entry.agent === 'codex') {
-      try { file = codex.rolloutFileFor(entry.id) || codex.findRolloutFile(entry.id); } catch {}
+      try { file = rolloutFileFor(entry.id); } catch {}
+      if (!file) {
+        const cached = turnIndexRolloutLookups.get(entry.id);
+        if (cached && (cached.file || now - cached.at < TURN_INDEX_ROLLOUT_MISS_MS)) file = cached.file;
+        else {
+          try { file = findRolloutFile(entry.id); } catch {}
+          turnIndexRolloutLookups.set(entry.id, { file: file || null, at: now });
+        }
+      }
     } else file = claudeFiles.get(entry.id) || null;
     if (file) sessions.push({ ...entry, file });
   }
