@@ -224,3 +224,60 @@ test('idle cleanup reconciles a late receipt after its card clears the schedule'
     assert.equal(statusForText(directory, 'check', 'card:date').received, true);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+// The reviewer wedge of 2026-09-12: one journal entry nothing could confirm refused
+// every later tick for 133 consecutive runs, because each tick's text differs from
+// the stranded one and only a confirmed delivery ever removed the entry.
+test('an old unconfirmed journal expires once the pane no longer holds its draft', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-stale-'));
+  const file = path.join(dir, 'transcript'); fs.writeFileSync(file, '');
+  const directory = path.join(dir, 'journal');
+  let typed = 0;
+  const base = { session: { id: 's', kind: 'claude' }, pane: 'p', file, directory,
+    precheck: async () => {}, type: async () => { typed += 1; }, submitDraft: async () => assert.fail('unexpected Enter'),
+    draftMatches: async () => false, pause: async () => {}, attempts: 1, staleJournalMs: 15 * 60e3 };
+  try {
+    await assert.rejects(deliver({ ...base, text: 'tick one' }), /unconfirmed/);
+    const journal = path.join(directory, fs.readdirSync(directory).find((name) => name.endsWith('.json')));
+    const entry = JSON.parse(fs.readFileSync(journal, 'utf8'));
+
+    // Still fresh: a message that may yet be in flight is never discarded.
+    await assert.rejects(deliver({ ...base, text: 'tick two' }), /Previous delivery is unconfirmed/);
+    assert.equal(typed, 1, 'nothing was retyped while the entry was fresh');
+
+    // Old, but the pane is still showing exactly this draft: recover it, never expire it.
+    fs.writeFileSync(journal, JSON.stringify({ ...entry, createdAt: Date.now() - 60 * 60e3 }));
+    let submitted = 0;
+    await assert.rejects(deliver({ ...base, text: 'tick one', draftMatches: async () => true,
+      submitDraft: async () => { submitted += 1; } }), /unconfirmed/);
+    assert.ok(submitted >= 1, 'the exact surviving draft gets Enter, not a retype');
+    assert.equal(typed, 1);
+
+    // Old and gone from the screen: expire it and let the next message through.
+    fs.writeFileSync(journal, JSON.stringify({ ...entry, createdAt: Date.now() - 60 * 60e3 }));
+    await assert.rejects(deliver({ ...base, text: 'tick three' }), /no matching transcript receipt/);
+    assert.equal(typed, 2, 'the new message was typed once the stale entry expired');
+    assert.equal(JSON.parse(fs.readFileSync(journal, 'utf8')).hash, require('./delivery').textHash('tick three'));
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('an unconfirmed journal with no createdAt still expires on its file age', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-stale-mtime-'));
+  const file = path.join(dir, 'transcript'); fs.writeFileSync(file, '');
+  const directory = path.join(dir, 'journal');
+  let typed = 0;
+  const base = { session: { id: 's', kind: 'claude' }, pane: 'p', file, directory,
+    precheck: async () => {}, type: async () => { typed += 1; }, submitDraft: async () => assert.fail('unexpected Enter'),
+    draftMatches: async () => false, pause: async () => {}, attempts: 1, staleJournalMs: 15 * 60e3 };
+  try {
+    await assert.rejects(deliver({ ...base, text: 'legacy' }), /unconfirmed/);
+    const journal = path.join(directory, fs.readdirSync(directory).find((name) => name.endsWith('.json')));
+    const entry = JSON.parse(fs.readFileSync(journal, 'utf8'));
+    delete entry.createdAt;
+    fs.writeFileSync(journal, JSON.stringify(entry));
+    const old = (Date.now() - 60 * 60e3) / 1000;
+    fs.utimesSync(journal, old, old);
+    await assert.rejects(deliver({ ...base, text: 'next' }), /no matching transcript receipt/);
+    assert.equal(typed, 2);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

@@ -123,7 +123,24 @@ function finish(directory, journal, entry) {
   }
 }
 
-async function deliverAttempt({ session, pane, text, key, file, directory, trace, retainReceipt = false, precheck, type, submitDraft, draftMatches, observe, pause = (ms) => new Promise((r) => setTimeout(r, ms)), attempts = 16 }) {
+// An unconfirmed journal entry survives forever: `received` never turns true for a
+// message the pane never accepted, and only a confirmed delivery calls finish().
+// Every later send to that session then dies on the refusal below, because the next
+// message is never byte-identical to the stranded one. On 2026-09-12 a single such
+// entry wedged the reviewer for 133 consecutive ticks with the daemon reporting only
+// "Previous delivery is unconfirmed". So an entry expires once it is far older than
+// any in-flight typing could be AND the pane is not showing that draft any more; a
+// fresh attempt then runs the full path again, and its precheck still refuses to type
+// into an input box that has text in it.
+const STALE_JOURNAL_MS = Math.max(1, parseInt(process.env.KEEP_DELIVERY_JOURNAL_STALE_MIN || '15', 10) || 15) * 60e3;
+
+function journalAgeMs(journal, entry, now) {
+  const createdAt = Number(entry && entry.createdAt);
+  if (Number.isFinite(createdAt) && createdAt > 0) return now - createdAt;
+  try { return now - fs.statSync(journal).mtimeMs; } catch { return 0; }
+}
+
+async function deliverAttempt({ session, pane, text, key, file, directory, trace, retainReceipt = false, precheck, type, submitDraft, draftMatches, observe, pause = (ms) => new Promise((r) => setTimeout(r, ms)), attempts = 16, staleJournalMs = STALE_JOURNAL_MS }) {
   let typingError;
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const activeJournal = path.join(directory, hash(session.id) + '.json');
@@ -144,10 +161,18 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
     } else {
       const sameMessage = entry.hash === hash(text), samePane = entry.pane === pane;
       trace('retry-identity', { sameMessage, samePane });
-      if (!sameMessage || !samePane || !await draftMatches()) {
-        throw new Error('Previous delivery is unconfirmed; no message was retyped. Inspect the session draft/transcript before retrying.');
+      const draftPresent = await draftMatches();
+      if (!sameMessage || !samePane || !draftPresent) {
+        const ageMs = journalAgeMs(journal, entry, Date.now());
+        if (draftPresent || ageMs < staleJournalMs) {
+          throw new Error('Previous delivery is unconfirmed; no message was retyped. Inspect the session draft/transcript before retrying.');
+        }
+        trace('pending-journal-expired', { ageMs });
+        try { fs.unlinkSync(journal); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        entry = null;
+      } else {
+        await submitDraft();
       }
-      await submitDraft();
     }
   }
   if (!entry) {
@@ -263,4 +288,4 @@ function reconcile(directory) {
   return settled;
 }
 module.exports = { deliver, received, reconcile, userText, statusForText, acknowledge, pendingForSession,
-  settleObserved, textHash: hash };
+  settleObserved, textHash: hash, STALE_JOURNAL_MS };

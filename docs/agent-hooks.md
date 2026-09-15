@@ -84,6 +84,13 @@ causes the answer to be resent. Corrupt or ambiguous attempts remain visible.
 Completed receipts move out of the active queue but remain available to the
 owning retry loop, so a late confirmation cannot cause duplicate typing. A busy
 delivery lock defers reconciliation while read-only inspection continues.
+A pending attempt no transcript can confirm used to block every later send to that
+session for good, because the next message is never byte-identical to the stranded
+one. An entry older than `KEEP_DELIVERY_JOURNAL_STALE_MIN` (default 15) minutes
+expires when the pane no longer shows its draft, and the next message goes through
+the normal path — whose precheck still refuses to type into an input box that has
+text in it. A draft still on screen is recovered with Enter, never discarded.
+
 The watchdog itself stays read-only and never sends input or restarts clients.
 It monitors attempted deliveries; it is not a startup compatibility certification
 and does not flag sends deferred before any draft was typed.
