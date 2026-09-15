@@ -33,13 +33,18 @@ test('every reminder is on until the daemon state file says otherwise', (t) => {
 });
 test('toggling writes the disabled list the daemon reads and keeps titles no longer configured', (t) => {
   const env = fixture(t, config);
-  update({ title: 'Stretch', enabled: false }, env);
-  assert.deepEqual(JSON.parse(fs.readFileSync(env.KEEP_REMINDERS_STATE, 'utf8')), { disabled: ['Stretch'] });
+  const read = () => JSON.parse(fs.readFileSync(env.KEEP_REMINDERS_STATE, 'utf8'));
+  update({ title: 'Stretch', enabled: false }, env, 1000);
+  assert.deepEqual(read(), { disabled: ['Stretch'], enabledAt: {} });
   assert.deepEqual(snapshot(env).map((reminder) => [reminder.title, reminder.enabled]), [['Stretch', false], ['Lunch', true]]);
-  update({ title: 'Stretch', enabled: false }, env);
-  fs.writeFileSync(env.KEEP_REMINDERS_STATE, JSON.stringify({ disabled: ['Stretch', 'Old'] }));
-  update({ title: 'Stretch', enabled: true }, env);
-  assert.deepEqual(JSON.parse(fs.readFileSync(env.KEEP_REMINDERS_STATE, 'utf8')), { disabled: ['Old'] });
+  update({ title: 'Stretch', enabled: false }, env, 2000);
+  fs.writeFileSync(env.KEEP_REMINDERS_STATE, JSON.stringify({ disabled: ['Stretch', 'Old'], enabledAt: { Lunch: 5 } }));
+  update({ title: 'Stretch', enabled: true }, env, 3000);
+  assert.deepEqual(read(), { disabled: ['Old'], enabledAt: { Lunch: 5, Stretch: 3000 } }, 'switching on records when, for the daemon interval restart');
+  update({ title: 'Stretch', enabled: true }, env, 4000);
+  assert.equal(read().enabledAt.Stretch, 3000, 'a repeated switch-on neither restarts nor forgets the interval restart');
+  update({ title: 'Stretch', enabled: false }, env, 5000);
+  assert.deepEqual(read(), { disabled: ['Old', 'Stretch'], enabledAt: { Lunch: 5 } });
 });
 test('rejects unknown titles and malformed bodies', (t) => {
   const env = fixture(t, config);

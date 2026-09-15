@@ -124,7 +124,7 @@ test('isolated browser: alert inbox, read persistence, card links and desktop cl
     await wait("document.querySelector('[data-reminder=Stretch]')?.checked === true");
     await evaluate("document.querySelector('[data-reminder=Stretch]').click()");
     await wait("document.querySelector('[data-reminder=Stretch]').checked === false && !document.querySelector('[data-reminder=Stretch]').disabled");
-    assert.deepEqual(JSON.parse(fs.readFileSync(reminderEnv.KEEP_REMINDERS_STATE, 'utf8')), { disabled: ['Stretch'] }, 'the switch writes the daemon state file');
+    assert.deepEqual(JSON.parse(fs.readFileSync(reminderEnv.KEEP_REMINDERS_STATE, 'utf8')), { disabled: ['Stretch'], enabledAt: {} }, 'the switch writes the daemon state file');
     assert.ok(await evaluate("document.querySelector('#notificationsPanel').open"), 'flipping a reminder keeps the panel open');
     assert.equal(await evaluate("document.querySelector('.notification-text').textContent"), '<img src=x onerror=alert(1)> Reviewer finding');
     assert.equal(await evaluate("document.querySelectorAll('.notification-list img').length"), 0, 'alert text is escaped');
