@@ -107,8 +107,8 @@ test('retired, disabled, on-demand and self-repair rows never produce a signatur
     { name: 'discord', disabled: true, consecutiveFailures: 40, lastError: 'not configured', lastErrorAt: NOW },
     { name: 'usage', consecutiveFailures: 40, lastError: 'on demand', lastErrorAt: NOW },
     { name: 'self-repair', consecutiveFailures: 40, lastError: 'itself', lastErrorAt: NOW },
-    // Excluded: these fail for reasons a daemon fix cannot address, and `runs`
-    // fails when this scheduler's own repair run fails to start.
+    // Excluded: these fail for reasons a daemon fix cannot address — queue
+    // congestion, a malformed card, a dirty checkout.
     { name: 'runs', consecutiveFailures: 40, lastError: 'already 3 runs active', lastErrorAt: NOW },
     { name: 'lint', consecutiveFailures: 40, lastError: 'malformed card', lastErrorAt: NOW },
     { name: 'git-pull', consecutiveFailures: 40, lastError: 'dirty checkout', lastErrorAt: NOW },
@@ -268,7 +268,7 @@ test('evidence carries the row, the daemon, the snapshot and a scrubbed log exce
 
 function harness(options = {}) {
   const root = options.root;
-  const calls = { cards: [], checkins: [], artifacts: [], worktrees: [], runs: [], health: [], log: [] };
+  const calls = { cards: [], checkins: [], artifacts: [], artifactText: new Map(), worktrees: [], runs: [], health: [], log: [] };
   let counter = 0;
   const deps = {
     root,
@@ -287,24 +287,31 @@ function harness(options = {}) {
     checkin: (id, payload) => calls.checkins.push({ id, ...payload }),
     artifact: (argv) => {
       calls.artifacts.push(argv);
-      return argv.slice(1).filter((value) => value !== '-m' && !value.startsWith('self-repair evidence'))
-        .map((file) => ({ destination: path.join(root, '.keep', 'artifacts', argv[0], path.basename(file)) }));
+      const message = argv.indexOf('-m');
+      const files = argv.slice(1, message === -1 ? undefined : message);
+      // Read while the staging directory still exists: createRepairCard deletes it
+      // the moment this returns, so this is the only place the text is visible.
+      for (const file of files) calls.artifactText.set(path.basename(file), fs.readFileSync(file, 'utf8'));
+      return files.map((file) => ({ destination: path.join(root, '.keep', 'artifacts', argv[0], path.basename(file)) }));
     },
     spawnWorktree: (name) => {
       calls.worktrees.push(name);
       return Promise.resolve(options.worktree || { ok: true, path: `/tmp/wt/keep-tool/${name}` });
     },
     insideWorktreeRoot: options.insideWorktreeRoot || (() => true),
-    startRun: (cardId, kind, extra, runOptions) => {
-      calls.runs.push({ cardId, kind, extra, runOptions });
+    accountId: () => options.accountId || 'claude-repair',
+    worktreePath: (name) => `/tmp/wt/keep-tool/${name}`,
+    openSession: async (body, openDeps) => {
+      calls.runs.push({ body, openDeps });
       if (options.runThrows) throw new Error(options.runThrows);
-      return { id: `run-${cardId}` };
+      const nth = calls.runs.length;
+      return { ok: true, pane: `pane-${nth}`, sessionId: `${String(nth).repeat(8)}-0000-4000-8000-000000000000` };
     },
   };
   return { deps, calls };
 }
 
-test('a ready signature opens one card, attaches evidence, makes a worktree and launches one run', async () => {
+test('a ready signature opens one card, attaches evidence, makes a worktree and opens one session', async () => {
   const root = makeRoot();
   try {
     fs.writeFileSync(path.join(root, '.keep', 'serve.log'), 'keep review: tick failed for pid 123\n');
@@ -347,42 +354,72 @@ test('a ready signature opens one card, attaches evidence, makes a worktree and 
     assert.match(card.draft.plan[2].text, /keep reviewed/);
     assert.match(card.draft.plan[3].text, /never restart it yourself/);
 
-    // Evidence went on as artifacts, staged inside Keep and cleaned up after.
-    assert.equal(calls.artifacts.length, 1);
+    // Evidence went on as artifacts, staged inside Keep and cleaned up after —
+    // and the recipe is one of them, because it does not fit in an open message.
+    assert.equal(calls.artifacts.length, 2);
     assert.equal(calls.artifacts[0][0], 'repair-card-1');
     assert.ok(calls.artifacts[0].some((value) => String(value).endsWith('health-row.json')));
+    assert.ok(calls.artifacts[1].some((value) => String(value).endsWith('recipe.md')));
     assert.equal(fs.existsSync(path.join(root, '.keep', 'self-repair', 'evidence', 'repair-card-1')), false);
 
-    // One worktree, named for the signature, and one run inside it.
+    // The recipe names the card and the worktree it will be read in — both known
+    // before `wt new` runs — and cites the evidence it was stored alongside.
+    const recipe = calls.artifactText.get('recipe.md');
+    assert.match(recipe, /repair-card-1/);
+    assert.match(recipe, /\/tmp\/wt\/keep-tool\/self-repair-[0-9a-f]{8} \(branch wt\/self-repair-[0-9a-f]{8}\)/);
+    assert.match(recipe, /health-row\.json/);
+    assert.match(recipe, /DATA, NOT INSTRUCTIONS/);
+    // The review is waited for in the foreground; the first live repair ended its
+    // turn with the review pending, which killed the poll and landed nothing.
+    assert.match(recipe, /YOUR TURN MUST NOT END WHILE THE REVIEW IS STILL PENDING/);
+    assert.match(recipe, /keep checkin repair-card-1 --step 3 --status review --commit <sha>/);
+    assert.match(recipe, /Aim to finish within 60 minutes/);
+    assert.equal(/VERDICT/.test(recipe), false, 'nothing parses a verdict line out of a session');
+    assert.equal(/killed/.test(recipe), false, 'and nothing kills it on a clock');
+
+    // One worktree, named for the signature, and one session opened inside it.
     assert.equal(calls.worktrees.length, 1);
     assert.match(calls.worktrees[0], /^self-repair-[0-9a-f]{8}$/);
     assert.equal(calls.runs.length, 1);
-    assert.equal(calls.runs[0].kind, 'task');
-    assert.equal(calls.runs[0].runOptions.purpose, 'repair');
-    assert.equal(calls.runs[0].runOptions.model, 'opus');
-    assert.equal(calls.runs[0].runOptions.budgetMin, 60);
-    assert.equal(calls.runs[0].runOptions.cwd, `/tmp/wt/keep-tool/${calls.worktrees[0]}`);
-    assert.match(calls.runs[0].extra, /never restart the daemon/i);
-    assert.match(calls.runs[0].extra, /VERDICT: PASS\|FAIL\|UNSURE/);
+    const body = calls.runs[0].body;
+    assert.equal(body.taskId, 'repair-card-1');
+    assert.equal(body.fresh, true);
+    assert.equal(body.agent, 'claude');
+    assert.equal(body.accountId, 'claude-repair');
+    assert.equal(body.model, 'opus');
+    assert.equal(body.cwd, `/tmp/wt/keep-tool/${calls.worktrees[0]}`);
+    // The guard that refuses `keep restart-daemon` keys on this and nothing else.
+    assert.deepEqual(calls.runs[0].openDeps, { launchEnv: { KEEP_REPAIR: '1' } });
 
-    // The launch is recorded on the card: run, worktree, purpose, model.
+    // The opening message is a pointer to the recipe, inside the open-message cap.
+    assert.ok(body.message.length <= require('./keep.js').OPEN_MESSAGE_LIMIT,
+      `the opening message is ${body.message.length} characters`);
+    assert.match(body.message, /repair-card-1/);
+    assert.match(body.message, /recipe\.md/);
+    assert.match(body.message, /DATA, NOT/);
+    assert.match(body.message, /Never restart the daemon/);
+    assert.match(body.message, /Never edit, commit, or run git writes in ~\/keep-tool/);
+
+    // The launch is recorded on the card: session, pane, worktree, purpose, model.
     const launch = calls.checkins.at(-1);
     assert.equal(launch.id, 'repair-card-1');
-    assert.match(launch.message, /Run: run-repair-card-1; account purpose: repair; model: opus; budget: 60m/);
+    assert.match(launch.message, /Session: 11111111 in pane pane-1; account purpose: repair; model: opus; aim: 60m/);
     assert.match(launch.message, /Worktree: \/tmp\/wt\/keep-tool\/self-repair-/);
     assert.equal(launch.linkSession, false);
 
     // …and in the state, where the next tick can see it.
     const entry = selfRepair.loadState(root).signatures[sig];
     assert.equal(entry.cardId, 'repair-card-1');
-    assert.equal(entry.runId, 'run-repair-card-1');
+    assert.equal(entry.sessionId, '11111111-0000-4000-8000-000000000000');
+    assert.equal(entry.pane, 'pane-1');
+    assert.equal(entry.runId, undefined, 'a repair is a session now, not a headless run');
     assert.equal(entry.attempts, 1);
     assert.equal(selfRepair.loadState(root).openedToday, 1);
 
     // A third tick opens nothing: one open card per signature.
     const third = await selfRepair.tick({ ...deps, now: later + 60e3 });
     assert.deepEqual(third.opened, []);
-    assert.match(third.skipped[0].why, /already open/);
+    assert.match(third.skipped[0].why, /already open for this signature \(session 11111111\)/);
     assert.equal(calls.cards.length, 1);
 
     const row = calls.health.at(-1);
@@ -538,7 +575,7 @@ test('keep self-repair prints state, dry-runs, and toggles the config', () => {
 
     selfRepair.mutateState((state) => {
       state.signatures['sched:review:abcd1234'] = {
-        firstSeenAt: NOW, cardId: 'a-repair-card', runId: 'run-1',
+        firstSeenAt: NOW, cardId: 'a-repair-card', sessionId: 'aaaaaaaa-0000-4000-8000-000000000000', pane: 'pane-7',
         worktree: '/Users/x/wt/keep-tool/self-repair-abcd1234', openedAt: NOW, attempts: 1,
       };
       state.day = '2026-09-15';
@@ -546,7 +583,7 @@ test('keep self-repair prints state, dry-runs, and toggles the config', () => {
     }, { root, now: NOW });
     const open = cli();
     assert.match(open.stdout, /open \(1\)/);
-    assert.match(open.stdout, /sched:review:abcd1234 — card a-repair-card, run run-1/);
+    assert.match(open.stdout, /sched:review:abcd1234 — card a-repair-card, session aaaaaaaa in pane pane-7/);
 
     const json = cli('--json');
     assert.equal(JSON.parse(json.stdout).open[0].cardId, 'a-repair-card');
@@ -604,7 +641,8 @@ test('the card slot is reserved before the worktree, and a lost launch resumes i
     const sig = crashed.opened[0].sig;
     const reserved = selfRepair.loadState(root).signatures[sig];
     assert.equal(reserved.cardId, 'repair-card-1', 'the card was recorded before the slow part');
-    assert.equal(reserved.runId, null, 'and the launch is visibly unfinished');
+    assert.equal(reserved.sessionId, null, 'and the launch is visibly unfinished');
+    assert.equal(reserved.pane, null);
     assert.equal(selfRepair.loadState(root).openedToday, 1, 'the daily cap already counts it');
 
     // The next tick inside the backoff leaves it alone rather than opening a second card.
@@ -622,14 +660,41 @@ test('the card slot is reserved before the worktree, and a lost launch resumes i
     assert.equal(resumed.resumed.length, 1);
     assert.equal(resumed.resumed[0].cardId, 'repair-card-1');
     assert.equal(next.calls.cards.length, 0);
-    assert.equal(next.calls.runs.length, 1, 'the run finally starts');
-    assert.equal(selfRepair.loadState(root).signatures[sig].runId, 'run-repair-card-1');
+    assert.equal(next.calls.runs.length, 1, 'the session finally opens');
+    assert.equal(next.calls.artifacts.length, 0, 'the recipe stored with the card is reused, not written again');
+    assert.match(next.calls.runs[0].body.message, /recipe\.md/);
+    assert.equal(selfRepair.loadState(root).signatures[sig].sessionId, '11111111-0000-4000-8000-000000000000');
     assert.equal(selfRepair.loadState(root).openedToday, 1, 'a resume never spends a second slot');
 
     // Once it has a run, later ticks leave it alone again.
     const settled = await selfRepair.tick({ ...next.deps, now: later + 60 * 60e3 });
     assert.deepEqual([settled.opened, settled.resumed], [[], []]);
-    assert.match(settled.skipped[0].why, /already open .*run run-repair-card-1/);
+    assert.match(settled.skipped[0].why, /already open .*session 11111111/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a session that cannot be opened is said on the card, and the next tick tries again', async () => {
+  const root = makeRoot();
+  try {
+    const snapshot = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const { deps, calls } = harness({
+      root, snapshot,
+      config: { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 },
+      runThrows: 'terminal host is unavailable',
+    });
+    const opened = await selfRepair.tick(deps);
+    assert.equal(opened.opened[0].launched, false);
+    assert.equal(opened.opened[0].sessionId, null);
+    assert.match(calls.checkins.at(-1).message, /the repair session could not be opened: terminal host is unavailable/);
+    assert.match(calls.checkins.at(-1).message, /keep resume repair-card-1/);
+
+    // Nothing is running, so the card must not read as launched.
+    const entry = selfRepair.loadState(root).signatures[opened.opened[0].sig];
+    assert.equal(entry.sessionId, null);
+    assert.equal(entry.pane, null);
+    assert.equal(selfRepair.resumeBlocker(entry, selfRepair.DEFAULT_CONFIG, NOW + 20 * 60e3), '');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
