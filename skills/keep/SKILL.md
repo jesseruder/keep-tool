@@ -301,7 +301,8 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   The same rule applies without an explicit delegation: a Codex session started from a
   Claude session that owns an open card is refused an ordinary `keep add`. Contribute to
   that card with `keep checkin <card> -m "..."` (no claim needed), file a follow-up with
-  `--file`, or pass `--force` for deliberately independent work. `keep lint`'s
+  `--file`, or pass `--force` for deliberately independent work; a forced card records that
+  decision as its created entry. An explicitly ended delegation lifts the refusal. `keep lint`'s
   `handoff-shadow` rule flags the cards that slipped through: a worker's card older than
   six hours with no check-ins, whose parent Claude session was on another card.
 - Session completion notices are ephemeral unread-turn signals. Deliberately ending

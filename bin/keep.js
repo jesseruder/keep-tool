@@ -1372,14 +1372,12 @@ function parentClaudeSession(session) {
   return process.env.CLAUDE_CODE_SESSION_ID || null;
 }
 
-function shadowGuard() {
+// The open card this Codex session's parent Claude session owns, or null.
+function shadowOwner() {
   const parentId = parentClaudeSession(currentSession());
-  if (!parentId) return;
+  if (!parentId) return null;
   const owned = taskForSession(parentId);
-  if (!owned) return;
-  die(`this Codex session was started by claude ${parentId.slice(0, 8)}, which owns ${owned.id} ("${owned.fm.title}").\n`
-    + `  Contribute there with keep checkin ${owned.id} -m "..." (no claim needed), or have the parent register the step with keep delegate ${owned.id} --step <n> --prepare.\n`
-    + '  File deliberately independent work with --file, or pass --force to create a top-level card anyway.');
+  return owned ? { parentId, owned } : null;
 }
 
 commands.add = (argv) => {
@@ -1388,8 +1386,9 @@ commands.add = (argv) => {
   if (!title.trim()) die('usage: keep add "title" [--kind k] [--file|--claim] [--tag t] [--project p] [--plan "step" …] [--done-when "cmd"]… [--allow a,b] [--until when] [--autonomous] [--experiment-id id] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"] [--status s] [--force] [-m note]');
   if (o.file && o.claim) die('--file and --claim are mutually exclusive');
   const filesOnly = o.file || (!o.claim && o.kind === 'idea');
+  let assigned = { kind: 'none' };
   if (!filesOnly) {
-    const assigned = currentDelegation();
+    assigned = currentDelegation();
     if (['active', 'stale', 'pending', 'invalid', 'identity-mismatch'].includes(assigned.kind)) {
       die(`${delegation.describe(assigned)} To start independent work deliberately, end the delegation or file it with --file.`);
     }
@@ -1398,7 +1397,19 @@ commands.add = (argv) => {
   // it is opt-in and parents forget. Nine top-level cards in two days shadowed a
   // plan step of the card their parent Claude session owned, so the same refusal
   // fires on the implicit relationship the codex SessionStart hook recorded.
-  if (!filesOnly && !o.force) shadowGuard();
+  // `keep delegate --end` is the documented way to start independent work, so an
+  // explicitly ended delegation skips it: the codex-parents record outlives the end.
+  const shadow = !filesOnly && !(assigned.kind === 'ended' && assigned.explicit) ? shadowOwner() : null;
+  if (shadow && !o.force) {
+    die(`this Codex session was started by claude ${shadow.parentId.slice(0, 8)}, which owns ${shadow.owned.id} ("${shadow.owned.fm.title}").\n`
+      + `  Contribute there with keep checkin ${shadow.owned.id} -m "..." (no claim needed), or have the parent register the step with keep delegate ${shadow.owned.id} --step <n> --prepare.\n`
+      + '  File deliberately independent work with --file, or pass --force to create a top-level card anyway.');
+  }
+  // A forced card must not look abandoned: the lint rule flags a worker's card with
+  // no log entries, so record the deliberate decision as its created entry.
+  const forcedNote = shadow && !o.m
+    ? `Created with --force as independent of ${shadow.owned.id}, the card this worker's parent claude ${shadow.parentId.slice(0, 8)} owns.`
+    : undefined;
   const plan = splitPlanValues(o.plan || []).map((text) => ({ text: cleanPlanText(text), state: 'todo' }));
   applyDoneWhen(plan, o['done-when']);
   let grants = [];
@@ -1418,7 +1429,7 @@ commands.add = (argv) => {
     // whichever cwd later reads the card, so runs, `keep who`, and the session-start
     // hook all miss it. Refuse an unresolvable name rather than store it.
     title, kind: o.kind, tags: o.tag, project: o.project ? resolveProjectArg(o.project) : undefined,
-    checkAfter: o['check-after'], check: o.check, status: o.status, note: o.m,
+    checkAfter: o['check-after'], check: o.check, status: o.status, note: o.m || forcedNote,
     onPass: o['on-pass'], checkEvery: o['check-every'], probe: o.probe,
     experimentId: o['experiment-id'], force: o.force,
     claim: o.claim ? true : o.file ? false : undefined,

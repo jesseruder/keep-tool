@@ -439,3 +439,52 @@ test('the shadow guard lifts once the parent card is done', () => {
     assert.equal(fs.existsSync(path.join(f.root, 'tasks', 'next-piece-of-work.md')), true);
   } finally { f.cleanup(); }
 });
+
+test('an explicitly ended delegation lets a Codex worker of the owning Claude session add ordinary work', () => {
+  const f = fixture();
+  try {
+    const created = f.run(['add', 'Claude parent plan', '--status', 'active', '--plan', 'Implement alpha', 'Verify beta'], { CLAUDE_CODE_SESSION_ID: 'parent-session' });
+    assert.equal(created.status, 0, created.stderr);
+    const card = 'claude-parent-plan';
+    writeCodexParent(f.root, 'worker-session', 'parent-session');
+    const registration = f.run(['delegate', card, '--step', '1', '--session', 'worker-session', '--agent', 'codex'], { CLAUDE_CODE_SESSION_ID: 'parent-session' });
+    assert.equal(registration.status, 0, registration.stderr);
+    const id = registration.stdout.match(/registered delegation ([a-f0-9]{32})/)[1];
+    const workerEnv = { KEEP_DELEGATION_ID: id, CODEX_THREAD_ID: 'worker-session' };
+
+    const duringDelegation = f.run(['add', 'Too soon', '--status', 'active'], workerEnv);
+    assert.equal(duringDelegation.status, 1, duringDelegation.stdout);
+    assert.equal(fs.existsSync(path.join(f.root, 'tasks', 'too-soon.md')), false);
+
+    const ended = f.run(['delegate', '--end'], workerEnv);
+    assert.equal(ended.status, 0, ended.stderr);
+    // Without the token too: the ended record is found through the worker's own session.
+    for (const [title, env] of [['After end with token', workerEnv], ['After end without token', { CODEX_THREAD_ID: 'worker-session' }]]) {
+      const result = f.run(['add', title, '--status', 'active'], env);
+      assert.equal(result.status, 0, result.stderr);
+      const file = path.join(f.root, 'tasks', `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.md`);
+      assert.equal(fs.existsSync(file), true, file);
+    }
+  } finally { f.cleanup(); }
+});
+
+test('a forced add records why, so the handoff-shadow lint rule does not flag it later', () => {
+  const f = fixture();
+  try {
+    const card = parentOwnedCard(f);
+    writeCodexParent(f.root, 'worker-session', 'parent-session');
+    const forced = f.run(['add', 'Deliberately independent', '--force', '--status', 'active'], { CODEX_THREAD_ID: 'worker-session' });
+    assert.equal(forced.status, 0, forced.stderr);
+    const keepModule = require('./keep.js');
+    const forcedFile = path.join(f.root, 'tasks', 'deliberately-independent.md');
+    const forcedTask = keepModule.parseTask(fs.readFileSync(forcedFile, 'utf8'), 'deliberately-independent');
+    assert.match(forcedTask.body, new RegExp(`Created with --force as independent of ${card}`));
+
+    // The same card without that entry is exactly the shape the rule exists to flag,
+    // which proves the forced card passes because of its entry and nothing else.
+    const unmarked = { ...forcedTask, id: 'unmarked-copy', body: '' };
+    fs.writeFileSync(path.join(f.root, 'tasks', 'unmarked-copy.md'), keepModule.serializeTask(unmarked));
+    const result = require('./lint.js').lint({ root: f.root, rule: 'handoff-shadow', now: Date.now() + 7 * 3600e3 });
+    assert.deepEqual(result.findings.map((item) => item.id), ['unmarked-copy']);
+  } finally { f.cleanup(); }
+});
