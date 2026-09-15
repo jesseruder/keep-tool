@@ -14,7 +14,7 @@ or third-party plugin installed on the machine.
 | SessionStart context | Points both agents at the same skill file; no Claude-only `/keep` instruction. Includes a short scheduling/readiness reminder and warns against duplicating daemon-scheduled checks. |
 | Stop enforcement reminder | Says an unattended question may be missed, not that it is invisible; explicit input is already represented in the UI. |
 | In-thread scheduled delivery | Read-only scope, clear/reschedule recipe, and `--handoff needs-input` override are explicit. Message-size test preserves the full card lookup. |
-| Headless check prompt | Already read-only, fences historical context, requires `VERDICT:`; daemon lands its result. Deliberately not the same check-in workflow as interactive delivery. |
+| Scheduled check delivery | One instruction, identical for the card's linked thread and for the session Keep opens when there is none: run the recipe read-only, then record the outcome with `keep checkin`. The card's `check_on_pass` declaration is spelled out in it. There is no headless prompt and no `VERDICT:` line any more — the agent that runs the check writes the check-in itself. |
 | Dependency unblocks | Already fence upstream evidence as data and explicitly deny new deploy authority. |
 | Fleet review skill / compaction prompt | Preserve cross-day patterns; no per-tick compaction. Corrected batch count, nothing-new omissions, partial landing failures and exact scoped holds in the installed fleet-review skill. |
 | Global Claude/Codex instructions | Keep and review obligations remain compatible; tool-specific review mechanisms intentionally differ. Neither global file changed. |

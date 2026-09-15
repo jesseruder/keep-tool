@@ -73,17 +73,6 @@ test('session transcript growth resets its observation clock', () => {
   assert.deepEqual(stalled.detectStalledSessions(sessions, now, { stallMs: 15 * 60e3, observations: next }), []);
 });
 
-test('headless runs use a 30-minute threshold and ignore finished runs', () => {
-  const now = 2_000_000;
-  assert.deepEqual(stalled.detectStalledRuns([
-    { id: 'run-1', taskId: 'card-a', status: 'running', logMtime: now - 31 * 60e3 },
-    { id: 'run-2', taskId: 'card-b', status: 'running', logMtime: now - 20 * 60e3 },
-    { id: 'run-3', taskId: 'card-c', status: 'done', logMtime: now - 60 * 60e3 },
-  ], now), [
-    { kind: 'run', taskId: 'card-a', runId: 'run-1', idleMs: 31 * 60e3 },
-  ]);
-});
-
 test('Codex jobs are dead only when small, old, and absent from ps', () => {
   const now = Date.parse('2026-09-04T01:00:00Z');
   const jobs = [

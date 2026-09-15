@@ -131,24 +131,6 @@ function detectStalledSessions(sessions, now = Date.now(), options = {}) {
   return out;
 }
 
-function detectStalledRuns(runs, now = Date.now(), options = {}) {
-  const threshold = longStallMs(options);
-  const out = [];
-  for (const run of runs || []) {
-    if (!run || run.status !== 'running') continue;
-    const last = timeMs(run.logMtime ?? run.logMtimeMs, timeMs(run.startedAt));
-    const idleMs = Math.max(0, number(now) - last);
-    if (!last || idleMs < threshold) continue;
-    out.push({
-      kind: 'run',
-      taskId: String(run.taskId || ''),
-      runId: String(run.runId || run.id || ''),
-      idleMs,
-    });
-  }
-  return out;
-}
-
 function workerAlive(pid, deps = {}, job = null) {
   if (typeof deps.processAlive === 'function') return deps.processAlive(pid, job);
   // With a ps snapshot, the pid must still be this job's worker: a reused pid that now
@@ -420,17 +402,7 @@ function observeSessions(sessions, previous, now) {
   return next;
 }
 
-function enrichRunLogs(runs, options = {}) {
-  return (runs || []).map((run) => {
-    if (!run || run.status !== 'running') return run;
-    const logFile = run.logFile || (run.id ? path.join(rootOf(options), '.keep', 'runs', `${run.id}.jsonl`) : '');
-    try { return { ...run, logMtime: fs.statSync(logFile).mtimeMs }; }
-    catch { return { ...run, logMtime: timeMs(run.startedAt) }; }
-  });
-}
-
 function itemKey(item) {
-  if (item.kind === 'run') return `run:${item.runId}`;
   if (item.kind === 'orphan-shell') return `orphan-shell:${item.pid}`;
   if (item.kind === 'codex-job') return `codex-job:${item.stateRoot || ''}:${item.accountId || ''}:${item.id}`;
   return `${item.kind}:${item.id}`;
@@ -476,7 +448,6 @@ async function sweep(options = {}) {
   state = { version: 1, sessions: observations };
   saveState(state, options);
 
-  const runs = enrichRunLogs(options.runs || [], options);
   const discovery = await discoverCodexJobs({ ...options, now }, deps);
   let psOutput = options.psOutput == null ? '' : String(options.psOutput);
   let psKnown = options.psKnown !== false && options.psOutput != null;
@@ -500,7 +471,6 @@ async function sweep(options = {}) {
       cwd: item.cwd, status: item.state, reason: item.reason,
     })),
     ...detectStalledSessions(sessions, now, { ...options, observations }),
-    ...detectStalledRuns(runs, now, options),
     ...(discovery.known ? detectStalledCodexJobs(discovery.jobs, now, {
       ...options,
       processAlive: deps.processAlive || options.processAlive,
@@ -593,11 +563,10 @@ function bytes(value) {
 
 function attentionItems(items) {
   return (items || []).map((item) => {
-    const stableId = item.kind === 'run' ? item.runId : item.kind === 'orphan-shell' ? item.pid : item.id;
+    const stableId = item.kind === 'orphan-shell' ? item.pid : item.id;
     let text;
     if (item.kind === 'session' && item.label === 'quiet (tool running)') text = `quiet (tool running): ${item.agent} "${item.title}" with no transcript growth for ${duration(item.idleMs)}`;
     else if (item.kind === 'session') text = `Stalled: ${item.agent} "${item.title}" running with no transcript growth for ${duration(item.idleMs)}`;
-    else if (item.kind === 'run') text = `Stalled run: ${item.taskId} log idle ${duration(item.idleMs)}`;
     else if (item.kind === 'orphan-agent') text = `Orphan ${item.agent} pid ${item.pid}: ${item.reason}; keep codex-jobs --reap`;
     else if (item.kind === 'codex-broker') text = `Codex broker ${item.pid ?? item.stateDir} for ${item.cwd || '(unknown)'}: ${item.reason}`;
     else if (item.kind === 'codex-job' && item.status === 'dead' && item.reason === 'worker gone') text = `Dead Codex job ${item.id}${item.accountId ? ` for ${item.accountId}` : ''}: worker process gone (record still running); keep codex-jobs --reap`;
@@ -612,7 +581,6 @@ function attentionItems(items) {
       detail: item.kind === 'session' ? text : '',
       since: item.firstSeenAt || item.since || Date.now(),
       ...(item.kind === 'session' ? { sessionId: item.id, project: item.project } : {}),
-      ...(item.kind === 'run' && item.taskId ? { taskId: item.taskId } : {}),
     };
   });
 }
@@ -630,7 +598,6 @@ module.exports = {
   LONG_STALL_MS,
   DEAD_JOB_MS,
   detectStalledSessions,
-  detectStalledRuns,
   detectStalledCodexJobs,
   workerAlive,
   detectOrphanShells,

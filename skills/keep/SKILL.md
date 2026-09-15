@@ -37,7 +37,10 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   `--check-after` to reschedule). Otherwise Keep opens a fresh interactive Claude session
   on the card and types the same instruction into it — nothing runs headless. At most one
   such session per card per day, and none while the checks account's usage window is
-  exhausted (the card records a `check deferred` note and stays overdue).
+  exhausted (the card records a `check deferred` note and stays overdue). Keep closes the
+  session it opened once the check is on the card, or after an hour of silence — never
+  mid-turn, and never over an unsent draft or an open question. If it ends without
+  recording anything, the card says so and comes due again.
   `--check-after` on its own, with no `--check` and no `--probe`, schedules nothing
   — it only makes the card show up in `keep overdue`. Run one early with
   `keep verify <id>`.

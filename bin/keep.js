@@ -2673,19 +2673,16 @@ async function whoSnapshot(project) {
   const tasks = loadAll(false);
   const holds = activeHolds(project, Date.now(), { devices: true });
   let sessions = null;
-  let runs = [];
   try {
     const response = await getKeepApi('/api/state');
     if (response.status === 200) {
       const state = JSON.parse(response.data);
       sessions = Array.isArray(state.sessions) ? state.sessions : [];
-      runs = Array.isArray(state.runs) ? state.runs : [];
     }
   } catch {}
   return who.fleetSnapshot(project, {
     tasks,
     sessions,
-    runs,
     holds,
     deviceHolds: true,
     steps: stepRegistry.status(project, { tasks, holds: activeHolds(project) }),

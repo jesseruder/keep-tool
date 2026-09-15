@@ -121,12 +121,12 @@ test('fleetSnapshot and renderWho include every section and the short session id
   const snapshot = fleetSnapshot(project, {
     tasks,
     sessions: [{ id: 'abcdefgh123456', taskId: 'card-a', project: '/tmp/other', kind: 'codex', state: 'idle', mtime: now - 120e3, endedTurn: true, lastUser: 'working' }],
-    runs: [{ id: 'run-one', taskId: 'card-a', status: 'running' }],
     holds: [{ id: 'hold-one', project, until: new Date(now + 60e3).toISOString(), released: false, reason: 'quiet', by: { agent: 'claude', sessionId: 'holdsid123' } }],
     git: { available: false }, now,
   });
   const text = renderWho(snapshot);
-  for (const heading of ['cards:', 'sessions:', 'scheduled:', 'runs:', 'holds:', 'git: unavailable']) assert.match(text, new RegExp(heading));
+  for (const heading of ['cards:', 'sessions:', 'scheduled:', 'holds:', 'git: unavailable']) assert.match(text, new RegExp(heading));
+  assert.doesNotMatch(text, /^runs:/m, 'nothing runs headless, so there is no run section to render');
   assert.match(text, /abcdefgh/);
   assert.match(text, /card-a/);
   assert.match(text, /card-b/);

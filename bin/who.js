@@ -55,7 +55,6 @@ function fleetSnapshot(project, input) {
   const normalized = normalizeProject(project);
   const allTasks = Array.isArray(data.tasks) ? data.tasks : [];
   const sourceSessions = data.sessions === null ? null : (Array.isArray(data.sessions) ? data.sessions : []);
-  const sourceRuns = Array.isArray(data.runs) ? data.runs : [];
   const sourceHolds = Array.isArray(data.holds) ? data.holds : [];
   const sourceSteps = data.steps && Array.isArray(data.steps.steps) ? data.steps.steps : [];
   // State notes arrive already split into active and expired-unconfirmed by
@@ -116,7 +115,6 @@ function fleetSnapshot(project, input) {
     };
   }).sort((a, b) => a.due.localeCompare(b.due));
 
-  const runs = sourceRuns.filter((run) => run && run.status === 'running' && taskIds.has(run.taskId));
   // deviceHolds: the caller asked for other projects' shared-device holds too.
   const holds = sourceHolds.filter((hold) => hold && !hold.released && Date.parse(hold.until) > now
     && (normalizeProject(hold.project) === normalized
@@ -128,7 +126,6 @@ function fleetSnapshot(project, input) {
     cards,
     sessions: sessionRows,
     scheduled,
-    runs,
     holds,
     notes: sourceNotes,
     steps: sourceSteps,
@@ -163,10 +160,6 @@ function renderWho(snapshot) {
   for (const item of snapshot.scheduled) {
     out.push(`  - ${item.taskId} · ${item.due}${item.overdue ? ' · OVERDUE' : ''} · ${item.recipe}`);
   }
-
-  out.push('runs:');
-  if (!snapshot.runs.length) out.push('  (none)');
-  for (const run of snapshot.runs) out.push(`  - ${run.id || '(unnamed)'} · ${run.taskId} · running`);
 
   out.push(`holds:${snapshot.holdScopes?.length ? ` matching ${snapshot.holdScopes.join(', ')} (plus project-wide holds)` : ''}`);
   if (!snapshot.holds.length) out.push('  (none)');

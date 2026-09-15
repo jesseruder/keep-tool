@@ -97,6 +97,8 @@ keep slack poll [--dry]
 keep slack status
 keep slack mode log|cards|alerts
 keep verify <id>       # run a check recipe now, in its thread or a fresh session (needs keep serve)
+                       # Owner-initiated: never refused by, and never counted against,
+                       # the scheduler's one-open-per-card-per-day allowance
 keep compact <sid>     # compact a live Claude or Codex session (needs keep serve)
 keep resume [--raw]    # post-restart: active tasks + keep open commands (--raw prints the bare CLI form)
 keep setup hooks [--account <id>]  # install the Keep hooks in every managed Claude account
@@ -550,6 +552,12 @@ runs. An exhausted window (budget code 6 or 7) is recorded as a healthy skip; a 
 that cannot be read at all (code 8) is recorded as a **failure**, so `consecutiveFailures`
 climbs and the brief shows it rather than the sweep dying silently behind a green row.
 
+Headless run logs written by Keep before scheduled checks became sessions
+(`.keep/runs/*.jsonl` and `*.diff`) are orphaned: nothing reads or removes them, and they
+can be deleted by hand. A headless run that was still in flight when the daemon was
+upgraded is dropped — its result was never landed, and its card comes due again on the
+next tick.
+
 The ideas sweep, standup and Slack classification are the only model calls Keep still
 makes headless (they are one-shot generators, not agents). They disable
 `codex@openai-codex` by default; set `KEEP_HEADLESS_DISABLED_PLUGINS` to a
@@ -866,17 +874,40 @@ thread that is mid-turn or waiting on the owner defers the check for 120 schedul
 (about two hours) by default (`KEEP_DELIVER_MAX_DEFERRALS`) before Keep opens a session
 instead; if no linked pane is open, Keep opens one immediately.
 
+A stamp written for a session Keep opened carries a two-hour TTL, unlike a thread
+delivery stamp, which stands until the schedule moves: a thread has Owner watching it,
+while a session Keep opened by itself has nobody to notice that it died. When the TTL
+passes with no result, the stamp is discarded and the card is simply due again.
+
 Keep opens at most one scheduler session per card per local day and three per scheduler
-tick. It opens none at all while the `checks` automation account's weekly or 5h window is
-exhausted: that records one `check deferred` check-in per card per day, changes neither
-the status nor the schedule, and leaves the card overdue for the tick after the reset. An
-*unreadable* usage snapshot is not treated as no budget — that would stop every card on
-the board.
+tick. That bookkeeping is persisted to `.keep/runs/scheduler-state.json`, so a daemon
+restart does not hand every card a second pane. It opens none at all while the `checks`
+automation account's weekly or 5h window is exhausted: that records one `check deferred`
+check-in per card per day (at most three cards a tick; the rest are logged only),
+changes neither the status nor the schedule, and leaves the card overdue for the tick
+after the reset. An *unreadable* usage snapshot is not treated as no budget — that would
+stop every card on the board. `KEEP_CHECK_MODEL`, when set, is both the model the opened
+session is launched with and the model the budget is classified against, so the window
+Keep checks is the window Keep spends; unset, the session takes the model in
+settings.json and the budget is read against the reviewer's model as a proxy.
 
 Sessions Keep opens this way are marked `ephemeral: check` on their host pane. A sweep in
 the same scheduler tick closes such a pane once its session has ended its turn and the
-card carries a newer check-in, or after 60 minutes with no check-in at all. A session
-mid-turn is never closed.
+card carries a check-in from that session since the launch, or after 60 minutes with no
+check-in at all. A session mid-turn is never closed. The close runs through the
+automatic-retirement path: an unsent draft, a modal prompt, a pending question,
+unverified background work, or a session that changed under the sweep all refuse the
+close outright — the pane is left alone and reconsidered next tick, never signalled
+anyway — and the signals that do follow a successful `/exit` are guarded by pid, session
+id and input/output counts. A pane the sweep closed is then removed from the terminal
+host so a dead one is not re-decided every minute. Restarting such a pane, or moving it
+to another account, drops the `ephemeral` mark: it becomes an ordinary session that
+nothing reaps.
+
+If a scheduler-opened session is reaped without having written anything to its card,
+Keep clears the delivery stamp, records one `check session <id8> ended without recording
+a result` check-in, and grants that card one extra open for the day, so a crashed session
+can never make a check disappear until tomorrow.
 
 If transcript verification shows that a scheduled-check prompt arrived truncated,
 Keep still stamps it as delivered to avoid typing the prompt twice, then adds a
@@ -903,8 +934,11 @@ no recipe, lands the failure for Owner review. An escalation opens a session on 
 and its message begins with what the probe already saw (exit code and a 300-character
 output tail) so the recipe starts from the failure. The same schedule is not re-probed
 more often than every ten minutes, and a card whose fingerprint changed while the probe
-ran keeps its status and schedule. Run one by hand with `keep probe <id>` — same
-execution semantics, no check-in, no daemon, exit 1 when it fails.
+ran keeps its status and schedule. An escalation spends from the same allowance as the
+scheduler — the per-card daily open, the per-tick cap and the account budget — so a
+probe failing every ten minutes is not a way around any of them. Run one by hand with
+`keep probe <id>` — same execution semantics, no check-in, no daemon, exit 1 when it
+fails.
 
 Cards that skip thread delivery entirely: anything with a `probe`, and any recurring
 (`check_on_pass: rearm`) recipe card. Both go straight to a session Keep opens, because
