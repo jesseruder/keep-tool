@@ -209,7 +209,8 @@ function collect(root, tasks, options = {}) {
   initialize(root, tasks, now);
   const ledger = read(file, null);
   if (!ledger) throw new Error('card usage ledger is missing; restore it from backup instead of resetting totals');
-  const owners = options.owners || read(path.join(dir(root), 'owners.json'), {});
+  // Folding leaves new facts unassigned; owners are resolved after every transcript read.
+  const noOwners = {};
   if (ledger.version !== 1) throw new Error('unsupported card usage ledger version');
   if (!fs.existsSync(path.join(dir(root), 'initialized.json'))) write(path.join(dir(root), 'initialized.json'), { since: ledger.since });
   ledger.excluded ||= {};
@@ -261,7 +262,7 @@ function collect(root, tasks, options = {}) {
       if (!line.trim()) continue;
       let record;
       try { record = JSON.parse(line); } catch { ledger.issues.malformedRecord = true; continue; }
-      fold(ledger, c, record, owners, root, authority);
+      fold(ledger, c, record, noOwners, root, authority);
     }
     c.offset += end + 1;
     c.anchor = anchor(source.file, c.offset);
@@ -275,6 +276,10 @@ function collect(root, tasks, options = {}) {
     const link = read(path.join(root, '.keep', 'codex-parents', `${sid}.json`), null);
     if (link?.parent) session.parent = key('claude', link.parent);
   }
+  // Read owners only after the transcripts, without Keep's lock (recordOwner renames
+  // atomically). A link recorded after this read is timestamped after every row read
+  // above, so it cannot change their attribution; an earlier snapshot could.
+  const owners = read(path.join(dir(root), 'owners.json'), {});
   // Parent metadata may be discovered after child usage, or on a later pass.
   for (const fact of Object.values(ledger.facts)) {
     if (!fact.card) fact.card = sessionOwner(ledger, owners, fact.session, fact.at);
@@ -311,14 +316,11 @@ function forCard(summary, id) {
 module.exports = { recordOwner, ownerAt, normalize, fold, initialize, collect, snapshot, forCard, summarize, discover };
 if (require.main === module) {
   const keep = require('./keep.js');
-  // Hold Keep's lock only to seed and snapshot owners. The scan reads transcripts and
-  // writes card-usage's own files for seconds; under the lock it starved every command.
+  // Hold Keep's lock only to seed a new ledger. The scan reads transcripts and writes
+  // card-usage's own files for seconds; under the lock it starved every command.
   try {
-    const owners = keep.withLock(() => {
-      initialize(keep.ROOT, () => keep.loadAll(true));
-      return read(path.join(dir(keep.ROOT), 'owners.json'), {});
-    });
-    collect(keep.ROOT, [], { owners });
+    keep.withLock(() => initialize(keep.ROOT, () => keep.loadAll(true)));
+    collect(keep.ROOT, []);
   }
   catch (e) { process.stderr.write(`card usage: ${e.message}\n`); process.exitCode = 1; }
 }
