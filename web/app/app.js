@@ -171,13 +171,30 @@ const setAsideWrites = new Map();
 const setAsideSettles = new Map();
 function beginSetAsideWrite(key) {
   const token = {};
-  setAsideSettles.set(key, { token, settledAt: null });
+  // Remember what this click replaces, so a failed write falls back to the previous
+  // click (still pending or already committed) instead of a possibly stale snapshot.
+  const prior = setAsideSettles.has(key)
+    ? { settle: setAsideSettles.get(key), entry: optimisticSetAside.get(key) } : null;
+  setAsideSettles.set(key, { token, settledAt: null, prior });
   return token;
+}
+function rollBackSetAsideWrite(key, token) {
+  const current = setAsideSettles.get(key);
+  // A newer click on this key owns the optimistic entry; only roll back our own.
+  if (current?.token !== token) return;
+  if (current.prior) {
+    setAsideSettles.set(key, current.prior.settle);
+    optimisticSetAside.set(key, current.prior.entry);
+  } else {
+    setAsideSettles.delete(key);
+    optimisticSetAside.delete(key);
+  }
 }
 function settleSetAsideWrite(key, token) {
   const current = setAsideSettles.get(key);
   if (current?.token !== token) return false;
   current.settledAt = reloadGeneration;
+  current.prior = null; // committed: a later failed click falls back to this one
   return true;
 }
 function queueSetAsideWrite(key, write) {
@@ -391,11 +408,7 @@ async function setAside(item, kind = 'dismiss', minutes) {
       : kind === 'running' ? 'Moved to Running & waiting. A new message or a new turn brings it back.'
       : kind === 'snooze' ? 'Snoozed for 1 hour.' : 'Dismissed. Restore it from the collapsed row.', { label: 'Undo', run: () => restore(key) });
   } catch (error) {
-    // A newer click on this key owns the optimistic entry; only roll back our own.
-    if (setAsideSettles.get(key)?.token === token) {
-      setAsideSettles.delete(key);
-      optimisticSetAside.delete(key);
-    }
+    rollBackSetAsideWrite(key, token);
     deriveDismissed();
     refresh();
     toast(`Could not set aside: ${error.message}`);
@@ -414,10 +427,7 @@ async function restore(key) {
     settleSetAsideWrite(key, token);
     toast('Back in the queue.');
   } catch (error) {
-    if (setAsideSettles.get(key)?.token === token) {
-      setAsideSettles.delete(key);
-      optimisticSetAside.delete(key);
-    }
+    rollBackSetAsideWrite(key, token);
     deriveDismissed();
     refresh();
     toast(`Could not restore: ${error.message}`);
