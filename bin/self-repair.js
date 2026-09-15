@@ -779,7 +779,12 @@ function cardForSession(sessionId, root = keep.ROOT) {
 // `Landed <branch> onto <default>`, with the pushed sha in that entry's
 // `commits:` field. That entry is the land record, and the sha in it is the only
 // thing worth checking.
-const LAND_ENTRY_RE = /^Landed\b[^\n]*\bonto\b/m;
+//
+// Matched as a whole line and nothing looser. The session this gates can write
+// check-ins, so prose that merely mentions landing something onto something —
+// "Landed the test harness onto the branch", a quoted log line — must not read as
+// a land record next to an unrelated sha.
+const LAND_ENTRY_RE = /^Landed \S+ onto \S+?(?: \(review record [^)\n]+\))?\.$/m;
 
 function landedShas(task) {
   const review = require('./review.js');
@@ -824,6 +829,14 @@ function landedFor(cardId, root = keep.ROOT, options = {}) {
   catch (error) { return { landed: false, sha: '', why: `${id} could not be read: ${clip(error && error.message || error, 120)}` }; }
   const shas = landedShas(task);
   if (!shas.length) return { landed: false, sha: '', why: `${id} carries no \`keep land\` check-in citing a commit` };
+  // Corroboration the session cannot write with a check-in: a repair card carries
+  // no `--allow` grants (an agent session cannot set them), so its land can only
+  // have gone through the reviewed-patch path, which needs a clean record. A card
+  // with no such record did not land, whatever its log says.
+  const records = (options.readRecords || ((value) => require('./reviews.js').readRecords(value, root)))(id);
+  if (!(Array.isArray(records) && records.some((record) => record && record.verdict === 'clean'))) {
+    return { landed: false, sha: shas[0], why: `${id} has no clean \`keep reviewed\` record, so nothing landed through \`keep land\`` };
+  }
   const checkouts = options.checkouts || mainCheckouts();
   const isAncestor = options.isAncestor || onOriginDefault;
   for (const sha of shas) {

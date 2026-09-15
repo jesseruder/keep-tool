@@ -1610,6 +1610,14 @@ function makeRepo() {
   return { repo, landedSha, localSha };
 }
 
+function writeReview(root, id, verdict = 'clean') {
+  const dir = path.join(root, '.keep', 'reviews');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify([
+    { id: 'rev-abc', at: '2026-09-15T11:00:00.000Z', by: 'codex sol', verdict, commits: [] },
+  ]) + '\n');
+}
+
 test('landedFor answers from the keep land check-in and the live checkout refs', () => {
   const root = makeRoot();
   const { repo, landedSha, localSha } = makeRepo();
@@ -1622,31 +1630,48 @@ test('landedFor answers from the keep land check-in and the live checkout refs',
     ].join('\n');
 
     writeCard(root, 'repair-landed', landedEntry(landedSha));
+    writeReview(root, 'repair-landed');
     const yes = selfRepair.landedFor('repair-landed', root, { checkouts });
     assert.equal(yes.landed, true);
     assert.equal(yes.sha, landedSha);
 
     // Pushed nowhere: the sha is real, but it is not on origin/master.
     writeCard(root, 'repair-local', landedEntry(localSha));
+    writeReview(root, 'repair-local');
     const notYet = selfRepair.landedFor('repair-local', root, { checkouts });
     assert.equal(notYet.landed, false);
     assert.match(notYet.why, /is not on origin's default branch/);
 
     // A sha this checkout has never heard of is not a land either.
     writeCard(root, 'repair-unknown', landedEntry('deadbee1deadbee2deadbee3deadbee4deadbee5'));
+    writeReview(root, 'repair-unknown');
     assert.equal(selfRepair.landedFor('repair-unknown', root, { checkouts }).landed, false);
 
-    // Every other check-in on the card, however much it talks about landing.
+    // Every other check-in on the card, however much it talks about landing. The
+    // session can write these, so prose next to a real sha must not read as a land.
     writeCard(root, 'repair-talk', [
       '## 2026-09-15 12:00 — check-in',
       `Fix is ready to land on master as ${landedSha}; keep allow refused it.`,
       '',
       '## 2026-09-15 11:00 — check-in',
-      'Landed the test harness onto the branch.',
+      'Landed the test harness onto the branch, so the suite runs there now.',
+      `commits: ${landedSha}`,
     ].join('\n'));
     const talk = selfRepair.landedFor('repair-talk', root, { checkouts });
     assert.equal(talk.landed, false);
     assert.match(talk.why, /no `keep land` check-in citing a commit/);
+
+    // A card with the right line and the right sha, but no review record: a repair
+    // card carries no grants, so nothing could have landed through `keep land`.
+    writeCard(root, 'repair-unreviewed', landedEntry(landedSha));
+    const unreviewed = selfRepair.landedFor('repair-unreviewed', root, { checkouts });
+    assert.equal(unreviewed.landed, false);
+    assert.match(unreviewed.why, /no clean `keep reviewed` record/);
+    writeReview(root, 'repair-unreviewed', 'findings');
+    assert.equal(selfRepair.landedFor('repair-unreviewed', root, { checkouts }).landed, false,
+      'a findings record is not authority for a land either');
+    writeReview(root, 'repair-unreviewed', 'clean');
+    assert.equal(selfRepair.landedFor('repair-unreviewed', root, { checkouts }).landed, true);
 
     // The land is found wherever it sits in the log, not only at the top.
     writeCard(root, 'repair-older', [
@@ -1655,6 +1680,7 @@ test('landedFor answers from the keep land check-in and the live checkout refs',
       '',
       landedEntry(landedSha),
     ].join('\n'));
+    writeReview(root, 'repair-older');
     assert.equal(selfRepair.landedFor('repair-older', root, { checkouts }).landed, true);
 
     // No card, a card that is not there, and a card id nobody can parse.
@@ -1682,6 +1708,21 @@ test('landedShas reads only the shas keep land cited', () => {
     ].join('\n'),
   });
   assert.deepEqual(shas, ['aaaaaaa1111', 'bbbbbbb2222']);
+  // Only the whole line `keep land` writes, not prose that mentions landing.
+  assert.deepEqual(selfRepair.landedShas({
+    body: [
+      '## 2026-09-15 12:00 — check-in',
+      'Landed the fix onto master by hand after a lot of trouble.',
+      'commits: aaaaaaa1111',
+    ].join('\n'),
+  }), []);
+  assert.deepEqual(selfRepair.landedShas({
+    body: [
+      '## 2026-09-15 12:00 — check-in',
+      'Landed wt/self-repair-abcd1234 onto master.',
+      'commits: aaaaaaa1111',
+    ].join('\n'),
+  }), ['aaaaaaa1111']);
   assert.deepEqual(selfRepair.landedShas({ body: '' }), []);
   assert.deepEqual(selfRepair.landedShas(null), []);
 });
