@@ -358,10 +358,13 @@ function commandSession() {
   return currentSession();
 }
 
-function resumeCommand(session, env = process.env) {
-  try {
-    if (require('./accounts').list(env).some((account) => account.managed)) return `keep open ${session.id}`;
-  } catch {}
+// Always `keep open <id>` now, whether or not any account is managed. A raw
+// `claude --resume` outside the host loses the pane binding, the account, the
+// permissions flags and the MCP config, and `keep hook pre-bash` refuses it; a
+// command Keep prints must not be one Keep then blocks. `--raw` is the escape
+// hatch for a human who knows what they are giving up.
+function resumeCommand(session, env = process.env, { raw = false } = {}) {
+  if (!raw) return `keep open ${session.id}`;
   return `${session.agent === 'codex' ? 'codex resume' : 'claude --resume'} ${session.id}`;
 }
 
@@ -4734,8 +4737,8 @@ commands.restore = async (argv, deps = {}) => {
 };
 
 commands.resume = async (argv, deps = {}) => {
-  const o = parseArgs(argv || [], {});
-  if (o._.length) die('usage: keep resume');
+  const o = parseArgs(argv || [], { raw: 'bool' });
+  if (o._.length) die('usage: keep resume [--raw]');
   const tasks = (deps.loadAll || loadAll)(false).filter((t) => ['active', 'review', 'landing'].includes(t.fm.status));
   const unblocked = require('./unblock.js').readRecords({ root: ROOT }).filter((record) => !record.deliveredAt);
   if (!tasks.length && !unblocked.length) return console.log('nothing active');
@@ -4750,7 +4753,7 @@ commands.resume = async (argv, deps = {}) => {
     const s = (t.fm.sessions || [])[t.fm.sessions ? t.fm.sessions.length - 1 : 0];
     if (s) {
       const proj = t.fm.project ? `cd ${t.fm.project} && ` : '';
-      console.log(color('90', `      ${proj}${resumeCommand(s)}`));
+      console.log(color('90', `      ${proj}${resumeCommand(s, process.env, { raw: Boolean(o.raw) })}`));
     }
   }
 };
@@ -5114,9 +5117,11 @@ commands.hook = async (argv) => {
     return;
   }
   if (argv[0] === 'pre-bash') {
-    // the only hook that blocks: a gated step's command without its claim
+    // the only hook that blocks: a gated step's command without its claim, and a
+    // raw `claude --resume` that would start a session outside Keep's launcher
     try {
-      const decision = guardStepCommand(input);
+      let decision = guardResumeCommand(input);
+      if (!decision.deny) decision = guardStepCommand(input);
       if (decision.deny) {
         process.stderr.write(`${decision.reason}\n`);
         process.exitCode = 2;
@@ -5798,6 +5803,53 @@ function guardStepCommand(input, now = Date.now()) {
     };
   }
   return { deny: false, reason: '', ctx };
+}
+
+// ---------- the raw `claude --resume` guard ----------
+
+// On 2026-09-09 a session was resumed by hand (session 39f6a38a, pane fa942244)
+// and the resume dropped `--dangerously-skip-permissions`, so the resumed
+// session's classifier denied a CronCreate it had been launched to make. A raw
+// `claude --resume` outside the host loses more than that: the Stop hook still
+// fires, so the session registers with no KEEP_PANE binding, no accountId (which
+// can throw "exists in multiple accounts without authority"), no --mcp-config,
+// no model, no pre-trust — and ambient credentials leak into it.
+//
+// `keep open <session-id>` is the path that keeps all of that. The host's own
+// resume carries KEEP_PANE, so this never sees it.
+const CLAUDE_BINARIES = new Set(['claude', 'clauded']);
+const CLAUDE_RESUME_FLAG_RE = /^(?:--resume|-r|--continue|-c)(?:=|$)/;
+// An inline `KEEP_RAW_CLAUDE=1 claude --resume …`: the assignment never reaches
+// this process's env, and stripCommandWrappers drops it before the guard sees it.
+const INLINE_BYPASS_RE = /(?:^|[\s;&|(])KEEP_RAW_CLAUDE=[^\s;&|)]+/;
+
+// The first `claude`/`clauded` invocation in a command that carries a resume flag,
+// however the command is wrapped. `bash -lc "claude --resume x"` counts;
+// `echo "claude --resume"` does not, because `echo` is the executable there.
+function rawClaudeResume(value) {
+  for (const command of stepRegistry.normalizedCommands(value)) {
+    const tokens = stepRegistry.commandTokens(command);
+    if (!tokens.length || !CLAUDE_BINARIES.has(stepRegistry.commandBasename(tokens[0]))) continue;
+    const flag = tokens.slice(1).find((token) => CLAUDE_RESUME_FLAG_RE.test(token));
+    if (flag) return { command, flag };
+  }
+  return null;
+}
+
+function guardResumeCommand(input, env = process.env) {
+  if (!input || input.tool_name !== 'Bash') return { deny: false, reason: '' };
+  const command = input.tool_input && input.tool_input.command;
+  if (!command) return { deny: false, reason: '' };
+  // KEEP_PANE means the host launched this shell, so its `claude --resume` is the
+  // launcher's own and must never be blocked.
+  if (env.KEEP_PANE || env.KEEP_RAW_CLAUDE) return { deny: false, reason: '' };
+  if (INLINE_BYPASS_RE.test(String(command))) return { deny: false, reason: '' };
+  const found = rawClaudeResume(command);
+  if (!found) return { deny: false, reason: '' };
+  return {
+    deny: true,
+    reason: `keep guard: \`${found.command}\` — raw claude --resume bypasses Keep's launcher (pane binding, account, permissions flags); use \`keep open <session-id>\` — or set KEEP_RAW_CLAUDE=1 to bypass`,
+  };
 }
 
 const STEP_FAILURE_RE = /(?:^|\n)\s*(?:Error:|Error \[|╷|Build '[^']*' errored|Some builds didn't complete|FAILED|Terraform encountered an error)/;
@@ -7713,6 +7765,9 @@ function helpText() {
   keep init [--dir path]   # create a separate private registry
   keep doctor              # diagnose this installation
   keep setup hooks         # install Claude hooks and shared agent skills
+  keep setup --shell [--write]
+                           # print (or write to ~/.zshrc) a zsh claude() that routes
+                           # --resume/-r/--continue/-c through keep open; KEEP_RAW_CLAUDE=1 bypasses
   keep service install|start|stop|restart|status
   keep add "title" [--kind task|experiment|idea|chore|bug] [--file|--claim] [--tag t]… [--project p]
                    [--plan "step" …] [--done-when "cmd"]… [--allow a,b] [--until when]
@@ -7842,7 +7897,7 @@ ${stepUsage()}
              screen <pane> [--lines n] [--scrollback n] | kill <pane> | clear <pane> | rm <pane>]
                          # no subcommand runs it in the foreground; shutdown ends every pane
   keep attach <pane> [--raw] [--observer]
-  keep resume            # post-restart: active tasks + agent-aware resume commands
+  keep resume [--raw]    # post-restart: active tasks + keep open commands (--raw prints the bare CLI form)
   keep restore [--dry] [--since +48h|hours] [--project path]
                          # reopen sessions whose agent process is gone
   keep sync              # pull --rebase + push
@@ -7962,7 +8017,7 @@ module.exports = {
   projectMatchesCwd, looksLikeGitWrite, normalizeProjectPath, resolveProjectArg, activeHolds,
   openNeeds, addNeed, meetNeeds, sweepNeeds,
   taskForSession, newestTaskForSession, readCodexParent, deployCommand, deployEntry, recordDeploy, redactCommand,
-  stepMatchForInput, guardStepCommand, recordStepRun, codexToolInput, codexExitCode,
+  stepMatchForInput, guardStepCommand, guardResumeCommand, rawClaudeResume, recordStepRun, codexToolInput, codexExitCode,
   codexJobText, renderCodexJobs,
   codexCommandCli: commands.codex,
   commandUsage, helpText, formatOpenResult, openCommand: commands.open, postOpen, OPEN_MESSAGE_LIMIT, OPEN_MESSAGE_ERROR, LAUNCH_MODEL_RE,
@@ -7985,7 +8040,8 @@ commands.reviewer = async (args) => {
 commands.init = (args) => require('./setup').init(args);
 commands.doctor = () => require('./setup').doctor(ROOT);
 commands.setup = (args) => {
-  if (args.length !== 1 || args[0] !== 'hooks') throw new KeepError('usage: keep setup hooks');
+  if (args.includes('--shell')) return require('./setup').shell(args);
+  if (args.length !== 1 || args[0] !== 'hooks') throw new KeepError('usage: keep setup hooks | keep setup --shell [--write]');
   return require('./setup').installHooks();
 };
 commands.service = (args) => require('./setup').service(args, ROOT);

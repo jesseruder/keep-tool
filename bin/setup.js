@@ -125,6 +125,68 @@ function installHooks() {
   console.log('Codex event hooks are version-dependent; see docs/agent-hooks.md for the adapter commands.');
 }
 
+// ---------- the shell-side half of the raw-resume guard ----------
+
+// `keep hook pre-bash` catches an agent's raw `claude --resume`. Nothing catches
+// Owner's own typing, and that is where the 2026-09-09 incident came from: a
+// by-hand resume that dropped --dangerously-skip-permissions (the `clauded`
+// alias), so the resumed session's classifier denied the CronCreate it existed to
+// make.
+//
+// A shell *function* rather than an alias, and `command claude` inside it: the
+// `clauded` alias expands to this function, so the aliased spelling is guarded
+// too, and --dangerously-skip-permissions passes straight through.
+const SHELL_START = '# >>> keep shell >>>';
+const SHELL_END = '# <<< keep shell <<<';
+
+function shellBlock() {
+  return [
+    SHELL_START,
+    '# keep: route session resumes through the launcher',
+    'claude() {',
+    '  if [ -z "$KEEP_PANE" ] && [ -z "$KEEP_RAW_CLAUDE" ]; then',
+    '    for a in "$@"; do',
+    '      case "$a" in --resume|-r|--continue|-c)',
+    `        echo "keep: use 'keep open <session-id>' to resume (KEEP_RAW_CLAUDE=1 claude ... to bypass)" >&2; return 1;;`,
+    '      esac',
+    '    done',
+    '  fi',
+    '  command claude "$@"',
+    '}',
+    SHELL_END,
+  ].join('\n');
+}
+
+// Replaces the marked block if it is already there, appends it if it is not, and
+// is a no-op when the file already holds exactly this block.
+function applyShellBlock(text, block) {
+  const start = text.indexOf(SHELL_START);
+  const end = text.indexOf(SHELL_END);
+  if (start !== -1 && end > start) return text.slice(0, start) + block + text.slice(end + SHELL_END.length);
+  const prefix = text && !text.endsWith('\n') ? `${text}\n` : text;
+  return `${prefix}${prefix ? '\n' : ''}${block}\n`;
+}
+
+function shell(args, home = os.homedir()) {
+  const unknown = args.find((arg) => arg !== '--shell' && arg !== '--write');
+  if (unknown) throw new Error('usage: keep setup --shell [--write]');
+  const block = shellBlock();
+  if (!args.includes('--write')) {
+    console.log(block);
+    console.error(`Not written. Append it to ${path.join(home, '.zshrc')} yourself, or run keep setup --shell --write.`);
+    return;
+  }
+  const file = path.join(home, '.zshrc');
+  const existing = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+  const next = applyShellBlock(existing, block);
+  if (next === existing) {
+    console.log(`${file} already has the keep shell block.`);
+    return;
+  }
+  fs.writeFileSync(file, next);
+  console.log(`Wrote the keep shell block to ${file}. Open a new shell, or run: source ${file}`);
+}
+
 function servicePlist(kind, root, envPath = process.env.PATH || '') {
   const label = `games.castle.keep.${kind}`;
   const env = { PATH: envPath, KEEP_NODE: process.execPath, KEEP_DIR: root, KEEP_CONFIG: config.configFile(), LANG: process.env.LANG || 'en_US.UTF-8' };
@@ -182,4 +244,7 @@ function doctor(root) {
   if (failed) process.exitCode = 1;
 }
 
-module.exports = { init, installHooks, service, doctor, mergeHooks, servicePlist, quote, canonicalPath, insideSource };
+module.exports = {
+  init, installHooks, service, doctor, mergeHooks, servicePlist, quote, canonicalPath, insideSource,
+  shell, shellBlock, applyShellBlock, SHELL_START, SHELL_END,
+};

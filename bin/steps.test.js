@@ -966,3 +966,62 @@ test('a shell running a script file names the script, and the awkward spellings 
   assert.equal(verdict('FOO=bar git push'), 'push');
   assert.equal(verdict(['bash', '-lc', 'FOO=bar git push']), 'push');
 });
+
+// ---------- the raw `claude --resume` guard ----------
+
+test('the pre-bash guard refuses a raw claude --resume and leaves everything else alone', () => {
+  const keep = require('./keep.js');
+  const bash = (command) => ({ tool_name: 'Bash', tool_input: { command } });
+  const clean = { KEEP_PANE: '', KEEP_RAW_CLAUDE: '' };
+  const denied = (command, env = clean) => keep.guardResumeCommand(bash(command), env).deny;
+
+  for (const command of [
+    'claude --resume 39f6a38a',
+    'claude -r 39f6a38a',
+    'claude --continue',
+    'claude -c',
+    'clauded --resume 39f6a38a',
+    'bash -lc "claude --resume 39f6a38a"',
+    '/bin/zsh -lic \'exec claude --resume 39f6a38a\'',
+    'cd ~/wt/keep-tool/x && claude --resume 39f6a38a',
+    '/usr/local/bin/claude --dangerously-skip-permissions --resume 39f6a38a',
+  ]) assert.equal(denied(command), true, command);
+
+  for (const command of [
+    'claude',
+    'claude --version',
+    'claude -p "how do I use --resume?"',
+    'echo "claude --resume 39f6a38a"',
+    'grep -- --resume notes.md',
+    'codex resume 39f6a38a',
+    'keep open 39f6a38a',
+  ]) assert.equal(denied(command), false, command);
+
+  // The host's own launcher always carries KEEP_PANE, and must never be blocked.
+  assert.equal(denied('claude --resume 39f6a38a', { KEEP_PANE: 'pane-7' }), false);
+  assert.equal(denied('claude --resume 39f6a38a', { KEEP_RAW_CLAUDE: '1' }), false);
+  // The inline spelling of the bypass never reaches this process's environment.
+  assert.equal(denied('KEEP_RAW_CLAUDE=1 claude --resume 39f6a38a'), false);
+
+  const reason = keep.guardResumeCommand(bash('claude --resume 39f6a38a'), clean).reason;
+  assert.match(reason, /raw claude --resume bypasses Keep's launcher \(pane binding, account, permissions flags\)/);
+  assert.match(reason, /use `keep open <session-id>` — or set KEEP_RAW_CLAUDE=1 to bypass/);
+
+  // End to end through the hook: exit 2 is the deny, and a plain claude passes.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-resume-guard-'));
+  try {
+    const env = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', KEEP_PORT: '65432', KEEP_PANE: '', KEEP_RAW_CLAUDE: '' };
+    const hook = (command) => spawnSync(process.execPath, [KEEP, 'hook', 'pre-bash'], {
+      cwd: root, encoding: 'utf8', env,
+      input: JSON.stringify({ session_id: 'raw-resume', cwd: root, tool_name: 'Bash', tool_input: { command } }),
+    });
+    const blocked = hook('claude --resume 39f6a38a');
+    assert.equal(blocked.status, 2, blocked.stderr);
+    assert.match(blocked.stderr, /keep guard: .*raw claude --resume bypasses Keep's launcher/);
+    assert.equal(hook('claude --version').status, 0);
+    assert.equal(spawnSync(process.execPath, [KEEP, 'hook', 'pre-bash'], {
+      cwd: root, encoding: 'utf8', env: { ...env, KEEP_RAW_CLAUDE: '1' },
+      input: JSON.stringify({ session_id: 'raw-resume', cwd: root, tool_name: 'Bash', tool_input: { command: 'claude --resume 39f6a38a' } }),
+    }).status, 0, 'the documented bypass works');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

@@ -143,3 +143,65 @@ test('local-only Git identity cannot leave a partially initialized registry', ()
     assert.equal(fs.readdirSync(tmp).some((name) => name.startsWith('.keep-init-')), false);
   } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 });
+
+test('keep setup --shell prints the guard, --write is idempotent, and a non-resume call still reaches claude', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-setup-shell-'));
+  const home = path.join(base, 'home');
+  const fakeBin = path.join(base, 'bin');
+  const capture = path.join(base, 'args.json');
+  fs.mkdirSync(home); fs.mkdirSync(fakeBin);
+  const cli = path.join(__dirname, 'keep.js');
+  const env = { ...process.env, HOME: home, ZDOTDIR: home, KEEP_NO_PUSH: '1' };
+  delete env.KEEP_CONFIG;
+  const run = (...args) => spawnSync(process.execPath, [cli, 'setup', ...args], { env, encoding: 'utf8', timeout: 15000 });
+  try {
+    // --shell prints and writes nothing.
+    const printed = run('--shell');
+    assert.equal(printed.status, 0, printed.stderr);
+    assert.match(printed.stdout, /# >>> keep shell >>>/);
+    assert.match(printed.stdout, /^claude\(\) \{$/m);
+    assert.match(printed.stdout, /command claude "\$@"/, 'command claude, so the clauded alias is guarded too');
+    assert.match(printed.stdout, /\[ -z "\$KEEP_PANE" \] && \[ -z "\$KEEP_RAW_CLAUDE" \]/);
+    assert.equal(fs.existsSync(path.join(home, '.zshrc')), false, '--shell alone never writes');
+
+    fs.writeFileSync(path.join(home, '.zshrc'), 'export EXISTING=1');
+    assert.equal(run('--shell', '--write').status, 0);
+    const first = fs.readFileSync(path.join(home, '.zshrc'), 'utf8');
+    assert.match(first, /^export EXISTING=1$/m, 'the existing rc is preserved');
+    assert.match(first, /# <<< keep shell <<</);
+    assert.equal(run('--shell', '--write').status, 0);
+    assert.equal(fs.readFileSync(path.join(home, '.zshrc'), 'utf8'), first, 'a second write changes nothing');
+
+    // An edited block is replaced, not duplicated.
+    fs.writeFileSync(path.join(home, '.zshrc'), first.replace('  command claude "$@"', '  command claude --stale "$@"'));
+    assert.equal(run('--shell', '--write').status, 0);
+    const third = fs.readFileSync(path.join(home, '.zshrc'), 'utf8');
+    assert.equal(third, first);
+    assert.equal(third.split(setup.SHELL_START).length - 1, 1, 'exactly one block');
+
+    // The function itself: a resume is refused, everything else reaches claude with every arg.
+    fs.writeFileSync(path.join(fakeBin, 'claude'), `#!${process.execPath}\n`
+      + `require('node:fs').writeFileSync(process.env.ARG_CAPTURE, JSON.stringify(process.argv.slice(2)));\n`, { mode: 0o755 });
+    const zsh = (line, extra = {}) => spawnSync('/bin/zsh', ['-c',
+      `source ${JSON.stringify(path.join(home, '.zshrc'))} >/dev/null 2>&1; ${line}`],
+    { env: { ...env, PATH: `${fakeBin}:${process.env.PATH}`, ARG_CAPTURE: capture, KEEP_PANE: '', KEEP_RAW_CLAUDE: '', ...extra }, encoding: 'utf8' });
+
+    const refused = zsh('claude --resume 39f6a38a');
+    assert.equal(refused.status, 1);
+    assert.match(refused.stderr, /keep: use 'keep open <session-id>' to resume/);
+
+    fs.rmSync(capture, { force: true });
+    const passed = zsh('claude --dangerously-skip-permissions --model opus -p hello');
+    assert.equal(passed.status, 0, passed.stderr);
+    assert.deepEqual(JSON.parse(fs.readFileSync(capture, 'utf8')),
+      ['--dangerously-skip-permissions', '--model', 'opus', '-p', 'hello'],
+      'every argument reaches claude untouched on a non-resume call');
+
+    // Both bypasses.
+    fs.rmSync(capture, { force: true });
+    assert.equal(zsh('claude --resume 39f6a38a', { KEEP_RAW_CLAUDE: '1' }).status, 0);
+    assert.deepEqual(JSON.parse(fs.readFileSync(capture, 'utf8')), ['--resume', '39f6a38a']);
+    fs.rmSync(capture, { force: true });
+    assert.equal(zsh('claude --resume 39f6a38a', { KEEP_PANE: 'pane-7' }).status, 0);
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
+});

@@ -51,12 +51,16 @@ test('profile environment isolates managed credentials while native no-config be
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
-test('resume hints route configured profiles through authoritative keep open', () => {
+test('resume hints route every profile through authoritative keep open; only --raw prints the CLI form', () => {
   const f = fixture();
   try {
     const session = { id: 'resume-me', agent: 'claude' };
     assert.equal(require('./keep.js').resumeCommand(session, f.env), 'keep open resume-me');
-    assert.equal(require('./keep.js').resumeCommand(session, { KEEP_DIR: path.join(f.root, 'legacy') }), 'claude --resume resume-me');
+    // A single unmanaged account used to get `claude --resume`, which `keep hook
+    // pre-bash` now refuses — Keep must not print a command it blocks.
+    assert.equal(require('./keep.js').resumeCommand(session, { KEEP_DIR: path.join(f.root, 'legacy') }), 'keep open resume-me');
+    assert.equal(require('./keep.js').resumeCommand(session, f.env, { raw: true }), 'claude --resume resume-me');
+    assert.equal(require('./keep.js').resumeCommand({ id: 'x', agent: 'codex' }, f.env, { raw: true }), 'codex resume x');
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
