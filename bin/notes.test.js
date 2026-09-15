@@ -376,3 +376,17 @@ test('the announce path excludes the author even when the ledger would list it',
     fs.rmSync(notes.notesDir(root), { recursive: true, force: true });
   }
 });
+
+test('sanitize strips bidi overrides, zero-width characters, and odd spaces', () => {
+  const root = makeRoot();
+  try {
+    const note = seed(root, { message: 'staging' + '\u202e' + ' is' + '\u200b' + 'home-only' + '\u00a0' + 'now' + '\u2066' });
+    assert.equal(note.message, 'staging is home-only now');
+    assert.equal(/[\p{Cf}\p{Zl}\p{Zp}]/u.test(note.message), false);
+    // The compatibility spelling of a separator is the same separator.
+    assert.equal(notes.scrub('a' + '\u3000' + 'b'), 'a b');
+    // And what is stored is what the watcher would have been willing to deliver.
+    const live = require('./watcher-live.js');
+    assert.equal(live.safeDeliveryText(notes.announcementFor(note, 'create')) !== null, true);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

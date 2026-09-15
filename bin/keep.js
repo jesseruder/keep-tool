@@ -3049,7 +3049,8 @@ function renderResourceRegistry(registry) {
   if (!names.length) lines.push('  (none)');
   for (const name of names) {
     const declaration = registry.resources[name] || {};
-    lines.push(`  ${name}${declaration.title ? ` — ${declaration.title}` : ''}`
+    const title = resources.titleOf(declaration);
+    lines.push(`  ${name}${title ? ` — ${title}` : ''}`
       + `  · note for ${resources.noteForOf(declaration)}`);
     for (const pattern of declaration.commands || []) lines.push(`      command: ${pattern}`);
     for (const pattern of declaration.paths || []) lines.push(`      path:    ${pattern}`);
@@ -3110,7 +3111,7 @@ commands.resources = (argv) => {
     }
     const registry = resources.loadResources(project);
     const declaration = { ...(registry && registry.resources[name]) || {} };
-    if (o.title) declaration.title = cleanScalar(o.title, 'title');
+    if (o.title) declaration.title = resources.clean(cleanScalar(o.title, 'title'), 120);
     if (o.command) declaration.commands = [...new Set([...(declaration.commands || []), ...o.command])];
     if (o.path) declaration.paths = [...new Set([...(declaration.paths || []), ...o.path])];
     if (o.deploy) declaration.deploys = [...new Set([...(declaration.deploys || []), ...o.deploy])];

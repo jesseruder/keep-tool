@@ -63,12 +63,22 @@ test('a path matcher is a glob over the turn files, absolute or relative', () =>
   const relative = resources.touchedResources({ files: ['terraform/staging/net.tf'] }, STAGING);
   assert.deepEqual(relative.map((row) => row.name), ['staging']);
   assert.equal(relative[0].evidence, 'file terraform/staging/net.tf');
-  const absolute = resources.touchedResources(
-    { files: ['/Users/someone/castle/castle-sandboxes/terraform/main.tf'] },
-    { project: '~/castle/castle-sandboxes', resources: STAGING },
-  );
-  assert.deepEqual(absolute.map((row) => row.name), ['staging']);
+  const declared = { project: '~/castle/castle-sandboxes', resources: STAGING };
+  const inside = path.join(os.homedir(), 'castle/castle-sandboxes/terraform/main.tf');
+  assert.deepEqual(resources.touchedResources({ files: [inside] }, declared).map((row) => row.name), ['staging']);
   assert.deepEqual(resources.touchedResources({ files: ['docs/terraform.md'] }, STAGING), []);
+});
+
+test('a relative glob does not match the same name in somebody else\'s tree', () => {
+  // Only the path as written and the path relative to the declaring project are
+  // candidates. Matching every trailing sub-path would make terraform/main.tf a
+  // match for a vendored copy of a different file.
+  assert.deepEqual(resources.touchedResources({ files: ['vendor/foo/terraform/main.tf'] }, STAGING), []);
+  assert.deepEqual(resources.touchedResources(
+    { files: ['/somewhere/else/castle-sandboxes/terraform/main.tf'] },
+    { project: '~/castle/castle-sandboxes', resources: STAGING },
+  ), []);
+  assert.deepEqual(resources.fileCandidates('/a/b/c/d.tf', '/a/b'), ['/a/b/c/d.tf', 'c/d.tf']);
 });
 
 test('a deploy matcher is <kind>:<target substring> over deployCommand results', () => {
@@ -212,4 +222,28 @@ test('the session-start hook names declared resources on this project', () => {
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('evidence and titles are scrubbed of bidi overrides and zero-width characters', () => {
+  const bidi = 'terraform apply ' + '\u202e' + ' --auto';
+  const touched = resources.touchedResources({ commands: [bidi] }, STAGING);
+  assert.equal(touched.length, 1);
+  assert.equal(/[\p{Cf}]/u.test(touched[0].evidence), false, touched[0].evidence);
+  assert.match(touched[0].evidence, /^command terraform apply .*--auto$/);
+  // Replaced with a space rather than deleted: silently joining two words is how
+  // a scrubber invents a word nobody wrote.
+  assert.equal(resources.clean('zero' + '\u200b' + 'width'), 'zero width');
+  assert.equal(resources.titleOf({ title: 'staging' + '\u202e' + ' box' }), 'staging box');
+  assert.equal(resources.clean('<<<fence>>>'), '---fence---');
+});
+
+test('a read-only keep notes does not count as saying something', () => {
+  const turn = { session_id: 'abc' };
+  const base = { declarations: STAGING, commands: ['terraform apply'] };
+  assert.deepEqual(
+    resources.observe(turn, { ...base, commands: ['terraform apply', 'keep notes'] }).map((row) => row.name),
+    ['staging'],
+    'reading the notes is not writing one',
+  );
+  assert.deepEqual(resources.observe(turn, { ...base, commands: ['terraform apply', 'keep note x --scope staging -m "y" --for +2h'] }), []);
 });

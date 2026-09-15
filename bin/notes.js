@@ -62,16 +62,34 @@ function atMs(value) {
 }
 
 // Agent-written text that ends up in another session's terminal, a model's
-// context, and the reviewer bundle. Same treatment as review.js lintField: strip
-// the control planes, neutralise the fence markers, collapse the whitespace.
-function sanitize(value, limit = MESSAGE_LIMIT) {
-  return String(value == null ? '' : value)
-    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ')
+// context, and the reviewer bundle. Stripping C0/C1 and the fence markers is not
+// enough: a bidi override (U+202E) reorders what a reader sees without changing a
+// byte of what was stored, a zero-width space hides a word boundary, and an
+// isolate can swallow the rest of a line. bin/watcher-live.js refuses text like
+// that outright, because a delivered message has to be the one Owner graded; a
+// note is stored rather than delivered verbatim, so the same class is stripped
+// here instead. Same set either way: controls, format characters, line and
+// paragraph separators, and every space that is not a plain one.
+const SCRUB_CLASS_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu;
+const SCRUB_SPACE_RE = /[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/g;
+
+// Folded first: a compatibility spelling of a separator is the same separator,
+// and stripping only the canonical one leaves the lookalike standing.
+function scrub(value) {
+  const text = String(value == null ? '' : value);
+  const folded = (() => { try { return text.normalize('NFKC'); } catch { return text; } })();
+  return folded
+    .replace(SCRUB_CLASS_RE, ' ')
+    .replace(SCRUB_SPACE_RE, ' ')
     .replace(/<<<|>>>/g, '---')
     .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, limit);
+    .trim();
 }
+
+function sanitize(value, limit = MESSAGE_LIMIT) {
+  return scrub(value).slice(0, limit);
+}
+
 
 // ---------- storage ----------
 
@@ -335,7 +353,7 @@ function startScheduler(options = {}) {
 
 module.exports = {
   MESSAGE_LIMIT, RETENTION_MS, EXPIRED_VISIBLE_MS, SWEEP_EVERY_MS, ANNOUNCE_PREFIX,
-  defaultRoot, notesDir, noteFile, projectKey, sanitize, stampOf,
+  defaultRoot, notesDir, noteFile, projectKey, scrub, sanitize, stampOf,
   loadNotes, allNotes, findNote, addNote, extendNote, clearNote, writeFileNotes,
   activeNotes, describeNote, announcementFor, nagFor,
   dueForNag, markNagged, sweep, startScheduler,

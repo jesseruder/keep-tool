@@ -18,6 +18,11 @@ const path = require('path');
 const os = require('os');
 
 const steps = require('./steps.js');
+// Declarations are hand-authored, but the evidence quoted back out of them comes
+// from a turn's own commands and files. Both end up in a terminal, a prompt, and
+// the reviewer bundle, so both go through the same scrubber a note's message
+// does — bidi overrides and zero-width characters included.
+const { scrub } = require('./notes.js');
 
 // Read the env per call: a test root is set before the CLI runs, and a module
 // constant captured at require time would point at the operator's registry.
@@ -173,17 +178,17 @@ function normalizeCommands(commands) {
   return [...new Set(out)];
 }
 
-// A turn's files arrive as whatever the tool was handed: an absolute path from
-// an edit, a relative one from a shell command. A declaration is written
-// relative to the project, so every trailing sub-path is a candidate.
+// A turn's files arrive as whatever the tool was handed: an absolute path from an
+// edit, a relative one from a shell command. Two candidates only — the path as
+// written, and the path relative to the declaring project. Matching every
+// trailing sub-path as well would make `terraform/main.tf` match
+// `vendor/foo/terraform/main.tf`, which is a different file in a different tree.
 function fileCandidates(file, project) {
   const text = String(file == null ? '' : file).replace(/\\/g, '/').replace(/^\.\//, '');
   if (!text) return [];
   const candidates = new Set([text]);
   const base = project ? String(steps.expandProject(project)).replace(/\\/g, '/').replace(/\/$/, '') : '';
   if (base && text.startsWith(base + '/')) candidates.add(text.slice(base.length + 1));
-  const parts = text.replace(/^\//, '').split('/');
-  for (let i = 1; i < parts.length; i += 1) candidates.add(parts.slice(i).join('/'));
   return [...candidates];
 }
 
@@ -205,9 +210,17 @@ function matchesDeploy(pattern, deploy) {
   return String(deploy.target || '').toLowerCase().includes(target);
 }
 
-function clipEvidence(value, limit = 80) {
-  const text = String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
+function clean(value, limit = 80) {
+  const text = scrub(value);
   return text.length > limit ? text.slice(0, limit - 1) + '…' : text;
+}
+
+const clipEvidence = clean;
+
+// A hand-authored label, but it is rendered into a terminal and read back by a
+// session, so it gets the same treatment.
+function titleOf(resource) {
+  return clean((resource && resource.title) || '', 120);
 }
 
 // The pure matcher. Returns one row per touched resource, with the first piece
@@ -257,7 +270,9 @@ function noteForOf(resource) {
 // A turn that already said something about shared state needs no reminder. The
 // head has to be `keep` at an executable position (bin/steps.js decided that
 // above) and the verb one of these; `grep "keep note"` is not a check-in.
-const STATE_VERBS = new Set(['note', 'notes', 'checkin', 'hold']);
+// `keep notes` is deliberately absent: reading the notes is not writing one, and
+// a session that only looked still owes the fleet a sentence.
+const STATE_VERBS = new Set(['note', 'checkin', 'hold']);
 
 function saysSomething(commands) {
   return normalizeCommands(commands).some((command) => {
@@ -303,7 +318,7 @@ module.exports = {
   defaultRoot, resourcesDir, registryFile,
   registeredResources, loadResources, saveResources,
   resourceMap, declaredNames, validName, noteForOf,
-  compileCommandMatchers, badMatchers,
+  compileCommandMatchers, badMatchers, clean, clipEvidence, titleOf,
   normalizeCommands, fileCandidates, matchesPath, matchesDeploy,
   touchedResources, saysSomething, observe, describeTouched,
 };
