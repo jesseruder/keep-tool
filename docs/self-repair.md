@@ -91,17 +91,34 @@ running, and a second one on the same fault is the one thing this must not do.
 (the old wall-clock cap) and then stops, so a card the old code opened cannot wedge
 its signature forever.
 
-Each tick checks the recorded pane against the host. A pane that has exited clears
-`sessionId`/`pane` and checks in once, so the resume path relaunches it — still
-capped at three attempts. And before it opens anything, a launch asks the host
+Each tick checks the recorded session against the host, matching by session id as
+well as pane id so an in-place restart or an account handoff does not read as an
+exit. A dead reading only starts a clock (`deadSince`); the sweep acts when a later
+tick still sees it dead **10 minutes on**, and a live reading in between clears the
+clock. When it does act it sets `relaunchDue` and deliberately leaves `sessionId`
+in place — nulling it would disarm KEEP_REPAIR for a session that turns out to be
+alive — and the relaunch overwrites it. An empty pane list, or no host at all,
+counts as "could not tell" and changes nothing. The sweep only looks at signatures
+that are still firing and whose card is still open; anything else belongs to the
+resolve path, and it says nothing about a card it is not going to touch.
+
+The cap is on **sessions spent**, not on launches that failed to start: the attempt
+is recorded before the launch runs, so a launch that throws cannot retry every tick,
+and a successful relaunch counts too. After `MAX_LAUNCH_ATTEMPTS` (3) the card is
+told so once and nothing more happens for that signature until `--reset`. And before it opens anything, a launch asks the host
 whether the card already has a live pane **that this scheduler spawned** — the
 launch stamps `repair: true` into the pane meta, alongside `card` — so a spawn
 response lost after the pane came up does not become a second agent, while a
 session Owner or a reviewer opened on the same card is never mistaken for the
 repair agent and adopted as one.
 
-`--reset` refuses only while the card is genuinely live: a card that is `done` or
-`archived`, or an entry whose launch was never confirmed, clears.
+`--reset` refuses while the recorded session is still running — clearing the entry
+would take KEEP_REPAIR away from a live agent mid-repair and let the next tick open
+a second card on the same fault. The CLI asks the terminal host directly; if it
+cannot be reached and the launch was never confirmed, it refuses for 90 minutes and
+says to check the pane. Otherwise it refuses only while the card is genuinely live:
+a card that is `done` or `archived` clears. A refused reset never drops the recorded
+session.
 
 Every change goes through one synchronous read-modify-write helper — atomic only
 because nothing inside it awaits, the same constraint as `review.js`'s
@@ -191,7 +208,11 @@ card rather than throwing inside the daemon loop.
 gets it from `deps.launchEnv`; every later one — `restartSession`,
 `forceRestartSession`, the account handoff, a reopen — has only a session id, so
 serve.js's `repairEnvFor` asks `self-repair.isRepairSession(id)` whether that id is
-recorded in the repair state, and re-sets the marker if it is. The repair *card* is
+recorded in the repair state, and re-sets the marker if it is. The marker therefore
+follows the recorded session id: if that record is lost — `state.json` deleted or
+corrupt — the marker lapses for a session that is still running, and the guard stops
+refusing it. An unreadable state file is logged for that reason rather than passed
+over in silence. The repair *card* is
 deliberately not the test: Owner opening his own session on one to look at the fix
 would otherwise inherit a refusal on `keep restart-daemon`, which is the restart he
 is there to do. `deps.launchEnv` is internal only: an `env` or `launchEnv` key in an
