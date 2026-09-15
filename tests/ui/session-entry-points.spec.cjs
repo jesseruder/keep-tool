@@ -38,7 +38,7 @@ test('rail chooser cancels without spawning and freezes one explicit agent launc
   await expect(chooser(page).locator('[data-launch-directory]')).toHaveValue(directory);
   await expect(chooser(page).locator('[data-launch-model]')).toHaveValue('claude-fable-5-1');
   await chooser(page).locator('[data-launch-account]').selectOption('claude-two');
-  await chooser(page).locator('[data-launch-model]').fill('claude-sonnet-4-5');
+  await chooser(page).locator('[data-launch-model]').selectOption('claude-sonnet-5');
   await chooser(page).locator('[data-launch-submit]').click();
   await expect(chooser(page).locator('[data-launch-kind]')).toBeDisabled();
   await expect(chooser(page).locator('[data-launch-account]')).toBeDisabled();
@@ -50,7 +50,7 @@ test('rail chooser cancels without spawning and freezes one explicit agent launc
   await expect(chooser(page)).not.toBeVisible();
   expect(requests('/api/open')).toHaveLength(1);
   expect(requests('/api/open')[0].body).toMatchObject({ fresh: true, cwd: directory,
-    agent: 'claude', accountId: 'claude-two', model: 'claude-sonnet-4-5' });
+    agent: 'claude', accountId: 'claude-two', model: 'claude-sonnet-5' });
   expect(typeof requests('/api/open')[0].body.requestId).toBe('string');
   expect(requests('/api/panes/spawn')).toHaveLength(0);
 });
@@ -218,7 +218,7 @@ test('partial review launch closes the picker and exposes its persisted recovery
   await page.locator('[data-review-action=start]').click();
   await expect(chooser(page).locator('[data-launch-directory]')).toHaveCount(0);
   await chooser(page).locator('[data-launch-account]').selectOption('claude-two');
-  await chooser(page).locator('[data-launch-model]').fill('claude-fable-5-1');
+  await chooser(page).locator('[data-launch-model]').selectOption('claude-fable-5-1');
   await chooser(page).locator('[data-launch-submit]').click();
   await expect(chooser(page)).not.toBeVisible();
   await expect(page.locator('[data-review-detail="idea:partial"] .review-action-error')).toContainText('delivery could not be confirmed');
@@ -241,11 +241,13 @@ test('card fallback and review actions send exact provider account and model cho
   await expect(chooser(page).locator('[data-launch-model]')).toHaveValue('claude-fable-5-1');
   await chooser(page).locator('[data-launch-kind]').selectOption('codex');
   await chooser(page).locator('[data-launch-account]').selectOption('codex-two');
-  await chooser(page).locator('[data-launch-model]').fill('gpt-5.6');
+  await expect(chooser(page).locator('[data-launch-model]')).toHaveValue('');
+  await chooser(page).locator('[data-launch-model]').selectOption('gpt-5.6-sol');
+  await expect(chooser(page).locator('[data-launch-model-custom]')).toHaveCount(0);
   await chooser(page).locator('[data-launch-submit]').click();
   await expect(chooser(page)).not.toBeVisible();
   expect(requests('/api/open').at(-1).body).toMatchObject({ taskId: 'card-fresh', fresh: true,
-    agent: 'codex', accountId: 'codex-two', model: 'gpt-5.6' });
+    agent: 'codex', accountId: 'codex-two', model: 'gpt-5.6-sol' });
 
   fixture.state.reviewQueue.items.push({ id: 'idea:chooser', type: 'idea', card: 'card-review', title: 'Chooser idea',
     body: 'Test explicit review launch settings.', project: fixture.state.sessions[0].project, status: 'needs-decision', at: Date.now(), sessions: [] });
@@ -255,12 +257,15 @@ test('card fallback and review actions send exact provider account and model cho
   await page.locator('[data-review-action=start]').click();
   await chooser(page).locator('[data-launch-kind]').selectOption('codex');
   await chooser(page).locator('[data-launch-account]').selectOption('codex-two');
-  await chooser(page).locator('[data-launch-model]').fill('gpt-5.6');
+  await chooser(page).locator('[data-launch-model]').selectOption('__other__');
+  await expect(chooser(page).locator('[data-launch-model-custom]')).toBeFocused();
+  await chooser(page).locator('[data-launch-model-custom]').fill('gpt-5.6');
   await chooser(page).locator('[data-launch-submit]').click();
   await expect(chooser(page).locator('[role=alert]')).toContainText('Fixture review launch failed');
   await expect(chooser(page).locator('[data-launch-kind]')).toHaveValue('codex');
   await expect(chooser(page).locator('[data-launch-account]')).toHaveValue('codex-two');
-  await expect(chooser(page).locator('[data-launch-model]')).toHaveValue('gpt-5.6');
+  await expect(chooser(page).locator('[data-launch-model]')).toHaveValue('__other__');
+  await expect(chooser(page).locator('[data-launch-model-custom]')).toHaveValue('gpt-5.6');
   await chooser(page).locator('[data-launch-submit]').click();
   await expect(chooser(page)).not.toBeVisible();
   const launchedReview = fixture.state.sessions.find(session => session.id.startsWith('review-'));

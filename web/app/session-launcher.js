@@ -2,6 +2,13 @@ let dialog;
 let runSequence = 0;
 
 const labels = { shell: 'Plain shell', claude: 'Claude Code', codex: 'Codex' };
+// Offered in the model dropdown; "Other…" still accepts any id the CLI takes.
+const modelPresets = {
+  claude: ['claude-fable-5-1', 'claude-fable-5-1[1m]', 'claude-opus-5', 'claude-opus-5[1m]', 'claude-sonnet-5', 'claude-haiku-4-5-20251001'],
+  codex: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5'],
+};
+const OTHER_MODEL = '__other__';
+const isCustomModel = (kind, model) => !!model && !(modelPresets[kind] || []).includes(model);
 
 function ensureDialog() {
   if (dialog?.isConnected) return dialog;
@@ -39,8 +46,11 @@ export function openSessionChooser(ctx, options) {
       claude: options.models?.claude ?? (options.agent === 'claude' ? options.model || '' : ''),
       codex: options.models?.codex ?? (options.agent === 'codex' ? options.model || '' : ''),
     },
+    customModel: {},
     error: '', busy: false, bound: false,
   };
+
+  for (const kind of ['claude', 'codex']) state.customModel[kind] = isCustomModel(kind, state.models[kind]);
 
   const render = () => {
     const choices = state.kind === 'shell' ? [] : accountsFor(ctx, state.kind);
@@ -55,8 +65,14 @@ export function openSessionChooser(ctx, options) {
       const suffix = account.id === options.accountId ? ' · current' : account.isDefault ? ' · default' : '';
       return `<option value="${ctx.esc(account.id)}" ${account.id === state.accountId ? 'selected' : ''}>${ctx.esc((account.label || account.id) + suffix)}</option>`;
     }).join('')}</select></label>`;
+    const locked = state.busy || state.bound ? 'disabled' : '';
+    const model = state.models[state.kind] || '';
+    const customModel = !!state.customModel[state.kind];
+    const selectedModel = customModel ? OTHER_MODEL : model;
+    const modelOptions = [['', 'Account default'], ...(modelPresets[state.kind] || []).map((id) => [id, id]), [OTHER_MODEL, 'Other…']];
     const modelField = state.kind === 'shell' || options.showModel === false ? ''
-      : `<label>Model <span>Optional; blank uses the account default</span><input data-launch-model autocomplete="off" ${state.busy || state.bound ? 'disabled' : ''} value="${ctx.esc(state.models[state.kind] || '')}" placeholder="Account default"></label>`;
+      : `<label>Model<select data-launch-model ${locked}>${modelOptions.map(([value, text]) => `<option value="${ctx.esc(value)}" ${value === selectedModel ? 'selected' : ''}>${ctx.esc(text)}</option>`).join('')}</select>${customModel
+        ? `<input data-launch-model-custom aria-label="Model id" autocomplete="off" spellcheck="false" ${locked} value="${ctx.esc(model)}" placeholder="Model id, e.g. gpt-5.6-sol">` : ''}</label>`;
     const projectField = options.editableDirectory
       ? `<label class="wide">Directory <span>Absolute path to an existing directory</span><input data-launch-directory autocomplete="off" spellcheck="false" ${state.busy || state.bound ? 'disabled' : ''} value="${ctx.esc(state.directory)}" placeholder="/absolute/path/to/project"></label>`
       : `<div class="session-launch-value wide"><span>Project</span><strong class="mono">${ctx.esc(options.project || 'Unknown project')}</strong></div>`;
@@ -79,7 +95,15 @@ export function openSessionChooser(ctx, options) {
       state.accountId = event.target.value;
       if (wasEmpty) render();
     });
-    modal.querySelector('[data-launch-model]')?.addEventListener('input', (event) => { state.models[state.kind] = event.target.value; });
+    modal.querySelector('[data-launch-model]')?.addEventListener('change', (event) => {
+      if (state.busy) return;
+      const custom = event.target.value === OTHER_MODEL;
+      state.customModel[state.kind] = custom;
+      if (!custom) state.models[state.kind] = event.target.value;
+      render();
+      queueMicrotask(() => modal.querySelector(custom ? '[data-launch-model-custom]' : '[data-launch-model]')?.focus());
+    });
+    modal.querySelector('[data-launch-model-custom]')?.addEventListener('input', (event) => { state.models[state.kind] = event.target.value; });
     modal.querySelector('[data-launch-directory]')?.addEventListener('input', (event) => { state.directory = event.target.value; });
     modal.querySelectorAll('[data-launch-cancel]').forEach((button) => button.addEventListener('click', () => { if (!state.busy) modal.close(); }));
     modal.querySelector('[data-launch-transfer]')?.addEventListener('click', () => { if (!state.busy) { modal.close(); options.onTransfer(); } });
