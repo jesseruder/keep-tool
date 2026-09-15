@@ -210,12 +210,43 @@ function recordTime(record) {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-// A record by a named human is testimony; a record an agent wrote about its own
-// work is not, unless it cites the job or the evidence that produced it.
-function selfAttested(record) {
-  if (/^human\b/i.test(String(record && record.by || ''))) return false;
-  return !String(record && record.job || '').trim() && !String(record && record.evidence || '').trim();
+// Prose short enough to be a reflex ("clean", "looks fine") is not evidence.
+// Mirrors reviews.EVIDENCE_MINIMUM, which cannot be required here: reviews.js
+// requires keep.js, which requires this module.
+const EVIDENCE_MINIMUM = 80;
+
+// What is wrong with this record as authority, or '' when nothing is.
+//
+// None of this is a boundary — an agent that writes card files directly can write
+// anything. It is an audit trail with a bar in front of it: every clean record
+// says who reviewed and points at something a reader can go and check, and the
+// cheap paths to a self-issued land grant ("--by human", "--evidence clean", a
+// --job nobody can resolve) are closed.
+function attestationFailure(record) {
+  const by = String(record && record.by || '');
+  const job = String(record && record.job || '').trim();
+  // A verified job carries the account whose jobs directory answered. A record
+  // with a job id and no account never went through that check.
+  const verifiedJob = job && String(record && record.jobAccountId || '').trim();
+  const evidence = String(record && record.evidence || '').trim();
+  if (/^human\b/i.test(by)) {
+    // A record written from inside an agent session is never human testimony,
+    // whatever `by` says. `keep reviewed` refuses to write one; a hand-edited
+    // file can still hold one.
+    return record && record.bySession ? 'is marked human but was written from inside an agent session' : '';
+  }
+  if (/^codex\b/i.test(by)) {
+    return verifiedJob ? '' : 'is a Codex review with no verified --job';
+  }
+  // opus / claude: a subagent review leaves no job file, so evidence carries it.
+  if (verifiedJob) return '';
+  if (evidence.length >= EVIDENCE_MINIMUM) return '';
+  return evidence
+    ? `cites ${evidence.length} characters of evidence, under the ${EVIDENCE_MINIMUM} required without a verified --job`
+    : 'is an agent self-attestation with no --job or --evidence';
 }
+
+function selfAttested(record) { return Boolean(attestationFailure(record)); }
 
 function decideLand({ grants = [], records = [], commits = [], optOut = '', worktree = null, now = Date.now() } = {}) {
   const tokens = (grants || []).map((grant) => (typeof grant === 'string' ? parseToken(grant, 'grant') : grant));
@@ -236,8 +267,9 @@ function decideLand({ grants = [], records = [], commits = [], optOut = '', work
     if (newest.verdict !== 'clean') {
       return { ok: false, implicit: true, why: `no land grant, and the newest review of ${label} is ${newest.verdict} (record ${newest.id}) — fix it and record a clean review`, record: newest };
     }
-    if (selfAttested(newest)) {
-      return { ok: false, implicit: true, why: `no land grant, and review record ${newest.id} for ${label} is an agent self-attestation with no --job or --evidence`, record: newest };
+    const attestation = attestationFailure(newest);
+    if (attestation) {
+      return { ok: false, implicit: true, why: `no land grant, and review record ${newest.id} for ${label} ${attestation}`, record: newest };
     }
     used.push(newest);
   }
@@ -347,6 +379,6 @@ function coversStop(task, text, opts = {}) {
 module.exports = {
   AllowError, KNOWN_ACTIONS,
   parseToken, formatToken, tokenKey, parseGrants, readGrants, expiryState, expired, decide, askSpan,
-  decideLand, coveringRecords, selfAttested,
+  decideLand, coveringRecords, selfAttested, attestationFailure, EVIDENCE_MINIMUM,
   INTENT, intents, coversStop,
 };

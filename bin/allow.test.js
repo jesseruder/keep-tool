@@ -260,7 +260,8 @@ const COMMIT_B = { sha: 'bbbbbbb2222222222222222222222222222222bb', patchId: 'p-
 function record(over = {}) {
   return {
     id: 'rev-1', at: '2026-09-07T11:00:00.000Z', by: 'codex sol', job: 'job_abc',
-    verdict: 'clean', evidence: '', commits: [{ ...COMMIT_A }], bySession: null, message: '',
+    jobAccountId: 'codex-default', jobAt: '2026-09-07T10:59:00.000Z',
+    verdict: 'clean', evidence: '', commits: [{ ...COMMIT_A }], bySession: { sessionId: 's1', agent: 'codex' }, message: '',
     ...over,
   };
 }
@@ -310,13 +311,35 @@ test('findings newer than the last clean record block the land', () => {
   assert.equal(allow.decideLand({ records: [clean, findings, fixed], commits: [COMMIT_A] }).ok, true);
 });
 
-test('an agent may not self-attest without a job id or evidence; a human may', () => {
-  const bare = record({ job: '', evidence: '' });
-  const verdict = allow.decideLand({ records: [bare], commits: [COMMIT_A] });
-  assert.equal(verdict.ok, false);
-  assert.match(verdict.why, /agent self-attestation with no --job or --evidence/);
-  assert.equal(allow.decideLand({ records: [record({ job: '', evidence: 'read the diff twice' })], commits: [COMMIT_A] }).ok, true);
-  assert.equal(allow.decideLand({ records: [record({ by: 'human jesse', job: '', evidence: '' })], commits: [COMMIT_A] }).ok, true);
+const LONG_EVIDENCE = 'read every hunk of the retry path and re-ran bin/delivery.test.js; the double-send is gone';
+
+test('the attestation bar: what each kind of reviewer has to cite', () => {
+  // codex: a verified job, nothing else will do. jobAccountId is what says the job
+  // resolved — a job id with no account never went through that check.
+  assert.equal(allow.decideLand({ records: [record()], commits: [COMMIT_A] }).ok, true);
+  const unverified = allow.decideLand({ records: [record({ jobAccountId: '' })], commits: [COMMIT_A] });
+  assert.equal(unverified.ok, false);
+  assert.match(unverified.why, /is a Codex review with no verified --job/);
+  const codexProse = allow.decideLand({ records: [record({ job: '', jobAccountId: '', evidence: LONG_EVIDENCE })], commits: [COMMIT_A] });
+  assert.equal(codexProse.ok, false, 'prose does not substitute for a Codex job');
+
+  // opus/claude: a subagent review leaves no job file, so evidence carries it — but
+  // only real evidence. "clean" was the whole loophole.
+  const bare = record({ by: 'opus', job: '', jobAccountId: '', evidence: '' });
+  assert.match(allow.decideLand({ records: [bare], commits: [COMMIT_A] }).why, /agent self-attestation with no --job or --evidence/);
+  const thin = record({ by: 'opus', job: '', jobAccountId: '', evidence: 'clean' });
+  const thinVerdict = allow.decideLand({ records: [thin], commits: [COMMIT_A] });
+  assert.equal(thinVerdict.ok, false);
+  assert.match(thinVerdict.why, /cites 5 characters of evidence, under the 80 required/);
+  assert.equal(LONG_EVIDENCE.length >= allow.EVIDENCE_MINIMUM, true);
+  assert.equal(allow.decideLand({ records: [record({ by: 'opus', job: '', jobAccountId: '', evidence: LONG_EVIDENCE })], commits: [COMMIT_A] }).ok, true);
+
+  // human: testimony only when Owner typed it in his own terminal. A record written
+  // from inside an agent session is not human testimony, whatever `by` says.
+  assert.equal(allow.decideLand({ records: [record({ by: 'human jesse', job: '', jobAccountId: '', evidence: '', bySession: null })], commits: [COMMIT_A] }).ok, true);
+  const impersonated = allow.decideLand({ records: [record({ by: 'human jesse', job: '', jobAccountId: '', evidence: '' })], commits: [COMMIT_A] });
+  assert.equal(impersonated.ok, false);
+  assert.match(impersonated.why, /marked human but was written from inside an agent session/);
 });
 
 test('an opt-out, an unusable worktree and an empty range each name themselves', () => {
