@@ -7617,7 +7617,16 @@ function start(deps = {}) {
   require('./delivery-health').startScheduler({ root: keep.ROOT, onChange: broadcast,
     // Global on purpose: reconcile reads every session's pending delivery record, so no
     // delivery may be mid-flight anywhere. It is synchronous file work, so the hold is brief.
-    reconcile: () => withInjectionLock(() => require('./delivery').reconcile(path.join(keep.ROOT, '.keep', 'delivery'))),
+    // The pane list is read first, outside the lock: a typed entry whose pane the host no
+    // longer lists at all is retired. Exited panes still count (replace-exited keeps the
+    // id), so a replacement racing this snapshot cannot retire a live draft. An
+    // unreachable host or an empty list (see findCardPane) retires nothing.
+    reconcile: async () => {
+      const listed = await listHostPanes(deps, true);
+      const panes = Array.isArray(listed) && listed.length
+        ? new Set(listed.filter((pane) => typeof pane?.id === 'string').map((pane) => pane.id)) : null;
+      return withInjectionLock(() => require('./delivery').reconcile(path.join(keep.ROOT, '.keep', 'delivery'), { panes }));
+    },
   });
   unblock.startScheduler({
     onChange: broadcast,

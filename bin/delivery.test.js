@@ -386,6 +386,47 @@ test('the reconcile sweep expires an old never-typed journal nobody sends to aga
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+// The delivery incident of 2026-09-15 (delivery:022ccb3f): a probe typed /model into a
+// Codex pane, whose picker writes no user message, and then closed the pane. No send
+// could reach that session again, so only the sweep can retire the typed entry.
+test('the reconcile sweep retires an old typed journal whose pane is gone', async () => {
+  const { reconcile, statusForText } = require('./delivery');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-gone-pane-'));
+  const file = path.join(dir, 'rollout.jsonl'); fs.writeFileSync(file, '');
+  const directory = path.join(dir, 'journal');
+  const send = (session, pane, options = {}) => deliver({ session: { id: session, kind: 'codex' }, pane, text: '/model', file, directory,
+    precheck: async () => {}, type: async () => {}, submitDraft: async () => assert.fail('unexpected Enter'),
+    draftMatches: async () => false, pause: async () => {}, attempts: 1, ...options });
+  const journalFor = (session) => path.join(directory, textHash(session) + '.json');
+  const panes = new Set(['live']);
+  const later = Date.now() + 60 * 60e3;
+  try {
+    await assert.rejects(send('closed', 'probe'), /no matching transcript receipt/);
+    await assert.rejects(send('open', 'live'), /no matching transcript receipt/);
+
+    // Young entries may still be settling, even in a pane that just closed.
+    assert.deepEqual(reconcile(directory, { panes }), []);
+    // Without the host's pane list, or with an empty one, nothing proves the pane is gone.
+    assert.deepEqual(reconcile(directory, { now: later }), []);
+    assert.deepEqual(reconcile(directory, { now: later, panes: new Set() }), []);
+    assert.equal(fs.existsSync(journalFor('closed')), true);
+
+    assert.deepEqual(reconcile(directory, { now: later, panes }), ['closed']);
+    assert.equal(fs.existsSync(journalFor('closed')), false, 'a closed pane can take no further Enter');
+    assert.equal(fs.existsSync(journalFor('open')), true, 'text on a listed pane is never expired blind');
+    // A plain send settles, so retrying the same text never types it twice.
+    assert.deepEqual(await send('closed', 'probe', { type: async () => assert.fail('retyped a retired send') }),
+      { ok: true, delivery: 'received', recovered: true });
+
+    // A scheduled check keeps no false "received": its owner must be free to run it headless.
+    fs.writeFileSync(file, '');
+    await assert.rejects(send('check', 'gone', { retainReceipt: true, key: 'check-1' }), /no matching transcript receipt/);
+    assert.equal(statusForText(directory, '/model', 'check-1').pending, true);
+    assert.deepEqual(reconcile(directory, { now: later, panes }), ['check']);
+    assert.equal(statusForText(directory, '/model', 'check-1'), null);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('text typed but never submitted still counts as having reached the pane', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-noenter-'));
   const file = path.join(dir, 'transcript'); fs.writeFileSync(file, '');

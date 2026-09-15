@@ -298,19 +298,43 @@ function pendingForSession(directory, sessionId) {
 // the pane. An old entry with no `typedAt` is exactly the case deliverAttempt would
 // delete and retype anyway, so the sweep drops it here without typing anything; a
 // later send still passes precheck, which refuses a non-empty input box. An entry
-// that did reach the pane is left alone: only the send path can check the screen.
-function reconcile(directory, { now = Date.now(), staleJournalMs = STALE_JOURNAL_MS } = {}) {
+// that did reach the pane is left alone while that pane lives: only the send path
+// can check the screen.
+//
+// On 2026-09-15 a probe typed /model into a Codex pane and closed it. The picker
+// writes no user message, so `received` never matched, and with the pane gone no
+// send could ever run the expiry above; the watchdog reported it for over an hour.
+// Transcript shapes cannot tell a /model pick from an ordinary turn, but a pane
+// the host no longer lists can neither show the draft nor take another Enter. So
+// an old typed entry whose pane is absent from `panes` (every pane id the host
+// lists, exited or not) is retired. A plain send settles as if received, so its
+// retry never types it twice. A retained receipt (a scheduled check) is dropped
+// with no receipt at all: a false "received" would stamp the check delivered for
+// good, while no record lets its owner fall back to a headless run. Without a
+// non-empty pane list nothing is retired - an empty list is a host that said
+// nothing, not a host with no panes.
+function reconcile(directory, { now = Date.now(), staleJournalMs = STALE_JOURNAL_MS, panes = null } = {}) {
   let files;
   try { files = fs.readdirSync(directory).filter(name => name.endsWith('.json')); }
   catch (error) { if (error.code === 'ENOENT') return []; throw error; }
   const settled = [];
+  const settle = (journal, name) => {
+    fs.mkdirSync(path.join(directory, 'settled'), { recursive: true, mode: 0o700 });
+    fs.renameSync(journal, path.join(directory, 'settled', name));
+  };
   for (const name of files) {
     try {
       const journal = path.join(directory, name);
       const entry = JSON.parse(fs.readFileSync(journal, 'utf8'));
       if (name !== hash(entry.sessionId) + '.json') continue;
       if (!received(entry)) {
-        if (!(Number(entry.typedAt) > 0) && journalAgeMs(journal, entry, now) >= staleJournalMs) fs.unlinkSync(journal);
+        if (journalAgeMs(journal, entry, now) < staleJournalMs) continue;
+        if (!(Number(entry.typedAt) > 0)) fs.unlinkSync(journal);
+        else if (panes?.size && !panes.has(entry.pane)) {
+          if (entry.retainReceipt) fs.unlinkSync(journal);
+          else settle(journal, name);
+          settled.push(entry.sessionId);
+        }
         continue;
       }
       // Keep successful evidence available to the owning retry loop, including
@@ -318,10 +342,7 @@ function reconcile(directory, { now = Date.now(), staleJournalMs = STALE_JOURNAL
       // followed by this sweep would make the next retry type it again.
       saveReceipt(directory, entry);
       if (entry.retainReceipt) fs.unlinkSync(journal);
-      else {
-        fs.mkdirSync(path.join(directory, 'settled'), { recursive: true, mode: 0o700 });
-        fs.renameSync(journal, path.join(directory, 'settled', name));
-      }
+      else settle(journal, name);
       settled.push(entry.sessionId);
     } catch {} // Read-only health inspection still exposes the unresolved record.
   }
