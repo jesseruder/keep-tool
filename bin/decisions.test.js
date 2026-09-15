@@ -213,3 +213,55 @@ test('a ledger that is valid JSON but not an array is refused too', () => {
     assert.match(out.stderr, /not a JSON array/);
   } finally { f.cleanup(); }
 });
+
+test('graduation counts only grades given on the prompt now in use', () => {
+  const rows = [];
+  const add = (promptHash, verdict, n) => {
+    for (let i = 0; i < n; i += 1) {
+      rows.push({ id: `d-${rows.length}`, type: 'continue', verdict, reviewer: 'watcher', at: 1, promptHash });
+    }
+  };
+  add('oldhash0', 'agree', 40);
+  add('newhash1', 'agree', 12);
+  add('newhash1', 'disagree', 1);
+
+  // Nobody asked about a prompt: every row counts, as it always did.
+  const merged = decisions.stats(rows).rows.find((row) => row.type === 'continue');
+  assert.equal(merged.judged, 53);
+  assert.equal(merged.ready, true);
+
+  // Asking about the current prompt does not hide the old rows, it just refuses
+  // to let them graduate a prompt they were never given on.
+  const scoped = decisions.stats(rows, { promptHash: 'newhash1' });
+  const row = scoped.rows.find((candidate) => candidate.type === 'continue');
+  assert.equal(row.judged, 53, 'the visible totals still show everything');
+  assert.equal(row.currentJudged, 13);
+  assert.equal(row.currentAgree, 12);
+  assert.equal(row.ready, false, '13 grades on this prompt is not 30');
+  assert.deepEqual(scoped.prompts.map((p) => [p.promptHash, p.judged]), [['oldhash0', 40], ['newhash1', 13]]);
+
+  // Enough on the current prompt, and it graduates.
+  add('newhash1', 'agree', 18);
+  assert.equal(decisions.stats(rows, { promptHash: 'newhash1' })
+    .rows.find((candidate) => candidate.type === 'continue').ready, true);
+
+  // A row with no hash at all is filed under "unknown" and never graduates one.
+  const legacy = decisions.stats([{ type: 'drift', verdict: 'agree', at: 1 }], { promptHash: 'newhash1' });
+  assert.equal(legacy.rows.find((candidate) => candidate.type === 'drift').currentJudged, 0);
+  assert.deepEqual(legacy.prompts.map((p) => p.promptHash), ['unknown']);
+
+  const text = decisions.renderStats(scoped);
+  assert.match(text, /by prompt \(graduation counts newhash1 only\)/);
+  assert.match(text, /^ {2}oldhash0\s+40 judged/m);
+});
+
+test('the graduation refusal names the prompt the grades have to be on', () => {
+  const live = require('./watcher-live.js');
+  const stats = decisions.stats(
+    Array.from({ length: 40 }, (_, i) => ({ id: `d-${i}`, type: 'continue', verdict: 'agree', at: 1, promptHash: 'oldhash0' })),
+    { promptHash: 'newhash1' },
+  );
+  const check = live.graduationCheck('continue', stats);
+  assert.equal(check.ok, false);
+  assert.match(check.reason, /no graded decisions yet on prompt newhash1/);
+});

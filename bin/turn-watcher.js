@@ -826,6 +826,9 @@ function recordDecision(turn, value, deps = {}) {
       why: value.reason || `watcher verdict ${value.verdict}`,
       message: value.message || '',
       reviewer: 'watcher',
+      // The prompt that produced this judgment, so a grade cannot graduate a
+      // prompt it was never given on.
+      promptHash: PROMPT_HASH,
     });
     return entry.id;
   } catch (error) {
@@ -1347,7 +1350,7 @@ function pendingDecisionsForSession(sessionId, deps = {}) {
 function shadowSummary(deps = {}) {
   const decisions = deps.decisions || require('./decisions.js');
   const entries = watcherLedger(deps);
-  const stats = decisions.stats(entries);
+  const stats = decisions.stats(entries, { promptHash: PROMPT_HASH });
   const sent = new Map();
   for (const entry of entries) {
     if (!entry.delivered) continue;
@@ -1372,7 +1375,7 @@ function judgeDecision(id, verdict, note, deps = {}) {
   const decisions = deps.decisions || require('./decisions.js');
   const entry = decisions.judge(id, verdict, note);
   forgetLedger();
-  const stats = decisions.stats(decisions.loadSafe().filter((row) => row && row.reviewer === 'watcher'));
+  const stats = decisions.stats(decisions.loadSafe().filter((row) => row && row.reviewer === 'watcher'), { promptHash: PROMPT_HASH });
   const row = stats.rows.find((candidate) => candidate.type === entry.type) || null;
   return { entry, stats: row, totals: stats.totals };
 }
@@ -1411,11 +1414,11 @@ function stats(options = {}) {
   try {
     const decisions = options.decisions || require('./decisions.js');
     const all = decisions.loadSafe().filter((entry) => entry.reviewer === 'watcher' && Number(entry.at || 0) >= since);
-    ledger = decisions.stats(all.filter((entry) => !entry.delivered));
+    ledger = decisions.stats(all.filter((entry) => !entry.delivered), { promptHash: PROMPT_HASH });
     const sent = all.filter((entry) => entry.delivered);
     delivered = {
       total: sent.length,
-      rows: decisions.stats(sent).rows.filter((row) => row.judged || row.pending),
+      rows: decisions.stats(sent, { promptHash: PROMPT_HASH }).rows.filter((row) => row.judged || row.pending),
     };
   } catch {}
   return {

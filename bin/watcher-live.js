@@ -188,13 +188,18 @@ function describeConfig(config) {
 function graduationCheck(type, stats) {
   const row = (stats && stats.rows || []).find((candidate) => candidate.type === decisionTypeFor(type));
   const graduation = (stats && stats.graduation) || { min: 30, rate: 0.9 };
-  if (!row || !row.judged) {
-    return { ok: false, reason: `${type} has no graded decisions yet; it needs ${graduation.min} at ${Math.round(graduation.rate * 100)}%` };
+  // Grades given on the prompt now in use, when the caller separated them out.
+  const judged = row && Number.isFinite(row.currentJudged) ? row.currentJudged : (row && row.judged) || 0;
+  const rate = row && Number.isFinite(row.currentJudged)
+    ? (row.currentRate === null ? 0 : row.currentRate)
+    : (!row || row.rate === null ? 0 : row.rate);
+  const onThisPrompt = stats && stats.promptHash ? ` on prompt ${stats.promptHash}` : '';
+  if (!row || !judged) {
+    return { ok: false, reason: `${type} has no graded decisions yet${onThisPrompt}; it needs ${graduation.min} at ${Math.round(graduation.rate * 100)}%` };
   }
   if (row.ready) return { ok: true, row };
   const missing = [];
-  if (row.judged < graduation.min) missing.push(`${graduation.min - row.judged} more graded (${row.judged}/${graduation.min})`);
-  const rate = row.rate === null ? 0 : row.rate;
+  if (judged < graduation.min) missing.push(`${graduation.min - judged} more graded (${judged}/${graduation.min}${onThisPrompt})`);
   if (rate < graduation.rate) {
     missing.push(`agreement ${Math.round(rate * 100)}% below ${Math.round(graduation.rate * 100)}%`);
   }
@@ -594,6 +599,7 @@ function observationMessage(turn, observation) {
 // beside the verdict's decision rather than deduplicating against it.
 function recordObservationDecision(turn, observation, message, deps = {}) {
   const decisions = deps.decisions || require('./decisions.js');
+  const watcher = deps.watcher || require('./turn-watcher.js');
   try {
     const entry = decisions.record({
       type: OBSERVATION_TYPE,
@@ -603,6 +609,7 @@ function recordObservationDecision(turn, observation, message, deps = {}) {
       why: `the turn touched ${observation.map((row) => row.name).join(', ')} and wrote no state note`,
       message,
       reviewer: 'watcher',
+      promptHash: watcher.PROMPT_HASH,
     });
     return entry.id;
   } catch (error) {

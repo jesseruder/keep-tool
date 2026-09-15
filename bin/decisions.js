@@ -80,7 +80,7 @@ function clip(value, max) {
   return String(value == null ? '' : value).replace(/\s+/g, ' ').trim().slice(0, max);
 }
 
-function record({ type, card, session, turn, why, message, reviewer, now = Date.now() }) {
+function record({ type, card, session, turn, why, message, reviewer, promptHash, now = Date.now() }) {
   if (!TYPES[type]) {
     throw new DecisionError(`--type must be one of: ${Object.keys(TYPES).join(', ')}`);
   }
@@ -106,6 +106,10 @@ function record({ type, card, session, turn, why, message, reviewer, now = Date.
     why: reason,
     message: would,
     reviewer: reviewer || '',
+    // Which prompt produced this judgment. An agreement rate is about a prompt
+    // as much as a model, so a grade given on one prompt must not graduate a
+    // different one. Older rows carry no hash and count only under "unknown".
+    ...(promptHash ? { promptHash: String(promptHash).slice(0, 40) } : {}),
     verdict: null,
     verdictAt: null,
     note: '',
@@ -169,25 +173,52 @@ function judge(id, verdict, note) {
 // Agreement per type over decisions that have a verdict. An `edit` counts
 // against the type: Owner having to rewrite the message is not the reviewer
 // getting it right, even though it is more useful than a flat disagreement.
-function stats(decisions, { graduation = GRADUATION } = {}) {
+//
+// `promptHash` narrows what may *graduate* a type without hiding anything: every
+// row still counts in the visible totals, and `prompts` breaks them down by the
+// prompt that produced them, but `ready` is decided only by grades given on the
+// prompt now in use. A prompt edit is a change to the thing being judged.
+function stats(decisions, { graduation = GRADUATION, promptHash = null } = {}) {
+  const blank = (type) => ({ type, pending: 0, agree: 0, disagree: 0, edit: 0 });
   const byType = new Map();
+  const current = new Map();
   for (const type of Object.keys(TYPES)) {
-    byType.set(type, { type, pending: 0, agree: 0, disagree: 0, edit: 0 });
+    byType.set(type, blank(type));
+    current.set(type, blank(type));
   }
+  const prompts = new Map();
   for (const entry of decisions || []) {
     const row = byType.get(entry && entry.type);
     if (!row) continue;
-    if (!entry.verdict) row.pending += 1;
-    else if (VERDICTS.includes(entry.verdict)) row[entry.verdict] += 1;
+    const hash = (entry && entry.promptHash) || 'unknown';
+    if (!prompts.has(hash)) prompts.set(hash, { promptHash: hash, pending: 0, judged: 0, agree: 0 });
+    const bucket = prompts.get(hash);
+    const mine = promptHash === null || hash === promptHash ? current.get(entry.type) : null;
+    if (!entry.verdict) {
+      row.pending += 1;
+      bucket.pending += 1;
+      if (mine) mine.pending += 1;
+    } else if (VERDICTS.includes(entry.verdict)) {
+      row[entry.verdict] += 1;
+      bucket.judged += 1;
+      if (entry.verdict === 'agree') bucket.agree += 1;
+      if (mine) mine[entry.verdict] += 1;
+    }
   }
   const rows = [...byType.values()].map((row) => {
     const judged = row.agree + row.disagree + row.edit;
     const rate = judged ? row.agree / judged : null;
+    const own = current.get(row.type);
+    const currentJudged = own.agree + own.disagree + own.edit;
+    const currentRate = currentJudged ? own.agree / currentJudged : null;
     return {
       ...row,
       judged,
       rate,
-      ready: Boolean(judged >= graduation.min && rate !== null && rate >= graduation.rate),
+      currentJudged,
+      currentAgree: own.agree,
+      currentRate,
+      ready: Boolean(currentJudged >= graduation.min && currentRate !== null && currentRate >= graduation.rate),
     };
   });
   const totals = rows.reduce((sum, row) => ({
@@ -195,7 +226,13 @@ function stats(decisions, { graduation = GRADUATION } = {}) {
     judged: sum.judged + row.judged,
     agree: sum.agree + row.agree,
   }), { pending: 0, judged: 0, agree: 0 });
-  return { rows, totals, graduation };
+  return {
+    rows,
+    totals,
+    graduation,
+    promptHash,
+    prompts: [...prompts.values()].sort((a, b) => b.judged - a.judged),
+  };
 }
 
 function formatRate(rate) {
@@ -213,6 +250,15 @@ function renderStats(result) {
       + `${String(row.disagree).padStart(6)} ${String(row.edit).padStart(4)} ${String(row.pending).padStart(7)}  ${row.ready ? 'yes' : ''}`);
   }
   lines.push('', `${result.totals.pending} awaiting your verdict, ${result.totals.judged} judged`);
+  // Which prompt earned which grades. A type graduates on the current prompt's
+  // rows only, so a scoreboard that hides the split invites the wrong reading.
+  if (result.prompts && (result.prompts.length > 1 || result.promptHash)) {
+    lines.push('', 'by prompt' + (result.promptHash ? ` (graduation counts ${result.promptHash} only)` : ''));
+    for (const prompt of result.prompts) {
+      lines.push(`  ${String(prompt.promptHash).padEnd(10)} ${String(prompt.judged).padStart(6)} judged`
+        + ` ${String(prompt.agree).padStart(5)} agree ${String(prompt.pending).padStart(6)} pending`);
+    }
+  }
   return lines.join('\n');
 }
 
