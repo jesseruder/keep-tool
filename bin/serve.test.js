@@ -1102,6 +1102,12 @@ test('dashboard publish reuses recent host panes instead of publishing none', ()
   assert.equal(hostPanesForPublish(null, memo, start + 30e3), panes, 'a failed host request reuses the last good list');
   assert.equal(hostPanesForPublish(null, memo, start + 2000 + 61e3), null, 'a host that stays down is published as down');
   assert.deepEqual(hostPanesForPublish([], memo, start + 70e3), [], 'a real empty list is published');
+  const fenced = { panes: [{ id: 'current' }], at: start, epoch: 0 };
+  const inFlightEpoch = fenced.epoch;
+  fenced.panes = null; fenced.at = 0; fenced.epoch += 1; // a mutation lands mid-lookup
+  assert.deepEqual(hostPanesForPublish([{ id: 'removed' }], fenced, start + 1000, inFlightEpoch), [{ id: 'removed' }]);
+  assert.equal(fenced.panes, null, 'a list collected before the mutation is not remembered');
+  assert.equal(hostPanesForPublish(null, fenced, start + 2000, fenced.epoch), null, 'and cannot be reused after it');
 });
 
 test('turn index reads only recently alive sessions and caches codex rollout walks', () => {
@@ -1136,8 +1142,13 @@ test('turn index reads only recently alive sessions and caches codex rollout wal
     ids();
     assert.deepEqual(walks, ['found', 'missing', 'missing'], 'a miss is retried after its window');
     const withBacklog = liveTurnIndexSessions({
-      ...deps, unfinishedFiles: (files) => new Set(files.filter((file) => file === '/claude/stale.jsonl')),
+      ...deps,
+      unfinishedSessionFiles: (entries) => new Map(entries
+        .filter((entry) => entry.file === '/claude/stale.jsonl' || entry.id === 'oldCodex')
+        .map((entry) => [entry.id, entry.id === 'oldCodex' ? '/codex/old-from-index.jsonl' : entry.file])),
     });
+    assert.ok(withBacklog.some((session) => session.id === 'oldCodex' && session.file === '/codex/old-from-index.jsonl'),
+      'a stale codex backlog is found through the index even with no cached path');
     assert.ok(withBacklog.some((session) => session.id === 'stale'), 'a stale session with unread turns stays in the sweep');
     assert.ok(!withBacklog.some((session) => session.id === 'unstamped'), 'a finished stale session does not');
     assert.deepEqual(walks, ['found', 'missing', 'missing'], 'stale sessions never trigger a rollout walk');

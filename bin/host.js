@@ -838,6 +838,7 @@ function createHost(options = {}) {
         if (old.restorePromise) await old.restorePromise;
         if (old.freezePromise) await old.freezePromise;
         if (panes.get(old.id) !== old) throw new Error('session process changed during replacement');
+        clearPrimaryGrace(old);
         panes.delete(old.id);
         let replacement;
         try { replacement = spawnPane({ ...params, meta: { ...old.meta, ...params.meta } }); }
@@ -1096,6 +1097,7 @@ function createHost(options = {}) {
         if (panes.get(pane.id) !== pane) throw new Error('pane process changed');
         for (const connection of pane.attachments.keys()) detachPane(connection, pane);
         pane.attachments.clear();
+        clearPrimaryGrace(pane);
         panes.delete(pane.id);
         emitPane('removed', pane);
         const record = publicPane(pane);

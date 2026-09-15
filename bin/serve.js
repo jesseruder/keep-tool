@@ -1228,13 +1228,18 @@ const URGENT_DASHBOARD_MUTATIONS = new Set([
 function urgentDashboardMutation(pathname) {
   return URGENT_DASHBOARD_MUTATIONS.has(pathname) || /^\/api\/panes\/[^/]+\/(?:kill|remove)$/.test(pathname);
 }
-function hostPanesForPublish(panes, memo, now) {
+// `epoch` is memo.epoch as it was when the lookup began: a mutation bumps it, so a list
+// collected before the mutation is neither remembered nor reused for a later build.
+function hostPanesForPublish(panes, memo, now, epoch = memo.epoch || 0) {
+  const current = epoch === (memo.epoch || 0);
   if (Array.isArray(panes)) {
-    memo.panes = panes;
-    memo.at = now;
+    if (current) {
+      memo.panes = panes;
+      memo.at = now;
+    }
     return panes;
   }
-  if (memo.panes && now - memo.at < HOST_PANES_REUSE_MS) return memo.panes;
+  if (current && memo.panes && now - memo.at < HOST_PANES_REUSE_MS) return memo.panes;
   return panes;
 }
 
@@ -5281,7 +5286,9 @@ function liveTurnIndexSessions(deps = {}) {
   // A session no longer seen alive may have stopped with turns still unread (or the
   // daemon was down). Keep it while its transcript is unfinished, using only paths
   // that are already known: this never walks the codex date directories.
-  const staleCandidates = [];
+  // The index's own ingest rows know each transcript path, so a backlog survives a
+  // daemon restart; a cached path only matters for a session never ingested at all.
+  const staleEntries = [];
   for (const entry of stale.values()) {
     if (wanted.has(entry.id)) continue;
     let file = null;
@@ -5289,15 +5296,18 @@ function liveTurnIndexSessions(deps = {}) {
       try { file = rolloutFileFor(entry.id); } catch {}
       file ||= turnIndexRolloutLookups.get(entry.id)?.file || null;
     } else file = claudeFiles.get(entry.id) || null;
-    if (file) staleCandidates.push({ ...entry, file });
+    staleEntries.push({ ...entry, sessionId: entry.id, file });
   }
-  if (staleCandidates.length) {
-    let unfinished = new Set();
+  if (staleEntries.length) {
+    let unfinished = new Map();
     try {
-      unfinished = (deps.unfinishedFiles || ((files) => require('./turn-index.js').unfinishedFiles(files, { busyTimeoutMs: 250 })))(
-        staleCandidates.map((candidate) => candidate.file));
+      unfinished = (deps.unfinishedSessionFiles
+        || ((entries) => require('./turn-index.js').unfinishedSessionFiles(entries, { busyTimeoutMs: 250 })))(staleEntries);
     } catch {}
-    for (const candidate of staleCandidates) if (unfinished.has(candidate.file)) sessions.push(candidate);
+    for (const entry of staleEntries) {
+      const file = unfinished.get(entry.id);
+      if (file) sessions.push({ id: entry.id, agent: entry.agent, file });
+    }
   }
   return sessions;
 }
@@ -7132,14 +7142,15 @@ function start(deps = {}) {
     hostPanes: options.hostPanes || [],
     companion: options.companion || null,
   });
-  const publishedPanes = { panes: null, at: 0 };
+  const publishedPanes = { panes: null, at: 0, epoch: 0 };
   dashboardPublisher = createDashboardPublisher({
     prepare: async () => {
       // Fence before every source read. A mutation that completes while panes,
       // review launch state, or companion jobs are being collected invalidates
       // this running pass and forces a follow-up carrying the newer fence.
       const capturedMutationFence = mutationFence();
-      const panes = hostPanesForPublish(await listHostPanes(deps), publishedPanes, Date.now());
+      const paneEpoch = publishedPanes.epoch;
+      const panes = hostPanesForPublish(await listHostPanes(deps), publishedPanes, Date.now(), paneEpoch);
       await reviewQueue.reconcile({ inspectLaunch: (active) => inspectReviewQueueLaunch(active) });
       const companion = await companionSnapshot(deps);
       return { hostPanes: panes, companion, mutationFence: capturedMutationFence };
@@ -8166,6 +8177,7 @@ function start(deps = {}) {
           // list predates it and must not be republished under the post-mutation fence.
           publishedPanes.panes = null;
           publishedPanes.at = 0;
+          publishedPanes.epoch += 1; // a lookup already in flight must not refill it
           dashboardPublisher.refresh();
         } else dashboardPublisher.invalidate();
       }

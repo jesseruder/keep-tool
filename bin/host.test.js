@@ -887,9 +887,17 @@ test('a host handoff cancels primary grace timers', async () => {
     const client = await connect({ sock });
     const bridge = await connect({ sock });
     const { pane } = await client.request('spawn', { cmd: '/bin/sh', args: ['-c', 'cat'] });
+    const { pane: doomed } = await client.request('spawn', { cmd: '/bin/sh', args: ['-c', 'cat'] });
     await bridge.attach(pane.id, { replay: false, viewer: 'stage', primary: true }, () => {});
+    await bridge.attach(doomed.id, { replay: false, viewer: 'stage', primary: true }, () => {});
     bridge.close();
     await waitFor(async () => host.panes.get(pane.id).primaryGraceTimer, 'grace timer armed');
+    const removed = host.panes.get(doomed.id);
+    await waitFor(async () => removed.primaryGraceTimer, 'second grace timer armed');
+    await client.request('kill', { pane: doomed.id, signal: 'SIGKILL' });
+    await waitFor(async () => !(await client.request('get', { pane: doomed.id })).pane.alive, 'doomed pane exit');
+    await client.request('remove', { pane: doomed.id });
+    assert.equal(removed.primaryGraceTimer, null, 'removing a pane cancels its grace timer');
     const disconnected = new Promise((resolve) => client.onDisconnect(resolve));
     record = await host.handoff();
     await disconnected;
