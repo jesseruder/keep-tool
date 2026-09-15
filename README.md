@@ -121,6 +121,11 @@ configuration and available agent sessions, Keep can:
   deliver that one for real, bounded by rate limits and carve-outs and revocable
   instantly with `keep watcher live off`. Off by default. See
   [turn watcher](docs/turn-watcher.md).
+- Let a project declare the shared resources several sessions touch — a staging
+  environment, a Terraform state file, a pool of hosts — and let a session say what
+  is true of one right now with `keep note <project> --scope staging -m "..." --for
+  +2h`. Notes expire, never block anything, and are broadcast to sibling sessions in
+  the same checkout. See [shared state](docs/shared-state.md).
 
 Scheduling, model access, and launch permissions are separate controls. Model-backed
 checks and reviews use your Claude account; Keep is not a model service. Optional
@@ -363,7 +368,8 @@ configuration, gated-step registries, runtime state, private reports, and machin
 service files are excluded. Tests use synthetic fixtures. Updates should be made
 here rather than by copying whole private checkouts back into this repository.
 
-See the [full command reference](docs/reference.md), [Keep skill](skills/keep/SKILL.md),
+See the [full command reference](docs/reference.md), [shared state](docs/shared-state.md),
+[Keep skill](skills/keep/SKILL.md),
 [fleet reviewer procedure](skills/fleet-review/SKILL.md), and [desktop README](desktop/README.md).
 
 ## Session handoffs

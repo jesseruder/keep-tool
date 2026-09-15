@@ -146,7 +146,18 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   under your own card's project and check it with `--scope device:<serial>`.
   Omitted scopes, including legacy holds, remain project-wide; do not reinterpret or
   release someone else's hold. Holds are advisory coordination, not permission or
-  replacements for gated-step claims. Before changing paths owned by a gated step, run
+  replacements for gated-step claims.
+  **State notes** are the other half. A hold asks people to wait; a note says what is
+  true now. When you change how a shared resource *behaves* for other sessions —
+  staging in home-only mode, a feature flag flipped, a service pointed somewhere
+  else — write `keep note <project> --scope staging -m "what is true now" --for +2h`.
+  It is broadcast to sibling sessions in this checkout, shows at their session start
+  and in `keep who`, and expires on its own; extend it with `keep note --extend <id>
+  --for +2h` or end it early with `keep note --clear <id>`. Notes never block
+  anything and are not a substitute for a hold when you genuinely need a quiet
+  window. `keep resources <project>` lists the resources this project has declared
+  and the scope names a note may use; `keep notes` lists what is currently stated.
+  Before changing paths owned by a gated step, run
   `keep steps <project>`, claim it with `keep step claim`, and run it through
   `keep step run` so a `landed` step uses a pinned revision in a clean worktree.
   A failed step prints its log path and is recorded as a failed run; your claim stays

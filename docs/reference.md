@@ -31,6 +31,8 @@ registry data or credentials to the public source repository.
 - `.keep/turns.sqlite` — the turn index; a derived cache, safe to delete and rebuild
 - `.keep/artifacts/` — committed per-card durable artifacts, force-added like `.keep/handoffs/`
 - `.keep/holds/` — quiet-window ledgers, one JSON file per hold
+- `resources/` — committed shared-resource declarations, one JSON file per project basename
+- `.keep/notes/` — state notes, one JSON file per project (bounded; pruned on every write)
 - `.keep/unblocked/` — pending and delivered cross-card unblock records
 - `steps/` — committed gated-step registries, one JSON file per project basename
 - `.keep/steps/` — local step run ledgers and logs (gitignored)
@@ -60,6 +62,13 @@ keep who <project> [--json] [--scope <resource>]
 keep hold <project> --for +15m -m "why" [--task <id>] [--scope <resource>]...
 keep release <hold-id>
 keep holds
+keep resources <project> [--json]
+keep resources <project> --add <name> [--title t] [--command <re>]... [--path <glob>]... [--deploy <kind:target>]... [--note-for +2h]
+keep resources <project> --remove <name>
+keep resources --check <project> "<command>"
+keep note <project> --scope <resource> [--scope ...] -m "what is true now" --for +2h [--task <card>]
+keep note --extend <id> --for +2h | --clear <id> [-m why]
+keep notes [<project>] [--all] [--json]
 keep steps [<project>] [--json]
 keep step claim <project> <step> [--task <id>] [--for <dur>] [--wait] [--force] -m "why"
 keep step run <project> <step> [--sha <sha>]
@@ -199,7 +208,10 @@ dependency), `daemon-health` (one finding for every scheduler in `.keep/health.j
 3+ consecutive failures or no successful run in 24h), `checkout-drift` (per project of an
 open card: a dirty tree or a branch ahead of/behind its upstream, from local refs with no
 fetch), `step-run-pending` (a gated step with landed commits its last run missed for over
-24h), and `handoff-shadow` cards — a Codex worker's
+24h), `note-expired` (a state note past its window that nobody extended or cleared,
+filed under `note:<id>`), `resource-bad-matcher` (a declared resource whose regex does
+not compile or whose glob is empty, filed under `resource:<project>:<name>`), and
+`handoff-shadow` cards — a Codex worker's
 card older than six hours with no check-ins, opened instead of checking in on the card
 its parent Claude session held. It always exits successfully when findings exist, writes the latest
 result to `.keep/lint.json`, and supports one-rule runs plus JSON output and fix hints.
@@ -417,6 +429,14 @@ bundle, and `keep who <project> --scope device:<serial>` or `keep wait --no-hold
 <project> --scope device:<serial>` matches them from any project. An unscoped
 `keep wait --no-hold` still waits only on its own project's holds. Serials are
 lowercased, so `--scope device:ABC123` and `--scope device:abc123` are the same hold.
+
+A hold asks other sessions to wait. When you have not taken a shared resource away
+but have *changed how it behaves*, write a state note instead: `keep note <project>
+--scope staging -m "staging is home-only, no deck-persistence config" --for +2h`.
+Notes are expiring, non-blocking, broadcast to sibling sessions in the same checkout,
+and visible everywhere holds are. `keep resources <project>` lists what a project has
+declared, and the watcher can notice a turn that touched one and said nothing. None
+of it gates anything — see [shared state](shared-state.md).
 
 ## Alerts and the morning brief
 
