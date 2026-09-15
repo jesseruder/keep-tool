@@ -282,6 +282,15 @@ git -C ~/keep-tool pull --ff-only     # or: pull --ff-only origin master
 keep restart-daemon                   # and the node/shebang spelling of it
 ```
 
+Each as a **whole command**, matched against the text, not against a parse of it.
+Everything else in this guard reads a command line without being a shell, which is
+the right trade for a refusal — a spelling it reads differently from zsh is at
+worst an over-refusal — but an allowance cannot be built on it: `node -r /tmp/keep.js
+~/keep-tool/bin/keep.js restart-daemon`, `bash --rcfile /tmp/x -ic '<command>'` and
+an `export GIT_CONFIG_*` in an earlier segment all parse one way here and run
+another way there. So the recipe's exact text is what is recognised, and a `cd`,
+an `&&`, a wrapper, an assignment or an extra flag means no match.
+
 The predicate is `landedFor(cardId)` in `bin/self-repair.js`, asked at most once
 per Bash command and only when something is about to be refused. It resolves the
 session to its card with `cardForSession(sessionId)` — the repair state entry whose
@@ -325,8 +334,7 @@ write in the live checkout. Nothing may ride along with the two either — an
 environment assignment (`GIT_CONFIG_*` can move the remote or point `core.hooksPath`
 at a script), a node flag (`-r`, `--eval`), a wrapper such as `env -C`, a second
 `-C`, or `--git-dir`/`--work-tree`, which pair another repository with the live
-working tree. What sits in front of a shell sits in front of everything the shell
-runs, so an assignment does not lose its meaning inside `bash -c '…'`. A session whose card cannot be resolved, whose card has
+working tree — none of which can be attached to a whole-command match anyway. A session whose card cannot be resolved, whose card has
 no land check-in, or whose predicate throws is refused exactly as it was before.
 
 **The card is not closed automatically**, the fix is not landed without a recorded
