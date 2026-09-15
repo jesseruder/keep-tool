@@ -16,7 +16,7 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 
 // Text caps. Transcripts contain whole files and 100k-line build logs; the index
 // exists to find and count turns, not to be a second copy of the corpus.
@@ -230,6 +230,23 @@ const MIGRATIONS = [
   // that happened after the first character was typed, and this says what
   // happened (bin/watcher-live.js).
   { version: 12, statements: ['ALTER TABLE deliveries ADD COLUMN error TEXT'] },
+  // What the console's own state machine said about the session at the moment the
+  // verdict was written (bin/session-status.js `activity()`): the winning rule,
+  // the state it produced, whether that rule is observed or inferred, and whether
+  // it put the session in "Waiting on you". Measurement only — nothing reads
+  // these to decide anything; `keep watcher compare` reports them. They ride
+  // along in turn_verdicts_kept so a re-ingest does not leave a restored verdict
+  // paired with nothing.
+  { version: 13, statements: [
+    'ALTER TABLE turns ADD COLUMN attention_rule TEXT',
+    'ALTER TABLE turns ADD COLUMN attention_state TEXT',
+    'ALTER TABLE turns ADD COLUMN attention_confidence TEXT',
+    'ALTER TABLE turns ADD COLUMN attention_needs_input INTEGER',
+    'ALTER TABLE turn_verdicts_kept ADD COLUMN attention_rule TEXT',
+    'ALTER TABLE turn_verdicts_kept ADD COLUMN attention_state TEXT',
+    'ALTER TABLE turn_verdicts_kept ADD COLUMN attention_confidence TEXT',
+    'ALTER TABLE turn_verdicts_kept ADD COLUMN attention_needs_input INTEGER',
+  ] },
 ];
 
 function migrate(handle) {
@@ -578,7 +595,10 @@ function headReplaced(file, stat, stored) {
 }
 
 const KEPT_VERDICT_COLUMNS = ['verdict', 'verdict_reason', 'verdict_message', 'state_line',
-  'verdict_confidence', 'verdict_model', 'verdict_ms', 'verdict_at', 'decision_id', 'card_id'];
+  'verdict_confidence', 'verdict_model', 'verdict_ms', 'verdict_at', 'decision_id', 'card_id',
+  // The state machine's answer belongs to the verdict it was recorded beside, so
+  // it is parked and restored with it rather than surviving on its own.
+  'attention_rule', 'attention_state', 'attention_confidence', 'attention_needs_input'];
 
 // Always scoped to one session id. A subagent file resetting must never reach
 // into its parent's rows, which is exactly what a wrong id here would do.

@@ -1054,6 +1054,38 @@ test('a verdict is dropped when the turn it described no longer exists', (t) => 
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM turn_verdicts_kept').get().n, 0, 'and nothing is left parked');
 });
 
+test('migration 13 adds the attention columns, and a parked verdict carries them across a re-ingest', (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, `${SESSION}.jsonl`);
+  fs.writeFileSync(file, jsonl(claudeRecords()));
+  turnIndex.ingestFile(file, { agent: 'claude' });
+  const db = turnIndex.open();
+
+  const attention = ['attention_rule', 'attention_state', 'attention_confidence', 'attention_needs_input'];
+  const turns = db.prepare('PRAGMA table_info(turns)').all().map((row) => row.name);
+  for (const column of attention) assert.ok(turns.includes(column), `turns.${column} exists`);
+  const parked = db.prepare('PRAGMA table_info(turn_verdicts_kept)').all().map((row) => row.name);
+  for (const column of attention) assert.ok(parked.includes(column), `turn_verdicts_kept.${column} exists`);
+  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 13);
+
+  db.prepare(`UPDATE turns SET verdict = 'continue', verdict_message = 'keep going', verdict_at = 1,
+      attention_rule = 'prose-request', attention_state = 'needs-input',
+      attention_confidence = 'inferred', attention_needs_input = 1
+    WHERE session_id = ?`).run(SESSION);
+
+  // The record belongs to the verdict it was taken beside, so an unchanged
+  // re-ingest must bring both back or neither.
+  assert.equal(turnIndex.ingestFile(file, { agent: 'claude', force: true }).ok, true);
+  const after = turnIndex.turnsForSession(SESSION).filter((turn) => turn.verdict);
+  assert.ok(after.length, 'the verdicts came back');
+  for (const turn of after) {
+    assert.equal(turn.attention_rule, 'prose-request');
+    assert.equal(turn.attention_state, 'needs-input');
+    assert.equal(turn.attention_confidence, 'inferred');
+    assert.equal(turn.attention_needs_input, 1);
+  }
+});
+
 test('the database carries its schema version, fingerprint column and journal limit', (t) => {
   tempDir(t);
   const db = turnIndex.open();
