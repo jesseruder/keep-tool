@@ -133,6 +133,8 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   Keep verifies what it can: `--job` must name a completed job in a registered Codex
   account, `--by human` cannot be written from an agent session, and a `codex` review
   needs a job while an `opus`/`claude` one needs a job or 80+ characters of `--evidence`.
+  Keep does not read the job's prompt: cite only a job that was actually a review of
+  those commits, never the thread that wrote them.
   `keep allow <card> land` then answers 0 when the reviewed patches are exactly what
   would land — every commit in `origin/<default>..HEAD` covered by a clean record whose
   patch-id matches, from a clean wt-managed `wt/` worktree with a linear range, with the

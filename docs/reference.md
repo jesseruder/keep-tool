@@ -580,7 +580,10 @@ None of this is a security boundary. An agent that edits card files or
 `.keep/reviews/*.json` directly can write anything, and Keep does not try to stop it.
 It is an **audit trail with a bar in front of it**: every clean record names a reviewer
 and points at something a later reader can go and check, and the cheap paths to a
-self-issued land grant are closed.
+self-issued land grant are closed. The remaining honest ceiling: a session can launch
+its own Codex job and cite it, and Keep does not read the job's prompt. A second model
+ran and its transcript is on disk; whether it was asked to review is for the fleet
+reviewer and Owner to check.
 
 The key is `git patch-id --stable`, not the sha: `wt land` rebases onto
 `origin/<default>` before it pushes, so the landed sha is never the reviewed one, while
@@ -635,6 +638,9 @@ The guard reads a command, not a process tree, so it does not cover `npx claude
 --resume`, a locally installed wrapper under another name, or bundled short flags
 (`claude -rc`, which the parser sees as one unknown token). Those are gaps in the bar,
 not holes in a boundary — the guard is a reminder that keeps the honest path honest.
+The bypass is read only as a leading assignment on the segment that runs `claude`:
+`KEEP_RAW_CLAUDE=1 claude --resume <id>` passes, `env KEEP_RAW_CLAUDE=1 claude
+--resume <id>` is still denied.
 
 `keep setup --shell` prints a zsh `claude()` that does the same for Owner's own typing;
 `keep setup --shell --write` installs it in `~/.zshrc` between
