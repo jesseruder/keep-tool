@@ -2268,7 +2268,8 @@ async function sweepPendingCompactSwaps(deps = {}) {
       const session = byId.get(record.sessionId);
       if (codexCompact.isCodexCompactSwap(record)) {
         try {
-          const recovered = await lock(() => codexCompact.recoverCodexCompactSwap(record, {
+          const recoverCodexCompactSwap = deps.recoverCodexCompactSwap || codexCompact.recoverCodexCompactSwap;
+          const recovered = await lock(() => recoverCodexCompactSwap(record, {
             ...deps,
             session,
             dir,
@@ -2277,6 +2278,7 @@ async function sweepPendingCompactSwaps(deps = {}) {
             readScreen: read,
             typeAndSubmit: submit,
             pressTargetKey,
+            writeTarget: deps.writeTarget || writeTarget,
             codexSendPrecheck,
             codexTypedTextVisible,
             transcriptFileForSession,
@@ -2423,6 +2425,7 @@ async function compactSession(session, target, instruction, deps = {}) {
             readScreen: deps.readScreen || ((t, lines, scrollback) => readScreen(t, lines, scrollback, deps)),
             typeAndSubmit: deps.typeAndSubmit || typeAndSubmit,
             pressTargetKey: deps.pressTargetKey || pressTargetKey,
+            writeTarget: deps.writeTarget || writeTarget,
             codexSendPrecheck,
             codexTypedTextVisible,
             transcriptFileForSession: deps.transcriptFileForSession || transcriptFileForSession,

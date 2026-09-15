@@ -2296,14 +2296,21 @@ test('pending swap sweep routes old Codex records away from Claude repair and ne
     configFile: path.join(dir, 'config.toml'),
   })}\n`);
   let claudeReads = 0;
+  let codexRecoveries = 0;
   const summary = await sweepPendingCompactSwaps({
     dir, now: () => Date.parse('2026-09-01T12:00:00Z'),
     scanSessions: () => [{ id: 'codex-session', kind: 'codex', endedTurn: false }],
     withInjectionLock: async (fn) => fn(),
     readClaudeSettingsModel: () => { claudeReads++; return { ok: true, present: false, value: '' }; },
+    recoverCodexCompactSwap: async (_record, deps) => {
+      codexRecoveries++;
+      assert.equal(deps.writeTarget, writeTarget);
+      return { restored: false, skipped: true, reason: 'session busy' };
+    },
   });
   assert.deepEqual(summary, { checked: 1, restored: 0, dropped: 0, skipped: 1, repairedSettings: 0 });
   assert.equal(claudeReads, 0);
+  assert.equal(codexRecoveries, 1);
   assert.equal(fs.existsSync(file), true);
 });
 
@@ -2958,6 +2965,7 @@ test('cold Codex compaction invokes the fallback transaction seam and forwards r
     compactionPolicy: { path: 'cold-fallback', originalModel: 'gpt-6-astra', targetModel: 'gpt-5.6-sol' },
     compactCodexFallback: async (_session, _target, _instruction, deps) => {
       seamCalls++;
+      assert.equal(deps.writeTarget, writeTarget);
       const compacted = await deps.compactCurrentModel();
       return { ...compacted, restoreUnconfirmed: true, reason: 'model restore unconfirmed' };
     },
