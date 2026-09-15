@@ -3,7 +3,16 @@
 
 const mode = process.argv[2] || process.env.KEEP_RELAY_FIXTURE_MODE;
 
-if (mode === 'silent-relay') {
+if (mode === 'marked-relay') {
+  // The real worker, touching a marker once its ready message has been written, so a
+  // test can stall the parent until ready is already queued on the IPC channel.
+  const fs = require('node:fs');
+  const send = process.send.bind(process);
+  process.send = (message, ...rest) => (message?.type === 'ready' && rest.length === 0
+    ? send(message, () => fs.writeFileSync(process.env.KEEP_RELAY_READY_MARKER, ''))
+    : send(message, ...rest));
+  require('./terminal-relay-worker.js');
+} else if (mode === 'silent-relay') {
   const sockets = new Set();
   process.on('message', (message, socket) => {
     if (message?.type === 'init') process.send?.({ type: 'ready' });

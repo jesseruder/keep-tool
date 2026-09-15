@@ -89,6 +89,13 @@ function stall(ms) {
   while (Date.now() - started < ms) { /* intentional parent event-loop stall */ }
 }
 
+// Stall until `ready()` holds and at least `minMs` passed, so a deadline shorter than
+// `minMs` expires while the awaited message is already queued for the parent.
+function stallUntil(ready, minMs, limitMs = 30000) {
+  const started = Date.now();
+  while (Date.now() - started < limitMs && !(Date.now() - started >= minMs && ready())) { /* intentional stall */ }
+}
+
 function maskedFrame(payload) {
   const data = Buffer.from(payload);
   assert.ok(data.length <= 125);
@@ -238,14 +245,18 @@ test('a late parent ACK callback does not kill a healthy relay or its viewers', 
 
 test('late parent processing of ready does not expire startup or its queued upgrade', async (t) => {
   let stalled = false;
+  const marker = path.join(os.tmpdir(), `keep-relay-ready-${process.pid}-${Date.now()}`);
+  t.after(() => fs.rmSync(marker, { force: true }));
   const f = await fixture({
     relayOptions: {
+      // The real worker, marking once its ready message is flushed to the parent.
+      workerPath: CHILD,
+      workerEnv: { KEEP_RELAY_FIXTURE_MODE: 'marked-relay', KEEP_RELAY_READY_MARKER: marker },
       startupTimeoutMs: 250,
       afterSend(type) {
         if (type !== 'init' || stalled) return;
         stalled = true;
-        // Long enough that the worker's reply is already queued when the parent resumes.
-        stall(1000);
+        stallUntil(() => fs.existsSync(marker), 500);
       },
     },
   });
