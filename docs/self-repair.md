@@ -102,10 +102,11 @@ counts as "could not tell" and changes nothing. The sweep only looks at signatur
 that are still firing and whose card is still open; anything else belongs to the
 resolve path, and it says nothing about a card it is not going to touch.
 
-The cap is on **sessions spent**, not on launches that failed to start: the attempt
-is recorded before the launch runs, so a launch that throws cannot retry every tick,
-and a successful relaunch counts too. After `MAX_LAUNCH_ATTEMPTS` (3) the card is
-told so once and nothing more happens for that signature until `--reset`. And before it opens anything, a launch asks the host
+**Every attempt counts**, started or not: a launch that never got off the ground, a
+pane adopted from the host, a successful relaunch. The attempt is recorded before
+the launch runs, so a launch that throws cannot retry every tick. After
+`MAX_LAUNCH_ATTEMPTS` (3) the card is told so once, `launchGaveUp` is set, and
+nothing more happens for that signature until `--reset`. And before it opens anything, a launch asks the host
 whether the card already has a live pane **that this scheduler spawned** — the
 launch stamps `repair: true` into the pane meta, alongside `card` — so a spawn
 response lost after the pane came up does not become a second agent, while a
@@ -117,8 +118,13 @@ would take KEEP_REPAIR away from a live agent mid-repair and let the next tick o
 a second card on the same fault. The CLI asks the terminal host directly; if it
 cannot be reached and the launch was never confirmed, it refuses for 90 minutes and
 says to check the pane. Otherwise it refuses only while the card is genuinely live:
-a card that is `done` or `archived` clears. A refused reset never drops the recorded
+a card that is `done` or `archived` clears, **and so does one this scheduler has
+given up on** — the give-up check-in tells Owner to run exactly this command, so the
+card does not have to be closed first. A refused reset never drops the recorded
 session.
+
+`keep self-repair` marks the states that explain a quiet row: `gave up after N
+sessions (--reset to start over)`, `relaunch due`, and `pane unseen since <t>`.
 
 Every change goes through one synchronous read-modify-write helper — atomic only
 because nothing inside it awaits, the same constraint as `review.js`'s
