@@ -75,6 +75,23 @@ keep open <card> --fresh --agent claude --account claude-secondary
 
 Specifying `--account` while resuming an existing session does not move it. Keep rejects a conflicting account and asks for an explicit handoff.
 
+### Automation accounts
+
+Work the daemon starts by itself runs under a named *purpose* in
+`automationAccounts` in `~/.config/keep/config.json`, resolved by
+`accounts.automationFor('claude', <purpose>)`. Each purpose falls back to
+`automationAccounts.claude` and then to `defaultAccounts.claude`, so none of them
+needs configuring to work:
+
+- `reviewer` — the fleet reviewer pane, and the budget its ticks are checked against.
+- `watcher` — the turn watcher's verdict calls.
+- `ideas` — the daily ideas sweep, and the budget it is checked against.
+
+With more than one Claude account configured, an automation path that does not pin
+an account cannot read a budget at all: it reports "reviewer account is unknown in
+multi-account mode" and does nothing. Pin the busy purposes onto their own account
+rather than letting them share the interactive default's weekly window.
+
 ## Transfer a limited session
 
 Native handoff moves an existing conversation between two accounts for the same provider. Use **Continue on another account** in the dashboard or the CLI with the exact session and pane:

@@ -3853,14 +3853,47 @@ function reviewerAccountId(env = process.env) {
   catch { return undefined; }
 }
 
+// Two shapes reach here. usage.getUsage()'s live view keys accounts to
+// {agent, limits, fetchedAt}; the on-disk cache (.keep/usage-cache.json) keys them to
+// {identity: {agent}, snapshot: {limits, fetchedAt}}. Reading the second as the first
+// looks exactly like "no usage snapshot available", which is how the ideas sweep sat
+// dead for three days with its health row green.
+// A cache written before multi-account support keys the default account's snapshot at
+// the top level as `claude`, which is how usage.setCacheFile still reads it. Pinning
+// an account must not make that file unreadable.
+function legacyClaudeLimits(value, accountId) {
+  if (!value || value.version || !value.claude || !Array.isArray(value.claude.limits)) return null;
+  let id = null;
+  try { id = require('./accounts.js').defaultFor('claude').id; } catch {}
+  if (id && id !== accountId) return null;
+  return { limits: value.claude.limits, fetchedAt: value.claude.fetchedAt };
+}
+
+function accountLimits(value, accountId) {
+  const entry = value && value.accounts && value.accounts[accountId];
+  if (!entry || typeof entry !== 'object') return legacyClaudeLimits(value, accountId);
+  const agent = entry.agent || (entry.identity && entry.identity.agent);
+  if (agent !== 'claude') return null;
+  const snapshot = Array.isArray(entry.limits) ? entry
+    : (entry.snapshot && Array.isArray(entry.snapshot.limits) ? entry.snapshot : null);
+  if (!snapshot || !snapshot.limits.length) return legacyClaudeLimits(value, accountId);
+  return { limits: snapshot.limits, fetchedAt: snapshot.fetchedAt };
+}
+
 function reviewBudget(model, snapshot, accountId) {
   const usage = require('./usage.js');
-  const value = snapshot || usage.getUsage();
   const pinned = accountId || process.env.KEEP_AGENT_ACCOUNT_ID;
   if (pinned) {
-    const accountUsage = value && value.accounts && value.accounts[pinned];
-    return classifyBudget({ claude: accountUsage && accountUsage.agent === 'claude' ? accountUsage : {} }, model || reviewerModel());
+    let claude = accountLimits(snapshot || usage.getUsage(), pinned);
+    // A cached file written before this account existed has no row for it. Ask the
+    // usage manager, which refreshes in-process, before declaring the budget unknown.
+    if (!claude && snapshot) {
+      try { claude = accountLimits(usage.getUsage(), pinned); } catch {}
+    }
+    if (!claude) return { code: 8, reason: `no usage snapshot for account ${pinned}` };
+    return classifyBudget({ claude }, model || reviewerModel());
   }
+  const value = snapshot || usage.getUsage();
   try {
     if (require('./accounts.js').hasMultiple('claude')) {
       return { code: 8, reason: 'reviewer account is unknown in multi-account mode' };

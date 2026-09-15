@@ -479,6 +479,15 @@ calling a model or writing state; `--model` overrides `KEEP_IDEAS_MODEL` (defaul
 `fable`). The daemon runs it every day at local `KEEP_IDEAS_AT` (default `07:30`) and
 retries failures every 30 minutes until noon.
 
+The sweep spends against `accounts.automationFor('claude', 'ideas')` — the same
+automation-purpose mechanism as `reviewer` and `watcher`, falling back to
+`automationAccounts.claude` and then the Claude default, so no config change is needed.
+Its budget is read against that account: without one, a fleet with more than one Claude
+account reports `reviewer account is unknown in multi-account mode` and the sweep never
+runs. An exhausted window (budget code 6 or 7) is recorded as a healthy skip; a budget
+that cannot be read at all (code 8) is recorded as a **failure**, so `consecutiveFailures`
+climbs and the brief shows it rather than the sweep dying silently behind a green row.
+
 ## Landed commits
 
 `keep landed` checks recent open cards for cited commit shas that have reached each

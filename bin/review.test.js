@@ -3013,3 +3013,31 @@ test('review-land refuses a note lint already covers and lands the rest of the t
     assert.equal(out.counts.findings, 1);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('a pinned budget reads both snapshot shapes and names the account it cannot find', () => {
+  const { reviewBudget } = require('./review.js');
+  const limits = [{ label: '5h', percent: 10 }, { label: 'week', percent: 10 }, { label: 'Fable wk', percent: 10 }];
+  const fetchedAt = Date.now();
+
+  // The live usage view: accounts[id] = {agent, limits, fetchedAt}.
+  assert.equal(reviewBudget('fable', { accounts: { 'claude-secondary': { agent: 'claude', limits, fetchedAt } } }, 'claude-secondary').code, 0);
+  // The on-disk cache: accounts[id] = {identity: {agent}, snapshot: {limits, fetchedAt}}.
+  // The ideas sweep passes exactly this, and reading it as the shape above is a
+  // silent code 8 - which is how the sweep sat dead for three days.
+  assert.equal(reviewBudget('fable', {
+    version: 2, accounts: { 'claude-secondary': { identity: { agent: 'claude' }, snapshot: { limits, fetchedAt } } },
+  }, 'claude-secondary').code, 0);
+  // A pre-multi-account cache keys the default account at the top level.
+  assert.equal(reviewBudget('fable', { claude: { limits, fetchedAt } }, 'claude/default').code, 0);
+  // The governor still applies through every shape.
+  assert.equal(reviewBudget('fable', {
+    version: 2,
+    accounts: { 'claude-secondary': { identity: { agent: 'claude' }, snapshot: { limits: [{ label: 'week', percent: 99 }], fetchedAt } } },
+  }, 'claude-secondary').code, 6);
+
+  const missing = reviewBudget('fable', { version: 2, accounts: {} }, 'claude-secondary');
+  assert.equal(missing.code, 8);
+  assert.match(missing.reason, /no usage snapshot for account claude-secondary/,
+    'the refusal names the account, so the fix is obvious');
+  assert.equal(reviewBudget('fable', { version: 2, accounts: { 'claude-secondary': { identity: { agent: 'codex' }, snapshot: { limits, fetchedAt } } } }, 'claude-secondary').code, 8);
+});

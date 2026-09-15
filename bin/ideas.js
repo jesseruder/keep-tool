@@ -569,12 +569,21 @@ function cachedBudget(root) {
   return value && typeof value === 'object' ? value : undefined;
 }
 
-async function run({ now = Date.now(), dry = false, model } = {}) {
+// The sweep spends against a real Claude account, so it has to name one: with more
+// than one configured an unpinned budget read is code 8 and the sweep never runs.
+// Falls back to automationAccounts.claude and then the default, so no config change
+// is needed to keep working.
+function ideasAccountId(env = process.env) {
+  try { return require('./accounts.js').automationFor('claude', 'ideas', env).id; }
+  catch { return undefined; }
+}
+
+async function run({ now = Date.now(), dry = false, model, accountId } = {}) {
   now = Number(now);
   if (!Number.isFinite(now)) throw new Error('ideas sweep needs a valid time');
   model = model || process.env.KEEP_IDEAS_MODEL || 'fable';
-  const budget = review.reviewBudget(model, cachedBudget(keep.ROOT));
-  if (budget.code !== 0) return { skipped: 'budget', reason: budget.reason };
+  const budget = review.reviewBudget(model, cachedBudget(keep.ROOT), accountId === undefined ? ideasAccountId() : accountId);
+  if (budget.code !== 0) return { skipped: 'budget', reason: budget.reason, code: budget.code };
   const evidence = buildEvidence({ now, root: keep.ROOT });
   const prompt = buildPrompt(evidence, now);
   if (dry) return { prompt, evidence };
@@ -640,6 +649,18 @@ function recordAttempt(now, reason) {
   });
 }
 
+// Which health record a sweep outcome deserves. An exhausted window (6, 7) is the
+// governor working and heals itself, so it stays a skip. Code 8 means the sweep could
+// not read its budget at all - a broken sweep - and recording that as a skip is how
+// this one sat dead from 2026-09-11 with a green health row and nobody the wiser.
+function healthForResult(result) {
+  if (result && result.skipped === 'budget' && result.code === 8) {
+    return { ok: false, error: `ideas sweep could not read its budget: ${result.reason}` };
+  }
+  const skipped = Boolean(result && result.skipped);
+  return { ok: true, skipped, detail: skipped ? 'nothing due' : 'completed' };
+}
+
 function startScheduler({ onChange } = {}) {
   const configured = ideasClock();
   const clock = configured.invalid ? DEFAULT_CLOCK : configured;
@@ -657,7 +678,9 @@ function startScheduler({ onChange } = {}) {
       const result = await run({ now });
       if (result.skipped === 'budget') recordAttempt(now, result.reason);
       if (!result.skipped && onChange) onChange();
-      health.record('ideas', { ok: true, skipped: Boolean(result.skipped), detail: result.skipped ? 'nothing due' : 'completed' });
+      const record = healthForResult(result);
+      if (!record.ok) process.stderr.write(`keep ideas: ${record.error}\n`);
+      health.record('ideas', record);
     } catch (error) {
       health.record('ideas', { ok: false, error });
       process.stderr.write(`keep ideas: ${error.message}\n`);
@@ -673,5 +696,5 @@ function startScheduler({ onChange } = {}) {
 
 module.exports = {
   EVIDENCE_MAX, MODEL_TIMEOUT_MS, CLAIM_MAX_AGE_MS, collectReviews, buildEvidence, renderEvidence, fitEvidence, buildPrompt, parseIdeas,
-  normalizeSweepTitle, captureModelOutput, runModel, landProposals, run, ideasClock, sweepDue, startScheduler, loadMeta,
+  normalizeSweepTitle, captureModelOutput, runModel, landProposals, run, ideasAccountId, healthForResult, ideasClock, sweepDue, startScheduler, loadMeta,
 };

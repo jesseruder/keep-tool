@@ -236,3 +236,63 @@ test('keep ideas --dry exits zero without writes', () => {
     fs.rmSync(fixture.root, { recursive: true, force: true });
   }
 });
+
+// The sweep died on 2026-09-11 and stayed dead for three days with a green health
+// row: no account was pinned, so a multi-account budget read was always code 8, and
+// code 8 was recorded as a skip.
+function accountsFixture(automationAccounts) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-ideas-accounts-'));
+  const config = path.join(root, 'config.json');
+  const dirs = Object.fromEntries(['a', 'b'].map((id) => [id, path.join(root, id)]));
+  for (const dir of Object.values(dirs)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(config, JSON.stringify({
+    version: 1,
+    accounts: [
+      { id: 'claude-default', label: 'Claude A', agent: 'claude', configDir: dirs.a },
+      { id: 'claude-secondary', label: 'Claude B', agent: 'claude', configDir: dirs.b },
+    ],
+    defaultAccounts: { claude: 'claude-default' },
+    ...(automationAccounts ? { automationAccounts } : {}),
+  }));
+  return { root, env: { KEEP_CONFIG: config } };
+}
+
+test('the ideas sweep resolves its own automation account, falling back to the default', () => {
+  const configured = accountsFixture({ ideas: 'claude-secondary', reviewer: 'claude-secondary' });
+  const bare = accountsFixture(null);
+  try {
+    assert.equal(ideas.ideasAccountId(configured.env), 'claude-secondary');
+    assert.equal(ideas.ideasAccountId(bare.env), 'claude-default', 'no `ideas` purpose still resolves');
+    assert.equal(ideas.ideasAccountId({ KEEP_CONFIG: path.join(bare.root, 'nope.json') }), 'claude/default',
+      'with no accounts configured at all it still names the built-in account, never nothing');
+  } finally {
+    fs.rmSync(configured.root, { recursive: true, force: true });
+    fs.rmSync(bare.root, { recursive: true, force: true });
+  }
+});
+
+test('a budget the sweep cannot read is a health failure; an exhausted one is a skip', async () => {
+  const review = require('./review.js');
+  const original = review.reviewBudget;
+  try {
+    // Code 8 is "the budget is unreadable": the sweep is broken and health must say so.
+    review.reviewBudget = () => ({ code: 8, reason: 'no usage snapshot for account claude-secondary' });
+    const unknown = await ideas.run({ now: Date.now() });
+    assert.equal(unknown.skipped, 'budget');
+    assert.equal(unknown.code, 8);
+    assert.deepEqual(ideas.healthForResult(unknown), {
+      ok: false, error: 'ideas sweep could not read its budget: no usage snapshot for account claude-secondary',
+    });
+
+    // 6 and 7 are the governor working; they heal on their own and stay skips.
+    for (const code of [6, 7]) {
+      review.reviewBudget = () => ({ code, reason: 'weekly usage at 99%' });
+      const exhausted = await ideas.run({ now: Date.now() });
+      assert.equal(exhausted.code, code);
+      assert.deepEqual(ideas.healthForResult(exhausted), { ok: true, skipped: true, detail: 'nothing due' });
+    }
+
+    assert.deepEqual(ideas.healthForResult({ skipped: 'in progress' }), { ok: true, skipped: true, detail: 'nothing due' });
+    assert.deepEqual(ideas.healthForResult({ landed: [] }), { ok: true, skipped: false, detail: 'completed' });
+  } finally { review.reviewBudget = original; }
+});
