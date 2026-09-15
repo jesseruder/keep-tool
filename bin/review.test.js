@@ -3275,6 +3275,22 @@ test('a tick refreshes the lint snapshot before waking the reviewer', async () =
   assert.equal(refreshes, 1, 'the bundle the reviewer is about to build reads a current snapshot');
   assert.equal(sent.length, 1);
   assert.ok(lintTool.LINT_EVERY_MS > 0);
+
+  // The refresh can take as long as the child's timeout. A reviewer that started a
+  // turn meanwhile is looked at again before anything is typed, and a drift that
+  // finds it busy is parked exactly as one that found it busy from the start.
+  let busy = false;
+  const late = {
+    ...deps,
+    findReviewer: () => ({ id: 'reviewer-1', state: 'idle', endedTurn: !busy }),
+    refreshLint: async () => { busy = true; ageMs = 0; return { ok: true }; },
+  };
+  ageMs = 4 * 3600e3;
+  const held = await cadence.driftWake(late, { sessionId: 'sess-late', turn: 1, cardId: 'c', stateLine: 's', reason: 'r' });
+  assert.equal(held.sent, false);
+  assert.equal(held.why, 'reviewer is mid-turn');
+  assert.equal(held.parked, true, 'the drift waits for the reviewer instead of being lost');
+  assert.equal(sent.length, 1, 'nothing was typed into a busy reviewer');
 });
 
 test('a stale lint block tells the reviewer the refusal is off, not on', () => {

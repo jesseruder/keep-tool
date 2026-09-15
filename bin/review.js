@@ -4343,16 +4343,17 @@ async function reviewTick(deps, opts) {
   // (announce slot, global suppression) must not be clobbered by our stale copy.
   // Deliberately not withLock - on contention it die()s, which in the daemon
   // would kill the server; the residual race only affects lastSkip/lastTickAt.
-  if (!decision.send) {
+  const skip = (why) => {
     // recorded so review-stats can tell "quiet fleet" from "dead scheduler"
-    const parked = Boolean(detail) && driftRetryable(decision.why);
+    const parked = Boolean(detail) && driftRetryable(why);
     mutateMeta((fresh) => {
-      fresh.lastSkip = { at: now, why: decision.why, trigger };
-      if (parked) recordPendingDrift(fresh, detail, now, decision.why);
+      fresh.lastSkip = { at: now, why, trigger };
+      if (parked) recordPendingDrift(fresh, detail, now, why);
       else if (detail) clearPendingDrift(fresh, detail.sessionId);
     });
-    return { sent: false, why: decision.why, budget, model, ranked: queue.ranked.length, trigger, parked };
-  }
+    return { sent: false, why, budget, model, ranked: queue.ranked.length, trigger, parked };
+  };
+  if (!decision.send) return skip(decision.why);
 
   // The reviewer is about to run review-bundle, which splices the persisted lint
   // snapshot in, and review-land will judge its notes against that same file. A stale
@@ -4360,6 +4361,19 @@ async function reviewTick(deps, opts) {
   // bounded by the child's own timeout, and never fatal: an old snapshot is still
   // better than no tick.
   await refreshLintSnapshot(deps);
+  // That refresh can take as long as the child's timeout, and "the reviewer is idle"
+  // was decided before it. Look again before typing: a reviewer that started a turn
+  // meanwhile gets the same skip (and a drift the same parking) it would have got
+  // had it been busy from the start.
+  if (!options.force) {
+    const again = (deps.findReviewer || findReviewerSession)(deps.sessions ? deps.sessions() : [], meta.bootstrapAttempts);
+    const recheck = shouldSendTick({
+      budget, reviewer: again && again.id === reviewer.id ? again : null, queue, lastTickAt: meta.lastTickAt, now, trigger,
+      drift: detail ? driftGate(meta, detail, now) : null,
+      sweepDue: options.sweepDue,
+    });
+    if (!recheck.send) return skip(recheck.why);
+  }
 
   const text = detail
     ? driftTickMessage(detail, queue.ranked)

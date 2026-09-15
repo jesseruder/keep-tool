@@ -947,7 +947,7 @@ function runLintChild(options = {}) {
   const execFile = options.execFile || require('child_process').execFile;
   const root = options.root || keep.ROOT;
   return new Promise((resolve) => {
-    execFile(process.execPath, [path.join(__dirname, 'keep.js'), 'lint', '--json'], {
+    const child = execFile(process.execPath, [path.join(__dirname, 'keep.js'), 'lint', '--json'], {
       env: { ...process.env, KEEP_DIR: root },
       timeout: Number(options.timeoutMs) || LINT_TIMEOUT_MS,
       maxBuffer: 4 * 1024 * 1024,
@@ -960,6 +960,9 @@ function runLintChild(options = {}) {
       try { findings = JSON.parse(String(stdout || '')).findings; } catch {}
       resolve({ ok: true, findings: Array.isArray(findings) ? findings.length : null });
     });
+    // A refresh in flight must not hold the daemon open on shutdown; the snapshot it
+    // was writing is rebuilt on the next run.
+    if (child && typeof child.unref === 'function') child.unref();
   });
 }
 
