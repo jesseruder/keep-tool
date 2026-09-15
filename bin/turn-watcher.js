@@ -772,6 +772,47 @@ function releaseClaim(turn, claim, options = {}) {
   } catch {}
 }
 
+// ---------- the state machine's answer, recorded for comparison ----------
+
+// The three rules in bin/session-status.js `activity()` that are inferred from
+// prose rather than observed as a fact on screen. They are the whole reason this
+// record exists: a permission prompt or a pending question is not in doubt, but
+// "the turn ended with a question mark" is, and the model's judgment is only
+// worth something where the rules are guessing.
+const INFERRED_ATTENTION_RULES = ['prose-request', 'conversation-wait', 'conversation-ready'];
+
+// Flatten an activity() result into the four columns. Shape-checked rather than
+// trusted: a null record is a turn with no comparison, which is exactly what
+// `keep watcher compare` skips.
+function attentionRecord(activity) {
+  if (!activity || typeof activity !== 'object') return null;
+  const decision = activity.decision && typeof activity.decision === 'object' ? activity.decision : {};
+  const rule = typeof decision.rule === 'string' && decision.rule ? decision.rule : null;
+  const state = typeof activity.state === 'string' && activity.state ? activity.state
+    : typeof decision.state === 'string' && decision.state ? decision.state : null;
+  if (!rule && !state) return null;
+  return {
+    rule,
+    state,
+    confidence: typeof decision.confidence === 'string' && decision.confidence ? decision.confidence : null,
+    needsInput: activity.needsInput ? 1 : 0,
+  };
+}
+
+// The resolver is supplied by whoever has session objects to hand — the daemon,
+// which just built the dashboard's own snapshot (bin/serve.js). It must never
+// cost the verdict: a missing resolver, a throw, or an unrecognizable answer
+// stores nulls and the verdict lands exactly as it would have.
+function attentionFor(turn, deps = {}) {
+  if (typeof deps.attentionFor !== 'function') return null;
+  try {
+    return attentionRecord(deps.attentionFor(turn.session_id, turn));
+  } catch (error) {
+    if (process.env.KEEP_DEBUG) process.stderr.write(`keep watcher: attention not recorded: ${error.message}\n`);
+    return null;
+  }
+}
+
 function judgedState(turn, options = {}) {
   const handle = turnIndex.open(options.db);
   return handle.prepare('SELECT verdict, verdict_model, decision_id FROM turns WHERE id = ?').get(turn.id) || {};
@@ -793,18 +834,32 @@ function writeVerdict(turn, value, options = {}) {
   if (options.replay) where.push("(verdict IS NULL OR verdict_model LIKE '%:replay')");
   const stateLine = oneLine(value.stateLine, STATE_LINE_LIMIT) || null;
   const at = Date.now();
+  // The state machine's answer is written only by a caller that actually asked
+  // for one. judge() always sets the key — to null when nothing could be
+  // computed — so a re-judge never leaves a fresh verdict paired with a record
+  // taken at some other moment. A caller that does not set it (a direct
+  // writeVerdict, a test) leaves whatever is already there alone, because it
+  // knows nothing about the session's attention either way.
+  const attention = Object.prototype.hasOwnProperty.call(value, 'attention') ? value.attention || null : undefined;
   // judging_at is deliberately NOT cleared here. The claim has to outlive the
   // verdict write: the ledger entry and the decision_id pointer come after it,
   // and a concurrent --force run that claimed in that gap would record a second
   // decision. judge() releases the claim in a finally, once the pointer is on.
-  const result = handle.prepare(`UPDATE turns SET verdict = ?, verdict_reason = ?, verdict_message = ?,
-      state_line = ?, verdict_confidence = ?, verdict_model = ?, verdict_ms = ?, verdict_at = ?,
-      card_id = ?
-    WHERE ${where.join(' AND ')}`).run(
-    value.verdict, oneLine(value.reason, REASON_LIMIT), clip(value.message || '', MESSAGE_LIMIT),
+  const assignments = ['verdict = ?', 'verdict_reason = ?', 'verdict_message = ?', 'state_line = ?',
+    'verdict_confidence = ?', 'verdict_model = ?', 'verdict_ms = ?', 'verdict_at = ?', 'card_id = ?'];
+  const values = [value.verdict, oneLine(value.reason, REASON_LIMIT), clip(value.message || '', MESSAGE_LIMIT),
     stateLine, value.confidence == null ? null : Number(value.confidence),
     value.model || null, Number.isFinite(value.ms) ? Math.round(value.ms) : null, at,
-    value.cardId || null, turn.id, ...guards);
+    value.cardId || null];
+  if (attention !== undefined) {
+    assignments.push('attention_rule = ?', 'attention_state = ?', 'attention_confidence = ?',
+      'attention_needs_input = ?');
+    values.push(attention && attention.rule, attention && attention.state, attention && attention.confidence,
+      attention ? attention.needsInput : null);
+  }
+  const result = handle.prepare(`UPDATE turns SET ${assignments.join(', ')}
+    WHERE ${where.join(' AND ')}`).run(...values.map((entry) => (entry === undefined ? null : entry)),
+    turn.id, ...guards);
   const changes = Number(result.changes);
   if (!changes) return 0;
   // The index records a card on the session too, so `keep turns show <card>` and
@@ -925,6 +980,11 @@ async function judgeClaimed(turn, deps, { prior, claim, startedAt }) {
   // Replays are scored automatically against what Owner actually typed, so they
   // must never add to the ledger Owner is asked to judge by hand.
   if (deps.replay === true) value.model = `${value.model}:replay`;
+  // Asked as late as possible, because the model call took minutes and the
+  // question is what the console would be showing about this session now — the
+  // same moment the verdict is stamped with. Always set, even when it comes back
+  // null: see writeVerdict.
+  value.attention = attentionFor(turn, deps);
   // Verdict first, ledger second, pointer last. The ledger entry is the durable
   // half, so a crash between the two must leave a turn with a verdict and no
   // decision — recoverable by a rerun — rather than a ledger entry nothing
@@ -1299,6 +1359,110 @@ function listVerdicts(options = {}) {
     ORDER BY COALESCE(t.verdict_at, 0) DESC LIMIT ?`).all(...params);
 }
 
+// ---------- attention comparison ----------
+
+// Only turns that have both halves: a verdict, and the state machine's answer
+// recorded beside it. A turn judged before the columns existed, or judged by a
+// caller with no session to hand, has nothing to compare and is not a miss.
+const COMPARABLE = 't.verdict IS NOT NULL AND t.attention_needs_input IS NOT NULL';
+
+// The model's side of the 2x2. `drift` is not an answer to "does this need
+// Owner" at all — it says the turn went the wrong way — so it is counted
+// separately and left out of the table rather than forced into one of the cells.
+function modelNeedsInput(verdict) {
+  if (verdict === 'needs-input') return true;
+  if (verdict === 'continue' || verdict === 'quiet') return false;
+  return null;
+}
+
+function emptyMatrix() {
+  return { bothYes: 0, noise: 0, missed: 0, bothNo: 0, agreed: 0, total: 0, drift: 0 };
+}
+
+// `noise`: the rules put the session in "Waiting on you" and the model says it
+// did not need to. `missed`: the model wants Owner and the rules did not say so.
+function addToMatrix(matrix, machine, verdict, n = 1) {
+  const model = modelNeedsInput(verdict);
+  if (model === null) { matrix.drift += n; return; }
+  matrix.total += n;
+  if (machine && model) { matrix.bothYes += n; matrix.agreed += n; }
+  else if (machine) matrix.noise += n;
+  else if (model) matrix.missed += n;
+  else { matrix.bothNo += n; matrix.agreed += n; }
+}
+
+function comparisonTail(text, limit = 200) {
+  const value = String(text == null ? '' : text).replace(/\s+/g, ' ').trim();
+  return value.length > limit ? `…${value.slice(-limit)}` : value;
+}
+
+function compareRowDirection(machine, verdict) {
+  const model = modelNeedsInput(verdict);
+  if (model === null) return 'drift';
+  if (machine === model) return 'agreed';
+  return machine ? 'noise' : 'missed';
+}
+
+// `missed` first: a session the console never flagged is the failure Owner
+// cannot see by looking at the console, so it is the half of the disagreement
+// list worth reading first.
+const DIRECTION_ORDER = { missed: 0, noise: 1, agreed: 2, drift: 3 };
+
+function compare(options = {}) {
+  const handle = turnIndex.open(options.db);
+  const since = Number.isFinite(options.sinceMs) ? options.sinceMs : 0;
+  const limit = Number.isInteger(options.limit) && options.limit > 0 ? options.limit : 40;
+  const only = options.only === 'all' ? 'all' : 'disagreements';
+  // Grouped in SQL: the totals are over every comparable turn in the window, and
+  // pulling one row per turn to count them would grow with the history.
+  const counts = handle.prepare(`SELECT t.attention_rule AS rule, t.attention_confidence AS confidence,
+      t.attention_needs_input AS machine, t.verdict AS verdict, COUNT(*) AS n
+    FROM turns t WHERE ${COMPARABLE} AND COALESCE(t.verdict_at, 0) >= ?
+    GROUP BY rule, confidence, machine, verdict`).all(since);
+  const all = emptyMatrix();
+  const inferred = emptyMatrix();
+  const byRule = new Map();
+  for (const row of counts) {
+    const machine = Number(row.machine) === 1;
+    const rule = row.rule || '(unknown)';
+    const isInferred = INFERRED_ATTENTION_RULES.includes(rule);
+    addToMatrix(all, machine, row.verdict, row.n);
+    if (isInferred) addToMatrix(inferred, machine, row.verdict, row.n);
+    if (!byRule.has(rule)) byRule.set(rule, { rule, confidence: row.confidence || null, inferred: isInferred, ...emptyMatrix() });
+    addToMatrix(byRule.get(rule), machine, row.verdict, row.n);
+  }
+  const where = [COMPARABLE, 'COALESCE(t.verdict_at, 0) >= ?'];
+  const params = [since];
+  if (only === 'disagreements') {
+    where.push("t.verdict <> 'drift'");
+    where.push("((t.attention_needs_input = 1 AND t.verdict <> 'needs-input')"
+      + " OR (t.attention_needs_input = 0 AND t.verdict = 'needs-input'))");
+  }
+  params.push(limit);
+  const rows = handle.prepare(`SELECT t.id, t.session_id, t.n, t.card_id, t.verdict, t.verdict_reason,
+      t.verdict_at, t.attention_rule, t.attention_state, t.attention_confidence, t.attention_needs_input,
+      t.last_assistant
+    FROM turns t WHERE ${where.join(' AND ')}
+    ORDER BY COALESCE(t.verdict_at, 0) DESC LIMIT ?`).all(...params).map((row) => {
+    const machine = Number(row.attention_needs_input) === 1;
+    return {
+      turn: row.id, session: row.session_id, n: row.n, card: row.card_id || '',
+      at: Number.isFinite(row.verdict_at) ? row.verdict_at : null,
+      rule: row.attention_rule || '(unknown)', state: row.attention_state || '',
+      confidence: row.attention_confidence || '', machineNeedsInput: machine,
+      verdict: row.verdict, reason: oneLine(row.verdict_reason, 160),
+      tail: comparisonTail(row.last_assistant),
+      direction: compareRowDirection(machine, row.verdict),
+      // `keep turns show` takes a session id or a card id, so Owner can read the
+      // whole turn without going near the database.
+      show: `keep turns show ${row.session_id}`,
+    };
+  });
+  rows.sort((a, b) => (DIRECTION_ORDER[a.direction] - DIRECTION_ORDER[b.direction]) || ((b.at || 0) - (a.at || 0)));
+  const rules = [...byRule.values()].sort((a, b) => (b.total + b.drift) - (a.total + a.drift) || a.rule.localeCompare(b.rule));
+  return { since, only, limit, inferredRules: INFERRED_ATTENTION_RULES, matrix: { all, inferred }, rules, rows };
+}
+
 // The latest state line per session, in one bounded query, for the dashboard.
 function stateLines(sessionIds, options = {}) {
   const ids = [...new Set((sessionIds || []).filter((id) => typeof id === 'string' && id))];
@@ -1478,5 +1642,6 @@ module.exports = {
   watcherModelTag, PROMPT_HASH,
   tick, enabled, replay, groundTruth, scoreOne, unquoted, confidenceBand, BANDS, BAND_LABELS,
   saveReplay, latestReplay, replayDir, listVerdicts, stateLines, stats, watcherModel,
+  attentionRecord, attentionFor, compare, modelNeedsInput, INFERRED_ATTENTION_RULES,
   pendingDecisions, pendingDecisionsForSession, shadowSummary, judgeDecision, forgetLedger,
 };

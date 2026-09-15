@@ -7870,6 +7870,19 @@ function start(deps = {}) {
         ? sessionSnapshot : scanSessions();
       const result = await watcher.tick({
         limit: WATCHER_TURNS_PER_TICK, concurrency: WATCHER_CONCURRENCY, windowMs: WATCHER_WINDOW_MS,
+        // What the console itself would say about this session, recorded beside
+        // the verdict so the two can be compared later (`keep watcher compare`,
+        // docs/turn-watcher.md). Read as late as the verdict, from the freshest
+        // snapshot there is: buildState has already run activity() over those
+        // objects, so this is a lookup rather than a second transcript scan.
+        // Measurement only — nothing here changes what the console shows.
+        attentionFor: (sessionId) => {
+          const pool = sessionSnapshot.length ? sessionSnapshot : sessions;
+          const session = pool.find((candidate) => candidate.id === sessionId)
+            || sessions.find((candidate) => candidate.id === sessionId);
+          if (!session) return null;
+          return session.activity || sessionStatus.activity(session);
+        },
         // The live path exists only here. It uses the same guarded send the
         // console's POST /api/send uses, so target resolution, the precheck and
         // the injection mutex all apply to a watcher message too.

@@ -1673,3 +1673,213 @@ test('building a context never unlinks a hold file', (t) => {
   watcher.holdBlock(turn);
   assert.equal(fs.existsSync(file), true);
 });
+
+// ---------- the state machine's answer, recorded beside the verdict ----------
+
+// The shape bin/session-status.js activity() returns, minus everything this
+// module does not read.
+function activityResult({ rule, state, confidence = 'observed', needsInput = false }) {
+  return { state, label: state, reason: null, needsInput, request: needsInput ? { kind: 'input' } : null,
+    decision: { rule, source: 'prose', confidence, at: null, state, alternatives: [] } };
+}
+
+test('a judged turn records what the console would have said about the session', async (t) => {
+  const dir = sandbox(t);
+  indexTurns(dir, [['do the thing', 'Done. Which of the two should I use?']]);
+  const asked = [];
+  const result = await watcher.judge(watcher.turnFor(SESSION, 1), fakeDeps(
+    '{"verdict":"needs-input","reason":"a real question","message":"","state_line":"s","confidence":0.8}',
+    {
+      decisions: { record: () => ({ id: 'd-1' }) },
+      attentionFor: (sessionId) => {
+        asked.push(sessionId);
+        return activityResult({ rule: 'prose-request', state: 'needs-input', confidence: 'inferred', needsInput: true });
+      },
+    },
+  ));
+  assert.equal(result.verdict, 'needs-input');
+  assert.deepEqual(asked, [SESSION], 'the session is resolved once, by id');
+  const row = turnIndex.open().prepare('SELECT * FROM turns WHERE session_id = ? AND n = 1').get(SESSION);
+  assert.equal(row.attention_rule, 'prose-request');
+  assert.equal(row.attention_state, 'needs-input');
+  assert.equal(row.attention_confidence, 'inferred');
+  assert.equal(row.attention_needs_input, 1);
+});
+
+test('a throwing or unusable activity() costs the attention record, never the verdict', async (t) => {
+  const dir = sandbox(t);
+  indexTurns(dir, [['a', 'Done.'], ['b', 'Done again.'], ['c', 'And again.']]);
+  const answer = '{"verdict":"quiet","reason":"nothing to do","message":"","state_line":"s","confidence":0.9}';
+  const resolvers = [
+    ['throws', () => { throw new Error('scan failed'); }],
+    ['returns nothing', () => null],
+    ['returns a shape with no rule and no state', () => ({ needsInput: true, decision: {} })],
+  ];
+  for (const [label, attentionFor] of resolvers) {
+    const n = resolvers.findIndex(([name]) => name === label) + 1;
+    const result = await watcher.judge(watcher.turnFor(SESSION, n), fakeDeps(answer, {
+      decisions: { record: () => ({ id: `d-${n}` }) }, attentionFor,
+    }));
+    assert.equal(result.verdict, 'quiet', `the verdict still lands when the resolver ${label}`);
+    const row = turnIndex.open().prepare('SELECT * FROM turns WHERE session_id = ? AND n = ?').get(SESSION, n);
+    assert.equal(row.verdict, 'quiet');
+    for (const column of ['attention_rule', 'attention_state', 'attention_confidence', 'attention_needs_input']) {
+      assert.equal(row[column], null, `${column} is null when the resolver ${label}`);
+    }
+  }
+
+  // No resolver at all is the same: the daemon supplies one, `keep watcher run`
+  // does not, and neither may be blocked by the other.
+  const bare = await watcher.judge(watcher.turnFor(SESSION, 1), fakeDeps(answer, {
+    force: true, decisions: { record: () => ({ id: 'd-bare' }) },
+  }));
+  assert.equal(bare.verdict, 'quiet');
+  assert.equal(bare.attention, null);
+});
+
+test('a direct writeVerdict leaves an attention record it knows nothing about alone', (t) => {
+  const dir = sandbox(t);
+  indexTurns(dir, [['a', 'Done.']]);
+  const turn = watcher.turnFor(SESSION, 1);
+  watcher.writeVerdict(turn, {
+    verdict: 'quiet', reason: 'r', message: '', stateLine: 's', confidence: 0.5, model: 'fake',
+    attention: { rule: 'conversation-ready', state: 'needs-input', confidence: 'inferred', needsInput: 1 },
+  });
+  const read = () => turnIndex.open().prepare('SELECT * FROM turns WHERE id = ?').get(turn.id);
+  assert.equal(read().attention_rule, 'conversation-ready');
+
+  // A caller that does not set the key is not claiming the record is stale.
+  watcher.writeVerdict(turn, { verdict: 'continue', reason: 'r', message: 'continue', stateLine: 's', model: 'fake' });
+  assert.equal(read().attention_rule, 'conversation-ready');
+  assert.equal(read().verdict, 'continue');
+
+  // A caller that sets it to null is, and clears all four.
+  watcher.writeVerdict(turn, { verdict: 'quiet', reason: 'r', message: '', stateLine: 's', model: 'fake', attention: null });
+  assert.equal(read().attention_rule, null);
+  assert.equal(read().attention_needs_input, null);
+});
+
+// ---------- keep watcher compare ----------
+
+// Seed the index directly: what compare() reads is four columns and a verdict,
+// and driving a model for each row would say nothing extra about the arithmetic.
+function seedComparison(dir, rows, baseAt = 1000) {
+  indexTurns(dir, rows.map((row, index) => [`opener ${index + 1}`, row.tail || `assistant ${index + 1}`]));
+  const handle = turnIndex.open();
+  rows.forEach((row, index) => {
+    handle.prepare(`UPDATE turns SET verdict = ?, verdict_reason = ?, verdict_at = ?, card_id = ?,
+        attention_rule = ?, attention_state = ?, attention_confidence = ?, attention_needs_input = ?
+      WHERE session_id = ? AND n = ?`).run(
+      row.verdict, row.reason || `because ${index + 1}`, baseAt + index, row.card || 'kt-1',
+      row.rule === undefined ? null : row.rule, row.state || 'needs-input',
+      row.confidence === undefined ? 'inferred' : row.confidence,
+      row.machine === undefined ? null : (row.machine ? 1 : 0),
+      SESSION, index + 1);
+  });
+}
+
+test('compare counts the 2x2 both ways, restricts it to the inferred rules, and leaves drift out', (t) => {
+  const dir = sandbox(t);
+  seedComparison(dir, [
+    // Agreement, on an observed rule.
+    { verdict: 'needs-input', rule: 'permission-hook', confidence: 'observed', machine: true },
+    // noise: the rules asked for Owner, the model did not.
+    { verdict: 'quiet', rule: 'prose-request', confidence: 'inferred', machine: true },
+    { verdict: 'continue', rule: 'conversation-ready', confidence: 'inferred', machine: true },
+    // missed: the model wants Owner, the rules did not say so.
+    { verdict: 'needs-input', rule: 'conversation-wait', confidence: 'inferred', machine: false },
+    // Agreement on nothing needed.
+    { verdict: 'quiet', rule: 'foreground-hook', confidence: 'observed', machine: false },
+    // Drift is an answer to a different question.
+    { verdict: 'drift', rule: 'prose-request', confidence: 'inferred', machine: true },
+    // No attention record at all: not a miss, just not comparable.
+    { verdict: 'needs-input', rule: undefined, machine: undefined },
+  ]);
+
+  const result = watcher.compare({ sinceMs: 0 });
+  assert.deepEqual({ ...result.matrix.all }, {
+    bothYes: 1, noise: 2, missed: 1, bothNo: 1, agreed: 2, total: 5, drift: 1,
+  });
+  // The restriction is the real question: only the three prose-inferred rules.
+  assert.deepEqual({ ...result.matrix.inferred }, {
+    bothYes: 0, noise: 2, missed: 1, bothNo: 0, agreed: 0, total: 3, drift: 1,
+  });
+  assert.deepEqual(result.inferredRules, ['prose-request', 'conversation-wait', 'conversation-ready']);
+
+  const byRule = Object.fromEntries(result.rules.map((row) => [row.rule, row]));
+  assert.equal(byRule['prose-request'].noise, 1);
+  assert.equal(byRule['prose-request'].drift, 1);
+  assert.equal(byRule['prose-request'].inferred, true);
+  assert.equal(byRule['permission-hook'].agreed, 1);
+  assert.equal(byRule['permission-hook'].inferred, false);
+  assert.equal(byRule['conversation-wait'].missed, 1);
+  assert.equal(result.rules.some((row) => row.rule === '(unknown)'), false, 'an uncomparable turn is not a rule');
+});
+
+test('the compare list shows disagreements only, missed first, with the turn tail and a pointer', (t) => {
+  const dir = sandbox(t);
+  seedComparison(dir, [
+    { verdict: 'quiet', rule: 'prose-request', machine: true, tail: 'Nothing left to do here.' },
+    { verdict: 'needs-input', rule: 'conversation-wait', machine: false, tail: 'Which of the two should I use?' },
+    { verdict: 'needs-input', rule: 'permission-hook', confidence: 'observed', machine: true, tail: 'Approve?' },
+  ]);
+
+  const result = watcher.compare({ sinceMs: 0 });
+  assert.deepEqual(result.rows.map((row) => row.direction), ['missed', 'noise'],
+    'agreements are out, and missed comes first');
+  assert.equal(result.rows[0].rule, 'conversation-wait');
+  assert.equal(result.rows[0].verdict, 'needs-input');
+  assert.match(result.rows[0].tail, /Which of the two should I use\?$/);
+  assert.equal(result.rows[0].show, `keep turns show ${SESSION}`);
+  assert.equal(result.rows[0].card, 'kt-1');
+  assert.equal(result.rows[1].direction, 'noise');
+
+  // --only all keeps the agreement, still newest-first inside each group.
+  const all = watcher.compare({ sinceMs: 0, only: 'all' });
+  assert.equal(all.rows.length, 3);
+  assert.deepEqual(all.rows.map((row) => row.direction), ['missed', 'noise', 'agreed']);
+  // The limit bounds the list, not the arithmetic.
+  const capped = watcher.compare({ sinceMs: 0, only: 'all', limit: 1 });
+  assert.equal(capped.rows.length, 1);
+  assert.equal(capped.matrix.all.total, 3);
+  // And --since excludes by verdict time.
+  assert.equal(watcher.compare({ sinceMs: 1002 }).matrix.all.total, 1);
+});
+
+test('compare survives a window with nothing comparable in it', (t) => {
+  sandbox(t);
+  const result = watcher.compare({ sinceMs: 0 });
+  assert.equal(result.matrix.all.total, 0);
+  assert.deepEqual(result.rows, []);
+  assert.deepEqual(result.rules, []);
+});
+
+test('keep watcher compare renders both directions inside 120 columns, and --json carries the same numbers', (t) => {
+  const dir = sandbox(t);
+  seedComparison(dir, [
+    { verdict: 'quiet', rule: 'prose-request', machine: true, tail: 'Everything above is committed and pushed.' },
+    { verdict: 'needs-input', rule: 'conversation-ready', machine: false, tail: 'Which of the two should I use?' },
+    { verdict: 'drift', rule: 'prose-request', machine: true },
+    { verdict: 'needs-input', rule: 'permission-hook', confidence: 'observed', machine: true },
+  ], Date.now() - 60e3);
+
+  const run = (args) => require('node:child_process').execFileSync(
+    process.execPath, [path.join(__dirname, 'keep.js'), 'watcher', 'compare', ...args],
+    { encoding: 'utf8', env: { ...process.env, KEEP_DIR: REGISTRY, KEEP_NO_PUSH: '1' } });
+
+  const text = run(['--since', '+1d']);
+  assert.match(text, /all rules — 3 turns, 1 drift excluded/);
+  assert.match(text, /inferred rules only \(prose-request, conversation-wait, conversation-ready\)/);
+  assert.match(text, /^missed\s/m);
+  assert.match(text, /^noise\s/m);
+  assert.match(text, new RegExp(`keep turns show ${SESSION}`));
+  // A terminal is 80 wide more often than not; nothing here may need a wider one.
+  for (const line of text.split('\n')) assert.ok(line.length <= 120, `line over 120 columns: ${line}`);
+
+  const json = JSON.parse(run(['--since', '+1d', '--json']));
+  assert.equal(json.matrix.all.total, 3);
+  assert.equal(json.matrix.all.drift, 1);
+  assert.equal(json.matrix.inferred.noise, 1);
+  assert.equal(json.matrix.inferred.missed, 1);
+  assert.deepEqual(json.rows.map((row) => row.direction), ['missed', 'noise']);
+});
