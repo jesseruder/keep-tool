@@ -726,6 +726,19 @@ function gcTable(rows) {
   return values.map((row) => row.map((value, index) => index === row.length - 1 ? value : value.padEnd(widths[index])).join('  ').trimEnd()).join('\n');
 }
 
+// When `wt new` claimed the tree. A fresh tree sits on origin's tip, whose commit
+// can be weeks old, so HEAD's age alone cannot say the tree has sat idle: gc
+// recycled a tree 41 s after creation that way. Unknown claim time reads as NaN,
+// which the caller treats as too new.
+function claimedAt(worktree) {
+  const file = path.join(worktree, '.wt.json');
+  try {
+    const created = Date.parse(JSON.parse(fs.readFileSync(file, 'utf8')).created);
+    if (Number.isFinite(created)) return created;
+  } catch {}
+  try { return fs.statSync(file).mtimeMs; } catch { return NaN; }
+}
+
 function gcWorktrees(options = {}) {
   const cfg = options.cfg || loadConfig();
   const days = options.days === undefined ? 3 : Number(options.days);
@@ -782,6 +795,7 @@ function gcWorktrees(options = {}) {
       else if (ahead > 0) reason = `${ahead} commit(s) ahead of origin/${defaultName}`;
       else if (liveCwds.some((cwd) => pathContains(cwd, item.path))) reason = 'live session cwd is inside worktree';
       else if (!item.free && (!Number.isFinite(committedAt) || now - committedAt < days * 86400e3)) reason = `last commit is newer than ${days} day(s)`;
+      else if (!item.free && !(now - claimedAt(item.path) >= days * 86400e3)) reason = `claimed less than ${days} day(s) ago`;
       assessments.push({ item, wasFree, safe: !reason, reason, committedAt });
     }
 

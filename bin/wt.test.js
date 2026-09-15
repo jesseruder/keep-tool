@@ -70,6 +70,11 @@ function ageHead(repo, iso) {
   });
 }
 
+function ageClaim(worktree, iso) {
+  const file = path.join(worktree, '.wt.json');
+  fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), created: iso }, null, 2) + '\n');
+}
+
 test('new creates a branch at origin/main, metadata, and excludes, then refuses duplicates', () => {
   const f = fixture();
   try {
@@ -564,6 +569,7 @@ test('gc recycles only old landed worktrees and explains every safety skip', () 
     ageHead(f.main, old);
     git(f.main, 'push', '-q', '--force', 'origin', 'main');
     const landed = runCli(f, ['new', f.name, 'landed', '--no-install']).stdout.trim();
+    ageClaim(landed, old);
     const dirty = runCli(f, ['new', f.name, 'dirty', '--no-install']).stdout.trim();
     const ahead = runCli(f, ['new', f.name, 'ahead', '--no-install']).stdout.trim();
     const live = runCli(f, ['new', f.name, 'live', '--no-install']).stdout.trim();
@@ -593,6 +599,31 @@ test('gc recycles only old landed worktrees and explains every safety skip', () 
     assert.equal(fs.existsSync(ahead), true);
     assert.equal(fs.existsSync(fresh), true);
     assert.equal(fs.existsSync(live), true);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('gc keeps a freshly claimed tree even when its base commit is older than --days', () => {
+  const f = fixture();
+  try {
+    // The 2026-09-14 case: `wt new` on a repo whose tip was five days old, then a
+    // daemon-start gc 41 s later recycled the tree while an agent was using it.
+    ageHead(f.main, '2026-08-01T00:00:00Z');
+    git(f.main, 'push', '-q', '--force', 'origin', 'main');
+    const claimed = runCli(f, ['new', f.name, 'just-claimed', '--no-install']).stdout.trim();
+    const unstamped = runCli(f, ['new', f.name, 'unstamped', '--no-install']).stdout.trim();
+    const metadata = JSON.parse(fs.readFileSync(path.join(unstamped, '.wt.json'), 'utf8'));
+    delete metadata.created;
+    fs.writeFileSync(path.join(unstamped, '.wt.json'), JSON.stringify(metadata) + '\n');
+
+    const result = wt.gcWorktrees({ cfg: f.cfg, days: 3, keepFree: 2, deps: { liveCwds: [] } });
+    const byName = new Map(result.rows.map((row) => [row.name, row]));
+    for (const [name, tree] of [['just-claimed', claimed], ['unstamped', unstamped]]) {
+      assert.equal(byName.get(name).action, 'skip', name);
+      assert.match(byName.get(name).reason, /claimed less than 3 day/, name);
+      assert.equal(fs.existsSync(path.join(tree, '.wt.json')), true, name);
+      assert.equal(fs.existsSync(path.join(tree, '.wt-free')), false, name);
+      assert.equal(git(tree, 'branch', '--show-current'), `wt/${name}`);
+    }
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
@@ -653,6 +684,7 @@ test('gc dry-run plans an old active tree through recycle and deletion when keep
     ageHead(f.main, old);
     git(f.main, 'push', '-q', '--force', 'origin', 'main');
     const worktree = runCli(f, ['new', f.name, 'disposable', '--no-install']).stdout.trim();
+    ageClaim(worktree, old);
     const options = { cfg: f.cfg, days: 3, keepFree: 0,
       now: Date.parse('2026-09-10T00:00:00Z'), deps: { liveCwds: [] } };
     const dry = wt.gcWorktrees({ ...options, dryRun: true });
