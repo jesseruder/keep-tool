@@ -5943,16 +5943,17 @@ function guardResumeCommand(input, env = process.env) {
   };
 }
 
-// ---------- the self-repair run guard ----------
+// ---------- the self-repair session guard ----------
 
-// A self-repair run is a bypassPermissions agent Keep launched by itself, in its
-// own worktree, to fix the daemon it is running inside. Three things it must
+// A self-repair session is a bypassPermissions agent Keep launched by itself, in
+// its own worktree, to fix the daemon it is running inside. Three things it must
 // never do: restart that daemon (Owner's call — and a restart mid-fix throws away
 // the evidence the card was opened with), touch the live ~/keep-tool checkout the
 // daemon runs from, or get a commit onto master without the review record.
-// runs.js sets KEEP_REPAIR=1 for exactly these runs, so this is silent in every
-// other session.
-const REPAIR_RULE = 'this is a Keep self-repair run (KEEP_REPAIR=1): fix the daemon in your own worktree, '
+// KEEP_REPAIR=1 is set on the pane at every launch of a session whose card carries
+// the `self-repair` tag — the open, a restart, a force-restart, an account handoff
+// — so the marker survives all of them, and this is silent in every other session.
+const REPAIR_RULE = 'this is a Keep self-repair session (KEEP_REPAIR=1): fix the daemon in your own worktree, '
   + 'land through `keep land <card>` after a recorded review, and leave the restart to Owner — '
   + 'step 4 of the repair card says so';
 const GIT_VALUE_FLAGS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env']);

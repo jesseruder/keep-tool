@@ -81,9 +81,13 @@ which is rewritten whole on every `record()` and would lose it:
   "day": "2026-09-15", "openedToday": 0 }
 ```
 
-`sessionId` (or, if the host never registered one, `pane`) is what marks a
-signature as launched. A reserved card with neither is a launch that did not
-finish, and the next tick resumes it.
+`sessionId` (or, if the host never registered one, `pane`, or `runId` from an entry
+an older keep-tool wrote) is what marks a signature as launched. A reserved card
+with none of them is a launch that did not finish, and the next tick resumes it.
+A launch that threw *after* the pane came up still counts as launched: the agent is
+running, and a second one on the same fault is the one thing this must not do.
+`attempts` belongs to one card, so it is cleared when the signature resolves and by
+`--reset`.
 
 Every change goes through one synchronous read-modify-write helper — atomic only
 because nothing inside it awaits, the same constraint as `review.js`'s
@@ -125,8 +129,9 @@ health row with the `daemon` row, the whole health snapshot, the last 80 serve.l
 lines mentioning the scheduler or its error (or the last 40 if none match), and,
 for a delivery incident, the inspection result, the matching journal, and the tail
 of `diagnostics/events.jsonl`. The recipe is stored alongside them as `recipe.md`,
-after the evidence so it can cite it — the session's opening message is capped at
-2000 characters and the recipe is several times that, so the session is pointed at
+after the evidence so it can cite it, and citing it by absolute path because the
+agent reads it with the worktree as its cwd. The opening message is capped at 2000
+characters and the recipe is about half again that, so the session is pointed at
 the file rather than told its contents. Each excerpt is scrubbed line by line, **redacted**
 and clipped to 64 KB, and staged inside `.keep` so nothing on the card ever cites
 `/tmp`. Redaction matters because evidence is committed and pushed with `~/keep`:
@@ -168,11 +173,15 @@ main checkout, so that matches. `self-repair.js` also refuses any cwd outside th
 configured worktree root before it calls `openSession` at all, and says so on the
 card rather than throwing inside the daemon loop.
 
-`deps.launchEnv` is how `KEEP_REPAIR=1` reaches the pane, and it is internal only:
-an `env` or `launchEnv` key in an HTTP request body is refused with 400. The
-variable rides the pane's environment through `/bin/zsh -lic` into
-`agent-launcher`, which strips only its own `KEEP_LAUNCHER` marker, so the guard
-below sees it in the agent's own Bash calls.
+`KEEP_REPAIR=1` is **derived from the card's `self-repair` tag, not from the launch
+call**. `serve.js`'s `repairEnvFor` merges it into the spawn environment at every
+launch site — the open, `restartSession`, `forceRestartSession` and the account
+handoff — so a restarted, force-restarted, handed-off or `keep resume`d repair
+session still carries the marker. self-repair.js also passes it through
+`deps.launchEnv`, which is internal only: an `env` or `launchEnv` key in an HTTP
+request body is refused with 400. The variable rides the pane's environment through
+`/bin/zsh -lic` into `agent-launcher`, which strips only its own `KEEP_LAUNCHER`
+marker, so the guard below sees it in the agent's own Bash calls.
 
 The session spends against the `repair` automation purpose, which falls back
 through `automationAccounts.claude` to the default, so nothing needs configuring
@@ -205,8 +214,8 @@ pre-bash` refuses, for any command in a session with `KEEP_REPAIR=1`:
   goes through `keep land`, which enforces the review record
 
 The refusal names the rule and points at step 4 of the repair card. The guard is
-keyed to the environment variable the repair launch puts on the pane, so no other
-session sees it.
+keyed to `KEEP_REPAIR=1`, which every launch of a session on a `self-repair`-tagged
+card sets, so no other session sees it and no restart clears it.
 
 **The card is not closed automatically**, the fix is not landed without a recorded
 review, and `--allow` grants cannot be set from an agent session, so the repair
