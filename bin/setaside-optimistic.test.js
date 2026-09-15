@@ -9,15 +9,17 @@ const start = app.indexOf('const optimisticSetAside = new Map();');
 const helpers = app.slice(start, app.indexOf('\nconst focusDebug', start));
 
 // Writes for one key finish in click order in the console (queueSetAsideWrite), so each
-// scenario finishes them in the order they began, with reloads interleaved.
+// scenario finishes them in the order they began. startReload/applyReload mirror
+// reload(): the generation is taken when it starts, pruning happens when it applies.
 function context() {
-  const c = vm.createContext({ reloadGeneration: 0, reloads: 0 });
+  const c = vm.createContext({ reloadGeneration: 0, appliedReloadGeneration: 0, reloads: 0 });
   vm.runInContext('function reload() { reloads += 1; }', c);
   vm.runInContext(helpers, c);
   const run = (code) => vm.runInContext(code, c);
   return {
     run,
-    generation: (value) => { c.reloadGeneration = value; },
+    startReload: () => { c.reloadGeneration += 1; return c.reloadGeneration; },
+    applyReload: (generation) => { c.appliedReloadGeneration = generation; run(`pruneSetAsideOverrides(${generation})`); },
     shown: (key) => run(`optimisticSetAside.has(${JSON.stringify(key)}) ? JSON.stringify(optimisticSetAside.get(${JSON.stringify(key)})) : 'snapshot'`),
     reloads: () => c.reloads,
   };
@@ -27,19 +29,28 @@ test('Mark running commits, a queued Unmark fails: the committed mark stays show
   const c = context();
   c.run("globalThis.mark = { kind: 'running' }; globalThis.a = beginSetAsideWrite('k', mark); globalThis.b = beginSetAsideWrite('k', null)");
   assert.equal(c.shown('k'), 'null', 'the newest click is shown while both are in flight');
-  c.generation(2);
+  const before = c.startReload(); // requested before Mark returned
   c.run("finishSetAsideWrite('k', a, mark, true)");
   assert.equal(c.shown('k'), 'null', 'an older write finishing does not replace the newest click');
-  c.run('pruneSetAsideOverrides(3)');
+  c.applyReload(before);
   assert.equal(c.shown('k'), 'null', 'a reload while a write is in flight keeps the override');
-  c.generation(3);
   c.run("finishSetAsideWrite('k', b, null, false)");
-  assert.equal(c.shown('k'), '{"kind":"running"}');
+  assert.equal(c.shown('k'), '{"kind":"running"}', 'the stale reload did not supersede the committed mark');
   assert.equal(c.reloads(), 1);
-  c.run('pruneSetAsideOverrides(3)');
-  assert.equal(c.shown('k'), '{"kind":"running"}', 'a reload that started before the failure keeps it');
-  c.run('pruneSetAsideOverrides(4)');
+  c.applyReload(c.startReload());
   assert.equal(c.shown('k'), 'snapshot', 'the reload after the failure hands back to fenced state');
+});
+
+test('a failed click does not resurrect a committed value that a newer reload already replaced', () => {
+  const c = context();
+  c.run("globalThis.a = beginSetAsideWrite('k', { kind: 'running' }); finishSetAsideWrite('k', a, { kind: 'running' }, true)");
+  c.run("globalThis.b = beginSetAsideWrite('k', null)");
+  c.applyReload(c.startReload()); // started after Mark returned, e.g. a new message cleared it
+  assert.equal(c.shown('k'), 'null', 'the in-flight click is not pruned');
+  c.run("finishSetAsideWrite('k', b, null, false)");
+  assert.equal(c.shown('k'), 'snapshot', 'the newer snapshot wins over the old mark');
+  assert.equal(c.run("setAsideKeys.has('k')"), false);
+  assert.equal(c.reloads(), 1);
 });
 
 test('two queued clicks that both fail fall back to the snapshot', () => {
@@ -53,30 +64,17 @@ test('two queued clicks that both fail fall back to the snapshot', () => {
   assert.equal(c.reloads(), 1);
 });
 
-test('a committed click survives a newer failed click even after an intervening reload', () => {
-  const c = context();
-  c.generation(3);
-  c.run("globalThis.a = beginSetAsideWrite('k', { kind: 'running' }); finishSetAsideWrite('k', a, { kind: 'running' }, true)");
-  c.run("globalThis.b = beginSetAsideWrite('k', null)");
-  c.run('pruneSetAsideOverrides(4)');
-  assert.equal(c.shown('k'), 'null', 'the in-flight click is not pruned');
-  c.generation(4);
-  c.run("finishSetAsideWrite('k', b, null, false)");
-  assert.equal(c.shown('k'), '{"kind":"running"}');
-  c.run('pruneSetAsideOverrides(5)');
-  assert.equal(c.shown('k'), 'snapshot', 'nothing lingers past the reload the failure requested');
-});
-
 test('an override stays until a reload that started after its last write returned', () => {
   const c = context();
   c.run("globalThis.a = beginSetAsideWrite('k', { kind: 'snooze' })");
-  c.run('pruneSetAsideOverrides(10)');
-  assert.equal(c.shown('k'), '{"kind":"snooze"}');
-  c.generation(10);
+  const early = c.startReload();
+  c.applyReload(early);
+  assert.equal(c.shown('k'), '{"kind":"snooze"}', 'pending writes survive any reload');
+  const straddling = c.startReload();
   c.run("finishSetAsideWrite('k', a, { kind: 'snooze' }, true)");
-  c.run('pruneSetAsideOverrides(10)');
-  assert.equal(c.shown('k'), '{"kind":"snooze"}', 'reload 10 started before the write returned');
-  c.run('pruneSetAsideOverrides(11)');
+  c.applyReload(straddling);
+  assert.equal(c.shown('k'), '{"kind":"snooze"}', 'a reload that started before the write returned keeps it');
+  c.applyReload(c.startReload());
   assert.equal(c.shown('k'), 'snapshot');
   assert.equal(c.run("setAsideKeys.has('k')"), false);
 });

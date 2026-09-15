@@ -181,13 +181,14 @@ function beginSetAsideWrite(key, entry) {
 function finishSetAsideWrite(key, record, entry, ok) {
   if (setAsideKeys.get(key) !== record) return;
   record.pending -= 1;
-  if (ok) record.committed = { entry };
+  if (ok) record.committed = { entry, at: reloadGeneration };
   if (record.pending > 0) return; // a newer click is still in flight and stays shown
   record.settledAt = reloadGeneration;
   if (ok) return;
-  // The newest click failed: show what the server last accepted for this key, or the
-  // snapshot if nothing landed, and fetch authoritative state right away.
-  if (record.committed) optimisticSetAside.set(key, record.committed.entry);
+  // The newest click failed: show what the server last accepted for this key unless a
+  // reload that started after that acceptance already applied newer state (which may
+  // have cleared it, e.g. a new message), then fetch authoritative state right away.
+  if (record.committed && appliedReloadGeneration <= record.committed.at) optimisticSetAside.set(key, record.committed.entry);
   else {
     setAsideKeys.delete(key);
     optimisticSetAside.delete(key);
