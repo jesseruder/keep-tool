@@ -25,6 +25,10 @@ const RETENTION_MS = 7 * 86400e3;
 // How long a note that nobody confirmed stays visible, dimmed, after it expires.
 const EXPIRED_VISIBLE_MS = 24 * 3600e3;
 const SWEEP_EVERY_MS = 60e3;
+// A nag whose author is merely busy is retried, not thrown away — but not
+// forever: after this many sweeps the note is Owner's, and the brief and lint
+// carry it from there.
+const NAG_ATTEMPT_LIMIT = 6;
 
 function defaultRoot() {
   return process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
@@ -146,18 +150,30 @@ function findNote(id, root) {
   return null;
 }
 
-// Read-modify-write on one project's file. Small files, one writer at a time in
-// practice, and a lost update costs a note rather than a card.
+// The registry lock, the same one cards are written under. Every writer below
+// is a read-modify-write of a whole file, and the daemon's expiry sweep runs on
+// a clock that does not care what a CLI is in the middle of: without this, a nag
+// mark and a new note on the same project lose each other. Falls back to running
+// uncontended if keep.js cannot be loaded, so this module stays usable alone.
+function withRegistryLock(fn) {
+  let keep = null;
+  try { keep = require('./keep.js'); } catch {}
+  return keep && typeof keep.withLock === 'function' ? keep.withLock(fn) : fn();
+}
+
+// Read-modify-write on one project's file, under the registry lock.
 function updateNote(id, root, mutate) {
-  const found = findNote(id, root);
-  if (!found) return null;
-  const notes = readFileNotes(found.file);
-  const note = notes.find((candidate) => candidate.id === id);
-  if (!note) return null;
-  const result = mutate(note);
-  if (result === false) return note;
-  writeFileNotes(found.file, found.project || note.project, notes);
-  return note;
+  return withRegistryLock(() => {
+    const found = findNote(id, root);
+    if (!found) return null;
+    const notes = readFileNotes(found.file);
+    const note = notes.find((candidate) => candidate.id === id);
+    if (!note) return null;
+    const result = mutate(note);
+    if (result === false) return note;
+    writeFileNotes(found.file, found.project || note.project, notes);
+    return note;
+  });
 }
 
 function nextId(notes, now) {
@@ -171,6 +187,7 @@ function nextId(notes, now) {
 }
 
 function addNote({ project, scopes, by, task, message, until, root, now = Date.now() }) {
+  return withRegistryLock(() => {
   const file = noteFile(project, root);
   const notes = readFileNotes(file);
   const note = {
@@ -185,10 +202,12 @@ function addNote({ project, scopes, by, task, message, until, root, now = Date.n
     cleared: '',
     extended: [],
     nagged: null,
+    nagAttempts: 0,
   };
   notes.push(note);
   writeFileNotes(file, project, notes, now);
   return note;
+  });
 }
 
 function extendNote(id, until, { root, now = Date.now() } = {}) {
@@ -196,8 +215,12 @@ function extendNote(id, until, { root, now = Date.now() } = {}) {
     if (note.cleared) return false;
     note.extended = [...(note.extended || []), { at: stampOf(new Date(now)), until }];
     note.until = until;
-    // A fresh window deserves a fresh nag: the note is being asserted again.
+    // A fresh window deserves a fresh nag: the note is being asserted again, so
+    // the author owes an answer at the new expiry too. Documented, because it is
+    // the one place a note's nag state is deliberately rewound.
     note.nagged = null;
+    note.nagAttempts = 0;
+    note.announcedAt = { ...(note.announcedAt || {}), extend: null };
   });
 }
 
@@ -219,11 +242,16 @@ function scopeMatches(note, scopes) {
 // Mirrors activeHolds: lazy expiry on read, no writes. Expired-but-unconfirmed
 // notes come back separately rather than disappearing, so every view can show
 // them dimmed for a day and Owner can see what nobody answered for.
+// `null` (or a missing argument) means every project — the brief asks for that.
+// An empty string means *no* project, and returns nothing: a caller that failed
+// to resolve a project must not silently get the whole fleet's notes.
 function activeNotes(project, now = Date.now(), options = {}) {
   const root = options.root;
   const scopes = options.scope ? (Array.isArray(options.scope) ? options.scope : [options.scope]) : [];
-  const rows = project ? loadNotes(project, root) : allNotes(root);
-  const wanted = project ? normalizeProject(project) : '';
+  const everywhere = project === null || project === undefined;
+  if (!everywhere && !String(project).trim()) return { active: [], expired: [] };
+  const rows = everywhere ? allNotes(root) : loadNotes(project, root);
+  const wanted = everywhere ? '' : normalizeProject(project);
   const active = [];
   const expired = [];
   for (const note of rows) {
@@ -291,25 +319,49 @@ function markNagged(id, value, root) {
   });
 }
 
-// One nag per note, ever. A note whose author is gone is marked `owner` and left
-// to the brief and to lint; nothing chases a session that is not there.
+// The author is there but cannot take a message right now. That is a reason to
+// come back in a minute, not a reason to give the note to Owner forever — but a
+// session that stays busy for six sweeps is not going to answer either.
+function deferNag(id, root, now, reason) {
+  return updateNote(id, root, (note) => {
+    if (note.nagged) return false;
+    const attempts = Number(note.nagAttempts || 0) + 1;
+    note.nagAttempts = attempts;
+    note.lastNagAttempt = { at: now, reason };
+    if (attempts >= NAG_ATTEMPT_LIMIT) {
+      note.nagged = { at: now, owner: true, reason: `${reason}, after ${attempts} attempts` };
+    }
+  });
+}
+
+// One nag per note, ever. A note whose author has gone is marked `owner` at once
+// and left to the brief and to lint; nothing chases a session that is not there.
 async function sweep(options = {}) {
   const now = Number.isFinite(options.now) ? options.now : Date.now();
   const root = options.root;
   const due = dueForNag(now, root);
-  if (!due.length) return { changed: 0, nagged: 0, owner: 0 };
+  if (!due.length) return { changed: 0, nagged: 0, owner: 0, deferred: 0 };
   const live = require('./watcher-live.js');
   let sessions = [];
   try { sessions = (options.sessions ? options.sessions() : []) || []; } catch {}
   let nagged = 0;
   let owner = 0;
+  let deferred = 0;
   for (const note of due) {
     const sessionId = (note.by && note.by.sessionId) || '';
     const session = sessionId ? sessions.find((candidate) => candidate && candidate.id === sessionId) : null;
-    const notReady = live.sessionReady(session);
-    if (!session || notReady || typeof options.send !== 'function') {
-      markNagged(note.id, { at: now, owner: true, reason: notReady || 'no session' }, root);
+    const gone = !session || session.exited === true || session.state === 'exited';
+    if (gone || typeof options.send !== 'function') {
+      markNagged(note.id, { at: now, owner: true, reason: session ? 'the session has exited' : 'no live session' }, root);
       owner += 1;
+      continue;
+    }
+    // Reviewer, mid-turn, question on screen, tool running: all transient.
+    const notReady = live.sessionReady(session);
+    if (notReady) {
+      const updated = deferNag(note.id, root, now, notReady);
+      if (updated && updated.nagged) owner += 1;
+      else deferred += 1;
       continue;
     }
     try {
@@ -319,10 +371,12 @@ async function sweep(options = {}) {
     } catch (error) {
       // A terminal that could not take the message is not a note to give up on;
       // leave it unnagged so the next sweep tries once more.
+      deferNag(note.id, root, now, `delivery failed: ${error.message}`);
+      deferred += 1;
       if (process.env.KEEP_DEBUG) process.stderr.write(`keep notes: nag failed: ${error.message}\n`);
     }
   }
-  return { changed: nagged + owner, nagged, owner };
+  return { changed: nagged + owner, nagged, owner, deferred };
 }
 
 function startScheduler(options = {}) {
@@ -356,5 +410,5 @@ module.exports = {
   defaultRoot, notesDir, noteFile, projectKey, scrub, sanitize, stampOf,
   loadNotes, allNotes, findNote, addNote, extendNote, clearNote, writeFileNotes,
   activeNotes, describeNote, announcementFor, nagFor,
-  dueForNag, markNagged, sweep, startScheduler,
+  dueForNag, markNagged, deferNag, sweep, startScheduler, NAG_ATTEMPT_LIMIT,
 };

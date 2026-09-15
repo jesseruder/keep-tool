@@ -162,7 +162,7 @@ test('the expiry sweep nags the live author once and leaves the rest to Owner', 
       health: { record: () => {} },
     };
     const first = await notes.sweep(options);
-    assert.deepEqual(first, { changed: 2, nagged: 1, owner: 1 });
+    assert.deepEqual(first, { changed: 2, nagged: 1, owner: 1, deferred: 0 });
     assert.equal(sent.length, 1);
     assert.equal(sent[0][0], 'author-session');
     assert.match(sent[0][1], /your state note on staging expired/);
@@ -171,27 +171,112 @@ test('the expiry sweep nags the live author once and leaves the rest to Owner', 
     assert.equal(notes.findNote(future.id, root).nagged, null);
     // One nag per note, ever.
     const second = await notes.sweep(options);
-    assert.deepEqual(second, { changed: 0, nagged: 0, owner: 0 });
+    assert.deepEqual(second, { changed: 0, nagged: 0, owner: 0, deferred: 0 });
     assert.equal(sent.length, 1);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('the sweep does not nag a session that is mid-turn or is the reviewer', async () => {
+test('a busy author is retried, not written off, and gives up after six sweeps', async () => {
   const root = makeRoot();
   const now = Date.now();
   try {
     seed(root, { until: stamp(now - 60e3) });
     const sent = [];
-    await notes.sweep({
+    const busy = {
       root, now,
       sessions: () => [{ id: 'author-session', kind: 'claude', endedTurn: false }],
       send: (sessionId, text) => sent.push([sessionId, text]),
-    });
+    };
+    const first = await notes.sweep(busy);
+    assert.deepEqual(first, { changed: 0, nagged: 0, owner: 0, deferred: 1 });
     assert.deepEqual(sent, []);
+    let [note] = notes.allNotes(root);
+    assert.equal(note.nagged, null, 'mid-turn is transient; the nag is still owed');
+    assert.equal(note.nagAttempts, 1);
+    assert.match(note.lastNagAttempt.reason, /mid-turn/);
+
+    // It comes back when the session frees up.
+    await notes.sweep({ ...busy, sessions: () => [{ id: 'author-session', kind: 'claude', endedTurn: true, state: 'idle' }] });
+    assert.equal(sent.length, 1);
+    assert.match(sent[0][1], /your state note on staging expired/);
+
+    // A session that stays busy is eventually Owner's problem.
+    const stuck = seed(root, { until: stamp(now - 60e3) });
+    for (let i = 0; i < notes.NAG_ATTEMPT_LIMIT - 1; i += 1) {
+      const round = await notes.sweep(busy);
+      assert.equal(round.deferred, 1, `sweep ${i}`);
+    }
+    const last = await notes.sweep(busy);
+    assert.equal(last.owner, 1);
+    const final = notes.findNote(stuck.id, root);
+    assert.equal(final.nagged.owner, true);
+    assert.equal(final.nagAttempts, notes.NAG_ATTEMPT_LIMIT);
+    assert.match(final.nagged.reason, /after 6 attempts/);
+    assert.equal(sent.length, 1, 'nothing was ever typed into the busy session');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('an exited author is handed to Owner at once, with no retries', async () => {
+  const root = makeRoot();
+  const now = Date.now();
+  try {
+    seed(root, { until: stamp(now - 60e3) });
+    const result = await notes.sweep({
+      root, now,
+      sessions: () => [{ id: 'author-session', kind: 'claude', state: 'exited', exited: true }],
+      send: () => { throw new Error('must not send'); },
+    });
+    assert.deepEqual(result, { changed: 1, nagged: 0, owner: 1, deferred: 0 });
     const [note] = notes.allNotes(root);
     assert.equal(note.nagged.owner, true);
-    assert.match(note.nagged.reason, /mid-turn/);
+    assert.match(note.nagged.reason, /exited/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('activeNotes: null is every project, an empty string is none', () => {
+  const root = makeRoot();
+  const now = Date.now();
+  try {
+    seed(root, { project: '/work/a' });
+    seed(root, { project: '/work/b' });
+    assert.equal(notes.activeNotes(null, now, { root }).active.length, 2, 'null means the fleet');
+    assert.equal(notes.activeNotes(undefined, now, { root }).active.length, 2);
+    assert.deepEqual(notes.activeNotes('', now, { root }).active, [],
+      'an unresolved project must not silently return everyone\'s notes');
+    assert.deepEqual(notes.activeNotes('   ', now, { root }).active, []);
+    assert.equal(notes.activeNotes('/work/a', now, { root }).active.length, 1);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('every note writer runs under the registry lock', async () => {
+  const root = makeRoot();
+  const now = Date.now();
+  const keepApi = require('./keep.js');
+  const seen = [];
+  const realWithLock = keepApi.withLock;
+  keepApi.withLock = (fn) => { seen.push('lock'); return realWithLock(fn); };
+  try {
+    const note = seed(root, { until: stamp(now - 60e3) });
+    notes.extendNote(note.id, stamp(now + 3600e3), { root });
+    notes.clearNote(note.id, 'done', { root });
+    assert.ok(seen.length >= 3, `add, extend and clear each take the lock (${seen.length})`);
+
+    // A sweep write and an add do not lose each other: both go through the lock,
+    // so the note added mid-sweep survives the sweep's own rewrite.
+    const expired = seed(root, { until: stamp(now - 60e3) });
+    let added = null;
+    await notes.sweep({
+      root, now,
+      sessions: () => [{ id: 'author-session', kind: 'claude', endedTurn: true, state: 'idle' }],
+      send: () => { added = seed(root, { message: 'written while the sweep ran' }); },
+    });
+    assert.ok(added, 'the add happened');
+    assert.ok(notes.findNote(added.id, root), 'and it is still there after the sweep marked the nag');
+    assert.ok(notes.findNote(expired.id, root).nagged, 'and the nag mark survived the add');
+  } finally {
+    keepApi.withLock = realWithLock;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('the brief lists state notes and flags the unconfirmed ones', () => {

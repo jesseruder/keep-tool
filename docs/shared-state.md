@@ -99,9 +99,17 @@ still recorded and still shows at the next session start.
 
 A per-minute daemon sweep finds notes past `until` that were neither extended nor
 cleared, and **nags the author once, ever**. If the author's session is live and
-ready it gets the nag in its terminal; if it is not, the note is marked as Owner's
-and left to the brief and to lint's `note-expired`. Nothing blocks on an expired
-note, and no nag is ever sent twice.
+ready it gets the nag in its terminal. If the session has exited the note is marked
+as Owner's at once and left to the brief and to lint's `note-expired`. If the
+session is merely busy — mid-turn, a question on screen, a tool running — the nag is
+*deferred* and retried on later sweeps, up to six attempts, after which it becomes
+Owner's too. Nothing blocks on an expired note, and no nag is ever sent twice.
+
+`keep note --extend` deliberately rewinds that: extending is asserting the note
+again, so its nag state and attempt count are reset and the author owes an answer
+at the new expiry. `keep note --clear` works from any session — if you are not the
+author, Keep prints who wrote it and clears it anyway, because whoever can see that
+a statement is no longer true should be able to say so.
 
 `keep wait --no-hold` does not see notes at all. There is a test that says so.
 

@@ -3179,7 +3179,8 @@ commands.note = async (argv) => {
     if (!existing) die(`no state note "${o.extend}"`);
     if (existing.cleared) die(`${existing.id} was cleared at ${existing.cleared}`);
     const note = notes.extendNote(o.extend, parseWhen(o.for));
-    console.log(`${note.id}: extended until ${note.until}`);
+    if (!note) die(`${o.extend} could not be extended; it may have just been cleared`);
+    console.log(`${note.id}: extended until ${note.until} (its expiry nag is reset)`);
     return announceNote(note, 'extend');
   }
 
@@ -3187,7 +3188,16 @@ commands.note = async (argv) => {
     const existing = notes.findNote(o.clear);
     if (!existing) die(`no state note "${o.clear}"`);
     if (existing.cleared) return console.log(`${existing.id} was already cleared at ${existing.cleared}`);
+    // A warning, not a refusal: whoever can see that a statement is no longer
+    // true should be able to say so, whether or not they wrote it.
+    const author = (existing.by && existing.by.sessionId) || '';
+    const clearing = commandSession();
+    if (author && clearing && clearing.id !== author) {
+      console.log(`note: ${existing.id} was written by ${(existing.by && existing.by.agent) || 'another session'}`
+        + ` ${author.slice(0, 8)} — clearing someone else's statement about shared state.`);
+    }
     const note = notes.clearNote(o.clear, o.m ? cleanScalar(o.m, 'reason') : '');
+    if (!note) die(`${o.clear} could not be cleared; it may have just been removed`);
     console.log(`${note.id}: cleared`);
     return announceNote(note, 'clear');
   }
@@ -3222,7 +3232,9 @@ commands.notes = (argv) => {
   const notes = require('./notes.js');
   const o = parseArgs(argv, { all: 'bool', json: 'bool', scope: 'list' });
   if (o._.length > 1) die('usage: keep notes [<project>] [--all] [--json]');
-  const project = o._.length ? resolveProjectArg(o._[0]) : '';
+  // null, not '': activeNotes reads an empty string as "no project" and returns
+  // nothing, so a fleet-wide listing has to say so explicitly.
+  const project = o._.length ? resolveProjectArg(o._[0]) : null;
   const scopes = require('./hold-scopes').parse(o.scope);
   const { active, expired } = notes.activeNotes(project, Date.now(), scopes.length ? { scope: scopes } : {});
   const cleared = o.all
