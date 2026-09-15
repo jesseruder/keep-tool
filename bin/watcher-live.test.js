@@ -1392,3 +1392,62 @@ test('resource is a live type with its own graduation record', () => {
   assert.equal(live.normalizeConfig({ live: { resource: true } }).live.resource, true);
   assert.equal(live.normalizeConfig({ live: { resources: true } }).invalid, true);
 });
+
+// ---------- the switch, from the CLI ----------
+
+function cliLive(args) {
+  const { spawnSync } = require('node:child_process');
+  return spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'watcher', 'live', ...args], {
+    encoding: 'utf8',
+    env: { ...process.env, KEEP_DIR: REGISTRY, KEEP_NO_PUSH: '1', KEEP_PORT: '1' },
+  });
+}
+
+function seedLedger(rows) {
+  fs.mkdirSync(path.join(REGISTRY, '.keep'), { recursive: true });
+  fs.writeFileSync(path.join(REGISTRY, '.keep', 'decisions.json'), JSON.stringify(rows, null, 2));
+}
+
+test('`on` turns on what has earned it and says why the rest stayed off', (t) => {
+  sandbox(t);
+  const graded = (type, n) => Array.from({ length: n }, (_, i) => ({
+    id: `d-${type}-${i}`, type, verdict: 'agree', reviewer: 'watcher', at: Date.now(),
+    promptHash: watcher.PROMPT_HASH, why: 'w', message: 'm',
+  }));
+
+  // Nothing graded: `on` is not a refusal, it is a no-op that explains itself.
+  seedLedger([]);
+  const cold = cliLive(['on']);
+  assert.equal(cold.status, 0, cold.stderr);
+  assert.match(cold.stdout, /nothing has earned live delivery yet; delivery stays off/);
+  assert.match(cold.stdout, /not turned on: continue has no graded decisions yet/);
+  assert.match(cold.stdout, /not turned on: resource has no graded decisions yet/);
+  assert.deepEqual(live.liveTypes(live.loadConfig()), []);
+
+  // One type has earned it; `on` turns that one on and names the others.
+  seedLedger(graded('continue', 30));
+  const warm = cliLive(['on']);
+  assert.equal(warm.status, 0, warm.stderr);
+  assert.deepEqual(live.liveTypes(live.loadConfig()), ['continue']);
+  assert.match(warm.stdout, /not turned on: drift has no graded decisions yet/);
+  assert.match(warm.stdout, /not turned on: resource has no graded decisions yet/);
+  assert.doesNotMatch(warm.stdout, /not turned on: continue/);
+
+  // --force stays explicit: it never rides in on `on`.
+  const forced = cliLive(['on', '--force']);
+  assert.notEqual(forced.status, 0);
+  assert.match(forced.stderr, /to overrule graduation, name them/);
+  assert.deepEqual(live.liveTypes(live.loadConfig()), ['continue'], 'the refusal changed nothing');
+
+  // Naming a type that has not earned it is still a refusal without --force.
+  const refused = cliLive(['resource']);
+  assert.notEqual(refused.status, 0);
+  assert.match(refused.stderr, /resource has no graded decisions yet/);
+
+  const overruled = cliLive(['resource', '--force']);
+  assert.equal(overruled.status, 0, overruled.stderr);
+  assert.deepEqual(live.liveTypes(live.loadConfig()), ['resource']);
+
+  assert.equal(cliLive(['off']).status, 0);
+  assert.deepEqual(live.liveTypes(live.loadConfig()), []);
+});

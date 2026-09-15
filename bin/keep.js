@@ -6588,19 +6588,37 @@ function watcherLive(argv) {
   const arg = o._[0];
   const config = live.loadConfig();
   if (arg) {
-    const wanted = arg === 'on' ? live.TYPES
-      : arg === 'off' ? []
-        : arg.split(',').map((type) => type.trim()).filter(Boolean);
-    const unknown = wanted.filter((type) => !live.TYPES.includes(type));
-    if (unknown.length) die(`unknown verdict type${unknown.length === 1 ? '' : 's'}: ${unknown.join(', ')}\nvalid: ${live.TYPES.join(', ')}`);
-    if (!o.force) {
+    let wanted;
+    let skipped = [];
+    if (arg === 'off') {
+      wanted = [];
+    } else if (arg === 'on') {
+      // `on` means "everything that has earned it", not "everything". A new
+      // verdict type has no record on day one, and the old reading made adding
+      // one turn this command into a flat refusal for the types that had.
+      if (o.force) {
+        die('`on` turns on the types that have earned it; to overrule graduation, name them:\n'
+          + `  keep watcher live ${live.TYPES.join(',')} --force`);
+      }
       const stats = watcher.stats({ sinceMs: 0 }).ledger;
-      const refusals = wanted.map((type) => live.graduationCheck(type, stats)).filter((check) => !check.ok);
-      if (refusals.length) {
-        die(`${refusals.map((check) => check.reason).join('\n')}\n`
-          + 'Grade more with `keep decisions` (or the console), or pass --force to overrule.');
+      const checks = live.TYPES.map((type) => ({ type, check: live.graduationCheck(type, stats) }));
+      wanted = checks.filter((row) => row.check.ok).map((row) => row.type);
+      skipped = checks.filter((row) => !row.check.ok);
+    } else {
+      wanted = arg.split(',').map((type) => type.trim()).filter(Boolean);
+      const unknown = wanted.filter((type) => !live.TYPES.includes(type));
+      if (unknown.length) die(`unknown verdict type${unknown.length === 1 ? '' : 's'}: ${unknown.join(', ')}\nvalid: ${live.TYPES.join(', ')}`);
+      if (!o.force) {
+        const stats = watcher.stats({ sinceMs: 0 }).ledger;
+        const refusals = wanted.map((type) => live.graduationCheck(type, stats)).filter((check) => !check.ok);
+        if (refusals.length) {
+          die(`${refusals.map((check) => check.reason).join('\n')}\n`
+            + 'Grade more with `keep decisions` (or the console), or pass --force to overrule.');
+        }
       }
     }
+    for (const row of skipped) console.log(`not turned on: ${row.check.reason}`);
+    if (arg === 'on' && !wanted.length) console.log('nothing has earned live delivery yet; delivery stays off');
     const next = { ...config, live: Object.fromEntries(live.TYPES.map((type) => [type, wanted.includes(type)])) };
     live.saveConfig(next);
     // Best effort: this is the riskiest switch in the system, so when the
