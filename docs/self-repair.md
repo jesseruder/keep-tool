@@ -87,7 +87,18 @@ with none of them is a launch that did not finish, and the next tick resumes it.
 A launch that threw *after* the pane came up still counts as launched: the agent is
 running, and a second one on the same fault is the one thing this must not do.
 `attempts` belongs to one card, so it is cleared when the signature resolves and by
-`--reset`.
+`--reset`. A `runId` from the pre-session code counts as launched for 90 minutes
+(the old wall-clock cap) and then stops, so a card the old code opened cannot wedge
+its signature forever.
+
+Each tick checks the recorded pane against the host. A pane that has exited clears
+`sessionId`/`pane` and checks in once, so the resume path relaunches it — still
+capped at three attempts. And before it opens anything, a launch asks the host
+whether the card already has a live pane, so a spawn response lost after the pane
+came up does not become a second agent.
+
+`--reset` refuses only while the card is genuinely live: a card that is `done` or
+`archived`, or an entry whose launch was never confirmed, clears.
 
 Every change goes through one synchronous read-modify-write helper — atomic only
 because nothing inside it awaits, the same constraint as `review.js`'s
@@ -173,15 +184,17 @@ main checkout, so that matches. `self-repair.js` also refuses any cwd outside th
 configured worktree root before it calls `openSession` at all, and says so on the
 card rather than throwing inside the daemon loop.
 
-`KEEP_REPAIR=1` is **derived from the card's `self-repair` tag, not from the launch
-call**. `serve.js`'s `repairEnvFor` merges it into the spawn environment at every
-launch site — the open, `restartSession`, `forceRestartSession` and the account
-handoff — so a restarted, force-restarted, handed-off or `keep resume`d repair
-session still carries the marker. self-repair.js also passes it through
-`deps.launchEnv`, which is internal only: an `env` or `launchEnv` key in an HTTP
-request body is refused with 400. The variable rides the pane's environment through
-`/bin/zsh -lic` into `agent-launcher`, which strips only its own `KEEP_LAUNCHER`
-marker, so the guard below sees it in the agent's own Bash calls.
+`KEEP_REPAIR=1` marks **the launched session and nothing else**. The first launch
+gets it from `deps.launchEnv`; every later one — `restartSession`,
+`forceRestartSession`, the account handoff, a reopen — has only a session id, so
+serve.js's `repairEnvFor` asks `self-repair.isRepairSession(id)` whether that id is
+recorded in the repair state, and re-sets the marker if it is. The repair *card* is
+deliberately not the test: Owner opening his own session on one to look at the fix
+would otherwise inherit a refusal on `keep restart-daemon`, which is the restart he
+is there to do. `deps.launchEnv` is internal only: an `env` or `launchEnv` key in an
+HTTP request body is refused with 400. The variable rides the pane's environment
+through `/bin/zsh -lic` into `agent-launcher`, which strips only its own
+`KEEP_LAUNCHER` marker, so the guard below sees it in the agent's own Bash calls.
 
 The session spends against the `repair` automation purpose, which falls back
 through `automationAccounts.claude` to the default, so nothing needs configuring
@@ -214,8 +227,8 @@ pre-bash` refuses, for any command in a session with `KEEP_REPAIR=1`:
   goes through `keep land`, which enforces the review record
 
 The refusal names the rule and points at step 4 of the repair card. The guard is
-keyed to `KEEP_REPAIR=1`, which every launch of a session on a `self-repair`-tagged
-card sets, so no other session sees it and no restart clears it.
+keyed to `KEEP_REPAIR=1`, which every launch of a session the repair state records
+as its agent sets, so no other session on the card sees it and no restart clears it.
 
 **The card is not closed automatically**, the fix is not landed without a recorded
 review, and `--allow` grants cannot be set from an agent session, so the repair
