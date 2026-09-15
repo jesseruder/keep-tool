@@ -203,9 +203,17 @@ function applySetAside(attention, options = {}) {
     const item = current.get(key);
     // "Mark running" overrides a misread status until the session gets a new
     // message; a newer attention event or a gone session also clears it below.
-    if (entry.kind === 'running' && Number.isFinite(item?.lastUserAt) && item.lastUserAt > entry.at) {
-      changed = true;
-      continue;
+    if (entry.kind === 'running') {
+      if (Number.isFinite(item?.lastUserAt) && item.lastUserAt > entry.at) {
+        changed = true;
+        continue;
+      }
+      // A synthetic candidate's since is the transcript mtime, which background
+      // work keeps moving; only a real attention event counts as a new turn.
+      if (item?.synthetic) {
+        items[key] = entry;
+        continue;
+      }
     }
     if (entry.kind === 'dependency' && (!item || item.taskId !== entry.taskId
         || JSON.stringify(item.dependencies) !== JSON.stringify(entry.dependencies)

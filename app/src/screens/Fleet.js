@@ -11,7 +11,8 @@ export default function Fleet({ data, onOpenScreen, onReopen, onSelect, styles }
     const waitingBySession = new Map();
     const paneAlive = new Map((data.panes || []).map((pane) => [pane.id, Boolean(pane.alive)]));
     for (const item of data.attention || []) {
-      if (!item.sessionId || item.kind === 'health') continue;
+      // Set-aside items (snoozed, dismissed, marked running) are not waiting, as on the desktop Fleet.
+      if (!item.sessionId || item.kind === 'health' || item.setAside) continue;
       const prior = waitingBySession.get(item.sessionId);
       if (!prior || Number(item.pri || 0) < Number(prior.pri || 0)) waitingBySession.set(item.sessionId, item);
     }

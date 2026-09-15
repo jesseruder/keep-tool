@@ -635,7 +635,10 @@ test('mark running persists without a timer and clears on a new message, newer e
     const store = readSetAside(root);
     const remaining = (items) => applySetAside(items, { store, now: 30 * 86400e3, write: false }).value.items;
     assert.deepEqual(Object.keys(remaining(candidates())), [session.id], 'survives reload and a long background job');
+    assert.deepEqual(Object.keys(remaining(candidates({ mtime: 5000 }, []))), [session.id],
+      'background transcript activity while no attention item is open keeps it');
     assert.deepEqual(remaining(candidates({ lastUserAt: 2500 })), {}, 'a new message clears it');
+    assert.deepEqual(remaining(candidates({ mtime: 5000, lastUserAt: 2500 }, [])), {}, 'a new message clears it without attention');
     assert.deepEqual(remaining(candidates({}, [{ ...question, since: 3000 }])), {}, 'a newer turn clears it');
     assert.deepEqual(remaining([]), {}, 'a gone session clears it');
     assert.deepEqual(parseSetAsideRequest({ key: 'one', kind: 'running' }), { key: 'one', kind: 'running', minutes: null });

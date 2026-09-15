@@ -162,6 +162,15 @@ let layoutSavesPending = 0;
 let attentionKeys = new Set();
 let attentionSeeded = false;
 const optimisticSetAside = new Map();
+// Set-aside writes for one key go out in click order, so a quick Mark running then
+// Unmark (or Undo) cannot land server-side as clear-before-set.
+const setAsideWrites = new Map();
+function queueSetAsideWrite(key, write) {
+  const next = (setAsideWrites.get(key) || Promise.resolve()).catch(() => {}).then(write);
+  setAsideWrites.set(key, next);
+  next.catch(() => {}).finally(() => { if (setAsideWrites.get(key) === next) setAsideWrites.delete(key); });
+  return next;
+}
 const focusDebug = installFocusDebug(() => ({ mode: state.mode, selected: state.selectedKey || '', session: state.currentItem?.sessionId || '', pane: state.currentItem?.pane || '' }));
 const reopeningSessions = new Map();
 const runningOrder = new Map();
@@ -360,7 +369,7 @@ async function setAside(item, kind = 'dismiss', minutes) {
   state.focused = false;
   refresh();
   try {
-    await api.setAside(key, kind, minutes);
+    await queueSetAsideWrite(key, () => api.setAside(key, kind, minutes));
     toast(kind === 'dependency' ? 'Waiting for dependency. New messages or changed dependencies bring it back.'
       : kind === 'running' ? 'Moved to Running & waiting. A new message or a new turn brings it back.'
       : kind === 'snooze' ? 'Snoozed for 1 hour.' : 'Dismissed. Restore it from the collapsed row.', { label: 'Undo', run: () => restore(key) });
@@ -379,7 +388,7 @@ async function restore(key) {
   state.showDismissed = false;
   refresh();
   try {
-    await api.setAside(key, 'clear');
+    await queueSetAsideWrite(key, () => api.setAside(key, 'clear'));
     toast('Back in the queue.');
   } catch (error) {
     optimisticSetAside.delete(key);
