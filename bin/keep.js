@@ -6068,6 +6068,12 @@ function repairDenial(invocation) {
     return `that runs \`git ${subcommand || '(no subcommand)'}\` in ${directory}, the live keep-tool checkout this daemon runs from`
       + ` (reading it with ${[...GIT_READ_ONLY].join(', ')} is fine)`;
   }
+  // `git diff --output=<file>` and `git log -o <file>` write through a read-only
+  // subcommand; the allowance is for reading the live checkout, not for writing
+  // into it.
+  if (underMainCheckout(directory) && args.some((token) => token === '-o' || token === '--output' || token.startsWith('--output='))) {
+    return `that writes a file from \`git ${subcommand}\` in ${directory}, the live keep-tool checkout (read it, do not write there)`;
+  }
   if (subcommand === 'push') {
     if (args.some((token) => token === '--force' || token === '-f' || token.startsWith('--force-with-lease'))) {
       return 'a force push rewrites shared history';

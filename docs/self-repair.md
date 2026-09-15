@@ -125,7 +125,9 @@ URL credentials, `Bearer`/`Basic` headers, `*_TOKEN=`/`*_SECRET=`/`*_KEY=` value
 token-shaped flags and long opaque strings are elided, in the evidence files and in
 the card's title, note and recipe. Uuids and hex runs are deliberately kept — a
 session id or a sha is what makes the excerpt worth reading, and neither is a
-secret.
+secret. The known cost: a classic 40-hex GitHub token looks exactly like a sha and
+is kept too. serve.log should never carry one; if a line does, treat the token as
+burned and rotate it, and file the log line that leaked it.
 
 A check-in records the launch: run id, worktree path, account purpose and model,
 so Owner can see what was spent.

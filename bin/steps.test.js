@@ -1060,6 +1060,9 @@ test('the pre-bash guard keeps a self-repair run off the daemon and out of the m
     'wget --post-data="" http://localhost:8765/api/restart-daemon',
     // Writes to the live checkout, at the root and below it, targeted or by cd.
     `git -C ${main} commit -am wip`,
+    // A read-only subcommand with an output file writes into the live checkout.
+    `git -C ${main} diff --output=${main}/notes.txt HEAD~1`,
+    `cd ${main} && git log -o dump.txt -1`,
     `git -C ${main}/bin commit -am wip`,
     `git -C ~/keep-tool add -A`,
     `git --work-tree=${main} add -A`,
