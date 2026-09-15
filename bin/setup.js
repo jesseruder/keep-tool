@@ -136,6 +136,12 @@ function installHooks() {
 // A shell *function* rather than an alias, and `command claude` inside it: the
 // `clauded` alias expands to this function, so the aliased spelling is guarded
 // too, and --dangerously-skip-permissions passes straight through.
+//
+// The launcher's own resume is told apart by KEEP_LAUNCHER, which Keep sets on the
+// pane's environment, NOT by KEEP_PANE: every hosted agent's shell inherits
+// KEEP_PANE, so exempting it would exempt exactly the sessions this exists for.
+// The function unsets the marker before exec'ing, so it never reaches the agent's
+// own children (bin/agent-launcher.js strips it on that path too).
 const SHELL_START = '# >>> keep shell >>>';
 const SHELL_END = '# <<< keep shell <<<';
 
@@ -144,7 +150,12 @@ function shellBlock() {
     SHELL_START,
     '# keep: route session resumes through the launcher',
     'claude() {',
-    '  if [ -z "$KEEP_PANE" ] && [ -z "$KEEP_RAW_CLAUDE" ]; then',
+    '  if [ -n "$KEEP_LAUNCHER" ]; then',
+    '    unset KEEP_LAUNCHER',
+    '    command claude "$@"',
+    '    return',
+    '  fi',
+    '  if [ -z "$KEEP_RAW_CLAUDE" ]; then',
     '    for a in "$@"; do',
     '      case "$a" in --resume|-r|--continue|-c)',
     `        echo "keep: use 'keep open <session-id>' to resume (KEEP_RAW_CLAUDE=1 claude ... to bypass)" >&2; return 1;;`,

@@ -1389,9 +1389,15 @@ function shadowOwner() {
 }
 
 commands.add = (argv) => {
-  const o = parseArgs(argv, { kind: 'str', tag: 'list', project: 'str', 'check-after': 'str', check: 'str', 'on-pass': 'str', 'check-every': 'str', probe: 'str', status: 'str', 'experiment-id': 'str', plan: 'many', 'done-when': 'list', allow: 'list', until: 'str', autonomous: 'bool', file: 'bool', claim: 'bool', force: 'bool' });
+  const o = parseArgs(argv, { kind: 'str', tag: 'list', project: 'str', 'check-after': 'str', check: 'str', 'on-pass': 'str', 'check-every': 'str', probe: 'str', status: 'str', 'experiment-id': 'str', plan: 'many', 'done-when': 'list', allow: 'list', until: 'str', autonomous: 'bool', file: 'bool', claim: 'bool', force: 'bool', 'as-owner': 'bool' });
   const title = o._.join(' ');
-  if (!title.trim()) die('usage: keep add "title" [--kind k] [--file|--claim] [--tag t] [--project p] [--plan "step" …] [--done-when "cmd"]… [--allow a,b] [--until when] [--autonomous] [--experiment-id id] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"] [--status s] [--force] [-m note]');
+  if (!title.trim()) die('usage: keep add "title" [--kind k] [--file|--claim] [--tag t] [--project p] [--plan "step" …] [--done-when "cmd"]… [--allow a,b] [--until when] [--autonomous] [--experiment-id id] [--check-after when] [--check "recipe"] [--on-pass done|rearm|review] [--check-every +7d] [--probe "cmd"] [--status s] [--force] [--as-owner] [-m note]');
+  // Creating a card with grants is granting. Gated exactly like `keep allow
+  // --grant`, or the refusal there would be one `keep add --allow` away.
+  if ((o.allow || o.until) && inAgentSession() && !(o['as-owner'] && process.env.KEEP_OWNER === '1')) {
+    die('only Owner grants. Create the card without --allow/--until and ask him for "keep allow <card> --grant …". '
+      + 'If Owner is running this himself from an agent session, pass --as-owner with KEEP_OWNER=1 in the environment.');
+  }
   if (o.file && o.claim) die('--file and --claim are mutually exclusive');
   const filesOnly = o.file || (!o.claim && o.kind === 'idea');
   let assigned = { kind: 'none' };
@@ -2855,7 +2861,10 @@ function implicitLandVerdict(task, deps = {}) {
   const reviews = deps.reviews || require('./reviews.js');
   const records = deps.records || reviews.readRecords(task.id);
   const optOut = deps.optOut !== undefined ? deps.optOut : reviews.optOutReason(task);
-  const context = deps.context || (optOut ? { ok: false, why: 'auto-land is off' } : reviews.landContext(deps.cwd || process.cwd()));
+  // Always resolved, even when the card is opted out or holds an explicit grant:
+  // `keep land` needs the worktree and the range, and an explicit `land` grant on
+  // an opted-out card used to short-circuit past this and land `undefined`.
+  const context = deps.context || reviews.landContext(deps.cwd || process.cwd());
   const verdict = allow.decideLand({
     grants: allow.readGrants(task),
     records,
@@ -2975,6 +2984,14 @@ commands.reviewed = (argv) => {
     }, reviews.gitDeps(process.cwd()));
     reviews.append(id, built);
     const contribution = recordContribution(task);
+    // A review of somebody else's card is legitimate — it is the whole point of an
+    // independent reviewer — but the owner should be able to see who filed it.
+    const session = commandSession();
+    const owners = (task.fm.sessions || []).map((entry) => entry.id);
+    if (session && owners.length && !owners.includes(session.id)) {
+      process.stderr.write(`keep: note — ${id} is claimed by ${owners.map((owner) => owner.slice(0, 8)).join(', ')},`
+        + ` not this ${session.agent} session ${String(session.id).slice(0, 8)}; the record is filed anyway\n`);
+    }
     // `code-review`, never a bare `review`: bin/review.js swallows a log heading
     // that starts with the word review as one of the fleet reviewer's own notes.
     appendLog(task, 'code-review', reviews.logLine(built), contribution.session);
@@ -3020,24 +3037,40 @@ commands.land = (argv) => {
     return;
   }
   const record = verdict.record || null;
+  // An explicit `land` grant says Owner allowed it; it does not say there is a
+  // landable worktree here. Without this, a granted card in an unusable tree
+  // reached wt.landWorktree(undefined).
+  const context = verdict.context;
+  if (!context || !context.ok) {
+    process.stderr.write(`keep: cannot land: ${(context && context.why) || 'no landable worktree here'}\n`);
+    process.exitCode = 3;
+    return;
+  }
   if (o['dry-run']) {
     console.log(`allowed: ${verdict.why}`);
-    for (const commit of verdict.context.commits || []) console.log(`  ${commit.sha.slice(0, 12)} ${commit.subject}`);
-    console.log(`would run wt land in ${verdict.context.worktree}`);
+    for (const commit of context.commits || []) console.log(`  ${commit.sha.slice(0, 12)} ${commit.subject}`);
+    console.log(`would run wt land in ${context.worktree}`);
     return;
   }
   const wt = require('./wt.js');
   let sha;
-  try { sha = wt.landWorktree(verdict.context.worktree); }
+  try { sha = wt.landWorktree(context.worktree); }
   catch (error) { die(`wt land refused: ${error.message}`); }
   if (!sha) die('wt land had nothing to push');
   const cited = record ? ` (review record ${record.id})` : '';
-  checkinTask(id, {
-    message: `Landed ${verdict.context.branch} onto ${verdict.context.defaultBranch}${cited}.`,
-    commits: [sha],
-  });
+  // The push already happened. A failure here loses the citation, not the land,
+  // so say what to record by hand rather than dying with a stack.
+  try {
+    checkinTask(id, {
+      message: `Landed ${context.branch} onto ${context.defaultBranch}${cited}.`,
+      commits: [sha],
+    });
+  } catch (error) {
+    process.stderr.write(`keep: landed ${sha} but the check-in failed: ${error.message}\n`
+      + `keep: record it by hand — keep checkin ${id} --commit ${sha} -m "Landed ${context.branch} onto ${context.defaultBranch}${cited}."\n`);
+  }
   if (o.json) return console.log(JSON.stringify({ id, landed: sha, record, why: verdict.why }, null, 2));
-  console.log(`${id}: landed ${sha.slice(0, 12)} onto origin/${verdict.context.defaultBranch}${cited}`);
+  console.log(`${id}: landed ${sha.slice(0, 12)} onto origin/${context.defaultBranch}${cited}`);
   console.log('  keep-tool\'s main checkout and daemon restart are still manual');
 };
 
@@ -5819,19 +5852,43 @@ function guardStepCommand(input, now = Date.now()) {
 // resume carries KEEP_PANE, so this never sees it.
 const CLAUDE_BINARIES = new Set(['claude', 'clauded']);
 const CLAUDE_RESUME_FLAG_RE = /^(?:--resume|-r|--continue|-c)(?:=|$)/;
-// An inline `KEEP_RAW_CLAUDE=1 claude --resume …`: the assignment never reaches
-// this process's env, and stripCommandWrappers drops it before the guard sees it.
-const INLINE_BYPASS_RE = /(?:^|[\s;&|(])KEEP_RAW_CLAUDE=[^\s;&|)]+/;
+const SHELL_BINARIES = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'ash']);
+const ASSIGNMENT_RE = /^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/;
 
 // The first `claude`/`clauded` invocation in a command that carries a resume flag,
 // however the command is wrapped. `bash -lc "claude --resume x"` counts;
 // `echo "claude --resume"` does not, because `echo` is the executable there.
-function rawClaudeResume(value) {
-  for (const command of stepRegistry.normalizedCommands(value)) {
-    const tokens = stepRegistry.commandTokens(command);
-    if (!tokens.length || !CLAUDE_BINARIES.has(stepRegistry.commandBasename(tokens[0]))) continue;
-    const flag = tokens.slice(1).find((token) => CLAUDE_RESUME_FLAG_RE.test(token));
-    if (flag) return { command, flag };
+//
+// Walks the segments itself rather than using normalizedCommands, because the
+// inline bypass (`KEEP_RAW_CLAUDE=1 claude --resume …`) is an assignment that
+// stripCommandWrappers deletes — and it only counts on the segment that runs
+// claude, so `echo "KEEP_RAW_CLAUDE=1"; claude --resume x` is not a bypass.
+function rawClaudeResume(value, inheritedBypass = false, depth = 0) {
+  if (depth > 4) return null;
+  for (const segment of stepRegistry.commandSegments(String(value || ''))) {
+    const tokens = stepRegistry.commandTokens(segment.text);
+    if (!tokens.length) continue;
+    let bypass = inheritedBypass;
+    let rest = tokens;
+    while (rest.length) {
+      const assignment = ASSIGNMENT_RE.exec(rest[0]);
+      if (!assignment) break;
+      if (assignment[1] === 'KEEP_RAW_CLAUDE' && assignment[2] !== '') bypass = true;
+      rest = rest.slice(1);
+    }
+    const stripped = stepRegistry.stripCommandWrappers(rest, { fromShell: true });
+    if (!stripped.length) continue;
+    const head = stepRegistry.commandBasename(stripped[0]);
+    if (SHELL_BINARIES.has(head)) {
+      // An assignment in front of the shell is exported into it, so it carries.
+      const script = stepRegistry.shellScriptArgument(stripped);
+      const found = script === null ? null : rawClaudeResume(script, bypass, depth + 1);
+      if (found) return found;
+      continue;
+    }
+    if (!CLAUDE_BINARIES.has(head)) continue;
+    const flag = stripped.slice(1).find((token) => CLAUDE_RESUME_FLAG_RE.test(token));
+    if (flag) return { command: stepRegistry.quoteArgv(stripped), flag, bypassed: bypass };
   }
   return null;
 }
@@ -5840,12 +5897,15 @@ function guardResumeCommand(input, env = process.env) {
   if (!input || input.tool_name !== 'Bash') return { deny: false, reason: '' };
   const command = input.tool_input && input.tool_input.command;
   if (!command) return { deny: false, reason: '' };
-  // KEEP_PANE means the host launched this shell, so its `claude --resume` is the
-  // launcher's own and must never be blocked.
-  if (env.KEEP_PANE || env.KEEP_RAW_CLAUDE) return { deny: false, reason: '' };
-  if (INLINE_BYPASS_RE.test(String(command))) return { deny: false, reason: '' };
+  // Deliberately NOT exempt on KEEP_PANE. Every hosted agent's Bash inherits it,
+  // so exempting it made the guard a no-op in the only place it has to hold; and
+  // PreToolUse only ever sees an agent's tool call, never the launcher's own exec.
+  if (env.KEEP_RAW_CLAUDE) return { deny: false, reason: '' };
   const found = rawClaudeResume(command);
   if (!found) return { deny: false, reason: '' };
+  // The inline spelling of the bypass, but only on the segment that actually runs
+  // claude: `echo "KEEP_RAW_CLAUDE=1"; claude --resume x` is not a bypass.
+  if (found.bypassed) return { deny: false, reason: '' };
   return {
     deny: true,
     reason: `keep guard: \`${found.command}\` — raw claude --resume bypasses Keep's launcher (pane binding, account, permissions flags); use \`keep open <session-id>\` — or set KEEP_RAW_CLAUDE=1 to bypass`,

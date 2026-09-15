@@ -3181,7 +3181,7 @@ async function restartSession(body, deps = {}) {
     }
     const result = await host('replace-exited', { paneId: pane.id, expectedPid: pane.pid, sessionId: stopped.meta?.sessionId,
       cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`], cwd,
-      ...(reviewerSpec.env ? { env: reviewerSpec.env } : {}),
+      env: require('./agent-launcher').launcherEnv(reviewerSpec.env),
       cols: pane.cols, rows: pane.rows, meta: { ...pane.meta, agent: session.kind, sessionId: session.id,
         accountId: account.id, accountLabel: account.label, restartedAt: Date.now() } });
     await (deps.waitForHostAgent || waitForHostAgent)({ pane: pane.id }, session.kind, deps);
@@ -3264,7 +3264,7 @@ async function forceRestartSession(entry, save, deps = {}) {
         }
         const result = await host('replace-exited', { paneId: job.pane, expectedPid, sessionId: stopped.meta?.sessionId,
           cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`], cwd: original.cwd,
-          ...(reviewerSpec.env ? { env: reviewerSpec.env } : {}),
+          env: require('./agent-launcher').launcherEnv(reviewerSpec.env),
           cols: original.cols, rows: original.rows, meta: { ...original.meta, accountId: account.id, accountLabel: account.label,
             forceRestartToken: job.token, restartedAt: Date.now() } });
         return { ok: true, pane: result.pane.id, pid: result.pane.pid, sessionId: job.sessionId };
@@ -4405,6 +4405,7 @@ async function openSession(body, deps = {}) {
     const spawned = await hostRequest('spawn', {
       cmd: '/bin/zsh',
       args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`],
+      env: require('./agent-launcher').launcherEnv(),
       cwd: project,
       cols: 200,
       rows: 50,
@@ -6267,7 +6268,7 @@ async function resumeExitedAccountHandoff(entry, account, mcpConfig, deps = {}) 
   const result = await host('replace-exited', {
     paneId: pane.id, expectedPid: entry.pid, sessionId: pane.meta?.sessionId,
     cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`], cwd,
-    ...(reviewerSpec.env ? { env: reviewerSpec.env } : {}),
+    env: require('./agent-launcher').launcherEnv(reviewerSpec.env),
     cols: entry.cols, rows: entry.rows,
     meta: { ...pane.meta, agent, sessionId: entry.sessionId, accountId: account.id, accountLabel: account.label,
       handoffTransactionId: entry.id, restartedAt: Date.now() },

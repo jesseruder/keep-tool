@@ -558,11 +558,29 @@ keep reviews <card> [--json]
 Run it from the worktree that holds the commits. A range (`origin/master..HEAD`) or a
 comma-separated list of shas both work; an unknown sha, or a cwd that is not a git
 repository, is refused. Each record goes to `.keep/reviews/<card>.json` as
-`{id, at, by, job, verdict, evidence, commits: [{sha, patchId, subject}], bySession, message}`
+`{id, at, by, job, jobAccountId, jobAt, verdict, evidence, commits: [{sha, patchId, subject}], bySession, message}`
 and the card gets a `code-review` log entry (never a heading starting with the bare
-word `review`, which the fleet reviewer's own notes own). `--by` starts with `codex`,
-`opus`, `claude` or `human` and may carry any suffix; `--evidence` is scrubbed and
-capped at 500 characters.
+word `review`, which the fleet reviewer's own notes own).
+
+**What is verified.** `--by` starts with `codex`, `opus`, `claude` or `human` and may
+carry any suffix. `--by human…` is Owner's own attestation and is **refused from inside
+an agent session**; a record that carries a `bySession` is never read as human
+testimony. `--job <codex-job-id>` is resolved against every registered Codex account's
+jobs directory (`.keep/codex-companion/accounts/*/state/*/jobs/<id>.json`, plus the
+legacy plugin root): a job Keep cannot find, or one whose `status` is not `completed`,
+is refused, and a resolved one stores `jobAccountId` and the result file's mtime as
+`jobAt`. `--evidence` is scrubbed and capped at 500 characters, and counts as a
+credential only for `opus…`/`claude…` reviews (a subagent review leaves no job file)
+and only at **80 characters or more** — "clean" is not evidence. A `codex…` review needs
+a resolvable `--job`; evidence alone will not do. A `--verdict clean` record that
+cannot meet its own bar is refused at write time; a `findings` record is never
+authority, so it is recorded whatever it cites.
+
+None of this is a security boundary. An agent that edits card files or
+`.keep/reviews/*.json` directly can write anything, and Keep does not try to stop it.
+It is an **audit trail with a bar in front of it**: every clean record names a reviewer
+and points at something a later reader can go and check, and the cheap paths to a
+self-issued land grant are closed.
 
 The key is `git patch-id --stable`, not the sha: `wt land` rebases onto
 `origin/<default>` before it pushes, so the landed sha is never the reviewed one, while
@@ -574,9 +592,10 @@ at <time> (record <id>)` when **all** of:
 | condition | why it fails |
 | --- | --- |
 | auto-land is not opted out | the card's `auto_land: off`, or `watch/autoland.json` `{"enabled": false}` or listing the card in `optOut` |
-| the cwd is a linked `wt/` worktree with a clean tree | not a worktree, a non-`wt/` branch, a detached HEAD, or uncommitted changes |
+| the cwd is a linked, wt-managed `wt/` worktree with a clean tree | not a worktree, no `.wt.json` (which `wt land` refuses too), a non-`wt/` branch, a detached HEAD, or uncommitted changes |
+| the range is linear | `origin/<default>..HEAD` contains a merge commit, whose conflict resolution is content no review of the branch saw — rebase first |
 | every commit in `origin/<default>..HEAD` has a `clean` record whose patch-id matches | a commit with no record, or one whose newest record is `findings` |
-| that record is not an agent self-attestation | `by` is not `human…` and the record carries neither `--job` nor `--evidence` |
+| that record clears the attestation bar | `human…` with a `bySession`; `codex…` with no verified `--job`; `opus…`/`claude…` with no verified `--job` and under 80 characters of `--evidence` |
 
 Anything else exits 3 and prints the condition that failed. `--json` adds `implicit:
 true` and the `record` that carried the decision. `watch/autoland.json` is
@@ -589,10 +608,12 @@ landed sha in a check-in naming the record. On a 3 it prints the `why` and lands
 nothing. `--dry-run` stops before the land. It never fast-forwards keep-tool's main
 checkout and never restarts the daemon: those stay manual.
 
-Writing grants is Owner's: `keep allow <card> --grant`/`--until` is refused inside an
-agent session (`CLAUDE_CODE_SESSION_ID` or a Codex session marker) unless `--as-owner`
-is passed with `KEEP_OWNER=1` in the environment. `--revoke` and `--clear` stay open,
-since they only ever reduce authority.
+Writing grants is Owner's: `keep allow <card> --grant`/`--until` and `keep add
+--allow`/`--until` are refused inside an agent session (`CLAUDE_CODE_SESSION_ID` or a
+Codex session marker) unless `--as-owner` is passed with `KEEP_OWNER=1` in the
+environment. `--revoke` and `--clear` stay open, since they only ever reduce authority.
+Like the review records, this is attribution and a bar, not enforcement: a session that
+edits the card file directly writes whatever frontmatter it likes.
 
 ## Resuming a session
 
@@ -603,16 +624,27 @@ resume that dropped `--dangerously-skip-permissions` left the resumed session de
 its own work.
 
 `keep hook pre-bash` denies a Bash command that invokes `claude` or `clauded` with
-`--resume`, `-r`, `--continue` or `-c` unless the environment has `KEEP_PANE` (which the
-host's own launcher always sets) or `KEEP_RAW_CLAUDE` set to bypass it. Plain `claude`
-with no resume flag is untouched, and a mention inside `echo` or `grep` is not an
-invocation.
+`--resume`, `-r`, `--continue` or `-c` unless `KEEP_RAW_CLAUDE` is set to bypass it,
+either in the environment or as an assignment on the segment that runs `claude`. It is
+deliberately **not** exempt on `KEEP_PANE`: every hosted agent's Bash inherits that, so
+exempting it would exempt exactly the sessions the guard exists for, and PreToolUse only
+ever sees an agent's tool call, never the launcher's own exec. Plain `claude` with no
+resume flag is untouched, and a mention inside `echo` or `grep` is not an invocation.
+
+The guard reads a command, not a process tree, so it does not cover `npx claude
+--resume`, a locally installed wrapper under another name, or bundled short flags
+(`claude -rc`, which the parser sees as one unknown token). Those are gaps in the bar,
+not holes in a boundary — the guard is a reminder that keeps the honest path honest.
 
 `keep setup --shell` prints a zsh `claude()` that does the same for Owner's own typing;
 `keep setup --shell --write` installs it in `~/.zshrc` between
 `# >>> keep shell >>>` / `# <<< keep shell <<<` markers, replacing the block if it is
 already there. It calls `command claude`, so the `clauded` alias expands to the function
-and is guarded too, and `--dangerously-skip-permissions` passes straight through.
+and is guarded too, and `--dangerously-skip-permissions` passes straight through. The
+launcher's own resume is told apart by `KEEP_LAUNCHER`, which Keep sets on the pane's
+environment and which the function `unset`s before exec'ing; `bin/agent-launcher.js`
+strips it again on the way into the agent process, so an agent's own shell calls never
+inherit a bypass.
 
 `keep resume` prints `keep open <id>` for every session; `keep resume --raw` prints the
 bare `claude --resume` / `codex resume` form for a human who knows what it gives up.

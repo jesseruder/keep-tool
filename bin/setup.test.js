@@ -161,7 +161,11 @@ test('keep setup --shell prints the guard, --write is idempotent, and a non-resu
     assert.match(printed.stdout, /# >>> keep shell >>>/);
     assert.match(printed.stdout, /^claude\(\) \{$/m);
     assert.match(printed.stdout, /command claude "\$@"/, 'command claude, so the clauded alias is guarded too');
-    assert.match(printed.stdout, /\[ -z "\$KEEP_PANE" \] && \[ -z "\$KEEP_RAW_CLAUDE" \]/);
+    assert.match(printed.stdout, /\[ -z "\$KEEP_RAW_CLAUDE" \]/);
+    assert.match(printed.stdout, /if \[ -n "\$KEEP_LAUNCHER" \]; then/);
+    assert.match(printed.stdout, /^ {4}unset KEEP_LAUNCHER$/m, 'the marker never reaches the agent process');
+    assert.equal(printed.stdout.includes('KEEP_PANE'), false,
+      'KEEP_PANE is not a bypass: every hosted agent shell inherits it');
     assert.equal(fs.existsSync(path.join(home, '.zshrc')), false, '--shell alone never writes');
 
     fs.writeFileSync(path.join(home, '.zshrc'), 'export EXISTING=1');
@@ -197,11 +201,24 @@ test('keep setup --shell prints the guard, --write is idempotent, and a non-resu
       ['--dangerously-skip-permissions', '--model', 'opus', '-p', 'hello'],
       'every argument reaches claude untouched on a non-resume call');
 
-    // Both bypasses.
+    // The documented bypass.
     fs.rmSync(capture, { force: true });
     assert.equal(zsh('claude --resume 39f6a38a', { KEEP_RAW_CLAUDE: '1' }).status, 0);
     assert.deepEqual(JSON.parse(fs.readFileSync(capture, 'utf8')), ['--resume', '39f6a38a']);
+
+    // A hosted agent's shell has KEEP_PANE and is still guarded.
+    assert.equal(zsh('claude --resume 39f6a38a', { KEEP_PANE: 'pane-7' }).status, 1);
+
+    // The launcher's own resume passes, and the marker it passed on does not leak
+    // into the claude process (whose own Bash calls would otherwise inherit a bypass).
     fs.rmSync(capture, { force: true });
-    assert.equal(zsh('claude --resume 39f6a38a', { KEEP_PANE: 'pane-7' }).status, 0);
+    fs.writeFileSync(path.join(fakeBin, 'claude'), `#!${process.execPath}\n`
+      + `require('node:fs').writeFileSync(process.env.ARG_CAPTURE, JSON.stringify({`
+      + ` args: process.argv.slice(2), launcher: process.env.KEEP_LAUNCHER ?? null }));\n`, { mode: 0o755 });
+    const launched = zsh('claude --resume 39f6a38a', { KEEP_LAUNCHER: '1', KEEP_PANE: 'pane-7' });
+    assert.equal(launched.status, 0, launched.stderr);
+    const seen = JSON.parse(fs.readFileSync(capture, 'utf8'));
+    assert.deepEqual(seen.args, ['--resume', '39f6a38a']);
+    assert.equal(seen.launcher, null, 'KEEP_LAUNCHER is unset before exec, so it reaches nothing downstream');
   } finally { fs.rmSync(base, { recursive: true, force: true }); }
 });

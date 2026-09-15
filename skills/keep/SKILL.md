@@ -124,12 +124,19 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   A granted action needs no message to Owner — do it, and say you did in the check-in.
   Only Owner grants: `keep allow <card> --grant push,review --until +7d`. Never grant
   on your own card, and never read a grant as covering more than it names — `--grant`
-  and `--until` are refused inside an agent session.
+  and `--until`, on `keep allow` and on `keep add`, are refused inside an agent session.
+  These grants are attributed and audited, not enforced: a session that edits card
+  files directly can write any frontmatter it likes, so the rule is the boundary and
+  the exit code only makes the honest path the easy one.
   After an independent review of your commits, record it:
   `keep reviewed <card> --commit origin/<default>..HEAD --verdict clean|findings --by "codex sol" --job <job-id>`.
+  Keep verifies what it can: `--job` must name a completed job in a registered Codex
+  account, `--by human` cannot be written from an agent session, and a `codex` review
+  needs a job while an `opus`/`claude` one needs a job or 80+ characters of `--evidence`.
   `keep allow <card> land` then answers 0 when the reviewed patches are exactly what
   would land — every commit in `origin/<default>..HEAD` covered by a clean record whose
-  patch-id matches, from a clean `wt/` worktree, with the card not opted out.
+  patch-id matches, from a clean wt-managed `wt/` worktree with a linear range, with the
+  card not opted out.
   `keep land <card>` does the land: it re-checks that, runs `wt land`, and cites the
   landed sha. Keep-tool's own main checkout and daemon restart stay manual.
 - **When you need Owner and the card does not grant it**: first do everything on the

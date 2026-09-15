@@ -44,8 +44,22 @@ const AUTH_ENV = {
   codex: ['OPENAI_API_KEY', 'CODEX_API_KEY', 'OPENAI_BASE_URL'],
 };
 
+// The marker that tells the `claude()` shell function in ~/.zshrc that this shell
+// is Keep's own launcher and its resume is the launcher's, not a hand-typed one.
+// It is set on the pane's environment (so the login shell sees it) and deleted
+// here, before the agent process starts — the function unsets it too, but only
+// when the exec'd word is literally `claude`. Stripping it on the way into the
+// agent is what guarantees the agent's own Bash calls never inherit a bypass;
+// that is exactly how exempting KEEP_PANE made the guard a no-op.
+const LAUNCHER_MARKER = 'KEEP_LAUNCHER';
+
+function launcherEnv(extra = null) {
+  return { ...(extra && typeof extra === 'object' ? extra : {}), [LAUNCHER_MARKER]: '1' };
+}
+
 function profileEnvironment(agent, profile, source = process.env) {
   const env = { ...source };
+  delete env[LAUNCHER_MARKER];
   if (!profile) return env;
   env.KEEP_AGENT_ACCOUNT_ID = profile.id;
   if (profile.managed) for (const key of AUTH_ENV[agent] || []) delete env[key];
@@ -136,4 +150,4 @@ if (require.main === module) {
     } else launch(agent, process.argv[5], process.argv.slice(6), profile);
   } else launch(process.argv[2], process.argv[3], process.argv.slice(4));
 }
-module.exports = { command, profileCommand, profileEnvironment, prepareProfile };
+module.exports = { command, profileCommand, profileEnvironment, prepareProfile, launcherEnv, LAUNCHER_MARKER };

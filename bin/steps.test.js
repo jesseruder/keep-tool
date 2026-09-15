@@ -997,11 +997,18 @@ test('the pre-bash guard refuses a raw claude --resume and leaves everything els
     'keep open 39f6a38a',
   ]) assert.equal(denied(command), false, command);
 
-  // The host's own launcher always carries KEEP_PANE, and must never be blocked.
-  assert.equal(denied('claude --resume 39f6a38a', { KEEP_PANE: 'pane-7' }), false);
+  // KEEP_PANE is NOT a bypass: every hosted agent's Bash inherits it, so exempting it
+  // made the guard a no-op in exactly the sessions it exists for. PreToolUse only ever
+  // sees an agent's tool call; the launcher's own exec never reaches this hook.
+  assert.equal(denied('claude --resume 39f6a38a', { KEEP_PANE: 'pane-7' }), true);
   assert.equal(denied('claude --resume 39f6a38a', { KEEP_RAW_CLAUDE: '1' }), false);
-  // The inline spelling of the bypass never reaches this process's environment.
+  // The inline spelling of the bypass never reaches this process's environment, so it
+  // is read off the command — but only on the segment that actually runs claude.
   assert.equal(denied('KEEP_RAW_CLAUDE=1 claude --resume 39f6a38a'), false);
+  assert.equal(denied('KEEP_RAW_CLAUDE=1 bash -lc "claude --resume 39f6a38a"'), false, 'exported into the shell');
+  assert.equal(denied('echo "KEEP_RAW_CLAUDE=1"; claude --resume 39f6a38a'), true, 'a mention is not an assignment');
+  assert.equal(denied('KEEP_RAW_CLAUDE= claude --resume 39f6a38a'), true, 'an empty value is not set');
+  assert.equal(denied('OTHER=1 claude --resume 39f6a38a'), true);
 
   const reason = keep.guardResumeCommand(bash('claude --resume 39f6a38a'), clean).reason;
   assert.match(reason, /raw claude --resume bypasses Keep's launcher \(pane binding, account, permissions flags\)/);
@@ -1010,7 +1017,9 @@ test('the pre-bash guard refuses a raw claude --resume and leaves everything els
   // End to end through the hook: exit 2 is the deny, and a plain claude passes.
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-resume-guard-'));
   try {
-    const env = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', KEEP_PORT: '65432', KEEP_PANE: '', KEEP_RAW_CLAUDE: '' };
+    // KEEP_PANE deliberately SET here: a hosted agent's Bash always has one, and the
+    // guard has to hold there or it holds nowhere.
+    const env = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', KEEP_PORT: '65432', KEEP_PANE: 'pane-7', KEEP_RAW_CLAUDE: '' };
     const hook = (command) => spawnSync(process.execPath, [KEEP, 'hook', 'pre-bash'], {
       cwd: root, encoding: 'utf8', env,
       input: JSON.stringify({ session_id: 'raw-resume', cwd: root, tool_name: 'Bash', tool_input: { command } }),
