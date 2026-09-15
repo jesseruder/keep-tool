@@ -392,6 +392,11 @@ function cardBlock(card) {
 const CONTEXT_NOTE_LIMIT = 160;
 const CONTEXT_NOTES = 5;
 const CONTEXT_HOLDS = 3;
+// What the notes and holds together may cost. fitContext trims the last section
+// — the assistant tail — when the whole runs long, so without a budget of their
+// own a project with five chatty notes would quietly eat the end of the turn,
+// which is the part every verdict is actually decided from.
+const STATE_BLOCK_BUDGET = 800;
 
 function stateNoteBlock(turn, deps = {}) {
   const project = turn && turn.project;
@@ -415,12 +420,47 @@ function holdBlock(turn, deps = {}) {
   const project = turn && turn.project;
   if (!project) return [];
   let holds = [];
-  try { holds = (deps.keep || require('./keep.js')).activeHolds(project, Date.now(), { devices: true }); } catch { return []; }
+  // prune: false — building a context is a read. The opportunistic 7-day GC in
+  // activeHolds unlinks files, and a judge that quietly deletes fleet state
+  // while forming an opinion about it is not a reader.
+  try {
+    holds = (deps.keep || require('./keep.js'))
+      .activeHolds(project, Date.now(), { devices: true, prune: false });
+  } catch { return []; }
   if (!holds.length) return [];
   const scopes = require('./hold-scopes.js');
   const lines = holds.slice(0, CONTEXT_HOLDS).map((hold) =>
     `  - [${scopes.label(hold)}] ${oneLine(hold.reason, CONTEXT_NOTE_LIMIT)} (until ${hold.until})`);
   return [`HOLDS (another session asked for a quiet window on these resources):\n${lines.join('\n')}`];
+}
+
+// Whole lines, never a half one: a block trimmed mid-row reads as a note that
+// says something it does not. The heading survives as long as one row does.
+function trimStateBlock(block, room) {
+  if (block.length <= room) return block;
+  const lines = block.split('\n');
+  const kept = [lines[0]];
+  let used = lines[0].length;
+  for (const line of lines.slice(1)) {
+    if (used + 1 + line.length > room) break;
+    kept.push(line);
+    used += 1 + line.length;
+  }
+  return kept.length > 1 ? kept.join('\n') : '';
+}
+
+function fitStateBlocks(blocks, budget = STATE_BLOCK_BUDGET) {
+  const out = [];
+  let used = 0;
+  for (const block of blocks) {
+    const room = budget - used - (out.length ? 2 : 0);
+    if (room <= 0) break;
+    const text = trimStateBlock(block, room);
+    if (!text) break;
+    used += text.length + (out.length ? 2 : 0);
+    out.push(text);
+  }
+  return out;
 }
 
 function turnBlock(turn) {
@@ -452,8 +492,7 @@ function buildContext(turn, deps = {}) {
   const previous = previousStateLine(turn, deps);
   const sections = [
     ...cardBlock(card),
-    ...stateNoteBlock(turn, deps),
-    ...holdBlock(turn, deps),
+    ...fitStateBlocks([...stateNoteBlock(turn, deps), ...holdBlock(turn, deps)]),
     turnBlock(turn),
     ...(previous ? [`PREVIOUS TURN STATE: ${oneLine(previous, STATE_LINE_LIMIT)}`] : []),
     ...signalBlock(signals, rule),
@@ -1434,7 +1473,7 @@ module.exports = {
   normalizeForMatch, explicitPauseAnywhere, askedAnywhere, askedForActionAnywhere,
   signalsFor, ruleVerdict, selectTurns, turnsForReplay, turnFor, buildContext, invocationFor,
   firstJsonObject, parseVerdict, runModel, spawnRunner, judge, writeVerdict, setDecisionId, decisionTypeFor,
-  stateNoteBlock, holdBlock, observationFor,
+  stateNoteBlock, holdBlock, fitStateBlocks, STATE_BLOCK_BUDGET, observationFor,
   normalizeContinue, isAllowedContinueMessage, canonicalContinueMessage, withoutQuoted,
   watcherModelTag, PROMPT_HASH,
   tick, enabled, replay, groundTruth, scoreOne, unquoted, confidenceBand, BANDS, BAND_LABELS,

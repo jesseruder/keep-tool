@@ -1608,3 +1608,68 @@ test('the tick reports observations without adding a model call', async (t) => {
   assert.equal(angry.judged, 1);
   assert.equal(angry.observations, 0);
 });
+
+test('the notes and holds block has its own budget and never eats the assistant tail', (t) => {
+  const dir = sandbox(t);
+  const notes = require('./notes.js');
+  t.after(() => {
+    fs.rmSync(path.join(REGISTRY, '.keep', 'notes'), { recursive: true, force: true });
+    fs.rmSync(path.join(REGISTRY, '.keep', 'holds'), { recursive: true, force: true });
+  });
+  const tail = 'Ran the suite. ' + 'w'.repeat(1200) + " Next, I'll land it.";
+  indexTurns(dir, [['do it', tail]]);
+  const turn = watcher.turnFor(SESSION, 1);
+  const until = notes.stampOf(new Date(Date.now() + 3600e3));
+  for (let i = 0; i < 8; i += 1) {
+    notes.addNote({
+      project: '/tmp/watched', scopes: [`res-${i}`], by: { sessionId: 'other', agent: 'claude' },
+      message: `resource ${i} is in a strange state ${'y'.repeat(200)}`, until,
+    });
+  }
+  const holdsDir = path.join(REGISTRY, '.keep', 'holds');
+  fs.mkdirSync(holdsDir, { recursive: true });
+  for (let i = 0; i < 3; i += 1) {
+    fs.writeFileSync(path.join(holdsDir, `hold-b${i}.json`), JSON.stringify({
+      id: `hold-b${i}`, project: '/tmp/watched', scopes: [`res-${i}`], reason: 'z'.repeat(150),
+      until: new Date(Date.now() + 3600e3).toISOString(), released: false, by: { sessionId: 'other', agent: 'claude' },
+    }));
+  }
+
+  const text = watcher.buildContext(turn).text;
+  const start = text.indexOf('STATE NOTES');
+  const end = text.indexOf('TURN 1 (');
+  assert.ok(start !== -1 && end > start);
+  const stateBlock = text.slice(start, end).trim();
+  assert.ok(stateBlock.length <= watcher.STATE_BLOCK_BUDGET,
+    `state block is ${stateBlock.length}, budget ${watcher.STATE_BLOCK_BUDGET}`);
+  // Whole rows only, and the tail the verdict is decided from is still intact.
+  assert.doesNotMatch(stateBlock, /\(until $/);
+  assert.ok(text.includes(tail), 'the assistant tail survived the notes');
+
+  // The budget drops rows rather than truncating one into a half-sentence.
+  const fitted = watcher.fitStateBlocks(['HEAD:\n  - one\n  - two\n  - three'], 20);
+  assert.deepEqual(fitted, ['HEAD:\n  - one']);
+  assert.deepEqual(watcher.fitStateBlocks(['HEAD:\n  - a very long single row'], 8), []);
+});
+
+test('building a context never unlinks a hold file', (t) => {
+  const dir = sandbox(t);
+  t.after(() => fs.rmSync(path.join(REGISTRY, '.keep', 'holds'), { recursive: true, force: true }));
+  indexTurns(dir, [['do it', 'Done.']]);
+  const turn = watcher.turnFor(SESSION, 1);
+  const holdsDir = path.join(REGISTRY, '.keep', 'holds');
+  fs.mkdirSync(holdsDir, { recursive: true });
+  // Old enough for activeHolds' opportunistic 7-day GC to delete it on read.
+  const file = path.join(holdsDir, 'hold-ancient.json');
+  fs.writeFileSync(file, JSON.stringify({
+    id: 'hold-ancient', project: '/tmp/watched', scopes: ['terraform'], reason: 'old',
+    until: new Date(Date.now() - 30 * 86400e3).toISOString(), released: false, by: {},
+  }));
+  const old = new Date(Date.now() - 30 * 86400e3);
+  fs.utimesSync(file, old, old);
+
+  watcher.buildContext(turn);
+  assert.equal(fs.existsSync(file), true, 'a read must not delete fleet state');
+  watcher.holdBlock(turn);
+  assert.equal(fs.existsSync(file), true);
+});
