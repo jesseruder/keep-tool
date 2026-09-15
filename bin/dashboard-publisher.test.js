@@ -42,6 +42,33 @@ test('dashboard publisher coalesces invalidations and retains the last good snap
   } finally { publisher.close(); }
 });
 
+test('background invalidations wait out the minimum interval; refresh does not', async () => {
+  const runs = [];
+  const publisher = createDashboardPublisher({
+    warmup: false, debounceMs: 0, cadenceMs: 60e3, minIntervalMs: 300,
+    build: async () => { runs.push(Date.now()); return { state: { generatedAt: Date.now() }, portableTransfers: [] }; },
+    publish: () => {},
+  });
+  try {
+    publisher.invalidate();
+    while (runs.length < 1) await tick();
+    publisher.invalidate();
+    publisher.invalidate();
+    await tick();
+    assert.equal(runs.length, 1, 'a background invalidation inside the gap waits');
+    while (runs.length < 2) await tick();
+    assert.ok(runs[1] - runs[0] >= 280, `second build waited ${runs[1] - runs[0]}ms`);
+    await tick();
+    assert.equal(runs.length, 2, 'invalidations inside the gap coalesce into one build');
+    publisher.invalidate();
+    await tick();
+    assert.equal(runs.length, 2);
+    publisher.refresh();
+    while (runs.length < 3) await tick();
+    assert.ok(runs[2] - runs[1] < 200, `refresh pulled the throttled build forward (${runs[2] - runs[1]}ms)`);
+  } finally { publisher.close(); }
+});
+
 test('an invalidation during a running build queues only one follow-up refresh', async () => {
   let release;
   let builds = 0;

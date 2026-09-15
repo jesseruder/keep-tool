@@ -1208,21 +1208,18 @@ async function listHostPanes(deps = {}, fresh = false) {
   }
 }
 
-// A timed-out host request, or a host not yet connected after a daemon restart,
-// leaves listHostPanes null. Publishing that as zero panes strips every session's
-// liveness, so Waiting on you empties and sessions flash into Running & waiting.
-// Reuse the last good list briefly; with none yet, publish nothing while starting.
+// A timed-out host request leaves listHostPanes null. Publishing that as zero panes
+// strips every session's liveness, so Waiting on you empties and sessions flash into
+// Running & waiting. Reuse the last good list briefly. With no good list yet (a fresh
+// daemon, or no host at all) publish as before rather than holding the dashboard.
 const HOST_PANES_REUSE_MS = 60e3;
-function hostPanesForPublish(panes, memo, now, options = {}) {
+function hostPanesForPublish(panes, memo, now) {
   if (Array.isArray(panes)) {
     memo.panes = panes;
     memo.at = now;
     return panes;
   }
   if (memo.panes && now - memo.at < HOST_PANES_REUSE_MS) return memo.panes;
-  if (!options.published && now - (options.startedAt || 0) < HOST_PANES_REUSE_MS) {
-    throw new Error('host panes unavailable; keeping the previous dashboard state');
-  }
   return panes;
 }
 
@@ -7014,22 +7011,13 @@ function start(deps = {}) {
     companion: options.companion || null,
   });
   const publishedPanes = { panes: null, at: 0 };
-  const publisherStartedAt = Date.now();
   dashboardPublisher = createDashboardPublisher({
     prepare: async () => {
       // Fence before every source read. A mutation that completes while panes,
       // review launch state, or companion jobs are being collected invalidates
       // this running pass and forces a follow-up carrying the newer fence.
       const capturedMutationFence = mutationFence();
-      let panes;
-      try {
-        panes = hostPanesForPublish(await listHostPanes(deps), publishedPanes, Date.now(),
-          { startedAt: publisherStartedAt, published: Boolean(retainedPublication) });
-      } catch (error) {
-        // Nothing else may invalidate soon after a restart; come back for the host.
-        setTimeout(() => dashboardPublisher?.invalidate(), 1000).unref();
-        throw error;
-      }
+      const panes = hostPanesForPublish(await listHostPanes(deps), publishedPanes, Date.now());
       await reviewQueue.reconcile({ inspectLaunch: (active) => inspectReviewQueueLaunch(active) });
       const companion = await companionSnapshot(deps);
       return { hostPanes: panes, companion, mutationFence: capturedMutationFence };
@@ -7043,6 +7031,7 @@ function start(deps = {}) {
       retainedPublication = publication;
       uiWorker?.publish(publication);
     },
+    minIntervalMs: envNumber('KEEP_DASHBOARD_MIN_INTERVAL_MS', 5000),
     onError: (error) => process.stderr.write(`keep serve: dashboard refresh failed; retaining published state: ${error.message}\n`),
   });
   const broadcast = () => dashboardPublisher.invalidate();
@@ -7974,7 +7963,8 @@ function start(deps = {}) {
         fenced = true;
         mutationSequence += 1;
         res.setHeader('x-keep-mutation-fence', mutationFence());
-        dashboardPublisher.invalidate();
+        // The client waits for this fence; skip the background rebuild throttle.
+        dashboardPublisher.refresh();
       }
       return writeHead.call(this, status, ...args);
     };
