@@ -324,7 +324,7 @@ test('stale jobs become uncertain; closing parent never marks jobs complete', ()
   assert.equal(jobs.targets(root).length, 1, 'daemon restart keeps tracking the closed parent job');
 }));
 
-test('partial lines retry without advancing and truncated transcripts retain unresolved jobs', () => fixture(({ file, append, sync }) => {
+test('partial lines retry without advancing and truncated transcripts retain unresolved jobs', () => fixture(({ root, file, append, sync, now }) => {
   launch(append); sync();
   fs.appendFileSync(file, '{"type":"user"');
   assert.equal(sync().recovering, true);
@@ -335,6 +335,198 @@ test('partial lines retry without advancing and truncated transcripts retain unr
   assert.equal(replaced.jobs[0].status, 'pending');
   assert.ok(replaced.uncertain.includes('j'));
   assert.ok(replaced.gap);
+  assert.equal(replaced.gapReason, 'transcript-replaced');
+  const snapshot = path.join(root, '.keep/background-jobs/claude/parent/state.json');
+  assert.equal(JSON.parse(fs.readFileSync(snapshot)).gapAt, now());
+  const stale = JSON.parse(fs.readFileSync(snapshot));
+  stale.childStopVersion = 2; delete stale.gapAt; delete stale.gapReason;
+  fs.writeFileSync(snapshot, JSON.stringify(stale));
+  fs.writeFileSync(file, 'x');
+  const anchored = sync();
+  assert.equal(anchored.gap, true);
+  assert.equal(anchored.gapReason, 'checkpoint-anchor');
+  assert.equal(JSON.parse(fs.readFileSync(snapshot)).gapAt, now());
+}));
+
+test('a cold replay clears a gap it can fully re-derive and never one it re-marks', () => fixture(({ root, file, append, sync, now }) => {
+  jobs.recordHook(root, 'claude', 'parent', { event: 'SubagentStart', entity: 'kid', at: 90000, offset: 0 });
+  launch(append); done(append); sync();
+  const snapshot = path.join(root, '.keep/background-jobs/claude/parent/state.json');
+  const reopen = () => JSON.parse(fs.readFileSync(snapshot));
+  const gapped = () => { const s = reopen(); s.gap = true; s.gapAt = 1; s.gapReason = 'budget-skip'; fs.writeFileSync(snapshot, JSON.stringify(s)); };
+
+  gapped();
+  const ignored = sync();
+  assert.equal(ignored.gap, true, 'an ordinary pass never replays a gapped ledger');
+  assert.equal(ignored.bytesRead, 0);
+  assert.equal(reopen().coldReplay, undefined);
+
+  const cleared = sync({ coldReplay: true });
+  assert.equal(cleared.gap, false);
+  assert.equal(cleared.gapReason, undefined);
+  assert.equal(cleared.gapClearedAt, now());
+  assert.ok(cleared.bytesRead > 0, 'the whole transcript is replayed');
+  const replayed = reopen();
+  assert.equal(replayed.gapClearedBy, 'cold-replay');
+  assert.equal(replayed.coldReplay, undefined);
+  assert.equal(replayed.lastColdReplayAt, now());
+  assert.equal(replayed.jobs['job:kid'].kind, 'agent', 'a hook-only agent job survives the replay');
+  assert.equal(replayed.jobs['job:j'].status, 'completed');
+
+  gapped();
+  append({ type: 'assistant', message: { content: 'x'.repeat(5000) } });
+  assert.equal(sync({ coldReplay: true, budget: 2000 }).recovering, true);
+  assert.equal(reopen().coldReplay.startedAt, now());
+  fs.writeFileSync(file, JSON.stringify({ type: 'user', message: { content: 'new file' } }) + '\n');
+  const remarked = sync({ budget: 2000 });
+  assert.equal(remarked.gap, true);
+  assert.equal(remarked.gapReason, 'transcript-replaced');
+  assert.equal(reopen().coldReplay, undefined, 'a replay that lost history is abandoned, not credited');
+}));
+
+test('sticky, legacy and growing-transcript gaps each get the replay they deserve', () => fixture(({ root, append, sync, now }) => {
+  launch(append); done(append); sync();
+  const snapshot = path.join(root, '.keep/background-jobs/claude/parent/state.json');
+  const reopen = () => JSON.parse(fs.readFileSync(snapshot));
+  const patch = (fields) => fs.writeFileSync(snapshot, JSON.stringify({ ...reopen(), ...fields }));
+
+  for (const reason of ['transcript-replaced', 'checkpoint-anchor', 'hook-transcript-mismatch']) {
+    patch({ gap: true, gapAt: 1, gapReason: reason });
+    const sticky = sync({ coldReplay: true });
+    assert.equal(sticky.gap, true, `history lost to ${reason} is never re-derivable`);
+    assert.equal(sticky.gapReason, reason);
+    assert.equal(reopen().coldReplay, undefined, 'the refreshing replay still finishes and is dropped');
+  }
+
+  const legacy = reopen();
+  legacy.gap = true; delete legacy.gapAt; delete legacy.gapReason;
+  fs.writeFileSync(snapshot, JSON.stringify(legacy));
+  const stamped = sync({ coldReplay: true });
+  assert.equal(stamped.gap, true);
+  assert.equal(stamped.gapReason, 'legacy');
+  assert.equal(reopen().coldReplay, undefined, 'the stamping pass defers the replay to the next one');
+  assert.equal(sync({ coldReplay: true, now: now() + 1000 }).gap, false, 'a legacy gap is clearable by a full replay');
+
+  patch({ gap: true, gapAt: 1, gapReason: 'budget-skip' });
+  append({ type: 'assistant', message: { content: 'x'.repeat(5000) } });
+  assert.equal(sync({ coldReplay: true, budget: 1000 }).recovering, true);
+  append({ type: 'user', message: { content: 'more work' } });
+  const finished = sync({ budget: 1000 });
+  assert.equal(finished.recovering, false);
+  assert.equal(finished.caughtUp, true);
+  assert.equal(finished.gap, false, 'growth during a replay only means another pass');
+  assert.equal(reopen().gapClearedBy, 'cold-replay');
+}));
+
+test('a sticky gap reason outranks the ordinary gaps that follow it', () => {
+  const state = { gap: false };
+  jobs.markGap(state, 1000, 'transcript-replaced');
+  jobs.markGap(state, 2000, 'read-error');
+  assert.equal(state.gapReason, 'transcript-replaced');
+  assert.equal(state.gapAt, 2000, 'the stamp still advances so a replay cannot outrun its own gap');
+  jobs.markGap(state, 3000, 'checkpoint-anchor');
+  assert.equal(state.gapReason, 'checkpoint-anchor', 'one lost-history reason may replace another');
+  fixture(({ root, file, append, sync, now }) => {
+    launch(append); done(append); sync();
+    const snapshot = path.join(root, '.keep/background-jobs/claude/parent/state.json');
+    fs.writeFileSync(snapshot, JSON.stringify({ ...JSON.parse(fs.readFileSync(snapshot)), gap: true, gapAt: 1, gapReason: 'transcript-replaced' }));
+    fs.appendFileSync(file, '{"type":"user"\n');
+    assert.equal(sync().gapReason, 'transcript-replaced', 'an ordinary re-mark cannot demote lost history');
+    const replayed = sync({ coldReplay: true, now: now() + 1000 });
+    assert.equal(replayed.gap, true, 'and the replay it triggers still refuses to clear the gap');
+    assert.equal(replayed.gapReason, 'transcript-replaced');
+  });
+});
+
+const ABANDON_AFTER = 3 * 3600e3;
+const abandonment = (childEvidence, recentCheck) => fixture(({ root, append, sync, now }) => {
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'spawn', name: 'Agent', input: {} }] } });
+  append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'spawn', content: 'Async agent launched successfully. agentId: kid' }] } });
+  const childAt = now(), inspectAgent = () => childEvidence(childAt);
+  const kid = (result) => result.jobs.find(j => j.id === 'kid');
+  assert.equal(kid(sync({ inspectAgent, now: childAt + ABANDON_AFTER + 1000 })).status, 'pending', 'an unfinished parent turn is not evidence the child died');
+  append({ sessionId: 'parent', type: 'assistant', message: { content: [], stop_reason: 'end_turn' } });
+  const ended = now();
+  assert.equal(kid(sync({ inspectAgent, now: ended + 1000 })).status, 'pending', 'a young job is ordinary outstanding work');
+  // A missing child transcript falls back to the launch time; a present one
+  // must itself be stale before the job can be called abandoned.
+  const childFile = path.join(root, 'child.jsonl');
+  let childTranscriptFor = () => path.join(root, 'missing.jsonl');
+  if (recentCheck) {
+    assert.equal(kid(sync({ inspectAgent: () => ({ at: ended + ABANDON_AFTER + 500, done: false }), now: ended + ABANDON_AFTER + 1000 })).status,
+      'pending', 'a child that is still writing is alive');
+    assert.equal(kid(sync({ inspectAgent: () => ({ at: ended + 1, done: false }), now: ended + ABANDON_AFTER + 2000 })).status,
+      'pending', 'a child that wrote after the parent stopped observing is not abandoned');
+    fs.writeFileSync(childFile, '');
+    childTranscriptFor = () => childFile;
+    assert.equal(kid(sync({ inspectAgent, childTranscriptFor, now: ended + ABANDON_AFTER + 1000 })).status,
+      'pending', 'a child transcript written moments ago is not a dead child');
+    fs.utimesSync(childFile, childAt / 1000, childAt / 1000);
+  }
+  const abandoned = kid(sync({ inspectAgent, childTranscriptFor, now: ended + ABANDON_AFTER + 1000 }));
+  assert.equal(abandoned.status, 'cancelled');
+  assert.equal(abandoned.evidence, 'abandoned-child');
+  assert.equal(abandoned.abandonedAt, ended + ABANDON_AFTER + 1000);
+  const state = jobs.read(root, 'claude', 'parent', ended + ABANDON_AFTER + 1000);
+  assert.equal(state.pending, false);
+  assert.deepEqual(state.uncertain, []);
+});
+
+test('a pending subagent is abandoned only once its completed parent turn outlives the child', () => {
+  abandonment((at) => ({ at, done: false }), true);
+  abandonment(() => { const error = Error('missing child transcript'); error.code = 'ENOENT'; throw error; }, false);
+});
+
+test('a multi-pass cold replay never abandons a child whose completion is still unread', () => fixture(({ root, append, sync, now }) => {
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'spawn', name: 'Agent', input: {} }] } });
+  append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'spawn', content: 'Async agent launched successfully. agentId: kid' }] } });
+  const childAt = now();
+  sync();
+  append({ sessionId: 'parent', type: 'assistant', message: { content: [], stop_reason: 'end_turn' } });
+  append({ type: 'assistant', message: { content: 'x'.repeat(5000) } });
+  done(append, 'kid');
+  const snapshot = path.join(root, '.keep/background-jobs/claude/parent/state.json');
+  const gapped = JSON.parse(fs.readFileSync(snapshot));
+  gapped.gap = true; gapped.gapAt = 1; gapped.gapReason = 'budget-skip';
+  fs.writeFileSync(snapshot, JSON.stringify(gapped));
+  const late = now() + 4 * 3600e3;
+  const options = { coldReplay: true, budget: 1000, inspectAgent: () => ({ at: childAt, done: false }), now: late };
+  let result = sync(options);
+  assert.equal(result.recovering, true, 'the parent turn is complete in the replayed prefix');
+  assert.equal(result.jobs.find(j => j.id === 'kid').status, 'pending', 'an unread tail may still hold the completion');
+  for (let i = 0; i < 40 && result.recovering; i++) result = sync({ ...options, coldReplay: false });
+  assert.equal(result.recovering, false);
+  assert.equal(result.jobs.find(j => j.id === 'kid').status, 'completed');
+  assert.equal(result.gap, false, 'the replay reached the end of a transcript it could re-derive');
+}));
+
+test('hook evidence that has not reached the transcript blocks abandonment', () => fixture(({ root, file, append, sync, now }) => {
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'spawn', name: 'Agent', input: {} }] } });
+  append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'spawn', content: 'Async agent launched successfully. agentId: kid' }] } });
+  append({ sessionId: 'parent', type: 'assistant', message: { content: [], stop_reason: 'end_turn' } });
+  const ended = now();
+  jobs.recordHook(root, 'claude', 'parent', { event: 'PreToolUse', entity: 'call', at: ended, offset: fs.statSync(file).size + 5000 });
+  const options = { inspectAgent: () => ({ at: ended - 1000, done: false }), now: ended + 4 * 3600e3 };
+  assert.equal(sync(options).jobs.find(j => j.id === 'kid').status, 'pending', 'the barrier may still hide the child work');
+  append({ sessionId: 'parent', type: 'assistant', message: { content: 'x'.repeat(5000), stop_reason: 'end_turn' } });
+  assert.equal(sync(options).jobs.find(j => j.id === 'kid').status, 'cancelled');
+}));
+
+test('an abandoned child tombstone outlives tombstone pruning while the parent still names it', () => fixture(({ root, append, sync, now }) => {
+  append({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'spawn', name: 'Agent', input: {} }] } });
+  append({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'spawn', content: 'Async agent launched successfully. agentId: kid' }] } });
+  append({ sessionId: 'parent', type: 'assistant', message: { content: [], stop_reason: 'end_turn' } });
+  const ended = now();
+  const abandoned = sync({ abandonAfter: 1000, inspectAgent: () => ({ at: ended - 1000, done: false }), now: ended + 2000 });
+  assert.equal(abandoned.jobs.find(j => j.id === 'kid').evidence, 'abandoned-child');
+  for (let i = 0; i < 501; i++) { launch(append, `job${i}`, `call${i}`); done(append, `job${i}`); }
+  sync();
+  const state = JSON.parse(fs.readFileSync(path.join(root, '.keep/background-jobs/claude/parent/state.json')));
+  assert.equal(state.jobs['job:job0'], undefined, 'older tombstones are still pruned');
+  assert.equal(state.jobs['job:kid'].status, 'cancelled');
+  assert.equal(state.jobs['job:kid'].evidence, 'abandoned-child');
+  assert.equal(state.restart.children.kid, 'owned');
+  assert.equal(jobs.read(root, 'claude', 'parent', now()).jobs.filter(j => j.evidence === 'abandoned-child').length, 1);
 }));
 
 test('verified fresh startup bridges the first hooks until a complete transcript exists', () => {
@@ -398,11 +590,18 @@ test('transaction rebind preserves evidence, ignores its frozen former source, a
     ].map(JSON.stringify).join('\n') + '\n';
     fs.writeFileSync(source, transcript); fs.copyFileSync(source, target);
     jobs.sync({ root, agent: 'claude', sid: 'parent', file: source, now: 1200 });
-    const before = JSON.parse(fs.readFileSync(path.join(root, '.keep/background-jobs/claude/parent/state.json')));
+    const snapshot = path.join(root, '.keep/background-jobs/claude/parent/state.json');
+    const seeded = JSON.parse(fs.readFileSync(snapshot));
+    seeded.restart.children = { kid: 'owned', ghost: 'owned' };
+    seeded.jobs['job:kid'] = { id: 'kid', kind: 'agent', status: 'pending', startedAt: 1100, eventAt: 1100, evidence: 'transcript', run: 'a' };
+    seeded.jobs['job:ghost'] = { id: 'ghost', kind: 'agent', status: 'cancelled', startedAt: 1100, eventAt: 1100, evidence: 'abandoned-child', run: 'b' };
+    fs.writeFileSync(snapshot, JSON.stringify(seeded));
+    const before = JSON.parse(fs.readFileSync(snapshot));
 
     const rebound = jobs.rebindSource({ root, agent: 'claude', sid: 'parent', sourceFile: source, targetFile: target,
       transactionId: 'tx-a-b', sourceStopVerifiedAt: 1 });
     assert.equal(rebound.reused, false);
+    assert.deepEqual(rebound.children, ['kid'], 'an abandoned child has no ledger left to rebind');
     const after = JSON.parse(fs.readFileSync(path.join(root, '.keep/background-jobs/claude/parent/state.json')));
     assert.deepEqual(after.jobs, before.jobs);
     assert.deepEqual(after.restart, before.restart);

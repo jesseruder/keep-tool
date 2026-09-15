@@ -53,6 +53,7 @@ const {
   pickDeliveryCandidates,
   checkDeliveryIds,
   deliverCheckToThread,
+  coldReplayDue,
   compactRefusal,
   compactCommand,
   chunkForTyping,
@@ -2566,6 +2567,21 @@ test('compact-first defers only while compaction is still in progress', () => {
   assert.equal(afterCompactAction({ compacted: false, reason: 'Not enough messages to compact.' }), 'proceed');
   assert.equal(afterCompactAction({ compacted: false, reason: 'session transcript is unavailable' }), 'proceed');
   assert.equal(afterCompactAction({ compacted: true }), 'proceed');
+});
+
+test('a gapped ledger is replayed only on an idle live session, and at most hourly', () => {
+  const now = 10 * 3600e3, mtime = now - 31 * 60e3;
+  const session = { endedTurn: true, toolRunning: false, pendingQuestion: null, pendingPlan: null };
+  const jobs = { gap: true };
+  assert.equal(coldReplayDue(session, jobs, mtime, true, now), true);
+  assert.equal(coldReplayDue(session, { gap: false }, mtime, true, now), false);
+  assert.equal(coldReplayDue(session, jobs, mtime, false, now), false);
+  assert.equal(coldReplayDue(session, jobs, now - 29 * 60e3, true, now), false, 'a transcript written minutes ago may still be mid-flush');
+  assert.equal(coldReplayDue(session, { gap: true, lastColdReplayAt: now - 59 * 60e3 }, mtime, true, now), false);
+  assert.equal(coldReplayDue(session, { gap: true, lastColdReplayAt: now - 61 * 60e3 }, mtime, true, now), true);
+  for (const patch of [{ endedTurn: false }, { toolRunning: true }, { pendingQuestion: {} }, { pendingPlan: {} }]) {
+    assert.equal(coldReplayDue({ ...session, ...patch }, jobs, mtime, true, now), false);
+  }
 });
 
 test('a refused compaction is recognised from the screen instead of waiting out the timeout', () => {

@@ -74,6 +74,10 @@ function verify({ root, agent, sid, file, instance, resolveChild, budget = 4 * 1
     for (const launch of Object.keys(s.launches)) if (!s.mapped[launch]) throw Error('Child launch has no verified job ledger identity');
     for (const [child, kind] of Object.entries(s.children)) {
       if (!ID.test(child) || !resolveChild) throw Error('Child job ledger identity is unverified');
+      const acknowledged = state.jobs[`job:${child}`];
+      // An abandoned child was cancelled on this parent's own evidence; its
+      // ledger and transcript are gone, so there is nothing left to walk.
+      if (acknowledged && terminal.has(acknowledged.status) && acknowledged.evidence === 'abandoned-child') continue;
       const childFile = resolveChild(child, source);
       if (agent === 'codex' && kind === 'interacted') {
         const meta = childFile && require('./codex').readSessionMeta(childFile);

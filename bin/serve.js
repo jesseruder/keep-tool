@@ -4794,6 +4794,16 @@ function scanChildTranscript(file) {
   }
 }
 
+// A permanent history gap can only clear by replaying the whole transcript, so
+// ask for one on an idle live session whose transcript has been quiet for half
+// an hour, at most hourly, and never while a turn or tool is still running.
+function coldReplayDue(session, jobs, mtime, live, now) {
+  return jobs?.gap === true && live === true && session.endedTurn === true
+    && !session.toolRunning && !session.pendingQuestion && !session.pendingPlan
+    && now - mtime >= 30 * 60e3
+    && !(jobs.lastColdReplayAt > now - 60 * 60e3);
+}
+
 function registerBackgroundTarget(target) {
   if (!target?.agent || !target?.sid || !target?.file) return;
   backgroundTargets.set(`${target.agent}:${target.sid}`, target);
@@ -5634,15 +5644,16 @@ function buildState(options = {}) {
       if (file) {
         const hosted = options.hostPanes.find(p => p.id === session.runtime?.paneId);
         const sourceEvidence = dashboardSourceEvidence.get(`${session.kind}:${session.id}`)?.stat;
+        const jobs = settledBackgroundJobs.get(`${session.kind}:${session.id}`)
+          || require('./background-jobs').read(keep.ROOT, session.kind, session.id, now);
+        const live = session.runtime?.state === 'live' ? true : session.runtime?.state === 'exited' ? false : null;
         const target = { agent: session.kind, sid: session.id, file,
           ...(sourceEvidence ? { sourceFingerprint: [sourceEvidence.dev, sourceEvidence.ino,
             sourceEvidence.size, sourceEvidence.mtimeMs, sourceEvidence.ctimeMs] } : {}),
-          instance: { id: require('./background-jobs').processInstance(hosted),
-            processScoped: true, live: session.runtime?.state === 'live' ? true : session.runtime?.state === 'exited' ? false : null } };
+          ...(coldReplayDue(session, jobs, sourceEvidence?.mtimeMs ?? session.mtime, live, now) ? { coldReplay: true } : {}),
+          instance: { id: require('./background-jobs').processInstance(hosted), processScoped: true, live } };
         if (workerMode) options.collectBackgroundTargets?.push(target);
         else registerBackgroundTarget(target);
-        const jobs = settledBackgroundJobs.get(`${session.kind}:${session.id}`)
-          || require('./background-jobs').read(keep.ROOT, session.kind, session.id, now);
         session.backgroundJobs = jobs;
         session.pendingBackground = jobs.pending || (!jobs.caughtUp && session.pendingBackground);
         session.unknownBackgroundJobs = [...new Set([...jobs.uncertain, ...(!jobs.caughtUp ? session.unknownBackgroundJobs || [] : [])])];
@@ -7124,19 +7135,31 @@ function start(deps = {}) {
     const selected = backgroundJobScheduler.select(Date.now());
     if (!selected) return;
     const { key, target } = selected;
+    // The same child transcript paths restart-ledger resolves: inspection reads
+    // them, abandonment needs their mtime as the child's last writing evidence.
+    const childTranscriptFor = (id) => {
+      if (!/^[a-zA-Z0-9_-]{1,160}$/.test(id)) return null;
+      return target.agent === 'claude'
+        ? path.join(path.dirname(target.file), path.basename(target.file, '.jsonl'), 'subagents', `agent-${id}.jsonl`)
+        : codex.findRolloutFile(id);
+    };
     try {
       const result = jobLedger.sync({ root: keep.ROOT, ...target,
         classify: (name, input) => isBoundedBackgroundWatcher('Bash', { ...input, command: input?.command || input?.cmd, run_in_background: true }) ? 'finite'
           : isBackgroundService('Bash', { ...input, command: input?.command || input?.cmd }) ? 'service' : 'unknown',
         inspectAgent: (id) => {
           if (target.agent === 'claude') {
-            if (!/^[a-zA-Z0-9_-]{1,160}$/.test(id)) return null;
-            const child = scanChildTranscript(path.join(path.dirname(target.file), path.basename(target.file, '.jsonl'), 'subagents', `agent-${id}.jsonl`));
+            const file = childTranscriptFor(id);
+            if (!file) return null;
+            const child = scanChildTranscript(file);
             return { at: child.attentionAt || 0, done: child.explicitEndTurn && !child.pendingOther && !child.pendingBackground };
           }
           return require('./codex-lifecycle').inspectChild(id, target.sid);
         },
+        childTranscriptFor,
       });
+      // One replay per decision: the next dashboard pass re-asks, rate limited.
+      delete target.coldReplay;
       backgroundJobScheduler.observe(key, target, result, Date.now());
       if (result.redirect?.agent === target.agent && result.redirect.sid === target.sid && result.redirect.file) {
         registerBackgroundTarget(result.redirect);
@@ -8073,6 +8096,7 @@ module.exports = {
   reviewerResumeSpec,
   forceRestartSession,
   applyHostedExitState,
+  coldReplayDue,
   closeExitedCodexShell,
   scanSessions,
   invalidateDashboardSources,

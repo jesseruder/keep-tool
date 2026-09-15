@@ -273,6 +273,18 @@ test('terminal Claude quota errors are allowed only by explicit handoff proof an
   assert.throws(() => verify({ allowTerminalRateLimit: true }), /calls|complete/);
 }, 'claude'));
 
+test('an abandoned child is not walked, while the same child left pending still refuses', () => fixture(({ root, append, verify }) => {
+  append('parent', { sessionId: 'parent', type: 'assistant', message: { content: [{ type: 'tool_use', id: 'spawn', name: 'Agent', input: {} }] } });
+  append('parent', { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'spawn', content: 'Async agent launched successfully. agentId: child' }] } });
+  append('parent', { type: 'assistant', sessionId: 'parent', message: { content: [], stop_reason: 'end_turn' } });
+  assert.throws(verify, /identity|ENOENT|complete/, 'a pending child still needs its own ledger and transcript');
+  const snapshot = path.join(root, '.keep/background-jobs/claude/parent/state.json');
+  const state = JSON.parse(fs.readFileSync(snapshot));
+  Object.assign(state.jobs['job:child'], { status: 'cancelled', evidence: 'abandoned-child', abandonedAt: Date.now() });
+  fs.writeFileSync(snapshot, JSON.stringify(state));
+  verify()();
+}, 'claude'));
+
 test('a forced restart accepts a gapped ledger with a dead pending agent while source changes still abort', () => fixture(({ root, append, verify }) => {
   append('parent', { sessionId: 'parent', type: 'assistant', message: { content: [{ type: 'tool_use', id: 'spawn', name: 'Agent', input: {} }] } });
   append('parent', { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'spawn', content: 'Async agent launched successfully. agentId: child' }] } });

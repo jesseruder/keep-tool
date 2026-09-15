@@ -5,9 +5,26 @@ const crypto = require('node:crypto');
 const restartEvidence = require('./restart-evidence');
 const ID = /^[a-zA-Z0-9_-]{1,160}$/;
 const TERMINAL = new Set(['completed', 'failed', 'cancelled']);
+// History written to a file this ledger no longer reads, to a file rewritten
+// under the checkpoint, or to a hook that named another transcript cannot come
+// back; replaying the current file never restores it. invalid-ledger stays
+// clearable: a full replay rebuilds every transcript-visible job, and only
+// hook-only corroboration is lost with the unreadable snapshot.
+const STICKY_GAP_REASONS = new Set(['transcript-replaced', 'checkpoint-anchor', 'hook-transcript-mismatch']);
 const restartVersion = agent => agent === 'claude' ? 2 : 1;
 const hash = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const text = (v) => typeof v === 'string' ? v : Array.isArray(v) ? v.filter(x => ['text', 'input_text', 'output_text'].includes(x?.type)).map(x => x.text || '').join('\n') : '';
+
+// Every gap records when and why it was marked so a cold replay can tell an
+// inherited gap from one its own pass re-observed. Lost history outranks a later
+// ordinary gap, so a sticky reason survives; the stamp always advances to the
+// newest mark, which is the conservative end of the `gapAt < startedAt` test.
+function markGap(state, now, reason) {
+  const keepSticky = state.gap === true && STICKY_GAP_REASONS.has(state.gapReason) && !STICKY_GAP_REASONS.has(reason);
+  state.gap = true;
+  state.gapAt = now;
+  if (!keepSticky) state.gapReason = reason;
+}
 
 // Scheduled jobs belong to an agent process, which may run inside a shell pane.
 function processInstance(pane, agentPid = pane?.agentPid) {
@@ -66,6 +83,12 @@ function fileEvidence(file, content = false) {
   } finally { fs.closeSync(fd); }
 }
 
+// An abandoned child has no ledger or transcript left to rebind or verify.
+function verifiableChildren(state) {
+  return Object.keys(state.restart?.children || {})
+    .filter((child) => state.jobs?.[`job:${child}`]?.evidence !== 'abandoned-child');
+}
+
 function sameFrozenFile(file, evidence) {
   if (!evidence || path.resolve(file) !== evidence.file) return false;
   try {
@@ -121,7 +144,7 @@ function rebindSource({ root, agent, sid, sourceFile, targetFile, transactionId,
       if (state.checkpoint?.identity !== target.identity || state.checkpoint.offset !== target.size
           || state.checkpoint.mtime !== target.mtime || state.checkpoint.anchor !== target.anchor
           || state.source?.file !== target.file) throw failure('completed ledger rebind no longer matches its target');
-      return { reused: true, children: force ? [] : Object.keys(state.restart?.children || {}) };
+      return { reused: true, children: force ? [] : verifiableChildren(state) };
     }
     const checkpoint = state.checkpoint;
     if (!checkpoint || state.source?.agent !== agent || state.source.sid !== sid || path.resolve(state.source.file || '') !== source.file
@@ -139,7 +162,7 @@ function rebindSource({ root, agent, sid, sourceFile, targetFile, transactionId,
       retiredSources: retained, reboundAt: Date.now() };
     writeState(snapshot, state);
     // Under force the child graph is unverified evidence, so it is never reported.
-    return { reused: false, children: force ? [] : Object.keys(state.restart?.children || {}) };
+    return { reused: false, children: force ? [] : verifiableChildren(state) };
   } finally { try { fs.unlinkSync(lock); } catch {} }
 }
 
@@ -174,7 +197,7 @@ function clearReplayObligation(state, id, run) {
 function update(state, id, kind, status, at, evidence, instance, run = '') {
   if (!ID.test(String(id || ''))) return;
   const key = `job:${id}`, old = state.jobs[key];
-  if (!old && Object.keys(state.jobs).length >= 2500) { state.gap = true; return; }
+  if (!old && Object.keys(state.jobs).length >= 2500) { markGap(state, Date.now(), 'jobs-cap'); return; }
   const clearedRetained = TERMINAL.has(status) && run && clearReplayObligation(state, id, run);
   if (old && TERMINAL.has(status) && run && old.run && run !== old.run && clearedRetained) return;
   const placeholderRun = old?.evidence === 'hook' && old.run?.startsWith('hook:');
@@ -298,7 +321,7 @@ function consume(state, row, agent, classify, instance) {
       // Legacy string envelopes lack result-block ownership. Do not mistake a
       // completed wrapper for proof that a process it yielded has also ended.
       if (typeof p.output === 'string' && /^Script (?:completed|running)\b/.test(value)
-          && /\n(?:Output|Final output):[\s\S]*(?:"session_id"\s*:\s*\d+|Process running with session ID|Script running with cell ID)/.test(value)) state.gap = true;
+          && /\n(?:Output|Final output):[\s\S]*(?:"session_id"\s*:\s*\d+|Process running with session ID|Script running with cell ID)/.test(value)) markGap(state, Date.now(), 'legacy-output-envelope');
       const pieces = Array.isArray(p.output) ? p.output.map(b => b?.text).filter(v => typeof v === 'string') : [value];
       const objects = pieces.flatMap(v => { try { const o = JSON.parse(v); return o && !Array.isArray(o) && typeof o === 'object' ? [o] : []; } catch { return []; } });
       // Only protocol headers and top-level tool-result fields are evidence.
@@ -349,7 +372,19 @@ function consume(state, row, agent, classify, instance) {
   }
 }
 
-function sync({ root, agent, sid, file, instance = null, classify = () => 'unknown', inspectAgent, includeSidechain = false, now = Date.now(), budget = 4 * 1024 * 1024, maxRecord = 32 * 1024 * 1024, staleAfter = 30 * 60e3 }) {
+// Replaying from offset 0 keeps every unresolved obligation plus agent history,
+// and rebuilds the restart observations the replay itself re-derives.
+function retainForReplay(state, gap) {
+  const jobs = Object.fromEntries(Object.entries(state.jobs).filter(([, j]) => gap || !TERMINAL.has(j.status) || j.kind === 'agent'));
+  if (!state.source?.instance?.processScoped) for (const j of Object.values(jobs)) j.instance = null;
+  const prior = state.restart || {};
+  return { jobs,
+    restart: { completed: false,
+      children: { ...(prior.children || {}), ...Object.fromEntries(Object.values(jobs).filter(j => j.kind === 'agent').map(j => [j.id, 'owned'])) },
+      launches: { ...(prior.launches || {}) }, mapped: { ...(prior.mapped || {}) } } };
+}
+
+function sync({ root, agent, sid, file, instance = null, classify = () => 'unknown', inspectAgent, childTranscriptFor, includeSidechain = false, now = Date.now(), budget = 4 * 1024 * 1024, maxRecord = 32 * 1024 * 1024, staleAfter = 30 * 60e3, coldReplay = false, abandonAfter = 3 * 3600e3 }) {
   const dir = directory(root, agent, sid);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const snapshot = path.join(dir, 'state.json'), lock = path.join(dir, 'writer.lock');
@@ -364,12 +399,19 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
   try {
     let state = { version: 1, jobs: {}, calls: {}, notices: {}, checkpoint: null, gap: false };
     try { state = JSON.parse(fs.readFileSync(snapshot, 'utf8')); if (state.version !== 1 || !state.jobs || !state.calls || !state.notices) throw Error('invalid ledger'); }
-    catch (e) { state = { version: 1, jobs: {}, calls: {}, notices: {}, checkpoint: null, gap: e.code !== 'ENOENT' }; }
+    catch (e) {
+      state = { version: 1, jobs: {}, calls: {}, notices: {}, checkpoint: null, gap: false };
+      if (e.code !== 'ENOENT') markGap(state, now, 'invalid-ledger');
+    }
+    // A gap from before this bookkeeping has no reason on record; the transcript
+    // is the only history such a ledger has, so a full replay is its best evidence.
+    const legacyGap = Boolean(state.gap) && state.gapAt === undefined;
+    if (legacyGap) markGap(state, now, 'legacy');
     const retiredSources = Array.isArray(state.handoffRebind?.retiredSources)
       ? state.handoffRebind.retiredSources.slice(0, 128) : state.handoffRebind?.source ? [state.handoffRebind.source] : [];
     const formerSource = retiredSources.find((entry) => entry?.file && path.resolve(file) === entry.file);
     if (formerSource) {
-      if (!sameFrozenFile(file, formerSource)) { state.gap = true; writeState(snapshot, state); }
+      if (!sameFrozenFile(file, formerSource)) { markGap(state, now, 'frozen-source-changed'); writeState(snapshot, state); }
       const currentJobs = Object.values(state.jobs);
       const open = currentJobs.filter(j => !TERMINAL.has(j.status) && !['service', 'scheduled'].includes(j.kind));
       const uncertain = open.filter(j => j.kind === 'unknown' || now - (j.lastCorroboratedAt || j.eventAt) > staleAfter
@@ -377,7 +419,9 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
       if (state.recovering || state.gap) uncertain.push(state.recovering ? 'history-recovery' : 'history-gap');
       return { pending: open.some(j => !uncertain.includes(j.id)), uncertain,
         jobs: currentJobs.map(j => ({ ...j, confidence: TERMINAL.has(j.status) ? 'observed' : uncertain.includes(j.id) ? 'uncertain' : 'observed' })),
-        recovering: Boolean(state.recovering), gap: Boolean(state.gap), bytesRead: 0, lastReconciledAt: state.lastReconciledAt,
+        recovering: Boolean(state.recovering), gap: Boolean(state.gap), gapReason: state.gapReason,
+        gapClearedAt: state.gapClearedAt, lastColdReplayAt: state.lastColdReplayAt,
+        bytesRead: 0, lastReconciledAt: state.lastReconciledAt,
         redirect: state.source };
     }
     if (state.source?.includeSidechain) includeSidechain = true;
@@ -390,8 +434,8 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
           fd = fs.openSync(file, 'r');
           const stat = fs.fstatSync(fd), cp = state.checkpoint, b = Buffer.alloc(Math.min(64, cp.offset));
           fs.readSync(fd, b, 0, b.length, cp.offset - b.length);
-          if (cp.identity !== `${hash(path.resolve(file))}:${stat.dev}:${stat.ino}` || cp.offset > stat.size || hash(b) !== cp.anchor) state.gap = true;
-        } catch { state.gap = true; }
+          if (cp.identity !== `${hash(path.resolve(file))}:${stat.dev}:${stat.ino}` || cp.offset > stat.size || hash(b) !== cp.anchor) markGap(state, now, 'checkpoint-anchor');
+        } catch { markGap(state, now, 'read-error'); }
         finally { if (fd != null) fs.closeSync(fd); }
       }
       state.jobs = Object.fromEntries(Object.entries(state.jobs).filter(([, j]) => !TERMINAL.has(j.status) || j.kind === 'agent')
@@ -409,7 +453,7 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
     // One cold replay when the evidence contract changes. Do not mix old
     // tombstones/notice deduplication with the new reducer's recovery cursor.
     if (state.restartVersion !== restartVersion(agent)) {
-      let migrationGap = state.gap;
+      const migration = { gap: state.gap, gapAt: state.gapAt, gapReason: state.gapReason };
       if (state.checkpoint) {
         let fd;
         try {
@@ -417,17 +461,14 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
           const stat = fs.fstatSync(fd), cp = state.checkpoint;
           const b = Buffer.alloc(Math.min(64, cp.offset));
           fs.readSync(fd, b, 0, b.length, cp.offset - b.length);
-          if (cp.identity !== `${hash(path.resolve(file))}:${stat.dev}:${stat.ino}` || cp.offset > stat.size || hash(b) !== cp.anchor) migrationGap = true;
-        } catch { migrationGap = true; }
+          if (cp.identity !== `${hash(path.resolve(file))}:${stat.dev}:${stat.ino}` || cp.offset > stat.size || hash(b) !== cp.anchor) markGap(migration, now, 'checkpoint-anchor');
+        } catch { markGap(migration, now, 'read-error'); }
         finally { if (fd != null) fs.closeSync(fd); }
       }
-      const retained = Object.fromEntries(Object.entries(state.jobs).filter(([, j]) => migrationGap || !TERMINAL.has(j.status) || j.kind === 'agent'));
-      if (!state.source?.instance?.processScoped) for (const j of Object.values(retained)) j.instance = null;
-      const priorRestart = state.restart || {};
-      state = { version: 1, restartVersion: restartVersion(agent), jobs: retained, calls: {}, notices: {}, checkpoint: null, gap: migrationGap,
-        restart: { completed: false,
-          children: { ...(priorRestart.children || {}), ...Object.fromEntries(Object.values(retained).filter(j => j.kind === 'agent').map(j => [j.id, 'owned'])) },
-          launches: { ...(priorRestart.launches || {}) }, mapped: { ...(priorRestart.mapped || {}) } },
+      const { jobs: retained, restart } = retainForReplay(state, migration.gap);
+      state = { version: 1, restartVersion: restartVersion(agent), jobs: retained, calls: {}, notices: {}, checkpoint: null,
+        gap: Boolean(migration.gap), ...(migration.gap ? { gapAt: migration.gapAt, gapReason: migration.gapReason } : {}),
+        restart,
         cronVersion: 1, turnVersion: 1, pollVersion: agent === 'codex' ? 2 : undefined, childStopVersion: 3,
         source: state.source, processEpoch: state.processEpoch, hookBarrier: state.hookBarrier,
         hookGeneration: state.hookGeneration, freshStartup: state.freshStartup, handoffRebind: state.handoffRebind };
@@ -437,12 +478,26 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
       state.checkpoint = null; state.calls = {}; state.notices = {}; state.turnStartedAt = null;
       state.cronVersion = 1; state.turnVersion = 1;
     }
+    // A gapped ledger only regains complete evidence by replaying the whole
+    // transcript; the gap clears at EOF unless this replay re-marks one.
+    if (coldReplay && state.gap && !state.coldReplay && !legacyGap) {
+      let fromIdentity = null;
+      try { const stat = fs.statSync(file); fromIdentity = `${hash(path.resolve(file))}:${stat.dev}:${stat.ino}`; } catch {}
+      if (fromIdentity) {
+        const { jobs: retained, restart } = retainForReplay(state, true);
+        state.jobs = retained; state.restart = restart;
+        state.checkpoint = null; state.calls = {}; state.notices = {}; state.turnStartedAt = null;
+        state.coldReplay = { startedAt: now, fromIdentity };
+        state.lastColdReplayAt = now;
+      }
+    }
     const freshBaseEligible = !state.checkpoint && !state.gap && state.hookBarrier == null;
-    let recovering = false, bytesRead = 0, sourceCaughtUp = false;
+    let recovering = false, bytesRead = 0, sourceCaughtUp = false, sourceIdentity = null;
     try {
       const fd = fs.openSync(file, 'r');
       try {
         const stat = fs.fstatSync(fd), identity = `${hash(path.resolve(file))}:${stat.dev}:${stat.ino}`;
+        sourceIdentity = identity;
         // On first observation of a process, historical launches have unknown
         // ownership. Only events appended after this watermark belong to it.
         // Never relabel old work as belonging to a newly resumed agent.
@@ -453,7 +508,7 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
         let cp = state.checkpoint;
         if (!cp || cp.identity !== identity || cp.offset > stat.size || anchor(cp.offset) !== cp.anchor
             || (cp.offset === stat.size && cp.mtime !== stat.mtimeMs)) {
-          if (cp) { state.gap = true; state.turnStartedAt = null; for (const j of Object.values(state.jobs)) if (!TERMINAL.has(j.status)) j.evidence = 'transcript-replaced'; }
+          if (cp) { markGap(state, now, 'transcript-replaced'); state.turnStartedAt = null; for (const j of Object.values(state.jobs)) if (!TERMINAL.has(j.status)) j.evidence = 'transcript-replaced'; }
           cp = { identity, offset: 0, skip: false }; state.calls = {};
         }
         let b = Buffer.alloc(Math.min(budget, stat.size - cp.offset));
@@ -475,11 +530,11 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
                 : instance;
               consume(state, includeSidechain ? { ...row, isSidechain: false } : row, agent, classify, owner);
             }
-            catch { state.gap = true; }
+            catch { markGap(state, now, 'record-parse'); }
           }
           start = end + 1;
         }
-        if (start === 0 && bytesRead >= (cp.skip ? budget : Math.max(budget, maxRecord))) { start = bytesRead; cp.skip = true; state.gap = true; }
+        if (start === 0 && bytesRead >= (cp.skip ? budget : Math.max(budget, maxRecord))) { start = bytesRead; cp.skip = true; markGap(state, now, 'budget-skip'); }
         cp.offset += start; cp.anchor = anchor(cp.offset); cp.mtime = stat.mtimeMs; state.checkpoint = cp;
         recovering = cp.offset < stat.size;
         sourceCaughtUp = !recovering && cp.offset === stat.size && cp.mtime === stat.mtimeMs;
@@ -514,7 +569,7 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
                 && (state.freshStartup.promptAt === e.at
                   || (state.freshStartup.promptAt == null && e.at >= state.freshStartup.at));
               if (freshPrompt) { state.freshStartup.promptAt ??= e.at; state.hookBarrier = Math.max(state.hookBarrier ?? -1, 0); }
-              else state.gap = true;
+              else markGap(state, now, 'hook-transcript-mismatch');
             }
           }
           if (e.event === 'SessionStart' && !(e.freshStart === true && e.missing === true && e.transcriptId === expectedTranscriptId)) {
@@ -523,7 +578,12 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
         }
         // Stop hooks can be blocked. They are not completion evidence.
       }
-    } catch (error) { if (error.code !== 'ENOENT') state.gap = true; consumed = []; }
+    } catch (error) { if (error.code !== 'ENOENT') markGap(state, now, 'read-error'); consumed = []; }
+    const caughtUp = sourceCaughtUp && (state.hookBarrier == null || state.checkpoint.offset > state.hookBarrier);
+    // Abandonment is a conclusion about the whole history: never draw it from a
+    // partial pass, or one whose hook evidence has not reached the transcript,
+    // when the unread bytes may still carry the child's completion.
+    const settledPass = caughtUp && !recovering && !state.coldReplay;
     for (const j of Object.values(state.jobs)) {
       if (j.kind === 'scheduled' && !TERMINAL.has(j.status)) {
         if (j.expiresAt <= now || (instance && typeof instance === 'object' && (instance.live === false || (instance.id && j.instance && j.instance !== instance.id)))) {
@@ -531,24 +591,65 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
         }
       }
       if (j.kind !== 'agent' || TERMINAL.has(j.status) || !inspectAgent) continue;
+      let childAt = null;
       try {
         const evidence = inspectAgent(j.id);
+        if (evidence && Number.isFinite(evidence.at)) childAt = evidence.at;
         if (evidence && evidence.at >= j.eventAt) {
           if (evidence.done) update(state, j.id, 'agent', 'completed', evidence.at, 'child-transcript', instance);
           else { j.lastCorroboratedAt = evidence.at; j.evidence = 'child-transcript'; }
         }
       } catch {} // Missing child evidence remains uncertain, not completed.
+      // A parent that finished its own turn after the child stopped writing is
+      // evidence the subagent died, not that it is still working. A subagent has
+      // no process of its own, so its transcript writes and the parent's
+      // completed turn are the only liveness evidence there is. Residual risk: a
+      // child running one tool call for longer than abandonAfter without writing
+      // its transcript is abandoned while alive -- 3h exceeds every built-in
+      // tool timeout, so that needs a tool that blocks far past its own limit.
+      if (!settledPass || state.jobs[`job:${j.id}`] !== j || TERMINAL.has(j.status)) continue;
+      const activeAt = childAt ?? (j.lastCorroboratedAt || j.eventAt);
+      if (state.restart?.completed !== true || !(state.restart.observedAt > activeAt)
+          || now - activeAt <= abandonAfter || now - j.eventAt <= abandonAfter) continue;
+      // Resolved only once everything else already says abandoned: a missing
+      // child file falls back to the launch time, a present one must be stale.
+      let wroteAt = j.eventAt;
+      const childFile = childTranscriptFor?.(j.id);
+      if (childFile) { try { wroteAt = fs.statSync(childFile).mtimeMs; } catch {} }
+      if (now - wroteAt > abandonAfter) {
+        update(state, j.id, 'agent', 'cancelled', now, 'abandoned-child', instance);
+        const abandoned = state.jobs[`job:${j.id}`];
+        if (abandoned && abandoned.evidence === 'abandoned-child') abandoned.abandonedAt = now;
+      }
     }
     const terminal = Object.entries(state.jobs).filter(([, j]) => TERMINAL.has(j.status)).sort((a, b) => b[1].eventAt - a[1].eventAt);
     if (!Object.keys(state.calls).length && !Object.values(state.jobs).some(j => j.id.startsWith('cell_') && j.status === 'pending')) {
-      for (const [key] of terminal.slice(500)) delete state.jobs[key];
+      // An abandoned child's tombstone is what lets restart and rebind skip a
+      // child the parent still names. Pruning it would revive that obligation.
+      for (const [key, j] of terminal.slice(500)) {
+        if (j.evidence === 'abandoned-child' && state.restart?.children?.[j.id]) continue;
+        delete state.jobs[key];
+      }
     }
     for (const field of ['calls', 'notices']) {
       const keys = Object.keys(state[field]);
-      if (keys.length > 2000) { state.gap = true; for (const key of keys.slice(0, keys.length - 2000)) delete state[field][key]; }
+      if (keys.length > 2000) { markGap(state, now, `${field}-cap`); for (const key of keys.slice(0, keys.length - 2000)) delete state[field][key]; }
     }
     const jobs = Object.values(state.jobs);
-    if (jobs.length > 2500) state.gap = true;
+    if (jobs.length > 2500) markGap(state, now, 'jobs-cap');
+    if (state.coldReplay) {
+      const held = sourceIdentity === state.coldReplay.fromIdentity;
+      const remarked = state.gapAt !== undefined && state.gapAt >= state.coldReplay.startedAt;
+      const finished = held && sourceCaughtUp && !recovering && state.checkpoint?.skip !== true
+        && !consumed.length && !Object.keys(state.calls).length;
+      // Only a clean replay of the same file back to EOF restores the evidence
+      // the gap stands for; anything less leaves the gap for a later attempt.
+      if (finished && !remarked && !STICKY_GAP_REASONS.has(state.gapReason)) {
+        state.gap = false; delete state.gapAt; delete state.gapReason;
+        state.gapClearedAt = now; state.gapClearedBy = 'cold-replay';
+      }
+      if (finished || !held || remarked) delete state.coldReplay;
+    }
     state.lastReconciledAt = now;
     state.source = { agent, sid, file, instance, includeSidechain };
     state.recovering = recovering;
@@ -558,10 +659,10 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
     const open = jobs.filter(j => !TERMINAL.has(j.status) && !['service', 'scheduled'].includes(j.kind));
     const uncertain = open.filter(j => j.kind === 'unknown' || now - (j.lastCorroboratedAt || j.eventAt) > staleAfter || j.evidence === 'transcript-replaced').map(j => j.id);
     if (recovering || state.gap) uncertain.push(recovering ? 'history-recovery' : 'history-gap');
-    const caughtUp = sourceCaughtUp && (state.hookBarrier == null || state.checkpoint.offset > state.hookBarrier);
     return { pending: open.some(j => !uncertain.includes(j.id)), uncertain,
       jobs: jobs.map(j => ({ ...j, confidence: TERMINAL.has(j.status) ? 'observed' : uncertain.includes(j.id) ? 'uncertain' : 'observed' })),
-      recovering, gap: state.gap, caughtUp, unresolvedCalls: Object.keys(state.calls).length,
+      recovering, gap: state.gap, gapReason: state.gapReason, gapClearedAt: state.gapClearedAt,
+      lastColdReplayAt: state.lastColdReplayAt, caughtUp, unresolvedCalls: Object.keys(state.calls).length,
       unconsumedHooks: consumed.length, bytesRead, lastReconciledAt: now };
   } finally { try { fs.unlinkSync(lock); } catch {} }
 }
@@ -579,7 +680,9 @@ function read(root, agent, sid, now = Date.now(), staleAfter = 30 * 60e3) {
     let unconsumedHooks = 0;
     try { unconsumedHooks = fs.readdirSync(path.join(dir, 'inbox')).length; } catch {}
     return { pending: open.some(j => !uncertain.includes(j.id)), uncertain, jobs, caughtUp,
-      recovering: Boolean(state.recovering), gap: Boolean(state.gap), unresolvedCalls: Object.keys(state.calls || {}).length,
+      recovering: Boolean(state.recovering), gap: Boolean(state.gap), gapReason: state.gapReason,
+      gapClearedAt: state.gapClearedAt, lastColdReplayAt: state.lastColdReplayAt,
+      unresolvedCalls: Object.keys(state.calls || {}).length,
       unconsumedHooks,
       turnStartedAt: state.turnStartedAt || null, lastReconciledAt: state.lastReconciledAt };
   } catch { return { pending: false, uncertain: ['history-recovery'], jobs: [] }; }
@@ -732,5 +835,5 @@ function createScheduler(options = {}) {
   };
 }
 
-module.exports = { restartVersion, processInstance, sync, read, targets, recordHook, consume, nextTarget, rebindSource,
+module.exports = { restartVersion, processInstance, sync, read, targets, recordHook, consume, markGap, nextTarget, rebindSource,
   targetKey, targetFingerprint, settledResult, createScheduler };

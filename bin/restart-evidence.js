@@ -13,13 +13,16 @@ function isClaudeInterruption(row) {
     && Array.isArray(content) && content.length === 1 && content[0]?.type === 'text'
     && CLAUDE_INTERRUPTION_MESSAGES.has(content[0].text);
 }
+// The reducer has no clock of its own, but the gaps it marks still need a stamp
+// so a cold replay cannot clear a gap this same pass re-observed.
+const markGap = (state, reason) => require('./background-jobs').markGap(state, Date.now(), reason);
 function consume(state, row, agent) {
   const s = state.restart ||= { completed: false, children: {}, launches: {}, mapped: {} };
   const at = Date.parse(row.timestamp || '') || 0;
   s.observedAt = Math.max(s.observedAt || 0, at);
   if (agent === 'claude') {
     if (row.sessionId) {
-      if (s.id && s.id !== row.sessionId) state.gap = true;
+      if (s.id && s.id !== row.sessionId) markGap(state, 'session-identity');
       s.id = row.sessionId;
     }
     const content = row.message?.content;
@@ -48,7 +51,7 @@ function consume(state, row, agent) {
   const p = row.payload || {};
   if (row.type === 'session_meta') {
     const id = p.id || p.session_id;
-    if (!ID.test(id || '') || (s.id && s.id !== id)) state.gap = true;
+    if (!ID.test(id || '') || (s.id && s.id !== id)) markGap(state, 'session-identity');
     s.id = id;
     s.parent = p.parent_thread_id || p.source?.subagent?.thread_spawn?.parent_thread_id || null;
   }
@@ -62,7 +65,7 @@ function consume(state, row, agent) {
           s.launches[p.call_id] = true;
           if (codeMode && require('./code-mode-polls').syntaxInvalid(p.input || '')) (s.invalidSyntax ||= {})[p.call_id] = true;
         }
-        else state.gap = true;
+        else markGap(state, 'unverified-launch');
       } else delete s.launches[p.call_id]; // Replay can disprove old dynamic-dispatch false positives.
     } else if (['function_call_output', 'custom_tool_call_output'].includes(p.type)) {
       if (typeof p.output === 'string' && /^collab (?:spawn|tool) failed: agent thread limit reached$/.test(p.output.trim())) delete s.launches[p.call_id];
@@ -81,13 +84,13 @@ function consume(state, row, agent) {
   if (p.type === 'task_complete') s.completed = true;
   const item = p.item;
   if (item?.type === 'SubAgentActivity') {
-    if (!ID.test(item.agent_thread_id || '') || !ID.test(item.id || '')) { state.gap = true; return; }
+    if (!ID.test(item.agent_thread_id || '') || !ID.test(item.id || '')) { markGap(state, 'unverified-child'); return; }
     // Keep even completed children: a child can start another turn without a
     // fresh parent-side launch. Its own ledger must be rechecked before exit.
     s.children[item.agent_thread_id] = s.children[item.agent_thread_id] === 'owned' || item.kind !== 'interacted' ? 'owned' : 'interacted';
     s.mapped[item.id] = item.agent_thread_id;
   }
-  if (item?.type === 'CollabAgentToolCall' && /spawn|send/i.test(item.tool || '')) state.gap = true;
-  if (Object.keys(s.children).length > 128 || Object.keys(s.launches).length > 10000 || Object.keys(s.mapped).length > 10000) state.gap = true;
+  if (item?.type === 'CollabAgentToolCall' && /spawn|send/i.test(item.tool || '')) markGap(state, 'collab-tool-call');
+  if (Object.keys(s.children).length > 128 || Object.keys(s.launches).length > 10000 || Object.keys(s.mapped).length > 10000) markGap(state, 'restart-graph-cap');
 }
 module.exports = { consume, isClaudeInterruption };
