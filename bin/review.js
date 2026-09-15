@@ -3890,7 +3890,7 @@ function reviewBudget(model, snapshot, accountId) {
     if (!claude && snapshot) {
       try { claude = accountLimits(usage.getUsage(), pinned); } catch {}
     }
-    if (!claude) return { code: 8, reason: `no usage snapshot for account ${pinned}` };
+    if (!claude) return { code: 8, reason: `no usage snapshot available for account ${pinned}` };
     return classifyBudget({ claude }, model || reviewerModel());
   }
   const value = snapshot || usage.getUsage();

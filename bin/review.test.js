@@ -3037,7 +3037,7 @@ test('a pinned budget reads both snapshot shapes and names the account it cannot
 
   const missing = reviewBudget('fable', { version: 2, accounts: {} }, 'claude-secondary');
   assert.equal(missing.code, 8);
-  assert.match(missing.reason, /no usage snapshot for account claude-secondary/,
+  assert.match(missing.reason, /no usage snapshot available for account claude-secondary/,
     'the refusal names the account, so the fix is obvious');
   assert.equal(reviewBudget('fable', { version: 2, accounts: { 'claude-secondary': { identity: { agent: 'codex' }, snapshot: { limits, fetchedAt } } } }, 'claude-secondary').code, 8);
 });
