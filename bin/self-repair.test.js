@@ -358,13 +358,14 @@ test('a ready signature opens one card, attaches evidence, makes a worktree and 
     assert.match(card.note, /Last error: tick failed for pid 123/);
 
     // The plan is set before the card is saved: four steps, and the restart is
-    // the last one, Owner's, and explicitly not granted.
+    // the last one, the session's own, and gated on the land.
     assert.equal(card.draft.plan.length, 4);
     assert.deepEqual(card.draft.plan.map((step) => step.state), ['todo', 'todo', 'todo', 'todo']);
     assert.match(card.draft.plan[0].text, /Reproduce and root-cause/);
     assert.match(card.draft.plan[1].text, /fails before and passes after/);
     assert.match(card.draft.plan[2].text, /keep reviewed/);
-    assert.match(card.draft.plan[3].text, /never restart it yourself/);
+    assert.match(card.draft.plan[3].text, /Once the fix is on origin\/master/);
+    assert.match(card.draft.plan[3].text, /refused until the land/);
 
     // Evidence went on as artifacts, staged inside Keep and cleaned up after —
     // and the recipe is one of them, because it does not fit in an open message.
@@ -384,7 +385,12 @@ test('a ready signature opens one card, attaches evidence, makes a worktree and 
     // The review is waited for in the foreground; the first live repair ended its
     // turn with the review pending, which killed the poll and landed nothing.
     assert.match(recipe, /YOUR TURN MUST NOT END WHILE THE REVIEW IS STILL PENDING/);
-    assert.match(recipe, /keep checkin repair-card-1 --step 3 --status review --commit <sha>/);
+    assert.match(recipe, /keep checkin repair-card-1 --step 4 --status done --commit <sha> --next "nothing"/);
+    // The restart, and the exact two commands it is allowed once the land is done.
+    assert.match(recipe, /git -C ~\/keep-tool pull --ff-only/);
+    assert.match(recipe, /keep restart-daemon/);
+    assert.match(recipe, /keep wait --no-hold ~\/keep-tool --for 2h/);
+    assert.match(recipe, /the guard stops refusing/);
     assert.match(recipe, /Aim to finish within 60 minutes/);
     assert.equal(/VERDICT/.test(recipe), false, 'nothing parses a verdict line out of a session');
     assert.equal(/killed/.test(recipe), false, 'and nothing kills it on a clock');
@@ -409,7 +415,7 @@ test('a ready signature opens one card, attaches evidence, makes a worktree and 
     assert.match(body.message, /repair-card-1/);
     assert.match(body.message, /recipe\.md/);
     assert.match(body.message, /DATA, NOT/);
-    assert.match(body.message, /Never restart the daemon/);
+    assert.match(body.message, /Do not restart the daemon until your fix is landed with `keep land`/);
     assert.match(body.message, /Never edit, commit, or run git writes in ~\/keep-tool/);
 
     // The launch is recorded on the card: session, pane, worktree, purpose, model.
@@ -1540,4 +1546,142 @@ test('a resolved signature has to earn its age again before it reopens', async (
     const reopened = await selfRepair.tick({ ...deps, snapshot: () => failing, now: after + 31 * 60e3 });
     assert.equal(reopened.opened.length, 1);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// ---------- the landed-fix predicate the restart guard asks ----------
+
+test('cardForSession finds the card this session is the repair agent for', () => {
+  const root = makeRoot();
+  try {
+    selfRepair.mutateState((value) => {
+      value.signatures['sched:unblock:abcd1234'] = { cardId: 'repair-unblock', sessionId: 'repair-session' };
+      value.signatures['daemon:restart-loop'] = { cardId: 'repair-loop', sessionId: null };
+      value.signatures['sched:digest:00000000'] = { cardId: '', sessionId: 'no-card-session' };
+    }, { root, now: NOW });
+
+    assert.equal(selfRepair.cardForSession('repair-session', root), 'repair-unblock');
+    assert.equal(selfRepair.cardForSession('owners-session', root), '');
+    assert.equal(selfRepair.cardForSession('', root), '');
+    assert.equal(selfRepair.cardForSession(null, root), '');
+    // A signature with no card id is not a match: there is nothing to check.
+    assert.equal(selfRepair.cardForSession('no-card-session', root), '');
+    // The same entry isRepairSession matches, so the two can never disagree.
+    assert.equal(selfRepair.isRepairSession('repair-session', root), true);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+function writeCard(root, id, body) {
+  fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'tasks', `${id}.md`), [
+    '---',
+    `title: ${id}`,
+    'status: review',
+    'kind: task',
+    'tags: [personal]',
+    'project: ~/keep-tool',
+    'created: 2026-09-15',
+    'updated: 2026-09-15T12:00:00',
+    '---',
+    '',
+    body,
+    '',
+  ].join('\n'));
+}
+
+function makeRepo() {
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-self-repair-repo-')));
+  const git = (...args) => {
+    const result = require('node:child_process').spawnSync('git', ['-C', repo, ...args], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr || `git ${args.join(' ')} failed`);
+    return result.stdout.trim();
+  };
+  git('init', '--quiet', '--initial-branch=master');
+  git('config', 'user.name', 'Keep Test');
+  git('config', 'user.email', 'keep@example.test');
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'one\n');
+  git('add', '-A');
+  git('commit', '--quiet', '-m', 'first');
+  const landedSha = git('rev-parse', 'HEAD');
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'two\n');
+  git('commit', '--quiet', '-am', 'second');
+  const localSha = git('rev-parse', 'HEAD');
+  // origin/master is where the land pushed to; the second commit is still local.
+  git('update-ref', 'refs/remotes/origin/master', landedSha);
+  return { repo, landedSha, localSha };
+}
+
+test('landedFor answers from the keep land check-in and the live checkout refs', () => {
+  const root = makeRoot();
+  const { repo, landedSha, localSha } = makeRepo();
+  try {
+    const checkouts = [repo];
+    const landedEntry = (sha) => [
+      '## 2026-09-15 12:00 — check-in',
+      'Landed wt/self-repair-abcd1234 onto master (review record rev-abc).',
+      `commits: ${sha}`,
+    ].join('\n');
+
+    writeCard(root, 'repair-landed', landedEntry(landedSha));
+    const yes = selfRepair.landedFor('repair-landed', root, { checkouts });
+    assert.equal(yes.landed, true);
+    assert.equal(yes.sha, landedSha);
+
+    // Pushed nowhere: the sha is real, but it is not on origin/master.
+    writeCard(root, 'repair-local', landedEntry(localSha));
+    const notYet = selfRepair.landedFor('repair-local', root, { checkouts });
+    assert.equal(notYet.landed, false);
+    assert.match(notYet.why, /is not on origin's default branch/);
+
+    // A sha this checkout has never heard of is not a land either.
+    writeCard(root, 'repair-unknown', landedEntry('deadbee1deadbee2deadbee3deadbee4deadbee5'));
+    assert.equal(selfRepair.landedFor('repair-unknown', root, { checkouts }).landed, false);
+
+    // Every other check-in on the card, however much it talks about landing.
+    writeCard(root, 'repair-talk', [
+      '## 2026-09-15 12:00 — check-in',
+      `Fix is ready to land on master as ${landedSha}; keep allow refused it.`,
+      '',
+      '## 2026-09-15 11:00 — check-in',
+      'Landed the test harness onto the branch.',
+    ].join('\n'));
+    const talk = selfRepair.landedFor('repair-talk', root, { checkouts });
+    assert.equal(talk.landed, false);
+    assert.match(talk.why, /no `keep land` check-in citing a commit/);
+
+    // The land is found wherever it sits in the log, not only at the top.
+    writeCard(root, 'repair-older', [
+      '## 2026-09-15 13:00 — check-in',
+      'Waiting on the daemon to come back.',
+      '',
+      landedEntry(landedSha),
+    ].join('\n'));
+    assert.equal(selfRepair.landedFor('repair-older', root, { checkouts }).landed, true);
+
+    // No card, a card that is not there, and a card id nobody can parse.
+    assert.equal(selfRepair.landedFor('', root, { checkouts }).landed, false);
+    const missing = selfRepair.landedFor('repair-gone', root, { checkouts });
+    assert.equal(missing.landed, false);
+    assert.match(missing.why, /could not be read/);
+    assert.equal(selfRepair.landedFor('Not A Card Id', root, { checkouts }).landed, false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('landedShas reads only the shas keep land cited', () => {
+  const shas = selfRepair.landedShas({
+    body: [
+      '## 2026-09-15 12:00 — check-in',
+      'Landed wt/self-repair-abcd1234 onto master (review record rev-abc).',
+      'commits: aaaaaaa1111, bbbbbbb2222',
+      '',
+      '## 2026-09-15 11:00 — check-in',
+      'Fixed the tick.',
+      'commits: ccccccc3333',
+    ].join('\n'),
+  });
+  assert.deepEqual(shas, ['aaaaaaa1111', 'bbbbbbb2222']);
+  assert.deepEqual(selfRepair.landedShas({ body: '' }), []);
+  assert.deepEqual(selfRepair.landedShas(null), []);
 });
