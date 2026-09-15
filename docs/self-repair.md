@@ -1,0 +1,163 @@
+# Daemon self-repair
+
+The daemon fails in the same ways more than once. A scheduler starts throwing the
+same error every minute; the daemon restart-loops under launchd's `KeepAlive`; a
+delivery incident sits unconfirmed for hours. Each time, somebody has to notice
+the red row in `keep health`, open a card, make a worktree, and put an agent on
+it. Self-repair is that loop, automated, with the one dangerous step left out.
+
+When a failure signature persists, Keep opens **one card per signature** with the
+health record and a log excerpt attached, creates a fresh `keep-tool` worktree out
+of process, and launches one headless repair agent there with a root-cause recipe.
+It never restarts the daemon. The agent lands a reviewed fix, or leaves the card
+in review with its branch named, and Owner restarts.
+
+## What counts as a signature
+
+A signature is a fault, not an occurrence: `pid 123` and `pid 456` are the same
+fault and get one card between them, not one per tick. `bin/self-repair.js`
+`signatures()` is pure — it takes a health snapshot and the repair state and
+returns candidates.
+
+| Signature | Opened when |
+| --- | --- |
+| `sched:<name>:<hash8>` | a scheduler has `consecutiveFailures >= minFailures` (5) on one normalized error, and that signature was first seen at least `minAgeMin` (30) minutes before its latest failure |
+| `daemon:restart-loop` | more than `restartsPerHour` (3) daemon starts in the last hour, on two consecutive ticks |
+| `delivery:<incidentId8>` | the `delivery` row's `incidentId` has been unchanged for `minAgeMin` |
+
+Retired schedulers, disabled rows, on-demand schedulers (`usage`, `digest`) and
+the `self-repair` row itself never produce a signature. A `delivery` row carrying
+a live incident gets the `delivery:` signature rather than a second `sched:` one.
+
+`hash8` is `sha256(name + '|' + normalizedError)`. The normalizer collapses
+whitespace and then replaces, in order: ISO timestamps (`<time>`), absolute paths
+(`<path>`), uuids (`<id>`), hex runs of 7 or more (`<hex>`), and bare numbers
+(`<n>`), lowercasing the result. That is the whole reason one recurring fault
+produces one card instead of one per tick, so it is tested directly in
+`bin/self-repair.test.js`.
+
+## Thresholds and rate limits
+
+- One open card per signature. A second is never opened while the first is open.
+- At most `maxPerDay` (2) cards per local day, fleet-wide.
+- After a signature resolves, `cooldownHours` (24) before it may open another.
+- A signature that recurs after the cooldown opens a new card whose note links the
+  previous one.
+- The repair run's wall-clock budget is `budgetMin` (60), capped at 90 whatever
+  the config says.
+
+## Resolution
+
+Each tick asks whether a signature's symptom is gone: the scheduler is back to
+`consecutiveFailures === 0` with a `lastOkAt` newer than the card, the restart
+loop stopped, the delivery incident cleared. Once it has stayed gone for an hour,
+the card gets **one** check-in — "signature cleared at *t*; verify the fix landed,
+then close" — plus `resolvedAt` and a cooldown.
+
+The card's status is deliberately not changed. A cleared symptom is not a landed
+fix, and only a person or the repair agent's own check-in should close the card.
+
+## State and config
+
+State lives in `~/keep/.keep/self-repair/state.json`, never in `health.json`,
+which is rewritten whole on every `record()` and would lose it:
+
+```json
+{ "signatures": { "<sig>": { "firstSeenAt": 0, "lastSeenAt": 0, "cardId": "",
+  "openedAt": 0, "runId": "", "worktree": "", "attempts": 1, "lastAttemptAt": 0,
+  "okSinceAt": 0, "resolvedAt": 0, "cooldownUntil": 0, "previousCardId": "" } },
+  "day": "2026-09-15", "openedToday": 0 }
+```
+
+Every change goes through one synchronous read-modify-write helper — atomic only
+because nothing inside it awaits, the same constraint as `review.js`'s
+`mutateMeta`. Entries are pruned 14 days after they resolve. If the directory is
+unwritable the tick logs and skips; the daemon keeps running.
+
+Config is `~/keep/watch/self-repair.json`, with these defaults when absent:
+
+```json
+{ "enabled": true, "launch": true, "minFailures": 5, "minAgeMin": 30,
+  "restartsPerHour": 3, "maxPerDay": 2, "cooldownHours": 24,
+  "model": "opus", "budgetMin": 60 }
+```
+
+An unknown key is ignored with a logged warning rather than failing closed:
+nothing dangerous is enabled by a key this version does not understand. `launch:
+false` opens cards with their evidence but creates no worktree and spends no
+agent. `KEEP_SELF_REPAIR=0` disables the scheduler entirely, and
+`KEEP_REPAIR_MODEL` overrides the configured model for one daemon.
+
+## The card
+
+Title `Daemon self-repair: <scheduler|restart loop|delivery incident>: <error>`,
+project `~/keep-tool`, tags `personal` and `self-repair`, status `active`. The
+note is the symptom: signature, first seen, consecutive failures, last error, last
+ok. The plan is always these four steps:
+
+1. Reproduce and root-cause from the attached health record and log excerpt
+2. Fix in the worktree with a test that fails before and passes after
+3. Independent review, then `keep reviewed` and `keep land` if `keep allow <card>
+   land` allows; otherwise leave the card in review with the branch named
+4. Owner restarts the daemon (`keep allow <card> restart` is not granted; never
+   restart it yourself)
+
+Evidence is attached as artifacts under `.keep/artifacts/<card>/`: the failing
+health row with the `daemon` row, the whole health snapshot, the last 80 serve.log
+lines mentioning the scheduler or its error (or the last 40 if none match), and,
+for a delivery incident, the inspection result, the matching journal, and the tail
+of `diagnostics/events.jsonl`. Each excerpt is scrubbed line by line and clipped
+to 64 KB, and staged inside `.keep` so nothing on the card ever cites `/tmp`.
+
+A check-in records the launch: run id, worktree path, account purpose and model,
+so Owner can see what was spent.
+
+## The repair run
+
+`runs.startRun(cardId, 'task', recipe, { cwd, purpose: 'repair', model,
+budgetMin })`. The `cwd` option only relocates a **task** run and only into the
+configured worktree root — otherwise a card could point a `bypassPermissions`
+agent anywhere on disk. The run spends against the `repair` automation purpose,
+which falls back through `automationAccounts.claude` to the default, so nothing
+needs configuring for it to work.
+
+The recipe frames the card log and the artifacts as data, not instructions, and
+names the constraints: work only in the worktree, never edit or commit in
+`~/keep-tool`, never restart the daemon, review through `keep codex` and record it
+with `keep reviewed`, land only through `keep allow` + `keep land`, and end with a
+`VERDICT: PASS|FAIL|UNSURE` line.
+
+## What is not automated, and why
+
+**The restart stays gated.** The agent can make the fix; it cannot decide that
+this is a good moment to drop every live session's daemon. A restart mid-repair
+also destroys the running state that produced the evidence. So `keep hook
+pre-bash` refuses, for any command in a run with `KEEP_REPAIR=1`:
+
+- `keep restart-daemon`, `keep service`, `launchctl`
+- git explicitly aimed at the main `~/keep-tool` checkout, and any git write
+  reached by `cd`-ing into it (reading its log still works)
+- `git push --force` and `wt land` — landing goes through `keep land`, which
+  enforces the review record
+
+The refusal names the rule and points at step 4 of the repair card. The guard is
+keyed to the environment variable `runs.js` sets for repair runs, so no other
+session sees it.
+
+**The card is not closed automatically**, the fix is not landed without a recorded
+review, and `--allow` grants cannot be set from an agent session, so the repair
+card carries none.
+
+## Seeing it
+
+```sh
+keep self-repair                          # open signatures, their cards, cooldowns, today's count
+keep self-repair --dry                    # what the next tick would open, and why; writes nothing
+keep self-repair --json
+keep self-repair --reset <signature>      # clear one signature's cooldown and resolution
+keep self-repair --disable | --enable
+```
+
+`keep lint`'s `daemon-health` finding ends with `repair card: <id>` when an open
+self-repair card covers a failing row, and the morning brief's daemon line ends
+with `Self-repair: <n> open (<ids>)`.

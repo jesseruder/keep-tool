@@ -84,6 +84,7 @@ keep alert -m "text" --level attention|urgent [--key k] [--card id] [--from name
 keep quiet <duration>|off
 keep alerts [--all]
 keep lint [--json] [--rule <name>] [--fix-hints]
+keep self-repair [--dry] [--json] [--reset <signature>] [--disable|--enable]  # what the daemon has opened on itself
 keep brief [--send]
 keep codex-jobs [--json] [--reap] [--dry]  # list companion jobs/brokers; optionally reap stale jobs, orphan pollers, and abandoned or idle brokers
 keep standup [--since "YYYY-MM-DD HH:MM"|ISO] [--dry] [--show]
@@ -528,6 +529,21 @@ account reports `reviewer account is unknown in multi-account mode` and the swee
 runs. An exhausted window (budget code 6 or 7) is recorded as a healthy skip; a budget
 that cannot be read at all (code 8) is recorded as a **failure**, so `consecutiveFailures`
 climbs and the brief shows it rather than the sweep dying silently behind a green row.
+
+## Daemon self-repair
+
+When a daemon failure signature persists — a scheduler failing repeatedly on the
+same normalized error, more than three daemon starts in an hour across two ticks,
+a delivery incident unchanged for half an hour — Keep opens one card per signature
+with the health record and a log excerpt attached, creates a fresh `keep-tool`
+worktree out of process, and launches one headless repair agent there. At most two
+cards a day, one open card per signature, a 24-hour cooldown after each resolves.
+
+The daemon restart stays manual: `keep hook pre-bash` refuses `keep
+restart-daemon`, `keep service`, `launchctl`, writes to the live `~/keep-tool`
+checkout, `git push --force` and `wt land` inside a repair run. `keep self-repair`
+shows what is open; `keep self-repair --dry` shows what the next tick would open.
+See [daemon self-repair](self-repair.md).
 
 ## Landed commits
 

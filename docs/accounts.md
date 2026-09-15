@@ -86,6 +86,7 @@ needs configuring to work:
 - `reviewer` — the fleet reviewer pane, and the budget its ticks are checked against.
 - `watcher` — the turn watcher's verdict calls.
 - `ideas` — the daily ideas sweep, and the budget it is checked against.
+- `repair` — the headless daemon self-repair runs (see [daemon self-repair](self-repair.md)).
 
 With more than one Claude account configured, an automation path that does not pin
 an account cannot read a budget at all: it reports "reviewer account is unknown in
