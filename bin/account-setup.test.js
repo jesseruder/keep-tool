@@ -246,6 +246,67 @@ test('managed MCP config upgrades only an exact legacy generated file', () => {
   }
 });
 
+test('a file Keep generated from an older source server set is regenerated; hand edits still conflict', () => {
+  const f = fixture();
+  try {
+    const stateFile = path.join(f.home, '.claude.json');
+    setup.shareSetup(f.source, f.target);
+    const generated = setup.mcpConfigPath(f.targetDir, f.repoA);
+    assert.ok(fs.existsSync(generated + '.sha256'));
+
+    const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    state.mcpServers.added = { command: 'added-server' };
+    fs.writeFileSync(stateFile, JSON.stringify(state));
+    const relaunched = setup.ensureSharedMemory(f.target, f.repoA);
+    assert.deepEqual(Object.keys(relaunched.mcpServers).sort(), ['added', 'global', 'projectA']);
+    assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(generated, 'utf8')).mcpServers).sort(), ['added', 'global', 'projectA']);
+    assert.equal(setup.compatible(f.source, f.target, f.repoA).ok, true);
+
+    // Source removes and changes servers: the recorded file still regenerates.
+    delete state.mcpServers.added;
+    state.mcpServers.global.command = 'global-server-v2';
+    fs.writeFileSync(stateFile, JSON.stringify(state));
+    assert.equal(setup.ensureSharedMemory(f.target, f.repoA).mcpServers.global.command, 'global-server-v2');
+
+    const edited = JSON.stringify({ mcpServers: { global: { command: 'hand-edited' } } }, null, 2) + '\n';
+    fs.writeFileSync(generated, edited);
+    assert.throws(() => setup.ensureSharedMemory(f.target, f.repoA), /managed MCP configuration conflicts/);
+    assert.equal(fs.readFileSync(generated, 'utf8'), edited);
+    state.mcpServers.another = { command: 'another' };
+    fs.writeFileSync(stateFile, JSON.stringify(state));
+    assert.throws(() => setup.ensureSharedMemory(f.target, f.repoA), /managed MCP configuration conflicts/);
+    assert.equal(fs.readFileSync(generated, 'utf8'), edited);
+  } finally { f.cleanup(); }
+});
+
+test('an unrecorded file from before Keep recorded its writes upgrades only as an unchanged subset', () => {
+  const f = fixture();
+  try {
+    const stateFile = path.join(f.home, '.claude.json');
+    setup.shareSetup(f.source, f.target);
+    const generated = setup.mcpConfigPath(f.targetDir, f.repoA);
+    const original = fs.readFileSync(generated, 'utf8');
+    const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    state.mcpServers.added = { command: 'added-server' };
+    fs.writeFileSync(stateFile, JSON.stringify(state));
+
+    fs.unlinkSync(generated + '.sha256');
+    assert.deepEqual(Object.keys(setup.ensureSharedMemory(f.target, f.repoA).mcpServers).sort(), ['added', 'global', 'projectA']);
+    assert.ok(fs.existsSync(generated + '.sha256'));
+
+    for (const edit of [
+      JSON.stringify({ mcpServers: { global: { command: 'hand-edited' } } }, null, 2) + '\n',
+      JSON.stringify({ mcpServers: { custom: { command: 'custom' } } }, null, 2) + '\n',
+      JSON.stringify(JSON.parse(original)) + '\n',
+    ]) {
+      fs.writeFileSync(generated, edit);
+      fs.rmSync(generated + '.sha256', { force: true });
+      assert.throws(() => setup.ensureSharedMemory(f.target, f.repoA), /managed MCP configuration conflicts/);
+      assert.equal(fs.readFileSync(generated, 'utf8'), edit);
+    }
+  } finally { f.cleanup(); }
+});
+
 test('only explicit builtIn accounts use the sibling Claude state file', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-state-path-'));
   try {

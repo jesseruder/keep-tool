@@ -211,13 +211,58 @@ function effectiveMcpServers(sourceAccount, cwd, options = {}) {
   const generatedText = fs.readFileSync(generated, 'utf8');
   const actual = readJSON(generated, {}).mcpServers || {};
   if (digest(actual) === digest(desired)) return actual;
-  const legacyText = JSON.stringify({ mcpServers: legacy }, null, 2) + '\n';
-  if (generatedText === legacyText) return desired;
+  if (keepGenerated(generated, generatedText, { desired, legacy })) return desired;
   throw new Error(`managed MCP configuration conflicts for ${canonical(cwd)}`);
 }
 
 function mcpConfigPath(configDir, cwd) {
   return path.join(configDir, 'projects', projectKey(cwd), '.keep-mcp.json');
+}
+
+function mcpText(servers) {
+  return JSON.stringify({ mcpServers: servers }, null, 2) + '\n';
+}
+
+// Keep records the digest of every .keep-mcp.json it writes, so a file generated from an
+// older source server set can be told apart from a hand edit.
+function mcpRecordPath(file) {
+  return file + '.sha256';
+}
+
+function textDigest(text) {
+  return crypto.createHash('sha256').update(text).digest('hex');
+}
+
+function readMcpRecord(file) {
+  try { return fs.readFileSync(mcpRecordPath(file), 'utf8').trim(); } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function recordMcpConfig(file, text) {
+  fs.writeFileSync(mcpRecordPath(file), textDigest(text) + '\n', { mode: 0o600 });
+}
+
+function writeMcpConfig(file, servers) {
+  writeJSON(file, { mcpServers: servers });
+  recordMcpConfig(file, mcpText(servers));
+}
+
+function keepGenerated(file, text, sets) {
+  const recorded = readMcpRecord(file);
+  if (recorded) return recorded === textDigest(text);
+  // Files from before Keep recorded its writes: accept the former global-plus-exact-cwd
+  // output, or Keep's exact serialization whose every server is one the source still
+  // defines identically for this cwd (an older subset of the current set).
+  if (text === mcpText(sets.legacy)) return true;
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { return false; }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.keys(parsed).join() !== 'mcpServers') return false;
+  const servers = parsed.mcpServers;
+  if (!servers || typeof servers !== 'object' || Array.isArray(servers) || text !== mcpText(servers)) return false;
+  return Object.entries(servers).every(([name, value]) => [sets.desired, sets.legacy]
+    .some((set) => Object.hasOwn(set, name) && digest(set[name]) === digest(value)));
 }
 
 function memoryPath(configDir, cwd) {
@@ -317,7 +362,7 @@ function populate(stage, sourceAccount, sourceDir, sourceStateFile) {
     const targetMemory = path.join(stage, 'projects', key, 'memory');
     if (fs.existsSync(sourceMemory) && !fs.existsSync(targetMemory)) { link(sourceMemory, targetMemory); memoryProjects++; }
     const servers = effectiveMcpServers(sourceAccount, cwd, { sourceStateFile: state.file });
-    if (Object.keys(servers).length) { writeJSON(path.join(stage, 'projects', key, '.keep-mcp.json'), { mcpServers: servers }); mcpProjects++; }
+    if (Object.keys(servers).length) { writeMcpConfig(path.join(stage, 'projects', key, '.keep-mcp.json'), servers); mcpProjects++; }
   }
   const manifest = { version: 1, sourceAccountId: sourceAccount.id, sourceConfigDir: sourceDir,
     sourceStateFile: state.file,
@@ -406,16 +451,17 @@ function ensureSharedMemory(account, cwd) {
   let mcpConfig = null;
   if (manifest) {
     mcpConfig = mcpConfigPath(account.configDir, cwd);
-    const desired = JSON.stringify({ mcpServers: servers }, null, 2) + '\n';
+    const desired = mcpText(servers);
     if (fs.existsSync(mcpConfig)) {
       const actual = fs.readFileSync(mcpConfig, 'utf8');
       if (actual !== desired) {
         const state = sourceState(sourceAccount, sourceStateFile).value;
-        const legacy = JSON.stringify({ mcpServers: mcpServerSets(state, cwd).legacy }, null, 2) + '\n';
-        if (actual !== legacy) throw new Error(`managed MCP configuration conflicts for ${canonical(cwd)}`);
-        writeJSON(mcpConfig, { mcpServers: servers });
-      }
-    } else writeJSON(mcpConfig, { mcpServers: servers });
+        if (!keepGenerated(mcpConfig, actual, mcpServerSets(state, cwd))) {
+          throw new Error(`managed MCP configuration conflicts for ${canonical(cwd)}`);
+        }
+        writeMcpConfig(mcpConfig, servers);
+      } else if (readMcpRecord(mcpConfig) !== textDigest(desired)) recordMcpConfig(mcpConfig, desired);
+    } else writeMcpConfig(mcpConfig, servers);
   }
   return { memoryDir: targetMemory, autoMemoryDirectory: explicitMemory || targetMemory,
     mcpConfig, mcpServerCount: Object.keys(servers).length, mcpServers: servers };
