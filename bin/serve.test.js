@@ -1864,19 +1864,21 @@ test('auto-compact candidates schedule warm Claude and Codex Astra before cold f
   })), [{ id: 'codex-astra', path: 'warm-current', target: 'gpt-6-astra' }]);
 });
 
-test('auto-compact uses a four-minute target for five-minute Claude caches and retries warm failures only when cold', () => {
+test('auto-compact waits an hour before sending five-minute Claude caches through the cold fallback', () => {
   const now = Date.parse('2026-09-01T12:00:00Z');
   const opts = {
     ttlMs: 0, maxIdleMs: 24 * 60 * 60e3, minTokens: 100000, models: ['fable'],
     claudeTtlMs: 60 * 60e3, claudeTargetMs: 50 * 60e3, claudeFallbackModel: 'opus',
   };
-  const base = { id: 'short-cache', kind: 'claude', endedTurn: true, mtime: now - 10 * 60e3,
+  const base = { id: 'short-cache', kind: 'claude', endedTurn: true, mtime: now - 61 * 60e3,
     model: 'claude-fable-5-1', contextTokens: 150000, cacheTtlMs: 5 * 60e3 };
-  assert.equal(autoCompactCandidates([{ ...base, usageAt: now - 3.9 * 60e3 }], {}, now, opts).length, 0);
-  const warm = autoCompactCandidates([{ ...base, usageAt: now - 4.1 * 60e3 }], {}, now, opts)[0];
-  assert.equal(warm.path, 'warm-current');
-  assert.equal(warm.targetAgeMs, 4 * 60e3);
-  const coldSession = { ...base, usageAt: now - 6 * 60e3 };
+  assert.equal(autoCompactCandidates([{ ...base, usageAt: now - 59.9 * 60e3 }], {}, now, opts).length, 0);
+  const coldSession = { ...base, usageAt: now - 60.1 * 60e3 };
+  const cold = autoCompactCandidates([coldSession], {}, now, opts)[0];
+  assert.equal(cold.path, 'cold-fallback');
+  assert.equal(cold.targetModel, 'opus');
+  assert.equal(cold.targetAgeMs, 60 * 60e3);
+  assert.equal(cold.cacheTtlMs, 5 * 60e3);
   const failedWarm = { mtime: base.mtime, path: 'warm-current', result: 'error', attemptStage: 'submitted' };
   assert.equal(autoCompactCandidates([coldSession], { [base.id]: failedWarm }, now, opts)[0].path, 'cold-fallback');
   assert.equal(autoCompactCandidates([coldSession], { [base.id]: { ...failedWarm, result: 'timeout' } }, now, opts).length, 0);

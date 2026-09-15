@@ -3717,13 +3717,28 @@ function autoCompactPolicy(session, now, opts) {
     ? (opts.codexTtlMs ?? 30 * 60e3) : (opts.claudeTtlMs ?? opts.ttlMs);
   const cacheTtlMs = session.kind === 'claude' && Number.isFinite(session.cacheTtlMs)
     ? session.cacheTtlMs : fallbackTtlMs;
+  const cacheAgeMs = now - usageAt;
+  if (!Number.isFinite(cacheAgeMs)) return null;
+  // A five-minute Claude cache is too short to justify an immediate compaction.
+  // Leave the session alone for an hour, then compact through the cheaper model.
+  if (session.kind === 'claude' && session.cacheTtlMs === 5 * 60e3) {
+    const targetAgeMs = 60 * 60e3;
+    if (cacheAgeMs < targetAgeMs) return null;
+    return {
+      path: 'cold-fallback',
+      originalModel: model,
+      targetModel: opts.claudeFallbackModel || 'opus',
+      cacheAgeMs,
+      cacheTtlMs,
+      targetAgeMs,
+    };
+  }
   const leadMs = cacheTtlMs <= 5 * 60e3 ? 60e3 : 10 * 60e3;
   const configuredTarget = session.kind === 'codex'
     ? (opts.codexTargetMs ?? cacheTtlMs - leadMs)
     : (opts.claudeTargetMs ?? cacheTtlMs - leadMs);
   const targetAgeMs = Math.min(configuredTarget, Math.max(0, cacheTtlMs - leadMs));
-  const cacheAgeMs = now - usageAt;
-  if (!Number.isFinite(cacheAgeMs) || cacheAgeMs < targetAgeMs) return null;
+  if (cacheAgeMs < targetAgeMs) return null;
   const warm = cacheAgeMs < cacheTtlMs;
   return {
     path: warm ? 'warm-current' : 'cold-fallback',

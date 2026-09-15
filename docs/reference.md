@@ -892,12 +892,14 @@ uses the cache-creation metadata to infer a five-minute or one-hour lifetime (mi
 metadata uses five minutes), falling back to `KEEP_AUTO_COMPACT_CLAUDE_TTL_MIN`, then
 `KEEP_CACHE_TTL_MIN` (default 60). For Codex the default lifetime is 30 minutes.
 
-The daemon first tries the current model while its cache should still be warm: minute
-4 for a five-minute Claude cache, minute 50 for a one-hour Claude cache, and minute 20
-for Codex. Configure these with `KEEP_AUTO_COMPACT_CLAUDE_TARGET_MIN` and
-`KEEP_AUTO_COMPACT_CODEX_TARGET_MIN`; configure the Codex lifetime with
-`KEEP_AUTO_COMPACT_CODEX_TTL_MIN`. Warm attempts are prioritized by approaching cache
-deadline. Once the deadline passes, Claude uses its existing Opus swap and Codex uses
+For a one-hour Claude cache, the daemon first tries the current model at minute 50. For
+Codex it tries the current model at minute 20. Configure these with
+`KEEP_AUTO_COMPACT_CLAUDE_TARGET_MIN` and `KEEP_AUTO_COMPACT_CODEX_TARGET_MIN`; configure
+the Codex lifetime with `KEEP_AUTO_COMPACT_CODEX_TTL_MIN`. A detected five-minute Claude
+cache follows a separate policy: Keep waits until one hour after the last usage record,
+then compacts through the existing Opus swap instead of attempting the current model.
+Warm attempts are prioritized by approaching cache deadline. After the normal cache
+deadline, Claude uses its Opus swap and Codex uses
 `KEEP_AUTO_COMPACT_CODEX_FALLBACK_MODEL` (default `gpt-5.6-sol`), with durable model and
 reasoning-effort restoration. Busy locks, visible questions, background work, active
 turns, exited sessions, and missing live panes remain ineligible.
