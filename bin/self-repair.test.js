@@ -107,9 +107,15 @@ test('retired, disabled, on-demand and self-repair rows never produce a signatur
     { name: 'discord', disabled: true, consecutiveFailures: 40, lastError: 'not configured', lastErrorAt: NOW },
     { name: 'usage', consecutiveFailures: 40, lastError: 'on demand', lastErrorAt: NOW },
     { name: 'self-repair', consecutiveFailures: 40, lastError: 'itself', lastErrorAt: NOW },
-    { name: 'runs', consecutiveFailures: 5, lastError: 'real', lastErrorAt: NOW },
+    // Excluded: these fail for reasons a daemon fix cannot address, and `runs`
+    // fails when this scheduler's own repair run fails to start.
+    { name: 'runs', consecutiveFailures: 40, lastError: 'already 3 runs active', lastErrorAt: NOW },
+    { name: 'lint', consecutiveFailures: 40, lastError: 'malformed card', lastErrorAt: NOW },
+    { name: 'git-pull', consecutiveFailures: 40, lastError: 'dirty checkout', lastErrorAt: NOW },
+    { name: 'unblock', consecutiveFailures: 5, lastError: 'real', lastErrorAt: NOW },
   ]);
-  assert.deepEqual(selfRepair.signatures(snapshot, null, NOW, config, null).map((row) => row.name), ['runs']);
+  assert.deepEqual(selfRepair.signatures(snapshot, null, NOW, config, null).map((row) => row.name), ['unblock']);
+  assert.deepEqual([...selfRepair.EXCLUDED].sort(), ['git-pull', 'lint', 'runs']);
 });
 
 test('the restart loop needs two consecutive ticks, and a delivery incident needs age', () => {
@@ -288,6 +294,7 @@ function harness(options = {}) {
       calls.worktrees.push(name);
       return Promise.resolve(options.worktree || { ok: true, path: `/tmp/wt/keep-tool/${name}` });
     },
+    insideWorktreeRoot: options.insideWorktreeRoot || (() => true),
     startRun: (cardId, kind, extra, runOptions) => {
       calls.runs.push({ cardId, kind, extra, runOptions });
       if (options.runThrows) throw new Error(options.runThrows);
@@ -387,7 +394,7 @@ test('a ready signature opens one card, attaches evidence, makes a worktree and 
 test('the daily cap, the disable switch and a failed worktree all hold', async () => {
   const root = makeRoot();
   try {
-    const rows = ['review', 'runs', 'notes'].map((name) => ({
+    const rows = ['review', 'unblock', 'notes'].map((name) => ({
       name, consecutiveFailures: 6, lastError: `${name} is broken`, lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3,
     }));
     const snapshot = snapshotOf(rows, { startedAt: NOW - 6 * 3600e3 });
@@ -409,7 +416,7 @@ test('a worktree that cannot be created leaves the card and skips the launch', a
   const root = makeRoot();
   try {
     const snapshot = snapshotOf([
-      { name: 'runs', consecutiveFailures: 6, lastError: 'runs is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
     ], { startedAt: NOW - 6 * 3600e3 });
     const { deps, calls } = harness({
       root, snapshot,
@@ -429,14 +436,14 @@ test('a cleared signature gets one check-in, a cooldown, and a linked card if it
   const root = makeRoot();
   try {
     const snapshot = snapshotOf([
-      { name: 'runs', consecutiveFailures: 6, lastError: 'runs is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
     ], { startedAt: NOW - 6 * 3600e3 });
     const { deps, calls } = harness({ root, snapshot, config: { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 } });
     const opened = await selfRepair.tick(deps);
     const sig = opened.opened[0].sig;
 
     // The scheduler recovers. The clear clock starts, but nothing is said yet.
-    const healed = snapshotOf([{ name: 'runs', consecutiveFailures: 0, lastOkAt: NOW + 60e3, lastError: 'runs is broken' }],
+    const healed = snapshotOf([{ name: 'unblock', consecutiveFailures: 0, lastOkAt: NOW + 60e3, lastError: 'unblock is broken' }],
       { startedAt: NOW - 6 * 3600e3 });
     const quiet = await selfRepair.tick({ ...deps, snapshot: () => healed, now: NOW + 2 * 60e3 });
     assert.deepEqual(quiet.resolved, []);
@@ -470,21 +477,21 @@ test('--dry explains what the next tick would do, and --reset clears a cooldown'
   const root = makeRoot();
   try {
     const snapshot = snapshotOf([
-      { name: 'runs', consecutiveFailures: 6, lastError: 'runs is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
       { name: 'notes', consecutiveFailures: 6, lastError: 'notes is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
     ], { startedAt: NOW - 6 * 3600e3 });
     const config = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0, maxPerDay: 1 };
     const dry = await selfRepair.dryRun({ root, now: NOW, config, snapshot: () => snapshot });
     assert.deepEqual(dry.candidates.map((row) => row.action), ['open', 'skip']);
     assert.match(dry.candidates[1].why, /daily cap reached/);
-    assert.match(selfRepair.renderDry(dry), /would open: Daemon self-repair: runs/);
-    assert.equal(selfRepair.loadState(root).signatures.runs, undefined, '--dry writes nothing');
+    assert.match(selfRepair.renderDry(dry), /would open: Daemon self-repair: unblock/);
+    assert.equal(selfRepair.loadState(root).signatures.unblock, undefined, '--dry writes nothing');
 
     selfRepair.mutateState((state) => {
-      state.signatures['sched:runs:abcd1234'] = { firstSeenAt: NOW, cardId: 'old-card', resolvedAt: NOW, cooldownUntil: NOW + 86400e3 };
+      state.signatures['sched:unblock:abcd1234'] = { firstSeenAt: NOW, cardId: 'old-card', resolvedAt: NOW, cooldownUntil: NOW + 86400e3 };
     }, { root, now: NOW });
-    assert.equal(selfRepair.reset('sched:runs:abcd1234', { root, now: NOW }).found, true);
-    assert.equal(selfRepair.loadState(root).signatures['sched:runs:abcd1234'].cooldownUntil, undefined);
+    assert.equal(selfRepair.reset('sched:unblock:abcd1234', { root, now: NOW }).found, true);
+    assert.equal(selfRepair.loadState(root).signatures['sched:unblock:abcd1234'].cooldownUntil, undefined);
     assert.equal(selfRepair.reset('sched:nope:00000000', { root, now: NOW }).found, false);
 
     const value = selfRepair.status({ root, now: NOW, config });
@@ -550,13 +557,268 @@ test('keep self-repair prints state, dry-runs, and toggles the config', () => {
     assert.match(cli('--dry').stdout, /self-repair is disabled/);
     assert.equal(cli('--enable').status, 0);
 
+    // --reset refuses while the card is open: one repair card per signature is
+    // the invariant the whole scheduler rests on.
+    const refused = cli('--reset', 'sched:review:abcd1234');
+    assert.match(refused.stdout, /still has an open card \(a-repair-card\); close it first/);
+    assert.equal(selfRepair.loadState(root).signatures['sched:review:abcd1234'].cardId, 'a-repair-card');
+
+    // Once it has resolved, --reset clears the cooldown and keeps the card as the
+    // link the next one cites.
+    selfRepair.mutateState((state) => {
+      const entry = state.signatures['sched:review:abcd1234'];
+      entry.resolvedAt = NOW;
+      entry.cooldownUntil = NOW + 86400e3;
+    }, { root, now: NOW });
     const reset = cli('--reset', 'sched:review:abcd1234');
     assert.match(reset.stdout, /cleared sched:review:abcd1234/);
-    assert.equal(selfRepair.loadState(root).signatures['sched:review:abcd1234'].cardId, undefined);
+    const after = selfRepair.loadState(root).signatures['sched:review:abcd1234'];
+    assert.equal(after.cardId, undefined);
+    assert.equal(after.cooldownUntil, undefined);
+    assert.equal(after.previousCardId, 'a-repair-card', 'the card it opened stays on the record');
     assert.match(cli('--reset', 'sched:nope:00000000').stdout, /no such signature/);
 
     const both = cli('--disable', '--enable');
     assert.equal(both.status, 1);
     assert.match(both.stderr, /either --disable or --enable/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// ---------- review fixes ----------
+
+test('the card slot is reserved before the worktree, and a lost launch resumes instead of opening again', async () => {
+  const root = makeRoot();
+  try {
+    const snapshot = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const config = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 };
+
+    // The daemon dies during the ~5-minute worktree build. Before the reserve
+    // split, nothing had been written yet and the next start opened another card.
+    const crashing = harness({ root, snapshot, config });
+    crashing.deps.spawnWorktree = () => Promise.reject(new Error('daemon died mid-build'));
+    const crashed = await selfRepair.tick(crashing.deps);
+    assert.equal(crashed.opened.length, 1);
+    assert.equal(crashed.opened[0].launched, false);
+    const sig = crashed.opened[0].sig;
+    const reserved = selfRepair.loadState(root).signatures[sig];
+    assert.equal(reserved.cardId, 'repair-card-1', 'the card was recorded before the slow part');
+    assert.equal(reserved.runId, null, 'and the launch is visibly unfinished');
+    assert.equal(selfRepair.loadState(root).openedToday, 1, 'the daily cap already counts it');
+
+    // The next tick inside the backoff leaves it alone rather than opening a second card.
+    const next = harness({ root, snapshot, config });
+    const soon = await selfRepair.tick({ ...next.deps, now: NOW + 60e3 });
+    assert.deepEqual(soon.opened, []);
+    assert.deepEqual(soon.resumed, []);
+    assert.match(soon.skipped[0].why, /launch is retried in/);
+    assert.equal(next.calls.cards.length, 0, 'no second card for the same signature');
+
+    // After the backoff it resumes the launch on the card it already has.
+    const later = NOW + 20 * 60e3;
+    const resumed = await selfRepair.tick({ ...next.deps, now: later });
+    assert.deepEqual(resumed.opened, []);
+    assert.equal(resumed.resumed.length, 1);
+    assert.equal(resumed.resumed[0].cardId, 'repair-card-1');
+    assert.equal(next.calls.cards.length, 0);
+    assert.equal(next.calls.runs.length, 1, 'the run finally starts');
+    assert.equal(selfRepair.loadState(root).signatures[sig].runId, 'run-repair-card-1');
+    assert.equal(selfRepair.loadState(root).openedToday, 1, 'a resume never spends a second slot');
+
+    // Once it has a run, later ticks leave it alone again.
+    const settled = await selfRepair.tick({ ...next.deps, now: later + 60 * 60e3 });
+    assert.deepEqual([settled.opened, settled.resumed], [[], []]);
+    assert.match(settled.skipped[0].why, /already open .*run run-repair-card-1/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a launch that keeps failing gives up instead of retrying forever', async () => {
+  const root = makeRoot();
+  try {
+    const snapshot = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const { deps, calls } = harness({
+      root, snapshot,
+      config: { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 },
+      worktree: { ok: false, error: 'worktree exists' },
+    });
+    await selfRepair.tick(deps);
+    let at = NOW;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      at += 20 * 60e3;
+      await selfRepair.tick({ ...deps, now: at });
+    }
+    assert.equal(calls.cards.length, 1, 'one card throughout');
+    assert.equal(calls.runs.length, 0);
+    const entry = selfRepair.loadState(root).signatures[Object.keys(selfRepair.loadState(root).signatures)[0]];
+    assert.equal(entry.attempts, selfRepair.MAX_LAUNCH_ATTEMPTS);
+    assert.equal(entry.launchGaveUp, true);
+    const last = await selfRepair.tick({ ...deps, now: at + 60 * 60e3 });
+    assert.match(last.skipped[0].why, /launch failed 3 times; resume it by hand/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a worktree outside the worktree root is refused on the card, not launched into', async () => {
+  const root = makeRoot();
+  try {
+    const snapshot = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const { deps, calls } = harness({
+      root, snapshot,
+      config: { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 },
+      // `wt new` printed something that is not a worktree — the live checkout, say.
+      worktree: { ok: true, path: `${os.homedir()}/keep-tool` },
+      insideWorktreeRoot: () => false,
+    });
+    const result = await selfRepair.tick(deps);
+    assert.equal(result.opened[0].launched, false);
+    assert.equal(calls.runs.length, 0, 'no agent is launched outside a worktree');
+    assert.match(calls.checkins.at(-1).message, /Refusing to launch: .* is not inside the configured worktree root/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a half-built worktree is rebuilt rather than reused', async () => {
+  const root = makeRoot();
+  const wtRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-self-repair-wt-'));
+  try {
+    const target = path.join(wtRoot, 'keep-tool', 'self-repair-abcd1234');
+    const worktreePath = () => target;
+    const calls = [];
+    const execFile = (bin, args, options, done) => {
+      calls.push(args.slice(1));
+      if (args[1] === 'rm') { fs.rmSync(target, { recursive: true, force: true }); return done(null, '', ''); }
+      fs.mkdirSync(path.join(target, 'node_modules'), { recursive: true });
+      fs.writeFileSync(path.join(target, '.git'), 'gitdir: elsewhere');
+      return done(null, `${target}\n`, '');
+    };
+
+    // Nothing there: built once.
+    const fresh = await selfRepair.spawnWorktree('self-repair-abcd1234', { worktreePath, execFile });
+    assert.deepEqual(fresh, { ok: true, path: target });
+    assert.deepEqual(calls, [['new', 'keep-tool/self-repair-abcd1234']]);
+    assert.equal(selfRepair.worktreeReady(target), true);
+
+    // A finished tree is reused without shelling out at all.
+    calls.length = 0;
+    const reused = await selfRepair.spawnWorktree('self-repair-abcd1234', { worktreePath, execFile });
+    assert.equal(reused.reused, true);
+    assert.deepEqual(calls, []);
+
+    // A stump — a checkout with no install — is removed and built again.
+    calls.length = 0;
+    fs.rmSync(path.join(target, 'node_modules'), { recursive: true, force: true });
+    assert.equal(selfRepair.worktreeReady(target), false, 'a checkout alone is not a usable worktree');
+    const rebuilt = await selfRepair.spawnWorktree('self-repair-abcd1234', { worktreePath, execFile });
+    assert.equal(rebuilt.ok, true);
+    assert.deepEqual(calls, [['rm', target, '--force', '--delete'], ['new', 'keep-tool/self-repair-abcd1234']]);
+
+    // A failed install is not a usable worktree either.
+    fs.writeFileSync(path.join(target, '.wt-install-failed'), '');
+    assert.equal(selfRepair.worktreeReady(target), false);
+
+    // If the stump cannot be removed, say so rather than hand it over.
+    const stubborn = await selfRepair.spawnWorktree('self-repair-abcd1234', {
+      worktreePath, execFile: (bin, args, options, done) => done(new Error('worktree is dirty'), '', 'wt: worktree is dirty'),
+    });
+    assert.equal(stubborn.ok, false);
+    assert.match(stubborn.error, /half-built worktree at .* could not be removed/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(wtRoot, { recursive: true, force: true });
+  }
+});
+
+test('evidence is redacted before it is committed with the registry', () => {
+  const { redactSecrets } = selfRepair;
+  const line = 'keep slack: POST https://bot:xoxb-9f3a1c0712ab@hooks.slack.test/services failed; '
+    + 'SLACK_TOKEN=xoxb-88aa11bb22cc33dd44ee GITHUB_SECRET="s3cret-value" --api-key AKIA1234567890ABCD '
+    + 'header Bearer eyJhbGciOi.JIUzI1NiIsInR5c.CI6IkpXVCJ9 sid=39f6a38a-1111-2222-3333-444455556666 sha 824a8c1f9b0d';
+  const redacted = redactSecrets(line);
+  for (const secret of ['xoxb-9f3a1c0712ab', 'xoxb-88aa11bb22cc33dd44ee', 's3cret-value', 'AKIA1234567890ABCD', 'eyJhbGciOi.JIUzI1NiIsInR5c.CI6IkpXVCJ9']) {
+    assert.equal(redacted.includes(secret), false, secret);
+  }
+  assert.match(redacted, /https:\/\/bot:…@hooks\.slack\.test/);
+  assert.match(redacted, /SLACK_TOKEN=…/);
+  assert.match(redacted, /Bearer …/);
+  // What makes the excerpt worth reading survives: session ids and shas are not secrets.
+  assert.match(redacted, /sid=39f6a38a-1111-2222-3333-444455556666/);
+  assert.match(redacted, /sha 824a8c1f9b0d/);
+
+  // …and it is applied on the way into every evidence file and onto the card.
+  const root = makeRoot();
+  try {
+    fs.writeFileSync(path.join(root, '.keep', 'serve.log'), `keep unblock: ${line}\n`);
+    const snapshot = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: `tick failed: SLACK_TOKEN=xoxb-88aa11bb22cc33dd44ee`, lastErrorAt: NOW },
+    ], { startedAt: NOW - 3600e3 });
+    const candidate = selfRepair.signatures(snapshot, null, NOW, { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 }, null)[0];
+    const evidence = selfRepair.collectEvidence(candidate, snapshot, { root, now: NOW });
+    for (const file of evidence.files) {
+      assert.equal(file.text.includes('xoxb-88aa11bb22cc33dd44ee'), false, file.name);
+    }
+    assert.deepEqual(JSON.parse(evidence.files[1].text).schedulers.length, 1, 'the JSON stays parseable');
+    assert.equal(selfRepair.cardTitle(candidate).includes('xoxb-88aa11bb22cc33dd44ee'), false);
+    assert.equal(selfRepair.symptomNote(candidate).includes('xoxb-88aa11bb22cc33dd44ee'), false);
+    assert.equal(selfRepair.buildRecipe({ candidate, cardId: 'c', worktree: '/w', branch: 'b' })
+      .includes('xoxb-88aa11bb22cc33dd44ee'), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('zero is a meaningful cap but not a meaningful threshold', () => {
+  const root = makeRoot();
+  selfRepair._resetWarnings();
+  try {
+    fs.writeFileSync(path.join(root, 'watch', 'self-repair.json'), JSON.stringify({
+      maxPerDay: 0, restartsPerHour: 0, minFailures: 0, cooldownHours: 0, budgetMin: 0,
+    }));
+    const logged = [];
+    const config = selfRepair.loadConfig(root, (line) => logged.push(line));
+    assert.equal(config.maxPerDay, 0, 'zero cards a day is how you pause it without disabling it');
+    assert.equal(config.restartsPerHour, 0, 'zero means any restart in the last hour is a loop');
+    assert.equal(config.minFailures, selfRepair.DEFAULT_CONFIG.minFailures);
+    assert.equal(config.cooldownHours, selfRepair.DEFAULT_CONFIG.cooldownHours);
+    assert.equal(config.budgetMin, selfRepair.DEFAULT_CONFIG.budgetMin);
+    assert.match(logged.join(''), /ignoring "minFailures": expected a number >= 1/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a resolved signature has to earn its age again before it reopens', async () => {
+  const root = makeRoot();
+  try {
+    const failing = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const healed = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 0, lastOkAt: NOW + 60e3, lastError: 'unblock is broken' },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const { deps } = harness({ root, snapshot: failing, config: { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 30 } });
+    selfRepair.mutateState((state) => {
+      state.signatures[`sched:unblock:${selfRepair.signatureHash('unblock', selfRepair.normalizeError('unblock is broken'))}`] = { firstSeenAt: NOW - 60 * 60e3 };
+    }, { root, now: NOW });
+
+    const opened = await selfRepair.tick(deps);
+    assert.equal(opened.opened.length, 1);
+    const sig = opened.opened[0].sig;
+
+    await selfRepair.tick({ ...deps, snapshot: () => healed, now: NOW + 2 * 60e3 });
+    await selfRepair.tick({ ...deps, snapshot: () => healed, now: NOW + 70 * 60e3 });
+    assert.equal(selfRepair.loadState(root).signatures[sig].firstSeenAt, undefined,
+      'the age clock is cleared on resolution, so a recurrence is a new fault');
+
+    // It comes back after the cooldown: seen again, but not old enough yet.
+    const after = NOW + 70 * 60e3 + 25 * 3600e3;
+    failing.schedulers[0].lastErrorAt = after;
+    const again = await selfRepair.tick({ ...deps, snapshot: () => failing, now: after });
+    assert.deepEqual(again.opened, []);
+    assert.match(again.skipped[0].why, /needs 30m/);
+    assert.equal(selfRepair.loadState(root).signatures[sig].firstSeenAt, after);
+
+    // Half an hour of the same failure later, it opens again.
+    failing.schedulers[0].lastErrorAt = after + 31 * 60e3;
+    const reopened = await selfRepair.tick({ ...deps, snapshot: () => failing, now: after + 31 * 60e3 });
+    assert.equal(reopened.opened.length, 1);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
