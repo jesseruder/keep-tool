@@ -251,3 +251,82 @@ test('scope identity ignores case for storage as well as for decisions', () => {
   assert.equal(grants.length, 1);
   assert.equal(allow.tokenKey(grants[0]), 'deploy:prod');
 });
+
+// ---------- the implicit land grant ----------
+
+const COMMIT_A = { sha: 'aaaaaaa1111111111111111111111111111111aa', patchId: 'p-a', subject: 'first' };
+const COMMIT_B = { sha: 'bbbbbbb2222222222222222222222222222222bb', patchId: 'p-b', subject: 'second' };
+
+function record(over = {}) {
+  return {
+    id: 'rev-1', at: '2026-09-07T11:00:00.000Z', by: 'codex sol', job: 'job_abc',
+    verdict: 'clean', evidence: '', commits: [{ ...COMMIT_A }], bySession: null, message: '',
+    ...over,
+  };
+}
+
+test('an explicit land grant short-circuits the reviewed-patch path', () => {
+  const verdict = allow.decideLand({ grants: allow.readGrants(card({ allow: ['land'] })), commits: [COMMIT_A] });
+  assert.equal(verdict.ok, true);
+  assert.equal(verdict.implicit, false);
+  assert.equal(verdict.grant, 'land');
+});
+
+test('a clean review of every landing patch is authority to land', () => {
+  const verdict = allow.decideLand({ records: [record()], commits: [COMMIT_A], now: NOW });
+  assert.equal(verdict.ok, true);
+  assert.equal(verdict.implicit, true);
+  assert.equal(verdict.grant, 'land');
+  assert.match(verdict.why, /^reviewed clean: 1 commit\(s\) by codex sol at .* \(record rev-1\)$/);
+});
+
+test('the patch-id is what matches, so a rebase does not invalidate the review', () => {
+  // `wt land` rebases before it pushes: the sha that lands is not the sha reviewed.
+  const rebased = { sha: 'cccccccc33333333333333333333333333333333', patchId: 'p-a', subject: 'first' };
+  assert.equal(allow.decideLand({ records: [record()], commits: [rebased] }).ok, true);
+  // A different patch under the reviewed sha's prefix is NOT the reviewed patch.
+  const rewritten = { sha: COMMIT_A.sha, patchId: 'p-rewritten', subject: 'first, amended' };
+  const verdict = allow.decideLand({ records: [record()], commits: [rewritten] });
+  assert.equal(verdict.ok, false);
+  assert.match(verdict.why, /has no review record/);
+});
+
+test('every landing commit needs its own clean record', () => {
+  const verdict = allow.decideLand({ records: [record()], commits: [COMMIT_A, COMMIT_B] });
+  assert.equal(verdict.ok, false);
+  assert.match(verdict.why, /bbbbbbb22222 \("second"\) has no review record/);
+  const both = record({ id: 'rev-2', commits: [{ ...COMMIT_A }, { ...COMMIT_B }] });
+  assert.equal(allow.decideLand({ records: [both], commits: [COMMIT_A, COMMIT_B] }).ok, true);
+});
+
+test('findings newer than the last clean record block the land', () => {
+  const clean = record({ id: 'rev-clean', at: '2026-09-07T10:00:00.000Z' });
+  const findings = record({ id: 'rev-findings', at: '2026-09-07T11:00:00.000Z', verdict: 'findings' });
+  const blocked = allow.decideLand({ records: [clean, findings], commits: [COMMIT_A] });
+  assert.equal(blocked.ok, false);
+  assert.match(blocked.why, /newest review of aaaaaaa11111 .* is findings \(record rev-findings\)/);
+  // A clean review recorded after the findings clears it again.
+  const fixed = record({ id: 'rev-again', at: '2026-09-07T12:00:00.000Z' });
+  assert.equal(allow.decideLand({ records: [clean, findings, fixed], commits: [COMMIT_A] }).ok, true);
+});
+
+test('an agent may not self-attest without a job id or evidence; a human may', () => {
+  const bare = record({ job: '', evidence: '' });
+  const verdict = allow.decideLand({ records: [bare], commits: [COMMIT_A] });
+  assert.equal(verdict.ok, false);
+  assert.match(verdict.why, /agent self-attestation with no --job or --evidence/);
+  assert.equal(allow.decideLand({ records: [record({ job: '', evidence: 'read the diff twice' })], commits: [COMMIT_A] }).ok, true);
+  assert.equal(allow.decideLand({ records: [record({ by: 'human jesse', job: '', evidence: '' })], commits: [COMMIT_A] }).ok, true);
+});
+
+test('an opt-out, an unusable worktree and an empty range each name themselves', () => {
+  const optOut = allow.decideLand({ records: [record()], commits: [COMMIT_A], optOut: 'card sets auto_land: off' });
+  assert.equal(optOut.ok, false);
+  assert.match(optOut.why, /auto-land is off: card sets auto_land: off/);
+
+  const dirty = allow.decideLand({ records: [record()], commits: [COMMIT_A], worktree: { ok: false, why: 'the tree has 2 uncommitted change(s)' } });
+  assert.equal(dirty.ok, false);
+  assert.match(dirty.why, /2 uncommitted change\(s\)/);
+
+  assert.match(allow.decideLand({ records: [record()], commits: [] }).why, /nothing to land/);
+});

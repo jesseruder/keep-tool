@@ -810,10 +810,7 @@ function commitAndPush(message, pathspecs = ['tasks', 'archive', 'digests'], { s
   git('commit', '-q', '-m', message, '--', ...changed);
   // Agent sessions must honor the user's explicit push-approval policy. Manual
   // terminal use keeps the original best-effort background sync behavior.
-  const inAgentSession = Boolean(
-    process.env.CLAUDE_CODE_SESSION_ID || process.env.CODEX_SESSION_ID || process.env.CODEX_THREAD_ID,
-  );
-  if (!push || process.env.KEEP_NO_PUSH || (inAgentSession && process.env.KEEP_ALLOW_PUSH !== '1')) return;
+  if (!push || process.env.KEEP_NO_PUSH || (inAgentSession() && process.env.KEEP_ALLOW_PUSH !== '1')) return;
   try {
     const child = spawn('git', ['-C', ROOT, 'push', '-q', 'origin', 'HEAD'], { detached: true, stdio: 'ignore' });
     child.unref();
@@ -855,6 +852,14 @@ function parseArgs(argv, spec) {
     }
   }
   return opts;
+}
+
+// Is this command running inside an agent's session rather than Owner's own
+// terminal? Claude sets CLAUDE_CODE_SESSION_ID; Codex sets one of its two markers.
+// Not a security boundary — an agent can unset an env var — but it is the same
+// signal the push policy already runs on, and it makes the honest path obvious.
+function inAgentSession(env = process.env) {
+  return Boolean(env.CLAUDE_CODE_SESSION_ID || env.CODEX_SESSION_ID || env.CODEX_THREAD_ID);
 }
 
 // Throws (rather than exiting) so withLock's finally always releases the lock.
@@ -2840,10 +2845,28 @@ function formatAllow(task) {
   return grants.map(allow.formatToken).join(', ') + suffix;
 }
 
+// `keep allow <card> land` with no explicit grant: the reviewed-patch path.
+// Everything git-shaped lives in bin/reviews.js; the decision itself is
+// allow.decideLand, which is pure.
+function implicitLandVerdict(task, deps = {}) {
+  const reviews = deps.reviews || require('./reviews.js');
+  const records = deps.records || reviews.readRecords(task.id);
+  const optOut = deps.optOut !== undefined ? deps.optOut : reviews.optOutReason(task);
+  const context = deps.context || (optOut ? { ok: false, why: 'auto-land is off' } : reviews.landContext(deps.cwd || process.cwd()));
+  const verdict = allow.decideLand({
+    grants: allow.readGrants(task),
+    records,
+    commits: context.ok ? context.commits : [],
+    optOut,
+    worktree: context.ok ? null : context,
+  });
+  return { ...verdict, context };
+}
+
 commands.allow = (argv) => {
-  const o = parseArgs(argv, { grant: 'list', revoke: 'list', until: 'str', clear: 'bool', amount: 'str', quiet: 'bool', json: 'bool' });
+  const o = parseArgs(argv, { grant: 'list', revoke: 'list', until: 'str', clear: 'bool', amount: 'str', quiet: 'bool', json: 'bool', 'as-owner': 'bool' });
   const id = o._[0];
-  const usage = 'usage: keep allow <id> [<action> [--amount n]] [--grant a,b] [--revoke a,b] [--until when] [--clear] [--quiet] [--json]';
+  const usage = 'usage: keep allow <id> [<action> [--amount n]] [--grant a,b] [--revoke a,b] [--until when] [--clear] [--quiet] [--json] [--as-owner]';
   if (!id) die(usage);
   const mutating = Boolean(o.grant || o.revoke || o.clear || o.until);
   // allow.js throws AllowError, which the top-level handler does not know; every
@@ -2862,13 +2885,31 @@ commands.allow = (argv) => {
       if (o.json) return console.log(JSON.stringify({ id, grants: allow.readGrants(task).map(allow.formatToken), until: task.fm.allow_until || '', expired: Boolean(allow.expired(task, Date.now())) }, null, 2));
       return console.log(`${id}: ${formatAllow(task)}`);
     }
-    const verdict = translating(() => allow.decide(task, request, { amount: o.amount }));
+    let verdict = translating(() => allow.decide(task, request, { amount: o.amount }));
+    // No explicit grant covers `land`, so ask the reviewed-patch question instead.
+    // Nothing else gets an implicit path: a land is the one action whose evidence
+    // Keep can verify byte for byte.
+    if (!verdict.ok && String(request).trim().toLowerCase() === 'land') {
+      const implicit = implicitLandVerdict(task);
+      verdict = { ok: implicit.ok, why: implicit.why, ...(implicit.grant ? { grant: implicit.grant } : {}), implicit: true, ...(implicit.record ? { record: implicit.record } : {}) };
+    }
     if (o.json) console.log(JSON.stringify({ id, action: request, ...verdict }, null, 2));
     else if (!o.quiet) console.log(verdict.ok ? `allowed: ${verdict.why}` : `not allowed: ${verdict.why}`);
     // Exit 3, not 1: an agent must be able to tell "you may not" from "that
     // command was wrong". `if keep allow c push; then …` reads naturally.
     if (!verdict.ok) process.exitCode = 3;
     return;
+  }
+
+  // The grants are the authority an unattended agent runs on, and until now any
+  // session could write its own: `keep allow <own card> --grant push` was an
+  // ordinary, unlogged-as-unusual command. The skill has always said only Owner
+  // grants; this is that sentence with an exit code behind it.
+  // Revoking and clearing only ever reduce authority, so they stay open.
+  const widening = Boolean(o.grant || o.until);
+  if (widening && inAgentSession() && !(o['as-owner'] && process.env.KEEP_OWNER === '1')) {
+    die(`only Owner grants. Never grant on your own card — end the turn and ask him for "keep allow ${id} --grant …". `
+      + 'If Owner is running this himself from an agent session, pass --as-owner with KEEP_OWNER=1 in the environment.');
   }
 
   translating(() => withLock(() => {
@@ -2908,6 +2949,93 @@ commands.allow = (argv) => {
     commitAndPush(`keep: allow ${id}`);
     console.log(`${id}: ${formatAllow(task)}`);
   }));
+};
+
+// ---------- review records and the land they authorize ----------
+
+function reviewRecordError(fn) {
+  const reviews = require('./reviews.js');
+  try { return fn(reviews); }
+  catch (error) { if (error instanceof reviews.ReviewRecordError) die(error.message); throw error; }
+}
+
+commands.reviewed = (argv) => {
+  const o = parseArgs(argv, { commit: 'list', verdict: 'str', by: 'str', job: 'str', evidence: 'str', json: 'bool' });
+  const id = o._[0];
+  const usage = 'usage: keep reviewed <card> --commit <sha|range>… --verdict clean|findings [--by codex|opus|claude|human…] [--job <id>] [--evidence "..."] [-m "..."] [--json]';
+  if (!id || o._.length > 1 || !o.commit || !o.verdict) die(usage);
+  const record = reviewRecordError((reviews) => withLock(() => {
+    const task = loadTask(id);
+    const built = reviews.buildRecord({
+      commits: o.commit, verdict: o.verdict, by: o.by, job: o.job, evidence: o.evidence,
+      message: o.m, session: commandSession(),
+    }, reviews.gitDeps(process.cwd()));
+    reviews.append(id, built);
+    const contribution = recordContribution(task);
+    // `code-review`, never a bare `review`: bin/review.js swallows a log heading
+    // that starts with the word review as one of the fleet reviewer's own notes.
+    appendLog(task, 'code-review', reviews.logLine(built), contribution.session);
+    task.fm.updated = nowStamp();
+    saveTask(task);
+    commitAndPush(`keep: code-review ${id}`);
+    return built;
+  }));
+  if (o.json) return console.log(JSON.stringify(record, null, 2));
+  console.log(`${id}: recorded ${record.verdict} review ${record.id} over ${record.commits.length} commit(s) by ${record.by}`);
+  for (const commit of record.commits) console.log(`  ${commit.sha.slice(0, 12)} ${commit.patchId ? `patch ${commit.patchId.slice(0, 12)}` : 'no patch-id (merge or empty)'} ${commit.subject}`);
+  if (record.verdict === 'clean') console.log(`  keep allow ${id} land now answers 0 while these are exactly what would land`);
+};
+
+commands.reviews = (argv) => {
+  const o = parseArgs(argv, { json: 'bool' });
+  const id = o._[0];
+  if (!id || o._.length > 1) die('usage: keep reviews <card> [--json]');
+  loadTask(id);
+  const records = require('./reviews.js').readRecords(id);
+  if (o.json) return console.log(JSON.stringify({ id, records }, null, 2));
+  if (!records.length) return console.log(`${id}: no review records — keep reviewed ${id} --commit <sha> --verdict clean`);
+  for (const record of records) {
+    console.log(`${record.at}  ${record.verdict.padEnd(8)} ${record.id}  by ${record.by}${record.job ? ` job ${record.job}` : ''}`);
+    for (const commit of record.commits) console.log(`    ${commit.sha.slice(0, 12)}  ${commit.subject}`);
+    if (record.evidence) console.log(`    evidence: ${record.evidence}`);
+    if (record.message) console.log(`    ${record.message}`);
+  }
+};
+
+commands.land = (argv) => {
+  const o = parseArgs(argv, { json: 'bool', 'dry-run': 'bool' });
+  const id = o._[0];
+  if (!id || o._.length > 1) die('usage: keep land <card> [--dry-run] [--json]\n'
+    + '  Checks keep allow <card> land, then runs wt land from the current worktree and cites the landed sha.\n'
+    + '  Keep-tool\'s own main checkout and daemon restart stay manual: this never pulls ~/keep-tool and never restarts the daemon.');
+  const task = loadTask(id);
+  const verdict = implicitLandVerdict(task);
+  if (!verdict.ok) {
+    if (o.json) console.log(JSON.stringify({ id, action: 'land', ...verdict, context: undefined }, null, 2));
+    else process.stderr.write(`keep: not allowed: ${verdict.why}\n`);
+    process.exitCode = 3;
+    return;
+  }
+  const record = verdict.record || null;
+  if (o['dry-run']) {
+    console.log(`allowed: ${verdict.why}`);
+    for (const commit of verdict.context.commits || []) console.log(`  ${commit.sha.slice(0, 12)} ${commit.subject}`);
+    console.log(`would run wt land in ${verdict.context.worktree}`);
+    return;
+  }
+  const wt = require('./wt.js');
+  let sha;
+  try { sha = wt.landWorktree(verdict.context.worktree); }
+  catch (error) { die(`wt land refused: ${error.message}`); }
+  if (!sha) die('wt land had nothing to push');
+  const cited = record ? ` (review record ${record.id})` : '';
+  checkinTask(id, {
+    message: `Landed ${verdict.context.branch} onto ${verdict.context.defaultBranch}${cited}.`,
+    commits: [sha],
+  });
+  if (o.json) return console.log(JSON.stringify({ id, landed: sha, record, why: verdict.why }, null, 2));
+  console.log(`${id}: landed ${sha.slice(0, 12)} onto origin/${verdict.context.defaultBranch}${cited}`);
+  console.log('  keep-tool\'s main checkout and daemon restart are still manual');
 };
 
 // ---------- shadow decisions ----------
@@ -7612,6 +7740,15 @@ function helpText() {
   keep allow <id>                              # what this card may do unattended
   keep allow <id> <action> [--amount n] [--quiet]   # exit 0 allowed, 3 not allowed
   keep allow <id> --grant a,b [--until when] | --revoke a,b | --clear
+                                               # only Owner grants: --grant/--until are refused inside an
+                                               # agent session unless --as-owner is passed with KEEP_OWNER=1
+  keep reviewed <card> --commit <sha|range>… --verdict clean|findings
+                       [--by codex|opus|claude|human…] [--job <id>] [--evidence "..."] [-m "..."] [--json]
+                       # record that an independent review saw exactly these patches
+  keep reviews <card> [--json]                 # the review records on this card
+  keep land <card> [--dry-run] [--json]        # keep allow <card> land, then wt land, then cite the sha
+                       # exit 3 when the reviewed patches are not exactly what would land
+                       # keep-tool's main checkout and daemon restart stay manual
   keep retitle <id> "new title"
   keep project <id> [<path|name>] [-m "reason"]   # show or change project; preserves session links and schedule
   keep claim <card>                                # claim for the current session; run from the card's project
@@ -7812,7 +7949,7 @@ commands.help = (argv) => {
 module.exports = {
   demoteHeadings,
   ROOT, TASKS, ARCHIVE, STATUSES, KINDS, STATUS_ORDER, META, HOLDS_DIR,
-  isReviewerSession, registerReviewerSession, currentSession, parseWhen, relativeDurationMs, postKeepApi, getKeepApi,
+  isReviewerSession, registerReviewerSession, currentSession, inAgentSession, implicitLandVerdict, parseWhen, relativeDurationMs, postKeepApi, getKeepApi,
   loadAll, loadTask, loadTaskAnywhere, parseTask, serializeTask, parsePlan, renderPlan, setPlan, nextStep, lastLogLine, isOverdue, nowStamp, stampOf, buildDigest,
   parseDependency, dependencyTarget, dependencyReason, dependencyStep, deploymentFact, isDoneLogHeading, dependencyResolved, dependencyInfo, unresolvedDependencyIds,
   withLock, commitAndPush, saveTask, recordDoneTransition, recordDaemonSessionClose, addTask, checkinTask, briefSnapshot, scopeForProject, KeepError,

@@ -516,7 +516,9 @@ test('retitle, plan, allow, checkin, and done preserve ownership while attributi
   const f = schedulerFixture();
   const parse = () => require('./keep.js').parseTask(f.read('routine-card'), 'routine-card');
   const owner = { CLAUDE_CODE_SESSION_ID: 'routine-owner' };
-  const writer = { CODEX_THREAD_ID: 'routine-writer' };
+  // KEEP_OWNER + --as-owner: writing a grant from an agent session is refused now,
+  // and this case is about log attribution, not about who may grant.
+  const writer = { CODEX_THREAD_ID: 'routine-writer', KEEP_OWNER: '1' };
   try {
     assert.equal(f.run(['add', 'Routine card', '--status', 'active'], owner).status, 0);
     assert.equal(f.run(['link', 'routine-card', '--session', 'second-owner', '--agent', 'claude']).status, 0);
@@ -525,7 +527,7 @@ test('retitle, plan, allow, checkin, and done preserve ownership while attributi
       ['retitle', 'routine-card', 'Retitled card'],
       ['plan', 'routine-card', '--set', 'First step'],
       ['plan', 'routine-card', '--start', '1'],
-      ['allow', 'routine-card', '--grant', 'push'],
+      ['allow', 'routine-card', '--grant', 'push', '--as-owner'],
       ['checkin', 'routine-card', '-m', 'Routine contribution.'],
       ['done', 'routine-card', '-m', 'Routine closure.'],
     ]) {

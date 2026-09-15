@@ -178,6 +178,76 @@ function decide(task, request, { amount, now = Date.now() } = {}) {
   return { ok: false, why: `${task.id} does not grant ${formatToken(want)} — ask Owner, or he can grant it with keep allow ${task.id} --grant ${formatToken(want)}` };
 }
 
+// ---------- the implicit land grant ----------
+
+// `land` is the one action Keep can authorize from evidence instead of from a
+// grant Owner typed. The evidence is a `keep reviewed` record whose patch-ids
+// cover exactly the commits that would land. Everything else in this module
+// answers "did Owner say yes?"; this answers "is what is about to land the thing
+// somebody already reviewed?" — and refuses the moment those differ.
+//
+// Pure on purpose: the git plumbing (what would land, and its patch-ids) is the
+// caller's, so every branch below is a unit test rather than a repository.
+//
+//   grants   — the card's parsed grant tokens (allow.readGrants)
+//   records  — `keep reviewed` records for the card, oldest first
+//   commits  — [{ sha, patchId, subject }] for origin/<default>..HEAD
+//   optOut   — '' when auto-land is on, else why it is off
+//   worktree — optional { ok, why } for the wt/-branch + clean-tree condition
+function coveringRecords(records, commit) {
+  const sha = String(commit && commit.sha || '');
+  const patchId = String(commit && commit.patchId || '');
+  return (records || []).filter((record) => (record.commits || []).some((entry) => {
+    const entryPatch = String(entry && entry.patchId || '');
+    if (patchId && entryPatch) return entryPatch === patchId;
+    const entrySha = String(entry && entry.sha || '');
+    return Boolean(sha && entrySha) && (entrySha.startsWith(sha) || sha.startsWith(entrySha));
+  }));
+}
+
+function recordTime(record) {
+  const parsed = Date.parse(String(record && record.at || ''));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+// A record by a named human is testimony; a record an agent wrote about its own
+// work is not, unless it cites the job or the evidence that produced it.
+function selfAttested(record) {
+  if (/^human\b/i.test(String(record && record.by || ''))) return false;
+  return !String(record && record.job || '').trim() && !String(record && record.evidence || '').trim();
+}
+
+function decideLand({ grants = [], records = [], commits = [], optOut = '', worktree = null, now = Date.now() } = {}) {
+  const tokens = (grants || []).map((grant) => (typeof grant === 'string' ? parseToken(grant, 'grant') : grant));
+  const explicit = tokens.find((token) => token && token.action === 'land');
+  if (explicit) return { ok: true, implicit: false, grant: formatToken(explicit), why: `granted ${formatToken(explicit)}` };
+  if (optOut) return { ok: false, implicit: true, why: `no land grant, and auto-land is off: ${optOut}` };
+  if (worktree && worktree.ok === false) return { ok: false, implicit: true, why: `no land grant, and ${worktree.why}` };
+  if (!commits.length) return { ok: false, implicit: true, why: 'no land grant, and there is nothing to land' };
+
+  const used = [];
+  for (const commit of commits) {
+    const label = `${String(commit.sha || '').slice(0, 12)}${commit.subject ? ` ("${commit.subject}")` : ''}`;
+    const covering = coveringRecords(records, commit).slice().sort((a, b) => recordTime(a) - recordTime(b));
+    if (!covering.length) {
+      return { ok: false, implicit: true, why: `no land grant, and ${label} has no review record — run keep reviewed <card> --commit ${String(commit.sha || '').slice(0, 12)} --verdict clean` };
+    }
+    const newest = covering[covering.length - 1];
+    if (newest.verdict !== 'clean') {
+      return { ok: false, implicit: true, why: `no land grant, and the newest review of ${label} is ${newest.verdict} (record ${newest.id}) — fix it and record a clean review`, record: newest };
+    }
+    if (selfAttested(newest)) {
+      return { ok: false, implicit: true, why: `no land grant, and review record ${newest.id} for ${label} is an agent self-attestation with no --job or --evidence`, record: newest };
+    }
+    used.push(newest);
+  }
+  const newest = used.slice().sort((a, b) => recordTime(a) - recordTime(b))[used.length - 1];
+  return {
+    ok: true, implicit: true, grant: 'land', record: newest,
+    why: `reviewed clean: ${commits.length} commit(s) by ${newest.by} at ${newest.at} (record ${newest.id})`,
+  };
+}
+
 // ---------- prose → actions, for the Stop hook ----------
 
 // The Stop hook needs to know what an agent is stopping to ask about. These
@@ -277,5 +347,6 @@ function coversStop(task, text, opts = {}) {
 module.exports = {
   AllowError, KNOWN_ACTIONS,
   parseToken, formatToken, tokenKey, parseGrants, readGrants, expiryState, expired, decide, askSpan,
+  decideLand, coveringRecords, selfAttested,
   INTENT, intents, coversStop,
 };

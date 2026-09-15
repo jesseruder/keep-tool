@@ -1117,6 +1117,13 @@ module.exports = {
   defaultBranch,
   mainCheckout,
   isLinkedWorktree,
+  // Exported so `keep allow <card> land` can ask the same questions `wt land` asks
+  // (linked worktree, wt/ branch, clean tree) instead of reimplementing them.
+  gitTopLevel,
+  branchFor,
+  statusWithoutMarkers,
+  hasMetadataFile,
+  isAncestor,
   nudgeFor,
   guardDecision,
   barePushOfSharedRef,
