@@ -540,8 +540,11 @@ worktree out of process, and launches one headless repair agent there. At most t
 cards a day, one open card per signature, a 24-hour cooldown after each resolves.
 
 The daemon restart stays manual: `keep hook pre-bash` refuses `keep
-restart-daemon`, `keep service`, `launchctl`, writes to the live `~/keep-tool`
-checkout, `git push --force` and `wt land` inside a repair run. `keep self-repair`
+restart-daemon` (however it is spelled, including the node wrapper and the
+`/api/restart-daemon` endpoint), `keep service`, `launchctl`, git writes anywhere
+under the live `~/keep-tool` checkout, force pushes and `wt land` inside a repair
+run; reading that checkout with `log`, `status`, `diff`, `show` or `rev-parse`
+still works. `keep self-repair`
 shows what is open; `keep self-repair --dry` shows what the next tick would open.
 See [daemon self-repair](self-repair.md).
 

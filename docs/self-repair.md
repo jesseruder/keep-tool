@@ -26,8 +26,13 @@ returns candidates.
 | `delivery:<incidentId8>` | the `delivery` row's `incidentId` has been unchanged for `minAgeMin` |
 
 Retired schedulers, disabled rows, on-demand schedulers (`usage`, `digest`) and
-the `self-repair` row itself never produce a signature. A `delivery` row carrying
-a live incident gets the `delivery:` signature rather than a second `sched:` one.
+the `self-repair` row itself never produce a signature. Nor do `runs`, `lint` and
+`git-pull`: `runs` fails when a headless run fails to start — including this
+scheduler's own repair run, which would let it feed on itself — and `lint` and
+`git-pull` fail on registry and checkout state (a malformed card, a dirty or
+diverged checkout), which is Owner's to fix rather than a daemon bug. A `delivery`
+row carrying a live incident gets the `delivery:` signature rather than a second
+`sched:` one.
 
 `hash8` is `sha256(name + '|' + normalizedError)`. The normalizer collapses
 whitespace and then replaces, in order: ISO timestamps (`<time>`), absolute paths
@@ -39,6 +44,9 @@ produces one card instead of one per tick, so it is tested directly in
 ## Thresholds and rate limits
 
 - One open card per signature. A second is never opened while the first is open.
+  The card is recorded the moment `addTask` returns, before the worktree build, so
+  a daemon that dies mid-build resumes that launch on the next tick instead of
+  opening another card. A launch that fails three times gives up and says so.
 - At most `maxPerDay` (2) cards per local day, fleet-wide.
 - After a signature resolves, `cooldownHours` (24) before it may open another.
 - A signature that recurs after the cooldown opens a new card whose note links the
@@ -52,7 +60,9 @@ Each tick asks whether a signature's symptom is gone: the scheduler is back to
 `consecutiveFailures === 0` with a `lastOkAt` newer than the card, the restart
 loop stopped, the delivery incident cleared. Once it has stayed gone for an hour,
 the card gets **one** check-in — "signature cleared at *t*; verify the fix landed,
-then close" — plus `resolvedAt` and a cooldown.
+then close" — plus `resolvedAt` and a cooldown. The first-sighting stamp is cleared
+at the same time: a recurrence after the cooldown is a new fault, and has to
+survive `minAgeMin` again before it opens anything.
 
 The card's status is deliberately not changed. A cleared symptom is not a landed
 fix, and only a person or the repair agent's own check-in should close the card.
@@ -83,7 +93,9 @@ Config is `~/keep/watch/self-repair.json`, with these defaults when absent:
 ```
 
 An unknown key is ignored with a logged warning rather than failing closed:
-nothing dangerous is enabled by a key this version does not understand. `launch:
+nothing dangerous is enabled by a key this version does not understand. `maxPerDay`
+and `restartsPerHour` accept `0` (no cards at all; any restart in the last hour is
+a loop); every other number must be at least 1. `launch:
 false` opens cards with their evidence but creates no worktree and spends no
 agent. `KEEP_SELF_REPAIR=0` disables the scheduler entirely, and
 `KEEP_REPAIR_MODEL` overrides the configured model for one daemon.
@@ -106,8 +118,14 @@ Evidence is attached as artifacts under `.keep/artifacts/<card>/`: the failing
 health row with the `daemon` row, the whole health snapshot, the last 80 serve.log
 lines mentioning the scheduler or its error (or the last 40 if none match), and,
 for a delivery incident, the inspection result, the matching journal, and the tail
-of `diagnostics/events.jsonl`. Each excerpt is scrubbed line by line and clipped
-to 64 KB, and staged inside `.keep` so nothing on the card ever cites `/tmp`.
+of `diagnostics/events.jsonl`. Each excerpt is scrubbed line by line, **redacted**
+and clipped to 64 KB, and staged inside `.keep` so nothing on the card ever cites
+`/tmp`. Redaction matters because evidence is committed and pushed with `~/keep`:
+URL credentials, `Bearer`/`Basic` headers, `*_TOKEN=`/`*_SECRET=`/`*_KEY=` values,
+token-shaped flags and long opaque strings are elided, in the evidence files and in
+the card's title, note and recipe. Uuids and hex runs are deliberately kept — a
+session id or a sha is what makes the excerpt worth reading, and neither is a
+secret.
 
 A check-in records the launch: run id, worktree path, account purpose and model,
 so Owner can see what was spent.
@@ -134,11 +152,16 @@ this is a good moment to drop every live session's daemon. A restart mid-repair
 also destroys the running state that produced the evidence. So `keep hook
 pre-bash` refuses, for any command in a run with `KEEP_REPAIR=1`:
 
-- `keep restart-daemon`, `keep service`, `launchctl`
-- git explicitly aimed at the main `~/keep-tool` checkout, and any git write
-  reached by `cd`-ing into it (reading its log still works)
-- `git push --force` and `wt land` — landing goes through `keep land`, which
-  enforces the review record
+- `keep restart-daemon`, `keep service`, `launchctl` — including the node-wrapper
+  and shebang spellings (`node ~/keep-tool/bin/keep.js restart-daemon`), starting a
+  second daemon with `bin/serve.js`, and `curl`/`wget`/`fetch` at
+  `/api/restart-daemon` (grepping the endpoint out of the source is still fine)
+- git in the main `~/keep-tool` checkout **or anything under it**, targeted with
+  `-C`/`--git-dir`/`--work-tree` or reached by `cd`, unless the subcommand is
+  `log`, `status`, `diff`, `show` or `rev-parse` — the diagnosing agent has every
+  reason to read the live checkout and none to write to it
+- `git push --force`, `--force-with-lease`, a `+refspec`, and `wt land` — landing
+  goes through `keep land`, which enforces the review record
 
 The refusal names the rule and points at step 4 of the repair card. The guard is
 keyed to the environment variable `runs.js` sets for repair runs, so no other
@@ -155,6 +178,7 @@ keep self-repair                          # open signatures, their cards, cooldo
 keep self-repair --dry                    # what the next tick would open, and why; writes nothing
 keep self-repair --json
 keep self-repair --reset <signature>      # clear one signature's cooldown and resolution
+                                          #   (refused while its card is still open)
 keep self-repair --disable | --enable
 ```
 
