@@ -165,37 +165,42 @@ const optimisticSetAside = new Map();
 // Set-aside writes for one key go out in click order, so a quick Mark running then
 // Unmark (or Undo) cannot land server-side as clear-before-set.
 const setAsideWrites = new Map();
-// A reload whose state request went out before a set-aside write finished can return
-// a snapshot without it. Keep each optimistic entry until a reload started after its
-// write settled: key -> { token, settledAt: reloadGeneration when the write returned }.
-const setAsideSettles = new Map();
-function beginSetAsideWrite(key) {
-  const token = {};
-  // Remember what this click replaces, so a failed write falls back to the previous
-  // click (still pending or already committed) instead of a possibly stale snapshot.
-  const prior = setAsideSettles.has(key)
-    ? { settle: setAsideSettles.get(key), entry: optimisticSetAside.get(key) } : null;
-  setAsideSettles.set(key, { token, settledAt: null, prior });
-  return token;
+// A reload whose state request went out before a set-aside write returned can carry a
+// snapshot without it, so a key keeps its optimistic entry while any of its writes is in
+// flight and until a reload that started after the last one returned. Writes for a key
+// finish in click order (queueSetAsideWrite), so one record per key sees every result.
+const setAsideKeys = new Map(); // key -> { pending, committed: { entry } | null, settledAt }
+function beginSetAsideWrite(key, entry) {
+  const record = setAsideKeys.get(key) || { pending: 0, committed: null, settledAt: null };
+  record.pending += 1;
+  record.settledAt = null;
+  setAsideKeys.set(key, record);
+  optimisticSetAside.set(key, entry);
+  return record;
 }
-function rollBackSetAsideWrite(key, token) {
-  const current = setAsideSettles.get(key);
-  // A newer click on this key owns the optimistic entry; only roll back our own.
-  if (current?.token !== token) return;
-  if (current.prior) {
-    setAsideSettles.set(key, current.prior.settle);
-    optimisticSetAside.set(key, current.prior.entry);
-  } else {
-    setAsideSettles.delete(key);
+function finishSetAsideWrite(key, record, entry, ok) {
+  if (setAsideKeys.get(key) !== record) return;
+  record.pending -= 1;
+  if (ok) record.committed = { entry };
+  if (record.pending > 0) return; // a newer click is still in flight and stays shown
+  record.settledAt = reloadGeneration;
+  if (ok) return;
+  // The newest click failed: show what the server last accepted for this key, or the
+  // snapshot if nothing landed, and fetch authoritative state right away.
+  if (record.committed) optimisticSetAside.set(key, record.committed.entry);
+  else {
+    setAsideKeys.delete(key);
     optimisticSetAside.delete(key);
   }
+  void reload();
 }
-function settleSetAsideWrite(key, token) {
-  const current = setAsideSettles.get(key);
-  if (current?.token !== token) return false;
-  current.settledAt = reloadGeneration;
-  current.prior = null; // committed: a later failed click falls back to this one
-  return true;
+function pruneSetAsideOverrides(generation) {
+  for (const [key, record] of [...setAsideKeys]) {
+    if (record.pending > 0 || record.settledAt === null || record.settledAt >= generation) continue;
+    setAsideKeys.delete(key);
+    optimisticSetAside.delete(key);
+  }
+  for (const key of [...optimisticSetAside.keys()]) if (!setAsideKeys.has(key)) optimisticSetAside.delete(key);
 }
 function queueSetAsideWrite(key, write) {
   const next = (setAsideWrites.get(key) || Promise.resolve()).catch(() => {}).then(write);
@@ -393,22 +398,20 @@ async function setAside(item, kind = 'dismiss', minutes) {
   if (state.historyTarget?.sessionId === item.sessionId) state.historyTarget = null;
   const key = itemKey(item);
   const now = Date.now();
-  const token = beginSetAsideWrite(key);
-  optimisticSetAside.set(key, {
-    kind, until: kind === 'snooze' ? now + (minutes || 60) * 60e3 : null, at: now, since: item.since,
-  });
+  const entry = { kind, until: kind === 'snooze' ? now + (minutes || 60) * 60e3 : null, at: now, since: item.since };
+  const record = beginSetAsideWrite(key, entry);
   state.dismissed.add(key);
   if (kind === 'running') state.markedRunning.add(key);
   state.focused = false;
   refresh();
   try {
     await queueSetAsideWrite(key, () => api.setAside(key, kind, minutes));
-    settleSetAsideWrite(key, token);
+    finishSetAsideWrite(key, record, entry, true);
     toast(kind === 'dependency' ? 'Waiting for dependency. New messages or changed dependencies bring it back.'
       : kind === 'running' ? 'Moved to Running & waiting. A new message or a new turn brings it back.'
       : kind === 'snooze' ? 'Snoozed for 1 hour.' : 'Dismissed. Restore it from the collapsed row.', { label: 'Undo', run: () => restore(key) });
   } catch (error) {
-    rollBackSetAsideWrite(key, token);
+    finishSetAsideWrite(key, record, entry, false);
     deriveDismissed();
     refresh();
     toast(`Could not set aside: ${error.message}`);
@@ -416,18 +419,17 @@ async function setAside(item, kind = 'dismiss', minutes) {
 }
 function dismiss(item) { return setAside(item, 'dismiss'); }
 async function restore(key) {
-  const token = beginSetAsideWrite(key);
-  optimisticSetAside.set(key, null);
+  const record = beginSetAsideWrite(key, null);
   state.dismissed.delete(key);
   state.markedRunning.delete(key);
   state.showDismissed = false;
   refresh();
   try {
     await queueSetAsideWrite(key, () => api.setAside(key, 'clear'));
-    settleSetAsideWrite(key, token);
+    finishSetAsideWrite(key, record, null, true);
     toast('Back in the queue.');
   } catch (error) {
-    rollBackSetAsideWrite(key, token);
+    finishSetAsideWrite(key, record, null, false);
     deriveDismissed();
     refresh();
     toast(`Could not restore: ${error.message}`);
@@ -946,14 +948,9 @@ async function reload() {
     }
     closingSessions.reconcile(data);
     void refreshProjectChoices();
-    // Drop an optimistic set-aside only once this reload started after its write
-    // returned; the fenced state then already reflects it. Pending writes stay optimistic.
-    for (const [key, settle] of [...setAsideSettles]) {
-      if (settle.settledAt === null || settle.settledAt >= generation) continue;
-      setAsideSettles.delete(key);
-      optimisticSetAside.delete(key);
-    }
-    for (const key of [...optimisticSetAside.keys()]) if (!setAsideSettles.has(key)) optimisticSetAside.delete(key);
+    // Drop an optimistic set-aside only once this reload started after its last write
+    // returned; the fenced state then already reflects it.
+    pruneSetAsideOverrides(generation);
     deriveDismissed();
     for (const pane of [...droppedPanes]) {
       if ((data.panes || []).some((candidate) => candidate.id === pane)) {
