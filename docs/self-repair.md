@@ -292,8 +292,12 @@ asks whether that card's fix has landed.
 `keep reviewed` records, which say a patch was reviewed, not that one was pushed.
 What `keep land` leaves is a check-in on the card — `Landed <branch> onto <default>`
 with the pushed sha in that entry's `commits:` field — and that entry is the land
-record. `landedFor` takes those shas and asks the live checkout whether any of them
-is an ancestor of `origin/<default>`. It never fetches: this runs in front of every
+record. Three things have to line up, because the session being gated can write
+check-ins of its own: the entry matches that whole line and not looser prose about
+landing something, the card carries a clean `keep reviewed` record (a repair card
+holds no `--allow` grants, so its land can only have gone the reviewed-patch way),
+and the cited sha is an ancestor of `origin/<default>` in the live checkout.
+It never fetches: this runs in front of every
 Bash call the session makes, so a network round trip would stall the whole repair,
 and the refs are already fresh — the landed sweep and the `git-pull` scheduler keep
 `origin/master` current, and `keep land` pushed seconds earlier.
@@ -307,7 +311,11 @@ keep: repair session may restart: <card>'s fix <sha7> is on origin/master
 Everything else stays refused, before and after the land: `keep service`,
 `launchctl`, `bin/serve.js`, the `/api/restart-daemon` fetch, a bare `git pull`
 without `--ff-only`, and `git -C ~/keep-tool merge`/`reset`/`checkout` or any other
-write in the live checkout. A session whose card cannot be resolved, whose card has
+write in the live checkout. Nothing may ride along with the two either — an
+environment assignment (`GIT_CONFIG_*` can move the remote or point `core.hooksPath`
+at a script), a node flag (`-r`, `--eval`), a wrapper such as `env -C`, a second
+`-C`, or `--git-dir`/`--work-tree`, which pair another repository with the live
+working tree. A session whose card cannot be resolved, whose card has
 no land check-in, or whose predicate throws is refused exactly as it was before.
 
 **The card is not closed automatically**, the fix is not landed without a recorded
