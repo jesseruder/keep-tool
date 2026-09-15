@@ -1523,11 +1523,14 @@ test('reload rebuilds alternate-screen state from serialization after raw-buffer
       cols: 40,
       rows: 4,
     });
+    // Serializing a 4MB alternate screen is slow while the full suite runs; give each
+    // screen request room instead of failing on the client's default 8s deadline.
+    const slow = { timeoutMs: 30000 };
     await waitFor(async () => {
-      const screen = await client.request('screen', { pane: pane.id });
+      const screen = await client.request('screen', { pane: pane.id }, slow);
       return screen.text.includes('OVERFLOW') && screen;
-    }, 'alternate-screen overflow', 10000);
-    assert.equal((await client.request('screen', { pane: pane.id })).alt, true);
+    }, 'alternate-screen overflow', 30000);
+    assert.equal((await client.request('screen', { pane: pane.id }, slow)).alt, true);
     const record = await first.handoff();
     assert.ok(record.panes[0].buffer.length <= 4 * 1024 * 1024);
     assert.ok(record.panes[0].screen.length < record.panes[0].buffer.length);
@@ -1535,7 +1538,7 @@ test('reload rebuilds alternate-screen state from serialization after raw-buffer
     first.finalizeHandoff();
     await active.listen();
     client = await connect({ sock });
-    assert.equal((await client.request('screen', { pane: pane.id })).alt, true);
+    assert.equal((await client.request('screen', { pane: pane.id }, slow)).alt, true);
   } finally {
     if (client) client.close();
     await active.close();

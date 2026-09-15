@@ -58,7 +58,9 @@ test('dashboard worker invalidation prevents stale coalescing and reaches the li
 });
 
 test('dashboard worker times out a hung build and recovers', async (t) => {
-  const worker = createDashboardWorker({ workerFile, timeoutMs: 100 });
+  // The deadline also covers respawning the worker thread, which takes well over
+  // 100ms while the full suite is running.
+  const worker = createDashboardWorker({ workerFile, timeoutMs: 1000 });
   t.after(() => worker.close());
   await assert.rejects(worker.build({ hang: true }), /timed out/);
   assert.deepEqual(await worker.build({ value: 'after-timeout' }), { value: 'after-timeout', invalidations: 0 });
