@@ -40,6 +40,8 @@ const RULE_NAMES = [
   'daemon-health',
   'checkout-drift',
   'step-run-pending',
+  'note-expired',
+  'resource-bad-matcher',
 ];
 const OPEN_STATUSES = ['active', 'review', 'landing', 'blocked', 'waiting'];
 // Every open card can trip the three status/project rules at once, and ten each would
@@ -743,9 +745,58 @@ function stepRunPending(_task, ctx) {
   return out;
 }
 
+// A state note whose window ran out and whose author never said whether it is
+// still true. Nothing was blocked by it and nothing is blocked now — but a stale
+// statement about shared state is worse than no statement, and the one nag the
+// daemon sends can land in a session that has since exited. An hour's grace, so
+// a note that expires between sweeps is not reported before its author is asked.
+const NOTE_EXPIRED_GRACE_MS = 3600e3;
+
+function noteExpired(_task, ctx) {
+  let rows = [];
+  try { rows = require('./notes.js').allNotes(ctx.root); } catch { return []; }
+  const out = [];
+  for (const note of rows) {
+    if (!note || note.cleared) continue;
+    const until = atMs(String(note.until || '').replace(' ', 'T'));
+    if (!Number.isFinite(until) || ctx.now - until < NOTE_EXPIRED_GRACE_MS) continue;
+    const scope = (note.scopes || []).join(', ') || 'unscoped';
+    out.push(finding('note-expired', { id: `note:${note.id}` }, 'low',
+      `state note on ${scope} in ${tilde(note.project)} expired ${Math.floor((ctx.now - until) / 3600e3)}h ago`
+      + ` and nobody said whether it still holds: "${String(note.message || '').slice(0, 120)}"`,
+      `keep note --clear ${note.id} (or keep note --extend ${note.id} --for +2h if it is still true)`));
+    if (out.length >= 10) break;
+  }
+  return out;
+}
+
+// A declared resource nothing can ever match: a regex that does not compile, an
+// empty glob, a malformed name. Silent by construction — the matcher simply never
+// fires — so the only way anyone finds out is here.
+function resourceBadMatcher(_task, ctx) {
+  let resources;
+  let registries = [];
+  try {
+    resources = require('./resources.js');
+    registries = resources.registeredResources(ctx.root);
+  } catch { return []; }
+  const out = [];
+  for (const registry of registries) {
+    for (const problem of resources.badMatchers(registry)) {
+      out.push(finding('resource-bad-matcher',
+        { id: `resource:${path.basename(registry.project)}:${problem.name}` }, 'low',
+        `${problem.name} in ${tilde(registry.project)} declares a ${problem.kind} matcher nothing can match`
+        + `${problem.pattern ? ` (${String(problem.pattern).slice(0, 80)})` : ''}: ${String(problem.reason).slice(0, 120)}`,
+        `edit ${tilde(registry.file)}, then check it with keep resources --check ${path.basename(registry.project)} "<command>"`));
+      if (out.length >= 10) return out;
+    }
+  }
+  return out;
+}
+
 // Fleet-level rules answer once for the whole registry, not once per card, so lint
 // calls them with no task. Everything else stays (task, ctx).
-for (const rule of [daemonHealth, checkoutDrift, stepRunPending]) rule.fleet = true;
+for (const rule of [daemonHealth, checkoutDrift, stepRunPending, noteExpired, resourceBadMatcher]) rule.fleet = true;
 
 const RULES = {
   'malformed-card': malformedCard,
@@ -770,6 +821,8 @@ const RULES = {
   'daemon-health': daemonHealth,
   'checkout-drift': checkoutDrift,
   'step-run-pending': stepRunPending,
+  'note-expired': noteExpired,
+  'resource-bad-matcher': resourceBadMatcher,
 };
 
 function git(repo, args) {

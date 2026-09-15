@@ -941,3 +941,55 @@ test('snapshotAgeMs reads the snapshot stamp, not the file mtime', () => {
     assert.equal(lintTool.snapshotAgeMs(root, now), Infinity);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('note-expired names a state note nobody confirmed, after an hour', () => {
+  const root = makeRoot();
+  const notes = require('./notes.js');
+  const now = Date.parse('2026-09-14T12:00:00');
+  const seed = (until, extra = {}) => notes.addNote({
+    root, project: '~/castle/castle-sandboxes', scopes: ['staging'],
+    by: { sessionId: 'author-session', agent: 'claude' },
+    message: 'staging is home-only, no deck-persistence config',
+    until, now, ...extra,
+  });
+  try {
+    writeCard(root, 'any-card', { status: 'active' });
+    seed('2026-09-14T14:00');
+    assert.deepEqual(lint({ root, now, rule: 'note-expired' }).findings, [], 'a live note is not a finding');
+    seed('2026-09-14T11:30');
+    assert.deepEqual(lint({ root, now, rule: 'note-expired' }).findings, [],
+      'half an hour of grace, so a note that expires between sweeps is not reported first');
+    const note = seed('2026-09-14T08:00');
+    const findings = lint({ root, now, rule: 'note-expired' }).findings;
+    assert.equal(findings.length, 1);
+    assert.equal(findings[0].id, `note:${note.id}`);
+    assert.equal(findings[0].severity, 'low');
+    assert.match(findings[0].text, /state note on staging in ~\/castle\/castle-sandboxes expired 4h ago/);
+    assert.match(findings[0].fix, new RegExp(`keep note --clear ${note.id}`));
+    notes.clearNote(note.id, '', { root, now });
+    assert.deepEqual(lint({ root, now, rule: 'note-expired' }).findings, [], 'a cleared note is answered');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('resource-bad-matcher names a declaration nothing can ever match', () => {
+  const root = makeRoot();
+  const now = Date.parse('2026-09-14T12:00:00');
+  try {
+    writeCard(root, 'any-card', { status: 'active' });
+    fs.mkdirSync(path.join(root, 'resources'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'resources', 'castle-sandboxes.json'), JSON.stringify({
+      project: '~/castle/castle-sandboxes',
+      resources: {
+        staging: { commands: ['terraform apply'], paths: ['terraform/**'] },
+        prod: { commands: ['heroku (release'], paths: ['   '] },
+      },
+    }));
+    const findings = lint({ root, now, rule: 'resource-bad-matcher' }).findings;
+    assert.equal(findings.length, 2);
+    assert.ok(findings.every((item) => item.id === 'resource:castle-sandboxes:prod'), JSON.stringify(findings));
+    assert.match(findings.find((item) => /command matcher/.test(item.text)).text, /heroku \(release/);
+    assert.match(findings.find((item) => /paths matcher/.test(item.text)).text, /empty entry/);
+    assert.match(findings[0].fix, /keep resources --check castle-sandboxes/);
+    assert.deepEqual(lint({ root, now: now, rule: 'resource-bad-matcher', stepRows: () => [] }).findings.length, 2);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
