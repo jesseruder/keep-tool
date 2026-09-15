@@ -1082,8 +1082,18 @@ test('the pre-bash guard keeps a self-repair run off the daemon and out of the m
     // A wrapper that moves the command into the live checkout moves it there.
     `env -C ${main} git add -A`,
     `env --chdir=${main} git commit -am wip`,
-    // The preload, not the script, used to look like what node was running.
+    // The preload, not the script, used to look like what node was running — and
+    // a decoy in flag position used to look like the script.
     `node -r /tmp/preload.cjs ${main}/bin/keep.js restart-daemon`,
+    `node --require=/tmp/keep.js ${main}/bin/keep.js restart-daemon`,
+    `node --require=/tmp/serve.js ${main}/bin/serve.js`,
+    // env's options stop at its command operand: this `-C` is git's.
+    'env git -C ~/keep-tool config guard.recheck value',
+    // git resolves --git-dir against the cwd, not against an earlier --work-tree.
+    'git --work-tree=/tmp --git-dir=~/keep-tool/.git config guard.recheck value',
+    // Whatever was in front of the shell is in front of what the shell runs.
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/tmp/hooks bash -c 'git -C ${main} pull --ff-only'`,
+    `NODE_OPTIONS=--require=/tmp/preload.cjs bash -c 'keep restart-daemon'`,
     // Force pushes, however spelled.
     'git push --force origin HEAD:master',
     'git push --force-with-lease',
@@ -1208,7 +1218,15 @@ test('once the repair card\'s fix is on origin/master the session may pull the l
     `git --git-dir=${main}/.git pull --ff-only`,
     `git -C ${main} -C bin pull --ff-only`,
     `git -C ${main} -c core.hooksPath=/tmp/hooks pull --ff-only`,
+    `node --require=/tmp/keep.js ${main}/bin/keep.js restart-daemon`,
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.url GIT_CONFIG_VALUE_0=/tmp/other bash -c 'git -C ${main} pull --ff-only'`,
+    `NODE_OPTIONS=--require=/tmp/preload.cjs bash -c 'keep restart-daemon'`,
+    `env git -C ${main} pull --ff-only`,
   ]) assert.equal(decide(command).deny, true, command);
+
+  // …but the plain pair still passes through a shell, which is how a recipe step
+  // written as one command reaches the guard.
+  assert.equal(decide(`bash -c 'git -C ${main} pull --ff-only && keep restart-daemon'`).deny, false);
 
   // One line to stderr, naming the card and the sha that made it allowable.
   assert.equal(decide('keep restart-daemon').note,

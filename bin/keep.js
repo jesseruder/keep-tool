@@ -6067,40 +6067,54 @@ function underMainCheckout(candidate) {
 // `node ~/keep-tool/bin/keep.js restart-daemon` is `keep restart-daemon`, and a
 // shebang invocation of the same file is too. Rewrite both to the plain spelling
 // so one rule covers every way of saying it.
-// The rewrite drops the interpreter and its flags, so both are kept alongside:
-// `node --require=/tmp/preload.cjs ~/keep-tool/bin/keep.js restart-daemon` reads
-// as `keep restart-daemon` here, and the refusal is right either way — but the
-// allowance after the land must not treat a preload as the plain command.
+//
+// Two things the rewrite must not lose. The interpreter's own arguments: a
+// `--require` preloads code before keep.js runs, so the allowance after the land
+// cannot treat that as the plain command. And which file node was actually
+// pointed at: node's script is its first operand, so `node -r /tmp/keep.js
+// ~/keep-tool/bin/keep.js restart-daemon` has a decoy in flag position and
+// `node -r /tmp/preload.cjs ~/keep-tool/bin/keep.js restart-daemon` has the real
+// one out of operand position. Whenever the two readings disagree, this refuses
+// to call it either command: `node-keep` is refused outright and never allowed.
 function repairExecutable(tokens) {
   const head = stepRegistry.commandBasename(tokens[0]);
   if (head === 'keep.js') return { head: 'keep', tokens: ['keep', ...tokens.slice(1)], script: tokens[0] };
   if (head === 'serve.js') return { head: 'serve.js', tokens };
   if (!NODE_BINARIES.has(head)) return { head, tokens };
-  // The script itself, wherever it sits — not "the first token that is not a
-  // flag": `node -r /tmp/preload.cjs ~/keep-tool/bin/keep.js restart-daemon` puts
-  // the preload there, and reading that as the script hid the restart entirely.
-  const index = tokens.findIndex((token, position) => position > 0
+  const index = tokens.findIndex((token, position) => position > 0 && !token.startsWith('-'));
+  const mentioned = tokens.some((token, position) => position > 0
     && NODE_SCRIPTS.has(stepRegistry.commandBasename(token)));
-  if (index === -1) return { head, tokens };
+  if (index === -1) return { head: mentioned ? 'node-keep' : head, tokens };
   const script = tokens[index];
+  const name = stepRegistry.commandBasename(script);
   const interpreter = tokens.slice(1, index);
-  if (stepRegistry.commandBasename(script) === 'keep.js') {
-    return { head: 'keep', tokens: ['keep', ...tokens.slice(index + 1)], script, interpreter };
-  }
-  return { head: 'serve.js', tokens, script, interpreter };
+  if (name === 'keep.js') return { head: 'keep', tokens: ['keep', ...tokens.slice(index + 1)], script, interpreter };
+  if (name === 'serve.js') return { head: 'serve.js', tokens, script, interpreter };
+  // node is running something else, with keep.js or serve.js named somewhere in
+  // its arguments. Nobody spells either command that way.
+  if (mentioned) return { head: 'node-keep', tokens, script, interpreter };
+  return { head, tokens };
 }
 
 // `env -C <dir> git …` runs git in <dir>. stripCommandWrappers takes the wrapper
 // off and the directory with it, so it is read here before it goes — otherwise
 // the invocation looked like it ran in the worktree and the live checkout was
 // wide open through one wrapper.
+const ENV_VALUE_FLAGS = new Set(['-u', '--unset', '-S', '--split-string']);
+
 function repairWrapperChdir(tokens, cwd) {
   if (!tokens.length || stepRegistry.commandBasename(tokens[0]) !== 'env') return cwd;
   for (let i = 1; i < tokens.length; i += 1) {
-    if (tokens[i] === '--') break;
-    const equals = /^--chdir=(.*)$/.exec(tokens[i]);
+    const token = tokens[i];
+    if (token === '--') break;
+    if (ASSIGNMENT_RE.test(token)) continue;
+    // env's own options stop at its command operand. Reading past it took the
+    // command's `-C` for env's and moved the invocation somewhere it never ran.
+    if (!/^-./.test(token)) break;
+    const equals = /^--chdir=(.*)$/.exec(token);
     if (equals) return repairResolvePath(equals[1], cwd);
-    if ((tokens[i] === '-C' || tokens[i] === '--chdir') && tokens[i + 1]) return repairResolvePath(tokens[i + 1], cwd);
+    if ((token === '-C' || token === '--chdir') && tokens[i + 1]) return repairResolvePath(tokens[i + 1], cwd);
+    if (ENV_VALUE_FLAGS.has(token)) i += 1;
   }
   return cwd;
 }
@@ -6129,9 +6143,21 @@ function repairInvocations(value, depth = 0, cwd = '') {
     }
     // Only for this invocation: `env -C` does not move the rest of the command.
     const here = repairWrapperChdir(rest, current);
+    const wrapped = stripped.length !== rest.length || stripped[0] !== rest[0];
     if (SHELL_BINARIES.has(head)) {
       const script = stepRegistry.shellScriptArgument(stripped);
-      if (script !== null) out.push(...repairInvocations(script, depth + 1, here));
+      // What was in front of the shell is in front of everything it runs:
+      // `GIT_CONFIG_COUNT=1 … bash -c 'git -C ~/keep-tool pull --ff-only'` is the
+      // same redirected pull one level down.
+      if (script !== null) {
+        for (const child of repairInvocations(script, depth + 1, here)) {
+          out.push({
+            ...child,
+            assignments: [...assignments, ...(child.assignments || [])],
+            wrapped: Boolean(child.wrapped || wrapped),
+          });
+        }
+      }
       continue;
     }
     const resolved = repairExecutable(stripped);
@@ -6144,7 +6170,7 @@ function repairInvocations(value, depth = 0, cwd = '') {
       interpreter: resolved.interpreter || [],
       // `env -C <dir> git …`, `timeout 30 keep …`: something else decided how this
       // runs. Nothing the allowance covers is ever written that way.
-      wrapped: stripped.length !== rest.length || stripped[0] !== rest[0],
+      wrapped,
     });
   }
   return out;
@@ -6159,19 +6185,26 @@ function gitSubcommand(args) {
   return '';
 }
 
-// Which directory a git invocation acts on: each `-C`/`--work-tree`/`--git-dir`
-// resolved against the one before it, starting from the directory a `cd` earlier
-// in the command left it in. Cumulative because git is: `git -C ~/keep-tool -C bin`
-// is ~/keep-tool/bin, and resolving the second one against the original cwd read
-// it as somewhere else entirely and let a write through.
-function repairGitDirectory(args, cwd) {
-  let directory = cwd;
+// Every directory a git invocation touches. `-C` is the only one that moves the
+// base, and it is cumulative because git is: `-C ~/keep-tool -C bin` is
+// ~/keep-tool/bin, and resolving the second against the original cwd read it as
+// somewhere else and let a write through. `--git-dir` and `--work-tree` are not
+// a base for anything — git resolves each against the (-C'd) cwd — and they are
+// independent of each other, so both are returned and both are checked: a command
+// that names the live checkout in either one is reaching for it.
+function repairGitTargets(args, cwd) {
+  let base = cwd;
+  const targets = [];
   for (let i = 0; i < args.length; i += 1) {
     const equals = /^--(?:work-tree|git-dir)=(.*)$/.exec(args[i]);
-    if (equals) { directory = repairResolvePath(equals[1], directory); continue; }
-    if (['-C', '--work-tree', '--git-dir'].includes(args[i]) && args[i + 1]) directory = repairResolvePath(args[i + 1], directory);
+    if (equals) { targets.push(repairResolvePath(equals[1], base)); continue; }
+    if (args[i] === '-C' && args[i + 1]) { base = repairResolvePath(args[i + 1], base); i += 1; continue; }
+    if ((args[i] === '--work-tree' || args[i] === '--git-dir') && args[i + 1]) {
+      targets.push(repairResolvePath(args[i + 1], base));
+      i += 1;
+    }
   }
-  return directory;
+  return [base, ...targets].filter(Boolean);
 }
 
 function repairDenial(invocation) {
@@ -6180,6 +6213,10 @@ function repairDenial(invocation) {
   const first = args.find((token) => !token.startsWith('-')) || '';
   if (head === 'launchctl') return "`launchctl` controls the daemon's launchd job";
   if (head === 'serve.js') return 'that starts a second keep daemon';
+  // node pointed at something else with keep.js or serve.js among its arguments:
+  // whatever it is, it is not one of the two commands, and it may be the restart
+  // with a preload in front of it.
+  if (head === 'node-keep') return 'that runs node over keep-tool\'s own code with something else in front of it';
   if (head === 'keep' && first === 'restart-daemon') return '`keep restart-daemon` restarts the daemon you were launched to repair';
   if (head === 'keep' && first === 'service') return "`keep service` installs, starts or stops the daemon's launchd job";
   if (head === 'wt' && first === 'land') return '`wt land` pushes without a review record';
@@ -6189,7 +6226,7 @@ function repairDenial(invocation) {
     return `that POSTs ${RESTART_ENDPOINT}, which restarts the daemon you were launched to repair`;
   }
   if (head !== 'git') return '';
-  const directory = repairGitDirectory(args, cwd);
+  const directory = repairGitTargets(args, cwd).find(underMainCheckout) || '';
   const subcommand = gitSubcommand(args);
   if (underMainCheckout(directory) && !GIT_READ_ONLY.has(subcommand)) {
     return `that runs \`git ${subcommand || '(no subcommand)'}\` in ${directory}, the live keep-tool checkout this daemon runs from`
@@ -6243,7 +6280,7 @@ function repairAfterLand(invocation) {
   // "pull the landed fix" by any reading. Only `-C`, and only one of them.
   if (args.some((token) => /^--(?:work-tree|git-dir)(?:=|$)/.test(token))) return false;
   if (args.filter((token) => token === '-C').length > 1) return false;
-  if (!underMainCheckout(repairGitDirectory(args, cwd))) return false;
+  if (!repairGitTargets(args, cwd).every(underMainCheckout)) return false;
   // Whatever named the directory is not part of the shape — `-C ~/keep-tool`
   // before the subcommand, or a `cd` that put it there, are the same command.
   const rest = [];
