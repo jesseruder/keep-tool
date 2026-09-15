@@ -163,3 +163,22 @@ test('dashboard merges Slack and Discord findings with source labels in time ord
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), [['slack', 'Slack row'], ['discord', 'Discord row']]);
 });
+
+test('scheduler health uses the configured Discord polling interval', () => {
+  const root = fixture({ enabled: true, intervalMin: 60 });
+  const result = run(root, `
+    const discord = require(${JSON.stringify(discordModule)});
+    const scheduler = discord.startScheduler();
+    clearInterval(scheduler.interval);
+    clearTimeout(scheduler.first);
+    const row = require(${JSON.stringify(path.join(__dirname, 'health.js'))}).snapshot()
+      .schedulers.find((entry) => entry.name === 'discord');
+    process.stdout.write(JSON.stringify({ cadenceMs: row.cadenceMs, state: row.state, detail: row.detail }));
+  `);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    cadenceMs: 60 * 60e3,
+    state: 'skipped',
+    detail: 'waiting for first poll',
+  });
+});

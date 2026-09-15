@@ -274,11 +274,12 @@ function dashboardState() {
 
 function startScheduler(options = {}) {
   const cfg = config();
+  const cadenceMs = cfg.intervalMin * 60e3;
   if (!cfg.enabled) {
-    health.record('discord', { disabled: true, detail: 'not enabled' });
+    health.record('discord', { disabled: true, detail: 'not enabled', cadenceMs });
     return null;
   }
-  health.record('discord', { skipped: true, detail: 'waiting for first poll' });
+  health.record('discord', { skipped: true, detail: 'waiting for first poll', cadenceMs });
   let running = false;
   const tick = async () => {
     if (running) return;
@@ -286,15 +287,17 @@ function startScheduler(options = {}) {
     try {
       const decisions = await poll();
       const current = status();
-      if (current.skipped) health.record('discord', { skipped: true, detail: current.detail || 'browser reader unavailable' });
-      else health.record('discord', { ok: true, detail: `${decisions.length} messages` });
+      if (current.skipped) health.record('discord', {
+        skipped: true, detail: current.detail || 'browser reader unavailable', cadenceMs,
+      });
+      else health.record('discord', { ok: true, detail: `${decisions.length} messages`, cadenceMs });
       if (options.onChange) options.onChange();
     } catch (error) {
-      health.record('discord', { ok: false, error });
+      health.record('discord', { ok: false, error, cadenceMs });
       process.stderr.write(`keep discord: ${error.message}\n`);
     } finally { running = false; }
   };
-  const interval = setInterval(() => { void tick(); }, cfg.intervalMin * 60e3);
+  const interval = setInterval(() => { void tick(); }, cadenceMs);
   interval.unref();
   const first = setTimeout(() => { void tick(); }, 2 * 60e3);
   first.unref();

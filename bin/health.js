@@ -102,18 +102,28 @@ function record(name, options = {}) {
     return store.daemon;
   }
 
+  const cadence = CADENCES[name] || {};
+  const prior = store[name] && typeof store[name] === 'object' ? store[name] : {};
   if (options.disabled === true) {
-    const entry = { ...(store[name] || {}), disabled: true, detail: clipError(options.detail || 'not configured') };
+    const entry = {
+      ...prior,
+      disabled: true,
+      cadenceMs: Number(options.cadenceMs || cadence.cadenceMs || prior.cadenceMs || 0),
+      detail: clipError(options.detail || 'not configured'),
+    };
     store[name] = entry;
     persist(store);
     return entry;
   }
-  const cadence = CADENCES[name] || {};
-  const prior = store[name] && typeof store[name] === 'object' ? store[name] : {};
   const ok = options.ok !== false;
   const skipped = options.skipped === true || (ok && options.detail === 'nothing due');
   if (skipped) {
-    const entry = { ...prior, disabled: false, lastRunAt: at };
+    const entry = {
+      ...prior,
+      disabled: false,
+      lastRunAt: at,
+      cadenceMs: Number(options.cadenceMs || cadence.cadenceMs || prior.cadenceMs || 0),
+    };
     if (options.detail == null || options.detail === '') delete entry.detail;
     else entry.detail = clipError(options.detail);
     store[name] = entry;
