@@ -88,16 +88,30 @@ const HOOK_EVENTS = {
 };
 const HOOK_ACTIONS = Object.values(HOOK_EVENTS).map(([action]) => action);
 
+// A Keep hook command for this action, whatever path or KEEP_CONFIG it names.
+// The command embeds the configuration path, so a moved registry would otherwise
+// leave the old spelling in place and fire both.
+function keepHookRe(action) {
+  return new RegExp(`(?:^|[\\s/])keep['"]?\\s+hook\\s+${action}(?![\\w-])`);
+}
+
 function mergeHooks(settings, command) {
   const next = structuredClone(settings);
   next.hooks ||= {};
-  const events = HOOK_EVENTS;
-  for (const [event, [action, matcher]] of Object.entries(events)) {
+  for (const [event, [action, matcher]] of Object.entries(HOOK_EVENTS)) {
     const entries = next.hooks[event] ||= [];
     const hookCommand = `${command} hook ${action}`;
-    if (!entries.some((entry) => (entry.hooks || []).some((hook) => hook.command === hookCommand))) {
-      entries.push({ matcher, hooks: [{ type: 'command', command: hookCommand }] });
+    const stale = keepHookRe(action);
+    let found = false;
+    for (const entry of entries) {
+      for (const hook of (entry && entry.hooks) || []) {
+        if (hook.command === hookCommand) { found = true; continue; }
+        // A Keep hook for the same action under a different spelling is updated
+        // in place, never left beside the new one.
+        if (stale.test(String(hook.command || ''))) { hook.command = hookCommand; found = true; }
+      }
     }
+    if (!found) entries.push({ matcher, hooks: [{ type: 'command', command: hookCommand }] });
   }
   return next;
 }
@@ -114,16 +128,23 @@ function missingHooks(settingsFile) {
 // Every Claude settings.json the hooks belong in: the default config directory
 // first, then each managed Claude account that keeps its own. Codex accounts have
 // their own adapter commands and are never touched here.
+function resolveDir(value) {
+  try { return canonicalPath(value); } catch { return path.resolve(value); }
+}
+
 function hookTargets(env = process.env) {
   const home = path.join(os.homedir(), '.claude');
-  const resolve = (value) => { try { return canonicalPath(value); } catch { return path.resolve(value); } };
-  const seen = new Set([resolve(home)]);
+  const homeKey = resolveDir(home);
+  const seen = new Set([homeKey]);
   const targets = [{ id: 'claude/default', dir: home, file: path.join(home, 'settings.json') }];
   let accounts = [];
   try { accounts = require('./accounts').list(env); } catch { accounts = []; }
   for (const account of accounts) {
     if (account.agent !== 'claude') continue;
-    const dir = resolve(account.configDir);
+    const dir = resolveDir(account.configDir);
+    // An account that keeps its state in the default directory is that target
+    // under its own name, not a second one.
+    if (dir === homeKey) { targets[0] = { ...targets[0], id: account.id }; continue; }
     if (seen.has(dir)) continue;
     seen.add(dir);
     targets.push({ id: account.id, dir: account.configDir, file: path.join(account.configDir, 'settings.json') });
@@ -131,16 +152,57 @@ function hookTargets(env = process.env) {
   return targets;
 }
 
-// Merges the hooks into one settings file, leaving an untouched file byte-for-byte
-// alone: a managed account whose settings.json is a symlink to the source already
-// has whatever the source has.
-function writeHooks(file, command) {
-  const existing = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
-  const next = JSON.stringify(mergeHooks(existing ? JSON.parse(existing) : {}, command), null, 2) + '\n';
-  if (existing === next) return false;
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  if (existing !== null) fs.copyFileSync(file, `${file}.keep-backup-${Date.now()}`, fs.constants.COPYFILE_EXCL);
-  fs.writeFileSync(file, next, { mode: 0o600 });
+// The target `--account <id>` names, or null. `claude/default` always means the
+// default configuration directory, whatever the account list calls it.
+function hookTarget(id, targets, env = process.env) {
+  const direct = targets.find((entry) => entry.id === id);
+  if (direct) return direct;
+  if (id === 'claude/default') return targets[0];
+  let account = null;
+  try { account = require('./accounts').get(id, env); } catch {}
+  if (account && account.agent === 'claude' && resolveDir(account.configDir) === resolveDir(targets[0].dir)) {
+    return { ...targets[0], id };
+  }
+  return null;
+}
+
+// What one settings file would become. Parsing every target before writing any of
+// them is the point: one unreadable account settings file must not leave the rest
+// half-installed.
+function hookPlan(target, command) {
+  const existing = fs.existsSync(target.file) ? fs.readFileSync(target.file, 'utf8') : null;
+  let value = {};
+  if (existing !== null && existing.trim()) {
+    try { value = JSON.parse(existing); }
+    catch (error) { throw new Error(`${target.id}: unreadable settings at ${target.file} (${error.message})`); }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error(`${target.id}: settings at ${target.file} are not a JSON object`);
+    }
+  }
+  return { ...target, existing, next: JSON.stringify(mergeHooks(value, command), null, 2) + '\n' };
+}
+
+function hookPlans(targets, command) {
+  const plans = [];
+  const failures = [];
+  for (const target of targets) {
+    try { plans.push(hookPlan(target, command)); }
+    catch (error) { failures.push(error.message); }
+  }
+  if (failures.length) throw new Error(`keep setup hooks changed nothing:\n  ${failures.join('\n  ')}`);
+  return plans;
+}
+
+// Applies one plan, leaving an already-correct file byte-for-byte alone: a managed
+// account whose settings.json is a symlink to the source already has whatever the
+// source has.
+function writeHooks(plan) {
+  if (plan.existing === plan.next) return false;
+  fs.mkdirSync(path.dirname(plan.file), { recursive: true });
+  if (plan.existing !== null) {
+    fs.copyFileSync(plan.file, `${plan.file}.keep-backup-${Date.now()}`, fs.constants.COPYFILE_EXCL);
+  }
+  fs.writeFileSync(plan.file, plan.next, { mode: 0o600 });
   return true;
 }
 
@@ -149,15 +211,17 @@ function installHooks(args = []) {
   const command = `KEEP_CONFIG=${quote(config.configFile())} ${quote(path.join(SOURCE, 'bin', 'keep'))}`;
   const targets = hookTargets();
   if (opts.account) {
-    const target = targets.find((entry) => entry.id === opts.account);
+    const target = hookTarget(opts.account, targets);
     if (!target) throw new Error(`no managed Claude account named ${opts.account}`);
-    const changed = writeHooks(target.file, command);
-    console.log(`${changed ? 'Installed' : 'Already installed'}: Keep hooks for ${target.id} (${target.file})`);
+    const [plan] = hookPlans([target], command);
+    console.log(`${writeHooks(plan) ? 'Installed' : 'Already installed'}: Keep hooks for ${target.id} (${target.file})`);
     return;
   }
-  const settingsFile = targets[0].file;
-  const existing = fs.existsSync(settingsFile) ? fs.readFileSync(settingsFile, 'utf8') : null;
-  const next = mergeHooks(existing ? JSON.parse(existing) : {}, command);
+  // Preflight every account's settings before writing to any of them, so an
+  // unreadable one stops the run instead of leaving the fan-out half done.
+  const [defaultPlan, ...accountPlans] = hookPlans(targets, command);
+  const settingsFile = defaultPlan.file;
+  const existing = defaultPlan.existing;
   // Preflight every destination before changing any settings or skill links.
   const links = [];
   for (const agentDir of ['.claude', '.agents']) for (const skill of ['keep', 'fleet-review']) {
@@ -170,7 +234,7 @@ function installHooks(args = []) {
     if (fs.lstatSync(dest, { throwIfNoEntry: false })) throw new Error(`existing skill link: ${dest}`);
     links.push({ dest, source });
   }
-  const newText = JSON.stringify(next, null, 2) + '\n';
+  const newText = defaultPlan.next;
   fs.mkdirSync(path.dirname(settingsFile), { recursive: true });
   if (existing !== null && existing !== newText) fs.copyFileSync(settingsFile, `${settingsFile}.keep-backup-${Date.now()}`, fs.constants.COPYFILE_EXCL);
   for (const { dest, source } of links) { fs.mkdirSync(path.dirname(dest), { recursive: true }); fs.symlinkSync(source, dest); }
@@ -178,9 +242,8 @@ function installHooks(args = []) {
   console.log('Installed Claude hooks and shared Claude/Codex skills. Restart agent sessions to load them.');
   // A managed automation account without the hooks has no restart guard and no
   // raw-resume guard, and nothing else installs them there.
-  for (const target of targets.slice(1)) {
-    const changed = writeHooks(target.file, command);
-    console.log(`${changed ? 'Installed' : 'Already installed'}: Keep hooks for ${target.id} (${target.file})`);
+  for (const plan of accountPlans) {
+    console.log(`${writeHooks(plan) ? 'Installed' : 'Already installed'}: Keep hooks for ${plan.id} (${plan.file})`);
   }
   console.log('Codex event hooks are version-dependent; see docs/agent-hooks.md for the adapter commands.');
 }
@@ -328,6 +391,6 @@ function doctor(root) {
 
 module.exports = {
   init, installHooks, service, doctor, mergeHooks, servicePlist, quote, canonicalPath, insideSource,
-  HOOK_ACTIONS, missingHooks, hookTargets,
+  HOOK_ACTIONS, missingHooks, hookTargets, hookTarget,
   shell, shellBlock, applyShellBlock, SHELL_START, SHELL_END,
 };

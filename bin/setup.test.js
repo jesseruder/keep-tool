@@ -225,7 +225,7 @@ test('keep setup --shell prints the guard, --write is idempotent, and a non-resu
 
 // A managed automation account without the Keep hooks has no restart guard and no
 // raw-resume guard, and nothing but `keep setup hooks` installs them there.
-function hooksFixture() {
+function hooksFixture({ defaultId = 'claude/default' } = {}) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-setup-hooks-'));
   const home = path.join(base, 'home');
   const automation = path.join(home, '.claude-automation');
@@ -236,12 +236,12 @@ function hooksFixture() {
     version: 1,
     dataDir: path.join(base, 'registry'),
     accounts: [
-      { id: 'claude/default', label: 'Claude (default)', agent: 'claude', configDir: path.join(home, '.claude'), useDefaultConfig: true },
+      { id: defaultId, label: 'Claude (default)', agent: 'claude', configDir: path.join(home, '.claude'), useDefaultConfig: true },
       { id: 'automation', label: 'Automation', agent: 'claude', configDir: automation },
       { id: 'codex/default', label: 'Codex (default)', agent: 'codex', configDir: path.join(home, '.codex') },
       { id: 'codex-alt', label: 'Codex alt', agent: 'codex', configDir: codex },
     ],
-    defaultAccounts: { claude: 'claude/default', codex: 'codex/default' },
+    defaultAccounts: { claude: defaultId, codex: 'codex/default' },
   }, null, 2) + '\n');
   const prior = { HOME: process.env.HOME, KEEP_CONFIG: process.env.KEEP_CONFIG, KEEP_DIR: process.env.KEEP_DIR };
   process.env.HOME = home;
@@ -296,4 +296,68 @@ test('keep setup hooks --account installs into that account alone', () => {
     assert.equal(fs.existsSync(path.join(f.home, '.claude', 'skills')), false);
     assert.throws(() => setup.installHooks(['--account', 'codex-alt']), /no managed Claude account/);
   } finally { f.cleanup(); }
+});
+
+test('one unreadable account settings file stops the fan-out before anything is written', () => {
+  const f = hooksFixture();
+  try {
+    fs.writeFileSync(f.accountSettings, '{ not json');
+    assert.throws(() => setup.installHooks(), (error) => {
+      assert.match(error.message, /changed nothing/);
+      assert.match(error.message, /automation: unreadable settings/);
+      assert.ok(error.message.includes(f.accountSettings), 'the failure names the file');
+      return true;
+    });
+    assert.equal(fs.existsSync(f.defaultSettings), false, 'the default account is left alone too');
+    assert.equal(fs.readFileSync(f.accountSettings, 'utf8'), '{ not json');
+    assert.equal(fs.existsSync(path.join(f.home, '.claude', 'skills')), false);
+
+    // A settings file that parses to something other than an object is named too.
+    fs.writeFileSync(f.accountSettings, '["hooks"]');
+    assert.throws(() => setup.installHooks(), /automation: settings .* are not a JSON object/);
+
+    fs.rmSync(f.accountSettings);
+    setup.installHooks();
+    assert.deepEqual(setup.missingHooks(f.defaultSettings), []);
+    assert.deepEqual(setup.missingHooks(f.accountSettings), []);
+  } finally { f.cleanup(); }
+});
+
+test('an account that keeps its state in the default directory is addressable by its own id', () => {
+  const f = hooksFixture({ defaultId: 'primary' });
+  try {
+    assert.deepEqual(setup.hookTargets().map((target) => target.id), ['primary', 'automation']);
+    assert.equal(setup.hookTarget('primary', setup.hookTargets()).file, f.defaultSettings);
+    // The built-in spelling still reaches it.
+    assert.equal(setup.hookTarget('claude/default', setup.hookTargets()).file, f.defaultSettings);
+    setup.installHooks(['--account', 'primary']);
+    assert.deepEqual(setup.missingHooks(f.defaultSettings), []);
+    assert.equal(fs.existsSync(f.accountSettings), false, '--account touches nothing else');
+  } finally { f.cleanup(); }
+});
+
+test('a Keep hook command from a moved checkout is rewritten, not duplicated', () => {
+  const stale = {
+    hooks: {
+      PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: "KEEP_CONFIG='/old/config.json' '/old/keep-tool/bin/keep' hook pre-bash" }] }],
+      SessionStart: [{ matcher: '', hooks: [
+        { type: 'command', command: 'other-tool hook session-start' },
+        { type: 'command', command: '/old/keep-tool/bin/keep hook session-start' },
+      ] }],
+    },
+  };
+  const command = "KEEP_CONFIG='/new/config.json' '/new/keep-tool/bin/keep'";
+  const next = setup.mergeHooks(stale, command);
+  assert.deepEqual(next.hooks.PreToolUse[0].hooks.map((hook) => hook.command), [`${command} hook pre-bash`]);
+  assert.equal(next.hooks.PreToolUse.length, 1, 'no second entry for the same action');
+  assert.deepEqual(next.hooks.SessionStart[0].hooks.map((hook) => hook.command), [
+    'other-tool hook session-start', `${command} hook session-start`,
+  ], 'another tool with the same shape is left alone');
+  assert.equal(next.hooks.SessionStart.length, 1);
+  for (const action of setup.HOOK_ACTIONS) {
+    const commands = Object.values(next.hooks).flatMap((entries) => entries.flatMap((entry) => entry.hooks.map((hook) => hook.command)));
+    assert.equal(commands.filter((value) => value === `${command} hook ${action}`).length, 1, action);
+    assert.equal(commands.filter((value) => / hook /.test(value) && value.includes('/old/')).length, 0);
+  }
+  assert.deepEqual(setup.mergeHooks(next, command), next, 'still idempotent');
 });
