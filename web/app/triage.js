@@ -387,7 +387,10 @@ function renderStage(ctx, active, focusItem, running, pinned) {
   const portable = item.sessionId && !session?.reviewer ? portableTransferControls(ctx, item.sessionId) : '';
   const handoff = (closable || pendingHandoff) && !session?.reviewer ? handoffControls(ctx, item.sessionId, item.pane) : '';
   const restart = closable && !pendingHandoff && !session?.reviewer ? restartControls(ctx, item.sessionId) : '';
-  const relay = item.sessionId ? relayControlsHTML(ctx, item.sessionId) : '';
+  // The reviewer is not a working session: relaying into or out of it would put
+  // the fleet reviewer's own words in a card's session, which is what
+  // `keep nudge` exists for.
+  const relay = item.sessionId && !session?.reviewer ? relayControlsHTML(ctx, item.sessionId) : '';
   const markedRunning = Boolean(item.sessionId) && ctx.isMarkedRunning(item);
   const markRunning = !item.sessionId ? ''
     : markedRunning ? '<button class="btn" data-unmark-running title="Put this session back in Waiting on you">Unmark running</button>'

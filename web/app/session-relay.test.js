@@ -20,7 +20,8 @@ function ctxFor(sessions = [], panes = []) {
 const SOURCE = { id: 'source-session-id', kind: 'claude', pane: 'pane-a', title: 'The finder', lastAssistant: 'The retry path double-sends on a 502.' };
 const TARGET = { id: 'target-session-id', kind: 'codex', pane: 'pane-b', title: 'The fixer', taskId: 'retry-card' };
 const DEAD = { id: 'dead-session-id', kind: 'claude', pane: 'pane-c', title: 'Exited' };
-const PANES = [{ id: 'pane-a', alive: true }, { id: 'pane-b', alive: true }, { id: 'pane-c', alive: false }];
+const REVIEWER = { id: 'reviewer-session-id', kind: 'claude', pane: 'pane-d', title: 'Fleet reviewer', reviewer: true };
+const PANES = [{ id: 'pane-a', alive: true }, { id: 'pane-b', alive: true }, { id: 'pane-c', alive: false }, { id: 'pane-d', alive: true }];
 
 test('the relay text is the prefix, one space, and the trimmed message', async () => {
   const { relayText, relayPrefix } = await import('./session-relay.js');
@@ -31,9 +32,11 @@ test('the relay text is the prefix, one space, and the trimmed message', async (
   assert.equal(relayText('', '', ''), '[keep relay from session] ');
 });
 
-test('the target picker lists live sessions only, and never the source', async () => {
+test('the target picker lists live sessions only, never the source, never the reviewer', async () => {
   const { relayTargets } = await import('./session-relay.js');
-  const targets = relayTargets(ctxFor([SOURCE, TARGET, DEAD], PANES), SOURCE.id);
+  const targets = relayTargets(ctxFor([SOURCE, TARGET, DEAD, REVIEWER], PANES), SOURCE.id);
+  // The fleet reviewer is not a working session: putting its words into a card's
+  // session is what keep nudge is for.
   assert.deepEqual(targets.map((target) => target.id), [TARGET.id]);
   assert.equal(targets[0].agent, 'codex');
   assert.equal(targets[0].card, 'retry-card');

@@ -35,7 +35,7 @@ export function relayWarning(text) {
 export function relayTargets(ctx, sourceSessionId) {
   const panes = ctx.paneMap();
   return (ctx.data.sessions || [])
-    .filter((session) => session.id && session.id !== sourceSessionId)
+    .filter((session) => session.id && session.id !== sourceSessionId && !session.reviewer)
     .filter((session) => Boolean(session.pane && panes.get(session.pane)?.alive))
     .map((session) => ({
       id: session.id,
@@ -86,12 +86,25 @@ function renderDialog(ctx, state) {
   modal.innerHTML = relayDialogHTML(ctx, state);
   modal.querySelector('[data-relay-target]')?.addEventListener('change', (event) => { state.targetId = event.target.value; });
   const field = modal.querySelector('[data-relay-text]');
+  // Only the preview and the Send state are updated as the text changes. Rerendering
+  // the whole form on every keystroke tears out the textarea mid-composition, which
+  // loses an IME's in-flight characters and the caret with them.
   field?.addEventListener('input', (event) => {
     state.text = event.target.value;
-    const selection = { start: event.target.selectionStart, end: event.target.selectionEnd };
-    renderDialog(ctx, state);
-    const next = ensureDialog().querySelector('[data-relay-text]');
-    if (next) { next.focus(); try { next.setSelectionRange(selection.start, selection.end); } catch {} }
+    const preview = relayText(state.sourceAgent, state.sourceSessionId, state.text);
+    const pre = modal.querySelector('.relay-preview pre');
+    if (pre) pre.textContent = preview;
+    const warning = relayWarning(preview);
+    let note = modal.querySelector('.relay-note');
+    if (warning && !note) {
+      note = document.createElement('p');
+      note.className = 'relay-note';
+      note.setAttribute('role', 'note');
+      modal.querySelector('.relay-preview')?.append(note);
+    }
+    if (note) { note.textContent = warning; note.hidden = !warning; }
+    const send = modal.querySelector('[data-relay-send]');
+    if (send) send.disabled = !(state.targets || []).length || !String(state.text || '').trim();
   });
   modal.querySelector('[data-relay-cancel]')?.addEventListener('click', () => modal.close());
   modal.querySelector('[data-relay-send]')?.addEventListener('click', async (event) => {
