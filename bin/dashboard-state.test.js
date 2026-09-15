@@ -22,6 +22,20 @@ test('already-open consoles use compact state while legacy and CLI clients retai
   assert.equal(wantsCompactState({ headers: { referer: 'http://localhost/app' } }, new URL(url + '?compact=0')), false);
 });
 
+test('a card-usage run stamp does not change a card detail version', () => {
+  const usage = (updatedAt, calls = 3) => ({ since: 1, updatedAt, pending: false, issues: {}, input: 10, cacheRead: 0, cacheWrite: 0, output: 5, calls, models: {} });
+  const card = (modelUsage) => ({ id: 'card', fm: { title: 'Card' }, body: 'notes', lastLog: 'latest', modelUsage });
+  const first = lightweightState({ tasks: [card(usage(1000))] }).tasks[0]._detailVersion;
+  const restamped = lightweightState({ tasks: [card(usage(31000))] }).tasks[0]._detailVersion;
+  assert.equal(restamped, first, 'only the collector run time changed');
+  assert.notEqual(lightweightState({ tasks: [card(usage(31000, 4))] }).tasks[0]._detailVersion, first, 'new usage is a new version');
+  const state = { tasks: [card(usage(61000))] };
+  assert.equal(dashboardDetail(state, 'task', 'card').version, lightweightState(state).tasks[0]._detailVersion,
+    'the detail route reports the version the list advertised');
+  assert.equal(lightweightState({ tasks: [card(null)] }).tasks[0]._detailVersion,
+    dashboardDetail({ tasks: [card(null)] }, 'task', 'card').version);
+});
+
 test('console state removes unused histories while preserving inbox notes and safety flags', () => {
   const state = {
     tasks: [{ id: 'inbox', body: 'notes', fm: { title: 'Card' } }, { id: 'other', body: 'long history', lastLog: 'latest' }],

@@ -16,6 +16,15 @@ function sessionDetailVersion(session) {
   return detailVersion({ lastAssistantFull: session.lastAssistantFull || '' });
 }
 
+function taskDetailVersion(task) {
+  // The card-usage collector stamps its run time on every card's modelUsage. Hashing
+  // it gave all cards a new version each run, so consoles refetched unchanged cards
+  // (and an open card could fail with "Details changed while loading").
+  if (!task?.modelUsage || !Object.hasOwn(task.modelUsage, 'updatedAt')) return detailVersion(task);
+  const { updatedAt: _updatedAt, ...modelUsage } = task.modelUsage;
+  return detailVersion({ ...task, modelUsage });
+}
+
 function clipped(value, limit = SUMMARY_TEXT_LIMIT) {
   const text = String(value || '');
   return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
@@ -35,7 +44,7 @@ function taskSummary(task) {
     lastLog: clipped(task.lastLog),
     createdAt: taskCreatedAt(task),
     hasCheck: Boolean(check),
-    _detailVersion: detailVersion(task),
+    _detailVersion: taskDetailVersion(task),
   };
 }
 
@@ -175,7 +184,8 @@ function dashboardDetail(state, kind, id) {
   const rows = kind === 'task' ? state.tasks : kind === 'session' ? state.sessions : state.reviewQueue?.items;
   const value = (rows || []).find((row) => row.id === id);
   if (!value) throw detailError(404, `${kind} detail not found: ${id}`);
-  return { kind, id, version: kind === 'session' ? sessionDetailVersion(value) : detailVersion(value), value };
+  return { kind, id, version: kind === 'session' ? sessionDetailVersion(value)
+    : kind === 'task' ? taskDetailVersion(value) : detailVersion(value), value };
 }
 
 function reviewQueueSearch(state, query) {
