@@ -3406,7 +3406,7 @@ async function restartSession(body, deps = {}) {
     const result = await host('replace-exited', { paneId: pane.id, expectedPid: pane.pid, sessionId: stopped.meta?.sessionId,
       cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`], cwd,
       env: require('./agent-launcher').launcherEnv({ ...repairEnvFor({ sessionId: session.id }, deps), ...reviewerSpec.env }),
-      cols: pane.cols, rows: pane.rows, meta: { ...pane.meta, agent: session.kind, sessionId: session.id,
+      cols: pane.cols, rows: pane.rows, meta: { ...adoptedPaneMeta(pane.meta), agent: session.kind, sessionId: session.id,
         accountId: account.id, accountLabel: account.label, restartedAt: Date.now() } });
     await (deps.waitForHostAgent || waitForHostAgent)({ pane: pane.id }, session.kind, deps);
     return { ok: true, sessionId: session.id, pane: result.pane.id, pid: result.pane.pid,
@@ -3489,7 +3489,7 @@ async function forceRestartSession(entry, save, deps = {}) {
         const result = await host('replace-exited', { paneId: job.pane, expectedPid, sessionId: stopped.meta?.sessionId,
           cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`], cwd: original.cwd,
           env: require('./agent-launcher').launcherEnv({ ...repairEnvFor({ sessionId: job.sessionId }, deps), ...reviewerSpec.env }),
-          cols: original.cols, rows: original.rows, meta: { ...original.meta, accountId: account.id, accountLabel: account.label,
+          cols: original.cols, rows: original.rows, meta: { ...adoptedPaneMeta(original.meta), accountId: account.id, accountLabel: account.label,
             forceRestartToken: job.token, restartedAt: Date.now() } });
         return { ok: true, pane: result.pane.id, pid: result.pane.pid, sessionId: job.sessionId };
       },
@@ -3540,11 +3540,15 @@ async function closeIdleSession(body, deps = {}) {
       const task = current.tasks.find((t) => t.id === owner?.taskId);
       const fm = task?.fm || task || {};
       // A restart or account transfer resumes the same session, so an open need or
-      // dependency on its card is no reason to keep the old process alive.
-      if ((!deps.closePolicy?.manual && fm.check_after) || (!deps.closePolicy?.restart && (fm.needs?.length || fm.depends_on?.length))) throw new InjectionError(409, 'Task has a scheduled check, need, or dependency; leave the session open');
-      // Explicit Close retires the process, not its durable scheduled recipes.
-      // The scheduler falls back to a headless run when the owner is closed.
-      if (!deps.closePolicy?.manual && current.tasks.some((t) => { const f = t.fm || t; return f.check_after && (f.scheduled_by === session.id || f.sessions?.some((s) => s.id === session.id)); })) throw new InjectionError(409, 'Session owns a scheduled check on another card');
+      // dependency on its card is no reason to keep the old process alive. So is an
+      // ephemeral check pane: Keep opened it for one recipe, and a `check_after` on
+      // that card is the schedule this very session just re-armed — holding the
+      // process open for it would mean a recurring card's pane is never closed.
+      const ownsItsSchedule = deps.closePolicy?.manual || deps.closePolicy?.ephemeral;
+      if ((!ownsItsSchedule && fm.check_after) || (!deps.closePolicy?.restart && !deps.closePolicy?.ephemeral && (fm.needs?.length || fm.depends_on?.length))) throw new InjectionError(409, 'Task has a scheduled check, need, or dependency; leave the session open');
+      // Explicit Close retires the process, not its durable scheduled recipes. The
+      // scheduler opens a fresh session for the check when its owner is closed.
+      if (!ownsItsSchedule && current.tasks.some((t) => { const f = t.fm || t; return f.check_after && (f.scheduled_by === session.id || f.sessions?.some((s) => s.id === session.id)); })) throw new InjectionError(409, 'Session owns a scheduled check on another card');
       if (require('./delivery').pendingForSession(path.join(deps.root || keep.ROOT, '.keep', 'delivery'), session.id)) throw new InjectionError(409, 'Session has an unconfirmed delivery');
     };
     checkTaskSafety(state);
@@ -4511,6 +4515,17 @@ function shellQuoteArg(value) {
 }
 
 const freshOpenOperations = new Map();
+
+// Pane metadata carried over when a pane is replaced — an in-place restart, a force
+// restart, an account handoff. `ephemeral` is dropped on purpose: it marks a pane the
+// check scheduler opened and may close on its own, and the moment Owner restarts it or
+// moves it to another account it is an ordinary session that nobody may reap. The
+// original `launchedAt` rides along because the open-request dedupe reads it; with
+// `ephemeral` gone the reaper never looks at it.
+function adoptedPaneMeta(meta) {
+  const { ephemeral, ...rest } = meta || {};
+  return rest;
+}
 
 // Pane metadata openSession resolves for itself. `repair` and the transfer ids are the
 // sharp ones: the self-repair scheduler adopts a pane by `meta.repair`, so an
@@ -6643,7 +6658,7 @@ async function resumeExitedAccountHandoff(entry, account, mcpConfig, deps = {}) 
     cmd: '/bin/zsh', args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`], cwd,
     env: require('./agent-launcher').launcherEnv({ ...repairEnvFor({ sessionId: entry.sessionId }, deps), ...reviewerSpec.env }),
     cols: entry.cols, rows: entry.rows,
-    meta: { ...pane.meta, agent, sessionId: entry.sessionId, accountId: account.id, accountLabel: account.label,
+    meta: { ...adoptedPaneMeta(pane.meta), agent, sessionId: entry.sessionId, accountId: account.id, accountLabel: account.label,
       handoffTransactionId: entry.id, restartedAt: Date.now() },
   });
   const launched = { ok: true, pane: result.pane.id, pid: result.pane.pid,
@@ -7172,7 +7187,12 @@ async function runCheckNow(taskId, deps = {}) {
   if (delivery && !delivery.deferred && delivery.sessionId) {
     return { ok: true, delivered: 'thread', sessionId: delivery.sessionId, kind: delivery.kind || 'claude' };
   }
-  const { opened } = await runs.openFreshCheckSession(task, { open: deps.open || openCheckSession });
+  // `enforce: false`: Owner asked for this check now, so it is neither refused by the
+  // scheduler's one-open-per-card-per-day allowance nor counted against it. It still
+  // writes the same TTL'd delivery stamp, so the tick a minute later does not put a
+  // second agent on the card, and runs.js's per-card in-flight guard covers two
+  // verifies racing each other.
+  const { opened } = await runs.openFreshCheckSession(task, { enforce: false, open: deps.open || openCheckSession });
   return { ok: true, delivered: 'session', sessionId: (opened && opened.sessionId) || null,
     pane: (opened && opened.pane) || null, kind: 'claude' };
 }
@@ -7658,17 +7678,37 @@ function start(deps = {}) {
   runs.setEphemeralHost({
     listPanes: () => listHostPanes({}, true),
     sessions: () => scanSessions(),
-    // Exactly the console Close button's path (/api/close-session): try /exit, then
-    // SIGTERM, then SIGKILL, each behind manual-close's identity and activity guards.
+    // The automatic-retirement path, not the Close button's. Nobody asked for this
+    // close, so a refusal from closeIdleSession — an unsent draft, a modal prompt, a
+    // pending question, unverified background work, a session that changed under the
+    // sweep — is final: `requireGraceful` re-throws it and the pane is left alone for
+    // the next tick rather than being signalled anyway. The signals that do follow a
+    // successful /exit are guarded by pid, session, and input/output counts, so a pane
+    // that came back to life between the steps is never killed.
     closePane: async (pane, sessionId) => {
-      const result = await require('./manual-close').manualClose({ pane: pane.id, sessionId }, {
-        getPane: async (id) => (await hostRequest('get', { pane: id })).pane,
-        graceful: (request) => closeIdleSession(request, { closePolicy: { manual: true } }),
-        signal: (id, signal) => hostRequest('kill', { pane: id, signal }),
-      });
+      const hostCapabilities = await hostRequest('hello');
+      const result = await withInjectionLock(() => require('./manual-close').manualClose(
+        { pane: pane.id, sessionId }, {
+          requireGraceful: true,
+          requireSignalGuard: true,
+          signalGuarded: hostCapabilities.guardedKill === true,
+          protectInput: true,
+          protectOutput: true,
+          getPane: async (id) => (await hostRequest('get', { pane: id })).pane,
+          // `ephemeral` says only that Keep opened this pane for one recipe, so the
+          // card's own schedule does not pin it. Every state guard still applies.
+          graceful: (request) => closeIdleSession(request, {
+            closePolicy: { ephemeral: true, idleMs: 0 },
+            withInjectionLock: (fn) => fn(),
+          }),
+          signal: (id, signal, guard) => hostRequest('guarded-kill', { pane: id, signal, ...guard }),
+        }), { pane: pane.id, session: sessionId });
       broadcast();
       return result;
     },
+    // A closed pane still sits in the host's list. Forget it, or the sweep re-decides
+    // about a dead pane on every tick and the `runs` health row never reports idle.
+    removePane: (pane) => hostRequest('remove', { pane: pane.id }),
   });
   summarize.setOnChange(broadcast);
   require('./session-summary').startScheduler({
@@ -8787,7 +8827,7 @@ module.exports = {
   agentProcessRows, liveSessionPids, liveSessionTick, restorePlan,
   annotatePaneAgents,
   readPaneRecord, sessionProjectFromTranscript, openSession, reopenSessionOnAccount,
-  runCheckNow, runTaskNow, taskRunMessage,
+  runCheckNow, runTaskNow, taskRunMessage, adoptedPaneMeta,
   inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, continueAccountHandoff, handoffSession,
   abandonAccountHandoff,
   listPortableTransfers, inspectPortableSource, portableTerminalRateLimitEvidence,

@@ -4620,11 +4620,30 @@ test('a check run goes to the card thread if one is open, and otherwise opens a 
     assert.equal(opens[0].taskId, 'some-card');
     assert.equal(opens[0].fresh, true);
     assert.match(opens[0].message, /confirm the recorder is green/);
-    require('./runs.js')._resetSchedulerState(); // the per-day cap is module state
   }
+  // Owner asking for a check now is never refused by the scheduler's daily allowance,
+  // and never spends it: three verifies in a row all open, and the state file is clean.
+  assert.equal(require('./runs.js').loadSchedulerState().opened.size, 0);
+  require('./runs.js')._resetSchedulerState();
 
   await assert.rejects(runCheckNow('some-card', { loadTask: () => ({ id: 'some-card', fm: {} }) }),
     /has no check recipe/);
+});
+
+test('a restarted or handed-off pane stops being the check scheduler\'s to reap', () => {
+  const { adoptedPaneMeta } = require('./serve.js');
+  const opened = { ephemeral: 'check', card: 'some-card', sessionId: 'sid', agent: 'claude',
+    accountId: 'checks', launchedAt: 1_000_000, project: '/tmp/project' };
+  const adopted = adoptedPaneMeta(opened);
+  // Owner restarting the pane, or moving it to another account, makes it an ordinary
+  // session. Carrying `ephemeral` across would let the sweep close a pane Owner is using.
+  assert.equal('ephemeral' in adopted, false);
+  assert.equal(adopted.card, 'some-card', 'everything else rides along unchanged');
+  assert.equal(adopted.sessionId, 'sid');
+  assert.equal(adopted.launchedAt, 1_000_000, 'the open-request dedupe still reads this');
+  assert.equal('ephemeral' in opened, true, 'the original is not mutated');
+  assert.deepEqual(adoptedPaneMeta(undefined), {});
+  assert.deepEqual(adoptedPaneMeta({ agent: 'codex' }), { agent: 'codex' });
 });
 
 test('a task run opens a session pointed at the card, not a copy of it', async () => {
