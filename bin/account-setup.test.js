@@ -298,6 +298,7 @@ test('an unrecorded file from before Keep recorded its writes upgrades only as a
       JSON.stringify({ mcpServers: { global: { command: 'hand-edited' } } }, null, 2) + '\n',
       JSON.stringify({ mcpServers: { custom: { command: 'custom' } } }, null, 2) + '\n',
       JSON.stringify(JSON.parse(original)) + '\n',
+      JSON.stringify({ mcpServers: {} }, null, 2) + '\n',
     ]) {
       fs.writeFileSync(generated, edit);
       fs.rmSync(generated + '.sha256', { force: true });

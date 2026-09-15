@@ -253,16 +253,18 @@ function keepGenerated(file, text, sets) {
   const recorded = readMcpRecord(file);
   if (recorded) return recorded === textDigest(text);
   // Files from before Keep recorded its writes: accept the former global-plus-exact-cwd
-  // output, or Keep's exact serialization whose every server is one the source still
-  // defines identically for this cwd (an older subset of the current set).
+  // output, or Keep's exact, non-empty serialization whose every server the source still
+  // defines identically in one of those sets (an older subset, as when a server was added).
+  // A deletion-only edit looks the same and is rewritten; removed or changed servers conflict.
   if (text === mcpText(sets.legacy)) return true;
   let parsed;
   try { parsed = JSON.parse(text); } catch { return false; }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.keys(parsed).join() !== 'mcpServers') return false;
   const servers = parsed.mcpServers;
   if (!servers || typeof servers !== 'object' || Array.isArray(servers) || text !== mcpText(servers)) return false;
-  return Object.entries(servers).every(([name, value]) => [sets.desired, sets.legacy]
-    .some((set) => Object.hasOwn(set, name) && digest(set[name]) === digest(value)));
+  const entries = Object.entries(servers);
+  return entries.length > 0 && [sets.desired, sets.legacy].some((set) => entries
+    .every(([name, value]) => Object.hasOwn(set, name) && digest(set[name]) === digest(value)));
 }
 
 function memoryPath(configDir, cwd) {
