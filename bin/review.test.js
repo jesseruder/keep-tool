@@ -1056,7 +1056,9 @@ test('review-idea accepts more than three distinct ideas in one day', () => {
     }
     assert.equal(fs.readdirSync(path.join(root, 'tasks')).filter((file) => file.startsWith('reviewer-idea-system-idea-')).length, 4);
     const meta = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'review', '_meta.json'), 'utf8'));
-    assert.equal(meta.days[new Date().toLocaleDateString('en-CA', { timeZone: 'Pacific/Honolulu' })].ideas, 4);
+    // bumpDay keys by the machine's local date; sum across days so neither the host
+    // timezone nor a run that straddles midnight changes the count.
+    assert.equal(Object.values(meta.days).reduce((total, day) => total + (day.ideas || 0), 0), 4);
   });
 });
 
