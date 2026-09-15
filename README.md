@@ -266,6 +266,28 @@ and registry must have separate remotes. Never point a registry at keep-tool.
 Slack polling activates only when `watch/slack.json` in your private registry names
 channels. Its adapter currently requires a compatible MCP CLI configured through
 `KEEP_JESSE_MCP` (legacy variable name); it is not a standalone Slack integration.
+Discord polling is separately opt-in. It reads only the messages currently rendered
+in the fixed local Edge channel tab; it does not open the browser, scroll, or fetch
+history. Keep that tab open at
+`https://discord.com/channels/515820161694171141/1526722921589112852` and configure:
+
+```json
+{
+  "enabled": true,
+  "guildId": "515820161694171141",
+  "channelId": "1526722921589112852",
+  "channel": "cauldron-testing",
+  "intervalMin": 15,
+  "model": "haiku",
+  "maxPerPoll": 100
+}
+```
+
+Save that as `watch/discord.json`. Findings stay in log mode and appear beside Slack
+findings in Message watch. `keep discord status` reports a missing extension or tab as
+a skipped snapshot. The default reader is the castle-mcp virtualenv under
+`~/castle/castle-mcp`; override its executable with `KEEP_DISCORD_READER` and its argv
+prefix with a JSON string array in `KEEP_DISCORD_READER_ARGS`.
 Phone pushes use `KEEP_PUSH_WEBHOOK`; speaker notifications require an `announce`
 command. Credentials belong in the local environment/configuration, never source.
 

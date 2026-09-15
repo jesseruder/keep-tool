@@ -4038,6 +4038,29 @@ commands.slack = async (argv) => {
   die('usage: keep slack poll [--dry] | keep slack status | keep slack mode log|cards|alerts');
 };
 
+commands.discord = async (argv) => {
+  const discord = require('./discord.js');
+  const [subcommand, ...rest] = argv;
+  if (subcommand === 'poll') {
+    const o = parseArgs(rest, { dry: 'bool' });
+    if (o._.length) die('usage: keep discord poll [--dry]');
+    const decisions = await discord.poll({ dry: o.dry });
+    if (!o.dry) console.log(`discord: classified ${decisions.length} new message${decisions.length === 1 ? '' : 's'}`);
+    return;
+  }
+  if (subcommand === 'status') {
+    if (rest.length) die('usage: keep discord status');
+    const state = discord.status();
+    console.log(`enabled: ${state.enabled ? 'yes' : 'no'}`);
+    console.log(`last poll: ${state.lastPollAt ? new Date(state.lastPollAt).toLocaleString() : 'never'}`);
+    if (state.skipped) console.log(`last attempt: skipped${state.detail ? ` · ${state.detail}` : ''}`);
+    const counts = Object.entries(state.counts);
+    console.log(`today: ${counts.length ? counts.map(([kind, count]) => `${kind} ${count}`).join(', ') : 'no classifications'}`);
+    return;
+  }
+  die('usage: keep discord poll [--dry] | keep discord status');
+};
+
 commands.verify = async (argv) => {
   const o = parseArgs(argv, {});
   const id = o._[0];
@@ -7164,6 +7187,8 @@ ${stepUsage()}
   keep slack poll [--dry]
   keep slack status
   keep slack mode log|cards|alerts
+  keep discord poll [--dry]
+  keep discord status
   keep probe <id>      # run this card's probe now (exit 1 = failed); no check-in, no daemon
   keep verify <id>     # run this task's check recipe now (needs keep serve)
   keep compact <sid>   # compact a live Claude or Codex session (needs keep serve)

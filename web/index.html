@@ -382,7 +382,7 @@
   </div>
 
   <div id="slackBox" class="summary-card" style="display:none">
-    <div class="alerts-hdr">Slack watch <span id="slackMeta"></span></div>
+    <div class="alerts-hdr">Message watch <span id="slackMeta"></span></div>
     <div id="slackList"></div>
   </div>
 
@@ -944,10 +944,14 @@ function render() {
 
   const slackEntries = [...(state.slack && state.slack.recent || [])].reverse();
   $('slackBox').style.display = slackEntries.length || (state.slack && state.slack.lastPollAt) ? '' : 'none';
-  $('slackMeta').textContent = state.slack ? `· ${state.slack.mode} · ${state.slack.lastPollAt ? ago(state.slack.lastPollAt) : 'not polled'}` : '';
+  const discordWatch = state.slack && state.slack.discord;
+  const discordMeta = discordWatch && discordWatch.enabled
+    ? ` · Discord ${discordWatch.skipped ? 'skipped' : (discordWatch.lastPollAt ? ago(discordWatch.lastPollAt) : 'not polled')}` : '';
+  $('slackMeta').textContent = state.slack ? `· Slack ${state.slack.mode} · ${state.slack.slackLastPollAt ? ago(state.slack.slackLastPollAt) : 'not polled'}${discordMeta}` : '';
   $('slackList').innerHTML = slackEntries.map((entry) => {
     const related = `${(entry.related || []).length} related${entry.cardId ? ` · ${entry.cardId}` : ''}`;
-    return `<div class="slack-row"><span>${esc(ago(entry.at))}</span><span>${esc(entry.channel)}</span><span>${esc(entry.from)}</span><span class="kind">${esc(entry.kind)} · ${esc(entry.severity)}</span><span class="summary" title="${esc(entry.summary)}">${esc(entry.summary)}</span><span>${esc(related)}</span></div>`;
+    const source = entry.source === 'discord' ? 'Discord' : 'Slack';
+    return `<div class="slack-row"><span>${esc(ago(entry.at))}</span><span>${esc(`${source} #${String(entry.channel || '').replace(/^#/, '')}`)}</span><span>${esc(entry.from)}</span><span class="kind">${esc(entry.kind)} · ${esc(entry.severity)}</span><span class="summary" title="${esc(entry.summary)}">${esc(entry.summary)}</span><span>${esc(related)}</span></div>`;
   }).join('');
 
   if (state.digest) {

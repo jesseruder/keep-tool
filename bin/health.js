@@ -27,6 +27,7 @@ const CADENCES = Object.freeze({
   delivery: { cadenceMs: 60e3 },
   unblock: { cadenceMs: 60e3 },
   slack: { cadenceMs: 15 * 60e3 },
+  discord: { cadenceMs: 15 * 60e3 },
   landed: { cadenceMs: 30 * 60e3 },
   'wt-gc': { cadenceMs: DAY_MS },
   'auto-compact': { cadenceMs: 2 * 60e3 },
@@ -113,6 +114,8 @@ function record(name, options = {}) {
   const skipped = options.skipped === true || (ok && options.detail === 'nothing due');
   if (skipped) {
     const entry = { ...prior, disabled: false, lastRunAt: at };
+    if (options.detail == null || options.detail === '') delete entry.detail;
+    else entry.detail = clipError(options.detail);
     store[name] = entry;
     persist(store);
     return entry;

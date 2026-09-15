@@ -27,6 +27,7 @@ const steps = require('./steps.js');
 const alerts = require('./alerts.js');
 const notifications = require('./notifications.js');
 const slack = require('./slack.js');
+const discord = require('./discord.js');
 const standup = require('./standup.js');
 const ideas = require('./ideas.js');
 const landed = require('./landed.js');
@@ -90,6 +91,21 @@ const COMPANION_SNAPSHOT_MS = 1000;
 let companionSnapshotCache = { at: 0, value: null, pending: null };
 // A frozen or non-advancing clock must not spin the poll loop forever.
 const SUGGESTION_PROBE_MAX_READS = Math.ceil(SUGGESTION_PROBE_MAX_MS / SUGGESTION_PROBE_WAIT_MS) + 1;
+
+function messageWatcherDashboardState() {
+  const slackState = slack.dashboardState();
+  const discordState = discord.dashboardState();
+  const recent = [...(slackState.recent || []), ...(discordState.recent || [])]
+    .sort((a, b) => Number(a.at || 0) - Number(b.at || 0))
+    .slice(-10);
+  return {
+    ...slackState,
+    slackLastPollAt: slackState.lastPollAt || null,
+    lastPollAt: Math.max(Number(slackState.lastPollAt || 0), Number(discordState.lastPollAt || 0)) || null,
+    discord: discordState,
+    recent,
+  };
+}
 
 function attentionAckKey(item) {
   if (item.kind === 'health' && item.id) {
@@ -5470,7 +5486,7 @@ function buildState(options = {}) {
     standup: standup.dashboardState(),
     landed: landed.dashboardState(),
     limitResume: limitresume.dashboardState(keep.ROOT),
-    slack: slack.dashboardState(),
+    slack: messageWatcherDashboardState(),
     health: healthSnapshot,
     runs: options.dashboardRuntime?.runs || runs.listRuns(),
     usage: options.dashboardRuntime?.usage || usage.getUsage(),
@@ -6971,6 +6987,7 @@ function start(deps = {}) {
     health.record('wt-gc', { disabled: true, detail: 'KEEP_WT_GC=0' });
   } else startWtGcScheduler({ onChange: broadcast });
   slack.startScheduler({ onChange: broadcast });
+  discord.startScheduler({ onChange: broadcast });
   const configuredLiveTickMs = Number(process.env.KEEP_LIVE_TICK_MS);
   const liveTickMs = Number.isFinite(configuredLiveTickMs) && configuredLiveTickMs > 0
     ? configuredLiveTickMs
@@ -7705,6 +7722,7 @@ function start(deps = {}) {
 }
 
 module.exports = {
+  messageWatcherDashboardState,
   prepareSessionSummary, sessionSummarySnapshot, associateDashboardSessionFiles,
   start,
   apiRequestAuthError,
