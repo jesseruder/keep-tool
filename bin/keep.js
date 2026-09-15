@@ -6602,8 +6602,25 @@ function watcherLive(argv) {
       }
       const stats = watcher.stats({ sinceMs: 0 }).ledger;
       const checks = live.TYPES.map((type) => ({ type, check: live.graduationCheck(type, stats) }));
-      wanted = checks.filter((row) => row.check.ok).map((row) => row.type);
-      skipped = checks.filter((row) => !row.check.ok);
+      const earned = checks.filter((row) => row.check.ok).map((row) => row.type);
+      // Additive, and only additive. A prompt edit resets what counts toward
+      // graduation, so `on` run afterwards would otherwise silently switch off
+      // whatever was already delivering — a change to live behaviour nobody
+      // asked for, from a word that reads like "more". Turning something off is
+      // `off`, or naming the list that should stay on.
+      const alreadyLive = live.liveTypes(config);
+      wanted = [...new Set([...alreadyLive, ...earned])];
+      skipped = checks.filter((row) => !row.check.ok && !alreadyLive.includes(row.type));
+      const added = earned.filter((type) => !alreadyLive.includes(type));
+      if (alreadyLive.length) {
+        const one = alreadyLive.length === 1;
+        console.log(`${alreadyLive.length} type${one ? '' : 's'} ${one ? 'was' : 'were'} already live`
+          + ` and ${one ? 'stays' : 'stay'} on: ${alreadyLive.join(', ')}`);
+      }
+      if (!added.length) {
+        console.log(`nothing new has earned live delivery under prompt ${watcher.PROMPT_HASH};`
+          + ` currently live: ${alreadyLive.length ? alreadyLive.join(', ') : 'none'}`);
+      }
     } else {
       wanted = arg.split(',').map((type) => type.trim()).filter(Boolean);
       const unknown = wanted.filter((type) => !live.TYPES.includes(type));
@@ -6618,7 +6635,6 @@ function watcherLive(argv) {
       }
     }
     for (const row of skipped) console.log(`not turned on: ${row.check.reason}`);
-    if (arg === 'on' && !wanted.length) console.log('nothing has earned live delivery yet; delivery stays off');
     const next = { ...config, live: Object.fromEntries(live.TYPES.map((type) => [type, wanted.includes(type)])) };
     live.saveConfig(next);
     // Best effort: this is the riskiest switch in the system, so when the

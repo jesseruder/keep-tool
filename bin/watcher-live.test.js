@@ -1484,7 +1484,7 @@ test('`on` turns on what has earned it and says why the rest stayed off', (t) =>
   seedLedger([]);
   const cold = cliLive(['on']);
   assert.equal(cold.status, 0, cold.stderr);
-  assert.match(cold.stdout, /nothing has earned live delivery yet; delivery stays off/);
+  assert.match(cold.stdout, /nothing new has earned live delivery under prompt [0-9a-f]{8}; currently live: none/);
   assert.match(cold.stdout, /not turned on: continue has no graded decisions yet/);
   assert.match(cold.stdout, /not turned on: resource has no graded decisions yet/);
   assert.deepEqual(live.liveTypes(live.loadConfig()), []);
@@ -1513,6 +1513,27 @@ test('`on` turns on what has earned it and says why the rest stayed off', (t) =>
   assert.equal(overruled.status, 0, overruled.stderr);
   assert.deepEqual(live.liveTypes(live.loadConfig()), ['resource']);
 
+  assert.equal(cliLive(['off']).status, 0);
+  assert.deepEqual(live.liveTypes(live.loadConfig()), []);
+});
+
+test('`on` is additive and never switches off something that is already live', (t) => {
+  sandbox(t);
+  // A prompt edit resets what counts toward graduation, so `on` afterwards finds
+  // nothing ready. That must not take down what is already delivering.
+  live.saveConfig({ live: { continue: true } });
+  assert.deepEqual(live.liveTypes(live.loadConfig()), ['continue']);
+  seedLedger([{ id: 'd-old', type: 'continue', verdict: 'agree', reviewer: 'watcher', at: Date.now(),
+    promptHash: 'oldprompt', why: 'w', message: 'm' }]);
+
+  const result = cliLive(['on']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(live.liveTypes(live.loadConfig()), ['continue'], 'continue stays live');
+  assert.match(result.stdout, /1 type was already live and stays on: continue/);
+  assert.match(result.stdout, /nothing new has earned live delivery under prompt [0-9a-f]{8}; currently live: continue/);
+  assert.doesNotMatch(result.stdout, /not turned on: continue/, 'a live type is not reported as skipped');
+
+  // Turning something off still takes the explicit spelling.
   assert.equal(cliLive(['off']).status, 0);
   assert.deepEqual(live.liveTypes(live.loadConfig()), []);
 });
