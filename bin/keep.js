@@ -6096,15 +6096,13 @@ function repairExecutable(tokens) {
   const script = index === -1 ? '' : tokens[index];
   const interpreter = index === -1 ? tokens.slice(1) : tokens.slice(1, index);
   const ambiguous = { head: 'node-keep', tokens, script, interpreter };
-  if (mentions.length > 1) return ambiguous;
-  if (index !== -1) {
-    const name = stepRegistry.commandBasename(script);
-    if (name === 'keep.js') return { head: 'keep', tokens: ['keep', ...tokens.slice(index + 1)], script, interpreter };
-    if (name === 'serve.js') return { head: 'serve.js', tokens, script, interpreter };
-  }
-  // `node -e '…' bin/keep.js` reads a file and is ordinary diagnosis; the same
-  // command with `restart-daemon` in it is not.
-  if (mentions.length && reaching) return ambiguous;
+  const name = index === -1 ? '' : stepRegistry.commandBasename(script);
+  // Ambiguity only matters when the command reaches for the daemon. Two keep.js
+  // tokens in `node bin/keep.js artifact <card> bin/keep.js` are a script and the
+  // file it is attaching, and `node -e '…' bin/keep.js` reads one.
+  if (reaching && (mentions.length > 1 || !NODE_SCRIPTS.has(name))) return ambiguous;
+  if (name === 'keep.js') return { head: 'keep', tokens: ['keep', ...tokens.slice(index + 1)], script, interpreter };
+  if (name === 'serve.js') return { head: 'serve.js', tokens, script, interpreter };
   return { head, tokens };
 }
 
@@ -6114,22 +6112,27 @@ function repairExecutable(tokens) {
 // wide open through one wrapper.
 const ENV_VALUE_FLAGS = new Set(['-u', '--unset', '-S', '--split-string']);
 
-function repairWrapperChdir(tokens, cwd) {
-  if (!tokens.length || stepRegistry.commandBasename(tokens[0]) !== 'env') return cwd;
-  for (let i = 1; i < tokens.length; i += 1) {
-    const token = tokens[i];
-    if (token === '--') break;
-    if (ASSIGNMENT_RE.test(token)) continue;
-    // env's own options stop at its command operand. Reading past it took the
-    // command's `-C` for env's and moved the invocation somewhere it never ran.
-    if (!/^-./.test(token)) break;
-    const equals = /^--chdir=(.*)$/.exec(token);
-    if (equals) return repairResolvePath(equals[1], cwd);
-    if ((token === '-C' || token === '--chdir') && tokens[i + 1]) return repairResolvePath(tokens[i + 1], cwd);
-    if (ENV_VALUE_FLAGS.has(token)) i += 1;
+function repairWrapperChdir(tokens, limit, cwd) {
+  let out = cwd;
+  for (let i = 0; i < limit && i < tokens.length; i += 1) {
+    // `command env -C … git …`, `nice env -C … git …`: env is not always first.
+    if (stepRegistry.commandBasename(tokens[i]) !== 'env') continue;
+    for (let j = i + 1; j < tokens.length; j += 1) {
+      const token = tokens[j];
+      if (token === '--') break;
+      if (ASSIGNMENT_RE.test(token)) continue;
+      // env's own options stop at its command operand. Reading past it took the
+      // command's `-C` for env's and moved the invocation somewhere it never ran.
+      if (!/^-./.test(token)) break;
+      const equals = /^--chdir=(.*)$/.exec(token);
+      if (equals) { out = repairResolvePath(equals[1], out); break; }
+      if ((token === '-C' || token === '--chdir') && tokens[j + 1]) { out = repairResolvePath(tokens[j + 1], out); break; }
+      if (ENV_VALUE_FLAGS.has(token)) j += 1;
+    }
   }
-  return cwd;
+  return out;
 }
+
 
 // Every real invocation in a command, however it is wrapped, with the directory
 // a `cd` earlier in the same command put it in. `echo "keep restart-daemon"`
@@ -6154,7 +6157,8 @@ function repairInvocations(value, depth = 0, cwd = '') {
       continue;
     }
     // Only for this invocation: `env -C` does not move the rest of the command.
-    const here = repairWrapperChdir(rest, current);
+    // The wrappers are the tokens stripCommandWrappers took off the front.
+    const here = repairWrapperChdir(rest, Math.max(0, rest.length - stripped.length), current);
     const wrapped = stripped.length !== rest.length || stripped[0] !== rest[0];
     if (SHELL_BINARIES.has(head)) {
       const script = stepRegistry.shellScriptArgument(stripped);
@@ -6205,12 +6209,18 @@ function gitSubcommand(args) {
 // independent of each other, so both are returned and both are checked: a command
 // that names the live checkout in either one is reaching for it.
 function repairGitTargets(args, cwd) {
+  // Two passes, because git is: every `-C` applies before the command runs, and
+  // `--git-dir`/`--work-tree` are then resolved against that final directory.
+  // Resolving them where they appear read `git --git-dir=keep-tool/.git -C ~`
+  // as somewhere else and let a write into the live checkout through.
   let base = cwd;
+  for (let i = 0; i < args.length; i += 1) {
+    if (args[i] === '-C' && args[i + 1]) { base = repairResolvePath(args[i + 1], base); i += 1; }
+  }
   const targets = [];
   for (let i = 0; i < args.length; i += 1) {
     const equals = /^--(?:work-tree|git-dir)=(.*)$/.exec(args[i]);
     if (equals) { targets.push(repairResolvePath(equals[1], base)); continue; }
-    if (args[i] === '-C' && args[i + 1]) { base = repairResolvePath(args[i + 1], base); i += 1; continue; }
     if ((args[i] === '--work-tree' || args[i] === '--git-dir') && args[i + 1]) {
       targets.push(repairResolvePath(args[i + 1], base));
       i += 1;
@@ -6218,6 +6228,7 @@ function repairGitTargets(args, cwd) {
   }
   return [base, ...targets].filter(Boolean);
 }
+
 
 function repairDenial(invocation) {
   const { head, cwd } = invocation;

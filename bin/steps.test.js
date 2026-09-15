@@ -1090,6 +1090,10 @@ test('the pre-bash guard keeps a self-repair run off the daemon and out of the m
     `node --require=/tmp/serve.js ${main}/bin/serve.js`,
     // env's options stop at its command operand: this `-C` is git's.
     'env git -C ~/keep-tool config guard.recheck value',
+    // …and env is not always the first wrapper.
+    `command env -C ${main} git add -A`,
+    // git resolves --git-dir against the cwd every -C has already moved.
+    `git --git-dir=keep-tool/.git -C ${os.homedir()} config guard.recheck value`,
     // git resolves --git-dir against the cwd, not against an earlier --work-tree.
     'git --work-tree=/tmp --git-dir=~/keep-tool/.git config guard.recheck value',
     // Whatever was in front of the shell is in front of what the shell runs.
@@ -1130,6 +1134,8 @@ test('the pre-bash guard keeps a self-repair run off the daemon and out of the m
     // Reading keep-tool's own source through node is diagnosis, not the daemon.
     'node -e "console.log(1)" bin/keep.js',
     `node -e "console.log(1)" ${main}/bin/keep.js`,
+    // A script and the file it attaches are two keep.js tokens, not an ambiguity.
+    'node bin/keep.js artifact repair-card bin/keep.js',
     'node --test --require ./scripts/test-env.cjs bin/serve.test.js',
     'wt ls',
   ]) assert.equal(denied(command), false, command);
