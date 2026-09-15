@@ -1076,6 +1076,14 @@ test('the pre-bash guard keeps a self-repair run off the daemon and out of the m
     // `$HOME` is the same checkout wearing another name.
     'git -C $HOME/keep-tool add -A',
     'git -C ${HOME}/keep-tool commit -am wip',
+    // `-C` is cumulative in git: the second one is relative to the first.
+    `git -C ${main} -C bin add -A`,
+    'git -C ~/keep-tool -C bin commit -am wip',
+    // A wrapper that moves the command into the live checkout moves it there.
+    `env -C ${main} git add -A`,
+    `env --chdir=${main} git commit -am wip`,
+    // The preload, not the script, used to look like what node was running.
+    `node -r /tmp/preload.cjs ${main}/bin/keep.js restart-daemon`,
     // Force pushes, however spelled.
     'git push --force origin HEAD:master',
     'git push --force-with-lease',
@@ -1162,7 +1170,6 @@ test('once the repair card\'s fix is on origin/master the session may pull the l
     'git -C ~/keep-tool pull --ff-only',
     'git -C $HOME/keep-tool pull --ff-only',
     `git -C ${main} pull --ff-only origin master`,
-    `git --git-dir=${main}/.git pull --ff-only`,
     `cd ${main} && git pull --ff-only`,
     // The pair the recipe's last step runs, in one command.
     `git -C ${main} pull --ff-only && keep restart-daemon`,
@@ -1184,6 +1191,23 @@ test('once the repair card\'s fix is on origin/master the session may pull the l
     `cd ${main} && git pull`,
     'git push --force origin HEAD:master',
     'wt land',
+    // Nothing may ride along with either of the two. An assignment redirects the
+    // pull's remote or points core.hooksPath at a script; a node flag preloads
+    // code before keep.js runs; a wrapper decides how the whole thing runs; and
+    // `--git-dir`/`--work-tree` pair another repository with the live work tree.
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.url GIT_CONFIG_VALUE_0=/tmp/other GIT_CONFIG_VALUE_0=/tmp/other git -C ${main} pull --ff-only`,
+    `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/tmp/hooks git -C ${main} pull --ff-only`,
+    'KEEP_PORT=1 keep restart-daemon',
+    `node --require=/tmp/preload.cjs ${main}/bin/keep.js restart-daemon`,
+    `node --eval=0 ${main}/bin/keep.js restart-daemon`,
+    `node -r /tmp/preload.cjs ${main}/bin/keep.js restart-daemon`,
+    '/tmp/keep.js restart-daemon',
+    `env -C ${main} git pull --ff-only`,
+    `timeout 60 keep restart-daemon`,
+    `git --git-dir=/tmp/other/.git --work-tree=${main} pull --ff-only`,
+    `git --git-dir=${main}/.git pull --ff-only`,
+    `git -C ${main} -C bin pull --ff-only`,
+    `git -C ${main} -c core.hooksPath=/tmp/hooks pull --ff-only`,
   ]) assert.equal(decide(command).deny, true, command);
 
   // One line to stderr, naming the card and the sha that made it allowable.
