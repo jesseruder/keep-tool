@@ -1213,6 +1213,21 @@ async function listHostPanes(deps = {}, fresh = false) {
 // Running & waiting. Reuse the last good list briefly. With no good list yet (a fresh
 // daemon, or no host at all) publish as before rather than holding the dashboard.
 const HOST_PANES_REUSE_MS = 60e3;
+
+// Writes a console waits on through its mutation fence rebuild the dashboard at once;
+// every other write (project icons, UI debug, terminal profiles, keys) waits out the
+// background rebuild throttle. Mirrors STATE_MUTATIONS in web/app/api.js.
+const URGENT_DASHBOARD_MUTATIONS = new Set([
+  '/api/abandon-account-handoff', '/api/ack', '/api/add', '/api/answer', '/api/checkin',
+  '/api/close-idle', '/api/close-session', '/api/compact', '/api/decisions/judge',
+  '/api/handoff-session', '/api/notifications', '/api/open', '/api/panes/spawn',
+  '/api/portable-transfers', '/api/reopen-session', '/api/resolve-portable-transfer',
+  '/api/restart-daemon', '/api/restart-session', '/api/review-queue', '/api/reviewtick',
+  '/api/run', '/api/send', '/api/setaside', '/api/stop', '/api/transfer-session',
+]);
+function urgentDashboardMutation(pathname) {
+  return URGENT_DASHBOARD_MUTATIONS.has(pathname) || /^\/api\/panes\/[^/]+\/(?:kill|remove)$/.test(pathname);
+}
 function hostPanesForPublish(panes, memo, now) {
   if (Array.isArray(panes)) {
     memo.panes = panes;
@@ -7963,8 +7978,12 @@ function start(deps = {}) {
         fenced = true;
         mutationSequence += 1;
         res.setHeader('x-keep-mutation-fence', mutationFence());
-        // The client waits for this fence; skip the background rebuild throttle.
-        dashboardPublisher.refresh();
+        // A client waits for this fence after a real mutation; skip the background
+        // rebuild throttle only then. Read-only POSTs arrive every few seconds.
+        let pathname = '';
+        try { pathname = new URL(req.url, 'http://localhost').pathname; } catch {}
+        if (urgentDashboardMutation(pathname)) dashboardPublisher.refresh();
+        else dashboardPublisher.invalidate();
       }
       return writeHead.call(this, status, ...args);
     };
@@ -8060,6 +8079,7 @@ module.exports = {
   stalledSessionSnapshot,
   liveTurnIndexSessions,
   hostPanesForPublish,
+  urgentDashboardMutation,
   buildState,
   applySessionLiveness,
   backfillHostSessions,

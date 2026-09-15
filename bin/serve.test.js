@@ -1074,6 +1074,23 @@ test('live ledger sightings and host panes keep Claude sessions alive; Codex sta
   assert.deepEqual(sessions.map((s) => [s.state, s.alive]), [['running', true], ['running', true], ['running', null]]);
 });
 
+test('only console-awaited mutations skip the dashboard rebuild throttle', () => {
+  const { urgentDashboardMutation } = require('./serve');
+  for (const route of ['/api/setaside', '/api/send', '/api/checkin', '/api/panes/abc123/kill', '/api/panes/abc123/remove']) {
+    assert.equal(urgentDashboardMutation(route), true, route);
+  }
+  for (const route of ['/api/project-icons', '/api/ui-debug', '/api/terminal-profile', '/api/keys', '/api/focus', '/api/layouts']) {
+    assert.equal(urgentDashboardMutation(route), false, route);
+  }
+  // The console's STATE_MUTATIONS decides which writes it waits on; the daemon must agree.
+  const source = fs.readFileSync(path.join(__dirname, '..', 'web', 'app', 'api.js'), 'utf8');
+  const block = source.match(/const STATE_MUTATIONS = new Set\(\[([\s\S]*?)\]\);/);
+  assert.ok(block, 'STATE_MUTATIONS found in web/app/api.js');
+  const routes = [...block[1].matchAll(/'([^']+)'/g)].map((match) => match[1]);
+  assert.ok(routes.length > 10);
+  for (const route of routes) assert.equal(urgentDashboardMutation(route), true, `${route} is awaited by the console`);
+});
+
 test('dashboard publish reuses recent host panes instead of publishing none', () => {
   const { hostPanesForPublish } = require('./serve');
   const start = 1_000_000;
