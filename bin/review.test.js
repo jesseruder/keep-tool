@@ -3041,3 +3041,26 @@ test('a pinned budget reads both snapshot shapes and names the account it cannot
     'the refusal names the account, so the fix is obvious');
   assert.equal(reviewBudget('fable', { version: 2, accounts: { 'claude-secondary': { identity: { agent: 'codex' }, snapshot: { limits, fetchedAt } } } }, 'claude-secondary').code, 8);
 });
+
+test('a misconfigured sweep time falls back rather than removing the sweep', () => {
+  const { sweepClock, sweepTickDue, nextSweepAt } = require('./review.js');
+  const at = (h, m) => new Date(2026, 8, 14, h, m).getTime();
+
+  // Unparseable, and a time at or after noon: the retry window closes at noon, so a
+  // 13:00 sweep could never open and would silently be no sweep at all.
+  for (const value of ['7:45am', 'nonsense', '', '13:00', '12:00', '23:59', '07:60']) {
+    const clock = sweepClock(value);
+    assert.equal(clock.invalid, true, value);
+    assert.equal(clock.hour, 7, value);
+    assert.equal(clock.minute, 45, value);
+    assert.equal(sweepTickDue({}, at(7, 45), clock), true, `${value} still sweeps at the default`);
+    assert.equal(sweepTickDue({}, at(7, 44), clock), false, value);
+    assert.equal(nextSweepAt(at(9, 0), clock), new Date(2026, 8, 15, 7, 45).getTime(), value);
+  }
+
+  // A single-digit hour is a legitimate spelling, not a misconfiguration.
+  assert.deepEqual(sweepClock('7:45'), { hour: 7, minute: 45, invalid: false });
+  assert.deepEqual(sweepClock('00:00'), { hour: 0, minute: 0, invalid: false });
+  assert.deepEqual(sweepClock('11:59'), { hour: 11, minute: 59, invalid: false });
+  assert.equal(sweepTickDue({}, at(11, 59), sweepClock('11:59')), true);
+});

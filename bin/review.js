@@ -3487,13 +3487,15 @@ function reviewStats() {
     }
   }
   const clock = sweepClock();
+  const effective = clock.invalid ? DEFAULT_SWEEP_CLOCK : clock;
   const drift = (meta.drift && typeof meta.drift === 'object') ? meta.drift : {};
   return {
     markers,
     cadence: {
       mode: cadenceMode(),
-      tickIntervalMs: cadenceMode() === 'clock' ? TICK_MS : (process.env.KEEP_WATCHER === '1' ? null : FALLBACK_TICK_MS),
-      sweepAt: clock.invalid ? null : `${String(clock.hour).padStart(2, '0')}:${String(clock.minute).padStart(2, '0')}`,
+      tickIntervalMs: cadenceMode() === 'clock' ? TICK_MS : FALLBACK_TICK_MS,
+      sweepAt: `${String(effective.hour).padStart(2, '0')}:${String(effective.minute).padStart(2, '0')}`,
+      sweepAtInvalid: clock.invalid ? clock.configured || true : false,
       nextSweepAt: nextSweepAt(now, clock),
       lastSweepDay: (meta.sweepTick && meta.sweepTick.day) || null,
       driftGapMs: DRIFT_GAP_MS,
@@ -3993,10 +3995,18 @@ function cadenceMode(env = process.env) {
   return String(env.KEEP_REVIEW_CADENCE || 'events').trim().toLowerCase() === 'clock' ? 'clock' : 'events';
 }
 
+// A misconfigured sweep time must not remove the sweep: in events mode it is the only
+// wake a quiet fleet gets. An unparseable value, or one at or after noon (the window
+// closes at noon, so it could never open), falls back to the default and says so -
+// which is also what the startup line has always claimed happens.
 function sweepClock(value = process.env.KEEP_REVIEW_SWEEP_AT || '07:45') {
-  const match = String(value).match(/^(\d{2}):(\d{2})$/);
-  if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) return { ...DEFAULT_SWEEP_CLOCK, invalid: true };
-  return { hour: Number(match[1]), minute: Number(match[2]), invalid: false };
+  const match = String(value).match(/^(\d{1,2}):(\d{2})$/);
+  const hour = match ? Number(match[1]) : NaN;
+  const minute = match ? Number(match[2]) : NaN;
+  if (!match || !(hour >= 0 && hour < 12) || !(minute >= 0 && minute <= 59)) {
+    return { ...DEFAULT_SWEEP_CLOCK, invalid: true, configured: String(value) };
+  }
+  return { hour, minute, invalid: false };
 }
 
 function localDay(at) {
@@ -4010,7 +4020,8 @@ function localDay(at) {
 // is often mid-turn at 07:45, so "due" has to survive a few refusals.
 function sweepTickDue(meta, now = Date.now(), clock = sweepClock()) {
   const at = Number(now);
-  if (!Number.isFinite(at) || clock.invalid) return false;
+  if (!Number.isFinite(at)) return false;
+  if (clock.invalid) clock = DEFAULT_SWEEP_CLOCK;
   const date = new Date(at);
   const minute = date.getHours() * 60 + date.getMinutes();
   if (minute < clock.hour * 60 + clock.minute || minute >= 12 * 60) return false;
@@ -4023,7 +4034,7 @@ function sweepTickDue(meta, now = Date.now(), clock = sweepClock()) {
 }
 
 function nextSweepAt(now = Date.now(), clock = sweepClock()) {
-  if (clock.invalid) return null;
+  if (clock.invalid) clock = DEFAULT_SWEEP_CLOCK;
   const date = new Date(Number(now));
   const target = new Date(date.getFullYear(), date.getMonth(), date.getDate(), clock.hour, clock.minute, 0, 0);
   if (target.getTime() <= Number(now)) target.setDate(target.getDate() + 1);
@@ -4190,6 +4201,13 @@ async function reviewTick(deps, opts) {
   const sessions = deps.sessions ? deps.sessions() : [];
   const reviewer = (deps.findReviewer || findReviewerSession)(sessions, meta.bootstrapAttempts);
   const model = reviewer ? (readReviewerMarker(reviewer.id).model || reviewerModel()) : reviewerModel();
+  // Account precedence, deliberately: the session's own account if the daemon knows
+  // it, then the `reviewer` automation purpose, and only then (inside reviewBudget)
+  // KEEP_AGENT_ACCOUNT_ID. The env var describes whichever session happens to have
+  // spawned this process, which for the daemon is not the reviewer's account at all;
+  // the configured purpose is the operator's actual statement about what the reviewer
+  // spends. `keep review-tick` from a pane inherits that pane's env, so without this
+  // the same tick would be budgeted against two different windows.
   const budget = options.force
     ? { code: 0, reason: 'forced' }
     : (deps.reviewBudget || reviewBudget)(model, undefined, (reviewer && reviewer.accountId) || reviewerAccountId());

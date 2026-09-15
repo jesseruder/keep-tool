@@ -842,8 +842,15 @@ Two invariants the code enforces:
   the ranked queue plus the sweep clause, and retries every 10 minutes until noon. With
   `KEEP_WATCHER` off there is no drift signal, so a fallback tick runs every
   `KEEP_REVIEW_FALLBACK_TICK_MIN` (default 120) minutes; the daemon logs the active mode
-  and why at startup. `POST /api/reviewtick` and `keep review-tick --force` work in both
-  modes, as does reviewer compaction. `keep review-stats` prints the mode, the next sweep
+  and why at startup. An unparseable `KEEP_REVIEW_SWEEP_AT`, or one at or after 12:00
+  (the retry window closes at noon), falls back to `07:45` and warns rather than removing
+  the sweep. `POST /api/reviewtick` and `keep review-tick --force` work in both
+  modes, as does reviewer compaction.
+- A tick's budget is read against the reviewer session's own account when the daemon
+  knows it, otherwise against `accounts.automationFor('claude', 'reviewer')`, and only
+  then against `KEEP_AGENT_ACCOUNT_ID`. The env var describes whichever session spawned
+  the process — for the daemon, not the reviewer's account — so the configured purpose
+  deliberately outranks it. `keep review-stats` prints the mode, the next sweep
   and the last drift wake, and the per-day counters include drift wakes.
 - A batch bundle (`review-bundle a b c` or `--queue`) prints the safety envelope, health,
   time-zone and evidence guidance once ahead of every card; a by-hand single-card bundle

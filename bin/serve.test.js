@@ -6148,3 +6148,46 @@ test('every refusal after the first character says so', async () => {
   }).then(() => null, (e) => e);
   assert.equal(exact.typingStarted, true);
 });
+
+// A drift verdict from judge() is camelCase; the turn-index columns are snake_case.
+// Reading state_line/decision_id off the verdict silently produced "(no state line)"
+// on every drift tick, which nothing would have failed on.
+test('the drift wake reads the verdict shape judge() actually returns', async () => {
+  const { driftWakeFromVerdict } = require('./serve');
+  const review = require('./review.js');
+  const turn = { session_id: 'sess-drift', n: 11, id: 'turn-11' };
+  const verdict = {
+    verdict: 'drift', model: 'claude-sonnet-5@abc1234',
+    cardId: 'drifting-card', stateLine: 'rewriting the auth layer', reason: 'card asked for a test fix',
+    message: 'stop and check the card', confidence: 0.9, decisionId: 'dec-1',
+    // The snake_case spellings never appear on a verdict; if they are what gets read,
+    // these decoys are what would show up.
+    state_line: 'WRONG', decision_id: 'WRONG',
+  };
+  const seen = [];
+  const reviewApi = {
+    cadenceMode: () => 'events',
+    driftWake: async (_deps, event) => { seen.push(event); return { sent: true, text: review.driftTickMessage(event, []) }; },
+  };
+
+  const wake = driftWakeFromVerdict(turn, verdict, { review: reviewApi, reviewDeps: {} });
+  assert.ok(wake, 'a live drift verdict wakes the reviewer');
+  const result = await wake;
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].stateLine, 'rewriting the auth layer');
+  assert.equal(seen[0].decisionId, 'dec-1');
+  assert.equal(seen[0].cardId, 'drifting-card');
+  assert.equal(seen[0].sessionId, 'sess-drift');
+  assert.equal(seen[0].turn, 11);
+  assert.match(result.text, /drift on drifting-card \(sess-dri\): "rewriting the auth layer"/);
+  assert.equal(result.text.includes('no state line'), false);
+  assert.equal(result.text.includes('WRONG'), false);
+
+  // Everything that is not a live drift verdict is left alone.
+  assert.equal(driftWakeFromVerdict(turn, { ...verdict, verdict: 'continue' }, { review: reviewApi, reviewDeps: {} }), null);
+  assert.equal(driftWakeFromVerdict(turn, { ...verdict, model: 'rules:replay' }, { review: reviewApi, reviewDeps: {} }), null);
+  assert.equal(driftWakeFromVerdict(turn, { ...verdict, skipped: 'lost-race' }, { review: reviewApi, reviewDeps: {} }), null);
+  assert.equal(driftWakeFromVerdict(turn, null, { review: reviewApi, reviewDeps: {} }), null);
+  assert.equal(driftWakeFromVerdict(turn, verdict, { review: { ...reviewApi, cadenceMode: () => 'clock' }, reviewDeps: {} }), null);
+  assert.equal(seen.length, 1, 'none of those reached driftWake');
+});

@@ -6828,6 +6828,28 @@ function sendReviewerMessage(sessionId, text, opts) {
   );
 }
 
+// The bridge from a drift verdict to a reviewer wake. Exported because the field
+// mapping is the whole risk: judge() hands back camelCase (bin/turn-watcher.js
+// parseVerdict/judge) while the turn-index columns are snake_case, and reading the
+// wrong spelling renders "(no state line)" on every drift tick without failing
+// anything. Returns the pending wake, or null when this verdict is not one.
+function driftWakeFromVerdict(turn, verdict, deps = {}) {
+  const reviewApi = deps.review || review;
+  if (reviewApi.cadenceMode() !== 'events') return null;
+  if (!verdict || verdict.skipped || verdict.verdict !== 'drift') return null;
+  if (String(verdict.model || '').endsWith(':replay')) return null;
+  return reviewApi.driftWake(deps.reviewDeps || reviewDeps, {
+    sessionId: turn.session_id,
+    turn: turn.n,
+    cardId: verdict.cardId,
+    stateLine: verdict.stateLine,
+    reason: verdict.reason,
+    message: verdict.message,
+    confidence: verdict.confidence,
+    decisionId: verdict.decisionId,
+  });
+}
+
 const reviewDeps = {
   send: (sessionId, text, opts) => withInjectionLock(() => sendReviewerMessage(sessionId, text, opts), { session: sessionId }),
   sendPlain: (sessionId, text) => withInjectionLock(() => sendToSession({ sessionId, text }), { session: sessionId }),
@@ -7395,18 +7417,19 @@ function start(deps = {}) {
           });
           // A drift verdict is the one event worth waking the reviewer for, so on
           // the events cadence it ticks here instead of on a ten-minute clock.
-          // Never fatal: the verdict and its delivery stand on their own.
-          if (review.cadenceMode() === 'events' && verdict && verdict.verdict === 'drift'
-              && !String(verdict.model || '').endsWith(':replay')) {
-            try {
-              const woken = await review.driftWake(reviewDeps, {
-                sessionId: turn.session_id, turn: turn.n, cardId: verdict.cardId,
-                stateLine: verdict.state_line, reason: verdict.reason, message: verdict.message,
-                confidence: verdict.confidence, decisionId: verdict.decision_id,
-              });
+          // Deliberately NOT awaited: the wake types a whole message under the
+          // injection lock, and there are only two watcher workers - holding one of
+          // them for that would stall judging behind a terminal. Never fatal either:
+          // the verdict and its own delivery stand on their own.
+          const wake = driftWakeFromVerdict(turn, verdict);
+          if (wake) {
+            wake.then((woken) => {
               review.recordTickOutcome(woken);
               if (woken.sent) broadcast();
-            } catch (error) { review.recordTickError(error); }
+            }).catch((error) => {
+              review.recordTickError(error);
+              process.stderr.write(`keep review: drift wake failed: ${error && error.message || error}\n`);
+            });
           }
           return outcome;
         },
@@ -8108,6 +8131,7 @@ module.exports = {
   chunkForTyping,
   deliveredMatches,
   exactDraft,
+  driftWakeFromVerdict,
   closeDraftVisible,
   codexTypedTextVisible,
   claudeTypedTextVisible,
