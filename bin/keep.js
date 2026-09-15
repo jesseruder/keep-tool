@@ -5150,10 +5150,12 @@ commands.hook = async (argv) => {
     return;
   }
   if (argv[0] === 'pre-bash') {
-    // the only hook that blocks: a gated step's command without its claim, and a
-    // raw `claude --resume` that would start a session outside Keep's launcher
+    // the only hook that blocks: a gated step's command without its claim, a raw
+    // `claude --resume` that would start a session outside Keep's launcher, and a
+    // self-repair run reaching for the daemon it was launched to fix
     try {
       let decision = guardResumeCommand(input);
+      if (!decision.deny) decision = guardRepairCommand(input);
       if (!decision.deny) decision = guardStepCommand(input);
       if (decision.deny) {
         process.stderr.write(`${decision.reason}\n`);
@@ -5910,6 +5912,112 @@ function guardResumeCommand(input, env = process.env) {
     deny: true,
     reason: `keep guard: \`${found.command}\` — raw claude --resume bypasses Keep's launcher (pane binding, account, permissions flags); use \`keep open <session-id>\` — or set KEEP_RAW_CLAUDE=1 to bypass`,
   };
+}
+
+// ---------- the self-repair run guard ----------
+
+// A self-repair run is a bypassPermissions agent Keep launched by itself, in its
+// own worktree, to fix the daemon it is running inside. Three things it must
+// never do: restart that daemon (Owner's call — and a restart mid-fix throws away
+// the evidence the card was opened with), touch the live ~/keep-tool checkout the
+// daemon runs from, or get a commit onto master without the review record.
+// runs.js sets KEEP_REPAIR=1 for exactly these runs, so this is silent in every
+// other session.
+const REPAIR_RULE = 'this is a Keep self-repair run (KEEP_REPAIR=1): fix the daemon in your own worktree, '
+  + 'land through `keep land <card>` after a recorded review, and leave the restart to Owner — '
+  + 'step 4 of the repair card says so';
+const GIT_VALUE_FLAGS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env']);
+
+function repairMainCheckouts() {
+  const base = path.join(os.homedir(), 'keep-tool');
+  const out = new Set([path.resolve(base)]);
+  try { out.add(fs.realpathSync(base)); } catch {}
+  return out;
+}
+
+function repairResolvePath(value, cwd) {
+  const raw = String(value || '').replace(/^~(?=\/|$)/, os.homedir());
+  if (!raw) return '';
+  const absolute = path.resolve(cwd || process.cwd(), raw).replace(/\/\.git$/, '');
+  try { return fs.realpathSync(absolute); } catch { return absolute; }
+}
+
+// Every real invocation in a command, however it is wrapped, with the directory
+// a `cd` earlier in the same command put it in. `echo "keep restart-daemon"`
+// never appears here, because `echo` is the executable there.
+function repairInvocations(value, depth = 0, cwd = '') {
+  const out = [];
+  if (depth > 4) return out;
+  let current = cwd;
+  for (const segment of stepRegistry.commandSegments(String(value || ''))) {
+    let rest = stepRegistry.commandTokens(segment.text);
+    while (rest.length && ASSIGNMENT_RE.test(rest[0])) rest = rest.slice(1);
+    const stripped = stepRegistry.stripCommandWrappers(rest, { fromShell: true });
+    if (!stripped.length) continue;
+    const head = stepRegistry.commandBasename(stripped[0]);
+    if (head === 'cd' || head === 'pushd') {
+      const target = stripped.slice(1).find((token) => token !== '--' && !token.startsWith('-'));
+      if (target) current = repairResolvePath(target, current);
+      continue;
+    }
+    if (SHELL_BINARIES.has(head)) {
+      const script = stepRegistry.shellScriptArgument(stripped);
+      if (script !== null) out.push(...repairInvocations(script, depth + 1, current));
+      continue;
+    }
+    out.push({ head, tokens: stripped, cwd: current });
+  }
+  return out;
+}
+
+function gitSubcommand(args) {
+  for (let i = 0; i < args.length; i += 1) {
+    if (GIT_VALUE_FLAGS.has(args[i])) { i += 1; continue; }
+    if (args[i].startsWith('-')) continue;
+    return args[i];
+  }
+  return '';
+}
+
+function repairDenial(invocation) {
+  const { head, cwd } = invocation;
+  const args = invocation.tokens.slice(1);
+  const first = args.find((token) => !token.startsWith('-')) || '';
+  if (head === 'launchctl') return "`launchctl` controls the daemon's launchd job";
+  if (head === 'keep' && first === 'restart-daemon') return '`keep restart-daemon` restarts the daemon you were launched to repair';
+  if (head === 'keep' && first === 'service') return "`keep service` installs, starts or stops the daemon's launchd job";
+  if (head === 'wt' && first === 'land') return '`wt land` pushes without a review record';
+  if (head !== 'git') return '';
+  const checkouts = repairMainCheckouts();
+  let targeted = '';
+  for (let i = 0; i < args.length; i += 1) {
+    const equals = /^--(?:work-tree|git-dir)=(.*)$/.exec(args[i]);
+    if (equals) { targeted = repairResolvePath(equals[1], cwd); continue; }
+    if (['-C', '--work-tree', '--git-dir'].includes(args[i]) && args[i + 1]) targeted = repairResolvePath(args[i + 1], cwd);
+  }
+  // An explicitly targeted main checkout is refused outright; reaching it by
+  // `cd` is refused only for a write, so reading its log stays possible.
+  if (targeted && checkouts.has(targeted)) return `that runs git in ${targeted}, the live keep-tool checkout this daemon runs from`;
+  if (!targeted && cwd && checkouts.has(cwd) && stepRegistry.runsGitWrite(invocation.tokens)) {
+    return `that writes to ${cwd}, the live keep-tool checkout this daemon runs from`;
+  }
+  if (gitSubcommand(args) === 'push'
+    && args.some((token) => token === '--force' || token === '-f' || token.startsWith('--force-with-lease'))) {
+    return 'a force push rewrites shared history';
+  }
+  return '';
+}
+
+function guardRepairCommand(input, env = process.env) {
+  if (!env || env.KEEP_REPAIR !== '1') return { deny: false, reason: '' };
+  if (!input || input.tool_name !== 'Bash') return { deny: false, reason: '' };
+  const command = input.tool_input && input.tool_input.command;
+  if (!command) return { deny: false, reason: '' };
+  for (const invocation of repairInvocations(command, 0, typeof input.cwd === 'string' ? input.cwd : '')) {
+    const why = repairDenial(invocation);
+    if (why) return { deny: true, reason: `keep guard: ${why} — ${REPAIR_RULE}` };
+  }
+  return { deny: false, reason: '' };
 }
 
 const STEP_FAILURE_RE = /(?:^|\n)\s*(?:Error:|Error \[|╷|Build '[^']*' errored|Some builds didn't complete|FAILED|Terraform encountered an error)/;
@@ -8077,7 +8185,8 @@ module.exports = {
   projectMatchesCwd, looksLikeGitWrite, normalizeProjectPath, resolveProjectArg, activeHolds,
   openNeeds, addNeed, meetNeeds, sweepNeeds,
   taskForSession, newestTaskForSession, readCodexParent, deployCommand, deployEntry, recordDeploy, redactCommand,
-  stepMatchForInput, guardStepCommand, guardResumeCommand, rawClaudeResume, recordStepRun, codexToolInput, codexExitCode,
+  stepMatchForInput, guardStepCommand, guardResumeCommand, guardRepairCommand, repairInvocations, rawClaudeResume,
+  recordStepRun, codexToolInput, codexExitCode,
   codexJobText, renderCodexJobs,
   codexCommandCli: commands.codex,
   commandUsage, helpText, formatOpenResult, openCommand: commands.open, postOpen, OPEN_MESSAGE_LIMIT, OPEN_MESSAGE_ERROR, LAUNCH_MODEL_RE,

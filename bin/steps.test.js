@@ -1034,3 +1034,73 @@ test('the pre-bash guard refuses a raw claude --resume and leaves everything els
     }).status, 0, 'the documented bypass works');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+// ---------- the self-repair run guard ----------
+
+test('the pre-bash guard keeps a self-repair run off the daemon and out of the main checkout', () => {
+  const keep = require('./keep.js');
+  const main = path.join(os.homedir(), 'keep-tool');
+  const worktree = path.join(os.homedir(), 'wt', 'keep-tool', 'self-repair-abcd1234');
+  const repair = { KEEP_REPAIR: '1' };
+  const decide = (command, env = repair, cwd = worktree) =>
+    keep.guardRepairCommand({ tool_name: 'Bash', cwd, tool_input: { command } }, env);
+  const denied = (...args) => decide(...args).deny;
+
+  for (const command of [
+    'keep restart-daemon',
+    'keep service restart',
+    'launchctl kickstart -k gui/501/com.jesse.keep',
+    '/bin/launchctl unload ~/Library/LaunchAgents/com.jesse.keep.plist',
+    `git -C ${main} commit -am wip`,
+    `git -C ~/keep-tool status`,
+    `git --work-tree=${main} add -A`,
+    `cd ${main} && git commit -am wip`,
+    'git push --force origin HEAD:master',
+    'git push --force-with-lease',
+    'wt land',
+    '~/bin/wt land --no-push',
+    `bash -lc "keep restart-daemon"`,
+    'cd /tmp && keep restart-daemon',
+    'npm test && keep restart-daemon',
+    'KEEP_FOO=1 keep restart-daemon',
+  ]) assert.equal(denied(command), true, command);
+
+  for (const command of [
+    'keep checkin some-card -m done',
+    'keep land some-card',
+    'keep reviewed some-card --commit origin/master..HEAD --verdict clean',
+    'keep allow some-card land',
+    'keep health --json',
+    'echo "keep restart-daemon"',
+    'grep -rn "launchctl" bin',
+    'git commit -am "self-repair: fix the tick"',
+    'git push origin HEAD',
+    `cd ${main} && git log -1`,
+    'node --test --require ./scripts/test-env.cjs bin/runs.test.js',
+    'wt ls',
+  ]) assert.equal(denied(command), false, command);
+
+  // Silent in every other session: the guard is keyed to the repair run's env.
+  assert.equal(denied('keep restart-daemon', {}), false);
+  assert.equal(denied('keep restart-daemon', { KEEP_REPAIR: '' }), false);
+  assert.equal(keep.guardRepairCommand({ tool_name: 'Read', tool_input: { command: 'keep restart-daemon' } }, repair).deny, false);
+
+  const reason = decide('keep restart-daemon').reason;
+  assert.match(reason, /keep guard: `keep restart-daemon` restarts the daemon you were launched to repair/);
+  assert.match(reason, /leave the restart to Owner — step 4 of the repair card says so/);
+
+  // End to end through the hook: exit 2 is the deny, and ordinary work passes.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-repair-guard-'));
+  try {
+    const env = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', KEEP_PORT: '65432', KEEP_REPAIR: '1' };
+    const hook = (command, overrides = {}) => spawnSync(process.execPath, [KEEP, 'hook', 'pre-bash'], {
+      cwd: root, encoding: 'utf8', env: { ...env, ...overrides },
+      input: JSON.stringify({ session_id: 'repair-run', cwd: worktree, tool_name: 'Bash', tool_input: { command } }),
+    });
+    const blocked = hook('keep restart-daemon');
+    assert.equal(blocked.status, 2, blocked.stderr);
+    assert.match(blocked.stderr, /keep guard: .*restarts the daemon you were launched to repair/);
+    assert.equal(hook('keep land some-card').status, 0);
+    assert.equal(hook('keep restart-daemon', { KEEP_REPAIR: '' }).status, 0, 'only a repair run is guarded');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
