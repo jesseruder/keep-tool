@@ -472,11 +472,17 @@ verdict, in the same `UPDATE` (`writeVerdict`, `bin/turn-watcher.js`):
 
 The daemon supplies the answer, because the daemon is the only place that has
 session objects: `bin/serve.js` passes `attentionFor(sessionId)` into
-`watcher.tick`, which looks the session up in the snapshot `buildState` just
-produced and reuses the `activity` already computed on it. **No second transcript
-scan**, and the same call the console's own buckets came from. It is read as late
-as the verdict is stamped — the model call takes minutes, and the question is
-what the console would be showing now.
+`watcher.tick`, which looks the session up in the freshest snapshot there is and
+reuses the `activity` **`buildState` already computed on it**. No second
+transcript scan, and literally the object the console's own buckets came from. It
+is read as late as the verdict is stamped — the model call takes minutes, and the
+question is what the console would be showing now.
+
+Only `buildState`'s own result counts. Calling `activity()` again here would run
+it without the task, dependency and liveness context `buildState` passes, which
+would record a decision the console never made; a session that has dropped out of
+the newest snapshot has no current answer at all. Both cases store nothing rather
+than store something else.
 
 Failing to compute it never costs the verdict. A resolver that throws, is absent,
 or hands back something unrecognizable stores four nulls; a turn with no record
@@ -496,7 +502,15 @@ yes/no — then the same table restricted to the three inferred rules, which is 
 real question. `needs-input` is the model saying yes; `continue` and `quiet` are
 it saying no. **`drift` is excluded**: it says the turn went the wrong way, which
 is an answer to a different question, so it is counted apart rather than forced
-into a cell. Then a per-rule breakdown, and the disagreement list (default
+into a cell.
+
+The restricted table takes the rule name **and** `attention_confidence`, not the
+name alone. `conversation-wait` reports `observed` when a real background job or
+a registry handoff is behind it, and `uncertain` when the job itself is
+(`bin/conversation-intent.js`); those samples are observations and do not belong
+in a table about guesses. The per-rule breakdown is split the same way, one row
+per (rule, confidence) — merging them would label a combined total with whichever
+confidence came back first. Then the disagreement list (default
 `--only disagreements`, 40 newest) with each turn's rule, verdict, clipped
 reason, the last 200 characters of its final assistant text, and a
 `keep turns show <session>` pointer to the whole turn.

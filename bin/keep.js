@@ -6970,12 +6970,20 @@ function watcherLs(argv) {
 // here changes what the console shows or overrides a rule.
 const COMPARE_WIDTH = 112;
 
+// A reason or an assistant tail can be one unbroken token — a url, a sha, a
+// stack frame — so a word-wrapper alone does not bound the line. Anything longer
+// than the room available is cut, because a 200-column line is not readable in
+// the terminal this is meant to be read in.
 function watcherWrap(text, indent) {
-  const words = String(text || '').split(/\s+/).filter(Boolean);
+  const room = Math.max(20, COMPARE_WIDTH - indent.length);
+  const words = [];
+  for (const word of String(text || '').split(/\s+/).filter(Boolean)) {
+    for (let at = 0; at < word.length; at += room) words.push(word.slice(at, at + room));
+  }
   const lines = [];
   let line = '';
   for (const word of words) {
-    if (line && `${line} ${word}`.length + indent.length > COMPARE_WIDTH) { lines.push(indent + line); line = word; }
+    if (line && `${line} ${word}`.length > room) { lines.push(indent + line); line = word; }
     else line = line ? `${line} ${word}` : word;
   }
   if (line) lines.push(indent + line);
@@ -7008,11 +7016,12 @@ function watcherCompare(argv) {
       + ' — the daemon records one per judged turn (KEEP_WATCHER=1)');
   }
   const lines = [...watcherMatrixLines('all rules', result.matrix.all), ''];
-  lines.push(...watcherMatrixLines(`inferred rules only (${result.inferredRules.join(', ')})`, result.matrix.inferred));
+  lines.push(...watcherMatrixLines('inferred rules only', result.matrix.inferred));
+  lines.push(`  (${result.inferredRules.join(', ')} — only where the rule itself said inferred)`);
   lines.push('', `${'per rule'.padEnd(26)}${'confidence'.padEnd(11)}${'turns'.padStart(7)}${'agree'.padStart(7)}`
     + `${'noise'.padStart(7)}${'missed'.padStart(7)}${'drift'.padStart(7)}`);
   for (const rule of result.rules) {
-    lines.push(`${turnsClip(rule.rule, 25).padEnd(26)}${(rule.confidence || '-').padEnd(11)}`
+    lines.push(`${turnsClip(rule.rule, 25).padEnd(26)}${turnsClip(rule.confidence || '-', 10).padEnd(11)}`
       + `${String(rule.total).padStart(7)}${String(rule.agreed).padStart(7)}${String(rule.noise).padStart(7)}`
       + `${String(rule.missed).padStart(7)}${String(rule.drift).padStart(7)}`);
   }
@@ -7020,12 +7029,14 @@ function watcherCompare(argv) {
     : `disagreements (missed first, then noise; newest first, ${result.rows.length} shown)`);
   if (!result.rows.length) lines.push('  none');
   for (const row of result.rows) {
+    // Every field here is agent- or registry-written, so each one is clipped:
+    // a long card id or rule name must not push the row past the terminal.
     lines.push('', `${row.direction.padEnd(8)}${turnsStamp(row.at)}  ${String(row.session).slice(0, 8)}`
-      + `  ${(row.card || '-').padEnd(10)}  ${row.rule} → ${row.state}`
-      + `${row.confidence ? ` (${row.confidence})` : ''}`);
+      + `  ${turnsClip(row.card || '-', 16).padEnd(17)}${turnsClip(row.rule, 24)} → ${turnsClip(row.state, 14)}`
+      + `${row.confidence ? ` (${turnsClip(row.confidence, 10)})` : ''}`);
     lines.push(...watcherWrap(`${row.verdict}: ${row.reason}`, '    '));
     if (row.tail) lines.push(...watcherWrap(`ended: ${row.tail}`, '    '));
-    lines.push(`    ${row.show}`);
+    lines.push(...watcherWrap(row.show, '    '));
   }
   console.log(lines.join('\n'));
 }

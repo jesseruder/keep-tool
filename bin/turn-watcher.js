@@ -1425,11 +1425,20 @@ function compare(options = {}) {
   for (const row of counts) {
     const machine = Number(row.machine) === 1;
     const rule = row.rule || '(unknown)';
-    const isInferred = INFERRED_ATTENTION_RULES.includes(rule);
+    const confidence = row.confidence || null;
+    // Rule name is not enough. `conversation-wait` reports `observed` when a
+    // current background job or a registry handoff is behind it and `uncertain`
+    // when the job itself is (bin/conversation-intent.js), and an observed fact
+    // is not what this is measuring. Both halves have to say inferred.
+    const isInferred = INFERRED_ATTENTION_RULES.includes(rule) && confidence === 'inferred';
     addToMatrix(all, machine, row.verdict, row.n);
     if (isInferred) addToMatrix(inferred, machine, row.verdict, row.n);
-    if (!byRule.has(rule)) byRule.set(rule, { rule, confidence: row.confidence || null, inferred: isInferred, ...emptyMatrix() });
-    addToMatrix(byRule.get(rule), machine, row.verdict, row.n);
+    // Keyed by rule AND confidence for the same reason: one row per rule would
+    // add an observed `conversation-wait` to an inferred one and then label the
+    // total with whichever confidence SQLite happened to group first.
+    const key = `${rule} ${confidence || ''}`;
+    if (!byRule.has(key)) byRule.set(key, { rule, confidence, inferred: isInferred, ...emptyMatrix() });
+    addToMatrix(byRule.get(key), machine, row.verdict, row.n);
   }
   const where = [COMPARABLE, 'COALESCE(t.verdict_at, 0) >= ?'];
   const params = [since];
@@ -1459,7 +1468,8 @@ function compare(options = {}) {
     };
   });
   rows.sort((a, b) => (DIRECTION_ORDER[a.direction] - DIRECTION_ORDER[b.direction]) || ((b.at || 0) - (a.at || 0)));
-  const rules = [...byRule.values()].sort((a, b) => (b.total + b.drift) - (a.total + a.drift) || a.rule.localeCompare(b.rule));
+  const rules = [...byRule.values()].sort((a, b) => (b.total + b.drift) - (a.total + a.drift)
+    || a.rule.localeCompare(b.rule) || String(a.confidence).localeCompare(String(b.confidence)));
   return { since, only, limit, inferredRules: INFERRED_ATTENTION_RULES, matrix: { all, inferred }, rules, rows };
 }
 

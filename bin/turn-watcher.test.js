@@ -1792,27 +1792,36 @@ test('compare counts the 2x2 both ways, restricts it to the inferred rules, and 
     { verdict: 'quiet', rule: 'foreground-hook', confidence: 'observed', machine: false },
     // Drift is an answer to a different question.
     { verdict: 'drift', rule: 'prose-request', confidence: 'inferred', machine: true },
+    // An inferred rule name is not enough: conversation-wait reports `observed`
+    // when a real background job is behind it, and an observed fact is not what
+    // the restricted table is measuring.
+    { verdict: 'quiet', rule: 'conversation-wait', confidence: 'observed', machine: true },
     // No attention record at all: not a miss, just not comparable.
     { verdict: 'needs-input', rule: undefined, machine: undefined },
   ]);
 
   const result = watcher.compare({ sinceMs: 0 });
   assert.deepEqual({ ...result.matrix.all }, {
-    bothYes: 1, noise: 2, missed: 1, bothNo: 1, agreed: 2, total: 5, drift: 1,
+    bothYes: 1, noise: 3, missed: 1, bothNo: 1, agreed: 2, total: 6, drift: 1,
   });
-  // The restriction is the real question: only the three prose-inferred rules.
+  // The restriction is the real question: the three prose rules, and only where
+  // the rule itself said it was inferring. The observed conversation-wait is out.
   assert.deepEqual({ ...result.matrix.inferred }, {
     bothYes: 0, noise: 2, missed: 1, bothNo: 0, agreed: 0, total: 3, drift: 1,
   });
   assert.deepEqual(result.inferredRules, ['prose-request', 'conversation-wait', 'conversation-ready']);
 
-  const byRule = Object.fromEntries(result.rules.map((row) => [row.rule, row]));
-  assert.equal(byRule['prose-request'].noise, 1);
-  assert.equal(byRule['prose-request'].drift, 1);
-  assert.equal(byRule['prose-request'].inferred, true);
-  assert.equal(byRule['permission-hook'].agreed, 1);
-  assert.equal(byRule['permission-hook'].inferred, false);
-  assert.equal(byRule['conversation-wait'].missed, 1);
+  const byRule = Object.fromEntries(result.rules.map((row) => [`${row.rule}/${row.confidence}`, row]));
+  assert.equal(byRule['prose-request/inferred'].noise, 1);
+  assert.equal(byRule['prose-request/inferred'].drift, 1);
+  assert.equal(byRule['prose-request/inferred'].inferred, true);
+  assert.equal(byRule['permission-hook/observed'].agreed, 1);
+  assert.equal(byRule['permission-hook/observed'].inferred, false);
+  assert.equal(byRule['conversation-wait/inferred'].missed, 1);
+  // Same rule, two confidences, two rows — merging them would label the total
+  // with whichever one came back first.
+  assert.equal(byRule['conversation-wait/observed'].noise, 1);
+  assert.equal(byRule['conversation-wait/observed'].inferred, false);
   assert.equal(result.rules.some((row) => row.rule === '(unknown)'), false, 'an uncomparable turn is not a rule');
 });
 
@@ -1861,6 +1870,9 @@ test('keep watcher compare renders both directions inside 120 columns, and --jso
     { verdict: 'needs-input', rule: 'conversation-ready', machine: false, tail: 'Which of the two should I use?' },
     { verdict: 'drift', rule: 'prose-request', machine: true },
     { verdict: 'needs-input', rule: 'permission-hook', confidence: 'observed', machine: true },
+    // An unbroken token far longer than the terminal: a word-wrapper alone would
+    // hand it over whole.
+    { verdict: 'quiet', rule: 'prose-request', machine: true, tail: `see https://example.test/${'x'.repeat(300)}` },
   ], Date.now() - 60e3);
 
   const run = (args) => require('node:child_process').execFileSync(
@@ -1868,8 +1880,9 @@ test('keep watcher compare renders both directions inside 120 columns, and --jso
     { encoding: 'utf8', env: { ...process.env, KEEP_DIR: REGISTRY, KEEP_NO_PUSH: '1' } });
 
   const text = run(['--since', '+1d']);
-  assert.match(text, /all rules — 3 turns, 1 drift excluded/);
-  assert.match(text, /inferred rules only \(prose-request, conversation-wait, conversation-ready\)/);
+  assert.match(text, /all rules — 4 turns, 1 drift excluded/);
+  assert.match(text, /inferred rules only — 3 turns/);
+  assert.match(text, /\(prose-request, conversation-wait, conversation-ready — only where/);
   assert.match(text, /^missed\s/m);
   assert.match(text, /^noise\s/m);
   assert.match(text, new RegExp(`keep turns show ${SESSION}`));
@@ -1877,9 +1890,9 @@ test('keep watcher compare renders both directions inside 120 columns, and --jso
   for (const line of text.split('\n')) assert.ok(line.length <= 120, `line over 120 columns: ${line}`);
 
   const json = JSON.parse(run(['--since', '+1d', '--json']));
-  assert.equal(json.matrix.all.total, 3);
+  assert.equal(json.matrix.all.total, 4);
   assert.equal(json.matrix.all.drift, 1);
-  assert.equal(json.matrix.inferred.noise, 1);
+  assert.equal(json.matrix.inferred.noise, 2);
   assert.equal(json.matrix.inferred.missed, 1);
-  assert.deepEqual(json.rows.map((row) => row.direction), ['missed', 'noise']);
+  assert.deepEqual(json.rows.map((row) => row.direction), ['missed', 'noise', 'noise']);
 });

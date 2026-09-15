@@ -7868,20 +7868,27 @@ function start(deps = {}) {
       // rescan rather than trust one older than the tick interval.
       const sessions = Date.now() - sessionSnapshotAt < 30e3 && sessionSnapshot.length
         ? sessionSnapshot : scanSessions();
+      // Whichever of the two was used, the snapshot clock now describes it, so a
+      // later reading means the dashboard has rebuilt since.
+      const sessionsAt = sessionSnapshotAt;
       const result = await watcher.tick({
         limit: WATCHER_TURNS_PER_TICK, concurrency: WATCHER_CONCURRENCY, windowMs: WATCHER_WINDOW_MS,
-        // What the console itself would say about this session, recorded beside
-        // the verdict so the two can be compared later (`keep watcher compare`,
+        // What the console itself said about this session, recorded beside the
+        // verdict so the two can be compared later (`keep watcher compare`,
         // docs/turn-watcher.md). Read as late as the verdict, from the freshest
-        // snapshot there is: buildState has already run activity() over those
-        // objects, so this is a lookup rather than a second transcript scan.
-        // Measurement only — nothing here changes what the console shows.
+        // list there is — a rebuild since this tick started wins.
+        //
+        // Only buildState's own `activity` counts. Recomputing one here would
+        // run activity() without the task, dependencies and liveness buildState
+        // passes it, and would record a decision the console never made; a
+        // session that has left the newest snapshot has no current answer at
+        // all. Either way the turn is left uncomparable rather than compared
+        // against something else. Measurement only — nothing here changes what
+        // the console shows.
         attentionFor: (sessionId) => {
-          const pool = sessionSnapshot.length ? sessionSnapshot : sessions;
-          const session = pool.find((candidate) => candidate.id === sessionId)
-            || sessions.find((candidate) => candidate.id === sessionId);
-          if (!session) return null;
-          return session.activity || sessionStatus.activity(session);
+          const pool = sessionSnapshotAt > sessionsAt && sessionSnapshot.length ? sessionSnapshot : sessions;
+          const session = pool.find((candidate) => candidate.id === sessionId);
+          return (session && session.activity) || null;
         },
         // The live path exists only here. It uses the same guarded send the
         // console's POST /api/send uses, so target resolution, the precheck and
