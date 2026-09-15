@@ -369,3 +369,73 @@ test('Codex startup reports a registered assignment and unrelated sessions retai
     assert.match(help.stdout, /keep delegate <card> --step <n> -- <command>/);
   } finally { f.cleanup(); }
 });
+
+function writeCodexParent(root, sid, parent) {
+  const dir = path.join(root, '.keep', 'codex-parents');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${sid}.json`), JSON.stringify({ at: Date.now(), parent, agent: 'claude', cwd: root }));
+}
+
+function parentOwnedCard(f) {
+  const created = f.run(['add', 'Parent owned card', '--status', 'active'], { CLAUDE_CODE_SESSION_ID: 'parent-session' });
+  assert.equal(created.status, 0, created.stderr);
+  return 'parent-owned-card';
+}
+
+test('a Codex worker of a Claude session that owns a card cannot open a shadow card', () => {
+  const f = fixture();
+  try {
+    const card = parentOwnedCard(f);
+    writeCodexParent(f.root, 'worker-session', 'parent-session');
+    const refused = f.run(['add', 'Shadow', '--status', 'active'], { CODEX_THREAD_ID: 'worker-session' });
+    assert.equal(refused.status, 1, refused.stdout);
+    assert.match(refused.stderr, new RegExp(`which owns ${card}`));
+    assert.match(refused.stderr, /keep checkin parent-owned-card/);
+    assert.equal(fs.existsSync(path.join(f.root, 'tasks', 'shadow.md')), false);
+  } finally { f.cleanup(); }
+});
+
+test('the shadow guard also fires on the ambient Claude id a Codex sub-session inherits', () => {
+  const f = fixture();
+  try {
+    const card = parentOwnedCard(f);
+    const refused = f.run(['add', 'Shadow', '--status', 'active'], {
+      CODEX_THREAD_ID: 'worker-session', CLAUDE_CODE_SESSION_ID: 'parent-session',
+    });
+    assert.equal(refused.status, 1, refused.stdout);
+    assert.match(refused.stderr, new RegExp(`which owns ${card}`));
+    assert.equal(fs.existsSync(path.join(f.root, 'tasks', 'shadow.md')), false);
+  } finally { f.cleanup(); }
+});
+
+test('--file, --kind idea and --force pass the shadow guard', () => {
+  const f = fixture();
+  try {
+    parentOwnedCard(f);
+    writeCodexParent(f.root, 'worker-session', 'parent-session');
+    const worker = { CODEX_THREAD_ID: 'worker-session' };
+    for (const [title, args] of [
+      ['Filed follow up', ['--file']],
+      ['An idea', ['--kind', 'idea']],
+      ['Deliberately independent', ['--force', '--status', 'active']],
+    ]) {
+      const result = f.run(['add', title, ...args], worker);
+      assert.equal(result.status, 0, result.stderr);
+      const id = title.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      assert.equal(fs.existsSync(path.join(f.root, 'tasks', `${id}.md`)), true, id);
+    }
+  } finally { f.cleanup(); }
+});
+
+test('the shadow guard lifts once the parent card is done', () => {
+  const f = fixture();
+  try {
+    const card = parentOwnedCard(f);
+    writeCodexParent(f.root, 'worker-session', 'parent-session');
+    const closed = f.run(['checkin', card, '--status', 'done', '-m', 'Finished.'], { CLAUDE_CODE_SESSION_ID: 'parent-session' });
+    assert.equal(closed.status, 0, closed.stderr);
+    const created = f.run(['add', 'Next piece of work', '--status', 'active'], { CODEX_THREAD_ID: 'worker-session' });
+    assert.equal(created.status, 0, created.stderr);
+    assert.equal(fs.existsSync(path.join(f.root, 'tasks', 'next-piece-of-work.md')), true);
+  } finally { f.cleanup(); }
+});

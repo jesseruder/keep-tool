@@ -547,3 +547,133 @@ test('autonomous-no-grants flags an autonomous card with no grants or expired on
     assert.match(result.findings.find((finding) => finding.id === 'auto-stale').text, /expired at 2026-09-01T09:00/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+function writeCodexParent(root, sid, parent, extra = {}) {
+  const dir = path.join(root, '.keep', 'codex-parents');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${sid}.json`), JSON.stringify({
+    at: Date.now(), parent, agent: 'claude', cwd: root, ...extra,
+  }));
+}
+
+function writeOwners(root, owners) {
+  const dir = path.join(root, '.keep', 'card-usage');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'owners.json'), JSON.stringify(owners));
+}
+
+test('handoff-shadow flags an unattended Codex worker card that shadows its parent card', () => {
+  const root = makeRoot();
+  try {
+    const now = Date.parse('2026-09-13T12:00:00');
+    const spawned = Date.parse('2026-09-12T10:00:00');
+    // `created` is a bare date (parsed as UTC) and `updated` a local stamp, so keep
+    // them a day apart: the age must be the same 26h in every timezone.
+    const stale = { created: '2026-09-11', updated: '2026-09-12T10:00' };
+    const noted = '## 2026-09-12 11:00 — check-in\nReal work.\n';
+
+    // The parent has since closed its card and moved to another one, so nothing
+    // links it to parent-card any more; only the owners history remembers.
+    writeOwners(root, {
+      'claude:parent-claude': [
+        { at: Date.parse('2026-09-12T09:00:00'), card: 'parent-card' },
+        { at: Date.parse('2026-09-13T09:00:00'), card: 'later-bug-card' },
+      ],
+      'claude:self-claude': [{ at: Date.parse('2026-09-12T09:00:00'), card: 'self-card' }],
+    });
+    writeCard(root, 'parent-card', { ...stale, title: 'Parent work', status: 'done' }, noted);
+    writeCard(root, 'later-bug-card', {
+      ...stale, title: 'A different bug', status: 'active',
+      sessions: [{ id: 'parent-claude', agent: 'claude', at: '2026-09-13T09:00' }],
+    }, noted);
+    writeCard(root, 'shadow-card', {
+      ...stale, title: 'Shadow', status: 'active',
+      sessions: [{ id: 'worker-1', agent: 'codex', at: '2026-09-12T10:00' }],
+    });
+    writeCodexParent(root, 'worker-1', 'parent-claude', { at: spawned });
+
+    // A worker card with a check-in on it is real work, whatever its provenance.
+    writeCard(root, 'noted-card', {
+      ...stale, title: 'Noted', status: 'active',
+      sessions: [{ id: 'worker-2', agent: 'codex', at: '2026-09-12T10:00' }],
+    }, noted);
+    writeCodexParent(root, 'worker-2', 'parent-claude', { at: spawned });
+
+    // A worker still in flight writes its first check-in within hours.
+    writeCard(root, 'fresh-card', {
+      title: 'Fresh work', status: 'active', created: '2026-09-13', updated: '2026-09-13T11:00',
+      sessions: [{ id: 'worker-3', agent: 'codex', at: '2026-09-13T11:00' }],
+    });
+    writeCodexParent(root, 'worker-3', 'parent-claude', { at: Date.parse('2026-09-13T11:00:00') });
+
+    // The parent id resolves to this very card; a card cannot shadow itself.
+    writeCard(root, 'self-card', {
+      ...stale, title: 'Self referential', status: 'active',
+      sessions: [
+        { id: 'worker-4', agent: 'codex', at: '2026-09-12T10:00' },
+        { id: 'self-claude', agent: 'codex', at: '2026-09-12T10:00' },
+      ],
+    });
+    writeCodexParent(root, 'worker-4', 'self-claude', { at: spawned });
+
+    // No recorded parent at all.
+    writeCard(root, 'no-record-card', {
+      ...stale, title: 'Unparented', status: 'active',
+      sessions: [{ id: 'worker-5', agent: 'codex', at: '2026-09-12T10:00' }],
+    });
+
+    // A Claude session is linked too, so this is not a worker-only card.
+    writeCard(root, 'mixed-card', {
+      ...stale, title: 'Mixed', status: 'active',
+      sessions: [
+        { id: 'worker-6', agent: 'codex', at: '2026-09-12T10:00' },
+        { id: 'parent-claude', agent: 'claude', at: '2026-09-12T08:00' },
+      ],
+    });
+    writeCodexParent(root, 'worker-6', 'parent-claude', { at: spawned });
+
+    const result = lint({ root, rule: 'handoff-shadow', now });
+    assert.deepEqual(result.findings.map((item) => item.id), ['shadow-card']);
+    const [item] = result.findings;
+    assert.equal(item.severity, 'med');
+    assert.equal(item.text, 'no check-ins after 26h; created by a Codex worker of claude parent-c, which was on parent-card');
+    assert.equal(item.fix, 'keep checkin shadow-card --status done -m "superseded by parent-card"');
+    assert.equal(result.byRule['handoff-shadow'], 1);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('handoff-shadow falls back to the parent session live card link', () => {
+  const root = makeRoot();
+  try {
+    writeCard(root, 'parent-card', {
+      title: 'Parent work', status: 'active', created: '2026-09-11', updated: '2026-09-12T09:00',
+      sessions: [{ id: 'parent-claude', agent: 'claude', at: '2026-09-12T09:00' }],
+    }, '## 2026-09-12 11:00 — check-in\nReal work.\n');
+    writeCard(root, 'shadow-card', {
+      title: 'Shadow', status: 'active', created: '2026-09-11', updated: '2026-09-12T10:00',
+      sessions: [{ id: 'worker-1', agent: 'codex', at: '2026-09-12T10:00' }],
+    });
+    writeCodexParent(root, 'worker-1', 'parent-claude', { at: Date.parse('2026-09-12T10:00:00') });
+
+    const findings = lint({ root, rule: 'handoff-shadow', now: Date.parse('2026-09-13T12:00:00') }).findings;
+    assert.deepEqual(findings.map((item) => item.id), ['shadow-card']);
+    assert.match(findings[0].text, /which was on parent-card/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('handoff-shadow ignores a malformed codex-parents record', () => {
+  const root = makeRoot();
+  try {
+    writeCard(root, 'parent-card', {
+      title: 'Parent work', status: 'active',
+      sessions: [{ id: 'parent-claude', agent: 'claude', at: '2026-09-12T09:00' }],
+    }, '## 2026-09-12 11:00 — check-in\nReal work.\n');
+    writeCard(root, 'shadow-card', {
+      title: 'Shadow', status: 'active',
+      sessions: [{ id: 'worker-1', agent: 'codex', at: '2026-09-12T10:00' }],
+    });
+    fs.mkdirSync(path.join(root, '.keep', 'codex-parents'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.keep', 'codex-parents', 'worker-1.json'), '{ truncated');
+    assert.deepEqual(lint({ root, rule: 'handoff-shadow' }).findings, []);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

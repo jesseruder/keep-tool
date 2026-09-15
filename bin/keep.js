@@ -1363,6 +1363,25 @@ function addTask({
   return withinLock ? create() : withLock(create);
 }
 
+// The Claude session that started this Codex worker, from the durable record the
+// codex SessionStart hook writes, else the ambient id a Codex sub-session inherits.
+function parentClaudeSession(session) {
+  if (!session || session.agent !== 'codex') return null;
+  const record = readCodexParent(ROOT, session.id);
+  if (record && record.agent === 'claude' && record.parent) return record.parent;
+  return process.env.CLAUDE_CODE_SESSION_ID || null;
+}
+
+function shadowGuard() {
+  const parentId = parentClaudeSession(currentSession());
+  if (!parentId) return;
+  const owned = taskForSession(parentId);
+  if (!owned) return;
+  die(`this Codex session was started by claude ${parentId.slice(0, 8)}, which owns ${owned.id} ("${owned.fm.title}").\n`
+    + `  Contribute there with keep checkin ${owned.id} -m "..." (no claim needed), or have the parent register the step with keep delegate ${owned.id} --step <n> --prepare.\n`
+    + '  File deliberately independent work with --file, or pass --force to create a top-level card anyway.');
+}
+
 commands.add = (argv) => {
   const o = parseArgs(argv, { kind: 'str', tag: 'list', project: 'str', 'check-after': 'str', check: 'str', 'on-pass': 'str', 'check-every': 'str', probe: 'str', status: 'str', 'experiment-id': 'str', plan: 'many', 'done-when': 'list', allow: 'list', until: 'str', autonomous: 'bool', file: 'bool', claim: 'bool', force: 'bool' });
   const title = o._.join(' ');
@@ -1375,6 +1394,11 @@ commands.add = (argv) => {
       die(`${delegation.describe(assigned)} To start independent work deliberately, end the delegation or file it with --file.`);
     }
   }
+  // Explicit `keep delegate` already stops a worker from opening its own card, but
+  // it is opt-in and parents forget. Nine top-level cards in two days shadowed a
+  // plan step of the card their parent Claude session owned, so the same refusal
+  // fires on the implicit relationship the codex SessionStart hook recorded.
+  if (!filesOnly && !o.force) shadowGuard();
   const plan = splitPlanValues(o.plan || []).map((text) => ({ text: cleanPlanText(text), state: 'todo' }));
   applyDoneWhen(plan, o['done-when']);
   let grants = [];
@@ -5092,20 +5116,36 @@ function stopAskedQuestion(state) {
   return text.slice(-400).includes('?') || STOP_QUESTION_RE.test(text);
 }
 
-// The open card this session most recently linked to.
-function taskForSession(sid) {
-  const open = loadAll(false).filter((task) => task.fm.status !== 'done');
+// The newest open card a session is linked to, chosen from cards already in hand.
+// Pure so lint can ask the same question of its own snapshot rather than re-reading
+// the registry — the two answers must agree, or a guard and its lint rule disagree.
+function newestTaskForSession(tasks, sid) {
   const linked = [];
-  for (const task of open) {
+  for (const task of tasks || []) {
+    if (!task || !task.fm || task.fm.status === 'done') continue;
     const matches = (task.fm.sessions || []).filter((session) => session && session.id === sid);
     if (!matches.length) continue;
     linked.push({ task, at: matches.reduce((latest, session) => String(session.at || '') > latest ? String(session.at || '') : latest, '') });
   }
-  if (linked.length) {
-    linked.sort((a, b) => b.at.localeCompare(a.at) || String(b.task.fm.updated || '').localeCompare(String(a.task.fm.updated || '')));
-    return linked[0].task;
-  }
-  return null;
+  if (!linked.length) return null;
+  linked.sort((a, b) => b.at.localeCompare(a.at) || String(b.task.fm.updated || '').localeCompare(String(a.task.fm.updated || '')));
+  return linked[0].task;
+}
+
+// The open card this session most recently linked to.
+function taskForSession(sid) {
+  return newestTaskForSession(loadAll(false), sid);
+}
+
+// A Codex session's recorded parent, written by the codex SessionStart hook.
+// Missing or malformed reads as "no parent" — a guard must not fail on a file
+// some earlier crash truncated.
+function readCodexParent(root, sid) {
+  if (typeof sid !== 'string' || !/^[A-Za-z0-9_-]+$/.test(sid)) return null;
+  try {
+    const record = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'codex-parents', `${sid}.json`), 'utf8'));
+    return record && typeof record === 'object' && typeof record.parent === 'string' ? record : null;
+  } catch { return null; }
 }
 
 function autoContinueTask(sid) {
@@ -7338,7 +7378,7 @@ module.exports = {
   releaseSessionPane,
   projectMatchesCwd, looksLikeGitWrite, normalizeProjectPath, resolveProjectArg, activeHolds,
   openNeeds, addNeed, meetNeeds, sweepNeeds,
-  taskForSession, deployCommand, deployEntry, recordDeploy, redactCommand,
+  taskForSession, newestTaskForSession, readCodexParent, deployCommand, deployEntry, recordDeploy, redactCommand,
   stepMatchForInput, guardStepCommand, recordStepRun, codexToolInput, codexExitCode,
   codexJobText, renderCodexJobs,
   codexCommandCli: commands.codex,

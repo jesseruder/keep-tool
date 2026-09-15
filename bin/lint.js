@@ -10,6 +10,7 @@ const keep = require('./keep.js');
 const review = require('./review.js');
 const landed = require('./landed.js');
 const allow = require('./allow.js');
+const cardUsage = require('./card-usage.js');
 const os = require('os');
 
 const DAY_MS = 86400e3;
@@ -29,6 +30,7 @@ const RULE_NAMES = [
   'check-no-result',
   'deploy-provenance',
   'tmp-artifact',
+  'handoff-shadow',
 ];
 const SEVERITY_ORDER = { med: 0, low: 1 };
 
@@ -532,6 +534,54 @@ function tmpArtifact(task, ctx) {
   return out;
 }
 
+const SHADOW_GRACE_MS = 6 * 3600e3;
+
+// The card the parent Claude session held when it spawned this worker. The card's
+// own `sessions` list cannot answer that: `claimSession` strips a session from every
+// other card as soon as it links a new one, so by the time lint runs the parent has
+// usually moved on and its link to the shadowed card is gone. The owners history is
+// append-only, so it still remembers where the parent was at `record.at`.
+function shadowedParent(task, ctx, record) {
+  const historical = ctx.ownerAt('claude', record.parent, record.at);
+  const id = historical && historical !== task.id && ctx.allTasks.has(historical)
+    ? historical
+    : null;
+  if (id) return id;
+  const current = keep.newestTaskForSession(ctx.tasks.filter((other) => other.id !== task.id), record.parent);
+  return current ? current.id : null;
+}
+
+// A Codex worker that ran `keep add` instead of checking in on the card its parent
+// Claude session owns leaves a top-level card shadowing one plan step: never checked
+// in on, never closed. Nine appeared over two days before `keep add` refused them.
+// Only the abandoned shape is flagged — a worker's card with a check-in on it is
+// real work, whatever its provenance — and only after six hours: a worker still in
+// flight writes its first check-in within hours, while a parent Claude session is
+// nearly always on some card, so without the grace period every fresh worker card
+// would light up.
+function handoffShadow(task, ctx) {
+  if (task.parseError || task.fm.status === 'done') return [];
+  const sessions = task.fm.sessions || [];
+  if (!sessions.length || !sessions.every((session) => session && session.agent === 'codex')) return [];
+  if (review.stampedLogEntries(task.body).length) return [];
+  const touched = [atMs(task.fm.updated), atMs(task.fm.created)].filter(Number.isFinite);
+  if (!touched.length) return [];
+  const age = ctx.now - Math.max(...touched);
+  if (age < SHADOW_GRACE_MS) return [];
+  for (const session of sessions) {
+    const record = keep.readCodexParent(ctx.root, session.id);
+    if (!record || record.agent !== 'claude') continue;
+    const parent = shadowedParent(task, ctx, record);
+    if (!parent) continue;
+    return [finding(
+      'handoff-shadow', task, 'med',
+      `no check-ins after ${Math.floor(age / 3600e3)}h; created by a Codex worker of claude ${String(record.parent).slice(0, 8)}, which was on ${parent}`,
+      `keep checkin ${task.id} --status done -m "superseded by ${parent}"`,
+    )];
+  }
+  return [];
+}
+
 const RULES = {
   'malformed-card': malformedCard,
   'scope-mismatch': scopeMismatch,
@@ -548,6 +598,7 @@ const RULES = {
   'check-no-result': checkNoResult,
   'deploy-provenance': deployProvenance,
   'tmp-artifact': tmpArtifact,
+  'handoff-shadow': handoffShadow,
 };
 
 function git(repo, args) {
@@ -605,6 +656,8 @@ function lint(options = {}) {
     if (title) titles.set(title, [...(titles.get(title) || []), task]);
   }
   const commitCache = new Map();
+  // Read once per run, and only if a rule asks: most runs never touch it.
+  let owners;
   const ctx = {
     now: Number.isFinite(now) ? now : Date.now(),
     root,
@@ -615,6 +668,16 @@ function lint(options = {}) {
     repoFor: landed.repoFor,
     sessionWindow: (task, session) => sessionWindow(task, session, Number.isFinite(now) ? now : Date.now()),
     newestSessionAt,
+    ownerAt(agent, sid, at) {
+      if (owners === undefined) {
+        try { owners = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'card-usage', 'owners.json'), 'utf8')); }
+        catch { owners = null; }
+        if (!owners || typeof owners !== 'object') owners = null;
+      }
+      if (!owners || typeof sid !== 'string' || !Number.isFinite(at)) return null;
+      try { return cardUsage.ownerAt(owners, `${agent}:${sid}`, at); }
+      catch { return null; }
+    },
     commitsFor(repo) {
       if (!commitCache.has(repo)) commitCache.set(repo, logCommits(repo));
       return commitCache.get(repo);

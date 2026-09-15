@@ -191,7 +191,9 @@ See [scenario testing](session-scenarios.md) for seeds and failure replay.
 
 `keep lint` runs advisory daily hygiene checks including `malformed-card`, scope tags,
 review next steps, waiting triggers, uncited commits, stale active work, old done cards,
-duplicate titles, and `tmp-artifact` citations. It always exits successfully when findings exist, writes the latest
+duplicate titles, `tmp-artifact` citations, and `handoff-shadow` cards — a Codex worker's
+card older than six hours with no check-ins, opened instead of checking in on the card
+its parent Claude session held. It always exits successfully when findings exist, writes the latest
 result to `.keep/lint.json`, and supports one-rule runs plus JSON output and fix hints.
 The brief refreshes findings older than 20 hours and shows the first five.
 The `unsatisfiable-wait` rule flags unresolved waits whose upstream has no live linked

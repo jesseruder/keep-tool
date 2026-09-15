@@ -298,6 +298,12 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   assignment; a successful explicit `keep claim` also leaves it. A resumed worker keeps
   a still-valid assignment. Unrelated follow-up work may be deliberately filed with
   `keep add "<title>" --file`; ideas continue to file without claiming by default.
+  The same rule applies without an explicit delegation: a Codex session started from a
+  Claude session that owns an open card is refused an ordinary `keep add`. Contribute to
+  that card with `keep checkin <card> -m "..."` (no claim needed), file a follow-up with
+  `--file`, or pass `--force` for deliberately independent work. `keep lint`'s
+  `handoff-shadow` rule flags the cards that slipped through: a worker's card older than
+  six hours with no check-ins, whose parent Claude session was on another card.
 - Session completion notices are ephemeral unread-turn signals. Deliberately ending
   a session acknowledges only its completion notice; any linked Keep task retains
   its durable `active`, `waiting`, `blocked`, or `review` state.
