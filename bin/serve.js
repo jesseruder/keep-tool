@@ -6828,10 +6828,18 @@ async function deliverUnblockToThread(task, text) {
 // the same way every other automated delivery excludes them, and a session that
 // is mid-turn or holding a prompt is simply skipped — the note is still on the
 // card, in `keep notes`, and in the next session-start block.
-async function announceStateNote(id, event, deps = {}) {
+async function announceStateNote(id, deps = {}) {
   const notes = deps.notes || require('./notes.js');
   const note = notes.findNote(id);
   if (!note) return { error: `no state note "${id}"` };
+  // The event is the note's own state, never the caller's word for it, and it
+  // happens once: a replayed request is a second identical message typed into
+  // every sibling session in the project.
+  const event = notes.announceEventFor(note);
+  if (notes.announcedAlready(note, event)) {
+    return { duplicate: true, id: note.id, event, error: `${note.id} has already been announced as ${event}` };
+  }
+  notes.markAnnounced(note.id, event, Date.now());
   const text = notes.announcementFor(note, event);
   const author = String((note.by && note.by.sessionId) || '');
   const ledger = (deps.liveSessionsInCheckout || review.liveSessionsInCheckout)(
@@ -7839,8 +7847,8 @@ function start(deps = {}) {
             if (!body || typeof body.id !== 'string' || !/^note-[a-z0-9]+$/.test(body.id)) {
               return json(res, 400, { error: 'a state note id is required' });
             }
-            const event = ['create', 'extend', 'clear'].includes(body.event) ? body.event : 'create';
-            const result = await announceStateNote(body.id, event);
+            const result = await announceStateNote(body.id);
+            if (result.duplicate) return json(res, 409, result);
             if (result.error) return json(res, 404, result);
             broadcast();
             return json(res, 200, result);

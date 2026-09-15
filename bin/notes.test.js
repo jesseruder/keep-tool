@@ -409,7 +409,7 @@ test('the announce path skips the author and never reaches the reviewer', async 
   });
   try {
     const sent = [];
-    const result = await serve.announceStateNote(note.id, 'create', {
+    const result = await serve.announceStateNote(note.id, {
       send: (sessionId, text) => { sent.push([sessionId, text]); },
       excluded: new Set(['spawned-session']),
       liveSessionsInCheckout: () => ({
@@ -427,7 +427,17 @@ test('the announce path skips the author and never reaches the reviewer', async 
     assert.deepEqual(sent.map((row) => row[0]), ['sibling-session']);
     assert.match(sent[0][1], /^\[keep\] state note on staging \(sandboxes\): home-only, no deck persistence/);
     assert.match(sent[0][1], /Information only; nothing is blocked\.$/);
-    assert.equal((await serve.announceStateNote('note-nope', 'create', {})).error, 'no state note "note-nope"');
+    assert.equal((await serve.announceStateNote('note-nope', {})).error, 'no state note "note-nope"');
+
+    // Replay: the same request again is refused rather than typed a second time.
+    const replay = await serve.announceStateNote(note.id, {
+      send: () => { throw new Error('must not send twice'); },
+      excluded: new Set(),
+      liveSessionsInCheckout: () => ({ available: true, sessions: [{ id: 'sibling-session' }] }),
+      scanSessions: () => [{ id: 'sibling-session', endedTurn: true, mtime: 2 }],
+    });
+    assert.equal(replay.duplicate, true);
+    assert.equal(replay.event, 'create');
   } finally {
     fs.rmSync(notes.notesDir(root), { recursive: true, force: true });
   }
@@ -445,8 +455,9 @@ test('the announce path excludes the author even when the ledger would list it',
     until: stamp(Date.now() + 3600e3),
   });
   try {
+    notes.extendNote(note.id, stamp(Date.now() + 7200e3), { root });
     let excludedIds = null;
-    const result = await serve.announceStateNote(note.id, 'extend', {
+    const result = await serve.announceStateNote(note.id, {
       send: () => {},
       excluded: new Set(),
       liveSessionsInCheckout: (project, exclude) => {
@@ -474,4 +485,44 @@ test('sanitize strips bidi overrides, zero-width characters, and odd spaces', ()
     const live = require('./watcher-live.js');
     assert.equal(live.safeDeliveryText(notes.announcementFor(note, 'create')) !== null, true);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the announced event is the note\'s own state, not the caller\'s word for it', async () => {
+  const serve = require('./serve.js');
+  const root = keep.ROOT;
+  const note = notes.addNote({
+    root,
+    project: PROJECT,
+    scopes: ['staging'],
+    by: { sessionId: 'author-session', agent: 'claude' },
+    message: 'home-only',
+    until: stamp(Date.now() + 3600e3),
+  });
+  const deps = () => ({
+    send: () => {},
+    excluded: new Set(),
+    liveSessionsInCheckout: () => ({ available: true, sessions: [{ id: 'sibling-session' }] }),
+    scanSessions: () => [{ id: 'sibling-session', endedTurn: true, mtime: 2 }],
+  });
+  try {
+    // An uncleared note cannot be announced as cleared, however it is asked for.
+    const created = await serve.announceStateNote(note.id, deps());
+    assert.equal(created.event, 'create');
+    assert.doesNotMatch(created.text, /cleared/);
+
+    // Each extension is its own event; a replay of the same one is refused.
+    notes.extendNote(note.id, stamp(Date.now() + 7200e3), { root });
+    assert.equal((await serve.announceStateNote(note.id, deps())).event, 'extend');
+    assert.equal((await serve.announceStateNote(note.id, deps())).duplicate, true);
+    notes.extendNote(note.id, stamp(Date.now() + 10800e3), { root });
+    assert.equal((await serve.announceStateNote(note.id, deps())).event, 'extend', 'a second extension is not a replay');
+
+    notes.clearNote(note.id, 'restored', { root });
+    const cleared = await serve.announceStateNote(note.id, deps());
+    assert.equal(cleared.event, 'clear');
+    assert.match(cleared.text, /cleared:/);
+    assert.equal((await serve.announceStateNote(note.id, deps())).duplicate, true);
+  } finally {
+    fs.rmSync(notes.notesDir(root), { recursive: true, force: true });
+  }
 });

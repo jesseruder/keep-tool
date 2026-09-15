@@ -89,7 +89,11 @@ Notes are visible wherever holds are:
 - the daemon's `who` snapshot, so the console can render them.
 
 They are also broadcast. After a create, extend, or clear, the CLI asks the daemon
-(`POST /api/notes/announce`) to tell the sibling live sessions in the same checkout —
+(`POST /api/notes/announce {id}`) to tell the sibling live sessions in the same
+checkout. The daemon derives *which* event it is from the note's own state rather
+than from the request — a caller cannot announce a live note as cleared — and
+records it on the note, so a replayed request is refused with 409 instead of typing
+the same line into every sibling a second time. Recipients are —
 the author excluded, reviewer and spawned sessions excluded, mid-turn sessions
 skipped. The message says what changed and then says `Information only; nothing is
 blocked.` If the daemon is down, the CLI prints one line and exits 0: the note is

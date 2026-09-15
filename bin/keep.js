@@ -3141,9 +3141,12 @@ const NOTE_USAGE = [
 // A note is information, so the daemon carries it to the siblings who need it and
 // a daemon that is down costs the broadcast, never the note. Same shape as
 // notifyStepWaiters: best effort, one line on failure, exit 0.
-async function announceNote(note, event) {
+async function announceNote(note) {
   try {
-    const response = await postKeepApi('/api/notes/announce', { id: note.id, event }, 5e3);
+    // No event: the daemon reads it off the note, so a replayed request cannot
+    // tell the fleet a constraint was lifted when it was not.
+    const response = await postKeepApi('/api/notes/announce', { id: note.id }, 5e3);
+    if (response.status === 409) return console.log('already broadcast; nothing sent twice');
     if (response.status < 200 || response.status >= 300) throw new Error(`HTTP ${response.status}`);
     let sent = 0;
     try { sent = (JSON.parse(response.data).sent || []).length; } catch {}
@@ -3181,7 +3184,7 @@ commands.note = async (argv) => {
     const note = notes.extendNote(o.extend, parseWhen(o.for));
     if (!note) die(`${o.extend} could not be extended; it may have just been cleared`);
     console.log(`${note.id}: extended until ${note.until} (its expiry nag is reset)`);
-    return announceNote(note, 'extend');
+    return announceNote(note);
   }
 
   if (o.clear !== undefined) {
@@ -3199,7 +3202,7 @@ commands.note = async (argv) => {
     const note = notes.clearNote(o.clear, o.m ? cleanScalar(o.m, 'reason') : '');
     if (!note) die(`${o.clear} could not be cleared; it may have just been removed`);
     console.log(`${note.id}: cleared`);
-    return announceNote(note, 'clear');
+    return announceNote(note);
   }
 
   if (o._.length !== 1 || !o.m || !o.for) die(NOTE_USAGE);
@@ -3225,7 +3228,7 @@ commands.note = async (argv) => {
   }
   console.log(`${note.id}: ${project} [${scopes.join(', ')}] until ${note.until} — ${note.message}`);
   console.log('Information only; nothing is blocked by a note. Clear it early with keep note --clear ' + note.id + '.');
-  return announceNote(note, 'create');
+  return announceNote(note);
 };
 
 commands.notes = (argv) => {

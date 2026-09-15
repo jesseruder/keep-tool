@@ -220,7 +220,6 @@ function extendNote(id, until, { root, now = Date.now() } = {}) {
     // the one place a note's nag state is deliberately rewound.
     note.nagged = null;
     note.nagAttempts = 0;
-    note.announcedAt = { ...(note.announcedAt || {}), extend: null };
   });
 }
 
@@ -280,6 +279,35 @@ function describeNote(note) {
 // ---------- the broadcast ----------
 
 const ANNOUNCE_PREFIX = '[keep] ';
+
+// What a note's own state says happened to it, rather than what a caller claims.
+// The announce endpoint is reachable by anything that can talk to the daemon, and
+// a caller-supplied event let a `create` be replayed as a `clear` — a message
+// telling every sibling session that a constraint had been lifted when it had
+// not. Derived here, from the note, or not at all.
+function announceEventFor(note) {
+  if (!note) return null;
+  if (note.cleared) return 'clear';
+  return (note.extended || []).length ? 'extend' : 'create';
+}
+
+// One announcement per event. `extend` is counted rather than flagged, because a
+// note extended twice has two things to say and the second is not a replay.
+function announcedAlready(note, event) {
+  const marks = (note && note.announcedAt) || {};
+  if (event === 'clear') return Boolean(marks.clear);
+  if (event === 'extend') return Number(marks.extendCount || 0) >= ((note.extended || []).length);
+  return Boolean(marks.create);
+}
+
+function markAnnounced(id, event, at, root) {
+  return updateNote(id, root, (note) => {
+    const marks = { ...(note.announcedAt || {}) };
+    marks[event] = at;
+    if (event === 'extend') marks.extendCount = (note.extended || []).length;
+    note.announcedAt = marks;
+  });
+}
 
 function announcementFor(note, event = 'create') {
   const by = note.by || {};
@@ -410,5 +438,6 @@ module.exports = {
   defaultRoot, notesDir, noteFile, projectKey, scrub, sanitize, stampOf,
   loadNotes, allNotes, findNote, addNote, extendNote, clearNote, writeFileNotes,
   activeNotes, describeNote, announcementFor, nagFor,
+  announceEventFor, announcedAlready, markAnnounced,
   dueForNag, markNagged, deferNag, sweep, startScheduler, NAG_ATTEMPT_LIMIT,
 };
