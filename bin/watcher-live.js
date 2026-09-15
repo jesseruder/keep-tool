@@ -632,6 +632,9 @@ function recordObservationDecision(turn, observation, message, deps = {}) {
       reviewer: 'watcher',
       promptHash: watcher.PROMPT_HASH,
       deferredReason: deps.deferredReason || '',
+      // The same clock the hourly cap reads, or a row stamped a millisecond
+      // after `now` counts against a window that starts at `now + 1`.
+      ...(Number.isFinite(deps.now) ? { now: deps.now } : {}),
     });
     return entry.id;
   } catch (error) {
