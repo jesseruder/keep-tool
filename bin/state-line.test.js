@@ -140,10 +140,13 @@ test('grading records agree without a reason and demands one for disagree', asyn
   // The module posts through api.js; stub the network at globalThis.fetch, which
   // is what api.request uses.
   const originalFetch = globalThis.fetch;
+  const originalLocation = globalThis.location;
+  // api.request resolves paths against location.origin, which Node does not define.
+  globalThis.location = { origin: 'http://keep.test' };
   globalThis.fetch = async (url, options) => {
     calls.push({ url, body: JSON.parse(options.body) });
     return {
-      ok: true, status: 200, statusText: 'OK',
+      ok: true, status: 200, statusText: 'OK', headers: new Headers(),
       text: async () => JSON.stringify({ ok: true, id: 'd-1', type: 'continue', verdict: 'agree',
         stats: { type: 'continue', judged: 14, agree: 12 } }),
     };
@@ -209,7 +212,7 @@ test('grading records agree without a reason and demands one for disagree', asyn
 
     fixture.listeners.get('cancel:click')();
     assert.equal(form.hidden, true);
-  } finally { globalThis.fetch = originalFetch; }
+  } finally { globalThis.fetch = originalFetch; globalThis.location = originalLocation; }
 });
 
 test('the a and d keys grade only when the brief has the keyboard', async () => {

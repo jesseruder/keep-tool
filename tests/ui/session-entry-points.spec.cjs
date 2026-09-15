@@ -19,6 +19,11 @@ test.afterEach(async ({}, info) => {
 
 const requests = path => fixture.events.filter(event => event.event === 'request' && event.path === path);
 const chooser = page => page.locator('.session-launch-dialog');
+async function openActions(root) {
+  const menu = root.locator('.session-actions');
+  if (await menu.getAttribute('open') === null) await menu.locator(':scope > summary').click();
+  return menu;
+}
 
 test('rail chooser cancels without spawning and freezes one explicit agent launch', async ({ page }) => {
   await page.locator('#rail [data-shell]').click();
@@ -120,7 +125,7 @@ test('Triage and Watch Reopen share the recorded-account chooser', async ({ page
   await page.reload();
   await page.locator('#qlist .qtoggle').filter({ hasText: 'Recent' }).click();
   await page.locator('#qlist [data-key="recent:a"]').click();
-  await page.locator('#stage [data-reopen]').click();
+  await (await openActions(page.locator('#stage'))).locator('[data-reopen]').click();
   await expect(chooser(page).locator('[data-launch-account]')).toHaveValue('claude-main');
   await expect(chooser(page).locator('[data-launch-model]')).toHaveCount(0);
   await expect(chooser(page).locator('[data-launch-directory]')).toHaveCount(0);
@@ -128,7 +133,7 @@ test('Triage and Watch Reopen share the recorded-account chooser', async ({ page
   expect(requests('/api/open')).toHaveLength(0);
 
   await page.locator('[data-mode=watch]').click();
-  await page.locator('.wpane[data-pane="pa"] [data-reopen]').click();
+  await (await openActions(page.locator('.wpane[data-pane="pa"]'))).locator('[data-reopen]').click();
   await expect(chooser(page).locator('[data-launch-account]')).toHaveValue('claude-main');
   await chooser(page).locator('[data-launch-submit]').click();
   await expect(chooser(page)).not.toBeVisible();
@@ -236,7 +241,7 @@ test('card fallback and review actions send exact provider account and model cho
   fixture.publish();
   await page.reload();
   await expect(page.locator('#stage')).toHaveAttribute('data-item-key', 'card-fresh');
-  await page.locator('#stage [data-reopen]').click();
+  await (await openActions(page.locator('#stage'))).locator('[data-reopen]').click();
   await expect(chooser(page).locator('[data-launch-kind]')).toHaveValue('claude');
   await expect(chooser(page).locator('[data-launch-model]')).toHaveValue('claude-fable-5-1');
   await chooser(page).locator('[data-launch-kind]').selectOption('codex');

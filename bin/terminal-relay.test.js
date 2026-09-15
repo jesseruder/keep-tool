@@ -210,7 +210,8 @@ test('a late parent ACK callback does not kill a healthy relay or its viewers', 
       afterSend(type) {
         if (type !== 'upgrade' || ++upgradeSends !== 2) return;
         stalled = true;
-        stall(100);
+        // Long enough that the worker's reply is already queued when the parent resumes.
+        stall(1000);
       },
     },
   });
@@ -243,7 +244,8 @@ test('late parent processing of ready does not expire startup or its queued upgr
       afterSend(type) {
         if (type !== 'init' || stalled) return;
         stalled = true;
-        stall(100);
+        // Long enough that the worker's reply is already queued when the parent resumes.
+        stall(1000);
       },
     },
   });
