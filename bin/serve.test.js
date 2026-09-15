@@ -1074,6 +1074,23 @@ test('live ledger sightings and host panes keep Claude sessions alive; Codex sta
   assert.deepEqual(sessions.map((s) => [s.state, s.alive]), [['running', true], ['running', true], ['running', null]]);
 });
 
+test('dashboard publish reuses recent host panes instead of publishing none', () => {
+  const { hostPanesForPublish } = require('./serve');
+  const start = 1_000_000;
+  const memo = { panes: null, at: 0 };
+  assert.throws(() => hostPanesForPublish(null, memo, start + 1000, { startedAt: start, published: false }),
+    /host panes unavailable/, 'a starting daemon publishes nothing rather than zero panes');
+  const panes = [{ id: 'p1' }];
+  assert.equal(hostPanesForPublish(panes, memo, start + 2000, { startedAt: start, published: true }), panes);
+  assert.equal(hostPanesForPublish(null, memo, start + 30e3, { startedAt: start, published: true }), panes,
+    'a failed host request reuses the last good list');
+  assert.equal(hostPanesForPublish(null, memo, start + 2000 + 61e3, { startedAt: start, published: true }), null,
+    'a host that stays down is published as down');
+  assert.equal(hostPanesForPublish(null, { panes: null, at: 0 }, start + 61e3, { startedAt: start, published: false }), null,
+    'startup does not hold publication forever');
+  assert.deepEqual(hostPanesForPublish([], memo, start + 70e3), [], 'a real empty list is published');
+});
+
 test('turn index reads only recently alive sessions and caches codex rollout walks', () => {
   const { liveTurnIndexSessions } = require('./serve');
   let now = Date.parse('2026-09-14T12:00:00Z');

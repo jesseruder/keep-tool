@@ -1200,6 +1200,24 @@ async function listHostPanes(deps = {}, fresh = false) {
   }
 }
 
+// A timed-out host request, or a host not yet connected after a daemon restart,
+// leaves listHostPanes null. Publishing that as zero panes strips every session's
+// liveness, so Waiting on you empties and sessions flash into Running & waiting.
+// Reuse the last good list briefly; with none yet, publish nothing while starting.
+const HOST_PANES_REUSE_MS = 60e3;
+function hostPanesForPublish(panes, memo, now, options = {}) {
+  if (Array.isArray(panes)) {
+    memo.panes = panes;
+    memo.at = now;
+    return panes;
+  }
+  if (memo.panes && now - memo.at < HOST_PANES_REUSE_MS) return memo.panes;
+  if (!options.published && now - (options.startedAt || 0) < HOST_PANES_REUSE_MS) {
+    throw new Error('host panes unavailable; keeping the previous dashboard state');
+  }
+  return panes;
+}
+
 function annotatePaneAgents(panes, rows) {
   const byPid = new Map(rows.map((row) => [row.pid, row]));
   for (const pane of panes) {
@@ -6780,13 +6798,23 @@ function start(deps = {}) {
     hostPanes: options.hostPanes || [],
     companion: options.companion || null,
   });
+  const publishedPanes = { panes: null, at: 0 };
+  const publisherStartedAt = Date.now();
   dashboardPublisher = createDashboardPublisher({
     prepare: async () => {
       // Fence before every source read. A mutation that completes while panes,
       // review launch state, or companion jobs are being collected invalidates
       // this running pass and forces a follow-up carrying the newer fence.
       const capturedMutationFence = mutationFence();
-      const panes = await listHostPanes(deps);
+      let panes;
+      try {
+        panes = hostPanesForPublish(await listHostPanes(deps), publishedPanes, Date.now(),
+          { startedAt: publisherStartedAt, published: Boolean(retainedPublication) });
+      } catch (error) {
+        // Nothing else may invalidate soon after a restart; come back for the host.
+        setTimeout(() => dashboardPublisher?.invalidate(), 1000).unref();
+        throw error;
+      }
       await reviewQueue.reconcile({ inspectLaunch: (active) => inspectReviewQueueLaunch(active) });
       const companion = await companionSnapshot(deps);
       return { hostPanes: panes, companion, mutationFence: capturedMutationFence };
@@ -7806,6 +7834,7 @@ module.exports = {
   invalidateDashboardSources,
   stalledSessionSnapshot,
   liveTurnIndexSessions,
+  hostPanesForPublish,
   buildState,
   applySessionLiveness,
   backfillHostSessions,
