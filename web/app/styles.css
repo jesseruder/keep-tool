@@ -247,6 +247,33 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
   .portable-transfer-card > header, .portable-transfer-card > footer { padding-inline: 14px; }
   .portable-transfer-pause, .portable-transfer-error, .portable-transfer-preview, .portable-transfer-resolution { margin-inline: 14px; }
 }
+/* Relay dialog — the portable-transfer dialog's shape at a narrower width: one
+   target, one message, and the exact text /api/send will receive. */
+.relay-dialog { width: min(680px, calc(100vw - 32px)); max-width: none; max-height: calc(100vh - 32px); padding: 0; border: 1px solid var(--line-2); border-radius: 10px; background: var(--panel); color: var(--text); box-shadow: var(--shadow); }
+.relay-dialog::backdrop { background: rgb(0 0 0 / .55); }
+.relay-card { display: flex; flex-direction: column; max-height: calc(100vh - 34px); }
+.relay-card > header { display: flex; justify-content: space-between; gap: 20px; padding: 20px 22px 14px; border-bottom: 1px solid var(--line); }
+.relay-card header h2 { margin: 1px 0 5px; font-size: 20px; }
+.relay-card header p { margin: 0; color: var(--muted); }
+.relay-card .eyebrow { color: var(--info); font: 500 10px var(--mono); text-transform: uppercase; letter-spacing: .09em; }
+.relay-fields { display: grid; gap: 14px; padding: 18px 22px 12px; }
+.relay-fields label { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 12px; }
+.relay-fields select, .relay-fields textarea { width: 100%; padding: 8px 9px; border: 1px solid var(--line-2); border-radius: 5px; background: var(--panel-2); color: var(--text); }
+.relay-fields textarea { min-height: 110px; resize: vertical; font: 12px/1.5 var(--mono); }
+.relay-empty { margin: 0; color: var(--warn); }
+.relay-preview { min-height: 0; margin: 0 22px 12px; display: flex; flex-direction: column; }
+.relay-preview h3 { margin: 0 0 7px; font-size: 12px; }
+.relay-preview pre { max-height: 26vh; margin: 0; padding: 12px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: 5px; background: var(--term-bg); color: var(--term-fg); font: 11.5px/1.5 var(--mono); }
+.relay-note { margin: 7px 0 0; color: var(--muted); font: 11px var(--mono); }
+.relay-error { margin: 0 22px 14px; color: var(--bad); }
+.relay-card > footer { display: flex; justify-content: flex-end; gap: 12px; padding: 12px 22px 18px; border-top: 1px solid var(--line); }
+@media (max-width: 660px) {
+  .relay-dialog { width: calc(100vw - 16px); max-height: calc(100vh - 16px); }
+  .relay-card { max-height: calc(100vh - 18px); }
+  .relay-fields { padding-inline: 14px; }
+  .relay-card > header, .relay-card > footer { padding-inline: 14px; }
+  .relay-preview, .relay-error { margin-inline: 14px; }
+}
 .reviewer-state { color: var(--ok); }
 .review-pop { display: none; position: absolute; top: 34px; right: 0; width: 340px; max-height: 65vh; overflow: auto; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 6px; padding: 10px 12px; box-shadow: var(--shadow); z-index: 20; font-size: 12px; }
 .shead .acts.open .review-pop { display: block; }

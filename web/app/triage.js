@@ -4,6 +4,7 @@ import { closeSession } from './close-session.js';
 import { restartControls, installRestartControls } from './restart-session.js';
 import { accountLabelHTML, handoffControls, installHandoffControls, hasPendingHandoff } from './account-controls.js';
 import { portableTransferControls, installPortableTransferControls } from './portable-transfer.js';
+import { relayControlsHTML, installRelayControls } from './session-relay.js';
 import { sessionLabel, sessionExplanation, backgroundLabel } from './status.js';
 import { retainSelection, selectionIndex } from './selection.js';
 import { actionsMenuHTML, installActionsMenu, patchActionsMenu, rendererControlsHTML } from './session-actions.js';
@@ -386,14 +387,16 @@ function renderStage(ctx, active, focusItem, running, pinned) {
   const portable = item.sessionId && !session?.reviewer ? portableTransferControls(ctx, item.sessionId) : '';
   const handoff = (closable || pendingHandoff) && !session?.reviewer ? handoffControls(ctx, item.sessionId, item.pane) : '';
   const restart = closable && !pendingHandoff && !session?.reviewer ? restartControls(ctx, item.sessionId) : '';
+  const relay = item.sessionId ? relayControlsHTML(ctx, item.sessionId) : '';
   const markedRunning = Boolean(item.sessionId) && ctx.isMarkedRunning(item);
   const markRunning = !item.sessionId ? ''
     : markedRunning ? '<button class="btn" data-unmark-running title="Put this session back in Waiting on you">Unmark running</button>'
     : waitingItem ? '<button class="btn" data-mark-running title="This session still has background work: list it under Running &amp; waiting until its next message or turn">Mark running</button>' : '';
   ctx.patchHTML(stage.querySelector('.quick-actions'), `${markRunning}${item.sessionId || waitingItem ? '<button class="btn" data-snooze>Snooze 1h</button><button class="btn" data-dismiss><kbd>x</kbd> Dismiss</button>' : ''}${closable ? '<button class="btn" data-close-session>Close</button>' : ''}`);
   const menu = stage.querySelector('.session-actions');
-  patchActionsMenu(ctx, menu, `<button class="btn" data-pin ${item.pane ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}${dependencyWait}<div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><span class="restart-controls">${restart}</span>${hasLivePane ? rendererControlsHTML(ctx, item.pane, pane) : ''}`);
+  patchActionsMenu(ctx, menu, `<button class="btn" data-pin ${item.pane ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}${dependencyWait}<span class="relay-controls">${relay}</span><div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><span class="restart-controls">${restart}</span>${hasLivePane ? rendererControlsHTML(ctx, item.pane, pane) : ''}`);
   installActionsMenu(menu, ctx, item.pane);
+  if (relay) installRelayControls(menu.querySelector('.relay-controls'), ctx);
   if (portable) installPortableTransferControls(menu.querySelector('.portable-transfer-controls'), ctx);
   if (handoff) installHandoffControls(menu.querySelector('.account-controls'), ctx, item.sessionId, item.pane);
   if (restart) installRestartControls(menu.querySelector('.restart-controls'), ctx, item.sessionId, item.pane);

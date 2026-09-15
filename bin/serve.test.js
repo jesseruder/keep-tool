@@ -5674,6 +5674,26 @@ function paneLockSendDeps(typed, gates = {}) {
   };
 }
 
+test('a console relay passes /api/send validation and reaches the target verbatim', async () => {
+  // The console's "Relay to…" action composes this prefix (web/app/session-relay.js)
+  // and sends it through the unchanged /api/send. Nothing about the brackets, the
+  // source id, or the length may make it look like a pane write or a /model command.
+  const typed = [];
+  const deps = paneLockSendDeps(typed);
+  const relay = '[keep relay from claude source-s] the retry path double-sends on a 502';
+  assert.deepEqual(await sendToSessionLocked({ sessionId: 'sess-b', text: relay }, deps), { ok: true, pane: 'pane-b' });
+  assert.deepEqual(typed, [`pane-b:${relay}`]);
+
+  // The server flattens whitespace and caps at 2000 — what the dialog's note says.
+  typed.length = 0;
+  await sendToSessionLocked({ sessionId: 'sess-b', text: '[keep relay from codex abcdefgh] two\nlines   spaced' }, deps);
+  assert.deepEqual(typed, ['pane-b:[keep relay from codex abcdefgh] two lines spaced']);
+  typed.length = 0;
+  await sendToSessionLocked({ sessionId: 'sess-b', text: `[keep relay from codex abcdefgh] ${'x'.repeat(2500)}` }, deps);
+  assert.equal(typed[0].length, 'pane-b:'.length + 2000);
+  assert.equal(isInjectionBusy(), false);
+});
+
 test('sends to different panes hold separate injection locks and run concurrently', async () => {
   const typed = [];
   const gateA = deferred();

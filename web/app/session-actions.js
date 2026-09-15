@@ -6,7 +6,7 @@ export function actionsMenuHTML() {
 
 function focusIdentity(element) {
   if (!(element instanceof Element)) return null;
-  for (const name of ['renderer', 'restart', 'handoffAccount', 'portableTransfer', 'portableFallback']) {
+  for (const name of ['renderer', 'restart', 'handoffAccount', 'portableTransfer', 'portableFallback', 'relaySession']) {
     if (element.dataset[name] != null) return `[data-${name.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)}="${CSS.escape(element.dataset[name])}"]`;
   }
   return ['pin', 'unpin', 'closeSession', 'snooze', 'dismiss', 'waitDependency', 'reopen', 'kill', 'removePane']
