@@ -836,6 +836,45 @@ test('viewer primary arbitration ignores observers and promotes the newest remai
   });
 });
 
+test('a viewer whose connection drops without detaching keeps primary while it reconnects', async () => {
+  await withHost({ primaryReconnectGraceMs: 300 }, async ({ client, sock }) => {
+    const bridge = await connect({ sock });
+    const other = await connect({ sock });
+    let back;
+    try {
+      const events = [];
+      await client.subscribe((event) => events.push(event));
+      const { pane } = await client.request('spawn', { cmd: '/bin/sh', args: ['-c', 'cat'] });
+      await bridge.attach(pane.id, { replay: false, viewer: 'stage', primary: true }, () => {});
+      await other.attach(pane.id, { replay: false, viewer: 'tile', primary: false }, () => {});
+      await bridge.request('resize', { pane: pane.id, cols: 120, rows: 40, force: true });
+      bridge.close(); // the daemon died: its bridge never sent detach
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal((await client.request('get', { pane: pane.id })).pane.primary, 'stage', 'held through the reconnect');
+
+      back = await connect({ sock });
+      await back.attach(pane.id, { replay: false, viewer: 'stage', primary: false }, () => {});
+      const resizedBefore = events.filter((event) => event.type === 'resized').length;
+      const same = await back.request('resize', { pane: pane.id, cols: 120, rows: 40, force: true });
+      assert.equal(same.applied, true);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      assert.equal(events.filter((event) => event.type === 'resized').length, resizedBefore,
+        'a same-size claim leaves the PTY alone');
+      assert.equal((await client.request('get', { pane: pane.id })).pane.primary, 'stage', 'the returned viewer keeps primary');
+
+      back.close();
+      await new Promise((resolve) => setTimeout(resolve, 450));
+      assert.equal((await client.request('get', { pane: pane.id })).pane.primary, null,
+        'a viewer that never returns hands off once the grace ends');
+      await client.request('kill', { pane: pane.id });
+    } finally {
+      bridge.close();
+      other.close();
+      if (back) back.close();
+    }
+  });
+});
+
 test('automatic input is accepted only from the attached primary and never claims an owner-less pane', async () => {
   await withHost({}, async ({ client, sock }) => {
     const observer = await connect({ sock });

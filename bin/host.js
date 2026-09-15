@@ -301,6 +301,7 @@ function createHost(options = {}) {
   const coldDir = path.resolve(options.coldDir || `${sock}.screens`);
   const coldIO = options.coldIO || fs.promises;
   const log = options.log === undefined ? (line) => process.stdout.write(`${line}\n`) : options.log;
+  const primaryReconnectGraceMs = Math.max(0, Number(options.primaryReconnectGraceMs ?? 60e3));
   const panes = new Map();
   const connections = new Set();
   const subscribers = new Set();
@@ -416,7 +417,21 @@ function createHost(options = {}) {
       .sort((a, b) => b.order - a.order);
     setPrimary(pane, remaining.length ? remaining[0].viewer : null);
   };
-  const detachPane = (connection, pane, preservePrimary = false) => {
+  // A daemon restart closes its host connection without detaching, and its bridges
+  // re-attach under the same viewer ids moments later. Keep that viewer primary for a
+  // grace period so the terminal neither drops to a scaled observer nor gets resized
+  // by whichever viewer claims first; a viewer that never returns hands off as before.
+  const holdPrimary = (pane, viewer) => {
+    if (pane.primaryGraceTimer) clearTimeout(pane.primaryGraceTimer);
+    pane.primaryGraceTimer = setTimeout(() => {
+      pane.primaryGraceTimer = null;
+      if (panes.get(pane.id) !== pane || pane.primary !== viewer) return;
+      if ([...pane.attachments.values()].some((candidate) => candidate.viewer === viewer)) return;
+      promotePrimary(pane);
+    }, primaryReconnectGraceMs);
+    pane.primaryGraceTimer.unref?.();
+  };
+  const detachPane = (connection, pane, preservePrimary = false, graceful = false) => {
     const attachment = pane.attachments.get(connection);
     pane.attachments.delete(connection);
     connection.attached.delete(pane.id);
@@ -424,21 +439,25 @@ function createHost(options = {}) {
     connection.viewers.delete(pane.id);
     if (!preservePrimary && attachment && pane.primary === attachment.viewer
         && ![...pane.attachments.values()].some((candidate) => candidate.viewer === attachment.viewer)) {
-      promotePrimary(pane);
+      if (graceful) holdPrimary(pane, attachment.viewer);
+      else promotePrimary(pane);
     }
     scheduleFreeze(pane);
   };
-  const detachConnection = (connection, preservePrimary = false) => {
+  const detachConnection = (connection, preservePrimary = false, graceful = false) => {
     subscribers.delete(connection);
     connection.subscribed = false;
     for (const id of [...connection.attached]) {
       const pane = panes.get(id);
-      if (pane) detachPane(connection, pane, preservePrimary);
+      if (pane) detachPane(connection, pane, preservePrimary, graceful);
     }
     if (!preservePrimary) {
       for (const [paneId, viewer] of connection.primaryClaims) {
         const pane = panes.get(paneId);
-        if (pane && pane.primary === viewer) promotePrimary(pane);
+        if (pane && pane.primary === viewer) {
+          if (graceful) holdPrimary(pane, viewer);
+          else promotePrimary(pane);
+        }
       }
     }
     connection.primaryClaims.clear();
@@ -887,6 +906,11 @@ function createHost(options = {}) {
             || (viewer && pane.primary !== viewer) || (!viewer && pane.primary !== null)) {
           return { result: { pane: publicPane(pane), applied: false, primary: pane.primary } };
         }
+        // A reconnecting viewer re-claims at the size it already set. Resizing the PTY
+        // anyway sends SIGWINCH and makes a full-screen TUI redraw for nothing.
+        if (cols === pane.cols && rows === pane.rows) {
+          return { result: { pane: publicPane(pane), applied: true, primary: pane.primary } };
+        }
         await settled(pane);
         if (!pane.alive) throw new Error('pane has exited');
         if (panes.get(pane.id) !== pane) throw new Error('pane process changed');
@@ -955,6 +979,10 @@ function createHost(options = {}) {
           connection.viewers.set(pane.id, viewer);
           connection.pendingAttach.set(pane.id, pending);
           if (attachment.primary && pane.primary === null) setPrimary(pane, viewer);
+          if (pane.primary === viewer && pane.primaryGraceTimer) {
+            clearTimeout(pane.primaryGraceTimer);
+            pane.primaryGraceTimer = null;
+          }
         } catch (error) {
           detachPane(connection, pane);
           throw error;
@@ -1144,7 +1172,7 @@ function createHost(options = {}) {
     socket.on('error', () => {});
     socket.on('close', () => {
       connections.delete(connection);
-      detachConnection(connection, handingOff);
+      detachConnection(connection, handingOff, true);
     });
   });
 
