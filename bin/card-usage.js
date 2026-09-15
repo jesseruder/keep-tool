@@ -203,6 +203,35 @@ function initialize(root, tasks, now = Date.now()) {
   write(file, ledger); // durable cutoff before scanning; crash can't move it
   return true;
 }
+// Serializes collectors (a manual run, an overlapping daemon) now that Keep's lock no
+// longer does: two passes replacing the ledger from the same base drop one pass's work.
+// A busy lock skips this pass instead of waiting; the next pass catches up.
+function withCollectLock(root, fn) {
+  const lock = path.join(dir(root), 'collect.lock');
+  const ownerFile = path.join(lock, 'owner.json');
+  fs.mkdirSync(dir(root), { recursive: true });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { fs.mkdirSync(lock); } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      let owner = null, age = 0;
+      try { owner = JSON.parse(fs.readFileSync(ownerFile, 'utf8')); } catch {}
+      try { age = Date.now() - fs.statSync(lock).mtimeMs; } catch { continue; }
+      let alive = !owner && age < 60e3; // owner.json is written just after mkdir
+      if (owner && Number.isInteger(owner.pid) && owner.pid > 0) {
+        try { process.kill(owner.pid, 0); alive = true; } catch (error) { alive = error.code === 'EPERM'; }
+      }
+      // The daemon kills a collector after 120s, so a lock this old is abandoned.
+      if (attempt === 0 && (!alive || age > 10 * 60e3)) {
+        fs.rmSync(lock, { recursive: true, force: true });
+        continue;
+      }
+      return { skipped: true, pid: owner?.pid ?? null };
+    }
+    fs.writeFileSync(ownerFile, JSON.stringify({ pid: process.pid, at: Date.now() }));
+    try { return fn(); } finally { fs.rmSync(lock, { recursive: true, force: true }); }
+  }
+  return { skipped: true, pid: null };
+}
 function collect(root, tasks, options = {}) {
   const file = path.join(dir(root), 'ledger.json');
   const now = options.now ?? Date.now();
@@ -313,14 +342,15 @@ function forCard(summary, id) {
   return { since: summary.since, updatedAt: summary.updatedAt, pending: summary.pending, issues: summary.issues,
     ...(Object.hasOwn(summary.cards, id) ? summary.cards[id] : { ...empty(), calls: 0, models: {} }) };
 }
-module.exports = { recordOwner, ownerAt, normalize, fold, initialize, collect, snapshot, forCard, summarize, discover };
+module.exports = { recordOwner, ownerAt, normalize, fold, initialize, withCollectLock, collect, snapshot, forCard, summarize, discover };
 if (require.main === module) {
   const keep = require('./keep.js');
   // Hold Keep's lock only to seed a new ledger. The scan reads transcripts and writes
   // card-usage's own files for seconds; under the lock it starved every command.
   try {
     keep.withLock(() => initialize(keep.ROOT, () => keep.loadAll(true)));
-    collect(keep.ROOT, []);
+    const result = withCollectLock(keep.ROOT, () => collect(keep.ROOT, []));
+    if (result?.skipped) process.stderr.write(`card usage: another collection is running${result.pid ? ` (pid ${result.pid})` : ''}; skipped\n`);
   }
   catch (e) { process.stderr.write(`card usage: ${e.message}\n`); process.exitCode = 1; }
 }

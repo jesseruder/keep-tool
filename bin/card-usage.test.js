@@ -159,6 +159,19 @@ test('initialize loads cards only when it creates the ledger', t => {
   assert.equal(usage.initialize(f.root, () => f.tasks, start), true);
   assert.equal(usage.initialize(f.root, () => { throw new Error('cards loaded'); }, start), false);
 });
+test('the collect lock admits one collector, reclaims a dead holder, and releases on error', t => {
+  const f = fixture(t);
+  const lock = path.join(f.root, '.keep/card-usage/collect.lock');
+  let inner;
+  assert.equal(usage.withCollectLock(f.root, () => { inner = usage.withCollectLock(f.root, () => 'ran'); return 'outer'; }), 'outer');
+  assert.deepEqual(inner, { skipped: true, pid: process.pid });
+  assert.equal(fs.existsSync(lock), false);
+  fs.mkdirSync(lock);
+  fs.writeFileSync(path.join(lock, 'owner.json'), JSON.stringify({ pid: 2 ** 31 - 2, at: start }));
+  assert.equal(usage.withCollectLock(f.root, () => 'reclaimed'), 'reclaimed');
+  assert.throws(() => usage.withCollectLock(f.root, () => { throw new Error('boom'); }), /boom/);
+  assert.equal(fs.existsSync(lock), false);
+});
 test('an owner change recorded while transcripts are being read applies to rows after it', t => {
   const f = fixture(t); f.collect(); f.append(claude('one', 10));
   const openSync = fs.openSync;
