@@ -231,6 +231,8 @@ instructions](app/README.md).
     "KEEP_HOST": "127.0.0.1",
     "KEEP_REVIEWER_MODEL": "fable",
     "KEEP_IDEAS_MODEL": "fable",
+    "KEEP_REVIEW_CADENCE": "events",
+    "KEEP_REVIEW_SWEEP_AT": "07:45",
     "KEEP_OPEN_CLAUDE_FLAGS": "",
     "KEEP_OPEN_CODEX_FLAGS": "",
     "KEEP_AUTO_CLOSE_DONE_MIN": "15"

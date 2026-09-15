@@ -809,6 +809,21 @@ Two invariants the code enforces:
 - Log entries written by headless runs count as weak evidence, and cards with no non-reviewer, non-spawned linked session have their evidence score halved.
 - Each tick includes at most one card per numeric-suffix-stripped title stem, leaving sibling cohort cards eligible for later ticks.
 - `KEEP_REVIEW_TICK_LIMIT` controls the per-tick candidate limit and defaults to 5.
+- `KEEP_REVIEW_CADENCE` chooses when the reviewer is woken. `events` (the default)
+  ticks on a drift verdict from the turn watcher and once a day for the cross-workstream
+  sweep; `clock` is the original tick every `KEEP_REVIEW_TICK_MIN` (default 10) minutes.
+  A drift wake leads with the drifting card, the watcher's state line and its reason,
+  bypasses `KEEP_REVIEW_MIN_GAP_MIN` but never the budget or the live-reviewer gates,
+  is limited to one per session per `KEEP_REVIEW_DRIFT_GAP_MIN` (default 30) minutes,
+  and is sent at most once per turn (the last 200 turn keys live in
+  `.keep/review/_meta.json`, so a daemon restart cannot repeat one). The daily sweep
+  runs at local `KEEP_REVIEW_SWEEP_AT` (default `07:45`, after the ideas sweep), carries
+  the ranked queue plus the sweep clause, and retries every 10 minutes until noon. With
+  `KEEP_WATCHER` off there is no drift signal, so a fallback tick runs every
+  `KEEP_REVIEW_FALLBACK_TICK_MIN` (default 120) minutes; the daemon logs the active mode
+  and why at startup. `POST /api/reviewtick` and `keep review-tick --force` work in both
+  modes, as does reviewer compaction. `keep review-stats` prints the mode, the next sweep
+  and the last drift wake, and the per-day counters include drift wakes.
 - A batch bundle (`review-bundle a b c` or `--queue`) prints the safety envelope, health,
   time-zone and evidence guidance once ahead of every card; a by-hand single-card bundle
   still carries them itself. Uncommitted diffs appear as per-file added/removed counts

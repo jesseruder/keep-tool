@@ -6767,12 +6767,21 @@ commands['review-stats'] = async (argv) => {
   for (const m of stats.markers) {
     console.log(`  ${m.id.slice(0, 8)}  ${m.name} (${m.model})  ${m.state}  registered ${fmt(m.registeredAt)}`);
   }
+  if (stats.cadence) {
+    const c = stats.cadence;
+    console.log(`cadence        : ${c.mode}`
+      + (c.mode === 'events'
+        ? `  (drift wakes${c.watcher ? '' : ' — watcher off, so a fallback tick runs every ' + Math.round(c.tickIntervalMs / 60e3) + ' min'}`
+          + `, sweep ${c.sweepAt || 'unset'}, next ${fmt(c.nextSweepAt)})`
+        : `  (a tick every ${Math.round(c.tickIntervalMs / 60e3)} min)`));
+    if (c.lastDriftWakeAt) console.log(`last drift wake: ${fmt(c.lastDriftWakeAt)}${c.lastDriftCard ? '  (' + c.lastDriftCard + ')' : ''}`);
+  }
   console.log(`last tick sent : ${fmt(stats.lastTickAt)}${stats.lastTickTasks.length ? '  (' + stats.lastTickTasks.join(', ') + ')' : ''}`);
   if (stats.lastSkip) console.log(`last skip      : ${fmt(stats.lastSkip.at)}  (${stats.lastSkip.why})`);
   const days = Object.keys(stats.days).sort().slice(-3);
   for (const day of days) {
     const d = stats.days[day];
-    console.log(`${day}: ticks ${d.ticks || 0}, notes ${d.notes || 0}, ideas ${d.ideas || 0}, acks ${d.acks || 0}, statuses ${d.statuses || 0}, nudges ${d.nudges || 0}, compacts ${d.compacts || 0}`);
+    console.log(`${day}: ticks ${d.ticks || 0} (${d.driftWakes || 0} drift), notes ${d.notes || 0}, ideas ${d.ideas || 0}, acks ${d.acks || 0}, statuses ${d.statuses || 0}, nudges ${d.nudges || 0}, compacts ${d.compacts || 0}`);
   }
   console.log(`findings on record: ${stats.findingsTotal} (${stats.dismissed} dismissed)`);
   console.log('finding outcomes: ' + Object.entries(stats.outcomes).map(([key, n]) => `${n} ${key}`).join(', '));

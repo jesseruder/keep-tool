@@ -2810,3 +2810,131 @@ test('gated-step lines sit below the safety envelope, never above it', () => {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+// ---------- event-driven cadence ----------
+
+const cadence = require('./review.js');
+
+test('the sweep clock opens a window, retries every ten minutes and closes at noon', () => {
+  const clock = cadence.sweepClock('07:45');
+  assert.deepEqual(clock, { hour: 7, minute: 45, invalid: false });
+  assert.equal(cadence.sweepClock('99:99').invalid, true, 'a bad clock falls back rather than ticking at midnight');
+
+  const at = (h, m) => new Date(2026, 8, 14, h, m).getTime();
+  assert.equal(cadence.sweepTickDue({}, at(7, 44), clock), false, 'before the window');
+  assert.equal(cadence.sweepTickDue({}, at(7, 45), clock), true);
+  assert.equal(cadence.sweepTickDue({}, at(12, 0), clock), false, 'the window closes at noon');
+  assert.equal(cadence.sweepTickDue({ sweepTick: { day: '2026-09-14' } }, at(9, 0), clock), false, 'once a day');
+  assert.equal(cadence.sweepTickDue({ sweepTick: { day: '2026-09-13' } }, at(9, 0), clock), true, 'yesterday does not count');
+  const attempted = { sweepTick: { lastAttemptAt: at(8, 0) } };
+  assert.equal(cadence.sweepTickDue(attempted, at(8, 5), clock), false, 'a refused attempt waits ten minutes');
+  assert.equal(cadence.sweepTickDue(attempted, at(8, 10), clock), true);
+  assert.equal(cadence.sweepTickDue({}, at(9, 0), { ...clock, invalid: true }), false);
+  assert.equal(cadence.nextSweepAt(at(9, 0), clock), new Date(2026, 8, 15, 7, 45).getTime(), 'past today, the next one is tomorrow');
+});
+
+test('a drift wake bypasses the min gap but not the budget, the turn or the per-session gap', () => {
+  const now = Date.parse('2026-09-14T10:00:00Z');
+  const detail = { sessionId: 'sess-a', turn: 12, cardId: 'card-a' };
+  const ok = {
+    budget: { code: 0 }, reviewer: { id: 'r', state: 'idle', endedTurn: true },
+    queue: { ranked: [] }, lastTickAt: now - 60e3, now, trigger: 'drift',
+  };
+  const gate = cadence.driftGate({}, detail, now);
+  assert.equal(shouldSendTick({ ...ok, drift: gate }).send, true, 'no ranked queue and a one-minute-old tick still wake it');
+  assert.match(shouldSendTick({ ...ok, drift: gate, budget: { code: 6, reason: 'weekly exhausted' } }).why, /weekly exhausted/);
+  assert.match(shouldSendTick({ ...ok, drift: gate, reviewer: { ...ok.reviewer, endedTurn: false } }).why, /mid-turn/);
+  assert.match(shouldSendTick({ ...ok, drift: gate, reviewer: null }).why, /no live reviewer/);
+
+  const recorded = cadence.recordDriftWake({}, detail, now);
+  assert.match(shouldSendTick({ ...ok, drift: cadence.driftGate(recorded, detail, now + 5 * 60e3) }).why,
+    /drift already sent for this turn/);
+  const laterTurn = { ...detail, turn: 13 };
+  assert.match(shouldSendTick({ ...ok, now: now + 5 * 60e3, drift: cadence.driftGate(recorded, laterTurn, now + 5 * 60e3) }).why,
+    /drift gap: last drift wake for this session 5 min ago/);
+  assert.equal(shouldSendTick({ ...ok, now: now + 31 * 60e3, drift: cadence.driftGate(recorded, laterTurn, now + 31 * 60e3) }).send,
+    true, 'past the per-session gap a new turn wakes it again');
+  assert.equal(shouldSendTick({ ...ok, drift: cadence.driftGate(recorded, { ...detail, sessionId: 'sess-b' }, now) }).send,
+    true, 'the gap is per session, not global');
+});
+
+test('drift dedupe state stays bounded and forgets sessions after a day', () => {
+  let meta = {};
+  for (let turn = 0; turn < cadence.MAX_DRIFT_TURN_KEYS + 25; turn += 1) {
+    meta = cadence.recordDriftWake(meta, { sessionId: 'sess-a', turn }, Date.now());
+  }
+  assert.equal(meta.drift.turns.length, cadence.MAX_DRIFT_TURN_KEYS);
+  assert.equal(meta.drift.turns.includes('sess-a#0'), false, 'the oldest keys fall off');
+  assert.equal(meta.drift.turns.at(-1), `sess-a#${cadence.MAX_DRIFT_TURN_KEYS + 24}`);
+
+  const now = Date.now();
+  const stale = { drift: { turns: [], sessions: { old: now - 25 * 3600e3, recent: now - 60e3 } } };
+  const next = cadence.recordDriftWake(stale, { sessionId: 'sess-c', turn: 1 }, now);
+  assert.deepEqual(Object.keys(next.drift.sessions).sort(), ['recent', 'sess-c']);
+});
+
+test('the drift tick message leads with the card and quotes the watcher as data', () => {
+  const text = cadence.driftTickMessage({
+    sessionId: '0123456789abcdef', turn: 4, cardId: 'ship-the-thing',
+    stateLine: 'rewriting the auth layer\nnobody asked for', reason: 'card says "fix the flaky test"',
+  }, [{ task: 'other-card', score: 41 }]);
+  assert.match(text, /^\[keep\] review tick - drift on ship-the-thing \(01234567\): "rewriting the auth layer nobody asked for"\./);
+  assert.match(text, /Watcher reason: "card says "fix the flaky test""/);
+  assert.match(text, /scope-creep\/other finding/);
+  assert.match(text, /Also ranked: other-card\(41\)\.$/);
+  assert.equal(text.includes('\n'), false, 'the injection path types one line');
+  assert.ok(text.length <= 2000);
+
+  const long = cadence.driftTickMessage({ sessionId: 's', turn: 1, cardId: 'c', stateLine: 'x'.repeat(4000), reason: 'y'.repeat(4000) },
+    Array.from({ length: 50 }, (_, i) => ({ task: `card-${i}`, score: i })));
+  assert.ok(long.length <= 2000, 'a runaway verdict cannot overflow the 2000-character limit');
+});
+
+test('the daily sweep sends even with an empty queue; an ordinary tick does not', () => {
+  const now = Date.now();
+  const base = { budget: { code: 0 }, reviewer: { id: 'r', state: 'idle', endedTurn: true }, queue: { ranked: [] }, now };
+  assert.match(shouldSendTick(base).why, /nothing ranked/);
+  assert.equal(shouldSendTick({ ...base, trigger: 'sweep', sweepDue: true }).send, true);
+  assert.equal(shouldSendTick({ ...base, trigger: 'sweep', sweepDue: false }).why, 'sweep not due');
+  assert.match(shouldSendTick({ ...base, trigger: 'sweep', sweepDue: true, lastTickAt: now - 60e3 }).why,
+    /last tick 1 min ago/, 'the sweep still respects the min gap and retries later');
+  assert.match(tickMessage([], true, null), /candidates: none\..*fleet sweep/);
+});
+
+test('cadence mode defaults to events and only `clock` opts out', () => {
+  assert.equal(cadence.cadenceMode({}), 'events');
+  assert.equal(cadence.cadenceMode({ KEEP_REVIEW_CADENCE: 'Clock' }), 'clock');
+  assert.equal(cadence.cadenceMode({ KEEP_REVIEW_CADENCE: 'nonsense' }), 'events');
+});
+
+test('driftWake sends one tick per turn and records it in the day counters', async () => {
+  const sent = [];
+  const deps = {
+    sessions: () => [],
+    findReviewer: () => ({ id: 'reviewer-1', state: 'idle', endedTurn: true }),
+    reviewBudget: () => ({ code: 0, reason: 'within budget' }),
+    send: async (sessionId, text) => { sent.push({ sessionId, text }); },
+  };
+  const event = { sessionId: 'sess-drift', turn: 7, cardId: 'drifting-card', stateLine: 'refactoring everything', reason: 'off card' };
+
+  const first = await cadence.driftWake(deps, event);
+  assert.equal(first.sent, true);
+  assert.equal(first.trigger, 'drift');
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /drift on drifting-card/);
+
+  const repeat = await cadence.driftWake(deps, event);
+  assert.equal(repeat.sent, false);
+  assert.match(repeat.why, /drift already sent for this turn/);
+  assert.equal(sent.length, 1);
+
+  assert.equal((await cadence.driftWake(deps, { turn: 1 })).why, 'drift event has no session/turn');
+
+  const stats = cadence.reviewStats();
+  const today = Object.keys(stats.days).sort().at(-1);
+  assert.equal(stats.days[today].driftWakes, 1);
+  assert.equal(stats.days[today].ticks, 1);
+  assert.equal(stats.cadence.mode, 'events');
+  assert.equal(stats.cadence.lastDriftCard, 'drifting-card');
+  assert.ok(Number.isFinite(stats.cadence.lastDriftWakeAt));
+});

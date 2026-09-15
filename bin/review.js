@@ -3427,8 +3427,21 @@ function reviewStats() {
       } catch {}
     }
   }
+  const clock = sweepClock();
+  const drift = (meta.drift && typeof meta.drift === 'object') ? meta.drift : {};
   return {
     markers,
+    cadence: {
+      mode: cadenceMode(),
+      tickIntervalMs: cadenceMode() === 'clock' ? TICK_MS : (process.env.KEEP_WATCHER === '1' ? null : FALLBACK_TICK_MS),
+      sweepAt: clock.invalid ? null : `${String(clock.hour).padStart(2, '0')}:${String(clock.minute).padStart(2, '0')}`,
+      nextSweepAt: nextSweepAt(now, clock),
+      lastSweepDay: (meta.sweepTick && meta.sweepTick.day) || null,
+      driftGapMs: DRIFT_GAP_MS,
+      lastDriftWakeAt: Number.isFinite(Number(drift.lastAt)) ? Number(drift.lastAt) : null,
+      lastDriftCard: drift.lastCard || null,
+      watcher: process.env.KEEP_WATCHER === '1',
+    },
     lastTickAt: meta.lastTickAt || null,
     lastTickTasks: meta.lastTickTasks || [],
     lastSkip: meta.lastSkip || null,
@@ -3772,6 +3785,15 @@ function classifyBudget(snapshot, model, minHeadroom) {
   return { code: 0, reason: 'within budget', model: scoped ? scoped.label : 'week' };
 }
 
+// The reviewer pane is launched under the automation account registered for the
+// `reviewer` purpose (bin/reviewer-launch.js), so its budget has to be read against
+// that same account: in a multi-account fleet an unpinned read is code 8 and the
+// tick never fires. Falls back to undefined, which is the single-account path.
+function reviewerAccountId(env = process.env) {
+  try { return require('./accounts.js').automationFor('claude', 'reviewer', env).id; }
+  catch { return undefined; }
+}
+
 function reviewBudget(model, snapshot, accountId) {
   const usage = require('./usage.js');
   const value = snapshot || usage.getUsage();
@@ -3793,6 +3815,15 @@ function reviewBudget(model, snapshot, accountId) {
 const TICK_MS = parseInt(process.env.KEEP_REVIEW_TICK_MIN || '10', 10) * 60e3;
 const MIN_GAP_MS = parseInt(process.env.KEEP_REVIEW_MIN_GAP_MIN || '20', 10) * 60e3;
 const TICK_LIMIT = parseInt(process.env.KEEP_REVIEW_TICK_LIMIT || '5', 10);
+// A clock tick pays a model to ask "has anything happened?"; 77% of them answered
+// no. The events cadence asks only when something did: the watcher saw drift, or
+// the day's cross-workstream sweep is due.
+const DRIFT_GAP_MS = parseInt(process.env.KEEP_REVIEW_DRIFT_GAP_MIN || '30', 10) * 60e3;
+const FALLBACK_TICK_MS = parseInt(process.env.KEEP_REVIEW_FALLBACK_TICK_MIN || '120', 10) * 60e3;
+const SWEEP_RETRY_MS = 10 * 60e3;
+const DEFAULT_SWEEP_CLOCK = { hour: 7, minute: 45, invalid: false };
+const MAX_DRIFT_TURN_KEYS = 200;
+const DRIFT_SESSION_TTL_MS = 24 * 3600e3;
 const REVIEW_COMPACT_MIN_TOKENS = parseInt(process.env.KEEP_REVIEW_COMPACT_TOKENS || '200000', 10);
 const REVIEW_COMPACT_IDLE_MS = 2 * 60e3;
 const DEFAULT_REVIEW_COMPACT_INSTRUCTION = 'Preserve continuity across the day: keep standing review instructions, unanswered questions from Owner, recurring cross-card patterns, unresolved hypotheses, counter-evidence, and lessons from corrected findings. For each pattern retain a concise claim, confidence, supporting card IDs/commit references and what would confirm or disprove it. Keep unresolved coordination risks and relevant decisions from today. Summarize repetitive bundle contents and completed per-card details; on-disk review state remains authoritative for exact findings and acknowledgments. Do not discard the pattern synthesis or treat your hypotheses as established facts.';
@@ -3859,12 +3890,111 @@ function tickMessage(rows, sweepDue, lastTick) {
     if ((prefix + candidateList + suffix).length > 2000) break;
     parts.push(part);
   }
-  return prefix + parts.join(', ') + suffix;
+  // The daily sweep sends even with an empty queue: its payload is the sweep clause.
+  return prefix + (parts.length ? parts.join(', ') : 'none') + suffix;
+}
+
+// `events` (the default) wakes the reviewer on drift and once a day; `clock` is the
+// original every-TICK_MS behaviour, kept verbatim for a fleet with the watcher off
+// or an Owner who wants the old cadence back.
+function cadenceMode(env = process.env) {
+  return String(env.KEEP_REVIEW_CADENCE || 'events').trim().toLowerCase() === 'clock' ? 'clock' : 'events';
+}
+
+function sweepClock(value = process.env.KEEP_REVIEW_SWEEP_AT || '07:45') {
+  const match = String(value).match(/^(\d{2}):(\d{2})$/);
+  if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) return { ...DEFAULT_SWEEP_CLOCK, invalid: true };
+  return { hour: Number(match[1]), minute: Number(match[2]), invalid: false };
+}
+
+function localDay(at) {
+  const date = new Date(Number(at));
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+// The same shape as the ideas sweep: a window that opens at the configured minute,
+// one success per local day, and a retry every ten minutes until noon. The reviewer
+// is often mid-turn at 07:45, so "due" has to survive a few refusals.
+function sweepTickDue(meta, now = Date.now(), clock = sweepClock()) {
+  const at = Number(now);
+  if (!Number.isFinite(at) || clock.invalid) return false;
+  const date = new Date(at);
+  const minute = date.getHours() * 60 + date.getMinutes();
+  if (minute < clock.hour * 60 + clock.minute || minute >= 12 * 60) return false;
+  const state = (meta && meta.sweepTick) || {};
+  const day = localDay(at);
+  if (state.day === day) return false;
+  const attemptedAt = Number(state.lastAttemptAt);
+  return !Number.isFinite(attemptedAt) || !attemptedAt
+    || localDay(attemptedAt) !== day || at - attemptedAt >= SWEEP_RETRY_MS;
+}
+
+function nextSweepAt(now = Date.now(), clock = sweepClock()) {
+  if (clock.invalid) return null;
+  const date = new Date(Number(now));
+  const target = new Date(date.getFullYear(), date.getMonth(), date.getDate(), clock.hour, clock.minute, 0, 0);
+  if (target.getTime() <= Number(now)) target.setDate(target.getDate() + 1);
+  return target.getTime();
+}
+
+function driftTurnKey(detail) {
+  return `${detail.sessionId}#${detail.turn}`;
+}
+
+// What the persisted dedupe state says about this drift event. Kept in
+// `_meta.json` so a daemon restart cannot re-wake the reviewer for a turn it has
+// already judged.
+function driftGate(meta, detail, now = Date.now(), gapMs = DRIFT_GAP_MS) {
+  const state = (meta && meta.drift) || {};
+  const turns = Array.isArray(state.turns) ? state.turns : [];
+  const sessions = state.sessions && typeof state.sessions === 'object' ? state.sessions : {};
+  return {
+    gapMs,
+    seenTurn: turns.includes(driftTurnKey(detail)),
+    lastAt: Number(sessions[detail.sessionId]),
+    now,
+  };
+}
+
+function recordDriftWake(meta, detail, now = Date.now()) {
+  const state = meta.drift = meta.drift && typeof meta.drift === 'object' ? meta.drift : {};
+  const turns = (Array.isArray(state.turns) ? state.turns : []).filter((key) => key !== driftTurnKey(detail));
+  turns.push(driftTurnKey(detail));
+  state.turns = turns.slice(-MAX_DRIFT_TURN_KEYS);
+  const sessions = state.sessions && typeof state.sessions === 'object' ? state.sessions : {};
+  state.sessions = Object.fromEntries(Object.entries(sessions)
+    .filter(([, at]) => Number.isFinite(Number(at)) && now - Number(at) < DRIFT_SESSION_TTL_MS));
+  state.sessions[detail.sessionId] = now;
+  state.lastAt = now;
+  state.lastCard = detail.cardId || '';
+  state.lastSession = detail.sessionId;
+  return meta;
+}
+
+// A drift verdict is the watcher's, i.e. a model's, so its prose is untrusted data:
+// quote it, strip control characters, and never let it run off past 2000 characters,
+// which is where the injection path truncates.
+function driftTickMessage(detail, rows) {
+  const card = lintField(detail.cardId, 60) || 'an unlinked session';
+  const session = String(detail.sessionId || '').slice(0, 8) || 'unknown';
+  const stateLine = lintField(detail.stateLine, 300) || '(no state line)';
+  const reason = lintField(detail.reason, 300) || '(none given)';
+  const head = `[keep] review tick - drift on ${card} (${session}): "${stateLine}". Watcher reason: "${reason}".`
+    + ' Verify against the card\'s goal and constraints; if it is real, land a scope-creep/other finding with the exact constraint;'
+    + ' if not, dismiss it and record the outcome.';
+  const parts = [];
+  for (const row of rows || []) {
+    const part = row.task + '(' + row.score + ')';
+    if ((head + ' Also ranked: ' + parts.concat(part).join(', ') + '.').length > 2000) break;
+    parts.push(part);
+  }
+  return parts.length ? `${head} Also ranked: ${parts.join(', ')}.` : head;
 }
 
 // Decide whether to wake the reviewer at all. Pure, so the policy is testable
 // without a daemon, a terminal, or a model.
-function shouldSendTick({ budget, reviewer, queue, lastTickAt, now }) {
+function shouldSendTick({ budget, reviewer, queue, lastTickAt, now, trigger = 'clock', drift, sweepDue }) {
   // Reviewer first: with none registered the budget is irrelevant, and reporting a
   // quota reason would point at the wrong problem.
   if (!reviewer) return { send: false, why: 'no live reviewer session registered' };
@@ -3875,10 +4005,25 @@ function shouldSendTick({ budget, reviewer, queue, lastTickAt, now }) {
   }
   // Mid-turn: typing now would queue behind whatever it is already doing.
   if (reviewer.endedTurn === false) return { send: false, why: 'reviewer is mid-turn' };
+  // Drift is the event the reviewer exists to catch, so it bypasses MIN_GAP and the
+  // ranked queue - but never the budget or the live-reviewer gates above.
+  if (trigger === 'drift') {
+    if (drift && drift.seenTurn) return { send: false, why: 'drift already sent for this turn' };
+    if (drift && Number.isFinite(drift.lastAt) && now - drift.lastAt < drift.gapMs) {
+      return { send: false, why: 'drift gap: last drift wake for this session ' + Math.round((now - drift.lastAt) / 60e3) + ' min ago' };
+    }
+    return { send: true };
+  }
+  if (trigger === 'sweep' && sweepDue === false) return { send: false, why: 'sweep not due' };
   if (lastTickAt && now - lastTickAt < MIN_GAP_MS) {
     return { send: false, why: 'last tick ' + Math.round((now - lastTickAt) / 60e3) + ' min ago' };
   }
-  if (!queue || !queue.ranked.length) return { send: false, why: 'nothing ranked' };
+  // The daily sweep's payload is the sweep clause itself, so a quiet queue is not a
+  // reason to skip it; an ordinary tick with nothing ranked has nothing to say.
+  if (!queue || !queue.ranked.length) {
+    if (trigger === 'sweep') return { send: true };
+    return { send: false, why: 'nothing ranked' };
+  }
   return { send: true };
 }
 
@@ -3946,16 +4091,24 @@ function gcReviewerMarkers(sessionIds) {
 
 async function reviewTick(deps, opts) {
   const options = opts || {};
+  const trigger = options.trigger || 'clock';
+  const detail = trigger === 'drift' ? options.drift : null;
   const now = Date.now();
   const meta = loadMeta();
   const sessions = deps.sessions ? deps.sessions() : [];
-  const reviewer = findReviewerSession(sessions, meta.bootstrapAttempts);
+  const reviewer = (deps.findReviewer || findReviewerSession)(sessions, meta.bootstrapAttempts);
   const model = reviewer ? (readReviewerMarker(reviewer.id).model || reviewerModel()) : reviewerModel();
-  const budget = options.force ? { code: 0, reason: 'forced' } : reviewBudget(model, undefined, reviewer && reviewer.accountId);
+  const budget = options.force
+    ? { code: 0, reason: 'forced' }
+    : (deps.reviewBudget || reviewBudget)(model, undefined, (reviewer && reviewer.accountId) || reviewerAccountId());
   const queue = reviewQueue({ limit: Number.isFinite(TICK_LIMIT) && TICK_LIMIT > 0 ? TICK_LIMIT : 5 });
   const decision = options.force
     ? (reviewer ? { send: Boolean(queue.ranked.length), why: queue.ranked.length ? '' : 'nothing ranked' } : { send: false, why: 'no live reviewer session registered' })
-    : shouldSendTick({ budget, reviewer, queue, lastTickAt: meta.lastTickAt, now });
+    : shouldSendTick({
+      budget, reviewer, queue, lastTickAt: meta.lastTickAt, now, trigger,
+      drift: detail ? driftGate(meta, detail, now) : null,
+      sweepDue: options.sweepDue,
+    });
 
   // Meta writes here re-read fresh state first: a concurrent review-note's save
   // (announce slot, global suppression) must not be clobbered by our stale copy.
@@ -3963,15 +4116,19 @@ async function reviewTick(deps, opts) {
   // would kill the server; the residual race only affects lastSkip/lastTickAt.
   if (!decision.send) {
     // recorded so review-stats can tell "quiet fleet" from "dead scheduler"
-    try { const fresh = loadMeta(); fresh.lastSkip = { at: now, why: decision.why }; saveMeta(fresh); } catch {}
-    return { sent: false, why: decision.why, budget, model, ranked: queue.ranked.length };
+    try { const fresh = loadMeta(); fresh.lastSkip = { at: now, why: decision.why, trigger }; saveMeta(fresh); } catch {}
+    return { sent: false, why: decision.why, budget, model, ranked: queue.ranked.length, trigger };
   }
 
-  const text = tickMessage(queue.ranked, queue.sweepDue, reviewer.bootstrap ? null : (deps.lastTickCost || lastTickCost)(reviewer.id));
+  const text = detail
+    ? driftTickMessage(detail, queue.ranked)
+    : tickMessage(queue.ranked, queue.sweepDue, reviewer.bootstrap ? null : (deps.lastTickCost || lastTickCost)(reviewer.id));
   await deps.send(reviewer.id, text, { bootstrap: Boolean(reviewer.bootstrap) });
   appendReviewEvent({
-    kind: 'tick', sessionId: reviewer.id, cards: queue.ranked.map((r) => r.task),
-    title: 'tick', detail: `read ${queue.ranked.length} card(s)`,
+    kind: 'tick', sessionId: reviewer.id,
+    cards: detail && detail.cardId ? [detail.cardId, ...queue.ranked.map((r) => r.task)] : queue.ranked.map((r) => r.task),
+    title: detail ? 'drift wake' : 'tick',
+    detail: detail ? `drift on ${detail.cardId || 'an unlinked session'}` : `read ${queue.ranked.length} card(s)`,
   });
   const fresh = loadMeta();
   fresh.lastTickAt = now;
@@ -3986,9 +4143,35 @@ async function reviewTick(deps, opts) {
     delete fresh.bootstrapAttempts[reviewer.id];
   }
   bumpDay(fresh, 'ticks');
+  if (detail) {
+    bumpDay(fresh, 'driftWakes');
+    recordDriftWake(fresh, detail, now);
+  }
+  if (trigger === 'sweep') fresh.sweepTick = { ...(fresh.sweepTick || {}), day: localDay(now), lastSentAt: now };
   saveMeta(fresh);
-  if (queue.sweepDue) markFleetSweep();
-  return { sent: true, sessionId: reviewer.id, model, text, ranked: queue.ranked.length };
+  // A drift wake carries no sweep clause, so it must not consume the day's sweep.
+  if (queue.sweepDue && !detail) markFleetSweep();
+  return { sent: true, sessionId: reviewer.id, model, text, ranked: queue.ranked.length, trigger };
+}
+
+// The watcher saw an agent drift from its card. That is exactly the judgment the
+// reviewer exists for, and it is the one moment worth paying a model for, so it
+// wakes the reviewer straight away instead of waiting out a ten-minute clock.
+async function driftWake(deps, event) {
+  const sessionId = String((event && event.sessionId) || '');
+  const turn = Number(event && event.turn);
+  if (!sessionId || !Number.isFinite(turn)) return { sent: false, why: 'drift event has no session/turn', trigger: 'drift' };
+  const detail = {
+    sessionId,
+    turn,
+    cardId: event.cardId || '',
+    stateLine: event.stateLine || '',
+    reason: event.reason || '',
+    message: event.message || '',
+    confidence: event.confidence,
+    decisionId: event.decisionId || '',
+  };
+  return reviewTick(deps, { trigger: 'drift', drift: detail });
 }
 
 function reviewerCompactDecision({ meta, reviewer, transcriptMtime, contextTokens, now, minTokens }) {
@@ -4088,13 +4271,56 @@ function recordTickError(e, record = health.record) {
   process.stderr.write('keep review: tick failed: ' + (e && e.message || e) + '\n');
 }
 
+function recordSweepAttempt(now, sent) {
+  try {
+    const meta = loadMeta();
+    meta.sweepTick = { ...(meta.sweepTick || {}), lastAttemptAt: Number(now) };
+    if (sent) meta.sweepTick.day = localDay(now);
+    saveMeta(meta);
+  } catch {}
+}
+
 function startScheduler(deps) {
-  const run = () => {
-    reviewTick(deps).then(recordTickOutcome).catch(recordTickError);
+  const mode = cadenceMode();
+  const clock = sweepClock();
+  const watcherLive = process.env.KEEP_WATCHER === '1';
+  const run = (options) => {
+    reviewTick(deps, options).then(recordTickOutcome).catch(recordTickError);
   };
-  const iv = setInterval(run, TICK_MS);
-  iv.unref();
-  setTimeout(run, 45e3).unref(); // first pass shortly after boot, after runs.js
+  if (mode === 'clock') {
+    process.stderr.write(`keep review: cadence clock - a tick every ${Math.round(TICK_MS / 60e3)} min (KEEP_REVIEW_CADENCE=clock)\n`);
+    setInterval(run, TICK_MS).unref();
+    setTimeout(run, 45e3).unref(); // first pass shortly after boot, after runs.js
+  } else {
+    // Without the watcher there is no drift signal at all, so the reviewer would
+    // only ever hear from the daily sweep. Keep a slow clock under it.
+    process.stderr.write(`keep review: cadence events - drift wakes plus the daily sweep at ${String(clock.hour).padStart(2, '0')}:${String(clock.minute).padStart(2, '0')}`
+      + (clock.invalid ? ' (invalid KEEP_REVIEW_SWEEP_AT; using the default)' : '')
+      + (watcherLive ? '' : `; KEEP_WATCHER is not 1, so a fallback tick runs every ${Math.round(FALLBACK_TICK_MS / 60e3)} min`) + '\n');
+    let sweeping = false;
+    const sweep = async () => {
+      if (sweeping) return;
+      const now = Date.now();
+      if (!sweepTickDue(loadMeta(), now, clock)) {
+        // health.record treats a skip as a heartbeat: it moves lastRunAt so the row
+        // does not read as a silent scheduler, without clearing a failing streak.
+        health.record('review', { ok: true, skipped: true, detail: 'events cadence; no sweep due' });
+        return;
+      }
+      sweeping = true;
+      try {
+        const result = await reviewTick(deps, { trigger: 'sweep', sweepDue: true });
+        recordSweepAttempt(now, result.sent);
+        recordTickOutcome(result);
+      } catch (error) {
+        recordSweepAttempt(now, false);
+        recordTickError(error);
+      } finally { sweeping = false; }
+    };
+    setInterval(() => { void sweep(); }, 60e3).unref();
+    setTimeout(() => { void sweep(); }, 45e3).unref();
+    if (!watcherLive) setInterval(run, FALLBACK_TICK_MS).unref();
+  }
   let compactInFlight = false;
   const compact = () => {
     if (compactInFlight) return;
@@ -4228,9 +4454,21 @@ module.exports = {
   sessionLiveness,
   classifyBudget,
   reviewBudget,
+  reviewerAccountId,
   reviewerModel,
   tickMessage,
+  driftTickMessage,
   shouldSendTick,
+  cadenceMode,
+  sweepClock,
+  sweepTickDue,
+  nextSweepAt,
+  driftGate,
+  recordDriftWake,
+  driftWake,
+  DRIFT_GAP_MS,
+  FALLBACK_TICK_MS,
+  MAX_DRIFT_TURN_KEYS,
   findReviewerSession,
   pickReviewer,
   BOOTSTRAP_MAX_AGE_MS,

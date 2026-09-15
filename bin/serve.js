@@ -5855,7 +5855,9 @@ function buildState(options = {}) {
           findingsTotal: reviewerStats.findingsTotal,
           dismissed: reviewerStats.dismissed,
           outcomes: reviewerStats.outcomes,
-          tickIntervalMs: review.TICK_MS,
+          tickIntervalMs: reviewerStats.cadence ? reviewerStats.cadence.tickIntervalMs : review.TICK_MS,
+          cadence: reviewerStats.cadence || null,
+          driftWakesToday: Number(((reviewerStats.days || {})[keep.nowStamp().slice(0, 10)] || {}).driftWakes || 0),
           reviewer: current ? { id: current.id, state: current.state, model: current.model } : null,
         },
       };
@@ -7380,16 +7382,34 @@ function start(deps = {}) {
         // The live path exists only here. It uses the same guarded send the
         // console's POST /api/send uses, so target resolution, the precheck and
         // the injection mutex all apply to a watcher message too.
-        deliver: (turn, verdict) => live.maybeDeliver(turn, verdict, {
-          session: sessions.find((candidate) => candidate.id === turn.session_id),
-          // Re-read the session the same way the injection path does, so the
-          // last-moment check is against what is actually on screen now.
-          freshSession: (id) => loadCurrentSession(id),
-          // The precondition runs inside the injection lock, immediately before
-          // the characters are typed: the mutex is the only place where "nothing
-          // has changed" can still be true when the keystrokes land.
-          send: (payload) => watcherSend(payload),
-        }),
+        deliver: async (turn, verdict) => {
+          const outcome = await live.maybeDeliver(turn, verdict, {
+            session: sessions.find((candidate) => candidate.id === turn.session_id),
+            // Re-read the session the same way the injection path does, so the
+            // last-moment check is against what is actually on screen now.
+            freshSession: (id) => loadCurrentSession(id),
+            // The precondition runs inside the injection lock, immediately before
+            // the characters are typed: the mutex is the only place where "nothing
+            // has changed" can still be true when the keystrokes land.
+            send: (payload) => watcherSend(payload),
+          });
+          // A drift verdict is the one event worth waking the reviewer for, so on
+          // the events cadence it ticks here instead of on a ten-minute clock.
+          // Never fatal: the verdict and its delivery stand on their own.
+          if (review.cadenceMode() === 'events' && verdict && verdict.verdict === 'drift'
+              && !String(verdict.model || '').endsWith(':replay')) {
+            try {
+              const woken = await review.driftWake(reviewDeps, {
+                sessionId: turn.session_id, turn: turn.n, cardId: verdict.cardId,
+                stateLine: verdict.state_line, reason: verdict.reason, message: verdict.message,
+                confidence: verdict.confidence, decisionId: verdict.decision_id,
+              });
+              review.recordTickOutcome(woken);
+              if (woken.sent) broadcast();
+            } catch (error) { review.recordTickError(error); }
+          }
+          return outcome;
+        },
       });
       health.record('watcher', {
         ok: result.failures === 0, cadenceMs: 30e3,
