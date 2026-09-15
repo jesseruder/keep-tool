@@ -481,6 +481,13 @@ test('sanitize strips bidi overrides, zero-width characters, and odd spaces', ()
     assert.equal(/[\p{Cf}\p{Zl}\p{Zp}]/u.test(note.message), false);
     // The compatibility spelling of a separator is the same separator.
     assert.equal(notes.scrub('a' + '\u3000' + 'b'), 'a b');
+    // Folding detects; it is never what gets stored. A ligature, a unit, and
+    // half-width katakana are text somebody wrote, and they round-trip.
+    assert.equal(notes.scrub('\ufb01le'), '\ufb01le');
+    assert.equal(notes.scrub('5 \u338f'), '5 \u338f');
+    assert.equal(notes.scrub('\uff76\uff80\uff76\uff85'), '\uff76\uff80\uff76\uff85');
+    const kept = seed(root, { message: 'the \ufb01le is 5 \u338f (\uff76\uff80\uff76\uff85)' + '\u202e' });
+    assert.equal(kept.message, 'the \ufb01le is 5 \u338f (\uff76\uff80\uff76\uff85)');
     // And what is stored is what the watcher would have been willing to deliver.
     const live = require('./watcher-live.js');
     assert.equal(live.safeDeliveryText(notes.announcementFor(note, 'create')) !== null, true);

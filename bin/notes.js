@@ -74,17 +74,28 @@ function atMs(value) {
 // note is stored rather than delivered verbatim, so the same class is stripped
 // here instead. Same set either way: controls, format characters, line and
 // paragraph separators, and every space that is not a plain one.
-const SCRUB_CLASS_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu;
-const SCRUB_SPACE_RE = /[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/g;
+const SCRUB_CLASS_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+const SCRUB_SPACE_RE = /[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/;
 
-// Folded first: a compatibility spelling of a separator is the same separator,
-// and stripping only the canonical one leaves the lookalike standing.
+function offends(text) {
+  return SCRUB_CLASS_RE.test(text) || SCRUB_SPACE_RE.test(text);
+}
+
+// Folding is how a lookalike is *detected*, never what gets stored. Storing the
+// folded form would quietly rewrite legitimate text — the ligature in a filename,
+// the unit in a measurement, half-width katakana someone actually typed — and a
+// note is quoted back to the session that wrote it. So every character is judged
+// on its own folded form and either kept exactly as written or replaced with a
+// plain space.
 function scrub(value) {
   const text = String(value == null ? '' : value);
-  const folded = (() => { try { return text.normalize('NFKC'); } catch { return text; } })();
-  return folded
-    .replace(SCRUB_CLASS_RE, ' ')
-    .replace(SCRUB_SPACE_RE, ' ')
+  let out = '';
+  for (const character of text) {
+    let folded = character;
+    try { folded = character.normalize('NFKC'); } catch {}
+    out += offends(character) || offends(folded) ? ' ' : character;
+  }
+  return out
     .replace(/<<<|>>>/g, '---')
     .replace(/\s+/g, ' ')
     .trim();
