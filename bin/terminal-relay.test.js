@@ -91,9 +91,13 @@ function stall(ms) {
 
 // Stall until `ready()` holds and at least `minMs` passed, so a deadline shorter than
 // `minMs` expires while the awaited message is already queued for the parent.
+// Returns false when `limitMs` ran out first; callers must assert the result.
 function stallUntil(ready, minMs, limitMs = 30000) {
   const started = Date.now();
-  while (Date.now() - started < limitMs && !(Date.now() - started >= minMs && ready())) { /* intentional stall */ }
+  while (Date.now() - started < limitMs) {
+    if (Date.now() - started >= minMs && ready()) return true;
+  }
+  return false;
 }
 
 function maskedFrame(payload) {
@@ -245,6 +249,7 @@ test('a late parent ACK callback does not kill a healthy relay or its viewers', 
 
 test('late parent processing of ready does not expire startup or its queued upgrade', async (t) => {
   let stalled = false;
+  let readyQueuedDuringStall = false;
   const marker = path.join(os.tmpdir(), `keep-relay-ready-${process.pid}-${Date.now()}`);
   t.after(() => fs.rmSync(marker, { force: true }));
   const f = await fixture({
@@ -256,7 +261,7 @@ test('late parent processing of ready does not expire startup or its queued upgr
       afterSend(type) {
         if (type !== 'init' || stalled) return;
         stalled = true;
-        stallUntil(() => fs.existsSync(marker), 500);
+        readyQueuedDuringStall = stallUntil(() => fs.existsSync(marker), 500);
       },
     },
   });
@@ -270,6 +275,7 @@ test('late parent processing of ready does not expire startup or its queued upgr
   await waitFrame(frames, (frame) => !frame.binary && JSON.parse(frame.data).t === 'attached', 'startup attach');
 
   assert.equal(stalled, true);
+  assert.equal(readyQueuedDuringStall, true, 'the worker queued ready before the stalled parent resumed');
   assert.ok(f.installed.relay.pid());
 });
 
