@@ -9,8 +9,10 @@ it. Self-repair is that loop, automated, with the one dangerous step left out.
 When a failure signature persists, Keep opens **one card per signature** with the
 health record and a log excerpt attached, creates a fresh `keep-tool` worktree out
 of process, and opens one repair session there, pointed at a root-cause recipe
-stored on the card. It never restarts the daemon. The agent lands a reviewed fix,
-or leaves the card in review with its branch named, and Owner restarts.
+stored on the card. The scheduler itself never restarts the daemon and never lands
+anything. The agent lands a reviewed fix and then — and only then — pulls it into
+`~/keep-tool` and restarts the daemon into it; if it could not land, it leaves the
+card in review with its branch named and the daemon untouched.
 
 ## What counts as a signature
 
@@ -159,8 +161,9 @@ ok. The plan is always these four steps:
 2. Fix in the worktree with a test that fails before and passes after
 3. Independent review, then `keep reviewed` and `keep land` if `keep allow <card>
    land` allows; otherwise leave the card in review with the branch named
-4. Owner restarts the daemon (`keep allow <card> restart` is not granted; never
-   restart it yourself)
+4. Once the fix is on origin/master: `git -C ~/keep-tool pull --ff-only`,
+   `keep restart-daemon`, then confirm the row is green with `keep health` (both
+   are refused until the land)
 
 Evidence is attached as artifacts under `.keep/artifacts/<card>/`: the failing
 health row with the `daemon` row, the whole health snapshot, the last 80 serve.log
@@ -235,25 +238,28 @@ for it to work.
 
 The recipe frames the card log and the artifacts as data, not instructions, and
 names the constraints: work only in the worktree, never edit or commit in
-`~/keep-tool`, never restart the daemon, review through `keep codex` — **waiting
+`~/keep-tool`, do not restart the daemon before the land, review through
+`keep codex` — **waiting
 for the result in the foreground, never ending a turn with the review pending** —
 record it with `keep reviewed`, land only through `keep allow` + `keep land`, and
-finish with a `keep checkin --status review` naming the commit and the restart
-Owner still has to do.
+then — only then — pull the fix into `~/keep-tool`, restart the daemon into it,
+confirm the row went green, and close the card.
 
-## What is not automated, and why
+## What is gated, and until when
 
-**The restart stays gated.** The agent can make the fix; it cannot decide that
-this is a good moment to drop every live session's daemon. A restart mid-repair
-also destroys the running state that produced the evidence. So `keep hook
-pre-bash` refuses, for any command in a session with `KEEP_REPAIR=1`:
+**The restart is gated on the fix being landed.** The agent can make the fix; it
+cannot decide, while that fix is still sitting in its worktree, that this is a good
+moment to drop every live session's daemon — and a restart mid-repair destroys the
+running state that produced the evidence. So `keep hook pre-bash` refuses, for any
+command in a session with `KEEP_REPAIR=1`:
 
 - `keep restart-daemon`, `keep service`, `launchctl` — including the node-wrapper
   and shebang spellings (`node ~/keep-tool/bin/keep.js restart-daemon`), starting a
   second daemon with `bin/serve.js`, and `curl`/`wget`/`fetch` at
   `/api/restart-daemon` (grepping the endpoint out of the source is still fine)
 - git in the main `~/keep-tool` checkout **or anything under it**, targeted with
-  `-C`/`--git-dir`/`--work-tree` or reached by `cd`, unless the subcommand is
+  `-C`/`--git-dir`/`--work-tree` or reached by `cd`, spelled `~`, `$HOME` or
+  absolute, unless the subcommand is
   `log`, `status`, `diff`, `show` or `rev-parse` — the diagnosing agent has every
   reason to read the live checkout and none to write to it
 - `git push --force`, `--force-with-lease`, a `+refspec`, and `wt land` — landing
@@ -268,6 +274,41 @@ installed: a repair session running in a managed automation account whose
 `settings.json` has no Keep hooks is unguarded, restart refusal and raw-resume
 refusal both. `keep setup hooks` installs them in every managed Claude account, and
 `keep doctor` names any account still missing them.
+
+**Once the card's fix is on `origin/master`, exactly two of those come back:**
+
+```sh
+git -C ~/keep-tool pull --ff-only     # or: pull --ff-only origin master
+keep restart-daemon                   # and the node/shebang spelling of it
+```
+
+The predicate is `landedFor(cardId)` in `bin/self-repair.js`, asked at most once
+per Bash command and only when something is about to be refused. It resolves the
+session to its card with `cardForSession(sessionId)` — the repair state entry whose
+`sessionId` matches, which is the same match that armed `KEEP_REPAIR=1` — and then
+asks whether that card's fix has landed.
+
+`keep land` writes no record of its own: `.keep/reviews/<card>.json` holds
+`keep reviewed` records, which say a patch was reviewed, not that one was pushed.
+What `keep land` leaves is a check-in on the card — `Landed <branch> onto <default>`
+with the pushed sha in that entry's `commits:` field — and that entry is the land
+record. `landedFor` takes those shas and asks the live checkout whether any of them
+is an ancestor of `origin/<default>`. It never fetches: this runs in front of every
+Bash call the session makes, so a network round trip would stall the whole repair,
+and the refs are already fresh — the landed sweep and the `git-pull` scheduler keep
+`origin/master` current, and `keep land` pushed seconds earlier.
+
+When it says yes, the command runs and one line goes to stderr:
+
+```
+keep: repair session may restart: <card>'s fix <sha7> is on origin/master
+```
+
+Everything else stays refused, before and after the land: `keep service`,
+`launchctl`, `bin/serve.js`, the `/api/restart-daemon` fetch, a bare `git pull`
+without `--ff-only`, and `git -C ~/keep-tool merge`/`reset`/`checkout` or any other
+write in the live checkout. A session whose card cannot be resolved, whose card has
+no land check-in, or whose predicate throws is refused exactly as it was before.
 
 **The card is not closed automatically**, the fix is not landed without a recorded
 review, and `--allow` grants cannot be set from an agent session, so the repair
