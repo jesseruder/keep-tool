@@ -935,18 +935,23 @@ let refreshFailingSince = 0;
 let refreshFailures = 0;
 let refreshFailureToasted = false;
 let refreshMarkedReconnecting = false;
+// What the event stream last reported; a fetch recovery must not claim "live" for it.
+let eventStreamStatus = null;
+// api.js marks the failures a restart produces: an unreachable daemon, the refresh
+// timeout, and the starting daemon's 503s. Anything else (a full action queue, a bug in
+// the API layer) is not a restart and toasts at once.
 function transientRefreshError(error) {
-  const status = Number(error?.status);
-  return !status || status === 502 || status === 503 || status === 504;
+  return error?.transient === true;
 }
 function refreshRecovered() {
+  clearTimeout(reloadRetry);
   refreshFailingSince = 0;
   refreshFailures = 0;
   refreshFailureToasted = false;
   if (refreshMarkedReconnecting) {
     refreshMarkedReconnecting = false;
     const label = document.querySelector('#connection');
-    if (label?.dataset.status === 'reconnecting') label.dataset.status = 'live';
+    if (label?.dataset.status === 'reconnecting') label.dataset.status = eventStreamStatus || 'live';
   }
 }
 let pendingNotificationKey = null;
@@ -1026,9 +1031,12 @@ async function reload() {
           refreshFailureToasted = true;
           toast(`State refresh failed: ${error.message}`);
         }
+        // One retry loop, however many reloads were in flight when the daemon went away.
+        clearTimeout(reloadRetry);
         reloadRetry = setTimeout(reload, Math.min(5000, 1500 * refreshFailures));
       } else {
         toast(`State refresh failed: ${error.message}`);
+        clearTimeout(reloadRetry);
         reloadRetry = setTimeout(reload, 1500);
       }
     }
@@ -1412,6 +1420,7 @@ installNotificationClicks((key) => { pendingNotificationKey = key; reload(); });
 // Subscribe even when the first request fails. EventSource reconnects after a
 // daemon restart; every successful connection refreshes the snapshot as well.
 api.subscribe(reload, (status) => {
+  eventStreamStatus = status;
   document.querySelector('#connection').dataset.status = status;
   if (status === 'live') reload();
 }, focusSession);

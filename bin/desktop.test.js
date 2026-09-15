@@ -73,13 +73,14 @@ test('a daemon restart retries quietly; only a long outage or a real error toast
   vm.runInContext(app.slice(reloadStart, app.indexOf('\nconst ctx =', reloadStart)), context);
   const reload = () => vm.runInContext('reload()', context);
 
-  failure = Object.assign(Error('dashboard state is still loading'), { status: 503 });
+  const unreachable = () => Object.assign(TypeError('Failed to fetch'), { transient: true });
+  failure = Object.assign(Error('dashboard state is still loading'), { status: 503, transient: true });
   await reload();
   assert.deepEqual(toasts, [], 'a restarting daemon does not toast');
   assert.equal(label.dataset.status, 'reconnecting');
   assert.equal(typeof retry, 'function');
   clock += 20e3;
-  failure = TypeError('Failed to fetch');
+  failure = unreachable();
   await retry();
   assert.deepEqual(toasts, [], 'twenty seconds of refused connections stays quiet');
   failure = null;
@@ -87,7 +88,23 @@ test('a daemon restart retries quietly; only a long outage or a real error toast
   assert.equal(label.dataset.status, 'live', 'recovery clears the reconnecting state');
   assert.equal(retry, null);
 
-  failure = TypeError('Failed to fetch');
+  failure = unreachable();
+  await reload();
+  vm.runInContext("eventStreamStatus = 'reconnecting'", context);
+  failure = null;
+  await retry();
+  assert.equal(label.dataset.status, 'reconnecting', 'a fetch recovery leaves the event stream status alone');
+  vm.runInContext("eventStreamStatus = 'live'", context);
+  label.dataset.status = 'live';
+
+  failure = Object.assign(Error('dashboard action queue is full'), { status: 503, transient: false });
+  await reload();
+  assert.equal(toasts.length, 1, 'a 503 that is not a restart toasts immediately');
+  failure = null;
+  await retry();
+  toasts.length = 0;
+
+  failure = unreachable();
   await reload();
   clock += 61e3;
   await retry();

@@ -36,14 +36,25 @@ async function request(url, options = {}) {
   if ((pathname === '/api/state' || pathname === '/api/portable-transfers') && requiredFence) {
     headers['x-keep-after-mutation'] = requiredFence;
   }
-  const response = await fetch(url, { ...options, headers });
-  const text = await response.text();
+  let response;
+  let text;
+  try {
+    response = await fetch(url, { ...options, headers });
+    text = await response.text();
+  } catch (error) {
+    // The daemon is unreachable (refused, dropped, aborted): a restart looks like this.
+    if (error && typeof error === 'object') error.transient = true;
+    throw error;
+  }
   let body = null;
   try { body = text ? JSON.parse(text) : null; } catch {}
   if (!response.ok) {
     const error = new Error(body?.error || text || `${response.status} ${response.statusText}`);
     error.status = response.status;
     error.body = body;
+    // A starting daemon answers these until its first dashboard build is published.
+    error.transient = response.status === 503
+      && ['dashboard state is still loading', 'dashboard state refresh is pending'].includes(body?.error);
     throw error;
   }
   const fence = response.headers.get('x-keep-mutation-fence') || '';
@@ -98,7 +109,11 @@ async function freshRequest(url) {
     }
   }
   catch (error) {
-    if (controller.signal.aborted) throw new Error('State refresh timed out after 10 seconds');
+    if (controller.signal.aborted) {
+      const timeout = new Error('State refresh timed out after 10 seconds');
+      timeout.transient = true;
+      throw timeout;
+    }
     throw error;
   } finally { clearTimeout(timer); }
 }

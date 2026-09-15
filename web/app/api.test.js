@@ -10,6 +10,22 @@ function reply(body, fence, status = 200) {
   });
 }
 
+test('state failures a daemon restart produces are marked transient, and only those', async () => {
+  let respond;
+  globalThis.fetch = async () => respond();
+  const api = await import(`./api.js?transient=${Date.now()}`);
+  const failure = async () => { try { await api.getState(); } catch (error) { return error; } assert.fail('expected a failure'); };
+
+  respond = () => { throw new TypeError('Failed to fetch'); };
+  assert.equal((await failure()).transient, true, 'an unreachable daemon');
+  respond = () => reply({ error: 'dashboard state is still loading' }, null, 503);
+  assert.equal((await failure()).transient, true, 'a starting daemon');
+  respond = () => reply({ error: 'dashboard action queue is full' }, null, 503);
+  assert.equal((await failure()).transient, false, 'a full action queue is not a restart');
+  respond = () => reply({ error: 'boom' }, null, 500);
+  assert.equal((await failure()).transient, false, 'a server error is not a restart');
+});
+
 test('fresh reads preserve the newest concurrent mutation fence and accept a restarted daemon epoch', async () => {
   const calls = [];
   let releaseOldState;
