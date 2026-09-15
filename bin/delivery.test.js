@@ -317,3 +317,63 @@ test('an expired journal for the same message on the same pane is never retyped'
     assert.equal(typed, 3, 'a pane change still retypes');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+// The journal is written before typing so a crash mid-keystroke stays recoverable —
+// which means the entry existing proves nothing about what reached the pane. Without
+// that distinction a failed type would expire as "assumed-delivered" 15 minutes later,
+// file a received receipt, and let a sweep tick consume the day for a message nobody
+// ever saw.
+test('an entry whose typing failed is retyped, not assumed delivered', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-typedat-'));
+  const file = path.join(dir, 'transcript'); fs.writeFileSync(file, '');
+  const directory = path.join(dir, 'journal');
+  let typed = 0;
+  let failTyping = true;
+  const base = { session: { id: 's', kind: 'claude' }, pane: 'p', text: 'the tick', file, directory,
+    precheck: async () => {}, submitDraft: async () => assert.fail('unexpected Enter'),
+    type: async () => { typed += 1; if (failTyping) throw new Error('pane went away'); },
+    draftMatches: async () => false, pause: async () => {}, attempts: 1, staleJournalMs: 15 * 60e3 };
+  const age = (journal) => {
+    const entry = JSON.parse(fs.readFileSync(journal, 'utf8'));
+    fs.writeFileSync(journal, JSON.stringify({ ...entry, createdAt: Date.now() - 60 * 60e3 }));
+    return entry;
+  };
+  try {
+    await assert.rejects(deliver(base), /pane went away/);
+    const journal = path.join(directory, fs.readdirSync(directory).find((name) => name.endsWith('.json')));
+    assert.equal(JSON.parse(fs.readFileSync(journal, 'utf8')).typedAt, undefined, 'nothing reached the pane');
+
+    // Expired with nothing ever typed: the entry goes, and the message is typed fresh.
+    age(journal);
+    failTyping = false;
+    await assert.rejects(deliver(base), /no matching transcript receipt/);
+    assert.equal(typed, 2, 'the message that was never typed is typed now');
+    const stamped = JSON.parse(fs.readFileSync(journal, 'utf8'));
+    assert.ok(Number(stamped.typedAt) > 0, 'a successful type stamps the journal');
+
+    // Now that it really was typed, the same message expires without retyping.
+    age(journal);
+    assert.deepEqual(await deliver(base), { ok: true, delivery: 'assumed-delivered', expired: true });
+    assert.equal(typed, 2);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('text typed but never submitted still counts as having reached the pane', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-noenter-'));
+  const file = path.join(dir, 'transcript'); fs.writeFileSync(file, '');
+  const directory = path.join(dir, 'journal');
+  let typed = 0;
+  const base = { session: { id: 's', kind: 'claude' }, pane: 'p', text: 'the tick', file, directory,
+    precheck: async () => {}, submitDraft: async () => assert.fail('unexpected Enter'),
+    type: async () => { typed += 1; throw new Error('message was typed but could not be confirmed; Enter was not pressed'); },
+    draftMatches: async () => false, pause: async () => {}, attempts: 1, staleJournalMs: 15 * 60e3 };
+  try {
+    await assert.rejects(deliver(base), /Enter was not pressed/);
+    const journal = path.join(directory, fs.readdirSync(directory).find((name) => name.endsWith('.json')));
+    const entry = JSON.parse(fs.readFileSync(journal, 'utf8'));
+    assert.ok(Number(entry.typedAt) > 0, 'the characters did land, only Enter did not');
+    fs.writeFileSync(journal, JSON.stringify({ ...entry, createdAt: Date.now() - 60 * 60e3 }));
+    assert.equal((await deliver(base)).delivery, 'assumed-delivered');
+    assert.equal(typed, 1, 'and it is never typed a second time');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

@@ -88,7 +88,9 @@ A pending attempt no transcript can confirm used to block every later send to th
 session for good, because the next message is never byte-identical to the stranded
 one. An entry older than `KEEP_DELIVERY_JOURNAL_STALE_MIN` (default 15) minutes
 expires when the pane no longer shows its draft. If its text and pane match the
-message being sent, it expires as `assumed-delivered` and nothing is typed: a session
+message being sent **and its characters actually reached the pane** (the journal is
+written before typing, so its existence alone proves nothing), it expires as
+`assumed-delivered` and nothing is typed: a session
 that resumed writes to a new transcript, so the journal can point at a file that will
 never gain another line, and retyping there would send the message twice. Otherwise
 the next message goes through the normal path — whose precheck still refuses to type

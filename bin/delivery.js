@@ -172,7 +172,12 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
         // that resumed writes to a new transcript, so the journal's file/offset can
         // point at a path that will never gain another line. Retyping there sends the
         // message twice. Expire it without typing: unproven delivery beats a duplicate.
-        const assumedDelivered = sameMessage && samePane;
+        //
+        // Only for an entry whose text actually reached the pane. Without `typedAt`
+        // the typing itself failed, nothing was ever on screen, and assuming delivery
+        // would file a received receipt - and let a sweep tick consume the day - for a
+        // message nobody has seen.
+        const assumedDelivered = sameMessage && samePane && Number(entry.typedAt) > 0;
         trace('pending-journal-expired', { ageMs, assumedDelivered });
         if (assumedDelivered) {
           finish(directory, journal, entry);
@@ -189,14 +194,27 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
     journal = activeJournal;
     await precheck();
     entry = { createdAt: Date.now(), sessionId: session.id, kind: session.kind, file, offset: fs.statSync(file).size, pane, hash: hash(text), key, receiptId: receiptId(text, key), retainReceipt };
-    const temp = journal + '.tmp';
-    fs.writeFileSync(temp, JSON.stringify(entry), { mode: 0o600 });
-    fs.renameSync(temp, journal);
+    const writeJournal = () => {
+      const temp = journal + '.tmp';
+      fs.writeFileSync(temp, JSON.stringify(entry), { mode: 0o600 });
+      fs.renameSync(temp, journal);
+    };
+    writeJournal();
     // Rendering may lag behind input. Keep the receipt/exact-draft recovery
     // path alive even if the initial screen confirmation timed out. Never type
     // again: a partial or changed draft still cannot receive Enter.
-    try { await type(); } catch (error) {
+    try {
+      await type();
+      // Only now may a later expiry assume this reached the pane. The journal is
+      // written BEFORE typing so a crash mid-keystroke is still recoverable, which
+      // means its mere existence proves nothing about what is on screen.
+      entry.typedAt = Date.now();
+      writeJournal();
+    } catch (error) {
       if (error.message !== 'message was typed but could not be confirmed; Enter was not pressed') throw error;
+      // The text was typed but Enter was never pressed: it did reach the pane.
+      entry.typedAt = Date.now();
+      try { writeJournal(); } catch {}
       typingError = error;
     }
   }
