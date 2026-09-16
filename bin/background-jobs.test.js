@@ -224,22 +224,49 @@ test('existing Claude ledgers replay once to recover a turn outside the tail', (
   assert.equal(sync().bytesRead, 0);
 }));
 
-test('a system local_command wrapper is proof the typed command finished', () => {
+test('a system local_command wrapper is proof only of the command turn it closes', () => {
   const restartEvidence = require('./restart-evidence');
-  const row = (content) => ({ type: 'system', subtype: 'local_command', content, timestamp: '2026-09-15T22:14:03.921Z' });
+  const at = '2026-09-15T22:14:03.921Z';
+  const row = (content) => ({ type: 'system', subtype: 'local_command', content, timestamp: at });
+  const typed = { type: 'user', message: { content: '/compact' }, timestamp: at };
+  const fresh = () => ({ restart: { completed: false, children: {}, launches: {}, mapped: {} } });
   for (const content of [
     '<local-command-stdout>Compacted (ctrl+o to see full summary)</local-command-stdout>',
     "<local-command-stderr>Error during compaction: You've reached your Fable limit.</local-command-stderr>",
   ]) {
-    const state = { restart: { completed: false, children: {}, launches: {}, mapped: {} } };
+    const state = fresh();
+    restartEvidence.consume(state, typed, 'claude');
+    assert.equal(state.restart.completed, false, 'the typed command opens a turn');
+    restartEvidence.consume(state, { type: 'user', message: { content: '<local-command-caveat>Caveat</local-command-caveat>' }, timestamp: at }, 'claude');
     restartEvidence.consume(state, row(content), 'claude');
     assert.equal(state.restart.completed, true, content);
-    assert.equal(state.restart.observedAt, Date.parse('2026-09-15T22:14:03.921Z'));
+    assert.equal(state.restart.observedAt, Date.parse(at));
   }
-  const echoed = { restart: { completed: false, children: {}, launches: {}, mapped: {} } };
+  const echoed = fresh();
+  restartEvidence.consume(echoed, typed, 'claude');
   restartEvidence.consume(echoed, row('<command-name>/compact</command-name>\n<command-args></command-args>'), 'claude');
   assert.equal(echoed.restart.completed, false, 'the echo of the typed command proves nothing');
-  assert.equal(echoed.restart.observedAt, Date.parse('2026-09-15T22:14:03.921Z'));
+  assert.equal(echoed.restart.observedAt, Date.parse(at));
+
+  // Owner pressing /model mid-turn writes the same rows while the model is still
+  // working. Nothing there closes the turn the tool call opened.
+  const interleaved = fresh();
+  restartEvidence.consume(interleaved, { type: 'user', message: { content: 'Why did the review miss this?' }, timestamp: at }, 'claude');
+  restartEvidence.consume(interleaved, { type: 'assistant', message: { stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash' }] }, timestamp: at }, 'claude');
+  restartEvidence.consume(interleaved, { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'ok' }] }, timestamp: at }, 'claude');
+  restartEvidence.consume(interleaved, row('<command-name>/model</command-name>'), 'claude');
+  restartEvidence.consume(interleaved, row('<local-command-stdout>Kept model as Opus 4.8</local-command-stdout>'), 'claude');
+  assert.equal(interleaved.restart.completed, false, 'the wrapper closes no command turn');
+  restartEvidence.consume(interleaved, { type: 'assistant', message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }] }, timestamp: at }, 'claude');
+  assert.equal(interleaved.restart.completed, true, 'the interrupted turn is what ends it');
+
+  // A finished command turn is spent: a second wrapper cannot resurrect it.
+  const reused = fresh();
+  restartEvidence.consume(reused, typed, 'claude');
+  restartEvidence.consume(reused, row('<local-command-stdout>Compacted</local-command-stdout>'), 'claude');
+  restartEvidence.consume(reused, { type: 'assistant', message: { stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'toolu_2', name: 'Bash' }] }, timestamp: at }, 'claude');
+  restartEvidence.consume(reused, row('<local-command-stdout>Kept model as Opus 4.8</local-command-stdout>'), 'claude');
+  assert.equal(reused.restart.completed, false);
 });
 
 test('a failed /compact settles the ledger on its stderr wrapper', () => fixture(({ root, append, sync }) => {

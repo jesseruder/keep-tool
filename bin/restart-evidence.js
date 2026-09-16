@@ -29,9 +29,15 @@ function consume(state, row, agent) {
     if (row.type === 'user') s.finalTextAt = 0;
     if (row.type === 'user' && !row.isCompactSummary) {
       s.rateLimitTerminal = false;
-      if (isClaudeInterruption(row)) { s.completed = true; return; }
+      if (isClaudeInterruption(row)) { s.completed = true; s.localCommandOpen = false; return; }
       const t = typeof content === 'string' ? content : '';
-      if (!/^<(?:system-reminder|task-notification|command-|local-command|bash-)/.test(t)) s.completed = false;
+      const wrapper = /^<(?:system-reminder|task-notification|command-|local-command|bash-)/.test(t);
+      if (!wrapper) s.completed = false;
+      // A bare slash prompt opens a command turn that only the harness closes. The
+      // caveat and <command-name> wrappers belong to that same turn; a tool result
+      // or a typed prompt means the model is working, so no later wrapper is its end.
+      if (t.startsWith('/')) s.localCommandOpen = true;
+      else if (!wrapper) s.localCommandOpen = false;
       const human = typeof content === 'string' ? t && !t.startsWith('<')
         : Array.isArray(content) && content.some(b => b.type === 'text') && !content.some(b => b.type === 'tool_result');
       // Compare against the last completed-text candidate, not duplicated
@@ -41,14 +47,20 @@ function consume(state, row, agent) {
     }
     // Newer Claude Code logs the local command's output as a `system` record
     // instead. Either stream means the harness finished the command; a failed
-    // /compact writes only stderr, and without this the turn never settles.
+    // /compact writes only stderr, and without this the turn never settles. The
+    // same rows also appear mid-turn when Owner presses /model while the model is
+    // working, so only an open command turn may be closed by one.
     if (row.type === 'system' && row.subtype === 'local_command' && typeof row.content === 'string') {
       const t = row.content.trimStart();
-      if (t.startsWith('<local-command-stdout>') || t.startsWith('<local-command-stderr>')) s.completed = true;
       // A <command-name> row is the echo of the typed command; it proves nothing.
+      if (s.localCommandOpen && (t.startsWith('<local-command-stdout>') || t.startsWith('<local-command-stderr>'))) {
+        s.completed = true;
+        s.localCommandOpen = false;
+      }
     }
     if (row.type === 'assistant') {
       s.completed = row.message?.stop_reason === 'end_turn';
+      s.localCommandOpen = false;
       s.rateLimitTerminal = row.isApiErrorMessage === true && (row.error === 'rate_limit' || row.apiErrorStatus === 429);
       s.finalTextAt = !s.finalTextBlocked && row.message?.stop_reason == null && (typeof content === 'string' ? content.trim().length > 0
         : Array.isArray(content) && content.length > 0 && content.every(b => b.type === 'text') && content.some(b => b.text?.trim())) ? at : 0;

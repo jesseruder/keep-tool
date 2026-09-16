@@ -30,6 +30,7 @@ const {
   lastClaudeHandoffModel,
   lastContextTokens,
   autoCompactIdleMs,
+  compactModelExhausted,
   autoCompactPolicy,
   autoCompactCandidates,
   autoCompactOutcome,
@@ -3196,15 +3197,6 @@ test('a system local_command wrapper ends the turn a failed /compact left open',
   // Newer Claude Code writes the command's output as a `system` record with a
   // top-level string content and no `message`.
   const system = (content) => JSON.stringify({ type: 'system', subtype: 'local_command', content });
-  const stderr = system("<local-command-stderr>Error during compaction: You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.</local-command-stderr>");
-  const limitError = JSON.stringify({
-    type: 'assistant',
-    timestamp: '2026-09-15T22:14:03.921Z',
-    isApiErrorMessage: true,
-    error: 'rate_limit',
-    apiErrorStatus: 429,
-    message: { model: '<synthetic>', content: [{ type: 'text', text: "You've reached your Fable 5.1 limit. Run /usage-credits to continue or switch models with /model." }] },
-  });
   const typed = [
     record('user', 'Keep going on the fleet card'),
     record('assistant', 'Working on it'),
@@ -3213,22 +3205,15 @@ test('a system local_command wrapper ends the turn a failed /compact left open',
   ];
   try {
     // A failed compaction leaves no summary and no assistant record, only stderr.
-    fs.writeFileSync(file, [...typed, stderr].join('\n'));
+    fs.writeFileSync(file, [...typed,
+      system("<local-command-stderr>Error during compaction: You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.</local-command-stderr>")].join('\n'));
     const failed = scanTranscript(file);
     assert.equal(failed.endedTurn, true, 'the stderr wrapper is the harness finishing the command');
     assert.equal(failed.localCommandPending, null);
     assert.equal(failed.exited, false, 'a failed local command is not an exit');
 
-    // Stderr is the harness reporting a failure, not Owner at the keyboard: a
-    // limit the session is parked on must survive it.
-    fs.writeFileSync(file, [...typed, limitError, stderr].join('\n'));
-    const parked = scanTranscript(file);
-    assert.equal(parked.endedTurn, true);
-    assert.equal(parked.localCommandPending, null);
-    assert.equal(parked.rateLimit?.type, 'fable_weekly', 'stderr does not clear the limit');
-
-    // Stdout means the command actually ran, so the session moved past the limit.
-    fs.writeFileSync(file, [...typed, limitError,
+    // The same shape when the compaction actually ran.
+    fs.writeFileSync(file, [...typed,
       system('<local-command-stdout>Compacted (ctrl+o to see full summary)</local-command-stdout>')].join('\n'));
     const compacted = scanTranscript(file);
     assert.equal(compacted.endedTurn, true);
@@ -3244,6 +3229,150 @@ test('a system local_command wrapper ends the turn a failed /compact left open',
     assert.equal(echoed.lastUser, '/compact', 'the echo is not a prompt of its own');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a local command typed mid-turn does not end the turn it interrupted', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-serve-interleaved-'));
+  const file = path.join(dir, 'session.jsonl');
+  const system = (content) => JSON.stringify({ type: 'system', subtype: 'local_command', content });
+  // Shape taken from a real transcript: Owner pressed /model while the model was
+  // working, and the same assistant turn resumed 1.5s after the stdout wrapper.
+  const midTurn = [
+    record('user', 'Is there some reason the review yesterday did not catch this?'),
+    JSON.stringify({ type: 'assistant', message: { stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'grep -n DUE_TIER_SQL src/db.js' } }] } }),
+    JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: '914:const DUE_TIER_SQL = ...' }] } }),
+    system('<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>'),
+    system('<local-command-stdout>Kept model as Opus 4.8</local-command-stdout>'),
+  ];
+  try {
+    fs.writeFileSync(file, midTurn.join('\n'));
+    const interrupted = scanTranscript(file);
+    assert.equal(interrupted.endedTurn, false, 'the wrapper closes no command turn: the model is still working');
+    assert.equal(interrupted.explicitEndTurn, false);
+    assert.equal(interrupted.localCommandPending, null, 'the last prompt was a person, not a slash command');
+
+    // The turn the wrapper interrupted is what actually ends it.
+    fs.appendFileSync(file, '\n' + JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'Straight answer on why it slipped' }] } }));
+    assert.equal(scanTranscript(file).endedTurn, true);
+    fs.appendFileSync(file, '\n' + JSON.stringify({ type: 'assistant', message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'both reviews were code-correctness passes' }] } }));
+    const done = scanTranscript(file);
+    assert.equal(done.endedTurn, true);
+    assert.equal(done.explicitEndTurn, true);
+
+    // A limit the session is parked on survives a wrapper that closes nothing.
+    const limitError = JSON.stringify({
+      type: 'assistant', timestamp: '2026-09-15T22:14:03.921Z', isApiErrorMessage: true,
+      error: 'rate_limit', apiErrorStatus: 429,
+      message: { model: '<synthetic>', content: [{ type: 'text', text: "You've reached your Fable 5.1 limit. Run /usage-credits to continue or switch models with /model." }] },
+    });
+    fs.writeFileSync(file, [...midTurn.slice(0, 1), limitError,
+      system('<local-command-stdout>Kept model as Opus 4.8</local-command-stdout>')].join('\n'));
+    assert.equal(scanTranscript(file).rateLimit?.type, 'fable_weekly', 'no typed command, so no proof anyone is at the keyboard');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a failed compaction stderr row parks the session on the per-model limit', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-serve-stderr-limit-'));
+  const file = path.join(dir, 'session.jsonl');
+  const system = (content) => JSON.stringify({
+    type: 'system', subtype: 'local_command', timestamp: '2026-09-16T04:02:11.000Z', content,
+  });
+  const typed = [
+    record('user', 'Keep going on the fleet card'),
+    record('assistant', 'Working on it'),
+    record('user', '/compact'),
+  ];
+  try {
+    // The only evidence the window is spent: no assistant record, no quotaLimits.
+    fs.writeFileSync(file, [...typed, system("<local-command-stderr>Error during compaction: You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.</local-command-stderr>")].join('\n'));
+    const parked = scanTranscript(file);
+    assert.equal(parked.rateLimit?.type, 'fable_weekly');
+    assert.equal(parked.rateLimit?.resetsAt, null, 'the prose carries no reset time');
+    assert.equal(parked.rateLimit?.at, '2026-09-16T04:02:11.000Z');
+    assert.match(parked.rateLimit.text, /reached your Fable limit/);
+
+    // Every other stderr row says nothing about the window.
+    fs.writeFileSync(file, [...typed, system('<local-command-stderr>Error: no such command</local-command-stderr>')].join('\n'));
+    assert.equal(scanTranscript(file).rateLimit, null);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('compactModelExhausted reads the per-model weekly window before compacting warm', () => {
+  const now = Date.parse('2026-09-16T04:00:00Z');
+  const snapshot = (percent, fetchedAt = now - 60e3, label = 'Fable wk') => ({
+    accounts: {
+      'claude/default': {
+        identity: { agent: 'claude' },
+        snapshot: { limits: [{ label: '5h', percent: 10 }, { label: 'week', percent: 40 }, { label, percent }], fetchedAt },
+      },
+    },
+  });
+  const session = (extra = {}) => ({ id: 's', kind: 'claude', model: 'claude-fable-5-1', accountId: 'claude/default', ...extra });
+  const at = (usage, extra = {}) => compactModelExhausted(session(extra.session), { usage, now, ...extra.options });
+
+  assert.equal(at(snapshot(100)), true, 'the window is spent');
+  assert.equal(at(snapshot(99)), false, 'headroom left, and the default threshold is exact exhaustion');
+  assert.equal(at(snapshot(99), { options: { minHeadroom: 5 } }), true);
+  assert.equal(at(snapshot(100, now - 31 * 60e3)), false, 'a stale snapshot is unknown, not exhausted');
+  assert.equal(at(snapshot(100, null)), false, 'a snapshot with no fetch time is unknown');
+  assert.equal(at(snapshot(100, now - 60e3, 'Opus wk')), false, 'another model\'s bucket is not this one');
+  assert.equal(at(null), false, 'no snapshot is unknown');
+  assert.equal(compactModelExhausted(session({ accountId: null }), { usage: snapshot(100), now }), false);
+
+  // The parked limit error is enough on its own, with no snapshot at all.
+  const limit = { at: '2026-09-16T04:02:11.000Z', text: "You've reached your Fable limit.", type: 'fable_weekly', resetsAt: null };
+  assert.equal(compactModelExhausted(session({ rateLimit: limit }), { usage: null, now }), true);
+  assert.equal(compactModelExhausted(session({ model: 'claude-opus-5', rateLimit: limit }), { usage: null, now }), false,
+    'a Fable window says nothing about an Opus session');
+  assert.equal(compactModelExhausted({ id: 's', kind: 'codex', model: 'gpt-6-astra', rateLimit: limit }, { usage: snapshot(100), now }), false);
+});
+
+test('auto-compact sends a session whose own model window is spent through the cold fallback', () => {
+  const now = Date.parse('2026-09-16T12:00:00Z');
+  const opts = {
+    ttlMs: 0, maxIdleMs: 24 * 60 * 60e3, minTokens: 100000, models: ['fable'],
+    claudeTtlMs: 60 * 60e3, claudeTargetMs: 50 * 60e3, claudeFallbackModel: 'opus',
+  };
+  const exhausted = { ...opts, modelExhausted: () => true };
+  const warm = { id: 'warm', kind: 'claude', endedTurn: true, mtime: now - 55 * 60e3,
+    model: 'claude-fable-5-1', contextTokens: 150000, usageAt: now - 55 * 60e3 };
+
+  // Warm cache, past the ordinary target: ordinarily compacted on its own model.
+  assert.equal(autoCompactPolicy(warm, now, opts).path, 'warm-current');
+  assert.equal(autoCompactPolicy(warm, now, opts).reason, undefined);
+  const forced = autoCompactPolicy(warm, now, exhausted);
+  assert.equal(forced.path, 'cold-fallback');
+  assert.equal(forced.targetModel, 'opus');
+  assert.equal(forced.reason, 'model-exhausted');
+  assert.equal(forced.originalModel, 'claude-fable-5-1');
+
+  // Still nothing before the ordinary target age: idle-detection timing is unchanged.
+  const fresh = { ...warm, usageAt: now - 49 * 60e3 };
+  assert.equal(autoCompactPolicy(fresh, now, exhausted), null);
+
+  // A five-minute cache waits an hour only because that wait buys a warm cache.
+  const short = { ...warm, id: 'short', cacheTtlMs: 5 * 60e3, usageAt: now - 30 * 60e3 };
+  assert.equal(autoCompactPolicy(short, now, opts), null, 'ordinarily it waits out the hour');
+  const shortForced = autoCompactPolicy(short, now, exhausted);
+  assert.equal(shortForced.path, 'cold-fallback');
+  assert.equal(shortForced.targetModel, 'opus');
+  assert.equal(shortForced.reason, 'model-exhausted');
+  assert.equal(shortForced.targetAgeMs, 4 * 60e3, 'the ordinary target for a five-minute cache');
+
+  // The warm attempt that hit the limit stamped `timeout`; without this the session
+  // would sit on that stamp until its mtime moved.
+  const stamp = { warm: { mtime: warm.mtime, path: 'warm-current', result: 'timeout' } };
+  assert.deepEqual(autoCompactCandidates([warm], stamp, now, opts), [], 'unchanged when the window is fine');
+  const retried = autoCompactCandidates([warm], stamp, now, exhausted);
+  assert.deepEqual(retried.map((c) => [c.session.id, c.path, c.reason]), [['warm', 'cold-fallback', 'model-exhausted']]);
+  for (const result of ['compacted', 'in-progress']) {
+    assert.deepEqual(autoCompactCandidates([warm], { warm: { ...stamp.warm, result } }, now, exhausted), [],
+      `a ${result} stamp is not retried`);
   }
 });
 

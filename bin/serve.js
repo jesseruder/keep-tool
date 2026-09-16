@@ -787,7 +787,13 @@ function scanTranscript(file, options = {}) {
     // Newer Claude Code logs the same local command as a `system` record with the
     // wrapper in a top-level string `content` and no `message`. A failed /compact
     // leaves only a stderr row, so without this the session stays "mid-turn" forever.
-    if (j.type === 'system' && j.subtype === 'local_command' && typeof j.content === 'string') {
+    // Only a wrapper that closes a command turn a bare slash-command prompt opened
+    // ends anything. Claude also writes these rows mid-turn when Owner presses
+    // /model while the model is working: there the last real event is the tool
+    // result or the assistant, the turn resumes a second later, and treating the
+    // wrapper as the end of it would hand a live turn to a restart or a cleanup.
+    if (j.type === 'system' && j.subtype === 'local_command' && typeof j.content === 'string'
+        && lastRealEvent === 'user' && (out.lastUser || '').startsWith('/')) {
       const t = j.content.trimStart();
       if (t.startsWith('<local-command-stdout>')) {
         finishLocalCommand(t, true);
@@ -796,6 +802,13 @@ function scanTranscript(file, options = {}) {
         out.rateLimit = null;
       } else if (t.startsWith('<local-command-stderr>')) {
         finishLocalCommand(t, false);
+        // A /compact that the model's own window refuses ("Error during compaction:
+        // You've reached your Fable limit.") leaves no assistant record at all, so this
+        // stderr row is the only evidence the session is parked on the limit. Only a
+        // row the classifier recognizes counts; every other stderr row says nothing
+        // about the window and leaves rateLimit as it was.
+        const limit = rateLimitInfo(j, t.replace(/^<local-command-stderr>/, '').replace(/<\/local-command-stderr>\s*$/, ''));
+        if (limit.type !== 'unknown') out.rateLimit = limit;
       }
       // A <command-name> system row is only the echo of the typed command; the
       // user record already carried it. It neither starts nor ends a turn.
@@ -3894,6 +3907,55 @@ function autoCompactIdleMs(session, stamps, now, opts) {
   return idleMs;
 }
 
+// A snapshot older than this says nothing about the current window, so it counts as
+// "unknown" rather than "exhausted". Same horizon the reviewer budget uses.
+const COMPACT_USAGE_STALE_MS = 30 * 60e3;
+
+// The on-disk usage snapshot the daemon's own refresh writes (serve/schedulers.js
+// points usage.setCacheFile here). Read from disk rather than usage.getUsage() so a
+// compaction tick never kicks off a network refresh of its own.
+function readUsageCache() {
+  try { return JSON.parse(fs.readFileSync(path.join(keep.ROOT, '.keep', 'usage-cache.json'), 'utf8')); }
+  catch { return null; }
+}
+
+// True when compacting on the session's *own* model would answer "You've reached your
+// <model> limit" instead of compacting. Session ed086c60 was compacted warm on a Fable
+// account already at 100% of its "Fable wk" window; the attempt burned the idle period
+// and stamped `timeout`. Two independent signals, either one is enough:
+//   (a) the session is already parked on the per-model limit error, and
+//   (b) the account's fresh usage snapshot says the model-scoped weekly bucket is spent.
+// A stale or missing snapshot is unknown, never exhausted: guessing wrong here would
+// push every warm compaction through the cold fallback for no reason.
+function compactModelExhausted(session, options = {}) {
+  if (!session || session.kind !== 'claude') return false;
+  const model = String(session.model || '').trim();
+  if (!model) return false;
+  if (session.rateLimit && session.rateLimit.type === 'fable_weekly'
+    && compactModelContainsFamily(model, 'fable')) return true;
+  const accountId = options.accountId || session.accountId;
+  if (!accountId) return false;
+  const claude = review.accountLimits(options.usage, accountId);
+  if (!claude || !Array.isArray(claude.limits) || !claude.limits.length) return false;
+  const now = Number.isFinite(options.now) ? options.now : Date.now();
+  const staleMs = Number.isFinite(options.staleMs) ? options.staleMs : COMPACT_USAGE_STALE_MS;
+  const fetchedAt = Number(claude.fetchedAt);
+  if (!Number.isFinite(fetchedAt) || fetchedAt <= 0 || now - fetchedAt > staleMs) return false;
+  // Resolve the per-model weekly bucket exactly as review.classifyBudget does: a
+  // label like "Fable wk" whose prefix is the model's family.
+  const family = review.modelFamily(model);
+  const prefix = (family === 'other' ? model : family).toLowerCase();
+  const scoped = claude.limits.find((limit) => {
+    const label = String(limit && limit.label || '').toLowerCase();
+    return label.endsWith(' wk') && prefix && label.startsWith(prefix);
+  });
+  if (!scoped) return false;
+  const percent = Number(scoped.percent);
+  if (!Number.isFinite(percent)) return false;
+  const minHeadroom = Number.isFinite(options.minHeadroom) ? options.minHeadroom : 0;
+  return percent >= 100 || 100 - percent < minHeadroom;
+}
+
 function autoCompactPolicy(session, now, opts) {
   const model = String(session?.model || '').trim().toLowerCase();
   const models = Array.isArray(opts.models) ? opts.models : [];
@@ -3913,9 +3975,13 @@ function autoCompactPolicy(session, now, opts) {
     ? session.cacheTtlMs : fallbackTtlMs;
   const cacheAgeMs = now - usageAt;
   if (!Number.isFinite(cacheAgeMs)) return null;
+  // The session's own model window is spent, so a warm compaction on it cannot run
+  // at all. Both waiting-for-a-warm-cache rules below exist only to reuse that cache;
+  // neither is worth anything once the model refuses the turn.
+  const exhausted = opts.modelExhausted?.(session) === true;
   // A five-minute Claude cache is too short to justify an immediate compaction.
   // Leave the session alone for an hour, then compact through the cheaper model.
-  if (session.kind === 'claude' && session.cacheTtlMs === 5 * 60e3) {
+  if (session.kind === 'claude' && session.cacheTtlMs === 5 * 60e3 && !exhausted) {
     const targetAgeMs = 60 * 60e3;
     if (cacheAgeMs < targetAgeMs) return null;
     return {
@@ -3933,7 +3999,7 @@ function autoCompactPolicy(session, now, opts) {
     : (opts.claudeTargetMs ?? cacheTtlMs - leadMs);
   const targetAgeMs = Math.min(configuredTarget, Math.max(0, cacheTtlMs - leadMs));
   if (cacheAgeMs < targetAgeMs) return null;
-  const warm = cacheAgeMs < cacheTtlMs;
+  const warm = !exhausted && cacheAgeMs < cacheTtlMs;
   return {
     path: warm ? 'warm-current' : 'cold-fallback',
     originalModel: model,
@@ -3943,6 +4009,7 @@ function autoCompactPolicy(session, now, opts) {
     cacheAgeMs,
     cacheTtlMs,
     targetAgeMs,
+    ...(exhausted ? { reason: 'model-exhausted' } : {}),
   };
 }
 
@@ -3957,8 +4024,15 @@ function autoCompactCandidates(sessions, stamps, now, opts) {
     if (!Number.isFinite(contextTokens) || contextTokens < opts.minTokens) continue; // Avoid lossy work on small contexts.
     const stamp = stamps instanceof Map ? stamps.get(session.id) : stamps && stamps[session.id];
     if (stamp && stamp.mtime === session.mtime) {
+      // A warm attempt that hit the model's own limit ends as `timeout` (Claude Code
+      // answers "You've reached your ... limit" and the compaction never lands), so the
+      // ordinary rule would strand the session until its mtime moved. When the policy
+      // now knows the model is spent, let that stamp fall back; only a compaction that
+      // succeeded or is still running is off limits.
+      const spent = policy.reason === 'model-exhausted';
+      const done = spent ? ['compacted', 'in-progress'] : ['would', 'compacted', 'timeout', 'in-progress'];
       const warmCanFallBack = stamp.path === 'warm-current' && policy.path === 'cold-fallback'
-        && !['would', 'compacted', 'timeout', 'in-progress'].includes(stamp.result);
+        && !done.includes(stamp.result);
       if (!warmCanFallBack) continue;
     }
     candidates.push({ session, idleMs, contextTokens, ...policy });
@@ -4034,7 +4108,8 @@ function logAutoCompactDecision(candidate, stamp) {
   const model = normalizedText(stamp.model);
   const compactionModel = normalizedText(stamp.compactionModel) || 'unknown';
   const cacheAge = Math.round(Number(stamp.cacheAgeMs || 0) / 60e3);
-  const pathName = normalizedText(stamp.path) || 'unknown';
+  const pathReason = normalizedText(stamp.pathReason);
+  const pathName = (normalizedText(stamp.path) || 'unknown') + (pathReason ? ` (${pathReason})` : '');
   if (stamp.result === 'skipped') {
     process.stderr.write(`keep serve: auto-compact skipped ${sid}: ${normalizedText(stamp.reason).slice(0, 300)}\n`);
     return;
@@ -4087,9 +4162,28 @@ async function autoCompactTick(deps = {}) {
   // Transcript-derived `exited` only observes explicit exit commands, not process
   // death. Keep live host state here rather than in the cached transcript record.
   const panes = await (deps.listHostPanes || listHostPanes)({}, true);
-  const liveIds = new Set([...hostPanesBySession(panes).entries()]
+  const panesBySession = hostPanesBySession(panes);
+  const liveIds = new Set([...panesBySession.entries()]
     .filter(([, pane]) => pane.alive && pane.agentAlive !== false)
     .map(([id]) => id));
+  // One snapshot read per tick, shared by every candidate. The cheap `scanSessions`
+  // rows carry no accountId, so the pane that is running the session names it; a
+  // single-account fleet falls back to the default.
+  const usageSnapshot = deps.usageSnapshot !== undefined ? deps.usageSnapshot : readUsageCache();
+  const minHeadroom = envNumber('KEEP_AUTO_COMPACT_MIN_HEADROOM', 0);
+  let defaultClaudeAccountId;
+  const claudeAccountId = (session) => {
+    if (session.accountId) return session.accountId;
+    const fromPane = panesBySession.get(session.id)?.meta?.accountId;
+    if (fromPane) return fromPane;
+    if (defaultClaudeAccountId === undefined) {
+      try { defaultClaudeAccountId = accounts.defaultFor('claude').id; } catch { defaultClaudeAccountId = null; }
+    }
+    return defaultClaudeAccountId;
+  };
+  opts.modelExhausted = (session) => compactModelExhausted(session, {
+    usage: usageSnapshot, now, minHeadroom, accountId: claudeAccountId(session),
+  });
   const cheap = (deps.scanSessions || scanSessions)().filter((session) =>
     liveIds.has(session.id) && autoCompactIdleMs(session, stamps, now, opts) !== null);
   const candidates = autoCompactCandidates(
@@ -4182,6 +4276,9 @@ async function autoCompactTick(deps = {}) {
     originalModel: String(compactedResult?.originalModel || candidate.originalModel || candidate.session.model || ''),
     compactionModel: String(compactedResult?.compactionModel || candidate.targetModel || ''),
     path: candidate.path,
+    // Why this path, when it was not the cache clock that chose it. `reason` below
+    // is the failure text, so the policy's reason gets its own field.
+    ...(candidate.reason ? { pathReason: candidate.reason } : {}),
     cacheAgeMs: compactedResult?.submissionCacheAgeMs ?? candidate.cacheAgeMs,
     cacheTtlMs: candidate.cacheTtlMs,
     targetAgeMs: candidate.targetAgeMs,
@@ -8098,6 +8195,7 @@ module.exports = {
   sendToSessionLocked,
   startAutoCompact,
   autoCompactIdleMs,
+  compactModelExhausted,
   autoCompactPolicy,
   autoCompactCandidates,
   autoCompactOutcome,
