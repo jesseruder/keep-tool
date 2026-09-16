@@ -115,25 +115,59 @@ test('an off feature reports the state its module reports when it has nothing', 
 
 test('startFeatureSchedulers starts only the features that are on', () => {
   const started = [];
+  const recorded = [];
   const fake = (name) => ({ startScheduler: (options) => { started.push([name, options]); return { name }; } });
   const options = { onChange: () => {} };
   const result = startFeatureSchedulers(
     { enabled: (name) => name !== 'slack' },
     { slack: fake('slack'), discord: fake('discord') },
     options,
+    { record: (name, entry) => recorded.push([name, entry]) },
   );
   assert.deepEqual(result, ['discord']);
   assert.deepEqual(started, [['discord', options]]);
+  // The off feature's health row says so, under the name its own scheduler uses.
+  // Left alone it would keep whatever it recorded when it was last on, and enough
+  // silence later reads as a failing scheduler rather than a switched-off one.
+  assert.deepEqual(recorded, [['slack', { disabled: true, detail: 'features.slack is off' }]]);
 });
 
 test('startFeatureSchedulers reads the real registry through the features module', () => {
   withEnv({ KEEP_FEATURES: '{"standup":false}' }, () => {
     const started = [];
+    const recorded = [];
     const fake = (name) => ({ startScheduler: () => started.push(name) });
-    const result = startFeatureSchedulers(features, { standup: fake('standup'), ideas: fake('ideas') }, {});
+    const result = startFeatureSchedulers(features, { standup: fake('standup'), ideas: fake('ideas') }, {},
+      { record: (name, entry) => recorded.push([name, entry]) });
     assert.deepEqual(result, ['ideas']);
     assert.deepEqual(started, ['ideas']);
+    // Only the off one: a feature that is on reports its own health from its ticks.
+    assert.deepEqual(recorded, [['standup', { disabled: true, detail: 'features.standup is off' }]]);
   });
+});
+
+test('an off feature reads as disabled rather than silent in the health snapshot', () => {
+  const health = require('./health.js');
+  for (const name of ['standup', 'ideas', 'slack', 'discord']) {
+    // A row from when the feature was on, old enough that a cadence check would
+    // call it silent.
+    health.record(name, { ok: true, at: Date.now() - 30 * 86400e3 });
+  }
+  startFeatureSchedulers(
+    { enabled: () => false },
+    Object.fromEntries(['standup', 'ideas', 'slack', 'discord'].map((name) => [name, { startScheduler: () => {
+      throw new Error('an off feature must not start a scheduler');
+    } }])),
+    {},
+    health,
+  );
+  const rows = new Map(health.snapshot().schedulers.map((row) => [row.name, row]));
+  for (const name of ['standup', 'ideas', 'slack', 'discord']) {
+    assert.equal(rows.get(name).state, 'disabled', name);
+    assert.equal(rows.get(name).detail, `features.${name} is off`, name);
+  }
+  const ids = ['standup', 'ideas', 'slack', 'discord'].map((name) => `health:${name}`);
+  assert.deepEqual(health.attentionItems(health.snapshot()).filter((item) => ids.includes(item.id)), []);
 });
 
 test('a command whose feature is off exits 1 and names the file that would turn it on', () => {

@@ -10,13 +10,23 @@
 // watcher tick has to read whichever snapshot is current when it runs.
 
 // The optional features' schedulers, in the order given. A feature that is off
-// never starts one: its module is not asked for a tick, so it records no health
-// row and reads no state. Exported on its own so a test can ask what a set of
-// switches starts without standing up the daemon.
-function startFeatureSchedulers(features, modules, options) {
+// never starts one: its module is not asked for a tick and reads no state of its
+// own. Its health row is written here instead, the way the wt-gc, self-repair,
+// watcher and registry-pull branches below write theirs. Without that, a feature
+// that used to be on keeps its last entry and health.snapshot() eventually calls
+// it `silent` — dashboard attention and a lint finding for something switched off
+// on purpose. Every one of these modules records under its own name, and
+// health.js's cadence table already knows each row, so no cadence is passed here:
+// a scheduler this process never starts has no cadence of its own to report.
+// Exported on its own so a test can ask what a set of switches starts without
+// standing up the daemon.
+function startFeatureSchedulers(features, modules, options, health) {
   const started = [];
   for (const [name, module] of Object.entries(modules)) {
-    if (!features.enabled(name)) continue;
+    if (!features.enabled(name)) {
+      health.record(name, { disabled: true, detail: `features.${name} is off` });
+      continue;
+    }
     module.startScheduler(options);
     started.push(name);
   }
@@ -171,7 +181,7 @@ function startSchedulers(ctx) {
   });
   review.startScheduler(reviewDeps);
   startBriefScheduler({ onChange: broadcast });
-  startFeatureSchedulers(features, { standup, ideas }, { onChange: broadcast });
+  startFeatureSchedulers(features, { standup, ideas }, { onChange: broadcast }, health);
   // Deterministic hygiene, refreshed on a clock: the reviewer bundle splices the
   // persisted snapshot in and review-land refuses notes against it, so a day-old
   // file is the same as no lint at all.
@@ -225,7 +235,7 @@ function startSchedulers(ctx) {
       return Boolean(match && match.alive && match.agentAlive !== false);
     },
   });
-  startFeatureSchedulers(features, { slack, discord }, { onChange: broadcast });
+  startFeatureSchedulers(features, { slack, discord }, { onChange: broadcast }, health);
   const configuredLiveTickMs = Number(process.env.KEEP_LIVE_TICK_MS);
   const liveTickMs = Number.isFinite(configuredLiveTickMs) && configuredLiveTickMs > 0
     ? configuredLiveTickMs
