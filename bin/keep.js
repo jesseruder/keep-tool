@@ -2208,6 +2208,44 @@ commands.slack = async (argv) => {
   die('usage: keep slack poll [--dry] | keep slack status | keep slack mode log|cards|alerts');
 };
 
+// Incident cards come from the Slack poll, not from here: this reads what the
+// parser has already recorded, and re-parses one message when a shape needs
+// debugging.
+commands.incidents = (argv) => {
+  const incidents = require('./incidents.js');
+  const [subcommand, ...rest] = argv;
+  if (subcommand === 'parse') {
+    const o = parseArgs(rest, { json: 'bool' });
+    if (o._.length !== 1) die('usage: keep incidents parse <file|->');
+    const raw = o._[0] === '-' ? fs.readFileSync(0, 'utf8') : fs.readFileSync(o._[0], 'utf8');
+    let payload;
+    try { payload = JSON.parse(raw); } catch { payload = { text: raw }; }
+    const messages = (Array.isArray(payload) ? payload : [payload]).filter((message) => message && typeof message === 'object');
+    const config = incidents.config(ROOT);
+    const bots = incidents.alertBots(ROOT);
+    const rows = messages.flatMap((message) => incidents.parse(message, { config, alertBots: bots }));
+    if (o.json) { console.log(JSON.stringify(rows, null, 2)); return; }
+    if (!rows.length) { console.log('(nothing parsed)'); return; }
+    for (const row of rows) {
+      console.log(`${row.signature || '(no signature)'}  state=${row.state} area=${row.area} severity=${row.severity} shape=${row.shape}`);
+      console.log(`  title: ${row.title}`);
+      if (row.source) console.log(`  source: ${row.source}`);
+    }
+    return;
+  }
+  const o = parseArgs(argv, { json: 'bool' });
+  if (o._.length) die('usage: keep incidents [--json] | keep incidents parse <file|->');
+  const open = incidents.openIncidents(ROOT);
+  if (o.json) { console.log(JSON.stringify(open, null, 2)); return; }
+  if (!open.length) { console.log('no open incidents'); return; }
+  for (const item of open) {
+    const fired = item.lastFiredAt ? new Date(item.lastFiredAt).toLocaleString() : 'never';
+    console.log(`${item.card || '(no card)'}  ${item.area}  x${item.fireCount}  last fired ${fired}${item.resolvedAt ? ' (resolved)' : ''}`);
+    console.log(`  ${item.title}`);
+    console.log(`  ${item.signature}`);
+  }
+};
+
 commands.discord = async (argv) => {
   const discord = features.load('discord');
   const [subcommand, ...rest] = argv;
@@ -2733,6 +2771,11 @@ ${stepUsage()}
   keep discord poll [--dry]
   keep discord status
     standup, ideas, slack and discord are optional features; keep doctor lists which are on.
+  keep incidents [--json]
+                         # open incident signatures: card, area, fire count, last fired
+  keep incidents parse <file|-> [--json]
+                         # parse one Slack message (or a JSON array of them) the way the
+                         # poll does — the way to debug an alert shape without polling
   keep probe <id>      # run this card's probe now (exit 1 = failed); no check-in, no daemon
   keep verify <id>     # run this task's check recipe now, in its thread or a fresh session (needs keep serve)
   keep compact <sid>   # compact a live Claude or Codex session (needs keep serve)
