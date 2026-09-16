@@ -46,6 +46,11 @@ function markGap(state, now, reason) {
 // a caller that cannot count the inbox must not get a settled verdict.
 // Callers that know whether the ledger has read its source to EOF also require
 // that (`caughtUp`); the ledger checks that separately where it matters.
+// Residual: a launch written after the last checkpoint and dropped by the
+// replacement is invisible to this ledger. A command that is still running is
+// still a child process of the agent, which mcp-restart.inspect refuses before
+// the source is stopped; an in-process agent lost that way is the same exposure
+// a forced restart already accepts.
 function settledGap(state, { unconsumedHooks } = {}) {
   if (!state || state.gap !== true || state.gapReason !== 'transcript-replaced') return false;
   if (state.recovering || state.coldReplay) return false;
@@ -722,13 +727,15 @@ function read(root, agent, sid, now = Date.now(), staleAfter = 30 * 60e3) {
     if (state.recovering || state.gap) uncertain.push(state.recovering ? 'history-recovery' : 'history-gap');
     let caughtUp = false;
     try { const s = fs.statSync(state.source.file); caughtUp = !state.recovering && state.checkpoint.offset === s.size && state.checkpoint.mtime === s.mtimeMs; } catch {}
-    let unconsumedHooks = 0;
-    try { unconsumedHooks = fs.readdirSync(path.join(dir, 'inbox')).length; } catch {}
+    let unconsumedHooks = 0, inboxReadable = true;
+    try { unconsumedHooks = fs.readdirSync(path.join(dir, 'inbox')).length; }
+    catch (error) { if (error.code !== 'ENOENT') inboxReadable = false; }
     return { pending: open.some(j => !uncertain.includes(j.id)), uncertain, jobs, caughtUp,
       recovering: Boolean(state.recovering), gap: Boolean(state.gap), gapReason: state.gapReason,
       // This is the ledger view the dashboard puts on session.backgroundJobs, so
-      // it is the one the restart/transfer refusal reads.
-      gapSettled: caughtUp === true && settledGap(state, { unconsumedHooks }),
+      // it is the one the restart/transfer refusal reads. An inbox that cannot
+      // be read yields no hook count, so the gap cannot settle on it.
+      gapSettled: caughtUp === true && settledGap(state, { unconsumedHooks: inboxReadable ? unconsumedHooks : undefined }),
       gapClearedAt: state.gapClearedAt, lastColdReplayAt: state.lastColdReplayAt,
       unresolvedCalls: Object.keys(state.calls || {}).length,
       unconsumedHooks,

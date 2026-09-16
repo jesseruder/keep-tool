@@ -731,6 +731,13 @@ test('a settled transcript-replaced gap reports as settled and rebinds without f
     assert.equal(replaced.gapSettled, true);
     assert.deepEqual(replaced.uncertain, ['history-gap'], 'a settled gap stays visible as uncertain evidence');
     assert.equal(jobs.read(root, 'claude', 'parent', 2300).gapSettled, true);
+    // An inbox that cannot be read (here: a file where the directory belongs)
+    // yields no hook count, so the dashboard view must not report the gap settled.
+    const inbox = path.join(root, '.keep', 'background-jobs', 'claude', 'parent', 'inbox');
+    fs.rmSync(inbox, { recursive: true, force: true }); fs.writeFileSync(inbox, '');
+    assert.equal(jobs.read(root, 'claude', 'parent', 2300).gapSettled, false, 'an unreadable inbox fails closed');
+    fs.rmSync(inbox); fs.mkdirSync(inbox);
+    assert.equal(jobs.read(root, 'claude', 'parent', 2300).gapSettled, true);
 
     const settled = load();
     assert.equal(jobs.settledGap(settled, { unconsumedHooks: 0 }), true);
