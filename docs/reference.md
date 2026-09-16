@@ -208,18 +208,26 @@ plus every pack recorded in the configuration's `skillPacks` and every `--pack <
 given now; an unknown name is refused with the list of known packs. Newly named packs
 are recorded in the configuration, so a later `keep setup hooks` reinstalls them (an
 isolated `KEEP_DIR` run with no configuration file installs but says it recorded
-nothing). Every destination for every pack is preflighted before anything is written.
-A missing destination is linked; one that already resolves to this checkout is left
-alone; a link Keep left behind whose text still ends in `/skills/<skill>` — an older
-checkout path, a deleted worktree — is repaired. A directory of its own is moved to
-`<dest>.keep-backup-<timestamp>` and linked when its `SKILL.md` is byte-identical to
-this checkout's; otherwise the run refuses, names the path, and asks for `--replace`,
-which backs it up and links. A parent such as `~/.agents/skills` that is itself a
-symlink is never modified. `--list` prints each pack, its description, its skills'
-status (`linked`, `missing`, `stale link`, `needs migration`) and whether it is
-recorded, and writes nothing. `keep doctor` checks one line per pack: `core` and the
-recorded packs are required with `keep setup skills` as the fix, and the rest print as
-`optional` with `keep setup skills --pack <name>`.
+nothing). The configuration is checked before anything is linked when `--pack` names a
+pack — unreadable or read-only, and the run refuses with `keep setup skills changed
+nothing: …` rather than installing packs it cannot remember — and the recorded list is
+written by renaming a file written beside it, keeping the configuration's existing
+permissions. Every destination for every pack is preflighted before anything is
+written. A missing destination is linked; one that already resolves to this checkout is
+left alone; a symlink that dangles, or that resolves into another keep-tool checkout (a
+`package.json` naming this application two directories above the target), is repaired
+in place — an older checkout path, a deleted worktree. Any other link or directory of
+its own is moved to `<dest>.keep-backup-<timestamp>` and linked when its `SKILL.md` is
+byte-identical to this checkout's; otherwise the run refuses, names the path, and asks
+for `--replace`, which backs it up and links: a live link into someone else's skill
+collection is never replaced silently. A parent such as `~/.agents/skills` that is
+itself a symlink is never modified, and when it names the same directory as
+`~/.claude/skills` — whether or not that directory exists yet — the two homes are one
+destination. `--list` prints each pack, its description, its skills' status (`linked`,
+`missing`, `stale link`, `needs migration`) and whether it is recorded, and writes
+nothing. `keep doctor` checks one line per pack, requiring every skill in both homes:
+`core` and the recorded packs are required with `keep setup skills` as the fix, and the
+rest print as `optional` with `keep setup skills --pack <name>`.
 
 Claude subagent lifecycle tracking uses `keep hook lifecycle` for both
 `SubagentStart` and `SubagentStop` in Claude's user settings. These observation-only

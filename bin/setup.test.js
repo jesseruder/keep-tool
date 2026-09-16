@@ -440,6 +440,45 @@ test('an agent skill directory that is a symlink to the other one is one destina
   } finally { f.cleanup(); }
 });
 
+test('a shared skill directory is one destination even before it exists', () => {
+  const f = hooksFixture();
+  try {
+    // The dotfiles layout as it looks on a fresh machine: the link is there, the
+    // directory it names is not. Planning both homes would link the same path twice.
+    fs.mkdirSync(path.join(f.home, '.agents'), { recursive: true });
+    fs.symlinkSync(path.join(f.home, '.claude', 'skills'), path.join(f.home, '.agents', 'skills'));
+    assert.equal(fs.existsSync(path.join(f.home, '.claude', 'skills')), false);
+
+    const plans = setup.skillPlans(['core']);
+    assert.deepEqual(plans.map((plan) => plan.skill), ['keep', 'fleet-review'], 'one plan per skill');
+    setup.installHooks();
+    for (const skill of ['keep', 'fleet-review']) {
+      for (const real of linkTargets(f.home, skill)) assert.equal(real, fs.realpathSync(path.join(SKILLS, skill)), skill);
+    }
+    assert.match(capture(() => setup.installHooks()), /Skills up to date/);
+  } finally { f.cleanup(); }
+});
+
+test('applying a destination that already points at the source is done, not a failure', () => {
+  const f = hooksFixture();
+  try {
+    fs.mkdirSync(path.join(f.home, '.agents'), { recursive: true });
+    fs.symlinkSync(path.join(f.home, '.claude', 'skills'), path.join(f.home, '.agents', 'skills'));
+    const source = path.join(SKILLS, 'keep');
+    const plans = ['.claude', '.agents'].map((dir) => ({
+      skill: 'keep', pack: 'core', source, action: 'link', dest: path.join(f.home, dir, 'skills', 'keep'),
+    }));
+    setup.applySkillPlans(plans);
+    for (const real of linkTargets(f.home, 'keep')) assert.equal(real, fs.realpathSync(source));
+
+    // A destination occupied by something else still fails loudly.
+    const taken = path.join(f.home, '.claude', 'skills', 'fleet-review');
+    fs.mkdirSync(taken);
+    assert.throws(() => setup.applySkillPlans([{ skill: 'fleet-review', pack: 'core', source: path.join(SKILLS, 'fleet-review'), action: 'link', dest: taken }]),
+      (error) => error.code === 'EEXIST');
+  } finally { f.cleanup(); }
+});
+
 test('a Keep skill link from a removed checkout is repaired rather than refused', () => {
   const f = hooksFixture();
   try {
@@ -452,8 +491,49 @@ test('a Keep skill link from a removed checkout is repaired rather than refused'
     assert.equal(plans.find((plan) => plan.dest === dest).action, 'relink');
     const printed = capture(() => { setup.applySkillPlans(plans); setup.reportSkillPlans(plans); });
     assert.match(printed, /Repaired stale skill link/);
+    assert.ok(printed.includes(path.join(f.base, 'gone', 'skills', 'keep')), 'the report names the link it replaced');
     assert.equal(fs.realpathSync(dest), fs.realpathSync(path.join(SKILLS, 'keep')));
     assert.deepEqual(backups(f.home), [], 'a stale link of ours is not worth backing up');
+  } finally { f.cleanup(); }
+});
+
+test('a live link into another keep-tool checkout is repointed, and one into anything else is not', () => {
+  const f = hooksFixture();
+  try {
+    // Another checkout of this application: its own package.json two directories
+    // above the skill is what makes the link Keep's to repoint.
+    const checkout = path.join(f.base, 'other-keep-tool');
+    fs.mkdirSync(path.join(checkout, 'skills', 'keep'), { recursive: true });
+    fs.writeFileSync(path.join(checkout, 'package.json'), JSON.stringify({ name: 'keep-tool', version: '0.0.0' }));
+    fs.writeFileSync(path.join(checkout, 'skills', 'keep', 'SKILL.md'), '# an older checkout\n');
+    const mine = path.join(f.home, '.claude', 'skills', 'keep');
+    fs.mkdirSync(path.dirname(mine), { recursive: true });
+    fs.symlinkSync(path.join(checkout, 'skills', 'keep'), mine);
+
+    // Somebody else's skill collection, laid out exactly like ours.
+    const company = path.join(f.base, 'company', 'skills', 'fleet-review');
+    fs.mkdirSync(company, { recursive: true });
+    fs.writeFileSync(path.join(company, 'SKILL.md'), '# the company procedure\n');
+    const theirs = path.join(f.home, '.claude', 'skills', 'fleet-review');
+    fs.symlinkSync(company, theirs);
+
+    assert.throws(() => setup.skillPlans(['core']), (error) => {
+      assert.ok(error.message.includes(theirs), 'a live foreign link is refused, not silently replaced');
+      assert.equal(error.message.includes(mine), false, 'the link into another checkout is not the problem');
+      return true;
+    });
+
+    const plans = setup.skillPlans(['core'], { replace: true });
+    assert.equal(plans.find((plan) => plan.dest === mine).action, 'relink');
+    assert.equal(plans.find((plan) => plan.dest === theirs).action, 'replace');
+    setup.applySkillPlans(plans);
+    assert.equal(fs.realpathSync(mine), fs.realpathSync(path.join(SKILLS, 'keep')));
+    assert.equal(fs.realpathSync(theirs), fs.realpathSync(path.join(SKILLS, 'fleet-review')));
+    assert.equal(fs.readFileSync(path.join(company, 'SKILL.md'), 'utf8'), '# the company procedure\n',
+      'the foreign skill itself is untouched; only the link was set aside');
+    const saved = backups(f.home);
+    assert.deepEqual(saved.map((name) => path.basename(name).split('.keep-backup-')[0]), ['fleet-review']);
+    assert.equal(fs.realpathSync(saved[0]), fs.realpathSync(company));
   } finally { f.cleanup(); }
 });
 
@@ -494,6 +574,7 @@ test('keep setup skills --pack installs the pack, records it, and a later hook i
     assert.throws(() => setup.installSkills(['--pack', 'nope']), /unknown skill pack nope; known packs: core, handoff/);
     assert.equal(fs.existsSync(path.join(f.home, '.claude', 'skills')), false);
 
+    fs.chmodSync(process.env.KEEP_CONFIG, 0o644);
     const printed = capture(() => setup.installSkills(['--pack', 'handoff']));
     assert.match(printed, /Installed skill packs: core, handoff\./);
     for (const skill of ['implementation-handoff', 'codex-review-runner', 'ui-driving-handoff', 'keep', 'fleet-review']) {
@@ -503,7 +584,9 @@ test('keep setup skills --pack installs the pack, records it, and a later hook i
     assert.deepEqual(recorded.skillPacks, ['handoff']);
     assert.equal(recorded.version, 1, 'the rest of the configuration survives');
     assert.ok(Array.isArray(recorded.accounts));
-    assert.equal(fs.statSync(process.env.KEEP_CONFIG).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(process.env.KEEP_CONFIG).mode & 0o777, 0o644, 'the permissions the user chose are kept');
+    assert.deepEqual(fs.readdirSync(path.dirname(process.env.KEEP_CONFIG)).filter((name) => name.startsWith('.config.json')), [],
+      'the atomic write leaves no temporary file behind');
     assert.deepEqual(setup.installPackNames(), ['core', 'handoff']);
 
     // A removed link from a recorded pack is reinstalled by the hook installer alone.
@@ -511,6 +594,31 @@ test('keep setup skills --pack installs the pack, records it, and a later hook i
     capture(() => setup.installHooks());
     assert.equal(fs.realpathSync(path.join(f.home, '.claude', 'skills', 'ui-driving-handoff')),
       fs.realpathSync(path.join(SKILLS, 'ui-driving-handoff')));
+  } finally { f.cleanup(); }
+});
+
+test('a configuration that cannot record the choice stops the install before it links anything', () => {
+  const f = hooksFixture();
+  try {
+    const good = fs.readFileSync(process.env.KEEP_CONFIG, 'utf8');
+    fs.writeFileSync(process.env.KEEP_CONFIG, '{ not json');
+    assert.throws(() => setup.installSkills(['--pack', 'handoff']), (error) => {
+      assert.match(error.message, /^keep setup skills changed nothing: /);
+      return true;
+    });
+    assert.equal(fs.existsSync(path.join(f.home, '.claude', 'skills')), false, 'nothing is linked');
+
+    // A configuration nobody can write to is refused for the same reason: the
+    // packs would be installed and forgotten by the next upgrade.
+    fs.writeFileSync(process.env.KEEP_CONFIG, good);
+    fs.chmodSync(process.env.KEEP_CONFIG, 0o400);
+    assert.throws(() => setup.installSkills(['--pack', 'handoff']), /changed nothing/);
+    assert.equal(fs.existsSync(path.join(f.home, '.claude', 'skills')), false);
+
+    // The core pack names no choice to record and installs anyway.
+    capture(() => setup.installSkills([]));
+    assert.equal(fs.realpathSync(path.join(f.home, '.claude', 'skills', 'keep')), fs.realpathSync(path.join(SKILLS, 'keep')));
+    fs.chmodSync(process.env.KEEP_CONFIG, 0o600);
   } finally { f.cleanup(); }
 });
 
@@ -537,6 +645,12 @@ test('keep doctor reports required and optional skill packs', () => {
     assert.match(printed, /^ok: skill pack core$/m);
     assert.match(printed, /^optional: skill pack handoff$/m);
     assert.match(printed, /^ {2}fix: keep setup skills --pack handoff$/m);
+
+    // Codex reads `~/.agents/skills`: a pack linked in one home only is not installed.
+    fs.rmSync(path.join(f.home, '.agents', 'skills', 'fleet-review'));
+    const half = capture(() => setup.doctor(path.join(f.base, 'registry')));
+    assert.match(half, /^FAIL: skill pack core$/m);
+    assert.match(half, /^ {2}fix: keep setup skills$/m);
 
     fs.rmSync(path.join(f.home, '.claude', 'skills', 'fleet-review'));
     const missing = capture(() => setup.doctor(path.join(f.base, 'registry')));

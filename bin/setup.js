@@ -130,9 +130,21 @@ function sameSkillFile(dest, source) {
   } catch { return false; }
 }
 
-// What one destination should become. The interesting case is a Keep link from an
+// `<dir>/skills/<skill>` inside some keep-tool checkout: the package manifest two
+// directories above the resolved target names this application. A link into another
+// checkout is Keep's own and safe to repoint; a link into anything else is the
+// user's and is treated like any other skill they installed themselves.
+function inKeepCheckout(resolved) {
+  try {
+    const manifest = JSON.parse(fs.readFileSync(path.join(resolved, '..', '..', 'package.json'), 'utf8'));
+    return manifest && manifest.name === 'keep-tool';
+  } catch { return false; }
+}
+
+// What one destination should become. The interesting case is a Keep link left by an
 // older checkout path, a deleted worktree, or the pre-pack `docs/agent-skills`
-// location: its link text still ends in `/skills/<skill>`, so it is ours to repair.
+// location: a dangling link has nothing to lose, and a live one into another
+// keep-tool checkout is ours to repoint.
 function skillPlan(skill, pack, dest) {
   const source = skillSource(skill);
   const base = { skill, pack, dest, source };
@@ -142,12 +154,25 @@ function skillPlan(skill, pack, dest) {
   try { resolved = fs.realpathSync(dest); } catch {}
   if (resolved && resolved === fs.realpathSync(source)) return { ...base, action: 'ok' };
   if (link.isSymbolicLink()) {
-    const text = fs.readlinkSync(dest).replace(/\/+$/, '');
-    if (text.endsWith(`${path.sep}skills${path.sep}${skill}`)) return { ...base, action: 'relink' };
+    const text = fs.readlinkSync(dest);
+    if (!resolved || inKeepCheckout(resolved)) return { ...base, action: 'relink', from: text };
   }
   // Someone else's skill, or a copy of ours. A byte-identical SKILL.md is an older
   // copy of this very skill and is safe to set aside; anything else needs --replace.
   return { ...base, action: sameSkillFile(dest, source) ? 'migrate' : 'replace' };
+}
+
+// The directory a destination really lands in. `~/.agents/skills` is often a symlink
+// to `~/.claude/skills`, including one whose target does not exist yet: resolving the
+// link text is what keeps the two homes from being planned as two destinations and
+// the second apply from failing on what the first just created.
+function skillDestKey(dest, skill) {
+  const parent = path.dirname(dest);
+  const link = fs.lstatSync(parent, { throwIfNoEntry: false });
+  // canonicalPath resolves the symlinked ancestors a destination does have, so a
+  // directory that exists and one that does not yet both key on the same name.
+  const target = link && link.isSymbolicLink() ? path.resolve(path.dirname(parent), fs.readlinkSync(parent)) : parent;
+  try { return path.join(canonicalPath(target), skill); } catch { return path.join(target, skill); }
 }
 
 // Every destination for every named pack, preflighted before anything is written.
@@ -161,12 +186,7 @@ function skillPlans(packNames, { replace = false, probe = false, packs = loadPac
     for (const skill of pack.skills) {
       for (const home of SKILL_HOMES) {
         const dest = path.join(os.homedir(), home, 'skills', skill);
-        // Two destinations can be one directory: `~/.agents/skills` is often a
-        // symlink to `~/.claude/skills`. Key on the resolved parent, or the
-        // second plan links a path the first one just created.
-        const parent = path.dirname(dest);
-        let key = dest;
-        if (fs.existsSync(parent)) { try { key = path.join(fs.realpathSync(parent), skill); } catch {} }
+        const key = skillDestKey(dest, skill);
         if (seen.has(key)) continue;
         seen.add(key);
         plans.push(skillPlan(skill, name, dest));
@@ -191,7 +211,14 @@ function applySkillPlans(plans) {
     }
     // Never touch the parent: `~/.agents/skills` is often a symlink itself.
     if (!fs.existsSync(path.dirname(plan.dest))) fs.mkdirSync(path.dirname(plan.dest), { recursive: true });
-    fs.symlinkSync(plan.source, plan.dest);
+    try { fs.symlinkSync(plan.source, plan.dest); }
+    catch (error) {
+      // Two homes that share a directory can still reach the same link twice.
+      // A destination that already points at the source is done, not a failure.
+      let resolved = null;
+      try { resolved = fs.realpathSync(plan.dest); } catch {}
+      if (error.code !== 'EEXIST' || resolved !== fs.realpathSync(plan.source)) throw error;
+    }
   }
   return plans;
 }
@@ -204,7 +231,8 @@ const SKILL_ACTIONS = {
 function reportSkillPlans(plans) {
   const changed = plans.filter((plan) => plan.action !== 'ok');
   for (const plan of changed) {
-    console.log(`${SKILL_ACTIONS[plan.action]}: ${plan.dest}${plan.backup ? ` (backed up to ${plan.backup})` : ''}`);
+    const note = plan.backup ? ` (backed up to ${plan.backup})` : plan.from ? ` (was ${plan.from})` : '';
+    console.log(`${SKILL_ACTIONS[plan.action]}: ${plan.dest}${note}`);
   }
   if (!changed.length) console.log('Skills up to date.');
   return changed;
@@ -227,6 +255,17 @@ function listPacks(packs, env = process.env) {
   }
 }
 
+// Whether the choice can be recorded at all, checked before anything is linked: an
+// unreadable or read-only configuration must refuse the run, not leave the packs
+// installed and the choice forgotten until the next upgrade drops them.
+function recordPreflight(named, env = process.env) {
+  if (!named.length) return;
+  const file = config.configFile(env);
+  if (!fs.existsSync(file)) return;
+  config.load(env);
+  fs.accessSync(file, fs.constants.W_OK);
+}
+
 // Records the packs this machine has chosen. An isolated KEEP_DIR run has no
 // configuration file to write; the install still happens, it just is not remembered.
 function recordPacks(named, env = process.env) {
@@ -238,10 +277,14 @@ function recordPacks(named, env = process.env) {
   for (const name of named) if (name !== CORE_PACK && !next.includes(name)) next.push(name);
   if (next.length !== current.length) {
     value.skillPacks = next;
-    fs.writeFileSync(file, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
-    // writeFileSync only applies the mode when it creates the file; the
-    // configuration carries account paths and stays private either way.
-    fs.chmodSync(file, 0o600);
+    // Write beside the configuration and rename over it: a failure here leaves the
+    // old file whole rather than a truncated one. The existing permissions are the
+    // user's to choose and are carried across.
+    const temp = path.join(path.dirname(file), `.${path.basename(file)}.keep-${process.pid}-${Date.now()}`);
+    try {
+      fs.writeFileSync(temp, JSON.stringify(value, null, 2) + '\n', { mode: fs.statSync(file).mode & 0o777 });
+      fs.renameSync(temp, file);
+    } catch (error) { fs.rmSync(temp, { force: true }); throw error; }
   }
   return true;
 }
@@ -267,6 +310,8 @@ function installSkills(args = []) {
   if (list) return listPacks(packs);
   const names = installPackNames(packs, named);
   const plans = skillPlans(names, { replace, packs });
+  try { recordPreflight(named); }
+  catch (error) { throw new Error(`keep setup skills changed nothing: ${error.message}`); }
   applySkillPlans(plans);
   const changed = reportSkillPlans(plans);
   if (named.length && !recordPacks(named)) console.log('No Keep configuration file: the pack choice was not recorded, so name it again next time.');
@@ -578,10 +623,10 @@ function doctor(root) {
   const recorded = new Set([CORE_PACK, ...configuredPacks(packs)]);
   for (const [name, pack] of Object.entries(packs)) {
     const required = recorded.has(name);
-    const ok = check(`skill pack ${name}`, () => pack.skills.every((skill) => {
-      const dest = path.join(os.homedir(), '.claude', 'skills', skill);
-      return fs.existsSync(dest) && fs.realpathSync(dest) === fs.realpathSync(skillSource(skill));
-    }), required);
+    // Every destination, not only `~/.claude`: Codex reads `~/.agents/skills`, and a
+    // pack linked in one home and missing from the other is not installed.
+    const ok = check(`skill pack ${name}`, () => skillPlans([name], { probe: true, packs })
+      .every((plan) => plan.action === 'ok'), required);
     if (!ok) console.log(`  fix: keep setup skills${required ? '' : ` --pack ${name}`}`);
   }
   console.log('Model access and external integrations require their own live checks; doctor does not call models or send notifications.');
@@ -591,6 +636,7 @@ function doctor(root) {
 module.exports = {
   init, installHooks, installSkills, service, doctor, mergeHooks, servicePlist, quote, canonicalPath, insideSource,
   HOOK_ACTIONS, missingHooks, hookTargets, hookTarget,
-  loadPacks, configuredPacks, installPackNames, skillPlans, applySkillPlans, reportSkillPlans, listPacks, recordPacks,
+  loadPacks, configuredPacks, installPackNames, skillPlans, applySkillPlans, reportSkillPlans, listPacks,
+  recordPacks, recordPreflight,
   shell, shellBlock, applyShellBlock, SHELL_START, SHELL_END,
 };
