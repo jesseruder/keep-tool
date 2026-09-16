@@ -539,6 +539,12 @@ const DEPLOY_AFTER_LAND = {
 // that session's to deploy, not this one's.
 function deployAfterLand(main, defaultName, sha, opts = {}) {
   const note = (text) => { try { process.stderr.write(`wt: ${text}\n`); } catch {} };
+  // A thrown non-Error, or a `message` getter that throws, must not turn a
+  // reported problem into an unhandled one.
+  const describe = (error) => {
+    try { return String(error && error.message || error).trim(); }
+    catch { return 'unprintable error'; }
+  };
   try {
     // Same escape hatch as WT_NO_INSTALL: a test harness or a scripted land must
     // be able to exercise `wt land` without restarting the machine's real daemon.
@@ -556,20 +562,33 @@ function deployAfterLand(main, defaultName, sha, opts = {}) {
     // Someone is mid-operation in there. A rebase is detached and a half-finished
     // merge is dirty, so both are usually caught above; this names the case.
     const gitDir = git(main, ['rev-parse', '--absolute-git-dir']).trim();
-    const busy = ['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply']
+    // `sequencer` outlives CHERRY_PICK_HEAD between the commits of a multi-commit
+    // cherry-pick or revert, so a clean-looking pause in one is still caught.
+    const busy = ['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply', 'sequencer']
       .find((entry) => fs.existsSync(path.join(gitDir, entry)));
     if (busy) return stale(`has an unfinished operation (${busy})`);
     if (statusWithoutMarkers(main).length) return stale('has uncommitted changes');
-    // Merging the pushed object, not a ref someone else may have moved. --ff-only
-    // is the actual guarantee: it can only advance the branch, never rewrite it or
-    // touch the working tree's own state, and it refuses anything that is not a
-    // fast-forward. The checks above choose when to try; this decides what happens.
-    try { git(main, ['merge', '--ff-only', sha]); }
-    catch (error) {
-      note(`could not fast-forward ${main} to ${sha.slice(0, 12)}: ${String(error.message || error).trim()}`);
-      return { deployed: false, why: 'merge' };
+    const head = git(main, ['rev-parse', 'HEAD']).trim();
+    // Already past this land: another session's commits are live, its code is what
+    // a restart would start, and its own land is what should decide to. This land's
+    // commits are in there either way, which is what it set out to achieve.
+    if (head !== sha && isAncestor(main, sha, head)) {
+      note(`${main} is already at ${head.slice(0, 12)}, past this land; leaving its restart to the land that put it there`);
+      return { deployed: false, why: 'ahead' };
     }
-    note(`fast-forwarded ${main} to ${sha.slice(0, 12)}`);
+    if (head === sha) note(`${main} is already at ${sha.slice(0, 12)}`);
+    else {
+      // Merging the pushed object, not a ref someone else may have moved. --ff-only
+      // is the actual guarantee: it can only advance the branch, never rewrite it or
+      // touch the working tree's own state, and it refuses anything that is not a
+      // fast-forward. The checks above choose when to try; this decides what happens.
+      try { git(main, ['merge', '--ff-only', sha]); }
+      catch (error) {
+        note(`could not fast-forward ${main} to ${sha.slice(0, 12)}: ${describe(error)}`);
+        return { deployed: false, why: 'merge' };
+      }
+      note(`fast-forwarded ${main} to ${sha.slice(0, 12)}`);
+    }
     const [command, ...args] = plan.restart;
     const result = run(command, args) || {};
     const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
@@ -581,7 +600,7 @@ function deployAfterLand(main, defaultName, sha, opts = {}) {
     if (output) note(output);
     return { deployed: true, output };
   } catch (error) {
-    note(`post-land deploy failed: ${String(error && error.message || error).trim()}`);
+    note(`post-land deploy failed: ${describe(error)}`);
     return { deployed: false, why: 'error' };
   }
 }

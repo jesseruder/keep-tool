@@ -1155,10 +1155,13 @@ names those repos — today just `keep-tool`, the tree the launchd-supervised
 checkout and runs the repo's restart, `keep restart-daemon`.
 
 It merges the sha this land pushed, not `origin/<default>`: a concurrent land that
-moved that ref on in the meantime is the other session's to deploy. `--ff-only` is
-what makes this safe — it can only advance the branch, never rewrite it — and the
+moved that ref on in the meantime is the other session's to deploy. For the same
+reason a checkout already *past* this land is left alone, restart included — this
+land's commits are in there either way, and the session that put the newer ones
+there is the one that should decide to start running them. `--ff-only` is what
+makes the advance safe: it can only move the branch forward, never rewrite it. The
 checkout is left alone entirely when it is on another branch, has an unfinished
-merge or cherry-pick, or has uncommitted changes. Those skips, a merge that is not
+merge, cherry-pick, revert or rebase, or has uncommitted changes. Those skips, a merge that is not
 a fast-forward, and a refused restart are all reported rather than raised: the land
 already happened, so they are things to say, not failures. The branch and status
 checks are policy, not a lock; a checkout being mutated concurrently is only

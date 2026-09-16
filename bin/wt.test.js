@@ -330,13 +330,16 @@ test('land deploys a live main checkout and says why when it cannot', () => {
 test('wt land deploys end to end through the CLI, and --no-deploy and WT_NO_DEPLOY opt out', () => {
   const f = fixture('keep-tool');
   try {
-    // A `keep` earlier on PATH than the real one: this exercises the actual plan,
-    // flag parsing and restart spawn without going near the machine's daemon.
+    // A `keep` shim as the only `keep` on PATH: this exercises the real plan, flag
+    // parsing and restart spawn, and the machine's own `keep` is not reachable from
+    // the test at all — not merely shadowed by it.
     const fakeBin = path.join(f.root, 'bin');
     const log = path.join(f.root, 'restart.log');
-    write(path.join(fakeBin, 'keep'), `#!/bin/sh\necho "$@" >> ${log}\necho restarted\n`);
+    write(path.join(fakeBin, 'keep'), `#!/bin/sh\necho "$@" >> '${log}'\necho restarted\n`);
     fs.chmodSync(path.join(fakeBin, 'keep'), 0o755);
-    const deployEnv = { WT_NO_DEPLOY: '', PATH: `${fakeBin}:${process.env.PATH}` };
+    fs.accessSync(path.join(fakeBin, 'keep'), fs.constants.X_OK); // a noexec tmpdir must fail here, not fall through to the real keep
+    const gitBin = path.dirname(execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim());
+    const deployEnv = { WT_NO_DEPLOY: '', PATH: `${fakeBin}:${gitBin}` };
     const readLog = () => { try { return fs.readFileSync(log, 'utf8'); } catch { return ''; } };
 
     const worktree = runCli(f, ['new', f.name, 'cli-deploy', '--no-install']).stdout.trim();
@@ -389,6 +392,42 @@ test('the deploy advances to the sha that was landed, not to wherever the shared
     assert.equal(deployed.deployed, true);
     assert.equal(git(f.main, 'rev-parse', 'HEAD'), mine, 'the live checkout runs what this land pushed');
     assert.notEqual(git(f.main, 'rev-parse', 'HEAD'), theirs);
+
+    // And once that other land has deployed its own commits, this one does not
+    // pull the checkout back or restart it onto code it never landed.
+    git(f.main, 'merge', '-q', '--ff-only', theirs);
+    const restarts = [];
+    const again = wt.deployAfterLand(f.main, 'main', mine, { runDeploy: (...args) => { restarts.push(args); return { status: 0 }; } });
+    assert.equal(again.why, 'ahead');
+    assert.equal(git(f.main, 'rev-parse', 'HEAD'), theirs, 'the newer checkout is left as it is');
+    assert.deepEqual(restarts, [], 'and the restart belongs to the land that put it there');
+
+    // A checkout at exactly this land's sha still gets its restart: the code is
+    // there, but nothing has necessarily started running it yet.
+    git(f.main, 'reset', '-q', '--hard', mine);
+    const exact = wt.deployAfterLand(f.main, 'main', mine, { runDeploy: (...args) => { restarts.push(args); return { status: 0 }; } });
+    assert.equal(exact.deployed, true);
+    assert.equal(restarts.length, 1);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('a checkout that cannot fast-forward to the landed sha is reported, not forced', () => {
+  const f = fixture('keep-tool');
+  const restarts = [];
+  try {
+    const worktree = runCli(f, ['new', f.name, 'diverged', '--no-install']).stdout.trim();
+    write(path.join(worktree, 'mine.txt'), 'mine\n');
+    commitIn(worktree, 'mine');
+    const mine = wt.landWorktree(worktree, { noDeploy: true });
+
+    // The live checkout has a commit of its own that origin never saw.
+    write(path.join(f.main, 'local.txt'), 'local only\n');
+    commitIn(f.main, 'local only');
+    const diverged = git(f.main, 'rev-parse', 'HEAD');
+    const result = wt.deployAfterLand(f.main, 'main', mine, { runDeploy: (...args) => { restarts.push(args); return { status: 0 }; } });
+    assert.equal(result.why, 'merge');
+    assert.equal(git(f.main, 'rev-parse', 'HEAD'), diverged, 'the checkout keeps its own commit');
+    assert.deepEqual(restarts, [], 'and is not restarted onto code it does not have');
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
