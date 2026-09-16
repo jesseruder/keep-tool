@@ -2285,6 +2285,29 @@ test('the worktree exit prompt is answered only when Keep worktree is the highli
   // The same scrollback on its own: heading, footer and a Keep worktree line all present,
   // but no modal open — answering here would type Enter into a live prompt.
   assert.equal(worktreeExitPromptKeepsWorktree(transcript.join('\n')), false);
+
+  // A complete retained copy of the modal is still scrollback: the live UI below it is a
+  // prompt, and that is where the Enter would land.
+  const gap = Array(10).fill('  tool output');
+  assert.equal(worktreeExitPromptKeepsWorktree([modal(1), '', '❯ '].join('\n')), false);
+  assert.equal(worktreeExitPromptKeepsWorktree([modal(1), ...gap, '❯ ', '  esc to interrupt'].join('\n')), false);
+  // But a retained copy above a live one does not hide it: the bottommost block wins.
+  assert.equal(worktreeExitPromptKeepsWorktree([modal(1), ...gap, modal(1)].join('\n')), true);
+  assert.equal(worktreeExitPromptKeepsWorktree([modal(1), ...gap, modal(2)].join('\n')), false);
+
+  // 80 columns: the "Stays at <path>" suffix wraps onto its own row, which is
+  // continuation text and not the next option.
+  assert.equal(worktreeExitPromptKeepsWorktree([
+    '  Exiting worktree session',
+    '  You have 4 uncommitted files. These will be lost if you remove the',
+    '  worktree.',
+    '',
+    '  ❯ 1. Keep worktree    Stays at',
+    '    /Users/jesseruder/wt/ghost-server/aws-cost-breakdown',
+    '    2. Remove worktree  All changes and commits will be lost.',
+    '',
+    '  Enter to confirm · Esc to cancel',
+  ].join('\n')), true);
 });
 
 test('lines after last echo excludes results belonging to earlier identical commands', () => {

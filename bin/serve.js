@@ -2216,23 +2216,36 @@ function modelSwitchConfirmed(screen, command) {
 // with no modal actually open, types a bare Enter into a live prompt.
 function worktreeExitPromptKeepsWorktree(screenText) {
   const lines = String(screenText || '').split(/\r?\n/).map(normalizedText);
-  const WINDOW = 6;
-  const qualifies = (index) => {
-    const top = Math.max(0, index - WINDOW);
-    const bottom = Math.min(lines.length - 1, index + WINDOW);
+  const ABOVE = 6, BELOW = 8;
+  // The footer row of a well-formed modal block around this candidate, or -1.
+  const blockFooter = (index) => {
+    const top = Math.max(0, index - ABOVE);
+    const bottom = Math.min(lines.length - 1, index + BELOW);
     // Any other highlighted option nearby means this is a different, larger menu.
     for (let i = top; i <= bottom; i += 1) {
-      if (i !== index && /^❯\s*\d+\./.test(lines[i])) return false;
+      if (i !== index && /^❯\s*\d+\./.test(lines[i])) return -1;
     }
-    if (!lines.slice(top, index).some((line) => /Exiting worktree session/i.test(line))) return false;
+    if (!lines.slice(top, index).some((line) => /Exiting worktree session/i.test(line))) return -1;
+    // A narrow pane wraps option 1's "Stays at <path>" onto its own row, so the sibling
+    // option is the next row that starts an option — anything before it is that wrap.
     let next = index + 1;
-    while (next <= bottom && !lines[next]) next += 1;
-    if (next > bottom || !/^2\.\s*Remove worktree\b/.test(lines[next])) return false;
-    return lines.slice(next + 1, bottom + 1).some((line) => /Enter to confirm/i.test(line));
+    while (next <= bottom && !/^(?:❯\s*)?\d+\./.test(lines[next])) next += 1;
+    if (next > bottom || !/^2\.\s*Remove worktree\b/.test(lines[next])) return -1;
+    const footer = lines.slice(next + 1, bottom + 1).findIndex((line) => /Enter to confirm/i.test(line));
+    return footer === -1 ? -1 : next + 1 + footer;
   };
-  const candidates = lines.reduce((found, line, index) =>
-    (/^❯\s*1\.\s*Keep worktree\b/.test(line) && qualifies(index) ? found.concat(index) : found), []);
-  return candidates.length === 1;
+  const footer = lines.reduce((found, line, index) => {
+    if (!/^❯\s*1\.\s*Keep worktree\b/.test(line)) return found;
+    const end = blockFooter(index);
+    return end === -1 ? found : end;
+  }, -1);
+  if (footer === -1) return false;
+  // The live modal is the bottommost UI on the screen. A retained copy of this same
+  // question sits above whatever is actually open now — a prompt, another menu, another
+  // confirmable dialog — so anything highlighted or confirmable below the footer means
+  // the Enter would land somewhere nobody asked for it. Taking the lowest qualifying
+  // block first keeps an old copy above from hiding the live one.
+  return !lines.slice(footer + 1).some((line) => line.startsWith('❯') || /Enter to confirm|Esc to cancel/i.test(line));
 }
 
 function modelSwitchDialogVisible(screen, command) {
@@ -3544,7 +3557,7 @@ async function restartSession(body, deps = {}) {
     // Answering it costs a round trip the plain exit does not, so the wait grows to ~15s
     // once — and only once — the prompt has been answered; every other screen waits the
     // same ~6s it always has. A screen that cannot be read is simply not the modal.
-    let promptAnswered = false;
+    let promptAnswered = false, screenReadReported = false;
     for (let i = 0, limit = 30; i < limit; i++) {
       stopped = (await host('get', { pane: body.pane })).pane;
       if (!restartPaneMatches(pane, stopped, session.id)) throw Error('Session process changed during restart');
@@ -3552,7 +3565,13 @@ async function restartSession(body, deps = {}) {
       if (!promptAnswered) {
         let screen = null;
         try { screen = await (deps.readScreenResult || readScreenResult)({ pane: body.pane }, null, false, deps); }
-        catch { screen = null; }
+        catch (error) {
+          screen = null;
+          if (!screenReadReported) {
+            screenReadReported = true;
+            process.stderr.write(`keep serve: could not read ${session.id}'s pane while waiting for it to exit: ${String(error && error.message || error)}\n`);
+          }
+        }
         if (worktreeExitPromptKeepsWorktree(String(screen && screen.text || ''))) {
           await writeTarget({ pane: body.pane }, '\r', deps);
           promptAnswered = true;
