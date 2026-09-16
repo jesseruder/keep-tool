@@ -210,7 +210,13 @@ function applySkillPlans(plans) {
     if (plan.action === 'ok') continue;
     if (plan.action === 'relink') fs.unlinkSync(plan.dest);
     if (plan.action === 'migrate' || plan.action === 'replace') {
-      plan.backup = `${plan.dest}.keep-backup-${Date.now()}`;
+      // Beside the skills directory, never inside it: an agent loads every directory
+      // under `skills` that has a SKILL.md, so a backup left there would come back as
+      // a second copy of the skill under its backup name. The home the destination
+      // names is the one that keeps it, shared parent or not.
+      const attic = path.join(path.dirname(path.dirname(plan.dest)), 'skill-backups');
+      fs.mkdirSync(attic, { recursive: true });
+      plan.backup = path.join(attic, `${plan.skill}.keep-backup-${Date.now()}`);
       fs.renameSync(plan.dest, plan.backup);
     }
     // Never touch the parent: `~/.agents/skills` is often a symlink itself.

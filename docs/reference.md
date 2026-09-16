@@ -265,8 +265,10 @@ written. A missing destination is linked; one that already resolves to this chec
 left alone; a symlink that dangles, or that resolves into another keep-tool checkout (a
 `package.json` naming this application two directories above the target), is repaired
 in place — an older checkout path, a deleted worktree. Any other link or directory of
-its own is moved to `<dest>.keep-backup-<timestamp>` and linked when its `SKILL.md` is
-byte-identical to this checkout's; otherwise the run refuses, names the path, and asks
+its own is moved to `<home>/skill-backups/<skill>.keep-backup-<timestamp>` — beside the
+skills directory, never inside it, where an agent would load the backup as a second
+copy of the skill — and linked when its `SKILL.md` is byte-identical to this
+checkout's; otherwise the run refuses, names the path, and asks
 for `--replace`, which backs it up and links: a live link into someone else's skill
 collection is never replaced silently. A parent such as `~/.agents/skills` that is
 itself a symlink is never modified, and when it names the same directory as

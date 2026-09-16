@@ -386,7 +386,19 @@ function linkTargets(home, skill) {
   });
 }
 
+// Backups live beside the skills directory, not in it: anything left under `skills`
+// would load as a second skill named after the backup.
 function backups(home) {
+  const found = [];
+  for (const dir of ['.claude', '.agents']) {
+    const attic = path.join(home, dir, 'skill-backups');
+    if (!fs.existsSync(attic)) continue;
+    for (const name of fs.readdirSync(attic)) if (name.includes('keep-backup')) found.push(path.join(attic, name));
+  }
+  return found;
+}
+
+function strayBackups(home) {
   const found = [];
   for (const dir of ['.claude', '.agents']) {
     const skills = path.join(home, dir, 'skills');
@@ -537,7 +549,9 @@ test('a live link into another keep-tool checkout is repointed, and one into any
       'the foreign skill itself is untouched; only the link was set aside');
     const saved = backups(f.home);
     assert.deepEqual(saved.map((name) => path.basename(name).split('.keep-backup-')[0]), ['fleet-review']);
+    assert.equal(path.dirname(saved[0]), path.join(f.home, '.claude', 'skill-backups'));
     assert.equal(fs.realpathSync(saved[0]), fs.realpathSync(company));
+    assert.deepEqual(strayBackups(f.home), [], 'no backup is left where an agent would load it as a skill');
   } finally { f.cleanup(); }
 });
 
@@ -568,7 +582,11 @@ test('an identical skill copy is migrated, and a different one needs --replace',
     assert.equal(fs.realpathSync(other), fs.realpathSync(path.join(SKILLS, 'keep')));
     const saved = backups(f.home);
     assert.equal(saved.length, 2, saved.join(', '));
+    assert.deepEqual(saved.map((name) => path.dirname(name)).sort(),
+      [path.join(f.home, '.agents', 'skill-backups'), path.join(f.home, '.claude', 'skill-backups')],
+      'each backup lands beside the skills directory of the home its destination named');
     assert.equal(fs.readFileSync(path.join(saved.find((name) => path.basename(name).startsWith('keep.')), 'SKILL.md'), 'utf8'), '# someone else\n');
+    assert.deepEqual(strayBackups(f.home), [], 'no backup is left where an agent would load it as a skill');
   } finally { f.cleanup(); }
 });
 
