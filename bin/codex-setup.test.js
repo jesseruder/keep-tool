@@ -27,7 +27,17 @@ function fixture() {
   const target = { id: 'codex-secondary', label: 'Secondary', agent: 'codex', configDir: targetDir, builtIn: false };
   const sourceConfig = {
     model: 'source-model', model_provider: 'source-provider',
+    model_reasoning_effort: 'high', service_tier: 'priority',
+    project_doc_fallback_filenames: ['CLAUDE.md'],
+    notify: ['/usr/bin/say', 'source profile'],
     features: { hooks: true, js_repl: false },
+    tui: { theme: 'source-dark' },
+    desktop: { enabled: true },
+    shell_environment_policy: { inherit: 'all', ignore_default_excludes: true },
+    projects: {
+      [path.join(root, 'shared-repo')]: { trust_level: 'trusted' },
+      [path.join(sourceDir, 'workspace')]: { trust_level: 'trusted' },
+    },
     plugins: { 'sample@bundled': { enabled: true }, 'computer-use@bundled': { enabled: false } },
     mcp_servers: {
       castle: { url: 'https://example.test/mcp', http_headers: { Authorization: 'secret-server-definition' } },
@@ -123,6 +133,102 @@ test('source changes update managed leaves while target changes become overrides
     assert.throws(() => setup.refresh(f.target), /conflicts at mcp_servers\.castle/);
     assert.equal(toml.parse(fs.readFileSync(path.join(f.targetDir, 'config.toml'), 'utf8')).mcp_servers.castle.url,
       'https://target-change.test/mcp', 'conflict leaves target untouched');
+  } finally { f.cleanup(); }
+});
+
+test('first adoption shares preferences and unions project trust without taking over target values', () => {
+  const f = fixture();
+  try {
+    setup.shareSetup(f.source, f.target);
+    const config = toml.parse(fs.readFileSync(path.join(f.targetDir, 'config.toml'), 'utf8'));
+    assert.equal(config.model, 'target-model', 'a differing preference at adoption stays a target override');
+    assert.equal(config.model_provider, 'target-provider', 'provider routing is never managed');
+    assert.equal(config.model_reasoning_effort, 'high');
+    assert.equal(config.service_tier, 'priority');
+    assert.deepEqual(config.project_doc_fallback_filenames, ['CLAUDE.md'],
+      'an array is one leaf, so the fallback project-doc list arrives whole');
+    assert.deepEqual(config.shell_environment_policy, { inherit: 'all', ignore_default_excludes: true });
+    assert.equal(config.projects[path.join(f.root, 'shared-repo')].trust_level, 'trusted',
+      'trust entries outside either config directory are shared verbatim');
+    assert.equal(config.projects[path.join(f.targetDir, 'workspace')].trust_level, 'trusted',
+      'a project inside the source home rebases into the target home');
+    assert.equal(Object.hasOwn(config.projects, path.join(f.sourceDir, 'workspace')), false);
+    assert.equal(config.projects['/private/project'].trust_level, 'trusted', 'the target keeps its own trust entries');
+  } finally { f.cleanup(); }
+});
+
+test('per-profile preferences never cross profiles', () => {
+  const f = fixture();
+  try {
+    setup.shareSetup(f.source, f.target);
+    const config = toml.parse(fs.readFileSync(path.join(f.targetDir, 'config.toml'), 'utf8'));
+    for (const key of ['notify', 'tui', 'desktop', 'notice']) {
+      assert.equal(Object.hasOwn(config, key), false, `${key} belongs to the profile that set it`);
+      assert.equal(setup.MANAGED_ROOTS.includes(key), false, key);
+    }
+    assert.equal(setup.CONFIG_ROOTS.includes('features'), true);
+    assert.equal(setup.PREFERENCE_ROOTS.includes('project_doc_fallback_filenames'), true);
+  } finally { f.cleanup(); }
+});
+
+test('a changed source preference propagates until the target edits it', () => {
+  const f = fixture();
+  const sourceFile = path.join(f.sourceDir, 'config.toml'), targetFile = path.join(f.targetDir, 'config.toml');
+  try {
+    setup.shareSetup(f.source, f.target);
+    const source = toml.parse(fs.readFileSync(sourceFile, 'utf8'));
+    source.project_doc_fallback_filenames = ['CLAUDE.md', 'NOTES.md'];
+    writeToml(sourceFile, source);
+    setup.refresh(f.target);
+    const target = toml.parse(fs.readFileSync(targetFile, 'utf8'));
+    assert.deepEqual(target.project_doc_fallback_filenames, ['CLAUDE.md', 'NOTES.md']);
+
+    target.project_doc_fallback_filenames = ['LOCAL.md'];
+    writeToml(targetFile, target);
+    setup.refresh(f.target);
+    assert.deepEqual(toml.parse(fs.readFileSync(targetFile, 'utf8')).project_doc_fallback_filenames, ['LOCAL.md']);
+    source.project_doc_fallback_filenames = ['CLAUDE.md'];
+    writeToml(sourceFile, source);
+    setup.refresh(f.target);
+    assert.deepEqual(toml.parse(fs.readFileSync(targetFile, 'utf8')).project_doc_fallback_filenames, ['LOCAL.md'],
+      'an account-local override survives later source updates');
+  } finally { f.cleanup(); }
+});
+
+test('preview reports what a refresh would do and writes nothing', () => {
+  const f = fixture();
+  const targetFile = path.join(f.targetDir, 'config.toml');
+  try {
+    assert.deepEqual(setup.previewRefresh(f.target), { managed: false, configChanges: [], missingAssets: [], conflicts: [] });
+    const adoption = setup.preview(f.source, f.target);
+    assert.equal(adoption.managed, false);
+    assert.equal(adoption.conflicts.length, 0);
+    for (const name of ['model_reasoning_effort', 'service_tier', 'features.hooks']) {
+      assert.ok(adoption.configChanges.includes(name), `${name}: ${adoption.configChanges.join(', ')}`);
+    }
+    assert.equal(adoption.configChanges.includes('model'), false, 'a target override is not a pending change');
+    for (const name of ['AGENTS.md', path.join('skills', 'shared'), 'marketplaces/bundled']) {
+      assert.ok(adoption.missingAssets.includes(name), `${name}: ${adoption.missingAssets.join(', ')}`);
+    }
+    assert.equal(fs.existsSync(path.join(f.targetDir, 'AGENTS.md')), false, 'preview links nothing');
+    assert.equal(fs.existsSync(path.join(f.targetDir, setup.MANIFEST)), false, 'preview records nothing');
+
+    setup.shareSetup(f.source, f.target);
+    assert.deepEqual(setup.previewRefresh(f.target),
+      { managed: true, sourceAccountId: f.source.id, configChanges: [], missingAssets: [], conflicts: [] });
+
+    const source = toml.parse(fs.readFileSync(path.join(f.sourceDir, 'config.toml'), 'utf8'));
+    source.model_reasoning_effort = 'low';
+    writeToml(path.join(f.sourceDir, 'config.toml'), source);
+    const bytes = fs.readFileSync(targetFile, 'utf8');
+    assert.deepEqual(setup.previewRefresh(f.target).configChanges, ['model_reasoning_effort']);
+    assert.equal(fs.readFileSync(targetFile, 'utf8'), bytes, 'preview leaves the target config byte-identical');
+
+    const target = toml.parse(bytes);
+    target.model_reasoning_effort = 'medium';
+    writeToml(targetFile, target);
+    assert.deepEqual(setup.previewRefresh(f.target).conflicts, ['model_reasoning_effort']);
+    assert.throws(() => setup.refresh(f.target), /conflicts at model_reasoning_effort/);
   } finally { f.cleanup(); }
 });
 

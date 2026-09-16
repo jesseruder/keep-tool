@@ -7,7 +7,24 @@ const { isDeepStrictEqual } = require('node:util');
 const toml = require('@iarna/toml');
 
 const MANIFEST = '.keep-codex-capabilities.json';
+// What a profile can do: tables whose entries are individual capabilities.
 const CONFIG_ROOTS = ['features', 'plugins', 'mcp_servers', 'apps', 'marketplaces', 'hooks', 'experimental_hooks'];
+// How a profile behaves: top-level preferences a second profile has no reason to
+// diverge on. `project_doc_fallback_filenames` is why Codex reads CLAUDE.md, and
+// `projects` carries per-directory trust, so a profile without them behaves
+// differently in every repository. Scalars and arrays are single leaves; tables
+// merge per entry, so trust entries union and the target keeps its own.
+// Deliberately not managed, because they are per-profile or per-machine:
+// `notify`, `tui`, `desktop`, `notice`, and the target's own `auth.json`,
+// `history`, and `model_provider` routing. `hooks.state` is inside a managed
+// root but its trusted-hash keys name the profile's own hooks.json path, so
+// `managedLeaves` splits it per hook path and `rebaseValue` rewrites the keys
+// into the target home; a hash recorded for a source-only path never applies to
+// the target. `marketplaces` sources inside the source home are rebased the same
+// way and linked into the target.
+const PREFERENCE_ROOTS = ['model', 'model_reasoning_effort', 'service_tier', 'project_doc_fallback_filenames',
+  'shell_environment_policy', 'projects'];
+const MANAGED_ROOTS = [...CONFIG_ROOTS, ...PREFERENCE_ROOTS];
 const FILE_ASSETS = ['AGENTS.md', 'hooks.json'];
 const DIRECTORY_ASSETS = ['skills', 'agents'];
 const MISSING = Symbol('missing');
@@ -57,9 +74,11 @@ function isObject(value) { return value && typeof value === 'object' && !Array.i
 
 function managedLeaves(config) {
   const result = new Map();
-  for (const root of CONFIG_ROOTS) {
+  for (const root of MANAGED_ROOTS) {
     if (!Object.prototype.hasOwnProperty.call(config, root)) continue;
     const value = config[root];
+    // A scalar or an array is one value, not a container of values: an array
+    // merges whole so a reordered or trimmed list stays a single decision.
     if (!isObject(value)) {
       result.set(JSON.stringify([root]), { path: [root], value });
       continue;
@@ -131,7 +150,7 @@ function rebaseValue(value, sourceDir, targetDir) {
 
 function desiredConfig(sourceConfig, sourceDir, targetDir) {
   const desired = {};
-  for (const root of CONFIG_ROOTS) {
+  for (const root of MANAGED_ROOTS) {
     if (Object.prototype.hasOwnProperty.call(sourceConfig, root)) desired[root] = rebaseValue(sourceConfig[root], sourceDir, targetDir);
   }
   return desired;
@@ -171,7 +190,11 @@ function mergeConfig(sourceConfig, targetConfig, previous, sourceDir, targetDir)
     }
     decisions.push({ path: sourceLeaves.get(key)?.path || targetLeaves.get(key)?.path || prior.path, managed });
   }
-  if (conflicts.length) throw new Error(`Codex capability sync conflicts at ${conflicts.join(', ')}`);
+  if (conflicts.length) {
+    // The list travels on the error so a read-only preview can report the paths
+    // without parsing the message.
+    throw Object.assign(new Error(`Codex capability sync conflicts at ${conflicts.join(', ')}`), { conflicts });
+  }
 
   const records = decisions.map(({ path: trail, managed }) => ({
     path: trail,
@@ -545,4 +568,59 @@ function refresh(account, options = {}) {
   return { ...shareSetup(source, account), managed: true };
 }
 
-module.exports = { MANIFEST, CONFIG_ROOTS, readSetup, shareSetup, refresh, mergeConfig, desiredConfig };
+// Only an absent target path is reported: a target that already holds its own
+// file or directory there is an intentional override a refresh leaves alone.
+function missingAssets(sourceConfig, sourceDir, targetDir) {
+  const missing = [];
+  const expect = (source, target, name) => { if (pathExists(source) && !pathExists(target)) missing.push(name); };
+  for (const name of FILE_ASSETS) expect(path.join(sourceDir, name), path.join(targetDir, name), name);
+  for (const container of DIRECTORY_ASSETS) {
+    const sourceRoot = path.join(sourceDir, container), targetRoot = path.join(targetDir, container);
+    if (!pathExists(sourceRoot) || expectedLink(sourceRoot, targetRoot)) continue;
+    if (pathExists(targetRoot) && !fs.statSync(targetRoot).isDirectory()) continue;
+    for (const name of fs.readdirSync(sourceRoot)) {
+      expect(path.join(sourceRoot, name), path.join(targetRoot, name), path.join(container, name));
+    }
+  }
+  for (const [name, definition] of Object.entries(sourceConfig.marketplaces || {})) {
+    const source = typeof definition?.source === 'string' ? path.resolve(definition.source) : null;
+    if (!source || !(source === sourceDir || source.startsWith(sourceDir + path.sep))) continue;
+    expect(source, path.join(targetDir, path.relative(sourceDir, source)), `marketplaces/${name}`);
+  }
+  return missing;
+}
+
+// The same reads and the same merge as shareSetup, with nothing written: what a
+// refresh would change, so `keep doctor` can report drift without repairing it.
+function preview(sourceAccount, targetAccount) {
+  const { source, target } = assertAccounts(sourceAccount, targetAccount);
+  const previous = readJSON(path.join(target, MANIFEST), null);
+  if (previous && (previous.version !== 1 || canonical(previous.sourceConfigDir) !== canonical(source))) {
+    throw new Error('target Codex profile is already managed from a different source');
+  }
+  const sourceConfig = readToml(path.join(source, 'config.toml'));
+  const targetConfig = readToml(path.join(target, 'config.toml'));
+  const configChanges = [], conflicts = [];
+  try {
+    const merged = mergeConfig(sourceConfig, targetConfig, previous?.config, source, target);
+    for (const record of merged.records) {
+      if (digest(getAt(merged.config, record.path)) !== digest(getAt(targetConfig, record.path))) {
+        configChanges.push(displayPath(record.path));
+      }
+    }
+  } catch (error) {
+    if (!Array.isArray(error.conflicts)) throw error;
+    conflicts.push(...error.conflicts);
+  }
+  return { managed: Boolean(previous), configChanges, missingAssets: missingAssets(sourceConfig, source, target), conflicts };
+}
+
+function previewRefresh(account) {
+  const manifest = readSetup(account);
+  if (!manifest) return { managed: false, configChanges: [], missingAssets: [], conflicts: [] };
+  const source = { id: manifest.sourceAccountId, agent: 'codex', configDir: manifest.sourceConfigDir };
+  return { ...preview(source, account), managed: true, sourceAccountId: manifest.sourceAccountId };
+}
+
+module.exports = { MANIFEST, CONFIG_ROOTS, PREFERENCE_ROOTS, MANAGED_ROOTS,
+  readSetup, shareSetup, refresh, preview, previewRefresh, mergeConfig, desiredConfig };
