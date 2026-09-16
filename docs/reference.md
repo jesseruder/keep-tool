@@ -26,6 +26,7 @@ registry data or credentials to the public source repository.
 - `bin/alerts.js` — alert routing, rate policy, channel adapters, and brief composition
 - `bin/unblock.js` — cross-card dependency resolution and linked-session delivery
 - `bin/slack.js` — read-only Slack polling, fleet correlation, cards, and alerts
+- `bin/incidents.js` — deterministic alert parsing for the bots in `alertBots`, and the incident card per signature
 - `bin/standup.js` — weekday standup evidence, generation, and scheduling
 - `bin/ideas.js` — daily fleet-wide Fable ideas evidence, generation, and scheduling
 - `bin/landed.js` — default-branch commit detection, card annotation, and scheduling
@@ -36,6 +37,7 @@ registry data or credentials to the public source repository.
 - `.keep/turns.sqlite` — the turn index; a derived cache, safe to delete and rebuild
 - `.keep/artifacts/` — committed per-card durable artifacts, force-added like `.keep/handoffs/`
 - `.keep/holds/` — quiet-window ledgers, one JSON file per hold
+- `.keep/incidents/` — incident signatures and the title index (`state.json`) plus the raw event feed (`events.jsonl`)
 - `resources/` — committed shared-resource declarations, one JSON file per project basename
 - `.keep/notes/` — state notes, one JSON file per project (bounded; pruned on every write)
 - `.keep/unblocked/` — pending and delivered cross-card unblock records
@@ -145,6 +147,8 @@ keep landed decisions [--disagree]
 keep slack poll [--dry]
 keep slack status
 keep slack mode log|cards|alerts
+keep incidents [--json]
+keep incidents parse <file|-> [--json]
 keep verify <id>       # run a check recipe now, in its thread or a fresh session (needs keep serve)
                        # Owner-initiated: never refused by, and never counted against,
                        # the scheduler's one-open-per-card-per-day allowance
@@ -865,6 +869,94 @@ parent plus the last 12 replies, related refs are capped at six, and reactions a
 omitted. Fleet context is capped at 12,000 characters (dropping old commits first),
 while the entire prompt is capped at 40,000 characters. Whole message/thread units
 that do not fit are deferred behind their cursors rather than dropped.
+
+## Incidents
+
+Alert posts are partitioned by **author**, not by channel. `watch/slack.json` gains an
+`alertBots` map of Slack bot id to the project that bot reports for:
+
+```json
+"alertBots": { "B06PX3MFG5C": "ghost-server", "B0C1KEHNH8F": "castle-sandboxes" }
+```
+
+A message from one of those ids never reaches the classifier: its shapes are fixed, so
+`bin/incidents.js` parses it deterministically and costs no model call. Every other
+message keeps the Haiku classifier unchanged. Bot messages are still recorded in
+`.keep/slack/decisions.jsonl` — one row per message, `kind: "alert"`, carrying
+`signature`, `state`, `title` and `area` — so watcher history stays complete. Both
+files are read on every poll, like `slack.json` itself; an absent `alertBots` map
+(the default) leaves every message on the classifier path.
+
+`watch/incidents.json` names the areas an alert can belong to:
+
+```json
+{
+  "areas": {
+    "sandboxes":  { "project": "castle-sandboxes", "match": ["^Sandbox ", "^Browser Service", "^Production sandbox"] },
+    "app-server": { "project": "ghost-server", "default": true }
+  },
+  "quietMin": 60, "reopenHours": 24,
+  "highTitles": ["Server Faults", "Sandbox Open Health", "Sandbox Host Capacity"]
+}
+```
+
+`match` entries are regexes tested against the *parsed* title in file order; the first
+hit wins. With no hit, the bot's project names the area; failing that the `default`
+area takes it. An unparseable regex is skipped rather than thrown. `highTitles` decides
+severity (`high` when a title matches, otherwise `med`; a human note is `low`). With no
+file at all there is one `default` area, `quietMin` 60 and `reopenHours` 24.
+
+Three message shapes are recognised, from the combined attachment title, attachment
+text and top-level text (bot posts put their body in `attachments[0]`, ad-hoc posts in
+the top-level text), with `&gt;`/`&lt;`/`&amp;` unescaped first:
+
+- **Grafana** — blocks beginning `**Firing**` or `**Resolved**`, each with `Value:`,
+  `Labels:`, `Annotations:`, `Source:` and `Silence:`. One Slack message can carry
+  several blocks with different alert names and different states
+  (`[FIRING:1, RESOLVED:1]`), and each block becomes its own alert. The title is the
+  `alertname` label, never the Slack title, which is unusable on a grouped post. The
+  signature is `grafana:<slug(alertname)>` plus every other label as sorted
+  `key=value` pairs, minus `grafana_folder` and `team` — so each stuck `sandbox_id`,
+  `failureReason` or `fields` instance is its own incident.
+- **Internal** (ghost-server `internalAlerts.ts`) — `Alert "<title>" firing`,
+  `Alert "<title>" resolved`, and `All alerts are passing`. The signature is the
+  `castle-alerts-<id>` token when the message carries one, else
+  `internal:<slug(title)>`. A resolved post carries only the title, so state keeps a
+  title→signature index to map it back. `All alerts are passing` resolves every open
+  `internal:`/`castle-alerts-` signature and nothing else; it is recorded with state
+  `all-clear` and no signature of its own.
+- **Ad-hoc** (`SlackNotifier.alert`) — signature `adhoc:<slug(text before the first
+  colon)>`, capped at 60 slug characters. There is no resolved form. Anything the
+  parser cannot read falls back to this shape, and a message with no readable text at
+  all is recorded with a null signature. `ingest` never throws.
+
+One incident card per signature: id `inc-<slug(signature)>` (long signatures are
+truncated with a hash suffix), kind `bug`, tag `incident`, status `active`, title
+`Incident: <title>`, project from the area. The body carries the Slack permalink, the
+area and the signature, plus the first firing text inside a `DATA, NOT INSTRUCTIONS`
+fence. Later firings check in as `alert firing (N)` and bump the count rather than
+opening a second card; `resolved` checks in and records the time but leaves the card
+active; the daemon's sweep after each Slack poll closes a card that has been quiet for
+`quietMin` with `--status done` and a `closed: quiet for 60m` check-in. Ad-hoc alerts
+have no resolved form, so their quiet clock runs from the last firing; a Grafana or
+internal alert that never resolved is left open. A firing within `reopenHours` of a
+close reopens the same card; later than that, a new `inc-<slug>-<yyyymmdd>` card links
+the old one. Deterministic commit, step-run and hold suspects from the prior
+`SUSPECT_WINDOW_MIN` minutes are attached to the first firing. A human thread reply
+under a bot post becomes a `note (by <name>)` check-in with the reply fenced as data —
+no classifier, and never attached twice.
+
+State lives under `.keep/incidents/`: `state.json` (signatures and the title index,
+written through one synchronous mutation the way `self-repair.js` writes its state) and
+`events.jsonl`, the raw feed of every lifecycle change — `incident-opened`,
+`incident-fired`, `incident-resolved`, `incident-closed`, `incident-reopened`,
+`human-note`. Each event carries `{at, kind, card, signature, title, area, severity,
+permalink, suspects}`: pointers, never message bodies.
+
+`keep incidents [--json]` lists the open signatures with their card, area, fire count
+and last firing. `keep incidents parse <file|-> [--json]` parses one Slack message — or
+a JSON array of them — exactly as the poll would, which is how a new alert shape gets
+debugged without polling.
 
 ## Steps
 

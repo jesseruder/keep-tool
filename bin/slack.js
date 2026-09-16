@@ -12,6 +12,7 @@ const steps = require('./steps.js');
 const alerts = require('./alerts.js');
 const health = require('./health.js');
 const summarize = require('./summarize.js');
+const incidents = require('./incidents.js');
 
 const WATCH_DIR = path.join(keep.ROOT, 'watch');
 const CONFIG_FILE = path.join(WATCH_DIR, 'slack.json');
@@ -68,6 +69,11 @@ function config() {
     model: String(value.model || 'haiku'),
     backfillHours: Math.max(0, Number(value.backfillHours) || 6),
     maxPerPoll: Math.max(1, Number(value.maxPerPoll) || 60),
+    // Bot ids whose posts are alerts, mapped to the project they belong to.
+    // These are parsed deterministically by incidents.js and never classified;
+    // an empty map (the default) leaves every message on the classifier path.
+    // Example: {"B06PX3MFG5C": "ghost-server", "B0C1KEHNH8F": "castle-sandboxes"}
+    alertBots: incidents.normalizeAlertBots(value.alertBots),
   };
 }
 
@@ -1078,7 +1084,11 @@ async function poll(options = {}) {
     }
     return { ...item, batch, boundedSnapshots, folded: foldThreads(batch, boundedSnapshots, input) };
   });
-  const candidates = folded.flatMap((item) => item.folded.units.map((unit) => {
+  // Partition by author before anything is built into a prompt: a unit whose
+  // parent was posted by an alert bot is parsed by incidents.js and costs no
+  // model call. Its human thread replies ride along as incident notes.
+  const isAlertUnit = (unit) => Boolean(cfg.alertBots[String(unit.from || '')]);
+  const candidates = folded.flatMap((item) => item.folded.units.filter((unit) => !isAlertUnit(unit)).map((unit) => {
     const memberTs = item.batch.filter((message) => messageUnitTs(message) === String(unit.ts)).map((message) => tsNumber(message.ts));
     return { item, unit, activityTs: memberTs.length ? Math.min(...memberTs) : tsNumber(unit.ts) };
   })).sort((a, b) => a.activityTs - b.activityTs);
@@ -1109,6 +1119,32 @@ async function poll(options = {}) {
     parentByTs = new Map(decisions.map((decision) => [decision.ts, decision]));
   }
   for (const item of folded) {
+    const alertTs = new Set();
+    const alertUnits = item.folded.units.filter(isAlertUnit);
+    if (alertUnits.length) {
+      const { entries } = incidents.ingest({
+        units: alertUnits, channel: item.channel, domain, now, dry,
+        alertBots: cfg.alertBots,
+        batchTs: new Set(item.batch.map((message) => String(message.ts))),
+      }, deps);
+      for (const entry of entries) {
+        alertTs.add(String(entry.ts));
+        results.push(entry);
+        if (dry) process.stdout.write(JSON.stringify(entry) + '\n');
+        else {
+          if (!decisionExists(item.channel, entry.ts)) appendDecision(entry);
+          seen[String(entry.ts)] = {
+            ...(entry.cardId ? { cardId: entry.cardId } : {}), state: 'done', classifiedAt: entry.at,
+          };
+        }
+      }
+      if (!dry) {
+        writeJsonAtomic(SEEN_FILE, seen);
+        if (entries.some((entry) => entry.cardId) && fs.existsSync(path.join(keep.ROOT, '.git'))) {
+          deps.commitAndPush('keep: incidents', ['tasks']);
+        }
+      }
+    }
     const selectedKeys = new Set(selected.filter((choice) => choice.item === item).map((choice) => String(choice.unit.ts)));
     const selectedBatch = item.batch.filter((message) => selectedKeys.has(messageUnitTs(message)));
     if (selectedBatch.length) {
@@ -1128,7 +1164,7 @@ async function poll(options = {}) {
       }
     }
     if (!dry) {
-      const selectedTs = new Set(selectedBatch.map((message) => String(message.ts)));
+      const selectedTs = new Set([...selectedBatch.map((message) => String(message.ts)), ...alertTs]);
       const nextHistory = advanceContiguous(item.afterTs, item.history, (message) => {
         const record = seen[String(message.ts)];
         return selectedTs.has(String(message.ts)) || isSeenDone(record);
@@ -1200,6 +1236,10 @@ function startScheduler(options = {}) {
     try {
       const decisions = await poll();
       process.stderr.write(`keep slack: polled ${decisions.length} new message${decisions.length === 1 ? '' : 's'}\n`);
+      // The daemon's quiet-incident sweep. Never let it fail a poll.
+      if (options.afterPoll) {
+        try { options.afterPoll(); } catch (error) { process.stderr.write(`keep incidents: sweep failed: ${error.message}\n`); }
+      }
       if (options.onChange) options.onChange();
       health.record('slack', { ok: true, detail: `${decisions.length} messages` });
     } catch (error) {

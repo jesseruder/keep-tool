@@ -235,7 +235,13 @@ function startSchedulers(ctx) {
       return Boolean(match && match.alive && match.agentAlive !== false);
     },
   });
-  startFeatureSchedulers(features, { slack, discord }, { onChange: broadcast }, health);
+  // Incidents ride on the Slack poll's clock: every alert that could close one
+  // arrived through it, so a sweep after each poll is both timely and free. It
+  // is deliberately not its own timer, and it never throws into the tick.
+  startFeatureSchedulers(features, { slack, discord }, {
+    onChange: broadcast,
+    afterPoll: () => require('../incidents.js').sweepQuietly(),
+  }, health);
   const configuredLiveTickMs = Number(process.env.KEEP_LIVE_TICK_MS);
   const liveTickMs = Number.isFinite(configuredLiveTickMs) && configuredLiveTickMs > 0
     ? configuredLiveTickMs
