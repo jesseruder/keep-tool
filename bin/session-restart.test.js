@@ -140,6 +140,18 @@ test('restart readiness protects active work, decisions, and viewed queued panes
   assert.equal(refusal(session, { ...pane, attached: 2, visibleAttached: 0 }, true), null);
   assert.ok(refusal(session, { ...pane, attached: 2, visibleAttached: 1 }, true));
   assert.equal(refusal(session, { ...pane, attached: 1 }), null);
+  // An auto-compacted session's job ledger keeps a permanent `history-gap`. Once
+  // the ledger reports that gap as settled it no longer blocks a restart or an
+  // account transfer; anything else uncertain alongside it still does.
+  const settledLedger = { gapSettled: true, uncertain: ['history-gap'], pending: false, jobs: [] };
+  assert.equal(refusal({ ...session, unknownBackgroundJobs: ['history-gap'], backgroundJobs: settledLedger }, pane), null);
+  assert.ok(refusal({ ...session, unknownBackgroundJobs: ['history-gap'] }, pane), 'an unsettled gap still refuses');
+  assert.ok(refusal({ ...session, unknownBackgroundJobs: ['history-gap'],
+    backgroundJobs: { ...settledLedger, gapSettled: false } }, pane));
+  assert.ok(refusal({ ...session, unknownBackgroundJobs: ['history-gap', 'job'], backgroundJobs: settledLedger }, pane),
+    'a settled gap excuses only itself');
+  assert.ok(refusal({ ...session, unknownBackgroundJobs: ['history-gap'], pendingBackground: true,
+    backgroundJobs: settledLedger }, pane));
   assert.ok(refusal({ ...session, state: 'needs-input', activity: { reason: 'next instruction' },
     backgroundJobs: { jobs: [{ kind: 'scheduled', status: 'pending' }] } }, pane), 'a cron must be protected even when final prose looks ready');
   assert.equal(refusal({ ...session, backgroundJobs: { jobs: [{ kind: 'scheduled', status: 'cancelled' }] } }, pane), null);

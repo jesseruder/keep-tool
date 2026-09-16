@@ -18,13 +18,24 @@ function refusal(session, pane, queued = false, options = {}) {
   // the model and the tick address all survive. Every guard below except the viewer
   // check still applies.
   if (session.activity?.background?.scheduled?.length || session.backgroundJobs?.jobs?.some(j => j.kind === 'scheduled' && j.status === 'pending')) return 'Pause session-local scheduled jobs before restarting';
+  // An auto-compacted session's job ledger carries a permanent `history-gap`
+  // (gapReason 'transcript-replaced') that no replay can clear, which used to
+  // refuse every non-forced restart and account transfer out of it forever.
+  // When the ledger itself reports that gap as settled -- see
+  // background-jobs.settledGap: no open job, no unresolved call, no unconsumed
+  // hook, a completed restart record, caught up, not recovering -- it stands for
+  // history that predates the compaction with no live work attached, so it alone
+  // stops blocking. Every other uncertain entry still counts, and every check
+  // below is unchanged.
+  const gapSettled = session.backgroundJobs?.gapSettled === true;
+  const unknownJobs = (session.unknownBackgroundJobs || []).filter((id) => !(gapSettled && id === 'history-gap'));
   // A forced restart discards only uncertain background evidence (a gapped job
   // ledger, stale pending entries, unknown or lifecycle agent work). A turn that
   // has not ended, a live tool, a rate limit, a running/waiting foreground
   // lifecycle and session-local scheduled jobs still refuse.
   if (session.endedTurn !== true || session.toolRunning || session.rateLimit
       || (!force && (session.pendingBackground || session.waitingFor
-        || session.unknownBackgroundJobs?.length || session.lifecycleAgents?.length
+        || unknownJobs.length || session.lifecycleAgents?.length
         || session.backgroundJobs?.jobs?.some(j => j.status === 'pending')))
       || session.lifecycleForeground?.state === 'running' || session.lifecycleForeground?.state === 'waiting') return 'Waiting for the turn and background work to finish';
   if (session.pendingQuestion || session.pendingPlan

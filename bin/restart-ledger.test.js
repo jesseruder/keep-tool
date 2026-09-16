@@ -238,14 +238,22 @@ test('Claude evidence migration keeps a pruned child ownership edge fail closed'
   assert.equal(migrated.restart.children.child, 'owned');
 }, 'claude'));
 
-test('partial writes recover, replacement fails closed, large records have a separate bound', () => fixture(({ file, append, verify }) => {
+test('partial writes recover, replacement fails closed, large records have a separate bound', () => fixture(({ root, file, append, verify }) => {
   append('parent', meta('parent')); append('parent', done()); verify()();
   fs.appendFileSync(file('parent'), '{"type":"event_msg"'); assert.throws(verify, ledger.Recovering);
   fs.appendFileSync(file('parent'), ',"payload":{"type":"task_complete"}}\n'); verify()();
   append('parent', row('response_item', { type: 'message', role: 'assistant', content: 'x'.repeat(5000) }));
   verify({ budget: 1024 })();
-  fs.writeFileSync(file('parent'), JSON.stringify(meta('parent')) + '\n' + JSON.stringify(done()) + '\n');
+  // A replaced transcript is a permanent gap, and a replacement whose replay
+  // leaves an unresolved call or an unfinished turn still fails closed. Only a
+  // replacement that replays back to a completely quiescent ledger settles that
+  // gap (see background-jobs.settledGap) without force.
+  fs.writeFileSync(file('parent'), JSON.stringify(meta('parent')) + '\n'
+    + JSON.stringify(row('response_item', { type: 'function_call', call_id: 'work', name: 'exec_command', arguments: '{}' })) + '\n');
   assert.throws(verify, /incomplete/);
+  fs.writeFileSync(file('parent'), JSON.stringify(meta('parent')) + '\n' + JSON.stringify(done()) + '\n');
+  verify()();
+  assert.equal(jobs.read(root, 'codex', 'parent').gap, true, 'the replacement gap stays on the record');
 }));
 
 test('Claude process-local cron and services block restart; Stop hook alone is insufficient', () => fixture(({ append, verify }) => {
@@ -299,4 +307,29 @@ test('a forced restart accepts a gapped ledger with a dead pending agent while s
   assert.equal(JSON.parse(fs.readFileSync(snapshot)).gap, true, 'force does not launder the gap away');
   append('parent', { type: 'user', sessionId: 'parent', message: { content: 'More work' } });
   assert.throws(proof, /source changed during restart/);
+}, 'claude'));
+
+test('a settled transcript-replaced gap verifies without force while any other gap still refuses', () => fixture(({ root, file, append, verify }) => {
+  for (let i = 0; i < 4; i++) {
+    append('parent', { type: 'user', sessionId: 'parent', message: { content: 'history that auto-compaction is about to replace' } });
+    append('parent', { type: 'assistant', sessionId: 'parent', message: { content: [], stop_reason: 'end_turn' } });
+  }
+  verify()();
+  // Auto-compaction rewrites the transcript as a shorter summary of itself, which
+  // leaves a permanent `transcript-replaced` gap no cold replay can ever clear.
+  fs.writeFileSync(file('parent'), [
+    { type: 'user', sessionId: 'parent', message: { content: 'summary' } },
+    { type: 'assistant', sessionId: 'parent', message: { content: [], stop_reason: 'end_turn' } },
+  ].map((value, index) => JSON.stringify({ timestamp: new Date(Date.now() + index).toISOString(), ...value })).join('\n') + '\n');
+  const snapshot = path.join(root, '.keep/background-jobs/claude/parent/state.json');
+  verify()();
+  const state = JSON.parse(fs.readFileSync(snapshot));
+  assert.equal(state.gap, true, 'accepting the gap never launders it away');
+  assert.equal(state.gapReason, 'transcript-replaced');
+  assert.equal(jobs.settledGap(state, { unconsumedHooks: 0 }), true);
+  verify()();
+  state.gapReason = 'checkpoint-anchor';
+  fs.writeFileSync(snapshot, JSON.stringify(state));
+  assert.throws(verify, /Job ledger evidence is incomplete/, 'only a transcript-replaced gap settles');
+  verify({ force: true })();
 }, 'claude'));

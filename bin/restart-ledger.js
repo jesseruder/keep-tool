@@ -27,14 +27,23 @@ function verify({ root, agent, sid, file, instance, resolveChild, budget = 4 * 1
     if (result.uncertain?.includes('ledger-busy') || result.recovering) throw new Recovering('Waiting for job ledger recovery');
     const snapshot = path.join(root, '.keep', 'background-jobs', agent, id, 'state.json');
     const state = JSON.parse(fs.readFileSync(snapshot, 'utf8'));
+    const inbox = path.join(path.dirname(snapshot), 'inbox');
+    let pendingHooks = 0;
+    try { pendingHooks = fs.readdirSync(inbox).length; } catch (e) { if (e.code !== 'ENOENT') throw e; }
     // A forced restart accepts a gapped or restart-record-less ledger. The
     // snapshot is still loaded and pinned below, so a source or hook change
-    // during the restart still aborts it.
-    if (state.restartVersion !== jobs.restartVersion(agent) || (!force && (state.gap || !state.restart))) throw Error('Job ledger evidence is incomplete');
+    // during the restart still aborts it. A settled `transcript-replaced` gap
+    // (see background-jobs.settledGap) is also accepted without force -- an
+    // auto-compacted session carries that gap forever and it stands for history
+    // with no live work attached. Unlike force this takes no shortcut: the
+    // checkpoint pinning, the completion record, the unresolved jobs and the
+    // whole child graph below are all still verified.
+    const settled = jobs.settledGap(state, { unconsumedHooks: pendingHooks });
+    if (state.restartVersion !== jobs.restartVersion(agent)
+        || (!force && ((state.gap && !settled) || !state.restart))) throw Error('Job ledger evidence is incomplete');
     const stat = fs.statSync(source), cp = state.checkpoint;
     if (!cp || cp.identity !== `${digest(path.resolve(source))}:${stat.dev}:${stat.ino}` || cp.offset !== stat.size || cp.mtime !== stat.mtimeMs) throw new Recovering('Waiting for job ledger recovery');
     if (state.hookBarrier != null && cp.offset <= state.hookBarrier) throw new Recovering('Waiting for hook activity to reach the job ledger');
-    const inbox = path.join(path.dirname(snapshot), 'inbox');
     const key = evidenceKey(state);
     const check = () => {
       const current = fs.statSync(source);

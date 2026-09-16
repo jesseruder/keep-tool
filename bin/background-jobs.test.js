@@ -710,6 +710,67 @@ test('a forced rebind accepts a gapped, restart-record-less ledger and reports n
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('a settled transcript-replaced gap reports as settled and rebinds without force', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-jobs-settled-gap-'));
+  const source = path.join(root, 'source', 'parent.jsonl'), target = path.join(root, 'target', 'parent.jsonl');
+  const snapshot = path.join(root, '.keep/background-jobs/claude/parent/state.json');
+  const load = () => JSON.parse(fs.readFileSync(snapshot, 'utf8'));
+  const line = (value) => JSON.stringify(value) + '\n';
+  const user = (at, content) => line({ type: 'user', sessionId: 'parent', timestamp: new Date(at).toISOString(), message: { content } });
+  const assistant = (at) => line({ type: 'assistant', sessionId: 'parent', timestamp: new Date(at).toISOString(), message: { content: [], stop_reason: 'end_turn' } });
+  try {
+    fs.mkdirSync(path.dirname(source)); fs.mkdirSync(path.dirname(target));
+    fs.writeFileSync(source, user(1000, 'history that auto-compaction is about to replace') + assistant(1100)
+      + user(1200, 'more history that auto-compaction is about to replace') + assistant(1300));
+    assert.equal(jobs.sync({ root, agent: 'claude', sid: 'parent', file: source, now: 1400 }).gapSettled, false);
+    // Auto-compaction rewrites the transcript as a shorter summary of itself.
+    fs.writeFileSync(source, user(2000, 'summary') + assistant(2100));
+    const replaced = jobs.sync({ root, agent: 'claude', sid: 'parent', file: source, now: 2200 });
+    assert.equal(replaced.gap, true);
+    assert.equal(replaced.gapReason, 'transcript-replaced');
+    assert.equal(replaced.gapSettled, true);
+    assert.deepEqual(replaced.uncertain, ['history-gap'], 'a settled gap stays visible as uncertain evidence');
+    assert.equal(jobs.read(root, 'claude', 'parent', 2300).gapSettled, true);
+
+    const settled = load();
+    assert.equal(jobs.settledGap(settled, { unconsumedHooks: 0 }), true);
+    assert.equal(jobs.settledGap(settled), false, 'an uncounted inbox never yields a settled verdict');
+    assert.equal(jobs.settledGap(settled, { unconsumedHooks: 1 }), false);
+    for (const patch of [
+      { jobs: { 'job:open': { id: 'open', kind: 'command', status: 'pending', eventAt: 2000 } } },
+      { calls: { 'call:open': { at: 2000 } } },
+      { gapReason: 'checkpoint-anchor' },
+      { gapReason: undefined },
+      { gap: false },
+      { recovering: true },
+      { coldReplay: { startedAt: 2000, fromIdentity: 'x' } },
+      { restart: { ...settled.restart, completed: false } },
+      { restart: undefined },
+    ]) assert.equal(jobs.settledGap({ ...settled, ...patch }, { unconsumedHooks: 0 }), false,
+      `a settled gap is refused by ${Object.keys(patch)[0]}`);
+    assert.equal(jobs.settledGap({ ...settled, jobs: {
+      'job:done': { id: 'done', kind: 'command', status: 'completed', eventAt: 2000 },
+      'job:svc': { id: 'svc', kind: 'service', status: 'pending', eventAt: 2000 },
+      'job:cron': { id: 'cron', kind: 'scheduled', status: 'pending', eventAt: 2000 },
+    } }, { unconsumedHooks: 0 }), true, 'terminal, service and scheduled jobs are not open work');
+
+    fs.copyFileSync(source, target);
+    const request = { root, agent: 'claude', sid: 'parent', sourceFile: source, targetFile: target,
+      transactionId: 'tx-settled', sourceStopVerifiedAt: 1 };
+    assert.equal(jobs.rebindSource(request).reused, false);
+    const after = load();
+    assert.equal(after.gap, true, 'the gap is carried into the rebound state unchanged');
+    assert.equal(after.gapReason, 'transcript-replaced');
+    assert.equal(after.source.file, path.resolve(target));
+    assert.deepEqual(after.jobs, settled.jobs);
+
+    const unsettled = load(); unsettled.gapReason = 'checkpoint-anchor';
+    fs.writeFileSync(snapshot, JSON.stringify(unsettled));
+    assert.throws(() => jobs.rebindSource({ ...request, transactionId: 'tx-unsettled' }),
+      /job ledger evidence is incomplete/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('missing resume, ungrounded prompt, prior gaps, and transcript read errors stay fail closed', () => {
   const lifecycle = require('./session-lifecycle');
   const scenarios = [

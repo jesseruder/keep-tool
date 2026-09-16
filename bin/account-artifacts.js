@@ -413,7 +413,14 @@ function catchUpStoppedLedger(plan, sessionId, transactionId, options) {
     && before.handoffRebind.target?.file === path.resolve(transcript.target)
     && before.source?.file === path.resolve(transcript.target);
   if (alreadyRebound) return () => {};
-  if (!before || before.version !== 1 || (before.gap && options.force !== true) || before.source?.agent !== 'claude'
+  // A settled `transcript-replaced` gap is accepted without force here too, for
+  // the same reason restart-ledger.verify accepts it: the full restart proof
+  // below still runs, so nothing else this check stood for is skipped.
+  let pendingHooks = 0;
+  try { pendingHooks = fs.readdirSync(path.join(path.dirname(snapshot), 'inbox')).length; }
+  catch (error) { if (error.code !== 'ENOENT') pendingHooks = 1; }
+  const settledGap = require('./background-jobs').settledGap(before, { unconsumedHooks: pendingHooks });
+  if (!before || before.version !== 1 || (before.gap && !settledGap && options.force !== true) || before.source?.agent !== 'claude'
       || before.source.sid !== sessionId || path.resolve(before.source.file || '') !== path.resolve(transcript.source)) {
     throw failure('job ledger source evidence is unavailable for stopped-session recovery', 'KEEP_ARTIFACT_LEDGER');
   }

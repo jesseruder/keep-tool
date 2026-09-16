@@ -73,8 +73,14 @@ and yielded cells drain (buffered results may still need tombstones); 2,500 tota
 Truncated/replaced files, unreadable history and oversized records are explicit
 uncertainty, not proof that work ended. Recovery replays the available file while
 preserving unresolved prior jobs; a permanent history gap remains visible rather
-than silently resetting the ledger. This ledger is evidence, not authority to
-kill a process or bypass the stricter close/restart checks.
+than silently resetting the ledger. A replaced transcript retains every job that
+was unresolved at that moment as an individually uncertain job, so once such a
+ledger has no open job, no unresolved call, no unconsumed hook, a completed
+restart record and is caught up, that permanent gap alone no longer blocks a
+restart or an account transfer. It stays visible as `history-gap`; the ledger
+reports it as settled. No other gap reason gets that treatment. This ledger is
+evidence, not authority to kill a process or bypass the stricter close/restart
+checks.
 
 ### Restart proof
 

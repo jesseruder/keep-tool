@@ -26,6 +26,35 @@ function markGap(state, now, reason) {
   if (!keepSticky) state.gapReason = reason;
 }
 
+// A `transcript-replaced` gap is sticky, so an auto-compacted session carries it
+// forever and every non-forced restart or account transfer out of it refuses.
+// That gap is safe to discount on its own. When the transcript is replaced, sync
+// resets the checkpoint to offset 0, re-reads the entire new file, and retains
+// every job that was non-terminal at that moment flagged
+// `evidence: 'transcript-replaced'` -- so live work survives the replacement as
+// an individually uncertain job rather than disappearing into the gap. A
+// `transcript-replaced` gap with no open job, no unresolved call, no unconsumed
+// hook evidence, a completed restart record and no recovery or cold replay in
+// progress therefore stands only for history that predates the replacement and
+// has no live work attached. That is the same evidence a forced restart already
+// accepts, minus the parts force skips blindly (the restart record, the open
+// jobs and the child graph, all of which are still checked here and by the
+// callers). Only this reason qualifies: 'checkpoint-anchor' and
+// 'hook-transcript-mismatch' can hide work the ledger never observed, a legacy
+// gap carries no reason at all, and the non-sticky reasons clear themselves on
+// a cold replay so they never need this door. `unconsumedHooks` has no default:
+// a caller that cannot count the inbox must not get a settled verdict.
+// Callers that know whether the ledger has read its source to EOF also require
+// that (`caughtUp`); the ledger checks that separately where it matters.
+function settledGap(state, { unconsumedHooks } = {}) {
+  if (!state || state.gap !== true || state.gapReason !== 'transcript-replaced') return false;
+  if (state.recovering || state.coldReplay) return false;
+  if (state.restart?.completed !== true) return false;
+  if (unconsumedHooks !== 0) return false;
+  if (!state.jobs || !state.calls || Object.keys(state.calls).length) return false;
+  return !Object.values(state.jobs).some(j => !TERMINAL.has(j.status) && !['service', 'scheduled'].includes(j.kind));
+}
+
 // Scheduled jobs belong to an agent process, which may run inside a shell pane.
 function processInstance(pane, agentPid = pane?.agentPid) {
   return pane && agentPid ? `${pane.id}:${pane.pid}:${agentPid}` : null;
@@ -126,11 +155,18 @@ function rebindSource({ root, agent, sid, sourceFile, targetFile, transactionId,
     // the same evidence restart-ledger.verify skips under force -- and carries the
     // gap into the rebound state; it then reports no children, so the caller
     // rebinds the root alone. The writer lock, the state version, an in-flight
-    // recovery and unconsumed hook evidence still hold.
-    if (state.version !== 1 || state.restartVersion !== restartVersion(agent) || !state.jobs || !state.calls
-        || (!force && (!state.restart || state.gap)) || state.recovering) throw failure('job ledger evidence is incomplete');
+    // recovery and unconsumed hook evidence still hold. A settled
+    // `transcript-replaced` gap (see settledGap) is accepted without force: the
+    // gap is then the ledger's only uncertainty and carries no live work, and
+    // every other check below -- the checkpoint being caught up with the stopped
+    // source, the content digests, the child graph -- still runs in full. The
+    // gap itself is carried into the rebound state unchanged either way, because
+    // nothing here writes state.gap.
     let entries = [];
     try { entries = fs.readdirSync(path.join(ledgerDir, 'inbox')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (state.version !== 1 || state.restartVersion !== restartVersion(agent) || !state.jobs || !state.calls
+        || (!force && (!state.restart || (state.gap && !settledGap(state, { unconsumedHooks: entries.length }))))
+        || state.recovering) throw failure('job ledger evidence is incomplete');
     if (entries.length) throw failure('job ledger has unconsumed hook evidence');
     const source = fileEvidence(sourceFile, true), target = fileEvidence(targetFile, true);
     if (source.dev === target.dev && source.ino === target.ino) {
@@ -417,9 +453,15 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
       const uncertain = open.filter(j => j.kind === 'unknown' || now - (j.lastCorroboratedAt || j.eventAt) > staleAfter
         || j.evidence === 'transcript-replaced').map(j => j.id);
       if (state.recovering || state.gap) uncertain.push(state.recovering ? 'history-recovery' : 'history-gap');
+      // This file is a retired source; the live ledger is at state.source. The
+      // inbox is not consumed on this path, so count what is waiting in it.
+      let pendingHooks = 0;
+      try { pendingHooks = fs.readdirSync(path.join(dir, 'inbox')).length; }
+      catch (error) { if (error.code !== 'ENOENT') pendingHooks = 1; }
       return { pending: open.some(j => !uncertain.includes(j.id)), uncertain,
         jobs: currentJobs.map(j => ({ ...j, confidence: TERMINAL.has(j.status) ? 'observed' : uncertain.includes(j.id) ? 'uncertain' : 'observed' })),
         recovering: Boolean(state.recovering), gap: Boolean(state.gap), gapReason: state.gapReason,
+        gapSettled: settledGap(state, { unconsumedHooks: pendingHooks }),
         gapClearedAt: state.gapClearedAt, lastColdReplayAt: state.lastColdReplayAt,
         bytesRead: 0, lastReconciledAt: state.lastReconciledAt,
         redirect: state.source };
@@ -662,6 +704,9 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
     return { pending: open.some(j => !uncertain.includes(j.id)), uncertain,
       jobs: jobs.map(j => ({ ...j, confidence: TERMINAL.has(j.status) ? 'observed' : uncertain.includes(j.id) ? 'uncertain' : 'observed' })),
       recovering, gap: state.gap, gapReason: state.gapReason, gapClearedAt: state.gapClearedAt,
+      // A ledger that has not read its source to EOF may still be hiding live
+      // work behind the gap, so a settled verdict also requires being caught up.
+      gapSettled: caughtUp === true && settledGap(state, { unconsumedHooks: consumed.length }),
       lastColdReplayAt: state.lastColdReplayAt, caughtUp, unresolvedCalls: Object.keys(state.calls).length,
       unconsumedHooks: consumed.length, bytesRead, lastReconciledAt: now };
   } finally { try { fs.unlinkSync(lock); } catch {} }
@@ -681,6 +726,9 @@ function read(root, agent, sid, now = Date.now(), staleAfter = 30 * 60e3) {
     try { unconsumedHooks = fs.readdirSync(path.join(dir, 'inbox')).length; } catch {}
     return { pending: open.some(j => !uncertain.includes(j.id)), uncertain, jobs, caughtUp,
       recovering: Boolean(state.recovering), gap: Boolean(state.gap), gapReason: state.gapReason,
+      // This is the ledger view the dashboard puts on session.backgroundJobs, so
+      // it is the one the restart/transfer refusal reads.
+      gapSettled: caughtUp === true && settledGap(state, { unconsumedHooks }),
       gapClearedAt: state.gapClearedAt, lastColdReplayAt: state.lastColdReplayAt,
       unresolvedCalls: Object.keys(state.calls || {}).length,
       unconsumedHooks,
@@ -835,5 +883,5 @@ function createScheduler(options = {}) {
   };
 }
 
-module.exports = { restartVersion, processInstance, sync, read, targets, recordHook, consume, markGap, nextTarget, rebindSource,
+module.exports = { restartVersion, processInstance, sync, read, targets, recordHook, consume, markGap, settledGap, nextTarget, rebindSource,
   targetKey, targetFingerprint, settledResult, createScheduler };
