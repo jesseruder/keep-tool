@@ -13,6 +13,8 @@ paths live in your separate data directory (`~/keep` by default). Never commit
 registry data or credentials to the public source repository.
 
 - `bin/keep` — the CLI (sh launcher + `keep.js`, runs on Node; symlinked from `~/bin/keep`)
+- `bin/keep-core.js` — the shared layer under the CLI: registry paths, card IO, the lock, session links, plans, and the mutators every command group uses
+- `bin/commands/` — one module per command group (`hook`, `step`, `turns`, `watcher`, `host`, `review`), each exporting its own slice of the command table
 - `tasks/` — live tasks, one `.md` per task
 - `archive/` — done tasks, swept here occasionally
 - `digests/` — generated digests (Phase 2)
