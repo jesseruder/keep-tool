@@ -335,11 +335,15 @@ test('wt land deploys end to end through the CLI, and --no-deploy and WT_NO_DEPL
     // the test at all — not merely shadowed by it.
     const fakeBin = path.join(f.root, 'bin');
     const log = path.join(f.root, 'restart.log');
-    write(path.join(fakeBin, 'keep'), `#!/bin/sh\necho "$@" >> '${log}'\necho restarted\n`);
+    // The log path travels in the environment: a TMPDIR with a quote in it would
+    // otherwise be shell syntax inside the shim.
+    write(path.join(fakeBin, 'keep'), '#!/bin/sh\necho "$@" >> "$WT_TEST_RESTART_LOG"\necho restarted\n');
     fs.chmodSync(path.join(fakeBin, 'keep'), 0o755);
-    fs.accessSync(path.join(fakeBin, 'keep'), fs.constants.X_OK); // a noexec tmpdir must fail here, not fall through to the real keep
-    const gitBin = path.dirname(execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim());
-    const deployEnv = { WT_NO_DEPLOY: '', PATH: `${fakeBin}:${gitBin}` };
+    // PATH is this directory and nothing else, so an unusable shim makes the land
+    // fail loudly instead of falling through to whatever `keep` the host has. wt
+    // resolves `git` through PATH too, hence the link.
+    fs.symlinkSync(execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim(), path.join(fakeBin, 'git'));
+    const deployEnv = { WT_NO_DEPLOY: '', PATH: fakeBin, WT_TEST_RESTART_LOG: log };
     const readLog = () => { try { return fs.readFileSync(log, 'utf8'); } catch { return ''; } };
 
     const worktree = runCli(f, ['new', f.name, 'cli-deploy', '--no-install']).stdout.trim();
@@ -362,7 +366,7 @@ test('wt land deploys end to end through the CLI, and --no-deploy and WT_NO_DEPL
 
     write(path.join(worktree, 'three.txt'), 'three\n');
     commitIn(worktree, 'third');
-    const disabled = runCli(f, ['land', worktree], undefined, { PATH: deployEnv.PATH });
+    const disabled = runCli(f, ['land', worktree], undefined, { PATH: deployEnv.PATH, WT_TEST_RESTART_LOG: log });
     assert.equal(disabled.status, 0, disabled.stderr);
     assert.equal(git(f.main, 'rev-parse', 'HEAD'), first, 'WT_NO_DEPLOY=1 keeps the harness away from the real thing');
     assert.equal(readLog().trim(), 'restart-daemon');
