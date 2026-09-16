@@ -187,7 +187,9 @@ to create a host-owned reviewer pane for review ticks. The terminal attaches to 
 pane; the reviewer also appears in the console. The `core` skill pack — the `keep` and
 `fleet-review` skills — is installed with the hooks; the reviewer registers through its
 Claude SessionStart hook. `keep setup skills --pack handoff` adds the optional agent
-handoff skills, `keep setup skills --list` shows every pack, its skills and whether they
+handoff skills. The conventions those skills assume are in
+[agent guidance](docs/agent-guidance.md), with blocks to paste into your own
+CLAUDE.md and AGENTS.md. `keep setup skills --list` shows every pack, its skills and whether they
 are linked, and the choice is remembered so later runs reinstall it. Re-running setup is
 safe: links left behind by a moved or deleted checkout are repaired, and an unrelated
 skill of the same name is never replaced without `--replace`, which backs it up first.
@@ -383,7 +385,8 @@ here rather than by copying whole private checkouts back into this repository.
 
 See the [full command reference](docs/reference.md), [shared state](docs/shared-state.md),
 [daemon self-repair](docs/self-repair.md), [Keep skill](skills/keep/SKILL.md),
-[fleet reviewer procedure](skills/fleet-review/SKILL.md), and [desktop README](desktop/README.md).
+[fleet reviewer procedure](skills/fleet-review/SKILL.md),
+[agent guidance](docs/agent-guidance.md), and [desktop README](desktop/README.md).
 
 ## Session handoffs
 

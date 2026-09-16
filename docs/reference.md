@@ -26,7 +26,7 @@ registry data or credentials to the public source repository.
 - `bin/alerts.js` — alert routing, rate policy, channel adapters, and brief composition
 - `bin/unblock.js` — cross-card dependency resolution and linked-session delivery
 - `bin/slack.js` — read-only Slack polling, fleet correlation, cards, and alerts
-- `bin/standup.js` — weekday Castle standup evidence, generation, and scheduling
+- `bin/standup.js` — weekday standup evidence, generation, and scheduling
 - `bin/ideas.js` — daily fleet-wide Fable ideas evidence, generation, and scheduling
 - `bin/landed.js` — default-branch commit detection, card annotation, and scheduling
 - `bin/lint.js` — deterministic card hygiene checks and their cached result
@@ -626,9 +626,9 @@ medium/high reviewer findings, active holds, and gated steps with pending commit
 failed delivery retries every 30 minutes until 12:00 local, when the daemon records the
 failure and gives up for that day; `keep brief --send` always sends immediately.
 
-## Castle standup
+## Standup
 
-`keep standup` overwrites `standup.md` with an at-most-three-sentence Castle update
+`keep standup` overwrites `standup.md` with an at-most-three-sentence standup note
 covering work since the previous weekday's generation time. `--since` overrides that
 cutoff (a bare date and time is Pacific), `--dry` prints the fenced evidence and prompt
 without calling a model or writing files, and `--show` prints the current note. The

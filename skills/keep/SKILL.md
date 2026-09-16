@@ -196,10 +196,10 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   browser state, a signed-in Chrome, or another agent's session to get past such a gate.
 - **Questions about current work**: answer from `keep list`, `keep overdue`, and
   `keep resume`.
-- **Castle standup**: `keep standup` writes the weekday Castle update; use `--dry` to
-  inspect its fenced evidence and prompt without a model call or file write,
-  `--since "YYYY-MM-DD HH:MM"` to override the Pacific cutoff, and `--show` to print the
-  current note.
+- **Standup**: `keep standup` writes the weekday standup note (an optional feature;
+  see `features` in the configuration); use `--dry` to inspect its fenced evidence and
+  prompt without a model call or file write, `--since "YYYY-MM-DD HH:MM"` to override
+  the Pacific cutoff, and `--show` to print the current note.
 - **Daily ideas sweep**: `keep ideas` runs the fleet-wide workflow-improvement pass;
   use `--dry` to inspect its seven-day fenced evidence without a model call or write,
   and `--model <m>` to override the default Fable model. The daemon runs it daily at
@@ -256,11 +256,11 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
 ## Landing and closing
 
 - When the requested work and validation are complete, default to `--status done`
-  with `--next "nothing"`. Jesse can reopen the card if an issue appears. Use
-  `review` only for a concrete decision, approval, or review Jesse explicitly requested;
-  describe what he needs to decide. Do not add "Jesse review" / "Owner review" as a
-  routine final step in check-ins or agent handoffs. If another agent still has work
-  to do, record that remaining work instead of assigning it to Jesse.
+  with `--next "nothing"`. Owner can reopen the card if an issue appears. Use
+  `review` only for a concrete decision, approval, or review Owner explicitly
+  requested; describe what they need to decide. Do not add "Owner review" as a routine
+  final step in check-ins or agent handoffs. If another agent still has work to do,
+  record that remaining work instead of assigning it to Owner.
 - When the work is finished, its commits are cited, and the only remaining step is the
   merge, use `--status landing` (it requires a cited sha). The landed sweep closes it
   when the shas reach the default branch, with no prose to parse and no model call, and

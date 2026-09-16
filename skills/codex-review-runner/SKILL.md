@@ -5,10 +5,12 @@ description: Run an independent Codex review after nontrivial code changes using
 
 # Running a Codex review
 
-Run the review required by `~/.claude/CLAUDE.md` through `keep codex` as a read-only
-background task. Do not use the plugin's model-invocation-blocked review commands,
-its rescue forwarder, or a direct companion invocation that bypasses account
-selection. This does not require another review-approval question.
+Run the independent review that [agent guidance](../../docs/agent-guidance.md) —
+Keep's `docs/agent-guidance.md` — asks for after a nontrivial code change through
+`keep codex` as a read-only background task. Do not use the plugin's
+model-invocation-blocked review commands, its rescue forwarder, or a direct companion
+invocation that bypasses account selection. This does not require another
+review-approval question.
 
 Load `implementation-handoff` for account selection, background launch, and watchdog
 rules. Keep the selected account explicit throughout candidate lookup, launch,

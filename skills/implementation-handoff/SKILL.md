@@ -28,10 +28,10 @@ The answer sticks for the rest of the session; don't re-ask per task. Don't ask 
 Hand Codex a scoped implementation task, not a "figure out what to do" task.
 
 Every handoff prompt includes the phrase **"handoff from Claude Code; do not spawn a
-reviewer"**. `~/.codex/AGENTS.md` tells Codex to get a second opinion from a reviewer
-subagent before reporting done; that phrase is the opt-out. The review of a handoff
-happens here afterwards (the `codex-review-runner` skill), so an inner review only doubles
-the wall time.
+reviewer"**. The AGENTS.md block in Keep's `docs/agent-guidance.md` tells Codex to get
+a second opinion from a reviewer subagent before reporting done; that phrase is the
+opt-out. The review of a handoff happens here afterwards (the `codex-review-runner`
+skill), so an inner review only doubles the wall time.
 
 ## Codex account and launch
 
