@@ -282,7 +282,8 @@ rest print as `optional` with `keep setup skills --pack <name>`.
 It then prints one line per nondefault account, reporting whether that profile’s
 shared setup is in sync with its source, behind it, conflicted, or not shared at all,
 with the `keep accounts setup <id> --share-from <source>` that repairs it; the check is
-read-only.
+read-only. It compares config values and shared file links; plugin cache
+differences are not reported and are refreshed at the next launch of that account.
 
 Claude subagent lifecycle tracking uses `keep hook lifecycle` for both
 `SubagentStart` and `SubagentStop` in Claude's user settings. These observation-only

@@ -641,7 +641,7 @@ function accountSetupReport() {
           lines.push({ status: 'FAIL', text: `${agent} account ${account.id} shared setup conflicts (${counted(state.conflicts)})${held}`,
             fix: `resolve those values in ${path.join(account.configDir, 'config.toml')}, then ${share(state.sourceAccountId)}` });
         } else {
-          const behind = [...state.configChanges, ...state.missingAssets];
+          const behind = [...state.configChanges, ...state.assetChanges];
           if (behind.length) lines.push({ status: 'FAIL', text: `${agent} account ${account.id} shared setup behind (${counted(behind)})${held}`, fix: share(state.sourceAccountId) });
           else lines.push({ status: 'ok', text: `${agent} account ${account.id} shared setup in sync${held}` });
         }

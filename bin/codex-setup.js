@@ -587,13 +587,20 @@ function shareSetup(sourceAccount, targetAccount, options = {}) {
   const targetConfigFile = path.join(target, 'config.toml');
   const targetConfigHash = fileDigest(targetConfigFile);
   const targetConfig = readToml(targetConfigFile);
-  const merged = mergeConfig(sourceConfig, targetConfig, previous?.config, source, target, deferredLeaves(target));
+  const frozen = deferredLeaves(target);
+  let merged = mergeConfig(sourceConfig, targetConfig, previous?.config, source, target, frozen);
   const assets = { ...syncSimpleAssets(source, target, previous?.assets),
     ...syncMarketplaceAssets(sourceConfig, source, target, previous?.assets) };
   const legacyPlugins = previous?.pluginFiles || {};
   const plugins = syncPlugins(source, target, legacyPlugins, { ...options, previousAliases: previous?.pluginAliases });
   options.beforeConfigCommit?.();
   if (fileDigest(targetConfigFile) !== targetConfigHash) throw new Error('target Codex config changed during capability sync');
+  // Asset and plugin sync takes time, and a compaction can record its swap in
+  // that window before it touches the config — so the unchanged-config check
+  // above passes and the first scan is already stale. The config on disk is
+  // provably identical, so re-merging with the wider frozen set is pure.
+  const late = deferredLeaves(target);
+  if (late.length > frozen.length) merged = mergeConfig(sourceConfig, targetConfig, previous?.config, source, target, late);
   if (!isDeepStrictEqual(merged.config, targetConfig)) writeToml(targetConfigFile, merged.config);
   const manifest = { version: 1, sourceAccountId: sourceAccount.id, sourceConfigDir: source,
     config: merged.records, assets, pluginVersions: plugins.versions, pluginFiles: plugins.pluginFiles,
@@ -611,26 +618,36 @@ function refresh(account, options = {}) {
   return { ...shareSetup(source, account), managed: true };
 }
 
-// Only an absent target path is reported: a target that already holds its own
-// file or directory there is an intentional override a refresh leaves alone.
-function missingAssets(sourceConfig, sourceDir, targetDir) {
-  const missing = [];
-  const expect = (source, target, name) => { if (pathExists(source) && !pathExists(target)) missing.push(name); };
-  for (const name of FILE_ASSETS) expect(path.join(sourceDir, name), path.join(targetDir, name), name);
+// Exactly the two things a refresh does to shared links, decided the way
+// `ensureLink` decides them: add a link the target does not have yet, and remove
+// one Keep still manages whose source is gone. A target that holds its own file
+// there is an intentional override, and a link Keep no longer manages is the
+// target's to keep, so neither is reported.
+function assetChanges(sourceConfig, sourceDir, targetDir, previous = {}) {
+  const changes = [];
+  const consider = (source, target, name) => {
+    if (pathExists(source)) { if (!pathExists(target)) changes.push(`${name} (add)`); }
+    else if (previous[name] && expectedLink(previous[name], target)) changes.push(`${name} (remove)`);
+  };
+  for (const name of FILE_ASSETS) consider(path.join(sourceDir, name), path.join(targetDir, name), name);
   for (const container of DIRECTORY_ASSETS) {
     const sourceRoot = path.join(sourceDir, container), targetRoot = path.join(targetDir, container);
     if (!pathExists(sourceRoot) || expectedLink(sourceRoot, targetRoot)) continue;
     if (pathExists(targetRoot) && !fs.statSync(targetRoot).isDirectory()) continue;
-    for (const name of fs.readdirSync(sourceRoot)) {
-      expect(path.join(sourceRoot, name), path.join(targetRoot, name), path.join(container, name));
+    const names = fs.readdirSync(sourceRoot);
+    for (const name of names) consider(path.join(sourceRoot, name), path.join(targetRoot, name), path.join(container, name));
+    for (const relative of Object.keys(previous)) {
+      if (path.dirname(relative) !== container || names.includes(path.basename(relative))) continue;
+      consider(path.join(sourceRoot, path.basename(relative)), path.join(targetRoot, path.basename(relative)), relative);
     }
   }
+  // Marketplace links are only ever added; a refresh never removes one.
   for (const [name, definition] of Object.entries(sourceConfig.marketplaces || {})) {
     const source = typeof definition?.source === 'string' ? path.resolve(definition.source) : null;
-    if (!source || !(source === sourceDir || source.startsWith(sourceDir + path.sep))) continue;
-    expect(source, path.join(targetDir, path.relative(sourceDir, source)), `marketplaces/${name}`);
+    if (!source || !(source === sourceDir || source.startsWith(sourceDir + path.sep)) || !pathExists(source)) continue;
+    consider(source, path.join(targetDir, path.relative(sourceDir, source)), `marketplaces/${name}`);
   }
-  return missing;
+  return changes;
 }
 
 // The same reads and the same merge as shareSetup, with nothing written: what a
@@ -657,13 +674,14 @@ function preview(sourceAccount, targetAccount) {
     if (!Array.isArray(error.conflicts)) throw error;
     conflicts.push(...error.conflicts);
   }
-  return { managed: Boolean(previous), configChanges, missingAssets: missingAssets(sourceConfig, source, target),
+  return { managed: Boolean(previous), configChanges,
+    assetChanges: assetChanges(sourceConfig, source, target, previous?.assets),
     conflicts, deferred };
 }
 
 function previewRefresh(account) {
   const manifest = readSetup(account);
-  if (!manifest) return { managed: false, configChanges: [], missingAssets: [], conflicts: [], deferred: [] };
+  if (!manifest) return { managed: false, configChanges: [], assetChanges: [], conflicts: [], deferred: [] };
   const source = { id: manifest.sourceAccountId, agent: 'codex', configDir: manifest.sourceConfigDir };
   return { ...preview(source, account), managed: true, sourceAccountId: manifest.sourceAccountId };
 }

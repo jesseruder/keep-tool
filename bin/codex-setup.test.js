@@ -200,7 +200,7 @@ test('preview reports what a refresh would do and writes nothing', () => {
   const targetFile = path.join(f.targetDir, 'config.toml');
   try {
     assert.deepEqual(setup.previewRefresh(f.target),
-      { managed: false, configChanges: [], missingAssets: [], conflicts: [], deferred: [] });
+      { managed: false, configChanges: [], assetChanges: [], conflicts: [], deferred: [] });
     const adoption = setup.preview(f.source, f.target);
     assert.equal(adoption.managed, false);
     assert.equal(adoption.conflicts.length, 0);
@@ -209,14 +209,14 @@ test('preview reports what a refresh would do and writes nothing', () => {
     }
     assert.equal(adoption.configChanges.includes('model'), false, 'a target override is not a pending change');
     for (const name of ['AGENTS.md', path.join('skills', 'shared'), 'marketplaces/bundled']) {
-      assert.ok(adoption.missingAssets.includes(name), `${name}: ${adoption.missingAssets.join(', ')}`);
+      assert.ok(adoption.assetChanges.includes(`${name} (add)`), `${name}: ${adoption.assetChanges.join(', ')}`);
     }
     assert.equal(fs.existsSync(path.join(f.targetDir, 'AGENTS.md')), false, 'preview links nothing');
     assert.equal(fs.existsSync(path.join(f.targetDir, setup.MANIFEST)), false, 'preview records nothing');
 
     setup.shareSetup(f.source, f.target);
     assert.deepEqual(setup.previewRefresh(f.target),
-      { managed: true, sourceAccountId: f.source.id, configChanges: [], missingAssets: [], conflicts: [], deferred: [] });
+      { managed: true, sourceAccountId: f.source.id, configChanges: [], assetChanges: [], conflicts: [], deferred: [] });
 
     const source = toml.parse(fs.readFileSync(path.join(f.sourceDir, 'config.toml'), 'utf8'));
     source.model_reasoning_effort = 'low';
@@ -302,6 +302,32 @@ test('a pending compaction swap freezes the model leaves instead of demoting the
   } finally { swap?.restore(); f.cleanup(); }
 });
 
+test('a compaction swap that starts during the sync still freezes the model leaves', () => {
+  const f = fixture();
+  const targetFile = path.join(f.targetDir, 'config.toml');
+  const record = (name) => JSON.parse(fs.readFileSync(path.join(f.targetDir, setup.MANIFEST), 'utf8')).config
+    .find((entry) => JSON.stringify(entry.path) === JSON.stringify([name]));
+  let swap;
+  try {
+    const target = toml.parse(fs.readFileSync(targetFile, 'utf8'));
+    delete target.model;
+    writeToml(targetFile, target);
+    setup.shareSetup(f.source, f.target);
+    const before = record('model');
+
+    // The source moves, then the compaction records its swap after the first
+    // scan and before the commit — the config on disk has not changed yet.
+    const source = toml.parse(fs.readFileSync(path.join(f.sourceDir, 'config.toml'), 'utf8'));
+    source.model = 'source-model-2';
+    writeToml(path.join(f.sourceDir, 'config.toml'), source);
+    const result = setup.shareSetup(f.source, f.target, { beforeConfigCommit() { swap = pendingSwap(f); } });
+    assert.deepEqual(result.deferred.map((entry) => entry.path), ['model', 'model_reasoning_effort']);
+    assert.equal(toml.parse(fs.readFileSync(targetFile, 'utf8')).model, 'source-model',
+      'the late swap keeps the source update out of the config it is about to rewrite');
+    assert.deepEqual(record('model'), before, 'the prior record carries forward byte for byte');
+  } finally { swap?.restore(); f.cleanup(); }
+});
+
 test('a pending compaction swap at first adoption records no model leaf at all', () => {
   const f = fixture();
   const targetFile = path.join(f.targetDir, 'config.toml');
@@ -329,6 +355,38 @@ test('a pending compaction swap at first adoption records no model leaf at all',
     }
     assert.deepEqual(setup.previewRefresh(f.target).deferred, preview.deferred);
   } finally { swap?.restore(); f.cleanup(); }
+});
+
+test('preview reports the shared links a refresh would add and remove', () => {
+  const f = fixture();
+  try {
+    setup.shareSetup(f.source, f.target);
+    assert.deepEqual(setup.previewRefresh(f.target).assetChanges, []);
+
+    // A source asset Keep still manages in the target is a pending removal.
+    fs.rmSync(path.join(f.sourceDir, 'AGENTS.md'));
+    fs.rmSync(path.join(f.sourceDir, 'skills', 'shared'), { recursive: true });
+    const added = path.join(f.sourceDir, 'skills', 'added');
+    fs.mkdirSync(added);
+    fs.writeFileSync(path.join(added, 'SKILL.md'), 'added\n');
+    const pending = setup.previewRefresh(f.target).assetChanges;
+    assert.ok(pending.includes('AGENTS.md (remove)'), pending.join(', '));
+    assert.ok(pending.includes(`${path.join('skills', 'shared')} (remove)`), pending.join(', '));
+    assert.ok(pending.includes(`${path.join('skills', 'added')} (add)`), pending.join(', '));
+    assert.equal(fs.lstatSync(path.join(f.targetDir, 'AGENTS.md')).isSymbolicLink(), true, 'preview removes nothing');
+
+    setup.refresh(f.target);
+    assert.deepEqual(setup.previewRefresh(f.target).assetChanges, [], 'the refresh did exactly that work');
+    assert.throws(() => fs.lstatSync(path.join(f.targetDir, 'AGENTS.md')), { code: 'ENOENT' });
+
+    // A target that replaced a shared link owns it; that is not pending work.
+    fs.writeFileSync(path.join(f.sourceDir, 'AGENTS.md'), 'shared again\n');
+    setup.refresh(f.target);
+    fs.unlinkSync(path.join(f.targetDir, 'AGENTS.md'));
+    fs.writeFileSync(path.join(f.targetDir, 'AGENTS.md'), 'target override\n');
+    fs.rmSync(path.join(f.sourceDir, 'AGENTS.md'));
+    assert.deepEqual(setup.previewRefresh(f.target).assetChanges, []);
+  } finally { f.cleanup(); }
 });
 
 test('skills, instructions, local marketplaces and exact plugin versions are portable', () => {
