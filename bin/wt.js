@@ -532,47 +532,56 @@ const DEPLOY_AFTER_LAND = {
   'keep-tool': { restart: ['keep', 'restart-daemon'] },
 };
 
-// Runs after the push, so nothing here may throw: the land already happened, and
-// a checkout that cannot be advanced is a thing to report, not a failed land.
-function deployAfterLand(main, defaultName, opts = {}) {
-  // Same escape hatch as WT_NO_INSTALL: a test harness or a scripted land must be
-  // able to exercise `wt land` without restarting the machine's real daemon.
-  if (process.env.WT_NO_DEPLOY === '1') return null;
-  const plans = opts.deployPlans || DEPLOY_AFTER_LAND;
-  const plan = plans[path.basename(main)];
-  if (!plan) return null;
-  const note = (text) => process.stderr.write(`wt: ${text}\n`);
-  const run = opts.runDeploy || ((command, args) => spawnSync(command, args, { encoding: 'utf8' }));
+// Everything here runs after the push, so nothing may throw out of it: the land
+// already happened, and a checkout that cannot be advanced is a thing to report,
+// not a failed land. `sha` is what this invocation pushed, and it is what gets
+// deployed — a concurrent land that moved origin/<default> on in the meantime is
+// that session's to deploy, not this one's.
+function deployAfterLand(main, defaultName, sha, opts = {}) {
+  const note = (text) => { try { process.stderr.write(`wt: ${text}\n`); } catch {} };
   try {
+    // Same escape hatch as WT_NO_INSTALL: a test harness or a scripted land must
+    // be able to exercise `wt land` without restarting the machine's real daemon.
+    if (process.env.WT_NO_DEPLOY === '1') return null;
+    const plans = opts.deployPlans || DEPLOY_AFTER_LAND;
+    const plan = plans[path.basename(main)];
+    if (!plan) return null;
+    const run = opts.runDeploy || ((command, args) => spawnSync(command, args, { encoding: 'utf8' }));
+    const stale = (why) => {
+      note(`${main}: ${why}; left it alone — it is still running the old code`);
+      return { deployed: false, why };
+    };
     const branch = branchFor(main);
-    if (branch !== defaultName) {
-      note(`${main} is on ${branch || 'a detached HEAD'}, not ${defaultName}; left it alone — it is still running the old code`);
-      return { deployed: false, why: 'branch' };
-    }
-    if (statusWithoutMarkers(main).length) {
-      note(`${main} has uncommitted changes; left it alone — it is still running the old code`);
-      return { deployed: false, why: 'dirty' };
-    }
-    // The push just moved origin/<default>, so this only ever fast-forwards to
-    // what was landed; no fetch, and no way to pick up anything else.
-    try { git(main, ['merge', '--ff-only', `origin/${defaultName}`]); }
+    if (branch !== defaultName) return stale(`on ${branch || 'a detached HEAD'}, not ${defaultName}`);
+    // Someone is mid-operation in there. A rebase is detached and a half-finished
+    // merge is dirty, so both are usually caught above; this names the case.
+    const gitDir = git(main, ['rev-parse', '--absolute-git-dir']).trim();
+    const busy = ['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply']
+      .find((entry) => fs.existsSync(path.join(gitDir, entry)));
+    if (busy) return stale(`has an unfinished operation (${busy})`);
+    if (statusWithoutMarkers(main).length) return stale('has uncommitted changes');
+    // Merging the pushed object, not a ref someone else may have moved. --ff-only
+    // is the actual guarantee: it can only advance the branch, never rewrite it or
+    // touch the working tree's own state, and it refuses anything that is not a
+    // fast-forward. The checks above choose when to try; this decides what happens.
+    try { git(main, ['merge', '--ff-only', sha]); }
     catch (error) {
-      note(`could not fast-forward ${main}: ${String(error.message || error).trim()}`);
+      note(`could not fast-forward ${main} to ${sha.slice(0, 12)}: ${String(error.message || error).trim()}`);
       return { deployed: false, why: 'merge' };
     }
-    note(`fast-forwarded ${main} to ${defaultName}`);
+    note(`fast-forwarded ${main} to ${sha.slice(0, 12)}`);
     const [command, ...args] = plan.restart;
-    const result = run(command, args);
+    const result = run(command, args) || {};
     const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
     if (result.status !== 0) {
       note(`${plan.restart.join(' ')} failed; the code is on disk but the daemon is still running the old build`);
-      if (output) process.stderr.write(`${output}\n`);
+      if (output) note(output);
       return { deployed: false, why: 'restart', output };
     }
-    if (output) process.stderr.write(`${output}\n`);
+    if (output) note(output);
     return { deployed: true, output };
   } catch (error) {
-    note(`post-land deploy failed: ${String(error.message || error).trim()}`);
+    note(`post-land deploy failed: ${String(error && error.message || error).trim()}`);
     return { deployed: false, why: 'error' };
   }
 }
@@ -635,7 +644,7 @@ function landWorktree(input, opts = {}) {
   } else {
     git(worktree, ['push', 'origin', `HEAD:${defaultName}`], { stdio: ['ignore', 2, 2] });
     process.stderr.write(`landed ${count} commit(s) to origin/${defaultName}\n`);
-    if (!opts.noDeploy) deployAfterLand(main, defaultName, opts);
+    if (!opts.noDeploy) deployAfterLand(main, defaultName, sha, opts);
   }
   return sha;
 }

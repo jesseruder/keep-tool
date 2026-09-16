@@ -1152,11 +1152,19 @@ For a repo whose main checkout is a live deployment rather than another copy of 
 code, landing to origin is only half the job. `DEPLOY_AFTER_LAND` in `bin/wt.js`
 names those repos — today just `keep-tool`, the tree the launchd-supervised
 `keep serve` daemon runs — and after a successful push `wt land` fast-forwards that
-checkout to the sha it just pushed (`merge --ff-only`, so it can pick up nothing
-else) and runs the repo's restart, `keep restart-daemon`. A checkout on another
-branch, one with uncommitted changes, or a refused restart is reported and skipped:
-the land already happened, so these are things to say, not failures. `--no-deploy`
-lands without touching the checkout. `keep land <card>` inherits all of this.
+checkout and runs the repo's restart, `keep restart-daemon`.
+
+It merges the sha this land pushed, not `origin/<default>`: a concurrent land that
+moved that ref on in the meantime is the other session's to deploy. `--ff-only` is
+what makes this safe — it can only advance the branch, never rewrite it — and the
+checkout is left alone entirely when it is on another branch, has an unfinished
+merge or cherry-pick, or has uncommitted changes. Those skips, a merge that is not
+a fast-forward, and a refused restart are all reported rather than raised: the land
+already happened, so they are things to say, not failures. The branch and status
+checks are policy, not a lock; a checkout being mutated concurrently is only
+protected by `--ff-only` itself. `--no-deploy` lands without touching the checkout,
+`WT_NO_DEPLOY=1` disables the step for a whole process (the test harness sets it),
+and `keep land <card>` inherits all of this.
 
 `wt gc` fetches each repository, then recycles only clean, fully landed worktrees
 whose last commit is at least three days old and whose directory contains no live

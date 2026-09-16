@@ -272,7 +272,7 @@ test('land deploys a live main checkout and says why when it cannot', () => {
     const first = land(worktree);
     assert.equal(git(f.main, 'rev-parse', 'HEAD'), first, 'the live checkout runs what was just landed');
     assert.deepEqual(restarts, [['keep', 'restart-daemon']], 'and is handed its own restart');
-    assert.match(said, /fast-forwarded .*keep-tool to main/);
+    assert.match(said, new RegExp(`fast-forwarded .*keep-tool to ${first.slice(0, 12)}`), 'the message names the sha this land pushed');
     assert.equal(git(f.main, 'status', '--porcelain'), '', 'the fast-forward leaves no working-tree changes');
 
     // A checkout someone is working in is not silently advanced over their edits.
@@ -282,7 +282,7 @@ test('land deploys a live main checkout and says why when it cannot', () => {
     const second = land(worktree);
     assert.equal(git(f.main, 'rev-parse', 'HEAD'), first, 'a dirty checkout keeps its own state');
     assert.equal(restarts.length, 1, 'and is not restarted onto code it does not have');
-    assert.match(said, /uncommitted changes; left it alone — it is still running the old code/);
+    assert.match(said, /has uncommitted changes; left it alone — it is still running the old code/);
     assert.equal(git(f.origin, 'rev-parse', 'main'), second, 'but the land itself still happened');
     fs.unlinkSync(path.join(f.main, 'local.txt'));
 
@@ -293,8 +293,18 @@ test('land deploys a live main checkout and says why when it cannot', () => {
     const third = land(worktree);
     assert.equal(git(f.main, 'rev-parse', 'side'), first, 'the other branch is left where it was');
     assert.equal(restarts.length, 1);
-    assert.match(said, /is on side, not main; left it alone/);
+    assert.match(said, /: on side, not main; left it alone/);
     git(f.main, 'checkout', '-q', 'main');
+
+    // A checkout someone is mid-operation in, even with a clean tree.
+    fs.writeFileSync(path.join(f.main, '.git', 'CHERRY_PICK_HEAD'), `${first}\n`);
+    write(path.join(worktree, 'mid.txt'), 'mid\n');
+    commitIn(worktree, 'mid-operation');
+    land(worktree);
+    assert.equal(git(f.main, 'rev-parse', 'HEAD'), first, 'an unfinished cherry-pick is not merged over');
+    assert.match(said, /unfinished operation \(CHERRY_PICK_HEAD\)/);
+    assert.equal(restarts.length, 1);
+    fs.unlinkSync(path.join(f.main, '.git', 'CHERRY_PICK_HEAD'));
 
     // A refused restart is reported, not raised: the commits are already on origin.
     const failing = () => ({ status: 1, stdout: '', stderr: 'Pending model restoration prevents daemon restart\n' });
@@ -314,6 +324,71 @@ test('land deploys a live main checkout and says why when it cannot', () => {
     assert.equal(git(f.origin, 'rev-parse', 'main'), fifth);
     assert.equal(git(f.main, 'rev-parse', 'HEAD'), fourth, 'the checkout stays where it was');
     assert.equal(restarts.length, 1);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('wt land deploys end to end through the CLI, and --no-deploy and WT_NO_DEPLOY opt out', () => {
+  const f = fixture('keep-tool');
+  try {
+    // A `keep` earlier on PATH than the real one: this exercises the actual plan,
+    // flag parsing and restart spawn without going near the machine's daemon.
+    const fakeBin = path.join(f.root, 'bin');
+    const log = path.join(f.root, 'restart.log');
+    write(path.join(fakeBin, 'keep'), `#!/bin/sh\necho "$@" >> ${log}\necho restarted\n`);
+    fs.chmodSync(path.join(fakeBin, 'keep'), 0o755);
+    const deployEnv = { WT_NO_DEPLOY: '', PATH: `${fakeBin}:${process.env.PATH}` };
+    const readLog = () => { try { return fs.readFileSync(log, 'utf8'); } catch { return ''; } };
+
+    const worktree = runCli(f, ['new', f.name, 'cli-deploy', '--no-install']).stdout.trim();
+    write(path.join(worktree, 'one.txt'), 'one\n');
+    commitIn(worktree, 'first');
+    const landed = runCli(f, ['land', worktree], undefined, deployEnv);
+    assert.equal(landed.status, 0, landed.stderr);
+    const first = landed.stdout.trim();
+    assert.equal(git(f.main, 'rev-parse', 'HEAD'), first);
+    assert.equal(readLog().trim(), 'restart-daemon', 'the configured restart actually runs');
+    assert.match(landed.stderr, /restarted/, 'and its output is relayed');
+
+    write(path.join(worktree, 'two.txt'), 'two\n');
+    commitIn(worktree, 'second');
+    const skipped = runCli(f, ['land', worktree, '--no-deploy'], undefined, deployEnv);
+    assert.equal(skipped.status, 0, skipped.stderr);
+    assert.equal(git(f.origin, 'rev-parse', 'main'), skipped.stdout.trim());
+    assert.equal(git(f.main, 'rev-parse', 'HEAD'), first, '--no-deploy reaches landWorktree from the CLI');
+    assert.equal(readLog().trim(), 'restart-daemon', 'and nothing was restarted');
+
+    write(path.join(worktree, 'three.txt'), 'three\n');
+    commitIn(worktree, 'third');
+    const disabled = runCli(f, ['land', worktree], undefined, { PATH: deployEnv.PATH });
+    assert.equal(disabled.status, 0, disabled.stderr);
+    assert.equal(git(f.main, 'rev-parse', 'HEAD'), first, 'WT_NO_DEPLOY=1 keeps the harness away from the real thing');
+    assert.equal(readLog().trim(), 'restart-daemon');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('the deploy advances to the sha that was landed, not to wherever the shared ref has reached', () => {
+  const f = fixture('keep-tool');
+  try {
+    const worktree = runCli(f, ['new', f.name, 'concurrent', '--no-install']).stdout.trim();
+    const base = git(f.main, 'rev-parse', 'HEAD');
+    write(path.join(worktree, 'mine.txt'), 'mine\n');
+    commitIn(worktree, 'mine');
+    const mine = wt.landWorktree(worktree, { noDeploy: true });
+
+    // Another session lands on top before this one gets to the checkout: their
+    // commit is theirs to deploy, and origin/main in the shared object store has
+    // already moved to it.
+    write(path.join(worktree, 'theirs.txt'), 'theirs\n');
+    commitIn(worktree, 'theirs');
+    const theirs = git(worktree, 'rev-parse', 'HEAD');
+    git(worktree, 'push', '-q', 'origin', 'HEAD:main');
+    assert.equal(git(worktree, 'rev-parse', 'origin/main'), theirs);
+
+    assert.equal(git(f.main, 'rev-parse', 'HEAD'), base);
+    const deployed = wt.deployAfterLand(f.main, 'main', mine, { runDeploy: () => ({ status: 0 }) });
+    assert.equal(deployed.deployed, true);
+    assert.equal(git(f.main, 'rev-parse', 'HEAD'), mine, 'the live checkout runs what this land pushed');
+    assert.notEqual(git(f.main, 'rev-parse', 'HEAD'), theirs);
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
