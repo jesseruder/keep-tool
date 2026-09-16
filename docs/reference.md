@@ -16,7 +16,8 @@ registry data or credentials to the public source repository.
 - `tasks/` — live tasks, one `.md` per task
 - `archive/` — done tasks, swept here occasionally
 - `digests/` — generated digests (Phase 2)
-- `skills/keep/` — canonical shared Keep skill, symlinked into each agent's user skill directory
+- `skills/` — canonical shared agent skills, symlinked into each agent's user skill directory
+- `skills/packs.json` — the named skill packs (`core`, `handoff`) `keep setup skills` installs
 - `reviews/` — fleet-reviewer findings, one file per day
 - `bin/alerts.js` — alert routing, rate policy, channel adapters, and brief composition
 - `bin/unblock.js` — cross-card dependency resolution and linked-session delivery
@@ -102,6 +103,9 @@ keep verify <id>       # run a check recipe now, in its thread or a fresh sessio
 keep compact <sid>     # compact a live Claude or Codex session (needs keep serve)
 keep resume [--raw]    # post-restart: active tasks + keep open commands (--raw prints the bare CLI form)
 keep setup hooks [--account <id>]  # install the Keep hooks in every managed Claude account
+                       # (without --account it installs the core and recorded skill packs too)
+keep setup skills [--pack <name>]… [--replace] [--list]
+                       # link skill packs into ~/.claude/skills and ~/.agents/skills
 keep setup --shell [--write]   # the zsh claude() that routes resumes through keep open
 keep sync              # pull --rebase + push
 keep hook session-start  # used by the Claude Code SessionStart hook
@@ -189,12 +193,33 @@ one. A managed account whose settings file is a symlink to the source already ca
 the hooks and is left byte-for-byte alone; a file it does change is backed up first.
 `--account <id>` limits the run to one account and skips the shared skill links; it
 accepts any Claude account id, including one whose config directory is the default
-`~/.claude`. Codex accounts keep
+`~/.claude`. Without `--account` it also installs the `core` skill pack and every pack
+recorded in the configuration's `skillPacks`, so an upgrade keeps the skills the last
+`keep setup skills` chose. Codex accounts keep
 their own version-dependent adapters and are never touched. `keep doctor` reports
 the hooks each account is missing, with `keep setup hooks` as the fix: an account
 without them has no restart guard and no raw-resume guard. For the same reason, an
 account handoff refuses a target missing a hook the source has ("target account is
 missing Keep hooks: …") even though hooks stay out of the portable settings digest.
+
+`keep setup skills` links skill packs from `skills/packs.json` into
+`~/.claude/skills/<skill>` and `~/.agents/skills/<skill>`. It always installs `core`,
+plus every pack recorded in the configuration's `skillPacks` and every `--pack <name>`
+given now; an unknown name is refused with the list of known packs. Newly named packs
+are recorded in the configuration, so a later `keep setup hooks` reinstalls them (an
+isolated `KEEP_DIR` run with no configuration file installs but says it recorded
+nothing). Every destination for every pack is preflighted before anything is written.
+A missing destination is linked; one that already resolves to this checkout is left
+alone; a link Keep left behind whose text still ends in `/skills/<skill>` — an older
+checkout path, a deleted worktree — is repaired. A directory of its own is moved to
+`<dest>.keep-backup-<timestamp>` and linked when its `SKILL.md` is byte-identical to
+this checkout's; otherwise the run refuses, names the path, and asks for `--replace`,
+which backs it up and links. A parent such as `~/.agents/skills` that is itself a
+symlink is never modified. `--list` prints each pack, its description, its skills'
+status (`linked`, `missing`, `stale link`, `needs migration`) and whether it is
+recorded, and writes nothing. `keep doctor` checks one line per pack: `core` and the
+recorded packs are required with `keep setup skills` as the fix, and the rest print as
+`optional` with `keep setup skills --pack <name>`.
 
 Claude subagent lifecycle tracking uses `keep hook lifecycle` for both
 `SubagentStart` and `SubagentStop` in Claude's user settings. These observation-only

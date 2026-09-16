@@ -18,7 +18,7 @@ implementation; its own lifecycle stays bound to the review's account.
 Use `--model gpt-5.6-sol --effort medium` routinely. For risky or security-sensitive
 changes, or difficult findings the routine review could not resolve, use
 `--model gpt-6-astra --effort high` and request an adversarial review. Choose one
-initially, not both. Astra xhigh requires Jesse's explicit request.
+initially, not both. Astra xhigh requires Owner's explicit request.
 
 1. Check `keep codex --account <id> task-resume-candidate --json`. Default to a
    fresh task: a thread that wrote the code must never review it. Use `--resume-last`

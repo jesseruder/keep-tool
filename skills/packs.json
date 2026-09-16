@@ -1,0 +1,10 @@
+{
+  "core": {
+    "description": "The Keep work-registry skill and the fleet reviewer procedure.",
+    "skills": ["keep", "fleet-review"]
+  },
+  "handoff": {
+    "description": "Route implementation to Codex or a cheaper Claude model, run independent Codex reviews, and hand routine UI driving to cheaper workers.",
+    "skills": ["implementation-handoff", "codex-review-runner", "ui-driving-handoff"]
+  }
+}

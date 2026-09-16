@@ -81,6 +81,198 @@ function init(args) {
   console.log(`Created private registry: ${root}\nConfiguration: ${file}\nNext: keep setup hooks, then keep doctor. No remote was configured.`);
 }
 
+// ---------- skill packs ----------
+
+// A pack is a named set of skills shipped in `skills/`. `core` is always installed;
+// every other pack a machine has chosen is recorded in the configuration, so a later
+// `keep setup hooks` on the same machine reinstalls exactly what it had.
+const SKILL_HOMES = ['.claude', '.agents'];
+const CORE_PACK = 'core';
+
+function skillSource(skill) {
+  return path.join(SOURCE, 'skills', skill);
+}
+
+function loadPacks() {
+  const file = path.join(SOURCE, 'skills', 'packs.json');
+  let value;
+  try { value = JSON.parse(fs.readFileSync(file, 'utf8')); }
+  catch (error) { throw new Error(`unreadable skill packs at ${file} (${error.message})`); }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`skill packs at ${file} are not a JSON object`);
+  for (const [name, pack] of Object.entries(value)) {
+    if (!pack || !Array.isArray(pack.skills) || !pack.skills.length) throw new Error(`skill pack ${name} lists no skills in ${file}`);
+    for (const skill of pack.skills) {
+      const skillFile = path.join(skillSource(skill), 'SKILL.md');
+      if (!fs.existsSync(skillFile)) throw new Error(`skill pack ${name} names a skill that is not in this checkout: ${skillFile}`);
+    }
+  }
+  if (!value[CORE_PACK]) throw new Error(`skill packs at ${file} have no ${CORE_PACK} pack`);
+  return value;
+}
+
+// Pack names recorded by an earlier `keep setup skills`. A recorded name this
+// checkout no longer ships is ignored rather than fatal: an upgrade that drops a
+// pack must not break hook installation.
+function configuredPacks(packs = loadPacks(), env = process.env) {
+  let value = {};
+  try { value = config.load(env); } catch { value = {}; }
+  const names = Array.isArray(value.skillPacks) ? value.skillPacks : [];
+  return names.filter((name) => typeof name === 'string' && name !== CORE_PACK && packs[name]);
+}
+
+function installPackNames(packs = loadPacks(), named = []) {
+  return [...new Set([CORE_PACK, ...configuredPacks(packs), ...named])];
+}
+
+function sameSkillFile(dest, source) {
+  try {
+    return fs.readFileSync(path.join(dest, 'SKILL.md')).equals(fs.readFileSync(path.join(source, 'SKILL.md')));
+  } catch { return false; }
+}
+
+// What one destination should become. The interesting case is a Keep link from an
+// older checkout path, a deleted worktree, or the pre-pack `docs/agent-skills`
+// location: its link text still ends in `/skills/<skill>`, so it is ours to repair.
+function skillPlan(skill, pack, dest) {
+  const source = skillSource(skill);
+  const base = { skill, pack, dest, source };
+  const link = fs.lstatSync(dest, { throwIfNoEntry: false });
+  if (!link) return { ...base, action: 'link' };
+  let resolved = null;
+  try { resolved = fs.realpathSync(dest); } catch {}
+  if (resolved && resolved === fs.realpathSync(source)) return { ...base, action: 'ok' };
+  if (link.isSymbolicLink()) {
+    const text = fs.readlinkSync(dest).replace(/\/+$/, '');
+    if (text.endsWith(`${path.sep}skills${path.sep}${skill}`)) return { ...base, action: 'relink' };
+  }
+  // Someone else's skill, or a copy of ours. A byte-identical SKILL.md is an older
+  // copy of this very skill and is safe to set aside; anything else needs --replace.
+  return { ...base, action: sameSkillFile(dest, source) ? 'migrate' : 'replace' };
+}
+
+// Every destination for every named pack, preflighted before anything is written.
+// `probe` reports conflicts as plans instead of refusing, for --list and doctor.
+function skillPlans(packNames, { replace = false, probe = false, packs = loadPacks() } = {}) {
+  const plans = [];
+  const seen = new Set();
+  for (const name of packNames) {
+    const pack = packs[name];
+    if (!pack) throw new Error(`unknown skill pack ${name}; known packs: ${Object.keys(packs).join(', ')}`);
+    for (const skill of pack.skills) {
+      for (const home of SKILL_HOMES) {
+        const dest = path.join(os.homedir(), home, 'skills', skill);
+        // Two destinations can be one directory: `~/.agents/skills` is often a
+        // symlink to `~/.claude/skills`. Key on the resolved parent, or the
+        // second plan links a path the first one just created.
+        const parent = path.dirname(dest);
+        let key = dest;
+        if (fs.existsSync(parent)) { try { key = path.join(fs.realpathSync(parent), skill); } catch {} }
+        if (seen.has(key)) continue;
+        seen.add(key);
+        plans.push(skillPlan(skill, name, dest));
+      }
+    }
+  }
+  const blocked = plans.filter((plan) => plan.action === 'replace');
+  if (blocked.length && !replace && !probe) {
+    throw new Error(`Keep skill links changed nothing:\n  ${blocked
+      .map((plan) => `${plan.dest} is not a Keep skill link; run keep setup skills --replace to back it up and link`).join('\n  ')}`);
+  }
+  return plans;
+}
+
+function applySkillPlans(plans) {
+  for (const plan of plans) {
+    if (plan.action === 'ok') continue;
+    if (plan.action === 'relink') fs.unlinkSync(plan.dest);
+    if (plan.action === 'migrate' || plan.action === 'replace') {
+      plan.backup = `${plan.dest}.keep-backup-${Date.now()}`;
+      fs.renameSync(plan.dest, plan.backup);
+    }
+    // Never touch the parent: `~/.agents/skills` is often a symlink itself.
+    if (!fs.existsSync(path.dirname(plan.dest))) fs.mkdirSync(path.dirname(plan.dest), { recursive: true });
+    fs.symlinkSync(plan.source, plan.dest);
+  }
+  return plans;
+}
+
+const SKILL_ACTIONS = {
+  link: 'Linked skill', relink: 'Repaired stale skill link',
+  migrate: 'Replaced an identical copy of this skill', replace: 'Replaced skill',
+};
+
+function reportSkillPlans(plans) {
+  const changed = plans.filter((plan) => plan.action !== 'ok');
+  for (const plan of changed) {
+    console.log(`${SKILL_ACTIONS[plan.action]}: ${plan.dest}${plan.backup ? ` (backed up to ${plan.backup})` : ''}`);
+  }
+  if (!changed.length) console.log('Skills up to date.');
+  return changed;
+}
+
+const SKILL_STATUS = { ok: 'linked', link: 'missing', relink: 'stale link', migrate: 'needs migration', replace: 'needs migration' };
+const SKILL_SEVERITY = { ok: 0, link: 1, relink: 2, migrate: 3, replace: 3 };
+
+function listPacks(packs, env = process.env) {
+  const recorded = new Set([CORE_PACK, ...configuredPacks(packs, env)]);
+  for (const [name, pack] of Object.entries(packs)) {
+    const note = name === CORE_PACK ? 'always installed' : recorded.has(name) ? 'recorded' : 'not recorded';
+    console.log(`${name} (${note}) — ${pack.description || ''}`.trimEnd());
+    const plans = skillPlans([name], { probe: true, packs });
+    for (const skill of pack.skills) {
+      const worst = plans.filter((plan) => plan.skill === skill)
+        .reduce((a, plan) => (SKILL_SEVERITY[plan.action] > SKILL_SEVERITY[a] ? plan.action : a), 'ok');
+      console.log(`  ${skill}: ${SKILL_STATUS[worst]}`);
+    }
+  }
+}
+
+// Records the packs this machine has chosen. An isolated KEEP_DIR run has no
+// configuration file to write; the install still happens, it just is not remembered.
+function recordPacks(named, env = process.env) {
+  const file = config.configFile(env);
+  if (!fs.existsSync(file)) return false;
+  const value = config.load(env);
+  const current = Array.isArray(value.skillPacks) ? value.skillPacks.filter((name) => typeof name === 'string') : [];
+  const next = [...current];
+  for (const name of named) if (name !== CORE_PACK && !next.includes(name)) next.push(name);
+  if (next.length !== current.length) {
+    value.skillPacks = next;
+    fs.writeFileSync(file, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
+    // writeFileSync only applies the mode when it creates the file; the
+    // configuration carries account paths and stays private either way.
+    fs.chmodSync(file, 0o600);
+  }
+  return true;
+}
+
+function installSkills(args = []) {
+  const named = [];
+  let replace = false;
+  let list = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--replace') replace = true;
+    else if (arg === '--list') list = true;
+    else if (arg === '--pack') {
+      const value = args[++i];
+      if (!value || value.startsWith('--')) throw new Error('expected --pack with a value');
+      named.push(value);
+    } else throw new Error('usage: keep setup skills [--pack <name>]… [--replace] [--list]');
+  }
+  const packs = loadPacks();
+  for (const name of named) {
+    if (!packs[name]) throw new Error(`unknown skill pack ${name}; known packs: ${Object.keys(packs).join(', ')}`);
+  }
+  if (list) return listPacks(packs);
+  const names = installPackNames(packs, named);
+  const plans = skillPlans(names, { replace, packs });
+  applySkillPlans(plans);
+  const changed = reportSkillPlans(plans);
+  if (named.length && !recordPacks(named)) console.log('No Keep configuration file: the pack choice was not recorded, so name it again next time.');
+  console.log(`Installed skill packs: ${names.join(', ')}.${changed.length ? ' Restart agent sessions to load them.' : ''}`);
+}
+
 const HOOK_EVENTS = {
   SessionStart: ['session-start', ''], SessionEnd: ['session-end', ''],
   Stop: ['stop', ''], Notification: ['notification', ''],
@@ -222,24 +414,18 @@ function installHooks(args = []) {
   const [defaultPlan, ...accountPlans] = hookPlans(targets, command);
   const settingsFile = defaultPlan.file;
   const existing = defaultPlan.existing;
-  // Preflight every destination before changing any settings or skill links.
-  const links = [];
-  for (const agentDir of ['.claude', '.agents']) for (const skill of ['keep', 'fleet-review']) {
-    const dest = path.join(os.homedir(), agentDir, 'skills', skill);
-    const source = path.join(SOURCE, 'skills', skill);
-    if (fs.existsSync(dest) || fs.lstatSync(path.dirname(dest), { throwIfNoEntry: false })?.isSymbolicLink()) {
-      if (fs.existsSync(dest) && fs.realpathSync(dest) === fs.realpathSync(source)) continue;
-      throw new Error(`existing skill needs a manual migration: ${dest}`);
-    }
-    if (fs.lstatSync(dest, { throwIfNoEntry: false })) throw new Error(`existing skill link: ${dest}`);
-    links.push({ dest, source });
-  }
+  // Preflight every destination before changing any settings or skill links. The
+  // core pack plus whatever packs this machine chose earlier, so an upgrade keeps
+  // the skills the last `keep setup skills` installed.
+  const packs = loadPacks();
+  const plans = skillPlans(installPackNames(packs), { packs });
   const newText = defaultPlan.next;
   fs.mkdirSync(path.dirname(settingsFile), { recursive: true });
   if (existing !== null && existing !== newText) fs.copyFileSync(settingsFile, `${settingsFile}.keep-backup-${Date.now()}`, fs.constants.COPYFILE_EXCL);
-  for (const { dest, source } of links) { fs.mkdirSync(path.dirname(dest), { recursive: true }); fs.symlinkSync(source, dest); }
+  applySkillPlans(plans);
   fs.writeFileSync(settingsFile, newText, { mode: 0o600 });
-  console.log('Installed Claude hooks and shared Claude/Codex skills. Restart agent sessions to load them.');
+  console.log('Installed Claude hooks and the shared Claude/Codex skills. Restart agent sessions to load them.');
+  reportSkillPlans(plans);
   // A managed automation account without the hooks has no restart guard and no
   // raw-resume guard, and nothing else installs them there.
   for (const plan of accountPlans) {
@@ -364,6 +550,7 @@ function doctor(root) {
     let ok = false; try { ok = Boolean(fn()); } catch {}
     console.log(`${ok ? 'ok' : required ? 'FAIL' : 'optional'}: ${name}`);
     if (!ok && required) failed = true;
+    return ok;
   };
   check('Node 22+', () => Number(process.versions.node.split('.')[0]) >= 22);
   check('Git registry outside application source', () => !insideSource(root) && git(root, ['rev-parse', '--show-toplevel']) === fs.realpathSync(root));
@@ -384,13 +571,26 @@ function doctor(root) {
   }
   for (const line of unguarded) console.log(`  ${line}`);
   if (unguarded.length) console.log('  fix: keep setup hooks');
-  check('fleet-review skill', () => fs.existsSync(path.join(os.homedir(), '.claude', 'skills', 'fleet-review', 'SKILL.md')));
+  // One check per skill pack: core and whatever packs this machine recorded are
+  // required, the rest are available but not chosen.
+  let packs = {};
+  try { packs = loadPacks(); } catch (error) { check('skill packs', () => { throw error; }); }
+  const recorded = new Set([CORE_PACK, ...configuredPacks(packs)]);
+  for (const [name, pack] of Object.entries(packs)) {
+    const required = recorded.has(name);
+    const ok = check(`skill pack ${name}`, () => pack.skills.every((skill) => {
+      const dest = path.join(os.homedir(), '.claude', 'skills', skill);
+      return fs.existsSync(dest) && fs.realpathSync(dest) === fs.realpathSync(skillSource(skill));
+    }), required);
+    if (!ok) console.log(`  fix: keep setup skills${required ? '' : ` --pack ${name}`}`);
+  }
   console.log('Model access and external integrations require their own live checks; doctor does not call models or send notifications.');
   if (failed) process.exitCode = 1;
 }
 
 module.exports = {
-  init, installHooks, service, doctor, mergeHooks, servicePlist, quote, canonicalPath, insideSource,
+  init, installHooks, installSkills, service, doctor, mergeHooks, servicePlist, quote, canonicalPath, insideSource,
   HOOK_ACTIONS, missingHooks, hookTargets, hookTarget,
+  loadPacks, configuredPacks, installPackNames, skillPlans, applySkillPlans, reportSkillPlans, listPacks, recordPacks,
   shell, shellBlock, applyShellBlock, SHELL_START, SHELL_END,
 };

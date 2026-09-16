@@ -8340,8 +8340,12 @@ function helpText() {
   keep init [--dir path]   # create a separate private registry
   keep doctor              # diagnose this installation
   keep setup hooks [--account <id>]
-                           # install Claude hooks and shared agent skills, in every
+                           # install Claude hooks and the core skill pack, in every
                            # managed Claude account (--account limits it to one)
+  keep setup skills [--pack <name>]… [--replace] [--list]
+                           # link skill packs into ~/.claude/skills and ~/.agents/skills;
+                           # core plus the recorded packs, repairing stale links
+                           # --list shows every pack and its status and writes nothing
   keep setup --shell [--write]
                            # print (or write to ~/.zshrc) a zsh claude() that routes
                            # --resume/-r/--continue/-c through keep open; KEEP_RAW_CLAUDE=1 bypasses
@@ -8631,8 +8635,9 @@ commands.init = (args) => require('./setup').init(args);
 commands.doctor = () => require('./setup').doctor(ROOT);
 commands.setup = (args) => {
   if (args.includes('--shell')) return require('./setup').shell(args);
+  if (args[0] === 'skills') return require('./setup').installSkills(args.slice(1));
   if (args[0] !== 'hooks' || (args.length !== 1 && (args.length !== 3 || args[1] !== '--account'))) {
-    throw new KeepError('usage: keep setup hooks [--account <id>] | keep setup --shell [--write]');
+    throw new KeepError('usage: keep setup hooks [--account <id>] | keep setup skills [--pack <name>]… [--replace] [--list] | keep setup --shell [--write]');
   }
   return require('./setup').installHooks(args.slice(1));
 };

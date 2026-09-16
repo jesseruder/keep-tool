@@ -10,7 +10,7 @@ The implementation-choice question below applies only to **Fable** sessions
 handing work to Codex. The Codex launch, watchdog, model, and effort rules apply
 to every Codex handoff, regardless of the Claude session model.
 
-**Why this exists:** Fable usage is the scarce budget. Jesse has far more Codex
+**Why this exists:** Fable usage is the scarce budget. Owner has far more Codex
 quota than Fable quota, so the point is to spend Fable on planning, judgment, and
 verification, and to spend Codex (or Opus) on the bulk of the code writing. When a
 case isn't covered below, bias toward Codex. A genuinely trivial edit — a line or
@@ -21,7 +21,7 @@ Plan here as normal — planning always happens in Claude Code, never in Codex. 
 
 - **Codex** (recommended default) — launch an account-aware background task with `keep codex` as described below.
 - **Opus** — hand off to an `Agent` subagent with `model: "opus"`. This session stays on Fable and drives; the subagent writes the code. Give it a scoped implementation task with the same specificity a Codex handoff gets.
-- **Fable** — implement directly here. Only when Jesse picks it; it spends the scarce budget.
+- **Fable** — implement directly here. Only when Owner picks it; it spends the scarce budget.
 
 The answer sticks for the rest of the session; don't re-ask per task. Don't ask at all on read-only, research, or Q&A sessions — only when code is about to change.
 
@@ -42,7 +42,7 @@ It does not change global defaults or transfer an existing job to another accoun
 
 Resolve the account before launching:
 
-- If Jesse selected an account, use that exact registered ID from `keep accounts list`.
+- If Owner selected an account, use that exact registered ID from `keep accounts list`.
   Do not substitute a default when the requested account is unavailable or ambiguous.
 - Otherwise run `keep codex context --json`, use the returned `accountId`, and state
   the selected account with the model and effort. No extra account question is needed.
@@ -53,9 +53,12 @@ Resolve the account before launching:
 
 Run context and every lifecycle command from the same intended worktree. Capture
 the returned `workspace` along with the account so a later shell directory change
-cannot redirect status, results, or cancellation to another project's jobs.
+cannot redirect status, results, or cancellation to another project's jobs. The job's
+writable root is that workspace: a task whose `workspace` is the parent session's cwd
+comes back "readable but not writable" and does nothing, so after launching, read the
+job json and confirm `workspaceRoot` is the worktree you meant.
 
-Account choice and conversation choice are separate. Honor Jesse's explicit choice
+Account choice and conversation choice are separate. Honor Owner's explicit choice
 of either; otherwise choose fresh versus resume from the work's continuity. Before
 launching, state the account, fresh or resumed conversation, model, and effort—for
 example, "Codex secondary, fresh conversation, Sol at high effort." Do not ask again
@@ -65,7 +68,7 @@ For a possible resume, check
 `keep codex --account <id> task-resume-candidate --json`. Resume only when that
 account's candidate continues the same work. Use `--resume-last` for that candidate
 and `--fresh` for an explicitly fresh task. A new account does not move the previous
-conversation there. If Jesse names a specific existing conversation, verify that
+conversation there. If Owner names a specific existing conversation, verify that
 it is the candidate on the selected account; if it is not, explain the limitation
 and ask how to proceed. The launcher has no arbitrary conversation picker. Never
 silently substitute another candidate or a fresh task for an explicit resume request.
@@ -112,7 +115,7 @@ this launcher.
 
 ## Codex model
 
-Pass `--model` explicitly for each handoff. Jesse's standing preference is to spend
+Pass `--model` explicitly for each handoff. Owner's standing preference is to spend
 Sol on implementation and routine review, reserving Astra for difficult work.
 This replaces the old rule to inherit the global model and check it against the
 highest-priority cached model. Leave `~/.codex/config.toml` unchanged: its Astra
@@ -125,7 +128,7 @@ default is for interactive Codex sessions, not every Claude handoff.
 - Reviews follow `codex-review-runner`: Sol at medium routinely, Astra at high for
   risky/security-sensitive changes or difficult unresolved findings.
 
-An explicit choice by Jesse overrides these defaults. State the selected model and effort, and pass the exact `--model` and `--effort`
+An explicit choice by Owner overrides these defaults. State the selected model and effort, and pass the exact `--model` and `--effort`
 flags to `keep codex`. Do not ask again just to
 select a Codex model. The existing once-per-session Codex/Opus/Fable choice remains.
 For an Astra handoff, explicitly tell Codex to implement the assigned scope directly
@@ -146,7 +149,7 @@ ladder one notch lower:
 | normal feature work, multi-file changes | `high` | `medium` |
 | gnarly debugging, architecture decisions, anything that already failed once | `xhigh` | `high` |
 
-`xhigh` on Astra only when Jesse asks for it. Reviews use the separate policy in
+`xhigh` on Astra only when Owner asks for it. Reviews use the separate policy in
 `codex-review-runner`: Sol at medium routinely, Astra at high for deep reviews.
 For mechanical Luna handoffs, use low.
 

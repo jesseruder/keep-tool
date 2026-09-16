@@ -361,3 +361,201 @@ test('a Keep hook command from a moved checkout is rewritten, not duplicated', (
   }
   assert.deepEqual(setup.mergeHooks(next, command), next, 'still idempotent');
 });
+
+// ---------- skill packs ----------
+
+const SKILLS = path.resolve(__dirname, '..', 'skills');
+
+function capture(fn) {
+  const lines = [];
+  const log = console.log;
+  console.log = (...args) => lines.push(args.map(String).join(' '));
+  try { fn(); } finally { console.log = log; }
+  return lines.join('\n');
+}
+
+function linkTargets(home, skill) {
+  return ['.claude', '.agents'].map((dir) => {
+    const dest = path.join(home, dir, 'skills', skill);
+    assert.equal(fs.lstatSync(dest).isSymbolicLink(), true, dest);
+    return fs.realpathSync(dest);
+  });
+}
+
+function backups(home) {
+  const found = [];
+  for (const dir of ['.claude', '.agents']) {
+    const skills = path.join(home, dir, 'skills');
+    if (!fs.existsSync(skills)) continue;
+    for (const name of fs.readdirSync(skills)) if (name.includes('keep-backup')) found.push(path.join(skills, name));
+  }
+  return found;
+}
+
+test('the pack manifest names skills this checkout ships', () => {
+  const packs = setup.loadPacks();
+  assert.deepEqual(packs.core.skills, ['keep', 'fleet-review']);
+  assert.deepEqual(packs.handoff.skills, ['implementation-handoff', 'codex-review-runner', 'ui-driving-handoff']);
+  for (const pack of Object.values(packs)) {
+    assert.ok(pack.description, 'every pack describes itself');
+    for (const skill of pack.skills) assert.ok(fs.existsSync(path.join(SKILLS, skill, 'SKILL.md')), skill);
+  }
+});
+
+test('keep setup hooks links the core pack into both agent skill directories and a second run changes nothing', () => {
+  const f = hooksFixture();
+  try {
+    setup.installHooks();
+    for (const skill of ['keep', 'fleet-review']) {
+      for (const real of linkTargets(f.home, skill)) assert.equal(real, fs.realpathSync(path.join(SKILLS, skill)), skill);
+    }
+    assert.equal(fs.existsSync(path.join(f.home, '.claude', 'skills', 'ui-driving-handoff')), false,
+      'an unchosen pack is not installed');
+    assert.deepEqual(backups(f.home), []);
+
+    const before = ['keep', 'fleet-review'].flatMap((skill) => linkTargets(f.home, skill));
+    const second = capture(() => setup.installHooks());
+    assert.match(second, /Skills up to date/);
+    assert.deepEqual(['keep', 'fleet-review'].flatMap((skill) => linkTargets(f.home, skill)), before);
+    assert.deepEqual(backups(f.home), [], 'a second run creates no backups');
+  } finally { f.cleanup(); }
+});
+
+test('an agent skill directory that is a symlink to the other one is one destination, not two', () => {
+  const f = hooksFixture();
+  try {
+    const shared = path.join(f.home, '.claude', 'skills');
+    fs.mkdirSync(shared, { recursive: true });
+    fs.mkdirSync(path.join(f.home, '.agents'));
+    fs.symlinkSync(shared, path.join(f.home, '.agents', 'skills'));
+
+    setup.installHooks();
+    for (const skill of ['keep', 'fleet-review']) {
+      for (const real of linkTargets(f.home, skill)) assert.equal(real, fs.realpathSync(path.join(SKILLS, skill)), skill);
+    }
+    assert.equal(fs.lstatSync(path.join(f.home, '.agents', 'skills')).isSymbolicLink(), true,
+      'the shared parent itself is never replaced');
+    assert.match(capture(() => setup.installHooks()), /Skills up to date/);
+    assert.deepEqual(backups(f.home), []);
+  } finally { f.cleanup(); }
+});
+
+test('a Keep skill link from a removed checkout is repaired rather than refused', () => {
+  const f = hooksFixture();
+  try {
+    const dest = path.join(f.home, '.claude', 'skills', 'keep');
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.symlinkSync(path.join(f.base, 'gone', 'skills', 'keep'), dest);
+    assert.equal(fs.existsSync(dest), false, 'the fixture link dangles');
+
+    const plans = setup.skillPlans(['core']);
+    assert.equal(plans.find((plan) => plan.dest === dest).action, 'relink');
+    const printed = capture(() => { setup.applySkillPlans(plans); setup.reportSkillPlans(plans); });
+    assert.match(printed, /Repaired stale skill link/);
+    assert.equal(fs.realpathSync(dest), fs.realpathSync(path.join(SKILLS, 'keep')));
+    assert.deepEqual(backups(f.home), [], 'a stale link of ours is not worth backing up');
+  } finally { f.cleanup(); }
+});
+
+test('an identical skill copy is migrated, and a different one needs --replace', () => {
+  const f = hooksFixture();
+  try {
+    const copy = path.join(f.home, '.claude', 'skills', 'fleet-review');
+    fs.mkdirSync(copy, { recursive: true });
+    fs.copyFileSync(path.join(SKILLS, 'fleet-review', 'SKILL.md'), path.join(copy, 'SKILL.md'));
+    const other = path.join(f.home, '.agents', 'skills', 'keep');
+    fs.mkdirSync(other, { recursive: true });
+    fs.writeFileSync(path.join(other, 'SKILL.md'), '# someone else\n');
+
+    assert.throws(() => setup.skillPlans(['core']), (error) => {
+      assert.match(error.message, /^Keep skill links changed nothing:/,
+        'the refusal names no subcommand: keep setup hooks raises it too');
+      assert.match(error.message, /run keep setup skills --replace to back it up and link/);
+      assert.ok(error.message.includes(other), 'the refusal names the path');
+      return true;
+    });
+    assert.equal(fs.lstatSync(copy).isDirectory(), true, 'nothing is written when one destination is refused');
+
+    const plans = setup.skillPlans(['core'], { replace: true });
+    assert.equal(plans.find((plan) => plan.dest === copy).action, 'migrate');
+    assert.equal(plans.find((plan) => plan.dest === other).action, 'replace');
+    setup.applySkillPlans(plans);
+    assert.equal(fs.realpathSync(copy), fs.realpathSync(path.join(SKILLS, 'fleet-review')));
+    assert.equal(fs.realpathSync(other), fs.realpathSync(path.join(SKILLS, 'keep')));
+    const saved = backups(f.home);
+    assert.equal(saved.length, 2, saved.join(', '));
+    assert.equal(fs.readFileSync(path.join(saved.find((name) => path.basename(name).startsWith('keep.')), 'SKILL.md'), 'utf8'), '# someone else\n');
+  } finally { f.cleanup(); }
+});
+
+test('keep setup skills --pack installs the pack, records it, and a later hook install keeps it', () => {
+  const f = hooksFixture();
+  try {
+    assert.throws(() => setup.installSkills(['--pack', 'nope']), /unknown skill pack nope; known packs: core, handoff/);
+    assert.equal(fs.existsSync(path.join(f.home, '.claude', 'skills')), false);
+
+    const printed = capture(() => setup.installSkills(['--pack', 'handoff']));
+    assert.match(printed, /Installed skill packs: core, handoff\./);
+    for (const skill of ['implementation-handoff', 'codex-review-runner', 'ui-driving-handoff', 'keep', 'fleet-review']) {
+      for (const real of linkTargets(f.home, skill)) assert.equal(real, fs.realpathSync(path.join(SKILLS, skill)), skill);
+    }
+    const recorded = JSON.parse(fs.readFileSync(process.env.KEEP_CONFIG, 'utf8'));
+    assert.deepEqual(recorded.skillPacks, ['handoff']);
+    assert.equal(recorded.version, 1, 'the rest of the configuration survives');
+    assert.ok(Array.isArray(recorded.accounts));
+    assert.equal(fs.statSync(process.env.KEEP_CONFIG).mode & 0o777, 0o600);
+    assert.deepEqual(setup.installPackNames(), ['core', 'handoff']);
+
+    // A removed link from a recorded pack is reinstalled by the hook installer alone.
+    fs.rmSync(path.join(f.home, '.claude', 'skills', 'ui-driving-handoff'));
+    capture(() => setup.installHooks());
+    assert.equal(fs.realpathSync(path.join(f.home, '.claude', 'skills', 'ui-driving-handoff')),
+      fs.realpathSync(path.join(SKILLS, 'ui-driving-handoff')));
+  } finally { f.cleanup(); }
+});
+
+test('keep setup skills --list reports every pack and writes nothing', () => {
+  const f = hooksFixture();
+  try {
+    setup.applySkillPlans(setup.skillPlans(['core']));
+    const printed = capture(() => setup.installSkills(['--list']));
+    assert.match(printed, /^core \(always installed\) — The Keep work-registry skill/m);
+    assert.match(printed, /^ {2}keep: linked$/m);
+    assert.match(printed, /^handoff \(not recorded\) — Route implementation/m);
+    assert.match(printed, /^ {2}ui-driving-handoff: missing$/m);
+    assert.equal(fs.existsSync(path.join(f.home, '.claude', 'skills', 'ui-driving-handoff')), false, '--list writes nothing');
+    assert.equal(JSON.parse(fs.readFileSync(process.env.KEEP_CONFIG, 'utf8')).skillPacks, undefined);
+  } finally { f.cleanup(); }
+});
+
+test('keep doctor reports required and optional skill packs', () => {
+  const f = hooksFixture();
+  const exitCode = process.exitCode;
+  try {
+    setup.applySkillPlans(setup.skillPlans(['core']));
+    const printed = capture(() => setup.doctor(path.join(f.base, 'registry')));
+    assert.match(printed, /^ok: skill pack core$/m);
+    assert.match(printed, /^optional: skill pack handoff$/m);
+    assert.match(printed, /^ {2}fix: keep setup skills --pack handoff$/m);
+
+    fs.rmSync(path.join(f.home, '.claude', 'skills', 'fleet-review'));
+    const missing = capture(() => setup.doctor(path.join(f.base, 'registry')));
+    assert.match(missing, /^FAIL: skill pack core$/m);
+    assert.match(missing, /^ {2}fix: keep setup skills$/m);
+  } finally { process.exitCode = exitCode; f.cleanup(); }
+});
+
+test('keep setup names its subcommands and refuses an unknown one', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-setup-usage-'));
+  try {
+    const env = { ...process.env, KEEP_CONFIG: path.join(tmp, 'config.json'), HOME: tmp };
+    delete env.KEEP_DIR;
+    const run = (...args) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), ...args], { env, encoding: 'utf8', timeout: 15000 });
+    const help = run('help', 'setup');
+    assert.equal(help.status, 0, help.stderr);
+    assert.match(help.stdout, /keep setup skills \[--pack <name>\]/);
+    const bad = run('setup', 'nonsense');
+    assert.notEqual(bad.status, 0);
+    assert.match(bad.stderr, /keep setup skills/);
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});

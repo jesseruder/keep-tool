@@ -173,6 +173,7 @@ npm ci
 npm link
 keep init
 keep setup hooks
+keep setup skills --pack handoff   # optional
 keep doctor
 keep service install
 keep service start
@@ -180,9 +181,14 @@ keep service start
 
 Open `http://localhost:7777/app`. Launch `keep-reviewer` in an interactive terminal
 to create a host-owned reviewer pane for review ticks. The terminal attaches to that
-pane; the reviewer also appears in the console. Both agent skills are bundled; the reviewer
-registers through its Claude SessionStart hook. Existing hook settings and skills
-are preserved: setup backs up settings and refuses to replace another skill.
+pane; the reviewer also appears in the console. The `core` skill pack — the `keep` and
+`fleet-review` skills — is installed with the hooks; the reviewer registers through its
+Claude SessionStart hook. `keep setup skills --pack handoff` adds the optional agent
+handoff skills, `keep setup skills --list` shows every pack, its skills and whether they
+are linked, and the choice is remembered so later runs reinstall it. Re-running setup is
+safe: links left behind by a moved or deleted checkout are repaired, and an unrelated
+skill of the same name is never replaced without `--replace`, which backs it up first.
+Existing hook settings are preserved and backed up before they change.
 `keep setup hooks` installs the hooks into every managed Claude account's
 `settings.json`, not only `~/.claude`; `--account <id>` limits it to one, and
 Codex accounts are never touched. `keep doctor` reports the missing hooks per
@@ -352,8 +358,9 @@ keep service restart
 ```
 
 For an existing registry, select it with `KEEP_DIR` or write the configuration above
-instead of running `keep init`. Keep its Git history intact. Existing services and
-skills require a deliberate migration; setup will not overwrite them.
+instead of running `keep init`. Keep its Git history intact. Existing services require a
+deliberate migration; setup will not overwrite them, and it replaces an unrelated skill
+of the same name only with `keep setup skills --replace`.
 
 ## Public source checks
 

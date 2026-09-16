@@ -1,10 +1,14 @@
 # Agent integration
 
 `keep setup hooks` merges the following Claude hooks into the existing user
-settings and installs the `keep` and `fleet-review` skills for Claude and Codex.
-Hook commands point to the application checkout and explicitly select its local
-configuration. Existing unrelated hooks are retained; existing skill directories
-are never replaced automatically.
+settings and installs the `core` skill pack — `keep` and `fleet-review` — for Claude
+and Codex, along with any other pack this machine recorded. `keep setup skills`
+installs packs on their own: `--pack <name>` adds one, `--list` shows every pack and
+its per-skill status, and `skills/packs.json` defines them. Hook commands point to the
+application checkout and explicitly select its local configuration. Existing unrelated
+hooks are retained. A skill link Keep itself left behind — an older checkout path, a
+deleted worktree — is repaired in place; an unrelated skill directory of the same name
+is never replaced without `keep setup skills --replace`, which backs it up first.
 
 | Event | Adapter |
 | --- | --- |
