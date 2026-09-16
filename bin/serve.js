@@ -2221,18 +2221,25 @@ function worktreeExitPromptKeepsWorktree(screenText) {
   const blockFooter = (index) => {
     const top = Math.max(0, index - ABOVE);
     const bottom = Math.min(lines.length - 1, index + BELOW);
-    // Any other highlighted option nearby means this is a different, larger menu.
-    for (let i = top; i <= bottom; i += 1) {
-      if (i !== index && /^❯\s*\d+\./.test(lines[i])) return -1;
+    // The block starts at its own heading. Rows above that are scrollback — a dialog
+    // that has just been answered still sits there, and it is not part of this modal.
+    let heading = -1;
+    for (let i = index - 1; i >= top && heading === -1; i -= 1) {
+      if (/Exiting worktree session/i.test(lines[i])) heading = i;
     }
-    if (!lines.slice(top, index).some((line) => /Exiting worktree session/i.test(line))) return -1;
+    if (heading === -1) return -1;
+    // Inside the block, though, another highlighted option means a different, larger menu.
+    for (let i = heading + 1; i < index; i += 1) if (/^❯\s*\d+\./.test(lines[i])) return -1;
     // A narrow pane wraps option 1's "Stays at <path>" onto its own row, so the sibling
     // option is the next row that starts an option — anything before it is that wrap.
     let next = index + 1;
     while (next <= bottom && !/^(?:❯\s*)?\d+\./.test(lines[next])) next += 1;
     if (next > bottom || !/^2\.\s*Remove worktree\b/.test(lines[next])) return -1;
-    const footer = lines.slice(next + 1, bottom + 1).findIndex((line) => /Enter to confirm/i.test(line));
-    return footer === -1 ? -1 : next + 1 + footer;
+    const offset = lines.slice(next + 1, bottom + 1).findIndex((line) => /Enter to confirm/i.test(line));
+    if (offset === -1) return -1;
+    const footer = next + 1 + offset;
+    for (let i = index + 1; i <= footer; i += 1) if (/^❯\s*\d+\./.test(lines[i])) return -1;
+    return footer;
   };
   const footer = lines.reduce((found, line, index) => {
     if (!/^❯\s*1\.\s*Keep worktree\b/.test(line)) return found;
@@ -3564,26 +3571,42 @@ async function restartSession(body, deps = {}) {
     // all: the pane may become a plain shell mid-wait, and a Codex screen is a different
     // UI with its own prompt, so neither is a place to be typing a blind Enter.
     const answerable = session.kind === 'claude';
-    let promptAnswered = false, screenReadReported = false;
+    let promptAnswered = false, screenReadReported = false, promptSkipReported = false;
     for (let i = 0, limit = 30; i < limit; i++) {
       stopped = (await host('get', { pane: body.pane })).pane;
       if (!restartPaneMatches(pane, stopped, session.id)) throw Error('Session process changed during restart');
       if (!stopped.alive) break;
       if (answerable && !promptAnswered) {
-        let screen = null;
-        try { screen = await (deps.readScreenResult || readScreenResult)({ pane: body.pane }, null, false, deps); }
-        catch (error) {
-          screen = null;
-          if (!screenReadReported) {
-            screenReadReported = true;
-            process.stderr.write(`keep serve: could not read ${session.id}'s pane while waiting for it to exit: ${String(error && error.message || error)}\n`);
+        const read = async () => {
+          try { return await (deps.readScreenResult || readScreenResult)({ pane: body.pane }, null, false, deps); }
+          catch (error) {
+            if (!screenReadReported) {
+              screenReadReported = true;
+              process.stderr.write(`keep serve: could not read ${session.id}'s pane while waiting for it to exit: ${String(error && error.message || error)}\n`);
+            }
+            return null;
           }
-        }
-        if (worktreeExitPromptKeepsWorktree(String(screen && screen.text || ''))) {
-          await writeTarget({ pane: body.pane }, '\r', deps);
-          promptAnswered = true;
-          limit = 75;
-          process.stderr.write(`keep serve: accepted "Keep worktree" for ${session.id} during graceful exit\n`);
+        };
+        const showsPrompt = async () => worktreeExitPromptKeepsWorktree(String((await read())?.text || ''));
+        if (await showsPrompt()) {
+          // The snapshot is already stale by the time it is read. Between it and the
+          // write the agent can exit — its own exit finishing, or Owner answering the
+          // modal himself — and the pane's root pid does not change when it falls back
+          // to the login shell, so nothing else here would notice. Confirm the very
+          // process that was asked the question is still running, then confirm the
+          // question is still on screen, and only then answer it; the loop keeps
+          // waiting either way, and the next poll reads the pane as dead or a shell.
+          const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
+          const owner = rows.find((p) => p.pid === originalIdentity.pid && p.pidStart === originalIdentity.pidStart);
+          if (owner && await showsPrompt()) {
+            await writeTarget({ pane: body.pane }, '\r', deps);
+            promptAnswered = true;
+            limit = 75;
+            process.stderr.write(`keep serve: accepted "Keep worktree" for ${session.id} during graceful exit\n`);
+          } else if (!promptSkipReported) {
+            promptSkipReported = true;
+            process.stderr.write(`keep serve: left the worktree prompt for ${session.id} alone; ${owner ? 'it went away' : 'the agent had already exited'} before the answer\n`);
+          }
         }
       }
       await closeRestartShell(pane, session, originalIdentity.pid, { ...deps, queued: body.mode === 'idle' });

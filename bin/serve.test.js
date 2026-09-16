@@ -2295,6 +2295,15 @@ test('the worktree exit prompt is answered only when Keep worktree is the highli
   assert.equal(worktreeExitPromptKeepsWorktree([modal(1), ...gap, modal(1)].join('\n')), true);
   assert.equal(worktreeExitPromptKeepsWorktree([modal(1), ...gap, modal(2)].join('\n')), false);
 
+  // A dialog answered a moment ago is retained above the heading, outside the block.
+  assert.equal(worktreeExitPromptKeepsWorktree([
+    '  Switch model?',
+    '❯ 1. Yes, switch to Sonnet 5',
+    '  2. No, go back',
+    '',
+    modal(1),
+  ].join('\n')), true);
+
   // Whatever sits under the footer, the modal is not the live UI — and the thing below
   // it is a place an Enter would do something nobody asked for.
   assert.equal(worktreeExitPromptKeepsWorktree(
@@ -7336,7 +7345,7 @@ test('a graceful exit answers the worktree exit prompt once and only for Keep wo
   ].join('\n');
   // `deadAfter` is how many turns of the wait the pane survives the typed /exit: the modal
   // holds it open until the Enter lands, and Infinity is the prompt nobody ever answers.
-  const scenario = ({ highlighted, deadAfter, kind = 'claude' }) => {
+  const scenario = ({ highlighted, deadAfter, kind = 'claude', vanishOnModal = false }) => {
     const command = kind === 'codex' ? '/test/codex resume wt' : '/test/claude --resume wt';
     const session = { id: 'wt', kind, state: 'idle', endedTurn: true, project: root };
     let pane = { id: 'p', pid: 10, cmd: '/bin/zsh', args: ['-l'], alive: true, attached: 0, visibleAttached: 0,
@@ -7354,7 +7363,12 @@ test('a graceful exit answers the worktree exit prompt once and only for Keep wo
       // The typed /exit reaches the modal, not the exit: the agent is still running.
       closeIdleSession: async (_body, guards) => { await guards.beforeClose(); },
       sleep: async () => { state.waits += 1; if (state.waits >= deadAfter) { pane = { ...pane, alive: false }; state.exited = true; } },
-      readScreenResult: async () => ({ text: modal(highlighted), cursor: { x: 0, y: 3 } }),
+      readScreenResult: async () => {
+        // The agent can exit between the snapshot and the answer — Owner answering the
+        // modal himself looks exactly like this.
+        if (vanishOnModal) state.exited = true;
+        return { text: modal(highlighted), cursor: { x: 0, y: 3 } };
+      },
       waitForHostAgent: async () => {},
       host: { request: async (type, params) => {
         if (type === 'hello') return { replaceExited: true };
@@ -7391,6 +7405,14 @@ test('a graceful exit answers the worktree exit prompt once and only for Keep wo
     await assert.rejects(slow.run(), /Graceful exit did not finish/);
     assert.deepEqual(slow.state.sent, ['\r']);
     assert.equal(slow.state.waits, 75);
+
+    // The agent that was asked the question is gone by the time the answer would go out,
+    // so nothing is typed: the pane's root pid is the login shell's either way, and that
+    // Enter would land on a shell. The restart finishes on the exit that already happened.
+    const vanished = scenario({ highlighted: 1, deadAfter: 2, vanishOnModal: true });
+    const after = await vanished.run();
+    assert.equal(after.sessionId, 'wt');
+    assert.deepEqual(vanished.state.sent, []);
 
     // Only Claude Code asks this question. A Codex pane showing the same text is showing
     // something else, so its screen is never read and nothing is ever typed into it.
