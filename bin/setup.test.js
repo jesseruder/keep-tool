@@ -590,6 +590,45 @@ test('an identical skill copy is migrated, and a different one needs --replace',
   } finally { f.cleanup(); }
 });
 
+test('a backup never renames over a name that is already taken', () => {
+  const f = hooksFixture();
+  const now = Date.now;
+  try {
+    // A clock that does not move is what makes the collision certain; in the wild it
+    // is two backups of the same skill inside one millisecond.
+    Date.now = () => 1700000000000;
+    // Somebody else's fleet-review, and an earlier backup already parked under the
+    // exact name this run will pick. A symlink, because a displaced foreign skill can
+    // be one and renaming over it would destroy the only pointer to their copy.
+    const company = path.join(f.base, 'company', 'skills', 'fleet-review');
+    fs.mkdirSync(company, { recursive: true });
+    fs.writeFileSync(path.join(company, 'SKILL.md'), '# the company procedure\n');
+    const theirs = path.join(f.home, '.claude', 'skills', 'fleet-review');
+    fs.mkdirSync(path.dirname(theirs), { recursive: true });
+    fs.symlinkSync(company, theirs);
+    const attic = path.join(f.home, '.claude', 'skill-backups');
+    fs.mkdirSync(attic, { recursive: true });
+    const taken = path.join(attic, `fleet-review.keep-backup-${Date.now()}`);
+    const earlier = path.join(f.base, 'earlier-fleet-review');
+    fs.mkdirSync(earlier, { recursive: true });
+    fs.writeFileSync(path.join(earlier, 'SKILL.md'), '# an earlier backup\n');
+    fs.symlinkSync(earlier, taken);
+
+    const plans = setup.skillPlans(['core'], { replace: true });
+    setup.applySkillPlans(plans);
+
+    assert.equal(fs.realpathSync(theirs), fs.realpathSync(path.join(SKILLS, 'fleet-review')));
+    assert.equal(fs.readFileSync(path.join(taken, 'SKILL.md'), 'utf8'), '# an earlier backup\n',
+      'the backup that was already there is left whole');
+    const saved = backups(f.home);
+    assert.equal(saved.length, 2, saved.join(', '));
+    const fresh = saved.find((name) => name !== taken);
+    assert.equal(fresh, `${taken}-1`, 'the new backup takes the next free name');
+    assert.equal(fs.readFileSync(path.join(fresh, 'SKILL.md'), 'utf8'), '# the company procedure\n');
+    assert.deepEqual(strayBackups(f.home), []);
+  } finally { Date.now = now; f.cleanup(); }
+});
+
 test('keep setup skills --pack installs the pack, records it, and a later hook install keeps it', () => {
   const f = hooksFixture();
   try {

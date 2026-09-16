@@ -205,6 +205,16 @@ function skillPlans(packNames, { replace = false, probe = false, packs = loadPac
   return plans;
 }
 
+// The timestamp alone is not unique: two backups of the same skill in one millisecond
+// collide, and so does a second run against a clock that has not moved. renameSync
+// would replace what is already there without a word — and a displaced foreign skill
+// can itself be a symlink, so the thing being overwritten is somebody's only copy.
+function freeBackupPath(candidate) {
+  let target = candidate;
+  for (let n = 1; fs.lstatSync(target, { throwIfNoEntry: false }); n++) target = `${candidate}-${n}`;
+  return target;
+}
+
 function applySkillPlans(plans) {
   for (const plan of plans) {
     if (plan.action === 'ok') continue;
@@ -216,7 +226,7 @@ function applySkillPlans(plans) {
       // names is the one that keeps it, shared parent or not.
       const attic = path.join(path.dirname(path.dirname(plan.dest)), 'skill-backups');
       fs.mkdirSync(attic, { recursive: true });
-      plan.backup = path.join(attic, `${plan.skill}.keep-backup-${Date.now()}`);
+      plan.backup = freeBackupPath(path.join(attic, `${plan.skill}.keep-backup-${Date.now()}`));
       fs.renameSync(plan.dest, plan.backup);
     }
     // Never touch the parent: `~/.agents/skills` is often a symlink itself.
