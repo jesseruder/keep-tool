@@ -46,6 +46,7 @@ const {
   compactScreenConfirmed,
   modelSwitchConfirmed,
   modelSwitchDialogVisible,
+  worktreeExitPromptKeepsWorktree,
   codexTypedTextVisible,
   pendingCompactSwaps,
   readPendingCompactSwap,
@@ -2240,6 +2241,34 @@ test('model switch state is anchored after the last echo of the full command', (
   assert.equal(modelSwitchConfirmed(`${pending}\n${oldResult}`, '/model sonnet'), true);
   assert.equal(modelSwitchConfirmed('⎿ Set model to Sonnet 5', '/model sonnet'), false);
   assert.equal(modelSwitchDialogVisible('Switch model?\n❯ 1. Yes, switch to Sonnet 5', '/model sonnet'), false);
+});
+
+test('the worktree exit prompt is answered only when Keep worktree is the highlighted option', () => {
+  const modal = (highlighted, { dirty = true, heading = true } = {}) => [
+    '',
+    ...(heading ? ['  Exiting worktree session'] : []),
+    ...(dirty ? ['  You have 4 uncommitted files. These will be lost if you remove the worktree.'] : []),
+    '',
+    `  ${highlighted === 1 ? '❯' : ' '} 1. Keep worktree    Stays at /Users/jesseruder/wt/ghost-server/aws-cost-breakdown`,
+    `  ${highlighted === 2 ? '❯' : ' '} 2. Remove worktree  All changes and commits will be lost.`,
+    '',
+    '  Enter to confirm · Esc to cancel',
+  ].join('\n');
+
+  assert.equal(worktreeExitPromptKeepsWorktree(modal(1)), true);
+  assert.equal(worktreeExitPromptKeepsWorktree(modal(1, { dirty: false })), true, 'a clean worktree names no files');
+  assert.equal(worktreeExitPromptKeepsWorktree(modal(2)), false, 'Remove worktree discards the work');
+  assert.equal(worktreeExitPromptKeepsWorktree(modal(1, { heading: false })), false);
+  assert.equal(worktreeExitPromptKeepsWorktree('Keep worktree is what wt land assumes\n❯ '), false);
+  // Another menu that happens to sit under the heading is not this question.
+  assert.equal(worktreeExitPromptKeepsWorktree([
+    '  Exiting worktree session',
+    '❯ 1. Keep worktree',
+    '  Enter to confirm · Esc to cancel',
+    'Switch model?',
+    '❯ 1. Yes, switch to Sonnet 5',
+  ].join('\n')), false);
+  assert.equal(worktreeExitPromptKeepsWorktree(''), false);
 });
 
 test('lines after last echo excludes results belonging to earlier identical commands', () => {
@@ -7209,6 +7238,82 @@ test('restarting the fleet reviewer keeps its identity, its launch env, and its 
     assert.equal(refreshed.name, 'fable');
     assert.equal(review.pickReviewer(sessions, { rev: refreshed }, Date.now())?.id, 'rev');
     fs.rmSync(keepRoot, { recursive: true, force: true });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a graceful exit answers the worktree exit prompt once and only for Keep worktree', async () => {
+  const { restartSession } = require('./serve');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-worktree-exit-'));
+  const claudeFile = path.join(root, 'claude.jsonl');
+  const accountConfig = path.join(root, 'config.json');
+  fs.writeFileSync(accountConfig, JSON.stringify({ version: 1, accounts: [
+    { id: 'claude/default', label: 'Primary', agent: 'claude', configDir: path.join(os.homedir(), '.claude'), useDefaultConfig: true },
+  ], defaultAccounts: { claude: 'claude/default' } }));
+  fs.writeFileSync(claudeFile, JSON.stringify({ type: 'assistant', sessionId: 'wt', message: { content: [], stop_reason: 'end_turn' } }) + '\n');
+  const modal = (highlighted) => [
+    '  Exiting worktree session',
+    '  You have 4 uncommitted files. These will be lost if you remove the worktree.',
+    '',
+    `  ${highlighted === 1 ? '❯' : ' '} 1. Keep worktree    Stays at ${root}`,
+    `  ${highlighted === 2 ? '❯' : ' '} 2. Remove worktree  All changes and commits will be lost.`,
+    '',
+    '  Enter to confirm · Esc to cancel',
+  ].join('\n');
+  // `deadAfter` is how many turns of the wait the pane survives the typed /exit: the modal
+  // holds it open until the Enter lands, and Infinity is the prompt nobody ever answers.
+  const scenario = ({ highlighted, deadAfter }) => {
+    const session = { id: 'wt', kind: 'claude', state: 'idle', endedTurn: true, project: root };
+    let pane = { id: 'p', pid: 10, cmd: '/bin/zsh', args: ['-l'], alive: true, attached: 0, visibleAttached: 0,
+      cols: 200, rows: 50, meta: { sessionId: 'wt', agent: 'claude' } };
+    const row = { pid: 11, ppid: 10, pidStart: 'Tue Sep  8 10:00:00 2026', agent: 'claude', interactive: true, args: '/test/claude --resume wt' };
+    const state = { waits: 0, sent: [], exited: false, replaced: null };
+    const deps = {
+      root, env: { KEEP_DIR: root, KEEP_CONFIG: accountConfig }, withInjectionLock: (fn) => fn(),
+      buildState: async () => ({ sessions: [session], tasks: [] }),
+      claudeRolloutFile: () => claudeFile,
+      agentProcessRows: async () => (state.exited ? [{ pid: 10, ppid: 1, args: '/bin/zsh -l' }] : [row]),
+      psTable: '11 10 ttys001 Tue Sep  8 10:00:00 2026 /test/claude --resume wt',
+      lsof: async () => '',
+      // The typed /exit reaches the modal, not the exit: the agent is still running.
+      closeIdleSession: async (_body, guards) => { await guards.beforeClose(); },
+      sleep: async () => { state.waits += 1; if (state.waits >= deadAfter) { pane = { ...pane, alive: false }; state.exited = true; } },
+      readScreenResult: async () => ({ text: modal(highlighted), cursor: { x: 0, y: 3 } }),
+      waitForHostAgent: async () => {},
+      host: { request: async (type, params) => {
+        if (type === 'hello') return { replaceExited: true };
+        if (type === 'get') return { pane: { ...pane } };
+        if (type === 'list') return { panes: [{ ...pane }] };
+        if (type === 'input') { state.sent.push(Buffer.from(params.data, 'base64').toString()); return {}; }
+        assert.equal(type, 'replace-exited');
+        state.replaced = params;
+        pane = { ...pane, alive: true, pid: 20 };
+        return { pane };
+      } },
+    };
+    return { state, run: () => restartSession({ sessionId: 'wt', pane: 'p', pid: 10, mode: 'idle' }, deps) };
+  };
+
+  try {
+    // Two polls on the modal, one Enter — the second poll still shows it, and the guard
+    // keeps the restart from answering a question it has already answered.
+    const keep = scenario({ highlighted: 1, deadAfter: 2 });
+    const result = await keep.run();
+    assert.equal(result.sessionId, 'wt');
+    assert.deepEqual(keep.state.sent, ['\r']);
+    assert.equal(keep.state.waits, 2);
+    assert.match(keep.state.replaced.args[1], /'--resume' 'wt'/);
+
+    // Highlighted Remove worktree is never answered: the wait runs out as before.
+    const remove = scenario({ highlighted: 2, deadAfter: Infinity });
+    await assert.rejects(remove.run(), /Graceful exit did not finish/);
+    assert.deepEqual(remove.state.sent, []);
+    assert.equal(remove.state.waits, 30, 'an unanswered prompt keeps the original wait');
+
+    // Answering buys the longer wait, and still only one Enter.
+    const slow = scenario({ highlighted: 1, deadAfter: Infinity });
+    await assert.rejects(slow.run(), /Graceful exit did not finish/);
+    assert.deepEqual(slow.state.sent, ['\r']);
+    assert.equal(slow.state.waits, 75);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

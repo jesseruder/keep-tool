@@ -2201,6 +2201,24 @@ function modelSwitchConfirmed(screen, command) {
   });
 }
 
+// A session that entered a git worktree with Claude Code's EnterWorktree tool does not
+// leave on a typed /exit: the exit is intercepted by a modal asking whether to keep or
+// remove the worktree, and the pane parks there until someone answers. Restart's wait
+// answers it, but only for the option that destroys nothing — so every part of the
+// screen has to agree: the "Exiting worktree session" heading above, the highlighted
+// "1. Keep worktree" itself, and the "Enter to confirm" footer below. A second
+// highlighted option means this is some other menu, and a highlighted "2. Remove
+// worktree" would throw away the very work the restart is trying to preserve.
+function worktreeExitPromptKeepsWorktree(screenText) {
+  const lines = String(screenText || '').split(/\r?\n/).map(normalizedText);
+  const options = lines.reduce((found, line, index) => (/^❯\s*\d+\./.test(line) ? found.concat(index) : found), []);
+  if (options.length !== 1) return false;
+  const index = options[0];
+  if (!/^❯\s*1\.\s*Keep worktree\b/.test(lines[index])) return false;
+  if (!lines.slice(0, index).some((line) => /Exiting worktree session/i.test(line))) return false;
+  return lines.slice(index + 1).some((line) => /Enter to confirm/i.test(line));
+}
+
 function modelSwitchDialogVisible(screen, command) {
   const lines = command === undefined
     ? String(screen || '').split(/\r?\n/).map(normalizedText)
@@ -3506,10 +3524,26 @@ async function restartSession(body, deps = {}) {
     }
     const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     let stopped;
-    for (let i = 0; i < 30; i++) {
+    // The typed /exit can land on the worktree-exit modal instead of ending the session.
+    // Answering it costs a round trip the plain exit does not, so the wait grows to ~15s
+    // once — and only once — the prompt has been answered; every other screen waits the
+    // same ~6s it always has. A screen that cannot be read is simply not the modal.
+    let promptAnswered = false;
+    for (let i = 0, limit = 30; i < limit; i++) {
       stopped = (await host('get', { pane: body.pane })).pane;
       if (!restartPaneMatches(pane, stopped, session.id)) throw Error('Session process changed during restart');
       if (!stopped.alive) break;
+      if (!promptAnswered) {
+        let screen = null;
+        try { screen = await (deps.readScreenResult || readScreenResult)({ pane: body.pane }, null, false, deps); }
+        catch { screen = null; }
+        if (worktreeExitPromptKeepsWorktree(String(screen && screen.text || ''))) {
+          await writeTarget({ pane: body.pane }, '\r', deps);
+          promptAnswered = true;
+          limit = 75;
+          process.stderr.write(`keep serve: accepted "Keep worktree" for ${session.id} during graceful exit\n`);
+        }
+      }
       await closeRestartShell(pane, session, originalIdentity.pid, { ...deps, queued: body.mode === 'idle' });
       await sleep(200);
     }
@@ -8216,6 +8250,7 @@ module.exports = {
   compactScreenConfirmed,
   modelSwitchConfirmed,
   modelSwitchDialogVisible,
+  worktreeExitPromptKeepsWorktree,
   repairClaudeSettingsModel,
   pickNotifyTarget,
   pickDeliveryCandidates,
