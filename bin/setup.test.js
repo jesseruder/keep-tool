@@ -370,6 +370,13 @@ test('a Keep hook command from a moved checkout is rewritten, not duplicated', (
 
 const SKILLS = path.resolve(__dirname, '..', 'skills');
 
+// Exactly what doctor's loop prints for the account lines, without paying for a
+// whole doctor run (each one spawns the Claude and Codex version probes).
+function accountLines() {
+  return setup.accountSetupReport()
+    .map((entry) => `${entry.status}: ${entry.text}${entry.fix ? `\n  fix: ${entry.fix}` : ''}`).join('\n');
+}
+
 function capture(fn) {
   const lines = [];
   const log = console.log;
@@ -726,7 +733,6 @@ test('keep doctor reports shared account setup drift for every nondefault accoun
   const accounts = require('./accounts');
   const codexSetup = require('./codex-setup');
   const accountSetup = require('./account-setup');
-  const run = () => capture(() => setup.doctor(path.join(f.base, 'registry')));
   try {
     const codexSource = accounts.get('codex/default'), codexTarget = accounts.get('codex-alt');
     fs.mkdirSync(codexSource.configDir, { recursive: true });
@@ -738,7 +744,7 @@ test('keep doctor reports shared account setup drift for every nondefault accoun
     fs.rmSync(claudeTarget.configDir, { recursive: true, force: true });
     accountSetup.shareSetup(claudeSource, claudeTarget);
 
-    const synced = run();
+    const synced = accountLines();
     assert.match(synced, /^ok: Codex account codex-alt shared setup in sync$/m);
     assert.match(synced, /^ok: Claude account automation shared setup in sync$/m);
     assert.equal(/account claude\/default/.test(synced), false, 'a default account is the source, not a target');
@@ -746,7 +752,8 @@ test('keep doctor reports shared account setup drift for every nondefault accoun
     // A source change nobody has refreshed, and a shared entry replaced in the target.
     fs.writeFileSync(path.join(codexSource.configDir, 'config.toml'), 'model = "source-model"\n\n[features]\nhooks = false\n');
     fs.unlinkSync(path.join(claudeTarget.configDir, 'CLAUDE.md'));
-    const behind = run();
+    // The one full doctor run: it prints these lines and fails the check.
+    const behind = capture(() => setup.doctor(path.join(f.base, 'registry')));
     assert.match(behind, /^FAIL: Codex account codex-alt shared setup behind \(1 value: features\.hooks\)$/m);
     assert.match(behind, /^ {2}fix: keep accounts setup codex-alt --share-from codex\/default$/m);
     assert.match(behind, /^FAIL: Claude account automation shared setup behind \(1 entry: CLAUDE\.md\)$/m);
@@ -755,11 +762,45 @@ test('keep doctor reports shared account setup drift for every nondefault accoun
 
     fs.rmSync(path.join(codexTarget.configDir, codexSetup.MANIFEST));
     fs.rmSync(path.join(claudeTarget.configDir, accountSetup.MANIFEST));
-    const unshared = run();
+    const unshared = accountLines();
     assert.match(unshared, /^optional: Codex account codex-alt is not sharing setup$/m);
     assert.match(unshared, /^ {2}fix: keep accounts setup codex-alt --share-from codex\/default$/m);
     assert.match(unshared, /^optional: Claude account automation is not sharing setup$/m);
   } finally { process.exitCode = exitCode; f.cleanup(); }
+});
+
+test('keep doctor reports a pending compaction swap as deferred rather than drift', () => {
+  const f = hooksFixture();
+  const exitCode = process.exitCode;
+  const prior = process.env.KEEP_DIR;
+  const accounts = require('./accounts');
+  const codexSetup = require('./codex-setup');
+  try {
+    const source = accounts.get('codex/default'), target = accounts.get('codex-alt');
+    fs.mkdirSync(source.configDir, { recursive: true });
+    fs.writeFileSync(path.join(source.configDir, 'config.toml'), 'model = "source-model"\n\n[features]\nhooks = true\n');
+    codexSetup.shareSetup(source, target);
+
+    process.env.KEEP_DIR = path.join(f.base, 'registry');
+    const swap = path.join(process.env.KEEP_DIR, '.keep', 'compact', 'swap-session.swap.json');
+    fs.mkdirSync(path.dirname(swap), { recursive: true });
+    fs.writeFileSync(swap, JSON.stringify({ kind: 'codex', sessionId: 'swap-session', accountId: target.id,
+      configFile: path.join(target.configDir, 'config.toml'),
+      transcriptFile: path.join(target.configDir, 'sessions', 'swap-session.jsonl') }) + '\n');
+    fs.writeFileSync(path.join(target.configDir, 'config.toml'), 'model = "fallback-model"\n\n[features]\nhooks = true\n');
+
+    const deferred = capture(() => setup.doctor(path.join(f.base, 'registry')));
+    assert.match(deferred, /^ok: Codex account codex-alt shared setup in sync \(model keys deferred: compaction swap pending\)$/m);
+
+    // The compaction restores the model it saved and drops its record.
+    fs.rmSync(swap);
+    fs.writeFileSync(path.join(target.configDir, 'config.toml'), 'model = "source-model"\n\n[features]\nhooks = true\n');
+    assert.match(accountLines(), /^ok: Codex account codex-alt shared setup in sync$/m);
+  } finally {
+    if (prior === undefined) delete process.env.KEEP_DIR; else process.env.KEEP_DIR = prior;
+    process.exitCode = exitCode;
+    f.cleanup();
+  }
 });
 
 test('keep doctor reports a conflicted or unreadable account without stopping', () => {
@@ -780,7 +821,7 @@ test('keep doctor reports a conflicted or unreadable account without stopping', 
     assert.match(conflicted, new RegExp(`^ {2}fix: resolve those values in .*config\\.toml, then keep accounts setup codex-alt --share-from codex/default$`, 'm'));
 
     fs.writeFileSync(path.join(target.configDir, codexSetup.MANIFEST), '{ not json');
-    const unreadable = capture(() => setup.doctor(path.join(f.base, 'registry')));
+    const unreadable = accountLines();
     assert.match(unreadable, /^FAIL: Codex account codex-alt shared setup unreadable \(invalid JSON in .*\)$/m);
     assert.match(unreadable, /^optional: Claude account automation is not sharing setup$/m,
       'one unreadable account does not stop the rest');

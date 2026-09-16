@@ -156,17 +156,21 @@ function desiredConfig(sourceConfig, sourceDir, targetDir) {
   return desired;
 }
 
-function mergeConfig(sourceConfig, targetConfig, previous, sourceDir, targetDir) {
+function mergeConfig(sourceConfig, targetConfig, previous, sourceDir, targetDir, deferred = []) {
   const desired = desiredConfig(sourceConfig, sourceDir, targetDir);
   const sourceLeaves = managedLeaves(desired);
   const targetLeaves = managedLeaves(targetConfig);
   const old = new Map((previous || []).map((entry) => [JSON.stringify(entry.path), entry]));
   const keys = new Set([...sourceLeaves.keys(), ...targetLeaves.keys(), ...old.keys()]);
+  const frozen = new Set(deferred.map((trail) => JSON.stringify(trail)));
   const result = structuredClone(targetConfig);
   const decisions = [];
   const conflicts = [];
 
   for (const key of [...keys].sort()) {
+    // A frozen leaf takes part in no decision this run: not written, not
+    // compared, and its prior record travels forward untouched below.
+    if (frozen.has(key)) continue;
     const source = sourceLeaves.get(key)?.value ?? MISSING;
     const target = targetLeaves.get(key)?.value ?? MISSING;
     const prior = old.get(key);
@@ -202,7 +206,12 @@ function mergeConfig(sourceConfig, targetConfig, previous, sourceDir, targetDir)
     targetHash: digest(getAt(result, trail)),
     managed,
   }));
-  return { config: result, records, desired };
+  // A frozen leaf keeps the record it already had, byte for byte, so the merge
+  // that runs after the swap sees the state from before it. A leaf with no prior
+  // record gets none this run.
+  for (const key of frozen) if (old.has(key)) records.push(structuredClone(old.get(key)));
+  records.sort((a, b) => JSON.stringify(a.path) < JSON.stringify(b.path) ? -1 : 1);
+  return { config: result, records, desired, deferred: [...frozen].map((key) => JSON.parse(key)) };
 }
 
 function expectedLink(source, target) {
@@ -527,6 +536,39 @@ function assertAccounts(sourceAccount, targetAccount) {
   return { source, target };
 }
 
+// A Codex fallback compaction rewrites `model` and `model_reasoning_effort` in
+// the account's own config.toml and restores them when it ends, recording the
+// transaction in `<keep>/.keep/compact/<session>.swap.json`. That rewrite is a
+// transaction, not an account-local choice: left to the ordinary merge, a
+// refresh inside that window would record the swapped value as a target edit and
+// demote the leaf to an override, or — if the source moved too — raise a
+// conflict and stop the launch. While a swap for this profile is pending both
+// leaves are frozen instead, and the merge after the restore picks up where it
+// left off.
+const SWAP_DEFERRED = [['model'], ['model_reasoning_effort']];
+const SWAP_REASON = 'compaction swap pending';
+
+function pendingSwap(targetDir) {
+  let compact;
+  try { compact = require('./codex-compact'); } catch { return false; }
+  let directory, names;
+  try { directory = compact.compactDir(); names = fs.readdirSync(directory); } catch { return false; }
+  const wanted = path.join(canonical(targetDir), 'config.toml');
+  for (const name of names) {
+    if (!name.endsWith('.swap.json')) continue;
+    let record;
+    try { record = JSON.parse(fs.readFileSync(path.join(directory, name), 'utf8')); } catch { continue; }
+    if (!compact.isCodexCompactSwap(record) || typeof record.configFile !== 'string') continue;
+    const file = path.join(canonical(path.dirname(record.configFile)), path.basename(record.configFile));
+    if (file === wanted) return true;
+  }
+  return false;
+}
+
+function deferredLeaves(targetDir) {
+  return pendingSwap(targetDir) ? SWAP_DEFERRED.map((trail) => [...trail]) : [];
+}
+
 function readSetup(account) {
   if (!account?.configDir) return null;
   const value = readJSON(path.join(account.configDir, MANIFEST), null);
@@ -545,7 +587,7 @@ function shareSetup(sourceAccount, targetAccount, options = {}) {
   const targetConfigFile = path.join(target, 'config.toml');
   const targetConfigHash = fileDigest(targetConfigFile);
   const targetConfig = readToml(targetConfigFile);
-  const merged = mergeConfig(sourceConfig, targetConfig, previous?.config, source, target);
+  const merged = mergeConfig(sourceConfig, targetConfig, previous?.config, source, target, deferredLeaves(target));
   const assets = { ...syncSimpleAssets(source, target, previous?.assets),
     ...syncMarketplaceAssets(sourceConfig, source, target, previous?.assets) };
   const legacyPlugins = previous?.pluginFiles || {};
@@ -558,6 +600,7 @@ function shareSetup(sourceAccount, targetAccount, options = {}) {
     pluginAliases: plugins.aliases, updatedAt: new Date().toISOString() };
   writeJSON(manifestFile, manifest);
   return { ok: true, idempotent: Boolean(previous), targetConfigDir: target,
+    deferred: merged.deferred.map((trail) => ({ path: displayPath(trail), reason: SWAP_REASON })),
     sharedEntries: [...Object.keys(assets), ...plugins.versions.map((entry) => path.join('plugins/cache', entry))] };
 }
 
@@ -600,9 +643,11 @@ function preview(sourceAccount, targetAccount) {
   }
   const sourceConfig = readToml(path.join(source, 'config.toml'));
   const targetConfig = readToml(path.join(target, 'config.toml'));
+  const frozen = deferredLeaves(target);
+  const deferred = frozen.map((trail) => ({ path: displayPath(trail), reason: SWAP_REASON }));
   const configChanges = [], conflicts = [];
   try {
-    const merged = mergeConfig(sourceConfig, targetConfig, previous?.config, source, target);
+    const merged = mergeConfig(sourceConfig, targetConfig, previous?.config, source, target, frozen);
     for (const record of merged.records) {
       if (digest(getAt(merged.config, record.path)) !== digest(getAt(targetConfig, record.path))) {
         configChanges.push(displayPath(record.path));
@@ -612,12 +657,13 @@ function preview(sourceAccount, targetAccount) {
     if (!Array.isArray(error.conflicts)) throw error;
     conflicts.push(...error.conflicts);
   }
-  return { managed: Boolean(previous), configChanges, missingAssets: missingAssets(sourceConfig, source, target), conflicts };
+  return { managed: Boolean(previous), configChanges, missingAssets: missingAssets(sourceConfig, source, target),
+    conflicts, deferred };
 }
 
 function previewRefresh(account) {
   const manifest = readSetup(account);
-  if (!manifest) return { managed: false, configChanges: [], missingAssets: [], conflicts: [] };
+  if (!manifest) return { managed: false, configChanges: [], missingAssets: [], conflicts: [], deferred: [] };
   const source = { id: manifest.sourceAccountId, agent: 'codex', configDir: manifest.sourceConfigDir };
   return { ...preview(source, account), managed: true, sourceAccountId: manifest.sourceAccountId };
 }

@@ -640,6 +640,7 @@ async function recoverCodexCompactSwap(record, deps = {}) {
 
 module.exports = {
   DEFAULT_FALLBACK_MODEL,
+  compactDir,
   compactCodexFallback,
   recoverCodexCompactSwap,
   isCodexCompactSwap,

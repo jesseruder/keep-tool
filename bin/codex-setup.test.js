@@ -199,7 +199,8 @@ test('preview reports what a refresh would do and writes nothing', () => {
   const f = fixture();
   const targetFile = path.join(f.targetDir, 'config.toml');
   try {
-    assert.deepEqual(setup.previewRefresh(f.target), { managed: false, configChanges: [], missingAssets: [], conflicts: [] });
+    assert.deepEqual(setup.previewRefresh(f.target),
+      { managed: false, configChanges: [], missingAssets: [], conflicts: [], deferred: [] });
     const adoption = setup.preview(f.source, f.target);
     assert.equal(adoption.managed, false);
     assert.equal(adoption.conflicts.length, 0);
@@ -215,7 +216,7 @@ test('preview reports what a refresh would do and writes nothing', () => {
 
     setup.shareSetup(f.source, f.target);
     assert.deepEqual(setup.previewRefresh(f.target),
-      { managed: true, sourceAccountId: f.source.id, configChanges: [], missingAssets: [], conflicts: [] });
+      { managed: true, sourceAccountId: f.source.id, configChanges: [], missingAssets: [], conflicts: [], deferred: [] });
 
     const source = toml.parse(fs.readFileSync(path.join(f.sourceDir, 'config.toml'), 'utf8'));
     source.model_reasoning_effort = 'low';
@@ -230,6 +231,104 @@ test('preview reports what a refresh would do and writes nothing', () => {
     assert.deepEqual(setup.previewRefresh(f.target).conflicts, ['model_reasoning_effort']);
     assert.throws(() => setup.refresh(f.target), /conflicts at model_reasoning_effort/);
   } finally { f.cleanup(); }
+});
+
+// A Codex fallback compaction owns `model` and `model_reasoning_effort` in the
+// target's own config.toml until it restores them, and records the transaction
+// where `keep serve` looks for it.
+function pendingSwap(f, sessionId = 'swap-session') {
+  const prior = process.env.KEEP_DIR;
+  process.env.KEEP_DIR = path.join(f.root, 'registry');
+  const file = path.join(process.env.KEEP_DIR, '.keep', 'compact', `${sessionId}.swap.json`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({
+    kind: 'codex', sessionId, accountId: f.target.id,
+    configFile: path.join(f.targetDir, 'config.toml'),
+    transcriptFile: path.join(f.targetDir, 'sessions', `${sessionId}.jsonl`),
+    original: { model: 'source-model', effort: 'high' },
+    fallback: { model: 'fallback-model', effort: 'medium' },
+    configBefore: { model: { present: true, value: 'source-model' }, effort: { present: true, value: 'high' } },
+  }) + '\n');
+  return {
+    file,
+    restore: () => { if (prior === undefined) delete process.env.KEEP_DIR; else process.env.KEEP_DIR = prior; },
+  };
+}
+
+function swapConfig(file, model, effort) {
+  const config = toml.parse(fs.readFileSync(file, 'utf8'));
+  config.model = model;
+  config.model_reasoning_effort = effort;
+  writeToml(file, config);
+}
+
+test('a pending compaction swap freezes the model leaves instead of demoting them', () => {
+  const f = fixture();
+  const targetFile = path.join(f.targetDir, 'config.toml');
+  const manifestFile = path.join(f.targetDir, setup.MANIFEST);
+  const record = (value) => JSON.parse(fs.readFileSync(manifestFile, 'utf8')).config
+    .find((entry) => JSON.stringify(entry.path) === JSON.stringify([value]));
+  let swap;
+  try {
+    // The target adopts the source model, so the leaf is managed before the swap.
+    const target = toml.parse(fs.readFileSync(targetFile, 'utf8'));
+    delete target.model;
+    writeToml(targetFile, target);
+    setup.shareSetup(f.source, f.target);
+    assert.equal(toml.parse(fs.readFileSync(targetFile, 'utf8')).model, 'source-model');
+    const managedBefore = record('model'), effortBefore = record('model_reasoning_effort');
+    assert.equal(managedBefore.managed, true);
+
+    swap = pendingSwap(f);
+    swapConfig(targetFile, 'fallback-model', 'medium');
+    // The source moves during the swap: without the freeze this is a conflict.
+    const source = toml.parse(fs.readFileSync(path.join(f.sourceDir, 'config.toml'), 'utf8'));
+    source.model = 'source-model-2';
+    writeToml(path.join(f.sourceDir, 'config.toml'), source);
+    const held = setup.shareSetup(f.source, f.target);
+    assert.deepEqual(held.deferred, [{ path: 'model', reason: 'compaction swap pending' },
+      { path: 'model_reasoning_effort', reason: 'compaction swap pending' }]);
+    assert.equal(toml.parse(fs.readFileSync(targetFile, 'utf8')).model, 'fallback-model', 'the swap keeps its value');
+    assert.deepEqual(record('model'), managedBefore, 'the prior record carries forward byte for byte');
+    assert.deepEqual(record('model_reasoning_effort'), effortBefore);
+
+    // The compaction restores the config it saved, then drops its record.
+    swapConfig(targetFile, 'source-model', 'high');
+    fs.rmSync(swap.file);
+    setup.refresh(f.target);
+    assert.equal(toml.parse(fs.readFileSync(targetFile, 'utf8')).model, 'source-model-2',
+      'the source update lands once the swap is over');
+    assert.equal(record('model').managed, true, 'the leaf is managed again');
+  } finally { swap?.restore(); f.cleanup(); }
+});
+
+test('a pending compaction swap at first adoption records no model leaf at all', () => {
+  const f = fixture();
+  const targetFile = path.join(f.targetDir, 'config.toml');
+  let swap;
+  try {
+    const target = toml.parse(fs.readFileSync(targetFile, 'utf8'));
+    delete target.model;
+    writeToml(targetFile, target);
+    swap = pendingSwap(f);
+    swapConfig(targetFile, 'fallback-model', 'medium');
+
+    const preview = setup.preview(f.source, f.target);
+    assert.deepEqual(preview.deferred, [{ path: 'model', reason: 'compaction swap pending' },
+      { path: 'model_reasoning_effort', reason: 'compaction swap pending' }]);
+    assert.equal(preview.configChanges.includes('model'), false);
+    assert.equal(preview.configChanges.includes('model_reasoning_effort'), false);
+    assert.ok(preview.configChanges.includes('service_tier'), 'everything else still merges');
+
+    setup.shareSetup(f.source, f.target);
+    assert.equal(toml.parse(fs.readFileSync(targetFile, 'utf8')).model, 'fallback-model');
+    const records = JSON.parse(fs.readFileSync(path.join(f.targetDir, setup.MANIFEST), 'utf8')).config;
+    for (const name of ['model', 'model_reasoning_effort']) {
+      assert.equal(records.some((entry) => JSON.stringify(entry.path) === JSON.stringify([name])), false,
+        `${name} has no record while it is frozen`);
+    }
+    assert.deepEqual(setup.previewRefresh(f.target).deferred, preview.deferred);
+  } finally { swap?.restore(); f.cleanup(); }
 });
 
 test('skills, instructions, local marketplaces and exact plugin versions are portable', () => {

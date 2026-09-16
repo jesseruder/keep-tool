@@ -633,14 +633,17 @@ function accountSetupReport() {
     try {
       if (account.agent === 'codex') {
         const state = require('./codex-setup').previewRefresh(account);
+        // A deferred leaf is a transaction in flight, not drift: it explains the
+        // line, it never fails it.
+        const held = state.deferred?.length ? ` (model keys deferred: ${state.deferred[0].reason})` : '';
         if (!state.managed) lines.push({ status: 'optional', text: `${agent} account ${account.id} is not sharing setup`, fix: share() });
         else if (state.conflicts.length) {
-          lines.push({ status: 'FAIL', text: `${agent} account ${account.id} shared setup conflicts (${counted(state.conflicts)})`,
+          lines.push({ status: 'FAIL', text: `${agent} account ${account.id} shared setup conflicts (${counted(state.conflicts)})${held}`,
             fix: `resolve those values in ${path.join(account.configDir, 'config.toml')}, then ${share(state.sourceAccountId)}` });
         } else {
           const behind = [...state.configChanges, ...state.missingAssets];
-          if (behind.length) lines.push({ status: 'FAIL', text: `${agent} account ${account.id} shared setup behind (${counted(behind)})`, fix: share(state.sourceAccountId) });
-          else lines.push({ status: 'ok', text: `${agent} account ${account.id} shared setup in sync` });
+          if (behind.length) lines.push({ status: 'FAIL', text: `${agent} account ${account.id} shared setup behind (${counted(behind)})${held}`, fix: share(state.sourceAccountId) });
+          else lines.push({ status: 'ok', text: `${agent} account ${account.id} shared setup in sync${held}` });
         }
       } else {
         const state = require('./account-setup').previewRefresh(account);
