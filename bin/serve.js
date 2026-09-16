@@ -638,6 +638,19 @@ function scanTranscript(file, options = {}) {
   let lastStopReason = null;
   let lastAssistantHadText = false;
   let exitCommand = false;
+  // A typed local command (/compact, /model, ...) is logged as a bare user prompt;
+  // the stdout/stderr wrapper that follows is the harness finishing it. The turn is
+  // over even though no assistant record follows. Claude Code writes the wrapper
+  // either as a user record or as a `system`/`local_command` record.
+  const finishLocalCommand = (t, stdout) => {
+    // Claude Code randomizes the farewell (Goodbye!, Bye!, See ya!, ...), so the
+    // /exit command that precedes it is the signal; the literals cover old transcripts.
+    if (stdout && (exitCommand || /^<local-command-stdout>(?:Goodbye!|Bye!|Catch you later!|See ya!)<\/local-command-stdout>$/.test(t.trim()))) out.exited = true;
+    exitCommand = false;
+    lastRealEvent = 'assistant';
+    lastStopReason = 'end_turn';
+    lastAssistantHadText = true;
+  };
   for (const line of text.split('\n')) {
     if (!line) continue;
     let j;
@@ -758,16 +771,7 @@ function scanTranscript(file, options = {}) {
         // longer parked on it, so it needs no resume.
         out.rateLimit = null;
       } else if (t.startsWith('<local-command-stdout>')) {
-        // A typed local command (/compact, /model, ...) is logged as a bare user
-        // prompt; this wrapper is the harness finishing it. The turn is over even
-        // though no assistant record follows.
-        // Claude Code randomizes the farewell (Goodbye!, Bye!, See ya!, ...), so the
-        // /exit command that precedes it is the signal; the literals cover old transcripts.
-        if (exitCommand || /^<local-command-stdout>(?:Goodbye!|Bye!|Catch you later!|See ya!)<\/local-command-stdout>$/.test(t.trim())) out.exited = true;
-        exitCommand = false;
-        lastRealEvent = 'assistant';
-        lastStopReason = 'end_turn';
-        lastAssistantHadText = true;
+        finishLocalCommand(t, true);
       }
       // Owner being at the keyboard also clears the stall, even when he typed a
       // slash command rather than a prompt: /model and /compact log a caveat, a
@@ -779,6 +783,22 @@ function scanTranscript(file, options = {}) {
         || t.startsWith('<command-name>') || t.startsWith('<local-command-caveat>')) {
         out.rateLimit = null;
       }
+    }
+    // Newer Claude Code logs the same local command as a `system` record with the
+    // wrapper in a top-level string `content` and no `message`. A failed /compact
+    // leaves only a stderr row, so without this the session stays "mid-turn" forever.
+    if (j.type === 'system' && j.subtype === 'local_command' && typeof j.content === 'string') {
+      const t = j.content.trimStart();
+      if (t.startsWith('<local-command-stdout>')) {
+        finishLocalCommand(t, true);
+        // Owner (or the daemon) was at the keyboard, so the session is no longer
+        // parked on a limit error. A stderr row proves no such thing.
+        out.rateLimit = null;
+      } else if (t.startsWith('<local-command-stderr>')) {
+        finishLocalCommand(t, false);
+      }
+      // A <command-name> system row is only the echo of the typed command; the
+      // user record already carried it. It neither starts nor ends a turn.
     }
     if (j.type === 'assistant' && j.message) {
       out.exited = false;

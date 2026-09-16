@@ -39,6 +39,14 @@ function consume(state, row, agent) {
       if (human) s.finalTextBlocked = Boolean(s.finalTextSeen) && (!at || at <= s.finalTextSeen);
       if (t.startsWith('<local-command-stdout>')) s.completed = true;
     }
+    // Newer Claude Code logs the local command's output as a `system` record
+    // instead. Either stream means the harness finished the command; a failed
+    // /compact writes only stderr, and without this the turn never settles.
+    if (row.type === 'system' && row.subtype === 'local_command' && typeof row.content === 'string') {
+      const t = row.content.trimStart();
+      if (t.startsWith('<local-command-stdout>') || t.startsWith('<local-command-stderr>')) s.completed = true;
+      // A <command-name> row is the echo of the typed command; it proves nothing.
+    }
     if (row.type === 'assistant') {
       s.completed = row.message?.stop_reason === 'end_turn';
       s.rateLimitTerminal = row.isApiErrorMessage === true && (row.error === 'rate_limit' || row.apiErrorStatus === 429);

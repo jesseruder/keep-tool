@@ -11,7 +11,9 @@ const TERMINAL = new Set(['completed', 'failed', 'cancelled']);
 // clearable: a full replay rebuilds every transcript-visible job, and only
 // hook-only corroboration is lost with the unreadable snapshot.
 const STICKY_GAP_REASONS = new Set(['transcript-replaced', 'checkpoint-anchor', 'hook-transcript-mismatch']);
-const restartVersion = agent => agent === 'claude' ? 2 : 1;
+// 3: the reducer reads `system`/local_command stdout and stderr rows as proof a
+// typed slash command finished; older ledgers must replay to settle a failed /compact.
+const restartVersion = agent => agent === 'claude' ? 3 : 1;
 const hash = (s) => crypto.createHash('sha256').update(s).digest('hex');
 const text = (v) => typeof v === 'string' ? v : Array.isArray(v) ? v.filter(x => ['text', 'input_text', 'output_text'].includes(x?.type)).map(x => x.text || '').join('\n') : '';
 
