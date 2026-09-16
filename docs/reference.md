@@ -301,7 +301,8 @@ lint findings as advisory evidence — up to ten rows, each naming its rule. Lin
 those classes outright: `review-land` refuses a note whose kind is
 `wrong-status`, `stale-checkin`, `daemon-health`, `env-hygiene`, `deploy-provenance` or
 `step-pending` (or `other` with a `:no-project` / `:closing-checkin` subject, a bare sha,
-a `/tmp` path, or prose about experiments left undecided) when a lint finding from a rule
+a `/tmp` path, or a subject naming all three of an experiment, its readout and the
+decision that never came) when a lint finding from a rule
 that covers it is already on record —
 matched on the same card, or fleet-wide for the rules that answer for the registry
 (`daemon-health`, `checkout-drift`, `step-run-pending`, which file under `daemon:<name>`,

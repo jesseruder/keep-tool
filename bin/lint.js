@@ -458,12 +458,14 @@ const READOUT_KIND_RE = /^check result \(agent\)(?:\s|$)/;
 // `alert`, `retitled`, `check session ended`, …) and any one a deny-list missed would
 // silence this rule forever. So name the decisions instead — a short closed set that
 // means somebody answered the readout — and treat everything else as machinery.
-const DECISION_KINDS = new Set(['check-in', 'done', 'answer', 'plan', 'allow']);
+// `plan` and `allow` are not on it: a plan-step mark and a permission grant are
+// bookkeeping about how the work runs, and neither one answers a readout.
+const DECISION_KINDS = new Set(['check-in', 'done', 'answer']);
 
-// `check-in (reviewer fable) → waiting`, `answer (agent)` and `done (reviewer)` are the
-// same decisions as their bare forms, so drop the parenthetical and the status suffix
-// before matching. `review (fable) answer` reduces to `review answer`, which is not on
-// the list: a reviewer sweep is still not a decision.
+// `check-in (reviewer fable) → waiting`, `answer (agent)`, `done (reviewer fable) → done`
+// and `needs met (by codex 01a04566-…)` are the same decisions as their bare forms, so
+// drop the parenthetical and the status suffix before matching. `review (fable) answer`
+// reduces to `review answer`, which is not on the list: a reviewer sweep is not a decision.
 function decisionKind(kind) {
   return String(kind || '')
     .replace(/\s*→.*$/, '')
@@ -981,6 +983,13 @@ function logCommits(repo) {
 // instead: every rule's first finding, then every rule's second, and so on. A rule with
 // two findings keeps both however loud the others are, and no rule is ever emptied by
 // its own name. The kept rows are put back in the sorted order, so readers see no change.
+//
+// Two consequences, both deliberate. The rounds ignore severity, so a `low` rule's first
+// row outranks a `med` rule's ninth — breadth is the point, and the ninth row of anything
+// is not the row that changes a morning. And a limit smaller than the number of firing
+// rules cannot give every rule a row, so it degrades to a prefix of the first rules in
+// the sorted order; that only happens on a single-rule run's limit of 10, where there is
+// one rule anyway.
 function fairShare(findings, limit) {
   if (findings.length <= limit) return findings;
   const order = new Map(findings.map((item, index) => [item, index]));

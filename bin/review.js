@@ -3154,17 +3154,22 @@ const TMP_SUBJECT_RE = /^(?:\/private)?\/(?:tmp|var\/folders)\//;
 // `<card>:<shape>` to key on and no kind to add without widening `other` to every piece
 // of judgment filed under it. Match the prose instead, and let lintCoverage do the rest:
 // the refusal still needs `experiment-undecided` on that same card.
-// Both halves must be present, in either order: a readout word and a phrase saying it
-// was never answered. Spanning the subject with `.*` between one word and the other
-// swept in real judgment — "the experiment defines no completion criteria" is a finding
-// about the card's design, not a restatement of the lint row.
+// All three must be present, in any order: the subject has to name an experiment, its
+// readout, and the decision that never came. Two of the three is not enough in either
+// direction — spanning the subject between "experiment" and an undecided phrase swept in
+// "the experiment defines no completion criteria", which is judgment about the card's
+// design; dropping the experiment word and leaning on "result" swept in "the deploy
+// result is still undecided", which is not about an experiment at all.
+const EXPERIMENT_SUBJECT_RE = /\b(?:experiments?|a\/b tests?|ab tests?|variants?)\b/i;
 const READOUT_SUBJECT_RE = /\b(?:read-?outs?|results?)\b/i;
-const UNANSWERED_SUBJECT_RE = /\b(?:undecided|unconcluded|not concluded|no (?:completion|decision)|awaiting (?:a )?decision|pending (?:a )?decision)\b/i;
+const UNANSWERED_SUBJECT_RE = /\b(?:undecided|unconcluded|not concluded|no (?:completion|decision|winner)|awaiting (?:a )?decision|pending (?:a )?decision)\b/i;
 const UNDECIDED_EXPERIMENT_SUBJECT_RE = /^(?:undecided|unconcluded) experiments?$/i;
 
 function isUndecidedExperimentSubject(subject) {
   if (UNDECIDED_EXPERIMENT_SUBJECT_RE.test(subject)) return true;
-  return READOUT_SUBJECT_RE.test(subject) && UNANSWERED_SUBJECT_RE.test(subject);
+  return EXPERIMENT_SUBJECT_RE.test(subject)
+    && READOUT_SUBJECT_RE.test(subject)
+    && UNANSWERED_SUBJECT_RE.test(subject);
 }
 
 // `other` is for judgment that fits no kind. These five shapes are the mechanical

@@ -381,6 +381,15 @@ test('experiment-undecided names an aged readout nobody answered', () => {
     writeCard(root, 'reviewer-answered', experiment,
       `## ${stamp(3)} — check-in (reviewer fable)\nOwner picked variant B in Slack; recorded here.\n\n` + readout(20));
     writeCard(root, 'needed', experiment, `## ${stamp(3)} — needs Owner\nWhich variant?\n\n` + readout(20));
+    writeCard(root, 'closed-out', experiment, `## ${stamp(3)} — done\nReverted the whole thing.\n\n` + readout(20));
+    writeCard(root, 'answered', experiment, `## ${stamp(3)} — answer\nVariant B, hardcode it.\n\n` + readout(20));
+    writeCard(root, 'reviewer-closed', experiment,
+      `## ${stamp(3)} — done (reviewer fable) → done\nClosed on Owner's call.\n\n` + readout(20));
+    writeCard(root, 'need-met', experiment,
+      `## ${stamp(3)} — needs met (by codex 01a04566-8f2b-4c11-9a3e-77d0c1e2b4aa)\nOwner answered.\n\n` + readout(20));
+    // A plan-step mark and a permission grant are bookkeeping, not an answer.
+    writeCard(root, 'planned', experiment, `## ${stamp(3)} — plan\nStep 2 marked done.\n\n` + readout(19));
+    writeCard(root, 'allowed', experiment, `## ${stamp(3)} — allow\nGranted push until +7d.\n\n` + readout(19));
     writeCard(root, 'fresh', experiment, automatic(1) + readout(5));
     writeCard(root, 'a-task', { kind: 'task', status: 'review' }, readout(20));
     writeCard(root, 'still-active', { kind: 'experiment', status: 'active' }, readout(20));
@@ -395,7 +404,7 @@ test('experiment-undecided names an aged readout nobody answered', () => {
 
     const findings = lint({ root, rule: 'experiment-undecided', now }).findings;
     assert.deepEqual(findings.map((item) => item.id),
-      ['aged', 'bare-readout', 'on-the-boundary', 'waiting-readout']);
+      ['aged', 'allowed', 'bare-readout', 'on-the-boundary', 'planned', 'waiting-readout']);
     const aged = findings.find((item) => item.id === 'aged');
     assert.equal(aged.severity, 'med');
     assert.equal(aged.text, `readout landed ${stamp(20)}, 20d ago; no keep/revert decision recorded`);
@@ -405,9 +414,11 @@ test('experiment-undecided names an aged readout nobody answered', () => {
     assert.match(findings.find((item) => item.id === 'on-the-boundary').text, /14d ago/);
 
     // The window is Owner's to move; 0 and nonsense keep the default.
-    for (const [value, expected] of [['3', ['aged', 'bare-readout', 'fresh', 'on-the-boundary', 'waiting-readout']],
-      ['0', ['aged', 'bare-readout', 'on-the-boundary', 'waiting-readout']],
-      ['soon', ['aged', 'bare-readout', 'on-the-boundary', 'waiting-readout']]]) {
+    const beyondWindow = ['aged', 'allowed', 'bare-readout', 'on-the-boundary', 'planned', 'waiting-readout'];
+    for (const [value, expected] of [
+      ['3', ['aged', 'allowed', 'bare-readout', 'fresh', 'on-the-boundary', 'planned', 'waiting-readout']],
+      ['0', beyondWindow],
+      ['soon', beyondWindow]]) {
       process.env.KEEP_LINT_EXPERIMENT_DECISION_DAYS = value;
       try {
         assert.deepEqual(lint({ root, rule: 'experiment-undecided', now }).findings.map((item) => item.id),
@@ -469,6 +480,16 @@ test('the total cap is filled fair-share, so no rule is evicted by its name', ()
   assert.deepEqual(kept.map((item) => order.get(item)), [...kept.map((item) => order.get(item))].sort((a, b) => a - b),
     'the kept rows come back in the order they were sorted into');
   assert.equal(fairShare(findings, 100), findings, 'under the cap, nothing is touched');
+
+  // Fewer slots than rules: nobody can have a row each, so it degrades to a prefix of
+  // the first rules in the sorted order rather than inventing a tie-break.
+  const narrow = fairShare(findings, 3);
+  assert.deepEqual(narrow.map((item) => item.id), ['a-rule-0', 'b-rule-0', 'c-rule-0']);
+
+  // The shape a single-rule run takes: one rule, limit 10, so the first ten rows.
+  const single = findings.filter((item) => item.rule === 'a-rule');
+  assert.deepEqual(fairShare(single, 10).map((item) => item.id),
+    Array.from({ length: 10 }, (_, index) => `a-rule-${index}`));
 });
 
 test('experiment-undecided is capped at eight so a batch cannot crowd the brief', () => {

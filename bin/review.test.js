@@ -2965,15 +2965,25 @@ test('the kind-to-rule table only covers a note lint actually answered for that 
     lint('experiment-undecided')), 'experiment-undecided');
   assert.equal(lintCoverage({ kind: 'other', subject: 'undecided experiments' },
     lint('experiment-undecided')), 'experiment-undecided');
-  // `other` is not widened: it takes both halves, a readout word and a phrase saying
-  // nobody answered it. These five are judgment about the experiment, not a restatement
-  // of the lint row, and each of them would have matched a subject-spanning pattern.
+  assert.equal(lintCoverage({ kind: 'other', subject: 'experiment readouts with no winner picked' },
+    lint('experiment-undecided')), 'experiment-undecided');
+  // `other` is not widened: the subject has to name all three of the experiment, its
+  // readout, and the decision that never came. Each of these would have been refused by
+  // one of the two looser patterns this replaced — the first five by spanning the subject
+  // from "experiment" to an undecided phrase, the last six by leaning on "result" alone —
+  // and every one of them is real judgment, not a restatement of the lint row.
   for (const subject of [
     'the experiment defines no completion criteria',
     'experiment scope creep in the readout work, not completed',
     'the rollout plan has no decision',
     'experiment results look healthy',
     'experiments are undecided about which framework to use',
+    'the deploy result is still undecided',
+    'the check result names no decision owner for the guardrail metric',
+    'test results are unconcluded because the Redash query timed out',
+    'the A/B results table has no decision column and the dashboard reads empty',
+    'results of the migration are undecided until the backfill finishes',
+    'the readout SQL is wrong: it counts bot installs, so any decision from it is no decision at all',
   ]) {
     assert.equal(lintCoverage({ kind: 'other', subject }, lint('experiment-undecided')), null, subject);
   }
