@@ -183,11 +183,21 @@ test('requested daemon restarts are not a restart loop; unrequested ones still a
   assert.deepEqual(health.attentionItems(value, now).filter((item) => item.id === 'health:daemon'), []);
 
   // A stale request does not cover a later crash, and crashes still count.
-  health.recordRestartRequest({ at: now - 19 * 60e3 });
+  health.recordRestartRequest({ at: now - 8 * 60e3 });
   for (const at of [now - 5 * 60e3, now - 4 * 60e3, now - 3 * 60e3, now - 2 * 60e3]) health.record('daemon', { at, pid: process.pid });
   value = health.snapshot(now);
   assert.deepEqual(health.unrequestedStarts(value.daemon, now - 3600e3), [now - 5 * 60e3, now - 4 * 60e3, now - 3 * 60e3, now - 2 * 60e3]);
   assert.match(health.attentionItems(value, now).find((item) => item.id === 'health:daemon').text, /4 starts in 1h/);
+
+  // Many deploys after the crashes do not evict them from the history.
+  for (let i = 0; i < 12; i++) {
+    const at = now - 60e3 + i * 1e3;
+    health.recordRestartRequest({ at: at - 500 });
+    health.record('daemon', { at, pid: process.pid });
+  }
+  value = health.snapshot(now + 60e3);
+  assert.equal(value.daemon.requestedStartAts.length, 10);
+  assert.deepEqual(health.unrequestedStarts(value.daemon, now - 3600e3), [now - 5 * 60e3, now - 4 * 60e3, now - 3 * 60e3, now - 2 * 60e3]);
 });
 
 test('reviewSection is compact for all-ok and diagnostic for failures', () => {

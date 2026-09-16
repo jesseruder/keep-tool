@@ -15,8 +15,9 @@ const HOUR_MS = 3600e3;
 const DAY_MS = 24 * HOUR_MS;
 const VERSION = 1;
 // How long after `keep restart-daemon` the next start still counts as the one
-// it asked for. launchd's KeepAlive relaunches within seconds.
-const RESTART_REQUEST_MS = 10 * 60e3;
+// it asked for. The marker is written just before exit and launchd's KeepAlive
+// relaunches within seconds, so a short window keeps it from covering a crash.
+const RESTART_REQUEST_MS = 2 * 60e3;
 let warnedWrite = false;
 
 // Schedulers that no longer exist. Their rows stay in health.json from older
@@ -77,7 +78,7 @@ function writeStore(value) {
   }
 }
 
-// Called by the daemon that is about to exit on `keep restart-daemon`.
+// Called by the daemon on `keep restart-daemon`, immediately before it exits.
 function recordRestartRequest(options = {}) {
   const at = atMs(options.at, Date.now());
   const store = readStore();
@@ -114,20 +115,23 @@ function record(name, options = {}) {
     const startedAts = Array.isArray(prior.startedAts) ? prior.startedAts.map(Number).filter(Number.isFinite) : [];
     if (Number.isFinite(Number(prior.startedAt)) && !startedAts.includes(Number(prior.startedAt))) startedAts.push(Number(prior.startedAt));
     if (!startedAts.includes(at)) startedAts.push(at);
-    const kept = startedAts.sort((a, b) => a - b).slice(-10);
     // A start the previous daemon asked for (a deploy's `keep restart-daemon`)
     // is not a crash, so the restart-loop check leaves it out.
     const requestedAt = Number(prior.restartRequestedAt);
     const requested = Number.isFinite(requestedAt) && requestedAt >= atMs(prior.startedAt) && requestedAt <= at && at - requestedAt <= RESTART_REQUEST_MS;
-    const requestedStartAts = (Array.isArray(prior.requestedStartAts) ? prior.requestedStartAts.map(Number) : [])
-      .concat(requested ? [at] : [])
-      .filter((value) => kept.includes(value));
+    const requestedSet = new Set((Array.isArray(prior.requestedStartAts) ? prior.requestedStartAts.map(Number) : [])
+      .filter((value) => startedAts.includes(value) && value !== at));
+    if (requested) requestedSet.add(at);
+    // Retain each kind separately so a run of deploys cannot push crashes out.
+    const sorted = startedAts.sort((a, b) => a - b);
+    const requestedKept = sorted.filter((value) => requestedSet.has(value)).slice(-10);
+    const unrequestedKept = sorted.filter((value) => !requestedSet.has(value)).slice(-10);
     store.daemon = {
       startedAt: at,
       pid: Number(options.pid || process.pid),
       version: options.version == null ? VERSION : options.version,
-      startedAts: kept,
-      requestedStartAts: [...new Set(requestedStartAts)],
+      startedAts: [...requestedKept, ...unrequestedKept].sort((a, b) => a - b),
+      requestedStartAts: requestedKept,
     };
     persist(store);
     return store.daemon;

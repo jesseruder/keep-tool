@@ -255,10 +255,11 @@ function routes(ctx) {
       handle: async ({ req, res, url, body }) => {
         try {
           const result = daemonRestartGate.prepare();
-          health.recordRestartRequest();
           // launchd KeepAlive starts the new daemon. The terminal host and
-          // its PTYs are separate processes and are not stopped here.
-          setTimeout(shutdown, 50);
+          // its PTYs are separate processes and are not stopped here. The
+          // request is marked right before exit so the new start is not read
+          // as a crash, and a daemon that dies before this point is.
+          setTimeout(() => { health.recordRestartRequest(); shutdown(); }, 50);
           return json(res, 200, result);
         } catch (error) { return json(res, 409, { error: error.message }); }
       },
