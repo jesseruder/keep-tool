@@ -351,6 +351,62 @@ test('check-no-result flags a card whose newest entry is a blank scheduled run',
   }
 });
 
+test('experiment-undecided names an aged readout nobody answered', () => {
+  const root = makeRoot();
+  const now = Date.parse('2026-09-16T12:00:00');
+  const stamp = (days) => localStamp(now - days * 86400e3).replace('T', ' ');
+  const readout = (days) => `## ${stamp(days)} — check result (agent) → review\nVariant B won by 4%.\n`;
+  // Everything the machinery writes by itself piles up after the readout and still
+  // leaves the decision unmade.
+  const automatic = (days) => `## ${stamp(days)} — review (fable sweep)\nSwept.\n\n`
+    + `## ${stamp(days)} — landed (daemon)\nLanded 3b08d08.\n\n`
+    + `## ${stamp(days)} — review outcome\nUnresolved.\n\n`
+    + `## ${stamp(days)} — agent run failed\nRun killed.\n\n`;
+  const experiment = { kind: 'experiment', status: 'review' };
+  try {
+    writeCard(root, 'aged', experiment, automatic(3) + readout(20));
+    writeCard(root, 'decided', experiment,
+      `## ${stamp(3)} — check-in\nKeeping variant B; hardcoding it now.\n\n` + automatic(4) + readout(20));
+    writeCard(root, 'noted', experiment, `## ${stamp(3)} — note\nStill thinking.\n\n` + readout(20));
+    writeCard(root, 'fresh', experiment, automatic(1) + readout(5));
+    writeCard(root, 'a-task', { kind: 'task', status: 'review' }, readout(20));
+    writeCard(root, 'still-active', { kind: 'experiment', status: 'active' }, readout(20));
+    writeCard(root, 'finished', { kind: 'experiment', status: 'done' }, readout(20));
+    // No readout at all is check-no-result / review-no-next territory, not this rule's.
+    writeCard(root, 'no-readout', experiment, `## ${stamp(20)} — check-in\nRunning.\n`);
+
+    const findings = lint({ root, rule: 'experiment-undecided', now }).findings;
+    assert.deepEqual(findings.map((item) => item.id), ['aged']);
+    assert.equal(findings[0].severity, 'med');
+    assert.equal(findings[0].text, `readout landed ${stamp(20)}, 20d ago; no keep/revert decision recorded`);
+    assert.equal(findings[0].fix,
+      'keep checkin aged -m "keep <variant>: hardcode and complete the experiment" --next "..."'
+      + '  |  keep checkin aged --status done -m "revert: <why>"');
+
+    // The window is Owner's to move.
+    process.env.KEEP_LINT_EXPERIMENT_DECISION_DAYS = '3';
+    try {
+      assert.deepEqual(lint({ root, rule: 'experiment-undecided', now }).findings.map((item) => item.id),
+        ['aged', 'fresh'], 'a shorter window catches the five-day-old readout too');
+    } finally { delete process.env.KEEP_LINT_EXPERIMENT_DECISION_DAYS; }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('experiment-undecided is capped at eight so a batch cannot crowd the brief', () => {
+  const root = makeRoot();
+  const now = Date.parse('2026-09-16T12:00:00');
+  const stamp = localStamp(now - 20 * 86400e3).replace('T', ' ');
+  try {
+    for (let index = 0; index < 12; index += 1) {
+      writeCard(root, `experiment-${index}`, { kind: 'experiment', status: 'review' },
+        `## ${stamp} — check result (agent) → review\nReadout.\n`);
+    }
+    const result = lint({ root, now });
+    assert.equal(result.findings.filter((item) => item.rule === 'experiment-undecided').length, 8);
+    assert.equal(result.byRule['experiment-undecided'], 12, 'the count still reports everything it found');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('tmp-artifact flags /tmp citations in recipes and recent check-ins', () => {
   const root = makeRoot();
   const now = Date.parse('2026-09-10T12:00:00');

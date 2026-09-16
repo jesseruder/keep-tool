@@ -29,6 +29,7 @@ const RULE_NAMES = [
   'missing-scope',
   'duplicate-title',
   'check-no-result',
+  'experiment-undecided',
   'deploy-provenance',
   'tmp-artifact',
   'handoff-shadow',
@@ -47,7 +48,12 @@ const OPEN_STATUSES = ['active', 'review', 'landing', 'blocked', 'waiting'];
 // Every open card can trip the three status/project rules at once, and ten each would
 // be thirty of the forty slots - the bookkeeping rules crowding out the ones that
 // found something specific. Five each, and a little more room overall.
-const RULE_CAPS = { 'missing-project': 5, 'landing-uncited': 5, 'blocked-no-need': 5 };
+// `experiment-undecided` gets eight: a season's worth of growth experiments can age
+// past the window together, and a batch of them must not crowd out the rules that
+// found something specific to one card.
+const RULE_CAPS = {
+  'missing-project': 5, 'landing-uncited': 5, 'blocked-no-need': 5, 'experiment-undecided': 8,
+};
 const TOTAL_CAP = 60;
 const SEVERITY_ORDER = { med: 0, low: 1 };
 
@@ -437,6 +443,46 @@ function checkNoResult(task, _ctx) {
     'check-no-result', task, 'med',
     `scheduled run on ${entry.stamp} produced no result; the card still shows its prior state`,
     `keep verify ${task.id} (or keep checkin ${task.id} -m "..." with the readout)`,
+  )];
+}
+
+// A growth experiment whose readout landed and then sat there. Owner picks the winner
+// — the reviewer's 2026-09-10 audit settled that — so the rule closes nothing and
+// changes nothing; it turns an aged readout into one question with both answers in the
+// hint. The fleet reviewer had been re-deriving exactly this from a model call in every
+// sweep since 2026-09-04 (finding eb8d39c45ba367a4).
+const READOUT_KIND_RE = /^check result \(agent\)(?:\s|$)/;
+// Entries the machinery writes for itself; none of them is anybody deciding. The
+// `review (fable…)` and `review (fable sweep)` headings never reach here at all —
+// review.stampedLogEntries drops every reviewer heading before returning. The run-log
+// kinds mirror review.js's own `isRunLogEntry` (bin/review.js, ~line 1030), which that
+// module does not export; the rest are the daemon's and lint's own bookkeeping.
+const AUTOMATIC_KIND_RE = /^(?:check result \(agent\)|agent run \([^)]*\)|agent run failed|delivery warning|landed \(daemon\)|review outcome|lint)(?:\s|$)/;
+
+// Thresholds that Owner may want to move without an edit, read per run so a test can
+// set them. Anything unparseable or non-positive falls back to the default.
+function envDays(name, fallback) {
+  const value = parseInt(process.env[name] || '', 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function experimentUndecided(task, ctx) {
+  if (task.fm.kind !== 'experiment' || task.fm.status !== 'review') return [];
+  const entries = review.stampedLogEntries(task.body).sort((a, b) => b.stamp.localeCompare(a.stamp));
+  const readout = entries.find((entry) => READOUT_KIND_RE.test(entry.kind));
+  if (!readout) return [];
+  const at = atMs(readout.stamp.replace(' ', 'T'));
+  if (!Number.isFinite(at)) return [];
+  const age = ctx.now - at;
+  if (age < envDays('KEEP_LINT_EXPERIMENT_DECISION_DAYS', 14) * DAY_MS) return [];
+  // A check-in by anyone, a note, a status change, a need: all of them are somebody
+  // answering the readout, and any one of them is enough.
+  if (entries.some((entry) => entry.stamp > readout.stamp && !AUTOMATIC_KIND_RE.test(entry.kind))) return [];
+  return [finding(
+    'experiment-undecided', task, 'med',
+    `readout landed ${readout.stamp}, ${Math.floor(age / DAY_MS)}d ago; no keep/revert decision recorded`,
+    `keep checkin ${task.id} -m "keep <variant>: hardcode and complete the experiment" --next "..."`
+    + `  |  keep checkin ${task.id} --status done -m "revert: <why>"`,
   )];
 }
 
@@ -839,6 +885,7 @@ const RULES = {
   'missing-scope': missingScope,
   'duplicate-title': duplicateTitle,
   'check-no-result': checkNoResult,
+  'experiment-undecided': experimentUndecided,
   'deploy-provenance': deployProvenance,
   'tmp-artifact': tmpArtifact,
   'handoff-shadow': handoffShadow,

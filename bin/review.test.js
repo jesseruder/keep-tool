@@ -2958,6 +2958,17 @@ test('the kind-to-rule table only covers a note lint actually answered for that 
   assert.equal(lintCoverage({ kind: 'other', subject: 'release-x:closing-checkin' }, lint('stale-active')), 'stale-active');
   assert.equal(lintCoverage({ kind: 'other', subject: '81aee6c' }, lint('uncited-commits')), 'uncited-commits');
   assert.equal(lintCoverage({ kind: 'other', subject: '/tmp/keep-force-restart/restart.cjs' }, lint('tmp-artifact')), 'tmp-artifact');
+  // The undecided-experiment sweep the reviewer re-derived every tick, verbatim.
+  assert.equal(lintCoverage({ kind: 'other', subject: 'growth experiments in review with readouts and no completion' },
+    lint('experiment-undecided')), 'experiment-undecided');
+  assert.equal(lintCoverage({ kind: 'other', subject: 'Experiment readout is still undecided' },
+    lint('experiment-undecided')), 'experiment-undecided');
+  // `other` itself is not widened: prose about anything else is still judgment, and
+  // the prose alone is not enough — lint must have said it about this very card.
+  assert.equal(lintCoverage({ kind: 'other', subject: 'the rollout plan has no decision' },
+    lint('experiment-undecided')), null);
+  assert.equal(lintCoverage({ kind: 'other', subject: 'growth experiments in review with readouts and no completion' },
+    lint('missing-project')), null);
 
   // Judgment is never covered, and neither is a covered kind lint stayed quiet about.
   assert.equal(lintCoverage({ kind: 'scope-creep', subject: 'bin/serve.js' }, lint('daemon-health')), null);

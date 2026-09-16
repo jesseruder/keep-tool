@@ -3150,8 +3150,13 @@ const LINT_COVERED_KINDS = {
 };
 const BARE_SHA_SUBJECT_RE = /^[0-9a-f]{7,40}$/i;
 const TMP_SUBJECT_RE = /^(?:\/private)?\/(?:tmp|var\/folders)\//;
+// An aged experiment readout arrives as `other` with a prose subject, so there is no
+// `<card>:<shape>` to key on and no kind to add without widening `other` to every piece
+// of judgment filed under it. Match the prose instead, and let lintCoverage do the rest:
+// the refusal still needs `experiment-undecided` on that same card.
+const UNDECIDED_EXPERIMENT_SUBJECT_RE = /\bexperiments?\b[\s\S]*\b(?:undecided|unconcluded|not concluded|no completion|not completed|no decision|no winner|awaiting (?:a )?decision|pending (?:a )?decision)\b/i;
 
-// `other` is for judgment that fits no kind. These four shapes are the mechanical
+// `other` is for judgment that fits no kind. These five shapes are the mechanical
 // ones the reviewer kept filing under it.
 function lintCoveringRules(note) {
   const kind = String((note && note.kind) || '');
@@ -3162,6 +3167,7 @@ function lintCoveringRules(note) {
   if (/:closing-checkin$/.test(subject)) return ['stale-active', 'review-no-next', 'check-no-result'];
   if (BARE_SHA_SUBJECT_RE.test(subject)) return ['uncited-commits', 'deploy-provenance'];
   if (TMP_SUBJECT_RE.test(subject)) return ['tmp-artifact'];
+  if (UNDECIDED_EXPERIMENT_SUBJECT_RE.test(subject)) return ['experiment-undecided'];
   return [];
 }
 

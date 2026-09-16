@@ -272,7 +272,11 @@ open card: a dirty tree or a branch ahead of/behind its upstream, from local ref
 fetch), `step-run-pending` (a gated step with landed commits its last run missed for over
 24h), `note-expired` (a state note past its window that nobody extended or cleared,
 filed under `note:<id>`), `resource-bad-matcher` (a declared resource whose regex does
-not compile or whose glob is empty, filed under `resource:<project>:<name>`), and
+not compile or whose glob is empty, filed under `resource:<project>:<name>`),
+`experiment-undecided` (a `kind: experiment` card in `review` whose newest
+`check result (agent)` readout is older than `KEEP_LINT_EXPERIMENT_DECISION_DAYS`
+(default 14) with nothing but automatic entries after it — the rule asks the question
+and never closes or changes the card, because the keep-or-revert call is Owner's), and
 `handoff-shadow` cards — a Codex worker's
 card older than six hours with no check-ins, opened instead of checking in on the card
 its parent Claude session held. It always exits successfully when findings exist, writes the latest
@@ -292,8 +296,9 @@ a linked session is gone. Reviewer bundle headers include bounded, card-specific
 lint findings as advisory evidence — up to ten rows, each naming its rule. Lint owns
 those classes outright: `review-land` refuses a note whose kind is
 `wrong-status`, `stale-checkin`, `daemon-health`, `env-hygiene`, `deploy-provenance` or
-`step-pending` (or `other` with a `:no-project` / `:closing-checkin` subject, a bare sha
-or a `/tmp` path) when a lint finding from a rule that covers it is already on record —
+`step-pending` (or `other` with a `:no-project` / `:closing-checkin` subject, a bare sha,
+a `/tmp` path, or prose about experiments left undecided) when a lint finding from a rule
+that covers it is already on record —
 matched on the same card, or fleet-wide for the rules that answer for the registry
 (`daemon-health`, `checkout-drift`, `step-run-pending`, which file under `daemon:<name>`,
 `repo:<project>` and `step:<project>:<step>`). Nothing is refused on a `.keep/lint.json`
@@ -303,7 +308,7 @@ snapshot is too old to refuse against, the bundle's `KEEP_LINT_FINDINGS` header 
 rather than claiming a refusal that will not happen. The refusal
 names the rule and is per item: the rest of the tick still lands.
 `missing-project`, `landing-uncited` and `blocked-no-need` are capped at five findings
-each so bookkeeping cannot crowd the 60-finding total.
+each, and `experiment-undecided` at eight, so bookkeeping cannot crowd the 60-finding total.
 
 `keep turns` reads the turn index, a SQLite summary of Claude Code and Codex CLI
 transcripts kept in `.keep/turns.sqlite`. Stop hooks and the daemon feed it
