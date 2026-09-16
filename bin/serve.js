@@ -69,6 +69,7 @@ const {
 const { createDashboardWorker } = require('./dashboard-worker');
 const { createDashboardPublisher } = require('./dashboard-publisher');
 const { createUiRequestWorker } = require('./ui-request-worker');
+const { routes: buildRequestRoutes, matchRoute } = require('./serve/routes.js');
 const execFileAsync = promisify(execFile);
 const ATTENTION_KINDS = new Set(['question', 'plan', 'permission', 'complete', 'input', 'review', 'blocked', 'overdue', 'unblocked', 'health', 'stalled']);
 const CODEX_DIALOG_MARKERS = [
@@ -7726,6 +7727,29 @@ function start(deps = {}) {
     } catch (error) { process.stderr.write(`keep jobs: ${error.message}\n`); }
   };
   setInterval(jobTick, 500).unref();
+  // Everything the daemon's request ladder needs from this module and from
+  // start()'s own scope. bin/serve/routes.js takes this instead of requiring
+  // serve.js, which would be a cycle. Bindings start() has not made yet, and the
+  // module-level hooks it rebinds, are getters so they are read live.
+  const ctx = {
+    ATTENTION_KINDS, InjectionError, MOBILE_VIEWS, TAG_INSTRUCTION, TASK_INSTRUCTION, WEB_ROOT,
+    abandonAccountHandoff, accounts, announceStateNote, answerSession, attentionAckKey, attentionAckName,
+    buildState, closeIdleSession, codex, compactSessionById, companionSnapshot, compactState,
+    daemonRestartGate, dashboardDetail, fs, handoffSession, health, hostRequest, inspectReviewQueueLaunch,
+    keep, launchReviewQueueSession, lightweightState, listHostPanes, listPortableTransfers, notifications,
+    openSession, path, portableTransferDraft, portableTransferPreview, preparePortableTransfer,
+    prepareSessionSummary, projectMobileState, recentTranscriptText, recoverReviewQueueLaunch, reminders,
+    reopenSessionOnAccount, resolvePortableTransfer, resolveReviewLaunchSelection, restorePlan, review,
+    reviewDeps, reviewQueue, reviewQueueSearch, runCheckNow, runTaskNow, screenHistorySession, screenSession,
+    sendSessionKeys, sendStateJson, sendToSessionLocked, sessionSummaryFile, setAsideCandidates, summarize,
+    transferSession, updateSetAside, wantsCompactState, wantsLightweightState, withInjectionLock,
+    writeToShellPane,
+    broadcast, dashboardBuild, dashboardBuilder, deps, shutdown, terminalProfile,
+    get json() { return json; },
+    get restarts() { return restarts; },
+    get onChange() { return onChange; },
+    get onFocus() { return onFocus; },
+  };
 
   runs.setOnChange(broadcast);
   runs.setDeliverer(deliverCheckToThread);
@@ -8160,6 +8184,8 @@ function start(deps = {}) {
   }
   const isLocal = (addr) => addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
 
+  const requestRoutes = buildRequestRoutes(ctx);
+
   const server = http.createServer(async (req, res) => {
     if (req.keepConsoleHandled) return;
     try {
@@ -8168,458 +8194,14 @@ function start(deps = {}) {
       const authError = apiRequestAuthError(req, { isLocal, token, internalToken: backendToken });
       if (authError) return json(res, authError.status, { error: authError.error });
 
-      if (req.method === 'GET' && url.pathname === '/api/terminal-profile') {
-        try {
-          return json(res, 200, terminalProfile.view(
-            url.searchParams.get('pane'), url.searchParams.get('runtime'),
-          ));
-        } catch (error) {
-          return json(res, error.status || 500, { error: error.message });
-        }
-      }
-
-      if (req.method === 'GET' && url.pathname === '/api/ui-debug') {
-        return json(res, 200, { events: require('./ui-debug').read() });
-      }
-      if (req.method === 'GET' && url.pathname === '/api/session-debug') {
-        return json(res, 200, { events: require('./session-debug').read(url.searchParams.get('session')) });
-      }
-
-      if (req.method === 'GET' && url.pathname === '/api/accounts') {
-        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
-        try {
-          return json(res, 200, { ok: true, ...accounts.publicState(), handoffs: require('./account-handoff').list(keep.ROOT) });
-        } catch (error) { return json(res, 500, { error: error.message }); }
-      }
-
-      if (req.method === 'GET' && url.pathname === '/api/portable-transfers') {
-        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
-        try { return json(res, 200, { ok: true, transfers: listPortableTransfers() }); }
-        catch (error) { return json(res, error.status || 500, { error: error.message }); }
-      }
-
-      if (req.method === 'GET' && url.pathname === '/api/dashboard-detail') {
-        const state = dashboardBuilder.latest();
-        if (!state) return json(res, 503, { error: 'dashboard state is still loading' });
-        try { return json(res, 200, dashboardDetail(state, url.searchParams.get('kind'), url.searchParams.get('id'))); }
-        catch (error) { return json(res, error.status === 400 || error.status === 404 ? error.status : 500, { error: error.message }); }
-      }
-
-      if (req.method === 'GET' && url.pathname === '/api/dashboard-review-search') {
-        const state = dashboardBuilder.latest();
-        if (!state) return json(res, 503, { error: 'dashboard state is still loading' });
-        try { return json(res, 200, reviewQueueSearch(state, url.searchParams.get('q') || '')); }
-        catch (error) { return json(res, error.status === 400 || error.status === 404 ? error.status : 500, { error: error.message }); }
-      }
-
-      if (req.method === 'GET' && url.pathname === '/api/portable-transfer-draft') {
-        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
-        try { return json(res, 200, await portableTransferDraft(url.searchParams)); }
-        catch (error) { return json(res, error.status || 500, { error: error.message }); }
-      }
-
-      if (req.method === 'GET' && url.pathname === '/api/portable-transfer-preview') {
-        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
-        try { return json(res, 200, portableTransferPreview(url.searchParams)); }
-        catch (error) { return json(res, error.status || 500, { error: error.message }); }
-      }
-
-      if (req.method === 'GET' && url.pathname === '/api/restore-plan') {
-        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
-        try { return json(res, 200, await restorePlan(url.searchParams)); }
-        catch (error) {
-          if (error instanceof InjectionError) return json(res, error.status, { error: error.message, ...error.extra });
-          throw error;
-        }
-      }
-
-      if (req.method === 'GET' && url.pathname === '/api/tasksummary') {
-        let task;
-        try { task = keep.loadTask(url.searchParams.get('id') || ''); }
-        catch (e) {
-          if (e instanceof keep.KeepError) return json(res, 400, { error: e.message });
-          throw e;
-        }
-        if ((task.body.match(/^## /gm) || []).length < 3) return json(res, 200, { text: null, tooShort: true });
-        const result = summarize.getSummary(`task-${task.id}`, task.body, TASK_INSTRUCTION, onChange);
-        return json(res, 200, { text: result.text, fresh: result.fresh });
-      }
-
-      if (req.method === 'GET' && url.pathname === '/api/sessionsummary') {
-        const id = url.searchParams.get('id') || '';
-        if (!/^[A-Za-z0-9_-]+$/.test(id)) return json(res, 400, { error: 'bad session id' });
-        const current = dashboardBuilder.latest();
-        if (!current) return json(res, 503, { error: 'dashboard state is still loading' });
-        const session = current.sessions?.find((s) => s.id === id);
-        const file = sessionSummaryFile(session, { publishedOnly: true });
-        if (!session || !file) return json(res, 404, { error: 'no session' });
-        // The dashboard snapshot identifies the session; the transcript itself is
-        // still read now, so summary input includes bytes written after that scan.
-        let result;
-        try { result = prepareSessionSummary(session, { priority: -1 }, { file }); }
-        catch (error) {
-          if (error.code === 'ENOENT') return json(res, 404, { error: 'no session' });
-          throw error;
-        }
-        return json(res, 200, { text: result.text, fresh: result.fresh });
-      }
-
-      // Shadow decisions the watcher recorded and Owner has not graded yet. The
-      // state payload already carries the newest one per session; this is for the
-      // edit flow and for refreshing after a grade.
-      if (req.method === 'GET' && url.pathname === '/api/decisions') {
-        const session = url.searchParams.get('session') || '';
-        if (!/^[A-Za-z0-9_-]+$/.test(session)) return json(res, 400, { error: 'bad session id' });
-        if (url.searchParams.get('pending') !== '1') return json(res, 400, { error: 'only pending=1 is supported' });
-        return json(res, 200, {
-          decisions: require('./turn-watcher.js').pendingDecisionsForSession(session),
-        });
-      }
-
-      if (req.method === 'GET' && url.pathname === '/api/sessiontail') {
-        const id = url.searchParams.get('id') || '';
-        if (!/^[A-Za-z0-9-]+$/.test(id)) return json(res, 400, { error: 'bad session id' });
-        const current = dashboardBuilder.latest();
-        if (!current) return json(res, 503, { error: 'dashboard state is still loading' });
-        const session = current.sessions?.find((s) => s.id === id);
-        const file = sessionSummaryFile(session, { publishedOnly: true });
-        if (!session || !file) return json(res, 404, { error: 'no session' });
-        let text;
-        try { text = session.kind === 'codex' ? codex.recentText(file) : recentTranscriptText(file); }
-        catch (error) {
-          if (error.code === 'ENOENT') return json(res, 404, { error: 'no session' });
-          throw error;
-        }
-        return json(res, 200, { text });
-      }
-
-      if (req.method === 'GET' && url.pathname === '/api/screen') {
-        // The header forces a CORS preflight, so a hostile page cannot even trigger the read.
-        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
-        try { return json(res, 200, await screenSession(url.searchParams)); }
-        catch (error) {
-          if (error instanceof InjectionError) return json(res, error.status, { error: error.message });
-          throw error;
-        }
-      }
-
-      if (req.method === 'GET' && url.pathname === '/api/screen/history') {
-        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
-        try { return json(res, 200, await screenHistorySession(url.searchParams)); }
-        catch (error) {
-          if (error instanceof InjectionError) return json(res, error.status, { error: error.message });
-          throw error;
-        }
-      }
-
-      if (req.method === 'GET' && url.pathname === '/api/tagsummary') {
-        const tag = url.searchParams.get('tag') || '';
-        if (!/^[a-z0-9-]+$/.test(tag)) return json(res, 400, { error: 'bad tag' });
-        const tasks = keep.loadAll(false)
-          .filter((t) => (t.fm.tags || []).includes(tag))
-          .sort((a, b) => a.id.localeCompare(b.id));
-        if (tasks.length < 2) return json(res, 200, { text: null, tooFew: true });
-        const input = tasks.map((t) => `- ${t.fm.title} [${t.fm.status}]: ${keep.lastLogLine(t)}`).join('\n');
-        const result = summarize.getSummary(`tag-${tag}`, input, TAG_INSTRUCTION, onChange);
-        return json(res, 200, { text: result.text, fresh: result.fresh });
-      }
-
       if (req.method === 'POST') {
         // custom header forces a CORS preflight, which no other origin passes —
         // keeps random web pages from firing POSTs at localhost
         let body;
         try { body = await readBody(req); } catch (e) { return json(res, 400, { error: e.message }); }
         try {
-          if (url.pathname === '/api/terminal-profile') {
-            try { return json(res, 200, terminalProfile.act(body)); }
-            catch (error) { return json(res, error.status || 500, { error: error.message }); }
-          }
-          if (url.pathname === '/api/restart-daemon') {
-            try {
-              const result = daemonRestartGate.prepare();
-              // launchd KeepAlive starts the new daemon. The terminal host and
-              // its PTYs are separate processes and are not stopped here.
-              setTimeout(shutdown, 50);
-              return json(res, 200, result);
-            } catch (error) { return json(res, 409, { error: error.message }); }
-          }
-          if (url.pathname === '/api/notifications') {
-            let result;
-            try { result = notifications.update(keep.ROOT, body); }
-            catch (error) { return json(res, 400, { error: error.message }); }
-            broadcast();
-            return json(res, 200, result);
-          }
-          if (url.pathname === '/api/reminders') {
-            let result;
-            try { result = reminders.update(body); }
-            catch (error) { return json(res, 400, { error: error.message }); }
-            broadcast();
-            return json(res, 200, result);
-          }
-          if (url.pathname === '/api/review-queue') {
-            try {
-              const result = await reviewQueue.act(body, {
-                resolveLaunchSelection: (selection) => resolveReviewLaunchSelection(selection),
-                launch: (request) => launchReviewQueueSession(request),
-                inspectLaunch: (active) => inspectReviewQueueLaunch(active),
-                recoverLaunch: (active, hooks) => recoverReviewQueueLaunch(active, hooks),
-              });
-              broadcast();
-              return json(res, 200, result);
-            } catch (error) {
-              if (error instanceof reviewQueue.QueueError) {
-                return json(res, error.status, { error: error.message, ...error.extra });
-              }
-              return json(res, 502, { error: String(error && error.message || error).slice(0, 500) });
-            }
-          }
-          if (url.pathname === '/api/reopen-session') {
-            try {
-              const result = await reopenSessionOnAccount(body);
-              broadcast();
-              return json(res, 200, result);
-            } catch (error) {
-              if (error instanceof InjectionError) return json(res, error.status, { error: error.message, ...error.extra });
-              return json(res, Number(error.status) || 502, { error: String(error && error.message || error).slice(0, 500), ...error.extra });
-            }
-          }
-          if (url.pathname === '/api/add') {
-            const task = keep.addTask({
-              title: body.title, kind: body.kind, tags: body.tags, project: body.project,
-              checkAfter: body.checkAfter, check: body.check, status: body.status, note: body.note,
-              experimentId: body.experimentId,
-            });
-            return json(res, 200, { ok: true, id: task.id });
-          }
-          // Owner grading a shadow verdict from the console. decisions.judge
-          // takes the registry lock, exactly as `keep decisions` does, so the
-          // console and the CLI cannot both write the ledger at once.
-          if (url.pathname === '/api/decisions/judge') {
-            const watcher = require('./turn-watcher.js');
-            const decisions = require('./decisions.js');
-            if (!body || typeof body.id !== 'string' || !body.id) return json(res, 400, { error: 'a decision id is required' });
-            if (!decisions.VERDICTS.includes(body.verdict)) {
-              return json(res, 400, { error: `verdict must be one of: ${decisions.VERDICTS.join(', ')}` });
-            }
-            // The ledger's reason is read back by the reviewer; an object coerced to
-            // "[object Object]" would corrupt it, so only a real string gets through.
-            if (body.message !== undefined && typeof body.message !== 'string') {
-              return json(res, 400, { error: 'message must be a string' });
-            }
-            if (body.verdict !== 'agree' && !(typeof body.message === 'string' && body.message.trim())) {
-              return json(res, 400, { error: `${body.verdict} needs a non-empty message` });
-            }
-            try {
-              const result = watcher.judgeDecision(body.id, body.verdict, body.message);
-              broadcast();
-              return json(res, 200, { ok: true, id: result.entry.id, type: result.entry.type,
-                verdict: result.entry.verdict, stats: result.stats, totals: result.totals });
-            } catch (error) {
-              if (error instanceof decisions.DecisionError) return json(res, 400, { error: error.message });
-              throw error;
-            }
-          }
-          if (url.pathname === '/api/notes/announce') {
-            if (!body || typeof body.id !== 'string' || !/^note-[a-z0-9]+$/.test(body.id)) {
-              return json(res, 400, { error: 'a state note id is required' });
-            }
-            const result = await announceStateNote(body.id);
-            if (result.duplicate) return json(res, 409, result);
-            if (result.error) return json(res, 404, result);
-            broadcast();
-            return json(res, 200, result);
-          }
-          if (url.pathname === '/api/checkin') {
-            keep.checkinTask(body.id, {
-              message: body.message, status: body.status,
-              checkAfter: body.checkAfter, clearCheckAfter: body.clearCheckAfter,
-              experimentId: body.experimentId,
-            });
-            broadcast();
-            return json(res, 200, { ok: true });
-          }
-          if (url.pathname === '/api/ack') {
-            const hasSessionId = Object.prototype.hasOwnProperty.call(body, 'sessionId');
-            const hasTaskId = Object.prototype.hasOwnProperty.call(body, 'taskId');
-            const isHealth = body.kind === 'health' && typeof body.id === 'string' && /^health:[A-Za-z0-9._-]+$/.test(body.id);
-            const isStalled = body.kind === 'stalled' && typeof body.id === 'string' && /^stalled:[A-Za-z0-9._:-]+$/.test(body.id);
-            const validId = /^[A-Za-z0-9._-]+$/;
-            if (!ATTENTION_KINDS.has(body.kind) || (isHealth ? hasSessionId || hasTaskId : isStalled ? hasSessionId && hasTaskId : hasSessionId === hasTaskId) ||
-                (hasSessionId && (typeof body.sessionId !== 'string' || !validId.test(body.sessionId))) ||
-                (hasTaskId && (typeof body.taskId !== 'string' || !validId.test(body.taskId))) ||
-                !['number', 'string'].includes(typeof body.since)) {
-              return json(res, 400, { error: 'bad attention acknowledgement' });
-            }
-            let ackItem = body;
-            if (isHealth) {
-              const current = health.attentionItems(health.snapshot()).find((item) => item.id === body.id);
-              if (!current) return json(res, 400, { error: 'health alert is no longer current' });
-              ackItem = { ...body, errorText: current.lastError || '', incidentId: current.incidentId || null };
-            }
-            const key = attentionAckKey(ackItem);
-            const ackDir = path.join(keep.ROOT, '.keep', 'acks');
-            try {
-              fs.mkdirSync(ackDir, { recursive: true });
-              fs.writeFileSync(path.join(ackDir, attentionAckName(key)), JSON.stringify({ key, at: Date.now() }) + '\n');
-            } catch (e) {
-              process.stderr.write(`keep serve: acknowledgement failed: ${e.message}\n`);
-              return json(res, 500, { error: 'could not save acknowledgement' });
-            }
-            try {
-              const cutoff = Date.now() - 14 * 864e5;
-              for (const name of fs.readdirSync(ackDir)) {
-                try {
-                  const file = path.join(ackDir, name);
-                  if (fs.statSync(file).mtimeMs < cutoff) fs.unlinkSync(file);
-                } catch {}
-              }
-            } catch {}
-            broadcast();
-            return json(res, 200, { ok: true });
-          }
-          if (url.pathname === '/api/setaside') {
-            try {
-              const panes = await listHostPanes(deps);
-              const state = buildState({ hostPanes: panes });
-              const entry = updateSetAside(body, setAsideCandidates(state.attention, state.sessions));
-              broadcast();
-              return json(res, 200, { ok: true, entry });
-            } catch (error) {
-              if (error instanceof InjectionError) return json(res, error.status, { error: error.message });
-              throw error;
-            }
-          }
-          if (url.pathname === '/api/ui-debug') {
-            try { require('./ui-debug').record(body.events); return json(res, 200, { ok: true }); }
-            catch (error) { return json(res, 400, { error: error.message }); }
-          }
-          if (url.pathname === '/api/run') {
-            try {
-              const result = body.kind === 'check' ? await runCheckNow(body.id) : await runTaskNow(body.id, body.prompt);
-              broadcast();
-              return json(res, 200, result);
-            } catch (e) {
-              if (e instanceof InjectionError) return json(res, e.status, { error: e.message, ...e.extra });
-              if (e instanceof keep.KeepError) return json(res, 400, { error: e.message });
-              return json(res, 502, { error: String(e && e.message || e).slice(0, 500) });
-            }
-          }
-          if (url.pathname === '/api/focus') {
-            const sessionId = String(body && body.sessionId || '');
-            if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) return json(res, 400, { error: 'bad session id' });
-            onFocus(sessionId);
-            return json(res, 200, { ok: true, focus: 'console', sessionId });
-          }
-          // A shell pane has no session to lock against and no agent to interrupt.
-          if (url.pathname === '/api/send' && body && body.pane && !body.sessionId) {
-            try { return json(res, 200, await writeToShellPane(body)); }
-            catch (e) {
-              if (e instanceof InjectionError) return json(res, e.status, { error: e.message });
-              return json(res, 502, { error: String(e && e.message || e).slice(0, 500) });
-            }
-          }
-          if (url.pathname === '/api/open' || url.pathname === '/api/send' || url.pathname === '/api/compact' ||
-              url.pathname === '/api/answer') {
-            // Each call locks only its own session and pane (compaction also the model
-            // key); a collision there is the same 429 the global lock used to return.
-            const sessionId = body && body.sessionId;
-            try {
-              const result = url.pathname === '/api/open' ? await openSession(body)
-                : url.pathname === '/api/send' ? await sendToSessionLocked(body)
-                  : url.pathname === '/api/compact'
-                    ? await withInjectionLock(() => compactSessionById(body), { session: sessionId, model: true })
-                    : await withInjectionLock(() => answerSession(body), { session: sessionId });
-              broadcast();
-              return json(res, 200, result);
-            } catch (e) {
-              if (e instanceof InjectionError) return json(res, e.status, { error: e.message, ...e.extra });
-              return json(res, 502, { error: String(e && e.message || e).slice(0, 500) });
-            }
-          }
-          if (url.pathname === '/api/restart-session') {
-            try { return json(res, 200, await restarts.request(body)); }
-            catch (error) { return json(res, error.status || 409, { error: error.message }); }
-          }
-          if (url.pathname === '/api/handoff-session') {
-            try {
-              const result = await handoffSession(body);
-              broadcast();
-              return json(res, 200, result);
-            } catch (error) {
-              return json(res, error.status || 500, { error: error.message, ...(error.extra || {}) });
-            }
-          }
-          if (url.pathname === '/api/abandon-account-handoff') {
-            try {
-              const result = await abandonAccountHandoff(body);
-              broadcast();
-              return json(res, 200, result);
-            } catch (error) {
-              return json(res, error.status || 500, { error: error.message, ...(error.extra || {}) });
-            }
-          }
-          if (url.pathname === '/api/transfer-session') {
-            try {
-              const result = await transferSession(body);
-              broadcast();
-              return json(res, 200, result);
-            } catch (error) {
-              return json(res, error.status || 500, { error: error.message });
-            }
-          }
-          if (url.pathname === '/api/portable-transfers') {
-            try {
-              const result = await preparePortableTransfer(body);
-              broadcast();
-              return json(res, 200, result);
-            } catch (error) {
-              return json(res, error.status || 500, { error: error.message });
-            }
-          }
-          if (url.pathname === '/api/resolve-portable-transfer') {
-            try {
-              const result = await resolvePortableTransfer(body);
-              broadcast();
-              return json(res, 200, result);
-            } catch (error) {
-              return json(res, error.status || 500, { error: error.message });
-            }
-          }
-          if (url.pathname === '/api/close-idle' || url.pathname === '/api/close-session') {
-            try {
-              const result = url.pathname === '/api/close-session'
-                ? await require('./manual-close').manualClose(body, {
-                  getPane: async (pane) => (await hostRequest('get', { pane })).pane,
-                  graceful: (request) => closeIdleSession(request, { closePolicy: { manual: true } }),
-                  signal: (pane, signal) => hostRequest('kill', { pane, signal }),
-                })
-                : await closeIdleSession(body);
-              broadcast(); return json(res, 200, result);
-            }
-            catch (e) { return json(res, e.status || 500, { error: e.message }); }
-          }
-          if (url.pathname === '/api/keys') {
-            try { return json(res, 200, await sendSessionKeys(body)); }
-            catch (e) {
-              if (e instanceof InjectionError) return json(res, e.status, { error: e.message });
-              return json(res, 502, { error: String(e && e.message || e).slice(0, 500) });
-            }
-          }
-          if (url.pathname === '/api/reviewtick') {
-            // The tick's send locks only the reviewer's pane. A collision there throws the
-            // same 429, and landing it in the catch records the healthy skip the scheduler would.
-            try {
-              const result = await review.reviewTick(reviewDeps, { force: Boolean(body.force) });
-              review.recordTickOutcome(result);
-              if (result.sent) broadcast();
-              return json(res, 200, result);
-            } catch (e) {
-              review.recordTickError(e);
-              if (e instanceof InjectionError) return json(res, e.status, { error: e.message, ...e.extra });
-              return json(res, 502, { error: String(e && e.message || e).slice(0, 500) });
-            }
-          }
+          const route = matchRoute(requestRoutes, { req, url, body });
+          if (route) return await route.handle({ req, res, url, body });
           return json(res, 404, { error: 'not found' });
         } catch (e) {
           if (e instanceof keep.KeepError) return json(res, 400, { error: e.message });
@@ -8627,43 +8209,10 @@ function start(deps = {}) {
         }
       }
 
-      if (url.pathname === '/api/panes') {
-        const panes = await listHostPanes({}, true);
-        return json(res, 200, panes ? { panes, host: true } : { panes: [], host: false });
-      } else if (url.pathname === '/') {
-        // build the full body before writeHead so a failure can still send a clean 500
-        const body = fs.readFileSync(path.join(WEB_ROOT, 'index.html'));
-        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-        res.end(body);
-      } else if (url.pathname === '/api/state') {
-        const mobileView = url.searchParams.get('view');
-        if (mobileView && !MOBILE_VIEWS.has(mobileView)) return json(res, 400, { error: `unknown mobile state view: ${mobileView}` });
-        const panes = await listHostPanes(deps);
-        await reviewQueue.reconcile({
-          // Reconciliation may authorize a replacement launch after absence, so
-          // it must bypass the dashboard host-list cache and inspect a complete list.
-          inspectLaunch: (active) => inspectReviewQueueLaunch(active),
-        });
-        const companion = await companionSnapshot(deps);
-        const enriched = await dashboardBuild({ hostPanes: panes, companion });
-        let responseState;
-        try {
-          responseState = mobileView
-            ? projectMobileState(enriched, mobileView, url.searchParams.get('id') || '')
-            : wantsLightweightState(url) ? lightweightState(enriched)
-            : wantsCompactState(req, url) ? compactState(enriched) : enriched;
-        } catch (error) {
-          if (error.status === 400) return json(res, 400, { error: error.message });
-          throw error;
-        }
-        const body = JSON.stringify(responseState);
-        await sendStateJson(req, res, body);
-      } else if (url.pathname === '/api/events') {
-        return json(res, 503, { error: 'events are served by the frontend worker' });
-      } else {
-        res.writeHead(404);
-        res.end('not found');
-      }
+      const route = matchRoute(requestRoutes, { req, url });
+      if (route) return await route.handle({ req, res, url });
+      res.writeHead(404);
+      res.end('not found');
     } catch (e) {
       process.stderr.write(`keep serve: request failed: ${e.message}\n`);
       try {
