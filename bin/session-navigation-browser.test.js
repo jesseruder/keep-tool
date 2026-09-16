@@ -467,6 +467,19 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     await wait("new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))");
     assert.equal(visibilityEvents.filter(e => e.pane === 'pa').at(-1)?.visible, false, 'cached hidden pane reports invisible');
     assert.equal(visibilityEvents.filter(e => e.pane === 'shell3').at(-1)?.visible, true, 'selected pane reports visible');
+    // Recording a session for the new pane re-keys its row; the pane stand-in the
+    // launch selected must hand over instead of standing beside it.
+    sessions.push({ id: 'shell3-agent', kind: 'claude', title: 'Shell three agent', project: '/tmp/history-fixture', pane: 'shell3', state: 'running', endedTurn: false, mtime: Date.now() });
+    panes.find((pane) => pane.id === 'shell3').meta = { agent: 'claude', sessionId: 'shell3-agent' };
+    for (const client of eventClients) client.write('data: changed\n\n');
+    await wait("document.querySelector('#qlist [data-key=\"running:shell3-agent\"]')");
+    assert.equal(await evaluate("document.querySelectorAll('#qlist .qitem[data-key$=\"shell3\"], #qlist .qitem[data-key$=\"shell3-agent\"]').length"), 1, 'the pane stand-in does not linger beside the session row');
+    assert.equal(await evaluate("document.querySelector('#qlist .qitem.sel')?.dataset.key"), 'running:shell3-agent', 'the selection follows the pane to its session row');
+    assert.equal(await evaluate("document.querySelector('#stage').dataset.pane"), 'shell3', 'the same terminal stays on the stage');
+    sessions.splice(sessions.findIndex((session) => session.id === 'shell3-agent'), 1);
+    panes.find((pane) => pane.id === 'shell3').meta = { agent: 'shell', title: 'New shell', project: '/tmp/history-fixture' };
+    for (const client of eventClients) client.write('data: changed\n\n');
+    await wait("!document.querySelector('#qlist [data-key=\"running:shell3-agent\"]')");
     await evaluate("document.querySelector('#qlist [data-key=\"pinned:a\"]').click()");
     await wait("document.querySelector('#stage').dataset.pane === 'pa' && document.activeElement?.matches('#stage .xterm-helper-textarea')");
     // Full UI sequence through real status policy, not hand-authored labels.

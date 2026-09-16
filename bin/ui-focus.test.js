@@ -123,6 +123,20 @@ test('running panel orders newest-created first regardless of activity and refre
   assert.deepEqual(order(), tied, 'missing creation logs have deterministic ties across reloads');
 });
 
+test('a retained pane stand-in gives way to the row that carries the pane now', () => {
+  const paneKey = (item) => item.sessionId || item.pane;
+  const paneSection = (item) => `${item.kind}:${paneKey(item)}`;
+  const standIn = { kind: 'running', pane: 'shell3' };
+  const agentRow = { kind: 'running', sessionId: 'agent', pane: 'shell3' };
+  const other = { kind: 'running', sessionId: 'other', pane: 'other' };
+  assert.equal(selection.supersededStandIn([other, agentRow], standIn), true, 'the recorded session re-keys the same terminal');
+  assert.equal(selection.supersededStandIn([other, { kind: 'pinned', pane: 'shell3' }], standIn), true, 'pinning the shell hands its row over too');
+  assert.equal(selection.supersededStandIn([other], standIn), false, 'a pane listed nowhere else still needs the stand-in');
+  assert.equal(selection.supersededStandIn([agentRow], { kind: 'recent', sessionId: 'agent', pane: 'shell3' }), false, 'a session-keyed retained row is not a stand-in');
+  assert.equal(selection.selectionIndex([other, agentRow], paneSection(standIn), standIn, 0, paneKey, paneSection), 1,
+    'dropping the stand-in leaves the selection on the pane its new key belongs to');
+});
+
 test('alive unpinned shells without a session list under running until they are pinned', () => {
   const source = fs.readFileSync(path.join(__dirname, '../web/app/app.js'), 'utf8');
   const pinned = new Set();

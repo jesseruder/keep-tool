@@ -13,7 +13,7 @@ import { captureFocusIntent } from './focus-intent.js';
 import { mountTerminal } from './terminal.js';
 import { setTerminalRendererPreference } from './terminal-renderer.js';
 import { installFocusDebug } from './focus-debug.js';
-import { retainSelection, stableSessionOrder } from './selection.js';
+import { retainSelection, stableSessionOrder, supersededStandIn } from './selection.js';
 import { createSessionHistory, installSessionHistory } from './session-history.js';
 import { installTriageControls, renderTriage } from './triage.js';
 import { renderWatch, installWatchControls } from './watch.js';
@@ -331,8 +331,9 @@ function triageItems() {
     ...(state.showPinned !== false ? pinnedItems().filter(triageVisible) : []),
     ...(state.showRecent ? recentItems().filter(triageVisible) : []),
   ];
-  return [...items, ...retainSelection(items, state.currentItem, state.selectedKey, itemKey, triageKey,
-    retainedSelectionItem)];
+  const retained = retainSelection(items, state.currentItem, state.selectedKey, itemKey, triageKey, retainedSelectionItem)
+    .filter((item) => !supersededStandIn(items, item));
+  return [...items, ...retained];
 }
 function knownProjects() {
   const values = new Map();

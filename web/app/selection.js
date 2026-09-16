@@ -6,6 +6,12 @@ export function retainSelection(items, current, selectedKey, keyOf, sectionKey, 
   const fresh = rebuild(current);
   return fresh ? [fresh] : [];
 }
+// retainSelection dedupes by item key, but openReviewPane's stand-in is keyed by
+// its pane and the pane's own row is keyed by the session it has since recorded.
+// Once that row is listed, the stand-in is a stale second row for one terminal.
+export function supersededStandIn(items, item) {
+  return !item.sessionId && items.some((row) => row.pane && row.pane === item.pane);
+}
 export function selectionIndex(items, selectedKey, current, fallback, keyOf, sectionKey) {
   let index = selectedKey ? items.findIndex((item) => sectionKey(item) === selectedKey) : -1;
   if (index < 0 && current) index = items.findIndex((item) => keyOf(item) === keyOf(current));
