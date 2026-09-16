@@ -826,7 +826,13 @@ function claimedAt(worktree) {
 
 function gcWorktrees(options = {}) {
   const cfg = options.cfg || loadConfig();
-  const days = options.days === undefined ? 3 : Number(options.days);
+  // A tree that reaches the age checks below is already wt-managed, clean, fully
+  // landed, and used by no live session: its commits are on origin and recycling
+  // keeps its node_modules, so an age rule has nothing left to protect — it only
+  // holds the tree out of the pool, and an empty pool is why every `wt new` builds
+  // a directory from scratch. `--days N` remains as an explicit grace for browsing
+  // finished trees; the default is to return them.
+  const days = options.days === undefined ? 0 : Number(options.days);
   const keepFree = options.keepFree === undefined ? 2 : Number(options.keepFree);
   if (!Number.isFinite(days) || days < 0) die('--days must be a non-negative number');
   if (!Number.isInteger(keepFree) || keepFree < 0) die('--keep-free must be a non-negative integer');
@@ -879,8 +885,12 @@ function gcWorktrees(options = {}) {
       else if (dirty.length) reason = `dirty (${dirty.length} change(s))`;
       else if (ahead > 0) reason = `${ahead} commit(s) ahead of origin/${defaultName}`;
       else if (liveCwds.some((cwd) => pathContains(cwd, item.path))) reason = 'live session cwd is inside worktree';
-      else if (!item.free && (!Number.isFinite(committedAt) || now - committedAt < days * 86400e3)) reason = `last commit is newer than ${days} day(s)`;
-      else if (!item.free && !(now - claimedAt(item.path) >= days * 86400e3)) reason = `claimed less than ${days} day(s) ago`;
+      // An unreadable date is not an old tree. These stay skipped whatever --days
+      // says, and now name the actual problem instead of reporting a false age.
+      else if (!item.free && !Number.isFinite(committedAt)) reason = 'cannot read the date of the last commit';
+      else if (!item.free && !Number.isFinite(claimedAt(item.path))) reason = 'cannot read when the tree was claimed';
+      else if (!item.free && now - committedAt < days * 86400e3) reason = `last commit is newer than ${days} day(s)`;
+      else if (!item.free && now - claimedAt(item.path) < days * 86400e3) reason = `claimed less than ${days} day(s) ago`;
       assessments.push({ item, wasFree, safe: !reason, reason, committedAt });
     }
 
@@ -897,7 +907,8 @@ function gcWorktrees(options = {}) {
         rows.push({ ...item, action: 'skip', reason: assessment.reason });
         continue;
       }
-      rows.push({ ...item, action: options.dryRun ? 'would-recycle' : 'recycle', reason: `clean, landed, and at least ${days} day(s) old` });
+      rows.push({ ...item, action: options.dryRun ? 'would-recycle' : 'recycle',
+        reason: days > 0 ? `clean, landed, unused, and at least ${days} day(s) old` : 'clean, landed, and unused' });
       if (!options.dryRun) recycleWorktree(item.path);
       item.free = true;
     }

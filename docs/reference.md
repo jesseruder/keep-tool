@@ -1811,9 +1811,17 @@ protected by `--ff-only` itself. `--no-deploy` lands without touching the checko
 and `keep land <card>` inherits all of this.
 
 `wt gc` fetches each repository, then recycles only clean, fully landed worktrees
-whose last commit is at least three days old and whose directory contains no live
-agent cwd. It keeps two safe recycled trees per repository and deletes older extras;
-`--days` and `--keep-free` change those defaults. `--dry-run` prints the same action
+whose directory contains no live agent cwd. It keeps two safe recycled trees per
+repository and deletes older extras; `--days` and `--keep-free` change those
+defaults.
+
+Recycling has no waiting period by default (`--days 0`). A tree that is clean,
+fully landed and unused has its commits on origin and keeps its `node_modules`
+through the recycle, so holding it back protects nothing and starves the free pool
+that `wt new` claims from — an empty pool is why a new worktree builds a directory
+and reinstalls from scratch. `--days N` reinstates a grace when you want finished
+trees left around to browse. The safety rules are unchanged: dirty, unlanded, and
+in-use trees are never touched, whatever `--days` says. `--dry-run` prints the same action
 table without changing anything. `keep serve` runs this sweep daily; set
 `KEEP_WT_GC=0` to disable it.
 

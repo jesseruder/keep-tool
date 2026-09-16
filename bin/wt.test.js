@@ -801,6 +801,47 @@ test('gc recycles only old landed worktrees and explains every safety skip', () 
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test('gc returns a finished tree to the pool the same day, and --days still holds one back', () => {
+  const f = fixture();
+  try {
+    // Exactly the shape every landed agent session leaves behind: claimed minutes
+    // ago, its work already on origin, nothing running in it. Under the old
+    // three-day default these piled up and the free pool stayed empty, so every
+    // `wt new` built a directory and reinstalled from scratch.
+    const finished = runCli(f, ['new', f.name, 'finished', '--no-install']).stdout.trim();
+    write(path.join(finished, 'work.txt'), 'work\n');
+    commitIn(finished, 'work');
+    runCli(f, ['land', finished]);
+
+    const held = wt.gcWorktrees({ cfg: f.cfg, days: 3, keepFree: 2, dryRun: true, deps: { liveCwds: [] } });
+    const heldRow = held.rows.find((row) => row.name === 'finished');
+    assert.equal(heldRow.action, 'skip', '--days is still an honoured grace when asked for');
+    assert.match(heldRow.reason, /newer than 3 day/);
+
+    const swept = wt.gcWorktrees({ cfg: f.cfg, keepFree: 2, deps: { liveCwds: [] } });
+    const row = swept.rows.find((row) => row.name === 'finished');
+    assert.equal(row.action, 'recycle');
+    assert.equal(row.reason, 'clean, landed, and unused');
+    assert.equal(fs.existsSync(path.join(finished, '.wt-free')), true, 'and it is back in the pool');
+    assert.equal(fs.existsSync(path.join(finished, '.wt.json')), false, 'no longer claimed');
+    assert.equal(git(finished, 'rev-parse', 'HEAD'), git(f.main, 'rev-parse', 'origin/main'), 'reset to origin');
+    assert.equal(fs.existsSync(path.join(finished, 'work.txt')), true, 'its landed work is there because origin has it');
+
+    // The safety rules are untouched: only the waiting was removed.
+    const busy = runCli(f, ['new', f.name, 'busy', '--no-install']).stdout.trim();
+    write(path.join(busy, 'unlanded.txt'), 'unlanded\n');
+    commitIn(busy, 'unlanded');
+    const open = runCli(f, ['new', f.name, 'open', '--no-install']).stdout.trim();
+    write(path.join(open, 'scratch.txt'), 'scratch\n');
+    const inUse = runCli(f, ['new', f.name, 'in-use', '--no-install']).stdout.trim();
+    const guarded = wt.gcWorktrees({ cfg: f.cfg, keepFree: 2, dryRun: true, deps: { liveCwds: [inUse] } });
+    const reasons = new Map(guarded.rows.map((row) => [row.name, row.reason]));
+    assert.match(reasons.get('busy'), /ahead of origin\/main/);
+    assert.match(reasons.get('open'), /dirty/);
+    assert.match(reasons.get('in-use'), /live session cwd/);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
 test('gc keeps a freshly claimed tree even when its base commit is older than --days', () => {
   const f = fixture();
   try {
