@@ -4,6 +4,23 @@ export function humanAttention(data) {
   return (data.attention || []).filter((item) => (item.sessionId || item.taskId) && HUMAN_KINDS.has(item.kind));
 }
 
+// The daemon publishes hostStatus.ok === false when the terminal host did not
+// answer its pane list. Panes missing from a list nobody could collect are
+// unknown, not gone, so the console reports the host rather than the pane.
+export function hostOutage(data) {
+  const status = data && data.hostStatus;
+  return status && status.ok === false ? status : null;
+}
+
+export function hostOutageText(status, now = Date.now()) {
+  if (!status) return '';
+  const seconds = Math.max(0, Math.round((now - (Number(status.since) || now)) / 1000));
+  const age = seconds < 60 ? `${seconds}s` : `${Math.round(seconds / 60)}m`;
+  const why = status.reason === 'timeout'
+    ? 'terminal host not answering' : 'terminal host unreachable';
+  return `${why} ${age}`;
+}
+
 export function sessionLabel(session) {
   return session?.stateLabel || session?.activity?.label || session?.state || 'unknown';
 }

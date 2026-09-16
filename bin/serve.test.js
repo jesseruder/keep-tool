@@ -1102,19 +1102,89 @@ test('only console-awaited mutations skip the dashboard rebuild throttle', () =>
 test('dashboard publish reuses recent host panes instead of publishing none', () => {
   const { hostPanesForPublish } = require('./serve');
   const start = 1_000_000;
+  const down = { panes: null, failure: 'unreachable' };
   const memo = { panes: null, at: 0 };
-  assert.equal(hostPanesForPublish(null, memo, start), null, 'with no good list yet the dashboard still publishes');
+  assert.deepEqual(hostPanesForPublish(down, memo, start).panes, null, 'with no good list yet the dashboard still publishes');
   const panes = [{ id: 'p1' }];
-  assert.equal(hostPanesForPublish(panes, memo, start + 2000), panes);
-  assert.equal(hostPanesForPublish(null, memo, start + 30e3), panes, 'a failed host request reuses the last good list');
-  assert.equal(hostPanesForPublish(null, memo, start + 2000 + 61e3), null, 'a host that stays down is published as down');
-  assert.deepEqual(hostPanesForPublish([], memo, start + 70e3), [], 'a real empty list is published');
+  assert.equal(hostPanesForPublish({ panes, failure: null }, memo, start + 2000).panes, panes);
+  assert.equal(hostPanesForPublish(down, memo, start + 30e3).panes, panes, 'a failed host request reuses the last good list');
+  assert.equal(hostPanesForPublish(down, memo, start + 2000 + 61e3).panes, null, 'a host that stays down is published as down');
+  assert.deepEqual(hostPanesForPublish({ panes: [], failure: null }, memo, start + 70e3).panes, [], 'a real empty list is published');
   const fenced = { panes: [{ id: 'current' }], at: start, epoch: 0 };
   const inFlightEpoch = fenced.epoch;
   fenced.panes = null; fenced.at = 0; fenced.epoch += 1; // a mutation lands mid-lookup
-  assert.deepEqual(hostPanesForPublish([{ id: 'removed' }], fenced, start + 1000, inFlightEpoch), [{ id: 'removed' }]);
+  assert.deepEqual(hostPanesForPublish({ panes: [{ id: 'removed' }], failure: null }, fenced, start + 1000, inFlightEpoch).panes, [{ id: 'removed' }]);
   assert.equal(fenced.panes, null, 'a list collected before the mutation is not remembered');
-  assert.equal(hostPanesForPublish(null, fenced, start + 2000, fenced.epoch), null, 'and cannot be reused after it');
+  assert.equal(hostPanesForPublish(down, fenced, start + 2000, fenced.epoch).panes, null, 'and cannot be reused after it');
+});
+
+test('a slow host keeps its panes and is published as unresponsive, not as no panes', () => {
+  const { hostPanesForPublish } = require('./serve');
+  const start = 1_000_000;
+  const panes = [{ id: 'p1' }, { id: 'p2' }];
+  const slow = { panes: null, failure: 'timeout' };
+  const memo = { panes: null, at: 0, epoch: 0 };
+  assert.equal(hostPanesForPublish({ panes, failure: null }, memo, start).host.ok, true);
+
+  // The incident: the host answered `hello` but took 7-11s to answer `list`, so
+  // every window claimed its pane was gone once the 60s reuse window expired.
+  const brief = hostPanesForPublish(slow, memo, start + 30e3);
+  assert.equal(brief.panes, panes, 'a slow host still owns the panes it last listed');
+  assert.deepEqual(brief.host, { ok: false, reason: 'timeout', since: start + 30e3, stale: true, panesAt: start });
+  const later = hostPanesForPublish(slow, memo, start + 5 * 60e3);
+  assert.equal(later.panes, panes, 'and keeps them well past the 60s window a down host gets');
+  assert.equal(later.host.since, start + 30e3, 'the outage is dated from the first silent lookup, not the latest');
+
+  const exhausted = hostPanesForPublish(slow, memo, start + 11 * 60e3);
+  assert.equal(exhausted.panes, null, 'a host silent for ten minutes is no longer speaking for its panes');
+  assert.deepEqual(exhausted.host, { ok: false, reason: 'timeout', since: start + 30e3, stale: false, panesAt: null });
+
+  const recovered = hostPanesForPublish({ panes: [], failure: null }, memo, start + 12 * 60e3);
+  assert.deepEqual(recovered, { panes: [], host: { ok: true } }, 'a host that answers again is published plainly');
+  assert.equal(hostPanesForPublish(slow, memo, start + 13 * 60e3).host.since, start + 13 * 60e3,
+    'and the next outage is dated from its own first failure');
+});
+
+test('a host that never answers the socket is published as unreachable', () => {
+  const { hostPanesForPublish } = require('./serve');
+  const start = 1_000_000;
+  const panes = [{ id: 'p1' }];
+  const down = { panes: null, failure: 'unreachable' };
+  const memo = { panes: null, at: 0, epoch: 0 };
+  hostPanesForPublish({ panes, failure: null }, memo, start);
+  const brief = hostPanesForPublish(down, memo, start + 30e3);
+  assert.equal(brief.panes, panes);
+  assert.equal(brief.host.reason, 'unreachable');
+  const after = hostPanesForPublish(down, memo, start + 61e3);
+  assert.equal(after.panes, null, 'a host that never answered may really have no panes');
+  assert.deepEqual(after.host, { ok: false, reason: 'unreachable', since: start + 30e3, stale: false, panesAt: null });
+
+  // `keep host` is launched on demand, so a daemon that has never reached one is
+  // not in an outage: it has no panes, and saying so is the truth.
+  const hostless = { panes: null, at: 0, epoch: 0 };
+  assert.deepEqual(hostPanesForPublish(down, hostless, start).host, { ok: true });
+  assert.deepEqual(hostPanesForPublish(down, hostless, start + 10 * 60e3).host, { ok: true });
+  assert.equal(hostPanesForPublish({ panes: null, failure: 'timeout' }, hostless, start).host.ok, false,
+    'a host that holds the socket open exists, listed or not');
+
+  // Every urgent mutation clears the remembered list; that must not make the next
+  // unreachable lookup look like a daemon that never had a host.
+  const mutated = { panes: null, at: 0, epoch: 0 };
+  hostPanesForPublish({ panes, failure: null }, mutated, start);
+  mutated.panes = null; mutated.at = 0; mutated.epoch += 1;
+  assert.equal(hostPanesForPublish(down, mutated, start + 1000, mutated.epoch).host.ok, false);
+});
+
+test('listHostPaneResult tells a slow host apart from an absent one', async () => {
+  const { listHostPaneResult } = require('./serve');
+  assert.deepEqual(await listHostPaneResult({ host: null }, true), { panes: null, failure: 'unreachable' });
+  const silent = { request: () => new Promise(() => {}) };
+  assert.deepEqual(await listHostPaneResult({ host: silent, hostRequestTimeoutMs: 20 }, true),
+    { panes: null, failure: 'timeout' }, 'a host that holds the socket open but does not answer is slow, not gone');
+  const broken = { request: async () => { const error = new Error('socket hang up'); error.code = 'ECONNRESET'; throw error; } };
+  assert.deepEqual(await listHostPaneResult({ host: broken }, true), { panes: null, failure: 'unreachable' });
+  const good = { request: async () => ({ panes: [{ id: 'p1', meta: {} }] }) };
+  assert.deepEqual(await listHostPaneResult({ host: good }, true), { panes: [{ id: 'p1', meta: {} }], failure: null });
 });
 
 test('turn index reads only recently alive sessions and caches codex rollout walks', () => {

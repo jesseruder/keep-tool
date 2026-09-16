@@ -1284,12 +1284,20 @@ async function hostRequest(type, params, deps = {}) {
   }
 }
 
-async function listHostPanes(deps = {}, fresh = false) {
+// Why a pane list could not be collected. 'unreachable': the host socket did not
+// answer at all, so its panes may really be gone. 'timeout': the host owns the
+// socket but did not answer `list` within HOST_REQUEST_TIMEOUT_MS, which under
+// machine load says nothing about the panes — they are still there, still running.
+function hostFailureKind(error) {
+  return /timed out/i.test(String(error && error.message || error)) ? 'timeout' : 'unreachable';
+}
+
+async function listHostPaneResult(deps = {}, fresh = false) {
   const client = await hostClient(deps);
-  if (!client) return null;
+  if (!client) return { panes: null, failure: 'unreachable' };
   const now = deps.now || Date.now;
   const cached = hostPaneCaches.get(client);
-  if (!fresh && cached && now() - cached.at < HOST_PANE_CACHE_MS) return cached.panes;
+  if (!fresh && cached && now() - cached.at < HOST_PANE_CACHE_MS) return { panes: cached.panes, failure: null };
   try {
     const result = await requestHostClient(client, 'list', {}, deps);
     const panes = Array.isArray(result && result.panes) ? result.panes : [];
@@ -1297,18 +1305,26 @@ async function listHostPanes(deps = {}, fresh = false) {
       try { annotatePaneAgents(panes, await (deps.agentProcessRows || agentProcessRows)(deps)); } catch {}
     }
     hostPaneCaches.set(client, { at: now(), panes });
-    return panes;
-  } catch {
+    return { panes, failure: null };
+  } catch (error) {
     invalidateHost(client, deps);
-    return null;
+    return { panes: null, failure: hostFailureKind(error) };
   }
 }
 
-// A timed-out host request leaves listHostPanes null. Publishing that as zero panes
+async function listHostPanes(deps = {}, fresh = false) {
+  return (await listHostPaneResult(deps, fresh)).panes;
+}
+
+// A failed host request leaves listHostPanes null. Publishing that as zero panes
 // strips every session's liveness, so Waiting on you empties and sessions flash into
-// Running & waiting. Reuse the last good list briefly. With no good list yet (a fresh
-// daemon, or no host at all) publish as before rather than holding the dashboard.
+// Running & waiting. Reuse the last good list instead. A host that never answered the
+// socket may genuinely be gone, so that reuse stays short; a host that answered but
+// could not list in time is merely slow, and its last good list stays true far longer
+// than a thrashing Mac takes to recover. Either way the publication says the list is
+// stale, so the console reports an unresponsive host instead of vanished panes.
 const HOST_PANES_REUSE_MS = 60e3;
+const HOST_PANES_SLOW_REUSE_MS = 10 * 60e3;
 
 // Writes a console waits on through its mutation fence rebuild the dashboard at once;
 // every other write (project icons, UI debug, terminal profiles, keys) waits out the
@@ -1324,19 +1340,42 @@ const URGENT_DASHBOARD_MUTATIONS = new Set([
 function urgentDashboardMutation(pathname) {
   return URGENT_DASHBOARD_MUTATIONS.has(pathname) || /^\/api\/panes\/[^/]+\/(?:kill|remove)$/.test(pathname);
 }
+// Takes a listHostPaneResult and returns the panes to publish alongside the host
+// status that describes them: `{ ok: true }` for a list this host just answered,
+// otherwise why the host is silent, since when, and whether the panes travelling
+// with it are a reused older list.
 // `epoch` is memo.epoch as it was when the lookup began: a mutation bumps it, so a list
 // collected before the mutation is neither remembered nor reused for a later build.
-function hostPanesForPublish(panes, memo, now, epoch = memo.epoch || 0) {
+function hostPanesForPublish(result, memo, now, epoch = memo.epoch || 0) {
   const current = epoch === (memo.epoch || 0);
+  const panes = result ? result.panes : null;
   if (Array.isArray(panes)) {
     if (current) {
       memo.panes = panes;
       memo.at = now;
+      memo.listed = true; // survives the mutation fence: this daemon has seen a host
+      memo.failingSince = 0;
     }
-    return panes;
+    return { panes, host: { ok: true } };
   }
-  if (current && memo.panes && now - memo.at < HOST_PANES_REUSE_MS) return memo.panes;
-  return panes;
+  const reason = (result && result.failure) || 'unreachable';
+  // No host has ever answered this daemon: `keep host` simply is not running, so
+  // there are no panes and nothing is being hidden. Publishing that as an outage
+  // would put a permanent warning on a console that is telling the truth.
+  if (reason === 'unreachable' && !memo.listed) return { panes, host: { ok: true } };
+  if (current && !memo.failingSince) memo.failingSince = now;
+  const reuseMs = reason === 'timeout' ? HOST_PANES_SLOW_REUSE_MS : HOST_PANES_REUSE_MS;
+  const reused = current && memo.panes && now - memo.at < reuseMs ? memo.panes : null;
+  return {
+    panes: reused || panes,
+    host: {
+      ok: false,
+      reason,
+      since: (current && memo.failingSince) || now,
+      stale: Boolean(reused),
+      panesAt: reused ? memo.at : null,
+    },
+  };
 }
 
 function annotatePaneAgents(panes, rows) {
@@ -7697,13 +7736,17 @@ function start(deps = {}) {
       // before the mutation may have filled it with the panes the mutation changed.
       const freshPanes = paneEpoch !== lastPaneEpoch;
       lastPaneEpoch = paneEpoch;
-      const panes = hostPanesForPublish(await listHostPanes(deps, freshPanes), publishedPanes, Date.now(), paneEpoch);
+      const listed = hostPanesForPublish(
+        await listHostPaneResult(deps, freshPanes), publishedPanes, Date.now(), paneEpoch,
+      );
       await reviewQueue.reconcile({ inspectLaunch: (active) => inspectReviewQueueLaunch(active) });
       const companion = await companionSnapshot(deps);
-      return { hostPanes: panes, companion, mutationFence: capturedMutationFence };
+      return { hostPanes: listed.panes, hostStatus: listed.host, companion, mutationFence: capturedMutationFence };
     },
+    // hostStatus rides beside the build input, not inside it: it changes on every
+    // second a silent host stays silent, and the worker keys its dedupe on the input.
     build: async (input) => ({
-      state: await dashboardBuild(input),
+      state: Object.assign(await dashboardBuild(input), { hostStatus: input.hostStatus || { ok: true } }),
       portableTransfers: listPortableTransfers(),
       mutationFence: input.mutationFence,
     }),
@@ -8101,6 +8144,7 @@ module.exports = {
   hostClient,
   hostRequest,
   listHostPanes,
+  listHostPaneResult,
   readScreenResult,
   readScreen,
   writeTarget,

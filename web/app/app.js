@@ -6,7 +6,7 @@ import { installNotifications } from './notifications.js';
 import { PALETTES, paletteById, swatches } from './palettes.js';
 import { applyTheme, getPalette, getPreference, onThemeChange, resolvedTheme, setPalette, setPreference, xtermTheme } from './theme.js';
 import * as api from './api.js';
-import { humanAttention, sessionLabel } from './status.js';
+import { humanAttention, sessionLabel, hostOutage, hostOutageText } from './status.js';
 import { createClosingSessions } from './closing-sessions.js';
 import { installInteractionGuard } from './interaction-guard.js';
 import { captureFocusIntent } from './focus-intent.js';
@@ -832,14 +832,21 @@ function renderHealth() {
   const unhealthy = rows.filter((row) => ['failing', 'silent', 'never'].includes(row.displayState));
   const warnings = rows.filter((row) => row.displayState === 'warning');
   const button = document.querySelector('#health');
+  // A silent terminal host is not a scheduler failure, but it is the reason every
+  // pane looks gone, so it belongs in the one always-visible health indicator.
+  const outage = hostOutage(data);
   button.classList.toggle('bad', !health.daemon?.running || unhealthy.length > 0);
-  button.classList.toggle('warning', health.daemon?.running && unhealthy.length === 0 && warnings.length > 0);
+  button.classList.toggle('warning', health.daemon?.running && unhealthy.length === 0 && (warnings.length > 0 || Boolean(outage)));
   const status = !health.daemon?.running ? 'offline' : unhealthy.length ? unhealthy[0].displayState : warnings.length ? 'warning' : 'healthy';
+  const summary = `Daemon ${status}${outage ? `; ${hostOutageText(outage)}` : ''}; show health details`;
   button.querySelector(':scope > span').textContent = 'daemon';
-  button.title = `Daemon ${status}; show health details`;
-  button.setAttribute('aria-label', `Daemon ${status}; show health details`);
+  button.title = summary;
+  button.setAttribute('aria-label', summary);
   const enable = notificationPermission() === 'default' ? '<button class="btn notify-enable">Enable notifications</button>' : '';
-  button.querySelector('.pop').innerHTML = `<b>keep serve</b> · pid ${esc(health.daemon?.pid || '—')}${enable}<dl>${rows.map((row) => `<dt>${esc(row.name)}</dt><dd class="${['failing', 'silent', 'never'].includes(row.displayState) ? 'bad' : row.displayState === 'warning' ? 'warning' : ''}">${esc(row.displayState)}${row.displayDetail ? ` · ${esc(row.displayDetail)}` : ''}</dd>`).join('')}</dl>`;
+  const hostRow = outage
+    ? `<dt>terminal host</dt><dd class="bad">${esc(hostOutageText(outage))}${outage.stale && outage.panesAt ? ` · panes last listed ${esc(rel(outage.panesAt))}` : ' · no pane list'}</dd>`
+    : '';
+  button.querySelector('.pop').innerHTML = `<b>keep serve</b> · pid ${esc(health.daemon?.pid || '—')}${enable}<dl>${hostRow}${rows.map((row) => `<dt>${esc(row.name)}</dt><dd class="${['failing', 'silent', 'never'].includes(row.displayState) ? 'bad' : row.displayState === 'warning' ? 'warning' : ''}">${esc(row.displayState)}${row.displayDetail ? ` · ${esc(row.displayDetail)}` : ''}</dd>`).join('')}</dl>`;
   button.querySelector('.notify-enable')?.addEventListener('click', async (event) => {
     event.stopPropagation();
     const permission = await requestPermission();
