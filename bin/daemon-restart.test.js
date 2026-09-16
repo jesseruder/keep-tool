@@ -23,3 +23,21 @@ test('unreadable pending-swap directory cannot authorize restart', () => {
   assert.throws(() => gate.prepare(), /EACCES/);
   assert.equal(gate.stopping, false);
 });
+
+test('the restart route marks the request right before shutdown, not when it accepts it', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { routes } = require('./serve/routes');
+  const calls = [];
+  const list = routes({
+    daemonRestartGate: createGate(),
+    health: { recordRestartRequest: () => calls.push('mark') },
+    shutdown: () => calls.push('shutdown'),
+    json: (res, status, value) => ({ status, value }),
+  });
+  const route = list.find((entry) => entry.path === '/api/restart-daemon');
+  const response = await route.handle({ req: { method: 'POST' }, res: {}, url: new URL('http://x/api/restart-daemon'), body: {} });
+  assert.equal(response.status, 200);
+  assert.deepEqual(calls, [], 'a daemon that dies before its shutdown must still read as a crash');
+  t.mock.timers.tick(50);
+  assert.deepEqual(calls, ['mark', 'shutdown']);
+});
