@@ -519,9 +519,11 @@ function rateLimitInfo(j, text) {
     text: String(text || '').slice(0, 200),
     // The 5h/weekly limits carry a machine-readable window; the per-model Fable
     // limit arrives with quotaLimits: null and only names itself in the prose, so
-    // it is matched on the sentence the harness prints, not on a bare "Fable".
+    // it is matched on the sentence the harness prints, which names the model
+    // version or not ("your Fable limit", "your Fable 5.1 limit"), rather than
+    // on a bare "Fable".
     type: RATE_LIMIT_TYPES.includes(declared) ? declared
-      : /reached your Fable .* limit/i.test(String(text || '')) ? 'fable_weekly'
+      : /reached your Fable\b.*\blimit/i.test(String(text || '')) ? 'fable_weekly'
       : 'unknown',
     resetsAt: quota ? rateLimitResetMs(quota.resetsAt) : null,
   };
@@ -3385,8 +3387,13 @@ async function restartSession(body, deps = {}) {
     if (!(await host('hello')).replaceExited) throw Error('Terminal host must be refreshed before restarting sessions');
     const pane = (await host('get', { pane: body.pane })).pane;
     const session = (await (deps.buildState || buildState)({ hostPanes: [pane] })).sessions.find((s) => s.id === body.sessionId);
+    // A session the API cut off mid-turn never ends its turn on its own, so the
+    // terminal-limit path supplies the ended turn. Its ledger may also carry a
+    // settled `transcript-replaced` history-gap, which is not live work and must
+    // not defeat this the way any real unknown job still does.
     const terminalLimit = deps.allowTerminalRateLimit === true && session?.kind === 'claude' && session.rateLimit && !session.pendingBackground
-      && !session.toolRunning && !session.pendingQuestion && !session.pendingPlan && !(session.unknownBackgroundJobs || []).length;
+      && !session.toolRunning && !session.pendingQuestion && !session.pendingPlan
+      && !require('./session-restart').blockingUnknownJobs(session).length;
     const restartSessionState = terminalLimit ? { ...session, endedTurn: true, rateLimit: null } : session;
     const reason = require('./session-restart').refusal(restartSessionState, pane, body.mode === 'idle', { force });
     if (pane.pid !== body.pid) throw new InjectionError(409, 'Session process changed');

@@ -152,6 +152,19 @@ test('restart readiness protects active work, decisions, and viewed queued panes
     'a settled gap excuses only itself');
   assert.ok(refusal({ ...session, unknownBackgroundJobs: ['history-gap'], pendingBackground: true,
     backgroundJobs: settledLedger }, pane));
+  // The same filter is what serve.js's terminal-rate-limit path uses, so it is
+  // exported rather than written out twice.
+  const { blockingUnknownJobs } = require('./session-restart');
+  assert.deepEqual(blockingUnknownJobs({ unknownBackgroundJobs: ['history-gap'], backgroundJobs: settledLedger }), []);
+  assert.deepEqual(blockingUnknownJobs({ unknownBackgroundJobs: ['history-gap'] }), ['history-gap']);
+  assert.deepEqual(blockingUnknownJobs({ unknownBackgroundJobs: ['history-gap'],
+    backgroundJobs: { ...settledLedger, gapSettled: false } }), ['history-gap']);
+  assert.deepEqual(blockingUnknownJobs({ unknownBackgroundJobs: ['history-gap', 'bash-7'],
+    backgroundJobs: settledLedger }), ['bash-7']);
+  assert.deepEqual(blockingUnknownJobs({ unknownBackgroundJobs: ['history-recovery'],
+    backgroundJobs: settledLedger }), ['history-recovery']);
+  assert.deepEqual(blockingUnknownJobs({}), []);
+  assert.deepEqual(blockingUnknownJobs(null), []);
   assert.ok(refusal({ ...session, state: 'needs-input', activity: { reason: 'next instruction' },
     backgroundJobs: { jobs: [{ kind: 'scheduled', status: 'pending' }] } }, pane), 'a cron must be protected even when final prose looks ready');
   assert.equal(refusal({ ...session, backgroundJobs: { jobs: [{ kind: 'scheduled', status: 'cancelled' }] } }, pane), null);

@@ -75,10 +75,13 @@ uncertainty, not proof that work ended. Recovery replays the available file whil
 preserving unresolved prior jobs; a permanent history gap remains visible rather
 than silently resetting the ledger. A replaced transcript retains every job that
 was unresolved at that moment as an individually uncertain job, so once such a
-ledger has no open job, no unresolved call, no unconsumed hook, a completed
-restart record and is caught up, that permanent gap alone no longer blocks a
-restart or an account transfer. It stays visible as `history-gap`; the ledger
-reports it as settled. No other gap reason gets that treatment. This ledger is
+ledger has no open job, no unresolved call, no unconsumed hook, an ended turn and
+is caught up, that permanent gap alone no longer blocks a restart or an account
+transfer. A turn the API ended by refusing it -- a terminal per-model rate limit
+-- counts as ended for callers that already accept that end state, the same ones
+that pass `allowTerminalRateLimit` to the restart proof. It stays visible as
+`history-gap`; the ledger reports it as settled. No other gap reason gets that
+treatment. This ledger is
 evidence, not authority to kill a process or bypass the stricter close/restart
 checks.
 

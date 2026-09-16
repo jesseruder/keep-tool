@@ -333,3 +333,33 @@ test('a settled transcript-replaced gap verifies without force while any other g
   assert.throws(verify, /Job ledger evidence is incomplete/, 'only a transcript-replaced gap settles');
   verify({ force: true })();
 }, 'claude'));
+
+test('a settled gap over a turn the API rate-limited verifies only under allowTerminalRateLimit', () => fixture(({ root, file, append, verify }) => {
+  for (let i = 0; i < 4; i++) {
+    append('parent', { type: 'user', sessionId: 'parent', message: { content: 'history that auto-compaction is about to replace' } });
+    append('parent', { type: 'assistant', sessionId: 'parent', message: { content: [], stop_reason: 'end_turn' } });
+  }
+  verify()();
+  // Auto-compaction replaces the transcript, and the turn that follows it is the
+  // one the API refuses outright: the ledger keeps a permanent
+  // `transcript-replaced` gap and a restart record with no completion, only
+  // `rateLimitTerminal`. Both have to be accepted, and by the same flag.
+  fs.writeFileSync(file('parent'), [
+    { type: 'user', sessionId: 'parent', message: { content: 'summary' } },
+    { type: 'assistant', sessionId: 'parent', isApiErrorMessage: true, error: 'rate_limit', apiErrorStatus: 429,
+      message: { content: [], stop_reason: null } },
+  ].map((value, index) => JSON.stringify({ timestamp: new Date(Date.now() + index).toISOString(), ...value })).join('\n') + '\n');
+  assert.throws(verify, /Job ledger evidence is incomplete/, 'an ordinary restart still refuses both');
+  verify({ allowTerminalRateLimit: true })();
+  const state = JSON.parse(fs.readFileSync(path.join(root, '.keep/background-jobs/claude/parent/state.json')));
+  assert.equal(state.gap, true, 'accepting the gap never launders it away');
+  assert.equal(state.gapReason, 'transcript-replaced');
+  assert.equal(state.restart.completed, false);
+  assert.equal(state.restart.rateLimitTerminal, true);
+  assert.equal(jobs.settledGap(state, { unconsumedHooks: 0 }), false);
+  assert.equal(jobs.settledGap(state, { unconsumedHooks: 0, allowTerminalRateLimit: true }), true);
+  // The flag excuses the rate-limited turn, not any other gap reason.
+  state.gapReason = 'checkpoint-anchor';
+  fs.writeFileSync(path.join(root, '.keep/background-jobs/claude/parent/state.json'), JSON.stringify(state));
+  assert.throws(() => verify({ allowTerminalRateLimit: true }), /Job ledger evidence is incomplete/);
+}, 'claude'));

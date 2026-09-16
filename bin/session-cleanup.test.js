@@ -188,6 +188,9 @@ test('done-close policy waits from the latest done or activity time and enforces
   assert.equal(doneClosePlan(session, pane, state, now).reason, null);
   assert.match(doneClosePlan(session, pane, { ...state, allTasks: [done, { id: 'live', fm: { status: 'review', sessions: [{ id: 's' }] } }] }, now).reason, /not done/);
   assert.match(doneClosePlan({ ...session, unknownBackgroundJobs: ['history-gap'] }, pane, state, now).reason, /activity is unknown/);
+  // A settled compaction gap is the one unknown entry that is not live work.
+  assert.equal(doneClosePlan({ ...session, unknownBackgroundJobs: ['history-gap'], backgroundJobs: { gapSettled: true } }, pane, state, now).reason, null);
+  assert.match(doneClosePlan({ ...session, unknownBackgroundJobs: ['history-gap', 'bash-1'], backgroundJobs: { gapSettled: true } }, pane, state, now).reason, /activity is unknown/);
   assert.match(doneClosePlan(session, { ...pane, lastInputAt: new Date(now - 5 * 60e3).toISOString() }, state, now).reason, /activity within/);
   assert.match(doneClosePlan(session, { ...pane, lastOutputAt: new Date(now - 5 * 60e3).toISOString(), lastReadAt: null }, state, now).reason, /activity within/);
   assert.match(doneClosePlan(session, { ...pane, lastReadAt: new Date(now - 21 * 60e3).toISOString() }, state, now).reason, /unread/);

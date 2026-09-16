@@ -10,6 +10,21 @@ function isReviewer(session, pane) {
   return Boolean(session?.reviewer || pane?.meta?.reviewer);
 }
 
+// An auto-compacted session's job ledger carries a permanent `history-gap`
+// (gapReason 'transcript-replaced') that no replay can clear, which used to
+// refuse every non-forced restart and account transfer out of it forever. When
+// the ledger itself reports that gap as settled -- see
+// background-jobs.settledGap: no open job, no unresolved call, no unconsumed
+// hook, an ended turn, caught up, not recovering -- it stands for history that
+// predates the compaction with no live work attached, so it alone stops
+// counting as unknown background work. Every other uncertain entry still counts.
+// Every caller that gates on unknownBackgroundJobs has to discount it the same
+// way, so the filter lives here rather than being written out at each one.
+function blockingUnknownJobs(session) {
+  const gapSettled = session?.backgroundJobs?.gapSettled === true;
+  return (session?.unknownBackgroundJobs || []).filter((id) => !(gapSettled && id === 'history-gap'));
+}
+
 function refusal(session, pane, queued = false, options = {}) {
   const force = options.force === true;
   if (!session || !pane?.alive || pane.meta?.sessionId !== session.id || !['claude', 'codex'].includes(pane.meta?.agent)) return 'Session is not live in its original pane';
@@ -18,17 +33,9 @@ function refusal(session, pane, queued = false, options = {}) {
   // the model and the tick address all survive. Every guard below except the viewer
   // check still applies.
   if (session.activity?.background?.scheduled?.length || session.backgroundJobs?.jobs?.some(j => j.kind === 'scheduled' && j.status === 'pending')) return 'Pause session-local scheduled jobs before restarting';
-  // An auto-compacted session's job ledger carries a permanent `history-gap`
-  // (gapReason 'transcript-replaced') that no replay can clear, which used to
-  // refuse every non-forced restart and account transfer out of it forever.
-  // When the ledger itself reports that gap as settled -- see
-  // background-jobs.settledGap: no open job, no unresolved call, no unconsumed
-  // hook, a completed restart record, caught up, not recovering -- it stands for
-  // history that predates the compaction with no live work attached, so it alone
-  // stops blocking. Every other uncertain entry still counts, and every check
-  // below is unchanged.
-  const gapSettled = session.backgroundJobs?.gapSettled === true;
-  const unknownJobs = (session.unknownBackgroundJobs || []).filter((id) => !(gapSettled && id === 'history-gap'));
+  // A settled history-gap alone stops blocking (see blockingUnknownJobs); every
+  // other uncertain entry still counts, and every check below is unchanged.
+  const unknownJobs = blockingUnknownJobs(session);
   // A forced restart discards only uncertain background evidence (a gapped job
   // ledger, stale pending entries, unknown or lifecycle agent work). A turn that
   // has not ended, a live tool, a rate limit, a running/waiting foreground
@@ -149,4 +156,4 @@ function createManager({ file, inspect, restart, forceRestart, onChange = () => 
   };
 }
 
-module.exports = { isReviewer, refusal, read, createManager, RestartDeferred };
+module.exports = { isReviewer, blockingUnknownJobs, refusal, read, createManager, RestartDeferred };

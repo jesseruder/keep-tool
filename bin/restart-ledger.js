@@ -37,8 +37,10 @@ function verify({ root, agent, sid, file, instance, resolveChild, budget = 4 * 1
     // auto-compacted session carries that gap forever and it stands for history
     // with no live work attached. Unlike force this takes no shortcut: the
     // checkpoint pinning, the completion record, the unresolved jobs and the
-    // whole child graph below are all still verified.
-    const settled = jobs.settledGap(state, { unconsumedHooks: pendingHooks });
+    // whole child graph below are all still verified. A turn the API ended with
+    // a terminal rate limit counts as ended for the gap exactly where it already
+    // counts as ended for the completion record below, under the same flag.
+    const settled = jobs.settledGap(state, { unconsumedHooks: pendingHooks, allowTerminalRateLimit });
     if (state.restartVersion !== jobs.restartVersion(agent)
         || (!force && ((state.gap && !settled) || !state.restart))) throw Error('Job ledger evidence is incomplete');
     const stat = fs.statSync(source), cp = state.checkpoint;

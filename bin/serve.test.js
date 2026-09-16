@@ -3287,6 +3287,14 @@ test('a hit usage limit is recorded as rateLimit until the session moves past it
     assert.equal(weekly.rateLimit.resetsAt, null);
     assert.equal(weekly.endedTurn, true);
 
+    // The live sentence often omits the model version entirely.
+    fs.writeFileSync(file, [...opening, limitError(
+      "You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.", null)].join('\n'));
+    assert.equal(scanTranscript(file).rateLimit.type, 'fable_weekly', 'an unversioned Fable limit is the same quota');
+    fs.writeFileSync(file, [...opening, limitError(
+      "Switch models with /model to keep using Fable on this task.", null)].join('\n'));
+    assert.equal(scanTranscript(file).rateLimit.type, 'unknown', 'a bare "Fable" is not a limit');
+
     fs.writeFileSync(file, [...opening, fiveHour, record('user', 'continue')].join('\n'));
     assert.equal(scanTranscript(file).rateLimit, null, 'a later prompt means the session resumed');
 
@@ -6870,6 +6878,33 @@ test('compact session restores the pane launch model rather than the transcript 
     else process.env.KEEP_COMPACT_TIMEOUT_MS = priorTimeout;
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('a rate-limited restart is not blocked by a settled history-gap', async () => {
+  const { restartSession } = require('./serve');
+  // The four sessions this came from all sat at "You've reached your Fable
+  // limit" with an auto-compacted ledger: endedTurn false, rateLimit set, and a
+  // lone settled `history-gap`. The terminal-limit path has to discount that gap
+  // the same way session-restart.refusal does, or it never supplies the ended
+  // turn and the refusal fires before the gap is ever considered.
+  const pane = { id: 'p', pid: 10, alive: true, attached: 0, visibleAttached: 0,
+    meta: { sessionId: 'limited', agent: 'claude' } };
+  const session = { id: 'limited', kind: 'claude', state: 'idle', endedTurn: false,
+    rateLimit: { at: '2026-09-12T20:34:01.831Z', type: 'fable_weekly' },
+    pendingBackground: false, toolRunning: false, pendingQuestion: null, pendingPlan: null,
+    unknownBackgroundJobs: ['history-gap'],
+    backgroundJobs: { pending: false, uncertain: ['history-gap'], caughtUp: true, gapSettled: true, jobs: [] } };
+  const deps = (over = {}) => ({ withInjectionLock: (fn) => fn(), allowTerminalRateLimit: true,
+    buildState: async () => ({ sessions: [over.session || session], tasks: [] }),
+    host: { request: async (type) => type === 'hello' ? { replaceExited: true } : { pane } } });
+  const restart = (over) => restartSession({ sessionId: 'limited', pane: 'p', pid: 10, mode: 'idle' }, deps(over));
+  // Getting as far as the resume directory means the refusal let it through; the
+  // reviewer test below covers the rest of the restart.
+  await assert.rejects(restart(), /Session directory is unavailable/);
+  await assert.rejects(restart({ session: { ...session, backgroundJobs: { ...session.backgroundJobs, gapSettled: false } } }),
+    /Waiting for the turn and background work to finish/, 'an unsettled gap still refuses');
+  await assert.rejects(restart({ session: { ...session, unknownBackgroundJobs: ['history-gap', 'bash-7'] } }),
+    /Waiting for the turn and background work to finish/, 'a settled gap excuses only itself');
 });
 
 test('restarting the fleet reviewer keeps its identity, its launch env, and its tick address', async () => {

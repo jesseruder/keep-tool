@@ -419,7 +419,8 @@ function catchUpStoppedLedger(plan, sessionId, transactionId, options) {
   let pendingHooks = 0;
   try { pendingHooks = fs.readdirSync(path.join(path.dirname(snapshot), 'inbox')).length; }
   catch (error) { if (error.code !== 'ENOENT') pendingHooks = 1; }
-  const settledGap = require('./background-jobs').settledGap(before, { unconsumedHooks: pendingHooks });
+  const settledGap = require('./background-jobs').settledGap(before,
+    { unconsumedHooks: pendingHooks, allowTerminalRateLimit: true });
   if (!before || before.version !== 1 || (before.gap && !settledGap && options.force !== true) || before.source?.agent !== 'claude'
       || before.source.sid !== sessionId || path.resolve(before.source.file || '') !== path.resolve(transcript.source)) {
     throw failure('job ledger source evidence is unavailable for stopped-session recovery', 'KEEP_ARTIFACT_LEDGER');
@@ -471,7 +472,7 @@ function rebindLedger(sessionId, source, target, transactionId, options = {}) {
     }
     visiting.add(id);
     const result = rebind({ root: plan.root, agent: 'claude', sid: id, sourceFile, targetFile, transactionId,
-      sourceStopVerifiedAt: options.sourceStopVerifiedAt, force: options.force === true });
+      sourceStopVerifiedAt: options.sourceStopVerifiedAt, allowTerminalRateLimit: true, force: options.force === true });
     rebound.push({ sessionId: id, reused: result.reused === true });
     // Under force the persisted child graph is exactly the evidence
     // restart-ledger.verify refused to trust, and a stale entry can name a child

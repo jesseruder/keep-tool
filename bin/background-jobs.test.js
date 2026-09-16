@@ -752,9 +752,20 @@ test('a settled transcript-replaced gap reports as settled and rebinds without f
       { recovering: true },
       { coldReplay: { startedAt: 2000, fromIdentity: 'x' } },
       { restart: { ...settled.restart, completed: false } },
+      { restart: { ...settled.restart, completed: false, rateLimitTerminal: true } },
+      { restart: { ...settled.restart, completed: false, rateLimitTerminal: false } },
       { restart: undefined },
     ]) assert.equal(jobs.settledGap({ ...settled, ...patch }, { unconsumedHooks: 0 }), false,
       `a settled gap is refused by ${Object.keys(patch)[0]}`);
+    // A turn the API ended with a terminal per-model rate limit never records a
+    // completion, so callers that already accept that end state ask for it here.
+    const limited = { ...settled, restart: { ...settled.restart, completed: false, rateLimitTerminal: true } };
+    assert.equal(jobs.settledGap(limited, { unconsumedHooks: 0, allowTerminalRateLimit: true }), true);
+    assert.equal(jobs.settledGap(limited, { unconsumedHooks: 1, allowTerminalRateLimit: true }), false);
+    assert.equal(jobs.settledGap({ ...limited, restart: { ...limited.restart, rateLimitTerminal: false } },
+      { unconsumedHooks: 0, allowTerminalRateLimit: true }), false, 'only a terminal rate limit stands in for a completion');
+    assert.equal(jobs.settledGap({ ...limited, recovering: true }, { unconsumedHooks: 0, allowTerminalRateLimit: true }), false);
+    assert.equal(jobs.settledGap({ ...limited, gapReason: 'checkpoint-anchor' }, { unconsumedHooks: 0, allowTerminalRateLimit: true }), false);
     assert.equal(jobs.settledGap({ ...settled, jobs: {
       'job:done': { id: 'done', kind: 'command', status: 'completed', eventAt: 2000 },
       'job:svc': { id: 'svc', kind: 'service', status: 'pending', eventAt: 2000 },
@@ -775,6 +786,17 @@ test('a settled transcript-replaced gap reports as settled and rebinds without f
     fs.writeFileSync(snapshot, JSON.stringify(unsettled));
     assert.throws(() => jobs.rebindSource({ ...request, transactionId: 'tx-unsettled' }),
       /job ledger evidence is incomplete/);
+
+    // The same ledger whose turn the API cut off rebinds only for a caller that
+    // accepts that end state, and never for one that does not.
+    // `settled` is the pre-rebind snapshot, so its checkpoint still names the source.
+    const limitedState = { ...settled, restart: { ...settled.restart, completed: false, rateLimitTerminal: true } };
+    const restore = () => fs.writeFileSync(snapshot, JSON.stringify(limitedState));
+    restore();
+    assert.throws(() => jobs.rebindSource({ ...request, transactionId: 'tx-limited' }),
+      /job ledger evidence is incomplete/);
+    restore();
+    assert.equal(jobs.rebindSource({ ...request, transactionId: 'tx-limited', allowTerminalRateLimit: true }).reused, false);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

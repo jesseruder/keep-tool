@@ -42,7 +42,13 @@ function markGap(state, now, reason) {
 // callers). Only this reason qualifies: 'checkpoint-anchor' and
 // 'hook-transcript-mismatch' can hide work the ledger never observed, a legacy
 // gap carries no reason at all, and the non-sticky reasons clear themselves on
-// a cold replay so they never need this door. `unconsumedHooks` has no default:
+// a cold replay so they never need this door. A turn that the API ended by
+// refusing it -- a terminal per-model rate limit -- leaves `restart.completed`
+// false and `restart.rateLimitTerminal` true, because the agent never got to
+// finish. That is an ended turn too, and it is the same end state
+// restart-ledger.verify accepts under its own `allowTerminalRateLimit` flag, so
+// this takes the option under the same name and only honours it when a caller
+// passes it. `unconsumedHooks` has no default:
 // a caller that cannot count the inbox must not get a settled verdict.
 // Callers that know whether the ledger has read its source to EOF also require
 // that (`caughtUp`); the ledger checks that separately where it matters.
@@ -51,10 +57,11 @@ function markGap(state, now, reason) {
 // still a child process of the agent, which mcp-restart.inspect refuses before
 // the source is stopped; an in-process agent lost that way is the same exposure
 // a forced restart already accepts.
-function settledGap(state, { unconsumedHooks } = {}) {
+function settledGap(state, { unconsumedHooks, allowTerminalRateLimit = false } = {}) {
   if (!state || state.gap !== true || state.gapReason !== 'transcript-replaced') return false;
   if (state.recovering || state.coldReplay) return false;
-  if (state.restart?.completed !== true) return false;
+  if (state.restart?.completed !== true
+      && !(allowTerminalRateLimit === true && state.restart?.rateLimitTerminal === true)) return false;
   if (unconsumedHooks !== 0) return false;
   if (!state.jobs || !state.calls || Object.keys(state.calls).length) return false;
   return !Object.values(state.jobs).some(j => !TERMINAL.has(j.status) && !['service', 'scheduled'].includes(j.kind));
@@ -135,7 +142,8 @@ function sameFrozenFile(file, evidence) {
 // Called only after the handoff artifact transaction has verified an exact copy
 // and the source process has exited. Ordinary sync never invokes this escape
 // hatch: unrelated path/inode changes remain permanent gaps.
-function rebindSource({ root, agent, sid, sourceFile, targetFile, transactionId, sourceStopVerifiedAt, force = false }) {
+function rebindSource({ root, agent, sid, sourceFile, targetFile, transactionId, sourceStopVerifiedAt,
+  force = false, allowTerminalRateLimit = false }) {
   if (!['claude', 'codex'].includes(agent) || !ID.test(sid || '') || !ID.test(transactionId || '')
       || !Number.isFinite(sourceStopVerifiedAt) || sourceStopVerifiedAt <= 0
       || !path.isAbsolute(sourceFile || '') || !path.isAbsolute(targetFile || '')
@@ -170,7 +178,7 @@ function rebindSource({ root, agent, sid, sourceFile, targetFile, transactionId,
     let entries = [];
     try { entries = fs.readdirSync(path.join(ledgerDir, 'inbox')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
     if (state.version !== 1 || state.restartVersion !== restartVersion(agent) || !state.jobs || !state.calls
-        || (!force && (!state.restart || (state.gap && !settledGap(state, { unconsumedHooks: entries.length }))))
+        || (!force && (!state.restart || (state.gap && !settledGap(state, { unconsumedHooks: entries.length, allowTerminalRateLimit }))))
         || state.recovering) throw failure('job ledger evidence is incomplete');
     if (entries.length) throw failure('job ledger has unconsumed hook evidence');
     const source = fileEvidence(sourceFile, true), target = fileEvidence(targetFile, true);
@@ -466,7 +474,12 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
       return { pending: open.some(j => !uncertain.includes(j.id)), uncertain,
         jobs: currentJobs.map(j => ({ ...j, confidence: TERMINAL.has(j.status) ? 'observed' : uncertain.includes(j.id) ? 'uncertain' : 'observed' })),
         recovering: Boolean(state.recovering), gap: Boolean(state.gap), gapReason: state.gapReason,
-        gapSettled: settledGap(state, { unconsumedHooks: pendingHooks }),
+        // A summary only says whether the gap still hides work; whether a
+        // rate-limited session may be stopped at all is the session-level
+        // rateLimit check and the caller's own allowTerminalRateLimit flag
+        // (serve.js terminalLimit, restart-ledger.verify, rebindSource), so the
+        // summary has no reason to withhold the verdict from them.
+        gapSettled: settledGap(state, { unconsumedHooks: pendingHooks, allowTerminalRateLimit: true }),
         gapClearedAt: state.gapClearedAt, lastColdReplayAt: state.lastColdReplayAt,
         bytesRead: 0, lastReconciledAt: state.lastReconciledAt,
         redirect: state.source };
@@ -711,7 +724,9 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
       recovering, gap: state.gap, gapReason: state.gapReason, gapClearedAt: state.gapClearedAt,
       // A ledger that has not read its source to EOF may still be hiding live
       // work behind the gap, so a settled verdict also requires being caught up.
-      gapSettled: caughtUp === true && settledGap(state, { unconsumedHooks: consumed.length }),
+      // The verdict covers a turn the API ended with a terminal rate limit too;
+      // see the retired-source summary above for why the summary may report it.
+      gapSettled: caughtUp === true && settledGap(state, { unconsumedHooks: consumed.length, allowTerminalRateLimit: true }),
       lastColdReplayAt: state.lastColdReplayAt, caughtUp, unresolvedCalls: Object.keys(state.calls).length,
       unconsumedHooks: consumed.length, bytesRead, lastReconciledAt: now };
   } finally { try { fs.unlinkSync(lock); } catch {} }
@@ -734,8 +749,11 @@ function read(root, agent, sid, now = Date.now(), staleAfter = 30 * 60e3) {
       recovering: Boolean(state.recovering), gap: Boolean(state.gap), gapReason: state.gapReason,
       // This is the ledger view the dashboard puts on session.backgroundJobs, so
       // it is the one the restart/transfer refusal reads. An inbox that cannot
-      // be read yields no hook count, so the gap cannot settle on it.
-      gapSettled: caughtUp === true && settledGap(state, { unconsumedHooks: inboxReadable ? unconsumedHooks : undefined }),
+      // be read yields no hook count, so the gap cannot settle on it. It reports
+      // a terminal rate limit as settled too: see the retired-source summary
+      // above -- the session-level rateLimit check, not this field, decides
+      // whether a rate-limited session may be stopped.
+      gapSettled: caughtUp === true && settledGap(state, { unconsumedHooks: inboxReadable ? unconsumedHooks : undefined, allowTerminalRateLimit: true }),
       gapClearedAt: state.gapClearedAt, lastColdReplayAt: state.lastColdReplayAt,
       unresolvedCalls: Object.keys(state.calls || {}).length,
       unconsumedHooks,

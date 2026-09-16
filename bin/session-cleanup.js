@@ -30,7 +30,7 @@ function refusal(session, pane, pinned, now = Date.now(), options = {}) {
     session.activity?.reason === 'your review' ||
     (session.activity?.reason === 'question' && session.activity?.request?.kind === 'input')
   );
-  if ((!['idle', 'done'].includes(session.state) && !nextInstruction && !manualAttention && !manualScheduled) || session.endedTurn !== true || session.toolRunning || session.pendingBackground || session.unknownBackgroundJobs?.length || session.waitingFor || session.pendingQuestion || session.pendingPlan || session.rateLimit || (session.activity?.needsInput && !nextInstruction && !manualAttention)) return 'Session is active, waiting, needs input, or activity is unknown';
+  if ((!['idle', 'done'].includes(session.state) && !nextInstruction && !manualAttention && !manualScheduled) || session.endedTurn !== true || session.toolRunning || session.pendingBackground || require('./session-restart').blockingUnknownJobs(session).length || session.waitingFor || session.pendingQuestion || session.pendingPlan || session.rateLimit || (session.activity?.needsInput && !nextInstruction && !manualAttention)) return 'Session is active, waiting, needs input, or activity is unknown';
   if (!Number.isFinite(session.mtime)) return 'Session activity time is unknown';
   const idleMs = Number.isFinite(options.idleMs) ? options.idleMs : IDLE_MS;
   const activityAt = Math.max(session.mtime, Number(options.activityAt) || 0);
