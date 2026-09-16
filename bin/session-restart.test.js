@@ -302,3 +302,79 @@ test('restart transaction resumes the same ID only after verified exit and prese
     }
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('a restart names the swapped-out model when the model key is busy', async () => {
+  const { restartSession, InjectionError } = require('./serve');
+  const accounts = require('./accounts');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-restart-busy-model-'));
+  const rollout = path.join(root, 'rollout.jsonl');
+  const claudeFile = path.join(root, 'claude.jsonl');
+  fs.writeFileSync(claudeFile, `${JSON.stringify({ type: 'assistant', sessionId: 's', message: { content: [], stop_reason: 'end_turn' } })}\n`);
+  fs.writeFileSync(rollout, `${JSON.stringify({ type: 'session_meta', payload: { id: 's', source: 'cli' } })}\n`
+    + `${JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete' } })}\n`);
+  const configDir = path.join(root, 'secondary'); fs.mkdirSync(configDir);
+  const config = path.join(root, 'config.json');
+  fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+    { id: 'secondary', label: 'Secondary', agent: 'claude', configDir },
+  ], defaultAccounts: { claude: 'secondary' } }));
+  try {
+    // Only a Claude agent on the built-in profile reads the settings.json the swap record
+    // describes. A Codex resume takes its model and reasoning effort from config.toml, and
+    // a managed Claude profile reads a settings.json of its own.
+    for (const profile of ['built-in', 'codex', 'managed']) {
+      const kind = profile === 'codex' ? 'codex' : 'claude';
+      const session = { id: 's', kind, state: 'idle', endedTurn: true, project: root };
+      let pane = { id: 'p', pid: 10, cmd: '/bin/zsh', args: ['-l'], alive: true, attached: 0, visibleAttached: 0,
+        cols: 80, rows: 24, meta: { sessionId: 's', agent: kind, title: 'Original' } };
+      const resume = kind === 'claude' ? '--resume' : 'resume';
+      const row = { pid: 11, ppid: 10, pidStart: 'Tue Sep  8 10:00:00 2026', agent: kind, interactive: true,
+        args: `/test/${kind} ${resume} s` };
+      const scopes = []; let exited = false, replaced = null, closed = false;
+      const deps = {
+        root,
+        // A compaction holds the model key for its whole run; every other key is free.
+        withInjectionLock: (fn, scope) => {
+          scopes.push(scope);
+          if (scope.model) throw new InjectionError(429, 'another session injection is busy');
+          return fn();
+        },
+        compactionSwappedModel: () => 'claude-fable-5-1[1m]',
+        buildState: async () => ({ sessions: [session], tasks: [] }),
+        codexRolloutFile: () => rollout, claudeRolloutFile: () => claudeFile,
+        agentProcessRows: async () => (exited ? [] : [row]),
+        psTable: `11 10 ttys001 Tue Sep  8 10:00:00 2026 /test/${kind} ${resume} s`,
+        lsof: async () => '',
+        closeIdleSession: async (_body, guards) => {
+          closed = true; await guards.beforeClose(); exited = true; pane.alive = false;
+        },
+        sleep: async () => {},
+        readScreenResult: async () => ({ text: `${kind} ${resume} s\n~/keep > `, cursor: { x: 9, y: 1 } }),
+        waitForHostAgent: async () => { assert.ok(replaced); },
+        host: { request: async (type, params) => {
+          if (type === 'hello') return { replaceExited: true };
+          if (type === 'get') return { pane: { ...pane } };
+          if (type === 'list') return { panes: [{ ...pane }] };
+          if (type === 'input') return {};
+          assert.equal(type, 'replace-exited');
+          replaced = params; pane = { ...pane, alive: true, pid: 20 }; return { pane };
+        } },
+      };
+      if (profile === 'managed') {
+        deps.env = { KEEP_DIR: root, KEEP_CONFIG: config };
+        accounts.pinSession('s', 'claude', 'secondary', { root, env: deps.env });
+      }
+      if (profile === 'built-in') {
+        const result = await restartSession({ sessionId: 's', pane: 'p', pid: 10, mode: 'now' }, deps);
+        assert.equal(result.pane, 'p');
+        assert.ok(replaced.args[1].includes("'--model' 'claude-fable-5-1[1m]'"), 'resumes on the pre-swap model');
+        assert.deepEqual(scopes.map(scope => Boolean(scope.model)), [true, false],
+          'the second attempt holds the pane and session keys but not the model key');
+      } else {
+        await assert.rejects(restartSession({ sessionId: 's', pane: 'p', pid: 10, mode: 'now' }, deps),
+          /another session injection is busy/, profile);
+        assert.equal(replaced, null, profile);
+        assert.equal(closed, false, `${profile}: the 429 comes back before the session is closed`);
+      }
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

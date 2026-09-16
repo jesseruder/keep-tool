@@ -909,6 +909,13 @@ function injectionBusyError() {
   return new InjectionError(429, 'another session injection is busy');
 }
 
+// Only the contended-keys refusal, never the 429 the restart gate raises: one is
+// worth starting an agent a different way, the other means no agent may start.
+function injectionKeysBusy(error) {
+  return error instanceof InjectionError && error.status === 429
+    && error.message === injectionBusyError().message;
+}
+
 function injectionLocked() {
   return Boolean(injectionGlobalHolder) || injectionHolders.size > 0;
 }
@@ -2021,6 +2028,26 @@ function repairClaudeSettingsModel(expected, expectedPresent = Boolean(expected)
       try { fs.unlinkSync(temp); } catch {}
     }
   }
+}
+
+// The model settings.json held before an in-flight compaction swapped it, for a caller
+// that will name it on the command line rather than let the agent read the file. The
+// compaction records it before typing /model and keeps it until the file is put back,
+// so it is what an agent starting now should run on.
+//
+// Only an in-flight compaction answers. Every other holder of the model key — a typed
+// /model, an interrupted compaction's restore — is in the middle of deciding what
+// settings.json says, and reading it mid-decision is exactly what the key is there to
+// prevent: the file still holds the old model, or a restore's transient one, and naming
+// that would start the agent on a model about to stop being the right one.
+//
+// '' also covers a swap that recorded no model at all, which means the agent's own
+// default: no command line can name that, so the caller must keep waiting for the key.
+function compactionSwappedModel(deps = {}) {
+  const swap = deps.inFlightCompactSwap !== undefined ? deps.inFlightCompactSwap : inFlightSwap;
+  if (!swap || !swap.settingsModelPresent) return '';
+  const model = typeof swap.settingsModelBefore === 'string' ? swap.settingsModelBefore : '';
+  return keep.LAUNCH_MODEL_RE.test(model) ? model : '';
 }
 
 function compactSwapPlan(session, opts) {
@@ -3289,9 +3316,16 @@ async function restartSession(body, deps = {}) {
   let exitInputStarted = false;
   const transient = (reason) => body.mode === 'idle' && !exitInputStarted
     ? new (require('./session-restart').RestartDeferred)(reason) : new InjectionError(409, reason);
-  // The resumed agent reads settings.json's model at startup, so it also holds the
-  // model key: a restart never starts an agent while a compaction has swapped it.
-  return (deps.withInjectionLock || withInjectionLock)(async () => {
+  // The resumed agent reads settings.json's model at startup, so a restart also holds
+  // the model key: it never starts an agent while a compaction has swapped the file.
+  // A busy key does not fail the restart — it runs again naming the model the compaction
+  // swapped out, so the resumed agent never reads the file. Not every session can be
+  // named that way, and the second attempt gives the 429 back before it closes anything.
+  // `entered` keeps that attempt for a key this restart never got, never for a 429
+  // raised once the body was underway and the session may already be gone.
+  let entered = false;
+  const attempt = (inheritedModel) => (deps.withInjectionLock || withInjectionLock)(async () => {
+    entered = true;
     if (!(await host('hello')).replaceExited) throw Error('Terminal host must be refreshed before restarting sessions');
     const pane = (await host('get', { pane: body.pane })).pane;
     const session = (await (deps.buildState || buildState)({ hostPanes: [pane] })).sessions.find((s) => s.id === body.sessionId);
@@ -3317,6 +3351,11 @@ async function restartSession(body, deps = {}) {
       }
       account ||= accounts.defaultFor(session.kind, deps.env || process.env);
     }
+    // This attempt gave up the model key on the promise of naming the model itself, which
+    // only describes a Claude agent on the built-in profile: Codex resumes on a model and
+    // reasoning effort from config.toml, and a managed profile reads its own settings.json.
+    // Hand the 429 back here, before anything is closed, rather than part way through.
+    if (inheritedModel && !(session.kind === 'claude' && account.builtIn === true)) throw injectionBusyError();
     let resumeMcpConfig = deps.resumeMcpConfig || null;
     if (session.kind === 'claude' && account.managed) {
       try { resumeMcpConfig ||= (deps.ensureSharedMemory || require('./account-setup').ensureSharedMemory)(account, cwd).mcpConfig; }
@@ -3395,7 +3434,8 @@ async function restartSession(body, deps = {}) {
     const reviewerSpec = reviewerResumeSpec(session, pane, deps);
     const requestedResumeModel = deps.resumeModel || pane.meta?.model;
     const launchModel = typeof requestedResumeModel === 'string' && keep.LAUNCH_MODEL_RE.test(requestedResumeModel) ? requestedResumeModel : '';
-    const modelArgs = launchModel ? (session.kind === 'codex' ? ['-m', launchModel] : ['--model', launchModel]) : [];
+    const resumeModel = launchModel || (session.kind === 'claude' ? inheritedModel : '');
+    const modelArgs = resumeModel ? (session.kind === 'codex' ? ['-m', resumeModel] : ['--model', resumeModel]) : [];
     const mcpArgs = session.kind === 'claude' && resumeMcpConfig ? ['--mcp-config', resumeMcpConfig] : [];
     let argv;
     if (deps.resumeArgv != null) {
@@ -3417,11 +3457,23 @@ async function restartSession(body, deps = {}) {
     await (deps.waitForHostAgent || waitForHostAgent)({ pane: pane.id }, session.kind, deps);
     return { ok: true, sessionId: session.id, pane: result.pane.id, pid: result.pane.pid,
       createdAt: result.pane.createdAt };
-  }, { pane: body.pane, session: body.sessionId, model: true });
+  }, { pane: body.pane, session: body.sessionId, ...(inheritedModel ? {} : { model: true }) });
+
+  try { return await attempt(''); }
+  catch (error) {
+    if (entered || !injectionKeysBusy(error)) throw error;
+    const inherited = (deps.compactionSwappedModel || compactionSwappedModel)(deps);
+    if (!inherited) throw error;
+    return attempt(inherited);
+  }
 }
 
+// Same two attempts as restartSession: hold the model key so the resumed agent reads a
+// settled settings.json, and if the key is busy, name the model a compaction swapped out.
 async function forceRestartSession(entry, save, deps = {}) {
-  return (deps.withInjectionLock || withInjectionLock)(async () => {
+  let entered = false;
+  const attempt = (inheritedModel) => (deps.withInjectionLock || withInjectionLock)(async () => {
+    entered = true;
     const host = (type, params) => hostRequest(type, params, deps);
     if (!(await host('hello')).replaceExited) throw Error('Terminal host must be refreshed before restarting sessions');
     const initial = (await host('get', { pane: entry.pane })).pane;
@@ -3440,6 +3492,11 @@ async function forceRestartSession(entry, save, deps = {}) {
       }
     }
     resumeAccount ||= accounts.defaultFor(resumeAgent, deps.env || process.env);
+    // Only a Claude agent on the built-in profile reads the settings.json this attempt
+    // gave up the key to name: Codex resumes on a model and reasoning effort from
+    // config.toml, and a managed profile reads a settings.json of its own. Hand the 429
+    // back here, before the close, rather than part way through the restart.
+    if (inheritedModel && !(resumeAgent === 'claude' && resumeAccount.builtIn === true)) throw injectionBusyError();
     let resumeMcpConfig = null;
     if (resumeAgent === 'claude' && resumeAccount.managed) {
       try { resumeMcpConfig = (deps.ensureSharedMemory || require('./account-setup').ensureSharedMemory)(resumeAccount, cwd).mcpConfig; }
@@ -3481,7 +3538,8 @@ async function forceRestartSession(entry, save, deps = {}) {
         const bypass = original.agent === 'codex' ? '--dangerously-bypass-approvals-and-sandbox' : '--dangerously-skip-permissions';
         const reviewerSpec = reviewerResumeSpec({ id: job.sessionId }, original, deps);
         const launchModel = typeof original.meta?.model === 'string' && keep.LAUNCH_MODEL_RE.test(original.meta.model) ? original.meta.model : '';
-        const modelArgs = launchModel ? (original.agent === 'codex' ? ['-m', launchModel] : ['--model', launchModel]) : [];
+        const resumeModel = launchModel || (original.agent === 'claude' ? inheritedModel : '');
+        const modelArgs = resumeModel ? (original.agent === 'codex' ? ['-m', resumeModel] : ['--model', resumeModel]) : [];
         const account = resumeAccount;
         const mcpArgs = resumeMcpConfig ? ['--mcp-config', resumeMcpConfig] : [];
         const argv = [original.agent, ...(original.bypass ? [bypass] : []), ...reviewerSpec.flags, ...mcpArgs, ...modelArgs,
@@ -3500,7 +3558,15 @@ async function forceRestartSession(entry, save, deps = {}) {
         return { ok: true, pane: result.pane.id, pid: result.pane.pid, sessionId: job.sessionId };
       },
     });
-  }, { pane: entry.pane, session: entry.sessionId, model: true });
+  }, { pane: entry.pane, session: entry.sessionId, ...(inheritedModel ? {} : { model: true }) });
+
+  try { return await attempt(''); }
+  catch (error) {
+    if (entered || !injectionKeysBusy(error)) throw error;
+    const inherited = (deps.compactionSwappedModel || compactionSwappedModel)(deps);
+    if (!inherited) throw error;
+    return attempt(inherited);
+  }
 }
 
 async function closeIdleSession(body, deps = {}) {
@@ -4774,11 +4840,16 @@ async function openSession(body, deps = {}) {
   const codexFlagArgs = String(codexFlags || '').trim().split(/\s+/).filter(Boolean);
   const launchedAt = (deps.now || Date.now)();
 
-  const launchHost = async () => {
+  // `inheritedModel` is set only when the launch could not hold the model key and is
+  // naming settings.json's model itself; it rides the command line exactly like an
+  // explicit one, but stays out of the pane meta, which means "the caller asked for
+  // this model" and is compared against the request when an open is retried.
+  const launchHost = async (inheritedModel = '') => {
     const sessionId = session ? session.id : agent === 'claude' ? (deps.randomUUID || crypto.randomUUID)() : null;
+    const commandModel = launchModel || inheritedModel;
     const argv = agent === 'codex'
-      ? ['codex', ...codexFlagArgs, ...(launchModel ? ['-m', launchModel] : []), ...(sessionId ? ['resume', sessionId] : [])]
-      : ['claude', ...claudeFlagArgs, ...(accountMcpConfig ? ['--mcp-config', accountMcpConfig] : []), ...(launchModel ? ['--model', launchModel] : []),
+      ? ['codex', ...codexFlagArgs, ...(commandModel ? ['-m', commandModel] : []), ...(sessionId ? ['resume', sessionId] : [])]
+      : ['claude', ...claudeFlagArgs, ...(accountMcpConfig ? ['--mcp-config', accountMcpConfig] : []), ...(commandModel ? ['--model', commandModel] : []),
         ...(sessionId ? [session ? '--resume' : '--session-id', sessionId] : [])];
     const command = argv.join(' ');
     // A launch that bypasses permission prompts has already crossed the boundary the
@@ -4870,9 +4941,33 @@ async function openSession(body, deps = {}) {
     }
   }
 
-  // A new pane has no lock to collide with. The launched agent reads settings.json's
-  // model at startup, so it holds only the model key: never start mid-compaction.
-  const launch = await withInjectionLock(launchHost, { model: true });
+  // A new pane has no lock to collide with, so the launch holds the model key for one
+  // reason: the agent it starts reads its model out of a config file a compaction may
+  // be swapping. A Claude launch that already names the model on the command line
+  // reads nothing, because the Claude swap touches only settings.json's model. A Codex
+  // one still does: that swap also rewrites model_reasoning_effort, which `-m` does not
+  // override.
+  //
+  // When the key is busy the launch does not fail. It names the model the compaction
+  // swapped out, which makes the file the agent never reads irrelevant. That only works
+  // for a Claude agent on the built-in profile: Codex takes its model from a config.toml
+  // whose own swap keeps no in-memory record, and a managed Claude profile reads its own
+  // settings.json, which the recorded value does not describe.
+  const readsSettingsModel = !launchModel || agent === 'codex';
+  const canNameSwappedModel = agent === 'claude' && !launchModel && account.builtIn === true;
+  let launch;
+  let spawnStarted = false;
+  try {
+    launch = await withInjectionLock(
+      () => { spawnStarted = true; return launchHost(); }, readsSettingsModel ? { model: true } : {},
+    );
+  } catch (error) {
+    // Only a key this launch never got earns a second attempt: nothing may spawn twice.
+    const inherited = !spawnStarted && injectionKeysBusy(error) && canNameSwappedModel
+      ? (deps.compactionSwappedModel || compactionSwappedModel)(deps) : '';
+    if (!inherited) throw error;
+    launch = await withInjectionLock(() => launchHost(inherited), {});
+  }
   const handoff = Boolean(body.taskId) && !session;
   let releasePending = handoff && Boolean(body.requester);
   const release = () => {
@@ -7924,6 +8019,7 @@ module.exports = {
   compactRequestTelemetry,
   hasCompactionMarker,
   compactSwapPlan,
+  compactionSwappedModel,
   ensureCompactionRestored,
   afterCompactAction,
   pendingCompactSwaps,

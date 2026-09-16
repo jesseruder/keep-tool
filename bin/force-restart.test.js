@@ -117,6 +117,65 @@ test('daemon adapter preserves pane, conversation and permission class for both 
   }
 });
 
+test('force restart names the swapped-out model when the model key is busy', async t => {
+  const { forceRestartSession, InjectionError } = require('./serve');
+  const accounts = require('./accounts');
+  const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-force-busy-model-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const configDir = path.join(root, 'secondary'); fs.mkdirSync(configDir);
+  const config = path.join(root, 'config.json');
+  fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+    { id: 'secondary', label: 'Secondary', agent: 'claude', configDir },
+  ], defaultAccounts: { claude: 'secondary' } }));
+
+  // Only a Claude agent on the built-in profile reads the settings.json the swap record
+  // describes. A Codex resume takes its model and reasoning effort from config.toml, and
+  // a managed Claude profile reads a settings.json of its own.
+  for (const profile of ['built-in', 'codex', 'managed']) {
+    const agent = profile === 'codex' ? 'codex' : 'claude';
+    const f = fixture(); f.pane().meta.agent = agent;
+    f.rows([{ pid: 10, ppid: 1, pidStart: 'shell' }, { pid: 11, ppid: 10, pidStart: 'agent',
+      agent, interactive: true, args: `${agent} ${agent === 'codex' ? 'resume' : '--resume'} s` }]);
+    const scopes = []; let launch, closed = false;
+    const deps = {
+      // A compaction holds the model key for its whole run; every other key is free.
+      withInjectionLock: (fn, scope) => {
+        scopes.push(scope);
+        if (scope.model) throw new InjectionError(429, 'another session injection is busy');
+        return fn();
+      },
+      compactionSwappedModel: () => 'claude-fable-5-1[1m]',
+      forceRows: f.deps.rows, sleep: async () => {}, lsof: async () => '',
+      closeIdleSession: async () => { closed = true; f.pane().alive = false; f.rows([]); },
+      waitForHostAgent: async () => {},
+      host: { request: async (type, params) => {
+        if (type === 'hello') return { replaceExited: true };
+        if (type === 'get') return { pane: f.pane() };
+        if (type === 'kill') { f.pane().alive = false; return {}; }
+        assert.equal(type, 'replace-exited'); launch = params;
+        return { pane: { id: 'p', pid: 20 } };
+      } },
+    };
+    if (profile === 'managed') {
+      deps.root = root;
+      deps.env = { KEEP_DIR: root, KEEP_CONFIG: config };
+      accounts.pinSession('s', 'claude', 'secondary', { root, env: deps.env });
+    }
+    if (profile === 'built-in') {
+      await forceRestartSession(f.entry, f.deps.save, deps);
+      assert.ok(launch.args[1].includes("'--model' 'claude-fable-5-1[1m]'"), 'resumes on the pre-swap model');
+      assert.deepEqual(scopes.map(scope => Boolean(scope.model)), [true, false],
+        'the second attempt holds the pane and session keys but not the model key');
+    } else {
+      await assert.rejects(forceRestartSession(f.entry, f.deps.save, deps),
+        /another session injection is busy/, profile);
+      assert.equal(launch, undefined, profile);
+      assert.equal(closed, false, `${profile}: the 429 comes back before the session is closed`);
+    }
+  }
+});
+
 test('fresh daemon force restart preflights a pinned managed Claude profile before close', async t => {
   const { forceRestartSession } = require('./serve');
   const accounts = require('./accounts');

@@ -38,6 +38,7 @@ const {
   compactRequestTelemetry,
   hasCompactionMarker,
   compactSwapPlan,
+  compactionSwappedModel,
   ensureCompactionRestored,
   afterCompactAction,
   linesAfterLastEcho,
@@ -4520,6 +4521,93 @@ test('open uses host panes for both existing sessions and new Claude and Codex l
     waitForHostAgent: async () => true,
     waitForHostSessionId: async () => null,
   }), (error) => error.status === 504 && /never registered its session id/.test(error.message));
+});
+
+test('only an in-flight compaction names the model it swapped out', () => {
+  // Mid-compaction settings.json holds the via model, and the swap remembers what it replaced.
+  assert.equal(compactionSwappedModel({
+    inFlightCompactSwap: { switchModel: 'opus', settingsModelBefore: 'claude-fable-5-1[1m]', settingsModelPresent: true },
+  }), 'claude-fable-5-1[1m]');
+  // No swap in flight, so the model key is held by something still deciding what
+  // settings.json says — a typed /model, an interrupted compaction's restore. Reading
+  // the file mid-decision is what the key exists to prevent, so nothing is named and
+  // the caller keeps waiting. The file is never consulted here at all.
+  const unread = () => assert.fail('settings.json must not be read to answer this');
+  assert.equal(compactionSwappedModel({ inFlightCompactSwap: null, readClaudeSettingsModel: unread }), '');
+  // A swap that recorded no model means the agent's own default, which no command line
+  // can name; neither can a recorded value that is not a model id.
+  for (const swap of [{ switchModel: 'opus', settingsModelBefore: '', settingsModelPresent: false },
+    { switchModel: 'opus', settingsModelBefore: 'two words', settingsModelPresent: true },
+    { switchModel: 'opus', settingsModelPresent: true }]) {
+    assert.equal(compactionSwappedModel({ inFlightCompactSwap: swap, readClaudeSettingsModel: unread }), '');
+  }
+});
+
+test('a launch names the swapped-out model rather than failing on the busy model key', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-busy-model-'));
+  const project = path.join(root, 'project');
+  fs.mkdirSync(project, { recursive: true });
+  const compacting = deferred();
+  const held = withInjectionLock(() => compacting.promise, { model: true });
+  try {
+    let asked = 0;
+    const launchDeps = (extra = {}) => ({
+      host: recordingHost((type) => type === 'spawn' ? { pane: { id: 'pane-busy' } } : {}),
+      loadTask: () => ({ fm: { project, sessions: [] } }),
+      randomUUID: () => '44444444-4444-4444-8444-444444444444',
+      waitForHostAgent: async () => true,
+      waitForHostSessionId: async () => 'codex-busy-session',
+      trustProject: () => true,
+      linkLaunchedSession: () => true,
+      compactionSwappedModel: () => { asked += 1; return 'claude-fable-5-1[1m]'; },
+      ...extra,
+    });
+
+    const deps = launchDeps();
+    const claude = await openSession({ taskId: 'card', fresh: true, agent: 'claude' }, deps);
+    assert.equal(claude.command, 'claude --dangerously-skip-permissions --model claude-fable-5-1[1m]'
+      + ' --session-id 44444444-4444-4444-8444-444444444444');
+    assert.equal(asked, 1);
+    // The model rode the command line only. Pane meta means "the caller asked for this
+    // model", and an open retried after the compaction ends must still match this pane.
+    assert.equal('model' in deps.host.calls.find((call) => call.type === 'spawn').params.meta, false);
+
+    // An explicit Claude model reads nothing out of settings.json, since the Claude swap
+    // touches only its model, so it never needed the key and neither waits nor asks.
+    const explicit = launchDeps();
+    const asExplicit = await openSession({ taskId: 'card', fresh: true, agent: 'claude', model: 'opus[1m]' }, explicit);
+    assert.equal(asExplicit.command, 'claude --dangerously-skip-permissions --model opus[1m]'
+      + ' --session-id 44444444-4444-4444-8444-444444444444');
+    assert.equal(asked, 1, 'an explicit model is not replaced by the swapped-out one');
+    assert.equal(explicit.host.calls.find((call) => call.type === 'spawn').params.meta.model, 'opus[1m]');
+
+    // A Codex launch waits either way: its swap rewrites model_reasoning_effort too, so
+    // even an explicit -m leaves it reading a config.toml a compaction may be swapping,
+    // and no in-memory record of that swap exists to name.
+    for (const body of [{}, { model: 'gpt-5.6-sol' }]) {
+      await assert.rejects(openSession({ taskId: 'card', fresh: true, agent: 'codex', ...body },
+        launchDeps()), injectionBusy429);
+    }
+    // A swap with no model to name leaves the agent's own default, so this one waits too.
+    await assert.rejects(openSession({ taskId: 'card', fresh: true, agent: 'claude' },
+      launchDeps({ compactionSwappedModel: () => '' })), injectionBusy429);
+
+    // A managed profile reads its own settings.json under its own config directory, which
+    // the daemon's recorded pre-swap model does not describe, so it waits rather than
+    // being forced onto the built-in profile's model.
+    const configDir = path.join(root, 'secondary');
+    const config = path.join(root, 'config.json');
+    fs.mkdirSync(configDir);
+    fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+      { id: 'secondary', label: 'Secondary', agent: 'claude', configDir },
+    ], defaultAccounts: { claude: 'secondary' } }));
+    await assert.rejects(openSession({ taskId: 'card', fresh: true, agent: 'claude', accountId: 'secondary' },
+      launchDeps({ root, env: { KEEP_DIR: root, KEEP_CONFIG: config } })), injectionBusy429);
+  } finally {
+    compacting.resolve();
+    await held;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('fresh card open launches in an explicit cwd only when it belongs to the card project', async () => {
