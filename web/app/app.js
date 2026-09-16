@@ -265,8 +265,21 @@ function runningItems() {
     return Date.parse(task?.createdAt) || Date.parse(task?.fm?.created)
       || Date.parse(panes.get(session.pane)?.createdAt) || 0;
   };
-  return stableSessionOrder(sessions, runningOrder, new Set((data.sessions || []).map((session) => session.id)), createdAt)
+  const items = stableSessionOrder(sessions, runningOrder, new Set((data.sessions || []).map((session) => session.id)), createdAt)
     .map((session) => sessionItem('running', session));
+  // A pane opened from the rail is not pinned, so Running & waiting is the only
+  // listing a sessionless shell has. stableSessionOrder ranks session ids, so
+  // keep shells out of it and append them in pane creation order instead.
+  const shells = (data.panes || [])
+    .filter((pane) => pane.alive && !(pane.meta?.agent && pane.meta.agent !== 'shell')
+      && !isPanePinned(pane.id) && !entityForPane(pane.id).session && !isClosingSession(pane.meta?.sessionId, pane.id))
+    .map((pane) => {
+      const entity = entityForPane(pane.id);
+      return { kind: 'running', pane: pane.id, sessionId: undefined, project: entity.project, title: entity.title,
+        state: 'running', since: Date.parse(pane.createdAt) || 0 };
+    })
+    .sort((a, b) => a.since - b.since);
+  return [...items, ...shells];
 }
 function pinnedItems() {
   return (pinnedLayout()?.ids || []).flatMap((paneId) => {

@@ -410,12 +410,15 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     const holdDeadline = Date.now() + 2000;
     while (!releaseHeldState && Date.now() < holdDeadline) await new Promise((resolve) => setTimeout(resolve, 5));
     assert.ok(releaseHeldState, 'fixture must capture the pre-spawn state request');
-    await evaluate("document.querySelector('.qfocus').click(); [...document.querySelectorAll('#qlist .qtoggle')].find(x=>x.textContent.includes('Pinned')).click(); document.querySelector('#rail [data-shell]').click(); document.querySelector('.session-launch-card').requestSubmit()");
+    await evaluate("document.querySelector('.qfocus').click(); [...document.querySelectorAll('#qlist .qtoggle')].find(x=>x.textContent.includes('Running & waiting')).click(); document.querySelector('#rail [data-shell]').click(); document.querySelector('.session-launch-card').requestSubmit()");
     await wait("document.querySelector('#stage').dataset.pane === 'shell1' && document.activeElement?.matches('#stage .xterm-helper-textarea')");
+    assert.ok(!layouts[0].ids.includes('shell1'), 'a shell opened from the rail is not pinned to Watch');
+    assert.equal(await evaluate("document.querySelector('#toast .toast-body button')?.textContent"), 'Pin', 'the new shell is offered as a pin instead');
     releaseHeldState();
     await wait("document.querySelector('#health .pop')?.textContent.includes('held-state-applied')");
     assert.equal(await evaluate("document.querySelector('#stage').dataset.pane"), 'shell1', 'a state response captured before spawn cannot replace the new terminal');
     assert.notEqual(await evaluate("document.querySelector('#qlist .qitem.sel')?.dataset.key"), 'recent:recent:undefined:undefined');
+    assert.equal(await evaluate("document.querySelector('#qlist .qitem.sel')?.dataset.key"), 'running:shell1', 'the unpinned shell is selected under Running & waiting');
     panes.splice(panes.findIndex((pane) => pane.id === 'shell1'), 1);
     nextStateMarker = 'authoritative-absent-state';
     for (const client of eventClients) client.write('data: changed\n\n');
@@ -460,6 +463,7 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     assert.ok(layouts[0].ids.includes('pa'), 'replacement retains pins');
     await evaluate("document.querySelector('#rail [data-shell]').click(); document.querySelector('.session-launch-card').requestSubmit()");
     await wait("document.querySelector('#stage').dataset.pane === 'shell3'");
+    assert.ok(!layouts[0].ids.includes('shell3'), 'the second rail shell is not pinned either');
     await wait("new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))");
     assert.equal(visibilityEvents.filter(e => e.pane === 'pa').at(-1)?.visible, false, 'cached hidden pane reports invisible');
     assert.equal(visibilityEvents.filter(e => e.pane === 'shell3').at(-1)?.visible, true, 'selected pane reports visible');

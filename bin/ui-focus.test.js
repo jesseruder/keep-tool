@@ -123,6 +123,32 @@ test('running panel orders newest-created first regardless of activity and refre
   assert.deepEqual(order(), tied, 'missing creation logs have deterministic ties across reloads');
 });
 
+test('alive unpinned shells without a session list under running until they are pinned', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../web/app/app.js'), 'utf8');
+  const pinned = new Set();
+  const data = {
+    tasks: [],
+    sessions: [{ id: 'agent', pane: 'agent-pane', state: 'running', mtime: 1 }],
+    panes: [
+      { id: 'agent-pane', alive: true, createdAt: '2026-01-01', meta: { agent: 'claude', sessionId: 'agent' } },
+      { id: 'shell-new', alive: true, createdAt: '2026-03-01', meta: { agent: 'shell' } },
+      { id: 'shell-old', alive: true, createdAt: '2026-02-01', cwd: '/tmp/shell', meta: {} },
+      { id: 'shell-exited', alive: false, createdAt: '2026-02-15', meta: { agent: 'shell' } },
+    ],
+  };
+  const ctx = vm.createContext({ data, runningOrder: new Map(), stableSessionOrder: selection.stableSessionOrder,
+    state: { markedRunning: new Set() }, isClosingSession: () => false, isPanePinned: (id) => pinned.has(id),
+    paneMap: () => new Map(data.panes.map((pane) => [pane.id, pane])),
+    entityForPane: (id) => ({ session: data.sessions.find((candidate) => candidate.pane === id),
+      project: '/tmp/shell', title: 'shell' }),
+    sessionItem: (kind, session) => ({ kind, sessionId: session.id, pane: session.pane }) });
+  vm.runInContext(source.slice(source.indexOf('function runningItems('), source.indexOf('function pinnedItems(')), ctx);
+  const listed = () => Array.from(ctx.runningItems(), (item) => item.sessionId || item.pane);
+  assert.deepEqual(listed(), ['agent', 'shell-old', 'shell-new'], 'shells follow the sessions in pane creation order');
+  pinned.add('shell-old');
+  assert.deepEqual(listed(), ['agent', 'shell-new'], 'a pinned shell is listed only once, under Pinned');
+});
+
 test('scheduled idle sessions can be dismissed without changing their scheduled task', () => {
   const serve = require('./serve');
   const session = { id: 'location', state: 'waiting', mtime: 1000, taskId: 'backup' };

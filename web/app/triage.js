@@ -136,25 +136,22 @@ function renderRail(ctx, items) {
       await ctx.newSession(shell.path, shell.name, async (pane, selection) => {
         const project = ctx.projectOf(selection.cwd);
         const title = ctx.entityForPane(pane.id).title;
-        const pinned = await ctx.pinPane(pane.id, title);
-        if (!pinned) {
-          ctx.refresh();
-          ctx.toast(`${selection.kind === 'shell' ? 'Shell' : selection.kind === 'claude' ? 'Claude Code' : 'Codex'} opened in ${project.name}, but pinning failed; it is listed in Watch`);
-          return;
-        }
-        // Creating a session is explicit navigation, including from waiting-only
-        // Focus mode or a collapsed Pinned group.
+        // A new pane is not pinned: it lists under Running & waiting, where a
+        // shell stays until it exits and a session appears once it is recorded.
+        // Creating one is explicit navigation, including from waiting-only Focus
+        // mode or a collapsed Running & waiting group.
         if (ctx.state.focusMode) ctx.toggleFocus(false, false);
-        ctx.state.showPinned = true;
-        try { sessionStorage.setItem('keep-pinned-expanded', '1'); } catch {}
+        ctx.state.showRunning = true;
+        try { sessionStorage.setItem('keep-running-expanded', '1'); } catch {}
         ctx.state.filter = null;
-        const index = ctx.triageItems().findIndex((item) => item.kind === 'pinned' && item.pane === pane.id);
-        if (index >= 0) ctx.setSelected(index, true);
+        // openReviewPane keeps the pane selected until its own running row exists.
+        if (ctx.paneMap().get(pane.id)?.alive) ctx.openReviewPane(pane.id);
         ctx.state.ensureSelectedVisible = true;
         ctx.state.focused = true;
         ctx.state.focusPane = pane.id;
         ctx.refresh();
-        ctx.toast(`${selection.kind === 'shell' ? 'Shell' : selection.kind === 'claude' ? 'Claude Code' : 'Codex'} opened in ${project.name}`);
+        ctx.toast(`${selection.kind === 'shell' ? 'Shell' : selection.kind === 'claude' ? 'Claude Code' : 'Codex'} opened in ${project.name}`,
+          { label: 'Pin', run: () => ctx.pinPane(pane.id, title) });
       });
     } finally { button.disabled = false; }
   });
@@ -167,7 +164,9 @@ function queueRow(ctx, item) {
   const task = ctx.taskFor(item);
   if (item.kind === 'running' || item.kind === 'pinned' || item.kind === 'recent') {
     const sessionState = session ? sessionLabel(session) : item.state || 'unknown';
-    const shell = item.kind === 'pinned' && ctx.paneMap().get(item.pane)?.meta?.agent === 'shell';
+    // Running rows without a session are plain shells; label them like pinned ones.
+    const shell = (item.kind === 'pinned' || (item.kind === 'running' && !item.sessionId))
+      && ctx.paneMap().get(item.pane)?.meta?.agent === 'shell';
     const recentTime = item.kind === 'recent' ? `<span class="w num">${ctx.esc(ctx.rel(item.since))}</span>` : '';
     return `<span class="stripe"></span><span class="t ${title === 'untitled session' ? 'untitled' : ''}">${ctx.esc(title)}</span>
       ${recentTime}
