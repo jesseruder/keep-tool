@@ -355,41 +355,120 @@ test('experiment-undecided names an aged readout nobody answered', () => {
   const root = makeRoot();
   const now = Date.parse('2026-09-16T12:00:00');
   const stamp = (days) => localStamp(now - days * 86400e3).replace('T', ' ');
-  const readout = (days) => `## ${stamp(days)} — check result (agent) → review\nVariant B won by 4%.\n`;
+  const readout = (days) => `## ${stamp(days)} — check result (agent) → review\nVariant B won by 4%.\n\n`;
   // Everything the machinery writes by itself piles up after the readout and still
-  // leaves the decision unmade.
+  // leaves the decision unmade. `review (fable sweep)` is here on purpose: the rule
+  // reads the log without review.js's reviewer filter, so it really does see this row
+  // and really does have to decide it is not a decision.
   const automatic = (days) => `## ${stamp(days)} — review (fable sweep)\nSwept.\n\n`
     + `## ${stamp(days)} — landed (daemon)\nLanded 3b08d08.\n\n`
     + `## ${stamp(days)} — review outcome\nUnresolved.\n\n`
+    + `## ${stamp(days)} — deployed\ndeployed 3b08d08 to prod\n\n`
+    + `## ${stamp(days)} — probe result\nStill green.\n\n`
+    + `## ${stamp(days)} — artifact\nStored the redash csv.\n\n`
+    + `## ${stamp(days)} — hold released\nHold lifted.\n\n`
+    + `## ${stamp(days)} — step terraform\nRan.\n\n`
+    + `## ${stamp(days)} — check session ended\nPane closed.\n\n`
+    + `## ${stamp(days)} — retitled\nRenamed.\n\n`
     + `## ${stamp(days)} — agent run failed\nRun killed.\n\n`;
   const experiment = { kind: 'experiment', status: 'review' };
   try {
     writeCard(root, 'aged', experiment, automatic(3) + readout(20));
     writeCard(root, 'decided', experiment,
       `## ${stamp(3)} — check-in\nKeeping variant B; hardcoding it now.\n\n` + automatic(4) + readout(20));
-    writeCard(root, 'noted', experiment, `## ${stamp(3)} — note\nStill thinking.\n\n` + readout(20));
+    // The reviewer's own check-in is a decision like anybody else's, and review.js drops
+    // it from stampedLogEntries, so the rule must read the log itself to see it.
+    writeCard(root, 'reviewer-answered', experiment,
+      `## ${stamp(3)} — check-in (reviewer fable)\nOwner picked variant B in Slack; recorded here.\n\n` + readout(20));
+    writeCard(root, 'needed', experiment, `## ${stamp(3)} — needs Owner\nWhich variant?\n\n` + readout(20));
     writeCard(root, 'fresh', experiment, automatic(1) + readout(5));
     writeCard(root, 'a-task', { kind: 'task', status: 'review' }, readout(20));
     writeCard(root, 'still-active', { kind: 'experiment', status: 'active' }, readout(20));
     writeCard(root, 'finished', { kind: 'experiment', status: 'done' }, readout(20));
     // No readout at all is check-no-result / review-no-next territory, not this rule's.
     writeCard(root, 'no-readout', experiment, `## ${stamp(20)} — check-in\nRunning.\n`);
+    // Both readout heading shapes: bare, and carrying a status other than review.
+    writeCard(root, 'bare-readout', experiment, `## ${stamp(18)} — check result (agent)\nNumbers are in.\n`);
+    writeCard(root, 'waiting-readout', experiment, `## ${stamp(17)} — check result (agent) → waiting\nNumbers are in.\n`);
+    // Exactly at the window: `age < threshold` is silent only strictly inside it.
+    writeCard(root, 'on-the-boundary', experiment, readout(14));
 
     const findings = lint({ root, rule: 'experiment-undecided', now }).findings;
-    assert.deepEqual(findings.map((item) => item.id), ['aged']);
-    assert.equal(findings[0].severity, 'med');
-    assert.equal(findings[0].text, `readout landed ${stamp(20)}, 20d ago; no keep/revert decision recorded`);
-    assert.equal(findings[0].fix,
+    assert.deepEqual(findings.map((item) => item.id),
+      ['aged', 'bare-readout', 'on-the-boundary', 'waiting-readout']);
+    const aged = findings.find((item) => item.id === 'aged');
+    assert.equal(aged.severity, 'med');
+    assert.equal(aged.text, `readout landed ${stamp(20)}, 20d ago; no keep/revert decision recorded`);
+    assert.equal(aged.fix,
       'keep checkin aged -m "keep <variant>: hardcode and complete the experiment" --next "..."'
       + '  |  keep checkin aged --status done -m "revert: <why>"');
+    assert.match(findings.find((item) => item.id === 'on-the-boundary').text, /14d ago/);
 
-    // The window is Owner's to move.
-    process.env.KEEP_LINT_EXPERIMENT_DECISION_DAYS = '3';
-    try {
-      assert.deepEqual(lint({ root, rule: 'experiment-undecided', now }).findings.map((item) => item.id),
-        ['aged', 'fresh'], 'a shorter window catches the five-day-old readout too');
-    } finally { delete process.env.KEEP_LINT_EXPERIMENT_DECISION_DAYS; }
+    // The window is Owner's to move; 0 and nonsense keep the default.
+    for (const [value, expected] of [['3', ['aged', 'bare-readout', 'fresh', 'on-the-boundary', 'waiting-readout']],
+      ['0', ['aged', 'bare-readout', 'on-the-boundary', 'waiting-readout']],
+      ['soon', ['aged', 'bare-readout', 'on-the-boundary', 'waiting-readout']]]) {
+      process.env.KEEP_LINT_EXPERIMENT_DECISION_DAYS = value;
+      try {
+        assert.deepEqual(lint({ root, rule: 'experiment-undecided', now }).findings.map((item) => item.id),
+          expected, `KEEP_LINT_EXPERIMENT_DECISION_DAYS=${value}`);
+      } finally { delete process.env.KEEP_LINT_EXPERIMENT_DECISION_DAYS; }
+    }
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('experiment-undecided ages from the oldest readout nobody has answered', () => {
+  const root = makeRoot();
+  const now = Date.parse('2026-09-16T12:00:00');
+  const stamp = (days) => localStamp(now - days * 86400e3).replace('T', ' ');
+  const readout = (days) => `## ${stamp(days)} — check result (agent) → review\nNumbers.\n\n`;
+  const checkin = (days) => `## ${stamp(days)} — check-in\nSaid something.\n\n`;
+  const experiment = { kind: 'experiment', status: 'review' };
+  try {
+    // A check that keeps re-running must not keep resetting the clock.
+    writeCard(root, 'repeating', experiment, readout(3) + readout(27));
+    writeCard(root, 'answered-between', experiment, readout(3) + checkin(10) + readout(27));
+    writeCard(root, 'answered-early', experiment, readout(20) + checkin(25) + readout(27));
+    // A decision in the readout's own minute counts, though the stamp is not greater:
+    // the log is newest-first, so the earlier row is the later one.
+    writeCard(root, 'same-minute', experiment,
+      `## ${stamp(20)} — check-in\nKeeping B.\n\n` + readout(20));
+    writeCard(root, 'same-minute-machine', experiment,
+      `## ${stamp(20)} — landed (daemon)\nLanded.\n\n` + readout(20));
+
+    const findings = lint({ root, rule: 'experiment-undecided', now }).findings;
+    assert.deepEqual(findings.map((item) => [item.id, item.text.match(/(\d+)d ago/)[1]]), [
+      ['answered-early', '20'],
+      ['repeating', '27'],
+      ['same-minute-machine', '20'],
+    ]);
+    assert.match(findings.find((item) => item.id === 'repeating').text, new RegExp(`landed ${stamp(27)},`));
+    assert.match(findings.find((item) => item.id === 'answered-early').text, new RegExp(`landed ${stamp(20)},`));
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the total cap is filled fair-share, so no rule is evicted by its name', () => {
+  const { fairShare } = require('./lint.js');
+  const findings = [];
+  for (const [rule, count] of [['a-rule', 20], ['b-rule', 20], ['c-rule', 20], ['d-rule', 2], ['e-rule', 2], ['f-rule', 3], ['g-rule', 3]]) {
+    for (let index = 0; index < count; index += 1) findings.push({ rule, id: `${rule}-${index}` });
+  }
+  assert.equal(findings.length, 70);
+
+  const kept = fairShare(findings, 60);
+  assert.equal(kept.length, 60);
+  const counts = {};
+  for (const item of kept) counts[item.rule] = (counts[item.rule] || 0) + 1;
+  assert.deepEqual(Object.keys(counts).sort(), ['a-rule', 'b-rule', 'c-rule', 'd-rule', 'e-rule', 'f-rule', 'g-rule'],
+    'every rule keeps at least one row');
+  for (const [rule, count] of [['d-rule', 2], ['e-rule', 2], ['f-rule', 3], ['g-rule', 3]])
+    assert.equal(counts[rule], count, `${rule} keeps all of its findings`);
+  for (const rule of ['a-rule', 'b-rule', 'c-rule']) assert.ok(counts[rule] >= 16, `${rule} kept ${counts[rule]}`);
+
+  const order = new Map(findings.map((item, index) => [item, index]));
+  assert.deepEqual(kept.map((item) => order.get(item)), [...kept.map((item) => order.get(item))].sort((a, b) => a - b),
+    'the kept rows come back in the order they were sorted into');
+  assert.equal(fairShare(findings, 100), findings, 'under the cap, nothing is touched');
 });
 
 test('experiment-undecided is capped at eight so a batch cannot crowd the brief', () => {

@@ -452,12 +452,53 @@ function checkNoResult(task, _ctx) {
 // hint. The fleet reviewer had been re-deriving exactly this from a model call in every
 // sweep since 2026-09-04 (finding eb8d39c45ba367a4).
 const READOUT_KIND_RE = /^check result \(agent\)(?:\s|$)/;
-// Entries the machinery writes for itself; none of them is anybody deciding. The
-// `review (fable…)` and `review (fable sweep)` headings never reach here at all —
-// review.stampedLogEntries drops every reviewer heading before returning. The run-log
-// kinds mirror review.js's own `isRunLogEntry` (bin/review.js, ~line 1030), which that
-// module does not export; the rest are the daemon's and lint's own bookkeeping.
-const AUTOMATIC_KIND_RE = /^(?:check result \(agent\)|agent run \([^)]*\)|agent run failed|delivery warning|landed \(daemon\)|review outcome|lint)(?:\s|$)/;
+
+// Naming the machinery was a losing game: the registry writes some forty-odd heading
+// kinds (`deployed`, `probe result`, `artifact`, `hold`, `step terraform`, `created`,
+// `alert`, `retitled`, `check session ended`, …) and any one a deny-list missed would
+// silence this rule forever. So name the decisions instead — a short closed set that
+// means somebody answered the readout — and treat everything else as machinery.
+const DECISION_KINDS = new Set(['check-in', 'done', 'answer', 'plan', 'allow']);
+
+// `check-in (reviewer fable) → waiting`, `answer (agent)` and `done (reviewer)` are the
+// same decisions as their bare forms, so drop the parenthetical and the status suffix
+// before matching. `review (fable) answer` reduces to `review answer`, which is not on
+// the list: a reviewer sweep is still not a decision.
+function decisionKind(kind) {
+  return String(kind || '')
+    .replace(/\s*→.*$/, '')
+    .replace(/\s*\([^)]*\)/g, '')
+    .trim()
+    .toLowerCase();
+}
+
+function isDecisionEntry(entry) {
+  const kind = decisionKind(entry && entry.kind);
+  // `needs Owner`, `needs Jesse`, `needs met` — asking for the decision, or recording
+  // that it came, is itself an answer to the readout.
+  return DECISION_KINDS.has(kind) || kind.startsWith('needs');
+}
+
+// review.stampedLogEntries drops every heading `isReviewerHeading` matches, and that
+// includes the reviewer's ordinary `check-in (reviewer fable)` and `done (reviewer)` —
+// decisions like anybody else's. So parse the headings here, off review.logEntries, with
+// no reviewer filter. The parse is deliberately a copy of review.js's, not a call into
+// it; the two want different things from the same headings.
+function datedEntries(body) {
+  const out = [];
+  for (const entry of review.logEntries(body)) {
+    const match = String(entry.heading || '').match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}) — (.*)$/);
+    // The log is newest-first, so the body index breaks ties between two entries that
+    // share a minute — stamps have minute resolution and a decision can land in the
+    // same minute as the readout it answers.
+    if (match) out.push({ ...entry, stamp: match[1], kind: match[2], index: out.length });
+  }
+  return out;
+}
+
+function isAfter(entry, other) {
+  return entry.stamp > other.stamp || (entry.stamp === other.stamp && entry.index < other.index);
+}
 
 // Thresholds that Owner may want to move without an edit, read per run so a test can
 // set them. Anything unparseable or non-positive falls back to the default.
@@ -468,16 +509,20 @@ function envDays(name, fallback) {
 
 function experimentUndecided(task, ctx) {
   if (task.fm.kind !== 'experiment' || task.fm.status !== 'review') return [];
-  const entries = review.stampedLogEntries(task.body).sort((a, b) => b.stamp.localeCompare(a.stamp));
-  const readout = entries.find((entry) => READOUT_KIND_RE.test(entry.kind));
-  if (!readout) return [];
+  const entries = datedEntries(task.body);
+  const readouts = entries.filter((entry) => READOUT_KIND_RE.test(entry.kind));
+  if (!readouts.length) return [];
+  const decision = entries.filter(isDecisionEntry)
+    .reduce((newest, entry) => (!newest || isAfter(entry, newest) ? entry : newest), null);
+  // A scheduled check that keeps re-running must not keep resetting the clock: what is
+  // waiting on Owner is the FIRST readout he has not answered, not the latest one.
+  const unanswered = readouts.filter((entry) => !decision || isAfter(entry, decision));
+  if (!unanswered.length) return [];
+  const readout = unanswered.reduce((oldest, entry) => (isAfter(oldest, entry) ? entry : oldest));
   const at = atMs(readout.stamp.replace(' ', 'T'));
   if (!Number.isFinite(at)) return [];
   const age = ctx.now - at;
   if (age < envDays('KEEP_LINT_EXPERIMENT_DECISION_DAYS', 14) * DAY_MS) return [];
-  // A check-in by anyone, a note, a status change, a need: all of them are somebody
-  // answering the readout, and any one of them is enough.
-  if (entries.some((entry) => entry.stamp > readout.stamp && !AUTOMATIC_KIND_RE.test(entry.kind))) return [];
   return [finding(
     'experiment-undecided', task, 'med',
     `readout landed ${readout.stamp}, ${Math.floor(age / DAY_MS)}d ago; no keep/revert decision recorded`,
@@ -930,6 +975,32 @@ function logCommits(repo) {
   } catch { return null; }
 }
 
+// Taking the first TOTAL_CAP of the sorted list spends the cap by prefix, and the sort
+// is severity then rule name — so adding one `med` rule silently evicted the whole of
+// `uncited-commits` (6 rows to 0) and started on `review-no-next`. Fill it in rounds
+// instead: every rule's first finding, then every rule's second, and so on. A rule with
+// two findings keeps both however loud the others are, and no rule is ever emptied by
+// its own name. The kept rows are put back in the sorted order, so readers see no change.
+function fairShare(findings, limit) {
+  if (findings.length <= limit) return findings;
+  const order = new Map(findings.map((item, index) => [item, index]));
+  const queues = new Map();
+  for (const item of findings) {
+    if (!queues.has(item.rule)) queues.set(item.rule, []);
+    queues.get(item.rule).push(item);
+  }
+  const kept = [];
+  const rounds = Math.max(...[...queues.values()].map((queue) => queue.length));
+  for (let round = 0; round < rounds && kept.length < limit; round += 1) {
+    for (const queue of queues.values()) {
+      if (round >= queue.length) continue;
+      kept.push(queue[round]);
+      if (kept.length >= limit) break;
+    }
+  }
+  return kept.sort((a, b) => order.get(a) - order.get(b));
+}
+
 function writeResult(root, result) {
   const file = path.join(root, '.keep', 'lint.json');
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -1030,7 +1101,7 @@ function lint(options = {}) {
   findings.sort((a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]
     || a.rule.localeCompare(b.rule) || a.id.localeCompare(b.id) || a.text.localeCompare(b.text));
   // A new convention can light up thirty cards under one rule; cap per rule first so
-  // the other rules still show, then cap the total.
+  // the other rules still show, then fill the total cap fair-share.
   const perRule = new Map();
   const capped = findings.filter((item) => {
     const n = (perRule.get(item.rule) || 0) + 1;
@@ -1040,7 +1111,7 @@ function lint(options = {}) {
   const result = {
     at: new Date(ctx.now).toISOString(),
     checked: tasks.length,
-    findings: capped.slice(0, options.rule ? 10 : TOTAL_CAP),
+    findings: fairShare(capped, options.rule ? 10 : TOTAL_CAP),
     byRule: Object.fromEntries(perRule),
     persisted: true,
   };
@@ -1128,4 +1199,5 @@ module.exports = {
   loadTasks,
   normalizedTitle,
   logCommits,
+  fairShare,
 };

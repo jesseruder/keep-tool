@@ -273,10 +273,14 @@ fetch), `step-run-pending` (a gated step with landed commits its last run missed
 24h), `note-expired` (a state note past its window that nobody extended or cleared,
 filed under `note:<id>`), `resource-bad-matcher` (a declared resource whose regex does
 not compile or whose glob is empty, filed under `resource:<project>:<name>`),
-`experiment-undecided` (a `kind: experiment` card in `review` whose newest
-`check result (agent)` readout is older than `KEEP_LINT_EXPERIMENT_DECISION_DAYS`
-(default 14) with nothing but automatic entries after it — the rule asks the question
-and never closes or changes the card, because the keep-or-revert call is Owner's), and
+`experiment-undecided` (a `kind: experiment` card in `review` carrying a
+`check result (agent)` readout nobody answered — the rule takes the oldest readout newer
+than the newest decision, so a repeating check does not reset the clock, and fires when
+that readout is at least `KEEP_LINT_EXPERIMENT_DECISION_DAYS` old; the default is 14, and
+an unset, zero or unparseable value keeps it. A decision is a `check-in`, `done`,
+`answer`, `plan`, `allow` or `needs …` entry from anyone, the reviewer included;
+everything else in the log is machinery. The rule asks the question and never closes or
+changes the card, because the keep-or-revert call is Owner's), and
 `handoff-shadow` cards — a Codex worker's
 card older than six hours with no check-ins, opened instead of checking in on the card
 its parent Claude session held. It always exits successfully when findings exist, writes the latest
@@ -308,7 +312,11 @@ snapshot is too old to refuse against, the bundle's `KEEP_LINT_FINDINGS` header 
 rather than claiming a refusal that will not happen. The refusal
 names the rule and is per item: the rest of the tick still lands.
 `missing-project`, `landing-uncited` and `blocked-no-need` are capped at five findings
-each, and `experiment-undecided` at eight, so bookkeeping cannot crowd the 60-finding total.
+each and `experiment-undecided` at eight, so no one rule fills the report. The
+60-finding total is then filled fair-share rather than by prefix — every rule's first
+finding, then every rule's second, and so on — because the rows are ordered by severity
+and then rule name, and taking a prefix would evict the alphabetically-last rules
+outright. `byRule` still counts what each rule found before either cap.
 
 `keep turns` reads the turn index, a SQLite summary of Claude Code and Codex CLI
 transcripts kept in `.keep/turns.sqlite`. Stop hooks and the daemon feed it

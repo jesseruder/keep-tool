@@ -2963,10 +2963,22 @@ test('the kind-to-rule table only covers a note lint actually answered for that 
     lint('experiment-undecided')), 'experiment-undecided');
   assert.equal(lintCoverage({ kind: 'other', subject: 'Experiment readout is still undecided' },
     lint('experiment-undecided')), 'experiment-undecided');
-  // `other` itself is not widened: prose about anything else is still judgment, and
-  // the prose alone is not enough — lint must have said it about this very card.
-  assert.equal(lintCoverage({ kind: 'other', subject: 'the rollout plan has no decision' },
-    lint('experiment-undecided')), null);
+  assert.equal(lintCoverage({ kind: 'other', subject: 'undecided experiments' },
+    lint('experiment-undecided')), 'experiment-undecided');
+  // `other` is not widened: it takes both halves, a readout word and a phrase saying
+  // nobody answered it. These five are judgment about the experiment, not a restatement
+  // of the lint row, and each of them would have matched a subject-spanning pattern.
+  for (const subject of [
+    'the experiment defines no completion criteria',
+    'experiment scope creep in the readout work, not completed',
+    'the rollout plan has no decision',
+    'experiment results look healthy',
+    'experiments are undecided about which framework to use',
+  ]) {
+    assert.equal(lintCoverage({ kind: 'other', subject }, lint('experiment-undecided')), null, subject);
+  }
+  // A different rule does not cover it. (`lint(...)` is a bare array, which takes
+  // lintCoverage's legacy branch: no card-id filter, so this isolates the rule match.)
   assert.equal(lintCoverage({ kind: 'other', subject: 'growth experiments in review with readouts and no completion' },
     lint('missing-project')), null);
 
