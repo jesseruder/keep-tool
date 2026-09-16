@@ -1139,7 +1139,7 @@ wt path <repo> <name>
 wt main [<path>]
 wt rm <path | repo/name> [--force] [--delete]
 wt gc [--dry-run] [--days N] [--keep-free N] [<repo>]
-wt land [<path>] [--dry-run] [--no-push]
+wt land [<path>] [--dry-run] [--no-push] [--ignore-main] [--no-deploy]
 wt guard [on|off|status]
 ```
 
@@ -1147,6 +1147,16 @@ Commit freely in the worktree. To land it, run `wt land`: it fetches and rebases
 onto `origin/<default>`, shows the commits, then pushes `HEAD:<default>` without
 checking out or changing the main checkout. After landing, `wt rm` recycles the
 tree for the next agent; use `--delete` to remove it instead.
+
+For a repo whose main checkout is a live deployment rather than another copy of the
+code, landing to origin is only half the job. `DEPLOY_AFTER_LAND` in `bin/wt.js`
+names those repos — today just `keep-tool`, the tree the launchd-supervised
+`keep serve` daemon runs — and after a successful push `wt land` fast-forwards that
+checkout to the sha it just pushed (`merge --ff-only`, so it can pick up nothing
+else) and runs the repo's restart, `keep restart-daemon`. A checkout on another
+branch, one with uncommitted changes, or a refused restart is reported and skipped:
+the land already happened, so these are things to say, not failures. `--no-deploy`
+lands without touching the checkout. `keep land <card>` inherits all of this.
 
 `wt gc` fetches each repository, then recycles only clean, fully landed worktrees
 whose last commit is at least three days old and whose directory contains no live

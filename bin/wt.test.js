@@ -53,7 +53,9 @@ function runCli(f, args, input, extraEnv = {}) {
   return spawnSync(process.execPath, [CLI, ...args], {
     input,
     encoding: 'utf8',
-    env: { ...process.env, WT_CONFIG: f.configFile, WT_NO_INSTALL: '1', ...extraEnv },
+    // WT_NO_DEPLOY: a fixture repo named after a live-deployment repo must never
+    // reach the real restart command through the CLI.
+    env: { ...process.env, WT_CONFIG: f.configFile, WT_NO_INSTALL: '1', WT_NO_DEPLOY: '1', ...extraEnv },
   });
 }
 
@@ -248,6 +250,85 @@ test('land advances origin, refuses dirt, and aborts a conflicting rebase', () =
     assert.match(landed.stderr, /rebase conflict.*manually/);
     assert.equal(fs.existsSync(path.join(worktree, '.git', 'rebase-merge')), false);
     assert.equal(git(worktree, 'status', '--porcelain'), '');
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('land deploys a live main checkout and says why when it cannot', () => {
+  const f = fixture('keep-tool');
+  const restarts = [];
+  const runDeploy = (command, args) => { restarts.push([command, ...args]); return { status: 0, stdout: 'Daemon 1 is restarting\n', stderr: '' }; };
+  let said = '';
+  const land = (worktree, extra = {}) => {
+    const write = process.stderr.write.bind(process.stderr);
+    said = '';
+    process.stderr.write = (chunk, ...rest) => { said += chunk; return write(chunk, ...rest); };
+    try { return wt.landWorktree(worktree, { runDeploy, ...extra }); }
+    finally { process.stderr.write = write; }
+  };
+  try {
+    const worktree = runCli(f, ['new', f.name, 'deploying', '--no-install']).stdout.trim();
+    write(path.join(worktree, 'one.txt'), 'one\n');
+    commitIn(worktree, 'first');
+    const first = land(worktree);
+    assert.equal(git(f.main, 'rev-parse', 'HEAD'), first, 'the live checkout runs what was just landed');
+    assert.deepEqual(restarts, [['keep', 'restart-daemon']], 'and is handed its own restart');
+    assert.match(said, /fast-forwarded .*keep-tool to main/);
+    assert.equal(git(f.main, 'status', '--porcelain'), '', 'the fast-forward leaves no working-tree changes');
+
+    // A checkout someone is working in is not silently advanced over their edits.
+    write(path.join(f.main, 'local.txt'), 'uncommitted\n');
+    write(path.join(worktree, 'two.txt'), 'two\n');
+    commitIn(worktree, 'second');
+    const second = land(worktree);
+    assert.equal(git(f.main, 'rev-parse', 'HEAD'), first, 'a dirty checkout keeps its own state');
+    assert.equal(restarts.length, 1, 'and is not restarted onto code it does not have');
+    assert.match(said, /uncommitted changes; left it alone — it is still running the old code/);
+    assert.equal(git(f.origin, 'rev-parse', 'main'), second, 'but the land itself still happened');
+    fs.unlinkSync(path.join(f.main, 'local.txt'));
+
+    // Nor is a checkout that is deliberately on another branch.
+    git(f.main, 'checkout', '-q', '-b', 'side');
+    write(path.join(worktree, 'three.txt'), 'three\n');
+    commitIn(worktree, 'third');
+    const third = land(worktree);
+    assert.equal(git(f.main, 'rev-parse', 'side'), first, 'the other branch is left where it was');
+    assert.equal(restarts.length, 1);
+    assert.match(said, /is on side, not main; left it alone/);
+    git(f.main, 'checkout', '-q', 'main');
+
+    // A refused restart is reported, not raised: the commits are already on origin.
+    const failing = () => ({ status: 1, stdout: '', stderr: 'Pending model restoration prevents daemon restart\n' });
+    write(path.join(worktree, 'four.txt'), 'four\n');
+    commitIn(worktree, 'fourth');
+    const fourth = land(worktree, { runDeploy: failing });
+    assert.equal(git(f.main, 'rev-parse', 'HEAD'), fourth, 'the code still reaches the checkout');
+    assert.equal(git(f.origin, 'rev-parse', 'main'), fourth);
+    assert.match(said, /keep restart-daemon failed; the code is on disk but the daemon is still running the old build/);
+    assert.match(said, /Pending model restoration/, 'the refusal itself is relayed, not swallowed');
+    assert.notEqual(third, null);
+
+    // --no-deploy lands without touching the checkout.
+    write(path.join(worktree, 'five.txt'), 'five\n');
+    commitIn(worktree, 'fifth');
+    const fifth = land(worktree, { noDeploy: true });
+    assert.equal(git(f.origin, 'rev-parse', 'main'), fifth);
+    assert.equal(git(f.main, 'rev-parse', 'HEAD'), fourth, 'the checkout stays where it was');
+    assert.equal(restarts.length, 1);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('land leaves the main checkout of an ordinary repo alone', () => {
+  const f = fixture();
+  const restarts = [];
+  try {
+    const worktree = runCli(f, ['new', f.name, 'ordinary', '--no-install']).stdout.trim();
+    const before = git(f.main, 'rev-parse', 'HEAD');
+    write(path.join(worktree, 'one.txt'), 'one\n');
+    commitIn(worktree, 'first');
+    const sha = wt.landWorktree(worktree, { runDeploy: (...args) => { restarts.push(args); return { status: 0 }; } });
+    assert.equal(git(f.origin, 'rev-parse', 'main'), sha);
+    assert.equal(git(f.main, 'rev-parse', 'HEAD'), before, 'a repo whose checkout is not a deployment is untouched');
+    assert.deepEqual(restarts, []);
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 

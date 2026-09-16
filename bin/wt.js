@@ -521,6 +521,62 @@ function recycleWorktree(input, opts = {}) {
   return worktree;
 }
 
+// Repos whose main checkout is not just a copy of the code but the thing running
+// it. Landing to origin leaves those still executing yesterday's build, and the
+// person who landed is the one who knows it should go live — so `wt land` fast-
+// forwards the shared checkout and hands it its own restart. Add a repo here when
+// its main checkout is a live deployment; --no-deploy skips it for one land.
+const DEPLOY_AFTER_LAND = {
+  // ~/keep-tool is what the launchd-supervised `keep serve` daemon executes, and
+  // its own git-pull only syncs the ~/keep registry, never the code.
+  'keep-tool': { restart: ['keep', 'restart-daemon'] },
+};
+
+// Runs after the push, so nothing here may throw: the land already happened, and
+// a checkout that cannot be advanced is a thing to report, not a failed land.
+function deployAfterLand(main, defaultName, opts = {}) {
+  // Same escape hatch as WT_NO_INSTALL: a test harness or a scripted land must be
+  // able to exercise `wt land` without restarting the machine's real daemon.
+  if (process.env.WT_NO_DEPLOY === '1') return null;
+  const plans = opts.deployPlans || DEPLOY_AFTER_LAND;
+  const plan = plans[path.basename(main)];
+  if (!plan) return null;
+  const note = (text) => process.stderr.write(`wt: ${text}\n`);
+  const run = opts.runDeploy || ((command, args) => spawnSync(command, args, { encoding: 'utf8' }));
+  try {
+    const branch = branchFor(main);
+    if (branch !== defaultName) {
+      note(`${main} is on ${branch || 'a detached HEAD'}, not ${defaultName}; left it alone — it is still running the old code`);
+      return { deployed: false, why: 'branch' };
+    }
+    if (statusWithoutMarkers(main).length) {
+      note(`${main} has uncommitted changes; left it alone — it is still running the old code`);
+      return { deployed: false, why: 'dirty' };
+    }
+    // The push just moved origin/<default>, so this only ever fast-forwards to
+    // what was landed; no fetch, and no way to pick up anything else.
+    try { git(main, ['merge', '--ff-only', `origin/${defaultName}`]); }
+    catch (error) {
+      note(`could not fast-forward ${main}: ${String(error.message || error).trim()}`);
+      return { deployed: false, why: 'merge' };
+    }
+    note(`fast-forwarded ${main} to ${defaultName}`);
+    const [command, ...args] = plan.restart;
+    const result = run(command, args);
+    const output = `${result.stdout || ''}${result.stderr || ''}`.trim();
+    if (result.status !== 0) {
+      note(`${plan.restart.join(' ')} failed; the code is on disk but the daemon is still running the old build`);
+      if (output) process.stderr.write(`${output}\n`);
+      return { deployed: false, why: 'restart', output };
+    }
+    if (output) process.stderr.write(`${output}\n`);
+    return { deployed: true, output };
+  } catch (error) {
+    note(`post-land deploy failed: ${String(error.message || error).trim()}`);
+    return { deployed: false, why: 'error' };
+  }
+}
+
 // Commits sitting on the main checkout's local default branch that origin does
 // not have. `wt land` rebases onto origin and would silently leave them behind,
 // and a later `git push <remote> main` from anywhere would ship them by surprise.
@@ -579,6 +635,7 @@ function landWorktree(input, opts = {}) {
   } else {
     git(worktree, ['push', 'origin', `HEAD:${defaultName}`], { stdio: ['ignore', 2, 2] });
     process.stderr.write(`landed ${count} commit(s) to origin/${defaultName}\n`);
+    if (!opts.noDeploy) deployAfterLand(main, defaultName, opts);
   }
   return sha;
 }
@@ -1033,9 +1090,11 @@ function main(argv = process.argv.slice(2)) {
     const result = gcWorktrees({ cfg, repo: opts._[0], dryRun: opts['dry-run'], days: opts.days, keepFree: opts['keep-free'] });
     console.log(gcTable(result.rows));
   } else if (command === 'land') {
-    const opts = parseArgs(rest, { 'dry-run': 'bool', 'no-push': 'bool', 'ignore-main': 'bool' });
-    if (opts._.length > 1) die('usage: wt land [<path>] [--dry-run] [--no-push] [--ignore-main]');
-    const sha = landWorktree(opts._[0] || process.cwd(), { dryRun: opts['dry-run'], noPush: opts['no-push'], ignoreMain: opts['ignore-main'] });
+    const opts = parseArgs(rest, { 'dry-run': 'bool', 'no-push': 'bool', 'ignore-main': 'bool', 'no-deploy': 'bool' });
+    if (opts._.length > 1) die('usage: wt land [<path>] [--dry-run] [--no-push] [--ignore-main] [--no-deploy]');
+    const sha = landWorktree(opts._[0] || process.cwd(), {
+      dryRun: opts['dry-run'], noPush: opts['no-push'], ignoreMain: opts['ignore-main'], noDeploy: opts['no-deploy'],
+    });
     if (sha) console.log(sha);
   } else if (command === 'main') {
     if (rest.length > 1) die('usage: wt main [<path>]');
@@ -1128,6 +1187,7 @@ module.exports = {
   guardDecision,
   barePushOfSharedRef,
   unpushedMainCommits,
+  deployAfterLand,
   createWorktree,
   recycleWorktree,
   landWorktree,
