@@ -24,7 +24,7 @@ returns candidates.
 | Signature | Opened when |
 | --- | --- |
 | `sched:<name>:<hash8>` | a scheduler has `consecutiveFailures >= minFailures` (5) on one normalized error, and that signature was first seen at least `minAgeMin` (30) minutes before its latest failure |
-| `daemon:restart-loop` | more than `restartsPerHour` (3) daemon starts in the last hour, on two consecutive ticks |
+| `daemon:restart-loop` | more than `restartsPerHour` (3) daemon starts in the last hour, on two consecutive ticks; a start that `keep restart-daemon` asked for (a deploy) does not count |
 | `delivery:<incidentId8>` | the `delivery` row's `incidentId` has been unchanged for `minAgeMin` |
 
 Retired schedulers, disabled rows, on-demand schedulers (`usage`, `digest`) and

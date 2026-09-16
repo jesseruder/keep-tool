@@ -14,6 +14,9 @@ const FILE = path.join(ROOT, '.keep', 'health.json');
 const HOUR_MS = 3600e3;
 const DAY_MS = 24 * HOUR_MS;
 const VERSION = 1;
+// How long after `keep restart-daemon` the next start still counts as the one
+// it asked for. launchd's KeepAlive relaunches within seconds.
+const RESTART_REQUEST_MS = 10 * 60e3;
 let warnedWrite = false;
 
 // Schedulers that no longer exist. Their rows stay in health.json from older
@@ -74,6 +77,23 @@ function writeStore(value) {
   }
 }
 
+// Called by the daemon that is about to exit on `keep restart-daemon`.
+function recordRestartRequest(options = {}) {
+  const at = atMs(options.at, Date.now());
+  const store = readStore();
+  const daemon = store.daemon && typeof store.daemon === 'object' ? store.daemon : {};
+  store.daemon = { ...daemon, restartRequestedAt: at };
+  persist(store);
+  return store.daemon;
+}
+
+// Daemon starts since `since` that nobody asked for: crashes, launchd relaunches.
+function unrequestedStarts(daemon, since) {
+  const requested = new Set((daemon && Array.isArray(daemon.requestedStartAts) ? daemon.requestedStartAts : []).map(Number));
+  return (daemon && Array.isArray(daemon.startedAts) ? daemon.startedAts : [])
+    .map(Number).filter((value) => Number.isFinite(value) && value >= since && !requested.has(value));
+}
+
 function persist(value) {
   try {
     writeStore(value);
@@ -94,11 +114,20 @@ function record(name, options = {}) {
     const startedAts = Array.isArray(prior.startedAts) ? prior.startedAts.map(Number).filter(Number.isFinite) : [];
     if (Number.isFinite(Number(prior.startedAt)) && !startedAts.includes(Number(prior.startedAt))) startedAts.push(Number(prior.startedAt));
     if (!startedAts.includes(at)) startedAts.push(at);
+    const kept = startedAts.sort((a, b) => a - b).slice(-10);
+    // A start the previous daemon asked for (a deploy's `keep restart-daemon`)
+    // is not a crash, so the restart-loop check leaves it out.
+    const requestedAt = Number(prior.restartRequestedAt);
+    const requested = Number.isFinite(requestedAt) && requestedAt >= atMs(prior.startedAt) && requestedAt <= at && at - requestedAt <= RESTART_REQUEST_MS;
+    const requestedStartAts = (Array.isArray(prior.requestedStartAts) ? prior.requestedStartAts.map(Number) : [])
+      .concat(requested ? [at] : [])
+      .filter((value) => kept.includes(value));
     store.daemon = {
       startedAt: at,
       pid: Number(options.pid || process.pid),
       version: options.version == null ? VERSION : options.version,
-      startedAts: startedAts.sort((a, b) => a - b).slice(-10),
+      startedAts: kept,
+      requestedStartAts: [...new Set(requestedStartAts)],
     };
     persist(store);
     return store.daemon;
@@ -266,8 +295,7 @@ function attentionItems(value, now = Date.now()) {
       ...(entry.incidentId ? { incidentId: entry.incidentId } : {}),
     };
   });
-  const recentStarts = (Array.isArray(daemon.startedAts) ? daemon.startedAts : [])
-    .map(Number).filter((valueAt) => Number.isFinite(valueAt) && valueAt >= at - HOUR_MS);
+  const recentStarts = unrequestedStarts(daemon, at - HOUR_MS);
   if (recentStarts.length > 3) {
     const eventAt = Math.max(...recentStarts);
     items.push({
@@ -373,6 +401,8 @@ module.exports = {
   CADENCES,
   RETIRED,
   record,
+  recordRestartRequest,
+  unrequestedStarts,
   stateOf,
   presentationOf,
   snapshot,

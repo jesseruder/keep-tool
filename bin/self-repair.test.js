@@ -139,6 +139,9 @@ test('the restart loop needs two consecutive ticks, and a delivery incident need
   assert.equal(second[0].ready, true);
   assert.match(second[0].why, /2 consecutive ticks/);
 
+  // Deploys restart the daemon on purpose; requested starts are not a loop.
+  assert.deepEqual(selfRepair.signatures(snapshotOf([], { startedAts: starts, requestedStartAts: starts.slice(1) }), null, NOW, config, null), []);
+
   // Three starts is the documented normal.
   assert.deepEqual(selfRepair.signatures(snapshotOf([], { startedAts: starts.slice(0, 3) }), null, NOW, config, null), []);
 

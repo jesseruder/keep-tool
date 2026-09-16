@@ -329,8 +329,8 @@ function signatures(snapshot, deliveryRow, now = Date.now(), config = DEFAULT_CO
     });
   }
 
-  const startedAts = ((snapshot && snapshot.daemon && snapshot.daemon.startedAts) || [])
-    .map(Number).filter((value) => Number.isFinite(value) && value >= at - HOUR_MS);
+  // Deploys restart the daemon on purpose; only the starts nobody asked for loop.
+  const startedAts = health.unrequestedStarts(snapshot && snapshot.daemon, at - HOUR_MS);
   if (startedAts.length > Number(cfg.restartsPerHour)) {
     const sig = 'daemon:restart-loop';
     const seen = prior(sig);

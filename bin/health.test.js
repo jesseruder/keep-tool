@@ -170,6 +170,26 @@ test('attentionItems has the stable health item shape and reports restart loops'
   ]);
 });
 
+test('requested daemon restarts are not a restart loop; unrequested ones still are', () => {
+  const { health } = fixture();
+  const now = 10 * 3600e3;
+  // Four deploys in an hour: each daemon asks for its restart before exiting.
+  for (const at of [now - 50 * 60e3, now - 40 * 60e3, now - 30 * 60e3, now - 20 * 60e3]) {
+    health.recordRestartRequest({ at: at - 5e3 });
+    health.record('daemon', { at, pid: process.pid });
+  }
+  let value = health.snapshot(now);
+  assert.equal(value.daemon.startedAts.length, 4);
+  assert.deepEqual(health.attentionItems(value, now).filter((item) => item.id === 'health:daemon'), []);
+
+  // A stale request does not cover a later crash, and crashes still count.
+  health.recordRestartRequest({ at: now - 19 * 60e3 });
+  for (const at of [now - 5 * 60e3, now - 4 * 60e3, now - 3 * 60e3, now - 2 * 60e3]) health.record('daemon', { at, pid: process.pid });
+  value = health.snapshot(now);
+  assert.deepEqual(health.unrequestedStarts(value.daemon, now - 3600e3), [now - 5 * 60e3, now - 4 * 60e3, now - 3 * 60e3, now - 2 * 60e3]);
+  assert.match(health.attentionItems(value, now).find((item) => item.id === 'health:daemon').text, /4 starts in 1h/);
+});
+
 test('reviewSection is compact for all-ok and diagnostic for failures', () => {
   const { health } = fixture();
   const now = 4 * 3600e3;
