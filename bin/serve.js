@@ -36,6 +36,7 @@ const landed = require('./landed.js');
 const unblock = require('./unblock.js');
 const limitresume = require('./limitresume.js');
 const health = require('./health.js');
+const features = require('./features.js');
 const stalled = require('./stalled.js');
 const keepConsole = require('./console.js');
 const sessionStatus = require('./session-status.js');
@@ -103,8 +104,10 @@ let companionSnapshotCache = { at: 0, value: null, pending: null };
 const SUGGESTION_PROBE_MAX_READS = Math.ceil(SUGGESTION_PROBE_MAX_MS / SUGGESTION_PROBE_WAIT_MS) + 1;
 
 function messageWatcherDashboardState() {
-  const slackState = slack.dashboardState();
-  const discordState = discord.dashboardState();
+  // A feature that is off looks to the console exactly like one that has never
+  // polled: same keys, no stored state read.
+  const slackState = features.dashboardState('slack', () => slack.dashboardState());
+  const discordState = features.dashboardState('discord', () => discord.dashboardState());
   const recent = [...(slackState.recent || []), ...(discordState.recent || [])]
     .sort((a, b) => Number(a.at || 0) - Number(b.at || 0))
     .slice(-10);
@@ -6177,7 +6180,7 @@ function buildState(options = {}) {
     reminders: reminders.snapshot(),
     alerts: alerts.readAlerts({ root: keep.ROOT, all: true, limit: 10 }),
     brief: alertMeta.lastBriefText ? { at: alertMeta.lastBriefAt || null, text: alertMeta.lastBriefText } : null,
-    standup: standup.dashboardState(),
+    standup: features.dashboardState('standup', () => standup.dashboardState()),
     landed: landed.dashboardState(),
     limitResume: limitresume.dashboardState(keep.ROOT),
     slack: messageWatcherDashboardState(),
@@ -7742,7 +7745,7 @@ function start(deps = {}) {
     answerSession, attentionAckKey, attentionAckName, buildState, cardUsage, closeEphemeralPane,
     closeIdleSession, codex, compactSessionById, compactState, companionSnapshot, daemonRestartGate,
     dashboardDetail, deliverCheckToThread, deliverUnblockToThread, discord, driftWakeFromVerdict,
-    envNumber, forceRestartSession, fs, handoffSession, health, hostRequest, ideas,
+    envNumber, features, forceRestartSession, fs, handoffSession, health, hostRequest, ideas,
     inspectReviewQueueLaunch, keep, keepConsole, landed, launchReviewQueueSession, lightweightState,
     limitresume, listHostPanes, listPortableTransfers, liveSessionTick, liveTurnIndexSessions,
     loadCurrentSession, notifications, openCheckSession, openSession, path, portableTransferDraft,

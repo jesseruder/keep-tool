@@ -37,7 +37,9 @@ function apply(env = process.env) {
     if (!['string', 'number', 'boolean'].includes(typeof entry)) throw new Error(`invalid value for ${key}`);
     if (env[key] === undefined) env[key] = String(entry);
   }
-  for (const [key, envKey] of [['scopes', 'KEEP_SCOPES'], ['projectCatalog', 'KEEP_PROJECT_CATALOG'], ['modelBudgets', 'KEEP_MODEL_BUDGETS']]) {
+  // Projected into the environment so a child process reads the same answer as
+  // its parent, including one started with an isolated KEEP_DIR.
+  for (const [key, envKey] of [['scopes', 'KEEP_SCOPES'], ['projectCatalog', 'KEEP_PROJECT_CATALOG'], ['modelBudgets', 'KEEP_MODEL_BUDGETS'], ['features', 'KEEP_FEATURES']]) {
     if (value[key] !== undefined && env[envKey] === undefined) env[envKey] = JSON.stringify(value[key]);
   }
   require('../web/app/shared/scope-rules').validate(env.KEEP_SCOPES ? JSON.parse(env.KEEP_SCOPES) : undefined);

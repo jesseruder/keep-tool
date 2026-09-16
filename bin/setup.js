@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
 const config = require('./config');
+const features = require('./features.js');
 const SOURCE = path.resolve(__dirname, '..');
 const quote = (value) => "'" + String(value).replace(/'/g, "'\\''") + "'";
 const xml = (value) => String(value).replace(/[<>&"']/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' })[c]);
@@ -72,12 +73,15 @@ function init(args) {
     fs.rmSync(staging, { recursive: true, force: true });
   }
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  // Optional features a fresh install has no accounts or channels for start off;
+  // `keep doctor` lists them. Existing configurations have no `features` key and
+  // keep every feature on.
   fs.writeFileSync(file, JSON.stringify({ version: 1, dataDir: root, env: {
     KEEP_NO_PUSH: '1', KEEP_SYNC: '0', KEEP_HOST: '127.0.0.1',
     KEEP_REVIEWER_MODEL: 'fable', KEEP_IDEAS_MODEL: 'fable',
     KEEP_REVIEW_CADENCE: 'events', KEEP_REVIEW_SWEEP_AT: '07:45',
     KEEP_OPEN_CLAUDE_FLAGS: '', KEEP_OPEN_CODEX_FLAGS: '',
-  } }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+  }, features: { ...features.INIT_FEATURES } }, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
   console.log(`Created private registry: ${root}\nConfiguration: ${file}\nNext: keep setup hooks, then keep doctor. No remote was configured.`);
 }
 
@@ -629,6 +633,9 @@ function doctor(root) {
       .every((plan) => plan.action === 'ok'), required);
     if (!ok) console.log(`  fix: keep setup skills${required ? '' : ` --pack ${name}`}`);
   }
+  // Optional features are switches, not health: report what this machine has
+  // chosen rather than passing or failing it.
+  console.log(`features: ${features.list().map((feature) => `${feature.name} ${feature.enabled ? 'on' : 'off'}`).join(', ')}`);
   console.log('Model access and external integrations require their own live checks; doctor does not call models or send notifications.');
   if (failed) process.exitCode = 1;
 }

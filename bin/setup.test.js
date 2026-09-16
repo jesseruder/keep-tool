@@ -39,6 +39,10 @@ test('fresh initialization supports the full task lifecycle without a source che
     ok('init', '--dir', root);
     assert.equal(fs.statSync(env.KEEP_CONFIG).mode & 0o777, 0o600);
     assert.equal(fs.existsSync(path.join(root, 'bin')), false);
+    // A new install starts without the features it has nothing configured for.
+    assert.deepEqual(JSON.parse(fs.readFileSync(env.KEEP_CONFIG, 'utf8')).features,
+      { standup: false, ideas: true, slack: false, discord: false });
+    assert.match(cli('doctor').stdout, /^features: standup off, ideas on, slack off, discord off$/m);
     ok('add', 'Synthetic task', '--project', root, '--tag', 'personal');
     ok('checkin', 'synthetic-task', '-m', 'Ready for verification.');
     assert.match(ok('list'), /Synthetic task/);

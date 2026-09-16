@@ -30,6 +30,7 @@ const stepRegistry = require('./steps.js');
 const allow = require('./allow.js');
 const cardUsage = require('./card-usage.js');
 const delegation = require('./delegation.js');
+const features = require('./features.js');
 const hookGroup = require('./commands/hook.js');
 const hostGroup = require('./commands/host.js');
 const reviewGroup = require('./commands/review.js');
@@ -2086,7 +2087,7 @@ commands.codex = async (argv) => {
 commands.standup = async (argv) => {
   const o = parseArgs(argv, { since: 'str', dry: 'bool', show: 'bool' });
   if (o._.length) die('usage: keep standup [--since "YYYY-MM-DD HH:MM"|ISO] [--dry] [--show]');
-  const standup = require('./standup.js');
+  const standup = features.load('standup');
   if (o.show) {
     try { process.stdout.write(fs.readFileSync(path.join(ROOT, 'standup.md'), 'utf8')); }
     catch { die('no standup.md yet — run `keep standup`'); }
@@ -2118,7 +2119,7 @@ commands.ideas = async (argv) => {
   const o = parseArgs(argv, { dry: 'bool', model: 'str' });
   if (o._.length) die('usage: keep ideas [--dry] [--model <m>]');
   if (isReviewerSession() && !o.dry) die('the fleet reviewer may only run `keep ideas --dry`');
-  const ideas = require('./ideas.js');
+  const ideas = features.load('ideas');
   const result = await ideas.run({ dry: o.dry, model: o.model });
   if (o.dry && result.prompt) {
     console.log(`${ideas.renderEvidence(result.evidence)}\n\n${result.prompt}`);
@@ -2175,7 +2176,7 @@ commands.landed = async (argv) => {
 };
 
 commands.slack = async (argv) => {
-  const slack = require('./slack.js');
+  const slack = features.load('slack');
   const [subcommand, ...rest] = argv;
   if (subcommand === 'poll') {
     const o = parseArgs(rest, { dry: 'bool' });
@@ -2207,7 +2208,7 @@ commands.slack = async (argv) => {
 };
 
 commands.discord = async (argv) => {
-  const discord = require('./discord.js');
+  const discord = features.load('discord');
   const [subcommand, ...rest] = argv;
   if (subcommand === 'poll') {
     const o = parseArgs(rest, { dry: 'bool' });
@@ -2228,6 +2229,17 @@ commands.discord = async (argv) => {
   }
   die('usage: keep discord poll [--dry] | keep discord status');
 };
+
+// Optional features are switched from the configuration; bin/features.js holds the
+// registry. The command stays registered when its feature is off so `keep <name>`
+// says how to turn it on instead of looking like a typo.
+for (const [name, feature] of Object.entries(features.FEATURES)) {
+  const run = commands[feature.command];
+  commands[feature.command] = async (...args) => {
+    if (!features.enabled(name)) throw new KeepError(features.offMessage(name));
+    return run(...args);
+  };
+}
 
 commands.verify = async (argv, deps = {}) => {
   const o = parseArgs(argv, {});
@@ -2702,6 +2714,7 @@ ${stepUsage()}
   keep slack mode log|cards|alerts
   keep discord poll [--dry]
   keep discord status
+    standup, ideas, slack and discord are optional features; keep doctor lists which are on.
   keep probe <id>      # run this card's probe now (exit 1 = failed); no check-in, no daemon
   keep verify <id>     # run this task's check recipe now, in its thread or a fresh session (needs keep serve)
   keep compact <sid>   # compact a live Claude or Codex session (needs keep serve)

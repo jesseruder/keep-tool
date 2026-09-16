@@ -130,6 +130,9 @@ configuration and available agent sessions, Keep can:
 Scheduling, model access, and launch permissions are separate controls. Model-backed
 checks and reviews use your Claude account; Keep is not a model service. Optional
 Slack polling and notification integrations require their own configuration.
+The standup, ideas, Slack, and Discord features are switched from the
+configuration's `features` key — off means no command, no scheduler, and no
+dashboard state; see [Features](docs/reference.md#features).
 See [configuration](#configuration) and the [command reference](docs/reference.md)
 for the controls and prerequisites.
 

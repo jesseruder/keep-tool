@@ -9,13 +9,27 @@
 // stay on ctx rather than being destructured: the dashboard rebinds them, and the
 // watcher tick has to read whichever snapshot is current when it runs.
 
+// The optional features' schedulers, in the order given. A feature that is off
+// never starts one: its module is not asked for a tick, so it records no health
+// row and reads no state. Exported on its own so a test can ask what a set of
+// switches starts without standing up the daemon.
+function startFeatureSchedulers(features, modules, options) {
+  const started = [];
+  for (const [name, module] of Object.entries(modules)) {
+    if (!features.enabled(name)) continue;
+    module.startScheduler(options);
+    started.push(name);
+  }
+  return started;
+}
+
 function startSchedulers(ctx) {
   const {
     TURN_INDEX_BUDGET_BYTES, TURN_INDEX_BUDGET_MS, TURN_INDEX_PRUNE_LIMIT,
     WATCHER_CONCURRENCY, WATCHER_TURNS_PER_TICK, WATCHER_WINDOW_MS,
     addHostSessionState, agentProcessRows, broadcast, buildState, cardUsage, closeEphemeralPane,
     closeIdleSession, dashboardBuild, dashboardBuilder, deliverCheckToThread, deliverUnblockToThread,
-    deps, discord, driftWakeFromVerdict, envNumber, forceRestartSession, fs, health, hostRequest,
+    deps, discord, driftWakeFromVerdict, envNumber, features, forceRestartSession, fs, health, hostRequest,
     ideas, keep, keepConsole, landed, limitresume, listHostPanes, liveSessionTick,
     liveTurnIndexSessions, loadCurrentSession, openCheckSession, openSession, path,
     prepareSessionSummary, readLiveSessionLedger, readScreenResult, restartSession, resumeAfterLimit,
@@ -157,8 +171,7 @@ function startSchedulers(ctx) {
   });
   review.startScheduler(reviewDeps);
   startBriefScheduler({ onChange: broadcast });
-  standup.startScheduler({ onChange: broadcast });
-  ideas.startScheduler({ onChange: broadcast });
+  startFeatureSchedulers(features, { standup, ideas }, { onChange: broadcast });
   // Deterministic hygiene, refreshed on a clock: the reviewer bundle splices the
   // persisted snapshot in and review-land refuses notes against it, so a day-old
   // file is the same as no lint at all.
@@ -212,8 +225,7 @@ function startSchedulers(ctx) {
       return Boolean(match && match.alive && match.agentAlive !== false);
     },
   });
-  slack.startScheduler({ onChange: broadcast });
-  discord.startScheduler({ onChange: broadcast });
+  startFeatureSchedulers(features, { slack, discord }, { onChange: broadcast });
   const configuredLiveTickMs = Number(process.env.KEEP_LIVE_TICK_MS);
   const liveTickMs = Number.isFinite(configuredLiveTickMs) && configuredLiveTickMs > 0
     ? configuredLiveTickMs
@@ -442,4 +454,4 @@ function startSchedulers(ctx) {
   return { restarts };
 }
 
-module.exports = { startSchedulers };
+module.exports = { startFeatureSchedulers, startSchedulers };

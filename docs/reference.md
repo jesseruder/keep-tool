@@ -15,6 +15,8 @@ registry data or credentials to the public source repository.
 - `bin/keep` — the CLI (sh launcher + `keep.js`, runs on Node; symlinked from `~/bin/keep`)
 - `bin/keep-core.js` — the shared layer under the CLI: registry paths, card IO, the lock, session links, plans, and the mutators every command group uses
 - `bin/commands/` — one module per command group (`hook`, `step`, `turns`, `watcher`, `host`, `review`), each exporting its own slice of the command table
+- `bin/features.js` — the optional-feature registry: descriptions, the configuration switches, and the empty dashboard state an off feature reports
+- `bin/serve/` — the daemon's request ladder (`routes.js`) and periodic jobs (`schedulers.js`), both driven from a `ctx` object `serve.js` assembles
 - `tasks/` — live tasks, one `.md` per task
 - `archive/` — done tasks, swept here occasionally
 - `digests/` — generated digests (Phase 2)
@@ -39,6 +41,50 @@ registry data or credentials to the public source repository.
 - `.keep/unblocked/` — pending and delivered cross-card unblock records
 - `steps/` — committed gated-step registries, one JSON file per project basename
 - `.keep/steps/` — local step run ledgers and logs (gitignored)
+
+## Features
+
+Four things the daemon and the CLI do are optional, and an install that does not
+want one should not run it at all. The configuration file's `features` key is an
+object of booleans:
+
+```json
+{ "version": 1, "features": { "standup": false, "ideas": true, "slack": false, "discord": false } }
+```
+
+| feature | what it is |
+| --- | --- |
+| `standup` | weekday standup note generated from card activity |
+| `ideas` | daily fleet-wide workflow-improvement pass |
+| `slack` | read-only Slack polling correlated with cards |
+| `discord` | Discord rendered-message polling |
+
+Absent means on. A configuration written before this key existed — every existing
+install — keeps all four, so nothing changes under an upgrade. Only an explicit
+`false` switches one off. `keep init` writes the block above into a *new*
+configuration, because a fresh install has no Slack workspace, no Discord tab and
+no standup history to summarize.
+
+Off means three things: the daemon starts no scheduler for it, its dashboard state
+degrades to the value the module reports when it has nothing (`standup` is absent,
+`slack` and `discord` are an unpolled watcher) so the console's response shape is
+unchanged, and its command refuses:
+
+```
+$ keep standup
+keep: feature standup is off; enable it with "features": {"standup": true} in ~/.config/keep/config.json
+```
+
+The command stays registered so that message is what you get, rather than `unknown
+command`. Off does not unload the module: `landed`, `review` and the reviewer may
+still call into `slack.js` as a library. `landed` itself is not switchable —
+review, lint and self-repair read what it records.
+
+`keep doctor` prints the current switches on one line
+(`features: standup off, ideas on, slack off, discord off`), and `config.apply()`
+projects the key into `KEEP_FEATURES` the same way it projects `scopes` into
+`KEEP_SCOPES`, so a child process reads the same answer as its parent.
+
 
 ## CLI
 
