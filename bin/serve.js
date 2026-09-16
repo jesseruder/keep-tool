@@ -103,6 +103,13 @@ const COMPANION_SNAPSHOT_MS = 1000;
 let companionSnapshotCache = { at: 0, value: null, pending: null };
 // A frozen or non-advancing clock must not spin the poll loop forever.
 const SUGGESTION_PROBE_MAX_READS = Math.ceil(SUGGESTION_PROBE_MAX_MS / SUGGESTION_PROBE_WAIT_MS) + 1;
+// The probe's Backspace is sent, not awaited — but the very next screen read is often
+// someone else's (the same tick's precheck and restore both read the pane). A read that
+// still shows the collapsed probe key becomes the next probe's "before", and that probe
+// sees `,` before and `,` after: 'unchanged', and a refusal every minute. Wait for the
+// undo to render so a probe always leaves a settled screen behind it.
+const SUGGESTION_PROBE_SETTLE_MS = 1000;
+const SUGGESTION_PROBE_SETTLE_READS = Math.ceil(SUGGESTION_PROBE_SETTLE_MS / SUGGESTION_PROBE_WAIT_MS);
 
 function messageWatcherDashboardState() {
   // A feature that is off looks to the console exactly like one that has never
@@ -1187,6 +1194,88 @@ function lastClaudeHandoffModel(lines) {
   return '<unknown>';
 }
 
+// A session parked on the rate limit has a tail of nothing but synthetic records, so the
+// tail alone reports '<unknown>' for a model that is still perfectly knowable further
+// back. Walk the transcript backwards for the newest genuine assistant record — bounded,
+// because a long-lived session's transcript runs to hundreds of megabytes.
+const HANDOFF_MODEL_SCAN_BYTES = 8 * 1024 * 1024;
+const HANDOFF_MODEL_SCAN_CHUNKS = 64;
+
+// Did this slice hold a genuine assistant record at all? It separates "a real record is
+// missing its model", which must keep failing closed on the malformed value, from "this
+// slice is only rate-limit noise", which is merely a reason to look further back.
+function hasGenuineAssistantUsage(text) {
+  for (const line of String(text || '').split(/\r?\n/)) {
+    let record;
+    try { record = JSON.parse(line); } catch { continue; }
+    if (!record || record.type !== 'assistant' || record.isSidechain || !record.message) continue;
+    if (record.isApiErrorMessage || record.message.model === '<synthetic>') continue;
+    if (record.message.usage) return true;
+  }
+  return false;
+}
+
+// lastClaudeHandoffModel over the whole file, newest slice first, so only the most recent
+// genuine assistant model can win. Returns '' when the bounded scan finds no genuine
+// record at all — "nothing on record", not "unsafe".
+function lastClaudeHandoffModelInFile(file, deps = {}) {
+  const chunkBytes = Number(deps.scanChunkBytes) || TAIL_BYTES;
+  const maxBytes = Number(deps.scanMaxBytes) || HANDOFF_MODEL_SCAN_BYTES;
+  const fd = fs.openSync(file, 'r');
+  try {
+    let end = fs.fstatSync(fd).size;
+    let scanned = 0;
+    // The head of a record split across a chunk boundary, carried back to the slice that
+    // holds the rest of it. Bytes, not text: a split multi-byte character must survive.
+    let carry = Buffer.alloc(0);
+    for (let chunks = 0; chunks < HANDOFF_MODEL_SCAN_CHUNKS && end > 0 && scanned < maxBytes; chunks += 1) {
+      const start = Math.max(0, end - chunkBytes);
+      const slice = Buffer.alloc((end - start) + carry.length);
+      fs.readSync(fd, slice, 0, end - start, start);
+      carry.copy(slice, end - start);
+      scanned += end - start;
+      let body = slice;
+      carry = Buffer.alloc(0);
+      if (start > 0) {
+        const newline = slice.indexOf(0x0a);
+        carry = newline === -1 ? slice : slice.subarray(0, newline);
+        body = newline === -1 ? Buffer.alloc(0) : slice.subarray(newline + 1);
+      }
+      const text = body.toString('utf8');
+      const model = lastClaudeHandoffModel(text);
+      if (model && (model !== '<unknown>' || hasGenuineAssistantUsage(text))) return model;
+      end = start;
+    }
+  } finally { fs.closeSync(fd); }
+  return '';
+}
+
+// `claude --model` takes the plain id; settings.json and `keep open --model` record the
+// 1M-context variant as `claude-fable-5-1[1m]`.
+function launchModelId(value) {
+  const model = String(value || '').trim().replace(/\[1m\]$/i, '');
+  return model && keep.LAUNCH_MODEL_RE.test(model) ? model : '';
+}
+
+const HANDOFF_ARGV_MODEL_RE = /(?:^|\s)--model(?:=|\s+)["']?([A-Za-z0-9][A-Za-z0-9._:[\]/-]*)["']?(?=\s|$)/;
+
+// The model the account handoff has to relaunch with. '' means "nothing on record",
+// which the handoff accepts — it only refuses a value it could not pass to `claude
+// --model`. A genuine record with a malformed model still comes through verbatim, so
+// that case keeps failing closed; a synthetic-only transcript no longer does.
+function handoffCurrentModel(session, pane, processArgs, deps = {}) {
+  try {
+    const file = (deps.findSessionFile || findSessionFile)(session.id);
+    const model = file ? (deps.lastClaudeHandoffModelInFile || lastClaudeHandoffModelInFile)(file, deps) : '';
+    if (model) return model;
+  } catch {}
+  // Launch metadata, most specific first. It can be stale after an in-session /model,
+  // so it is only ever consulted when the transcript says nothing at all.
+  return launchModelId(pane?.meta?.model)
+    || launchModelId(HANDOFF_ARGV_MODEL_RE.exec(String(processArgs || ''))?.[1])
+    || '';
+}
+
 function lastContextTokens(lines, kind) {
   return lastTurnUsage(lines, kind).contextTokens;
 }
@@ -1572,6 +1661,28 @@ function logDraftRefusal(target, message, beforeScreen, afterScreen, probe, deps
   write(`${out.join('\n')}\n`);
 }
 
+// Poll until the probe key is gone from the input box: the box empties, the suggestion
+// re-renders, or a real draft's own text comes back. Never throws — a probe that cannot
+// prove its own cleanup landed is not a reason to fail the send that succeeded; the next
+// caller's probe sees the stray comma and refuses safely on its own.
+async function waitForProbeUndo(target, lastScreen, read, wait, now, deps = {}) {
+  // Only the collapsed-suggestion shape is ambiguous to the next reader. Any other box
+  // visibly loses its trailing probe key, and an empty box is already settled.
+  if (promptText(promptLine(lastScreen)) !== SUGGESTION_PROBE_KEY) return;
+  const startedAt = now();
+  for (let reads = 0; reads < SUGGESTION_PROBE_SETTLE_READS; reads += 1) {
+    await wait(SUGGESTION_PROBE_WAIT_MS);
+    let screen;
+    // A pane that cannot be read tells us nothing about the Backspace, and whoever
+    // reads it next will fail on the same pane.
+    try { screen = await read(target, 30, false); } catch { return; }
+    if (promptText(promptLine(screen)) !== SUGGESTION_PROBE_KEY) return;
+    if (now() - startedAt >= SUGGESTION_PROBE_SETTLE_MS) break;
+  }
+  const write = deps.stderr || process.stderr.write.bind(process.stderr);
+  write(`keep serve: probe keystroke ${JSON.stringify(SUGGESTION_PROBE_KEY)} still on screen after Backspace on pane ${(target && target.pane) || 'unknown'}; the next probe may refuse\n`);
+}
+
 async function probeSuggestion(target, beforeScreen, deps = {}) {
   let precheckError;
   try {
@@ -1648,7 +1759,12 @@ async function probeSuggestion(target, beforeScreen, deps = {}) {
       // 'unchanged': Claude Code may simply not have re-rendered yet. Keep polling
       // until the deadline, then refuse — an unreactive prompt is not provably empty.
       if (now() - startedAt >= SUGGESTION_PROBE_MAX_MS || reads >= SUGGESTION_PROBE_MAX_READS) {
-        const message = 'the session input box shows text that did not react to a probe keystroke (a draft, or a prompt suggestion that has not re-rendered); clear it in the terminal first';
+        // The box held exactly the probe key before we typed and still does: a
+        // collapsed suggestion and a stale read are indistinguishable here, so say
+        // which one the log should be read as instead of the generic "did not react".
+        const message = normalizedText(beforeText) === SUGGESTION_PROBE_KEY && afterText === SUGGESTION_PROBE_KEY
+          ? 'the input box held the probe key before the probe began; a previous probe\'s Backspace may not have rendered (or the box holds a literal comma); clear it in the terminal first'
+          : 'the session input box shows text that did not react to a probe keystroke (a draft, or a prompt suggestion that has not re-rendered); clear it in the terminal first';
         logDraftRefusal(target, message, beforeScreen, afterScreen, SUGGESTION_PROBE_KEY, deps);
         throw new InjectionError(409, message, extra());
       }
@@ -1662,8 +1778,10 @@ async function probeSuggestion(target, beforeScreen, deps = {}) {
     // Only undo a keystroke that actually landed: a failed send followed by Backspace
     // would eat the last character of a real draft.
     if (typed) {
+      let undone = false;
       try {
         await pressTargetKey(target, 'Backspace', deps);
+        undone = true;
       } catch (error) {
         const message = 'the probe keystroke could not be undone; clear the session input box in the terminal first';
         if (failure == null) {
@@ -1679,6 +1797,9 @@ async function probeSuggestion(target, beforeScreen, deps = {}) {
         const write = deps.stderr || process.stderr.write.bind(process.stderr);
         write(`keep serve: draft refusal cleanup failed on pane ${(target && target.pane) || 'unknown'}: ${detail}\n`);
       }
+      // Leave a settled screen for whoever reads this pane next — including a probe
+      // later in this same tick.
+      if (undone) await waitForProbeUndo(target, lastScreen, read, wait, now, deps);
     }
   }
 }
@@ -2516,12 +2637,12 @@ async function sweepPendingCompactSwaps(deps = {}) {
                 && !/esc to (?:interrupt|cancel)/i.test(screen);
             if (!complete) return null;
           }
+          // typeAndSubmit confirms the typed command, but does not check the input box
+          // or modal before typing — precheck does, and for a Claude session it is the
+          // suggestion probe. One probe per tick: a second one here re-read the screen
+          // before the first probe's Backspace had rendered, saw the stray `,` as its
+          // own "before", and refused every minute with "did not react".
           await precheck(current, target, deps);
-          // typeAndSubmit confirms the typed command, but does not check the
-          // input box or modal before typing. The re-read goes through the suggestion
-          // probe too: the probe's Backspace puts the prompt suggestion back, so a
-          // bare sendPrecheck here would see it again and refuse.
-          await probeSuggestion(target, await read(target, 30, false), deps);
           const via = String(record.switchModel || envString('KEEP_COMPACT_VIA_MODEL', 'opus')).trim();
           const before = readSettings();
           // /model also overwrites settings.json. Save a hand change so we can
@@ -6914,9 +7035,7 @@ async function inspectAccountHandoff(body, deps = {}) {
   const processArgs = identity ? rows.find((entry) => entry.pid === identity.pid)?.args || '' : '';
   let currentModel = '';
   try {
-    if (session?.kind === 'claude') {
-      currentModel = lastClaudeHandoffModel(readTranscriptTail(findSessionFile(session.id)));
-    }
+    if (session?.kind === 'claude') currentModel = handoffCurrentModel(session, pane, processArgs, deps);
   } catch {}
   return { session, pane, processArgs, currentModel,
     agentIdentity: identity ? { pid: identity.pid, pidStart: identity.pidStart, primary: identity.primary === true,
@@ -8353,6 +8472,7 @@ module.exports = {
   lastTurnUsage,
   sessionLastTurn,
   lastClaudeHandoffModel,
+  handoffCurrentModel,
   lastContextTokens,
   compactRefusal,
   compactCommand,
@@ -8410,6 +8530,7 @@ module.exports = {
   sendPrecheck,
   SUGGESTION_PROBE_KEY,
   SUGGESTION_PROBE_MAX_READS,
+  SUGGESTION_PROBE_SETTLE_READS,
   isHostTarget,
   hostClient,
   hostRequest,

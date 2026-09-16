@@ -16,6 +16,7 @@ const { spawnSync } = require('node:child_process');
 // State-shape fixtures must never call real models, even through async summaries.
 const STATE_FIXTURE_SETUP = "require('./bin/summarize').getSummary = () => ({ text: null }); require('./bin/titles').applyLiveTitles = () => {};";
 const codex = require('./codex.js');
+const { readTranscriptTail } = require('./transcripts.js');
 const {
   scanTranscript,
   claudeTranscriptIsInteractive,
@@ -28,6 +29,7 @@ const {
   lastTurnUsage,
   sessionLastTurn,
   lastClaudeHandoffModel,
+  handoffCurrentModel,
   lastContextTokens,
   autoCompactIdleMs,
   compactModelExhausted,
@@ -79,6 +81,7 @@ const {
   probeSuggestion,
   sendPrecheck,
   SUGGESTION_PROBE_MAX_READS,
+  SUGGESTION_PROBE_SETTLE_READS,
   isHostTarget,
   hostClient,
   hostRequest,
@@ -267,7 +270,11 @@ test('probeSuggestion distinguishes generated suggestions from drafts through ho
   const stderr = (message) => { logged.push(message); };
   const target = { pane: 'pane-probe' };
   await probeSuggestion(target, 'header\n❯ suggested next prompt', {
-    host, wait: async () => {}, readScreen: async () => 'header\n❯ ,', stderr,
+    host,
+    wait: async () => {},
+    // The Backspace puts the suggestion back, and the probe waits for that to render.
+    readScreen: async () => (inputs.includes('\x7f') ? 'header\n❯ suggested next prompt' : 'header\n❯ ,'),
+    stderr,
   });
   assert.deepEqual(inputs, [',', '\x7f']);
   assert.deepEqual(logged, []);
@@ -328,7 +335,7 @@ test('probeSuggestion accepts a real Claude Code prompt suggestion captured from
   await probeSuggestion({ pane: 'pane-8460a8a0' }, REVIEWER_SUGGESTION_BEFORE, {
     host,
     wait: async () => {},
-    readScreen: async () => REVIEWER_SUGGESTION_AFTER,
+    readScreen: async () => (inputs.includes('\x7f') ? REVIEWER_SUGGESTION_BEFORE : REVIEWER_SUGGESTION_AFTER),
     stderr: (message) => { logged.push(message); },
   });
   assert.deepEqual(inputs, [',', '\x7f']);
@@ -343,11 +350,84 @@ test('probeSuggestion keeps polling while Claude Code has not re-rendered the pr
     wait: async () => {},
     readScreen: async () => {
       reads += 1;
+      if (inputs.includes('\x7f')) return REVIEWER_SUGGESTION_BEFORE;
       return reads < 3 ? REVIEWER_SUGGESTION_BEFORE : REVIEWER_SUGGESTION_AFTER;
     },
   });
-  assert.equal(reads, 3);
+  assert.equal(reads, 4, 'two polls for the probe, one more for the Backspace that undoes it');
   assert.deepEqual(inputs, [',', '\x7f']);
+});
+
+test('probeSuggestion waits for its own Backspace to render before returning', async () => {
+  const { inputs, host } = probeInputRecorder();
+  const logged = [];
+  let reads = 0;
+  await probeSuggestion({ pane: 'pane-8460a8a0' }, REVIEWER_SUGGESTION_BEFORE, {
+    host,
+    wait: async () => {},
+    // Read 1 classifies the collapsed suggestion. Reads 2 and 3 still show the probe
+    // key: the Backspace has not landed. Read 4 has the suggestion back, so whoever
+    // reads this pane next cannot mistake a stale `,` for a draft.
+    readScreen: async () => {
+      reads += 1;
+      return reads < 4 ? REVIEWER_SUGGESTION_AFTER : REVIEWER_SUGGESTION_BEFORE;
+    },
+    stderr: (message) => { logged.push(message); },
+  });
+  assert.equal(reads, 4, 'the probe polls until its own probe key is off the prompt line');
+  assert.deepEqual(inputs, [',', '\x7f']);
+  assert.deepEqual(logged, []);
+});
+
+test('probeSuggestion logs once and returns when its Backspace never renders', async () => {
+  const { inputs, host } = probeInputRecorder();
+  const logged = [];
+  let reads = 0;
+  await probeSuggestion({ pane: 'pane-stale' }, REVIEWER_SUGGESTION_BEFORE, {
+    host,
+    wait: async () => {},
+    readScreen: async () => { reads += 1; return REVIEWER_SUGGESTION_AFTER; },
+    stderr: (message) => { logged.push(message); },
+  });
+  // A send that already proved the box was a suggestion is not failed by a cleanup we
+  // cannot observe: the next caller's probe sees the comma and refuses on its own.
+  assert.equal(reads, 1 + SUGGESTION_PROBE_SETTLE_READS);
+  assert.equal(logged.length, 1);
+  assert.match(logged[0], /still on screen after Backspace on pane pane-stale/);
+  assert.deepEqual(inputs, [',', '\x7f']);
+});
+
+test('a second probe on a pane that renders one poll late still sees a suggestion', async () => {
+  // The host's screen model: a keystroke changes the input box now, but a read shows the
+  // box as of the previous read. Two probes in one tick used to make the second one read
+  // the first one's `,` as its own "before" and refuse with "did not react".
+  const inputs = [];
+  let box = '';
+  let rendered = '';
+  const host = recordingHost((type, params) => {
+    if (type !== 'input') return {};
+    const data = Buffer.from(params.data, 'base64').toString('utf8');
+    inputs.push(data);
+    box = data === '\x7f' ? box.slice(0, -1) : box + data;
+    return {};
+  });
+  const readScreen = async () => {
+    const shown = rendered;
+    rendered = box;
+    return shown ? suggestionScreenWithBox(shown) : REVIEWER_SUGGESTION_BEFORE;
+  };
+  const target = { pane: 'pane-latent' };
+  const deps = {
+    host,
+    wait: async () => {},
+    readScreen,
+    stderr: (message) => { throw new Error(`unexpected refusal log: ${message}`); },
+  };
+  for (let probe = 0; probe < 2; probe += 1) {
+    await probeSuggestion(target, await readScreen(target, 30, false), deps);
+  }
+  assert.deepEqual(inputs, [',', '\x7f', ',', '\x7f'], 'each probe types once and undoes itself');
+  assert.equal(box, '', 'the input box is left empty');
 });
 
 test('probeSuggestion refuses and logs the screen tail when the prompt never reacts to the probe', async () => {
@@ -387,6 +467,26 @@ test('probeSuggestion refuses a draft that is exactly the probe key', async () =
     stderr: () => {},
   }), /contains a draft/);
   assert.deepEqual(inputs, [',', '\x7f']);
+});
+
+test('probeSuggestion names a stale probe key when the box held one before the probe', async () => {
+  const { inputs, host } = probeInputRecorder();
+  const logged = [];
+  // A box that is exactly `,` before and after our own `,` is the one shape the probe
+  // cannot decide: a leftover from a previous probe reads the same as a typed comma.
+  const error = await probeSuggestion({ pane: 'pane-stale-comma' }, 'header\n❯ ,', {
+    host,
+    wait: async () => {},
+    readScreen: async () => 'header\n❯ ,',
+    stderr: (message) => { logged.push(message); },
+  }).then(() => null, (e) => e);
+  assert.ok(error, 'an undecidable box must still be refused');
+  assert.equal(error.status, 409);
+  assert.match(error.message, /held the probe key before the probe began/);
+  assert.match(error.message, /Backspace may not have rendered/);
+  assert.equal(error.extra.probe.outcome, 'unchanged');
+  assert.deepEqual(inputs, [',', '\x7f']);
+  assert.ok(logged.some((message) => /held the probe key before the probe began/.test(message)));
 });
 
 test('probeSuggestion stops polling after a bounded number of reads on a frozen clock', async () => {
@@ -1850,6 +1950,92 @@ test('handoff model selection retains the last real Claude model across syntheti
   } }]), '<invalid>', 'a malformed genuine model remains visible to fail-closed validation');
 });
 
+// The two sessions parked on the Fable limit: every record in the transcript's tail is a
+// synthetic rate-limit error, so the handoff read the model as unknown and refused to
+// move a session whose model was written down a few megabytes earlier.
+function rateLimitedTranscript(dir, name, realModel) {
+  const file = path.join(dir, name);
+  const padding = 'x'.repeat(2000);
+  const weeklyLimit = JSON.stringify({
+    type: 'assistant', isApiErrorMessage: true, error: 'rate_limit', apiErrorStatus: 429,
+    message: { model: '<synthetic>', usage: { input_tokens: 0 }, padding, content: [{
+      type: 'text', text: "You've reached your Fable 5.1 limit.",
+    }] },
+  });
+  const lines = [];
+  if (realModel) {
+    lines.push(JSON.stringify({ type: 'assistant', message: {
+      model: realModel, usage: { input_tokens: 400, cache_read_input_tokens: 60 },
+    } }));
+  }
+  // Comfortably past TAIL_BYTES, so the tail read alone cannot reach the real record.
+  for (let i = 0; i < 200; i += 1) lines.push(weeklyLimit);
+  fs.writeFileSync(file, `${lines.join('\n')}\n`);
+  assert.ok(fs.statSync(file).size > 256 * 1024, 'the synthetic tail must overflow one tail read');
+  return file;
+}
+
+test('handoff model resolution looks past a synthetic-only tail and then at launch metadata', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-handoff-model-'));
+  try {
+    const session = { id: 'cba96b8d', kind: 'claude' };
+    const withReal = rateLimitedTranscript(dir, 'real.jsonl', 'claude-fable-5-1');
+    const syntheticOnly = rateLimitedTranscript(dir, 'synthetic.jsonl', null);
+    const at = (file) => ({ findSessionFile: () => file });
+
+    assert.equal(lastClaudeHandoffModel(readTranscriptTail(withReal)), '<unknown>',
+      'the tail on its own still reports the model as unknown');
+    assert.equal(handoffCurrentModel(session, null, '', at(withReal)), 'claude-fable-5-1');
+
+    assert.equal(handoffCurrentModel(session, { meta: { model: 'claude-opus-5' } }, '', at(syntheticOnly)),
+      'claude-opus-5', 'the pane meta names the model when the transcript never does');
+    assert.equal(
+      handoffCurrentModel(session, null, 'claude --resume cba96b8d --model claude-fable-5-1[1m]', at(syntheticOnly)),
+      'claude-fable-5-1', 'a resume passes the plain id, not the settings.json [1m] variant');
+    assert.equal(handoffCurrentModel(session, null, 'claude --resume cba96b8d', at(syntheticOnly)), '',
+      'nothing on record is empty, which the handoff accepts, and never the unsafe sentinel');
+    assert.equal(handoffCurrentModel(session, null, '', { findSessionFile: () => null }), '');
+    assert.equal(handoffCurrentModel(session, null, '', {
+      findSessionFile: () => { throw new Error('two accounts, no authority'); },
+    }), '', 'an unresolvable transcript falls through to the launch metadata');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('handoff model resolution stops at a malformed genuine model and rejoins split records', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-handoff-model-scan-'));
+  try {
+    const session = { id: 'c6fc6716', kind: 'claude' };
+    const real = (model) => JSON.stringify({ type: 'assistant', message: {
+      model, usage: { input_tokens: 10 },
+    } });
+    const synthetic = JSON.stringify({
+      type: 'assistant', isApiErrorMessage: true,
+      message: { model: '<synthetic>', usage: { input_tokens: 0 } },
+    });
+    const file = path.join(dir, 'malformed.jsonl');
+    fs.writeFileSync(file, `${[real('claude-fable-5-1'), real('<invalid>'), synthetic].join('\n')}\n`);
+    // Tiny chunks: every record is split across a boundary, and a multi-byte character
+    // sits on one. The scan must rejoin them rather than lose the record.
+    const scan = { findSessionFile: () => file, scanChunkBytes: 24 };
+    assert.equal(handoffCurrentModel(session, { meta: { model: 'claude-opus-5' } }, '', scan), '<invalid>',
+      'a real record with an unusable model keeps failing closed instead of falling back');
+
+    const unicode = path.join(dir, 'unicode.jsonl');
+    fs.writeFileSync(unicode, `${[
+      JSON.stringify({ type: 'assistant', message: {
+        model: 'claude-fable-5-1', usage: { input_tokens: 10 }, note: '❯ überlang ✓',
+      } }),
+      synthetic, synthetic,
+    ].join('\n')}\n`);
+    assert.equal(handoffCurrentModel(session, null, '', { findSessionFile: () => unicode, scanChunkBytes: 24 }),
+      'claude-fable-5-1');
+    // A budget that cannot reach the record is an unknown model, not a wrong one.
+    assert.equal(handoffCurrentModel(session, null, '', {
+      findSessionFile: () => unicode, scanChunkBytes: 24, scanMaxBytes: 48,
+    }), '');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('Claude compact boundaries replace stale assistant context until the next assistant turn', () => {
   const assistant = (contextTokens) => ({
     type: 'assistant',
@@ -2679,7 +2865,7 @@ test('pending swap sweep restores through a prompt suggestion that Backspace put
   const readScreen = async () => (box ? suggestionScreenWithBox(box) : REVIEWER_SUGGESTION_BEFORE);
   try {
     // Drop the no-op precheck so the production precheckSessionTarget runs: it reads
-    // the screen and probes it too, so the suggestion is met twice per restore.
+    // the screen and probes it, and that is the tick's only probe.
     const { precheckSessionTarget: _skip, ...base } = compactRestoreDeps(dir, session, calls);
     const summary = await sweepPendingCompactSwaps({
       ...base,
@@ -2693,10 +2879,10 @@ test('pending swap sweep restores through a prompt suggestion that Backspace put
     });
     assert.deepEqual(summary, { checked: 1, restored: 1, dropped: 0, skipped: 0, repairedSettings: 0 });
     assert.deepEqual(calls, ['/model claude-fable-5-1[1m]']);
-    assert.deepEqual(inputs, [',', '\x7f', ',', '\x7f']);
-    assert.deepEqual(order, [
-      'input:,', 'input:\x7f', 'input:,', 'input:\x7f', 'type:/model claude-fable-5-1[1m]',
-    ]);
+    // One probe per tick: a second one would read the first probe's `,` as its own
+    // "before" and refuse the restore for as long as the record lives.
+    assert.deepEqual(inputs, [',', '\x7f']);
+    assert.deepEqual(order, ['input:,', 'input:\x7f', 'type:/model claude-fable-5-1[1m]']);
     assert.equal(fs.existsSync(swapFile), false);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -2804,8 +2990,13 @@ test('pending swap sweep rejects drafts and modals before typing', async () => {
     for (const screen of ['❯ my unsent draft', 'Switch model?\nEnter to confirm · Esc to cancel']) {
       writeCompactSwapFixture(dir, session.id);
       const calls = [];
-      const deps = compactRestoreDeps(dir, session, calls);
+      // The sweep's only gate on the input box is precheckSessionTarget, so run the
+      // production one rather than the harness no-op.
+      const { precheckSessionTarget: _skip, ...deps } = compactRestoreDeps(dir, session, calls);
       deps.readScreen = async () => screen;
+      deps.host = recordingHost();
+      deps.wait = async () => {};
+      deps.stderr = () => {};
       const summary = await sweepPendingCompactSwaps(deps);
       assert.equal(summary.skipped, 1);
       assert.deepEqual(calls, []);
