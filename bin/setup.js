@@ -609,6 +609,54 @@ function service(args, root) {
   }
 }
 
+// A profile can be behind on dozens of fields; name enough of them to recognize
+// the drift and leave the rest to the fix command.
+function counted(list, one = 'value', many = 'values') {
+  return `${list.length} ${list.length === 1 ? one : many}: ${list.slice(0, 6).join(', ')}${list.length > 6 ? ', …' : ''}`;
+}
+
+// One line per managed nondefault account. The default profile of each agent is
+// the source, not a target, so it has nothing to be behind.
+function accountSetupReport() {
+  const lines = [];
+  let accounts;
+  try { accounts = require('./accounts'); } catch { return lines; }
+  let records = [], defaults = {};
+  try {
+    records = accounts.list();
+    for (const agent of new Set(records.map((account) => account.agent))) defaults[agent] = accounts.defaultFor(agent)?.id;
+  } catch { return lines; }
+  for (const account of records) {
+    if (account.id === defaults[account.agent]) continue;
+    const agent = account.agent === 'codex' ? 'Codex' : 'Claude';
+    const share = (source) => `keep accounts setup ${account.id} --share-from ${source || defaults[account.agent] || '<source-id>'}`;
+    try {
+      if (account.agent === 'codex') {
+        const state = require('./codex-setup').previewRefresh(account);
+        if (!state.managed) lines.push({ status: 'optional', text: `${agent} account ${account.id} is not sharing setup`, fix: share() });
+        else if (state.conflicts.length) {
+          lines.push({ status: 'FAIL', text: `${agent} account ${account.id} shared setup conflicts (${counted(state.conflicts)})`,
+            fix: `resolve those values in ${path.join(account.configDir, 'config.toml')}, then ${share(state.sourceAccountId)}` });
+        } else {
+          const behind = [...state.configChanges, ...state.missingAssets];
+          if (behind.length) lines.push({ status: 'FAIL', text: `${agent} account ${account.id} shared setup behind (${counted(behind)})`, fix: share(state.sourceAccountId) });
+          else lines.push({ status: 'ok', text: `${agent} account ${account.id} shared setup in sync` });
+        }
+      } else {
+        const state = require('./account-setup').previewRefresh(account);
+        if (!state.managed) lines.push({ status: 'optional', text: `${agent} account ${account.id} is not sharing setup`, fix: share() });
+        else if (state.entries.length) {
+          lines.push({ status: 'FAIL', fix: share(state.sourceAccountId),
+            text: `${agent} account ${account.id} shared setup behind (${counted(state.entries, 'entry', 'entries')})` });
+        } else lines.push({ status: 'ok', text: `${agent} account ${account.id} shared setup in sync` });
+      }
+    } catch (error) {
+      lines.push({ status: 'FAIL', text: `${agent} account ${account.id} shared setup unreadable (${error.message})`, fix: share() });
+    }
+  }
+  return lines;
+}
+
 function doctor(root) {
   let failed = false;
   const check = (name, fn, required = true) => {
@@ -649,6 +697,14 @@ function doctor(root) {
       .every((plan) => plan.action === 'ok'), required);
     if (!ok) console.log(`  fix: keep setup skills${required ? '' : ` --pack ${name}`}`);
   }
+  // Shared account setup drifts silently: a secondary profile that stopped
+  // tracking its source keeps launching, just without the capabilities and
+  // preferences it was set up to inherit. Read-only; doctor never repairs.
+  for (const entry of accountSetupReport()) {
+    console.log(`${entry.status}: ${entry.text}`);
+    if (entry.fix) console.log(`  fix: ${entry.fix}`);
+    if (entry.status === 'FAIL') failed = true;
+  }
   // Optional features are switches, not health: report what this machine has
   // chosen rather than passing or failing it.
   console.log(`features: ${features.list().map((feature) => `${feature.name} ${feature.enabled ? 'on' : 'off'}`).join(', ')}`);
@@ -657,7 +713,7 @@ function doctor(root) {
 }
 
 module.exports = {
-  init, installHooks, installSkills, service, doctor, mergeHooks, servicePlist, quote, canonicalPath, insideSource,
+  init, installHooks, installSkills, service, doctor, accountSetupReport, mergeHooks, servicePlist, quote, canonicalPath, insideSource,
   HOOK_ACTIONS, missingHooks, hookTargets, hookTarget,
   loadPacks, configuredPacks, installPackNames, skillPlans, applySkillPlans, reportSkillPlans, listPacks,
   recordPacks, recordPreflight,

@@ -415,6 +415,18 @@ function readSetup(account) {
   return manifest;
 }
 
+// Read-only counterpart of verifyManaged: which shared entries are no longer the
+// link the manifest recorded, so `keep doctor` can report drift without repairing
+// it. A Codex account has its own manifest and its own preview.
+function previewRefresh(account) {
+  const manifest = account?.agent === 'claude' && account.configDir ? readSetup(account) : null;
+  if (!manifest) return { managed: false, entries: [] };
+  const source = canonical(manifest.sourceConfigDir), target = canonical(account.configDir);
+  const entries = (manifest.sharedEntries || [])
+    .filter((name) => !expectedLink(path.join(source, name), path.join(target, name)));
+  return { managed: true, sourceAccountId: manifest.sourceAccountId, entries };
+}
+
 function ensureSharedMemory(account, cwd) {
   const manifest = readSetup(account);
   if (!account || account.agent !== 'claude' || !account.configDir) throw new Error('shared memory requires a Claude account');
@@ -515,5 +527,5 @@ function compatible(sourceAccount, targetAccount, cwd) {
     memoryDir: target.memoryDir, autoMemoryDirectory: target.autoMemoryDirectory };
 }
 
-module.exports = { MANIFEST, shareSetup, readSetup, ensureSharedMemory, compatible, effectiveMcpServers,
+module.exports = { MANIFEST, shareSetup, readSetup, previewRefresh, ensureSharedMemory, compatible, effectiveMcpServers,
   projectKey, repositoryRoot, stateFile, trustProject, mcpConfigPath };

@@ -279,6 +279,11 @@ nothing. `keep doctor` checks one line per pack, requiring every skill in both h
 `core` and the recorded packs are required with `keep setup skills` as the fix, and the
 rest print as `optional` with `keep setup skills --pack <name>`.
 
+It then prints one line per nondefault account, reporting whether that profile’s
+shared setup is in sync with its source, behind it, conflicted, or not shared at all,
+with the `keep accounts setup <id> --share-from <source>` that repairs it; the check is
+read-only.
+
 Claude subagent lifecycle tracking uses `keep hook lifecycle` for both
 `SubagentStart` and `SubagentStop` in Claude's user settings. These observation-only
 hooks write bounded, content-free records under `.keep/lifecycle/<session-id>`;

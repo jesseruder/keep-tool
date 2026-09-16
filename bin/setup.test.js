@@ -720,6 +720,73 @@ test('keep doctor reports required and optional skill packs', () => {
   } finally { process.exitCode = exitCode; f.cleanup(); }
 });
 
+test('keep doctor reports shared account setup drift for every nondefault account', () => {
+  const f = hooksFixture();
+  const exitCode = process.exitCode;
+  const accounts = require('./accounts');
+  const codexSetup = require('./codex-setup');
+  const accountSetup = require('./account-setup');
+  const run = () => capture(() => setup.doctor(path.join(f.base, 'registry')));
+  try {
+    const codexSource = accounts.get('codex/default'), codexTarget = accounts.get('codex-alt');
+    fs.mkdirSync(codexSource.configDir, { recursive: true });
+    fs.writeFileSync(path.join(codexSource.configDir, 'config.toml'), 'model = "source-model"\n\n[features]\nhooks = true\n');
+    codexSetup.shareSetup(codexSource, codexTarget);
+    const claudeSource = accounts.get('claude/default'), claudeTarget = accounts.get('automation');
+    fs.mkdirSync(claudeSource.configDir, { recursive: true });
+    fs.writeFileSync(path.join(claudeSource.configDir, 'CLAUDE.md'), 'shared instructions\n');
+    fs.rmSync(claudeTarget.configDir, { recursive: true, force: true });
+    accountSetup.shareSetup(claudeSource, claudeTarget);
+
+    const synced = run();
+    assert.match(synced, /^ok: Codex account codex-alt shared setup in sync$/m);
+    assert.match(synced, /^ok: Claude account automation shared setup in sync$/m);
+    assert.equal(/account claude\/default/.test(synced), false, 'a default account is the source, not a target');
+
+    // A source change nobody has refreshed, and a shared entry replaced in the target.
+    fs.writeFileSync(path.join(codexSource.configDir, 'config.toml'), 'model = "source-model"\n\n[features]\nhooks = false\n');
+    fs.unlinkSync(path.join(claudeTarget.configDir, 'CLAUDE.md'));
+    const behind = run();
+    assert.match(behind, /^FAIL: Codex account codex-alt shared setup behind \(1 value: features\.hooks\)$/m);
+    assert.match(behind, /^ {2}fix: keep accounts setup codex-alt --share-from codex\/default$/m);
+    assert.match(behind, /^FAIL: Claude account automation shared setup behind \(1 entry: CLAUDE\.md\)$/m);
+    assert.match(behind, /^ {2}fix: keep accounts setup automation --share-from claude\/default$/m);
+    assert.equal(fs.existsSync(path.join(claudeTarget.configDir, 'CLAUDE.md')), false, 'doctor repairs nothing');
+
+    fs.rmSync(path.join(codexTarget.configDir, codexSetup.MANIFEST));
+    fs.rmSync(path.join(claudeTarget.configDir, accountSetup.MANIFEST));
+    const unshared = run();
+    assert.match(unshared, /^optional: Codex account codex-alt is not sharing setup$/m);
+    assert.match(unshared, /^ {2}fix: keep accounts setup codex-alt --share-from codex\/default$/m);
+    assert.match(unshared, /^optional: Claude account automation is not sharing setup$/m);
+  } finally { process.exitCode = exitCode; f.cleanup(); }
+});
+
+test('keep doctor reports a conflicted or unreadable account without stopping', () => {
+  const f = hooksFixture();
+  const exitCode = process.exitCode;
+  const accounts = require('./accounts');
+  const codexSetup = require('./codex-setup');
+  try {
+    const source = accounts.get('codex/default'), target = accounts.get('codex-alt');
+    fs.mkdirSync(source.configDir, { recursive: true });
+    const sourceConfig = path.join(source.configDir, 'config.toml');
+    fs.writeFileSync(sourceConfig, 'model = "source-model"\n\n[features]\nhooks = true\n');
+    codexSetup.shareSetup(source, target);
+    fs.writeFileSync(sourceConfig, 'model = "source-model"\n\n[features]\nhooks = false\n');
+    fs.writeFileSync(path.join(target.configDir, 'config.toml'), 'model = "source-model"\n\n[features]\nhooks = "maybe"\n');
+    const conflicted = capture(() => setup.doctor(path.join(f.base, 'registry')));
+    assert.match(conflicted, /^FAIL: Codex account codex-alt shared setup conflicts \(1 value: features\.hooks\)$/m);
+    assert.match(conflicted, new RegExp(`^ {2}fix: resolve those values in .*config\\.toml, then keep accounts setup codex-alt --share-from codex/default$`, 'm'));
+
+    fs.writeFileSync(path.join(target.configDir, codexSetup.MANIFEST), '{ not json');
+    const unreadable = capture(() => setup.doctor(path.join(f.base, 'registry')));
+    assert.match(unreadable, /^FAIL: Codex account codex-alt shared setup unreadable \(invalid JSON in .*\)$/m);
+    assert.match(unreadable, /^optional: Claude account automation is not sharing setup$/m,
+      'one unreadable account does not stop the rest');
+  } finally { process.exitCode = exitCode; f.cleanup(); }
+});
+
 test('keep setup names its subcommands and refuses an unknown one', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-setup-usage-'));
   try {
