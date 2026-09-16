@@ -2260,15 +2260,31 @@ test('the worktree exit prompt is answered only when Keep worktree is the highli
   assert.equal(worktreeExitPromptKeepsWorktree(modal(2)), false, 'Remove worktree discards the work');
   assert.equal(worktreeExitPromptKeepsWorktree(modal(1, { heading: false })), false);
   assert.equal(worktreeExitPromptKeepsWorktree('Keep worktree is what wt land assumes\n❯ '), false);
-  // Another menu that happens to sit under the heading is not this question.
+  // Another menu sharing the modal's neighbourhood is not this question.
   assert.equal(worktreeExitPromptKeepsWorktree([
     '  Exiting worktree session',
     '❯ 1. Keep worktree',
+    '  2. Remove worktree  All changes and commits will be lost.',
     '  Enter to confirm · Esc to cancel',
     'Switch model?',
     '❯ 1. Yes, switch to Sonnet 5',
   ].join('\n')), false);
   assert.equal(worktreeExitPromptKeepsWorktree(''), false);
+
+  // Retained transcript above the modal is not part of it: old option lists, and even an
+  // old copy of this same question, must neither hide a live modal nor stand in for one.
+  const transcript = [
+    '❯ 1. something a user typed',
+    '❯ 2. other',
+    'Exiting worktree session',
+    '❯ 1. Keep worktree    Stays at /Users/jesseruder/wt/ghost-server/aws-cost-breakdown',
+    'Enter to confirm · Esc to cancel',
+    ...Array(8).fill('  tool output'),
+  ];
+  assert.equal(worktreeExitPromptKeepsWorktree([...transcript, modal(1)].join('\n')), true);
+  // The same scrollback on its own: heading, footer and a Keep worktree line all present,
+  // but no modal open — answering here would type Enter into a live prompt.
+  assert.equal(worktreeExitPromptKeepsWorktree(transcript.join('\n')), false);
 });
 
 test('lines after last echo excludes results belonging to earlier identical commands', () => {

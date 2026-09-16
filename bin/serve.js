@@ -2204,19 +2204,35 @@ function modelSwitchConfirmed(screen, command) {
 // A session that entered a git worktree with Claude Code's EnterWorktree tool does not
 // leave on a typed /exit: the exit is intercepted by a modal asking whether to keep or
 // remove the worktree, and the pane parks there until someone answers. Restart's wait
-// answers it, but only for the option that destroys nothing — so every part of the
-// screen has to agree: the "Exiting worktree session" heading above, the highlighted
-// "1. Keep worktree" itself, and the "Enter to confirm" footer below. A second
-// highlighted option means this is some other menu, and a highlighted "2. Remove
-// worktree" would throw away the very work the restart is trying to preserve.
+// answers it, but only for the option that destroys nothing — so the whole modal has to
+// be there, as one block: the "Exiting worktree session" heading just above, the
+// highlighted "1. Keep worktree", an unhighlighted "2. Remove worktree" as the very next
+// option, and the "Enter to confirm" footer under it.
+//
+// Matching a block rather than the viewport is what keeps the retained transcript out of
+// this. Scrollback above the modal routinely holds old option lists and old copies of
+// this same question, and a viewport-wide reading would both miss a real modal sitting
+// under them and accept a heading and footer that belong to different screens — which,
+// with no modal actually open, types a bare Enter into a live prompt.
 function worktreeExitPromptKeepsWorktree(screenText) {
   const lines = String(screenText || '').split(/\r?\n/).map(normalizedText);
-  const options = lines.reduce((found, line, index) => (/^❯\s*\d+\./.test(line) ? found.concat(index) : found), []);
-  if (options.length !== 1) return false;
-  const index = options[0];
-  if (!/^❯\s*1\.\s*Keep worktree\b/.test(lines[index])) return false;
-  if (!lines.slice(0, index).some((line) => /Exiting worktree session/i.test(line))) return false;
-  return lines.slice(index + 1).some((line) => /Enter to confirm/i.test(line));
+  const WINDOW = 6;
+  const qualifies = (index) => {
+    const top = Math.max(0, index - WINDOW);
+    const bottom = Math.min(lines.length - 1, index + WINDOW);
+    // Any other highlighted option nearby means this is a different, larger menu.
+    for (let i = top; i <= bottom; i += 1) {
+      if (i !== index && /^❯\s*\d+\./.test(lines[i])) return false;
+    }
+    if (!lines.slice(top, index).some((line) => /Exiting worktree session/i.test(line))) return false;
+    let next = index + 1;
+    while (next <= bottom && !lines[next]) next += 1;
+    if (next > bottom || !/^2\.\s*Remove worktree\b/.test(lines[next])) return false;
+    return lines.slice(next + 1, bottom + 1).some((line) => /Enter to confirm/i.test(line));
+  };
+  const candidates = lines.reduce((found, line, index) =>
+    (/^❯\s*1\.\s*Keep worktree\b/.test(line) && qualifies(index) ? found.concat(index) : found), []);
+  return candidates.length === 1;
 }
 
 function modelSwitchDialogVisible(screen, command) {
