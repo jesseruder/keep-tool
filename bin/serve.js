@@ -1296,9 +1296,12 @@ function hostFailureKind(error) {
 // unlinks it on the way out, and it outlives daemon restarts, so its presence is
 // the difference between "the host is not answering" and "no host is running".
 function hostEndpointExists(deps = {}) {
-  if (typeof deps.hostEndpointExists === 'function') return Boolean(deps.hostEndpointExists());
-  try { return fs.existsSync(deps.hostSock || require('./hostclient.js').socketPath()); }
-  catch { return false; }
+  // Never throws: this runs inside the dashboard refresh, and a failed lookup only
+  // means the endpoint is not evidence of anything.
+  try {
+    if (typeof deps.hostEndpointExists === 'function') return Boolean(deps.hostEndpointExists());
+    return fs.existsSync(deps.hostSock || require('./hostclient.js').socketPath());
+  } catch { return false; }
 }
 
 async function listHostPaneResult(deps = {}, fresh = false) {

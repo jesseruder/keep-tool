@@ -1189,6 +1189,8 @@ test('listHostPaneResult tells a slow host apart from an absent one', async () =
   const silent = { request: () => new Promise(() => {}) };
   assert.deepEqual(await listHostPaneResult({ host: silent, hostRequestTimeoutMs: 20 }, true),
     { panes: null, failure: 'timeout', endpoint: true }, 'a host that holds the socket open but does not answer is slow, not gone');
+  assert.deepEqual(await listHostPaneResult({ host: null, hostEndpointExists: () => { throw new Error('no'); } }, true),
+    { panes: null, failure: 'unreachable', endpoint: false }, 'a failed endpoint check is not evidence, and never fails the refresh');
   const broken = { request: async () => { const error = new Error('socket hang up'); error.code = 'ECONNRESET'; throw error; } };
   assert.deepEqual(await listHostPaneResult({ host: broken }, true), { panes: null, failure: 'unreachable', endpoint: true });
   const good = { request: async () => ({ panes: [{ id: 'p1', meta: {} }] }) };
