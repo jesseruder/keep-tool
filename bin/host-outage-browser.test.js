@@ -118,8 +118,8 @@ test('isolated browser: an unresponsive terminal host is reported as unresponsiv
       state.panes = [];
       state.sessions = [{ ...sessions[0], pane: null }];
       state.hostStatus = { ok: false, reason: 'timeout', since: now - 90e3, stale: false, panesAt: null };
-      await push("document.querySelector('#stage .host-outage')");
-      const outageText = await evaluate("document.querySelector('#stage .host-outage').textContent");
+      await push("document.querySelector('#stage .legacy .host-outage')");
+      const outageText = await evaluate("document.querySelector('#stage .legacy .host-outage').textContent");
       assert.match(outageText, /terminal host not answering/);
       assert.match(outageText, /pane is unknown/);
       assert.equal(await evaluate("document.querySelector('#stage').textContent.includes('no host pane')"), false,
@@ -129,13 +129,21 @@ test('isolated browser: an unresponsive terminal host is reported as unresponsiv
       assert.equal(await evaluate("document.querySelector('#health').classList.contains('warning')"), true);
       assert.match(await evaluate("document.querySelector('#health .pop').textContent"), /terminal host.*not answering/);
 
-      // A reused list is published with the panes it was collected with, and says so.
-      state.hostStatus = { ok: false, reason: 'timeout', since: now - 90e3, stale: true, panesAt: now - 80e3 };
-      await push("document.querySelector('#stage .host-outage').textContent.includes('last listed')");
-
-      // The host answers again: the console goes back to reporting the pane itself.
+      // A reused list carries its panes, so the pane is mounted as usual - but it is
+      // a pane nobody has confirmed for a minute, and the stage says so rather than
+      // presenting it as a list the host just answered.
       state.panes = panes;
       state.sessions = sessions;
+      state.hostStatus = { ok: false, reason: 'timeout', since: now - 90e3, stale: true, panesAt: now - 80e3 };
+      await push("document.querySelector('#stage .shead .host-outage')?.textContent.includes('last listed')");
+      const staleText = await evaluate("document.querySelector('#stage .shead .host-outage').textContent");
+      assert.match(staleText, /terminal host not answering/);
+      assert.match(staleText, /panes last listed/);
+      assert.equal(await evaluate("document.querySelector('#stage .stage-terminal .legacy') === null"), true,
+        'the reused pane is still mounted, labelled rather than replaced by an unknown-pane notice');
+      assert.equal(await evaluate("document.querySelector('#health').classList.contains('warning')"), true);
+
+      // The host answers again: the console goes back to reporting the pane itself.
       state.hostStatus = { ok: true };
       await push("!document.querySelector('#stage .host-outage')");
       assert.equal(await evaluate("document.querySelector('#health').classList.contains('warning')"), false);

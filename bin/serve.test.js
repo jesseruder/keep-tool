@@ -1159,13 +1159,18 @@ test('a host that never answers the socket is published as unreachable', () => {
   assert.equal(after.panes, null, 'a host that never answered may really have no panes');
   assert.deepEqual(after.host, { ok: false, reason: 'unreachable', since: start + 30e3, stale: false, panesAt: null });
 
-  // `keep host` is launched on demand, so a daemon that has never reached one is
-  // not in an outage: it has no panes, and saying so is the truth.
+  // `keep host` is launched on demand, so a daemon that has never reached one and
+  // finds nothing bound to its socket is not in an outage: it has no panes.
   const hostless = { panes: null, at: 0, epoch: 0 };
   assert.deepEqual(hostPanesForPublish(down, hostless, start).host, { ok: true });
   assert.deepEqual(hostPanesForPublish(down, hostless, start + 10 * 60e3).host, { ok: true });
   assert.equal(hostPanesForPublish({ panes: null, failure: 'timeout' }, hostless, start).host.ok, false,
     'a host that holds the socket open exists, listed or not');
+  // The host outlives daemon restarts, so a restarted daemon that cannot reach the
+  // bound socket is in an outage even before its first successful list.
+  const restarted = { panes: null, at: 0, epoch: 0 };
+  assert.equal(hostPanesForPublish({ ...down, endpoint: true }, restarted, start).host.ok, false,
+    'a socket nothing answers is an unreachable host, not an absent one');
 
   // Every urgent mutation clears the remembered list; that must not make the next
   // unreachable lookup look like a daemon that never had a host.
@@ -1177,12 +1182,15 @@ test('a host that never answers the socket is published as unreachable', () => {
 
 test('listHostPaneResult tells a slow host apart from an absent one', async () => {
   const { listHostPaneResult } = require('./serve');
-  assert.deepEqual(await listHostPaneResult({ host: null }, true), { panes: null, failure: 'unreachable' });
+  assert.deepEqual(await listHostPaneResult({ host: null, hostEndpointExists: () => false }, true),
+    { panes: null, failure: 'unreachable', endpoint: false });
+  assert.deepEqual(await listHostPaneResult({ host: null, hostEndpointExists: () => true }, true),
+    { panes: null, failure: 'unreachable', endpoint: true }, 'a bound socket nobody answers is a host that should be there');
   const silent = { request: () => new Promise(() => {}) };
   assert.deepEqual(await listHostPaneResult({ host: silent, hostRequestTimeoutMs: 20 }, true),
-    { panes: null, failure: 'timeout' }, 'a host that holds the socket open but does not answer is slow, not gone');
+    { panes: null, failure: 'timeout', endpoint: true }, 'a host that holds the socket open but does not answer is slow, not gone');
   const broken = { request: async () => { const error = new Error('socket hang up'); error.code = 'ECONNRESET'; throw error; } };
-  assert.deepEqual(await listHostPaneResult({ host: broken }, true), { panes: null, failure: 'unreachable' });
+  assert.deepEqual(await listHostPaneResult({ host: broken }, true), { panes: null, failure: 'unreachable', endpoint: true });
   const good = { request: async () => ({ panes: [{ id: 'p1', meta: {} }] }) };
   assert.deepEqual(await listHostPaneResult({ host: good }, true), { panes: [{ id: 'p1', meta: {} }], failure: null });
 });

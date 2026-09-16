@@ -1292,9 +1292,18 @@ function hostFailureKind(error) {
   return /timed out/i.test(String(error && error.message || error)) ? 'timeout' : 'unreachable';
 }
 
+// Whether a host is supposed to be there at all. `keep host` binds this socket and
+// unlinks it on the way out, and it outlives daemon restarts, so its presence is
+// the difference between "the host is not answering" and "no host is running".
+function hostEndpointExists(deps = {}) {
+  if (typeof deps.hostEndpointExists === 'function') return Boolean(deps.hostEndpointExists());
+  try { return fs.existsSync(deps.hostSock || require('./hostclient.js').socketPath()); }
+  catch { return false; }
+}
+
 async function listHostPaneResult(deps = {}, fresh = false) {
   const client = await hostClient(deps);
-  if (!client) return { panes: null, failure: 'unreachable' };
+  if (!client) return { panes: null, failure: 'unreachable', endpoint: hostEndpointExists(deps) };
   const now = deps.now || Date.now;
   const cached = hostPaneCaches.get(client);
   if (!fresh && cached && now() - cached.at < HOST_PANE_CACHE_MS) return { panes: cached.panes, failure: null };
@@ -1308,7 +1317,8 @@ async function listHostPaneResult(deps = {}, fresh = false) {
     return { panes, failure: null };
   } catch (error) {
     invalidateHost(client, deps);
-    return { panes: null, failure: hostFailureKind(error) };
+    // A client existed, so a host answered this daemon at least this far.
+    return { panes: null, failure: hostFailureKind(error), endpoint: true };
   }
 }
 
@@ -1359,10 +1369,14 @@ function hostPanesForPublish(result, memo, now, epoch = memo.epoch || 0) {
     return { panes, host: { ok: true } };
   }
   const reason = (result && result.failure) || 'unreachable';
-  // No host has ever answered this daemon: `keep host` simply is not running, so
-  // there are no panes and nothing is being hidden. Publishing that as an outage
-  // would put a permanent warning on a console that is telling the truth.
-  if (reason === 'unreachable' && !memo.listed) return { panes, host: { ok: true } };
+  // Nothing is bound to the host socket and this daemon has never listed a pane:
+  // `keep host` is launched on demand and is simply not running, so there are no
+  // panes and nothing is being hidden. Publishing that as an outage would put a
+  // permanent warning on a console that is telling the truth. The socket is the
+  // evidence, not the memo alone, because the host outlives daemon restarts.
+  if (reason === 'unreachable' && !memo.listed && !(result && result.endpoint)) {
+    return { panes, host: { ok: true } };
+  }
   if (current && !memo.failingSince) memo.failingSince = now;
   const reuseMs = reason === 'timeout' ? HOST_PANES_SLOW_REUSE_MS : HOST_PANES_REUSE_MS;
   const reused = current && memo.panes && now - memo.at < reuseMs ? memo.panes : null;

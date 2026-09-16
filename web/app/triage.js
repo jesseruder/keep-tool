@@ -379,13 +379,20 @@ function renderStage(ctx, active, focusItem, running, pinned) {
   const dependencyWait = session?.activity?.background?.dependencies?.length
     ? `<button class="btn" data-wait-dependency ${dependencyAcknowledged ? 'disabled' : ''}>${dependencyAcknowledged ? 'Waiting for dependency' : 'Wait for dependency'}</button>` : '';
   const pendingHandoff = hasPendingHandoff(ctx, item.sessionId, item.pane);
-  // While the host is silent its panes are unknown, not gone: reopening would
-  // race a session that is still running, and a spawn would fail the same way.
-  const outage = hasLivePane ? null : hostOutage(ctx.data);
+  // A silent host says nothing about its panes, whether this one is missing from
+  // the list or was carried over from an older one. Both are labelled: a reused
+  // pane is shown but named as unconfirmed, and a missing pane is unknown rather
+  // than gone, so Reopen - which would race a session that is still running -
+  // waits for the host to speak again.
+  const outage = hostOutage(ctx.data);
+  const paneUnknown = Boolean(outage) && !hasLivePane;
+  const outageNote = !outage ? ''
+    : `<span class="host-outage">${ctx.esc(hostOutageText(outage))}${outage.stale && outage.panesAt
+      ? ` · panes last listed ${ctx.esc(ctx.rel(outage.panesAt))}` : ''}</span>`;
   const reopen = hasLivePane || pendingHandoff ? ''
-    : `<button class="btn" data-reopen ${outage ? 'disabled title="The terminal host is not answering; its panes cannot be listed."' : ''}>Reopen</button>`;
+    : `<button class="btn" data-reopen ${paneUnknown ? 'disabled title="The terminal host is not answering; its panes cannot be listed."' : ''}>Reopen</button>`;
   const heading = stage.querySelector('.shead .session-heading');
-  ctx.patchHTML(heading, `<h2>${ctx.esc(title)}</h2><div class="meta mono">${ctx.projectHTML(item.project || session?.project || '', true)}${item.taskId ? `<span>${ctx.esc(item.taskId)}</span>${ctx.tagsHTML(task)}` : ''}${accountLabelHTML(ctx, session, pane)}</div>${task ? modelUsageHTML(task.modelUsage) : ''}`);
+  ctx.patchHTML(heading, `<h2>${ctx.esc(title)}</h2><div class="meta mono">${ctx.projectHTML(item.project || session?.project || '', true)}${item.taskId ? `<span>${ctx.esc(item.taskId)}</span>${ctx.tagsHTML(task)}` : ''}${accountLabelHTML(ctx, session, pane)}${outageNote}</div>${task ? modelUsageHTML(task.modelUsage) : ''}`);
   const brief = stage.querySelector('.brief');
   const portable = item.sessionId && !session?.reviewer ? portableTransferControls(ctx, item.sessionId) : '';
   const handoff = (closable || pendingHandoff) && !session?.reviewer ? handoffControls(ctx, item.sessionId, item.pane) : '';
@@ -425,14 +432,14 @@ function renderStage(ctx, active, focusItem, running, pinned) {
       : session?.lastAssistant || item.detail || 'No transcript tail available.';
     // A pane absent from a list the host never answered is unknown, not gone, and
     // that is worth saying even while the transcript tail is still loading.
-    const paneStatus = outage
+    const paneStatus = paneUnknown
       ? `<p class="host-outage" role="status">${ctx.esc(hostOutageText(outage))} — its pane list is unavailable, so this session's pane is unknown${outage.stale && outage.panesAt ? `; panes shown were last listed ${ctx.esc(ctx.rel(outage.panesAt))}` : ''}.</p>`
       : '';
     const detailStatus = sessionDetail.status === 'loading'
       ? '<p class="muted" role="status">Loading recent conversation…</p>'
       : sessionDetail.status === 'error'
         ? `<p role="alert">Could not load recent conversation: ${ctx.esc(sessionDetail.error)} <button class="btn" data-retry-session-detail>Retry</button></p>`
-        : outage ? '' : '<p class="muted">no host pane</p>';
+        : paneUnknown ? '' : '<p class="muted">no host pane</p>';
     let legacy = terminalHost.querySelector('.legacy');
     if (!legacy) {
       terminalHost.innerHTML = '<div class="legacy"></div>';
