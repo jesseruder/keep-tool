@@ -476,6 +476,14 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     assert.equal(await evaluate("document.querySelectorAll('#qlist .qitem[data-key$=\"shell3\"], #qlist .qitem[data-key$=\"shell3-agent\"]').length"), 1, 'the pane stand-in does not linger beside the session row');
     assert.equal(await evaluate("document.querySelector('#qlist .qitem.sel')?.dataset.key"), 'running:shell3-agent', 'the selection follows the pane to its session row');
     assert.equal(await evaluate("document.querySelector('#stage').dataset.pane"), 'shell3', 'the same terminal stays on the stage');
+    // Collapsing the group rebuilds the retained row: the spent stand-in must not
+    // take the selection back from the session it handed over to.
+    await evaluate("[...document.querySelectorAll('#qlist .qtoggle')].find(el => el.textContent.includes('Running & waiting')).click()");
+    await wait("!document.querySelector('#qlist [data-key=\"running:shell3-agent\"]')");
+    assert.equal(await evaluate("document.querySelector('#qlist .qitem.sel')?.dataset.key"), 'recent:shell3-agent', 'the collapsed group retains the session, not the pane stand-in');
+    assert.equal(await evaluate("document.querySelector('#stage').dataset.pane"), 'shell3', 'the retained session keeps its own terminal');
+    await evaluate("[...document.querySelectorAll('#qlist .qtoggle')].find(el => el.textContent.includes('Running & waiting')).click()");
+    await wait("document.querySelector('#qlist [data-key=\"running:shell3-agent\"]')");
     sessions.splice(sessions.findIndex((session) => session.id === 'shell3-agent'), 1);
     panes.find((pane) => pane.id === 'shell3').meta = { agent: 'shell', title: 'New shell', project: '/tmp/history-fixture' };
     for (const client of eventClients) client.write('data: changed\n\n');

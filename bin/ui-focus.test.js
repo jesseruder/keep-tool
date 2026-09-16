@@ -123,18 +123,19 @@ test('running panel orders newest-created first regardless of activity and refre
   assert.deepEqual(order(), tied, 'missing creation logs have deterministic ties across reloads');
 });
 
-test('a retained pane stand-in gives way to the row that carries the pane now', () => {
+test('a rebuilt row that hands over to a listed key is not appended beside it', () => {
   const paneKey = (item) => item.sessionId || item.pane;
   const paneSection = (item) => `${item.kind}:${paneKey(item)}`;
   const standIn = { kind: 'running', pane: 'shell3' };
   const agentRow = { kind: 'running', sessionId: 'agent', pane: 'shell3' };
   const other = { kind: 'running', sessionId: 'other', pane: 'other' };
-  assert.equal(selection.supersededStandIn([other, agentRow], standIn), true, 'the recorded session re-keys the same terminal');
-  assert.equal(selection.supersededStandIn([other, { kind: 'pinned', pane: 'shell3' }], standIn), true, 'pinning the shell hands its row over too');
-  assert.equal(selection.supersededStandIn([other], standIn), false, 'a pane listed nowhere else still needs the stand-in');
-  assert.equal(selection.supersededStandIn([agentRow], { kind: 'recent', sessionId: 'agent', pane: 'shell3' }), false, 'a session-keyed retained row is not a stand-in');
+  const handover = { kind: 'recent', sessionId: 'agent', pane: 'shell3' };
+  assert.equal(selection.retainSelection([other, agentRow], standIn, paneSection(standIn), paneKey, paneSection, () => handover).length, 0,
+    'the stand-in hands over to the session row already listed');
+  assert.equal(selection.retainSelection([other], standIn, paneSection(standIn), paneKey, paneSection, () => handover)[0], handover,
+    'a handover to a key listed nowhere else is still retained');
   assert.equal(selection.selectionIndex([other, agentRow], paneSection(standIn), standIn, 0, paneKey, paneSection), 1,
-    'dropping the stand-in leaves the selection on the pane its new key belongs to');
+    'dropping the rebuilt row leaves the selection on the pane its new key belongs to');
 });
 
 test('alive unpinned shells without a session list under running until they are pinned', () => {

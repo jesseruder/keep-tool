@@ -13,7 +13,7 @@ import { captureFocusIntent } from './focus-intent.js';
 import { mountTerminal } from './terminal.js';
 import { setTerminalRendererPreference } from './terminal-renderer.js';
 import { installFocusDebug } from './focus-debug.js';
-import { retainSelection, stableSessionOrder, supersededStandIn } from './selection.js';
+import { retainSelection, stableSessionOrder } from './selection.js';
 import { createSessionHistory, installSessionHistory } from './session-history.js';
 import { installTriageControls, renderTriage } from './triage.js';
 import { renderWatch, installWatchControls } from './watch.js';
@@ -317,7 +317,13 @@ function retainedSelectionItem(item) {
     const pane = paneMap().get(item.pane);
     if (!pane?.alive || !matchesTriageFilter(state.paneTarget)) { state.paneTarget = null; return null; }
     const entity = entityForPane(item.pane);
-    return { ...state.paneTarget, project: entity.project, title: entity.title, state: entity.state };
+    if (!entity.session) return { ...state.paneTarget, project: entity.project, title: entity.title, state: entity.state };
+    // The pane's session is recorded: the stand-in has done its job. Hand over to
+    // the session so its own row, or the session-backed retained row when that row
+    // is collapsed or dismissed, carries the selection with its summary and actions.
+    // The target itself is only spent once the selection is the session's own.
+    if (item.sessionId === entity.session.id) state.paneTarget = null;
+    item = sessionItem('running', entity.session, item.pane);
   }
   const session = sessionFor(item);
   if (state.historyTarget?.sessionId && state.historyTarget.sessionId === item?.sessionId && matchesTriageFilter(item)) return session
@@ -331,9 +337,8 @@ function triageItems() {
     ...(state.showPinned !== false ? pinnedItems().filter(triageVisible) : []),
     ...(state.showRecent ? recentItems().filter(triageVisible) : []),
   ];
-  const retained = retainSelection(items, state.currentItem, state.selectedKey, itemKey, triageKey, retainedSelectionItem)
-    .filter((item) => !supersededStandIn(items, item));
-  return [...items, ...retained];
+  return [...items, ...retainSelection(items, state.currentItem, state.selectedKey, itemKey, triageKey,
+    retainedSelectionItem)];
 }
 function knownProjects() {
   const values = new Map();

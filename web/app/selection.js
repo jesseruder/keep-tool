@@ -3,14 +3,11 @@
 export function retainSelection(items, current, selectedKey, keyOf, sectionKey, rebuild) {
   if (!current || selectedKey !== sectionKey(current)
       || items.some((item) => keyOf(item) === keyOf(current))) return [];
+  // A rebuilt row may be keyed differently than the one that went missing: a pane
+  // stand-in hands over to the session the pane has since recorded. Never append it
+  // beside a row already listed under that key.
   const fresh = rebuild(current);
-  return fresh ? [fresh] : [];
-}
-// retainSelection dedupes by item key, but openReviewPane's stand-in is keyed by
-// its pane and the pane's own row is keyed by the session it has since recorded.
-// Once that row is listed, the stand-in is a stale second row for one terminal.
-export function supersededStandIn(items, item) {
-  return !item.sessionId && items.some((row) => row.pane && row.pane === item.pane);
+  return fresh && !items.some((item) => keyOf(item) === keyOf(fresh)) ? [fresh] : [];
 }
 export function selectionIndex(items, selectedKey, current, fallback, keyOf, sectionKey) {
   let index = selectedKey ? items.findIndex((item) => sectionKey(item) === selectedKey) : -1;

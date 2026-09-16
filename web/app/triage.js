@@ -6,7 +6,7 @@ import { accountLabelHTML, handoffControls, installHandoffControls, hasPendingHa
 import { portableTransferControls, installPortableTransferControls } from './portable-transfer.js';
 import { relayControlsHTML, installRelayControls } from './session-relay.js';
 import { sessionLabel, sessionExplanation, backgroundLabel } from './status.js';
-import { retainSelection, selectionIndex, supersededStandIn } from './selection.js';
+import { retainSelection, selectionIndex } from './selection.js';
 import { actionsMenuHTML, installActionsMenu, patchActionsMenu, rendererControlsHTML } from './session-actions.js';
 import { stateLineHTML, installGrading } from './state-line.js';
 
@@ -187,7 +187,7 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
   const shownPinned = ctx.state.showPinned ? pinned : [];
   const active = [...waiting, ...shownRunning, ...shownPinned, ...(ctx.state.showRecent ? recent : [])];
   const retainedSelection = retainSelection(active, ctx.state.currentItem, ctx.state.selectedKey, ctx.itemKey, ctx.triageKey,
-    ctx.retainedSelectionItem).filter((item) => !supersededStandIn(active, item));
+    ctx.retainedSelectionItem);
   active.push(...retainedSelection);
   const collapsed = ctx.state.collapsed.queue;
   const queue = document.querySelector('#triage .queue');
