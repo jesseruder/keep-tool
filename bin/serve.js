@@ -2216,7 +2216,7 @@ function modelSwitchConfirmed(screen, command) {
 // with no modal actually open, types a bare Enter into a live prompt.
 function worktreeExitPromptKeepsWorktree(screenText) {
   const lines = String(screenText || '').split(/\r?\n/).map(normalizedText);
-  const ABOVE = 6, BELOW = 8;
+  const ABOVE = 12, BELOW = 20;
   // The footer row of a well-formed modal block around this candidate, or -1.
   const blockFooter = (index) => {
     const top = Math.max(0, index - ABOVE);
@@ -2240,12 +2240,14 @@ function worktreeExitPromptKeepsWorktree(screenText) {
     return end === -1 ? found : end;
   }, -1);
   if (footer === -1) return false;
-  // The live modal is the bottommost UI on the screen. A retained copy of this same
-  // question sits above whatever is actually open now — a prompt, another menu, another
-  // confirmable dialog — so anything highlighted or confirmable below the footer means
-  // the Enter would land somewhere nobody asked for it. Taking the lowest qualifying
-  // block first keeps an old copy above from hiding the live one.
-  return !lines.slice(footer + 1).some((line) => line.startsWith('❯') || /Enter to confirm|Esc to cancel/i.test(line));
+  // A live modal owns the bottom of the screen: nothing but blank rows sits under its
+  // footer. A retained copy sits above whatever is open now instead, and that can be
+  // anything — a Claude input box, a Codex `›` prompt, a zsh prompt with a half-typed
+  // command, a status line — none of which wants an Enter. Enumerating what may not
+  // appear there would miss one, so nothing may. A live modal that some rendering puts
+  // text under simply goes unanswered, which is the timeout this already had.
+  // Taking the lowest qualifying block first keeps an old copy above from hiding it.
+  return lines.slice(footer + 1).every((line) => !line);
 }
 
 function modelSwitchDialogVisible(screen, command) {
@@ -3557,12 +3559,17 @@ async function restartSession(body, deps = {}) {
     // Answering it costs a round trip the plain exit does not, so the wait grows to ~15s
     // once — and only once — the prompt has been answered; every other screen waits the
     // same ~6s it always has. A screen that cannot be read is simply not the modal.
+    //
+    // Only Claude Code asks this question, and only a Claude session's screen is read at
+    // all: the pane may become a plain shell mid-wait, and a Codex screen is a different
+    // UI with its own prompt, so neither is a place to be typing a blind Enter.
+    const answerable = session.kind === 'claude';
     let promptAnswered = false, screenReadReported = false;
     for (let i = 0, limit = 30; i < limit; i++) {
       stopped = (await host('get', { pane: body.pane })).pane;
       if (!restartPaneMatches(pane, stopped, session.id)) throw Error('Session process changed during restart');
       if (!stopped.alive) break;
-      if (!promptAnswered) {
+      if (answerable && !promptAnswered) {
         let screen = null;
         try { screen = await (deps.readScreenResult || readScreenResult)({ pane: body.pane }, null, false, deps); }
         catch (error) {

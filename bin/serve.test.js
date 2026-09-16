@@ -2279,7 +2279,7 @@ test('the worktree exit prompt is answered only when Keep worktree is the highli
     'Exiting worktree session',
     '❯ 1. Keep worktree    Stays at /Users/jesseruder/wt/ghost-server/aws-cost-breakdown',
     'Enter to confirm · Esc to cancel',
-    ...Array(8).fill('  tool output'),
+    ...Array(14).fill('  tool output'),
   ];
   assert.equal(worktreeExitPromptKeepsWorktree([...transcript, modal(1)].join('\n')), true);
   // The same scrollback on its own: heading, footer and a Keep worktree line all present,
@@ -2295,6 +2295,16 @@ test('the worktree exit prompt is answered only when Keep worktree is the highli
   assert.equal(worktreeExitPromptKeepsWorktree([modal(1), ...gap, modal(1)].join('\n')), true);
   assert.equal(worktreeExitPromptKeepsWorktree([modal(1), ...gap, modal(2)].join('\n')), false);
 
+  // Whatever sits under the footer, the modal is not the live UI — and the thing below
+  // it is a place an Enter would do something nobody asked for.
+  assert.equal(worktreeExitPromptKeepsWorktree(
+    [modal(1), '/Users/jesseruder/wt/ghost-server/aws-cost-breakdown > '].join('\n')), false,
+    'a zsh prompt may hold a half-typed command');
+  assert.equal(worktreeExitPromptKeepsWorktree([modal(1), '› '].join('\n')), false, 'a Codex prompt');
+  assert.equal(worktreeExitPromptKeepsWorktree(
+    [modal(1), '  aws-cost-breakdown  (wt/aws-cost-breakdown)  ctx:33%'].join('\n')), false, 'a status line');
+  assert.equal(worktreeExitPromptKeepsWorktree([modal(1), '', '   ', ''].join('\n')), true, 'blank rows are the screen');
+
   // 80 columns: the "Stays at <path>" suffix wraps onto its own row, which is
   // continuation text and not the next option.
   assert.equal(worktreeExitPromptKeepsWorktree([
@@ -2307,6 +2317,28 @@ test('the worktree exit prompt is answered only when Keep worktree is the highli
     '    2. Remove worktree  All changes and commits will be lost.',
     '',
     '  Enter to confirm · Esc to cancel',
+  ].join('\n')), true);
+
+  // 40 columns: the warning wraps across three rows and the options across seven more.
+  assert.equal(worktreeExitPromptKeepsWorktree([
+    '  Exiting worktree session',
+    '  You have 4 uncommitted files. These',
+    '  will be lost if you remove the',
+    '  worktree.',
+    '',
+    '  ❯ 1. Keep worktree',
+    '      Stays at',
+    '      /Users/jesseruder/wt/',
+    '      ghost-server/',
+    '      aws-cost-breakdown',
+    '      with every uncommitted change',
+    '      still in place',
+    '    2. Remove worktree',
+    '      All changes and commits will be',
+    '      lost.',
+    '',
+    '  Enter to confirm · Esc to cancel',
+    '',
   ].join('\n')), true);
 });
 
@@ -7284,11 +7316,15 @@ test('a graceful exit answers the worktree exit prompt once and only for Keep wo
   const { restartSession } = require('./serve');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-worktree-exit-'));
   const claudeFile = path.join(root, 'claude.jsonl');
+  const codexFile = path.join(root, 'rollout.jsonl');
   const accountConfig = path.join(root, 'config.json');
   fs.writeFileSync(accountConfig, JSON.stringify({ version: 1, accounts: [
     { id: 'claude/default', label: 'Primary', agent: 'claude', configDir: path.join(os.homedir(), '.claude'), useDefaultConfig: true },
-  ], defaultAccounts: { claude: 'claude/default' } }));
+    { id: 'codex/default', label: 'Codex', agent: 'codex', configDir: path.join(os.homedir(), '.codex'), useDefaultConfig: true },
+  ], defaultAccounts: { claude: 'claude/default', codex: 'codex/default' } }));
   fs.writeFileSync(claudeFile, JSON.stringify({ type: 'assistant', sessionId: 'wt', message: { content: [], stop_reason: 'end_turn' } }) + '\n');
+  fs.writeFileSync(codexFile, JSON.stringify({ type: 'session_meta', payload: { id: 'wt', source: 'cli' } }) + '\n'
+    + JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete' } }) + '\n');
   const modal = (highlighted) => [
     '  Exiting worktree session',
     '  You have 4 uncommitted files. These will be lost if you remove the worktree.',
@@ -7300,18 +7336,20 @@ test('a graceful exit answers the worktree exit prompt once and only for Keep wo
   ].join('\n');
   // `deadAfter` is how many turns of the wait the pane survives the typed /exit: the modal
   // holds it open until the Enter lands, and Infinity is the prompt nobody ever answers.
-  const scenario = ({ highlighted, deadAfter }) => {
-    const session = { id: 'wt', kind: 'claude', state: 'idle', endedTurn: true, project: root };
+  const scenario = ({ highlighted, deadAfter, kind = 'claude' }) => {
+    const command = kind === 'codex' ? '/test/codex resume wt' : '/test/claude --resume wt';
+    const session = { id: 'wt', kind, state: 'idle', endedTurn: true, project: root };
     let pane = { id: 'p', pid: 10, cmd: '/bin/zsh', args: ['-l'], alive: true, attached: 0, visibleAttached: 0,
-      cols: 200, rows: 50, meta: { sessionId: 'wt', agent: 'claude' } };
-    const row = { pid: 11, ppid: 10, pidStart: 'Tue Sep  8 10:00:00 2026', agent: 'claude', interactive: true, args: '/test/claude --resume wt' };
+      cols: 200, rows: 50, meta: { sessionId: 'wt', agent: kind } };
+    const row = { pid: 11, ppid: 10, pidStart: 'Tue Sep  8 10:00:00 2026', agent: kind, interactive: true, args: command };
     const state = { waits: 0, sent: [], exited: false, replaced: null };
     const deps = {
       root, env: { KEEP_DIR: root, KEEP_CONFIG: accountConfig }, withInjectionLock: (fn) => fn(),
       buildState: async () => ({ sessions: [session], tasks: [] }),
       claudeRolloutFile: () => claudeFile,
+      codexRolloutFile: () => codexFile,
       agentProcessRows: async () => (state.exited ? [{ pid: 10, ppid: 1, args: '/bin/zsh -l' }] : [row]),
-      psTable: '11 10 ttys001 Tue Sep  8 10:00:00 2026 /test/claude --resume wt',
+      psTable: `11 10 ttys001 Tue Sep  8 10:00:00 2026 ${command}`,
       lsof: async () => '',
       // The typed /exit reaches the modal, not the exit: the agent is still running.
       closeIdleSession: async (_body, guards) => { await guards.beforeClose(); },
@@ -7353,6 +7391,13 @@ test('a graceful exit answers the worktree exit prompt once and only for Keep wo
     await assert.rejects(slow.run(), /Graceful exit did not finish/);
     assert.deepEqual(slow.state.sent, ['\r']);
     assert.equal(slow.state.waits, 75);
+
+    // Only Claude Code asks this question. A Codex pane showing the same text is showing
+    // something else, so its screen is never read and nothing is ever typed into it.
+    const codex = scenario({ highlighted: 1, deadAfter: Infinity, kind: 'codex' });
+    await assert.rejects(codex.run(), /Graceful exit did not finish/);
+    assert.deepEqual(codex.state.sent, []);
+    assert.equal(codex.state.waits, 30);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
