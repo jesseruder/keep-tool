@@ -5002,9 +5002,11 @@ test('a box holding more than the typed message is not submitted', async () => {
 // that typing started.
 const RECOVERY_SESSION = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
 
-// The squash boxEndsWithMessage compares tails with: canonicalText, then every space
-// out. canonicalText is not exported, so this is its normalizedText-then-NFC spelling.
-const squashedDraft = (value) => String(value ?? '')
+// Historical, and deliberately kept: the gate before nothingAfterDraft asked whether
+// the parsed box ENDED with the message, squashed this way (canonicalText, which is not
+// exported, then every space out). It is used below only to state, as a fact, what that
+// comparison let through — a suffix test cannot tell a draft from a correction of it.
+const squashedTail = (value) => String(value ?? '')
   .replace(/\s+/g, ' ').trim().normalize('NFC').replace(/\s+/g, '');
 
 // The state a send that typed its message but never saw a receipt leaves behind: an
@@ -5157,14 +5159,25 @@ test('an earlier Codex prompt glyph up the pane does not refuse an unchanged dra
     '  ⏎ send   ⌃C quit',
   ].join('\n');
 
+  // The premise nothingAfterDraft rests on: whatever the parse drags in sits in FRONT
+  // of the last glyph, so from that glyph past the block exactDraft reads there is
+  // nothing left in the box but blanks. draftRegionLines is not exported, so the
+  // premise is stated the way it is enforced — one line added after the draft, behind a
+  // blank so exactDraft cannot see it, must be refused.
+  const withAddition = (rows) => [
+    '› instruction',
+    ...Array.from({ length: rows }, (_, index) => `  output line ${index + 1}`),
+    `› ${DRAFT}`,
+    '',
+    'and also stop when it fails',
+    '',
+    '  ⏎ send   ⌃C quit',
+  ].join('\n');
+
   for (const rows of [8, 35]) {
-    // The box parser really does misread this pane; the point is that the misread text
-    // still ends where the draft ends, which is the premise boxEndsWithMessage rests on.
-    const { draftRegionText } = require('./serve');
+    const { draftRegionText, exactDraft } = require('./serve');
     const box = draftRegionText(pane(rows), 'codex');
     assert.match(box, /^instruction/, `${rows} rows: the parse puts a finished turn in front`);
-    assert.equal(squashedDraft(box).endsWith(squashedDraft(DRAFT)), true,
-      `${rows} rows: the quirk is in front of the draft, never after it`);
     const harness = recoveryHarness({
       text: DRAFT, kind: 'codex',
       screenFor: () => ({ text: pane(rows), cursorY: rows + 1 }),
@@ -5175,6 +5188,20 @@ test('an earlier Codex prompt glyph up the pane does not refuse an unchanged dra
       assert.deepEqual(harness.inputs, ['\r'], `${rows} rows: submitted exactly once`);
       assert.deepEqual(harness.requested, [200, 200], `${rows} rows`);
     } finally { fs.rmSync(harness.base, { recursive: true, force: true }); }
+
+    // Same quirky parse, one line after the draft: exactDraft still says yes, and the
+    // recovery still refuses.
+    assert.equal(exactDraft(withAddition(rows), DRAFT, 'codex'), true, `${rows} rows: hidden behind the blank`);
+    const added = recoveryHarness({
+      text: DRAFT, kind: 'codex',
+      screenFor: () => ({ text: withAddition(rows), cursorY: rows + 1 }),
+      onEnter: () => assert.fail(`${rows} rows: nothing may be pressed`),
+    });
+    try {
+      await assert.rejects(added.send(), /Previous delivery is unconfirmed/, `${rows} rows`);
+      assert.deepEqual(added.inputs, [], `${rows} rows: no key is pressed`);
+      assert.deepEqual(added.requested, [200], `${rows} rows: submitDraft is never reached`);
+    } finally { fs.rmSync(added.base, { recursive: true, force: true }); }
   }
 });
 
@@ -5199,13 +5226,21 @@ test('a long line up the pane does not skew the wrap width of an unchanged draft
     '─'.repeat(COLS), `❯ ${HEAD}`, TAIL, '─'.repeat(COLS), '? for shortcuts',
   ].join('\n');
 
+  // The premise nothingAfterDraft rests on: the spurious space is INSIDE the draft, so
+  // the box still has nothing but blanks after the block exactDraft reads. Stated the
+  // way it is enforced, since draftRegionLines is not exported — a line added after the
+  // draft, behind a blank so exactDraft cannot see it, must be refused.
+  const withAddition = (rows) => [
+    ACCENTS,
+    ...Array.from({ length: rows }, (_, index) => `  transcript line ${index + 1}`),
+    '─'.repeat(COLS), `❯ ${HEAD}`, TAIL, '', 'and also stop when it fails',
+    '─'.repeat(COLS), '? for shortcuts',
+  ].join('\n');
+
   for (const rows of [8, 34]) {
-    const { draftRegionText } = require('./serve');
+    const { draftRegionText, exactDraft } = require('./serve');
     const box = draftRegionText(pane(rows), 'claude');
     assert.equal(box, `${HEAD} ${TAIL}`, `${rows} rows: the parse really does insert a space mid-word`);
-    // The spurious space is inside the draft, so squashing it out restores the tail.
-    assert.equal(squashedDraft(box).endsWith(squashedDraft(DRAFT)), true,
-      `${rows} rows: the quirk survives the squash boxEndsWithMessage applies`);
     const harness = recoveryHarness({
       text: DRAFT,
       screenFor: () => ({ text: pane(rows), cursorY: rows + 2 }),
@@ -5215,6 +5250,47 @@ test('a long line up the pane does not skew the wrap width of an unchanged draft
       assert.deepEqual(await harness.send(), { ok: true, delivery: 'received' }, `${rows} rows`);
       assert.deepEqual(harness.inputs, ['\r'], `${rows} rows: submitted exactly once`);
       assert.deepEqual(harness.requested, [200, 200], `${rows} rows`);
+    } finally { fs.rmSync(harness.base, { recursive: true, force: true }); }
+
+    // Same skewed width, one line after the draft: exactDraft still says yes, and the
+    // recovery still refuses.
+    assert.equal(exactDraft(withAddition(rows), DRAFT, 'claude'), true, `${rows} rows: hidden behind the blank`);
+    const added = recoveryHarness({
+      text: DRAFT,
+      screenFor: () => ({ text: withAddition(rows), cursorY: rows + 2 }),
+      onEnter: () => assert.fail(`${rows} rows: nothing may be pressed`),
+    });
+    try {
+      await assert.rejects(added.send(), /Previous delivery is unconfirmed/, `${rows} rows`);
+      assert.deepEqual(added.inputs, [], `${rows} rows: no key is pressed`);
+      assert.deepEqual(added.requested, [200], `${rows} rows: submitDraft is never reached`);
+    } finally { fs.rmSync(added.base, { recursive: true, force: true }); }
+  }
+});
+
+test('a draft the pane wrapped over three rows is still submitted', async () => {
+  // A legitimate multi-row draft: no blank lines, so the block exactDraft reads is the
+  // whole box and there is nothing after it. The rows rejoin into the message through
+  // the `\s*` exactDraft puts between them.
+  const DRAFT = 'rerun the regression suite and report back';
+  const ROWS = ['rerun the regression', 'suite and report', 'back'];
+  assert.equal(ROWS.join(' '), DRAFT, 'the three rows are the message, wrapped');
+  const layouts = [
+    { kind: 'claude', pane: ['─'.repeat(46), `❯ ${ROWS[0]}`, ROWS[1], ROWS[2], '─'.repeat(46), '? for shortcuts'].join('\n'), cursorY: 3 },
+    { kind: 'codex', pane: [`› ${ROWS[0]}`, ROWS[1], ROWS[2], '', '  ⏎ send   ⌃C quit'].join('\n'), cursorY: 2 },
+  ];
+  const { exactDraft } = require('./serve');
+  for (const { kind, pane, cursorY } of layouts) {
+    assert.equal(exactDraft(pane, DRAFT, kind), true, `${kind}: the rows read back as the message`);
+    const harness = recoveryHarness({
+      text: DRAFT, kind,
+      screenFor: () => ({ text: pane, cursorY }),
+      onEnter: (_file, receipt) => receipt(),
+    });
+    try {
+      assert.deepEqual(await harness.send(), { ok: true, delivery: 'received' }, kind);
+      assert.deepEqual(harness.inputs, ['\r'], `${kind}: submitted exactly once`);
+      assert.deepEqual(harness.requested, [200, 200], kind);
     } finally { fs.rmSync(harness.base, { recursive: true, force: true }); }
   }
 });
@@ -5291,39 +5367,45 @@ test('a draft the first read would not accept is never submitted by the second',
 test('a box that already held more than the message at the first read is never recovered', async () => {
   // Owner's line was in the box before recovery even looked. exactDraft cannot see it —
   // it stops at the first blank line — and the cursor is back on the message line, so
-  // the only thing standing between this and an Enter is boxEndsWithMessage: the parsed
-  // box ends with Owner's words, not with ours.
-  const layouts = [
-    {
-      kind: 'claude',
-      // The composer's own rules close the box around all three lines.
-      pane: ['─'.repeat(46), `❯ ${MESSAGE}`, '', 'Owner instruction', '─'.repeat(46), '? for shortcuts'].join('\n'),
-      cursorY: 1,
-    },
-    {
-      kind: 'codex',
-      // Codex has no rules; its composer runs to the blank line above the status row.
-      pane: [`› ${MESSAGE}`, '', 'Owner instruction', '', '  ⏎ send   ⌃C quit'].join('\n'),
-      cursorY: 0,
-    },
-  ];
+  // the only thing standing between this and an Enter is nothingAfterDraft: past the
+  // block exactDraft read, the box is not empty.
+  //
+  // `correction` is the layout a suffix comparison could not refuse. Owner's addition
+  // ends with the message itself, so "the box ends with our words" was true of a box
+  // whose last words were "do not continue". Only looking for anything at all after the
+  // draft tells the two apart.
+  const box = (kind, message, addition) => (kind === 'claude'
+    // The composer's own rules close the box around all three lines.
+    ? ['─'.repeat(46), `❯ ${message}`, '', addition, '─'.repeat(46), '? for shortcuts']
+    // Codex has no rules; its composer runs to the blank line above the status row.
+    : [`› ${message}`, '', addition, '', '  ⏎ send   ⌃C quit']).join('\n');
+  const layouts = [];
+  for (const kind of ['claude', 'codex']) {
+    layouts.push({ kind, message: MESSAGE, addition: 'Owner instruction', suffixWouldRefuse: true,
+      cursorY: kind === 'claude' ? 1 : 0 });
+    layouts.push({ kind, message: 'continue', addition: 'Actually, do not continue', suffixWouldRefuse: false,
+      cursorY: kind === 'claude' ? 1 : 0 });
+  }
   const { draftRegionText, exactDraft } = require('./serve');
-  for (const { kind, pane, cursorY } of layouts) {
-    // Both halves of the premise: exactDraft is fooled, the box parser is not.
-    assert.equal(exactDraft(pane, MESSAGE, kind), true, `${kind}: exactDraft stops at the blank line`);
-    assert.equal(squashedDraft(draftRegionText(pane, kind)).endsWith(squashedDraft(MESSAGE)), false,
-      `${kind}: the box ends with Owner's words`);
+  for (const { kind, message, addition, suffixWouldRefuse, cursorY } of layouts) {
+    const pane = box(kind, message, addition);
+    const label = `${kind} ${JSON.stringify(addition)}`;
+    // exactDraft is fooled either way: it never reads past the blank line.
+    assert.equal(exactDraft(pane, message, kind), true, `${label}: exactDraft stops at the blank line`);
+    // And what the superseded suffix comparison would have said about this box.
+    assert.equal(squashedTail(draftRegionText(pane, kind)).endsWith(squashedTail(message)), !suffixWouldRefuse,
+      `${label}: the suffix comparison ${suffixWouldRefuse ? 'caught this' : 'let this through'}`);
     const harness = recoveryHarness({
-      kind, screenFor: () => ({ text: pane, cursorY }),
-      onEnter: () => assert.fail(`${kind}: nothing may be pressed`),
+      text: message, kind, screenFor: () => ({ text: pane, cursorY }),
+      onEnter: () => assert.fail(`${label}: nothing may be pressed`),
     });
     try {
       const error = await harness.send().then(() => null, (e) => e);
-      assert.match(error.message, /Previous delivery is unconfirmed; no message was retyped/, kind);
-      assert.deepEqual(harness.inputs, [], `${kind}: no key is pressed`);
-      assert.deepEqual(harness.requested, [200], `${kind}: submitDraft is never reached`);
-      assert.equal(error.typingStarted, false, kind);
-      assert.equal(fs.existsSync(harness.journal), true, `${kind}: the journal is left alone`);
+      assert.match(error.message, /Previous delivery is unconfirmed; no message was retyped/, label);
+      assert.deepEqual(harness.inputs, [], `${label}: no key is pressed`);
+      assert.deepEqual(harness.requested, [200], `${label}: submitDraft is never reached`);
+      assert.equal(error.typingStarted, false, label);
+      assert.equal(fs.existsSync(harness.journal), true, `${label}: the journal is left alone`);
     } finally { fs.rmSync(harness.base, { recursive: true, force: true }); }
   }
 });
@@ -5341,8 +5423,8 @@ test('a paste that imitates composer chrome cannot leave the key unchanged', asy
   assert.equal(draftRegionText(pasted, 'claude'), draftRegionText(clean, 'claude'),
     'the parse cannot tell these two screens apart');
   assert.equal(exactDraft(pasted, MESSAGE, 'claude'), true, 'nor can exactDraft');
-  assert.equal(squashedDraft(draftRegionText(pasted, 'claude')).endsWith(squashedDraft(MESSAGE)), true,
-    'nor can the tail comparison');
+  assert.equal(squashedTail(draftRegionText(pasted, 'claude')).endsWith(squashedTail(MESSAGE)), true,
+    'nor could the suffix comparison this replaced');
   assert.notEqual(pasted, clean, 'the screen is what changed');
 
   const harness = recoveryHarness({

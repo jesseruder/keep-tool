@@ -4956,18 +4956,23 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
   // — a footer ticking over — the recovery is refused once and the next attempt takes
   // both reads again.
   let matchedScreen = null;
-  // Whether the box ends with our message. exactDraft stops at the first blank line,
-  // so a line Owner added below one is invisible to it; the box parser reads the whole
-  // box, but guesses where it starts and how wide the pane is from whatever else is on
-  // screen, so an earlier Codex prompt or a long line of output puts extra text in
-  // FRONT of the draft or a spurious space INSIDE it. Neither of those touches the
-  // end, and Owner's addition always does: compare tails, ignoring whitespace. A box
-  // that cannot be parsed at all leaves exactDraft as the only witness.
-  const boxEndsWithMessage = (screenText) => {
-    const box = draftRegionText(screenText, session.kind);
-    if (box === null) return true;
-    const squash = (value) => canonicalText(value).replace(/\s+/g, '');
-    return squash(box).endsWith(squash(text));
+  // Whether the box holds anything after the draft exactDraft matched. exactDraft reads
+  // from the last prompt glyph to the first blank line, so a line Owner added below one
+  // is invisible to it; the box parser knows where the box ENDS, but guesses where it
+  // starts and how wide the pane is from whatever else is on screen, so its text cannot
+  // be compared with the message. Its lines can: from the last glyph in the box, past
+  // the block exactDraft read, every remaining line has to be blank. Comparing tails
+  // instead let "continue" / blank / "Actually, do not continue" through. A box that
+  // cannot be parsed at all leaves exactDraft as the only witness.
+  const nothingAfterDraft = (screenText) => {
+    const region = draftRegionLines(screenText, session.kind);
+    if (!region) return true;
+    const prompt = session.kind === 'codex' ? /^\s*›(?:\s|$)/ : /^\s*❯(?:\s|$)/;
+    let at = 0;
+    region.lines.forEach((line, i) => { if (i > 0 && prompt.test(line)) at = i; });
+    at += 1;
+    while (at < region.lines.length && region.lines[at].trim()) at += 1;
+    return region.lines.slice(at).every((line) => !line.trim());
   };
   try {
     // Claude does not transcript /mcp. A previously submitted command can be
@@ -5016,7 +5021,7 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
         let end = start;
         while (end + 1 < lines.length && lines[end + 1].trim() && !/^\s*[─━]/.test(lines[end + 1])) end++;
         const cursorInPrompt = Number.isFinite(screen.cursor?.y) && screen.cursor.y >= start && screen.cursor.y <= end;
-        const matched = exactDraft(screen.text, text, session.kind) && boxEndsWithMessage(screen.text);
+        const matched = exactDraft(screen.text, text, session.kind) && nothingAfterDraft(screen.text);
         trace('draft-screen-check', { cursorInPrompt, matched });
         matchedScreen = cursorInPrompt && matched ? String(screen.text || '') : null;
         return cursorInPrompt && matched;
