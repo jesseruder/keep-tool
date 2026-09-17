@@ -21,6 +21,7 @@ const path = require('path');
 const SEND_LIMIT = 2000;
 const TELL_TEXT_LIMIT = 1600;
 const TELL_TEXT_ERROR = `a tell is limited to ${TELL_TEXT_LIMIT} characters; use --message-file <path> for anything longer`;
+const UNSAFE_TEXT_ERROR = 'a tell may only contain plain printable text; control characters, escape sequences and bidi overrides are refused';
 
 // At most six tells from one session to the same session per hour, and twenty into
 // any one session per hour whoever sends them. The first cap stops a pair looping;
@@ -39,6 +40,24 @@ function clock(ms) {
 function sessionName(session) {
   if (!session) return '';
   return session.num ? `#${session.num}` : String(session.id || '').slice(0, 8);
+}
+
+// A card id, and nothing else, may appear in the frame. A sender that could put
+// arbitrary text in the `card ...` slot could forge the rest of the framing.
+const CARD_ID_RE = /^[A-Za-z0-9_-]+$/;
+
+// Everything a tell carries ends up as keystrokes in somebody's terminal, so it is
+// validated rather than sanitised — the same judgement, in the same words,
+// bin/watcher-live.js applies to a delivered watcher verdict. Tab, newline and CR are
+// the exception: a person writing prose puts them in by hand, and normalizedText has
+// already collapsed them to a plain space before this runs. Everything else — an ESC
+// that starts a control sequence, a CR that erases the frame and submits what follows,
+// a bidi override that reorders what the recipient reads — refuses the whole message,
+// because a message that had to be rewritten is not the one the sender wrote.
+// Required lazily: bin/keep.js loads this module on every CLI call and only the daemon
+// validates.
+function unsafeText(value) {
+  return require('./watcher-live.js').unsafeDeliveryText(value);
 }
 
 // One line by construction. The framing is load-bearing and is built here rather than
@@ -77,6 +96,18 @@ function tellRefusal(session) {
     return { reason: 'busy', detail: 'session is mid-turn' };
   }
   return null;
+}
+
+// When a card has several linked sessions and none can be told, one of them has to
+// supply the reason. `waiting-on-owner` leads deliberately: it is the one state
+// `--wait` must not sit through, and reporting `busy` instead would have the caller
+// spin for its whole duration against a session holding a question for Owner. After
+// that the order runs from the most live and most likely to change to the least.
+const CARD_REFUSAL_ORDER = ['waiting-on-owner', 'usage-limit', 'busy', 'exited', 'not-live'];
+
+function cardRefusalRank(refusal) {
+  const at = CARD_REFUSAL_ORDER.indexOf(refusal && refusal.reason);
+  return at === -1 ? CARD_REFUSAL_ORDER.length : at;
 }
 
 // ---------- the hourly brake ----------
@@ -152,6 +183,7 @@ function logTell(root, record) {
 
 module.exports = {
   SEND_LIMIT, TELL_TEXT_LIMIT, TELL_TEXT_ERROR, PAIR_HOURLY_MAX, TARGET_HOURLY_MAX, WINDOW_MS,
-  clock, sessionName, tellEnvelope, tellRefusal,
+  CARD_ID_RE, UNSAFE_TEXT_ERROR, unsafeText,
+  clock, sessionName, tellEnvelope, tellRefusal, cardRefusalRank,
   ledgerFile, logFile, loadLedger, saveLedger, pairKey, tellDecision, recordTell, releaseTell, logTell,
 };

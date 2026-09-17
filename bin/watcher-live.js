@@ -152,6 +152,20 @@ const UNSAFE_TEXT_RE = new RegExp('[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202
 const UNSAFE_CLASS_RE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
 const ODD_SPACE_RE = new RegExp('[\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]');
 
+// The judgement on its own, so anything else that types somebody's text into a pane
+// asks the same question in the same words. `keep tell` (bin/tell.js) does: a peer's
+// message reaches a terminal exactly the way a watcher verdict does.
+function unsafeDeliveryText(text) {
+  const value = String(text == null ? '' : text);
+  const folded = (() => { try { return value.normalize('NFKC'); } catch { return value; } })();
+  for (const candidate of [value, folded]) {
+    if (UNSAFE_TEXT_RE.test(candidate)) return true;
+    if (UNSAFE_CLASS_RE.test(candidate)) return true;
+    if (ODD_SPACE_RE.test(candidate)) return true;
+  }
+  return false;
+}
+
 function safeDeliveryText(text) {
   // The message is delivered as written. Rewriting it — even into an equivalent
   // canonical form — would type something other than the bytes Owner graded, and
@@ -159,12 +173,7 @@ function safeDeliveryText(text) {
   // NFC belongs to comparison (the receipt hash), not to what is typed.
   const value = String(text == null ? '' : text);
   if (!value) return null;
-  const folded = (() => { try { return value.normalize('NFKC'); } catch { return value; } })();
-  for (const candidate of [value, folded]) {
-    if (UNSAFE_TEXT_RE.test(candidate)) return null;
-    if (UNSAFE_CLASS_RE.test(candidate)) return null;
-    if (ODD_SPACE_RE.test(candidate)) return null;
-  }
+  if (unsafeDeliveryText(value)) return null;
   // Runs of spaces are the one thing worth repairing: they change nothing about
   // what the message says or where it ends.
   const collapsed = value.replace(/ {2,}/g, ' ').trim();
@@ -770,7 +779,7 @@ function cardFor(turn, keepApi) {
 module.exports = {
   TYPES, DEFAULTS, DELIVERY_PREFIX, RISKY_QUESTION_RE, SESSION_WINDOW_MS, HOUR_MS,
   configFile, loadConfig, saveConfig, normalizeConfig, liveTypes, describeConfig,
-  graduationCheck, decisionTypeFor, safeDeliveryText, turnText, assistantMessages, cardFor,
+  graduationCheck, decisionTypeFor, safeDeliveryText, unsafeDeliveryText, turnText, assistantMessages, cardFor,
   UNREADABLE_COMMAND, UNREADABLE_REASON, recordReservationError,
   pausedCarveOut, riskyQuestionCarveOut, cardCarveOut, releaseCarveOut, chainCarveOut, carveOut,
   freshness, sessionReady, rateLimit, reserve, releaseReservation, confirmReservation, revalidate,

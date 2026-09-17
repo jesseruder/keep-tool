@@ -72,6 +72,10 @@ permission-bypass defaults; set them explicitly for your intended policy.
   is the reviewer, or is you. `--wait +10m` retries while the target is only busy; nothing
   else is retried. Exit 0 delivered, 3 refused, 124 wait timed out. `--dry` shows what
   would be sent and whether it would be accepted.
+- A refusal with reason `unconfirmed` means typing started and the message may have
+  arrived. Do not send it again: look at the target (`keep pane screen`, its card) first.
+- Plain text only. Control characters and invisible Unicode are refused, not cleaned;
+  newlines collapse to spaces, and anything long or multi-line belongs in `--message-file`.
 - There is an hourly cap per sender and per target, so two agents cannot loop. Do not
   answer a message that needs no answer.
 - **Put durable facts on the card, not in a message.** A tell is for something the other

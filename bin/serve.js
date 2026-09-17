@@ -5569,23 +5569,33 @@ async function openSession(body, deps = {}) {
     if (body.accountId != null) {
       account = accounts.get(body.accountId, env);
     } else if (body.accountPolicy === 'auto') {
-      const choice = openAccount.chooseOpenAccount(agent, openAccount.orderOpenCandidates(agent, {
-        accounts: accounts.list(env),
-        defaultAccountId: accounts.defaultFor(agent, env).id,
-        callerAccountId: body.callerAccountId,
-      }), usageSnapshot(deps), launchModel, Date.now());
+      // Choosing an account is a convenience, never a gate: a malformed usage reading
+      // or a chooser bug must not be able to stop a launch. Anything thrown here falls
+      // back to the registry default, exactly as an open with no policy would.
+      let choice = null;
+      try {
+        choice = openAccount.chooseOpenAccount(agent, openAccount.orderOpenCandidates(agent, {
+          accounts: accounts.list(env),
+          defaultAccountId: accounts.defaultFor(agent, env).id,
+          callerAccountId: body.callerAccountId,
+        }), usageSnapshot(deps), launchModel, Date.now());
+      } catch (error) {
+        process.stderr.write(`keep serve: could not choose a ${agent} account: ${String(error && error.message || error)}\n`);
+      }
       // Launching a session that can only answer "you are out of usage" wastes the
       // pane and the caller's turn; say which accounts are spent and let Owner
       // override deliberately.
-      if (!choice.account) throw new InjectionError(409, openAccount.noAccountMessage(agent, choice.skipped));
-      account = choice.account;
-      accountNote = openAccount.accountNote(choice);
+      if (choice && !choice.account) throw new InjectionError(409, openAccount.noAccountMessage(agent, choice.skipped));
+      account = choice ? choice.account : accounts.defaultFor(agent, env);
+      accountNote = choice ? openAccount.accountNote(choice) : '';
     } else {
       account = accounts.defaultFor(agent, env);
     }
     if (!account || account.agent !== agent) throw new InjectionError(400, `account ${body.accountId || '?'} is not a ${agent} account`);
     if (body.accountId != null) {
-      accountWarning = openAccount.exhaustedWarning(account, usageSnapshot(deps), launchModel, Date.now());
+      // Same rule: an unreadable snapshot costs the warning, never the launch.
+      try { accountWarning = openAccount.exhaustedWarning(account, usageSnapshot(deps), launchModel, Date.now()); }
+      catch { accountWarning = ''; }
     }
   }
   const allowPendingRegistration = freshStandalone && agent === 'codex' && !message && Boolean(body.requestId)
@@ -6511,7 +6521,7 @@ function scanSessions(options = {}) {
   sessions.sort((a, b) => b.mtime - a.mtime);
   // Every session carries its short number from here on: the snapshot below is
   // what the dashboard state, /api/state and the console all read.
-  sessionNumbers.assign(sessions, { root: keep.ROOT });
+  sessionNumbers.assign(sessions, { root: keep.ROOT, readOnly: options.readOnly === true });
   sessionSnapshot = copySessions(sessions);
   sessionSnapshotAt = now;
   if (options.dashboard === true) lastDashboardSessionScan = now;
@@ -8265,6 +8275,20 @@ async function deliverUnblockToThread(task, text) {
     : null;
 }
 
+// The ordinary session scan expires stale attention and spawned markers and allocates
+// console numbers, so it is not something `--dry` may run: a dry run promises to leave
+// the registry exactly as it found it. Prefer the snapshot the daemon keeps warm — the
+// same one resolveSessionId reads — and fall back to an explicitly read-only scan,
+// which labels whatever is already numbered and writes nothing.
+function tellSessions(dry, deps = {}) {
+  const scan = deps.scanSessions || scanSessions;
+  if (!dry) return scan({});
+  if (!deps.scanSessions && Date.now() - sessionSnapshotAt < 5000 && sessionSnapshot.length) {
+    return copySessions(sessionSnapshot);
+  }
+  return scan({ readOnly: true });
+}
+
 // `keep tell`: one session addressing another. Everything that decides whether the
 // message may be typed at all — the frame, the target-state guards, the hourly brake —
 // is data in bin/tell.js; this is the part that needs the daemon's live view.
@@ -8278,12 +8302,20 @@ async function deliverUnblockToThread(task, text) {
 async function tellSession(body, deps = {}) {
   body = body && typeof body === 'object' ? body : {};
   const root = deps.root || keep.ROOT;
+  const dry = body.dry === true;
   const text = normalizedText(body.text || '');
   if (!text) throw new InjectionError(400, 'message is empty');
+  // Validated, not sanitised, and before anything else looks at it: this text becomes
+  // keystrokes, and a message that had to be rewritten is not the one the sender wrote.
+  if (tell.unsafeText(text)) throw new InjectionError(400, tell.UNSAFE_TEXT_ERROR);
   if (body.senderSessionId != null && !/^[A-Za-z0-9_-]+$/.test(String(body.senderSessionId))) {
     throw new InjectionError(400, 'bad sender session id');
   }
-  const sessions = (deps.scanSessions || scanSessions)();
+  // The card rides inside the frame, so it may only ever be a card id.
+  if (body.senderCard != null && !tell.CARD_ID_RE.test(String(body.senderCard))) {
+    throw new InjectionError(400, 'bad sender card id');
+  }
+  const sessions = tellSessions(dry, deps);
   const excluded = deps.excluded || excludedSessionIds();
   const senderId = body.senderSessionId ? String(body.senderSessionId) : '';
 
@@ -8292,20 +8324,25 @@ async function tellSession(body, deps = {}) {
     let task;
     try { task = (deps.loadTask || keep.loadTask)(body.taskId); } catch {}
     if (!task) throw new InjectionError(400, 'no task');
-    // The same candidate rule every automated delivery onto a card uses: its linked
-    // sessions, minus the reviewer, keep-spawned runs, and the sender itself.
-    const { candidates, busy } = pickDeliveryCandidates(
-      (task.fm.sessions || []).map((entry) => entry && entry.id),
-      sessions,
-      new Set([...excluded, ...(senderId ? [senderId] : [])]),
-    );
-    if (!candidates.length && busy > 0) {
-      throw new InjectionError(409, `busy: the live session on ${body.taskId} is mid-turn or waiting on Owner`, { reason: 'busy' });
-    }
-    if (!candidates.length) {
-      throw new InjectionError(409, `no live session on ${body.taskId}; start one with keep open ${body.taskId} --fresh -m "..."`, { reason: 'not-live' });
-    }
+    // The card's own linked sessions, minus the reviewer, keep-spawned runs and the
+    // sender. pickDeliveryCandidates ranks the deliverable ones for us; the refusal,
+    // when there are none, has to name the actual state rather than the count, because
+    // `--wait` may sit through `busy` and must never sit through a question Owner is
+    // holding. Ranked by tell.js's order, and the most recently active wins a tie.
+    const skip = new Set([...excluded, ...(senderId ? [senderId] : [])]);
+    const linked = new Set((task.fm.sessions || []).map((entry) => entry && entry.id).filter(Boolean));
+    const { candidates } = pickDeliveryCandidates([...linked], sessions, skip);
     target = candidates[0];
+    if (!target) {
+      const present = sessions.filter((session) => session && linked.has(session.id) && !skip.has(session.id))
+        .sort((a, b) => b.mtime - a.mtime);
+      if (!present.length) {
+        throw new InjectionError(409, `no live session on ${body.taskId}; start one with keep open ${body.taskId} --fresh -m "..."`, { reason: 'not-live' });
+      }
+      const refusals = present.map((session) => tell.tellRefusal(session) || { reason: 'busy', detail: 'session is mid-turn' });
+      const worst = refusals.reduce((a, b) => (tell.cardRefusalRank(b) < tell.cardRefusalRank(a) ? b : a));
+      throw new InjectionError(409, `${worst.reason}: ${worst.detail} (on ${body.taskId})`, { reason: worst.reason });
+    }
   } else {
     target = (deps.resolveSessionId || resolveSessionId)(body.sessionId, { ...deps, scanSessions: () => sessions });
   }
@@ -8344,7 +8381,7 @@ async function tellSession(body, deps = {}) {
   };
   const now = Date.now();
   const slot = { sender: senderId || null, target: target.id, now };
-  if (body.dry === true) {
+  if (dry) {
     // Read-only all the way down: the ledger is consulted, never written.
     const decision = tell.tellDecision(tell.loadLedger(root), slot);
     if (!decision.ok) throw new InjectionError(409, `rate-limited: ${decision.why}`, { reason: 'rate-limited' });
@@ -8359,24 +8396,51 @@ async function tellSession(body, deps = {}) {
   });
   if (!gate.ok) throw new InjectionError(409, `rate-limited: ${gate.why}`, { reason: 'rate-limited' });
 
+  // watcherSend runs this three times — entering the lock, immediately before the first
+  // character, and again after the text is confirmed on screen and before Enter. Its
+  // own verdict is kept here rather than parsed back out of the message, so the reason
+  // reaches the CLI structurally and `--wait` keeps its one retryable state.
+  let movedOnVerdict = null;
   try {
     await (deps.watcherSend || watcherSend)({
       sessionId: target.id,
       text: envelope,
       precondition: async () => {
-        const fresh = ((deps.scanSessions || scanSessions)()).find((row) => row.id === target.id);
+        const fresh = (tellSessions(false, deps)).find((row) => row.id === target.id);
         const moved = tell.tellRefusal(fresh);
+        movedOnVerdict = moved;
         return moved ? `${moved.reason}: ${moved.detail}` : null;
       },
     }, deps);
   } catch (error) {
-    try {
-      (deps.withLock || keep.withLock)(() => tell.saveLedger(root, tell.releaseTell(tell.loadLedger(root), slot)));
-    } catch {}
+    // An error after the first character may have arrived: the text can be sitting in
+    // the box, or submitted with the receipt lost. Keeping the reservation is the
+    // conservative read — a retry that double-delivers is worse than a slot spent on a
+    // message that may already be there — and the caller is told it cannot know.
+    const typed = Boolean(error && error.typingStarted);
+    if (!typed) {
+      try {
+        (deps.withLock || keep.withLock)(() => tell.saveLedger(root, tell.releaseTell(tell.loadLedger(root), slot)));
+      } catch {}
+    } else {
+      tell.logTell(root, {
+        ts: keep.nowStamp(),
+        sender: sender.sessionId, senderCard: sender.card,
+        target: target.id, targetCard,
+        text: text.slice(0, 200),
+        delivery: 'unconfirmed',
+      });
+      throw new InjectionError(409,
+        `unconfirmed: the message reached ${tell.sessionName(target)}'s input box but could not be confirmed; check the session before sending again (${String(error && error.message || error)})`,
+        { reason: 'unconfirmed' });
+    }
     // A session the scan still lists but whose pane has gone is a refusal like any
     // other, not a transport failure: say so in the same shape the guards use.
     if (error instanceof InjectionError && error.status === 404 && error.extra && error.extra.notLive) {
       throw new InjectionError(409, 'not-live: that session has no live host pane', { reason: 'not-live' });
+    }
+    if (movedOnVerdict) {
+      throw new InjectionError(409, `${movedOnVerdict.reason}: ${movedOnVerdict.detail}`, { reason: movedOnVerdict.reason });
     }
     throw error;
   }

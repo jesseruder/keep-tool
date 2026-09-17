@@ -6847,6 +6847,17 @@ test('an auto fresh open skips a spent default, and no policy keeps the old defa
     const blind = await openSession({ ...body, accountPolicy: 'auto' },
       { ...common, usageSnapshot: () => { throw new Error('usage manager is down'); } });
     assert.equal(blind.accountId, 'claude/default');
+
+    // Nor may the chooser itself: a snapshot that throws while it is being read falls
+    // back to the registry default with no note, exactly as an open with no policy.
+    const exploding = () => ({ get accounts() { throw new Error('snapshot exploded'); } });
+    const survived = await openSession({ ...body, accountPolicy: 'auto' }, { ...common, usageSnapshot: exploding });
+    assert.equal(survived.accountId, 'claude/default');
+    assert.equal(survived.accountNote, undefined);
+    // And an explicit account loses only its warning, never its launch.
+    const warned = await openSession({ ...body, accountId: 'claude/default' }, { ...common, usageSnapshot: exploding });
+    assert.equal(warned.accountId, 'claude/default');
+    assert.equal(warned.accountWarning, undefined);
     await assert.rejects(openSession({ ...body, accountPolicy: 'sometimes' }, common), /accountPolicy must be auto/);
     await assert.rejects(openSession({ ...body, accountPolicy: 'auto', callerAccountId: 'Not An Id' }, common), /bad caller account id/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }

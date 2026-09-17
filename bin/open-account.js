@@ -34,47 +34,86 @@ function describeReset(resetsAt) {
   return `, resets ${MONTHS[when.getMonth()]} ${when.getDate()} ${clock}`;
 }
 
-// One account's verdict, from the buckets classifyBudget reads. `model` names the
-// per-model weekly bucket when the launch names a model; without one only the generic
-// `week` and `5h` windows apply, because a launch that names no model does not yet
-// know which per-model window it will spend against.
+// The buckets one account's reading offers, for either provider, or null when there is
+// nothing usable to read. Claude's come from the poller as `{limits, fetchedAt}`;
+// Codex's are the `{windows, asOf}` its own rollout writes (bin/usage.js codexWindow),
+// already carrying the same `{label, percent, resetsAt}` shape and the same `week` and
+// `5h` labels. Only the age is judged differently: Claude's is polled, so half an hour
+// old means the poller is broken, while Codex's only advances when a Codex session
+// takes a turn, so the same age means nobody has used Codex — not that the reading is
+// wrong. A reading nobody can parse is unknown, which still launches.
+const CODEX_STALE_MS = 6 * 3600e3;
+
+function accountLimits(snapshot, account) {
+  const agent = account && account.agent;
+  if (agent === 'codex') {
+    const entry = snapshot && snapshot.accounts && snapshot.accounts[account.id];
+    if (!entry || typeof entry !== 'object' || !Array.isArray(entry.windows)) return null;
+    return { limits: entry.windows, fetchedAt: entry.asOf, staleMs: CODEX_STALE_MS };
+  }
+  const claude = review.accountLimits(snapshot, account && account.id);
+  return claude ? { ...claude, staleMs: USAGE_STALE_MS } : null;
+}
+
+// One account's verdict. `model` names the per-model weekly bucket when the launch
+// names one; without a model only the generic `week` and `5h` windows apply, because a
+// launch that names no model does not yet know which per-model window it will spend
+// against. Every applicable bucket is judged and the worst one decides: a week at 94%
+// must not hide a five-hour window at 100%.
 function accountBudget(snapshot, account, model, now) {
   const id = account && account.id;
-  const claude = review.accountLimits(snapshot, id);
-  if (!claude || !Array.isArray(claude.limits) || !claude.limits.length) {
+  const reading = accountLimits(snapshot, account);
+  if (!reading || !Array.isArray(reading.limits) || !reading.limits.length) {
     return { code: 8, reason: `no usage reading for ${id}` };
   }
-  if (!claude.fetchedAt || now - claude.fetchedAt > USAGE_STALE_MS) {
+  const fetchedAt = Number(reading.fetchedAt);
+  if (!Number.isFinite(fetchedAt) || !fetchedAt || now - fetchedAt > reading.staleMs) {
     return { code: 8, reason: `usage reading for ${id} is stale` };
   }
-  const limits = claude.limits;
-  // A non-numeric percent makes every headroom comparison false, which would read as
-  // "plenty left". Unknown is the honest answer, and unknown is still launchable.
-  if (limits.some((limit) => !Number.isFinite(Number(limit && limit.percent)))) {
-    return { code: 8, reason: `usage reading for ${id} has an unreadable percent` };
+  const limits = reading.limits;
+  // A bucket that is not an object, or whose percent is not a number, makes every
+  // headroom comparison false — which would read as "plenty left" — and reaches for
+  // `.label` on whatever it is. Unknown is the honest answer, and unknown still
+  // launches.
+  if (limits.some((limit) => !limit || typeof limit !== 'object'
+    || !Number.isFinite(Number(limit.percent)))) {
+    return { code: 8, reason: `usage reading for ${id} is unreadable` };
   }
   const family = review.modelFamily(model);
   const budget = preferences.modelBudgets()[family] || {};
   const min = budget.minHeadroom ?? MIN_HEADROOM;
   const headroom = (limit) => 100 - Number(limit.percent);
-  // `low` is under the headroom floor but not yet at the wall: worth passing over for a
-  // better account, still better than refusing to launch at all.
-  const spent = (code, limit) => ({ code, reason: `${limit.label} ${limit.percent}%`, resetsAt: limit.resetsAt, low: Number(limit.percent) < 100 });
   const name = String(model || '').toLowerCase();
   const scoped = name ? limits.find((limit) => {
     const label = String(limit.label || '').toLowerCase();
     return budget.weeklyLabel ? label === budget.weeklyLabel.toLowerCase()
       : label.endsWith(' wk') && label.startsWith(family === 'other' ? name : family);
   }) : null;
-  if (scoped && headroom(scoped) < min) return spent(6, scoped);
   const week = limits.find((limit) => limit.label === 'week');
   // No weekly bucket at all means the schema moved under us; reading that as room
   // would launch against a window nobody can see.
   if (!week) return { code: 8, reason: `usage reading for ${id} has no weekly bucket` };
-  if (headroom(week) < min) return spent(6, week);
   const short = limits.find((limit) => limit.label === '5h');
-  if (short && headroom(short) < min) return spent(7, short);
-  return { code: 0, reason: 'within budget' };
+  // 6 for a weekly window (scoped or shared), 7 for the short one, as classifyBudget
+  // numbers them. Ordered so an exact headroom tie keeps the weekly reading, which is
+  // the one that takes days rather than hours to come back.
+  const applicable = [
+    ...(scoped ? [{ limit: scoped, code: 6 }] : []),
+    { limit: week, code: 6 },
+    ...(short ? [{ limit: short, code: 7 }] : []),
+  ];
+  const offending = applicable.filter((entry) => headroom(entry.limit) < min);
+  if (!offending.length) return { code: 0, reason: 'within budget' };
+  const worst = offending.reduce((a, b) => (headroom(b.limit) < headroom(a.limit) ? b : a));
+  // `low` is under the headroom floor but not yet at the wall: worth passing over for a
+  // better account, still better than refusing to launch at all. A bucket at or past
+  // 100% is the wall, whatever the other buckets say.
+  return {
+    code: worst.code,
+    reason: `${worst.limit.label} ${worst.limit.percent}%`,
+    resetsAt: worst.limit.resetsAt,
+    low: Number(worst.limit.percent) < 100,
+  };
 }
 
 // Registered accounts for `agent`, in the order a fresh open should try them: the
@@ -145,7 +184,7 @@ function exhaustedWarning(account, snapshot, model, now) {
 }
 
 module.exports = {
-  MIN_HEADROOM, USAGE_STALE_MS,
-  describeReset, accountBudget, orderOpenCandidates, chooseOpenAccount,
+  MIN_HEADROOM, USAGE_STALE_MS, CODEX_STALE_MS,
+  describeReset, accountLimits, accountBudget, orderOpenCandidates, chooseOpenAccount,
   accountNote, noAccountMessage, exhaustedWarning,
 };
