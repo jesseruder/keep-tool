@@ -423,10 +423,65 @@ test('an agent’s session loses the four controls and is not listed under Runni
 test('app.js repeats the Running exclusion inline, and identically', async () => {
   const fs = await import('node:fs');
   const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
-  const body = source.slice(source.indexOf('function runningItems('), source.indexOf('function pinnedItems('));
-  assert.match(body, /!session\.reviewer && !session\.agentName/);
-  // The comment there names the predicate on purpose; the code must not.
-  const code = body.split('\n').filter((line) => !line.trim().startsWith('//')).join('\n');
-  assert.equal(code.includes('hiddenFromRunning'), false,
-    'a bare identifier from another module is not defined in that harness');
+  // Every queue that lists sessions makes the same test, spelled out, and none of
+  // them may reach for the predicate by name.
+  for (const [from, to] of [
+    ['function runningItems(', 'function pinnedItems('],
+    ['function pinnedItems(', 'function recentSessionTime('],
+    ['function recentItems(', 'function matchesTriageFilter('],
+  ]) {
+    const body = source.slice(source.indexOf(from), source.indexOf(to));
+    assert.match(body, /\.reviewer \|\| [a-zA-Z.]*\.agentName|!session\.reviewer && !session\.agentName/, from);
+    // The comment there names the predicate on purpose; the code must not.
+    const code = body.split('\n').filter((line) => !line.trim().startsWith('//')).join('\n');
+    assert.equal(code.includes('hiddenFromRunning'), false,
+      `a bare identifier from another module is not defined in that harness (${from})`);
+  }
+});
+
+// The console lists an agent's session exactly once, under Agents. Every other
+// queue that could show it — Waiting on you, Running, Pinned, Recent — leaves it
+// out, and a needs-input agent is the case that used to slip through: it is not
+// running, so Recent picked it up as a row of its own.
+test('an agent in needs-input appears under Agents and in no other queue', async () => {
+  const fs = await import('node:fs');
+  const vm = await import('node:vm');
+  const { humanAttention } = await import('./status.js');
+  const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+  const agent = { id: 'agent-sid', pane: 'agent-pane', project: '/tmp/p', title: 'sandboxes',
+    state: 'needs-input', mtime: 30, lastUserAt: 30, agentName: 'sandboxes' };
+  const working = { id: 'work-sid', pane: 'work-pane', project: '/tmp/p', title: 'a card',
+    state: 'needs-input', mtime: 20, lastUserAt: 20 };
+  const data = {
+    sessions: [agent, working],
+    panes: [{ id: 'agent-pane', alive: true, meta: { agent: 'claude', sessionId: 'agent-sid', agentName: 'sandboxes' } },
+      { id: 'work-pane', alive: true, meta: { agent: 'claude', sessionId: 'work-sid' } }],
+    // The daemon leaves an agent session out of `attention`; this asserts the
+    // console would not list it even if one arrived.
+    attention: [{ kind: 'question', sessionId: 'work-sid', title: 'a card', since: 20 }],
+    agents: [{ name: 'sandboxes', role: 'incident responder', lifecycle: 'working',
+      session: { id: 'agent-sid', pane: 'agent-pane' } }],
+  };
+  const ctx = vm.createContext({
+    data,
+    state: { markedRunning: new Set(), sent: new Set(), dismissed: new Set() },
+    humanAttention,
+    isClosingSession: () => false,
+    eventKey: (item) => item.sessionId || item.kind,
+    pinnedLayout: () => ({ ids: ['agent-pane', 'work-pane'] }),
+    paneMap: () => new Map(data.panes.map((pane) => [pane.id, pane])),
+    entityForPane: (id) => ({ session: data.sessions.find((candidate) => candidate.pane === id),
+      project: '/tmp/p', title: 'pane' }),
+    recentSessionTime: (session) => session.lastUserAt,
+    sessionItem: (kind, session) => ({ kind, sessionId: session.id }),
+  });
+  const slice = (from, to) => source.slice(source.indexOf(from), source.indexOf(to));
+  vm.runInContext(slice('function queueItems(', 'function sessionItem('), ctx);
+  vm.runInContext(slice('function pinnedItems(', 'function recentSessionTime('), ctx);
+  vm.runInContext(slice('function recentItems(', 'function matchesTriageFilter('), ctx);
+  const ids = (items) => items.map((item) => item.sessionId || item.pane);
+  assert.deepEqual(ids(ctx.queueItems()), ['work-sid'], 'Waiting on you');
+  assert.deepEqual(ids(ctx.pinnedItems()), ['work-sid'], 'Pinned');
+  assert.deepEqual(ids(ctx.recentItems()), ['work-sid'], 'Recent');
+  assert.deepEqual(data.agents.map((row) => row.name), ['sandboxes'], 'and exactly one Agents row');
 });

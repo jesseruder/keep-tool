@@ -297,6 +297,10 @@ function pinnedItems() {
     if (!entity.session) return [{
       kind: 'pinned', pane: paneId, project: entity.project, title: entity.title, state: entity.state,
     }];
+    // An agent's pane is listed once, by its row under Agents — the same test
+    // triage.js's hiddenFromRunning() makes, spelled out like the other sites. A pin
+    // it picked up before the agent adopted it must not list the pane twice.
+    if (entity.session.reviewer || entity.session.agentName) return [];
     return [sessionItem('pinned', entity.session, paneId)];
   });
 }
@@ -307,7 +311,12 @@ function recentSessionTime(session) {
 }
 function recentItems() {
   return (data.sessions || [])
-    .filter((session) => !session.reviewer && !isClosingSession(session.id, session.pane) && session.state !== 'running'
+    // The reviewer and every other standing agent are listed under Agents, not here
+    // — the same test triage.js's hiddenFromRunning() makes, spelled out for the same
+    // reason runningItems() spells it out. An agent that is not running would
+    // otherwise appear a second time as its own Recent row.
+    .filter((session) => !session.reviewer && !session.agentName
+      && !isClosingSession(session.id, session.pane) && session.state !== 'running'
       && (Number.isFinite(typeof session.lastUserAt === 'number' ? session.lastUserAt : Date.parse(session.lastUserAt)) || session.exited))
     .sort((a, b) => recentSessionTime(b) - recentSessionTime(a))
     .slice(0, 6)
