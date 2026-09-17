@@ -2156,10 +2156,10 @@ test('handoff model resolution follows a /model typed after the newest assistant
       content: `<local-command-stdout>${text}</local-command-stdout>` });
     const userStdout = (text) => JSON.stringify({ type: 'user', message: { content: [{ type: 'text',
       text: `<local-command-stdout>${text}</local-command-stdout>` }] } });
-    const resolve = (name, rows, deps = {}) => {
+    const resolve = (name, rows, deps = {}, pane = { meta: { model: 'claude-opus-4-5' } }) => {
       const file = path.join(dir, `${name}.jsonl`);
       fs.writeFileSync(file, `${rows.join('\n')}\n`);
-      return handoffCurrentModel(session, { meta: { model: 'claude-opus-4-5' } },
+      return handoffCurrentModel(session, pane,
         'claude --model claude-opus-4-5', { findSessionFile: () => file, ...deps });
     };
 
@@ -2170,6 +2170,14 @@ test('handoff model resolution follows a /model typed after the newest assistant
     assert.equal(handoffCurrentModel(session, { meta: { model: 'claude-fable-5-1[1m]' } }, '', {
       findSessionFile: () => path.join(dir, 'switched.jsonl'),
     }), 'claude-opus-5');
+    // A typed /model names the window too, so the launch spelling never merges into it:
+    // dropping [1m] by hand is a decision, and asking for it by hand is the same.
+    assert.equal(resolve('narrowed', [
+      real('claude-fable-5-1[1m]'), modelCommand('claude-fable-5-1'), stdout('Set model to Fable 5.1'), synthetic,
+    ], {}, { meta: { model: 'claude-fable-5-1[1m]' } }), 'claude-fable-5-1');
+    assert.equal(resolve('widened', [
+      real('claude-fable-5-1'), modelCommand('claude-fable-5-1[1m]'), stdout('Set model to Fable 5.1 (1M context)'), synthetic,
+    ], {}, { meta: { model: 'claude-fable-5-1' } }), 'claude-fable-5-1[1m]');
     assert.equal(resolve('switched-user-row', [
       real('claude-fable-5-1'), modelCommand('claude-opus-5'), userStdout('Set model to Opus 5'), synthetic,
     ]), 'claude-opus-5', 'the harness reply is logged as a user record in older transcripts');

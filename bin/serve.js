@@ -1277,14 +1277,17 @@ function lastModelEventInText(text, newerText = '') {
 }
 
 // lastClaudeHandoffModel over the whole file, newest slice first, so only the most recent
-// genuine assistant model can win. Returns '' only after reading back to byte zero with
-// no genuine record in the whole file; a scan cut short by the bound or by a read error
-// returns the '<unknown>' sentinel, because unread bytes are not evidence of absence.
+// genuine assistant model can win. Reports which kind of record decided it, because a
+// model a person typed and a model an assistant record reports carry different things:
+// only the latter has had its context-window suffix stripped by the API. The model is ''
+// only after reading back to byte zero with no genuine record in the whole file; a scan
+// cut short by the bound or by a read error reports the '<unknown>' sentinel, because
+// unread bytes are not evidence of absence.
 function lastClaudeHandoffModelInFile(file, deps = {}) {
   const chunkBytes = Number(deps.scanChunkBytes) || TAIL_BYTES;
   const maxBytes = Number(deps.scanMaxBytes) || HANDOFF_MODEL_SCAN_BYTES;
   let fd;
-  try { fd = fs.openSync(file, 'r'); } catch { return '<unknown>'; }
+  try { fd = fs.openSync(file, 'r'); } catch { return { model: '<unknown>', source: '' }; }
   let reachedStart = false;
   try {
     let end = fs.fstatSync(fd).size;
@@ -1299,7 +1302,7 @@ function lastClaudeHandoffModelInFile(file, deps = {}) {
     for (let chunks = 0; chunks < HANDOFF_MODEL_SCAN_CHUNKS && end > 0 && scanned < maxBytes; chunks += 1) {
       const start = Math.max(0, end - chunkBytes);
       const slice = Buffer.alloc((end - start) + carry.length);
-      try { fs.readSync(fd, slice, 0, end - start, start); } catch { return '<unknown>'; }
+      try { fs.readSync(fd, slice, 0, end - start, start); } catch { return { model: '<unknown>', source: '' }; }
       carry.copy(slice, end - start);
       scanned += end - start;
       let body = slice;
@@ -1311,14 +1314,14 @@ function lastClaudeHandoffModelInFile(file, deps = {}) {
       }
       const text = body.toString('utf8');
       const event = lastModelEventInText(text, newerText);
-      if (event && event.kind === 'assistant') return event.model;
-      if (event) return resolveLocalModelSwitch(event.args, event.following);
+      if (event && event.kind === 'assistant') return { model: event.model, source: 'assistant' };
+      if (event) return { model: resolveLocalModelSwitch(event.args, event.following), source: 'switch' };
       newerText = `${text}\n${newerText}`.slice(0, HANDOFF_MODEL_LOOKAHEAD_CHARS);
       end = start;
       if (end === 0) reachedStart = true;
     }
   } finally { fs.closeSync(fd); }
-  return reachedStart ? '' : '<unknown>';
+  return { model: reachedStart ? '' : '<unknown>', source: '' };
 }
 
 // A launch model is taken verbatim: `claude --model claude-fable-5-1[1m]` is a model this
@@ -1337,22 +1340,28 @@ const HANDOFF_ARGV_MODEL_RE = /(?:^|\s)--model(?:=|\s+)["']?([A-Za-z0-9][A-Za-z0
 // reading, a genuine record whose model is malformed, and a transcript that names nothing
 // with no launch metadata behind it all fail closed.
 function handoffCurrentModel(session, pane, processArgs, deps = {}) {
-  let model;
+  let found;
   try {
     const file = (deps.findSessionFile || findSessionFile)(session.id);
-    model = file ? (deps.lastClaudeHandoffModelInFile || lastClaudeHandoffModelInFile)(file, deps) : '';
+    found = file
+      ? (deps.lastClaudeHandoffModelInFile || lastClaudeHandoffModelInFile)(file, deps)
+      : { model: '', source: '' };
   } catch {
     // An unreadable or ambiguous transcript is not permission to guess from launch
     // metadata: the session may have switched model in-session since launch.
     return '<unknown>';
   }
-  // Launch metadata, most specific first. It is the only place the context-window
-  // variant is written down: `claude --model claude-fable-5-1[1m]` and the transcript's
-  // own `claude-fable-5-1` are the same model with different windows.
+  // Launch metadata, most specific first. It is the only place an assistant record's
+  // model cannot name the context window: `claude --model claude-fable-5-1[1m]` and the
+  // record's own `claude-fable-5-1` are the same model with different windows.
   const launch = launchModelId(pane?.meta?.model)
     || launchModelId(HANDOFF_ARGV_MODEL_RE.exec(String(processArgs || ''))?.[1]);
+  const { model, source } = found;
   if (model === '<unknown>') return model;
   if (!model) return launch || '<unknown>';
+  // A confirmed `/model` is someone naming the model and its window by hand, newer than
+  // anything the pane was launched with. It is taken exactly as typed.
+  if (source === 'switch') return model;
   if (!launch || compactModelBase(launch) !== compactModelBase(model)) {
     // A different base model means the transcript is the newer evidence — an in-session
     // /model switch is already resolved by the scan.
