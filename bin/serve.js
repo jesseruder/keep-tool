@@ -26,6 +26,7 @@ const reviewQueue = require('./review-queue.js');
 const who = require('./who.js');
 const steps = require('./steps.js');
 const alerts = require('./alerts.js');
+const agents = require('./agents.js');
 const notifications = require('./notifications.js');
 const reminders = require('./reminders.js');
 const slack = require('./slack.js');
@@ -1627,7 +1628,9 @@ const URGENT_DASHBOARD_MUTATIONS = new Set([
   '/api/run', '/api/send', '/api/setaside', '/api/transfer-session',
 ]);
 function urgentDashboardMutation(pathname) {
-  return URGENT_DASHBOARD_MUTATIONS.has(pathname) || /^\/api\/panes\/[^/]+\/(?:kill|remove)$/.test(pathname);
+  return URGENT_DASHBOARD_MUTATIONS.has(pathname) || /^\/api\/panes\/[^/]+\/(?:kill|remove)$/.test(pathname)
+    // Marking an agent's feed seen clears its badge, which only a rebuilt state shows.
+    || /^\/api\/agents\/[^/]+\/seen$/.test(pathname);
 }
 // Takes a listHostPaneResult and returns the panes to publish alongside the host
 // status that describes them: `{ ok: true }` for a list this host just answered,
@@ -6890,6 +6893,14 @@ function buildState(options = {}) {
   else try { digest = ensureDigest(); } catch (e) { process.stderr.write(`keep serve: digest failed: ${e.message}\n`); }
   const alertMeta = alerts.loadMeta(keep.ROOT);
   attachStateLines(sessions);
+  // Agent records are on disk; the reviewer's row is derived further down, once
+  // its own stats have been built. A session carrying an agent is marked here so
+  // the console can tell it apart from a working session.
+  let agentRecords = [];
+  try {
+    agentRecords = agents.records(keep.ROOT);
+    agents.applySessions(sessions, agentRecords);
+  } catch {}
   const state = {
     generatedAt: Date.now(),
     shadowDecisions: shadowDecisionSummary(),
@@ -7003,6 +7014,15 @@ function buildState(options = {}) {
   } catch {
     state.review = { events: [], stats: {} };
   }
+  // The reviewer is the first agent, derived from the stats above rather than
+  // stored: `.keep/reviewer/<id>` keeps owning the reviewer's own state, and
+  // `session.reviewer` keeps its meaning.
+  try {
+    state.agents = agents.dashboardAgents({
+      root: keep.ROOT, records: agentRecords, sessions,
+      reviewer: state.review?.stats?.reviewer || null,
+    });
+  } catch { state.agents = []; }
   return state;
 }
 

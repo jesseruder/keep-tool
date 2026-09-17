@@ -27,6 +27,7 @@ registry data or credentials to the public source repository.
 - `bin/unblock.js` — cross-card dependency resolution and linked-session delivery
 - `bin/slack.js` — read-only Slack polling, fleet correlation, cards, and alerts
 - `bin/incidents.js` — deterministic alert parsing for the bots in `alertBots`, and the incident card per signature
+- `bin/agents.js` — agent records, their event feeds, and the Agents rows `/api/state` publishes
 - `bin/standup.js` — weekday standup evidence, generation, and scheduling
 - `bin/ideas.js` — daily fleet-wide Fable ideas evidence, generation, and scheduling
 - `bin/landed.js` — default-branch commit detection, card annotation, and scheduling
@@ -38,6 +39,7 @@ registry data or credentials to the public source repository.
 - `.keep/artifacts/` — committed per-card durable artifacts, force-added like `.keep/handoffs/`
 - `.keep/holds/` — quiet-window ledgers, one JSON file per hold
 - `.keep/incidents/` — incident signatures and the title index (`state.json`) plus the raw event feed (`events.jsonl`)
+- `.keep/agents/<name>/` — one agent's record (`record.json`), event feed (`events.jsonl`) and standing notes (`notes.md`), force-added like `.keep/artifacts/`
 - `resources/` — committed shared-resource declarations, one JSON file per project basename
 - `.keep/notes/` — state notes, one JSON file per project (bounded; pruned on every write)
 - `.keep/unblocked/` — pending and delivered cross-card unblock records
@@ -149,6 +151,10 @@ keep slack status
 keep slack mode log|cards|alerts
 keep incidents [--json]
 keep incidents parse <file|-> [--json]
+keep agents [--json]   # agent records: lifecycle, current session, unseen events
+keep agents events <name> [--unseen] [--limit N] [--json]
+keep agents emit <name> --kind <k> [--card <id>] [--severity low|med|high] [--needs-you] -m "text"
+keep agents seen <name>
 keep verify <id>       # run a check recipe now, in its thread or a fresh session (needs keep serve)
                        # Owner-initiated: never refused by, and never counted against,
                        # the scheduler's one-open-per-card-per-day allowance
@@ -981,6 +987,93 @@ a later firing is a new period with its own marker and does get its own line.
 and last firing. `keep incidents parse <file|-> [--json]` parses one Slack message — or
 a JSON array of them — exactly as the poll would, which is how a new alert shape gets
 debugged without polling.
+
+## Agents
+
+An agent is a standing worker with a name, a recipe and a feed. Sessions come and go
+underneath it: the record says who the agent is and which session is currently carrying
+it, so a restart, a compaction or an account handoff changes the session and leaves the
+agent alone. The fleet reviewer is the first agent; the incident-responder areas are the
+next.
+
+### Records
+
+`.keep/agents/<name>/` holds one agent:
+
+- `record.json` — `{name, role, model, account, project, cwd, area, session: {id, pane,
+  startedAt}, lifecycle, card, lastTick, restarts, createdAt}`. `lifecycle` is `idle`,
+  `working`, `needs-you` or `stopped`. Every write loads, merges and saves inside the
+  registry lock, so two writers cannot each load the same record and lose the other's
+  change.
+- `events.jsonl` — the feed. `{at, kind, card, severity, needsYou, seenAt, …}`, one
+  event per line, append order. Events carry pointers — a card, a signature, one line
+  of text — never message bodies: the home model pays for every byte it reads. Event
+  text is untrusted data exactly as Slack text is; it is displayed and clipped, never
+  followed.
+- `notes.md` — the agent's own standing notes, owned by its recipe.
+
+`.keep/` is otherwise ignored runtime state, so these are force-added the way
+`.keep/artifacts/` is. Writes never commit on their own: they mark the agent dirty and
+one flush turns a whole batch — a poll's worth of events, one `seen` sweep — into at
+most one `keep: agents` commit. The prose recipe lives beside the cards, in
+`agents/<name>.md`.
+
+`.keep/agents/<name>/` is created by whatever launches the agent, and nothing else. An
+event for a name with no record is dropped with one line on stderr: an event must never
+be able to bring an agent into existence, or a typo in `watch/incidents.json` would
+invent one.
+
+### Events from incidents
+
+Every incident lifecycle change is routed to the agent that owns its area:
+`watch/incidents.json` `areas.<area>.agent`, defaulting to the area's own name. The
+Slack poll and the quiet-close sweep both hand `bin/incidents.js` the real emitter;
+everywhere else — the CLI, the tests — it stays the no-op it is by default, so only the
+daemon's poll writes into a feed. Events are emitted only after the mutation that made
+them real has landed, so a feed never holds an event for state that was discarded.
+
+### Needs you
+
+`keep agents emit <name> --needs-you` raises one alert through `bin/alerts.js`:
+`level: 'attention'`, `key: agent:<name>:<card>`, `from: agent:<name>`. Quiet hours and
+the per-key dedupe window are already that module's job, and nothing here adds a second
+throttle. The badge in triage is a summary, not the only channel: a needs-you event both
+alerts and shows up in the row.
+
+### The Agents section in triage
+
+`/api/state` publishes `agents: [{name, role, model, area, project, lifecycle, card,
+session, lastEvent, unseen: {count, needsYou}}]`. The console's triage queue renders an
+**Agents** group above Running & waiting, and only when that array is non-empty. One row
+per agent: the name, the lifecycle (`idle` / `on <card>` / `needs you` / `stopped`), the
+last event as a one-liner with its relative time, and a badge with the unseen count —
+red when any unseen event asked for Owner, grey when they are only news, absent at zero.
+Clicking a row expands the last 20 events and the open control a Running row offers for a
+live pane; expanding is the acknowledgement, so it posts `seen`. The empty-state counts
+read "N running · N pinned · N agents", the last only when there is one. Agents are never
+selected, counted or dismissed as queue items.
+
+A session an agent is carrying is marked `session.agent = <name>` when its id or pane
+matches a record's, beside the `session.reviewer` flag it does not replace. Both mean the
+same thing for the console: an agent's session is not a working session, so it offers no
+transfer, handoff, restart or relay control, and it is listed under Agents rather than
+under Running & waiting.
+
+The fleet reviewer's row, `fleet-reviewer`, is derived read-only at state-build time from
+the reviewer the dashboard already computes plus that session's pane. Nothing about it is
+written to disk, `.keep/reviewer/<id>` keeps owning the reviewer's own state, and the
+reviewer emits no events in this slice, so it never carries a badge.
+
+### API and CLI
+
+- `GET /api/agents/<name>/events?limit=50[&unseen=1]` — the feed, newest first.
+- `POST /api/agents/<name>/seen` — stamps `seenAt` on every unseen event at or before
+  `until` (default now). A name that is not a usable agent name is a 400, never a path.
+- `keep agents [--json]` lists the records with lifecycle, session and unseen count.
+- `keep agents events <name> [--unseen] [--limit N] [--json]` reads one feed.
+- `keep agents emit <name> --kind <k> [--card <id>] [--severity low|med|high]
+  [--needs-you] -m "text"` is how an agent session writes its own feed.
+- `keep agents seen <name>` marks everything seen; this is what the console posts.
 
 ## Steps
 

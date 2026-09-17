@@ -242,6 +242,41 @@ function routes(ctx) {
       },
     },
     {
+      method: 'GET',
+      path: /^\/api\/agents\/[^/]+\/events$/,
+      handle: async ({ req, res, url }) => {
+        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
+        const agents = require('../agents.js');
+        const name = agents.nameFromPath(url.pathname);
+        if (!name) return json(res, 400, { error: 'bad agent name' });
+        try {
+          return json(res, 200, {
+            ok: true, name,
+            events: agents.readEvents(name, {
+              root: keep.ROOT,
+              limit: Number(url.searchParams.get('limit')) || agents.DEFAULT_EVENT_LIMIT,
+              unseen: url.searchParams.get('unseen') === '1',
+            }),
+          });
+        } catch (error) { return json(res, error.status || 500, { error: error.message }); }
+      },
+    },
+    {
+      method: 'POST',
+      path: /^\/api\/agents\/[^/]+\/seen$/,
+      handle: async ({ req, res, url, body }) => {
+        const agents = require('../agents.js');
+        const name = agents.nameFromPath(url.pathname);
+        if (!name) return json(res, 400, { error: 'bad agent name' });
+        try {
+          const result = agents.markSeen(name, Number(body && body.until) || Date.now(), { root: keep.ROOT });
+          agents.flushCommits(keep.ROOT);
+          broadcast();
+          return json(res, 200, { ok: true, name, ...result });
+        } catch (error) { return json(res, error.status || 500, { error: error.message }); }
+      },
+    },
+    {
       method: 'POST',
       path: '/api/terminal-profile',
       handle: async ({ req, res, url, body }) => {
@@ -700,7 +735,9 @@ function matchRoute(list, { req, url, body }) {
   for (const route of list) {
     if (post ? route.method !== 'POST' : route.method === 'POST' || (route.method && route.method !== req.method)) continue;
     const paths = Array.isArray(route.path) ? route.path : [route.path];
-    if (!paths.includes(url.pathname)) continue;
+    // A path is an exact pathname or, where a route owns a segment it does not
+    // choose (an agent's name), the pattern that pathname must match.
+    if (!paths.some((value) => value instanceof RegExp ? value.test(url.pathname) : value === url.pathname)) continue;
     if (route.when && !route.when({ req, url, body })) continue;
     return route;
   }

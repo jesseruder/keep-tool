@@ -24,7 +24,7 @@ const SHARED_LABELS = new Set(['alertname', 'grafana_folder', 'team']);
 const DEFAULT_QUIET_MIN = 60;
 const DEFAULT_REOPEN_HOURS = 24;
 const DEFAULT_HIGH_TITLES = ['Server Faults', 'Sandbox Open Health', 'Sandbox Host Capacity'];
-const DEFAULT_AREAS = { default: { project: '', match: [], default: true, session: false, account: '' } };
+const DEFAULT_AREAS = { default: { project: '', match: [], default: true, session: false, account: '', agent: 'default' } };
 
 function readJson(file, fallback) {
   try {
@@ -122,6 +122,9 @@ function config(root = keep.ROOT) {
       default: value.default === true,
       session: value.session === true,
       account: String(value.account || ''),
+      // The agent whose feed this area's events land in. Default: the area's
+      // own name, so an area only needs this when the two differ.
+      agent: String(value.agent || name),
     };
   }
   if (!Object.keys(areas).length) Object.assign(areas, JSON.parse(JSON.stringify(DEFAULT_AREAS)));
@@ -462,8 +465,10 @@ function defaultDeps() {
     addTask: keep.addTask,
     checkinTask: keep.checkinTask,
     commitAndPush: keep.commitAndPush,
-    // Stage B replaces this with the area agent's feed. Until then every event
-    // is still written to .keep/incidents/events.jsonl.
+    // The Slack poll replaces this with agents.incidentEmitter(), which routes
+    // each event to the feed of the agent that owns its area. The default is a
+    // no-op so the CLI and the tests write only
+    // .keep/incidents/events.jsonl unless they ask for more.
     emitAgentEvent() {},
   };
 }
@@ -882,6 +887,9 @@ function sweep(options = {}, deps = {}) {
   if (closed.length && fs.existsSync(path.join(root, '.git'))) {
     try { d.commitAndPush('keep: incidents', ['tasks']); } catch {}
   }
+  // At most one `keep: agents` commit for the whole sweep, whatever the
+  // emitter wrote into the area feeds.
+  if (closed.length) { try { require('./agents.js').flushCommits(root); } catch {} }
   return closed;
 }
 

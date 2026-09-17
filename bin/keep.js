@@ -2246,6 +2246,71 @@ commands.incidents = (argv) => {
   }
 };
 
+// An agent's own way in and out of its feed. Listing and reading are free;
+// `emit` is what an agent session calls to say what it found, and `seen` is what
+// the console's Agents section posts when a row is expanded.
+commands.agents = (argv) => {
+  const agents = require('./agents.js');
+  const [subcommand, ...rest] = argv;
+
+  if (subcommand === 'events') {
+    const o = parseArgs(rest, { json: 'bool', unseen: 'bool', limit: 'str' });
+    if (o._.length !== 1) die('usage: keep agents events <name> [--unseen] [--limit N] [--json]');
+    const name = o._[0];
+    if (!agents.validName(name)) die(`bad agent name: ${name}`);
+    const events = agents.readEvents(name, { root: ROOT, unseen: o.unseen, limit: Number(o.limit) || 50 });
+    if (o.json) { console.log(JSON.stringify(events, null, 2)); return; }
+    if (!events.length) { console.log(o.unseen ? 'no unseen events' : 'no events'); return; }
+    for (const event of events) {
+      console.log(`${new Date(event.at).toLocaleString()}  ${event.kind}${event.card ? `  ${event.card}` : ''}  ${event.severity}${event.needsYou ? '  needs-you' : ''}${event.seenAt ? '' : '  (unseen)'}`);
+      const line = agents.eventLine(event);
+      if (line && line !== event.kind) console.log(`  ${line}`);
+    }
+    return;
+  }
+
+  if (subcommand === 'emit') {
+    const o = parseArgs(rest, { kind: 'str', card: 'str', severity: 'str', 'needs-you': 'bool' });
+    if (o._.length !== 1) die('usage: keep agents emit <name> --kind <k> [--card <id>] [--severity low|med|high] [--needs-you] -m "text"');
+    const name = o._[0];
+    if (!agents.validName(name)) die(`bad agent name: ${name}`);
+    if (!o.kind) die('keep agents emit needs --kind');
+    if (o.severity && !['low', 'med', 'high'].includes(o.severity)) die('--severity must be low, med or high');
+    const event = agents.emit(name, {
+      kind: o.kind, card: o.card || '', severity: o.severity || 'med',
+      needsYou: Boolean(o['needs-you']), text: o.m || '',
+    }, { root: ROOT });
+    if (!event) die(`no agent record for ${name}; nothing was written`);
+    agents.flushCommits(ROOT);
+    console.log(`${name}: ${event.kind}${event.card ? ` on ${event.card}` : ''}${event.needsYou ? ' (needs you)' : ''}`);
+    return;
+  }
+
+  if (subcommand === 'seen') {
+    const o = parseArgs(rest, { json: 'bool' });
+    if (o._.length !== 1) die('usage: keep agents seen <name>');
+    const name = o._[0];
+    if (!agents.validName(name)) die(`bad agent name: ${name}`);
+    const result = agents.markSeen(name, Date.now(), { root: ROOT });
+    agents.flushCommits(ROOT);
+    if (o.json) { console.log(JSON.stringify(result, null, 2)); return; }
+    console.log(`${name}: marked ${result.marked} event${result.marked === 1 ? '' : 's'} seen`);
+    return;
+  }
+
+  const o = parseArgs(argv, { json: 'bool' });
+  if (o._.length) die('usage: keep agents [--json] | keep agents events|emit|seen <name> …');
+  const rows = agents.records(ROOT).map((record) => agents.agentView(record, { root: ROOT }));
+  if (o.json) { console.log(JSON.stringify(rows, null, 2)); return; }
+  if (!rows.length) { console.log('no agent records'); return; }
+  for (const row of rows) {
+    const badge = row.unseen.count ? `  ${row.unseen.count} unseen${row.unseen.needsYou ? ' (needs you)' : ''}` : '';
+    console.log(`${row.name}  ${row.lifecycle}${row.card ? ` on ${row.card}` : ''}${row.session && row.session.id ? `  session ${row.session.id}` : ''}${badge}`);
+    if (row.role || row.area) console.log(`  ${[row.role, row.area && `area ${row.area}`].filter(Boolean).join(' · ')}`);
+    if (row.lastEvent) console.log(`  last: ${row.lastEvent.kind} — ${agents.eventLine(row.lastEvent)}`);
+  }
+};
+
 commands.discord = async (argv) => {
   const discord = features.load('discord');
   const [subcommand, ...rest] = argv;
@@ -2776,6 +2841,13 @@ ${stepUsage()}
   keep incidents parse <file|-> [--json]
                          # parse one Slack message (or a JSON array of them) the way the
                          # poll does — the way to debug an alert shape without polling
+  keep agents [--json]   # agent records: lifecycle, current session, unseen events
+  keep agents events <name> [--unseen] [--limit N] [--json]
+  keep agents emit <name> --kind <k> [--card <id>] [--severity low|med|high] [--needs-you] -m "text"
+                         # an agent session's own way to write its feed; --needs-you also
+                         # raises an attention alert keyed agent:<name>:<card>
+  keep agents seen <name>
+                         # mark every unseen event seen (what the console posts on expand)
   keep probe <id>      # run this card's probe now (exit 1 = failed); no check-in, no daemon
   keep verify <id>     # run this task's check recipe now, in its thread or a fresh session (needs keep serve)
   keep compact <sid>   # compact a live Claude or Codex session (needs keep serve)

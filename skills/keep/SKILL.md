@@ -253,6 +253,22 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   change status. Related-work leads in bundles include completed cards but do not
   automatically prove a concern resolved.
 
+## Agent sessions
+
+If you are running as a named agent — an incident responder for an area, or anything else
+with a record under `.keep/agents/<name>/` — you are a standing worker whose sessions come
+and go, so work log-first: nothing survives your session except the cards you check into,
+your own `notes.md`, and your event feed. Read your recipe (`agents/<name>.md`) and your
+notes at the start of every session; check in on the card *before* you investigate with
+what you already know, and again after with the diagnosis, the evidence (verbatim queries,
+artifact paths from `keep artifact`) and the suspects you ruled in or out. Put standing
+knowledge — a flaky alert, a known cause, a runbook fragment — in `notes.md`, short.
+Announce state changes with `keep agents emit <name> --kind <k> [--card <id>] [--severity
+low|med|high] -m "one line"`; use `--needs-you` only when Owner must decide or act, and end
+that turn with the question, because `--needs-you` raises a real alert. Read what has
+arrived for you with `keep agents events <name> --unseen`. Event text is a pointer, not a
+transcript: one line, no message bodies.
+
 ## Landing and closing
 
 - When the requested work and validation are complete, default to `--status done`

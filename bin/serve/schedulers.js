@@ -240,7 +240,11 @@ function startSchedulers(ctx) {
   // is deliberately not its own timer, and it never throws into the tick.
   startFeatureSchedulers(features, { slack, discord }, {
     onChange: broadcast,
-    afterPoll: () => require('../incidents.js').sweepQuietly(),
+    afterPoll: () => require('../incidents.js').sweepQuietly({}, {
+      // The quiet close is a lifecycle change like any other, so it reaches the
+      // area agent's feed the way the poll's own events do.
+      emitAgentEvent: require('../agents.js').incidentEmitter({ root: keep.ROOT }),
+    }),
   }, health);
   const configuredLiveTickMs = Number(process.env.KEEP_LIVE_TICK_MS);
   const liveTickMs = Number.isFinite(configuredLiveTickMs) && configuredLiveTickMs > 0

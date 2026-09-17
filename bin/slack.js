@@ -950,6 +950,10 @@ function defaultDeps() {
     checkinTask: keep.checkinTask,
     commitAndPush: keep.commitAndPush,
     sendAlert: alerts.sendAlert,
+    // The poll is where incident events become agent events: this is the real
+    // emitter incidents.js's no-op stands in for everywhere else. One per poll,
+    // so the area map is read once for the whole batch.
+    emitAgentEvent: require('./agents.js').incidentEmitter({ root: keep.ROOT }),
   };
 }
 
@@ -1153,6 +1157,8 @@ async function poll(options = {}) {
         if (landedAlerts.some((entry) => entry.cardId) && fs.existsSync(path.join(keep.ROOT, '.git'))) {
           deps.commitAndPush('keep: incidents', ['tasks']);
         }
+        // Whatever the emitter appended to the area feeds lands as one commit.
+        try { require('./agents.js').flushCommits(keep.ROOT); } catch {}
       }
     }
     const selectedKeys = new Set(selected.filter((choice) => choice.item === item).map((choice) => String(choice.unit.ts)));

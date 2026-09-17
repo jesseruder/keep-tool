@@ -85,6 +85,9 @@ function shared(state, view) {
     paneCount: (state.panes || []).length,
     needsCount: (state.attention || []).filter((item) => item.sessionId && HUMAN_ATTENTION_KINDS.has(item.kind) && !item.setAside).length,
     review: { stats: pick(stats, ['lastTickAt', 'reviewer']) },
+    // One short row per agent — name, lifecycle, last event, unseen count. The
+    // mobile client shows the same section the console's triage does.
+    agents: state.agents || [],
   };
 }
 
