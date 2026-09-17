@@ -14,7 +14,7 @@ import { RENAMED_HINT, installRenameControls, isEditing, renameButtonsHTML } fro
 
 const summaryCache = new Map(); // session id -> { text, fetchedAt, mtime, fresh }
 const summaryInflight = new Map();
-// Agent name -> `{ events, newest, readAt, misses }`: the last page read for an
+// Agent name -> `{ events, seq, at, read, readAt, misses }`: the last page read for an
 // agent and what that read did. Only an agent that has been opened has one;
 // /api/state carries the badge and the last event for every row, so a listed
 // agent nobody is watching costs no request. A read that fails keeps the page in
@@ -23,6 +23,9 @@ const summaryInflight = new Map();
 // instead of being asked for on every poll.
 const agentFeeds = new Map();
 const agentFeedInflight = new Set();
+// Reads are numbered so a slow answer can be recognised as one: the page from a
+// read a later one has already overtaken is dropped, whatever it holds.
+let agentFeedReads = 0;
 const LOG_EVENTS = 20;
 const FEED_RETRY_MS = 5e3;
 const FEED_RETRY_MAX_MS = 60e3;
@@ -121,17 +124,30 @@ export function agentStageItem(ctx, agent, current = null) {
   };
 }
 
+// The row an explicit selection names, or null when no group lists it. A key that
+// names nothing is a row that has left, never a licence to select its neighbour.
+export function selectedRowItem(ctx, items, selectedKey) {
+  return (selectedKey && items.find((item) => ctx.triageKey(item) === selectedKey)) || null;
+}
+
 // Where the queue's selection sits and what the stage renders for it.
 //
 // An agent is selected by its Agents row and by nothing else. Its session is not
 // a queue item: app.js's retainedSelectionItem refuses to rebuild a retained row
 // for one, so `items` never holds the pane stand-in openReviewPane leaves behind,
 // and the index is cleared here so no ordinary row can claim the selection at the
-// same time - if the same session is also listed under Recent, the Agents row
-// wins and that row is left unmarked. With no index, j/k start again from the top
-// of the queue and the number keys have nothing invisible to land on.
+// same time. With no index, j/k start again from the top of the queue and the
+// number keys have nothing invisible to land on.
+//
+// A key that names a listed row is asked first, because it is the newer fact: the
+// stage's item stays the agent's until renderStage replaces it, so j/k and a
+// click - which move the key and nothing else - would otherwise be read as the
+// agent still being selected, and Owner could never leave it. That also settles
+// the case of an agent's session listed under Recent as well: the Agents row
+// carries it until Owner selects that row by name, and then that row does.
 export function queueSelection(ctx, items, { current, selectedKey, fallback = 0, focusMode = false } = {}) {
-  const agent = focusMode ? null : agentForStage(ctx, current, ctx.sessionFor(current));
+  const chosen = selectedRowItem(ctx, items, selectedKey);
+  const agent = focusMode || chosen ? null : agentForStage(ctx, current, ctx.sessionFor(current));
   if (agent) return { agent, selected: -1, selectedKey: null, stageItem: agentStageItem(ctx, agent, current) };
   if (focusMode && !current) return { agent: null, selected: -1, selectedKey: null, stageItem: null };
   const selected = selectionIndex(items, selectedKey, current, fallback, ctx.itemKey, ctx.triageKey);
@@ -156,20 +172,44 @@ export function agentStageLogHTML(ctx, agent, events, collapsed = false) {
 }
 
 const eventAt = (at) => (typeof at === 'number' ? at : Date.parse(at) || 0);
+const eventSeq = (event) => (event && event.seq != null ? Math.max(0, Number(event.seq) || 0) : null);
 
-// What a finished read leaves behind. A refused read keeps the page in hand; a
-// page whose newest event is no newer than the one in hand - the same page again,
-// an empty one, or a late answer to an earlier read - is not news and is never
-// written over a newer one, so a slow response cannot roll the log back.
-function recordAgentFeed(name, events) {
+// Whether the feed's own summary on /api/state has outrun the page in hand.
+//
+// The feed's order is its seq, never its clock: two events written in the same
+// millisecond tie, and an incident event is stamped with the time Slack posted
+// its message, so a backfilled firing is dated before a close somebody ran a
+// minute ago. Comparing `at` would call both of those "nothing new" and leave the
+// log a page behind for good. `at` answers only for a feed written before seq
+// existed, where every event reads as seq 0.
+export function agentFeedBehind(agent, feed) {
+  const last = agent?.lastEvent;
+  if (!last || !feed?.events) return false;
+  const lastSeq = eventSeq(last);
+  return lastSeq !== null && feed.seq !== null ? lastSeq > feed.seq : eventAt(last.at) > (feed.at || 0);
+}
+
+// What a finished read leaves behind.
+//
+// A refused read keeps the page in hand: an empty log is a lie about an agent
+// that has events. A page that answers the newest read always replaces the one in
+// hand, whatever its seq - a rotated or truncated feed is the log now, and
+// refusing a lower seq for ever would freeze the column on a page that no longer
+// exists. Ordering is settled by the read counter instead: an answer that a later
+// read has already overtaken is dropped, so a slow response cannot roll the log
+// back. `misses` counts the reads that brought nothing new, which is what the
+// backoff is made of.
+function recordAgentFeed(name, events, read) {
   const previous = agentFeeds.get(name) || null;
-  const newest = events ? eventAt(events[0]?.at) : null;
-  const fresh = Boolean(events) && (!previous?.events || newest > previous.newest);
+  if (previous && read <= previous.read) return;
+  const newest = events ? events[0] || null : null;
+  const seq = events ? eventSeq(newest) : previous?.seq ?? null;
+  const at = events ? eventAt(newest?.at) : previous?.at ?? 0;
+  const same = !events || (previous?.events && seq === previous.seq && at === previous.at);
   agentFeeds.set(name, {
-    events: fresh ? events : previous?.events || null,
-    newest: fresh ? newest : previous?.newest ?? null,
-    readAt: Date.now(),
-    misses: fresh ? 0 : (previous?.misses || 0) + 1,
+    events: events || previous?.events || null,
+    seq, at, read, readAt: Date.now(),
+    misses: same ? (previous?.misses || 0) + 1 : 0,
   });
 }
 
@@ -177,10 +217,11 @@ function recordAgentFeed(name, events) {
 // failure is worth a toast storm on a background refresh, so a read that fails
 // leaves the last page standing and is retried by `agentFeedDue` instead.
 export async function openAgentFeed(ctx, name) {
+  const read = ++agentFeedReads;
   try { await api.markAgentSeen(name); } catch {}
   let events = null;
   try { events = (await api.getAgentEvents(name, LOG_EVENTS))?.events || []; } catch {}
-  recordAgentFeed(name, events);
+  recordAgentFeed(name, events, read);
   ctx.refresh();
   return agentFeed(name) || [];
 }
@@ -188,14 +229,14 @@ export async function openAgentFeed(ctx, name) {
 export function agentFeed(name) { return agentFeeds.get(name)?.events || null; }
 
 // Whether the agent on the stage needs its log read again: nothing in hand, every
-// read so far refused, or a page /api/state's last event has outrun. A read that
+// read so far refused, or a page the agent's own summary has outrun. A read that
 // brings nothing new doubles the wait up to a minute, so a feed that cannot be
 // read - or one whose file is gone while the record still remembers an event -
 // costs one request now and then rather than one per poll.
 export function agentFeedDue(agent, feed, now = Date.now()) {
   if (!feed) return true;
   const wait = Math.min(FEED_RETRY_MS * 2 ** Math.max(0, (feed.misses || 0) - 1), FEED_RETRY_MAX_MS);
-  if (feed.events && eventAt(agent?.lastEvent?.at) <= (feed.newest || 0)) return false;
+  if (feed.events && !agentFeedBehind(agent, feed)) return false;
   return now - (feed.readAt || 0) >= wait;
 }
 
@@ -224,7 +265,14 @@ function openAgent(ctx, name) {
   if (!agent) return;
   void readAgentFeed(ctx, name);
   const live = agentLivePane(ctx, agent);
-  if (live) { ctx.openReviewPane(live); return; }
+  if (live) {
+    // openReviewPane leaves a pane stand-in behind to hold the selection until
+    // the pane grows a running row of its own. An agent's pane never does - its
+    // Agents row is the listing - so the stand-in is spent the moment it is made,
+    // rather than left to answer for a pane Owner has since navigated away from.
+    if (ctx.openReviewPane(live)) ctx.state.paneTarget = null;
+    return;
+  }
   if (agent.session?.id) { ctx.openReviewSession?.(agent.session.id); return; }
   ctx.toast?.(`${name} has no session to open`);
 }
@@ -314,12 +362,15 @@ function shellProject(ctx) {
   const projects = ctx.knownProjects();
   const fallback = projects.find((project) => project.key === 'keep') || ctx.projectOf('~/keep');
   if (ctx.state.filter) return projects.find((project) => project.key === ctx.state.filter) || fallback;
-  // The rail renders before the queue reconciles the numeric index, so trust the
-  // key. A selection with no row of its own - an agent's, or focus mode's - has
-  // no index either, so the stage's own item answers for it.
+  // The rail renders before the queue reconciles the numeric index, so it follows
+  // queueSelection's order rather than the index, which is still the previous
+  // selection's: the key when a row answers to it, then the stage's own item when
+  // that is an agent - an agent has no row and no index - and only then the index.
   const items = ctx.triageItems();
-  const item = (ctx.state.selectedKey && items.find((candidate) => ctx.triageKey(candidate) === ctx.state.selectedKey))
-    || items[ctx.state.selected] || ctx.state.currentItem;
+  const current = ctx.state.currentItem;
+  const item = selectedRowItem(ctx, items, ctx.state.selectedKey)
+    || (agentForStage(ctx, current, ctx.sessionFor(current)) ? current : null)
+    || items[ctx.state.selected] || current;
   const projectPath = item?.project || ctx.sessionFor(item)?.project;
   if (!projectPath) return fallback;
   const selected = ctx.projectOf(projectPath);

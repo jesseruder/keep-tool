@@ -194,9 +194,10 @@ test('an agent’s pane is carried by its Agents row, never by a queue index', a
     'the stage renders the agent’s own session, not the pane stand-in');
   assert.equal(opened.stageItem.title, 'sandboxes agent');
 
-  // The same session listed under Recent must not take the selection from the
-  // Agents row: exactly one of them is marked, and it is the Agents row.
-  const listed = queueSelection(ctx, [waiting, recentAgentRow], { current: recentAgentRow, selectedKey: 'recent:sess-1' });
+  // The agent's session is also listed under Recent, and the render that follows
+  // opening it carries no key: the Agents row keeps the selection and that row is
+  // left unmarked, so only one row is ever marked for one terminal.
+  const listed = queueSelection(ctx, [waiting, recentAgentRow], { current: opened.stageItem, selectedKey: null, fallback: -1 });
   assert.equal(listed.agent?.name, 'sandboxes');
   assert.equal(listed.selected, -1);
   assert.equal(listed.selectedKey, null);
@@ -206,6 +207,31 @@ test('an agent’s pane is carried by its Agents row, never by a queue index', a
   const dead = ctxFor({ agents: [QUIET_ROW], sessions: [agentSession], panes: [{ id: 'pane-1', alive: false }] });
   assert.equal(dead.data.agents.length, 1);
   assert.equal(queueSelection(dead, [], { current: { kind: 'running', pane: 'pane-1' } }).stageItem.kind, 'recent');
+
+  // Leaving the agent: j/k and a click move the key alone, and `current` stays
+  // the agent's until the stage is rendered again. The key wins, or Owner could
+  // never navigate out of an agent at all.
+  const left = queueSelection(ctx, [waiting, recentAgentRow], {
+    current: opened.stageItem, selectedKey: 'waiting:sess-2', fallback: -1,
+  });
+  assert.equal(left.agent, null, 'the Agents row is no longer the selection');
+  assert.equal(left.selected, 0);
+  assert.equal(left.selectedKey, 'waiting:sess-2');
+  assert.equal(left.stageItem, waiting);
+
+  // Selecting the agent's own Recent listing by name is the same rule: that row
+  // is what Owner picked, so it carries the selection instead of the Agents row.
+  const picked = queueSelection(ctx, [waiting, recentAgentRow], {
+    current: opened.stageItem, selectedKey: 'recent:sess-1', fallback: -1,
+  });
+  assert.equal(picked.agent, null);
+  assert.equal(picked.selected, 1);
+  assert.equal(picked.stageItem, recentAgentRow);
+
+  // A key that names nothing - a row that has left - is not a way out: the agent
+  // on the stage keeps the selection rather than handing it to a neighbour.
+  assert.equal(queueSelection(ctx, [waiting], { current: opened.stageItem, selectedKey: 'recent:gone' }).agent?.name,
+    'sandboxes');
 
   // An ordinary selection is untouched: the row keeps its index and the stage
   // keeps rendering it.
@@ -256,23 +282,38 @@ test('opening a row marks the feed seen and then reads it', async () => {
   assert.equal(agentFeed('never-read'), null, 'a failed read is not a read that returned nothing');
 });
 
-test('a feed is re-read when it falls behind, and backs off when it brings nothing', async () => {
-  const { agentFeedDue } = await import('./triage.js');
+test('a feed is re-read when it falls behind, by seq, and backs off when it brings nothing', async () => {
+  const { agentFeedDue, agentFeedBehind } = await import('./triage.js');
   const quiet = { ...QUIET_ROW, lastEvent: null };
-  const busy = { ...QUIET_ROW, lastEvent: { at: 900, kind: 'diagnosed', text: 'host pool is full' } };
-  const page = (at, misses = 0, readAt = 1000) => ({ events: [{ at }], newest: at, readAt, misses });
+  const busy = { ...QUIET_ROW, lastEvent: { at: 900, seq: 7, kind: 'diagnosed', text: 'host pool is full' } };
+  const page = (seq, at, misses = 0, readAt = 1000) => ({ events: [{ seq, at }], seq, at, readAt, misses });
+
+  // The feed's order is its seq. Two events can share a millisecond, and an
+  // incident event carries the time Slack posted it, so an event written after
+  // the page in hand can be dated before it - and `at` would call it old news.
+  assert.equal(agentFeedBehind(busy, page(7, 900)), false, 'the page already has that event');
+  assert.equal(agentFeedBehind(busy, page(6, 900)), true, 'a tie on the clock is still a new event');
+  assert.equal(agentFeedBehind(busy, page(6, 4000)), true, 'and so is one dated before the page in hand');
+  assert.equal(agentFeedBehind(busy, page(8, 100)), false, 'a page ahead of the summary is not behind it');
+  // A feed written before seq existed reads as seq 0 throughout; the clock is all
+  // there is, and it still answers.
+  const legacy = { ...QUIET_ROW, lastEvent: { at: 900, kind: 'diagnosed' } };
+  assert.equal(agentFeedBehind(legacy, { events: [{ at: 100 }], seq: null, at: 100, readAt: 0, misses: 0 }), true);
+  assert.equal(agentFeedBehind(legacy, { events: [{ at: 900 }], seq: null, at: 900, readAt: 0, misses: 0 }), false);
+  assert.equal(agentFeedBehind(busy, { events: null, seq: null, at: 0, readAt: 0, misses: 1 }), false,
+    'a feed with no page is not behind; it has never been read');
 
   assert.equal(agentFeedDue(busy, null), true, 'nothing in hand is always due');
-  assert.equal(agentFeedDue(busy, page(900), 99e3), false, 'a page that has the last event is not re-read');
-  assert.equal(agentFeedDue(quiet, { events: [], newest: 0, readAt: 1000, misses: 0 }, 99e3), false,
+  assert.equal(agentFeedDue(busy, page(7, 900), 99e3), false, 'a page that has the last event is not re-read');
+  assert.equal(agentFeedDue(quiet, { events: [], seq: null, at: 0, readAt: 1000, misses: 0 }, 99e3), false,
     'an agent with no events has nothing to re-read');
-  assert.equal(agentFeedDue(busy, page(100, 0, 1000), 4e3), false, 'behind, but inside the throttle');
-  assert.equal(agentFeedDue(busy, page(100, 0, 1000), 6.1e3), true, 'behind, and the throttle has passed');
+  assert.equal(agentFeedDue(busy, page(6, 100, 0, 1000), 4e3), false, 'behind, but inside the throttle');
+  assert.equal(agentFeedDue(busy, page(6, 100, 0, 1000), 6.1e3), true, 'behind, and the throttle has passed');
 
   // A read that failed, or one that came back with nothing new, doubles the wait
   // up to a minute: an unreadable feed costs one request now and then, never one
   // per poll, and it is never given up on.
-  const failed = { events: null, newest: null, readAt: 1000, misses: 3 };
+  const failed = { events: null, seq: null, at: 0, readAt: 1000, misses: 3 };
   assert.equal(agentFeedDue(busy, failed, 1000 + 19e3), false);
   assert.equal(agentFeedDue(busy, failed, 1000 + 21e3), true);
   assert.equal(agentFeedDue(busy, { ...failed, misses: 99 }, 1000 + 59e3), false, 'the wait is capped');
@@ -280,22 +321,21 @@ test('a feed is re-read when it falls behind, and backs off when it brings nothi
   // An empty page an agent's last event has outrun is the same case: the feed
   // file may be gone while the record still remembers. It backs off; it does not
   // spin.
-  assert.equal(agentFeedDue(busy, { events: [], newest: 0, readAt: 1000, misses: 4 }, 1000 + 39e3), false);
-  assert.equal(agentFeedDue(busy, { events: [], newest: 0, readAt: 1000, misses: 4 }, 1000 + 41e3), true);
+  assert.equal(agentFeedDue(busy, { events: [], seq: null, at: 0, readAt: 1000, misses: 4 }, 1000 + 39e3), false);
+  assert.equal(agentFeedDue(busy, { events: [], seq: null, at: 0, readAt: 1000, misses: 4 }, 1000 + 41e3), true);
 });
 
-test('a second read for the same agent waits for the first, and a late one cannot roll the log back', async () => {
+test('a second read for the same agent waits for the first', async () => {
   const calls = [];
-  let events = [{ at: 500, kind: 'diagnosed', card: 'inc-one', text: 'host pool is full' }];
   let release;
   const gate = new Promise((resolve) => { release = resolve; });
   globalThis.fetch = async (url, options = {}) => {
     calls.push(`${options.method || 'GET'} ${String(url).includes('/events') ? 'events' : 'seen'}`);
     if (String(url).includes('/events')) await gate;
-    return new Response(JSON.stringify({ ok: true, name: 'sandboxes', events }),
+    return new Response(JSON.stringify({ ok: true, name: 'sandboxes', events: [{ seq: 4, at: 500, kind: 'diagnosed', text: 'host pool is full' }] }),
       { status: 200, headers: { 'content-type': 'application/json' } });
   };
-  const { readAgentFeed, openAgentFeed, agentFeed } = await import(`./triage.js?inflight=${Date.now()}`);
+  const { readAgentFeed, agentFeed } = await import(`./triage.js?inflight=${Date.now()}`);
   const ctx = ctxFor({ agents: [QUIET_ROW] });
 
   // openAgent and the render it causes both ask; one round trip answers both.
@@ -305,16 +345,48 @@ test('a second read for the same agent waits for the first, and a late one canno
   await first;
   assert.deepEqual(calls, ['POST seen', 'GET events'], 'one seen/events round trip, not two');
   assert.deepEqual(agentFeed('sandboxes').map((event) => event.at), [500]);
+});
 
-  // A late answer carrying an older page is not news; the newer page stands.
-  const newer = [{ at: 900, kind: 'diagnosed', text: 'pool drained' }];
-  events = newer;
+test('a rotated feed replaces the page in hand, and a late answer never does', async () => {
+  const pages = [];
+  const gates = [];
+  let reads = 0;
+  const json = (body) => new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
+  globalThis.fetch = async (url) => {
+    if (!String(url).includes('/events')) return json({ ok: true, name: 'sandboxes', marked: 0 });
+    const index = reads++;
+    await gates[index];
+    return json({ ok: true, name: 'sandboxes', events: pages[index] });
+  };
+  const { openAgentFeed, agentFeed } = await import(`./triage.js?rotate=${Date.now()}`);
+  const ctx = ctxFor({ agents: [QUIET_ROW] });
+
+  pages.push([{ seq: 9, at: 900, kind: 'diagnosed', text: 'pool drained' }]);
+  gates.push(Promise.resolve());
   await openAgentFeed(ctx, 'sandboxes');
-  assert.deepEqual(agentFeed('sandboxes').map((event) => event.at), [900]);
-  events = [{ at: 500, kind: 'diagnosed', card: 'inc-one', text: 'host pool is full' }];
+  assert.deepEqual(agentFeed('sandboxes').map((event) => event.seq), [9]);
+
+  // A feed that has rotated or been truncated is the log now. Refusing a lower
+  // seq would leave the column on a page that no longer exists.
+  pages.push([{ seq: 3, at: 300, kind: 'diagnosed', text: 'all that is left' }]);
+  gates.push(Promise.resolve());
   await openAgentFeed(ctx, 'sandboxes');
-  assert.deepEqual(agentFeed('sandboxes').map((event) => event.at), [900],
-    'an older page is a late answer to an earlier read, never news');
+  assert.deepEqual(agentFeed('sandboxes').map((event) => event.seq), [3], 'the read that answered last is the log');
+
+  // Ordering is settled by which read answered last, not by what it holds: an
+  // answer a later read has overtaken is dropped whatever its seq.
+  let releaseSlow;
+  gates.push(new Promise((resolve) => { releaseSlow = resolve; }));
+  pages.push([{ seq: 3, at: 300, kind: 'diagnosed', text: 'a late answer' }]);
+  gates.push(Promise.resolve());
+  pages.push([{ seq: 11, at: 1100, kind: 'diagnosed', text: 'the newest page' }]);
+  const slow = openAgentFeed(ctx, 'sandboxes');
+  const quick = openAgentFeed(ctx, 'sandboxes');
+  await quick;
+  assert.deepEqual(agentFeed('sandboxes').map((event) => event.seq), [11]);
+  releaseSlow();
+  await slow;
+  assert.deepEqual(agentFeed('sandboxes').map((event) => event.seq), [11], 'the late answer is not the log');
 });
 
 test('an agent’s session loses the four controls and is not listed under Running', async () => {

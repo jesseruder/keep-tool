@@ -445,6 +445,14 @@ function eventSummary(event) {
   if (!event || typeof event !== 'object' || Array.isArray(event)) return null;
   return {
     at: Number(event.at || 0) || 0,
+    // The feed's order is its seq, not its clock: two events can share a
+    // millisecond and an incident event is stamped with the time Slack posted
+    // it, so a backfilled one is dated before an event written after it. A
+    // reader holding a page — the console's agent log — compares this against the
+    // seq of the newest event it has, and a summary that carried only `at` would
+    // tell it a tied or backdated event is nothing new. 0 is a feed written
+    // before seq existed.
+    seq: Math.max(0, Number(event.seq || 0) || 0),
     kind: oneLine(event.kind || '', 60),
     card: oneLine(event.card || '', 120),
     severity: SEVERITIES.has(event.severity) ? event.severity : 'med',

@@ -1168,7 +1168,11 @@ alerts and shows up in the row.
 ### The Agents section in triage
 
 `/api/state` publishes `agents: [{name, role, model, area, project, lifecycle, card,
-session, lastEvent, unseen: {count, needsYou, truncated?}}]`. The console's triage queue
+session, lastEvent, unseen: {count, needsYou, truncated?}}]`. The `lastEvent` summary
+carries the event's `seq` beside its `at`, because a reader holding a page of the feed
+asks it whether that page is behind, and that is a question only `seq` answers: two
+events can share a millisecond, and an incident event is stamped with the time Slack
+posted it, so one written after the page in hand can be dated before it. The console's triage queue
 renders an
 **Agents** group under Running & waiting and above Pinned, and only when that array is
 non-empty. The group is not gated on the Running toggle: collapsing the working sessions
@@ -1189,9 +1193,20 @@ is an agent's or the reviewer's (and spends the pane stand-in `openReviewPane` l
 behind), so neither `triageItems()` nor the queue's own list ever carries an invisible
 last item for `j`/`k` or the number keys to land on. `queueSelection` then clears the
 index: the Agents row is the only row marked `.sel`, and if the same session is also
-listed under Recent that row stays unmarked — the Agents row wins. With no index, `j`/`k`
+listed under Recent that row stays unmarked. With no index, `j`/`k`
 start again from the top of the queue, and the stage renders `stageItem` instead of
 `active[selected]`, the way focus mode renders the item it is holding.
+
+`queueSelection` asks `selectedKey` before it asks the stage's item, and only a key a
+group actually lists counts (`selectedRowItem`). That is what lets Owner leave an agent:
+`j`, `k` and a click move the key and nothing else — `state.currentItem` stays the agent's
+until `renderStage` replaces it — so reading the item first would detect the same agent on
+the next render and clear the index again, for ever. It also settles the Recent listing of
+an agent's own session: the Agents row carries it until Owner selects that row by name,
+and then that row does. A key that names nothing is a row that has left, not a licence to
+select its neighbour, so the agent keeps the stage. `shellProject` follows the same order
+for the rail's New session button, because `renderRail` runs before the queue reconciles
+the index and would otherwise bind it to the previous selection's project.
 `agentForStage(ctx, item, session)` decides whose work is on the stage: it matches the
 pane against `agent.session.pane` first across every agent, because that is the terminal
 actually on screen and a record an in-place restart has moved on from may still name the
@@ -1210,13 +1225,21 @@ control alone, remembered in `localStorage` under `keep-agent-log-collapsed`.
 Reads all go through `readAgentFeed`, which allows one per agent at a time: a click and
 the render it causes must not each post `seen` and read the feed, and two reads in flight
 can land out of order. `agentFeedDue` decides when to read again — nothing in hand, every
-read so far refused, or a page `/api/state`'s last event has outrun — and a read that
-brings nothing new (a refusal, the same page again, or an empty one while the record still
-remembers an event) doubles the wait from five seconds up to a minute, so an unreadable
-feed costs one request now and then rather than one per poll, and is never given up on. A
-refused read keeps the page in hand rather than caching an empty one: an empty log is a lie
-about an agent that has events. A page whose newest event is no newer than the one in hand
-is never written over it, so a late answer to an earlier read cannot roll the log back.
+read so far refused, or a page the row's own `lastEvent` has outrun (`agentFeedBehind`) —
+and a read that brings nothing new (a refusal, the same page again, or an empty one while
+the record still remembers an event) doubles the wait from five seconds up to a minute, so
+an unreadable feed costs one request now and then rather than one per poll, and is never
+given up on. A refused read keeps the page in hand rather than caching an empty one: an
+empty log is a lie about an agent that has events.
+
+"Behind" is decided by `seq`, falling back to `at` only for a feed written before `seq`
+existed (everything in it reads as `seq: 0`). Comparing clocks would call a tied or
+backdated event nothing new and leave the column a page behind for good. A page that
+answers the newest read always replaces the one in hand, whatever its `seq`: a rotated or
+truncated feed is the log now, and refusing a lower `seq` for ever would freeze the column
+on a page that no longer exists. Ordering is settled by a read counter instead — an answer
+a later read has already overtaken is dropped — so a slow response cannot roll the log
+back without also refusing a rotation.
 
 The empty-state counts
 read "N running · N pinned · N agents", the last only when there is one. Agents are never

@@ -325,7 +325,7 @@ test('the record tracks the feed’s end, so a state build never opens events.js
     const record = agents.readRecord('sandboxes', root);
     assert.deepEqual(record.unseen, { count: 2, needsYou: true });
     assert.deepEqual(record.lastEvent, {
-      at: 2000, kind: 'needs-you', card: 'inc-one', severity: 'med', needsYou: true, text: 'raise the cap?',
+      at: 2000, seq: 2, kind: 'needs-you', card: 'inc-one', severity: 'med', needsYou: true, text: 'raise the cap?',
     });
     assert.equal(Object.hasOwn(record.lastEvent, 'seenAt'), false, 'the row needs a summary, not the event');
 
@@ -755,6 +755,14 @@ test('the reviewer is derived from the reviewer field, never written, and never 
     assert.equal(sandboxes.lastEvent.kind, 'needs-you');
     assert.equal(sandboxes.lastEvent.text, 'raise the cap?');
     assert.equal(sandboxes.lastEvent.at, 8000);
+    // The console's agent log holds a page of the feed and asks this row whether
+    // it has fallen behind. That question is answered by seq, because two events
+    // can share a millisecond and a backfilled incident is dated before an event
+    // written after it — so the row publishes the seq, not only the clock.
+    assert.equal(sandboxes.lastEvent.seq, 1);
+    agents.emit('sandboxes', { kind: 'diagnosed', card: 'inc-one', at: 10, text: 'backdated' }, { root, now: 9000 });
+    assert.equal(agents.dashboardAgents({ root }).find((row) => row.name === 'sandboxes').lastEvent.seq, 2,
+      'an event dated before the one in hand is still newer, and says so');
     assert.equal(agents.dashboardAgents({ root: path.join(root, 'nothing-here') }).length, 0);
   } finally { cleanup(root); }
 });
