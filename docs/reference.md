@@ -1355,15 +1355,34 @@ good at.
 
 A `confirmed` batch the cursor has not passed can only mean the write that would have
 moved the cursor never landed, so the cursor moves on the next tick and nothing is typed.
+It is left on the record rather than cleared — it is the record of what was last
+delivered — which is why the restart guard counts only a batch whose state is not
+`confirmed` as outstanding work. Counting every `pendingDelivery` meant the first
+successful delivery pinned the session open for good.
+
 A `sending` batch being retried is asked about one more thing first: a send that *was*
 confirmed finishes the transport's journal, so a daemon that died in the moment between
 the transport returning and our state write leaves nothing for the journal to recognise —
-and the transcript is the remaining witness. `transcriptShows` (wired from
-`delivery.received` over the session's transcript) is asked once per stuck batch, on a
-retry only, because it scans a transcript; if it finds the text the cursor advances with
-nothing typed, and if it does not, the send goes ahead. `deliveryKey` stays
-`agent:<name>:seq:<firstSeq>-<lastSeq>` so the transport's own journal identity is stable
-across the retry.
+and the transcript is the remaining witness. `transcriptShows` (`delivery.received` over
+the session's transcript, shared by `area-session.js` and wired into both the daemon tick
+and `keep incidents session`) is asked once per stuck batch, on a retry only, because it
+scans a transcript.
+
+That check is **not optional**. When it is missing, throws, or answers anything other
+than a plain yes or no, the tick defers with one line on stderr and leaves the batch
+`sending`: without an answer there is no way to tell a batch that arrived from one that
+never did, and both guesses are wrong in their own way — typing doubles the message,
+acknowledging loses it. A tick that could not be wired for recovery is a tick that must
+not retry.
+
+And what it matches has to be specific to one batch, which is why **every delivered
+message carries its own key on its first line**: `[keep] delivery
+agent:<name>:seq:<firstSeq>-<lastSeq>`. Two batches can render identically — the same
+event re-emitted, a single event whose line matches one delivered an hour ago — and an
+older entry in the transcript would then answer for a newer batch, acknowledging events
+that were never sent. With the key in the message, a transcript entry can only ever
+answer for itself. The same key is `deliveryKey`, so the transport's own journal identity
+is stable across a retry.
 
 Only a transcript-confirmed result counts as delivered. `delivery.deliver` also reports
 `assumed-delivered`: its journal expired with the text known to have reached the pane and
