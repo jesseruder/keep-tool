@@ -248,6 +248,64 @@ test('writes go out in the order they were made: an emoji blur followed by Clear
   assert.deepEqual(order, [{ emoji: '🔥' }, { color: null, emoji: null }]);
 });
 
+test('a write that fails behind a newer one does not undo the newer belief', async () => {
+  const { installMarkControls, markControlsHTML } = await import('./session-mark.js');
+  const gates = [];
+  const writes = [];
+  const menu = new FakeMenu(markControlsHTML(esc, 'mid', { color: 'red' }));
+  const setMark = (sessionId, patch) => new Promise((resolve, reject) => {
+    writes.push(patch);
+    gates.push({ resolve: () => resolve({ ok: true }), reject: () => reject(new Error('bad emoji')) });
+  });
+  installMarkControls(menu, { esc, toast() {} }, 'mid', { color: 'red' }, setMark);
+
+  // A: 🔥, then B: 🚀 while A is still in flight; A fails, B lands.
+  menu.emoji.value = '🔥';
+  menu.emoji.keydown('Enter');
+  menu.emoji.value = '🚀';
+  menu.emoji.keydown('Enter');
+  await settle();
+  gates.shift().reject();
+  await settle();
+  gates.shift().resolve();
+  await settle();
+  assert.deepEqual(writes, [{ emoji: '🔥' }, { emoji: '🚀' }]);
+  // The belief is B's value, so B's own blur is not a third write.
+  menu.emoji.blur();
+  await settle();
+  assert.equal(writes.length, 2, 'A failing did not roll the field back to what it was before A');
+});
+
+test('the queue and the belief outlive a re-render while a write is still in flight', async () => {
+  const { installMarkControls, markControlsHTML } = await import('./session-mark.js');
+  const gates = [];
+  const order = [];
+  const setMark = (sessionId, patch) => new Promise((resolve) => { gates.push(() => { order.push(patch); resolve({ ok: true }); }); });
+  const first = new FakeMenu(markControlsHTML(esc, 'again', null));
+  installMarkControls(first, { esc }, 'again', null, setMark);
+  first.swatch('green').click();
+  await settle();
+
+  // The reload re-renders the menu with the daemon's (still unmarked) answer
+  // while the green write is still on its way.
+  const second = new FakeMenu(markControlsHTML(esc, 'again', null));
+  installMarkControls(second, { esc }, 'again', null, setMark);
+  second.emoji.value = '🔥';
+  second.emoji.keydown('Enter');
+  await settle();
+  assert.equal(gates.length, 1, 'the emoji write queues behind the in-flight color write');
+  // The belief kept the optimistic green: clicking green again takes it off rather than setting it.
+  second.swatch('green').click();
+  await settle();
+  gates.shift()();
+  await settle();
+  gates.shift()();
+  await settle();
+  gates.shift()();
+  await settle();
+  assert.deepEqual(order, [{ color: 'green' }, { emoji: '🔥' }, { color: null }]);
+});
+
 test('installing on every render leaves one handler per control', async () => {
   const { menu, writes } = await wired(null, { installs: 3 });
   menu.swatch('red').click();

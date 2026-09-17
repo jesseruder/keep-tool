@@ -76,7 +76,7 @@ test('normalizeEmoji takes exactly one emoji and nothing else', () => {
   }
   // A text symbol without the selector, a bare keycap digit, and a heart typed
   // without its presentation selector are text, not emoji.
-  for (const value of ['a', '1', '!', '©', '1⃣', `${FIRE}${FIRE}`, 'fire', '', '   ', '\t', 'ab', null, undefined, 12, {}]) {
+  for (const value of ['a', '1', '!', '©', '1⃣', '❤', `${FIRE}${FIRE}`, 'fire', '', '   ', '\t', 'ab', null, undefined, 12, {}]) {
     assert.equal(marks.normalizeEmoji(value), null, `${JSON.stringify(value)} is not one emoji`);
   }
   // A cluster longer than the cap is refused before the segmenter sees it.
