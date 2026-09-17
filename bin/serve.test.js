@@ -6267,6 +6267,8 @@ test('API state adds an alive Codex host session omitted by the transcript windo
     kind: 'codex', project: '/from/meta', pane: 'pane-codex-old',
     hostOnly: true, stalled: undefined, taskId: 'owned-card',
   });
+  assert.ok(Number.isInteger(state.sessions[0].num) && state.sessions[0].num >= 1,
+    'a host-only row is numbered like every scanned session');
   assert.equal(state.attention[0].pane, 'pane-codex-old');
 });
 
@@ -6278,7 +6280,9 @@ test('API state synthesizes a minimal session when a host transcript lookup find
     meta: { sessionId: 'missing-rollout', agent: 'codex', title: 'Pane title' },
   }] } : {});
   await addHostSessionState(state, { host, codexSessionFor: () => null });
-  assert.deepEqual(state.sessions[0], {
+  const { num, ...synthesized } = state.sessions[0];
+  assert.ok(Number.isInteger(num) && num >= 1, 'even a synthesized host row is numbered');
+  assert.deepEqual(synthesized, {
     id: 'missing-rollout', kind: 'codex', project: '/pane/fallback', title: 'Pane title',
     lastUser: '', lastAssistant: '', lastAssistantFull: '', mtime: Date.parse(createdAt),
     size: 0, endedTurn: true, state: 'recent', pane: 'pane-missing', hostOnly: true,

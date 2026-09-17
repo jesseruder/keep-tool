@@ -6812,6 +6812,9 @@ function backfillHostSessions(sessions, panes, deps = {}) {
     } catch {}
   }
   sessions.sort((a, b) => (Number(b.mtime) || 0) - (Number(a.mtime) || 0));
+  // Host-only rows join after scanSessions numbered the rest, so number them here;
+  // the registry hands a known session its old number and a new one the next.
+  if (added.length) sessionNumbers.assign(added, { root: deps.root || keep.ROOT });
   return added;
 }
 
