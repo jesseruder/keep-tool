@@ -11,6 +11,7 @@ const test = require('node:test');
 const {
   parseClassification, fleetContext, computeSuspects, foldThreads, buildPrompt,
   messageForPrompt, messageBody, parseClaudeCapabilities, classifierArgs, classify, slackCardId, cardTitle,
+  config, whoamiDomain, workspaceDomain,
 } = require('./slack.js');
 const { profileEnvironment } = require('./agent-launcher.js');
 
@@ -115,6 +116,58 @@ test('classifier selects the Slack automation account and isolates its spawned e
   assert.deepEqual(launched.args.slice(0, 8), [
     '-p', 'classify fixture', '--session-id', 'classifier-session', '--model', 'haiku', '--output-format', 'json',
   ]);
+});
+
+test('the workspace domain is read from whatever shape whoami returns', () => {
+  // What the live tool actually returns: `team` is a plain string and the only
+  // domain in the answer is inside `url`.
+  assert.equal(whoamiDomain({
+    user: 'jesse', user_id: 'UFPCSGWEP', team: 'Castle', team_id: 'TFP1M7GLS',
+    url: 'https://castle-xyz.slack.com/', token_type: 'user (acts as you)',
+  }), 'castle-xyz');
+  assert.equal(whoamiDomain({ domain: 'example' }), 'example');
+  assert.equal(whoamiDomain({ domain: 'example.slack.com' }), 'example');
+  assert.equal(whoamiDomain({ team_domain: 'https://example.slack.com/' }), 'example');
+  assert.equal(whoamiDomain({ team: { domain: 'example' } }), 'example');
+  assert.equal(whoamiDomain({ team: 'Castle' }), '');
+  assert.equal(whoamiDomain({}), '');
+  assert.equal(whoamiDomain(null), '');
+});
+
+test('an empty domain answer is never cached, and the configured domain wins', async () => {
+  // A cached "" is what pinned every permalink to empty: the key was present,
+  // falsy, and rewritten on every poll.
+  const cursors = {};
+  let calls = 0;
+  const empty = async () => { calls += 1; return { user: 'jesse', team: 'Castle' }; };
+  assert.equal(await workspaceDomain(cursors, empty), '');
+  assert.equal('workspaceDomain' in cursors, false);
+  assert.equal(calls, 1);
+
+  // So a later poll asks again rather than living with the empty answer.
+  const found = async () => { calls += 1; return { url: 'https://castle-xyz.slack.com/' }; };
+  assert.equal(await workspaceDomain(cursors, found), 'castle-xyz');
+  assert.equal(cursors.workspaceDomain, 'castle-xyz');
+  assert.equal(calls, 2);
+  // And once it is known, no further lookup.
+  assert.equal(await workspaceDomain(cursors, async () => { throw new Error('should not be called'); }), 'castle-xyz');
+
+  // The configured domain short-circuits the lookup entirely.
+  const fresh = {};
+  assert.equal(await workspaceDomain(fresh, async () => { throw new Error('should not be called'); }, 'configured'), 'configured');
+  assert.equal('workspaceDomain' in fresh, false);
+});
+
+test('watch/slack.json can pin the workspace domain as a host or a url', (t) => {
+  const root = require('./keep.js').ROOT;
+  const file = path.join(root, 'watch', 'slack.json');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  t.after(() => fs.rmSync(file, { force: true }));
+  assert.equal(config().domain, '');
+  fs.writeFileSync(file, JSON.stringify({ channels: ['#errors'], domain: 'https://castle-xyz.slack.com/' }));
+  assert.equal(config().domain, 'castle-xyz');
+  fs.writeFileSync(file, JSON.stringify({ channels: ['#errors'], domain: 'castle-xyz' }));
+  assert.equal(config().domain, 'castle-xyz');
 });
 
 test('Slack bug ids and titles are deterministic and sanitized', () => {

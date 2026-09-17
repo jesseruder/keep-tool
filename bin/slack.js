@@ -74,6 +74,11 @@ function config() {
     // an empty map (the default) leaves every message on the classifier path.
     // Example: {"B06PX3MFG5C": "ghost-server", "B0C1KEHNH8F": "castle-sandboxes"}
     alertBots: incidents.normalizeAlertBots(value.alertBots),
+    // The workspace domain permalinks are built from ("castle-xyz" in
+    // https://castle-xyz.slack.com/...). Optional: when it is set it wins over
+    // the slack_whoami lookup, which is worth setting if that tool's answer
+    // ever stops carrying a domain. A full url or host is accepted.
+    domain: workspaceHost(value.domain),
   };
 }
 
@@ -753,12 +758,42 @@ function fleetInput(now = Date.now()) {
   };
 }
 
-async function workspaceDomain(cursors, call = callSlack) {
+// `castle-xyz` out of anything Slack might hand us: a bare domain, a
+// `<domain>.slack.com` host, or a full workspace url.
+function workspaceHost(value) {
+  return String(value == null ? '' : value).trim()
+    .replace(/^https?:\/\//, '')
+    .replace(/\/.*$/, '')
+    .replace(/\.slack\.com$/i, '');
+}
+
+// The whoami shape varies by build: some return `domain` or `team_domain`, some
+// a `team` object carrying one, and the live tool returns `team` as a plain
+// string with the domain only in `url`. Read all of them.
+function whoamiDomain(who) {
+  const team = who && who.team;
+  for (const candidate of [
+    who && who.domain,
+    who && who.team_domain,
+    team && typeof team === 'object' ? team.domain : '',
+    who && who.url,
+  ]) {
+    const host = workspaceHost(candidate);
+    if (host) return host;
+  }
+  return '';
+}
+
+async function workspaceDomain(cursors, call = callSlack, configured = '') {
+  if (configured) return configured;
   if (cursors.workspaceDomain) return cursors.workspaceDomain;
-  const who = await call('slack_whoami', {});
-  const raw = who.domain || who.team_domain || (who.team && who.team.domain) || '';
-  cursors.workspaceDomain = String(raw).replace(/^https?:\/\//, '').replace(/\.slack\.com.*$/, '');
-  return cursors.workspaceDomain;
+  const domain = whoamiDomain(await call('slack_whoami', {}));
+  // Never cache an empty answer. Writing `workspaceDomain: ""` back into
+  // cursors.json is how every permalink on every decision row and incident
+  // card came out empty: the key was there, falsy, and rewritten each poll.
+  if (domain) cursors.workspaceDomain = domain;
+  else delete cursors.workspaceDomain;
+  return domain;
 }
 
 function permalink(domain, channel, ts) {
@@ -1031,7 +1066,7 @@ async function poll(options = {}) {
   const now = Number(options.now) || Date.now();
   pruneSeen(seen, now);
   const threads = normalizeThreads(readJson(THREADS_FILE, {}), cfg.channels);
-  const domain = await workspaceDomain(cursors, deps.callSlack);
+  const domain = await workspaceDomain(cursors, deps.callSlack, cfg.domain);
   const input = deps.fleetInput(now);
   const context = fleetContext(input);
   const refs = contextRefs(context);
@@ -1281,6 +1316,9 @@ module.exports = {
   fleetContext,
   computeSuspects,
   foldThreads,
+  workspaceHost,
+  whoamiDomain,
+  workspaceDomain,
   parseClassification,
   buildPrompt,
   messageForPrompt,
