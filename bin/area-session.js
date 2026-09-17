@@ -248,9 +248,17 @@ function eventLine(event) {
 // must never do — a clipped batch acknowledges an event the session was shown
 // half of — so the batch builder is what guarantees the fit, by measuring THIS
 // function's output rather than the raw lines (see nextBatch).
-function deliveryMessage(name, events, waiting = 0) {
+// The first line carries the batch's own delivery key, and it is not decoration.
+// Recovery asks the session's transcript whether this message is already in it,
+// and two batches can render identically — the same events re-emitted, a single
+// event whose line is the same as one delivered an hour ago — so without the key
+// an older entry in the transcript would answer for a newer batch and events
+// would be acknowledged that were never sent. The key names one seq range, so a
+// message carrying it can only ever answer for itself.
+function deliveryMessage(name, events, waiting = 0, key = '') {
   const body = events.map(eventLine).join('\n');
   return [
+    `[keep] delivery ${key || deliveryKeyFor(name, 0, 0)}`,
     `${events.length} new event${events.length === 1 ? '' : 's'} for the \`${name}\` area, from Keep's incident feed.`,
     '',
     incidents.dataFence(body, Number.MAX_SAFE_INTEGER),
@@ -264,6 +272,22 @@ function deliveryMessage(name, events, waiting = 0) {
 // send asks about the same receipt rather than about a batch it recomputed.
 function deliveryKeyFor(name, firstSeq, lastSeq) {
   return `agent:${name}:seq:${Number(firstSeq) || 0}-${Number(lastSeq) || 0}`;
+}
+
+// Whether a session's transcript already contains an exact delivered message.
+// The last witness when a confirmed send finished the transport's journal and
+// the daemon died before recording that it was confirmed.
+//
+// It lives here, and both the daemon tick and `keep incidents session` are wired
+// to it, because a recovery that is wired into one and not the other is a
+// recovery that sometimes types twice. `transcriptFile` is the caller's, since
+// resolving it is serve.js's business, not this module's.
+function transcriptShowsIn(session, text, transcriptFile) {
+  const delivery = require('./delivery');
+  return delivery.received({
+    file: transcriptFile(session), offset: 0,
+    kind: session.kind, hash: delivery.textHash(text),
+  });
 }
 
 // ---------- observing the session ----------
@@ -551,23 +575,25 @@ function nextBatch(name, record, root, deps = {}) {
   const found = probe.more ? read(name, cursor, { root, fromOffset }) : probe;
   const ends = Array.isArray(found.ends) ? found.ends : [];
   let included = [];
-  let text = '';
   for (let index = 0; index < found.events.length; index += 1) {
     const candidate = found.events.slice(0, index + 1);
-    const rendered = deliveryMessage(name, candidate, 0);
+    // Measured with the key this candidate would carry, since the key is part
+    // of the message and therefore part of what has to fit.
+    const rendered = deliveryMessage(name, candidate, 0,
+      deliveryKeyFor(name, candidate[0].seq, candidate[candidate.length - 1].seq));
     if (included.length && rendered.length > DELIVERY_BODY_MAX) break;
     included = candidate;
-    text = rendered;
   }
   const waiting = (found.events.length - included.length) + (found.more ? 1 : 0);
   const firstSeq = included[0].seq;
   const lastSeq = included[included.length - 1].seq;
+  const key = deliveryKeyFor(name, firstSeq, lastSeq);
   return {
-    events: included, firstSeq, lastSeq, waiting,
+    events: included, firstSeq, lastSeq, waiting, key,
     offset: Number(ends[included.length - 1]) || 0,
-    key: deliveryKeyFor(name, firstSeq, lastSeq),
-    // Rendered once, here, with the real `waiting` count, and carried from now on.
-    text: waiting ? deliveryMessage(name, included, waiting) : text,
+    // Rendered once, here, with the real `waiting` count and the real key, and
+    // carried from now on.
+    text: deliveryMessage(name, included, waiting, key),
   };
 }
 
@@ -1064,9 +1090,26 @@ async function deliveryStep(context, deps, say) {
     // second time. The transcript is the remaining witness: the session
     // recorded the message when it accepted it. Asked once per stuck batch, and
     // only on a retry, because it scans a transcript.
-    if (batch.retry && deps.transcriptShows) {
+    if (batch.retry) {
+      // Not optional. Without an answer here this tick cannot tell a batch that
+      // already arrived from one that never did, and the only safe move is to
+      // wait: typing would double the message, and acknowledging would lose it.
+      if (!deps.transcriptShows) {
+        say(`${agentName} cannot retry seq ${batch.firstSeq}-${batch.lastSeq}: no transcript check is wired`
+          + ' into this tick, so there is no way to tell whether it already arrived');
+        return defer('no transcript check is wired in, so a retry cannot be made safely');
+      }
       let shown = null;
-      try { shown = deps.transcriptShows(session, text); } catch { shown = null; }
+      try { shown = deps.transcriptShows(session, text); } catch (error) {
+        say(`${agentName} could not read the session transcript for seq ${batch.firstSeq}-${batch.lastSeq}: `
+          + `${oneLine(error && error.message || error, 160)}; leaving the batch pending`);
+        return defer('the session transcript could not be read');
+      }
+      if (shown !== true && shown !== false) {
+        // Anything that is not a plain yes or no is "could not tell", which is a
+        // reason to wait rather than to guess.
+        return defer('the transcript check gave no answer');
+      }
       if (shown === true) {
         say(`${agentName} seq ${batch.firstSeq}-${batch.lastSeq} is already in the session transcript;`
           + ' advancing the cursor without sending it again');
@@ -1264,7 +1307,13 @@ async function considerRestart(context, deps, say) {
   if (midTurn(seen.session) || waitingOnOwner(seen.session)) {
     return { state: 'not-due', reason: 'the session is mid-turn or waiting on Owner' };
   }
-  if (batch || (delivery && delivery.state === 'deferred') || pendingDeliveryOf(record)) {
+  // A `confirmed` pendingDelivery is the record of what was last delivered, and
+  // it is retained on purpose — so it must not read as outstanding work. Before
+  // this, the first successful delivery pinned the session open for good: every
+  // later tick saw a pending batch and refused to restart an agent that had been
+  // idle and caught up for hours.
+  const owed = pendingDeliveryOf(record);
+  if (batch || (delivery && delivery.state === 'deferred') || (owed && owed.state !== 'confirmed')) {
     return { state: 'not-due', reason: 'events are still undelivered' };
   }
   const since = lastActivityAt(record, seen);
@@ -1410,7 +1459,7 @@ module.exports = {
   worktreePath, runWt, ensureWorktree,
   recipeSource, recipeTarget, ensureRecipe,
   bootstrapMessage, deliveryMessage, deliveryKeyFor, eventLine,
-  observe, midTurn, waitingOnOwner, lastActivityAt,
+  observe, midTurn, waitingOnOwner, lastActivityAt, transcriptShowsIn,
   nextBatch, persistedBatch, pendingDeliveryOf,
   claimLaunchLease, renewLaunchLease, releaseLaunchLease, launchRequestId,
   claimDeliveryLease, renewDeliveryLease, releaseDeliveryLease,

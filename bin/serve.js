@@ -8821,6 +8821,7 @@ module.exports = {
   annotatePaneAgents,
   readPaneRecord, sessionProjectFromTranscript, openSession, reopenSessionOnAccount,
   runCheckNow, runTaskNow, taskRunMessage, adoptedPaneMeta, closeEphemeralPane,
+  transcriptFileForSession,
   inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, continueAccountHandoff, handoffSession,
   abandonAccountHandoff,
   listPortableTransfers, inspectPortableSource, portableTerminalRateLimitEvidence,

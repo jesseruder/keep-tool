@@ -2238,6 +2238,11 @@ commands.incidents = async (argv, cliDeps = {}) => {
       sendToResolvedTarget: (session, target, text, opts) => serve().sendToResolvedTarget(session, target, text, opts),
       withInjectionLock: (fn, scope) => serve().withInjectionLock(fn, scope),
       closeIdleSession: (body, closeDeps) => serve().closeIdleSession(body, closeDeps),
+      // The same recovery the daemon tick has. A retry cannot tell an arrived
+      // batch from a lost one without it, so a tick without this one defers
+      // rather than risking a second copy of the message.
+      transcriptShows: (session, text) => areaSession.transcriptShowsIn(
+        session, text, serve().transcriptFileForSession),
     });
 
     // `force` only with `--dry`: a dry run is how the switch gets inspected

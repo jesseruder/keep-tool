@@ -73,6 +73,10 @@ function makeDeps(fixture, state = {}) {
   // unconfirmed send submits the draft it still recognises instead of retyping,
   // while a retry after a confirmed send has nothing left to recover from.
   const journal = new Set();
+  // And the session's transcript: a message lands in it when the session accepts
+  // it, which is exactly what a confirmed send means. It is the witness a retry
+  // consults when the journal has nothing left.
+  const transcript = new Set();
   const deps = {
     calls,
     worktreePath: (repo, name) => path.join(fixture.root, 'wt', repo, name),
@@ -104,6 +108,7 @@ function makeDeps(fixture, state = {}) {
       if (journal.has(text)) {
         // Its own draft, still in the box: submitted, not retyped.
         journal.delete(text);
+        transcript.add(text);
         return { ok: true, delivery: 'received', recovered: true };
       }
       if (state.sendError) { journal.add(text); calls.types.push(text); throw state.sendError; }
@@ -118,9 +123,14 @@ function makeDeps(fixture, state = {}) {
         return state.sendResult;
       }
       // What delivery.js reports for a transcript-confirmed send: its journal is
-      // finished, so there is nothing to recover from afterwards.
+      // finished, so there is nothing to recover from afterwards — the session's
+      // own transcript is what remembers it.
+      transcript.add(text);
       return { ok: true, delivery: 'received' };
     },
+    // Wired by default, because the daemon and the CLI both wire it: a tick that
+    // cannot ask this cannot retry safely, and defers.
+    transcriptShows: (session, text) => transcript.has(text),
     withInjectionLock: (fn) => fn(),
     closeIdleSession: async (body, closeDeps) => {
       calls.closes.push({ body, closeDeps });
@@ -1141,6 +1151,134 @@ test('the lease is renewed across the worktree steps, so a slow build keeps its 
     assert.equal(renewals.length, 2);
     assert.equal(new Set(renewals).size, 1, 'the same holder both times');
     assert.equal(record(fixture).launchLease, null, 'and released at the end');
+  } finally { cleanup(fixture.root); }
+});
+
+test('a message carries its own delivery key, so an older identical batch cannot answer for it', async () => {
+  const fixture = makeRoot();
+  try {
+    feed(fixture, [{ at: NOW - 5 * MINUTE, kind: 'incident-fired', card: 'inc-a', title: 'Sandbox Open Health' }]);
+    const state = { panes: [livePane()], sessions: [idleSession()] };
+    const deps = makeDeps(fixture, state);
+    const first = sandboxes(await tick(fixture, deps));
+    assert.equal(first.delivery.state, 'sent');
+    assert.match(deps.calls.sends[0].text, /^\[keep\] delivery agent:sandboxes:seq:1-1$/m);
+    assert.equal(cursor(fixture), 1);
+
+    // The same event again: every rendered line is identical, so without the key
+    // the two messages would be the same string and the first one's transcript
+    // entry would answer for the second.
+    agents.emit('sandboxes', { at: NOW - 5 * MINUTE, kind: 'incident-fired', card: 'inc-a', title: 'Sandbox Open Health' },
+      { root: fixture.root, now: NOW });
+    // This one is confirmed by the transport but its cursor write dies, so the
+    // next tick has to recover it — which is where the transcript is consulted.
+    state.writeError = (patch) => (patch.lastDeliveredSeq ? new Error('disk went away') : null);
+    const second = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
+    assert.equal(second.delivery.state, 'sent');
+    assert.match(deps.calls.sends[1].text, /^\[keep\] delivery agent:sandboxes:seq:2-2$/m);
+    assert.notEqual(deps.calls.sends[1].text, deps.calls.sends[0].text, 'two batches, two messages');
+    assert.equal(cursor(fixture), 1, 'the cursor write died');
+
+    // Now prove the key is what makes the recovery specific. A transcript that
+    // only ever saw the FIRST batch must not satisfy the second's retry.
+    const onlyFirst = makeDeps(fixture, { panes: [livePane()], sessions: [idleSession()] });
+    onlyFirst.transcriptShows = (session, text) => text === deps.calls.sends[0].text;
+    const stillOwed = sandboxes(await tick(fixture, onlyFirst, { now: NOW + 2 * MINUTE }));
+    assert.equal(stillOwed.delivery.state, 'sent');
+    assert.notEqual(stillOwed.delivery.delivery, 'found-in-transcript',
+      'the first batch\'s entry did not answer for the second');
+    assert.equal(onlyFirst.calls.types.length, 1, 'so the second batch was actually sent');
+    assert.equal(cursor(fixture), 2);
+  } finally { cleanup(fixture.root); }
+});
+
+test('a retry with no usable transcript check defers instead of typing', async () => {
+  const fixture = makeRoot();
+  try {
+    feed(fixture, [{ at: NOW - MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox Open Health' }]);
+    const state = {
+      panes: [livePane()], sessions: [idleSession()],
+      sendError: new Error('Delivery unconfirmed: no matching transcript receipt.'),
+    };
+    const deps = makeDeps(fixture, state);
+    assert.equal(sandboxes(await tick(fixture, deps)).delivery.state, 'deferred');
+    assert.equal(deps.calls.types.length, 1);
+    assert.equal(areaSession.pendingDeliveryOf(record(fixture)).state, 'sending');
+    state.sendError = null;
+
+    // Not wired at all. Without an answer there is no way to tell an arrived
+    // batch from a lost one, and both guesses are wrong in their own way, so the
+    // only safe move is to wait.
+    delete deps.transcriptShows;
+    const unwired = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
+    assert.equal(unwired.delivery.state, 'deferred');
+    assert.match(unwired.delivery.reason, /no transcript check is wired/);
+    assert.equal(deps.calls.types.length, 1, 'nothing more was typed');
+    assert.equal(cursor(fixture), 0);
+    assert.ok(deps.calls.notes.some((line) => line.includes('no transcript check is wired')));
+
+    // Wired but broken: same answer.
+    deps.transcriptShows = () => { throw new Error('EACCES: the transcript is unreadable'); };
+    const broken = sandboxes(await tick(fixture, deps, { now: NOW + 2 * MINUTE }));
+    assert.equal(broken.delivery.state, 'deferred');
+    assert.match(broken.delivery.reason, /transcript could not be read/);
+    assert.equal(deps.calls.types.length, 1);
+    assert.ok(deps.calls.notes.some((line) => line.includes('could not read the session transcript')));
+
+    // Wired but evasive: anything that is not a plain yes or no is "could not
+    // tell", which is a reason to wait rather than to guess.
+    deps.transcriptShows = () => null;
+    const evasive = sandboxes(await tick(fixture, deps, { now: NOW + 3 * MINUTE }));
+    assert.equal(evasive.delivery.state, 'deferred');
+    assert.match(evasive.delivery.reason, /gave no answer/);
+    assert.equal(deps.calls.types.length, 1);
+
+    // And a straight answer lets it move again.
+    deps.transcriptShows = () => false;
+    const answered = sandboxes(await tick(fixture, deps, { now: NOW + 4 * MINUTE }));
+    assert.equal(answered.delivery.state, 'sent');
+    assert.equal(cursor(fixture), 1);
+  } finally { cleanup(fixture.root); }
+});
+
+test('a confirmed delivery does not pin the session open for good', async () => {
+  const fixture = makeRoot();
+  try {
+    feed(fixture, [{ at: NOW - 9 * HOUR, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox Open Health' }],
+      { startedAt: NOW - 9 * HOUR });
+    const state = quietState(9);
+    const deps = makeDeps(fixture, state);
+    // Deliver, and confirm it.
+    const sent = sandboxes(await tick(fixture, deps));
+    assert.equal(sent.delivery.state, 'sent');
+    assert.equal(areaSession.pendingDeliveryOf(record(fixture)).state, 'confirmed');
+    // That delivery is this session's last activity, so it is not idle yet.
+    assert.equal(sent.restart.state, 'not-due');
+
+    // Wind every clock back past the window. The batch on the record is the
+    // record of what was last delivered, not work still owed, so a caught-up
+    // idle session restarts — it used to be pinned open by its own success.
+    agents.writeRecord('sandboxes', { lastDeliveredAt: NOW - 9 * HOUR }, { root: fixture.root });
+    const later = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
+    assert.equal(later.delivery.state, 'nothing');
+    assert.equal(later.restart.state, 'closed');
+    assert.equal(deps.calls.closes.length, 1);
+
+    // A batch that is genuinely still owed keeps blocking it, as it should.
+    agents.writeRecord('sandboxes', {
+      session: { id: 'sess-1', pane: 'pane-1', startedAt: NOW - 9 * HOUR },
+      lastDeliveredAt: NOW - 9 * HOUR,
+      pendingDelivery: {
+        key: 'agent:sandboxes:seq:9-9', firstSeq: 9, lastSeq: 9, offset: 0, count: 1,
+        text: 'still owed', at: NOW - 9 * HOUR, state: 'sending',
+      },
+    }, { root: fixture.root });
+    const owed = makeDeps(fixture, quietState(9));
+    owed.transcriptShows = () => false;
+    const blocked = sandboxes(await tick(fixture, owed, { now: NOW + 2 * MINUTE }));
+    assert.equal(blocked.restart.state, 'not-due');
+    assert.match(blocked.restart.reason, /undelivered/);
+    assert.equal(owed.calls.closes.length, 0);
   } finally { cleanup(fixture.root); }
 });
 

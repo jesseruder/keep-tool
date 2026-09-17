@@ -262,17 +262,17 @@ function startSchedulers(ctx) {
     // Graceful only, and nothing behind it: nobody asked for this close, so a
     // refusal is the answer rather than the first step of an escalation.
     closeIdleSession: (body, closeDeps) => closeIdleSession(body, closeDeps),
-    // Did this session already accept this exact text? The last witness when a
+    // Did this session already accept this exact message? The last witness when a
     // confirmed send finished its delivery journal and the daemon died before
     // recording that it was confirmed. Scans the transcript, so area-session.js
-    // asks it only when retrying a batch it was part-way through sending.
-    transcriptShows: (session, text) => {
-      const delivery = require('../delivery');
-      return delivery.received({
-        file: transcriptFileForSession(session), offset: 0,
-        kind: session.kind, hash: delivery.textHash(text),
-      });
-    },
+    // asks it only when retrying a batch it was part-way through sending — and it
+    // must be wired, because without an answer that retry cannot be made safely.
+    //
+    // The message carries its own delivery key on its first line, so this matches
+    // one seq range's message and cannot be satisfied by an older batch that
+    // happened to render the same way.
+    transcriptShows: (session, text) => require('../area-session.js')
+      .transcriptShowsIn(session, text, transcriptFileForSession),
     onChange: broadcast,
   });
   const areaSessionTick = (options = {}) => require('../area-session.js').tickQuietly(options, areaSessionDeps());
