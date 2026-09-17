@@ -484,7 +484,16 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
     wrap.querySelector('[data-dismiss-toggle]').addEventListener('click', () => { ctx.state.showDismissed = !ctx.state.showDismissed; ctx.refresh(); });
     wrap.querySelectorAll('[data-restore]').forEach((button) => button.addEventListener('click', () => ctx.restore(button.dataset.restore)));
   }
-  for (const child of [...list.children]) if (!retained.has(child)) child.remove();
+  for (const child of [...list.children]) {
+    if (retained.has(child)) continue;
+    // An expanded agent that left the list takes its terminal with it: the loop
+    // above only disposes slots for agents it still iterates, and a panel that
+    // leaves the document would otherwise keep its xterm and socket cached until
+    // disposeUnusedTerminals retires them, colliding with a fresh mount should
+    // the agent return under the same slot.
+    if (child.dataset.key?.startsWith('agent-panel:')) ctx.unmount(`agent:${child.dataset.key.slice('agent-panel:'.length)}`);
+    child.remove();
+  }
   list.scrollTop = scrollTop;
   if (ctx.state.ensureSelectedVisible) {
     [...list.querySelectorAll(':scope > .qitem')].find((row) => row.dataset.key === ctx.state.selectedKey)?.scrollIntoView({ block: 'nearest' });
