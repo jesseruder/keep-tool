@@ -147,10 +147,14 @@ function codexHook(kind, input) {
       indexTurns(input, 'codex'); // a child or headless rollout still belongs in the index
       return;
     }
-    const blocked = stopHook(input, 'codex') === true;
-    indexTurns(input, 'codex');
-    if (blocked) return true;
-    return codexHook('complete', input);
+    // The pane is what says whether anybody is reading this session, and the Stop
+    // hook itself is synchronous, so the read happens here.
+    return unattendedState(input.session_id).catch(() => ({ unattended: false })).then((unattended) => {
+      const blocked = stopHook(input, 'codex', { unattended }) === true;
+      indexTurns(input, 'codex');
+      if (blocked) return true;
+      return codexHook('complete', input);
+    });
   }
   if (kind === 'lifecycle') {
     try { require('../codex-lifecycle').record(ROOT, input); } catch {}
@@ -190,7 +194,14 @@ function codexHook(kind, input) {
     } catch {}
     recordCodexParent(input);
     if (codexStopState(input)) initializeStopCheck(input);
-    return Promise.resolve(pending).then(() => ({ delegationStatus }));
+    return Promise.resolve(pending).then(async (record) => {
+      let unattendedText = '';
+      try {
+        unattendedText = unattendedStartupContext(input.session_id, 'codex',
+          await startupUnattendedState(input.session_id, record));
+      } catch {}
+      return { delegationStatus, unattendedText };
+    });
   }
   if (kind === 'end') {
     clearCompletionMarker(input, 'codex');
@@ -201,6 +212,23 @@ function codexHook(kind, input) {
     clearClientCompletion(input);
     return;
   }
+  if (kind === 'question') {
+    // Nobody answers a question here, and the attention marker would park the pane in
+    // a "Needs you" slot forever. Refuse the tool instead; the dispatcher prints the
+    // deny. An unreadable host reads as attended, so the question still goes through.
+    return unattendedState(input && (input.session_id || input.sessionId)).then((state) => {
+      if (!state.unattended) return codexAttentionMarker(kind, input);
+      const error = new KeepError(UNATTENDED_DENY_REASON);
+      error.hookDeny = true;
+      throw error;
+    });
+  }
+  return codexAttentionMarker(kind, input);
+}
+
+// The attention marker behind the console's "Needs you" row: a finished turn, a
+// question waiting for an answer, or a permission prompt.
+function codexAttentionMarker(kind, input) {
   const now = Date.now();
   let sid = input && (input.session_id || input.sessionId);
   if (typeof sid !== 'string' || !/^[A-Za-z0-9_-]+$/.test(sid)) sid = '';
@@ -340,14 +368,17 @@ commands.hook = async (argv) => {
       if (codexInputValid) {
         const result = await codexHook(argv[1], input);
         if (argv[1] === 'stop' && result === true) return;
-        if (argv[1] === 'start' && result && delegation.describe(result.delegationStatus)) {
-          console.log(JSON.stringify({
-            hookSpecificOutput: {
-              hookEventName: 'SessionStart',
-              additionalContext: delegation.describe(result.delegationStatus),
-            },
-          }));
-          return;
+        if (argv[1] === 'start' && result) {
+          // Both can apply: a delegated worker in a session nobody reads needs its
+          // assignment and the unattended rules, in that order of precedence.
+          const context = [result.unattendedText, delegation.describe(result.delegationStatus)]
+            .filter(Boolean).join('\n\n');
+          if (context) {
+            console.log(JSON.stringify({
+              hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: context },
+            }));
+            return;
+          }
         }
       }
     } catch (error) {
@@ -368,7 +399,9 @@ commands.hook = async (argv) => {
   if (argv[0] === 'stop') {
     // enforcement must never break a session's ability to stop
     try {
-      const blocked = stopHook(input) === true;
+      let unattended = { unattended: false };
+      try { unattended = await unattendedState(input && input.session_id); } catch {}
+      const blocked = stopHook(input, 'claude', { unattended }) === true;
       if (!blocked) recordClaudeCompletion(input);
     } catch {}
     indexTurns(input, 'claude');
@@ -391,6 +424,25 @@ commands.hook = async (argv) => {
       if (decision.deny) {
         process.stderr.write(`${decision.reason}\n`);
         process.exitCode = 2;
+      }
+    } catch {}
+    return;
+  }
+  if (argv[0] === 'pre-question') {
+    // AskUserQuestion in a session Keep opened for a program: the dialog would wait
+    // for an answer nobody is there to give. Deny it and say what to do instead.
+    // Never throws, and any failure allows the question: a hook that could not read
+    // the pane must not be the reason a session cannot ask for help.
+    try {
+      const state = await unattendedState(input && input.session_id);
+      if (state.unattended) {
+        console.log(JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason: UNATTENDED_DENY_REASON,
+          },
+        }));
       }
     } catch {}
     return;
@@ -465,12 +517,20 @@ commands.hook = async (argv) => {
     } catch {}
     return;
   }
-  if (argv[0] !== 'session-start') die('usage: keep hook session-start|session-end|stop|notification|lifecycle|pre-bash|post-bash|codex <start|stop|question|approval|complete|end|client-end|pre-tool|post-tool|lifecycle>');
+  if (argv[0] !== 'session-start') die('usage: keep hook session-start|session-end|stop|notification|lifecycle|pre-bash|pre-question|post-bash|codex <start|stop|question|approval|complete|end|client-end|pre-tool|post-tool|lifecycle>');
   // A Claude session ID survives `--resume`, so marker age alone cannot tell a
   // resumed run from the work that preceded it. Anchor enforcement at the
   // transcript's current end on every startup/resume hook instead.
   try { registerReviewerSession(input); } catch {}
-  try { await recordSessionPane(input); } catch {}
+  let paneRecord = null;
+  try { paneRecord = await recordSessionPane(input); } catch {}
+  // Said before anything else, and re-said after a compaction, which is what we want:
+  // a session nobody reads has to know that before it decides to ask a question.
+  let unattendedText = '';
+  try {
+    unattendedText = unattendedStartupContext(input.session_id, 'claude',
+      await startupUnattendedState(input.session_id, paneRecord));
+  } catch {}
   let delegationStatus = { kind: 'none' };
   try {
     delegationStatus = withLock(() => delegation.registerStart(
@@ -496,7 +556,10 @@ commands.hook = async (argv) => {
   // The context below is guidance for a session someone drives. Headless runs
   // (claude -p, the Agent SDK, Keep's own runs) pay for it on every call and
   // never act on it; a delegated headless worker still needs its assignment.
-  if (isHeadlessSessionEnv(process.env) && !delegationText) return;
+  if (isHeadlessSessionEnv(process.env) && !delegationText) {
+    if (unattendedText) console.log(unattendedText);
+    return;
+  }
   const allOverdue = loadAll(false).filter(isOverdue);
   const overdue = allOverdue.filter((t) => projectMatchesCwd(t.fm.project, cwd));
   if (overdue.length) {
@@ -577,6 +640,7 @@ commands.hook = async (argv) => {
     nudge = wt.nudgeFor(cwd, wt.loadConfig());
   } catch {}
   const paragraphs = [];
+  if (unattendedText) paragraphs.push(unattendedText);
   if (lines.length) {
     const workflow = delegationStatus.kind === 'active'
       ? 'Return progress and evidence to the parent session; the parent owns Keep check-ins for this assignment.'
@@ -1602,6 +1666,115 @@ function writePaneRecord(file, record) {
   fs.renameSync(tmp, file);
 }
 
+// ---------- unattended sessions ----------
+//
+// A session Keep opened for a program — a scheduled check, a standing agent, the
+// self-repair scheduler, another session's `keep open` — has no reader. openSession
+// stamps `unattended` and `opener` on its pane; the hooks below tell the session so
+// at startup, refuse its question tools, and push back a final question once.
+
+const UNATTENDED_DENY_REASON = 'Unattended Keep session: nobody answers questions here.'
+  + ' Take your own recommended option and record the choice on the card, or run'
+  + ' keep needs <card> "<what>" if only Owner can supply it, then end the turn.';
+
+const UNATTENDED_STOP_REASON = 'Your final message ends in a question, and nobody is reading'
+  + ' this session. Answer it yourself from the card and the recipe and continue, or record it'
+  + ' with keep needs <card> "<what>" or a check-in with --handoff needs-input, then end the'
+  + ' turn with a statement.';
+
+// Who the session was opened for, in the second person. An opener Keep does not
+// recognize still gets a sentence: the point of the block is that nobody is reading.
+function openerDescription(opener, options = {}) {
+  const kind = opener && typeof opener === 'object' ? String(opener.kind || '') : '';
+  const id = opener && opener.id ? String(opener.id) : '';
+  // Every kind but `session` and `agent` carries its card as the opener id.
+  const card = options.card ? String(options.card) : (kind === 'session' || kind === 'agent' ? '' : id);
+  const onCard = card ? ` on card ${card}` : '';
+  switch (kind) {
+    case 'agent': return id ? `agent ${id}` : 'a Keep agent';
+    case 'session': return `session ${id.slice(0, 8) || '(unknown)'}${onCard}`;
+    case 'check': return `the scheduled check${onCard}`;
+    case 'repair': return `self-repair${card ? ` of card ${card}` : ''}`;
+    case 'review-queue': return `the review queue${onCard}`;
+    case 'reviewer': return 'the fleet reviewer';
+    case 'transfer': return 'a transferred session';
+    default: return 'Keep';
+  }
+}
+
+function unattendedContext(agent, description) {
+  const lines = [
+    '[keep — unattended session]',
+    `Keep opened this session for ${description}. Nobody is reading it.`,
+  ];
+  if (agent === 'codex') {
+    lines.push('- Do not ask questions. request_user_input is refused here, and a final message that ends in a question goes unanswered. Decide from the card, the recipe and your own judgement, and record the decision on the card in a check-in that says what you chose and why.');
+    lines.push('- Reviews: the reviewer subagent your instructions require is still required; it is the review for this session. Skip it only when the prompt carries the Claude handoff phrase.');
+  } else {
+    lines.push('- Do not ask questions. AskUserQuestion is refused here, and a final message that ends in a question goes unanswered. Decide from the card, the recipe and your own judgement, and record the decision on the card (`keep decide` where a recipe says so, otherwise a check-in that says what you chose and why).');
+    lines.push('- Implementation: hand code to an Opus subagent (Agent tool, model "opus") or to Codex Sol via `keep codex`. That is the answer to the implementation-handoff question; do not ask it.');
+    lines.push('- Reviews: the `codex-review-runner` skill, Codex Sol at medium.');
+  }
+  lines.push('- Reach Owner only for what he alone can supply, or a decision a recipe reserves for him: `keep needs <card> "<what>"`, or a check-in with `--handoff needs-input`, then end the turn.');
+  lines.push('- When the work is done or you are stuck, check in and end the turn.');
+  return lines.join('\n');
+}
+
+// The startup record this session's own pane hook wrote. The only synchronous
+// answer available, and the fallback when the host cannot be reached.
+function recordedUnattended(sessionId, deps = {}) {
+  if (typeof sessionId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(sessionId)) return null;
+  const meta = deps.root ? path.join(deps.root, '.keep') : META;
+  try {
+    const record = JSON.parse(fs.readFileSync(path.join(meta, 'panes', `${sessionId}.json`), 'utf8'));
+    if (!record || typeof record !== 'object' || !('unattended' in record)) return null;
+    return { unattended: record.unattended === true, opener: record.opener || null, pane: record.pane || '' };
+  } catch { return null; }
+}
+
+// Whether anybody is reading this session. The pane meta is the authority, because a
+// console keystroke clears the mark there; the startup record is the fallback. Fails
+// open in every direction — an unreachable host never makes a session unattended.
+async function unattendedState(sessionId, deps = {}) {
+  const recorded = recordedUnattended(sessionId, deps);
+  try {
+    const env = deps.env || process.env;
+    const pane = deps.pane || env.KEEP_PANE || (recorded && recorded.pane) || '';
+    if (pane) {
+      const connectHost = deps.connectHost || require('../hostclient.js').connect;
+      const timeoutMs = deps.timeoutMs == null ? 500 : deps.timeoutMs;
+      let client;
+      try {
+        client = await connectHost({ timeoutMs });
+        const current = await client.request('get', { pane }, { timeoutMs });
+        const paneMeta = current && current.pane && current.pane.meta;
+        // A pane another session owns says nothing about this one.
+        if (paneMeta && (!paneMeta.sessionId || paneMeta.sessionId === sessionId)) {
+          return { unattended: paneMeta.unattended === true, opener: paneMeta.opener || null };
+        }
+      } finally { if (client) client.close(); }
+    }
+  } catch {}
+  if (recorded) return { unattended: recorded.unattended, opener: recorded.opener };
+  return { unattended: false, opener: null };
+}
+
+// The startup block, ready to print. The card is what the opener is working on, so
+// the session can name it back without being told twice.
+function unattendedStartupContext(sessionId, agent, state) {
+  if (!state || state.unattended !== true) return '';
+  let card = '';
+  try { card = (taskForSession(String(sessionId || '')) || {}).id || ''; } catch {}
+  return unattendedContext(agent, openerDescription(state.opener, { card }));
+}
+
+async function startupUnattendedState(sessionId, record) {
+  if (record && typeof record === 'object' && 'unattended' in record) {
+    return { unattended: record.unattended === true, opener: record.opener || null };
+  }
+  return unattendedState(sessionId);
+}
+
 async function recordSessionPane(input, agent = 'claude', deps = {}) {
   const sid = input && input.session_id;
   const env = deps.env || process.env;
@@ -1615,16 +1788,21 @@ async function recordSessionPane(input, agent = 'claude', deps = {}) {
   const startedAt = (deps.now || Date.now)();
   let at = startedAt;
   let claimed = false;
+  // Whether anybody is reading this session, as the last hook found it. Carried
+  // forward so a host that is momentarily unreachable does not erase a known answer;
+  // the live read below replaces it whenever the pane can be asked.
+  let attendance = null;
   try {
     const prior = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (prior && prior.pane === pane && prior.agent === agent) {
       if (prior.cwd === cwd && Number.isFinite(Number(prior.at))) at = Number(prior.at);
       claimed = prior.claimed === true;
+      if ('unattended' in prior) attendance = { unattended: prior.unattended === true, opener: prior.opener || null };
     }
   } catch {}
   const accountId = /^(?:[a-z0-9][a-z0-9_-]{0,63}|(?:claude|codex)\/default)$/.test(env.KEEP_AGENT_ACCOUNT_ID || '')
     ? env.KEEP_AGENT_ACCOUNT_ID : null;
-  const record = { at, startedAt, cwd, agent, pane, claimed, ...(accountId ? { accountId } : {}) };
+  const record = { at, startedAt, cwd, agent, pane, claimed, ...(accountId ? { accountId } : {}), ...(attendance || {}) };
   fs.mkdirSync(dir, { recursive: true });
   (deps.writePaneRecord || writePaneRecord)(file, record);
   for (const name of fs.readdirSync(dir)) {
@@ -1644,6 +1822,10 @@ async function recordSessionPane(input, agent = 'claude', deps = {}) {
       client = await connectHost({ timeoutMs: deps.timeoutMs == null ? 500 : deps.timeoutMs });
       const current = await client.request('get', { pane }, { timeoutMs });
       const paneMeta = current?.pane?.meta || {};
+      // Whether anybody is reading this session, recorded while the pane is in hand:
+      // the Stop hook has no async read of its own, and this is its only answer.
+      record.unattended = paneMeta.unattended === true;
+      record.opener = paneMeta.opener || null;
       const launchedCodex = agent === 'codex' && paneMeta.openRequestId != null
         && !paneMeta.sessionId && !paneMeta.restartedAt && !paneMeta.handoffTransactionId;
       if (launchedCodex) {
@@ -1867,7 +2049,7 @@ function codexStopState(input) {
       require('../codex-lifecycle').state(ROOT, info).pendingBackground) };
 }
 
-function stopHook(input, agent = 'claude') {
+function stopHook(input, agent = 'claude', options = {}) {
   if (input.stop_hook_active) return; // never double-block
   if (process.env.KEEP_RUN) return; // Keep's own headless generators (ideas, standup, Slack) land their own records
   if (isReviewerSession()) return; // the reviewer writes no code; nagging it is noise
@@ -1977,7 +2159,18 @@ function stopHook(input, agent = 'claude') {
 
   // Any other question is a handoff to Owner. The console shows every pane's
   // final turn as needing an answer, so the pane is the inbox.
-  if (asked && !preauthorized) return;
+  if (asked && !preauthorized) {
+    // Unless nobody is reading this pane, in which case the handoff strands the work.
+    // Say so once — `stop_hook_active` above is why this cannot loop — and only for a
+    // real request, not every turn that happens to contain a question mark.
+    const unattended = options.unattended || recordedUnattended(sid) || { unattended: false };
+    if (unattended.unattended === true
+        && require('../session-status').proseRequest(transcriptState.lastAssistant)) {
+      console.log(JSON.stringify({ decision: 'block', reason: UNATTENDED_STOP_REASON }));
+      return true;
+    }
+    return;
+  }
 
   const canContinue = transcriptState.interactive && task && task.fm.status === 'active'
     && String(task.fm.autocontinue || '').toLowerCase() !== 'off' && (next || preauthorized);
@@ -2048,4 +2241,6 @@ function stopHook(input, agent = 'claude') {
   return true;
 }
 
-module.exports = { commands, codexToolInput, codexExitCode, emptyStopEvidence, looksLikeGitWrite, scanStopEvidence, hasSubstantiveStopEvidence, newestTaskForSession, taskForSession, readCodexParent, redactCommand, deployCommand, deployEntry, stepMatchForInput, guardStepCommand, rawClaudeResume, guardResumeCommand, repairInvocations, repairAllowedCommand, guardRepairCommand, recordStepRun, recordDeploy, writePaneRecord, recordSessionPane, releaseSessionPane, registerReviewerSession, stopHook };
+module.exports = { commands, codexToolInput, codexExitCode, emptyStopEvidence, looksLikeGitWrite, scanStopEvidence, hasSubstantiveStopEvidence, newestTaskForSession, taskForSession, readCodexParent, redactCommand, deployCommand, deployEntry, stepMatchForInput, guardStepCommand, rawClaudeResume, guardResumeCommand, repairInvocations, repairAllowedCommand, guardRepairCommand, recordStepRun, recordDeploy, writePaneRecord, recordSessionPane, releaseSessionPane, registerReviewerSession, stopHook,
+  openerDescription, unattendedContext, unattendedState, recordedUnattended,
+  UNATTENDED_DENY_REASON, UNATTENDED_STOP_REASON };

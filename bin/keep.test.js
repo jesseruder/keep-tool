@@ -1308,7 +1308,10 @@ test('recordSessionPane writes a host-only record and binds both agent kinds to 
     });
     assert.equal(codexRecord.bound, true);
     const record = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'panes', 'host-session.json'), 'utf8'));
-    assert.deepEqual(record, { at: 5678, startedAt: 5678, cwd: '/tmp/project', agent: 'codex', pane: 'pane-123', claimed: true, bound: true });
+    // `unattended`/`opener` come from the pane the hook just read: the Stop hook has
+    // no async read of its own, so the record is the only answer it gets.
+    assert.deepEqual(record, { at: 5678, startedAt: 5678, cwd: '/tmp/project', agent: 'codex', pane: 'pane-123',
+      claimed: true, bound: true, unattended: false, opener: null });
     assert.deepEqual(calls[0], { options: { timeoutMs: 500 }, type: 'get', params: { pane: 'pane-123' }, requestOptions: { timeoutMs: 1000 } },
       'the hook checks who owns the pane before binding');
     assert.deepEqual(calls[1], {
@@ -1334,6 +1337,281 @@ test('recordSessionPane writes a host-only record and binds both agent kinds to 
       sessionId: 'claude-session', agent: 'claude', project: '/tmp/project',
     });
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// ---------- unattended sessions ----------
+
+const hookInternals = require('./commands/hook.js');
+
+// A session Keep opened for a program, seen from the hooks: the startup record the
+// pane hook would have written had the host answered.
+function unattendedFixture() {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-unattended-')));
+  const project = path.join(root, 'project');
+  fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+  fs.mkdirSync(path.join(root, '.keep', 'panes'), { recursive: true });
+  fs.mkdirSync(project, { recursive: true });
+  fs.writeFileSync(path.join(root, 'tasks', 'unread-card.md'), [
+    '---', 'title: Sweep the seed queue', 'status: active', 'kind: task',
+    `project: ${project}`, 'created: 2026-09-01T09:00', 'updated: 2026-09-01T09:00', '---', '',
+  ].join('\n'));
+  const write = (sid, agent, extra) => fs.writeFileSync(path.join(root, '.keep', 'panes', `${sid}.json`),
+    JSON.stringify({ at: Date.now(), startedAt: Date.now(), cwd: project, agent,
+      pane: `pane-${sid}`, claimed: false, bound: true, ...extra }));
+  return {
+    root,
+    project,
+    pane: write,
+    env: (extra = {}) => {
+      const env = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', ...extra };
+      for (const key of ['KEEP_PANE', 'KEEP_RUN', 'KEEP_REVIEWER', 'CLAUDE_CODE_SESSION_ID',
+        'CODEX_THREAD_ID', 'CODEX_SESSION_ID']) delete env[key];
+      Object.assign(env, extra);
+      return env;
+    },
+    cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+  };
+}
+
+test('the opener reads back as a sentence, whatever kind it is', () => {
+  const { openerDescription, unattendedContext } = hookInternals;
+  assert.equal(openerDescription({ kind: 'agent', id: 'delivery-responder' }), 'agent delivery-responder');
+  assert.equal(openerDescription({ kind: 'session', id: 'abcdef0123456789' }, { card: 'some-card' }),
+    'session abcdef01 on card some-card');
+  assert.equal(openerDescription({ kind: 'check', id: 'some-card' }), 'the scheduled check on card some-card');
+  assert.equal(openerDescription({ kind: 'repair', id: 'daemon-card' }), 'self-repair of card daemon-card');
+  assert.equal(openerDescription({ kind: 'review-queue', id: 'queued-card' }), 'the review queue on card queued-card');
+  assert.equal(openerDescription({ kind: 'reviewer' }), 'the fleet reviewer');
+  assert.equal(openerDescription({ kind: 'transfer' }), 'a transferred session');
+  // An opener from a newer Keep, or none at all, still says the part that matters.
+  assert.equal(openerDescription({ kind: 'something-new' }), 'Keep');
+  assert.equal(openerDescription(null), 'Keep');
+  assert.match(unattendedContext('claude', 'the fleet reviewer'), /^\[keep — unattended session\]\n/);
+  assert.match(unattendedContext('claude', 'the fleet reviewer'), /AskUserQuestion is refused here/);
+  assert.match(unattendedContext('codex', 'the fleet reviewer'), /request_user_input is refused here/);
+});
+
+test('the pane is the authority on attendance, and an unreachable host never invents it', async () => {
+  const { unattendedState } = hookInternals;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-attendance-'));
+  try {
+    fs.mkdirSync(path.join(root, '.keep', 'panes'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.keep', 'panes', 'sid.json'), JSON.stringify({
+      pane: 'pane-1', agent: 'claude', unattended: true, opener: { kind: 'check', id: 'card' },
+    }));
+    const host = (meta) => async () => ({
+      request: async () => ({ pane: { id: 'pane-1', meta } }),
+      close: () => {},
+    });
+    // Owner typed into the console, so the pane says attended even though the startup
+    // record still says otherwise.
+    assert.deepEqual(await unattendedState('sid', { root, env: {}, connectHost: host({ sessionId: 'sid', unattended: false }) }),
+      { unattended: false, opener: null });
+    assert.deepEqual(await unattendedState('sid', { root, env: {}, connectHost: host({ sessionId: 'sid', unattended: true, opener: { kind: 'reviewer' } }) }),
+      { unattended: true, opener: { kind: 'reviewer' } });
+    // A pane another session owns says nothing about this one; the record decides.
+    assert.deepEqual(await unattendedState('sid', { root, env: {}, connectHost: host({ sessionId: 'somebody-else' }) }),
+      { unattended: true, opener: { kind: 'check', id: 'card' } });
+    // An unreachable host falls back to the record, and never to "unattended".
+    const dead = async () => { throw new Error('no host'); };
+    assert.deepEqual(await unattendedState('sid', { root, env: {}, connectHost: dead }),
+      { unattended: true, opener: { kind: 'check', id: 'card' } });
+    assert.deepEqual(await unattendedState('unknown-sid', { root, env: { KEEP_PANE: 'pane-1' }, connectHost: dead }),
+      { unattended: false, opener: null });
+    assert.deepEqual(await unattendedState('../etc/passwd', { root, env: {}, connectHost: dead }),
+      { unattended: false, opener: null });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('session-start tells an unattended session so before anything else', () => {
+  const f = unattendedFixture();
+  const run = (sid) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'hook', 'session-start'], {
+    encoding: 'utf8', env: f.env(), input: JSON.stringify({ session_id: sid, cwd: f.project }),
+  });
+  try {
+    f.pane('unread-session', 'claude', { unattended: true, opener: { kind: 'check', id: 'unread-card' } });
+    const started = run('unread-session');
+    assert.equal(started.status, 0, started.stderr);
+    assert.ok(started.stdout.startsWith('[keep — unattended session]\n'),
+      `the block comes first, got: ${started.stdout.slice(0, 80)}`);
+    assert.match(started.stdout, /Keep opened this session for the scheduled check on card unread-card\. Nobody is reading it\./);
+    assert.match(started.stdout, /AskUserQuestion is refused here/);
+    assert.match(started.stdout, /hand code to an Opus subagent/);
+    // And the registry block still follows it.
+    assert.ok(started.stdout.indexOf('[keep — work registry]') > 0);
+    assert.match(started.stdout, /unread-card \(active\)/);
+
+    // A session Owner opened is told nothing extra.
+    f.pane('owner-session', 'claude', { unattended: false, opener: { kind: 'owner' } });
+    const owner = run('owner-session');
+    assert.equal(owner.status, 0, owner.stderr);
+    assert.doesNotMatch(owner.stdout, /unattended session/);
+    assert.ok(owner.stdout.startsWith('[keep — work registry]'));
+
+    // No record and no reachable host: nothing is assumed.
+    const unknown = run('no-record-session');
+    assert.equal(unknown.status, 0, unknown.stderr);
+    assert.doesNotMatch(unknown.stdout, /unattended session/);
+  } finally { f.cleanup(); }
+});
+
+test('the Codex start hook carries the unattended block in additionalContext', () => {
+  const f = unattendedFixture();
+  const run = (sid) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'hook', 'codex', 'start'], {
+    encoding: 'utf8', env: f.env(), input: JSON.stringify({ session_id: sid, cwd: f.project }),
+  });
+  try {
+    f.pane('codex-unread', 'codex', { unattended: true, opener: { kind: 'agent', id: 'delivery-responder' } });
+    const started = run('codex-unread');
+    assert.equal(started.status, 0, started.stderr);
+    const context = JSON.parse(started.stdout).hookSpecificOutput;
+    assert.equal(context.hookEventName, 'SessionStart');
+    assert.ok(context.additionalContext.startsWith('[keep — unattended session]\n'));
+    assert.match(context.additionalContext, /Keep opened this session for agent delivery-responder\./);
+    assert.match(context.additionalContext, /request_user_input is refused here/);
+    assert.doesNotMatch(context.additionalContext, /AskUserQuestion/);
+
+    f.pane('codex-owned', 'codex', { unattended: false });
+    const owner = run('codex-owned');
+    assert.equal(owner.status, 0, owner.stderr);
+    assert.equal(owner.stdout.trim(), '{}');
+  } finally { f.cleanup(); }
+});
+
+test('AskUserQuestion is denied in an unattended session and nowhere else', () => {
+  const f = unattendedFixture();
+  const run = (sid, extra = {}) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'hook', 'pre-question'], {
+    encoding: 'utf8', env: f.env(extra),
+    input: JSON.stringify({ session_id: sid, cwd: f.project, tool_name: 'AskUserQuestion',
+      tool_input: { questions: [{ question: 'Which option?' }] } }),
+  });
+  try {
+    f.pane('unread-session', 'claude', { unattended: true, opener: { kind: 'check', id: 'unread-card' } });
+    const denied = run('unread-session');
+    assert.equal(denied.status, 0, denied.stderr);
+    assert.deepEqual(JSON.parse(denied.stdout), {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: hookInternals.UNATTENDED_DENY_REASON,
+      },
+    });
+    assert.match(hookInternals.UNATTENDED_DENY_REASON, /nobody answers questions here/);
+
+    f.pane('owner-session', 'claude', { unattended: false });
+    const allowed = run('owner-session');
+    assert.equal(allowed.status, 0, allowed.stderr);
+    assert.equal(allowed.stdout, '', 'Owner is asked his question');
+
+    // Fail open: an unreadable pane and an unreachable host must never be the reason
+    // a session cannot ask for help.
+    const unknown = run('no-record-session', { KEEP_PANE: 'pane-gone' });
+    assert.equal(unknown.status, 0, unknown.stderr);
+    assert.equal(unknown.stdout, '');
+  } finally { f.cleanup(); }
+});
+
+test('the Codex question hook denies in an unattended session instead of parking the pane', () => {
+  const f = unattendedFixture();
+  const run = (sid) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'hook', 'codex', 'question'], {
+    encoding: 'utf8', env: f.env(),
+    input: JSON.stringify({ session_id: sid, cwd: f.project,
+      tool_input: { questions: [{ question: 'Which option?', options: ['A', 'B'] }] } }),
+  });
+  const marker = (sid) => path.join(f.root, '.keep', 'attention', `${sid}.json`);
+  try {
+    f.pane('codex-unread', 'codex', { unattended: true, opener: { kind: 'reviewer' } });
+    const denied = run('codex-unread');
+    assert.equal(denied.status, 2, denied.stderr);
+    const output = JSON.parse(denied.stdout);
+    assert.equal(output.decision, 'block');
+    assert.equal(output.hookSpecificOutput.permissionDecision, 'deny');
+    assert.equal(output.hookSpecificOutput.permissionDecisionReason, hookInternals.UNATTENDED_DENY_REASON);
+    assert.equal(fs.existsSync(marker('codex-unread')), false, 'and it never asks for a "Needs you" slot');
+
+    f.pane('codex-owned', 'codex', { unattended: false });
+    const asked = run('codex-owned');
+    assert.equal(asked.status, 0, asked.stderr);
+    assert.equal(asked.stdout.trim(), '{}');
+    const recorded = JSON.parse(fs.readFileSync(marker('codex-owned'), 'utf8'));
+    assert.equal(recorded.type, 'question');
+    assert.equal(recorded.message, 'Which option?');
+    assert.deepEqual(recorded.options, ['A', 'B']);
+  } finally { f.cleanup(); }
+});
+
+test('a final question in an unattended session is pushed back once', () => {
+  const f = unattendedFixture();
+  const transcript = path.join(f.root, 'session.jsonl');
+  fs.writeFileSync(transcript, [
+    transcriptRecord({ type: 'mode', mode: 'default' }),
+    transcriptRecord({ type: 'assistant', message: { content: [{ type: 'text',
+      text: 'I can land this on master or open a branch. Which do you want?' }] } }),
+  ].join(''));
+  const statementTranscript = path.join(f.root, 'statement.jsonl');
+  fs.writeFileSync(statementTranscript, [
+    transcriptRecord({ type: 'mode', mode: 'default' }),
+    transcriptRecord({ type: 'assistant', message: { content: [{ type: 'text',
+      text: 'Landed on master and restarted the daemon.' }] } }),
+  ].join(''));
+  const run = (sid, extra = {}) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'hook', 'stop'], {
+    encoding: 'utf8', env: f.env(),
+    input: JSON.stringify({ session_id: sid, cwd: f.project, transcript_path: transcript,
+      last_assistant_message: 'I can land this on master or open a branch. Which do you want?', ...extra }),
+  });
+  try {
+    f.pane('unread-session', 'claude', { unattended: true, opener: { kind: 'check', id: 'unread-card' } });
+    const blocked = run('unread-session');
+    assert.equal(blocked.status, 0, blocked.stderr);
+    const decision = JSON.parse(blocked.stdout);
+    assert.equal(decision.decision, 'block');
+    assert.equal(decision.reason, hookInternals.UNATTENDED_STOP_REASON);
+    assert.match(decision.reason, /nobody is reading this session/);
+
+    // Once per turn: a re-entered Stop hook must not trap the session in a loop.
+    const again = run('unread-session', { stop_hook_active: true });
+    assert.equal(again.status, 0, again.stderr);
+    assert.equal(again.stdout, '');
+
+    // A statement is not a question, even in an unattended session.
+    const statement = run('unread-session', {
+      transcript_path: statementTranscript,
+      last_assistant_message: 'Landed on master and restarted the daemon.',
+    });
+    assert.equal(statement.status, 0, statement.stderr);
+    assert.equal(statement.stdout, '');
+
+    // And Owner's own session keeps today's behaviour: the pane is his inbox.
+    f.pane('owner-session', 'claude', { unattended: false });
+    const owner = run('owner-session');
+    assert.equal(owner.status, 0, owner.stderr);
+    assert.equal(owner.stdout, '');
+  } finally { f.cleanup(); }
+});
+
+test('the Codex Stop hook pushes the same question back, through the same policy', () => {
+  const f = unattendedFixture();
+  const transcript = path.join(f.root, 'codex.jsonl');
+  const row = (type, payload) => JSON.stringify({ type, payload, timestamp: new Date().toISOString() }) + '\n';
+  const rollout = (sid) => row('session_meta', { id: sid, source: 'cli', originator: 'codex-tui' })
+    + row('event_msg', { type: 'user_message', message: 'Continue the work.' })
+    + row('event_msg', { type: 'agent_message', message: 'I can land this or open a branch. Which do you want?' });
+  const run = (sid, extra = {}) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'hook', 'codex', 'stop'], {
+    encoding: 'utf8', env: f.env(),
+    input: JSON.stringify({ session_id: sid, cwd: f.project, transcript_path: transcript, ...extra }),
+  });
+  try {
+    f.pane('codex-unread', 'codex', { unattended: true, opener: { kind: 'agent', id: 'delivery-responder' } });
+    fs.writeFileSync(transcript, rollout('codex-unread'));
+    const blocked = run('codex-unread');
+    assert.equal(blocked.status, 0, blocked.stderr);
+    assert.equal(JSON.parse(blocked.stdout).reason, hookInternals.UNATTENDED_STOP_REASON);
+    assert.deepEqual(JSON.parse(run('codex-unread', { stop_hook_active: true }).stdout), {});
+
+    f.pane('codex-owned', 'codex', { unattended: false });
+    fs.writeFileSync(transcript, rollout('codex-owned'));
+    assert.deepEqual(JSON.parse(run('codex-owned').stdout), {});
+  } finally { f.cleanup(); }
 });
 
 test('Codex SessionStart pins a daemon-launched session only after exact pane and account verification', async () => {
