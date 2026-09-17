@@ -1295,16 +1295,31 @@ scheduled check delivery uses (`resolveSessionTarget` +
 deliveryKey}))`), so target resolution, the compaction-if-cold policy, the injection
 mutex and the delivery receipt all apply.
 
-One tick owns the sending. `record.deliveryLease = {at, by}` is claimed under the
-registry lock before anything is read or written, and released in a `finally`; a fresh
-one held by anybody else defers the tick. Without it the receipt lookup and the
-pending-batch write both sat outside any mutual exclusion, so two overlapping ticks — a
-slow poll and the next one, `keep incidents session` racing the daemon — could each read
-"no receipt", each persist their own batch over the other's, and each type. The
-injection mutex serialises typing; it does not stop the second message existing. And
-because everything up to that mutex was decided outside it, the record is read **again**
-inside it: a cursor that moved past this batch, or a pending batch that changed, aborts
-the send.
+One tick owns the sending, from choosing the batch to writing the cursor.
+`record.deliveryLease = {at, by}` is claimed under the registry lock and released in a
+`finally`; a fresh one held by anybody else defers the tick. Without it, two overlapping
+ticks — a slow poll and the next one, `keep incidents session` racing the daemon — could
+each decide independently and each type, because the injection mutex serialises typing
+and does not stop the second message existing.
+
+The batch is chosen **twice**: once cheaply and read-only, to find out whether there is
+anything to deliver at all (so a quiet tick takes no lease and writes nothing), and then
+again from the record read *after* the lease is claimed — and that second one is what
+gets sent. Choosing once, before the lease, was not enough: a tick delayed between its
+read and its claim could hold a batch of [1,2] built from a cursor another tick had
+already moved to 1, persist it, and pass every later guard, because the guards compare
+against the pending record it wrote itself. And because everything up to the injection
+mutex was still decided outside it, the record is read once more inside it: a cursor past
+this batch, or a pending batch that changed, aborts the send.
+
+The lease is ten minutes, not two, and it is **renewed** on a 30-second timer underneath
+the awaited send (the timer is unref'd and cleared in the `finally`). A send is not the
+quick thing it looks like: `compactIfCold` can spend minutes compacting a cold session
+before a character is typed, and a two-minute lease expired underneath exactly that.
+Ownership is re-checked immediately before typing — through the transport's `beforeType`
+hook, which also fires before it re-submits a recovered draft — and again when the send
+returns. A lease lost during a send means the cursor is not ours to move: the batch stays
+`sending` for whoever holds it now.
 
 The batch is bounded by the size of its own **rendered message** (`DELIVERY_BODY_MAX`,
 6000 characters), not by a count and not by the raw lines: `dataFence` prefixes every
@@ -1322,32 +1337,51 @@ the text, and a batch rebuilt from the feed loses the "N more events are queued"
 sentence, whose count is gone by the next tick. Same range, different message, receipt
 nobody can find, message typed twice.
 
-`deliveryKey` is `agent:<name>:seq:<firstSeq>-<lastSeq>`, so the retry asks about the
-same receipt the previous send wrote. A receipt that says `received` advances the cursor
-and types nothing. A receipt that cannot be *read* — malformed, a permission error —
-defers the tick with one line on stderr rather than counting as absent, because treating
-it as absent types the message again. An unconfirmed receipt does **not** stop the tick:
-the send is attempted again with byte-identical text, because `delivery.deliver` inside
-`sendToResolvedTarget` finds its own journal entry and submits the draft still in the box
-rather than retyping — returning early there is what wedged the reviewer for 133
-consecutive ticks in September, and stable text is the whole reason the batch is
-persisted.
+**What a delivery is worth is our own state, not the transport's receipt.** The transport
+is called with `retainReceipt: false`: its receipt store answered "did this arrive" from
+outside anything we hold a lock on, and it files a *received* receipt for a delivery it
+only assumed, so it could never be provenance. What it keeps either way is its journal,
+which is what recovers a draft that was typed but never submitted, and that is what it is
+good at.
 
-Only a transcript-confirmed send counts as delivered. `delivery.deliver` also reports
-`assumed-delivered`: its journal expired with the text known to have reached the pane
-and no receipt ever appeared. That is a guess, so the batch stays pending and is offered
-again — and it is flagged `assumed`, because the helper files a *received* receipt as
-part of assuming, and reading that back next tick would acknowledge a batch nobody
-confirmed. A flagged batch skips the receipt lookup entirely.
+`record.pendingDelivery.state` is the provenance instead, and it moves one way only:
 
-The cursor advances, and `pendingDelivery` clears, only on a confirmed send. A mid-turn
+- **`sending`** — written under the registry lock *before* a character is typed, together
+  with the text. A tick that finds this reaches the transport again with the same text;
+  the transport recognises its own journal and submits the draft rather than retyping.
+- **`confirmed`** — written in the **same locked write** that advances the cursor, so no
+  reader can ever see one without the other. It stays on the record afterwards as the
+  record of what was last delivered, and the next batch overwrites it.
+
+A `confirmed` batch the cursor has not passed can only mean the write that would have
+moved the cursor never landed, so the cursor moves on the next tick and nothing is typed.
+A `sending` batch being retried is asked about one more thing first: a send that *was*
+confirmed finishes the transport's journal, so a daemon that died in the moment between
+the transport returning and our state write leaves nothing for the journal to recognise —
+and the transcript is the remaining witness. `transcriptShows` (wired from
+`delivery.received` over the session's transcript) is asked once per stuck batch, on a
+retry only, because it scans a transcript; if it finds the text the cursor advances with
+nothing typed, and if it does not, the send goes ahead. `deliveryKey` stays
+`agent:<name>:seq:<firstSeq>-<lastSeq>` so the transport's own journal identity is stable
+across the retry.
+
+Only a transcript-confirmed result counts as delivered. `delivery.deliver` also reports
+`assumed-delivered`: its journal expired with the text known to have reached the pane and
+no transcript ever confirmed it. That is a guess, so the batch stays `sending` and is
+offered again. **After `ASSUMED_ATTEMPT_LIMIT` (3) of those the cursor moves past it
+anyway** — the session has probably had those events three times, and retyping them
+forever is its own failure — and the uncertainty becomes a `delivery-uncertain` event on
+the feed (severity `med`, no card, naming the seq range). It lands after the cursor, so
+the next batch carries it into the session and the agent row shows it. The queue never
+wedges on one batch.
+
+The cursor advances only on a confirmed send. A mid-turn
 session (`endedTurn !== true`), a session showing a question, plan or permission prompt,
-a send that throws, a send that reports only part of the message accepted, and an
-assumed delivery all leave both alone and offer the same batch next tick. A cursor write
-that fails after a confirmed send is reported and left to that same mechanism: the next
-tick asks about the key, the receipt says received, and the cursor moves then without a
-second message. A session launched this tick is delivered nothing — it has the bootstrap
-to read. No delivery ever opens a second session.
+a send that throws, a send that reports only part of the message accepted, an assumed
+delivery, and a lease lost mid-send all leave the batch `sending` and offer it again next
+tick. A cursor write that fails after a confirmed send is reported and left to the
+transcript check above. A session launched this tick is delivered nothing — it has the
+bootstrap to read. No delivery ever opens a second session.
 
 `record.lastDeliveredOffset` rides along with the cursor: the byte just past the last
 delivered line, so the next forward scan starts there instead of re-parsing a feed
@@ -1387,6 +1421,24 @@ have been cheaper still and is deliberately not trusted for it: it is a cache of
 feed's end, and an emit whose record write failed leaves it behind, so believing it would
 declare a feed with an undelivered event in it empty. `flushCommits` is asked for exactly
 once per tick that did change something, and never otherwise.
+
+### Known limits
+
+Two things are understood and deliberately not fixed here; they are their own card.
+
+- **A stale feed offset can coincide with a real line boundary.** `lastDeliveredOffset`
+  is validated by checking that the byte before it is a newline, which catches a
+  truncated or shortened feed. It cannot catch a *rewritten* one — `markSeen` rewrites
+  every line, and if the new file happens to have a line boundary at the same byte, the
+  scan would start from the wrong event. The seq check still applies to everything it
+  then reads, so the failure mode is skipping events whose lines moved before that
+  offset, not delivering the wrong ones. A generation counter on the feed, bumped by
+  every rewrite and stored beside the offset, is the fix.
+- **`readAll` is unbounded and the commit is synchronous.** A forward scan from the
+  cursor reads to the end of the file in one buffer, which is fine for a feed of
+  one-line events and unbounded in principle; and `flushCommits` runs `git` synchronously
+  on the daemon's event loop when a tick changed something. `self-repair.js` has the same
+  shape, so this is a fleet-wide question rather than an area-session one.
 
 ### Configuration
 
