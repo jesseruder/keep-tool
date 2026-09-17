@@ -22,14 +22,19 @@ const EXPANDED_EVENTS = 20;
 // An agent's session is not a working session. It keeps the same four controls
 // off that the reviewer's does: transferring, handing off, restarting or
 // relaying into it would put Owner's words where the agent's recipe belongs.
+//
+// `agentName`, never `agent`: on a session and on pane meta, `agent` is the
+// provider — claude or codex.
 export function sessionControlsAllowed(session) {
-  return !session?.reviewer && !session?.agent;
+  return !session?.reviewer && !session?.agentName;
 }
 
 // Running & waiting lists the fleet's working sessions. An agent's session is
 // listed under Agents instead, exactly as the reviewer's is listed nowhere.
+// app.js's runningItems() repeats this test rather than calling it; see the note
+// there.
 export function hiddenFromRunning(session) {
-  return Boolean(session?.reviewer || session?.agent);
+  return Boolean(session?.reviewer || session?.agentName);
 }
 
 export function agentLifecycleLabel(agent) {

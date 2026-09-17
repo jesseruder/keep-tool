@@ -134,18 +134,37 @@ test('expanding a row marks the feed seen and then reads it', async () => {
 
 test('an agent’s session loses the four controls and is not listed under Running', async () => {
   const { sessionControlsAllowed, hiddenFromRunning } = await import('./triage.js');
-  const working = { id: 'sess-2', kind: 'claude', pane: 'pane-2', state: 'running' };
-  const agent = { id: 'sess-1', kind: 'claude', pane: 'pane-1', state: 'running', agent: 'sandboxes' };
-  const reviewer = { id: 'r1', kind: 'claude', pane: 'pane-r', state: 'running', reviewer: true };
+  const working = { id: 'sess-2', kind: 'claude', agent: 'claude', pane: 'pane-2', state: 'running' };
+  // `agent` is the provider; `agentName` is the standing agent. A codex session
+  // carrying one has both, and only `agentName` gates anything.
+  const agent = { id: 'sess-1', kind: 'codex', agent: 'codex', pane: 'pane-1', state: 'running', agentName: 'sandboxes' };
+  const reviewer = { id: 'r1', kind: 'claude', agent: 'claude', pane: 'pane-r', state: 'running', reviewer: true };
 
   assert.equal(sessionControlsAllowed(working), true);
   assert.equal(sessionControlsAllowed(agent), false, 'transfer, handoff, restart and relay are all gated on this');
   assert.equal(sessionControlsAllowed(reviewer), false);
   assert.equal(sessionControlsAllowed(undefined), true, 'an item with no session keeps today’s behaviour');
+  assert.equal(sessionControlsAllowed({ id: 'plain', agent: 'codex' }), true,
+    'the provider is not a standing agent: a plain codex session keeps its controls');
 
   assert.equal(hiddenFromRunning(working), false);
   assert.equal(hiddenFromRunning(agent), true);
   assert.equal(hiddenFromRunning(reviewer), true);
+  assert.equal(hiddenFromRunning({ id: 'plain', agent: 'codex' }), false);
   assert.deepEqual([working, agent, reviewer].filter((session) => !hiddenFromRunning(session)).map((session) => session.id),
     ['sess-2']);
+});
+
+// app.js's runningItems() is evaluated as source text in a bare vm context by
+// bin/ui-focus.test.js, so it spells this test out rather than importing it.
+// Both copies must stay the same test.
+test('app.js repeats the Running exclusion inline, and identically', async () => {
+  const fs = await import('node:fs');
+  const source = fs.readFileSync(new URL('./app.js', import.meta.url), 'utf8');
+  const body = source.slice(source.indexOf('function runningItems('), source.indexOf('function pinnedItems('));
+  assert.match(body, /!session\.reviewer && !session\.agentName/);
+  // The comment there names the predicate on purpose; the code must not.
+  const code = body.split('\n').filter((line) => !line.trim().startsWith('//')).join('\n');
+  assert.equal(code.includes('hiddenFromRunning'), false,
+    'a bare identifier from another module is not defined in that harness');
 });

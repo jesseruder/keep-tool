@@ -15,7 +15,7 @@ import { setTerminalRendererPreference } from './terminal-renderer.js';
 import { installFocusDebug } from './focus-debug.js';
 import { retainSelection, stableSessionOrder } from './selection.js';
 import { createSessionHistory, installSessionHistory } from './session-history.js';
-import { installTriageControls, renderTriage, hiddenFromRunning } from './triage.js';
+import { installTriageControls, renderTriage } from './triage.js';
 import { renderWatch, installWatchControls } from './watch.js';
 import { renderFleet } from './fleet.js';
 import { numLabel } from './session-number.js';
@@ -258,8 +258,13 @@ function sessionItem(kind, session, pane = session.pane) {
 }
 function runningItems() {
   const sessions = (data.sessions || [])
+    // The reviewer and every other standing agent are listed under Agents, not
+    // here — the same test triage.js's hiddenFromRunning() makes. It is spelled
+    // out rather than called because bin/ui-focus.test.js evaluates this
+    // function's source text in a bare context: a bare identifier from another
+    // module is not defined there.
     .filter((session) => (['running', 'waiting'].includes(session.state) || state.markedRunning.has(session.id))
-      && !hiddenFromRunning(session) && !isClosingSession(session.id, session.pane));
+      && !session.reviewer && !session.agentName && !isClosingSession(session.id, session.pane));
   const tasks = new Map((data.tasks || []).map((task) => [task.id, task]));
   const panes = paneMap();
   const createdAt = (session) => {
