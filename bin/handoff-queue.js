@@ -36,7 +36,16 @@ const SETTLED_KEEP_MS = 24 * 60 * 60e3;
 const PARKED_KEEP_MS = 7 * 24 * 60 * 60e3;
 
 const SESSION_RE = /^[A-Za-z0-9_-]+$/;
+// The session-id shape bin/portable-handoff.js and serve.js already validate. A
+// filter that arrives in a request body is not a place to accept anything else:
+// a string, a null or an object used to mean "no filter" would quietly enqueue
+// the whole account.
+const FILTER_ID_RE = /^[A-Za-z0-9_-]{8,160}$/;
 const STATUSES = ['queued', 'moved', 'parked', 'cancelled'];
+// A handoff transaction that has not finished has already stopped the source or
+// staged its artifacts. It must be allowed to complete whatever the session looks
+// like now.
+const TERMINAL_HANDOFF_STATUSES = ['done', 'failed'];
 
 function defaultRoot() { return process.env.KEEP_DIR || path.join(os.homedir(), 'keep'); }
 function dir(root) { return path.join(root || defaultRoot(), '.keep', 'handoff-queue'); }
@@ -90,8 +99,18 @@ function normalize(input) {
   if (sourceAccountId && !accounts.ID_RE.test(sourceAccountId)) throw badRequest('Expected an exact source account');
   if (sourceAccountId && sourceAccountId === targetAccountId) throw badRequest('source and target account are the same', 409);
   if (input?.force !== undefined && typeof input.force !== 'boolean') throw badRequest('Queued transfer force must be a boolean');
-  return { sessionId, pane, sourceAccountId, targetAccountId, force: input?.force === true };
+  // The rate-limit event this entry exists for, so a later attempt can tell that
+  // it is still the same one. limitresume.js compares the same `at` the same way.
+  const rateLimitAt = input?.rateLimitAt == null ? null : input.rateLimitAt;
+  if (rateLimitAt !== null && typeof rateLimitAt !== 'string' && typeof rateLimitAt !== 'number') {
+    throw badRequest('Queued transfer rateLimitAt must be a string or a number');
+  }
+  return { sessionId, pane, sourceAccountId, targetAccountId, force: input?.force === true, rateLimitAt };
 }
+
+// Every write bumps it, and a settle only lands when the entry on disk still
+// carries the generation the attempt was computed from.
+function nextGeneration(current) { return Number(current && current.generation || 0) + 1; }
 
 // Idempotent per session: a queued entry is left exactly as it is, backoff and
 // all, so a repeated batch request cannot reset an entry's patience. A parked or
@@ -104,6 +123,7 @@ function enqueue(root, input, options = {}) {
   if (current && current.status === 'queued') return { entry: current, created: false };
   const entry = writeOne(root, {
     ...fields,
+    generation: nextGeneration(current),
     enqueuedAt: now,
     attempts: 0,
     lastReason: '',
@@ -124,7 +144,8 @@ function cancel(root, sessionId, options = {}) {
   const current = readOne(root, sessionId);
   if (!current) throw badRequest('no queued transfer for this session', 404);
   if (!['queued', 'parked'].includes(current.status)) return { ok: true, entry: current, changed: false };
-  const entry = writeOne(root, { ...current, status: 'cancelled', cancelledAt: now, updatedAt: now });
+  const entry = writeOne(root, { ...current, status: 'cancelled', cancelledAt: now,
+    generation: nextGeneration(current), updatedAt: now });
   log(`cancelled ${sessionId}`);
   return { ok: true, entry, changed: true };
 }
@@ -207,17 +228,49 @@ function policyEnqueue(root, sessions, now, deps, log) {
       summary.exhausted += 1;
       continue;
     }
-    enqueue(root, { sessionId: session.id, pane: session.pane, sourceAccountId, targetAccountId }, { now, log });
+    enqueue(root, { sessionId: session.id, pane: session.pane, sourceAccountId, targetAccountId,
+      rateLimitAt: session.rateLimit?.at ?? null }, { now, log });
     summary.enqueued += 1;
   }
   if (summary.exhausted) log(`policy held ${summary.exhausted} session(s): the target's weekly window is spent`);
   return summary;
 }
 
+// A settle lands only on the state the attempt was computed from. A transfer can
+// take minutes, and a cancel from the console (or another writer) may land while
+// it is in flight; writing the attempt's conclusion over that would resurrect a
+// transfer a person just stopped — a transient refusal would put it back to
+// 'queued' and it would run again.
 function settle(root, entry, patch, now, log, line) {
-  const next = writeOne(root, { ...entry, ...patch, updatedAt: now });
+  const current = readOne(root, entry.sessionId);
+  if (!current || Number(current.generation || 0) !== Number(entry.generation || 0)) {
+    log(`left ${entry.sessionId} alone: its queue entry changed while the transfer was running`);
+    return { entry: current, landed: false };
+  }
+  const next = writeOne(root, { ...current, ...patch, generation: nextGeneration(current), updatedAt: now });
   log(line);
-  return next;
+  return { entry: next, landed: true };
+}
+
+// Where the session lives now. The live row names it; durable authority answers
+// for a row that has not been given one, which is how handoffSession itself
+// resolves a source account.
+function currentAccount(session, deps) {
+  const fromState = accountOf(session);
+  if (fromState) return fromState;
+  try {
+    const resolve = deps.accountFor || ((sessionId, kind) => accounts.forSession(sessionId, kind,
+      { root: deps.root || defaultRoot(), env: deps.env || process.env })?.id || null);
+    return resolve(session.id, session.kind || 'claude') || null;
+  } catch { return null; }
+}
+
+function transferStarted(root, entry, deps) {
+  let records;
+  try { records = deps.handoffRecords ? deps.handoffRecords() : require('./account-handoff').list(root); }
+  catch { return false; }
+  return (records || []).some((record) => record && record.sessionId === entry.sessionId
+    && !TERMINAL_HANDOFF_STATUSES.includes(record.status));
 }
 
 async function attemptOne(root, entry, sessions, now, deps, log) {
@@ -226,9 +279,26 @@ async function attemptOne(root, entry, sessions, now, deps, log) {
     return settle(root, entry, { status: 'moved', movedAt: now, note: 'session is no longer in state' },
       now, log, `done ${entry.sessionId}: session is no longer in state`);
   }
-  if (accountOf(session) === entry.targetAccountId) {
+  // Where it is now, not where it was when it was queued. A person may have moved
+  // it somewhere else in the meantime, and asking for C → B — with the force this
+  // entry recorded for A → B — is a transfer nobody asked for.
+  const on = currentAccount(session, deps);
+  if (on === entry.targetAccountId) {
     return settle(root, entry, { status: 'moved', movedAt: now, note: 'already on the target account' },
       now, log, `done ${entry.sessionId}: already on ${entry.targetAccountId}`);
+  }
+  if (on && entry.sourceAccountId && on !== entry.sourceAccountId) {
+    const note = `no longer on ${entry.sourceAccountId}; it is on ${on}`;
+    return settle(root, entry, { status: 'moved', movedAt: now, note }, now, log, `done ${entry.sessionId}: ${note}`);
+  }
+  // The limit is the whole reason this entry exists. If it cleared, or the person
+  // went back to work on the session, transferring would stop a live session and
+  // inject a continuation nobody asked for. A transaction that already started is
+  // the one exception: it has to be allowed to finish.
+  if (entry.rateLimitAt != null && String(session.rateLimit?.at ?? '') !== String(entry.rateLimitAt)
+      && !transferStarted(root, entry, deps)) {
+    return settle(root, entry, { status: 'cancelled', cancelledAt: now, note: 'rate limit cleared' },
+      now, log, `cancelled ${entry.sessionId}: rate limit cleared`);
   }
   // The live pane wins over the recorded one: the session may have been reopened
   // since it was queued, and the transfer must name the pane it is in now.
@@ -291,14 +361,22 @@ async function tick(deps = {}) {
     return { ok: true, detail: policy.enqueued ? `queued ${policy.enqueued}` : 'nothing due' };
   }
   const sessions = await loadSessions();
-  const counts = { moved: 0, retrying: 0, parked: 0 };
-  for (const entry of due) {
-    const settled = await attemptOne(root, entry, sessions, now, deps, log);
+  const counts = { moved: 0, retrying: 0, parked: 0, cancelled: 0, skipped: 0 };
+  for (const candidate of due) {
+    // The list was taken before the first transfer; an earlier one in this same
+    // tick may have taken minutes, and a cancel may have landed since. Read the
+    // entry again and dispatch only what is still queued and still due.
+    const entry = readOne(root, candidate.sessionId);
+    if (!entry || entry.status !== 'queued' || Number(entry.nextAt || 0) > now) { counts.skipped += 1; continue; }
+    const { entry: settled, landed } = await attemptOne(root, entry, sessions, now, deps, log);
+    if (!landed) { counts.skipped += 1; continue; }
     if (settled.status === 'moved') counts.moved += 1;
     else if (settled.status === 'parked') counts.parked += 1;
+    else if (settled.status === 'cancelled') counts.cancelled += 1;
     else counts.retrying += 1;
   }
-  return { ok: true, detail: `moved ${counts.moved}, retrying ${counts.retrying}, parked ${counts.parked}` };
+  const extra = [counts.cancelled ? `cancelled ${counts.cancelled}` : '', counts.skipped ? `skipped ${counts.skipped}` : ''].filter(Boolean);
+  return { ok: true, detail: [`moved ${counts.moved}`, `retrying ${counts.retrying}`, `parked ${counts.parked}`, ...extra].join(', ') };
 }
 
 // The batch the console's "Move N rate-limited sessions" button asks for. It only
@@ -321,7 +399,14 @@ function batch(deps = {}) {
   if (source.id === target.id) throw badRequest('source and target account are the same', 409);
   if (source.agent !== target.agent) throw badRequest('A batch transfer needs two accounts for the same provider', 409);
   const force = deps.force === true;
-  const only = Array.isArray(deps.sessionIds) ? new Set(deps.sessionIds.map((id) => String(id))) : null;
+  let only = null;
+  if (deps.sessionIds !== undefined) {
+    if (!Array.isArray(deps.sessionIds) || !deps.sessionIds.length
+        || !deps.sessionIds.every((id) => typeof id === 'string' && FILTER_ID_RE.test(id))) {
+      throw badRequest('Batch transfer sessionIds must be a list of exact session ids');
+    }
+    only = new Set(deps.sessionIds);
+  }
   const queued = [];
   const skipped = [];
   for (const session of deps.sessions || []) {
@@ -335,7 +420,8 @@ function batch(deps = {}) {
     if (!session.pane) { skipped.push({ sessionId: session.id, reason: 'no live pane' }); continue; }
     const current = readOne(root, session.id);
     if (current && current.status === 'queued') { skipped.push({ sessionId: session.id, reason: 'already queued' }); continue; }
-    enqueue(root, { sessionId: session.id, pane: session.pane, sourceAccountId, targetAccountId, force }, { now, log });
+    enqueue(root, { sessionId: session.id, pane: session.pane, sourceAccountId, targetAccountId, force,
+      rateLimitAt: session.rateLimit?.at ?? null }, { now, log });
     queued.push({ sessionId: session.id, pane: session.pane, title: session.title || '' });
   }
   return { ok: true, queued, skipped };
