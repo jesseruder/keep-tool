@@ -793,6 +793,18 @@ test('a session carrying an agent is marked with its name, by id, pane or pane m
   } finally { cleanup(root); }
 });
 
+// The mark has to be on the session before anything asks whether it belongs to an
+// agent. session-status.attention() reads `agentName` to keep an agent out of
+// "Waiting on you", and the queue used to be built before applySessions ran.
+test('the agent mark is applied before the attention queue is built', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'serve.js'), 'utf8');
+  const marked = source.indexOf('agents.applySessions(sessions, agentRecords');
+  const queued = source.indexOf('const item = sessionAttentionItem(s, now);');
+  assert.ok(marked > 0, 'the state build still marks agent sessions');
+  assert.ok(queued > 0, 'the state build still has an attention loop');
+  assert.ok(marked < queued, 'an agent session cannot be recognised after the queue is built');
+});
+
 // `agent` is the provider — claude or codex — on sessions, pane meta, process
 // rows and the mobile contract. The standing agent's name is a separate field
 // precisely so a codex-backed agent session does not surface as codex-less.

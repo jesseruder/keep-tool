@@ -120,6 +120,9 @@ test('live stopped sessions need a next instruction without a prose question', (
       assert.equal(attention({ ...live, endedTurn: false }), null);
       assert.equal(attention({ ...live, toolRunning: true }), null);
       assert.equal(attention({ ...live, reviewer: true }), null);
+      // A standing agent is watched through its Agents row, the same as the
+      // reviewer: its session never takes a "Waiting on you" slot.
+      assert.equal(attention({ ...live, agentName: 'sandboxes' }), null);
       assert.equal(attention({ ...live, exited: true }), null);
       assert.equal(attention({ ...live, taskStatus: 'done' }).attentionLabel, 'Ready for next instruction');
       assert.equal(attention({ ...live, pendingBackground: true }), null);

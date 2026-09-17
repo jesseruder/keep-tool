@@ -7344,6 +7344,17 @@ function buildState(options = {}) {
   const stalledItems = stalled.readCurrent({ root: keep.ROOT });
   const stalledSessionIds = new Set(stalledItems.filter((item) => item.kind === 'session').map((item) => item.id));
   for (const s of sessions) s.stalled = stalledSessionIds.has(s.id);
+  // Agent records are on disk, and a session carrying a standing agent is marked
+  // here so the console can tell it apart from a working session. It happens before
+  // the attention queue below and not after it, which is where it used to sit: the
+  // queue asks whether a session is an agent's, and an agent nobody is watching must
+  // not take a "Waiting on you" slot. The reviewer's own row is derived further down,
+  // once its stats have been built.
+  let agentRecords = [];
+  try {
+    agentRecords = agents.records(keep.ROOT);
+    agents.applySessions(sessions, agentRecords, options.hostPanes || []);
+  } catch {}
   const attention = [];
   for (const s of sessions) {
     const item = sessionAttentionItem(s, now);
@@ -7396,14 +7407,6 @@ function buildState(options = {}) {
   else try { digest = ensureDigest(); } catch (e) { process.stderr.write(`keep serve: digest failed: ${e.message}\n`); }
   const alertMeta = alerts.loadMeta(keep.ROOT);
   attachStateLines(sessions);
-  // Agent records are on disk; the reviewer's row is derived further down, once
-  // its own stats have been built. A session carrying an agent is marked here so
-  // the console can tell it apart from a working session.
-  let agentRecords = [];
-  try {
-    agentRecords = agents.records(keep.ROOT);
-    agents.applySessions(sessions, agentRecords, options.hostPanes || []);
-  } catch {}
   const state = {
     generatedAt: Date.now(),
     shadowDecisions: shadowDecisionSummary(),

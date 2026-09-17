@@ -91,7 +91,10 @@ function activity(session, context = {}) {
 }
 
 function attention(session, context) {
-  if (session.reviewer || session.exited || session.state === 'exited') return null;
+  // A standing agent's session is watched through its own row under Agents, the
+  // same as the reviewer's: nobody triages it from "Waiting on you", and a row
+  // there would be a second listing of a pane that already has one.
+  if (session.reviewer || session.agentName || session.exited || session.state === 'exited') return null;
   const status = context ? activity(session, context) : session.activity || activity(session);
   if (!status.needsInput) return null;
   return {
