@@ -6,43 +6,60 @@ const http = require('node:http');
 const WebSocket = require('ws');
 const { createTerminalBridge, containsKeystroke } = require('./terminal-bridge.js');
 
-// A pane the console is attached to, with a meta patch log. `attach` and `subscribe`
-// are the only other calls the bridge makes on a host client.
-function fakeHost(meta = {}) {
-  const calls = [];
+const key = (text) => Buffer.from(text, 'latin1');
+
+// One pane, and a fresh host client per `hostClient()` call, so a test can tell the
+// relay's client from the one the attendance clear opens for itself.
+function fakeHost(meta = {}, onRequest = null) {
   const pane = { id: 'pane-1', meta: { ...meta } };
-  const client = {
-    calls,
-    request: async (type, params) => {
-      calls.push({ type, params });
-      if (type === 'get') return { pane: { ...pane, meta: { ...pane.meta } } };
-      if (type === 'meta') { Object.assign(pane.meta, params.patch); return { pane }; }
-      return {};
-    },
-    attach: async () => ({ pane, detach: () => {} }),
-    subscribe: async () => ({ unsubscribe: () => {} }),
-    close: () => {},
+  const clients = [];
+  const hostClient = async () => {
+    const client = {
+      requests: [],
+      closed: false,
+      attached: false,
+      request: async (type, params) => {
+        client.requests.push({ type, params });
+        if (onRequest) {
+          const override = await onRequest(type, params, client);
+          if (override !== undefined) return override;
+        }
+        if (type === 'get') return { pane: { ...pane, meta: { ...pane.meta } } };
+        if (type === 'meta') { Object.assign(pane.meta, params.patch); return { pane }; }
+        return {};
+      },
+      attach: async () => { client.attached = true; return { pane, detach: () => {} }; },
+      subscribe: async () => ({ unsubscribe: () => {} }),
+      close: () => { client.closed = true; },
+    };
+    clients.push(client);
+    return client;
   };
-  return { client, pane, calls };
+  return {
+    pane,
+    clients,
+    hostClient,
+    relay: () => clients.find((client) => client.attached) || null,
+    attendance: () => clients.filter((client) => !client.attached),
+    patches: () => clients.flatMap((client) => client.requests.filter((call) => call.type === 'meta')),
+  };
 }
 
-async function bridged(meta) {
-  const host = fakeHost(meta);
-  const bridge = createTerminalBridge({ hostClient: async () => host.client });
+async function bridged(host, options = {}) {
+  const bridge = createTerminalBridge({ hostClient: host.hostClient, ...options });
   const server = http.createServer();
   server.on('upgrade', (req, socket, head) => bridge.handleUpgrade(req, socket, head, { pane: 'pane-1' }));
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const ws = new WebSocket(`ws://127.0.0.1:${server.address().port}/`);
-  await new Promise((resolve, reject) => {
-    ws.once('open', resolve);
-    ws.once('error', reject);
-  });
+  const closes = [];
+  ws.on('close', (code) => closes.push(code));
+  await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
   return {
-    host,
+    closes,
     send: (value, binary = true) => new Promise((resolve, reject) => {
       ws.send(value, { binary }, (error) => (error ? reject(error) : resolve()));
     }),
-    settle: async () => { for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setImmediate(resolve)); },
+    settle: async () => { for (let i = 0; i < 40; i += 1) await new Promise((resolve) => setImmediate(resolve)); },
     close: async () => {
       ws.close();
       bridge.close();
@@ -51,95 +68,170 @@ async function bridged(meta) {
   };
 }
 
-test('keystroke detection ignores what xterm sends on its own', () => {
-  assert.equal(containsKeystroke(Buffer.from('a')), true);
-  assert.equal(containsKeystroke(Buffer.from('\r')), true);
-  assert.equal(containsKeystroke(Buffer.from('pasted text\r')), true);
-  assert.equal(containsKeystroke(Buffer.from('\x1b')), true, 'a bare Escape is a key');
-  // Focus reports and query replies arrive without anybody touching the keyboard.
-  assert.equal(containsKeystroke(Buffer.from('\x1b[I')), false);
-  assert.equal(containsKeystroke(Buffer.from('\x1b[O')), false);
-  assert.equal(containsKeystroke(Buffer.from('\x1b[?1;2c')), false);
-  assert.equal(containsKeystroke(Buffer.from('\x1b[8;50;200t')), false);
-  // Arrow keys are indistinguishable from those, so they do not count either.
-  assert.equal(containsKeystroke(Buffer.from('\x1b[A')), false);
-  assert.equal(containsKeystroke(Buffer.from('\x1bOB')), false);
-  assert.equal(containsKeystroke(Buffer.from('\x1b[Ix')), true, 'a letter beside a report still counts');
+test('a keystroke is what the terminal did not send by itself', () => {
+  // Typed input, in every shape.
+  assert.equal(containsKeystroke(key('a')), true);
+  assert.equal(containsKeystroke(key('\r')), true);
+  assert.equal(containsKeystroke(key('\x1b')), true, 'a lone Escape is a key');
+  assert.equal(containsKeystroke(key('\x1b[200~pasted text\x1b[201~')), true, 'a paste is a person');
+
+  // Navigation and function keys, including the modified and application-mode forms.
+  for (const sequence of ['\x1b[A', '\x1b[B', '\x1b[C', '\x1b[D', '\x1b[H', '\x1b[F',
+    '\x1b[Z', '\x1b[1;5C', '\x1b[3~', '\x1b[5~', '\x1b[15;2~', '\x1bOB', '\x1bOP']) {
+    assert.equal(containsKeystroke(key(sequence)), true, JSON.stringify(sequence));
+  }
+
+  // What xterm answers on its own, with nobody at the keyboard.
+  for (const reply of [
+    '\x1b[I', '\x1b[O',                       // focus in/out
+    '\x1b[?2026;2$y',                          // DECRPM, synchronised output
+    '\x1b[?1;2c', '\x1b[>0;276;0c',            // primary and secondary DA
+    '\x1b[24;80R',                             // cursor position report
+    '\x1b[8;50;200t',                          // window report
+    '\x1b]11;rgb:0000/0000/0000\x07',          // OSC background colour reply
+    '\x1b]10;rgb:ffff/ffff/ffff\x1b\\',        // the same, ST-terminated
+    '\x1b[<0;10;5M', '\x1b[<0;10;5m',          // SGR mouse press and release
+    '\x1bP>|xterm(390)\x1b\\',                 // DCS version reply
+  ]) {
+    assert.equal(containsKeystroke(key(reply)), false, JSON.stringify(reply));
+  }
+  // An X10 mouse report's three coordinate bytes are arbitrary, high bytes included.
+  assert.equal(containsKeystroke(key(`\x1b[M${String.fromCharCode(32, 33, 34)}`)), false);
+  assert.equal(containsKeystroke(key(`\x1b[M${String.fromCharCode(96, 200, 210)}`)), false);
+  // A letter alongside a reply still counts.
+  assert.equal(containsKeystroke(key('\x1b[Ix')), true);
   assert.equal(containsKeystroke(Buffer.alloc(0)), false);
   assert.equal(containsKeystroke(null), false);
 });
 
-test('a console keystroke clears the unattended mark exactly once', async () => {
-  const f = await bridged({ unattended: true, opener: { kind: 'check', id: 'card-1' }, sessionId: 'sid' });
+test('a console keystroke clears the unattended mark exactly once, off the relay client', async () => {
+  const host = fakeHost({ unattended: true, opener: { kind: 'check', id: 'card-1' }, sessionId: 'sid' });
+  const f = await bridged(host);
   try {
-    await f.send(Buffer.from('y'));
+    await f.send(key('y'));
     await f.settle();
-    assert.equal(f.host.pane.meta.unattended, false, 'somebody is reading this pane now');
-    assert.equal(f.host.pane.meta.attendedBy, 'console');
-    assert.ok(f.host.pane.meta.attendedAt > Date.now() - 10_000);
-    assert.deepEqual(f.host.pane.meta.opener, { kind: 'check', id: 'card-1' }, 'who opened it does not change');
-    const patches = f.host.calls.filter((call) => call.type === 'meta').length;
-    assert.equal(patches, 1);
+    assert.equal(host.pane.meta.unattended, false, 'somebody is reading this pane now');
+    assert.equal(host.pane.meta.attendedBy, 'console');
+    assert.ok(host.pane.meta.attendedAt > Date.now() - 10_000);
+    assert.deepEqual(host.pane.meta.opener, { kind: 'check', id: 'card-1' }, 'who opened it does not change');
+    assert.equal(host.patches().length, 1);
+
+    // Its own client, opened and closed for the two requests, so nothing it does can
+    // reach the relay's shared client or the input in flight on it.
+    assert.equal(host.attendance().length, 1);
+    assert.deepEqual(host.attendance()[0].requests.map((call) => call.type), ['get', 'meta']);
+    assert.equal(host.attendance()[0].closed, true);
+    assert.equal(host.relay().closed, false, 'the relay client is untouched');
+    assert.deepEqual(host.relay().requests.map((call) => call.type), ['input']);
+
     // A second keystroke does not ask the host again.
-    await f.send(Buffer.from('es\r'));
+    await f.send(key('es\r'));
     await f.settle();
-    assert.equal(f.host.calls.filter((call) => call.type === 'meta').length, 1);
-    // The input itself always reaches the pane.
-    const input = f.host.calls.filter((call) => call.type === 'input');
-    assert.deepEqual(input.map((call) => Buffer.from(call.params.data, 'base64').toString('utf8')), ['y', 'es\r']);
+    assert.equal(host.patches().length, 1);
+    assert.equal(host.attendance().length, 1);
+    assert.deepEqual(host.relay().requests.filter((call) => call.type === 'input')
+      .map((call) => Buffer.from(call.params.data, 'base64').toString('utf8')), ['y', 'es\r']);
+    assert.deepEqual(f.closes, []);
   } finally { await f.close(); }
 });
 
-test('focus reports and automatic replies leave an unattended pane unattended', async () => {
-  const f = await bridged({ unattended: true, sessionId: 'sid' });
+test('replies the terminal generates leave an unattended pane unattended', async () => {
+  const host = fakeHost({ unattended: true, sessionId: 'sid' });
+  const f = await bridged(host);
   try {
-    await f.send(Buffer.from('\x1b[I'));
-    await f.send(Buffer.from('\x1b[O'));
-    await f.send(Buffer.from('\x1b[A'));
+    for (const reply of ['\x1b[I', '\x1b[O', '\x1b[?2026;2$y', '\x1b]11;rgb:0000/0000/0000\x07',
+      `\x1b[M${String.fromCharCode(32, 33, 34)}`, '\x1b[<0;10;5M', '\x1b[24;80R']) {
+      await f.send(key(reply));
+    }
     await f.settle();
-    assert.equal(f.host.pane.meta.unattended, true);
-    assert.equal(f.host.calls.filter((call) => call.type === 'meta').length, 0);
+    assert.equal(host.pane.meta.unattended, true);
+    assert.equal(host.patches().length, 0);
+    assert.equal(host.attendance().length, 0, 'the host is not even contacted');
 
     // The console's own reply path is xterm answering a query, not a person typing.
     await f.send(JSON.stringify({ t: 'reply', data: Buffer.from('x').toString('base64') }), false);
     await f.settle();
-    assert.equal(f.host.pane.meta.unattended, true);
-    assert.equal(f.host.calls.filter((call) => call.type === 'meta').length, 0);
-    assert.equal(f.host.calls.filter((call) => call.type === 'input' && call.params.auto === true).length, 1);
+    assert.equal(host.pane.meta.unattended, true);
+    assert.equal(host.patches().length, 0);
+    assert.equal(host.relay().requests.filter((call) => call.type === 'input' && call.params.auto === true).length, 1);
   } finally { await f.close(); }
 });
 
-test('a pane nobody marked, and a failing patch, never cost the console a keystroke', async () => {
-  const attended = await bridged({ sessionId: 'sid' });
+test('an attended pane is read once and never patched', async () => {
+  const host = fakeHost({ sessionId: 'sid' });
+  const f = await bridged(host);
   try {
-    await attended.send(Buffer.from('a'));
-    await attended.settle();
-    assert.equal(attended.host.calls.filter((call) => call.type === 'meta').length, 0,
-      'an attended pane is never patched');
-    assert.equal(attended.host.calls.filter((call) => call.type === 'input').length, 1);
-  } finally { await attended.close(); }
+    await f.send(key('a'));
+    await f.settle();
+    assert.equal(host.patches().length, 0);
+    assert.deepEqual(host.attendance()[0].requests.map((call) => call.type), ['get']);
+    await f.send(key('b'));
+    await f.settle();
+    assert.equal(host.attendance().length, 1, 'and the answer is remembered');
+    assert.equal(host.relay().requests.filter((call) => call.type === 'input').length, 2);
+  } finally { await f.close(); }
+});
 
+test('a failed clear is retried by a later keystroke, and never costs the relay anything', async () => {
+  let failures = 1;
+  const host = fakeHost({ unattended: true, sessionId: 'sid' }, (type) => {
+    if (type === 'meta' && failures > 0) { failures -= 1; throw new Error('host refused the patch'); }
+    return undefined;
+  });
+  const f = await bridged(host, { attendanceRetryMs: 0 });
+  try {
+    await f.send(key('a'));
+    await f.settle();
+    assert.equal(host.pane.meta.unattended, true, 'the patch failed, so nothing changed');
+    assert.equal(host.attendance().length, 1);
+    assert.equal(host.attendance()[0].closed, true, 'its own client is still closed');
+
+    // Not latched: a later keystroke tries again and succeeds.
+    await f.send(key('b'));
+    await f.settle();
+    assert.equal(host.pane.meta.unattended, false);
+    assert.equal(host.attendance().length, 2);
+    assert.equal(host.patches().length, 2);
+
+    // And once it has, it stops asking.
+    await f.send(key('c'));
+    await f.settle();
+    assert.equal(host.attendance().length, 2);
+
+    // Through all of it the relay kept its client and delivered every keystroke.
+    assert.equal(host.relay().closed, false);
+    assert.deepEqual(host.relay().requests.filter((call) => call.type === 'input')
+      .map((call) => Buffer.from(call.params.data, 'base64').toString('utf8')), ['a', 'b', 'c']);
+    assert.deepEqual(f.closes, [], 'and the socket survived a refused patch');
+  } finally { await f.close(); }
+});
+
+test('a host that is down is retried once per window, not on every keystroke', async () => {
   const host = fakeHost({ unattended: true, sessionId: 'sid' });
-  const failing = {
-    ...host.client,
-    request: async (type, params) => {
-      if (type === 'meta') throw new Error('host refused the patch');
-      return host.client.request(type, params);
-    },
+  let refuse = true;
+  const hostClient = async () => {
+    if (refuse) throw new Error('terminal host is unavailable');
+    return host.hostClient();
   };
-  const bridge = createTerminalBridge({ hostClient: async () => failing });
+  const bridge = createTerminalBridge({ hostClient, attendanceRetryMs: 60_000 });
   const server = http.createServer();
   server.on('upgrade', (req, socket, head) => bridge.handleUpgrade(req, socket, head, { pane: 'pane-1' }));
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const ws = new WebSocket(`ws://127.0.0.1:${server.address().port}/`);
-  const closes = [];
-  ws.on('close', (code) => closes.push(code));
   try {
+    // The relay's own connect loop retries too, so let it settle before typing.
     await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+    refuse = false;
+    for (let i = 0; i < 40; i += 1) await new Promise((resolve) => setImmediate(resolve));
+    refuse = true;
+    const before = host.clients.length;
     ws.send(Buffer.from('a'), { binary: true });
     for (let i = 0; i < 40; i += 1) await new Promise((resolve) => setImmediate(resolve));
-    assert.deepEqual(closes, [], 'the socket survives a refused patch');
-    assert.equal(host.calls.filter((call) => call.type === 'input').length, 1, 'and the keystroke still landed');
+    ws.send(Buffer.from('b'), { binary: true });
+    ws.send(Buffer.from('c'), { binary: true });
+    for (let i = 0; i < 40; i += 1) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(host.clients.length, before, 'a host that refuses the connection is asked once');
+    assert.equal(host.pane.meta.unattended, true);
   } finally {
     ws.close();
     bridge.close();

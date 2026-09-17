@@ -5,21 +5,44 @@ const { WebSocketServer, WebSocket } = require('ws');
 const RECONNECT_WINDOW_MS = Number(process.env.KEEP_CONSOLE_RECONNECT_MS) || 60_000;
 const MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
 const MAX_REPLY_BYTES = 4 * 1024;
+// The attendance clear is best effort and off the keystroke's path: a short deadline
+// per request, and one attempt per window when the host is not answering.
+const ATTENDANCE_TIMEOUT_MS = 1000;
+const ATTENDANCE_RETRY_MS = 5000;
 
-// xterm.js answers the terminal's own queries and reports focus changes without
-// anybody touching the keyboard, so those bytes are not a person. Strip the escape
-// sequences and focus reports; whatever is left — a letter, Enter, a paste — is.
+// Keys that a person pressed, and that look exactly like the replies below: arrows,
+// Home/End, Shift-Tab (CSI Z), the modified forms (`\x1b[1;5C`), the tilde keys
+// (Delete, PgUp, F5…) and the SS3 forms an application-mode terminal sends instead.
+const NAVIGATION_KEY = /\x1b\[[ABCDHFZ]|\x1b\[1;\d+[ABCDHF]|\x1b\[\d+(?:;\d+)?~|\x1bO[ABCDHFPQRS]/;
+
+// What xterm.js emits on its own, with nobody at the keyboard: answers to the
+// terminal's own queries (DECRPM `\x1b[?2026;2$y`, primary DA, cursor position),
+// focus reports, mouse reports, colour and title replies. Matched structurally
+// rather than by name so a reply Keep has never seen is still not a person.
+const TERMINAL_REPLIES = [
+  /\x1b\[M[\s\S]{3}/g,                  // X10 mouse: three arbitrary bytes, before the CSI rule
+  /\x1b\[[\x20-\x3f]*[\x40-\x7e]/g,     // CSI: DECRPM, DA, CPR, focus, SGR mouse, paste markers
+  /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, // OSC: colour and title replies
+  /\x1b[PX^_][\s\S]*?\x1b\\/g,          // DCS, SOS, PM, APC
+  /\x1bO./g,                            // SS3
+];
+
 function containsKeystroke(data) {
   if (!data || !data.length) return false;
-  const text = Buffer.from(data).toString('latin1')
-    .replace(/\x1b\[[0-9;?<>=]*[A-Za-z~]/g, '')
-    .replace(/\x1bO[A-Za-z]/g, '');
-  return text.length > 0;
+  // latin1 keeps one byte to one character, so a mouse report's high bytes stay the
+  // three characters the X10 rule above expects.
+  const text = Buffer.from(data).toString('latin1');
+  if (NAVIGATION_KEY.test(text)) return true;
+  let rest = text;
+  for (const pattern of TERMINAL_REPLIES) rest = rest.replace(pattern, '');
+  return rest.length > 0;
 }
 
 function createTerminalBridge(options = {}) {
   if (typeof options.hostClient !== 'function') throw new Error('terminal bridge needs a host client');
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
+  const attendanceRetryMs = Number.isFinite(Number(options.attendanceRetryMs))
+    ? Math.max(0, Number(options.attendanceRetryMs)) : ATTENDANCE_RETRY_MS;
 
   const onConnection = async (ws, pane, viewer, attachPrimary, snapshotScrollback) => {
     let closed = false;
@@ -190,27 +213,53 @@ function createTerminalBridge(options = {}) {
       return result;
     });
     // A person typing into the console is the one thing that proves somebody is
-    // reading this pane. Clear the unattended mark once per socket, and never let a
-    // failure here delay or break the keystroke itself.
-    let attendedPatched = false;
+    // reading this pane. Two rules keep this off the keystroke's own path: it runs on
+    // a host client of its own — the relay's `hostRequest` reconnects on error, which
+    // closes the shared client and rejects the input still in flight on it — and
+    // nothing here is latched until it actually succeeded, so a host that was down
+    // when the first key landed is asked again by a later one.
+    let attended = false;
+    let attending = null;
+    let attemptedAt = 0;
     const markAttended = async () => {
-      if (attendedPatched) return;
-      attendedPatched = true;
+      let client = null;
       try {
-        const current = await hostRequest('get', { pane });
-        if (current?.pane?.meta?.unattended !== true) return;
-        await hostRequest('meta', {
+        client = await options.hostClient();
+        if (!client) return false;
+        const current = await client.request('get', { pane }, { timeoutMs: ATTENDANCE_TIMEOUT_MS });
+        // Already attended, or never marked: there is nothing left to clear.
+        if (current?.pane?.meta?.unattended !== true) return true;
+        await client.request('meta', {
           pane,
           patch: { unattended: false, attendedAt: Date.now(), attendedBy: 'console' },
-        });
-      } catch {}
+        }, { timeoutMs: ATTENDANCE_TIMEOUT_MS });
+        return true;
+      } catch { return false; }
+      finally { if (client) { try { client.close(); } catch {} } }
+    };
+    const noteAttended = (data) => {
+      if (attended || attending || !containsKeystroke(data)) return;
+      const now = Date.now();
+      // A down host is retried on a later keystroke, not hammered on every one.
+      if (attemptedAt && now - attemptedAt < attendanceRetryMs) return;
+      attemptedAt = now;
+      const attempt = markAttended();
+      attending = attempt;
+      const settle = (ok) => {
+        if (attending !== attempt) return;
+        attending = null;
+        if (ok === true) attended = true;
+      };
+      attempt.then(settle, () => settle(false));
+      // A factory that never settles must not block every later attempt either.
+      setTimeout(() => settle(false), attendanceRetryMs).unref?.();
     };
     ws.on('message', (data, binary) => {
       if (closed) return;
       let operation;
       if (binary) {
         operation = hostRequest('input', { pane, data: Buffer.from(data).toString('base64') });
-        if (!attendedPatched && containsKeystroke(data)) Promise.resolve(markAttended()).catch(() => {});
+        noteAttended(data);
       } else {
         let message;
         try { message = JSON.parse(data.toString('utf8')); }
