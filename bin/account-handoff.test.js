@@ -1069,6 +1069,19 @@ test('a transfer in flight is visible to anything that would close the session u
     // A refusal at another phase never stopped the source at all.
     record({ status: 'recovery-needed', phase: 'delivering-continuation', updatedAt: now });
     assert.equal(handoff.transferInFlight(root, sid, now), null);
+    // A stamp that is not a finite moment in the past is not freshness. Each of these
+    // read as brand new while the age was computed as `now - Number(x || 0)`.
+    for (const updatedAt of ['Infinity', Infinity, -Infinity, 'soon', null, undefined, 0, now + 60e3]) {
+      record({ status: 'starting', phase: 'starting-target', updatedAt });
+      assert.equal(handoff.transferInFlight(root, sid, now), null, `working ${String(updatedAt)}`);
+      record({ status: 'recovery-needed', phase: 'stopping-source', updatedAt });
+      assert.equal(handoff.transferInFlight(root, sid, now), null, `stopped source ${String(updatedAt)}`);
+    }
+    // The boundary itself: this instant is fresh, and so is the last millisecond.
+    record({ status: 'starting', phase: 'starting-target', updatedAt: now });
+    assert.deepEqual(handoff.transferInFlight(root, sid, now), { status: 'starting', phase: 'starting-target' });
+    record({ status: 'starting', phase: 'starting-target', updatedAt: now - (15 * 60e3 - 1) });
+    assert.deepEqual(handoff.transferInFlight(root, sid, now), { status: 'starting', phase: 'starting-target' });
     for (const status of ['done', 'failed']) {
       record({ status, phase: status === 'done' ? 'done' : 'preflight', updatedAt: now });
       assert.equal(handoff.transferInFlight(root, sid, now), null, status);

@@ -147,16 +147,26 @@ const STOPPED_SOURCE_GRACE_MS = 10 * 60e3;
 // The queue branch is the one that is not bounded here, because the queue parks its
 // own entries at 45 minutes and that is its decision to make, not this one's.
 //
-// Freshness is read from updatedAt, which writeOne stamps on every phase write.
+// Freshness is read from updatedAt, which writeOne stamps on every phase write. A
+// record is fresh only when that stamp is a finite number and the age it gives is
+// neither negative nor past the window: a timestamp in the future, or one that is
+// missing, a string or Infinity, says nothing about when anything last happened, and
+// the old `now - Number(x || 0) < window` read all three of those as brand new.
+function fresh(entry, now, windowMs) {
+  const updatedAt = Number(entry.updatedAt);
+  if (!Number.isFinite(updatedAt)) return false;
+  const age = now - updatedAt;
+  return age >= 0 && age < windowMs;
+}
 function transferInFlight(root, sessionId, now = Date.now()) {
   if (!/^[A-Za-z0-9_-]+$/.test(String(sessionId || ''))) return null;
   let entry = null;
   try { entry = readOne(root, sessionId); } catch { entry = null; }
-  if (entry && IN_FLIGHT_STATUSES.includes(entry.status) && now - Number(entry.updatedAt || 0) < WORKING_GRACE_MS) {
+  if (entry && IN_FLIGHT_STATUSES.includes(entry.status) && fresh(entry, now, WORKING_GRACE_MS)) {
     return { status: entry.status, phase: entry.phase || '' };
   }
   if (entry && entry.status === 'recovery-needed' && entry.phase === 'stopping-source'
-      && now - Number(entry.updatedAt || 0) < STOPPED_SOURCE_GRACE_MS) {
+      && fresh(entry, now, STOPPED_SOURCE_GRACE_MS)) {
     return { status: entry.status, phase: entry.phase };
   }
   let queued = null;
