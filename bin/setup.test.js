@@ -104,6 +104,61 @@ test('a settings file missing only the question hook is reported and repaired', 
   } finally { f.cleanup(); }
 });
 
+test('a Keep hook installed under the wrong matcher is moved, not left to fire on the wrong tool', () => {
+  const command = "'/keep-tool/bin/keep'";
+  // Hand-edited, or merged by an older Keep: the question refusal sits under the Bash
+  // matcher, where Claude Code would run it on every command and never on a question.
+  const wrong = {
+    hooks: {
+      PreToolUse: [{ matcher: 'Bash', hooks: [
+        { type: 'command', command: `${command} hook pre-bash` },
+        { type: 'command', command: `${command} hook pre-question` },
+      ] }],
+      Stop: [{ matcher: 'Bash', hooks: [{ type: 'command', command: `${command} hook stop` }] }],
+    },
+  };
+  const next = setup.mergeHooks(wrong, command);
+  assert.deepEqual(next.hooks.PreToolUse.map((entry) => [entry.matcher, entry.hooks.map((hook) => hook.command)]), [
+    ['Bash', [`${command} hook pre-bash`]],
+    ['AskUserQuestion', [`${command} hook pre-question`]],
+  ]);
+  // An entry that held nothing but the misplaced hook goes with it.
+  assert.deepEqual(next.hooks.Stop.map((entry) => [entry.matcher, entry.hooks.map((hook) => hook.command)]), [
+    ['', [`${command} hook stop`]],
+  ]);
+  assert.deepEqual(setup.mergeHooks(next, command), next, 'and the repair is idempotent');
+
+  // An unmatched event whose entry simply omits `matcher` is already correct.
+  const unkeyed = { hooks: { Stop: [{ hooks: [{ type: 'command', command: `${command} hook stop` }] }] } };
+  const kept = setup.mergeHooks(unkeyed, command);
+  assert.equal(kept.hooks.Stop.length, 1, 'a missing matcher is not a wrong one');
+  assert.deepEqual(kept.hooks.Stop[0].hooks.map((hook) => hook.command), [`${command} hook stop`]);
+});
+
+test('an account carrying only the Bash guard is reported and gains just the question hook', () => {
+  const f = hooksFixture();
+  try {
+    const command = "'/keep-tool/bin/keep'";
+    fs.writeFileSync(f.accountSettings, JSON.stringify({
+      enabledPlugins: { example: true },
+      hooks: {
+        PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: `${command} hook pre-bash` }] }],
+      },
+    }, null, 2) + '\n');
+    assert.deepEqual(setup.missingHooks(f.accountSettings),
+      ['session-start', 'session-end', 'stop', 'notification', 'pre-question', 'post-bash']);
+
+    setup.installHooks(['--account', 'automation']);
+    assert.deepEqual(setup.missingHooks(f.accountSettings), []);
+    const settings = JSON.parse(fs.readFileSync(f.accountSettings, 'utf8'));
+    assert.equal(settings.enabledPlugins.example, true, 'unrelated settings are kept');
+    assert.deepEqual(settings.hooks.PreToolUse.map((entry) => entry.matcher), ['Bash', 'AskUserQuestion']);
+    // The guard it already had is rewritten to this checkout, not duplicated.
+    assert.equal(settings.hooks.PreToolUse[0].hooks.length, 1);
+    assert.match(settings.hooks.PreToolUse[0].hooks[0].command, / hook pre-bash$/);
+  } finally { f.cleanup(); }
+});
+
 test('service definitions escape user paths and pin Node and registry independently', () => {
   const text = setup.servicePlist('serve', '/tmp/registry & notes', '/tmp/node & tools');
   assert.match(text, /registry &amp; notes/);

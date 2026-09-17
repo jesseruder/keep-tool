@@ -361,20 +361,34 @@ function keepHookRe(action) {
 function mergeHooks(settings, command) {
   const next = structuredClone(settings);
   next.hooks ||= {};
+  // A missing `matcher` is Claude Code's "every tool", which is what the unmatched
+  // events ask for, so it counts as the same thing as an empty one.
+  const matcherOf = (entry) => (entry && entry.matcher != null ? String(entry.matcher) : '');
   for (const { event, action, matcher } of HOOK_DEFS) {
     const entries = next.hooks[event] ||= [];
     const hookCommand = `${command} hook ${action}`;
     const stale = keepHookRe(action);
     let found = false;
     for (const entry of entries) {
-      for (const hook of (entry && entry.hooks) || []) {
-        if (hook.command === hookCommand) { found = true; continue; }
+      const hooks = (entry && Array.isArray(entry.hooks)) ? entry.hooks : [];
+      // A Keep hook under the wrong matcher is not this hook at all: Claude Code
+      // would run the question refusal on Bash, or the Bash guard on nothing. Take it
+      // out and let the push below put the action back where it belongs.
+      const misplaced = matcherOf(entry) !== matcher;
+      for (let i = hooks.length - 1; i >= 0; i -= 1) {
+        const hook = hooks[i];
+        const value = String((hook && hook.command) || '');
+        if (value !== hookCommand && !stale.test(value)) continue;
+        if (misplaced) { hooks.splice(i, 1); continue; }
         // A Keep hook for the same action under a different spelling is updated
         // in place, never left beside the new one.
-        if (stale.test(String(hook.command || ''))) { hook.command = hookCommand; found = true; }
+        if (hook.command !== hookCommand) hook.command = hookCommand;
+        found = true;
       }
     }
-    if (!found) entries.push({ matcher, hooks: [{ type: 'command', command: hookCommand }] });
+    // An entry emptied by that move held nothing but the misplaced hook.
+    next.hooks[event] = entries.filter((entry) => !entry || !Array.isArray(entry.hooks) || entry.hooks.length > 0);
+    if (!found) next.hooks[event].push({ matcher, hooks: [{ type: 'command', command: hookCommand }] });
   }
   return next;
 }
