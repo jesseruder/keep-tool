@@ -279,6 +279,11 @@ test('Enter on the focused title opens the editor', async () => {
   assert.equal(isEditing(heading), false, 'another key is not a rename');
   heading.dispatch('keydown', { key: 'Enter', target: badge });
   assert.equal(isEditing(heading), false, 'the title itself has to be the focused element');
+  // ⌘Enter is a global shortcut; app.js prevents its default before this handler sees it.
+  heading.dispatch('keydown', { key: 'Enter', target: title, metaKey: true });
+  assert.equal(isEditing(heading), false, 'a modified Enter belongs to the global shortcuts');
+  heading.dispatch('keydown', { key: 'Enter', target: title, defaultPrevented: true });
+  assert.equal(isEditing(heading), false, 'an Enter another handler already took is not a rename');
   heading.dispatch('keydown', { key: 'Enter', target: title });
   assert.equal(isEditing(heading), true);
 });

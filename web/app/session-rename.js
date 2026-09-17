@@ -137,6 +137,9 @@ export function installHeadingRename(heading, ctx, sessionId, title, rename) {
   heading.addEventListener('click', open);
   heading.addEventListener('keydown', (event) => {
     if (event?.key !== 'Enter') return;
+    // ⌘Enter and friends belong to the global shortcuts (app.js handles them in
+    // the capture phase and prevents the default without stopping propagation).
+    if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
     const titleNode = heading.querySelector?.('h2') || heading.querySelector?.('b');
     if (!titleNode || event.target !== titleNode) return;
     open(event);
