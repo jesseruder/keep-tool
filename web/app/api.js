@@ -83,7 +83,8 @@ async function request(url, options = {}) {
     }
   }
   else if ((options.method || 'GET') !== 'GET'
-      && (STATE_MUTATIONS.has(pathname) || /^\/api\/panes\/[^/]+\/(?:kill|remove)$/.test(pathname))
+      && (STATE_MUTATIONS.has(pathname) || /^\/api\/panes\/[^/]+\/(?:kill|remove)$/.test(pathname)
+        || /^\/api\/agents\/[^/]+\/seen$/.test(pathname))
       && fence) rememberMutationFence(fence, observedFenceAtStart);
   return body;
 }
@@ -150,6 +151,8 @@ export const preparePortableTransfer = (body) => write('/api/portable-transfers'
 export const launchPortableTransfer = (transferId) => write('/api/transfer-session', { transferId });
 export const resolvePortableTransfer = (transferId, destinationSessionId) => write('/api/resolve-portable-transfer', { transferId, destinationSessionId });
 export const abandonAccountHandoff = (sessionId, pane, transactionId) => write('/api/abandon-account-handoff', { sessionId, pane, transactionId });
+export const getAgentEvents = (name, limit = 20) => request(`/api/agents/${encodeURIComponent(name)}/events?limit=${encodeURIComponent(limit)}`);
+export const markAgentSeen = (name) => write(`/api/agents/${encodeURIComponent(name)}/seen`);
 
 export function write(url, body, method = 'POST') {
   return request(url, { method, headers: WRITE_HEADERS, body: JSON.stringify(body || {}) });

@@ -13,6 +13,84 @@ import { numBadgeHTML } from './session-number.js';
 
 const summaryCache = new Map(); // session id -> { text, fetchedAt, mtime, fresh }
 const summaryInflight = new Map();
+// Agent name -> the last feed page fetched for it. Only the expanded row has
+// one; /api/state carries the badge and the last event for every row, so a
+// collapsed agent costs no request.
+const agentFeeds = new Map();
+const EXPANDED_EVENTS = 20;
+
+// An agent's session is not a working session. It keeps the same four controls
+// off that the reviewer's does: transferring, handing off, restarting or
+// relaying into it would put Owner's words where the agent's recipe belongs.
+export function sessionControlsAllowed(session) {
+  return !session?.reviewer && !session?.agent;
+}
+
+// Running & waiting lists the fleet's working sessions. An agent's session is
+// listed under Agents instead, exactly as the reviewer's is listed nowhere.
+export function hiddenFromRunning(session) {
+  return Boolean(session?.reviewer || session?.agent);
+}
+
+export function agentLifecycleLabel(agent) {
+  if (agent?.lifecycle === 'needs-you') return 'needs you';
+  if (agent?.lifecycle === 'stopped') return 'stopped';
+  if (agent?.lifecycle === 'working') return agent.card ? `on ${agent.card}` : 'working';
+  return 'idle';
+}
+
+// Red when any unseen event asked for Owner, grey when they are only news, and
+// absent at zero: a badge that is always there says nothing.
+export function agentBadge(agent) {
+  const count = Number(agent?.unseen?.count || 0);
+  if (!(count > 0)) return null;
+  return { count, tone: agent?.unseen?.needsYou ? 'hot' : 'grey' };
+}
+
+export function agentEventText(event) {
+  return event ? String(event.text || event.title || event.kind || '') : '';
+}
+
+export function agentRowHTML(ctx, agent, expanded = false) {
+  const badge = agentBadge(agent);
+  const last = agent?.lastEvent || null;
+  return `<span class="stripe"></span><span class="t">${expanded ? '▾' : '▸'} ${ctx.esc(agent.name)}</span>
+    <span class="w">${badge ? `<span class="abadge ${badge.tone}">${ctx.esc(badge.count)}</span>` : ''}</span>
+    <span class="p"><span class="kind agent-life">${ctx.esc(agentLifecycleLabel(agent))}</span>${ctx.esc(agent.role || '')}</span>
+    <span class="s">${last ? `${ctx.esc(agentEventText(last))} <span class="w num">${ctx.esc(ctx.rel(last.at))}</span>` : 'no events yet'}</span>`;
+}
+
+// The expanded panel: the last events and the one control a Running row offers
+// for a live pane, so an agent can be opened where it already runs.
+export function agentPanelHTML(ctx, agent, events) {
+  const pane = agent?.session?.pane || '';
+  const open = pane ? `<button class="btn" data-agent-open="${ctx.esc(pane)}">Open pane</button>` : '';
+  const rows = (events || []).slice(0, EXPANDED_EVENTS).map((event) => `<div class="aevent${event.needsYou ? ' needs' : ''}">
+    <span class="w num">${ctx.esc(ctx.rel(event.at))}</span><span class="kind">${ctx.esc(event.kind)}</span>${event.card ? `<span class="card">${ctx.esc(event.card)}</span>` : ''}<span class="at">${ctx.esc(agentEventText(event))}</span>
+  </div>`).join('');
+  return `<div class="ahead">${agent?.model ? `<span class="kind">${ctx.esc(agent.model)}</span>` : ''}${open}</div>${rows || '<div class="aevent muted">No events yet.</div>'}`;
+}
+
+// Expanding a row is the acknowledgement: the feed is marked seen and fetched.
+// Neither failure is worth a toast storm on a background refresh, so a feed that
+// cannot be read renders as an empty one.
+export async function openAgentFeed(ctx, name) {
+  try { await api.markAgentSeen(name); } catch {}
+  let events = [];
+  try { events = (await api.getAgentEvents(name, EXPANDED_EVENTS))?.events || []; } catch {}
+  agentFeeds.set(name, events);
+  ctx.refresh();
+  return events;
+}
+
+export function agentFeed(name) { return agentFeeds.get(name) || null; }
+
+function toggleAgent(ctx, name) {
+  const open = ctx.state.expandedAgent === name;
+  ctx.state.expandedAgent = open ? null : name;
+  if (!open) void openAgentFeed(ctx, name);
+  ctx.refresh();
+}
 
 function waitText(since) {
   const age = Math.max(0, Date.now() - (typeof since === 'number' ? since : Date.parse(since) || Date.now()));
@@ -209,7 +287,7 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
   ctx.state.selected = ctx.state.focusMode && !ctx.state.currentItem ? -1
     : selectionIndex(active, ctx.state.selectedKey, ctx.state.currentItem, ctx.state.selected, ctx.itemKey, ctx.triageKey);
   ctx.state.selectedKey = active[ctx.state.selected] ? ctx.triageKey(active[ctx.state.selected]) : null;
-  const existing = new Map([...list.querySelectorAll(':scope > .qitem')].map((row) => [row.dataset.key, row]));
+  const existing = new Map([...list.querySelectorAll(':scope > .qitem, :scope > .qagent-panel')].map((row) => [row.dataset.key, row]));
   const retained = new Set();
   let cursor = list.firstElementChild;
   const place = (element) => {
@@ -247,6 +325,42 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
     place(row);
   });
   addRows(waiting, 0);
+  // Agents are the fleet's standing workers, not queue items: they are never
+  // selected, counted or dismissed, only read and expanded. The group is absent
+  // entirely when there is no agent to list.
+  const agentRows = ctx.data.agents || [];
+  if (agentRows.length) {
+    addGroup(`Agents · ${ctx.esc(agentRows.length)}`);
+    for (const agent of agentRows) {
+      const key = `agent:${agent.name}`;
+      const expanded = ctx.state.expandedAgent === agent.name;
+      let row = existing.get(key);
+      if (!row) {
+        row = document.createElement('div');
+        row.tabIndex = 0;
+        row.dataset.key = key;
+        row.addEventListener('click', (event) => {
+          if (event.target instanceof Element && event.target.closest('[data-agent-open]')) return;
+          toggleAgent(ctx, row.dataset.key.slice('agent:'.length));
+        });
+      }
+      row.className = `qitem k-agent${expanded ? ' open' : ''}`;
+      ctx.patchHTML(row, agentRowHTML(ctx, agent, expanded));
+      place(row);
+      if (!expanded) continue;
+      const panelKey = `agent-panel:${agent.name}`;
+      let panel = existing.get(panelKey);
+      if (!panel) {
+        panel = document.createElement('div');
+        panel.className = 'qagent-panel';
+        panel.dataset.key = panelKey;
+      }
+      ctx.patchHTML(panel, agentPanelHTML(ctx, agent, agentFeed(agent.name)));
+      place(panel);
+      const openPane = panel.querySelector('[data-agent-open]');
+      if (openPane) openPane.onclick = () => ctx.openReviewPane(openPane.dataset.agentOpen);
+    }
+  }
   const runningHead = addGroup(`${ctx.state.showRunning ? '▾' : '▸'} Running & waiting · ${ctx.esc(running.length)}`, 'qhead qgroup qtoggle', 'button');
   runningHead.addEventListener('click', () => ctx.toggleRunning());
   if (ctx.state.showRunning) addRows(running, waiting.length);
@@ -330,6 +444,14 @@ async function chooseOption(ctx, item, number) {
   } catch (error) { ctx.toast(error.message); }
 }
 
+// "N running · N pinned", and the agents only when there are any: a standing
+// zero teaches nothing.
+export function emptyStateCounts(ctx, running, pinned) {
+  const agentCount = (ctx.data.agents || []).length;
+  return [`${running.length} running`, `${pinned.length} pinned`,
+    ...(agentCount ? [`${agentCount} agent${agentCount === 1 ? '' : 's'}`] : [])].join(' · ');
+}
+
 function renderStage(ctx, active, focusItem, running, pinned) {
   const item = ctx.state.focusMode
     ? active.find((candidate) => focusItem && ctx.itemKey(candidate) === ctx.itemKey(focusItem)) || focusItem
@@ -346,7 +468,7 @@ function renderStage(ctx, active, focusItem, running, pinned) {
     // No terminal is on the stage, so plain keys (w, t, f, ?) must reach the app again.
     ctx.state.focused = false;
     ctx.patchHTML(stage, ctx.state.focusMode
-      ? `<div class="qempty stage-empty focus-waiting" role="status"><span class="focus-pulse" aria-hidden="true"></span><b>Nothing needs you</b><div>${ctx.esc(running.length)} running · ${ctx.esc(pinned.length)} pinned</div><p>Waiting for the next session…</p></div>`
+      ? `<div class="qempty stage-empty focus-waiting" role="status"><span class="focus-pulse" aria-hidden="true"></span><b>Nothing needs you</b><div>${ctx.esc(emptyStateCounts(ctx, running, pinned))}</div><p>Waiting for the next session…</p></div>`
       : '<div class="qempty stage-empty"><b>Queue clear</b><span>Press <kbd>w</kbd> to watch what is running.</span></div>');
     stage.dataset.itemKey = '';
     stage.dataset.pane = '';
@@ -399,13 +521,14 @@ function renderStage(ctx, active, focusItem, running, pinned) {
   const heading = stage.querySelector('.shead .session-heading');
   ctx.patchHTML(heading, `<h2>${ctx.esc(title)}${numBadgeHTML(ctx.esc, item.num ?? session?.num, item.sessionId || session?.id)}</h2><div class="meta mono">${ctx.projectHTML(item.project || session?.project || '', true)}${item.taskId ? `<span>${ctx.esc(item.taskId)}</span>${ctx.tagsHTML(task)}` : ''}${accountLabelHTML(ctx, session, pane)}${outageNote}</div>${task ? modelUsageHTML(task.modelUsage) : ''}`);
   const brief = stage.querySelector('.brief');
-  const portable = item.sessionId && !session?.reviewer ? portableTransferControls(ctx, item.sessionId) : '';
-  const handoff = (closable || pendingHandoff) && !session?.reviewer ? handoffControls(ctx, item.sessionId, item.pane) : '';
-  const restart = closable && !pendingHandoff && !session?.reviewer ? restartControls(ctx, item.sessionId) : '';
-  // The reviewer is not a working session: relaying into or out of it would put
-  // the fleet reviewer's own words in a card's session, which is what
-  // `keep nudge` exists for.
-  const relay = item.sessionId && !session?.reviewer ? relayControlsHTML(ctx, item.sessionId) : '';
+  const ownControls = sessionControlsAllowed(session);
+  const portable = item.sessionId && ownControls ? portableTransferControls(ctx, item.sessionId) : '';
+  const handoff = (closable || pendingHandoff) && ownControls ? handoffControls(ctx, item.sessionId, item.pane) : '';
+  const restart = closable && !pendingHandoff && ownControls ? restartControls(ctx, item.sessionId) : '';
+  // The reviewer and every other agent are not working sessions: relaying into
+  // or out of one would put the agent's own words in a card's session, which is
+  // what `keep nudge` exists for.
+  const relay = item.sessionId && ownControls ? relayControlsHTML(ctx, item.sessionId) : '';
   const markedRunning = Boolean(item.sessionId) && ctx.isMarkedRunning(item);
   const markRunning = !item.sessionId ? ''
     : markedRunning ? '<button class="btn" data-unmark-running title="Put this session back in Waiting on you">Unmark running</button>'
@@ -504,7 +627,7 @@ export function renderTriage(ctx) {
   const visible = items.filter(matchesFilter);
   const waiting = visible.filter((item) => !ctx.state.dismissed.has(ctx.itemKey(item)));
   const sessions = [...ctx.runningItems(), ...ctx.pinnedItems(), ...ctx.recentItems(),
-    ...(ctx.data.sessions || []).filter((session) => !session.reviewer && !ctx.isClosingSession(session.id, session.pane)).map((session) => ({
+    ...(ctx.data.sessions || []).filter((session) => !hiddenFromRunning(session) && !ctx.isClosingSession(session.id, session.pane)).map((session) => ({
       kind: 'recent', sessionId: session.id, pane: session.pane, project: session.project,
       title: session.title, taskId: session.taskId, since: session.mtime, state: session.state,
     }))];

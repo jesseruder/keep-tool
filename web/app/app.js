@@ -15,7 +15,7 @@ import { setTerminalRendererPreference } from './terminal-renderer.js';
 import { installFocusDebug } from './focus-debug.js';
 import { retainSelection, stableSessionOrder } from './selection.js';
 import { createSessionHistory, installSessionHistory } from './session-history.js';
-import { installTriageControls, renderTriage } from './triage.js';
+import { installTriageControls, renderTriage, hiddenFromRunning } from './triage.js';
 import { renderWatch, installWatchControls } from './watch.js';
 import { renderFleet } from './fleet.js';
 import { numLabel } from './session-number.js';
@@ -259,7 +259,7 @@ function sessionItem(kind, session, pane = session.pane) {
 function runningItems() {
   const sessions = (data.sessions || [])
     .filter((session) => (['running', 'waiting'].includes(session.state) || state.markedRunning.has(session.id))
-      && !session.reviewer && !isClosingSession(session.id, session.pane));
+      && !hiddenFromRunning(session) && !isClosingSession(session.id, session.pane));
   const tasks = new Map((data.tasks || []).map((task) => [task.id, task]));
   const panes = paneMap();
   const createdAt = (session) => {

@@ -133,6 +133,19 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .kind.question, .kind.permission, .kind.plan { color: var(--accent); } .kind.rateLimit { color: var(--violet); } .kind.complete { color: var(--ok); }
 .kind.state { color: var(--muted); } .kind.state.running { color: var(--ok); }
 .kind.state.waiting { color: var(--warn); } .kind.state.needs-input { color: var(--accent); }
+/* Agents: one standing row per agent, its badge in the same right-hand column
+   the wait time uses, so the narrow layout needs nothing of its own. */
+.qitem.k-agent .stripe { background: var(--violet); }
+.qitem.k-agent .t { font-family: var(--mono); font-size: 12px; }
+.abadge { display: inline-block; min-width: 18px; padding: 1px 5px; border-radius: 9px; color: var(--bg); background: var(--muted); font: 600 10px/1.4 var(--mono); text-align: center; }
+.abadge.hot { background: var(--accent); }
+.kind.agent-life { color: var(--violet); }
+.qagent-panel { padding: 2px 12px 10px 22px; border-left: 3px solid var(--violet); background: var(--panel-2); }
+.qagent-panel .ahead { display: flex; align-items: center; gap: 8px; padding: 4px 0 6px; }
+.qagent-panel .aevent { display: flex; align-items: baseline; gap: 8px; padding: 3px 0; color: var(--muted); font-size: 12px; }
+.qagent-panel .aevent.needs .at { color: var(--accent); }
+.qagent-panel .aevent .at { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qagent-panel .aevent .card { color: var(--faint); font: 11px var(--mono); }
 .qdis-head { width: 100%; text-align: left; padding: 10px 14px; color: var(--muted); font: 500 11px var(--mono); letter-spacing: .06em; text-transform: uppercase; }
 .qdis-head:hover { color: var(--text); }
 .qdis { display: grid; grid-template-columns: 4px 1fr auto; gap: 0 10px; padding: 8px 12px 8px 10px; border-top: 1px solid var(--line); opacity: .7; align-items: center; }
