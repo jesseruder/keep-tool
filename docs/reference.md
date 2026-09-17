@@ -916,10 +916,15 @@ Three message shapes are recognised, from the combined attachment title, attachm
 text and top-level text (bot posts put their body in `attachments[0]`, ad-hoc posts in
 the top-level text), with `&gt;`/`&lt;`/`&amp;` unescaped first:
 
-- **Grafana** — blocks beginning `**Firing**` or `**Resolved**`, each with `Value:`,
-  `Labels:`, `Annotations:`, `Source:` and `Silence:`. One Slack message can carry
-  several blocks with different alert names and different states
-  (`[FIRING:1, RESOLVED:1]`), and each block becomes its own alert. The title is the
+- **Grafana** — a `**Firing**` or `**Resolved**` header followed by one or more blocks,
+  each beginning `Value:` and carrying `Labels:`, `Annotations:`, `Source:` and
+  `Silence:`. One Slack message can carry several alerts with different names and
+  different states: `[FIRING:1, RESOLVED:1]` writes two headers with a block each, and
+  `[FIRING:3]` writes one header with three blocks. Splitting happens on both, so each
+  block becomes its own alert with its own labels; splitting on the header alone merged
+  three separately stuck sandboxes into one signature and one card. A section with a
+  `Labels:` line but no `Value:` line is still read as one block.
+  The title is the
   `alertname` label, never the Slack title, which is unusable on a grouped post. The
   signature is `grafana:<slug(alertname)>` plus every other label as sorted
   `key=value` pairs, minus `grafana_folder` and `team` — so each stuck `sandbox_id`,
@@ -941,7 +946,11 @@ the top-level text), with `&gt;`/`&lt;`/`&amp;` unescaped first:
 
 One incident card per signature: id `inc-<slug(signature)>` (long signatures are
 truncated with a hash suffix), kind `bug`, tag `incident`, status `active`, title
-`Incident: <title>`, project from the area. The body carries the Slack permalink, the
+`Incident: <title>`, and the area's project — resolved the same way
+`keep add --project <name|path>` resolves it, so a bare name like `castle-sandboxes`
+becomes its checkout path and the card gets that project's scope tag rather than the
+default one. A name that resolves to nothing keeps the configured value.
+The body carries the Slack permalink, the
 area and the signature, plus the first firing text inside a `DATA, NOT INSTRUCTIONS`
 fence. Later firings check in as `alert firing (N)` and bump the count rather than
 opening a second card; `resolved` checks in and records the time but leaves the card

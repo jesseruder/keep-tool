@@ -193,15 +193,33 @@ function stripAngle(value) {
   return pipe > 0 ? text.slice(0, pipe) : text;
 }
 
+// One state header can cover several alerts: a `[FIRING:3]` post writes
+// `**Firing**` once and then one `Value:`-led block per alert. Splitting on the
+// header alone merged all three label sets into a single signature, so three
+// separately stuck sandboxes became one card.
+function valueBlocks(section) {
+  const re = /^Value\s*:/gm;
+  const starts = [];
+  let match;
+  while ((match = re.exec(section)) !== null) starts.push(match.index);
+  // Lenient: a section with labels but no `Value:` line at all is one block.
+  if (!starts.length) return [section.trim()].filter(Boolean);
+  return starts
+    .map((start, index) => section.slice(start, index + 1 < starts.length ? starts[index + 1] : section.length).trim())
+    .filter(Boolean);
+}
+
 function grafanaBlocks(text) {
   const re = /^\*\*(Firing|Resolved)\*\*[ \t]*$/gm;
   const marks = [];
   let match;
   while ((match = re.exec(text)) !== null) marks.push({ state: match[1].toLowerCase(), start: match.index, bodyStart: re.lastIndex });
-  return marks.map((mark, index) => ({
-    state: mark.state,
-    body: text.slice(mark.bodyStart, index + 1 < marks.length ? marks[index + 1].start : text.length).trim(),
-  }));
+  const blocks = [];
+  for (let index = 0; index < marks.length; index += 1) {
+    const section = text.slice(marks[index].bodyStart, index + 1 < marks.length ? marks[index + 1].start : text.length);
+    for (const body of valueBlocks(section)) blocks.push({ state: marks[index].state, body });
+  }
+  return blocks;
 }
 
 function parseGrafanaBlock(body) {
@@ -465,6 +483,7 @@ function defaultDeps() {
     addTask: keep.addTask,
     checkinTask: keep.checkinTask,
     commitAndPush: keep.commitAndPush,
+    resolveProject: keep.resolveProjectArg,
     // The Slack poll replaces this with agents.incidentEmitter(), which routes
     // each event to the feed of the agent that owns its area. The default is a
     // no-op so the CLI and the tests write only
@@ -513,6 +532,18 @@ function slackTsLine(ts) {
 // One open-to-closed period of one incident. `openedAt` alone is not enough:
 // a reopen keeps it, so the close that follows the reopen needs a marker of its
 // own, and the last firing is what distinguishes the two periods.
+// `watch/incidents.json` may name an area's project the way Owner would type it
+// ("castle-sandboxes"). addTask reads a card's scope off the project PATH, and a
+// bare name matches no scope rule, so every incident card was filed under the
+// default scope. Resolve it exactly as `keep add --project <name|path>` does. A
+// name that resolves to nothing (no open card in that project, no such
+// directory) keeps the configured value rather than failing the poll.
+function areaProject(cfg, area, deps) {
+  const configured = ((cfg.areas || {})[area] || {}).project || '';
+  if (!configured) return '';
+  try { return deps.resolveProject(configured) || configured; } catch { return configured; }
+}
+
 function closeMarker(signature, entry) {
   return `Incident close: ${signature} opened ${Number(entry.openedAt || 0)} fired ${Number(entry.lastFiredAt || 0)}`;
 }
@@ -559,7 +590,6 @@ function landAlert(state, alert, context, deps, options) {
     : alert.signature;
   if (!sig) return null;
   const entry = state.signatures[sig];
-  const project = (cfg.areas[alert.area] || {}).project || '';
   const base = {
     at: now, card: '', signature: sig, title: alert.title, area: alert.area,
     severity: alert.severity, permalink, suspects: context.suspects || [],
@@ -639,7 +669,7 @@ function landAlert(state, alert, context, deps, options) {
       title: `Incident: ${alert.title || sig}`,
       kind: 'bug',
       tags: ['incident'],
-      project,
+      project: areaProject(cfg, alert.area, deps),
       status: 'active',
       note: cardBody(alert, { permalink, previousCard }),
       linkSession: false,

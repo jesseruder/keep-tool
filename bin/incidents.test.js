@@ -34,6 +34,8 @@ const HOME_FEED_FIRING = FIXTURES[6];
 const SANDBOX_OPENS_FIRING = FIXTURES[7];
 const GROUPED = FIXTURES[8];
 const ALLOWLIST_FIRING = FIXTURES[9];
+// `[FIRING:3]`: one **Firing** header, three Value-led blocks, three alertnames.
+const GROUPED_THREE = FIXTURES[10];
 
 function writeExecutable(file, body) {
   fs.writeFileSync(file, body);
@@ -96,7 +98,7 @@ function ingest(root, registry, units, options = {}) {
     alertBots: ALERT_BOTS, config: incidents.config(root),
     batchTs: options.batchTs === null ? undefined : new Set(units.map((unit) => String(unit.ts))),
     ...(options.batchTs ? { batchTs: options.batchTs } : {}),
-  }, registry.deps);
+  }, options.deps || registry.deps);
 }
 
 function parse(root, message) {
@@ -159,6 +161,73 @@ test('one grouped Grafana message yields two alerts with two states and two name
       'grafana:sandbox-teardown-stuck-in-a-failure-loop|agent_hostname=ip-10-70-4-76|sandbox_id=gsphzngft2ipui|service=sandbox-host-agent');
     assert.equal(parsed[1].signature,
       'grafana:sandbox-opens-failing|environment=prod|failureReason=recovery_in_progress|service=ghost-sandboxes');
+  } finally { cleanup(root); }
+});
+
+test('one state header with three Value blocks yields three alerts, not one merged one', () => {
+  const root = makeRoot();
+  try {
+    const parsed = parse(root, GROUPED_THREE);
+    assert.equal(parsed.length, 3);
+    assert.deepEqual(parsed.map((alert) => alert.state), ['firing', 'firing', 'firing']);
+    assert.deepEqual(parsed.map((alert) => alert.title), [
+      'Sandbox deck saves failing repeatedly',
+      'Sandbox teardown stuck in a failure loop',
+      'Sandbox opens failing',
+    ]);
+    assert.deepEqual(parsed.map((alert) => alert.signature), [
+      'grafana:sandbox-deck-saves-failing-repeatedly|deck_id=TfUHENvI4j3L|sandbox_id=1zdl6owxk3dglq|service=sandbox-host-agent',
+      'grafana:sandbox-teardown-stuck-in-a-failure-loop|agent_hostname=ip-10-70-4-76|sandbox_id=1zdl6owxk3dglq|service=sandbox-host-agent',
+      'grafana:sandbox-opens-failing|environment=prod|failureReason=recovery_in_progress|service=ghost-sandboxes',
+    ]);
+    // Merging the blocks used to put every label in one signature, so the
+    // labels of one block must not appear in another's.
+    assert.equal(parsed[2].signature.includes('deck_id'), false);
+    assert.equal(parsed[2].signature.includes('agent_hostname'), false);
+    assert.equal(parsed[0].signature.includes('failureReason'), false);
+    assert.deepEqual(parsed.map((alert) => alert.source), [
+      'https://castlexyz.grafana.net/alerting/grafana/cfyh26qo7ixa8b/view?orgId=1',
+      'https://castlexyz.grafana.net/alerting/grafana/efygdcwibwdmof/view?orgId=1',
+      'https://castlexyz.grafana.net/alerting/grafana/ffygddnyb8l4wf/view?orgId=1',
+    ]);
+    // Each block keeps its own annotations, not the last block's.
+    assert.match(parsed[0].annotations.summary, /^Deck TfUHENvI4j3L in sandbox 1zdl6owxk3dglq/);
+    assert.match(parsed[1].annotations.summary, /^Sandbox 1zdl6owxk3dglq on ip-10-70-4-76/);
+
+    // A section with a `Labels:` line but no `Value:` line is still one block.
+    const noValue = JSON.parse(JSON.stringify(SANDBOX_OPENS_FIRING));
+    noValue.attachments[0].text = noValue.attachments[0].text.replace(/^Value:.*\n/m, '');
+    const lenient = parse(root, noValue);
+    assert.equal(lenient.length, 1);
+    assert.equal(lenient[0].signature, parse(root, SANDBOX_OPENS_FIRING)[0].signature);
+
+    // And the two-header message still splits by header, one alert each.
+    const mixed = parse(root, GROUPED);
+    assert.equal(mixed.length, 2);
+    assert.deepEqual(mixed.map((alert) => alert.state), ['firing', 'resolved']);
+  } finally { cleanup(root); }
+});
+
+test('a three-alert message opens three cards and records them on one decisions row', () => {
+  const root = makeRoot();
+  try {
+    const registry = fakeRegistry(root);
+    const { entries } = ingest(root, registry, [GROUPED_THREE], { channel: '#errors-sandboxes' });
+    assert.equal(registry.created.length, 3);
+    assert.equal(new Set(registry.created.map((card) => card.id)).size, 3);
+    assert.deepEqual(registry.created.map((card) => card.title), [
+      'Incident: Sandbox deck saves failing repeatedly',
+      'Incident: Sandbox teardown stuck in a failure loop',
+      'Incident: Sandbox opens failing',
+    ]);
+    assert.equal(Object.keys(incidents.loadState(root).signatures).length, 3);
+
+    assert.equal(entries.length, 1, 'still one row per bot message');
+    assert.equal(entries[0].alerts.length, 3);
+    assert.deepEqual(entries[0].alerts.map((alert) => alert.state), ['firing', 'firing', 'firing']);
+    assert.equal(entries[0].cardId, registry.created[0].id);
+    assert.deepEqual(registry.events.map((item) => item.event.kind),
+      ['incident-opened', 'incident-opened', 'incident-opened']);
   } finally { cleanup(root); }
 });
 
@@ -639,6 +708,81 @@ test('a human thread reply under a bot post becomes a note, once, with no classi
   } finally { cleanup(root); }
 });
 
+test('an area project named by bare name is resolved to its path before the card is filed', () => {
+  const root = makeRoot({ config: { areas: { sandboxes: { project: 'castle-sandboxes', match: ['^Sandbox '], default: true } } } });
+  try {
+    const registry = fakeRegistry(root);
+    const asked = [];
+    const resolved = path.join(os.homedir(), 'castle-scope-test', 'castle-sandboxes');
+    ingest(root, registry, [SANDBOX_OPENS_FIRING], {
+      channel: '#errors-sandboxes',
+      deps: {
+        ...registry.deps,
+        resolveProject(name) { asked.push(name); return resolved; },
+      },
+    });
+    assert.deepEqual(asked, ['castle-sandboxes']);
+    assert.equal(registry.created[0].project, resolved);
+
+    // A project already given as a path is passed through, and a name nothing
+    // can resolve falls back to the configured value rather than failing.
+    const other = makeRoot({ config: { areas: { sandboxes: { project: '~/castle-scope-test/castle-sandboxes', match: ['^Sandbox '], default: true } } } });
+    const second = fakeRegistry(other);
+    ingest(other, second, [SANDBOX_OPENS_FIRING], {
+      channel: '#errors-sandboxes',
+      deps: {
+        ...second.deps,
+        resolveProject() { throw new Error('no open Keep project or existing directory matches'); },
+      },
+    });
+    assert.equal(second.created[0].project, '~/castle-scope-test/castle-sandboxes');
+    cleanup(other);
+  } finally { cleanup(root); }
+});
+
+test('the real addTask files an incident card under the project\'s scope, not the default', () => {
+  // The bug this covers was invisible to a fake addTask: the scope tag comes
+  // from the project PATH, and a bare name matches no scope rule at all.
+  const root = require('./keep.js').ROOT;
+  const previousScopes = process.env.KEEP_SCOPES;
+  const home = os.homedir();
+  const prefix = path.join(home, 'castle-scope-test');
+  process.env.KEEP_SCOPES = JSON.stringify({
+    names: ['castle', 'personal'], default: 'personal',
+    rules: [{ path: prefix.replace(home, '~'), scope: 'castle' }],
+  });
+  for (const directory of ['tasks', 'archive', 'watch']) fs.mkdirSync(path.join(root, directory), { recursive: true });
+  fs.writeFileSync(path.join(root, 'watch', 'incidents.json'), JSON.stringify({
+    areas: { sandboxes: { project: 'castle-sandboxes', match: ['^Sandbox '], default: true } },
+  }));
+  const keepApi = require('./keep.js');
+  const created = [];
+  try {
+    incidents.ingest({
+      units: [SANDBOX_OPENS_FIRING], channel: '#errors-sandboxes', domain: 'example',
+      alertBots: ALERT_BOTS, batchTs: new Set([SANDBOX_OPENS_FIRING.ts]),
+    }, {
+      addTask(options) {
+        const task = keepApi.addTask(options);
+        created.push(task);
+        return task;
+      },
+      resolveProject: () => path.join(prefix, 'castle-sandboxes'),
+      commitAndPush() {},
+      emitAgentEvent() {},
+    });
+    assert.equal(created.length, 1);
+    assert.equal(created[0].fm.project, '~/castle-scope-test/castle-sandboxes');
+    assert.deepEqual(created[0].fm.tags, ['incident', 'castle']);
+  } finally {
+    if (previousScopes === undefined) delete process.env.KEEP_SCOPES;
+    else process.env.KEEP_SCOPES = previousScopes;
+    for (const task of created) fs.rmSync(path.join(root, 'tasks', `${task.id}.md`), { force: true });
+    fs.rmSync(path.join(root, '.keep', 'incidents'), { recursive: true, force: true });
+    fs.rmSync(path.join(root, 'watch', 'incidents.json'), { force: true });
+  }
+});
+
 test('config falls back to one default area and a documented quiet window', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-incidents-bare-'));
   try {
@@ -958,9 +1102,11 @@ test('keep incidents lists open signatures and parses a file of fixtures', () =>
     const parsed = cli('parse', path.join(__dirname, 'incidents.fixtures.json'), '--json');
     assert.equal(parsed.status, 0, parsed.stderr);
     const rows = JSON.parse(parsed.stdout);
-    // Ten real messages, eleven alerts: the grouped message carries two.
-    assert.equal(rows.length, 11);
-    assert.equal(rows.filter((row) => row.signature).length, 10);
+    // Eleven real messages, fourteen alerts: one grouped message carries two
+    // and one carries three.
+    assert.equal(FIXTURES.length, 11);
+    assert.equal(rows.length, 14);
+    assert.equal(rows.filter((row) => row.signature).length, 13);
     assert.equal(rows.filter((row) => !row.signature)[0].state, 'all-clear');
     assert.deepEqual([...new Set(rows.map((row) => row.shape))].sort(), ['adhoc', 'grafana', 'internal']);
 
