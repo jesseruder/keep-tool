@@ -1255,40 +1255,44 @@ function resolveLocalModelSwitch(args, following) {
   return '<unknown>';
 }
 
-// The newest record in this slice that decides the model: a genuine assistant turn, or a
-// `/model` switch typed after it. Rows the slice does not decide return null, and the
-// scan goes on to the slice before it.
-function lastModelEventInText(text, newerText = '') {
+// Everything in this slice that bears on the model, oldest first: genuine assistant turns
+// and `/model` switches. A switch carries the rows that follow it, which is where its
+// confirmation sits — including the rows of the slice we read before this one.
+function modelEventsInText(text, newerText = '') {
   const lines = String(text || '').split(/\r?\n/);
-  let event = null;
+  const newerLines = String(newerText || '').split(/\r?\n/);
+  const events = [];
   for (let i = 0; i < lines.length; i += 1) {
     let record;
     try { record = JSON.parse(lines[i]); } catch { continue; }
     const model = genuineAssistantModel(record);
-    if (model) { event = { kind: 'assistant', model }; continue; }
+    if (model) { events.push({ kind: 'assistant', model }); continue; }
     const args = localModelSwitchArgs(record);
-    if (args != null) event = { kind: 'switch', args, index: i };
+    if (args != null) events.push({ kind: 'switch', args, following: () => lines.slice(i + 1).concat(newerLines) });
   }
-  // The stdout row that confirms a switch can sit in the slice we read before this one.
-  if (event && event.kind === 'switch') {
-    event.following = lines.slice(event.index + 1).concat(String(newerText || '').split(/\r?\n/));
-  }
-  return event;
+  return events;
 }
 
-// lastClaudeHandoffModel over the whole file, newest slice first, so only the most recent
-// genuine assistant model can win. Reports which kind of record decided it, because a
-// model a person typed and a model an assistant record reports carry different things:
-// only the latter has had its context-window suffix stripped by the API. The model is ''
-// only after reading back to byte zero with no genuine record in the whole file; a scan
-// cut short by the bound or by a read error reports the '<unknown>' sentinel, because
-// unread bytes are not evidence of absence.
+// The model over the whole file, newest slice first, as { model, source, window }:
+//  - source 'switch' is a model someone typed, spelling and context window included, so
+//    it is used exactly as it stands; 'assistant' is an API record, which names the base
+//    model but not reliably the `[1m]` window.
+//  - window 'exact' means the model string already carries the right window, 'launch'
+//    that the launch metadata may supply it, and 'unknown' that it cannot be told —
+//    a switch beyond the scan's bound could have set a window nothing else records.
+// The model is '' only after reading back to byte zero with no genuine record in the
+// whole file; a scan cut short by the bound or by a read error reports the '<unknown>'
+// sentinel, because unread bytes are not evidence of absence.
 function lastClaudeHandoffModelInFile(file, deps = {}) {
   const chunkBytes = Number(deps.scanChunkBytes) || TAIL_BYTES;
   const maxBytes = Number(deps.scanMaxBytes) || HANDOFF_MODEL_SCAN_BYTES;
+  const unreadable = { model: '<unknown>', source: '', window: 'unknown' };
   let fd;
-  try { fd = fs.openSync(file, 'r'); } catch { return { model: '<unknown>', source: '' }; }
+  try { fd = fs.openSync(file, 'r'); } catch { return unreadable; }
   let reachedStart = false;
+  // The newest genuine assistant model, once one is found. The scan carries on past it:
+  // a `/model` older than it still decided the window it is running with.
+  let assistant = null;
   try {
     let end = fs.fstatSync(fd).size;
     reachedStart = end === 0;
@@ -1302,7 +1306,7 @@ function lastClaudeHandoffModelInFile(file, deps = {}) {
     for (let chunks = 0; chunks < HANDOFF_MODEL_SCAN_CHUNKS && end > 0 && scanned < maxBytes; chunks += 1) {
       const start = Math.max(0, end - chunkBytes);
       const slice = Buffer.alloc((end - start) + carry.length);
-      try { fs.readSync(fd, slice, 0, end - start, start); } catch { return { model: '<unknown>', source: '' }; }
+      try { fs.readSync(fd, slice, 0, end - start, start); } catch { return unreadable; }
       carry.copy(slice, end - start);
       scanned += end - start;
       let body = slice;
@@ -1313,15 +1317,46 @@ function lastClaudeHandoffModelInFile(file, deps = {}) {
         body = newline === -1 ? Buffer.alloc(0) : slice.subarray(newline + 1);
       }
       const text = body.toString('utf8');
-      const event = lastModelEventInText(text, newerText);
-      if (event && event.kind === 'assistant') return { model: event.model, source: 'assistant' };
-      if (event) return { model: resolveLocalModelSwitch(event.args, event.following), source: 'switch' };
+      const events = modelEventsInText(text, newerText);
+      let seen = events.length - 1;
+      if (assistant == null && seen >= 0) {
+        // The newest event in the file decides on its own when it is a switch: nothing
+        // older can undo a model someone typed after it.
+        if (events[seen].kind === 'switch') return switchResult(events[seen]);
+        assistant = events[seen].model;
+        seen -= 1;
+      }
+      // Older slices, and the rest of this one, are searched only for the switch that
+      // last set the window the assistant record is running with.
+      for (; seen >= 0; seen -= 1) {
+        if (events[seen].kind === 'switch') return switchBehindAssistant(events[seen], assistant);
+      }
       newerText = `${text}\n${newerText}`.slice(0, HANDOFF_MODEL_LOOKAHEAD_CHARS);
       end = start;
       if (end === 0) reachedStart = true;
     }
   } finally { fs.closeSync(fd); }
-  return { model: reachedStart ? '' : '<unknown>', source: '' };
+  // No switch anywhere in what was read. Reaching byte zero proves there is none, so the
+  // launch metadata may fill in the window; stopping at the bound proves nothing.
+  if (assistant != null) return { model: assistant, source: 'assistant', window: reachedStart ? 'launch' : 'unknown' };
+  return { model: reachedStart ? '' : '<unknown>', source: '', window: 'unknown' };
+}
+
+function switchResult(event) {
+  const model = resolveLocalModelSwitch(event.args, event.following());
+  return { model, source: 'switch', window: model === '<unknown>' ? 'unknown' : 'exact' };
+}
+
+// A `/model` older than the newest assistant record: the record confirms the base model,
+// and the switch is still the only thing that named the context window.
+function switchBehindAssistant(event, assistant) {
+  const { model } = switchResult(event);
+  // An alias, or a switch the harness never confirmed, leaves the window unknowable.
+  if (model === '<unknown>') return { model, source: 'switch', window: 'unknown' };
+  if (compactModelBase(model) === compactModelBase(assistant)) return { model, source: 'switch', window: 'exact' };
+  // The model changed after the switch by some other path, so the record is the evidence
+  // and its window comes from the launch metadata as usual.
+  return { model: assistant, source: 'assistant', window: 'launch' };
 }
 
 // A launch model is taken verbatim: `claude --model claude-fable-5-1[1m]` is a model this
@@ -1356,17 +1391,15 @@ function handoffCurrentModel(session, pane, processArgs, deps = {}) {
   // record's own `claude-fable-5-1` are the same model with different windows.
   const launch = launchModelId(pane?.meta?.model)
     || launchModelId(HANDOFF_ARGV_MODEL_RE.exec(String(processArgs || ''))?.[1]);
-  const { model, source } = found;
+  const { model, source, window } = found;
   if (model === '<unknown>') return model;
   if (!model) return launch || '<unknown>';
-  // A confirmed `/model` is someone naming the model and its window by hand, newer than
-  // anything the pane was launched with. It is taken exactly as typed.
+  // A confirmed `/model` is someone naming the model and its window by hand. It is taken
+  // exactly as typed, whichever side of the newest assistant record it fell on.
   if (source === 'switch') return model;
-  if (!launch || compactModelBase(launch) !== compactModelBase(model)) {
-    // A different base model means the transcript is the newer evidence — an in-session
-    // /model switch is already resolved by the scan.
-    return model;
-  }
+  const sameBase = Boolean(launch) && compactModelBase(launch) === compactModelBase(model);
+  // A different base model means the transcript is the newer evidence.
+  if (!sameBase) return window === 'unknown' ? '<unknown>' : model;
   // Same model, so the launch spelling carries the window. Never downgrade: whichever
   // side asked for the 1M context is the one that has to be relaunched.
   return /\[1m\]$/i.test(model) && !/\[1m\]$/i.test(launch) ? model : launch;
@@ -1761,29 +1794,55 @@ function logDraftRefusal(target, message, beforeScreen, afterScreen, probe, deps
 // the same text again (the suggestion re-rendered). Anything else fails closed — the
 // caller is about to type, and its confirmation only looks for its own text as a
 // substring, so a leftover `,` would be submitted as part of the command.
+// Claude Code draws `❯ ` and then the input value, and paints a ghost suggestion past
+// the cursor without moving it. So the cursor resting on the first input column means
+// the input value is empty however much text the prompt line shows; a cursor after that
+// text means the value is the text — someone accepted the suggestion.
+function cursorAtInputStart(screen, cursor) {
+  if (!cursor || !Number.isInteger(cursor.x) || !Number.isInteger(cursor.y)) return false;
+  const lines = String(screen || '').split(/\r?\n/);
+  let row = -1;
+  lines.forEach((line, index) => { if (/^\s*❯(?:\s|$)/.test(line)) row = index; });
+  if (row === -1 || cursor.y !== row) return false;
+  return cursor.x === lines[row].indexOf('❯') + 2;
+}
+
 async function waitForProbeUndo(target, beforeScreen, lastScreen, read, wait, now, deps = {}) {
   // Only the collapsed-suggestion shape is ambiguous to the next reader. Any other box
   // visibly loses its trailing probe key, and an empty box is already settled.
   if (promptText(promptLine(lastScreen)) !== SUGGESTION_PROBE_KEY) return;
   const beforeText = normalizedText(promptText(promptLine(beforeScreen)));
+  // The cursor is the only thing that tells a re-rendered ghost suggestion from a person
+  // pressing Tab to accept it: both paint the same text. A caller that injected a
+  // text-only reader gets no cursor, and then that shape is refused rather than trusted.
+  const readResult = deps.readScreenResult
+    || (deps.readScreen ? null : (t, lines, scrollback) => readScreenResult(t, lines, scrollback, deps));
   const startedAt = now();
   let screen = lastScreen;
   for (let reads = 0; reads < SUGGESTION_PROBE_SETTLE_READS; reads += 1) {
     await wait(SUGGESTION_PROBE_WAIT_MS);
     // A pane that cannot be read tells us nothing about the Backspace: the probe key is
     // still the last thing we saw, so it is still the answer we have to give.
-    try { screen = await read(target, 30, false); } catch { break; }
+    let cursor = null;
+    try {
+      if (readResult) {
+        const result = await readResult(target, 30, false);
+        screen = String((result && result.text) || '');
+        cursor = result && result.cursor;
+      } else screen = await read(target, 30, false);
+    } catch { break; }
     const line = promptLine(screen);
     // No prompt line at all is Claude Code mid-render, not an empty input box — the same
     // reading classifyPromptLine takes. It proves nothing, so it only costs a poll.
     const text = line == null ? null : normalizedText(promptText(line));
-    if (text != null && (!text || text === beforeText)) return;
+    if (text != null && !text) return;
+    if (text === beforeText && cursorAtInputStart(screen, cursor)) return;
     if (text == null || text === SUGGESTION_PROBE_KEY) {
       if (now() - startedAt >= SUGGESTION_PROBE_SETTLE_MS) break;
       continue;
     }
-    // Someone typed into the box while we were undoing our own keystroke. Whatever it
-    // is, it is neither the suggestion we probed nor an empty box.
+    // Someone typed into the box, or accepted the suggestion into it, while we were
+    // undoing our own keystroke. Either way it is no longer a box we may type into.
     const changed = 'the session input box changed while the probe was being undone; clear it in the terminal first';
     logDraftRefusal(target, changed, beforeScreen, screen, SUGGESTION_PROBE_KEY, deps);
     throw new InjectionError(409, changed, { screenTail: screenTail(screen) });

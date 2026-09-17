@@ -269,11 +269,13 @@ test('probeSuggestion distinguishes generated suggestions from drafts through ho
   const logged = [];
   const stderr = (message) => { logged.push(message); };
   const target = { pane: 'pane-probe' };
+  const settling = async () => (inputs.includes('\x7f') ? 'header\n❯ suggested next prompt' : 'header\n❯ ,');
   await probeSuggestion(target, 'header\n❯ suggested next prompt', {
     host,
     wait: async () => {},
     // The Backspace puts the suggestion back, and the probe waits for that to render.
-    readScreen: async () => (inputs.includes('\x7f') ? 'header\n❯ suggested next prompt' : 'header\n❯ ,'),
+    readScreen: settling,
+    readScreenResult: withCursor(settling),
     stderr,
   });
   assert.deepEqual(inputs, [',', '\x7f']);
@@ -319,6 +321,31 @@ function suggestionScreenWithBox(box) {
     .map((line, index) => (index === 5 ? `❯\u00a0${box}` : line)).join('\n');
 }
 
+// The host returns the cursor with the screen. Claude Code paints a ghost suggestion past
+// the cursor without moving it, so on a re-rendered suggestion the cursor rests on the
+// first input column — two cells past the `❯` marker.
+function ghostCursor(text) {
+  const lines = String(text).split(/\r?\n/);
+  let row = -1;
+  lines.forEach((line, index) => { if (/^\s*❯(?:\s|$)/.test(line)) row = index; });
+  return row === -1 ? null : { x: lines[row].indexOf('❯') + 2, y: row };
+}
+
+// The cursor a person leaves by pressing Tab: the suggestion became the input value.
+function acceptedCursor(text) {
+  const lines = String(text).split(/\r?\n/);
+  let row = -1;
+  lines.forEach((line, index) => { if (/^\s*❯(?:\s|$)/.test(line)) row = index; });
+  return row === -1 ? null : { x: lines[row].trimEnd().length, y: row };
+}
+
+function withCursor(readScreen, cursor = ghostCursor) {
+  return async (...args) => {
+    const text = await readScreen(...args);
+    return { text, cursor: cursor(text) };
+  };
+}
+
 function probeInputRecorder() {
   const inputs = [];
   const host = recordingHost((type, params) => {
@@ -331,11 +358,13 @@ function probeInputRecorder() {
 test('probeSuggestion accepts a real Claude Code prompt suggestion captured from the reviewer pane', async () => {
   const { inputs, host } = probeInputRecorder();
   const logged = [];
+  const undone = async () => (inputs.includes('\x7f') ? REVIEWER_SUGGESTION_BEFORE : REVIEWER_SUGGESTION_AFTER);
   assert.throws(() => sendPrecheck(REVIEWER_SUGGESTION_BEFORE), /already contains text/);
   await probeSuggestion({ pane: 'pane-8460a8a0' }, REVIEWER_SUGGESTION_BEFORE, {
     host,
     wait: async () => {},
-    readScreen: async () => (inputs.includes('\x7f') ? REVIEWER_SUGGESTION_BEFORE : REVIEWER_SUGGESTION_AFTER),
+    readScreen: undone,
+    readScreenResult: withCursor(undone),
     stderr: (message) => { logged.push(message); },
   });
   assert.deepEqual(inputs, [',', '\x7f']);
@@ -345,14 +374,16 @@ test('probeSuggestion accepts a real Claude Code prompt suggestion captured from
 test('probeSuggestion keeps polling while Claude Code has not re-rendered the probe', async () => {
   const { inputs, host } = probeInputRecorder();
   let reads = 0;
+  const rendering = async () => {
+    reads += 1;
+    if (inputs.includes('\x7f')) return REVIEWER_SUGGESTION_BEFORE;
+    return reads < 3 ? REVIEWER_SUGGESTION_BEFORE : REVIEWER_SUGGESTION_AFTER;
+  };
   await probeSuggestion({ pane: 'pane-8460a8a0' }, REVIEWER_SUGGESTION_BEFORE, {
     host,
     wait: async () => {},
-    readScreen: async () => {
-      reads += 1;
-      if (inputs.includes('\x7f')) return REVIEWER_SUGGESTION_BEFORE;
-      return reads < 3 ? REVIEWER_SUGGESTION_BEFORE : REVIEWER_SUGGESTION_AFTER;
-    },
+    readScreen: rendering,
+    readScreenResult: withCursor(rendering),
   });
   assert.equal(reads, 4, 'two polls for the probe, one more for the Backspace that undoes it');
   assert.deepEqual(inputs, [',', '\x7f']);
@@ -362,16 +393,18 @@ test('probeSuggestion waits for its own Backspace to render before returning', a
   const { inputs, host } = probeInputRecorder();
   const logged = [];
   let reads = 0;
+  // Read 1 classifies the collapsed suggestion. Reads 2 and 3 still show the probe key:
+  // the Backspace has not landed. Read 4 has the suggestion back, so whoever reads this
+  // pane next cannot mistake a stale `,` for a draft.
+  const lagging = async () => {
+    reads += 1;
+    return reads < 4 ? REVIEWER_SUGGESTION_AFTER : REVIEWER_SUGGESTION_BEFORE;
+  };
   await probeSuggestion({ pane: 'pane-8460a8a0' }, REVIEWER_SUGGESTION_BEFORE, {
     host,
     wait: async () => {},
-    // Read 1 classifies the collapsed suggestion. Reads 2 and 3 still show the probe
-    // key: the Backspace has not landed. Read 4 has the suggestion back, so whoever
-    // reads this pane next cannot mistake a stale `,` for a draft.
-    readScreen: async () => {
-      reads += 1;
-      return reads < 4 ? REVIEWER_SUGGESTION_AFTER : REVIEWER_SUGGESTION_BEFORE;
-    },
+    readScreen: lagging,
+    readScreenResult: withCursor(lagging),
     stderr: (message) => { logged.push(message); },
   });
   assert.equal(reads, 4, 'the probe polls until its own probe key is off the prompt line');
@@ -445,6 +478,41 @@ test('probeSuggestion waits out a mid-render screen and settles on the bare prom
   assert.deepEqual(inputs, [',', '\x7f']);
 });
 
+test('probeSuggestion tells a re-rendered suggestion from one the user accepted', async () => {
+  const bare = REVIEWER_SUGGESTION_LINES.map((line, index) => (index === 5 ? '❯' : line)).join('\n');
+  const settle = async (screen, cursor) => {
+    const { inputs, host } = probeInputRecorder();
+    const logged = [];
+    const read = async () => (inputs.includes('\x7f') ? screen : REVIEWER_SUGGESTION_AFTER);
+    const error = await probeSuggestion({ pane: 'pane-tab' }, REVIEWER_SUGGESTION_BEFORE, {
+      host,
+      wait: async () => {},
+      readScreen: read,
+      readScreenResult: withCursor(read, cursor),
+      stderr: (message) => { logged.push(message); },
+    }).then(() => null, (e) => e);
+    assert.deepEqual(inputs, [',', '\x7f'], 'the probe never types twice');
+    return { error, logged };
+  };
+
+  // The suggestion is painted past the cursor, which stays on the first input column.
+  assert.equal((await settle(REVIEWER_SUGGESTION_BEFORE, ghostCursor)).error, null);
+  // Tab during the settle window turns that same text into a real draft, and the only
+  // difference on screen is where the cursor sits.
+  const accepted = await settle(REVIEWER_SUGGESTION_BEFORE, acceptedCursor);
+  assert.ok(accepted.error, 'an accepted suggestion is a draft, not a settled box');
+  assert.equal(accepted.error.status, 409);
+  assert.match(accepted.error.message, /changed while the probe was being undone/);
+  assert.equal(accepted.logged.length, 1);
+  // An empty box is empty wherever the cursor is; it is what the undo was aiming for.
+  assert.equal((await settle(bare, ghostCursor)).error, null);
+  assert.equal((await settle(bare, () => null)).error, null);
+  // Without cursor evidence the two cases cannot be told apart, so the same text refuses.
+  const blind = await settle(REVIEWER_SUGGESTION_BEFORE, () => null);
+  assert.ok(blind.error, 'no cursor is not proof of a ghost suggestion');
+  assert.match(blind.error.message, /changed while the probe was being undone/);
+});
+
 test('probeSuggestion refuses when someone types while the probe is being undone', async () => {
   const { inputs, host } = probeInputRecorder();
   const logged = [];
@@ -493,6 +561,7 @@ test('a second probe on a pane that renders one poll late still sees a suggestio
     host,
     wait: async () => {},
     readScreen,
+    readScreenResult: withCursor(readScreen),
     stderr: (message) => { throw new Error(`unexpected refusal log: ${message}`); },
   };
   for (let probe = 0; probe < 2; probe += 1) {
@@ -2175,6 +2244,36 @@ test('handoff model resolution follows a /model typed after the newest assistant
     assert.equal(resolve('narrowed', [
       real('claude-fable-5-1[1m]'), modelCommand('claude-fable-5-1'), stdout('Set model to Fable 5.1'), synthetic,
     ], {}, { meta: { model: 'claude-fable-5-1[1m]' } }), 'claude-fable-5-1');
+    // An assistant record newer than the switch confirms the base model but never the
+    // window, so the switch that set it still decides the spelling.
+    assert.equal(resolve('narrowed-then-answered', [
+      modelCommand('claude-fable-5-1'), stdout('Set model to Fable 5.1'), real('claude-fable-5-1'), synthetic,
+    ], {}, { meta: { model: 'claude-fable-5-1[1m]' } }), 'claude-fable-5-1',
+    'the launch window does not come back after it was switched away by hand');
+    assert.equal(resolve('widened-then-answered', [
+      modelCommand('claude-fable-5-1[1m]'), stdout('Set model to Fable 5.1 (1M context)'), real('claude-fable-5-1'), synthetic,
+    ], {}, { meta: { model: 'claude-fable-5-1' } }), 'claude-fable-5-1[1m]',
+    'and a window asked for by hand is not dropped by the reply that follows it');
+    assert.equal(resolve('alias-then-answered', [
+      modelCommand('opus'), stdout('Set model to Opus 5'), real('claude-opus-5'), synthetic,
+    ], {}, { meta: { model: 'claude-fable-5-1[1m]' } }), '<unknown>',
+    'an alias switch leaves a base model with no reproducible window');
+    // The bound stops the scan before byte zero, so an older switch could still be
+    // hiding: only launch metadata for the same model can supply the window.
+    const bounded = { scanChunkBytes: 512, scanMaxBytes: 512 };
+    const bulky = JSON.stringify({
+      type: 'assistant', isApiErrorMessage: true,
+      message: { model: '<synthetic>', usage: { input_tokens: 0 }, padding: 'x'.repeat(2000) },
+    });
+    const deep = [bulky, bulky, real('claude-fable-5-1')];
+    assert.equal(resolve('bounded-launch', deep, bounded, { meta: { model: 'claude-fable-5-1[1m]' } }),
+      'claude-fable-5-1[1m]');
+    const boundedFile = path.join(dir, 'bounded-launch.jsonl');
+    assert.equal(handoffCurrentModel(session, null, '', { findSessionFile: () => boundedFile, ...bounded }),
+      '<unknown>', 'with no launch metadata behind it, the unread bytes decide nothing');
+    assert.equal(handoffCurrentModel(session, null, '', { findSessionFile: () => boundedFile }),
+      'claude-fable-5-1', 'the same file read to byte zero has no switch to hide');
+
     assert.equal(resolve('widened', [
       real('claude-fable-5-1'), modelCommand('claude-fable-5-1[1m]'), stdout('Set model to Fable 5.1 (1M context)'), synthetic,
     ], {}, { meta: { model: 'claude-fable-5-1' } }), 'claude-fable-5-1[1m]');
@@ -3039,6 +3138,7 @@ test('pending swap sweep restores through a prompt suggestion that Backspace put
       host,
       wait: async () => {},
       readScreen,
+      readScreenResult: withCursor(readScreen),
       typeAndSubmit: async (target, command) => {
         order.push(`type:${command}`);
         return base.typeAndSubmit(target, command);
