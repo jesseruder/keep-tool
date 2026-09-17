@@ -749,14 +749,32 @@ function applySessions(sessions, list, panes = []) {
   }
 }
 
-// One row, entirely out of record.json. A dashboard build runs on every state
-// refresh, so it must not open a feed: an agent months into its life would then
-// cost a full parse of its whole history on every poll.
-function agentView(record) {
+// The agent's own session, as the dashboard sees it. Matched by pane first, for the
+// same reason the console's agentForStage() does: a record that still names the
+// session an in-place restart moved on from must not beat the pane the agent owns.
+function sessionForAgent(record, sessions) {
+  const pane = record.session.pane || '';
+  const id = record.session.id || '';
+  return (pane && (sessions || []).find((candidate) => candidate
+      && (candidate.pane === pane || candidate.runtime?.paneId === pane)))
+    || (id && (sessions || []).find((candidate) => candidate && candidate.id === id))
+    || null;
+}
+
+// One row, entirely out of record.json, plus one view-only fact from the session it
+// is carrying. A dashboard build runs on every state refresh, so it must not open a
+// feed: an agent months into its life would then cost a full parse of its whole
+// history on every poll.
+function agentView(record, options = {}) {
   const last = record.lastEvent;
   const session = record.session.id || record.session.pane
     ? { id: record.session.id, pane: record.session.pane, startedAt: record.session.startedAt || null }
     : null;
+  // The agent's session is listed nowhere else, so its row is the only place a
+  // question or a permission prompt can show. `lifecycle` is the daemon's own
+  // record and stays exactly as written; this is the row's label, nothing more.
+  const live = sessionForAgent(record, options.sessions);
+  const needsInput = Boolean(live && !live.exited && live.state === 'needs-input');
   return {
     name: record.name,
     role: record.role,
@@ -764,6 +782,7 @@ function agentView(record) {
     area: record.area,
     project: record.project,
     lifecycle: record.lifecycle,
+    ...(needsInput ? { needsInput: true } : {}),
     card: record.card || (record.lifecycle === 'working' && last ? last.card : '') || '',
     session,
     lastEvent: last,
@@ -809,7 +828,7 @@ function dashboardAgents(options = {}) {
     if (reviewer) rows.push(reviewer);
   } catch {}
   for (const record of options.records || records(root)) {
-    try { rows.push(agentView(record)); } catch {}
+    try { rows.push(agentView(record, options)); } catch {}
   }
   return rows;
 }

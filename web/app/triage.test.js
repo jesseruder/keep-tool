@@ -73,6 +73,15 @@ test('a row carries the name, lifecycle, last event and its relative time', asyn
   assert.equal(agentLifecycleLabel({ lifecycle: 'working' }), 'working', 'working with no card is not "on undefined"');
   assert.equal(agentLifecycleLabel({ lifecycle: 'needs-you' }), 'needs you');
   assert.equal(agentLifecycleLabel({ lifecycle: 'stopped' }), 'stopped');
+  // This row is the only place the agent's session is listed, so a question or a
+  // permission prompt on it has to read here rather than as "working".
+  assert.equal(agentLifecycleLabel({ lifecycle: 'working', needsInput: true }), 'needs input');
+  assert.equal(agentLifecycleLabel({ lifecycle: 'working', needsInput: true, card: 'inc-one' }), 'needs input · inc-one');
+  assert.equal(agentLifecycleLabel({ lifecycle: 'idle', needsInput: true }), 'needs input');
+  // The daemon's own lifecycle words still win: a stopped agent answers nothing.
+  assert.equal(agentLifecycleLabel({ lifecycle: 'stopped', needsInput: true }), 'stopped');
+  assert.equal(agentLifecycleLabel({ lifecycle: 'needs-you', needsInput: true }), 'needs you');
+  assert.match(agentRowHTML(ctx, { ...QUIET_ROW, needsInput: true }), /needs input/);
 
   const html = agentRowHTML(ctx, QUIET_ROW);
   assert.match(html, /<span class="t">sandboxes<\/span>/, 'the row opens a pane, so it carries no expand chevron');

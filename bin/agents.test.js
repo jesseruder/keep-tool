@@ -793,6 +793,37 @@ test('a session carrying an agent is marked with its name, by id, pane or pane m
   } finally { cleanup(root); }
 });
 
+// An agent's session is listed in no other queue, so its row is the only place a
+// question or a permission prompt can show. The row says so from the session's own
+// state; the record's `lifecycle` is the daemon's and is not rewritten for a label.
+test('an agent whose session needs input says so on its row, without touching its lifecycle', () => {
+  const root = makeRoot();
+  try {
+    agents.ensure('sandboxes', { role: 'incident-responder', lifecycle: 'working', card: 'inc-one',
+      session: { id: 'agent-sid', pane: 'agent-pane' } }, { root });
+    const row = (sessions) => agents.dashboardAgents({ root, sessions }).find((entry) => entry.name === 'sandboxes');
+
+    const working = row([{ id: 'agent-sid', pane: 'agent-pane', state: 'running' }]);
+    assert.equal(working.needsInput, undefined, 'a working session adds nothing');
+    assert.equal(working.lifecycle, 'working');
+
+    const asking = row([{ id: 'agent-sid', pane: 'agent-pane', state: 'needs-input' }]);
+    assert.equal(asking.needsInput, true);
+    assert.equal(asking.lifecycle, 'working', 'the record on disk is untouched');
+    assert.equal(asking.card, 'inc-one');
+    assert.equal(agents.readRecord('sandboxes', root).lifecycle, 'working');
+
+    // A restart replaces the pane and the record catches up later, so the pane the
+    // record names answers first — by `runtime.paneId` too, before `session.pane`
+    // is attached to the response rows.
+    assert.equal(row([{ id: 'other', runtime: { paneId: 'agent-pane' }, state: 'needs-input' }]).needsInput, true);
+    // An exited session, and no session at all, say nothing.
+    assert.equal(row([{ id: 'agent-sid', pane: 'agent-pane', state: 'needs-input', exited: true }]).needsInput, undefined);
+    assert.equal(row([]).needsInput, undefined);
+    assert.equal(row(undefined).needsInput, undefined);
+  } finally { cleanup(root); }
+});
+
 // The mark has to be on the session before anything asks whether it belongs to an
 // agent. session-status.attention() reads `agentName` to keep an agent out of
 // "Waiting on you", and the queue used to be built before applySessions ran.

@@ -52,6 +52,11 @@ export function hiddenFromRunning(session) {
 export function agentLifecycleLabel(agent) {
   if (agent?.lifecycle === 'needs-you') return 'needs you';
   if (agent?.lifecycle === 'stopped') return 'stopped';
+  // The agent's session is listed nowhere but this row, so a question or a
+  // permission prompt has to read off it. `needsInput` is the daemon's view of that
+  // session, beside the lifecycle it records rather than instead of it: an agent
+  // waiting on an answer is not working, whatever its last event said.
+  if (agent?.needsInput) return agent.card ? `needs input · ${agent.card}` : 'needs input';
   if (agent?.lifecycle === 'working') return agent.card ? `on ${agent.card}` : 'working';
   return 'idle';
 }
