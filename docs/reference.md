@@ -966,6 +966,13 @@ poll` racing the daemon cannot load the same state twice and lose the other's up
 If that mutation fails, the message is *not* acknowledged: no decisions row, no
 `seen.json` entry, no event, and the channel cursor stops short of it, so the next poll
 fetches and retries it. One transient lock or disk failure must not lose an alert.
+Events are built inside the mutation but published — to `events.jsonl` and to the area
+agent's feed — only once its write has landed, so neither feed ever holds an event for
+state that was discarded. Card writes cannot be rolled back the same way, so every
+check-in that quotes a `Slack message ts:` line is written at most once per card: a
+retry after a partial failure re-runs the firing, resolve, reopen, suspects or note
+check-in, finds its own timestamp already on the card, and skips it while still moving
+the state and emitting the event.
 
 `keep incidents [--json]` lists the open signatures with their card, area, fire count
 and last firing. `keep incidents parse <file|-> [--json]` parses one Slack message — or

@@ -460,13 +460,35 @@ function defaultDeps() {
   };
 }
 
-function emit(root, area, event, deps) {
-  appendEvent(root, event);
-  try { deps.emitAgentEvent(area, event); } catch {}
-  return event;
+// Lifecycle functions build events; nobody publishes one until the mutation
+// that made it real has been written. Publishing inside the mutation put events
+// for discarded state into the raw feed and the agent's feed, which the retry
+// then duplicated.
+function publish(root, events, deps) {
+  const published = [];
+  for (const event of events || []) {
+    if (!event) continue;
+    appendEvent(root, event);
+    try { deps.emitAgentEvent(event.area, event); } catch {}
+    published.push(event);
+  }
+  return published;
 }
 
 // ---------- lifecycle ----------
+
+// A check-in that quotes a Slack timestamp is written once per card. A mutation
+// that failed after its card write is retried on the next poll, and without this
+// the firing, resolve or reopen line would be appended a second time. Only the
+// duplicate write is skipped: state still moves and the event is still returned,
+// because the retry is what makes them real.
+function checkinOnce(deps, root, cardId, ts, options) {
+  if (ts && taskContainsSlackTs(root, cardId, ts)) return false;
+  deps.checkinTask(cardId, options);
+  return true;
+}
+
+function slackTsLine(ts) { return `Slack message ts: ${String(ts || '')}`; }
 
 function isInternalSignature(signature) {
   return /^(?:internal:|castle-alerts-)/.test(String(signature || ''));
@@ -519,16 +541,16 @@ function landAlert(state, alert, context, deps, options) {
   if (alert.state === 'resolved') {
     if (!entry || entry.closedAt) return null;
     if (!entry.resolvedAt) {
-      deps.checkinTask(entry.card, {
+      checkinOnce(deps, root, entry.card, context.ts, {
         heading: 'alert resolved',
-        message: dataFence([`Slack message ts: ${context.ts}`, permalink, alert.title].filter(Boolean).join('\n'), NOTE_TEXT_MAX),
+        message: dataFence([slackTsLine(context.ts), permalink, alert.title].filter(Boolean).join('\n'), NOTE_TEXT_MAX),
         linkSession: false, commit: false, withinLock: true,
       });
     }
     entry.resolvedAt = now;
     entry.title = alert.title;
     indexTitle(state, alert, sig);
-    return emit(root, alert.area, { ...base, kind: 'incident-resolved', card: entry.card }, deps);
+    return { ...base, kind: 'incident-resolved', card: entry.card };
   }
 
   // firing
@@ -539,12 +561,12 @@ function landAlert(state, alert, context, deps, options) {
     entry.title = alert.title;
     entry.area = alert.area;
     indexTitle(state, alert, sig);
-    deps.checkinTask(entry.card, {
+    checkinOnce(deps, root, entry.card, context.ts, {
       heading: `alert firing (${entry.fireCount})`,
-      message: dataFence([`Slack message ts: ${context.ts}`, permalink, clip(alert.text || alert.title, NOTE_TEXT_MAX)].filter(Boolean).join('\n'), NOTE_TEXT_MAX),
+      message: dataFence([slackTsLine(context.ts), permalink, clip(alert.text || alert.title, NOTE_TEXT_MAX)].filter(Boolean).join('\n'), NOTE_TEXT_MAX),
       linkSession: false, commit: false, withinLock: true,
     });
-    return emit(root, alert.area, { ...base, kind: 'incident-fired', card: entry.card }, deps);
+    return { ...base, kind: 'incident-fired', card: entry.card };
   }
 
   let previousCard = '';
@@ -569,10 +591,10 @@ function landAlert(state, alert, context, deps, options) {
   }
 
   if (reopened) {
-    deps.checkinTask(cardId, {
+    checkinOnce(deps, root, cardId, context.ts, {
       heading: 'reopened',
       status: 'active',
-      message: dataFence([`Slack message ts: ${context.ts}`, permalink, clip(alert.text || alert.title, NOTE_TEXT_MAX)].filter(Boolean).join('\n'), NOTE_TEXT_MAX),
+      message: dataFence([slackTsLine(context.ts), permalink, clip(alert.text || alert.title, NOTE_TEXT_MAX)].filter(Boolean).join('\n'), NOTE_TEXT_MAX),
       linkSession: false, commit: false, withinLock: true,
     });
     state.signatures[sig] = {
@@ -581,7 +603,7 @@ function landAlert(state, alert, context, deps, options) {
       fireCount: Number(entry.fireCount || 0) + 1,
     };
     indexTitle(state, alert, sig);
-    return emit(root, alert.area, { ...base, kind: 'incident-reopened', card: cardId }, deps);
+    return { ...base, kind: 'incident-reopened', card: cardId };
   }
 
   if (!fs.existsSync(taskFile(root, cardId))) {
@@ -600,11 +622,14 @@ function landAlert(state, alert, context, deps, options) {
     });
     cardId = created && created.id ? created.id : cardId;
   }
+  // The ts line is what makes this one idempotent: a retry finds the card the
+  // failed attempt created, skips the creation, and must not append the
+  // suspects a second time.
   const suspects = suspectLines(context.suspects);
   if (suspects.length) {
-    deps.checkinTask(cardId, {
+    checkinOnce(deps, root, cardId, context.ts, {
       heading: 'suspects',
-      message: ['Changes shortly before the first firing:', ...suspects].join('\n'),
+      message: [slackTsLine(context.ts), 'Changes shortly before the first firing:', ...suspects].join('\n'),
       linkSession: false, commit: false, withinLock: true,
     });
   }
@@ -614,7 +639,7 @@ function landAlert(state, alert, context, deps, options) {
     ...(previousCard ? { previousCard } : {}),
   };
   indexTitle(state, alert, sig);
-  return emit(root, alert.area, { ...base, kind: 'incident-opened', card: cardId }, deps);
+  return { ...base, kind: 'incident-opened', card: cardId };
 }
 
 // "All alerts are passing" is only posted by the internal-alert bot when nothing
@@ -626,17 +651,17 @@ function landAllClear(state, alert, context, deps, options) {
   for (const [sig, entry] of Object.entries(state.signatures)) {
     if (!/^(internal:|castle-alerts-)/.test(sig)) continue;
     if (!entry || entry.closedAt || entry.resolvedAt) continue;
-    deps.checkinTask(entry.card, {
+    checkinOnce(deps, root, entry.card, context.ts, {
       heading: 'alert resolved',
-      message: dataFence([`Slack message ts: ${context.ts}`, context.permalink, 'All alerts are passing'].filter(Boolean).join('\n'), NOTE_TEXT_MAX),
+      message: dataFence([slackTsLine(context.ts), context.permalink, 'All alerts are passing'].filter(Boolean).join('\n'), NOTE_TEXT_MAX),
       linkSession: false, commit: false, withinLock: true,
     });
     entry.resolvedAt = now;
-    events.push(emit(root, entry.area, {
+    events.push({
       at: now, kind: 'incident-resolved', card: entry.card, signature: sig,
       title: entry.title || sig, area: entry.area, severity: 'med',
       permalink: context.permalink || '', suspects: [],
-    }, deps));
+    });
   }
   return events;
 }
@@ -648,21 +673,20 @@ function landNote(state, signature, reply, context, deps, options) {
   const entry = signature && state.signatures[signature];
   if (!entry || !entry.card) return null;
   const who = oneLine(reply.from || 'unknown', 80);
-  if (taskContainsSlackTs(root, entry.card, reply.ts)) return null;
-  deps.checkinTask(entry.card, {
+  checkinOnce(deps, root, entry.card, reply.ts, {
     heading: `note (by ${who})`,
     message: dataFence([
-      `Slack message ts: ${String(reply.ts || '')}`,
+      slackTsLine(reply.ts),
       context.permalink,
       `${who}: ${clip(combinedText(reply) || String(reply.text || ''), NOTE_TEXT_MAX)}`,
     ].filter(Boolean).join('\n'), NOTE_TEXT_MAX),
     linkSession: false, commit: false, withinLock: true,
   });
-  return emit(root, entry.area, {
+  return {
     at: now, kind: 'human-note', card: entry.card, signature,
     title: entry.title || signature, area: entry.area, severity: 'low',
     permalink: context.permalink || '', suspects: [],
-  }, deps);
+  };
 }
 
 // ---------- ingest ----------
@@ -710,17 +734,18 @@ function ingest(options = {}, deps = {}) {
   const events = [];
   const handledTs = new Set();
 
-  // One state mutation per message, under the registry lock. Events are only
-  // published once the write that made them real has landed: a caller that
-  // acknowledged a failed write would retire the message from the cursor and
-  // lose the alert.
+  // One state mutation per message, under the registry lock. Events are built
+  // inside it but published only once the write that made them real has landed:
+  // a caller that acknowledged a failed write would retire the message from the
+  // cursor and lose the alert, and a feed holding events for discarded state
+  // would then see them again on the retry.
   const write = (fn, ts) => {
     if (dry) return { ok: true, cardId: '' };
     const at = messageTime(ts, now);
     const produced = [];
     const outcome = mutateState((state) => { produced.push(...(fn(state, at) || [])); }, { root });
     if (!outcome.ok) return { ok: false, error: outcome.error, cardId: '' };
-    events.push(...produced);
+    events.push(...publish(root, produced, d));
     return { ok: true, cardId: (produced.find((event) => event && event.card) || {}).card || '' };
   };
 
@@ -826,7 +851,7 @@ function sweep(options = {}, deps = {}) {
     }
   }, { root });
   // Only once the state write landed: a close nobody recorded is not a close.
-  const closed = outcome.ok ? pending.map((event) => emit(root, event.area, event, d)) : [];
+  const closed = outcome.ok ? publish(root, pending, d) : [];
   if (closed.length && fs.existsSync(path.join(root, '.git'))) {
     try { d.commitAndPush('keep: incidents', ['tasks']); } catch {}
   }

@@ -695,6 +695,74 @@ test('a failed write is reported on the entry instead of being acknowledged', ()
   } finally { cleanup(root); }
 });
 
+const TEARDOWN = 'grafana:sandbox-teardown-stuck-in-a-failure-loop|agent_hostname=ip-10-70-4-76|sandbox_id=gsphzngft2ipui|service=sandbox-host-agent';
+const OPENS_FAILING = 'grafana:sandbox-opens-failing|environment=prod|failureReason=recovery_in_progress|service=ghost-sandboxes';
+const occurrences = (text, needle) => text.split(needle).length - 1;
+
+test('a discarded mutation publishes no events and its retry duplicates no check-in', () => {
+  const root = makeRoot();
+  try {
+    const registry = fakeRegistry(root);
+    const run = (units, deps) => incidents.ingest({
+      root, units, channel: '#errors-sandboxes', domain: 'example', now: Date.now(),
+      alertBots: ALERT_BOTS, config: incidents.config(root),
+      batchTs: new Set(units.map((unit) => String(unit.ts))),
+    }, deps || registry.deps);
+
+    // Get both of the grouped message's signatures open, so its next delivery
+    // is a firing bump on one card and a resolve on another: two ts-bearing
+    // check-ins inside a single mutation.
+    ingest(root, registry, [SANDBOX_OPENS_FIRING], { channel: '#errors-sandboxes' });
+    run([reposted(GROUPED, '1789590000.000000')]);
+    run([reposted(SANDBOX_OPENS_FIRING, '1789591000.000000')]);
+    const teardownCard = incidents.loadState(root).signatures[TEARDOWN].card;
+    const openFailingCard = incidents.loadState(root).signatures[OPENS_FAILING].card;
+    const feedBefore = incidents.readEvents(root).length;
+    const emittedBefore = registry.events.length;
+    const cardsBefore = registry.created.length;
+
+    // The bump lands, then the resolve throws, so the mutation is rolled back
+    // around a card write that already happened.
+    const broken = {
+      ...registry.deps,
+      checkinTask(id, options) {
+        if (options.heading === 'alert resolved') throw new Error('registry lock timed out');
+        return registry.deps.checkinTask(id, options);
+      },
+    };
+    const failing = reposted(GROUPED, '1789592000.000000');
+    const failed = run([failing], broken);
+    assert.equal(failed.entries[0].ok, false);
+    assert.deepEqual(failed.events, []);
+    assert.equal(incidents.readEvents(root).length, feedBefore, 'nothing in the raw feed');
+    assert.equal(registry.events.length, emittedBefore, 'nothing on the agent feed');
+    assert.equal(occurrences(registry.body(teardownCard), `Slack message ts: ${failing.ts}`), 1,
+      'the bump the failed attempt wrote is on the card');
+    // State was discarded whole, including the part that did land a check-in.
+    const rolledBack = incidents.loadState(root);
+    assert.equal(rolledBack.signatures[TEARDOWN].fireCount, 1);
+    assert.equal(rolledBack.signatures[OPENS_FAILING].resolvedAt, 0);
+
+    const retried = run([failing]);
+    assert.equal(retried.entries[0].ok, undefined);
+    assert.deepEqual(retried.events.map((event) => event.kind), ['incident-fired', 'incident-resolved']);
+    assert.deepEqual(incidents.readEvents(root).slice(feedBefore).map((event) => event.kind),
+      ['incident-fired', 'incident-resolved']);
+    assert.deepEqual(registry.events.slice(emittedBefore).map((item) => item.event.kind),
+      ['incident-fired', 'incident-resolved']);
+    assert.equal(registry.created.length, cardsBefore, 'no new card');
+
+    // The check-in the failed attempt already wrote is not written again, and
+    // the state it was recording does move this time.
+    assert.equal(occurrences(registry.body(teardownCard), `Slack message ts: ${failing.ts}`), 1);
+    assert.equal(occurrences(registry.body(teardownCard), '## alert firing (2)'), 1);
+    assert.equal(occurrences(registry.body(openFailingCard), `Slack message ts: ${failing.ts}`), 1);
+    const landed = incidents.loadState(root);
+    assert.equal(landed.signatures[TEARDOWN].fireCount, 2);
+    assert.equal(landed.signatures[OPENS_FAILING].resolvedAt, incidents.messageTime(failing.ts, 0));
+  } finally { cleanup(root); }
+});
+
 // ---------- the Slack poll partition, end to end ----------
 
 function pollScenario() {
