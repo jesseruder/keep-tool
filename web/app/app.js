@@ -236,7 +236,7 @@ function entityForPane(id) {
     title: session?.title || pane.meta?.title || pane.title || 'shell', state: pane.alive === false ? 'exited' : session?.state || (pane.alive ? 'running' : 'exited'),
     stateLabel: pane.alive === false ? 'Exited' : session ? sessionLabel(session) : pane.alive ? 'Running' : 'Exited',
     reviewer: Boolean(session?.reviewer), taskId: session?.taskId || null, num: session?.num,
-    renamed: Boolean(session?.renamed),
+    renamed: Boolean(session?.renamed), mark: session?.mark,
   };
 }
 function queueItems() {

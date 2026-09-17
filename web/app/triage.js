@@ -11,6 +11,7 @@ import { actionsMenuHTML, installActionsMenu, patchActionsMenu, rendererControls
 import { stateLineHTML, installGrading } from './state-line.js';
 import { numBadgeHTML } from './session-number.js';
 import { installHeadingRename, installRenameControls, isEditing, renameButtonsHTML, titleAttrsHTML } from './session-rename.js';
+import { installMarkControls, markControlsHTML, markHTML } from './session-mark.js';
 
 const summaryCache = new Map(); // session id -> { text, fetchedAt, mtime, fresh }
 const summaryInflight = new Map();
@@ -444,10 +445,12 @@ export function queueRow(ctx, item) {
   const title = item.title || session?.title || 'untitled session';
   const project = item.project || session?.project || '';
   const task = ctx.taskFor(item);
-  // "#12" ahead of the title. A row with no session of its own (a plain shell)
-  // has no number and shows none. It lives inside .t because .qitem is a fixed
-  // three-column grid: another top-level span would shift every cell after it.
-  const badge = numBadgeHTML(ctx.esc, item.num ?? session?.num, item.sessionId || session?.id);
+  // "#12" ahead of the title, with the hand-set mark between it and the title. A
+  // row with no session of its own (a plain shell) has no number and shows none.
+  // Both live inside .t because .qitem is a fixed three-column grid: another
+  // top-level span would shift every cell after it.
+  const badge = numBadgeHTML(ctx.esc, item.num ?? session?.num, item.sessionId || session?.id)
+    + markHTML(ctx.esc, item.mark ?? session?.mark);
   if (item.kind === 'running' || item.kind === 'pinned' || item.kind === 'recent') {
     const sessionState = session ? sessionLabel(session) : item.state || 'unknown';
     // Running rows without a session are plain shells; label them like pinned ones.
@@ -730,7 +733,7 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
   // An open rename editor lives inside this heading; patching it would type over
   // Owner's input on the next refresh.
   if (!isEditing(heading)) {
-    ctx.patchHTML(heading, `<h2${titleAttrsHTML(ctx.esc, item.sessionId, session?.renamed)}>${ctx.esc(title)}${numBadgeHTML(ctx.esc, item.num ?? session?.num, item.sessionId || session?.id)}</h2><div class="meta mono">${ctx.projectHTML(item.project || session?.project || '', true)}${item.taskId ? `<span>${ctx.esc(item.taskId)}</span>${ctx.tagsHTML(task)}` : ''}${accountLabelHTML(ctx, session, pane)}${outageNote}</div>${task ? modelUsageHTML(task.modelUsage) : ''}`);
+    ctx.patchHTML(heading, `<h2${titleAttrsHTML(ctx.esc, item.sessionId, session?.renamed)}>${markHTML(ctx.esc, session?.mark)}${ctx.esc(title)}${numBadgeHTML(ctx.esc, item.num ?? session?.num, item.sessionId || session?.id)}</h2><div class="meta mono">${ctx.projectHTML(item.project || session?.project || '', true)}${item.taskId ? `<span>${ctx.esc(item.taskId)}</span>${ctx.tagsHTML(task)}` : ''}${accountLabelHTML(ctx, session, pane)}${outageNote}</div>${task ? modelUsageHTML(task.modelUsage) : ''}`);
   }
   const brief = stage.querySelector('.brief');
   const ownControls = sessionControlsAllowed(session);
@@ -747,9 +750,10 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
     : waitingItem ? '<button class="btn" data-mark-running title="This session still has background work: list it under Running &amp; waiting until its next message or turn">Mark running</button>' : '';
   ctx.patchHTML(stage.querySelector('.quick-actions'), `${markRunning}${item.sessionId || waitingItem ? '<button class="btn" data-snooze>Snooze 1h</button><button class="btn" data-dismiss><kbd>x</kbd> Dismiss</button>' : ''}${closable ? '<button class="btn" data-close-session>Close</button>' : ''}`);
   const menu = stage.querySelector('.session-actions');
-  patchActionsMenu(ctx, menu, `<button class="btn" data-pin ${item.pane ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}${dependencyWait}${renameButtonsHTML(item.sessionId, session?.renamed)}<span class="relay-controls">${relay}</span><div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><span class="restart-controls">${restart}</span>${hasLivePane ? rendererControlsHTML(ctx, item.pane, pane) : ''}`);
+  patchActionsMenu(ctx, menu, `<button class="btn" data-pin ${item.pane ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}${dependencyWait}${renameButtonsHTML(item.sessionId, session?.renamed)}${markControlsHTML(ctx.esc, item.sessionId, session?.mark)}<span class="relay-controls">${relay}</span><div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><span class="restart-controls">${restart}</span>${hasLivePane ? rendererControlsHTML(ctx, item.pane, pane) : ''}`);
   installActionsMenu(menu, ctx, item.pane);
   installRenameControls(menu, ctx, heading, item.sessionId, title, api.renameSession);
+  installMarkControls(menu, ctx, item.sessionId, session?.mark, api.markSession);
   installHeadingRename(heading, ctx, item.sessionId, title, api.renameSession);
   if (relay) installRelayControls(menu.querySelector('.relay-controls'), ctx);
   if (portable) installPortableTransferControls(menu.querySelector('.portable-transfer-controls'), ctx);

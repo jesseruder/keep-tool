@@ -271,6 +271,29 @@ test('the number badge, an open editor and a session-less heading are left alone
   assert.equal(isEditing(shell.heading), false);
 });
 
+test('the hand-set mark beside the title is not a rename target either', async () => {
+  const { installHeadingRename, isEditing } = await import('./session-rename.js');
+  const { heading, title } = clickableHeading();
+  // What markHTML writes before the title text: the wrapper, and the color dot
+  // inside it, whose own class only starts with "mark-".
+  const mark = new FakeElement('span');
+  mark.attributes.set('class', 'mark');
+  const dot = new FakeElement('i');
+  dot.attributes.set('class', 'mark-dot mark-red');
+  mark.children.push(dot);
+  title.children.unshift(mark);
+
+  installHeadingRename(heading, { esc }, 'abc', 'The finder', async () => assert.fail('the mark is not the title'));
+  heading.dispatch('click', { target: mark });
+  assert.equal(isEditing(heading), false);
+  heading.dispatch('click', { target: dot });
+  assert.equal(isEditing(heading), false, 'the dot inside the mark counts as the mark');
+
+  // The title text around it still opens the editor.
+  heading.dispatch('click', { target: title });
+  assert.equal(isEditing(heading), true);
+});
+
 test('Enter on the focused title opens the editor', async () => {
   const { installHeadingRename, isEditing } = await import('./session-rename.js');
   const { heading, title, badge } = clickableHeading();

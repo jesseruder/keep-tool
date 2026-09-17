@@ -119,9 +119,10 @@ export function installHeadingRename(heading, ctx, sessionId, title, rename) {
     const titleNode = heading.querySelector?.('h2') || heading.querySelector?.('b');
     const path = pathTo(titleNode, event?.target);
     // Only the title itself: not the meta line, not the number badge (whose
-    // tooltip carries the session id), not the editor once it is open.
+    // tooltip carries the session id), not the hand-set mark beside it, not the
+    // editor once it is open.
     if (!path) return;
-    if (path.some((node) => hasClass(node, 'num-id') || hasClass(node, 'rename-session'))) return;
+    if (path.some((node) => hasClass(node, 'num-id') || hasClass(node, 'mark') || hasClass(node, 'rename-session'))) return;
     event?.preventDefault?.();
     const context = target.ctx || {};
     startRename({

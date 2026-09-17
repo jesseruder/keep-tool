@@ -1,5 +1,20 @@
 :root {
   --sans: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif; --mono: "IBM Plex Mono", "SF Mono", Menlo, Consolas, monospace; --top-bar-height: 44px;
+  /* Session marks. The palette is the same eight names the daemon validates, in
+     the same order; palettes.css owns the rest of the theme, so these follow its
+     dark-by-default, light-on-demand shape. */
+  --mark-red: #e06c5c; --mark-orange: #e0904c; --mark-yellow: #e6b04a; --mark-green: #7ac48a;
+  --mark-teal: #5cc0b4; --mark-blue: #73aad2; --mark-purple: #a58be0; --mark-pink: #dd83b4;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --mark-red: #c9403a; --mark-orange: #c4701a; --mark-yellow: #c48a12; --mark-green: #4f8f5a;
+    --mark-teal: #2f8a80; --mark-blue: #3c7ea6; --mark-purple: #6c71c4; --mark-pink: #b8447f;
+  }
+}
+:root[data-theme="light"] {
+  --mark-red: #c9403a; --mark-orange: #c4701a; --mark-yellow: #c48a12; --mark-green: #4f8f5a;
+  --mark-teal: #2f8a80; --mark-blue: #3c7ea6; --mark-purple: #6c71c4; --mark-pink: #b8447f;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.45 var(--sans); height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
@@ -180,6 +195,8 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .session-heading [data-rename-title]:hover, .session-heading [data-rename-title]:focus-visible { text-decoration: underline dotted; text-decoration-color: var(--muted); text-underline-offset: 3px; }
 /* An inline-block is an atomic inline: the ancestor's underline does not propagate into it. */
 .session-heading [data-rename-title] .num-id { display: inline-block; text-decoration: none; cursor: default; }
+/* The mark is inline-flex, atomic in the same way; it only has to opt out of the underline and the text cursor. */
+.session-heading [data-rename-title] .mark { text-decoration: none; cursor: default; }
 /* The inline rename editor stands in for the heading's title text. */
 .rename-session { display: block; }
 .rename-session input { width: 100%; box-sizing: border-box; font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--accent); border-radius: 4px; padding: 1px 6px; }
@@ -221,6 +238,24 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .renderer-choice { justify-content: space-between; width: 100%; padding: 6px 8px; text-align: left; }
 .renderer-choice.selected { color: var(--text); background: var(--sel); }
 .renderer-check { color: var(--accent); }
+/* A session's hand-set mark: an emoji, a color dot, or both, sitting just before
+   the title wherever the title is shown. */
+.mark { display: inline-flex; align-items: center; gap: 3px; margin-right: 5px; }
+.mark-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.mark-dot.mark-red, .mark-swatch.mark-red { background: var(--mark-red); }
+.mark-dot.mark-orange, .mark-swatch.mark-orange { background: var(--mark-orange); }
+.mark-dot.mark-yellow, .mark-swatch.mark-yellow { background: var(--mark-yellow); }
+.mark-dot.mark-green, .mark-swatch.mark-green { background: var(--mark-green); }
+.mark-dot.mark-teal, .mark-swatch.mark-teal { background: var(--mark-teal); }
+.mark-dot.mark-blue, .mark-swatch.mark-blue { background: var(--mark-blue); }
+.mark-dot.mark-purple, .mark-swatch.mark-purple { background: var(--mark-purple); }
+.mark-dot.mark-pink, .mark-swatch.mark-pink { background: var(--mark-pink); }
+/* The Actions-menu block that sets one. */
+.mark-controls { display: flex; flex-direction: column; gap: 4px; }
+.mark-swatches { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 8px; }
+.mark-swatch { width: 16px; height: 16px; border-radius: 50%; padding: 0; flex: none; }
+.mark-swatch[aria-pressed="true"] { box-shadow: 0 0 0 2px var(--panel-2), 0 0 0 4px var(--focus); }
+.mark-emoji { width: 84px; margin: 0 8px; font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line-2); border-radius: 4px; padding: 1px 6px; }
 .handoff-status, .handoff-error { align-self: center; color: var(--muted); font-size: 11px; white-space: nowrap; }
 .handoff-error { color: var(--bad); }
 .session-launch-dialog { width: min(560px, calc(100vw - 32px)); max-width: none; padding: 0; border: 1px solid var(--line-2); border-radius: 10px; background: var(--panel); color: var(--text); box-shadow: var(--shadow); }

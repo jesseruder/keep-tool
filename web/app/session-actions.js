@@ -6,11 +6,12 @@ export function actionsMenuHTML() {
 
 function focusIdentity(element) {
   if (!(element instanceof Element)) return null;
-  for (const name of ['renderer', 'restart', 'handoffAccount', 'portableTransfer', 'portableFallback', 'relaySession']) {
+  for (const name of ['renderer', 'restart', 'handoffAccount', 'portableTransfer', 'portableFallback', 'relaySession',
+    'markColor']) {
     if (element.dataset[name] != null) return `[data-${name.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)}="${CSS.escape(element.dataset[name])}"]`;
   }
   return ['pin', 'unpin', 'closeSession', 'snooze', 'dismiss', 'waitDependency', 'reopen', 'kill', 'removePane',
-    'rename', 'renameReset']
+    'rename', 'renameReset', 'markEmoji', 'markClear']
     .find((name) => element.dataset[name] != null);
 }
 
@@ -22,9 +23,18 @@ function focusSelector(identity) {
 
 export function patchActionsMenu(ctx, menu, html) {
   const content = menu.querySelector('.session-actions-content');
-  const identity = menu.contains(document.activeElement) ? focusIdentity(document.activeElement) : null;
+  const focused = menu.contains(document.activeElement) ? document.activeElement : null;
+  const identity = focused ? focusIdentity(focused) : null;
+  // A text field Owner is typing in has a value the markup does not know about
+  // yet — the emoji field is only written once it is committed. Carry it across
+  // the patch so a refresh a second later does not type over it.
+  const typed = identity && focused.tagName === 'INPUT' ? focused.value : null;
   const changed = ctx.patchHTML(content, html);
-  if (changed && identity) content.querySelector(focusSelector(identity))?.focus({ preventScroll: true });
+  if (changed && identity) {
+    const restored = content.querySelector(focusSelector(identity));
+    if (restored && typed != null) restored.value = typed;
+    restored?.focus({ preventScroll: true });
+  }
   return changed;
 }
 
