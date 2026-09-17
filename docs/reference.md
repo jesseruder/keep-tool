@@ -922,7 +922,10 @@ the top-level text), with `&gt;`/`&lt;`/`&amp;` unescaped first:
   `Alert "<title>" resolved`, and `All alerts are passing`. The signature is the
   `castle-alerts-<id>` token when the message carries one, else
   `internal:<slug(title)>`. A resolved post carries only the title, so state keeps a
-  title→signature index to map it back. `All alerts are passing` resolves every open
+  title→signature index to map it back; only an internal firing writes that index and
+  only an open internal incident can be read out of it, so a Grafana rule or an ad-hoc
+  error sharing a title is never resolved by somebody else's message.
+  `All alerts are passing` resolves every open
   `internal:`/`castle-alerts-` signature and nothing else; it is recorded with state
   `all-clear` and no signature of its own.
 - **Ad-hoc** (`SlackNotifier.alert`) — signature `adhoc:<slug(text before the first
@@ -941,17 +944,28 @@ active; the daemon's sweep after each Slack poll closes a card that has been qui
 have no resolved form, so their quiet clock runs from the last firing; a Grafana or
 internal alert that never resolved is left open. A firing within `reopenHours` of a
 close reopens the same card; later than that, a new `inc-<slug>-<yyyymmdd>` card links
-the old one. Deterministic commit, step-run and hold suspects from the prior
+the old one, and a second late refire on the same day reopens that dated card rather
+than leaving it `done`. Every one of those clocks is the Slack timestamp the message
+was posted at, not the poll that noticed it — otherwise the first poll after the
+feature is enabled would stamp a six-hour backfill with one time and close quiet
+incidents an hour after the poll instead of an hour after they went quiet.
+Deterministic commit, step-run and hold suspects from the prior
 `SUSPECT_WINDOW_MIN` minutes are attached to the first firing. A human thread reply
 under a bot post becomes a `note (by <name>)` check-in with the reply fenced as data —
 no classifier, and never attached twice.
 
-State lives under `.keep/incidents/`: `state.json` (signatures and the title index,
-written through one synchronous mutation the way `self-repair.js` writes its state) and
+State lives under `.keep/incidents/`: `state.json` (signatures and the title index) and
 `events.jsonl`, the raw feed of every lifecycle change — `incident-opened`,
 `incident-fired`, `incident-resolved`, `incident-closed`, `incident-reopened`,
 `human-note`. Each event carries `{at, kind, card, signature, title, area, severity,
 permalink, suspects}`: pointers, never message bodies.
+
+One message is one state mutation, and the whole mutation — loading state, writing the
+card, writing `state.json` — runs inside the registry lock, so a manual `keep slack
+poll` racing the daemon cannot load the same state twice and lose the other's update.
+If that mutation fails, the message is *not* acknowledged: no decisions row, no
+`seen.json` entry, no event, and the channel cursor stops short of it, so the next poll
+fetches and retries it. One transient lock or disk failure must not lose an alert.
 
 `keep incidents [--json]` lists the open signatures with their card, area, fire count
 and last firing. `keep incidents parse <file|-> [--json]` parses one Slack message — or

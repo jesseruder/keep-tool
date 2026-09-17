@@ -1127,8 +1127,18 @@ async function poll(options = {}) {
         alertBots: cfg.alertBots,
         batchTs: new Set(item.batch.map((message) => String(message.ts))),
       }, deps);
+      const landedAlerts = [];
       for (const entry of entries) {
+        // A write that failed is not a message we have handled. Leaving it out
+        // of seen.json and out of alertTs stops the cursor short of it, so the
+        // next poll fetches it again — acknowledging it here would lose the
+        // alert for good on one transient lock or disk failure.
+        if (entry.ok === false) {
+          process.stderr.write(`keep slack: incident ${entry.ts} not recorded (${entry.error || 'write failed'}); retrying next poll\n`);
+          continue;
+        }
         alertTs.add(String(entry.ts));
+        landedAlerts.push(entry);
         results.push(entry);
         if (dry) process.stdout.write(JSON.stringify(entry) + '\n');
         else {
@@ -1140,7 +1150,7 @@ async function poll(options = {}) {
       }
       if (!dry) {
         writeJsonAtomic(SEEN_FILE, seen);
-        if (entries.some((entry) => entry.cardId) && fs.existsSync(path.join(keep.ROOT, '.git'))) {
+        if (landedAlerts.some((entry) => entry.cardId) && fs.existsSync(path.join(keep.ROOT, '.git'))) {
           deps.commitAndPush('keep: incidents', ['tasks']);
         }
       }

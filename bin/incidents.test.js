@@ -103,6 +103,12 @@ function parse(root, message) {
   return incidents.parse(message, { root, config: incidents.config(root), alertBots: ALERT_BOTS });
 }
 
+// An alert's clock is the Slack timestamp it was posted at, never the poll that
+// noticed it.
+function at(message) { return incidents.messageTime(message.ts, 0); }
+
+function reposted(message, ts) { return { ...message, ts }; }
+
 function cleanup(root) { fs.rmSync(root, { recursive: true, force: true }); }
 
 test('the three bot shapes parse into signatures, titles and states', () => {
@@ -285,8 +291,16 @@ test('a firing alert opens one card, attaches suspects and emits incident-opened
     assert.equal(feed[0].kind, 'incident-opened');
 
     const state = incidents.loadState(root);
-    assert.equal(state.signatures[entries[0].signature].fireCount, 1);
-    assert.equal(state.titles['Sandbox opens failing'], entries[0].signature);
+    const entry = state.signatures[entries[0].signature];
+    assert.equal(entry.fireCount, 1);
+    // The clock is the message's, not the poll's.
+    assert.equal(entry.openedAt, at(SANDBOX_OPENS_FIRING));
+    assert.equal(entry.lastFiredAt, at(SANDBOX_OPENS_FIRING));
+    assert.equal(registry.events[0].event.at, at(SANDBOX_OPENS_FIRING));
+    // The decisions row is stamped when the watcher saw it, which is the poll.
+    assert.equal(entries[0].at, now);
+    // Only internal alerts populate the title index.
+    assert.deepEqual(state.titles, {});
   } finally { cleanup(root); }
 });
 
@@ -296,7 +310,7 @@ test('a second firing bumps the open card instead of opening another', () => {
     const registry = fakeRegistry(root);
     const base = Date.UTC(2026, 8, 16, 12, 0, 0);
     ingest(root, registry, [SANDBOX_OPENS_FIRING], { channel: '#errors-sandboxes', now: base });
-    const again = { ...SANDBOX_OPENS_FIRING, ts: '1789585999.000000' };
+    const again = reposted(SANDBOX_OPENS_FIRING, '1789585999.000000');
     ingest(root, registry, [again], { channel: '#errors-sandboxes', now: base + 30 * 60e3 });
 
     assert.equal(registry.created.length, 1);
@@ -307,7 +321,7 @@ test('a second firing bumps the open card instead of opening another', () => {
     const state = incidents.loadState(root);
     const entry = Object.values(state.signatures)[0];
     assert.equal(entry.fireCount, 2);
-    assert.equal(entry.lastFiredAt, base + 30 * 60e3);
+    assert.equal(entry.lastFiredAt, at(again));
     assert.deepEqual(registry.events.map((item) => item.event.kind), ['incident-opened', 'incident-fired']);
   } finally { cleanup(root); }
 });
@@ -316,43 +330,61 @@ test('resolved checks in and leaves the card active; the quiet sweep closes it',
   const root = makeRoot();
   try {
     const registry = fakeRegistry(root);
-    const base = Date.UTC(2026, 8, 16, 12, 0, 0);
-    ingest(root, registry, [SERVER_FAULTS_FIRING], { now: base });
+    const firing = reposted(SERVER_FAULTS_FIRING, '1789600000.000000');
+    const resolved = reposted(SERVER_FAULTS_RESOLVED, '1789600300.000000');
+    // Both messages are already 90 minutes old when the poll first sees them —
+    // the shape of a backfill, and the case the poll clock got wrong.
+    const poll = at(resolved) + 90 * 60e3;
+    ingest(root, registry, [firing, resolved], { now: poll });
     const card = registry.created[0].id;
-    ingest(root, registry, [SERVER_FAULTS_RESOLVED], { now: base + 10 * 60e3 });
 
     assert.equal(registry.checkins.at(-1).heading, 'alert resolved');
     assert.equal(registry.statuses.get(card), 'active');
-    assert.equal(incidents.loadState(root).signatures['grafana:unacknowledged-server-faults'].resolvedAt, base + 10 * 60e3);
+    const state = incidents.loadState(root).signatures['grafana:unacknowledged-server-faults'];
+    assert.equal(state.openedAt, at(firing));
+    assert.equal(state.resolvedAt, at(resolved));
 
-    // Not yet quiet.
-    assert.deepEqual(incidents.sweep({ root, now: base + 60 * 60e3 }, registry.deps), []);
+    // Not yet quiet, measured from the resolution, not the poll.
+    assert.deepEqual(incidents.sweep({ root, now: at(resolved) + 59 * 60e3 }, registry.deps), []);
     assert.equal(registry.statuses.get(card), 'active');
 
-    const closed = incidents.sweep({ root, now: base + 71 * 60e3 }, registry.deps);
+    // The sweep that runs right after this poll closes it at once: it has been
+    // quiet for 85 minutes in the real world, even though the poll is new.
+    const closed = incidents.sweep({ root, now: poll }, registry.deps);
     assert.equal(closed.length, 1);
     assert.equal(closed[0].kind, 'incident-closed');
     assert.equal(registry.statuses.get(card), 'done');
     assert.equal(registry.checkins.at(-1).message, 'closed: quiet for 60m');
-    assert.equal(incidents.loadState(root).signatures['grafana:unacknowledged-server-faults'].closedAt, base + 71 * 60e3);
+    assert.equal(incidents.loadState(root).signatures['grafana:unacknowledged-server-faults'].closedAt, poll);
     // Closing is idempotent.
-    assert.deepEqual(incidents.sweep({ root, now: base + 200 * 60e3 }, registry.deps), []);
+    assert.deepEqual(incidents.sweep({ root, now: poll + 200 * 60e3 }, registry.deps), []);
     // And a closed incident is off `keep incidents`.
     assert.deepEqual(incidents.openIncidents(root), []);
   } finally { cleanup(root); }
 });
 
+// Every timestamp below is the message's own, and the day the dated card is
+// named for is a local day, so the clock is built from local time on purpose.
+const DAY_START = Math.floor(new Date(2026, 8, 16, 1, 0, 0).getTime() / 1000);
+const slackTs = (offsetSeconds) => `${DAY_START + offsetSeconds}.000000`;
+const datedSuffix = (ms) => {
+  const stamp = new Date(ms);
+  return `${stamp.getFullYear()}${String(stamp.getMonth() + 1).padStart(2, '0')}${String(stamp.getDate()).padStart(2, '0')}`;
+};
+
 test('a firing after the close reopens inside the window and opens a dated card outside it', () => {
   const root = makeRoot();
   try {
-    const base = Date.UTC(2026, 8, 16, 12, 0, 0);
     const inside = fakeRegistry(root);
-    ingest(root, inside, [SERVER_FAULTS_FIRING], { now: base });
+    const firing = reposted(SERVER_FAULTS_FIRING, slackTs(0));
+    ingest(root, inside, [firing], { now: at(firing) });
     const card = inside.created[0].id;
-    ingest(root, inside, [SERVER_FAULTS_RESOLVED], { now: base + 10 * 60e3 });
-    incidents.sweep({ root, now: base + 71 * 60e3 }, inside.deps);
+    const resolved = reposted(SERVER_FAULTS_RESOLVED, slackTs(300));
+    ingest(root, inside, [resolved], { now: at(resolved) });
+    incidents.sweep({ root, now: at(resolved) + 61 * 60e3 }, inside.deps);
 
-    ingest(root, inside, [{ ...SERVER_FAULTS_FIRING, ts: '1789600000.000000' }], { now: base + 5 * 3600e3 });
+    const soon = reposted(SERVER_FAULTS_FIRING, slackTs(5 * 3600));
+    ingest(root, inside, [soon], { now: at(soon) });
     assert.equal(inside.created.length, 1, 'reopen reuses the card');
     assert.equal(inside.checkins.at(-1).heading, 'reopened');
     assert.equal(inside.statuses.get(card), 'active');
@@ -360,20 +392,67 @@ test('a firing after the close reopens inside the window and opens a dated card 
     assert.equal(reopened.card, card);
     assert.equal(reopened.closedAt, 0);
     assert.equal(reopened.fireCount, 2);
+    assert.equal(reopened.lastFiredAt, at(soon));
     assert.equal(inside.events.at(-1).event.kind, 'incident-reopened');
 
     // Now close it again and come back after the reopen window.
-    ingest(root, inside, [{ ...SERVER_FAULTS_RESOLVED, ts: '1789600100.000000' }], { now: base + 6 * 3600e3 });
-    incidents.sweep({ root, now: base + 8 * 3600e3 }, inside.deps);
-    ingest(root, inside, [{ ...SERVER_FAULTS_FIRING, ts: '1789700000.000000' }], { now: base + 40 * 3600e3 });
+    const resolvedAgain = reposted(SERVER_FAULTS_RESOLVED, slackTs(6 * 3600));
+    ingest(root, inside, [resolvedAgain], { now: at(resolvedAgain) });
+    incidents.sweep({ root, now: at(resolvedAgain) + 61 * 60e3 }, inside.deps);
+    const late = reposted(SERVER_FAULTS_FIRING, slackTs(40 * 3600));
+    ingest(root, inside, [late], { now: at(late) });
     assert.equal(inside.created.length, 2, 'a new card outside the reopen window');
     const fresh = inside.created[1];
-    const stamp = new Date(base + 40 * 3600e3);
-    const dated = `${stamp.getFullYear()}${String(stamp.getMonth() + 1).padStart(2, '0')}${String(stamp.getDate()).padStart(2, '0')}`;
-    assert.equal(fresh.id, `${card}-${dated}`);
+    assert.equal(fresh.id, `${card}-${datedSuffix(at(late))}`);
     assert.match(fresh.note, new RegExp(`Earlier incident on this signature: ${card}`));
     assert.equal(incidents.loadState(root).signatures['grafana:unacknowledged-server-faults'].card, fresh.id);
     assert.equal(inside.events.at(-1).event.kind, 'incident-opened');
+  } finally { cleanup(root); }
+});
+
+test('a second late refire on the same day reactivates the dated card it already made', () => {
+  // A short reopen window is what makes this reachable: two closes and two late
+  // refires inside one calendar day land on the same `inc-<slug>-<yyyymmdd>` id.
+  const root = makeRoot({ config: { reopenHours: 1 } });
+  try {
+    const registry = fakeRegistry(root);
+    const fire = (offset) => {
+      const message = reposted(SERVER_FAULTS_FIRING, slackTs(offset));
+      ingest(root, registry, [message], { now: at(message) });
+      return message;
+    };
+    const resolveAndClose = (offset) => {
+      const message = reposted(SERVER_FAULTS_RESOLVED, slackTs(offset));
+      ingest(root, registry, [message], { now: at(message) });
+      incidents.sweep({ root, now: at(message) + 61 * 60e3 }, registry.deps);
+    };
+
+    fire(0);
+    const card = registry.created[0].id;
+    resolveAndClose(300);
+
+    const first = fire(3 * 3600);
+    const dated = `${card}-${datedSuffix(at(first))}`;
+    assert.equal(registry.created.length, 2);
+    assert.equal(registry.created[1].id, dated);
+    resolveAndClose(3 * 3600 + 300);
+    assert.equal(registry.statuses.get(dated), 'done');
+
+    const second = fire(7 * 3600);
+    assert.equal(datedSuffix(at(second)), datedSuffix(at(first)), 'same calendar day');
+    // The id is taken, so the card is reopened rather than left `done` with the
+    // state pretending a fresh incident is active on it.
+    assert.equal(registry.created.length, 2, 'no third card');
+    assert.equal(registry.checkins.at(-1).heading, 'reopened');
+    assert.equal(registry.checkins.at(-1).id, dated);
+    assert.equal(registry.statuses.get(dated), 'active');
+    const state = incidents.loadState(root).signatures['grafana:unacknowledged-server-faults'];
+    assert.equal(state.card, dated);
+    assert.equal(state.closedAt, 0);
+    // The dated card started its own count when it was created; the reopen
+    // carries that count forward rather than starting again at one.
+    assert.equal(state.fireCount, 2);
+    assert.equal(registry.events.at(-1).event.kind, 'incident-reopened');
   } finally { cleanup(root); }
 });
 
@@ -392,7 +471,33 @@ test('the title index resolves an internal alert whose resolved post has no id',
     assert.equal(registry.checkins.at(-1).heading, 'alert resolved');
     const state = incidents.loadState(root);
     assert.equal(state.signatures['internal:cron-jobs-sqs'], undefined);
-    assert.equal(state.signatures['castle-alerts-cron-jobs-sqs'].resolvedAt, base + 18 * 60e3);
+    assert.equal(state.signatures['castle-alerts-cron-jobs-sqs'].resolvedAt, at(CRON_RESOLVED));
+  } finally { cleanup(root); }
+});
+
+test('the title index never hands an internal resolve somebody else\'s incident', () => {
+  const root = makeRoot();
+  try {
+    const registry = fakeRegistry(root);
+    const base = Date.UTC(2026, 8, 16, 12, 0, 0);
+    // A Grafana rule and an ad-hoc error can both be called "Cron Jobs SQS".
+    const grafana = {
+      channel: '#errors', ts: '1789600000.000000', from: GHOST_BOT, text: '', subtype: 'bot_message',
+      attachments: [{
+        title: '[FIRING:1] Cron Jobs SQS Castle',
+        text: '**Firing**\n\nValue: A=1\nLabels:\n - alertname = Cron Jobs SQS\n - grafana_folder = Castle\nAnnotations:\nSource: <https://castlexyz.grafana.net/x>',
+      }],
+    };
+    const adhoc = { channel: '#errors', ts: '1789600100.000000', from: GHOST_BOT, text: 'Cron Jobs SQS: queue is behind', subtype: 'bot_message' };
+    ingest(root, registry, [grafana, adhoc], { now: base });
+    assert.equal(registry.created.length, 2);
+    assert.deepEqual(incidents.loadState(root).titles, {}, 'only internal firings index a title');
+
+    ingest(root, registry, [reposted(CRON_RESOLVED, '1789600200.000000')], { now: base + 60e3 });
+    const state = incidents.loadState(root);
+    assert.equal(state.signatures['grafana:cron-jobs-sqs'].resolvedAt, 0, 'the Grafana incident is still firing');
+    assert.equal(state.signatures['adhoc:cron-jobs-sqs'].resolvedAt, 0);
+    assert.equal(registry.checkins.some((item) => item.heading === 'alert resolved'), false);
   } finally { cleanup(root); }
 });
 
@@ -413,8 +518,8 @@ test('"All alerts are passing" resolves internal signatures and leaves Grafana a
     assert.equal(entries[0].signature, null);
 
     const state = incidents.loadState(root);
-    assert.equal(state.signatures['castle-alerts-cron-jobs-sqs'].resolvedAt, base + 5 * 60e3);
-    assert.equal(state.signatures['castle-alerts-home-feed-global-candidates'].resolvedAt, base + 5 * 60e3);
+    assert.equal(state.signatures['castle-alerts-cron-jobs-sqs'].resolvedAt, at(ALL_CLEAR));
+    assert.equal(state.signatures['castle-alerts-home-feed-global-candidates'].resolvedAt, at(ALL_CLEAR));
     assert.equal(state.signatures['grafana:unacknowledged-server-faults'].resolvedAt, 0);
     assert.equal(state.signatures['adhoc:error-deleting-user-180802552-https'].resolvedAt, 0);
     assert.equal(registry.events.filter((item) => item.event.kind === 'incident-resolved').length, 2);
@@ -429,8 +534,8 @@ test('an ad-hoc alert has no resolved form and closes on the quiet clock alone',
     ingest(root, registry, [ADHOC], { now: base });
     const card = registry.created[0].id;
     assert.equal(card, 'inc-adhoc-error-deleting-user-180802552-https');
-    assert.deepEqual(incidents.sweep({ root, now: base + 30 * 60e3 }, registry.deps), []);
-    const closed = incidents.sweep({ root, now: base + 61 * 60e3 }, registry.deps);
+    assert.deepEqual(incidents.sweep({ root, now: at(ADHOC) + 30 * 60e3 }, registry.deps), []);
+    const closed = incidents.sweep({ root, now: at(ADHOC) + 61 * 60e3 }, registry.deps);
     assert.equal(closed.length, 1);
     assert.equal(registry.statuses.get(card), 'done');
 
@@ -438,7 +543,7 @@ test('an ad-hoc alert has no resolved form and closes on the quiet clock alone',
     // still firing as far as anybody knows.
     const other = fakeRegistry(root);
     ingest(root, other, [SANDBOX_OPENS_FIRING], { channel: '#errors-sandboxes', now: base });
-    assert.deepEqual(incidents.sweep({ root, now: base + 10 * 3600e3 }, other.deps), []);
+    assert.deepEqual(incidents.sweep({ root, now: at(SANDBOX_OPENS_FIRING) + 10 * 3600e3 }, other.deps), []);
   } finally { cleanup(root); }
 });
 
@@ -502,17 +607,91 @@ test('config falls back to one default area and a documented quiet window', () =
   } finally { cleanup(root); }
 });
 
-test('an unwritable state file is reported and does not throw out of the sweep', () => {
+test('an unwritable state file reports failure and does not throw out of the sweep', () => {
   const root = makeRoot();
   try {
     fs.mkdirSync(incidents.stateFile(root), { recursive: true });
     const warnings = [];
     const result = incidents.mutateState((state) => { state.signatures.x = {}; },
       { root, write: (line) => warnings.push(line) });
-    assert.equal(result, null);
+    assert.equal(result.ok, false);
+    assert.equal(typeof result.error, 'string');
     assert.equal(warnings.length, 1);
     assert.match(warnings[0], /could not update/);
     assert.deepEqual(incidents.sweepQuietly({ root }, fakeRegistry(root).deps), []);
+  } finally { cleanup(root); }
+});
+
+test('every mutation runs inside the registry lock and reloads state there', () => {
+  const root = makeRoot();
+  try {
+    const registry = fakeRegistry(root);
+    const order = [];
+    const withLock = (fn) => { order.push('lock'); try { return fn(); } finally { order.push('unlock'); } };
+
+    const first = incidents.mutateState((state) => { state.signatures.a = { card: 'inc-a' }; }, { root, withLock });
+    assert.equal(first.ok, true);
+    assert.deepEqual(order, ['lock', 'unlock']);
+
+    // The second mutation must see the first one's write: state is loaded inside
+    // the lock, not carried in from before it, so no update can be lost.
+    let seen = null;
+    const second = incidents.mutateState((state) => {
+      seen = Object.keys(state.signatures);
+      state.signatures.b = { card: 'inc-b' };
+    }, { root, withLock });
+    assert.equal(second.ok, true);
+    assert.deepEqual(seen, ['a']);
+    assert.deepEqual(Object.keys(incidents.loadState(root).signatures), ['a', 'b']);
+
+    // And the card helpers are told the lock is already held, so they do not
+    // try to take it again from inside the callback.
+    ingest(root, registry, [SERVER_FAULTS_FIRING]);
+    assert.equal(registry.created[0].withinLock, true);
+    ingest(root, registry, [reposted(SERVER_FAULTS_FIRING, '1789600000.000000')]);
+    assert.equal(registry.checkins.at(-1).withinLock, true);
+  } finally { cleanup(root); }
+});
+
+test('a failed write is reported on the entry instead of being acknowledged', () => {
+  const root = makeRoot();
+  try {
+    const registry = fakeRegistry(root);
+    ingest(root, registry, [SANDBOX_OPENS_FIRING], { channel: '#errors-sandboxes' });
+    const opened = registry.created.length;
+
+    // The grouped message opens the teardown incident and resolves the one
+    // above. The check-in for that resolve fails.
+    const broken = {
+      ...registry.deps,
+      checkinTask(id, options) {
+        if (options.heading === 'alert resolved') throw new Error('registry lock timed out');
+        return registry.deps.checkinTask(id, options);
+      },
+    };
+    const { entries, events } = incidents.ingest({
+      root, units: [GROUPED], channel: '#errors-sandboxes', domain: 'example',
+      now: Date.now(), alertBots: ALERT_BOTS, config: incidents.config(root),
+      batchTs: new Set([GROUPED.ts]),
+    }, broken);
+
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].ok, false);
+    assert.match(entries[0].error, /registry lock timed out/);
+    assert.deepEqual(events, [], 'no event is published for a write that did not land');
+
+    // The whole mutation was discarded: the teardown incident the first alert of
+    // the same message opened is not in state, and the resolve did not stick.
+    const state = incidents.loadState(root);
+    assert.equal(Object.keys(state.signatures).length, 1);
+    assert.equal(state.signatures['grafana:sandbox-opens-failing|environment=prod|failureReason=recovery_in_progress|service=ghost-sandboxes'].resolvedAt, 0);
+
+    // A retry with a working registry lands it, reusing the card the failed
+    // attempt had already written.
+    const retry = ingest(root, registry, [GROUPED], { channel: '#errors-sandboxes' });
+    assert.equal(retry.entries[0].ok, undefined);
+    assert.equal(registry.created.length, opened + 1);
+    assert.equal(Object.keys(incidents.loadState(root).signatures).length, 2);
   } finally { cleanup(root); }
 });
 
@@ -520,11 +699,17 @@ test('an unwritable state file is reported and does not throw out of the sweep',
 
 function pollScenario() {
   const root = makeRoot();
+  // The poll only fetches the last `backfillHours`, so the fixtures are reposted
+  // a few minutes ago rather than at the timestamps they really carry — those
+  // would age out of the window and quietly stop being tested.
+  const base = Math.floor(Date.now() / 1000) - 600;
+  const alertTs = [`${base + 1}.000000`, `${base + 2}.000000`];
   const mcp = path.join(root, 'fake-mcp.js');
   writeExecutable(mcp, `#!/usr/bin/env node
 const tool = process.argv[3];
-const fixtures = ${JSON.stringify([SERVER_FAULTS_FIRING, GROUPED])};
-const human = { ts: '1789600001.000000', at: '12:01', from: 'Ben', text: 'is the sandbox thing us?', channel: '#errors' };
+const fixtures = ${JSON.stringify([SERVER_FAULTS_FIRING, GROUPED])}
+  .map((message, index) => ({ ...message, ts: ${JSON.stringify(alertTs)}[index] }));
+const human = { ts: '${base + 3}.000000', at: '12:01', from: 'Ben', text: 'is the sandbox thing us?', channel: '#errors' };
 if (tool === 'slack_whoami') process.stdout.write(JSON.stringify({ domain: 'example' }));
 if (tool === 'slack_history') {
   const args = JSON.parse(process.argv[4] || '{}');
@@ -543,7 +728,7 @@ const body = prompt.slice(prompt.indexOf('<<<KEEP_INPUT') + '<<<KEEP_INPUT'.leng
 const decisions = JSON.parse(body).map((message) => ({ ts: message.ts, kind: 'other', summary: 'chatter', severity: 'low', resolved: false, related: [], duplicate_of: null, confidence: 1 }));
 process.stdout.write(JSON.stringify({ result: JSON.stringify(decisions) }));
 `);
-  return { root, mcp, claude };
+  return { root, mcp, claude, alertTs };
 }
 
 test('the poll parses alert bots without a model and still records their decisions', () => {
@@ -589,6 +774,48 @@ test('the poll parses alert bots without a model and still records their decisio
     const second = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', env });
     assert.equal(second.status, 0, second.stderr);
     assert.equal(fs.readdirSync(path.join(fixture.root, 'tasks')).filter((name) => name.startsWith('inc-')).length, 2);
+  } finally { cleanup(fixture.root); }
+});
+
+test('a poll whose incident write fails leaves the message for the next poll', () => {
+  const fixture = pollScenario();
+  try {
+    // An unwritable state file is the cheapest stand-in for a transient lock or
+    // disk failure; it fails every incident mutation this poll attempts.
+    fs.mkdirSync(path.join(fixture.root, '.keep', 'incidents', 'state.json'), { recursive: true });
+    const script = `require(${JSON.stringify(path.join(__dirname, 'slack.js'))}).poll()`
+      + '.then((rows) => process.stdout.write(String(rows.length)))'
+      + '.catch((error) => { console.error(error.stack); process.exit(1); });';
+    const env = {
+      ...process.env, KEEP_DIR: fixture.root, KEEP_NO_PUSH: '1', KEEP_ALERT_CHANNELS: 'none',
+      KEEP_JESSE_MCP: fixture.mcp, KEEP_CLAUDE: fixture.claude,
+    };
+    delete env.CLAUDE_CODE_SESSION_ID;
+    const first = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', env });
+    assert.equal(first.status, 0, first.stderr);
+    assert.match(first.stderr, /not recorded/);
+
+    const readDecisions = () => fs.readFileSync(path.join(fixture.root, '.keep', 'slack', 'decisions.jsonl'), 'utf8')
+      .trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(readDecisions().some((entry) => entry.kind === 'alert'), false, 'nothing acknowledged');
+
+    const seen = JSON.parse(fs.readFileSync(path.join(fixture.root, '.keep', 'slack', 'seen.json'), 'utf8'));
+    for (const ts of fixture.alertTs) assert.equal(seen[ts], undefined, ts);
+
+    // The cursor stopped short of the bot messages, so they are fetched again.
+    const cursors = JSON.parse(fs.readFileSync(path.join(fixture.root, '.keep', 'slack', 'cursors.json'), 'utf8'));
+    for (const [channel, ts] of [['#errors', fixture.alertTs[0]], ['#errors-sandboxes', fixture.alertTs[1]]]) {
+      assert.equal(Number(cursors.channels[channel].after_ts) < Number(ts), true, channel);
+    }
+
+    // With the state file writable again the next poll lands them.
+    fs.rmdirSync(path.join(fixture.root, '.keep', 'incidents', 'state.json'));
+    const second = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', env });
+    assert.equal(second.status, 0, second.stderr);
+    const alerts = readDecisions().filter((entry) => entry.kind === 'alert');
+    assert.equal(alerts.length, 2);
+    assert.equal(alerts.every((entry) => entry.ok === undefined && entry.cardId), true);
+    assert.equal(Object.keys(JSON.parse(fs.readFileSync(path.join(fixture.root, '.keep', 'incidents', 'state.json'), 'utf8')).signatures).length, 2);
   } finally { cleanup(fixture.root); }
 });
 

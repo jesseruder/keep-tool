@@ -150,6 +150,10 @@ function alertBots(root = keep.ROOT) {
   return normalizeAlertBots(readJson(watchFile(root, SLACK_CONFIG_NAME), {}).alertBots);
 }
 
+// The patterns are Owner-written configuration in the registry, not anything a
+// bot or a stranger can reach, and every value tested against them is a title
+// already capped at 120 characters. A pathological pattern is therefore a
+// misconfiguration to fix in the file, not an attack to defend against here.
 function matches(patterns, value) {
   for (const pattern of patterns || []) {
     let re;
@@ -352,23 +356,35 @@ function loadState(root = keep.ROOT) {
   };
 }
 
-// The one way to change state.json, and the same constraint as self-repair.js's
-// mutateState: atomic only because it is synchronous end to end. `fn` must never
-// await and must never be handed a state loaded before the call. An unwritable
-// directory is reported and returns null — the daemon keeps polling.
+// The one way to change state.json. Load, card writes and the state write all
+// happen inside the registry lock, so a manual `keep slack poll` racing the
+// daemon cannot load the same state twice and overwrite the other's update —
+// an atomic rename stops a torn file, not a lost update. `fn` must never await:
+// like self-repair.js's mutateState this is atomic only because it is
+// synchronous end to end, and it must never be handed a state loaded before the
+// call. The card helpers are called with `withinLock` so they do not try to take
+// the lock this already holds.
+//
+// Returns {ok:true, state, result} or {ok:false, error}. A caller that records
+// a message as handled MUST check `ok` first: acknowledging a write that did not
+// happen loses the alert for good.
 function mutateState(fn, options = {}) {
   const root = options.root || keep.ROOT;
   const write = options.write || process.stderr.write.bind(process.stderr);
+  const lock = options.withLock || keep.withLock;
   try {
-    const state = loadState(root);
-    const result = fn(state);
-    writeJsonAtomic(stateFile(root), state);
-    return result === undefined ? state : result;
+    return lock(() => {
+      const state = loadState(root);
+      const result = fn(state);
+      writeJsonAtomic(stateFile(root), state);
+      return { ok: true, state, result };
+    });
   } catch (error) {
+    const message = oneLine(error && error.message || error, 200);
     try {
-      write(`keep incidents: could not update ${stateFile(root)}: ${oneLine(error && error.message || error, 200)}\n`);
+      write(`keep incidents: could not update ${stateFile(root)}: ${message}\n`);
     } catch {}
-    return null;
+    return { ok: false, error: message };
   }
 }
 
@@ -452,6 +468,33 @@ function emit(root, area, event, deps) {
 
 // ---------- lifecycle ----------
 
+function isInternalSignature(signature) {
+  return /^(?:internal:|castle-alerts-)/.test(String(signature || ''));
+}
+
+// The title index is only ever written by an internal firing, and only an open
+// internal incident may be read back out of it.
+function internalTitleTarget(state, title) {
+  const signature = state.titles[title];
+  if (!isInternalSignature(signature)) return null;
+  const entry = state.signatures[signature];
+  return entry && !entry.closedAt ? signature : null;
+}
+
+function indexTitle(state, alert, signature) {
+  if (alert.shape === 'internal' && isInternalSignature(signature)) state.titles[alert.title] = signature;
+}
+
+// Slack timestamps are seconds with a microsecond fraction. An alert's clock is
+// when it was posted, not when the poll happened to notice it: on the first
+// enabled poll that difference is the whole 6-hour backfill, and quiet close
+// would then run an hour after the poll rather than an hour after the incident
+// actually went quiet.
+function messageTime(ts, fallback) {
+  const seconds = Number(ts);
+  return Number.isFinite(seconds) && seconds > 0 ? Math.round(seconds * 1000) : fallback;
+}
+
 // `alert` is one parsed alert; `context` carries what the Slack poll knows about
 // the message it came from. Returns the event it emitted, or null.
 function landAlert(state, alert, context, deps, options) {
@@ -459,9 +502,11 @@ function landAlert(state, alert, context, deps, options) {
   const permalink = context.permalink || '';
   // A resolved internal alert carries only its title: `Alert "X" resolved` has
   // no castle-alerts id, so the title index is the only way back to the
-  // signature the firing message opened.
-  const sig = alert.state === 'resolved' && !state.signatures[alert.signature] && state.titles[alert.title]
-    ? state.titles[alert.title]
+  // signature the firing message opened. Only an internal alert may be found
+  // that way, and only while it is still open: a Grafana rule or an ad-hoc
+  // error sharing a title must never be resolved by somebody else's message.
+  const sig = alert.state === 'resolved' && alert.shape === 'internal' && !state.signatures[alert.signature]
+    ? internalTitleTarget(state, alert.title)
     : alert.signature;
   if (!sig) return null;
   const entry = state.signatures[sig];
@@ -477,12 +522,12 @@ function landAlert(state, alert, context, deps, options) {
       deps.checkinTask(entry.card, {
         heading: 'alert resolved',
         message: dataFence([`Slack message ts: ${context.ts}`, permalink, alert.title].filter(Boolean).join('\n'), NOTE_TEXT_MAX),
-        linkSession: false, commit: false,
+        linkSession: false, commit: false, withinLock: true,
       });
     }
     entry.resolvedAt = now;
     entry.title = alert.title;
-    state.titles[alert.title] = sig;
+    indexTitle(state, alert, sig);
     return emit(root, alert.area, { ...base, kind: 'incident-resolved', card: entry.card }, deps);
   }
 
@@ -493,11 +538,11 @@ function landAlert(state, alert, context, deps, options) {
     entry.resolvedAt = 0;
     entry.title = alert.title;
     entry.area = alert.area;
-    state.titles[alert.title] = sig;
+    indexTitle(state, alert, sig);
     deps.checkinTask(entry.card, {
       heading: `alert firing (${entry.fireCount})`,
       message: dataFence([`Slack message ts: ${context.ts}`, permalink, clip(alert.text || alert.title, NOTE_TEXT_MAX)].filter(Boolean).join('\n'), NOTE_TEXT_MAX),
-      linkSession: false, commit: false,
+      linkSession: false, commit: false, withinLock: true,
     });
     return emit(root, alert.area, { ...base, kind: 'incident-fired', card: entry.card }, deps);
   }
@@ -512,6 +557,14 @@ function landAlert(state, alert, context, deps, options) {
     } else {
       previousCard = entry.card;
       cardId = cardIdFor(sig, dayStamp(now));
+      // Two late refires on the same day pick the same dated id. The card is
+      // already there and closed, so reopen it: skipping creation and resetting
+      // state around a card still marked done is how an incident goes
+      // untracked.
+      if (fs.existsSync(taskFile(root, cardId))) {
+        reopened = true;
+        previousCard = '';
+      }
     }
   }
 
@@ -520,14 +573,14 @@ function landAlert(state, alert, context, deps, options) {
       heading: 'reopened',
       status: 'active',
       message: dataFence([`Slack message ts: ${context.ts}`, permalink, clip(alert.text || alert.title, NOTE_TEXT_MAX)].filter(Boolean).join('\n'), NOTE_TEXT_MAX),
-      linkSession: false, commit: false,
+      linkSession: false, commit: false, withinLock: true,
     });
     state.signatures[sig] = {
       ...entry, card: cardId, title: alert.title, area: alert.area,
       lastFiredAt: now, resolvedAt: 0, closedAt: 0,
       fireCount: Number(entry.fireCount || 0) + 1,
     };
-    state.titles[alert.title] = sig;
+    indexTitle(state, alert, sig);
     return emit(root, alert.area, { ...base, kind: 'incident-reopened', card: cardId }, deps);
   }
 
@@ -542,6 +595,7 @@ function landAlert(state, alert, context, deps, options) {
       note: cardBody(alert, { permalink, previousCard }),
       linkSession: false,
       commit: false,
+      withinLock: true,
       beforeSave(task) { task.id = expectedId; },
     });
     cardId = created && created.id ? created.id : cardId;
@@ -551,7 +605,7 @@ function landAlert(state, alert, context, deps, options) {
     deps.checkinTask(cardId, {
       heading: 'suspects',
       message: ['Changes shortly before the first firing:', ...suspects].join('\n'),
-      linkSession: false, commit: false,
+      linkSession: false, commit: false, withinLock: true,
     });
   }
   state.signatures[sig] = {
@@ -559,7 +613,7 @@ function landAlert(state, alert, context, deps, options) {
     openedAt: now, lastFiredAt: now, resolvedAt: 0, closedAt: 0, fireCount: 1,
     ...(previousCard ? { previousCard } : {}),
   };
-  state.titles[alert.title] = sig;
+  indexTitle(state, alert, sig);
   return emit(root, alert.area, { ...base, kind: 'incident-opened', card: cardId }, deps);
 }
 
@@ -575,7 +629,7 @@ function landAllClear(state, alert, context, deps, options) {
     deps.checkinTask(entry.card, {
       heading: 'alert resolved',
       message: dataFence([`Slack message ts: ${context.ts}`, context.permalink, 'All alerts are passing'].filter(Boolean).join('\n'), NOTE_TEXT_MAX),
-      linkSession: false, commit: false,
+      linkSession: false, commit: false, withinLock: true,
     });
     entry.resolvedAt = now;
     events.push(emit(root, entry.area, {
@@ -602,7 +656,7 @@ function landNote(state, signature, reply, context, deps, options) {
       context.permalink,
       `${who}: ${clip(combinedText(reply) || String(reply.text || ''), NOTE_TEXT_MAX)}`,
     ].filter(Boolean).join('\n'), NOTE_TEXT_MAX),
-    linkSession: false, commit: false,
+    linkSession: false, commit: false, withinLock: true,
   });
   return emit(root, entry.area, {
     at: now, kind: 'human-note', card: entry.card, signature,
@@ -656,6 +710,31 @@ function ingest(options = {}, deps = {}) {
   const events = [];
   const handledTs = new Set();
 
+  // One state mutation per message, under the registry lock. Events are only
+  // published once the write that made them real has landed: a caller that
+  // acknowledged a failed write would retire the message from the cursor and
+  // lose the alert.
+  const write = (fn, ts) => {
+    if (dry) return { ok: true, cardId: '' };
+    const at = messageTime(ts, now);
+    const produced = [];
+    const outcome = mutateState((state) => { produced.push(...(fn(state, at) || [])); }, { root });
+    if (!outcome.ok) return { ok: false, error: outcome.error, cardId: '' };
+    events.push(...produced);
+    return { ok: true, cardId: (produced.find((event) => event && event.card) || {}).card || '' };
+  };
+
+  const land = (alerts, context) => write((state, at) => {
+    const produced = [];
+    for (const alert of alerts) {
+      const result = alert.state === 'all-clear'
+        ? landAllClear(state, alert, context, d, { root, cfg, now: at })
+        : landAlert(state, alert, context, d, { root, cfg, now: at });
+      for (const event of [].concat(result || [])) if (event) produced.push(event);
+    }
+    return produced;
+  }, context.ts);
+
   for (const unit of options.units || []) {
     let unitAlerts = [];
     try { unitAlerts = parse(unit, { root, config: cfg, alertBots: bots, channel }); } catch { unitAlerts = []; }
@@ -664,23 +743,11 @@ function ingest(options = {}, deps = {}) {
 
     if (inBatch(parentTs)) {
       handledTs.add(parentTs);
-      let cardId = '';
-      if (!dry) {
-        mutateState((state) => {
-          for (const alert of unitAlerts) {
-            const context = { ts: parentTs, permalink: parentLink, suspects: unit.suspects || [] };
-            const produced = alert.state === 'all-clear'
-              ? landAllClear(state, alert, context, d, { root, cfg, now })
-              : landAlert(state, alert, context, d, { root, cfg, now });
-            for (const event of [].concat(produced || [])) {
-              if (!event) continue;
-              events.push(event);
-              if (!cardId) cardId = event.card;
-            }
-          }
-        }, { root });
-      }
-      entries.push(decisionRow({ channel, message: unit, alerts: unitAlerts, cardId, now, permalink: parentLink }));
+      const landed = land(unitAlerts, { ts: parentTs, permalink: parentLink, suspects: unit.suspects || [] });
+      entries.push({
+        ...decisionRow({ channel, message: unit, alerts: unitAlerts, cardId: landed.cardId, now, permalink: parentLink }),
+        ...(landed.ok ? {} : { ok: false, error: landed.error }),
+      });
     }
 
     const parentSignature = (unitAlerts.find((alert) => alert.signature) || {}).signature || null;
@@ -692,39 +759,25 @@ function ingest(options = {}, deps = {}) {
       if (bots[String(reply.from || '')]) {
         let replyAlerts = [];
         try { replyAlerts = parse(reply, { root, config: cfg, alertBots: bots, channel }); } catch { replyAlerts = []; }
-        let cardId = '';
-        if (!dry) {
-          mutateState((state) => {
-            for (const alert of replyAlerts) {
-              const context = { ts, permalink: link, suspects: reply.suspects || [] };
-              const produced = alert.state === 'all-clear'
-                ? landAllClear(state, alert, context, d, { root, cfg, now })
-                : landAlert(state, alert, context, d, { root, cfg, now });
-              for (const event of [].concat(produced || [])) {
-                if (!event) continue;
-                events.push(event);
-                if (!cardId) cardId = event.card;
-              }
-            }
-          }, { root });
-        }
-        entries.push(decisionRow({ channel, message: reply, alerts: replyAlerts, cardId, now, permalink: link }));
+        const landed = land(replyAlerts, { ts, permalink: link, suspects: reply.suspects || [] });
+        entries.push({
+          ...decisionRow({ channel, message: reply, alerts: replyAlerts, cardId: landed.cardId, now, permalink: link }),
+          ...(landed.ok ? {} : { ok: false, error: landed.error }),
+        });
         continue;
       }
-      let card = '';
-      if (!dry) {
-        mutateState((state) => {
-          const event = landNote(state, parentSignature, reply, { ts, permalink: link }, d, { root, cfg, now });
-          if (event) { events.push(event); card = event.card; }
-        }, { root });
-      }
+      const noted = write((state, at) => {
+        const event = landNote(state, parentSignature, reply, { ts, permalink: link }, d, { root, cfg, now: at });
+        return event ? [event] : [];
+      }, ts);
       entries.push({
         source: 'slack', at: now, channel, ts,
         from: oneLine(reply.from || '', 100), at_slack: String(reply.at || ''),
         kind: 'note', signature: parentSignature, state: 'note',
         title: oneLine(combinedText(reply) || String(reply.text || ''), 140),
         area: (unitAlerts[0] || {}).area || '', severity: 'low',
-        permalink: link, ...(card ? { cardId: card } : {}),
+        permalink: link, ...(noted.cardId ? { cardId: noted.cardId } : {}),
+        ...(noted.ok ? {} : { ok: false, error: noted.error }),
       });
     }
   }
@@ -752,8 +805,8 @@ function sweep(options = {}, deps = {}) {
   const d = { ...defaultDeps(), ...deps };
   let cfg;
   try { cfg = options.config || config(root); } catch { return []; }
-  const closed = [];
-  mutateState((state) => {
+  const pending = [];
+  const outcome = mutateState((state) => {
     for (const [sig, entry] of Object.entries(state.signatures)) {
       if (!quietDue(sig, entry, cfg, now)) continue;
       try {
@@ -761,17 +814,19 @@ function sweep(options = {}, deps = {}) {
           heading: 'closed',
           status: 'done',
           message: `closed: quiet for ${cfg.quietMin}m`,
-          linkSession: false, commit: false,
+          linkSession: false, commit: false, withinLock: true,
         });
       } catch { continue; }
       entry.closedAt = now;
-      closed.push(emit(root, entry.area, {
+      pending.push({
         at: now, kind: 'incident-closed', card: entry.card, signature: sig,
         title: entry.title || sig, area: entry.area, severity: 'low',
         permalink: '', suspects: [],
-      }, d));
+      });
     }
   }, { root });
+  // Only once the state write landed: a close nobody recorded is not a close.
+  const closed = outcome.ok ? pending.map((event) => emit(root, event.area, event, d)) : [];
   if (closed.length && fs.existsSync(path.join(root, '.git'))) {
     try { d.commitAndPush('keep: incidents', ['tasks']); } catch {}
   }
@@ -812,6 +867,6 @@ module.exports = {
   parse, resolveArea, severityFor, grafanaSignature, internalSignature,
   loadState, mutateState, emptyState,
   appendEvent, readEvents,
-  cardIdFor, ingest, sweep, sweepQuietly, quietDue, openIncidents,
+  cardIdFor, ingest, sweep, sweepQuietly, quietDue, openIncidents, messageTime,
   permalinkFor, defaultDeps,
 };
