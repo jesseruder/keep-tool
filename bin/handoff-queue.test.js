@@ -113,9 +113,10 @@ test('a transient refusal backs off, keeps its request identical, and parks when
   assert.equal(queue.backoffMs(4), 160e3);
   assert.equal(queue.backoffMs(9), queue.BACKOFF_MAX_MS, 'the backoff is capped at three minutes');
 
-  // Every attempt asked for exactly the transfer the console button asks for.
+  // Every attempt asked for exactly the same transfer, naming what it assumed.
   for (const body of asked) {
-    assert.deepEqual(body, { sessionId: 'session-a', pane: 'pane-1', accountId: 'two', intent: 'continue' });
+    assert.deepEqual(body, { sessionId: 'session-a', pane: 'pane-1', accountId: 'two', intent: 'continue',
+      expectedSourceAccountId: 'one' });
   }
 
   // Past the deadline the same transient refusal parks the entry instead.
@@ -156,7 +157,8 @@ test('a successful transfer marks the entry moved, and force travels only when t
   const asked = [];
   const result = await queue.tick(tickDeps(f, async (body) => { asked.push(body); return { ok: true, status: 'done' }; }));
   assert.match(result.detail, /moved 1/);
-  assert.deepEqual(asked, [{ sessionId: 'session-a', pane: 'pane-1', accountId: 'two', intent: 'continue', force: true }]);
+  assert.deepEqual(asked, [{ sessionId: 'session-a', pane: 'pane-1', accountId: 'two', intent: 'continue', force: true,
+    expectedSourceAccountId: 'one' }]);
   const entry = entryFor(f.root, 'session-a');
   assert.deepEqual([entry.status, entry.movedAt], ['moved', T]);
   assert.deepEqual(queue.visible(f.root, T + 60e3).map((row) => row.sessionId), ['session-a']);
@@ -373,15 +375,58 @@ test('an entry whose session has moved to a third account is retired, not transf
   assert.equal(entry.status, 'moved');
   assert.match(entry.note, /no longer on one; it is on three/);
 
-  // A row without an account is answered by durable authority, the same source
-  // the transfer itself resolves.
+  // Durable authority is asked first, and it wins: the state row is a snapshot
+  // and can still name the old account seconds after a move has committed, while
+  // authority is what the transfer itself would resolve.
   queue.enqueue(f.root, { sessionId: 'session-b', pane: 'pane-2', sourceAccountId: 'one', targetAccountId: 'two' }, { now: T, log: () => {} });
   await queue.tick(tickDeps(f, async () => { calls += 1; return { ok: true, status: 'done' }; }, {
-    sessions: async () => [session({ id: 'session-b', pane: 'pane-2', accountId: null })],
+    sessions: async () => [session({ id: 'session-b', pane: 'pane-2', accountId: 'one' })],
     accountFor: () => 'three',
   }));
   assert.equal(calls, 0);
   assert.equal(entryFor(f.root, 'session-b').status, 'moved');
+  assert.match(entryFor(f.root, 'session-b').note, /it is on three/);
+
+  // And a row is still the answer when authority has none to give.
+  queue.enqueue(f.root, { sessionId: 'session-c', pane: 'pane-3', sourceAccountId: 'one', targetAccountId: 'two' }, { now: T, log: () => {} });
+  await queue.tick(tickDeps(f, async () => { calls += 1; return { ok: true, status: 'done' }; }, {
+    sessions: async () => [session({ id: 'session-c', pane: 'pane-3', accountId: 'three' })],
+    accountFor: () => null,
+  }));
+  assert.equal(calls, 0);
+  assert.equal(entryFor(f.root, 'session-c').status, 'moved');
+});
+
+test('each attempt is judged against state taken after the transfer before it finished', async () => {
+  for (const drift of ['moved', 'cleared']) {
+    const f = fixture();
+    // B is written first so A sorts ahead of it and runs first.
+    queue.enqueue(f.root, { sessionId: 'session-b', pane: 'pane-2', sourceAccountId: 'one', targetAccountId: 'two', rateLimitAt: T },
+      { now: T, log: () => {} });
+    queue.enqueue(f.root, { sessionId: 'session-a', pane: 'pane-1', sourceAccountId: 'one', targetAccountId: 'two', rateLimitAt: T },
+      { now: T + 1e3, log: () => {} });
+    // What A's transfer takes minutes to do, while B is still waiting its turn.
+    let during = false;
+    const rows = () => [
+      session({ id: 'session-a' }),
+      session({ id: 'session-b', pane: 'pane-2',
+        ...(during && drift === 'moved' ? { accountId: 'three' } : {}),
+        ...(during && drift === 'cleared' ? { rateLimit: null } : {}) }),
+    ];
+    const asked = [];
+    await queue.tick(tickDeps(f, async (body) => { asked.push(body.sessionId); during = true; return { ok: true, status: 'done' }; }, {
+      now: () => T + 2e3, sessions: async () => rows(),
+    }));
+    assert.deepEqual(asked, ['session-a'], `${drift}: the second entry was dispatched on a stale snapshot`);
+    const entry = entryFor(f.root, 'session-b');
+    if (drift === 'moved') {
+      assert.equal(entry.status, 'moved');
+      assert.match(entry.note, /it is on three/);
+    } else {
+      assert.equal(entry.status, 'cancelled');
+      assert.equal(entry.note, 'rate limit cleared');
+    }
+  }
 });
 
 test('a limit that cleared retires the entry, and a transaction already under way still finishes', async () => {
@@ -407,21 +452,36 @@ test('a limit that cleared retires the entry, and a transaction already under wa
   assert.deepEqual(asked, []);
   assert.equal(entryFor(f.root, 'session-a').status, 'cancelled');
 
-  // But a transaction that already stopped the source has to be allowed to finish.
-  fs.rmSync(path.join(queue.dir(f.root), 'session-a.json'));
-  queueOne('session-a', 'pane-1');
-  await run([session({ rateLimit: null })],
-    { handoffRecords: () => [{ sessionId: 'session-a', status: 'recovery-needed' }] });
-  assert.deepEqual(asked, ['session-a']);
-  assert.equal(entryFor(f.root, 'session-a').status, 'moved');
-
-  // A finished or failed record is not an excuse to keep going.
+  // But a transaction that already stopped the source has to be allowed to finish,
+  // and it names no limit on the request: there is no live turn left to carry one.
   fs.rmSync(path.join(queue.dir(f.root), 'session-a.json'));
   asked.length = 0;
+  const bodies = [];
   queueOne('session-a', 'pane-1');
-  await run([session({ rateLimit: null })], { handoffRecords: () => [{ sessionId: 'session-a', status: 'done' }] });
-  assert.deepEqual(asked, []);
-  assert.equal(entryFor(f.root, 'session-a').status, 'cancelled');
+  await queue.tick(tickDeps(f, async (body) => { bodies.push(body); return { ok: true, status: 'done' }; }, {
+    sessions: async () => [session({ rateLimit: null })],
+    handoffRecords: () => [{ sessionId: 'session-a', status: 'recovery-needed', phase: 'starting-target',
+      sourceStopVerifiedAt: T }],
+  }));
+  assert.equal(bodies.length, 1);
+  assert.equal(bodies[0].expectedRateLimitAt, undefined);
+  assert.equal(entryFor(f.root, 'session-a').status, 'moved');
+
+  // A refusal that landed before anything was stopped is not an in-flight
+  // transaction. account-handoff writes recovery-needed/stopping-source for an
+  // injection 429, and that must not exempt every later attempt from the check.
+  for (const record of [
+    { sessionId: 'session-a', status: 'recovery-needed', phase: 'stopping-source', reason: 'another session injection is busy' },
+    { sessionId: 'session-a', status: 'failed', phase: 'preflight' },
+    { sessionId: 'session-a', status: 'done' },
+  ]) {
+    fs.rmSync(path.join(queue.dir(f.root), 'session-a.json'));
+    asked.length = 0;
+    queueOne('session-a', 'pane-1');
+    await run([session({ rateLimit: null })], { handoffRecords: () => [record] });
+    assert.deepEqual(asked, [], JSON.stringify(record));
+    assert.equal(entryFor(f.root, 'session-a').status, 'cancelled');
+  }
 
   // And an entry with no recorded limit event keeps the old behaviour.
   queue.enqueue(f.root, { sessionId: 'session-c', pane: 'pane-3', sourceAccountId: 'one', targetAccountId: 'two' }, { now: T, log: () => {} });

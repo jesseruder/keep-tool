@@ -252,25 +252,44 @@ function settle(root, entry, patch, now, log, line) {
   return { entry: next, landed: true };
 }
 
-// Where the session lives now. The live row names it; durable authority answers
-// for a row that has not been given one, which is how handoffSession itself
-// resolves a source account.
+// Where the session lives now. Durable authority is asked first, because that is
+// what handoffSession itself resolves the source account from; a state row is a
+// snapshot and can be a few seconds behind a move that already committed. The row
+// answers only when authority has nothing to say.
 function currentAccount(session, deps) {
-  const fromState = accountOf(session);
-  if (fromState) return fromState;
   try {
     const resolve = deps.accountFor || ((sessionId, kind) => accounts.forSession(sessionId, kind,
       { root: deps.root || defaultRoot(), env: deps.env || process.env })?.id || null);
-    return resolve(session.id, session.kind || 'claude') || null;
-  } catch { return null; }
+    const authoritative = resolve(session.id, session.kind || 'claude');
+    if (authoritative) return authoritative;
+  } catch {
+    // An unfinished handoff makes authority refuse to answer. Fall back to the row.
+  }
+  return accountOf(session) || null;
+}
+
+// A transaction that has passed the stop: the source agent exited, or its
+// artifacts and target authority are already staged behind it. Only those may
+// keep going once the limit has cleared, because leaving one half-done strands
+// the session.
+//
+// Deliberately not "any non-terminal record". account-handoff writes
+// recovery-needed/stopping-source for a refusal that landed before anything was
+// stopped — an injection 429 does exactly that — and treating that as in-flight
+// would exempt every later attempt from the limit check and re-drive a transfer
+// after the person had gone back to work.
+function transferPastStop(record) {
+  if (!record || TERMINAL_HANDOFF_STATUSES.includes(record.status)) return false;
+  return Boolean(record.sourceStopVerifiedAt)
+    || ['copying', 'staged', 'starting', 'verifying', 'delivering'].includes(record.status)
+    || ['copying-artifacts', 'starting-target', 'verifying-target', 'delivering-continuation'].includes(record.phase);
 }
 
 function transferStarted(root, entry, deps) {
   let records;
   try { records = deps.handoffRecords ? deps.handoffRecords() : require('./account-handoff').list(root); }
   catch { return false; }
-  return (records || []).some((record) => record && record.sessionId === entry.sessionId
-    && !TERMINAL_HANDOFF_STATUSES.includes(record.status));
+  return (records || []).some((record) => record && record.sessionId === entry.sessionId && transferPastStop(record));
 }
 
 async function attemptOne(root, entry, sessions, now, deps, log) {
@@ -295,8 +314,8 @@ async function attemptOne(root, entry, sessions, now, deps, log) {
   // went back to work on the session, transferring would stop a live session and
   // inject a continuation nobody asked for. A transaction that already started is
   // the one exception: it has to be allowed to finish.
-  if (entry.rateLimitAt != null && String(session.rateLimit?.at ?? '') !== String(entry.rateLimitAt)
-      && !transferStarted(root, entry, deps)) {
+  const started = transferStarted(root, entry, deps);
+  if (entry.rateLimitAt != null && !started && String(session.rateLimit?.at ?? '') !== String(entry.rateLimitAt)) {
     return settle(root, entry, { status: 'cancelled', cancelledAt: now, note: 'rate limit cleared' },
       now, log, `cancelled ${entry.sessionId}: rate limit cleared`);
   }
@@ -311,6 +330,13 @@ async function attemptOne(root, entry, sessions, now, deps, log) {
       accountId: entry.targetAccountId,
       intent: 'continue',
       ...(entry.force === true ? { force: true } : {}),
+      // Belt and braces for the checks above: the transfer re-resolves both
+      // itself, before it writes a record or stops anything, so a snapshot this
+      // queue read a moment too early cannot move a session that has moved on.
+      // A transaction already past its stop names no limit: there is no live turn
+      // left to carry one.
+      ...(entry.sourceAccountId ? { expectedSourceAccountId: entry.sourceAccountId } : {}),
+      ...(entry.rateLimitAt != null && !started ? { expectedRateLimitAt: entry.rateLimitAt } : {}),
     });
     if (result && result.status && result.status !== 'done') reason = String(result.reason || `transfer reported ${result.status}`);
     else {
@@ -344,14 +370,12 @@ async function tick(deps = {}) {
   const now = deps.now ? deps.now() : Date.now();
   const log = deps.log || stderrLog;
   gc(root, now);
-  let cached;
-  const loadSessions = async () => {
-    if (cached === undefined) {
-      cached = deps.sessions ? await deps.sessions()
-        : deps.buildState ? (await deps.buildState()).sessions || [] : [];
-    }
-    return cached;
-  };
+  // Always a fresh build. A transfer can take minutes, so the state a later entry
+  // is judged against must be taken after the earlier ones finished, not once at
+  // the top of the tick: in between, a session can be moved by hand or have its
+  // limit cleared, and acting on the stale row would transfer it anyway.
+  const loadSessions = async () => (deps.sessions ? await deps.sessions()
+    : deps.buildState ? (await deps.buildState()).sessions || [] : []);
   let policy = { enqueued: 0, exhausted: 0 };
   if (deps.policy || deps.policyEnabled !== false) {
     policy = policyEnqueue(root, await loadSessions(), now, deps, log);
@@ -360,7 +384,6 @@ async function tick(deps = {}) {
   if (!due.length) {
     return { ok: true, detail: policy.enqueued ? `queued ${policy.enqueued}` : 'nothing due' };
   }
-  const sessions = await loadSessions();
   const counts = { moved: 0, retrying: 0, parked: 0, cancelled: 0, skipped: 0 };
   for (const candidate of due) {
     // The list was taken before the first transfer; an earlier one in this same
@@ -368,7 +391,7 @@ async function tick(deps = {}) {
     // entry again and dispatch only what is still queued and still due.
     const entry = readOne(root, candidate.sessionId);
     if (!entry || entry.status !== 'queued' || Number(entry.nextAt || 0) > now) { counts.skipped += 1; continue; }
-    const { entry: settled, landed } = await attemptOne(root, entry, sessions, now, deps, log);
+    const { entry: settled, landed } = await attemptOne(root, entry, await loadSessions(), now, deps, log);
     if (!landed) { counts.skipped += 1; continue; }
     if (settled.status === 'moved') counts.moved += 1;
     else if (settled.status === 'parked') counts.parked += 1;
