@@ -3265,7 +3265,9 @@ if (require.main === module) {
       // command runs, not a crash: say so in one line, and say who does the writing.
       // Only here, at the CLI's edge: the daemon shares withLock, and for it an
       // unwritable registry is a server failure that should keep its own shape.
-      if (e && ['EPERM', 'EACCES', 'EROFS'].includes(e.code) && String(e.path || '').startsWith(ROOT)) {
+      // A path boundary, not a prefix: ~/keep-tool is not under ~/keep.
+      const under = (file) => { const rel = path.relative(ROOT, path.resolve(String(file))); return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel)); };
+      if (e && ['EPERM', 'EACCES', 'EROFS'].includes(e.code) && e.path && under(e.path)) {
         process.stderr.write(`keep: the Keep registry at ${ROOT} is not writable from here (${e.code}); a sandboxed worker returns its result to the parent session, which checks in\n`);
         process.exit(1);
       }
