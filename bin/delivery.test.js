@@ -427,6 +427,38 @@ test('the reconcile sweep retires an old typed journal whose pane is gone', asyn
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('a draft taken back off the screen leaves no journal and blocks no later send', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-cleared-'));
+  const file = path.join(dir, 'transcript'); fs.writeFileSync(file, '');
+  const directory = path.join(dir, 'journal');
+  let typed = 0;
+  // What typeAndSubmit throws when it could not confirm the text on screen and the
+  // guarded discard then took it back: characters were written, and nothing remains.
+  const cleared = () => Object.assign(new Error('message was typed but could not be confirmed; the typed message was cleared'),
+    { typingStarted: true, draftCleared: true });
+  const base = { session: { id: 's', kind: 'claude' }, pane: 'p', text: 'the tick', file, directory,
+    precheck: async () => {}, submitDraft: async () => assert.fail('unexpected Enter'),
+    type: async () => { typed += 1; throw cleared(); },
+    draftMatches: async () => false, pause: async () => {}, attempts: 1, staleJournalMs: 15 * 60e3 };
+  try {
+    await assert.rejects(deliver(base), /the typed message was cleared/);
+    assert.deepEqual(fs.readdirSync(directory).filter((name) => name.endsWith('.json')), [],
+      'nothing reached the pane, so nothing is left claiming it might have');
+    // The same message a moment later is a fresh attempt, not "previous delivery is
+    // unconfirmed": the old entry would have refused it for the next fifteen minutes.
+    await assert.rejects(deliver(base), /the typed message was cleared/);
+    assert.equal(typed, 2, 'and it is free to type again');
+
+    // A draft that stayed on the screen is still the other thing entirely.
+    const stuck = { ...base, type: async () => { typed += 1; throw Object.assign(
+      new Error('message was typed but could not be confirmed; Enter was not pressed'),
+      { typingStarted: true, draftLeftOnScreen: true }); } };
+    await assert.rejects(deliver(stuck), /Enter was not pressed/);
+    const journal = path.join(directory, fs.readdirSync(directory).find((name) => name.endsWith('.json')));
+    assert.ok(Number(JSON.parse(fs.readFileSync(journal, 'utf8')).typedAt) > 0);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('text typed but never submitted still counts as having reached the pane', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-noenter-'));
   const file = path.join(dir, 'transcript'); fs.writeFileSync(file, '');

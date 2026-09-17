@@ -211,6 +211,18 @@ async function deliverAttempt({ session, pane, text, key, file, directory, trace
       entry.typedAt = Date.now();
       writeJournal();
     } catch (error) {
+      // Characters were written and then taken back off the screen under the input
+      // guard, which proves the box is empty and that only our own keys touched it. So
+      // this send typed nothing in the end, and it must not leave a journal entry
+      // behind: one without typedAt refuses every later send to this session until it
+      // goes stale — the wedge described above — for a message the pane never kept.
+      // The error is rethrown untouched, as any failure before typing is, and the
+      // caller is free to send again whenever it likes.
+      if (error && error.typingStarted && error.draftCleared) {
+        trace('typed-draft-cleared');
+        try { fs.unlinkSync(journal); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+        throw error;
+      }
       if (error.message !== 'message was typed but could not be confirmed; Enter was not pressed') throw error;
       // The text was typed but Enter was never pressed: it did reach the pane.
       entry.typedAt = Date.now();

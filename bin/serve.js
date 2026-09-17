@@ -2439,6 +2439,10 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
       error.draftLeftOnScreen = true;
       error.draftReason = discard.reason;
     }
+    // Read with typingStarted by anything that has to decide what reached the pane:
+    // characters were written, and then taken back off the screen under the guard, so
+    // the pane ends where it began. bin/delivery.js keeps no journal for such a send.
+    if (discard.cleared) error.draftCleared = true;
     throw typedAlready(error);
   }
   if (deps.beforeEnter) {
@@ -2455,9 +2459,12 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
         ? await discardTypedDraft(target, text, deps.draftKind, deps)
         : { cleared: false, reason: 'not requested' };
       deps.deliveryTrace?.('enter-aborted', { cleared: discard.cleared, reason: discard.reason });
-      if (deps.discardDraftOnAbort && !discard.cleared && error && typeof error === 'object') {
-        error.draftLeftOnScreen = true;
-        error.draftReason = discard.reason;
+      if (error && typeof error === 'object') {
+        if (deps.discardDraftOnAbort && !discard.cleared) {
+          error.draftLeftOnScreen = true;
+          error.draftReason = discard.reason;
+        }
+        if (discard.cleared) error.draftCleared = true;
       }
       throw typedAlready(error);
     }
