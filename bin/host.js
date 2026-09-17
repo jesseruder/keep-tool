@@ -816,8 +816,13 @@ function createHost(options = {}) {
     const params = request && typeof request === 'object' ? request : {};
     switch (params.type) {
       case 'hello':
+        // guardedInput: input requests honour expectedPid and expectedInputCount
+        // together. A caller gates on this before it sends a keystroke it would not
+        // send unguarded, so the flag names the whole guard and not a part of it: a
+        // host that checked only one of the two would have to advertise something
+        // else, because what the caller is asking about is the pair.
         return { result: {
-          version: 1, replaceExited: true, guardedKill: true, compactScreen: true, conditionalInput: true,
+          version: 1, replaceExited: true, guardedKill: true, compactScreen: true, guardedInput: true,
           bootVersion: options.boot && options.boot.version || null,
           panes: panes.size, pid: process.pid, sock,
           residentTerminals: [...panes.values()].filter((pane) => pane.term).length,
@@ -886,7 +891,7 @@ function createHost(options = {}) {
         // the way `guarded-kill` compares it.
         if (params.expectedInputCount !== undefined || params.expectedPid !== undefined) {
           if (!Number.isInteger(params.expectedInputCount) || !Number.isInteger(params.expectedPid)) {
-            throw new Error('a conditional input requires expectedInputCount and expectedPid as integers');
+            throw new Error('a guarded input requires expectedInputCount and expectedPid as integers');
           }
           if (pane.pty.pid !== params.expectedPid) {
             return { result: { dropped: true, reason: 'pane replaced', pid: pane.pty.pid, inputCount: pane.inputCount } };

@@ -2298,13 +2298,15 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
     write(`keep serve: left an aborted draft on pane ${pane}: the pane's process was replaced while it was being cleared\n`);
     return { cleared: false, reason: 'pane replaced' };
   };
-  // The conditional write is a host feature, and a host from before it ignores
-  // expectedInputCount and writes the key unconditionally — the very race this is here
-  // to avoid, run silently and reported as a clean clear. So the host is asked what it
-  // supports first, the same way loading history and guarded kills ask, and a host
-  // that has not been reloaded yet gets no keystrokes at all. The caller's refusal
-  // then keeps the message that says the draft is still on screen, which is the true
-  // state of the pane until somebody runs `keep host reload`.
+  // The guarded write is a host feature, and a host from before it ignores
+  // expectedInputCount and expectedPid and writes the key anyway — the very race this
+  // is here to avoid, run silently and reported as a clean clear. So the host is asked
+  // what it supports first, the same way loading history and guarded kills ask, and a
+  // host that has not been reloaded yet gets no keystrokes at all. `guardedInput`
+  // promises both halves of the guard, which is what this relies on: a host honouring
+  // only the count would still deliver an Escape to a replaced process. The caller's
+  // refusal then keeps the message that says the draft is still on screen, which is
+  // the true state of the pane until somebody runs `keep host reload`.
   const reloadRequired = (detail) => {
     write(`keep serve: left an aborted draft on pane ${pane}: ${detail}\n`);
     return { cleared: false, reason: 'host reload required' };
@@ -2315,12 +2317,12 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
   } catch (error) {
     return reloadRequired(`the terminal host could not be asked what it supports: ${String((error && error.message) || error)}`);
   }
-  if (!capabilities || capabilities.conditionalInput !== true) {
+  if (!capabilities || capabilities.guardedInput !== true) {
     return reloadRequired('the terminal host must be reloaded (keep host reload) before a typed draft can be cleared');
   }
   // The baseline is taken before the screen is read, not after it. Taken after, an
   // Enter arriving between the read and the baseline would already be inside the
-  // baseline: the conditional Escape would then be accepted, interrupting the turn
+  // baseline: the guarded Escape would then be accepted, interrupting the turn
   // that Enter had just started, and the empty box it left would pass for our own
   // clean clear. Nothing is pressed at all when the count cannot be read either: an
   // Escape this could not account for is worse than a draft left where it is.

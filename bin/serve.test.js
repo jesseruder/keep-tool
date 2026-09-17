@@ -4848,7 +4848,7 @@ test('typing exit confirms the prompt above a tall Claude slash-command menu', a
 // text is in the box. `screen` is whatever the pane shows when it is read back.
 // The host counts every input request that reaches the pane, so the harness's own
 // record of them plus `foreign.count` — somebody else typing at the same pane — is
-// the inputCount it reports, and it honours a conditional write exactly as the host
+// the inputCount it reports, and it honours a guarded write exactly as the host
 // does: a count that no longer agrees writes nothing and bumps nothing. `onEvent` is
 // called as each request arrives, which is where a test puts a keystroke into the one
 // gap it wants to reproduce.
@@ -4858,7 +4858,7 @@ function draftHarness(screen, onEvent = () => {}) {
   const foreign = { count: 0 };
   // What this host says it can do. A test drops a capability to stand for a host that
   // is still running the code it was started with.
-  const hello = { version: 1, conditionalInput: true };
+  const hello = { version: 1, guardedInput: true };
   // The process behind the pane. `replace-exited` keeps the pane id and starts a new
   // process's count at zero, so a test moves this to stand for that.
   const live = { pid: 4242 };
@@ -5049,7 +5049,7 @@ test('a draft is only reported cleared when nobody else typed while it was being
 
   // An Enter landing while the box is first being read, before any Escape. The
   // baseline is taken before that read, so this is outside it: were it taken after,
-  // the Enter would be part of the baseline, the conditional Escape would be accepted,
+  // the Enter would be part of the baseline, the guarded Escape would be accepted,
   // and it would interrupt the turn that Enter had just started.
   let listed = false;
   const entry = await run(CLEARABLE('/exit'), (type, { inputs, foreign }) => {
@@ -5087,14 +5087,14 @@ test('a draft is only reported cleared when nobody else typed while it was being
   assert.equal(relisted.error.draftReason, 'pane replaced');
   assert.equal(relisted.escapes, 0);
 
-  // A host that has not been reloaded since the conditional write landed would ignore
+  // A host that has not been reloaded since the guarded write landed would ignore
   // the expected count and press the key anyway, which is the race itself. It is asked
   // before anything is pressed, and until somebody runs `keep host reload` the draft
   // stays where it is and the refusal says so.
   for (const capability of [false, undefined, 'yes']) {
     const old = draftHarness(CLEARABLE('/exit'));
-    if (capability === undefined) delete old.hello.conditionalInput;
-    else old.hello.conditionalInput = capability;
+    if (capability === undefined) delete old.hello.guardedInput;
+    else old.hello.guardedInput = capability;
     const error = await typeAndSubmit({ pane: 'p' }, '/exit', () => false, {
       ...old.deps, discardDraftOnAbort: true,
     }).then(() => null, (e) => e);

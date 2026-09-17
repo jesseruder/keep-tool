@@ -910,11 +910,11 @@ test('a host handoff cancels primary grace timers', async () => {
   }
 });
 
-test('a conditional input writes only while the pane has taken no other keystroke', async () => {
+test('a guarded input writes only while the pane is the same process and has taken no other keystroke', async () => {
   await withHost({}, async ({ client }) => {
     // Advertised, because a host that predates this ignores the parameter and writes
     // the key anyway; the daemon refuses to press rather than race such a host.
-    assert.equal((await client.request('hello')).conditionalInput, true);
+    assert.equal((await client.request('hello')).guardedInput, true);
     const { pane } = await client.request('spawn', {
       cmd: '/bin/sh',
       args: ['-c', "stty -echo; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done"],
@@ -927,7 +927,7 @@ test('a conditional input writes only while the pane has taken no other keystrok
       pane: pane.id, data: Buffer.from('first\n').toString('base64'),
       expectedInputCount: start, expectedPid: pane.pid,
     }), {});
-    await waitFor(async () => (await client.request('screen', { pane: pane.id })).text.includes('got:first'), 'conditional input');
+    await waitFor(async () => (await client.request('screen', { pane: pane.id })).text.includes('got:first'), 'guarded input');
     assert.equal(await countOf(), start + 1);
 
     // Somebody else typed since. Nothing reaches the pty and the counter does not move,
