@@ -1847,11 +1847,15 @@ async function waitForProbeUndo(target, beforeScreen, lastScreen, read, wait, no
     // still the last thing we saw, so it is still the answer we have to give.
     let cursor = null;
     try {
+      // The whole viewport, not the last 30 rows: the host crops the text it returns but
+      // always reports the cursor against the full viewport, so only an uncropped read
+      // puts the rows and `cursor.y` in the same coordinate space. closeRestartShell
+      // reads this way for the same reason.
       if (readResult) {
-        const result = await readResult(target, 30, false);
+        const result = await readResult(target, null, false);
         screen = String((result && result.text) || '');
         cursor = result && result.cursor;
-      } else screen = await read(target, 30, false);
+      } else screen = await read(target, null, false);
     } catch { break; }
     const line = promptLine(screen);
     // No prompt line at all is Claude Code mid-render, not an empty input box — the same

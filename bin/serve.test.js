@@ -513,6 +513,39 @@ test('probeSuggestion tells a re-rendered suggestion from one the user accepted'
   assert.match(blind.error.message, /changed while the probe was being undone/);
 });
 
+test('probeSuggestion settles on a terminal taller than the rows it reads', async () => {
+  // The host crops the text to the rows asked for but always reports the cursor against
+  // the whole viewport. On a 50-row terminal the prompt is row 46 of the viewport and row
+  // 27 of a 30-row read, so only an uncropped read can be compared to the cursor.
+  const filler = Array.from({ length: 41 }, (_, index) => `  ⎿  output line ${index}`);
+  const tall = (screen) => [...filler, ...screen.split('\n')].join('\n');
+  const promptRow = (lines) => lines.findLastIndex((line) => /^\s*❯(?:\s|$)/.test(line));
+  const settle = async (cursorFor) => {
+    const { inputs, host } = probeInputRecorder();
+    const shown = () => tall(inputs.includes('\x7f') ? REVIEWER_SUGGESTION_BEFORE : REVIEWER_SUGGESTION_AFTER);
+    const crop = (text, lines) => (lines == null ? text : text.split('\n').slice(-lines).join('\n'));
+    const error = await probeSuggestion({ pane: 'pane-tall' }, tall(REVIEWER_SUGGESTION_BEFORE), {
+      host,
+      wait: async () => {},
+      readScreen: async (_target, lines) => crop(shown(), lines),
+      readScreenResult: async (_target, lines) => {
+        const text = shown();
+        const viewport = text.split('\n');
+        return { text: crop(text, lines), cursor: cursorFor(viewport, promptRow(viewport)) };
+      },
+      stderr: () => {},
+    }).then(() => null, (e) => e);
+    assert.deepEqual(inputs, [',', '\x7f']);
+    return error;
+  };
+
+  assert.equal(await settle((viewport, row) => ({ x: viewport[row].indexOf('❯') + 2, y: row })), null,
+    'a re-rendered suggestion on a tall terminal is still a settled box');
+  const accepted = await settle((viewport, row) => ({ x: viewport[row].trimEnd().length, y: row }));
+  assert.ok(accepted, 'and an accepted suggestion is still refused there');
+  assert.match(accepted.message, /changed while the probe was being undone/);
+});
+
 test('probeSuggestion refuses when someone types while the probe is being undone', async () => {
   const { inputs, host } = probeInputRecorder();
   const logged = [];
