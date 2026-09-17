@@ -5002,6 +5002,11 @@ test('a box holding more than the typed message is not submitted', async () => {
 // that typing started.
 const RECOVERY_SESSION = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
 
+// The squash boxEndsWithMessage compares tails with: canonicalText, then every space
+// out. canonicalText is not exported, so this is its normalizedText-then-NFC spelling.
+const squashedDraft = (value) => String(value ?? '')
+  .replace(/\s+/g, ' ').trim().normalize('NFC').replace(/\s+/g, '');
+
 // The state a send that typed its message but never saw a receipt leaves behind: an
 // unfinished journal for this text and pane, the draft still on screen, and a
 // transcript with nothing in it yet.
@@ -5153,10 +5158,13 @@ test('an earlier Codex prompt glyph up the pane does not refuse an unchanged dra
   ].join('\n');
 
   for (const rows of [8, 35]) {
-    // The box parser really does misread this pane; the point is that it misreads it
-    // identically twice.
+    // The box parser really does misread this pane; the point is that the misread text
+    // still ends where the draft ends, which is the premise boxEndsWithMessage rests on.
     const { draftRegionText } = require('./serve');
-    assert.match(draftRegionText(pane(rows), 'codex'), /^instruction/, `${rows} rows: the parse is wrong`);
+    const box = draftRegionText(pane(rows), 'codex');
+    assert.match(box, /^instruction/, `${rows} rows: the parse puts a finished turn in front`);
+    assert.equal(squashedDraft(box).endsWith(squashedDraft(DRAFT)), true,
+      `${rows} rows: the quirk is in front of the draft, never after it`);
     const harness = recoveryHarness({
       text: DRAFT, kind: 'codex',
       screenFor: () => ({ text: pane(rows), cursorY: rows + 1 }),
@@ -5193,8 +5201,11 @@ test('a long line up the pane does not skew the wrap width of an unchanged draft
 
   for (const rows of [8, 34]) {
     const { draftRegionText } = require('./serve');
-    assert.equal(draftRegionText(pane(rows), 'claude'), `${HEAD} ${TAIL}`,
-      `${rows} rows: the parse really does insert a space mid-word`);
+    const box = draftRegionText(pane(rows), 'claude');
+    assert.equal(box, `${HEAD} ${TAIL}`, `${rows} rows: the parse really does insert a space mid-word`);
+    // The spurious space is inside the draft, so squashing it out restores the tail.
+    assert.equal(squashedDraft(box).endsWith(squashedDraft(DRAFT)), true,
+      `${rows} rows: the quirk survives the squash boxEndsWithMessage applies`);
     const harness = recoveryHarness({
       text: DRAFT,
       screenFor: () => ({ text: pane(rows), cursorY: rows + 2 }),
@@ -5275,6 +5286,105 @@ test('a draft the first read would not accept is never submitted by the second',
     assert.deepEqual(midTurn.inputs, []);
     assert.deepEqual(midTurn.requested, [], 'the screen is not even read');
   } finally { fs.rmSync(midTurn.base, { recursive: true, force: true }); }
+});
+
+test('a box that already held more than the message at the first read is never recovered', async () => {
+  // Owner's line was in the box before recovery even looked. exactDraft cannot see it —
+  // it stops at the first blank line — and the cursor is back on the message line, so
+  // the only thing standing between this and an Enter is boxEndsWithMessage: the parsed
+  // box ends with Owner's words, not with ours.
+  const layouts = [
+    {
+      kind: 'claude',
+      // The composer's own rules close the box around all three lines.
+      pane: ['─'.repeat(46), `❯ ${MESSAGE}`, '', 'Owner instruction', '─'.repeat(46), '? for shortcuts'].join('\n'),
+      cursorY: 1,
+    },
+    {
+      kind: 'codex',
+      // Codex has no rules; its composer runs to the blank line above the status row.
+      pane: [`› ${MESSAGE}`, '', 'Owner instruction', '', '  ⏎ send   ⌃C quit'].join('\n'),
+      cursorY: 0,
+    },
+  ];
+  const { draftRegionText, exactDraft } = require('./serve');
+  for (const { kind, pane, cursorY } of layouts) {
+    // Both halves of the premise: exactDraft is fooled, the box parser is not.
+    assert.equal(exactDraft(pane, MESSAGE, kind), true, `${kind}: exactDraft stops at the blank line`);
+    assert.equal(squashedDraft(draftRegionText(pane, kind)).endsWith(squashedDraft(MESSAGE)), false,
+      `${kind}: the box ends with Owner's words`);
+    const harness = recoveryHarness({
+      kind, screenFor: () => ({ text: pane, cursorY }),
+      onEnter: () => assert.fail(`${kind}: nothing may be pressed`),
+    });
+    try {
+      const error = await harness.send().then(() => null, (e) => e);
+      assert.match(error.message, /Previous delivery is unconfirmed; no message was retyped/, kind);
+      assert.deepEqual(harness.inputs, [], `${kind}: no key is pressed`);
+      assert.deepEqual(harness.requested, [200], `${kind}: submitDraft is never reached`);
+      assert.equal(error.typingStarted, false, kind);
+      assert.equal(fs.existsSync(harness.journal), true, `${kind}: the journal is left alone`);
+    } finally { fs.rmSync(harness.base, { recursive: true, force: true }); }
+  }
+});
+
+test('a paste that imitates composer chrome cannot leave the key unchanged', async () => {
+  // The hole the raw comparison closes. Owner pastes a fragment into the box that ends
+  // in something shaped like the composer itself — a rule and a prompt glyph repeating
+  // the message — and the box parser reads back from that fake glyph, which makes the
+  // parsed box identical to the clean one. Every parsed check agrees; only the screen
+  // itself says anything happened.
+  const { draftRegionText, exactDraft } = require('./serve');
+  const clean = ['─'.repeat(46), `❯ ${MESSAGE}`, '─'.repeat(46), '? for shortcuts'].join('\n');
+  const pasted = ['─'.repeat(46), `❯ ${MESSAGE}`, '', 'Owner instruction', '───',
+    `❯ ${MESSAGE}`, '─'.repeat(46), '? for shortcuts'].join('\n');
+  assert.equal(draftRegionText(pasted, 'claude'), draftRegionText(clean, 'claude'),
+    'the parse cannot tell these two screens apart');
+  assert.equal(exactDraft(pasted, MESSAGE, 'claude'), true, 'nor can exactDraft');
+  assert.equal(squashedDraft(draftRegionText(pasted, 'claude')).endsWith(squashedDraft(MESSAGE)), true,
+    'nor can the tail comparison');
+  assert.notEqual(pasted, clean, 'the screen is what changed');
+
+  const harness = recoveryHarness({
+    screenFor: (read) => ({ text: read === 1 ? clean : pasted, cursorY: 1 }),
+    onEnter: () => assert.fail('nothing may be pressed'),
+  });
+  try {
+    const error = await harness.send().then(() => null, (e) => e);
+    assert.equal(error.status, 409);
+    assert.match(error.message, /the recovered draft changed before Enter; Enter was not pressed/);
+    assert.deepEqual(harness.inputs, [], 'Enter is never pressed');
+    assert.equal(error.typingStarted, false, 'nothing reached the pane');
+    assert.deepEqual(harness.requested, [200, 200]);
+  } finally { fs.rmSync(harness.base, { recursive: true, force: true }); }
+});
+
+test('a footer that moved between the reads refuses once, and the next attempt delivers', async () => {
+  // Comparing the raw screen means anything on it counts, including a status row that
+  // has nothing to do with the draft. That is the price of not trusting the parser, and
+  // it has to be a delay rather than a wedge: the refusal leaves the journal exactly as
+  // it found it, so the next attempt reads both screens again and goes through.
+  const pane = (footer) => ['─'.repeat(46), `❯ ${MESSAGE}`, '─'.repeat(46), footer].join('\n');
+  let footer = '? for shortcuts';
+  const harness = recoveryHarness({
+    // Only the second read of the first attempt sees the footer mid-tick.
+    screenFor: (read) => ({ text: pane(read === 2 ? '? for shortcuts · 2 background tasks' : footer), cursorY: 1 }),
+    onEnter: (_file, receipt) => receipt(),
+  });
+  try {
+    const error = await harness.send().then(() => null, (e) => e);
+    assert.equal(error.status, 409);
+    assert.match(error.message, /the recovered draft changed before Enter/);
+    assert.deepEqual(harness.inputs, [], 'nothing was pressed');
+    assert.equal(error.typingStarted, false, 'so the caller may try again');
+    assert.equal(fs.existsSync(harness.journal), true, 'and the pending attempt is still there');
+
+    // Same journal, same draft, a pane that now holds still.
+    assert.deepEqual(await harness.send(), { ok: true, delivery: 'received' });
+    assert.deepEqual(harness.inputs, ['\r'], 'submitted exactly once across both attempts');
+    assert.deepEqual(harness.requested, [200, 200, 200, 200]);
+    assert.equal(fs.existsSync(harness.journal), false, 'and finished');
+  } finally { fs.rmSync(harness.base, { recursive: true, force: true }); }
 });
 
 test('the draft region is the whole input box, however it is rendered', () => {

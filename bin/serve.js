@@ -4950,12 +4950,24 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
   }
   };
   const confirmation = session.kind === 'codex' ? codexTypedTextVisible : claudeTypedTextVisible;
-  // What the input box held when draftMatches accepted it, for submitDraft to compare
-  // against. The box parser's text when it finds a box, the raw screen when it does not.
-  let matchedBox = null;
-  const boxKey = (screenText) => {
+  // The screen as draftMatches accepted it, for submitDraft to compare against. Raw,
+  // not parsed: a parse can be talked into the same answer by text that looks like
+  // composer chrome, and the rows of an idle session do not otherwise move. If they do
+  // — a footer ticking over — the recovery is refused once and the next attempt takes
+  // both reads again.
+  let matchedScreen = null;
+  // Whether the box ends with our message. exactDraft stops at the first blank line,
+  // so a line Owner added below one is invisible to it; the box parser reads the whole
+  // box, but guesses where it starts and how wide the pane is from whatever else is on
+  // screen, so an earlier Codex prompt or a long line of output puts extra text in
+  // FRONT of the draft or a spurious space INSIDE it. Neither of those touches the
+  // end, and Owner's addition always does: compare tails, ignoring whitespace. A box
+  // that cannot be parsed at all leaves exactDraft as the only witness.
+  const boxEndsWithMessage = (screenText) => {
     const box = draftRegionText(screenText, session.kind);
-    return box === null ? `raw:${String(screenText || '')}` : `box:${box}`;
+    if (box === null) return true;
+    const squash = (value) => canonicalText(value).replace(/\s+/g, '');
+    return squash(box).endsWith(squash(text));
   };
   try {
     // Claude does not transcript /mcp. A previously submitted command can be
@@ -4977,16 +4989,11 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
         // which Owner can have typed into the box. Read it again and leave a mixed
         // draft alone rather than submit it.
         //
-        // Two questions, because neither parser answers both. exactDraft says the
-        // message is still there, but stops at the first blank line, so a line Owner
-        // added below one is invisible to it. The box parser sees the whole box, but
-        // guesses where it starts and how wide the pane is from whatever else is on
-        // screen — an earlier Codex prompt, a long line of output — and would refuse a
-        // draft nobody touched. So it is not asked what the box says, only whether it
-        // says what it said when draftMatches looked: the same read, the same parse,
-        // the same quirks on both sides, on a session that is idle and printing nothing.
+        // draftMatches decided the box holds our message and nothing after it. All
+        // that is left to ask is whether anything moved since: the same read, compared
+        // whole.
         const screen = await readScreenResult(target, 200, false, deps);
-        const unchanged = matchedBox !== null && boxKey(screen.text) === matchedBox;
+        const unchanged = matchedScreen !== null && String(screen.text || '') === matchedScreen;
         if (!unchanged || !exactDraft(screen.text, text, session.kind)) {
           trace('draft-changed-before-enter');
           throw new InjectionError(409, 'the recovered draft changed before Enter; Enter was not pressed');
@@ -5009,9 +5016,9 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
         let end = start;
         while (end + 1 < lines.length && lines[end + 1].trim() && !/^\s*[─━]/.test(lines[end + 1])) end++;
         const cursorInPrompt = Number.isFinite(screen.cursor?.y) && screen.cursor.y >= start && screen.cursor.y <= end;
-        const matched = exactDraft(screen.text, text, session.kind);
+        const matched = exactDraft(screen.text, text, session.kind) && boxEndsWithMessage(screen.text);
         trace('draft-screen-check', { cursorInPrompt, matched });
-        matchedBox = cursorInPrompt && matched ? boxKey(screen.text) : null;
+        matchedScreen = cursorInPrompt && matched ? String(screen.text || '') : null;
         return cursorInPrompt && matched;
       },
     });
