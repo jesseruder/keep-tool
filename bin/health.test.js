@@ -57,6 +57,33 @@ test('skipped polls preserve the failure sequence until a real success', () => {
   assert.equal(health.snapshot(5000).schedulers.find((entry) => entry.name === 'review').state, 'failing');
 });
 
+test('a skip that clears the streak leaves the row skipped rather than red', () => {
+  const { root, health } = fixture();
+  // Three real failures on a row that self-repair watches.
+  for (const at of [1000, 2000, 3000]) health.record('discord', { ok: false, error: 'reader gone', at });
+  assert.equal(health.snapshot(3000).schedulers.find((entry) => entry.name === 'discord').state, 'failing');
+
+  // A tick that decides the failure is weather rather than a fault: the streak goes,
+  // the history stays, and neither `keep health` nor bin/self-repair.js sees red.
+  health.record('discord', { skipped: true, clearFailures: true, detail: 'reader unavailable: tab closed', at: 4000 });
+  const raw = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'health.json'), 'utf8')).discord;
+  assert.equal(raw.consecutiveFailures, 0);
+  assert.equal(raw.lastErrorAt, 3000, 'the failure history is kept');
+  assert.equal(raw.lastError, 'reader gone');
+  const row = health.snapshot(4000).schedulers.find((entry) => entry.name === 'discord');
+  assert.equal(row.state, 'skipped');
+  assert.equal(row.displayState, 'skipped');
+  assert.equal(row.displayDetail, 'reader unavailable: tab closed');
+
+  // Without it a skip still inherits the streak, which is what keeps a genuinely
+  // failing account visible between real retries.
+  health.record('usage', { ok: false, error: 'Primary: credentials unavailable', at: 5000 });
+  health.record('usage', { ok: true, skipped: true, detail: 'waiting for failed account retry', at: 6000 });
+  const inherited = health.snapshot(6000).schedulers.find((entry) => entry.name === 'usage');
+  assert.equal(inherited.consecutiveFailures, 1);
+  assert.equal(inherited.displayState, 'warning');
+});
+
 test('snapshot and CLI presentation separate recovered errors from unresolved failures', () => {
   const { health } = fixture();
   const now = 20 * 3600e3;

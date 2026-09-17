@@ -99,6 +99,8 @@ const {
   writeToShellPane,
   stripTerminalAnsi,
   openSession,
+  accountBudgetModel,
+  openBudgetModel,
   repairEnvFor,
   reopenSessionOnAccount,
   resolveReviewLaunchSelection,
@@ -7337,6 +7339,82 @@ test('an auto fresh open skips a spent default, and no policy keeps the old defa
     assert.equal(warned.accountWarning, undefined);
     await assert.rejects(openSession({ ...body, accountPolicy: 'sometimes' }, common), /accountPolicy must be auto/);
     await assert.rejects(openSession({ ...body, accountPolicy: 'auto', callerAccountId: 'Not An Id' }, common), /bad caller account id/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('an auto fresh open with no --model judges each account on its own default model', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-default-model-'));
+  try {
+    const primary = path.join(root, 'primary');
+    const secondary = path.join(root, 'secondary');
+    for (const dir of [primary, secondary]) fs.mkdirSync(dir);
+    // What `claude` itself reads at startup when the launch names no model.
+    fs.writeFileSync(path.join(primary, 'settings.json'), JSON.stringify({ model: 'claude-fable-5-1' }));
+    fs.writeFileSync(path.join(secondary, 'settings.json'), JSON.stringify({ model: 'sonnet' }));
+    const config = path.join(root, 'config.json');
+    fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+      { id: 'claude-primary', label: 'Primary', agent: 'claude', configDir: primary },
+      { id: 'claude-secondary', label: 'Secondary', agent: 'claude', configDir: secondary },
+    ], defaultAccounts: { claude: 'claude-primary' } }));
+    const env = { KEEP_DIR: root, KEEP_CONFIG: config };
+    const calls = [];
+    const host = recordingHost((type, params) => {
+      if (type === 'spawn') { calls.push(params); return { pane: { id: `pane-${calls.length}` } }; }
+      return {};
+    });
+    const profileId = (params) => JSON.parse(Buffer.from(
+      /'--profile' '([^']+)'/.exec(params.args[1])[1], 'base64url').toString()).id;
+    // The live 2026-09-17 shape: the default account's generic buckets look fine while
+    // the model a session launched there would run on is at the wall.
+    const reset = '2026-09-21T21:59:59.000Z';
+    const view = () => ({ accounts: {
+      'claude-primary': { agent: 'claude', fetchedAt: Date.now(), limits: [
+        { label: '5h', percent: 0, resetsAt: reset },
+        { label: 'week', percent: 80, resetsAt: reset },
+        { label: 'Fable wk', percent: 100, resetsAt: reset },
+      ] },
+      'claude-secondary': { agent: 'claude', fetchedAt: Date.now(), limits: [
+        { label: '5h', percent: 58, resetsAt: reset },
+        { label: 'week', percent: 51, resetsAt: reset },
+        { label: 'Fable wk', percent: 61, resetsAt: reset },
+      ] },
+    } });
+    const common = { root, env, host, waitForHostAgent: async () => true, trustProject: () => true,
+      pinSession: () => {}, loadTask: () => ({ fm: { project: os.tmpdir(), sessions: [] } }), usageSnapshot: view };
+    const body = { taskId: 'card', fresh: true, agent: 'claude' };
+
+    const opened = await openSession({ ...body, accountPolicy: 'auto' }, common);
+    assert.equal(profileId(calls[0]), 'claude-secondary');
+    assert.match(opened.accountNote, /^claude-primary skipped: Fable wk 100%, resets .*; opened on claude-secondary$/);
+
+    // An explicit `--model` applies to every candidate, so a Sonnet launch is judged
+    // on the generic windows and the default account is fine again.
+    const sonnet = await openSession({ ...body, accountPolicy: 'auto', model: 'sonnet' }, common);
+    assert.equal(sonnet.accountId, 'claude-primary');
+    assert.equal(sonnet.accountNote, undefined);
+
+    // And an explicit account warns on the bucket its own default would spend.
+    const forced = await openSession({ ...body, accountId: 'claude-primary' }, common);
+    assert.match(forced.accountWarning, /^claude-primary is out of usage \(Fable wk 100%, resets /);
+
+    // The resolver reads only that account's own settings.json, and nothing in it can
+    // cost a launch: a missing file, a file that is not a JSON object, a settings
+    // object with no `model`, and a value `claude --model` would not take are all
+    // "no model", which is the generic behaviour.
+    assert.equal(accountBudgetModel({ id: 'claude-primary', agent: 'claude', configDir: primary }), 'claude-fable-5-1');
+    assert.equal(accountBudgetModel({ id: 'claude-gone', agent: 'claude', configDir: path.join(root, 'gone') }), '');
+    assert.equal(accountBudgetModel({ id: 'codex-a', agent: 'codex', configDir: primary }), '', 'Codex keeps the generic windows');
+    assert.equal(accountBudgetModel(null), '');
+    assert.equal(accountBudgetModel({ id: 'claude-x', agent: 'claude' }), '');
+    const probe = path.join(root, 'probe');
+    fs.mkdirSync(probe);
+    for (const settings of ['not json', '[]', 'null', '{}', '{"model":42}', '{"model":"claude fable"}', '{"model":""}']) {
+      fs.writeFileSync(path.join(probe, 'settings.json'), settings);
+      assert.equal(accountBudgetModel({ id: 'claude-x', agent: 'claude', configDir: probe }), '', settings);
+    }
+    // An explicit model short-circuits the resolver entirely.
+    assert.equal(openBudgetModel('claude-fable-5-1'), 'claude-fable-5-1');
+    assert.equal(typeof openBudgetModel(''), 'function');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

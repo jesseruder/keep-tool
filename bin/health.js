@@ -160,6 +160,15 @@ function record(name, options = {}) {
       lastRunAt: at,
       cadenceMs: Number(options.cadenceMs || cadence.cadenceMs || prior.cadenceMs || 0),
     };
+    // A skip ordinarily keeps the streak, so a scheduler that fails and then has
+    // nothing to do still reads as unresolved. `clearFailures` is for the opposite
+    // case: the tick decided the failure it is standing in for is not a fault at all
+    // (an endpoint rate limit, a browser reader that is unreliable by design). Without
+    // this the inherited count keeps the row amber, and turns it red at three —
+    // stateOf answers 'failing' on the streak before it ever looks at the skip, and
+    // bin/self-repair.js opens a card on the same count. lastError/lastErrorAt stay as
+    // history; presentationOf only reads them when the streak is nonzero.
+    if (options.clearFailures === true) entry.consecutiveFailures = 0;
     if (options.detail == null || options.detail === '') delete entry.detail;
     else entry.detail = clipError(options.detail);
     store[name] = entry;

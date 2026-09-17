@@ -286,6 +286,90 @@ test('cached account errors do not inflate usage health between real retries', a
   assert.equal(manager._states.get('claude-secondary').backoffMs, 0);
 });
 
+test('a 429 over a recent reading is weather, logged once and bounded by the staleness window', async () => {
+  const configured = [
+    { id: 'claude/default', label: 'Primary', agent: 'claude', configDir: '/profiles/default', builtIn: true },
+    { id: 'claude-secondary', label: 'Secondary', agent: 'claude', configDir: '/profiles/secondary' },
+  ];
+  const accountApi = { list: () => configured, defaultFor: () => configured[0] };
+  const records = [];
+  const logs = [];
+  const firstAt = Date.parse('2026-09-17T12:00:00Z');
+  let currentTime = firstAt;
+  const manager = createUsageManager({
+    accounts: accountApi, health: { record: (name, options) => records.push({ name, options }) }, now: () => currentTime,
+  });
+  const rateLimit = async () => { throw Object.assign(new Error('limited'), { code: 429 }); };
+  const succeed = async () => ({ limits: [{ label: 'week', percent: 20 }], fetchedAt: currentTime });
+  const originalWrite = process.stderr.write;
+  process.stderr.write = (chunk) => { logs.push(String(chunk)); return true; };
+  try {
+    manager.requestRefresh(firstAt, succeed);
+    await settleRefresh();
+    assert.deepEqual(records.at(-1), { name: 'usage', options: { ok: true } });
+
+    // The endpoint's limit is shared with every running Claude Code session, so a 429
+    // over a reading the consumers are still using is weather: the row stays out of
+    // the red, and the streak is cleared so three polls cannot turn it red either.
+    currentTime = firstAt + 14 * 60e3;
+    manager.requestRefresh(currentTime, rateLimit);
+    await settleRefresh();
+    const weather = records.at(-1);
+    assert.equal(weather.name, 'usage');
+    assert.equal(weather.options.ok, true);
+    assert.equal(weather.options.skipped, true);
+    assert.equal(weather.options.clearFailures, true);
+    assert.match(weather.options.detail,
+      /^rate limited \(Primary\); retrying \d\d:\d\d, reading 14m old; rate limited \(Secondary\); retrying \d\d:\d\d, reading 14m old$/);
+    assert.deepEqual(logs, [`keep usage: ${weather.options.detail}\n`]);
+
+    // The same cooldown on a later poll is the same state, not a new event.
+    currentTime = firstAt + 24 * 60e3 + 1;
+    manager.requestRefresh(currentTime, rateLimit);
+    await settleRefresh();
+    assert.match(records.at(-1).options.detail, /reading 24m old/);
+    assert.equal(logs.length, 1, 'the log line belongs to the transition, not to every poll');
+
+    // The cooldown is capped so a recovered endpoint is read again inside the
+    // 30-minute window bin/open-account.js and bin/review.js judge staleness by.
+    currentTime = firstAt + 44 * 60e3 + 2;
+    manager.requestRefresh(currentTime, rateLimit);
+    await settleRefresh();
+    for (const id of ['claude/default', 'claude-secondary']) {
+      assert.equal(manager._states.get(id).backoffMs, 20 * 60e3, id);
+      assert.equal(manager._states.get(id).nextAttemptAt, currentTime + 20 * 60e3, id);
+    }
+
+    // Past two hours nobody can say what the account has left any more, so the row
+    // fails exactly as it always did.
+    currentTime = firstAt + 121 * 60e3;
+    manager.requestRefresh(currentTime, rateLimit);
+    await settleRefresh();
+    assert.deepEqual(records.at(-1), { name: 'usage', options: { ok: false, error: 'Primary: HTTP 429; Secondary: HTTP 429' } });
+
+    // A recovered endpoint, then a 429 again: a new transition, so a new log line.
+    currentTime = firstAt + 142 * 60e3;
+    manager.requestRefresh(currentTime, succeed);
+    await settleRefresh();
+    assert.deepEqual(records.at(-1), { name: 'usage', options: { ok: true } });
+    currentTime = firstAt + 148 * 60e3;
+    manager.requestRefresh(currentTime, rateLimit);
+    await settleRefresh();
+    assert.equal(records.at(-1).options.skipped, true);
+    assert.equal(logs.length, 2);
+
+    // Anything that is not a rate limit fails the row, whatever else the batch holds.
+    currentTime = firstAt + 160 * 60e3;
+    manager.requestRefresh(currentTime, async (account) => {
+      if (account.id === 'claude/default') throw Object.assign(new Error('missing'), { code: 'credentials' });
+      throw Object.assign(new Error('limited'), { code: 429 });
+    });
+    await settleRefresh();
+    assert.deepEqual(records.at(-1),
+      { name: 'usage', options: { ok: false, error: 'Primary: credentials unavailable; Secondary: HTTP 429' } });
+  } finally { process.stderr.write = originalWrite; }
+});
+
 test('failures from accounts removed during refresh do not create stale health alerts', async () => {
   const configured = [
     { id: 'claude/default', label: 'Primary', agent: 'claude', configDir: '/profiles/default', builtIn: true },

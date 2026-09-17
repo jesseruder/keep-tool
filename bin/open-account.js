@@ -60,30 +60,29 @@ function accountLimits(snapshot, account) {
   return claude ? { ...claude, staleMs: USAGE_STALE_MS } : null;
 }
 
-// One account's verdict. `model` names the per-model weekly bucket when the launch
-// names one; without a model only the generic `week` and `5h` windows apply, because a
-// launch that names no model does not yet know which per-model window it will spend
-// against. Every applicable bucket is judged and the worst one decides: a week at 94%
-// must not hide a five-hour window at 100%.
+// One account's verdict. `model` is the model this launch will actually run on, which
+// the caller has already resolved: an explicit `--model`, or the launching account's own
+// default (bin/serve.js openSession). Without one only the generic `week` and `5h`
+// windows apply. Every applicable bucket is judged and the worst one decides: a week at
+// 94% must not hide a five-hour window at 100%.
 function accountBudget(snapshot, account, model, now) {
   const id = account && account.id;
   const reading = accountLimits(snapshot, account);
   if (!reading || !Array.isArray(reading.limits) || !reading.limits.length) {
     return { code: 8, reason: `no usage reading for ${id}` };
   }
-  const fetchedAt = Number(reading.fetchedAt);
-  if (!Number.isFinite(fetchedAt) || !fetchedAt || now - fetchedAt > reading.staleMs) {
-    return { code: 8, reason: `usage reading for ${id} is stale` };
-  }
   const limits = reading.limits;
   // A bucket that is not an object, or whose percent is not a number, makes every
   // headroom comparison false — which would read as "plenty left" — and reaches for
   // `.label` on whatever it is. Unknown is the honest answer, and unknown still
-  // launches.
+  // launches. Judged before the age, because a reading nobody can parse says nothing
+  // whether it is minutes or hours old.
   if (limits.some((limit) => !limit || typeof limit !== 'object'
     || !Number.isFinite(Number(limit.percent)))) {
     return { code: 8, reason: `usage reading for ${id} is unreadable` };
   }
+  const fetchedAt = Number(reading.fetchedAt);
+  const stale = !Number.isFinite(fetchedAt) || !fetchedAt || now - fetchedAt > reading.staleMs;
   const family = review.modelFamily(model);
   const budget = preferences.modelBudgets()[family] || {};
   const min = budget.minHeadroom ?? MIN_HEADROOM;
@@ -112,13 +111,29 @@ function accountBudget(snapshot, account, model, now) {
   // window can sit in the snapshot for hours after it reopened; believing it would
   // refuse an account that is fine. It is unknown, not exhausted and not room.
   const expired = (entry) => { const at = resetTime(entry.limit.resetsAt); return Number.isFinite(at) && at <= now; };
+  const worstOf = (entries) => entries.reduce((a, b) => (headroom(b.limit) < headroom(a.limit) ? b : a));
+  // Usage only rises until a bucket resets, so a bucket that read at or past 100% and
+  // whose reset is still ahead of us is spent right now however old the reading is: the
+  // poller being broken cannot have given the account room back. Nothing else survives
+  // staleness — a stale reading never proves room, and a spent bucket whose reset has
+  // passed describes a window that no longer exists.
+  if (stale) {
+    const walls = applicable.filter((entry) => {
+      const at = resetTime(entry.limit.resetsAt);
+      return Number(entry.limit.percent) >= 100 && Number.isFinite(at) && at > now;
+    });
+    if (!walls.length) return { code: 8, reason: `usage reading for ${id} is stale` };
+    const worst = worstOf(walls);
+    return { code: worst.code, reason: `${worst.limit.label} ${worst.limit.percent}%`,
+      resetsAt: worst.limit.resetsAt, low: false };
+  }
   const offending = applicable.filter((entry) => headroom(entry.limit) < min && !expired(entry));
   if (!offending.length) {
     return applicable.some(expired)
       ? { code: 8, reason: `usage reading for ${id} predates a reset` }
       : { code: 0, reason: 'within budget' };
   }
-  const worst = offending.reduce((a, b) => (headroom(b.limit) < headroom(a.limit) ? b : a));
+  const worst = worstOf(offending);
   // `low` is under the headroom floor but not yet at the wall: worth passing over for a
   // better account, still better than refusing to launch at all. A bucket at or past
   // 100% is the wall, whatever the other buckets say.
@@ -128,6 +143,21 @@ function accountBudget(snapshot, account, model, now) {
     resetsAt: worst.limit.resetsAt,
     low: Number(worst.limit.percent) < 100,
   };
+}
+
+// The model one candidate's launch would run on. An explicit `--model` is a single
+// string that applies to every candidate; with no `--model` each account has its own
+// default and the daemon passes a resolver instead, because judging `claude/default` on
+// the generic buckets said "fine" while a session launched there ran on Fable, whose own
+// weekly bucket was at 100%, and could not take a turn. A resolver that throws or
+// answers with anything but a string leaves the generic buckets in charge — exactly
+// what a launch naming no model did before.
+function modelForAccount(model, account) {
+  if (typeof model !== 'function') return model;
+  try {
+    const resolved = model(account);
+    return typeof resolved === 'string' ? resolved : '';
+  } catch { return ''; }
 }
 
 // Registered accounts for `agent`, in the order a fresh open should try them: the
@@ -153,13 +183,14 @@ function orderOpenCandidates(agent, { accounts = [], defaultAccountId, callerAcc
 // unreadable, which is no reason to refuse a launch — but an account we can see is
 // fine beats one we cannot read, wherever it sits in the order. When nothing is fine or
 // unreadable, an account that is only under the headroom floor still launches; the
-// refusal is for when every account is at the wall.
+// refusal is for when every account is at the wall. `model` is a model string or a
+// per-account resolver (modelForAccount).
 function chooseOpenAccount(agent, candidates, snapshot, model, now) {
   const skipped = [];
   let unknown = null;
   let low = null;
   for (const account of candidates || []) {
-    const verdict = accountBudget(snapshot, account, model, now);
+    const verdict = accountBudget(snapshot, account, modelForAccount(model, account), now);
     if (verdict.code === 6 || verdict.code === 7) {
       skipped.push({ id: account.id, reason: verdict.reason, resetsAt: verdict.resetsAt || null });
       if (verdict.low) low = low || { account, reason: verdict.reason };
@@ -192,13 +223,13 @@ function noAccountMessage(agent, skipped) {
 // the reset on purpose — but the launch says so, because the alternative is a silent
 // session that can do nothing.
 function exhaustedWarning(account, snapshot, model, now) {
-  const verdict = accountBudget(snapshot, account, model, now);
+  const verdict = accountBudget(snapshot, account, modelForAccount(model, account), now);
   if (verdict.code !== 6 && verdict.code !== 7) return '';
   return `${account.id} is ${verdict.low ? 'low on' : 'out of'} usage (${verdict.reason}${describeReset(verdict.resetsAt)})`;
 }
 
 module.exports = {
   MIN_HEADROOM, USAGE_STALE_MS, CODEX_STALE_MS,
-  describeReset, accountLimits, accountBudget, orderOpenCandidates, chooseOpenAccount,
+  describeReset, accountLimits, accountBudget, modelForAccount, orderOpenCandidates, chooseOpenAccount,
   accountNote, noAccountMessage, exhaustedWarning,
 };

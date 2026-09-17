@@ -91,6 +91,15 @@ review, lint and self-repair read what it records.
 projects the key into `KEEP_FEATURES` the same way it projects `scopes` into
 `KEEP_SCOPES`, so a child process reads the same answer as its parent.
 
+The `discord` row in `keep health` never reads as failing. Its reader drives a
+logged-in browser tab, so it is unreliable by design — a closed tab, a restarting
+browser, a timed-out spawn — and none of that is a daemon fault a repair card could
+address. A failed poll logs `keep discord: <message>` on stderr and records a skip with
+`reader unavailable: <message>` as the row's detail, clearing the failure streak so the
+row stays `skipped` rather than turning amber and then red. A poll that classifies
+messages still records a real success. `keep discord status` is unchanged: it reads the
+watcher's own status file, not health.
+
 
 ## CLI
 
@@ -869,6 +878,24 @@ takes a turn, so it gets a six-hour horizon before it counts as unknown. Anythin
 unreadable — a missing weekly bucket, a bucket that is not a number, a snapshot that
 throws — is unknown, and unknown never blocks a launch: the chooser falls back to the
 registry default.
+
+The window judged is the one the launch would actually spend. An explicit `--model`
+names a per-model weekly bucket that applies to every candidate. With no `--model`, each
+Claude candidate is judged against its own default model — the `model` in that account's
+`settings.json`, which is the file `claude` itself reads at startup — because judging the
+generic buckets alone read `claude/default` at `week 80%` as fine while a session opened
+there ran on Fable, whose `Fable wk` bucket was at 100%, and could not take a turn. The
+daemon resolves it per candidate (`accountBudgetModel` in `bin/serve.js`, injected into
+`chooseOpenAccount`/`exhaustedWarning` as a resolver so the chooser stays pure);
+unreadable settings, no `model` key, and a value `claude --model` would not take all mean
+"no model", which is the generic behaviour. Codex accounts keep the generic windows.
+
+Staleness has one exception. Usage only rises until a bucket resets, so a bucket that
+read at or past 100% and whose `resetsAt` is still in the future is exhausted *now*,
+however old the reading: a broken or rate-limited poller cannot have given the account
+room back. That verdict applies to stale readings from both providers, with the bucket
+as the reason and never as `low`. Everything else about a stale reading is unchanged — it
+never proves room, and a spent bucket whose reset has already passed is unknown again.
 
 `--account <id>` is still exactly as it was: that account, spent or not. A spent one
 launches with a `warning:` line on stderr. Resumes are unaffected — a session is pinned

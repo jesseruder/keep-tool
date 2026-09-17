@@ -90,6 +90,80 @@ test('a named model is judged against its own weekly bucket, and no model agains
   assert.equal(openAccount.chooseOpenAccount('claude', candidates, view, '', NOW).account.id, 'claude/default');
 });
 
+test('with no --model each candidate is judged against its own default model', () => {
+  const candidates = [account('claude/default'), account('claude-secondary')];
+  // The live shape on 2026-09-17: the default account's generic buckets read as fine
+  // while the model a session launched there would actually run on was at the wall.
+  const view = snapshot({
+    'claude/default': [short(0), week(80), { label: 'Fable wk', percent: 100, resetsAt: RESET }],
+    'claude-secondary': [short(58), week(51), { label: 'Fable wk', percent: 61, resetsAt: RESET }],
+  });
+  const settings = { 'claude/default': 'claude-fable-5-1', 'claude-secondary': 'claude-fable-5-1' };
+  const resolver = (entry) => settings[entry.id] || '';
+  const choice = openAccount.chooseOpenAccount('claude', candidates, view, resolver, NOW);
+  assert.equal(choice.account.id, 'claude-secondary');
+  assert.deepEqual(choice.skipped.map((entry) => entry.reason), ['Fable wk 100%']);
+  // The generic buckets alone still say the default is fine, which is the bug.
+  assert.equal(openAccount.chooseOpenAccount('claude', candidates, view, '', NOW).account.id, 'claude/default');
+
+  // Every spelling a settings.json may hold reaches the same `Fable wk` bucket.
+  for (const model of ['claude-fable-5-1', 'fable', 'claude-fable-5-1[1m]']) {
+    assert.equal(openAccount.accountBudget(view, candidates[0], model, NOW).reason, 'Fable wk 100%', model);
+  }
+  // A family with no scoped bucket in the reading falls back to the generic windows.
+  assert.equal(openAccount.accountBudget(view, candidates[0], 'opus', NOW).code, 0);
+
+  // Each candidate is asked separately, so two accounts on different defaults are
+  // judged on different buckets.
+  const mixed = (entry) => (entry.id === 'claude/default' ? 'opus' : 'claude-fable-5-1');
+  assert.equal(openAccount.chooseOpenAccount('claude', candidates, view, mixed, NOW).account.id, 'claude/default');
+
+  // An explicit account warns on the bucket its own default model would spend.
+  assert.match(openAccount.exhaustedWarning(candidates[0], view, resolver, NOW),
+    /^claude\/default is out of usage \(Fable wk 100%, resets /);
+  // A resolver that throws, or answers with anything but a string, costs the scoped
+  // bucket and never the launch.
+  for (const hostile of [() => { throw new Error('no settings'); }, () => null, () => 7]) {
+    assert.equal(openAccount.accountBudget(view, candidates[0], openAccount.modelForAccount(hostile, candidates[0]), NOW).code, 0);
+    assert.equal(openAccount.chooseOpenAccount('claude', candidates, view, hostile, NOW).account.id, 'claude/default');
+  }
+});
+
+test('a stale reading still proves exhaustion until the spent bucket resets', () => {
+  const claude = account('claude/default');
+  const stale = NOW - openAccount.USAGE_STALE_MS - 1;
+  // Usage only rises until a reset, so an hours-old 100% with a live reset is the wall
+  // now — the poller being rate-limited cannot have handed the account room back.
+  const spent = openAccount.accountBudget(snapshot({ 'claude/default': [week(100), short(4)] }, stale), claude, '', NOW);
+  assert.deepEqual({ code: spent.code, reason: spent.reason, low: spent.low, resetsAt: spent.resetsAt },
+    { code: 6, reason: 'week 100%', low: false, resetsAt: RESET });
+  // And the scoped bucket is reached the same way, so the account is skipped rather
+  // than launched onto a model that cannot take a turn.
+  const scoped = snapshot({ 'claude/default': [short(0), week(80), { label: 'Fable wk', percent: 100, resetsAt: RESET }] }, stale);
+  assert.equal(openAccount.accountBudget(scoped, claude, 'claude-fable-5-1', NOW).reason, 'Fable wk 100%');
+  assert.equal(openAccount.accountBudget(scoped, claude, '', NOW).code, 8, 'the generic buckets are merely stale');
+
+  // A stale reading never proves room, however comfortable it looks.
+  assert.equal(openAccount.accountBudget(snapshot({ 'claude/default': [week(20), short(10)] }, stale), claude, '', NOW).code, 8);
+  // Nor does a bucket that is under the wall but past the headroom floor.
+  assert.equal(openAccount.accountBudget(snapshot({ 'claude/default': [week(94), short(10)] }, stale), claude, '', NOW).code, 8);
+  // A spent bucket whose reset has already passed describes a window that no longer
+  // exists, and a reading this old cannot say what replaced it: unknown.
+  const reopened = { accounts: { 'claude/default': { agent: 'claude',
+    limits: [{ label: 'week', percent: 100, resetsAt: '2026-09-17T06:00:00.000Z' }, short(4)], fetchedAt: stale } } };
+  assert.equal(openAccount.accountBudget(reopened, claude, '', NOW).code, 8);
+  // A reset nobody can parse is no proof either.
+  const unparseable = { accounts: { 'claude/default': { agent: 'claude',
+    limits: [{ label: 'week', percent: 100 }, short(4)], fetchedAt: stale } } };
+  assert.equal(openAccount.accountBudget(unparseable, claude, '', NOW).code, 8);
+
+  // Codex readings get the same inference on their own horizon and epoch resets.
+  const codex = account('codex/default', 'codex');
+  const codexStale = { accounts: { 'codex/default': { agent: 'codex', asOf: NOW - openAccount.CODEX_STALE_MS - 1,
+    windows: [{ label: 'week', percent: 100, resetsAt: Date.parse(RESET) }] } } };
+  assert.equal(openAccount.accountBudget(codexStale, codex, '', NOW).code, 6);
+});
+
 test('every account exhausted refuses, names each one, and points at the override', () => {
   const candidates = [account('claude/default'), account('claude-secondary')];
   const view = snapshot({ 'claude/default': [week(100), short(4)], 'claude-secondary': [week(20), short(100)] });
@@ -128,10 +202,13 @@ test('malformed usage is unknown, never an exception and never room', () => {
     assert.equal(verdict.code, 8, JSON.stringify(limits));
   }
   // A truthy but unparseable fetchedAt makes `now - fetchedAt > stale` false, which
-  // would read a reading of unknown age as fresh.
+  // would read a reading of unknown age as fresh. A reading of unknown age proves no
+  // room — only a bucket already at the wall survives it, which the stale test covers.
   for (const fetchedAt of ['yesterday', {}, NaN, Infinity, 0]) {
-    const stamped = { accounts: { 'claude/default': { agent: 'claude', limits: [week(100), short(10)], fetchedAt } } };
+    const stamped = { accounts: { 'claude/default': { agent: 'claude', limits: [week(94), short(10)], fetchedAt } } };
     assert.equal(openAccount.accountBudget(stamped, claude, '', NOW).code, 8, String(fetchedAt));
+    const walled = { accounts: { 'claude/default': { agent: 'claude', limits: [week(100), short(10)], fetchedAt } } };
+    assert.equal(openAccount.accountBudget(walled, claude, '', NOW).code, 6, String(fetchedAt));
   }
   // And nothing in the shape of a snapshot throws.
   for (const value of [null, {}, { accounts: null }, { accounts: { 'claude/default': 7 } }]) {
@@ -193,8 +270,10 @@ test('a Codex account is judged on its own windows, not treated as unreadable', 
   // longer horizon than the polled Claude one before it counts as unknown.
   assert.equal(openAccount.accountBudget(codexView([{ label: 'week', percent: 100 }], NOW - 40 * 60e3), codex, '', NOW).code, 6);
   assert.equal(openAccount.accountBudget(codexView([{ label: 'week', percent: 100 }], NOW - openAccount.CODEX_STALE_MS - 1), codex, '', NOW).code, 8);
-  // A Claude account with the same age is stale, because its snapshot is polled.
-  assert.equal(openAccount.accountBudget(snapshot({ 'claude/default': [week(100)] }, NOW - 40 * 60e3), account('claude/default'), '', NOW).code, 8);
+  // A Claude account with the same age is stale, because its snapshot is polled. These
+  // Codex windows carry no reset, so neither age proves exhaustion on its own; a stale
+  // reading that does carry one is the stale-exhaustion test below.
+  assert.equal(openAccount.accountBudget(snapshot({ 'claude/default': [week(20)] }, NOW - 40 * 60e3), account('claude/default'), '', NOW).code, 8);
   // Codex windows are never read as a Claude reading, or the other way round.
   assert.equal(openAccount.accountLimits(codexView([{ label: 'week', percent: 10 }]), account('claude/default')), null);
 });

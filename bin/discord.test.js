@@ -164,6 +164,45 @@ test('dashboard merges Slack and Discord findings with source labels in time ord
   assert.deepEqual(JSON.parse(result.stdout), [['slack', 'Slack row'], ['discord', 'Discord row']]);
 });
 
+test('a reader failure is a log line, not a failing scheduler and never a repair card', () => {
+  const root = fixture({ enabled: true, intervalMin: 15 });
+  const healthModule = path.join(__dirname, 'health.js');
+  const selfRepairModule = path.join(__dirname, 'self-repair.js');
+  const result = run(root, `
+    const health = require(${JSON.stringify(healthModule)});
+    const selfRepair = require(${JSON.stringify(selfRepairModule)});
+    const discord = require(${JSON.stringify(discordModule)});
+    health.record('daemon', { at: Date.now() - 60e3 });
+    // Enough real failures for self-repair to have opened a card on the old behaviour.
+    for (let i = 0; i < 5; i += 1) health.record('discord', { ok: false, error: 'Discord reader timed out after 30s' });
+    const before = health.snapshot().schedulers.find((entry) => entry.name === 'discord');
+    const scheduler = discord.startScheduler();
+    clearInterval(scheduler.interval);
+    clearTimeout(scheduler.first);
+    scheduler.tick().then(() => {
+      const row = health.snapshot().schedulers.find((entry) => entry.name === 'discord');
+      process.stdout.write(JSON.stringify({
+        before: { state: before.state, sigs: selfRepair.signatures({ schedulers: [before] }).map((entry) => entry.sig).length },
+        state: row.state,
+        displayState: row.displayState,
+        detail: row.detail,
+        failures: row.consecutiveFailures,
+        sigs: selfRepair.signatures(health.snapshot()).map((entry) => entry.sig),
+      }));
+    }).catch((error) => { console.error(error.stack); process.exit(1); });
+  `, { KEEP_DISCORD_READER_ARGS: 'not json' });
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(result.stdout);
+  assert.equal(state.before.state, 'failing', 'the old behaviour turned the row red');
+  assert.equal(state.before.sigs, 1, 'and handed self-repair a signature');
+  assert.equal(state.state, 'skipped');
+  assert.equal(state.displayState, 'skipped');
+  assert.equal(state.detail, 'reader unavailable: KEEP_DISCORD_READER_ARGS must be a JSON array');
+  assert.equal(state.failures, 0);
+  assert.deepEqual(state.sigs, []);
+  assert.match(result.stderr, /^keep discord: KEEP_DISCORD_READER_ARGS must be a JSON array\n/m);
+});
+
 test('scheduler health uses the configured Discord polling interval', () => {
   const root = fixture({ enabled: true, intervalMin: 60 });
   const result = run(root, `

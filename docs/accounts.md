@@ -81,7 +81,17 @@ Specifying `--account` while resuming an existing session does not move it. Keep
 
 Every applicable window is judged and the worst one decides, so a comfortable week cannot hide a five-hour window at 100%. Codex accounts are read the same way, from the `week` and `5h` windows their own rollout records, with a longer horizon before the reading counts as stale — Claude's snapshot is polled, while Codex's only advances when a Codex session takes a turn.
 
+The window judged is the window the launch would actually spend. With `--model`, that model's per-model weekly bucket applies to every candidate. Without one, each Claude account is judged against its *own* default model — the `model` in that account's `settings.json`, which is what `claude` itself reads at startup — so an account sitting at `week 80%` with its default model's `Fable wk` at 100% is passed over rather than handed a session that cannot take a turn. An account whose settings cannot be read, or that names no model, keeps the generic `week` and `5h` windows; Codex accounts always do.
+
+A stale reading is unknown, and unknown still launches — except that usage only rises until a bucket resets, so a bucket that read at or past 100% and whose reset is still ahead of us is spent right now however old the reading is. That one verdict survives staleness in both providers; a stale reading never proves *room*, and a spent bucket whose reset has already passed is unknown again.
+
 If every account of that provider is at the wall, the open is refused and names each account's limiting bucket and reset time. Launching anyway is `--account <id>`: an explicit account is always honoured, spent or not, and a spent one prints a `warning:` line on stderr. This applies only to `keep open` asking; the daemon's own launches — scheduled checks, the reviewer, restore, reopen, and the console, which always names an account — keep the behaviour they had.
+
+### Where the readings come from
+
+`bin/usage.js` polls the OAuth usage endpoint per Claude account every five minutes into `~/keep/.keep/usage-cache.json`. That endpoint's limit is per account and shared with every running Claude Code session, so `HTTP 429` is weather, not a fault. A 429 starts a ten-minute cooldown that doubles to at most **twenty** minutes — short enough that a recovered endpoint is read again inside the thirty-minute window the consumers judge staleness by. A `Retry-After` header longer than that is still honoured: that one is the server saying when it will answer.
+
+While that is running, the `usage` row in `keep health` stays out of the red. When *every* failure in a batch is a 429 and each affected account still holds a reading younger than two hours, the row records a skip — `rate limited (Primary); retrying 12:40, reading 14m old` — and clears the failure streak, and the daemon logs one line on entering that state rather than one per poll. Anything that is not a rate limit, a 429 against an account with no reading, or a reading older than two hours fails the row exactly as before.
 
 ### Automation accounts
 

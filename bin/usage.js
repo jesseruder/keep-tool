@@ -16,8 +16,17 @@ const CODEX_REFRESH_MS = 5 * 60e3;
 const INITIAL_BACKOFF_MS = 4 * 60e3;
 const MAX_BACKOFF_MS = 29 * 60e3;
 const INITIAL_RATE_LIMIT_MS = 10 * 60e3;
-const MAX_RATE_LIMIT_MS = 60 * 60e3;
+// The endpoint's limit is per account and shared with every running Claude Code session,
+// so 429s are weather rather than a fault. The backoff still has to keep the reading
+// inside the 30-minute staleness window its consumers judge against (bin/review.js
+// classifyBudget, bin/open-account.js USAGE_STALE_MS): an hour of cooldown left the
+// chooser and the reviewer reading "unknown" long after the endpoint recovered. A larger
+// Retry-After is still honoured — that one is the server telling us when it will answer.
+const MAX_RATE_LIMIT_MS = 20 * 60e3;
 const MAX_RETRY_AFTER_MS = 24 * 60 * 60e3;
+// How old a reading may be and still make a 429 weather rather than a failure. Past it
+// the row goes red, because nobody can tell what the account has left any more.
+const RATE_LIMIT_HEALTH_GRACE_MS = 2 * 3600e3;
 const TAIL_BYTES = 256 * 1024;
 
 function shortError(source, error) {
@@ -311,6 +320,9 @@ function createUsageManager(deps = {}) {
   let onChange = () => {};
   let cacheFile = null;
   let configurationRemovedFailure = false;
+  // Whether the last batch with failures was rate-limit weather. The log line belongs to
+  // the transition, not to every poll that finds the same cooldown still running.
+  let rateLimitWeather = false;
 
   function configured() { return accountApi.list(deps.env || process.env); }
 
@@ -444,6 +456,30 @@ function createUsageManager(deps = {}) {
       : Promise.resolve().then(() => scanCodexAccount(stateAccount, deps));
   }
 
+  function clockTime(at) {
+    const when = new Date(Number(at));
+    return `${String(when.getHours()).padStart(2, '0')}:${String(when.getMinutes()).padStart(2, '0')}`;
+  }
+
+  // A 429 from an account that still holds a recent reading is weather, not a broken
+  // scheduler: the endpoint's limit is per account and every running Claude Code session
+  // shares it, so there is nothing here for a person or a repair card to fix. The detail
+  // names the account, when the next attempt is due and how old the reading its
+  // consumers are still judging against is. Null — so the row fails exactly as it always
+  // did — when any failure in the batch is something else, or when an affected account
+  // has no reading at all, or only one too old to still stand for what it has left.
+  function rateLimitWeatherDetail(failures, now) {
+    if (!failures.length || failures.some((outcome) => !outcome.rateLimited)) return null;
+    const parts = [];
+    for (const outcome of failures) {
+      const fetchedAt = Number(outcome.state.snapshot.fetchedAt);
+      if (!Number.isFinite(fetchedAt) || !fetchedAt || now - fetchedAt > RATE_LIMIT_HEALTH_GRACE_MS) return null;
+      parts.push(`rate limited (${outcome.account.label || outcome.account.id}); retrying ${clockTime(outcome.state.nextAttemptAt)}`
+        + `, reading ${Math.round((now - fetchedAt) / 60e3)}m old`);
+    }
+    return parts.join('; ');
+  }
+
   function requestRefresh(now = clock(), performRefresh = refreshAccount) {
     now = Number.isFinite(Number(now)) ? Number(now) : clock();
     const current = sync();
@@ -489,6 +525,9 @@ function createUsageManager(deps = {}) {
               state.failureKind = 'other';
             }
             await saveCache(state, currentAttempt);
+            if (state.failureKind === 'rate-limit') {
+              return { account, state, generation, ok: false, error: message, rateLimited: true };
+            }
           } else state.nextAttemptAt = completedAt + CODEX_REFRESH_MS;
           return { account, state, generation, ok: false, error: message };
         })
@@ -506,12 +545,25 @@ function createUsageManager(deps = {}) {
           && states.get(outcome.account.id) === outcome.state
           && outcome.state.generation === outcome.generation);
         if (failures.length) {
+          const weather = rateLimitWeatherDetail(failures, Number(clock()));
+          if (weather) {
+            if (!rateLimitWeather) {
+              rateLimitWeather = true;
+              process.stderr.write(`keep usage: ${weather}\n`);
+            }
+            healthApi.record('usage', { ok: true, skipped: true, clearFailures: true, detail: weather });
+            return;
+          }
+          rateLimitWeather = false;
           const error = failures.map((outcome) => `${outcome.account.label || outcome.account.id}: ${outcome.error}`).join('; ');
           healthApi.record('usage', { ok: false, error });
           return;
         }
         const cachedErrors = [...states.values()].filter((state) => state.snapshot.error);
-        if (!cachedErrors.length) configurationRemovedFailure = false;
+        if (!cachedErrors.length) {
+          configurationRemovedFailure = false;
+          rateLimitWeather = false;
+        }
         healthApi.record('usage', cachedErrors.length
           ? { ok: true, skipped: true, detail: 'waiting for failed account retry' }
           : { ok: true });

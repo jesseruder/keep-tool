@@ -293,7 +293,13 @@ function startScheduler(options = {}) {
       else health.record('discord', { ok: true, detail: `${decisions.length} messages`, cadenceMs });
       if (options.onChange) options.onChange();
     } catch (error) {
-      health.record('discord', { ok: false, error, cadenceMs });
+      // The reader drives a logged-in browser tab, so it fails for reasons nothing here
+      // can fix: the tab is closed, the window moved, Edge is restarting. Owner wants
+      // that logged, not presented as a failing scheduler — and `clearFailures` keeps
+      // the streak from turning the row red or handing bin/self-repair.js a signature
+      // for weather. A real classification still records `ok: true`.
+      const detail = `reader unavailable: ${String(error && error.message || error).replace(/\s+/g, ' ').trim()}`;
+      health.record('discord', { skipped: true, clearFailures: true, detail, cadenceMs });
       process.stderr.write(`keep discord: ${error.message}\n`);
     } finally { running = false; }
   };

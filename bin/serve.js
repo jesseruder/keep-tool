@@ -5455,6 +5455,28 @@ function usageSnapshot(deps = {}) {
   catch { return null; }
 }
 
+// What the account chooser should judge one candidate against. An explicit `--model`
+// is the whole answer and applies to every candidate. Without one, `claude` reads the
+// launching account's own settings.json at startup, so the per-model weekly bucket that
+// launch would spend against is that account's default model — not the generic week:
+// `claude/default` sat at week 80% and `Fable wk` 100%, which the generic buckets read
+// as fine although a session opened there could not take a turn. Each candidate has its
+// own settings.json, so this is asked per account. Codex accounts have no such file and
+// keep the generic windows. Anything unreadable is '' — today's generic behaviour — and
+// nothing here throws: choosing an account is a convenience, never a gate.
+function accountBudgetModel(account, deps = {}) {
+  try {
+    if (!account || account.agent !== 'claude'
+      || typeof account.configDir !== 'string' || !account.configDir) return '';
+    const read = deps.readAccountSettings || readAccountSettingsModel;
+    return launchModelId(read(path.join(account.configDir, 'settings.json')));
+  } catch { return ''; }
+}
+
+function openBudgetModel(launchModel, deps = {}) {
+  return launchModel || ((account) => accountBudgetModel(account, deps));
+}
+
 async function openSession(body, deps = {}) {
   body = body && typeof body === 'object' ? body : {};
   const freshStandalone = body.fresh === true && !body.taskId && !body.sessionId;
@@ -5620,7 +5642,7 @@ async function openSession(body, deps = {}) {
           accounts: accounts.list(env),
           defaultAccountId: accounts.defaultFor(agent, env).id,
           callerAccountId: body.callerAccountId,
-        }), usageSnapshot(deps), launchModel, Date.now());
+        }), usageSnapshot(deps), openBudgetModel(launchModel, deps), Date.now());
         note = choice.account ? openAccount.accountNote(choice) : openAccount.noAccountMessage(agent, choice.skipped);
       } catch (error) {
         choice = null;
@@ -5638,7 +5660,7 @@ async function openSession(body, deps = {}) {
     if (!account || account.agent !== agent) throw new InjectionError(400, `account ${body.accountId || '?'} is not a ${agent} account`);
     if (body.accountId != null) {
       // Same rule: an unreadable snapshot costs the warning, never the launch.
-      try { accountWarning = openAccount.exhaustedWarning(account, usageSnapshot(deps), launchModel, Date.now()); }
+      try { accountWarning = openAccount.exhaustedWarning(account, usageSnapshot(deps), openBudgetModel(launchModel, deps), Date.now()); }
       catch { accountWarning = ''; }
     }
   }
@@ -9149,6 +9171,8 @@ module.exports = {
   sessionLastTurn,
   lastClaudeHandoffModel,
   handoffCurrentModel,
+  accountBudgetModel,
+  openBudgetModel,
   lastContextTokens,
   compactRefusal,
   compactCommand,

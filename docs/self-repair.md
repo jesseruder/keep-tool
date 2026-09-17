@@ -37,6 +37,16 @@ diverged checkout), which is Owner's to fix rather than a daemon bug. A `deliver
 row carrying a live incident gets the `delivery:` signature rather than a second
 `sched:` one.
 
+A tick may also decide its own failure is weather rather than a fault and record
+`health.record(name, { skipped: true, clearFailures: true, detail })` instead of a
+failure. A skip ordinarily *keeps* the streak, so that a scheduler which failed and
+then had nothing to do still reads as unresolved; `clearFailures` zeroes it, which is
+what keeps the row out of the red and out of this table — `signatures()` gates on
+`consecutiveFailures`. Two rows use it: `usage` when every failure in a batch is an
+endpoint rate limit over a reading still younger than two hours, and `discord` when
+its browser reader is unavailable. `lastError`/`lastErrorAt` stay as history;
+`presentationOf` only reads them while the streak is nonzero.
+
 `hash8` is `sha256(name + '|' + normalizedError)`. The normalizer collapses
 whitespace and then replaces, in order: ISO timestamps (`<time>`), absolute paths
 (`<path>`), uuids (`<id>`), hex runs of 7 or more (`<hex>`), and bare numbers
