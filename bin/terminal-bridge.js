@@ -15,11 +15,12 @@ const ATTENDANCE_RETRY_MS = 5000;
 // Shift-F1), the tilde keys (Delete, PgUp, F5…) and the SS3 forms an application-mode
 // terminal sends instead.
 //
-// `\x1b[1;2R` — modified F3 — is byte-identical to a cursor-position report for row 1.
-// Counting it as a key is the right way round: xterm's CPR answers reach Keep on the
-// console's `auto` reply path, which never gets here, so a CSI R arriving as a binary
-// frame is somebody's keyboard.
-const NAVIGATION_KEY = /\x1b\[[ABCDHFZ]|\x1b\[1;\d+[ABCDHFPQRS]|\x1b\[\d+(?:;\d+)?~|\x1bO[ABCDHFPQRS]/;
+// `\x1b[1;2R` — modified F3 — is byte-identical to a cursor-position report for row 1,
+// column 2. Counting it as a key is the right way round: xterm's CPR answers reach Keep
+// on the console's `auto` reply path, which never gets here, so a CSI R arriving as a
+// binary frame is somebody's keyboard. The modifier parameter is bounded to the values
+// xterm sends (2–16) so a row-1 report for any other column stays a reply.
+const NAVIGATION_KEY = /\x1b\[[ABCDHFZ]|\x1b\[1;(?:[2-9]|1[0-6])[ABCDHFPQRS]|\x1b\[\d+(?:;\d+)?~|\x1bO[ABCDHFPQRS]/;
 
 // What xterm.js emits on its own, with nobody at the keyboard: answers to the
 // terminal's own queries (DECRPM `\x1b[?2026;2$y`, primary DA, cursor position),

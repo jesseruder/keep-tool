@@ -94,7 +94,7 @@ test('a keystroke is what the terminal did not send by itself', () => {
     '\x1b[I', '\x1b[O',                       // focus in/out
     '\x1b[?2026;2$y',                          // DECRPM, synchronised output
     '\x1b[?1;2c', '\x1b[>0;276;0c',            // primary and secondary DA
-    '\x1b[24;80R',                             // cursor position report
+    '\x1b[24;80R', '\x1b[1;80R', '\x1b[1;17R', // cursor position reports, row 1 included
     '\x1b[8;50;200t',                          // window report
     '\x1b]11;rgb:0000/0000/0000\x07',          // OSC background colour reply
     '\x1b]10;rgb:ffff/ffff/ffff\x1b\\',        // the same, ST-terminated
