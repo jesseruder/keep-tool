@@ -50,7 +50,7 @@ test('agent-facing scheduling contract is present in skill, README, and CLI help
   const keepRoot = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'keep-guidance-help-'));
   fs.mkdirSync(path.join(keepRoot, 'tasks'));
   t.after(() => fs.rmSync(keepRoot, { recursive: true, force: true }));
-  for (const file of ['skills/keep/SKILL.md', 'README.md', 'docs/session-reliability.md']) {
+  for (const file of ['skills/keep/SKILL.md', 'skills/keep-scheduled-checks/SKILL.md', 'README.md', 'docs/session-reliability.md']) {
     const text = fs.readFileSync(path.join(root, file), 'utf8');
     assert.match(text, /--handoff needs-input/, file);
     assert.match(text, /turn-scoped/, file);
@@ -64,5 +64,5 @@ test('agent-facing scheduling contract is present in skill, README, and CLI help
     assert.match(r.stdout, /--check "recipe"/);
   }
   assert.equal(require('./health').CADENCES.runs.cadenceMs, 60000);
-  assert.match(fs.readFileSync(path.join(root, 'skills/keep/SKILL.md'), 'utf8'), /polls due recipes every minute/);
+  assert.match(fs.readFileSync(path.join(root, 'skills/keep-scheduled-checks/SKILL.md'), 'utf8'), /polls due recipes every minute/);
 });

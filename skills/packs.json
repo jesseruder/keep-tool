@@ -1,7 +1,7 @@
 {
   "core": {
-    "description": "The Keep work-registry skill and the fleet reviewer procedure.",
-    "skills": ["keep", "fleet-review"]
+    "description": "The Keep work-registry skill, its situational companions (scheduled checks, sessions, shared state, operations, named agents), and the fleet reviewer procedure.",
+    "skills": ["keep", "keep-scheduled-checks", "keep-sessions", "keep-shared-state", "keep-ops", "keep-agent-session", "fleet-review"]
   },
   "handoff": {
     "description": "Route implementation to Codex or a cheaper Claude model, run independent Codex reviews, and hand routine UI driving to cheaper workers.",

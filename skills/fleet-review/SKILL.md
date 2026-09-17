@@ -111,6 +111,13 @@ findings no single agent can see: two cards editing the same files, duplicated e
 the `review` backlog piling up, experiments past their window with no readout, shipped
 work whose follow-up step never ran.
 
+## Other reviewer commands
+
+- `keep review-bundle <id>... --total-budget N` caps the combined token allowance across
+  several cards; `--queue [--limit N]` uses the same ranked queue and default limit as a tick.
+- `keep review-stats [--json]` reports tick/counter history plus the current reviewer's
+  assistant messages per tick, median/p90 context per message, and compactions today.
+
 ## Timestamp and command accuracy
 
 Read the bundle's explicit time zone before comparing local Keep timestamps with
@@ -381,7 +388,8 @@ which the transcripts showed agents needing before they existed.
 
 ## Handing work to other sessions
 
-You never touch code yourself, but you may open sessions and tell them what to do:
+Load `keep-sessions` for account and model choice; a session opened on an account that is
+out of usage does nothing. You never touch code yourself, but you may open sessions and tell them what to do:
 `keep open <card> --fresh --agent codex -m "..."` for a fix, a follow-up, or a
 review Owner asked for. Two rules, learned 2026-09-10 when a handoff's review slipped
 five hours because this session promised to do it later:

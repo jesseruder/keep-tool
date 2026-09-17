@@ -583,7 +583,7 @@ commands.hook = async (argv) => {
       : delegationText
         ? 'Ask the parent to refresh or reassign this delegation before continuing.'
         : 'Check in with `keep checkin <id> -m "..."` when status changes. File follow-up work with `keep add "<title>" --file`; ideas file without claiming by default, and `--claim` starts one now.';
-    paragraphs.push(`[keep — work registry]\n${lines.join('\n')}\n${workflow} Delegated workers given a parent card or step contribute to it without claiming it or opening a duplicate card. Conventions: read the shared keep skill (${path.join(ROOT, 'skills/keep/SKILL.md')}). Card status is not conversation readiness; scheduling a check yields this turn unless you also pass --handoff needs-input.`);
+    paragraphs.push(`[keep — work registry]\n${lines.join('\n')}\n${workflow} Delegated workers given a parent card or step contribute to it without claiming it or opening a duplicate card. Conventions: read the shared keep skill (${path.resolve(__dirname, '../../skills/keep/SKILL.md')}). Card status is not conversation readiness; scheduling a check yields this turn unless you also pass --handoff needs-input.`);
   }
   if (nudge) paragraphs.push(nudge);
   if (paragraphs.length) console.log(paragraphs.join('\n\n'));

@@ -1,6 +1,6 @@
 ---
 name: codex-review-runner
-description: Run an independent Codex review after nontrivial code changes using Keep's account-aware background task launcher. Use for routine and adversarial Codex reviews from Claude Code.
+description: Run an independent Codex review after nontrivial code changes using Keep's account-aware background task launcher, then record it on the card (keep reviewed) and land through Keep (keep land). Use for routine and adversarial Codex reviews from Claude Code, and before pushing or landing reviewed commits.
 ---
 
 # Running a Codex review
@@ -39,3 +39,28 @@ initially, not both. Astra xhigh requires Owner's explicit request.
    `keep codex --account <id> result <job-id>`, relay the review findings, and act on
    them before pushing. A start-only or stale result is not a review; use the
    implementation-handoff stall handling instead of treating it as clean.
+
+## Recording the review and landing
+
+Once the review has a verdict, record it on the card so the land gate can see it:
+
+```sh
+keep reviewed <card> --commit origin/<default>..HEAD --verdict clean|findings --by "codex sol" --job <job-id>
+```
+
+- Keep verifies what it can: `--job` must name a completed job in a registered Codex
+  account, `--by human` cannot be written from an agent session, and a `codex` review
+  needs a job while an `opus`/`claude` one needs a job or 80+ characters of `--evidence`.
+- Keep does not read the job's prompt: cite only a job that was actually a review of those
+  commits, never the thread that wrote them.
+- A `findings` record is not superseded by the commit that fixes it. Re-review the fixed
+  range and record that verdict; `keep reviews <card>` lists what is on the card.
+- `keep allow <card> land` answers 0 when the reviewed patches are exactly what would
+  land — every commit in `origin/<default>..HEAD` covered by a clean record whose
+  patch-id matches, from a clean wt-managed `wt/` worktree with a linear range, with the
+  card not opted out.
+- `keep land <card>` does the land: it re-checks that, runs `wt land`, and cites the
+  landed sha (exit 3 when the reviewed patches are not exactly what would land;
+  `--dry-run` shows the decision). Keep-tool's own main checkout and daemon restart
+  stay manual.
+- Cite the landed shas in the final check-in, not the pre-rebase worktree shas.

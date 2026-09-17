@@ -76,8 +76,10 @@ before you finish.
 
 ## Skill packs
 
-`keep setup skills` installs the `core` pack — the `keep` and `fleet-review` skills —
-alongside `keep setup hooks`. `keep setup skills --pack handoff` adds the three
+`keep setup skills` installs the `core` pack alongside `keep setup hooks`: the `keep`
+skill (cards, check-ins, plans, dependencies, closing), its situational companions —
+`keep-scheduled-checks`, `keep-sessions`, `keep-shared-state`, `keep-ops` and
+`keep-agent-session`, each loaded only when its moment comes — and `fleet-review`. `keep setup skills --pack handoff` adds the three
 handoff skills (`implementation-handoff`, `codex-review-runner`, `ui-driving-handoff`),
 which refer back to this page for the conventions above.
 
