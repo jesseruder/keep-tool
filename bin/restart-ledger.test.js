@@ -363,3 +363,23 @@ test('a settled gap over a turn the API rate-limited verifies only under allowTe
   fs.writeFileSync(path.join(root, '.keep/background-jobs/claude/parent/state.json'), JSON.stringify(state));
   assert.throws(() => verify({ allowTerminalRateLimit: true }), /Job ledger evidence is incomplete/);
 }, 'claude'));
+
+test('a child with no transcript anywhere is skipped only once the parent ledger says it finished', () => fixture(({ root, append, verify }) => {
+  append('parent', { type: 'user', sessionId: 'parent', message: { content: 'work' } });
+  append('parent', { type: 'assistant', sessionId: 'parent', message: { stop_reason: 'tool_use',
+    content: [{ type: 'tool_use', id: 'spawn', name: 'Agent', input: {} }] } });
+  append('parent', { type: 'user', sessionId: 'parent', message: { content: [
+    { type: 'tool_result', tool_use_id: 'spawn', content: 'Async agent launched successfully. agentId: child' }] } });
+  append('parent', { type: 'assistant', sessionId: 'parent', message: { stop_reason: 'end_turn', content: [] } });
+  // The agent's transcript is nowhere in the profile. While the parent still counts it
+  // as live its history is required; once the parent's own ledger says it finished
+  // there is nothing left to walk.
+  const unresolved = () => verify({ resolveChild: () => null });
+  assert.throws(unresolved, /Child job ledger transcript is missing/);
+  append('parent', { type: 'user', sessionId: 'parent', message: { content:
+    '<task-notification><task-id>child</task-id><status>completed</status><result>done</result></task-notification>' } });
+  append('parent', { type: 'assistant', sessionId: 'parent', message: { stop_reason: 'end_turn', content: [] } });
+  unresolved()();
+  const state = JSON.parse(fs.readFileSync(path.join(root, '.keep/background-jobs/claude/parent/state.json')));
+  assert.equal(state.jobs['job:child'].status, 'completed');
+}, 'claude'));

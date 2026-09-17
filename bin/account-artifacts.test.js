@@ -380,6 +380,114 @@ test('a changed recovery backup is refused instead of being trusted or replaced'
   } finally { t.mock.restoreAll(); fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+// A session that changed cwd writes its later subagent transcripts under the worktree's
+// own project dir, with no `<sid>.jsonl` beside them, and a replaced transcript leaves a
+// `<sid>.superseded-*` tree behind. Both hold child transcripts the ledger walk needs.
+function extraTrees(f) {
+  const worktree = path.join(f.profiles.a, 'projects', '-wt-work-repo-slug', f.sid);
+  const superseded = path.join(project(f, 'a'), `${f.sid}.superseded-1758000000000`);
+  for (const [dir, agent] of [[worktree, 'worktree'], [superseded, 'old']]) {
+    fs.mkdirSync(path.join(dir, 'subagents'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'subagents', `agent-${agent}.jsonl`), `${JSON.stringify({ agent })}\n`);
+  }
+  return { worktree, superseded };
+}
+
+test('every session tree of a session moves with it, in its own project name', () => {
+  const f = fixture();
+  try {
+    const trees = extraTrees(f);
+    const plan = artifacts.preflight(f.sid, f.records.a, f.records.b, options(f));
+    const extra = plan.artifacts.filter((entry) => entry.extra === true);
+    assert.deepEqual(extra.map((entry) => entry.source).sort(), [trees.superseded, trees.worktree].sort());
+    assert.deepEqual(extra.map((entry) => entry.kind), ['session', 'session']);
+    assert.equal(plan.artifacts.filter((entry) => entry.kind === 'session' && !entry.extra).length, 1);
+    artifacts.copyClaudeArtifacts(f.sid, f.records.a, f.records.b, 'tx-extra-trees', options(f));
+    assert.equal(fs.readFileSync(path.join(f.profiles.b, 'projects', '-wt-work-repo-slug', f.sid,
+      'subagents', 'agent-worktree.jsonl'), 'utf8'), `${JSON.stringify({ agent: 'worktree' })}\n`);
+    assert.equal(fs.readFileSync(path.join(project(f, 'b'), `${f.sid}.superseded-1758000000000`,
+      'subagents', 'agent-old.jsonl'), 'utf8'), `${JSON.stringify({ agent: 'old' })}\n`);
+    assert.equal(artifacts.preflight(f.sid, f.records.a, f.records.b, options(f)).disposition, 'reused');
+    // A tree that appears afterwards is part of the plan, and the target no longer matches.
+    fs.mkdirSync(path.join(f.profiles.a, 'projects', '-later', f.sid), { recursive: true });
+    fs.writeFileSync(path.join(f.profiles.a, 'projects', '-later', f.sid, 'late.txt'), 'late');
+    assert.equal(artifacts.preflight(f.sid, f.records.a, f.records.b, options(f)).disposition, 'managed');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+// A child whose transcript sits under some other session's tree -- a codex-rescue child
+// does this -- is not part of what the transaction moves.
+function prepareForeignChild(f, child = 'child') {
+  const at = (value) => new Date(value).toISOString();
+  fs.writeFileSync(transcript(f, 'a'), [
+    { type: 'user', sessionId: f.sid, timestamp: at(1000), message: { content: 'work' } },
+    { type: 'assistant', sessionId: f.sid, timestamp: at(1100), message: { stop_reason: 'tool_use',
+      content: [{ type: 'tool_use', id: 'spawn', name: 'Agent', input: {} }] } },
+    { type: 'user', sessionId: f.sid, timestamp: at(1200), message: { content: [
+      { type: 'tool_result', tool_use_id: 'spawn', content: `Async agent launched successfully. agentId: ${child}` }] } },
+    { type: 'user', sessionId: f.sid, timestamp: at(1300), message: { content:
+      `<task-notification><task-id>${child}</task-id><status>completed</status><result>done</result></task-notification>` } },
+    { type: 'assistant', sessionId: f.sid, timestamp: at(1500), message: { stop_reason: 'end_turn', content: [] } },
+  ].map(JSON.stringify).join('\n') + '\n');
+  const foreign = path.join(f.profiles.a, 'projects', '-other', 'session-999', 'subagents');
+  fs.mkdirSync(foreign, { recursive: true });
+  const file = path.join(foreign, `agent-${child}.jsonl`);
+  fs.writeFileSync(file, JSON.stringify({ type: 'assistant', sessionId: f.sid, timestamp: at(1400),
+    message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }] } }) + '\n');
+  restartLedger.verify({ root: f.root, agent: 'claude', sid: f.sid, file: transcript(f, 'a'),
+    instance: { id: 'pane:a', since: 1, live: true }, resolveChild: () => null })();
+  return { child, file };
+}
+
+test('a child transcript outside the session trees is skipped when finished and refused when not', () => {
+  const f = fixture();
+  try {
+    const foreign = prepareForeignChild(f);
+    artifacts.copyClaudeArtifacts(f.sid, f.records.a, f.records.b, 'tx-foreign', options(f));
+    const result = artifacts.rebindLedger(f.sid, f.records.a, f.records.b, 'tx-foreign', rebindOptions(f));
+    assert.deepEqual(result.rebound.map((entry) => entry.sessionId), [f.sid]);
+    assert.deepEqual(result.skippedChildren, [{ sessionId: foreign.child, reason: 'transcript outside the session trees' }]);
+    assert.equal(fs.existsSync(path.join(f.profiles.b, 'projects', '-other', 'session-999')), false, 'a foreign tree is not moved');
+
+    // The same child while the parent's ledger still counts it as live: nothing here
+    // can move its history, so the transfer refuses instead of leaving it behind.
+    fs.mkdirSync(path.join(f.profiles.a, 'projects', '-other', 'session-999', 'subagents'), { recursive: true });
+    fs.writeFileSync(path.join(f.profiles.a, 'projects', '-other', 'session-999', 'subagents', 'agent-live.jsonl'), '{}\n');
+    assert.throws(() => artifacts.rebindLedger(f.sid, f.records.a, f.records.b, 'tx-foreign', rebindOptions(f, {
+      rebindSource: (args) => {
+        const rebound = jobs.rebindSource(args);
+        return { ...rebound, children: [...(rebound.children || []), 'live'] };
+      },
+    })), (error) => {
+      assert.equal(error.code, 'KEEP_ARTIFACT_ESCAPE');
+      assert.match(error.message, /outside the session trees/);
+      return true;
+    });
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('a child with no transcript anywhere is refused while the parent still counts it as live', () => {
+  const f = fixture();
+  try {
+    prepareForeignChild(f, 'ghost');
+    fs.rmSync(path.join(f.profiles.a, 'projects', '-other'), { recursive: true, force: true });
+    artifacts.copyClaudeArtifacts(f.sid, f.records.a, f.records.b, 'tx-missing', options(f));
+    assert.throws(() => artifacts.rebindLedger(f.sid, f.records.a, f.records.b, 'tx-missing', rebindOptions(f, {
+      rebindSource: (args) => {
+        const rebound = jobs.rebindSource(args);
+        return { ...rebound, children: [...(rebound.children || []), 'live'] };
+      },
+    })), (error) => {
+      assert.equal(error.code, 'KEEP_ARTIFACT_ESCAPE');
+      assert.match(error.message, /Claude child transcript is missing/);
+      return true;
+    });
+    // The finished one is recorded rather than refused.
+    const result = artifacts.rebindLedger(f.sid, f.records.a, f.records.b, 'tx-missing', rebindOptions(f));
+    assert.deepEqual(result.skippedChildren, [{ sessionId: 'ghost', reason: 'transcript is missing' }]);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test('symlinked artifact paths and profile aliases are rejected', () => {
   const f = fixture();
   try {

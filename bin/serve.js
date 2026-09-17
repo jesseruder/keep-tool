@@ -4070,8 +4070,18 @@ async function restartSession(body, deps = {}) {
     const ledger = require('./restart-ledger');
     const file = session.kind === 'codex' ? (deps.codexRolloutFile || codex.rolloutFileFor)(session.id)
       : (deps.claudeRolloutFile || findSessionFile)(session.id);
+    // Claude child transcripts are looked for across the whole profile that holds the
+    // transcript being walked, not just beside it: a session that changed cwd writes
+    // later subagent files under the worktree's own project dir. That profile is the
+    // one the live agent runs on, which during an account handoff is not `account` --
+    // that is the account the session is about to resume under. The transcript's own
+    // `<configDir>/projects/<project>/<sid>.jsonl` shape names it exactly; liveAccount
+    // is the fallback when the path is not in that shape.
+    const claudeProfileDir = typeof file === 'string' && path.basename(path.dirname(path.dirname(file))) === 'projects'
+      ? path.dirname(path.dirname(path.dirname(file))) : (liveAccount || account).configDir;
+    const resolveClaudeChild = deps.resolveClaudeChild || require('./child-transcripts').resolveClaudeChild;
     const resolveChild = session.kind === 'codex' ? deps.codexChildRolloutFile || codex.findRolloutFile
-      : (id, parentFile = file) => path.join(path.dirname(parentFile), path.basename(parentFile, '.jsonl'), 'subagents', `agent-${id}.jsonl`);
+      : (id, parentFile = file) => resolveClaudeChild(id, parentFile, { configDir: claudeProfileDir });
     let childProof;
     try {
       childProof = ledger.verify({ root: deps.root || keep.ROOT, agent: session.kind, sid: session.id, file,

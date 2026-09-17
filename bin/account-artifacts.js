@@ -5,8 +5,9 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const accounts = require('./accounts');
+const childTranscripts = require('./child-transcripts');
 
-const KINDS = ['transcript', 'session', 'file-history'];
+const TERMINAL_JOBS = new Set(['completed', 'failed', 'cancelled']);
 
 function failure(message, code = 'KEEP_ARTIFACT_UNSAFE') {
   const error = new Error(message);
@@ -127,12 +128,17 @@ function sameManifest(left, right) {
     && left.entries === right.entries && left.bytes === right.bytes;
 }
 
+// Keyed by artifact id, not kind: a session can carry more than one session tree (see
+// buildPlan), and two of them under the same kind would collide here and in the journal.
+// The three original artifacts keep their kind as their id, so records written before
+// extra trees existed still read back.
 function manifestMap(artifacts, side) {
-  return Object.fromEntries(artifacts.map((artifact) => [artifact.kind, artifact[side]]));
+  return Object.fromEntries(artifacts.map((artifact) => [artifact.id, artifact[side]]));
 }
 
 function sameManifestMap(left, right) {
-  return KINDS.every((kind) => sameManifest(left?.[kind] ?? null, right?.[kind] ?? null));
+  const keys = new Set([...Object.keys(left || {}), ...Object.keys(right || {})]);
+  return [...keys].every((key) => sameManifest(left?.[key] ?? null, right?.[key] ?? null));
 }
 
 function locateSource(sessionId, source, env) {
@@ -166,20 +172,37 @@ function buildPlan(sessionId, source, target, options = {}) {
   if (targetMatches.some((entry) => path.resolve(entry.file) !== expectedTargetFile)) {
     throw failure(`target account ${target.id} has an aliased transcript for ${sessionId}`, 'KEEP_ARTIFACT_ALIAS');
   }
+  const primaryTree = path.join(sourceProject, sessionId);
   const specifications = [
-    ['transcript', sourceFile, expectedTargetFile, true],
-    ['session', path.join(sourceProject, sessionId), path.join(targetProject, sessionId), false],
-    ['file-history', path.join(sourceRoot, 'file-history', sessionId), path.join(targetRoot, 'file-history', sessionId), false],
+    ['transcript', 'transcript', sourceFile, expectedTargetFile, true],
+    ['session', 'session', primaryTree, path.join(targetProject, sessionId), false],
+    ['file-history', 'file-history', path.join(sourceRoot, 'file-history', sessionId), path.join(targetRoot, 'file-history', sessionId), false],
   ];
-  const artifacts = specifications.map(([kind, from, to, required]) => {
+  // A session that changed cwd writes its later subagent transcripts under the
+  // worktree's own project dir, and a replaced transcript leaves a
+  // `<sid>.superseded-*` tree behind. Those trees hold child transcripts the ledger
+  // walk has to reach, so they move with the session, each into the same project name
+  // on the target. They are session trees like the primary one, kept apart by id.
+  for (const tree of childTranscripts.listClaudeSessionTrees(sessionId, sourceRoot)) {
+    if (path.resolve(tree.dir) === primaryTree) continue;
+    if (!tree.projectName || path.basename(tree.projectName) !== tree.projectName
+        || tree.projectName === '.' || tree.projectName === '..') {
+      throw failure(`unsafe source project for ${sessionId}`, 'KEEP_ARTIFACT_ESCAPE');
+    }
+    const name = path.basename(tree.dir);
+    specifications.push([`session:${tree.projectName}/${name}`, 'session', tree.dir,
+      path.join(targetRoot, 'projects', tree.projectName, name), false]);
+  }
+  const artifacts = specifications.map(([id, kind, from, to, required]) => {
     const sourcePath = assertPath(sourceRoot, from, `source ${kind}`);
     const targetPath = assertPath(targetRoot, to, `target ${kind}`);
     const sourceManifest = treeManifest(sourcePath);
     if (required && !sourceManifest) throw failure(`required source artifact is missing: ${sourcePath}`, 'KEEP_ARTIFACT_SOURCE');
-    return { kind, source: sourcePath, target: targetPath, sourceManifest, targetManifest: treeManifest(targetPath) };
+    return { id, kind, source: sourcePath, target: targetPath, sourceManifest, targetManifest: treeManifest(targetPath),
+      ...(id === kind ? {} : { extra: true }) };
   });
   return { root, env, sessionId, source, target, projectName: match.projectName, sourceDir: sourceProject,
-    targetDir: targetProject, artifacts };
+    targetDir: targetProject, sourceRoot, targetRoot, artifacts };
 }
 
 function publicPlan(plan) {
@@ -188,6 +211,7 @@ function publicPlan(plan) {
     targetDir: plan.targetDir,
     artifacts: plan.artifacts.map((entry) => ({
       kind: entry.kind, source: entry.source, target: entry.target,
+      ...(entry.extra ? { extra: true } : {}),
       sourceDigest: entry.sourceManifest?.digest || null,
       targetDigest: entry.targetManifest?.digest || null,
     })),
@@ -202,11 +226,16 @@ function readProvenance(plan, profile) {
   return value;
 }
 
+// Journals and provenance written before session trees could be plural carry only a
+// kind, which was their identity then and is their id now.
+function recordId(record) { return record?.id || record?.kind; }
+
 function journalArtifacts(plan, transactionId, before) {
   const suffix = digest(transactionId).slice(0, 20);
   return plan.artifacts.map((artifact) => ({
+    id: artifact.id,
     kind: artifact.kind,
-    before: before[artifact.kind] ?? null,
+    before: before[artifact.id] ?? null,
     desired: artifact.sourceManifest,
     stage: path.join(path.dirname(artifact.target), `.${path.basename(artifact.target)}.keep-stage-${suffix}`),
     backup: path.join(path.dirname(artifact.target), `.${path.basename(artifact.target)}.keep-backup-${suffix}`),
@@ -218,7 +247,7 @@ function journalPathsMatch(plan, transactionId, records) {
   if (!Array.isArray(records) || records.length !== plan.artifacts.length) return false;
   const expected = journalArtifacts(plan, transactionId, {});
   return expected.every((entry) => {
-    const record = records.find((candidate) => candidate.kind === entry.kind);
+    const record = records.find((candidate) => recordId(candidate) === entry.id);
     return record && record.stage === entry.stage && record.backup === entry.backup;
   });
 }
@@ -228,10 +257,10 @@ function validRecovery(plan, value) {
       || value.sourceAccountId !== plan.source.id || value.targetAccountId !== plan.target.id
       || value.projectName !== plan.projectName || !journalPathsMatch(plan, value.transactionId, value.artifacts)) return false;
   const desired = manifestMap(plan.artifacts, 'sourceManifest');
-  const recorded = Object.fromEntries(value.artifacts.map((entry) => [entry.kind, entry.desired ?? null]));
+  const recorded = Object.fromEntries(value.artifacts.map((entry) => [recordId(entry), entry.desired ?? null]));
   if (!sameManifestMap(desired, recorded)) return false;
   for (const artifact of plan.artifacts) {
-    const record = value.artifacts.find((entry) => entry.kind === artifact.kind);
+    const record = value.artifacts.find((entry) => recordId(entry) === artifact.id);
     if (!record) return false;
     if (sameManifest(artifact.targetManifest, record.desired ?? null)
         || sameManifest(artifact.targetManifest, record.before ?? null)) continue;
@@ -296,7 +325,7 @@ function validateExistingJournal(plan, journal, transactionId) {
     throw failure(`artifact transaction ${transactionId} conflicts with its recovery journal`, 'KEEP_ARTIFACT_JOURNAL');
   }
   const desired = manifestMap(plan.artifacts, 'sourceManifest');
-  const recorded = Object.fromEntries(journal.artifacts.map((entry) => [entry.kind, entry.desired ?? null]));
+  const recorded = Object.fromEntries(journal.artifacts.map((entry) => [recordId(entry), entry.desired ?? null]));
   if (!sameManifestMap(desired, recorded)) {
     throw failure(`source artifacts changed after transaction ${transactionId} began`, 'KEEP_ARTIFACT_SOURCE_CHANGED');
   }
@@ -373,11 +402,11 @@ function copyClaudeArtifacts(sessionId, source, target, transactionId, options =
   writeJson(provenanceFile(plan.root, sessionId, source.id), provenance(plan, source, desired, transactionId));
   const copied = [];
   for (const artifact of plan.artifacts) {
-    const record = journal.artifacts.find((entry) => entry.kind === artifact.kind);
+    const record = journal.artifacts.find((entry) => recordId(entry) === artifact.id);
     if (!record) throw failure(`artifact transaction ${transactionId} is incomplete`, 'KEEP_ARTIFACT_JOURNAL');
     if (publishArtifact(artifact, record, journal, file)) copied.push(artifact.target);
   }
-  const installed = Object.fromEntries(plan.artifacts.map((artifact) => [artifact.kind, treeManifest(artifact.target)]));
+  const installed = Object.fromEntries(plan.artifacts.map((artifact) => [artifact.id, treeManifest(artifact.target)]));
   if (!sameManifestMap(installed, desired)) throw failure('published Claude artifact set failed verification');
   writeJson(provenanceFile(plan.root, sessionId, target.id), provenance(plan, target, desired, transactionId));
   journal.status = 'complete'; persistJournal(file, journal);
@@ -397,6 +426,22 @@ function completedPlan(sessionId, source, target, transactionId, options) {
   return plan;
 }
 
+// The plan's session tree that holds this child transcript, or null. A tree's own
+// directory is not a child of itself, so an exact match does not count.
+function treeHolding(sessionTrees, child) {
+  return sessionTrees.find((tree) => {
+    const relative = path.relative(tree.source, child);
+    return relative !== '' && !path.isAbsolute(relative) && within(tree.source, child);
+  }) || null;
+}
+
+// The parent's own view of a child agent, read from the persisted ledger snapshot.
+function childJobStatus(root, parentId, childId) {
+  const state = readJson(path.join(root, '.keep', 'background-jobs', 'claude', parentId, 'state.json'));
+  const job = state?.jobs?.[`job:${childId}`];
+  return typeof job?.status === 'string' ? job.status : null;
+}
+
 // Claude can append bookkeeping and local-command rows after its process has
 // accepted /exit. The normal restart proof runs before that exit, while a dead
 // session is no longer part of the daemon's polling set. Advance the persisted
@@ -404,7 +449,7 @@ function completedPlan(sessionId, source, target, transactionId, options) {
 // restart proof before any source identity is rebound to the copied profile.
 function catchUpStoppedLedger(plan, sessionId, transactionId, options) {
   const transcript = plan.artifacts.find((entry) => entry.kind === 'transcript');
-  const sessionTree = plan.artifacts.find((entry) => entry.kind === 'session');
+  const sessionTrees = plan.artifacts.filter((entry) => entry.kind === 'session');
   if (!transcript) throw failure('Claude transcript artifact is unavailable', 'KEEP_ARTIFACT_LEDGER');
   const snapshot = path.join(plan.root, '.keep', 'background-jobs', 'claude', sessionId, 'state.json');
   const before = readJson(snapshot);
@@ -428,12 +473,14 @@ function catchUpStoppedLedger(plan, sessionId, transactionId, options) {
   const priorInstance = before.source.instance;
   const instance = priorInstance && typeof priorInstance === 'object'
     ? { ...priorInstance, live: false } : priorInstance || null;
+  // Only a child inside one of the session trees this transaction moves can be walked
+  // here: a transcript anywhere else is not something the target will have. A child
+  // with no transcript, and one sitting under a foreign session's tree, are both
+  // unresolved -- restart-ledger then walks it if the parent's ledger says it is still
+  // running, and skips it if that ledger says it finished.
   const resolveChild = (id, parentFile) => {
-    const child = path.join(path.dirname(parentFile), path.basename(parentFile, '.jsonl'), 'subagents', `agent-${id}.jsonl`);
-    if (!sessionTree || !within(sessionTree.source, child)) {
-      throw failure('Claude child artifact escapes its stopped session tree', 'KEEP_ARTIFACT_ESCAPE');
-    }
-    return child;
+    const child = childTranscripts.resolveClaudeChild(id, parentFile, { configDir: plan.sourceRoot });
+    return child && treeHolding(sessionTrees, child) ? child : null;
   };
   const ledger = options.restartLedger || require('./restart-ledger');
   let recovering;
@@ -463,9 +510,9 @@ function rebindLedger(sessionId, source, target, transactionId, options = {}) {
   unchanged();
   completedPlan(sessionId, source, target, transactionId, options);
   const transcript = plan.artifacts.find((entry) => entry.kind === 'transcript');
-  const sessionTree = plan.artifacts.find((entry) => entry.kind === 'session');
+  const sessionTrees = plan.artifacts.filter((entry) => entry.kind === 'session');
   const rebind = options.rebindSource || require('./background-jobs').rebindSource;
-  const rebound = [], visiting = new Set();
+  const rebound = [], skippedChildren = [], visiting = new Set();
   function visit(id, sourceFile, targetFile, depth) {
     if (!/^[A-Za-z0-9_-]+$/.test(id) || depth > 8 || visiting.has(id) || rebound.length >= 128) {
       throw failure('Claude child ledger graph is unverified', 'KEEP_ARTIFACT_LEDGER');
@@ -480,23 +527,33 @@ function rebindLedger(sessionId, source, target, transactionId, options = {}) {
     // untouched rather than stranding a half-rebound transaction.
     if (options.force === true) { visiting.delete(id); return; }
     for (const child of result.children || []) {
-      if (!sessionTree?.sourceManifest || !sessionTree?.targetManifest) {
+      const childSource = childTranscripts.resolveClaudeChild(child, sourceFile, { configDir: plan.sourceRoot });
+      const tree = childSource ? treeHolding(sessionTrees, childSource) : null;
+      // A child whose transcript is nowhere in the source profile, or which sits under
+      // a foreign session's tree this transaction does not move, has no ledger to
+      // rebind. The parent's own ledger decides: a finished agent is recorded and
+      // skipped, a live one is a transfer that would leave work behind.
+      if (!tree) {
+        const reason = childSource ? 'transcript outside the session trees' : 'transcript is missing';
+        if (!TERMINAL_JOBS.has(childJobStatus(plan.root, id, child))) {
+          throw failure(childSource ? 'Claude child transcript lives outside the session trees'
+            : 'Claude child transcript is missing', 'KEEP_ARTIFACT_ESCAPE');
+        }
+        skippedChildren.push({ sessionId: child, reason });
+        continue;
+      }
+      if (!tree.sourceManifest || !tree.targetManifest) {
         throw failure('Claude child artifacts are unavailable', 'KEEP_ARTIFACT_LEDGER');
       }
-      const childSource = path.join(path.dirname(sourceFile), path.basename(sourceFile, '.jsonl'), 'subagents', `agent-${child}.jsonl`);
-      const relative = path.relative(sessionTree.source, childSource);
-      if (!within(sessionTree.source, childSource) || relative === '' || path.isAbsolute(relative)) {
-        throw failure('Claude child artifact escapes its session tree', 'KEEP_ARTIFACT_ESCAPE');
-      }
-      const childTarget = path.join(sessionTree.target, relative);
-      if (!within(sessionTree.target, childTarget)) throw failure('Claude target child artifact escapes its session tree', 'KEEP_ARTIFACT_ESCAPE');
+      const childTarget = path.join(tree.target, path.relative(tree.source, childSource));
+      if (!within(tree.target, childTarget)) throw failure('Claude target child artifact escapes its session tree', 'KEEP_ARTIFACT_ESCAPE');
       visit(child, childSource, childTarget, depth + 1);
     }
     visiting.delete(id);
   }
   visit(sessionId, transcript.source, transcript.target, 0);
   completedPlan(sessionId, source, target, transactionId, options);
-  return { ...publicPlan(plan), rebound };
+  return { ...publicPlan(plan), rebound, ...(skippedChildren.length ? { skippedChildren } : {}) };
 }
 
 module.exports = { preflight, copyClaudeArtifacts, rebindLedger };
