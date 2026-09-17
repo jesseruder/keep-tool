@@ -4847,21 +4847,32 @@ test('typing exit confirms the prompt above a tall Claude slash-command menu', a
 // One harness for the three ways typing into a live pane can go wrong after the
 // text is in the box. `screen` is whatever the pane shows when it is read back.
 // The host counts every input request that reaches the pane, so the harness's own
-// record of them is its inputCount; `extraInputs` stands in for somebody else typing
-// into the same pane, and is added to the count the pane reports from then on.
-function draftHarness(screen, extraInputs = () => 0) {
+// record of them plus `foreign.count` — somebody else typing at the same pane — is
+// the inputCount it reports, and it honours a conditional write exactly as the host
+// does: a count that no longer agrees writes nothing and bumps nothing. `onEvent` is
+// called as each request arrives, which is where a test puts a keystroke into the one
+// gap it wants to reproduce.
+function draftHarness(screen, onEvent = () => {}) {
   const inputs = [];
   const events = [];
+  const foreign = { count: 0 };
+  const count = () => inputs.length + foreign.count;
   const host = recordingHost(async (type, params) => {
+    onEvent(type, { inputs, foreign });
     if (type === 'screen') return { text: typeof screen === 'function' ? screen(inputs) : screen };
-    if (type === 'input') inputs.push(Buffer.from(params.data, 'base64').toString());
+    if (type === 'input') {
+      if (params.expectedInputCount !== undefined && count() !== params.expectedInputCount) {
+        return { dropped: true, reason: 'input arrived', inputCount: count() };
+      }
+      inputs.push(Buffer.from(params.data, 'base64').toString());
+    }
     return {};
   });
   return {
-    inputs, events, host,
+    inputs, events, host, foreign,
     deps: {
       host, sleep: async () => {}, draftKind: 'claude',
-      listHostPanes: async () => [{ id: 'p', inputCount: inputs.length + extraInputs(inputs) }],
+      listHostPanes: async () => [{ id: 'p', inputCount: count() }],
       deliveryTrace: (stage, fields) => events.push({ stage, ...fields }),
     },
   };
@@ -4997,29 +5008,41 @@ test('a draft is only reported cleared when nobody else typed while it was being
   // keystroke that reaches the pane, so the count is what decides.
   const escapes = (inputs) => inputs.filter((value) => value === '\x1b').length;
   const menuScreen = (inputs) => (escapes(inputs) === 0 ? MENU('/exit') : escapes(inputs) === 1 ? BOX('/exit') : BOX(''));
-  const run = async (extraInputs) => {
-    const harness = draftHarness(menuScreen, extraInputs);
+  const run = async (screen, onEvent) => {
+    const harness = draftHarness(screen, onEvent);
     const error = await typeAndSubmit({ pane: 'p' }, '/exit', () => false, {
       ...harness.deps, discardDraftOnAbort: true,
     }).then(() => null, (e) => e);
     return { harness, error, escapes: escapes(harness.inputs) };
   };
 
-  // His keystroke lands between the first Escape's count and the second: the second
-  // Escape is never pressed at all.
-  let between = 0;
-  const gap = await run(() => (++between > 2 ? 1 : 0));
-  assert.equal(gap.error.message, 'message was typed but could not be confirmed; Enter was not pressed');
-  assert.equal(gap.error.draftLeftOnScreen, true);
-  assert.equal(gap.error.draftReason, 'input arrived');
-  assert.equal(gap.escapes, 1, 'the second Escape is not pressed into text somebody else is writing');
+  // His keystroke lands after the count was read and before our Escape reaches the
+  // pane — the gap this process cannot check for itself. The count travels with the
+  // keystroke, so the host refuses the write and nothing of ours is typed at all.
+  const dropped = await run(menuScreen, (type, { inputs, foreign }) => {
+    if (type === 'input' && inputs.length >= 1) foreign.count = 1;
+  });
+  assert.equal(dropped.error.message, 'message was typed but could not be confirmed; Enter was not pressed');
+  assert.equal(dropped.error.draftLeftOnScreen, true);
+  assert.equal(dropped.error.draftReason, 'input arrived');
+  assert.equal(dropped.escapes, 0, 'the refused write typed nothing');
 
-  // And when it lands around the second Escape itself, the box is empty afterwards —
-  // and it is still not reported cleared, because his Enter may have sent a turn.
-  let late = 0;
-  const raced = await run(() => (++late > 3 ? 1 : 0));
+  // The same, one round trip later: the menu-closing Escape lands, and his key arrives
+  // before the second one. The second Escape carries its own count and is refused too.
+  const second = await run(menuScreen, (type, { inputs, foreign }) => {
+    if (type === 'input' && escapes(inputs) === 1) foreign.count = 1;
+  });
+  assert.equal(second.error.draftReason, 'input arrived');
+  assert.equal(second.escapes, 1, 'only the first Escape was written');
+
+  // And an Enter landing between the screen read and the count taken after it: the box
+  // reads empty, and it is still not reported cleared, because that Enter may have
+  // sent a turn rather than left a box our Escape emptied.
+  const raced = await run(CLEARABLE('/exit'), (type, { inputs, foreign }) => {
+    if (type === 'screen' && inputs.includes('\x1b')) foreign.count = 1;
+  });
   assert.equal(raced.error.draftReason, 'input arrived');
-  assert.equal(raced.escapes, 2);
+  assert.equal(raced.escapes, 1);
   assert.ok(raced.harness.events.some((e) => e.stage === 'enter-aborted' && e.cleared === false && e.reason === 'input arrived'));
 
   // A count that cannot be read at all presses nothing: an Escape this could not

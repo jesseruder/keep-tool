@@ -872,6 +872,18 @@ function createHost(options = {}) {
       case 'input': {
         const pane = needPane(params.pane);
         if (!pane.alive) throw new Error('pane has exited');
+        // An optional guard for a keystroke that is only safe to send while nothing
+        // else has typed into the pane. A caller cannot do this for itself: it would
+        // read the count, and a viewer's key could still land before its own write
+        // arrived. Here the compare and the write are one step in the single process
+        // that owns the counter, so nothing can slip between them. Without the
+        // parameter this is the ordinary unconditional write it has always been.
+        if (params.expectedInputCount !== undefined) {
+          if (!Number.isInteger(params.expectedInputCount)) throw new Error('expectedInputCount must be an integer');
+          if (pane.inputCount !== params.expectedInputCount) {
+            return { result: { dropped: true, reason: 'input arrived', inputCount: pane.inputCount } };
+          }
+        }
         const attachment = pane.attachments.get(connection);
         if (params.auto === true) {
           if (!attachment || pane.primary !== attachment.viewer) {

@@ -1775,21 +1775,34 @@ async function readScreen(target, lines, scrollback, deps = {}) {
   return String(screen && screen.text || '');
 }
 
-async function writeTarget(target, value, deps = {}) {
+// `expectedInputCount` makes the write conditional: the host compares it with the
+// pane's own input counter and writes only if they still agree, in one step, so a
+// keystroke from a viewer cannot land between the check and the write. A refused
+// write typed nothing at all, which is what inputDropped says.
+async function writeTarget(target, value, deps = {}, options = {}) {
   if (!isHostTarget(target)) throw new Error('terminal target needs a host pane');
-  await hostRequest('input', {
+  const expected = options.expectedInputCount;
+  const result = await hostRequest('input', {
     pane: target.pane,
     data: Buffer.from(String(value), 'utf8').toString('base64'),
+    ...(expected === undefined ? {} : { expectedInputCount: expected }),
   }, deps);
+  if (result && result.dropped) {
+    const error = new Error('input arrived on the pane before this keystroke; nothing was typed');
+    error.inputDropped = true;
+    error.inputCount = Number.isInteger(result.inputCount) ? result.inputCount : null;
+    throw error;
+  }
+  return result;
 }
 
-async function pressTargetKey(target, key, deps = {}) {
+async function pressTargetKey(target, key, deps = {}, options = {}) {
   const named = {
     Enter: '\r', enter: '\r', Escape: '\x1b', escape: '\x1b', Backspace: '\x7f', backspace: '\x7f',
   };
   const value = Object.prototype.hasOwnProperty.call(named, key) ? named[key] : String(key);
   if (Array.from(value).length !== 1) throw new Error(`unsupported terminal key ${key}`);
-  return writeTarget(target, value, deps);
+  return writeTarget(target, value, deps, options);
 }
 
 function loadInjectionSession(id) {
@@ -2257,16 +2270,18 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
   // The pane's own input counter. The host raises it for every keystroke that reaches
   // the pane — a viewer's exactly as much as this daemon's — so it is the only thing
   // that can tell a box which emptied because of our Escape from one which emptied
-  // because Owner was typing in the same gap. An empty box is not proof: he can append
-  // a word, and the next Escape wipes his text with ours leaving nothing to see; he can
-  // press Enter, and the box is empty because a turn was sent.
+  // because Owner was typing at the same moment. An empty box is not proof: he can
+  // append a word, and the next Escape wipes his text with ours leaving nothing to
+  // see; he can press Enter, and the box is empty because a turn was sent.
   //
-  // So every Escape is bracketed by a count and "cleared" is claimed only when the
-  // count moved by exactly our own keys. The gap between reading the count and pressing
-  // the key cannot be closed — it is inherent to typing into a terminal somebody else
-  // is sitting at, and the same gap sits between the unchanged({ expectedInputCount })
-  // before Enter and the Enter itself. What the bracket buys is that a keystroke which
-  // did land in that gap is never reported as our clean clear.
+  // Two different gaps, closed two different ways. Between reading the count and our
+  // key reaching the pane there is nothing this process can check, so it does not try:
+  // the count travels with the keystroke and the host, which owns the counter, refuses
+  // the write if anything has typed since. And between our key and the screen this
+  // reads back afterwards, the count is taken once more — a screen read that spans
+  // somebody else's keystroke says nothing about what our Escape did, whatever it
+  // shows. "Cleared" is claimed only for an empty box whose count moved by exactly our
+  // own keys.
   const countInputs = async () => {
     try {
       const panes = await (deps.listHostPanes || listHostPanes)(deps, true);
@@ -2290,33 +2305,30 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
   // "cleared" is a claim about the session, so it is only made when the box is
   // actually empty. Twice at most, because a Claude slash draft has its command menu
   // open below the box and the first Escape may close only that menu. The second one
-  // is pressed only while the box still holds exactly what was typed and the count has
-  // not moved since — the menu-closing Escape and its read-back are a whole round trip
-  // in which Owner could have started typing.
+  // carries its own expected count, so it is refused by the host rather than typed
+  // into text somebody started writing during the first round trip.
   let after = screen;
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    if (attempt > 0) {
-      if (!draftIsExactly(after, text, kind)) break;
-      const between = await countInputs();
-      if (between === null) return unverified();
-      if (between !== count) return arrived();
-    }
+    if (attempt > 0 && !draftIsExactly(after, text, kind)) break;
     try {
-      await pressTargetKey(target, 'Escape', deps);
+      await pressTargetKey(target, 'Escape', deps, { expectedInputCount: count });
     } catch (error) {
+      if (error && error.inputDropped) return arrived();
       write(`keep serve: could not clear an aborted draft on pane ${pane}: ${String((error && error.message) || error)}\n`);
       return { cleared: false, reason: 'escape failed' };
     }
-    const counted = await countInputs();
-    if (counted === null) return unverified();
-    if (counted !== count + 1) return arrived();
-    count = counted;
     try {
       after = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false);
     } catch (error) {
       write(`keep serve: could not confirm the cleared draft on pane ${pane}: ${String((error && error.message) || error)}\n`);
       return { cleared: false, reason: 'unconfirmed clear' };
     }
+    // After the read, not before it: this is what says the screen just read is a
+    // screen only our own Escape changed.
+    const counted = await countInputs();
+    if (counted === null) return unverified();
+    if (counted !== count + 1) return arrived();
+    count = counted;
     if (draftRegionText(after, kind) === '') return { cleared: true, reason: null };
   }
   write(`keep serve: the draft on pane ${pane} is still there after Escape\n`);

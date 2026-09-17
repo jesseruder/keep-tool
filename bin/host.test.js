@@ -910,6 +910,47 @@ test('a host handoff cancels primary grace timers', async () => {
   }
 });
 
+test('a conditional input writes only while the pane has taken no other keystroke', async () => {
+  await withHost({}, async ({ client }) => {
+    const { pane } = await client.request('spawn', {
+      cmd: '/bin/sh',
+      args: ['-c', "stty -echo; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done"],
+    });
+    const countOf = async () => (await client.request('get', { pane: pane.id })).pane.inputCount;
+    const start = await countOf();
+
+    // The count still agrees, so the write happens and the counter moves with it.
+    assert.deepEqual(await client.request('input', {
+      pane: pane.id, data: Buffer.from('first\n').toString('base64'), expectedInputCount: start,
+    }), {});
+    await waitFor(async () => (await client.request('screen', { pane: pane.id })).text.includes('got:first'), 'conditional input');
+    assert.equal(await countOf(), start + 1);
+
+    // Somebody else typed since. Nothing reaches the pty and the counter does not move,
+    // so a caller is never told its keystroke landed when it did not.
+    const dropped = await client.request('input', {
+      pane: pane.id, data: Buffer.from('second\n').toString('base64'), expectedInputCount: start,
+    });
+    assert.deepEqual(dropped, { dropped: true, reason: 'input arrived', inputCount: start + 1 });
+    assert.equal(await countOf(), start + 1, 'a refused write bumps nothing');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal((await client.request('screen', { pane: pane.id })).text.includes('got:second'), false,
+      'and writes nothing');
+
+    // An unconditional write is untouched by any of this.
+    assert.deepEqual(await client.request('input', {
+      pane: pane.id, data: Buffer.from('third\n').toString('base64'),
+    }), {});
+    await waitFor(async () => (await client.request('screen', { pane: pane.id })).text.includes('got:third'), 'unconditional input');
+    assert.equal(await countOf(), start + 2);
+
+    await assert.rejects(client.request('input', {
+      pane: pane.id, data: Buffer.from('x').toString('base64'), expectedInputCount: 'many',
+    }), /expectedInputCount must be an integer/);
+    await client.request('kill', { pane: pane.id });
+  });
+});
+
 test('automatic input is accepted only from the attached primary and never claims an owner-less pane', async () => {
   await withHost({}, async ({ client, sock }) => {
     const observer = await connect({ sock });
