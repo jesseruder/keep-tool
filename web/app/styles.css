@@ -189,6 +189,9 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .account-menu { position: absolute; top: calc(100% + 5px); right: 0; min-width: 190px; padding: 6px; display: flex; flex-direction: column; gap: 4px; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 6px; box-shadow: var(--shadow); z-index: 25; }
 .account-menu .btn { justify-content: space-between; width: 100%; }
 .account-menu .btn small { color: var(--faint); font-size: 10px; }
+.bulk-handoff { display: flex; flex-direction: column; gap: 4px; }
+.bulk-handoff .btn { justify-content: space-between; width: 100%; text-align: left; }
+.bulk-handoff .btn small { color: var(--faint); font-size: 10px; }
 .session-actions { position: relative; }
 .session-actions > summary { list-style: none; cursor: pointer; white-space: nowrap; }
 .session-actions > summary::-webkit-details-marker { display: none; }
@@ -199,7 +202,7 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .session-actions-content > .btn, .session-actions-content > div > .btn,
 .session-actions-content .account-handoff > summary { width: 100%; justify-content: space-between; padding: 6px 8px; text-align: left; }
 .session-actions-content .portable-transfer-controls, .session-actions-content .account-controls,
-.session-actions-content .restart-controls { display: contents; }
+.session-actions-content .bulk-handoff, .session-actions-content .restart-controls { display: contents; }
 .session-actions-content .account-menu { position: static; min-width: 0; margin-top: 4px; box-shadow: none; }
 .session-actions-content .handoff-status, .session-actions-content .handoff-error,
 .session-actions-content .restart-reason, .session-actions-content .portable-transfer-state { padding: 4px 8px; white-space: normal; }
