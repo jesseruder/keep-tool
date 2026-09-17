@@ -2,5 +2,6 @@
   "kind": "folder-trust",
   "highlighted": 1,
   "live": true,
-  "heading": "Do you trust the files in this folder?"
+  "heading": "Do you trust the files in this folder?",
+  "answerable": false
 }

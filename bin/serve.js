@@ -2595,8 +2595,7 @@ function modelSwitchConfirmed(screen, command) {
 // UI — see bin/claude-prompts.js for what "live" costs and why a block is matched rather
 // than the viewport.
 function worktreeExitPromptKeepsWorktree(screenText) {
-  const dialog = claudePrompts.recognize(screenText);
-  return Boolean(dialog && dialog.kind === 'worktree-exit' && dialog.live && dialog.highlighted === 1);
+  return claudePrompts.answerable(claudePrompts.recognize(screenText));
 }
 
 // Not a liveness reading: this scans the rows below the last echo of the command that
@@ -3940,7 +3939,7 @@ async function restartSession(body, deps = {}) {
     // all: the pane may become a plain shell mid-wait, and a Codex screen is a different
     // UI with its own prompt, so neither is a place to be typing a blind Enter.
     const answerable = session.kind === 'claude';
-    let promptAnswered = false, screenReadReported = false, promptSkipReported = false;
+    let promptAnswered = false, screenReadReported = false, promptSkipReported = false, refusedKind = null;
     for (let i = 0, limit = 30; i < limit; i++) {
       stopped = (await host('get', { pane: body.pane })).pane;
       if (!restartPaneMatches(pane, stopped, session.id)) throw Error('Session process changed during restart');
@@ -3957,16 +3956,21 @@ async function restartSession(body, deps = {}) {
           }
         };
         const dialogOf = async () => claudePrompts.recognize(String((await read())?.text || ''));
-        const keepsWorktree = (dialog) => Boolean(dialog && dialog.kind === 'worktree-exit'
-          && dialog.live && dialog.highlighted === 1);
         const dialog = await dialogOf();
         // Any other modal owning the pane is a question only Owner may answer, and the
         // /exit is parked behind it: waiting out the loop would end in a timeout that
-        // names nothing. Fail now, and name the dialog.
-        if (dialog && dialog.live && claudePrompts.policyFor(dialog.kind).action === 'refuse') {
-          throw Error(`Claude Code is showing the ${claudePrompts.refusalLabel(dialog)} dialog; answer it in the pane before restarting`);
+        // names nothing. One frame is not a parked session, though — Owner may be
+        // answering it as this reads, and a repaint can catch a dialog on its way out —
+        // so the refusal needs the same dialog still live on a later poll, and the pause
+        // below puts that poll far enough away (>300ms, plus the loop's own) to mean it.
+        const refusing = dialog && dialog.live
+          && claudePrompts.policyFor(dialog.kind).action === 'refuse' ? dialog : null;
+        if (refusing && refusedKind === refusing.kind) {
+          throw Error(`Claude Code is showing the ${claudePrompts.refusalLabel(refusing)} dialog; answer it in the pane before restarting`);
         }
-        if (keepsWorktree(dialog)) {
+        if (refusing) await sleep(300);
+        refusedKind = refusing && refusing.kind || null;
+        if (claudePrompts.answerable(dialog)) {
           // The snapshot is already stale by the time it is read. Between it and the
           // write the agent can exit — its own exit finishing, or Owner answering the
           // modal himself — and the pane's root pid does not change when it falls back
@@ -3976,8 +3980,8 @@ async function restartSession(body, deps = {}) {
           // waiting either way, and the next poll reads the pane as dead or a shell.
           const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
           const owner = rows.find((p) => p.pid === originalIdentity.pid && p.pidStart === originalIdentity.pidStart);
-          if (owner && keepsWorktree(await dialogOf())) {
-            await writeTarget({ pane: body.pane }, '\r', deps);
+          if (owner && claudePrompts.answerable(await dialogOf())) {
+            await writeTarget({ pane: body.pane }, claudePrompts.policyFor(dialog.kind).key, deps);
             promptAnswered = true;
             limit = 75;
             process.stderr.write(`keep serve: accepted "Keep worktree" for ${session.id} during graceful exit\n`);
@@ -5167,7 +5171,7 @@ async function waitForHostAgent(target, agent, deps = {}) {
   const now = deps.now || Date.now;
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const deadline = now() + AGENT_PROMPT_TIMEOUT_MS;
-  let screen = '';
+  let screen = '', refusedDialog = null;
   while (now() < deadline) {
     try { screen = await readScreen(target, 30, false, deps); } catch { screen = ''; }
     if (agentPromptVisible(agent, screen)) return true;
@@ -5188,11 +5192,18 @@ async function waitForHostAgent(target, agent, deps = {}) {
     // message about an empty prompt.
     if (agent === 'claude') {
       const dialog = claudePrompts.recognize(stripTerminalAnsi(screen));
-      if (dialog && dialog.live && claudePrompts.policyFor(dialog.kind).action === 'refuse') {
-        throw new InjectionError(409, `Claude Code is showing the ${claudePrompts.refusalLabel(dialog)} dialog in ${target.pane}; message not sent`, {
+      const refusing = dialog && dialog.live
+        && claudePrompts.policyFor(dialog.kind).action === 'refuse' ? dialog : null;
+      // Two reads a poll apart, or none: a single frame can catch a dialog Owner is
+      // already dismissing, and that wait used to finish on the next poll.
+      if (refusing && refusedDialog && refusedDialog.kind === refusing.kind
+          && now() - refusedDialog.at >= 300) {
+        throw new InjectionError(409, `Claude Code is showing the ${claudePrompts.refusalLabel(refusing)} dialog in ${target.pane}; message not sent`, {
           screenTail: screenTail(screen),
         });
       }
+      if (!refusing) refusedDialog = null;
+      else if (!refusedDialog || refusedDialog.kind !== refusing.kind) refusedDialog = { kind: refusing.kind, at: now() };
     }
     await sleep(Math.min(500, Math.max(0, deadline - now())));
   }

@@ -2,5 +2,6 @@
   "kind": "unknown",
   "highlighted": 1,
   "live": true,
-  "heading": "Rewind to a previous checkpoint?"
+  "heading": "Rewind to a previous checkpoint?",
+  "answerable": false
 }

@@ -1,7 +1,7 @@
 {
-  "kind": "worktree-exit",
+  "kind": "unknown",
   "highlighted": 1,
-  "live": false,
+  "live": true,
   "heading": "Exiting worktree session",
   "answerable": false
 }

@@ -8137,13 +8137,13 @@ test('a graceful exit answers the worktree exit prompt once and only for Keep wo
   ].join('\n');
   // `deadAfter` is how many turns of the wait the pane survives the typed /exit: the modal
   // holds it open until the Enter lands, and Infinity is the prompt nobody ever answers.
-  const scenario = ({ highlighted, deadAfter, kind = 'claude', vanishOnModal = false, screen = null }) => {
+  const scenario = ({ highlighted, deadAfter, kind = 'claude', vanishOnModal = false, screens = null }) => {
     const command = kind === 'codex' ? '/test/codex resume wt' : '/test/claude --resume wt';
     const session = { id: 'wt', kind, state: 'idle', endedTurn: true, project: root };
     let pane = { id: 'p', pid: 10, cmd: '/bin/zsh', args: ['-l'], alive: true, attached: 0, visibleAttached: 0,
       cols: 200, rows: 50, meta: { sessionId: 'wt', agent: kind } };
     const row = { pid: 11, ppid: 10, pidStart: 'Tue Sep  8 10:00:00 2026', agent: kind, interactive: true, args: command };
-    const state = { waits: 0, sent: [], exited: false, replaced: null };
+    const state = { waits: 0, reads: 0, sent: [], exited: false, replaced: null };
     const deps = {
       root, env: { KEEP_DIR: root, KEEP_CONFIG: accountConfig }, withInjectionLock: (fn) => fn(),
       buildState: async () => ({ sessions: [session], tasks: [] }),
@@ -8159,7 +8159,10 @@ test('a graceful exit answers the worktree exit prompt once and only for Keep wo
         // The agent can exit between the snapshot and the answer — Owner answering the
         // modal himself looks exactly like this.
         if (vanishOnModal) state.exited = true;
-        return { text: screen || modal(highlighted), cursor: { x: 0, y: 3 } };
+        // A sequence plays one screen per read and then holds on the last one.
+        const text = screens ? screens[Math.min(state.reads, screens.length - 1)] : modal(highlighted);
+        state.reads += 1;
+        return { text, cursor: { x: 0, y: 3 } };
       },
       waitForHostAgent: async () => {},
       host: { request: async (type, params) => {
@@ -8216,34 +8219,64 @@ test('a graceful exit answers the worktree exit prompt once and only for Keep wo
     // Another modal has the pane, and it is not one Keep may answer: the /exit is parked
     // behind a question only Owner can settle, so the restart fails now, by name, rather
     // than waiting out the loop and reporting that the exit did not finish.
-    const trust = scenario({ highlighted: 1, deadAfter: Infinity, screen: [
+    const folderTrust = [
       '  Quick safety check: Is this a project you created or one you trust?',
       '',
       '    1. Yes, I trust this folder',
       '  ❯ 2. No, exit',
       '',
       '  Enter to confirm · Esc to exit',
-    ].join('\n') });
+    ].join('\n');
+    const trust = scenario({ highlighted: 1, deadAfter: Infinity, screens: [folderTrust] });
     await assert.rejects(trust.run(), /Claude Code is showing the folder trust dialog; answer it in the pane before restarting/);
     assert.deepEqual(trust.state.sent, [], 'no key is ever sent to a dialog Keep does not own');
-    assert.equal(trust.state.waits, 0, 'the refusal is immediate');
+    assert.equal(trust.state.waits, 2, 'one sighting waits; the second refuses');
+
+    // One frame is not a parked session: Owner answering the dialog, or a repaint caught
+    // mid-draw, leaves the next poll with a prompt, and the exit finishes as it always did.
+    const answered = scenario({ highlighted: 1, deadAfter: 3, screens: [folderTrust, '────────────────────\n❯ '] });
+    const finished = await answered.run();
+    assert.equal(finished.sessionId, 'wt');
+    assert.deepEqual(answered.state.sent, []);
 
     // A dialog nobody has taught Keep about is still refused, and carries its heading.
-    const unknown = scenario({ highlighted: 1, deadAfter: Infinity, screen: [
+    const unknown = scenario({ highlighted: 1, deadAfter: Infinity, screens: [[
       '  Rewind to a previous checkpoint?',
       '',
       '  ❯ 1. Conversation and code',
       '    2. Conversation only',
       '',
       '  Enter to confirm · Esc to cancel',
-    ].join('\n') });
+    ].join('\n')] });
     await assert.rejects(unknown.run(), /showing the unrecognized "Rewind to a previous checkpoint\?" dialog/);
     assert.deepEqual(unknown.state.sent, []);
+
+    // The same heading with the options renumbered is not the dialog Keep answers: "1."
+    // is the option that destroys the work, so it is refused, not pressed.
+    const swapped = scenario({ highlighted: 1, deadAfter: Infinity, screens: [[
+      '  Exiting worktree session',
+      '  You have 4 uncommitted files. These will be lost if you remove the worktree.',
+      '',
+      '  ❯ 1. Remove worktree  All changes and commits will be lost.',
+      '    2. Keep worktree    Stays at /tmp/wt',
+      '',
+      '  Enter to confirm · Esc to cancel',
+    ].join('\n')] });
+    await assert.rejects(swapped.run(), /showing the unrecognized "Exiting worktree session" dialog/);
+    assert.deepEqual(swapped.state.sent, [], 'the renumbered option list is never answered');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('a live Claude Code dialog ends the opening wait by name instead of timing out', async () => {
-  const dialog = (rows) => ({ host: { request: async (type) => { assert.equal(type, 'screen'); return { text: rows.join('\n') }; } } });
+  const dialog = (...frames) => {
+    let read = 0;
+    return { host: { request: async (type) => {
+      assert.equal(type, 'screen');
+      const rows = frames[Math.min(read, frames.length - 1)];
+      read += 1;
+      return { text: rows.join('\n') };
+    } } };
+  };
   const clock = (host) => { let now = 0; return { ...host, now: () => now, sleep: async (ms) => { now += ms; } }; };
   const trust = [
     '  Do you trust the files in this folder?',
@@ -8271,6 +8304,10 @@ test('a live Claude Code dialog ends the opening wait by name instead of timing 
   // goes on, and the ordinary timeout still says what it always said.
   await assert.rejects(waitForHostAgent({ pane: 'pane-dialog' }, 'claude', clock(dialog([...trust, '', '❯ ']))),
     (error) => error.status === 504 && /never showed an empty prompt/.test(error.message));
+  // One frame showing a dialog is not a refusal: Owner may be answering it as this reads,
+  // and the next poll finds the prompt the message was waiting for.
+  assert.equal(await waitForHostAgent({ pane: 'pane-dialog' }, 'claude',
+    clock(dialog(trust, ['────────────────────', '❯']))), true);
   // Claude Code's dialogs are not read off a Codex pane.
   await assert.rejects(waitForHostAgent({ pane: 'pane-dialog' }, 'codex', clock(dialog(trust))),
     (error) => error.status === 504);

@@ -29,17 +29,23 @@ function normalizedText(value) {
 }
 
 // Known dialogs. `heading` anchors the block (it is what "the nearest heading above"
-// means for a dialog we know); `options` must all match some option in the block, or the
-// block is well formed but not this dialog and falls back to 'unknown'. `signals` is the
-// looser text-only reading, for the one caller that needs to see a dialog whose footer
-// has not rendered yet — see showsDialog.
+// means for a dialog we know). `options` is positional and binds numbers to text: entry
+// i must be option i + 1, or the block is well formed but is not this dialog and falls
+// back to 'unknown'. Positional is the point — an option list Claude Code renders in
+// another order is a dialog whose numbers mean something else, and reading "1." as the
+// safe answer there is how an Enter deletes a worktree. Options past the list are free.
+// `answer` is the text the highlighted option must have before Keep may press `key`;
+// `signals` is the looser text-only reading, for the one caller that needs to see a
+// dialog whose footer has not rendered yet — see showsDialog.
 const DIALOGS = [
   {
     kind: 'worktree-exit',
     heading: /Exiting worktree session/i,
     options: [/^Keep worktree\b/i, /^Remove worktree\b/i],
     signals: [/Exiting worktree session/i],
-    // The only dialog Keep ever answers, and only on the option that destroys nothing.
+    // The only dialog Keep ever answers, and only on the option that destroys nothing —
+    // which is the one whose *text* keeps the worktree, never a number on its own.
+    answer: /^Keep worktree\b/i,
     policy: { action: 'answer', key: '\r', label: 'worktree exit' },
   },
   {
@@ -67,6 +73,18 @@ const UNKNOWN_POLICY = { action: 'refuse', label: 'unrecognized' };
 function policyFor(kind) {
   const known = DIALOGS.find((dialog) => dialog.kind === kind);
   return { ...(known ? known.policy : UNKNOWN_POLICY) };
+}
+
+// May Keep press this dialog's key? A kind with an answer policy is not enough: the
+// answer is one option's text, and the recognized block has to be showing it highlighted,
+// live, right now. Everything else — a refuse policy, a dead copy in scrollback, the
+// destructive option highlighted, a renumbered option list — is Owner's to answer.
+function answerable(match) {
+  if (!match || !match.live) return false;
+  const known = DIALOGS.find((dialog) => dialog.kind === match.kind);
+  if (!known || known.policy.action !== 'answer') return false;
+  const option = (match.options || []).find((candidate) => candidate.number === match.highlighted);
+  return Boolean(option && known.answer.test(option.text));
 }
 
 // What a refusal calls the dialog. An unrecognized one is only identifiable by its
@@ -130,7 +148,11 @@ function blockAt(lines, index) {
   }
   if (!options.length) return null;
 
-  const named = dialog && dialog.options.every((pattern) => options.some((option) => pattern.test(option.text)));
+  const byNumber = new Map(options.map((option) => [option.number, option]));
+  const named = dialog && dialog.options.every((pattern, i) => {
+    const option = byNumber.get(i + 1);
+    return Boolean(option && pattern.test(option.text));
+  });
   return {
     kind: named ? dialog.kind : 'unknown',
     heading: lines[heading],
@@ -175,4 +197,4 @@ function showsDialog(kind, screenText) {
   return known.signals.some((pattern) => lines.some((line) => pattern.test(line)));
 }
 
-module.exports = { KINDS, recognize, policyFor, refusalLabel, showsDialog, normalizedText };
+module.exports = { KINDS, recognize, policyFor, answerable, refusalLabel, showsDialog, normalizedText };

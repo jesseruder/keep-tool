@@ -2,5 +2,6 @@
   "kind": "folder-trust",
   "highlighted": 2,
   "live": true,
-  "heading": "Quick safety check: Is this a project you created or one you trust?"
+  "heading": "Quick safety check: Is this a project you created or one you trust?",
+  "answerable": false
 }

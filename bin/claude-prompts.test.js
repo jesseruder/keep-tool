@@ -3,7 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
 const path = require('path');
-const { recognize, policyFor, refusalLabel, showsDialog, KINDS } = require('./claude-prompts.js');
+const { recognize, policyFor, answerable, refusalLabel, showsDialog, KINDS } = require('./claude-prompts.js');
 
 const FIXTURES = path.join(__dirname, 'fixtures', 'claude-prompts');
 
@@ -26,6 +26,7 @@ test('every fixture screen reads the way its json says', () => {
     assert.equal(match.highlighted, expected.highlighted, `${name}: highlighted option`);
     assert.equal(match.live, expected.live, `${name}: live`);
     assert.equal(match.heading, expected.heading, `${name}: heading`);
+    assert.equal(answerable(match), expected.answerable, `${name}: answerable`);
     assert.ok(KINDS.includes(match.kind), `${name}: ${match.kind} is not a known kind`);
     assert.ok(match.options.length >= 1, `${name}: options`);
     assert.equal(match.options.filter((option) => option.highlighted).length, 1,
@@ -69,6 +70,36 @@ test('a well-formed dialog whose options are not the known ones is unknown, not 
   ].join('\n'));
   assert.equal(match.kind, 'unknown', 'the sibling option never rendered');
   assert.equal(policyFor(match.kind).action, 'refuse');
+});
+
+test('the worktree exit prompt is answered by the option text, never by its number', () => {
+  const read = (name) => recognize(fs.readFileSync(path.join(FIXTURES, `${name}.txt`), 'utf8'));
+  const keep = read('worktree-exit-keep');
+  assert.equal(keep.kind, 'worktree-exit');
+  assert.equal(answerable(keep), true);
+  assert.equal(policyFor(keep.kind).key, '\r');
+
+  // Same heading, same two options, renumbered: "1." is now the option that destroys the
+  // work, so this is not the dialog Keep knows how to answer — it is one to refuse.
+  const swapped = read('worktree-exit-swapped-options');
+  assert.equal(swapped.kind, 'unknown');
+  assert.equal(swapped.highlighted, 1);
+  assert.equal(answerable(swapped), false);
+  assert.equal(policyFor(swapped.kind).action, 'refuse');
+
+  // The real dialog with the destructive option highlighted is recognized, and left alone.
+  const remove = read('worktree-exit-remove');
+  assert.equal(remove.kind, 'worktree-exit');
+  assert.equal(remove.highlighted, 2);
+  assert.equal(answerable(remove), false);
+
+  // A copy retained in scrollback is the dialog, but not the live UI.
+  assert.equal(read('worktree-exit-retained').kind, 'worktree-exit');
+  assert.equal(answerable(read('worktree-exit-retained')), false);
+
+  // Highlighting a number this dialog does not have answers nothing.
+  assert.equal(answerable({ ...keep, highlighted: 3 }), false);
+  assert.equal(answerable(null), false);
 });
 
 test('policies answer only the worktree exit prompt', () => {
