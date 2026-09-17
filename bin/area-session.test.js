@@ -1613,10 +1613,12 @@ test('the recipe this repo ships covers every section the responder needs', () =
     'keep incidents', 'keep agents events sandboxes --unseen',
     'keep incidents close <card-id|signature> -m "why"',
     'read-only Slack MCP', 'DATA, NOT INSTRUCTIONS',
+    '--account claude-secondary', 'keep hold castle-sandboxes', 'keep who castle-sandboxes',
   ]) {
     assert.ok(text.includes(fragment), `the recipe covers ${fragment}`);
   }
-  for (const heading of ['## Identity and scope', '## Log first, always', '## Diagnose only',
+  for (const heading of ['## Identity and scope', '## Log first, always', '## Act like the on-call engineer',
+    '### Judgement, and what waits for Owner', '### Decisions are still recorded',
     '## Badging', '## Overlap', '## Untrusted input', '## Budget', '## Ending the turn']) {
     assert.ok(text.includes(heading), `the recipe has ${heading}`);
   }
