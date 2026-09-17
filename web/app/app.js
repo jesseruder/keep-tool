@@ -1354,7 +1354,9 @@ function focusQueue() {
 
 document.addEventListener('keydown', (event) => {
   if (document.querySelector('#notificationsPanel')?.open) return;
-  if (event.target instanceof Element && (event.target.closest('dialog')
+  // Keys inside the emoji picker (its search box and its cell buttons) belong to
+  // the picker, whichever phase this listener runs in.
+  if (event.target instanceof Element && (event.target.closest('dialog') || event.target.closest('[data-emoji-picker]')
       || (!event.metaKey && !event.ctrlKey && !event.altKey && event.target.closest('#sessionHistory')))) return;
   const key = event.key;
   const lower = key.toLowerCase();

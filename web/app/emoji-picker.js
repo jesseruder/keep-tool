@@ -19,9 +19,6 @@ import { EMOJI } from './emoji-list.js';
 
 const RECENT_KEY = 'keep.console.recentEmoji';
 const RECENT_MAX = 8;
-// A filtered grid longer than this is not a list anyone reads; the search box is
-// the way to the rest.
-const GRID_MAX = 120;
 
 const escapeHTML = (value) => String(value == null ? '' : value)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -41,7 +38,9 @@ export function recentEmoji(storage) {
     if (!Array.isArray(parsed)) return [];
     const recent = [];
     for (const entry of parsed) {
-      if (typeof entry !== 'string' || !entry || recent.includes(entry)) continue;
+      // Only what the picker itself offers: a stored value from another build
+      // or a hand-edited one must not become a selectable, refusable pick.
+      if (typeof entry !== 'string' || !labels.has(entry) || recent.includes(entry)) continue;
       recent.push(entry);
     }
     return recent.slice(0, RECENT_MAX);
@@ -82,7 +81,7 @@ export function pickerHTML(esc = escapeHTML) {
     + `<div class="emoji-picker" data-emoji-picker hidden>`
     + `<input class="emoji-search" data-emoji-search placeholder="${esc('search')}" aria-label="${esc('Search emoji')}">`
     + `<div class="emoji-recent" data-emoji-recent></div>`
-    + `<div class="emoji-grid" data-emoji-grid role="listbox"></div></div>`;
+    + `<div class="emoji-grid" data-emoji-grid role="group" aria-label="${esc('Emoji')}"></div></div>`;
 }
 
 // `host` is the element holding the toggle, the panel and the mark's own emoji
@@ -107,7 +106,7 @@ export function installEmojiPicker(host, options = {}) {
   };
 
   const renderGrid = (query) => {
-    grid.innerHTML = matching(query).slice(0, GRID_MAX).map(([emoji, words]) => cellHTML(emoji, words)).join('');
+    grid.innerHTML = matching(query).map(([emoji, words]) => cellHTML(emoji, words)).join('');
     wireCells(grid);
   };
 
@@ -180,4 +179,8 @@ export function installEmojiPicker(host, options = {}) {
   search.oninput = () => renderGrid(search.value);
   search.onkeydown = onKeyDown;
   panel.onkeydown = onKeyDown;
+  // Cells already on screen (a panel left open across a re-render) take this
+  // install's choose, so a menu rebound to another session writes to that one.
+  wireCells(grid);
+  if (recentBox) wireCells(recentBox);
 }

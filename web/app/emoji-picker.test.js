@@ -105,7 +105,7 @@ test('the closed markup carries the toggle and an empty panel', async () => {
   assert.match(html, /<div class="emoji-picker" data-emoji-picker hidden>/);
   assert.match(html, /<input class="emoji-search" data-emoji-search placeholder="search" aria-label="Search emoji">/);
   assert.match(html, /<div class="emoji-recent" data-emoji-recent><\/div>/);
-  assert.match(html, /<div class="emoji-grid" data-emoji-grid role="listbox"><\/div>/);
+  assert.match(html, /<div class="emoji-grid" data-emoji-grid role="group" aria-label="Emoji"><\/div>/);
   // The grid is filled on open, so the menu's HTML stays short for patchActionsMenu.
   assert.ok(html.length < 500, `the closed markup is small: ${html.length}`);
   assert.equal(html.includes('emoji-cell'), false);
@@ -121,7 +121,7 @@ test('the toggle opens the panel, fills the grid and focuses the search box', as
   assert.equal(host.panel.hidden, false);
   assert.equal(host.toggle.getAttribute('aria-expanded'), 'true');
   assert.equal(host.search.focuses, 1);
-  assert.equal(host.grid.cells.length, 120, 'at most ~120 cells at once');
+  assert.equal(host.grid.cells.length, EMOJI.length, 'the whole list is there to browse; the grid scrolls');
   assert.deepEqual(host.grid.emoji.slice(0, 3), EMOJI.slice(0, 3).map(([emoji]) => emoji));
   assert.equal(host.grid.cell('🔥').getAttribute('title'), 'fire hot burning');
 
@@ -131,6 +131,7 @@ test('the toggle opens the panel, fills the grid and focuses the search box', as
 });
 
 test('the search box filters by words and by the emoji itself', async () => {
+  const { EMOJI } = await import('./emoji-list.js');
   const { host } = await wired();
   host.toggle.click();
   host.search.type('rock');
@@ -147,7 +148,7 @@ test('the search box filters by words and by the emoji itself', async () => {
   assert.deepEqual(host.grid.emoji, [], 'nothing matches nonsense');
 
   host.search.type('');
-  assert.equal(host.grid.cells.length, 120, 'an empty query is the whole list again');
+  assert.equal(host.grid.cells.length, EMOJI.length, 'an empty query is the whole list again');
 });
 
 test('clicking a cell picks it once, records it and closes the panel', async () => {
@@ -224,6 +225,8 @@ test('a corrupt or unreachable storage is an empty list, never a broken picker',
   assert.deepEqual(recentEmoji(fakeStorage('not json at all')), []);
   assert.deepEqual(recentEmoji(fakeStorage('{"nope":1}')), [], 'an object is not a list of recents');
   assert.deepEqual(recentEmoji(fakeStorage('["🔥",7,"🔥",""]')), ['🔥'], 'only usable strings survive');
+  assert.deepEqual(recentEmoji(fakeStorage('["<b>x</b>","fire","🔥🔥","🔥"]')), ['🔥'],
+    'a stored value the list does not offer is never a selectable pick');
   assert.deepEqual(recentEmoji(brokenStorage()), []);
   assert.deepEqual(rememberEmoji('🔥', brokenStorage()), ['🔥'], 'a failed write is still the list in hand');
 
@@ -263,15 +266,19 @@ test('installing on every render leaves one handler per control', async () => {
   assert.deepEqual(picked, ['🚀']);
   assert.deepEqual(storage.recent(), ['🚀']);
 
-  // And re-installing over an open panel does not close it or wipe the grid.
+  // And re-installing over an open panel does not close it or wipe the grid,
+  // while the cells already on screen now pick for the new install (a menu
+  // rebound to another session must write to that session).
   const { installEmojiPicker } = await import('./emoji-picker.js');
   host.toggle.click();
   host.search.type('bug');
-  installEmojiPicker(host, { onPick: (emoji) => picked.push(emoji), storage });
+  const rebound = [];
+  installEmojiPicker(host, { onPick: (emoji) => rebound.push(emoji), storage });
   assert.equal(host.panel.hidden, false);
   assert.deepEqual(host.grid.emoji, ['🐛']);
   host.grid.cell('🐛').click();
-  assert.deepEqual(picked, ['🚀', '🐛']);
+  assert.deepEqual(picked, ['🚀'], 'the old install is out of the picture');
+  assert.deepEqual(rebound, ['🐛']);
 });
 
 test('a host without the picker markup, and a picker without a handler, are wired to nothing', async () => {
