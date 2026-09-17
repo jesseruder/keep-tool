@@ -300,6 +300,11 @@ test('a feed is re-read when it falls behind, by seq, and backs off when it brin
   const legacy = { ...QUIET_ROW, lastEvent: { at: 900, kind: 'diagnosed' } };
   assert.equal(agentFeedBehind(legacy, { events: [{ at: 100 }], seq: null, at: 100, readAt: 0, misses: 0 }), true);
   assert.equal(agentFeedBehind(legacy, { events: [{ at: 900 }], seq: null, at: 900, readAt: 0, misses: 0 }), false);
+  // The daemon publishes seq 0, not a missing field, for such a feed on both sides.
+  const legacyZero = { ...QUIET_ROW, lastEvent: { at: 900, seq: 0, kind: 'diagnosed' } };
+  assert.equal(agentFeedBehind(legacyZero, { events: [{ at: 100, seq: 0 }], seq: null, at: 100, readAt: 0, misses: 0 }), true,
+    'seq 0 on both sides is the clock comparison, not 0 > 0');
+  assert.equal(agentFeedBehind(legacyZero, { events: [{ at: 900, seq: 0 }], seq: null, at: 900, readAt: 0, misses: 0 }), false);
   assert.equal(agentFeedBehind(busy, { events: null, seq: null, at: 0, readAt: 0, misses: 1 }), false,
     'a feed with no page is not behind; it has never been read');
 

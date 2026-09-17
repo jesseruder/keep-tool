@@ -172,7 +172,9 @@ export function agentStageLogHTML(ctx, agent, events, collapsed = false) {
 }
 
 const eventAt = (at) => (typeof at === 'number' ? at : Date.parse(at) || 0);
-const eventSeq = (event) => (event && event.seq != null ? Math.max(0, Number(event.seq) || 0) : null);
+// 0 is what the daemon publishes for a feed written before seq existed, so it
+// is no order at all: those feeds fall back to the clock.
+const eventSeq = (event) => (event && Number(event.seq) > 0 ? Number(event.seq) : null);
 
 // Whether the feed's own summary on /api/state has outrun the page in hand.
 //
