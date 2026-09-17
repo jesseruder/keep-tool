@@ -81,6 +81,22 @@ function offends(text) {
   return SCRUB_CLASS_RE.test(text) || SCRUB_SPACE_RE.test(text);
 }
 
+// An ESC byte is a control character, so `scrub` already replaces it with a
+// space — but that leaves `[2J` behind as visible junk, and a reader cannot tell
+// the remains of a screen-clear from something somebody typed. These remove the
+// whole sequence instead: CSI (`ESC [ … final`), OSC and the other string
+// introducers up to their terminator, and a lone two-character escape.
+//
+// This matters wherever text written by somebody else is typed into a terminal.
+// An alert title, a Grafana annotation or a Slack reply reaches a pane through
+// the same keystrokes a person's message does, and a pane is a real terminal: a
+// CSI sequence in that text is interpreted, not displayed.
+const ESCAPE_SEQUENCE_RE = /\x1b(?:[P_^\]X][\s\S]*?(?:\x1b\\|\x07|$)|\[[0-?]*[ -/]*[@-~]|[ -/]*[0-~]|$)/g;
+
+function stripEscapes(value) {
+  return String(value == null ? '' : value).replace(ESCAPE_SEQUENCE_RE, '');
+}
+
 // Folding is how a lookalike is *detected*, never what gets stored. Storing the
 // folded form would quietly rewrite legitimate text — the ligature in a filename,
 // the unit in a measurement, half-width katakana someone actually typed — and a
@@ -88,7 +104,7 @@ function offends(text) {
 // on its own folded form and either kept exactly as written or replaced with a
 // plain space.
 function scrub(value) {
-  const text = String(value == null ? '' : value);
+  const text = stripEscapes(value);
   let out = '';
   for (const character of text) {
     let folded = character;
@@ -104,6 +120,16 @@ function scrub(value) {
 function sanitize(value, limit = MESSAGE_LIMIT) {
   return scrub(value).slice(0, limit);
 }
+
+// `scrub` for text whose line breaks are the point — a fenced block of one line
+// per item. Every line is scrubbed on its own, so a control character cannot
+// forge a line break and a newline is the one whitespace that survives. Tabs
+// and everything else fold to a space exactly as they do in `scrub`.
+function scrubLines(value) {
+  return stripEscapes(value).replace(/\r\n?/g, '\n').split('\n')
+    .map((line) => scrub(line)).join('\n');
+}
+
 
 
 // ---------- storage ----------
@@ -446,7 +472,7 @@ function startScheduler(options = {}) {
 
 module.exports = {
   MESSAGE_LIMIT, RETENTION_MS, EXPIRED_VISIBLE_MS, SWEEP_EVERY_MS, ANNOUNCE_PREFIX,
-  defaultRoot, notesDir, noteFile, projectKey, scrub, sanitize, stampOf,
+  defaultRoot, notesDir, noteFile, projectKey, scrub, sanitize, stripEscapes, scrubLines, stampOf,
   loadNotes, allNotes, findNote, addNote, extendNote, clearNote, writeFileNotes,
   activeNotes, describeNote, announcementFor, nagFor,
   announceEventFor, announcedAlready, markAnnounced,

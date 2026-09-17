@@ -169,6 +169,78 @@ test('emit appends, markSeen stamps only what it was asked for, and the feed rea
   } finally { cleanup(root); }
 });
 
+test('every event gets a seq inside the emit lock, and readAfterSeq is a forward scan', () => {
+  const root = makeRoot();
+  try {
+    agents.ensure('sandboxes', { role: 'incident-responder' }, { root });
+    assert.equal(agents.readRecord('sandboxes', root).nextSeq, 1, 'a fresh record starts at 1');
+
+    // Two events in the same millisecond, and one dated BEFORE both but written
+    // after them — which is what a backfilled Slack firing looks like next to a
+    // close somebody ran by hand. A timestamp cursor drops one of each pair.
+    const first = agents.emit('sandboxes', { at: 5000, kind: 'incident-opened', card: 'inc-a' }, { root });
+    const second = agents.emit('sandboxes', { at: 5000, kind: 'incident-fired', card: 'inc-b' }, { root });
+    const backdated = agents.emit('sandboxes', { at: 1000, kind: 'incident-closed', card: 'inc-c' }, { root });
+    assert.deepEqual([first.seq, second.seq, backdated.seq], [1, 2, 3]);
+    assert.equal(agents.readRecord('sandboxes', root).nextSeq, 4);
+    assert.deepEqual(lines(root, 'sandboxes').map((event) => event.seq), [1, 2, 3]);
+
+    // From the start: feed order, every event exactly once.
+    const all = agents.readAfterSeq('sandboxes', 0, { root });
+    assert.deepEqual(all.events.map((event) => event.card), ['inc-a', 'inc-b', 'inc-c']);
+    assert.equal(all.more, false);
+    // From a cursor: only what is after it, and the tie is not lost.
+    assert.deepEqual(agents.readAfterSeq('sandboxes', 1, { root }).events.map((event) => event.card), ['inc-b', 'inc-c']);
+    assert.deepEqual(agents.readAfterSeq('sandboxes', 3, { root }).events, []);
+
+    // A limit says there is more rather than pretending it saw the end.
+    const page = agents.readAfterSeq('sandboxes', 0, { root, limit: 2 });
+    assert.deepEqual(page.events.map((event) => event.seq), [1, 2]);
+    assert.equal(page.more, true);
+
+    // markSeen rewrites the whole file; the sequence and the counter survive it.
+    agents.markSeen('sandboxes', 5000, { root });
+    assert.deepEqual(lines(root, 'sandboxes').map((event) => event.seq), [1, 2, 3]);
+    assert.equal(agents.readRecord('sandboxes', root).nextSeq, 4);
+    // Seen-ness and delivered-ness are independent: a seen event is still after
+    // a cursor that has not passed it.
+    assert.equal(agents.readAfterSeq('sandboxes', 0, { root }).events.length, 3);
+
+    // A feed with no seq at all — one written before this existed — reads as 0,
+    // which is behind every cursor.
+    fs.appendFileSync(agents.eventsFile('sandboxes', root), JSON.stringify({ at: 6000, kind: 'legacy' }) + '\n');
+    assert.deepEqual(agents.readAfterSeq('sandboxes', 0, { root }).events.map((event) => event.kind),
+      ['incident-opened', 'incident-fired', 'incident-closed']);
+
+    // And a feed that cannot be read is not an empty one.
+    assert.deepEqual(agents.readAfterSeq('nobody-here', 0, { root }), { events: [], more: false });
+  } finally { cleanup(root); }
+});
+
+test('a control sequence in an event field never reaches the terminal', () => {
+  const root = makeRoot();
+  try {
+    agents.ensure('sandboxes', { role: 'incident-responder' }, { root });
+    const event = agents.emit('sandboxes', {
+      kind: 'incident-opened', card: 'inc-a',
+      title: 'Sandbox \x1b[2JOpen\x03 Health\x15',
+      text: 'line one\rline two‮txet',
+      permalink: 'https://slack/\x1b]0;pwned\x07a',
+    }, { root });
+    assert.equal(event.title, 'Sandbox Open Health');
+    assert.equal(event.text, 'line one line two txet');
+    assert.equal(event.permalink, 'https://slack/a');
+    for (const field of [event.title, event.text, event.permalink]) {
+      assert.equal(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(field), false, 'no control byte survives');
+    }
+    // What is on disk is what was scrubbed, not the original.
+    const [stored] = lines(root, 'sandboxes');
+    assert.equal(stored.title, 'Sandbox Open Health');
+    // Fence markers in somebody else's text cannot close a fence they sit inside.
+    assert.equal(agents.emit('sandboxes', { kind: 'note', text: '>>>KEEP_INPUT' }, { root }).text, '---KEEP_INPUT');
+  } finally { cleanup(root); }
+});
+
 test('the record tracks the feed’s end, so a state build never opens events.jsonl', () => {
   const root = makeRoot();
   try {

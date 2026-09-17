@@ -16,6 +16,7 @@
 const fs = require('fs');
 const path = require('path');
 const keep = require('./keep.js');
+const notes = require('./notes.js');
 
 // A name is a directory name under .keep/agents and a path segment in the API,
 // so it is validated everywhere it arrives rather than trusted anywhere.
@@ -36,8 +37,14 @@ function clip(value, limit) {
   return text.length > limit ? text.slice(0, Math.max(0, limit - 1)) + '…' : text;
 }
 
+// Every string an event carries is somebody else's: an alert title, a Grafana
+// annotation, a Slack reply. It is shown in the console, and — since Stage C —
+// typed into a real terminal, where a CSI sequence is interpreted rather than
+// displayed. So a field is scrubbed of controls, escape sequences, format
+// characters and fence markers BEFORE it is capped: capping first would let a
+// limit fall inside an escape sequence and leave its tail behind as text.
 function oneLine(value, limit) {
-  return clip(value, limit).replace(/[\r\n\t]+/g, ' ').trim();
+  return clip(notes.scrub(value), limit);
 }
 
 function validName(name) {
@@ -110,6 +117,19 @@ function normalizeRecord(name, value = {}) {
     },
     lifecycle: LIFECYCLES.has(value.lifecycle) ? value.lifecycle : 'idle',
     card: oneLine(value.card || '', 120),
+    // The next `seq` an emit will assign. Every event on the feed carries one,
+    // assigned inside the lock that appended it, so the feed has a total order
+    // that does not depend on a clock. A timestamp cannot be that order: two
+    // events written in the same millisecond tie, and an alert is stamped with
+    // the Slack time it was POSTED at, so a backfilled firing lands on the feed
+    // after — but dated before — a close somebody ran by hand a minute ago.
+    // A cursor made of timestamps drops both.
+    //
+    // Feeds written before this existed have no `seq` at all; those events read
+    // as `seq: 0`, which is behind every cursor. They are still Owner's badge
+    // state, they are simply never delivered — there was no session to deliver
+    // them to.
+    nextSeq: Math.max(1, Number(value.nextSeq || 0) || 1),
     lastTick: Number(value.lastTick || 0) || 0,
     restarts: Number(value.restarts || 0) || 0,
     createdAt: Number(value.createdAt || 0) || 0,
@@ -196,6 +216,9 @@ function normalizeEvent(event = {}, now = Date.now()) {
   const entry = {
     ...value,
     at: Number(value.at) || now,
+    // 0 means "before every cursor": an event from a feed written before seq
+    // existed, or one normalized outside an emit.
+    seq: Math.max(0, Number(value.seq || 0) || 0),
     kind: oneLine(value.kind || 'note', 60) || 'note',
     card: oneLine(value.card || '', 120),
     severity: SEVERITIES.has(value.severity) ? value.severity : 'med',
@@ -294,6 +317,37 @@ function readEvents(name, options = {}) {
   return readTail(name, options).events;
 }
 
+// Everything after a cursor, in feed order. This is the delivery read, and it is
+// deliberately a forward scan of the WHOLE feed rather than a tail: a tail window
+// can begin after an event a cursor has not passed yet, and since the cursor only
+// ever moves forward that event would never be delivered at all. `readTail` stays
+// what the API, the CLI and a badge summary use — they want the end, and they can
+// afford to miss the beginning.
+//
+// The caller is expected to ask only when the record says there is something to
+// find (`nextSeq - 1 > cursor`), so a quiet tick reads nothing.
+//
+// Throws when the feed exists and cannot be read: a caller that advances a cursor
+// must not be handed an empty list for a feed it could not see.
+function readAfterSeq(name, afterSeq = 0, options = {}) {
+  const root = options.root || keep.ROOT;
+  const cursor = Math.max(0, Number(afterSeq) || 0);
+  const limit = Math.min(EVENT_LIMIT, Math.max(1, Number(options.limit) || EVENT_LIMIT));
+  const text = readFeed(eventsFile(name, root));
+  if (text === null) return { events: [], more: false };
+  const found = [];
+  let more = false;
+  for (const line of String(text).split('\n')) {
+    if (!line.trim()) continue;
+    let event;
+    try { event = normalizeEvent(JSON.parse(line), 0); } catch { continue; }
+    if (event.seq <= cursor) continue;
+    if (found.length >= limit) { more = true; break; }
+    found.push(event);
+  }
+  return { events: found, more };
+}
+
 function unseenSummary(events) {
   const unseen = (events || []).filter((event) => !event.seenAt);
   return { count: unseen.length, needsYou: unseen.some((event) => event.needsYou === true) };
@@ -371,6 +425,10 @@ function emit(name, event = {}, options = {}) {
       const record = readRecord(name, root);
       if (!record) return { missing: true };
       fs.mkdirSync(agentDir(name, root), { recursive: true });
+      // Assigned here and nowhere else: inside the one lock hold that also
+      // appends, so two emitters cannot be given the same number. It rides on
+      // the appended line, which is what makes the feed's order durable.
+      entry.seq = record.nextSeq;
       // The feed is the truth and the record's summary is a cache of its end, so
       // the append comes first and alone decides whether this emit happened.
       fs.appendFileSync(eventsFile(name, root), JSON.stringify(entry) + '\n');
@@ -391,9 +449,9 @@ function emit(name, event = {}, options = {}) {
           ? { ...summary, needsYou: summary.needsYou || record.unseen.needsYou, truncated: true }
           : summary;
         writeJsonAtomic(recordFile(name, root), normalizeRecord(name, {
-          ...record, lastEvent: tail.events[0] || entry, unseen,
+          ...record, lastEvent: tail.events[0] || entry, unseen, nextSeq: entry.seq + 1,
         }));
-      } catch (error) { return { ok: true, recordError: error }; }
+      } catch (error) { return { ok: true, recordError: error, seqStalled: true }; }
       return { ok: true };
     });
   } catch (error) {
@@ -412,6 +470,11 @@ function emit(name, event = {}, options = {}) {
   if (landed.recordError) {
     say(`wrote the ${entry.kind} event for ${name} but not its summary: `
       + `${oneLine(landed.recordError.message || landed.recordError, 200)}`);
+    // `nextSeq` did not advance either, so the next emit reuses this number.
+    // Two events sharing a seq are delivered together and exactly once — a
+    // cursor at seq-1 returns both, and it advances past both — which is the
+    // outcome worth having here. Repairing the counter would mean writing the
+    // record this write just failed at.
   }
   markPending(root, name);
   if (entry.needsYou) routeAlert(name, entry, { ...options, root });
@@ -655,7 +718,7 @@ module.exports = {
   REVIEWER_NAME, EXPANDED_EVENTS, DEFAULT_EVENT_LIMIT, TAIL_BYTES,
   validName, nameFromPath, agentsDir, agentDir, recordFile, eventsFile, notesFile,
   readRecord, records, writeRecord, ensure, normalizeRecord,
-  emit, markSeen, readEvents, readTail, loadEvents, unseenSummary, eventLine, eventSummary, alertText, normalizeEvent,
+  emit, markSeen, readEvents, readTail, readAfterSeq, loadEvents, unseenSummary, eventLine, eventSummary, alertText, normalizeEvent,
   flushCommits, pendingNames,
   areaAgent, incidentEmitter,
   applySessions, agentView, reviewerView, dashboardAgents,
