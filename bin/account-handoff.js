@@ -123,7 +123,13 @@ function list(root) {
 }
 
 // The statuses a transaction passes through while it is actively moving a session.
+// Bounded by freshness like every other branch here: a record that says 'starting'
+// and then lost its daemon never advances, and an unbounded working status would
+// reserve a dead pane forever. A live transfer's own launch and verify timeouts all
+// finish well inside fifteen minutes, so a working record older than that is a record
+// nobody is working.
 const IN_FLIGHT_STATUSES = ['stopping', 'copying', 'starting', 'verifying', 'delivering'];
+const WORKING_GRACE_MS = 15 * 60e3;
 // How long a stopped source is still somebody's business. The queue's own patience
 // runs to 45 minutes, but a transfer that has not moved in ten is not one whose pane
 // this should keep reserving.
@@ -134,15 +140,21 @@ const STOPPED_SOURCE_GRACE_MS = 10 * 60e3;
 // 2026-09-17 the ephemeral-pane sweep closed such a pane within a minute of a
 // transfer's host `get` timing out, and the retry found nothing left to resume.
 //
-// In flight is any of the working statuses; or a 'recovery-needed' record stopped at
-// 'stopping-source', which is exactly the shape a retry picks up (the same safePhase
-// portableFallbackCandidate reads) for as long as it is fresh; or an entry the queue
-// is still holding and has not tried yet.
+// In flight is any of the working statuses, while the record is still being written
+// to; or a 'recovery-needed' record stopped at 'stopping-source', which is exactly the
+// shape a retry picks up (the same safePhase portableFallbackCandidate reads) for as
+// long as it is fresh; or an entry the queue is still holding and has not tried yet.
+// The queue branch is the one that is not bounded here, because the queue parks its
+// own entries at 45 minutes and that is its decision to make, not this one's.
+//
+// Freshness is read from updatedAt, which writeOne stamps on every phase write.
 function transferInFlight(root, sessionId, now = Date.now()) {
   if (!/^[A-Za-z0-9_-]+$/.test(String(sessionId || ''))) return null;
   let entry = null;
   try { entry = readOne(root, sessionId); } catch { entry = null; }
-  if (entry && IN_FLIGHT_STATUSES.includes(entry.status)) return { status: entry.status, phase: entry.phase || '' };
+  if (entry && IN_FLIGHT_STATUSES.includes(entry.status) && now - Number(entry.updatedAt || 0) < WORKING_GRACE_MS) {
+    return { status: entry.status, phase: entry.phase || '' };
+  }
   if (entry && entry.status === 'recovery-needed' && entry.phase === 'stopping-source'
       && now - Number(entry.updatedAt || 0) < STOPPED_SOURCE_GRACE_MS) {
     return { status: entry.status, phase: entry.phase };

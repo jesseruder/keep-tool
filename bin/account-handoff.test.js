@@ -1051,6 +1051,12 @@ test('a transfer in flight is visible to anything that would close the session u
 
     assert.equal(handoff.transferInFlight(root, sid, now), null, 'no record and no queue entry, nothing in flight');
     for (const status of ['stopping', 'copying', 'starting', 'verifying', 'delivering']) {
+      record({ status, phase: `${status}-phase`, updatedAt: now - 14 * 60e3 });
+      assert.deepEqual(handoff.transferInFlight(root, sid, now), { status, phase: `${status}-phase` }, status);
+      // A working status that stopped being written to is a transaction that lost its
+      // daemon, not one still moving; it does not reserve the pane forever.
+      record({ status, phase: `${status}-phase`, updatedAt: now - 16 * 60e3 });
+      assert.equal(handoff.transferInFlight(root, sid, now), null, `stale ${status}`);
       record({ status, phase: `${status}-phase` });
       assert.deepEqual(handoff.transferInFlight(root, sid, now), { status, phase: `${status}-phase` }, status);
     }
