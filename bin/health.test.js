@@ -57,31 +57,49 @@ test('skipped polls preserve the failure sequence until a real success', () => {
   assert.equal(health.snapshot(5000).schedulers.find((entry) => entry.name === 'review').state, 'failing');
 });
 
-test('a skip that clears the streak leaves the row skipped rather than red', () => {
+test('an expected state clears the streak, marks the row, and any later record unmarks it', () => {
   const { root, health } = fixture();
-  // Three real failures on a row that self-repair watches.
+  const stored = () => JSON.parse(fs.readFileSync(path.join(root, '.keep', 'health.json'), 'utf8')).discord;
+  const row = (now) => health.snapshot(now).schedulers.find((entry) => entry.name === 'discord');
+  // Three real failures on a row that self-repair and lint both watch.
   for (const at of [1000, 2000, 3000]) health.record('discord', { ok: false, error: 'reader gone', at });
-  assert.equal(health.snapshot(3000).schedulers.find((entry) => entry.name === 'discord').state, 'failing');
+  assert.equal(row(3000).state, 'failing');
+  assert.equal(row(3000).expected, false);
 
-  // A tick that decides the failure is weather rather than a fault: the streak goes,
-  // the history stays, and neither `keep health` nor bin/self-repair.js sees red.
-  health.record('discord', { skipped: true, clearFailures: true, detail: 'reader unavailable: tab closed', at: 4000 });
-  const raw = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'health.json'), 'utf8')).discord;
-  assert.equal(raw.consecutiveFailures, 0);
-  assert.equal(raw.lastErrorAt, 3000, 'the failure history is kept');
-  assert.equal(raw.lastError, 'reader gone');
-  const row = health.snapshot(4000).schedulers.find((entry) => entry.name === 'discord');
-  assert.equal(row.state, 'skipped');
-  assert.equal(row.displayState, 'skipped');
-  assert.equal(row.displayDetail, 'reader unavailable: tab closed');
+  // A tick that decides the state is one its scheduler tolerates: the streak goes, the
+  // history stays, the row is marked, and nothing reads as red.
+  health.record('discord', { skipped: true, expected: true, detail: 'reader unavailable: tab closed', at: 4000 });
+  assert.equal(stored().consecutiveFailures, 0);
+  assert.equal(stored().expected, true);
+  assert.equal(stored().lastErrorAt, 3000, 'the failure history is kept');
+  assert.equal(stored().lastError, 'reader gone');
+  assert.equal(row(4000).state, 'skipped');
+  assert.equal(row(4000).displayState, 'skipped');
+  assert.equal(row(4000).displayDetail, 'reader unavailable: tab closed');
+  assert.equal(row(4000).expected, true);
 
-  // Without it a skip still inherits the streak, which is what keeps a genuinely
+  // Every other record drops the mark, so a real fault is visible again at once.
+  for (const options of [
+    { ok: false, error: 'classifier refused', at: 5000 },
+    { ok: true, detail: '2 messages', at: 6000 },
+    { skipped: true, detail: 'waiting for first poll', at: 7000 },
+    { disabled: true, detail: 'not enabled', at: 8000 },
+  ]) {
+    health.record('discord', { skipped: true, expected: true, detail: 'reader unavailable: tab closed', at: options.at - 1 });
+    assert.equal(stored().expected, true);
+    health.record('discord', options);
+    assert.equal(stored().expected, undefined, JSON.stringify(options));
+    assert.equal(row(options.at).expected, false, JSON.stringify(options));
+  }
+
+  // And an ordinary skip still inherits the streak, which is what keeps a genuinely
   // failing account visible between real retries.
-  health.record('usage', { ok: false, error: 'Primary: credentials unavailable', at: 5000 });
-  health.record('usage', { ok: true, skipped: true, detail: 'waiting for failed account retry', at: 6000 });
-  const inherited = health.snapshot(6000).schedulers.find((entry) => entry.name === 'usage');
+  health.record('usage', { ok: false, error: 'Primary: credentials unavailable', at: 9000 });
+  health.record('usage', { ok: true, skipped: true, detail: 'waiting for failed account retry', at: 10000 });
+  const inherited = health.snapshot(10000).schedulers.find((entry) => entry.name === 'usage');
   assert.equal(inherited.consecutiveFailures, 1);
   assert.equal(inherited.displayState, 'warning');
+  assert.equal(inherited.expected, false);
 });
 
 test('snapshot and CLI presentation separate recovered errors from unresolved failures', () => {

@@ -37,15 +37,34 @@ diverged checkout), which is Owner's to fix rather than a daemon bug. A `deliver
 row carrying a live incident gets the `delivery:` signature rather than a second
 `sched:` one.
 
-A tick may also decide its own failure is weather rather than a fault and record
-`health.record(name, { skipped: true, clearFailures: true, detail })` instead of a
-failure. A skip ordinarily *keeps* the streak, so that a scheduler which failed and
-then had nothing to do still reads as unresolved; `clearFailures` zeroes it, which is
-what keeps the row out of the red and out of this table — `signatures()` gates on
-`consecutiveFailures`. Two rows use it: `usage` when every failure in a batch is an
-endpoint rate limit over a reading still younger than two hours, and `discord` when
-its browser reader is unavailable. `lastError`/`lastErrorAt` stay as history;
-`presentationOf` only reads them while the streak is nonzero.
+A tick may also decide the state it is reporting is one its own scheduler tolerates
+rather than a fault, and record
+`health.record(name, { skipped: true, expected: true, detail })` instead of a failure.
+A skip ordinarily *keeps* the streak, so that a scheduler which failed and then had
+nothing to do still reads as unresolved; `expected` zeroes it, which is what keeps the
+row out of the red and out of this table — `signatures()` gates on
+`consecutiveFailures`. It also writes `expected: true` on the row, which is what
+`bin/lint.js` `daemon-health` reads to leave the row alone instead of naming it "no
+successful run in 24h"; the two travel together so they cannot drift apart, and every
+other record — a success, a failure, an ordinary skip, a disable — clears the mark, so
+a real fault is a candidate again the moment it lands. `lastError`/`lastErrorAt` stay
+as history; `presentationOf` only reads them while the streak is nonzero.
+
+Two rows use it. `discord` records it when its browser reader is unavailable — by
+either route, the `ReaderUnavailable` its `poll()` swallows into the status file or a
+reader subprocess that would not spawn, timed out or printed nothing usable. Nothing
+downstream of a good reader envelope qualifies: a wrong guild or channel, a classifier
+that refused, a decisions file that would not write, a `KEEP_DISCORD_READER_ARGS`
+nobody can parse are real failures and stay red. `usage` records it when every failure
+in a batch is an endpoint rate limit over a reading still younger than two hours **and**
+no other account is sitting on an unresolved non-rate-limit fault — the row is
+scheduler-wide, so one account's weather must not clear another account's evidence. In
+that mixed case it records a plain skip instead: the streak is neither cleared nor
+inflated, and the real fault still reaches three on its own retries.
+
+One tick writes one record. A tolerated-state record followed in the same tick by a
+real failure would zero the streak and then add one to it, so the failure could never
+count past one however long it recurred.
 
 `hash8` is `sha256(name + '|' + normalizedError)`. The normalizer collapses
 whitespace and then replaces, in order: ISO timestamps (`<time>`), absolute paths

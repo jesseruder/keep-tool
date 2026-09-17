@@ -318,7 +318,7 @@ test('a 429 over a recent reading is weather, logged once and bounded by the sta
     assert.equal(weather.name, 'usage');
     assert.equal(weather.options.ok, true);
     assert.equal(weather.options.skipped, true);
-    assert.equal(weather.options.clearFailures, true);
+    assert.equal(weather.options.expected, true);
     assert.match(weather.options.detail,
       /^rate limited \(Primary\); retrying \d\d:\d\d, reading 14m old; rate limited \(Secondary\); retrying \d\d:\d\d, reading 14m old$/);
     assert.deepEqual(logs, [`keep usage: ${weather.options.detail}\n`]);
@@ -367,6 +367,90 @@ test('a 429 over a recent reading is weather, logged once and bounded by the sta
     await settleRefresh();
     assert.deepEqual(records.at(-1),
       { name: 'usage', options: { ok: false, error: 'Primary: credentials unavailable; Secondary: HTTP 429' } });
+  } finally { process.stderr.write = originalWrite; }
+});
+
+test('weather on one account never clears another account\'s unresolved real failure', async () => {
+  const configured = [
+    { id: 'claude/default', label: 'Primary', agent: 'claude', configDir: '/profiles/default', builtIn: true },
+    { id: 'claude-secondary', label: 'Secondary', agent: 'claude', configDir: '/profiles/secondary' },
+  ];
+  const accountApi = { list: () => configured, defaultFor: () => configured[0] };
+  const records = [];
+  const firstAt = Date.parse('2026-09-17T12:00:00Z');
+  let currentTime = firstAt;
+  const manager = createUsageManager({
+    accounts: accountApi, health: { record: (name, options) => records.push({ name, options }) }, now: () => currentTime,
+  });
+  // The streak the scheduler-wide row actually carries, folded exactly as
+  // bin/health.js does: a failure adds one, a success or an expected state zeroes it,
+  // an ordinary skip leaves it alone.
+  let streak = 0;
+  const apply = () => {
+    const options = records.at(-1).options;
+    if (options.ok === false) streak += 1;
+    else if (options.expected === true || !options.skipped) streak = 0;
+    return options;
+  };
+  // The two accounts' cooldowns interleave, which is the whole shape of the bug: a
+  // broken-credentials account retries at +5m+4m and a rate-limited one at +10m, so
+  // there are batches that hold only the rate-limited account while the real fault is
+  // still unresolved. `t1` is the first tick on which both are due.
+  const t1 = firstAt + 5 * 60e3 + 1;
+  const mixed = async (account) => {
+    if (account.id === 'claude/default') throw Object.assign(new Error('missing'), { code: 'credentials' });
+    throw Object.assign(new Error('limited'), { code: 429 });
+  };
+  const poll = async (at, refresh = mixed) => {
+    currentTime = at;
+    manager.requestRefresh(at, refresh);
+    await settleRefresh();
+    return apply();
+  };
+  const originalWrite = process.stderr.write;
+  process.stderr.write = () => true;
+  try {
+    // Both readable to begin with, so the 429s below are over recent readings.
+    await poll(firstAt, async () => ({ limits: [{ label: 'week', percent: 20 }], fetchedAt: currentTime }));
+    assert.equal(streak, 0);
+
+    // Primary's credentials are broken, Secondary is rate limited: a batch with a real
+    // fault in it fails the row, as it always did.
+    assert.equal((await poll(t1)).ok, false);
+    assert.equal(streak, 1);
+    assert.equal((await poll(t1 + 9 * 60e3)).error, 'Primary: credentials unavailable', 'only Primary is due');
+    assert.equal(streak, 2);
+
+    // Now only Secondary is due and its failure is weather. Before the fix this
+    // recorded an expected state, which zeroed the streak Primary's unresolved fault
+    // had just earned — the reviewer's twelve-hour simulation cleared it 46 times, so
+    // the row never reached two consecutive failures and never went red.
+    const weather = (options) => {
+      assert.equal(options.ok, true);
+      assert.equal(options.skipped, true);
+      assert.equal(options.expected, undefined, 'the other account\'s fault is not cleared');
+      assert.match(options.detail,
+        /^rate limited \(Secondary\); retrying \d\d:\d\d, reading \d+m old; unresolved: Primary: credentials unavailable$/);
+    };
+    weather(await poll(t1 + 10 * 60e3));
+    assert.equal(streak, 2, 'weather neither clears the streak');
+    assert.equal((await poll(t1 + 22 * 60e3)).error, 'Primary: credentials unavailable');
+    assert.equal(streak, 3, 'so the row still goes red on Primary\'s third retry');
+    weather(await poll(t1 + 30 * 60e3));
+    assert.equal(streak, 3, 'nor inflates it');
+
+    // Once the real fault clears, the very next weather skip is expected again.
+    await poll(t1 + 43 * 60e3, async (account) => {
+      if (account.id === 'claude/default') return { limits: [{ label: 'week', percent: 20 }], fetchedAt: currentTime };
+      throw Object.assign(new Error('limited'), { code: 429 });
+    });
+    const cleared = await poll(t1 + 50 * 60e3, async (account) => {
+      if (account.id === 'claude/default') return { limits: [{ label: 'week', percent: 20 }], fetchedAt: currentTime };
+      throw Object.assign(new Error('limited'), { code: 429 });
+    });
+    assert.equal(cleared.expected, true);
+    assert.match(cleared.detail, /^rate limited \(Secondary\); retrying \d\d:\d\d, reading 55m old$/);
+    assert.equal(streak, 0);
   } finally { process.stderr.write = originalWrite; }
 });
 

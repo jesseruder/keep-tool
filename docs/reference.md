@@ -91,14 +91,26 @@ review, lint and self-repair read what it records.
 projects the key into `KEEP_FEATURES` the same way it projects `scopes` into
 `KEEP_SCOPES`, so a child process reads the same answer as its parent.
 
-The `discord` row in `keep health` never reads as failing. Its reader drives a
-logged-in browser tab, so it is unreliable by design — a closed tab, a restarting
-browser, a timed-out spawn — and none of that is a daemon fault a repair card could
-address. A failed poll logs `keep discord: <message>` on stderr and records a skip with
-`reader unavailable: <message>` as the row's detail, clearing the failure streak so the
-row stays `skipped` rather than turning amber and then red. A poll that classifies
-messages still records a real success. `keep discord status` is unchanged: it reads the
-watcher's own status file, not health.
+An unavailable Discord **reader** does not make the `discord` row in `keep health` read
+as failing. The reader drives a logged-in browser tab, so it is unavailable for reasons
+no daemon fix addresses — a closed tab, a restarting browser, a binary that is not
+there — and that is treated as a state the scheduler tolerates: the row records a skip
+detailed `reader unavailable: <message>`, marked `expected`, which clears the failure
+streak and keeps `bin/lint.js` `daemon-health` from calling it late. One
+`keep discord: reader unavailable: <message>` line goes to stderr on entering that
+state, not one per tick. Both routes into it are covered: the `browser_reader_unavailable`
+envelope `poll()` swallows into its status file, and a reader subprocess that would not
+spawn, timed out after 30s, exited nonzero or printed something that is not the
+envelope.
+
+Only the reader qualifies. Everything downstream of a good envelope — a wrong guild or
+channel, a classifier that refused, a decisions file that would not write, a
+`KEEP_DISCORD_READER_ARGS` nobody can parse — is a real failure, records `ok: false` with
+its own error, logs the ordinary `keep discord: <message>` line, and goes red on the
+third one as it always did. A poll that classifies messages records a real success. One
+tick writes one health record, so a broken console notification counts as this tick's
+failure rather than clearing the streak first. `keep discord status` is unchanged: it
+reads the watcher's own status file, not health.
 
 
 ## CLI
@@ -348,7 +360,9 @@ duplicate titles, `tmp-artifact` citations, `missing-project` (an open card whos
 is empty or does not resolve to a directory), `landing-uncited` (status `landing` with no
 cited sha), `blocked-no-need` (status `blocked` with neither an open need nor a
 dependency), `daemon-health` (one finding for every scheduler in `.keep/health.json` with
-3+ consecutive failures or no successful run in 24h), `checkout-drift` (per project of an
+3+ consecutive failures or no successful run in 24h, skipping on-demand rows and any row
+whose latest record is a state its scheduler tolerates — see [self-repair](self-repair.md)),
+`checkout-drift` (per project of an
 open card: a dirty tree or a branch ahead of/behind its upstream, from local refs with no
 fetch), `step-run-pending` (a gated step with landed commits its last run missed for over
 24h), `note-expired` (a state note past its window that nobody extended or cleared,

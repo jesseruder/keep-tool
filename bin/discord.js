@@ -25,6 +25,21 @@ const SEEN_MAX_AGE_MS = 30 * 86400e3;
 
 class ReaderUnavailable extends Error {}
 
+// A failure produced by the reader subprocess itself: it would not spawn, it timed out,
+// it exited nonzero, it printed something that is not the envelope. The browser tab it
+// drives is unreliable by design, so the scheduler treats these the way it treats
+// `ReaderUnavailable` — logged, not a failing scheduler. Everything downstream of a good
+// envelope is deliberately NOT tagged: a wrong guild or channel, a malformed
+// KEEP_DISCORD_READER_ARGS, a classifier that refused, a decisions file that would not
+// write are real failures somebody has to fix, and they stay red.
+function readerError(message) {
+  return Object.assign(new Error(message), { readerFailure: true });
+}
+
+function isReaderFailure(error) {
+  return error instanceof ReaderUnavailable || Boolean(error && error.readerFailure);
+}
+
 function readJson(file, fallback) {
   try {
     const value = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -81,7 +96,7 @@ function callReader(limit, deps = {}) {
       child = (deps.spawn || spawn)(argv[0], [...argv.slice(1), 'read_messages', '--limit', String(limit)], {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
-    } catch (error) { reject(error); return; }
+    } catch (error) { reject(Object.assign(error, { readerFailure: true })); return; }
     let stdout = '';
     let stderr = '';
     let settled = false;
@@ -91,24 +106,24 @@ function callReader(limit, deps = {}) {
       clearTimeout(timer);
       if (error) { reject(error); return; }
       let envelope;
-      try { envelope = JSON.parse(stdout); } catch { reject(new Error('Discord reader returned malformed JSON')); return; }
+      try { envelope = JSON.parse(stdout); } catch { reject(readerError('Discord reader returned malformed JSON')); return; }
       if (code === 3 && envelope?.error?.code === 'browser_reader_unavailable') {
         reject(new ReaderUnavailable(envelope.error.message || 'Discord browser reader unavailable'));
         return;
       }
       if (code !== 0 || envelope?.ok !== true) {
-        reject(new Error(envelope?.error?.message || `Discord reader exited ${code}${stderr.trim() ? `: ${stderr.trim()}` : ''}`));
+        reject(readerError(envelope?.error?.message || `Discord reader exited ${code}${stderr.trim() ? `: ${stderr.trim()}` : ''}`));
         return;
       }
       resolve(envelope.result || {});
     };
     const tooLarge = (stream) => {
       try { child.kill(); } catch {}
-      finish(new Error(`Discord reader ${stream} exceeded 10 MiB`));
+      finish(readerError(`Discord reader ${stream} exceeded 10 MiB`));
     };
     const timer = setTimeout(() => {
       try { child.kill(); } catch {}
-      finish(new Error('Discord reader timed out after 30s'));
+      finish(readerError('Discord reader timed out after 30s'));
     }, 30e3);
     child.stdout.on('data', (chunk) => {
       stdout += chunk;
@@ -118,7 +133,7 @@ function callReader(limit, deps = {}) {
       stderr += chunk;
       if (Buffer.byteLength(stderr) > PROCESS_OUTPUT_MAX) tooLarge('error output');
     });
-    child.on('error', (error) => finish(error));
+    child.on('error', (error) => finish(Object.assign(error, { readerFailure: true })));
     child.on('close', (code) => finish(null, code));
   });
 }
@@ -281,26 +296,52 @@ function startScheduler(options = {}) {
   }
   health.record('discord', { skipped: true, detail: 'waiting for first poll', cadenceMs });
   let running = false;
+  // Whether the last tick already found the reader unavailable. The log line belongs to
+  // the transition into that state, not to every tick that finds the tab still closed.
+  let readerDown = false;
+  // The reader drives a logged-in browser tab, so it fails for reasons nothing in this
+  // process can fix: the tab is closed, the window moved, Edge is restarting. Owner
+  // wants that logged, not presented as a failing scheduler. `expected` keeps the streak
+  // from turning the row red, keeps bin/self-repair.js from opening a card on weather,
+  // and tells bin/lint.js that this row has no success to be late against.
+  const readerUnavailable = (message) => {
+    const detail = `reader unavailable: ${String(message || '').replace(/\s+/g, ' ').trim()}`;
+    if (!readerDown) {
+      readerDown = true;
+      process.stderr.write(`keep discord: ${detail}\n`);
+    }
+    health.record('discord', { skipped: true, expected: true, detail, cadenceMs });
+  };
   const tick = async () => {
     if (running) return;
     running = true;
     try {
       const decisions = await poll();
+      // poll() swallows ReaderUnavailable and records it in the status file, so this is
+      // the same unavailable state arriving by the other route.
       const current = status();
-      if (current.skipped) health.record('discord', {
-        skipped: true, detail: current.detail || 'browser reader unavailable', cadenceMs,
-      });
-      else health.record('discord', { ok: true, detail: `${decisions.length} messages`, cadenceMs });
+      // Ahead of the record, so one tick writes one record. Notifying the console is
+      // part of this tick, and a throwing onChange used to land in the catch *after* a
+      // tolerated-state record had already zeroed the streak — which meant the failure
+      // could never count past one, never reach three, and never go red.
       if (options.onChange) options.onChange();
+      if (current.skipped) readerUnavailable(current.detail || 'browser reader unavailable');
+      else {
+        readerDown = false;
+        health.record('discord', { ok: true, detail: `${decisions.length} messages`, cadenceMs });
+      }
     } catch (error) {
-      // The reader drives a logged-in browser tab, so it fails for reasons nothing here
-      // can fix: the tab is closed, the window moved, Edge is restarting. Owner wants
-      // that logged, not presented as a failing scheduler — and `clearFailures` keeps
-      // the streak from turning the row red or handing bin/self-repair.js a signature
-      // for weather. A real classification still records `ok: true`.
-      const detail = `reader unavailable: ${String(error && error.message || error).replace(/\s+/g, ' ').trim()}`;
-      health.record('discord', { skipped: true, clearFailures: true, detail, cadenceMs });
-      process.stderr.write(`keep discord: ${error.message}\n`);
+      // Only the reader subprocess itself is weather. This catch wraps the whole
+      // pipeline, so a classifier that refused, a decisions file that would not write
+      // and an onChange that threw all land here too — those are real failures, and
+      // calling them "reader unavailable" would hide a broken watcher behind a closed
+      // browser tab.
+      if (isReaderFailure(error)) readerUnavailable(error.message);
+      else {
+        readerDown = false;
+        health.record('discord', { ok: false, error, cadenceMs });
+        process.stderr.write(`keep discord: ${error.message}\n`);
+      }
     } finally { running = false; }
   };
   const interval = setInterval(() => { void tick(); }, cadenceMs);
@@ -317,6 +358,7 @@ module.exports = {
   STATUS_FILE,
   DECISIONS_FILE,
   ReaderUnavailable,
+  isReaderFailure,
   config,
   readerArgv,
   callReader,

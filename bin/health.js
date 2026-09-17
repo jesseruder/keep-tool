@@ -147,6 +147,7 @@ function record(name, options = {}) {
       cadenceMs: Number(options.cadenceMs || cadence.cadenceMs || prior.cadenceMs || 0),
       detail: clipError(options.detail || 'not configured'),
     };
+    delete entry.expected;
     store[name] = entry;
     persist(store);
     return entry;
@@ -161,14 +162,23 @@ function record(name, options = {}) {
       cadenceMs: Number(options.cadenceMs || cadence.cadenceMs || prior.cadenceMs || 0),
     };
     // A skip ordinarily keeps the streak, so a scheduler that fails and then has
-    // nothing to do still reads as unresolved. `clearFailures` is for the opposite
-    // case: the tick decided the failure it is standing in for is not a fault at all
-    // (an endpoint rate limit, a browser reader that is unreliable by design). Without
-    // this the inherited count keeps the row amber, and turns it red at three —
-    // stateOf answers 'failing' on the streak before it ever looks at the skip, and
-    // bin/self-repair.js opens a card on the same count. lastError/lastErrorAt stay as
-    // history; presentationOf only reads them when the streak is nonzero.
-    if (options.clearFailures === true) entry.consecutiveFailures = 0;
+    // nothing to do still reads as unresolved. `expected` is for the opposite case: the
+    // tick decided the state it is standing in for is one the scheduler tolerates and
+    // no fault at all — an endpoint rate limit shared with every running session, a
+    // browser reader whose tab is closed. It does two things, together so they cannot
+    // drift apart. It zeroes the streak, because otherwise the inherited count keeps
+    // the row amber and turns it red at three: stateOf answers 'failing' on the streak
+    // before it ever looks at the skip, and bin/self-repair.js opens a card on the same
+    // count. And it marks the row, because a tolerated state has no success to be late
+    // against either — the Discord reader's tab can be closed for a weekend — which is
+    // what bin/lint.js daemonHealth reads instead of naming schedulers. Every other
+    // record clears the mark, so a real failure is lintable again the moment it lands.
+    // lastError/lastErrorAt stay as history; presentationOf only reads them while the
+    // streak is nonzero.
+    if (options.expected === true) {
+      entry.consecutiveFailures = 0;
+      entry.expected = true;
+    } else delete entry.expected;
     if (options.detail == null || options.detail === '') delete entry.detail;
     else entry.detail = clipError(options.detail);
     store[name] = entry;
@@ -192,6 +202,7 @@ function record(name, options = {}) {
   else delete entry.incidentAt;
   if (!ok && typeof options.incidentId === 'string') entry.incidentId = options.incidentId;
   else delete entry.incidentId;
+  delete entry.expected;
   if (options.detail == null || options.detail === '') delete entry.detail;
   else entry.detail = clipError(options.detail);
   store[name] = entry;
@@ -271,6 +282,10 @@ function snapshot(now = Date.now()) {
       consecutiveFailures: Number(entry.consecutiveFailures || 0),
       cadenceMs: Number(entry.cadenceMs || config.cadenceMs || 0),
       detail: entry.detail || '',
+      // Whether the latest record is a state the scheduler tolerates rather than
+      // progress or a fault. Carried into the row so `keep health --json` can be
+      // asked why a row has gone a long time without a success.
+      expected: entry.expected === true,
       daemonStartedAt: daemon.startedAt || null,
     };
     row.state = stateOf(row, now);

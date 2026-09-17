@@ -480,6 +480,14 @@ function createUsageManager(deps = {}) {
     return parts.join('; ');
   }
 
+  // Every account still carrying a failure that is not a rate limit: broken
+  // credentials, a timeout, a response nobody could parse, a Codex scan that found no
+  // snapshot. There is one `usage` row for every account, so a 429 on one account must
+  // not erase what another account's real fault has already recorded on it.
+  function unresolvedRealFailures() {
+    return [...states.values()].filter((state) => state.snapshot.error && state.failureKind !== 'rate-limit');
+  }
+
   function requestRefresh(now = clock(), performRefresh = refreshAccount) {
     now = Number.isFinite(Number(now)) ? Number(now) : clock();
     const current = sync();
@@ -551,7 +559,20 @@ function createUsageManager(deps = {}) {
               rateLimitWeather = true;
               process.stderr.write(`keep usage: ${weather}\n`);
             }
-            healthApi.record('usage', { ok: true, skipped: true, clearFailures: true, detail: weather });
+            // The 429s are weather, so they neither add to the streak nor — while some
+            // other account is still sitting on a real fault — clear it. Recording a
+            // failure instead would let weather inflate the streak on every poll, which
+            // is the thing this branch exists to stop; recording an expected state would
+            // clear the other account's evidence, which the reviewer's 12-hour
+            // simulation did 46 times without the row ever reaching two failures. An
+            // ordinary skip does neither: the streak, lastError and lastErrorAt stay,
+            // `keep health` keeps showing "N failed attempts · latest check skipped",
+            // and the row is still lintable and still a self-repair candidate.
+            const unresolved = unresolvedRealFailures();
+            healthApi.record('usage', unresolved.length ? {
+              ok: true, skipped: true,
+              detail: `${weather}; unresolved: ${unresolved.map((state) => `${state.account.label || state.account.id}: ${state.snapshot.error}`).join('; ')}`,
+            } : { ok: true, skipped: true, expected: true, detail: weather });
             return;
           }
           rateLimitWeather = false;

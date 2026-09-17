@@ -918,6 +918,38 @@ test('daemon-health folds every failing scheduler into one finding', () => {
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('daemon-health leaves a row whose latest record is a tolerated state alone', () => {
+  const root = makeRoot();
+  const now = Date.parse('2026-09-14T12:00:00');
+  try {
+    const write = (discord) => fs.writeFileSync(path.join(root, '.keep', 'health.json'), JSON.stringify({
+      daemon: { startedAt: now - 3600e3 }, discord,
+    }));
+    fs.mkdirSync(path.join(root, '.keep'), { recursive: true });
+
+    // The Discord reader's browser tab has been closed since Friday. That is a state
+    // its scheduler expects and tolerates, so there is no finding to act on — and the
+    // rule reads the row's own marker rather than knowing the name 'discord'.
+    write({ consecutiveFailures: 0, lastOkAt: now - 72 * 3600e3, cadenceMs: 15 * 60e3,
+      expected: true, detail: 'reader unavailable: Edge tab is closed' });
+    assert.deepEqual(lint({ root, rule: 'daemon-health', now }).findings, []);
+
+    // Without the marker the same row is late, exactly as before.
+    write({ consecutiveFailures: 0, lastOkAt: now - 72 * 3600e3, cadenceMs: 15 * 60e3 });
+    const late = lint({ root, rule: 'daemon-health', now }).findings;
+    assert.equal(late.length, 1);
+    assert.match(late[0].text, /discord: no successful run in 72h/);
+
+    // And a real classifier or storage failure is lintable the moment it lands: the
+    // record that carries it drops the marker.
+    write({ consecutiveFailures: 4, lastError: 'Discord classifier returned no JSON',
+      lastOkAt: now - 72 * 3600e3, cadenceMs: 15 * 60e3 });
+    const failing = lint({ root, rule: 'daemon-health', now }).findings;
+    assert.equal(failing.length, 1);
+    assert.match(failing[0].text, /discord: 4 consecutive failures: Discord classifier returned no JSON/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('daemon-health names the open self-repair card covering a failing row', () => {
   const root = makeRoot();
   const now = Date.parse('2026-09-15T12:00:00');

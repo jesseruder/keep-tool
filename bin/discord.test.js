@@ -164,43 +164,114 @@ test('dashboard merges Slack and Discord findings with source labels in time ord
   assert.deepEqual(JSON.parse(result.stdout), [['slack', 'Slack row'], ['discord', 'Discord row']]);
 });
 
-test('a reader failure is a log line, not a failing scheduler and never a repair card', () => {
-  const root = fixture({ enabled: true, intervalMin: 15 });
-  const healthModule = path.join(__dirname, 'health.js');
-  const selfRepairModule = path.join(__dirname, 'self-repair.js');
+const healthModule = path.join(__dirname, 'health.js');
+const selfRepairModule = path.join(__dirname, 'self-repair.js');
+const lintModule = path.join(__dirname, 'lint.js');
+
+// Two ticks of the scheduler against whatever reader `env` names, reporting the health
+// row each one left behind. Five real failures are recorded first, so every assertion
+// is also a statement about whether that inherited streak survives.
+function schedulerTicks(root, env, onChange = '') {
   const result = run(root, `
     const health = require(${JSON.stringify(healthModule)});
     const selfRepair = require(${JSON.stringify(selfRepairModule)});
+    const { lint } = require(${JSON.stringify(lintModule)});
     const discord = require(${JSON.stringify(discordModule)});
     health.record('daemon', { at: Date.now() - 60e3 });
-    // Enough real failures for self-repair to have opened a card on the old behaviour.
     for (let i = 0; i < 5; i += 1) health.record('discord', { ok: false, error: 'Discord reader timed out after 30s' });
     const before = health.snapshot().schedulers.find((entry) => entry.name === 'discord');
-    const scheduler = discord.startScheduler();
+    const scheduler = discord.startScheduler({ ${onChange} });
     clearInterval(scheduler.interval);
     clearTimeout(scheduler.first);
-    scheduler.tick().then(() => {
+    const observe = () => {
       const row = health.snapshot().schedulers.find((entry) => entry.name === 'discord');
-      process.stdout.write(JSON.stringify({
-        before: { state: before.state, sigs: selfRepair.signatures({ schedulers: [before] }).map((entry) => entry.sig).length },
-        state: row.state,
-        displayState: row.displayState,
-        detail: row.detail,
-        failures: row.consecutiveFailures,
-        sigs: selfRepair.signatures(health.snapshot()).map((entry) => entry.sig),
-      }));
-    }).catch((error) => { console.error(error.stack); process.exit(1); });
-  `, { KEEP_DISCORD_READER_ARGS: 'not json' });
+      return { state: row.state, displayState: row.displayState, detail: row.detail,
+        failures: row.consecutiveFailures, expected: row.expected,
+        sigs: selfRepair.signatures(health.snapshot()).map((entry) => entry.sig) };
+    };
+    scheduler.tick()
+      .then(() => { const first = observe(); return scheduler.tick().then(() => [first, observe()]); })
+      .then(([first, second]) => {
+        // A row late by a day, asked of the rule that flags exactly that.
+        const store = JSON.parse(require('fs').readFileSync(process.env.KEEP_DIR + '/.keep/health.json', 'utf8'));
+        store.discord.lastOkAt = Date.now() - 72 * 3600e3;
+        require('fs').writeFileSync(process.env.KEEP_DIR + '/.keep/health.json', JSON.stringify(store));
+        process.stdout.write(JSON.stringify({
+          before: { state: before.state, sigs: selfRepair.signatures({ schedulers: [before] }).length },
+          first,
+          second,
+          lint: lint({ root: process.env.KEEP_DIR, rule: 'daemon-health' }).findings.map((entry) => entry.text),
+        }));
+      })
+      .catch((error) => { console.error(error.stack); process.exit(1); });
+  `, env);
   assert.equal(result.status, 0, result.stderr);
-  const state = JSON.parse(result.stdout);
-  assert.equal(state.before.state, 'failing', 'the old behaviour turned the row red');
-  assert.equal(state.before.sigs, 1, 'and handed self-repair a signature');
-  assert.equal(state.state, 'skipped');
-  assert.equal(state.displayState, 'skipped');
-  assert.equal(state.detail, 'reader unavailable: KEEP_DISCORD_READER_ARGS must be a JSON array');
-  assert.equal(state.failures, 0);
-  assert.deepEqual(state.sigs, []);
-  assert.match(result.stderr, /^keep discord: KEEP_DISCORD_READER_ARGS must be a JSON array\n/m);
+  return { ...JSON.parse(result.stdout), stderr: result.stderr };
+}
+
+// A reader that answers the way the real one does when its browser tab is gone:
+// exit 3 with a `browser_reader_unavailable` envelope, which poll() swallows into the
+// status file rather than throwing.
+const UNAVAILABLE_READER = {
+  KEEP_DISCORD_READER: '/bin/sh',
+  KEEP_DISCORD_READER_ARGS: JSON.stringify(['-c',
+    'printf \'{"ok":false,"error":{"code":"browser_reader_unavailable","message":"Edge tab is closed"}}\'; exit 3']),
+};
+
+test('an unavailable reader is a tolerated state on both routes, logged once', () => {
+  // Route one: poll() swallowed ReaderUnavailable and status() reports the skip.
+  const swallowed = schedulerTicks(fixture({ enabled: true, intervalMin: 15 }), UNAVAILABLE_READER);
+  assert.equal(swallowed.before.state, 'failing', 'the inherited streak read as red');
+  assert.equal(swallowed.before.sigs, 1, 'and handed self-repair a signature');
+  for (const row of [swallowed.first, swallowed.second]) {
+    assert.equal(row.state, 'skipped');
+    assert.equal(row.displayState, 'skipped');
+    assert.equal(row.detail, 'reader unavailable: Edge tab is closed');
+    assert.equal(row.failures, 0);
+    assert.equal(row.expected, true);
+    assert.deepEqual(row.sigs, []);
+  }
+  assert.deepEqual(swallowed.stderr.split('\n').filter((line) => line.startsWith('keep discord:')),
+    ['keep discord: reader unavailable: Edge tab is closed'], 'one line for the transition, not one per tick');
+  assert.deepEqual(swallowed.lint, [], 'a closed browser tab is not a finding, however long it lasts');
+
+  // Route two: the reader subprocess itself failed, so poll() threw.
+  const threw = schedulerTicks(fixture({ enabled: true, intervalMin: 15 }),
+    { KEEP_DISCORD_READER: path.join(os.tmpdir(), 'keep-discord-no-such-reader') });
+  for (const row of [threw.first, threw.second]) {
+    assert.equal(row.state, 'skipped');
+    assert.equal(row.failures, 0);
+    assert.equal(row.expected, true);
+    assert.match(row.detail, /^reader unavailable: spawn .*keep-discord-no-such-reader ENOENT$/);
+    assert.deepEqual(row.sigs, []);
+  }
+  assert.equal(threw.stderr.split('\n').filter((line) => line.startsWith('keep discord:')).length, 1);
+  assert.deepEqual(threw.lint, []);
+});
+
+test('only the reader is weather: everything downstream of it still fails the row', () => {
+  // The catch wraps classification, persistence and onChange too. A failure there is
+  // somebody's to fix, and calling it "reader unavailable" would hide a broken watcher
+  // behind a closed browser tab.
+  const downstream = schedulerTicks(fixture({ enabled: true, intervalMin: 15 }), UNAVAILABLE_READER,
+    'onChange: () => { throw new Error(\'decisions file is not writable\'); }');
+  for (const row of [downstream.first, downstream.second]) {
+    assert.equal(row.expected, false, 'the marker is dropped by the real failure');
+    assert.equal(row.detail, '', 'and it is not reported as an unavailable reader');
+  }
+  assert.equal(downstream.second.state, 'failing');
+  assert.equal(downstream.second.failures, 7, 'the inherited streak keeps counting');
+  assert.deepEqual(downstream.second.sigs.map((sig) => sig.split(':')[1]), ['discord']);
+  assert.match(downstream.stderr, /^keep discord: decisions file is not writable$/m);
+  assert.deepEqual(downstream.lint, ['discord: 7 consecutive failures: decisions file is not writable']);
+
+  // A misconfigured reader command is a person's to fix, not weather either.
+  const misconfigured = schedulerTicks(fixture({ enabled: true, intervalMin: 15 }),
+    { KEEP_DISCORD_READER_ARGS: 'not json' });
+  assert.equal(misconfigured.second.state, 'failing');
+  assert.equal(misconfigured.second.expected, false);
+  assert.equal(misconfigured.second.failures, 7);
+  assert.match(misconfigured.stderr, /^keep discord: KEEP_DISCORD_READER_ARGS must be a JSON array$/m);
 });
 
 test('scheduler health uses the configured Discord polling interval', () => {

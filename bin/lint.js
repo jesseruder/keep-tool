@@ -756,6 +756,12 @@ function daemonHealth(_task, ctx) {
     // An on-demand scheduler (digest, usage) has no cadence to be late against: it
     // runs when something asks, and "no successful run in 24h" is its normal state.
     if (cadence.onDemand) continue;
+    // Nor has a row whose latest record is a state its own scheduler tolerates and
+    // expects (`health.record(..., { expected: true })`). The Discord reader's browser
+    // tab can be closed for a weekend, which is not a daemon fault and not something a
+    // finding can fix. Any real failure clears the mark as it is recorded, so a broken
+    // classifier or an unwritable decisions file is lintable again immediately.
+    if (entry.expected === true) continue;
     // A daily one legitimately goes a day between runs, so 24h alone makes it flap
     // every morning before it has run. Give every row two of its own cadences.
     const silentMs = Math.max(HEALTH_SILENT_MS, 2 * Number(cadence.cadenceMs || entry.cadenceMs || 0));
