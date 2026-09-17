@@ -82,6 +82,25 @@ Launch directly with one Bash call in the intended worktree, for example:
 keep codex --account codex-secondary task --background --model gpt-5.6-sol --effort high --write 'Scoped implementation request; handoff from Claude Code; do not spawn a reviewer. Do not run long builds or test suites; verify with git diff --check and read the diff.'
 ```
 
+When this session owns a Keep card with a plan and the handoff is one of its steps,
+register the assignment by wrapping that same launch in `keep delegate`:
+
+```sh
+keep delegate <card> --step <n> -- keep codex --account codex-secondary task --background --model gpt-5.6-sol --effort high --write '...'
+```
+
+The delegation id rides the environment through the companion and its broker into the
+Codex session (verified 2026-09-17: the record binds with `bindSource: environment`),
+so `--prepare` and `--accept` are not needed for this launcher. The worker is then
+refused an ordinary `keep add` with a message naming the parent card and step, instead
+of opening a shadow card. Skip the wrapper for a card with no plan, and for reviews.
+
+A Codex task cannot write the Keep registry: its sandbox's writable root is the
+workspace, and `~/keep` is outside it, with or without `--write`. Do not ask it to
+check in, mark a step, or file a follow-up. Tell it to return its result, the files it
+changed and anything it would have filed; this session checks in, advances the step
+with `keep checkin <card> --step <n>`, and files follow-ups with `keep add --file`.
+
 Preserve the required lowercase phrase **"handoff from Claude Code; do not spawn a
 reviewer"** in the actual prompt. Select model and effort using the rules below.
 Add `--write` for implementation; omit it for read-only review or diagnosis.

@@ -2161,3 +2161,23 @@ test('a probe full of shell punctuation survives the frontmatter round-trip', ()
     assert.equal(f.run(['probe', 'bracket-probe']).status, 1, 'and fails once the file is gone');
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
+
+test('a registry this process cannot write is one line, not a stack trace', { skip: process.getuid && process.getuid() === 0 }, () => {
+  // Where a sandboxed Codex worker finds itself: it can read the card and cannot take the lock.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-readonly-'));
+  try {
+    fs.mkdirSync(path.join(root, 'tasks'));
+    fs.mkdirSync(path.join(root, '.keep'));
+    fs.writeFileSync(path.join(root, 'tasks', 'card.md'), '---\ntitle: Card\nstatus: active\ntags: [personal]\n---\n');
+    fs.chmodSync(path.join(root, '.keep'), 0o555);
+    const env = { ...process.env, KEEP_DIR: root };
+    delete env.CLAUDE_CODE_SESSION_ID;
+    const r = spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'checkin', 'card', '-m', 'from a sandbox'], { encoding: 'utf8', env });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /^keep: the Keep registry at .* is not writable from here \((EPERM|EACCES)\); a sandboxed worker returns its result to the parent session, which checks in\n$/);
+    assert.doesNotMatch(r.stderr, /at withLock|node:fs/);
+  } finally {
+    try { fs.chmodSync(path.join(root, '.keep'), 0o755); } catch {}
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

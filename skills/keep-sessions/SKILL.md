@@ -117,6 +117,11 @@ cannot carry environment variables, run `--prepare` and give the printed
   or passes `--force` for deliberately independent work; a forced card records that
   decision as its created entry. `keep lint`'s `handoff-shadow` rule flags the cards that
   slipped through.
+- A background Codex task (`keep codex task`) cannot write the registry at all: its
+  sandbox's writable root is its workspace. It returns its result to the parent, and the
+  parent checks in. Wrap that launch in `keep delegate <card> --step <n> -- keep codex
+  ... task ...`; the delegation id reaches the Codex session through the environment.
+  `implementation-handoff` has the launch rules.
 
 Use `keep open --fresh` when the other session should own the card, and `keep delegate`
 when you keep the card and want one step done.
