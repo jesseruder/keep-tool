@@ -730,6 +730,53 @@ test('a closed pane is removed from the host, and a dead one is removed without 
   } finally { _resetSchedulerState(); }
 });
 
+test('the ephemeral sweep leaves a session an account transfer is moving alone', async () => {
+  _resetSchedulerState();
+  const keepModule = require('./keep.js');
+  const previousRoot = keepModule.ROOT;
+  const previousWrite = process.stderr.write;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-runs-transfer-'));
+  try {
+    keepModule.ROOT = root;
+    const sid = 'transferring-sid';
+    const recordFile = path.join(root, '.keep', 'account-handoffs', `${sid}.json`);
+    fs.mkdirSync(path.dirname(recordFile), { recursive: true });
+    const now = 1_000_000 + 5 * 3600e3;
+    // A transfer stops the source agent on purpose, so mid-transfer the pane reads
+    // here as an agent that has exited — and closing it takes away the pane the
+    // retry resumes into.
+    fs.writeFileSync(recordFile, JSON.stringify({
+      sessionId: sid, status: 'recovery-needed', phase: 'stopping-source', updatedAt: now - 30e3 }));
+    const closed = [], removed = [], lines = [];
+    const host = {
+      listPanes: async () => [ephemeralPane({ id: 'moving', alive: false, meta: { card: null, sessionId: sid } })],
+      sessions: async () => [{ id: sid, exited: true, mtime: 1_000_000 }],
+      closePane: async (pane, id) => { closed.push([pane.id, id]); },
+      removePane: async (pane) => { removed.push(pane.id); },
+    };
+    process.stderr.write = (line) => { lines.push(String(line)); return true; };
+    const result = await sweepEphemeralPanes(host, now);
+    process.stderr.write = previousWrite;
+    assert.deepEqual(result, [], 'the pane is not closed');
+    assert.deepEqual(closed, []);
+    assert.deepEqual(removed, [], 'and it is not forgotten either, so the next tick reconsiders it');
+    assert.ok(lines.some((line) => line.includes('an account transfer is in flight (recovery-needed/stopping-source)')),
+      lines.join(''));
+
+    // Once the transfer is done the same pane is reaped exactly as before.
+    fs.writeFileSync(recordFile, JSON.stringify({ sessionId: sid, status: 'done', phase: 'done', updatedAt: now }));
+    process.stderr.write = () => true;
+    assert.deepEqual(await sweepEphemeralPanes(host, now), ['moving']);
+    process.stderr.write = previousWrite;
+    assert.deepEqual(removed, ['moving']);
+  } finally {
+    process.stderr.write = previousWrite;
+    keepModule.ROOT = previousRoot;
+    fs.rmSync(root, { recursive: true, force: true });
+    _resetSchedulerState();
+  }
+});
+
 test('a pane that will not be forgotten leaves its card exactly as it was', async () => {
   _resetSchedulerState();
   try {

@@ -645,6 +645,14 @@ async function sweepEphemeralPanes(host = ephemeralHost, now = Date.now()) {
     const decision = reapEphemeralPane({ pane, session: byId.get(sessionId), checkedInAt, now });
     if (!decision.reap) continue;
     const label = `${pane.meta.ephemeral} session pane ${pane.id} for ${pane.meta.card || 'no card'}`;
+    // An account transfer stops the source agent on purpose, so mid-transfer the pane
+    // reads here as an agent that has exited. Closing it takes away the very pane the
+    // transfer's retry resumes into, and the check is then cancelled for nothing.
+    const transfer = require('./account-handoff').transferInFlight(keep.ROOT, sessionId, now);
+    if (transfer) {
+      process.stderr.write(`keep runs: left the ${label} open: an account transfer is in flight (${transfer.status}/${transfer.phase})\n`);
+      continue;
+    }
     try {
       // A pane that is already dead needs no graceful close, only removal; a live one
       // is closed through the guarded automatic path, which refuses rather than kills

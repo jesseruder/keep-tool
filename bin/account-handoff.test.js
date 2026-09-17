@@ -1037,3 +1037,49 @@ test('a limit that clears while the target login is checked stops the transfer b
     assert.equal(restarts, 1);
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
+
+test('a transfer in flight is visible to anything that would close the session under it', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-inflight-'));
+  try {
+    const sid = 'session-inflight';
+    const now = Date.UTC(2026, 8, 17, 12, 0, 0);
+    const recordFile = path.join(root, '.keep', 'account-handoffs', `${sid}.json`);
+    fs.mkdirSync(path.dirname(recordFile), { recursive: true });
+    const record = (over) => fs.writeFileSync(recordFile, JSON.stringify({ sessionId: sid, updatedAt: now, ...over }));
+    const queueFile = path.join(root, '.keep', 'handoff-queue', `${sid}.json`);
+    fs.mkdirSync(path.dirname(queueFile), { recursive: true });
+
+    assert.equal(handoff.transferInFlight(root, sid, now), null, 'no record and no queue entry, nothing in flight');
+    for (const status of ['stopping', 'copying', 'starting', 'verifying', 'delivering']) {
+      record({ status, phase: `${status}-phase` });
+      assert.deepEqual(handoff.transferInFlight(root, sid, now), { status, phase: `${status}-phase` }, status);
+    }
+    // The source agent is gone by design here and the queue retries from exactly this
+    // shape, so whatever it will resume into has to still be there.
+    record({ status: 'recovery-needed', phase: 'stopping-source', updatedAt: now - 60e3 });
+    assert.deepEqual(handoff.transferInFlight(root, sid, now), { status: 'recovery-needed', phase: 'stopping-source' });
+    record({ status: 'recovery-needed', phase: 'stopping-source', updatedAt: now - 11 * 60e3 });
+    assert.equal(handoff.transferInFlight(root, sid, now), null, 'nobody is coming back for a stopped source this old');
+    // A refusal at another phase never stopped the source at all.
+    record({ status: 'recovery-needed', phase: 'delivering-continuation', updatedAt: now });
+    assert.equal(handoff.transferInFlight(root, sid, now), null);
+    for (const status of ['done', 'failed']) {
+      record({ status, phase: status === 'done' ? 'done' : 'preflight', updatedAt: now });
+      assert.equal(handoff.transferInFlight(root, sid, now), null, status);
+    }
+    // A queued entry counts on its own: the transfer has not started, but it is about
+    // to, and the phase it last stopped at is worth saying in the refusal.
+    fs.writeFileSync(queueFile, JSON.stringify({ sessionId: sid, status: 'queued' }));
+    assert.deepEqual(handoff.transferInFlight(root, sid, now), { status: 'queued', phase: 'preflight' });
+    fs.rmSync(recordFile);
+    assert.deepEqual(handoff.transferInFlight(root, sid, now), { status: 'queued', phase: 'not started' });
+    for (const status of ['parked', 'moved', 'cancelled']) {
+      fs.writeFileSync(queueFile, JSON.stringify({ sessionId: sid, status }));
+      assert.equal(handoff.transferInFlight(root, sid, now), null, status);
+    }
+    // A session id is a path component here, so nothing but a session id is read.
+    fs.writeFileSync(queueFile, JSON.stringify({ sessionId: sid, status: 'queued' }));
+    assert.equal(handoff.transferInFlight(root, `../handoff-queue/${sid}`, now), null);
+    assert.equal(handoff.transferInFlight(root, '', now), null);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

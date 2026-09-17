@@ -117,6 +117,37 @@ function list(root) {
   }).sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt));
 }
 
+// The statuses a transaction passes through while it is actively moving a session.
+const IN_FLIGHT_STATUSES = ['stopping', 'copying', 'starting', 'verifying', 'delivering'];
+// How long a stopped source is still somebody's business. The queue's own patience
+// runs to 45 minutes, but a transfer that has not moved in ten is not one whose pane
+// this should keep reserving.
+const STOPPED_SOURCE_GRACE_MS = 10 * 60e3;
+// Whether a transfer is still holding this session, for callers whose own action
+// would take the session out from under it. A transfer stops the source agent by
+// design, which makes the session look exited to anything watching processes: on
+// 2026-09-17 the ephemeral-pane sweep closed such a pane within a minute of a
+// transfer's host `get` timing out, and the retry found nothing left to resume.
+//
+// In flight is any of the working statuses; or a 'recovery-needed' record stopped at
+// 'stopping-source', which is exactly the shape a retry picks up (the same safePhase
+// portableFallbackCandidate reads) for as long as it is fresh; or an entry the queue
+// is still holding and has not tried yet.
+function transferInFlight(root, sessionId, now = Date.now()) {
+  if (!/^[A-Za-z0-9_-]+$/.test(String(sessionId || ''))) return null;
+  let entry = null;
+  try { entry = readOne(root, sessionId); } catch { entry = null; }
+  if (entry && IN_FLIGHT_STATUSES.includes(entry.status)) return { status: entry.status, phase: entry.phase || '' };
+  if (entry && entry.status === 'recovery-needed' && entry.phase === 'stopping-source'
+      && now - Number(entry.updatedAt || 0) < STOPPED_SOURCE_GRACE_MS) {
+    return { status: entry.status, phase: entry.phase };
+  }
+  let queued = null;
+  try { queued = require('./handoff-queue').readOne(root, sessionId); } catch { queued = null; }
+  if (queued && queued.status === 'queued') return { status: 'queued', phase: (entry && entry.phase) || 'not started' };
+  return null;
+}
+
 function commitTargetAuthority(sessionId, targetAccountId, transactionId, root) {
   const current = accounts.authority(root)[sessionId];
   if (current?.accountId === targetAccountId && !current.stagedAccountId && current.transactionId === transactionId) return current;
@@ -794,4 +825,4 @@ function abandonedForPortable(root, sessionId) {
 }
 
 module.exports = { run, abandonForPortable, abandonedForPortable, list, safe, authPreflight, permissionClass,
-  loginShellOutput, classifyRefusal, CONTINUATION_TEXT };
+  loginShellOutput, classifyRefusal, transferInFlight, CONTINUATION_TEXT };
