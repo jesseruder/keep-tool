@@ -67,7 +67,12 @@ function idleSession(id = 'sess-1', pane = 'pane-1', mtime = NOW - 4 * HOUR) {
 // Every seam the tick reaches the world through. Nothing here spawns a process,
 // opens a pane, or types into a terminal.
 function makeDeps(fixture, state = {}) {
-  const calls = { wt: [], opens: [], sends: [], closes: [], targets: [], notes: [], flushes: 0, writes: [] };
+  const calls = { wt: [], opens: [], sends: [], types: [], closes: [], targets: [], notes: [], flushes: 0, writes: [] };
+  // The transport's own delivery journal, modelled: `delivery.deliver` writes one
+  // before it types and finishes it on a confirmation, so a retry of an
+  // unconfirmed send submits the draft it still recognises instead of retyping,
+  // while a retry after a confirmed send has nothing left to recover from.
+  const journal = new Set();
   const deps = {
     calls,
     worktreePath: (repo, name) => path.join(fixture.root, 'wt', repo, name),
@@ -94,10 +99,26 @@ function makeDeps(fixture, state = {}) {
     },
     sendToResolvedTarget: async (session, target, text, opts) => {
       calls.sends.push({ session: session.id, pane: target.pane, text, opts });
+      if (opts && opts.beforeType) await opts.beforeType();
       if (state.onSend) await state.onSend(text, opts);
-      if (state.sendError) throw state.sendError;
-      if (state.sendResult) return state.sendResult;
-      // What delivery.js reports for a transcript-confirmed send.
+      if (journal.has(text)) {
+        // Its own draft, still in the box: submitted, not retyped.
+        journal.delete(text);
+        return { ok: true, delivery: 'received', recovered: true };
+      }
+      if (state.sendError) { journal.add(text); calls.types.push(text); throw state.sendError; }
+      calls.types.push(text);
+      if (state.sendResult) {
+        // `assumed-delivered` is what the transport returns when it GIVES UP on an
+        // expired journal, which it finishes on the way out — so there is nothing
+        // left to recover from afterwards. A truncated send is the opposite: the
+        // draft is still in the box and its journal is still there.
+        if (state.sendResult.truncated) journal.add(text);
+        else journal.delete(text);
+        return state.sendResult;
+      }
+      // What delivery.js reports for a transcript-confirmed send: its journal is
+      // finished, so there is nothing to recover from afterwards.
       return { ok: true, delivery: 'received' };
     },
     withInjectionLock: (fn) => fn(),
@@ -418,11 +439,15 @@ test('one delivery per tick carries every new event, in seq order, and moves the
       assert.ok(text.includes(fragment), `the batch carries ${fragment}`);
     }
     assert.equal(opts.compactIfCold, true);
-    assert.equal(opts.retainReceipt, true);
-    // The key is the batch's seq range, so a retry asks about the same receipt.
+    // No retained receipt: what a delivery is worth is our own
+    // `pendingDelivery.state`, not the transport's receipt store, which files a
+    // received receipt for a delivery it only assumed.
+    assert.equal(opts.retainReceipt, false);
     assert.equal(opts.deliveryKey, 'agent:sandboxes:seq:1-3');
     assert.equal(cursor(fixture), 3);
-    assert.equal(areaSession.pendingDeliveryOf(record(fixture)), null, 'a confirmed send clears the pending batch');
+    const acknowledged = areaSession.pendingDeliveryOf(record(fixture));
+    assert.equal(acknowledged.state, 'confirmed', 'the cursor and the confirmation land together');
+    assert.equal(acknowledged.lastSeq, 3);
 
     const repeat = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
     assert.equal(repeat.delivery.state, 'nothing');
@@ -528,49 +553,6 @@ test('a mid-turn session is not interrupted and its cursor does not move', async
   } finally { cleanup(fixture.root); }
 });
 
-test('a daemon death between the send and the cursor write retries the same key and sends nothing', async () => {
-  const fixture = makeRoot();
-  try {
-    feed(fixture, [
-      { at: NOW - 2 * MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox Open Health' },
-      { at: NOW - MINUTE, kind: 'incident-fired', card: 'inc-a', title: 'Sandbox Open Health' },
-    ]);
-    // The send is confirmed and the receipt written; the record write that would
-    // have advanced the cursor is what dies.
-    const receipts = new Set();
-    const state = {
-      panes: [livePane()], sessions: [idleSession()],
-      receiptFor: (text, key) => (receipts.has(key) ? { sessionId: 'sess-1', kind: 'claude', received: true } : null),
-      writeError: (patch) => (patch.lastDeliveredSeq ? new Error('disk went away') : null),
-    };
-    const deps = makeDeps(fixture, state);
-    const original = deps.sendToResolvedTarget;
-    deps.sendToResolvedTarget = async (session, target, text, opts) => {
-      receipts.add(opts.deliveryKey);
-      return original(session, target, text, opts);
-    };
-
-    const died = sandboxes(await tick(fixture, deps));
-    assert.equal(deps.calls.sends.length, 1, 'the message went out');
-    assert.equal(died.delivery.state, 'sent');
-    assert.match(died.delivery.cursorError, /disk went away/);
-    assert.equal(cursor(fixture), 0, 'the cursor never advanced');
-    const pending = areaSession.pendingDeliveryOf(record(fixture));
-    assert.deepEqual({ key: pending.key, firstSeq: pending.firstSeq, lastSeq: pending.lastSeq },
-      { key: 'agent:sandboxes:seq:1-2', firstSeq: 1, lastSeq: 2 });
-
-    // The next tick asks about the persisted batch's own key, finds the receipt,
-    // and acknowledges it without typing anything.
-    state.writeError = null;
-    const recovered = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
-    assert.equal(recovered.delivery.state, 'sent');
-    assert.equal(recovered.delivery.delivery, 'received');
-    assert.equal(deps.calls.sends.length, 1, 'nothing was retyped');
-    assert.equal(cursor(fixture), 2);
-    assert.equal(areaSession.pendingDeliveryOf(record(fixture)), null);
-  } finally { cleanup(fixture.root); }
-});
-
 test('a typed-but-unconfirmed batch is retried through the recovery path, not stalled', async () => {
   const fixture = makeRoot();
   try {
@@ -602,6 +584,54 @@ test('a typed-but-unconfirmed batch is retried through the recovery path, not st
     assert.equal(deps.calls.sends[1].text, deps.calls.sends[0].text, 'the same characters, not a recomputed batch');
     assert.equal(deps.calls.sends[1].opts.deliveryKey, deps.calls.sends[0].opts.deliveryKey);
     assert.equal(cursor(fixture), 1);
+  } finally { cleanup(fixture.root); }
+});
+
+test('a delayed tick cannot resurrect a batch built from a cursor that has moved', async () => {
+  const fixture = makeRoot();
+  try {
+    feed(fixture, [{ at: NOW - 2 * MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox A' }]);
+    const state = { panes: [livePane()], sessions: [idleSession()] };
+    const deps = makeDeps(fixture, state);
+
+    // The interleaving that used to get event 1 delivered twice. Tick A starts
+    // while only event 1 exists, so it selects [1]. Before it can take the lease,
+    // event 2 arrives and tick B delivers [1,2] and moves the cursor to 2. Tick A
+    // then wakes up holding a batch built from a cursor of 0.
+    //
+    // The fix is that the batch tick A actually sends is chosen from the record it
+    // reads AFTER claiming the lease — by which time the cursor is 2 and there is
+    // nothing left to send — so its stale [1] is never persisted and never typed.
+    let releaseA;
+    let started = false;
+    deps.claimDeliveryLease = (name, root, at, d) => {
+      if (!started) {
+        started = true;
+        return new Promise((resolve) => { releaseA = () => resolve(areaSession.claimDeliveryLease(name, root, at, d)); });
+      }
+      return areaSession.claimDeliveryLease(name, root, at, d);
+    };
+    const a = tick(fixture, deps);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Tick B, with both events, delivering [1,2].
+    agents.emit('sandboxes', { at: NOW - MINUTE, kind: 'incident-fired', card: 'inc-a', title: 'Sandbox A' },
+      { root: fixture.root, now: NOW });
+    const b = makeDeps(fixture, state);
+    const bReport = sandboxes(await tick(fixture, b, { now: NOW + 1000 }));
+    assert.equal(bReport.delivery.state, 'sent');
+    assert.equal(bReport.delivery.count, 2);
+    assert.equal(cursor(fixture), 2);
+
+    releaseA();
+    const aReport = sandboxes(await a);
+    assert.equal(aReport.delivery.state, 'nothing', 'tick A found nothing left to send');
+    assert.equal(deps.calls.sends.length, 0, 'and typed nothing');
+    assert.equal(cursor(fixture), 2, 'the cursor did not go backwards');
+    // Event 1 went out exactly once, inside tick B's batch.
+    const sent = b.calls.sends.filter((call) => call.text.includes('inc-a'));
+    assert.equal(sent.length, 1);
+    assert.equal(areaSession.pendingDeliveryOf(record(fixture)).lastSeq, 2);
   } finally { cleanup(fixture.root); }
 });
 
@@ -689,67 +719,182 @@ test('a retry types the same characters, queued-count sentence and all', async (
   } finally { cleanup(fixture.root); }
 });
 
-test('an assumed delivery leaves the cursor and the batch alone, receipt or no receipt', async () => {
+test('a crash between the send and the state write does not double-type', async () => {
   const fixture = makeRoot();
   try {
-    feed(fixture, [{ at: NOW - MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox Open Health' }]);
-    // What delivery.js returns when it gives up on an expired journal whose text
-    // had reached the pane. It files a *received* receipt for that, which is not a
-    // transcript confirmation of anything.
-    // The helper files the received receipt as part of assuming delivery, so the
-    // receipt appears only after the first send — exactly as it would in life.
-    const filed = new Set();
+    feed(fixture, [
+      { at: NOW - 2 * MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox Open Health' },
+      { at: NOW - MINUTE, kind: 'incident-fired', card: 'inc-a', title: 'Sandbox Open Health' },
+    ]);
+    // Confirmed by the transport, and then the write that would have recorded it
+    // — the one that moves the cursor and sets `state: 'confirmed'` together — is
+    // what dies. Our own state is still `sending`.
     const state = {
       panes: [livePane()], sessions: [idleSession()],
-      sendResult: { ok: true, delivery: 'assumed-delivered', expired: true },
-      onSend: (text, opts) => { filed.add(opts.deliveryKey); },
-      receiptFor: (text, key) => (filed.has(key) ? { sessionId: 'sess-1', kind: 'claude', received: true } : null),
+      writeError: (patch) => (patch.lastDeliveredSeq ? new Error('disk went away') : null),
     };
     const deps = makeDeps(fixture, state);
-    const assumed = sandboxes(await tick(fixture, deps));
-    assert.equal(assumed.delivery.state, 'deferred');
-    assert.equal(assumed.delivery.assumed, true);
-    assert.equal(assumed.delivery.assumedAttempts, 1);
-    assert.equal(cursor(fixture), 0, 'nothing was acknowledged');
+    const died = sandboxes(await tick(fixture, deps));
+    assert.equal(deps.calls.types.length, 1, 'the message was typed once');
+    assert.equal(died.delivery.state, 'sent');
+    assert.match(died.delivery.cursorError, /disk went away/);
+    assert.equal(cursor(fixture), 0, 'the cursor never advanced');
     const pending = areaSession.pendingDeliveryOf(record(fixture));
-    assert.equal(pending.assumed, true);
-    assert.equal(pending.key, 'agent:sandboxes:seq:1-1');
+    assert.equal(pending.state, 'sending', 'so our state still says we were sending');
+    assert.equal(pending.key, 'agent:sandboxes:seq:1-2');
 
-    // Next tick: the receipt on disk says received, but it was filed by that
-    // assumption, so it is not read back as evidence. The batch is offered again.
-    const again = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
-    assert.equal(again.delivery.state, 'deferred');
-    assert.equal(again.delivery.assumedAttempts, 2);
-    assert.equal(deps.calls.sends.length, 2, 'offered again rather than acknowledged');
-    assert.equal(cursor(fixture), 0);
-
-    // A real confirmation ends it.
-    state.sendResult = { ok: true, delivery: 'received' };
-    const confirmed = sandboxes(await tick(fixture, deps, { now: NOW + 2 * MINUTE }));
-    assert.equal(confirmed.delivery.state, 'sent');
-    assert.equal(cursor(fixture), 1);
-    assert.equal(areaSession.pendingDeliveryOf(record(fixture)), null);
+    // The next tick. A confirmed send finished the transport's journal, so there
+    // is nothing there to recover a draft from — the transcript is the remaining
+    // witness, and it is asked before anything is typed.
+    state.writeError = null;
+    const asked = [];
+    deps.transcriptShows = (session, text) => { asked.push(text); return true; };
+    const recovered = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
+    assert.equal(recovered.delivery.state, 'sent');
+    assert.equal(recovered.delivery.delivery, 'found-in-transcript');
+    assert.equal(deps.calls.types.length, 1, 'and it was not typed a second time');
+    assert.equal(asked[0], pending.text, 'the transcript was asked about the persisted text');
+    assert.equal(cursor(fixture), 2);
+    assert.equal(areaSession.pendingDeliveryOf(record(fixture)).state, 'confirmed');
   } finally { cleanup(fixture.root); }
 });
 
-test('a receipt that cannot be read defers the tick rather than counting as absent', async () => {
+test('a transcript that does not show the text retypes it, through the journal path', async () => {
+  const fixture = makeRoot();
+  try {
+    feed(fixture, [{ at: NOW - MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox Open Health' }]);
+    const state = {
+      panes: [livePane()], sessions: [idleSession()],
+      sendError: new Error('Delivery unconfirmed: no matching transcript receipt.'),
+    };
+    const deps = makeDeps(fixture, state);
+    // Typed, never confirmed: the transport keeps its journal for that.
+    assert.equal(sandboxes(await tick(fixture, deps)).delivery.state, 'deferred');
+    assert.equal(deps.calls.types.length, 1);
+    assert.equal(areaSession.pendingDeliveryOf(record(fixture)).state, 'sending');
+
+    // The transcript has nothing, so the send is attempted again — and the
+    // transport recognises its own journal and submits the draft rather than
+    // typing it twice.
+    state.sendError = null;
+    deps.transcriptShows = () => false;
+    const retried = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
+    assert.equal(retried.delivery.state, 'sent');
+    assert.equal(deps.calls.sends.length, 2, 'the transport was called again');
+    assert.equal(deps.calls.types.length, 1, 'and recovered its draft instead of retyping');
+    assert.equal(deps.calls.sends[1].text, deps.calls.sends[0].text);
+    assert.equal(cursor(fixture), 1);
+  } finally { cleanup(fixture.root); }
+});
+
+test('our own confirmed state moves the cursor with no transport at all', async () => {
+  const fixture = makeRoot();
+  try {
+    feed(fixture, [{ at: NOW - MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox Open Health' }]);
+    const deps = makeDeps(fixture, { panes: [livePane()], sessions: [idleSession()] });
+    // A record left behind by a tick that confirmed a batch and then failed to
+    // write the cursor in the same breath. Our state is the provenance, so the
+    // cursor moves and nothing is sent, asked or recovered.
+    agents.writeRecord('sandboxes', {
+      pendingDelivery: {
+        key: 'agent:sandboxes:seq:1-1', firstSeq: 1, lastSeq: 1, offset: 0, count: 1,
+        text: 'whatever was sent', at: NOW - MINUTE, state: 'confirmed',
+      },
+    }, { root: fixture.root });
+    const report = sandboxes(await tick(fixture, deps));
+    assert.equal(report.delivery.state, 'sent');
+    assert.equal(report.delivery.delivery, 'confirmed-earlier');
+    assert.equal(deps.calls.sends.length, 0, 'nothing was sent');
+    assert.equal(cursor(fixture), 1);
+  } finally { cleanup(fixture.root); }
+});
+
+test('three unconfirmed sends advance the cursor and put the uncertainty on the feed', async () => {
+  const fixture = makeRoot();
+  try {
+    feed(fixture, [{ at: NOW - MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox Open Health' }]);
+    const state = {
+      panes: [livePane()], sessions: [idleSession()],
+      sendResult: { ok: true, delivery: 'assumed-delivered', expired: true },
+    };
+    const deps = makeDeps(fixture, state);
+    deps.transcriptShows = () => false;
+    let at = NOW;
+    for (let attempt = 1; attempt < areaSession.ASSUMED_ATTEMPT_LIMIT; attempt += 1) {
+      const report = sandboxes(await tick(fixture, deps, { now: at }));
+      assert.equal(report.delivery.state, 'deferred', `attempt ${attempt} defers`);
+      assert.equal(report.delivery.assumedAttempts, attempt);
+      assert.equal(cursor(fixture), 0, 'and acknowledges nothing');
+      at += MINUTE;
+    }
+    // The cap. Retyping the same events forever is its own failure — the session
+    // has probably had them every time — so the queue moves on and says so.
+    const capped = sandboxes(await tick(fixture, deps, { now: at }));
+    assert.equal(capped.delivery.state, 'sent');
+    assert.equal(capped.delivery.delivery, 'uncertain');
+    assert.equal(capped.delivery.assumedAttempts, areaSession.ASSUMED_ATTEMPT_LIMIT);
+    assert.equal(cursor(fixture), 1, 'the cursor moved past it');
+    const uncertain = agents.readEvents('sandboxes', { root: fixture.root })
+      .find((event) => event.kind === 'delivery-uncertain');
+    assert.ok(uncertain, 'and the uncertainty is on the feed');
+    assert.equal(uncertain.severity, 'med');
+    assert.equal(uncertain.card, '');
+    assert.match(uncertain.text, /seq 1-1/);
+    assert.ok(uncertain.seq > 1, 'after the cursor, so the next batch carries it');
+
+    // Which it does: the next batch is that event, and the queue is moving again.
+    state.sendResult = null;
+    const next = sandboxes(await tick(fixture, deps, { now: at + MINUTE }));
+    assert.equal(next.delivery.state, 'sent');
+    assert.match(deps.calls.sends.at(-1).text, /delivery-uncertain/);
+  } finally { cleanup(fixture.root); }
+});
+
+test('a delivery lease stolen during a slow send stops the cursor advancing', async () => {
   const fixture = makeRoot();
   try {
     feed(fixture, [{ at: NOW - MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox Open Health' }]);
     const state = { panes: [livePane()], sessions: [idleSession()] };
     const deps = makeDeps(fixture, state);
-    deps.deliveryStatus = () => { throw new Error('EACCES: receipts are unreadable'); };
+    // `compactIfCold` can spend minutes before a character is typed. Somebody
+    // else takes the lease while this send is in flight.
+    state.onSend = () => {
+      agents.writeRecord('sandboxes', {
+        deliveryLease: { at: Date.now(), by: 'another-tick' },
+      }, { root: fixture.root });
+    };
     const report = sandboxes(await tick(fixture, deps));
     assert.equal(report.delivery.state, 'deferred');
-    assert.match(report.delivery.reason, /receipt could not be read/);
-    assert.equal(deps.calls.sends.length, 0, 'an unreadable receipt is not an absent one');
-    assert.equal(cursor(fixture), 0);
-    assert.ok(deps.calls.notes.some((line) => line.includes('could not read the delivery receipt')));
+    assert.match(report.delivery.reason, /delivery lease was lost/);
+    assert.equal(report.delivery.leaseLost, true);
+    assert.equal(cursor(fixture), 0, 'the cursor is not ours to move any more');
+    assert.equal(areaSession.pendingDeliveryOf(record(fixture)).state, 'sending',
+      'and the batch stays sending, for whoever holds the lease');
+    assert.equal(record(fixture).deliveryLease.by, 'another-tick', 'whose lease is left alone');
+  } finally { cleanup(fixture.root); }
+});
 
-    deps.deliveryStatus = () => null;
-    const sent = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
-    assert.equal(sent.delivery.state, 'sent');
-    assert.equal(cursor(fixture), 1);
+test('the lease is renewed underneath a slow send, and the timer is always cleared', async () => {
+  const fixture = makeRoot();
+  try {
+    feed(fixture, [{ at: NOW - MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox Open Health' }]);
+    const state = { panes: [livePane()], sessions: [idleSession()] };
+    const deps = makeDeps(fixture, state);
+    const renewals = [];
+    deps.renewDeliveryLease = (name, root, at, by, d) => {
+      renewals.push(at);
+      return areaSession.renewDeliveryLease(name, root, at, by, d);
+    };
+    // The renewal timer runs on a 30 s clock, so what this asserts is that it is
+    // created, unref'd and always cleared — not that it fires inside a test.
+    const timers = () => process.getActiveResourcesInfo().filter((kind) => kind === 'Timeout').length;
+    const before = timers();
+    const report = sandboxes(await tick(fixture, deps));
+    assert.equal(report.delivery.state, 'sent');
+    // Once before typing, once from beforeType, once after the send returns.
+    assert.ok(renewals.length >= 3, `the lease was renewed around the send (${renewals.length})`);
+    assert.equal(timers(), before, 'and no renewal timer was left running');
+    assert.equal(record(fixture).deliveryLease, null);
   } finally { cleanup(fixture.root); }
 });
 
@@ -1287,16 +1432,12 @@ test('--dry reports what it would do and performs nothing', async () => {
 
     agents.emit('sandboxes', { at: NOW, kind: 'incident-opened', card: 'inc-a' }, { root: fixture.root, now: NOW });
     const waiting = makeDeps(fixture, quietState(3));
-    // `statusForText` is not a read: when it finds a confirmed retained entry it
-    // files the receipt and unlinks the journal. A dry run must not ask it
-    // anything, so it reports the key it would have checked instead.
-    let asked = 0;
-    waiting.deliveryStatus = () => { asked += 1; return null; };
+    // A dry run takes no lease and touches nothing in the delivery directory; it
+    // reports the batch it would have claimed the lease to send.
     const batch = sandboxes(await tick(fixture, waiting, { dry: true, force: true }));
     assert.equal(batch.delivery.state, 'would-send');
     assert.equal(batch.delivery.count, 1);
-    assert.equal(asked, 0, 'no receipt was consulted');
-    assert.match(batch.delivery.note, /would check receipt agent:sandboxes:seq:1-1/);
+    assert.match(batch.delivery.note, /would claim the delivery lease and send agent:sandboxes:seq:1-1/);
     assert.equal(waiting.calls.sends.length, 0);
     assert.equal(cursor(fixture), 0);
     assert.equal(areaSession.pendingDeliveryOf(record(fixture)), null);

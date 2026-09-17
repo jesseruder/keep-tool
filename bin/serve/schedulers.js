@@ -46,7 +46,8 @@ function startSchedulers(ctx) {
     resumeAfterLimit,
     review, reviewDeps, runs, scanSessions, sendToResolvedTarget, sendToSession, sessionSummarySnapshot, slack,
     stallAliveIds, stalled, stalledSessionSnapshot, standup, startAutoCompact, startBriefScheduler,
-    startWtGcScheduler, summarize, unblock, usage, watcherSend, withInjectionLock, writeTarget,
+    startWtGcScheduler, summarize, transcriptFileForSession,
+    unblock, usage, watcherSend, withInjectionLock, writeTarget,
   } = ctx;
 
   runs.setOnChange(broadcast);
@@ -261,6 +262,17 @@ function startSchedulers(ctx) {
     // Graceful only, and nothing behind it: nobody asked for this close, so a
     // refusal is the answer rather than the first step of an escalation.
     closeIdleSession: (body, closeDeps) => closeIdleSession(body, closeDeps),
+    // Did this session already accept this exact text? The last witness when a
+    // confirmed send finished its delivery journal and the daemon died before
+    // recording that it was confirmed. Scans the transcript, so area-session.js
+    // asks it only when retrying a batch it was part-way through sending.
+    transcriptShows: (session, text) => {
+      const delivery = require('../delivery');
+      return delivery.received({
+        file: transcriptFileForSession(session), offset: 0,
+        kind: session.kind, hash: delivery.textHash(text),
+      });
+    },
     onChange: broadcast,
   });
   const areaSessionTick = (options = {}) => require('../area-session.js').tickQuietly(options, areaSessionDeps());

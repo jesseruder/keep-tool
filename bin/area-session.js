@@ -65,9 +65,20 @@ const LAUNCH_RETRY_MS = 15 * MINUTE_MS;
 // to cover a worktree build plus an `openSession` that has to wait for a pane;
 // short enough that a daemon killed mid-launch is not locked out for an hour.
 const LAUNCH_LEASE_MS = 5 * MINUTE_MS;
-// The same idea for the right to send. Shorter: a delivery is one injection-lock
-// hold and a screen confirmation, not a worktree build.
-const DELIVERY_LEASE_MS = 2 * MINUTE_MS;
+// The same idea for the right to send. Long, because a send is not the quick
+// thing it looks like: `compactIfCold` can spend minutes compacting a cold
+// session before a character is typed, and `delivery.deliver` then waits on a
+// transcript receipt. A two-minute lease expired underneath exactly that and let
+// a second tick start its own send.
+const DELIVERY_LEASE_MS = 10 * MINUTE_MS;
+// And it is renewed on a timer while the send is awaited, so the ten minutes are
+// a bound on going silent rather than on how long a delivery may take.
+const DELIVERY_RENEW_MS = 30e3;
+// How many times a batch may come back `assumed-delivered` before the cursor
+// moves past it anyway. Retyping the same events forever is its own failure —
+// the session has probably had them every time — so at this point the
+// uncertainty is recorded on the feed instead and the queue moves on.
+const ASSUMED_ATTEMPT_LIMIT = 3;
 const WORKTREE_TIMEOUT_MS = 5 * MINUTE_MS;
 // Every area's session lives in the same long-lived worktree name under its own
 // repo, so `~/wt/castle-sandboxes/responder` is the sandboxes responder's tree
@@ -455,6 +466,20 @@ function claimDeliveryLease(name, root, now, deps = {}) {
   });
 }
 
+// Bumps the lease's clock and answers whether it is still ours. Both halves are
+// a single locked read-and-write, because "check, then act" on a lease is the
+// bug a lease exists to prevent.
+function renewDeliveryLease(name, root, now, by, deps = {}) {
+  const lock = deps.withLock || keep.withLock;
+  return lock(() => {
+    const current = agents.readRecord(name, root);
+    const lease = current && current.deliveryLease;
+    if (!lease || !lease.by || lease.by !== by) return null;
+    return agents.writeRecord(name, { deliveryLease: { ...lease, at: now } },
+      { root, now, withinLock: true });
+  });
+}
+
 function releaseDeliveryLease(name, root, now, by, deps = {}) {
   const lock = deps.withLock || keep.withLock;
   return lock(() => {
@@ -471,8 +496,8 @@ function releaseDeliveryLease(name, root, now, by, deps = {}) {
 // TEXT, not just the seq range it was built from: a retry has to type the same
 // characters, and a batch reconstructed from the feed does not — the "N more
 // events are queued" sentence depends on how much was waiting at the time, which
-// is gone by the next tick. The delivery receipt is keyed on the text, so text
-// that drifted is a receipt nobody can find and a message typed twice.
+// is gone by the next tick. The transport recovers a draft by comparing text, so
+// text that drifted is a draft it cannot recognise and a message typed twice.
 function pendingDeliveryOf(record) {
   const value = record && record.pendingDelivery;
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
@@ -485,12 +510,15 @@ function pendingDeliveryOf(record) {
     count: Math.max(1, Number(value.count) || 1),
     offset: Math.max(0, Number(value.offset) || 0),
     at: Number(value.at) || 0,
-    // Set when a send came back `assumed-delivered`: the text reached the pane
-    // but no transcript receipt was ever found. The helper files a *received*
-    // receipt for that, so this flag is what stops the next tick reading that
-    // receipt as proof of something nobody confirmed.
-    assumed: value.assumed === true,
+    // Our own record of how far this delivery got: `sending` before a character
+    // is typed, `confirmed` in the same write that advances the cursor. See the
+    // note above deliveryStateOf for why the transport's receipt store cannot
+    // be this.
+    state: value.state === 'confirmed' ? 'confirmed' : 'sending',
+    // How many times this batch came back `assumed-delivered`: the text reached
+    // the pane and no transcript ever confirmed it.
     assumedAttempts: Math.max(0, Number(value.assumedAttempts) || 0),
+    uncertain: value.uncertain === true,
   };
 }
 
@@ -549,7 +577,7 @@ function persistedBatch(pending) {
   return {
     events: [], count: pending.count, firstSeq: pending.firstSeq, lastSeq: pending.lastSeq,
     offset: pending.offset, waiting: 0, key: pending.key, text: pending.text, retry: true,
-    assumed: pending.assumed, assumedAttempts: pending.assumedAttempts,
+    state: pending.state, assumedAttempts: pending.assumedAttempts,
   };
 }
 
@@ -760,44 +788,17 @@ async function runArea(name, entry, options = {}, deps = {}) {
     }
 
     // ---- deliver ----
-    // A pending batch is always the one retried, exactly as it was rendered. It
-    // is never rebuilt from the feed and never replaced by a newer batch: its
-    // text is what the delivery receipt on disk is keyed on.
-    const pending = pendingDeliveryOf(record);
-    const batch = pending ? persistedBatch(pending) : nextBatch(agentName, record, root, deps);
+    // Selection, the send and the cursor write all happen inside deliveryStep,
+    // under one delivery lease. They cannot be split: a batch chosen before the
+    // lease was taken may have been built from a cursor another tick had already
+    // moved, and every later guard would compare it against the record it wrote
+    // itself and find it consistent.
     const liveForWork = report.session.state === 'live' && report.session.id;
-    if (!batch) {
-      report.delivery = { state: 'nothing', count: 0 };
-    } else if (!liveForWork) {
-      report.delivery = { state: 'deferred', count: batchCount(batch), reason: 'no live session to deliver into' };
-    } else {
-      const outcome = await deliverBatch({ agentName, root, batch, seen, dry, pending, now }, deps, say);
-      report.delivery = outcome;
-      if (outcome.persisted) changed = true;
-      if (outcome.state === 'sent' && !dry) {
-        try {
-          record = writeRecord(agentName, {
-            lastDeliveredSeq: batch.lastSeq, lastDeliveredAt: now,
-            // Where this batch's last line ends in the feed, so the next scan
-            // starts there instead of re-parsing the whole file. agents.js
-            // verifies it is still a line boundary and falls back to a full scan
-            // when it is not, so a stale or moved offset costs work, never events.
-            ...(batch.offset ? { lastDeliveredOffset: batch.offset } : {}),
-            pendingDelivery: null,
-          }, { root, now });
-        } catch (error) {
-          // The send landed and its receipt is on disk; only the cursor did not
-          // move. Failing the tick here would be wrong — and retyping on the next
-          // one would be worse — so this is reported and left to the pending batch
-          // the next tick recovers: it asks about this exact key, the receipt says
-          // received, and the cursor advances then without a second message.
-          report.delivery = { ...outcome, cursorError: oneLine(error && error.message || error, 160) };
-          say(`${agentName} received seq ${batch.firstSeq}-${batch.lastSeq} but the cursor could not be saved: `
-            + `${oneLine(error && error.message || error, 160)}`);
-        }
-        changed = true;
-      }
-    }
+    const delivered = await deliveryStep({ agentName, root, seen, dry, now, liveForWork, record }, deps, say);
+    report.delivery = delivered.delivery;
+    const batch = delivered.batch;
+    if (delivered.changed) changed = true;
+    if (!dry) record = agents.readRecord(agentName, root) || record;
 
     // ---- restart from the log ----
     report.restart = await considerRestart({
@@ -903,65 +904,147 @@ async function launchSession(context, deps, say) {
   };
 }
 
-// ONE message per tick, through the same helpers a scheduled check delivery uses,
-// so target resolution, the compaction-if-cold policy, the injection mutex and
-// the delivery receipt all apply to this too. A refusal is not a failure: the
-// cursor stays where it was and the same batch is offered again next tick.
-async function deliverBatch(context, deps, say) {
-  const { agentName, root, batch, seen, dry, pending, now } = context;
-  const key = batch.key;
-  const count = batchCount(batch);
-  // The text a previous tick rendered, verbatim, whenever there is one. Never
-  // re-rendered: the receipt is keyed on the text, and a batch rebuilt from the
-  // feed drops the "N more events are queued" sentence, which would make the
-  // retry a different message with a receipt nobody can find.
-  const text = batch.text;
-  const writeRecord = deps.writeRecord || agents.writeRecord;
-  const defer = (reason, extra = {}) => ({ state: 'deferred', count, key, reason, ...extra });
+// What a delivery is worth is OUR state, not the transport's. `retainReceipt` is
+// deliberately false below: the helper's receipt store answered "did this text
+// arrive" from outside anything we hold a lock on, and it files a *received*
+// receipt for a delivery it only assumed, so it could never be provenance. What
+// the transport keeps is its journal, which is what recovers a draft that was
+// typed but not submitted, and that is exactly what it is good at.
+//
+// `record.pendingDelivery.state` is the provenance instead, and it only ever
+// moves one way:
+//
+//   sending    — written under the registry lock BEFORE a character is typed.
+//                A tick that finds this either recovers the draft through the
+//                transport's journal or, when there is no journal and the
+//                transcript does not show the text, types the persisted text
+//                again. Both are `sendToResolvedTarget` with the same text.
+//   confirmed  — written in the SAME locked write that advances the cursor, so
+//                there is no instant where one is true and the other is not.
+//                It stays on the record afterwards as the record of what was
+//                last delivered, and is overwritten by the next batch.
+//
+// A `confirmed` batch the cursor has not passed can only mean the write that
+// would have moved the cursor never landed. Our own state says it arrived, so
+// the cursor moves on the next tick without anybody typing anything.
+function deliveryStateOf(pending) {
+  return pending && pending.state === 'confirmed' ? 'confirmed' : 'sending';
+}
 
-  // A dry run reports and touches nothing. The receipt lookup comes AFTER this
-  // guard on purpose: `statusForText` is not a read — when it finds a confirmed
-  // retained entry it files the receipt and unlinks the journal — so asking it
-  // anything would be a write into the live delivery directory.
+// The batch this tick owes the session: the persisted one while the cursor has
+// not passed it, otherwise the next one off the feed.
+function selectBatch(name, record, root, deps = {}) {
+  const pending = pendingDeliveryOf(record);
+  const cursor = Number(record.lastDeliveredSeq || 0) || 0;
+  if (pending && pending.lastSeq > cursor) return { batch: persistedBatch(pending), pending };
+  // A pending batch the cursor is past is provenance, not work. It is left on the
+  // record rather than cleared, so a quiet tick writes nothing, and the next
+  // batch overwrites it.
+  return { batch: nextBatch(name, record, root, deps), pending: null };
+}
+
+// ONE message per tick, through the same helpers a scheduled check delivery uses,
+// so target resolution, the compaction-if-cold policy and the injection mutex all
+// apply to this too. A refusal is not a failure: the cursor stays where it was and
+// the same batch is offered again next tick.
+//
+// The delivery lease spans this whole function — selection, send AND the cursor
+// write. It has to: a tick that selected its batch before taking the lease could
+// build [1,2] from a cursor another tick had already moved to 1, overwrite the
+// pending batch with it, and pass every later guard, because the guards compare
+// against the record it wrote itself. So the batch is chosen twice — once, cheaply
+// and read-only, to find out whether there is anything to do at all, and then
+// again from the record read after the lease is claimed, which is the one that
+// gets sent.
+async function deliveryStep(context, deps, say) {
+  const { agentName, root, seen, dry, now, liveForWork, record } = context;
+  const writeRecord = deps.writeRecord || agents.writeRecord;
+  const nothing = { delivery: { state: 'nothing', count: 0 }, batch: null, changed: false };
+
+  // Read-only, and before any lease: a tick with nothing to deliver must not
+  // write, and most ticks have nothing to deliver.
+  const probe = selectBatch(agentName, record, root, deps);
+  if (!probe.batch) return nothing;
+
   if (dry) {
     return {
-      state: 'would-send', count, waiting: batch.waiting, key,
-      note: `would check receipt ${key}`,
+      batch: probe.batch, changed: false,
+      delivery: {
+        state: 'would-send', count: batchCount(probe.batch), waiting: probe.batch.waiting,
+        key: probe.batch.key,
+        note: `would claim the delivery lease and send ${probe.batch.key}`,
+      },
+    };
+  }
+  if (!liveForWork) {
+    return {
+      batch: probe.batch, changed: false,
+      delivery: {
+        state: 'deferred', count: batchCount(probe.batch), key: probe.batch.key,
+        reason: 'no live session to deliver into',
+      },
     };
   }
 
-  // The right to send into this session, taken under the registry lock. Without
-  // it the receipt lookup and the pending-batch write both sat outside any
-  // mutual exclusion, so two overlapping ticks could each read "no receipt",
-  // each overwrite the other's pending batch, and each type. The injection mutex
-  // serialises the typing; it does not stop the second message existing.
-  const lease = (deps.claimDeliveryLease || claimDeliveryLease)(agentName, root, now, deps);
-  if (lease.held) {
-    return defer(`another tick holds the delivery lease (${Math.round((now - (Number(lease.lease.at) || 0)) / 1000)}s old)`);
+  // Awaited, though the real claim is synchronous: the lock it takes is, and a
+  // caller that wants to interpose on this boundary should be able to.
+  const lease = await (deps.claimDeliveryLease || claimDeliveryLease)(agentName, root, now, deps);
+  if (!lease || (!lease.held && !lease.by)) {
+    // A claim that came back without a holder is not a claim. Sending without one
+    // is the thing the lease exists to prevent, so this defers rather than
+    // proceeding unprotected.
+    return { batch: probe.batch, changed: false,
+      delivery: { state: 'deferred', count: batchCount(probe.batch), key: probe.batch.key,
+        reason: 'the delivery lease could not be claimed' } };
   }
+  if (lease.missing) {
+    return { batch: probe.batch, changed: false,
+      delivery: { state: 'deferred', count: batchCount(probe.batch), key: probe.batch.key,
+        reason: 'the agent record disappeared' } };
+  }
+  if (lease.held) {
+    return { batch: probe.batch, changed: false,
+      delivery: { state: 'deferred', count: batchCount(probe.batch), key: probe.batch.key,
+        reason: `another tick holds the delivery lease (${Math.round((now - (Number(lease.lease.at) || 0)) / 1000)}s old)` } };
+  }
+
+  let renewTimer = null;
   try {
-    const status = deps.deliveryStatus
-      || ((message, deliveryKey) => require('./delivery').statusForText(
-        deps.deliveryDirectory || path.join(root, '.keep', 'delivery'), message, deliveryKey));
-    // The receipt, not our own bookkeeping, is what says whether this batch
-    // already arrived: a tick that sent it and died before writing the cursor
-    // must not type it again.
-    //
-    // Except when the pending batch is flagged `assumed`. `delivery.deliver`
-    // files a *received* receipt when it gives up on an expired journal whose
-    // text had reached the pane, and that is not a transcript confirmation of
-    // anything. Reading it back as proof would acknowledge a batch nobody has
-    // been shown.
-    let prior = null;
-    if (!(pending && pending.key === key && pending.assumed)) {
-      try { prior = status(text, key); } catch (error) {
-        // A malformed or unreadable receipt is not an absent one. Treating it as
-        // absent types the message again; deferring costs one tick.
-        say(`could not read the delivery receipt for ${agentName} ${key}: `
-          + `${oneLine(error && error.message || error, 160)}; leaving the batch pending`);
-        return defer('the delivery receipt could not be read');
+    // THE record the batch comes from. Everything above was read before the
+    // lease existed and is only good enough to decide whether to take it.
+    const current = lease.record || agents.readRecord(agentName, root);
+    if (!current) {
+      return { batch: probe.batch, changed: true,
+        delivery: { state: 'deferred', count: batchCount(probe.batch), key: probe.batch.key,
+          reason: 'the agent record disappeared' } };
+    }
+    const { batch, pending } = selectBatch(agentName, current, root, deps);
+    if (!batch) {
+      // Another tick delivered it between the probe and the claim. Nothing to do,
+      // which is the right answer rather than a message.
+      return { ...nothing, changed: true };
+    }
+    const key = batch.key;
+    const count = batchCount(batch);
+    // The text a previous tick rendered, verbatim, whenever there is one.
+    const text = batch.text;
+    const defer = (reason, extra = {}) => ({
+      batch, changed: true,
+      delivery: { state: 'deferred', count, key, reason, ...extra },
+    });
+
+    // Our own state says this batch arrived and only the cursor write was lost.
+    // No transport is involved: the cursor moves and nothing is typed.
+    if (pending && deliveryStateOf(pending) === 'confirmed') {
+      try {
+        writeRecord(agentName, {
+          lastDeliveredSeq: batch.lastSeq, lastDeliveredAt: now,
+          ...(batch.offset ? { lastDeliveredOffset: batch.offset } : {}),
+        }, { root, now });
+      } catch (error) {
+        return defer(`the cursor could not be saved: ${oneLine(error && error.message || error, 160)}`);
       }
-      if (prior && prior.received) return { state: 'sent', count, delivery: 'received', key };
+      return { batch, changed: true, delivery: { state: 'sent', count, key, delivery: 'confirmed-earlier' } };
     }
 
     let session = seen.session || null;
@@ -972,92 +1055,185 @@ async function deliverBatch(context, deps, say) {
     }
     if (midTurn(session)) return defer('the session is mid-turn');
     if (waitingOnOwner(session)) return defer('the session is waiting on Owner');
+
+    // A retry of a batch our state says we were `sending`. The transport can
+    // recover a draft it typed but never submitted, because it kept a journal
+    // for it — but a send that WAS confirmed finishes that journal, so a daemon
+    // that died in the moment between the transport returning and our state
+    // write leaves nothing for it to recognise, and it would type the message a
+    // second time. The transcript is the remaining witness: the session
+    // recorded the message when it accepted it. Asked once per stuck batch, and
+    // only on a retry, because it scans a transcript.
+    if (batch.retry && deps.transcriptShows) {
+      let shown = null;
+      try { shown = deps.transcriptShows(session, text); } catch { shown = null; }
+      if (shown === true) {
+        say(`${agentName} seq ${batch.firstSeq}-${batch.lastSeq} is already in the session transcript;`
+          + ' advancing the cursor without sending it again');
+        try {
+          writeRecord(agentName, {
+            lastDeliveredSeq: batch.lastSeq, lastDeliveredAt: now,
+            ...(batch.offset ? { lastDeliveredOffset: batch.offset } : {}),
+            pendingDelivery: { ...pendingDeliveryOf(current), state: 'confirmed', confirmedAt: now },
+          }, { root, now });
+        } catch (error) {
+          return defer(`the cursor could not be saved: ${oneLine(error && error.message || error, 160)}`);
+        }
+        return { batch, changed: true, delivery: { state: 'sent', count, key, delivery: 'found-in-transcript' } };
+      }
+    }
     let target;
     try { target = await deps.resolveSessionTarget(session, null); }
     catch (error) { return defer(oneLine(error && error.message || error, 160)); }
 
-    // Persisted BEFORE a single character is typed, and left there until the send
-    // is confirmed. Text, seq range, key and feed offset together: that is what
-    // lets the next tick retry this exact batch instead of one the receipt on
-    // disk knows nothing about.
-    let persisted = false;
-    if (!pending || pending.key !== key) {
-      try {
-        writeRecord(agentName, {
-          pendingDelivery: {
-            key, firstSeq: batch.firstSeq, lastSeq: batch.lastSeq,
-            offset: batch.offset || 0, count, text, at: now,
-          },
-        }, { root, now });
-        persisted = true;
-      } catch (error) {
-        return defer(`could not record the pending batch: ${oneLine(error && error.message || error, 160)}`, { persisted: false });
-      }
+    const assumedBefore = pending && pending.key === key ? pending.assumedAttempts : 0;
+    const pendingRecord = {
+      key, firstSeq: batch.firstSeq, lastSeq: batch.lastSeq,
+      offset: batch.offset || 0, count, text, at: now,
+      state: 'sending', assumedAttempts: assumedBefore,
+    };
+    // Written BEFORE a character is typed, so a daemon that dies mid-send leaves
+    // behind the fact that it was sending and the exact text it was sending.
+    try {
+      writeRecord(agentName, { pendingDelivery: pendingRecord }, { root, now });
+    } catch (error) {
+      return defer(`could not record the pending batch: ${oneLine(error && error.message || error, 160)}`);
     }
+
+    // Still ours? A lease is renewed rather than merely checked, so the clock
+    // keeps running while a slow send is awaited. `compactIfCold` can spend
+    // minutes compacting the session before a character is typed, which is why
+    // the lease is ten minutes and why this also runs on a timer underneath the
+    // await: a lease that lapsed mid-send would let another tick start its own.
+    const renew = deps.renewDeliveryLease || renewDeliveryLease;
+    const held = () => {
+      try { return Boolean(renew(agentName, root, Date.now(), lease.by, deps)); } catch { return false; }
+    };
+    if (!held()) return defer('the delivery lease was lost before typing');
+    renewTimer = setInterval(() => { held(); }, DELIVERY_RENEW_MS);
+    if (renewTimer && typeof renewTimer.unref === 'function') renewTimer.unref();
 
     try {
       const lock = deps.withInjectionLock || ((fn) => fn());
-      // An unconfirmed prior attempt is NOT a reason to stop: `delivery.deliver`
-      // inside sendToResolvedTarget finds its own journal entry, and when the
-      // draft in the box is still byte-identical it submits that draft rather
-      // than typing again. Returning early here is what wedged the reviewer for
-      // 133 ticks in September; the recovery path is the whole reason the text
-      // has to be stable.
       const result = await lock(async () => {
-        // Inside the mutex, and only now, the record is read again. Everything
-        // decided above was decided outside it: if another writer moved the
-        // cursor past this batch or replaced the pending one, this send is
-        // stale and must not happen.
-        const current = agents.readRecord(agentName, root);
-        if (!current) throw new keep.KeepError('the agent record disappeared before the send');
-        if (Number(current.lastDeliveredSeq || 0) >= batch.lastSeq) {
+        // Inside the mutex, and only now, the record is read once more.
+        // Everything above was decided outside it.
+        const inside = agents.readRecord(agentName, root);
+        if (!inside) throw new keep.KeepError('the agent record disappeared before the send');
+        if (Number(inside.lastDeliveredSeq || 0) >= batch.lastSeq) {
           throw new keep.KeepError(`seq ${batch.firstSeq}-${batch.lastSeq} was delivered by somebody else`);
         }
-        const mine = pendingDeliveryOf(current);
-        if (!mine || mine.key !== key) {
-          throw new keep.KeepError('the pending batch changed before the send');
-        }
-        return deps.sendToResolvedTarget(session, target, text,
-          { compactIfCold: true, retainReceipt: true, deliveryKey: key });
+        const mine = pendingDeliveryOf(inside);
+        if (!mine || mine.key !== key) throw new keep.KeepError('the pending batch changed before the send');
+        // `retainReceipt: false` — see the note above deliveryStateOf. The
+        // transport keeps its journal either way, which is what recovers a draft
+        // that was typed but never submitted.
+        return deps.sendToResolvedTarget(session, target, text, {
+          compactIfCold: true, retainReceipt: false, deliveryKey: key,
+          // The transport calls this immediately before it types, and again
+          // before it re-submits a recovered draft. It is the last possible
+          // moment to notice the lease is somebody else's now.
+          beforeType: () => {
+            if (!held()) throw new keep.KeepError('the delivery lease was lost before typing');
+          },
+        });
       }, { pane: target && target.pane, session: session.id });
+
+      // Ownership again, on the way out: if it was lost while the send was in
+      // flight, another tick may already be sending, and the cursor is not ours
+      // to move. Our state stays `sending`, so whoever holds the lease next
+      // recovers the same batch.
+      if (!held()) {
+        say(`${agentName} finished sending seq ${batch.firstSeq}-${batch.lastSeq} but no longer holds the delivery lease;`
+          + ' leaving the cursor for whoever does');
+        return defer('the delivery lease was lost during the send', { leaseLost: true });
+      }
 
       if (result && result.truncated) {
         // Only part of the message was accepted, so this batch was NOT delivered.
-        // Acknowledging it here is how an event disappears: leave the cursor and
-        // the pending record alone and let the next tick recover the same draft.
         say(`${agentName} received only ${result.received}/${result.expected} characters of seq ${batch.firstSeq}-${batch.lastSeq}; leaving the batch pending`);
-        return defer('only part of the message was accepted', { persisted, truncated: true });
+        return defer('only part of the message was accepted', { truncated: true });
       }
-      // `assumed-delivered` means the journal expired with the text on screen and
-      // no transcript receipt ever appeared. It is the helper's best guess, not a
-      // confirmation, so the batch stays pending and is offered again — flagged,
-      // so the received receipt the helper just filed for it is not read back as
-      // evidence next tick.
+
+      // `assumed-delivered`: the transport's journal expired with the text known
+      // to have reached the pane, and no transcript ever confirmed it. That is a
+      // guess. The batch stays `sending` and is offered again.
       if (result && result.delivery === 'assumed-delivered') {
-        const attempts = (pending && pending.key === key ? pending.assumedAttempts : 0) + 1;
+        const attempts = assumedBefore + 1;
+        if (attempts >= ASSUMED_ATTEMPT_LIMIT) {
+          // Retyping the same batch forever is its own failure: the session has
+          // probably had it three times. So the cursor moves past it and the
+          // uncertainty becomes an event of its own — which lands after the
+          // cursor, so the next batch carries it and the agent row shows it.
+          say(`${agentName} seq ${batch.firstSeq}-${batch.lastSeq} was never confirmed after ${attempts} attempts;`
+            + ' advancing past it and recording the uncertainty on the feed');
+          try {
+            writeRecord(agentName, {
+              lastDeliveredSeq: batch.lastSeq, lastDeliveredAt: now,
+              ...(batch.offset ? { lastDeliveredOffset: batch.offset } : {}),
+              pendingDelivery: { ...pendingRecord, state: 'confirmed', assumedAttempts: attempts, uncertain: true },
+            }, { root, now });
+          } catch (error) {
+            return defer(`the cursor could not be saved: ${oneLine(error && error.message || error, 160)}`);
+          }
+          try {
+            (deps.emit || agents.emit)(agentName, {
+              kind: 'delivery-uncertain', card: '', severity: 'med',
+              text: `events seq ${batch.firstSeq}-${batch.lastSeq} reached the pane but were never confirmed`
+                + ` after ${attempts} attempts; they may not be in this session's history`,
+            }, { root, now });
+          } catch {}
+          return {
+            batch, changed: true,
+            delivery: { state: 'sent', count, key, delivery: 'uncertain', assumedAttempts: attempts },
+          };
+        }
         say(`${agentName} seq ${batch.firstSeq}-${batch.lastSeq} reached the pane but was never confirmed`
           + ` (attempt ${attempts}); leaving the batch pending rather than acknowledging it`);
         try {
           writeRecord(agentName, {
-            pendingDelivery: {
-              key, firstSeq: batch.firstSeq, lastSeq: batch.lastSeq,
-              offset: batch.offset || 0, count, text, at: now,
-              assumed: true, assumedAttempts: attempts,
-            },
+            pendingDelivery: { ...pendingRecord, assumedAttempts: attempts },
           }, { root, now });
         } catch {}
         return defer('the send reached the pane but no transcript confirmed it',
-          { persisted: true, assumed: true, assumedAttempts: attempts });
+          { assumed: true, assumedAttempts: attempts });
+      }
+
+      // Confirmed. ONE locked write moves the cursor and records that it was
+      // confirmed, so no reader can ever see one without the other.
+      try {
+        writeRecord(agentName, {
+          lastDeliveredSeq: batch.lastSeq, lastDeliveredAt: now,
+          ...(batch.offset ? { lastDeliveredOffset: batch.offset } : {}),
+          pendingDelivery: { ...pendingRecord, state: 'confirmed', confirmedAt: now },
+        }, { root, now });
+      } catch (error) {
+        // The message arrived; only the cursor did not move. Our own state still
+        // says `sending`, so the next tick reaches the transport again — and its
+        // journal, or the transcript, is what stops a second typing there.
+        say(`${agentName} received seq ${batch.firstSeq}-${batch.lastSeq} but the cursor could not be saved: `
+          + `${oneLine(error && error.message || error, 160)}`);
+        return {
+          batch, changed: true,
+          delivery: {
+            state: 'sent', count, waiting: batch.waiting, key,
+            cursorError: oneLine(error && error.message || error, 160),
+          },
+        };
       }
       return {
-        state: 'sent', count, waiting: batch.waiting, key, persisted,
-        ...(batch.retry ? { recovered: true } : {}),
-        ...(result && result.delivery ? { delivery: result.delivery } : {}),
+        batch, changed: true,
+        delivery: {
+          state: 'sent', count, waiting: batch.waiting, key,
+          ...(batch.retry ? { recovered: true } : {}),
+          ...(result && result.delivery ? { delivery: result.delivery } : {}),
+        },
       };
     } catch (error) {
-      return defer(oneLine(error && error.message || error, 200), { persisted });
+      return defer(oneLine(error && error.message || error, 200));
     }
   } finally {
+    if (renewTimer) clearInterval(renewTimer);
     try { (deps.releaseDeliveryLease || releaseDeliveryLease)(agentName, root, now, lease.by, deps); } catch {}
   }
 }
@@ -1237,7 +1413,9 @@ module.exports = {
   observe, midTurn, waitingOnOwner, lastActivityAt,
   nextBatch, persistedBatch, pendingDeliveryOf,
   claimLaunchLease, renewLaunchLease, releaseLaunchLease, launchRequestId,
-  claimDeliveryLease, releaseDeliveryLease, DELIVERY_LEASE_MS,
+  claimDeliveryLease, renewDeliveryLease, releaseDeliveryLease,
+  DELIVERY_LEASE_MS, DELIVERY_RENEW_MS, ASSUMED_ATTEMPT_LIMIT,
+  selectBatch, deliveryStateOf, deliveryStep,
   conflictingAgents, areasForAgent, batchCount,
   runArea, tick, tickQuietly, describe,
 };
