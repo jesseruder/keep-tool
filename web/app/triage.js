@@ -331,9 +331,14 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
     place(row);
   });
   addRows(waiting, 0);
+  const runningHead = addGroup(`${ctx.state.showRunning ? '▾' : '▸'} Running & waiting · ${ctx.esc(running.length)}`, 'qhead qgroup qtoggle', 'button');
+  runningHead.addEventListener('click', () => ctx.toggleRunning());
+  if (ctx.state.showRunning) addRows(running, waiting.length);
   // Agents are the fleet's standing workers, not queue items: they are never
-  // selected, counted or dismissed, only read and expanded. The group is absent
-  // entirely when there is no agent to list.
+  // selected, counted or dismissed, only read and expanded. They sit under
+  // Running & waiting, below the sessions doing a card's work, and the group is
+  // absent entirely when there is no agent to list. Unlike Running, it is not
+  // gated on `showRunning`: collapsing the sessions must not hide the fleet.
   const agentRows = ctx.data.agents || [];
   if (agentRows.length) {
     addGroup(`Agents · ${ctx.esc(agentRows.length)}`);
@@ -367,9 +372,6 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
       if (openPane) openPane.onclick = () => ctx.openReviewPane(openPane.dataset.agentOpen);
     }
   }
-  const runningHead = addGroup(`${ctx.state.showRunning ? '▾' : '▸'} Running & waiting · ${ctx.esc(running.length)}`, 'qhead qgroup qtoggle', 'button');
-  runningHead.addEventListener('click', () => ctx.toggleRunning());
-  if (ctx.state.showRunning) addRows(running, waiting.length);
   const pinnedHead = addGroup(`${ctx.state.showPinned ? '▾' : '▸'} Pinned · ${ctx.esc(pinned.length)}`, 'qhead qgroup qtoggle', 'button');
   pinnedHead.addEventListener('click', () => togglePinned(ctx));
   if (ctx.state.showPinned) addRows(pinned, waiting.length + shownRunning.length);

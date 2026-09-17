@@ -1170,7 +1170,9 @@ alerts and shows up in the row.
 `/api/state` publishes `agents: [{name, role, model, area, project, lifecycle, card,
 session, lastEvent, unseen: {count, needsYou, truncated?}}]`. The console's triage queue
 renders an
-**Agents** group above Running & waiting, and only when that array is non-empty. One row
+**Agents** group under Running & waiting and above Pinned, and only when that array is
+non-empty. The group is not gated on the Running toggle: collapsing the working sessions
+leaves the fleet listed. One row
 per agent: the name, the lifecycle (`idle` / `on <card>` / `needs you` / `stopped`), the
 last event as a one-liner with its relative time, and a badge with the unseen count —
 red when any unseen event asked for Owner, grey when they are only news, absent at zero.
