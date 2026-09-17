@@ -189,34 +189,81 @@ test('orphan detection follows captured identity after reparenting, never kills 
   assert.equal(gone([helper], [{ ...helper, pidStart: 'new' }]), true);
   assert.equal(gone([helper], []), true);
 });
-test('an npx-declared server is admitted under the npm exec title npm rewrote over it', () => {
+// npx unpacks a registry spec into <npm cache>/_npx/<digest>/, keyed by a digest over
+// the specs exactly as written. libnpmexec computes it this way; so does the module.
+const npxDigest = (specs) => require('node:crypto').createHash('sha512')
+  .update(specs.sort((a, b) => a.localeCompare(b, 'en')).join('\n')).digest('hex').slice(0, 16);
+function npxInstall(cacheRoot, spec, pkgName, bin) {
+  const dir = path.join(cacheRoot, '_npx', npxDigest([spec]));
+  const pkgDir = path.join(dir, 'node_modules', pkgName);
+  fs.mkdirSync(pkgDir, { recursive: true });
+  fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name: pkgName, version: '1.0.0', bin }));
+  fs.writeFileSync(path.join(pkgDir, 'cli.js'), '#!/usr/bin/env node\nrun();\n');
+  fs.writeFileSync(path.join(pkgDir, 'other.js'), '#!/usr/bin/env node\nsomethingElse();\n');
+  const binDir = path.join(dir, 'node_modules', '.bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  const names = typeof bin === 'string' ? { [pkgName.replace(/^@[^/]+\//, '')]: bin } : bin;
+  for (const [name, file] of Object.entries(names)) {
+    fs.symlinkSync(path.join('..', pkgName, file), path.join(binDir, name));
+  }
+  return { dir, binDir, pkgDir };
+}
+
+test('an npx-declared server is admitted only as the npx cache install of the declared spec', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-mcp-npx-'));
   try {
     const cwd = path.join(root, 'project');
     fs.mkdirSync(cwd);
+    const cacheRoot = path.join(root, 'npm-cache');
+    const env = { npm_config_cache: cacheRoot };
+    const spec = '@playwright/mcp@latest';
+    const { binDir } = npxInstall(cacheRoot, spec, '@playwright/mcp', { 'playwright-mcp': 'cli.js' });
     const declare = (args) => fs.writeFileSync(path.join(cwd, '.mcp.json'), JSON.stringify({ mcpServers: {
       playwright: { command: 'npx', args } } }));
-    declare(['@playwright/mcp@latest', '--headless']);
+    declare([spec, '--headless']);
     const parent = { pid: 1, args: '/test/claude' };
-    // The npx bin splices `exec` into argv and npm overwrites its own title with
-    // `npm` plus the positional arguments, so this is the row the session leaves.
+    // The npx bin splices `exec` into argv and npm overwrites its own title with `npm`
+    // plus the positional arguments, so this is the row the session actually leaves.
     const title = { pid: 2, ppid: 1, pidStart: 'launcher', args: 'npm exec @playwright/mcp@latest --headless' };
-    const server = { pid: 3, ppid: 2, pidStart: 'server',
-      args: `/opt/node/bin/node ${path.join(root, '.npm', '_npx', 'abc123', 'node_modules', '.bin', 'playwright-mcp')} --headless` };
-    const check = (rows) => inspect({ root, agent: 'claude', sessionId: 'session-1', parent, rows, cwd });
-    const helpers = check([parent, title, server]);
-    assert.deepEqual(helpers.map((h) => h.pid), [2, 3], 'the title row and the real server under it are one helper unit');
+    const server = { pid: 3, ppid: 2, pidStart: 'server', args: `node ${path.join(binDir, 'playwright-mcp')} --headless` };
+    const browser = { pid: 4, ppid: 3, pidStart: 'browser', args: '/opt/chromium --headless' };
+    const check = (rows) => inspect({ root, agent: 'claude', sessionId: 'session-1', parent, rows, cwd, env });
+    const helpers = check([parent, title, server, browser]);
+    assert.deepEqual(helpers.map((h) => h.pid), [2, 3, 4], 'the title row, the installed bin under it and its own child are one unit');
     assert.ok(helpers.every((h) => h.pidStart), 'every process in the unit carries a start time');
-    assert.throws(() => check([parent, title, { ...server, pidStart: null }]), /background/,
-      'the child under the matched title still needs a captured identity');
+    assert.throws(() => check([parent, title, server, { ...browser, pidStart: null }]), /background/,
+      'a descendant without a captured identity refuses the whole unit');
+
+    // The title alone is not evidence. A row wearing it whose child is some other
+    // install — the shape `npm exec --package=/tmp/impostor -- …` leaves — is refused.
+    const other = npxInstall(cacheRoot, 'mcp-server-fetch@latest', 'mcp-server-fetch', 'cli.js');
+    assert.throws(() => check([parent, title, { ...server, args: `node ${path.join(other.binDir, 'mcp-server-fetch')} --headless` }]),
+      /background/, 'a child under another install is not what this declaration names');
+    assert.throws(() => check([parent, title, { ...server, args: `node ${path.join(root, 'impostor', 'playwright-mcp')} --headless` }]),
+      /background/, 'nor is a bin of the right name somewhere else entirely');
+    assert.throws(() => check([parent, title]), /background/,
+      'an npm exec row with no child yet proves nothing and is refused');
+    assert.throws(() => check([parent, title, server, { pid: 5, ppid: 2, pidStart: 'second', args: '/usr/bin/sleep 60' }]),
+      /background/, 'nor does a row with two children');
+
+    // The .bin link has to resolve to the very file the manifest points at.
+    const link = path.join(binDir, 'playwright-mcp');
+    fs.rmSync(link);
+    fs.symlinkSync(path.join('..', '@playwright/mcp', 'other.js'), link);
+    assert.throws(() => check([parent, title, server]), /background/,
+      'a .bin link pointing somewhere the manifest does not name is not the declared program');
+    fs.rmSync(link);
+    fs.symlinkSync(path.join('..', '@playwright/mcp', 'cli.js'), link);
+    assert.deepEqual(check([parent, title, server]).map((h) => h.pid), [2, 3], 'and it matches again once it does');
+
     // Fetch-only options in front of the package are gone from the title, so they are
-    // stripped from the declaration too.
-    declare(['-y', '@playwright/mcp@latest', '--headless']);
+    // stripped from the declaration too; the install is keyed by the spec either way.
+    declare(['-y', spec, '--headless']);
     assert.deepEqual(check([parent, title, server]).map((h) => h.pid), [2, 3], '-y before the package is stripped');
-    declare(['--yes', '--prefer-offline', '--', '@playwright/mcp@latest', '--headless']);
+    declare(['--yes', '--prefer-offline', '--', spec, '--headless']);
     assert.deepEqual(check([parent, title, server]).map((h) => h.pid), [2, 3], 'the npx option separator is stripped once');
     // These decide what actually runs, so the title no longer says what was declared.
-    declare(['--package', 'foo', '@playwright/mcp@latest', '--headless']);
+    declare(['--package', 'foo', spec, '--headless']);
     assert.throws(() => check([parent, title, server]), /background/, '--package changes what runs and is not stripped');
     declare(['-c', 'playwright-mcp']);
     assert.throws(() => check([parent, title, server]), /background/, '--call is not stripped either');
@@ -224,8 +271,35 @@ test('an npx-declared server is admitted under the npm exec title npm rewrote ov
     assert.throws(() => check([parent, title, server]), /background/, 'options alone declare no package');
     declare(['@playwright/mcp@1.2.3', '--headless']);
     assert.throws(() => check([parent, title, server]), /background/, 'a different package is a different declaration');
-    declare(['@playwright/mcp@latest', '--headless']);
+    // A spec that is not a registry spec names no cache directory to check against.
+    for (const local of ['./local-mcp', '/opt/local-mcp', '~/local-mcp', 'github:owner/repo']) {
+      declare([local, '--headless']);
+      assert.throws(() => check([parent, { ...title, args: `npm exec ${local} --headless` }, server]), /background/, local);
+    }
+    declare([spec, '--headless']);
     assert.throws(() => check([parent, { ...title, args: '/usr/local/bin/npm exec @playwright/mcp@latest --headless' }, server]),
       /background/, 'the title npm writes is the bare word npm, never a path');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('an unscoped npx package publishes its bin under its own name', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-mcp-npx-string-bin-'));
+  try {
+    const cwd = path.join(root, 'project');
+    fs.mkdirSync(cwd);
+    const cacheRoot = path.join(root, 'npm-cache');
+    const env = { npm_config_cache: cacheRoot };
+    // `"bin": "cli.js"` publishes exactly one bin, named for the package.
+    const { binDir } = npxInstall(cacheRoot, 'mcp-server-fetch@latest', 'mcp-server-fetch', 'cli.js');
+    fs.writeFileSync(path.join(cwd, '.mcp.json'), JSON.stringify({ mcpServers: {
+      fetch: { command: 'npx', args: ['-y', 'mcp-server-fetch@latest', '--port', '3000'] } } }));
+    const parent = { pid: 1, args: '/test/claude' };
+    const title = { pid: 2, ppid: 1, pidStart: 'launcher', args: 'npm exec mcp-server-fetch@latest --port 3000' };
+    const server = { pid: 3, ppid: 2, pidStart: 'server', args: `${path.join(binDir, 'mcp-server-fetch')} --port 3000` };
+    const check = (rows) => inspect({ root, agent: 'claude', sessionId: 'session-1', parent, rows, cwd, env });
+    assert.deepEqual(check([parent, title, server]).map((h) => h.pid), [2, 3],
+      'the child runs the .bin link directly, and it is the one the manifest names');
+    assert.throws(() => check([parent, title, { ...server, args: `${path.join(binDir, 'mcp-server-fetch')} --port 3001` }]),
+      /background/, 'the arguments after the spec are the declared ones');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

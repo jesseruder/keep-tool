@@ -49,9 +49,35 @@ Any other leading dash token (`-p`/`--package`, `-c`/`--call`) changes what actu
 runs, so it refuses instead, as does an empty remainder. The first token must be the
 bare word `npm`, because that is literally what npm wrote into its title; a real
 `/usr/local/bin/npm exec …` argv is a launcher row and is matched, or not, by the
-rules above. Note that npm redacts credentials out of the arguments before joining
-them, so a declaration carrying a credentialed URL cannot be reconstructed from the
-row, does not match this form, and stays on the audit-pin path.
+rules above.
+
+The title is a pointer and never the evidence. `npm exec --package=/tmp/impostor --
+mcp-server-fetch --port 3000` wears exactly the title of a declared `npx -y
+mcp-server-fetch --port 3000`, and any node process can assign that string to
+`process.title` outright, so a match on the title alone would admit an impostor and
+its whole subtree. What is checked is the program underneath it. npx unpacks a
+registry spec into `<npm cache root>/_npx/<digest>/`, where the cache root is
+`npm_config_cache` or `~/.npm` and the digest is the first 16 hex of a SHA-512 over
+the sorted package specs as written; the row is therefore admitted only when it has
+exactly one child, and that child matches — by the same launcher and interpreter rules
+as any other declaration — a synthetic declaration whose command is
+`<npxCache>/<digest>/node_modules/.bin/<bin>` and whose arguments are the declared
+ones after the spec. `<bin>` is the basename of the child's own launcher token, it has
+to be one of the bin names in that install's `<pkg>/package.json` (a string `bin`
+publishes one named for the unscoped package), and the `.bin` link has to resolve to
+the very file the manifest points at. Any read that fails means no match. On a match
+the `npm exec` row, its child, and everything below are captured as the one helper
+unit. On no match the row is refused exactly as before — which is also what an
+`npm exec` that is still installing gets, since it has no child yet.
+
+Three kinds of declaration therefore have no title form at all and stay on the
+audit-pin path. A spec that is not a registry spec — one starting with `.`, `/` or
+`~`, or containing `:`, so directory, git and URL specs — because there is no cache
+directory to derive. A declaration whose arguments carry a credentialed URL, because
+npm redacts secrets out of the title and the row can no longer be reconstructed from
+the declaration. And a package that is already present in the project's own
+`node_modules`, because npx then runs the local bin and writes no `_npx` directory for
+this to check against.
 
 What a match asserts is that the row, joined with single spaces, is the declared
 invocation. It cannot assert where the live process put its argument boundaries: `ps`

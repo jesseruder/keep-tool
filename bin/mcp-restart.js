@@ -16,10 +16,21 @@
 // npx bin rewrites its own argv to `npm exec …` and npm then overwrites process.title
 // with `npm` plus the positional arguments, so the live row for an npx-declared server
 // reads `npm exec <package> <args>`, and matching only the declared spelling refused
-// every session that had one. That title is matched here. npm builds it by redacting
-// secrets out of those positional arguments, so a declaration whose arguments carry a
-// credentialed URL cannot be reconstructed from the row and does not match this form:
-// such a server stays on the audit-pin path.
+// every session that had one. That title is read here — but only as a pointer, never
+// as proof. A title proves nothing: `npm exec --package=/tmp/impostor -- mcp-server-fetch`
+// wears the title of a declared `npx mcp-server-fetch`, and any node process can assign
+// that string to process.title outright. What is checked is the program underneath it.
+// npx unpacks a registry spec into `<npm cache>/_npx/<digest of the spec>/`, so the
+// declaration names that directory; the single child of the `npm exec` row must be a
+// bin that this install's own manifest publishes, reached through the `.bin` link that
+// resolves to the very file the manifest points at, and matched by the same launcher
+// and interpreter rules as any other declaration.
+//
+// Two declarations therefore keep no title form at all and stay on the audit-pin path.
+// One whose arguments carry a credentialed URL: npm redacts secrets out of the title,
+// so the row cannot be reconstructed from the declaration. And one whose package is
+// already in the project's own node_modules: npx runs the local bin, writes no `_npx`
+// directory, and there is nothing for this to check against.
 //
 // Residual, deliberately not closed here: a helper unit is a snapshot of the process
 // tree. A descendant a declared launcher spawns after the snapshot is not waited for;
@@ -28,6 +39,7 @@
 // pgid: adding one changes the single ps invocation and positional parser that every
 // identity proof in this daemon reads, which is a worse risk than the residual.
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
@@ -152,11 +164,12 @@ function realpath(file) { try { return fs.realpathSync(file); } catch { return n
 // the same program running. Anything else in front of the package — -p/--package,
 // -c/--call — changes what actually runs and is not stripped: no match.
 const NPX_LEADING_OPTIONS = new Set(['-y', '--yes', '-q', '--quiet', '--no-install', '--prefer-online', '--prefer-offline']);
-// The tail npm's process title carries for a server declared as `npx <args>`, or null
-// when this declaration has no such form. The `npx` bin splices `exec` into argv and
-// npm sets its title from the positional arguments only, so the declared npx options
-// are gone from the row and the package and its arguments remain.
-function npxTitleTail(entry) {
+// What npm's process title would read for a server declared as `npx <args>`, split
+// into the package spec and the arguments after it, or null when this declaration has
+// no such form. The `npx` bin splices `exec` into argv and npm sets its title from the
+// positional arguments only, so the declared npx options are gone from the row and the
+// package spec and its arguments remain.
+function npxDeclaration(entry) {
   if (path.basename(entry.command) !== 'npx') return null;
   const args = [...entry.args];
   while (args.length && args[0].startsWith('-')) {
@@ -164,7 +177,79 @@ function npxTitleTail(entry) {
     if (option === '--') break; // the one separator npm drops; what follows is positional
     if (!NPX_LEADING_OPTIONS.has(option)) return null;
   }
-  return args.length ? args.join(' ') : null;
+  return args.length ? { spec: args[0], rest: args.slice(1), title: args.join(' ') } : null;
+}
+// Only a registry spec is resolvable back to an npx cache directory. A directory, git
+// or URL spec names something this cannot re-derive, so it stays on the pin path.
+function registrySpec(spec) { return !/^[.~/]/.test(spec) && !spec.includes(':'); }
+// A package name npm would accept, and nothing that could walk out of the cache
+// directory it is joined into.
+const PACKAGE_NAME_RE = /^(?:@[a-z0-9~][a-z0-9-._~]*\/)?[a-z0-9~][a-z0-9-._~]*$/;
+function packageNameOf(spec) {
+  const at = spec.lastIndexOf('@');
+  const name = at > 0 ? spec.slice(0, at) : spec;
+  return PACKAGE_NAME_RE.test(name) ? name : null;
+}
+// Where npx unpacks what it runs. The cache root is npm's own (`npm_config_cache`,
+// else ~/.npm) and the install directory under it is keyed by a digest of the package
+// specs exactly as they were written on the command line — libnpmexec computes it the
+// same way, which is why a declaration can be checked against one.
+function npxCacheDir(env) {
+  const source = env && typeof env === 'object' ? env : process.env;
+  const cache = source.npm_config_cache;
+  return path.join(typeof cache === 'string' && path.isAbsolute(cache) ? cache : path.join(os.homedir(), '.npm'), '_npx');
+}
+function npxInstallHash(specs) {
+  return crypto.createHash('sha512').update(specs.sort((a, b) => a.localeCompare(b, 'en')).join('\n')).digest('hex').slice(0, 16);
+}
+// The bin file the declared spec's own install publishes under `name`, as an absolute
+// path, or null. Read entirely from what npx wrote: the package manifest names its
+// bins, and the `.bin` link has to resolve to the very file that manifest points at.
+// Any unreadable or surprising file means no match at all.
+function npxInstalledBin(dir, pkgName, name) {
+  try {
+    if (!word(name) || name.includes('/') || name === '.' || name === '..') return null;
+    const pkgDir = path.join(dir, 'node_modules', pkgName);
+    const manifest = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8'));
+    // `"bin": "cli.js"` publishes one bin named for the package, without its scope.
+    const bins = typeof manifest.bin === 'string' ? { [pkgName.replace(/^@[^/]+\//, '')]: manifest.bin }
+      : (manifest.bin && typeof manifest.bin === 'object' && !Array.isArray(manifest.bin) ? manifest.bin : null);
+    if (!bins || typeof bins[name] !== 'string' || !bins[name]) return null;
+    const link = path.join(dir, 'node_modules', '.bin', name);
+    const target = realpath(path.join(pkgDir, bins[name]));
+    return target && realpath(link) === target ? link : null;
+  } catch { return null; }
+}
+// The title alone proves nothing: `npm exec --package=/tmp/impostor -- mcp-server-fetch`
+// wears the title of a declared `npx mcp-server-fetch`, and any node process can simply
+// assign that string to process.title. So the title is only ever read as a pointer, and
+// what is actually checked is the program underneath it: the single child of the
+// `npm exec` row must be the bin that the declared spec's own npx cache install
+// publishes, matched by the unchanged launcher and interpreter rules.
+function npxInstallMatch(child, npx, context) {
+  if (!registrySpec(npx.spec)) return false;
+  const pkgName = packageNameOf(npx.spec);
+  if (!pkgName) return false;
+  const rows = Array.isArray(context.rows) ? context.rows : [];
+  const children = rows.filter(row => row.ppid === child.pid);
+  // Exactly one: an `npm exec` still installing has no child yet and is refused (a
+  // refusal the transfer queue retries), and more than one is not this shape at all.
+  if (children.length !== 1) return false;
+  const live = children[0];
+  const liveArgs = typeof live.args === 'string' ? live.args : '';
+  if (!liveArgs || liveArgs.length > 64 * 1024) return false;
+  const dir = path.join(npxCacheDir(context.env), npxInstallHash([npx.spec]));
+  const tokens = liveArgs.split(' ');
+  // The child's launcher token is its first, or its second under an interpreter. Its
+  // basename only names which bin to look up; the path itself is settled by matching
+  // the synthetic declaration below, which carries the cache path this derived.
+  for (const token of [tokens[0], tokens[1]]) {
+    if (!word(token)) continue;
+    const command = npxInstalledBin(dir, pkgName, path.basename(token));
+    if (!command || !word(command)) continue;
+    if (declaredMatch(live, { command, args: npx.rest }, { ...context, npxTitle: false })) return true;
+  }
+  return false;
 }
 // Interpreters are compared by resolved file, never by name: python and python3 in
 // one virtualenv are the same binary, and /elsewhere/python3 is not.
@@ -191,7 +276,7 @@ function launcherMatch(command, value) {
 // exactly like two. Declarations carrying whitespace are dropped, which settles the
 // declared side only. A bare declared command likewise matches that basename at any
 // absolute path, since PATH is what chose it.
-function declaredMatch(child, entry) {
+function declaredMatch(child, entry, context = {}) {
   const args = typeof child.args === 'string' ? child.args : '';
   if (!args || args.length > 64 * 1024) return false;
   const tail = entry.args.join(' ');
@@ -206,9 +291,12 @@ function declaredMatch(child, entry) {
   // --headless` is live as `npm exec @playwright/mcp@latest --headless`. The title is
   // the literal word `npm` that npm wrote, never a path, so only the bare token is
   // accepted here; a real `/usr/local/bin/npm exec …` argv goes through the launcher
-  // rules above like any other row.
-  const npxTail = npxTitleTail(entry);
-  if (npxTail && tokens[0] === 'npm' && tokens[1] === 'exec' && tokens.slice(2).join(' ') === npxTail) return true;
+  // rules above like any other row. And the title is never the evidence — it is a
+  // pointer to the npx cache install of the declared spec, and the program there is
+  // what npxInstallMatch checks.
+  const npx = context.npxTitle === false ? null : npxDeclaration(entry);
+  if (npx && tokens[0] === 'npm' && tokens[1] === 'exec' && tokens.slice(2).join(' ') === npx.title
+      && npxInstallMatch(child, npx, context)) return true;
   // Interpreter-expanded launcher. The interpreter is not free: it must be the one
   // the launcher's shebang names, resolved to the same file, or — for `#!/usr/bin/env
   // NAME` — a command of that name. `/bin/sh /path/server` is a different program.
@@ -235,7 +323,7 @@ function subtree(child, rows) {
   }
   return captured;
 }
-function inspect({ root, agent, sessionId, parent, rows, cwd, account }) {
+function inspect({ root, agent, sessionId, parent, rows, cwd, account, env }) {
   const executable = parent.args.split(/\s+/)[0];
   const runtime = agent === 'codex' && executable.startsWith('/') ? path.join(path.dirname(executable), 'codex-code-mode-host') : null;
   const pinCache = new Map(); // One fresh inspection only; never across exit checks.
@@ -249,7 +337,7 @@ function inspect({ root, agent, sessionId, parent, rows, cwd, account }) {
     const refuse = () => { throw Error('Local background processes are still present'); };
     if (!child.pidStart) refuse();
     declared ??= declarations({ agent, parent, cwd, account });
-    if (declared.some(entry => declaredMatch(child, entry))) {
+    if (declared.some(entry => declaredMatch(child, entry, { rows, env }))) {
       const tree = subtree(child, rows);
       if (!tree || tree.some(p => captured.has(p.pid))) refuse();
       for (const p of tree) captured.add(p.pid);
