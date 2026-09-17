@@ -322,6 +322,23 @@ test('an npx package is matched on the one bin npm would select, not any it publ
     for (const name of ['serve', 'maintenance']) {
       assert.throws(() => check(rowsFor(none, ambiguous.binDir, name)), /background/, name);
     }
+
+    // Several names for one file. npm reads that as an alias and runs the first key,
+    // before it ever looks for a key named after the package — so both of these follow
+    // the manifest's own order, not the package name.
+    const aliased = 'alias-mcp@1.0.0';
+    const alias = npxInstall(cacheRoot, aliased, 'alias-mcp', { serve: 'cli.js', shortcut: 'cli.js' });
+    declare(aliased);
+    assert.deepEqual(check(rowsFor(aliased, alias.binDir, 'serve')).map((h) => h.pid), [2, 3],
+      'the first key of an alias set is the one npm runs');
+    assert.throws(() => check(rowsFor(aliased, alias.binDir, 'shortcut')), /background/,
+      'and its other names are not, however well they resolve');
+    const later = 'later-mcp@1.0.0';
+    const ordered = npxInstall(cacheRoot, later, 'later-mcp', { serve: 'cli.js', 'later-mcp': 'cli.js' });
+    declare(later);
+    assert.deepEqual(check(rowsFor(later, ordered.binDir, 'serve')).map((h) => h.pid), [2, 3],
+      'an alias set runs its first key even when a later key is the package name');
+    assert.throws(() => check(rowsFor(later, ordered.binDir, 'later-mcp')), /background/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

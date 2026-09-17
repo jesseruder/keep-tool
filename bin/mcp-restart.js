@@ -202,19 +202,31 @@ function npxCacheDir(env) {
 function npxInstallHash(specs) {
   return crypto.createHash('sha512').update(specs.sort((a, b) => a.localeCompare(b, 'en')).join('\n')).digest('hex').slice(0, 16);
 }
-// Which bin npm runs for a package it was given no explicit command for: the only one
-// there is, or the one named after the package. A manifest publishing `demo-mcp` and
-// `maintenance` runs `demo-mcp` and nothing else, so the selection is derived from the
-// manifest alone and the live row is then held to it — never the other way round,
-// which would let a row pick whichever of the published bins suited it.
+// Which bin npm runs for a package it was given no explicit command for. This follows
+// npm's own getBinFromManifest (npm/node_modules/libnpmexec/lib/get-bin-from-manifest.js)
+// in its order, because a rule of our own would disagree with it somewhere:
+//
+//   1. the manifest's `bin`, normalised to an object — a string publishes one bin
+//      named for the package without its scope;
+//   2. if every published bin points at the same file, the FIRST key, which covers
+//      both the single-bin case and an alias like {serve, alias} → both cli.js;
+//   3. otherwise the key equal to the unscoped package name;
+//   4. otherwise npm refuses to choose, and so does this.
+//
+// Step 2 comes before step 3 in npm, so a manifest whose values are all one file runs
+// its first key even when a later key is the package's own name. The selection is
+// derived from the manifest alone and the live row is then held to it — never the
+// other way round, which would let a row pick whichever published bin suited it.
 function npxSelectedBin(manifest, pkgName) {
   const unscoped = pkgName.replace(/^@[^/]+\//, '');
-  // `"bin": "cli.js"` publishes one bin named for the package, without its scope.
-  if (typeof manifest.bin === 'string' && manifest.bin) return { name: unscoped, file: manifest.bin };
-  if (!manifest.bin || typeof manifest.bin !== 'object' || Array.isArray(manifest.bin)) return null;
-  const names = Object.keys(manifest.bin);
-  const name = names.length === 1 ? names[0] : (names.includes(unscoped) ? unscoped : null);
-  return name && typeof manifest.bin[name] === 'string' && manifest.bin[name] ? { name, file: manifest.bin[name] } : null;
+  const bin = typeof manifest.bin === 'string' && manifest.bin ? { [unscoped]: manifest.bin }
+    : (manifest.bin && typeof manifest.bin === 'object' && !Array.isArray(manifest.bin) ? manifest.bin : {});
+  const files = Object.values(bin);
+  // npm would run a non-string bin value straight into a path join; there is nothing
+  // here to resolve it to, so such a manifest matches nothing rather than guessing.
+  if (!files.every((file) => typeof file === 'string' && file)) return null;
+  if (new Set(files).size === 1) return { name: Object.keys(bin)[0], file: files[0] };
+  return bin[unscoped] ? { name: unscoped, file: bin[unscoped] } : null;
 }
 // The bin file the declared spec's own install publishes, as an absolute path, or
 // null. Read entirely from what npx wrote: the manifest names its bins and says which

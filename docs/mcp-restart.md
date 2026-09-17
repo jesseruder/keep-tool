@@ -63,13 +63,15 @@ exactly one child, and that child matches — by the same launcher and interpret
 as any other declaration — a synthetic declaration whose command is
 `<npxCache>/<digest>/node_modules/.bin/<bin>` and whose arguments are the declared
 ones after the spec. `<bin>` is the one bin npm itself would run, derived from that
-install's `<pkg>/package.json` before the live row is looked at: a string `bin`
-publishes one named for the unscoped package; an object with a single key publishes
-that one; an object with several publishes the key equal to the unscoped package name,
-and nothing otherwise. The basename of the child's own launcher token must equal that
-selected name — a manifest publishing `demo-mcp` and `maintenance` runs `demo-mcp`,
-and a child running `maintenance` is refused — and the `.bin` link has to resolve to
-the very file the manifest points at. Any read that fails means no match. On a match
+install's `<pkg>/package.json` before the live row is looked at, in the order npm's own
+`getBinFromManifest` uses: normalise `bin` to an object, where a string publishes one
+bin named for the unscoped package; if every published bin points at the same file,
+take the first key, which covers both a single bin and an alias set; otherwise take the
+key equal to the unscoped package name; otherwise npm refuses to choose and so does
+this. The basename of the child's own launcher token must equal that selected name — a
+manifest publishing `demo-mcp` and `maintenance` runs `demo-mcp`, and a child running
+`maintenance` is refused — and the `.bin` link has to resolve to the very file the
+manifest points at. Any read that fails means no match. On a match
 the `npm exec` row, its child, and everything below are captured as the one helper
 unit. On no match the row is refused exactly as before — which is also what an
 `npm exec` that is still installing gets, since it has no child yet.
