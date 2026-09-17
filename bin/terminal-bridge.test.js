@@ -77,9 +77,17 @@ test('a keystroke is what the terminal did not send by itself', () => {
 
   // Navigation and function keys, including the modified and application-mode forms.
   for (const sequence of ['\x1b[A', '\x1b[B', '\x1b[C', '\x1b[D', '\x1b[H', '\x1b[F',
-    '\x1b[Z', '\x1b[1;5C', '\x1b[3~', '\x1b[5~', '\x1b[15;2~', '\x1bOB', '\x1bOP']) {
+    '\x1b[Z', '\x1b[1;5C', '\x1b[3~', '\x1b[5~', '\x1b[15;2~', '\x1bOB', '\x1bOP',
+    '\x1b[1;2P', '\x1b[1;5S']) {
     assert.equal(containsKeystroke(key(sequence)), true, JSON.stringify(sequence));
   }
+  // The modified function keys share their final bytes with query replies. Shift-F1
+  // is ESC[1;2P and Ctrl-F4 is ESC[1;5S, and modified F3 (ESC[1;2R) is byte-identical
+  // to a cursor-position report for row 1 — which is fine, because xterm's CPR answers
+  // come back on the console's `auto` reply path and never reach this function.
+  assert.equal(containsKeystroke(key('\x1b[1;2P')), true, 'Shift-F1');
+  assert.equal(containsKeystroke(key('\x1b[1;5S')), true, 'Ctrl-F4');
+  assert.equal(containsKeystroke(key('\x1b[1;2R')), true, 'modified F3, not a row-1 CPR');
 
   // What xterm answers on its own, with nobody at the keyboard.
   for (const reply of [
