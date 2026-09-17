@@ -2214,6 +2214,28 @@ commands.slack = async (argv) => {
 commands.incidents = (argv) => {
   const incidents = require('./incidents.js');
   const [subcommand, ...rest] = argv;
+  // Closing one by hand. The quiet sweep needs a `resolvedAt` to start its clock,
+  // so an incident whose `resolved` message can never match — a merged signature
+  // from the first live polls, before Grafana blocks were split by their `Labels:`
+  // line — would otherwise stay open forever. Noise the responder has diagnosed is
+  // the other case, and this is the command its recipe's `keep decide close` is
+  // recommending.
+  if (subcommand === 'close') {
+    const o = parseArgs(rest, { json: 'bool' });
+    if (o._.length !== 1) die('usage: keep incidents close <card-id|signature> -m "why"');
+    if (!o.m) die('keep incidents close needs -m "why"');
+    // Deliberately not the default no-op emitter the CLI uses elsewhere: a hand
+    // close is a lifecycle change like the sweep's, and the area agent's feed is
+    // where its own console row reads it.
+    const result = incidents.close(o._[0], { root: ROOT, reason: o.m }, {
+      emitAgentEvent: require('./agents.js').incidentEmitter({ root: ROOT }),
+    });
+    if (o.json) { console.log(JSON.stringify(result, null, 2)); return; }
+    console.log(result.already
+      ? `${result.card} was already closed (${result.signature}); nothing changed`
+      : `closed ${result.card} (${result.signature})`);
+    return;
+  }
   if (subcommand === 'parse') {
     const o = parseArgs(rest, { json: 'bool' });
     if (o._.length !== 1) die('usage: keep incidents parse <file|->');
@@ -2234,7 +2256,7 @@ commands.incidents = (argv) => {
     return;
   }
   const o = parseArgs(argv, { json: 'bool' });
-  if (o._.length) die('usage: keep incidents [--json] | keep incidents parse <file|->');
+  if (o._.length) die('usage: keep incidents [--json] | keep incidents parse <file|-> | keep incidents close <card-id|signature> -m "why"');
   const open = incidents.openIncidents(ROOT);
   // A write the last poll could not land is retried behind the channel cursor,
   // which means nothing newer is fetched until it succeeds. It is reported here
@@ -2850,6 +2872,9 @@ ${stepUsage()}
   keep incidents parse <file|-> [--json]
                          # parse one Slack message (or a JSON array of them) the way the
                          # poll does — the way to debug an alert shape without polling
+  keep incidents close <card-id|signature> -m "why"
+                         # close an incident that will never resolve itself (a merged
+                         # signature, diagnosed noise): same locked close as the sweep
   keep agents [--json]   # agent records: lifecycle, current session, unseen events
   keep agents events <name> [--unseen] [--limit N] [--json]
   keep agents emit <name> --kind <k> [--card <id>] [--severity low|med|high] [--needs-you] -m "text"

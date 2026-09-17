@@ -24,7 +24,18 @@ const SHARED_LABELS = new Set(['alertname', 'grafana_folder', 'team']);
 const DEFAULT_QUIET_MIN = 60;
 const DEFAULT_REOPEN_HOURS = 24;
 const DEFAULT_HIGH_TITLES = ['Server Faults', 'Sandbox Open Health', 'Sandbox Host Capacity'];
-const DEFAULT_AREAS = { default: { project: '', match: [], default: true, session: false, account: '', agent: 'default' } };
+// The account a standing area session spends against, and how long it may sit
+// idle with nothing open before the daemon restarts it from its log. Both are
+// only read by bin/area-session.js; they live here because `watch/incidents.json`
+// is the one file that describes an area.
+const DEFAULT_ACCOUNT = 'claude-secondary';
+const DEFAULT_RESTART_AFTER_IDLE_MIN = 120;
+const DEFAULT_AREAS = {
+  default: {
+    project: '', match: [], default: true, session: false,
+    account: DEFAULT_ACCOUNT, restartAfterIdleMin: DEFAULT_RESTART_AFTER_IDLE_MIN, agent: 'default',
+  },
+};
 
 function readJson(file, fallback) {
   try {
@@ -120,8 +131,12 @@ function config(root = keep.ROOT) {
       project: String(value.project || ''),
       match: (Array.isArray(value.match) ? value.match : []).map(String),
       default: value.default === true,
+      // Whether this area gets a standing incident-responder session. Off by
+      // default: watching is deterministic without one, and turning it on spends
+      // a model account, so it is Owner's switch to flip per area.
       session: value.session === true,
-      account: String(value.account || ''),
+      account: String(value.account || '') || DEFAULT_ACCOUNT,
+      restartAfterIdleMin: Math.max(1, Number(value.restartAfterIdleMin) || DEFAULT_RESTART_AFTER_IDLE_MIN),
       // The agent whose feed this area's events land in. Default: the area's
       // own name, so an area only needs this when the two differ.
       agent: String(value.agent || name),
@@ -1013,6 +1028,73 @@ function sweepQuietly(options = {}, deps = {}) {
   try { return sweep(options, deps) || []; } catch { return []; }
 }
 
+// ---------- closing one by hand ----------
+
+// An incident that will never resolve itself. The first live polls, before
+// Grafana blocks were split by their `Labels:` line, opened cards on merged
+// signatures that no `resolved` message can ever match; noise the responder has
+// diagnosed is the other case. Neither can wait for the quiet sweep, because
+// that sweep needs a `resolvedAt` (or an `adhoc:` signature) to start its clock.
+//
+// The same locked mutation, the same `closeMarker` idempotence and the same
+// publish path as the sweep, so a hand close is a lifecycle change like any
+// other and reaches the area agent's feed the way the poll's own events do.
+// A target is a card id or a signature; an open signature is matched first,
+// because a signature reopened after a close is the one anybody means.
+function resolveCloseTarget(state, target) {
+  const wanted = String(target || '').trim();
+  if (!wanted) return null;
+  const entries = Object.entries(state.signatures || {});
+  const bySignature = entries.filter(([signature]) => signature === wanted);
+  const byCard = entries.filter(([, entry]) => entry && String(entry.card || '') === wanted);
+  const found = [...bySignature, ...byCard];
+  const open = found.find(([, entry]) => entry && !entry.closedAt);
+  return open || found[0] || null;
+}
+
+function close(target, options = {}, deps = {}) {
+  const root = options.root || keep.ROOT;
+  const now = Number(options.now) || Date.now();
+  const reason = oneLine(options.reason || '', NOTE_TEXT_MAX);
+  if (!reason) throw new keep.KeepError('closing an incident needs -m "why"');
+  const d = { ...defaultDeps(), ...deps };
+  const pending = [];
+  let outcome = { missing: true };
+  const mutated = mutateState((state) => {
+    const found = resolveCloseTarget(state, target);
+    if (!found) return;
+    const [signature, entry] = found;
+    if (!entry.card) { outcome = { signature, noCard: true }; return; }
+    // Already closed: say so and change nothing. A second close must not append
+    // another line to the card or emit a second event.
+    if (entry.closedAt) { outcome = { signature, card: entry.card, already: true }; return; }
+    const marker = closeMarker(signature, entry);
+    d.checkinTask(entry.card, {
+      heading: 'closed',
+      status: 'done',
+      message: [`closed by hand: ${reason}`, marker].join('\n'),
+      linkSession: false, commit: false, withinLock: true,
+    });
+    entry.closedAt = now;
+    outcome = { signature, card: entry.card, closed: true, title: entry.title || signature, area: entry.area || '' };
+    pending.push({
+      at: now, kind: 'incident-closed', card: entry.card, signature,
+      title: entry.title || signature, area: entry.area || '', severity: 'low',
+      permalink: '', suspects: [],
+    });
+  }, { root, withLock: options.withLock, write: options.write });
+  if (!mutated.ok) throw new keep.KeepError(`could not close ${target}: ${mutated.error}`);
+  if (outcome.missing) throw new keep.KeepError(`no incident signature or card matching ${target}`);
+  if (outcome.noCard) throw new keep.KeepError(`signature ${outcome.signature} has no card to close`);
+  // Only once the state write landed: a close nobody recorded is not a close.
+  const published = publish(root, pending, d);
+  if (published.length && fs.existsSync(path.join(root, '.git'))) {
+    try { d.commitAndPush('keep: incidents', ['tasks']); } catch {}
+  }
+  if (published.length) { try { require('./agents.js').flushCommits(root); } catch {} }
+  return outcome;
+}
+
 // ---------- reporting ----------
 
 // What the last Slack poll did to incidents. A failed write is retried on the
@@ -1069,7 +1151,7 @@ function openIncidents(root = keep.ROOT, now = Date.now()) {
 }
 
 module.exports = {
-  CONFIG_NAME,
+  CONFIG_NAME, DEFAULT_ACCOUNT, DEFAULT_RESTART_AFTER_IDLE_MIN,
   configFile, stateDir, stateFile, eventsFile,
   config, alertBots, normalizeAlertBots,
   combinedText, unescapeEntities, slug, dataFence,
@@ -1077,6 +1159,7 @@ module.exports = {
   loadState, mutateState, emptyState,
   appendEvent, readEvents, taskContainsLine, closeMarker, slackTsLine,
   cardIdFor, ingest, sweep, sweepQuietly, quietDue, openIncidents, messageTime,
+  close, resolveCloseTarget,
   recordPoll, lastPoll, pendingFailures,
   permalinkFor, defaultDeps,
 };

@@ -451,6 +451,84 @@ test('a second firing bumps the open card instead of opening another', () => {
   } finally { cleanup(root); }
 });
 
+test('an incident that will never resolve itself can be closed by hand, by card or by signature', () => {
+  const root = makeRoot();
+  try {
+    const registry = fakeRegistry(root);
+    const firing = reposted(SERVER_FAULTS_FIRING, '1789600000.000000');
+    const sandbox = reposted(SANDBOX_OPENS_FIRING, '1789600100.000000');
+    ingest(root, registry, [firing, sandbox]);
+    const [serverCard, sandboxCard] = registry.created.map((row) => row.id);
+    const serverSig = 'grafana:unacknowledged-server-faults';
+    assert.equal(incidents.openIncidents(root).length, 2);
+    registry.events.length = 0;
+
+    // A firing with no resolution has no quiet clock of its own, so the sweep
+    // will never touch it however long it sits there.
+    assert.deepEqual(incidents.sweep({ root, now: Date.UTC(2026, 8, 20) }, registry.deps), []);
+
+    // By card id.
+    const byCard = incidents.close(serverCard, { root, now: 5000, reason: 'merged signature from the first polls; it can never resolve' }, registry.deps);
+    assert.equal(byCard.closed, true);
+    assert.equal(byCard.card, serverCard);
+    assert.equal(byCard.signature, serverSig);
+    assert.equal(registry.statuses.get(serverCard), 'done');
+    assert.match(registry.body(serverCard), /closed by hand: merged signature from the first polls/);
+    assert.equal(incidents.loadState(root).signatures[serverSig].closedAt, 5000);
+    // The area agent's feed sees it, exactly as the sweep's close does.
+    assert.deepEqual(registry.events.map((item) => item.event.kind), ['incident-closed']);
+    assert.equal(registry.events[0].area, 'app-server');
+
+    // A second close changes nothing and appends nothing.
+    const linesBefore = registry.body(serverCard);
+    const again = incidents.close(serverSig, { root, now: 9000, reason: 'again' }, registry.deps);
+    assert.equal(again.already, true);
+    assert.equal(again.card, serverCard);
+    assert.equal(registry.body(serverCard), linesBefore, 'no second close line');
+    assert.equal(incidents.loadState(root).signatures[serverSig].closedAt, 5000, 'the first close time stands');
+    assert.equal(registry.events.length, 1, 'and no second event');
+
+    // By signature.
+    const sandboxSig = incidents.openIncidents(root)[0].signature;
+    const bySignature = incidents.close(sandboxSig, { root, now: 6000, reason: 'flapping; diagnosed as noise' }, registry.deps);
+    assert.equal(bySignature.closed, true);
+    assert.equal(bySignature.card, sandboxCard);
+    assert.equal(registry.statuses.get(sandboxCard), 'done');
+    assert.deepEqual(incidents.openIncidents(root), []);
+
+    // Nothing to close, and no reason given.
+    assert.throws(() => incidents.close('inc-nothing-like-this', { root, reason: 'why' }, registry.deps),
+      /no incident signature or card matching/);
+    assert.throws(() => incidents.close(serverCard, { root, reason: '' }, registry.deps), /needs -m/);
+  } finally { cleanup(root); }
+});
+
+test('a hand close of a reopened signature closes the period it is in', () => {
+  const root = makeRoot();
+  try {
+    const registry = fakeRegistry(root);
+    const firing = reposted(SERVER_FAULTS_FIRING, '1789600000.000000');
+    const resolved = reposted(SERVER_FAULTS_RESOLVED, '1789600300.000000');
+    ingest(root, registry, [firing, resolved]);
+    const card = registry.created[0].id;
+    const signature = 'grafana:unacknowledged-server-faults';
+    // Closed by the sweep, then it fires again within the reopen window.
+    incidents.sweep({ root, now: at(resolved) + 61 * 60e3 }, registry.deps);
+    assert.equal(registry.statuses.get(card), 'done');
+    ingest(root, registry, [reposted(SERVER_FAULTS_FIRING, '1789610000.000000')]);
+    assert.equal(registry.statuses.get(card), 'active');
+    assert.equal(incidents.openIncidents(root).length, 1);
+
+    // The reopened period gets its own close line: the marker carries the last
+    // firing, so the sweep's earlier one does not suppress this one.
+    const closed = incidents.close(signature, { root, now: 7000, reason: 'known cause, fix is landing' }, registry.deps);
+    assert.equal(closed.closed, true);
+    assert.equal(registry.statuses.get(card), 'done');
+    assert.equal(registry.body(card).match(/^closed by hand:/gm).length, 1);
+    assert.deepEqual(incidents.openIncidents(root), []);
+  } finally { cleanup(root); }
+});
+
 test('resolved checks in and leaves the card active; the quiet sweep closes it', () => {
   const root = makeRoot();
   try {
