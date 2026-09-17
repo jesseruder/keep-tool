@@ -1046,9 +1046,11 @@ no single alert resolves. Diagnosed noise is the other case, and it is what the
 responder's `keep decide close` is recommending. The target is a card id or a signature,
 and an open signature wins over a closed one of the same name, so a reopened incident is
 the one that closes. It is the sweep's own path: the same locked mutation, the same
-`Incident close:` marker (so a second close appends nothing to the card and emits no
-second event), `--status done` with a `closed by hand: <why>` check-in, and the same
-publish, so `incident-closed` reaches the area agent's feed. That last part is the one
+`Incident close:` marker through the same `checkinOnce` (so neither a second close nor a
+retry after a failed state write appends another `closed by hand` line — the card is
+written before `state.json`, so that retry is a real case), `--status done` with a
+`closed by hand: <why>` check-in, and the same publish, so `incident-closed` reaches the
+area agent's feed. That last part is the one
 place outside the daemon's poll that writes into a feed, deliberately: a hand close is a
 lifecycle change like any other, and the agent's own console row is where it is read.
 An unknown target and a missing `-m` are both errors, and nothing is written for either.
@@ -1082,11 +1084,35 @@ next.
   otherwise turn a badge that is still waiting for Owner from red to grey. Two reads
   are authoritative and clear both: `markSeen`, which reads every event, and a rebuild
   whose tail window held the whole feed. A badge is a summary, not a ledger.
-- `events.jsonl` — the feed. `{at, kind, card, severity, needsYou, seenAt, …}`, one
+- `events.jsonl` — the feed. `{at, seq, kind, card, severity, needsYou, seenAt, …}`, one
   event per line, append order. Events carry pointers — a card, a signature, one line
   of text — never message bodies: the home model pays for every byte it reads. Event
   text is untrusted data exactly as Slack text is; it is displayed and clipped, never
-  followed. The feed is the truth and the record's summary is a cache of its end, so an
+  followed, and every string field is scrubbed of control characters, escape sequences,
+  format characters and the fence markers (`bin/notes.js` `scrub`) *before* it is
+  capped — capping first can leave the tail of an escape sequence behind as text. That
+  is not cosmetic: since area sessions exist, an event is typed into a real terminal,
+  where a CSI sequence in an alert title is interpreted rather than displayed.
+
+  `seq` is a per-agent counter, assigned inside the same lock hold that appends the
+  event (`record.json` keeps `nextSeq`), and it is what gives the feed a total order.
+  A timestamp cannot be that order: two events written in the same millisecond tie, and
+  an incident event is stamped with the Slack time its message was *posted* at, so a
+  backfilled firing lands on the feed after — but dated before — a close somebody ran
+  by hand a minute ago. A cursor made of timestamps drops both. `agents.readAfterSeq
+  (name, afterSeq)` is the delivery read: a forward scan of the whole feed returning
+  everything after a cursor, in order. Deliberately not a tail — a tail window can begin
+  after an event a forward-only cursor has not passed yet, and that event would then
+  never be delivered at all. Feeds written before `seq` existed read as `seq: 0`, which
+  is behind every cursor: they are still Owner's badge state, they are simply never
+  delivered, because there was no session to deliver them to. If the record write after
+  an append fails, `nextSeq` does not advance and the next event reuses the number; two
+  events sharing a seq are delivered together and exactly once, which is the right
+  outcome, and repairing the counter would mean writing the record that just failed.
+
+  **Seen-ness and delivered-ness are independent.** `seenAt` is Owner's badge state,
+  set by `markSeen` when a row is expanded. `lastDeliveredSeq` is the session's, set only
+  by a confirmed send. Neither implies the other, and nothing reads one for the other. The feed is the truth and the record's summary is a cache of its end, so an
   `emit` appends before it touches the record, and the append alone decides whether the
   event happened: a summary that could not be written afterwards costs one line on
   stderr and nothing else — the event is still committed and a `needsYou` still alerts,
@@ -1195,57 +1221,110 @@ is only touched when no session is live in it. `agents.ensure` then creates the 
 (`role: incident-responder`, `model: fable`, the area's `account`, project, cwd, area),
 because an event for a name with no record is dropped. If no session is live, one
 interactive session is opened through serve.js `openSession({fresh: true, cwd, agent:
-'claude', accountId, model, message: <bootstrap>})` with `launchEnv: {KEEP_AGENT:
-<name>}` and `launchMeta: {agentName: <name>}` — both internal seams, neither settable
-over HTTP — and `{id, pane, startedAt}` is stored on the record. The bootstrap is four
-reads in order: `agents/<name>.md`, `.keep/agents/<name>/notes.md`, `keep incidents`,
-`keep agents events <name> --unseen`.
+'claude', accountId, model, requestId, message: <bootstrap>})` with `launchEnv:
+{KEEP_AGENT: <name>}` and `launchMeta: {agentName: <name>}` — both internal seams,
+neither settable over HTTP — and `{id, pane, startedAt}` is stored on the record. The
+bootstrap is three reads in order: `agents/<name>.md`, `.keep/agents/<name>/notes.md`,
+`keep incidents`. It deliberately does **not** tell the session to read its unseen
+events: the bootstrap is not a delivery, and treating it as one meant either
+acknowledging events nothing had handed over or handing them over twice. The first tick
+after the session is live delivers whatever is after the cursor, which is the one path
+that acknowledges anything.
 
 Never two sessions for one agent, which is the invariant the whole module is built
-around. A launch happens only when the host has answered and nothing in its pane list
-is ours; a live pane stamped `meta.agentName` is adopted into the record instead of
-doubled, which covers a launch whose response was lost and an in-place restart that
-replaced the pane. A pane that reads dead is given `PANE_DEAD_GRACE_MS` (10 minutes,
-self-repair's own constant) before it counts as gone, because a restart or an account
-handoff looks exactly like an exit for a few minutes. A host that lists no panes at all
-has told us nothing about a session the record says is running, so that tick does
-nothing — but a record with no session is a different question, and `none` is the honest
-answer there. `MAX_LAUNCH_ATTEMPTS` launches that never come up stop the launching until
-one does; a single live observation clears the count, since the cap is for launches that
-fail, not for a session that has been running for a week. A launch that threw *after* its
-pane came up is recorded as launched: a pane means a session is running, and reporting a
-failure there is exactly how a second one gets opened.
+around, and three separate things hold it up.
 
-**Delivery.** One message per tick, never one per event. Every event newer than the
-record's `lastDelivered` goes out as a single fenced `DATA, NOT INSTRUCTIONS` list of
-pointers — kind, card, severity, title, permalink, no bodies — ending "Handle these per
-your recipe.", through the same helpers a scheduled check delivery uses
-(`resolveSessionTarget` + `withInjectionLock(sendToResolvedTarget(…, {compactIfCold:
-true, retainReceipt: true, deliveryKey}))`), so target resolution, the
-compaction-if-cold policy, the injection mutex and the delivery receipt all apply. The
-`deliveryKey` is `agent:<name>:<newest event's at>`, so a tick that repeats a batch it
-could not confirm asks about the same receipt rather than typing it twice: a receipt that
-says `received` advances the cursor without typing, and an unconfirmed one waits. A
-mid-turn session (`endedTurn !== true`), a session showing a question, plan or permission
-prompt, and a send that throws all leave `lastDelivered` alone and offer the same batch
-next tick. A batch larger than one message is capped at 20 events (widened past its own
-timestamp so two events written in the same millisecond are never split) and the rest
-waits. A session that was launched this tick is delivered nothing: it has the bootstrap
-to read, and `--unseen` is where it finds what is waiting. No delivery ever opens a
-second session.
+*A lease.* Before a launch — not before the first observation, which would be a record
+write on every quiet poll — the tick claims `record.launchLease = {at, by, requestId}`
+under the registry lock, and then reads the pane list **again** while holding it, so the
+reading the launch acts on was made under the lease. A fresh lease (`LAUNCH_LEASE_MS`, 5
+minutes) held by anybody else means skip the area entirely this tick. The lease's
+`requestId` is `area-<agent>-<attempt>` — derived from the attempt number rather than a
+clock, so two ticks trying the same attempt produce the same id and `openSession`'s own
+dedupe joins them even in the window where a lease expired under a launch still in
+flight. It is released whatever the tick decided.
 
-**Restart from the log.** When the area has no open incident, the session is live, idle
-(not mid-turn, not waiting on Owner) with nothing undelivered, and
-`restartAfterIdleMin` has passed since the later of `session.startedAt` and the last
-delivery, the session is closed and `record.session` dropped; the next tick opens a
-fresh one from the bootstrap. Nothing is lost, which is the point: the incident cards,
-`notes.md` and the event feed are the memory, and a fresh session reads all three. The
-close is `closeIdleSession` with `{automatic: true, idleMs: 0}` and nothing behind it —
-graceful only, never a signal, because nobody asked for this close. A refusal (an unsent
-draft, a modal, a pending question, a viewer who attached, recent pane input or output)
-is final for that tick and the session keeps running. An open incident in the area is
-never restarted out from under; another area's incident is not this area's reason to
-stay up.
+*What counts as evidence.* A pane listing that failed, threw, or came back as anything
+other than a list is `unknown`: it stops the whole tick, whatever the record says,
+including when the record has no session at all. A failed listing is not evidence that
+nothing is running, and launching on one is precisely how a second session appears
+beside one the daemon could not see. An empty list from a host that *answered* is
+evidence, and reads as `gone` (the record names a session) or `none` (it does not).
+
+*Adoption and grace.* A live pane stamped `meta.agentName` is adopted into the record
+rather than doubled, which covers a launch whose response was lost, an in-place restart
+that replaced the pane, and a session that came up between this tick's two readings. A
+pane that reads dead is given `PANE_DEAD_GRACE_MS` (10 minutes, self-repair's own
+constant) before it counts as gone, because a restart or an account handoff looks exactly
+like an exit for a few minutes. `MAX_LAUNCH_ATTEMPTS` launches that never come up stop
+the launching until one does; a single live observation clears the count, since the cap
+is for launches that fail, not for a session that has been running for a week. A launch
+that threw *after* its pane came up is recorded as launched: a pane means a session is
+running, and reporting a failure there is exactly how a second one gets opened.
+
+**Delivery.** One message per tick, never one per event, and never the same event twice.
+Everything after `record.lastDeliveredSeq` goes out as a single fenced `DATA, NOT
+INSTRUCTIONS` list of pointers — kind, card, severity, title, permalink, separated by
+` · `, no bodies — ending "Handle these per your recipe.", through the same helpers a
+scheduled check delivery uses (`resolveSessionTarget` +
+`withInjectionLock(sendToResolvedTarget(…, {compactIfCold: true, retainReceipt: true,
+deliveryKey}))`), so target resolution, the compaction-if-cold policy, the injection
+mutex and the delivery receipt all apply.
+
+The batch is bounded by the size of its own encoded body (`DELIVERY_BODY_MAX`, 6000
+characters), not by a count: events are added in seq order until the next one would not
+fit and the rest wait for the next tick. A batch is never clipped, because a clipped
+batch would acknowledge an event the session was shown half of.
+
+The batch is **persisted before a character is typed** — `record.pendingDelivery = {key,
+firstSeq, lastSeq, at}` — and a tick that finds one retries *that* batch, rebuilt from
+the feed by its seq range, rather than recomputing one. That is what makes the receipt
+worth consulting: `deliveryKey` is `agent:<name>:seq:<firstSeq>-<lastSeq>`, so the retry
+asks about the same receipt the previous send wrote. A receipt that says `received`
+advances the cursor and types nothing. An unconfirmed one does **not** stop the tick: the
+send is attempted again with byte-identical text, because `delivery.deliver` inside
+`sendToResolvedTarget` finds its own journal entry and submits the draft still in the box
+rather than retyping — returning early there is what wedged the reviewer for 133
+consecutive ticks in September, and stable text is the whole reason the batch is
+persisted.
+
+The cursor advances, and `pendingDelivery` clears, only on a confirmed send. A mid-turn
+session (`endedTurn !== true`), a session showing a question, plan or permission prompt,
+a send that throws, and a send that reports only part of the message accepted all leave
+both alone and offer the same batch next tick. A cursor write that fails after a
+confirmed send is reported and left to that same mechanism: the next tick asks about the
+key, the receipt says received, and the cursor moves then without a second message. A
+session launched this tick is delivered nothing — it has the bootstrap to read. No
+delivery ever opens a second session.
+
+**Restart from the log.** When **none of the agent's areas** has an open incident, the
+session is live and idle (not mid-turn, not waiting on Owner) with nothing undelivered
+and nothing pending, and `restartAfterIdleMin` has passed, the session is closed and
+`record.session` dropped; the next tick opens a fresh one from the bootstrap. Nothing is
+lost, which is the point: the incident cards, `notes.md` and the event feed are the
+memory, and a fresh session reads all three.
+
+Every area routing to the same agent counts, because an agent whose second area is on
+fire is not idle however quiet its first is. Two areas that both set `session: true` and
+name one agent would fight over one record — two launches, two cursors, two restart
+clocks — so that is a config error: it is reported once on stderr and **both** areas are
+skipped rather than half-served.
+
+Idle is measured from real activity, not from `startedAt`: the latest of the session's
+start, the last confirmed delivery, the transcript's `mtime`, and the pane's own last
+input/output. A session that has been investigating for nine hours without a delivery is
+not idle. The close is `closeIdleSession` and nothing behind it — graceful only, never a
+signal, because nobody asked for this close — and it is handed `{automatic: true, idleMs:
+restartAfterIdleMin * 60e3}` rather than zero, so its own elapsed-activity checks do
+their work instead of being waived. A refusal (an unsent draft, a modal, a pending
+question, a viewer who attached, recent pane input or output) is final for that tick and
+the session keeps running.
+
+**Daemon hygiene.** A tick that changed nothing writes nothing: no `lastTick`, no lease,
+no commit, and not even a read of the feed — the record's `nextSeq` says whether there is
+anything after the cursor, so the quiet case (a live session, an empty feed, nothing due,
+which is most polls) touches the disk not at all. `flushCommits` is asked for exactly
+once per tick that did change something.
 
 ### Configuration
 
@@ -1265,7 +1344,9 @@ stay up.
 `session` defaults to `false` — watching works without a standing session and turning one
 on spends a model account, so it is Owner's switch to flip, per area, and only after the
 parser has run clean. `account` defaults to `claude-secondary`, `restartAfterIdleMin` to
-120, and `agent` to the area's own name.
+120, and `agent` to the area's own name. Several areas may share one `agent` so their
+events land in one feed, but only one of them may set `session: true`: two that do are a
+config error and neither runs (see **Restart from the log**).
 
 ### The recipe
 
@@ -1280,12 +1361,15 @@ that recipe.
 
 `keep incidents session <area> [--dry] [--json]` runs one tick for one area by hand and
 prints what it launched, delivered and restarted. `--dry` performs nothing at all — no
-worktree, no record, no recipe, no session opened and nothing typed — and reports what it
-would have done, which is how the switch gets checked before it is flipped; it is also
-the only form that runs for an area whose `session` is `false`, since actually opening a
-session for a disabled area would be flipping that switch from the command line. A real
-tick needs the daemon's own seams, so it loads them from `serve.js`; `--dry` stays a
-cheap read.
+lease, no worktree, no record, no recipe, no session opened, nothing typed and no cursor
+moved — and reports what it *would* have done, which is how the switch gets checked
+before it is flipped; it is also the only form that runs for an area whose `session` is
+`false`, since actually opening a session for a disabled area would be flipping that
+switch from the command line. Both forms get the same seams out of `serve.js` (loaded on
+first use, so an area that is off costs nothing): a dry run that could not ask the
+terminal host what is running would have nothing true to say, and performing nothing is
+`bin/area-session.js`'s own guarantee — every write, send and close is gated on it —
+rather than something withholding a dependency buys.
 
 ## Steps
 

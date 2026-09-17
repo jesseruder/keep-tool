@@ -132,15 +132,18 @@ the console shows a session's final turn in Waiting on you and his reply arrives
 this session. One `--needs-you` per thing you need. Event text is a pointer: one line, a
 card id, no transcripts and no log excerpts.
 
-You can always read what Keep has sent you:
+You can always look at what is going on:
 
 ```
-keep incidents                            # the open incidents, with cards and fire counts
-keep agents events sandboxes --unseen      # the events you have not been handed yet
+keep incidents                         # the open incidents, with cards and fire counts
+keep agents events sandboxes --unseen   # your feed, as Owner's console sees it
 ```
 
-Keep also delivers new events into this session as one batch per poll, so you do not
-need to poll for them yourself.
+Keep delivers each new batch of events into this session by itself, as one message per
+poll, so you never need to poll for them. Those delivered batches are what you are
+answerable for. `--unseen` is Owner's badge state rather than your inbox: reading it
+acknowledges nothing and skips nothing, so look whenever it helps, but do not treat
+something as handled because it no longer shows there.
 
 ## Overlap
 
