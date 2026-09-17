@@ -1,0 +1,191 @@
+'use strict';
+
+// The two daemon timers that can be exercised on their own: the registry pull and
+// the event-loop lag probe. Both are built by factories precisely so a test can
+// drive them with its own git children, lock and clock instead of standing up
+// startSchedulers and the whole daemon around it.
+
+const assert = require('node:assert/strict');
+const test = require('node:test');
+
+const { createRegistryPull, startLoopLagProbe } = require('./serve/schedulers.js');
+
+const ROOT = '/registry/root';
+
+// Which git this is, for both the answers table and the order log. The abort is
+// told apart from the rebase it follows because only the order of the two says
+// the registry was left clean.
+const gitName = (args) => (args[2] === 'rebase' && args[3] === '--abort' ? 'abort' : args[2]);
+
+// A pull whose git children are the `answers` table: per subcommand, what it
+// prints, how long it takes on the fake clock, whether it fails and whether it
+// was killed for running too long. `hold` defers one child's answer until the
+// test releases it, which is how an overlapping tick is observed.
+function harness(answers = {}) {
+  const order = [];
+  const rows = [];
+  const calls = { async: [], sync: [] };
+  const held = [];
+  let clock = 1000;
+
+  const answerFor = (args) => {
+    const answer = answers[gitName(args)] || {};
+    clock += answer.elapsed || 0;
+    return answer;
+  };
+
+  const keep = {
+    ROOT,
+    withLock(fn) {
+      order.push('lock');
+      try { return fn(); } finally { order.push('unlock'); }
+    },
+  };
+
+  const pull = createRegistryPull({
+    keep,
+    health: { record: (name, entry) => rows.push([name, entry]) },
+    now: () => clock,
+    execFile: (file, args, options, cb) => {
+      calls.async.push({ file, args, options });
+      order.push(gitName(args));
+      const answer = answerFor(args);
+      const answered = () => (answer.error
+        ? cb(Object.assign(new Error(answer.error), { killed: Boolean(answer.killed) }), '', answer.stderr || '')
+        : cb(null, answer.stdout ?? '', ''));
+      // One-shot, so a released pull's next tick runs straight through.
+      if (answer.hold) { answer.hold = false; held.push(answered); return; }
+      setImmediate(answered);
+    },
+    execFileSync: (file, args, options) => {
+      calls.sync.push({ file, args, options });
+      order.push(gitName(args));
+      const answer = answerFor(args);
+      if (answer.error) {
+        throw Object.assign(new Error(answer.error), { stderr: answer.stderr || '', killed: Boolean(answer.killed) });
+      }
+      return answer.stdout ?? '';
+    },
+  });
+
+  return { pull, order, rows, calls, release: () => held.shift()() };
+}
+
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+test('a registry already up to date fetches, counts, and never takes the lock', async () => {
+  const h = harness({ fetch: { elapsed: 120 }, 'rev-list': { stdout: '0\n', elapsed: 5 } });
+  await h.pull();
+  assert.deepEqual(h.calls.async.map((call) => call.args), [
+    ['-C', ROOT, 'fetch', '-q'],
+    ['-C', ROOT, 'rev-list', '--count', 'HEAD..@{u}'],
+  ]);
+  assert.equal(h.calls.async[0].file, 'git');
+  assert.equal(h.calls.async[0].options.timeout, 30e3);
+  assert.equal(h.calls.async[0].options.maxBuffer, 64 * 1024);
+  assert.deepEqual(h.calls.sync, [], 'nothing local ran');
+  assert.deepEqual(h.order, ['fetch', 'rev-list'], 'the lock was never taken');
+  assert.deepEqual(h.rows, [['git-pull', { ok: true, detail: 'up to date, 125ms' }]]);
+});
+
+test('a registry behind the remote rebases under the ordinary synchronous lock', async () => {
+  const h = harness({ fetch: { elapsed: 200 }, 'rev-list': { stdout: '3\n' }, rebase: { elapsed: 40 } });
+  await h.pull();
+  assert.deepEqual(h.order, ['fetch', 'rev-list', 'lock', 'rebase', 'unlock'],
+    'the lock is taken after the network is done with, and only around the local rebase');
+  assert.deepEqual(h.calls.sync.map((call) => call.args), [['-C', ROOT, 'rebase', '-q', '--autostash', '@{u}']]);
+  assert.deepEqual(h.calls.sync[0].options.stdio, ['ignore', 'ignore', 'pipe']);
+  assert.equal(h.calls.sync[0].options.timeout, 30e3);
+  assert.deepEqual(h.rows, [['git-pull', { ok: true, detail: '3 behind, rebased in 240ms' }]]);
+});
+
+test('a rebase that conflicts is aborted inside the same lock and reported with git’s own reason', async () => {
+  const h = harness({
+    fetch: {},
+    'rev-list': { stdout: '2\n' },
+    rebase: { error: 'Command failed: git rebase', stderr: 'error: could not apply 1234567\n' },
+  });
+  await h.pull();
+  assert.deepEqual(h.order, ['fetch', 'rev-list', 'lock', 'rebase', 'abort', 'unlock'],
+    'the registry is never left mid-rebase, and never outside the lock while it is');
+  assert.deepEqual(h.calls.sync[1].args, ['-C', ROOT, 'rebase', '--abort']);
+  assert.equal(h.rows[0][1].ok, false);
+  assert.equal(h.rows[0][1].error.message, 'error: could not apply 1234567');
+});
+
+test('an abort that fails too is still the rebase’s failure, not the abort’s', async () => {
+  const h = harness({
+    fetch: {},
+    'rev-list': { stdout: '1\n' },
+    rebase: { error: 'Command failed: git rebase', stderr: 'error: could not apply 1234567\n' },
+    abort: { error: 'Command failed: git rebase --abort', stderr: 'fatal: No rebase in progress?\n' },
+  });
+  await h.pull();
+  assert.deepEqual(h.order, ['fetch', 'rev-list', 'lock', 'rebase', 'abort', 'unlock']);
+  assert.equal(h.rows[0][1].error.message, 'error: could not apply 1234567');
+});
+
+test('a fetch that fails is the whole tick: nothing is counted, nothing is locked', async () => {
+  const h = harness({ fetch: { error: 'Command failed: git fetch', stderr: 'fatal: could not read from remote repository\n' } });
+  await h.pull();
+  assert.deepEqual(h.order, ['fetch']);
+  assert.deepEqual(h.calls.sync, []);
+  assert.equal(h.rows[0][1].ok, false);
+  assert.equal(h.rows[0][1].error.message, 'fatal: could not read from remote repository');
+});
+
+test('a fetch killed for taking too long says so, so a hung network is not read as a refusal', async () => {
+  const h = harness({ fetch: { error: 'Command failed: git fetch', killed: true } });
+  await h.pull();
+  assert.equal(h.rows[0][1].ok, false);
+  assert.equal(h.rows[0][1].error.message, 'Command failed: git fetch (killed after 30s)');
+});
+
+test('a pull still running is never joined by a second one', async () => {
+  const h = harness({ fetch: { hold: true }, 'rev-list': { stdout: '0\n' } });
+  const first = h.pull();
+  await settle();
+  await h.pull();
+  assert.deepEqual(h.order, ['fetch'], 'the overlapping call fetched nothing');
+  assert.deepEqual(h.rows, [], 'and recorded nothing: the first pull owns the row');
+
+  h.release();
+  await first;
+  assert.deepEqual(h.order, ['fetch', 'rev-list']);
+  assert.equal(h.rows.length, 1);
+
+  // Once it has finished, the next tick pulls again as usual.
+  await h.pull();
+  assert.equal(h.rows.length, 2);
+});
+
+test('the lag probe names a tick that arrived late and stays quiet for one on time', () => {
+  const lines = [];
+  let clock = 0;
+  let tick = null;
+  let asked = null;
+  let unrefs = 0;
+  startLoopLagProbe({
+    write: (line) => lines.push(line),
+    setInterval: (fn, ms) => { tick = fn; asked = ms; return { unref() { unrefs += 1; } }; },
+    now: () => clock,
+  });
+  assert.equal(asked, 1000);
+  assert.equal(unrefs, 1, 'the probe never keeps the daemon alive by itself');
+
+  clock = 1000;
+  tick();
+  assert.deepEqual(lines, [], 'a tick on time says nothing');
+
+  clock = 2400;
+  tick();
+  assert.deepEqual(lines, [], '400ms of lateness is under the threshold');
+
+  clock = 4600;
+  tick();
+  assert.deepEqual(lines, ['keep serve: event loop stalled 1200ms\n']);
+
+  clock = 5600;
+  tick();
+  assert.equal(lines.length, 1, 'the next tick is on time again: one stall is reported once');
+});

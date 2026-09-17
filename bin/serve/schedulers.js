@@ -33,6 +33,108 @@ function startFeatureSchedulers(features, modules, options, health) {
   return started;
 }
 
+const PULL_TIMEOUT_MS = 30e3;
+
+// git's own reason for refusing, which the old `stdio: 'ignore'` threw away and
+// health showed as a bare exit status. A child killed for running past the timeout
+// says so: "Command failed" reads the same whether git refused in a millisecond or
+// the network hung for thirty seconds, and those want different answers.
+function gitFailure(error, stderr) {
+  const reason = String(stderr || '').trim() || error.message;
+  return new Error(error.killed ? `${reason} (killed after ${PULL_TIMEOUT_MS / 1000}s)` : reason);
+}
+
+// Pulls cloud-made commits (the overnight check routine's, say) into the local
+// registry, in two halves that are deliberately not one `git pull`.
+//
+// The fetch is the slow, network-bound half, and it runs unlocked in a child: it
+// touches nothing but .git/refs, and holding the registry lock across it was the
+// whole problem. Nothing else here may hold that lock asynchronously — every other
+// keep.withLock caller in this process waits for it by blocking the event loop in
+// a `sleep 0.1` loop, so an async holder could never be woken to release it, and
+// the collision would be a guaranteed five seconds followed by the lock error.
+//
+// The rebase is the only part that touches the working tree, and with the objects
+// already local it is a fast-forward or a few commits — tens of milliseconds. It
+// runs synchronously under the ordinary lock, exactly like every other registry
+// mutation the daemon makes. When the remote has not moved, the counting stops the
+// tick and the lock is never taken at all.
+//
+// Built by a factory so a test can drive it without standing up startSchedulers.
+function createRegistryPull({
+  keep, health,
+  execFile = require('child_process').execFile,
+  execFileSync = require('child_process').execFileSync,
+  now = Date.now,
+} = {}) {
+  const run = (...args) => new Promise((resolve, reject) => {
+    execFile('git', ['-C', keep.ROOT, ...args], { timeout: PULL_TIMEOUT_MS, maxBuffer: 64 * 1024 },
+      (error, stdout, stderr) => {
+        if (error) reject(gitFailure(error, stderr));
+        else resolve(String(stdout || ''));
+      });
+  });
+  let running = false;
+  return async function pull() {
+    // A pull slow enough to still be running at the next tick must not be joined by
+    // a second one; the same guard collectCardUsage uses.
+    if (running) return;
+    running = true;
+    const startedAt = now();
+    try {
+      await run('fetch', '-q');
+      const behind = Number(String(await run('rev-list', '--count', 'HEAD..@{u}')).trim()) || 0;
+      if (!behind) {
+        health.record('git-pull', { ok: true, detail: `up to date, ${now() - startedAt}ms` });
+        return;
+      }
+      keep.withLock(() => {
+        try {
+          execFileSync('git', ['-C', keep.ROOT, 'rebase', '-q', '--autostash', '@{u}'], {
+            timeout: PULL_TIMEOUT_MS, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8',
+          });
+        } catch (error) {
+          // A conflict must not leave the registry mid-rebase for the next keep
+          // command to walk into. The abort happens inside the same lock, and its
+          // own failure says nothing the rebase's stderr does not already say.
+          try {
+            execFileSync('git', ['-C', keep.ROOT, 'rebase', '--abort'], {
+              timeout: PULL_TIMEOUT_MS, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf8',
+            });
+          } catch {}
+          throw gitFailure(error, error.stderr);
+        }
+      });
+      health.record('git-pull', { ok: true, detail: `${behind} behind, rebased in ${now() - startedAt}ms` });
+    } catch (error) {
+      // offline, a rebase that needs hands, or lock contention — the next tick catches up
+      health.record('git-pull', { ok: false, error });
+    } finally {
+      running = false;
+    }
+  };
+}
+
+// The stall detector. A timer that asks to run every second and arrives much
+// later than that arrived late because something held the event loop for the
+// difference, so the lateness is the measurement. launchd appends the daemon's
+// stderr to ~/keep/.keep/serve.log, which makes this the one record of a stall
+// that outlives the process it happened in.
+function startLoopLagProbe({ thresholdMs = 500, intervalMs = 1000, write = (line) => process.stderr.write(line),
+  setInterval: si = setInterval, now = Date.now } = {}) {
+  let expectedAt = now() + intervalMs;
+  const timer = si(() => {
+    const at = now();
+    const lag = at - expectedAt;
+    if (lag > thresholdMs) write(`keep serve: event loop stalled ${Math.round(lag)}ms\n`);
+    // Measured against when this tick actually landed, so one stall is reported
+    // once rather than as a lasting offset on every tick after it.
+    expectedAt = at + intervalMs;
+  }, intervalMs);
+  timer?.unref?.();
+  return timer;
+}
+
 function startSchedulers(ctx) {
   const {
     TURN_INDEX_BUDGET_BYTES, TURN_INDEX_BUDGET_MS, TURN_INDEX_PRUNE_LIMIT,
@@ -470,9 +572,12 @@ function startSchedulers(ctx) {
   // percentage of a WEEKLY window - 30s freshness bought nothing and cost a full
   // directory walk each time. Five minutes is still 288 folds a day.
   const foldFleetUsage = () => {
+    const startedAt = Date.now();
     try {
       review.foldFleetUsage(24 * 1024 * 1024);
-      health.record('fleet-usage', { ok: true });
+      // Timed because every pass is synchronous work on this loop: the health row
+      // is where a fold that has grown expensive shows up.
+      health.record('fleet-usage', { ok: true, detail: `${Date.now() - startedAt}ms` });
     } catch (error) {
       health.record('fleet-usage', { ok: false, error });
     }
@@ -497,18 +602,8 @@ function startSchedulers(ctx) {
   setInterval(foldFleetUsage, 5 * 60e3).unref();
   setTimeout(foldFleetUsage, 20e3).unref();
 
-  // pull cloud-made commits (e.g. the overnight check routine) into the local repo
-  const { execFileSync } = require('child_process');
-  const pull = () => {
-    try {
-      keep.withLock(() => {
-        execFileSync('git', ['-C', keep.ROOT, 'pull', '-q', '--rebase', '--autostash'], { timeout: 30e3, stdio: 'ignore' });
-      });
-      health.record('git-pull', { ok: true });
-    } catch (error) {
-      health.record('git-pull', { ok: false, error });
-    } // offline or lock contention — next tick will catch up
-  };
+  startLoopLagProbe();
+  const pull = createRegistryPull({ keep, health });
   if (process.env.KEEP_SYNC === '1') {
     health.record('git-pull', { skipped: true });
     setInterval(pull, 30 * 60e3).unref();
@@ -521,4 +616,4 @@ function startSchedulers(ctx) {
   return { restarts };
 }
 
-module.exports = { startFeatureSchedulers, startSchedulers };
+module.exports = { startFeatureSchedulers, startSchedulers, createRegistryPull, startLoopLagProbe };
