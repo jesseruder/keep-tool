@@ -1,0 +1,9 @@
+  Exiting worktree session
+  You have 4 uncommitted files. These will be lost if you remove the
+  worktree.
+
+  ❯ 1. Keep worktree    Stays at
+    /Users/jesseruder/wt/ghost-server/aws-cost-breakdown
+    2. Remove worktree  All changes and commits will be lost.
+
+  Enter to confirm · Esc to cancel

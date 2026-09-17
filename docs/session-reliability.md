@@ -32,6 +32,36 @@ instance; titles, queue membership, card progress and focus do not.
 - Old connections and disposed instances cannot deliver output or lifecycle
   events to a replacement terminal. Deferred focus loses to newer user input.
 
+### Claude Code dialogs
+
+Claude Code parks a pane on a modal dialog — the worktree exit prompt, the folder
+trust prompt, the model switch confirmation — and until it is answered there is no
+prompt to type into and no exit to wait for. `bin/claude-prompts.js` recognizes all
+of them from one shape instead of one detector per dialog: `recognize(screenText)`
+returns the dialog's kind, heading, numbered options, which option is highlighted,
+and whether it is *live*. A dialog is a block — the heading above the options, the
+footer (`Enter to confirm`) below them, exactly one highlighted row between — found
+within a bounded window around that highlighted row, and the lowest such block on
+the screen wins. It is live only when nothing but blank rows sits under its footer;
+a copy retained in scrollback sits above whatever is open now, and a keystroke aimed
+at it would land in a live prompt instead. A well-formed dialog Keep has never seen
+is recognized as `unknown` rather than missed.
+
+`policyFor(kind)` says what Keep may do about it. Only the worktree exit prompt is
+ever answered, and only its "Keep worktree" option, by the restart's graceful-exit
+wait. Every other dialog is refused by name: the restart fails with `Claude Code is
+showing the <dialog> dialog; answer it in the pane before restarting` (an unknown one
+carries its heading), and an opening-message wait fails with a 409 naming the dialog
+and the pane instead of spending 45 seconds on its way to "never showed an empty
+prompt", which remains the message for a genuine timeout. Keep sends no key to any
+dialog but that one answer.
+
+The dialogs live in `bin/fixtures/claude-prompts/`: each `<name>.txt` is a screen as
+the host reads it, and `<name>.json` is the reading `recognize()` must produce (`null`
+for a screen that holds no dialog). `bin/claude-prompts.test.js` checks every pair, so
+a new Claude Code dialog is a fixture pair plus, if Keep needs to name it, one entry
+in the module's kind table.
+
 ## Release verification
 
 Run `npm run test:reliability` and `npm run test:reliability:browser` before

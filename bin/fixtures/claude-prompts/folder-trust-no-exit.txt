@@ -1,0 +1,10 @@
+  Accessing workspace: /Users/jesseruder/wt/ghost-server/aws-cost-breakdown
+
+  Quick safety check: Is this a project you created or one you trust?
+
+  Claude Code may read and run files in this folder.
+
+    1. Yes, I trust this folder
+  ❯ 2. No, exit
+
+  Enter to confirm · Esc to exit

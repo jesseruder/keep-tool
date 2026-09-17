@@ -8137,7 +8137,7 @@ test('a graceful exit answers the worktree exit prompt once and only for Keep wo
   ].join('\n');
   // `deadAfter` is how many turns of the wait the pane survives the typed /exit: the modal
   // holds it open until the Enter lands, and Infinity is the prompt nobody ever answers.
-  const scenario = ({ highlighted, deadAfter, kind = 'claude', vanishOnModal = false }) => {
+  const scenario = ({ highlighted, deadAfter, kind = 'claude', vanishOnModal = false, screen = null }) => {
     const command = kind === 'codex' ? '/test/codex resume wt' : '/test/claude --resume wt';
     const session = { id: 'wt', kind, state: 'idle', endedTurn: true, project: root };
     let pane = { id: 'p', pid: 10, cmd: '/bin/zsh', args: ['-l'], alive: true, attached: 0, visibleAttached: 0,
@@ -8159,7 +8159,7 @@ test('a graceful exit answers the worktree exit prompt once and only for Keep wo
         // The agent can exit between the snapshot and the answer — Owner answering the
         // modal himself looks exactly like this.
         if (vanishOnModal) state.exited = true;
-        return { text: modal(highlighted), cursor: { x: 0, y: 3 } };
+        return { text: screen || modal(highlighted), cursor: { x: 0, y: 3 } };
       },
       waitForHostAgent: async () => {},
       host: { request: async (type, params) => {
@@ -8212,7 +8212,68 @@ test('a graceful exit answers the worktree exit prompt once and only for Keep wo
     await assert.rejects(codex.run(), /Graceful exit did not finish/);
     assert.deepEqual(codex.state.sent, []);
     assert.equal(codex.state.waits, 30);
+
+    // Another modal has the pane, and it is not one Keep may answer: the /exit is parked
+    // behind a question only Owner can settle, so the restart fails now, by name, rather
+    // than waiting out the loop and reporting that the exit did not finish.
+    const trust = scenario({ highlighted: 1, deadAfter: Infinity, screen: [
+      '  Quick safety check: Is this a project you created or one you trust?',
+      '',
+      '    1. Yes, I trust this folder',
+      '  ❯ 2. No, exit',
+      '',
+      '  Enter to confirm · Esc to exit',
+    ].join('\n') });
+    await assert.rejects(trust.run(), /Claude Code is showing the folder trust dialog; answer it in the pane before restarting/);
+    assert.deepEqual(trust.state.sent, [], 'no key is ever sent to a dialog Keep does not own');
+    assert.equal(trust.state.waits, 0, 'the refusal is immediate');
+
+    // A dialog nobody has taught Keep about is still refused, and carries its heading.
+    const unknown = scenario({ highlighted: 1, deadAfter: Infinity, screen: [
+      '  Rewind to a previous checkpoint?',
+      '',
+      '  ❯ 1. Conversation and code',
+      '    2. Conversation only',
+      '',
+      '  Enter to confirm · Esc to cancel',
+    ].join('\n') });
+    await assert.rejects(unknown.run(), /showing the unrecognized "Rewind to a previous checkpoint\?" dialog/);
+    assert.deepEqual(unknown.state.sent, []);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a live Claude Code dialog ends the opening wait by name instead of timing out', async () => {
+  const dialog = (rows) => ({ host: { request: async (type) => { assert.equal(type, 'screen'); return { text: rows.join('\n') }; } } });
+  const clock = (host) => { let now = 0; return { ...host, now: () => now, sleep: async (ms) => { now += ms; } }; };
+  const trust = [
+    '  Do you trust the files in this folder?',
+    '',
+    '  /Users/jesseruder/wt/ghost-server/aws-cost-breakdown',
+    '',
+    '  ❯ 1. Yes, proceed',
+    '    2. No, exit',
+    '',
+    '  Enter to confirm · Esc to exit',
+  ];
+  await assert.rejects(waitForHostAgent({ pane: 'pane-dialog' }, 'claude', clock(dialog(trust))),
+    (error) => error.status === 409
+      && error.message === 'Claude Code is showing the folder trust dialog in pane-dialog; message not sent');
+  await assert.rejects(waitForHostAgent({ pane: 'pane-dialog' }, 'claude', clock(dialog([
+    '  Rewind to a previous checkpoint?',
+    '',
+    '  ❯ 1. Conversation and code',
+    '    2. Conversation only',
+    '',
+    '  Enter to confirm · Esc to cancel',
+  ]))), (error) => error.status === 409
+    && /showing the unrecognized "Rewind to a previous checkpoint\?" dialog in pane-dialog/.test(error.message));
+  // A retained copy of a dialog above a live prompt is not a reason to refuse: the wait
+  // goes on, and the ordinary timeout still says what it always said.
+  await assert.rejects(waitForHostAgent({ pane: 'pane-dialog' }, 'claude', clock(dialog([...trust, '', '❯ ']))),
+    (error) => error.status === 504 && /never showed an empty prompt/.test(error.message));
+  // Claude Code's dialogs are not read off a Codex pane.
+  await assert.rejects(waitForHostAgent({ pane: 'pane-dialog' }, 'codex', clock(dialog(trust))),
+    (error) => error.status === 504);
 });
 
 test('every refusal after the first character says so', async () => {

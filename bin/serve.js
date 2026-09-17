@@ -47,6 +47,9 @@ const { sendStateJson } = require('./state-response.js');
 const { MOBILE_VIEWS, projectMobileState } = require('./mobile-state.js');
 const { createScreenHistoryCache } = require('./screen-history.js');
 const { createSettledSessionCache } = require('./settled-session-cache.js');
+const claudePrompts = require('./claude-prompts.js');
+// One copy, shared with the recognizer that reads the same screen rows.
+const { normalizedText } = claudePrompts;
 
 const PORT = parseInt(process.env.KEEP_PORT || '7777', 10);
 const { PROJECTS_DIR, TAIL_BYTES, textOf, readTranscriptTail, findSessionFile } = transcripts;
@@ -1028,10 +1031,6 @@ function claimInjectionTarget(target) {
   const holder = activeInjectionHolder();
   if (holder && isHostTarget(target)) takeInjectionKeys(holder, [`pane:${target.pane}`]);
   return target;
-}
-
-function normalizedText(value) {
-  return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
 // Comparison only, and never applied to text on its way to a terminal: a message
@@ -2589,67 +2588,26 @@ function modelSwitchConfirmed(screen, command) {
   });
 }
 
-// A session that entered a git worktree with Claude Code's EnterWorktree tool does not
-// leave on a typed /exit: the exit is intercepted by a modal asking whether to keep or
-// remove the worktree, and the pane parks there until someone answers. Restart's wait
-// answers it, but only for the option that destroys nothing — so the whole modal has to
-// be there, as one block: the "Exiting worktree session" heading just above, the
-// highlighted "1. Keep worktree", an unhighlighted "2. Remove worktree" as the very next
-// option, and the "Enter to confirm" footer under it.
-//
-// Matching a block rather than the viewport is what keeps the retained transcript out of
-// this. Scrollback above the modal routinely holds old option lists and old copies of
-// this same question, and a viewport-wide reading would both miss a real modal sitting
-// under them and accept a heading and footer that belong to different screens — which,
-// with no modal actually open, types a bare Enter into a live prompt.
+// A session that entered a worktree with Claude Code's EnterWorktree tool does not leave
+// on a typed /exit: the exit is intercepted by a modal asking whether to keep or remove
+// the worktree, and the pane parks there until someone answers. Restart's wait answers
+// it, but only for the option that destroys nothing, and only while the modal is the live
+// UI — see bin/claude-prompts.js for what "live" costs and why a block is matched rather
+// than the viewport.
 function worktreeExitPromptKeepsWorktree(screenText) {
-  const lines = String(screenText || '').split(/\r?\n/).map(normalizedText);
-  const ABOVE = 12, BELOW = 20;
-  // The footer row of a well-formed modal block around this candidate, or -1.
-  const blockFooter = (index) => {
-    const top = Math.max(0, index - ABOVE);
-    const bottom = Math.min(lines.length - 1, index + BELOW);
-    // The block starts at its own heading. Rows above that are scrollback — a dialog
-    // that has just been answered still sits there, and it is not part of this modal.
-    let heading = -1;
-    for (let i = index - 1; i >= top && heading === -1; i -= 1) {
-      if (/Exiting worktree session/i.test(lines[i])) heading = i;
-    }
-    if (heading === -1) return -1;
-    // Inside the block, though, another highlighted option means a different, larger menu.
-    for (let i = heading + 1; i < index; i += 1) if (/^❯\s*\d+\./.test(lines[i])) return -1;
-    // A narrow pane wraps option 1's "Stays at <path>" onto its own row, so the sibling
-    // option is the next row that starts an option — anything before it is that wrap.
-    let next = index + 1;
-    while (next <= bottom && !/^(?:❯\s*)?\d+\./.test(lines[next])) next += 1;
-    if (next > bottom || !/^2\.\s*Remove worktree\b/.test(lines[next])) return -1;
-    const offset = lines.slice(next + 1, bottom + 1).findIndex((line) => /Enter to confirm/i.test(line));
-    if (offset === -1) return -1;
-    const footer = next + 1 + offset;
-    for (let i = index + 1; i <= footer; i += 1) if (/^❯\s*\d+\./.test(lines[i])) return -1;
-    return footer;
-  };
-  const footer = lines.reduce((found, line, index) => {
-    if (!/^❯\s*1\.\s*Keep worktree\b/.test(line)) return found;
-    const end = blockFooter(index);
-    return end === -1 ? found : end;
-  }, -1);
-  if (footer === -1) return false;
-  // A live modal owns the bottom of the screen: nothing but blank rows sits under its
-  // footer. A retained copy sits above whatever is open now instead, and that can be
-  // anything — a Claude input box, a Codex `›` prompt, a zsh prompt with a half-typed
-  // command, a status line — none of which wants an Enter. Enumerating what may not
-  // appear there would miss one, so nothing may. A live modal that some rendering puts
-  // text under simply goes unanswered, which is the timeout this already had.
-  // Taking the lowest qualifying block first keeps an old copy above from hiding it.
-  return lines.slice(footer + 1).every((line) => !line);
+  const dialog = claudePrompts.recognize(screenText);
+  return Boolean(dialog && dialog.kind === 'worktree-exit' && dialog.live && dialog.highlighted === 1);
 }
 
+// Not a liveness reading: this scans the rows below the last echo of the command that
+// opened the dialog, where the heading can be above the slice and the footer not yet
+// drawn. waitForModelSwitch is watching for a dialog it asked for and is about to answer,
+// which is the one case the looser reading is for.
 function modelSwitchDialogVisible(screen, command) {
   const lines = command === undefined
     ? String(screen || '').split(/\r?\n/).map(normalizedText)
     : linesAfterLastEcho(screen, command);
-  return lines.some((line) => /Switch model\?|Yes, switch to/i.test(line));
+  return claudePrompts.showsDialog('model-switch', lines.join('\n'));
 }
 
 function compactModelBase(value) {
@@ -3998,8 +3956,17 @@ async function restartSession(body, deps = {}) {
             return null;
           }
         };
-        const showsPrompt = async () => worktreeExitPromptKeepsWorktree(String((await read())?.text || ''));
-        if (await showsPrompt()) {
+        const dialogOf = async () => claudePrompts.recognize(String((await read())?.text || ''));
+        const keepsWorktree = (dialog) => Boolean(dialog && dialog.kind === 'worktree-exit'
+          && dialog.live && dialog.highlighted === 1);
+        const dialog = await dialogOf();
+        // Any other modal owning the pane is a question only Owner may answer, and the
+        // /exit is parked behind it: waiting out the loop would end in a timeout that
+        // names nothing. Fail now, and name the dialog.
+        if (dialog && dialog.live && claudePrompts.policyFor(dialog.kind).action === 'refuse') {
+          throw Error(`Claude Code is showing the ${claudePrompts.refusalLabel(dialog)} dialog; answer it in the pane before restarting`);
+        }
+        if (keepsWorktree(dialog)) {
           // The snapshot is already stale by the time it is read. Between it and the
           // write the agent can exit — its own exit finishing, or Owner answering the
           // modal himself — and the pane's root pid does not change when it falls back
@@ -4009,7 +3976,7 @@ async function restartSession(body, deps = {}) {
           // waiting either way, and the next poll reads the pane as dead or a shell.
           const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
           const owner = rows.find((p) => p.pid === originalIdentity.pid && p.pidStart === originalIdentity.pidStart);
-          if (owner && await showsPrompt()) {
+          if (owner && keepsWorktree(await dialogOf())) {
             await writeTarget({ pane: body.pane }, '\r', deps);
             promptAnswered = true;
             limit = 75;
@@ -5213,6 +5180,18 @@ async function waitForHostAgent(target, agent, deps = {}) {
         });
         error.code = 'KEEP_PORTABLE_TRANSFER_AWAITING_SETUP';
         throw error;
+      }
+    }
+    // A modal is why the prompt is not there, and no wait resolves one: only Owner can
+    // answer it (Keep types into a dialog nowhere but the worktree-exit prompt, and only
+    // during a restart). Say which dialog, now, instead of timing out in 45s with a
+    // message about an empty prompt.
+    if (agent === 'claude') {
+      const dialog = claudePrompts.recognize(stripTerminalAnsi(screen));
+      if (dialog && dialog.live && claudePrompts.policyFor(dialog.kind).action === 'refuse') {
+        throw new InjectionError(409, `Claude Code is showing the ${claudePrompts.refusalLabel(dialog)} dialog in ${target.pane}; message not sent`, {
+          screenTail: screenTail(screen),
+        });
       }
     }
     await sleep(Math.min(500, Math.max(0, deadline - now())));

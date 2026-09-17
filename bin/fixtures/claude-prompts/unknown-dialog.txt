@@ -1,0 +1,8 @@
+  Rewind to a previous checkpoint?
+  This restores the conversation and the files it changed.
+
+  ❯ 1. Conversation and code
+    2. Conversation only
+    3. Code only
+
+  Enter to confirm · Esc to cancel
