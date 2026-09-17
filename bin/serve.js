@@ -4969,7 +4969,11 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
         // draftMatches() ran before that await, and every millisecond since is one in
         // which Owner can have typed into the box. Read it again, as typeAndSubmit does
         // before its own Enter, and leave a mixed draft alone rather than submit it.
-        const screen = await readScreenResult(target, 200, false, deps);
+        // The same short read typeAndSubmit takes before its own Enter. A taller one
+        // drags older output into the parse: an earlier Codex prompt glyph reads as the
+        // start of the box, and a long line far above skews the inferred wrap width,
+        // and either refuses a draft that has not changed.
+        const screen = await readScreenResult(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false, deps);
         // draftIsExactly, not exactDraft: the latter stops at the first blank line, so
         // a line Owner added below one would be invisible to it.
         if (!draftIsExactly(screen.text, text, session.kind)) {
