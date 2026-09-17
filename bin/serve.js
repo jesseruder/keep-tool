@@ -1216,14 +1216,18 @@ function hasGenuineAssistantUsage(text) {
 }
 
 // lastClaudeHandoffModel over the whole file, newest slice first, so only the most recent
-// genuine assistant model can win. Returns '' when the bounded scan finds no genuine
-// record at all — "nothing on record", not "unsafe".
+// genuine assistant model can win. Returns '' only after reading back to byte zero with
+// no genuine record in the whole file; a scan cut short by the bound or by a read error
+// returns the '<unknown>' sentinel, because unread bytes are not evidence of absence.
 function lastClaudeHandoffModelInFile(file, deps = {}) {
   const chunkBytes = Number(deps.scanChunkBytes) || TAIL_BYTES;
   const maxBytes = Number(deps.scanMaxBytes) || HANDOFF_MODEL_SCAN_BYTES;
-  const fd = fs.openSync(file, 'r');
+  let fd;
+  try { fd = fs.openSync(file, 'r'); } catch { return '<unknown>'; }
+  let reachedStart = false;
   try {
     let end = fs.fstatSync(fd).size;
+    reachedStart = end === 0;
     let scanned = 0;
     // The head of a record split across a chunk boundary, carried back to the slice that
     // holds the rest of it. Bytes, not text: a split multi-byte character must survive.
@@ -1231,7 +1235,7 @@ function lastClaudeHandoffModelInFile(file, deps = {}) {
     for (let chunks = 0; chunks < HANDOFF_MODEL_SCAN_CHUNKS && end > 0 && scanned < maxBytes; chunks += 1) {
       const start = Math.max(0, end - chunkBytes);
       const slice = Buffer.alloc((end - start) + carry.length);
-      fs.readSync(fd, slice, 0, end - start, start);
+      try { fs.readSync(fd, slice, 0, end - start, start); } catch { return '<unknown>'; }
       carry.copy(slice, end - start);
       scanned += end - start;
       let body = slice;
@@ -1245,32 +1249,39 @@ function lastClaudeHandoffModelInFile(file, deps = {}) {
       const model = lastClaudeHandoffModel(text);
       if (model && (model !== '<unknown>' || hasGenuineAssistantUsage(text))) return model;
       end = start;
+      if (end === 0) reachedStart = true;
     }
   } finally { fs.closeSync(fd); }
-  return '';
+  return reachedStart ? '' : '<unknown>';
 }
 
-// `claude --model` takes the plain id; settings.json and `keep open --model` record the
-// 1M-context variant as `claude-fable-5-1[1m]`.
+// A launch model is taken verbatim: `claude --model claude-fable-5-1[1m]` is a model this
+// repo launches on purpose, so the 1M-context suffix is part of the id, not noise.
 function launchModelId(value) {
-  const model = String(value || '').trim().replace(/\[1m\]$/i, '');
+  const model = String(value || '').trim();
   return model && keep.LAUNCH_MODEL_RE.test(model) ? model : '';
 }
 
 const HANDOFF_ARGV_MODEL_RE = /(?:^|\s)--model(?:=|\s+)["']?([A-Za-z0-9][A-Za-z0-9._:[\]/-]*)["']?(?=\s|$)/;
 
-// The model the account handoff has to relaunch with. '' means "nothing on record",
-// which the handoff accepts — it only refuses a value it could not pass to `claude
-// --model`. A genuine record with a malformed model still comes through verbatim, so
-// that case keeps failing closed; a synthetic-only transcript no longer does.
+// The model the account handoff has to relaunch with. '' means "the whole transcript is
+// on record and names no model", which the handoff accepts — it only refuses a value it
+// could not pass to `claude --model`. '<unknown>' means we could not finish looking, and
+// keeps failing closed, as does a genuine record whose model is malformed. Only a
+// synthetic-only transcript — the rate-limited session this exists for — resolves.
 function handoffCurrentModel(session, pane, processArgs, deps = {}) {
+  let model;
   try {
     const file = (deps.findSessionFile || findSessionFile)(session.id);
-    const model = file ? (deps.lastClaudeHandoffModelInFile || lastClaudeHandoffModelInFile)(file, deps) : '';
-    if (model) return model;
-  } catch {}
-  // Launch metadata, most specific first. It can be stale after an in-session /model,
-  // so it is only ever consulted when the transcript says nothing at all.
+    model = file ? (deps.lastClaudeHandoffModelInFile || lastClaudeHandoffModelInFile)(file, deps) : '';
+  } catch {
+    // An unreadable or ambiguous transcript is not permission to guess from launch
+    // metadata: the session may have switched model in-session since launch.
+    return '<unknown>';
+  }
+  if (model) return model;
+  // Launch metadata, most specific first, and only once the transcript has been read to
+  // the end without naming a model at all.
   return launchModelId(pane?.meta?.model)
     || launchModelId(HANDOFF_ARGV_MODEL_RE.exec(String(processArgs || ''))?.[1])
     || '';
@@ -1661,26 +1672,37 @@ function logDraftRefusal(target, message, beforeScreen, afterScreen, probe, deps
   write(`${out.join('\n')}\n`);
 }
 
-// Poll until the probe key is gone from the input box: the box empties, the suggestion
-// re-renders, or a real draft's own text comes back. Never throws — a probe that cannot
-// prove its own cleanup landed is not a reason to fail the send that succeeded; the next
-// caller's probe sees the stray comma and refuses safely on its own.
-async function waitForProbeUndo(target, lastScreen, read, wait, now, deps = {}) {
+// Poll until the input box is provably back to what the probe found: empty, or holding
+// the same text again (the suggestion re-rendered). Anything else fails closed — the
+// caller is about to type, and its confirmation only looks for its own text as a
+// substring, so a leftover `,` would be submitted as part of the command.
+async function waitForProbeUndo(target, beforeScreen, lastScreen, read, wait, now, deps = {}) {
   // Only the collapsed-suggestion shape is ambiguous to the next reader. Any other box
   // visibly loses its trailing probe key, and an empty box is already settled.
   if (promptText(promptLine(lastScreen)) !== SUGGESTION_PROBE_KEY) return;
+  const beforeText = normalizedText(promptText(promptLine(beforeScreen)));
   const startedAt = now();
+  let screen = lastScreen;
   for (let reads = 0; reads < SUGGESTION_PROBE_SETTLE_READS; reads += 1) {
     await wait(SUGGESTION_PROBE_WAIT_MS);
-    let screen;
-    // A pane that cannot be read tells us nothing about the Backspace, and whoever
-    // reads it next will fail on the same pane.
-    try { screen = await read(target, 30, false); } catch { return; }
-    if (promptText(promptLine(screen)) !== SUGGESTION_PROBE_KEY) return;
-    if (now() - startedAt >= SUGGESTION_PROBE_SETTLE_MS) break;
+    // A pane that cannot be read tells us nothing about the Backspace: the probe key is
+    // still the last thing we saw, so it is still the answer we have to give.
+    try { screen = await read(target, 30, false); } catch { break; }
+    const text = normalizedText(promptText(promptLine(screen)));
+    if (!text || text === beforeText) return;
+    if (text === SUGGESTION_PROBE_KEY) {
+      if (now() - startedAt >= SUGGESTION_PROBE_SETTLE_MS) break;
+      continue;
+    }
+    // Someone typed into the box while we were undoing our own keystroke. Whatever it
+    // is, it is neither the suggestion we probed nor an empty box.
+    const changed = 'the session input box changed while the probe was being undone; clear it in the terminal first';
+    logDraftRefusal(target, changed, beforeScreen, screen, SUGGESTION_PROBE_KEY, deps);
+    throw new InjectionError(409, changed, { screenTail: screenTail(screen) });
   }
-  const write = deps.stderr || process.stderr.write.bind(process.stderr);
-  write(`keep serve: probe keystroke ${JSON.stringify(SUGGESTION_PROBE_KEY)} still on screen after Backspace on pane ${(target && target.pane) || 'unknown'}; the next probe may refuse\n`);
+  const stuck = 'the probe keystroke is still on screen after Backspace; clear the session input box in the terminal first';
+  logDraftRefusal(target, stuck, beforeScreen, screen, SUGGESTION_PROBE_KEY, deps);
+  throw new InjectionError(409, stuck, { screenTail: screenTail(screen) });
 }
 
 async function probeSuggestion(target, beforeScreen, deps = {}) {
@@ -1798,8 +1820,17 @@ async function probeSuggestion(target, beforeScreen, deps = {}) {
         write(`keep serve: draft refusal cleanup failed on pane ${(target && target.pane) || 'unknown'}: ${detail}\n`);
       }
       // Leave a settled screen for whoever reads this pane next — including a probe
-      // later in this same tick.
-      if (undone) await waitForProbeUndo(target, lastScreen, read, wait, now, deps);
+      // later in this same tick, and the caller that is about to type.
+      if (undone) {
+        try {
+          await waitForProbeUndo(target, beforeScreen, lastScreen, read, wait, now, deps);
+        } catch (error) {
+          if (failure == null) throw error;
+          // A more specific refusal is already on its way out and wins; the unsettled
+          // box still has to reach whoever reads the error.
+          if (failure.extra) failure.extra.cleanupError = String((error && error.message) || error);
+        }
+      }
     }
   }
 }

@@ -379,22 +379,49 @@ test('probeSuggestion waits for its own Backspace to render before returning', a
   assert.deepEqual(logged, []);
 });
 
-test('probeSuggestion logs once and returns when its Backspace never renders', async () => {
+test('probeSuggestion refuses when its Backspace never renders', async () => {
   const { inputs, host } = probeInputRecorder();
   const logged = [];
   let reads = 0;
-  await probeSuggestion({ pane: 'pane-stale' }, REVIEWER_SUGGESTION_BEFORE, {
+  // The caller types next, and its confirmation only looks for its own text as a
+  // substring, so a leftover `,` would be submitted as part of the command.
+  const error = await probeSuggestion({ pane: 'pane-stale' }, REVIEWER_SUGGESTION_BEFORE, {
     host,
     wait: async () => {},
     readScreen: async () => { reads += 1; return REVIEWER_SUGGESTION_AFTER; },
     stderr: (message) => { logged.push(message); },
-  });
-  // A send that already proved the box was a suggestion is not failed by a cleanup we
-  // cannot observe: the next caller's probe sees the comma and refuses on its own.
+  }).then(() => null, (e) => e);
+  assert.ok(error, 'an unproven cleanup must not report a clean input box');
+  assert.equal(error.status, 409);
+  assert.match(error.message, /probe keystroke is still on screen after Backspace/);
   assert.equal(reads, 1 + SUGGESTION_PROBE_SETTLE_READS);
   assert.equal(logged.length, 1);
-  assert.match(logged[0], /still on screen after Backspace on pane pane-stale/);
+  assert.match(logged[0], /still on screen after Backspace/);
   assert.deepEqual(inputs, [',', '\x7f']);
+});
+
+test('probeSuggestion refuses when someone types while the probe is being undone', async () => {
+  const { inputs, host } = probeInputRecorder();
+  const logged = [];
+  let reads = 0;
+  const error = await probeSuggestion({ pane: 'pane-raced' }, REVIEWER_SUGGESTION_BEFORE, {
+    host,
+    wait: async () => {},
+    // The probe collapsed the suggestion; by the time the Backspace lands a person has
+    // started typing, so the box is neither empty nor the suggestion we probed.
+    readScreen: async () => {
+      reads += 1;
+      return reads < 2 ? REVIEWER_SUGGESTION_AFTER : suggestionScreenWithBox('hello');
+    },
+    stderr: (message) => { logged.push(message); },
+  }).then(() => null, (e) => e);
+  assert.ok(error, 'a box that filled up during the undo is not a restored suggestion');
+  assert.equal(error.status, 409);
+  assert.match(error.message, /changed while the probe was being undone/);
+  assert.equal(reads, 2, 'the refusal is immediate, not at the settle deadline');
+  assert.deepEqual(inputs, [',', '\x7f'], 'nothing is typed after the probe and its undo');
+  assert.equal(logged.length, 1);
+  assert.match(logged[0], /"❯ hello"/);
 });
 
 test('a second probe on a pane that renders one poll late still sees a suggestion', async () => {
@@ -1991,13 +2018,15 @@ test('handoff model resolution looks past a synthetic-only tail and then at laun
       'claude-opus-5', 'the pane meta names the model when the transcript never does');
     assert.equal(
       handoffCurrentModel(session, null, 'claude --resume cba96b8d --model claude-fable-5-1[1m]', at(syntheticOnly)),
-      'claude-fable-5-1', 'a resume passes the plain id, not the settings.json [1m] variant');
+      'claude-fable-5-1[1m]', 'the 1M-context suffix is part of the id `claude --model` takes');
     assert.equal(handoffCurrentModel(session, null, 'claude --resume cba96b8d', at(syntheticOnly)), '',
-      'nothing on record is empty, which the handoff accepts, and never the unsafe sentinel');
+      'a transcript read to the end that names no model is empty, which the handoff accepts');
     assert.equal(handoffCurrentModel(session, null, '', { findSessionFile: () => null }), '');
-    assert.equal(handoffCurrentModel(session, null, '', {
+    assert.equal(handoffCurrentModel(session, { meta: { model: 'claude-opus-5' } }, '', {
       findSessionFile: () => { throw new Error('two accounts, no authority'); },
-    }), '', 'an unresolvable transcript falls through to the launch metadata');
+    }), '<unknown>', 'an unresolvable transcript fails closed instead of guessing from launch metadata');
+    assert.equal(require('./keep.js').LAUNCH_MODEL_RE.test('<unknown>'), false,
+      'which is exactly the value account-handoff refuses to reproduce');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -2029,10 +2058,21 @@ test('handoff model resolution stops at a malformed genuine model and rejoins sp
     ].join('\n')}\n`);
     assert.equal(handoffCurrentModel(session, null, '', { findSessionFile: () => unicode, scanChunkBytes: 24 }),
       'claude-fable-5-1');
-    // A budget that cannot reach the record is an unknown model, not a wrong one.
+    // A budget that stops with bytes still unread proves nothing about the model, so it
+    // fails closed rather than falling back to launch metadata or claiming "none".
+    assert.equal(handoffCurrentModel(session, { meta: { model: 'claude-opus-5' } },
+      'claude --model claude-opus-5', {
+        findSessionFile: () => unicode, scanChunkBytes: 24, scanMaxBytes: 48,
+      }), '<unknown>');
+    // The same file read to byte zero does name a model, so the bound is the only reason
+    // the scan above gave up.
     assert.equal(handoffCurrentModel(session, null, '', {
-      findSessionFile: () => unicode, scanChunkBytes: 24, scanMaxBytes: 48,
-    }), '');
+      findSessionFile: () => unicode, scanChunkBytes: 24,
+    }), 'claude-fable-5-1');
+    // A transcript with no assistant record at all is read to the end: nothing on record.
+    const empty = path.join(dir, 'empty.jsonl');
+    fs.writeFileSync(empty, '');
+    assert.equal(handoffCurrentModel(session, null, '', { findSessionFile: () => empty }), '');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
