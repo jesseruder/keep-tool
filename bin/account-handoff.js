@@ -43,10 +43,15 @@ const TRANSIENT_REFUSALS = [
   // The identity and helper checks read one `ps` snapshot, and under swap pressure a
   // snapshot can come back wrong: on 2026-09-17 a transfer refused here for a process
   // whose pid and start time had not moved at all, and every liveSessionPids call
-  // afterwards returned the same identity. Retrying is safe because nothing is carried
-  // across attempts — restartSession re-derives originalIdentity from a fresh ps before
-  // it touches anything, and re-runs the same comparison — so a real identity change is
-  // caught again on the next attempt rather than waved through by this class.
+  // afterwards returned the same identity.
+  //
+  // What a retry does is not re-detect this mismatch: it takes a fresh ps, adopts
+  // whatever identity it finds as its own baseline, and compares against that. So
+  // classing these transient does mean an agent that really was replaced between the
+  // two attempts is adopted rather than refused. What still protects the move is
+  // everything the attempt re-runs around it — the session, pane and account the
+  // transfer was requested for, the rate-limit event it exists for, and the restart
+  // path's own ledger and helper proofs — each of which is taken again from scratch.
   /^Agent process identity changed during restart$/,
   /^Original agent process identity is unverified$/,
   /^Session helper processes changed during restart$/,
