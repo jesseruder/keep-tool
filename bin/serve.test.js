@@ -8290,10 +8290,12 @@ test('dashboard Claude resolver reuses one indexed snapshot and preserves accoun
   assert.equal(rowReads, 1);
 });
 
-test('a host-only row shows the name Owner typed for that session', () => {
+test('a host-only row shows the name and mark Owner put on that session', () => {
   const sessionNames = require('./session-names.js');
+  const sessionMarks = require('./session-marks.js');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-rename-host-'));
   sessionNames.set('host-only', 'The finder', { root: dir });
+  sessionMarks.set('host-only', { color: 'red', emoji: '\u{1f525}' }, { root: dir });
   const sessions = [];
   const added = backfillHostSessions(sessions, [{
     id: 'pane', alive: true, createdAt: new Date().toISOString(),
@@ -8302,7 +8304,9 @@ test('a host-only row shows the name Owner typed for that session', () => {
   assert.equal(added.length, 1);
   assert.equal(added[0].title, 'The finder');
   assert.equal(added[0].renamed, true);
+  assert.deepEqual(added[0].mark, { color: 'red', emoji: '\u{1f525}' });
   assert.equal(sessions[0].title, 'The finder', 'the row pushed onto the list is the row that was named');
+  assert.deepEqual(sessions[0].mark, { color: 'red', emoji: '\u{1f525}' });
 });
 
 test('/api/rename-session stores a name, clears it, and refuses a bad id or a non-string title', async () => {
@@ -8349,6 +8353,61 @@ test('/api/rename-session stores a name, clears it, and refuses a bad id or a no
     { status: 200, value: { ok: true, sessionId: 'abc', title: null } });
   assert.equal(broadcasts, 2);
   assert.equal(sessionNames.lookup('abc', { root: dir }), null);
+});
+
+test('/api/mark-session stores a mark, merges it, clears it, and refuses bad input', async () => {
+  const { routes } = require('./serve/routes');
+  const sessionMarks = require('./session-marks.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-mark-route-'));
+  const fire = '\u{1f525}';
+  let broadcasts = 0;
+  const list = routes({
+    keep: { ROOT: dir },
+    sessionMarks,
+    broadcast: () => { broadcasts += 1; },
+    json: (res, status, value) => ({ status, value }),
+  });
+  const route = list.find((entry) => entry.path === '/api/mark-session');
+  const post = (body) => route.handle({ req: { method: 'POST' }, res: {}, url: new URL('http://x/api/mark-session'), body });
+
+  assert.deepEqual(await post({ sessionId: 'bad id', color: 'red' }), { status: 400, value: { error: 'bad session id' } });
+  assert.deepEqual(await post({ color: 'red' }), { status: 400, value: { error: 'bad session id' } });
+  assert.deepEqual(await post({ sessionId: 'abc', color: 12 }), { status: 400, value: { error: 'color must be a string' } });
+  assert.deepEqual(await post({ sessionId: 'abc', emoji: ['x'] }), { status: 400, value: { error: 'emoji must be a string' } });
+  assert.deepEqual(await post({ sessionId: 'abc', color: 'chartreuse' }), { status: 400, value: { error: 'bad color' } });
+  assert.deepEqual(await post({ sessionId: 'abc', emoji: 'nope' }), { status: 400, value: { error: 'bad emoji' } });
+  assert.equal(broadcasts, 0, 'a refused mark changes nothing');
+  assert.equal(sessionMarks.lookup('abc', { root: dir }), null);
+
+  assert.deepEqual(await post({ sessionId: 'abc', emoji: fire }),
+    { status: 200, value: { ok: true, sessionId: 'abc', mark: { emoji: fire } } });
+  assert.deepEqual(await post({ sessionId: 'abc', color: ' Red ' }),
+    { status: 200, value: { ok: true, sessionId: 'abc', mark: { color: 'red', emoji: fire } } },
+    'a colour arrives without disturbing the emoji');
+  assert.equal(broadcasts, 2);
+
+  // The state built next stamps the mark onto that session's row and no other.
+  const sessions = [{ id: 'abc', kind: 'claude' }, { id: 'other', kind: 'claude' }];
+  sessionMarks.apply(sessions, { root: dir });
+  assert.deepEqual(sessions.map((session) => session.mark), [{ color: 'red', emoji: fire }, undefined]);
+
+  assert.deepEqual(await post({ sessionId: 'abc', color: null, emoji: null }),
+    { status: 200, value: { ok: true, sessionId: 'abc', mark: null } });
+  assert.equal(broadcasts, 3);
+  assert.equal(sessionMarks.lookup('abc', { root: dir }), null);
+  sessionMarks.apply(sessions, { root: dir });
+  assert.equal(Object.hasOwn(sessions[0], 'mark'), false, 'a cleared mark leaves the row');
+
+  // A write the registry refuses outright is a 500, not a crashed daemon.
+  const broken = routes({
+    keep: { ROOT: dir },
+    sessionMarks: { set: () => { throw new Error('disk on fire'); } },
+    broadcast: () => { broadcasts += 1; },
+    json: (res, status, value) => ({ status, value }),
+  }).find((entry) => entry.path === '/api/mark-session');
+  assert.deepEqual(await broken.handle({ req: { method: 'POST' }, res: {}, url: new URL('http://x/api/mark-session'), body: { sessionId: 'abc', color: 'red' } }),
+    { status: 500, value: { error: 'could not save the mark: disk on fire' } });
+  assert.equal(broadcasts, 3);
 });
 
 test('host backfill uses indexed Claude discovery only for dashboard state', () => {

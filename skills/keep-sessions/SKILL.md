@@ -136,6 +136,12 @@ when you keep the card and want one step done.
 - `keep rename "title"` names the current session by hand in the console and stops its
   automatic title from changing; `keep rename <#n|session-id> "title"` names another
   session; `--clear` hands it back to automatic titles.
+- `keep mark --emoji 🔥` marks the current session with an emoji shown beside its title
+  everywhere in the console; `--color <name>` adds one of eight palette colors
+  (`keep mark --colors` lists them); `keep mark <#n|session-id> ...` marks another
+  session; `--no-emoji`, `--no-color` and `--clear` take the mark off. Marks are manual
+  only — nothing assigns one. Mark yourself when Owner asked for it, or when a mark
+  would help him pick this session out of a long list; not routinely.
 
 ## Moving a session to another account
 

@@ -57,6 +57,18 @@ test('a hand-renamed session reaches every client with its name and the renamed 
     [['The finder', true], ['The fixer', true]], 'an exited row is trimmed hard but keeps its name');
 });
 
+test("a session's mark reaches every client: compact, lightweight and exited rows", () => {
+  const fire = '\u{1f525}';
+  const live = { id: 'live', mark: { color: 'red', emoji: fire }, state: 'running' };
+  const gone = { id: 'gone', mark: { color: 'blue' }, exited: true, state: 'exited', lastAssistantFull: 'answer', size: 10 };
+  const state = { tasks: [], sessions: [live, gone], notifications: [], attention: [] };
+  assert.deepEqual(compactState(state).sessions.map((session) => session.mark),
+    [{ color: 'red', emoji: fire }, { color: 'blue' }]);
+  const light = lightweightState(state).sessions;
+  assert.deepEqual(light.map((session) => session.mark),
+    [{ color: 'red', emoji: fire }, { color: 'blue' }], 'an exited row is trimmed hard but keeps its mark');
+});
+
 test('console state removes unused histories while preserving inbox notes and safety flags', () => {
   const state = {
     tasks: [{ id: 'inbox', body: 'notes', fm: { title: 'Card' } }, { id: 'other', body: 'long history', lastLog: 'latest' }],

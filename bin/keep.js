@@ -34,6 +34,7 @@ const features = require('./features.js');
 const sessionNumbers = require('./session-numbers.js');
 const { TELL_TEXT_LIMIT } = require('./tell.js');
 const sessionNames = require('./session-names.js');
+const sessionMarks = require('./session-marks.js');
 const hookGroup = require('./commands/hook.js');
 const hostGroup = require('./commands/host.js');
 const reviewGroup = require('./commands/review.js');
@@ -460,6 +461,27 @@ commands.retitle = (argv) => {
   });
 };
 
+// The session a per-session command acts on: `#n` or an id when one was named,
+// otherwise the session this command is running inside. Shared by `keep rename`
+// and `keep mark` so both resolve a target the same way.
+function resolveSessionByNumberOrId(sessionArg, options = {}) {
+  const root = options.root || ROOT;
+  if (sessionArg != null) {
+    const found = sessionNumbers.lookup(sessionArg, { root });
+    if (found) return { sessionId: found.id, num: found.num };
+    // A token that reads as a number and is not in the registry names nothing;
+    // only an id-shaped token is taken at face value (the daemon may know a
+    // session this checkout's registry has not numbered).
+    const number = sessionNumbers.parseNumber(sessionArg);
+    if (number) die(`no session ${sessionNumbers.label(number)}`);
+    if (!/^[A-Za-z0-9_-]+$/.test(sessionArg)) die('bad session id');
+    return { sessionId: sessionArg, num: null };
+  }
+  const self = (options.currentSession || currentSession)();
+  if (!self || !self.id) die(options.noCurrent || 'no current session: run inside a Claude or Codex session, or name one');
+  return { sessionId: self.id, num: sessionNumbers.lookup(self.id, { root })?.num || null };
+}
+
 // Names a session by hand, the way the console's rename does: the name replaces
 // the generated title and switches generation off until it is cleared. The daemon
 // owns the registry while it runs, so the rename goes through its route and the
@@ -472,26 +494,11 @@ commands.rename = async (argv, deps = {}) => {
   const root = deps.root || ROOT;
 
   const sessionArg = o.clear ? (o._.length ? o._[0] : null) : (o._.length === 2 ? o._[0] : null);
-  let sessionId;
-  let num = null;
-  if (sessionArg != null) {
-    const found = sessionNumbers.lookup(sessionArg, { root });
-    if (found) ({ id: sessionId, num } = found);
-    else {
-      // A token that reads as a number and is not in the registry names nothing;
-      // only an id-shaped token is taken at face value (the daemon may know a
-      // session this checkout's registry has not numbered).
-      const number = sessionNumbers.parseNumber(sessionArg);
-      if (number) die(`no session ${sessionNumbers.label(number)}`);
-      if (!/^[A-Za-z0-9_-]+$/.test(sessionArg)) die('bad session id');
-      sessionId = sessionArg;
-    }
-  } else {
-    const self = (deps.currentSession || currentSession)();
-    if (!self || !self.id) die('no current session: run inside a Claude or Codex session, or name one: keep rename <#n|session-id> "title"');
-    sessionId = self.id;
-    num = sessionNumbers.lookup(sessionId, { root })?.num || null;
-  }
+  const { sessionId, num } = resolveSessionByNumberOrId(sessionArg, {
+    root,
+    currentSession: deps.currentSession || currentSession,
+    noCurrent: 'no current session: run inside a Claude or Codex session, or name one: keep rename <#n|session-id> "title"',
+  });
 
   const title = o.clear ? '' : sessionNames.sanitize(o._[o._.length - 1]);
   if (!o.clear && !title) die('title is empty (use --clear to hand the session back to automatic titles)');
@@ -518,6 +525,109 @@ commands.rename = async (argv, deps = {}) => {
   const stdout = deps.stdout || console.log;
   const named = num ? `${sessionNumbers.label(num)} (${sessionId})` : String(sessionId);
   stdout(o.clear ? `cleared ${named}: automatic titles again` : `renamed ${named}: "${title}"`);
+  if (unreachable) stdout("keep serve isn't running; written to the registry, the console picks it up when the daemon starts");
+};
+
+// What `keep mark` prints when the daemon answered without echoing the mark:
+// the same merge sessionMarks.set does, over whatever this checkout can read.
+function mergeMarkForDisplay(sessionId, patch, root) {
+  let current = {};
+  try { current = sessionMarks.lookup(sessionId, { root }) || {}; } catch {}
+  const next = { ...current };
+  for (const field of ['color', 'emoji']) {
+    if (patch[field] === undefined) continue;
+    if (patch[field]) next[field] = patch[field];
+    else delete next[field];
+  }
+  return next.color || next.emoji ? next : null;
+}
+
+// Marks a session with a color, an emoji, or both: decoration Owner (or an agent
+// he asked) puts on a session so it is findable in a long console list. Nothing
+// assigns a mark automatically, and a mark is independent of the session's name.
+// Routed through the daemon like `keep rename`, with the same registry fallback
+// when nothing is listening.
+commands.mark = async (argv, deps = {}) => {
+  const o = parseArgs(argv, {
+    emoji: 'str', color: 'str', 'no-emoji': 'bool', 'no-color': 'bool', clear: 'bool', colors: 'bool',
+  });
+  const usage = 'usage: keep mark [<#n|session-id>] --emoji <e> | --color <name> | --no-emoji | --no-color | --clear'
+    + '\n       keep mark --colors';
+  const stdout = deps.stdout || console.log;
+  const root = deps.root || ROOT;
+
+  if (o.colors) {
+    for (const color of sessionMarks.PALETTE) stdout(color);
+    return;
+  }
+
+  const setting = o.emoji !== undefined || o.color !== undefined || o['no-emoji'] || o['no-color'];
+  if (!setting && !o.clear) die(usage);
+  // --clear says "no mark at all"; pairing it with a value, or asking to set and
+  // remove the same half at once, is a typo rather than an order to guess at.
+  if (o.clear && setting) die(usage);
+  if (o.emoji !== undefined && o['no-emoji']) die(usage);
+  if (o.color !== undefined && o['no-color']) die(usage);
+  if (o._.length > 1) die(usage);
+
+  // Checked here as well as in the daemon so a typo costs a message, not a round trip.
+  let emoji = null;
+  if (o.emoji !== undefined) {
+    emoji = sessionMarks.normalizeEmoji(o.emoji);
+    if (!emoji) die(`not an emoji: "${o.emoji}"`);
+  }
+  let color = null;
+  if (o.color !== undefined) {
+    color = sessionMarks.normalizeColor(o.color);
+    if (!color) die(`not a palette color: "${o.color}" (keep mark --colors)`);
+  }
+
+  const { sessionId, num } = resolveSessionByNumberOrId(o._.length ? o._[0] : null, {
+    root,
+    currentSession: deps.currentSession || currentSession,
+    noCurrent: 'no current session: run inside a Claude or Codex session, or name one: keep mark <#n|session-id> --emoji 🔥',
+  });
+
+  const patch = {};
+  if (o.clear) {
+    patch.color = null;
+    patch.emoji = null;
+  } else {
+    if (emoji) patch.emoji = emoji;
+    else if (o['no-emoji']) patch.emoji = null;
+    if (color) patch.color = color;
+    else if (o['no-color']) patch.color = null;
+  }
+
+  let response = null;
+  let unreachable = null;
+  try { response = await (deps.postKeepApi || postKeepApi)('/api/mark-session', { sessionId, ...patch }, 10000); }
+  catch (error) {
+    // Only a refused connection means nobody owns the registry. A timeout or a
+    // reset may have reached a daemon that then wrote the file; writing it again
+    // here would race that write.
+    if (error && error.code === 'ECONNREFUSED') unreachable = error;
+    else die(`keep serve did not answer (${error && error.message || error}); try again`);
+  }
+  let mark = null;
+  if (unreachable) {
+    try { ({ mark } = sessionMarks.set(sessionId, patch, { root })); }
+    catch (error) { die('cannot write the session-mark registry: ' + error.message); }
+  } else if (response.status !== 200) {
+    let result = {};
+    try { result = JSON.parse(response.data); } catch {}
+    die(result.error || `keep serve returned an unexpected response (${response.status})`);
+  } else {
+    let result = {};
+    try { result = JSON.parse(response.data); } catch {}
+    // The daemon owns the merge, so its answer is what the mark now is; an answer
+    // that does not carry one is merged here rather than printed as "no mark".
+    mark = result.mark !== undefined ? result.mark : mergeMarkForDisplay(sessionId, patch, root);
+  }
+
+  const named = num ? `${sessionNumbers.label(num)} (${sessionId})` : String(sessionId);
+  const shown = mark ? [mark.emoji, mark.color].filter(Boolean).join(' ') : '';
+  stdout(shown ? `marked ${named}: ${shown}` : `cleared ${named}: no mark`);
   if (unreachable) stdout("keep serve isn't running; written to the registry, the console picks it up when the daemon starts");
 };
 
@@ -3017,6 +3127,9 @@ function helpText() {
   keep retitle <id> "new title"
   keep rename [<#n|session-id>] "new title"    # name a session by hand; its automatic title stops updating
   keep rename [<#n|session-id>] --clear        # hand the session back to automatic titles
+  keep mark [<#n|session-id>] --emoji 🔥 | --color red     # mark a session so it stands out in the console
+  keep mark [<#n|session-id>] --no-emoji | --no-color | --clear   # take the mark off again
+  keep mark --colors                           # the eight palette colors
   keep project <id> [<path|name>] [-m "reason"]   # show or change project; preserves session links and schedule
   keep claim <card>                                # claim for the current session; run from the card's project
   keep link <card> --session <sid> --agent claude|codex   # repair ownership metadata without waking or launching
@@ -3279,7 +3392,7 @@ module.exports = {
   tellCommandCli: commands.tell, writeOpenHandoff,
   postOpen, OPEN_MESSAGE_LIMIT, OPEN_MESSAGE_ERROR, LAUNCH_MODEL_RE,
   restoreCommandCli: commands.restore, resumeCommandCli: commands.resume, resumeCommand,
-  renameCommandCli: commands.rename,
+  renameCommandCli: commands.rename, markCommandCli: commands.mark,
   accountsCommandCli: commands.accounts, handoffCommandCli: commands.handoff, transferCommandCli: commands.transfer,
   delegateCommandCli: commands.delegate,
   artifactCommandCli: commands.artifact,

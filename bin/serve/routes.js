@@ -24,7 +24,7 @@ function routes(ctx) {
     prepareSessionSummary, projectMobileState, recentTranscriptText, recoverReviewQueueLaunch, reminders,
     reopenSessionOnAccount, resolvePortableTransfer, resolveReviewLaunchSelection, restorePlan, review,
     reviewDeps, reviewQueue, reviewQueueSearch, runCheckNow, runTaskNow, screenHistorySession, screenSession,
-    sendSessionKeys, sendStateJson, sendToSessionLocked, sessionNames, sessionSummaryFile, setAsideCandidates, summarize,
+    sendSessionKeys, sendStateJson, sendToSessionLocked, sessionMarks, sessionNames, sessionSummaryFile, setAsideCandidates, summarize,
     tellSession, transferSession, updateSetAside, wantsCompactState, wantsLightweightState, withInjectionLock,
     writeToShellPane,
     // start()'s own locals. onChange and onFocus are the module-level hooks start()
@@ -524,6 +524,32 @@ function routes(ctx) {
         catch (error) { return json(res, 500, { error: `could not save the name: ${String(error && error.message || error).slice(0, 200)}` }); }
         broadcast();
         return json(res, 200, { ok: true, sessionId, title: result.title });
+      },
+    },
+    // A mark is Owner's own color and emoji on a session, independent of its name.
+    // Each field is an instruction: absent leaves it alone, null or '' removes it,
+    // a string sets it. `mark` comes back null when nothing is left.
+    {
+      method: 'POST',
+      path: '/api/mark-session',
+      handle: async ({ req, res, url, body }) => {
+        const sessionId = String(body && body.sessionId || '');
+        if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) return json(res, 400, { error: 'bad session id' });
+        const patch = {};
+        for (const field of ['color', 'emoji']) {
+          if (!body || !Object.prototype.hasOwnProperty.call(body, field) || body[field] === undefined) continue;
+          if (body[field] !== null && typeof body[field] !== 'string') return json(res, 400, { error: `${field} must be a string` });
+          patch[field] = body[field];
+        }
+        let result;
+        try { result = sessionMarks.set(sessionId, patch, { root: keep.ROOT }); }
+        catch (error) {
+          const message = String(error && error.message || error);
+          if (message === 'bad color' || message === 'bad emoji') return json(res, 400, { error: message });
+          return json(res, 500, { error: `could not save the mark: ${message.slice(0, 200)}` });
+        }
+        broadcast();
+        return json(res, 200, { ok: true, sessionId, mark: result.mark });
       },
     },
     {

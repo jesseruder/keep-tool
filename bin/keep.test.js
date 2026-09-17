@@ -2324,3 +2324,164 @@ test('keep rename reports the daemon\'s own refusal', async () => {
     }), /bad session id/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+// ---------- keep mark (the colour and emoji Owner puts on a session) ----------
+
+const MARK_FIRE = '\u{1f525}';
+const MARK_ROCKET = '\u{1f680}';
+
+// The daemon's answer, computed the way the route would, so the printed line is
+// the mark the registry now holds.
+function markDaemon(calls, state = {}) {
+  return async (pathname, body, timeoutMs) => {
+    calls.push({ pathname, body, timeoutMs });
+    for (const field of ['color', 'emoji']) {
+      if (!Object.prototype.hasOwnProperty.call(body, field)) continue;
+      if (body[field]) state[field] = body[field];
+      else delete state[field];
+    }
+    const mark = state.color || state.emoji ? { ...state } : null;
+    return { status: 200, data: JSON.stringify({ ok: true, sessionId: body.sessionId, mark }) };
+  };
+}
+
+test('keep mark puts an emoji on the current session', async () => {
+  const { markCommandCli } = require('./keep.js');
+  const root = renameRoot({ 'sess-a': 7 });
+  const calls = [];
+  const stdout = [];
+  try {
+    await markCommandCli(['--emoji', MARK_FIRE], {
+      root,
+      currentSession: () => ({ id: 'sess-a', agent: 'claude' }),
+      postKeepApi: markDaemon(calls),
+      stdout: (line) => stdout.push(line),
+    });
+    assert.deepEqual(calls, [{
+      pathname: '/api/mark-session',
+      body: { sessionId: 'sess-a', emoji: MARK_FIRE },
+      timeoutMs: 10000,
+    }]);
+    assert.deepEqual(stdout, [`marked #7 (sess-a): ${MARK_FIRE}`]);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('keep mark sets both halves on a numbered session, then takes one off', async () => {
+  const { markCommandCli } = require('./keep.js');
+  const root = renameRoot({ 'sess-fifty-three': 53 });
+  const calls = [];
+  const stdout = [];
+  const state = {};
+  try {
+    await markCommandCli(['#53', '--color', 'red', '--emoji', MARK_ROCKET], {
+      root, postKeepApi: markDaemon(calls, state), stdout: (line) => stdout.push(line),
+    });
+    await markCommandCli(['#53', '--no-color'], {
+      root, postKeepApi: markDaemon(calls, state), stdout: (line) => stdout.push(line),
+    });
+    assert.deepEqual(calls.map((call) => call.body), [
+      { sessionId: 'sess-fifty-three', emoji: MARK_ROCKET, color: 'red' },
+      { sessionId: 'sess-fifty-three', color: null },
+    ]);
+    assert.deepEqual(stdout, [
+      `marked #53 (sess-fifty-three): ${MARK_ROCKET} red`,
+      `marked #53 (sess-fifty-three): ${MARK_ROCKET}`,
+    ]);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('keep mark --clear removes both halves at once', async () => {
+  const { markCommandCli } = require('./keep.js');
+  const root = renameRoot({ 'sess-a': 4 });
+  const calls = [];
+  const stdout = [];
+  try {
+    await markCommandCli(['--clear'], {
+      root,
+      currentSession: () => ({ id: 'sess-a', agent: 'codex' }),
+      postKeepApi: markDaemon(calls, { color: 'blue', emoji: MARK_FIRE }),
+      stdout: (line) => stdout.push(line),
+    });
+    assert.deepEqual(calls.map((call) => call.body), [{ sessionId: 'sess-a', color: null, emoji: null }]);
+    assert.deepEqual(stdout, ['cleared #4 (sess-a): no mark']);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('keep mark --colors prints the palette without asking the daemon', async () => {
+  const { markCommandCli } = require('./keep.js');
+  const { PALETTE } = require('./session-marks.js');
+  const root = renameRoot();
+  const stdout = [];
+  try {
+    await markCommandCli(['--colors'], { root, postKeepApi: refuseRequest(), stdout: (line) => stdout.push(line) });
+    assert.deepEqual(stdout, [...PALETTE]);
+    assert.equal(stdout.length, 8);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('keep mark refuses a bad mark, contradictory flags and no flags at all, without a request', async () => {
+  const { markCommandCli } = require('./keep.js');
+  const root = renameRoot({ 'sess-a': 4 });
+  const deps = { root, currentSession: () => ({ id: 'sess-a', agent: 'claude' }), postKeepApi: refuseRequest() };
+  try {
+    await assert.rejects(markCommandCli(['--emoji', 'nope'], deps), /not an emoji: "nope"/);
+    await assert.rejects(markCommandCli(['--emoji', `${MARK_FIRE}${MARK_FIRE}`], deps), /not an emoji/);
+    await assert.rejects(markCommandCli(['--color', 'chartreuse'], deps), /not a palette color: "chartreuse" \(keep mark --colors\)/);
+    await assert.rejects(markCommandCli([], deps), /usage: keep mark/);
+    await assert.rejects(markCommandCli(['#4'], deps), /usage: keep mark/);
+    await assert.rejects(markCommandCli(['--clear', '--color', 'red'], deps), /usage: keep mark/);
+    await assert.rejects(markCommandCli(['--emoji', MARK_FIRE, '--no-emoji'], deps), /usage: keep mark/);
+    await assert.rejects(markCommandCli(['--color', 'red', '--no-color'], deps), /usage: keep mark/);
+    await assert.rejects(markCommandCli(['sess-a', 'extra', '--no-color'], deps), /usage: keep mark/);
+    await assert.rejects(markCommandCli(['#99', '--no-color'], deps), /no session #99/);
+    await assert.rejects(markCommandCli(['--no-color'], { ...deps, currentSession: () => null }), /no current session/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('keep mark writes the registry itself when keep serve is down', async () => {
+  const { markCommandCli } = require('./keep.js');
+  const sessionMarks = require('./session-marks.js');
+  const root = renameRoot({ 'sess-a': 4 });
+  const stdout = [];
+  const down = async () => { throw Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }); };
+  try {
+    await markCommandCli(['--emoji', MARK_FIRE], {
+      root, currentSession: () => ({ id: 'sess-a', agent: 'claude' }), postKeepApi: down, stdout: (line) => stdout.push(line),
+    });
+    assert.deepEqual(sessionMarks.lookup('sess-a', { root }), { emoji: MARK_FIRE });
+    assert.equal(stdout[0], `marked #4 (sess-a): ${MARK_FIRE}`);
+    assert.match(stdout[1], /keep serve isn't running; written to the registry/);
+
+    await markCommandCli(['--color', 'teal'], {
+      root, currentSession: () => ({ id: 'sess-a', agent: 'claude' }), postKeepApi: down, stdout: (line) => stdout.push(line),
+    });
+    assert.deepEqual(sessionMarks.lookup('sess-a', { root }), { color: 'teal', emoji: MARK_FIRE });
+    assert.equal(stdout[2], `marked #4 (sess-a): ${MARK_FIRE} teal`);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('keep mark does not write the registry itself when the daemon may have taken the request', async () => {
+  const { markCommandCli } = require('./keep.js');
+  const sessionMarks = require('./session-marks.js');
+  const root = renameRoot({ 'sess-a': 4 });
+  try {
+    await assert.rejects(markCommandCli(['--emoji', MARK_FIRE], {
+      root,
+      currentSession: () => ({ id: 'sess-a', agent: 'claude' }),
+      postKeepApi: async () => { throw new Error('timed out'); },
+    }), /keep serve did not answer \(timed out\)/);
+    assert.equal(sessionMarks.lookup('sess-a', { root }), null);
+    assert.equal(fs.existsSync(sessionMarks.markFile(root, 'sess-a')), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('keep mark reports the daemon\'s own refusal', async () => {
+  const { markCommandCli } = require('./keep.js');
+  const root = renameRoot();
+  try {
+    await assert.rejects(markCommandCli(['sess-a', '--color', 'red'], {
+      root,
+      postKeepApi: async () => ({ status: 400, data: '{"error":"bad session id"}' }),
+    }), /bad session id/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
