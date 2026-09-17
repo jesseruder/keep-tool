@@ -276,6 +276,107 @@ test('a write that fails behind a newer one does not undo the newer belief', asy
   assert.equal(writes.length, 2, 'A failing did not roll the field back to what it was before A');
 });
 
+// A writer whose every call waits for the test to decide its fate.
+function gatedWriter() {
+  const gates = [];
+  const sent = [];
+  const setMark = (sessionId, patch) => new Promise((resolve, reject) => {
+    sent.push(patch);
+    gates.push({ ok: () => resolve({ ok: true }), fail: () => reject(new Error('bad emoji')) });
+  });
+  return { gates, sent, setMark, next: () => gates.shift() };
+}
+
+test('two queued writes to the same field that both fail leave the belief where the daemon has it', async () => {
+  const { installMarkControls, markControlsHTML } = await import('./session-mark.js');
+  const writer = gatedWriter();
+  const menu = new FakeMenu(markControlsHTML(esc, 'both-fail', { emoji: '🎯' }));
+  installMarkControls(menu, { esc, toast() {} }, 'both-fail', { emoji: '🎯' }, writer.setMark);
+  menu.emoji.value = '🔥';
+  menu.emoji.keydown('Enter');
+  menu.emoji.value = '🚀';
+  menu.emoji.keydown('Enter');
+  await settle();
+  writer.next().fail();
+  await settle();
+  writer.next().fail();
+  await settle();
+  // Neither landed, so the belief is the daemon's 🎯 again and typing it is not a write.
+  menu.emoji.value = '🎯';
+  menu.emoji.blur();
+  await settle();
+  assert.deepEqual(writer.sent, [{ emoji: '🔥' }, { emoji: '🚀' }]);
+  // ...and 🔥 is a write again, not "unchanged".
+  menu.emoji.value = '🔥';
+  menu.emoji.blur();
+  await settle();
+  assert.equal(writer.sent.length, 3);
+});
+
+test('an A-B-A sequence whose first write fails keeps the newest write as the belief', async () => {
+  const { installMarkControls, markControlsHTML } = await import('./session-mark.js');
+  const writer = gatedWriter();
+  const menu = new FakeMenu(markControlsHTML(esc, 'aba', null));
+  installMarkControls(menu, { esc, toast() {} }, 'aba', null, writer.setMark);
+  for (const value of ['🔥', '🚀', '🔥']) {
+    menu.emoji.value = value;
+    menu.emoji.keydown('Enter');
+  }
+  await settle();
+  writer.next().fail();
+  await settle();
+  writer.next().ok();
+  await settle();
+  writer.next().ok();
+  await settle();
+  assert.deepEqual(writer.sent, [{ emoji: '🔥' }, { emoji: '🚀' }, { emoji: '🔥' }]);
+  menu.emoji.value = '🔥';
+  menu.emoji.blur();
+  await settle();
+  assert.equal(writer.sent.length, 3, 'the last 🔥 landed, so it is the belief and not rewritten');
+});
+
+test('a color write failing beside an emoji write leaves the emoji belief alone', async () => {
+  const { installMarkControls, markControlsHTML } = await import('./session-mark.js');
+  const writer = gatedWriter();
+  const menu = new FakeMenu(markControlsHTML(esc, 'split', null));
+  installMarkControls(menu, { esc, toast() {} }, 'split', null, writer.setMark);
+  menu.swatch('teal').click();
+  menu.emoji.value = '🔥';
+  menu.emoji.keydown('Enter');
+  await settle();
+  writer.next().fail();
+  await settle();
+  writer.next().ok();
+  await settle();
+  menu.emoji.value = '🔥';
+  menu.emoji.blur();
+  menu.swatch('teal').click();
+  await settle();
+  assert.deepEqual(writer.sent, [{ color: 'teal' }, { emoji: '🔥' }, { color: 'teal' }],
+    'the emoji stands; teal never landed, so clicking it sets rather than clears');
+});
+
+test('a writer that throws synchronously is a failed write, and the queue moves on', async () => {
+  const { installMarkControls, markControlsHTML } = await import('./session-mark.js');
+  const toasts = [];
+  let calls = 0;
+  const setMark = () => { calls += 1; if (calls === 1) throw new Error('boom'); return Promise.resolve({ ok: true }); };
+  const menu = new FakeMenu(markControlsHTML(esc, 'sync', null));
+  installMarkControls(menu, { esc, toast: (message) => toasts.push(message) }, 'sync', null, setMark);
+  menu.swatch('red').click();
+  menu.swatch('blue').click();
+  await settle();
+  assert.deepEqual(toasts, ['Not marked: boom']);
+  assert.equal(calls, 2, 'the second write went out after the first threw');
+  // Nothing pending: blue landed and is the belief, so clicking it again clears.
+  const sent = [];
+  installMarkControls(menu, { esc }, 'sync', { color: 'blue' }, async (id, patch) => { sent.push(patch); return { ok: true }; });
+  menu.swatch('blue').click();
+  await settle();
+  assert.deepEqual(sent, [{ color: null }]);
+});
+
 test('the queue and the belief outlive a re-render while a write is still in flight', async () => {
   const { installMarkControls, markControlsHTML } = await import('./session-mark.js');
   const gates = [];

@@ -44,27 +44,41 @@ export function markControlsHTML(esc = escapeHTML, sessionId, mark) {
   return `<div class="mark-controls" data-mark-controls><div class="session-actions-label">Mark</div><div class="mark-swatches" role="group" aria-label="Mark color">${swatches}</div><input class="mark-emoji" data-mark-emoji name="emoji" maxlength="16" placeholder="emoji" value="${esc(emoji)}" aria-label="Session emoji">${clear}</div>`;
 }
 
-// `setMark(sessionId, patch)` is the api call. Handlers are assigned rather than
-// added so that re-installing on every patchActionsMenu render — which happens
-// every few seconds — leaves exactly one of each.
-// Per session, across re-installs: the queue of writes and what the console
-// believes the mark is. Both outlive one render, because a reload re-renders the
-// menu while an earlier write may still be on its way to the daemon.
+// Per session, across re-installs: what the daemon last confirmed, the writes
+// still on their way to it, and the queue that sends them one at a time. All of
+// it outlives one render, because a reload re-renders the menu while an earlier
+// write may still be in flight.
 const sessions = new Map();
+
+function applyPatch(base, patch) {
+  const next = { ...base };
+  for (const field of ['color', 'emoji']) if (patch[field] !== undefined) next[field] = patch[field] || '';
+  return next;
+}
 
 function sessionState(sessionId, mark) {
   let state = sessions.get(sessionId);
   if (!state) {
-    state = { chain: Promise.resolve(), pending: 0, current: { color: '', emoji: '' } };
+    state = { chain: Promise.resolve(), confirmed: { color: '', emoji: '' }, queued: [] };
     sessions.set(sessionId, state);
   }
-  // With nothing in flight the daemon's answer is the truth; while a write is
-  // pending the belief stays optimistic, or the blur after an Enter would write
-  // the same emoji twice.
-  if (!state.pending) state.current = { color: colorOf(mark), emoji: emojiOf(mark) };
+  // With nothing in flight the daemon's answer is the truth. While writes are
+  // pending the confirmed base stays what it was, and the belief is that base
+  // with the pending writes laid over it, so the blur after an Enter does not
+  // write the same emoji twice and a write that fails simply drops out of the
+  // picture, whatever was written before or after it.
+  if (!state.queued.length) state.confirmed = { color: colorOf(mark), emoji: emojiOf(mark) };
   return state;
 }
 
+// The mark the console believes the session has right now.
+function belief(state) {
+  return state.queued.reduce(applyPatch, state.confirmed);
+}
+
+// `setMark(sessionId, patch)` is the api call. Handlers are assigned rather than
+// added so that re-installing on every patchActionsMenu render — which happens
+// every few seconds — leaves exactly one of each.
 export function installMarkControls(menu, ctx = {}, sessionId, mark, setMark) {
   if (!menu || !sessionId || typeof setMark !== 'function') return;
   const state = sessionState(sessionId, mark);
@@ -73,22 +87,20 @@ export function installMarkControls(menu, ctx = {}, sessionId, mark, setMark) {
   // request the daemon would otherwise have handled first.
   const write = (patch, close) => {
     if (close) menu.removeAttribute?.('open');
-    const fields = ['color', 'emoji'].filter((field) => patch[field] !== undefined);
-    const before = { ...state.current };
-    const wanted = {};
-    for (const field of fields) wanted[field] = state.current[field] = patch[field] || '';
-    state.pending += 1;
+    const entry = { ...patch };
+    state.queued.push(entry);
+    const drop = () => { state.queued = state.queued.filter((queued) => queued !== entry); };
     state.chain = state.chain
-      .then(() => setMark(sessionId, patch))
-      .then(() => ctx.reload?.())
-      .catch((error) => {
-        // The write did not happen, so a field this write set goes back to what
-        // it was, unless a later write has already moved it on: that write's
-        // belief stands, and its own outcome decides.
-        for (const field of fields) if (state.current[field] === wanted[field]) state.current[field] = before[field];
+      .then(() => setMark(sessionId, entry))
+      .then(() => {
+        state.confirmed = applyPatch(state.confirmed, entry);
+        drop();
+        return ctx.reload?.();
+      }, (error) => {
+        drop();
         ctx.toast?.(`Not marked: ${error && error.message ? error.message : String(error)}`);
       })
-      .finally(() => { state.pending -= 1; });
+      .catch(() => {});
     return state.chain;
   };
 
@@ -96,7 +108,7 @@ export function installMarkControls(menu, ctx = {}, sessionId, mark, setMark) {
     button.onclick = () => {
       const name = button.dataset?.markColor ?? button.getAttribute?.('data-mark-color');
       // Clicking the color a session already carries takes it off again.
-      write({ color: name === state.current.color ? null : name }, true);
+      write({ color: name === belief(state).color ? null : name }, true);
     };
   }
 
@@ -104,7 +116,7 @@ export function installMarkControls(menu, ctx = {}, sessionId, mark, setMark) {
   if (input) {
     const commit = () => {
       const value = String(input.value ?? '').trim();
-      if (value === state.current.emoji) return;
+      if (value === belief(state).emoji) return;
       // Typing is not finished until Enter, a change or a blur, and none of them
       // closes the menu: the emoji field is the one control Owner stays in.
       write({ emoji: value || null }, false);
