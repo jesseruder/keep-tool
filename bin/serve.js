@@ -6877,6 +6877,10 @@ function buildState(options = {}) {
         continue;
       }
       const frozen = { ...session };
+      // A hand-typed name is re-applied on every build from its registry, so the
+      // frozen row keeps the transcript title: a name cleared while the row was
+      // cached must not come back with it.
+      if (frozen.renamed && typeof frozen.baseTitle === 'string') frozen.title = frozen.baseTitle;
       for (const field of derived) delete frozen[field];
       delete frozen.notify; // attention markers are refreshed on every build
       settledSessionCache.set({ agent: session.kind, id: session.id, file: evidence.file,

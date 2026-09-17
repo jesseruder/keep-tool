@@ -19,7 +19,9 @@ const MAX_TITLE = 120;
 function directory(root) { return path.join(root, '.keep'); }
 function registryFile(root) { return path.join(directory(root), 'session-names.json'); }
 
-function emptyRegistry() { return { version: 1, names: {} }; }
+// Session ids are route input, so the map has no prototype: `constructor` or
+// `__proto__` must be an absent key, not an inherited value.
+function emptyRegistry() { return { version: 1, names: Object.create(null) }; }
 
 // Owner's text, not a model's: strip what would corrupt a line of console UI
 // (control, bidi-override and zero-width characters), then collapse and cap.
@@ -41,8 +43,9 @@ function read(options = {}) {
   try { value = JSON.parse(fs.readFileSync(registryFile(root), 'utf8')); } catch { return emptyRegistry(); }
   if (!value || typeof value !== 'object' || value.version !== 1) return emptyRegistry();
   const source = value.names && typeof value.names === 'object' && !Array.isArray(value.names) ? value.names : {};
-  const names = {};
+  const names = Object.create(null);
   for (const [id, entry] of Object.entries(source)) {
+    if (!Object.hasOwn(source, id)) continue;
     const title = sanitize(entry && entry.title);
     if (!title) continue;
     names[id] = { title, at: Number.isFinite(entry.at) ? entry.at : 0 };
@@ -81,10 +84,13 @@ function lookup(sessionId, options = {}) {
   return read(options).names[id]?.title || null;
 }
 
-// Stamps every named session with its name and the flag that stops generation,
-// and clears the flag on a session whose name was cleared — a row can arrive
-// from a cache that was filled while it still had one. Never throws: a scan that
-// cannot read the registry is still a usable scan.
+// Stamps every named session with its name and the flag that stops generation.
+// The row's own title moves to baseTitle first (applyLiveTitles would have done
+// that, but it skips renamed rows), so a row that arrives from a cache filled
+// while it still had a name gets that title back, and the flag removed, once the
+// name is cleared; otherwise the old name would be adopted as the base title and
+// shown for ever. Never throws: a scan that cannot read the registry is still a
+// usable scan.
 function apply(sessions, options = {}) {
   const rows = Array.isArray(sessions) ? sessions : [];
   if (!options.root || !rows.length) return rows;
@@ -94,10 +100,12 @@ function apply(sessions, options = {}) {
       if (!session || typeof session !== 'object') continue;
       const name = typeof session.id === 'string' ? names[session.id] : null;
       if (name) {
+        if (session.baseTitle == null) session.baseTitle = session.title ?? '';
         session.title = name.title;
         session.renamed = true;
       } else if (session.renamed) {
         delete session.renamed;
+        if (typeof session.baseTitle === 'string') session.title = session.baseTitle;
       }
     }
   } catch {}
