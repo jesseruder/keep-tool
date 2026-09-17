@@ -17,6 +17,7 @@ is never replaced without `keep setup skills --replace`, which backs it up first
 | Stop | `keep hook stop` |
 | Notification | `keep hook notification` |
 | PreToolUse (Bash) | `keep hook pre-bash` |
+| PreToolUse (AskUserQuestion) | `keep hook pre-question` |
 | PostToolUse (Bash) | `keep hook post-bash` |
 
 The installer currently adds only the Claude hooks in this table. For supported

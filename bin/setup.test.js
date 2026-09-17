@@ -73,7 +73,35 @@ test('hook merging preserves unrelated hooks and is idempotent', () => {
   assert.deepEqual(next.enabledPlugins, input.enabledPlugins);
   assert.equal(next.hooks.Stop[0].hooks[0].command, 'existing-stop');
   assert.equal(input.hooks.Stop.length, 1);
+  // PreToolUse carries two adapters with different matchers, each in its own entry:
+  // the Bash guard and the question refusal in a session nobody is reading.
+  assert.deepEqual(next.hooks.PreToolUse.map((entry) => [entry.matcher, entry.hooks[0].command]), [
+    ['Bash', "'/path with spaces/keep' hook pre-bash"],
+    ['AskUserQuestion', "'/path with spaces/keep' hook pre-question"],
+  ]);
   assert.deepEqual(setup.mergeHooks(next, "'/path with spaces/keep'"), next);
+});
+
+test('a settings file missing only the question hook is reported and repaired', () => {
+  const f = hooksFixture();
+  try {
+    setup.installHooks();
+    assert.deepEqual(setup.missingHooks(f.accountSettings), []);
+    // Installed before `pre-question` existed: the doctor reads that as unguarded,
+    // and a second `keep setup hooks` adds the one entry without touching the rest.
+    const settings = JSON.parse(fs.readFileSync(f.accountSettings, 'utf8'));
+    settings.hooks.PreToolUse = settings.hooks.PreToolUse
+      .filter((entry) => !entry.hooks.some((hook) => / hook pre-question/.test(hook.command)));
+    fs.writeFileSync(f.accountSettings, JSON.stringify(settings, null, 2) + '\n');
+    assert.deepEqual(setup.missingHooks(f.accountSettings), ['pre-question']);
+
+    setup.installHooks();
+    assert.deepEqual(setup.missingHooks(f.accountSettings), []);
+    const repaired = JSON.parse(fs.readFileSync(f.accountSettings, 'utf8'));
+    assert.deepEqual(repaired.hooks.PreToolUse.map((entry) => entry.matcher), ['Bash', 'AskUserQuestion']);
+    assert.equal(repaired.hooks.PreToolUse.filter((entry) =>
+      entry.hooks.some((hook) => / hook pre-bash/.test(hook.command))).length, 1, 'the Bash guard is not duplicated');
+  } finally { f.cleanup(); }
 });
 
 test('service definitions escape user paths and pin Node and registry independently', () => {
@@ -353,7 +381,8 @@ test('a Keep hook command from a moved checkout is rewritten, not duplicated', (
   const command = "KEEP_CONFIG='/new/config.json' '/new/keep-tool/bin/keep'";
   const next = setup.mergeHooks(stale, command);
   assert.deepEqual(next.hooks.PreToolUse[0].hooks.map((hook) => hook.command), [`${command} hook pre-bash`]);
-  assert.equal(next.hooks.PreToolUse.length, 1, 'no second entry for the same action');
+  assert.deepEqual(next.hooks.PreToolUse.map((entry) => entry.matcher), ['Bash', 'AskUserQuestion'],
+    'the stale Bash entry is rewritten in place, and only the missing matcher is added');
   assert.deepEqual(next.hooks.SessionStart[0].hooks.map((hook) => hook.command), [
     'other-tool hook session-start', `${command} hook session-start`,
   ], 'another tool with the same shape is left alone');

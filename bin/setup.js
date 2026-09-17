@@ -338,12 +338,18 @@ function installSkills(args = []) {
   console.log(`Installed skill packs: ${names.join(', ')}.${changed.length ? ' Restart agent sessions to load them.' : ''}`);
 }
 
-const HOOK_EVENTS = {
-  SessionStart: ['session-start', ''], SessionEnd: ['session-end', ''],
-  Stop: ['stop', ''], Notification: ['notification', ''],
-  PreToolUse: ['pre-bash', 'Bash'], PostToolUse: ['post-bash', 'Bash'],
-};
-const HOOK_ACTIONS = Object.values(HOOK_EVENTS).map(([action]) => action);
+// A list, not a map keyed by event: PreToolUse carries two adapters with different
+// matchers — the Bash guard and the question refusal in an unattended session.
+const HOOK_DEFS = [
+  { event: 'SessionStart', action: 'session-start', matcher: '' },
+  { event: 'SessionEnd', action: 'session-end', matcher: '' },
+  { event: 'Stop', action: 'stop', matcher: '' },
+  { event: 'Notification', action: 'notification', matcher: '' },
+  { event: 'PreToolUse', action: 'pre-bash', matcher: 'Bash' },
+  { event: 'PreToolUse', action: 'pre-question', matcher: 'AskUserQuestion' },
+  { event: 'PostToolUse', action: 'post-bash', matcher: 'Bash' },
+];
+const HOOK_ACTIONS = HOOK_DEFS.map(({ action }) => action);
 
 // A Keep hook command for this action, whatever path or KEEP_CONFIG it names.
 // The command embeds the configuration path, so a moved registry would otherwise
@@ -355,7 +361,7 @@ function keepHookRe(action) {
 function mergeHooks(settings, command) {
   const next = structuredClone(settings);
   next.hooks ||= {};
-  for (const [event, [action, matcher]] of Object.entries(HOOK_EVENTS)) {
+  for (const { event, action, matcher } of HOOK_DEFS) {
     const entries = next.hooks[event] ||= [];
     const hookCommand = `${command} hook ${action}`;
     const stale = keepHookRe(action);
@@ -373,7 +379,7 @@ function mergeHooks(settings, command) {
   return next;
 }
 
-// Which of Keep's six hook commands a settings file does not carry. A missing or
+// Which of Keep's hook commands a settings file does not carry. A missing or
 // unreadable file carries none: an automation account with no settings.json is
 // exactly the unguarded case this reports.
 function missingHooks(settingsFile) {
@@ -675,8 +681,8 @@ function doctor(root) {
   check('Claude CLI (reviewer and scheduled checks)', () => spawnSync('claude', ['--version'], { timeout: 10000 }).status === 0);
   check('Codex CLI', () => spawnSync('codex', ['--version'], { timeout: 10000 }).status === 0, false);
   check('terminal dependencies', () => { require('node-pty'); require('ws'); return true; });
-  // Per account: the restart guard and the raw-resume guard live in the hooks, so
-  // an automation account without them runs unguarded.
+  // Per account: the restart guard, the raw-resume guard and the unattended question
+  // refusal all live in the hooks, so an account without them runs unguarded.
   const unguarded = [];
   for (const target of hookTargets()) {
     check(`Claude Keep hooks (${target.id})`, () => {
