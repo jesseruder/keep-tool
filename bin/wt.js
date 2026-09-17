@@ -826,13 +826,15 @@ function claimedAt(worktree) {
 
 function gcWorktrees(options = {}) {
   const cfg = options.cfg || loadConfig();
-  // A tree that reaches the age checks below is already wt-managed, clean, fully
-  // landed, and used by no live session: its commits are on origin and recycling
-  // keeps its node_modules, so an age rule has nothing left to protect — it only
-  // holds the tree out of the pool, and an empty pool is why every `wt new` builds
-  // a directory from scratch. `--days N` remains as an explicit grace for browsing
-  // finished trees; the default is to return them.
-  const days = options.days === undefined ? 0 : Number(options.days);
+  // The old three-day default outlived the trees it governed: keep-tool turns over
+  // about nine worktrees a day, so nothing was ever old enough to recycle and the
+  // pool `wt new` claims from stayed empty. One day is enough to keep it supplied —
+  // supply only has to beat the pool cap, not the churn — while leaving a real
+  // window, because "unused" is weaker than it looks: liveAgentCwds only sees the
+  // cwd of processes named claude or codex, so a shell, an editor, a dev server or
+  // a build sitting in a finished tree is invisible to it, and recycling deletes
+  // that tree's ignored files and its landed branch.
+  const days = options.days === undefined ? 1 : Number(options.days);
   const keepFree = options.keepFree === undefined ? 2 : Number(options.keepFree);
   if (!Number.isFinite(days) || days < 0) die('--days must be a non-negative number');
   if (!Number.isInteger(keepFree) || keepFree < 0) die('--keep-free must be a non-negative integer');
@@ -923,6 +925,13 @@ function gcWorktrees(options = {}) {
       const { item } = assessment;
       if (!assessment.safe) {
         rows.push({ ...item, action: 'skip', reason: assessment.reason });
+      } else if (!assessment.wasFree && keepFree > 0) {
+        // Recycled moments ago by this same sweep. Returning a finished tree to the
+        // pool and destroying its directory are different decisions, and a scheduled
+        // sweep must not make both at once: a tree earns deletion by surviving a
+        // sweep as free. `--keep-free 0` asks for no pool at all, so there is nothing
+        // for such a tree to survive into and it goes now.
+        continue;
       } else if (deletionsNeeded > 0) {
         const liveNow = liveAgentCwds(options.deps || {});
         if (liveNow.some((cwd) => pathContains(cwd, item.path))) {

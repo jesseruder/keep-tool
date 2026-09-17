@@ -801,44 +801,86 @@ test('gc recycles only old landed worktrees and explains every safety skip', () 
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 
-test('gc returns a finished tree to the pool the same day, and --days still holds one back', () => {
+test('gc returns a day-old finished tree to the pool, and keeps today’s', () => {
   const f = fixture();
   try {
-    // Exactly the shape every landed agent session leaves behind: claimed minutes
-    // ago, its work already on origin, nothing running in it. Under the old
-    // three-day default these piled up and the free pool stayed empty, so every
-    // `wt new` built a directory and reinstalled from scratch.
+    // What every landed agent session leaves behind: work already on origin,
+    // nothing of its own left, nothing running in it. Under the old three-day
+    // default these outlived the sweep that was supposed to collect them, the pool
+    // stayed empty, and every `wt new` built a directory and reinstalled.
+    const yesterday = '2026-09-09T00:00:00Z';
     const finished = runCli(f, ['new', f.name, 'finished', '--no-install']).stdout.trim();
     write(path.join(finished, 'work.txt'), 'work\n');
     commitIn(finished, 'work');
     runCli(f, ['land', finished]);
+    ageHead(finished, yesterday);
+    ageClaim(finished, yesterday);
+    git(finished, 'push', '-q', '--force', 'origin', 'HEAD:main');
 
-    const held = wt.gcWorktrees({ cfg: f.cfg, days: 3, keepFree: 2, dryRun: true, deps: { liveCwds: [] } });
-    const heldRow = held.rows.find((row) => row.name === 'finished');
-    assert.equal(heldRow.action, 'skip', '--days is still an honoured grace when asked for');
-    assert.match(heldRow.reason, /newer than 3 day/);
+    const today = runCli(f, ['new', f.name, 'today', '--no-install']).stdout.trim();
+    const now = Date.parse('2026-09-10T12:00:00Z');
 
-    const swept = wt.gcWorktrees({ cfg: f.cfg, keepFree: 2, deps: { liveCwds: [] } });
-    const row = swept.rows.find((row) => row.name === 'finished');
-    assert.equal(row.action, 'recycle');
-    assert.equal(row.reason, 'clean, landed, and unused');
+    const swept = wt.gcWorktrees({ cfg: f.cfg, keepFree: 2, now, deps: { liveCwds: [] } });
+    const byName = new Map(swept.rows.map((row) => [row.name, row]));
+    assert.equal(byName.get('finished').action, 'recycle');
+    assert.match(byName.get('finished').reason, /clean, landed, unused, and at least 1 day/);
     assert.equal(fs.existsSync(path.join(finished, '.wt-free')), true, 'and it is back in the pool');
     assert.equal(fs.existsSync(path.join(finished, '.wt.json')), false, 'no longer claimed');
     assert.equal(git(finished, 'rev-parse', 'HEAD'), git(f.main, 'rev-parse', 'origin/main'), 'reset to origin');
-    assert.equal(fs.existsSync(path.join(finished, 'work.txt')), true, 'its landed work is there because origin has it');
 
-    // The safety rules are untouched: only the waiting was removed.
+    // A tree finished minutes ago keeps its day: "unused" only knows about the cwd
+    // of live claude/codex processes, so a shell or an editor sitting in a landed
+    // tree is invisible to the sweep, and recycling takes its ignored files with it.
+    assert.equal(byName.get('today').action, 'skip');
+    assert.match(byName.get('today').reason, /1 day\(s\)/);
+
+    // The safety rules are untouched: only the waiting was shortened.
     const busy = runCli(f, ['new', f.name, 'busy', '--no-install']).stdout.trim();
     write(path.join(busy, 'unlanded.txt'), 'unlanded\n');
     commitIn(busy, 'unlanded');
+    ageHead(busy, yesterday);
     const open = runCli(f, ['new', f.name, 'open', '--no-install']).stdout.trim();
     write(path.join(open, 'scratch.txt'), 'scratch\n');
+    ageClaim(open, yesterday);
     const inUse = runCli(f, ['new', f.name, 'in-use', '--no-install']).stdout.trim();
-    const guarded = wt.gcWorktrees({ cfg: f.cfg, keepFree: 2, dryRun: true, deps: { liveCwds: [inUse] } });
+    ageClaim(inUse, yesterday);
+    const guarded = wt.gcWorktrees({ cfg: f.cfg, keepFree: 2, now, dryRun: true, deps: { liveCwds: [inUse] } });
     const reasons = new Map(guarded.rows.map((row) => [row.name, row.reason]));
     assert.match(reasons.get('busy'), /ahead of origin\/main/);
     assert.match(reasons.get('open'), /dirty/);
     assert.match(reasons.get('in-use'), /live session cwd/);
+  } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test('gc never recycles and deletes the same tree in one sweep', () => {
+  const f = fixture();
+  try {
+    // Feeding the pool and destroying a directory are different decisions. Once
+    // finished trees became eligible on the day they landed, the pool cap turned
+    // "return them" into "delete almost all of them, tonight, unprompted".
+    const old = '2026-09-01T00:00:00Z';
+    const now = Date.parse('2026-09-10T00:00:00Z');
+    const names = ['one', 'two', 'three', 'four'];
+    const trees = names.map((name) => {
+      const tree = runCli(f, ['new', f.name, name, '--no-install']).stdout.trim();
+      ageClaim(tree, old);
+      return tree;
+    });
+    ageHead(f.main, old);
+    git(f.main, 'push', '-q', '--force', 'origin', 'main');
+    for (const tree of trees) git(tree, 'reset', '-q', '--hard', 'origin/main');
+
+    const first = wt.gcWorktrees({ cfg: f.cfg, keepFree: 2, now, deps: { liveCwds: [] } });
+    const actions = new Map(first.rows.map((row) => [row.name, row.action]));
+    assert.deepEqual(names.map((name) => actions.get(name)), ['recycle', 'recycle', 'recycle', 'recycle'],
+      'all four go back to the pool');
+    assert.equal(first.deleted, 0, 'and none is deleted in the sweep that freed it');
+    for (const tree of trees) assert.equal(fs.existsSync(tree), true);
+
+    // Having survived a sweep as free, the extras are deletable on the next one.
+    const second = wt.gcWorktrees({ cfg: f.cfg, keepFree: 2, now: now + 86400e3, deps: { liveCwds: [] } });
+    assert.equal(second.deleted, 2, 'trimmed to the pool limit, a cycle later');
+    assert.equal(trees.filter((tree) => fs.existsSync(tree)).length, 2);
   } finally { fs.rmSync(f.root, { recursive: true, force: true }); }
 });
 

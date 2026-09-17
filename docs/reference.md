@@ -1815,13 +1815,19 @@ whose directory contains no live agent cwd. It keeps two safe recycled trees per
 repository and deletes older extras; `--days` and `--keep-free` change those
 defaults.
 
-Recycling has no waiting period by default (`--days 0`). A tree that is clean,
-fully landed and unused has its commits on origin and keeps its `node_modules`
-through the recycle, so holding it back protects nothing and starves the free pool
-that `wt new` claims from — an empty pool is why a new worktree builds a directory
-and reinstalls from scratch. `--days N` reinstates a grace when you want finished
-trees left around to browse. The safety rules are unchanged: dirty, unlanded, and
-in-use trees are never touched, whatever `--days` says. `--dry-run` prints the same action
+The default grace is one day, not three. Three outlived the trees it governed —
+keep-tool turns over roughly nine worktrees a day, so none was ever old enough to
+collect, the pool stayed empty, and every `wt new` built a directory and
+reinstalled from scratch. Supply only has to beat the pool cap, so a day is
+plenty, and it leaves a real window: "unused" means no live `claude` or `codex`
+process has its cwd in the tree, which a shell, an editor, a dev server or a build
+sitting in a finished tree will not trip, and recycling takes that tree's ignored
+files and its landed branch with it. `--days N` sets a longer grace.
+
+A sweep never both frees a tree and deletes it. A newly recycled tree goes into
+the pool and becomes eligible for deletion only on a later sweep, so the directory
+outlives its branch by a cycle. `--keep-free 0` asks for no pool at all, and there
+a freed tree has nothing to survive into, so it is removed at once. `--dry-run` prints the same action
 table without changing anything. `keep serve` runs this sweep daily; set
 `KEEP_WT_GC=0` to disable it.
 
