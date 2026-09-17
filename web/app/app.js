@@ -334,6 +334,20 @@ function retainedSelectionItem(item) {
     item = sessionItem('running', entity.session, item.pane);
   }
   const session = sessionFor(item);
+  // An agent's session is listed once, by its row under Agents: triage marks that
+  // row as the selection instead, so a retained row here would be a second
+  // listing of the same pane - and an invisible last queue item for j/k and the
+  // number keys to land on. The pane stand-in that brought us here has nothing
+  // left to hand over to, so it is spent.
+  //
+  // This is triage.js's hiddenFromRunning() test, spelled out for the same reason
+  // runningItems() spells it out: bin/session-history.test.js evaluates this
+  // function's source text in a bare vm context, where a bare identifier from
+  // another module is not defined.
+  if (session?.reviewer || session?.agentName) {
+    if (state.paneTarget && state.paneTarget.pane === item?.pane) state.paneTarget = null;
+    return null;
+  }
   if (state.historyTarget?.sessionId && state.historyTarget.sessionId === item?.sessionId && matchesTriageFilter(item)) return session
     ? sessionItem('recent', session) : { ...state.historyTarget, kind: 'recent', pane: null, state: 'exited' };
   return session && triageVisible(item) ? sessionItem('recent', session) : null;

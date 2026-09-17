@@ -14,13 +14,18 @@ import { RENAMED_HINT, installRenameControls, isEditing, renameButtonsHTML } fro
 
 const summaryCache = new Map(); // session id -> { text, fetchedAt, mtime, fresh }
 const summaryInflight = new Map();
-// Agent name -> the last feed page fetched for it. Only an agent that has been
-// opened has one; /api/state carries the badge and the last event for every row,
-// so a listed agent nobody is watching costs no request.
+// Agent name -> `{ events, newest, readAt, misses }`: the last page read for an
+// agent and what that read did. Only an agent that has been opened has one;
+// /api/state carries the badge and the last event for every row, so a listed
+// agent nobody is watching costs no request. A read that fails keeps the page in
+// hand - an empty log is a lie about an agent that has events - and `misses`
+// counts the reads that brought nothing new, so an unreadable feed backs off
+// instead of being asked for on every poll.
 const agentFeeds = new Map();
-const agentFeedFetchedAt = new Map();
 const agentFeedInflight = new Set();
 const LOG_EVENTS = 20;
+const FEED_RETRY_MS = 5e3;
+const FEED_RETRY_MAX_MS = 60e3;
 
 // An agent's session is not a working session. It keeps the same four controls
 // off that the reviewer's does: transferring, handing off, restarting or
@@ -85,15 +90,56 @@ export function agentLogHTML(ctx, events) {
   return `<div class="alog-head">Log</div>${rows || '<div class="aevent muted">No events yet.</div>'}`;
 }
 
-// The agent whose work the stage is showing, or null. A pane is the surer match -
-// it is the terminal actually on screen - and the session id catches an agent
-// whose pane is gone, where the stage shows its transcript instead.
+// The agent whose work the stage is showing, or null. The pane is asked first,
+// across every agent, because it is the terminal actually on screen: a record
+// that still names a session an in-place restart has moved on from must not beat
+// the agent that owns the pane. Only then does the session id answer, for an
+// agent whose pane is gone and whose transcript the stage is showing instead.
 export function agentForStage(ctx, item, session) {
   if (!item) return null;
+  const agents = ctx.data?.agents || [];
   const pane = item.pane || '';
   const sessionId = item.sessionId || session?.id || '';
-  return (ctx.data?.agents || []).find((agent) => (pane && agent.session?.pane === pane)
-    || (sessionId && agent.session?.id === sessionId)) || null;
+  return (pane && agents.find((agent) => agent.session?.pane === pane))
+    || (sessionId && agents.find((agent) => agent.session?.id === sessionId))
+    || null;
+}
+
+// The item the stage renders for an agent: its own session, rebuilt from
+// /api/state on every render the way a queue row is, so the heading, the brief
+// and the actions stay the session's own instead of the pane stand-in
+// openReviewPane left behind. An agent whose session /api/state does not carry
+// keeps that stand-in, which is all there is to show.
+export function agentStageItem(ctx, agent, current = null) {
+  const session = (ctx.data?.sessions || []).find((candidate) => candidate.id === agent?.session?.id);
+  if (!session) return current;
+  const pane = session.pane || agent.session?.pane || current?.pane || null;
+  return {
+    kind: pane && ctx.paneMap?.().get(pane)?.alive ? 'running' : 'recent',
+    sessionId: session.id, num: session.num, pane, project: session.project, title: session.title,
+    taskId: session.taskId || undefined, since: session.mtime, state: session.state,
+  };
+}
+
+// Where the queue's selection sits and what the stage renders for it.
+//
+// An agent is selected by its Agents row and by nothing else. Its session is not
+// a queue item: app.js's retainedSelectionItem refuses to rebuild a retained row
+// for one, so `items` never holds the pane stand-in openReviewPane leaves behind,
+// and the index is cleared here so no ordinary row can claim the selection at the
+// same time - if the same session is also listed under Recent, the Agents row
+// wins and that row is left unmarked. With no index, j/k start again from the top
+// of the queue and the number keys have nothing invisible to land on.
+export function queueSelection(ctx, items, { current, selectedKey, fallback = 0, focusMode = false } = {}) {
+  const agent = focusMode ? null : agentForStage(ctx, current, ctx.sessionFor(current));
+  if (agent) return { agent, selected: -1, selectedKey: null, stageItem: agentStageItem(ctx, agent, current) };
+  if (focusMode && !current) return { agent: null, selected: -1, selectedKey: null, stageItem: null };
+  const selected = selectionIndex(items, selectedKey, current, fallback, ctx.itemKey, ctx.triageKey);
+  return {
+    agent: null, selected,
+    selectedKey: items[selected] ? ctx.triageKey(items[selected]) : null,
+    stageItem: items[selected] || null,
+  };
 }
 
 // The log column beside the stage terminal: who is working, what the fleet last
@@ -109,40 +155,64 @@ export function agentStageLogHTML(ctx, agent, events, collapsed = false) {
     <div class="salog-body">${agentLogHTML(ctx, events)}</div>`;
 }
 
-// Opening a row is the acknowledgement: the feed is marked seen and fetched.
-// Neither failure is worth a toast storm on a background refresh, so a feed that
-// cannot be read renders as an empty one.
-export async function openAgentFeed(ctx, name) {
-  agentFeedFetchedAt.set(name, Date.now());
-  try { await api.markAgentSeen(name); } catch {}
-  let events = [];
-  try { events = (await api.getAgentEvents(name, LOG_EVENTS))?.events || []; } catch {}
-  agentFeeds.set(name, events);
-  ctx.refresh();
-  return events;
-}
-
-export function agentFeed(name) { return agentFeeds.get(name) || null; }
-
 const eventAt = (at) => (typeof at === 'number' ? at : Date.parse(at) || 0);
 
-// The log beside the stage is not a one-off read: the agent keeps working while
-// Owner watches its pane. /api/state carries only the last event, so a feed whose
-// newest entry is older than that one is behind and is re-read - at most once
-// every few seconds, and only for the agent the stage is showing.
-function ensureAgentFeed(ctx, agent) {
-  const name = agent?.name;
-  if (!name || agentFeedInflight.has(name)) return;
-  const events = agentFeeds.get(name);
-  if (events) {
-    const fetchedAt = agentFeedFetchedAt.get(name) || 0;
-    // A page that came back empty is compared against the read itself: an agent
-    // whose feed cannot be read must not be re-read on every poll for ever.
-    const newest = events.length ? eventAt(events[0].at) : fetchedAt;
-    if (!(eventAt(agent.lastEvent?.at) > newest) || Date.now() - fetchedAt < 5e3) return;
-  }
+// What a finished read leaves behind. A refused read keeps the page in hand; a
+// page whose newest event is no newer than the one in hand - the same page again,
+// an empty one, or a late answer to an earlier read - is not news and is never
+// written over a newer one, so a slow response cannot roll the log back.
+function recordAgentFeed(name, events) {
+  const previous = agentFeeds.get(name) || null;
+  const newest = events ? eventAt(events[0]?.at) : null;
+  const fresh = Boolean(events) && (!previous?.events || newest > previous.newest);
+  agentFeeds.set(name, {
+    events: fresh ? events : previous?.events || null,
+    newest: fresh ? newest : previous?.newest ?? null,
+    readAt: Date.now(),
+    misses: fresh ? 0 : (previous?.misses || 0) + 1,
+  });
+}
+
+// Opening a row is the acknowledgement: the feed is marked seen and read. Neither
+// failure is worth a toast storm on a background refresh, so a read that fails
+// leaves the last page standing and is retried by `agentFeedDue` instead.
+export async function openAgentFeed(ctx, name) {
+  try { await api.markAgentSeen(name); } catch {}
+  let events = null;
+  try { events = (await api.getAgentEvents(name, LOG_EVENTS))?.events || []; } catch {}
+  recordAgentFeed(name, events);
+  ctx.refresh();
+  return agentFeed(name) || [];
+}
+
+export function agentFeed(name) { return agentFeeds.get(name)?.events || null; }
+
+// Whether the agent on the stage needs its log read again: nothing in hand, every
+// read so far refused, or a page /api/state's last event has outrun. A read that
+// brings nothing new doubles the wait up to a minute, so a feed that cannot be
+// read - or one whose file is gone while the record still remembers an event -
+// costs one request now and then rather than one per poll.
+export function agentFeedDue(agent, feed, now = Date.now()) {
+  if (!feed) return true;
+  const wait = Math.min(FEED_RETRY_MS * 2 ** Math.max(0, (feed.misses || 0) - 1), FEED_RETRY_MAX_MS);
+  if (feed.events && eventAt(agent?.lastEvent?.at) <= (feed.newest || 0)) return false;
+  return now - (feed.readAt || 0) >= wait;
+}
+
+// One read per agent at a time, and the only way in: a click and the render it
+// causes must not each start their own seen/events round trip, and two reads in
+// flight can land out of order. Whoever asks first owns the read; the rest get
+// its result on the refresh it ends with, and are told so with a null.
+export function readAgentFeed(ctx, name) {
+  if (!name || agentFeedInflight.has(name)) return null;
   agentFeedInflight.add(name);
-  void openAgentFeed(ctx, name).finally(() => agentFeedInflight.delete(name));
+  return openAgentFeed(ctx, name).finally(() => agentFeedInflight.delete(name));
+}
+
+// The log beside the stage is not a one-off read: the agent keeps working while
+// Owner watches its pane.
+function ensureAgentFeed(ctx, agent) {
+  if (agent?.name && agentFeedDue(agent, agentFeeds.get(agent.name))) void readAgentFeed(ctx, agent.name);
 }
 
 // Clicking an Agents row is "show me this agent": its live pane goes on the
@@ -152,7 +222,7 @@ function ensureAgentFeed(ctx, agent) {
 function openAgent(ctx, name) {
   const agent = (ctx.data.agents || []).find((candidate) => candidate.name === name);
   if (!agent) return;
-  void openAgentFeed(ctx, name);
+  void readAgentFeed(ctx, name);
   const live = agentLivePane(ctx, agent);
   if (live) { ctx.openReviewPane(live); return; }
   if (agent.session?.id) { ctx.openReviewSession?.(agent.session.id); return; }
@@ -244,9 +314,12 @@ function shellProject(ctx) {
   const projects = ctx.knownProjects();
   const fallback = projects.find((project) => project.key === 'keep') || ctx.projectOf('~/keep');
   if (ctx.state.filter) return projects.find((project) => project.key === ctx.state.filter) || fallback;
-  // The rail renders before the queue reconciles the numeric index, so trust the key.
+  // The rail renders before the queue reconciles the numeric index, so trust the
+  // key. A selection with no row of its own - an agent's, or focus mode's - has
+  // no index either, so the stage's own item answers for it.
   const items = ctx.triageItems();
-  const item = (ctx.state.selectedKey && items.find((candidate) => ctx.triageKey(candidate) === ctx.state.selectedKey)) || items[ctx.state.selected];
+  const item = (ctx.state.selectedKey && items.find((candidate) => ctx.triageKey(candidate) === ctx.state.selectedKey))
+    || items[ctx.state.selected] || ctx.state.currentItem;
   const projectPath = item?.project || ctx.sessionFor(item)?.project;
   if (!projectPath) return fallback;
   const selected = ctx.projectOf(projectPath);
@@ -361,14 +434,13 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
   head.querySelector('.collapse').onclick = () => ctx.toggleCollapsed('queue');
   strip.innerHTML = `<button class="collapse" aria-expanded="false" title="Expand (⌘\\)">›</button><span class="strip-label"><b class="${waiting.length ? 'hot' : ''}">${ctx.esc(waiting.length)}</b> waiting</span>`;
   strip.querySelector('.collapse').addEventListener('click', () => ctx.toggleCollapsed('queue'));
-  ctx.state.selected = ctx.state.focusMode && !ctx.state.currentItem ? -1
-    : selectionIndex(active, ctx.state.selectedKey, ctx.state.currentItem, ctx.state.selected, ctx.itemKey, ctx.triageKey);
-  ctx.state.selectedKey = active[ctx.state.selected] ? ctx.triageKey(active[ctx.state.selected]) : null;
-  // An agent's pane on the stage is selected by its Agents row, not by a row of
-  // its own: the row is the only listing an agent has, and a second one for the
-  // same terminal would be a duplicate of it.
-  const selectedItem = active[ctx.state.selected];
-  const selectedAgent = agentForStage(ctx, selectedItem, ctx.sessionFor(selectedItem));
+  const selection = queueSelection(ctx, active, {
+    current: ctx.state.currentItem, selectedKey: ctx.state.selectedKey,
+    fallback: ctx.state.selected, focusMode: ctx.state.focusMode,
+  });
+  ctx.state.selected = selection.selected;
+  ctx.state.selectedKey = selection.selectedKey;
+  const selectedAgent = selection.agent;
   let selectedAgentRow = null;
   const existing = new Map([...list.querySelectorAll(':scope > .qitem')].map((row) => [row.dataset.key, row]));
   const retained = new Set();
@@ -441,9 +513,7 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
   const recentHead = addGroup(`${ctx.state.showRecent ? '▾' : '▸'} Recent · ${ctx.esc(recent.length)}`, 'qhead qgroup qtoggle', 'button');
   recentHead.addEventListener('click', () => ctx.toggleRecent());
   if (ctx.state.showRecent) addRows(recent, waiting.length + shownRunning.length + shownPinned.length);
-  // The retained row keeps the stage's session selected when it has left every
-  // group - except an agent's, which its Agents row above carries instead.
-  if (retainedSelection.length && !agentForStage(ctx, retainedSelection[0], ctx.sessionFor(retainedSelection[0]))) {
+  if (retainedSelection.length) {
     addGroup('Selected session');
     addRows(retainedSelection, active.length - retainedSelection.length);
   }
@@ -472,7 +542,10 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
     (selectedRow || selectedAgentRow)?.scrollIntoView({ block: 'nearest' });
     ctx.state.ensureSelectedVisible = false;
   }
-  return active;
+  // The stage renders `stageItem`, not `active[selected]`: an agent has no row
+  // of its own, so its session is handed over here the way focus mode hands over
+  // the item it is holding.
+  return { active, stageItem: selection.stageItem };
 }
 
 function briefHTML(ctx, item, session) {
@@ -530,10 +603,10 @@ export function emptyStateCounts(ctx, running, pinned) {
     ...(agentCount ? [`${agentCount} agent${agentCount === 1 ? '' : 's'}`] : [])].join(' · ');
 }
 
-function renderStage(ctx, active, focusItem, running, pinned) {
+function renderStage(ctx, queue, focusItem, running, pinned) {
   const item = ctx.state.focusMode
-    ? active.find((candidate) => focusItem && ctx.itemKey(candidate) === ctx.itemKey(focusItem)) || focusItem
-    : active[ctx.state.selected];
+    ? queue.active.find((candidate) => focusItem && ctx.itemKey(candidate) === ctx.itemKey(focusItem)) || focusItem
+    : queue.stageItem;
   const stage = document.querySelector('#stage');
   // Check before replacing the stage: its find bar may be about to detach.
   const focusedElement = document.activeElement;
@@ -764,6 +837,6 @@ export function renderTriage(ctx) {
     ctx.state.currentItem = focusItem || null;
   }
   renderRail(ctx, [...items, ...ctx.runningItems(), ...ctx.pinnedItems()]);
-  const active = renderQueue(ctx, waiting, running, pinned, recent, dismissed);
-  renderStage(ctx, active, focusItem, running, pinned);
+  const queue = renderQueue(ctx, waiting, running, pinned, recent, dismissed);
+  renderStage(ctx, queue, focusItem, running, pinned);
 }

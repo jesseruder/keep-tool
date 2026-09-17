@@ -8,12 +8,20 @@ globalThis.location = new URL('http://localhost:7777/app/');
 const esc = (value) => String(value == null ? '' : value)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
+// app.js's own key helpers, which queueSelection() reads off ctx.
+const itemKey = (item) => item?.key || item?.sessionId || item?.taskId || item?.pane
+  || `${item?.kind}:${item?.title}:${item?.since}`;
+const triageKey = (item) => `${['running', 'pinned', 'recent'].includes(item.kind) ? item.kind : 'waiting'}:${itemKey(item)}`;
+
 function ctxFor(data = {}, detail = { status: 'ready', value: null, error: '' }) {
   const refreshes = [];
   const ensured = [];
   const state = { sessions: [], panes: [], agents: [], ...data };
   return {
     esc,
+    itemKey,
+    triageKey,
+    sessionFor: (item) => (item?.sessionId ? (state.sessions || []).find((session) => session.id === item.sessionId) : undefined),
     rel: (at) => `${Math.round((1000 - Number(at || 0)) / 1000)}s ago`,
     data: state,
     state: {},
@@ -114,6 +122,16 @@ test('the stage knows whose work it is showing, by pane or by session', async ()
   assert.equal(agentForStage(ctx, { kind: 'recent', pane: null }, { id: 'sess-1' })?.name, 'sandboxes',
     'the stage session answers for an item that carries no id of its own');
 
+  // A record an in-place restart has moved on from still names the old session.
+  // The pane is asked first, across every agent, so the stale record listed ahead
+  // of the one that owns the pane cannot answer for it.
+  const stale = { ...REVIEWER_ROW, name: 'stale', session: { id: 'sess-1', pane: 'pane-old' } };
+  const restarted = ctxFor({ agents: [stale, QUIET_ROW] });
+  assert.equal(agentForStage(restarted, { kind: 'running', pane: 'pane-1', sessionId: 'sess-1' })?.name, 'sandboxes',
+    'the agent that owns the pane on the stage wins over an earlier record naming the same session');
+  assert.equal(agentForStage(restarted, { kind: 'recent', pane: null, sessionId: 'sess-1' })?.name, 'stale',
+    'with no pane to go on, the session id answers in listed order');
+
   assert.equal(agentForStage(ctx, { kind: 'running', pane: 'pane-9', sessionId: 'sess-9' }), null);
   assert.equal(agentForStage(ctx, null), null, 'an empty stage belongs to nobody');
   assert.equal(agentForStage(ctxFor(), { kind: 'running', pane: 'pane-1' }), null, 'no agents, no match');
@@ -153,24 +171,54 @@ test('the log beside the stage terminal heads the agent and lists its feed', asy
   assert.equal(collapsed.includes('raise the cap'), false);
 });
 
-// The click handler and the queue's row placement need a document; what can be
-// tested without one is the rule they both follow, and that the queue asks for it.
-test('an agent’s pane is carried by its Agents row, never by a second row', async () => {
-  const fs = await import('node:fs');
-  const { agentForStage } = await import('./triage.js');
-  const ctx = ctxFor({ agents: [QUIET_ROW] });
-  // What openReviewPane leaves behind for the agent's pane: a synthetic running
-  // item, and then the session-backed row retainSelection would rebuild from it.
-  assert.equal(agentForStage(ctx, { kind: 'running', pane: 'pane-1', title: 'sandboxes' })?.name, 'sandboxes');
-  assert.equal(agentForStage(ctx, { kind: 'recent', sessionId: 'sess-1', pane: 'pane-1' })?.name, 'sandboxes');
+test('an agent’s pane is carried by its Agents row, never by a queue index', async () => {
+  const { queueSelection } = await import('./triage.js');
+  const agentSession = { id: 'sess-1', pane: 'pane-1', project: '~/keep', title: 'sandboxes agent',
+    state: 'running', mtime: 10, agentName: 'sandboxes' };
+  const ctx = ctxFor({
+    agents: [QUIET_ROW],
+    sessions: [agentSession, { id: 'sess-2', pane: 'pane-2', project: '~/keep', title: 'a card', state: 'waiting' }],
+    panes: [{ id: 'pane-1', alive: true }, { id: 'pane-2', alive: true }],
+  });
+  const waiting = { kind: 'question', sessionId: 'sess-2', pane: 'pane-2', title: 'a card' };
+  const recentAgentRow = { kind: 'recent', sessionId: 'sess-1', pane: 'pane-1', title: 'sandboxes agent' };
 
-  const source = fs.readFileSync(new URL('./triage.js', import.meta.url), 'utf8');
-  const queue = source.slice(source.indexOf('function renderQueue('), source.indexOf('function briefHTML('));
-  assert.match(queue, /if \(retainedSelection\.length && !agentForStage\(/,
-    'the "Selected session" group is skipped when the selection is an agent’s');
-  assert.match(queue, /qitem k-agent\$\{selected \? ' sel' : ''\}/,
-    'the Agents row is the one marked selected instead');
-  assert.equal(queue.includes('ctx.mount('), false, 'the queue mounts no agent terminal of its own');
+  // What openReviewPane leaves behind when an Agents row is clicked: a synthetic
+  // running item for the pane. No row lists it, and none is asked to.
+  const opened = queueSelection(ctx, [waiting], { current: { kind: 'running', pane: 'pane-1' }, selectedKey: 'running:pane-1' });
+  assert.equal(opened.agent?.name, 'sandboxes');
+  assert.equal(opened.selected, -1, 'no queue index, so j/k start from the top and 1-9 have nothing to land on');
+  assert.equal(opened.selectedKey, null);
+  assert.deepEqual({ sessionId: opened.stageItem.sessionId, pane: opened.stageItem.pane, kind: opened.stageItem.kind },
+    { sessionId: 'sess-1', pane: 'pane-1', kind: 'running' },
+    'the stage renders the agent’s own session, not the pane stand-in');
+  assert.equal(opened.stageItem.title, 'sandboxes agent');
+
+  // The same session listed under Recent must not take the selection from the
+  // Agents row: exactly one of them is marked, and it is the Agents row.
+  const listed = queueSelection(ctx, [waiting, recentAgentRow], { current: recentAgentRow, selectedKey: 'recent:sess-1' });
+  assert.equal(listed.agent?.name, 'sandboxes');
+  assert.equal(listed.selected, -1);
+  assert.equal(listed.selectedKey, null);
+
+  // A pane the host no longer lists is still the agent's; the stage shows its
+  // transcript, and the item says so.
+  const dead = ctxFor({ agents: [QUIET_ROW], sessions: [agentSession], panes: [{ id: 'pane-1', alive: false }] });
+  assert.equal(dead.data.agents.length, 1);
+  assert.equal(queueSelection(dead, [], { current: { kind: 'running', pane: 'pane-1' } }).stageItem.kind, 'recent');
+
+  // An ordinary selection is untouched: the row keeps its index and the stage
+  // keeps rendering it.
+  const ordinary = queueSelection(ctx, [waiting, recentAgentRow], { current: waiting, selectedKey: 'waiting:sess-2' });
+  assert.equal(ordinary.agent, null);
+  assert.equal(ordinary.selected, 0);
+  assert.equal(ordinary.selectedKey, 'waiting:sess-2');
+  assert.equal(ordinary.stageItem, waiting);
+
+  // Focus mode holds its own item and never lands on an agent.
+  assert.deepEqual(queueSelection(ctx, [waiting], { current: null, focusMode: true }),
+    { agent: null, selected: -1, selectedKey: null, stageItem: null });
+  assert.equal(queueSelection(ctx, [waiting], { current: { kind: 'running', pane: 'pane-1' }, focusMode: true }).agent, null);
 });
 
 test('opening a row marks the feed seen and then reads it', async () => {
@@ -194,11 +242,79 @@ test('opening a row marks the feed seen and then reads it', async () => {
   assert.deepEqual(agentFeed('sandboxes'), events);
   assert.equal(ctx.refreshes.length, 1);
 
-  // A daemon that refuses either call leaves an empty feed, not an exception.
+  // A daemon that refuses either call is not an exception, and not an empty log
+  // either: the page in hand stands until a read brings something back.
   globalThis.fetch = async () => new Response(JSON.stringify({ error: 'no such agent' }), {
     status: 404, headers: { 'content-type': 'application/json' },
   });
-  assert.deepEqual(await openAgentFeed(ctx, 'sandboxes'), []);
+  assert.deepEqual(await openAgentFeed(ctx, 'sandboxes'), events, 'a refused read keeps the last good page');
+  assert.deepEqual(agentFeed('sandboxes'), events);
+
+  // An agent whose very first read fails has no page at all, and says so rather
+  // than claiming the agent has no events.
+  assert.deepEqual(await openAgentFeed(ctx, 'never-read'), []);
+  assert.equal(agentFeed('never-read'), null, 'a failed read is not a read that returned nothing');
+});
+
+test('a feed is re-read when it falls behind, and backs off when it brings nothing', async () => {
+  const { agentFeedDue } = await import('./triage.js');
+  const quiet = { ...QUIET_ROW, lastEvent: null };
+  const busy = { ...QUIET_ROW, lastEvent: { at: 900, kind: 'diagnosed', text: 'host pool is full' } };
+  const page = (at, misses = 0, readAt = 1000) => ({ events: [{ at }], newest: at, readAt, misses });
+
+  assert.equal(agentFeedDue(busy, null), true, 'nothing in hand is always due');
+  assert.equal(agentFeedDue(busy, page(900), 99e3), false, 'a page that has the last event is not re-read');
+  assert.equal(agentFeedDue(quiet, { events: [], newest: 0, readAt: 1000, misses: 0 }, 99e3), false,
+    'an agent with no events has nothing to re-read');
+  assert.equal(agentFeedDue(busy, page(100, 0, 1000), 4e3), false, 'behind, but inside the throttle');
+  assert.equal(agentFeedDue(busy, page(100, 0, 1000), 6.1e3), true, 'behind, and the throttle has passed');
+
+  // A read that failed, or one that came back with nothing new, doubles the wait
+  // up to a minute: an unreadable feed costs one request now and then, never one
+  // per poll, and it is never given up on.
+  const failed = { events: null, newest: null, readAt: 1000, misses: 3 };
+  assert.equal(agentFeedDue(busy, failed, 1000 + 19e3), false);
+  assert.equal(agentFeedDue(busy, failed, 1000 + 21e3), true);
+  assert.equal(agentFeedDue(busy, { ...failed, misses: 99 }, 1000 + 59e3), false, 'the wait is capped');
+  assert.equal(agentFeedDue(busy, { ...failed, misses: 99 }, 1000 + 61e3), true, 'and it is only a cap, not a stop');
+  // An empty page an agent's last event has outrun is the same case: the feed
+  // file may be gone while the record still remembers. It backs off; it does not
+  // spin.
+  assert.equal(agentFeedDue(busy, { events: [], newest: 0, readAt: 1000, misses: 4 }, 1000 + 39e3), false);
+  assert.equal(agentFeedDue(busy, { events: [], newest: 0, readAt: 1000, misses: 4 }, 1000 + 41e3), true);
+});
+
+test('a second read for the same agent waits for the first, and a late one cannot roll the log back', async () => {
+  const calls = [];
+  let events = [{ at: 500, kind: 'diagnosed', card: 'inc-one', text: 'host pool is full' }];
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push(`${options.method || 'GET'} ${String(url).includes('/events') ? 'events' : 'seen'}`);
+    if (String(url).includes('/events')) await gate;
+    return new Response(JSON.stringify({ ok: true, name: 'sandboxes', events }),
+      { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  const { readAgentFeed, openAgentFeed, agentFeed } = await import(`./triage.js?inflight=${Date.now()}`);
+  const ctx = ctxFor({ agents: [QUIET_ROW] });
+
+  // openAgent and the render it causes both ask; one round trip answers both.
+  const first = readAgentFeed(ctx, 'sandboxes');
+  assert.equal(readAgentFeed(ctx, 'sandboxes'), null, 'the second ask joins the read already in flight');
+  release();
+  await first;
+  assert.deepEqual(calls, ['POST seen', 'GET events'], 'one seen/events round trip, not two');
+  assert.deepEqual(agentFeed('sandboxes').map((event) => event.at), [500]);
+
+  // A late answer carrying an older page is not news; the newer page stands.
+  const newer = [{ at: 900, kind: 'diagnosed', text: 'pool drained' }];
+  events = newer;
+  await openAgentFeed(ctx, 'sandboxes');
+  assert.deepEqual(agentFeed('sandboxes').map((event) => event.at), [900]);
+  events = [{ at: 500, kind: 'diagnosed', card: 'inc-one', text: 'host pool is full' }];
+  await openAgentFeed(ctx, 'sandboxes');
+  assert.deepEqual(agentFeed('sandboxes').map((event) => event.at), [900],
+    'an older page is a late answer to an earlier read, never news');
 });
 
 test('an agent’s session loses the four controls and is not listed under Running', async () => {

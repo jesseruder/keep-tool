@@ -1183,12 +1183,21 @@ never a second view of the same PTY. An agent whose pane is gone opens as its se
 instead (`ctx.openReviewSession`), where the stage shows the same transcript tail a
 Running row falls back to; an agent with neither says so in a toast.
 
-The selection then belongs to the Agents row itself: the row is marked `.sel`, and the
-"Selected session" row `retainSelection` would otherwise append for that pane or session
-is skipped, so an agent is listed once and in one place. `agentForStage(ctx, item,
-session)` decides both — it matches the stage's pane against `agent.session.pane` first,
-because that is the terminal actually on screen, and falls back to the session id for an
-agent whose pane is gone.
+The selection then belongs to the Agents row itself. An agent's session is not a queue
+item at all: `retainedSelectionItem` refuses to rebuild a retained row for a session that
+is an agent's or the reviewer's (and spends the pane stand-in `openReviewPane` left
+behind), so neither `triageItems()` nor the queue's own list ever carries an invisible
+last item for `j`/`k` or the number keys to land on. `queueSelection` then clears the
+index: the Agents row is the only row marked `.sel`, and if the same session is also
+listed under Recent that row stays unmarked — the Agents row wins. With no index, `j`/`k`
+start again from the top of the queue, and the stage renders `stageItem` instead of
+`active[selected]`, the way focus mode renders the item it is holding.
+`agentForStage(ctx, item, session)` decides whose work is on the stage: it matches the
+pane against `agent.session.pane` first across every agent, because that is the terminal
+actually on screen and a record an in-place restart has moved on from may still name the
+session, and only then falls back to the session id for an agent whose pane is gone.
+`agentStageItem` rebuilds that session into the stage's item on every render, so the
+heading, brief and actions are the session's own rather than a stale stand-in.
 
 Beside that terminal, `.stage-body` is a row holding `.stage-terminal` and an `<aside
 class="stage-agent-log">`: the agent's **Log** — the last 20 events, newest first — under
@@ -1196,10 +1205,18 @@ a head naming the agent, its lifecycle and its last event. The aside is part of 
 skeleton and is only hidden, never added or removed, so a log appearing cannot rebuild the
 host the terminal is mounted in; xterm's own `ResizeObserver` refits the terminal when the
 column appears, collapses or goes away. One control in its head collapses it to that
-control alone, remembered in `localStorage` under `keep-agent-log-collapsed`. While an
-agent is on the stage its feed is re-read whenever `/api/state`'s last event is newer than
-the page in hand, at most once every five seconds; a page that came back empty is compared
-against the read itself, so a feed that cannot be read is not re-read on every poll.
+control alone, remembered in `localStorage` under `keep-agent-log-collapsed`.
+
+Reads all go through `readAgentFeed`, which allows one per agent at a time: a click and
+the render it causes must not each post `seen` and read the feed, and two reads in flight
+can land out of order. `agentFeedDue` decides when to read again — nothing in hand, every
+read so far refused, or a page `/api/state`'s last event has outrun — and a read that
+brings nothing new (a refusal, the same page again, or an empty one while the record still
+remembers an event) doubles the wait from five seconds up to a minute, so an unreadable
+feed costs one request now and then rather than one per poll, and is never given up on. A
+refused read keeps the page in hand rather than caching an empty one: an empty log is a lie
+about an agent that has events. A page whose newest event is no newer than the one in hand
+is never written over it, so a late answer to an earlier read cannot roll the log back.
 
 The empty-state counts
 read "N running · N pinned · N agents", the last only when there is one. Agents are never

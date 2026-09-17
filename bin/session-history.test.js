@@ -92,6 +92,40 @@ test('a missing shell selection is not fabricated as an empty history row', () =
   assert.equal(c.retainedSelectionItem({ kind: 'recent', sessionId: 'gone' }).sessionId, 'gone');
 });
 
+// An agent is listed by its Agents row alone. A retained row for its session
+// would be a second listing of the same pane, and an invisible last queue item
+// for j/k and the number keys to land on.
+test('an agent’s session is never retained as a queue row', () => {
+  const agentSession = { id: 'sess-1', agentName: 'sandboxes' };
+  const context = (session) => {
+    const state = { historyTarget: null, paneTarget: { pane: 'pane-1', kind: 'running' } };
+    const c = vm.createContext({ state, isClosingSession: () => false, sessionFor: () => session,
+      matchesTriageFilter: () => true, triageVisible: () => true,
+      paneMap: () => new Map([['pane-1', { id: 'pane-1', alive: true }]]),
+      entityForPane: () => ({ session, project: '~/keep', title: 'sandboxes', state: 'running' }),
+      sessionItem: (kind, from, pane) => ({ kind, sessionId: from.id, pane }) });
+    vm.runInContext(functionText('retainedSelectionItem', '\nfunction triageItems'), c);
+    return { state, c };
+  };
+
+  // The pane stand-in openReviewPane leaves behind, and the session-backed row it
+  // would otherwise hand over to.
+  const opened = context(agentSession);
+  assert.equal(opened.c.retainedSelectionItem({ kind: 'running', pane: 'pane-1' }), null);
+  assert.equal(opened.state.paneTarget, null, 'the stand-in has nothing left to hand over to');
+  const listed = context(agentSession);
+  assert.equal(listed.c.retainedSelectionItem({ kind: 'recent', sessionId: 'sess-1', pane: 'pane-1' }), null);
+
+  // The reviewer's session is the same case, and carries `reviewer` instead.
+  const reviewer = context({ id: 'r1', reviewer: true });
+  assert.equal(reviewer.c.retainedSelectionItem({ kind: 'recent', sessionId: 'r1', pane: 'pane-1' }), null);
+
+  // A working session still gets its retained row.
+  const working = context({ id: 'sess-2' });
+  assert.deepEqual(working.c.retainedSelectionItem({ kind: 'recent', sessionId: 'sess-2', pane: 'pane-1' }),
+    { kind: 'recent', sessionId: 'sess-2', pane: undefined });
+});
+
 test('Close follows Dismiss and acts immediately without a confirmation', () => {
   const triage = fs.readFileSync(path.join(__dirname, '../web/app/triage.js'), 'utf8');
   const header = triage.split('\n').find((line) => line.includes("querySelector('.quick-actions')"));
