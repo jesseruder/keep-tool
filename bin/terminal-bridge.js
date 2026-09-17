@@ -6,6 +6,17 @@ const RECONNECT_WINDOW_MS = Number(process.env.KEEP_CONSOLE_RECONNECT_MS) || 60_
 const MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
 const MAX_REPLY_BYTES = 4 * 1024;
 
+// xterm.js answers the terminal's own queries and reports focus changes without
+// anybody touching the keyboard, so those bytes are not a person. Strip the escape
+// sequences and focus reports; whatever is left — a letter, Enter, a paste — is.
+function containsKeystroke(data) {
+  if (!data || !data.length) return false;
+  const text = Buffer.from(data).toString('latin1')
+    .replace(/\x1b\[[0-9;?<>=]*[A-Za-z~]/g, '')
+    .replace(/\x1bO[A-Za-z]/g, '');
+  return text.length > 0;
+}
+
 function createTerminalBridge(options = {}) {
   if (typeof options.hostClient !== 'function') throw new Error('terminal bridge needs a host client');
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
@@ -178,11 +189,28 @@ function createTerminalBridge(options = {}) {
       });
       return result;
     });
+    // A person typing into the console is the one thing that proves somebody is
+    // reading this pane. Clear the unattended mark once per socket, and never let a
+    // failure here delay or break the keystroke itself.
+    let attendedPatched = false;
+    const markAttended = async () => {
+      if (attendedPatched) return;
+      attendedPatched = true;
+      try {
+        const current = await hostRequest('get', { pane });
+        if (current?.pane?.meta?.unattended !== true) return;
+        await hostRequest('meta', {
+          pane,
+          patch: { unattended: false, attendedAt: Date.now(), attendedBy: 'console' },
+        });
+      } catch {}
+    };
     ws.on('message', (data, binary) => {
       if (closed) return;
       let operation;
       if (binary) {
         operation = hostRequest('input', { pane, data: Buffer.from(data).toString('base64') });
+        if (!attendedPatched && containsKeystroke(data)) Promise.resolve(markAttended()).catch(() => {});
       } else {
         let message;
         try { message = JSON.parse(data.toString('utf8')); }
@@ -236,4 +264,4 @@ function createTerminalBridge(options = {}) {
   };
 }
 
-module.exports = { createTerminalBridge };
+module.exports = { createTerminalBridge, containsKeystroke };
