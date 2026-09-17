@@ -1190,11 +1190,37 @@ test('keep incidents lists open signatures and parses a file of fixtures', () =>
 
     const listed = cli('--json');
     assert.equal(listed.status, 0, listed.stderr);
-    const open = JSON.parse(listed.stdout);
+    const { open, pending } = JSON.parse(listed.stdout);
     assert.equal(open.length, 1);
     assert.equal(open[0].area, 'sandboxes');
     assert.equal(open[0].fireCount, 1);
     assert.match(open[0].card, /^inc-grafana-sandbox-opens-failing/);
+    assert.equal(pending, null, 'nothing failed yet');
+
+    const clean = cli();
+    assert.equal(clean.status, 0, clean.stderr);
+    assert.match(clean.stdout, /^inc-grafana-sandbox-opens-failing/m);
+    assert.equal(clean.stdout.includes('pending:'), false);
+
+    // A write the last poll could not land is reported on the way out, so the
+    // retry behind the cursor is not silent.
+    incidents.recordPoll({ root, now: Date.UTC(2026, 8, 16, 12, 0, 0), failed: 2, error: 'project castle-sandboxes did not resolve' });
+    const failing = cli();
+    assert.equal(failing.status, 0, failing.stderr);
+    assert.match(failing.stdout, /^pending: 2 incident writes failed at .*: project castle-sandboxes did not resolve$/m);
+    const withPending = JSON.parse(cli('--json').stdout);
+    assert.equal(withPending.open.length, 1);
+    assert.equal(withPending.pending.failed, 2);
+    assert.equal(withPending.pending.error, 'project castle-sandboxes did not resolve');
+
+    // It is printed even with nothing open: a poll that failed every write is
+    // exactly the case where there is no open incident to show.
+    fs.rmSync(incidents.stateFile(root), { force: true });
+    incidents.recordPoll({ root, now: Date.UTC(2026, 8, 16, 12, 0, 0), failed: 1, error: 'registry lock timed out' });
+    const empty = cli();
+    assert.equal(empty.status, 0, empty.stderr);
+    assert.match(empty.stdout, /^no open incidents$/m);
+    assert.match(empty.stdout, /^pending: 1 incident write failed at .*: registry lock timed out$/m);
 
     const parsed = cli('parse', path.join(__dirname, 'incidents.fixtures.json'), '--json');
     assert.equal(parsed.status, 0, parsed.stderr);

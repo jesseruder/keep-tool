@@ -2236,13 +2236,22 @@ commands.incidents = (argv) => {
   const o = parseArgs(argv, { json: 'bool' });
   if (o._.length) die('usage: keep incidents [--json] | keep incidents parse <file|->');
   const open = incidents.openIncidents(ROOT);
-  if (o.json) { console.log(JSON.stringify(open, null, 2)); return; }
-  if (!open.length) { console.log('no open incidents'); return; }
+  // A write the last poll could not land is retried behind the channel cursor,
+  // which means nothing newer is fetched until it succeeds. It is reported here
+  // as well as on the Slack health row, and printed even when nothing is open —
+  // a poll that failed every write is exactly the case with no open incidents.
+  const pending = incidents.pendingFailures(ROOT);
+  if (o.json) { console.log(JSON.stringify({ open, pending: pending || null }, null, 2)); return; }
+  if (!open.length) console.log('no open incidents');
   for (const item of open) {
     const fired = item.lastFiredAt ? new Date(item.lastFiredAt).toLocaleString() : 'never';
     console.log(`${item.card || '(no card)'}  ${item.area}  x${item.fireCount}  last fired ${fired}${item.resolvedAt ? ' (resolved)' : ''}`);
     console.log(`  ${item.title}`);
     console.log(`  ${item.signature}`);
+  }
+  if (pending) {
+    const when = pending.at ? new Date(pending.at).toLocaleString() : 'an unknown time';
+    console.log(`pending: ${pending.failed} incident write${pending.failed === 1 ? '' : 's'} failed at ${when}: ${pending.error}`);
   }
 };
 
