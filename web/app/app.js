@@ -731,20 +731,6 @@ function mount(container, pane, options = {}) {
   visibleTerminals.push(entry.mounted);
   return entry.mounted;
 }
-// A slot whose owner is gone for good - an agent panel that has just collapsed,
-// say - disposes on the spot instead of waiting for disposeUnusedTerminals to
-// retire it: that path keeps a hidden terminal and its socket for minutes, which
-// is right for a view one can come straight back to and wrong for a panel that
-// is no longer in the document. Other slots viewing the same pane are untouched.
-function unmount(slot) {
-  for (const [pane, mounts] of terminals) {
-    const entry = mounts.get(slot);
-    if (!entry) continue;
-    entry.mounted.dispose();
-    mounts.delete(slot);
-    if (!mounts.size) terminals.delete(pane);
-  }
-}
 function disposeUnusedTerminals(focused) {
   const known = paneMap();
   const hidden = [];
@@ -1126,7 +1112,7 @@ const ctx = {
   state, get data() { return data; }, closingSessions, isClosingSession, beginClose, esc, rel, projectOf, projectIcon, projectHTML, tagsHTML, knownProjects,
   queueItems, runningItems, pinnedItems, recentItems, triageItems, toggleCollapsed, toggleRunning, toggleRecent, setSelected,
   itemKey, triageKey, eventKey, sessionFor, taskFor, paneMap, entityForPane, kindLabel, limitResumeFor, toast, dismiss, restore, setAside, setAsideFor, isMarkedRunning,
-  pinPane, startShell, newSession, reopenSession, removePane, isPanePinned, knownPaneCount, saveLayouts, dropPane, mount, unmount, patchHTML, clearElement, refresh, reload,
+  pinPane, startShell, newSession, reopenSession, removePane, isPanePinned, knownPaneCount, saveLayouts, dropPane, mount, patchHTML, clearElement, refresh, reload,
   scheduleTerminalFit, setTerminalRenderer, setMode, setDock, toggleFocus, focusTerminal, focusDebug, retainedSelectionItem,
   detail(kind, item) { return item ? detailStore.peek(kind, item.id, item._detailVersion) : { status: 'idle', value: null, error: '' }; },
   ensureDetail(kind, item) { return item && item._detailVersion ? detailStore.ensure(kind, item.id, item._detailVersion) : Promise.resolve(item || null); },

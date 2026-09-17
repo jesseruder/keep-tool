@@ -14,11 +14,13 @@ import { RENAMED_HINT, installRenameControls, isEditing, renameButtonsHTML } fro
 
 const summaryCache = new Map(); // session id -> { text, fetchedAt, mtime, fresh }
 const summaryInflight = new Map();
-// Agent name -> the last feed page fetched for it. Only the expanded row has
-// one; /api/state carries the badge and the last event for every row, so a
-// collapsed agent costs no request.
+// Agent name -> the last feed page fetched for it. Only an agent that has been
+// opened has one; /api/state carries the badge and the last event for every row,
+// so a listed agent nobody is watching costs no request.
 const agentFeeds = new Map();
-const EXPANDED_EVENTS = 20;
+const agentFeedFetchedAt = new Map();
+const agentFeedInflight = new Set();
+const LOG_EVENTS = 20;
 
 // An agent's session is not a working session. It keeps the same four controls
 // off that the reviewer's does: transferring, handing off, restarting or
@@ -57,85 +59,64 @@ export function agentEventText(event) {
   return event ? String(event.text || event.title || event.kind || '') : '';
 }
 
-export function agentRowHTML(ctx, agent, expanded = false) {
+export function agentRowHTML(ctx, agent) {
   const badge = agentBadge(agent);
   const last = agent?.lastEvent || null;
-  return `<span class="stripe"></span><span class="t">${expanded ? '▾' : '▸'} ${ctx.esc(agent.name)}</span>
+  return `<span class="stripe"></span><span class="t">${ctx.esc(agent.name)}</span>
     <span class="w">${badge ? `<span class="abadge ${badge.tone}">${ctx.esc(badge.count)}</span>` : ''}</span>
     <span class="p"><span class="kind agent-life">${ctx.esc(agentLifecycleLabel(agent))}</span>${ctx.esc(agent.role || '')}</span>
     <span class="s">${last ? `${ctx.esc(agentEventText(last))} <span class="w num">${ctx.esc(ctx.rel(last.at))}</span>` : 'no events yet'}</span>`;
 }
 
-// The pane an expanded agent can be watched in, or '' when it has none the host
-// still lists as alive. A dead or unlisted pane is not one a terminal can attach
-// to, so the panel falls back to the transcript tail instead.
+// The pane an agent can be watched in, or '' when it has none the host still
+// lists as alive. A dead or unlisted pane is not one a terminal can attach to, so
+// opening the row falls back to the session's own transcript on the stage.
 export function agentLivePane(ctx, agent) {
   const pane = agent?.session?.pane || '';
   return pane && ctx.paneMap?.().get(pane)?.alive ? pane : '';
 }
 
-// The agent's own log: the feed page fetched when its row was expanded, newest
-// first, headed so it reads as a log beside the terminal below it.
+// The agent's own log: the feed page fetched when it was opened, newest first,
+// headed so it reads as a log beside the terminal it sits next to.
 export function agentLogHTML(ctx, events) {
-  const rows = (events || []).slice(0, EXPANDED_EVENTS).map((event) => `<div class="aevent${event.needsYou ? ' needs' : ''}">
+  const rows = (events || []).slice(0, LOG_EVENTS).map((event) => `<div class="aevent${event.needsYou ? ' needs' : ''}">
     <span class="w num">${ctx.esc(ctx.rel(event.at))}</span><span class="kind">${ctx.esc(event.kind)}</span>${event.card ? `<span class="card">${ctx.esc(event.card)}</span>` : ''}<span class="at">${ctx.esc(agentEventText(event))}</span>
   </div>`).join('');
   return `<div class="alog-head">Log</div>${rows || '<div class="aevent muted">No events yet.</div>'}`;
 }
 
-// What stands in for the terminal when there is no live pane: the same
-// transcript tail a Running row falls back to. The caller resolves it - the
-// detail store lives there - and passes `{status, text, error}`.
-export function agentTailHTML(ctx, detail = {}) {
-  if (detail.status === 'loading') return '<p class="muted" role="status">Loading recent conversation…</p>';
-  if (detail.status === 'error') {
-    return `<p role="alert">Could not load recent conversation: ${ctx.esc(detail.error)} <button class="btn" data-agent-retry>Retry</button></p>`;
-  }
-  return detail.text ? `<pre>${ctx.esc(detail.text)}</pre>` : '<p class="muted">no host pane</p>';
+// The agent whose work the stage is showing, or null. A pane is the surer match -
+// it is the terminal actually on screen - and the session id catches an agent
+// whose pane is gone, where the stage shows its transcript instead.
+export function agentForStage(ctx, item, session) {
+  if (!item) return null;
+  const pane = item.pane || '';
+  const sessionId = item.sessionId || session?.id || '';
+  return (ctx.data?.agents || []).find((agent) => (pane && agent.session?.pane === pane)
+    || (sessionId && agent.session?.id === sessionId)) || null;
 }
 
-// Resolving that tail through the same store a Running row uses: /api/state
-// carries only a summary for a session whose pane is gone, and the full last
-// message is fetched on demand. A summary already in hand is shown while the
-// fetch is in flight, so the panel is never a bare spinner.
-export function agentTailDetail(ctx, session) {
-  if (!session) return { status: 'ready', text: '' };
-  const deferred = Boolean(session._detailVersion && !Object.hasOwn(session, 'lastAssistantFull'));
-  const detail = deferred ? ctx.detail('session', session) : { status: 'ready', value: session, error: '' };
-  if (deferred && detail.status === 'idle') void ctx.ensureDetail('session', session);
-  if (detail.status === 'error') return { status: 'error', error: detail.error };
-  if (detail.status === 'ready') return { status: 'ready', text: detail.value?.lastAssistantFull || session.lastAssistant || '' };
-  return session.lastAssistant ? { status: 'ready', text: session.lastAssistant } : { status: 'loading' };
+// The log column beside the stage terminal: who is working, what the fleet last
+// heard from them, and the feed under it. Collapsed, it keeps only the head's
+// toggle, so the terminal takes the width back without the column leaving.
+export function agentStageLogHTML(ctx, agent, events, collapsed = false) {
+  const last = agent?.lastEvent || null;
+  const toggle = `<button class="btn salog-toggle" data-agent-log-toggle aria-expanded="${collapsed ? 'false' : 'true'}"
+    title="${collapsed ? 'Show the agent log' : 'Hide the agent log'}">${collapsed ? '‹' : '›'}</button>`;
+  if (collapsed) return `<div class="salog-head">${toggle}</div>`;
+  return `<div class="salog-head"><span class="t">${ctx.esc(agent.name)}</span><span class="kind agent-life">${ctx.esc(agentLifecycleLabel(agent))}</span>${toggle}</div>
+    <div class="salog-last">${last ? `${ctx.esc(agentEventText(last))} <span class="w num">${ctx.esc(ctx.rel(last.at))}</span>` : 'no events yet'}</div>
+    <div class="salog-body">${agentLogHTML(ctx, events)}</div>`;
 }
 
-// The expanded panel: the agent's log, and under it the pane it is working in -
-// an empty host the caller mounts the live terminal into, never filled here - or
-// the transcript tail when that pane is gone. The one control a Running row
-// offers for a live pane stays in the head, so an agent can still be opened in
-// the main view where it already runs.
-export function agentPanelHTML(ctx, agent, events, detail = {}) {
-  const live = agentLivePane(ctx, agent);
-  const below = live
-    ? `<div class="aterm" data-agent-terminal="${ctx.esc(live)}"></div>`
-    : `<div class="atail">${agentTailHTML(ctx, detail)}</div>`;
-  return `<div class="ahead">${agentHeadHTML(ctx, agent)}</div><div class="alog">${agentLogHTML(ctx, events)}</div>${below}`;
-}
-
-// The head's contents, patched on their own so the panel around them - and the
-// terminal mounted in it - survives a change of model or of session.
-export function agentHeadHTML(ctx, agent) {
-  const pane = agent?.session?.pane || '';
-  const open = pane ? `<button class="btn" data-agent-open="${ctx.esc(pane)}">Open pane</button>` : '';
-  return `${agent?.model ? `<span class="kind">${ctx.esc(agent.model)}</span>` : ''}${open}`;
-}
-
-// Expanding a row is the acknowledgement: the feed is marked seen and fetched.
+// Opening a row is the acknowledgement: the feed is marked seen and fetched.
 // Neither failure is worth a toast storm on a background refresh, so a feed that
 // cannot be read renders as an empty one.
 export async function openAgentFeed(ctx, name) {
+  agentFeedFetchedAt.set(name, Date.now());
   try { await api.markAgentSeen(name); } catch {}
   let events = [];
-  try { events = (await api.getAgentEvents(name, EXPANDED_EVENTS))?.events || []; } catch {}
+  try { events = (await api.getAgentEvents(name, LOG_EVENTS))?.events || []; } catch {}
   agentFeeds.set(name, events);
   ctx.refresh();
   return events;
@@ -143,11 +124,49 @@ export async function openAgentFeed(ctx, name) {
 
 export function agentFeed(name) { return agentFeeds.get(name) || null; }
 
-function toggleAgent(ctx, name) {
-  const open = ctx.state.expandedAgent === name;
-  ctx.state.expandedAgent = open ? null : name;
-  if (!open) void openAgentFeed(ctx, name);
-  ctx.refresh();
+const eventAt = (at) => (typeof at === 'number' ? at : Date.parse(at) || 0);
+
+// The log beside the stage is not a one-off read: the agent keeps working while
+// Owner watches its pane. /api/state carries only the last event, so a feed whose
+// newest entry is older than that one is behind and is re-read - at most once
+// every few seconds, and only for the agent the stage is showing.
+function ensureAgentFeed(ctx, agent) {
+  const name = agent?.name;
+  if (!name || agentFeedInflight.has(name)) return;
+  const events = agentFeeds.get(name);
+  if (events) {
+    const fetchedAt = agentFeedFetchedAt.get(name) || 0;
+    // A page that came back empty is compared against the read itself: an agent
+    // whose feed cannot be read must not be re-read on every poll for ever.
+    const newest = events.length ? eventAt(events[0].at) : fetchedAt;
+    if (!(eventAt(agent.lastEvent?.at) > newest) || Date.now() - fetchedAt < 5e3) return;
+  }
+  agentFeedInflight.add(name);
+  void openAgentFeed(ctx, name).finally(() => agentFeedInflight.delete(name));
+}
+
+// Clicking an Agents row is "show me this agent": its live pane goes on the
+// stage, in the one slot the stage terminal already owns, so there is never a
+// second view of the same PTY. An agent whose pane is gone opens as its session
+// instead, where the stage shows the transcript tail.
+function openAgent(ctx, name) {
+  const agent = (ctx.data.agents || []).find((candidate) => candidate.name === name);
+  if (!agent) return;
+  void openAgentFeed(ctx, name);
+  const live = agentLivePane(ctx, agent);
+  if (live) { ctx.openReviewPane(live); return; }
+  if (agent.session?.id) { ctx.openReviewSession?.(agent.session.id); return; }
+  ctx.toast?.(`${name} has no session to open`);
+}
+
+// Collapsing the log column is Owner's, and it outlives a reload: the same
+// terminal and the same agent should come back the way they were left.
+export function agentLogCollapsed() {
+  try { return localStorage.getItem('keep-agent-log-collapsed') === '1'; } catch { return false; }
+}
+
+function setAgentLogCollapsed(value) {
+  try { localStorage.setItem('keep-agent-log-collapsed', value ? '1' : '0'); } catch {}
 }
 
 function waitText(since) {
@@ -345,7 +364,13 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
   ctx.state.selected = ctx.state.focusMode && !ctx.state.currentItem ? -1
     : selectionIndex(active, ctx.state.selectedKey, ctx.state.currentItem, ctx.state.selected, ctx.itemKey, ctx.triageKey);
   ctx.state.selectedKey = active[ctx.state.selected] ? ctx.triageKey(active[ctx.state.selected]) : null;
-  const existing = new Map([...list.querySelectorAll(':scope > .qitem, :scope > .qagent-panel')].map((row) => [row.dataset.key, row]));
+  // An agent's pane on the stage is selected by its Agents row, not by a row of
+  // its own: the row is the only listing an agent has, and a second one for the
+  // same terminal would be a duplicate of it.
+  const selectedItem = active[ctx.state.selected];
+  const selectedAgent = agentForStage(ctx, selectedItem, ctx.sessionFor(selectedItem));
+  let selectedAgentRow = null;
+  const existing = new Map([...list.querySelectorAll(':scope > .qitem')].map((row) => [row.dataset.key, row]));
   const retained = new Set();
   let cursor = list.firstElementChild;
   const place = (element) => {
@@ -387,77 +412,27 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
   runningHead.addEventListener('click', () => ctx.toggleRunning());
   if (ctx.state.showRunning) addRows(running, waiting.length);
   // Agents are the fleet's standing workers, not queue items: they are never
-  // selected, counted or dismissed, only read and expanded. They sit under
-  // Running & waiting, below the sessions doing a card's work, and the group is
-  // absent entirely when there is no agent to list. Unlike Running, it is not
-  // gated on `showRunning`: collapsing the sessions must not hide the fleet.
+  // counted or dismissed, only read and opened. They sit under Running &
+  // waiting, below the sessions doing a card's work, and the group is absent
+  // entirely when there is no agent to list. Unlike Running, it is not gated on
+  // `showRunning`: collapsing the sessions must not hide the fleet.
   const agentRows = ctx.data.agents || [];
   if (agentRows.length) {
     addGroup(`Agents · ${ctx.esc(agentRows.length)}`);
     for (const agent of agentRows) {
       const key = `agent:${agent.name}`;
-      const expanded = ctx.state.expandedAgent === agent.name;
       let row = existing.get(key);
       if (!row) {
         row = document.createElement('div');
         row.tabIndex = 0;
         row.dataset.key = key;
-        row.addEventListener('click', (event) => {
-          if (event.target instanceof Element && event.target.closest('[data-agent-open]')) return;
-          toggleAgent(ctx, row.dataset.key.slice('agent:'.length));
-        });
+        row.addEventListener('click', () => openAgent(ctx, row.dataset.key.slice('agent:'.length)));
       }
-      row.className = `qitem k-agent${expanded ? ' open' : ''}`;
-      ctx.patchHTML(row, agentRowHTML(ctx, agent, expanded));
+      const selected = Boolean(selectedAgent) && selectedAgent.name === agent.name;
+      row.className = `qitem k-agent${selected ? ' sel' : ''}`;
+      ctx.patchHTML(row, agentRowHTML(ctx, agent));
       place(row);
-      const slot = key; // `agent:<name>`, the terminal slot as well as the row's key.
-      const live = expanded ? agentLivePane(ctx, agent) : '';
-      const panelKey = `agent-panel:${agent.name}`;
-      let panel = existing.get(panelKey);
-      // A row that has just collapsed, a pane the host no longer calls alive and
-      // a pane a restart has replaced all leave a terminal nothing will render
-      // again. The slot is disposed now rather than left to
-      // disposeUnusedTerminals, which keeps a hidden terminal and its socket for
-      // minutes: right for a view one can come straight back to, wrong for a
-      // panel that is already out of the document. One slot, one terminal.
-      if (!live || (panel?.dataset.pane && panel.dataset.pane !== live)) ctx.unmount(slot);
-      if (!expanded) continue;
-      const agentSession = agent.session?.id
-        ? (ctx.data.sessions || []).find((candidate) => candidate.id === agent.session.id) : null;
-      const detail = live ? {} : agentTailDetail(ctx, agentSession);
-      if (!panel) {
-        panel = document.createElement('div');
-        panel.className = 'qagent-panel';
-        panel.dataset.key = panelKey;
-      }
-      // The terminal host has to outlive the log's own re-renders: a relative
-      // time ticking over would otherwise rewrite the panel and tear the mounted
-      // terminal out of the document. So the skeleton is rebuilt only when the
-      // panel changes shape - a pane appearing, dying or being replaced - and
-      // the head, log and tail are patched inside it.
-      const shape = `${live}:${agent.session?.id || ''}:${agent.session?.pane || ''}`;
-      if (panel.dataset.shape !== shape) {
-        ctx.clearElement(panel);
-        ctx.patchHTML(panel, agentPanelHTML(ctx, agent, agentFeed(agent.name), detail));
-        panel.dataset.shape = shape;
-      } else {
-        ctx.patchHTML(panel.querySelector('.ahead'), agentHeadHTML(ctx, agent));
-        ctx.patchHTML(panel.querySelector('.alog'), agentLogHTML(ctx, agentFeed(agent.name)));
-        const tail = panel.querySelector('.atail');
-        if (tail) ctx.patchHTML(tail, agentTailHTML(ctx, detail));
-      }
-      place(panel);
-      const openPane = panel.querySelector('[data-agent-open]');
-      if (openPane) openPane.onclick = () => ctx.openReviewPane(openPane.dataset.agentOpen);
-      const retryTail = panel.querySelector('[data-agent-retry]');
-      if (retryTail) retryTail.onclick = () => ctx.retryDetail('session', agentSession);
-      // The pane runs in a slot of its own, never the stage's: expanding an
-      // agent must not take the terminal away from whatever is selected, and it
-      // takes no keyboard focus either - the row was clicked to read, not to
-      // type into someone else's session.
-      const terminalHost = live ? panel.querySelector('.aterm') : null;
-      if (terminalHost) ctx.mount(terminalHost, live, { slot, focus: false });
-      panel.dataset.pane = live;
+      if (selected) selectedAgentRow = row;
     }
   }
   const pinnedHead = addGroup(`${ctx.state.showPinned ? '▾' : '▸'} Pinned · ${ctx.esc(pinned.length)}`, 'qhead qgroup qtoggle', 'button');
@@ -466,7 +441,9 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
   const recentHead = addGroup(`${ctx.state.showRecent ? '▾' : '▸'} Recent · ${ctx.esc(recent.length)}`, 'qhead qgroup qtoggle', 'button');
   recentHead.addEventListener('click', () => ctx.toggleRecent());
   if (ctx.state.showRecent) addRows(recent, waiting.length + shownRunning.length + shownPinned.length);
-  if (retainedSelection.length) {
+  // The retained row keeps the stage's session selected when it has left every
+  // group - except an agent's, which its Agents row above carries instead.
+  if (retainedSelection.length && !agentForStage(ctx, retainedSelection[0], ctx.sessionFor(retainedSelection[0]))) {
     addGroup('Selected session');
     addRows(retainedSelection, active.length - retainedSelection.length);
   }
@@ -486,17 +463,13 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
   }
   for (const child of [...list.children]) {
     if (retained.has(child)) continue;
-    // An expanded agent that left the list takes its terminal with it: the loop
-    // above only disposes slots for agents it still iterates, and a panel that
-    // leaves the document would otherwise keep its xterm and socket cached until
-    // disposeUnusedTerminals retires them, colliding with a fresh mount should
-    // the agent return under the same slot.
-    if (child.dataset.key?.startsWith('agent-panel:')) ctx.unmount(`agent:${child.dataset.key.slice('agent-panel:'.length)}`);
     child.remove();
   }
   list.scrollTop = scrollTop;
   if (ctx.state.ensureSelectedVisible) {
-    [...list.querySelectorAll(':scope > .qitem')].find((row) => row.dataset.key === ctx.state.selectedKey)?.scrollIntoView({ block: 'nearest' });
+    // An agent has no row under its own key: its Agents row is the selection.
+    const selectedRow = [...list.querySelectorAll(':scope > .qitem')].find((row) => row.dataset.key === ctx.state.selectedKey);
+    (selectedRow || selectedAgentRow)?.scrollIntoView({ block: 'nearest' });
     ctx.state.ensureSelectedVisible = false;
   }
   return active;
@@ -600,7 +573,11 @@ function renderStage(ctx, active, focusItem, running, pinned) {
   if (stage.dataset.itemKey !== key || stage.dataset.pane !== (item.pane || '')) {
     ctx.focusDebug?.('stage-replace', { reason: 'selection-or-pane-change', session: item.sessionId || '', pane: item.pane || '', related: stage.dataset.pane || '' });
     ctx.clearElement(stage);
-    ctx.patchHTML(stage, `<div class="shead"><div class="session-heading"></div><div class="acts"><span class="quick-actions"></span>${actionsMenuHTML()}</div></div><div class="brief"></div><div class="stage-terminal"></div>`);
+    // `.stage-body` is a row: the terminal, and beside it the agent log when the
+    // stage is showing an agent's work. The aside is part of the skeleton and is
+    // only hidden, never added or removed, so appearing next to the terminal
+    // cannot rebuild the host the terminal is mounted in.
+    ctx.patchHTML(stage, `<div class="shead"><div class="session-heading"></div><div class="acts"><span class="quick-actions"></span>${actionsMenuHTML()}</div></div><div class="brief"></div><div class="stage-body"><div class="stage-terminal"></div><aside class="stage-agent-log" hidden></aside></div>`);
     stage.dataset.itemKey = key;
     stage.dataset.pane = item.pane || '';
     stage.dataset.focusKey = '';
@@ -653,6 +630,31 @@ function renderStage(ctx, active, focusItem, running, pinned) {
   if (restart) installRestartControls(menu.querySelector('.restart-controls'), ctx, item.sessionId, item.pane);
   const briefChanged = ctx.patchHTML(brief, briefHTML(ctx, item, session));
   installGrading(brief, ctx, session);
+  // An agent's pane on the stage brings its log with it, in a column beside the
+  // terminal. The aside is patched like the brief; the terminal host beside it is
+  // never rebuilt, and xterm's own ResizeObserver refits it when the column
+  // appears, collapses or goes away.
+  const stageAgent = agentForStage(ctx, item, session);
+  const logAside = stage.querySelector('.stage-agent-log');
+  const logWasHidden = logAside.hidden;
+  const logWasCollapsed = logAside.classList.contains('collapsed');
+  if (stageAgent) {
+    ensureAgentFeed(ctx, stageAgent);
+    const collapsed = agentLogCollapsed();
+    logAside.hidden = false;
+    logAside.classList.toggle('collapsed', collapsed);
+    ctx.patchHTML(logAside, agentStageLogHTML(ctx, stageAgent, agentFeed(stageAgent.name), collapsed));
+    logAside.querySelector('[data-agent-log-toggle]').onclick = () => {
+      setAgentLogCollapsed(!collapsed);
+      ctx.refresh();
+    };
+  } else {
+    logAside.hidden = true;
+    ctx.patchHTML(logAside, '');
+  }
+  if (logWasHidden !== logAside.hidden || logWasCollapsed !== logAside.classList.contains('collapsed')) {
+    ctx.scheduleTerminalFit();
+  }
   const terminalHost = stage.querySelector('.stage-terminal');
   if (hasLivePane) {
     const focusKey = `${key}:${item.pane}`;

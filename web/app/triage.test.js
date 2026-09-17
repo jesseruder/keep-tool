@@ -66,11 +66,10 @@ test('a row carries the name, lifecycle, last event and its relative time', asyn
   assert.equal(agentLifecycleLabel({ lifecycle: 'needs-you' }), 'needs you');
   assert.equal(agentLifecycleLabel({ lifecycle: 'stopped' }), 'stopped');
 
-  const html = agentRowHTML(ctx, QUIET_ROW, false);
-  assert.match(html, /▸ sandboxes/);
+  const html = agentRowHTML(ctx, QUIET_ROW);
+  assert.match(html, /<span class="t">sandboxes<\/span>/, 'the row opens a pane, so it carries no expand chevron');
   assert.match(html, /waiting for the next scrape/);
   assert.match(html, /1s ago/);
-  assert.match(agentRowHTML(ctx, QUIET_ROW, true), /▾ sandboxes/);
   assert.match(agentRowHTML(ctx, { ...QUIET_ROW, lastEvent: null }), /no events yet/);
 
   // Event text is whatever an alert, a log line or a Slack reply put in it.
@@ -90,83 +89,91 @@ test('the badge counts unseen events and turns red only for needs-you', async ()
   assert.match(agentRowHTML(ctx, LOUD_ROW), /<span class="abadge hot">1<\/span>/);
 });
 
-test('the expanded panel lists the feed and offers the Running row’s open control', async () => {
-  const { agentPanelHTML } = await import('./triage.js');
-  const ctx = ctxFor();
+test('the pane a row opens is the live one, or none at all', async () => {
+  const { agentLivePane } = await import('./triage.js');
+  const live = ctxFor({ agents: [QUIET_ROW], panes: [{ id: 'pane-1', alive: true }] });
+  assert.equal(agentLivePane(live, QUIET_ROW), 'pane-1');
+
+  // A pane the host lists as dead - or does not list at all - cannot be attached
+  // to, so the row opens the agent's session instead.
+  const dead = ctxFor({ agents: [QUIET_ROW], panes: [{ id: 'pane-1', alive: false }] });
+  assert.equal(agentLivePane(dead, QUIET_ROW), '');
+  assert.equal(agentLivePane(ctxFor({ agents: [QUIET_ROW] }), QUIET_ROW), '', 'an unlisted pane is not a live one');
+  assert.equal(agentLivePane(live, { ...QUIET_ROW, session: null }), '', 'an agent with no session has no pane');
+});
+
+test('the stage knows whose work it is showing, by pane or by session', async () => {
+  const { agentForStage } = await import('./triage.js');
+  const ctx = ctxFor({ agents: [REVIEWER_ROW, QUIET_ROW] });
+
+  // The pane is the surer match: it is the terminal actually on the stage.
+  assert.equal(agentForStage(ctx, { kind: 'running', pane: 'pane-1' })?.name, 'sandboxes');
+  assert.equal(agentForStage(ctx, { kind: 'running', pane: 'pane-r' })?.name, 'fleet-reviewer');
+  // A pane that is gone leaves the session, which the stage still shows.
+  assert.equal(agentForStage(ctx, { kind: 'recent', sessionId: 'sess-1', pane: null })?.name, 'sandboxes');
+  assert.equal(agentForStage(ctx, { kind: 'recent', pane: null }, { id: 'sess-1' })?.name, 'sandboxes',
+    'the stage session answers for an item that carries no id of its own');
+
+  assert.equal(agentForStage(ctx, { kind: 'running', pane: 'pane-9', sessionId: 'sess-9' }), null);
+  assert.equal(agentForStage(ctx, null), null, 'an empty stage belongs to nobody');
+  assert.equal(agentForStage(ctxFor(), { kind: 'running', pane: 'pane-1' }), null, 'no agents, no match');
+  assert.equal(agentForStage(ctxFor({ agents: [{ name: 'lonely', session: null }] }),
+    { kind: 'running', pane: null, sessionId: '' }), null,
+    'an item with neither pane nor session must not match an agent that has neither either');
+});
+
+test('the log beside the stage terminal heads the agent and lists its feed', async () => {
+  const { agentStageLogHTML } = await import('./triage.js');
+  const ctx = ctxFor({ agents: [LOUD_ROW] });
   const events = [
     { at: 500, kind: 'needs-you', card: 'inc-one', needsYou: true, text: 'raise the cap or drain?' },
     { at: 0, kind: 'diagnosed', card: 'inc-one', needsYou: false, text: 'host pool is full' },
   ];
-  const html = agentPanelHTML(ctx, LOUD_ROW, events);
-  assert.match(html, /data-agent-open="pane-1"/);
+  const html = agentStageLogHTML(ctx, LOUD_ROW, events);
+  assert.match(html, /sandboxes/);
+  assert.match(html, /needs you/, 'the lifecycle is named beside the terminal too');
+  assert.match(html, /<div class="alog-head">Log<\/div>/, 'the feed is labelled as the agent’s log');
   assert.match(html, /aevent needs/);
   assert.match(html, /raise the cap or drain\?/);
   assert.match(html, /host pool is full/);
+  assert.equal(html.includes('data-agent-terminal'), false,
+    'the pane is on the stage, so the log mounts no terminal of its own');
 
-  // A session with no pane has nothing to open, and a feed that has not arrived
-  // yet says so rather than rendering an empty block.
-  const paneless = agentPanelHTML(ctx, { ...LOUD_ROW, session: null }, []);
-  assert.equal(paneless.includes('data-agent-open'), false);
-  assert.match(paneless, /No events yet/);
+  // A feed that has not arrived yet says so rather than rendering an empty block.
+  assert.match(agentStageLogHTML(ctx, { ...LOUD_ROW, lastEvent: null }, []), /no events yet/i);
+
+  // Event text is whatever an alert, a log line or a Slack reply put in it.
+  const hostile = agentStageLogHTML(ctx, LOUD_ROW, [{ at: 0, kind: 'diagnosed', text: '<img src=x onerror=1>' }]);
+  assert.equal(hostile.includes('<img src=x'), false, 'event text is escaped, not interpolated');
+
+  // Collapsed, only the control that brings it back is left.
+  const collapsed = agentStageLogHTML(ctx, LOUD_ROW, events, true);
+  assert.match(collapsed, /data-agent-log-toggle/);
+  assert.equal(collapsed.includes('class="alog-head"'), false);
+  assert.equal(collapsed.includes('raise the cap'), false);
 });
 
-test('the panel heads its log and mounts the pane’s terminal only while it is alive', async () => {
-  const { agentPanelHTML, agentLivePane } = await import('./triage.js');
-  const events = [{ at: 0, kind: 'diagnosed', card: 'inc-one', text: 'host pool is full' }];
+// The click handler and the queue's row placement need a document; what can be
+// tested without one is the rule they both follow, and that the queue asks for it.
+test('an agent’s pane is carried by its Agents row, never by a second row', async () => {
+  const fs = await import('node:fs');
+  const { agentForStage } = await import('./triage.js');
+  const ctx = ctxFor({ agents: [QUIET_ROW] });
+  // What openReviewPane leaves behind for the agent's pane: a synthetic running
+  // item, and then the session-backed row retainSelection would rebuild from it.
+  assert.equal(agentForStage(ctx, { kind: 'running', pane: 'pane-1', title: 'sandboxes' })?.name, 'sandboxes');
+  assert.equal(agentForStage(ctx, { kind: 'recent', sessionId: 'sess-1', pane: 'pane-1' })?.name, 'sandboxes');
 
-  const live = ctxFor({ agents: [QUIET_ROW], panes: [{ id: 'pane-1', alive: true }] });
-  assert.equal(agentLivePane(live, QUIET_ROW), 'pane-1');
-  const html = agentPanelHTML(live, QUIET_ROW, events);
-  assert.match(html, /<div class="alog-head">Log<\/div>/, 'the feed is labelled as the agent’s log');
-  assert.match(html, /host pool is full/);
-  assert.match(html, /<div class="aterm" data-agent-terminal="pane-1"><\/div>/,
-    'an empty host: the terminal is mounted into it, never written as HTML');
-  assert.equal(html.includes('atail'), false, 'a live pane needs no transcript tail');
-  assert.match(html, /data-agent-open="pane-1"/, 'the pane can still be opened in the main view');
-
-  // A pane the host lists as dead - or does not list at all - cannot be attached
-  // to, so the panel falls back to the tail a Running row would show.
-  const dead = ctxFor({ agents: [QUIET_ROW], panes: [{ id: 'pane-1', alive: false }] });
-  assert.equal(agentLivePane(dead, QUIET_ROW), '');
-  assert.equal(agentLivePane(ctxFor({ agents: [QUIET_ROW] }), QUIET_ROW), '', 'an unlisted pane is not a live one');
-  const tail = agentPanelHTML(dead, QUIET_ROW, events, { status: 'ready', text: 'draining the pool' });
-  assert.equal(tail.includes('aterm'), false);
-  assert.match(tail, /<div class="alog-head">Log<\/div>/);
-  assert.match(tail, /<pre>draining the pool<\/pre>/);
-  assert.match(agentPanelHTML(dead, QUIET_ROW, events, {}), /no host pane/,
-    'a session that left no transcript behind says so');
-  assert.match(agentPanelHTML(dead, QUIET_ROW, events, { status: 'loading' }), /Loading recent conversation/);
-  assert.match(agentPanelHTML(dead, QUIET_ROW, events, { status: 'error', error: 'gone' }), /data-agent-retry/);
-
-  // Transcripts are whatever the session printed, including markup.
-  const hostile = agentPanelHTML(dead, QUIET_ROW, events, { status: 'ready', text: '<img src=x onerror=1>' });
-  assert.equal(hostile.includes('<img src=x'), false, 'the tail is escaped, not interpolated');
+  const source = fs.readFileSync(new URL('./triage.js', import.meta.url), 'utf8');
+  const queue = source.slice(source.indexOf('function renderQueue('), source.indexOf('function briefHTML('));
+  assert.match(queue, /if \(retainedSelection\.length && !agentForStage\(/,
+    'the "Selected session" group is skipped when the selection is an agent’s');
+  assert.match(queue, /qitem k-agent\$\{selected \? ' sel' : ''\}/,
+    'the Agents row is the one marked selected instead');
+  assert.equal(queue.includes('ctx.mount('), false, 'the queue mounts no agent terminal of its own');
 });
 
-test('the tail resolves through the session detail store, showing the summary while it loads', async () => {
-  const { agentTailDetail } = await import('./triage.js');
-  assert.deepEqual(agentTailDetail(ctxFor(), null), { status: 'ready', text: '' },
-    'an agent with no session has no tail to show');
-
-  // A session /api/state already carried in full needs no fetch.
-  const whole = ctxFor();
-  assert.deepEqual(agentTailDetail(whole, { id: 'sess-1', lastAssistant: 'short', lastAssistantFull: 'the whole turn' }),
-    { status: 'ready', text: 'the whole turn' });
-  assert.deepEqual(whole.ensured, []);
-
-  const idle = ctxFor({}, { status: 'idle', value: null, error: '' });
-  assert.deepEqual(agentTailDetail(idle, { id: 'sess-1', _detailVersion: 2, lastAssistant: 'short' }),
-    { status: 'ready', text: 'short' }, 'the summary in hand beats a spinner');
-  assert.deepEqual(idle.ensured, ['session:sess-1'], 'the full turn is fetched once');
-  assert.deepEqual(agentTailDetail(ctxFor({}, { status: 'loading', value: null, error: '' }),
-    { id: 'sess-1', _detailVersion: 2 }), { status: 'loading' });
-  assert.deepEqual(agentTailDetail(ctxFor({}, { status: 'error', value: null, error: 'gone' }),
-    { id: 'sess-1', _detailVersion: 2, lastAssistant: 'short' }), { status: 'error', error: 'gone' });
-  assert.deepEqual(agentTailDetail(ctxFor({}, { status: 'ready', value: { lastAssistantFull: 'the whole turn' }, error: '' }),
-    { id: 'sess-1', _detailVersion: 2, lastAssistant: 'short' }), { status: 'ready', text: 'the whole turn' });
-});
-
-test('expanding a row marks the feed seen and then reads it', async () => {
+test('opening a row marks the feed seen and then reads it', async () => {
   const calls = [];
   globalThis.fetch = async (url, options = {}) => {
     calls.push({ url: String(url), method: options.method || 'GET' });

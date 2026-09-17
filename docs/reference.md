@@ -1124,7 +1124,7 @@ next.
   the feed itself rather than declaring it empty.
 
   **Seen-ness and delivered-ness are independent.** `seenAt` is Owner's badge state,
-  set by `markSeen` when a row is expanded. `lastDeliveredSeq` is the session's, set only
+  set by `markSeen` when a row is opened. `lastDeliveredSeq` is the session's, set only
   by a confirmed send. Neither implies the other, and nothing reads one for the other. The feed is the truth and the record's summary is a cache of its end, so an
   `emit` appends before it touches the record, and the append alone decides whether the
   event happened: a summary that could not be written afterwards costs one line on
@@ -1176,26 +1176,35 @@ leaves the fleet listed. One row
 per agent: the name, the lifecycle (`idle` / `on <card>` / `needs you` / `stopped`), the
 last event as a one-liner with its relative time, and a badge with the unseen count —
 red when any unseen event asked for Owner, grey when they are only news, absent at zero.
-Clicking a row expands it; expanding is the acknowledgement, so it posts `seen`. The
-panel shows the agent's **Log** — the last 20 events — and under it the agent's pane:
-its live terminal when the host still lists that pane as alive, and otherwise the same
-transcript tail a Running row falls back to (`lastAssistantFull` through the session
-detail store, the `/api/state` summary while that loads, "no host pane" when the session
-left nothing). The open control a Running row offers for a live pane stays in the panel's
-head, so the pane can still be taken into the main view.
+Clicking a row opens the agent on the stage; opening is the acknowledgement, so it posts
+`seen` and re-reads the feed. A pane the host still lists as alive goes on the stage
+through `ctx.openReviewPane`, in the one slot the stage terminal already owns: there is
+never a second view of the same PTY. An agent whose pane is gone opens as its session
+instead (`ctx.openReviewSession`), where the stage shows the same transcript tail a
+Running row falls back to; an agent with neither says so in a toast.
 
-That terminal is mounted in its own slot, `agent:<name>`, never the stage's: expanding an
-agent neither steals the stage's terminal nor takes the keyboard, which stays wherever
-Owner put it. Collapsing the row — or a pane the host stops calling alive — disposes that
-slot through `ctx.unmount(slot)` rather than leaving a hidden terminal and its socket
-behind for the five minutes `disposeUnusedTerminals` allows a view one can come straight
-back to. The panel's skeleton is rebuilt only when its shape changes (a pane appearing,
-dying or being replaced); the head, log and tail are patched inside it, so a relative time
-ticking over cannot tear the mounted terminal out of the document.
+The selection then belongs to the Agents row itself: the row is marked `.sel`, and the
+"Selected session" row `retainSelection` would otherwise append for that pane or session
+is skipped, so an agent is listed once and in one place. `agentForStage(ctx, item,
+session)` decides both — it matches the stage's pane against `agent.session.pane` first,
+because that is the terminal actually on screen, and falls back to the session id for an
+agent whose pane is gone.
+
+Beside that terminal, `.stage-body` is a row holding `.stage-terminal` and an `<aside
+class="stage-agent-log">`: the agent's **Log** — the last 20 events, newest first — under
+a head naming the agent, its lifecycle and its last event. The aside is part of the stage
+skeleton and is only hidden, never added or removed, so a log appearing cannot rebuild the
+host the terminal is mounted in; xterm's own `ResizeObserver` refits the terminal when the
+column appears, collapses or goes away. One control in its head collapses it to that
+control alone, remembered in `localStorage` under `keep-agent-log-collapsed`. While an
+agent is on the stage its feed is re-read whenever `/api/state`'s last event is newer than
+the page in hand, at most once every five seconds; a page that came back empty is compared
+against the read itself, so a feed that cannot be read is not re-read on every poll.
 
 The empty-state counts
 read "N running · N pinned · N agents", the last only when there is one. Agents are never
-selected, counted or dismissed as queue items.
+counted or dismissed as queue items, and the keyboard's own selection never lands on one:
+the Agents row is marked selected only to say whose pane the stage is showing.
 
 A session an agent is carrying is marked `session.agentName = <name>` when its id or pane
 matches a record's — or when the pane's `meta.agentName` names one, which is authority for
