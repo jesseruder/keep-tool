@@ -868,6 +868,11 @@ test('refusals that clear on their own are told apart from the ones that need a 
     'Job ledger source changed during restart',
     'Job ledger evidence changed during restart',
     'New hook activity arrived during restart',
+    // A bad `ps` snapshot under load, not a changed process: the next attempt reads
+    // the identity again from scratch and re-runs the same comparison.
+    'Agent process identity changed during restart',
+    'Original agent process identity is unverified',
+    'Session helper processes changed during restart',
   ]) assert.equal(handoff.classifyRefusal(reason), 'transient', reason);
 
   // And these say a person has to look before the same request is worth repeating.
@@ -880,7 +885,6 @@ test('refusals that clear on their own are told apart from the ones that need a 
     'Source account setup is unavailable: managed memory is missing',
     'Session process changed',
     'Session process changed during restart',
-    'Agent process identity changed during restart',
     'Claude is showing a dialog',
     'source and target account are the same',
     '',

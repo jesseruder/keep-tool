@@ -40,6 +40,16 @@ const TRANSIENT_REFUSALS = [
   /^Command failed: ps/,
   // A caffeinate or a sleeping sentinel child that ends on its own minutes later.
   /^Local background processes are still present$/,
+  // The identity and helper checks read one `ps` snapshot, and under swap pressure a
+  // snapshot can come back wrong: on 2026-09-17 a transfer refused here for a process
+  // whose pid and start time had not moved at all, and every liveSessionPids call
+  // afterwards returned the same identity. Retrying is safe because nothing is carried
+  // across attempts — restartSession re-derives originalIdentity from a fresh ps before
+  // it touches anything, and re-runs the same comparison — so a real identity change is
+  // caught again on the next attempt rather than waved through by this class.
+  /^Agent process identity changed during restart$/,
+  /^Original agent process identity is unverified$/,
+  /^Session helper processes changed during restart$/,
 ];
 // Checked first: these contain transient-looking words but name a durable
 // incompatibility that retrying cannot resolve.
