@@ -202,21 +202,32 @@ function npxCacheDir(env) {
 function npxInstallHash(specs) {
   return crypto.createHash('sha512').update(specs.sort((a, b) => a.localeCompare(b, 'en')).join('\n')).digest('hex').slice(0, 16);
 }
-// The bin file the declared spec's own install publishes under `name`, as an absolute
-// path, or null. Read entirely from what npx wrote: the package manifest names its
-// bins, and the `.bin` link has to resolve to the very file that manifest points at.
-// Any unreadable or surprising file means no match at all.
+// Which bin npm runs for a package it was given no explicit command for: the only one
+// there is, or the one named after the package. A manifest publishing `demo-mcp` and
+// `maintenance` runs `demo-mcp` and nothing else, so the selection is derived from the
+// manifest alone and the live row is then held to it — never the other way round,
+// which would let a row pick whichever of the published bins suited it.
+function npxSelectedBin(manifest, pkgName) {
+  const unscoped = pkgName.replace(/^@[^/]+\//, '');
+  // `"bin": "cli.js"` publishes one bin named for the package, without its scope.
+  if (typeof manifest.bin === 'string' && manifest.bin) return { name: unscoped, file: manifest.bin };
+  if (!manifest.bin || typeof manifest.bin !== 'object' || Array.isArray(manifest.bin)) return null;
+  const names = Object.keys(manifest.bin);
+  const name = names.length === 1 ? names[0] : (names.includes(unscoped) ? unscoped : null);
+  return name && typeof manifest.bin[name] === 'string' && manifest.bin[name] ? { name, file: manifest.bin[name] } : null;
+}
+// The bin file the declared spec's own install publishes, as an absolute path, or
+// null. Read entirely from what npx wrote: the manifest names its bins and says which
+// one this invocation runs, and the `.bin` link has to resolve to the very file that
+// manifest points at. Any unreadable or surprising file means no match at all.
 function npxInstalledBin(dir, pkgName, name) {
   try {
     if (!word(name) || name.includes('/') || name === '.' || name === '..') return null;
     const pkgDir = path.join(dir, 'node_modules', pkgName);
-    const manifest = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8'));
-    // `"bin": "cli.js"` publishes one bin named for the package, without its scope.
-    const bins = typeof manifest.bin === 'string' ? { [pkgName.replace(/^@[^/]+\//, '')]: manifest.bin }
-      : (manifest.bin && typeof manifest.bin === 'object' && !Array.isArray(manifest.bin) ? manifest.bin : null);
-    if (!bins || typeof bins[name] !== 'string' || !bins[name]) return null;
+    const selected = npxSelectedBin(JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8')), pkgName);
+    if (!selected || selected.name !== name) return null;
     const link = path.join(dir, 'node_modules', '.bin', name);
-    const target = realpath(path.join(pkgDir, bins[name]));
+    const target = realpath(path.join(pkgDir, selected.file));
     return target && realpath(link) === target ? link : null;
   } catch { return null; }
 }

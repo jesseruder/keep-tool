@@ -282,6 +282,49 @@ test('an npx-declared server is admitted only as the npx cache install of the de
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('an npx package is matched on the one bin npm would select, not any it publishes', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-mcp-npx-bins-'));
+  try {
+    const cwd = path.join(root, 'project');
+    fs.mkdirSync(cwd);
+    const cacheRoot = path.join(root, 'npm-cache');
+    const env = { npm_config_cache: cacheRoot };
+    const parent = { pid: 1, args: '/test/claude' };
+    const check = (rows) => inspect({ root, agent: 'claude', sessionId: 'session-1', parent, rows, cwd, env });
+    const declare = (spec) => fs.writeFileSync(path.join(cwd, '.mcp.json'), JSON.stringify({ mcpServers: {
+      demo: { command: 'npx', args: ['-y', spec] } } }));
+    const rowsFor = (spec, binDir, name) => [parent,
+      { pid: 2, ppid: 1, pidStart: 'launcher', args: `npm exec ${spec}` },
+      { pid: 3, ppid: 2, pidStart: 'server', args: `node ${path.join(binDir, name)}` }];
+
+    // Several bins, and npm runs the one named after the package. The others exist on
+    // disk and resolve perfectly well; they are still not what this declaration runs.
+    const many = 'demo-mcp@2.0.0';
+    const multi = npxInstall(cacheRoot, many, 'demo-mcp', { 'demo-mcp': 'cli.js', maintenance: 'other.js' });
+    declare(many);
+    assert.deepEqual(check(rowsFor(many, multi.binDir, 'demo-mcp')).map((h) => h.pid), [2, 3],
+      'the bin named for the package is the one npm selects');
+    assert.throws(() => check(rowsFor(many, multi.binDir, 'maintenance')), /background/,
+      'a published bin npm would not have run is not this declaration');
+
+    // One bin under a name of its own: with nothing to choose between, that is it.
+    const only = 'solo-mcp@1.0.0';
+    const solo = npxInstall(cacheRoot, only, 'solo-mcp', { 'run-solo': 'cli.js' });
+    declare(only);
+    assert.deepEqual(check(rowsFor(only, solo.binDir, 'run-solo')).map((h) => h.pid), [2, 3],
+      'a single bin is selected whatever it is called');
+
+    // Several bins and none named for the package: npm needs a --package/--call to
+    // pick one, and this declaration carries neither, so nothing is derived.
+    const none = 'ambiguous-mcp@1.0.0';
+    const ambiguous = npxInstall(cacheRoot, none, 'ambiguous-mcp', { serve: 'cli.js', maintenance: 'other.js' });
+    declare(none);
+    for (const name of ['serve', 'maintenance']) {
+      assert.throws(() => check(rowsFor(none, ambiguous.binDir, name)), /background/, name);
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('an unscoped npx package publishes its bin under its own name', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-mcp-npx-string-bin-'));
   try {
