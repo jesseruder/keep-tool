@@ -1,10 +1,36 @@
 # Session-owned MCP helpers
 
 Restart still requires a verified idle prompt, no outstanding tool calls or jobs,
-and unchanged session identity. A configured MCP server is not automatically safe:
-some servers retain work after returning a tool result.
+and unchanged session identity. A process under the agent is not automatically safe:
+it may be real background work rather than a helper, so anything unaccounted for
+blocks the restart. Two things account for one: the session's own configuration
+declares it, or the operator has audited it.
 
-`.keep/mcp-restart.json` is an explicit, local audit policy:
+## Declared servers
+
+A Claude child process is admitted without policy when it is a stdio server the
+session's own configuration declares: the `--mcp-config` file on the agent's argv,
+`<cwd>/.mcp.json`, or the account's `.claude.json` (top-level `mcpServers` for user
+scope and `projects[<cwd>].mcpServers` for local scope). Those declarations are
+restart-safe by construction — resuming the session launches every declared server
+again from the same file, so a running instance is replaceable and admitting it grants
+nothing the session did not already start for itself. Only `command` and `args` are
+read; `env` is never inspected, compared, or logged, and no declared command is ever
+executed.
+
+A live row matches a declaration by its exact command line, by an absolute launcher
+whose basename is the bare declared command (`npm` → `/opt/node/bin/npm`), or by an
+interpreter expansion `<interpreter> <declared argv>`. When the launcher's own first
+line names a single absolute interpreter, the live interpreter must resolve to that
+same file — `python` and `python3` in one virtualenv match, the same basename
+elsewhere does not. Arguments containing whitespace stay ambiguous and unmatched. A
+matched server is captured together with its whole descendant subtree as one helper
+unit, since a launcher such as `npm exec` runs the real server as a child; every
+process in the unit must have a start time, and all of them must be gone before
+resume. Codex keeps its audited runtime-tree path below and has no declared rule.
+
+Helpers that appear in no declaration still need policy. `.keep/mcp-restart.json` is
+an explicit, local audit policy:
 
 ```json
 {"version":1,"servers":[{"agent":"claude","server":"example",
@@ -20,9 +46,10 @@ secrets into policy or logs. Pin the launcher and all audited implementation fil
 reaudit after implementation or dependency updates. Policy is a trusted operator
 assertion, not an automatic proof of server semantics or a sandbox against local edits.
 
-Matching requires the exact absolute command/arguments, or its single absolute
+Pinned matching requires the exact absolute command/arguments, or its single absolute
 shebang interpreter expansion. Arguments containing whitespace or ambiguous
-characters, launch wrappers, unknown helpers, and helpers with children stay blocked.
+characters, launch wrappers, unknown helpers, and pinned helpers with children of
+their own stay blocked.
 The process must be a direct child of the verified agent; PID/start time and command
 are captured and checked again before exit. No helper is killed by this feature.
 After graceful exit, the old helper identities must disappear before resume; an
@@ -31,6 +58,10 @@ orphan stops the restart and is reported rather than force-killed.
 Additional servers require policy/configuration and an audit, not per-server code.
 This does not cover arbitrary config precedence, remote MCP servers, shell launch
 chains, or autonomous servers with persistent jobs.
+
+A declaration is an accounting rule, never a licence to kill: nothing is signalled.
+A process that matches a declaration but does not exit when the agent does still stops
+the restart, reported as a surviving helper.
 
 ## Codex runtime trees
 
