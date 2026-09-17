@@ -199,6 +199,11 @@ const BOUNDARY_LOOKAHEAD = 3;
 const VALUE_LINE = /^Value\s*:/;
 const LABELS_LINE = /^Labels\s*:/;
 const FIELD_LINE = /^(?:Value|Source|Silence)\s*:/;
+const ANNOTATIONS_LINE = /^Annotations\s*:/;
+// Every field that ends a block's label list, so the search for that list's
+// `Annotations:` line cannot run on into the next block and find its one.
+const BLOCK_FIELD_LINE = /^(?:Value|Labels|Source|Silence)\s*:/;
+const LABEL_ENTRY = /^\s{0,3}-\s+[A-Za-z_][\w.]*\s*=\s/;
 
 // The `Labels:` line belonging to the `Value:` line at `index`, or -1 when
 // there is none. An annotation's text can wrap onto its own line at column
@@ -223,6 +228,23 @@ function labelsFor(lines, index) {
 // a `Value:` line that owns a `Labels:` line, or a `Labels:` line no such
 // `Value:` line has claimed — otherwise an alert whose `Value:` line is missing
 // gets absorbed into the block before it and silently overwrites its labels.
+//
+// An unclaimed `Labels:` line has to earn it, though: annotation text wraps
+// onto column-zero lines of its own, so a description reading "Labels: none of
+// these matter" is the exact mirror of the `Value:` problem. A real label list
+// opens with a `key = value` entry and the block it starts reaches its own
+// `Annotations:` line before any other field could end it.
+function startsLabelList(lines, index) {
+  let next = index + 1;
+  while (next < lines.length && !lines[next].trim()) next += 1;
+  if (next >= lines.length || !LABEL_ENTRY.test(lines[next])) return false;
+  for (let ahead = next; ahead < lines.length; ahead += 1) {
+    if (ANNOTATIONS_LINE.test(lines[ahead])) return true;
+    if (BLOCK_FIELD_LINE.test(lines[ahead])) return false;
+  }
+  return false;
+}
+
 function blockStarts(lines) {
   const claimed = new Set();
   const starts = new Set();
@@ -234,7 +256,8 @@ function blockStarts(lines) {
     starts.add(index);
   }
   for (let index = 0; index < lines.length; index += 1) {
-    if (LABELS_LINE.test(lines[index]) && !claimed.has(index)) starts.add(index);
+    if (!LABELS_LINE.test(lines[index]) || claimed.has(index)) continue;
+    if (startsLabelList(lines, index)) starts.add(index);
   }
   return [...starts].sort((a, b) => a - b);
 }
@@ -272,11 +295,17 @@ function parseGrafanaBlock(body) {
   let value = '';
   let source = '';
   let silence = '';
+  // Each header counts once. A block has one of each, so a second `Labels:` or
+  // `Value:` is an annotation's wrapped text rather than a field: honouring it
+  // would reopen the labels section and file that annotation's own entries as
+  // labels, which puts them in the signature.
+  const seen = new Set();
   for (const line of String(body || '').split('\n')) {
     const pair = line.match(/^\s*-\s*([A-Za-z0-9_.:-]+)\s*=\s*(.*)$/);
     if (pair && section) { section[pair[1]] = pair[2].trim(); continue; }
     const head = line.match(/^(Labels|Annotations|Value|Source|Silence)\s*:\s*(.*)$/);
-    if (!head) continue;
+    if (!head || seen.has(head[1])) continue;
+    seen.add(head[1]);
     if (head[1] === 'Labels') { section = labels; continue; }
     if (head[1] === 'Annotations') { section = annotations; continue; }
     section = null;
@@ -995,6 +1024,10 @@ function recordPoll(options = {}) {
   const failed = Math.max(0, Number(options.failed) || 0);
   const error = failed ? oneLine(options.error || 'write failed', 200) : '';
   const outcome = mutateState((state) => {
+    // A poll that started earlier can finish later. Letting it overwrite a
+    // newer poll's record would clear a failure nobody has fixed yet.
+    const prior = state.lastPoll && typeof state.lastPoll === 'object' ? state.lastPoll : null;
+    if (prior && Number(prior.at) > at) return;
     state.lastPoll = { at, failed, ...(error ? { error } : {}) };
   }, { root, write: options.write });
   return Boolean(outcome && outcome.ok);

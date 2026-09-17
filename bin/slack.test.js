@@ -171,6 +171,22 @@ test('a rejected domain is not cached either', async () => {
   assert.equal('workspaceDomain' in cursors, false);
 });
 
+test('a cached domain is revalidated on read, not trusted', async () => {
+  // Anything cursors.json already holds was written before this validation
+  // existed, so the cache has to earn its way through it on every read.
+  const poisoned = { workspaceDomain: 'attacker.example#castle-xyz' };
+  let asked = 0;
+  const call = async () => { asked += 1; return { url: 'https://castle-xyz.slack.com/' }; };
+  assert.equal(await workspaceDomain(poisoned, call), 'castle-xyz');
+  assert.equal(asked, 1, 'the poisoned value was discarded and whoami consulted');
+  assert.equal(poisoned.workspaceDomain, 'castle-xyz');
+
+  // A cached value that is merely unnormalised is repaired in place, no lookup.
+  const stale = { workspaceDomain: 'CASTLE-XYZ.slack.com' };
+  assert.equal(await workspaceDomain(stale, async () => { throw new Error('should not be called'); }), 'castle-xyz');
+  assert.equal(stale.workspaceDomain, 'castle-xyz');
+});
+
 test('an empty domain answer is never cached, and the configured domain wins', async () => {
   // A cached "" is what pinned every permalink to empty: the key was present,
   // falsy, and rewritten on every poll.

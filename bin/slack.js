@@ -807,7 +807,14 @@ function whoamiDomain(who) {
 
 async function workspaceDomain(cursors, call = callSlack, configured = '') {
   if (configured) return configured;
-  if (cursors.workspaceDomain) return cursors.workspaceDomain;
+  // Revalidated on read, not only on write: a value cached before this
+  // validation existed would otherwise keep reaching permalink() forever.
+  const cached = workspaceHost(cursors.workspaceDomain);
+  if (cached) {
+    cursors.workspaceDomain = cached;
+    return cached;
+  }
+  delete cursors.workspaceDomain;
   const domain = whoamiDomain(await call('slack_whoami', {}));
   // Never cache an empty answer. Writing `workspaceDomain: ""` back into
   // cursors.json is how every permalink on every decision row and incident

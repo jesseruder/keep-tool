@@ -869,6 +869,16 @@ contiguous message actually landed, so later messages remain for the next poll. 
 bug card ids are deterministic (`slack-<channel>-<timestamp-without-dot>`), and a
 `landing` state plus those ids makes retries reuse cards and thread check-ins.
 
+Permalinks need the workspace domain, which comes from `slack_whoami` — from whichever
+of `domain`, `team_domain`, `team.domain` or `url` carries one, since that answer's
+shape varies by build. It is validated rather than trimmed, on write *and* on every
+read of the cached copy in `cursors.json`, because it is interpolated into every link
+written onto a card: a url is parsed and its host must end in `.slack.com`, a bare
+value must carry no path, credentials, port or whitespace, and what is left must be a
+single lowercase DNS label. Anything else is no domain, and no domain is ever cached —
+a cached empty string is what made every permalink empty for a day. `watch/slack.json`
+takes an optional `domain` that wins over the lookup, through the same validation.
+
 The classifier uses the configured small model (`haiku` by default). Each message is
 clipped to 1,500 characters, files contribute names only, thread prompts keep the
 parent plus the last 12 replies, related refs are capped at six, and reactions are
@@ -917,18 +927,25 @@ text and top-level text (bot posts put their body in `attachments[0]`, ad-hoc po
 the top-level text), with `&gt;`/`&lt;`/`&amp;` unescaped first:
 
 - **Grafana** — a `**Firing**` or `**Resolved**` header followed by one or more blocks,
-  each beginning `Value:` and carrying `Labels:`, `Annotations:`, `Source:` and
+  each usually beginning `Value:` and carrying `Labels:`, `Annotations:`, `Source:` and
   `Silence:`. One Slack message can carry several alerts with different names and
   different states: `[FIRING:1, RESOLVED:1]` writes two headers with a block each, and
   `[FIRING:3]` writes one header with three blocks. Splitting happens on both, so each
   block becomes its own alert with its own labels; splitting on the header alone merged
-  three separately stuck sandboxes into one signature and one card. A `Value:` line is a
-  block boundary only when that alert's `Labels:` line follows it within three lines and
-  before any other field: an annotation's text can wrap onto its own line at column zero,
-  so a description containing "Value: something" would otherwise open a spurious
-  label-less card. A section with no boundary at all is read as one block, and text ahead
-  of the first boundary is its own block when it carries a `Labels:` line — an alert
-  missing its own `Value:` line would otherwise be swallowed into the next one's slice.
+  three separately stuck sandboxes into one signature and one card.
+
+  Inside a section, blocks are found by their `Labels:` line, since that is what makes a
+  block an alert while `Value:` is only how one usually starts. A boundary is either a
+  `Value:` line whose own `Labels:` line follows within three lines and before any other
+  field, or a `Labels:` line no such `Value:` line has claimed — the latter only when it
+  is immediately followed by a `key = value` entry and reaches its own `Annotations:`
+  line before the next field. Both halves of that rule are there because an annotation's
+  text wraps onto lines of its own at column zero: a stray `Value:` or `Labels:` line in
+  a description is body text, not a boundary, and would otherwise open a spurious
+  label-less card or steal the labels of the block it sits in. For the same reason each
+  field header is read once per block; a repeat is body text. A section with no boundary
+  at all is read as one block.
+
   The title is the
   `alertname` label, never the Slack title, which is unusable on a grouped post. The
   signature is `grafana:<slug(alertname)>` plus every other label as sorted
@@ -1002,7 +1019,17 @@ close whose state write failed is not appended to the card again by every later 
 a later firing is a new period with its own marker and does get its own line.
 
 `keep incidents [--json]` lists the open signatures with their card, area, fire count
-and last firing. `keep incidents parse <file|-> [--json]` parses one Slack message — or
+and last firing, and closes with a `pending: N incident write(s) failed at <time>:
+<error>` line when the last poll could not land one (`{open, pending}` in `--json`).
+That line is printed with nothing open too, since a poll that failed every write is
+exactly the case with no open incident to show. The same failure fails the Slack
+channel's health row for that tick — `N incident write(s) failed: <error>` — because
+the message stays behind the channel cursor until the write lands, so nothing newer is
+fetched meanwhile. `.keep/incidents/state.json` keeps it as `lastPoll: {at, failed,
+error}`, written by the newest poll only, so a poll that started earlier and finished
+later cannot clear a newer failure.
+
+`keep incidents parse <file|-> [--json]` parses one Slack message — or
 a JSON array of them — exactly as the poll would, which is how a new alert shape gets
 debugged without polling.
 

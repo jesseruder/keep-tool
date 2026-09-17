@@ -230,6 +230,26 @@ test('one state header with three Value blocks yields three alerts, not one merg
     assert.deepEqual(unchanged.map((alert) => alert.signature), parsed.map((alert) => alert.signature));
     assert.deepEqual(unchanged.map((alert) => alert.title), parsed.map((alert) => alert.title));
 
+    // And the mirror of it: a `Labels:` line inside annotation text opens no
+    // block, because its list reaches `Source:` before any `Annotations:`.
+    const labelled = JSON.parse(JSON.stringify(GROUPED_THREE));
+    labelled.attachments[0].text = labelled.attachments[0].text.replace(
+      ' - summary = 16.26406638888889 sandbox opens failed',
+      'Labels: none of these matter\n - summary = 16.26406638888889 sandbox opens failed',
+    );
+    const ignored = parse(root, labelled);
+    assert.deepEqual(ignored.map((alert) => alert.signature), parsed.map((alert) => alert.signature));
+    assert.deepEqual(ignored.map((alert) => alert.title), parsed.map((alert) => alert.title));
+
+    // A `Labels:` line whose next line is prose, not a `key = value` entry, is
+    // not a label list either.
+    const prose = JSON.parse(JSON.stringify(GROUPED_THREE));
+    prose.attachments[0].text = prose.attachments[0].text.replace(
+      ' - description = ghost\'s openOrResumeSandbox is failing.',
+      ' - description = see below\nLabels: whatever the operator wrote\nstill prose',
+    );
+    assert.deepEqual(parse(root, prose).map((alert) => alert.signature), parsed.map((alert) => alert.signature));
+
     // A section with a `Labels:` line but no `Value:` line is still one block.
     const noValue = JSON.parse(JSON.stringify(SANDBOX_OPENS_FIRING));
     noValue.attachments[0].text = noValue.attachments[0].text.replace(/^Value:.*\n/m, '');
@@ -826,9 +846,19 @@ test('the last poll\'s failed writes are recorded where anyone asking about inci
     assert.equal(Object.keys(incidents.loadState(root).signatures).length, 1);
     assert.equal(incidents.openIncidents(root).length, 1);
 
+    // A poll that started earlier and finished later must not clear a newer
+    // poll's failure.
+    assert.equal(incidents.recordPoll({ root, now: 1500, failed: 0 }), true);
+    assert.deepEqual(incidents.pendingFailures(root),
+      { at: 2000, failed: 2, error: 'project castle-sandboxes did not resolve' });
+
     // And once the writes land, the pending line goes away.
     incidents.recordPoll({ root, now: 3000, failed: 0 });
     assert.equal(incidents.pendingFailures(root), null);
+    assert.deepEqual(incidents.lastPoll(root), { at: 3000, failed: 0, error: '' });
+    // Same instant replaces, so a retry within the clock's resolution lands.
+    incidents.recordPoll({ root, now: 3000, failed: 1, error: 'registry lock timed out' });
+    assert.equal(incidents.pendingFailures(root).failed, 1);
   } finally { cleanup(root); }
 });
 
