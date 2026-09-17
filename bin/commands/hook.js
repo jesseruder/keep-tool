@@ -148,8 +148,13 @@ function codexHook(kind, input) {
       return;
     }
     // The pane is what says whether anybody is reading this session, and the Stop
-    // hook itself is synchronous, so the read happens here.
-    return unattendedState(input.session_id).catch(() => ({ unattended: false })).then((unattended) => {
+    // hook itself is synchronous, so the read happens here — and only for a session
+    // the start hook already found unattended.
+    const recorded = recordedUnattended(input.session_id);
+    const attendance = recorded && recorded.unattended
+      ? unattendedState(input.session_id).catch(() => recorded)
+      : Promise.resolve({ unattended: false });
+    return attendance.then((unattended) => {
       const blocked = stopHook(input, 'codex', { unattended }) === true;
       indexTurns(input, 'codex');
       if (blocked) return true;
@@ -399,8 +404,14 @@ commands.hook = async (argv) => {
   if (argv[0] === 'stop') {
     // enforcement must never break a session's ability to stop
     try {
+      // Only a session the start hook found unattended can be pushed back, so ask the
+      // pane (in case a console keystroke since then cleared the mark) only then:
+      // Owner's own Stop hook never waits on the host for this.
       let unattended = { unattended: false };
-      try { unattended = await unattendedState(input && input.session_id); } catch {}
+      try {
+        const recorded = recordedUnattended(input && input.session_id);
+        if (recorded && recorded.unattended) unattended = await unattendedState(input.session_id);
+      } catch {}
       const blocked = stopHook(input, 'claude', { unattended }) === true;
       if (!blocked) recordClaudeCompletion(input);
     } catch {}
