@@ -10,8 +10,11 @@ declares it, or the operator has audited it.
 
 A Claude child process is admitted without policy when it is a stdio server the
 session's own configuration declares: the `--mcp-config` file on the agent's argv,
-`<cwd>/.mcp.json`, or the account's `.claude.json` (top-level `mcpServers` for user
-scope and `projects[<cwd>].mcpServers` for local scope). Those declarations are
+`<cwd>/.mcp.json`, or the `.claude.json` of the account the restart resolved for this
+session (top-level `mcpServers` for user scope and `projects[<cwd>].mcpServers` for
+local scope). That account is passed in by the caller and no other is consulted: a
+server the default account declares is not this session's, and a session with no
+resolved account draws on the first two sources only. Those declarations are
 restart-safe by construction — resuming the session launches every declared server
 again from the same file, so a running instance is replaceable and admitting it grants
 nothing the session did not already start for itself. Only `command` and `args` are
@@ -20,14 +23,32 @@ executed.
 
 A live row matches a declaration by its exact command line, by an absolute launcher
 whose basename is the bare declared command (`npm` → `/opt/node/bin/npm`), or by an
-interpreter expansion `<interpreter> <declared argv>`. When the launcher's own first
-line names a single absolute interpreter, the live interpreter must resolve to that
-same file — `python` and `python3` in one virtualenv match, the same basename
-elsewhere does not. Arguments containing whitespace stay ambiguous and unmatched. A
-matched server is captured together with its whole descendant subtree as one helper
+interpreter expansion `<interpreter> <declared argv>`. The interpreter is never free:
+the launcher must be an absolute path whose own first line is either a single absolute
+interpreter, which the live one must resolve to by realpath (`python` and `python3` in
+one virtualenv are the same binary; the same basename elsewhere is not), or
+`#!/usr/bin/env NAME` with one bare name, which admits a command of that name, bare or
+absolute (`node /opt/node/bin/npm exec …`). A launcher with no readable shebang of
+either shape has no interpreter-expanded form at all, so `/bin/sh /path/server` is
+refused.
+
+What a match asserts is that the row, joined with single spaces, is the declared
+invocation. It cannot assert where the live process put its argument boundaries: `ps`
+joins argv with spaces, so one element containing a space reads exactly like two.
+Declarations whose own command or arguments carry whitespace are dropped, which
+settles the declared side only. A bare declared command matches that basename at any
+absolute path, since PATH is what chose it.
+
+A matched server is captured together with its whole descendant subtree as one helper
 unit, since a launcher such as `npm exec` runs the real server as a child; every
 process in the unit must have a start time, and all of them must be gone before
-resume. Codex keeps its audited runtime-tree path below and has no declared rule.
+resume. The unit is a snapshot: a descendant the launcher spawns after it is taken is
+not waited for. That one is orphaned when the agent exits, and the resumed session
+launches its declared servers again. Waiting for it would mean matching process
+groups, and the `ps` rows carry no pgid — adding one changes the single `ps`
+invocation and positional parser every identity proof in the daemon reads, which is a
+worse risk than the residual. Codex keeps its audited runtime-tree path below and has
+no declared rule.
 
 Helpers that appear in no declaration still need policy. `.keep/mcp-restart.json` is
 an explicit, local audit policy:

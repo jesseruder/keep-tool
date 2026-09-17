@@ -3942,7 +3942,7 @@ async function restartSession(body, deps = {}) {
       if (!identity?.primary || identity.pid !== originalIdentity.pid || identity.pidStart !== originalIdentity.pidStart) throw Error('Agent process identity changed during restart');
       const parent = rows.find((p) => p.pid === identity.pid);
       const helpers = mcpRestart.inspect({ root: deps.root || keep.ROOT, agent: session.kind, sessionId: session.id, parent, rows,
-        cwd: session.project || pane.cwd });
+        cwd: session.project || pane.cwd, account });
       if (restartHelpers && JSON.stringify(helpers) !== JSON.stringify(restartHelpers)) throw Error('Session helper processes changed during restart');
       restartHelpers = helpers;
       try { childProof(); } catch (error) {
