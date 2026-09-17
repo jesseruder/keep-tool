@@ -383,6 +383,67 @@ test('an event that landed keeps its alert and heals the summary on the next emi
   } finally { cleanup(root); }
 });
 
+test('a needs-you event older than the tail window keeps the badge red until it is seen', () => {
+  const root = makeRoot();
+  try {
+    agents.ensure('sandboxes', {}, { root });
+    const sent = [];
+    agents.emit('sandboxes', {
+      kind: 'needs-you', card: 'inc-one', needsYou: true, text: 'raise the cap or drain?',
+    }, { root, now: 1000, sendAlert: (request) => sent.push(request) });
+    assert.equal(sent.length, 1);
+    assert.deepEqual(agents.readRecord('sandboxes', root).unseen, { count: 1, needsYou: true });
+
+    // Enough unseen chatter after it to push it out of the window. Written to
+    // the feed directly: 600 emits would each re-read the whole window, and what
+    // is under test is the read, not the appending.
+    const filler = [];
+    for (let index = 0; index < 600; index += 1) filler.push(paddedFeedLine(index, 512));
+    fs.appendFileSync(agents.eventsFile('sandboxes', root), filler.join('\n') + '\n');
+    const tail = agents.readTail('sandboxes', { root, limit: 2000 });
+    assert.equal(tail.truncated, true);
+    assert.equal(tail.events.some((entry) => entry.needsYou), false,
+      'the needs-you event really is outside the window');
+
+    agents.emit('sandboxes', { kind: 'watching', card: 'inc-one', text: 'waiting for the next scrape' }, { root, now: 9000 });
+    const record = agents.readRecord('sandboxes', root);
+    // The rebuild could not see the needs-you event, so it may not recolour the
+    // badge: something is still waiting for Owner and grey would say otherwise.
+    assert.equal(record.unseen.needsYou, true, 'the colour is carried forward, not recomputed away');
+    assert.equal(record.unseen.truncated, true, 'and the count is marked a lower bound');
+    assert.ok(record.unseen.count > 1 && record.unseen.count < 602,
+      `a lower bound, not the total: ${record.unseen.count}`);
+    assert.equal(record.lastEvent.kind, 'watching');
+    // The dashboard row carries both, so the badge is red and the count honest.
+    const row = agents.dashboardAgents({ root })[0];
+    assert.equal(row.unseen.needsYou, true);
+    assert.equal(row.unseen.truncated, true);
+
+    // markSeen reads every event, so it is the one thing allowed to clear them.
+    const swept = agents.markSeen('sandboxes', 9000, { root, now: 10000 });
+    assert.equal(swept.marked, 602);
+    assert.deepEqual(agents.readRecord('sandboxes', root).unseen, { count: 0, needsYou: false });
+    assert.equal(Object.hasOwn(agents.readRecord('sandboxes', root).unseen, 'truncated'), false);
+  } finally { cleanup(root); }
+});
+
+test('a rebuild that saw the whole feed is authority, and clears a stale colour', () => {
+  const root = makeRoot();
+  try {
+    agents.ensure('sandboxes', {}, { root });
+    agents.emit('sandboxes', { kind: 'diagnosed', card: 'inc-one', text: 'host pool is full' }, { root, now: 1000 });
+    // A colour left over from a truncated rebuild, with nothing in the feed to
+    // justify it.
+    agents.writeRecord('sandboxes', { unseen: { count: 9, needsYou: true, truncated: true } }, { root });
+
+    agents.emit('sandboxes', { kind: 'watching', card: 'inc-one', text: 'waiting' }, { root, now: 2000 });
+    const record = agents.readRecord('sandboxes', root);
+    assert.deepEqual(record.unseen, { count: 2, needsYou: false },
+      'this read saw the whole feed, so it is not carrying anything forward');
+    assert.equal(Object.hasOwn(record.unseen, 'truncated'), false);
+  } finally { cleanup(root); }
+});
+
 test('markSeen rewrites and emit appends under one lock each, losing neither write', () => {
   const root = makeRoot();
   try {

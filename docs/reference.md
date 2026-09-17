@@ -1046,8 +1046,8 @@ next.
 `.keep/agents/<name>/` holds one agent:
 
 - `record.json` — `{name, role, model, account, project, cwd, area, session: {id, pane,
-  startedAt}, lifecycle, card, lastEvent, unseen: {count, needsYou}, lastTick, restarts,
-  createdAt}`. `lifecycle` is `idle`, `working`, `needs-you` or `stopped`. Every write
+  startedAt}, lifecycle, card, lastEvent, unseen: {count, needsYou, truncated?}, lastTick,
+  restarts, createdAt}`. `lifecycle` is `idle`, `working`, `needs-you` or `stopped`. Every write
   loads, merges and saves inside the registry lock, so two writers cannot each load the
   same record and lose the other's change. `lastEvent` and `unseen` are the feed's
   summary, kept here so a dashboard build never opens `events.jsonl`: an agent months
@@ -1056,8 +1056,12 @@ next.
   `emit` rebuilds them from the tail window inside the lock that appended the event, and
   `markSeen`, which rewrites the whole file anyway, rebuilds them from all of it — so a
   summary an earlier failure left behind heals on the next write instead of drifting
-  further. A feed holding more unseen events than fit in the tail window undercounts the
-  badge until `markSeen` settles it; a badge is a summary, not a ledger.
+  further. A rebuild that only saw the tail window cannot prove either number: it marks
+  the count a lower bound with `unseen.truncated` and carries the previous
+  `needsYou` forward, because an unseen needs-you event older than the window would
+  otherwise turn a badge that is still waiting for Owner from red to grey. Both go one
+  way; only `markSeen`, which reads every event, clears them. A badge is a summary, not
+  a ledger.
 - `events.jsonl` — the feed. `{at, kind, card, severity, needsYou, seenAt, …}`, one
   event per line, append order. Events carry pointers — a card, a signature, one line
   of text — never message bodies: the home model pays for every byte it reads. Event
@@ -1105,7 +1109,8 @@ alerts and shows up in the row.
 ### The Agents section in triage
 
 `/api/state` publishes `agents: [{name, role, model, area, project, lifecycle, card,
-session, lastEvent, unseen: {count, needsYou}}]`. The console's triage queue renders an
+session, lastEvent, unseen: {count, needsYou, truncated?}}]`. The console's triage queue
+renders an
 **Agents** group above Running & waiting, and only when that array is non-empty. One row
 per agent: the name, the lifecycle (`idle` / `on <card>` / `needs you` / `stopped`), the
 last event as a one-liner with its relative time, and a badge with the unseen count —

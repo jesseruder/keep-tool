@@ -118,7 +118,13 @@ function normalizeRecord(name, value = {}) {
     // and markSeen — which rewrites the file anyway — recomputes them from it,
     // which is also how a count that drifted is repaired.
     lastEvent: eventSummary(value.lastEvent),
-    unseen: { count: Math.max(0, Number(unseen.count || 0) || 0), needsYou: unseen.needsYou === true },
+    unseen: {
+      count: Math.max(0, Number(unseen.count || 0) || 0),
+      needsYou: unseen.needsYou === true,
+      // Only present when the count is a lower bound — the rebuild that wrote
+      // it did not see the whole feed. markSeen, which does, clears it.
+      ...(unseen.truncated === true ? { truncated: true } : {}),
+    },
   };
 }
 
@@ -249,12 +255,17 @@ function loadEvents(name, root = keep.ROOT) {
 // A feed that is not there is empty; a feed that exists and cannot be read
 // throws, because a caller that writes what it read back (emit's summary,
 // markSeen) must not be handed an empty list for it.
-function readEvents(name, options = {}) {
+//
+// `truncated` says the page is not the whole feed: the window began after the
+// start of the file, or more events were in it than the limit returns. A caller
+// deriving a total from this page has to treat it as a lower bound.
+function readTail(name, options = {}) {
   const root = options.root || keep.ROOT;
   const limit = Math.min(EVENT_LIMIT, Math.max(1, Number(options.limit) || DEFAULT_EVENT_LIMIT));
   const file = eventsFile(name, root);
   let text = '';
   let partial = false;
+  let windowed = false;
   let handle;
   try {
     handle = fs.openSync(file, 'r');
@@ -266,15 +277,21 @@ function readEvents(name, options = {}) {
     if (length) fs.readSync(handle, buffer, 0, length, start - probe);
     // 0x0a is '\n': the byte before the window ended a line, so nothing was cut.
     partial = probe === 1 && buffer[0] !== 0x0a;
+    // Whether or not a line was cut, everything before the window is unread.
+    windowed = start > 0;
     text = buffer.subarray(probe).toString('utf8');
   } catch (error) {
     if (!error || error.code !== 'ENOENT') throw error;
-    return [];
+    return { events: [], truncated: false };
   }
   finally { if (handle !== undefined) { try { fs.closeSync(handle); } catch {} } }
   let events = parseEventLines(partial ? text.slice(text.indexOf('\n') + 1) : text).reverse();
   if (options.unseen) events = events.filter((event) => !event.seenAt);
-  return events.slice(0, limit);
+  return { events: events.slice(0, limit), truncated: windowed || events.length > limit };
+}
+
+function readEvents(name, options = {}) {
+  return readTail(name, options).events;
 }
 
 function unseenSummary(events) {
@@ -361,12 +378,20 @@ function emit(name, event = {}, options = {}) {
         // Rebuilt from the feed rather than counted up from the record: a
         // summary an earlier failure left behind heals on the next emit instead
         // of drifting further. The tail window is what bounds the cost, and it
-        // is the same read the API does. A feed with more unseen events than fit
-        // in the window undercounts the badge until markSeen — which reads all
-        // of it — settles the number; a badge is a summary, not a ledger.
-        const tail = readEvents(name, { root, limit: EVENT_LIMIT });
+        // is the same read the API does.
+        const tail = readTail(name, { root, limit: EVENT_LIMIT });
+        const summary = unseenSummary(tail.events);
+        // A page that is not the whole feed can only lower-bound the count, and
+        // it cannot prove a colour: an unseen needs-you event older than the
+        // window would turn the badge grey while it is still waiting for Owner.
+        // So the count is marked a lower bound and the previous colour is
+        // carried forward. It goes one way — only markSeen, which reads every
+        // event, is allowed to clear either.
+        const unseen = tail.truncated
+          ? { ...summary, needsYou: summary.needsYou || record.unseen.needsYou, truncated: true }
+          : summary;
         writeJsonAtomic(recordFile(name, root), normalizeRecord(name, {
-          ...record, lastEvent: tail[0] || entry, unseen: unseenSummary(tail),
+          ...record, lastEvent: tail.events[0] || entry, unseen,
         }));
       } catch (error) { return { ok: true, recordError: error }; }
       return { ok: true };
@@ -424,7 +449,10 @@ function markSeen(name, until = Date.now(), options = {}) {
       const last = events.length ? events[events.length - 1] : null;
       const current = eventSummary(record.lastEvent);
       const rebuilt = eventSummary(last);
+      // A `truncated` flag is always cleared here even when the numbers agree:
+      // this read saw every event, so the count is exact from now on.
       if (record.unseen.count !== summary.count || record.unseen.needsYou !== summary.needsYou
+          || record.unseen.truncated === true
           || JSON.stringify(current) !== JSON.stringify(rebuilt)) {
         writeJsonAtomic(recordFile(name, root), normalizeRecord(name, {
           ...record, unseen: summary, lastEvent: last,
@@ -627,7 +655,7 @@ module.exports = {
   REVIEWER_NAME, EXPANDED_EVENTS, DEFAULT_EVENT_LIMIT, TAIL_BYTES,
   validName, nameFromPath, agentsDir, agentDir, recordFile, eventsFile, notesFile,
   readRecord, records, writeRecord, ensure, normalizeRecord,
-  emit, markSeen, readEvents, loadEvents, unseenSummary, eventLine, eventSummary, alertText, normalizeEvent,
+  emit, markSeen, readEvents, readTail, loadEvents, unseenSummary, eventLine, eventSummary, alertText, normalizeEvent,
   flushCommits, pendingNames,
   areaAgent, incidentEmitter,
   applySessions, agentView, reviewerView, dashboardAgents,
