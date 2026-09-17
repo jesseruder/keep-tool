@@ -193,20 +193,46 @@ function stripAngle(value) {
   return pipe > 0 ? text.slice(0, pipe) : text;
 }
 
+// How far past a `Value:` line to look for the `Labels:` line that makes it an
+// alert boundary. In Grafana's layout it is the very next line.
+const BOUNDARY_LOOKAHEAD = 3;
+const VALUE_LINE = /^Value\s*:/;
+const LABELS_LINE = /^Labels\s*:/;
+const FIELD_LINE = /^(?:Value|Source|Silence)\s*:/;
+
+// An annotation's text can wrap onto its own line at column zero, so a
+// description that happens to contain "Value: something" would otherwise look
+// like the start of another alert and open a spurious label-less card. A real
+// boundary is followed by that alert's `Labels:` before any other field.
+function isBoundary(lines, index) {
+  if (!VALUE_LINE.test(lines[index])) return false;
+  for (let ahead = index + 1; ahead <= index + BOUNDARY_LOOKAHEAD && ahead < lines.length; ahead += 1) {
+    if (LABELS_LINE.test(lines[ahead])) return true;
+    if (FIELD_LINE.test(lines[ahead])) return false;
+  }
+  return false;
+}
+
 // One state header can cover several alerts: a `[FIRING:3]` post writes
 // `**Firing**` once and then one `Value:`-led block per alert. Splitting on the
 // header alone merged all three label sets into a single signature, so three
 // separately stuck sandboxes became one card.
 function valueBlocks(section) {
-  const re = /^Value\s*:/gm;
+  const lines = section.split('\n');
   const starts = [];
-  let match;
-  while ((match = re.exec(section)) !== null) starts.push(match.index);
+  for (let index = 0; index < lines.length; index += 1) if (isBoundary(lines, index)) starts.push(index);
   // Lenient: a section with labels but no `Value:` line at all is one block.
   if (!starts.length) return [section.trim()].filter(Boolean);
-  return starts
-    .map((start, index) => section.slice(start, index + 1 < starts.length ? starts[index + 1] : section.length).trim())
-    .filter(Boolean);
+  const blocks = [];
+  // An alert missing its own `Value:` line sits ahead of the first boundary.
+  // Without this it would be swallowed into the next alert's slice and lost.
+  const preamble = lines.slice(0, starts[0]).join('\n').trim();
+  if (preamble && preamble.split('\n').some((line) => LABELS_LINE.test(line))) blocks.push(preamble);
+  for (let index = 0; index < starts.length; index += 1) {
+    const body = lines.slice(starts[index], index + 1 < starts.length ? starts[index + 1] : lines.length).join('\n').trim();
+    if (body) blocks.push(body);
+  }
+  return blocks;
 }
 
 function grafanaBlocks(text) {
@@ -534,14 +560,25 @@ function slackTsLine(ts) {
 // own, and the last firing is what distinguishes the two periods.
 // `watch/incidents.json` may name an area's project the way Owner would type it
 // ("castle-sandboxes"). addTask reads a card's scope off the project PATH, and a
-// bare name matches no scope rule, so every incident card was filed under the
-// default scope. Resolve it exactly as `keep add --project <name|path>` does. A
-// name that resolves to nothing (no open card in that project, no such
-// directory) keeps the configured value rather than failing the poll.
+// bare name matches no scope rule, so a bare name filed as-is lands every
+// incident card under the default scope. A path is already usable and costs no
+// registry walk; a bare name is resolved exactly as `keep add --project` does.
+//
+// Throwing when a bare name resolves to nothing is deliberate: the mutation
+// fails, the Slack poll does not acknowledge the message, and the next poll
+// retries it. Filing the card with the unresolved name instead would put it
+// under the wrong scope, silently, which is the bug this replaced.
+function isProjectPath(value) {
+  return /^(?:~(?:\/|$)|\/)/.test(String(value || ''));
+}
+
 function areaProject(cfg, area, deps) {
   const configured = ((cfg.areas || {})[area] || {}).project || '';
-  if (!configured) return '';
-  try { return deps.resolveProject(configured) || configured; } catch { return configured; }
+  if (!configured || isProjectPath(configured)) return configured;
+  let resolved = '';
+  try { resolved = deps.resolveProject(configured) || ''; } catch { resolved = ''; }
+  if (!resolved) throw new Error(`project ${configured} did not resolve`);
+  return resolved;
 }
 
 function closeMarker(signature, entry) {

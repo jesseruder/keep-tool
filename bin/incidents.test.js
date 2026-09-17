@@ -86,6 +86,9 @@ function fakeRegistry(root) {
         save(id);
       },
       commitAndPush() {},
+      // `watch/incidents.json` names projects the way Owner types them, so most
+      // tests go through the resolver the way production does.
+      resolveProject(name) { return path.join(os.homedir(), name); },
       emitAgentEvent(area, event) { events.push({ area, event }); },
     },
   };
@@ -193,6 +196,28 @@ test('one state header with three Value blocks yields three alerts, not one merg
     // Each block keeps its own annotations, not the last block's.
     assert.match(parsed[0].annotations.summary, /^Deck TfUHENvI4j3L in sandbox 1zdl6owxk3dglq/);
     assert.match(parsed[1].annotations.summary, /^Sandbox 1zdl6owxk3dglq on ip-10-70-4-76/);
+
+    // An alert whose own `Value:` line is missing sits ahead of the first
+    // boundary; slicing from that boundary used to drop it silently.
+    const headless = JSON.parse(JSON.stringify(GROUPED_THREE));
+    headless.attachments[0].text = headless.attachments[0].text.replace('Value: A=28, C=1\n', '');
+    const kept = parse(root, headless);
+    assert.equal(kept.length, 3);
+    assert.deepEqual(kept.map((alert) => alert.title), parsed.map((alert) => alert.title));
+    assert.equal(kept[0].signature, parsed[0].signature);
+    assert.equal(kept[0].value, '', 'it really has no Value line');
+
+    // A `Value:` line inside an annotation's own text is body, not a boundary:
+    // it has no `Labels:` after it, so it must not open a label-less card under
+    // the Slack fallback title.
+    const chatty = JSON.parse(JSON.stringify(GROUPED_THREE));
+    chatty.attachments[0].text = chatty.attachments[0].text.replace(
+      ' - summary = 16.26406638888889 sandbox opens failed',
+      ' - summary = compare these\nValue: A=99 was yesterday\nand today\n - other = 16.26406638888889 sandbox opens failed',
+    );
+    const unchanged = parse(root, chatty);
+    assert.deepEqual(unchanged.map((alert) => alert.signature), parsed.map((alert) => alert.signature));
+    assert.deepEqual(unchanged.map((alert) => alert.title), parsed.map((alert) => alert.title));
 
     // A section with a `Labels:` line but no `Value:` line is still one block.
     const noValue = JSON.parse(JSON.stringify(SANDBOX_OPENS_FIRING));
@@ -323,7 +348,7 @@ test('a firing alert opens one card, attaches suspects and emits incident-opened
     assert.equal(card.kind, 'bug');
     assert.deepEqual(card.tags, ['incident']);
     assert.equal(card.status, 'active');
-    assert.equal(card.project, 'castle-sandboxes');
+    assert.equal(card.project, path.join(os.homedir(), 'castle-sandboxes'), 'the bare name was resolved to a path');
     assert.equal(card.linkSession, false);
     assert.equal(card.commit, false);
     assert.equal(card.title, 'Incident: Sandbox opens failing');
@@ -724,19 +749,49 @@ test('an area project named by bare name is resolved to its path before the card
     assert.deepEqual(asked, ['castle-sandboxes']);
     assert.equal(registry.created[0].project, resolved);
 
-    // A project already given as a path is passed through, and a name nothing
-    // can resolve falls back to the configured value rather than failing.
+    // A project already given as a path carries its own scope, so the resolver
+    // is not asked at all.
     const other = makeRoot({ config: { areas: { sandboxes: { project: '~/castle-scope-test/castle-sandboxes', match: ['^Sandbox '], default: true } } } });
     const second = fakeRegistry(other);
     ingest(other, second, [SANDBOX_OPENS_FIRING], {
       channel: '#errors-sandboxes',
       deps: {
         ...second.deps,
-        resolveProject() { throw new Error('no open Keep project or existing directory matches'); },
+        resolveProject() { throw new Error('should not be called for a path'); },
       },
     });
     assert.equal(second.created[0].project, '~/castle-scope-test/castle-sandboxes');
     cleanup(other);
+  } finally { cleanup(root); }
+});
+
+test('a bare project name that resolves to nothing fails the write instead of mis-scoping', () => {
+  const root = makeRoot({ config: { areas: { sandboxes: { project: 'castle-sandboxes', match: ['^Sandbox '], default: true } } } });
+  try {
+    const registry = fakeRegistry(root);
+    for (const resolveProject of [
+      () => { throw new Error('no open Keep project or existing directory matches "castle-sandboxes"'); },
+      () => '',
+    ]) {
+      const { entries, events } = ingest(root, registry, [SANDBOX_OPENS_FIRING], {
+        channel: '#errors-sandboxes',
+        deps: { ...registry.deps, resolveProject },
+      });
+      // Filing the card under the unresolved name would put it in the default
+      // scope, silently and for good; leaving the message unacknowledged means
+      // the next poll tries again.
+      assert.equal(entries[0].ok, false);
+      assert.match(entries[0].error, /project castle-sandboxes did not resolve/);
+      assert.deepEqual(events, []);
+      assert.equal(registry.created.length, 0, 'no card');
+      assert.deepEqual(incidents.loadState(root).signatures, {});
+    }
+
+    // And the retry, once the project resolves, lands it.
+    const landed = ingest(root, registry, [SANDBOX_OPENS_FIRING], { channel: '#errors-sandboxes' });
+    assert.equal(landed.entries[0].ok, undefined);
+    assert.equal(registry.created.length, 1);
+    assert.equal(registry.created[0].project, path.join(os.homedir(), 'castle-sandboxes'));
   } finally { cleanup(root); }
 });
 
@@ -960,7 +1015,12 @@ test('a discarded mutation publishes no events and its retry duplicates no check
 // ---------- the Slack poll partition, end to end ----------
 
 function pollScenario() {
-  const root = makeRoot();
+  // Path projects, so the real resolver is not asked about a name this throwaway
+  // registry has never heard of; resolution has its own tests.
+  const root = makeRoot({ config: { areas: {
+    sandboxes: { project: '~/castle-sandboxes', match: ['^Sandbox '] },
+    'app-server': { project: '~/ghost-server', default: true },
+  } } });
   // The poll only fetches the last `backfillHours`, so the fixtures are reposted
   // a few minutes ago rather than at the timestamps they really carry — those
   // would age out of the window and quietly stop being tested.
