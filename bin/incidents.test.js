@@ -207,6 +207,17 @@ test('one state header with three Value blocks yields three alerts, not one merg
     assert.equal(kept[0].signature, parsed[0].signature);
     assert.equal(kept[0].value, '', 'it really has no Value line');
 
+    // Same for a block in the middle: without label-led detection it was
+    // absorbed into the block before it and its labels overwrote that one's.
+    const middle = JSON.parse(JSON.stringify(GROUPED_THREE));
+    middle.attachments[0].text = middle.attachments[0].text.replace('Value: A=14, C=1\n', '');
+    const kept2 = parse(root, middle);
+    assert.equal(kept2.length, 3);
+    assert.deepEqual(kept2.map((alert) => alert.signature), parsed.map((alert) => alert.signature));
+    assert.equal(kept2[1].value, '');
+    assert.equal(kept2[0].labels.deck_id, 'TfUHENvI4j3L');
+    assert.equal(kept2[0].labels.agent_hostname, undefined, 'the later block did not bleed back');
+
     // A `Value:` line inside an annotation's own text is body, not a boundary:
     // it has no `Labels:` after it, so it must not open a label-less card under
     // the Slack fallback title.
@@ -792,6 +803,32 @@ test('a bare project name that resolves to nothing fails the write instead of mi
     assert.equal(landed.entries[0].ok, undefined);
     assert.equal(registry.created.length, 1);
     assert.equal(registry.created[0].project, path.join(os.homedir(), 'castle-sandboxes'));
+  } finally { cleanup(root); }
+});
+
+test('the last poll\'s failed writes are recorded where anyone asking about incidents sees them', () => {
+  const root = makeRoot();
+  try {
+    assert.equal(incidents.lastPoll(root), null);
+    assert.equal(incidents.pendingFailures(root), null);
+
+    const registry = fakeRegistry(root);
+    ingest(root, registry, [SERVER_FAULTS_FIRING]);
+    // A poll that landed everything still records itself.
+    assert.equal(incidents.recordPoll({ root, now: 1000, failed: 0 }), true);
+    assert.deepEqual(incidents.lastPoll(root), { at: 1000, failed: 0, error: '' });
+    assert.equal(incidents.pendingFailures(root), null);
+
+    assert.equal(incidents.recordPoll({ root, now: 2000, failed: 2, error: 'project castle-sandboxes did not resolve' }), true);
+    assert.deepEqual(incidents.pendingFailures(root),
+      { at: 2000, failed: 2, error: 'project castle-sandboxes did not resolve' });
+    // Recording the poll must not disturb the incidents themselves.
+    assert.equal(Object.keys(incidents.loadState(root).signatures).length, 1);
+    assert.equal(incidents.openIncidents(root).length, 1);
+
+    // And once the writes land, the pending line goes away.
+    incidents.recordPoll({ root, now: 3000, failed: 0 });
+    assert.equal(incidents.pendingFailures(root), null);
   } finally { cleanup(root); }
 });
 

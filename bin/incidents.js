@@ -200,34 +200,51 @@ const VALUE_LINE = /^Value\s*:/;
 const LABELS_LINE = /^Labels\s*:/;
 const FIELD_LINE = /^(?:Value|Source|Silence)\s*:/;
 
-// An annotation's text can wrap onto its own line at column zero, so a
-// description that happens to contain "Value: something" would otherwise look
-// like the start of another alert and open a spurious label-less card. A real
-// boundary is followed by that alert's `Labels:` before any other field.
-function isBoundary(lines, index) {
-  if (!VALUE_LINE.test(lines[index])) return false;
+// The `Labels:` line belonging to the `Value:` line at `index`, or -1 when
+// there is none. An annotation's text can wrap onto its own line at column
+// zero, so a description that happens to contain "Value: something" would
+// otherwise look like the start of another alert and open a spurious label-less
+// card; a real boundary is followed by its own `Labels:` before any other field.
+function labelsFor(lines, index) {
   for (let ahead = index + 1; ahead <= index + BOUNDARY_LOOKAHEAD && ahead < lines.length; ahead += 1) {
-    if (LABELS_LINE.test(lines[ahead])) return true;
-    if (FIELD_LINE.test(lines[ahead])) return false;
+    if (LABELS_LINE.test(lines[ahead])) return ahead;
+    if (FIELD_LINE.test(lines[ahead])) return -1;
   }
-  return false;
+  return -1;
 }
 
 // One state header can cover several alerts: a `[FIRING:3]` post writes
-// `**Firing**` once and then one `Value:`-led block per alert. Splitting on the
-// header alone merged all three label sets into a single signature, so three
-// separately stuck sandboxes became one card.
+// `**Firing**` once and then one block per alert. Splitting on the header alone
+// merged all three label sets into a single signature, so three separately
+// stuck sandboxes became one card.
+//
+// Detection is label-led, because `Labels:` is the line that actually makes a
+// block an alert while `Value:` is merely how one usually starts. A boundary is
+// a `Value:` line that owns a `Labels:` line, or a `Labels:` line no such
+// `Value:` line has claimed — otherwise an alert whose `Value:` line is missing
+// gets absorbed into the block before it and silently overwrites its labels.
+function blockStarts(lines) {
+  const claimed = new Set();
+  const starts = new Set();
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!VALUE_LINE.test(lines[index])) continue;
+    const labels = labelsFor(lines, index);
+    if (labels < 0) continue;
+    claimed.add(labels);
+    starts.add(index);
+  }
+  for (let index = 0; index < lines.length; index += 1) {
+    if (LABELS_LINE.test(lines[index]) && !claimed.has(index)) starts.add(index);
+  }
+  return [...starts].sort((a, b) => a - b);
+}
+
 function valueBlocks(section) {
   const lines = section.split('\n');
-  const starts = [];
-  for (let index = 0; index < lines.length; index += 1) if (isBoundary(lines, index)) starts.push(index);
-  // Lenient: a section with labels but no `Value:` line at all is one block.
+  const starts = blockStarts(lines);
+  // Lenient: a section with neither line is still one block.
   if (!starts.length) return [section.trim()].filter(Boolean);
   const blocks = [];
-  // An alert missing its own `Value:` line sits ahead of the first boundary.
-  // Without this it would be swallowed into the next alert's slice and lost.
-  const preamble = lines.slice(0, starts[0]).join('\n').trim();
-  if (preamble && preamble.split('\n').some((line) => LABELS_LINE.test(line))) blocks.push(preamble);
   for (let index = 0; index < starts.length; index += 1) {
     const body = lines.slice(starts[index], index + 1 < starts.length ? starts[index + 1] : lines.length).join('\n').trim();
     if (body) blocks.push(body);
@@ -400,6 +417,8 @@ function loadState(root = keep.ROOT) {
       ? value.signatures : {},
     titles: value.titles && typeof value.titles === 'object' && !Array.isArray(value.titles)
       ? value.titles : {},
+    ...(value.lastPoll && typeof value.lastPoll === 'object' && !Array.isArray(value.lastPoll)
+      ? { lastPoll: value.lastPoll } : {}),
   };
 }
 
@@ -967,6 +986,36 @@ function sweepQuietly(options = {}, deps = {}) {
 
 // ---------- reporting ----------
 
+// What the last Slack poll did to incidents. A failed write is retried on the
+// next poll, which is correct but silent, so the count is kept where anyone
+// asking about incidents will see it.
+function recordPoll(options = {}) {
+  const root = options.root || keep.ROOT;
+  const at = Number(options.now) || Date.now();
+  const failed = Math.max(0, Number(options.failed) || 0);
+  const error = failed ? oneLine(options.error || 'write failed', 200) : '';
+  const outcome = mutateState((state) => {
+    state.lastPoll = { at, failed, ...(error ? { error } : {}) };
+  }, { root, write: options.write });
+  return Boolean(outcome && outcome.ok);
+}
+
+function lastPoll(root = keep.ROOT) {
+  const value = loadState(root).lastPoll;
+  if (!value || typeof value !== 'object') return null;
+  return {
+    at: Number(value.at) || 0,
+    failed: Math.max(0, Number(value.failed) || 0),
+    error: String(value.error || ''),
+  };
+}
+
+// For `keep incidents`: the writes the last poll could not land, if any.
+function pendingFailures(root = keep.ROOT) {
+  const poll = lastPoll(root);
+  return poll && poll.failed ? poll : null;
+}
+
 function openIncidents(root = keep.ROOT, now = Date.now()) {
   const state = loadState(root);
   return Object.entries(state.signatures)
@@ -995,5 +1044,6 @@ module.exports = {
   loadState, mutateState, emptyState,
   appendEvent, readEvents, taskContainsLine, closeMarker, slackTsLine,
   cardIdFor, ingest, sweep, sweepQuietly, quietDue, openIncidents, messageTime,
+  recordPoll, lastPoll, pendingFailures,
   permalinkFor, defaultDeps,
 };
