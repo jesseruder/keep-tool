@@ -415,6 +415,43 @@ test('every session tree of a session moves with it, in its own project name', (
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test('a transaction interrupted before its extra session trees existed still recovers', (t) => {
+  const f = fixture();
+  try {
+    const originalRename = fs.renameSync;
+    const historyTarget = path.join(f.profiles.b, 'file-history', f.sid);
+    let crashed = false;
+    t.mock.method(fs, 'renameSync', function (from, to) {
+      if (!crashed && String(from).includes('.keep-stage-') && to === historyTarget) {
+        crashed = true;
+        const error = new Error('simulated crash before publish'); error.code = 'EIO'; throw error;
+      }
+      return originalRename.call(fs, from, to);
+    });
+    assert.throws(() => artifacts.copyClaudeArtifacts(f.sid, f.records.a, f.records.b, 'tx-legacy', options(f)), /simulated crash/);
+    t.mock.restoreAll();
+    const directory = path.join(f.root, '.keep', 'account-artifacts', 'transactions');
+    const journalFile = path.join(directory, fs.readdirSync(directory)[0]);
+    const journal = JSON.parse(fs.readFileSync(journalFile, 'utf8'));
+    assert.equal(journal.artifacts.length, 3);
+    // Exactly what a journal written before session trees could be plural looks like:
+    // three records, each identified by its kind alone.
+    journal.artifacts = journal.artifacts.map(({ id, ...record }) => record);
+    fs.writeFileSync(journalFile, JSON.stringify(journal));
+    // The session moves into a worktree only now, so the interrupted transaction knows
+    // nothing about the trees its plan has grown.
+    extraTrees(f);
+    assert.equal(artifacts.preflight(f.sid, f.records.a, f.records.b, options(f)).disposition, 'recovery');
+    const recovered = artifacts.copyClaudeArtifacts(f.sid, f.records.a, f.records.b, 'tx-legacy', options(f));
+    assert.equal(recovered.reused, false);
+    assert.equal(fs.readFileSync(path.join(historyTarget, 'a.txt'), 'utf8'), 'history a');
+    assert.equal(fs.readFileSync(path.join(f.profiles.b, 'projects', '-wt-work-repo-slug', f.sid,
+      'subagents', 'agent-worktree.jsonl'), 'utf8'), `${JSON.stringify({ agent: 'worktree' })}\n`);
+    assert.equal(JSON.parse(fs.readFileSync(journalFile, 'utf8')).artifacts.length, 5, 'the extra trees joined the journal');
+    assert.equal(artifacts.preflight(f.sid, f.records.a, f.records.b, options(f)).disposition, 'reused');
+  } finally { t.mock.restoreAll(); fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
 // A child whose transcript sits under some other session's tree -- a codex-rescue child
 // does this -- is not part of what the transaction moves.
 function prepareForeignChild(f, child = 'child') {

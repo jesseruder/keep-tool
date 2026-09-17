@@ -71,6 +71,36 @@ test('a superseded session tree is searched too', () => run((f) => {
     [`${SID}.superseded-1758000000000`]);
 }));
 
+test('two session trees holding different transcripts for one agent are ambiguous', () => run((f) => {
+  const parentFile = f.parent('-repo');
+  f.tree('-repo', SID);
+  const worktree = f.child(f.tree('-wt-repo-slug', SID), 'theta');
+  fs.writeFileSync(path.join(f.project('-repo'), SID, 'subagents', 'agent-theta.jsonl'), '{"agent":"theta","copy":2}\n');
+  // Beside the parent wins outright, so take the parent out of that project first.
+  const elsewhere = f.parent('-elsewhere');
+  assert.equal(childTranscripts.resolveClaudeChild('theta', elsewhere, { configDir: f.configDir }), null);
+
+  // One file under two names, on the other hand, is one transcript: the first tree
+  // answers for it.
+  fs.rmSync(worktree);
+  fs.linkSync(path.join(f.project('-repo'), SID, 'subagents', 'agent-theta.jsonl'), worktree);
+  assert.equal(childTranscripts.resolveClaudeChild('theta', elsewhere, { configDir: f.configDir }),
+    path.join(f.project('-repo'), SID, 'subagents', 'agent-theta.jsonl'));
+  assert.equal(childTranscripts.resolveClaudeChild('theta', parentFile, { configDir: f.configDir }),
+    path.join(f.project('-repo'), SID, 'subagents', 'agent-theta.jsonl'));
+}));
+
+test('a symlinked path component inside the profile is refused even where it lands', () => run((f) => {
+  const parentFile = f.parent('-repo');
+  const shared = path.join(f.project('-repo'), 'shared');
+  fs.mkdirSync(shared, { recursive: true });
+  fs.writeFileSync(path.join(shared, 'agent-iota.jsonl'), '{"agent":"iota"}\n');
+  const dir = path.join(f.project('-repo'), SID);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.symlinkSync(shared, path.join(dir, 'subagents'));
+  assert.equal(childTranscripts.resolveClaudeChild('iota', parentFile, { configDir: f.configDir }), null);
+}));
+
 test('a lone child under some other session is accepted as foreign', () => run((f) => {
   const parentFile = f.parent('-repo');
   f.tree('-repo', SID);

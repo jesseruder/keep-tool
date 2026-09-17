@@ -46,16 +46,27 @@ function roots(configDir) {
   return { projectsRoot, physical };
 }
 
-// A candidate is a hit only if it is a real file, inside the profile's projects tree
-// both by path and after every symlink on the way to it has been resolved.
+// A candidate is a hit only if it is a real file inside the profile's projects tree with
+// no symlink anywhere in its path: resolved, it must be the very path it names, rebuilt
+// under the resolved root. A link that still lands inside `projects/` is refused too --
+// an alias is another name for a file, and which file a child transcript is has to be
+// exactly one answer.
 function accept(tree, candidate) {
   if (!tree.physical) return null;
   const file = path.resolve(candidate);
   if (!within(tree.projectsRoot, file) || file === tree.projectsRoot) return null;
-  try { if (!fs.lstatSync(file).isFile()) return null; } catch { return null; }
+  let stat;
+  try { stat = fs.lstatSync(file); } catch { return null; }
+  if (!stat.isFile()) return null;
   let real;
   try { real = fs.realpathSync(file); } catch { return null; }
-  return within(tree.physical, real) ? file : null;
+  if (real !== path.join(tree.physical, path.relative(tree.projectsRoot, file))) return null;
+  return { file, real, dev: stat.dev, ino: stat.ino };
+}
+
+// Two names for one file -- a second path, or a hard link -- are not two transcripts.
+function sameFile(left, right) {
+  return left.real === right.real || (left.dev === right.dev && left.ino === right.ino);
 }
 
 function childOf(directory) { return (id) => path.join(directory, 'subagents', `agent-${id}.jsonl`); }
@@ -95,15 +106,21 @@ function locateClaudeChild(childId, parentFile, options = {}) {
   if (!sid || sid === '.' || sid === '..') return null;
 
   // a. Beside the parent transcript: where Claude Code writes them by default.
-  const beside = accept(tree, childOf(path.join(path.dirname(parent), sid))(id));
-  if (beside) return { file: beside, tree: path.join(path.dirname(parent), sid), foreign: false };
+  const besideDir = path.join(path.dirname(parent), sid);
+  const beside = accept(tree, childOf(besideDir)(id));
+  if (beside) return { file: beside.file, tree: besideDir, foreign: false };
 
   // b. The same session id under any project dir, including a superseded tree: where
-  //    a session that changed cwd keeps writing them.
+  //    a session that changed cwd keeps writing them. Two distinct transcripts for one
+  //    agent is ambiguous, which is unverified, exactly as in c below.
+  const owned = [];
   for (const entry of listClaudeSessionTrees(sid, options.configDir)) {
-    const file = accept(tree, childOf(entry.dir)(id));
-    if (file) return { file, tree: entry.dir, foreign: false };
+    const hit = accept(tree, childOf(entry.dir)(id));
+    if (!hit || owned.some((other) => sameFile(other.hit, hit))) continue;
+    owned.push({ hit, dir: entry.dir });
+    if (owned.length > 1) return null;
   }
+  if (owned.length === 1) return { file: owned[0].hit.file, tree: owned[0].dir, foreign: false };
 
   // c. Last resort: this agent's transcript under some other session's tree. Accepted
   //    only when exactly one exists, because a second one means Keep cannot say which
@@ -115,9 +132,9 @@ function locateClaudeChild(childId, parentFile, options = {}) {
     for (const name of names(projectDir)) {
       const dir = path.join(projectDir, name);
       if (!isDirectory(dir)) continue;
-      const file = accept(tree, childOf(dir)(id));
-      if (!file) continue;
-      matches.push({ file, tree: dir, foreign: true });
+      const hit = accept(tree, childOf(dir)(id));
+      if (!hit) continue;
+      matches.push({ file: hit.file, tree: dir, foreign: true });
       if (matches.length > 1) return null;
     }
   }

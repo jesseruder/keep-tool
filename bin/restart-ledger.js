@@ -90,11 +90,13 @@ function verify({ root, agent, sid, file, instance, resolveChild, budget = 4 * 1
       // ledger and transcript are gone, so there is nothing left to walk.
       if (acknowledged && terminal.has(acknowledged.status) && acknowledged.evidence === 'abandoned-child') continue;
       const childFile = resolveChild(child, source);
-      // No transcript anywhere for this child. The parent's own ledger says this agent
-      // finished, and no transcript exists anywhere in the profile to walk, so there is
-      // nothing left to verify -- the same position as the abandoned child above. A
-      // child that has not finished still needs its history and is refused.
-      if (!childFile) {
+      // No transcript anywhere for this Claude child. The parent's own ledger says this
+      // agent finished, and no transcript exists anywhere in the profile to walk, so
+      // there is nothing left to verify -- the same position as the abandoned child
+      // above. A child that has not finished still needs its history and is refused.
+      // Codex keeps its own rule below: a rollout it cannot find is unverified,
+      // whatever the parent says about it.
+      if (agent === 'claude' && !childFile) {
         if (acknowledged && terminal.has(acknowledged.status)) continue;
         throw Error('Child job ledger transcript is missing');
       }

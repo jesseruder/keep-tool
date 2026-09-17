@@ -364,6 +364,18 @@ test('a settled gap over a turn the API rate-limited verifies only under allowTe
   assert.throws(() => verify({ allowTerminalRateLimit: true }), /Job ledger evidence is incomplete/);
 }, 'claude'));
 
+test('a Codex child whose rollout cannot be found stays unverified whatever the parent says', () => fixture(({ append, verify }) => {
+  append('parent', meta('parent'));
+  append('parent', row('event_msg', { item: { type: 'SubAgentActivity', kind: 'completed', id: 'spawn', agent_thread_id: 'child' } }));
+  append('parent', done());
+  append('child', meta('child', 'parent'));
+  append('child', done());
+  verify()();
+  // The same complete ledger, with the rollout out of reach: Claude's missing-transcript
+  // rule is not Codex's, and an unfindable rollout stays unverified.
+  assert.throws(() => verify({ resolveChild: () => null }), /unverified/);
+}));
+
 test('a child with no transcript anywhere is skipped only once the parent ledger says it finished', () => fixture(({ root, append, verify }) => {
   append('parent', { type: 'user', sessionId: 'parent', message: { content: 'work' } });
   append('parent', { type: 'assistant', sessionId: 'parent', message: { stop_reason: 'tool_use',

@@ -230,6 +230,20 @@ function readProvenance(plan, profile) {
 // kind, which was their identity then and is their id now.
 function recordId(record) { return record?.id || record?.kind; }
 
+const BASE_IDS = ['transcript', 'session', 'file-history'];
+
+// Which of the plan's artifacts a journal is about. A journal written before a session
+// could carry more than one session tree holds exactly the three base artifacts, and a
+// transaction interrupted under it is still recoverable: it is matched against those
+// three, and the extra trees are simply not in it yet -- copyClaudeArtifacts adds them
+// and copies them fresh, through the same checks as any other artifact.
+function journalScope(plan, records) {
+  const legacy = Array.isArray(records) && plan.artifacts.length > BASE_IDS.length
+    && records.length === BASE_IDS.length
+    && BASE_IDS.every((id) => records.some((record) => recordId(record) === id));
+  return legacy ? plan.artifacts.filter((artifact) => BASE_IDS.includes(artifact.id)) : plan.artifacts;
+}
+
 function journalArtifacts(plan, transactionId, before) {
   const suffix = digest(transactionId).slice(0, 20);
   return plan.artifacts.map((artifact) => ({
@@ -244,8 +258,9 @@ function journalArtifacts(plan, transactionId, before) {
 }
 
 function journalPathsMatch(plan, transactionId, records) {
-  if (!Array.isArray(records) || records.length !== plan.artifacts.length) return false;
-  const expected = journalArtifacts(plan, transactionId, {});
+  const scope = journalScope(plan, records);
+  if (!Array.isArray(records) || records.length !== scope.length) return false;
+  const expected = journalArtifacts({ ...plan, artifacts: scope }, transactionId, {});
   return expected.every((entry) => {
     const record = records.find((candidate) => recordId(candidate) === entry.id);
     return record && record.stage === entry.stage && record.backup === entry.backup;
@@ -256,10 +271,11 @@ function validRecovery(plan, value) {
   if (!value || value.version !== 1 || value.status === 'complete' || value.sessionId !== plan.sessionId
       || value.sourceAccountId !== plan.source.id || value.targetAccountId !== plan.target.id
       || value.projectName !== plan.projectName || !journalPathsMatch(plan, value.transactionId, value.artifacts)) return false;
-  const desired = manifestMap(plan.artifacts, 'sourceManifest');
+  const scope = journalScope(plan, value.artifacts);
+  const desired = manifestMap(scope, 'sourceManifest');
   const recorded = Object.fromEntries(value.artifacts.map((entry) => [recordId(entry), entry.desired ?? null]));
   if (!sameManifestMap(desired, recorded)) return false;
-  for (const artifact of plan.artifacts) {
+  for (const artifact of scope) {
     const record = value.artifacts.find((entry) => recordId(entry) === artifact.id);
     if (!record) return false;
     if (sameManifest(artifact.targetManifest, record.desired ?? null)
@@ -324,7 +340,7 @@ function validateExistingJournal(plan, journal, transactionId) {
       || journal.projectName !== plan.projectName || !journalPathsMatch(plan, transactionId, journal.artifacts)) {
     throw failure(`artifact transaction ${transactionId} conflicts with its recovery journal`, 'KEEP_ARTIFACT_JOURNAL');
   }
-  const desired = manifestMap(plan.artifacts, 'sourceManifest');
+  const desired = manifestMap(journalScope(plan, journal.artifacts), 'sourceManifest');
   const recorded = Object.fromEntries(journal.artifacts.map((entry) => [recordId(entry), entry.desired ?? null]));
   if (!sameManifestMap(desired, recorded)) {
     throw failure(`source artifacts changed after transaction ${transactionId} began`, 'KEEP_ARTIFACT_SOURCE_CHANGED');
@@ -396,6 +412,16 @@ function copyClaudeArtifacts(sessionId, source, target, transactionId, options =
     journal = { version: 1, transactionId, sessionId, sourceAccountId: source.id, targetAccountId: target.id,
       projectName: plan.projectName, status: 'copying', disposition,
       artifacts: journalArtifacts(plan, transactionId, before), createdAt: Date.now() };
+    persistJournal(file, journal);
+  }
+  // A journal from before this session carried extra session trees does not mention
+  // them. Nothing was ever staged, backed up or published for them under it, so they
+  // join it now with the target's current state as their `before` and go through the
+  // same publish as every other artifact.
+  const unjournaled = plan.artifacts.filter((artifact) => !journal.artifacts.some((entry) => recordId(entry) === artifact.id));
+  if (unjournaled.length) {
+    journal.artifacts = [...journal.artifacts,
+      ...journalArtifacts({ ...plan, artifacts: unjournaled }, transactionId, manifestMap(plan.artifacts, 'targetManifest'))];
     persistJournal(file, journal);
   }
   const desired = manifestMap(plan.artifacts, 'sourceManifest');
