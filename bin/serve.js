@@ -1200,19 +1200,80 @@ function lastClaudeHandoffModel(lines) {
 // because a long-lived session's transcript runs to hundreds of megabytes.
 const HANDOFF_MODEL_SCAN_BYTES = 8 * 1024 * 1024;
 const HANDOFF_MODEL_SCAN_CHUNKS = 64;
+const HANDOFF_MODEL_LOOKAHEAD_CHARS = 64 * 1024;
 
-// Did this slice hold a genuine assistant record at all? It separates "a real record is
-// missing its model", which must keep failing closed on the malformed value, from "this
-// slice is only rate-limit noise", which is merely a reason to look further back.
-function hasGenuineAssistantUsage(text) {
-  for (const line of String(text || '').split(/\r?\n/)) {
+// lastClaudeHandoffModel's per-record rule, one record at a time: the model of a genuine
+// assistant turn, '<unknown>' for a genuine turn whose model is malformed (which must
+// keep failing closed), or null for anything that is not one — synthetic rate-limit
+// records above all, which is what a parked session's transcript is made of.
+function genuineAssistantModel(record) {
+  if (!record || record.type !== 'assistant' || record.isSidechain || !record.message) return null;
+  const candidate = typeof record.message.model === 'string' ? record.message.model : '<unknown>';
+  if (record.isApiErrorMessage || candidate === '<synthetic>') return null;
+  if (!record.message.usage) return null;
+  return candidate || '<unknown>';
+}
+
+// Claude Code logs a typed local command either as a user record or, since 2.x, as a
+// `system`/`local_command` record with the wrapper in a top-level string.
+function localCommandText(record) {
+  if (!record) return '';
+  if (record.type === 'system' && record.subtype === 'local_command' && typeof record.content === 'string') {
+    return record.content.trimStart();
+  }
+  if (record.type === 'user' && !record.isSidechain && record.message) return textOf(record.message.content).trimStart();
+  return '';
+}
+
+function localModelSwitchArgs(record) {
+  const text = localCommandText(record);
+  if (!/^<command-name>\/model<\/command-name>/.test(text)) return null;
+  return (text.match(/<command-args>([^<>]*)<\/command-args>/)?.[1] || '').trim();
+}
+
+function localCommandStdout(record) {
+  const text = localCommandText(record);
+  const open = '<local-command-stdout>';
+  return text.startsWith(open) ? text.slice(open.length).trimStart() : null;
+}
+
+// A `/model` typed after the newest genuine assistant record is the session's model, and
+// no assistant record reflects it yet. It only counts when it names a full id the resume
+// could pass to `claude --model` and the harness confirmed the switch: a bare alias
+// (`opus`) resolves against settings we cannot see, no argument opens the picker, and
+// "Kept model as …" means the switch never happened.
+function resolveLocalModelSwitch(args, following) {
+  const model = /-/.test(args) && !/\s/.test(args) ? launchModelId(args) : '';
+  if (!model) return '<unknown>';
+  for (const line of following) {
     let record;
     try { record = JSON.parse(line); } catch { continue; }
-    if (!record || record.type !== 'assistant' || record.isSidechain || !record.message) continue;
-    if (record.isApiErrorMessage || record.message.model === '<synthetic>') continue;
-    if (record.message.usage) return true;
+    const stdout = localCommandStdout(record);
+    if (stdout == null) continue;
+    return /^Set model to/i.test(stdout) ? model : '<unknown>';
   }
-  return false;
+  return '<unknown>';
+}
+
+// The newest record in this slice that decides the model: a genuine assistant turn, or a
+// `/model` switch typed after it. Rows the slice does not decide return null, and the
+// scan goes on to the slice before it.
+function lastModelEventInText(text, newerText = '') {
+  const lines = String(text || '').split(/\r?\n/);
+  let event = null;
+  for (let i = 0; i < lines.length; i += 1) {
+    let record;
+    try { record = JSON.parse(lines[i]); } catch { continue; }
+    const model = genuineAssistantModel(record);
+    if (model) { event = { kind: 'assistant', model }; continue; }
+    const args = localModelSwitchArgs(record);
+    if (args != null) event = { kind: 'switch', args, index: i };
+  }
+  // The stdout row that confirms a switch can sit in the slice we read before this one.
+  if (event && event.kind === 'switch') {
+    event.following = lines.slice(event.index + 1).concat(String(newerText || '').split(/\r?\n/));
+  }
+  return event;
 }
 
 // lastClaudeHandoffModel over the whole file, newest slice first, so only the most recent
@@ -1232,6 +1293,9 @@ function lastClaudeHandoffModelInFile(file, deps = {}) {
     // The head of a record split across a chunk boundary, carried back to the slice that
     // holds the rest of it. Bytes, not text: a split multi-byte character must survive.
     let carry = Buffer.alloc(0);
+    // The beginning of everything already scanned, so a `/model` row at the end of a
+    // slice can still find the stdout row that confirms it.
+    let newerText = '';
     for (let chunks = 0; chunks < HANDOFF_MODEL_SCAN_CHUNKS && end > 0 && scanned < maxBytes; chunks += 1) {
       const start = Math.max(0, end - chunkBytes);
       const slice = Buffer.alloc((end - start) + carry.length);
@@ -1246,8 +1310,10 @@ function lastClaudeHandoffModelInFile(file, deps = {}) {
         body = newline === -1 ? Buffer.alloc(0) : slice.subarray(newline + 1);
       }
       const text = body.toString('utf8');
-      const model = lastClaudeHandoffModel(text);
-      if (model && (model !== '<unknown>' || hasGenuineAssistantUsage(text))) return model;
+      const event = lastModelEventInText(text, newerText);
+      if (event && event.kind === 'assistant') return event.model;
+      if (event) return resolveLocalModelSwitch(event.args, event.following);
+      newerText = `${text}\n${newerText}`.slice(0, HANDOFF_MODEL_LOOKAHEAD_CHARS);
       end = start;
       if (end === 0) reachedStart = true;
     }
@@ -1688,9 +1754,12 @@ async function waitForProbeUndo(target, beforeScreen, lastScreen, read, wait, no
     // A pane that cannot be read tells us nothing about the Backspace: the probe key is
     // still the last thing we saw, so it is still the answer we have to give.
     try { screen = await read(target, 30, false); } catch { break; }
-    const text = normalizedText(promptText(promptLine(screen)));
-    if (!text || text === beforeText) return;
-    if (text === SUGGESTION_PROBE_KEY) {
+    const line = promptLine(screen);
+    // No prompt line at all is Claude Code mid-render, not an empty input box — the same
+    // reading classifyPromptLine takes. It proves nothing, so it only costs a poll.
+    const text = line == null ? null : normalizedText(promptText(line));
+    if (text != null && (!text || text === beforeText)) return;
+    if (text == null || text === SUGGESTION_PROBE_KEY) {
       if (now() - startedAt >= SUGGESTION_PROBE_SETTLE_MS) break;
       continue;
     }

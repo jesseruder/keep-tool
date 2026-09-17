@@ -400,6 +400,51 @@ test('probeSuggestion refuses when its Backspace never renders', async () => {
   assert.deepEqual(inputs, [',', '\x7f']);
 });
 
+// The same screen mid-render: Claude Code has not drawn the input box at all.
+const REVIEWER_SUGGESTION_NO_PROMPT = REVIEWER_SUGGESTION_LINES
+  .filter((_line, index) => index !== 5).join('\n');
+
+test('probeSuggestion refuses when the prompt line never comes back after the Backspace', async () => {
+  const { inputs, host } = probeInputRecorder();
+  const logged = [];
+  let reads = 0;
+  // A screen with no `❯` line is mid-render, not an empty input box: it is the shape
+  // classifyPromptLine already refuses to read as evidence.
+  const error = await probeSuggestion({ pane: 'pane-blank' }, REVIEWER_SUGGESTION_BEFORE, {
+    host,
+    wait: async () => {},
+    readScreen: async () => {
+      reads += 1;
+      return reads < 2 ? REVIEWER_SUGGESTION_AFTER : REVIEWER_SUGGESTION_NO_PROMPT;
+    },
+    stderr: (message) => { logged.push(message); },
+  }).then(() => null, (e) => e);
+  assert.ok(error, 'a missing prompt line cannot stand in for a cleared input box');
+  assert.equal(error.status, 409);
+  assert.match(error.message, /probe keystroke is still on screen after Backspace/);
+  assert.equal(reads, 1 + SUGGESTION_PROBE_SETTLE_READS, 'it polls the whole budget first');
+  assert.deepEqual(inputs, [',', '\x7f']);
+  assert.equal(logged.length, 1);
+});
+
+test('probeSuggestion waits out a mid-render screen and settles on the bare prompt', async () => {
+  const { inputs, host } = probeInputRecorder();
+  const bare = REVIEWER_SUGGESTION_LINES.map((line, index) => (index === 5 ? '❯' : line)).join('\n');
+  let reads = 0;
+  await probeSuggestion({ pane: 'pane-blank-then-bare' }, REVIEWER_SUGGESTION_BEFORE, {
+    host,
+    wait: async () => {},
+    readScreen: async () => {
+      reads += 1;
+      if (reads === 1) return REVIEWER_SUGGESTION_AFTER;
+      return reads === 2 ? REVIEWER_SUGGESTION_NO_PROMPT : bare;
+    },
+    stderr: (message) => { throw new Error(`unexpected refusal log: ${message}`); },
+  });
+  assert.equal(reads, 3, 'the mid-render read costs a poll and nothing more');
+  assert.deepEqual(inputs, [',', '\x7f']);
+});
+
 test('probeSuggestion refuses when someone types while the probe is being undone', async () => {
   const { inputs, host } = probeInputRecorder();
   const logged = [];
@@ -2073,6 +2118,61 @@ test('handoff model resolution stops at a malformed genuine model and rejoins sp
     const empty = path.join(dir, 'empty.jsonl');
     fs.writeFileSync(empty, '');
     assert.equal(handoffCurrentModel(session, null, '', { findSessionFile: () => empty }), '');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('handoff model resolution follows a /model typed after the newest assistant record', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-handoff-model-switch-'));
+  try {
+    const session = { id: 'switched', kind: 'claude' };
+    const real = (model) => JSON.stringify({ type: 'assistant', message: {
+      model, usage: { input_tokens: 10 },
+    } });
+    const synthetic = JSON.stringify({
+      type: 'assistant', isApiErrorMessage: true,
+      message: { model: '<synthetic>', usage: { input_tokens: 0 } },
+    });
+    // How Claude Code logs a typed slash command: the echo as a user record, the harness
+    // reply as a system/local_command row.
+    const modelCommand = (args) => JSON.stringify({ type: 'user', message: { content: [{ type: 'text',
+      text: `<command-name>/model</command-name><command-message>model</command-message><command-args>${args}</command-args>`,
+    }] } });
+    const stdout = (text) => JSON.stringify({ type: 'system', subtype: 'local_command',
+      content: `<local-command-stdout>${text}</local-command-stdout>` });
+    const userStdout = (text) => JSON.stringify({ type: 'user', message: { content: [{ type: 'text',
+      text: `<local-command-stdout>${text}</local-command-stdout>` }] } });
+    const resolve = (name, rows, deps = {}) => {
+      const file = path.join(dir, `${name}.jsonl`);
+      fs.writeFileSync(file, `${rows.join('\n')}\n`);
+      return handoffCurrentModel(session, { meta: { model: 'claude-opus-4-5' } },
+        'claude --model claude-opus-4-5', { findSessionFile: () => file, ...deps });
+    };
+
+    assert.equal(resolve('switched', [
+      real('claude-fable-5-1'), modelCommand('claude-opus-5'), stdout('Set model to Opus 5 (claude-opus-5)'), synthetic,
+    ]), 'claude-opus-5', 'the switch is newer than the last assistant record, so it wins');
+    assert.equal(resolve('switched-user-row', [
+      real('claude-fable-5-1'), modelCommand('claude-opus-5'), userStdout('Set model to Opus 5'), synthetic,
+    ]), 'claude-opus-5', 'the harness reply is logged as a user record in older transcripts');
+    assert.equal(resolve('alias', [
+      real('claude-fable-5-1'), modelCommand('opus'), stdout('Set model to Opus 5'), synthetic,
+    ]), '<unknown>', 'an alias resolves against settings this scan cannot see');
+    assert.equal(resolve('kept', [
+      real('claude-fable-5-1'), modelCommand('claude-opus-5'), stdout('Kept model as Fable 5.1'), synthetic,
+    ]), '<unknown>', 'a switch the harness did not make is not a model');
+    assert.equal(resolve('picker', [
+      real('claude-fable-5-1'), modelCommand(''), synthetic,
+    ]), '<unknown>', 'a bare /model opens the picker and confirms nothing');
+    assert.equal(resolve('unconfirmed', [
+      real('claude-fable-5-1'), modelCommand('claude-opus-5'), synthetic,
+    ]), '<unknown>', 'no stdout row means the switch was never confirmed');
+    assert.equal(resolve('older-switch', [
+      modelCommand('claude-opus-5'), stdout('Set model to Opus 5'), real('claude-fable-5-1'), synthetic,
+    ]), 'claude-fable-5-1', 'an assistant record after the switch already reflects it');
+    // The /model row and the stdout row that confirms it land in different slices.
+    assert.equal(resolve('straddled', [
+      real('claude-fable-5-1'), modelCommand('claude-opus-5'), stdout('Set model to Opus 5 (claude-opus-5)'), synthetic,
+    ], { scanChunkBytes: 48 }), 'claude-opus-5');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
