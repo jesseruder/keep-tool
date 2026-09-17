@@ -92,6 +92,7 @@ const CODEX_DIALOG_MARKERS = [
 const CLAUDE_TRUST_MARKERS = [
   'Do you trust the contents of this directory?',
   'Do you trust the files in this folder?',
+  'Is this a project you created or one you trust',
   'Yes, I trust this folder',
   'Quick safety check',
 ];
@@ -5512,13 +5513,25 @@ async function waitForHostAgent(target, agent, deps = {}) {
     // during a restart). Say which dialog, now, instead of timing out in 45s with a
     // message about an empty prompt.
     if (agent === 'claude') {
-      const dialog = claudePrompts.recognize(stripTerminalAnsi(screen));
-      const refusing = dialog && dialog.live
+      const plain = stripTerminalAnsi(screen);
+      const dialog = claudePrompts.recognize(plain);
+      // A trust screen this module cannot read as a dialog -- its option list and
+      // wording move from release to release -- is still a trust screen, and no wait
+      // resolves one: an account handoff into an untrusted worktree waited this out on
+      // 2026-09-17 and reported nothing but "never showed an empty prompt" 45 seconds
+      // later. Confirmed across the same two reads a recognized dialog needs.
+      const trustScreen = !dialog && CLAUDE_TRUST_MARKERS.some((marker) => plain.includes(marker));
+      const refusing = trustScreen ? { kind: 'workspace-trust' } : dialog && dialog.live
         && claudePrompts.policyFor(dialog.kind).action === 'refuse' ? dialog : null;
       // Two reads a poll apart, or none: a single frame can catch a dialog Owner is
       // already dismissing, and that wait used to finish on the next poll.
       if (refusing && refusedDialog && refusedDialog.kind === refusing.kind
           && now() - refusedDialog.at >= DIALOG_CONFIRM_MS) {
+        if (trustScreen) {
+          throw new InjectionError(409, `${agent} is awaiting workspace trust in pane ${target.pane}; accept it there, then retry delivery`, {
+            awaitingSetup: true, setupKind: 'workspace-trust', screenTail: screenTail(screen),
+          });
+        }
         throw new InjectionError(409, `Claude Code is showing the ${claudePrompts.refusalLabel(refusing)} dialog in ${target.pane}; message not sent`, {
           screenTail: screenTail(screen),
         });

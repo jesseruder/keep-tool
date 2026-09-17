@@ -69,6 +69,23 @@ function acquireStateLock(file, timeoutMs) {
   }
 }
 
+// Which directory key, if any, makes this account trust `cwd`: the directory itself or
+// the nearest ancestor the operator has already accepted the folder-trust dialog for.
+// Read-only, and a missing or unreadable state file is simply no trust.
+function trustedProjectFor(account, cwd) {
+  let state;
+  try { state = readJSON(stateFile(account), {}); } catch { return null; }
+  const projects = state && typeof state === 'object' && !Array.isArray(state) ? state.projects : null;
+  if (!projects || typeof projects !== 'object' || Array.isArray(projects)) return null;
+  let directory;
+  try { directory = fs.realpathSync(cwd); } catch { directory = path.resolve(String(cwd || '')); }
+  for (let current = directory; ; current = path.dirname(current)) {
+    const entry = projects[current];
+    if (entry && typeof entry === 'object' && !Array.isArray(entry) && entry.hasTrustDialogAccepted === true) return current;
+    if (path.dirname(current) === current) return null;
+  }
+}
+
 function trustProject(account, cwd, options = {}) {
   const file = stateFile(account);
   const directory = path.dirname(file);
@@ -528,4 +545,4 @@ function compatible(sourceAccount, targetAccount, cwd) {
 }
 
 module.exports = { MANIFEST, shareSetup, readSetup, previewRefresh, ensureSharedMemory, compatible, effectiveMcpServers,
-  projectKey, repositoryRoot, stateFile, trustProject, mcpConfigPath };
+  projectKey, repositoryRoot, stateFile, trustProject, trustedProjectFor, mcpConfigPath };

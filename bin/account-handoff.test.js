@@ -1102,3 +1102,96 @@ test('a transfer in flight is visible to anything that would close the session u
     assert.equal(handoff.transferInFlight(root, '', now), null);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+// Claude Code asks its folder-trust question in the directory the session resumes in,
+// and that dialog stands where the prompt should be, so the continuation is never typed.
+function trustDeps(f, events, trusted) {
+  return deps(f, {
+    trustedProjectFor: (account, cwd) => {
+      assert.equal(cwd, f.project);
+      return trusted[account.id] === undefined ? null : trusted[account.id];
+    },
+    trustProject: (account, directory) => { events.push(`trust:${account.id}:${directory}`); return true; },
+  });
+}
+
+test('a Claude transfer pre-trusts the resume directory on the target before it stops the source', async () => {
+  const f = fixture();
+  try {
+    const events = [], ancestor = path.dirname(f.project);
+    const d = trustDeps(f, events, { one: ancestor });
+    const restartSession = d.restartSession;
+    d.restartSession = (body, options) => { events.push('stop-source'); return restartSession(body, options); };
+    const result = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d);
+    assert.equal(result.status, 'done');
+    // The directory key the source trusts, which is the ancestor here, not the cwd.
+    assert.deepEqual(events, [`trust:two:${ancestor}`, 'stop-source']);
+    const record = JSON.parse(fs.readFileSync(path.join(f.root, '.keep', 'account-handoffs', `${f.sid}.json`), 'utf8'));
+    assert.equal(record.trustCarried, ancestor);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('recovery of a stopped source pre-trusts the target before it relaunches there', async () => {
+  const f = fixture();
+  try {
+    const events = [];
+    const d = trustDeps(f, events, { one: f.project });
+    const restartSession = d.restartSession;
+    d.restartSession = async (body, options) => {
+      await restartSession(body, options);
+      d.pane.alive = false;
+      throw new Error('target launch failed');
+    };
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /target launch failed/);
+    assert.deepEqual(events, [`trust:two:${f.project}`]);
+    const resumeExited = d.resumeExited;
+    d.resumeExited = (...args) => { events.push('resume-exited'); return resumeExited(...args); };
+    const recovered = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d);
+    assert.equal(recovered.status, 'done');
+    assert.deepEqual(events.slice(1), [`trust:two:${f.project}`, 'resume-exited']);
+    const record = JSON.parse(fs.readFileSync(path.join(f.root, '.keep', 'account-handoffs', `${f.sid}.json`), 'utf8'));
+    assert.equal(record.trustCarried, f.project);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('nothing is written when the source has no trust to carry or the target already has it', async () => {
+  const f = fixture();
+  try {
+    const events = [];
+    const result = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, trustDeps(f, events, {}));
+    assert.equal(result.status, 'done');
+    assert.deepEqual(events, [], 'no evidence the operator ever trusted it: the target dialog stands');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(f.root, '.keep', 'account-handoffs', `${f.sid}.json`), 'utf8')).trustCarried,
+      undefined);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+  const g = fixture();
+  try {
+    const events = [];
+    const result = await handoff.run({ sessionId: g.sid, pane: 'pane-1', accountId: 'two' },
+      trustDeps(g, events, { one: g.project, two: g.project }));
+    assert.equal(result.status, 'done');
+    assert.deepEqual(events, [], 'the target already trusts it');
+  } finally { fs.rmSync(g.base, { recursive: true, force: true }); }
+});
+
+test('a target that cannot be pre-trusted refuses the transfer with the source still running', async () => {
+  const f = fixture();
+  try {
+    const d = deps(f, {
+      trustedProjectFor: (account) => account.id === 'one' ? f.project : null,
+      trustProject: () => { throw new Error('claude state file is locked'); },
+      restartSession: async () => assert.fail('the source must not be stopped'),
+    });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d),
+      (error) => error.status === 409
+        && error.message === `Target account could not pre-trust ${f.project}: claude state file is locked`);
+    assert.equal(d.pane.alive, true);
+    assert.equal(d.continuations(), 0);
+    assert.equal(fs.existsSync(path.join(f.profiles.two, 'projects', f.projectName, `${f.sid}.jsonl`)), false);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('a target parked on the folder-trust dialog is a blocked refusal, not a transient one', () => {
+  assert.equal(handoff.classifyRefusal(
+    'claude is awaiting workspace trust in pane pane-1; accept it there, then retry delivery'), 'blocked');
+});

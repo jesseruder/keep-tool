@@ -7229,7 +7229,7 @@ test('portable transfer keeps a trust-blocked opening bound and retries through 
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('workspace trust is typed setup only for portable opening waits', async () => {
+test('a Claude workspace-trust screen refuses any wait; the portable code stays portable', async () => {
   let now = 0;
   let screen = 'Do you trust the contents of this directory?';
   const host = { request: async (type) => {
@@ -7246,6 +7246,14 @@ test('workspace trust is typed setup only for portable opening waits', async () 
   screen = 'Accessing workspace: /project\nQuick safety check: Is this a project you created or one you trust?\nNo, exit\nYes, I trust this folder';
   await assert.rejects(waitForHostAgent({ pane: 'pane-trust' }, 'claude', { ...clock, detectPortableSetup: true }),
     (error) => error.status === 409 && error.code === 'KEEP_PORTABLE_TRANSFER_AWAITING_SETUP'
+      && error.extra.setupKind === 'workspace-trust');
+  // An account handoff waits here too, and waiting out the dialog used to report
+  // nothing but a 504 about a prompt that never came.
+  now = 0;
+  screen = 'Is this a project you created or one you trust?\n 1. Yes, proceed';
+  await assert.rejects(waitForHostAgent({ pane: 'pane-trust' }, 'claude', clock),
+    (error) => error.status === 409 && error.code === undefined
+      && /awaiting workspace trust in pane pane-trust/.test(error.message)
       && error.extra.setupKind === 'workspace-trust');
 });
 

@@ -66,6 +66,9 @@ const TRANSIENT_REFUSALS = [
 const BLOCKED_REFUSALS = [
   /^Target account setup is incompatible/,
   /^Source account setup is unavailable/,
+  // The target is parked on the folder-trust dialog. It says "retry delivery" because a
+  // person can answer it, but nothing a queue does clears it.
+  /is awaiting workspace trust in pane /,
 ];
 function classifyRefusal(reason) {
   const text = String(reason == null ? '' : reason).trim();
@@ -336,6 +339,25 @@ function providerCompatibility(agent, source, target, cwd, resumeSpec, deps = {}
   return agent === 'codex'
     ? require('./codex-handoff-support').compatible(source, target, resumeSpec)
     : require('./account-setup').compatible(source, target, cwd);
+}
+
+// A transferred session resumes in its working directory under the target profile, and
+// Claude Code asks its folder-trust question there unless that profile already trusts
+// the directory. The dialog takes the place of the prompt, so the continuation is never
+// typed and the transfer ends on a timeout that only says the prompt never came. The
+// operator answered that question once already, on the source profile: carry their
+// answer over, using the exact directory key the source trusts, which may be an
+// ancestor of the resume directory. No trust on the source is no evidence of an answer,
+// and the target's own dialog is then the correct outcome.
+function carryProjectTrust(source, target, cwd, deps = {}) {
+  if (!cwd || source?.agent !== 'claude' || target?.agent !== 'claude') return null;
+  const setup = require('./account-setup');
+  const trustedProjectFor = deps.trustedProjectFor || setup.trustedProjectFor;
+  const trusted = trustedProjectFor(source, cwd);
+  if (!trusted || trustedProjectFor(target, cwd)) return null;
+  try { (deps.trustProject || setup.trustProject)(target, trusted); }
+  catch (error) { throw new Error(`Target account could not pre-trust ${trusted}: ${error?.message || error}`); }
+  return trusted;
 }
 
 function copyProviderArtifacts(provider, agent, ...args) {
@@ -637,9 +659,11 @@ async function run(body, deps = {}) {
       try {
         if (!current.sourceStopVerifiedAt) throw new Error('Source exit was not verified by the handoff transaction; recovery is blocked');
         if (!await authPreflight(target, deps)) throw new Error(`Target ${agent} account is not logged in`);
-        const compatibility = providerCompatibility(agent, source, target, session.project || current.cwd || pane.cwd,
-          current.resumeSpec, deps);
+        const recoveryCwd = session.project || current.cwd || pane.cwd;
+        const compatibility = providerCompatibility(agent, source, target, recoveryCwd, current.resumeSpec, deps);
         if (!compatibility.ok) throw new Error(`Target account setup is incompatible: ${compatibility.reasons.join('; ')}`);
+        const recoveryTrust = carryProjectTrust(source, target, recoveryCwd, deps);
+        if (recoveryTrust) { current.trustCarried = recoveryTrust; writeOne(root, current); }
         const targetWasStaged = ['starting-target', 'verifying-target', 'delivering-continuation'].includes(current.phase);
         if (!targetWasStaged) {
           if (agent === 'claude') providerArtifacts.preflight(session.id, source, target, { root, env });
@@ -718,6 +742,11 @@ async function run(body, deps = {}) {
     if (!compatibility.ok) {
       const error = new Error(`Target account setup is incompatible: ${compatibility.reasons.join('; ')}`); error.status = 409; throw error;
     }
+    // Before the source is stopped: a target that cannot be pre-trusted refuses the
+    // transfer here, with the session still running, rather than parking it on a dialog.
+    let trustCarried = null;
+    try { trustCarried = carryProjectTrust(source, target, resumeCwd, deps); }
+    catch (error) { error.status ||= 409; throw error; }
     // The limit was last observed before authPreflight, which starts an
     // interactive login shell and can take 45 seconds. A person can finish a turn
     // in that time, and stopping an idle session to type a continuation into it is
@@ -734,6 +763,7 @@ async function run(body, deps = {}) {
     current.ownedSessionIds = agent === 'codex' ? artifactPlan.artifacts.map((entry) => entry.sessionId) : [session.id];
     Object.assign(current, { status: 'stopping', phase: 'stopping-source', reason: '', cwd: resumeCwd,
       pid: pane.pid, cols: pane.cols, rows: pane.rows, ...(force ? { force: true } : {}),
+      ...(trustCarried ? { trustCarried } : {}),
       ...(sourceIdentity ? { sourceAgentPid: sourceIdentity.pid, sourceAgentPidStart: sourceIdentity.pidStart,
         sourceOwnsPane: true } : {}),
       ...(resumeSpec ? {

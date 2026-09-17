@@ -333,6 +333,33 @@ test('trustProject creates missing Claude state with the canonical project key',
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('trustedProjectFor reads the trusted directory, its nearest trusted ancestor, or nothing', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-project-trusted-for-'));
+  const configDir = path.join(root, 'claude'), file = path.join(configDir, '.claude.json');
+  const account = { id: 'claude-test', agent: 'claude', configDir, builtIn: false };
+  const worktrees = path.join(root, 'wt'), inside = path.join(worktrees, 'repo', 'slug');
+  const untrusted = path.join(root, 'elsewhere');
+  try {
+    fs.mkdirSync(inside, { recursive: true }); fs.mkdirSync(untrusted); fs.mkdirSync(configDir);
+    assert.equal(setup.trustedProjectFor(account, inside), null, 'no state file is no trust');
+    fs.writeFileSync(file, JSON.stringify({ projects: {
+      [fs.realpathSync(inside)]: { hasTrustDialogAccepted: true },
+      [fs.realpathSync(worktrees)]: { hasTrustDialogAccepted: true },
+      [fs.realpathSync(untrusted)]: { hasTrustDialogAccepted: false },
+    } }));
+    assert.equal(setup.trustedProjectFor(account, inside), fs.realpathSync(inside));
+    fs.writeFileSync(file, JSON.stringify({ projects: {
+      [fs.realpathSync(worktrees)]: { hasTrustDialogAccepted: true },
+    } }));
+    assert.equal(setup.trustedProjectFor(account, inside), fs.realpathSync(worktrees), 'an ancestor answers for it');
+    assert.equal(setup.trustedProjectFor(account, untrusted), null);
+    fs.writeFileSync(file, '{ not json');
+    assert.equal(setup.trustedProjectFor(account, inside), null, 'an unreadable state file is no trust');
+    fs.writeFileSync(file, JSON.stringify({ projects: [fs.realpathSync(inside)] }));
+    assert.equal(setup.trustedProjectFor(account, inside), null);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('trustProject preserves existing state and other project entries', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-project-trust-preserve-'));
   const cwd = path.join(root, 'project'), configDir = path.join(root, 'claude');
