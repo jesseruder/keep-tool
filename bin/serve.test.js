@@ -7930,6 +7930,36 @@ test('a rate-limited restart is not blocked by a settled history-gap', async () 
     /Waiting for the turn and background work to finish/, 'a settled gap excuses only itself');
 });
 
+test('a restart that names the limit it exists for refuses inside the lock when that limit is gone', async () => {
+  const { restartSession } = require('./serve');
+  // An account handoff observed the limit before its target-login preflight, which
+  // starts an interactive shell and can take 45 seconds. This is the last look, on
+  // the session this restart is about to close, and it happens inside the lock.
+  const pane = { id: 'p', pid: 10, alive: true, attached: 0, visibleAttached: 0,
+    meta: { sessionId: 'limited', agent: 'claude' } };
+  const at = '2026-09-12T20:34:01.831Z';
+  const session = { id: 'limited', kind: 'claude', state: 'idle', endedTurn: false,
+    rateLimit: { at, type: 'fable_weekly' },
+    pendingBackground: false, toolRunning: false, pendingQuestion: null, pendingPlan: null,
+    unknownBackgroundJobs: ['history-gap'],
+    backgroundJobs: { pending: false, uncertain: ['history-gap'], caughtUp: true, gapSettled: true, jobs: [] } };
+  const deps = (over = {}) => ({ withInjectionLock: (fn) => fn(), allowTerminalRateLimit: true,
+    buildState: async () => ({ sessions: [over.session === undefined ? session : over.session], tasks: [] }),
+    host: { request: async (type) => type === 'hello' ? { replaceExited: true } : { pane } },
+    ...(over.expectedRateLimitAt === undefined ? {} : { expectedRateLimitAt: over.expectedRateLimitAt }) });
+  const restart = (over) => restartSession({ sessionId: 'limited', pane: 'p', pid: 10, mode: 'idle' }, deps(over));
+
+  // Reaching the resume directory means the check let it through.
+  await assert.rejects(restart({ expectedRateLimitAt: at }), /Session directory is unavailable/);
+  // The person finished a turn: a newer limit event, or none at all.
+  await assert.rejects(restart({ expectedRateLimitAt: '2026-09-11T00:00:00.000Z' }),
+    /no longer carries the account limit/);
+  await assert.rejects(restart({ expectedRateLimitAt: at, session: { ...session, rateLimit: null } }),
+    /no longer carries the account limit/);
+  // A restart that names no limit is untouched by any of this.
+  await assert.rejects(restart({}), /Session directory is unavailable/);
+});
+
 test('restarting the fleet reviewer keeps its identity, its launch env, and its tick address', async () => {
   const { restartSession } = require('./serve');
   const review = require('./review.js');

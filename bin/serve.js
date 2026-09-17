@@ -3833,6 +3833,15 @@ async function restartSession(body, deps = {}) {
     if (!(await host('hello')).replaceExited) throw Error('Terminal host must be refreshed before restarting sessions');
     const pane = (await host('get', { pane: body.pane })).pane;
     const session = (await (deps.buildState || buildState)({ hostPanes: [pane] })).sessions.find((s) => s.id === body.sessionId);
+    // An account handoff names the limit its transfer exists for. Its own
+    // observation is minutes old by now — a login-shell auth preflight alone can
+    // take 45 seconds — so this is the last look, inside the lock, on the session
+    // this restart is about to close. The wording matches account-handoff's own
+    // refusal so a queue reads it as blocked either way.
+    if (deps.expectedRateLimitAt != null
+        && String(session?.rateLimit?.at ?? '') !== String(deps.expectedRateLimitAt)) {
+      throw new InjectionError(409, 'Session no longer carries the account limit this transfer was requested for');
+    }
     // A session the API cut off mid-turn never ends its turn on its own, so the
     // terminal-limit path supplies the ended turn. Its ledger may also carry a
     // settled `transcript-replaced` history-gap, which is not live work and must

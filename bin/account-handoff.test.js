@@ -993,3 +993,38 @@ test('a refusal that landed before the stop does not exempt a queued transfer fr
     assert.equal(entry.note, 'rate limit cleared');
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
+
+test('a limit that clears while the target login is checked stops the transfer before the source is touched', async () => {
+  const f = fixture();
+  try {
+    let restarts = 0;
+    let at = 1000;
+    const d = deps(f);
+    const baseRestart = d.restartSession;
+    d.restartSession = async (...args) => { restarts += 1; return baseRestart(...args); };
+    const baseInspect = d.inspect;
+    d.inspect = async (body) => {
+      const inspected = await baseInspect(body);
+      return { ...inspected, session: { ...inspected.session,
+        ...(at == null ? {} : { rateLimit: { type: 'fable_weekly', at } }) } };
+    };
+    // The login check starts an interactive shell and can take 45 seconds. The
+    // person finishes their turn while it runs, and the limit is gone.
+    let preflights = 0;
+    d.authPreflight = async () => { preflights += 1; at = null; return true; };
+
+    await assert.rejects(
+      handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two', expectedRateLimitAt: 1000 }, d),
+      (error) => error.status === 409 && /no longer carries the account limit/.test(error.message));
+    assert.equal(preflights, 1, 'the expectation held past the preflight, not only before it');
+    assert.equal(restarts, 0, 'an idle session was never stopped');
+    assert.deepEqual(handoff.list(f.root), [], 'and no journal record was written');
+
+    // The same transfer goes through when the limit is still there afterwards.
+    at = 1000;
+    d.authPreflight = async () => true;
+    const result = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two', expectedRateLimitAt: 1000 }, d);
+    assert.equal(result.status, 'done');
+    assert.equal(restarts, 1);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});

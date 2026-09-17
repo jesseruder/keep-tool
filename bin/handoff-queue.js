@@ -384,14 +384,25 @@ async function tick(deps = {}) {
   if (!due.length) {
     return { ok: true, detail: policy.enqueued ? `queued ${policy.enqueued}` : 'nothing due' };
   }
+  const dispatchable = (entry) => Boolean(entry && entry.status === 'queued' && Number(entry.nextAt || 0) <= now);
   const counts = { moved: 0, retrying: 0, parked: 0, cancelled: 0, skipped: 0 };
   for (const candidate of due) {
     // The list was taken before the first transfer; an earlier one in this same
     // tick may have taken minutes, and a cancel may have landed since. Read the
-    // entry again and dispatch only what is still queued and still due.
+    // entry again before paying for a state build.
     const entry = readOne(root, candidate.sessionId);
-    if (!entry || entry.status !== 'queued' || Number(entry.nextAt || 0) > now) { counts.skipped += 1; continue; }
-    const { entry: settled, landed } = await attemptOne(root, entry, await loadSessions(), now, deps, log);
+    if (!dispatchable(entry)) { counts.skipped += 1; continue; }
+    const sessions = await loadSessions();
+    // And once more with the state in hand. The rebuild is itself an await, and a
+    // Cancel landing inside it would otherwise still be dispatched — the
+    // generation check in settle() only stops the result being written, after the
+    // transfer has already happened.
+    const fresh = readOne(root, candidate.sessionId);
+    if (!dispatchable(fresh) || Number(fresh.generation || 0) !== Number(entry.generation || 0)) {
+      counts.skipped += 1;
+      continue;
+    }
+    const { entry: settled, landed } = await attemptOne(root, fresh, sessions, now, deps, log);
     if (!landed) { counts.skipped += 1; continue; }
     if (settled.status === 'moved') counts.moved += 1;
     else if (settled.status === 'parked') counts.parked += 1;

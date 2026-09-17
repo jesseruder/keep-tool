@@ -364,6 +364,26 @@ test('a cancel that lands during an entry\'s own transfer is not overwritten by 
   assert.equal(entryFor(f.root, 'session-b').status, 'cancelled');
 });
 
+test('a cancel that lands while state is being rebuilt stops the transfer before it is dispatched', async () => {
+  const f = fixture();
+  queue.enqueue(f.root, { sessionId: 'session-a', pane: 'pane-1', sourceAccountId: 'one', targetAccountId: 'two' },
+    { now: T, log: () => {} });
+  const asked = [];
+  const result = await queue.tick(tickDeps(f, async (body) => { asked.push(body.sessionId); return { ok: true, status: 'done' }; }, {
+    // The rebuild is an await of its own; the console's Cancel lands inside it.
+    // Re-reading the entry only before the rebuild would still dispatch here, and
+    // settle()'s generation check would then stop the result of a transfer that
+    // had already happened.
+    sessions: async () => {
+      queue.cancel(f.root, 'session-a', { now: T, log: () => {} });
+      return [session()];
+    },
+  }));
+  assert.deepEqual(asked, [], 'the cancelled entry was never dispatched');
+  assert.equal(entryFor(f.root, 'session-a').status, 'cancelled');
+  assert.match(result.detail, /skipped 1/);
+});
+
 test('an entry whose session has moved to a third account is retired, not transferred from wherever it is now', async () => {
   const f = fixture();
   queue.enqueue(f.root, { sessionId: 'session-a', pane: 'pane-1', sourceAccountId: 'one', targetAccountId: 'two', force: true }, { now: T, log: () => {} });

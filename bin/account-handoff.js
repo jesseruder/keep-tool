@@ -407,6 +407,19 @@ function permissionClass(args, options = {}) {
   return text.trim() ? null : bypass ? 'bypass' : 'restricted';
 }
 
+const LIMIT_GONE = 'Session no longer carries the account limit this transfer was requested for';
+
+// The caller named the limit its transfer exists for. This compares that against a
+// fresh observation, and is deliberately cheap to call more than once: it is the
+// only thing standing between a long preflight and a stopped idle session.
+async function requireExpectedRateLimit(body, deps) {
+  if (body?.expectedRateLimitAt == null) return;
+  const latest = await deps.inspect(body);
+  if (!latest?.session || String(latest.session.rateLimit?.at ?? '') !== String(body.expectedRateLimitAt)) {
+    const error = new Error(LIMIT_GONE); error.status = 409; throw error;
+  }
+}
+
 async function run(body, deps = {}) {
   const root = deps.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
   const env = deps.env || process.env;
@@ -482,8 +495,7 @@ async function run(body, deps = {}) {
     // source exits there is no live turn left to carry a limit.
     if (body.expectedRateLimitAt != null
         && String(inspected?.session?.rateLimit?.at ?? '') !== String(body.expectedRateLimitAt)) {
-      const error = new Error('Session no longer carries the account limit this transfer was requested for');
-      error.status = 409; throw error;
+      const error = new Error(LIMIT_GONE); error.status = 409; throw error;
     }
     if (current && force) current.force = true;
     if (current && current.status !== 'recovery-needed') {
@@ -633,6 +645,14 @@ async function run(body, deps = {}) {
     if (!compatibility.ok) {
       const error = new Error(`Target account setup is incompatible: ${compatibility.reasons.join('; ')}`); error.status = 409; throw error;
     }
+    // The limit was last observed before authPreflight, which starts an
+    // interactive login shell and can take 45 seconds. A person can finish a turn
+    // in that time, and stopping an idle session to type a continuation into it is
+    // exactly what this expectation exists to prevent. Look again, after the long
+    // wait and still before anything is written or stopped. restartSession takes
+    // the same expectation below and answers it once more inside the injection
+    // lock, on the session it reads there.
+    await requireExpectedRateLimit(body, deps);
     current ||= { id: crypto.randomUUID(), transactionId: null, sessionId: session.id, pane: pane.id,
       agent, sourceAccountId: source.id, targetAccountId: target.id };
     current.transactionId ||= current.id;
@@ -678,6 +698,7 @@ async function run(body, deps = {}) {
         ...deps.restartDeps, root, env, host: wrappedHost, resumeAccount: target, resumeMcpConfig: compatibility.mcpConfig,
         resumeModel: current.model, resumeArgv: current.resumeSpec?.argv, resumeCwd: current.resumeSpec ? current.cwd : null,
         allowTerminalRateLimit: true,
+        ...(body.expectedRateLimitAt != null ? { expectedRateLimitAt: body.expectedRateLimitAt } : {}),
       });
       Object.assign(current, { status: 'verifying', phase: 'verifying-target', pid: result.pid }); writeOne(root, current);
       const record = await deps.waitForAccountRecord(session.id, pane.id, target.id, current.targetLaunchStartedAt);
