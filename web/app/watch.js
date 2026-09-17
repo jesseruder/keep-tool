@@ -4,7 +4,7 @@ import { accountLabelHTML, handoffControls, installHandoffControls, hasPendingHa
 import { portableTransferControls, installPortableTransferControls } from './portable-transfer.js';
 import { actionsMenuHTML, installActionsMenu, patchActionsMenu, rendererControlsHTML } from './session-actions.js';
 import { numBadgeHTML } from './session-number.js';
-import { RENAMED_HINT, installRenameControls, isEditing, renameButtonsHTML } from './session-rename.js';
+import { installHeadingRename, installRenameControls, isEditing, renameButtonsHTML, titleAttrsHTML } from './session-rename.js';
 
 const SHELL_PROJECT_KEY = 'keep.console.shellProject';
 
@@ -121,7 +121,7 @@ function renderGrid(ctx, layout) {
     const heading = element.querySelector('.ph .session-heading');
     // Skipped while a rename editor is open in this heading; see session-rename.js.
     if (!isEditing(heading)) {
-      ctx.patchHTML(heading, `<b${entity.renamed ? ` title="${ctx.esc(RENAMED_HINT)}"` : ''}>${ctx.esc(entity.title)}${numBadgeHTML(ctx.esc, entity.num, entity.session?.id)}</b><div class="meta">${ctx.projectHTML(entity.project)}${entity.taskId ? `<span class="proj">${ctx.esc(entity.taskId)}</span>${ctx.tagsHTML(ctx.taskFor(entity))}` : ''}${accountLabelHTML(ctx, entity.session, pane)}</div>`);
+      ctx.patchHTML(heading, `<b${titleAttrsHTML(ctx.esc, entity.session?.id, entity.renamed)}>${ctx.esc(entity.title)}${numBadgeHTML(ctx.esc, entity.num, entity.session?.id)}</b><div class="meta">${ctx.projectHTML(entity.project)}${entity.taskId ? `<span class="proj">${ctx.esc(entity.taskId)}</span>${ctx.tagsHTML(ctx.taskFor(entity))}` : ''}${accountLabelHTML(ctx, entity.session, pane)}</div>`);
     }
     ctx.patchHTML(element.querySelector('.pane-state'), `<span class="st"><i class="${ctx.esc(entity.state)}"></i>${ctx.esc(entity.stateLabel || entity.state)}</span>`);
     const portable = (closable || pendingHandoff) && !entity.session?.reviewer ? portableTransferControls(ctx, pane.meta.sessionId) : '';
@@ -131,6 +131,7 @@ function renderGrid(ctx, layout) {
     patchActionsMenu(ctx, menu, `<button class="btn" data-unpin>Unpin from Watch</button>${closable ? '<button class="btn" data-close-session>Close session</button>' : ''}${shell ? `<button class="btn" data-kill>${pane.alive ? 'Kill shell' : 'Remove shell'}</button>` : ''}${exitedAgent && !pendingHandoff ? '<button class="btn" data-reopen>Reopen</button><button class="btn" data-remove-pane>Remove pane</button>' : ''}${renameButtonsHTML(entity.session?.id, entity.renamed)}<div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><span class="restart-controls">${restart}</span>${rendererControlsHTML(ctx, pane.id, pane)}`);
     installActionsMenu(menu, ctx, pane.id);
     installRenameControls(menu, ctx, heading, entity.session?.id, entity.title, api.renameSession);
+    installHeadingRename(heading, ctx, entity.session?.id, entity.title, api.renameSession);
     if (portable) installPortableTransferControls(menu.querySelector('.portable-transfer-controls'), ctx);
     if (handoff) installHandoffControls(menu.querySelector('.account-controls'), ctx, pane.meta.sessionId, pane.id);
     if (restart) installRestartControls(menu.querySelector('.restart-controls'), ctx, pane.meta.sessionId, pane.id);

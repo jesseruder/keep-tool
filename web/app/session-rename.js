@@ -71,6 +71,78 @@ export function startRename(options = {}) {
   return { input, form, cancel: close };
 }
 
+// The heading's title advertises itself as the rename affordance: the renderers
+// put these attributes on the h2/b whenever there is a session to rename, so the
+// markup for the hint lives here next to the handler that reads it.
+export function titleAttrsHTML(esc = escapeHTML, sessionId, renamed) {
+  if (!sessionId) return '';
+  const hint = renamed ? `${RENAMED_HINT}. Click to rename` : 'Click to rename';
+  return ` data-rename-title tabindex="0" title="${esc(hint)}"`;
+}
+
+// The heading element survives every re-render; only its innerHTML is patched.
+// So the click listener goes on the heading once and reads the session it points
+// at now, not the one it pointed at when the listener was installed.
+const renameTargets = new WeakMap();
+const renameWired = new WeakSet();
+
+function hasClass(node, name) {
+  if (node?.classList?.contains) return node.classList.contains(name);
+  const value = node?.attributes?.get?.('class') ?? node?.className ?? '';
+  return String(value).split(/\s+/).includes(name);
+}
+
+// The chain from `root` down to `node`, or null when `node` is outside `root`.
+// Walking `children` keeps this true for the console's DOM and for the fake DOM
+// the tests use, neither of which needs `closest`.
+function pathTo(root, node) {
+  if (!root || !node) return null;
+  if (root === node) return [root];
+  for (const child of root.children || []) {
+    const found = pathTo(child, node);
+    if (found) return [root, ...found];
+  }
+  return null;
+}
+
+// Clicking the title starts the rename; the Actions menu keeps its buttons as
+// the discoverable fallback. Called on every render to refresh the target.
+export function installHeadingRename(heading, ctx, sessionId, title, rename) {
+  if (!heading) return;
+  renameTargets.set(heading, { ctx, sessionId, title, rename });
+  if (renameWired.has(heading)) return;
+  renameWired.add(heading);
+  const open = (event) => {
+    const target = renameTargets.get(heading);
+    if (!target || !target.sessionId || typeof target.rename !== 'function') return;
+    if (isEditing(heading)) return;
+    const titleNode = heading.querySelector?.('h2') || heading.querySelector?.('b');
+    const path = pathTo(titleNode, event?.target);
+    // Only the title itself: not the meta line, not the number badge (whose
+    // tooltip carries the session id), not the editor once it is open.
+    if (!path) return;
+    if (path.some((node) => hasClass(node, 'num-id') || hasClass(node, 'rename-session'))) return;
+    event?.preventDefault?.();
+    const context = target.ctx || {};
+    startRename({
+      heading,
+      sessionId: target.sessionId,
+      title: target.title,
+      rename: target.rename,
+      esc: context.esc,
+      onDone: () => context.reload?.(),
+      onError: (message) => context.toast?.(`Not renamed: ${message}`),
+    });
+  };
+  heading.addEventListener('click', open);
+  heading.addEventListener('keydown', (event) => {
+    if (event?.key !== 'Enter') return;
+    const titleNode = heading.querySelector?.('h2') || heading.querySelector?.('b');
+    if (!titleNode || event.target !== titleNode) return;
+    open(event);
+  });
+}
+
 // Wires the two Actions-menu buttons. `rename` is the api call so the stage and
 // the Watch pane can share this without either importing the other.
 export function installRenameControls(menu, ctx, heading, sessionId, title, rename) {

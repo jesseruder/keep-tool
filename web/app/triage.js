@@ -10,7 +10,7 @@ import { retainSelection, selectionIndex } from './selection.js';
 import { actionsMenuHTML, installActionsMenu, patchActionsMenu, rendererControlsHTML } from './session-actions.js';
 import { stateLineHTML, installGrading } from './state-line.js';
 import { numBadgeHTML } from './session-number.js';
-import { RENAMED_HINT, installRenameControls, isEditing, renameButtonsHTML } from './session-rename.js';
+import { installHeadingRename, installRenameControls, isEditing, renameButtonsHTML, titleAttrsHTML } from './session-rename.js';
 
 const summaryCache = new Map(); // session id -> { text, fetchedAt, mtime, fresh }
 const summaryInflight = new Map();
@@ -730,7 +730,7 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
   // An open rename editor lives inside this heading; patching it would type over
   // Owner's input on the next refresh.
   if (!isEditing(heading)) {
-    ctx.patchHTML(heading, `<h2${session?.renamed ? ` title="${ctx.esc(RENAMED_HINT)}"` : ''}>${ctx.esc(title)}${numBadgeHTML(ctx.esc, item.num ?? session?.num, item.sessionId || session?.id)}</h2><div class="meta mono">${ctx.projectHTML(item.project || session?.project || '', true)}${item.taskId ? `<span>${ctx.esc(item.taskId)}</span>${ctx.tagsHTML(task)}` : ''}${accountLabelHTML(ctx, session, pane)}${outageNote}</div>${task ? modelUsageHTML(task.modelUsage) : ''}`);
+    ctx.patchHTML(heading, `<h2${titleAttrsHTML(ctx.esc, item.sessionId, session?.renamed)}>${ctx.esc(title)}${numBadgeHTML(ctx.esc, item.num ?? session?.num, item.sessionId || session?.id)}</h2><div class="meta mono">${ctx.projectHTML(item.project || session?.project || '', true)}${item.taskId ? `<span>${ctx.esc(item.taskId)}</span>${ctx.tagsHTML(task)}` : ''}${accountLabelHTML(ctx, session, pane)}${outageNote}</div>${task ? modelUsageHTML(task.modelUsage) : ''}`);
   }
   const brief = stage.querySelector('.brief');
   const ownControls = sessionControlsAllowed(session);
@@ -750,6 +750,7 @@ function renderStage(ctx, queue, focusItem, running, pinned) {
   patchActionsMenu(ctx, menu, `<button class="btn" data-pin ${item.pane ? '' : 'disabled'}><kbd>p</kbd> ${ctx.esc(pinLabel)}</button>${reopen}${dependencyWait}${renameButtonsHTML(item.sessionId, session?.renamed)}<span class="relay-controls">${relay}</span><div class="portable-transfer-controls">${portable}</div><div class="account-controls">${handoff}</div><span class="restart-controls">${restart}</span>${hasLivePane ? rendererControlsHTML(ctx, item.pane, pane) : ''}`);
   installActionsMenu(menu, ctx, item.pane);
   installRenameControls(menu, ctx, heading, item.sessionId, title, api.renameSession);
+  installHeadingRename(heading, ctx, item.sessionId, title, api.renameSession);
   if (relay) installRelayControls(menu.querySelector('.relay-controls'), ctx);
   if (portable) installPortableTransferControls(menu.querySelector('.portable-transfer-controls'), ctx);
   if (handoff) installHandoffControls(menu.querySelector('.account-controls'), ctx, item.sessionId, item.pane);

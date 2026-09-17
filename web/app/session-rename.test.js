@@ -181,3 +181,112 @@ test('a failed write is reported and the heading is left as it was', async () =>
   assert.deepEqual(errors, ['bad session id']);
   assert.equal(heading.innerHTML, before);
 });
+
+// Clicking the title. The heading container outlives every re-render, so the
+// listener goes on it once and the title element under it is replaced; these
+// helpers stand in for what patchHTML writes.
+function renderHeadingTitle(heading, titleTag, titleHTML) {
+  const title = new FakeElement(titleTag);
+  title._html = titleHTML;
+  const badge = new FakeElement('span');
+  badge.attributes.set('class', 'num-id');
+  badge._html = '#12';
+  title.children.push(badge);
+  const meta = new FakeElement('div');
+  meta.attributes.set('class', 'meta');
+  heading.children = [title, meta];
+  heading._html = `<${titleTag}>${titleHTML}<span class="num-id">#12</span></${titleTag}><div class="meta"></div>`;
+  return { title, badge, meta };
+}
+
+function clickableHeading(titleTag = 'h2', titleHTML = 'The finder') {
+  const heading = new FakeElement('div');
+  heading.attributes.set('class', 'session-heading');
+  return { heading, ...renderHeadingTitle(heading, titleTag, titleHTML) };
+}
+
+test('clicking the title opens the editor, and the next render retargets it', async () => {
+  const { installHeadingRename, isEditing } = await import('./session-rename.js');
+  const writes = [];
+  const rename = async (sessionId, value) => { writes.push([sessionId, value]); };
+  let reloads = 0;
+  const ctx = { esc, reload: () => { reloads += 1; }, toast: () => assert.fail('no toast for a good write') };
+  const { heading, title } = clickableHeading();
+
+  installHeadingRename(heading, ctx, 'abc', 'The finder', rename);
+  heading.dispatch('click', { target: title });
+  assert.equal(isEditing(heading), true);
+  const input = heading.querySelector('input[name="title"]');
+  assert.equal(input.value, 'The finder', 'the current title is prefilled');
+  heading.querySelector('.rename-session').dispatch('submit');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(writes, [['abc', 'The finder']]);
+  assert.equal(reloads, 1);
+
+  // The renderer redraws the heading for a different session; the same listener
+  // must now write that session's name.
+  const next = renderHeadingTitle(heading, 'h2', 'Retry path');
+  installHeadingRename(heading, ctx, 'xyz', 'Retry path', rename);
+  heading.dispatch('click', { target: next.title });
+  assert.equal(heading.querySelector('input[name="title"]').value, 'Retry path');
+  heading.querySelector('.rename-session').dispatch('submit');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(writes[1], ['xyz', 'Retry path']);
+});
+
+test('installing on every render leaves one click listener', async () => {
+  const { installHeadingRename } = await import('./session-rename.js');
+  const ctx = { esc };
+  const { heading, title } = clickableHeading('b', 'The finder');
+  for (let i = 0; i < 3; i += 1) installHeadingRename(heading, ctx, 'abc', 'The finder', async () => {});
+  assert.equal(heading.listeners.get('click').length, 1);
+  heading.dispatch('click', { target: title });
+  assert.equal(title.children.filter((child) => child.attributes.get('class') === 'rename-session').length, 1);
+});
+
+test('the number badge, an open editor and a session-less heading are left alone', async () => {
+  const { installHeadingRename, isEditing } = await import('./session-rename.js');
+  const ctx = { esc };
+
+  // The badge carries the session id in its tooltip; clicking it is a read, not a rename.
+  const badgeCase = clickableHeading();
+  installHeadingRename(badgeCase.heading, ctx, 'abc', 'The finder', async () => {});
+  badgeCase.heading.dispatch('click', { target: badgeCase.badge });
+  assert.equal(isEditing(badgeCase.heading), false);
+  badgeCase.heading.dispatch('click', { target: badgeCase.meta });
+  assert.equal(isEditing(badgeCase.heading), false, 'the meta line is not the title');
+
+  // A click inside the open editor must not restart it and lose what was typed.
+  badgeCase.heading.dispatch('click', { target: badgeCase.title });
+  assert.equal(isEditing(badgeCase.heading), true);
+  const input = badgeCase.heading.querySelector('input[name="title"]');
+  input.value = 'half typed';
+  badgeCase.heading.dispatch('click', { target: input });
+  assert.equal(badgeCase.heading.querySelector('input[name="title"]').value, 'half typed');
+
+  // A pane with no session has nothing to rename.
+  const shell = clickableHeading();
+  installHeadingRename(shell.heading, ctx, '', 'bash', async () => assert.fail('no session, no write'));
+  shell.heading.dispatch('click', { target: shell.title });
+  assert.equal(isEditing(shell.heading), false);
+});
+
+test('Enter on the focused title opens the editor', async () => {
+  const { installHeadingRename, isEditing } = await import('./session-rename.js');
+  const { heading, title, badge } = clickableHeading();
+  installHeadingRename(heading, { esc }, 'abc', 'The finder', async () => {});
+  heading.dispatch('keydown', { key: 'a', target: title });
+  assert.equal(isEditing(heading), false, 'another key is not a rename');
+  heading.dispatch('keydown', { key: 'Enter', target: badge });
+  assert.equal(isEditing(heading), false, 'the title itself has to be the focused element');
+  heading.dispatch('keydown', { key: 'Enter', target: title });
+  assert.equal(isEditing(heading), true);
+});
+
+test('the title advertises the rename, with the hand-named hint kept', async () => {
+  const { titleAttrsHTML, RENAMED_HINT } = await import('./session-rename.js');
+  assert.equal(titleAttrsHTML(esc, '', false), '', 'a shell pane has no session to rename');
+  const plain = titleAttrsHTML(esc, 'abc', false);
+  assert.match(plain, /^ data-rename-title tabindex="0" title="Click to rename"$/);
+  assert.equal(titleAttrsHTML(esc, 'abc', true), ` data-rename-title tabindex="0" title="${esc(RENAMED_HINT)}. Click to rename"`);
+});

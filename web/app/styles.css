@@ -175,6 +175,10 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .session-heading .meta a { min-width: 0; }
 .wpane .session-heading > b { display: block; }
 .wpane .session-heading { flex-basis: 0; }
+/* The title is the rename affordance; the Actions menu keeps the same two buttons. */
+.session-heading [data-rename-title] { cursor: text; }
+.session-heading [data-rename-title]:hover, .session-heading [data-rename-title]:focus-visible { text-decoration: underline dotted; text-decoration-color: var(--muted); text-underline-offset: 3px; }
+.session-heading [data-rename-title] .num-id { text-decoration: none; }
 /* The inline rename editor stands in for the heading's title text. */
 .rename-session { display: block; }
 .rename-session input { width: 100%; box-sizing: border-box; font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--accent); border-radius: 4px; padding: 1px 6px; }
