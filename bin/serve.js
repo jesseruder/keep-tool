@@ -2253,39 +2253,51 @@ function draftIsExactly(screen, text, kind) {
   return draft !== null && draft === canonicalText(text);
 }
 
+// The pane's input counter and the process it belongs to, or null when either cannot
+// be read. The host raises the counter for every keystroke that reaches the pane — a
+// viewer's exactly as much as this daemon's. The two travel together everywhere,
+// because `replace-exited` keeps the pane id and starts a new process's count at zero,
+// so a count on its own says nothing about which program received those keys.
+async function livePaneState(paneId, deps = {}) {
+  try {
+    const panes = await (deps.listHostPanes || listHostPanes)(deps, true);
+    const live = Array.isArray(panes) ? panes.find((entry) => entry && entry.id === paneId) : null;
+    return live && Number.isInteger(live.inputCount) && Number.isInteger(live.pid)
+      ? { inputCount: live.inputCount, pid: live.pid } : null;
+  } catch { return null; }
+}
+
 // Escape clears a non-empty Claude/Codex input box — but only ever *our* draft.
 // If Owner has typed into the pane since, the box is his now: erasing it would
 // destroy text nobody asked us to touch, so the draft is left exactly as found
 // and the caller is told why.
+//
+// What `cleared: true` claims, exactly: from before Keep's first keystroke to after
+// its last Escape, the only input this pane received was Keep's own, and the box was
+// empty when that was read back. Nothing weaker would do. An empty box by itself is
+// not proof — Owner can append a word and have the Escape wipe both, or press Enter
+// and leave the box empty because a turn was sent, and a caller that believed the box
+// would then retype a message the session already has.
+//
+// The claim has to reach back past the typing, which is why the expectation comes in
+// through deps rather than being taken here: the count is read before the first chunk
+// is written, and what arrives is `that count + one per chunk`. Taking a fresh baseline
+// at this point would absorb an Enter that landed between the last confirmation read
+// and the discard, and that Enter is exactly the one that matters.
+//
+// From there, two gaps, closed two ways. Between reading a count and our key reaching
+// the pane there is nothing this process can check, so it does not try: the count and
+// the pid travel with the keystroke and the host, which owns both, refuses the write
+// if anything has changed. And around every screen this reads, the count is taken on
+// both sides — a read spanning somebody else's keystroke says nothing about the box it
+// shows, whichever side of the Escape it is on. A redraw arriving late needs no
+// separate check: with the count unchanged, the only keys that could have put text
+// back into that box are Keep's own, so an empty box after the Escape is conclusive.
 async function discardTypedDraft(target, text, kind, deps = {}) {
   const read = deps.readScreen || ((t, lines, scrollback) => readScreen(t, lines, scrollback, deps));
   const write = deps.stderr || process.stderr.write.bind(process.stderr);
   const pane = (target && target.pane) || 'unknown';
-  // The pane's own input counter. The host raises it for every keystroke that reaches
-  // the pane — a viewer's exactly as much as this daemon's — so it is the only thing
-  // that can tell a box which emptied because of our Escape from one which emptied
-  // because Owner was typing at the same moment. An empty box is not proof: he can
-  // append a word, and the next Escape wipes his text with ours leaving nothing to
-  // see; he can press Enter, and the box is empty because a turn was sent.
-  //
-  // Two different gaps, closed two different ways. Between reading the count and our
-  // key reaching the pane there is nothing this process can check, so it does not try:
-  // the count travels with the keystroke and the host, which owns the counter, refuses
-  // the write if anything has typed since. And around every screen this reads, the
-  // count is taken on both sides — a read that spans somebody else's keystroke says
-  // nothing about the box it shows, whichever side of the Escape it is on. "Cleared"
-  // is claimed only for an empty box whose count moved by exactly our own keys.
-  // The count is only meaningful together with the process it was counted for:
-  // `replace-exited` keeps the pane id and starts the new process's count at zero, so
-  // both travel together everywhere below.
-  const paneState = async () => {
-    try {
-      const panes = await (deps.listHostPanes || listHostPanes)(deps, true);
-      const live = Array.isArray(panes) ? panes.find((entry) => entry && entry.id === pane) : null;
-      return live && Number.isInteger(live.inputCount) && Number.isInteger(live.pid)
-        ? { inputCount: live.inputCount, pid: live.pid } : null;
-    } catch { return null; }
-  };
+  const paneState = () => livePaneState(pane, deps);
   const unverified = () => {
     write(`keep serve: left an aborted draft on pane ${pane}: its input activity could not be verified\n`);
     return { cleared: false, reason: 'input unverified' };
@@ -2320,16 +2332,19 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
   if (!capabilities || capabilities.guardedInput !== true) {
     return reloadRequired('the terminal host must be reloaded (keep host reload) before a typed draft can be cleared');
   }
-  // The baseline is taken before the screen is read, not after it. Taken after, an
-  // Enter arriving between the read and the baseline would already be inside the
-  // baseline: the guarded Escape would then be accepted, interrupting the turn
-  // that Enter had just started, and the empty box it left would pass for our own
-  // clean clear. Nothing is pressed at all when the count cannot be read either: an
-  // Escape this could not account for is worse than a draft left where it is.
-  const baseline = await paneState();
-  if (baseline === null) return unverified();
-  const pid = baseline.pid;
-  let count = baseline.inputCount;
+  // What the pane must look like for any of this to be ours: the count the caller read
+  // before it typed, plus its own chunks, on the process it read it from. An
+  // expectation that could not be formed at all — the pane would not list before the
+  // typing — presses nothing, and neither does a pane that has moved since: an Escape
+  // this cannot account for is worse than a draft left where it is.
+  const expected = deps.expectedPaneState;
+  if (!expected || !Number.isInteger(expected.inputCount) || !Number.isInteger(expected.pid)) return unverified();
+  const entry = await paneState();
+  if (entry === null) return unverified();
+  if (entry.pid !== expected.pid) return replaced();
+  if (entry.inputCount !== expected.inputCount) return arrived();
+  const pid = expected.pid;
+  let count = expected.inputCount;
   let screen = '';
   try {
     screen = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false);
@@ -2397,6 +2412,21 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
   const chunkChars = Math.max(1, Math.floor(envNumber('KEEP_SEND_CHUNK_CHARS', 200)));
   const chunkDelayMs = envNumber('KEEP_SEND_CHUNK_DELAY_MS', 120);
   const chunks = chunkForTyping(text, chunkChars);
+  // A caller that may take its draft back has to be able to say that nothing but its
+  // own keys reached the pane, and that claim starts before the first of them. Read
+  // the pane now: each chunk is one input request, so after the typing the count must
+  // be exactly this plus chunks.length, on this same process. discardTypedDraft is
+  // given that expectation rather than taking a baseline of its own, which would
+  // already contain anything Owner typed while the confirmation was being polled.
+  // Only when a discard is possible at all: a plain send never looks at this, and
+  // every send should not pay for a pane listing it will not read.
+  const discardExpectation = deps.discardDraftOnAbort
+    ? await (async () => {
+      const before = await livePaneState((target && target.pane) || 'unknown', deps);
+      return before && { pid: before.pid, inputCount: before.inputCount + chunks.length };
+    })()
+    : null;
+  const discardDeps = { ...deps, expectedPaneState: discardExpectation };
   deps.deliveryTrace?.('write-start');
   for (let index = 0; index < chunks.length; index += 1) {
     await writeTarget(target, chunks[index], deps);
@@ -2424,7 +2454,7 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
     // text stays there forever — nothing pressed Enter and nothing pressed Escape —
     // and the next attempt refuses on a draft this one left behind.
     const discard = deps.discardDraftOnAbort
-      ? await discardTypedDraft(target, text, deps.draftKind, deps)
+      ? await discardTypedDraft(target, text, deps.draftKind, discardDeps)
       : { cleared: false, reason: 'not requested' };
     deps.deliveryTrace?.('enter-aborted', { cleared: discard.cleared, reason: discard.reason });
     // Whether the pane was left with text in it is the difference between a refusal
@@ -2456,7 +2486,7 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
       // it. A close Owner asked for keeps its typed /exit on screen, as it always
       // has, so he can see what was about to happen.
       const discard = deps.discardDraftOnAbort
-        ? await discardTypedDraft(target, text, deps.draftKind, deps)
+        ? await discardTypedDraft(target, text, deps.draftKind, discardDeps)
         : { cleared: false, reason: 'not requested' };
       deps.deliveryTrace?.('enter-aborted', { cleared: discard.cleared, reason: discard.reason });
       if (error && typeof error === 'object') {

@@ -5047,14 +5047,26 @@ test('a draft is only reported cleared when nobody else typed while it was being
   assert.equal(second.error.draftReason, 'input arrived');
   assert.equal(second.escapes, 1, 'only the first Escape was written');
 
-  // An Enter landing while the box is first being read, before any Escape. The
-  // baseline is taken before that read, so this is outside it: were it taken after,
-  // the Enter would be part of the baseline, the guarded Escape would be accepted,
-  // and it would interrupt the turn that Enter had just started.
-  let listed = false;
+  // An Enter landing after the last confirmation poll and before the discard begins.
+  // This is the one a baseline taken inside the discard would have swallowed whole:
+  // the count would have agreed with itself, the guarded Escape would have been
+  // accepted into the turn that Enter had just submitted, and the empty box it left
+  // would have passed for a clean clear — after which a later send would type the
+  // message a second time. The expectation is formed before the first chunk instead,
+  // so this keystroke is outside it and nothing is pressed.
+  const beforeDiscard = await run(CLEARABLE('/exit'), (type, { foreign }) => {
+    if (type === 'hello') foreign.count = 1;
+  });
+  assert.equal(beforeDiscard.error.message, 'message was typed but could not be confirmed; Enter was not pressed');
+  assert.equal(beforeDiscard.error.draftReason, 'input arrived');
+  assert.equal(beforeDiscard.error.draftCleared, undefined, 'and delivery keeps its journal entry');
+  assert.equal(beforeDiscard.escapes, 0);
+
+  // An Enter landing while the box is being read, before any Escape.
+  let sawHello = false;
   const entry = await run(CLEARABLE('/exit'), (type, { inputs, foreign }) => {
-    if (type === 'list') listed = true;
-    if (type === 'screen' && listed && !inputs.includes('\x1b')) foreign.count = 1;
+    if (type === 'hello') sawHello = true;
+    if (type === 'screen' && sawHello && !inputs.includes('\x1b')) foreign.count = 1;
   });
   assert.equal(entry.error.draftReason, 'input arrived');
   assert.equal(entry.escapes, 0, 'nothing is pressed at a box somebody typed into while it was read');
@@ -5079,13 +5091,17 @@ test('a draft is only reported cleared when nobody else typed while it was being
   assert.equal(swapped.error.message, 'message was typed but could not be confirmed; Enter was not pressed');
   assert.equal(swapped.error.draftReason, 'pane replaced');
   assert.equal(swapped.escapes, 0, 'nothing is typed into a process this never looked at');
-  // And a replacement noticed by the listing rather than the write is the same answer.
-  let seen = 0;
-  const relisted = await run(CLEARABLE('/exit'), (type, { live }) => {
-    if (type === 'list' && ++seen === 2) live.pid = 5151;
-  });
-  assert.equal(relisted.error.draftReason, 'pane replaced');
-  assert.equal(relisted.escapes, 0);
+  // And a replacement noticed by a listing rather than by the write is the same
+  // answer, whether it is the one that checks the expectation or the one after the
+  // box was read. (Listings in order: before typing, at discard entry, after the read.)
+  for (const nth of [2, 3]) {
+    let seen = 0;
+    const relisted = await run(CLEARABLE('/exit'), (type, { live }) => {
+      if (type === 'list' && ++seen === nth) live.pid = 5151;
+    });
+    assert.equal(relisted.error.draftReason, 'pane replaced', `listing ${nth}`);
+    assert.equal(relisted.escapes, 0, `listing ${nth}`);
+  }
 
   // A host that has not been reloaded since the guarded write landed would ignore
   // the expected count and press the key anyway, which is the race itself. It is asked
