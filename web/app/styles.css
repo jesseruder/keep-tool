@@ -250,12 +250,30 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .mark-dot.mark-blue, .mark-swatch.mark-blue { background: var(--mark-blue); }
 .mark-dot.mark-purple, .mark-swatch.mark-purple { background: var(--mark-purple); }
 .mark-dot.mark-pink, .mark-swatch.mark-pink { background: var(--mark-pink); }
-/* The Actions-menu block that sets one. */
-.mark-controls { display: flex; flex-direction: column; gap: 4px; }
+/* The Actions-menu block that sets one: one column, except that the emoji field
+   and the picker's toggle share a row. */
+.mark-controls { display: grid; grid-template-columns: auto 1fr; gap: 4px 0; align-items: center; }
+.mark-controls > * { grid-column: 1 / -1; }
+.mark-controls > .mark-emoji { grid-column: 1; }
+.mark-controls > .emoji-pick { grid-column: 2; }
 .mark-swatches { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 8px; }
 .mark-swatch { width: 16px; height: 16px; border-radius: 50%; padding: 0; flex: none; }
 .mark-swatch[aria-pressed="true"] { box-shadow: 0 0 0 2px var(--panel-2), 0 0 0 4px var(--focus); }
 .mark-emoji { width: 84px; margin: 0 8px; font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line-2); border-radius: 4px; padding: 1px 6px; }
+/* The emoji picker: a compact toggle beside the field, and a panel that opens
+   inside the Actions menu, narrow and with its own scroll rather than making the
+   menu too tall for a Watch pane. The selector beats
+   `.session-actions-content > div > .btn`, which stretches menu buttons. */
+.mark-controls > .emoji-pick.btn { justify-self: start; width: auto; padding: 1px 6px; line-height: 1.35; }
+.emoji-picker { margin: 4px 8px 0; width: 260px; max-width: 100%; padding: 6px; border: 1px solid var(--line-2); border-radius: 5px; background: var(--panel); }
+.emoji-picker[hidden] { display: none; }
+.emoji-search { width: 100%; font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 4px; padding: 2px 6px; }
+.emoji-recent { display: flex; flex-wrap: wrap; gap: 1px; margin-top: 5px; padding-bottom: 4px; border-bottom: 1px solid var(--line); }
+.emoji-recent[hidden] { display: none; }
+.emoji-grid { display: flex; flex-wrap: wrap; gap: 1px; margin-top: 4px; max-height: 180px; overflow: auto; }
+.emoji-cell { width: 32px; height: 32px; padding: 0; flex: none; border: 0; border-radius: 4px; background: transparent; font-size: 17px; line-height: 1; text-align: center; }
+.emoji-cell:hover { background: var(--panel-2); }
+.emoji-cell:focus-visible { background: var(--panel-2); outline: 1px solid var(--accent); }
 .handoff-status, .handoff-error { align-self: center; color: var(--muted); font-size: 11px; white-space: nowrap; }
 .handoff-error { color: var(--bad); }
 .session-launch-dialog { width: min(560px, calc(100vw - 32px)); max-width: none; padding: 0; border: 1px solid var(--line-2); border-radius: 10px; background: var(--panel); color: var(--text); box-shadow: var(--shadow); }

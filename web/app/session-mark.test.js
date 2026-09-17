@@ -35,12 +35,65 @@ class FakeControl {
   blur() { this.onblur?.(); }
 }
 
+// The emoji picker's own half of the Mark row, enough of it for installMarkControls
+// to wire the picker to the same field. emoji-picker.test.js is where the picker
+// itself is put through its paces; here it only has to be able to hand an emoji back.
+class FakePickerNode {
+  constructor(tag, dataset = {}) {
+    this.tag = tag;
+    this.dataset = dataset;
+    this.value = '';
+    this.hidden = false;
+    this.cells = [];
+    this.html = '';
+    this.onclick = null;
+    this.onkeydown = null;
+    this.oninput = null;
+  }
+
+  setAttribute() {}
+  getAttribute() { return null; }
+  focus() {}
+  click() { this.onclick?.(); }
+
+  set innerHTML(html) {
+    this.html = html;
+    this.cells = [...html.matchAll(/data-emoji="([^"]*)"/g)].map(([, emoji]) => new FakePickerNode('button', { emoji }));
+  }
+
+  get innerHTML() { return this.html; }
+  querySelectorAll(selector) { return selector === '[data-emoji]' ? this.cells : []; }
+  cell(emoji) { return this.cells.find((entry) => entry.dataset.emoji === emoji); }
+}
+
+class FakeControls {
+  constructor() {
+    this.dataset = { markControls: '' };
+    this.toggle = new FakePickerNode('button', { emojiPick: '' });
+    this.panel = new FakePickerNode('div', { emojiPicker: '' });
+    this.panel.hidden = true;
+    this.search = new FakePickerNode('input', { emojiSearch: '' });
+    this.recent = new FakePickerNode('div', { emojiRecent: '' });
+    this.grid = new FakePickerNode('div', { emojiGrid: '' });
+    this.nodes = {
+      '[data-emoji-pick]': this.toggle,
+      '[data-emoji-picker]': this.panel,
+      '[data-emoji-search]': this.search,
+      '[data-emoji-recent]': this.recent,
+      '[data-emoji-grid]': this.grid,
+    };
+  }
+
+  querySelector(selector) { return this.nodes[selector] ?? null; }
+}
+
 class FakeMenu {
   constructor(html) {
     this.html = html;
     this.open = true;
     this.closes = 0;
     this.controls = [];
+    this.markControls = html.includes('data-mark-controls') ? new FakeControls() : null;
     for (const [, color] of html.matchAll(/data-mark-color="([^"]*)"/g)) {
       this.controls.push(new FakeControl('button', { markColor: color }));
     }
@@ -60,7 +113,11 @@ class FakeMenu {
   }
 
   querySelectorAll(selector) { return this.controls.filter((control) => FakeMenu.match(control, selector)); }
-  querySelector(selector) { return this.controls.find((control) => FakeMenu.match(control, selector)) || null; }
+
+  querySelector(selector) {
+    if (selector === '[data-mark-controls]') return this.markControls;
+    return this.controls.find((control) => FakeMenu.match(control, selector)) || null;
+  }
   removeAttribute(name) { if (name === 'open') { this.open = false; this.closes += 1; } }
 
   swatch(color) { return this.controls.find((control) => control.dataset.markColor === color); }
@@ -117,6 +174,10 @@ test('the controls offer the eight palette colors in order, with the current one
   assert.match(html, /data-mark-color="red" title="red" aria-pressed="false"/);
   assert.match(html, /maxlength="16"/);
   assert.match(html, /value="🔥"/, 'the current emoji is prefilled');
+  // The picker's toggle sits right after the field, its grid still empty.
+  assert.match(html, /aria-label="Session emoji"><button type="button" class="btn emoji-pick" data-emoji-pick/);
+  assert.match(html, /<div class="emoji-picker" data-emoji-picker hidden>/);
+  assert.equal(html.includes('emoji-cell'), false, 'the grid is filled on open, not in the markup');
   assert.match(html, /data-mark-clear>Clear mark</);
 });
 
@@ -435,6 +496,43 @@ test('installing on every render leaves one handler per control', async () => {
   emoji.menu.emoji.keydown('Enter');
   await settle();
   assert.deepEqual(emoji.writes, [['abc', { emoji: '🔥' }]]);
+});
+
+test('the picker sets the field and writes once, and the blur that follows is not a second write', async () => {
+  const set = await wired({ color: 'blue' });
+  const picker = set.menu.markControls;
+  assert.ok(picker, 'the Mark row is the picker\'s host');
+
+  // Opening the picker takes focus off the emoji field: the blur commits an
+  // unchanged value, which is no write at all.
+  picker.toggle.click();
+  set.menu.emoji.blur();
+  await settle();
+  assert.deepEqual(set.writes, []);
+  assert.equal(picker.panel.hidden, false);
+
+  picker.grid.cell('🚀').click();
+  await settle();
+  assert.deepEqual(set.writes, [['abc', { emoji: '🚀' }]]);
+  assert.equal(set.menu.emoji.value, '🚀', 'the field shows what was picked');
+  assert.equal(set.menu.open, true, 'picking an emoji leaves the Actions menu open');
+  assert.equal(picker.panel.hidden, true, 'and closes the picker');
+
+  // Focus leaving the picker blurs the field again. The belief already carries
+  // the picked emoji — the write put it there — so commit finds nothing to do.
+  set.menu.emoji.blur();
+  set.menu.emoji.change();
+  await settle();
+  assert.deepEqual(set.writes, [['abc', { emoji: '🚀' }]], 'exactly one write for one pick');
+});
+
+test('the picker is installed once per render, however often the menu re-installs', async () => {
+  const set = await wired(null, { installs: 3 });
+  set.menu.markControls.toggle.click();
+  assert.equal(set.menu.markControls.panel.hidden, false, 'three installs is one toggle handler');
+  set.menu.markControls.grid.cell('🔥').click();
+  await settle();
+  assert.deepEqual(set.writes, [['abc', { emoji: '🔥' }]]);
 });
 
 test('a session-less pane and a missing writer are wired to nothing', async () => {

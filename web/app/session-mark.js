@@ -6,6 +6,7 @@
 //
 // The mark rides along with the number badge, so it shows up wherever a session's
 // title does: the stage heading, a Watch pane, the triage queue and the fleet.
+import { installEmojiPicker, pickerHTML } from './emoji-picker.js';
 
 // The fixed order the backend validates against; the swatch row follows it.
 export const PALETTE = ['red', 'orange', 'yellow', 'green', 'teal', 'blue', 'purple', 'pink'];
@@ -33,15 +34,16 @@ export function markHTML(esc = escapeHTML, mark) {
   return `<span class="mark">${esc(emoji)}${dot}</span>`;
 }
 
-// The Actions-menu block: eight swatches, a small emoji field, and a Clear that
-// only appears once there is something to clear.
+// The Actions-menu block: eight swatches, a small emoji field with the picker's
+// toggle beside it, and a Clear that only appears once there is something to
+// clear.
 export function markControlsHTML(esc = escapeHTML, sessionId, mark) {
   if (!sessionId) return '';
   const color = colorOf(mark);
   const emoji = emojiOf(mark);
   const swatches = PALETTE.map((name) => `<button type="button" class="mark-swatch mark-${name}" data-mark-color="${name}" title="${name}" aria-pressed="${name === color}"></button>`).join('');
   const clear = color || emoji ? '<button type="button" class="btn" data-mark-clear>Clear mark</button>' : '';
-  return `<div class="mark-controls" data-mark-controls><div class="session-actions-label">Mark</div><div class="mark-swatches" role="group" aria-label="Mark color">${swatches}</div><input class="mark-emoji" data-mark-emoji name="emoji" maxlength="16" placeholder="emoji" value="${esc(emoji)}" aria-label="Session emoji">${clear}</div>`;
+  return `<div class="mark-controls" data-mark-controls><div class="session-actions-label">Mark</div><div class="mark-swatches" role="group" aria-label="Mark color">${swatches}</div><input class="mark-emoji" data-mark-emoji name="emoji" maxlength="16" placeholder="emoji" value="${esc(emoji)}" aria-label="Session emoji">${pickerHTML(esc)}${clear}</div>`;
 }
 
 // Per session, across re-installs: what the daemon last confirmed, the writes
@@ -134,6 +136,20 @@ export function installMarkControls(menu, ctx = {}, sessionId, mark, setMark) {
     };
     input.onchange = commit;
     input.onblur = commit;
+
+    // The picker sets the field and writes in one go. The blur that follows —
+    // focus left the field for the toggle the moment the panel was opened, or
+    // leaves the picker now — runs `commit` against a belief the write has
+    // already moved on to, so it is a no-op rather than a second write.
+    const controls = menu.querySelector('[data-mark-controls]');
+    if (controls) {
+      installEmojiPicker(controls, {
+        onPick: (emoji) => {
+          input.value = emoji;
+          write({ emoji }, false);
+        },
+      });
+    }
   }
 
   const clear = menu.querySelector('[data-mark-clear]');

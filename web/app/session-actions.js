@@ -7,11 +7,11 @@ export function actionsMenuHTML() {
 function focusIdentity(element) {
   if (!(element instanceof Element)) return null;
   for (const name of ['renderer', 'restart', 'handoffAccount', 'portableTransfer', 'portableFallback', 'relaySession',
-    'markColor']) {
+    'markColor', 'emoji']) {
     if (element.dataset[name] != null) return `[data-${name.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)}="${CSS.escape(element.dataset[name])}"]`;
   }
   return ['pin', 'unpin', 'closeSession', 'snooze', 'dismiss', 'waitDependency', 'reopen', 'kill', 'removePane',
-    'rename', 'renameReset', 'markEmoji', 'markClear']
+    'rename', 'renameReset', 'markEmoji', 'emojiPick', 'emojiSearch', 'markClear']
     .find((name) => element.dataset[name] != null);
 }
 
