@@ -26,15 +26,22 @@
 // resolves to the very file the manifest points at, and matched by the same launcher
 // and interpreter rules as any other declaration.
 //
-// Four kinds of declaration therefore keep no title form at all and stay on the
-// audit-pin path. One whose arguments carry a credentialed URL: npm redacts secrets out
-// of the title, so the row cannot be reconstructed from the declaration. One whose
-// package is already in the project's own node_modules: npx runs the local bin, writes
-// no `_npx` directory, and there is nothing to check against. One whose spec is not a
-// registry spec — starting with `.`, `/` or `~`, or containing `:` — since no cache
-// directory can be derived from it. And one whose install publishes no bin npm would
-// pick on its own: several bins, pointing at different files, none named for the
-// package. docs/mcp-restart.md carries the same list with the cache-root residual.
+// Five kinds of declaration therefore keep no title form at all and stay on the
+// audit-pin path:
+//
+//   - its arguments carry a credentialed URL — npm redacts secrets out of the title,
+//     so the row cannot be reconstructed from the declaration;
+//   - its package is already in the project's own node_modules — npx runs the local
+//     bin, writes no `_npx` directory, and there is nothing to check against;
+//   - its spec is not a registry spec, starting with `.`, `/` or `~` or containing
+//     `:`, so no cache directory can be derived from it;
+//   - the install publishes no bin npm would pick on its own: several bins, pointing
+//     at different files, none named for the package;
+//   - the cache root is not the daemon's own. It is read from the daemon's
+//     npm_config_cache, which the sessions it launches inherit, so a per-session
+//     override or a `cache=` line in an ~/.npmrc names a directory this never looks in.
+//
+// docs/mcp-restart.md lists the same five.
 //
 // Residual, deliberately not closed here: a helper unit is a snapshot of the process
 // tree. A descendant a declared launcher spawns after the snapshot is not waited for;
