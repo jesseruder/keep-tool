@@ -46,18 +46,23 @@ the screen wins. It is live only when nothing but blank rows sits under its foot
 a copy retained in scrollback sits above whatever is open now, and a keystroke aimed
 at it would land in a live prompt instead. A well-formed dialog Keep has never seen
 is recognized as `unknown` rather than missed — and so is a known heading over an
-option list in another order, because the numbers there mean something else.
+option list that is not numbered 1..n down the screen (out of order, repeated, gapped),
+because the numbers there cannot mean what a known dialog's option table says they mean.
 
 `policyFor(kind)` says what Keep may do about it, and `answerable(match)` decides
 whether a key may actually go out: only the worktree exit prompt is ever answered, only
-while it is live, and only when the *text* of the highlighted option is "Keep worktree".
-A number is never the answer on its own. That is the restart's graceful-exit wait, still
-behind its process-identity re-check and a second read of the screen.
+while it is live, only under an `Enter to confirm` footer, and only when the *text* of the
+row the cursor is on is "Keep worktree". Not the option numbered 1 — the highlighted row,
+read as text. That is the restart's graceful-exit wait, still behind its process-identity
+re-check and a second read of the screen.
 
 Every other dialog is refused by name — but not on one frame. Owner may be answering the
 dialog as the screen is read, so a refusal needs the same kind still live on a later poll,
 at least ~300 ms after the first sighting; a dialog that is gone by the next read costs
-nothing and the wait finishes as it always did. A confirmed dialog fails the restart with
+nothing and the wait finishes as it always did. A first sighting on the last poll of a
+wait buys that one confirming read (the restart loop keeps a poll in hand, the opening
+wait extends its deadline once), so a pane parked on a dialog is named rather than
+reported as a timeout. A confirmed dialog fails the restart with
 `Claude Code is showing the <dialog> dialog; answer it in the pane before restarting` (an
 unknown one carries its heading), and fails an opening-message wait with a 409 naming the
 dialog and the pane instead of spending 45 seconds on its way to "never showed an empty

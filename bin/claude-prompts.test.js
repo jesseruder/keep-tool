@@ -97,8 +97,31 @@ test('the worktree exit prompt is answered by the option text, never by its numb
   assert.equal(read('worktree-exit-retained').kind, 'worktree-exit');
   assert.equal(answerable(read('worktree-exit-retained')), false);
 
-  // Highlighting a number this dialog does not have answers nothing.
-  assert.equal(answerable({ ...keep, highlighted: 3 }), false);
+  // A screen that repeats an option number cannot be read as "option 2 is the one below
+  // option 1": the answer would be found by number and land on the wrong row.
+  const duplicate = read('worktree-exit-duplicate-numbers');
+  assert.equal(duplicate.kind, 'unknown');
+  assert.equal(answerable(duplicate), false);
+  assert.deepEqual(duplicate.options.filter((option) => option.highlighted).map((option) => option.text),
+    ['Remove worktree All changes and commits will be lost.']);
+
+  // Numbered the other way down the screen: also not this dialog.
+  const reversed = read('worktree-exit-out-of-order');
+  assert.equal(reversed.kind, 'unknown');
+  assert.equal(answerable(reversed), false);
+
+  // A footer offering only a way out does not take an Enter, whatever is highlighted.
+  const escOnly = read('worktree-exit-esc-only-footer');
+  assert.equal(escOnly.kind, 'worktree-exit');
+  assert.equal(escOnly.live, true);
+  assert.equal(answerable(escOnly), false);
+
+  // The flagged row is what is read, so a stale highlighted number changes nothing —
+  // and a block whose flagged row is the destructive option is never answerable.
+  assert.equal(answerable({ ...keep, highlighted: 3 }), true, 'the number is not the answer');
+  assert.equal(answerable({ ...keep, options: [{ number: 1, text: 'Remove worktree', highlighted: true }] }), false);
+  assert.equal(answerable({ ...keep, footer: 'Esc to cancel' }), false);
+  assert.equal(answerable({ ...keep, options: keep.options.map((option) => ({ ...option, highlighted: true })) }), false);
   assert.equal(answerable(null), false);
 });
 

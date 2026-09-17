@@ -3939,7 +3939,8 @@ async function restartSession(body, deps = {}) {
     // all: the pane may become a plain shell mid-wait, and a Codex screen is a different
     // UI with its own prompt, so neither is a place to be typing a blind Enter.
     const answerable = session.kind === 'claude';
-    let promptAnswered = false, screenReadReported = false, promptSkipReported = false, refusedKind = null;
+    let promptAnswered = false, screenReadReported = false, promptSkipReported = false;
+    let refusedKind = null, refusalGrace = false;
     for (let i = 0, limit = 30; i < limit; i++) {
       stopped = (await host('get', { pane: body.pane })).pane;
       if (!restartPaneMatches(pane, stopped, session.id)) throw Error('Session process changed during restart');
@@ -3968,7 +3969,14 @@ async function restartSession(body, deps = {}) {
         if (refusing && refusedKind === refusing.kind) {
           throw Error(`Claude Code is showing the ${claudePrompts.refusalLabel(refusing)} dialog; answer it in the pane before restarting`);
         }
-        if (refusing) await sleep(300);
+        if (refusing) {
+          await sleep(DIALOG_CONFIRM_MS);
+          // A first sighting on the last poll would otherwise leave the loop to end in
+          // the generic timeout, which names nothing, for a pane that is plainly parked
+          // on a dialog. Keep one poll in hand for the read that confirms it — once, so
+          // the wait stays bounded whatever the screen does.
+          if (!refusalGrace && i + 1 >= limit) { refusalGrace = true; limit += 1; }
+        }
         refusedKind = refusing && refusing.kind || null;
         if (claudePrompts.answerable(dialog)) {
           // The snapshot is already stale by the time it is read. Between it and the
@@ -5137,6 +5145,10 @@ async function answerSession(body, deps = {}) {
 }
 
 const AGENT_PROMPT_TIMEOUT_MS = 45e3;
+// How long a dialog must still be live after it is first seen before a wait refuses,
+// and the room a wait keeps so that confirming read always happens.
+const DIALOG_CONFIRM_MS = 300;
+const DIALOG_CONFIRM_GRACE_MS = 600;
 
 // A bare `❯` alone is not enough: the shell prompt in these panes can be `❯` too,
 // and a stale one stays on screen while Claude loads (or after it exits). Claude's
@@ -5170,8 +5182,8 @@ async function typeOpeningMessage(target, agent, text, deps = {}) {
 async function waitForHostAgent(target, agent, deps = {}) {
   const now = deps.now || Date.now;
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-  const deadline = now() + AGENT_PROMPT_TIMEOUT_MS;
-  let screen = '', refusedDialog = null;
+  let deadline = now() + AGENT_PROMPT_TIMEOUT_MS;
+  let screen = '', refusedDialog = null, refusalGrace = false;
   while (now() < deadline) {
     try { screen = await readScreen(target, 30, false, deps); } catch { screen = ''; }
     if (agentPromptVisible(agent, screen)) return true;
@@ -5197,13 +5209,22 @@ async function waitForHostAgent(target, agent, deps = {}) {
       // Two reads a poll apart, or none: a single frame can catch a dialog Owner is
       // already dismissing, and that wait used to finish on the next poll.
       if (refusing && refusedDialog && refusedDialog.kind === refusing.kind
-          && now() - refusedDialog.at >= 300) {
+          && now() - refusedDialog.at >= DIALOG_CONFIRM_MS) {
         throw new InjectionError(409, `Claude Code is showing the ${claudePrompts.refusalLabel(refusing)} dialog in ${target.pane}; message not sent`, {
           screenTail: screenTail(screen),
         });
       }
       if (!refusing) refusedDialog = null;
-      else if (!refusedDialog || refusedDialog.kind !== refusing.kind) refusedDialog = { kind: refusing.kind, at: now() };
+      else if (!refusedDialog || refusedDialog.kind !== refusing.kind) {
+        refusedDialog = { kind: refusing.kind, at: now() };
+        // A dialog first seen as the deadline arrives would expire before the read that
+        // confirms it, and the caller would get the generic timeout for a pane that is
+        // plainly parked on a dialog. Extend once, by just enough for that one read.
+        if (!refusalGrace && deadline - now() < DIALOG_CONFIRM_GRACE_MS) {
+          refusalGrace = true;
+          deadline = now() + DIALOG_CONFIRM_GRACE_MS;
+        }
+      }
     }
     await sleep(Math.min(500, Math.max(0, deadline - now())));
   }

@@ -21,6 +21,9 @@
 const ABOVE = 12, BELOW = 20;
 
 const OPTION = /^(?:❯\s*)?(\d+)\.\s*(.*)$/;
+// The footer of a dialog that takes a keystroke. `Esc to cancel` on its own is some
+// other affordance, and Enter is not its answer, so Keep does not press anything there.
+const ANSWER_FOOTER = /Enter to confirm/i;
 const HIGHLIGHTED = /^❯\s*\d+\./;
 const FOOTER = /Enter to confirm|Esc to (?:cancel|exit)/i;
 
@@ -83,8 +86,11 @@ function answerable(match) {
   if (!match || !match.live) return false;
   const known = DIALOGS.find((dialog) => dialog.kind === match.kind);
   if (!known || known.policy.action !== 'answer') return false;
-  const option = (match.options || []).find((candidate) => candidate.number === match.highlighted);
-  return Boolean(option && known.answer.test(option.text));
+  if (!ANSWER_FOOTER.test(match.footer || '')) return false;
+  // The highlighted row itself, never a row looked up by its number: a screen can repeat
+  // a number, and the answer is the option the cursor is actually on.
+  const highlighted = (match.options || []).filter((option) => option.highlighted);
+  return highlighted.length === 1 && known.answer.test(highlighted[0].text);
 }
 
 // What a refusal calls the dialog. An unrecognized one is only identifiable by its
@@ -148,11 +154,13 @@ function blockAt(lines, index) {
   }
   if (!options.length) return null;
 
-  const byNumber = new Map(options.map((option) => [option.number, option]));
-  const named = dialog && dialog.options.every((pattern, i) => {
-    const option = byNumber.get(i + 1);
-    return Boolean(option && pattern.test(option.text));
-  });
+  // An option list Keep can reason about is numbered 1..n down the screen. A repeated
+  // number, a gap, or a list out of order is a screen nobody can read as "option 2 is the
+  // one below option 1" — which is the whole of what a known kind's option table claims —
+  // so it is a dialog, and an unknown one.
+  const ordered = options.every((option, i) => option.number === i + 1);
+  const named = ordered && dialog
+    && dialog.options.every((pattern, i) => Boolean(options[i]) && pattern.test(options[i].text));
   return {
     kind: named ? dialog.kind : 'unknown',
     heading: lines[heading],

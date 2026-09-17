@@ -1,0 +1,7 @@
+
+  Exiting worktree session
+
+  ❯ 2. Keep worktree    Stays at /Users/jesseruder/wt/ghost-server/aws-cost-breakdown
+    1. Remove worktree  All changes and commits will be lost.
+
+  Enter to confirm · Esc to cancel

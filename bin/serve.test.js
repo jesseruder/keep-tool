@@ -8239,6 +8239,15 @@ test('a graceful exit answers the worktree exit prompt once and only for Keep wo
     assert.equal(finished.sessionId, 'wt');
     assert.deepEqual(answered.state.sent, []);
 
+    // The dialog appears on the last poll of the wait. The refusal needs a second read,
+    // and the loop keeps one poll in hand for it rather than ending in a timeout that
+    // names nothing.
+    const late = scenario({ highlighted: 1, deadAfter: Infinity,
+      screens: [...Array(29).fill('────────────────────\n❯ '), folderTrust] });
+    await assert.rejects(late.run(), /Claude Code is showing the folder trust dialog; answer it in the pane before restarting/);
+    assert.deepEqual(late.state.sent, []);
+    assert.equal(late.state.reads, 31, 'one poll past the original limit, and no further');
+
     // A dialog nobody has taught Keep about is still refused, and carries its heading.
     const unknown = scenario({ highlighted: 1, deadAfter: Infinity, screens: [[
       '  Rewind to a previous checkpoint?',
@@ -8308,6 +8317,13 @@ test('a live Claude Code dialog ends the opening wait by name instead of timing 
   // and the next poll finds the prompt the message was waiting for.
   assert.equal(await waitForHostAgent({ pane: 'pane-dialog' }, 'claude',
     clock(dialog(trust, ['────────────────────', '❯']))), true);
+  // The dialog appears on the last read the 45s deadline allows. The wait extends itself
+  // once, by one read, so a parked pane is named rather than reported as a timeout.
+  const busy = ['  ⎿  Running tests…'];
+  await assert.rejects(waitForHostAgent({ pane: 'pane-dialog' }, 'claude',
+    clock(dialog(...Array(89).fill(busy), trust))),
+    (error) => error.status === 409
+      && error.message === 'Claude Code is showing the folder trust dialog in pane-dialog; message not sent');
   // Claude Code's dialogs are not read off a Codex pane.
   await assert.rejects(waitForHostAgent({ pane: 'pane-dialog' }, 'codex', clock(dialog(trust))),
     (error) => error.status === 504);
