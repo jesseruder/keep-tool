@@ -824,6 +824,46 @@ test('an agent whose session needs input says so on its row, without touching it
   } finally { cleanup(root); }
 });
 
+// The stamp and the row have to name the same session. applySessions() lets a pane's
+// own meta.agentName override a record that has not caught up — a launch whose
+// response was lost, a restart or a handoff onto a new pane — and attention() then
+// suppresses that session's question because of the stamp. A row that still looked
+// only at the record's old pane and id would report nothing, and the prompt would be
+// absent from every list in the console.
+test('a record that has not caught up with the pane still gets the right row', () => {
+  const root = makeRoot();
+  try {
+    // The record points at the pane and session a lost launch response left behind.
+    agents.ensure('sandboxes', { role: 'incident-responder', lifecycle: 'working', card: 'inc-one',
+      session: { id: 'stale-sid', pane: 'stale-pane' } }, { root });
+    const panes = [{ id: 'live-pane', alive: true, meta: { agent: 'claude', agentName: 'sandboxes' } }];
+    const live = { id: 'live-sid', pane: 'live-pane', state: 'needs-input',
+      pendingQuestion: { question: 'Raise the cap?' } };
+    const sessions = [live];
+
+    agents.applySessions(sessions, agents.records(root), panes);
+    assert.equal(live.agentName, 'sandboxes', 'the pane is authority over the stale record');
+    // Which is what keeps it out of "Waiting on you"...
+    assert.equal(require('./session-status').attention(live), null);
+    // ...so its row is the only place the question can show, and it does.
+    const row = agents.dashboardAgents({ root, sessions, panes }).find((entry) => entry.name === 'sandboxes');
+    assert.equal(row.needsInput, true);
+    assert.equal(row.lifecycle, 'working', 'the record on disk is untouched');
+    assert.equal(agents.readRecord('sandboxes', root).session.id, 'stale-sid');
+
+    // A caller with no pane list has the stamp, which is the same answer.
+    assert.equal(agents.dashboardAgents({ root, sessions }).find((entry) => entry.name === 'sandboxes').needsInput, true);
+
+    // The record's own session still wins when it is the one the pane names, so an
+    // obsolete row cannot outrank the live one.
+    const stale = { id: 'stale-sid', pane: 'stale-pane', state: 'needs-input' };
+    const working = { id: 'live-sid', pane: 'live-pane', state: 'running', agentName: 'sandboxes' };
+    assert.equal(agents.dashboardAgents({ root, sessions: [stale, working], panes })
+      .find((entry) => entry.name === 'sandboxes').needsInput, undefined,
+    'the pane the agent owns answers first, and that session is working');
+  } finally { cleanup(root); }
+});
+
 // The mark has to be on the session before anything asks whether it belongs to an
 // agent. session-status.attention() reads `agentName` to keep an agent out of
 // "Waiting on you", and the queue used to be built before applySessions ran.

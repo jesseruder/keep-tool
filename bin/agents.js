@@ -749,15 +749,31 @@ function applySessions(sessions, list, panes = []) {
   }
 }
 
-// The agent's own session, as the dashboard sees it. Matched by pane first, for the
-// same reason the console's agentForStage() does: a record that still names the
-// session an in-place restart moved on from must not beat the pane the agent owns.
-function sessionForAgent(record, sessions) {
-  const pane = record.session.pane || '';
-  const id = record.session.id || '';
-  return (pane && (sessions || []).find((candidate) => candidate
-      && (candidate.pane === pane || candidate.runtime?.paneId === pane)))
-    || (id && (sessions || []).find((candidate) => candidate && candidate.id === id))
+// The agent's own session, as the dashboard sees it — resolved in the order
+// applySessions() above stamps `agentName` in, because the two must never disagree.
+// attention() suppresses a session's question on the strength of that stamp, so a
+// row that looked somewhere else for its label would hide a genuine prompt
+// completely: a launch whose response was lost, or a restart or handoff that moved
+// to a new pane, leaves the record naming a session that is gone while the pane's
+// own `meta.agentName` is the only thing that still knows whose session it is.
+function sessionForAgent(record, sessions, panes) {
+  const name = record.name;
+  const list = (sessions || []).filter(Boolean);
+  const onPane = (paneId) => (paneId
+    ? list.find((candidate) => candidate.pane === paneId || candidate.runtime?.paneId === paneId)
+    : null) || null;
+  // A pane whose meta names this agent is authority over the record, the same as in
+  // applySessions() and the console's agentForStage().
+  for (const pane of panes || []) {
+    if (!pane || !pane.id || pane.meta?.agentName !== name) continue;
+    const found = onPane(String(pane.id));
+    if (found) return found;
+  }
+  return onPane(record.session.pane || '')
+    || (record.session.id ? list.find((candidate) => candidate.id === record.session.id) : null)
+    // The stamp itself, for a caller with no pane list to hand: applySessions has
+    // already resolved the pane meta, so this is the same answer by another route.
+    || list.find((candidate) => candidate.agentName === name)
     || null;
 }
 
@@ -773,7 +789,7 @@ function agentView(record, options = {}) {
   // The agent's session is listed nowhere else, so its row is the only place a
   // question or a permission prompt can show. `lifecycle` is the daemon's own
   // record and stays exactly as written; this is the row's label, nothing more.
-  const live = sessionForAgent(record, options.sessions);
+  const live = sessionForAgent(record, options.sessions, options.panes);
   const needsInput = Boolean(live && !live.exited && live.state === 'needs-input');
   return {
     name: record.name,

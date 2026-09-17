@@ -7526,7 +7526,7 @@ function buildState(options = {}) {
   // `session.reviewer` keeps its meaning.
   try {
     state.agents = agents.dashboardAgents({
-      root: keep.ROOT, records: agentRecords, sessions,
+      root: keep.ROOT, records: agentRecords, sessions, panes: options.hostPanes || [],
       reviewer: state.review?.stats?.reviewer || null,
     });
   } catch { state.agents = []; }
