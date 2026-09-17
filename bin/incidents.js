@@ -425,8 +425,16 @@ function dayStamp(now) {
 
 function taskFile(root, cardId) { return path.join(root, 'tasks', `${cardId}.md`); }
 
+// The card file is the record of what was already written to it. A mutation
+// that failed after its card write is retried, and this is how the retry tells
+// what it does not need to write again.
+function taskContainsLine(root, cardId, line) {
+  if (!line) return false;
+  try { return fs.readFileSync(taskFile(root, cardId), 'utf8').includes(String(line)); } catch { return false; }
+}
+
 function taskContainsSlackTs(root, cardId, ts) {
-  try { return fs.readFileSync(taskFile(root, cardId), 'utf8').includes(`Slack message ts: ${String(ts)}`); } catch { return false; }
+  return taskContainsLine(root, cardId, slackTsLine(ts));
 }
 
 function suspectLines(suspects) {
@@ -482,13 +490,27 @@ function publish(root, events, deps) {
 // the firing, resolve or reopen line would be appended a second time. Only the
 // duplicate write is skipped: state still moves and the event is still returned,
 // because the retry is what makes them real.
-function checkinOnce(deps, root, cardId, ts, options) {
-  if (ts && taskContainsSlackTs(root, cardId, ts)) return false;
+// `marker` is a line the check-in's own message carries, so finding it on the
+// card means this exact check-in has already been written.
+function checkinOnce(deps, root, cardId, marker, options) {
+  if (taskContainsLine(root, cardId, marker)) return false;
   deps.checkinTask(cardId, options);
   return true;
 }
 
-function slackTsLine(ts) { return `Slack message ts: ${String(ts || '')}`; }
+// Empty when there is no timestamp: `Slack message ts: ` on its own is a prefix
+// of every other ts line, so it would match any of them.
+function slackTsLine(ts) {
+  const value = String(ts == null ? '' : ts);
+  return value ? `Slack message ts: ${value}` : '';
+}
+
+// One open-to-closed period of one incident. `openedAt` alone is not enough:
+// a reopen keeps it, so the close that follows the reopen needs a marker of its
+// own, and the last firing is what distinguishes the two periods.
+function closeMarker(signature, entry) {
+  return `Incident close: ${signature} opened ${Number(entry.openedAt || 0)} fired ${Number(entry.lastFiredAt || 0)}`;
+}
 
 function isInternalSignature(signature) {
   return /^(?:internal:|castle-alerts-)/.test(String(signature || ''));
@@ -541,7 +563,7 @@ function landAlert(state, alert, context, deps, options) {
   if (alert.state === 'resolved') {
     if (!entry || entry.closedAt) return null;
     if (!entry.resolvedAt) {
-      checkinOnce(deps, root, entry.card, context.ts, {
+      checkinOnce(deps, root, entry.card, slackTsLine(context.ts), {
         heading: 'alert resolved',
         message: dataFence([slackTsLine(context.ts), permalink, alert.title].filter(Boolean).join('\n'), NOTE_TEXT_MAX),
         linkSession: false, commit: false, withinLock: true,
@@ -561,7 +583,7 @@ function landAlert(state, alert, context, deps, options) {
     entry.title = alert.title;
     entry.area = alert.area;
     indexTitle(state, alert, sig);
-    checkinOnce(deps, root, entry.card, context.ts, {
+    checkinOnce(deps, root, entry.card, slackTsLine(context.ts), {
       heading: `alert firing (${entry.fireCount})`,
       message: dataFence([slackTsLine(context.ts), permalink, clip(alert.text || alert.title, NOTE_TEXT_MAX)].filter(Boolean).join('\n'), NOTE_TEXT_MAX),
       linkSession: false, commit: false, withinLock: true,
@@ -591,7 +613,7 @@ function landAlert(state, alert, context, deps, options) {
   }
 
   if (reopened) {
-    checkinOnce(deps, root, cardId, context.ts, {
+    checkinOnce(deps, root, cardId, slackTsLine(context.ts), {
       heading: 'reopened',
       status: 'active',
       message: dataFence([slackTsLine(context.ts), permalink, clip(alert.text || alert.title, NOTE_TEXT_MAX)].filter(Boolean).join('\n'), NOTE_TEXT_MAX),
@@ -627,7 +649,7 @@ function landAlert(state, alert, context, deps, options) {
   // suspects a second time.
   const suspects = suspectLines(context.suspects);
   if (suspects.length) {
-    checkinOnce(deps, root, cardId, context.ts, {
+    checkinOnce(deps, root, cardId, slackTsLine(context.ts), {
       heading: 'suspects',
       message: [slackTsLine(context.ts), 'Changes shortly before the first firing:', ...suspects].join('\n'),
       linkSession: false, commit: false, withinLock: true,
@@ -651,7 +673,7 @@ function landAllClear(state, alert, context, deps, options) {
   for (const [sig, entry] of Object.entries(state.signatures)) {
     if (!/^(internal:|castle-alerts-)/.test(sig)) continue;
     if (!entry || entry.closedAt || entry.resolvedAt) continue;
-    checkinOnce(deps, root, entry.card, context.ts, {
+    checkinOnce(deps, root, entry.card, slackTsLine(context.ts), {
       heading: 'alert resolved',
       message: dataFence([slackTsLine(context.ts), context.permalink, 'All alerts are passing'].filter(Boolean).join('\n'), NOTE_TEXT_MAX),
       linkSession: false, commit: false, withinLock: true,
@@ -673,7 +695,7 @@ function landNote(state, signature, reply, context, deps, options) {
   const entry = signature && state.signatures[signature];
   if (!entry || !entry.card) return null;
   const who = oneLine(reply.from || 'unknown', 80);
-  checkinOnce(deps, root, entry.card, reply.ts, {
+  checkinOnce(deps, root, entry.card, slackTsLine(reply.ts), {
     heading: `note (by ${who})`,
     message: dataFence([
       slackTsLine(reply.ts),
@@ -834,11 +856,16 @@ function sweep(options = {}, deps = {}) {
   const outcome = mutateState((state) => {
     for (const [sig, entry] of Object.entries(state.signatures)) {
       if (!quietDue(sig, entry, cfg, now)) continue;
+      // The card is set `done` before state.json is written, so a failed state
+      // write leaves a closed card with an open signature. Without this marker
+      // every later sweep would append another `closed: quiet for Nm` line to
+      // that card until the state became writable again.
+      const marker = closeMarker(sig, entry);
       try {
-        d.checkinTask(entry.card, {
+        checkinOnce(d, root, entry.card, marker, {
           heading: 'closed',
           status: 'done',
-          message: `closed: quiet for ${cfg.quietMin}m`,
+          message: [`closed: quiet for ${cfg.quietMin}m`, marker].join('\n'),
           linkSession: false, commit: false, withinLock: true,
         });
       } catch { continue; }
@@ -849,7 +876,7 @@ function sweep(options = {}, deps = {}) {
         permalink: '', suspects: [],
       });
     }
-  }, { root });
+  }, { root, withLock: options.withLock, write: options.write });
   // Only once the state write landed: a close nobody recorded is not a close.
   const closed = outcome.ok ? publish(root, pending, d) : [];
   if (closed.length && fs.existsSync(path.join(root, '.git'))) {
@@ -891,7 +918,7 @@ module.exports = {
   combinedText, unescapeEntities, slug, dataFence,
   parse, resolveArea, severityFor, grafanaSignature, internalSignature,
   loadState, mutateState, emptyState,
-  appendEvent, readEvents,
+  appendEvent, readEvents, taskContainsLine, closeMarker, slackTsLine,
   cardIdFor, ingest, sweep, sweepQuietly, quietDue, openIncidents, messageTime,
   permalinkFor, defaultDeps,
 };

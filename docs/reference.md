@@ -972,7 +972,10 @@ state that was discarded. Card writes cannot be rolled back the same way, so eve
 check-in that quotes a `Slack message ts:` line is written at most once per card: a
 retry after a partial failure re-runs the firing, resolve, reopen, suspects or note
 check-in, finds its own timestamp already on the card, and skips it while still moving
-the state and emitting the event.
+the state and emitting the event. The quiet close works the same way with an
+`Incident close: <signature> opened <t> fired <t>` marker instead of a timestamp, so a
+close whose state write failed is not appended to the card again by every later sweep;
+a later firing is a new period with its own marker and does get its own line.
 
 `keep incidents [--json]` lists the open signatures with their card, area, fire count
 and last firing. `keep incidents parse <file|-> [--json]` parses one Slack message — or

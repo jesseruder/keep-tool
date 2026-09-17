@@ -354,7 +354,7 @@ test('resolved checks in and leaves the card active; the quiet sweep closes it',
     assert.equal(closed.length, 1);
     assert.equal(closed[0].kind, 'incident-closed');
     assert.equal(registry.statuses.get(card), 'done');
-    assert.equal(registry.checkins.at(-1).message, 'closed: quiet for 60m');
+    assert.match(registry.checkins.at(-1).message, /^closed: quiet for 60m$/m);
     assert.equal(incidents.loadState(root).signatures['grafana:unacknowledged-server-faults'].closedAt, poll);
     // Closing is idempotent.
     assert.deepEqual(incidents.sweep({ root, now: poll + 200 * 60e3 }, registry.deps), []);
@@ -371,6 +371,56 @@ const datedSuffix = (ms) => {
   const stamp = new Date(ms);
   return `${stamp.getFullYear()}${String(stamp.getMonth() + 1).padStart(2, '0')}${String(stamp.getDate()).padStart(2, '0')}`;
 };
+
+test('a close whose state write failed is not written to the card again', () => {
+  const root = makeRoot();
+  try {
+    const registry = fakeRegistry(root);
+    const firing = reposted(SERVER_FAULTS_FIRING, slackTs(0));
+    const resolved = reposted(SERVER_FAULTS_RESOLVED, slackTs(300));
+    ingest(root, registry, [firing, resolved], { now: at(resolved) });
+    const card = registry.created[0].id;
+    const quiet = at(resolved) + 61 * 60e3;
+    const emittedBefore = registry.events.length;
+    const feedBefore = incidents.readEvents(root).length;
+
+    // The card is set `done` before state.json is written, so this is the state
+    // write failing with the close already on the card. The state directory is
+    // made read-only for the duration: the load inside the lock still works,
+    // the write at the end of it does not.
+    const failing = (fn) => {
+      fs.chmodSync(incidents.stateDir(root), 0o500);
+      try { return fn(); } finally { fs.chmodSync(incidents.stateDir(root), 0o700); }
+    };
+    assert.deepEqual(incidents.sweep({ root, now: quiet, withLock: failing, write: () => {} }, registry.deps), []);
+    assert.equal(occurrences(registry.body(card), '## closed'), 1);
+    assert.equal(registry.statuses.get(card), 'done', 'the card write did land');
+    assert.equal(incidents.loadState(root).signatures['grafana:unacknowledged-server-faults'].closedAt, 0);
+    assert.equal(registry.events.length, emittedBefore, 'no event for a close nobody recorded');
+    assert.equal(incidents.readEvents(root).length, feedBefore);
+
+    // The next sweep finishes the job without appending a second close.
+    const closed = incidents.sweep({ root, now: quiet + 60e3 }, registry.deps);
+    assert.equal(closed.length, 1);
+    assert.equal(closed[0].kind, 'incident-closed');
+    assert.equal(occurrences(registry.body(card), '## closed'), 1, 'still one close on the card');
+    assert.equal(incidents.loadState(root).signatures['grafana:unacknowledged-server-faults'].closedAt, quiet + 60e3);
+    assert.equal(registry.events.slice(emittedBefore).filter((item) => item.event.kind === 'incident-closed').length, 1);
+    assert.equal(incidents.readEvents(root).slice(feedBefore).length, 1);
+    // And it stays closed.
+    assert.deepEqual(incidents.sweep({ root, now: quiet + 120 * 60e3 }, registry.deps), []);
+    assert.equal(occurrences(registry.body(card), '## closed'), 1);
+
+    // A later firing and close is a new period, so it gets its own marker and
+    // its own line on the same card.
+    const again = reposted(SERVER_FAULTS_FIRING, slackTs(3 * 3600));
+    ingest(root, registry, [again], { now: at(again) });
+    const resolvedAgain = reposted(SERVER_FAULTS_RESOLVED, slackTs(3 * 3600 + 300));
+    ingest(root, registry, [resolvedAgain], { now: at(resolvedAgain) });
+    assert.equal(incidents.sweep({ root, now: at(resolvedAgain) + 61 * 60e3 }, registry.deps).length, 1);
+    assert.equal(occurrences(registry.body(card), '## closed'), 2);
+  } finally { cleanup(root); }
+});
 
 test('a firing after the close reopens inside the window and opens a dated card outside it', () => {
   const root = makeRoot();
