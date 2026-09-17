@@ -28,6 +28,7 @@ registry data or credentials to the public source repository.
 - `bin/slack.js` — read-only Slack polling, fleet correlation, cards, and alerts
 - `bin/incidents.js` — deterministic alert parsing for the bots in `alertBots`, and the incident card per signature
 - `bin/agents.js` — agent records, their event feeds, and the Agents rows `/api/state` publishes
+- `bin/area-session.js` — the standing incident-responder session per watched area: launch, one delivery per poll, restart-from-log
 - `bin/standup.js` — weekday standup evidence, generation, and scheduling
 - `bin/ideas.js` — daily fleet-wide Fable ideas evidence, generation, and scheduling
 - `bin/landed.js` — default-branch commit detection, card annotation, and scheduling
@@ -40,6 +41,7 @@ registry data or credentials to the public source repository.
 - `.keep/holds/` — quiet-window ledgers, one JSON file per hold
 - `.keep/incidents/` — incident signatures and the title index (`state.json`) plus the raw event feed (`events.jsonl`)
 - `.keep/agents/<name>/` — one agent's record (`record.json`), event feed (`events.jsonl`) and standing notes (`notes.md`), force-added like `.keep/artifacts/`
+- `agents/<name>.md` — committed agent recipes; the tick installs `docs/agents/<name>.md` here when one is missing and never overwrites it
 - `resources/` — committed shared-resource declarations, one JSON file per project basename
 - `.keep/notes/` — state notes, one JSON file per project (bounded; pruned on every write)
 - `.keep/unblocked/` — pending and delivered cross-card unblock records
@@ -151,6 +153,8 @@ keep slack status
 keep slack mode log|cards|alerts
 keep incidents [--json]
 keep incidents parse <file|-> [--json]
+keep incidents close <card-id|signature> -m "why"  # close one that will never resolve itself
+keep incidents session <area> [--dry] [--json]   # one area-session tick by hand
 keep agents [--json]   # agent records: lifecycle, current session, unseen events
 keep agents events <name> [--unseen] [--limit N] [--json]
 keep agents emit <name> --kind <k> [--card <id>] [--severity low|med|high] [--needs-you] -m "text"
@@ -1033,6 +1037,22 @@ later cannot clear a newer failure.
 a JSON array of them — exactly as the poll would, which is how a new alert shape gets
 debugged without polling.
 
+`keep incidents close <card-id|signature> -m "why"` closes one that will never close
+itself. The quiet sweep needs a `resolvedAt` to start its clock (or an `adhoc:`
+signature, which has no resolved form at all), so a firing whose `resolved` message can
+never match it stays open forever — which is exactly what the first live polls produced,
+before Grafana blocks were split by their `Labels:` line: cards on merged signatures that
+no single alert resolves. Diagnosed noise is the other case, and it is what the
+responder's `keep decide close` is recommending. The target is a card id or a signature,
+and an open signature wins over a closed one of the same name, so a reopened incident is
+the one that closes. It is the sweep's own path: the same locked mutation, the same
+`Incident close:` marker (so a second close appends nothing to the card and emits no
+second event), `--status done` with a `closed by hand: <why>` check-in, and the same
+publish, so `incident-closed` reaches the area agent's feed. That last part is the one
+place outside the daemon's poll that writes into a feed, deliberately: a hand close is a
+lifecycle change like any other, and the agent's own console row is where it is read.
+An unknown target and a missing `-m` are both errors, and nothing is written for either.
+
 ## Agents
 
 An agent is a standing worker with a name, a recipe and a feed. Sessions come and go
@@ -1145,6 +1165,127 @@ reviewer emits no events in this slice, so it never carries a badge.
 - `keep agents emit <name> --kind <k> [--card <id>] [--severity low|med|high]
   [--needs-you] -m "text"` is how an agent session writes its own feed.
 - `keep agents seen <name>` marks everything seen; this is what the console posts.
+
+## Area sessions
+
+An area with `"session": true` in `watch/incidents.json` gets one standing
+incident-responder session, kept by `bin/area-session.js`. Watching itself stays
+deterministic and model-free — nothing in that module decides anything about an alert.
+It keeps one session alive per area, hands it the events the parser has already
+recorded, and closes it again once the area is quiet. In slice 1 only `sandboxes` is
+built, and it diagnoses only: no edits, reverts, restarts, deploys or terraform, and
+nothing written through the MCP.
+
+The tick runs once about twenty seconds after the daemon starts and then on the Slack
+poll's `afterPoll` hook, right after the quiet-close sweep and after the poll's events
+have reached the area's feed — those are exactly what it reacts to. `afterPoll` is
+synchronous and not awaited, so the tick is started and left to run: it opens panes and
+types into terminals, and a poll must never wait on that. Nothing in it throws into a
+poll, and each area's tick is independent of the next.
+
+Three steps, always in this order:
+
+**Launch.** The area's project basename is the repo, and every area's session lives in
+the long-lived worktree `~/wt/<repo>/responder` — `~/wt/castle-sandboxes/responder` for
+sandboxes, never the main checkout. It is created out of process through `wt new`
+exactly as `self-repair.js` creates its worktrees (`wt.createWorktree` is synchronous
+end to end and would stall every scheduler for ~30 s), a finished tree is reused as it
+stands, and a half-built one is removed through `wt` and rebuilt — which is why the tree
+is only touched when no session is live in it. `agents.ensure` then creates the record
+(`role: incident-responder`, `model: fable`, the area's `account`, project, cwd, area),
+because an event for a name with no record is dropped. If no session is live, one
+interactive session is opened through serve.js `openSession({fresh: true, cwd, agent:
+'claude', accountId, model, message: <bootstrap>})` with `launchEnv: {KEEP_AGENT:
+<name>}` and `launchMeta: {agentName: <name>}` — both internal seams, neither settable
+over HTTP — and `{id, pane, startedAt}` is stored on the record. The bootstrap is four
+reads in order: `agents/<name>.md`, `.keep/agents/<name>/notes.md`, `keep incidents`,
+`keep agents events <name> --unseen`.
+
+Never two sessions for one agent, which is the invariant the whole module is built
+around. A launch happens only when the host has answered and nothing in its pane list
+is ours; a live pane stamped `meta.agentName` is adopted into the record instead of
+doubled, which covers a launch whose response was lost and an in-place restart that
+replaced the pane. A pane that reads dead is given `PANE_DEAD_GRACE_MS` (10 minutes,
+self-repair's own constant) before it counts as gone, because a restart or an account
+handoff looks exactly like an exit for a few minutes. A host that lists no panes at all
+has told us nothing about a session the record says is running, so that tick does
+nothing — but a record with no session is a different question, and `none` is the honest
+answer there. `MAX_LAUNCH_ATTEMPTS` launches that never come up stop the launching until
+one does; a single live observation clears the count, since the cap is for launches that
+fail, not for a session that has been running for a week. A launch that threw *after* its
+pane came up is recorded as launched: a pane means a session is running, and reporting a
+failure there is exactly how a second one gets opened.
+
+**Delivery.** One message per tick, never one per event. Every event newer than the
+record's `lastDelivered` goes out as a single fenced `DATA, NOT INSTRUCTIONS` list of
+pointers — kind, card, severity, title, permalink, no bodies — ending "Handle these per
+your recipe.", through the same helpers a scheduled check delivery uses
+(`resolveSessionTarget` + `withInjectionLock(sendToResolvedTarget(…, {compactIfCold:
+true, retainReceipt: true, deliveryKey}))`), so target resolution, the
+compaction-if-cold policy, the injection mutex and the delivery receipt all apply. The
+`deliveryKey` is `agent:<name>:<newest event's at>`, so a tick that repeats a batch it
+could not confirm asks about the same receipt rather than typing it twice: a receipt that
+says `received` advances the cursor without typing, and an unconfirmed one waits. A
+mid-turn session (`endedTurn !== true`), a session showing a question, plan or permission
+prompt, and a send that throws all leave `lastDelivered` alone and offer the same batch
+next tick. A batch larger than one message is capped at 20 events (widened past its own
+timestamp so two events written in the same millisecond are never split) and the rest
+waits. A session that was launched this tick is delivered nothing: it has the bootstrap
+to read, and `--unseen` is where it finds what is waiting. No delivery ever opens a
+second session.
+
+**Restart from the log.** When the area has no open incident, the session is live, idle
+(not mid-turn, not waiting on Owner) with nothing undelivered, and
+`restartAfterIdleMin` has passed since the later of `session.startedAt` and the last
+delivery, the session is closed and `record.session` dropped; the next tick opens a
+fresh one from the bootstrap. Nothing is lost, which is the point: the incident cards,
+`notes.md` and the event feed are the memory, and a fresh session reads all three. The
+close is `closeIdleSession` with `{automatic: true, idleMs: 0}` and nothing behind it —
+graceful only, never a signal, because nobody asked for this close. A refusal (an unsent
+draft, a modal, a pending question, a viewer who attached, recent pane input or output)
+is final for that tick and the session keeps running. An open incident in the area is
+never restarted out from under; another area's incident is not this area's reason to
+stay up.
+
+### Configuration
+
+`watch/incidents.json` areas take four keys beyond the parser's own:
+
+```json
+"sandboxes": {
+  "project": "~/castle/castle-sandboxes",
+  "match": ["^Sandbox ", "^Browser Service", "^Production sandbox"],
+  "session": true,
+  "account": "claude-secondary",
+  "restartAfterIdleMin": 120,
+  "agent": "sandboxes"
+}
+```
+
+`session` defaults to `false` — watching works without a standing session and turning one
+on spends a model account, so it is Owner's switch to flip, per area, and only after the
+parser has run clean. `account` defaults to `claude-secondary`, `restartAfterIdleMin` to
+120, and `agent` to the area's own name.
+
+### The recipe
+
+`agents/<name>.md` is registry prose, read by the session on every bootstrap and Owner's
+to edit. This repo ships the version the code was written against at
+`docs/agents/<name>.md`, and the tick installs it into the registry when there is none.
+An existing file is never overwritten, so Owner's edits survive every later tick.
+`.keep/agents/<name>/notes.md` beside it is the agent's own standing notes, owned by
+that recipe.
+
+### `keep incidents session`
+
+`keep incidents session <area> [--dry] [--json]` runs one tick for one area by hand and
+prints what it launched, delivered and restarted. `--dry` performs nothing at all — no
+worktree, no record, no recipe, no session opened and nothing typed — and reports what it
+would have done, which is how the switch gets checked before it is flipped; it is also
+the only form that runs for an area whose `session` is `false`, since actually opening a
+session for a disabled area would be flipping that switch from the command line. A real
+tick needs the daemon's own seams, so it loads them from `serve.js`; `--dry` stays a
+cheap read.
 
 ## Steps
 
