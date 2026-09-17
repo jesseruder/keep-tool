@@ -29,6 +29,10 @@ the incident cards, your notes and your event feed are the memory.
 - Sessions you start yourself (`keep open <card> --account claude-secondary`) run on
   your own account. `claude/default` is out of Fable budget most weeks; a session
   opened there dies on its first message.
+- Those sessions are unattended, like this one: Keep tells them so at start and
+  refuses their questions. Give them everything they need in the opening message —
+  the card, the incident, what "done" means — because they cannot ask you, and
+  nobody will be asked on their behalf.
 
 ### The tools that matter
 
@@ -257,7 +261,10 @@ Your model is expensive and you are woken by every poll, so spend deliberately:
 
 ## Ending the turn
 
-Check in, then stop. Do not wait for more events and do not poll — the daemon delivers
+Check in, then stop. Nobody is reading this session, so never end a turn on a question:
+`AskUserQuestion` is refused here, and a final message that asks something goes
+unanswered. Decide, record the decision, or badge Owner as above, and end with a
+statement. Do not wait for more events and do not poll — the daemon delivers
 the next batch into this session when there is one, and closes this session when your
 area has been quiet long enough. A fresh session reads this file, your notes and
 `keep incidents`, and picks up exactly where the cards say you left off. That is the

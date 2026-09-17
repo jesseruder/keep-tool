@@ -67,6 +67,11 @@ Claude Code; do not spawn a reviewer", skip the reviewer and report back directl
 the review happens on the Claude Code side after the handoff returns, so an inner
 review only doubles the wall time.
 
+In an unattended session (the SessionStart block says Keep opened it and nobody is
+reading it) do not use request_user_input or end on a question: decide, record the
+decision on the card, or file a `keep needs`. The reviewer subagent stays required
+unless the prompt carries the handoff phrase.
+
 # Keep — work registry
 
 The same Keep conventions apply here as in Claude Code: they are in the shared `keep`
