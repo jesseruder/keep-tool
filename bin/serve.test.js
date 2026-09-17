@@ -4846,7 +4846,10 @@ test('typing exit confirms the prompt above a tall Claude slash-command menu', a
 
 // One harness for the three ways typing into a live pane can go wrong after the
 // text is in the box. `screen` is whatever the pane shows when it is read back.
-function draftHarness(screen) {
+// The host counts every input request that reaches the pane, so the harness's own
+// record of them is its inputCount; `extraInputs` stands in for somebody else typing
+// into the same pane, and is added to the count the pane reports from then on.
+function draftHarness(screen, extraInputs = () => 0) {
   const inputs = [];
   const events = [];
   const host = recordingHost(async (type, params) => {
@@ -4858,6 +4861,7 @@ function draftHarness(screen) {
     inputs, events, host,
     deps: {
       host, sleep: async () => {}, draftKind: 'claude',
+      listHostPanes: async () => [{ id: 'p', inputCount: inputs.length + extraInputs(inputs) }],
       deliveryTrace: (stage, fields) => events.push({ stage, ...fields }),
     },
   };
@@ -4984,6 +4988,54 @@ test('a send the screen never confirmed takes its draft back when the caller ask
   assert.equal(manual.message, 'message was typed but could not be confirmed; Enter was not pressed');
   assert.equal(manual.draftLeftOnScreen, undefined, 'a caller that asked for nothing is told nothing new');
   assert.equal(kept.inputs.includes('\x1b'), false, 'and nothing is erased');
+});
+
+test('a draft is only reported cleared when nobody else typed while it was being cleared', async () => {
+  // Two Escapes are two round trips, and Owner is sitting at the same pane. If he
+  // appends a word after the menu-closing Escape, the second one wipes his text with
+  // ours and the empty box afterwards cannot show that. The host counts every
+  // keystroke that reaches the pane, so the count is what decides.
+  const escapes = (inputs) => inputs.filter((value) => value === '\x1b').length;
+  const menuScreen = (inputs) => (escapes(inputs) === 0 ? MENU('/exit') : escapes(inputs) === 1 ? BOX('/exit') : BOX(''));
+  const run = async (extraInputs) => {
+    const harness = draftHarness(menuScreen, extraInputs);
+    const error = await typeAndSubmit({ pane: 'p' }, '/exit', () => false, {
+      ...harness.deps, discardDraftOnAbort: true,
+    }).then(() => null, (e) => e);
+    return { harness, error, escapes: escapes(harness.inputs) };
+  };
+
+  // His keystroke lands between the first Escape's count and the second: the second
+  // Escape is never pressed at all.
+  let between = 0;
+  const gap = await run(() => (++between > 2 ? 1 : 0));
+  assert.equal(gap.error.message, 'message was typed but could not be confirmed; Enter was not pressed');
+  assert.equal(gap.error.draftLeftOnScreen, true);
+  assert.equal(gap.error.draftReason, 'input arrived');
+  assert.equal(gap.escapes, 1, 'the second Escape is not pressed into text somebody else is writing');
+
+  // And when it lands around the second Escape itself, the box is empty afterwards —
+  // and it is still not reported cleared, because his Enter may have sent a turn.
+  let late = 0;
+  const raced = await run(() => (++late > 3 ? 1 : 0));
+  assert.equal(raced.error.draftReason, 'input arrived');
+  assert.equal(raced.escapes, 2);
+  assert.ok(raced.harness.events.some((e) => e.stage === 'enter-aborted' && e.cleared === false && e.reason === 'input arrived'));
+
+  // A count that cannot be read at all presses nothing: an Escape this could not
+  // account for is worse than a draft left where it is.
+  const blind = draftHarness(menuScreen);
+  const unverified = await typeAndSubmit({ pane: 'p' }, '/exit', () => false, {
+    ...blind.deps, listHostPanes: async () => null, discardDraftOnAbort: true,
+  }).then(() => null, (e) => e);
+  assert.equal(unverified.draftReason, 'input unverified');
+  assert.equal(blind.inputs.includes('\x1b'), false, 'nothing is pressed');
+  const missing = draftHarness(menuScreen);
+  const other = await typeAndSubmit({ pane: 'p' }, '/exit', () => false, {
+    ...missing.deps, listHostPanes: async () => [{ id: 'somewhere-else', inputCount: 4 }], discardDraftOnAbort: true,
+  }).then(() => null, (e) => e);
+  assert.equal(other.draftReason, 'input unverified');
+  assert.equal(missing.inputs.includes('\x1b'), false);
 });
 
 test('the confirmation poll count is the caller\'s to set', async () => {

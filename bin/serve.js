@@ -2254,21 +2254,63 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
     write(`keep serve: left an aborted draft on pane ${pane}: the input box no longer holds only the typed message\n`);
     return { cleared: false, reason: 'mixed draft' };
   }
+  // The pane's own input counter. The host raises it for every keystroke that reaches
+  // the pane — a viewer's exactly as much as this daemon's — so it is the only thing
+  // that can tell a box which emptied because of our Escape from one which emptied
+  // because Owner was typing in the same gap. An empty box is not proof: he can append
+  // a word, and the next Escape wipes his text with ours leaving nothing to see; he can
+  // press Enter, and the box is empty because a turn was sent.
+  //
+  // So every Escape is bracketed by a count and "cleared" is claimed only when the
+  // count moved by exactly our own keys. The gap between reading the count and pressing
+  // the key cannot be closed — it is inherent to typing into a terminal somebody else
+  // is sitting at, and the same gap sits between the unchanged({ expectedInputCount })
+  // before Enter and the Enter itself. What the bracket buys is that a keystroke which
+  // did land in that gap is never reported as our clean clear.
+  const countInputs = async () => {
+    try {
+      const panes = await (deps.listHostPanes || listHostPanes)(deps, true);
+      const live = Array.isArray(panes) ? panes.find((entry) => entry && entry.id === pane) : null;
+      return live && Number.isInteger(live.inputCount) ? live.inputCount : null;
+    } catch { return null; }
+  };
+  const unverified = () => {
+    write(`keep serve: left an aborted draft on pane ${pane}: its input activity could not be verified\n`);
+    return { cleared: false, reason: 'input unverified' };
+  };
+  const arrived = () => {
+    write(`keep serve: left an aborted draft on pane ${pane}: input arrived from elsewhere while it was being cleared\n`);
+    return { cleared: false, reason: 'input arrived' };
+  };
+  // Nothing is pressed at all when the count cannot be read: an Escape this could not
+  // account for is worse than a draft left where it is.
+  let count = await countInputs();
+  if (count === null) return unverified();
   // Escape is a keystroke, not a guarantee. Read the box back after each one:
   // "cleared" is a claim about the session, so it is only made when the box is
   // actually empty. Twice at most, because a Claude slash draft has its command menu
   // open below the box and the first Escape may close only that menu. The second one
-  // is pressed only while the box still holds exactly what was typed — if it holds
-  // anything else by then it is somebody's text, and this stops touching it.
+  // is pressed only while the box still holds exactly what was typed and the count has
+  // not moved since — the menu-closing Escape and its read-back are a whole round trip
+  // in which Owner could have started typing.
   let after = screen;
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    if (attempt > 0 && !draftIsExactly(after, text, kind)) break;
+    if (attempt > 0) {
+      if (!draftIsExactly(after, text, kind)) break;
+      const between = await countInputs();
+      if (between === null) return unverified();
+      if (between !== count) return arrived();
+    }
     try {
       await pressTargetKey(target, 'Escape', deps);
     } catch (error) {
       write(`keep serve: could not clear an aborted draft on pane ${pane}: ${String((error && error.message) || error)}\n`);
       return { cleared: false, reason: 'escape failed' };
     }
+    const counted = await countInputs();
+    if (counted === null) return unverified();
+    if (counted !== count + 1) return arrived();
+    count = counted;
     try {
       after = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false);
     } catch (error) {
