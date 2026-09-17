@@ -103,6 +103,34 @@ keep handoff <session-id> --pane <pane-id> --account claude-secondary
 
 Before stopping the source, Keep verifies the target login, compatible provider settings, a reproducible permission class, model, reasoning effort, approval policy, reviewer, and working directory, an idle or terminal rate-limited turn, and the absence of unresolved tools, background commands, child agents, drafts, questions, or permission dialogs. Only after every preflight succeeds does Keep exit the source gracefully. It copies the verified conversation artifacts, resumes the same session id under the target profile, changes durable authority, and sends one continuation instruction.
 
+### Move every rate-limited session at once
+
+When an account has more than one session parked on its weekly limit, the account controls offer **Move N rate-limited sessions to ‹account›**, one button per same-provider destination, with that destination's usage next to it. The button does not transfer anything. It enqueues each of those sessions in the daemon's transfer queue (`~/keep/.keep/handoff-queue/`, one file per session) and answers with what it queued and what it skipped.
+
+A queue entry is only patience. Every thirty seconds the daemon takes the entries that are due and asks for the **same** transfer the single-session button asks for, through the same `handoffSession`, with every preflight intact. The queue never bypasses a check, never launches or types anything, and passes `force` only when the request that queued the session carried it.
+
+What happens to a refusal depends on which kind it is:
+
+- **Transient** — the injection lock was busy, a turn or a background child was still finishing, the pane was being watched, the job ledger was recovering, the host timed out, `ps` failed, a `caffeinate` or sentinel child was still around. These clear on their own, so the entry waits 20s, then 40s, 80s, 160s, and every 3 minutes after that. If it is still being refused `KEEP_HANDOFF_QUEUE_MAX_MIN` minutes (45 by default) after it was queued, it parks and the console shows **Transfer gave up: ‹reason›** with **Retry** and **Cancel**.
+- **Blocked** — an unreproducible model or permission class, a logged-out target, a missing artifact, an incompatible target setup, a changed process. Retrying would only repeat it, so the entry parks immediately and the console shows **Transfer needs you: ‹reason›** with **Cancel**.
+
+A queued session shows **Moving to ‹account›** with its last refusal and a **Cancel** button in place of the usual transfer controls, and counts as a pending handoff, so nothing offers to reopen or restart it meanwhile. A session that has left the state, or that is already on the target account, is marked moved rather than retried. The dashboard's `handoffQueue` carries the queued and parked entries plus the moves from the last hour; the queue's own health row is `handoff-queue`.
+
+### Automatic transfer on the weekly limit
+
+`rateLimitHandoff` in `~/.config/keep/config.json` maps a source account to the account its rate-limited sessions should move to:
+
+```json
+{
+  "version": 1,
+  "rateLimitHandoff": { "claude-main": "claude-secondary" }
+}
+```
+
+With a key present, each queue tick enqueues every rate-limited Claude session on that source account, without `force`, and the ordinary queue rules above take it from there. The pair must name two existing accounts for the same provider and must not name the same account twice; an unusable key is reported on stderr once per tick and ignored rather than guessed at. A target whose own weekly window the usage snapshot shows at 100% is held rather than moved onto; an unknown or stale snapshot is never read as exhausted. A parked or cancelled entry is waiting on a person, so the policy never re-queues it — only the console's **Retry** does.
+
+**This ships switched off.** With no `rateLimitHandoff` key, nothing is ever queued automatically, and the only way a session moves is the single-session button, the batch button, or `keep handoff`.
+
 A session that has been auto-compacted carries a permanent job-ledger history gap that no replay can clear. That gap alone no longer refuses a transfer: once the ledger is caught up with no open job, no unresolved call, no unconsumed hook and a completed restart record, the gap only describes history that predates the compaction, and the full restart proof still runs. Every other kind of gap still requires an explicit forced transfer.
 
 Source artifacts stay as a backup because tool-result records can contain absolute paths. Durable authority prevents their stale duplicate from being discovered or resumed. If a failure occurs after source exit, ordinary open/restart/restore stays blocked. Retry the same command or the same dashboard action to recover the journaled transaction. Keep does not automatically switch accounts, switch back later, or retry a different target.
