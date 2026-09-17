@@ -2256,17 +2256,6 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
   const read = deps.readScreen || ((t, lines, scrollback) => readScreen(t, lines, scrollback, deps));
   const write = deps.stderr || process.stderr.write.bind(process.stderr);
   const pane = (target && target.pane) || 'unknown';
-  let screen = '';
-  try {
-    screen = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false);
-  } catch (error) {
-    write(`keep serve: could not read pane ${pane} to clear an aborted draft: ${String((error && error.message) || error)}\n`);
-    return { cleared: false, reason: 'unreadable screen' };
-  }
-  if (!draftIsExactly(screen, text, kind)) {
-    write(`keep serve: left an aborted draft on pane ${pane}: the input box no longer holds only the typed message\n`);
-    return { cleared: false, reason: 'mixed draft' };
-  }
   // The pane's own input counter. The host raises it for every keystroke that reaches
   // the pane — a viewer's exactly as much as this daemon's — so it is the only thing
   // that can tell a box which emptied because of our Escape from one which emptied
@@ -2277,11 +2266,10 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
   // Two different gaps, closed two different ways. Between reading the count and our
   // key reaching the pane there is nothing this process can check, so it does not try:
   // the count travels with the keystroke and the host, which owns the counter, refuses
-  // the write if anything has typed since. And between our key and the screen this
-  // reads back afterwards, the count is taken once more — a screen read that spans
-  // somebody else's keystroke says nothing about what our Escape did, whatever it
-  // shows. "Cleared" is claimed only for an empty box whose count moved by exactly our
-  // own keys.
+  // the write if anything has typed since. And around every screen this reads, the
+  // count is taken on both sides — a read that spans somebody else's keystroke says
+  // nothing about the box it shows, whichever side of the Escape it is on. "Cleared"
+  // is claimed only for an empty box whose count moved by exactly our own keys.
   const countInputs = async () => {
     try {
       const panes = await (deps.listHostPanes || listHostPanes)(deps, true);
@@ -2317,10 +2305,30 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
   if (!capabilities || capabilities.conditionalInput !== true) {
     return reloadRequired('the terminal host must be reloaded (keep host reload) before a typed draft can be cleared');
   }
-  // Nothing is pressed at all when the count cannot be read either: an Escape this
-  // could not account for is worse than a draft left where it is.
+  // The baseline is taken before the screen is read, not after it. Taken after, an
+  // Enter arriving between the read and the baseline would already be inside the
+  // baseline: the conditional Escape would then be accepted, interrupting the turn
+  // that Enter had just started, and the empty box it left would pass for our own
+  // clean clear. Nothing is pressed at all when the count cannot be read either: an
+  // Escape this could not account for is worse than a draft left where it is.
   let count = await countInputs();
   if (count === null) return unverified();
+  let screen = '';
+  try {
+    screen = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false);
+  } catch (error) {
+    write(`keep serve: could not read pane ${pane} to clear an aborted draft: ${String((error && error.message) || error)}\n`);
+    return { cleared: false, reason: 'unreadable screen' };
+  }
+  if (!draftIsExactly(screen, text, kind)) {
+    write(`keep serve: left an aborted draft on pane ${pane}: the input box no longer holds only the typed message\n`);
+    return { cleared: false, reason: 'mixed draft' };
+  }
+  // The other side of that read: the box just examined is only worth acting on if
+  // nothing reached the pane while it was being read.
+  const settled = await countInputs();
+  if (settled === null) return unverified();
+  if (settled !== count) return arrived();
   // Escape is a keystroke, not a guarantee. Read the box back after each one:
   // "cleared" is a claim about the session, so it is only made when the box is
   // actually empty. Twice at most, because a Claude slash draft has its command menu

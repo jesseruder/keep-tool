@@ -4876,7 +4876,7 @@ function draftHarness(screen, onEvent = () => {}) {
     inputs, events, host, foreign, hello,
     deps: {
       host, sleep: async () => {}, draftKind: 'claude',
-      listHostPanes: async () => [{ id: 'p', inputCount: count() }],
+      listHostPanes: async () => { onEvent('list', { inputs, foreign }); return [{ id: 'p', inputCount: count() }]; },
       deliveryTrace: (stage, fields) => events.push({ stage, ...fields }),
     },
   };
@@ -5038,6 +5038,18 @@ test('a draft is only reported cleared when nobody else typed while it was being
   });
   assert.equal(second.error.draftReason, 'input arrived');
   assert.equal(second.escapes, 1, 'only the first Escape was written');
+
+  // An Enter landing while the box is first being read, before any Escape. The
+  // baseline is taken before that read, so this is outside it: were it taken after,
+  // the Enter would be part of the baseline, the conditional Escape would be accepted,
+  // and it would interrupt the turn that Enter had just started.
+  let listed = false;
+  const entry = await run(CLEARABLE('/exit'), (type, { inputs, foreign }) => {
+    if (type === 'list') listed = true;
+    if (type === 'screen' && listed && !inputs.includes('\x1b')) foreign.count = 1;
+  });
+  assert.equal(entry.error.draftReason, 'input arrived');
+  assert.equal(entry.escapes, 0, 'nothing is pressed at a box somebody typed into while it was read');
 
   // And an Enter landing between the screen read and the count taken after it: the box
   // reads empty, and it is still not reported cleared, because that Enter may have
