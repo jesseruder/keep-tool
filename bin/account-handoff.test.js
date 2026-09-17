@@ -903,3 +903,93 @@ test('a stopped transfer records its refusal class and publishes it with the rec
     assert.equal(handoff.list(f.root)[0].refusalClass, 'blocked');
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
+
+// ---------- what the caller assumed, rechecked before anything moves ----------
+
+test('a transfer refuses when the session is not where the caller believed, before any record or stop', async () => {
+  const f = fixture();
+  try {
+    let restarts = 0;
+    const d = deps(f, { restartSession: async () => { restarts += 1; throw new Error('must not stop source'); } });
+    await assert.rejects(
+      handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two', expectedSourceAccountId: 'three' }, d),
+      (error) => error.status === 409 && /Session is on one, not the three this transfer was requested from/.test(error.message));
+    assert.equal(restarts, 0, 'nothing was stopped');
+    assert.deepEqual(handoff.list(f.root), [], 'and no journal record was written');
+    // The refusal is one a queue must not keep retrying.
+    assert.equal(handoff.classifyRefusal('Session is on one, not the three this transfer was requested from'), 'blocked');
+
+    // The limit the transfer was requested for is checked the same way. The whole
+    // deps object is kept, pane and all, and only the observed limit is dressed on.
+    const withLimit = (at) => {
+      const value = deps(f);
+      const baseRestart = value.restartSession;
+      value.restartSession = async (...args) => { restarts += 1; return baseRestart(...args); };
+      const baseInspect = value.inspect;
+      value.inspect = async (body) => {
+        const inspected = await baseInspect(body);
+        return { ...inspected, session: { ...inspected.session, rateLimit: { type: 'fable_weekly', at } } };
+      };
+      return value;
+    };
+    await assert.rejects(
+      handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two', expectedRateLimitAt: 1000 }, withLimit(2000)),
+      (error) => error.status === 409 && /no longer carries the account limit/.test(error.message));
+    assert.equal(restarts, 0);
+    assert.deepEqual(handoff.list(f.root), []);
+    assert.equal(handoff.classifyRefusal('Session no longer carries the account limit this transfer was requested for'), 'blocked');
+
+    // Matching expectations are simply not in the way.
+    const result = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two',
+      expectedSourceAccountId: 'one', expectedRateLimitAt: 1000 }, withLimit(1000));
+    assert.equal(result.status, 'done');
+    assert.equal(restarts, 1, 'the matching transfer is the only one that reached the source');
+
+    for (const body of [{ expectedSourceAccountId: 'Not An Id' }, { expectedRateLimitAt: { at: 1 } }, { expectedRateLimitAt: true }]) {
+      await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two', ...body },
+        deps(f, { inspect: async () => assert.fail('must not inspect') })), (error) => error.status === 400);
+    }
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('a refusal that landed before the stop does not exempt a queued transfer from the limit check', async () => {
+  const f = fixture();
+  try {
+    const queue = require('./handoff-queue');
+    let restarts = 0;
+    const rows = [{ id: f.sid, kind: 'claude', pane: 'pane-1', accountId: 'one',
+      rateLimit: { type: 'fable_weekly', at: 1000 } }];
+    const d = deps(f, {
+      restartSession: async () => { restarts += 1; throw new Error('another session injection is busy'); },
+      inspect: async () => ({ session: { ...rows[0], project: f.project, endedTurn: true },
+        pane: d.pane, processArgs: 'claude --dangerously-skip-permissions --resume session-123',
+        currentModel: 'claude-opus-4-1',
+        agentIdentity: { pid: 11, pidStart: 'source-start', primary: true, ownsPane: true } }),
+    });
+    const tickWith = (now) => queue.tick({ root: f.root, env: f.env, policyEnabled: false, log: () => {},
+      now: () => now, sessions: async () => rows, handoffSession: (body) => handoff.run(body, d) });
+
+    queue.enqueue(f.root, { sessionId: f.sid, pane: 'pane-1', sourceAccountId: 'one', targetAccountId: 'two',
+      rateLimitAt: 1000 }, { now: 1000, log: () => {} });
+    await tickWith(1000);
+    assert.equal(restarts, 1);
+    assert.equal(queue.list(f.root)[0].status, 'queued');
+
+    // The journal now holds a recovery-needed record — written for a refusal that
+    // landed before the source was touched, and it says so.
+    const record = handoff.list(f.root)[0];
+    assert.equal(record.status, 'recovery-needed');
+    assert.equal(record.phase, 'stopping-source');
+    assert.equal(record.sourceStopVerifiedAt, undefined);
+    assert.equal(record.refusalClass, 'transient');
+
+    // The person resumed work and the limit cleared. That record must not be read
+    // as an in-flight transaction and re-drive the transfer.
+    rows[0].rateLimit = null;
+    await tickWith(1000 + 30 * 60e3);
+    assert.equal(restarts, 1, 'restartSession was never reached again');
+    const entry = queue.list(f.root)[0];
+    assert.equal(entry.status, 'cancelled');
+    assert.equal(entry.note, 'rate limit cleared');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});

@@ -84,7 +84,10 @@ function portableFallbackCandidate(entry) {
 }
 function safe(entry) {
   if (!entry) return null;
-  const keys = ['id', 'transactionId', 'sessionId', 'pane', 'agent', 'sourceAccountId', 'targetAccountId', 'intent', 'force', 'status', 'phase', 'reason', 'refusalClass', 'updatedAt'];
+  // sourceStopVerifiedAt is the transaction's own proof that the source agent
+  // exited. Without it a 'recovery-needed' record may be a refusal that landed
+  // before anything was stopped, which is a different thing entirely.
+  const keys = ['id', 'transactionId', 'sessionId', 'pane', 'agent', 'sourceAccountId', 'targetAccountId', 'intent', 'force', 'status', 'phase', 'reason', 'refusalClass', 'sourceStopVerifiedAt', 'updatedAt'];
   return {
     ...Object.fromEntries(keys.filter((key) => entry[key] != null).map((key) => [key, entry[key]])),
     ...(portableFallbackCandidate(entry) ? { portableFallbackAvailable: true } : {}),
@@ -414,6 +417,17 @@ async function run(body, deps = {}) {
   if (body.force !== undefined && typeof body.force !== 'boolean') {
     const error = new Error('Account handoff force must be a boolean'); error.status = 400; throw error;
   }
+  // What the caller believed about the session when it decided to ask. A queued
+  // transfer is minutes old by the time it runs and its own snapshot can be
+  // stale, so it names its assumptions here and this preflight is the check that
+  // is not stale. Both are optional; a person pressing the button names neither.
+  if (body.expectedSourceAccountId !== undefined && !accounts.ID_RE.test(String(body.expectedSourceAccountId || ''))) {
+    const error = new Error('Account handoff expectedSourceAccountId must be an exact account'); error.status = 400; throw error;
+  }
+  if (body.expectedRateLimitAt !== undefined
+      && !['string', 'number'].includes(typeof body.expectedRateLimitAt)) {
+    const error = new Error('Account handoff expectedRateLimitAt must be a string or a number'); error.status = 400; throw error;
+  }
   // Force only tells the stop path to ignore uncertain background-job evidence;
   // a session that is genuinely mid-turn is still refused downstream.
   const force = body.force === true;
@@ -454,14 +468,28 @@ async function run(body, deps = {}) {
       const error = new Error(current ? 'Interrupted handoff needs the original pane for recovery' : 'Expected a live session in this pane');
       error.status = 409; throw error;
     }
+    // Resolved before anything is written and before anything is stopped, so the
+    // expectations below can be answered against the accounts this transfer would
+    // actually use rather than the ones the caller assumed.
+    const source = (current ? accounts.get(current.sourceAccountId, env) : null) || accounts.forSession(session.id, session.kind, { root, env })
+      || (pane.meta?.accountId ? accounts.get(pane.meta.accountId, env) : null)
+      || accounts.defaultFor(session.kind, env);
+    if (body.expectedSourceAccountId != null && source.id !== body.expectedSourceAccountId) {
+      const error = new Error(`Session is on ${source.id}, not the ${body.expectedSourceAccountId} this transfer was requested from`);
+      error.status = 409; throw error;
+    }
+    // Only a caller that has not yet stopped anything may name this: after the
+    // source exits there is no live turn left to carry a limit.
+    if (body.expectedRateLimitAt != null
+        && String(inspected?.session?.rateLimit?.at ?? '') !== String(body.expectedRateLimitAt)) {
+      const error = new Error('Session no longer carries the account limit this transfer was requested for');
+      error.status = 409; throw error;
+    }
     if (current && force) current.force = true;
     if (current && current.status !== 'recovery-needed') {
       Object.assign(current, { status: 'recovery-needed', reason: `Handoff interrupted during ${current.phase || 'an unknown phase'}` });
       writeOne(root, current);
     }
-    const source = (current ? accounts.get(current.sourceAccountId, env) : null) || accounts.forSession(session.id, session.kind, { root, env })
-      || (pane.meta?.accountId ? accounts.get(pane.meta.accountId, env) : null)
-      || accounts.defaultFor(session.kind, env);
     const target = accounts.get(body.accountId, env);
     if (!target) { const error = new Error(`unknown account ${body.accountId}`); error.status = 400; throw error; }
     if (!['claude', 'codex'].includes(session.kind) || target.agent !== session.kind) {
