@@ -21,12 +21,15 @@ const path = require('path');
 // belongs at the end of both lists.
 const PALETTE = Object.freeze(['red', 'orange', 'yellow', 'green', 'teal', 'blue', 'purple', 'pink']);
 const ID = /^[A-Za-z0-9_-]+$/;
-// One emoji can be a long cluster (a four-person family is 11 code units), but
-// nothing legitimate is longer than this, and the cap keeps a pathological
-// cluster out of every console row before the segmenter ever runs.
-const MAX_EMOJI_UNITS = 16;
-
-const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+// One emoji can be a long sequence (a four-person family is 11 code units, and
+// the longest recommended sequences run to about 20), and the cap keeps a
+// pathological string out of every console row before the property test runs.
+const MAX_EMOJI_UNITS = 32;
+// Unicode's own list of what an emoji keyboard offers: every single emoji, every
+// keycap, flag, skin-tone and ZWJ sequence, and nothing that is a text symbol
+// (`©` fails, `©️` with its presentation selector passes). The `v` flag makes the
+// property match whole sequences, so "exactly one emoji" is the whole test.
+const ONE_EMOJI = /^\p{RGI_Emoji}$/v;
 
 function directory(root) { return path.join(root, '.keep', 'session-marks'); }
 
@@ -52,16 +55,7 @@ function normalizeEmoji(value) {
   if (typeof value !== 'string') return null;
   const text = value.trim();
   if (!text || text.length > MAX_EMOJI_UNITS) return null;
-  let clusters = 0;
-  for (const _ of graphemes.segment(text)) {
-    clusters += 1;
-    if (clusters > 1) return null;
-  }
-  if (clusters !== 1) return null;
-  for (const codePoint of text) {
-    if (/\p{Extended_Pictographic}/u.test(codePoint) || /\p{Emoji_Presentation}/u.test(codePoint)) return text;
-  }
-  return null;
+  return ONE_EMOJI.test(text) ? text : null;
 }
 
 // The mark a file holds, re-normalized, or null for anything unreadable, corrupt

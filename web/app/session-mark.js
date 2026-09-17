@@ -53,21 +53,31 @@ export function installMarkControls(menu, ctx = {}, sessionId, mark, setMark) {
   // so the blur that follows an Enter is not a second write; a failed one leaves
   // it optimistic, and the next reload re-installs with the daemon's answer.
   const current = { color: colorOf(mark), emoji: emojiOf(mark) };
+  // Writes go out one after another, in the order Owner made them: a blur commit
+  // of the emoji field followed by a click on Clear must end cleared, whichever
+  // request the daemon would otherwise have handled first.
+  let chain = Promise.resolve();
   const write = (patch, close) => {
     if (close) menu.removeAttribute?.('open');
-    return Promise.resolve()
+    const before = { ...current };
+    for (const field of ['color', 'emoji']) if (patch[field] !== undefined) current[field] = patch[field] || '';
+    chain = chain
       .then(() => setMark(sessionId, patch))
       .then(() => ctx.reload?.())
-      .catch((error) => ctx.toast?.(`Not marked: ${error && error.message ? error.message : String(error)}`));
+      .catch((error) => {
+        // The write did not happen, so what the console believes goes back to
+        // what it believed before; the same value can then be tried again.
+        for (const field of ['color', 'emoji']) if (patch[field] !== undefined) current[field] = before[field];
+        ctx.toast?.(`Not marked: ${error && error.message ? error.message : String(error)}`);
+      });
+    return chain;
   };
 
   for (const button of menu.querySelectorAll('[data-mark-color]') || []) {
     button.onclick = () => {
       const name = button.dataset?.markColor ?? button.getAttribute?.('data-mark-color');
       // Clicking the color a session already carries takes it off again.
-      const color = name === current.color ? null : name;
-      current.color = color || '';
-      write({ color }, true);
+      write({ color: name === current.color ? null : name }, true);
     };
   }
 
@@ -76,7 +86,6 @@ export function installMarkControls(menu, ctx = {}, sessionId, mark, setMark) {
     const commit = () => {
       const value = String(input.value ?? '').trim();
       if (value === current.emoji) return;
-      current.emoji = value;
       // Typing is not finished until Enter, a change or a blur, and none of them
       // closes the menu: the emoji field is the one control Owner stays in.
       write({ emoji: value || null }, false);
@@ -91,9 +100,5 @@ export function installMarkControls(menu, ctx = {}, sessionId, mark, setMark) {
   }
 
   const clear = menu.querySelector('[data-mark-clear]');
-  if (clear) clear.onclick = () => {
-    current.color = '';
-    current.emoji = '';
-    write({ color: null, emoji: null }, true);
-  };
+  if (clear) clear.onclick = () => write({ color: null, emoji: null }, true);
 }

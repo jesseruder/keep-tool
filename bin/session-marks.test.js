@@ -69,7 +69,14 @@ test('normalizeEmoji takes exactly one emoji and nothing else', () => {
     assert.equal(marks.normalizeEmoji(value), value, `${JSON.stringify(value)} is one emoji`);
     assert.equal(marks.normalizeEmoji(`  ${value}  `), value, 'surrounding spaces are the shell, not the mark');
   }
-  for (const value of ['a', '1', '!', `${FIRE}${FIRE}`, 'fire', '', '   ', '\t', 'ab', null, undefined, 12, {}]) {
+  // Keycaps, a symbol with its emoji presentation selector, and a two-glyph
+  // ZWJ sequence are single emoji by Unicode's own list.
+  for (const value of ['1️⃣', '©️', '👨‍💻']) {
+    assert.equal(marks.normalizeEmoji(value), value, `${JSON.stringify(value)} is one emoji`);
+  }
+  // A text symbol without the selector, a bare keycap digit, and a heart typed
+  // without its presentation selector are text, not emoji.
+  for (const value of ['a', '1', '!', '©', '1⃣', `${FIRE}${FIRE}`, 'fire', '', '   ', '\t', 'ab', null, undefined, 12, {}]) {
     assert.equal(marks.normalizeEmoji(value), null, `${JSON.stringify(value)} is not one emoji`);
   }
   // A cluster longer than the cap is refused before the segmenter sees it.

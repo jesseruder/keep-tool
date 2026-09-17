@@ -199,6 +199,55 @@ test('a failed write is reported and nothing is reloaded', async () => {
   assert.equal(reloadCount(), 0);
 });
 
+test('a failed write is forgotten, so the same value can be tried again and a swatch is not toggled off', async () => {
+  const { installMarkControls, markControlsHTML } = await import('./session-mark.js');
+  const writes = [];
+  let failNext = true;
+  const menu = new FakeMenu(markControlsHTML(esc, 'abc', { color: 'red' }));
+  const setMark = async (sessionId, patch) => {
+    writes.push(patch);
+    if (failNext) { failNext = false; throw new Error('daemon away'); }
+    return { ok: true };
+  };
+  installMarkControls(menu, { esc, toast() {} }, 'abc', { color: 'red' }, setMark);
+
+  menu.emoji.value = '🔥';
+  menu.emoji.keydown('Enter');
+  await settle();
+  menu.emoji.keydown('Enter');
+  await settle();
+  assert.deepEqual(writes, [{ emoji: '🔥' }, { emoji: '🔥' }], 'the retry is a real write, not skipped as unchanged');
+
+  failNext = true;
+  menu.swatch('blue').click();
+  await settle();
+  menu.swatch('blue').click();
+  await settle();
+  assert.deepEqual(writes.slice(2), [{ color: 'blue' }, { color: 'blue' }], 'a color that never landed is not toggled off');
+});
+
+test('writes go out in the order they were made: an emoji blur followed by Clear ends cleared', async () => {
+  const { installMarkControls, markControlsHTML } = await import('./session-mark.js');
+  const order = [];
+  const gates = [];
+  const menu = new FakeMenu(markControlsHTML(esc, 'abc', { color: 'red' }));
+  const setMark = (sessionId, patch) => new Promise((resolve) => { gates.push(() => { order.push(patch); resolve({ ok: true }); }); });
+  installMarkControls(menu, { esc }, 'abc', { color: 'red' }, setMark);
+
+  // Owner types an emoji and clicks Clear: the field blurs first, then the click lands.
+  menu.emoji.value = '🔥';
+  menu.emoji.blur();
+  menu.clear.click();
+  await settle();
+  assert.equal(gates.length, 1, 'the clear waits for the emoji write');
+  gates.shift()();
+  await settle();
+  assert.equal(gates.length, 1);
+  gates.shift()();
+  await settle();
+  assert.deepEqual(order, [{ emoji: '🔥' }, { color: null, emoji: null }]);
+});
+
 test('installing on every render leaves one handler per control', async () => {
   const { menu, writes } = await wired(null, { installs: 3 });
   menu.swatch('red').click();
