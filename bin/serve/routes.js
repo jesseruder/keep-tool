@@ -16,8 +16,9 @@ function routes(ctx) {
     // serve.js internals
     ATTENTION_KINDS, InjectionError, MOBILE_VIEWS, TAG_INSTRUCTION, TASK_INSTRUCTION, WEB_ROOT,
     abandonAccountHandoff, accounts, announceStateNote, answerSession, attentionAckKey, attentionAckName,
-    buildState, closeIdleSession, codex, compactSessionById, companionSnapshot, compactState,
-    daemonRestartGate, dashboardDetail, fs, handoffSession, health, hostRequest, inspectReviewQueueLaunch,
+    buildState, cancelQueuedHandoff, closeIdleSession, codex, compactSessionById, companionSnapshot, compactState,
+    daemonRestartGate, dashboardDetail, fs, handoffRateLimited, handoffSession, health, hostRequest,
+    inspectReviewQueueLaunch,
     keep, launchReviewQueueSession, lightweightState, listHostPanes, listPortableTransfers, notifications,
     openSession, path, portableTransferDraft, portableTransferPreview, preparePortableTransfer,
     prepareSessionSummary, projectMobileState, recentTranscriptText, recoverReviewQueueLaunch, reminders,
@@ -587,6 +588,37 @@ function routes(ctx) {
           return json(res, 200, result);
         } catch (error) {
           return json(res, error.status || 500, { error: error.message, ...(error.extra || {}) });
+        }
+      },
+    },
+    {
+      // The batch behind "Move N rate-limited sessions": it only enqueues, and the
+      // daemon's queue tick performs each transfer through the same handoffSession
+      // this ladder's /api/handoff-session calls.
+      method: 'POST',
+      path: '/api/handoff-rate-limited',
+      handle: async ({ req, res, url, body }) => {
+        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
+        try {
+          const result = await handoffRateLimited(body);
+          broadcast();
+          return json(res, 200, result);
+        } catch (error) {
+          return json(res, error.status || 500, { error: error.message });
+        }
+      },
+    },
+    {
+      method: 'POST',
+      path: '/api/handoff-queue-cancel',
+      handle: async ({ req, res, url, body }) => {
+        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
+        try {
+          const result = cancelQueuedHandoff(body);
+          broadcast();
+          return json(res, 200, result);
+        } catch (error) {
+          return json(res, error.status || 500, { error: error.message });
         }
       },
     },

@@ -36,6 +36,7 @@ const CADENCES = Object.freeze({
   landed: { cadenceMs: 30 * 60e3 },
   'wt-gc': { cadenceMs: DAY_MS },
   'auto-compact': { cadenceMs: 30e3 },
+  'handoff-queue': { cadenceMs: 30e3 },
   'limit-resume': { cadenceMs: 60e3 },
   usage: { onDemand: true },
   'fleet-usage': { cadenceMs: 5 * 60e3 },

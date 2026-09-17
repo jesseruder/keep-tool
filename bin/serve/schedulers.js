@@ -46,7 +46,7 @@ function startSchedulers(ctx) {
     resumeAfterLimit,
     review, reviewDeps, runs, scanSessions, sendToResolvedTarget, sendToSession, sessionSummarySnapshot, slack,
     stallAliveIds, stalled, stalledSessionSnapshot, standup, startAutoCompact, startBriefScheduler,
-    startWtGcScheduler, summarize, transcriptFileForSession,
+    startHandoffQueue, startWtGcScheduler, summarize, transcriptFileForSession,
     unblock, usage, watcherSend, withInjectionLock, writeTarget,
   } = ctx;
 
@@ -99,6 +99,9 @@ function startSchedulers(ctx) {
     send: (sessionId, text) => withInjectionLock(() => sendToSession({ sessionId, text }), { session: sessionId }),
   });
   startAutoCompact();
+  // Retries the transfers a rate-limited session's move was refused for, and
+  // nothing else: no launch, no input, no check skipped. See bin/handoff-queue.js.
+  startHandoffQueue();
   const restarts = require('../session-restart').createManager({
     file: path.join(keep.ROOT, '.keep', 'session-restarts.json'),
     inspect: async (body) => {

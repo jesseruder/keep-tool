@@ -1680,7 +1680,8 @@ const HOST_PANES_SLOW_REUSE_MS = 10 * 60e3;
 const URGENT_DASHBOARD_MUTATIONS = new Set([
   '/api/abandon-account-handoff', '/api/ack', '/api/add', '/api/answer', '/api/checkin',
   '/api/close-idle', '/api/close-session', '/api/compact', '/api/decisions/judge',
-  '/api/handoff-session', '/api/notifications', '/api/open', '/api/panes/spawn',
+  '/api/handoff-queue-cancel', '/api/handoff-rate-limited', '/api/handoff-session',
+  '/api/notifications', '/api/open', '/api/panes/spawn',
   '/api/portable-transfers', '/api/reminders', '/api/rename-session', '/api/reopen-session',
   '/api/resolve-portable-transfer', '/api/restart-daemon', '/api/restart-session', '/api/review-queue',
   '/api/reviewtick', '/api/run', '/api/send', '/api/setaside', '/api/transfer-session',
@@ -4816,6 +4817,67 @@ function startAutoCompact() {
   setTimeout(() => { void tick(); }, 15e3).unref();
 }
 
+// ---- the rate-limit transfer queue -------------------------------------
+//
+// bin/handoff-queue.js holds the entries and the retry policy. Everything it
+// needs from the daemon arrives here: the live session rows (a transfer names a
+// pane, so the host list has to be part of the state), the usage snapshot the
+// policy reads, and handoffSession itself. Nothing else is handed over: the
+// queue may only ask for the same transfer the console button asks for.
+async function handoffQueueSessions(deps = {}) {
+  const panes = await (deps.listHostPanes || listHostPanes)({}, true);
+  const state = await (deps.addHostSessionState || addHostSessionState)(
+    await (deps.buildState || buildState)({ hostPanes: panes }), { panes });
+  return state.sessions || [];
+}
+
+function handoffQueueTick(deps = {}) {
+  return require('./handoff-queue').tick({
+    root: keep.ROOT,
+    sessions: () => handoffQueueSessions(deps),
+    readUsageCache,
+    handoffSession: (body) => handoffSession(body),
+    ...deps,
+  });
+}
+
+async function handoffRateLimited(body, deps = {}) {
+  return require('./handoff-queue').batch({
+    root: deps.root || keep.ROOT,
+    env: deps.env || process.env,
+    sessions: await handoffQueueSessions(deps),
+    sourceAccountId: body?.sourceAccountId,
+    targetAccountId: body?.targetAccountId,
+    ...(body?.force === undefined ? {} : { force: body.force }),
+    ...(body?.sessionIds === undefined ? {} : { sessionIds: body.sessionIds }),
+  });
+}
+
+function cancelQueuedHandoff(body, deps = {}) {
+  return require('./handoff-queue').cancel(deps.root || keep.ROOT, body?.sessionId);
+}
+
+function startHandoffQueue() {
+  let running = false;
+  const tick = async () => {
+    if (running) return;
+    running = true;
+    try {
+      const result = await handoffQueueTick();
+      health.record('handoff-queue', result.ok
+        ? { ok: true, detail: result.detail }
+        : { ok: false, error: result.error, detail: result.detail });
+    }
+    catch (e) {
+      health.record('handoff-queue', { ok: false, error: e });
+      process.stderr.write(`keep serve: handoff queue tick failed: ${e.message}\n`);
+    }
+    finally { running = false; }
+  };
+  setInterval(() => { void tick(); }, 30e3).unref();
+  setTimeout(() => { void tick(); }, 20e3).unref();
+}
+
 function claudeMcpMenuVisible(screen) {
   const lines = stripTerminalAnsi(screen).split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   const title = lines.lastIndexOf('Manage MCP servers');
@@ -7018,6 +7080,7 @@ function buildState(options = {}) {
   };
   Object.assign(state, accounts.publicState(), {
     handoffs: require('./account-handoff').list(keep.ROOT),
+    handoffQueue: require('./handoff-queue').visible(keep.ROOT, now),
   });
   const accountLabels = new Map(state.accounts.map((account) => [account.id, account.label]));
   for (const session of sessions) {
@@ -8590,10 +8653,11 @@ function start(deps = {}) {
     TURN_INDEX_BUDGET_BYTES, TURN_INDEX_BUDGET_MS, TURN_INDEX_PRUNE_LIMIT, WATCHER_CONCURRENCY,
     WATCHER_TURNS_PER_TICK, WATCHER_WINDOW_MS, WEB_ROOT,
     abandonAccountHandoff, accounts, addHostSessionState, agentProcessRows, announceStateNote,
-    answerSession, attentionAckKey, attentionAckName, buildState, cardUsage, closeEphemeralPane,
+    answerSession, attentionAckKey, attentionAckName, buildState, cancelQueuedHandoff, cardUsage, closeEphemeralPane,
     closeIdleSession, codex, compactSessionById, compactState, companionSnapshot, daemonRestartGate,
     dashboardDetail, deliverCheckToThread, deliverUnblockToThread, discord, driftWakeFromVerdict,
-    envNumber, features, forceRestartSession, fs, handoffSession, health, hostRequest, ideas,
+    envNumber, features, forceRestartSession, fs, handoffRateLimited, handoffSession, health, hostRequest,
+    ideas,
     inspectReviewQueueLaunch, keep, keepConsole, landed, launchReviewQueueSession, lightweightState,
     limitresume, listHostPanes, listPortableTransfers, liveSessionTick, liveTurnIndexSessions,
     loadCurrentSession, notifications, openCheckSession, openSession, path, portableTransferDraft,
@@ -8605,7 +8669,8 @@ function start(deps = {}) {
     runTaskNow, runs, scanSessions, screenHistorySession, screenSession, sendSessionKeys,
     sendStateJson, sendToResolvedTarget, sendToSession, sendToSessionLocked, sessionNames, sessionSummaryFile, sessionSummarySnapshot,
     setAsideCandidates, slack, stallAliveIds, stalled, stalledSessionSnapshot, standup,
-    startAutoCompact, startBriefScheduler, startWtGcScheduler, summarize, transcriptFileForSession,
+    startAutoCompact, startBriefScheduler, startHandoffQueue, startWtGcScheduler, summarize,
+    transcriptFileForSession,
     transferSession,
     unblock, updateSetAside, usage, wantsCompactState, wantsLightweightState, watcherSend,
     withInjectionLock, writeTarget, writeToShellPane,
@@ -8880,6 +8945,7 @@ module.exports = {
   transcriptFileForSession,
   inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, continueAccountHandoff, handoffSession,
   abandonAccountHandoff,
+  handoffQueueSessions, handoffQueueTick, handoffRateLimited, cancelQueuedHandoff,
   listPortableTransfers, inspectPortableSource, portableTerminalRateLimitEvidence,
   portableTransferDraft, preparePortableTransfer,
   portableTransferPreview, transferSession, resolvePortableTransfer, recoverPortableOpening,

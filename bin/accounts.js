@@ -316,7 +316,7 @@ function setDefault(agent, accountId, env = process.env) {
 }
 
 module.exports = {
-  AGENTS, ID_RE, CUSTOM_ID_RE, list, get, defaultFor, automationFor, hasMultiple, envFor, projectRoots,
+  AGENTS, ID_RE, CUSTOM_ID_RE, rawConfig, list, get, defaultFor, automationFor, hasMultiple, envFor, projectRoots,
   publicState, authority, authorityFile, locateClaudeFiles, forSession, pinSession,
   stageSession, commitStaged, clearStaged, add, setDefault,
 };
