@@ -10,6 +10,7 @@ const agents = require('./agents.js');
 const incidents = require('./incidents.js');
 
 const MINUTE = 60e3;
+const HOUR = 60 * MINUTE;
 const NOW = 1_700_000_000_000;
 
 function makeRoot(options = {}) {
@@ -27,8 +28,12 @@ function makeRoot(options = {}) {
         project, match: ['^Sandbox '], session: options.session !== false,
         account: 'claude-secondary',
         ...(options.restartAfterIdleMin ? { restartAfterIdleMin: options.restartAfterIdleMin } : {}),
+        ...(options.sandboxesAgent ? { agent: options.sandboxesAgent } : {}),
       },
-      'app-server': { project: path.join(root, 'checkouts', 'ghost-server'), default: true },
+      'app-server': {
+        project: path.join(root, 'checkouts', 'ghost-server'), default: true,
+        ...(options.appServer || {}),
+      },
     },
     quietMin: 60, reopenHours: 24,
   }));
@@ -44,20 +49,25 @@ function cleanup(root) {
   try { fs.rmSync(root, { recursive: true, force: true }); } catch {}
 }
 
-function livePane(id = 'pane-1', sessionId = 'sess-1', name = 'sandboxes') {
-  return { id, alive: true, agentAlive: true, meta: { sessionId, agentName: name, agent: 'claude' } };
+function livePane(id = 'pane-1', sessionId = 'sess-1', extra = {}) {
+  return {
+    id, alive: true, agentAlive: true, attached: 0,
+    meta: { sessionId, agentName: 'sandboxes', agent: 'claude' },
+    lastOutputAt: NOW - 4 * HOUR, lastInputAt: NOW - 4 * HOUR,
+    ...extra,
+  };
 }
 
-function idleSession(id = 'sess-1', pane = 'pane-1') {
-  return { id, kind: 'claude', pane, endedTurn: true, state: 'idle', mtime: NOW - 10 * MINUTE };
+// A session whose turn ended. `mtime` is real activity, so it is explicit: idle
+// is measured from it, and a default of "just now" would hide the restart tests.
+function idleSession(id = 'sess-1', pane = 'pane-1', mtime = NOW - 4 * HOUR) {
+  return { id, kind: 'claude', pane, endedTurn: true, state: 'idle', mtime };
 }
 
 // Every seam the tick reaches the world through. Nothing here spawns a process,
 // opens a pane, or types into a terminal.
 function makeDeps(fixture, state = {}) {
-  const calls = {
-    wt: [], opens: [], sends: [], closes: [], targets: [], notes: [],
-  };
+  const calls = { wt: [], opens: [], sends: [], closes: [], targets: [], notes: [], flushes: 0, writes: [] };
   const deps = {
     calls,
     worktreePath: (repo, name) => path.join(fixture.root, 'wt', repo, name),
@@ -69,10 +79,13 @@ function makeDeps(fixture, state = {}) {
     },
     openSession: async (body, openDeps) => {
       calls.opens.push({ body, openDeps });
+      if (state.openGate) await state.openGate;
       if (state.openError) throw state.openError;
       return { sessionId: state.newSessionId || 'sess-1', pane: state.newPane || 'pane-1' };
     },
-    listPanes: async () => state.panes || [],
+    // `null` is a host that could not be asked; `[]` is a host that answered and
+    // has no panes. serve.js's listHostPanes draws exactly that distinction.
+    listPanes: async () => (state.panes === undefined ? [] : state.panes),
     scanSessions: () => state.sessions || [],
     resolveSessionTarget: async (session) => {
       calls.targets.push(session.id);
@@ -82,16 +95,23 @@ function makeDeps(fixture, state = {}) {
     sendToResolvedTarget: async (session, target, text, opts) => {
       calls.sends.push({ session: session.id, pane: target.pane, text, opts });
       if (state.sendError) throw state.sendError;
+      if (state.sendResult) return state.sendResult;
       return {};
     },
     withInjectionLock: (fn) => fn(),
-    closeIdleSession: async (body) => {
-      calls.closes.push(body);
+    closeIdleSession: async (body, closeDeps) => {
+      calls.closes.push({ body, closeDeps });
       if (state.closeError) throw state.closeError;
       return { ok: true };
     },
-    deliveryStatus: () => state.receipt || null,
+    deliveryStatus: (text, key) => (state.receiptFor ? state.receiptFor(text, key) : state.receipt || null),
     openIncidents: () => state.open || [],
+    flushCommits: () => { calls.flushes += 1; return false; },
+    writeRecord: (name, patch, options) => {
+      calls.writes.push(patch);
+      if (state.writeError && state.writeError(patch)) throw state.writeError(patch);
+      return agents.writeRecord(name, patch, options);
+    },
     write: (line) => { calls.notes.push(String(line)); },
   };
   return deps;
@@ -103,6 +123,27 @@ function tick(fixture, deps, options = {}) {
 
 function sandboxes(result) {
   return result.areas.find((row) => row.area === 'sandboxes');
+}
+
+function record(fixture, name = 'sandboxes') {
+  return agents.readRecord(name, fixture.root);
+}
+
+function cursor(fixture, name = 'sandboxes') {
+  const found = record(fixture, name);
+  return found ? Number(found.lastDeliveredSeq || 0) : 0;
+}
+
+// Events land on the feed the way the Slack poll puts them there, so each one
+// gets its seq from the emit lock.
+function feed(fixture, events, options = {}) {
+  agents.ensure('sandboxes', {
+    role: 'incident-responder', area: 'sandboxes', model: 'fable',
+    lastDeliveredSeq: 0, lastDeliveredAt: 0,
+    session: options.session === null ? undefined
+      : { id: 'sess-1', pane: 'pane-1', startedAt: options.startedAt || NOW - 30 * MINUTE },
+  }, { root: fixture.root });
+  for (const event of events) agents.emit('sandboxes', event, { root: fixture.root, now: event.at || NOW });
 }
 
 // ---------- launch ----------
@@ -126,28 +167,33 @@ test('the first tick installs the recipe, creates the record, and opens exactly 
     assert.equal(body.agent, 'claude');
     assert.equal(body.accountId, 'claude-secondary');
     assert.equal(body.model, 'fable');
+    // openSession's own dedupe, keyed to the attempt rather than a clock, so two
+    // ticks trying the same attempt are one open.
+    assert.equal(body.requestId, 'area-sandboxes-1');
+    assert.match(body.requestId, /^[A-Za-z0-9_-]{1,128}$/);
     // The session's own name goes on the pane as `agentName`; `meta.agent` is the
     // provider everywhere in the daemon and must not be overloaded.
     assert.deepEqual(openDeps.launchMeta, { agentName: 'sandboxes' });
     assert.deepEqual(openDeps.launchEnv, { KEEP_AGENT: 'sandboxes' });
-    // The bootstrap is the four reads, in order.
-    for (const fragment of ['agents/sandboxes.md', '.keep/agents/sandboxes/notes.md',
-      'keep incidents', 'keep agents events sandboxes --unseen']) {
+    // The bootstrap is three reads. It is deliberately NOT told to read its
+    // unseen events: the bootstrap is not a delivery.
+    for (const fragment of ['agents/sandboxes.md', '.keep/agents/sandboxes/notes.md', 'keep incidents']) {
       assert.ok(body.message.includes(fragment), `the bootstrap names ${fragment}`);
     }
+    assert.equal(body.message.includes('--unseen'), false, 'the bootstrap does not acknowledge events');
     assert.ok(body.message.length <= 2000, 'the bootstrap fits an opening message');
 
-    const record = agents.readRecord('sandboxes', fixture.root);
-    assert.equal(record.session.id, 'sess-1');
-    assert.equal(record.session.pane, 'pane-1');
-    assert.equal(record.session.startedAt, NOW);
-    assert.equal(record.role, 'incident-responder');
-    assert.equal(record.model, 'fable');
-    assert.equal(record.cwd, fixture.worktree);
-    assert.equal(record.area, 'sandboxes');
+    const saved = record(fixture);
+    assert.equal(saved.session.id, 'sess-1');
+    assert.equal(saved.session.pane, 'pane-1');
+    assert.equal(saved.session.startedAt, NOW);
+    assert.equal(saved.role, 'incident-responder');
+    assert.equal(saved.model, 'fable');
+    assert.equal(saved.cwd, fixture.worktree);
+    assert.equal(saved.area, 'sandboxes');
+    assert.equal(saved.launchLease, null, 'the lease is released whatever the tick decided');
 
-    // A launch tick delivers nothing and closes nothing: the session has a
-    // bootstrap to read, and `--unseen` is how it finds what is waiting.
+    // A launch tick delivers nothing and closes nothing.
     assert.equal(first.delivery.state, 'skipped');
     assert.equal(first.restart.state, 'not-due');
 
@@ -158,6 +204,62 @@ test('the first tick installs the recipe, creates the record, and opens exactly 
     assert.equal(second.launch.state, 'live');
     assert.equal(deps.calls.opens.length, 1, 'no second session while one is live');
     assert.equal(second.record, 'present');
+  } finally { cleanup(fixture.root); }
+});
+
+test('two ticks racing open exactly one session', async () => {
+  const fixture = makeRoot();
+  try {
+    // The first tick to claim the lease reaches openSession and then blocks
+    // inside it; the second runs to completion while it is in there.
+    let release;
+    const state = { panes: [], sessions: [], openGate: new Promise((resolve) => { release = resolve; }) };
+    const deps = makeDeps(fixture, state);
+    const first = tick(fixture, deps);
+    // Let the first tick get as far as the gate before the second starts.
+    await new Promise((resolve) => setImmediate(resolve));
+    const second = sandboxes(await tick(fixture, deps, { now: NOW + 1000 }));
+
+    assert.equal(second.launch.state, 'skipped');
+    assert.match(second.launch.reason, /launch lease/);
+    assert.equal(second.delivery.state, 'skipped');
+    assert.equal(second.restart.state, 'not-due');
+
+    release();
+    assert.equal(sandboxes(await first).launch.state, 'launched');
+    assert.equal(deps.calls.opens.length, 1, 'one open, not two');
+    assert.equal(record(fixture).session.id, 'sess-1');
+    assert.equal(record(fixture).launchLease, null);
+
+    // An expired lease does not lock the agent out for good.
+    agents.writeRecord('sandboxes', {
+      session: { id: '', pane: '', startedAt: 0 },
+      launch: { attempts: 0, lastAt: 0, deadSince: 0 },
+      launchLease: { at: NOW, by: 'somebody-who-died', requestId: 'area-sandboxes-1' },
+    }, { root: fixture.root });
+    const later = sandboxes(await tick(fixture, deps, { now: NOW + areaSession.LAUNCH_LEASE_MS + 1000 }));
+    assert.equal(later.launch.state, 'launched');
+  } finally { cleanup(fixture.root); }
+});
+
+test('a session that came up while the tick was deciding is adopted, not doubled', async () => {
+  const fixture = makeRoot();
+  try {
+    // The first listing shows nothing; the confirming one, taken under the lease,
+    // shows a live pane stamped with this agent's name.
+    let listings = 0;
+    const state = { panes: [], sessions: [idleSession('sess-9', 'pane-9')] };
+    const deps = makeDeps(fixture, state);
+    deps.listPanes = async () => {
+      listings += 1;
+      return listings === 1 ? [] : [livePane('pane-9', 'sess-9')];
+    };
+    const report = sandboxes(await tick(fixture, deps));
+    assert.equal(report.launch.state, 'live');
+    assert.equal(report.launch.adopted, true);
+    assert.equal(deps.calls.opens.length, 0, 'nothing was opened');
+    assert.equal(record(fixture).session.id, 'sess-9');
+    assert.equal(record(fixture).launchLease, null);
   } finally { cleanup(fixture.root); }
 });
 
@@ -175,7 +277,7 @@ test('a pane that reads dead waits out the grace window before another launch', 
     const noticed = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
     assert.equal(noticed.launch.state, 'waiting');
     assert.equal(deps.calls.opens.length, 1);
-    assert.equal(agents.readRecord('sandboxes', fixture.root).launch.deadSince, NOW + MINUTE);
+    assert.equal(record(fixture).launch.deadSince, NOW + MINUTE);
 
     // Still inside the window.
     const still = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE + areaSession.PANE_DEAD_GRACE_MS - 1 }));
@@ -187,33 +289,49 @@ test('a pane that reads dead waits out the grace window before another launch', 
     const relaunched = sandboxes(await tick(fixture, deps, { now: past }));
     assert.equal(relaunched.launch.state, 'launched');
     assert.equal(deps.calls.opens.length, 2);
-    assert.equal(agents.readRecord('sandboxes', fixture.root).session.startedAt, past);
+    assert.equal(record(fixture).session.startedAt, past);
+    // A relaunch is a new attempt, so its request id is a new one too.
+    assert.equal(deps.calls.opens[1].body.requestId, 'area-sandboxes-2');
   } finally { cleanup(fixture.root); }
 });
 
-test('a host that lists no panes at all is never read as a dead session', async () => {
+test('a pane listing that failed authorizes nothing, with or without a recorded session', async () => {
   const fixture = makeRoot();
   try {
-    const state = { panes: [], sessions: [] };
+    // An unreachable host, with an empty record: the listing is not evidence that
+    // nothing is running, and launching on it is how a second session appears
+    // beside one the daemon could not see.
+    const state = { panes: null, sessions: [] };
     const deps = makeDeps(fixture, state);
-    await tick(fixture, deps);
-    assert.equal(deps.calls.opens.length, 1);
-    // An unreachable or still-starting host: an empty list has told us nothing
-    // about the session the record says is running.
-    state.panes = [];
-    const blind = sandboxes(await tick(fixture, deps, { now: NOW + areaSession.PANE_DEAD_GRACE_MS * 3 }));
+    const blind = sandboxes(await tick(fixture, deps));
     assert.equal(blind.launch.state, 'skipped');
-    assert.match(blind.launch.reason, /listed no panes/);
-    assert.equal(deps.calls.opens.length, 1);
-    assert.equal(agents.readRecord('sandboxes', fixture.root).launch.deadSince, 0);
+    assert.match(blind.launch.reason, /did not answer/);
+    assert.equal(deps.calls.opens.length, 0, 'a failed listing never launches');
+    assert.equal(blind.delivery.state, 'skipped');
+    assert.equal(blind.restart.state, 'not-due');
+
+    // A listing that throws reads the same way.
+    deps.listPanes = () => { throw new Error('terminal host socket is gone'); };
+    const threw = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
+    assert.equal(threw.launch.state, 'skipped');
+    assert.match(threw.launch.reason, /could not be asked/);
+    assert.equal(deps.calls.opens.length, 0);
+
+    // And with a session on the record it is still not a dead pane.
+    const live = makeDeps(fixture, { panes: [], sessions: [] });
+    await tick(fixture, live, { now: NOW + 2 * MINUTE });
+    assert.equal(live.calls.opens.length, 1);
+    live.listPanes = async () => null;
+    const kept = sandboxes(await tick(fixture, live, { now: NOW + 5 * areaSession.PANE_DEAD_GRACE_MS }));
+    assert.equal(kept.launch.state, 'skipped');
+    assert.equal(live.calls.opens.length, 1);
+    assert.equal(record(fixture).launch.deadSince, 0, 'no dead clock was started');
   } finally { cleanup(fixture.root); }
 });
 
 test('three launches that never come up stop, and a live session clears the count', async () => {
   const fixture = makeRoot();
   try {
-    // The host always answers and nothing in its list is ever ours, so every one
-    // of these launches is a launch that never came up.
     const other = { id: 'pane-other', alive: true, agentAlive: true, meta: { sessionId: 'somebody-else' } };
     const state = { panes: [other], sessions: [] };
     const deps = makeDeps(fixture, state);
@@ -223,7 +341,6 @@ test('three launches that never come up stop, and a live session clears the coun
       state.newPane = `pane-${attempt}`;
       const opened = sandboxes(await tick(fixture, deps, { now: at }));
       assert.equal(opened.launch.state, 'launched', `attempt ${attempt} launched`);
-      // One dead observation, then past both the grace and the retry window.
       await tick(fixture, deps, { now: at + MINUTE });
       at += areaSession.LAUNCH_RETRY_MS + MINUTE;
     }
@@ -233,13 +350,11 @@ test('three launches that never come up stop, and a live session clears the coun
     assert.match(capped.launch.reason, /produced no live session/);
     assert.equal(deps.calls.opens.length, areaSession.MAX_LAUNCH_ATTEMPTS);
 
-    // One live observation and the cap is gone: it exists for launches that do
-    // not come up, not for a session that has been running for a week.
     state.panes = [livePane('pane-3', 'sess-3')];
     state.sessions = [idleSession('sess-3', 'pane-3')];
     const live = sandboxes(await tick(fixture, deps, { now: at + MINUTE }));
     assert.equal(live.launch.state, 'live');
-    assert.equal(agents.readRecord('sandboxes', fixture.root).launch.attempts, 0);
+    assert.equal(record(fixture).launch.attempts, 0);
   } finally { cleanup(fixture.root); }
 });
 
@@ -247,8 +362,6 @@ test('a live pane stamped with the agent name is adopted rather than doubled', a
   const fixture = makeRoot();
   try {
     const state = {
-      // A launch whose response was lost: the pane is up and says whose it is,
-      // and the record never heard the session id.
       panes: [livePane('pane-9', 'sess-9')],
       sessions: [idleSession('sess-9', 'pane-9')],
     };
@@ -258,21 +371,30 @@ test('a live pane stamped with the agent name is adopted rather than doubled', a
     assert.equal(report.launch.state, 'live');
     assert.equal(report.launch.adopted, true);
     assert.equal(deps.calls.opens.length, 0, 'an adopted pane is not a reason to launch');
-    assert.equal(agents.readRecord('sandboxes', fixture.root).session.id, 'sess-9');
+    assert.equal(record(fixture).session.id, 'sess-9');
+  } finally { cleanup(fixture.root); }
+});
+
+test('a launch that threw after its pane came up still counts as launched', async () => {
+  const fixture = makeRoot();
+  try {
+    const error = new Error('could not confirm the session id');
+    error.extra = { launch: { pane: 'pane-7', sessionId: 'sess-7' } };
+    const deps = makeDeps(fixture, { panes: [], sessions: [], openError: error });
+    const report = sandboxes(await tick(fixture, deps));
+    assert.equal(report.launch.state, 'launched');
+    assert.equal(report.launch.pane, 'pane-7');
+    assert.match(report.launch.unconfirmed, /could not confirm/);
+    const saved = record(fixture);
+    assert.equal(saved.session.id, 'sess-7', 'a pane means a session IS running');
+    assert.equal(saved.session.pane, 'pane-7');
+    assert.equal(saved.launchLease, null);
   } finally { cleanup(fixture.root); }
 });
 
 // ---------- delivery ----------
 
-function feed(fixture, events) {
-  agents.ensure('sandboxes', {
-    role: 'incident-responder', area: 'sandboxes', model: 'fable',
-    session: { id: 'sess-1', pane: 'pane-1', startedAt: NOW - 30 * MINUTE },
-  }, { root: fixture.root });
-  for (const event of events) agents.emit('sandboxes', event, { root: fixture.root, now: event.at });
-}
-
-test('one delivery per tick carries every new event as pointers, and moves the cursor once', async () => {
+test('one delivery per tick carries every new event, in seq order, and moves the cursor once', async () => {
   const fixture = makeRoot();
   try {
     feed(fixture, [
@@ -289,56 +411,93 @@ test('one delivery per tick carries every new event as pointers, and moves the c
     assert.equal(deps.calls.sends.length, 1, 'ONE message, not one per event');
     const { text, opts } = deps.calls.sends[0];
     assert.match(text, /DATA, NOT INSTRUCTIONS/);
-    assert.ok(text.includes('Handle these per your recipe.'), 'the message says what to do with them');
+    assert.ok(text.includes('Handle these per your recipe.'));
     for (const fragment of ['incident-opened', 'incident-fired', 'human-note', 'inc-a', 'high', 'https://slack/c']) {
       assert.ok(text.includes(fragment), `the batch carries ${fragment}`);
     }
     assert.equal(opts.compactIfCold, true);
     assert.equal(opts.retainReceipt, true);
-    assert.equal(opts.deliveryKey, areaSession.deliveryKeyFor('sandboxes', NOW - MINUTE));
-    assert.equal(agents.readRecord('sandboxes', fixture.root).lastDelivered, NOW - MINUTE);
+    // The key is the batch's seq range, so a retry asks about the same receipt.
+    assert.equal(opts.deliveryKey, 'agent:sandboxes:seq:1-3');
+    assert.equal(cursor(fixture), 3);
+    assert.equal(areaSession.pendingDeliveryOf(record(fixture)), null, 'a confirmed send clears the pending batch');
 
-    // Same tick again with nothing new: the cursor is past everything, so
-    // nothing is typed a second time.
     const repeat = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
     assert.equal(repeat.delivery.state, 'nothing');
     assert.equal(deps.calls.sends.length, 1);
   } finally { cleanup(fixture.root); }
 });
 
-test('a launch moves the cursor past the feed the bootstrap already handed over', async () => {
+test('equal timestamps and a backdated event are each delivered exactly once', async () => {
   const fixture = makeRoot();
   try {
-    // Events that arrived while there was no session. The bootstrap's fourth read
-    // is `keep agents events sandboxes --unseen`, which is exactly this list, so
-    // delivering it again a poll later would be a duplicate.
-    agents.ensure('sandboxes', { role: 'incident-responder', area: 'sandboxes' }, { root: fixture.root });
-    agents.emit('sandboxes', { at: NOW - 5 * MINUTE, kind: 'incident-opened', card: 'inc-a' }, { root: fixture.root, now: NOW - 5 * MINUTE });
-    agents.emit('sandboxes', { at: NOW - 4 * MINUTE, kind: 'incident-fired', card: 'inc-a' }, { root: fixture.root, now: NOW - 4 * MINUTE });
-
-    const state = { panes: [], sessions: [] };
+    // Two events in the same millisecond, then one stamped BEFORE both — which is
+    // what a backfilled Slack firing looks like next to a hand close a minute
+    // ago. A timestamp cursor loses one of each pair.
+    feed(fixture, [
+      { at: NOW - 2 * MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox A' },
+      { at: NOW - 2 * MINUTE, kind: 'incident-opened', card: 'inc-b', title: 'Sandbox B' },
+    ]);
+    const state = { panes: [livePane()], sessions: [idleSession()] };
     const deps = makeDeps(fixture, state);
-    assert.equal(sandboxes(await tick(fixture, deps)).launch.state, 'launched');
-    assert.equal(agents.readRecord('sandboxes', fixture.root).lastDelivered, NOW - 4 * MINUTE);
+    assert.equal(sandboxes(await tick(fixture, deps)).delivery.count, 2);
+    assert.ok(deps.calls.sends[0].text.includes('inc-a'));
+    assert.ok(deps.calls.sends[0].text.includes('inc-b'));
+    assert.equal(cursor(fixture), 2);
 
-    state.panes = [livePane()];
-    state.sessions = [idleSession()];
-    const next = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
-    assert.equal(next.delivery.state, 'nothing');
-    assert.equal(deps.calls.sends.length, 0);
+    agents.emit('sandboxes', { at: NOW - 10 * MINUTE, kind: 'incident-closed', card: 'inc-c', title: 'Sandbox C' },
+      { root: fixture.root, now: NOW });
+    const later = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
+    assert.equal(later.delivery.count, 1);
+    assert.ok(deps.calls.sends[1].text.includes('inc-c'), 'a backdated event is still after the cursor');
+    assert.equal(cursor(fixture), 3);
+    assert.equal(sandboxes(await tick(fixture, deps, { now: NOW + 2 * MINUTE })).delivery.state, 'nothing');
+    assert.equal(deps.calls.sends.length, 2, 'and never twice');
+  } finally { cleanup(fixture.root); }
+});
 
-    // Something genuinely new still gets delivered.
-    agents.emit('sandboxes', { at: NOW + 2 * MINUTE, kind: 'human-note', card: 'inc-a' }, { root: fixture.root, now: NOW + 2 * MINUTE });
-    const fresh = sandboxes(await tick(fixture, deps, { now: NOW + 3 * MINUTE }));
-    assert.equal(fresh.delivery.state, 'sent');
-    assert.equal(fresh.delivery.count, 1);
+test('a batch is split by encoded size, never clipped, and every event gets delivered', async () => {
+  const fixture = makeRoot();
+  try {
+    // Long titles, so the body runs past the limit well before any event count would.
+    const events = [];
+    for (let i = 0; i < 60; i += 1) {
+      events.push({
+        at: NOW - (120 - i) * MINUTE, kind: 'incident-fired', card: `inc-${i}`,
+        title: `Sandbox ${i} ${'x'.repeat(100)}`, severity: 'med',
+        permalink: `https://slack/${'y'.repeat(100)}${i}`,
+      });
+    }
+    feed(fixture, events);
+    const state = { panes: [livePane()], sessions: [idleSession()] };
+    const deps = makeDeps(fixture, state);
+
+    const seen = new Set();
+    let ticks = 0;
+    let at = NOW;
+    while (cursor(fixture) < 60 && ticks < 20) {
+      const report = sandboxes(await tick(fixture, deps, { now: at }));
+      if (report.delivery.state === 'nothing') break;
+      assert.equal(report.delivery.state, 'sent');
+      ticks += 1;
+      at += MINUTE;
+      const body = deps.calls.sends.at(-1).text;
+      // Never clipped: the ellipsis dataFence adds when it has to truncate must
+      // never appear, because a clipped batch acknowledges a half-shown event.
+      assert.equal(body.includes('…'), false, 'no batch was clipped');
+      for (let i = 0; i < 60; i += 1) if (body.includes(`inc-${i} \u00b7 `)) seen.add(i);
+    }
+    assert.ok(ticks > 1, `the backlog took more than one message (${ticks})`);
+    assert.equal(seen.size, 60, 'every event was delivered');
+    assert.equal(cursor(fixture), 60);
+    assert.match(deps.calls.sends[0].text, /more events are queued behind these/);
   } finally { cleanup(fixture.root); }
 });
 
 test('a mid-turn session is not interrupted and its cursor does not move', async () => {
   const fixture = makeRoot();
   try {
-    feed(fixture, [{ at: NOW - MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox Open Health', severity: 'high' }]);
+    feed(fixture, [{ at: NOW - MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox Open Health' }]);
     const state = {
       panes: [livePane()],
       sessions: [{ ...idleSession(), endedTurn: false, state: 'running' }],
@@ -348,7 +507,8 @@ test('a mid-turn session is not interrupted and its cursor does not move', async
     assert.equal(busy.delivery.state, 'deferred');
     assert.match(busy.delivery.reason, /mid-turn/);
     assert.equal(deps.calls.sends.length, 0);
-    assert.equal(Number(agents.readRecord('sandboxes', fixture.root).lastDelivered || 0), 0, 'the cursor is untouched');
+    assert.equal(cursor(fixture), 0, 'the cursor is untouched');
+    assert.equal(areaSession.pendingDeliveryOf(record(fixture)), null, 'and nothing was persisted for a send that never started');
 
     // A question on screen is Owner's turn, not ours.
     state.sessions = [{ ...idleSession(), pendingQuestion: { text: 'which host?' } }];
@@ -362,34 +522,147 @@ test('a mid-turn session is not interrupted and its cursor does not move', async
     const sent = sandboxes(await tick(fixture, deps));
     assert.equal(sent.delivery.state, 'sent');
     assert.equal(deps.calls.sends.length, 1);
-    assert.equal(agents.readRecord('sandboxes', fixture.root).lastDelivered, NOW - MINUTE);
+    assert.equal(cursor(fixture), 1);
   } finally { cleanup(fixture.root); }
 });
 
-test('a batch whose receipt says it already arrived advances the cursor without typing', async () => {
+test('a daemon death between the send and the cursor write retries the same key and sends nothing', async () => {
   const fixture = makeRoot();
   try {
-    feed(fixture, [{ at: NOW - MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox Open Health', severity: 'high' }]);
+    feed(fixture, [
+      { at: NOW - 2 * MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox Open Health' },
+      { at: NOW - MINUTE, kind: 'incident-fired', card: 'inc-a', title: 'Sandbox Open Health' },
+    ]);
+    // The send is confirmed and the receipt written; the record write that would
+    // have advanced the cursor is what dies.
+    const receipts = new Set();
     const state = {
       panes: [livePane()], sessions: [idleSession()],
-      receipt: { sessionId: 'sess-1', kind: 'claude', received: true },
+      receiptFor: (text, key) => (receipts.has(key) ? { sessionId: 'sess-1', kind: 'claude', received: true } : null),
+      writeError: (patch) => (patch.lastDeliveredSeq ? new Error('disk went away') : null),
+    };
+    const deps = makeDeps(fixture, state);
+    const original = deps.sendToResolvedTarget;
+    deps.sendToResolvedTarget = async (session, target, text, opts) => {
+      receipts.add(opts.deliveryKey);
+      return original(session, target, text, opts);
+    };
+
+    const died = sandboxes(await tick(fixture, deps));
+    assert.equal(deps.calls.sends.length, 1, 'the message went out');
+    assert.equal(died.delivery.state, 'sent');
+    assert.match(died.delivery.cursorError, /disk went away/);
+    assert.equal(cursor(fixture), 0, 'the cursor never advanced');
+    const pending = areaSession.pendingDeliveryOf(record(fixture));
+    assert.deepEqual({ key: pending.key, firstSeq: pending.firstSeq, lastSeq: pending.lastSeq },
+      { key: 'agent:sandboxes:seq:1-2', firstSeq: 1, lastSeq: 2 });
+
+    // The next tick asks about the persisted batch's own key, finds the receipt,
+    // and acknowledges it without typing anything.
+    state.writeError = null;
+    const recovered = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
+    assert.equal(recovered.delivery.state, 'sent');
+    assert.equal(recovered.delivery.delivery, 'received');
+    assert.equal(deps.calls.sends.length, 1, 'nothing was retyped');
+    assert.equal(cursor(fixture), 2);
+    assert.equal(areaSession.pendingDeliveryOf(record(fixture)), null);
+  } finally { cleanup(fixture.root); }
+});
+
+test('a typed-but-unconfirmed batch is retried through the recovery path, not stalled', async () => {
+  const fixture = makeRoot();
+  try {
+    feed(fixture, [{ at: NOW - MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox Open Health' }]);
+    // What `delivery.deliver` leaves behind when it typed but could not confirm:
+    // a pending, unreceived journal entry. A tick that merely reported "deferred"
+    // here is what wedged the reviewer for 133 consecutive ticks in September.
+    const state = {
+      panes: [livePane()], sessions: [idleSession()],
+      receipt: { sessionId: 'sess-1', kind: 'claude', received: false, pending: true },
+      sendError: new Error('Previous delivery is unconfirmed; no message was retyped.'),
+    };
+    const deps = makeDeps(fixture, state);
+    const first = sandboxes(await tick(fixture, deps));
+    assert.equal(first.delivery.state, 'deferred');
+    assert.equal(deps.calls.sends.length, 1, 'the send was attempted, so delivery.js could recover the draft');
+    assert.equal(cursor(fixture), 0);
+    const pending = areaSession.pendingDeliveryOf(record(fixture));
+    assert.equal(pending.key, 'agent:sandboxes:seq:1-1');
+
+    // Next tick: the draft was submitted, so the same call succeeds and the text
+    // is byte-identical because the batch came off the record rather than being
+    // recomputed.
+    state.sendError = null;
+    state.sendResult = { ok: true, delivery: 'received', recovered: true };
+    const second = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
+    assert.equal(second.delivery.state, 'sent');
+    assert.equal(second.delivery.recovered, true);
+    assert.equal(deps.calls.sends[1].text, deps.calls.sends[0].text, 'the same characters, not a recomputed batch');
+    assert.equal(deps.calls.sends[1].opts.deliveryKey, deps.calls.sends[0].opts.deliveryKey);
+    assert.equal(cursor(fixture), 1);
+  } finally { cleanup(fixture.root); }
+});
+
+test('a batch the pane only half accepted is not acknowledged', async () => {
+  const fixture = makeRoot();
+  try {
+    feed(fixture, [{ at: NOW - MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox Open Health' }]);
+    const state = {
+      panes: [livePane()], sessions: [idleSession()],
+      sendResult: { truncated: true, received: 40, expected: 300 },
     };
     const deps = makeDeps(fixture, state);
     const report = sandboxes(await tick(fixture, deps));
-    assert.equal(report.delivery.state, 'sent');
-    assert.equal(report.delivery.delivery, 'received');
-    assert.equal(deps.calls.sends.length, 0, 'the receipt is the delivery');
-    assert.equal(agents.readRecord('sandboxes', fixture.root).lastDelivered, NOW - MINUTE);
+    assert.equal(report.delivery.state, 'deferred');
+    assert.equal(report.delivery.truncated, true);
+    assert.equal(cursor(fixture), 0, 'a half-delivered batch is not delivered');
+    assert.equal(areaSession.pendingDeliveryOf(record(fixture)).key, 'agent:sandboxes:seq:1-1');
 
-    // An unconfirmed prior send is the opposite: wait for that one rather than
-    // typing the same batch twice.
-    state.receipt = { sessionId: 'sess-1', kind: 'claude', received: false, pending: true };
-    agents.writeRecord('sandboxes', { lastDelivered: 0 }, { root: fixture.root });
-    const unconfirmed = sandboxes(await tick(fixture, deps));
-    assert.equal(unconfirmed.delivery.state, 'deferred');
-    assert.match(unconfirmed.delivery.reason, /unconfirmed/);
-    assert.equal(deps.calls.sends.length, 0);
-    assert.equal(agents.readRecord('sandboxes', fixture.root).lastDelivered, 0);
+    state.sendResult = null;
+    const retried = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
+    assert.equal(retried.delivery.state, 'sent');
+    assert.equal(cursor(fixture), 1);
+  } finally { cleanup(fixture.root); }
+});
+
+test('a launch leaves the cursor alone and the next tick delivers the backlog', async () => {
+  const fixture = makeRoot();
+  try {
+    // Events that arrived while there was no session. The bootstrap does not hand
+    // them over, so they are still undelivered.
+    agents.ensure('sandboxes', { role: 'incident-responder', area: 'sandboxes' }, { root: fixture.root });
+    agents.emit('sandboxes', { at: NOW - 5 * MINUTE, kind: 'incident-opened', card: 'inc-a' }, { root: fixture.root, now: NOW });
+    agents.emit('sandboxes', { at: NOW - 4 * MINUTE, kind: 'incident-fired', card: 'inc-a' }, { root: fixture.root, now: NOW });
+
+    const state = { panes: [], sessions: [] };
+    const deps = makeDeps(fixture, state);
+    assert.equal(sandboxes(await tick(fixture, deps)).launch.state, 'launched');
+    assert.equal(cursor(fixture), 0, 'the bootstrap acknowledged nothing');
+
+    state.panes = [livePane()];
+    state.sessions = [idleSession()];
+    const next = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
+    assert.equal(next.delivery.state, 'sent');
+    assert.equal(next.delivery.count, 2, 'the backlog is delivered by the tick, not the bootstrap');
+    assert.equal(cursor(fixture), 2);
+  } finally { cleanup(fixture.root); }
+});
+
+test('a control sequence in an event never reaches the pane', async () => {
+  const fixture = makeRoot();
+  try {
+    feed(fixture, [{
+      at: NOW - MINUTE, kind: 'incident-opened', card: 'inc-a',
+      title: 'Sandbox \x1b[2JOpen\x03 Health\x15',
+      permalink: 'https://slack/\x1b]0;pwned\x07a',
+    }]);
+    const deps = makeDeps(fixture, { panes: [livePane()], sessions: [idleSession()] });
+    assert.equal(sandboxes(await tick(fixture, deps)).delivery.state, 'sent');
+    const { text } = deps.calls.sends[0];
+    assert.ok(text.includes('Sandbox Open Health'));
+    assert.ok(text.includes('https://slack/a'));
+    assert.equal(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(text), false, 'not one control byte is typed');
+    assert.equal(text.includes('[2J'), false, 'and no escape sequence is left as visible junk');
   } finally { cleanup(fixture.root); }
 });
 
@@ -405,58 +678,54 @@ test('a send that throws leaves the cursor for the next tick', async () => {
     const failed = sandboxes(await tick(fixture, deps));
     assert.equal(failed.delivery.state, 'deferred');
     assert.match(failed.delivery.reason, /busy typing/);
-    assert.equal(Number(agents.readRecord('sandboxes', fixture.root).lastDelivered || 0), 0);
+    assert.equal(cursor(fixture), 0);
 
     state.sendError = null;
     const retried = sandboxes(await tick(fixture, deps));
     assert.equal(retried.delivery.state, 'sent');
-    assert.equal(agents.readRecord('sandboxes', fixture.root).lastDelivered, NOW - MINUTE);
-  } finally { cleanup(fixture.root); }
-});
-
-test('a batch bigger than one message is capped, and the rest waits for the next tick', async () => {
-  const fixture = makeRoot();
-  try {
-    const events = [];
-    for (let i = 0; i < areaSession.DELIVERY_EVENT_MAX + 5; i += 1) {
-      events.push({ at: NOW - (30 - i) * MINUTE, kind: 'incident-fired', card: `inc-${i}`, title: `Sandbox ${i}` });
-    }
-    feed(fixture, events);
-    const state = { panes: [livePane()], sessions: [idleSession()] };
-    const deps = makeDeps(fixture, state);
-    const first = sandboxes(await tick(fixture, deps));
-    assert.equal(first.delivery.count, areaSession.DELIVERY_EVENT_MAX);
-    assert.equal(first.delivery.waiting, 5);
-    assert.match(deps.calls.sends[0].text, /5 more events are queued/);
-    const second = sandboxes(await tick(fixture, deps));
-    assert.equal(second.delivery.count, 5);
-    assert.equal(deps.calls.sends.length, 2);
+    assert.equal(cursor(fixture), 1);
   } finally { cleanup(fixture.root); }
 });
 
 // ---------- restart from the log ----------
 
-function idleForHours(fixture, hours = 3) {
+function idleFor(fixture, hours, options = {}) {
   agents.ensure('sandboxes', {
     role: 'incident-responder', area: 'sandboxes',
-    session: { id: 'sess-1', pane: 'pane-1', startedAt: NOW - hours * 60 * MINUTE },
+    lastDeliveredSeq: 0, lastDeliveredAt: 0,
+    session: { id: 'sess-1', pane: 'pane-1', startedAt: NOW - hours * HOUR },
+    ...options,
   }, { root: fixture.root });
+}
+
+// A pane and a session whose every activity clock is older than `hours`.
+function quietState(hours = 3) {
+  const at = NOW - hours * HOUR;
+  return {
+    panes: [livePane('pane-1', 'sess-1', { lastOutputAt: at, lastInputAt: at })],
+    sessions: [idleSession('sess-1', 'pane-1', at)],
+    open: [],
+  };
 }
 
 test('an idle session with nothing open is closed gracefully, and the next tick opens a fresh one', async () => {
   const fixture = makeRoot();
   try {
-    idleForHours(fixture, 3);
-    const state = { panes: [livePane()], sessions: [idleSession()], open: [] };
+    idleFor(fixture, 3);
+    const state = quietState(3);
     const deps = makeDeps(fixture, state);
     const closed = sandboxes(await tick(fixture, deps));
     assert.equal(closed.restart.state, 'closed');
-    assert.deepEqual(deps.calls.closes, [{ sessionId: 'sess-1', pane: 'pane-1' }]);
-    const record = agents.readRecord('sandboxes', fixture.root);
-    assert.equal(record.session.id, '', 'the record drops the session it closed');
-    assert.equal(record.lifecycle, 'idle');
+    assert.equal(deps.calls.closes.length, 1);
+    assert.deepEqual(deps.calls.closes[0].body, { sessionId: 'sess-1', pane: 'pane-1' });
+    // The area's own idle window, not zero: closeIdleSession's elapsed-activity
+    // checks are a second opinion this decision wants, not one it should waive.
+    assert.deepEqual(deps.calls.closes[0].closeDeps.closePolicy,
+      { automatic: true, idleMs: 120 * MINUTE });
+    const saved = record(fixture);
+    assert.equal(saved.session.id, '', 'the record drops the session it closed');
+    assert.equal(saved.lifecycle, 'idle');
 
-    // Nothing is lost: the next tick launches fresh from the bootstrap.
     state.panes = [];
     state.sessions = [];
     const relaunched = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
@@ -465,33 +734,89 @@ test('an idle session with nothing open is closed gracefully, and the next tick 
   } finally { cleanup(fixture.root); }
 });
 
-test('an open incident in the area is never restarted out from under', async () => {
+test('a session that just finished a turn is not closed, however long ago it started', async () => {
   const fixture = makeRoot();
   try {
-    idleForHours(fixture, 9);
-    const state = {
-      panes: [livePane()], sessions: [idleSession()],
-      open: [{ signature: 'grafana:sandbox-open-health', card: 'inc-a', area: 'sandboxes', title: 'Sandbox Open Health' }],
-    };
+    idleFor(fixture, 9);
+    // Started nine hours ago, but the transcript moved two minutes ago: it has
+    // been working, not sitting there. Idle is measured from real activity.
+    const state = { ...quietState(9), sessions: [idleSession('sess-1', 'pane-1', NOW - 2 * MINUTE)] };
+    const deps = makeDeps(fixture, state);
+    const busy = sandboxes(await tick(fixture, deps));
+    assert.equal(busy.restart.state, 'not-due');
+    assert.match(busy.restart.reason, /idle for 2m of 120m/);
+    assert.equal(deps.calls.closes.length, 0);
+
+    // Same for the pane's own clocks.
+    state.sessions = [idleSession('sess-1', 'pane-1', NOW - 9 * HOUR)];
+    state.panes = [livePane('pane-1', 'sess-1', { lastOutputAt: NOW - 3 * MINUTE, lastInputAt: NOW - 9 * HOUR })];
+    const echoing = sandboxes(await tick(fixture, deps));
+    assert.equal(echoing.restart.state, 'not-due');
+    assert.match(echoing.restart.reason, /idle for 3m of 120m/);
+    assert.equal(deps.calls.closes.length, 0);
+
+    // A confirmed delivery counts too.
+    agents.writeRecord('sandboxes', { lastDeliveredAt: NOW - 5 * MINUTE }, { root: fixture.root });
+    state.panes = quietState(9).panes;
+    const delivered = sandboxes(await tick(fixture, deps));
+    assert.equal(delivered.restart.state, 'not-due');
+    assert.match(delivered.restart.reason, /idle for 5m of 120m/);
+  } finally { cleanup(fixture.root); }
+});
+
+test('an open incident in any of the agent’s areas keeps its session', async () => {
+  const fixture = makeRoot();
+  try {
+    // Both areas route to one agent: `sandboxes` has the session, `app-server`
+    // merely feeds it. An incident in either is this agent's work.
+    const fixtureRoot = fixture.root;
+    fs.writeFileSync(path.join(fixtureRoot, 'watch', 'incidents.json'), JSON.stringify({
+      areas: {
+        sandboxes: { project: fixture.project, match: ['^Sandbox '], session: true, account: 'claude-secondary' },
+        'app-server': { project: path.join(fixtureRoot, 'checkouts', 'ghost-server'), default: true, agent: 'sandboxes' },
+      },
+      quietMin: 60, reopenHours: 24,
+    }));
+    idleFor(fixture, 9);
+    const state = quietState(9);
+    state.open = [{ signature: 'grafana:server-faults', card: 'inc-b', area: 'app-server', title: 'Server Faults' }];
     const deps = makeDeps(fixture, state);
     const held = sandboxes(await tick(fixture, deps));
     assert.equal(held.restart.state, 'not-due');
-    assert.match(held.restart.reason, /open incident/);
+    assert.match(held.restart.reason, /open incident in app-server/);
     assert.equal(deps.calls.closes.length, 0);
 
-    // Another area's incident is not this area's reason to stay up.
-    state.open = [{ signature: 'grafana:server-faults', card: 'inc-b', area: 'app-server', title: 'Server Faults' }];
-    const released = sandboxes(await tick(fixture, deps));
-    assert.equal(released.restart.state, 'closed');
+    // Its own area counts the same way.
+    state.open = [{ signature: 'grafana:sandbox-open-health', card: 'inc-a', area: 'sandboxes', title: 'Sandbox Open Health' }];
+    assert.equal(sandboxes(await tick(fixture, deps)).restart.state, 'not-due');
+    assert.equal(deps.calls.closes.length, 0);
+
+    // An area that is not this agent's is not its reason to stay up.
+    state.open = [{ signature: 'grafana:multiplayer', card: 'inc-c', area: 'multiplayer', title: 'Multiplayer' }];
+    assert.equal(sandboxes(await tick(fixture, deps)).restart.state, 'closed');
     assert.equal(deps.calls.closes.length, 1);
+  } finally { cleanup(fixture.root); }
+});
+
+test('two areas that both want a session as one agent are a config error, and neither runs', async () => {
+  const fixture = makeRoot({ appServer: { session: true, agent: 'sandboxes' } });
+  try {
+    const deps = makeDeps(fixture, { panes: [], sessions: [] });
+    const result = await areaSession.tick({ root: fixture.root, now: NOW }, deps);
+    assert.equal(result.areas.length, 2);
+    for (const row of result.areas) assert.match(row.error, /both want a session as agent sandboxes/);
+    assert.equal(deps.calls.opens.length, 0, 'neither area is half-served');
+    assert.equal(agents.readRecord('sandboxes', fixture.root), null);
+    // Reported once for the agent, not once per area.
+    assert.equal(deps.calls.notes.filter((line) => line.includes('both want a session')).length, 1);
   } finally { cleanup(fixture.root); }
 });
 
 test('a session is not restarted before its idle window, mid-turn, or with events waiting', async () => {
   const fixture = makeRoot();
   try {
-    idleForHours(fixture, 1);
-    const state = { panes: [livePane()], sessions: [idleSession()], open: [] };
+    idleFor(fixture, 1);
+    const state = quietState(1);
     const deps = makeDeps(fixture, state);
     const early = sandboxes(await tick(fixture, deps));
     assert.equal(early.restart.state, 'not-due');
@@ -499,21 +824,29 @@ test('a session is not restarted before its idle window, mid-turn, or with event
     assert.equal(deps.calls.closes.length, 0);
 
     // Past the window, but mid-turn.
-    agents.writeRecord('sandboxes', { session: { startedAt: NOW - 5 * 60 * MINUTE } }, { root: fixture.root });
-    state.sessions = [{ ...idleSession(), endedTurn: false }];
+    agents.writeRecord('sandboxes', { session: { startedAt: NOW - 5 * HOUR } }, { root: fixture.root });
+    Object.assign(state, quietState(5));
+    state.sessions = [{ ...idleSession('sess-1', 'pane-1', NOW - 5 * HOUR), endedTurn: false }];
     const busy = sandboxes(await tick(fixture, deps));
     assert.equal(busy.restart.state, 'not-due');
     assert.match(busy.restart.reason, /mid-turn/);
     assert.equal(deps.calls.closes.length, 0);
 
     // Idle again, but a batch is still undelivered.
-    state.sessions = [idleSession()];
+    Object.assign(state, quietState(5));
     state.sendError = new Error('pane is busy typing');
-    agents.emit('sandboxes', { at: NOW - MINUTE, kind: 'incident-opened', card: 'inc-a' }, { root: fixture.root, now: NOW - MINUTE });
+    agents.emit('sandboxes', { at: NOW - MINUTE, kind: 'incident-opened', card: 'inc-a' }, { root: fixture.root, now: NOW });
     const pending = sandboxes(await tick(fixture, deps));
     assert.equal(pending.delivery.state, 'deferred');
     assert.equal(pending.restart.state, 'not-due');
     assert.match(pending.restart.reason, /undelivered/);
+    assert.equal(deps.calls.closes.length, 0);
+
+    // And still not, once that batch is merely pending on the record.
+    state.sendError = null;
+    state.sendResult = { truncated: true, received: 10, expected: 300 };
+    const half = sandboxes(await tick(fixture, deps));
+    assert.equal(half.restart.state, 'not-due');
     assert.equal(deps.calls.closes.length, 0);
   } finally { cleanup(fixture.root); }
 });
@@ -521,18 +854,15 @@ test('a session is not restarted before its idle window, mid-turn, or with event
 test('a refused close is final for the tick and leaves the session running', async () => {
   const fixture = makeRoot();
   try {
-    idleForHours(fixture, 3);
-    const state = {
-      panes: [livePane()], sessions: [idleSession()], open: [],
-      closeError: new Error('Pane has recent or unknown output activity'),
-    };
+    idleFor(fixture, 3);
+    const state = quietState(3);
+    state.closeError = new Error('Pane has recent or unknown output activity');
     const deps = makeDeps(fixture, state);
     const refused = sandboxes(await tick(fixture, deps));
     assert.equal(refused.restart.state, 'refused');
     assert.match(refused.restart.reason, /recent or unknown output/);
     assert.equal(deps.calls.closes.length, 1, 'refused once, not retried inside the tick');
-    const record = agents.readRecord('sandboxes', fixture.root);
-    assert.equal(record.session.id, 'sess-1', 'the session it could not close is still its session');
+    assert.equal(record(fixture).session.id, 'sess-1', 'the session it could not close is still its session');
     assert.equal(deps.calls.opens.length, 0, 'and no replacement is opened for it');
   } finally { cleanup(fixture.root); }
 });
@@ -541,9 +871,10 @@ test('restartAfterIdleMin is read off the area', async () => {
   const fixture = makeRoot({ restartAfterIdleMin: 30 });
   try {
     assert.equal(incidents.config(fixture.root).areas.sandboxes.restartAfterIdleMin, 30);
-    idleForHours(fixture, 1);
-    const deps = makeDeps(fixture, { panes: [livePane()], sessions: [idleSession()], open: [] });
+    idleFor(fixture, 1);
+    const deps = makeDeps(fixture, quietState(1));
     assert.equal(sandboxes(await tick(fixture, deps)).restart.state, 'closed');
+    assert.equal(deps.calls.closes[0].closeDeps.closePolicy.idleMs, 30 * MINUTE);
   } finally { cleanup(fixture.root); }
 });
 
@@ -560,6 +891,45 @@ test('config defaults the account and the idle window, and leaves session off', 
     assert.equal(area.restartAfterIdleMin, 120);
     assert.equal(area.agent, 'sandboxes');
   } finally { cleanup(root); }
+});
+
+// ---------- daemon hygiene ----------
+
+test('a tick with nothing to do writes nothing and asks for no commit', async () => {
+  const fixture = makeRoot();
+  try {
+    idleFor(fixture, 0);
+    agents.writeRecord('sandboxes', { session: { startedAt: NOW - MINUTE } }, { root: fixture.root });
+    fs.mkdirSync(path.join(fixture.root, 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(fixture.root, 'agents', 'sandboxes.md'), '# already here\n');
+    const deps = makeDeps(fixture, {
+      panes: [livePane('pane-1', 'sess-1', { lastOutputAt: NOW - MINUTE, lastInputAt: NOW - MINUTE })],
+      sessions: [idleSession('sess-1', 'pane-1', NOW - MINUTE)],
+      open: [],
+    });
+    // A live session, nothing on the feed, nothing due: the quiet case, which is
+    // most of them.
+    // The fixture's own writes marked the agent dirty; the tick under test is the
+    // only thing that may leave it that way.
+    agents.flushCommits(fixture.root);
+    const before = fs.readFileSync(agents.recordFile('sandboxes', fixture.root), 'utf8');
+    const quiet = sandboxes(await tick(fixture, deps));
+    assert.equal(quiet.launch.state, 'live');
+    assert.equal(quiet.delivery.state, 'nothing');
+    assert.equal(quiet.restart.state, 'not-due');
+    assert.equal(quiet.changed, false);
+    assert.deepEqual(deps.calls.writes, [], 'no record write at all');
+    assert.equal(fs.readFileSync(agents.recordFile('sandboxes', fixture.root), 'utf8'), before);
+    assert.equal(deps.calls.flushes, 0, 'and no commit was asked for');
+    assert.equal(agents.pendingNames(fixture.root).length, 0);
+
+    // One that does something asks for exactly one commit.
+    agents.emit('sandboxes', { at: NOW, kind: 'incident-opened', card: 'inc-a' }, { root: fixture.root, now: NOW });
+    const busy = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
+    assert.equal(busy.delivery.state, 'sent');
+    assert.equal(busy.changed, true);
+    assert.equal(deps.calls.flushes, 1);
+  } finally { cleanup(fixture.root); }
 });
 
 // ---------- the switch, the recipe, and dry runs ----------
@@ -590,17 +960,27 @@ test('--dry reports what it would do and performs nothing', async () => {
     assert.equal(deps.calls.wt.length, 0);
     assert.equal(deps.calls.sends.length, 0);
     assert.equal(deps.calls.closes.length, 0);
+    assert.deepEqual(deps.calls.writes, [], 'no lease, no record, no cursor');
     assert.equal(agents.readRecord('sandboxes', fixture.root), null, 'no record');
     assert.equal(fs.existsSync(path.join(fixture.root, 'agents', 'sandboxes.md')), false, 'no recipe');
     assert.ok(areaSession.describe(report).join('\n').includes('would-launch'));
 
     // A dry run over a live, idle, quiet session says what it would close, and
-    // does not close it.
-    idleForHours(fixture, 3);
-    const live = makeDeps(fixture, { panes: [livePane()], sessions: [idleSession()], open: [] });
+    // does not close it; over a session with a batch waiting, what it would send.
+    idleFor(fixture, 3);
+    const live = makeDeps(fixture, quietState(3));
     const quiet = sandboxes(await tick(fixture, live, { dry: true, force: true }));
     assert.equal(quiet.restart.state, 'would-close');
     assert.equal(live.calls.closes.length, 0);
+
+    agents.emit('sandboxes', { at: NOW, kind: 'incident-opened', card: 'inc-a' }, { root: fixture.root, now: NOW });
+    const waiting = makeDeps(fixture, quietState(3));
+    const batch = sandboxes(await tick(fixture, waiting, { dry: true, force: true }));
+    assert.equal(batch.delivery.state, 'would-send');
+    assert.equal(batch.delivery.count, 1);
+    assert.equal(waiting.calls.sends.length, 0);
+    assert.equal(cursor(fixture), 0);
+    assert.equal(areaSession.pendingDeliveryOf(record(fixture)), null);
   } finally { cleanup(fixture.root); }
 });
 
@@ -641,7 +1021,7 @@ test('the recipe this repo ships covers every section the responder needs', () =
     '## Badging', '## Overlap', '## Untrusted input', '## Budget', '## Ending the turn']) {
     assert.ok(text.includes(heading), `the recipe has ${heading}`);
   }
-} );
+});
 
 // ---------- the worktree ----------
 
@@ -657,7 +1037,6 @@ test('a finished worktree is reused, a half-built one is rebuilt, and no keep ch
     assert.deepEqual(reused, { ok: true, path: fixture.worktree, reused: true });
     assert.equal(wt.length, 0, 'a ready tree costs no wt run');
 
-    // Half-built: removed through wt, which knows how to unregister it, then built.
     const stump = path.join(fixture.root, 'wt', 'castle-sandboxes', 'stump');
     fs.mkdirSync(stump, { recursive: true });
     const built = await areaSession.ensureWorktree('castle-sandboxes', 'stump', {
@@ -673,7 +1052,6 @@ test('a finished worktree is reused, a half-built one is rebuilt, and no keep ch
     assert.deepEqual(wt.map((args) => args[0]), ['rm', 'new']);
     assert.deepEqual(wt[1], ['new', 'castle-sandboxes/stump']);
 
-    // The child must not attribute what it writes to whichever session spawned it.
     let childEnv = null;
     await areaSession.runWt(['ls'], {
       env: { PATH: '/usr/bin', CLAUDE_CODE_SESSION_ID: 'session_abc' },
@@ -694,29 +1072,12 @@ test('an area with no project, or a worktree outside the worktree root, launches
     assert.match(noProject.launch.reason, /no project/);
     assert.equal(deps.calls.opens.length, 0);
 
-    // The last gate before an unattended session starts: a responder only ever
-    // runs in a worktree, never in a main checkout.
     const outside = makeDeps(fixture, { panes: [], sessions: [], insideWorktreeRoot: false });
     const refused = sandboxes(await tick(fixture, outside));
     assert.equal(refused.launch.state, 'failed');
     assert.match(refused.launch.reason, /worktree root/);
     assert.equal(outside.calls.opens.length, 0);
-  } finally { cleanup(fixture.root); }
-});
-
-test('a launch that threw after its pane came up still counts as launched', async () => {
-  const fixture = makeRoot();
-  try {
-    const error = new Error('could not confirm the session id');
-    error.extra = { launch: { pane: 'pane-7', sessionId: 'sess-7' } };
-    const deps = makeDeps(fixture, { panes: [], sessions: [], openError: error });
-    const report = sandboxes(await tick(fixture, deps));
-    assert.equal(report.launch.state, 'launched');
-    assert.equal(report.launch.pane, 'pane-7');
-    assert.match(report.launch.unconfirmed, /could not confirm/);
-    const record = agents.readRecord('sandboxes', fixture.root);
-    assert.equal(record.session.id, 'sess-7', 'a pane means a session IS running');
-    assert.equal(record.session.pane, 'pane-7');
+    assert.equal(record(fixture).launchLease, null, 'a failed launch still releases the lease');
   } finally { cleanup(fixture.root); }
 });
 
@@ -724,18 +1085,17 @@ test('a tick never throws into the poll, whatever a dep does', async () => {
   const fixture = makeRoot();
   try {
     const deps = makeDeps(fixture, { panes: [], sessions: [] });
-    deps.listPanes = () => { throw new Error('the terminal host is gone'); };
-    const result = await areaSession.tickQuietly({ root: fixture.root, area: 'sandboxes', now: NOW }, deps);
-    assert.ok(result.areas.length === 1);
-    // A thrown listPanes reads as "could not tell", which is the safe answer.
-    assert.equal(sandboxes(result).launch.state, 'launched');
-
     const broken = makeDeps(fixture, { panes: [], sessions: [] });
     broken.openSession = () => { throw new Error('boom'); };
-    const second = await areaSession.tickQuietly({ root: fixture.root, area: 'sandboxes', now: NOW + MINUTE }, broken);
-    assert.ok(second.areas.length === 1);
+    const second = await areaSession.tickQuietly({ root: fixture.root, area: 'sandboxes', now: NOW }, broken);
+    assert.equal(second.areas.length, 1);
+    assert.equal(sandboxes(second).launch.state, 'failed');
 
     const missing = await areaSession.tickQuietly({ root: fixture.root, area: 'nowhere', now: NOW }, deps);
     assert.match(missing.areas[0].error, /no area nowhere/);
+
+    const noConfig = await areaSession.tickQuietly({ root: fixture.root, now: NOW },
+      { ...deps, config: () => { throw new Error('unreadable incidents.json'); } });
+    assert.match(noConfig.error, /unreadable/);
   } finally { cleanup(fixture.root); }
 });

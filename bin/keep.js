@@ -2223,11 +2223,14 @@ commands.incidents = async (argv, cliDeps = {}) => {
     const o = parseArgs(rest, { dry: 'bool', json: 'bool' });
     if (o._.length !== 1) die('usage: keep incidents session <area> [--dry] [--json]');
     const areaSession = require('./area-session.js');
-    // A real tick opens panes and types into terminals, so it needs the daemon's
-    // own seams. Each one requires serve.js on first use rather than up front:
-    // `--dry`, and an area whose session is off, must stay a cheap read.
+    // The daemon's own seams, each requiring serve.js on first use rather than up
+    // front, so an area whose session is off costs nothing. `--dry` gets the same
+    // set on purpose: a dry run that could not ask the terminal host what is
+    // running would have nothing true to report, and performing nothing is
+    // area-session's own guarantee (every write, send and close is gated on it),
+    // not something withholding a dependency buys.
     const serve = () => require('./serve.js');
-    const deps = cliDeps.deps || (o.dry ? {} : {
+    const deps = cliDeps.deps || ({
       openSession: (body, openDeps) => serve().openSession(body, openDeps),
       listPanes: () => serve().listHostPanes({}, true),
       scanSessions: () => serve().scanSessions(),
@@ -2236,6 +2239,7 @@ commands.incidents = async (argv, cliDeps = {}) => {
       withInjectionLock: (fn, scope) => serve().withInjectionLock(fn, scope),
       closeIdleSession: (body, closeDeps) => serve().closeIdleSession(body, closeDeps),
     });
+
     // `force` only with `--dry`: a dry run is how the switch gets inspected
     // before it is flipped, but actually opening a session for an area whose
     // `session` is false would flip it from the command line.
