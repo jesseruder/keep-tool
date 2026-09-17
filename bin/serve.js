@@ -1775,21 +1775,26 @@ async function readScreen(target, lines, scrollback, deps = {}) {
   return String(screen && screen.text || '');
 }
 
-// `expectedInputCount` makes the write conditional: the host compares it with the
-// pane's own input counter and writes only if they still agree, in one step, so a
-// keystroke from a viewer cannot land between the check and the write. A refused
-// write typed nothing at all, which is what inputDropped says.
+// `expectedInputCount` and `expectedPid` make the write conditional: the host compares
+// both against the live pane and writes only if they still agree, in one step, so a
+// keystroke from a viewer cannot land between the check and the write, and a pane that
+// was replaced under the same id cannot receive a key meant for the process before it.
+// A refused write typed nothing at all, which is what inputDropped says.
 async function writeTarget(target, value, deps = {}, options = {}) {
   if (!isHostTarget(target)) throw new Error('terminal target needs a host pane');
-  const expected = options.expectedInputCount;
+  const guarded = options.expectedInputCount !== undefined || options.expectedPid !== undefined;
   const result = await hostRequest('input', {
     pane: target.pane,
     data: Buffer.from(String(value), 'utf8').toString('base64'),
-    ...(expected === undefined ? {} : { expectedInputCount: expected }),
+    ...(guarded ? { expectedInputCount: options.expectedInputCount, expectedPid: options.expectedPid } : {}),
   }, deps);
   if (result && result.dropped) {
-    const error = new Error('input arrived on the pane before this keystroke; nothing was typed');
+    const replaced = result.reason === 'pane replaced';
+    const error = new Error(replaced
+      ? 'the pane was replaced before this keystroke; nothing was typed'
+      : 'input arrived on the pane before this keystroke; nothing was typed');
     error.inputDropped = true;
+    error.dropReason = typeof result.reason === 'string' ? result.reason : null;
     error.inputCount = Number.isInteger(result.inputCount) ? result.inputCount : null;
     throw error;
   }
@@ -2270,11 +2275,15 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
   // count is taken on both sides — a read that spans somebody else's keystroke says
   // nothing about the box it shows, whichever side of the Escape it is on. "Cleared"
   // is claimed only for an empty box whose count moved by exactly our own keys.
-  const countInputs = async () => {
+  // The count is only meaningful together with the process it was counted for:
+  // `replace-exited` keeps the pane id and starts the new process's count at zero, so
+  // both travel together everywhere below.
+  const paneState = async () => {
     try {
       const panes = await (deps.listHostPanes || listHostPanes)(deps, true);
       const live = Array.isArray(panes) ? panes.find((entry) => entry && entry.id === pane) : null;
-      return live && Number.isInteger(live.inputCount) ? live.inputCount : null;
+      return live && Number.isInteger(live.inputCount) && Number.isInteger(live.pid)
+        ? { inputCount: live.inputCount, pid: live.pid } : null;
     } catch { return null; }
   };
   const unverified = () => {
@@ -2284,6 +2293,10 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
   const arrived = () => {
     write(`keep serve: left an aborted draft on pane ${pane}: input arrived from elsewhere while it was being cleared\n`);
     return { cleared: false, reason: 'input arrived' };
+  };
+  const replaced = () => {
+    write(`keep serve: left an aborted draft on pane ${pane}: the pane's process was replaced while it was being cleared\n`);
+    return { cleared: false, reason: 'pane replaced' };
   };
   // The conditional write is a host feature, and a host from before it ignores
   // expectedInputCount and writes the key unconditionally — the very race this is here
@@ -2311,8 +2324,10 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
   // that Enter had just started, and the empty box it left would pass for our own
   // clean clear. Nothing is pressed at all when the count cannot be read either: an
   // Escape this could not account for is worse than a draft left where it is.
-  let count = await countInputs();
-  if (count === null) return unverified();
+  const baseline = await paneState();
+  if (baseline === null) return unverified();
+  const pid = baseline.pid;
+  let count = baseline.inputCount;
   let screen = '';
   try {
     screen = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false);
@@ -2325,10 +2340,12 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
     return { cleared: false, reason: 'mixed draft' };
   }
   // The other side of that read: the box just examined is only worth acting on if
-  // nothing reached the pane while it was being read.
-  const settled = await countInputs();
+  // nothing reached the pane while it was being read, and if it is still the same
+  // process's box at all.
+  const settled = await paneState();
   if (settled === null) return unverified();
-  if (settled !== count) return arrived();
+  if (settled.pid !== pid) return replaced();
+  if (settled.inputCount !== count) return arrived();
   // Escape is a keystroke, not a guarantee. Read the box back after each one:
   // "cleared" is a claim about the session, so it is only made when the box is
   // actually empty. Twice at most, because a Claude slash draft has its command menu
@@ -2339,9 +2356,9 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     if (attempt > 0 && !draftIsExactly(after, text, kind)) break;
     try {
-      await pressTargetKey(target, 'Escape', deps, { expectedInputCount: count });
+      await pressTargetKey(target, 'Escape', deps, { expectedInputCount: count, expectedPid: pid });
     } catch (error) {
-      if (error && error.inputDropped) return arrived();
+      if (error && error.inputDropped) return error.dropReason === 'pane replaced' ? replaced() : arrived();
       write(`keep serve: could not clear an aborted draft on pane ${pane}: ${String((error && error.message) || error)}\n`);
       return { cleared: false, reason: 'escape failed' };
     }
@@ -2353,10 +2370,11 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
     }
     // After the read, not before it: this is what says the screen just read is a
     // screen only our own Escape changed.
-    const counted = await countInputs();
+    const counted = await paneState();
     if (counted === null) return unverified();
-    if (counted !== count + 1) return arrived();
-    count = counted;
+    if (counted.pid !== pid) return replaced();
+    if (counted.inputCount !== count + 1) return arrived();
+    count = counted.inputCount;
     if (draftRegionText(after, kind) === '') return { cleared: true, reason: null };
   }
   write(`keep serve: the draft on pane ${pane} is still there after Escape\n`);

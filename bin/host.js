@@ -877,9 +877,20 @@ function createHost(options = {}) {
         // read the count, and a viewer's key could still land before its own write
         // arrived. Here the compare and the write are one step in the single process
         // that owns the counter, so nothing can slip between them. Without the
-        // parameter this is the ordinary unconditional write it has always been.
-        if (params.expectedInputCount !== undefined) {
-          if (!Number.isInteger(params.expectedInputCount)) throw new Error('expectedInputCount must be an integer');
+        // parameters this is the ordinary unconditional write it has always been.
+        //
+        // The pid is part of the guard and not optional beside the count, because
+        // `replace-exited` keeps the pane id and starts the replacement's count at
+        // zero: a keystroke captured at count N would otherwise be delivered to a
+        // different process that happens to have seen N inputs of its own. Compared
+        // the way `guarded-kill` compares it.
+        if (params.expectedInputCount !== undefined || params.expectedPid !== undefined) {
+          if (!Number.isInteger(params.expectedInputCount) || !Number.isInteger(params.expectedPid)) {
+            throw new Error('a conditional input requires expectedInputCount and expectedPid as integers');
+          }
+          if (pane.pty.pid !== params.expectedPid) {
+            return { result: { dropped: true, reason: 'pane replaced', pid: pane.pty.pid, inputCount: pane.inputCount } };
+          }
           if (pane.inputCount !== params.expectedInputCount) {
             return { result: { dropped: true, reason: 'input arrived', inputCount: pane.inputCount } };
           }

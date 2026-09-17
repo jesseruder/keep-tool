@@ -4859,24 +4859,32 @@ function draftHarness(screen, onEvent = () => {}) {
   // What this host says it can do. A test drops a capability to stand for a host that
   // is still running the code it was started with.
   const hello = { version: 1, conditionalInput: true };
+  // The process behind the pane. `replace-exited` keeps the pane id and starts a new
+  // process's count at zero, so a test moves this to stand for that.
+  const live = { pid: 4242 };
   const count = () => inputs.length + foreign.count;
   const host = recordingHost(async (type, params) => {
-    onEvent(type, { inputs, foreign });
+    onEvent(type, { inputs, foreign, live });
     if (type === 'hello') return { ...hello };
     if (type === 'screen') return { text: typeof screen === 'function' ? screen(inputs) : screen };
     if (type === 'input') {
-      if (params.expectedInputCount !== undefined && count() !== params.expectedInputCount) {
-        return { dropped: true, reason: 'input arrived', inputCount: count() };
+      if (params.expectedInputCount !== undefined || params.expectedPid !== undefined) {
+        if (live.pid !== params.expectedPid) {
+          return { dropped: true, reason: 'pane replaced', pid: live.pid, inputCount: count() };
+        }
+        if (count() !== params.expectedInputCount) {
+          return { dropped: true, reason: 'input arrived', inputCount: count() };
+        }
       }
       inputs.push(Buffer.from(params.data, 'base64').toString());
     }
     return {};
   });
   return {
-    inputs, events, host, foreign, hello,
+    inputs, events, host, foreign, hello, live,
     deps: {
       host, sleep: async () => {}, draftKind: 'claude',
-      listHostPanes: async () => { onEvent('list', { inputs, foreign }); return [{ id: 'p', inputCount: count() }]; },
+      listHostPanes: async () => { onEvent('list', { inputs, foreign, live }); return [{ id: 'p', pid: live.pid, inputCount: count() }]; },
       deliveryTrace: (stage, fields) => events.push({ stage, ...fields }),
     },
   };
@@ -5060,6 +5068,24 @@ test('a draft is only reported cleared when nobody else typed while it was being
   assert.equal(raced.error.draftReason, 'input arrived');
   assert.equal(raced.escapes, 1);
   assert.ok(raced.harness.events.some((e) => e.stage === 'enter-aborted' && e.cleared === false && e.reason === 'input arrived'));
+
+  // The pane id outlives the process behind it: replace-exited reuses it and starts
+  // the replacement's input count at zero, so the count alone would let a keystroke
+  // captured for one process be delivered to another that has typed just as little.
+  // The pid travels with the count, and the host drops the write.
+  const swapped = await run(CLEARABLE('/exit'), (type, { inputs, live }) => {
+    if (type === 'input' && inputs.length >= 1) live.pid = 5151;
+  });
+  assert.equal(swapped.error.message, 'message was typed but could not be confirmed; Enter was not pressed');
+  assert.equal(swapped.error.draftReason, 'pane replaced');
+  assert.equal(swapped.escapes, 0, 'nothing is typed into a process this never looked at');
+  // And a replacement noticed by the listing rather than the write is the same answer.
+  let seen = 0;
+  const relisted = await run(CLEARABLE('/exit'), (type, { live }) => {
+    if (type === 'list' && ++seen === 2) live.pid = 5151;
+  });
+  assert.equal(relisted.error.draftReason, 'pane replaced');
+  assert.equal(relisted.escapes, 0);
 
   // A host that has not been reloaded since the conditional write landed would ignore
   // the expected count and press the key anyway, which is the race itself. It is asked

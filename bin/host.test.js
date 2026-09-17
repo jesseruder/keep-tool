@@ -922,9 +922,10 @@ test('a conditional input writes only while the pane has taken no other keystrok
     const countOf = async () => (await client.request('get', { pane: pane.id })).pane.inputCount;
     const start = await countOf();
 
-    // The count still agrees, so the write happens and the counter moves with it.
+    // Both still agree, so the write happens and the counter moves with it.
     assert.deepEqual(await client.request('input', {
-      pane: pane.id, data: Buffer.from('first\n').toString('base64'), expectedInputCount: start,
+      pane: pane.id, data: Buffer.from('first\n').toString('base64'),
+      expectedInputCount: start, expectedPid: pane.pid,
     }), {});
     await waitFor(async () => (await client.request('screen', { pane: pane.id })).text.includes('got:first'), 'conditional input');
     assert.equal(await countOf(), start + 1);
@@ -932,13 +933,25 @@ test('a conditional input writes only while the pane has taken no other keystrok
     // Somebody else typed since. Nothing reaches the pty and the counter does not move,
     // so a caller is never told its keystroke landed when it did not.
     const dropped = await client.request('input', {
-      pane: pane.id, data: Buffer.from('second\n').toString('base64'), expectedInputCount: start,
+      pane: pane.id, data: Buffer.from('second\n').toString('base64'),
+      expectedInputCount: start, expectedPid: pane.pid,
     });
     assert.deepEqual(dropped, { dropped: true, reason: 'input arrived', inputCount: start + 1 });
     assert.equal(await countOf(), start + 1, 'a refused write bumps nothing');
     await new Promise((resolve) => setTimeout(resolve, 100));
     assert.equal((await client.request('screen', { pane: pane.id })).text.includes('got:second'), false,
       'and writes nothing');
+
+    // The count belongs to a process, not to a pane id: replace-exited reuses the id
+    // and starts the replacement's count at zero, so the pid is checked first.
+    const wrongPid = await client.request('input', {
+      pane: pane.id, data: Buffer.from('stranger\n').toString('base64'),
+      expectedInputCount: start + 1, expectedPid: pane.pid + 100000,
+    });
+    assert.deepEqual(wrongPid, { dropped: true, reason: 'pane replaced', pid: pane.pid, inputCount: start + 1 });
+    assert.equal(await countOf(), start + 1);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal((await client.request('screen', { pane: pane.id })).text.includes('got:stranger'), false);
 
     // An unconditional write is untouched by any of this.
     assert.deepEqual(await client.request('input', {
@@ -947,9 +960,16 @@ test('a conditional input writes only while the pane has taken no other keystrok
     await waitFor(async () => (await client.request('screen', { pane: pane.id })).text.includes('got:third'), 'unconditional input');
     assert.equal(await countOf(), start + 2);
 
-    await assert.rejects(client.request('input', {
-      pane: pane.id, data: Buffer.from('x').toString('base64'), expectedInputCount: 'many',
-    }), /expectedInputCount must be an integer/);
+    // Neither half of the guard stands on its own.
+    for (const params of [
+      { expectedInputCount: 'many', expectedPid: pane.pid },
+      { expectedInputCount: start + 2 },
+      { expectedPid: pane.pid },
+    ]) {
+      await assert.rejects(client.request('input', {
+        pane: pane.id, data: Buffer.from('x').toString('base64'), ...params,
+      }), /requires expectedInputCount and expectedPid as integers/, JSON.stringify(params));
+    }
     await client.request('kill', { pane: pane.id });
   });
 });
