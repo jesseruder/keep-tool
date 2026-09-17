@@ -11,7 +11,7 @@ const test = require('node:test');
 const {
   parseClassification, fleetContext, computeSuspects, foldThreads, buildPrompt,
   messageForPrompt, messageBody, parseClaudeCapabilities, classifierArgs, classify, slackCardId, cardTitle,
-  config, whoamiDomain, workspaceDomain,
+  config, whoamiDomain, workspaceDomain, workspaceHost, startScheduler,
 } = require('./slack.js');
 const { profileEnvironment } = require('./agent-launcher.js');
 
@@ -134,6 +134,43 @@ test('the workspace domain is read from whatever shape whoami returns', () => {
   assert.equal(whoamiDomain(null), '');
 });
 
+test('a workspace domain is validated before it can reach a permalink', () => {
+  for (const good of [
+    'https://castle-xyz.slack.com/',
+    'https://castle-xyz.slack.com/archives/C123/p1789',
+    'http://castle-xyz.slack.com',
+    'CASTLE-XYZ.slack.com',
+    'castle-xyz.slack.com',
+    'castle-xyz',
+  ]) assert.equal(workspaceHost(good), 'castle-xyz', good);
+
+  for (const bad of [
+    'https://attacker.example#',
+    'https://attacker.example#castle-xyz.slack.com',
+    'javascript:alert(1)',
+    'user@castle-xyz.slack.com',
+    'https://user:pw@castle-xyz.slack.com/',
+    'castle-xyz.slack.com/evil',
+    'castle-xyz.slack.com:8080',
+    'castle xyz',
+    'castle-xyz/../evil',
+    'castle.xyz.example',
+    '-castle',
+    '',
+    null,
+  ]) assert.equal(workspaceHost(bad), '', String(bad));
+
+  // The same validation on the way out of whoami and out of the config file.
+  assert.equal(whoamiDomain({ url: 'https://attacker.example#castle-xyz.slack.com' }), '');
+  assert.equal(whoamiDomain({ domain: 'castle-xyz.slack.com/evil', url: 'https://castle-xyz.slack.com/' }), 'castle-xyz');
+});
+
+test('a rejected domain is not cached either', async () => {
+  const cursors = {};
+  assert.equal(await workspaceDomain(cursors, async () => ({ url: 'https://attacker.example/' })), '');
+  assert.equal('workspaceDomain' in cursors, false);
+});
+
 test('an empty domain answer is never cached, and the configured domain wins', async () => {
   // A cached "" is what pinned every permalink to empty: the key was present,
   // falsy, and rewritten on every poll.
@@ -168,6 +205,66 @@ test('watch/slack.json can pin the workspace domain as a host or a url', (t) => 
   assert.equal(config().domain, 'castle-xyz');
   fs.writeFileSync(file, JSON.stringify({ channels: ['#errors'], domain: 'castle-xyz' }));
   assert.equal(config().domain, 'castle-xyz');
+  // And a hostile override is refused the same way a hostile whoami answer is.
+  fs.writeFileSync(file, JSON.stringify({ channels: ['#errors'], domain: 'https://attacker.example#' }));
+  assert.equal(config().domain, '');
+});
+
+test('a poll whose incident writes failed records the Slack channel as failing', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-slack-health-'));
+  try {
+    for (const directory of ['tasks', 'archive', 'digests', 'watch']) fs.mkdirSync(path.join(root, directory), { recursive: true });
+    const base = Math.floor(Date.now() / 1000) - 600;
+    fs.writeFileSync(path.join(root, 'watch', 'slack.json'), JSON.stringify({
+      channels: ['#errors'], mode: 'cards', backfillHours: 6, maxPerPoll: 60,
+      alertBots: { BOT: 'castle-sandboxes' },
+    }));
+    // A bare project name this throwaway registry cannot resolve: the incident
+    // write fails, the message stays behind the cursor, and the tick must say so.
+    const incidentsFile = path.join(root, 'watch', 'incidents.json');
+    fs.writeFileSync(incidentsFile, JSON.stringify({
+      areas: { sandboxes: { project: 'no-such-project-anywhere', default: true } },
+    }));
+    const mcp = path.join(root, 'fake-mcp.js');
+    writeExecutable(mcp, `#!/usr/bin/env node
+const tool = process.argv[3];
+if (tool === 'slack_whoami') process.stdout.write(JSON.stringify({ url: 'https://castle-xyz.slack.com/' }));
+if (tool === 'slack_history') process.stdout.write(JSON.stringify({ has_more: false, messages: [
+  { ts: '${base + 1}.000000', from: 'BOT', channel: '#errors', subtype: 'bot_message', text: '',
+    attachments: [{ title: '[FIRING:1] Sandbox opens failing', text: '**Firing**\\n\\nValue: A=1\\nLabels:\\n - alertname = Sandbox opens failing\\nAnnotations:\\nSource: <https://castlexyz.grafana.net/x>' }] },
+] }));
+if (tool === 'slack_thread') process.stdout.write(JSON.stringify({ messages: [] }));
+`);
+    const script = `(async () => {
+      const slack = require(${JSON.stringify(path.join(__dirname, 'slack.js'))});
+      const fs = require('fs');
+      const scheduler = slack.startScheduler({});
+      await scheduler.tick();
+      fs.copyFileSync(${JSON.stringify(path.join(root, '.keep', 'health.json'))}, ${JSON.stringify(path.join(root, 'health-1.json'))});
+      // Now give the area a path project, so the write lands and the channel recovers.
+      fs.writeFileSync(${JSON.stringify(incidentsFile)}, JSON.stringify({
+        areas: { sandboxes: { project: '~/', default: true } },
+      }));
+      await scheduler.tick();
+      fs.copyFileSync(${JSON.stringify(path.join(root, '.keep', 'health.json'))}, ${JSON.stringify(path.join(root, 'health-2.json'))});
+    })().catch((error) => { console.error(error.stack); process.exit(1); });`;
+    const env = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', KEEP_ALERT_CHANNELS: 'none', KEEP_JESSE_MCP: mcp };
+    delete env.CLAUDE_CODE_SESSION_ID;
+    const result = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', env });
+    assert.equal(result.status, 0, result.stderr);
+
+    const failing = JSON.parse(fs.readFileSync(path.join(root, 'health-1.json'), 'utf8')).slack;
+    assert.equal(failing.lastOkAt, undefined);
+    assert.equal(failing.consecutiveFailures, 1);
+    assert.match(failing.lastError, /^1 incident write failed: project no-such-project-anywhere did not resolve/);
+    // The incident state says the same thing, for `keep incidents`.
+    const pending = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'incidents', 'state.json'), 'utf8')).lastPoll;
+    assert.equal(pending.failed, 0, 'the second poll cleared it');
+
+    const recovered = JSON.parse(fs.readFileSync(path.join(root, 'health-2.json'), 'utf8')).slack;
+    assert.ok(recovered.lastOkAt, 'the clean poll records ok again');
+    assert.equal(recovered.consecutiveFailures, 0);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('Slack bug ids and titles are deterministic and sanitized', () => {

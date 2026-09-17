@@ -758,13 +758,34 @@ function fleetInput(now = Date.now()) {
   };
 }
 
-// `castle-xyz` out of anything Slack might hand us: a bare domain, a
-// `<domain>.slack.com` host, or a full workspace url.
+// `castle-xyz` out of anything Slack might hand us: a bare label, a
+// `<label>.slack.com` host, or a full workspace url. Whatever comes back is
+// interpolated into every permalink we write onto a card, so it is validated
+// rather than trimmed: a url is parsed, which is what rules out userinfo, a
+// path or a fragment by construction, and the label itself must be a single
+// DNS label. Anything else is no domain at all.
+const WORKSPACE_LABEL = /^[a-z0-9][a-z0-9-]{0,62}$/;
+const SLACK_SUFFIX = '.slack.com';
+
 function workspaceHost(value) {
-  return String(value == null ? '' : value).trim()
-    .replace(/^https?:\/\//, '')
-    .replace(/\/.*$/, '')
-    .replace(/\.slack\.com$/i, '');
+  const raw = String(value == null ? '' : value).trim();
+  if (!raw) return '';
+  let label = raw;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(raw) || raw.startsWith('//')) {
+    let url;
+    try { url = new URL(raw.startsWith('//') ? `https:${raw}` : raw); } catch { return ''; }
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return '';
+    const hostname = url.hostname.toLowerCase();
+    if (!hostname.endsWith(SLACK_SUFFIX)) return '';
+    label = hostname.slice(0, -SLACK_SUFFIX.length);
+  } else {
+    // A bare host or label. Anything that could carry a path, credentials, a
+    // port or whitespace is not one.
+    if (/[/\\@?#:\s]/.test(raw)) return '';
+    label = raw.toLowerCase();
+    if (label.endsWith(SLACK_SUFFIX)) label = label.slice(0, -SLACK_SUFFIX.length);
+  }
+  return WORKSPACE_LABEL.test(label) ? label : '';
 }
 
 // The whoami shape varies by build: some return `domain` or `team_domain`, some
@@ -1072,6 +1093,7 @@ async function poll(options = {}) {
   const refs = contextRefs(context);
   const cardIds = contextCardIds(context);
   const results = [];
+  const incidentFailures = { count: 0, error: '' };
   const work = [];
   for (const channel of cfg.channels) {
     const afterTs = String(cursors.channels[channel] && cursors.channels[channel].after_ts || ((now - cfg.backfillHours * 3600e3) / 1000).toFixed(6));
@@ -1173,6 +1195,12 @@ async function poll(options = {}) {
         // next poll fetches it again — acknowledging it here would lose the
         // alert for good on one transient lock or disk failure.
         if (entry.ok === false) {
+          // Counted, not just logged. The message stays behind the cursor until
+          // it lands, so once maxPerPoll worth of messages are all seen the
+          // cursor stops moving and nothing newer is fetched — a poll that
+          // reported `ok` while silently stuck is how that goes unnoticed.
+          incidentFailures.count += 1;
+          if (!incidentFailures.error) incidentFailures.error = String(entry.error || 'write failed');
           process.stderr.write(`keep slack: incident ${entry.ts} not recorded (${entry.error || 'write failed'}); retrying next poll\n`);
           continue;
         }
@@ -1239,6 +1267,10 @@ async function poll(options = {}) {
     writeJsonAtomic(SEEN_FILE, seen);
     writeJsonAtomic(THREADS_FILE, threads);
   }
+  if (!dry) incidents.recordPoll({ now, failed: incidentFailures.count, error: incidentFailures.error });
+  // Carried on the result so the scheduler can fail this tick's health row;
+  // the array itself is still just the landed decisions.
+  results.incidentFailures = incidentFailures;
   return results;
 }
 
@@ -1284,15 +1316,28 @@ function startScheduler(options = {}) {
   const tick = async () => {
     if (running) return;
     running = true;
+    let failures = 0;
+    let failureError = '';
     try {
       const decisions = await poll();
       process.stderr.write(`keep slack: polled ${decisions.length} new message${decisions.length === 1 ? '' : 's'}\n`);
+      failures = decisions.incidentFailures && Number(decisions.incidentFailures.count) || 0;
+      failureError = failures ? String(decisions.incidentFailures.error || 'write failed') : '';
       // The daemon's quiet-incident sweep. Never let it fail a poll.
       if (options.afterPoll) {
         try { options.afterPoll(); } catch (error) { process.stderr.write(`keep incidents: sweep failed: ${error.message}\n`); }
       }
       if (options.onChange) options.onChange();
-      health.record('slack', { ok: true, detail: `${decisions.length} messages` });
+      // An incident write that failed leaves its message behind the cursor, so
+      // the channel is not healthy until it lands, however many messages the
+      // poll itself got through.
+      if (failures) {
+        health.record('slack', {
+          ok: false,
+          error: `${failures} incident write${failures === 1 ? '' : 's'} failed: ${failureError}`,
+          detail: `${decisions.length} messages`,
+        });
+      } else health.record('slack', { ok: true, detail: `${decisions.length} messages` });
     } catch (error) {
       health.record('slack', { ok: false, error });
       process.stderr.write(`keep slack: ${error.message}\n`);
