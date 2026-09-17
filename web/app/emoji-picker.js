@@ -4,7 +4,7 @@
 // validates a mark against — so nothing the picker hands over can be refused.
 //
 // The picker lives inside the Actions menu, which re-renders every few seconds and
-// closes on a pointerdown outside itself. Two consequences run through the whole
+// closes on a pointerdown outside itself. Three consequences run through the whole
 // file:
 //
 //   * Handlers are assigned (`onclick`, `oninput`, `onkeydown`), never added, so
@@ -15,6 +15,11 @@
 //     to diff. An open panel is open by attribute and property only, so the HTML is
 //     unchanged across a refresh and patchHTML leaves the DOM — and the open panel —
 //     alone.
+//   * Like the menu around it, the picker closes on a pointerdown outside itself,
+//     which is what a panel over the rest of the console has to do. That one
+//     listener is added per document rather than per install, for the same reason
+//     the handlers above are assigned: an install runs on every render, and a
+//     listener added there would pile up a new copy each time.
 import { EMOJI } from './emoji-list.js';
 
 const RECENT_KEY = 'keep.console.recentEmoji';
@@ -84,6 +89,29 @@ export function pickerHTML(esc = escapeHTML) {
     + `<div class="emoji-grid" data-emoji-grid role="group" aria-label="${esc('Emoji')}"></div></div>`;
 }
 
+// The documents already carrying the dismiss listener, and the one open picker it
+// acts on — only one Actions menu is open at a time, so there is never a second.
+// `current` holds this install's own `close`, so a panel that outlived a re-render
+// is closed by the handlers now bound to it rather than by the ones it was built
+// with.
+const dismissInstalled = new WeakSet();
+let current = null;
+
+function installOutsideDismiss(doc) {
+  if (!doc?.addEventListener || dismissInstalled.has(doc)) return;
+  dismissInstalled.add(doc);
+  // Bubble phase, like the Actions menu's own dismiss in session-actions.js, so a
+  // click that lands on a control still reaches it first.
+  doc.addEventListener('pointerdown', (event) => {
+    if (!current || current.panel.hidden !== false) return;
+    const target = event?.target;
+    // The toggle closes the panel itself. Closing it here first would leave that
+    // click reopening what the pointerdown had just shut.
+    if (current.panel.contains?.(target) || current.toggle.contains?.(target)) return;
+    current.close(false);
+  });
+}
+
 // `host` is the element holding the toggle, the panel and the mark's own emoji
 // input — the `.mark-controls` div. `onPick(emoji)` is what actually sets the
 // mark; the picker itself only decides which emoji that is.
@@ -97,6 +125,8 @@ export function installEmojiPicker(host, options = {}) {
   const grid = host.querySelector('[data-emoji-grid]');
   const recentBox = host.querySelector('[data-emoji-recent]');
   if (!toggle || !panel || !search || !grid) return;
+  const doc = options.document ?? (typeof document !== 'undefined' ? document : null);
+  installOutsideDismiss(doc);
 
   const wireCells = (root) => {
     for (const cell of root.querySelectorAll('[data-emoji]') || []) {
@@ -121,11 +151,13 @@ export function installEmojiPicker(host, options = {}) {
   const close = (toToggle) => {
     panel.hidden = true;
     toggle.setAttribute?.('aria-expanded', 'false');
+    if (current?.panel === panel) current = null;
     if (toToggle) toggle.focus?.({ preventScroll: true });
   };
 
   const open = () => {
     panel.hidden = false;
+    current = { panel, toggle, close };
     toggle.setAttribute?.('aria-expanded', 'true');
     search.value = '';
     renderRecents();
@@ -183,4 +215,8 @@ export function installEmojiPicker(host, options = {}) {
   // install's choose, so a menu rebound to another session writes to that one.
   wireCells(grid);
   if (recentBox) wireCells(recentBox);
+  // And a panel still open across that re-render becomes the dismiss's current
+  // one, so an outside pointerdown closes it through this install's close rather
+  // than through the one the previous install left behind.
+  if (panel.hidden === false) current = { panel, toggle, close };
 }

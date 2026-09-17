@@ -18,11 +18,20 @@ class FakeNode {
     this.value = '';
     this.hidden = false;
     this.cells = [];
+    this.children = [];
     this.html = '';
     this.focuses = 0;
     this.onclick = null;
     this.onkeydown = null;
     this.oninput = null;
+  }
+
+  // Enough of Node.contains for the dismiss: itself, the cells its own innerHTML
+  // wrote, and whatever was registered as a child of it.
+  add(...nodes) { this.children.push(...nodes); return this; }
+  contains(node) {
+    if (node === this || this.cells.includes(node)) return true;
+    return this.children.some((child) => child.contains?.(node));
   }
 
   setAttribute(name, value) { this.attrs[name] = String(value); }
@@ -59,6 +68,7 @@ class FakeHost {
     this.search = new FakeNode('input', { emojiSearch: '' });
     this.recent = new FakeNode('div', { emojiRecent: '' });
     this.grid = new FakeNode('div', { emojiGrid: '' });
+    this.panel.add(this.search, this.recent, this.grid);
     this.nodes = {
       '[data-emoji-pick]': this.toggle,
       '[data-emoji-picker]': this.panel,
@@ -87,15 +97,29 @@ const brokenStorage = () => ({
   setItem() { throw new Error('site data blocked'); },
 });
 
+// The document the dismiss listener is installed on. A fresh one per test, so what
+// one test installs is never what the next one counts.
+function fakeDocument() {
+  const listeners = [];
+  return {
+    listeners,
+    addEventListener(type, fn) { listeners.push({ type, fn }); },
+    pointerdown(target) {
+      for (const { type, fn } of listeners) if (type === 'pointerdown') fn({ target });
+    },
+  };
+}
+
 async function wired(options = {}) {
   const { installEmojiPicker } = await import('./emoji-picker.js');
   const host = new FakeHost();
   const picked = [];
   const storage = options.storage === undefined ? fakeStorage(options.saved) : options.storage;
+  const doc = options.document === undefined ? fakeDocument() : options.document;
   for (let i = 0; i < (options.installs || 1); i += 1) {
-    installEmojiPicker(host, { onPick: (emoji) => picked.push(emoji), storage });
+    installEmojiPicker(host, { onPick: (emoji) => picked.push(emoji), storage, document: doc });
   }
-  return { host, picked, storage };
+  return { host, picked, storage, doc };
 }
 
 test('the closed markup carries the toggle and an empty panel', async () => {
@@ -279,6 +303,77 @@ test('installing on every render leaves one handler per control', async () => {
   host.grid.cell('🐛').click();
   assert.deepEqual(picked, ['🚀'], 'the old install is out of the picture');
   assert.deepEqual(rebound, ['🐛']);
+});
+
+test('a pointerdown outside the picker closes it, the way the menu around it closes', async () => {
+  const { host, picked, doc } = await wired();
+  host.toggle.click();
+  doc.pointerdown(new FakeNode('div'));
+  assert.equal(host.panel.hidden, true);
+  assert.equal(host.toggle.getAttribute('aria-expanded'), 'false');
+  assert.equal(host.toggle.focuses, 0, 'dismissing is not Escape: focus follows the pointer, not the toggle');
+  assert.deepEqual(picked, [], 'and nothing was picked on the way out');
+});
+
+test('a pointerdown inside the picker, or on the toggle, leaves it open', async () => {
+  const { host, doc } = await wired();
+  host.toggle.click();
+  const inside = [
+    ['the toggle', host.toggle],
+    ['the panel itself', host.panel],
+    ['the search box', host.search],
+    ['the grid', host.grid],
+    ['a cell', host.grid.cell('🔥')],
+  ];
+  for (const [what, target] of inside) {
+    doc.pointerdown(target);
+    // The toggle is the case that would bite: closing here would leave its own
+    // click reopening the panel the pointerdown had just shut.
+    assert.equal(host.panel.hidden, false, `a pointerdown on ${what} is not an outside one`);
+  }
+});
+
+test('a pointerdown with the panel already closed does nothing at all', async () => {
+  const { host, picked, doc } = await wired();
+  doc.pointerdown(new FakeNode('div'));
+  assert.equal(host.panel.hidden, true);
+  assert.equal(host.toggle.focuses, 0);
+
+  host.toggle.click();
+  host.search.keydown('Escape');
+  assert.equal(host.toggle.focuses, 1);
+  doc.pointerdown(new FakeNode('div'));
+  assert.equal(host.toggle.focuses, 1, 'a closed picker is out of the dismiss’s hands');
+  assert.deepEqual(picked, []);
+});
+
+test('the dismiss is installed once per document, however often the menu re-renders', async () => {
+  const { doc } = await wired({ installs: 5 });
+  assert.equal(doc.listeners.length, 1);
+  assert.equal(doc.listeners[0].type, 'pointerdown');
+});
+
+test('a panel open across a re-render is still dismissed, by the new install', async () => {
+  const { installEmojiPicker } = await import('./emoji-picker.js');
+  const { host, picked, doc, storage } = await wired();
+  host.toggle.click();
+  const rebound = [];
+  installEmojiPicker(host, { onPick: (emoji) => rebound.push(emoji), storage, document: doc });
+  assert.equal(host.panel.hidden, false, 're-installing over an open panel does not close it');
+  assert.equal(doc.listeners.length, 1);
+
+  doc.pointerdown(new FakeNode('div'));
+  assert.equal(host.panel.hidden, true);
+  assert.deepEqual(picked, []);
+  assert.deepEqual(rebound, []);
+});
+
+test('without a document the picker still wires up, and nothing throws', async () => {
+  const { host } = await wired({ document: null });
+  host.toggle.click();
+  assert.equal(host.panel.hidden, false);
+  host.grid.cell('🔥').click();
+  assert.equal(host.panel.hidden, true);
 });
 
 test('a host without the picker markup, and a picker without a handler, are wired to nothing', async () => {
