@@ -265,7 +265,10 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
    menu too tall for a Watch pane. The selector beats
    `.session-actions-content > div > .btn`, which stretches menu buttons. */
 .mark-controls > .emoji-pick.btn { justify-self: start; width: auto; padding: 1px 6px; line-height: 1.35; }
-.emoji-picker { margin: 4px 8px 0; width: 260px; max-width: 100%; padding: 6px; border: 1px solid var(--line-2); border-radius: 5px; background: var(--panel); }
+/* Sized by the menu, never by its own content: a fixed width here would widen the
+   Actions menu's grid track and push the panel past the right edge of the screen. */
+.emoji-picker { margin: 4px 0 0; min-width: 0; box-sizing: border-box; padding: 6px; border: 1px solid var(--line-2); border-radius: 5px; background: var(--panel); }
+.mark-controls { min-width: 0; }
 .emoji-picker[hidden] { display: none; }
 .emoji-search { width: 100%; font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 4px; padding: 2px 6px; }
 .emoji-recent { display: flex; flex-wrap: wrap; gap: 1px; margin-top: 5px; padding-bottom: 4px; border-bottom: 1px solid var(--line); }
