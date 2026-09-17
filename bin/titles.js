@@ -57,7 +57,9 @@ function liveTitle(session, deps = {}) {
   const peekSummary = deps.peekSummary || summarize.peekSummary;
   const now = deps.now || Date.now;
   const onChange = typeof deps.onChange === 'function' ? deps.onChange : () => {};
-  if (!session || session.reviewer) return null;
+  // A session Owner named by hand keeps that name: no generation, no cache read,
+  // and nothing for applyLiveTitles to overwrite.
+  if (!session || session.reviewer || session.renamed === true) return null;
   const baseTitle = sanitizeTitle(session.baseTitle ?? session.title);
   const prompt = session.kind === 'claude' ? session.lastHuman : session.kind === 'codex' ? session.lastUser : '';
 
@@ -87,6 +89,9 @@ function liveTitle(session, deps = {}) {
 function applyLiveTitles(sessions, deps = {}) {
   for (const session of sessions || []) {
     if (!session) continue;
+    // A hand-named session is left exactly as bin/session-names.js stamped it, so
+    // its baseTitle stays the transcript's own title for when the name is cleared.
+    if (session.renamed === true) continue;
     session.baseTitle = session.baseTitle ?? session.title ?? '';
     const live = liveTitle(session, deps);
     if (live !== null && live !== session.baseTitle) session.title = live;

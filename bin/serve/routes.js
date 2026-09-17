@@ -23,7 +23,7 @@ function routes(ctx) {
     prepareSessionSummary, projectMobileState, recentTranscriptText, recoverReviewQueueLaunch, reminders,
     reopenSessionOnAccount, resolvePortableTransfer, resolveReviewLaunchSelection, restorePlan, review,
     reviewDeps, reviewQueue, reviewQueueSearch, runCheckNow, runTaskNow, screenHistorySession, screenSession,
-    sendSessionKeys, sendStateJson, sendToSessionLocked, sessionSummaryFile, setAsideCandidates, summarize,
+    sendSessionKeys, sendStateJson, sendToSessionLocked, sessionNames, sessionSummaryFile, setAsideCandidates, summarize,
     transferSession, updateSetAside, wantsCompactState, wantsLightweightState, withInjectionLock,
     writeToShellPane,
     // start()'s own locals. onChange and onFocus are the module-level hooks start()
@@ -507,6 +507,22 @@ function routes(ctx) {
           if (e instanceof keep.KeepError) return json(res, 400, { error: e.message });
           return json(res, 502, { error: String(e && e.message || e).slice(0, 500) });
         }
+      },
+    },
+    // A name Owner typed replaces the generated title and switches generation off
+    // for that session; an empty title clears the name and hands it back.
+    {
+      method: 'POST',
+      path: '/api/rename-session',
+      handle: async ({ req, res, url, body }) => {
+        const sessionId = String(body && body.sessionId || '');
+        if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) return json(res, 400, { error: 'bad session id' });
+        if (typeof (body && body.title) !== 'string') return json(res, 400, { error: 'title must be a string' });
+        let result;
+        try { result = sessionNames.set(sessionId, body.title, { root: keep.ROOT }); }
+        catch (error) { return json(res, 500, { error: `could not save the name: ${String(error && error.message || error).slice(0, 200)}` }); }
+        broadcast();
+        return json(res, 200, { ok: true, sessionId, title: result.title });
       },
     },
     {

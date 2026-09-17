@@ -7409,6 +7409,67 @@ test('dashboard Claude resolver reuses one indexed snapshot and preserves accoun
   assert.equal(rowReads, 1);
 });
 
+test('a host-only row shows the name Owner typed for that session', () => {
+  const sessionNames = require('./session-names.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-rename-host-'));
+  sessionNames.set('host-only', 'The finder', { root: dir });
+  const sessions = [];
+  const added = backfillHostSessions(sessions, [{
+    id: 'pane', alive: true, createdAt: new Date().toISOString(),
+    meta: { sessionId: 'host-only', agent: 'claude', title: 'Pane title' },
+  }], { root: dir, freshClaudeSessionFor: () => null });
+  assert.equal(added.length, 1);
+  assert.equal(added[0].title, 'The finder');
+  assert.equal(added[0].renamed, true);
+  assert.equal(sessions[0].title, 'The finder', 'the row pushed onto the list is the row that was named');
+});
+
+test('/api/rename-session stores a name, clears it, and refuses a bad id or a non-string title', async () => {
+  const { routes } = require('./serve/routes');
+  const sessionNames = require('./session-names.js');
+  const titles = require('./titles.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-rename-route-'));
+  let broadcasts = 0;
+  const list = routes({
+    keep: { ROOT: dir },
+    sessionNames,
+    broadcast: () => { broadcasts += 1; },
+    json: (res, status, value) => ({ status, value }),
+  });
+  const route = list.find((entry) => entry.path === '/api/rename-session');
+  const post = (body) => route.handle({ req: { method: 'POST' }, res: {}, url: new URL('http://x/api/rename-session'), body });
+
+  assert.deepEqual(await post({ sessionId: 'bad id', title: 'x' }), { status: 400, value: { error: 'bad session id' } });
+  assert.deepEqual(await post({ title: 'x' }), { status: 400, value: { error: 'bad session id' } });
+  assert.deepEqual(await post({ sessionId: 'abc' }), { status: 400, value: { error: 'title must be a string' } });
+  assert.deepEqual(await post({ sessionId: 'abc', title: 12 }), { status: 400, value: { error: 'title must be a string' } });
+  assert.equal(broadcasts, 0, 'a refused rename changes nothing');
+
+  assert.deepEqual(await post({ sessionId: 'abc', title: '  The finder  ' }),
+    { status: 200, value: { ok: true, sessionId: 'abc', title: 'The finder' } });
+  assert.equal(broadcasts, 1);
+
+  // The state built next stamps the name and switches title generation off.
+  const sessions = [
+    { id: 'abc', kind: 'claude', title: 'Generated title', lastHuman: 'Fix the retry path that double-sends' },
+    { id: 'other', kind: 'claude', title: 'Generated title', lastHuman: 'Fix the retry path that double-sends' },
+  ];
+  sessionNames.apply(sessions, { root: dir });
+  const generated = [];
+  titles.applyLiveTitles(sessions, {
+    peekSummary: () => null,
+    getSummary: (key) => { generated.push(key); return { text: 'Retry path' }; },
+  });
+  assert.deepEqual(sessions.map((session) => [session.title, session.renamed]),
+    [['The finder', true], ['Retry path', undefined]]);
+  assert.deepEqual(generated, ['title-other'], 'only the session without a name is titled by the model');
+
+  assert.deepEqual(await post({ sessionId: 'abc', title: '' }),
+    { status: 200, value: { ok: true, sessionId: 'abc', title: null } });
+  assert.equal(broadcasts, 2);
+  assert.equal(sessionNames.lookup('abc', { root: dir }), null);
+});
+
 test('host backfill uses indexed Claude discovery only for dashboard state', () => {
   const pane = { id: 'pane', alive: true, meta: { sessionId: 'host-only', agent: 'claude' } };
   let exactCalls = 0;

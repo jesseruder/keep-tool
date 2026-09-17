@@ -40,6 +40,7 @@ const health = require('./health.js');
 const features = require('./features.js');
 const stalled = require('./stalled.js');
 const sessionNumbers = require('./session-numbers.js');
+const sessionNames = require('./session-names.js');
 const keepConsole = require('./console.js');
 const sessionStatus = require('./session-status.js');
 const { sendStateJson } = require('./state-response.js');
@@ -1664,9 +1665,9 @@ const URGENT_DASHBOARD_MUTATIONS = new Set([
   '/api/abandon-account-handoff', '/api/ack', '/api/add', '/api/answer', '/api/checkin',
   '/api/close-idle', '/api/close-session', '/api/compact', '/api/decisions/judge',
   '/api/handoff-session', '/api/notifications', '/api/open', '/api/panes/spawn',
-  '/api/portable-transfers', '/api/reminders', '/api/reopen-session', '/api/resolve-portable-transfer',
-  '/api/restart-daemon', '/api/restart-session', '/api/review-queue', '/api/reviewtick',
-  '/api/run', '/api/send', '/api/setaside', '/api/transfer-session',
+  '/api/portable-transfers', '/api/reminders', '/api/rename-session', '/api/reopen-session',
+  '/api/resolve-portable-transfer', '/api/restart-daemon', '/api/restart-session', '/api/review-queue',
+  '/api/reviewtick', '/api/run', '/api/send', '/api/setaside', '/api/transfer-session',
 ]);
 function urgentDashboardMutation(pathname) {
   return URGENT_DASHBOARD_MUTATIONS.has(pathname) || /^\/api\/panes\/[^/]+\/(?:kill|remove)$/.test(pathname)
@@ -6350,6 +6351,9 @@ function scanSessions(options = {}) {
   else try { codexSessions = codex.scan({ dashboard: options.dashboard === true }); } catch {}
   attachCodexMarkers(codexSessions, attentionDir, now, options);
   sessions.push(...codexSessions);
+  // Hand-typed names are stamped before every titling pass: the generator must
+  // see `renamed` so it leaves the name alone.
+  sessionNames.apply(sessions, { root: keep.ROOT });
   titles.applyLiveTitles(sessions, { cachedOnly: true });
   sessions.sort((a, b) => b.mtime - a.mtime);
   // Every session carries its short number from here on: the snapshot below is
@@ -6809,6 +6813,7 @@ function buildState(options = {}) {
     s.taskId = byId[s.id] || null;
     s.taskStatus = taskById.get(s.taskId)?.fm.status || null;
   }
+  sessionNames.apply(sessions, { root: keep.ROOT });
   titles.applyLiveTitles(sessions, {
     onChange,
     cachedOnly: workerMode,
@@ -6854,7 +6859,7 @@ function buildState(options = {}) {
   if (workerMode) {
     const terminal = new Set(['completed', 'failed', 'cancelled']);
     const derived = new Set(['taskId', 'taskStatus', 'runtime', 'pane', 'launchModel', 'accountLabel',
-      'backgroundJobs', 'activity', 'observation', 'stateLabel', 'stalled']);
+      'backgroundJobs', 'activity', 'observation', 'stateLabel', 'stalled', 'renamed']);
     for (const session of sessions) {
       const key = `${session.kind}:${session.id}`;
       const evidence = dashboardSourceEvidence.get(key);
@@ -7095,6 +7100,7 @@ function finalizeDashboardWorkerResult(result) {
   }
 
   const taskById = new Map((state.tasks || []).map((task) => [task.id, task]));
+  sessionNames.apply(state.sessions, { root: keep.ROOT });
   titles.applyLiveTitles(state.sessions, { onChange, taskFor: (session) => taskById.get(session.taskId) });
   for (const session of state.sessions || []) require('./session-debug').record(session, Date.now());
   const sessionById = new Map((state.sessions || []).map((session) => [session.id, session]));
@@ -7203,7 +7209,12 @@ function backfillHostSessions(sessions, panes, deps = {}) {
   sessions.sort((a, b) => (Number(b.mtime) || 0) - (Number(a.mtime) || 0));
   // Host-only rows join after scanSessions numbered the rest, so number them here;
   // the registry hands a known session its old number and a new one the next.
-  if (added.length) sessionNumbers.assign(added, { root: deps.root || keep.ROOT });
+  if (added.length) {
+    sessionNumbers.assign(added, { root: deps.root || keep.ROOT });
+    // These rows never pass through a titling call, so their hand-typed name has
+    // to be stamped here or a renamed host-only session shows its pane title.
+    sessionNames.apply(added, { root: deps.root || keep.ROOT });
+  }
   return added;
 }
 
@@ -8548,7 +8559,7 @@ function start(deps = {}) {
     restartSession,
     restorePlan, resumeAfterLimit, review, reviewDeps, reviewQueue, reviewQueueSearch, runCheckNow,
     runTaskNow, runs, scanSessions, screenHistorySession, screenSession, sendSessionKeys,
-    sendStateJson, sendToResolvedTarget, sendToSession, sendToSessionLocked, sessionSummaryFile, sessionSummarySnapshot,
+    sendStateJson, sendToResolvedTarget, sendToSession, sendToSessionLocked, sessionNames, sessionSummaryFile, sessionSummarySnapshot,
     setAsideCandidates, slack, stallAliveIds, stalled, stalledSessionSnapshot, standup,
     startAutoCompact, startBriefScheduler, startWtGcScheduler, summarize, transcriptFileForSession,
     transferSession,

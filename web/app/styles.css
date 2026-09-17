@@ -163,6 +163,9 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .session-heading .meta a { min-width: 0; }
 .wpane .session-heading > b { display: block; }
 .wpane .session-heading { flex-basis: 0; }
+/* The inline rename editor stands in for the heading's title text. */
+.rename-session { display: block; }
+.rename-session input { width: 100%; box-sizing: border-box; font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--accent); border-radius: 4px; padding: 1px 6px; }
 .summary-updating { color: var(--faint); font-size: 11px; position: absolute; bottom: 5px; right: 16px; }
 .shead h2 { margin: 0; flex: 1 1 240px; min-width: 0; font-size: 15px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .shead .meta { color: var(--muted); font-size: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; } .shead .meta a { color: var(--info); text-decoration: none; }

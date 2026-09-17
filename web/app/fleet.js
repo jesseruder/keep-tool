@@ -2,6 +2,7 @@ import { sessionLabel } from './status.js';
 import { closeSession } from './close-session.js';
 import { shadowSummaryHTML } from './state-line.js';
 import { numBadgeHTML, numHaystack } from './session-number.js';
+import { RENAMED_HINT } from './session-rename.js';
 const FILTER_KEY = 'keep.console.fleet.filter';
 let filter = '';
 try { filter = sessionStorage.getItem(FILTER_KEY) || ''; } catch {}
@@ -18,7 +19,7 @@ export function fleetRowHTML(ctx, row, panes) {
   const account = row.accountLabel || configured?.label || row.accountId;
   const badge = numBadgeHTML(ctx.esc, row.num, row.id);
   const identity = badge || `<span class="mono faint">${ctx.esc(row.id)}</span>`;
-  return `<tr><td><span class="st"><i class="${ctx.esc(row.state)}"></i>${ctx.esc(row.stateLabel || row.state)}</span></td><td>${ctx.esc(row.title)}${row.reviewer ? '<span class="rv">reviewer</span>' : ''} ${identity}</td><td class="mono muted">${ctx.esc(row.branch)}</td><td class="mono info">${ctx.esc(row.taskId || '')}${ctx.tagsHTML(ctx.taskFor(row))}</td><td class="mono waiting-kind">${ctx.esc(row.waiting)}</td><td class="mono muted">${ctx.esc(ctx.rel(row.since))}</td><td class="mono ${row.kind === 'codex' ? 'kind-codex' : ''}">${ctx.esc(row.kind)}</td><td>${ctx.esc(account || '—')}</td><td><button class="btn" data-pin="${ctx.esc(row.pane || '')}" data-title="${ctx.esc(row.title)}" ${row.alive && !pinned ? '' : 'disabled'}>${pinned ? 'Pinned' : 'Pin'}</button>${reopen}${remove}</td></tr>`;
+  return `<tr><td><span class="st"><i class="${ctx.esc(row.state)}"></i>${ctx.esc(row.stateLabel || row.state)}</span></td><td${row.renamed ? ` title="${ctx.esc(RENAMED_HINT)}"` : ''}>${ctx.esc(row.title)}${row.reviewer ? '<span class="rv">reviewer</span>' : ''} ${identity}</td><td class="mono muted">${ctx.esc(row.branch)}</td><td class="mono info">${ctx.esc(row.taskId || '')}${ctx.tagsHTML(ctx.taskFor(row))}</td><td class="mono waiting-kind">${ctx.esc(row.waiting)}</td><td class="mono muted">${ctx.esc(ctx.rel(row.since))}</td><td class="mono ${row.kind === 'codex' ? 'kind-codex' : ''}">${ctx.esc(row.kind)}</td><td>${ctx.esc(account || '—')}</td><td><button class="btn" data-pin="${ctx.esc(row.pane || '')}" data-title="${ctx.esc(row.title)}" ${row.alive && !pinned ? '' : 'disabled'}>${pinned ? 'Pinned' : 'Pin'}</button>${reopen}${remove}</td></tr>`;
 }
 
 export function renderFleet(ctx) {
@@ -38,6 +39,7 @@ export function renderFleet(ctx) {
     const pane = session.pane ? panes.get(session.pane) : null;
     rows.push({
       id: session.id, num: session.num, pane: session.pane, project: session.project, title: session.title || 'untitled session',
+      renamed: Boolean(session.renamed),
       state: pane?.alive === false ? 'exited' : session.state || 'idle', stateLabel: pane?.alive === false ? 'Exited' : sessionLabel(session), kind: session.kind, reviewer: session.reviewer,
       taskId: session.taskId, branch: session.gitBranch || '', since: session.mtime, session: true,
       waiting: waitingBySession.get(session.id)?.kind || '', alive: Boolean(pane?.alive),

@@ -1,0 +1,107 @@
+'use strict';
+
+// Names Owner types by hand for a session. The AI title generator renames a
+// session whenever the effort moves, which is what most sessions want; a session
+// Owner has named is not one of them, so a name here both replaces the title
+// everywhere it shows and switches generation off for that session (the `renamed`
+// flag bin/titles.js reads). Clearing the name hands the session back to the
+// generator.
+//
+// The registry is one small JSON file written atomically. Unlike session numbers
+// there is no lock: only the rename route writes, and it rewrites the entry it
+// was given without touching any other.
+
+const fs = require('fs');
+const path = require('path');
+
+const MAX_TITLE = 120;
+
+function directory(root) { return path.join(root, '.keep'); }
+function registryFile(root) { return path.join(directory(root), 'session-names.json'); }
+
+function emptyRegistry() { return { version: 1, names: {} }; }
+
+// Owner's text, not a model's: strip what would corrupt a line of console UI
+// (control, bidi-override and zero-width characters), then collapse and cap.
+function sanitize(text) {
+  return String(text == null ? '' : text)
+    // Newlines and tabs become the space they read as; only then are the
+    // remaining invisible characters dropped, so words are not glued together.
+    .replace(/\s+/g, ' ')
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, MAX_TITLE)
+    .trim();
+}
+
+function read(options = {}) {
+  const root = options.root;
+  let value = null;
+  try { value = JSON.parse(fs.readFileSync(registryFile(root), 'utf8')); } catch { return emptyRegistry(); }
+  if (!value || typeof value !== 'object' || value.version !== 1) return emptyRegistry();
+  const source = value.names && typeof value.names === 'object' && !Array.isArray(value.names) ? value.names : {};
+  const names = {};
+  for (const [id, entry] of Object.entries(source)) {
+    const title = sanitize(entry && entry.title);
+    if (!title) continue;
+    names[id] = { title, at: Number.isFinite(entry.at) ? entry.at : 0 };
+  }
+  return { version: 1, names };
+}
+
+function write(value, options = {}) {
+  const file = registryFile(options.root);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const temp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`);
+  try {
+    fs.writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+    fs.renameSync(temp, file);
+  } catch (error) {
+    try { fs.unlinkSync(temp); } catch {}
+    throw error;
+  }
+}
+
+// An empty title deletes the entry: that is how Owner hands the session back to
+// automatic titling.
+function set(sessionId, title, options = {}) {
+  const id = String(sessionId == null ? '' : sessionId);
+  const clean = sanitize(title);
+  const registry = read(options);
+  if (clean) registry.names[id] = { title: clean, at: Date.now() };
+  else delete registry.names[id];
+  write(registry, options);
+  return { sessionId: id, title: clean || null };
+}
+
+function lookup(sessionId, options = {}) {
+  const id = String(sessionId == null ? '' : sessionId);
+  if (!id) return null;
+  return read(options).names[id]?.title || null;
+}
+
+// Stamps every named session with its name and the flag that stops generation,
+// and clears the flag on a session whose name was cleared — a row can arrive
+// from a cache that was filled while it still had one. Never throws: a scan that
+// cannot read the registry is still a usable scan.
+function apply(sessions, options = {}) {
+  const rows = Array.isArray(sessions) ? sessions : [];
+  if (!options.root || !rows.length) return rows;
+  try {
+    const { names } = read(options);
+    for (const session of rows) {
+      if (!session || typeof session !== 'object') continue;
+      const name = typeof session.id === 'string' ? names[session.id] : null;
+      if (name) {
+        session.title = name.title;
+        session.renamed = true;
+      } else if (session.renamed) {
+        delete session.renamed;
+      }
+    }
+  } catch {}
+  return rows;
+}
+
+module.exports = { apply, lookup, read, set, write, sanitize, registryFile, MAX_TITLE };

@@ -176,3 +176,23 @@ test('invalidated title cache repairs from the actual card and project even afte
   assert.match(input, /Linked Keep card: Build Redis-pull/);
   assert.doesNotMatch(input, /Latest request: ok/);
 });
+
+test('a hand-named session keeps its name: no cache read, no generation, no baseTitle churn', () => {
+  const session = {
+    id: 'named', kind: 'claude', title: 'The finder', renamed: true,
+    baseTitle: 'Transcript title', lastHuman: 'Fix the retry path that double-sends',
+  };
+  const deps = {
+    getSummary: () => assert.fail('a renamed session must not generate a title'),
+    peekSummary: () => assert.fail('a renamed session must not even read the title cache'),
+  };
+  assert.equal(liveTitle(session, deps), null);
+  applyLiveTitles([session], deps);
+  assert.equal(session.title, 'The finder');
+  assert.equal(session.baseTitle, 'Transcript title', 'the transcript title survives for when the name is cleared');
+
+  // Clearing the name (no `renamed` flag on the next scan) hands the session back.
+  const cleared = { id: 'named', kind: 'claude', title: 'Transcript title', lastHuman: 'Fix the retry path that double-sends' };
+  applyLiveTitles([cleared], { peekSummary: () => null, getSummary: () => ({ text: 'Retry path' }) });
+  assert.equal(cleared.title, 'Retry path');
+});

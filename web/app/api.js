@@ -3,9 +3,9 @@ const STATE_MUTATIONS = new Set([
   '/api/abandon-account-handoff', '/api/ack', '/api/add', '/api/answer', '/api/checkin',
   '/api/close-idle', '/api/close-session', '/api/compact', '/api/decisions/judge',
   '/api/handoff-session', '/api/notifications', '/api/open', '/api/panes/spawn',
-  '/api/portable-transfers', '/api/reminders', '/api/reopen-session', '/api/resolve-portable-transfer',
-  '/api/restart-daemon', '/api/restart-session', '/api/review-queue', '/api/reviewtick',
-  '/api/run', '/api/send', '/api/setaside', '/api/transfer-session',
+  '/api/portable-transfers', '/api/reminders', '/api/rename-session', '/api/reopen-session',
+  '/api/resolve-portable-transfer', '/api/restart-daemon', '/api/restart-session', '/api/review-queue',
+  '/api/reviewtick', '/api/run', '/api/send', '/api/setaside', '/api/transfer-session',
 ]);
 let stateAfterMutation = '';
 let observedMutationFence = '';
@@ -181,6 +181,8 @@ export const answer = (sessionId, option, label) => write('/api/answer', { sessi
 export const setAside = (key, kind, minutes) => write('/api/setaside', {
   key, kind, ...(minutes === undefined ? {} : { minutes }),
 });
+// An empty title clears the hand-typed name and restores automatic titling.
+export const renameSession = (sessionId, title) => write('/api/rename-session', { sessionId, title });
 export const spawnPane = (cwd, name) => write('/api/panes/spawn', { cwd, name });
 export const killPane = (pane) => write(`/api/panes/${encodeURIComponent(pane)}/kill`);
 export const removePane = (pane) => write(`/api/panes/${encodeURIComponent(pane)}/remove`);
