@@ -2211,9 +2211,40 @@ commands.slack = async (argv) => {
 // Incident cards come from the Slack poll, not from here: this reads what the
 // parser has already recorded, and re-parses one message when a shape needs
 // debugging.
-commands.incidents = (argv) => {
+commands.incidents = async (argv, cliDeps = {}) => {
   const incidents = require('./incidents.js');
   const [subcommand, ...rest] = argv;
+  // One area-session tick by hand: what the daemon does after every Slack poll,
+  // for one area, with its decisions printed. `--dry` performs nothing at all —
+  // no worktree, no record, no recipe, no session opened and nothing typed — so
+  // it is safe against the live registry and is how the switch gets checked
+  // before it is flipped.
+  if (subcommand === 'session') {
+    const o = parseArgs(rest, { dry: 'bool', json: 'bool' });
+    if (o._.length !== 1) die('usage: keep incidents session <area> [--dry] [--json]');
+    const areaSession = require('./area-session.js');
+    // A real tick opens panes and types into terminals, so it needs the daemon's
+    // own seams. Each one requires serve.js on first use rather than up front:
+    // `--dry`, and an area whose session is off, must stay a cheap read.
+    const serve = () => require('./serve.js');
+    const deps = cliDeps.deps || (o.dry ? {} : {
+      openSession: (body, openDeps) => serve().openSession(body, openDeps),
+      listPanes: () => serve().listHostPanes({}, true),
+      scanSessions: () => serve().scanSessions(),
+      resolveSessionTarget: (session, hint) => serve().resolveSessionTarget(session, hint),
+      sendToResolvedTarget: (session, target, text, opts) => serve().sendToResolvedTarget(session, target, text, opts),
+      withInjectionLock: (fn, scope) => serve().withInjectionLock(fn, scope),
+      closeIdleSession: (body, closeDeps) => serve().closeIdleSession(body, closeDeps),
+    });
+    // `force` only with `--dry`: a dry run is how the switch gets inspected
+    // before it is flipped, but actually opening a session for an area whose
+    // `session` is false would flip it from the command line.
+    const result = await areaSession.tick({ root: ROOT, area: o._[0], dry: Boolean(o.dry), force: Boolean(o.dry) }, deps);
+    if (o.json) { console.log(JSON.stringify(result, null, 2)); return; }
+    if (result.error) die(result.error);
+    for (const report of result.areas) for (const line of areaSession.describe(report)) console.log(line);
+    return;
+  }
   // Closing one by hand. The quiet sweep needs a `resolvedAt` to start its clock,
   // so an incident whose `resolved` message can never match — a merged signature
   // from the first live polls, before Grafana blocks were split by their `Labels:`
@@ -2256,7 +2287,7 @@ commands.incidents = (argv) => {
     return;
   }
   const o = parseArgs(argv, { json: 'bool' });
-  if (o._.length) die('usage: keep incidents [--json] | keep incidents parse <file|-> | keep incidents close <card-id|signature> -m "why"');
+  if (o._.length) die('usage: keep incidents [--json] | keep incidents parse <file|-> | keep incidents close <card-id|signature> -m "why" | keep incidents session <area> [--dry]');
   const open = incidents.openIncidents(ROOT);
   // A write the last poll could not land is retried behind the channel cursor,
   // which means nothing newer is fetched until it succeeds. It is reported here
@@ -2875,6 +2906,9 @@ ${stepUsage()}
   keep incidents close <card-id|signature> -m "why"
                          # close an incident that will never resolve itself (a merged
                          # signature, diagnosed noise): same locked close as the sweep
+  keep incidents session <area> [--dry] [--json]
+                         # one area-session tick by hand: launch, deliver, restart-from-log
+                         # --dry performs nothing and reports what it would do
   keep agents [--json]   # agent records: lifecycle, current session, unseen events
   keep agents events <name> [--unseen] [--limit N] [--json]
   keep agents emit <name> --kind <k> [--card <id>] [--severity low|med|high] [--needs-you] -m "text"

@@ -42,8 +42,9 @@ function startSchedulers(ctx) {
     deps, discord, driftWakeFromVerdict, envNumber, features, forceRestartSession, fs, health, hostRequest,
     ideas, keep, keepConsole, landed, limitresume, listHostPanes, liveSessionTick,
     liveTurnIndexSessions, loadCurrentSession, openCheckSession, openSession, path,
-    prepareSessionSummary, readLiveSessionLedger, readScreenResult, restartSession, resumeAfterLimit,
-    review, reviewDeps, runs, scanSessions, sendToSession, sessionSummarySnapshot, slack,
+    prepareSessionSummary, readLiveSessionLedger, readScreenResult, resolveSessionTarget, restartSession,
+    resumeAfterLimit,
+    review, reviewDeps, runs, scanSessions, sendToResolvedTarget, sendToSession, sessionSummarySnapshot, slack,
     stallAliveIds, stalled, stalledSessionSnapshot, standup, startAutoCompact, startBriefScheduler,
     startWtGcScheduler, summarize, unblock, usage, watcherSend, withInjectionLock, writeTarget,
   } = ctx;
@@ -238,14 +239,45 @@ function startSchedulers(ctx) {
   // Incidents ride on the Slack poll's clock: every alert that could close one
   // arrived through it, so a sweep after each poll is both timely and free. It
   // is deliberately not its own timer, and it never throws into the tick.
+  //
+  // The area-session tick hangs off the same hook, after the sweep and after the
+  // emitter has written the poll's events, because launch/deliver/restart all
+  // react to exactly what those two just produced. `afterPoll` is called
+  // synchronously and not awaited, so the tick is started and left to run: it
+  // opens panes and types into terminals, and a poll must never wait on that.
+  // Everything bin/area-session.js needs from the daemon, so it requires nothing
+  // of serve.js itself. Cheap to rebuild per tick and always the live bindings.
+  const areaSessionDeps = () => ({
+    openSession: (body, openDeps) => openSession(body, openDeps),
+    // `true` bypasses the host-list cache: a launch decision made from a stale
+    // list is how a second session gets opened, and a close decision made from
+    // one would signal a pane that has come back to life.
+    listPanes: () => listHostPanes(deps, true),
+    scanSessions: () => scanSessions(),
+    loadCurrentSession: (id) => loadCurrentSession(id),
+    resolveSessionTarget: (session, hint) => resolveSessionTarget(session, hint),
+    sendToResolvedTarget: (session, target, text, opts) => sendToResolvedTarget(session, target, text, opts),
+    withInjectionLock: (fn, scope) => withInjectionLock(fn, scope),
+    // Graceful only, and nothing behind it: nobody asked for this close, so a
+    // refusal is the answer rather than the first step of an escalation.
+    closeIdleSession: (body, closeDeps) => closeIdleSession(body, closeDeps),
+    onChange: broadcast,
+  });
+  const areaSessionTick = (options = {}) => require('../area-session.js').tickQuietly(options, areaSessionDeps());
   startFeatureSchedulers(features, { slack, discord }, {
     onChange: broadcast,
-    afterPoll: () => require('../incidents.js').sweepQuietly({}, {
-      // The quiet close is a lifecycle change like any other, so it reaches the
-      // area agent's feed the way the poll's own events do.
-      emitAgentEvent: require('../agents.js').incidentEmitter({ root: keep.ROOT }),
-    }),
+    afterPoll: () => {
+      require('../incidents.js').sweepQuietly({}, {
+        // The quiet close is a lifecycle change like any other, so it reaches the
+        // area agent's feed the way the poll's own events do.
+        emitAgentEvent: require('../agents.js').incidentEmitter({ root: keep.ROOT }),
+      });
+      void areaSessionTick();
+    },
   }, health);
+  // Once at daemon start too: a restart must not leave an area without its
+  // responder until the next poll comes round.
+  setTimeout(() => { void areaSessionTick(); }, 20e3).unref();
   const configuredLiveTickMs = Number(process.env.KEEP_LIVE_TICK_MS);
   const liveTickMs = Number.isFinite(configuredLiveTickMs) && configuredLiveTickMs > 0
     ? configuredLiveTickMs
