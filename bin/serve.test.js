@@ -2188,6 +2188,50 @@ test('handoff model resolution looks past a synthetic-only tail and then at laun
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+// The same two sessions, opened by `keep runs`, which passes no `--model`: one synthetic
+// record, no `/model` row, no pane meta, no argv model. The model is still knowable — the
+// launch took it from the launching account's settings.json, and reading the transcript
+// back to byte zero without finding a switch proves the session never moved off it.
+test('handoff model resolution falls back to the source account settings, and only there', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-handoff-model-settings-'));
+  try {
+    const session = { id: 'cba96b8d', kind: 'claude' };
+    const syntheticOnly = rateLimitedTranscript(dir, 'synthetic.jsonl', null);
+    const configDir = path.join(dir, 'account-config');
+    fs.mkdirSync(configDir, { recursive: true });
+    const forSession = (id, agent) => {
+      assert.equal(id, 'cba96b8d');
+      assert.equal(agent, 'claude');
+      return { id: 'claude/work', agent: 'claude', configDir };
+    };
+    const at = (extra) => ({ findSessionFile: () => syntheticOnly, forSession, ...extra });
+
+    // The real reader, against a real settings.json in the source account's config dir.
+    fs.writeFileSync(path.join(configDir, 'settings.json'),
+      JSON.stringify({ model: 'claude-fable-5-1[1m]', env: {} }));
+    assert.equal(handoffCurrentModel(session, null, '', at()), 'claude-fable-5-1[1m]',
+      'a session launched with no --model is running the launching account settings model');
+    assert.equal(handoffCurrentModel(session, null, '',
+      at({ readAccountSettings: () => 'not a model' })), '<unknown>',
+    'a settings value `claude --model` would not take is no better than nothing');
+    assert.equal(handoffCurrentModel(session, null, '',
+      at({ readAccountSettings: () => '' })), '<unknown>',
+    'settings.json with no model leaves the handoff refusing');
+    assert.equal(handoffCurrentModel(session, null, '', {
+      findSessionFile: () => syntheticOnly,
+      forSession: () => { throw new Error('two accounts, no authority'); },
+      readAccountSettings: () => 'claude-fable-5-1[1m]',
+    }), '<unknown>', 'an unresolvable source account is not permission to guess');
+    // A scan that stopped at its bound never proved there was no `/model` behind it, so
+    // the settings say nothing about what the session is running now.
+    assert.equal(handoffCurrentModel(session, null, '',
+      at({ scanChunkBytes: 24, scanMaxBytes: 48 })), '<unknown>',
+    'settings never rescue a scan that gave up before byte zero');
+    assert.equal(handoffCurrentModel(session, { meta: { model: 'claude-opus-5[1m]' } }, '', at()),
+      'claude-opus-5[1m]', 'launch metadata is the more specific evidence and still wins');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('handoff model resolution stops at a malformed genuine model and rejoins split records', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-handoff-model-scan-'));
   try {

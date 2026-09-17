@@ -1359,7 +1359,12 @@ function lastClaudeHandoffModelInFile(file, deps = {}) {
   // No switch anywhere in what was read. Reaching byte zero proves there is none, so the
   // launch metadata may fill in the window; stopping at the bound proves nothing.
   if (assistant != null) return { model: assistant, source: 'assistant', window: reachedStart ? 'launch' : 'unknown' };
-  return { model: reachedStart ? '' : '<unknown>', source: '', window: 'unknown' };
+  // Window 'launch' on the empty result is the same promise as above: the whole file was
+  // read and it holds no switch, so whatever the session was launched with is still what
+  // it is running. Stopping at the bound keeps the '<unknown>' sentinel instead.
+  return reachedStart
+    ? { model: '', source: '', window: 'launch' }
+    : { model: '<unknown>', source: '', window: 'unknown' };
 }
 
 function switchResult(event) {
@@ -1388,12 +1393,44 @@ function launchModelId(value) {
 
 const HANDOFF_ARGV_MODEL_RE = /(?:^|\s)--model(?:=|\s+)["']?([A-Za-z0-9][A-Za-z0-9._:[\]/-]*)["']?(?=\s|$)/;
 
+// The `model` in one account's settings.json, or '' if that file cannot be read as a JSON
+// object. Never the daemon's own ~/.claude/settings.json (readClaudeSettingsModel): the
+// account that launched a session is usually not the account this process runs under.
+function readAccountSettingsModel(file) {
+  try {
+    const settings = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return '';
+    return typeof settings.model === 'string' ? settings.model : '';
+  } catch { return ''; }
+}
+
+// The model a session launched with no `--model` inherited: `claude` reads it out of the
+// launching account's settings.json at startup. That file is trustworthy here and only
+// here — the caller has already proved, by reading the transcript back to byte zero
+// without finding a `/model`, that nothing in the session ever moved off it. The target
+// account's settings.json is a different file with its own value, which is precisely the
+// silent model change this whole function exists to prevent, so the source account is
+// resolved the way bin/account-handoff.js resolves it and no other account is consulted.
+// Anything unresolvable — no account, no readable file, a value `claude --model` would
+// not take — is '' and leaves the handoff refusing.
+function sourceAccountSettingsModel(session, deps = {}) {
+  try {
+    const account = (deps.forSession || accounts.forSession)(session.id, 'claude', {
+      root: deps.root || keep.ROOT, env: deps.env || process.env,
+    });
+    if (!account || typeof account.configDir !== 'string' || !account.configDir) return '';
+    const read = deps.readAccountSettings || readAccountSettingsModel;
+    return launchModelId(read(path.join(account.configDir, 'settings.json')));
+  } catch { return ''; }
+}
+
 // The model the account handoff has to relaunch with. Every answer is either a model id
 // or '<unknown>': the handoff refuses on the sentinel, and resuming with no `--model` at
 // all would silently hand the session to the target account's default, so "we could not
 // tell" must never look like "no model was configured". A transcript we could not finish
 // reading, a genuine record whose model is malformed, and a transcript that names nothing
-// with no launch metadata behind it all fail closed.
+// with neither launch metadata nor readable source-account settings behind it all fail
+// closed.
 function handoffCurrentModel(session, pane, processArgs, deps = {}) {
   let found;
   try {
@@ -1413,7 +1450,11 @@ function handoffCurrentModel(session, pane, processArgs, deps = {}) {
     || launchModelId(HANDOFF_ARGV_MODEL_RE.exec(String(processArgs || ''))?.[1]);
   const { model, source, window } = found;
   if (model === '<unknown>') return model;
-  if (!model) return launch || '<unknown>';
+  // Nothing in the whole transcript names a model. Launch metadata first, and then — only
+  // when the scan actually reached byte zero, so there is no switch it could have missed —
+  // the settings the launch itself would have read. A session opened by `keep runs` passes
+  // no `--model` and records none, and that is not the same as having no model.
+  if (!model) return launch || (window === 'launch' ? sourceAccountSettingsModel(session, deps) : '') || '<unknown>';
   // A confirmed `/model` is someone naming the model and its window by hand. It is taken
   // exactly as typed, whichever side of the newest assistant record it fell on.
   if (source === 'switch') return model;
