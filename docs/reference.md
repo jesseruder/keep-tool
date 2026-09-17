@@ -1089,14 +1089,28 @@ next.
   of text — never message bodies: the home model pays for every byte it reads. Event
   text is untrusted data exactly as Slack text is; it is displayed and clipped, never
   followed, and every string field is scrubbed of control characters, escape sequences,
-  format characters and the fence markers (`bin/notes.js` `scrub`) *before* it is
+  bidi overrides, other invisible format characters and the fence markers *before* it is
   capped — capping first can leave the tail of an escape sequence behind as text. That
   is not cosmetic: since area sessions exist, an event is typed into a real terminal,
-  where a CSI sequence in an alert title is interpreted rather than displayed.
+  where a CSI sequence in an alert title is interpreted rather than displayed, and a
+  whole `ESC [ … ` sequence is removed rather than neutralized byte by byte, because
+  `[2J` left behind reads as something somebody typed.
+
+  The scrubber is `bin/notes.js` `scrubControls` / `scrubControlsOneLine`, not the
+  `scrub` a state note goes through: that one also normalizes whitespace, which is
+  right for prose Keep rewrites once and wrong here. An area session renders its
+  events as columns made of runs of spaces, and `a  b` in an alert is what its author
+  wrote. Newlines survive `scrubControls` because a fenced block's line breaks are its
+  structure; a CR becomes one, so nothing can overwrite a line a reader has seen.
 
   `seq` is a per-agent counter, assigned inside the same lock hold that appends the
   event (`record.json` keeps `nextSeq`), and it is what gives the feed a total order.
-  A timestamp cannot be that order: two events written in the same millisecond tie, and
+  The seq is allocated from the FEED, not from that counter: the append lands first and
+  the record write can fail after it, so `nextSeq` can sit behind the feed. Each emit
+  reads the seq off the feed's last line and uses `max(that, nextSeq - 1) + 1`, so no
+  number is ever handed out twice — which matters, because a cursor sitting on a
+  duplicated seq would skip the second event for good. A timestamp cannot be that order
+  either: two events written in the same millisecond tie, and
   an incident event is stamped with the Slack time its message was *posted* at, so a
   backfilled firing lands on the feed after — but dated before — a close somebody ran
   by hand a minute ago. A cursor made of timestamps drops both. `agents.readAfterSeq
@@ -1105,10 +1119,9 @@ next.
   after an event a forward-only cursor has not passed yet, and that event would then
   never be delivered at all. Feeds written before `seq` existed read as `seq: 0`, which
   is behind every cursor: they are still Owner's badge state, they are simply never
-  delivered, because there was no session to deliver them to. If the record write after
-  an append fails, `nextSeq` does not advance and the next event reuses the number; two
-  events sharing a seq are delivered together and exactly once, which is the right
-  outcome, and repairing the counter would mean writing the record that just failed.
+  delivered, because there was no session to deliver them to. A stale `nextSeq` costs
+  nothing but a wasted comparison: a reader that has caught up with the counter checks
+  the feed itself rather than declaring it empty.
 
   **Seen-ness and delivered-ness are independent.** `seenAt` is Owner's badge state,
   set by `markSeen` when a row is expanded. `lastDeliveredSeq` is the session's, set only
@@ -1238,11 +1251,22 @@ around, and three separate things hold it up.
 write on every quiet poll — the tick claims `record.launchLease = {at, by, requestId}`
 under the registry lock, and then reads the pane list **again** while holding it, so the
 reading the launch acts on was made under the lease. A fresh lease (`LAUNCH_LEASE_MS`, 5
-minutes) held by anybody else means skip the area entirely this tick. The lease's
-`requestId` is `area-<agent>-<attempt>` — derived from the attempt number rather than a
-clock, so two ticks trying the same attempt produce the same id and `openSession`'s own
-dedupe joins them even in the window where a lease expired under a launch still in
-flight. It is released whatever the tick decided.
+minutes) held by anybody else means skip the area entirely this tick. It is released
+whatever the tick decided.
+
+Building a worktree is `wt rm` plus `wt new` out of process — a checkout and a
+dependency install, minutes — so the lease is renewed under the registry lock after that
+work and checked once more as the last thing before a pane is spawned. A tick that has
+lost its claim by then abandons the launch and reports it, and that is **not** a failed
+attempt: nothing was spawned, so it burns neither an attempt nor the backoff clock.
+
+The lease's `requestId` is `openSession`'s dedupe key, and it must name one launch for
+all time. `record.generation` — durable, incremented on every claim, never reset — is
+what gives it that: `area-<agent>-g<generation>`. Deriving it from `launch.attempts`
+did not, because that counter resets on a live observation and on an idle close, so the
+generation after a restart asked for `area-<agent>-1` again and `openSession`, seeing an
+id it knew, would hand back the retained record of the pane that had already exited
+instead of opening a session.
 
 *What counts as evidence.* A pane listing that failed, threw, or came back as anything
 other than a list is `unknown`: it stops the whole tick, whatever the record says,
@@ -1271,31 +1295,67 @@ scheduled check delivery uses (`resolveSessionTarget` +
 deliveryKey}))`), so target resolution, the compaction-if-cold policy, the injection
 mutex and the delivery receipt all apply.
 
-The batch is bounded by the size of its own encoded body (`DELIVERY_BODY_MAX`, 6000
-characters), not by a count: events are added in seq order until the next one would not
-fit and the rest wait for the next tick. A batch is never clipped, because a clipped
-batch would acknowledge an event the session was shown half of.
+One tick owns the sending. `record.deliveryLease = {at, by}` is claimed under the
+registry lock before anything is read or written, and released in a `finally`; a fresh
+one held by anybody else defers the tick. Without it the receipt lookup and the
+pending-batch write both sat outside any mutual exclusion, so two overlapping ticks — a
+slow poll and the next one, `keep incidents session` racing the daemon — could each read
+"no receipt", each persist their own batch over the other's, and each type. The
+injection mutex serialises typing; it does not stop the second message existing. And
+because everything up to that mutex was decided outside it, the record is read **again**
+inside it: a cursor that moved past this batch, or a pending batch that changed, aborts
+the send.
+
+The batch is bounded by the size of its own **rendered message** (`DELIVERY_BODY_MAX`,
+6000 characters), not by a count and not by the raw lines: `dataFence` prefixes every
+line, adds its wrapper and rewrites each `KEEP_INPUT` to `KEEP_INPUT_DATA`, so text that
+fitted as lines could arrive over the limit. Events are added in seq order while the
+rendered message still fits and the rest wait for the next tick. A batch is never
+clipped, because a clipped batch would acknowledge an event the session was shown half
+of — the fence is handed an unreachable limit, and the batch builder is what guarantees
+the fit.
 
 The batch is **persisted before a character is typed** — `record.pendingDelivery = {key,
-firstSeq, lastSeq, at}` — and a tick that finds one retries *that* batch, rebuilt from
-the feed by its seq range, rather than recomputing one. That is what makes the receipt
-worth consulting: `deliveryKey` is `agent:<name>:seq:<firstSeq>-<lastSeq>`, so the retry
-asks about the same receipt the previous send wrote. A receipt that says `received`
-advances the cursor and types nothing. An unconfirmed one does **not** stop the tick: the
-send is attempted again with byte-identical text, because `delivery.deliver` inside
+firstSeq, lastSeq, offset, count, text, at}` — and a tick that finds one retries *that*
+batch. It carries the **rendered text**, not just the seq range: the receipt is keyed on
+the text, and a batch rebuilt from the feed loses the "N more events are queued"
+sentence, whose count is gone by the next tick. Same range, different message, receipt
+nobody can find, message typed twice.
+
+`deliveryKey` is `agent:<name>:seq:<firstSeq>-<lastSeq>`, so the retry asks about the
+same receipt the previous send wrote. A receipt that says `received` advances the cursor
+and types nothing. A receipt that cannot be *read* — malformed, a permission error —
+defers the tick with one line on stderr rather than counting as absent, because treating
+it as absent types the message again. An unconfirmed receipt does **not** stop the tick:
+the send is attempted again with byte-identical text, because `delivery.deliver` inside
 `sendToResolvedTarget` finds its own journal entry and submits the draft still in the box
 rather than retyping — returning early there is what wedged the reviewer for 133
 consecutive ticks in September, and stable text is the whole reason the batch is
 persisted.
 
+Only a transcript-confirmed send counts as delivered. `delivery.deliver` also reports
+`assumed-delivered`: its journal expired with the text known to have reached the pane
+and no receipt ever appeared. That is a guess, so the batch stays pending and is offered
+again — and it is flagged `assumed`, because the helper files a *received* receipt as
+part of assuming, and reading that back next tick would acknowledge a batch nobody
+confirmed. A flagged batch skips the receipt lookup entirely.
+
 The cursor advances, and `pendingDelivery` clears, only on a confirmed send. A mid-turn
 session (`endedTurn !== true`), a session showing a question, plan or permission prompt,
-a send that throws, and a send that reports only part of the message accepted all leave
-both alone and offer the same batch next tick. A cursor write that fails after a
-confirmed send is reported and left to that same mechanism: the next tick asks about the
-key, the receipt says received, and the cursor moves then without a second message. A
-session launched this tick is delivered nothing — it has the bootstrap to read. No
-delivery ever opens a second session.
+a send that throws, a send that reports only part of the message accepted, and an
+assumed delivery all leave both alone and offer the same batch next tick. A cursor write
+that fails after a confirmed send is reported and left to that same mechanism: the next
+tick asks about the key, the receipt says received, and the cursor moves then without a
+second message. A session launched this tick is delivered nothing — it has the bootstrap
+to read. No delivery ever opens a second session.
+
+`record.lastDeliveredOffset` rides along with the cursor: the byte just past the last
+delivered line, so the next forward scan starts there instead of re-parsing a feed
+months long. `agents.readAfterSeq` trusts it only when it really is a line boundary —
+the byte before it is a newline and it is inside the file — and falls back to a full
+scan otherwise, which is what keeps a `markSeen` (it rewrites the whole feed and moves
+every offset) or a truncation from silently skipping events. A bad offset costs work,
+never an event.
 
 **Restart from the log.** When **none of the agent's areas** has an open incident, the
 session is live and idle (not mid-turn, not waiting on Owner) with nothing undelivered
@@ -1321,10 +1381,12 @@ question, a viewer who attached, recent pane input or output) is final for that 
 the session keeps running.
 
 **Daemon hygiene.** A tick that changed nothing writes nothing: no `lastTick`, no lease,
-no commit, and not even a read of the feed — the record's `nextSeq` says whether there is
-anything after the cursor, so the quiet case (a live session, an empty feed, nothing due,
-which is most polls) touches the disk not at all. `flushCommits` is asked for exactly
-once per tick that did change something.
+no commit. It does read the feed — one event's worth, starting at the saved offset, so on
+a quiet tick that is a stat and an empty read at the end of the file. `nextSeq` would
+have been cheaper still and is deliberately not trusted for it: it is a cache of the
+feed's end, and an emit whose record write failed leaves it behind, so believing it would
+declare a feed with an undelivered event in it empty. `flushCommits` is asked for exactly
+once per tick that did change something, and never otherwise.
 
 ### Configuration
 
@@ -1361,8 +1423,11 @@ that recipe.
 
 `keep incidents session <area> [--dry] [--json]` runs one tick for one area by hand and
 prints what it launched, delivered and restarted. `--dry` performs nothing at all — no
-lease, no worktree, no record, no recipe, no session opened, nothing typed and no cursor
-moved — and reports what it *would* have done, which is how the switch gets checked
+lease, no worktree, no record, no recipe, no session opened, nothing typed, no cursor
+moved and no receipt consulted (`statusForText` is not a read: when it finds a confirmed
+retained entry it files the receipt and unlinks the journal, so a dry run reports the key
+it *would* have checked instead) — and reports what it would have done, which is how the
+switch gets checked
 before it is flipped; it is also the only form that runs for an area whose `session` is
 `false`, since actually opening a session for a disabled area would be flipping that
 switch from the command line. Both forms get the same seams out of `serve.js` (loaded on
