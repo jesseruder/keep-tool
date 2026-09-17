@@ -2289,13 +2289,28 @@ test('keep rename writes the registry itself when keep serve is down', async () 
     await renameCommandCli(['Named without the daemon'], {
       root,
       currentSession: () => ({ id: 'sess-a', agent: 'claude' }),
-      postKeepApi: async () => { throw new Error('connect ECONNREFUSED'); },
+      postKeepApi: async () => { throw Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }); },
       stdout: (line) => stdout.push(line),
     });
     assert.equal(sessionNames.lookup('sess-a', { root }), 'Named without the daemon');
     assert.equal(sessionNames.read({ root }).names['sess-a'].title, 'Named without the daemon');
     assert.equal(stdout[0], 'renamed #4 (sess-a): "Named without the daemon"');
     assert.match(stdout[1], /keep serve isn't running; written to the registry/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('keep rename does not write the registry itself when the daemon may have taken the request', async () => {
+  const { renameCommandCli } = require('./keep.js');
+  const sessionNames = require('./session-names.js');
+  const root = renameRoot({ 'sess-a': 4 });
+  try {
+    await assert.rejects(renameCommandCli(['Timed out'], {
+      root,
+      currentSession: () => ({ id: 'sess-a', agent: 'claude' }),
+      postKeepApi: async () => { throw new Error('timed out'); },
+    }), /keep serve did not answer \(timed out\)/);
+    assert.equal(sessionNames.lookup('sess-a', { root }), null);
+    assert.equal(fs.existsSync(sessionNames.registryFile(root)), false);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

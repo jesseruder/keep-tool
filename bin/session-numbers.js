@@ -75,7 +75,7 @@ function sleepSync(ms) {
 // knows and leaves allocation to the next scan rather than racing.
 function withLock(options, run) {
   const root = options.root;
-  const file = lockFile(root);
+  const file = options.lockFile || lockFile(root);
   const retries = Number.isInteger(options.lockRetries) ? options.lockRetries : LOCK_RETRIES;
   const waitMs = Number.isInteger(options.lockWaitMs) ? options.lockWaitMs : LOCK_WAIT_MS;
   const staleMs = Number.isInteger(options.lockStaleMs) ? options.lockStaleMs : LOCK_STALE_MS;
@@ -189,4 +189,4 @@ function lookup(idOrNumber, options = {}) {
   return num ? { id, num } : null;
 }
 
-module.exports = { assign, lookup, read, write, parseNumber, label, registryFile, lockFile, MAX_NUMBER };
+module.exports = { assign, lookup, read, write, withLock, parseNumber, label, registryFile, lockFile, MAX_NUMBER };

@@ -499,7 +499,13 @@ commands.rename = async (argv, deps = {}) => {
   let response = null;
   let unreachable = null;
   try { response = await (deps.postKeepApi || postKeepApi)('/api/rename-session', { sessionId, title }, 10000); }
-  catch (error) { unreachable = error; }
+  catch (error) {
+    // Only a refused connection means nobody owns the registry. A timeout or a
+    // reset may have reached a daemon that then wrote the file; writing it again
+    // here would race that write.
+    if (error && error.code === 'ECONNREFUSED') unreachable = error;
+    else die(`keep serve did not answer (${error && error.message || error}); try again`);
+  }
   if (unreachable) {
     try { sessionNames.set(sessionId, title, { root }); }
     catch (error) { die('cannot write the session-name registry: ' + error.message); }

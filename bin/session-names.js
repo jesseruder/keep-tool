@@ -7,17 +7,21 @@
 // flag bin/titles.js reads). Clearing the name hands the session back to the
 // generator.
 //
-// The registry is one small JSON file written atomically. Unlike session numbers
-// there is no lock: only the rename route writes, and it rewrites the entry it
-// was given without touching any other.
+// The registry is one small JSON file written atomically under a lock, because
+// two writers exist: the daemon's rename route, and `keep rename` writing the
+// file itself while the daemon is down. Each set is a read-modify-write of the
+// whole file, so without the lock one writer could drop the other's entry.
 
 const fs = require('fs');
 const path = require('path');
+const sessionNumbers = require('./session-numbers.js');
 
 const MAX_TITLE = 120;
+const LOCK_RETRIES = 20;
 
 function directory(root) { return path.join(root, '.keep'); }
 function registryFile(root) { return path.join(directory(root), 'session-names.json'); }
+function lockFile(root) { return path.join(directory(root), 'session-names.lock'); }
 
 // Session ids are route input, so the map has no prototype: `constructor` or
 // `__proto__` must be an absent key, not an inherited value.
@@ -71,10 +75,14 @@ function write(value, options = {}) {
 function set(sessionId, title, options = {}) {
   const id = String(sessionId == null ? '' : sessionId);
   const clean = sanitize(title);
-  const registry = read(options);
-  if (clean) registry.names[id] = { title: clean, at: Date.now() };
-  else delete registry.names[id];
-  write(registry, options);
+  const lockOptions = { root: options.root, lockFile: lockFile(options.root), lockRetries: LOCK_RETRIES, ...options };
+  const locked = sessionNumbers.withLock(lockOptions, () => {
+    const registry = read(options);
+    if (clean) registry.names[id] = { title: clean, at: Date.now() };
+    else delete registry.names[id];
+    write(registry, options);
+  });
+  if (!locked) throw new Error('the session-name registry is busy; try again');
   return { sessionId: id, title: clean || null };
 }
 
@@ -112,4 +120,4 @@ function apply(sessions, options = {}) {
   return rows;
 }
 
-module.exports = { apply, lookup, read, set, write, sanitize, registryFile, MAX_TITLE };
+module.exports = { apply, lookup, read, set, write, sanitize, registryFile, lockFile, MAX_TITLE };
