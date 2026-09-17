@@ -813,9 +813,8 @@ test('an agent whose session needs input says so on its row, without touching it
     assert.equal(asking.card, 'inc-one');
     assert.equal(agents.readRecord('sandboxes', root).lifecycle, 'working');
 
-    // A restart replaces the pane and the record catches up later, so the pane the
-    // record names answers first — by `runtime.paneId` too, before `session.pane`
-    // is attached to the response rows.
+    // The record's pane is a tie-breaker, and it answers by `runtime.paneId` too:
+    // that is where the pane id lives before it is attached to the response rows.
     assert.equal(row([{ id: 'other', runtime: { paneId: 'agent-pane' }, state: 'needs-input' }]).needsInput, true);
     // An exited session, and no session at all, say nothing.
     assert.equal(row([{ id: 'agent-sid', pane: 'agent-pane', state: 'needs-input', exited: true }]).needsInput, undefined);
@@ -824,12 +823,11 @@ test('an agent whose session needs input says so on its row, without touching it
   } finally { cleanup(root); }
 });
 
-// The stamp and the row have to name the same session. applySessions() lets a pane's
-// own meta.agentName override a record that has not caught up — a launch whose
-// response was lost, a restart or a handoff onto a new pane — and attention() then
-// suppresses that session's question because of the stamp. A row that still looked
-// only at the record's old pane and id would report nothing, and the prompt would be
-// absent from every list in the console.
+// The row and the attention exclusion have to be the same set by construction, not
+// by two functions agreeing about identity. applySessions() is the one place pane
+// meta is read; it stamps `agentName`, attention() suppresses on the strength of
+// that stamp, and the row picks among exactly the stamped sessions. When the two
+// disagreed, a genuine question was absent from every list in the console.
 test('a record that has not caught up with the pane still gets the right row', () => {
   const root = makeRoot();
   try {
@@ -850,17 +848,99 @@ test('a record that has not caught up with the pane still gets the right row', (
     assert.equal(row.needsInput, true);
     assert.equal(row.lifecycle, 'working', 'the record on disk is untouched');
     assert.equal(agents.readRecord('sandboxes', root).session.id, 'stale-sid');
+  } finally { cleanup(root); }
+});
 
-    // A caller with no pane list has the stamp, which is the same answer.
-    assert.equal(agents.dashboardAgents({ root, sessions }).find((entry) => entry.name === 'sandboxes').needsInput, true);
+test('a restart leaves an exited pane behind, and the live session is still the row', () => {
+  const root = makeRoot();
+  try {
+    agents.ensure('sandboxes', { role: 'incident-responder', lifecycle: 'working',
+      session: { id: 'old-sid', pane: 'old-pane' } }, { root });
+    // Both panes name the agent and the dead one is listed first, which is how a
+    // restart leaves them. An exited pane must not shadow the session Owner can
+    // actually answer.
+    const panes = [
+      { id: 'old-pane', alive: false, meta: { agent: 'claude', agentName: 'sandboxes' } },
+      { id: 'new-pane', alive: true, meta: { agent: 'claude', agentName: 'sandboxes' } },
+    ];
+    const sessions = [
+      { id: 'old-sid', pane: 'old-pane', state: 'needs-input', mtime: 100 },
+      { id: 'new-sid', pane: 'new-pane', state: 'needs-input', mtime: 200 },
+    ];
+    const row = (options) => agents.dashboardAgents({ root, ...options }).find((entry) => entry.name === 'sandboxes');
+    assert.equal(row({ sessions, panes }).needsInput, true);
+    assert.equal(row({ sessions, panes }).session.pane, 'old-pane',
+      'the record still names the old pane, and this row is not what rewrites it');
 
-    // The record's own session still wins when it is the one the pane names, so an
-    // obsolete row cannot outrank the live one.
-    const stale = { id: 'stale-sid', pane: 'stale-pane', state: 'needs-input' };
-    const working = { id: 'live-sid', pane: 'live-pane', state: 'running', agentName: 'sandboxes' };
-    assert.equal(agents.dashboardAgents({ root, sessions: [stale, working], panes })
-      .find((entry) => entry.name === 'sandboxes').needsInput, undefined,
-    'the pane the agent owns answers first, and that session is working');
+    // The live one is the session the row speaks for: with it working and only the
+    // dead one asking, there is nothing to answer.
+    const settled = [
+      { id: 'old-sid', pane: 'old-pane', state: 'needs-input', mtime: 100 },
+      { id: 'new-sid', pane: 'new-pane', state: 'running', mtime: 200 },
+    ];
+    assert.equal(row({ sessions: settled, panes }).needsInput, undefined);
+    // An `exited` session is out whether or not a pane list says so.
+    assert.equal(row({ sessions: [{ id: 'old-sid', pane: 'old-pane', state: 'needs-input', exited: true },
+      { id: 'new-sid', pane: 'new-pane', state: 'running' }] }).needsInput, undefined);
+    // With no pane list at all, the newest of two stamped live sessions answers.
+    assert.equal(row({ sessions: [{ id: 'new-sid', pane: 'new-pane', state: 'needs-input', mtime: 200 },
+      { id: 'other', pane: 'third-pane', agentName: 'sandboxes', state: 'running', mtime: 300 }] }).needsInput,
+    undefined, 'the newest stamped live session is the one the row speaks for');
+  } finally { cleanup(root); }
+});
+
+test('the row never picks a session stamped for somebody else, or the reviewer', () => {
+  const root = makeRoot();
+  try {
+    // This record names a session and a pane nothing live matches any more, which is
+    // when a row that guessed at identity used to reach for the wrong session.
+    agents.ensure('sandboxes', { role: 'incident-responder', lifecycle: 'working',
+      session: { id: 'stale-sid', pane: 'stale-pane' } }, { root });
+    agents.ensure('app-responder', { role: 'incident-responder', lifecycle: 'working',
+      session: { id: 'app-sid', pane: 'app-pane' } }, { root });
+    const row = (name, sessions, panes) => agents.dashboardAgents({ root, sessions, panes })
+      .find((entry) => entry.name === name);
+    const panes = [{ id: 'app-pane', alive: true, meta: { agent: 'claude', agentName: 'app-responder' } }];
+    const asking = [{ id: 'app-sid', pane: 'app-pane', state: 'needs-input' }];
+
+    // The only session asking belongs to another agent. Its own row says so, and
+    // this one does not borrow it.
+    assert.equal(row('app-responder', asking, panes).needsInput, true);
+    assert.equal(row('sandboxes', asking, panes).needsInput, undefined);
+
+    // Nor the reviewer's, even carrying this agent's stamp: its row is derived
+    // separately, and `session.reviewer` keeps its own meaning.
+    assert.equal(row('sandboxes', [{ id: 'stale-sid', pane: 'stale-pane', state: 'needs-input',
+      agentName: 'sandboxes', reviewer: true }]).needsInput, undefined);
+    // And an unstamped session is never a fallback. applySessions leaves a session on
+    // a pane no record and no pane meta names alone, so this row does too.
+    assert.equal(row('sandboxes', [{ id: 'unknown-sid', pane: 'unknown-pane', state: 'needs-input' }]).needsInput,
+      undefined, 'applySessions did not claim it, so this row does not either');
+  } finally { cleanup(root); }
+});
+
+test('a caller that never stamped its sessions gets the same row as the state build', () => {
+  const root = makeRoot();
+  try {
+    agents.ensure('sandboxes', { role: 'incident-responder', lifecycle: 'working',
+      session: { id: 'stale-sid', pane: 'stale-pane' } }, { root });
+    const panes = [{ id: 'live-pane', alive: true, meta: { agent: 'claude', agentName: 'sandboxes' } }];
+    const fresh = () => [{ id: 'live-sid', pane: 'live-pane', state: 'needs-input' }];
+
+    // serve.js stamps the sessions before it builds the queue, then hands the same
+    // array here. Anything else — a probe, a test, the mobile projection — has not.
+    const stamped = fresh();
+    agents.applySessions(stamped, agents.records(root), panes);
+    const viaState = agents.dashboardAgents({ root, sessions: stamped, panes });
+    const viaCaller = agents.dashboardAgents({ root, sessions: fresh(), panes });
+    assert.deepEqual(viaCaller, viaState);
+    assert.equal(viaCaller.find((entry) => entry.name === 'sandboxes').needsInput, true);
+
+    // And stamping again changes nothing, which is what makes doing it here free.
+    const twice = fresh();
+    agents.applySessions(twice, agents.records(root), panes);
+    agents.applySessions(twice, agents.records(root), panes);
+    assert.deepEqual(agents.dashboardAgents({ root, sessions: twice, panes }), viaState);
   } finally { cleanup(root); }
 });
 

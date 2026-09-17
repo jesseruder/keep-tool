@@ -749,32 +749,47 @@ function applySessions(sessions, list, panes = []) {
   }
 }
 
-// The agent's own session, as the dashboard sees it — resolved in the order
-// applySessions() above stamps `agentName` in, because the two must never disagree.
-// attention() suppresses a session's question on the strength of that stamp, so a
-// row that looked somewhere else for its label would hide a genuine prompt
-// completely: a launch whose response was lost, or a restart or handoff that moved
-// to a new pane, leaves the record naming a session that is gone while the pane's
-// own `meta.agentName` is the only thing that still knows whose session it is.
-function sessionForAgent(record, sessions, panes) {
-  const name = record.name;
-  const list = (sessions || []).filter(Boolean);
-  const onPane = (paneId) => (paneId
-    ? list.find((candidate) => candidate.pane === paneId || candidate.runtime?.paneId === paneId)
-    : null) || null;
-  // A pane whose meta names this agent is authority over the record, the same as in
-  // applySessions() and the console's agentForStage().
-  for (const pane of panes || []) {
-    if (!pane || !pane.id || pane.meta?.agentName !== name) continue;
-    const found = onPane(String(pane.id));
-    if (found) return found;
-  }
-  return onPane(record.session.pane || '')
-    || (record.session.id ? list.find((candidate) => candidate.id === record.session.id) : null)
-    // The stamp itself, for a caller with no pane list to hand: applySessions has
-    // already resolved the pane meta, so this is the same answer by another route.
-    || list.find((candidate) => candidate.agentName === name)
-    || null;
+// The agent's own session, as the dashboard sees it. It selects only among the
+// sessions applySessions() above has already stamped, which is by construction the
+// set attention() suppresses — so the row and the exclusion can never be talking
+// about different sessions. Re-deriving identity here was the whole bug: pane meta
+// is read in exactly one place, and this picks among the answers it gave.
+//
+// The record is a tie-breaker, never the question. It is rewritten after the fact,
+// so a launch whose response was lost, or a restart or handoff onto a new pane,
+// leaves it naming a session that no longer exists.
+function sessionForAgent(name, sessions, record = null, panes = null) {
+  const stamped = (sessions || []).filter((candidate) => candidate
+    && candidate.agentName === name && !candidate.reviewer);
+  if (!stamped.length) return null;
+  // A pane the host did not list is unknown, not gone: only `alive: false`
+  // disqualifies a session, which is what keeps an exited pane left over from a
+  // restart from shadowing the live one.
+  const alive = (panes || []).length
+    ? new Map((panes || []).filter(Boolean).map((pane) => [String(pane.id), pane.alive !== false]))
+    : null;
+  const isLive = (candidate) => {
+    if (candidate.exited === true || candidate.state === 'exited') return false;
+    if (!alive) return true;
+    const pane = candidate.pane || candidate.runtime?.paneId || '';
+    return !pane || alive.get(String(pane)) !== false;
+  };
+  const recordPane = record?.session?.pane || '';
+  const recordId = record?.session?.id || '';
+  const rank = (candidate) => [
+    isLive(candidate) ? 1 : 0,
+    recordPane && (candidate.pane === recordPane || candidate.runtime?.paneId === recordPane) ? 1 : 0,
+    recordId && candidate.id === recordId ? 1 : 0,
+    Number(candidate.mtime) || 0,
+  ];
+  return stamped.reduce((best, candidate) => {
+    const left = rank(candidate);
+    const right = rank(best);
+    for (let i = 0; i < left.length; i += 1) {
+      if (left[i] !== right[i]) return left[i] > right[i] ? candidate : best;
+    }
+    return best;
+  });
 }
 
 // One row, entirely out of record.json, plus one view-only fact from the session it
@@ -789,7 +804,7 @@ function agentView(record, options = {}) {
   // The agent's session is listed nowhere else, so its row is the only place a
   // question or a permission prompt can show. `lifecycle` is the daemon's own
   // record and stays exactly as written; this is the row's label, nothing more.
-  const live = sessionForAgent(record, options.sessions, options.panes);
+  const live = sessionForAgent(record.name, options.sessions, record, options.panes);
   const needsInput = Boolean(live && !live.exited && live.state === 'needs-input');
   return {
     name: record.name,
@@ -838,13 +853,22 @@ function reviewerView(options = {}) {
 // Never throws: a dashboard build must not fail over an unreadable record.
 function dashboardAgents(options = {}) {
   const root = options.root || keep.ROOT;
+  let list = [];
+  try { list = options.records || records(root); } catch {}
+  const sessions = options.sessions || [];
+  // agentView() below picks only among stamped sessions, which is what makes its
+  // answer the same set attention() excludes. Stamping here rather than trusting the
+  // caller's ordering is what makes that true for every caller: applySessions is
+  // idempotent, so the state build's earlier pass over the same sessions and panes
+  // costs nothing and a caller that never made one still gets the same row.
+  try { applySessions(sessions, list, options.panes || []); } catch {}
   const rows = [];
   try {
-    const reviewer = reviewerView(options);
+    const reviewer = reviewerView({ ...options, sessions });
     if (reviewer) rows.push(reviewer);
   } catch {}
-  for (const record of options.records || records(root)) {
-    try { rows.push(agentView(record, options)); } catch {}
+  for (const record of list) {
+    try { rows.push(agentView(record, { ...options, sessions })); } catch {}
   }
   return rows;
 }
