@@ -7250,11 +7250,23 @@ test('a Claude workspace-trust screen refuses any wait; the portable code stays 
   // An account handoff waits here too, and waiting out the dialog used to report
   // nothing but a 504 about a prompt that never came.
   now = 0;
-  screen = 'Is this a project you created or one you trust?\n 1. Yes, proceed';
+  screen = 'Quick safety check\n\nIs this a project you created or one you trust?\n\n 1. Yes, proceed\n 2. No, exit';
   await assert.rejects(waitForHostAgent({ pane: 'pane-trust' }, 'claude', clock),
     (error) => error.status === 409 && error.code === undefined
       && /awaiting workspace trust in pane pane-trust/.test(error.message)
       && error.extra.setupKind === 'workspace-trust');
+  // The question without its option list is text, not a dialog: our own transcripts
+  // quote these phrases, and a starting session that shows one is still just starting.
+  for (const quoted of [
+    'I asked whether this is a project you created or one you trust, and it was.',
+    'Quick safety check: the handoff docs describe "Do you trust the files in this folder?"',
+    'Do you trust the files in this folder?\n\n 3. Yes, run the deploy',
+    ' 1. Yes, proceed\n\nDo you trust the files in this folder?',
+  ]) {
+    now = 0; screen = quoted;
+    await assert.rejects(waitForHostAgent({ pane: 'pane-trust' }, 'claude', clock),
+      (error) => error.status === 504 && /never showed an empty prompt/.test(error.message), quoted);
+  }
 });
 
 test('setup recovery rechecks the destination incarnation under the injection lock before typing', async () => {

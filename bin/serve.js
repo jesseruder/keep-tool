@@ -89,13 +89,26 @@ const CODEX_DIALOG_MARKERS = [
   'Do you trust the contents of this directory?',
   'Press enter to continue',
 ];
-const CLAUDE_TRUST_MARKERS = [
+// What the trust screen asks, as opposed to what its options say.
+const CLAUDE_TRUST_QUESTIONS = [
   'Do you trust the contents of this directory?',
   'Do you trust the files in this folder?',
   'Is this a project you created or one you trust',
-  'Yes, I trust this folder',
   'Quick safety check',
 ];
+const CLAUDE_TRUST_MARKERS = [...CLAUDE_TRUST_QUESTIONS, 'Yes, I trust this folder'];
+// One row of its option list, read as a row: a line that begins with the number.
+const CLAUDE_TRUST_OPTION = /^\s*(?:❯\s*)?\d+\.\s+(?:Yes, I trust|No, exit|Yes, proceed)/m;
+
+// A trust screen, not a mention of one. These phrases turn up in ordinary conversation
+// -- Keep's own transcripts quote them -- and a session that has one on screen while it
+// is still starting up is not a dialog. The question and an option row under it are.
+function claudeTrustScreen(plain) {
+  const asked = CLAUDE_TRUST_QUESTIONS.map((marker) => plain.indexOf(marker)).filter((at) => at >= 0);
+  if (!asked.length) return false;
+  const option = CLAUDE_TRUST_OPTION.exec(plain);
+  return Boolean(option) && option.index > Math.min(...asked);
+}
 // Claude Code renders an AI prompt suggestion on the `❯` line only while the input box
 // is empty; typing any character hides it. The host trims trailing whitespace from screen
 // lines, so a space cannot tell a draft from a lagging re-render — a visible character can:
@@ -5520,7 +5533,7 @@ async function waitForHostAgent(target, agent, deps = {}) {
       // resolves one: an account handoff into an untrusted worktree waited this out on
       // 2026-09-17 and reported nothing but "never showed an empty prompt" 45 seconds
       // later. Confirmed across the same two reads a recognized dialog needs.
-      const trustScreen = !dialog && CLAUDE_TRUST_MARKERS.some((marker) => plain.includes(marker));
+      const trustScreen = !dialog && claudeTrustScreen(plain);
       const refusing = trustScreen ? { kind: 'workspace-trust' } : dialog && dialog.live
         && claudePrompts.policyFor(dialog.kind).action === 'refuse' ? dialog : null;
       // Two reads a poll apart, or none: a single frame can catch a dialog Owner is
