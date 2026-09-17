@@ -503,6 +503,42 @@ test('an incident that will never resolve itself can be closed by hand, by card 
   } finally { cleanup(root); }
 });
 
+test('a hand close whose state write failed is retried without a second check-in', () => {
+  const root = makeRoot();
+  try {
+    const registry = fakeRegistry(root);
+    ingest(root, registry, [reposted(SERVER_FAULTS_FIRING, '1789600000.000000')]);
+    const card = registry.created[0].id;
+    const signature = 'grafana:unacknowledged-server-faults';
+
+    // The card is written before state.json, so a failed state write leaves a
+    // `done` card with an open signature — and the retry that follows must not
+    // append a second `closed by hand` line to it.
+    // Read-only for the duration of the lock: the load inside it still works, the
+    // write at the end of it does not.
+    const failing = (fn) => {
+      fs.chmodSync(incidents.stateDir(root), 0o500);
+      try { return fn(); } finally { fs.chmodSync(incidents.stateDir(root), 0o700); }
+    };
+    assert.throws(() => incidents.close(card, { root, now: 4000, reason: 'merged signature', withLock: failing, write: () => {} }, registry.deps),
+      /could not close/);
+    assert.equal(registry.statuses.get(card), 'done', 'the card write landed');
+    assert.equal(registry.body(card).match(/^closed by hand:/gm).length, 1);
+    assert.ok(!incidents.loadState(root).signatures[signature].closedAt, 'and the state did not');
+    assert.equal(registry.events.length, 1, 'only the opening event; no close was published');
+
+    // The retry finds its own marker on the card, writes no second line, and
+    // still moves the state and publishes the event — the retry is what makes
+    // them real.
+    const closed = incidents.close(signature, { root, now: 5000, reason: 'merged signature' }, registry.deps);
+    assert.equal(closed.closed, true);
+    assert.equal(registry.body(card).match(/^closed by hand:/gm).length, 1, 'still one close line');
+    assert.equal(incidents.loadState(root).signatures[signature].closedAt, 5000);
+    assert.deepEqual(registry.events.map((item) => item.event.kind), ['incident-opened', 'incident-closed']);
+    assert.deepEqual(incidents.openIncidents(root), []);
+  } finally { cleanup(root); }
+});
+
 test('a hand close of a reopened signature closes the period it is in', () => {
   const root = makeRoot();
   try {
