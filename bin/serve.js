@@ -1515,6 +1515,23 @@ async function hostClient(deps = {}) {
   return pendingHost;
 }
 
+// Hang up on the terminal host and forget the cache. The daemon never wants
+// this — it holds one connection for its whole life — but a one-shot command
+// that asked the host a single question does: the socket is a live handle, so
+// the process would sit in the event loop long after its report is printed.
+// Awaiting a connection still in flight first means a client that arrives late
+// is closed too rather than being left behind as the cached one. The next
+// hostClient() call simply reconnects.
+async function closeHostClient() {
+  if (pendingHost) await pendingHost.catch(() => null);
+  const client = cachedHost;
+  cachedHost = null;
+  if (!client) return false;
+  hostPaneCaches.delete(client);
+  try { client.close(); } catch {}
+  return true;
+}
+
 function retryableHostError(error) {
   const code = error && error.code;
   return ['ECONNREFUSED', 'ECONNRESET', 'ENOENT', 'EPIPE'].includes(code)
@@ -8818,6 +8835,7 @@ module.exports = {
   SUGGESTION_PROBE_SETTLE_READS,
   isHostTarget,
   hostClient,
+  closeHostClient,
   hostRequest,
   listHostPanes,
   listHostPaneResult,

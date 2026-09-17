@@ -2229,7 +2229,11 @@ commands.incidents = async (argv, cliDeps = {}) => {
     // running would have nothing true to report, and performing nothing is
     // area-session's own guarantee (every write, send and close is gated on it),
     // not something withholding a dependency buys.
-    const serve = () => require('./serve.js');
+    // Whether this command ever reached for serve.js. Only then is there a host
+    // connection to hang up afterwards, and only then may this require it: the
+    // point of the lazy require is that an area whose session is off pays nothing.
+    let usedServe = false;
+    const serve = () => { usedServe = true; return require('./serve.js'); };
     const deps = cliDeps.deps || ({
       openSession: (body, openDeps) => serve().openSession(body, openDeps),
       listPanes: () => serve().listHostPanes({}, true),
@@ -2248,7 +2252,18 @@ commands.incidents = async (argv, cliDeps = {}) => {
     // `force` only with `--dry`: a dry run is how the switch gets inspected
     // before it is flipped, but actually opening a session for an area whose
     // `session` is false would flip it from the command line.
-    const result = await areaSession.tick({ root: ROOT, area: o._[0], dry: Boolean(o.dry), force: Boolean(o.dry) }, deps);
+    let result;
+    try {
+      result = await areaSession.tick({ root: ROOT, area: o._[0], dry: Boolean(o.dry), force: Boolean(o.dry) }, deps);
+    } finally {
+      // Asking the terminal host what is running opens a connection serve.js
+      // keeps: right for the daemon, which holds one for its whole life, and
+      // wrong here — the live socket would keep this process in the event loop
+      // for good once the report was printed. Hang it up whether the tick
+      // succeeded or threw. Not process.exit(): stdout to a pipe is
+      // asynchronous, so exiting would cut the report short.
+      if (usedServe) await require('./serve.js').closeHostClient();
+    }
     if (o.json) { console.log(JSON.stringify(result, null, 2)); return; }
     if (result.error) die(result.error);
     for (const report of result.areas) for (const line of areaSession.describe(report)) console.log(line);

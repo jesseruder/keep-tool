@@ -1473,6 +1473,26 @@ test('listHostPaneResult tells a slow host apart from an absent one', async () =
   assert.deepEqual(await listHostPaneResult({ host: good }, true), { panes: [{ id: 'p1', meta: {} }], failure: null });
 });
 
+test('closeHostClient hangs up the cached connection so a one-shot command can exit', async () => {
+  const { closeHostClient } = require('./serve');
+  const opened = [];
+  const connectHost = async () => {
+    const client = { closed: false, socket: { destroyed: false }, onDisconnect: () => ({ dispose() {} }) };
+    client.close = () => { client.closed = true; client.socket.destroyed = true; };
+    opened.push(client);
+    return client;
+  };
+  const first = await hostClient({ connectHost });
+  assert.equal(await hostClient({ connectHost }), first, 'the connection is cached while its socket is open');
+  assert.equal(await closeHostClient(), true);
+  assert.equal(first.closed, true, 'a live socket would keep a CLI process in the event loop for good');
+  assert.equal(await closeHostClient(), false, 'closing again is a no-op, not a second hang-up');
+  const second = await hostClient({ connectHost });
+  assert.notEqual(second, first, 'the cache is forgotten, so the next caller reconnects');
+  assert.equal(opened.length, 2);
+  await closeHostClient();
+});
+
 test('turn index reads only recently alive sessions and caches codex rollout walks', () => {
   const { liveTurnIndexSessions } = require('./serve');
   let now = Date.parse('2026-09-14T12:00:00Z');

@@ -1525,6 +1525,14 @@ terminal host what is running would have nothing true to say, and performing not
 `bin/area-session.js`'s own guarantee — every write, send and close is gated on it —
 rather than something withholding a dependency buys.
 
+Asking the host what is running opens the connection `serve.js` caches, and that socket is
+a live handle: the daemon wants it for its whole life, a command that prints a report and
+stops does not, and left open it kept the process sitting in the event loop after the last
+line was printed. The command hangs up with `serve.closeHostClient()` in a `finally`,
+whether the tick returned or threw, and only when something actually reached for
+`serve.js`. Not `process.exit()`: stdout to a pipe is asynchronous on macOS, so exiting
+there would truncate the report it just wrote.
+
 ## Steps
 
 Step commands run with stdin closed, so anything that prompts dies at the prompt. Write
