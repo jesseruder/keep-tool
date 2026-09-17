@@ -51,9 +51,11 @@ because the numbers there cannot mean what a known dialog's option table says th
 
 `policyFor(kind)` says what Keep may do about it, and `answerable(match)` decides
 whether a key may actually go out: only the worktree exit prompt is ever answered, only
-while it is live, only under an `Enter to confirm` footer, and only when the *text* of the
-row the cursor is on is "Keep worktree". Not the option numbered 1 — the highlighted row,
-read as text. That is the restart's graceful-exit wait, still behind its process-identity
+while it is live, only under an `Enter to confirm` footer, and only when the cursor is on
+the answer's own row — the first of exactly two options — with the text "Keep worktree"
+still on it. The worktree dialog's option table is exact, so a block with a third option
+is a different question and reads as `unknown`, however familiar its rows look; and the
+answer is a place in that list plus its text, never a row that merely says the words. That is the restart's graceful-exit wait, still behind its process-identity
 re-check and a second read of the screen.
 
 Every other dialog is refused by name — but not on one frame. Owner may be answering the

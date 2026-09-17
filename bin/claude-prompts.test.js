@@ -110,6 +110,15 @@ test('the worktree exit prompt is answered by the option text, never by its numb
   assert.equal(reversed.kind, 'unknown');
   assert.equal(answerable(reversed), false);
 
+  // An option list longer than the one Keep knows is a different question, even when a
+  // row of it carries the answer's words: the extra option is an extra meaning.
+  const extra = read('worktree-exit-extra-option');
+  assert.equal(extra.kind, 'unknown');
+  assert.equal(extra.options.length, 3);
+  assert.equal(answerable(extra), false);
+  // And even called the known kind, the highlighted row has to be the answer's own row.
+  assert.equal(answerable({ ...extra, kind: 'worktree-exit' }), false);
+
   // A footer offering only a way out does not take an Enter, whatever is highlighted.
   const escOnly = read('worktree-exit-esc-only-footer');
   assert.equal(escOnly.kind, 'worktree-exit');

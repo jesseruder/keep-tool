@@ -37,18 +37,21 @@ function normalizedText(value) {
 // back to 'unknown'. Positional is the point — an option list Claude Code renders in
 // another order is a dialog whose numbers mean something else, and reading "1." as the
 // safe answer there is how an Enter deletes a worktree. Options past the list are free.
-// `answer` is the text the highlighted option must have before Keep may press `key`;
-// `signals` is the looser text-only reading, for the one caller that needs to see a
-// dialog whose footer has not rendered yet — see showsDialog.
+// `exact` means the table is the whole option list, not a prefix of it — required of
+// any dialog Keep answers, because an extra option is an extra meaning. `answer` is the
+// index into that table of the one option Keep may press `key` on, with the text it must
+// have; `signals` is the looser text-only reading, for the one caller that needs to see
+// a dialog whose footer has not rendered yet — see showsDialog.
 const DIALOGS = [
   {
     kind: 'worktree-exit',
     heading: /Exiting worktree session/i,
     options: [/^Keep worktree\b/i, /^Remove worktree\b/i],
+    exact: true,
     signals: [/Exiting worktree session/i],
     // The only dialog Keep ever answers, and only on the option that destroys nothing —
-    // which is the one whose *text* keeps the worktree, never a number on its own.
-    answer: /^Keep worktree\b/i,
+    // the first row of that exact list, and only while its text still keeps the worktree.
+    answer: { at: 0, text: /^Keep worktree\b/i },
     policy: { action: 'answer', key: '\r', label: 'worktree exit' },
   },
   {
@@ -89,8 +92,12 @@ function answerable(match) {
   if (!ANSWER_FOOTER.test(match.footer || '')) return false;
   // The highlighted row itself, never a row looked up by its number: a screen can repeat
   // a number, and the answer is the option the cursor is actually on.
-  const highlighted = (match.options || []).filter((option) => option.highlighted);
-  return highlighted.length === 1 && known.answer.test(highlighted[0].text);
+  const options = match.options || [];
+  if (options.filter((option) => option.highlighted).length !== 1) return false;
+  // The answer is one row of a list Keep recognizes whole: that row's place in it, and
+  // its text, and the cursor on it. A third option carrying the same words is not it.
+  const option = options[known.answer.at];
+  return Boolean(option && option.highlighted && known.answer.text.test(option.text));
 }
 
 // What a refusal calls the dialog. An unrecognized one is only identifiable by its
@@ -160,6 +167,7 @@ function blockAt(lines, index) {
   // so it is a dialog, and an unknown one.
   const ordered = options.every((option, i) => option.number === i + 1);
   const named = ordered && dialog
+    && !(dialog.exact && options.length !== dialog.options.length)
     && dialog.options.every((pattern, i) => Boolean(options[i]) && pattern.test(options[i].text));
   return {
     kind: named ? dialog.kind : 'unknown',
