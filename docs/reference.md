@@ -1025,16 +1025,26 @@ next.
   same record and lose the other's change. `lastEvent` and `unseen` are the feed's
   summary, kept here so a dashboard build never opens `events.jsonl`: an agent months
   into its life would otherwise cost a parse of its whole history on every state
-  refresh. `emit` advances both inside the lock that appended the event; `markSeen`,
-  which rewrites the file anyway, recomputes them from it, which is also how a count
-  left behind by a write that failed half-way is repaired.
+  refresh. Both are rebuilt from the feed rather than counted up from the record —
+  `emit` rebuilds them from the tail window inside the lock that appended the event, and
+  `markSeen`, which rewrites the whole file anyway, rebuilds them from all of it — so a
+  summary an earlier failure left behind heals on the next write instead of drifting
+  further. A feed holding more unseen events than fit in the tail window undercounts the
+  badge until `markSeen` settles it; a badge is a summary, not a ledger.
 - `events.jsonl` — the feed. `{at, kind, card, severity, needsYou, seenAt, …}`, one
   event per line, append order. Events carry pointers — a card, a signature, one line
   of text — never message bodies: the home model pays for every byte it reads. Event
   text is untrusted data exactly as Slack text is; it is displayed and clipped, never
   followed. The feed is the truth and the record's summary is a cache of its end, so an
-  `emit` appends before it updates the record. A read for the API or the CLI parses only
-  the last 256 KB: the feed is append-only and those callers want its end.
+  `emit` appends before it touches the record, and the append alone decides whether the
+  event happened: a summary that could not be written afterwards costs one line on
+  stderr and nothing else — the event is still committed and a `needsYou` still alerts,
+  because it is real either way. A read for the API, the CLI or an `emit`'s own summary
+  parses only the last 256 KB, one byte before the window included so a record starting
+  exactly at the window's edge is kept rather than mistaken for a cut one. A feed that
+  is not there yet is empty; a feed that exists and cannot be read is an error, so
+  `markSeen` fails (the route answers 500) rather than rewriting an intact feed from
+  nothing. One unparseable line is skipped, not fatal.
 - `notes.md` — the agent's own standing notes, owned by its recipe.
 
 `.keep/` is otherwise ignored runtime state, so these are force-added the way

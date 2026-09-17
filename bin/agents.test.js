@@ -243,6 +243,146 @@ test('a feed read parses only the end of the file', () => {
   } finally { cleanup(root); }
 });
 
+// One line of a feed, exactly `lineBytes` long including its newline, so a test
+// can put the tail window's start on a byte it chose.
+function paddedFeedLine(index, lineBytes) {
+  const event = { at: 1000 + index, kind: `e${index}`, card: '', severity: 'med', needsYou: false, seenAt: 0, text: '' };
+  const pad = lineBytes - 1 - JSON.stringify(event).length;
+  assert.ok(pad >= 0, `line ${index} does not fit in ${lineBytes} bytes`);
+  event.text = 'x'.repeat(pad);
+  const line = JSON.stringify(event);
+  assert.equal(Buffer.byteLength(line) + 1, lineBytes);
+  return line;
+}
+
+function writePaddedFeed(root, name, count, lineBytes) {
+  const rows = [];
+  for (let index = 0; index < count; index += 1) rows.push(paddedFeedLine(index, lineBytes));
+  fs.writeFileSync(agents.eventsFile(name, root), rows.join('\n') + '\n');
+  return count * lineBytes;
+}
+
+test('a tail window that starts on a line start keeps that line', () => {
+  const root = makeRoot();
+  try {
+    agents.ensure('sandboxes', {}, { root });
+    // 512 divides the window exactly, so `size - TAIL_BYTES` lands on a line
+    // start and nothing was cut: every line in the window is a whole record.
+    const size = writePaddedFeed(root, 'sandboxes', 600, 512);
+    const start = size - agents.TAIL_BYTES;
+    assert.equal(start % 512, 0, 'the fixture puts the window start on a line start');
+    const kept = agents.readEvents('sandboxes', { root, limit: 2000 });
+    assert.equal(kept.length, 512, 'the whole window, with no line discarded');
+    assert.equal(kept[0].kind, 'e599');
+    assert.equal(kept.at(-1).kind, `e${start / 512}`, 'the line at the window edge survived');
+
+    // 500 does not, so the offset lands inside a line; that one is dropped and
+    // nothing else is.
+    const oddSize = writePaddedFeed(root, 'sandboxes', 600, 500);
+    const oddStart = oddSize - agents.TAIL_BYTES;
+    assert.notEqual(oddStart % 500, 0, 'the fixture cuts a line in half');
+    const cut = agents.readEvents('sandboxes', { root, limit: 2000 });
+    assert.equal(cut.length, 600 - Math.ceil(oddStart / 500), 'exactly the cut line is missing');
+    assert.equal(cut.at(-1).kind, `e${Math.ceil(oddStart / 500)}`);
+    assert.equal(cut.every((event) => /^e\d+$/.test(event.kind)), true, 'no half-parsed line survived');
+  } finally { cleanup(root); }
+});
+
+test('a feed that cannot be read fails markSeen instead of emptying the record', async () => {
+  const root = makeRoot();
+  try {
+    agents.ensure('sandboxes', {}, { root });
+    agents.emit('sandboxes', { kind: 'diagnosed', card: 'inc-one', text: 'host pool is full' }, { root, now: 1000 });
+    agents.emit('sandboxes', { kind: 'needs-you', card: 'inc-one', needsYou: true, text: 'raise the cap?' }, {
+      root, now: 2000, sendAlert: () => {},
+    });
+    const before = fs.readFileSync(agents.recordFile('sandboxes', root), 'utf8');
+    const feed = fs.readFileSync(agents.eventsFile('sandboxes', root), 'utf8');
+
+    const realReadFileSync = fs.readFileSync;
+    fs.readFileSync = (file, ...rest) => {
+      if (String(file).endsWith('events.jsonl')) {
+        const error = new Error(`EACCES: permission denied, open '${file}'`);
+        error.code = 'EACCES';
+        throw error;
+      }
+      return realReadFileSync(file, ...rest);
+    };
+    try {
+      // An unreadable feed is not an empty one. Rewriting it from nothing would
+      // delete the events and reset the summary while both were fine on disk.
+      assert.throws(() => agents.markSeen('sandboxes', 9000, { root, now: 3000 }), /EACCES/);
+      assert.equal(fs.existsSync(agents.agentsDir(root)), true);
+
+      // The route turns it into a 500 rather than a silent success.
+      const { routes, matchRoute } = require('./serve/routes.js');
+      const list = routes({ keep: { ROOT: root }, broadcast: () => {}, json: (res, status, value) => ({ status, value }) });
+      const url = new URL('http://x/api/agents/sandboxes/seen');
+      const route = matchRoute(list, { req: { method: 'POST', headers: {} }, url, body: {} });
+      const answer = await route.handle({ req: { method: 'POST', headers: {} }, res: {}, url, body: {} });
+      assert.equal(answer.status, 500);
+      assert.match(answer.value.error, /EACCES/);
+    } finally { fs.readFileSync = realReadFileSync; }
+
+    assert.equal(fs.readFileSync(agents.recordFile('sandboxes', root), 'utf8'), before, 'the record is untouched');
+    assert.equal(fs.readFileSync(agents.eventsFile('sandboxes', root), 'utf8'), feed, 'and so is the feed');
+    assert.deepEqual(agents.readRecord('sandboxes', root).unseen, { count: 2, needsYou: true });
+
+    // A feed that is simply not there yet is still empty, not an error.
+    agents.ensure('app-responder', {}, { root });
+    assert.deepEqual(agents.loadEvents('app-responder', root), []);
+    assert.deepEqual(agents.readEvents('app-responder', { root }), []);
+    assert.equal(agents.markSeen('app-responder', 9000, { root }).marked, 0);
+    // And one unreadable line is skipped, not fatal.
+    fs.appendFileSync(agents.eventsFile('app-responder', root), 'not json\n');
+    agents.emit('app-responder', { kind: 'note', text: 'after the bad line' }, { root, now: 4000 });
+    assert.deepEqual(agents.readEvents('app-responder', { root }).map((entry) => entry.kind), ['note']);
+  } finally { cleanup(root); }
+});
+
+test('an event that landed keeps its alert and heals the summary on the next emit', () => {
+  const root = makeRoot();
+  try {
+    agents.ensure('sandboxes', {}, { root });
+    agents.emit('sandboxes', { kind: 'diagnosed', card: 'inc-one', text: 'host pool is full' }, { root, now: 1000 });
+    assert.deepEqual(agents.readRecord('sandboxes', root).unseen, { count: 1, needsYou: false });
+    agents.flushCommits(root);
+
+    const sent = [];
+    const stderr = [];
+    const realWriteFileSync = fs.writeFileSync;
+    fs.writeFileSync = (file, ...rest) => {
+      if (String(file).includes('record.json')) throw new Error('ENOSPC: no space left on device');
+      return realWriteFileSync(file, ...rest);
+    };
+    let landed;
+    try {
+      landed = agents.emit('sandboxes', {
+        kind: 'needs-you', card: 'inc-two', needsYou: true, text: 'raise the cap or drain?',
+      }, { root, now: 2000, sendAlert: (request) => sent.push(request), write: (line) => stderr.push(line) });
+    } finally { fs.writeFileSync = realWriteFileSync; }
+
+    // The append is the durable act: the event exists, so it alerts and it is
+    // committed, whatever happened to the summary afterwards.
+    assert.equal(landed.kind, 'needs-you');
+    assert.equal(lines(root, 'sandboxes').length, 2);
+    assert.equal(sent.length, 1, 'a needs-you event that landed still reaches Owner');
+    assert.equal(sent[0].key, 'agent:sandboxes:inc-two');
+    assert.deepEqual(agents.pendingNames(root), ['sandboxes'], 'and it is still waiting to be committed');
+    assert.equal(stderr.length, 1);
+    assert.match(stderr[0], /wrote the needs-you event for sandboxes but not its summary/);
+    assert.deepEqual(agents.readRecord('sandboxes', root).unseen, { count: 1, needsYou: false }, 'the summary is stale');
+
+    // The next emit rebuilds the summary from the feed rather than counting up
+    // from the stale record, so it heals instead of drifting further.
+    agents.emit('sandboxes', { kind: 'watching', card: 'inc-two', text: 'waiting for the next scrape' }, { root, now: 3000 });
+    const record = agents.readRecord('sandboxes', root);
+    assert.deepEqual(record.unseen, { count: 3, needsYou: true }, 'three unseen, not the stale one plus one');
+    assert.equal(record.lastEvent.kind, 'watching');
+    assert.equal(record.lastEvent.at, 3000);
+  } finally { cleanup(root); }
+});
+
 test('markSeen rewrites and emit appends under one lock each, losing neither write', () => {
   const root = makeRoot();
   try {

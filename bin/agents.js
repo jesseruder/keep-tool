@@ -211,18 +211,44 @@ function parseEventLines(text) {
   return events;
 }
 
-// The whole file, in append order. Only markSeen needs this — it rewrites the
-// file, so it has to hold all of it — and it is the one place the feed's own
-// counts are recomputed. Nothing on the dashboard path calls it.
-function loadEvents(name, root = keep.ROOT) {
-  try { return parseEventLines(fs.readFileSync(eventsFile(name, root), 'utf8')); } catch { return []; }
+// A feed that is not there yet is empty. Anything else — a permission, a device,
+// a truncated read — is a feed we cannot see rather than a feed with nothing in
+// it, and it must not be mistaken for one: markSeen rewrites what it reads, and
+// treating an unreadable feed as empty would replace it with nothing and reset
+// the record's summary while the events were still on disk. A single unparseable
+// line is a different matter and is skipped (see parseEventLines).
+function readFeed(file) {
+  try { return fs.readFileSync(file, 'utf8'); }
+  catch (error) {
+    if (error && error.code === 'ENOENT') return null;
+    throw error;
+  }
 }
 
-// The feed as the API and the CLI show it: newest first, capped. Only the last
-// TAIL_BYTES are read — a feed is append-only and these callers want its end,
-// so an agent that has been running for months costs the same as a new one. The
-// first line of the window may have been cut mid-record by the byte offset, so
-// it is dropped unless the window is the whole file.
+// The whole file, in append order. Only markSeen needs this — it rewrites the
+// file, so it has to hold all of it — and it is the one place the feed's own
+// counts are recomputed from every event rather than from the tail. Nothing on
+// the dashboard path calls it. Throws when the feed exists but cannot be read.
+function loadEvents(name, root = keep.ROOT) {
+  const text = readFeed(eventsFile(name, root));
+  return text === null ? [] : parseEventLines(text);
+}
+
+// The feed as the API, the CLI and each emit's own summary see it: newest first,
+// capped. Only the last TAIL_BYTES are read — a feed is append-only and these
+// callers want its end, so an agent that has been running for months costs the
+// same as a new one.
+//
+// One byte before the window is read along with it, purely to ask whether the
+// window began at a line start. If it did, the window's first line is a whole
+// record and is kept; otherwise the offset cut it in half and it is dropped.
+// Only that raw byte is compared, so an offset landing inside a multi-byte
+// character cannot be mistaken for a newline — it reads as "cut", which is the
+// safe answer.
+//
+// A feed that is not there is empty; a feed that exists and cannot be read
+// throws, because a caller that writes what it read back (emit's summary,
+// markSeen) must not be handed an empty list for it.
 function readEvents(name, options = {}) {
   const root = options.root || keep.ROOT;
   const limit = Math.min(EVENT_LIMIT, Math.max(1, Number(options.limit) || DEFAULT_EVENT_LIMIT));
@@ -234,12 +260,17 @@ function readEvents(name, options = {}) {
     handle = fs.openSync(file, 'r');
     const size = fs.fstatSync(handle).size;
     const start = Math.max(0, size - TAIL_BYTES);
-    const length = size - start;
+    const probe = start > 0 ? 1 : 0;
+    const length = size - start + probe;
     const buffer = Buffer.alloc(length);
-    if (length) fs.readSync(handle, buffer, 0, length, start);
-    text = buffer.toString('utf8');
-    partial = start > 0;
-  } catch { return []; }
+    if (length) fs.readSync(handle, buffer, 0, length, start - probe);
+    // 0x0a is '\n': the byte before the window ended a line, so nothing was cut.
+    partial = probe === 1 && buffer[0] !== 0x0a;
+    text = buffer.subarray(probe).toString('utf8');
+  } catch (error) {
+    if (!error || error.code !== 'ENOENT') throw error;
+    return [];
+  }
   finally { if (handle !== undefined) { try { fs.closeSync(handle); } catch {} } }
   let events = parseEventLines(partial ? text.slice(text.indexOf('\n') + 1) : text).reverse();
   if (options.unseen) events = events.filter((event) => !event.seenAt);
@@ -315,35 +346,47 @@ function emit(name, event = {}, options = {}) {
   const entry = normalizeEvent(event, Number(options.now) || Date.now());
   let landed;
   try {
-    // The record is read, the event appended and the record's summary advanced
-    // in one lock hold: a reader that saw the new line and the old count would
-    // be showing a stale badge, and a second emitter loading the count before
-    // this one wrote it would lose an increment.
+    // The record is read, the event appended and the record's summary rebuilt in
+    // one lock hold: a reader that saw the new line and the old count would be
+    // showing a stale badge, and a second emitter rebuilding the summary before
+    // this one had appended would miss this event.
     landed = locked(options, () => {
       const record = readRecord(name, root);
       if (!record) return { missing: true };
       fs.mkdirSync(agentDir(name, root), { recursive: true });
-      // The feed is the truth and the record's counts are a cache of its end,
-      // so the append goes first: a failure after it leaves a count to repair
-      // (markSeen recomputes it), not an event nobody has.
+      // The feed is the truth and the record's summary is a cache of its end, so
+      // the append comes first and alone decides whether this emit happened.
       fs.appendFileSync(eventsFile(name, root), JSON.stringify(entry) + '\n');
-      writeJsonAtomic(recordFile(name, root), normalizeRecord(name, {
-        ...record,
-        lastEvent: entry,
-        unseen: {
-          count: record.unseen.count + 1,
-          needsYou: record.unseen.needsYou || entry.needsYou,
-        },
-      }));
+      try {
+        // Rebuilt from the feed rather than counted up from the record: a
+        // summary an earlier failure left behind heals on the next emit instead
+        // of drifting further. The tail window is what bounds the cost, and it
+        // is the same read the API does. A feed with more unseen events than fit
+        // in the window undercounts the badge until markSeen — which reads all
+        // of it — settles the number; a badge is a summary, not a ledger.
+        const tail = readEvents(name, { root, limit: EVENT_LIMIT });
+        writeJsonAtomic(recordFile(name, root), normalizeRecord(name, {
+          ...record, lastEvent: tail[0] || entry, unseen: unseenSummary(tail),
+        }));
+      } catch (error) { return { ok: true, recordError: error }; }
       return { ok: true };
     });
   } catch (error) {
+    // The append itself failed, so there is no event: this is the one path that
+    // reports nothing happened.
     say(`could not write to ${agentDir(name, root)}: ${oneLine(error && error.message || error, 200)}`);
     return null;
   }
   if (landed.missing) {
     say(`no record for ${name}; dropped its ${entry.kind} event`);
     return null;
+  }
+  // The event is on disk. A summary that could not be written is worth a line
+  // and nothing more — it must not suppress the alert that asked for Owner, or
+  // leave the write uncommitted, because the event is real either way.
+  if (landed.recordError) {
+    say(`wrote the ${entry.kind} event for ${name} but not its summary: `
+      + `${oneLine(landed.recordError.message || landed.recordError, 200)}`);
   }
   markPending(root, name);
   if (entry.needsYou) routeAlert(name, entry, { ...options, root });
