@@ -11,6 +11,49 @@ const artifacts = require('./account-artifacts');
 const active = new Map();
 const CONTINUATION_TEXT = 'Continue the work from the request that hit the account limit.';
 
+// Why a transfer was refused, in the only two shapes a caller can act on.
+//
+// 'transient' is a refusal that clears on its own: another injection held the lock,
+// a turn or a background child was still finishing, the pane was being watched, the
+// host was slow, the job ledger was mid-recovery. Nine sessions moved by hand on
+// 2026-09-15 each hit at least one of these, and every one of them succeeded on a
+// later attempt with nothing changed. 'blocked' is everything else — a refusal that
+// says a person has to look: an unreproducible model or permission class, a missing
+// artifact, a logged-out target, a dialog on the screen, a changed process.
+//
+// Nothing here loosens a check. The class only decides whether a queue may try the
+// exact same request again later; handoffSession/restartSession run every preflight
+// they always ran, on every attempt.
+const TRANSIENT_REFUSALS = [
+  /^another session injection is busy$/,
+  // RestartDeferred and the restart path's own deferrals.
+  /^Waiting /,
+  /^Pause session-local scheduled jobs/,
+  /^Job ledger (?:source|evidence) changed during restart$/,
+  /^New hook activity arrived during restart$/,
+  // A racing observation: the session or its pane moved under a check that will be
+  // taken again from scratch next time.
+  /^Session changed/,
+  /^host request timed out/,
+  /could not be verified/,
+  // `ps` under load. The helper scan is the evidence, not the verdict.
+  /^Command failed: ps/,
+  // A caffeinate or a sleeping sentinel child that ends on its own minutes later.
+  /^Local background processes are still present$/,
+];
+// Checked first: these contain transient-looking words but name a durable
+// incompatibility that retrying cannot resolve.
+const BLOCKED_REFUSALS = [
+  /^Target account setup is incompatible/,
+  /^Source account setup is unavailable/,
+];
+function classifyRefusal(reason) {
+  const text = String(reason == null ? '' : reason).trim();
+  if (!text) return 'blocked';
+  if (BLOCKED_REFUSALS.some((pattern) => pattern.test(text))) return 'blocked';
+  return TRANSIENT_REFUSALS.some((pattern) => pattern.test(text)) ? 'transient' : 'blocked';
+}
+
 function dir(root) { return path.join(root, '.keep', 'account-handoffs'); }
 function fileFor(root, sessionId) { return path.join(dir(root), `${sessionId}.json`); }
 function readOne(root, sessionId) {
@@ -20,6 +63,10 @@ function readOne(root, sessionId) {
 function writeOne(root, entry) {
   fs.mkdirSync(dir(root), { recursive: true });
   entry.updatedAt = Date.now();
+  // Every path that stops a transfer lands here, so the class is derived once
+  // rather than at each of the dozen Object.assign sites that set the status.
+  if (entry.status === 'recovery-needed' || entry.status === 'failed') entry.refusalClass = classifyRefusal(entry.reason);
+  else delete entry.refusalClass;
   const file = fileFor(root, entry.sessionId);
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(entry, null, 2) + '\n', { mode: 0o600 });
@@ -37,7 +84,7 @@ function portableFallbackCandidate(entry) {
 }
 function safe(entry) {
   if (!entry) return null;
-  const keys = ['id', 'transactionId', 'sessionId', 'pane', 'agent', 'sourceAccountId', 'targetAccountId', 'intent', 'force', 'status', 'phase', 'reason', 'updatedAt'];
+  const keys = ['id', 'transactionId', 'sessionId', 'pane', 'agent', 'sourceAccountId', 'targetAccountId', 'intent', 'force', 'status', 'phase', 'reason', 'refusalClass', 'updatedAt'];
   return {
     ...Object.fromEntries(keys.filter((key) => entry[key] != null).map((key) => [key, entry[key]])),
     ...(portableFallbackCandidate(entry) ? { portableFallbackAvailable: true } : {}),
@@ -683,4 +730,4 @@ function abandonedForPortable(root, sessionId) {
 }
 
 module.exports = { run, abandonForPortable, abandonedForPortable, list, safe, authPreflight, permissionClass,
-  loginShellOutput, CONTINUATION_TEXT };
+  loginShellOutput, classifyRefusal, CONTINUATION_TEXT };

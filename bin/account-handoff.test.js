@@ -845,3 +845,61 @@ test('a non-boolean force is rejected before anything is inspected', async () =>
       (error) => error.status === 400 && /force must be a boolean/.test(error.message));
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
+
+// ---------- refusal classes ----------
+
+test('refusals that clear on their own are told apart from the ones that need a person', () => {
+  // Every one of these refused at least one of the nine transfers moved by hand on
+  // 2026-09-15, and every one of them cleared on its own.
+  for (const reason of [
+    'another session injection is busy',
+    'Waiting for the turn and background work to finish',
+    'Waiting until the pane is no longer being viewed',
+    'Waiting for pending input to be resolved',
+    'Waiting for job ledger recovery',
+    'Pause session-local scheduled jobs before restarting',
+    'Session changed during cleanup; nothing closed',
+    'Session changed during restart',
+    'host request timed out (get)',
+    'Session activity could not be verified',
+    'Live pane state could not be verified',
+    'Command failed: ps -axo pid=,ppid=,tty=,lstart=,args=',
+    'Local background processes are still present',
+    'Job ledger source changed during restart',
+    'Job ledger evidence changed during restart',
+    'New hook activity arrived during restart',
+  ]) assert.equal(handoff.classifyRefusal(reason), 'transient', reason);
+
+  // And these say a person has to look before the same request is worth repeating.
+  for (const reason of [
+    'Current Claude model cannot be reproduced safely',
+    'Session uses a custom permission configuration that cannot be reproduced safely',
+    "ENOENT: no such file or directory, open '/x/subagents/agent-1.jsonl'",
+    'Target claude account is not logged in; source session was left running',
+    'Target account setup is incompatible: Codex provider configuration could not be verified',
+    'Source account setup is unavailable: managed memory is missing',
+    'Session process changed',
+    'Session process changed during restart',
+    'Agent process identity changed during restart',
+    'Claude is showing a dialog',
+    'source and target account are the same',
+    '',
+    null,
+    undefined,
+  ]) assert.equal(handoff.classifyRefusal(reason), 'blocked', String(reason));
+});
+
+test('a stopped transfer records its refusal class and publishes it with the record', async () => {
+  const f = fixture();
+  try {
+    const d = deps(f, { restartSession: async () => { throw new Error('another session injection is busy'); } });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d));
+    const [transient] = handoff.list(f.root);
+    assert.equal(transient.status, 'recovery-needed');
+    assert.equal(transient.refusalClass, 'transient');
+
+    const blocked = deps(f, { restartSession: async () => { throw new Error('Session process changed'); } });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, blocked));
+    assert.equal(handoff.list(f.root)[0].refusalClass, 'blocked');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
