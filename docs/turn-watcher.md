@@ -688,8 +688,13 @@ when the box holds exactly what was typed, which is the ordinary case; then the
 box is read *again*, and "cleared" is claimed only when it is genuinely empty. If
 Owner has typed into it since, the box is his, the message is left where it is,
 and the refusal carries `draftLeftOnScreen` with a reason — `mixed draft`,
-`still there`, `escape failed`, `unreadable screen`. Clearing is opt-in per
-caller: session cleanup keeps its typed `/exit` on screen, as it always has.
+`still there`, `escape failed`, `unreadable screen`, `input arrived`, `pane
+replaced`, `input unverified`, `host reload required`. Clearing is opt-in per
+caller, and session cleanup is both kinds of caller. A close Owner asked for
+keeps its typed `/exit` on screen, as it always has, so he can see what was about
+to happen; a restart's cleanup typed on nobody's behalf and will be tried again,
+so it takes the draft back through the same guarded discard — the retry cannot
+type into a box that still holds it.
 
 **The slot is reserved before the send, not counted.** A `deliveries` row
 (`turn_id` primary key) is claimed inside one `BEGIN IMMEDIATE` alongside the
