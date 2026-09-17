@@ -15,6 +15,9 @@ const TASK_FRONTMATTER_FIELDS = ['title', 'status', 'project', 'tags', 'next', '
 const SESSION_SUMMARY_FIELDS = [
   'id', 'num', 'kind', 'agent', 'project', 'title', 'taskId', 'taskStatus', 'mtime', 'lastUserAt',
   'state', 'stateLabel', 'endedTurn', 'alive', 'exited', 'pane', 'rateLimit', 'reviewer',
+  // `agent` above is the provider (claude/codex); `agentName` is the standing
+  // agent whose session this is, and gates the same controls `reviewer` does.
+  'agentName',
   // The watcher's one-line "what this session just did and what is next", and the
   // verdict it came from. `pick` drops them when the watcher has not run.
   'gitBranch', 'stalled', 'stateLine', 'lastVerdict', 'lastVerdictAt', 'verdictConfidence', 'pendingDecision',

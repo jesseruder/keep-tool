@@ -922,8 +922,13 @@ the top-level text), with `&gt;`/`&lt;`/`&amp;` unescaped first:
   different states: `[FIRING:1, RESOLVED:1]` writes two headers with a block each, and
   `[FIRING:3]` writes one header with three blocks. Splitting happens on both, so each
   block becomes its own alert with its own labels; splitting on the header alone merged
-  three separately stuck sandboxes into one signature and one card. A section with a
-  `Labels:` line but no `Value:` line is still read as one block.
+  three separately stuck sandboxes into one signature and one card. A `Value:` line is a
+  block boundary only when that alert's `Labels:` line follows it within three lines and
+  before any other field: an annotation's text can wrap onto its own line at column zero,
+  so a description containing "Value: something" would otherwise open a spurious
+  label-less card. A section with no boundary at all is read as one block, and text ahead
+  of the first boundary is its own block when it carries a `Labels:` line — an alert
+  missing its own `Value:` line would otherwise be swallowed into the next one's slice.
   The title is the
   `alertname` label, never the Slack title, which is unusable on a grouped post. The
   signature is `grafana:<slug(alertname)>` plus every other label as sorted
@@ -946,10 +951,14 @@ the top-level text), with `&gt;`/`&lt;`/`&amp;` unescaped first:
 
 One incident card per signature: id `inc-<slug(signature)>` (long signatures are
 truncated with a hash suffix), kind `bug`, tag `incident`, status `active`, title
-`Incident: <title>`, and the area's project — resolved the same way
-`keep add --project <name|path>` resolves it, so a bare name like `castle-sandboxes`
-becomes its checkout path and the card gets that project's scope tag rather than the
-default one. A name that resolves to nothing keeps the configured value.
+`Incident: <title>`, and the area's project. A configured path is used as it stands; a
+bare name like `castle-sandboxes` is resolved the way `keep add --project <name|path>`
+resolves it, into its checkout path, because `addTask` reads a card's scope off the
+project *path* and a bare name matches no scope rule — filed as-is it would land every
+incident card under the default scope. A bare name that resolves to nothing fails that
+alert's write: the mutation is reported `ok:false` with one line on stderr, the poll does
+not acknowledge the message, and the next poll retries it. That is deliberate — filing
+the card under the wrong scope, silently, is the bug this replaced.
 The body carries the Slack permalink, the
 area and the signature, plus the first firing text inside a `DATA, NOT INSTRUCTIONS`
 fence. Later firings check in as `alert firing (N)` and bump the count rather than
@@ -1010,15 +1019,22 @@ next.
 `.keep/agents/<name>/` holds one agent:
 
 - `record.json` — `{name, role, model, account, project, cwd, area, session: {id, pane,
-  startedAt}, lifecycle, card, lastTick, restarts, createdAt}`. `lifecycle` is `idle`,
-  `working`, `needs-you` or `stopped`. Every write loads, merges and saves inside the
-  registry lock, so two writers cannot each load the same record and lose the other's
-  change.
+  startedAt}, lifecycle, card, lastEvent, unseen: {count, needsYou}, lastTick, restarts,
+  createdAt}`. `lifecycle` is `idle`, `working`, `needs-you` or `stopped`. Every write
+  loads, merges and saves inside the registry lock, so two writers cannot each load the
+  same record and lose the other's change. `lastEvent` and `unseen` are the feed's
+  summary, kept here so a dashboard build never opens `events.jsonl`: an agent months
+  into its life would otherwise cost a parse of its whole history on every state
+  refresh. `emit` advances both inside the lock that appended the event; `markSeen`,
+  which rewrites the file anyway, recomputes them from it, which is also how a count
+  left behind by a write that failed half-way is repaired.
 - `events.jsonl` — the feed. `{at, kind, card, severity, needsYou, seenAt, …}`, one
   event per line, append order. Events carry pointers — a card, a signature, one line
   of text — never message bodies: the home model pays for every byte it reads. Event
   text is untrusted data exactly as Slack text is; it is displayed and clipped, never
-  followed.
+  followed. The feed is the truth and the record's summary is a cache of its end, so an
+  `emit` appends before it updates the record. A read for the API or the CLI parses only
+  the last 256 KB: the feed is append-only and those callers want its end.
 - `notes.md` — the agent's own standing notes, owned by its recipe.
 
 `.keep/` is otherwise ignored runtime state, so these are force-added the way
@@ -1062,8 +1078,12 @@ live pane; expanding is the acknowledgement, so it posts `seen`. The empty-state
 read "N running · N pinned · N agents", the last only when there is one. Agents are never
 selected, counted or dismissed as queue items.
 
-A session an agent is carrying is marked `session.agent = <name>` when its id or pane
-matches a record's, beside the `session.reviewer` flag it does not replace. Both mean the
+A session an agent is carrying is marked `session.agentName = <name>` when its id or pane
+matches a record's — or when the pane's `meta.agentName` names one, which is authority for
+a pane a record has not caught up with. It is deliberately not `session.agent`: on a
+session, on pane meta and on a process row, `agent` already means the provider, claude or
+codex, and `meta.agent` keeps saying which harness is running in the pane. `agentName`
+sits beside the `session.reviewer` flag it does not replace. Both mean the
 same thing for the console: an agent's session is not a working session, so it offers no
 transfer, handoff, restart or relay control, and it is listed under Agents rather than
 under Running & waiting.

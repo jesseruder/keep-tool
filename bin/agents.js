@@ -25,6 +25,9 @@ const LIFECYCLES = new Set(['idle', 'working', 'needs-you', 'stopped']);
 const SEVERITIES = new Set(['low', 'med', 'high']);
 const TEXT_MAX = 400;
 const EVENT_LIMIT = 2000;
+// How much of a feed's end a read looks at. Generous next to a 50-event page of
+// one-line events, and a hard ceiling on what one request can parse.
+const TAIL_BYTES = 256 * 1024;
 const DEFAULT_EVENT_LIMIT = 50;
 const EXPANDED_EVENTS = 20;
 
@@ -89,6 +92,8 @@ function writeTextAtomic(file, text) {
 function normalizeRecord(name, value = {}) {
   const session = value.session && typeof value.session === 'object' && !Array.isArray(value.session)
     ? value.session : {};
+  const unseen = value.unseen && typeof value.unseen === 'object' && !Array.isArray(value.unseen)
+    ? value.unseen : {};
   return {
     ...value,
     name: String(name),
@@ -108,6 +113,12 @@ function normalizeRecord(name, value = {}) {
     lastTick: Number(value.lastTick || 0) || 0,
     restarts: Number(value.restarts || 0) || 0,
     createdAt: Number(value.createdAt || 0) || 0,
+    // The feed's summary, kept here so a dashboard build never opens
+    // events.jsonl: emit advances both inside the lock that appended the event,
+    // and markSeen — which rewrites the file anyway — recomputes them from it,
+    // which is also how a count that drifted is repaired.
+    lastEvent: eventSummary(value.lastEvent),
+    unseen: { count: Math.max(0, Number(unseen.count || 0) || 0), needsYou: unseen.needsYou === true },
   };
 }
 
@@ -191,24 +202,46 @@ function normalizeEvent(event = {}, now = Date.now()) {
   return entry;
 }
 
-// File order, oldest first: that is append order, which is what markSeen and
-// "the last event" both reason about.
-function loadEvents(name, root = keep.ROOT) {
-  let text;
-  try { text = fs.readFileSync(eventsFile(name, root), 'utf8'); } catch { return []; }
+function parseEventLines(text) {
   const events = [];
-  for (const line of text.split('\n')) {
+  for (const line of String(text || '').split('\n')) {
     if (!line.trim()) continue;
     try { events.push(normalizeEvent(JSON.parse(line), 0)); } catch {}
   }
   return events;
 }
 
-// The feed as the API and the CLI show it: newest first, capped.
+// The whole file, in append order. Only markSeen needs this — it rewrites the
+// file, so it has to hold all of it — and it is the one place the feed's own
+// counts are recomputed. Nothing on the dashboard path calls it.
+function loadEvents(name, root = keep.ROOT) {
+  try { return parseEventLines(fs.readFileSync(eventsFile(name, root), 'utf8')); } catch { return []; }
+}
+
+// The feed as the API and the CLI show it: newest first, capped. Only the last
+// TAIL_BYTES are read — a feed is append-only and these callers want its end,
+// so an agent that has been running for months costs the same as a new one. The
+// first line of the window may have been cut mid-record by the byte offset, so
+// it is dropped unless the window is the whole file.
 function readEvents(name, options = {}) {
   const root = options.root || keep.ROOT;
   const limit = Math.min(EVENT_LIMIT, Math.max(1, Number(options.limit) || DEFAULT_EVENT_LIMIT));
-  let events = loadEvents(name, root).slice().reverse();
+  const file = eventsFile(name, root);
+  let text = '';
+  let partial = false;
+  let handle;
+  try {
+    handle = fs.openSync(file, 'r');
+    const size = fs.fstatSync(handle).size;
+    const start = Math.max(0, size - TAIL_BYTES);
+    const length = size - start;
+    const buffer = Buffer.alloc(length);
+    if (length) fs.readSync(handle, buffer, 0, length, start);
+    text = buffer.toString('utf8');
+    partial = start > 0;
+  } catch { return []; }
+  finally { if (handle !== undefined) { try { fs.closeSync(handle); } catch {} } }
+  let events = parseEventLines(partial ? text.slice(text.indexOf('\n') + 1) : text).reverse();
   if (options.unseen) events = events.filter((event) => !event.seenAt);
   return events.slice(0, limit);
 }
@@ -221,6 +254,20 @@ function unseenSummary(events) {
 function eventLine(event) {
   if (!event) return '';
   return oneLine(event.text || event.title || event.kind || '', TEXT_MAX);
+}
+
+// What a row shows about the newest event, and all of it the record stores: the
+// feed itself stays the only copy of the events.
+function eventSummary(event) {
+  if (!event || typeof event !== 'object' || Array.isArray(event)) return null;
+  return {
+    at: Number(event.at || 0) || 0,
+    kind: oneLine(event.kind || '', 60),
+    card: oneLine(event.card || '', 120),
+    severity: SEVERITIES.has(event.severity) ? event.severity : 'med',
+    needsYou: event.needsYou === true,
+    text: eventLine(event),
+  };
 }
 
 function alertText(name, event) {
@@ -265,18 +312,37 @@ function emit(name, event = {}, options = {}) {
     say(`dropped an event for an unusable agent name ${JSON.stringify(String(name || ''))}`);
     return null;
   }
-  if (!readRecord(name, root)) {
-    say(`no record for ${name}; dropped its ${oneLine(event && event.kind || 'note', 60)} event`);
-    return null;
-  }
   const entry = normalizeEvent(event, Number(options.now) || Date.now());
+  let landed;
   try {
-    locked(options, () => {
+    // The record is read, the event appended and the record's summary advanced
+    // in one lock hold: a reader that saw the new line and the old count would
+    // be showing a stale badge, and a second emitter loading the count before
+    // this one wrote it would lose an increment.
+    landed = locked(options, () => {
+      const record = readRecord(name, root);
+      if (!record) return { missing: true };
       fs.mkdirSync(agentDir(name, root), { recursive: true });
+      // The feed is the truth and the record's counts are a cache of its end,
+      // so the append goes first: a failure after it leaves a count to repair
+      // (markSeen recomputes it), not an event nobody has.
       fs.appendFileSync(eventsFile(name, root), JSON.stringify(entry) + '\n');
+      writeJsonAtomic(recordFile(name, root), normalizeRecord(name, {
+        ...record,
+        lastEvent: entry,
+        unseen: {
+          count: record.unseen.count + 1,
+          needsYou: record.unseen.needsYou || entry.needsYou,
+        },
+      }));
+      return { ok: true };
     });
   } catch (error) {
-    say(`could not append to ${eventsFile(name, root)}: ${oneLine(error && error.message || error, 200)}`);
+    say(`could not write to ${agentDir(name, root)}: ${oneLine(error && error.message || error, 200)}`);
+    return null;
+  }
+  if (landed.missing) {
+    say(`no record for ${name}; dropped its ${entry.kind} event`);
     return null;
   }
   markPending(root, name);
@@ -285,8 +351,13 @@ function emit(name, event = {}, options = {}) {
 }
 
 // Stamp `seenAt` on every unseen event at or before `until`. The whole file is
-// rewritten, so it happens under the lock and through a temp file: a feed the
-// dashboard is reading must never be a half-written one.
+// read and rewritten, so it happens under the lock and through a temp file: a
+// feed the dashboard is reading must never be a half-written one, and an emit
+// appending between the read and the rewrite would otherwise be erased.
+//
+// This is also the one place the record's cached counts are recomputed from the
+// feed rather than advanced, so a count left behind by a write that failed
+// half-way is repaired the next time Owner looks at the row.
 function markSeen(name, until = Date.now(), options = {}) {
   const root = options.root || keep.ROOT;
   const now = Number(options.now) || Date.now();
@@ -304,7 +375,21 @@ function markSeen(name, until = Date.now(), options = {}) {
       writeTextAtomic(eventsFile(name, root), events.map((event) => JSON.stringify(event)).join('\n') + '\n');
       markPending(root, name);
     }
-    return { marked, ...unseenSummary(events) };
+    const summary = unseenSummary(events);
+    const record = readRecord(name, root);
+    if (record) {
+      const last = events.length ? events[events.length - 1] : null;
+      const current = eventSummary(record.lastEvent);
+      const rebuilt = eventSummary(last);
+      if (record.unseen.count !== summary.count || record.unseen.needsYou !== summary.needsYou
+          || JSON.stringify(current) !== JSON.stringify(rebuilt)) {
+        writeJsonAtomic(recordFile(name, root), normalizeRecord(name, {
+          ...record, unseen: summary, lastEvent: last,
+        }));
+        markPending(root, name);
+      }
+    }
+    return { marked, ...summary };
   });
 }
 
@@ -395,30 +480,46 @@ function sessionLive(session) {
   return ['running', 'waiting'].includes(session.state);
 }
 
-// `session.agent` is the name of the agent a session is currently carrying. It
-// sits beside `session.reviewer` and means the same thing for the controls the
-// console offers: a session that belongs to an agent is not a working session
-// Owner transfers, hands off, restarts or relays into.
-function applySessions(sessions, list) {
+// `session.agentName` is the name of the standing agent a session is currently
+// carrying. It sits beside `session.reviewer` and means the same thing for the
+// controls the console offers: a session that belongs to an agent is not a
+// working session Owner transfers, hands off, restarts or relays into.
+//
+// Deliberately not `agent`: that name is already the provider — claude or codex
+// — on pane meta, process rows, session identities and the mobile contract. A
+// pane an agent owns is stamped `meta.agentName` for the same reason, and
+// `meta.agent` keeps saying which harness is running in it.
+function applySessions(sessions, list, panes = []) {
+  const known = new Set();
   const byId = new Map();
   const byPane = new Map();
   for (const record of list || []) {
+    known.add(record.name);
     if (record.session.id) byId.set(record.session.id, record.name);
     if (record.session.pane) byPane.set(record.session.pane, record.name);
   }
-  if (!byId.size && !byPane.size) return;
+  if (!known.size) return;
+  // A pane that names its agent is authority for the panes a record has not
+  // caught up with yet: an in-place restart replaces the pane, and between the
+  // agent stopping and the record being rewritten the pane is the only thing
+  // that still knows whose session it is.
+  for (const pane of panes || []) {
+    const name = pane && pane.meta && pane.meta.agentName;
+    if (name && known.has(name) && pane.id) byPane.set(String(pane.id), String(name));
+  }
   for (const session of sessions || []) {
     const name = byId.get(session.id)
       || byPane.get(session.pane)
       || byPane.get(session.runtime && session.runtime.paneId);
-    if (name) session.agent = name;
+    if (name) session.agentName = name;
   }
 }
 
-function agentView(record, options = {}) {
-  const root = options.root || keep.ROOT;
-  const events = loadEvents(record.name, root);
-  const last = events.length ? events[events.length - 1] : null;
+// One row, entirely out of record.json. A dashboard build runs on every state
+// refresh, so it must not open a feed: an agent months into its life would then
+// cost a full parse of its whole history on every poll.
+function agentView(record) {
+  const last = record.lastEvent;
   const session = record.session.id || record.session.pane
     ? { id: record.session.id, pane: record.session.pane, startedAt: record.session.startedAt || null }
     : null;
@@ -431,11 +532,8 @@ function agentView(record, options = {}) {
     lifecycle: record.lifecycle,
     card: record.card || (record.lifecycle === 'working' && last ? last.card : '') || '',
     session,
-    lastEvent: last ? {
-      at: last.at, kind: last.kind, card: last.card, severity: last.severity,
-      needsYou: last.needsYou === true, text: eventLine(last),
-    } : null,
-    unseen: unseenSummary(events),
+    lastEvent: last,
+    unseen: { ...record.unseen },
   };
 }
 
@@ -467,8 +565,8 @@ function reviewerView(options = {}) {
   };
 }
 
-// The `agents` array `/api/state` publishes. Never throws: a dashboard build
-// must not fail over an unreadable feed.
+// The `agents` array `/api/state` publishes, built from the records alone.
+// Never throws: a dashboard build must not fail over an unreadable record.
 function dashboardAgents(options = {}) {
   const root = options.root || keep.ROOT;
   const rows = [];
@@ -477,16 +575,16 @@ function dashboardAgents(options = {}) {
     if (reviewer) rows.push(reviewer);
   } catch {}
   for (const record of options.records || records(root)) {
-    try { rows.push(agentView(record, { root })); } catch {}
+    try { rows.push(agentView(record)); } catch {}
   }
   return rows;
 }
 
 module.exports = {
-  REVIEWER_NAME, EXPANDED_EVENTS, DEFAULT_EVENT_LIMIT,
+  REVIEWER_NAME, EXPANDED_EVENTS, DEFAULT_EVENT_LIMIT, TAIL_BYTES,
   validName, nameFromPath, agentsDir, agentDir, recordFile, eventsFile, notesFile,
   readRecord, records, writeRecord, ensure, normalizeRecord,
-  emit, markSeen, readEvents, loadEvents, unseenSummary, eventLine, alertText, normalizeEvent,
+  emit, markSeen, readEvents, loadEvents, unseenSummary, eventLine, eventSummary, alertText, normalizeEvent,
   flushCommits, pendingNames,
   areaAgent, incidentEmitter,
   applySessions, agentView, reviewerView, dashboardAgents,

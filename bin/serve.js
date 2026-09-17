@@ -6899,7 +6899,7 @@ function buildState(options = {}) {
   let agentRecords = [];
   try {
     agentRecords = agents.records(keep.ROOT);
-    agents.applySessions(sessions, agentRecords);
+    agents.applySessions(sessions, agentRecords, options.hostPanes || []);
   } catch {}
   const state = {
     generatedAt: Date.now(),

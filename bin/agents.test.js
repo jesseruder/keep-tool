@@ -13,11 +13,14 @@ const GHOST_BOT = 'B06PX3MFG5C';
 const SANDBOX_BOT = 'B0C1KEHNH8F';
 const ALERT_BOTS = { [GHOST_BOT]: 'ghost-server', [SANDBOX_BOT]: 'castle-sandboxes' };
 // `sandboxes` keeps the area's own name as its agent (the default); `app-server`
-// names a different one, which is the whole point of the mapping.
+// names a different one, which is the whole point of the mapping. The projects
+// are paths because a bare name is resolved against the real checkout tree and
+// would fail the write in a fixture root; the area here is chosen by `match` and
+// `default`, not by the bot's project.
 const AREAS = {
   areas: {
-    sandboxes: { project: 'castle-sandboxes', match: ['^Sandbox '] },
-    'app-server': { project: 'ghost-server', default: true, agent: 'app-responder' },
+    sandboxes: { project: '/tmp/castle-sandboxes', match: ['^Sandbox '] },
+    'app-server': { project: '/tmp/ghost-server', default: true, agent: 'app-responder' },
   },
   quietMin: 60,
   reopenHours: 24,
@@ -86,6 +89,8 @@ test('a record round-trips through the lock, and a second write merges rather th
     assert.equal(created.name, 'sandboxes');
     assert.equal(created.lifecycle, 'idle', 'an unset lifecycle defaults to idle');
     assert.equal(created.createdAt, 5000);
+    assert.equal(created.lastEvent, null);
+    assert.deepEqual(created.unseen, { count: 0, needsYou: false });
 
     const read = agents.readRecord('sandboxes', root);
     assert.deepEqual(read, created);
@@ -161,6 +166,111 @@ test('emit appends, markSeen stamps only what it was asked for, and the feed rea
     assert.equal(agents.markSeen('sandboxes', 2000, { root, now: 5000 }).marked, 0);
     assert.deepEqual(lines(root, 'sandboxes').map((event) => event.seenAt), [4000, 4000, 0]);
     assert.equal(agents.markSeen('sandboxes', 9000, { root, now: 6000 }).marked, 1);
+  } finally { cleanup(root); }
+});
+
+test('the record tracks the feed’s end, so a state build never opens events.jsonl', () => {
+  const root = makeRoot();
+  try {
+    agents.ensure('sandboxes', { role: 'incident-responder' }, { root });
+    agents.emit('sandboxes', { kind: 'diagnosed', card: 'inc-one', text: 'host pool is full' }, { root, now: 1000 });
+    agents.emit('sandboxes', { kind: 'needs-you', card: 'inc-one', needsYou: true, text: 'raise the cap?' }, {
+      root, now: 2000, sendAlert: () => {},
+    });
+
+    // Every emit advanced the record inside the lock that appended the event.
+    const record = agents.readRecord('sandboxes', root);
+    assert.deepEqual(record.unseen, { count: 2, needsYou: true });
+    assert.deepEqual(record.lastEvent, {
+      at: 2000, kind: 'needs-you', card: 'inc-one', severity: 'med', needsYou: true, text: 'raise the cap?',
+    });
+    assert.equal(Object.hasOwn(record.lastEvent, 'seenAt'), false, 'the row needs a summary, not the event');
+
+    // markSeen recomputes both from the file it rewrites.
+    agents.markSeen('sandboxes', 1000, { root, now: 3000 });
+    assert.deepEqual(agents.readRecord('sandboxes', root).unseen, { count: 1, needsYou: true });
+    agents.markSeen('sandboxes', 9000, { root, now: 4000 });
+    assert.deepEqual(agents.readRecord('sandboxes', root).unseen, { count: 0, needsYou: false });
+    assert.equal(agents.readRecord('sandboxes', root).lastEvent.kind, 'needs-you', 'seen is not forgotten');
+
+    // A count left behind by a write that failed half-way is repaired, not kept.
+    agents.writeRecord('sandboxes', { unseen: { count: 99, needsYou: true } }, { root });
+    assert.equal(agents.markSeen('sandboxes', 9000, { root, now: 5000 }).count, 0);
+    assert.deepEqual(agents.readRecord('sandboxes', root).unseen, { count: 0, needsYou: false });
+
+    // And the dashboard row comes out of record.json alone: a feed that cannot
+    // be read at all changes nothing about it.
+    const realReadFileSync = fs.readFileSync;
+    let feedReads = 0;
+    fs.readFileSync = (file, ...rest) => {
+      if (String(file).endsWith('events.jsonl')) { feedReads += 1; throw new Error('events.jsonl is not readable'); }
+      return realReadFileSync(file, ...rest);
+    };
+    let rows;
+    try { rows = agents.dashboardAgents({ root }); } finally { fs.readFileSync = realReadFileSync; }
+    assert.equal(feedReads, 0, 'the state build did not even try to open the feed');
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].name, 'sandboxes');
+    assert.equal(rows[0].lastEvent.kind, 'needs-you');
+    assert.deepEqual(rows[0].unseen, { count: 0, needsYou: false });
+  } finally { cleanup(root); }
+});
+
+test('a feed read parses only the end of the file', () => {
+  const root = makeRoot();
+  try {
+    agents.ensure('sandboxes', {}, { root });
+    // A feed longer than the tail window, written directly: emit would be the
+    // slow way to build one and the point here is the read.
+    const filler = 'x'.repeat(2000);
+    const rows = [];
+    for (let index = 0; index < 1200; index += 1) {
+      rows.push(JSON.stringify(agents.normalizeEvent({ kind: `e${index}`, at: 1000 + index, text: filler }, 0)));
+    }
+    fs.writeFileSync(agents.eventsFile('sandboxes', root), rows.join('\n') + '\n');
+    assert.ok(fs.statSync(agents.eventsFile('sandboxes', root)).size > agents.TAIL_BYTES,
+      'the fixture is bigger than the window');
+
+    const page = agents.readEvents('sandboxes', { root, limit: 3 });
+    assert.deepEqual(page.map((event) => event.kind), ['e1199', 'e1198', 'e1197'], 'newest first');
+    // The window starts mid-file, so the line it cut in half is dropped rather
+    // than parsed as a truncated record.
+    const all = agents.readEvents('sandboxes', { root, limit: 2000 });
+    assert.ok(all.length > 1 && all.length < 1200, `a bounded slice of the feed, got ${all.length}`);
+    assert.equal(all.every((event) => /^e\d+$/.test(event.kind)), true, 'no half-parsed line survived');
+    // markSeen still sees the whole file: it rewrites it.
+    assert.equal(agents.markSeen('sandboxes', 9000, { root, now: 5000 }).marked, 1200);
+  } finally { cleanup(root); }
+});
+
+test('markSeen rewrites and emit appends under one lock each, losing neither write', () => {
+  const root = makeRoot();
+  try {
+    agents.ensure('sandboxes', {}, { root });
+    let depth = 0;
+    let nested = false;
+    const holds = [];
+    const withLock = (fn) => {
+      if (depth > 0) nested = true;
+      depth += 1;
+      holds.push('enter');
+      try { return fn(); } finally { depth -= 1; holds.push('exit'); }
+    };
+    agents.emit('sandboxes', { kind: 'one', at: 1000 }, { root, withLock });
+    agents.emit('sandboxes', { kind: 'two', at: 2000 }, { root, withLock });
+    // The whole load-stamp-rewrite is one hold: an emit that landed between the
+    // read and the rewrite would be erased by it, which is why they share a lock.
+    assert.equal(agents.markSeen('sandboxes', 9000, { root, now: 3000, withLock }).marked, 2);
+    // A third event arrives after the rewrite and is not lost by it.
+    agents.emit('sandboxes', { kind: 'three', at: 4000 }, { root, withLock });
+
+    assert.equal(nested, false, 'no write takes the registry lock twice');
+    assert.equal(holds.length, 8, 'one enter/exit pair per write, read-modify-write included');
+    const written = lines(root, 'sandboxes');
+    assert.deepEqual(written.map((event) => event.kind), ['one', 'two', 'three']);
+    assert.deepEqual(written.map((event) => event.seenAt), [3000, 3000, 0]);
+    assert.deepEqual(agents.readRecord('sandboxes', root).unseen, { count: 1, needsYou: false });
+    assert.equal(agents.readRecord('sandboxes', root).lastEvent.kind, 'three');
   } finally { cleanup(root); }
 });
 
@@ -305,7 +415,7 @@ test('the reviewer is derived from the reviewer field, never written, and never 
   } finally { cleanup(root); }
 });
 
-test('a session carrying an agent is marked with its name, by id or by pane', () => {
+test('a session carrying an agent is marked with its name, by id, pane or pane meta', () => {
   const root = makeRoot();
   try {
     agents.ensure('sandboxes', { session: { id: 'sess-1', pane: 'pane-1' } }, { root });
@@ -315,10 +425,105 @@ test('a session carrying an agent is marked with its name, by id or by pane', ()
       { id: 'sess-2', pane: 'pane-2' },
       { id: 'sess-3', pane: 'pane-3', runtime: { paneId: 'pane-2' } },
       { id: 'sess-4', pane: 'pane-4' },
+      { id: 'sess-5', pane: 'pane-5' },
     ];
-    agents.applySessions(sessions, agents.records(root));
-    assert.deepEqual(sessions.map((session) => session.agent),
-      ['sandboxes', 'app-responder', 'app-responder', undefined]);
+    const panes = [
+      // A pane an agent owns names it, and a record that has not caught up with
+      // a replaced pane does not hide it.
+      { id: 'pane-5', meta: { agent: 'claude', agentName: 'sandboxes' } },
+      // `meta.agent` on its own is the provider and names no agent at all.
+      { id: 'pane-4', meta: { agent: 'codex' } },
+      { id: 'pane-6', meta: { agentName: 'not-a-record' } },
+    ];
+    agents.applySessions(sessions, agents.records(root), panes);
+    assert.deepEqual(sessions.map((session) => session.agentName),
+      ['sandboxes', 'app-responder', 'app-responder', undefined, 'sandboxes']);
+  } finally { cleanup(root); }
+});
+
+// `agent` is the provider — claude or codex — on sessions, pane meta, process
+// rows and the mobile contract. The standing agent's name is a separate field
+// precisely so a codex-backed agent session does not surface as codex-less.
+test('the provider field survives: a codex session keeps agent and gains agentName', () => {
+  const root = makeRoot();
+  try {
+    agents.ensure('sandboxes', { session: { id: 'sess-codex', pane: 'pane-1' } }, { root });
+    const session = { id: 'sess-codex', kind: 'codex', agent: 'codex', pane: 'pane-1' };
+    agents.applySessions([session], agents.records(root));
+    assert.equal(session.agent, 'codex', 'the provider is untouched');
+    assert.equal(session.kind, 'codex');
+    assert.equal(session.agentName, 'sandboxes');
+
+    // The mobile projection carries both, and they do not stand in for each other.
+    const { sessionSummary, projectMobileState } = require('./mobile-state.js');
+    const summary = sessionSummary(session);
+    assert.equal(summary.agent, 'codex');
+    assert.equal(summary.agentName, 'sandboxes');
+    const view = projectMobileState({ sessions: [session], attention: [], tasks: [], panes: [], agents: [{ name: 'sandboxes' }] }, 'fleet');
+    assert.equal(view.sessions[0].agent, 'codex');
+    assert.equal(view.sessions[0].agentName, 'sandboxes');
+    assert.deepEqual(view.agents, [{ name: 'sandboxes' }]);
+  } finally { cleanup(root); }
+});
+
+// ---------- the routes ----------
+
+test('the agent routes match through the real ladder without shadowing an exact path', async () => {
+  const root = makeRoot();
+  try {
+    agents.ensure('sandboxes', {}, { root });
+    agents.emit('sandboxes', { kind: 'diagnosed', card: 'inc-one', text: 'host pool is full' }, { root, now: 1000 });
+
+    const { routes, matchRoute } = require('./serve/routes.js');
+    const broadcasts = [];
+    const list = routes({
+      keep: { ROOT: root },
+      broadcast: () => broadcasts.push('state'),
+      json: (res, status, value) => ({ status, value }),
+    });
+    const match = (method, pathname) => {
+      const url = new URL(`http://x${pathname}`);
+      const route = matchRoute(list, { req: { method, headers: { 'x-keep': '1' } }, url, body: {} });
+      return { route, url };
+    };
+    const call = async (method, pathname, body = {}) => {
+      const { route, url } = match(method, pathname);
+      assert.ok(route, `${method} ${pathname} matched no route`);
+      return route.handle({ req: { method, headers: { 'x-keep': '1' } }, res: {}, url, body });
+    };
+
+    const read = await call('GET', '/api/agents/sandboxes/events?limit=5');
+    assert.equal(read.status, 200);
+    assert.deepEqual(read.value.events.map((event) => event.kind), ['diagnosed']);
+
+    const seen = await call('POST', '/api/agents/sandboxes/seen');
+    assert.equal(seen.status, 200);
+    assert.deepEqual({ marked: seen.value.marked, count: seen.value.count }, { marked: 1, count: 0 });
+    assert.deepEqual(broadcasts, ['state'], 'the badge only clears on a rebuilt state');
+
+    // An encoded traversal reaches the route — the pathname keeps its %2F — and
+    // the handler refuses it rather than reading whatever it points at.
+    for (const pathname of ['/api/agents/..%2F..%2Fetc/events', '/api/agents/Sandboxes/events']) {
+      const refused = await call('GET', pathname);
+      assert.equal(refused.status, 400);
+      assert.equal(refused.value.error, 'bad agent name');
+    }
+    assert.equal((await call('POST', '/api/agents/..%2F..%2Fetc/seen')).status, 400);
+    assert.equal(fs.existsSync(path.join(root, '.keep', 'agents', '..')), true, 'the parent dir, untouched');
+    assert.deepEqual(fs.readdirSync(path.join(root, '.keep', 'agents')), ['sandboxes']);
+
+    // A missing x-keep header is still a 403 on the read, as on every other
+    // route that exposes session detail.
+    const { route: guarded, url } = match('GET', '/api/agents/sandboxes/events');
+    assert.equal((await guarded.handle({ req: { method: 'GET', headers: {} }, res: {}, url })).status, 403);
+
+    // The patterns own exactly their own paths, and nothing else moved.
+    assert.equal(match('GET', '/api/agents/sandboxes/seen').route, null);
+    assert.equal(match('POST', '/api/agents/sandboxes/events').route, null);
+    assert.equal(match('GET', '/api/agents/a/b/events').route, null);
+    assert.equal(match('GET', '/api/state').route.path, '/api/state');
+    assert.equal(match('POST', '/api/terminal-profile').route.path, '/api/terminal-profile');
+    assert.equal(match('GET', '/api/panes').route.path, '/api/panes');
   } finally { cleanup(root); }
 });
 
