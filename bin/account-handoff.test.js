@@ -873,6 +873,8 @@ test('refusals that clear on their own are told apart from the ones that need a 
     'Agent process identity changed during restart',
     'Original agent process identity is unverified',
     'Session helper processes changed during restart',
+    // The restart's /exit was taken back off the screen, so the pane is as it was.
+    'message was typed but could not be confirmed; the typed /exit was cleared',
   ]) assert.equal(handoff.classifyRefusal(reason), 'transient', reason);
 
   // And these say a person has to look before the same request is worth repeating.
@@ -885,6 +887,9 @@ test('refusals that clear on their own are told apart from the ones that need a 
     'Source account setup is unavailable: managed memory is missing',
     'Session process changed',
     'Session process changed during restart',
+    // The other spelling of the same refusal: the text is still in the box, and a
+    // person has to clear it before anything can type there again.
+    'message was typed but could not be confirmed; Enter was not pressed',
     'Claude is showing a dialog',
     'source and target account are the same',
     '',

@@ -2254,26 +2254,31 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
     write(`keep serve: left an aborted draft on pane ${pane}: the input box no longer holds only the typed message\n`);
     return { cleared: false, reason: 'mixed draft' };
   }
-  try {
-    await pressTargetKey(target, 'Escape', deps);
-  } catch (error) {
-    write(`keep serve: could not clear an aborted draft on pane ${pane}: ${String((error && error.message) || error)}\n`);
-    return { cleared: false, reason: 'escape failed' };
+  // Escape is a keystroke, not a guarantee. Read the box back after each one:
+  // "cleared" is a claim about the session, so it is only made when the box is
+  // actually empty. Twice at most, because a Claude slash draft has its command menu
+  // open below the box and the first Escape may close only that menu. The second one
+  // is pressed only while the box still holds exactly what was typed — if it holds
+  // anything else by then it is somebody's text, and this stops touching it.
+  let after = screen;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (attempt > 0 && !draftIsExactly(after, text, kind)) break;
+    try {
+      await pressTargetKey(target, 'Escape', deps);
+    } catch (error) {
+      write(`keep serve: could not clear an aborted draft on pane ${pane}: ${String((error && error.message) || error)}\n`);
+      return { cleared: false, reason: 'escape failed' };
+    }
+    try {
+      after = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false);
+    } catch (error) {
+      write(`keep serve: could not confirm the cleared draft on pane ${pane}: ${String((error && error.message) || error)}\n`);
+      return { cleared: false, reason: 'unconfirmed clear' };
+    }
+    if (draftRegionText(after, kind) === '') return { cleared: true, reason: null };
   }
-  // Escape is a keystroke, not a guarantee. Read the box back: "cleared" is a
-  // claim about the session, so it is only made when the box is actually empty.
-  let after = '';
-  try {
-    after = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false);
-  } catch (error) {
-    write(`keep serve: could not confirm the cleared draft on pane ${pane}: ${String((error && error.message) || error)}\n`);
-    return { cleared: false, reason: 'unconfirmed clear' };
-  }
-  if (draftRegionText(after, kind) !== '') {
-    write(`keep serve: the draft on pane ${pane} is still there after Escape\n`);
-    return { cleared: false, reason: 'still there' };
-  }
-  return { cleared: true, reason: null };
+  write(`keep serve: the draft on pane ${pane} is still there after Escape\n`);
+  return { cleared: false, reason: 'still there' };
 }
 
 // Marks a failure as one that happened with characters already written to the
@@ -2298,26 +2303,52 @@ async function typeAndSubmit(target, text, confirmationCheck, deps = {}) {
   deps.deliveryTrace?.('write-finished');
   let confirmed = false;
   let confirmation = '';
-  for (let attempt = 0; attempt < 4 && !confirmed; attempt += 1) {
+  // How long the screen is given to catch up, at 400ms a poll. Four is enough for a
+  // plain message; a caller whose text makes Claude render more than the line — a
+  // slash command draws its menu too — asks for more, because on a loaded machine
+  // 1.6s was not enough and the typed /exit was abandoned in the box with its menu
+  // open, which is the one state a retry cannot type into.
+  const requested = Number(deps.confirmationAttempts);
+  const attempts = Number.isFinite(requested) && requested >= 1 ? Math.floor(requested) : 4;
+  for (let attempt = 0; attempt < attempts && !confirmed; attempt += 1) {
     await sleep(400);
     try { confirmation = await read(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false); } catch { deps.deliveryTrace?.('screen-read-failed'); continue; }
     confirmed = confirmationCheck(confirmation, text);
     deps.deliveryTrace?.('screen-confirmation', { matched: confirmed });
   }
   if (!confirmed) {
-    throw typedAlready(new InjectionError(409, 'message was typed but could not be confirmed; Enter was not pressed', {
+    // Same rule as the beforeEnter abort below: a caller that typed on nobody's
+    // behalf takes its draft back rather than leaving it in the box. Without this the
+    // text stays there forever — nothing pressed Enter and nothing pressed Escape —
+    // and the next attempt refuses on a draft this one left behind.
+    const discard = deps.discardDraftOnAbort
+      ? await discardTypedDraft(target, text, deps.draftKind, deps)
+      : { cleared: false, reason: 'not requested' };
+    deps.deliveryTrace?.('enter-aborted', { cleared: discard.cleared, reason: discard.reason });
+    // Whether the pane was left with text in it is the difference between a refusal
+    // worth retrying and one a person has to clear, so it is in the message itself.
+    const label = /^\/[A-Za-z][A-Za-z0-9-]{0,19}$/.test(String(text)) ? String(text) : 'message';
+    const error = new InjectionError(409, discard.cleared
+      ? `message was typed but could not be confirmed; the typed ${label} was cleared`
+      : 'message was typed but could not be confirmed; Enter was not pressed', {
       screenTail: screenTail(confirmation),
-    }));
+    });
+    if (deps.discardDraftOnAbort && !discard.cleared) {
+      error.draftLeftOnScreen = true;
+      error.draftReason = discard.reason;
+    }
+    throw typedAlready(error);
   }
   if (deps.beforeEnter) {
     try {
       await deps.beforeEnter(target);
     } catch (error) {
       // The text is in the box and Enter has not been pressed. Callers that
-      // typed on nobody's behalf (the watcher) ask for the draft to be cleared,
-      // because a draft nobody typed is worse than no message at all. Session
-      // cleanup keeps its typed /exit on screen, as it always has, so Owner can
-      // see what was about to happen.
+      // typed on nobody's behalf — the watcher, and a restart's own /exit — ask
+      // for the draft to be cleared, because a draft nobody typed is worse than
+      // no message at all, and a retry cannot type into a box that still holds
+      // it. A close Owner asked for keeps its typed /exit on screen, as it always
+      // has, so he can see what was about to happen.
       const discard = deps.discardDraftOnAbort
         ? await discardTypedDraft(target, text, deps.draftKind, deps)
         : { cleared: false, reason: 'not requested' };
@@ -4341,10 +4372,20 @@ async function closeIdleSession(body, deps = {}) {
       }
     }
     deps.beforeExitInput?.();
-    // Claude's slash menu can occupy more than 30 rows below the input.
+    // Claude's slash menu can occupy more than 30 rows below the input, and on a
+    // loaded machine it can take seconds to draw: 4s of polling for Claude rather
+    // than 1.6s, because the alternative is a /exit stranded in the box.
+    //
+    // A restart types this on nobody's behalf and will be tried again, so an abort
+    // has to take the draft back with it. A manual close does not: Owner asked for
+    // it, and leaving the typed /exit on screen is how he sees what was about to
+    // happen.
     await typeAndSubmit(target, '/exit', (screen, text) => closeDraftVisible(screen, text, session.kind), {
       ...deps,
       confirmationLines: session.kind === 'claude' ? null : 30,
+      confirmationAttempts: session.kind === 'claude' ? 10 : 4,
+      discardDraftOnAbort: deps.closePolicy?.restart === true,
+      draftKind: session.kind,
       beforeEnter: async () => {
         submittedPane = await unchanged({
           expectedInputCount: authorizedPane ? authorizedPane.inputCount + 1 : null,

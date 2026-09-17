@@ -50,6 +50,11 @@ const TRANSIENT_REFUSALS = [
   /^Agent process identity changed during restart$/,
   /^Original agent process identity is unverified$/,
   /^Session helper processes changed during restart$/,
+  // The restart's own `/exit` typed, but the screen did not render it inside the
+  // poll — and the draft was taken back, so the pane is exactly as it was and the
+  // next attempt can type into it. The other spelling of this refusal, the one that
+  // leaves the text in the box, stays blocked: a person has to clear it first.
+  /^message was typed but could not be confirmed; the typed \/exit was cleared$/,
 ];
 // Checked first: these contain transient-looking words but name a durable
 // incompatibility that retrying cannot resolve.

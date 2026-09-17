@@ -4938,6 +4938,71 @@ test('an abort after typing clears only a draft that is still ours', async () =>
   assert.equal(fine.inputs[fine.inputs.length - 1], '\r');
 });
 
+// Claude draws a slash command's menu below the input box, under the rule that
+// closes it. The first Escape closes the menu and leaves the draft exactly where it
+// was; only the second one empties the box.
+const MENU = (draft) => [RULE, `❯ ${draft}`, RULE,
+  '  /exit                Exit the REPL',
+  '  /export              Export this conversation',
+  '  /extensions          Manage extensions'].join('\n');
+
+test('a send the screen never confirmed takes its draft back when the caller asked for it', async () => {
+  const { draftIsExactly } = require('./serve');
+  assert.equal(draftIsExactly(MENU('/exit'), '/exit', 'claude'), true,
+    'the box is read as ours with its menu rows below the closing rule');
+
+  // A restart types /exit on nobody's behalf and will be tried again. Leaving the
+  // command in the box — nothing pressed Enter, nothing pressed Escape — is the one
+  // state the next attempt cannot type into, so the draft goes back.
+  const escapes = (inputs) => inputs.filter((value) => value === '\x1b').length;
+  const menu = draftHarness((inputs) => (escapes(inputs) === 0 ? MENU('/exit') : escapes(inputs) === 1 ? BOX('/exit') : BOX('')));
+  const cleared = await typeAndSubmit({ pane: 'p' }, '/exit', () => false, {
+    ...menu.deps, discardDraftOnAbort: true,
+  }).then(() => null, (error) => error);
+  assert.equal(cleared.message, 'message was typed but could not be confirmed; the typed /exit was cleared');
+  assert.equal(cleared.status, 409);
+  assert.equal(cleared.typingStarted, true, 'characters reached the pane either way');
+  assert.equal(cleared.draftLeftOnScreen, undefined);
+  assert.equal(escapes(menu.inputs), 2, 'one Escape only closed the menu');
+  assert.equal(menu.inputs.includes('\r'), false, 'Enter is never pressed');
+  assert.ok(menu.events.some((e) => e.stage === 'enter-aborted' && e.cleared === true));
+  assert.equal(menu.events.some((e) => e.stage === 'enter-sent'), false);
+
+  // A box that never empties is not a cleared box, and the refusal says the text is
+  // still there — which is a refusal for a person, not one to retry.
+  const stuck = draftHarness(MENU('/exit'));
+  const left = await typeAndSubmit({ pane: 'p' }, '/exit', () => false, {
+    ...stuck.deps, discardDraftOnAbort: true,
+  }).then(() => null, (error) => error);
+  assert.equal(left.message, 'message was typed but could not be confirmed; Enter was not pressed');
+  assert.equal(left.draftLeftOnScreen, true);
+  assert.equal(left.draftReason, 'still there');
+
+  // A close Owner asked for keeps its typed /exit on screen, as it always has.
+  const kept = draftHarness(CLEARABLE('/exit'));
+  const manual = await typeAndSubmit({ pane: 'p' }, '/exit', () => false, kept.deps).then(() => null, (error) => error);
+  assert.equal(manual.message, 'message was typed but could not be confirmed; Enter was not pressed');
+  assert.equal(manual.draftLeftOnScreen, undefined, 'a caller that asked for nothing is told nothing new');
+  assert.equal(kept.inputs.includes('\x1b'), false, 'and nothing is erased');
+});
+
+test('the confirmation poll count is the caller\'s to set', async () => {
+  const run = async (over) => {
+    let reads = 0;
+    const harness = draftHarness(BOX('/exit'));
+    const error = await typeAndSubmit({ pane: 'p' }, '/exit', () => false, {
+      ...harness.deps, readScreen: async () => { reads += 1; return BOX('/exit'); }, ...over,
+    }).then(() => null, (e) => e);
+    assert.match(error.message, /could not be confirmed/);
+    return reads;
+  };
+  assert.equal(await run({}), 4, 'four polls unless the caller says otherwise');
+  assert.equal(await run({ confirmationAttempts: 10 }), 10, 'ten for a Claude /exit: 4s for the menu to draw');
+  assert.equal(await run({ confirmationAttempts: 1 }), 1);
+  assert.equal(await run({ confirmationAttempts: 0 }), 4, 'a count below one is no count at all');
+  assert.equal(await run({ confirmationAttempts: 'many' }), 4);
+});
+
 test('a box holding more than the typed message is not submitted', async () => {
   // The old confirmation only asked whether the typed text was *visible*. If
   // Owner types while the watcher types, it is visible and the line reads as
