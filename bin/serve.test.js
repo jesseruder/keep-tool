@@ -2058,15 +2058,26 @@ test('handoff model resolution looks past a synthetic-only tail and then at laun
     assert.equal(lastClaudeHandoffModel(readTranscriptTail(withReal)), '<unknown>',
       'the tail on its own still reports the model as unknown');
     assert.equal(handoffCurrentModel(session, null, '', at(withReal)), 'claude-fable-5-1');
+    // Only the launch metadata records the context window, so on the same base model the
+    // launch spelling decides it — the transcript never says `[1m]` on its own.
+    assert.equal(handoffCurrentModel(session, { meta: { model: 'claude-fable-5-1[1m]' } }, '', at(withReal)),
+      'claude-fable-5-1[1m]', 'a session launched on the 1M window must resume on it');
+    assert.equal(handoffCurrentModel(session, null, 'claude --model claude-fable-5-1[1m]', at(withReal)),
+      'claude-fable-5-1[1m]', 'argv carries the window just as the pane meta does');
+    assert.equal(handoffCurrentModel(session, { meta: { model: 'claude-opus-5[1m]' } }, '', at(withReal)),
+      'claude-fable-5-1', 'a different base model means the transcript is the newer evidence');
+    const wideTranscript = rateLimitedTranscript(dir, 'wide.jsonl', 'claude-fable-5-1[1m]');
+    assert.equal(handoffCurrentModel(session, { meta: { model: 'claude-fable-5-1' } }, '', at(wideTranscript)),
+      'claude-fable-5-1[1m]', 'and the window is never downgraded by staler launch metadata');
 
     assert.equal(handoffCurrentModel(session, { meta: { model: 'claude-opus-5' } }, '', at(syntheticOnly)),
       'claude-opus-5', 'the pane meta names the model when the transcript never does');
     assert.equal(
       handoffCurrentModel(session, null, 'claude --resume cba96b8d --model claude-fable-5-1[1m]', at(syntheticOnly)),
       'claude-fable-5-1[1m]', 'the 1M-context suffix is part of the id `claude --model` takes');
-    assert.equal(handoffCurrentModel(session, null, 'claude --resume cba96b8d', at(syntheticOnly)), '',
-      'a transcript read to the end that names no model is empty, which the handoff accepts');
-    assert.equal(handoffCurrentModel(session, null, '', { findSessionFile: () => null }), '');
+    assert.equal(handoffCurrentModel(session, null, 'claude --resume cba96b8d', at(syntheticOnly)), '<unknown>',
+      'nothing on record anywhere is not permission to resume on the target account default');
+    assert.equal(handoffCurrentModel(session, null, '', { findSessionFile: () => null }), '<unknown>');
     assert.equal(handoffCurrentModel(session, { meta: { model: 'claude-opus-5' } }, '', {
       findSessionFile: () => { throw new Error('two accounts, no authority'); },
     }), '<unknown>', 'an unresolvable transcript fails closed instead of guessing from launch metadata');
@@ -2114,10 +2125,14 @@ test('handoff model resolution stops at a malformed genuine model and rejoins sp
     assert.equal(handoffCurrentModel(session, null, '', {
       findSessionFile: () => unicode, scanChunkBytes: 24,
     }), 'claude-fable-5-1');
-    // A transcript with no assistant record at all is read to the end: nothing on record.
+    // A transcript with no assistant record at all is read to the end and still names no
+    // model: with no launch metadata behind it, that fails closed rather than resuming
+    // with no --model at all.
     const empty = path.join(dir, 'empty.jsonl');
     fs.writeFileSync(empty, '');
-    assert.equal(handoffCurrentModel(session, null, '', { findSessionFile: () => empty }), '');
+    assert.equal(handoffCurrentModel(session, null, '', { findSessionFile: () => empty }), '<unknown>');
+    assert.equal(handoffCurrentModel(session, { meta: { model: 'claude-opus-5' } }, '',
+      { findSessionFile: () => empty }), 'claude-opus-5');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -2151,6 +2166,10 @@ test('handoff model resolution follows a /model typed after the newest assistant
     assert.equal(resolve('switched', [
       real('claude-fable-5-1'), modelCommand('claude-opus-5'), stdout('Set model to Opus 5 (claude-opus-5)'), synthetic,
     ]), 'claude-opus-5', 'the switch is newer than the last assistant record, so it wins');
+    // The launch metadata is now stale on both the base model and its window.
+    assert.equal(handoffCurrentModel(session, { meta: { model: 'claude-fable-5-1[1m]' } }, '', {
+      findSessionFile: () => path.join(dir, 'switched.jsonl'),
+    }), 'claude-opus-5');
     assert.equal(resolve('switched-user-row', [
       real('claude-fable-5-1'), modelCommand('claude-opus-5'), userStdout('Set model to Opus 5'), synthetic,
     ]), 'claude-opus-5', 'the harness reply is logged as a user record in older transcripts');

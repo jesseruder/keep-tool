@@ -1330,11 +1330,12 @@ function launchModelId(value) {
 
 const HANDOFF_ARGV_MODEL_RE = /(?:^|\s)--model(?:=|\s+)["']?([A-Za-z0-9][A-Za-z0-9._:[\]/-]*)["']?(?=\s|$)/;
 
-// The model the account handoff has to relaunch with. '' means "the whole transcript is
-// on record and names no model", which the handoff accepts — it only refuses a value it
-// could not pass to `claude --model`. '<unknown>' means we could not finish looking, and
-// keeps failing closed, as does a genuine record whose model is malformed. Only a
-// synthetic-only transcript — the rate-limited session this exists for — resolves.
+// The model the account handoff has to relaunch with. Every answer is either a model id
+// or '<unknown>': the handoff refuses on the sentinel, and resuming with no `--model` at
+// all would silently hand the session to the target account's default, so "we could not
+// tell" must never look like "no model was configured". A transcript we could not finish
+// reading, a genuine record whose model is malformed, and a transcript that names nothing
+// with no launch metadata behind it all fail closed.
 function handoffCurrentModel(session, pane, processArgs, deps = {}) {
   let model;
   try {
@@ -1345,12 +1346,21 @@ function handoffCurrentModel(session, pane, processArgs, deps = {}) {
     // metadata: the session may have switched model in-session since launch.
     return '<unknown>';
   }
-  if (model) return model;
-  // Launch metadata, most specific first, and only once the transcript has been read to
-  // the end without naming a model at all.
-  return launchModelId(pane?.meta?.model)
-    || launchModelId(HANDOFF_ARGV_MODEL_RE.exec(String(processArgs || ''))?.[1])
-    || '';
+  // Launch metadata, most specific first. It is the only place the context-window
+  // variant is written down: `claude --model claude-fable-5-1[1m]` and the transcript's
+  // own `claude-fable-5-1` are the same model with different windows.
+  const launch = launchModelId(pane?.meta?.model)
+    || launchModelId(HANDOFF_ARGV_MODEL_RE.exec(String(processArgs || ''))?.[1]);
+  if (model === '<unknown>') return model;
+  if (!model) return launch || '<unknown>';
+  if (!launch || compactModelBase(launch) !== compactModelBase(model)) {
+    // A different base model means the transcript is the newer evidence — an in-session
+    // /model switch is already resolved by the scan.
+    return model;
+  }
+  // Same model, so the launch spelling carries the window. Never downgrade: whichever
+  // side asked for the 1M context is the one that has to be relaunched.
+  return /\[1m\]$/i.test(model) && !/\[1m\]$/i.test(launch) ? model : launch;
 }
 
 function lastContextTokens(lines, kind) {
