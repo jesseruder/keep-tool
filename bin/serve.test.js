@@ -6668,10 +6668,15 @@ test('every launch says who Keep opened it for, and only Owner\'s own opens stay
     { opener: { kind: 'check', id: 'card-1' }, unattended: true });
   assert.deepEqual(resolveOpener({ taskId: 'card-2' }, { launchEnv: { KEEP_REPAIR: '1' } }),
     { opener: { kind: 'repair', id: 'card-2' }, unattended: true });
+  // The review queue's buttons are Owner in the console, so the kind is recorded but
+  // the session is his to read.
   assert.deepEqual(resolveOpener({ taskId: 'card-3', reviewQueueLaunchId: 'queue-7' }, {}),
-    { opener: { kind: 'review-queue', id: 'card-3' }, unattended: true });
-  // Another session ran `keep open <card>`: the pane belongs to a program too.
+    { opener: { kind: 'review-queue', id: 'card-3' }, unattended: false });
+  // Another session ran `keep open <card>`: the pane belongs to a program too, and
+  // wins over the queue if a launch ever carried both.
   assert.deepEqual(resolveOpener({ taskId: 'card-4', requester: 'requesting-session' }, {}),
+    { opener: { kind: 'session', id: 'requesting-session' }, unattended: true });
+  assert.deepEqual(resolveOpener({ taskId: 'card-4', requester: 'requesting-session', reviewQueueLaunchId: 'queue-7' }, {}),
     { opener: { kind: 'session', id: 'requesting-session' }, unattended: true });
   // Console "Start work", the console's Run agent button, `keep open` from his shell.
   assert.deepEqual(resolveOpener({ taskId: 'card-5' }, {}), { opener: { kind: 'owner' }, unattended: false });

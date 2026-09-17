@@ -5638,8 +5638,13 @@ function resolveOpener(body = {}, deps = {}) {
   if (launchMeta.agentName) return { opener: { kind: 'agent', id: String(launchMeta.agentName) }, unattended: true };
   if (launchMeta.ephemeral === 'check') return onCard('check');
   if (deps.launchEnv && deps.launchEnv.KEEP_REPAIR === '1') return onCard('repair');
-  if (body.reviewQueueLaunchId) return onCard('review-queue');
+  // Another session ran `keep open <card>`. Above the review queue on purpose: if a
+  // launch ever carried both, the session that asked for it is the truer opener.
   if (body.requester) return { opener: { kind: 'session', id: String(body.requester) }, unattended: true };
+  // The review queue's Discuss, Investigate and Start work buttons are Owner in the
+  // console — `launchReviewQueueSession` has no other caller — so the kind is recorded
+  // for the pane's history and the session stays attended.
+  if (body.reviewQueueLaunchId) return { opener: { kind: 'review-queue', ...(card ? { id: card } : {}) }, unattended: false };
   // Console "Start work", the console's "Run agent" button, `keep open` from Owner's
   // own shell: he clicked it and he is there.
   return { opener: { kind: 'owner' }, unattended: false };
