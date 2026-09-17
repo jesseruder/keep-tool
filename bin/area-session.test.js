@@ -94,9 +94,11 @@ function makeDeps(fixture, state = {}) {
     },
     sendToResolvedTarget: async (session, target, text, opts) => {
       calls.sends.push({ session: session.id, pane: target.pane, text, opts });
+      if (state.onSend) await state.onSend(text, opts);
       if (state.sendError) throw state.sendError;
       if (state.sendResult) return state.sendResult;
-      return {};
+      // What delivery.js reports for a transcript-confirmed send.
+      return { ok: true, delivery: 'received' };
     },
     withInjectionLock: (fn) => fn(),
     closeIdleSession: async (body, closeDeps) => {
@@ -169,7 +171,7 @@ test('the first tick installs the recipe, creates the record, and opens exactly 
     assert.equal(body.model, 'fable');
     // openSession's own dedupe, keyed to the attempt rather than a clock, so two
     // ticks trying the same attempt are one open.
-    assert.equal(body.requestId, 'area-sandboxes-1');
+    assert.equal(body.requestId, 'area-sandboxes-g1');
     assert.match(body.requestId, /^[A-Za-z0-9_-]{1,128}$/);
     // The session's own name goes on the pane as `agentName`; `meta.agent` is the
     // provider everywhere in the daemon and must not be overloaded.
@@ -290,8 +292,8 @@ test('a pane that reads dead waits out the grace window before another launch', 
     assert.equal(relaunched.launch.state, 'launched');
     assert.equal(deps.calls.opens.length, 2);
     assert.equal(record(fixture).session.startedAt, past);
-    // A relaunch is a new attempt, so its request id is a new one too.
-    assert.equal(deps.calls.opens[1].body.requestId, 'area-sandboxes-2');
+    // A relaunch is a new generation, so its request id is a new one too.
+    assert.equal(deps.calls.opens[1].body.requestId, 'area-sandboxes-g2');
   } finally { cleanup(fixture.root); }
 });
 
@@ -485,7 +487,7 @@ test('a batch is split by encoded size, never clipped, and every event gets deli
       // Never clipped: the ellipsis dataFence adds when it has to truncate must
       // never appear, because a clipped batch acknowledges a half-shown event.
       assert.equal(body.includes('…'), false, 'no batch was clipped');
-      for (let i = 0; i < 60; i += 1) if (body.includes(`inc-${i} \u00b7 `)) seen.add(i);
+      for (let i = 0; i < 60; i += 1) if (body.includes(`inc-${i}  `)) seen.add(i);
     }
     assert.ok(ticks > 1, `the backlog took more than one message (${ticks})`);
     assert.equal(seen.size, 60, 'every event was delivered');
@@ -603,6 +605,229 @@ test('a typed-but-unconfirmed batch is retried through the recovery path, not st
   } finally { cleanup(fixture.root); }
 });
 
+test('two overlapping ticks send one message', async () => {
+  const fixture = makeRoot();
+  try {
+    feed(fixture, [{ at: NOW - MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox Open Health' }]);
+    const state = { panes: [livePane()], sessions: [idleSession()] };
+    const deps = makeDeps(fixture, state);
+    // The first tick blocks inside the send; the second runs to completion while
+    // it is in there. Without a delivery lease both read "no receipt", both
+    // persist their own pending batch over the other's, and both type — the
+    // injection mutex only serialises the typing, it does not prevent it.
+    let release;
+    let second = null;
+    state.onSend = async () => {
+      if (second) return;
+      second = tick(fixture, deps, { now: NOW + 1000 });
+      await new Promise((resolve) => { release = resolve; });
+    };
+    const first = tick(fixture, deps);
+    await new Promise((resolve) => setImmediate(resolve));
+    const secondReport = sandboxes(await second);
+    assert.equal(secondReport.delivery.state, 'deferred');
+    assert.match(secondReport.delivery.reason, /delivery lease/);
+    release();
+    assert.equal(sandboxes(await first).delivery.state, 'sent');
+    assert.equal(deps.calls.sends.length, 1, 'one message, not two');
+    assert.equal(cursor(fixture), 1);
+    assert.equal(record(fixture).deliveryLease, null, 'the lease is released either way');
+  } finally { cleanup(fixture.root); }
+});
+
+test('a send whose batch was delivered by somebody else is abandoned inside the lock', async () => {
+  const fixture = makeRoot();
+  try {
+    feed(fixture, [{ at: NOW - MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox Open Health' }]);
+    const state = { panes: [livePane()], sessions: [idleSession()] };
+    const deps = makeDeps(fixture, state);
+    // Everything before the injection lock was decided outside it. If the cursor
+    // moved past this batch in the meantime, the send is stale.
+    deps.withInjectionLock = async (fn) => {
+      agents.writeRecord('sandboxes', { lastDeliveredSeq: 1, pendingDelivery: null }, { root: fixture.root });
+      return fn();
+    };
+    const report = sandboxes(await tick(fixture, deps));
+    assert.equal(report.delivery.state, 'deferred');
+    assert.match(report.delivery.reason, /delivered by somebody else/);
+    assert.equal(deps.calls.sends.length, 0, 'nothing was typed');
+  } finally { cleanup(fixture.root); }
+});
+
+test('a retry types the same characters, queued-count sentence and all', async () => {
+  const fixture = makeRoot();
+  try {
+    // Enough events that the first batch says "N more are queued" — a sentence a
+    // batch rebuilt from the feed would silently drop, making the retry a
+    // different message with a receipt nobody can find.
+    const events = [];
+    for (let i = 0; i < 40; i += 1) {
+      events.push({
+        at: NOW - (60 - i) * MINUTE, kind: 'incident-fired', card: 'inc-' + i,
+        title: 'Sandbox ' + i + ' ' + 'x'.repeat(100),
+        permalink: 'https://slack/' + 'y'.repeat(100) + i,
+      });
+    }
+    feed(fixture, events);
+    const state = {
+      panes: [livePane()], sessions: [idleSession()],
+      sendError: new Error('pane is busy typing'),
+    };
+    const deps = makeDeps(fixture, state);
+    const first = sandboxes(await tick(fixture, deps));
+    assert.equal(first.delivery.state, 'deferred');
+    assert.match(deps.calls.sends[0].text, /more events are queued behind these/);
+    const pending = areaSession.pendingDeliveryOf(record(fixture));
+    assert.equal(pending.text, deps.calls.sends[0].text, 'the record carries the rendered text');
+
+    state.sendError = null;
+    const second = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
+    assert.equal(second.delivery.state, 'sent');
+    assert.equal(second.delivery.recovered, true);
+    assert.equal(deps.calls.sends[1].text, deps.calls.sends[0].text, 'byte-identical');
+    assert.equal(deps.calls.sends[1].opts.deliveryKey, deps.calls.sends[0].opts.deliveryKey);
+  } finally { cleanup(fixture.root); }
+});
+
+test('an assumed delivery leaves the cursor and the batch alone, receipt or no receipt', async () => {
+  const fixture = makeRoot();
+  try {
+    feed(fixture, [{ at: NOW - MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox Open Health' }]);
+    // What delivery.js returns when it gives up on an expired journal whose text
+    // had reached the pane. It files a *received* receipt for that, which is not a
+    // transcript confirmation of anything.
+    // The helper files the received receipt as part of assuming delivery, so the
+    // receipt appears only after the first send — exactly as it would in life.
+    const filed = new Set();
+    const state = {
+      panes: [livePane()], sessions: [idleSession()],
+      sendResult: { ok: true, delivery: 'assumed-delivered', expired: true },
+      onSend: (text, opts) => { filed.add(opts.deliveryKey); },
+      receiptFor: (text, key) => (filed.has(key) ? { sessionId: 'sess-1', kind: 'claude', received: true } : null),
+    };
+    const deps = makeDeps(fixture, state);
+    const assumed = sandboxes(await tick(fixture, deps));
+    assert.equal(assumed.delivery.state, 'deferred');
+    assert.equal(assumed.delivery.assumed, true);
+    assert.equal(assumed.delivery.assumedAttempts, 1);
+    assert.equal(cursor(fixture), 0, 'nothing was acknowledged');
+    const pending = areaSession.pendingDeliveryOf(record(fixture));
+    assert.equal(pending.assumed, true);
+    assert.equal(pending.key, 'agent:sandboxes:seq:1-1');
+
+    // Next tick: the receipt on disk says received, but it was filed by that
+    // assumption, so it is not read back as evidence. The batch is offered again.
+    const again = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
+    assert.equal(again.delivery.state, 'deferred');
+    assert.equal(again.delivery.assumedAttempts, 2);
+    assert.equal(deps.calls.sends.length, 2, 'offered again rather than acknowledged');
+    assert.equal(cursor(fixture), 0);
+
+    // A real confirmation ends it.
+    state.sendResult = { ok: true, delivery: 'received' };
+    const confirmed = sandboxes(await tick(fixture, deps, { now: NOW + 2 * MINUTE }));
+    assert.equal(confirmed.delivery.state, 'sent');
+    assert.equal(cursor(fixture), 1);
+    assert.equal(areaSession.pendingDeliveryOf(record(fixture)), null);
+  } finally { cleanup(fixture.root); }
+});
+
+test('a receipt that cannot be read defers the tick rather than counting as absent', async () => {
+  const fixture = makeRoot();
+  try {
+    feed(fixture, [{ at: NOW - MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox Open Health' }]);
+    const state = { panes: [livePane()], sessions: [idleSession()] };
+    const deps = makeDeps(fixture, state);
+    deps.deliveryStatus = () => { throw new Error('EACCES: receipts are unreadable'); };
+    const report = sandboxes(await tick(fixture, deps));
+    assert.equal(report.delivery.state, 'deferred');
+    assert.match(report.delivery.reason, /receipt could not be read/);
+    assert.equal(deps.calls.sends.length, 0, 'an unreadable receipt is not an absent one');
+    assert.equal(cursor(fixture), 0);
+    assert.ok(deps.calls.notes.some((line) => line.includes('could not read the delivery receipt')));
+
+    deps.deliveryStatus = () => null;
+    const sent = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
+    assert.equal(sent.delivery.state, 'sent');
+    assert.equal(cursor(fixture), 1);
+  } finally { cleanup(fixture.root); }
+});
+
+test('the cursor carries a feed offset, and a bad one only costs a full scan', async () => {
+  const fixture = makeRoot();
+  try {
+    feed(fixture, [
+      { at: NOW - 3 * MINUTE, kind: 'incident-opened', card: 'inc-a', title: 'Sandbox A' },
+      { at: NOW - 2 * MINUTE, kind: 'incident-fired', card: 'inc-b', title: 'Sandbox B' },
+    ]);
+    const state = { panes: [livePane()], sessions: [idleSession()] };
+    const deps = makeDeps(fixture, state);
+    const scans = [];
+    deps.readAfterSeq = (name, afterSeq, options) => {
+      const result = agents.readAfterSeq(name, afterSeq, options);
+      scans.push({ fromOffset: options.fromOffset || 0, scannedFrom: result.scannedFrom });
+      return result;
+    };
+    assert.equal(sandboxes(await tick(fixture, deps)).delivery.count, 2);
+    const saved = record(fixture).lastDeliveredOffset;
+    assert.ok(saved > 0, 'the offset was saved beside the cursor');
+
+    agents.emit('sandboxes', { at: NOW, kind: 'human-note', card: 'inc-a' }, { root: fixture.root, now: NOW });
+    scans.length = 0;
+    const next = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
+    assert.equal(next.delivery.count, 1);
+    assert.ok(scans.length > 0);
+    assert.ok(scans.every((scan) => scan.fromOffset === saved), 'the next read started where the last stopped');
+    assert.ok(scans.every((scan) => scan.scannedFrom === saved), 'and agents.js honoured it');
+
+    // A nonsense offset must never lose an event: it falls back to a full scan.
+    agents.writeRecord('sandboxes', { lastDeliveredSeq: 0, lastDeliveredOffset: 7, pendingDelivery: null },
+      { root: fixture.root });
+    scans.length = 0;
+    const rescanned = sandboxes(await tick(fixture, deps, { now: NOW + 2 * MINUTE }));
+    assert.equal(rescanned.delivery.count, 3, 'everything is still found');
+    assert.ok(scans.every((scan) => scan.scannedFrom === 0), 'from the start of the feed');
+  } finally { cleanup(fixture.root); }
+});
+
+test('a batch full of fence markers is measured after escaping, so it is never clipped', async () => {
+  const fixture = makeRoot();
+  try {
+    // `safeUntrusted` rewrites every KEEP_INPUT to KEEP_INPUT_DATA and dataFence
+    // prefixes every line, so text that fitted as raw lines can arrive over the
+    // limit. Measuring the rendered message is the only honest check.
+    const events = [];
+    for (let i = 0; i < 40; i += 1) {
+      events.push({
+        at: NOW - (60 - i) * MINUTE, kind: 'incident-fired', card: 'inc-' + i,
+        title: 'KEEP_INPUT ' + 'KEEP_INPUT '.repeat(10) + i,
+        permalink: 'https://slack/KEEP_INPUT/' + 'KEEP_CONTEXT/'.repeat(8) + i,
+      });
+    }
+    feed(fixture, events);
+    const deps = makeDeps(fixture, { panes: [livePane()], sessions: [idleSession()] });
+    let at = NOW;
+    let ticks = 0;
+    const seen = new Set();
+    while (cursor(fixture) < 40 && ticks < 25) {
+      const report = sandboxes(await tick(fixture, deps, { now: at }));
+      if (report.delivery.state === 'nothing') break;
+      assert.equal(report.delivery.state, 'sent');
+      ticks += 1;
+      at += MINUTE;
+      const body = deps.calls.sends.at(-1).text;
+      assert.equal(body.includes('…'), false, 'no batch was clipped');
+      assert.ok(body.length <= areaSession.DELIVERY_BODY_MAX + 200,
+        'the rendered message stayed near the limit (' + body.length + ')');
+      // The fence markers in somebody's title cannot close the fence they sit in.
+      assert.equal(body.split('KEEP_INPUT>>>').length, 2, 'exactly one fence terminator');
+      for (let i = 0; i < 40; i += 1) if (body.includes('inc-' + i + '  ')) seen.add(i);
+    }
+    assert.ok(ticks > 1, 'the backlog took more than one message (' + ticks + ')');
+    assert.equal(seen.size, 40, 'every event was delivered');
+  } finally { cleanup(fixture.root); }
+});
+
 test('a batch the pane only half accepted is not acknowledged', async () => {
   const fixture = makeRoot();
   try {
@@ -684,6 +909,93 @@ test('a send that throws leaves the cursor for the next tick', async () => {
     const retried = sandboxes(await tick(fixture, deps));
     assert.equal(retried.delivery.state, 'sent');
     assert.equal(cursor(fixture), 1);
+  } finally { cleanup(fixture.root); }
+});
+
+test('a request id names one launch for all time, across generations', async () => {
+  const fixture = makeRoot();
+  try {
+    idleFor(fixture, 3);
+    const state = quietState(3);
+    const deps = makeDeps(fixture, state);
+    // Closing a session as idle resets `launch.attempts`, which is what the
+    // request id used to be built from.
+    assert.equal(sandboxes(await tick(fixture, deps)).restart.state, 'closed');
+
+    state.panes = [];
+    state.sessions = [];
+    const first = sandboxes(await tick(fixture, deps, { now: NOW + MINUTE }));
+    assert.equal(first.launch.state, 'launched');
+    assert.equal(deps.calls.opens[0].body.requestId, 'area-sandboxes-g1');
+    assert.equal(record(fixture).generation, 1);
+
+    // Close it as idle again and launch once more. The id must NOT come back
+    // round to g1: openSession would recognise it and hand back the retained
+    // record of the pane that already exited instead of opening a session.
+    agents.writeRecord('sandboxes', { session: { startedAt: NOW - 9 * HOUR } }, { root: fixture.root });
+    Object.assign(state, quietState(9));
+    assert.equal(sandboxes(await tick(fixture, deps, { now: NOW + 2 * MINUTE })).restart.state, 'closed');
+    assert.equal(record(fixture).launch.attempts, 0, 'the attempt counter did reset');
+    state.panes = [];
+    state.sessions = [];
+    const second = sandboxes(await tick(fixture, deps, { now: NOW + 3 * MINUTE }));
+    assert.equal(second.launch.state, 'launched');
+    assert.notEqual(deps.calls.opens[1].body.requestId, deps.calls.opens[0].body.requestId);
+    assert.match(deps.calls.opens[1].body.requestId, /^area-sandboxes-g[2-9]$/);
+    assert.ok(record(fixture).generation > 1, 'the generation only ever increases');
+  } finally { cleanup(fixture.root); }
+});
+
+test('a launch lease stolen while the worktree is being prepared spawns nothing', async () => {
+  const fixture = makeRoot();
+  try {
+    const state = { panes: [], sessions: [], worktreeReady: false };
+    const deps = makeDeps(fixture, state);
+    // `wt rm` plus `wt new` is minutes of out-of-process work, and the lease is
+    // five. Somebody else takes it while that runs.
+    deps.runWt = async (args) => {
+      deps.calls.wt.push(args);
+      if (args[0] === 'rm') fs.rmSync(fixture.worktree, { recursive: true, force: true });
+      else fs.mkdirSync(fixture.worktree, { recursive: true });
+      agents.writeRecord('sandboxes', {
+        launchLease: { at: Date.now(), by: 'another-tick', requestId: 'area-sandboxes-g9' },
+      }, { root: fixture.root });
+      return { ok: true, stdout: fixture.worktree + '\n', error: '' };
+    };
+    const report = sandboxes(await tick(fixture, deps));
+    assert.equal(report.launch.state, 'skipped');
+    assert.match(report.launch.reason, /launch lease was lost/);
+    assert.equal(deps.calls.opens.length, 0, 'nothing was spawned');
+    assert.equal(report.delivery.state, 'skipped');
+    assert.equal(report.restart.state, 'not-due');
+    // Not a failed attempt either: it never tried, so it must not burn one.
+    assert.equal(record(fixture).launch.attempts, 0);
+    assert.equal(record(fixture).launchLease.by, 'another-tick', 'and the thief keeps its lease');
+  } finally { cleanup(fixture.root); }
+});
+
+test('the lease is renewed across the worktree steps, so a slow build keeps its claim', async () => {
+  const fixture = makeRoot();
+  try {
+    const state = { panes: [], sessions: [], worktreeReady: false };
+    const deps = makeDeps(fixture, state);
+    deps.runWt = async (args) => {
+      deps.calls.wt.push(args);
+      if (args[0] === 'rm') fs.rmSync(fixture.worktree, { recursive: true, force: true });
+      else fs.mkdirSync(fixture.worktree, { recursive: true });
+      return { ok: true, stdout: fixture.worktree + '\n', error: '' };
+    };
+    const renewals = [];
+    deps.renewLaunchLease = (name, root, at, by, d) => {
+      renewals.push(by);
+      return areaSession.renewLaunchLease(name, root, at, by, d);
+    };
+    const report = sandboxes(await tick(fixture, deps));
+    assert.equal(report.launch.state, 'launched');
+    // Once after the worktree work, once immediately before the spawn.
+    assert.equal(renewals.length, 2);
+    assert.equal(new Set(renewals).size, 1, 'the same holder both times');
+    assert.equal(record(fixture).launchLease, null, 'and released at the end');
   } finally { cleanup(fixture.root); }
 });
 
@@ -975,12 +1287,20 @@ test('--dry reports what it would do and performs nothing', async () => {
 
     agents.emit('sandboxes', { at: NOW, kind: 'incident-opened', card: 'inc-a' }, { root: fixture.root, now: NOW });
     const waiting = makeDeps(fixture, quietState(3));
+    // `statusForText` is not a read: when it finds a confirmed retained entry it
+    // files the receipt and unlinks the journal. A dry run must not ask it
+    // anything, so it reports the key it would have checked instead.
+    let asked = 0;
+    waiting.deliveryStatus = () => { asked += 1; return null; };
     const batch = sandboxes(await tick(fixture, waiting, { dry: true, force: true }));
     assert.equal(batch.delivery.state, 'would-send');
     assert.equal(batch.delivery.count, 1);
+    assert.equal(asked, 0, 'no receipt was consulted');
+    assert.match(batch.delivery.note, /would check receipt agent:sandboxes:seq:1-1/);
     assert.equal(waiting.calls.sends.length, 0);
     assert.equal(cursor(fixture), 0);
     assert.equal(areaSession.pendingDeliveryOf(record(fixture)), null);
+    assert.equal(record(fixture).deliveryLease, undefined, 'and no lease was taken');
   } finally { cleanup(fixture.root); }
 });
 
