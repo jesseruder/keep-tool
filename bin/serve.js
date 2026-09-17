@@ -2297,8 +2297,28 @@ async function discardTypedDraft(target, text, kind, deps = {}) {
     write(`keep serve: left an aborted draft on pane ${pane}: input arrived from elsewhere while it was being cleared\n`);
     return { cleared: false, reason: 'input arrived' };
   };
-  // Nothing is pressed at all when the count cannot be read: an Escape this could not
-  // account for is worse than a draft left where it is.
+  // The conditional write is a host feature, and a host from before it ignores
+  // expectedInputCount and writes the key unconditionally — the very race this is here
+  // to avoid, run silently and reported as a clean clear. So the host is asked what it
+  // supports first, the same way loading history and guarded kills ask, and a host
+  // that has not been reloaded yet gets no keystrokes at all. The caller's refusal
+  // then keeps the message that says the draft is still on screen, which is the true
+  // state of the pane until somebody runs `keep host reload`.
+  const reloadRequired = (detail) => {
+    write(`keep serve: left an aborted draft on pane ${pane}: ${detail}\n`);
+    return { cleared: false, reason: 'host reload required' };
+  };
+  let capabilities;
+  try {
+    capabilities = await (deps.hostRequest || hostRequest)('hello', {}, deps);
+  } catch (error) {
+    return reloadRequired(`the terminal host could not be asked what it supports: ${String((error && error.message) || error)}`);
+  }
+  if (!capabilities || capabilities.conditionalInput !== true) {
+    return reloadRequired('the terminal host must be reloaded (keep host reload) before a typed draft can be cleared');
+  }
+  // Nothing is pressed at all when the count cannot be read either: an Escape this
+  // could not account for is worse than a draft left where it is.
   let count = await countInputs();
   if (count === null) return unverified();
   // Escape is a keystroke, not a guarantee. Read the box back after each one:

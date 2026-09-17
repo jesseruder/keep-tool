@@ -817,7 +817,7 @@ function createHost(options = {}) {
     switch (params.type) {
       case 'hello':
         return { result: {
-          version: 1, replaceExited: true, guardedKill: true, compactScreen: true,
+          version: 1, replaceExited: true, guardedKill: true, compactScreen: true, conditionalInput: true,
           bootVersion: options.boot && options.boot.version || null,
           panes: panes.size, pid: process.pid, sock,
           residentTerminals: [...panes.values()].filter((pane) => pane.term).length,

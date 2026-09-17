@@ -912,6 +912,9 @@ test('a host handoff cancels primary grace timers', async () => {
 
 test('a conditional input writes only while the pane has taken no other keystroke', async () => {
   await withHost({}, async ({ client }) => {
+    // Advertised, because a host that predates this ignores the parameter and writes
+    // the key anyway; the daemon refuses to press rather than race such a host.
+    assert.equal((await client.request('hello')).conditionalInput, true);
     const { pane } = await client.request('spawn', {
       cmd: '/bin/sh',
       args: ['-c', "stty -echo; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done"],

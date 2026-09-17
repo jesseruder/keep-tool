@@ -4856,9 +4856,13 @@ function draftHarness(screen, onEvent = () => {}) {
   const inputs = [];
   const events = [];
   const foreign = { count: 0 };
+  // What this host says it can do. A test drops a capability to stand for a host that
+  // is still running the code it was started with.
+  const hello = { version: 1, conditionalInput: true };
   const count = () => inputs.length + foreign.count;
   const host = recordingHost(async (type, params) => {
     onEvent(type, { inputs, foreign });
+    if (type === 'hello') return { ...hello };
     if (type === 'screen') return { text: typeof screen === 'function' ? screen(inputs) : screen };
     if (type === 'input') {
       if (params.expectedInputCount !== undefined && count() !== params.expectedInputCount) {
@@ -4869,7 +4873,7 @@ function draftHarness(screen, onEvent = () => {}) {
     return {};
   });
   return {
-    inputs, events, host, foreign,
+    inputs, events, host, foreign, hello,
     deps: {
       host, sleep: async () => {}, draftKind: 'claude',
       listHostPanes: async () => [{ id: 'p', inputCount: count() }],
@@ -5044,6 +5048,31 @@ test('a draft is only reported cleared when nobody else typed while it was being
   assert.equal(raced.error.draftReason, 'input arrived');
   assert.equal(raced.escapes, 1);
   assert.ok(raced.harness.events.some((e) => e.stage === 'enter-aborted' && e.cleared === false && e.reason === 'input arrived'));
+
+  // A host that has not been reloaded since the conditional write landed would ignore
+  // the expected count and press the key anyway, which is the race itself. It is asked
+  // before anything is pressed, and until somebody runs `keep host reload` the draft
+  // stays where it is and the refusal says so.
+  for (const capability of [false, undefined, 'yes']) {
+    const old = draftHarness(CLEARABLE('/exit'));
+    if (capability === undefined) delete old.hello.conditionalInput;
+    else old.hello.conditionalInput = capability;
+    const error = await typeAndSubmit({ pane: 'p' }, '/exit', () => false, {
+      ...old.deps, discardDraftOnAbort: true,
+    }).then(() => null, (e) => e);
+    assert.equal(error.message, 'message was typed but could not be confirmed; Enter was not pressed',
+      'the honest message until the host is reloaded');
+    assert.equal(error.draftLeftOnScreen, true);
+    assert.equal(error.draftReason, 'host reload required');
+    assert.equal(old.inputs.includes('\x1b'), false, 'nothing is pressed at an unreloaded host');
+  }
+  // And with the capability there, the same draft clears.
+  const reloaded = draftHarness(CLEARABLE('/exit'));
+  const cleared = await typeAndSubmit({ pane: 'p' }, '/exit', () => false, {
+    ...reloaded.deps, discardDraftOnAbort: true,
+  }).then(() => null, (e) => e);
+  assert.equal(cleared.message, 'message was typed but could not be confirmed; the typed /exit was cleared');
+  assert.equal(reloaded.inputs.includes('\x1b'), true);
 
   // A count that cannot be read at all presses nothing: an Escape this could not
   // account for is worse than a draft left where it is.
