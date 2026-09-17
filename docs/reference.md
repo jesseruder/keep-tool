@@ -1059,9 +1059,9 @@ next.
   further. A rebuild that only saw the tail window cannot prove either number: it marks
   the count a lower bound with `unseen.truncated` and carries the previous
   `needsYou` forward, because an unseen needs-you event older than the window would
-  otherwise turn a badge that is still waiting for Owner from red to grey. Both go one
-  way; only `markSeen`, which reads every event, clears them. A badge is a summary, not
-  a ledger.
+  otherwise turn a badge that is still waiting for Owner from red to grey. Two reads
+  are authoritative and clear both: `markSeen`, which reads every event, and a rebuild
+  whose tail window held the whole feed. A badge is a summary, not a ledger.
 - `events.jsonl` — the feed. `{at, kind, card, severity, needsYou, seenAt, …}`, one
   event per line, append order. Events carry pointers — a card, a signature, one line
   of text — never message bodies: the home model pays for every byte it reads. Event
