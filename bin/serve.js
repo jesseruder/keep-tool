@@ -38,6 +38,7 @@ const limitresume = require('./limitresume.js');
 const health = require('./health.js');
 const features = require('./features.js');
 const stalled = require('./stalled.js');
+const sessionNumbers = require('./session-numbers.js');
 const keepConsole = require('./console.js');
 const sessionStatus = require('./session-status.js');
 const { sendStateJson } = require('./state-response.js');
@@ -3113,11 +3114,19 @@ async function resolveSessionTarget(session, targetHint, deps = {}) {
 
 function resolveSessionId(value, deps = {}) {
   const wanted = String(value || '');
-  if (!/^[A-Za-z0-9_-]+$/.test(wanted)) throw new InjectionError(400, 'bad session id');
+  // `#12` / `12` / `s12` name a session by its console number. Ids are never all
+  // digits at that length, so a number can only ever mean the numbered session.
+  const number = sessionNumbers.parseNumber(wanted);
+  if (!number && !/^[A-Za-z0-9_-]+$/.test(wanted)) throw new InjectionError(400, 'bad session id');
   // A phone polls this every couple of seconds; a snapshot under 5 s old is fresh enough
   // to resolve an id and spares the event loop a full transcript scan per poll.
   const scanned = deps.scanSessions ? deps.scanSessions()
     : (Date.now() - sessionSnapshotAt < 5000 && sessionSnapshot.length ? sessionSnapshot : scanSessions());
+  if (number) {
+    const numbered = scanned.filter((candidate) => candidate.num === number);
+    if (numbered.length !== 1) throw new InjectionError(400, 'bad session id');
+    return numbered[0];
+  }
   const exact = scanned.find((candidate) => candidate.id === wanted);
   const matches = exact ? [exact] : wanted.length >= 8
     ? scanned.filter((candidate) => candidate.id.startsWith(wanted))
@@ -4898,6 +4907,15 @@ const RESERVED_LAUNCH_META = new Set([
   'requester', 'portableTransferId', 'reviewQueueLaunchId', 'openRequestId', 'launchedAt',
 ]);
 
+// The console number of an already-numbered session, for the open result the CLI
+// prints. A session launched a moment ago has none until the next scan numbers it.
+function openedSessionNumber(id, deps = {}) {
+  if (!id) return {};
+  let num = null;
+  try { num = sessionNumbers.lookup(id, { root: deps.root || keep.ROOT })?.num || null; } catch {}
+  return num ? { num } : {};
+}
+
 function annotationMeta(launchMeta) {
   if (!launchMeta || typeof launchMeta !== 'object') return {};
   return Object.fromEntries(Object.entries(launchMeta).filter(([key]) => !RESERVED_LAUNCH_META.has(key)));
@@ -5096,7 +5114,8 @@ async function openSession(body, deps = {}) {
         }
       }
       return { ok: true, existing: true, focus: 'console', pane: existing.id,
-        sessionId, accountId: account.id, accountLabel: account.label,
+        sessionId, ...openedSessionNumber(sessionId, deps),
+        accountId: account.id, accountLabel: account.label,
         agent, recoverable: existing.agentAlive === false,
         ...(!sessionId && allowPendingRegistration ? { pendingRegistration: true } : {}) };
     }
@@ -5177,7 +5196,9 @@ async function openSession(body, deps = {}) {
     }, deps);
     const pane = spawned && spawned.pane && spawned.pane.id;
     if (!pane) throw new Error('terminal host did not return a pane');
-    return { ok: true, created: 'pane', command, pane, sessionId, accountId: account.id, accountLabel: account.label,
+    return { ok: true, created: 'pane', command, pane, sessionId,
+      ...openedSessionNumber(sessionId, deps),
+      accountId: account.id, accountLabel: account.label,
       ...(Number.isInteger(spawned.pane.pid) ? { pid: spawned.pane.pid } : {}),
       ...(spawned.pane.createdAt != null ? { createdAt: spawned.pane.createdAt } : {}) };
   };
@@ -5207,6 +5228,7 @@ async function openSession(body, deps = {}) {
           existing: true,
           focus: 'console',
           sessionId: session.id,
+          ...(session.num ? { num: session.num } : openedSessionNumber(session.id, deps)),
           pane: target.pane,
         };
         if (message) {
@@ -5958,6 +5980,9 @@ function scanSessions(options = {}) {
   sessions.push(...codexSessions);
   titles.applyLiveTitles(sessions, { cachedOnly: true });
   sessions.sort((a, b) => b.mtime - a.mtime);
+  // Every session carries its short number from here on: the snapshot below is
+  // what the dashboard state, /api/state and the console all read.
+  sessionNumbers.assign(sessions, { root: keep.ROOT });
   sessionSnapshot = copySessions(sessions);
   sessionSnapshotAt = now;
   if (options.dashboard === true) lastDashboardSessionScan = now;

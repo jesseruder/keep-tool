@@ -301,7 +301,7 @@ Every command answers `--help` (or `keep help <cmd>`) with its usage line.
   approval is `review`.
 - Run `keep tags` before adding a tag. Every task must have exactly one scope tag,
   `work` or `personal` (or your configured scope names); `keep add` normally infers it from the project path.
-- Use `keep open <card-id|session-id>` to start or focus an interactive session in a terminal-host pane, visible in the Keep console (`--fresh` starts a new session); `keep restore [--dry]` reopens every session whose agent process is gone (after a host restart or a killed pane). `keep pane ls|show|send|screen|attach` drives panes directly.
+- Use `keep open <card-id|session-id|#n>` (`#n` is the session number the console shows; `12` and `s12` also work) to start or focus an interactive session in a terminal-host pane, visible in the Keep console (`--fresh` starts a new session); `keep restore [--dry]` reopens every session whose agent process is gone (after a host restart or a killed pane). `keep pane ls|show|send|screen|attach` drives panes directly.
   To hand a card to a new session, pass the opening prompt: `keep open <card> --fresh -m "..."`. Keep waits for the agent's empty prompt, types the message, and prints the new session id. Write the prompt like a check recipe: name the card, the goal, and what to check in. The session also sees the project's cards from its session-start hook.
   `--model <id>` launches that one process on a model (`claude --model` / `codex -m`) and records it in the pane meta; it never changes `~/.claude/settings.json`, unlike typing `/model` as the first message. Omit it for the agent's default.
   Long or multiline opening messages, and `--message-file <path>` even for short text,

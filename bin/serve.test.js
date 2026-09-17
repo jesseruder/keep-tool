@@ -4852,6 +4852,24 @@ test('open resolves a unique session prefix and refuses a session running outsid
   }), /running outside the host \(pid 4242\)/);
 });
 
+test('a console number resolves to its session, and an unknown number is a bad session id', () => {
+  const { resolveSessionId } = require('./serve.js');
+  const ids = ['abcdef12-0000-4000-8000-000000000001', 'abcdef99-0000-4000-8000-000000000002'];
+  const scanSessions = () => [{ id: ids[0], kind: 'claude', num: 12 }, { id: ids[1], kind: 'claude', num: 7 }];
+
+  for (const typed of ['#12', '12', 's12']) {
+    assert.equal(resolveSessionId(typed, { scanSessions }).id, ids[0], `${typed} names session 12`);
+  }
+  assert.equal(resolveSessionId('7', { scanSessions }).id, ids[1]);
+  assert.equal(resolveSessionId(ids[1], { scanSessions }).id, ids[1], 'a full id still resolves');
+  assert.equal(resolveSessionId('abcdef12', { scanSessions }).id, ids[0], 'the 8-character prefix rule is unchanged');
+
+  assert.throws(() => resolveSessionId('#99', { scanSessions }),
+    (error) => error.status === 400 && error.message === 'bad session id');
+  assert.throws(() => resolveSessionId('3', { scanSessions: () => [{ id: ids[0], kind: 'claude' }] }),
+    (error) => error.status === 400 && error.message === 'bad session id');
+});
+
 test('open uses host panes for both existing sessions and new Claude and Codex launches', async () => {
   const project = os.tmpdir();
   const task = { fm: { project, sessions: [{ id: 'existing-session', agent: 'claude' }] } };

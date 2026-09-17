@@ -1,9 +1,25 @@
 import { sessionLabel } from './status.js';
 import { closeSession } from './close-session.js';
 import { shadowSummaryHTML } from './state-line.js';
+import { numBadgeHTML, numHaystack } from './session-number.js';
 const FILTER_KEY = 'keep.console.fleet.filter';
 let filter = '';
 try { filter = sessionStorage.getItem(FILTER_KEY) || ''; } catch {}
+
+// A numbered session is listed as "#12" with the uuid in the badge tooltip; rows
+// with no session of their own (shells, exited panes) keep the plain id.
+export function fleetRowHTML(ctx, row, panes) {
+  const pinned = ctx.isPanePinned(row.pane);
+  const reopen = row.sessionId && !row.alive ? `<button class="btn" data-reopen="${ctx.esc(row.sessionId)}" data-agent="${ctx.esc(row.agent)}" data-title="${ctx.esc(row.title)}" data-stale="${ctx.esc(row.pane || '')}">Reopen</button>` : '';
+  const closeIdle = row.session && row.alive
+    ? `<button class="btn" data-close-idle="${ctx.esc(row.sessionId)}" data-pane="${ctx.esc(row.pane)}">Close</button>` : '';
+  const remove = (row.pane && panes.get(row.pane)?.alive === false ? `<button class="btn" data-remove="${ctx.esc(row.pane)}">Remove</button>` : '') + closeIdle;
+  const configured = (ctx.data.accounts || []).find((account) => account.id === row.accountId);
+  const account = row.accountLabel || configured?.label || row.accountId;
+  const badge = numBadgeHTML(ctx.esc, row.num, row.id);
+  const identity = badge || `<span class="mono faint">${ctx.esc(row.id)}</span>`;
+  return `<tr><td><span class="st"><i class="${ctx.esc(row.state)}"></i>${ctx.esc(row.stateLabel || row.state)}</span></td><td>${ctx.esc(row.title)}${row.reviewer ? '<span class="rv">reviewer</span>' : ''} ${identity}</td><td class="mono muted">${ctx.esc(row.branch)}</td><td class="mono info">${ctx.esc(row.taskId || '')}${ctx.tagsHTML(ctx.taskFor(row))}</td><td class="mono waiting-kind">${ctx.esc(row.waiting)}</td><td class="mono muted">${ctx.esc(ctx.rel(row.since))}</td><td class="mono ${row.kind === 'codex' ? 'kind-codex' : ''}">${ctx.esc(row.kind)}</td><td>${ctx.esc(account || '—')}</td><td><button class="btn" data-pin="${ctx.esc(row.pane || '')}" data-title="${ctx.esc(row.title)}" ${row.alive && !pinned ? '' : 'disabled'}>${pinned ? 'Pinned' : 'Pin'}</button>${reopen}${remove}</td></tr>`;
+}
 
 export function renderFleet(ctx) {
   const rows = [];
@@ -21,7 +37,7 @@ export function renderFleet(ctx) {
     panesBySession.set(session.id, session.pane);
     const pane = session.pane ? panes.get(session.pane) : null;
     rows.push({
-      id: session.id, pane: session.pane, project: session.project, title: session.title || 'untitled session',
+      id: session.id, num: session.num, pane: session.pane, project: session.project, title: session.title || 'untitled session',
       state: pane?.alive === false ? 'exited' : session.state || 'idle', stateLabel: pane?.alive === false ? 'Exited' : sessionLabel(session), kind: session.kind, reviewer: session.reviewer,
       taskId: session.taskId, branch: session.gitBranch || '', since: session.mtime, session: true,
       waiting: waitingBySession.get(session.id)?.kind || '', alive: Boolean(pane?.alive),
@@ -48,7 +64,8 @@ export function renderFleet(ctx) {
   const visible = rows.filter((row) => {
     if (!needle) return true;
     const project = ctx.projectOf(row.project);
-    return [row.title, row.id, row.taskId, project.name, project.key, project.path, row.branch, row.accountLabel, row.accountId]
+    return [row.title, row.id, row.taskId, project.name, project.key, project.path, row.branch, row.accountLabel, row.accountId,
+      ...numHaystack(row.num)]
       .some((value) => String(value || '').toLowerCase().includes(needle));
   });
   const groups = new Map();
@@ -61,16 +78,7 @@ export function renderFleet(ctx) {
   const table = visible.length ? `<table><thead><tr><th>State</th><th>Session / pane</th><th>Branch</th><th>Card</th><th>Waiting</th><th>Last activity</th><th>Kind</th><th>Account</th><th></th></tr></thead><tbody>${ordered.map((group) => {
     const waiting = group.rows.filter((row) => row.waiting).length;
     const sessions = group.rows.filter((row) => row.session).length;
-    return `<tr class="grp"><td colspan="9">${ctx.projectHTML(group.project.path, true)} <span class="group-meta">${sessions} session${sessions === 1 ? '' : 's'}${waiting ? ` · ${waiting} waiting` : ''}</span></td></tr>${group.rows.map((row) => {
-      const pinned = ctx.isPanePinned(row.pane);
-      const reopen = row.sessionId && !row.alive ? `<button class="btn" data-reopen="${ctx.esc(row.sessionId)}" data-agent="${ctx.esc(row.agent)}" data-title="${ctx.esc(row.title)}" data-stale="${ctx.esc(row.pane || '')}">Reopen</button>` : '';
-      const closeIdle = row.session && row.alive
-        ? `<button class="btn" data-close-idle="${ctx.esc(row.sessionId)}" data-pane="${ctx.esc(row.pane)}">Close</button>` : '';
-      const remove = (row.pane && panes.get(row.pane)?.alive === false ? `<button class="btn" data-remove="${ctx.esc(row.pane)}">Remove</button>` : '') + closeIdle;
-      const configured = (ctx.data.accounts || []).find((account) => account.id === row.accountId);
-      const account = row.accountLabel || configured?.label || row.accountId;
-      return `<tr><td><span class="st"><i class="${ctx.esc(row.state)}"></i>${ctx.esc(row.stateLabel || row.state)}</span></td><td>${ctx.esc(row.title)}${row.reviewer ? '<span class="rv">reviewer</span>' : ''} <span class="mono faint">${ctx.esc(row.id)}</span></td><td class="mono muted">${ctx.esc(row.branch)}</td><td class="mono info">${ctx.esc(row.taskId || '')}${ctx.tagsHTML(ctx.taskFor(row))}</td><td class="mono waiting-kind">${ctx.esc(row.waiting)}</td><td class="mono muted">${ctx.esc(ctx.rel(row.since))}</td><td class="mono ${row.kind === 'codex' ? 'kind-codex' : ''}">${ctx.esc(row.kind)}</td><td>${ctx.esc(account || '—')}</td><td><button class="btn" data-pin="${ctx.esc(row.pane || '')}" data-title="${ctx.esc(row.title)}" ${row.alive && !pinned ? '' : 'disabled'}>${pinned ? 'Pinned' : 'Pin'}</button>${reopen}${remove}</td></tr>`;
-    }).join('')}`;
+    return `<tr class="grp"><td colspan="9">${ctx.projectHTML(group.project.path, true)} <span class="group-meta">${sessions} session${sessions === 1 ? '' : 's'}${waiting ? ` · ${waiting} waiting` : ''}</span></td></tr>${group.rows.map((row) => fleetRowHTML(ctx, row, panes)).join('')}`;
   }).join('')}</tbody></table>` : '<div class="qempty"><b>No fleet rows match</b>Try another title, card, project, or branch.</div>';
 
   const root = document.querySelector('#fleet');

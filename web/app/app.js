@@ -18,6 +18,7 @@ import { createSessionHistory, installSessionHistory } from './session-history.j
 import { installTriageControls, renderTriage } from './triage.js';
 import { renderWatch, installWatchControls } from './watch.js';
 import { renderFleet } from './fleet.js';
+import { numLabel } from './session-number.js';
 import { openReviewQueueNotification, renderReviewQueue, reviewQueueIdForNotification } from './review-queue.js';
 import { openSessionChooser } from './session-launcher.js';
 import { openPortableTransfer } from './portable-transfer.js';
@@ -234,7 +235,7 @@ function entityForPane(id) {
     pane, session, project: session?.project || pane.meta?.project || pane.cwd || '',
     title: session?.title || pane.meta?.title || pane.title || 'shell', state: pane.alive === false ? 'exited' : session?.state || (pane.alive ? 'running' : 'exited'),
     stateLabel: pane.alive === false ? 'Exited' : session ? sessionLabel(session) : pane.alive ? 'Running' : 'Exited',
-    reviewer: Boolean(session?.reviewer), taskId: session?.taskId || null,
+    reviewer: Boolean(session?.reviewer), taskId: session?.taskId || null, num: session?.num,
   };
 }
 function queueItems() {
@@ -246,6 +247,7 @@ function sessionItem(kind, session, pane = session.pane) {
   return {
     kind,
     sessionId: session.id,
+    num: session.num,
     pane: pane || null,
     project: session.project,
     title: session.title,
@@ -1171,7 +1173,9 @@ function focusSession(sessionId) {
   window.focus();
   if (item) { selectAttention(attentionKey(item)); return; }
   const session = (data.sessions || []).find((candidate) => candidate.id === sessionId);
-  toast(session ? `${session.title || sessionId.slice(0, 8)} is not waiting on you` : `Session ${sessionId.slice(0, 8)} is not in the fleet list`);
+  // A session Owner can name by number should be named that way, not by uuid stub.
+  const named = session?.num ? numLabel(session.num) : sessionId.slice(0, 8);
+  toast(session ? `${session.title || named} is not waiting on you` : `Session ${named} is not in the fleet list`);
 }
 function selectAttention(key) {
   state.filter = null;

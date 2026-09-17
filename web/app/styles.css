@@ -111,6 +111,10 @@ main { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .strip-label { margin: auto 0; writing-mode: vertical-rl; font: 500 10px var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
 .strip-label b { font: inherit; color: inherit; } .strip-label b.hot { color: var(--accent); }
 .qlist { overflow-y: auto; flex: 1; }
+/* The session's console number. Reads like the faint mono ids it stands in for. */
+.num-id { margin-left: 6px; color: var(--faint); font: 11px/1 var(--mono); font-weight: 400; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.qitem .t .num-id { margin: 0 6px 0 0; }
+.shead h2 .num-id { font-size: 12px; }
 .qitem { display: grid; grid-template-columns: 4px 1fr auto; gap: 1px 10px; padding: 10px 12px 10px 8px; border-left: 3px solid transparent; cursor: pointer; }
 .qitem:hover { background: var(--panel-2); } .qitem.sel { background: var(--sel); border-left-color: var(--accent); }
 .qitem .stripe { grid-row: 1 / span 3; border-radius: 2px; background: transparent; }

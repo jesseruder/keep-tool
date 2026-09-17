@@ -6,6 +6,7 @@
 const {
   die, parseArgs, KeepError, postKeepApi, ROOT,
 } = require('../keep-core.js');
+const sessionNumbers = require('../session-numbers.js');
 
 const commands = {};
 
@@ -20,6 +21,16 @@ async function connectHost(deps = {}) {
 async function resolveHostPane(client, value) {
   if (!value) die('a pane id is required');
   const { panes } = await client.request('list');
+  // A console session number names the pane hosting that session. Read-only: the
+  // CLI never allocates numbers, it only reads what the daemon's scan wrote.
+  const numbered = sessionNumbers.parseNumber(value);
+  if (numbered) {
+    const found = sessionNumbers.lookup(numbered, { root: ROOT });
+    const hosting = found ? panes.filter((pane) => String(pane.meta && pane.meta.sessionId || '') === found.id) : [];
+    if (hosting.length === 1) return hosting[0];
+    if (hosting.length > 1) die(`${sessionNumbers.label(numbered)} is hosted by several panes (${hosting.map((pane) => pane.id).join(', ')})`);
+    if (found) die(`no pane is running ${sessionNumbers.label(numbered)} (${found.id})`);
+  }
   const exact = panes.filter((pane) => pane.id === value || String(pane.meta && pane.meta.sessionId || '') === value);
   if (exact.length === 1) return exact[0];
   const matches = panes.filter((pane) => pane.id.startsWith(value)
@@ -51,7 +62,12 @@ function renderHostPanes(panes) {
   return [headings, ...rows].map((row) => row.map((value, index) => value.padEnd(widths[index])).join('  ')).join('\n');
 }
 
-function renderPanePanes(panes) {
+function knownSessionNumbers() {
+  try { return sessionNumbers.read({ root: ROOT }).ids; } catch { return {}; }
+}
+
+function renderPanePanes(panes, numbers = null) {
+  const registry = numbers || knownSessionNumbers();
   const headings = ['id', 'state', 'size', 'primary', 'title', 'agent/session', 'cwd'];
   const rows = panes.map((pane) => [
     String(pane.id),
@@ -59,11 +75,19 @@ function renderPanePanes(panes) {
     `${pane.cols}×${pane.rows}`,
     String(pane.primary || ''),
     String(pane.title || '').replace(/\s+/g, ' '),
-    [pane.meta && pane.meta.agent, pane.meta && pane.meta.sessionId].filter(Boolean).join('/'),
+    sessionColumn(pane, registry),
     String(pane.cwd || ''),
   ]);
   const widths = headings.map((heading, index) => Math.max(heading.length, ...rows.map((row) => row[index].length)));
   return [headings, ...rows].map((row) => row.map((value, index) => value.padEnd(widths[index])).join('  ')).join('\n');
+}
+
+// "#12 claude/<uuid>" once the daemon has numbered the session behind the pane.
+function sessionColumn(pane, registry) {
+  const sessionId = String(pane.meta && pane.meta.sessionId || '');
+  const agentSession = [pane.meta && pane.meta.agent, sessionId || null].filter(Boolean).join('/');
+  const num = sessionId ? registry[sessionId] : null;
+  return num ? `${sessionNumbers.label(num)} ${agentSession}` : agentSession;
 }
 
 function renderPaneDetails(pane) {
@@ -449,4 +473,4 @@ commands.reviewer = async (args) => {
   else console.log('Open the reviewer in the Keep console.');
 };
 
-module.exports = { commands, resolveHostPane, renderHostPanes, parseHostSpawn };
+module.exports = { commands, resolveHostPane, renderHostPanes, renderPanePanes, parseHostSpawn };

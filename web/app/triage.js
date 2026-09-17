@@ -9,6 +9,7 @@ import { sessionLabel, sessionExplanation, backgroundLabel, hostOutage, hostOuta
 import { retainSelection, selectionIndex } from './selection.js';
 import { actionsMenuHTML, installActionsMenu, patchActionsMenu, rendererControlsHTML } from './session-actions.js';
 import { stateLineHTML, installGrading } from './state-line.js';
+import { numBadgeHTML } from './session-number.js';
 
 const summaryCache = new Map(); // session id -> { text, fetchedAt, mtime, fresh }
 const summaryInflight = new Map();
@@ -157,24 +158,28 @@ function renderRail(ctx, items) {
   });
 }
 
-function queueRow(ctx, item) {
+export function queueRow(ctx, item) {
   const session = ctx.sessionFor(item);
   const title = item.title || session?.title || 'untitled session';
   const project = item.project || session?.project || '';
   const task = ctx.taskFor(item);
+  // "#12" ahead of the title. A row with no session of its own (a plain shell)
+  // has no number and shows none. It lives inside .t because .qitem is a fixed
+  // three-column grid: another top-level span would shift every cell after it.
+  const badge = numBadgeHTML(ctx.esc, item.num ?? session?.num, item.sessionId || session?.id);
   if (item.kind === 'running' || item.kind === 'pinned' || item.kind === 'recent') {
     const sessionState = session ? sessionLabel(session) : item.state || 'unknown';
     // Running rows without a session are plain shells; label them like pinned ones.
     const shell = (item.kind === 'pinned' || (item.kind === 'running' && !item.sessionId))
       && ctx.paneMap().get(item.pane)?.meta?.agent === 'shell';
     const recentTime = item.kind === 'recent' ? `<span class="w num">${ctx.esc(ctx.rel(item.since))}</span>` : '';
-    return `<span class="stripe"></span><span class="t ${title === 'untitled session' ? 'untitled' : ''}">${ctx.esc(title)}</span>
+    return `<span class="stripe"></span><span class="t ${title === 'untitled session' ? 'untitled' : ''}">${badge}${ctx.esc(title)}</span>
       ${recentTime}
       <span class="p">${ctx.projectHTML(project)}${item.taskId ? `<span class="card">${ctx.esc(item.taskId)}</span>` : ''}${ctx.tagsHTML(task)}</span>
       <span class="s">${shell ? '<span class="kind shell">shell</span>' : ''}<span title="${ctx.esc(sessionExplanation(session))}" class="kind state ${ctx.esc(session?.state || item.state || '')}">${ctx.esc(sessionState)}</span>${item.kind === 'running' && ctx.isMarkedRunning(item) ? '<span class="kind marked-running">marked running</span>' : ''}${backgroundLabel(session) ? `<span class="kind">${ctx.esc(backgroundLabel(session))}</span>` : ''}</span>`;
   }
   const waited = waitText(item.since);
-  return `<span class="stripe"></span><span class="t ${title === 'untitled session' ? 'untitled' : ''}">${ctx.esc(title)}</span>
+  return `<span class="stripe"></span><span class="t ${title === 'untitled session' ? 'untitled' : ''}">${badge}${ctx.esc(title)}</span>
     <span class="w num ${waited.includes('d') ? 'long' : ''}">${ctx.esc(waited)}</span>
     <span class="p">${ctx.projectHTML(project)}${item.taskId ? `<span class="card">${ctx.esc(item.taskId)}</span>` : ''}${ctx.tagsHTML(task)}</span>
     <span class="s"><span title="${ctx.esc(sessionExplanation(session))}" class="kind ${ctx.esc(item.kind)}">${ctx.esc(item.attentionLabel || ctx.kindLabel(item.kind))}</span>${backgroundLabel(session) ? `<span class="kind">${ctx.esc(backgroundLabel(session))}</span>` : ''}${ctx.esc(itemSummary(item, session))}</span>`;
@@ -392,7 +397,7 @@ function renderStage(ctx, active, focusItem, running, pinned) {
   const reopen = hasLivePane || pendingHandoff ? ''
     : `<button class="btn" data-reopen ${paneUnknown ? 'disabled title="The terminal host is not answering; its panes cannot be listed."' : ''}>Reopen</button>`;
   const heading = stage.querySelector('.shead .session-heading');
-  ctx.patchHTML(heading, `<h2>${ctx.esc(title)}</h2><div class="meta mono">${ctx.projectHTML(item.project || session?.project || '', true)}${item.taskId ? `<span>${ctx.esc(item.taskId)}</span>${ctx.tagsHTML(task)}` : ''}${accountLabelHTML(ctx, session, pane)}${outageNote}</div>${task ? modelUsageHTML(task.modelUsage) : ''}`);
+  ctx.patchHTML(heading, `<h2>${ctx.esc(title)}${numBadgeHTML(ctx.esc, item.num ?? session?.num, item.sessionId || session?.id)}</h2><div class="meta mono">${ctx.projectHTML(item.project || session?.project || '', true)}${item.taskId ? `<span>${ctx.esc(item.taskId)}</span>${ctx.tagsHTML(task)}` : ''}${accountLabelHTML(ctx, session, pane)}${outageNote}</div>${task ? modelUsageHTML(task.modelUsage) : ''}`);
   const brief = stage.querySelector('.brief');
   const portable = item.sessionId && !session?.reviewer ? portableTransferControls(ctx, item.sessionId) : '';
   const handoff = (closable || pendingHandoff) && !session?.reviewer ? handoffControls(ctx, item.sessionId, item.pane) : '';

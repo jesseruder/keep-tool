@@ -36,6 +36,16 @@ test('a card-usage run stamp does not change a card detail version', () => {
     dashboardDetail({ tasks: [card(null)] }, 'task', 'card').version);
 });
 
+test('the session number reaches every client: compact, lightweight and exited rows keep num', () => {
+  const live = { id: 'live', num: 12, state: 'running' };
+  const gone = { id: 'gone', num: 3, exited: true, state: 'exited', lastAssistantFull: 'answer', size: 10 };
+  const state = { tasks: [], sessions: [live, gone], notifications: [], attention: [] };
+  assert.deepEqual(compactState(state).sessions.map((session) => session.num), [12, 3]);
+  const light = lightweightState(state).sessions;
+  assert.equal(light[0].num, 12);
+  assert.equal(light[1].num, 3, 'an exited row is trimmed hard but keeps its number');
+});
+
 test('console state removes unused histories while preserving inbox notes and safety flags', () => {
   const state = {
     tasks: [{ id: 'inbox', body: 'notes', fm: { title: 'Card' } }, { id: 'other', body: 'long history', lastLog: 'latest' }],

@@ -31,6 +31,7 @@ const allow = require('./allow.js');
 const cardUsage = require('./card-usage.js');
 const delegation = require('./delegation.js');
 const features = require('./features.js');
+const sessionNumbers = require('./session-numbers.js');
 const hookGroup = require('./commands/hook.js');
 const hostGroup = require('./commands/host.js');
 const reviewGroup = require('./commands/review.js');
@@ -2284,10 +2285,16 @@ commands.compact = async (argv) => {
   die(result.error || `keep serve returned an unexpected response (${response.status})`);
 };
 
+function openedSessionName(result) {
+  if (!result.sessionId) return '';
+  const num = sessionNumbers.parseNumber(result.num);
+  return num ? `${sessionNumbers.label(num)} (${result.sessionId})` : String(result.sessionId);
+}
+
 function formatOpenResult(result) {
   const sent = result.sent ? ' (message sent)' : '';
-  if (result.existing && result.pane) return `session ${result.sessionId} is running in pane ${result.pane}; open it in the console${sent}`;
-  const session = result.sessionId ? ` as ${result.sessionId}` : '';
+  if (result.existing && result.pane) return `session ${openedSessionName(result)} is running in pane ${result.pane}; open it in the console${sent}`;
+  const session = result.sessionId ? ` as ${openedSessionName(result)}` : '';
   const handoff = [];
   if (result.linked) handoff.push(`card now owned by ${result.sessionId}`);
   if (result.unlinked) handoff.push(`${result.unlinked} unlinked`);
@@ -2316,6 +2323,7 @@ async function postOpen(payload, post = postKeepApi, timeoutMs) {
 }
 
 function writeOpenHandoff(id, message, task) {
+  id = String(id).replace(/^#(?=[0-9])/, 's');
   if (!/^[A-Za-z0-9_-]+$/.test(id)) die('bad card or session id');
   return withLock(() => {
     const directory = path.join(META, 'handoffs');
@@ -2349,8 +2357,8 @@ function writeOpenHandoff(id, message, task) {
 
 commands.open = async (argv, deps = {}) => {
   const o = parseArgs(argv, { fresh: 'bool', agent: 'str', model: 'str', account: 'str', 'message-file': 'str' });
-  const id = o._[0];
-  if (!id) die('usage: keep open <card-id|session-id> [--fresh] [--agent claude|codex] [--account <id>] [--model <id>] [-m "opening message" | --message-file <path>]');
+  let id = o._[0];
+  if (!id) die('usage: keep open <card|session-id|#n> [--fresh] [--agent claude|codex] [--account <id>] [--model <id>] [-m "opening message" | --message-file <path>]');
   if (o.agent && !['claude', 'codex'].includes(o.agent)) die('agent must be claude or codex');
   // --model goes on the launched command line only (claude --model / codex -m), so it
   // applies to that process and never touches ~/.claude/settings.json.
@@ -2364,6 +2372,11 @@ commands.open = async (argv, deps = {}) => {
   if (message != null && !message.trim()) die(o['message-file'] != null ? '--message-file needs a message' : '-m needs a message');
   let task;
   try { task = (deps.loadTask || loadTask)(id); } catch {}
+  if (!task) {
+    const numbered = sessionNumbers.parseNumber(id);
+    const found = numbered ? sessionNumbers.lookup(numbered, { root: ROOT }) : null;
+    if (found) id = found.id;
+  }
   if (message != null && (o['message-file'] != null || message.length > OPEN_MESSAGE_LIMIT || /[\r\n]/.test(message))) {
     message = writeOpenHandoff(id, message, task);
   }
@@ -2546,7 +2559,12 @@ commands.resume = async (argv, deps = {}) => {
     const s = (t.fm.sessions || [])[t.fm.sessions ? t.fm.sessions.length - 1 : 0];
     if (s) {
       const proj = t.fm.project ? `cd ${t.fm.project} && ` : '';
-      console.log(color('90', `      ${proj}${resumeCommand(s, process.env, { raw: Boolean(o.raw) })}`));
+      // The label rides the printed `keep open <id>` line: an extra positional the
+      // command ignores, so the line stays copy-pasteable. --raw prints a bare agent
+      // command, where a trailing word would become an argument.
+      const numbered = !o.raw && s.id ? sessionNumbers.lookup(s.id, { root: ROOT }) : null;
+      const num = numbered ? `  ${sessionNumbers.label(numbered.num)}` : '';
+      console.log(color('90', `      ${proj}${resumeCommand(s, process.env, { raw: Boolean(o.raw) })}${num}`));
     }
   }
 };
@@ -2718,7 +2736,8 @@ ${stepUsage()}
   keep probe <id>      # run this card's probe now (exit 1 = failed); no check-in, no daemon
   keep verify <id>     # run this task's check recipe now, in its thread or a fresh session (needs keep serve)
   keep compact <sid>   # compact a live Claude or Codex session (needs keep serve)
-  keep open <card-id|session-id> [--fresh] [--agent claude|codex] [--model <id>] [-m "opening message" | --message-file <path>]
+  keep open <card|session-id|#n> [--fresh] [--agent claude|codex] [--model <id>] [-m "opening message" | --message-file <path>]
+                         # #n is the console's session number (12, #12 and s12 all work);
                          # --model applies to the launched process only (never settings.json);
                          # -m waits for the agent's prompt and types the message;
                          # --fresh on a card links the new session and unlinks the caller's

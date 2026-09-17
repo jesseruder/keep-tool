@@ -13,7 +13,7 @@ function pick(source, fields) {
 
 const TASK_FRONTMATTER_FIELDS = ['title', 'status', 'project', 'tags', 'next', 'next_step', 'updated'];
 const SESSION_SUMMARY_FIELDS = [
-  'id', 'kind', 'agent', 'project', 'title', 'taskId', 'taskStatus', 'mtime', 'lastUserAt',
+  'id', 'num', 'kind', 'agent', 'project', 'title', 'taskId', 'taskStatus', 'mtime', 'lastUserAt',
   'state', 'stateLabel', 'endedTurn', 'alive', 'exited', 'pane', 'rateLimit', 'reviewer',
   // The watcher's one-line "what this session just did and what is next", and the
   // verdict it came from. `pick` drops them when the watcher has not run.

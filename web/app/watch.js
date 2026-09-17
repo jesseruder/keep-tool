@@ -3,6 +3,7 @@ import { sessionExplanation } from './status.js';
 import { accountLabelHTML, handoffControls, installHandoffControls, hasPendingHandoff } from './account-controls.js';
 import { portableTransferControls, installPortableTransferControls } from './portable-transfer.js';
 import { actionsMenuHTML, installActionsMenu, patchActionsMenu, rendererControlsHTML } from './session-actions.js';
+import { numBadgeHTML } from './session-number.js';
 
 const SHELL_PROJECT_KEY = 'keep.console.shellProject';
 
@@ -116,7 +117,7 @@ function renderGrid(ctx, layout) {
     const closable = pane.alive && ['claude', 'codex'].includes(pane.meta?.agent) && pane.meta?.sessionId;
     const pendingHandoff = hasPendingHandoff(ctx, pane.meta?.sessionId, pane.id);
     const exitedAgent = pane.alive === false && ['claude', 'codex'].includes(pane.meta?.agent);
-    ctx.patchHTML(element.querySelector('.ph .session-heading'), `<b>${ctx.esc(entity.title)}</b><div class="meta">${ctx.projectHTML(entity.project)}${entity.taskId ? `<span class="proj">${ctx.esc(entity.taskId)}</span>${ctx.tagsHTML(ctx.taskFor(entity))}` : ''}${accountLabelHTML(ctx, entity.session, pane)}</div>`);
+    ctx.patchHTML(element.querySelector('.ph .session-heading'), `<b>${ctx.esc(entity.title)}${numBadgeHTML(ctx.esc, entity.num, entity.session?.id)}</b><div class="meta">${ctx.projectHTML(entity.project)}${entity.taskId ? `<span class="proj">${ctx.esc(entity.taskId)}</span>${ctx.tagsHTML(ctx.taskFor(entity))}` : ''}${accountLabelHTML(ctx, entity.session, pane)}</div>`);
     ctx.patchHTML(element.querySelector('.pane-state'), `<span class="st"><i class="${ctx.esc(entity.state)}"></i>${ctx.esc(entity.stateLabel || entity.state)}</span>`);
     const portable = (closable || pendingHandoff) && !entity.session?.reviewer ? portableTransferControls(ctx, pane.meta.sessionId) : '';
     const handoff = (closable || pendingHandoff) && !entity.session?.reviewer ? handoffControls(ctx, pane.meta.sessionId, pane.id) : '';
