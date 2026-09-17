@@ -344,6 +344,13 @@ test('a card with no deliverable session reports the exact state, not the count'
       }));
     assert.equal(ok.sessionId, 'b');
     assert.equal(sent.length, 1);
+    // pickDeliveryCandidates does not know about a usage limit, so the newest session
+    // being rate-limited must not hide the ready one behind it.
+    const sibling = await tellSession({ taskId: 'some-card', text: 'ping' }, tellDeps(root,
+      [liveSession('a', { rateLimit: { at: 1 }, mtime: 9 }), liveSession('b', { mtime: 2 })], {
+        loadTask: () => ({ id: 'some-card', fm: { sessions: [{ id: 'a' }, { id: 'b' }] } }),
+      }));
+    assert.equal(sibling.sessionId, 'b');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -430,7 +437,7 @@ test('--dry leaves the registry byte for byte as it found it', async () => {
   const before = snapshotTree();
   // The real scanner, in the mode --dry uses. It may read anything; it may write
   // nothing.
-  scanSessions({ readOnly: true });
+  scanSessions({ readOnly: true, allocateNumbers: false });
   assert.deepEqual(snapshotTree(), before, 'a read-only scan writes nothing under the registry');
 
   // And the ordinary scan is what would have expired it, so the flag is load-bearing.
@@ -444,7 +451,7 @@ test('--dry leaves the registry byte for byte as it found it', async () => {
   });
   await tellSession({ sessionId: 'target-session', text: 'ping', dry: true }, deps);
   await tellSession({ sessionId: 'target-session', text: 'ping' }, deps);
-  assert.deepEqual(asked, [{ readOnly: true }, {}], 'only the dry run asks for the read-only mode');
+  assert.deepEqual(asked, [{ readOnly: true, allocateNumbers: false }, {}], 'only the dry run asks for the read-only mode');
 });
 
 // ---------- the CLI ----------

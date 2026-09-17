@@ -26,8 +26,13 @@ const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', '
 
 // Claude limits carry an ISO string, Codex ones epoch milliseconds; a reset nobody
 // can parse simply goes unmentioned rather than printing "Invalid Date".
+function resetTime(resetsAt) {
+  try { return typeof resetsAt === 'number' ? resetsAt : Date.parse(String(resetsAt || '')); }
+  catch { return NaN; }
+}
+
 function describeReset(resetsAt) {
-  const at = typeof resetsAt === 'number' ? resetsAt : Date.parse(String(resetsAt || ''));
+  const at = resetTime(resetsAt);
   if (!Number.isFinite(at)) return '';
   const when = new Date(at);
   const clock = `${String(when.getHours()).padStart(2, '0')}:${String(when.getMinutes()).padStart(2, '0')}`;
@@ -102,8 +107,17 @@ function accountBudget(snapshot, account, model, now) {
     { limit: week, code: 6 },
     ...(short ? [{ limit: short, code: 7 }] : []),
   ];
-  const offending = applicable.filter((entry) => headroom(entry.limit) < min);
-  if (!offending.length) return { code: 0, reason: 'within budget' };
+  // A bucket whose recorded reset has already passed describes a window that no longer
+  // exists. A Codex reading only advances when a Codex session takes a turn, so a spent
+  // window can sit in the snapshot for hours after it reopened; believing it would
+  // refuse an account that is fine. It is unknown, not exhausted and not room.
+  const expired = (entry) => { const at = resetTime(entry.limit.resetsAt); return Number.isFinite(at) && at <= now; };
+  const offending = applicable.filter((entry) => headroom(entry.limit) < min && !expired(entry));
+  if (!offending.length) {
+    return applicable.some(expired)
+      ? { code: 8, reason: `usage reading for ${id} predates a reset` }
+      : { code: 0, reason: 'within budget' };
+  }
   const worst = offending.reduce((a, b) => (headroom(b.limit) < headroom(a.limit) ? b : a));
   // `low` is under the headroom floor but not yet at the wall: worth passing over for a
   // better account, still better than refusing to launch at all. A bucket at or past

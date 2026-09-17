@@ -137,7 +137,7 @@ function assign(sessions, options = {}) {
   if (!unknown.length) return rows;
   // A read-only scan labels whatever the registry already knows and allocates nothing.
   // Allocation writes the registry file, and a caller that promised to change nothing —
-  // `keep tell --dry`, the stalled-session snapshot — must not. The next ordinary scan
+  // `keep tell --dry` — must not. The next ordinary scan
   // numbers these.
   if (options.readOnly === true) return rows;
   try {

@@ -90,6 +90,7 @@ const {
   writeTarget,
   pressTargetKey,
   typeAndSubmit,
+  sendToResolvedTarget,
   resolveSessionTarget,
   screenSession,
   screenHistorySession,
@@ -4990,6 +4991,122 @@ test('a box holding more than the typed message is not submitted', async () => {
     ...gone.deps, requireExactDraft: true,
   }), /no longer holds only the typed message/);
   assert.equal(gone.inputs.includes('\r'), false);
+});
+
+// Recovery is the one place an Enter is pressed on a draft this process did not just
+// type. deliverAttempt (bin/delivery.js) finds a pending journal for the same text and
+// pane, sees that draft still in the box, and submits it rather than typing the message
+// a second time — so typeAndSubmit, with all of its guards, is never reached. The two
+// properties it borrows from that path have to be established here instead: the box is
+// read again immediately before Enter, and once Enter is on its way the caller is told
+// that typing started.
+const RECOVERY_SESSION = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+
+// The state a send that typed its message but never saw a receipt leaves behind: an
+// unfinished journal for this text and pane, the draft still on screen, and a
+// transcript with nothing in it yet.
+function recoveryHarness({ screenFor, onEnter }) {
+  const delivery = require('./delivery');
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-draft-recovery-'));
+  const directory = path.join(base, 'delivery');
+  const file = path.join(base, 'transcript.jsonl');
+  const journal = path.join(directory, `${delivery.textHash(RECOVERY_SESSION)}.json`);
+  fs.mkdirSync(directory, { recursive: true });
+  fs.writeFileSync(file, '');
+  fs.writeFileSync(journal, JSON.stringify({
+    createdAt: Date.now(), sessionId: RECOVERY_SESSION, kind: 'claude', file, offset: 0,
+    pane: 'pane-recovery', hash: delivery.textHash(MESSAGE), typedAt: Date.now(),
+  }));
+  const inputs = [];
+  let reads = 0;
+  const host = recordingHost(async (type, params) => {
+    if (type === 'screen') {
+      reads += 1;
+      // y: 1 is the prompt line of BOX(), which is where draftMatches insists the
+      // cursor be before it will call a draft present.
+      return { text: screenFor(reads), cursor: { x: 2, y: 1 } };
+    }
+    if (type === 'input') {
+      const value = Buffer.from(params.data, 'base64').toString();
+      inputs.push(value);
+      if (value === '\r' && onEnter) await onEnter(file);
+    }
+    return {};
+  });
+  return {
+    base, file, journal, inputs,
+    send: () => sendToResolvedTarget({ id: RECOVERY_SESSION, kind: 'claude' }, { pane: 'pane-recovery' },
+      MESSAGE, undefined, {
+        host, deliveryDirectory: directory,
+        transcriptFileForSession: () => file,
+        loadDeliverySession: () => ({ id: RECOVERY_SESSION, endedTurn: true }),
+      }),
+  };
+}
+
+test('a recovered draft is submitted once, and only while the box still holds exactly it', async () => {
+  // The box still holds exactly the message when Enter is pressed, and the receipt
+  // lands: one Enter, nothing retyped, and the pending attempt is finished.
+  const clean = recoveryHarness({
+    screenFor: () => BOX(MESSAGE),
+    onEnter: (file) => fs.appendFileSync(file,
+      `${JSON.stringify({ type: 'user', message: { role: 'user', content: MESSAGE } })}\n`),
+  });
+  try {
+    assert.deepEqual(await clean.send(), { ok: true, delivery: 'received' });
+    assert.deepEqual(clean.inputs, ['\r'], 'the draft is submitted, never retyped');
+    assert.equal(fs.existsSync(clean.journal), false, 'and the pending attempt is finished');
+  } finally { fs.rmSync(clean.base, { recursive: true, force: true }); }
+
+  // Owner typed into the same box between the draft check and Enter. Submitting now
+  // would send a line neither of them wrote, so Enter is not pressed and the box is
+  // not touched. Nothing was typed, so the caller is free to try again later.
+  const mixed = recoveryHarness({
+    screenFor: (reads) => (reads === 1 ? BOX(MESSAGE) : BOX(`${MESSAGE} and rm -rf build`)),
+  });
+  try {
+    const error = await mixed.send().then(() => null, (e) => e);
+    assert.equal(error.status, 409);
+    assert.match(error.message, /the recovered draft changed before Enter; Enter was not pressed/);
+    assert.deepEqual(mixed.inputs, [], 'Enter is never pressed, and nothing is erased either');
+    assert.equal(error.typingStarted, false, 'nothing reached the pane, so the slot may be given back');
+    assert.equal(fs.existsSync(mixed.journal), true, 'the pending attempt is left for the next try');
+  } finally { fs.rmSync(mixed.base, { recursive: true, force: true }); }
+
+  // Enter went in and the receipt could not be read — a resumed session writes to a
+  // new transcript, so the recorded file can be gone by the time it is checked. The
+  // caller must see that typing started: handing the slot back here would retype a
+  // message that may well have been submitted.
+  const lost = recoveryHarness({
+    screenFor: () => BOX(MESSAGE),
+    onEnter: (file) => fs.rmSync(file),
+  });
+  try {
+    const failure = await lost.send().then(() => null, (e) => e);
+    assert.deepEqual(lost.inputs, ['\r'], 'the recovered draft was submitted');
+    assert.equal(failure.status, 409);
+    assert.equal(failure.typingStarted, true, 'a recovery Enter counts as typing');
+  } finally { fs.rmSync(lost.base, { recursive: true, force: true }); }
+});
+
+// Known gap, not a passing contract. The recovery check above calls exactDraft, which
+// stops reading the box at the first blank line, so Owner's line below one is invisible
+// to it and the recovered draft is submitted with his text still in the box. The
+// Enter-time check on the first-send path does not have this hole: requireExactDraft
+// calls draftIsExactly, which reads the whole box (see the multi-line cases in "a box
+// holding more than the typed message is not submitted"). Swapping exactDraft for
+// draftIsExactly in submitDraft turns this green.
+test("Owner's line below a blank one stops a recovered draft too", async () => {
+  const buried = recoveryHarness({
+    screenFor: (reads) => (reads === 1 ? BOX(MESSAGE) : BOX(MESSAGE, '', 'and rm -rf build')),
+    // Only so the run ends at once when the Enter this asserts against is pressed.
+    onEnter: (file) => fs.appendFileSync(file,
+      `${JSON.stringify({ type: 'user', message: { role: 'user', content: MESSAGE } })}\n`),
+  });
+  try {
+    await buried.send().catch(() => {});
+    assert.deepEqual(buried.inputs, [], 'Enter is never pressed on a box that gained a buried line');
+  } finally { fs.rmSync(buried.base, { recursive: true, force: true }); }
 });
 
 test('the draft region is the whole input box, however it is rendered', () => {

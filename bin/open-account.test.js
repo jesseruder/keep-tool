@@ -212,3 +212,35 @@ test('an account under the headroom floor is passed over but still beats refusin
   assert.equal(better.account.id, 'claude-secondary');
   assert.match(openAccount.accountNote(better), /claude\/default skipped: week 94%/);
 });
+
+test('a bucket whose reset has already passed is unknown, not exhausted', () => {
+  const candidates = [account('codex/default', 'codex'), account('codex-secondary', 'codex')];
+  const past = NOW - 3600e3;
+  // Codex readings only advance when a Codex session takes a turn, so a spent window
+  // can outlive its own reset in the snapshot. It must not refuse the account.
+  const view = { accounts: {
+    'codex/default': { agent: 'codex', asOf: NOW - 2 * 3600e3, windows: [{ label: 'week', percent: 20, resetsAt: RESET }, { label: '5h', percent: 100, resetsAt: past }] },
+  } };
+  const verdict = openAccount.accountBudget(view, candidates[0], '', NOW);
+  assert.equal(verdict.code, 8);
+  assert.match(verdict.reason, /predates a reset/);
+  assert.equal(openAccount.chooseOpenAccount('codex', candidates, view, '', NOW).account.id, 'codex/default');
+  // A window that is still open is still believed.
+  const open = { accounts: {
+    'codex/default': { agent: 'codex', asOf: NOW - 2 * 3600e3, windows: [{ label: 'week', percent: 20, resetsAt: RESET }, { label: '5h', percent: 100, resetsAt: NOW + 3600e3 }] },
+  } };
+  assert.equal(openAccount.accountBudget(open, candidates[0], '', NOW).code, 7);
+});
+
+test('reset metadata nobody can format costs the reset time, never the launch', () => {
+  const hostile = { toString: null };
+  assert.equal(openAccount.describeReset(hostile), '');
+  const candidates = [account('claude/default'), account('claude-secondary')];
+  const view = snapshot({
+    'claude/default': [{ label: 'week', percent: 100, resetsAt: hostile }, short(10)],
+    'claude-secondary': [week(20), short(10)],
+  });
+  const choice = openAccount.chooseOpenAccount('claude', candidates, view, '', NOW);
+  assert.equal(choice.account.id, 'claude-secondary');
+  assert.equal(openAccount.accountNote(choice), 'claude/default skipped: week 100%; opened on claude-secondary');
+});

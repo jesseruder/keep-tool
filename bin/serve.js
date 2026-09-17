@@ -4966,6 +4966,19 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
       },
       submitDraft: async () => {
         if (opts?.beforeType) await opts.beforeType();
+        // draftMatches() ran before that await, and every millisecond since is one in
+        // which Owner can have typed into the box. Read it again, as typeAndSubmit does
+        // before its own Enter, and leave a mixed draft alone rather than submit it.
+        const screen = await readScreenResult(target, 200, false, deps);
+        // draftIsExactly, not exactDraft: the latter stops at the first blank line, so
+        // a line Owner added below one would be invisible to it.
+        if (!draftIsExactly(screen.text, text, session.kind)) {
+          trace('draft-changed-before-enter');
+          throw new InjectionError(409, 'the recovered draft changed before Enter; Enter was not pressed');
+        }
+        // From here the message may arrive: a caller deciding whether to give a
+        // reservation back has to see that, exactly as it does for a first send.
+        trace('enter-start');
         return pressTargetKey(target, 'Enter', deps);
       },
       draftMatches: async () => {
@@ -5573,21 +5586,24 @@ async function openSession(body, deps = {}) {
       // or a chooser bug must not be able to stop a launch. Anything thrown here falls
       // back to the registry default, exactly as an open with no policy would.
       let choice = null;
+      let note = '';
       try {
         choice = openAccount.chooseOpenAccount(agent, openAccount.orderOpenCandidates(agent, {
           accounts: accounts.list(env),
           defaultAccountId: accounts.defaultFor(agent, env).id,
           callerAccountId: body.callerAccountId,
         }), usageSnapshot(deps), launchModel, Date.now());
+        note = choice.account ? openAccount.accountNote(choice) : openAccount.noAccountMessage(agent, choice.skipped);
       } catch (error) {
+        choice = null;
         process.stderr.write(`keep serve: could not choose a ${agent} account: ${String(error && error.message || error)}\n`);
       }
       // Launching a session that can only answer "you are out of usage" wastes the
       // pane and the caller's turn; say which accounts are spent and let Owner
       // override deliberately.
-      if (choice && !choice.account) throw new InjectionError(409, openAccount.noAccountMessage(agent, choice.skipped));
+      if (choice && !choice.account) throw new InjectionError(409, note);
       account = choice ? choice.account : accounts.defaultFor(agent, env);
-      accountNote = choice ? openAccount.accountNote(choice) : '';
+      accountNote = choice ? note : '';
     } else {
       account = accounts.defaultFor(agent, env);
     }
@@ -6521,7 +6537,7 @@ function scanSessions(options = {}) {
   sessions.sort((a, b) => b.mtime - a.mtime);
   // Every session carries its short number from here on: the snapshot below is
   // what the dashboard state, /api/state and the console all read.
-  sessionNumbers.assign(sessions, { root: keep.ROOT, readOnly: options.readOnly === true });
+  sessionNumbers.assign(sessions, { root: keep.ROOT, readOnly: options.allocateNumbers === false });
   sessionSnapshot = copySessions(sessions);
   sessionSnapshotAt = now;
   if (options.dashboard === true) lastDashboardSessionScan = now;
@@ -8286,7 +8302,7 @@ function tellSessions(dry, deps = {}) {
   if (!deps.scanSessions && Date.now() - sessionSnapshotAt < 5000 && sessionSnapshot.length) {
     return copySessions(sessionSnapshot);
   }
-  return scan({ readOnly: true });
+  return scan({ readOnly: true, allocateNumbers: false });
 }
 
 // `keep tell`: one session addressing another. Everything that decides whether the
@@ -8332,7 +8348,9 @@ async function tellSession(body, deps = {}) {
     const skip = new Set([...excluded, ...(senderId ? [senderId] : [])]);
     const linked = new Set((task.fm.sessions || []).map((entry) => entry && entry.id).filter(Boolean));
     const { candidates } = pickDeliveryCandidates([...linked], sessions, skip);
-    target = candidates[0];
+    // Its predicate does not know about a usage limit or a turn that died, and ours
+    // does: a rate-limited newest session must not hide a ready sibling behind it.
+    target = candidates.find((session) => !tell.tellRefusal(session));
     if (!target) {
       const present = sessions.filter((session) => session && linked.has(session.id) && !skip.has(session.id))
         .sort((a, b) => b.mtime - a.mtime);
