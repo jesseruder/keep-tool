@@ -86,6 +86,15 @@ root is read from the daemon's `npm_config_cache`, which the sessions it launche
 inherit, so a per-session override or a `cache=` setting in an `~/.npmrc` is not read
 and the directory this derives is not the one that server installed into.
 
+Residual, deliberately not closed here: a node process that sets its own title to
+`npm exec <declared spec>` and spawns one genuine server out of the declared package's
+cache install as a decoy is admitted, along with whatever else that process is doing.
+Nothing read from `ps` can tell that apart from the real thing, and this is not the
+rule that would catch it — every process-tree rule in this file trusts the tree, the
+audit pins included, and an agent that deliberately disguises its own background work
+as its declared server defeats all of them equally. The declared-server rule grants
+such an agent nothing it could not already have had by pinning.
+
 What a match asserts is that the row, joined with single spaces, is the declared
 invocation. It cannot assert where the live process put its argument boundaries: `ps`
 joins argv with spaces, so one element containing a space reads exactly like two.
