@@ -1869,13 +1869,25 @@ async function recordSessionPane(input, agent = 'claude', deps = {}) {
       } else if (!owner) {
         record.claimed = true;
       }
-      await client.request('meta', { pane, patch: { sessionId: sid, agent, project: cwd } }, { timeoutMs });
+      const patched = await client.request('meta', { pane, patch: { sessionId: sid, agent, project: cwd } }, { timeoutMs });
       record.bound = true;
-      // Whether anybody is reading this session, from the pane this session now owns.
-      // Written only when it was actually read: the Stop hook uses the record to skip
-      // a host round trip, and a remembered `true` would outlive the fact.
-      record.unattended = paneMeta.unattended === true;
-      record.opener = paneMeta.opener || null;
+      // Whether anybody is reading this session, taken from the pane as it stands
+      // AFTER binding — never from the read above. A console keystroke landing while
+      // the bind was in flight clears the mark, and carrying the earlier `true`
+      // forward would tell an attended session that nobody is listening. The patch
+      // reply carries the pane the host just wrote; if it does not name this session,
+      // ask once more. Left absent when it could not be confirmed, which reads as
+      // unknown, which is attended: the Stop hook uses this record to skip a host
+      // round trip and must never be handed a mark that has already lapsed.
+      let settled = patched && patched.pane && patched.pane.meta;
+      if (!settled || settled.sessionId !== sid) {
+        const confirmed = await client.request('get', { pane }, { timeoutMs });
+        settled = confirmed && confirmed.pane && confirmed.pane.meta;
+      }
+      if (settled && settled.sessionId === sid) {
+        record.unattended = settled.unattended === true;
+        record.opener = settled.opener || null;
+      }
     } catch {
       if (attempt < attempts - 1) await new Promise((resolve) => setTimeout(resolve, deps.retryMs == null ? 400 : deps.retryMs));
     } finally {

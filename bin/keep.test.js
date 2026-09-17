@@ -1299,10 +1299,19 @@ test('the fleet reviewer never becomes a check scheduler', () => {
 test('recordSessionPane writes a host-only record and binds both agent kinds to pane metadata', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-pane-record-'));
   const calls = [];
-  const connectHost = async (options) => ({
-    async request(type, params, requestOptions) { calls.push({ options, type, params, requestOptions }); return { pane: { id: params.pane } }; },
-    close() { calls.push({ type: 'close' }); },
-  });
+  // As bin/host.js does it: a `meta` patch is answered with the pane it just wrote,
+  // which is where the startup attendance is read from — never the `get` before it.
+  const connectHost = async (options) => {
+    const meta = {};
+    return {
+      async request(type, params, requestOptions) {
+        calls.push({ options, type, params, requestOptions });
+        if (type === 'meta') Object.assign(meta, params.patch);
+        return { pane: { id: params.pane, meta: { ...meta } } };
+      },
+      close() { calls.push({ type: 'close' }); },
+    };
+  };
   try {
     const codexRecord = await recordSessionPane({ session_id: 'host-session', cwd: '/tmp/project' }, 'codex', {
       root, env: { KEEP_PANE: 'pane-123' }, connectHost, now: () => 5678,
@@ -1366,7 +1375,7 @@ function runHookCli(argv, options = {}) {
 // A unix-socket terminal host that answers `get` and `meta` the way bin/host.js does.
 // The hooks refuse to take a disk record's word for attendance, so anything that
 // expects a refusal has to let them ask a real socket.
-function hostSocketFixture(sock, panes) {
+function hostSocketFixture(sock, panes, afterReply = null) {
   const { encodeFrame, FrameDecoder } = require('./host.js');
   const server = net.createServer((socket) => {
     const decoder = new FrameDecoder((frame) => {
@@ -1380,6 +1389,9 @@ function hostSocketFixture(sock, panes) {
       socket.write(encodeFrame(pane
         ? { ok: true, id: frame.id, pane: { ...pane, meta: { ...pane.meta } } }
         : { ok: false, id: frame.id, error: 'no such pane' }));
+      // Called once the reply is on the wire, so a test can change the pane between
+      // one request and the next the way a console keystroke would.
+      if (afterReply) afterReply(frame, pane);
     }, () => socket.destroy());
     socket.on('data', (chunk) => decoder.push(chunk));
     socket.on('error', () => {});
@@ -1414,7 +1426,7 @@ function unattendedFixture() {
       panes.set(id, { id, alive: true, meta: { sessionId: sid, agent: 'claude', project, ...meta } });
       return id;
     },
-    startHost: async () => { server = await hostSocketFixture(sock, panes); },
+    startHost: async (afterReply) => { server = await hostSocketFixture(sock, panes, afterReply); },
     stopHost: async () => {
       if (server) await new Promise((resolve) => server.close(resolve));
       server = null;
@@ -1549,6 +1561,31 @@ test('session-start tells an unattended session so before anything else', async 
     assert.equal(owner.status, 0, owner.stderr);
     assert.doesNotMatch(owner.stdout, /unattended session/);
     assert.ok(owner.stdout.startsWith('[keep — work registry]'));
+  } finally { await f.cleanup(); }
+});
+
+test('a keystroke landing mid-bind is not outrun by the startup block', async () => {
+  const f = unattendedFixture();
+  const run = (sid, pane) => runHookCli(['hook', 'session-start'], {
+    env: f.env({ KEEP_PANE: pane }), input: JSON.stringify({ session_id: sid, cwd: f.project }),
+  });
+  try {
+    // Owner opens the console and types while the session is still binding to its
+    // pane: the first `get` says unattended, and by the time the bind lands it is not.
+    // The startup block must follow the pane as it ends up, not as it was read.
+    let cleared = false;
+    await f.startHost((frame, pane) => {
+      if (frame.type !== 'get' || !pane || cleared) return;
+      cleared = true;
+      pane.meta = { ...pane.meta, unattended: false, attendedAt: Date.now(), attendedBy: 'console' };
+    });
+    const pane = f.hostPane('raced-session', { unattended: true, opener: { kind: 'check', id: 'unread-card' } });
+    const started = await run('raced-session', pane);
+    assert.equal(started.status, 0, started.stderr);
+    assert.equal(cleared, true, 'the keystroke landed after the first read');
+    assert.doesNotMatch(started.stdout, /unattended session/);
+    assert.equal(f.readRecord('raced-session').unattended, false,
+      'and the record follows the pane after binding, not the read before it');
   } finally { await f.cleanup(); }
 });
 
@@ -1993,13 +2030,19 @@ test('a failed shell release is recorded so the next session can claim the pane'
     const calls = [];
     await recordSessionPane({ session_id: 'new-session' }, 'claude', {
       root, env: { KEEP_PANE: 'pane-1' }, now: () => 5678,
-      connectHost: async () => ({
-        async request(type, params) {
-          calls.push({ type, params });
-          return { pane: { meta: { sessionId: 'old-session' } } };
-        },
-        close() {},
-      }),
+      connectHost: async () => {
+        const meta = { sessionId: 'old-session' };
+        return {
+          async request(type, params) {
+            calls.push({ type, params });
+            // The patch reply carries the pane the host just wrote, so the bind needs
+            // no second read to see whose pane it now is.
+            if (type === 'meta') Object.assign(meta, params.patch);
+            return { pane: { meta: { ...meta } } };
+          },
+          close() {},
+        };
+      },
     });
     assert.deepEqual(calls.map((call) => call.type), ['get', 'meta']);
     assert.equal(calls[1].params.patch.sessionId, 'new-session');
