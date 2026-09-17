@@ -10,11 +10,13 @@ declares it, or the operator has audited it.
 
 A Claude child process is admitted without policy when it is a stdio server the
 session's own configuration declares: the `--mcp-config` file on the agent's argv,
-`<cwd>/.mcp.json`, or the `.claude.json` of the account the restart resolved for this
-session (top-level `mcpServers` for user scope and `projects[<cwd>].mcpServers` for
-local scope). That account is passed in by the caller and no other is consulted: a
-server the default account declares is not this session's, and a session with no
-resolved account draws on the first two sources only. Those declarations are
+`<cwd>/.mcp.json`, or the `.claude.json` of the account the live agent belongs to
+(top-level `mcpServers` for user scope and `projects[<cwd>].mcpServers` for local
+scope). That account is passed in by the caller and no other is consulted: a server
+the default account declares is not this session's, and a session with no resolved
+account draws on the first two sources only. During an account handoff it is the
+source account, not the target the session is about to resume under — the process
+being accounted for is the one the source started. Those declarations are
 restart-safe by construction — resuming the session launches every declared server
 again from the same file, so a running instance is replaceable and admitting it grants
 nothing the session did not already start for itself. Only `command` and `args` are
@@ -28,7 +30,8 @@ the launcher must be an absolute path whose own first line is either a single ab
 interpreter, which the live one must resolve to by realpath (`python` and `python3` in
 one virtualenv are the same binary; the same basename elsewhere is not), or
 `#!/usr/bin/env NAME` with one bare name, which admits a command of that name, bare or
-absolute (`node /opt/node/bin/npm exec …`). A launcher with no readable shebang of
+absolute (`node /opt/node/bin/npm exec …`). The env path must be the real
+`/usr/bin/env`; a program someone named `env` elsewhere expands nothing. A launcher with no readable shebang of
 either shape has no interpreter-expanded form at all, so `/bin/sh /path/server` is
 refused.
 

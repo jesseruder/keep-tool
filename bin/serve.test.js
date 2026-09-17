@@ -8049,6 +8049,70 @@ test('restarting the fleet reviewer keeps its identity, its launch env, and its 
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('a restart reads MCP declarations from the account the live agent belongs to, not the one it is moving to', async () => {
+  const { restartSession } = require('./serve');
+  const accountStore = require('./accounts');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-mcp-handoff-'));
+  try {
+    const claudeFile = path.join(root, 'claude.jsonl');
+    const sourceDir = path.join(root, 'source'), targetDir = path.join(root, 'target');
+    fs.mkdirSync(sourceDir); fs.mkdirSync(targetDir);
+    const accountConfig = path.join(root, 'config.json');
+    fs.writeFileSync(accountConfig, JSON.stringify({ version: 1, accounts: [
+      { id: 'claude/default', label: 'Primary', agent: 'claude', configDir: path.join(os.homedir(), '.claude'), useDefaultConfig: true },
+      { id: 'claude-source', label: 'Source', agent: 'claude', configDir: sourceDir },
+      { id: 'claude-target', label: 'Target', agent: 'claude', configDir: targetDir },
+    ], defaultAccounts: { claude: 'claude/default' } }));
+    const env = { KEEP_DIR: root, KEEP_CONFIG: accountConfig };
+    accountStore.pinSession('mcp', 'claude', 'claude-source', { root, env });
+    fs.writeFileSync(claudeFile, JSON.stringify({ type: 'assistant', sessionId: 'mcp', message: { content: [], stop_reason: 'end_turn' } }) + '\n');
+    const declared = JSON.stringify({ mcpServers: { jesse: { command: '/opt/mcp/jesse-mcp' } } });
+    const nothing = JSON.stringify({ mcpServers: {} });
+    const command = '/test/claude --resume mcp';
+    // The transfer hands restartSession the target account to resume under, while the
+    // process it must account for is still the source's.
+    const run = () => {
+      const session = { id: 'mcp', kind: 'claude', state: 'idle', endedTurn: true, project: root, accountId: 'claude-source' };
+      let pane = { id: 'p', pid: 10, cmd: '/bin/zsh', args: ['-l'], alive: true, attached: 0, visibleAttached: 0,
+        cols: 200, rows: 50, meta: { sessionId: 'mcp', agent: 'claude' } };
+      const agent = { pid: 11, ppid: 10, pidStart: 'Tue Sep  8 10:00:00 2026', agent: 'claude', interactive: true, args: command };
+      const helper = { pid: 12, ppid: 11, pidStart: 'Tue Sep  8 10:00:01 2026', args: '/opt/mcp/jesse-mcp' };
+      const state = { exited: false };
+      const deps = {
+        root, env, withInjectionLock: (fn) => fn(),
+        buildState: async () => ({ sessions: [session], tasks: [] }),
+        claudeRolloutFile: () => claudeFile,
+        resumeAccount: accountStore.get('claude-target', env),
+        ensureSharedMemory: () => ({ mcpConfig: path.join(targetDir, 'project.keep-mcp.json') }),
+        agentProcessRows: async () => (state.exited ? [{ pid: 10, ppid: 1, args: '/bin/zsh -l' }] : [agent, helper]),
+        psTable: `11 10 ttys001 Tue Sep  8 10:00:00 2026 ${command}`,
+        lsof: async () => '',
+        closeIdleSession: async (_body, guards) => { await guards.beforeClose(); },
+        sleep: async () => { pane = { ...pane, alive: false }; state.exited = true; },
+        readScreenResult: async () => ({ text: `${command}\n~/keep > `, cursor: { x: 9, y: 1 } }),
+        waitForHostAgent: async () => {},
+        host: { request: async (type, params) => {
+          if (type === 'hello') return { replaceExited: true };
+          if (type === 'get') return { pane: { ...pane } };
+          if (type === 'list') return { panes: [{ ...pane }] };
+          if (type === 'input') return {};
+          assert.equal(type, 'replace-exited');
+          pane = { ...pane, alive: true, pid: 20 };
+          return { pane };
+        } },
+      };
+      return restartSession({ sessionId: 'mcp', pane: 'p', pid: 10, mode: 'idle' }, deps);
+    };
+    fs.writeFileSync(path.join(sourceDir, '.claude.json'), declared);
+    fs.writeFileSync(path.join(targetDir, '.claude.json'), nothing);
+    assert.equal((await run()).sessionId, 'mcp', 'the account the live agent belongs to declares its helper');
+    fs.writeFileSync(path.join(sourceDir, '.claude.json'), nothing);
+    fs.writeFileSync(path.join(targetDir, '.claude.json'), declared);
+    await assert.rejects(run(), /Local background processes are still present/,
+      'what the account it is moving to declares says nothing about this process');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('a graceful exit answers the worktree exit prompt once and only for Keep worktree', async () => {
   const { restartSession } = require('./serve');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-worktree-exit-'));

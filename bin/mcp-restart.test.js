@@ -77,6 +77,17 @@ test('a project .mcp.json server is admitted with the whole subtree its launcher
     assert.throws(() => check([parent, { ...child, args: `/opt/node/bin/deno ${npm} exec @playwright/mcp@latest --headless` }]), /background/);
     assert.throws(() => check([parent, { ...child, args: `/opt/node/bin/node ${path.join(root, 'node_bin', 'missing-npm')} exec @playwright/mcp@latest --headless` }]),
       /background/, 'a launcher with no readable shebang has no interpreter-expanded form');
+    // Only the real /usr/bin/env expands a name; a program someone called `env` does not.
+    const impostor = path.join(root, 'node_bin', 'npm-impostor');
+    fs.writeFileSync(impostor, `#!${path.join(root, 'env')} node\nrequire("./npm-cli.js");\n`);
+    fs.writeFileSync(path.join(root, 'env'), '#!/bin/sh\nexec "$@"\n');
+    fs.writeFileSync(path.join(cwd, '.mcp.json'), JSON.stringify({ mcpServers: {
+      playwright: { command: 'npm', args: ['exec', '@playwright/mcp@latest', '--headless'] },
+      impostor: { command: impostor, args: ['exec', '@playwright/mcp@latest', '--headless'] } } }));
+    assert.equal(check([parent, { ...child, args: `${impostor} exec @playwright/mcp@latest --headless` }]).length, 1,
+      'the impostor launcher is still declared under its own absolute name');
+    assert.throws(() => check([parent, { ...child, args: `node ${impostor} exec @playwright/mcp@latest --headless` }]), /background/,
+      'a shebang naming some other `env` expands nothing');
     assert.equal(gone(helpers, [grandchild]), false, 'the surviving server still blocks resume');
     assert.equal(gone(helpers, [child]), false, 'the surviving launcher still blocks resume');
     assert.equal(gone(helpers, []), true);

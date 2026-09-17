@@ -115,10 +115,12 @@ function declarations({ agent, parent, cwd, account }) {
   }
   return entries.slice(0, MAX_DECLARATIONS);
 }
+const ENV_LAUNCHER = '/usr/bin/env';
 // The two first lines a kernel expansion can come from: a single absolute
 // interpreter, or `/usr/bin/env NAME` with exactly one bare name after it. Anything
 // else — a wrapper, flags, a longer env line, an unreadable head — is no shebang, and
-// without one there is no interpreter-expanded match at all.
+// without one there is no interpreter-expanded match at all. Only the real
+// /usr/bin/env counts: a program someone named `env` elsewhere is not it.
 function shebangSpec(file) {
   let fd;
   try {
@@ -132,7 +134,7 @@ function shebangSpec(file) {
     const single = /^#!(\/[^\s]+)$/.exec(line)?.[1];
     if (single) return token(single) ? { interpreter: single } : null;
     const viaEnv = /^#!(\/[^\s]+) +([^\s]+)$/.exec(line);
-    if (!viaEnv || path.basename(viaEnv[1]) !== 'env') return null;
+    if (!viaEnv || (viaEnv[1] !== ENV_LAUNCHER && !sameInterpreter(viaEnv[1], ENV_LAUNCHER))) return null;
     return token(viaEnv[2]) && !viaEnv[2].includes('/') ? { name: viaEnv[2] } : null;
   } catch { return null; } finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch {} } }
 }

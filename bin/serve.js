@@ -3902,6 +3902,17 @@ async function restartSession(body, deps = {}) {
       }
       account ||= accounts.defaultFor(session.kind, deps.env || process.env);
     }
+    // Which account the process being inspected belongs to, which is not the account
+    // it is about to resume under: an account handoff passes the target as
+    // resumeAccount while the live agent, and the MCP servers it declared, are still
+    // the source's. Staged authority is read at its source for the same reason, and
+    // an unresolved account is left unresolved rather than guessed at.
+    let liveAccount = null;
+    try {
+      liveAccount = accounts.forSession(session.id, session.kind,
+        { root: deps.root || keep.ROOT, env: deps.env || process.env, allowStagedSource: true });
+    } catch { liveAccount = null; }
+    if (!liveAccount && session.accountId) liveAccount = accounts.get(session.accountId, deps.env || process.env);
     // This attempt gave up the model key on the promise of naming the model itself, which
     // only describes a Claude agent on the built-in profile: Codex resumes on a model and
     // reasoning effort from config.toml, and a managed profile reads its own settings.json.
@@ -3942,7 +3953,7 @@ async function restartSession(body, deps = {}) {
       if (!identity?.primary || identity.pid !== originalIdentity.pid || identity.pidStart !== originalIdentity.pidStart) throw Error('Agent process identity changed during restart');
       const parent = rows.find((p) => p.pid === identity.pid);
       const helpers = mcpRestart.inspect({ root: deps.root || keep.ROOT, agent: session.kind, sessionId: session.id, parent, rows,
-        cwd: session.project || pane.cwd, account });
+        cwd: session.project || pane.cwd, account: liveAccount });
       if (restartHelpers && JSON.stringify(helpers) !== JSON.stringify(restartHelpers)) throw Error('Session helper processes changed during restart');
       restartHelpers = helpers;
       try { childProof(); } catch (error) {
