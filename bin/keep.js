@@ -33,6 +33,7 @@ const delegation = require('./delegation.js');
 const features = require('./features.js');
 const sessionNumbers = require('./session-numbers.js');
 const { TELL_TEXT_LIMIT } = require('./tell.js');
+const sessionNames = require('./session-names.js');
 const hookGroup = require('./commands/hook.js');
 const hostGroup = require('./commands/host.js');
 const reviewGroup = require('./commands/review.js');
@@ -457,6 +458,61 @@ commands.retitle = (argv) => {
     commitAndPush(`keep: retitle ${id}`);
     console.log(fmtTask(task, { brief: true }));
   });
+};
+
+// Names a session by hand, the way the console's rename does: the name replaces
+// the generated title and switches generation off until it is cleared. The daemon
+// owns the registry while it runs, so the rename goes through its route and the
+// console updates at once; a daemon that is down is not a reason to refuse, so the
+// CLI writes the registry itself and says the console will catch up.
+commands.rename = async (argv, deps = {}) => {
+  const o = parseArgs(argv, { clear: 'bool' });
+  const usage = 'usage: keep rename [<#n|session-id>] "new title" | keep rename [<#n|session-id>] --clear';
+  if (o.clear ? o._.length > 1 : o._.length < 1 || o._.length > 2) die(usage);
+  const root = deps.root || ROOT;
+
+  const sessionArg = o.clear ? (o._.length ? o._[0] : null) : (o._.length === 2 ? o._[0] : null);
+  let sessionId;
+  let num = null;
+  if (sessionArg != null) {
+    const found = sessionNumbers.lookup(sessionArg, { root });
+    if (found) ({ id: sessionId, num } = found);
+    else {
+      // A token that reads as a number and is not in the registry names nothing;
+      // only an id-shaped token is taken at face value (the daemon may know a
+      // session this checkout's registry has not numbered).
+      const number = sessionNumbers.parseNumber(sessionArg);
+      if (number) die(`no session ${sessionNumbers.label(number)}`);
+      if (!/^[A-Za-z0-9_-]+$/.test(sessionArg)) die('bad session id');
+      sessionId = sessionArg;
+    }
+  } else {
+    const self = (deps.currentSession || currentSession)();
+    if (!self || !self.id) die('no current session: run inside a Claude or Codex session, or name one: keep rename <#n|session-id> "title"');
+    sessionId = self.id;
+    num = sessionNumbers.lookup(sessionId, { root })?.num || null;
+  }
+
+  const title = o.clear ? '' : sessionNames.sanitize(o._[o._.length - 1]);
+  if (!o.clear && !title) die('title is empty (use --clear to hand the session back to automatic titles)');
+
+  let response = null;
+  let unreachable = null;
+  try { response = await (deps.postKeepApi || postKeepApi)('/api/rename-session', { sessionId, title }, 10000); }
+  catch (error) { unreachable = error; }
+  if (unreachable) {
+    try { sessionNames.set(sessionId, title, { root }); }
+    catch (error) { die('cannot write the session-name registry: ' + error.message); }
+  } else if (response.status !== 200) {
+    let result = {};
+    try { result = JSON.parse(response.data); } catch {}
+    die(result.error || `keep serve returned an unexpected response (${response.status})`);
+  }
+
+  const stdout = deps.stdout || console.log;
+  const named = num ? `${sessionNumbers.label(num)} (${sessionId})` : String(sessionId);
+  stdout(o.clear ? `cleared ${named}: automatic titles again` : `renamed ${named}: "${title}"`);
+  if (unreachable) stdout("keep serve isn't running; written to the registry, the console picks it up when the daemon starts");
 };
 
 commands.project = (argv) => {
@@ -2953,6 +3009,8 @@ function helpText() {
                        # exit 3 when the reviewed patches are not exactly what would land
                        # keep-tool's main checkout and daemon restart stay manual
   keep retitle <id> "new title"
+  keep rename [<#n|session-id>] "new title"    # name a session by hand; its automatic title stops updating
+  keep rename [<#n|session-id>] --clear        # hand the session back to automatic titles
   keep project <id> [<path|name>] [-m "reason"]   # show or change project; preserves session links and schedule
   keep claim <card>                                # claim for the current session; run from the card's project
   keep link <card> --session <sid> --agent claude|codex   # repair ownership metadata without waking or launching
@@ -3215,6 +3273,7 @@ module.exports = {
   tellCommandCli: commands.tell, writeOpenHandoff,
   postOpen, OPEN_MESSAGE_LIMIT, OPEN_MESSAGE_ERROR, LAUNCH_MODEL_RE,
   restoreCommandCli: commands.restore, resumeCommandCli: commands.resume, resumeCommand,
+  renameCommandCli: commands.rename,
   accountsCommandCli: commands.accounts, handoffCommandCli: commands.handoff, transferCommandCli: commands.transfer,
   delegateCommandCli: commands.delegate,
   artifactCommandCli: commands.artifact,

@@ -46,6 +46,8 @@ test('parseDependency and help expose step-qualified wait-on syntax', () => {
     assert.equal(help.status, 0, help.stderr);
     assert.match(help.stdout, /keep wait-on <card> <upstream>\[#<step>\]/);
     assert.match(help.stdout, /keep claim <card>/);
+    assert.match(help.stdout, /keep rename \[<#n\|session-id>\] "new title"/);
+    assert.match(help.stdout, /keep rename \[<#n\|session-id>\] --clear/);
     assert.match(help.stdout, /--handoff waiting\|needs-input/);
     assert.match(help.stdout, /--check "recipe"/);
     assert.match(help.stdout, /keep hook session-start\|session-end\|stop\|notification\|lifecycle/);
@@ -2180,4 +2182,130 @@ test('a registry this process cannot write is one line, not a stack trace', { sk
     try { fs.chmodSync(path.join(root, '.keep'), 0o755); } catch {}
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+// ---------- keep rename (session names Owner types) ----------
+
+function renameRoot(ids) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-rename-'));
+  if (ids) require('./session-numbers.js').write({ next: 1000, ids }, { root });
+  return root;
+}
+
+function refuseRequest() {
+  return async () => assert.fail('a refused rename must not reach the daemon');
+}
+
+test('keep rename names a numbered session through the daemon', async () => {
+  const { renameCommandCli } = require('./keep.js');
+  const root = renameRoot({ 'sess-fifty-three': 53 });
+  const calls = [];
+  const stdout = [];
+  try {
+    await renameCommandCli(['#53', 'Paying down the queue'], {
+      root,
+      postKeepApi: async (pathname, body, timeoutMs) => {
+        calls.push({ pathname, body, timeoutMs });
+        return { status: 200, data: JSON.stringify({ ok: true, sessionId: body.sessionId, title: body.title }) };
+      },
+      stdout: (line) => stdout.push(line),
+    });
+    assert.deepEqual(calls, [{
+      pathname: '/api/rename-session',
+      body: { sessionId: 'sess-fifty-three', title: 'Paying down the queue' },
+      timeoutMs: 10000,
+    }]);
+    assert.deepEqual(stdout, ['renamed #53 (sess-fifty-three): "Paying down the queue"']);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('keep rename with one argument names the current session', async () => {
+  const { renameCommandCli } = require('./keep.js');
+  const root = renameRoot({ 'sess-a': 7 });
+  const bodies = [];
+  const stdout = [];
+  try {
+    await renameCommandCli(['Just me'], {
+      root,
+      currentSession: () => ({ id: 'sess-a', agent: 'claude' }),
+      postKeepApi: async (pathname, body) => {
+        bodies.push(body);
+        return { status: 200, data: JSON.stringify({ ok: true }) };
+      },
+      stdout: (line) => stdout.push(line),
+    });
+    assert.deepEqual(bodies, [{ sessionId: 'sess-a', title: 'Just me' }]);
+    assert.deepEqual(stdout, ['renamed #7 (sess-a): "Just me"']);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('keep rename --clear hands the session back to automatic titles', async () => {
+  const { renameCommandCli } = require('./keep.js');
+  const root = renameRoot();
+  const bodies = [];
+  const stdout = [];
+  try {
+    await renameCommandCli(['--clear'], {
+      root,
+      currentSession: () => ({ id: 'sess-a', agent: 'codex' }),
+      postKeepApi: async (pathname, body) => {
+        bodies.push(body);
+        return { status: 200, data: JSON.stringify({ ok: true, sessionId: body.sessionId, title: null }) };
+      },
+      stdout: (line) => stdout.push(line),
+    });
+    assert.deepEqual(bodies, [{ sessionId: 'sess-a', title: '' }]);
+    assert.deepEqual(stdout, ['cleared sess-a: automatic titles again']);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('keep rename refuses an empty title, an unknown number and no current session', async () => {
+  const { renameCommandCli } = require('./keep.js');
+  const root = renameRoot();
+  try {
+    await assert.rejects(renameCommandCli(['   '], {
+      root,
+      currentSession: () => ({ id: 'sess-a', agent: 'claude' }),
+      postKeepApi: refuseRequest(),
+    }), /title is empty/);
+    await assert.rejects(renameCommandCli(['#99', 'x'], {
+      root,
+      postKeepApi: refuseRequest(),
+    }), /no session #99/);
+    await assert.rejects(renameCommandCli(['Just me'], {
+      root,
+      currentSession: () => null,
+      postKeepApi: refuseRequest(),
+    }), /no current session/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('keep rename writes the registry itself when keep serve is down', async () => {
+  const { renameCommandCli } = require('./keep.js');
+  const sessionNames = require('./session-names.js');
+  const root = renameRoot({ 'sess-a': 4 });
+  const stdout = [];
+  try {
+    await renameCommandCli(['Named without the daemon'], {
+      root,
+      currentSession: () => ({ id: 'sess-a', agent: 'claude' }),
+      postKeepApi: async () => { throw new Error('connect ECONNREFUSED'); },
+      stdout: (line) => stdout.push(line),
+    });
+    assert.equal(sessionNames.lookup('sess-a', { root }), 'Named without the daemon');
+    assert.equal(sessionNames.read({ root }).names['sess-a'].title, 'Named without the daemon');
+    assert.equal(stdout[0], 'renamed #4 (sess-a): "Named without the daemon"');
+    assert.match(stdout[1], /keep serve isn't running; written to the registry/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('keep rename reports the daemon\'s own refusal', async () => {
+  const { renameCommandCli } = require('./keep.js');
+  const root = renameRoot();
+  try {
+    await assert.rejects(renameCommandCli(['sess-a', 'A name'], {
+      root,
+      postKeepApi: async () => ({ status: 400, data: '{"error":"bad session id"}' }),
+    }), /bad session id/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

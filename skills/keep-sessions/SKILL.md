@@ -133,6 +133,9 @@ when you keep the card and want one step done.
   killed pane) and leaves live ones alone.
 - `keep compact <sid>` compacts a live Claude or Codex session. Check in first: the
   compacted session reads the card, not its old context.
+- `keep rename "title"` names the current session by hand in the console and stops its
+  automatic title from changing; `keep rename <#n|session-id> "title"` names another
+  session; `--clear` hands it back to automatic titles.
 
 ## Moving a session to another account
 
