@@ -6559,7 +6559,8 @@ test('the check sweep close composition refuses rather than kills, and guards it
 test('a restarted or handed-off pane stops being the check scheduler\'s to reap', () => {
   const { adoptedPaneMeta } = require('./serve.js');
   const opened = { ephemeral: 'check', card: 'some-card', sessionId: 'sid', agent: 'claude',
-    accountId: 'checks', launchedAt: 1_000_000, project: '/tmp/project' };
+    accountId: 'checks', launchedAt: 1_000_000, project: '/tmp/project',
+    opener: { kind: 'check', id: 'some-card' }, unattended: true };
   const adopted = adoptedPaneMeta(opened);
   // Owner restarting the pane, or moving it to another account, makes it an ordinary
   // session. Carrying `ephemeral` across would let the sweep close a pane Owner is using.
@@ -6567,6 +6568,10 @@ test('a restarted or handed-off pane stops being the check scheduler\'s to reap'
   assert.equal(adopted.card, 'some-card', 'everything else rides along unchanged');
   assert.equal(adopted.sessionId, 'sid');
   assert.equal(adopted.launchedAt, 1_000_000, 'the open-request dedupe still reads this');
+  // A restart, a force restart and an account handoff all replace the pane. None of
+  // them gives the session a reader, so the unattended mark and its opener ride along.
+  assert.equal(adopted.unattended, true);
+  assert.deepEqual(adopted.opener, { kind: 'check', id: 'some-card' });
   assert.equal('ephemeral' in opened, true, 'the original is not mutated');
   assert.deepEqual(adoptedPaneMeta(undefined), {});
   assert.deepEqual(adoptedPaneMeta({ agent: 'codex' }), { agent: 'codex' });
@@ -6619,6 +6624,9 @@ test('an internal launchMeta marks the pane, and a request body can never set on
     assert.equal(meta.ephemeral, 'check');
     assert.equal(meta.card, 'card', 'and the card link is untouched');
     assert.equal(meta.agent, 'claude');
+    // Nobody reads a check's session, and the session is told so at startup.
+    assert.deepEqual(meta.opener, { kind: 'check', id: 'card' });
+    assert.equal(meta.unattended, true);
 
     // Identity is never up for grabs: a launchMeta that names an agent, an account or
     // a session loses to the values openSession resolved.
@@ -6630,7 +6638,8 @@ test('an internal launchMeta marks the pane, and a request body can never set on
       waitForHostAgent: async () => true,
       trustProject: () => true,
       linkLaunchedSession: () => true,
-      launchMeta: { agent: 'codex', sessionId: 'not-mine', card: 'other-card', repair: true, launchedAt: 1 },
+      launchMeta: { agent: 'codex', sessionId: 'not-mine', card: 'other-card', repair: true, launchedAt: 1,
+        opener: { kind: 'agent', id: 'somebody' }, unattended: true },
     });
     const liarMeta = liarHost.calls.find((call) => call.type === 'spawn').params.meta;
     assert.equal(liarMeta.agent, 'claude');
@@ -6638,6 +6647,10 @@ test('an internal launchMeta marks the pane, and a request body can never set on
     assert.equal(liarMeta.card, 'card');
     assert.equal(liarMeta.repair, undefined, 'the repair flag is the scheduler\'s, not a caller\'s');
     assert.notEqual(liarMeta.launchedAt, 1);
+    // An annotation may not claim an opener, and above all may not mark Owner's own
+    // session unattended: the question hooks read this and would refuse to ask him.
+    assert.deepEqual(liarMeta.opener, { kind: 'owner' });
+    assert.equal(liarMeta.unattended, undefined);
 
     // Over HTTP it is refused: pane meta is what the dedupe, the repair guard and the
     // sweep all key on, so a caller that could write it could make a pane lie.
@@ -6645,6 +6658,97 @@ test('an internal launchMeta marks the pane, and a request body can never set on
       host, loadTask: () => ({ fm: { project, sessions: [] } }),
     }), (error) => error.status === 400 && /launch meta is not accepted/.test(error.message));
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('every launch says who Keep opened it for, and only Owner\'s own opens stay attended', () => {
+  const { resolveOpener } = require('./serve.js');
+  assert.deepEqual(resolveOpener({}, { launchMeta: { agentName: 'delivery-responder' } }),
+    { opener: { kind: 'agent', id: 'delivery-responder' }, unattended: true });
+  assert.deepEqual(resolveOpener({ taskId: 'card-1' }, { launchMeta: { ephemeral: 'check' } }),
+    { opener: { kind: 'check', id: 'card-1' }, unattended: true });
+  assert.deepEqual(resolveOpener({ taskId: 'card-2' }, { launchEnv: { KEEP_REPAIR: '1' } }),
+    { opener: { kind: 'repair', id: 'card-2' }, unattended: true });
+  assert.deepEqual(resolveOpener({ taskId: 'card-3', reviewQueueLaunchId: 'queue-7' }, {}),
+    { opener: { kind: 'review-queue', id: 'card-3' }, unattended: true });
+  // Another session ran `keep open <card>`: the pane belongs to a program too.
+  assert.deepEqual(resolveOpener({ taskId: 'card-4', requester: 'requesting-session' }, {}),
+    { opener: { kind: 'session', id: 'requesting-session' }, unattended: true });
+  // Console "Start work", the console's Run agent button, `keep open` from his shell.
+  assert.deepEqual(resolveOpener({ taskId: 'card-5' }, {}), { opener: { kind: 'owner' }, unattended: false });
+  assert.deepEqual(resolveOpener({}, {}), { opener: { kind: 'owner' }, unattended: false });
+  // An internal caller's inheritance wins, and carries only the shape this owns.
+  assert.deepEqual(resolveOpener({ taskId: 'card-6', requester: 'someone' }, {
+    opener: { kind: 'agent', id: 'inherited', unattended: true, card: 'ignored' },
+  }), { opener: { kind: 'agent', id: 'inherited' }, unattended: true });
+  assert.deepEqual(resolveOpener({ requester: 'someone' }, { opener: { kind: 'owner', unattended: false } }),
+    { opener: { kind: 'owner' }, unattended: false });
+  // Junk inheritance falls back to the launch facts rather than writing a bad opener.
+  assert.deepEqual(resolveOpener({}, { opener: { id: 'no-kind' } }), { opener: { kind: 'owner' }, unattended: false });
+});
+
+test('a transferred session inherits the opener of the pane it came from', async () => {
+  const { inheritedOpener } = require('./serve.js');
+  const panes = [
+    { id: 'pane-unattended', alive: true, meta: { sessionId: 'agent-session', agent: 'codex', unattended: true,
+      opener: { kind: 'agent', id: 'delivery-responder' } } },
+    { id: 'pane-owner', alive: true, meta: { sessionId: 'owner-session', agent: 'codex', opener: { kind: 'owner' } } },
+    { id: 'pane-legacy', alive: true, meta: { sessionId: 'legacy-session', agent: 'codex', unattended: true } },
+  ];
+  const listHostPanes = async () => panes;
+  assert.deepEqual(await inheritedOpener('agent-session', { listHostPanes }),
+    { kind: 'agent', id: 'delivery-responder', unattended: true });
+  // A transfer of a session Owner opened stays his.
+  assert.equal(await inheritedOpener('owner-session', { listHostPanes }), null);
+  // Marked before openers were recorded, or by the reviewer launcher: still unattended.
+  assert.deepEqual(await inheritedOpener('legacy-session', { listHostPanes }), { kind: 'transfer', unattended: true });
+  assert.equal(await inheritedOpener('unknown-session', { listHostPanes }), null);
+  assert.equal(await inheritedOpener('', { listHostPanes }), null);
+  // An unreadable host never makes a session unattended.
+  assert.equal(await inheritedOpener('agent-session', { listHostPanes: async () => { throw new Error('no host'); } }), null);
+
+  // And the transfer hands it to openSession, so the destination pane carries it.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-transfer-opener-'));
+  try {
+    const project = path.join(root, 'project');
+    fs.mkdirSync(project, { recursive: true });
+    const id = 'b'.repeat(64);
+    const safe = { id, status: 'prepared', sourceSessionId: 'agent-session', cardId: 'portable-card' };
+    const host = recordingHost((type) => type === 'spawn' ? { pane: { id: 'pane-destination' } } : {});
+    const portable = {
+      launchPrepared: async (transferId, deps) => {
+        await deps.open({ taskId: safe.cardId, fresh: true, agent: 'claude', cwd: project,
+          portableSourceSessionId: safe.sourceSessionId });
+        return { ...safe, status: 'done', destinationSessionId: 'destination-session-5678', destinationPane: 'pane-destination' };
+      },
+      recordLaunch: () => {}, reserveDelivery: () => {}, recordDelivery: () => {}, safeSummary: (value) => value,
+    };
+    await transferSession({ transferId: id }, {
+      root, portable, host, listHostPanes,
+      loadTask: () => ({ fm: { project, sessions: [] } }),
+      randomUUID: () => '77777777-7777-4777-8777-777777777777',
+      waitForHostAgent: async () => true,
+      trustProject: () => true,
+      linkLaunchedSession: () => true,
+    });
+    const meta = host.calls.find((call) => call.type === 'spawn').params.meta;
+    assert.deepEqual(meta.opener, { kind: 'agent', id: 'delivery-responder' });
+    assert.equal(meta.unattended, true);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the state a session publishes says whether anybody is reading it', async () => {
+  const state = { sessions: [{ id: 'unattended-session' }, { id: 'owner-session' }], tasks: [], attention: [] };
+  const panes = [
+    { id: 'pane-a', alive: true, meta: { sessionId: 'unattended-session', agent: 'claude', unattended: true,
+      opener: { kind: 'check', id: 'card-9' } } },
+    { id: 'pane-b', alive: true, meta: { sessionId: 'owner-session', agent: 'claude', opener: { kind: 'owner' } } },
+  ];
+  await addHostSessionState(state, { panes });
+  const [unattended, owner] = state.sessions;
+  assert.equal(unattended.unattended, true);
+  assert.deepEqual(unattended.opener, { kind: 'check', id: 'card-9' });
+  assert.equal(owner.unattended, false);
+  assert.deepEqual(owner.opener, { kind: 'owner' });
 });
 
 test('KEEP_REPAIR follows the launched repair session, not the card it works on', async () => {

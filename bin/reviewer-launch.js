@@ -53,7 +53,10 @@ async function launch(args, root, deps = {}) {
       // The marker keeps only the family (the budget governor matches on it), so the
       // exact model and Bash limit this pane was launched with are recorded here —
       // a restart resumes from them rather than unfreezing a deliberately pinned id.
+      // The fleet reviewer is nobody's conversation: it spawns outside openSession, so
+      // the unattended mark is stamped here or it would never carry one.
       meta: { agent: 'claude', reviewer: true, sessionId, project: root, launchedAt: Date.now(),
+        opener: { kind: 'reviewer' }, unattended: true,
         accountId: account.id, accountLabel: account.label,
         reviewerModel: model, reviewerBashOutput: reviewerBashOutput() },
     });

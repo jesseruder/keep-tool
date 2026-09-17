@@ -5617,7 +5617,33 @@ function adoptedPaneMeta(meta) {
 const RESERVED_LAUNCH_META = new Set([
   'agent', 'accountId', 'accountLabel', 'sessionId', 'model', 'project', 'card', 'repair',
   'requester', 'portableTransferId', 'reviewQueueLaunchId', 'openRequestId', 'launchedAt',
+  'opener', 'unattended',
 ]);
+
+// Who Keep opened a pane for, and therefore whether anybody is reading it. Resolved
+// from the launch facts openSession already has, never from an annotation: the hooks
+// refuse a question in an unattended session, so a caller that could set this could
+// silence the guard, or — worse — make Owner's own session refuse to ask him anything.
+function resolveOpener(body = {}, deps = {}) {
+  const inherited = deps.opener;
+  if (inherited && typeof inherited === 'object' && typeof inherited.kind === 'string' && inherited.kind) {
+    return {
+      opener: { kind: inherited.kind, ...(inherited.id ? { id: String(inherited.id) } : {}) },
+      unattended: inherited.unattended === true,
+    };
+  }
+  const launchMeta = deps.launchMeta && typeof deps.launchMeta === 'object' ? deps.launchMeta : {};
+  const card = body.taskId ? String(body.taskId) : '';
+  const onCard = (kind) => ({ opener: { kind, ...(card ? { id: card } : {}) }, unattended: true });
+  if (launchMeta.agentName) return { opener: { kind: 'agent', id: String(launchMeta.agentName) }, unattended: true };
+  if (launchMeta.ephemeral === 'check') return onCard('check');
+  if (deps.launchEnv && deps.launchEnv.KEEP_REPAIR === '1') return onCard('repair');
+  if (body.reviewQueueLaunchId) return onCard('review-queue');
+  if (body.requester) return { opener: { kind: 'session', id: String(body.requester) }, unattended: true };
+  // Console "Start work", the console's "Run agent" button, `keep open` from Owner's
+  // own shell: he clicked it and he is there.
+  return { opener: { kind: 'owner' }, unattended: false };
+}
 
 // The console number of an already-numbered session, for the open result the CLI
 // prints. A session launched a moment ago has none until the next scan numbers it.
@@ -5923,6 +5949,7 @@ async function openSession(body, deps = {}) {
     : (process.env.KEEP_OPEN_CODEX_FLAGS != null ? process.env.KEEP_OPEN_CODEX_FLAGS : '--dangerously-bypass-approvals-and-sandbox');
   const codexFlagArgs = String(codexFlags || '').trim().split(/\s+/).filter(Boolean);
   const launchedAt = (deps.now || Date.now)();
+  const openedFor = resolveOpener(body, deps);
 
   // `inheritedModel` is set only when the launch could not hold the model key and is
   // naming settings.json's model itself; it rides the command line exactly like an
@@ -5977,6 +6004,11 @@ async function openSession(body, deps = {}) {
         ...(body.portableTransferId ? { portableTransferId: body.portableTransferId } : {}),
         ...(body.reviewQueueLaunchId ? { reviewQueueLaunchId: body.reviewQueueLaunchId } : {}),
         ...(freshStandalone && body.requestId ? { openRequestId: body.requestId } : {}),
+        // Who this pane was opened for, and whether anybody is reading it. The session
+        // asks its own pane at startup: an unattended one is told not to ask questions,
+        // and the question hooks refuse it if it does.
+        opener: openedFor.opener,
+        ...(openedFor.unattended ? { unattended: true } : {}),
         launchedAt,
       },
     }, deps);
@@ -7656,6 +7688,10 @@ async function addHostSessionState(state, deps = {}) {
     // The launch model from `keep open --model`, when the pane carries one.
     const launchModel = pane && pane.meta && pane.meta.model;
     if (typeof launchModel === 'string' && launchModel) session.launchModel = launchModel;
+    // Whether Keep opened this session for a program rather than for Owner. A console
+    // keystroke clears the pane mark, so this follows the pane and not the launch.
+    session.unattended = Boolean(pane?.meta?.unattended);
+    session.opener = pane?.meta?.opener || null;
     const accountId = pane?.meta?.accountId || session.accountId;
     if (accountId) {
       const account = accounts.get(accountId);
@@ -8235,6 +8271,21 @@ function portableTransferPreview(query, deps = {}) {
   return { ok: true, ...(deps.portable || require('./portable-handoff')).readPreview(transferId, { root: deps.root || keep.ROOT }) };
 }
 
+// The opener a transfer's destination pane inherits from its source. Moving a session
+// to another account does not give it a reader: a session Keep opened for a program is
+// still unattended on the far side, and one Owner opened stays attended. A source pane
+// nobody can read reads as attended — failing open here only costs a session the block.
+async function inheritedOpener(sessionId, deps = {}) {
+  if (typeof sessionId !== 'string' || !sessionId) return null;
+  let panes = null;
+  try { panes = await (deps.listHostPanes || listHostPanes)(deps, true); } catch { return null; }
+  const meta = hostPanesBySession(panes || []).get(sessionId)?.meta;
+  if (!meta || meta.unattended !== true) return null;
+  const opener = meta.opener && typeof meta.opener === 'object' && typeof meta.opener.kind === 'string' && meta.opener.kind
+    ? meta.opener : { kind: 'transfer' };
+  return { kind: opener.kind, ...(opener.id ? { id: String(opener.id) } : {}), unattended: true };
+}
+
 async function transferSession(body, deps = {}) {
   if (!body || typeof body.transferId !== 'string' || !/^[a-f0-9]{64}$/.test(body.transferId)) {
     throw new InjectionError(400, 'portable transfer id is invalid');
@@ -8255,13 +8306,17 @@ async function transferSession(body, deps = {}) {
     ...portableDeps(deps),
     requireDeliveryReceipt: true,
     resumeOpening: deps.resumeOpening || ((state, message) => recoverPortableOpening(state, message, hooks, deps)),
-    open: deps.open || ((payload) => openSession({ ...payload, portableTransferId: body.transferId }, {
-      ...deps,
-      detectPortableSetup: true,
-      onLaunched: hooks.onLaunched,
-      onOpeningReady: hooks.onReady,
-      onOpeningDelivered: hooks.onDelivered,
-    })),
+    open: deps.open || (async (payload) => {
+      const opener = await (deps.inheritedOpener || inheritedOpener)(payload.portableSourceSessionId, deps);
+      return openSession({ ...payload, portableTransferId: body.transferId }, {
+        ...deps,
+        ...(opener ? { opener } : {}),
+        detectPortableSetup: true,
+        onLaunched: hooks.onLaunched,
+        onOpeningReady: hooks.onReady,
+        onOpeningDelivered: hooks.onDelivered,
+      });
+    }),
   });
   const transfer = portable.safeSummary(result);
   if (!transfer) throw new InjectionError(500, 'portable transfer result is invalid');
@@ -9440,7 +9495,7 @@ module.exports = {
   agentProcessRows, liveSessionPids, liveSessionTick, restorePlan,
   annotatePaneAgents,
   readPaneRecord, sessionProjectFromTranscript, openSession, reopenSessionOnAccount,
-  runCheckNow, runTaskNow, taskRunMessage, adoptedPaneMeta, closeEphemeralPane,
+  runCheckNow, runTaskNow, taskRunMessage, adoptedPaneMeta, closeEphemeralPane, resolveOpener, inheritedOpener,
   transcriptFileForSession,
   inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, continueAccountHandoff, handoffSession,
   abandonAccountHandoff,
