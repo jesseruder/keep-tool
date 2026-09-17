@@ -6780,6 +6780,78 @@ test('explicit account launches stay pinned when the session is resumed', async 
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('an auto fresh open skips a spent default, and no policy keeps the old default', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-auto-account-'));
+  try {
+    const secondary = path.join(root, 'secondary');
+    fs.mkdirSync(secondary);
+    const config = path.join(root, 'config.json');
+    fs.writeFileSync(config, JSON.stringify({ version: 1, accounts: [
+      { id: 'claude/default', label: 'Primary', agent: 'claude', configDir: path.join(os.homedir(), '.claude'), useDefaultConfig: true },
+      { id: 'claude-secondary', label: 'Secondary', agent: 'claude', configDir: secondary },
+    ], defaultAccounts: { claude: 'claude/default' } }));
+    const env = { KEEP_DIR: root, KEEP_CONFIG: config };
+    const calls = [];
+    const host = recordingHost((type, params) => {
+      if (type === 'spawn') { calls.push(params); return { pane: { id: `pane-${calls.length}` } }; }
+      return {};
+    });
+    const profileId = (params) => JSON.parse(Buffer.from(
+      /'--profile' '([^']+)'/.exec(params.args[1])[1], 'base64url').toString()).id;
+    const limits = (percent) => [{ label: 'week', percent, resetsAt: '2026-09-21T12:00:00.000Z' },
+      { label: '5h', percent: 10, resetsAt: '2026-09-21T12:00:00.000Z' }];
+    const view = (primary, second) => ({ accounts: {
+      'claude/default': { agent: 'claude', limits: limits(primary), fetchedAt: Date.now() },
+      'claude-secondary': { agent: 'claude', limits: limits(second), fetchedAt: Date.now() },
+    } });
+    const common = { root, env, host, waitForHostAgent: async () => true, trustProject: () => true,
+      pinSession: () => {}, loadTask: () => ({ fm: { project: os.tmpdir(), sessions: [] } }) };
+    const body = { taskId: 'card', fresh: true, agent: 'claude' };
+
+    const opened = await openSession({ ...body, accountPolicy: 'auto' },
+      { ...common, usageSnapshot: () => view(100, 20) });
+    assert.equal(profileId(calls[0]), 'claude-secondary');
+    assert.equal(opened.accountId, 'claude-secondary');
+    assert.match(opened.accountNote, /^claude\/default skipped: week 100%, resets .*; opened on claude-secondary$/);
+    assert.equal(opened.accountWarning, undefined);
+
+    // Every other caller of openSession omits accountPolicy and must be unaffected:
+    // the registry default is still the choice, spent or not, and there is no note.
+    const unchanged = await openSession(body, { ...common, usageSnapshot: () => view(100, 20) });
+    assert.equal(profileId(calls[1]), 'claude/default');
+    assert.equal(unchanged.accountId, 'claude/default');
+    assert.equal(unchanged.accountNote, undefined);
+
+    // The caller's own account leads when nothing is spent, so a session on the
+    // secondary keeps opening siblings there.
+    const caller = await openSession({ ...body, accountPolicy: 'auto', callerAccountId: 'claude-secondary' },
+      { ...common, usageSnapshot: () => view(20, 20) });
+    assert.equal(profileId(calls[2]), 'claude-secondary');
+    assert.equal(caller.accountNote, undefined, 'nothing was passed over, so nothing is said');
+
+    // Nothing left anywhere: refuse rather than spend a pane on a session that could
+    // only report the limit back.
+    await assert.rejects(openSession({ ...body, accountPolicy: 'auto' },
+      { ...common, usageSnapshot: () => view(100, 100) }),
+    (error) => error.status === 409 && /^no claude account has usage left: claude\/default \(week 100%/.test(error.message)
+      && /pass --account <id> to launch anyway$/.test(error.message));
+    assert.equal(calls.length, 3, 'a refused choice spawns nothing');
+
+    // An explicit account is honoured even when it is spent, and says so.
+    const forced = await openSession({ ...body, accountId: 'claude/default' },
+      { ...common, usageSnapshot: () => view(100, 20) });
+    assert.equal(profileId(calls[3]), 'claude/default');
+    assert.match(forced.accountWarning, /^claude\/default is out of usage \(week 100%, resets /);
+
+    // A usage view that cannot be read must never stop an open.
+    const blind = await openSession({ ...body, accountPolicy: 'auto' },
+      { ...common, usageSnapshot: () => { throw new Error('usage manager is down'); } });
+    assert.equal(blind.accountId, 'claude/default');
+    await assert.rejects(openSession({ ...body, accountPolicy: 'sometimes' }, common), /accountPolicy must be auto/);
+    await assert.rejects(openSession({ ...body, accountPolicy: 'auto', callerAccountId: 'Not An Id' }, common), /bad caller account id/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('different-account reopen serializes source opening and starts one open-only handoff', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-reopen-account-'));
   try {

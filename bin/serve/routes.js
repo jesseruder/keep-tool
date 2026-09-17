@@ -25,7 +25,7 @@ function routes(ctx) {
     reopenSessionOnAccount, resolvePortableTransfer, resolveReviewLaunchSelection, restorePlan, review,
     reviewDeps, reviewQueue, reviewQueueSearch, runCheckNow, runTaskNow, screenHistorySession, screenSession,
     sendSessionKeys, sendStateJson, sendToSessionLocked, sessionNames, sessionSummaryFile, setAsideCandidates, summarize,
-    transferSession, updateSetAside, wantsCompactState, wantsLightweightState, withInjectionLock,
+    tellSession, transferSession, updateSetAside, wantsCompactState, wantsLightweightState, withInjectionLock,
     writeToShellPane,
     // start()'s own locals. onChange and onFocus are the module-level hooks start()
     // has already pointed at its broadcaster by the time routes() is called.
@@ -562,6 +562,24 @@ function routes(ctx) {
               : url.pathname === '/api/compact'
                 ? await withInjectionLock(() => compactSessionById(body), { session: sessionId, model: true })
                 : await withInjectionLock(() => answerSession(body), { session: sessionId });
+          broadcast();
+          return json(res, 200, result);
+        } catch (e) {
+          if (e instanceof InjectionError) return json(res, e.status, { error: e.message, ...e.extra });
+          return json(res, 502, { error: String(e && e.message || e).slice(0, 500) });
+        }
+      },
+    },
+    // One session addressing another. Its own route rather than a shape of /api/send:
+    // the guards, the frame and the hourly brake all belong to this path, and the
+    // refusal reason rides back in the body so `keep tell --wait` can tell a session
+    // that is merely mid-turn from one that is waiting on Owner.
+    {
+      method: 'POST',
+      path: '/api/tell',
+      handle: async ({ req, res, url, body }) => {
+        try {
+          const result = await tellSession(body);
           broadcast();
           return json(res, 200, result);
         } catch (e) {

@@ -32,6 +32,7 @@ const cardUsage = require('./card-usage.js');
 const delegation = require('./delegation.js');
 const features = require('./features.js');
 const sessionNumbers = require('./session-numbers.js');
+const { TELL_TEXT_LIMIT } = require('./tell.js');
 const hookGroup = require('./commands/hook.js');
 const hostGroup = require('./commands/host.js');
 const reviewGroup = require('./commands/review.js');
@@ -2484,12 +2485,16 @@ function formatOpenResult(result) {
   const sent = result.sent ? ' (message sent)' : '';
   if (result.existing && result.pane) return `session ${openedSessionName(result)} is running in pane ${result.pane}; open it in the console${sent}`;
   const session = result.sessionId ? ` as ${openedSessionName(result)}` : '';
+  // The account id, not its label: it is what `--account` takes back.
+  const on = result.accountId ? ` on ${result.accountId}` : '';
   const handoff = [];
   if (result.linked) handoff.push(`card now owned by ${result.sessionId}`);
   if (result.unlinked) handoff.push(`${result.unlinked} unlinked`);
   const tail = handoff.length ? `; ${handoff.join(', ')}` : '';
-  if (result.created === 'pane') return `opened pane ${result.pane}: ${result.command}${session}${sent}${tail}`;
-  return `opened session${session}${sent}${tail}`;
+  // Only an auto-selected open that had to pass over an account carries a note.
+  const note = result.accountNote ? `\n${result.accountNote}` : '';
+  if (result.created === 'pane') return `opened pane ${result.pane}: ${result.command}${session}${on}${sent}${tail}${note}`;
+  return `opened session${session}${on}${sent}${tail}${note}`;
 }
 
 async function postOpen(payload, post = postKeepApi, timeoutMs) {
@@ -2511,7 +2516,11 @@ async function postOpen(payload, post = postKeepApi, timeoutMs) {
   return result;
 }
 
-function writeOpenHandoff(id, message, task) {
+// `options` lets `keep tell` reuse the same committed spill with its own wording, and
+// with `cardLog: false` — a message between two sessions is not a decision about the
+// work, and a card whose log filled with relay traffic would be unreadable.
+function writeOpenHandoff(id, message, task, options = {}) {
+  const pointerFor = options.pointer || ((file) => `Your instructions are in ${file}; read that file first.`);
   id = String(id).replace(/^#(?=[0-9])/, 's');
   if (!/^[A-Za-z0-9_-]+$/.test(id)) die('bad card or session id');
   return withLock(() => {
@@ -2521,14 +2530,14 @@ function writeOpenHandoff(id, message, task) {
     let pointer;
     for (let timestamp = Date.now(); ; timestamp++) {
       file = path.join(directory, `${id}-${timestamp}.md`);
-      pointer = `Your instructions are in ${file}; read that file first.`;
+      pointer = pointerFor(file);
       if (pointer.length > OPEN_MESSAGE_LIMIT) die(OPEN_MESSAGE_ERROR);
       if (/[\r\n]/.test(pointer)) die('handoff path cannot contain newlines');
       try { fs.writeFileSync(file, message, { flag: 'wx' }); break; }
       catch (error) { if (error.code !== 'EEXIST') throw error; }
     }
     const paths = [path.relative(ROOT, file)];
-    const owner = task ? loadTask(task.id) : taskForSession(id);
+    const owner = options.cardLog === false ? null : (task ? loadTask(task.id) : taskForSession(id));
     if (owner) {
       // Commit the complete instructions before a session can read the pointer.
       // This is a launch request, not a claim that the daemon succeeded.
@@ -2539,7 +2548,7 @@ function writeOpenHandoff(id, message, task) {
     // .keep is otherwise ignored runtime state; only this immutable handoff is
     // deliberately tracked. Never sweep up another launch's handoff or card.
     git('add', '-f', '--', ...paths);
-    commitAndPush(`keep: open ${id} (handoff instructions)`, paths, { staged: true });
+    commitAndPush(options.commitLabel ? options.commitLabel(id) : `keep: open ${id} (handoff instructions)`, paths, { staged: true });
     return pointer;
   });
 }
@@ -2572,15 +2581,112 @@ commands.open = async (argv, deps = {}) => {
   try {
     const payload = { ...(task ? { taskId: id } : { sessionId: id }), fresh: Boolean(o.fresh), agent: o.agent };
     if (o.account != null) payload.accountId = o.account;
+    else if (o.fresh || task) {
+      // No account named: let the daemon pick one that still has usage, starting from
+      // this session's own. A card with no session to resume launches fresh without
+      // --fresh, so it asks too; the daemon ignores the policy whenever it resolves a
+      // session, because a resume is pinned to its account.
+      payload.accountPolicy = 'auto';
+      const caller = (deps.env || process.env).KEEP_AGENT_ACCOUNT_ID;
+      if (caller) payload.callerAccountId = caller;
+    }
     if (o.model != null) payload.model = o.model;
     if (message != null) payload.message = message;
     // The launching session hands the card over; the daemon unlinks it once the new session is on the card.
     const self = (deps.currentSession || currentSession)();
     if (task && self && self.id) payload.requester = self.id;
     const result = await postOpen(payload, deps.postKeepApi);
-    console.log(formatOpenResult(result));
+    (deps.log || console.log)(formatOpenResult(result));
+    // An explicit --account is honoured even when it is spent; the launch says so.
+    if (result.accountWarning) (deps.errorOutput || ((line) => process.stderr.write(line)))(`warning: ${result.accountWarning}\n`);
   } catch (e) {
     die(e.status ? e.message : "keep serve isn't running (start it or use the dashboard)");
+  }
+};
+
+// How often `--wait` re-asks while the target is mid-turn. Long enough that a busy
+// session is not polled once a second, short enough to land as soon as it is free.
+const TELL_RETRY_MS = 15e3;
+
+commands.tell = async (argv, deps = {}) => {
+  const o = parseArgs(argv, { 'message-file': 'str', wait: 'str', dry: 'bool', json: 'bool' });
+  const id = o._[0];
+  if (!id || o._.length !== 1) die('usage: keep tell <card|session-id|#n> [-m "message" | --message-file <path>] [--wait <duration>] [--dry] [--json]');
+  if (o.m != null && o['message-file'] != null) die('use either -m or --message-file, not both');
+  let message = o.m;
+  if (o['message-file'] != null) {
+    try { message = fs.readFileSync(path.resolve(o['message-file']), 'utf8'); }
+    catch (error) { die('cannot read message file: ' + error.message); }
+  }
+  if (message == null || !String(message).trim()) {
+    die(o['message-file'] != null ? '--message-file needs a message' : 'keep tell needs -m "message" or --message-file <path>');
+  }
+  let waitMs = 0;
+  if (o.wait != null) {
+    try { waitMs = require('./wait.js').parseDuration(o.wait); }
+    catch { die('--wait must be a duration such as +10m or 10m'); }
+  }
+  let target = id;
+  let task;
+  try { task = (deps.loadTask || loadTask)(target); } catch {}
+  if (!task) {
+    const numbered = sessionNumbers.parseNumber(target);
+    const found = numbered ? sessionNumbers.lookup(numbered, { root: ROOT }) : null;
+    if (found) target = found.id;
+  }
+  // Long or multi-line text is spilled to a committed handoff file, exactly as a long
+  // `keep open -m` is, and the session is sent the pointer instead.
+  if (o['message-file'] != null || message.length > TELL_TEXT_LIMIT || /[\r\n]/.test(message)) {
+    // A dry run writes nothing, and a handoff file is a commit.
+    if (o.dry) message = 'The full message is in <a handoff file written on the real send>; read that file.';
+    else message = (deps.writeOpenHandoff || writeOpenHandoff)(target, message, task, {
+      pointer: (file) => `The full message is in ${file}; read that file.`,
+      commitLabel: (name) => `keep: tell ${name} (message text)`,
+      cardLog: false,
+    });
+  }
+  // The same identity a check-in is attributed to; a plain shell has none, and the
+  // daemon frames the message as Owner's shell.
+  const self = (deps.commandSession || commandSession)();
+  const card = self ? (((deps.taskForSession || taskForSession)(self.id) || {}).id || null) : null;
+  const payload = {
+    ...(task ? { taskId: target } : { sessionId: target }),
+    text: message,
+    ...(self ? { senderSessionId: self.id, senderAgent: self.agent } : {}),
+    ...(card ? { senderCard: card } : {}),
+    ...(o.dry ? { dry: true } : {}),
+  };
+  const post = deps.postKeepApi || postKeepApi;
+  const log = deps.log || console.log;
+  const errorOutput = deps.errorOutput || ((line) => process.stderr.write(line));
+  const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const now = deps.now || Date.now;
+  const deadline = now() + waitMs;
+  for (;;) {
+    let response;
+    try { response = await post('/api/tell', payload); }
+    catch { die("keep serve isn't running (start it or use the dashboard)"); }
+    let result = {};
+    try { result = JSON.parse(response.data); } catch {}
+    if (response.status === 200 && result.ok) {
+      if (o.json) log(JSON.stringify(result));
+      else if (result.dry) log(`would tell ${result.name} (${result.sessionId}) on ${result.card || 'no card'}: ${result.text}`);
+      else log(`told ${result.name} (${result.sessionId}) on ${result.card || 'no card'}`);
+      return;
+    }
+    if (response.status !== 409) die(result.error || `keep serve returned an unexpected response (${response.status})`);
+    // Only a session that is merely mid-turn is worth re-asking: every other refusal
+    // is a state a wait cannot change, and waiting on a question Owner has to answer
+    // would just type over it later.
+    if (result.reason === 'busy' && now() < deadline) {
+      await sleep(Math.min(TELL_RETRY_MS, deadline - now()));
+      continue;
+    }
+    const timedOut = result.reason === 'busy' && waitMs > 0;
+    if (o.json) log(JSON.stringify({ ok: false, reason: result.reason || null, error: result.error || null }));
+    else errorOutput(`keep tell: ${timedOut ? `still busy after ${o.wait}: ` : ''}${result.error || 'refused'}\n`);
+    process.exitCode = timedOut ? 124 : 3;
+    return;
   }
 };
 
@@ -2943,11 +3049,19 @@ ${stepUsage()}
   keep probe <id>      # run this card's probe now (exit 1 = failed); no check-in, no daemon
   keep verify <id>     # run this task's check recipe now, in its thread or a fresh session (needs keep serve)
   keep compact <sid>   # compact a live Claude or Codex session (needs keep serve)
-  keep open <card|session-id|#n> [--fresh] [--agent claude|codex] [--model <id>] [-m "opening message" | --message-file <path>]
+  keep open <card|session-id|#n> [--fresh] [--agent claude|codex] [--account <id>] [--model <id>] [-m "opening message" | --message-file <path>]
                          # #n is the console's session number (12, #12 and s12 all work);
+                         # a fresh launch without --account picks the caller's account, then the
+                         # default, skipping accounts that are out of usage;
                          # --model applies to the launched process only (never settings.json);
                          # -m waits for the agent's prompt and types the message;
                          # --fresh on a card links the new session and unlinks the caller's
+  keep tell <card|session-id|#n> -m "message" | --message-file <path> [--wait <duration>] [--dry] [--json]
+                         # message another live agent session through the same guarded send
+                         # path Keep's own deliveries use; the daemon builds the frame, and
+                         # refuses a target that is mid-turn, waiting on Owner, or spent
+                         # (exit 3 refused, 124 --wait ran out); --wait retries only on busy;
+                         # --dry resolves the target and prints what would be sent
   keep delegate <card> --step <n> -- <command> [args]
   keep delegate <card> --step <n> --prepare
   keep delegate <card> --step <n> --session <sid> --agent claude|codex
@@ -3098,6 +3212,7 @@ module.exports = {
   codexJobText, renderCodexJobs,
   codexCommandCli: commands.codex,
   commandUsage, helpText, formatOpenResult, openCommand: commands.open, verifyCommand: commands.verify,
+  tellCommandCli: commands.tell, writeOpenHandoff,
   postOpen, OPEN_MESSAGE_LIMIT, OPEN_MESSAGE_ERROR, LAUNCH_MODEL_RE,
   restoreCommandCli: commands.restore, resumeCommandCli: commands.resume, resumeCommand,
   accountsCommandCli: commands.accounts, handoffCommandCli: commands.handoff, transferCommandCli: commands.transfer,

@@ -75,6 +75,12 @@ keep open <card> --fresh --agent claude --account claude-secondary
 
 Specifying `--account` while resuming an existing session does not move it. Keep rejects a conflicting account and asks for an explicit handoff.
 
+### A fresh open with no account named
+
+`keep open <card> --fresh` without `--account` no longer goes straight to the registry default. Keep tries the caller's own account first — every launched session carries it as `KEEP_AGENT_ACCOUNT_ID` — then the registry default, then the remaining accounts of that provider in registry order, skipping any whose weekly or five-hour window is spent. An account with no usage reading is still usable, but ranks behind one that is known to have room, and an id from the other provider is ignored. The result names the account it opened on and, on a second line, which accounts it passed over and why.
+
+If every account of that provider is spent, the open is refused and names each account's limiting bucket and reset time. Launching anyway is `--account <id>`: an explicit account is always honoured, spent or not, and a spent one prints a `warning:` line on stderr. This applies only to `keep open` asking; the daemon's own launches — scheduled checks, the reviewer, restore, reopen, and the console, which always names an account — keep the behaviour they had.
+
 ### Automation accounts
 
 Work the daemon starts by itself runs under a named *purpose* in

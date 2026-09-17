@@ -196,6 +196,8 @@ keep review-budget [--json] [--model m] [--account claude-id]
 keep review-tick [--force]                               # wake the reviewer (needs keep serve)
 keep review-stats [--json]                               # last tick, skips, per-day counts
 keep nudge <id> --session <sid> --key <k> -m "..." [--send]  # message a live agent (dry-run default)
+keep tell <card|session-id|#n> -m "..." | --message-file <path> [--wait <dur>] [--dry] [--json]
+                       # one session addressing another (needs keep serve)
 ```
 
 `keep claim <card>` assigns the current Claude or Codex session to an existing card.
@@ -844,6 +846,60 @@ inherit a bypass.
 
 `keep resume` prints `keep open <id>` for every session; `keep resume --raw` prints the
 bare `claude --resume` / `codex resume` form for a human who knows what it gives up.
+
+## Which account a fresh open lands on
+
+`keep open <card> --fresh` with no `--account` lets Keep choose: the caller's own
+account first (`KEEP_AGENT_ACCOUNT_ID`, which every launched session carries), then the
+registry default, then the remaining accounts of that provider in registry order,
+skipping any whose weekly or five-hour window is spent. An account nobody has a usage
+reading for is usable but ranks behind one that is known to have room. The result line
+names the account, and a second line says what was passed over. If every account is
+spent the open is refused with each account's limiting bucket and reset time rather
+than launching a session that could only report the limit back.
+
+`--account <id>` is still exactly as it was: that account, spent or not. A spent one
+launches with a `warning:` line on stderr. Resumes are unaffected — a session is pinned
+to its account, and `keep open <session> --account other` still refuses and asks for a
+handoff. Only the CLI asks for the choice; the check scheduler, the reviewer launch,
+restore, reopen and the console all name an account or take the registry default, as
+before. See [agent accounts](accounts.md).
+
+## Telling another session
+
+`keep tell <card|session-id|#n> -m "..."` is how one agent session hands something to
+another. Before it, the only routes across were `keep pane send`, which types raw
+characters at whatever is on screen, and `keep nudge`, which is the reviewer's and
+dry-run by default.
+
+A card id resolves to that card's live linked session by the same candidate rule every
+automated delivery uses; a card with no live linked session is refused with the
+`keep open` that would start one. Delivery goes through the same send funnel as Keep's
+own messages — injection lock, draft and modal prechecks, typed-text confirmation,
+delivery journal, transcript receipt — and every guard is re-checked inside that lock
+immediately before the first character.
+
+The daemon builds the frame, so a caller cannot dress its message up as Owner or as
+Keep: the recipient reads who sent it, which card they are on, and that it grants no
+approval or permission. Text that will not fit the 2000-character send cap, and
+anything passed with `--message-file`, is committed to `.keep/handoffs/` exactly as a
+long `keep open -m` is, and the pointer is sent instead. From a plain shell with no
+agent session the sender is Owner's shell.
+
+It refuses, with a one-line reason and exit 3, a target that has exited, is waiting on
+a usage limit, is mid-turn (`busy`), is waiting on Owner — a question, a plan, a
+permission prompt, or a turn that ended with a question — is the reviewer or a
+keep-spawned run, or is the sender itself. `--wait <duration>` re-asks every 15 seconds
+while the reason is `busy` and nothing else, and exits 124 if the duration runs out.
+`--dry` resolves the target, runs every guard and the brake read-only, and prints what
+would be sent without typing or reserving anything.
+
+A ledger at `.keep/tell.json` allows six tells per sender-recipient pair per rolling
+hour and twenty into any one session per hour; Owner's shell is exempt from the pair
+cap but not the per-recipient one. The slot is reserved under the registry lock before
+the send and handed back if the send fails. Every delivered tell appends one line to
+`.keep/tell-log.jsonl`; nothing is written to the card, because a message between
+sessions is not a decision about the work.
 
 ## Slack watch
 

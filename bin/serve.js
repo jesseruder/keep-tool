@@ -21,6 +21,8 @@ const codex = require('./codex.js');
 const codexCompact = require('./codex-compact.js');
 const transcripts = require('./transcripts.js');
 const accounts = require('./accounts.js');
+const openAccount = require('./open-account.js');
+const tell = require('./tell.js');
 const review = require('./review.js');
 const reviewQueue = require('./review-queue.js');
 const who = require('./who.js');
@@ -5405,6 +5407,13 @@ function annotationMeta(launchMeta) {
   return Object.fromEntries(Object.entries(launchMeta).filter(([key]) => !RESERVED_LAUNCH_META.has(key)));
 }
 
+// The account chooser reads the in-memory usage view, which never blocks and may be
+// empty. An unreadable snapshot means "unknown", which still launches.
+function usageSnapshot(deps = {}) {
+  try { return (deps.usageSnapshot || usage.getUsage)(); }
+  catch { return null; }
+}
+
 async function openSession(body, deps = {}) {
   body = body && typeof body === 'object' ? body : {};
   const freshStandalone = body.fresh === true && !body.taskId && !body.sessionId;
@@ -5439,6 +5448,15 @@ async function openSession(body, deps = {}) {
   if (body.message != null && !message) throw new InjectionError(400, 'message is empty');
   if (body.requester != null && (typeof body.requester !== 'string' || !/^[A-Za-z0-9_-]+$/.test(body.requester))) {
     throw new InjectionError(400, 'bad requester session id');
+  }
+  // `auto` is the CLI's own fresh open asking Keep to pick an account with usage
+  // left. Every other caller — the check scheduler, the reviewer launch, restore,
+  // reopen, the console — omits it and keeps the registry default it always had.
+  if (body.accountPolicy != null && body.accountPolicy !== 'auto') {
+    throw new InjectionError(400, 'accountPolicy must be auto');
+  }
+  if (body.callerAccountId != null && !accounts.ID_RE.test(String(body.callerAccountId))) {
+    throw new InjectionError(400, 'bad caller account id');
   }
   if (body.portableTransferId != null && (typeof body.portableTransferId !== 'string'
       || !/^[a-f0-9]{64}$/.test(body.portableTransferId))) {
@@ -5530,6 +5548,8 @@ async function openSession(body, deps = {}) {
     throw new InjectionError(400, 'bad session id');
   }
   let account;
+  let accountNote = '';
+  let accountWarning = '';
   if (session) {
     try { account = accounts.forSession(session.id, agent, { root: deps.root || keep.ROOT, env: deps.env || process.env }); }
     catch (error) { throw new InjectionError(409, error.message); }
@@ -5545,8 +5565,28 @@ async function openSession(body, deps = {}) {
     }
     if (account.managed) accounts.pinSession(session.id, agent, account.id, { root: deps.root || keep.ROOT, env: deps.env || process.env });
   } else {
-    account = body.accountId == null ? accounts.defaultFor(agent, deps.env || process.env) : accounts.get(body.accountId, deps.env || process.env);
+    const env = deps.env || process.env;
+    if (body.accountId != null) {
+      account = accounts.get(body.accountId, env);
+    } else if (body.accountPolicy === 'auto') {
+      const choice = openAccount.chooseOpenAccount(agent, openAccount.orderOpenCandidates(agent, {
+        accounts: accounts.list(env),
+        defaultAccountId: accounts.defaultFor(agent, env).id,
+        callerAccountId: body.callerAccountId,
+      }), usageSnapshot(deps), launchModel, Date.now());
+      // Launching a session that can only answer "you are out of usage" wastes the
+      // pane and the caller's turn; say which accounts are spent and let Owner
+      // override deliberately.
+      if (!choice.account) throw new InjectionError(409, openAccount.noAccountMessage(agent, choice.skipped));
+      account = choice.account;
+      accountNote = openAccount.accountNote(choice);
+    } else {
+      account = accounts.defaultFor(agent, env);
+    }
     if (!account || account.agent !== agent) throw new InjectionError(400, `account ${body.accountId || '?'} is not a ${agent} account`);
+    if (body.accountId != null) {
+      accountWarning = openAccount.exhaustedWarning(account, usageSnapshot(deps), launchModel, Date.now());
+    }
   }
   const allowPendingRegistration = freshStandalone && agent === 'codex' && !message && Boolean(body.requestId)
     && !body.portableTransferId && !body.reviewQueueLaunchId
@@ -5600,6 +5640,7 @@ async function openSession(body, deps = {}) {
       return { ok: true, existing: true, focus: 'console', pane: existing.id,
         sessionId, ...openedSessionNumber(sessionId, deps),
         accountId: account.id, accountLabel: account.label,
+        ...(accountNote ? { accountNote } : {}), ...(accountWarning ? { accountWarning } : {}),
         agent, recoverable: existing.agentAlive === false,
         ...(!sessionId && allowPendingRegistration ? { pendingRegistration: true } : {}) };
     }
@@ -5683,6 +5724,7 @@ async function openSession(body, deps = {}) {
     return { ok: true, created: 'pane', command, pane, sessionId,
       ...openedSessionNumber(sessionId, deps),
       accountId: account.id, accountLabel: account.label,
+      ...(accountNote ? { accountNote } : {}), ...(accountWarning ? { accountWarning } : {}),
       ...(Number.isInteger(spawned.pane.pid) ? { pid: spawned.pane.pid } : {}),
       ...(spawned.pane.createdAt != null ? { createdAt: spawned.pane.createdAt } : {}) };
   };
@@ -8223,6 +8265,130 @@ async function deliverUnblockToThread(task, text) {
     : null;
 }
 
+// `keep tell`: one session addressing another. Everything that decides whether the
+// message may be typed at all — the frame, the target-state guards, the hourly brake —
+// is data in bin/tell.js; this is the part that needs the daemon's live view.
+//
+// Three properties it must keep. The frame is built here, so a caller cannot dress its
+// message up as Owner or as Keep itself. Every guard is re-checked inside the injection
+// lock immediately before the first character, through watcherSend's precondition, so a
+// session that took a turn or raised a question between the decision and the keystrokes
+// stops it. And the ledger slot is reserved before the send and given back if the send
+// fails, so a refused tell never spends the sender's hour.
+async function tellSession(body, deps = {}) {
+  body = body && typeof body === 'object' ? body : {};
+  const root = deps.root || keep.ROOT;
+  const text = normalizedText(body.text || '');
+  if (!text) throw new InjectionError(400, 'message is empty');
+  if (body.senderSessionId != null && !/^[A-Za-z0-9_-]+$/.test(String(body.senderSessionId))) {
+    throw new InjectionError(400, 'bad sender session id');
+  }
+  const sessions = (deps.scanSessions || scanSessions)();
+  const excluded = deps.excluded || excludedSessionIds();
+  const senderId = body.senderSessionId ? String(body.senderSessionId) : '';
+
+  let target;
+  if (body.taskId) {
+    let task;
+    try { task = (deps.loadTask || keep.loadTask)(body.taskId); } catch {}
+    if (!task) throw new InjectionError(400, 'no task');
+    // The same candidate rule every automated delivery onto a card uses: its linked
+    // sessions, minus the reviewer, keep-spawned runs, and the sender itself.
+    const { candidates, busy } = pickDeliveryCandidates(
+      (task.fm.sessions || []).map((entry) => entry && entry.id),
+      sessions,
+      new Set([...excluded, ...(senderId ? [senderId] : [])]),
+    );
+    if (!candidates.length && busy > 0) {
+      throw new InjectionError(409, `busy: the live session on ${body.taskId} is mid-turn or waiting on Owner`, { reason: 'busy' });
+    }
+    if (!candidates.length) {
+      throw new InjectionError(409, `no live session on ${body.taskId}; start one with keep open ${body.taskId} --fresh -m "..."`, { reason: 'not-live' });
+    }
+    target = candidates[0];
+  } else {
+    target = (deps.resolveSessionId || resolveSessionId)(body.sessionId, { ...deps, scanSessions: () => sessions });
+  }
+
+  if (senderId && target.id === senderId) {
+    throw new InjectionError(409, 'self: a session cannot tell itself', { reason: 'self' });
+  }
+  const marked = (dir) => {
+    try { return fs.existsSync(path.join(root, '.keep', dir, target.id)); } catch { return false; }
+  };
+  // The reviewer's only input is its own tick, and a keep-spawned run is headless.
+  if (target.reviewer || marked('reviewer')) {
+    throw new InjectionError(409, 'reviewer: the reviewer session takes its work from its own tick', { reason: 'reviewer' });
+  }
+  if (marked('spawned')) {
+    throw new InjectionError(409, 'keep-spawned: that session is a headless run, not a thread', { reason: 'keep-spawned' });
+  }
+  const refusal = tell.tellRefusal(target);
+  if (refusal) throw new InjectionError(409, `${refusal.reason}: ${refusal.detail}`, { reason: refusal.reason });
+
+  const sender = {
+    sessionId: senderId || null,
+    agent: body.senderAgent === 'codex' ? 'codex' : 'claude',
+    card: body.senderCard || null,
+    name: tell.sessionName(sessions.find((row) => row.id === senderId)
+      || (senderId ? { id: senderId, ...(sessionNumbers.lookup(senderId, { root }) || {}) } : null)),
+  };
+  const envelope = tell.tellEnvelope(sender, text);
+  if (envelope.length > tell.SEND_LIMIT) throw new InjectionError(400, tell.TELL_TEXT_ERROR);
+
+  const targetCard = body.taskId
+    || (((deps.taskForSession || keep.taskForSession)(target.id) || {}).id || null);
+  const receipt = {
+    ok: true, sessionId: target.id, name: tell.sessionName(target), kind: target.kind,
+    card: targetCard, text: envelope,
+  };
+  const now = Date.now();
+  const slot = { sender: senderId || null, target: target.id, now };
+  if (body.dry === true) {
+    // Read-only all the way down: the ledger is consulted, never written.
+    const decision = tell.tellDecision(tell.loadLedger(root), slot);
+    if (!decision.ok) throw new InjectionError(409, `rate-limited: ${decision.why}`, { reason: 'rate-limited' });
+    return { ...receipt, dry: true };
+  }
+
+  const gate = (deps.withLock || keep.withLock)(() => {
+    const store = tell.loadLedger(root);
+    const decision = tell.tellDecision(store, slot);
+    if (decision.ok) tell.saveLedger(root, tell.recordTell(store, slot));
+    return decision;
+  });
+  if (!gate.ok) throw new InjectionError(409, `rate-limited: ${gate.why}`, { reason: 'rate-limited' });
+
+  try {
+    await (deps.watcherSend || watcherSend)({
+      sessionId: target.id,
+      text: envelope,
+      precondition: async () => {
+        const fresh = ((deps.scanSessions || scanSessions)()).find((row) => row.id === target.id);
+        const moved = tell.tellRefusal(fresh);
+        return moved ? `${moved.reason}: ${moved.detail}` : null;
+      },
+    }, deps);
+  } catch (error) {
+    try {
+      (deps.withLock || keep.withLock)(() => tell.saveLedger(root, tell.releaseTell(tell.loadLedger(root), slot)));
+    } catch {}
+    // A session the scan still lists but whose pane has gone is a refusal like any
+    // other, not a transport failure: say so in the same shape the guards use.
+    if (error instanceof InjectionError && error.status === 404 && error.extra && error.extra.notLive) {
+      throw new InjectionError(409, 'not-live: that session has no live host pane', { reason: 'not-live' });
+    }
+    throw error;
+  }
+  tell.logTell(root, {
+    ts: keep.nowStamp(),
+    sender: sender.sessionId, senderCard: sender.card,
+    target: target.id, targetCard,
+    text: text.slice(0, 200),
+  });
+  return receipt;
+}
+
 // A state note reaches the sibling sessions in the same checkout as information.
 // Not a gate, not a question, and never a reason to stop: the text says so, and
 // nothing here waits for an answer. Reviewer and spawned sessions are excluded
@@ -8677,7 +8843,7 @@ function start(deps = {}) {
     restorePlan, resumeAfterLimit, review, reviewDeps, reviewQueue, reviewQueueSearch, runCheckNow,
     runTaskNow, runs, scanSessions, screenHistorySession, screenSession, sendSessionKeys,
     sendStateJson, sendToResolvedTarget, sendToSession, sendToSessionLocked, sessionNames, sessionSummaryFile, sessionSummarySnapshot,
-    setAsideCandidates, slack, stallAliveIds, stalled, stalledSessionSnapshot, standup,
+    setAsideCandidates, slack, stallAliveIds, stalled, stalledSessionSnapshot, standup, tellSession,
     startAutoCompact, startBriefScheduler, startHandoffQueue, startWtGcScheduler, summarize,
     transcriptFileForSession,
     transferSession,
@@ -8867,6 +9033,7 @@ module.exports = {
   pickDeliveryCandidates,
   checkDeliveryIds,
   deliverCheckToThread,
+  tellSession,
   shouldCompactFirst,
   lastTurnUsage,
   sessionLastTurn,

@@ -936,6 +936,9 @@ test('open CLI posts card or session identity and formats one-line results', asy
   const calls = [];
   const deps = {
     loadTask: (id) => { if (id === 'card') return {}; throw new Error('no task'); },
+    // This suite runs inside an agent session, whose own account would otherwise ride
+    // along on every fresh open; the account cases below set it deliberately.
+    env: {},
     postKeepApi: async (url, body) => {
       calls.push({ url, body });
       return { status: 200, data: JSON.stringify({ ok: true, created: 'pane', pane: 'pane-40', command: 'codex' }) };
@@ -945,11 +948,12 @@ test('open CLI posts card or session identity and formats one-line results', asy
   await openCommand(['card', '--fresh', '--agent', 'codex'], deps);
   await openCommand(['sid'], deps);
   await openCommand(['card', '--fresh', '-m', 'Work the batch'], deps);
-  assert.deepEqual(calls[0], { url: '/api/open', body: { taskId: 'card', fresh: true, agent: 'codex', requester: 'me' } });
+  assert.deepEqual(calls[0], { url: '/api/open', body: { taskId: 'card', fresh: true, agent: 'codex', accountPolicy: 'auto', requester: 'me' } });
   assert.equal(calls[1].body.sessionId, 'sid');
   assert.equal(calls[1].body.message, undefined);
   assert.equal(calls[1].body.requester, undefined, 'a session target carries no requester');
-  assert.deepEqual(calls[2].body, { taskId: 'card', fresh: true, agent: undefined, message: 'Work the batch', requester: 'me' });
+  assert.equal(calls[1].body.accountPolicy, undefined, 'a resume is pinned to its account and never asks');
+  assert.deepEqual(calls[2].body, { taskId: 'card', fresh: true, agent: undefined, accountPolicy: 'auto', message: 'Work the batch', requester: 'me' });
   deps.currentSession = () => null;
   await openCommand(['card'], deps);
   assert.equal(calls[3].body.requester, undefined);
@@ -959,10 +963,62 @@ test('open CLI posts card or session identity and formats one-line results', asy
   await assert.rejects(openCommand(['card', '-m', '  '], deps), /-m needs a message/);
   deps.currentSession = () => ({ id: 'me', agent: 'claude' });
   await openCommand(['card', '--fresh', '--model', 'claude-fable-5-1'], deps);
-  assert.deepEqual(calls.at(-1).body, { taskId: 'card', fresh: true, agent: undefined, model: 'claude-fable-5-1', requester: 'me' });
+  assert.deepEqual(calls.at(-1).body, { taskId: 'card', fresh: true, agent: undefined, accountPolicy: 'auto', model: 'claude-fable-5-1', requester: 'me' });
   await openCommand(['card', '--fresh', '--agent', 'codex', '--model', 'gpt-5.6-sol'], deps);
   assert.equal(calls.at(-1).body.model, 'gpt-5.6-sol');
   await assert.rejects(openCommand(['card', '--model', 'opus; rm -rf /'], deps), /--model must be a model id/);
+});
+
+test('a fresh open asks for an account only when it names none, and says which it got', async () => {
+  const { openCommand, formatOpenResult } = require('./keep.js');
+  const calls = [];
+  const lines = [];
+  const warnings = [];
+  const deps = {
+    loadTask: (id) => { if (id === 'card') return {}; throw new Error('no task'); },
+    currentSession: () => ({ id: 'me', agent: 'claude' }),
+    env: { KEEP_AGENT_ACCOUNT_ID: 'claude-secondary' },
+    log: (line) => lines.push(line),
+    errorOutput: (line) => warnings.push(line),
+    postKeepApi: async (url, body) => {
+      calls.push(body);
+      return { status: 200, data: JSON.stringify({ ok: true, created: 'pane', pane: 'pane-40', command: 'claude' }) };
+    },
+  };
+  // A session running on its own account offers that account first.
+  await openCommand(['card', '--fresh'], deps);
+  assert.equal(calls[0].accountPolicy, 'auto');
+  assert.equal(calls[0].callerAccountId, 'claude-secondary');
+  // An explicit --account is passed through exactly as before, with nothing to choose.
+  await openCommand(['card', '--fresh', '--account', 'claude/default'], deps);
+  assert.equal(calls[1].accountId, 'claude/default');
+  assert.equal(calls[1].accountPolicy, undefined);
+  assert.equal(calls[1].callerAccountId, undefined);
+  // Outside an agent session there is no caller account to offer.
+  deps.env = {};
+  await openCommand(['card', '--fresh'], deps);
+  assert.equal(calls[2].accountPolicy, 'auto');
+  assert.equal(calls[2].callerAccountId, undefined);
+
+  deps.postKeepApi = async () => ({ status: 200, data: JSON.stringify({ ok: true, created: 'pane', pane: 'pane-1',
+    command: 'claude', sessionId: 'new', accountId: 'claude-secondary',
+    accountNote: 'claude/default skipped: week 100%, resets Sep 21 12:00; opened on claude-secondary' }) });
+  lines.length = 0;
+  await openCommand(['card', '--fresh'], deps);
+  assert.equal(lines[0], 'opened pane pane-1: claude as new on claude-secondary'
+    + '\nclaude/default skipped: week 100%, resets Sep 21 12:00; opened on claude-secondary');
+  assert.deepEqual(warnings, []);
+
+  // An explicit account with nothing left still launches; the warning goes to stderr.
+  deps.postKeepApi = async () => ({ status: 200, data: JSON.stringify({ ok: true, created: 'pane', pane: 'pane-1',
+    command: 'claude', sessionId: 'new', accountId: 'claude/default',
+    accountWarning: 'claude/default is out of usage (week 100%, resets Sep 21 12:00)' }) });
+  await openCommand(['card', '--fresh', '--account', 'claude/default'], deps);
+  assert.deepEqual(warnings, ['warning: claude/default is out of usage (week 100%, resets Sep 21 12:00)\n']);
+
+  // A daemon that knows nothing about accounts still prints the old line.
+  assert.equal(formatOpenResult({ created: 'pane', pane: 'pane-1', command: 'claude', sessionId: 'new' }),
+    'opened pane pane-1: claude as new');
 });
 
 test('restore --dry prints a fake daemon plan without opening sessions', async () => {
