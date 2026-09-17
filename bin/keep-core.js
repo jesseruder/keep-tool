@@ -738,17 +738,8 @@ function processStartedAt(pid) {
   } catch { return ''; }
 }
 
-// A sandboxed worker — a Codex task, whose writable root is its own workspace — can
-// read the registry and cannot write it. That is a fact about where it runs, not a
-// crash: say so in one line, and say who does the writing.
-function readOnlyRegistry(error) {
-  if (!error || !['EPERM', 'EACCES', 'EROFS'].includes(error.code)) return error;
-  return new KeepError(`the Keep registry at ${ROOT} is not writable from here (${error.code}); a sandboxed worker returns its result to the parent session, which checks in`);
-}
-
 function withLock(fn) {
-  try { fs.mkdirSync(META, { recursive: true }); }
-  catch (error) { throw readOnlyRegistry(error); }
+  fs.mkdirSync(META, { recursive: true });
   const deadline = Date.now() + 5000;
   const ownerFile = path.join(LOCK, 'owner.json');
   const token = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
@@ -766,7 +757,7 @@ function withLock(fn) {
       }
       break;
     } catch (e) {
-      if (e.code !== 'EEXIST') throw readOnlyRegistry(e);
+      if (e.code !== 'EEXIST') throw e;
       try {
         if (Date.now() - fs.statSync(LOCK).mtimeMs > 60e3) {
           let owner = null;

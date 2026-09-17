@@ -3260,6 +3260,15 @@ if (require.main === module) {
         process.stderr.write(`keep: ${e.message}\n`);
         process.exit(Number.isInteger(e.exitCode) ? e.exitCode : 1);
       }
+      // A sandboxed worker — a Codex task, whose writable root is its own workspace —
+      // can read the registry and cannot write it. That is a fact about where this
+      // command runs, not a crash: say so in one line, and say who does the writing.
+      // Only here, at the CLI's edge: the daemon shares withLock, and for it an
+      // unwritable registry is a server failure that should keep its own shape.
+      if (e && ['EPERM', 'EACCES', 'EROFS'].includes(e.code) && String(e.path || '').startsWith(ROOT)) {
+        process.stderr.write(`keep: the Keep registry at ${ROOT} is not writable from here (${e.code}); a sandboxed worker returns its result to the parent session, which checks in\n`);
+        process.exit(1);
+      }
       throw e;
     }
   })();
