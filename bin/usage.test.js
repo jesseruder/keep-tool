@@ -454,6 +454,123 @@ test('weather on one account never clears another account\'s unresolved real fai
   } finally { process.stderr.write = originalWrite; }
 });
 
+test('a rate limit nobody can judge stays a real failure that another account\'s weather cannot clear', async () => {
+  const configured = [
+    { id: 'claude-a', label: 'Alpha', agent: 'claude', configDir: '/profiles/a' },
+    { id: 'claude-b', label: 'Bravo', agent: 'claude', configDir: '/profiles/b' },
+  ];
+  const t0 = Date.parse('2026-09-17T12:00:00Z');
+  const GRACE_MS = 2 * 3600e3;
+  const HOUR_MS = 60 * 60e3;
+
+  // Alpha is rate limited continuously with nothing anyone can judge it by, so its 429
+  // is recorded as a real failure — and has to stay one while it waits. Two ways to get
+  // there: it never had a reading at all, or the reading it has ages past the grace.
+  // Bravo meanwhile alternates success and 429 over a reading minutes old, which is
+  // tolerable weather. Exempting *every* rate-limited account from the unresolved check
+  // let Bravo's weather clear the streak Alpha had earned, so the row never passed one
+  // failure in twelve hours.
+  for (const variant of [
+    { name: 'Alpha never had a reading', setupAt: null, start: t0 },
+    { name: 'Alpha\'s reading ages past the grace', setupAt: t0, start: t0 + GRACE_MS + 5 * 60e3 },
+  ]) {
+    const accountApi = { list: () => configured, defaultFor: () => configured[0] };
+    const records = [];
+    let currentTime = t0;
+    const manager = createUsageManager({
+      accounts: accountApi, health: { record: (name, options) => records.push({ name, options }) }, now: () => currentTime,
+    });
+    // The streak the scheduler-wide row carries, folded the way bin/health.js does: a
+    // failure adds one, a success or an expected state zeroes it, an ordinary skip
+    // leaves it alone.
+    let streak = 0;
+    const apply = () => {
+      const options = records.at(-1).options;
+      if (options.ok === false) streak += 1;
+      else if (options.expected === true || !options.skipped) streak = 0;
+      return options;
+    };
+    const reading = () => ({ limits: [{ label: 'week', percent: 20 }], fetchedAt: currentTime });
+    const limited = () => { throw Object.assign(new Error('limited'), { code: 429 }); };
+    // Alpha's 429s carry the endpoint's own Retry-After, which Keep honours past its
+    // exponential cap. An hour is what holds Alpha out of the polls between rounds, so
+    // each batch below contains exactly the accounts its assertion is about. Bravo's are
+    // plain, so it keeps the ordinary ten-minute cooldown and cycles inside that hour.
+    const limitedForAnHour = () => { throw Object.assign(new Error('limited'), { code: 429, retryAfter: '3600' }); };
+    const poll = async (at, plan) => {
+      const asked = [];
+      currentTime = at;
+      manager.requestRefresh(at, async (account) => {
+        asked.push(account.id);
+        const outcome = plan[account.id];
+        if (!outcome) throw Object.assign(new Error('unplanned'), { code: 'response' });
+        return outcome();
+      });
+      await settleRefresh();
+      return { asked, options: apply() };
+    };
+    const originalWrite = process.stderr.write;
+    process.stderr.write = () => true;
+    try {
+      if (variant.setupAt !== null) {
+        // Alpha starts with the reading that later ages out.
+        const first = await poll(variant.setupAt, { 'claude-a': reading, 'claude-b': reading });
+        assert.deepEqual(first.options, { ok: true }, variant.name);
+        assert.equal(streak, 0, variant.name);
+      }
+
+      for (let round = 0; round < 4; round += 1) {
+        const at = variant.start + round * HOUR_MS;
+        const before = streak;
+        const where = `${variant.name}, round ${round}`;
+
+        // Alpha's 429 over no usable reading fails the row, exactly as it does today.
+        // Bravo answers, so Alpha's is the batch's only failure.
+        const real = await poll(at, { 'claude-a': limitedForAnHour, 'claude-b': reading });
+        assert.deepEqual(real.asked, ['claude-a', 'claude-b'], where);
+        assert.deepEqual(real.options, { ok: false, error: 'Alpha: HTTP 429' }, where);
+        assert.equal(streak, before + 1, where);
+
+        // Alpha is now an hour into the server's own cooldown, so these batches hold
+        // only Bravo. Its 429 over a five-minute-old reading is weather: it must neither
+        // inflate the streak nor clear what Alpha is still sitting on.
+        const weather = async (offset) => {
+          const step = await poll(at + offset, { 'claude-b': limited });
+          assert.deepEqual(step.asked, ['claude-b'], where);
+          assert.equal(step.options.ok, true, where);
+          assert.equal(step.options.skipped, true, where);
+          assert.equal(step.options.expected, undefined, `${where}: Alpha's failure is not cleared`);
+          assert.match(step.options.detail,
+            /^rate limited \(Bravo\); retrying \d\d:\d\d, reading 5m old; unresolved: Alpha: HTTP 429$/, where);
+          assert.equal(streak, before + 1, where);
+        };
+        await weather(5 * 60e3);
+
+        // Bravo recovering refreshes its reading. Alpha is still the only thing
+        // outstanding, so this is the ordinary between-retries skip, which has always
+        // left the streak alone.
+        const between = await poll(at + 15 * 60e3, { 'claude-b': reading });
+        assert.deepEqual(between.asked, ['claude-b'], where);
+        assert.deepEqual(between.options, { ok: true, skipped: true, detail: 'waiting for failed account retry' }, where);
+        assert.equal(streak, before + 1, where);
+
+        await weather(20 * 60e3);
+      }
+      // Four of Alpha's own hourly retries, eight tolerable Bravo 429s in between, and
+      // the count is exactly Alpha's: the row goes red at three and stays red.
+      assert.equal(streak, 4, variant.name);
+
+      // Once Alpha answers, the only failure left is Bravo's own 429 inside the grace.
+      // Nothing is outstanding, so the row may finally clear.
+      const cleared = await poll(variant.start + 4 * HOUR_MS, { 'claude-a': reading, 'claude-b': limited });
+      assert.deepEqual(cleared.asked, ['claude-a', 'claude-b'], variant.name);
+      assert.equal(cleared.options.expected, true, variant.name);
+      assert.match(cleared.options.detail, /^rate limited \(Bravo\); retrying \d\d:\d\d, reading 45m old$/, variant.name);
+      assert.equal(streak, 0, variant.name);
+    } finally { process.stderr.write = originalWrite; }
+  }
+});
+
 test('failures from accounts removed during refresh do not create stale health alerts', async () => {
   const configured = [
     { id: 'claude/default', label: 'Primary', agent: 'claude', configDir: '/profiles/default', builtIn: true },

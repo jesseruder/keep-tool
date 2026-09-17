@@ -461,6 +461,15 @@ function createUsageManager(deps = {}) {
     return `${String(when.getHours()).padStart(2, '0')}:${String(when.getMinutes()).padStart(2, '0')}`;
   }
 
+  // Whether a state still holds a reading recent enough to stand for what the account
+  // has left. The one test of "tolerable" — the batch that just failed and the accounts
+  // already waiting on a retry are judged by it alike.
+  function readingAge(state, now) {
+    const fetchedAt = Number(state.snapshot.fetchedAt);
+    if (!Number.isFinite(fetchedAt) || !fetchedAt || now - fetchedAt > RATE_LIMIT_HEALTH_GRACE_MS) return null;
+    return now - fetchedAt;
+  }
+
   // A 429 from an account that still holds a recent reading is weather, not a broken
   // scheduler: the endpoint's limit is per account and every running Claude Code session
   // shares it, so there is nothing here for a person or a repair card to fix. The detail
@@ -472,20 +481,23 @@ function createUsageManager(deps = {}) {
     if (!failures.length || failures.some((outcome) => !outcome.rateLimited)) return null;
     const parts = [];
     for (const outcome of failures) {
-      const fetchedAt = Number(outcome.state.snapshot.fetchedAt);
-      if (!Number.isFinite(fetchedAt) || !fetchedAt || now - fetchedAt > RATE_LIMIT_HEALTH_GRACE_MS) return null;
+      const age = readingAge(outcome.state, now);
+      if (age === null) return null;
       parts.push(`rate limited (${outcome.account.label || outcome.account.id}); retrying ${clockTime(outcome.state.nextAttemptAt)}`
-        + `, reading ${Math.round((now - fetchedAt) / 60e3)}m old`);
+        + `, reading ${Math.round(age / 60e3)}m old`);
     }
     return parts.join('; ');
   }
 
-  // Every account still carrying a failure that is not a rate limit: broken
+  // Every account still carrying a failure that is not tolerable weather: broken
   // credentials, a timeout, a response nobody could parse, a Codex scan that found no
-  // snapshot. There is one `usage` row for every account, so a 429 on one account must
-  // not erase what another account's real fault has already recorded on it.
-  function unresolvedRealFailures() {
-    return [...states.values()].filter((state) => state.snapshot.error && state.failureKind !== 'rate-limit');
+  // snapshot — and a rate limit on an account with no reading, or only one past the
+  // grace, which is recorded as a failure when it happens and has to stay one while it
+  // waits. There is one `usage` row for every account, so weather on one account must
+  // not erase what another account's fault has already recorded on it.
+  function unresolvedRealFailures(now) {
+    return [...states.values()].filter((state) => state.snapshot.error
+      && !(state.failureKind === 'rate-limit' && readingAge(state, now) !== null));
   }
 
   function requestRefresh(now = clock(), performRefresh = refreshAccount) {
@@ -568,7 +580,7 @@ function createUsageManager(deps = {}) {
             // ordinary skip does neither: the streak, lastError and lastErrorAt stay,
             // `keep health` keeps showing "N failed attempts · latest check skipped",
             // and the row is still lintable and still a self-repair candidate.
-            const unresolved = unresolvedRealFailures();
+            const unresolved = unresolvedRealFailures(Number(clock()));
             healthApi.record('usage', unresolved.length ? {
               ok: true, skipped: true,
               detail: `${weather}; unresolved: ${unresolved.map((state) => `${state.account.label || state.account.id}: ${state.snapshot.error}`).join('; ')}`,
