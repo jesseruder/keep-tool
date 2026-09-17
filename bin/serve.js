@@ -3114,20 +3114,20 @@ async function resolveSessionTarget(session, targetHint, deps = {}) {
 
 function resolveSessionId(value, deps = {}) {
   const wanted = String(value || '');
-  // `#12` / `12` / `s12` name a session by its console number. Ids are never all
-  // digits at that length, so a number can only ever mean the numbered session.
+  // `#12` / `12` / `s12` name a session by its console number, unless a session
+  // id is literally that string: an exact id always wins.
   const number = sessionNumbers.parseNumber(wanted);
   if (!number && !/^[A-Za-z0-9_-]+$/.test(wanted)) throw new InjectionError(400, 'bad session id');
   // A phone polls this every couple of seconds; a snapshot under 5 s old is fresh enough
   // to resolve an id and spares the event loop a full transcript scan per poll.
   const scanned = deps.scanSessions ? deps.scanSessions()
     : (Date.now() - sessionSnapshotAt < 5000 && sessionSnapshot.length ? sessionSnapshot : scanSessions());
-  if (number) {
+  const exact = scanned.find((candidate) => candidate.id === wanted);
+  if (number && !exact) {
     const numbered = scanned.filter((candidate) => candidate.num === number);
     if (numbered.length !== 1) throw new InjectionError(400, 'bad session id');
     return numbered[0];
   }
-  const exact = scanned.find((candidate) => candidate.id === wanted);
   const matches = exact ? [exact] : wanted.length >= 8
     ? scanned.filter((candidate) => candidate.id.startsWith(wanted))
     : [];

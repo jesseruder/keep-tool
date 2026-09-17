@@ -143,4 +143,10 @@ test('the CLI reads numbers without allocating: pane ls labels the session colum
   const client = { request: async () => ({ panes }) };
   assert.equal((await resolveHostPane(client, '#1')).id, 'p1', 'a number names the pane hosting that session');
   assert.equal((await resolveHostPane(client, 'p2')).id, 'p2', 'pane ids still resolve');
+
+  // Pane ids may be all digits: the pane literally named 1 wins over session #1.
+  const digitPanes = [...panes, { id: '1', alive: true, cols: 80, rows: 24, title: 'digits', cwd: '/tmp', meta: { agent: 'shell' } }];
+  const digitClient = { request: async () => ({ panes: digitPanes }) };
+  assert.equal((await resolveHostPane(digitClient, '1')).id, '1', 'an exact pane id beats a session number');
+  assert.equal((await resolveHostPane(digitClient, '#1')).id, 'p1', '#1 still names the numbered session');
 });

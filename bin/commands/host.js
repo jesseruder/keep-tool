@@ -21,6 +21,10 @@ async function connectHost(deps = {}) {
 async function resolveHostPane(client, value) {
   if (!value) die('a pane id is required');
   const { panes } = await client.request('list');
+  // An exact pane id or session id wins outright: pane ids may be all digits, so
+  // `keep pane kill 12` must mean the pane named 12 when one exists.
+  const exact = panes.filter((pane) => pane.id === value || String(pane.meta && pane.meta.sessionId || '') === value);
+  if (exact.length === 1) return exact[0];
   // A console session number names the pane hosting that session. Read-only: the
   // CLI never allocates numbers, it only reads what the daemon's scan wrote.
   const numbered = sessionNumbers.parseNumber(value);
@@ -31,8 +35,6 @@ async function resolveHostPane(client, value) {
     if (hosting.length > 1) die(`${sessionNumbers.label(numbered)} is hosted by several panes (${hosting.map((pane) => pane.id).join(', ')})`);
     if (found) die(`no pane is running ${sessionNumbers.label(numbered)} (${found.id})`);
   }
-  const exact = panes.filter((pane) => pane.id === value || String(pane.meta && pane.meta.sessionId || '') === value);
-  if (exact.length === 1) return exact[0];
   const matches = panes.filter((pane) => pane.id.startsWith(value)
     || String(pane.meta && pane.meta.sessionId || '').startsWith(value));
   if (!matches.length) die(`no pane matches "${value}"`);

@@ -4861,6 +4861,9 @@ test('a console number resolves to its session, and an unknown number is a bad s
     assert.equal(resolveSessionId(typed, { scanSessions }).id, ids[0], `${typed} names session 12`);
   }
   assert.equal(resolveSessionId('7', { scanSessions }).id, ids[1]);
+  const literal = () => [...scanSessions(), { id: '12', kind: 'claude', num: 3 }];
+  assert.equal(resolveSessionId('12', { scanSessions: literal }).id, '12', 'a session whose id is literally 12 wins over #12');
+  assert.equal(resolveSessionId('#12', { scanSessions: literal }).id, ids[0], '#12 still names the numbered session');
   assert.equal(resolveSessionId(ids[1], { scanSessions }).id, ids[1], 'a full id still resolves');
   assert.equal(resolveSessionId('abcdef12', { scanSessions }).id, ids[0], 'the 8-character prefix rule is unchanged');
 

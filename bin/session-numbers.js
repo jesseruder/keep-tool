@@ -14,8 +14,8 @@ const fs = require('fs');
 const path = require('path');
 
 const LOCK_STALE_MS = 5000;
-const LOCK_RETRIES = 6;
-const LOCK_WAIT_MS = 25;
+const LOCK_RETRIES = 4;
+const LOCK_WAIT_MS = 10;
 const MAX_NUMBER = 999999;
 
 function directory(root) { return path.join(root, '.keep'); }
@@ -88,7 +88,14 @@ function withLock(options, run) {
       // A crashed writer must not stop every later scan from numbering anything.
       let stale = false;
       try { stale = Date.now() - fs.statSync(file).mtimeMs > staleMs; } catch { stale = true; }
-      if (stale) { try { fs.unlinkSync(file); } catch {} continue; }
+      // Claim the stale lock by renaming it: rename is atomic, so of two scanners
+      // that both judge it stale only one succeeds, and a lock the holder released
+      // and someone else re-took in between is never deleted from under them.
+      if (stale) {
+        const claimed = `${file}.stale-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+        try { fs.renameSync(file, claimed); fs.unlinkSync(claimed); } catch {}
+        continue;
+      }
       if (attempt < retries) sleepSync(waitMs);
     }
   }
