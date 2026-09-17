@@ -1176,8 +1176,24 @@ leaves the fleet listed. One row
 per agent: the name, the lifecycle (`idle` / `on <card>` / `needs you` / `stopped`), the
 last event as a one-liner with its relative time, and a badge with the unseen count —
 red when any unseen event asked for Owner, grey when they are only news, absent at zero.
-Clicking a row expands the last 20 events and the open control a Running row offers for a
-live pane; expanding is the acknowledgement, so it posts `seen`. The empty-state counts
+Clicking a row expands it; expanding is the acknowledgement, so it posts `seen`. The
+panel shows the agent's **Log** — the last 20 events — and under it the agent's pane:
+its live terminal when the host still lists that pane as alive, and otherwise the same
+transcript tail a Running row falls back to (`lastAssistantFull` through the session
+detail store, the `/api/state` summary while that loads, "no host pane" when the session
+left nothing). The open control a Running row offers for a live pane stays in the panel's
+head, so the pane can still be taken into the main view.
+
+That terminal is mounted in its own slot, `agent:<name>`, never the stage's: expanding an
+agent neither steals the stage's terminal nor takes the keyboard, which stays wherever
+Owner put it. Collapsing the row — or a pane the host stops calling alive — disposes that
+slot through `ctx.unmount(slot)` rather than leaving a hidden terminal and its socket
+behind for the five minutes `disposeUnusedTerminals` allows a view one can come straight
+back to. The panel's skeleton is rebuilt only when its shape changes (a pane appearing,
+dying or being replaced); the head, log and tail are patched inside it, so a relative time
+ticking over cannot tear the mounted terminal out of the document.
+
+The empty-state counts
 read "N running · N pinned · N agents", the last only when there is one. Agents are never
 selected, counted or dismissed as queue items.
 

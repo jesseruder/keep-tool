@@ -66,15 +66,67 @@ export function agentRowHTML(ctx, agent, expanded = false) {
     <span class="s">${last ? `${ctx.esc(agentEventText(last))} <span class="w num">${ctx.esc(ctx.rel(last.at))}</span>` : 'no events yet'}</span>`;
 }
 
-// The expanded panel: the last events and the one control a Running row offers
-// for a live pane, so an agent can be opened where it already runs.
-export function agentPanelHTML(ctx, agent, events) {
+// The pane an expanded agent can be watched in, or '' when it has none the host
+// still lists as alive. A dead or unlisted pane is not one a terminal can attach
+// to, so the panel falls back to the transcript tail instead.
+export function agentLivePane(ctx, agent) {
   const pane = agent?.session?.pane || '';
-  const open = pane ? `<button class="btn" data-agent-open="${ctx.esc(pane)}">Open pane</button>` : '';
+  return pane && ctx.paneMap?.().get(pane)?.alive ? pane : '';
+}
+
+// The agent's own log: the feed page fetched when its row was expanded, newest
+// first, headed so it reads as a log beside the terminal below it.
+export function agentLogHTML(ctx, events) {
   const rows = (events || []).slice(0, EXPANDED_EVENTS).map((event) => `<div class="aevent${event.needsYou ? ' needs' : ''}">
     <span class="w num">${ctx.esc(ctx.rel(event.at))}</span><span class="kind">${ctx.esc(event.kind)}</span>${event.card ? `<span class="card">${ctx.esc(event.card)}</span>` : ''}<span class="at">${ctx.esc(agentEventText(event))}</span>
   </div>`).join('');
-  return `<div class="ahead">${agent?.model ? `<span class="kind">${ctx.esc(agent.model)}</span>` : ''}${open}</div>${rows || '<div class="aevent muted">No events yet.</div>'}`;
+  return `<div class="alog-head">Log</div>${rows || '<div class="aevent muted">No events yet.</div>'}`;
+}
+
+// What stands in for the terminal when there is no live pane: the same
+// transcript tail a Running row falls back to. The caller resolves it - the
+// detail store lives there - and passes `{status, text, error}`.
+export function agentTailHTML(ctx, detail = {}) {
+  if (detail.status === 'loading') return '<p class="muted" role="status">Loading recent conversation…</p>';
+  if (detail.status === 'error') {
+    return `<p role="alert">Could not load recent conversation: ${ctx.esc(detail.error)} <button class="btn" data-agent-retry>Retry</button></p>`;
+  }
+  return detail.text ? `<pre>${ctx.esc(detail.text)}</pre>` : '<p class="muted">no host pane</p>';
+}
+
+// Resolving that tail through the same store a Running row uses: /api/state
+// carries only a summary for a session whose pane is gone, and the full last
+// message is fetched on demand. A summary already in hand is shown while the
+// fetch is in flight, so the panel is never a bare spinner.
+export function agentTailDetail(ctx, session) {
+  if (!session) return { status: 'ready', text: '' };
+  const deferred = Boolean(session._detailVersion && !Object.hasOwn(session, 'lastAssistantFull'));
+  const detail = deferred ? ctx.detail('session', session) : { status: 'ready', value: session, error: '' };
+  if (deferred && detail.status === 'idle') void ctx.ensureDetail('session', session);
+  if (detail.status === 'error') return { status: 'error', error: detail.error };
+  if (detail.status === 'ready') return { status: 'ready', text: detail.value?.lastAssistantFull || session.lastAssistant || '' };
+  return session.lastAssistant ? { status: 'ready', text: session.lastAssistant } : { status: 'loading' };
+}
+
+// The expanded panel: the agent's log, and under it the pane it is working in -
+// an empty host the caller mounts the live terminal into, never filled here - or
+// the transcript tail when that pane is gone. The one control a Running row
+// offers for a live pane stays in the head, so an agent can still be opened in
+// the main view where it already runs.
+export function agentPanelHTML(ctx, agent, events, detail = {}) {
+  const live = agentLivePane(ctx, agent);
+  const below = live
+    ? `<div class="aterm" data-agent-terminal="${ctx.esc(live)}"></div>`
+    : `<div class="atail">${agentTailHTML(ctx, detail)}</div>`;
+  return `<div class="ahead">${agentHeadHTML(ctx, agent)}</div><div class="alog">${agentLogHTML(ctx, events)}</div>${below}`;
+}
+
+// The head's contents, patched on their own so the panel around them - and the
+// terminal mounted in it - survives a change of model or of session.
+export function agentHeadHTML(ctx, agent) {
+  const pane = agent?.session?.pane || '';
+  const open = pane ? `<button class="btn" data-agent-open="${ctx.esc(pane)}">Open pane</button>` : '';
+  return `${agent?.model ? `<span class="kind">${ctx.esc(agent.model)}</span>` : ''}${open}`;
 }
 
 // Expanding a row is the acknowledgement: the feed is marked seen and fetched.
@@ -358,18 +410,54 @@ function renderQueue(ctx, waiting, running, pinned, recent, dismissed) {
       row.className = `qitem k-agent${expanded ? ' open' : ''}`;
       ctx.patchHTML(row, agentRowHTML(ctx, agent, expanded));
       place(row);
-      if (!expanded) continue;
+      const slot = key; // `agent:<name>`, the terminal slot as well as the row's key.
+      const live = expanded ? agentLivePane(ctx, agent) : '';
       const panelKey = `agent-panel:${agent.name}`;
       let panel = existing.get(panelKey);
+      // A row that has just collapsed, a pane the host no longer calls alive and
+      // a pane a restart has replaced all leave a terminal nothing will render
+      // again. The slot is disposed now rather than left to
+      // disposeUnusedTerminals, which keeps a hidden terminal and its socket for
+      // minutes: right for a view one can come straight back to, wrong for a
+      // panel that is already out of the document. One slot, one terminal.
+      if (!live || (panel?.dataset.pane && panel.dataset.pane !== live)) ctx.unmount(slot);
+      if (!expanded) continue;
+      const agentSession = agent.session?.id
+        ? (ctx.data.sessions || []).find((candidate) => candidate.id === agent.session.id) : null;
+      const detail = live ? {} : agentTailDetail(ctx, agentSession);
       if (!panel) {
         panel = document.createElement('div');
         panel.className = 'qagent-panel';
         panel.dataset.key = panelKey;
       }
-      ctx.patchHTML(panel, agentPanelHTML(ctx, agent, agentFeed(agent.name)));
+      // The terminal host has to outlive the log's own re-renders: a relative
+      // time ticking over would otherwise rewrite the panel and tear the mounted
+      // terminal out of the document. So the skeleton is rebuilt only when the
+      // panel changes shape - a pane appearing, dying or being replaced - and
+      // the head, log and tail are patched inside it.
+      const shape = `${live}:${agent.session?.id || ''}:${agent.session?.pane || ''}`;
+      if (panel.dataset.shape !== shape) {
+        ctx.clearElement(panel);
+        ctx.patchHTML(panel, agentPanelHTML(ctx, agent, agentFeed(agent.name), detail));
+        panel.dataset.shape = shape;
+      } else {
+        ctx.patchHTML(panel.querySelector('.ahead'), agentHeadHTML(ctx, agent));
+        ctx.patchHTML(panel.querySelector('.alog'), agentLogHTML(ctx, agentFeed(agent.name)));
+        const tail = panel.querySelector('.atail');
+        if (tail) ctx.patchHTML(tail, agentTailHTML(ctx, detail));
+      }
       place(panel);
       const openPane = panel.querySelector('[data-agent-open]');
       if (openPane) openPane.onclick = () => ctx.openReviewPane(openPane.dataset.agentOpen);
+      const retryTail = panel.querySelector('[data-agent-retry]');
+      if (retryTail) retryTail.onclick = () => ctx.retryDetail('session', agentSession);
+      // The pane runs in a slot of its own, never the stage's: expanding an
+      // agent must not take the terminal away from whatever is selected, and it
+      // takes no keyboard focus either - the row was clicked to read, not to
+      // type into someone else's session.
+      const terminalHost = live ? panel.querySelector('.aterm') : null;
+      if (terminalHost) ctx.mount(terminalHost, live, { slot, focus: false });
+      panel.dataset.pane = live;
     }
   }
   const pinnedHead = addGroup(`${ctx.state.showPinned ? '▾' : '▸'} Pinned · ${ctx.esc(pinned.length)}`, 'qhead qgroup qtoggle', 'button');
