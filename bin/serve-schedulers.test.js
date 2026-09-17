@@ -62,7 +62,8 @@ function harness(answers = {}) {
       order.push(gitName(args));
       const answer = answerFor(args);
       if (answer.error) {
-        throw Object.assign(new Error(answer.error), { stderr: answer.stderr || '', killed: Boolean(answer.killed) });
+        // Node's synchronous timeout shape: code ETIMEDOUT, no `killed` at all.
+        throw Object.assign(new Error(answer.error), { stderr: answer.stderr || '', ...(answer.code ? { code: answer.code } : {}) });
       }
       return answer.stdout ?? '';
     },
@@ -139,6 +140,17 @@ test('a fetch killed for taking too long says so, so a hung network is not read 
   await h.pull();
   assert.equal(h.rows[0][1].ok, false);
   assert.equal(h.rows[0][1].error.message, 'Command failed: git fetch (killed after 30s)');
+});
+
+test('a rebase that times out says so in the synchronous error shape, which has no killed flag', async () => {
+  const h = harness({
+    fetch: {},
+    'rev-list': { stdout: '1\n' },
+    rebase: { error: 'spawnSync git ETIMEDOUT', code: 'ETIMEDOUT' },
+  });
+  await h.pull();
+  assert.deepEqual(h.order, ['fetch', 'rev-list', 'lock', 'rebase', 'abort', 'unlock']);
+  assert.equal(h.rows[0][1].error.message, 'spawnSync git ETIMEDOUT (killed after 30s)');
 });
 
 test('a pull still running is never joined by a second one', async () => {

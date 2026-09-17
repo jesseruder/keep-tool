@@ -41,7 +41,9 @@ const PULL_TIMEOUT_MS = 30e3;
 // the network hung for thirty seconds, and those want different answers.
 function gitFailure(error, stderr) {
   const reason = String(stderr || '').trim() || error.message;
-  return new Error(error.killed ? `${reason} (killed after ${PULL_TIMEOUT_MS / 1000}s)` : reason);
+  // execFile marks a timed-out child `killed`; execFileSync says ETIMEDOUT instead.
+  const timedOut = Boolean(error.killed) || error.code === 'ETIMEDOUT';
+  return new Error(timedOut ? `${reason} (killed after ${PULL_TIMEOUT_MS / 1000}s)` : reason);
 }
 
 // Pulls cloud-made commits (the overnight check routine's, say) into the local
