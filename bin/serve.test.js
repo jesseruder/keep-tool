@@ -2205,6 +2205,46 @@ test('handoff model resolution stops at a malformed genuine model and rejoins sp
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('handoff model resolution fails closed on an unholdable record and on a short read', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-handoff-model-huge-'));
+  try {
+    const session = { id: 'huge', kind: 'claude' };
+    const real = JSON.stringify({ type: 'assistant', message: {
+      model: 'claude-fable-5-1', usage: { input_tokens: 10 },
+    } });
+    // A tool result big enough that holding the record while looking for the newline that
+    // ends it is itself the problem. The last line has no terminating newline, which is
+    // how a transcript being written right now looks.
+    const oversized = path.join(dir, 'oversized.jsonl');
+    fs.writeFileSync(oversized, `${real}\n${JSON.stringify({ type: 'user', message: { content: 'y'.repeat(3 * 1024 * 1024) } })}`);
+    assert.equal(handoffCurrentModel(session, { meta: { model: 'claude-opus-5' } }, '',
+      { findSessionFile: () => oversized }), '<unknown>',
+    'a record the scan cannot hold is a model it cannot prove');
+
+    const large = path.join(dir, 'large.jsonl');
+    fs.writeFileSync(large, `${real}\n${JSON.stringify({ type: 'user', message: { content: 'y'.repeat(1024 * 1024) } })}\n`);
+    assert.equal(handoffCurrentModel(session, null, '', { findSessionFile: () => large }), 'claude-fable-5-1',
+      'a record that fits is rejoined across every chunk it spans');
+
+    // A file rewritten under the scan hands back fewer bytes than asked for; the rest of
+    // the buffer is zeroes, and the evidence that lived there is gone.
+    const readSync = fs.readSync;
+    let short = true;
+    fs.readSync = (...args) => {
+      const got = readSync(...args);
+      if (!short) return got;
+      short = false;
+      return Math.max(0, got - 1);
+    };
+    try {
+      assert.equal(handoffCurrentModel(session, { meta: { model: 'claude-opus-5' } }, '',
+        { findSessionFile: () => large }), '<unknown>');
+    } finally { fs.readSync = readSync; }
+    assert.equal(handoffCurrentModel(session, null, '', { findSessionFile: () => large }), 'claude-fable-5-1',
+      'and the scan is unharmed once the file holds still');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('handoff model resolution follows a /model typed after the newest assistant record', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-handoff-model-switch-'));
   try {

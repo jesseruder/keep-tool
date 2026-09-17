@@ -1204,6 +1204,9 @@ function lastClaudeHandoffModel(lines) {
 const HANDOFF_MODEL_SCAN_BYTES = 32 * 1024 * 1024;
 const HANDOFF_MODEL_SCAN_CHUNKS = 128;
 const HANDOFF_MODEL_LOOKAHEAD_CHARS = 64 * 1024;
+// One transcript record the scan is willing to hold while looking for the newline that
+// ends it. Past this it fails closed rather than buffering a tool result of any size.
+const HANDOFF_MODEL_CARRY_BYTES = 2 * 1024 * 1024;
 
 // lastClaudeHandoffModel's per-record rule, one record at a time: the model of a genuine
 // assistant turn, '<unknown>' for a genuine turn whose model is malformed (which must
@@ -1301,25 +1304,38 @@ function lastClaudeHandoffModelInFile(file, deps = {}) {
     reachedStart = end === 0;
     let scanned = 0;
     // The head of a record split across a chunk boundary, carried back to the slice that
-    // holds the rest of it. Bytes, not text: a split multi-byte character must survive.
-    let carry = Buffer.alloc(0);
+    // holds the rest of it — as pieces, oldest first, joined only when the newline that
+    // completes the record finally turns up. Bytes, not text: a split multi-byte
+    // character must survive. Copying the accumulated carry into every chunk instead
+    // would make one newline-free record (a huge tool result) quadratic.
+    let carry = [];
+    let carryBytes = 0;
     // The beginning of everything already scanned, so a `/model` row at the end of a
     // slice can still find the stdout row that confirms it.
     let newerText = '';
     for (let chunks = 0; chunks < HANDOFF_MODEL_SCAN_CHUNKS && end > 0 && scanned < maxBytes; chunks += 1) {
       const start = Math.max(0, end - chunkBytes);
-      const slice = Buffer.alloc((end - start) + carry.length);
-      try { fs.readSync(fd, slice, 0, end - start, start); } catch { return unreadable; }
-      carry.copy(slice, end - start);
-      scanned += end - start;
-      let body = slice;
-      carry = Buffer.alloc(0);
-      if (start > 0) {
-        const newline = slice.indexOf(0x0a);
-        carry = newline === -1 ? slice : slice.subarray(0, newline);
-        body = newline === -1 ? Buffer.alloc(0) : slice.subarray(newline + 1);
+      const slice = Buffer.alloc(end - start);
+      // A short read means the file changed under us: the rest of the buffer is zeroes,
+      // which would silently drop whatever evidence lived in those bytes.
+      try {
+        if (fs.readSync(fd, slice, 0, slice.length, start) !== slice.length) return unreadable;
+      } catch { return unreadable; }
+      scanned += slice.length;
+      const newline = start > 0 ? slice.indexOf(0x0a) : -1;
+      if (start > 0 && newline === -1) {
+        // Still inside one record. Keep its pieces and read further back, up to a bound:
+        // a record we cannot hold is a model we cannot prove.
+        carryBytes += slice.length;
+        if (carryBytes > HANDOFF_MODEL_CARRY_BYTES) return unreadable;
+        carry.unshift(slice);
+        end = start;
+        if (end === 0) reachedStart = true;
+        continue;
       }
-      const text = body.toString('utf8');
+      const text = Buffer.concat([slice.subarray(newline + 1), ...carry]).toString('utf8');
+      carry = newline > 0 ? [slice.subarray(0, newline)] : [];
+      carryBytes = newline > 0 ? newline : 0;
       const events = modelEventsInText(text, newerText);
       let seen = events.length - 1;
       if (assistant == null && seen >= 0) {
