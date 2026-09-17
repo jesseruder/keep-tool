@@ -7893,7 +7893,7 @@ test('API state synthesizes a minimal session when a host transcript lookup find
     id: 'missing-rollout', kind: 'codex', project: '/pane/fallback', title: 'Pane title',
     lastUser: '', lastAssistant: '', lastAssistantFull: '', mtime: Date.parse(createdAt),
     size: 0, endedTurn: true, state: 'recent', pane: 'pane-missing', hostOnly: true,
-    taskId: null,
+    taskId: null, unattended: false, opener: null,
   });
 });
 
