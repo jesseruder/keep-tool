@@ -212,8 +212,75 @@ test('every event gets a seq inside the emit lock, and readAfterSeq is a forward
     assert.deepEqual(agents.readAfterSeq('sandboxes', 0, { root }).events.map((event) => event.kind),
       ['incident-opened', 'incident-fired', 'incident-closed']);
 
-    // And a feed that cannot be read is not an empty one.
-    assert.deepEqual(agents.readAfterSeq('nobody-here', 0, { root }), { events: [], more: false });
+    // And a feed that is not there is empty rather than an error.
+    assert.deepEqual(agents.readAfterSeq('nobody-here', 0, { root }).events, []);
+  } finally { cleanup(root); }
+});
+
+test('a seq comes from the feed, so a failed record write cannot repeat one', () => {
+  const root = makeRoot();
+  try {
+    agents.ensure('sandboxes', { role: 'incident-responder' }, { root });
+    const first = agents.emit('sandboxes', { kind: 'incident-opened', card: 'inc-a' }, { root });
+    assert.equal(first.seq, 1);
+
+    // The append lands before the record write, so a record write that fails
+    // leaves `nextSeq` behind the feed. Two events sharing a seq would be worse
+    // than a stale counter: a cursor sitting on it skips the second for good.
+    // Read-only on the DIRECTORY, not the file: the record is written through a
+    // temp file and a rename, so the append to the existing feed still lands
+    // while the record write cannot.
+    fs.chmodSync(agents.agentDir('sandboxes', root), 0o500);
+    const stalled = agents.emit('sandboxes', { kind: 'incident-fired', card: 'inc-a' }, { root, write: () => {} });
+    fs.chmodSync(agents.agentDir('sandboxes', root), 0o700);
+    assert.equal(stalled.seq, 2, 'the event still got a number');
+    assert.equal(agents.readRecord('sandboxes', root).nextSeq, 2, 'and the counter is behind the feed');
+
+    // The next emit reads the feed's own last line rather than that counter.
+    const third = agents.emit('sandboxes', { kind: 'human-note', card: 'inc-a' }, { root });
+    assert.equal(third.seq, 3, 'no number is handed out twice');
+    assert.deepEqual(lines(root, 'sandboxes').map((event) => event.seq), [1, 2, 3]);
+    assert.equal(agents.readRecord('sandboxes', root).nextSeq, 4, 'and the counter caught up');
+    assert.equal(agents.lastFeedSeq('sandboxes', root), 3);
+
+    // A record that somehow ran ahead of the feed is a floor, not an override.
+    agents.writeRecord('sandboxes', { nextSeq: 50 }, { root });
+    assert.equal(agents.emit('sandboxes', { kind: 'note' }, { root }).seq, 50);
+  } finally { cleanup(root); }
+});
+
+test('a forward read from a saved offset returns exactly what a full scan does', () => {
+  const root = makeRoot();
+  try {
+    agents.ensure('sandboxes', { role: 'incident-responder' }, { root });
+    for (let i = 1; i <= 8; i += 1) {
+      agents.emit('sandboxes', { kind: 'incident-fired', card: `inc-${i}`, title: `Sandbox ${i}` }, { root });
+    }
+    const full = agents.readAfterSeq('sandboxes', 3, { root });
+    assert.deepEqual(full.events.map((event) => event.seq), [4, 5, 6, 7, 8]);
+    assert.equal(full.scannedFrom, 0);
+    assert.equal(full.ends.length, full.events.length);
+
+    // Starting at the offset where event 3's line ends gives the same answer for
+    // less work.
+    const afterThree = agents.readAfterSeq('sandboxes', 0, { root }).ends[2];
+    const offset = agents.readAfterSeq('sandboxes', 3, { root, fromOffset: afterThree });
+    assert.equal(offset.scannedFrom, afterThree);
+    assert.deepEqual(offset.events.map((event) => event.seq), full.events.map((event) => event.seq));
+    assert.deepEqual(offset.ends, full.ends);
+
+    // An offset that is not a line boundary, is past the end, or belongs to a
+    // feed that has since been rewritten falls back to a full scan rather than
+    // reading half a line.
+    for (const bad of [afterThree - 1, afterThree + 1, 10 ** 9]) {
+      const fallback = agents.readAfterSeq('sandboxes', 3, { root, fromOffset: bad });
+      assert.deepEqual(fallback.events.map((event) => event.seq), [4, 5, 6, 7, 8], `offset ${bad} still reads everything`);
+    }
+    // markSeen rewrites the whole file, so every saved offset moves; the guard is
+    // what keeps that from silently skipping events.
+    agents.markSeen('sandboxes', Date.now(), { root });
+    assert.deepEqual(agents.readAfterSeq('sandboxes', 3, { root, fromOffset: afterThree })
+      .events.map((event) => event.seq), [4, 5, 6, 7, 8]);
   } finally { cleanup(root); }
 });
 
@@ -228,7 +295,7 @@ test('a control sequence in an event field never reaches the terminal', () => {
       permalink: 'https://slack/\x1b]0;pwned\x07a',
     }, { root });
     assert.equal(event.title, 'Sandbox Open Health');
-    assert.equal(event.text, 'line one line two txet');
+    assert.equal(event.text, 'line one line twotxet');
     assert.equal(event.permalink, 'https://slack/a');
     for (const field of [event.title, event.text, event.permalink]) {
       assert.equal(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/.test(field), false, 'no control byte survives');
@@ -238,6 +305,10 @@ test('a control sequence in an event field never reaches the terminal', () => {
     assert.equal(stored.title, 'Sandbox Open Health');
     // Fence markers in somebody else's text cannot close a fence they sit inside.
     assert.equal(agents.emit('sandboxes', { kind: 'note', text: '>>>KEEP_INPUT' }, { root }).text, '---KEEP_INPUT');
+    // But ordinary spacing is not the scrubber's business: `a  b` is what its
+    // author wrote, and the area session renders events in columns of spaces.
+    assert.equal(agents.emit('sandboxes', { kind: 'note', text: 'a  b' }, { root }).text, 'a  b');
+    assert.equal(agents.emit('sandboxes', { kind: 'note', text: '  padded  ' }, { root }).text, '  padded  ');
   } finally { cleanup(root); }
 });
 

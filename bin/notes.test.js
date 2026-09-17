@@ -493,6 +493,50 @@ test('sanitize strips bidi overrides, zero-width characters, and odd spaces', ()
     assert.equal(live.safeDeliveryText(notes.announcementFor(note, 'create')) !== null, true);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+test('the control-only scrubber strips what a terminal would obey and nothing else', () => {
+  const esc = String.fromCharCode(27);
+  const bel = String.fromCharCode(7);
+  // The point of this one, next to `scrub`: it is not a whitespace normalizer.
+  // Its callers render tables whose columns are runs of spaces, and `a  b` in
+  // somebody's alert text is what they wrote.
+  assert.equal(notes.scrubControls('a  b'), 'a  b');
+  assert.equal(notes.scrubControls('  padded  '), '  padded  ');
+  assert.equal(notes.scrubControls('kind  card  sev  title'), 'kind  card  sev  title');
+  assert.equal(notes.scrub('a  b'), 'a b', 'while `scrub` keeps collapsing, for its own callers');
+
+  // Line breaks are structure inside a fence, so they survive; a CR does not get
+  // to overwrite a line a reader has already seen.
+  assert.equal(notes.scrubControls('one\ntwo'), 'one\ntwo');
+  assert.equal(notes.scrubControls('one\rtwo'), 'one\ntwo');
+  assert.equal(notes.scrubControls('one\r\ntwo'), 'one\ntwo');
+  assert.equal(notes.scrubControlsOneLine('one\ntwo'), 'one two');
+
+  // Everything a terminal would act on goes, sequence and all — leaving `[2J`
+  // behind would be indistinguishable from something somebody typed.
+  assert.equal(notes.scrubControls('Sandbox ' + esc + '[2JOpen Health'), 'Sandbox Open Health');
+  assert.equal(notes.scrubControls('a' + esc + ']0;title' + bel + 'b'), 'ab');
+  assert.equal(notes.scrubControls('a' + esc + 'Mb'), 'ab');
+  assert.equal(notes.scrubControls('a' + String.fromCharCode(3) + String.fromCharCode(21) + 'b'), 'ab');
+  assert.equal(notes.scrubControls('a' + String.fromCharCode(127) + 'b'), 'ab');
+  assert.equal(notes.scrubControls('a' + String.fromCharCode(155) + 'b'), 'ab');
+  assert.equal(notes.scrubControls('a\tb'), 'a b');
+  // Bidi overrides and other invisibles reorder or hide text without changing a
+  // byte of it, so they go too — removed, not replaced, since they were invisible.
+  assert.equal(notes.scrubControls('abc' + '‮' + 'def'), 'abcdef');
+  assert.equal(notes.scrubControls('a' + '​' + 'b'), 'ab');
+  // A fence marker in somebody else's text cannot close the fence it sits in.
+  assert.equal(notes.scrubControls('<<<KEEP_INPUT and >>>'), '---KEEP_INPUT and ---');
+
+  for (const value of ['a  b', 'one\ntwo', 'Sandbox ' + esc + '[2JOpen', 'abc' + '‮' + 'def']) {
+    assert.equal(/[ ---]/.test(notes.scrubControls(value)), false,
+      'no control byte survives ' + JSON.stringify(value));
+  }
+  // And the source itself carries no literal control characters: they belong in
+  // a character class as escapes, not as bytes in the file.
+  const source = fs.readFileSync(require.resolve('./notes.js'), 'utf8');
+  assert.equal(/[ ---]/.test(source), false);
+});
+
 
 test('the announced event is the note\'s own state, not the caller\'s word for it', async () => {
   const serve = require('./serve.js');

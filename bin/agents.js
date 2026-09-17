@@ -30,6 +30,9 @@ const EVENT_LIMIT = 2000;
 // one-line events, and a hard ceiling on what one request can parse.
 const TAIL_BYTES = 256 * 1024;
 const DEFAULT_EVENT_LIMIT = 50;
+// How much of a feed's end is read to find its highest seq. Generous next to a
+// one-line event, so in practice this always finds the last line.
+const SEQ_TAIL_BYTES = 64 * 1024;
 const EXPANDED_EVENTS = 20;
 
 function clip(value, limit) {
@@ -43,8 +46,13 @@ function clip(value, limit) {
 // displayed. So a field is scrubbed of controls, escape sequences, format
 // characters and fence markers BEFORE it is capped: capping first would let a
 // limit fall inside an escape sequence and leave its tail behind as text.
+//
+// `scrubControlsOneLine` and not `scrub`: the latter also normalizes whitespace,
+// which is right for a state note Keep rewrites once and wrong here — `a  b` in
+// somebody's alert text is what they wrote, and the area session renders events
+// in columns made of runs of spaces.
 function oneLine(value, limit) {
-  return clip(notes.scrub(value), limit);
+  return clip(notes.scrubControlsOneLine(value), limit);
 }
 
 function validName(name) {
@@ -240,6 +248,46 @@ function parseEventLines(text) {
   return events;
 }
 
+// Everything from `start` to `size`, as a string. One read, because a feed line
+// is short and the whole point of an offset is that this is the tail.
+function readAll(handle, start, size) {
+  const length = Math.max(0, size - start);
+  if (!length) return '';
+  const buffer = Buffer.alloc(length);
+  fs.readSync(handle, buffer, 0, length, start);
+  return buffer.toString('utf8');
+}
+
+// The seq on the last usable line of the feed — the highest number this feed is
+// known to have handed out. Only the end of the file is read: an append-only feed
+// carries its own high-water mark on its last line, and a line that was written
+// without a seq (a feed older than this scheme) contributes nothing.
+function lastFeedSeq(name, root = keep.ROOT) {
+  let handle;
+  try {
+    handle = fs.openSync(eventsFile(name, root), 'r');
+    const size = fs.fstatSync(handle).size;
+    const start = Math.max(0, size - SEQ_TAIL_BYTES);
+    const text = readAll(handle, start, size);
+    const lines = text.split('\n');
+    // A window that began mid-file may have cut its first line in half.
+    if (start > 0) lines.shift();
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      if (!lines[index].trim()) continue;
+      try {
+        const seq = Number(JSON.parse(lines[index]).seq) || 0;
+        if (seq > 0) return seq;
+      } catch {}
+    }
+    // Nothing usable in the window. On a feed longer than it, the record's
+    // counter is the only floor left, and emit takes the max of the two.
+    return 0;
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return 0;
+    throw error;
+  } finally { if (handle !== undefined) { try { fs.closeSync(handle); } catch {} } }
+}
+
 // A feed that is not there yet is empty. Anything else — a permission, a device,
 // a truncated read — is a feed we cannot see rather than a feed with nothing in
 // it, and it must not be mistaken for one: markSeen rewrites what it reads, and
@@ -333,19 +381,52 @@ function readAfterSeq(name, afterSeq = 0, options = {}) {
   const root = options.root || keep.ROOT;
   const cursor = Math.max(0, Number(afterSeq) || 0);
   const limit = Math.min(EVENT_LIMIT, Math.max(1, Number(options.limit) || EVENT_LIMIT));
-  const text = readFeed(eventsFile(name, root));
-  if (text === null) return { events: [], more: false };
-  const found = [];
-  let more = false;
-  for (const line of String(text).split('\n')) {
-    if (!line.trim()) continue;
-    let event;
-    try { event = normalizeEvent(JSON.parse(line), 0); } catch { continue; }
-    if (event.seq <= cursor) continue;
-    if (found.length >= limit) { more = true; break; }
-    found.push(event);
-  }
-  return { events: found, more };
+  const file = eventsFile(name, root);
+  // A byte offset the caller saved beside its cursor, so a feed months long is
+  // not re-parsed on every poll. Only trusted when it really is a line boundary:
+  // the byte before it must be a newline (or it must be the start of the file),
+  // and it must be inside the file. Anything else — a truncated feed, a rewritten
+  // one (markSeen rewrites the whole file and moves every offset), a stale
+  // number — falls back to a full scan, which is always correct.
+  let start = 0;
+  let handle;
+  try {
+    handle = fs.openSync(file, 'r');
+    const size = fs.fstatSync(handle).size;
+    const wanted = Math.max(0, Number(options.fromOffset) || 0);
+    if (wanted > 0 && wanted <= size) {
+      const probe = Buffer.alloc(1);
+      fs.readSync(handle, probe, 0, 1, wanted - 1);
+      // 0x0a is '\n'. Compared as a raw byte, so an offset landing inside a
+      // multi-byte character reads as "not a boundary", which is the safe answer.
+      if (probe[0] === 0x0a) start = wanted;
+    }
+    const text = readAll(handle, start, size);
+    const found = [];
+    const ends = [];
+    let more = false;
+    let at = start;
+    for (const line of text.split('\n')) {
+      const end = at + Buffer.byteLength(line, 'utf8') + 1;
+      at = end;
+      if (!line.trim()) continue;
+      let event;
+      try { event = normalizeEvent(JSON.parse(line), 0); } catch { continue; }
+      // A line with no seq at all comes from a feed written before seq existed.
+      // It is behind every cursor by definition and is never delivered: there was
+      // no session to deliver it to.
+      if (!event.seq || event.seq <= cursor) continue;
+      if (found.length >= limit) { more = true; break; }
+      found.push(event);
+      // Where this event's line ends, so a caller that delivers up to here can
+      // save it and start the next scan there.
+      ends.push(Math.min(end, size));
+    }
+    return { events: found, ends, more, scannedFrom: start };
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return { events: [], ends: [], more: false, scannedFrom: 0 };
+    throw error;
+  } finally { if (handle !== undefined) { try { fs.closeSync(handle); } catch {} } }
 }
 
 function unseenSummary(events) {
@@ -425,10 +506,21 @@ function emit(name, event = {}, options = {}) {
       const record = readRecord(name, root);
       if (!record) return { missing: true };
       fs.mkdirSync(agentDir(name, root), { recursive: true });
-      // Assigned here and nowhere else: inside the one lock hold that also
-      // appends, so two emitters cannot be given the same number. It rides on
-      // the appended line, which is what makes the feed's order durable.
-      entry.seq = record.nextSeq;
+      // Allocated from the FEED, not from the record's counter, inside the one
+      // lock hold that also appends.
+      //
+      // The counter alone is only best-effort: the append is what lands first and
+      // the record write can fail after it, leaving `nextSeq` behind the feed —
+      // and the next emit would then reuse a number that is already on disk.
+      // Two events sharing a seq is not a small problem: a cursor sitting on it
+      // skips the second one for good, and a delivery deciding from
+      // `nextSeq - 1 > cursor` would read the feed as having nothing new while an
+      // undelivered event sat in it.
+      //
+      // The last line of the feed is authority, and the counter is only a floor
+      // under it, so a record that raced ahead cannot hand out a number twice
+      // either. One short tail read per emit, inside a lock that is already held.
+      entry.seq = Math.max(lastFeedSeq(name, root), record.nextSeq - 1) + 1;
       // The feed is the truth and the record's summary is a cache of its end, so
       // the append comes first and alone decides whether this emit happened.
       fs.appendFileSync(eventsFile(name, root), JSON.stringify(entry) + '\n');
@@ -470,11 +562,11 @@ function emit(name, event = {}, options = {}) {
   if (landed.recordError) {
     say(`wrote the ${entry.kind} event for ${name} but not its summary: `
       + `${oneLine(landed.recordError.message || landed.recordError, 200)}`);
-    // `nextSeq` did not advance either, so the next emit reuses this number.
-    // Two events sharing a seq are delivered together and exactly once — a
-    // cursor at seq-1 returns both, and it advances past both — which is the
-    // outcome worth having here. Repairing the counter would mean writing the
-    // record this write just failed at.
+    // `nextSeq` did not advance, but the event's seq is on the appended line and
+    // the next emit reads it from there, so no number is handed out twice. What a
+    // stale counter costs is a delivery that decides there is nothing new from
+    // `nextSeq` alone — which is why area-session.js falls back to the feed when
+    // its cursor is at or past the counter.
   }
   markPending(root, name);
   if (entry.needsYou) routeAlert(name, entry, { ...options, root });
@@ -717,7 +809,7 @@ function dashboardAgents(options = {}) {
 module.exports = {
   REVIEWER_NAME, EXPANDED_EVENTS, DEFAULT_EVENT_LIMIT, TAIL_BYTES,
   validName, nameFromPath, agentsDir, agentDir, recordFile, eventsFile, notesFile,
-  readRecord, records, writeRecord, ensure, normalizeRecord,
+  readRecord, records, writeRecord, ensure, normalizeRecord, lastFeedSeq,
   emit, markSeen, readEvents, readTail, readAfterSeq, loadEvents, unseenSummary, eventLine, eventSummary, alertText, normalizeEvent,
   flushCommits, pendingNames,
   areaAgent, incidentEmitter,

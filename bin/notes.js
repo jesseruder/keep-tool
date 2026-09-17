@@ -121,13 +121,33 @@ function sanitize(value, limit = MESSAGE_LIMIT) {
   return scrub(value).slice(0, limit);
 }
 
-// `scrub` for text whose line breaks are the point — a fenced block of one line
-// per item. Every line is scrubbed on its own, so a control character cannot
-// forge a line break and a newline is the one whitespace that survives. Tabs
-// and everything else fold to a space exactly as they do in `scrub`.
-function scrubLines(value) {
-  return stripEscapes(value).replace(/\r\n?/g, '\n').split('\n')
-    .map((line) => scrub(line)).join('\n');
+// `scrub` for text that is going to be typed into a terminal rather than stored
+// as a note. Same threat — controls, escape sequences, bidi overrides, invisible
+// format characters, forged fence markers — but it is deliberately NOT a
+// whitespace normalizer: a note is prose Keep rewrote once, while this is a
+// rendered table whose columns are runs of spaces, and a caller that lines events
+// up in columns must not have them collapsed out from under it. `a  b` survives
+// as `a  b`.
+//
+// Newlines survive too, because a fenced block's line breaks are its structure.
+// Every other C0/C1 control is removed rather than replaced, a tab becomes a
+// single space, and a CR (alone or in a CRLF) becomes a newline — a bare CR
+// would otherwise let somebody overwrite the line a reader has already seen.
+const SCRUB_KEEP_SPACES_RE = /[\p{Cf}\p{Zl}\p{Zp}\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu;
+
+function scrubControls(value) {
+  return stripEscapes(value)
+    .replace(/\r\n?/g, '\n')
+    .replace(/\t/g, ' ')
+    .replace(SCRUB_KEEP_SPACES_RE, '')
+    .replace(/<<<|>>>/g, '---');
+}
+
+// The same thing for a field that has to stay on one line. The newlines go — a
+// field that forged a line break would forge a row in the caller's table — and
+// nothing else about the spacing changes.
+function scrubControlsOneLine(value) {
+  return scrubControls(value).replace(/\n+/g, ' ');
 }
 
 
@@ -472,7 +492,8 @@ function startScheduler(options = {}) {
 
 module.exports = {
   MESSAGE_LIMIT, RETENTION_MS, EXPIRED_VISIBLE_MS, SWEEP_EVERY_MS, ANNOUNCE_PREFIX,
-  defaultRoot, notesDir, noteFile, projectKey, scrub, sanitize, stripEscapes, scrubLines, stampOf,
+  defaultRoot, notesDir, noteFile, projectKey, scrub, sanitize, stripEscapes,
+  scrubControls, scrubControlsOneLine, stampOf,
   loadNotes, allNotes, findNote, addNote, extendNote, clearNote, writeFileNotes,
   activeNotes, describeNote, announcementFor, nagFor,
   announceEventFor, announcedAlready, markAnnounced,
