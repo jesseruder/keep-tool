@@ -92,8 +92,14 @@ export function installMarkControls(menu, ctx = {}, sessionId, mark, setMark) {
     const drop = () => { state.queued = state.queued.filter((queued) => queued !== entry); };
     state.chain = state.chain
       .then(() => setMark(sessionId, entry))
-      .then(() => {
-        state.confirmed = applyPatch(state.confirmed, entry);
+      .then((result) => {
+        // The daemon answers with the whole mark as it now stands, which also
+        // carries anything `keep mark` changed meanwhile; only an answer without
+        // one falls back to laying this patch over the old base.
+        const answered = result && typeof result === 'object' && 'mark' in result;
+        state.confirmed = answered
+          ? { color: colorOf(result.mark), emoji: emojiOf(result.mark) }
+          : applyPatch(state.confirmed, entry);
         drop();
         return ctx.reload?.();
       }, (error) => {

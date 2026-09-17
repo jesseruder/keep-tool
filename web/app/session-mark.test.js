@@ -377,6 +377,23 @@ test('a writer that throws synchronously is a failed write, and the queue moves 
   assert.deepEqual(sent, [{ color: null }]);
 });
 
+test("a successful write takes the daemon's answer as the confirmed mark, so a CLI change meanwhile survives", async () => {
+  const { installMarkControls, markControlsHTML } = await import('./session-mark.js');
+  const sent = [];
+  // The daemon answers the color write with a mark that also carries an emoji
+  // `keep mark --emoji` set from a terminal while the click was in flight.
+  const setMark = async (sessionId, patch) => { sent.push(patch); return { ok: true, sessionId, mark: { ...patch, emoji: '🛰️' } }; };
+  const menu = new FakeMenu(markControlsHTML(esc, 'cli-too', null));
+  installMarkControls(menu, { esc }, 'cli-too', null, setMark);
+  menu.swatch('pink').click();
+  await settle();
+  // The belief now includes the emoji the daemon reported: typing it is not a write.
+  menu.emoji.value = '🛰️';
+  menu.emoji.blur();
+  await settle();
+  assert.deepEqual(sent, [{ color: 'pink' }]);
+});
+
 test('the queue and the belief outlive a re-render while a write is still in flight', async () => {
   const { installMarkControls, markControlsHTML } = await import('./session-mark.js');
   const gates = [];
