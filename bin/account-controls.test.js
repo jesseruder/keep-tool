@@ -5,8 +5,10 @@ const writes = [];
 const source = fs.readFileSync(path.join(__dirname, '../web/app/account-controls.js'), 'utf8')
   .replace(/^import .*;\n/gm, '')
   .replaceAll('export function', 'function');
-const context = vm.createContext({ write: async (url, body) => { writes.push({ url, body }); return { status: 'done' }; },
-  openPortableTransfer() {} });
+// `writeResult`, when a test sets it on the context, is what write() answers with;
+// otherwise it keeps the single-session handoff's shape.
+const context = vm.createContext({ write: async (url, body) => { writes.push({ url, body }); return context.writeResult || { status: 'done' }; },
+  openPortableTransfer() {}, writeResult: null });
 vm.runInContext(source, context);
 
 // installHandoffControls binds several attributes; a stub that answered every
@@ -221,4 +223,68 @@ test('the batch, retry, and cancel buttons post exactly what they name', async (
   context.installHandoffControls(fakeContainer({ '[data-queue-cancel]': [cancel] }), ctx, 's', 'p');
   await cancel.onclick();
   assert.equal(JSON.stringify(writes), JSON.stringify([{ url: '/api/handoff-queue-cancel', body: { sessionId: 's' } }]));
+});
+
+test('a parked transfer whose session has moved on keeps the ordinary controls beside it', () => {
+  const parked = { sessionId: 's', sourceAccountId: 'claude-main', targetAccountId: 'claude-two',
+    status: 'parked', lastClass: 'transient', lastReason: 'host request timed out (get)' };
+
+  // Still rate-limited on the source: the queue entry owns the controls.
+  const owned = context.handoffControls(limited({ handoffQueue: [parked] }), 's', 'p');
+  assert.match(owned, /Transfer gave up/);
+  assert.match(owned, /data-queue-retry="s"/);
+  assert.doesNotMatch(owned, /Continue on another account/);
+
+  // The limit cleared while it was parked. Retrying would only be skipped by the
+  // batch, so the status stays as a note and the ordinary controls come back.
+  const cleared = limited({ handoffQueue: [parked] });
+  cleared.data.sessions[0].rateLimit = null;
+  const clearedHTML = context.handoffControls(cleared, 's', 'p');
+  assert.match(clearedHTML, /Transfer gave up: host request timed out/);
+  assert.match(clearedHTML, /data-queue-cancel="s"/);
+  assert.doesNotMatch(clearedHTML, /data-queue-retry/);
+  assert.match(clearedHTML, /Continue on another account/);
+  assert.match(clearedHTML, /data-handoff-account="claude-two"/);
+
+  // Same when a person moved the session elsewhere in the meantime.
+  const moved = limited({ handoffQueue: [parked] });
+  moved.data.sessions[0].accountId = 'claude-three';
+  moved.data.panes[0].meta.accountId = 'claude-three';
+  const movedHTML = context.handoffControls(moved, 's', 'p');
+  assert.match(movedHTML, /Transfer gave up/);
+  assert.match(movedHTML, /data-queue-cancel="s"/);
+
+  // An interrupted handoff record underneath still shows its own recovery controls.
+  const recovering = limited({ handoffQueue: [parked],
+    handoffs: [{ sessionId: 's', targetAccountId: 'claude-two', status: 'recovery-needed', reason: 'stopped' }] });
+  recovering.data.sessions[0].rateLimit = null;
+  const recoveringHTML = context.handoffControls(recovering, 's', 'p');
+  assert.match(recoveringHTML, /Transfer gave up/);
+  assert.match(recoveringHTML, /Transfer interrupted/);
+  assert.match(recoveringHTML, /data-handoff-account="claude-two"/);
+});
+
+test('a retry that the batch skipped says so instead of claiming it was queued', async () => {
+  const toasts = [];
+  const ctx = limited();
+  ctx.toast = (message) => toasts.push(message);
+  const button = { disabled: false, dataset: { queueRetry: 's', queueSource: 'claude-main', queueTarget: 'claude-two' } };
+  const container = fakeContainer({ '[data-queue-retry]': [button] });
+
+  context.writeResult = { queued: [], skipped: [{ sessionId: 's', reason: 'not rate limited' }] };
+  context.installHandoffControls(container, ctx, 's', 'p');
+  await button.onclick();
+  assert.deepEqual(toasts, ['Not queued: not rate limited.']);
+
+  context.writeResult = { queued: [{ sessionId: 's', pane: 'p' }], skipped: [] };
+  context.installHandoffControls(container, ctx, 's', 'p');
+  await button.onclick();
+  assert.deepEqual(toasts.at(-1), 'Queued again for Claude Two.');
+
+  // A response that names neither is not a success either.
+  context.writeResult = { queued: [], skipped: [] };
+  context.installHandoffControls(container, ctx, 's', 'p');
+  await button.onclick();
+  assert.match(toasts.at(-1), /^Not queued: this session no longer needs the transfer/);
+  context.writeResult = null;
 });

@@ -61,7 +61,17 @@ function rateLimitedSessions(ctx, account) {
     && (session.accountId || session.account) === account.id && session.pane);
 }
 
-function queueStatusHTML(ctx, entry) {
+// A parked entry whose session has moved on. Queueing it again would only be
+// skipped by the batch, and the status alone would hide the ordinary transfer and
+// recovery controls the person actually needs now.
+function parkedTransferIsStale(ctx, entry, session) {
+  if (!entry || entry.status !== 'parked' || !session) return false;
+  if (!session.rateLimit) return true;
+  const on = session.accountId || session.account;
+  return Boolean(entry.sourceAccountId && on && on !== entry.sourceAccountId);
+}
+
+function queueStatusHTML(ctx, entry, options = {}) {
   const label = labelForAccountId(ctx, entry.targetAccountId);
   const reason = entry.lastReason || '';
   const cancel = `<button class="btn" data-queue-cancel="${ctx.esc(entry.sessionId)}" title="Stop retrying this transfer">Cancel</button>`;
@@ -72,7 +82,7 @@ function queueStatusHTML(ctx, entry) {
   // Parked. A transient class means the refusals kept clearing and coming back
   // until the queue ran out of patience, so retrying is worth offering. A blocked
   // one named something only a person can resolve, and retrying would just repeat it.
-  const retry = entry.lastClass === 'transient'
+  const retry = entry.lastClass === 'transient' && options.retry !== false
     ? `<button class="btn" data-queue-retry="${ctx.esc(entry.sessionId)}" data-queue-source="${ctx.esc(entry.sourceAccountId || '')}" data-queue-target="${ctx.esc(entry.targetAccountId || '')}"${entry.force ? ' data-queue-force="1"' : ''} title="Queue this transfer again">Retry</button>`
     : '';
   const heading = entry.lastClass === 'transient' ? 'Transfer gave up' : 'Transfer needs you';
@@ -114,9 +124,13 @@ export function handoffControls(ctx, sessionId, paneId) {
   const pane = (ctx.data.panes || []).find((candidate) => candidate.id === paneId);
   const current = accountFor(ctx, session, pane);
   // A queue entry owns the transfer controls while it exists: offering Continue or
-  // Retry beside it would race the daemon's own retry for the same session.
+  // Retry beside it would race the daemon's own retry for the same session. The one
+  // exception is a parked entry the queue has already moved past — that stays on
+  // screen as a note, with the ordinary controls beside it.
   const queued = queueEntry(ctx, sessionId);
-  if (queued) return queueStatusHTML(ctx, queued);
+  const stale = parkedTransferIsStale(ctx, queued, session);
+  if (queued && !stale) return queueStatusHTML(ctx, queued);
+  const parked = stale ? queueStatusHTML(ctx, queued, { retry: false }) : '';
   const handoff = latestHandoff(ctx, sessionId);
   const openOnly = handoff?.intent === 'open-only';
   const target = targetFor(ctx, handoff);
@@ -129,25 +143,25 @@ export function handoffControls(ctx, sessionId, paneId) {
     // reason needs the ordinary retry.
     const forceable = String(handoff.reason || '').startsWith('Waiting for the turn and background work')
       ? `<button class="btn" data-handoff-account="${ctx.esc(handoff.targetAccountId || '')}" data-handoff-force="1" title="Ignore uncertain background-job evidence and transfer now; a session mid-turn is still refused">Force transfer</button>` : '';
-    return `<span class="handoff-error" role="alert" title="${ctx.esc(handoff.reason || '')}">${openOnly ? 'Reopen interrupted' : 'Transfer interrupted'}</span><button class="btn" data-handoff-account="${ctx.esc(handoff.targetAccountId || '')}">Retry</button>${forceable}${fallback}`;
+    return `${parked}<span class="handoff-error" role="alert" title="${ctx.esc(handoff.reason || '')}">${openOnly ? 'Reopen interrupted' : 'Transfer interrupted'}</span><button class="btn" data-handoff-account="${ctx.esc(handoff.targetAccountId || '')}">Retry</button>${forceable}${fallback}`;
   }
   if (handoff?.status === 'done' && current?.id !== handoff.targetAccountId) {
-    return `<span class="handoff-status" role="status">Verifying ${openOnly ? 'reopen on' : 'transfer to'} ${ctx.esc(targetLabel)}…</span>`;
+    return `${parked}<span class="handoff-status" role="status">Verifying ${openOnly ? 'reopen on' : 'transfer to'} ${ctx.esc(targetLabel)}…</span>`;
   }
   if (handoff && !['done', 'failed', 'recovery-needed'].includes(handoff.status)) {
     // Retrying the same transaction joins a live request, or resumes its durable
     // journal after a daemon crash. Do not strand a persisted in-flight status.
-    return `<span class="handoff-status" role="status">${openOnly ? 'Opening on' : 'Continuing on'} ${ctx.esc(targetLabel)}…</span><button class="btn" data-handoff-account="${ctx.esc(handoff.targetAccountId || '')}">Retry</button>`;
+    return `${parked}<span class="handoff-status" role="status">${openOnly ? 'Opening on' : 'Continuing on'} ${ctx.esc(targetLabel)}…</span><button class="btn" data-handoff-account="${ctx.esc(handoff.targetAccountId || '')}">Retry</button>`;
   }
 
   const error = handoff?.status === 'failed'
     ? `<span class="handoff-error" role="alert" title="${ctx.esc(handoff.reason || '')}">${openOnly ? 'Reopen failed' : 'Transfer failed'}</span>` : '';
   const destinations = handoffDestinations(ctx, session, pane);
   const bulk = bulkHandoffHTML(ctx, session, pane);
-  if (!current || !destinations.length) return error;
+  if (!current || !destinations.length) return `${parked}${error}`;
   const provider = current.agent === 'codex' ? 'Codex' : 'Claude';
   const chooser = `<details class="account-handoff"><summary class="btn" title="Continue this ${provider} conversation on another account">Continue on another account</summary><div class="account-menu">${destinations.map((account) => { const hint = usageHint(ctx, account); const label = account.label || account.id; return `<button class="btn" data-handoff-account="${ctx.esc(account.id)}" title="Continue this conversation on ${ctx.esc(label)}"><span>${ctx.esc(label)}</span>${hint ? `<small>${ctx.esc(hint)}</small>` : ''}</button>`; }).join('')}</div></details>`;
-  return `${error}${fallback}${chooser}${bulk}`;
+  return `${parked}${error}${fallback}${chooser}${bulk}`;
 }
 
 function confirmedAccount(ctx, sessionId, paneId) {
@@ -184,10 +198,16 @@ export function installHandoffControls(container, ctx, sessionId, pane) {
   container.querySelectorAll('[data-queue-retry]').forEach((button) => {
     once(button, async () => {
       const targetAccountId = button.dataset.queueTarget;
+      const retried = button.dataset.queueRetry;
       try {
-        await write('/api/handoff-rate-limited', { sourceAccountId: button.dataset.queueSource, targetAccountId,
-          sessionIds: [button.dataset.queueRetry], ...(button.dataset.queueForce === '1' ? { force: true } : {}) });
-        ctx.toast(`Queued again for ${labelForAccountId(ctx, targetAccountId)}.`);
+        const result = await write('/api/handoff-rate-limited', { sourceAccountId: button.dataset.queueSource, targetAccountId,
+          sessionIds: [retried], ...(button.dataset.queueForce === '1' ? { force: true } : {}) });
+        // The batch decides what is still eligible. Saying "queued again" when it
+        // skipped this session would leave the person watching a parked entry.
+        const took = (result.queued || []).some((row) => row.sessionId === retried);
+        const skipped = (result.skipped || []).find((row) => row.sessionId === retried);
+        ctx.toast(took ? `Queued again for ${labelForAccountId(ctx, targetAccountId)}.`
+          : `Not queued: ${skipped?.reason || 'this session no longer needs the transfer'}.`);
         await ctx.reload();
       } catch (error) { ctx.toast(`Not queued: ${error.message}`); }
     });
