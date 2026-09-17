@@ -148,13 +148,8 @@ function codexHook(kind, input) {
       return;
     }
     // The pane is what says whether anybody is reading this session, and the Stop
-    // hook itself is synchronous, so the read happens here — and only for a session
-    // the start hook already found unattended.
-    const recorded = recordedUnattended(input.session_id);
-    const attendance = recorded && recorded.unattended
-      ? unattendedState(input.session_id).catch(() => recorded)
-      : Promise.resolve({ unattended: false });
-    return attendance.then((unattended) => {
+    // hook itself is synchronous, so the read happens here.
+    return enforcedUnattendedState(input.session_id).then((unattended) => {
       const blocked = stopHook(input, 'codex', { unattended }) === true;
       indexTurns(input, 'codex');
       if (blocked) return true;
@@ -221,7 +216,7 @@ function codexHook(kind, input) {
     // Nobody answers a question here, and the attention marker would park the pane in
     // a "Needs you" slot forever. Refuse the tool instead; the dispatcher prints the
     // deny. An unreadable host reads as attended, so the question still goes through.
-    return unattendedState(input && (input.session_id || input.sessionId)).then((state) => {
+    return enforcedUnattendedState(input && (input.session_id || input.sessionId)).then((state) => {
       if (!state.unattended) return codexAttentionMarker(kind, input);
       const error = new KeepError(UNATTENDED_DENY_REASON);
       error.hookDeny = true;
@@ -404,14 +399,10 @@ commands.hook = async (argv) => {
   if (argv[0] === 'stop') {
     // enforcement must never break a session's ability to stop
     try {
-      // Only a session the start hook found unattended can be pushed back, so ask the
-      // pane (in case a console keystroke since then cleared the mark) only then:
-      // Owner's own Stop hook never waits on the host for this.
-      let unattended = { unattended: false };
-      try {
-        const recorded = recordedUnattended(input && input.session_id);
-        if (recorded && recorded.unattended) unattended = await unattendedState(input.session_id);
-      } catch {}
+      // The pane decides, and only the pane; the record is consulted solely to skip a
+      // host round trip for a session it already knows somebody is reading.
+      let unattended = ATTENDED;
+      try { unattended = await enforcedUnattendedState(input && input.session_id); } catch {}
       const blocked = stopHook(input, 'claude', { unattended }) === true;
       if (!blocked) recordClaudeCompletion(input);
     } catch {}
@@ -445,7 +436,7 @@ commands.hook = async (argv) => {
     // Never throws, and any failure allows the question: a hook that could not read
     // the pane must not be the reason a session cannot ask for help.
     try {
-      const state = await unattendedState(input && input.session_id);
+      const state = await enforcedUnattendedState(input && input.session_id);
       if (state.unattended) {
         console.log(JSON.stringify({
           hookSpecificOutput: {
@@ -1731,43 +1722,61 @@ function unattendedContext(agent, description) {
   return lines.join('\n');
 }
 
-// The startup record this session's own pane hook wrote. The only synchronous
-// answer available, and the fallback when the host cannot be reached.
+const ATTENDED = { unattended: false, opener: null };
+
+// The startup record this session's own pane hook wrote, when it wrote one. Usable in
+// one direction only: a record that says attended, or carries no mark at all, lets a
+// hook skip the host round trip below, because under-reporting `unattended` only ever
+// fails open. It is never evidence that a session IS unattended — the mark is cleared
+// on the pane by a console keystroke, and this file would not hear about it.
 function recordedUnattended(sessionId, deps = {}) {
   if (typeof sessionId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(sessionId)) return null;
   const meta = deps.root ? path.join(deps.root, '.keep') : META;
   try {
     const record = JSON.parse(fs.readFileSync(path.join(meta, 'panes', `${sessionId}.json`), 'utf8'));
     if (!record || typeof record !== 'object' || !('unattended' in record)) return null;
-    return { unattended: record.unattended === true, opener: record.opener || null, pane: record.pane || '' };
+    return { unattended: record.unattended === true, opener: record.opener || null };
   } catch { return null; }
 }
 
-// Whether anybody is reading this session. The pane meta is the authority, because a
-// console keystroke clears the mark there; the startup record is the fallback. Fails
-// open in every direction — an unreachable host never makes a session unattended.
+// Whether anybody is reading this session. Only a live read of the pane this session
+// owns can say so, and every other outcome is "attended": an unreachable host, a
+// timeout, a pane that is gone, a pane another session owns, or no KEEP_PANE at all
+// (Owner resumed this session in his own terminal, so he is the one reading it).
+// Refusing a question is enforcement; it may never rest on a file that can go stale.
 async function unattendedState(sessionId, deps = {}) {
-  const recorded = recordedUnattended(sessionId, deps);
+  if (typeof sessionId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(sessionId)) return ATTENDED;
+  const env = deps.env || process.env;
+  const pane = deps.pane || env.KEEP_PANE || '';
+  if (!pane) return ATTENDED;
+  const connectHost = deps.connectHost || require('../hostclient.js').connect;
+  const timeoutMs = deps.timeoutMs == null ? 500 : deps.timeoutMs;
+  let client;
   try {
-    const env = deps.env || process.env;
-    const pane = deps.pane || env.KEEP_PANE || (recorded && recorded.pane) || '';
-    if (pane) {
-      const connectHost = deps.connectHost || require('../hostclient.js').connect;
-      const timeoutMs = deps.timeoutMs == null ? 500 : deps.timeoutMs;
-      let client;
-      try {
-        client = await connectHost({ timeoutMs });
-        const current = await client.request('get', { pane }, { timeoutMs });
-        const paneMeta = current && current.pane && current.pane.meta;
-        // A pane another session owns says nothing about this one.
-        if (paneMeta && (!paneMeta.sessionId || paneMeta.sessionId === sessionId)) {
-          return { unattended: paneMeta.unattended === true, opener: paneMeta.opener || null };
-        }
-      } finally { if (client) client.close(); }
-    }
-  } catch {}
-  if (recorded) return { unattended: recorded.unattended, opener: recorded.opener };
-  return { unattended: false, opener: null };
+    client = await connectHost({ timeoutMs });
+    const current = await client.request('get', { pane }, { timeoutMs });
+    const paneMeta = current && current.pane && current.pane.meta;
+    if (!paneMeta || paneMeta.sessionId !== sessionId || paneMeta.unattended !== true) return ATTENDED;
+    return { unattended: true, opener: paneMeta.opener || null };
+  } catch { return ATTENDED; }
+  finally { if (client) { try { client.close(); } catch {} } }
+}
+
+// Whether to say anything, with the record used only to skip a pointless host call.
+async function enforcedUnattendedState(sessionId, deps = {}) {
+  const recorded = recordedUnattended(sessionId, deps);
+  if (recorded && !recorded.unattended) return ATTENDED;
+  return unattendedState(sessionId, deps);
+}
+
+// At startup the pane hook has just asked the host, so the record it returns IS this
+// run's live read; without one — no KEEP_PANE, a headless run, a host that did not
+// answer — ask directly, and print nothing if that fails too.
+async function startupUnattendedState(sessionId, record) {
+  if (record && typeof record === 'object' && 'unattended' in record) {
+    return { unattended: record.unattended === true, opener: record.opener || null };
+  }
+  return unattendedState(sessionId);
 }
 
 // The startup block, ready to print. The card is what the opener is working on, so
@@ -1777,13 +1786,6 @@ function unattendedStartupContext(sessionId, agent, state) {
   let card = '';
   try { card = (taskForSession(String(sessionId || '')) || {}).id || ''; } catch {}
   return unattendedContext(agent, openerDescription(state.opener, { card }));
-}
-
-async function startupUnattendedState(sessionId, record) {
-  if (record && typeof record === 'object' && 'unattended' in record) {
-    return { unattended: record.unattended === true, opener: record.opener || null };
-  }
-  return unattendedState(sessionId);
 }
 
 async function recordSessionPane(input, agent = 'claude', deps = {}) {
@@ -1799,21 +1801,16 @@ async function recordSessionPane(input, agent = 'claude', deps = {}) {
   const startedAt = (deps.now || Date.now)();
   let at = startedAt;
   let claimed = false;
-  // Whether anybody is reading this session, as the last hook found it. Carried
-  // forward so a host that is momentarily unreachable does not erase a known answer;
-  // the live read below replaces it whenever the pane can be asked.
-  let attendance = null;
   try {
     const prior = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (prior && prior.pane === pane && prior.agent === agent) {
       if (prior.cwd === cwd && Number.isFinite(Number(prior.at))) at = Number(prior.at);
       claimed = prior.claimed === true;
-      if ('unattended' in prior) attendance = { unattended: prior.unattended === true, opener: prior.opener || null };
     }
   } catch {}
   const accountId = /^(?:[a-z0-9][a-z0-9_-]{0,63}|(?:claude|codex)\/default)$/.test(env.KEEP_AGENT_ACCOUNT_ID || '')
     ? env.KEEP_AGENT_ACCOUNT_ID : null;
-  const record = { at, startedAt, cwd, agent, pane, claimed, ...(accountId ? { accountId } : {}), ...(attendance || {}) };
+  const record = { at, startedAt, cwd, agent, pane, claimed, ...(accountId ? { accountId } : {}) };
   fs.mkdirSync(dir, { recursive: true });
   (deps.writePaneRecord || writePaneRecord)(file, record);
   for (const name of fs.readdirSync(dir)) {
@@ -1833,10 +1830,6 @@ async function recordSessionPane(input, agent = 'claude', deps = {}) {
       client = await connectHost({ timeoutMs: deps.timeoutMs == null ? 500 : deps.timeoutMs });
       const current = await client.request('get', { pane }, { timeoutMs });
       const paneMeta = current?.pane?.meta || {};
-      // Whether anybody is reading this session, recorded while the pane is in hand:
-      // the Stop hook has no async read of its own, and this is its only answer.
-      record.unattended = paneMeta.unattended === true;
-      record.opener = paneMeta.opener || null;
       const launchedCodex = agent === 'codex' && paneMeta.openRequestId != null
         && !paneMeta.sessionId && !paneMeta.restartedAt && !paneMeta.handoffTransactionId;
       if (launchedCodex) {
@@ -1878,6 +1871,11 @@ async function recordSessionPane(input, agent = 'claude', deps = {}) {
       }
       await client.request('meta', { pane, patch: { sessionId: sid, agent, project: cwd } }, { timeoutMs });
       record.bound = true;
+      // Whether anybody is reading this session, from the pane this session now owns.
+      // Written only when it was actually read: the Stop hook uses the record to skip
+      // a host round trip, and a remembered `true` would outlive the fact.
+      record.unattended = paneMeta.unattended === true;
+      record.opener = paneMeta.opener || null;
     } catch {
       if (attempt < attempts - 1) await new Promise((resolve) => setTimeout(resolve, deps.retryMs == null ? 400 : deps.retryMs));
     } finally {
@@ -2174,7 +2172,9 @@ function stopHook(input, agent = 'claude', options = {}) {
     // Unless nobody is reading this pane, in which case the handoff strands the work.
     // Say so once — `stop_hook_active` above is why this cannot loop — and only for a
     // real request, not every turn that happens to contain a question mark.
-    const unattended = options.unattended || recordedUnattended(sid) || { unattended: false };
+    // Live pane state, read by the caller: this hook is synchronous, and the pane
+    // record on disk is never enough to refuse anybody.
+    const unattended = options.unattended || ATTENDED;
     if (unattended.unattended === true
         && require('../session-status').proseRequest(transcriptState.lastAssistant)) {
       console.log(JSON.stringify({ decision: 'block', reason: UNATTENDED_STOP_REASON }));
@@ -2253,5 +2253,5 @@ function stopHook(input, agent = 'claude', options = {}) {
 }
 
 module.exports = { commands, codexToolInput, codexExitCode, emptyStopEvidence, looksLikeGitWrite, scanStopEvidence, hasSubstantiveStopEvidence, newestTaskForSession, taskForSession, readCodexParent, redactCommand, deployCommand, deployEntry, stepMatchForInput, guardStepCommand, rawClaudeResume, guardResumeCommand, repairInvocations, repairAllowedCommand, guardRepairCommand, recordStepRun, recordDeploy, writePaneRecord, recordSessionPane, releaseSessionPane, registerReviewerSession, stopHook,
-  openerDescription, unattendedContext, unattendedState, recordedUnattended,
+  openerDescription, unattendedContext, unattendedState, enforcedUnattendedState, recordedUnattended,
   UNATTENDED_DENY_REASON, UNATTENDED_STOP_REASON };

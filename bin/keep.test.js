@@ -11,7 +11,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
-const { spawnSync } = require('node:child_process');
+const net = require('node:net');
+const { spawn, spawnSync } = require('node:child_process');
 const test = require('node:test');
 const {
   emptyStopEvidence,
@@ -1343,8 +1344,52 @@ test('recordSessionPane writes a host-only record and binds both agent kinds to 
 
 const hookInternals = require('./commands/hook.js');
 
-// A session Keep opened for a program, seen from the hooks: the startup record the
-// pane hook would have written had the host answered.
+// Never spawnSync in this block: the fake host below runs in this process, and a
+// blocking spawn would hold the event loop while the hook waits to connect to it.
+function runHookCli(argv, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [path.join(__dirname, 'keep.js'), ...argv], {
+      env: options.env, stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.once('error', reject);
+    child.once('close', (status) => resolve({ status, stdout, stderr }));
+    child.stdin.end(options.input == null ? '' : options.input);
+  });
+}
+
+// A unix-socket terminal host that answers `get` and `meta` the way bin/host.js does.
+// The hooks refuse to take a disk record's word for attendance, so anything that
+// expects a refusal has to let them ask a real socket.
+function hostSocketFixture(sock, panes) {
+  const { encodeFrame, FrameDecoder } = require('./host.js');
+  const server = net.createServer((socket) => {
+    const decoder = new FrameDecoder((frame) => {
+      if (!frame || !frame.id) return;
+      const pane = panes.get(frame.pane) || null;
+      if (frame.type === 'meta' && pane) pane.meta = { ...pane.meta, ...frame.patch };
+      if (frame.type !== 'get' && frame.type !== 'meta') {
+        socket.write(encodeFrame({ ok: false, id: frame.id, error: `unsupported ${frame.type}` }));
+        return;
+      }
+      socket.write(encodeFrame(pane
+        ? { ok: true, id: frame.id, pane: { ...pane, meta: { ...pane.meta } } }
+        : { ok: false, id: frame.id, error: 'no such pane' }));
+    }, () => socket.destroy());
+    socket.on('data', (chunk) => decoder.push(chunk));
+    socket.on('error', () => {});
+  });
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(sock, () => resolve(server));
+  });
+}
+
 function unattendedFixture() {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-unattended-')));
   const project = path.join(root, 'project');
@@ -1355,21 +1400,42 @@ function unattendedFixture() {
     '---', 'title: Sweep the seed queue', 'status: active', 'kind: task',
     `project: ${project}`, 'created: 2026-09-01T09:00', 'updated: 2026-09-01T09:00', '---', '',
   ].join('\n'));
-  const write = (sid, agent, extra) => fs.writeFileSync(path.join(root, '.keep', 'panes', `${sid}.json`),
-    JSON.stringify({ at: Date.now(), startedAt: Date.now(), cwd: project, agent,
-      pane: `pane-${sid}`, claimed: false, bound: true, ...extra }));
+  const sock = path.join(root, 'host.sock');
+  const panes = new Map();
+  let server = null;
+  const recordFile = (sid) => path.join(root, '.keep', 'panes', `${sid}.json`);
   return {
     root,
     project,
-    pane: write,
+    panes,
+    // The pane as the host reports it: what openSession stamped on it at launch.
+    hostPane: (sid, meta = {}) => {
+      const id = `pane-${sid}`;
+      panes.set(id, { id, alive: true, meta: { sessionId: sid, agent: 'claude', project, ...meta } });
+      return id;
+    },
+    startHost: async () => { server = await hostSocketFixture(sock, panes); },
+    stopHost: async () => {
+      if (server) await new Promise((resolve) => server.close(resolve));
+      server = null;
+    },
+    // The startup record on disk. It may only ever make a hook skip the host read.
+    record: (sid, agent, extra = {}) => fs.writeFileSync(recordFile(sid), JSON.stringify({
+      at: Date.now(), startedAt: Date.now(), cwd: project, agent,
+      pane: `pane-${sid}`, claimed: false, bound: true, ...extra,
+    })),
+    readRecord: (sid) => JSON.parse(fs.readFileSync(recordFile(sid), 'utf8')),
     env: (extra = {}) => {
-      const env = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', ...extra };
+      const env = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1', KEEP_HOST_SOCK: sock };
       for (const key of ['KEEP_PANE', 'KEEP_RUN', 'KEEP_REVIEWER', 'CLAUDE_CODE_SESSION_ID',
         'CODEX_THREAD_ID', 'CODEX_SESSION_ID']) delete env[key];
       Object.assign(env, extra);
       return env;
     },
-    cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+    cleanup: async () => {
+      if (server) await new Promise((resolve) => server.close(resolve));
+      fs.rmSync(root, { recursive: true, force: true });
+    },
   };
 }
 
@@ -1391,46 +1457,81 @@ test('the opener reads back as a sentence, whatever kind it is', () => {
   assert.match(unattendedContext('codex', 'the fleet reviewer'), /request_user_input is refused here/);
 });
 
-test('the pane is the authority on attendance, and an unreachable host never invents it', async () => {
-  const { unattendedState } = hookInternals;
+test('attendance comes from the pane this session owns, and from nothing else', async () => {
+  const { unattendedState, enforcedUnattendedState } = hookInternals;
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-attendance-'));
+  const env = { KEEP_PANE: 'pane-1' };
+  const host = (meta) => async () => ({
+    request: async () => ({ pane: { id: 'pane-1', meta } }),
+    close: () => {},
+  });
   try {
     fs.mkdirSync(path.join(root, '.keep', 'panes'), { recursive: true });
-    fs.writeFileSync(path.join(root, '.keep', 'panes', 'sid.json'), JSON.stringify({
-      pane: 'pane-1', agent: 'claude', unattended: true, opener: { kind: 'check', id: 'card' },
-    }));
-    const host = (meta) => async () => ({
-      request: async () => ({ pane: { id: 'pane-1', meta } }),
-      close: () => {},
-    });
-    // Owner typed into the console, so the pane says attended even though the startup
-    // record still says otherwise.
-    assert.deepEqual(await unattendedState('sid', { root, env: {}, connectHost: host({ sessionId: 'sid', unattended: false }) }),
+    const write = (value) => fs.writeFileSync(path.join(root, '.keep', 'panes', 'sid.json'), JSON.stringify(value));
+
+    assert.deepEqual(await unattendedState('sid', { root, env,
+      connectHost: host({ sessionId: 'sid', unattended: true, opener: { kind: 'reviewer' } }) }),
+    { unattended: true, opener: { kind: 'reviewer' } });
+
+    // Owner typed into the console, so the pane is attended whatever the record on
+    // disk still remembers. Enforcement never rests on that file.
+    write({ pane: 'pane-1', agent: 'claude', unattended: true, opener: { kind: 'check', id: 'card' } });
+    assert.deepEqual(await unattendedState('sid', { root, env, connectHost: host({ sessionId: 'sid', unattended: false }) }),
       { unattended: false, opener: null });
-    assert.deepEqual(await unattendedState('sid', { root, env: {}, connectHost: host({ sessionId: 'sid', unattended: true, opener: { kind: 'reviewer' } }) }),
-      { unattended: true, opener: { kind: 'reviewer' } });
-    // A pane another session owns says nothing about this one; the record decides.
-    assert.deepEqual(await unattendedState('sid', { root, env: {}, connectHost: host({ sessionId: 'somebody-else' }) }),
-      { unattended: true, opener: { kind: 'check', id: 'card' } });
-    // An unreachable host falls back to the record, and never to "unattended".
-    const dead = async () => { throw new Error('no host'); };
-    assert.deepEqual(await unattendedState('sid', { root, env: {}, connectHost: dead }),
-      { unattended: true, opener: { kind: 'check', id: 'card' } });
-    assert.deepEqual(await unattendedState('unknown-sid', { root, env: { KEEP_PANE: 'pane-1' }, connectHost: dead }),
+    // A pane another session owns cannot speak for this one, even to refuse it.
+    assert.deepEqual(await unattendedState('sid', { root, env, connectHost: host({ sessionId: 'somebody-else', unattended: true }) }),
       { unattended: false, opener: null });
-    assert.deepEqual(await unattendedState('../etc/passwd', { root, env: {}, connectHost: dead }),
+    // A pane that is gone, a reply with no meta, a timeout, an unreachable host.
+    assert.deepEqual(await unattendedState('sid', { root, env,
+      connectHost: async () => ({ request: async () => ({}), close: () => {} }) }), { unattended: false, opener: null });
+    assert.deepEqual(await unattendedState('sid', { root, env,
+      connectHost: async () => ({ request: async () => { throw new Error('host request timed out (get)'); }, close: () => {} }) }),
+    { unattended: false, opener: null });
+    assert.deepEqual(await unattendedState('sid', { root, env, connectHost: async () => { throw new Error('no host'); } }),
       { unattended: false, opener: null });
+    assert.deepEqual(await unattendedState('../etc/passwd', { root, env, connectHost: host({ unattended: true }) }),
+      { unattended: false, opener: null });
+
+    // Without KEEP_PANE this process is not running in a pane Keep opened — Owner
+    // resumed it in his own terminal — and the host is not even contacted.
+    let asked = false;
+    assert.deepEqual(await unattendedState('sid', { root, env: {},
+      connectHost: async () => { asked = true; throw new Error('never reached'); } }), { unattended: false, opener: null });
+    assert.equal(asked, false, 'the record is never used as the pane to read');
+
+    // The client is closed on the failing path too.
+    let closes = 0;
+    await unattendedState('sid', { root, env,
+      connectHost: async () => ({ request: async () => { throw new Error('boom'); }, close: () => { closes += 1; } }) });
+    assert.equal(closes, 1);
+
+    // The record may skip the host call in one direction only: the one that allows.
+    let connects = 0;
+    const counting = (meta) => async () => {
+      connects += 1;
+      return { request: async () => ({ pane: { id: 'pane-1', meta } }), close: () => {} };
+    };
+    write({ pane: 'pane-1', agent: 'claude', unattended: false });
+    assert.deepEqual(await enforcedUnattendedState('sid', { root, env, connectHost: counting({ sessionId: 'sid', unattended: true }) }),
+      { unattended: false, opener: null });
+    assert.equal(connects, 0, 'a record that says attended saves the round trip');
+    write({ pane: 'pane-1', agent: 'claude', unattended: true });
+    assert.deepEqual(await enforcedUnattendedState('sid', { root, env,
+      connectHost: counting({ sessionId: 'sid', unattended: true, opener: { kind: 'check', id: 'card' } }) }),
+    { unattended: true, opener: { kind: 'check', id: 'card' } });
+    assert.equal(connects, 1, 'and a record that says unattended still has to ask the pane');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test('session-start tells an unattended session so before anything else', () => {
+test('session-start tells an unattended session so before anything else', async () => {
   const f = unattendedFixture();
-  const run = (sid) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'hook', 'session-start'], {
-    encoding: 'utf8', env: f.env(), input: JSON.stringify({ session_id: sid, cwd: f.project }),
+  const run = (sid, pane) => runHookCli(['hook', 'session-start'], {
+    env: f.env({ KEEP_PANE: pane }), input: JSON.stringify({ session_id: sid, cwd: f.project }),
   });
   try {
-    f.pane('unread-session', 'claude', { unattended: true, opener: { kind: 'check', id: 'unread-card' } });
-    const started = run('unread-session');
+    await f.startHost();
+    const pane = f.hostPane('unread-session', { unattended: true, opener: { kind: 'check', id: 'unread-card' } });
+    const started = await run('unread-session', pane);
     assert.equal(started.status, 0, started.stderr);
     assert.ok(started.stdout.startsWith('[keep — unattended session]\n'),
       `the block comes first, got: ${started.stdout.slice(0, 80)}`);
@@ -1440,29 +1541,69 @@ test('session-start tells an unattended session so before anything else', () => 
     // And the registry block still follows it.
     assert.ok(started.stdout.indexOf('[keep — work registry]') > 0);
     assert.match(started.stdout, /unread-card \(active\)/);
+    assert.equal(f.readRecord('unread-session').unattended, true);
 
     // A session Owner opened is told nothing extra.
-    f.pane('owner-session', 'claude', { unattended: false, opener: { kind: 'owner' } });
-    const owner = run('owner-session');
+    const ownerPane = f.hostPane('owner-session', { opener: { kind: 'owner' } });
+    const owner = await run('owner-session', ownerPane);
     assert.equal(owner.status, 0, owner.stderr);
     assert.doesNotMatch(owner.stdout, /unattended session/);
     assert.ok(owner.stdout.startsWith('[keep — work registry]'));
-
-    // No record and no reachable host: nothing is assumed.
-    const unknown = run('no-record-session');
-    assert.equal(unknown.status, 0, unknown.stderr);
-    assert.doesNotMatch(unknown.stdout, /unattended session/);
-  } finally { f.cleanup(); }
+  } finally { await f.cleanup(); }
 });
 
-test('the Codex start hook carries the unattended block in additionalContext', () => {
+test('a console takeover, and a host that cannot be reached, both stop the refusals', async () => {
   const f = unattendedFixture();
-  const run = (sid) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'hook', 'codex', 'start'], {
-    encoding: 'utf8', env: f.env(), input: JSON.stringify({ session_id: sid, cwd: f.project }),
+  const transcript = path.join(f.root, 'session.jsonl');
+  fs.writeFileSync(transcript, [
+    transcriptRecord({ type: 'mode', mode: 'default' }),
+    transcriptRecord({ type: 'assistant', message: { content: [{ type: 'text',
+      text: 'I can land this on master or open a branch. Which do you want?' }] } }),
+  ].join(''));
+  const hook = (kind, sid, pane) => runHookCli(['hook', kind], {
+    env: f.env({ KEEP_PANE: pane }),
+    input: JSON.stringify({ session_id: sid, cwd: f.project, transcript_path: transcript,
+      tool_name: 'AskUserQuestion', tool_input: { questions: [{ question: 'Which option?' }] } }),
   });
   try {
-    f.pane('codex-unread', 'codex', { unattended: true, opener: { kind: 'agent', id: 'delivery-responder' } });
-    const started = run('codex-unread');
+    await f.startHost();
+    // Keep opened it unattended; then Owner typed into the console, which cleared the
+    // pane mark. The startup record still says unattended and must not be believed.
+    const pane = f.hostPane('taken-over', { unattended: false, attendedBy: 'console',
+      opener: { kind: 'check', id: 'unread-card' } });
+    f.record('taken-over', 'claude', { unattended: true, opener: { kind: 'check', id: 'unread-card' } });
+    assert.equal((await hook('pre-question', 'taken-over', pane)).stdout, '', 'his question is asked');
+    assert.equal((await hook('stop', 'taken-over', pane)).stdout, '', 'and his turn ends as it always did');
+    const started = await hook('session-start', 'taken-over', pane);
+    assert.equal(started.status, 0, started.stderr);
+    assert.doesNotMatch(started.stdout, /unattended session/);
+    assert.equal(f.readRecord('taken-over').unattended, false, 'the record is corrected, not carried forward');
+
+    // A host that cannot be reached is not a reason to refuse anybody, however
+    // firmly the last record on disk remembers otherwise.
+    await f.stopHost();
+    f.record('unread-session', 'claude', { unattended: true, opener: { kind: 'check', id: 'unread-card' } });
+    const down = f.hostPane('unread-session', { unattended: true, opener: { kind: 'check', id: 'unread-card' } });
+    assert.equal((await hook('pre-question', 'unread-session', down)).stdout, '');
+    assert.equal((await hook('stop', 'unread-session', down)).stdout, '');
+    const startedDown = await hook('session-start', 'unread-session', down);
+    assert.equal(startedDown.status, 0, startedDown.stderr);
+    assert.doesNotMatch(startedDown.stdout, /unattended session/);
+    assert.equal('unattended' in f.readRecord('unread-session'), false,
+      'and a mark nobody could confirm this run is not written');
+  } finally { await f.cleanup(); }
+});
+
+test('the Codex start hook carries the unattended block in additionalContext', async () => {
+  const f = unattendedFixture();
+  const run = (sid, pane) => runHookCli(['hook', 'codex', 'start'], {
+    env: f.env({ KEEP_PANE: pane }), input: JSON.stringify({ session_id: sid, cwd: f.project }),
+  });
+  try {
+    await f.startHost();
+    const pane = f.hostPane('codex-unread', { agent: 'codex', unattended: true,
+      opener: { kind: 'agent', id: 'delivery-responder' } });
+    const started = await run('codex-unread', pane);
     assert.equal(started.status, 0, started.stderr);
     const context = JSON.parse(started.stdout).hookSpecificOutput;
     assert.equal(context.hookEventName, 'SessionStart');
@@ -1471,23 +1612,24 @@ test('the Codex start hook carries the unattended block in additionalContext', (
     assert.match(context.additionalContext, /request_user_input is refused here/);
     assert.doesNotMatch(context.additionalContext, /AskUserQuestion/);
 
-    f.pane('codex-owned', 'codex', { unattended: false });
-    const owner = run('codex-owned');
+    const ownerPane = f.hostPane('codex-owned', { agent: 'codex' });
+    const owner = await run('codex-owned', ownerPane);
     assert.equal(owner.status, 0, owner.stderr);
     assert.equal(owner.stdout.trim(), '{}');
-  } finally { f.cleanup(); }
+  } finally { await f.cleanup(); }
 });
 
-test('AskUserQuestion is denied in an unattended session and nowhere else', () => {
+test('AskUserQuestion is denied in an unattended session and nowhere else', async () => {
   const f = unattendedFixture();
-  const run = (sid, extra = {}) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'hook', 'pre-question'], {
-    encoding: 'utf8', env: f.env(extra),
+  const run = (sid, pane) => runHookCli(['hook', 'pre-question'], {
+    env: f.env({ KEEP_PANE: pane }),
     input: JSON.stringify({ session_id: sid, cwd: f.project, tool_name: 'AskUserQuestion',
       tool_input: { questions: [{ question: 'Which option?' }] } }),
   });
   try {
-    f.pane('unread-session', 'claude', { unattended: true, opener: { kind: 'check', id: 'unread-card' } });
-    const denied = run('unread-session');
+    await f.startHost();
+    const pane = f.hostPane('unread-session', { unattended: true, opener: { kind: 'check', id: 'unread-card' } });
+    const denied = await run('unread-session', pane);
     assert.equal(denied.status, 0, denied.stderr);
     assert.deepEqual(JSON.parse(denied.stdout), {
       hookSpecificOutput: {
@@ -1498,30 +1640,37 @@ test('AskUserQuestion is denied in an unattended session and nowhere else', () =
     });
     assert.match(hookInternals.UNATTENDED_DENY_REASON, /nobody answers questions here/);
 
-    f.pane('owner-session', 'claude', { unattended: false });
-    const allowed = run('owner-session');
+    const ownerPane = f.hostPane('owner-session', { opener: { kind: 'owner' } });
+    const allowed = await run('owner-session', ownerPane);
     assert.equal(allowed.status, 0, allowed.stderr);
     assert.equal(allowed.stdout, '', 'Owner is asked his question');
 
-    // Fail open: an unreadable pane and an unreachable host must never be the reason
-    // a session cannot ask for help.
-    const unknown = run('no-record-session', { KEEP_PANE: 'pane-gone' });
-    assert.equal(unknown.status, 0, unknown.stderr);
-    assert.equal(unknown.stdout, '');
-  } finally { f.cleanup(); }
+    // Fail open: a pane that is gone, and a session running outside a Keep pane at
+    // all, must never be the reason a session cannot ask for help.
+    const missing = await run('unread-session', 'pane-that-exited');
+    assert.equal(missing.status, 0, missing.stderr);
+    assert.equal(missing.stdout, '');
+    const noPane = await runHookCli(['hook', 'pre-question'], {
+      env: f.env(),
+      input: JSON.stringify({ session_id: 'unread-session', cwd: f.project, tool_name: 'AskUserQuestion' }),
+    });
+    assert.equal(noPane.status, 0, noPane.stderr);
+    assert.equal(noPane.stdout, '');
+  } finally { await f.cleanup(); }
 });
 
-test('the Codex question hook denies in an unattended session instead of parking the pane', () => {
+test('the Codex question hook denies in an unattended session instead of parking the pane', async () => {
   const f = unattendedFixture();
-  const run = (sid) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'hook', 'codex', 'question'], {
-    encoding: 'utf8', env: f.env(),
+  const run = (sid, pane) => runHookCli(['hook', 'codex', 'question'], {
+    env: f.env({ KEEP_PANE: pane }),
     input: JSON.stringify({ session_id: sid, cwd: f.project,
       tool_input: { questions: [{ question: 'Which option?', options: ['A', 'B'] }] } }),
   });
   const marker = (sid) => path.join(f.root, '.keep', 'attention', `${sid}.json`);
   try {
-    f.pane('codex-unread', 'codex', { unattended: true, opener: { kind: 'reviewer' } });
-    const denied = run('codex-unread');
+    await f.startHost();
+    const pane = f.hostPane('codex-unread', { agent: 'codex', unattended: true, opener: { kind: 'reviewer' } });
+    const denied = await run('codex-unread', pane);
     assert.equal(denied.status, 2, denied.stderr);
     const output = JSON.parse(denied.stdout);
     assert.equal(output.decision, 'block');
@@ -1529,18 +1678,18 @@ test('the Codex question hook denies in an unattended session instead of parking
     assert.equal(output.hookSpecificOutput.permissionDecisionReason, hookInternals.UNATTENDED_DENY_REASON);
     assert.equal(fs.existsSync(marker('codex-unread')), false, 'and it never asks for a "Needs you" slot');
 
-    f.pane('codex-owned', 'codex', { unattended: false });
-    const asked = run('codex-owned');
+    const ownerPane = f.hostPane('codex-owned', { agent: 'codex' });
+    const asked = await run('codex-owned', ownerPane);
     assert.equal(asked.status, 0, asked.stderr);
     assert.equal(asked.stdout.trim(), '{}');
     const recorded = JSON.parse(fs.readFileSync(marker('codex-owned'), 'utf8'));
     assert.equal(recorded.type, 'question');
     assert.equal(recorded.message, 'Which option?');
     assert.deepEqual(recorded.options, ['A', 'B']);
-  } finally { f.cleanup(); }
+  } finally { await f.cleanup(); }
 });
 
-test('a final question in an unattended session is pushed back once', () => {
+test('a final question in an unattended session is pushed back once', async () => {
   const f = unattendedFixture();
   const transcript = path.join(f.root, 'session.jsonl');
   fs.writeFileSync(transcript, [
@@ -1554,14 +1703,14 @@ test('a final question in an unattended session is pushed back once', () => {
     transcriptRecord({ type: 'assistant', message: { content: [{ type: 'text',
       text: 'Landed on master and restarted the daemon.' }] } }),
   ].join(''));
-  const run = (sid, extra = {}) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'hook', 'stop'], {
-    encoding: 'utf8', env: f.env(),
-    input: JSON.stringify({ session_id: sid, cwd: f.project, transcript_path: transcript,
-      last_assistant_message: 'I can land this on master or open a branch. Which do you want?', ...extra }),
+  const run = (sid, pane, extra = {}) => runHookCli(['hook', 'stop'], {
+    env: f.env({ KEEP_PANE: pane }),
+    input: JSON.stringify({ session_id: sid, cwd: f.project, transcript_path: transcript, ...extra }),
   });
   try {
-    f.pane('unread-session', 'claude', { unattended: true, opener: { kind: 'check', id: 'unread-card' } });
-    const blocked = run('unread-session');
+    await f.startHost();
+    const pane = f.hostPane('unread-session', { unattended: true, opener: { kind: 'check', id: 'unread-card' } });
+    const blocked = await run('unread-session', pane);
     assert.equal(blocked.status, 0, blocked.stderr);
     const decision = JSON.parse(blocked.stdout);
     assert.equal(decision.decision, 'block');
@@ -1569,49 +1718,48 @@ test('a final question in an unattended session is pushed back once', () => {
     assert.match(decision.reason, /nobody is reading this session/);
 
     // Once per turn: a re-entered Stop hook must not trap the session in a loop.
-    const again = run('unread-session', { stop_hook_active: true });
+    const again = await run('unread-session', pane, { stop_hook_active: true });
     assert.equal(again.status, 0, again.stderr);
     assert.equal(again.stdout, '');
 
     // A statement is not a question, even in an unattended session.
-    const statement = run('unread-session', {
-      transcript_path: statementTranscript,
-      last_assistant_message: 'Landed on master and restarted the daemon.',
-    });
+    const statement = await run('unread-session', pane, { transcript_path: statementTranscript });
     assert.equal(statement.status, 0, statement.stderr);
     assert.equal(statement.stdout, '');
 
     // And Owner's own session keeps today's behaviour: the pane is his inbox.
-    f.pane('owner-session', 'claude', { unattended: false });
-    const owner = run('owner-session');
+    const ownerPane = f.hostPane('owner-session', { opener: { kind: 'owner' } });
+    const owner = await run('owner-session', ownerPane);
     assert.equal(owner.status, 0, owner.stderr);
     assert.equal(owner.stdout, '');
-  } finally { f.cleanup(); }
+  } finally { await f.cleanup(); }
 });
 
-test('the Codex Stop hook pushes the same question back, through the same policy', () => {
+test('the Codex Stop hook pushes the same question back, through the same policy', async () => {
   const f = unattendedFixture();
   const transcript = path.join(f.root, 'codex.jsonl');
   const row = (type, payload) => JSON.stringify({ type, payload, timestamp: new Date().toISOString() }) + '\n';
   const rollout = (sid) => row('session_meta', { id: sid, source: 'cli', originator: 'codex-tui' })
     + row('event_msg', { type: 'user_message', message: 'Continue the work.' })
     + row('event_msg', { type: 'agent_message', message: 'I can land this or open a branch. Which do you want?' });
-  const run = (sid, extra = {}) => spawnSync(process.execPath, [path.join(__dirname, 'keep.js'), 'hook', 'codex', 'stop'], {
-    encoding: 'utf8', env: f.env(),
+  const run = (sid, pane, extra = {}) => runHookCli(['hook', 'codex', 'stop'], {
+    env: f.env({ KEEP_PANE: pane }),
     input: JSON.stringify({ session_id: sid, cwd: f.project, transcript_path: transcript, ...extra }),
   });
   try {
-    f.pane('codex-unread', 'codex', { unattended: true, opener: { kind: 'agent', id: 'delivery-responder' } });
+    await f.startHost();
+    const pane = f.hostPane('codex-unread', { agent: 'codex', unattended: true,
+      opener: { kind: 'agent', id: 'delivery-responder' } });
     fs.writeFileSync(transcript, rollout('codex-unread'));
-    const blocked = run('codex-unread');
+    const blocked = await run('codex-unread', pane);
     assert.equal(blocked.status, 0, blocked.stderr);
     assert.equal(JSON.parse(blocked.stdout).reason, hookInternals.UNATTENDED_STOP_REASON);
-    assert.deepEqual(JSON.parse(run('codex-unread', { stop_hook_active: true }).stdout), {});
+    assert.deepEqual(JSON.parse((await run('codex-unread', pane, { stop_hook_active: true })).stdout), {});
 
-    f.pane('codex-owned', 'codex', { unattended: false });
+    const ownerPane = f.hostPane('codex-owned', { agent: 'codex' });
     fs.writeFileSync(transcript, rollout('codex-owned'));
-    assert.deepEqual(JSON.parse(run('codex-owned').stdout), {});
-  } finally { f.cleanup(); }
+    assert.deepEqual(JSON.parse((await run('codex-owned', ownerPane)).stdout), {});
+  } finally { await f.cleanup(); }
 });
 
 test('Codex SessionStart pins a daemon-launched session only after exact pane and account verification', async () => {
