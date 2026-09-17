@@ -5009,7 +5009,8 @@ const RECOVERY_SESSION = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
 // `screenFor(read)` answers each screen request with the whole pane, as a string or as
 // `{ text, cursorY }`; the host below narrows it to the rows that were asked for, the
 // way a real pane does.
-function recoveryHarness({ text = MESSAGE, kind = 'claude', screenFor, onEnter, confirmationLines }) {
+function recoveryHarness({ text = MESSAGE, kind = 'claude', screenFor, onEnter,
+  loadDeliverySession = (id) => ({ id, endedTurn: true }) }) {
   const delivery = require('./delivery');
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-draft-recovery-'));
   const directory = path.join(base, 'delivery');
@@ -5039,9 +5040,9 @@ function recoveryHarness({ text = MESSAGE, kind = 'claude', screenFor, onEnter, 
       requested.push(want);
       // renderScreen (bin/host.js) returns the last N rows of the viewport but reports
       // `cursor` against the viewport rather than against the rows it returned, so
-      // cursor.y indexes the whole pane whether or not the read was narrowed. Only
-      // draftMatches looks at it, and it asks for 200 rows — the whole viewport of any
-      // real pane — which is why that one number stays where it is.
+      // cursor.y indexes the whole pane whether or not the read was narrowed. Both
+      // reads on this path ask for 200 rows — the whole viewport of any real pane —
+      // which is what lets the cursor line up and lets the two reads be compared.
       return {
         text: lines.slice(Math.max(0, lines.length - want)).join('\n'),
         cursor: { x: 2, y: screen.cursorY }, cols: 80, rows: lines.length,
@@ -5059,9 +5060,8 @@ function recoveryHarness({ text = MESSAGE, kind = 'claude', screenFor, onEnter, 
     send: () => sendToResolvedTarget({ id: RECOVERY_SESSION, kind }, { pane: 'pane-recovery' },
       text, undefined, {
         host, deliveryDirectory: directory,
-        ...(confirmationLines === undefined ? {} : { confirmationLines }),
         transcriptFileForSession: () => file,
-        loadDeliverySession: () => ({ id: RECOVERY_SESSION, endedTurn: true }),
+        loadDeliverySession: (id) => loadDeliverySession(id),
       }),
   };
 }
@@ -5077,9 +5077,9 @@ test('a recovered draft is submitted once, and only while the box still holds ex
     assert.deepEqual(await clean.send(), { ok: true, delivery: 'received' });
     assert.deepEqual(clean.inputs, ['\r'], 'the draft is submitted, never retyped');
     assert.equal(fs.existsSync(clean.journal), false, 'and the pending attempt is finished');
-    // The cursor check needs the whole viewport; the check before Enter needs a short
-    // read, for the reasons the two tests below pin down.
-    assert.deepEqual(clean.requested, [200, 30]);
+    // The same read on both sides, so the same parse with the same quirks is being
+    // compared against itself. The tests below are what that buys.
+    assert.deepEqual(clean.requested, [200, 200]);
   } finally { fs.rmSync(clean.base, { recursive: true, force: true }); }
 
   // Owner typed into the same box between the draft check and Enter. Submitting now
@@ -5130,49 +5130,50 @@ test("Owner's line below a blank one stops a recovered draft too", async () => {
   } finally { fs.rmSync(buried.base, { recursive: true, force: true }); }
 });
 
-// Both of these are unchanged drafts that a 200-row read refuses, because reading the
-// whole viewport drags a finished turn into the parse. The check before Enter takes the
-// same short read typeAndSubmit does, which is what keeps them deliverable — each test
-// asks for the tall read too, so it is the read size that is on trial and not the
-// screen.
+// What follows are unchanged drafts that the box parser reads wrongly, and reads
+// wrongly whatever the read is: the reviewer reproduced both with the offending output
+// eight rows above the draft. Shortening the read only moved the boundary. So the
+// parser is never asked what the box says, only whether it says what it said when
+// draftMatches accepted it — same 200 rows, same parse, same quirks on both sides. The
+// misparse is then harmless, because it is compared against itself.
 
 test('an earlier Codex prompt glyph up the pane does not refuse an unchanged draft', async () => {
   // A Codex composer has no closing rule, so draftRegionLines finds the box from the
   // last glyph on screen and then walks up looking for a rule to stop at. Codex never
-  // draws one, so given the whole viewport it runs past the output of the previous turn
-  // and takes that turn's echoed glyph as the first line of the current draft.
+  // draws one, so it runs past the output of the previous turn and takes that turn's
+  // echoed glyph as the first line of the current draft — eight rows up or thirty-five,
+  // it makes no difference.
   const DRAFT = 'hello';
-  const PANE = [
+  const pane = (rows) => [
     '› instruction',
-    ...Array.from({ length: 35 }, (_, index) => `  output line ${index + 1}`),
+    ...Array.from({ length: rows }, (_, index) => `  output line ${index + 1}`),
     `› ${DRAFT}`,
     '',
     '  ⏎ send   ⌃C quit',
   ].join('\n');
-  const codex = (confirmationLines) => recoveryHarness({
-    text: DRAFT, kind: 'codex', confirmationLines,
-    screenFor: () => ({ text: PANE, cursorY: 36 }),
-    onEnter: (_file, receipt) => receipt(),
-  });
 
-  const short = codex(undefined);
-  try {
-    assert.deepEqual(await short.send(), { ok: true, delivery: 'received' });
-    assert.deepEqual(short.inputs, ['\r'], 'the unchanged draft is submitted exactly once');
-    assert.deepEqual(short.requested, [200, 30]);
-  } finally { fs.rmSync(short.base, { recursive: true, force: true }); }
-
-  const tall = codex(200);
-  try {
-    await assert.rejects(tall.send(), /the recovered draft changed before Enter/);
-    assert.deepEqual(tall.inputs, [], 'which is what the whole viewport used to do to it');
-  } finally { fs.rmSync(tall.base, { recursive: true, force: true }); }
+  for (const rows of [8, 35]) {
+    // The box parser really does misread this pane; the point is that it misreads it
+    // identically twice.
+    const { draftRegionText } = require('./serve');
+    assert.match(draftRegionText(pane(rows), 'codex'), /^instruction/, `${rows} rows: the parse is wrong`);
+    const harness = recoveryHarness({
+      text: DRAFT, kind: 'codex',
+      screenFor: () => ({ text: pane(rows), cursorY: rows + 1 }),
+      onEnter: (_file, receipt) => receipt(),
+    });
+    try {
+      assert.deepEqual(await harness.send(), { ok: true, delivery: 'received' }, `${rows} rows`);
+      assert.deepEqual(harness.inputs, ['\r'], `${rows} rows: submitted exactly once`);
+      assert.deepEqual(harness.requested, [200, 200], `${rows} rows`);
+    } finally { fs.rmSync(harness.base, { recursive: true, force: true }); }
+  }
 });
 
 test('a long line up the pane does not skew the wrap width of an unchanged draft', async () => {
   // draftRegionText rejoins a line the pane cut mid-word by taking the widest line on
   // screen as the pane's width: a line that reached it was cut rather than ended. One
-  // line of decomposed accents is 60 columns wide and 120 code units long, so measuring
+  // line of decomposed accents is 60 columns wide but 120 code units long, so measuring
   // it makes an 80-column pane look 120 wide — and the draft's own wrapped line, at 80,
   // then reads as a line that ended, so the word is rejoined with a space in it.
   const COLS = 80;
@@ -5180,31 +5181,100 @@ test('a long line up the pane does not skew the wrap width of an unchanged draft
   const TAIL = 'suite-again';
   const DRAFT = HEAD + TAIL;
   assert.equal(`❯ ${HEAD}`.length, COLS, 'the first rendered line fills the pane');
+  // Written as an escape on purpose: the precomposed spelling is one code unit and
+  // would not reproduce the skew at all.
   const ACCENTS = 'é'.repeat(60);
-  assert.equal(ACCENTS.length, 120);
-  const PANE = [
+  assert.equal(ACCENTS.length, 120, 'decomposed: 60 columns, 120 code units');
+  const pane = (rows) => [
     ACCENTS,
-    ...Array.from({ length: 34 }, (_, index) => `  transcript line ${index + 1}`),
+    ...Array.from({ length: rows }, (_, index) => `  transcript line ${index + 1}`),
     '─'.repeat(COLS), `❯ ${HEAD}`, TAIL, '─'.repeat(COLS), '? for shortcuts',
   ].join('\n');
-  const claude = (confirmationLines) => recoveryHarness({
-    text: DRAFT, confirmationLines,
-    screenFor: () => ({ text: PANE, cursorY: 36 }),
+
+  for (const rows of [8, 34]) {
+    const { draftRegionText } = require('./serve');
+    assert.equal(draftRegionText(pane(rows), 'claude'), `${HEAD} ${TAIL}`,
+      `${rows} rows: the parse really does insert a space mid-word`);
+    const harness = recoveryHarness({
+      text: DRAFT,
+      screenFor: () => ({ text: pane(rows), cursorY: rows + 2 }),
+      onEnter: (_file, receipt) => receipt(),
+    });
+    try {
+      assert.deepEqual(await harness.send(), { ok: true, delivery: 'received' }, `${rows} rows`);
+      assert.deepEqual(harness.inputs, ['\r'], `${rows} rows: submitted exactly once`);
+      assert.deepEqual(harness.requested, [200, 200], `${rows} rows`);
+    } finally { fs.rmSync(harness.base, { recursive: true, force: true }); }
+  }
+});
+
+test('a pane whose box cannot be parsed at all is compared raw, and strictly', async () => {
+  // The bottom rule has no glyph between it and the rule above it, so draftRegionLines
+  // gives up and returns null. exactDraft still finds the draft, so recovery is still
+  // on the table — and with no box to key on, the whole screen is the key.
+  const DRAFT = 'hello';
+  const pane = (tail) => [`❯ ${DRAFT}`, '─'.repeat(46), tail, '─'.repeat(46)].join('\n');
+  const { draftRegionText } = require('./serve');
+  assert.equal(draftRegionText(pane('some output'), 'claude'), null, 'no box to read');
+
+  const same = recoveryHarness({
+    text: DRAFT,
+    screenFor: () => ({ text: pane('some output'), cursorY: 0 }),
     onEnter: (_file, receipt) => receipt(),
   });
-
-  const short = claude(undefined);
   try {
-    assert.deepEqual(await short.send(), { ok: true, delivery: 'received' });
-    assert.deepEqual(short.inputs, ['\r'], 'the unchanged draft is submitted exactly once');
-    assert.deepEqual(short.requested, [200, 30]);
-  } finally { fs.rmSync(short.base, { recursive: true, force: true }); }
+    assert.deepEqual(await same.send(), { ok: true, delivery: 'received' });
+    assert.deepEqual(same.inputs, ['\r'], 'an unchanged screen is still an unchanged draft');
+  } finally { fs.rmSync(same.base, { recursive: true, force: true }); }
 
-  const tall = claude(200);
+  // Without a box, anything at all on screen is part of the key — including output that
+  // has nothing to do with the draft. That is the conservative reading on purpose: a
+  // pane that is still printing is not one to press Enter in blind.
+  const moved = recoveryHarness({
+    text: DRAFT,
+    screenFor: (read) => ({ text: pane(read === 1 ? 'some output' : 'some more output'), cursorY: 0 }),
+    onEnter: (_file, receipt) => receipt(),
+  });
   try {
-    await assert.rejects(tall.send(), /the recovered draft changed before Enter/);
-    assert.deepEqual(tall.inputs, [], 'which is what the whole viewport used to do to it');
-  } finally { fs.rmSync(tall.base, { recursive: true, force: true }); }
+    const error = await moved.send().then(() => null, (e) => e);
+    assert.equal(error.status, 409);
+    assert.match(error.message, /the recovered draft changed before Enter/);
+    assert.deepEqual(moved.inputs, [], 'Enter is never pressed on a screen that moved');
+    assert.equal(error.typingStarted, false);
+  } finally { fs.rmSync(moved.base, { recursive: true, force: true }); }
+});
+
+test('a draft the first read would not accept is never submitted by the second', async () => {
+  // draftMatches refusing is what leaves matchedBox null, and submitDraft treats null
+  // as "nothing was ever accepted" rather than as "nothing has changed". Recovery is
+  // not attempted at all, so this surfaces as the unconfirmed-journal refusal, and no
+  // key is pressed.
+  const cursorOutside = recoveryHarness({
+    // The cursor sits above the input box, so the box is on screen but is not where
+    // Owner is typing: draftMatches will not call that draft present.
+    screenFor: () => ({ text: BOX(MESSAGE), cursorY: 0 }),
+    onEnter: () => assert.fail('nothing may be pressed'),
+  });
+  try {
+    const error = await cursorOutside.send().then(() => null, (e) => e);
+    assert.match(error.message, /Previous delivery is unconfirmed; no message was retyped/);
+    assert.deepEqual(cursorOutside.inputs, []);
+    assert.deepEqual(cursorOutside.requested, [200], 'submitDraft is never reached');
+    assert.equal(error.typingStarted, false);
+    assert.equal(fs.existsSync(cursorOutside.journal), true, 'and the journal is left alone');
+  } finally { fs.rmSync(cursorOutside.base, { recursive: true, force: true }); }
+
+  // A session that is mid-turn is the same answer by a different route.
+  const midTurn = recoveryHarness({
+    screenFor: () => BOX(MESSAGE),
+    loadDeliverySession: (id) => ({ id, endedTurn: false }),
+    onEnter: () => assert.fail('nothing may be pressed'),
+  });
+  try {
+    await assert.rejects(midTurn.send(), /Previous delivery is unconfirmed/);
+    assert.deepEqual(midTurn.inputs, []);
+    assert.deepEqual(midTurn.requested, [], 'the screen is not even read');
+  } finally { fs.rmSync(midTurn.base, { recursive: true, force: true }); }
 });
 
 test('the draft region is the whole input box, however it is rendered', () => {

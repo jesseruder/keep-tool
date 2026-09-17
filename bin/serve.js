@@ -4950,6 +4950,13 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
   }
   };
   const confirmation = session.kind === 'codex' ? codexTypedTextVisible : claudeTypedTextVisible;
+  // What the input box held when draftMatches accepted it, for submitDraft to compare
+  // against. The box parser's text when it finds a box, the raw screen when it does not.
+  let matchedBox = null;
+  const boxKey = (screenText) => {
+    const box = draftRegionText(screenText, session.kind);
+    return box === null ? `raw:${String(screenText || '')}` : `box:${box}`;
+  };
   try {
     // Claude does not transcript /mcp. A previously submitted command can be
     // recovered only while its native menu is still positively identified.
@@ -4967,16 +4974,20 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
       submitDraft: async () => {
         if (opts?.beforeType) await opts.beforeType();
         // draftMatches() ran before that await, and every millisecond since is one in
-        // which Owner can have typed into the box. Read it again, as typeAndSubmit does
-        // before its own Enter, and leave a mixed draft alone rather than submit it.
-        // The same short read typeAndSubmit takes before its own Enter. A taller one
-        // drags older output into the parse: an earlier Codex prompt glyph reads as the
-        // start of the box, and a long line far above skews the inferred wrap width,
-        // and either refuses a draft that has not changed.
-        const screen = await readScreenResult(target, deps.confirmationLines === undefined ? 30 : deps.confirmationLines, false, deps);
-        // draftIsExactly, not exactDraft: the latter stops at the first blank line, so
-        // a line Owner added below one would be invisible to it.
-        if (!draftIsExactly(screen.text, text, session.kind)) {
+        // which Owner can have typed into the box. Read it again and leave a mixed
+        // draft alone rather than submit it.
+        //
+        // Two questions, because neither parser answers both. exactDraft says the
+        // message is still there, but stops at the first blank line, so a line Owner
+        // added below one is invisible to it. The box parser sees the whole box, but
+        // guesses where it starts and how wide the pane is from whatever else is on
+        // screen — an earlier Codex prompt, a long line of output — and would refuse a
+        // draft nobody touched. So it is not asked what the box says, only whether it
+        // says what it said when draftMatches looked: the same read, the same parse,
+        // the same quirks on both sides, on a session that is idle and printing nothing.
+        const screen = await readScreenResult(target, 200, false, deps);
+        const unchanged = matchedBox !== null && boxKey(screen.text) === matchedBox;
+        if (!unchanged || !exactDraft(screen.text, text, session.kind)) {
           trace('draft-changed-before-enter');
           throw new InjectionError(409, 'the recovered draft changed before Enter; Enter was not pressed');
         }
@@ -5000,6 +5011,7 @@ async function sendToResolvedTarget(session, target, text, opts, deps = {}) {
         const cursorInPrompt = Number.isFinite(screen.cursor?.y) && screen.cursor.y >= start && screen.cursor.y <= end;
         const matched = exactDraft(screen.text, text, session.kind);
         trace('draft-screen-check', { cursorInPrompt, matched });
+        matchedBox = cursorInPrompt && matched ? boxKey(screen.text) : null;
         return cursorInPrompt && matched;
       },
     });
