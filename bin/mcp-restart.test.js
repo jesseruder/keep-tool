@@ -189,3 +189,43 @@ test('orphan detection follows captured identity after reparenting, never kills 
   assert.equal(gone([helper], [{ ...helper, pidStart: 'new' }]), true);
   assert.equal(gone([helper], []), true);
 });
+test('an npx-declared server is admitted under the npm exec title npm rewrote over it', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-mcp-npx-'));
+  try {
+    const cwd = path.join(root, 'project');
+    fs.mkdirSync(cwd);
+    const declare = (args) => fs.writeFileSync(path.join(cwd, '.mcp.json'), JSON.stringify({ mcpServers: {
+      playwright: { command: 'npx', args } } }));
+    declare(['@playwright/mcp@latest', '--headless']);
+    const parent = { pid: 1, args: '/test/claude' };
+    // The npx bin splices `exec` into argv and npm overwrites its own title with
+    // `npm` plus the positional arguments, so this is the row the session leaves.
+    const title = { pid: 2, ppid: 1, pidStart: 'launcher', args: 'npm exec @playwright/mcp@latest --headless' };
+    const server = { pid: 3, ppid: 2, pidStart: 'server',
+      args: `/opt/node/bin/node ${path.join(root, '.npm', '_npx', 'abc123', 'node_modules', '.bin', 'playwright-mcp')} --headless` };
+    const check = (rows) => inspect({ root, agent: 'claude', sessionId: 'session-1', parent, rows, cwd });
+    const helpers = check([parent, title, server]);
+    assert.deepEqual(helpers.map((h) => h.pid), [2, 3], 'the title row and the real server under it are one helper unit');
+    assert.ok(helpers.every((h) => h.pidStart), 'every process in the unit carries a start time');
+    assert.throws(() => check([parent, title, { ...server, pidStart: null }]), /background/,
+      'the child under the matched title still needs a captured identity');
+    // Fetch-only options in front of the package are gone from the title, so they are
+    // stripped from the declaration too.
+    declare(['-y', '@playwright/mcp@latest', '--headless']);
+    assert.deepEqual(check([parent, title, server]).map((h) => h.pid), [2, 3], '-y before the package is stripped');
+    declare(['--yes', '--prefer-offline', '--', '@playwright/mcp@latest', '--headless']);
+    assert.deepEqual(check([parent, title, server]).map((h) => h.pid), [2, 3], 'the npx option separator is stripped once');
+    // These decide what actually runs, so the title no longer says what was declared.
+    declare(['--package', 'foo', '@playwright/mcp@latest', '--headless']);
+    assert.throws(() => check([parent, title, server]), /background/, '--package changes what runs and is not stripped');
+    declare(['-c', 'playwright-mcp']);
+    assert.throws(() => check([parent, title, server]), /background/, '--call is not stripped either');
+    declare(['-y']);
+    assert.throws(() => check([parent, title, server]), /background/, 'options alone declare no package');
+    declare(['@playwright/mcp@1.2.3', '--headless']);
+    assert.throws(() => check([parent, title, server]), /background/, 'a different package is a different declaration');
+    declare(['@playwright/mcp@latest', '--headless']);
+    assert.throws(() => check([parent, { ...title, args: '/usr/local/bin/npm exec @playwright/mcp@latest --headless' }, server]),
+      /background/, 'the title npm writes is the bare word npm, never a path');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

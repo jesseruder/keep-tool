@@ -35,6 +35,24 @@ absolute (`node /opt/node/bin/npm exec …`). The env path must be the real
 either shape has no interpreter-expanded form at all, so `/bin/sh /path/server` is
 refused.
 
+A fourth form exists for one declared command only, because one declared command is
+never visible as itself. A server declared `{"command": "npx", "args":
+["@playwright/mcp@latest", "--headless"]}` runs as the row `npm exec
+@playwright/mcp@latest --headless`: the `npx` bin splices `exec` into argv and npm
+then overwrites `process.title` with `npm` joined to the positional arguments. Without
+this form the helper audit refused every session with an npx-declared server, and the
+session could not be restarted at all. So a declaration whose command basename is
+`npx` also matches the tokens `npm`, `exec`, then its own arguments with leading npx
+options stripped — `-y`, `--yes`, `-q`, `--quiet`, `--no-install`, `--prefer-online`,
+`--prefer-offline` and one `--`, all of which change only how the package is fetched.
+Any other leading dash token (`-p`/`--package`, `-c`/`--call`) changes what actually
+runs, so it refuses instead, as does an empty remainder. The first token must be the
+bare word `npm`, because that is literally what npm wrote into its title; a real
+`/usr/local/bin/npm exec …` argv is a launcher row and is matched, or not, by the
+rules above. Note that npm redacts credentials out of the arguments before joining
+them, so a declaration carrying a credentialed URL cannot be reconstructed from the
+row, does not match this form, and stays on the audit-pin path.
+
 What a match asserts is that the row, joined with single spaces, is the declared
 invocation. It cannot assert where the live process put its argument boundaries: `ps`
 joins argv with spaces, so one element containing a space reads exactly like two.

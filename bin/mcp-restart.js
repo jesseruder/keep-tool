@@ -12,6 +12,15 @@
 // already start for itself. Audit pins remain for helpers that appear in no
 // declaration.
 //
+// One declared form never appears in the process list as it was written: `npx`. The
+// npx bin rewrites its own argv to `npm exec …` and npm then overwrites process.title
+// with `npm` plus the positional arguments, so the live row for an npx-declared server
+// reads `npm exec <package> <args>`, and matching only the declared spelling refused
+// every session that had one. That title is matched here. npm builds it by redacting
+// secrets out of those positional arguments, so a declaration whose arguments carry a
+// credentialed URL cannot be reconstructed from the row and does not match this form:
+// such a server stays on the audit-pin path.
+//
 // Residual, deliberately not closed here: a helper unit is a snapshot of the process
 // tree. A descendant a declared launcher spawns after the snapshot is not waited for;
 // it is orphaned when the agent exits, and the resumed session launches its servers
@@ -139,6 +148,24 @@ function shebangSpec(file) {
   } catch { return null; } finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch {} } }
 }
 function realpath(file) { try { return fs.realpathSync(file); } catch { return null; } }
+// npx options that only change how the package is fetched, so stripping them leaves
+// the same program running. Anything else in front of the package — -p/--package,
+// -c/--call — changes what actually runs and is not stripped: no match.
+const NPX_LEADING_OPTIONS = new Set(['-y', '--yes', '-q', '--quiet', '--no-install', '--prefer-online', '--prefer-offline']);
+// The tail npm's process title carries for a server declared as `npx <args>`, or null
+// when this declaration has no such form. The `npx` bin splices `exec` into argv and
+// npm sets its title from the positional arguments only, so the declared npx options
+// are gone from the row and the package and its arguments remain.
+function npxTitleTail(entry) {
+  if (path.basename(entry.command) !== 'npx') return null;
+  const args = [...entry.args];
+  while (args.length && args[0].startsWith('-')) {
+    const option = args.shift();
+    if (option === '--') break; // the one separator npm drops; what follows is positional
+    if (!NPX_LEADING_OPTIONS.has(option)) return null;
+  }
+  return args.length ? args.join(' ') : null;
+}
 // Interpreters are compared by resolved file, never by name: python and python3 in
 // one virtualenv are the same binary, and /elsewhere/python3 is not.
 function sameInterpreter(left, right) {
@@ -157,8 +184,9 @@ function launcherMatch(command, value) {
 }
 // What a match asserts: the row, joined with single spaces, is the declared
 // invocation — either literally, or with the declared command spelled as the absolute
-// path PATH resolved it to, or with the interpreter the launcher's own first line
-// asks for in front. What it cannot assert is where the live process put its argument
+// path PATH resolved it to, with the interpreter the launcher's own first line asks
+// for in front, or — for an `npx` declaration alone — as the `npm exec …` title npm
+// rewrote over it. What it cannot assert is where the live process put its argument
 // boundaries: ps joins argv with spaces, so one element containing a space reads
 // exactly like two. Declarations carrying whitespace are dropped, which settles the
 // declared side only. A bare declared command likewise matches that basename at any
@@ -172,6 +200,15 @@ function declaredMatch(child, entry) {
   if (tokens.some(value => value === '')) return false;
   // PATH-resolved launcher: /abs/npm exec @playwright/mcp@latest --headless.
   if (launcherMatch(entry.command, tokens[0]) && tokens.slice(1).join(' ') === tail) return true;
+  // npm's rewritten process title. An `npx`-declared server never runs under a row
+  // that says npx: the npx bin splices `exec` into argv and npm then overwrites its
+  // own title with `npm` plus the positional arguments. So `npx @playwright/mcp@latest
+  // --headless` is live as `npm exec @playwright/mcp@latest --headless`. The title is
+  // the literal word `npm` that npm wrote, never a path, so only the bare token is
+  // accepted here; a real `/usr/local/bin/npm exec …` argv goes through the launcher
+  // rules above like any other row.
+  const npxTail = npxTitleTail(entry);
+  if (npxTail && tokens[0] === 'npm' && tokens[1] === 'exec' && tokens.slice(2).join(' ') === npxTail) return true;
   // Interpreter-expanded launcher. The interpreter is not free: it must be the one
   // the launcher's shebang names, resolved to the same file, or — for `#!/usr/bin/env
   // NAME` — a command of that name. `/bin/sh /path/server` is a different program.
