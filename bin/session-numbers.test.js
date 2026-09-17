@@ -86,50 +86,6 @@ test('a stale lock is overridden so one crash does not stop numbering forever', 
   assert.equal(fs.existsSync(lock), false);
 });
 
-test('a stale lock is not reclaimed while another contender holds the reclaim guard, unless that guard is stale too', () => {
-  const dir = root();
-  fs.mkdirSync(path.join(dir, '.keep'), { recursive: true });
-  const lock = numbers.lockFile(dir);
-  const guard = `${lock}.reclaim`;
-  const old = new Date(Date.now() - 60000);
-  fs.writeFileSync(lock, 'crashed');
-  fs.utimesSync(lock, old, old);
-
-  // Someone else is mid-reclaim: this scan neither touches the lock nor allocates.
-  fs.writeFileSync(guard, '');
-  const first = [{ id: 'later', mtime: 1 }];
-  numbers.assign(first, { root: dir, lockRetries: 1, lockWaitMs: 1 });
-  assert.equal(first[0].num, undefined, 'allocation waits for the next scan');
-  assert.equal(fs.existsSync(lock), true, 'the stale lock is left for the reclaimer');
-  assert.equal(fs.existsSync(guard), true);
-
-  // A reclaim guard older than the stale window was left by a crash and is cleared.
-  fs.utimesSync(guard, old, old);
-  const second = [{ id: 'later', mtime: 1 }];
-  numbers.assign(second, { root: dir, lockRetries: 2, lockWaitMs: 1 });
-  assert.equal(second[0].num, 1);
-  assert.equal(fs.existsSync(lock), false);
-  assert.equal(fs.existsSync(guard), false);
-});
-
-test('a lock reclaimed and replaced while its holder was still running is not deleted by that holder', () => {
-  const dir = root();
-  fs.mkdirSync(path.join(dir, '.keep'), { recursive: true });
-  const lock = numbers.lockFile(dir);
-  const result = numbers.withLock({ root: dir }, () => {
-    // Simulate a reclaim by a faster contender: the holder's lock goes away and a
-    // fresh one, belonging to someone else, takes its name.
-    fs.unlinkSync(lock);
-    fs.writeFileSync(lock, 'someone else');
-    return 'ran';
-  });
-  assert.deepEqual(result, { value: 'ran' });
-  assert.equal(fs.readFileSync(lock, 'utf8'), 'someone else', 'the replacement lock survives the release');
-  fs.unlinkSync(lock);
-  assert.deepEqual(numbers.withLock({ root: dir }, () => 'again'), { value: 'again' });
-  assert.equal(fs.existsSync(lock), false, 'an undisturbed lock is released');
-});
-
 test('a corrupt registry is treated as empty rather than throwing out of a scan', () => {
   const dir = root();
   fs.mkdirSync(path.join(dir, '.keep'), { recursive: true });

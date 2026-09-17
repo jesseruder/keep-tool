@@ -2310,7 +2310,7 @@ test('keep rename does not write the registry itself when the daemon may have ta
       postKeepApi: async () => { throw new Error('timed out'); },
     }), /keep serve did not answer \(timed out\)/);
     assert.equal(sessionNames.lookup('sess-a', { root }), null);
-    assert.equal(fs.existsSync(sessionNames.registryFile(root)), false);
+    assert.equal(fs.existsSync(sessionNames.nameFile(root, 'sess-a')), false);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

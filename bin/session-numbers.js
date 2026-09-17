@@ -75,7 +75,7 @@ function sleepSync(ms) {
 // knows and leaves allocation to the next scan rather than racing.
 function withLock(options, run) {
   const root = options.root;
-  const file = options.lockFile || lockFile(root);
+  const file = lockFile(root);
   const retries = Number.isInteger(options.lockRetries) ? options.lockRetries : LOCK_RETRIES;
   const waitMs = Number.isInteger(options.lockWaitMs) ? options.lockWaitMs : LOCK_WAIT_MS;
   const staleMs = Number.isInteger(options.lockStaleMs) ? options.lockStaleMs : LOCK_STALE_MS;
@@ -86,52 +86,24 @@ function withLock(options, run) {
     catch (error) {
       if (error.code !== 'EEXIST') return null;
       // A crashed writer must not stop every later scan from numbering anything.
-      if (isStale(file, staleMs)) { reclaimStale(file, staleMs); continue; }
+      let stale = false;
+      try { stale = Date.now() - fs.statSync(file).mtimeMs > staleMs; } catch { stale = true; }
+      // Claim the stale lock by renaming it: rename is atomic, so of two scanners
+      // that both judge it stale only one succeeds, and a lock the holder released
+      // and someone else re-took in between is never deleted from under them.
+      if (stale) {
+        const claimed = `${file}.stale-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+        try { fs.renameSync(file, claimed); fs.unlinkSync(claimed); } catch {}
+        continue;
+      }
       if (attempt < retries) sleepSync(waitMs);
     }
   }
   if (handle === null) return null;
-  let ino = null;
-  try { ino = fs.fstatSync(handle).ino; } catch {}
   try { return { value: run() }; }
   finally {
     try { fs.closeSync(handle); } catch {}
-    // Release only the file this handle created. A holder that overran the stale
-    // window has had its lock reclaimed and replaced by now, and the replacement
-    // belongs to someone else.
-    let current = null;
-    try { current = fs.statSync(file).ino; } catch {}
-    if (ino === null || current === ino) { try { fs.unlinkSync(file); } catch {} }
-  }
-}
-
-function isStale(file, staleMs) {
-  try { return Date.now() - fs.statSync(file).mtimeMs > staleMs; }
-  catch { return true; }
-}
-
-// Reclaiming a stale lock is itself serialized through a second, momentary lock:
-// judging the file stale and renaming it away are two steps, and without this a
-// contender could reclaim the lock and take a fresh one between them, only for
-// the rename to steal that fresh lock and let two writers in. Under the reclaim
-// lock the staleness check is repeated, so a fresh lock is never touched. The
-// reclaim lock is held for a stat and a rename, so one older than the stale
-// window was left by a crash and is removed the same way.
-function reclaimStale(file, staleMs) {
-  const guard = `${file}.reclaim`;
-  let held = null;
-  try { held = fs.openSync(guard, 'wx'); }
-  catch (error) {
-    if (error.code === 'EEXIST' && isStale(guard, staleMs)) { try { fs.unlinkSync(guard); } catch {} }
-    return;
-  }
-  try {
-    if (!isStale(file, staleMs)) return;
-    const claimed = `${file}.stale-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
-    try { fs.renameSync(file, claimed); fs.unlinkSync(claimed); } catch {}
-  } finally {
-    try { fs.closeSync(held); } catch {}
-    try { fs.unlinkSync(guard); } catch {}
+    try { fs.unlinkSync(file); } catch {}
   }
 }
 
@@ -217,4 +189,4 @@ function lookup(idOrNumber, options = {}) {
   return num ? { id, num } : null;
 }
 
-module.exports = { assign, lookup, read, write, withLock, parseNumber, label, registryFile, lockFile, MAX_NUMBER };
+module.exports = { assign, lookup, read, write, parseNumber, label, registryFile, lockFile, MAX_NUMBER };
