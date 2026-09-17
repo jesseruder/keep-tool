@@ -2267,10 +2267,13 @@ test('handoff model resolution follows a /model typed after the newest assistant
     });
     const deep = [bulky, bulky, real('claude-fable-5-1')];
     assert.equal(resolve('bounded-launch', deep, bounded, { meta: { model: 'claude-fable-5-1[1m]' } }),
-      'claude-fable-5-1[1m]');
+      '<unknown>', 'launch metadata cannot rule out a switch hiding in the unread bytes');
     const boundedFile = path.join(dir, 'bounded-launch.jsonl');
     assert.equal(handoffCurrentModel(session, null, '', { findSessionFile: () => boundedFile, ...bounded }),
-      '<unknown>', 'with no launch metadata behind it, the unread bytes decide nothing');
+      '<unknown>', 'and neither can the absence of it');
+    assert.equal(handoffCurrentModel(session, { meta: { model: 'claude-fable-5-1[1m]' } }, '',
+      { findSessionFile: () => boundedFile }), 'claude-fable-5-1[1m]',
+    'once the bound covers the file, byte zero proves there is no switch and launch decides');
     assert.equal(handoffCurrentModel(session, null, '', { findSessionFile: () => boundedFile }),
       'claude-fable-5-1', 'the same file read to byte zero has no switch to hide');
 
@@ -3130,8 +3133,8 @@ test('pending swap sweep restores through a prompt suggestion that Backspace put
   });
   const readScreen = async () => (box ? suggestionScreenWithBox(box) : REVIEWER_SUGGESTION_BEFORE);
   try {
-    // Drop the no-op precheck so the production precheckSessionTarget runs: it reads
-    // the screen and probes it, and that is the tick's only probe.
+    // Drop the no-op precheck so the production precheckSessionTarget runs: it reads the
+    // screen and probes it, and the sweep probes once more just before it types.
     const { precheckSessionTarget: _skip, ...base } = compactRestoreDeps(dir, session, calls);
     const summary = await sweepPendingCompactSwaps({
       ...base,
@@ -3146,11 +3149,55 @@ test('pending swap sweep restores through a prompt suggestion that Backspace put
     });
     assert.deepEqual(summary, { checked: 1, restored: 1, dropped: 0, skipped: 0, repairedSettings: 0 });
     assert.deepEqual(calls, ['/model claude-fable-5-1[1m]']);
-    // One probe per tick: a second one would read the first probe's `,` as its own
-    // "before" and refuse the restore for as long as the record lives.
-    assert.deepEqual(inputs, [',', '\x7f']);
-    assert.deepEqual(order, ['input:,', 'input:\x7f', 'type:/model claude-fable-5-1[1m]']);
+    // Each probe settles before the next reader looks, so the second one still sees a
+    // suggestion rather than the first one's `,`.
+    assert.deepEqual(inputs, [',', '\x7f', ',', '\x7f']);
+    assert.deepEqual(order, [
+      'input:,', 'input:\x7f', 'input:,', 'input:\x7f', 'type:/model claude-fable-5-1[1m]',
+    ]);
     assert.equal(fs.existsSync(swapFile), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('pending swap sweep refuses a draft typed after its precheck and types nothing', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-compact-late-draft-'));
+  const session = { id: 'late-draft', kind: 'claude', model: 'claude-fable-5-1', endedTurn: true };
+  const calls = [];
+  const inputs = [];
+  const swapFile = writeCompactSwapFixture(dir, session.id);
+  let box = '';
+  const host = recordingHost((type, params) => {
+    if (type !== 'input') return {};
+    const data = Buffer.from(params.data, 'base64').toString('utf8');
+    inputs.push(data);
+    box = data === '\x7f' ? box.slice(0, -1) : box + data;
+    return {};
+  });
+  // Reads 1-3 are the precheck's probe and its settled undo. Owner starts typing right
+  // after it, in the gap where the sweep reads settings and writes its record.
+  let reads = 0;
+  const readScreen = async () => {
+    reads += 1;
+    const screen = box ? suggestionScreenWithBox(box) : REVIEWER_SUGGESTION_BEFORE;
+    if (reads === 3) box = 'wait, stop';
+    return screen;
+  };
+  try {
+    const { precheckSessionTarget: _skip, ...base } = compactRestoreDeps(dir, session, calls);
+    const summary = await sweepPendingCompactSwaps({
+      ...base,
+      host,
+      wait: async () => {},
+      readScreen,
+      readScreenResult: withCursor(readScreen),
+      stderr: () => {},
+    });
+    assert.deepEqual(summary, { checked: 1, restored: 0, dropped: 0, skipped: 1, repairedSettings: 0 });
+    assert.deepEqual(calls, [], 'nothing is typed into a box that filled up after the precheck');
+    assert.deepEqual(inputs, [',', '\x7f', ',', '\x7f'], 'only the two probes and their undos');
+    assert.equal(fs.existsSync(swapFile), true, 'the record survives for the next tick');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

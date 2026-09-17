@@ -1198,8 +1198,11 @@ function lastClaudeHandoffModel(lines) {
 // tail alone reports '<unknown>' for a model that is still perfectly knowable further
 // back. Walk the transcript backwards for the newest genuine assistant record — bounded,
 // because a long-lived session's transcript runs to hundreds of megabytes.
-const HANDOFF_MODEL_SCAN_BYTES = 8 * 1024 * 1024;
-const HANDOFF_MODEL_SCAN_CHUNKS = 64;
+// Generous, because stopping short of byte zero now costs the handoff a refusal: a
+// `/model` older than the bound could have set a context window nothing else records.
+// The whole scan runs once per handoff inspect.
+const HANDOFF_MODEL_SCAN_BYTES = 32 * 1024 * 1024;
+const HANDOFF_MODEL_SCAN_CHUNKS = 128;
 const HANDOFF_MODEL_LOOKAHEAD_CHARS = 64 * 1024;
 
 // lastClaudeHandoffModel's per-record rule, one record at a time: the model of a genuine
@@ -1397,9 +1400,12 @@ function handoffCurrentModel(session, pane, processArgs, deps = {}) {
   // A confirmed `/model` is someone naming the model and its window by hand. It is taken
   // exactly as typed, whichever side of the newest assistant record it fell on.
   if (source === 'switch') return model;
-  const sameBase = Boolean(launch) && compactModelBase(launch) === compactModelBase(model);
+  // The scan stopped short of byte zero, so a `/model` older than the bound may have set
+  // a window the launch metadata no longer describes. Launch metadata cannot rule that
+  // out — only reading the rest of the file could, and it was too long to read.
+  if (window === 'unknown') return '<unknown>';
   // A different base model means the transcript is the newer evidence.
-  if (!sameBase) return window === 'unknown' ? '<unknown>' : model;
+  if (!launch || compactModelBase(launch) !== compactModelBase(model)) return model;
   // Same model, so the launch spelling carries the window. Never downgrade: whichever
   // side asked for the 1M context is the one that has to be relaunched.
   return /\[1m\]$/i.test(model) && !/\[1m\]$/i.test(launch) ? model : launch;
@@ -2817,9 +2823,7 @@ async function sweepPendingCompactSwaps(deps = {}) {
           }
           // typeAndSubmit confirms the typed command, but does not check the input box
           // or modal before typing — precheck does, and for a Claude session it is the
-          // suggestion probe. One probe per tick: a second one here re-read the screen
-          // before the first probe's Backspace had rendered, saw the stray `,` as its
-          // own "before", and refused every minute with "did not react".
+          // suggestion probe.
           await precheck(current, target, deps);
           const via = String(record.switchModel || envString('KEEP_COMPACT_VIA_MODEL', 'opus')).trim();
           const before = readSettings();
@@ -2845,6 +2849,11 @@ async function sweepPendingCompactSwaps(deps = {}) {
             record.at = compactSwapRecordAt(record); // Preserve mtime-based age across retry writes.
             record.lastAttemptAt = now();
             writeCompactSwapRecord(record.file, record);
+            // Reading settings and writing the record above take long enough for someone
+            // to start typing, and typeAndSubmit only looks for its own command somewhere
+            // in the box. Re-verify it at the moment of typing: the first probe waits for
+            // its own Backspace to render, so this one reads a settled screen.
+            await probeSuggestion(target, await read(target, 30, false), deps);
             await submit(target, record.restoreCommand, claudeTypedTextVisible, deps);
             return await waitForSwitch(target, record.restoreCommand, sid, deps);
           } finally {
