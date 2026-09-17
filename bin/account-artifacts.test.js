@@ -415,29 +415,39 @@ test('every session tree of a session moves with it, in its own project name', (
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+// Exactly what a journal written before session trees could be plural looks like: three
+// records, each identified by its kind alone.
+function asLegacyJournal(f) {
+  const directory = path.join(f.root, '.keep', 'account-artifacts', 'transactions');
+  const file = path.join(directory, fs.readdirSync(directory)[0]);
+  const journal = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(journal.artifacts.length, 3);
+  journal.artifacts = journal.artifacts.map(({ id, ...record }) => record);
+  fs.writeFileSync(file, JSON.stringify(journal));
+  return file;
+}
+
+function interruptLegacyCopy(f, t, transactionId) {
+  const originalRename = fs.renameSync;
+  const historyTarget = path.join(f.profiles.b, 'file-history', f.sid);
+  let crashed = false;
+  t.mock.method(fs, 'renameSync', function (from, to) {
+    if (!crashed && String(from).includes('.keep-stage-') && to === historyTarget) {
+      crashed = true;
+      const error = new Error('simulated crash before publish'); error.code = 'EIO'; throw error;
+    }
+    return originalRename.call(fs, from, to);
+  });
+  assert.throws(() => artifacts.copyClaudeArtifacts(f.sid, f.records.a, f.records.b, transactionId, options(f)), /simulated crash/);
+  t.mock.restoreAll();
+  return asLegacyJournal(f);
+}
+
 test('a transaction interrupted before its extra session trees existed still recovers', (t) => {
   const f = fixture();
   try {
-    const originalRename = fs.renameSync;
+    const journalFile = interruptLegacyCopy(f, t, 'tx-legacy');
     const historyTarget = path.join(f.profiles.b, 'file-history', f.sid);
-    let crashed = false;
-    t.mock.method(fs, 'renameSync', function (from, to) {
-      if (!crashed && String(from).includes('.keep-stage-') && to === historyTarget) {
-        crashed = true;
-        const error = new Error('simulated crash before publish'); error.code = 'EIO'; throw error;
-      }
-      return originalRename.call(fs, from, to);
-    });
-    assert.throws(() => artifacts.copyClaudeArtifacts(f.sid, f.records.a, f.records.b, 'tx-legacy', options(f)), /simulated crash/);
-    t.mock.restoreAll();
-    const directory = path.join(f.root, '.keep', 'account-artifacts', 'transactions');
-    const journalFile = path.join(directory, fs.readdirSync(directory)[0]);
-    const journal = JSON.parse(fs.readFileSync(journalFile, 'utf8'));
-    assert.equal(journal.artifacts.length, 3);
-    // Exactly what a journal written before session trees could be plural looks like:
-    // three records, each identified by its kind alone.
-    journal.artifacts = journal.artifacts.map(({ id, ...record }) => record);
-    fs.writeFileSync(journalFile, JSON.stringify(journal));
     // The session moves into a worktree only now, so the interrupted transaction knows
     // nothing about the trees its plan has grown.
     extraTrees(f);
@@ -450,6 +460,51 @@ test('a transaction interrupted before its extra session trees existed still rec
     assert.equal(JSON.parse(fs.readFileSync(journalFile, 'utf8')).artifacts.length, 5, 'the extra trees joined the journal');
     assert.equal(artifacts.preflight(f.sid, f.records.a, f.records.b, options(f)).disposition, 'reused');
   } finally { t.mock.restoreAll(); fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('recovery does not adopt unaccounted target content under an extra session tree', (t) => {
+  const f = fixture();
+  try {
+    interruptLegacyCopy(f, t, 'tx-legacy-guard');
+    extraTrees(f);
+    // Something the transfer never put there is already at one extra tree's target. The
+    // legacy journal is no evidence about it, and recovery must not back it up and
+    // replace it the way it may a tree it recorded.
+    const occupied = path.join(f.profiles.b, 'projects', '-wt-work-repo-slug', f.sid);
+    fs.mkdirSync(occupied, { recursive: true });
+    fs.writeFileSync(path.join(occupied, 'someone-elses.txt'), 'not ours');
+    assert.throws(() => artifacts.copyClaudeArtifacts(f.sid, f.records.a, f.records.b, 'tx-legacy-guard', options(f)),
+      (error) => {
+        assert.equal(error.code, 'KEEP_ARTIFACT_UNSAFE');
+        assert.match(error.message, /unrecognized changes: .*-wt-work-repo-slug/);
+        return true;
+      });
+    assert.equal(fs.readFileSync(path.join(occupied, 'someone-elses.txt'), 'utf8'), 'not ours');
+    assert.deepEqual(fs.readdirSync(occupied), ['someone-elses.txt'], 'nothing was staged, backed up or published there');
+    assert.equal(fs.existsSync(path.join(f.profiles.b, 'file-history', f.sid)), false, 'the interrupted artifact stays unpublished');
+  } finally { t.mock.restoreAll(); fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('a legacy transaction that completed before the extra trees existed finishes them', () => {
+  const f = fixture();
+  try {
+    artifacts.copyClaudeArtifacts(f.sid, f.records.a, f.records.b, 'tx-legacy-complete', options(f));
+    const journalFile = asLegacyJournal(f);
+    assert.equal(JSON.parse(fs.readFileSync(journalFile, 'utf8')).status, 'complete');
+    // The crash was after the copy marked itself complete and before the rebind, and
+    // the plan has grown trees the completed journal never mentioned.
+    extraTrees(f);
+    const target = path.join(f.profiles.b, 'projects', '-wt-work-repo-slug', f.sid, 'subagents', 'agent-worktree.jsonl');
+    assert.equal(fs.existsSync(target), false);
+    const recovered = artifacts.copyClaudeArtifacts(f.sid, f.records.a, f.records.b, 'tx-legacy-complete', options(f));
+    assert.equal(recovered.reused, false);
+    assert.equal(fs.readFileSync(target, 'utf8'), `${JSON.stringify({ agent: 'worktree' })}\n`);
+    const journal = JSON.parse(fs.readFileSync(journalFile, 'utf8'));
+    assert.equal(journal.status, 'complete');
+    assert.equal(journal.artifacts.length, 5);
+    assert.equal(artifacts.preflight(f.sid, f.records.a, f.records.b, options(f)).disposition, 'reused');
+    assert.equal(artifacts.copyClaudeArtifacts(f.sid, f.records.a, f.records.b, 'tx-legacy-complete', options(f)).reused, true);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
 // A child whose transcript sits under some other session's tree -- a codex-rescue child

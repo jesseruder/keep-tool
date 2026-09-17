@@ -401,11 +401,17 @@ function copyClaudeArtifacts(sessionId, source, target, transactionId, options =
   if (journal) {
     validateExistingJournal(plan, journal, transactionId);
     if (journal.status === 'complete') {
-      const current = manifestMap(plan.artifacts.map((artifact) => ({ ...artifact, targetManifest: treeManifest(artifact.target) })), 'targetManifest');
-      if (!sameManifestMap(current, manifestMap(plan.artifacts, 'sourceManifest'))) {
+      const scope = journalScope(plan, journal.artifacts);
+      const current = manifestMap(scope.map((artifact) => ({ ...artifact, targetManifest: treeManifest(artifact.target) })), 'targetManifest');
+      if (!sameManifestMap(current, manifestMap(scope, 'sourceManifest'))) {
         throw failure(`completed artifact transaction ${transactionId} no longer matches its target`);
       }
-      return { ...publicPlan(plan), copied: [], reused: true };
+      // A journal written before this session carried extra session trees is complete
+      // for everything it knew about. The trees it never mentioned are still missing
+      // from the target, so the transaction goes back to copying, publishes them below
+      // under the same checks as any other artifact, and is marked complete again.
+      if (scope.length === plan.artifacts.length) return { ...publicPlan(plan), copied: [], reused: true };
+      journal.status = 'copying'; persistJournal(file, journal);
     }
   } else {
     const before = manifestMap(plan.artifacts, 'targetManifest');
@@ -420,6 +426,18 @@ function copyClaudeArtifacts(sessionId, source, target, transactionId, options =
   // same publish as every other artifact.
   const unjournaled = plan.artifacts.filter((artifact) => !journal.artifacts.some((entry) => recordId(entry) === artifact.id));
   if (unjournaled.length) {
+    // The journal's recovery evidence says nothing about these trees, so the target's
+    // copy of each one has to stand on its own: absent, already exactly what the source
+    // holds, or exactly what this target's provenance recorded. Anything else is target
+    // content nobody accounted for, and it must not become a `before` that the publish
+    // below backs up and replaces -- the same rule, and the same refusal, that target
+    // content without provenance meets outside recovery.
+    const recorded = readProvenance(plan, plan.target)?.artifacts || {};
+    for (const artifact of unjournaled) {
+      if (artifact.targetManifest === null || sameManifest(artifact.targetManifest, artifact.sourceManifest)
+          || sameManifest(artifact.targetManifest, recorded[artifact.id] ?? null)) continue;
+      throw failure(`target session artifacts for ${plan.sessionId} in ${plan.target.id} have unrecognized changes: ${artifact.target}`);
+    }
     journal.artifacts = [...journal.artifacts,
       ...journalArtifacts({ ...plan, artifacts: unjournaled }, transactionId, manifestMap(plan.artifacts, 'targetManifest'))];
     persistJournal(file, journal);
