@@ -738,26 +738,44 @@ function processStartedAt(pid) {
   } catch { return ''; }
 }
 
-function withLock(fn) {
-  fs.mkdirSync(META, { recursive: true });
-  const deadline = Date.now() + 5000;
-  const ownerFile = path.join(LOCK, 'owner.json');
-  const token = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+// Our own start time never changes, and the daemon takes this lock on a timer, so
+// asking `ps` for it on every acquisition was a spawned process each time. Only
+// this pid is memoized: another pid's start time is what proves a recorded owner
+// is really the process that took the lock, and that answer has to stay live.
+let ownStartedAt = null;
+function ownProcessStartedAt() {
+  if (ownStartedAt === null) ownStartedAt = processStartedAt(process.pid);
+  return ownStartedAt;
+}
+
+const LOCK_BUSY = 'could not acquire lock (.keep/lock) — another keep running?';
+const lockOwnerFile = () => path.join(LOCK, 'owner.json');
+const lockToken = () => `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+
+// One attempt at the lock: true once this process holds it under `token`, false
+// while someone else still does. A lock older than a minute whose recorded owner
+// is gone is reclaimed and the attempt retried at once, so a keep killed mid-edit
+// blocks the next one for a minute rather than forever. Named and separate so
+// withLock below is the three lines it actually is — acquire, wait, release —
+// rather than that loop with a body threaded through it.
+function acquireLock(token) {
+  const ownerFile = lockOwnerFile();
   for (;;) {
     try {
       fs.mkdirSync(LOCK);
       try {
         fs.writeFileSync(ownerFile, JSON.stringify({
-          pid: process.pid, token, startedAt: processStartedAt(process.pid),
+          pid: process.pid, token, startedAt: ownProcessStartedAt(),
         }));
       }
       catch (error) {
         try { fs.rmdirSync(LOCK); } catch {}
         throw error;
       }
-      break;
+      return true;
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
+      let reclaimed = false;
       try {
         if (Date.now() - fs.statSync(LOCK).mtimeMs > 60e3) {
           let owner = null;
@@ -773,23 +791,41 @@ function withLock(fn) {
           }
           if (!alive) {
             try { fs.unlinkSync(ownerFile); } catch {}
-            try { fs.rmdirSync(LOCK); continue; } catch {}
+            try { fs.rmdirSync(LOCK); reclaimed = true; } catch {}
           }
         }
       } catch {}
-      if (Date.now() > deadline) die('could not acquire lock (.keep/lock) — another keep running?');
-      execFileSync('sleep', ['0.1']);
+      if (reclaimed) continue;
+      return false;
     }
+  }
+}
+
+// Only ever drops a lock this process still owns: a reclaim by someone else means
+// the directory now belongs to them, and removing it would hand the registry to a
+// third writer.
+function releaseLock(token) {
+  const ownerFile = lockOwnerFile();
+  let owner = null;
+  try { owner = JSON.parse(fs.readFileSync(ownerFile, 'utf8')); } catch {}
+  if (owner && owner.token === token) {
+    try { fs.unlinkSync(ownerFile); } catch {}
+    try { fs.rmdirSync(LOCK); } catch {}
+  }
+}
+
+function withLock(fn) {
+  fs.mkdirSync(META, { recursive: true });
+  const deadline = Date.now() + 5000;
+  const token = lockToken();
+  while (!acquireLock(token)) {
+    if (Date.now() > deadline) die(LOCK_BUSY);
+    execFileSync('sleep', ['0.1']);
   }
   try {
     return fn();
   } finally {
-    let owner = null;
-    try { owner = JSON.parse(fs.readFileSync(ownerFile, 'utf8')); } catch {}
-    if (owner && owner.token === token) {
-      try { fs.unlinkSync(ownerFile); } catch {}
-      try { fs.rmdirSync(LOCK); } catch {}
-    }
+    releaseLock(token);
   }
 }
 
