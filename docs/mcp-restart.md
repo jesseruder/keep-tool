@@ -74,14 +74,17 @@ the `npm exec` row, its child, and everything below are captured as the one help
 unit. On no match the row is refused exactly as before — which is also what an
 `npm exec` that is still installing gets, since it has no child yet.
 
-Three kinds of declaration therefore have no title form at all and stay on the
+Four kinds of declaration therefore have no title form at all and stay on the
 audit-pin path. A spec that is not a registry spec — one starting with `.`, `/` or
 `~`, or containing `:`, so directory, git and URL specs — because there is no cache
 directory to derive. A declaration whose arguments carry a credentialed URL, because
 npm redacts secrets out of the title and the row can no longer be reconstructed from
-the declaration. And a package that is already present in the project's own
+the declaration. A package that is already present in the project's own
 `node_modules`, because npx then runs the local bin and writes no `_npx` directory for
-this to check against.
+this to check against. And a server whose npx cache is not the daemon's own: the cache
+root is read from the daemon's `npm_config_cache`, which the sessions it launches
+inherit, so a per-session override or a `cache=` setting in an `~/.npmrc` is not read
+and the directory this derives is not the one that server installed into.
 
 What a match asserts is that the row, joined with single spaces, is the declared
 invocation. It cannot assert where the live process put its argument boundaries: `ps`

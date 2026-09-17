@@ -4006,8 +4006,12 @@ async function restartSession(body, deps = {}) {
       const identity = (await liveSessionPids({ ...deps, agentProcessRows: async () => rows })).get(session.id);
       if (!identity?.primary || identity.pid !== originalIdentity.pid || identity.pidStart !== originalIdentity.pidStart) throw Error('Agent process identity changed during restart');
       const parent = rows.find((p) => p.pid === identity.pid);
+      // process.env and not deps.env: the npx cache an `npx`-declared server unpacked
+      // into is the one this daemon's own environment names, because the daemon is
+      // what launched the session and the session inherited it. deps.env is the
+      // account configuration's environment, which is a different thing.
       const helpers = mcpRestart.inspect({ root: deps.root || keep.ROOT, agent: session.kind, sessionId: session.id, parent, rows,
-        cwd: session.project || pane.cwd, account: liveAccount });
+        cwd: session.project || pane.cwd, account: liveAccount, env: process.env });
       if (restartHelpers && JSON.stringify(helpers) !== JSON.stringify(restartHelpers)) throw Error('Session helper processes changed during restart');
       restartHelpers = helpers;
       try { childProof(); } catch (error) {
