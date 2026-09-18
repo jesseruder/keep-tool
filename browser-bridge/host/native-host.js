@@ -89,8 +89,9 @@ function openLog() {
   if (!existing.isFile()) throw new Error(`${LOG} is not a regular file`);
   if (existing.uid !== process.getuid()) throw new Error(`${LOG} is not owned by this user`);
 
-  const fd = fs.openSync(LOG, fs.constants.O_RDWR | NOFOLLOW);
-  let size;
+  // O_APPEND from the start: two hosts overlapping for a moment must interleave lines
+  // rather than overwrite each other from a fixed offset.
+  const fd = fs.openSync(LOG, fs.constants.O_RDWR | fs.constants.O_APPEND | NOFOLLOW);
   try {
     const opened = fs.fstatSync(fd);
     // The descriptor must be the very file the lstat approved.
@@ -100,27 +101,33 @@ function openLog() {
     if (opened.dev !== existing.dev || opened.ino !== existing.ino) {
       throw new Error(`${LOG} was replaced while it was being opened`);
     }
-    size = opened.size;
-    if (size > MAX_LOG_BYTES) {
-      // Keep only the tail: this file is append-only across every host start.
+    if (opened.size > MAX_LOG_BYTES) {
+      // Keep only the tail: this file is append-only across every host start. Reads take
+      // an explicit position, and an O_APPEND write after the truncation lands at 0.
       const keep = Buffer.allocUnsafe(MAX_LOG_BYTES);
-      fs.readSync(fd, keep, 0, MAX_LOG_BYTES, size - MAX_LOG_BYTES);
+      fs.readSync(fd, keep, 0, MAX_LOG_BYTES, opened.size - MAX_LOG_BYTES);
       fs.ftruncateSync(fd, 0);
-      fs.writeSync(fd, keep, 0, keep.length, 0);
-      size = keep.length;
+      fs.writeSync(fd, keep, 0, keep.length);
     }
   } catch (error) {
     fs.closeSync(fd);
     throw error;
   }
-  // Same descriptor, positioned at the end: the path is never resolved again.
-  logStream = fs.createWriteStream(null, { fd, start: size });
+  // Same descriptor, appending: the path is never resolved again.
+  logStream = fs.createWriteStream(null, { fd });
 }
 
 // --- extension port -------------------------------------------------------
 
 const decoder = new NativeDecoder();
-const assembler = new ChunkAssembler();
+// An evicted partial is a reply that will never arrive. Whoever asked for it hears so
+// now rather than waiting out the request timeout for nothing.
+const assembler = new ChunkAssembler({
+  onEvict: (wireId, reason) => {
+    log("dropped a partial reply:", wireId, reason);
+    failPending(wireId, `the browser's reply was dropped before it completed: ${reason}`);
+  },
+});
 
 let extensionVersion = null;
 let extensionReady = false;

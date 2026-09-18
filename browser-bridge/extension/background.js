@@ -73,18 +73,12 @@ async function handleRequest(message, generation) {
   // and aborts rather than closing tabs this request is about to use.
   noteActivity(message.sessionKey);
 
-  let session = message.sessionKey ? await getSession(message.sessionKey) : null;
-  if (message.sessionKey && message.session?.name && session?.name !== message.session.name) {
-    session = await putSession(message.sessionKey, message.session);
-  }
-  if (message.sessionKey && session?.ended && session.groupId != null) {
-    // The same session key is back on a new host: take its group out of "(ended)".
-    // Through the lock, so it cannot overlap a teardown of the same session.
-    await withSessionLock(message.sessionKey, () =>
-      reviveSession(message.sessionKey, session.groupId, message.session?.name ?? session.name),
-    );
-    session = await getSession(message.sessionKey);
-  }
+  // Then queue behind that teardown rather than racing it. Whichever way it goes, this
+  // request sees a settled world: either the teardown aborted and the group is still
+  // here, or it finished and the session starts fresh.
+  const session = message.sessionKey
+    ? await withSessionLock(message.sessionKey, () => lookUpSession(message))
+    : null;
   const ctx = {
     sessionKey: message.sessionKey,
     sessionName: message.session?.name ?? session?.name ?? "agent",
@@ -99,6 +93,23 @@ async function handleRequest(message, generation) {
       error: { message: String(error?.message ?? error) },
     });
   }
+}
+
+/**
+ * The session's stored record, refreshed from what the host told us and taken back out
+ * of "(ended)" if this session key has returned. Runs under the session's lock; it must
+ * not call anything that takes that lock again.
+ */
+async function lookUpSession(message) {
+  let session = await getSession(message.sessionKey);
+  if (message.session?.name && session?.name !== message.session.name) {
+    session = await putSession(message.sessionKey, message.session);
+  }
+  if (session?.ended && session.groupId != null) {
+    await reviveSession(message.sessionKey, session.groupId, message.session?.name ?? session.name);
+    session = await getSession(message.sessionKey);
+  }
+  return session;
 }
 
 /**
@@ -184,9 +195,10 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   if (changeInfo.groupId === undefined) return;
   const state = peekTab(tabId);
   if (!state) return; // nothing of ours to clean up
+  const owner = state.owner;
   try {
-    if (state.owner) {
-      const session = await getSession(state.owner);
+    if (owner) {
+      const session = await getSession(owner);
       // Still in its owner's group (the group id can be re-reported unchanged).
       if (session?.groupId != null && session.groupId === changeInfo.groupId) return;
     } else {
@@ -197,6 +209,12 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
       if (ours) return;
     }
     await detach(tabId);
+    // The destination session may have claimed the tab while we were awaiting, and its
+    // fresh state is not ours to throw away. Detaching it was harmless: the next command
+    // re-attaches.
+    const current = peekTab(tabId);
+    if (!current) return;
+    if (current.owner !== owner) return;
     dropTab(tabId);
   } catch (error) {
     console.warn("browser-bridge: group change cleanup failed", error);

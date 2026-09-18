@@ -326,6 +326,39 @@ test("a reply that cannot be reassembled fails its client instead of hanging it"
   assert.equal((await client.reply("after")).ok, true);
 });
 
+test("a partial reply dropped for capacity fails its client rather than going quiet", async (t) => {
+  const { socketFile, extension } = await startHost(t, { timeoutMs: 60_000 });
+  const client = await connect(socketFile);
+  client.send({ id: "h", method: "hello", params: { sessionKey: "crowded-session", name: "crowded" } });
+  await client.reply("h");
+
+  // Nine requests in flight, each answered with a first chunk and nothing more. The
+  // ninth partial pushes the oldest out of the assembler.
+  const count = 9;
+  for (let index = 1; index <= count; index++) {
+    client.send({ id: `q${index}`, method: "read_page", params: { tabId: index } });
+  }
+  const forwarded = await waitFor(
+    () => {
+      const seen = extension.messages.filter((message) => message.method === "read_page");
+      return seen.length === count ? seen : null;
+    },
+    { label: "all nine requests to be forwarded" },
+  );
+
+  for (const request of forwarded) {
+    extension.send({ id: request.id, chunk: 0, of: 2, data: '{"ok":true' });
+  }
+
+  const reply = await client.reply("q1");
+  assert.equal(reply.ok, false);
+  assert.match(reply.error.message, /the browser's reply was dropped before it completed/);
+  assert.match(reply.error.message, /too many unfinished messages/);
+
+  // The newest requests are untouched and still waiting for their second chunk.
+  assert.equal(client.replies.some((message) => message.id === `q${count}`), false);
+});
+
 test("the socket file is removed when the extension port closes", async (t) => {
   const { child, socketFile } = await startHost(t);
   assert.ok(fs.existsSync(socketFile));

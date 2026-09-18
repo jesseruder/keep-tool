@@ -170,9 +170,25 @@ export function isChunk(message) {
     && typeof message.of === "number" && typeof message.data === "string";
 }
 
-/** Reassembles `chunkMessage` output; returns null until the last piece arrives. */
+/**
+ * Reassembles `chunkMessage` output; returns null until the last piece arrives.
+ *
+ * `onEvict(id, reason)` fires whenever a half-finished message is thrown away. Silence
+ * there would leave whoever is waiting for that reply to sit out their whole timeout,
+ * so the host turns it into an error for that request.
+ */
 export class ChunkAssembler {
   #pending = new Map();
+  #onEvict;
+
+  constructor({ onEvict } = {}) {
+    this.#onEvict = typeof onEvict === "function" ? onEvict : null;
+  }
+
+  #evict(id, reason) {
+    this.#pending.delete(id);
+    if (this.#onEvict) this.#onEvict(id, reason);
+  }
 
   accept(message, now = Date.now()) {
     if (!isChunk(message)) return message;
@@ -215,7 +231,7 @@ export class ChunkAssembler {
    */
   sweep(now = Date.now()) {
     for (const [id, slot] of this.#pending) {
-      if (now - slot.at > CHUNK_TTL_MS) this.#pending.delete(id);
+      if (now - slot.at > CHUNK_TTL_MS) this.#evict(id, "it was left unfinished for too long");
     }
   }
 
@@ -234,7 +250,7 @@ export class ChunkAssembler {
       }
       if (oldestId === null) return;
       total -= this.#pending.get(oldestId).bytes;
-      this.#pending.delete(oldestId);
+      this.#evict(oldestId, "too many unfinished messages were in flight at once");
     }
   }
 

@@ -179,6 +179,25 @@ test("the pending byte total is capped across messages", () => {
   assert.ok(assembler.pendingCount < 8, "older partials were dropped");
 });
 
+test("evictions are reported, so the owner can answer whoever was waiting", () => {
+  for (const Assembler of [ChunkAssembler, ExtensionAssembler]) {
+    const evicted = [];
+    const assembler = new Assembler({ onEvict: (id, reason) => evicted.push({ id, reason }) });
+
+    assembler.accept({ id: "expiring", chunk: 0, of: 2, data: "half" }, 1000);
+    assembler.sweep(1000 + CHUNK_TTL_MS + 1);
+    assert.deepEqual(evicted.map((entry) => entry.id), ["expiring"]);
+    assert.match(evicted[0].reason, /unfinished for too long/);
+
+    evicted.length = 0;
+    for (let index = 0; index < MAX_PARTIAL_MESSAGES + 1; index++) {
+      assembler.accept({ id: `c${index}`, chunk: 0, of: 2, data: "x" }, 2000 + index);
+    }
+    assert.deepEqual(evicted.map((entry) => entry.id), ["c0"]);
+    assert.match(evicted[0].reason, /too many unfinished messages/);
+  }
+});
+
 test("sweep expires partials without any new chunk arriving", () => {
   for (const Assembler of [ChunkAssembler, ExtensionAssembler]) {
     const assembler = new Assembler();

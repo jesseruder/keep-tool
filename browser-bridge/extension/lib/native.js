@@ -82,6 +82,16 @@ export function chunkMessage(message, max = MAX_CHUNK_BYTES) {
 
 export class ChunkAssembler {
   #pending = new Map();
+  #onEvict;
+
+  constructor({ onEvict } = {}) {
+    this.#onEvict = typeof onEvict === "function" ? onEvict : null;
+  }
+
+  #evict(id, reason) {
+    this.#pending.delete(id);
+    if (this.#onEvict) this.#onEvict(id, reason);
+  }
 
   accept(message, now = Date.now()) {
     if (!message || typeof message.chunk !== "number" || typeof message.data !== "string") {
@@ -123,7 +133,7 @@ export class ChunkAssembler {
   /** Drop expired partials; called on accept and on the bridge's sweep timer. */
   sweep(now = Date.now()) {
     for (const [id, slot] of this.#pending) {
-      if (now - slot.at > CHUNK_TTL_MS) this.#pending.delete(id);
+      if (now - slot.at > CHUNK_TTL_MS) this.#evict(id, "it was left unfinished for too long");
     }
   }
 
@@ -141,7 +151,7 @@ export class ChunkAssembler {
       }
       if (oldestId === null) return;
       total -= this.#pending.get(oldestId).bytes;
-      this.#pending.delete(oldestId);
+      this.#evict(oldestId, "too many unfinished messages were in flight at once");
     }
   }
 
@@ -156,9 +166,14 @@ export class ChunkAssembler {
   }
 }
 
+/** Requests dropped mid-reassembly are the host's problem to report; we just say so. */
+const logEviction = (id, reason) => {
+  console.warn(`browser-bridge: dropped a partial message (${id}): ${reason}`);
+};
+
 export class NativeBridge {
   #port = null;
-  #assembler = new ChunkAssembler();
+  #assembler = new ChunkAssembler({ onEvict: logEviction });
   #onRequest;
   #onStatus;
   #connectedAt = null;
@@ -234,7 +249,7 @@ export class NativeBridge {
       this.#lastError = chrome.runtime.lastError?.message ?? null;
       this.#port = null;
       this.#connectedAt = null;
-      this.#assembler = new ChunkAssembler();
+      this.#assembler = new ChunkAssembler({ onEvict: logEviction });
       this.#stopSweeping();
       this.#onStatus(this.status);
     });

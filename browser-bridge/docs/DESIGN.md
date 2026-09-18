@@ -147,9 +147,12 @@ slow). The host answers the client with an error on timeout and drops the late r
   mapping stays with them under an `ended` flag so the same session key gets its group
   back instead of opening a second one beside it.
 - Creating, reviving and tearing down a session all run under one promise chain per
-  session key, and teardown re-reads an activity counter after every await: a request
-  that arrives while a `session_closed` is still in flight (a host restart is exactly
-  that) aborts the teardown before any tab is closed or any mapping forgotten.
+  session key, and so does each request's own session lookup: a request that arrives
+  while a `session_closed` is still in flight (a host restart is exactly that) waits for
+  that teardown to finish or abort rather than racing it, and then sees a settled world —
+  either the group is still there or the session starts fresh. Teardown also re-reads an
+  activity counter after every await and aborts before any tab is closed or any mapping
+  forgotten, which is what turns a host restart into a no-op.
 - Session state (`sessionKey -> {groupId, windowId, name}`) lives in
   `chrome.storage.session` so it survives worker restarts, and every write to it goes
   through a single queue: two tools arriving together would otherwise read the same
@@ -163,7 +166,9 @@ slow). The host answers the client with an error on timeout and drops the late r
 - A reply the host could never reassemble is never sent: a result over the 16 MiB
   assembled limit comes back as `result too large (N bytes, limit M)` instead of frames
   that would be dropped, leaving the caller to wait out its timeout. The host answers
-  the same way if reassembly fails for any other reason.
+  the same way if reassembly fails for any other reason, or if a half-received reply is
+  dropped because it went stale or because too many were in flight at once — an
+  abandoned partial always becomes an error for whoever was waiting on it.
 
 ## Tools
 

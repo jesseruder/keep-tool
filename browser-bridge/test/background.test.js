@@ -13,9 +13,23 @@ const state = {
   nextTabId: 1,
   nextGroupId: 100,
   detached: [],
+  detachCalls: [],
+  removeCalls: [],
+  holdRemove: null,
+  holdDetach: null,
+  holdEndedTitle: null,
   ports: [],
   listeners: { tabsUpdated: [], tabsRemoved: [], groupsRemoved: [], alarm: [] },
 };
+
+/** A promise the test resolves when it wants a stubbed call to finish. */
+function deferred() {
+  let resolve;
+  const promise = new Promise((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
 
 function makePort() {
   const port = {
@@ -86,7 +100,10 @@ globalThis.chrome = {
       return state.tabs.get(id);
     },
     async remove(ids) {
+      state.removeCalls.push(ids);
       await tick();
+      // A test can hold the removal open to sit inside the window it cares about.
+      if (state.holdRemove) await state.holdRemove;
       for (const id of Array.isArray(ids) ? ids : [ids]) state.tabs.delete(id);
     },
     async group({ tabIds, groupId, createProperties }) {
@@ -108,6 +125,9 @@ globalThis.chrome = {
       await tick();
       if (!state.groups.has(id)) throw new Error("no group");
       Object.assign(state.groups.get(id), changes);
+      if (state.holdEndedTitle && String(changes.title ?? "").endsWith("(ended)")) {
+        await state.holdEndedTitle;
+      }
       return state.groups.get(id);
     },
   },
@@ -132,7 +152,9 @@ globalThis.chrome = {
       await tick();
     },
     async detach({ tabId }) {
+      state.detachCalls.push(tabId);
       await tick();
+      if (state.holdDetach) await state.holdDetach;
       state.detached.push(tabId);
     },
     async sendCommand() {
@@ -308,6 +330,115 @@ test("a request that arrives during teardown aborts it", async () => {
   await tick();
   assert.ok(state.tabs.has(session.tab.id));
   assert.notEqual(await sessions.getSession("racing"), null);
+});
+
+test("a request that arrives mid-removal waits for the teardown instead of racing it", async () => {
+  const session = await makeSession("late-racing", "late");
+  assert.equal(session.tab.url, "about:blank");
+
+  // Hold chrome.tabs.remove open: the teardown is now past its last generation check,
+  // which is the window where a returning session used to lose a tab and its mapping.
+  const held = deferred();
+  state.holdRemove = held.promise;
+  state.removeCalls.length = 0;
+
+  deliver({ method: "session_closed", params: { sessionKey: "late-racing" } });
+  await waitFor(() => state.removeCalls.length === 1, "the teardown to reach the tab removal");
+
+  deliver({
+    id: "w4_c1",
+    sessionKey: "late-racing",
+    session: { name: "late" },
+    method: "tabs_context_mcp",
+    params: { createIfEmpty: true },
+  });
+  // The request takes the same per-session lock, so it cannot observe a half-finished
+  // teardown: no reply until the teardown lets go.
+  for (let index = 0; index < 5; index++) await tick();
+  assert.equal(replyFor("w4_c1"), null, "the request must wait for the teardown");
+
+  held.resolve();
+  state.holdRemove = null;
+
+  const reply = await waitFor(() => replyFor("w4_c1"), "the request's reply");
+  assert.equal(reply.ok, true);
+  const context = JSON.parse(reply.result.text);
+  // Either outcome is fine; what must never happen is a live mapping pointing at tabs
+  // that were closed under it.
+  assert.notEqual(await sessions.getSession("late-racing"), null, "the session has a mapping");
+  assert.ok(state.groups.has(context.groupId), "which names a live group");
+  assert.ok(context.tabs.length > 0, "with at least one tab");
+  for (const tab of context.tabs) {
+    assert.ok(state.tabs.has(tab.id), `tab ${tab.id} must still exist`);
+  }
+});
+
+test("a request during the last step of teardown still ends up with a live session", async () => {
+  const session = await makeSession("ending-late", "ending");
+  state.tabs.get(session.tab.id).url = "https://example.com/work";
+
+  // Freeze the teardown on its very last step, after every generation check it makes.
+  const held = deferred();
+  state.holdEndedTitle = held.promise;
+  deliver({ method: "session_closed", params: { sessionKey: "ending-late" } });
+  await waitFor(
+    () => state.groups.get(session.group.groupId).title === "ending (ended)",
+    "the teardown to reach the ended title",
+  );
+
+  // A page tool, deliberately: it does not go near ensureGroup, so the only thing that
+  // can put this session right is the request path taking the session's lock.
+  deliver({
+    id: "w5_c1",
+    sessionKey: "ending-late",
+    session: { name: "ending" },
+    method: "read_page",
+    params: { tabId: session.tab.id },
+  });
+  for (let index = 0; index < 3; index++) await tick();
+
+  held.resolve();
+  state.holdEndedTitle = null;
+  const reply = await waitFor(() => replyFor("w5_c1"), "the request's reply");
+  assert.equal(reply.ok, true);
+
+  // Because the request queues behind the teardown, it sees the finished result and
+  // undoes it. Without that ordering the session stays marked ended while its owner is
+  // very much alive, and the group keeps the "(ended)" title.
+  await waitFor(
+    async () => (await sessions.getSession("ending-late"))?.ended === false,
+    "the session to be live again",
+  );
+  assert.equal(state.groups.get(session.group.groupId).title, "ending");
+  assert.ok(state.tabs.has(session.tab.id));
+});
+
+test("a tab claimed by its new session during cleanup keeps that session's state", async () => {
+  const from = await makeSession("owner-g", "G");
+  const to = await makeSession("owner-h", "H");
+  await cdp.attach(from.tab.id);
+  await sessions.requireTab("owner-g", from.tab.id);
+
+  const held = deferred();
+  state.holdDetach = held.promise;
+  state.detachCalls.length = 0;
+
+  fireGroupChange(from.tab.id, to.group.groupId);
+  await waitFor(() => state.detachCalls.includes(from.tab.id), "the cleanup to reach detach");
+
+  // H takes the tab while the detach is still in flight.
+  cdp.claimTab(from.tab.id, "owner-h", to.group.groupId);
+  cdp.peekTab(from.tab.id).console.push({ level: "log", text: "H's own", at: Date.now() });
+
+  held.resolve();
+  state.holdDetach = null;
+  for (let index = 0; index < 5; index++) await tick();
+
+  const stateAfter = cdp.peekTab(from.tab.id);
+  assert.notEqual(stateAfter, null, "the new owner's state must survive the old owner's cleanup");
+  assert.equal(stateAfter.owner, "owner-h");
+  assert.equal(stateAfter.console.length, 1);
+  assert.equal(stateAfter.console[0].text, "H's own");
 });
 
 test("an ended session that comes back takes its group out of (ended)", async () => {
