@@ -12,6 +12,7 @@ import {
   CODEX_TABLE,
   applyEdit,
   buildPlan,
+  launchdCommands,
   claudeEdit,
   claudeConfigDirs,
   claudeConfigFile,
@@ -66,17 +67,52 @@ async function capture(fn) {
 }
 
 /**
- * A stand-in for the agent CLIs. launchctl is only recorded; `claude` also does what the
- * real one would do to the config file, so the end-to-end assertions stay meaningful
- * without a real Claude Code on PATH.
+ * A stand-in for the commands the installer runs. `claude` does what the real one would do
+ * to the config file, so the end-to-end assertions stay meaningful without a real Claude
+ * Code on PATH. `launchctl` is scripted: `print` answers from `loaded`, a queue of booleans
+ * or one boolean, and `bootstrap`/`kickstart` from a queue of exit codes - which is how the
+ * teardown race and its retries are reproduced without launchd.
  */
-function fakeCli(env) {
+function fakeCli(env, launchctl = {}) {
   const ran = [];
+  // `loaded`: is the job there to begin with. `stuckPolls`: how many `print`s after a
+  // bootout still report it, which is launchd's teardown race. `bootstrap`/`kickstart`:
+  // queues of exit codes, so a first attempt can fail the way the live run's did.
+  let loaded = launchctl.loaded === true;
+  let lingering = 0;
+  const stuckPolls = launchctl.stuckPolls ?? 0;
+  const bootstrap = [...(launchctl.bootstrap ?? [])];
+  const kickstart = [...(launchctl.kickstart ?? [])];
+
   return {
     ran,
+    verbs: () => ran.filter((command) => command.name === "launchctl").map((command) => command.args[0]),
     run(command) {
       ran.push(command);
-      if (command.name !== "claude") return;
+      if (command.name === "launchctl") {
+        const verb = command.args[0];
+        if (verb === "print") {
+          if (lingering > 0) {
+            lingering -= 1;
+            if (lingering === 0) loaded = false;
+            return 0; // still reported, though bootout has already returned
+          }
+          return loaded ? 0 : 1;
+        }
+        if (verb === "bootout") {
+          if (stuckPolls > 0) lingering = stuckPolls;
+          else loaded = false;
+          return 0;
+        }
+        if (verb === "kickstart") return kickstart.length ? kickstart.shift() : 0;
+        if (verb === "bootstrap") {
+          const status = bootstrap.length ? bootstrap.shift() : 0;
+          if (status === 0) loaded = true;
+          return status;
+        }
+        return 0;
+      }
+      if (command.name !== "claude") return 0;
       const dir = command.env.CLAUDE_CONFIG_DIR ?? path.join(env.HOME, ".claude");
       const file = claudeConfigFile(dir, env);
       let text = "{}";
@@ -90,15 +126,25 @@ function fakeCli(env) {
           ? withClaudeServer(text, JSON.parse(command.args[5]))
           : withoutClaudeServer(text);
       if (next !== null) fs.writeFileSync(file, next);
+      return 0;
     },
   };
 }
 
 /** A real run with nothing that leaves the process: no launchctl, no real CLI, no fetch. */
-async function runInstaller(argv, env, health = { ok: true, port: DEFAULT_DAEMON_PORT, pid: 1, sessions: 0 }) {
-  const cli = fakeCli(env);
-  const output = await capture(() => main(argv, env, { run: cli.run, health: async () => health }));
-  return { ran: cli.ran, output };
+async function runInstaller(argv, env, options = {}) {
+  const health = options.health ?? { ok: true, port: DEFAULT_DAEMON_PORT, pid: 1, sessions: 0 };
+  const cli = fakeCli(env, options.launchctl);
+  const slept = [];
+  const output = await capture(() =>
+    main(argv, env, {
+      run: cli.run,
+      health: async () => health,
+      // No real waiting: the poll and the retry backoff are recorded instead.
+      sleep: async (ms) => slept.push(ms),
+    }),
+  );
+  return { ran: cli.ran, verbs: cli.verbs(), slept, output };
 }
 
 test("arguments select the browsers and the mode", () => {
@@ -258,15 +304,28 @@ test("the plan writes the launcher, the manifests, daemon.json and the launchd j
   assert.equal(plan.url, `http://127.0.0.1:${DEFAULT_DAEMON_PORT}/mcp`);
   assert.match(plan.helperCommand, /bin\/headers\.js$/);
 
-  // bootout first, and its failure is the normal case: launchd does not know the label yet.
-  const launchctl = plan.commands.filter((command) => command.name === "launchctl");
-  assert.equal(launchctl.length, 2);
-  assert.deepEqual(launchctl[0].args, ["bootout", `gui/${process.getuid()}/${DAEMON_LABEL}`]);
-  assert.equal(launchctl[0].optional, true);
-  assert.deepEqual(launchctl[1].args, ["bootstrap", `gui/${process.getuid()}`, daemonPlistPath(env)]);
-  assert.equal(launchctl[1].optional, false);
+  // The launchd job is a sequence, not a list of commands: see reloadDaemon.
+  assert.deepEqual(plan.commands.filter((command) => command.name === "launchctl"), []);
+  assert.equal(plan.launchd.label, DAEMON_LABEL);
+  assert.equal(plan.launchd.uid, process.getuid());
+  assert.equal(plan.launchd.plist, daemonPlistPath(env));
+  assert.equal(plan.launchd.uninstall, false);
+  assert.equal(plan.launchd.plistUnchanged, false, "nothing is on disk yet");
+  const verbs = launchdCommands(plan.launchd);
+  assert.deepEqual(verbs.print.args, ["print", `gui/${process.getuid()}/${DAEMON_LABEL}`]);
+  assert.equal(verbs.print.quiet, true, "it runs on every poll and prints a page each time");
+  assert.deepEqual(verbs.kickstart.args, ["kickstart", "-k", `gui/${process.getuid()}/${DAEMON_LABEL}`]);
+  assert.deepEqual(verbs.bootout.args, ["bootout", `gui/${process.getuid()}/${DAEMON_LABEL}`]);
+  assert.deepEqual(verbs.bootstrap.args, ["bootstrap", `gui/${process.getuid()}`, daemonPlistPath(env)]);
   // Codex's helper field has no CLI flag, so that one is a file edit, not a command.
   assert.deepEqual(plan.commands.filter((command) => command.name === "codex"), []);
+
+  // An identical plist already on disk is what lets the reload be a restart in place.
+  fs.mkdirSync(path.dirname(daemonPlistPath(env)), { recursive: true });
+  fs.writeFileSync(daemonPlistPath(env), daemonPlist(process.execPath, env));
+  assert.equal(buildPlan({ browsers: ["edge"], uninstall: false }, env).launchd.plistUnchanged, true);
+  fs.writeFileSync(daemonPlistPath(env), "<plist>something else</plist>");
+  assert.equal(buildPlan({ browsers: ["edge"], uninstall: false }, env).launchd.plistUnchanged, false);
 });
 
 test("Claude Code is registered through mcp add-json, which is the only CLI path for the helper", (t) => {
@@ -377,9 +436,8 @@ test("uninstall removes both browsers' manifests and the launchd job, and keeps 
     false,
     "the token survives an uninstall: a running session's registration still carries it",
   );
-  const launchctl = plan.commands.filter((command) => command.name === "launchctl");
-  assert.equal(launchctl.length, 1);
-  assert.deepEqual(launchctl[0].args, ["bootout", `gui/${process.getuid()}/${DAEMON_LABEL}`]);
+  assert.deepEqual(plan.commands.filter((command) => command.name === "launchctl"), []);
+  assert.equal(plan.launchd.uninstall, true);
   for (const edit of plan.edits) assert.match(edit.describe, /^remove /);
 });
 
@@ -517,13 +575,15 @@ test("--dry-run prints every file, edit and command and changes nothing", async 
   assert.match(output, /edit .*\.codex\/config\.toml: set \[mcp_servers\.browser\]/);
   assert.match(output, /http_headers_helper = /);
   assert.match(output, /env_http_headers = \{ "X-Browser-Bridge-Session" = "BROWSER_BRIDGE_SESSION_NAME"/);
-  assert.match(output, /run {2}\/bin\/launchctl bootout gui\/\d+\/com\.keep\.browser_bridge\.daemon {3}\(failure ignored\)/);
-  assert.match(output, /run {2}\/bin\/launchctl bootstrap gui\/\d+ /);
+  assert.match(output, /run {2}\/bin\/launchctl print gui\/\d+\/com\.keep\.browser_bridge\.daemon {3}\(is it loaded\?\)/);
+  assert.match(output, /if loaded: bootout .*then poll print until it is gone/);
+  assert.match(output, /then: bootstrap gui\/\d+ .*\(up to 5 attempts, 1 s apart\)/);
   assert.ok(
-    output.indexOf("launchctl bootout") < output.indexOf("launchctl bootstrap"),
-    "the bootout has to come first",
+    output.indexOf("launchctl print") < output.indexOf("bootstrap gui/"),
+    "it asks whether the job is loaded before it touches it",
   );
   assert.match(output, /wait for http:\/\/127\.0\.0\.1:47331\/healthz/);
+  assert.match(output, /exit non-zero, saying so, if it does not/);
   assert.match(output, /Load unpacked/);
   assert.match(output, new RegExp(EXTENSION_ID));
 
@@ -539,11 +599,8 @@ test("a real run writes the files, edits both configs and bootstraps the job", a
   );
   fs.writeFileSync(path.join(env.HOME, ".codex", "config.toml"), 'model = "gpt-5"\n');
 
-  const { ran, output } = await runInstaller([], env, {
-    ok: true,
-    port: DEFAULT_DAEMON_PORT,
-    pid: 999,
-    sessions: 0,
+  const { ran, verbs, output } = await runInstaller([], env, {
+    health: { ok: true, port: DEFAULT_DAEMON_PORT, pid: 999, sessions: 0 },
   });
 
   const launcher = path.join(env.HOME, RUNTIME, "native-host");
@@ -576,16 +633,11 @@ test("a real run writes the files, edits both configs and bootstraps the job", a
   assert.equal(fs.readFileSync(path.join(env.HOME, ".codex", "config.toml.bak"), "utf8"), 'model = "gpt-5"\n');
 
   assert.deepEqual(
-    ran.map((command) => `${command.name} ${command.args.slice(0, 2).join(" ")}`),
-    [
-      "launchctl bootout gui/" + process.getuid() + "/" + DAEMON_LABEL,
-      "launchctl bootstrap gui/" + process.getuid(),
-      "claude mcp remove",
-      "claude mcp add-json",
-      "claude mcp remove",
-      "claude mcp add-json",
-    ],
+    ran.filter((command) => command.name === "claude").map((command) => command.args[1]),
+    ["remove", "add-json", "remove", "add-json"],
   );
+  // Nothing was loaded, so there is nothing to boot out: ask, then bootstrap, then verify.
+  assert.deepEqual(verbs, ["print", "bootstrap", "print"]);
   assert.match(output, /daemon up on port 47331 \(pid 999\)/);
 
   // Running it again keeps the token and says the configs already agree.
@@ -599,12 +651,113 @@ test("a real run writes the files, edits both configs and bootstraps the job", a
   assert.ok(again.ran.some((command) => command.args[1] === "add-json"));
 });
 
+// --- the launchd teardown race -------------------------------------------
+//
+// `launchctl bootout` returns before the job is gone, and a bootstrap in that window fails
+// with "Bootstrap failed: 5: Input/output error". That happened for real on 2026-09-18: the
+// installer took the daemon down, reported success, and left every session without a
+// browser. Each of these is one step of the sequence that replaced it.
+
+test("an unchanged plist restarts the loaded job in place instead of tearing it down", async (t) => {
+  const env = fakeHome(t);
+  // Pre-seed exactly the plist this run would write, and say the job is loaded.
+  fs.mkdirSync(path.dirname(daemonPlistPath(env)), { recursive: true });
+  fs.writeFileSync(daemonPlistPath(env), daemonPlist(process.execPath, env));
+
+  const { verbs, output } = await runInstaller([], env, { launchctl: { loaded: true } });
+
+  assert.deepEqual(verbs, ["print", "kickstart", "print"], "no bootout, so no race to lose");
+  assert.match(output, /plist is unchanged; restarting it in place/);
+  assert.match(output, /daemon up on port 47331/);
+});
+
+test("a changed plist waits for the teardown to finish before bootstrapping", async (t) => {
+  const env = fakeHome(t);
+  fs.mkdirSync(path.dirname(daemonPlistPath(env)), { recursive: true });
+  fs.writeFileSync(daemonPlistPath(env), "<plist>an older version</plist>");
+
+  // launchd keeps reporting the job for two more polls after bootout returns.
+  const { verbs, slept, output } = await runInstaller([], env, {
+    launchctl: { loaded: true, stuckPolls: 2 },
+  });
+
+  assert.deepEqual(verbs, ["print", "bootout", "print", "print", "print", "bootstrap", "print"]);
+  assert.deepEqual(slept, [250, 250], "it polls rather than bootstrapping into the race");
+  assert.equal(output.includes("still loaded"), false, "the job did go away, so no complaint");
+  assert.match(output, /daemon up on port 47331/);
+});
+
+test("a bootstrap that fails once is retried", async (t) => {
+  const env = fakeHome(t);
+  // Exactly the live failure: the job was booted out, and the first bootstrap got EIO.
+  const { verbs, slept, output } = await runInstaller([], env, {
+    launchctl: { loaded: true, bootstrap: [5, 0] },
+  });
+
+  assert.deepEqual(verbs, ["print", "bootout", "print", "bootstrap", "bootstrap", "print"]);
+  assert.deepEqual(slept, [1000], "one second between attempts");
+  assert.match(output, /bootstrap failed \(attempt 1 of 5\); retrying/);
+  assert.match(output, /daemon up on port 47331/);
+});
+
+test("a job that never comes back is a non-zero exit and instructions, not a success", async (t) => {
+  const env = fakeHome(t);
+  const before = process.exitCode;
+  // Every bootstrap attempt fails, which is what left the daemon down in the live run.
+  const { verbs, slept, output } = await runInstaller([], env, {
+    launchctl: { loaded: true, bootstrap: [5, 5, 5, 5, 5] },
+  });
+
+  assert.equal(verbs.filter((verb) => verb === "bootstrap").length, 5, "five attempts, then it stops");
+  assert.deepEqual(slept, [1000, 1000, 1000, 1000]);
+  assert.match(output, /THE DAEMON IS DOWN \(the launchd job is not loaded; bootstrap failed\)/);
+  assert.match(output, /launchctl bootstrap gui\/\d+ .*\.plist/);
+  assert.equal(process.exitCode, 1);
+  process.exitCode = before;
+});
+
+test("a kickstart that fails falls back to the full reload", async (t) => {
+  const env = fakeHome(t);
+  fs.mkdirSync(path.dirname(daemonPlistPath(env)), { recursive: true });
+  fs.writeFileSync(daemonPlistPath(env), daemonPlist(process.execPath, env));
+
+  const { verbs, output } = await runInstaller([], env, {
+    launchctl: { loaded: true, kickstart: [1] },
+  });
+
+  assert.match(output, /kickstart failed; falling back to a full reload/);
+  assert.deepEqual(verbs, ["print", "kickstart", "print", "bootout", "print", "bootstrap", "print"]);
+  assert.match(output, /daemon up on port 47331/);
+});
+
+test("uninstall tolerates a job that is not loaded", async (t) => {
+  const env = fakeHome(t);
+  const before = process.exitCode;
+  const { verbs, output } = await runInstaller(["--uninstall"], env, { launchctl: { loaded: false } });
+
+  assert.deepEqual(verbs, ["print"], "nothing to boot out, so nothing is run");
+  assert.match(output, /is not loaded; nothing to boot out/);
+  assert.notEqual(process.exitCode, 1, "a job that is already gone is not a failure");
+  process.exitCode = before;
+});
+
+test("uninstall waits for a loaded job to actually go away", async (t) => {
+  const env = fakeHome(t);
+  const { verbs, slept } = await runInstaller(["--uninstall"], env, {
+    launchctl: { loaded: true, stuckPolls: 1 },
+  });
+  assert.deepEqual(verbs, ["print", "bootout", "print", "print", "print"]);
+  assert.deepEqual(slept, [250]);
+});
+
 test("a daemon that never answers /healthz is reported, not glossed over", async (t) => {
   const env = fakeHome(t);
   const before = process.exitCode;
-  const { output } = await runInstaller([], env, { ok: false, reason: "connect ECONNREFUSED" });
-  assert.match(output, /did not answer \/healthz within 10 s \(connect ECONNREFUSED\)/);
+  const { output } = await runInstaller([], env, { health: { ok: false, reason: "connect ECONNREFUSED" } });
+  assert.match(output, /THE DAEMON IS DOWN \(connect ECONNREFUSED; bootstrapped\)/);
   assert.match(output, /BrowserBridge\/daemon\.log/);
+  assert.match(output, /launchctl bootstrap gui\/\d+ /, "and how to start it by hand");
+  assert.match(output, /curl -s http:\/\/127\.0\.0\.1:47331\/healthz/);
   assert.equal(process.exitCode, 1);
   process.exitCode = before;
 });
@@ -616,7 +769,9 @@ test("a dry-run uninstall lists the removals and nothing about loading the exten
   assert.match(output, /remove .*LaunchAgents\/com\.keep\.browser_bridge\.daemon\.plist/);
   assert.match(output, /run {2}.*claude mcp remove --scope user browser/);
   assert.match(output, /edit .*\.codex\/config\.toml: remove \[mcp_servers\.browser\]/);
-  assert.match(output, /run {2}\/bin\/launchctl bootout/);
+  assert.match(output, /run {2}\/bin\/launchctl print gui\/\d+/);
+  assert.match(output, /if loaded: bootout /);
+  assert.match(output, /if not loaded: nothing to do/);
   assert.equal(output.includes("Load unpacked"), false, "there is nothing to load after an uninstall");
   assert.equal(output.includes("bootstrap"), false);
   assert.equal(output.includes("daemon.json"), false, "the token is not touched");
@@ -629,7 +784,7 @@ test("uninstall takes the registrations and the job out but leaves daemon.json",
   await runInstaller([], env);
 
   const token = JSON.parse(fs.readFileSync(path.join(env.HOME, RUNTIME, "daemon.json"), "utf8")).token;
-  const { ran } = await runInstaller(["--uninstall"], env);
+  const { ran, verbs, output } = await runInstaller(["--uninstall"], env);
 
   assert.equal(fs.existsSync(path.join(env.HOME, RUNTIME, "native-host")), false);
   assert.equal(fs.existsSync(hostManifestPath("edge", env)), false);
@@ -646,8 +801,8 @@ test("uninstall takes the registrations and the job out but leaves daemon.json",
     false,
   );
   assert.deepEqual(
-    ran.map((command) => `${command.name} ${command.args.slice(0, 2).join(" ")}`),
-    ["launchctl bootout gui/" + process.getuid() + "/" + DAEMON_LABEL, "claude mcp remove", "claude mcp remove"],
+    ran.filter((command) => command.name === "claude").map((command) => command.args[1]),
+    ["remove", "remove"],
   );
 });
 

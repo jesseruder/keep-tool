@@ -38,8 +38,10 @@ The installer:
    (`--chrome-too` adds Chrome's);
 3. writes `BrowserBridge/daemon.json` (mode 0600) with the loopback port and a random
    32-byte token, keeping the token if one is already there (`--rotate-token` replaces it);
-4. writes `~/Library/LaunchAgents/com.keep.browser_bridge.daemon.plist` and reloads it with
-   `launchctl bootout` then `launchctl bootstrap`, then waits for `/healthz`;
+4. writes `~/Library/LaunchAgents/com.keep.browser_bridge.daemon.plist` and reloads the
+   launchd job — `kickstart -k` when the plist has not changed, otherwise `bootout`, a poll
+   until launchd has really let go, and `bootstrap` with retries — then waits for `/healthz`
+   and **exits non-zero if the daemon is not answering**, rather than claiming success;
 5. points `browser` at `http://127.0.0.1:<port>/mcp` in every Claude config directory it
    finds and in `~/.codex` / `~/.codex-secondary`, with `bin/headers.js` as the headers
    helper that supplies the token and the session name. Neither CLI has a *flag* for a
@@ -165,6 +167,10 @@ Worth knowing:
 - **The daemon will not stay up** — `~/Library/Application Support/BrowserBridge/daemon.log`
   has one line per session plus the reason it exited. `launchctl print gui/$UID/com.keep.browser_bridge.daemon`
   shows what launchd thinks. A port already in use is an exit 1 with the reason.
+- **`node bin/install.js` printed `THE DAEMON IS DOWN`** — it tried and could not get the
+  job up, and it prints the commands to run by hand. `Bootstrap failed: 5: Input/output
+  error` means launchd had not finished removing the old job; the installer polls for that
+  now, so if it still happens, wait a few seconds and run it again.
 - **"Browser Bridge is not connected"** — Edge is closed, the extension is disabled, or
   the installer has not run. Open the popup and press Reconnect.
 - **The popup says disconnected** — look at `~/Library/Application Support/BrowserBridge/host.log`.

@@ -637,9 +637,25 @@ node bin/install.js [--browser edge|chrome] [--chrome-too] [--stdio]
    for no reason. `--rotate-token` is the way to do it deliberately.
 4. Write `~/Library/LaunchAgents/com.keep.browser_bridge.daemon.plist` (the same node the
    native-host launcher uses, `mcp/daemon.js`, RunAtLoad, KeepAlive, ThrottleInterval 5,
-   WorkingDirectory the bridge directory, both output paths `BrowserBridge/daemon.log`),
-   then `launchctl bootout gui/<uid>/<label>` (failure ignored — the normal case is that
-   launchd has never heard of it) and `launchctl bootstrap gui/<uid> <plist>`.
+   WorkingDirectory the bridge directory, both output paths `BrowserBridge/daemon.log`) and
+   bring the job up. **`launchctl bootout` returns before the job is actually gone**, and a
+   `bootstrap` inside that window fails with `Bootstrap failed: 5: Input/output error` — on
+   2026-09-18 that took the daemon down and the installer reported success anyway, leaving
+   every session without a browser. So the sequence is:
+
+   - `launchctl print gui/<uid>/<label>` to find out whether the job is loaded at all. Its
+     output is a page of job state and its exit code is the whole answer, so it runs quietly.
+   - If it is loaded **and** the plist already on disk is byte-identical to the one this run
+     would write, `launchctl kickstart -k gui/<uid>/<label>` restarts it in place. That is
+     the common case — a landing changes the code the job runs, not the job — and it skips
+     the teardown entirely. A kickstart that fails falls through to the full reload.
+   - Otherwise: `bootout`, then poll `print` every 250 ms until it reports the job gone (up
+     to 10 s), then `bootstrap`, retried up to 5 times 1 s apart while it fails.
+   - Then read the state back with `print` rather than trusting an exit code, because
+     launchd sometimes takes a job despite the status it returned.
+
+   `plistUnchanged` is computed in `buildPlan`, before anything is written, which is the only
+   moment the old content is still there to compare against.
 5. Register `browser` as an HTTP MCP server pointing at `http://127.0.0.1:<port>/mcp` with
    `bin/headers.js` as the headers helper, in every Claude config directory found
    (`~/.claude`, `~/.claude-secondary`, `~/.claude-tertiary`, and any `~/.claude-*` that
@@ -712,8 +728,11 @@ node bin/install.js [--browser edge|chrome] [--chrome-too] [--stdio]
    byte in the TOML — and both keep a `.bak`. An edit that would change nothing is skipped
    entirely, so a re-run does not churn a file a live session is holding. A file that is not
    valid JSON is reported with the block to paste and left exactly as it was.
-6. Wait up to 10 s for `GET /healthz` to answer and report the port, the pid and the
-   session count, or say the daemon never came up and where its log is (and exit 1).
+6. Wait up to 10 s for `GET /healthz` to answer and report the port, the pid and the session
+   count. **A dark `/healthz`, or a job launchd does not have loaded, is never reported as
+   success**: the installer prints `THE DAEMON IS DOWN`, where the log is, and the three
+   commands to bring it up by hand, and exits 1. Saying "installed" while the daemon was
+   down is what made the 2026-09-18 failure cost a working browser for every session.
 7. Print the extension directory to load via `edge://extensions` (Developer mode, Load
    unpacked) and the extension id the manifest key fixes.
 
@@ -721,8 +740,10 @@ node bin/install.js [--browser edge|chrome] [--chrome-too] [--stdio]
 registered through `claude mcp add` / `codex mcp add` as one stdio process per session.
 
 `--uninstall` removes the launcher, both browsers' manifests and the plist, boots the job
-out, and takes `browser` out of every config. `daemon.json` stays: sessions that are still
-running hold that token in their registration, and a reinstall must not lock them out.
+out (and waits for it to go, the same way; a job that is not loaded is the normal state and
+not an error), and takes `browser` out of every config. `daemon.json` stays: sessions that
+are still running hold that token in their registration, and a reinstall must not lock them
+out.
 
 **The daemon runs this checkout's files.** After every landing the job has to be reloaded,
 and `node bin/install.js` is what reloads it. Nothing else does — not a `git pull`, not a
@@ -784,7 +805,13 @@ needs no private key. The id is a constant in `host/protocol.js` and the install
 - `test/install.test.js`: `--dry-run` output, the manifest, the plist, `daemon.json`
   creation without rotation, both config edits as pure functions, and a real run against a
   temp HOME with a fake command runner and a fake health probe (nothing reaches launchd,
-  the real CLIs or the network).
+  the real CLIs or the network). The fake `launchctl` models the job's state, so the
+  teardown race is reproducible: an unchanged plist takes the kickstart path and never
+  boots out, a changed one polls `print` until the job is gone before bootstrapping, a
+  bootstrap that fails once is retried, five failures are an exit 1 with the commands to
+  run by hand, a failed kickstart falls back to the full reload, and an uninstall against a
+  job that is not loaded runs nothing and is not a failure. The poll and the retry delays
+  are a `sleep` hook, so none of it waits.
 
 Live verification against Edge is done from the driving session, not by the
 implementer.

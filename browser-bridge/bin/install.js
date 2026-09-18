@@ -438,32 +438,20 @@ export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) 
     });
   }
 
-  if (options.uninstall || daemon) {
-    const uid = typeof process.getuid === "function" ? process.getuid() : 501;
-    const plist = daemonPlistPath(env);
-    // bootout first: launchd refuses to bootstrap a label it already knows, and the
-    // failure when it does not know it yet is the normal case.
-    commands.push({
-      label: "launchctl bootout",
-      bin: LAUNCHCTL,
-      name: "launchctl",
-      args: ["bootout", `gui/${uid}/${DAEMON_LABEL}`],
-      env: {},
-      optional: true,
-      fallback: `Run: launchctl bootout gui/${uid}/${DAEMON_LABEL}`,
-    });
-    if (!options.uninstall) {
-      commands.push({
-        label: "launchctl bootstrap",
-        bin: LAUNCHCTL,
-        name: "launchctl",
-        args: ["bootstrap", `gui/${uid}`, plist],
-        env: {},
-        optional: false,
-        fallback: `Run: launchctl bootstrap gui/${uid} ${plist}`,
-      });
-    }
-  }
+  const launchd =
+    options.uninstall || daemon
+      ? {
+          uid: typeof process.getuid === "function" ? process.getuid() : 501,
+          label: DAEMON_LABEL,
+          plist: daemonPlistPath(env),
+          uninstall: Boolean(options.uninstall),
+          // Read before anything is written: the point of knowing is to decide whether the
+          // job can be restarted in place instead of torn down and put back.
+          plistUnchanged: daemon
+            ? readIfPresent(daemonPlistPath(env)) === daemonPlist(nodePath, env, projectDir)
+            : false,
+        }
+      : null;
 
   const claudeBin = which("claude");
   for (const { dir, useEnv } of claudeConfigDirs(env)) {
@@ -537,7 +525,109 @@ export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) 
     });
   }
 
-  return { files, removals, commands, edits, nodePath, serverPath, daemonPath, helperCommand, daemon, url };
+  return {
+    files,
+    removals,
+    commands,
+    edits,
+    launchd,
+    nodePath,
+    serverPath,
+    daemonPath,
+    helperCommand,
+    daemon,
+    url,
+  };
+}
+
+function readIfPresent(file) {
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+// --- talking to launchd ---------------------------------------------------
+//
+// `launchctl bootout` returns before the job is actually gone, and a `bootstrap` inside
+// that window fails with "Bootstrap failed: 5: Input/output error" - which is how a
+// re-install once left the daemon down while the installer reported success. So: restart
+// in place when nothing about the job has changed, and otherwise wait for the teardown to
+// finish before putting it back, with retries, and never claim success without checking.
+
+/** How long launchd gets to finish removing a job after bootout returns. */
+const BOOTOUT_WAIT_MS = 10_000;
+const BOOTOUT_POLL_MS = 250;
+const BOOTSTRAP_ATTEMPTS = 5;
+const BOOTSTRAP_RETRY_MS = 1_000;
+
+function launchctlCommand(label, args, { quiet = false } = {}) {
+  return { label, bin: LAUNCHCTL, name: "launchctl", args, env: {}, optional: true, quiet };
+}
+
+export function launchdCommands({ uid, label, plist }) {
+  return {
+    print: launchctlCommand("launchctl print", ["print", `gui/${uid}/${label}`], { quiet: true }),
+    kickstart: launchctlCommand("launchctl kickstart", ["kickstart", "-k", `gui/${uid}/${label}`]),
+    bootout: launchctlCommand("launchctl bootout", ["bootout", `gui/${uid}/${label}`]),
+    bootstrap: launchctlCommand("launchctl bootstrap", ["bootstrap", `gui/${uid}`, plist]),
+  };
+}
+
+/**
+ * Bring the launchd job to the state the plan asks for. Returns `{loaded, how}`; `loaded`
+ * is what the caller reports on, and it is read back from launchd rather than inferred
+ * from an exit code.
+ */
+export async function reloadDaemon(launchd, { run, sleep, write = (text) => process.stdout.write(text) }) {
+  const commands = launchdCommands(launchd);
+  const isLoaded = () => run(commands.print) === 0;
+
+  if (launchd.uninstall) {
+    // A job that is not loaded is the normal state after a first uninstall, or after a
+    // reboot with the plist already gone. Nothing to do, and nothing to complain about.
+    if (!isLoaded()) {
+      write(`${launchd.label} is not loaded; nothing to boot out\n`);
+      return { loaded: false, how: "already gone" };
+    }
+    run(commands.bootout);
+    await waitForGone(commands, { run, sleep });
+    return { loaded: isLoaded(), how: "booted out" };
+  }
+
+  if (launchd.plistUnchanged && isLoaded()) {
+    // Same plist, same job: restarting in place skips the teardown race entirely, which is
+    // the common case (a landing changes the code the job runs, not the job).
+    write(`${launchd.label} is loaded and its plist is unchanged; restarting it in place\n`);
+    if (run(commands.kickstart) === 0) return { loaded: isLoaded(), how: "kickstarted" };
+    write("kickstart failed; falling back to a full reload\n");
+  }
+
+  if (isLoaded()) {
+    run(commands.bootout);
+    if (!(await waitForGone(commands, { run, sleep }))) {
+      write(`${launchd.label} is still loaded ${BOOTOUT_WAIT_MS / 1000}s after bootout; bootstrapping anyway\n`);
+    }
+  }
+
+  for (let attempt = 1; attempt <= BOOTSTRAP_ATTEMPTS; attempt++) {
+    if (run(commands.bootstrap) === 0) return { loaded: isLoaded(), how: "bootstrapped" };
+    if (attempt < BOOTSTRAP_ATTEMPTS) {
+      write(`bootstrap failed (attempt ${attempt} of ${BOOTSTRAP_ATTEMPTS}); retrying\n`);
+      await sleep(BOOTSTRAP_RETRY_MS);
+    }
+  }
+  // launchd may have taken it despite the last exit code, so ask rather than assume.
+  return { loaded: isLoaded(), how: "bootstrap failed" };
+}
+
+async function waitForGone(commands, { run, sleep }) {
+  for (let waited = 0; waited < BOOTOUT_WAIT_MS; waited += BOOTOUT_POLL_MS) {
+    if (run(commands.print) !== 0) return true;
+    await sleep(BOOTOUT_POLL_MS);
+  }
+  return run(commands.print) !== 0;
 }
 
 function claudeFallback(entry, dir, env) {
@@ -578,7 +668,24 @@ export function renderPlan(plan, options) {
       );
     }
   }
-  if (plan.daemon) lines.push(`wait for ${plan.url.replace("/mcp", "/healthz")} to answer (up to 10 s)`);
+  if (plan.launchd) {
+    const { uid, label, plist, plistUnchanged, uninstall } = plan.launchd;
+    lines.push(`run  ${LAUNCHCTL} print gui/${uid}/${label}   (is it loaded?)`);
+    if (uninstall) {
+      lines.push(`     if loaded: bootout gui/${uid}/${label}, then poll print until it is gone`);
+      lines.push("     if not loaded: nothing to do");
+    } else if (plistUnchanged) {
+      lines.push(`     the plist on disk already matches, so if it is loaded: kickstart -k gui/${uid}/${label}`);
+      lines.push(`     otherwise: bootout, poll print until gone, then bootstrap gui/${uid} ${plist}`);
+    } else {
+      lines.push(`     if loaded: bootout gui/${uid}/${label}, then poll print until it is gone`);
+      lines.push(`     then: bootstrap gui/${uid} ${plist} (up to 5 attempts, 1 s apart)`);
+    }
+  }
+  if (plan.daemon) {
+    lines.push(`wait for ${plan.url.replace("/mcp", "/healthz")} to answer (up to 10 s)`);
+    lines.push("     and exit non-zero, saying so, if it does not");
+  }
   return lines.join("\n");
 }
 
@@ -666,37 +773,43 @@ async function waitForHealth(url, timeoutMs = HEALTH_TIMEOUT_MS) {
   }
 }
 
+/** Returns the exit status, which the launchd sequence reads; 127 when there is no binary. */
 function runCommand(command) {
   if (!command.bin) {
-    if (command.optional) return;
+    if (command.optional) return 127;
     // An edit of our own is better than a message the user has to act on, but only as a
     // second choice: the CLI is what other sessions expect to be writing that file.
     if (command.orEdit) {
       process.stdout.write(`${command.name} is not installed; editing the config directly\n`);
       applyEdit(command.orEdit);
-      return;
+      return 127;
     }
     process.stdout.write(`${command.name} is not installed; add it by hand:\n${command.fallback}\n\n`);
-    return;
+    return 127;
   }
-  process.stdout.write(`$ ${describeCommand(command)}\n`);
+  // A quiet command is one whose output is noise and whose exit code is the answer -
+  // `launchctl print` runs on every poll and prints a page of job state each time.
+  if (!command.quiet) process.stdout.write(`$ ${describeCommand(command)}\n`);
   const env = { ...process.env };
   for (const [key, value] of Object.entries(command.env)) {
     if (value == null) delete env[key];
     else env[key] = value;
   }
-  const result = spawnSync(command.bin, command.args, { env, stdio: "inherit" });
-  if (result.status === 0) return;
+  const result = spawnSync(command.bin, command.args, {
+    env,
+    stdio: command.quiet ? "ignore" : "inherit",
+  });
+  const status = result.status ?? 1;
+  if (status === 0) return 0;
   // The pre-emptive remove fails whenever nothing was registered, which is the normal case.
-  if (command.optional) return;
+  if (command.optional) return status;
   if (command.orEdit) {
-    process.stdout.write(`${command.label} refused (exit ${result.status}); editing the config directly\n`);
+    process.stdout.write(`${command.label} refused (exit ${status}); editing the config directly\n`);
     applyEdit(command.orEdit);
-    return;
+    return status;
   }
-  process.stdout.write(
-    `${command.label} refused (exit ${result.status}); add it by hand:\n${command.fallback}\n\n`,
-  );
+  process.stdout.write(`${command.label} refused (exit ${status}); add it by hand:\n${command.fallback}\n\n`);
+  return status;
 }
 
 const HELP = `Browser Bridge installer
@@ -724,6 +837,7 @@ change only reaches sessions once the daemon has been restarted, which this does
 export async function main(argv, env = process.env, hooks = {}) {
   const run = hooks.run ?? runCommand;
   const health = hooks.health ?? waitForHealth;
+  const sleep = hooks.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   let options;
   try {
     options = parseArgs(argv);
@@ -750,15 +864,25 @@ export async function main(argv, env = process.env, hooks = {}) {
   for (const edit of plan.edits ?? []) applyEdit(edit);
   for (const command of plan.commands) run(command);
 
+  let reloaded = null;
+  if (plan.launchd) reloaded = await reloadDaemon(plan.launchd, { run, sleep });
+
   if (plan.daemon) {
-    const status = await health(plan.url.replace("/mcp", "/healthz"));
+    const status = reloaded?.loaded === false ? { ok: false, reason: "the launchd job is not loaded" } : await health(plan.url.replace("/mcp", "/healthz"));
     if (status.ok) {
       process.stdout.write(`daemon up on port ${status.port} (pid ${status.pid}), ${status.sessions} session(s)\n`);
     } else {
+      // Never "installed" while /healthz is dark: that is exactly how a reload once left
+      // every session without a browser and said nothing.
       process.stdout.write(
-        `the daemon did not answer /healthz within 10 s (${status.reason}); look at ${daemonLogPath(env)}\n`,
+        `\nTHE DAEMON IS DOWN (${status.reason}; ${reloaded?.how ?? "not reloaded"}).\n` +
+          `Look at ${daemonLogPath(env)}, then start it by hand:\n` +
+          `  launchctl bootout gui/${plan.launchd.uid}/${plan.launchd.label}\n` +
+          `  launchctl bootstrap gui/${plan.launchd.uid} ${plan.launchd.plist}\n` +
+          `  curl -s http://127.0.0.1:${plan.daemon.port}/healthz\n`,
       );
       process.exitCode = 1;
+      return;
     }
   }
 
