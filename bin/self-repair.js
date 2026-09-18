@@ -16,6 +16,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { ref: sessionRef } = require('./session-numbers.js');
 const crypto = require('crypto');
 const { execFile } = require('child_process');
 const keep = require('./keep.js');
@@ -952,7 +953,7 @@ function launchNote(candidate, cardId, worktree, opened, config, artifacts, mode
   return [
     `Self-repair launched for ${candidate.sig}.`,
     `Worktree: ${worktree} (branch wt/${worktreeName(candidate.sig)}).`,
-    `Session: ${sessionId ? sessionId.slice(0, 8) : 'unknown'} in pane ${(opened && opened.pane) || 'unknown'};`
+    `Session: ${sessionId ? sessionRef(sessionId) : 'unknown'} in pane ${(opened && opened.pane) || 'unknown'};`
       + ` account purpose: repair; model: ${model || config.model}; aim: ${config.budgetMin}m.`,
     artifacts.length ? `Evidence: ${artifacts.join(', ')}.` : 'Evidence: none stored.',
     'The agent may not restart the daemon until its fix is landed; after `keep land` it pulls ~/keep-tool and restarts the daemon itself.',
@@ -1060,7 +1061,7 @@ async function launchRepair(candidate, cardId, artifacts, context) {
     deps.checkin(cardId, {
       heading: 'self-repair',
       message: `Found the repair session already running in pane ${existing.pane}`
-        + `${existing.sessionId ? ` (session ${String(existing.sessionId).slice(0, 8)})` : ''};`
+        + `${existing.sessionId ? ` (session ${sessionRef(existing.sessionId)})` : ''};`
         + ' no second session was opened.',
       linkSession: false,
       commitLabel: SELF_NAME,
@@ -1102,7 +1103,7 @@ async function launchRepair(candidate, cardId, artifacts, context) {
     if (started && started.pane) {
       deps.checkin(cardId, {
         heading: 'self-repair',
-        message: `A repair session opened in pane ${started.pane}${started.sessionId ? ` (session ${String(started.sessionId).slice(0, 8)})` : ''},`
+        message: `A repair session opened in pane ${started.pane}${started.sessionId ? ` (session ${sessionRef(started.sessionId)})` : ''},`
           + ` but the launch could not be confirmed: ${clip(error && error.message || error, 300)}.`
           + ` Look at that pane before doing anything: it is probably running. If it has already exited,`
           + ` a later tick relaunches it once the session has stayed gone for ${describeAge(PANE_DEAD_GRACE_MS)};`
@@ -1159,7 +1160,7 @@ function resumeBlocker(entry, config, now) {
   // window. The session is kept on the entry until a new one replaces it, so the
   // marker stays armed, but it no longer blocks.
   if (launched && !entry.relaunchDue) {
-    return `card ${entry.cardId} is already open for this signature (session ${String(launched).slice(0, 8)})`;
+    return `card ${entry.cardId} is already open for this signature (session ${sessionRef(launched)})`;
   }
   // `runId` is the pre-session spelling, from a headless run. Those were killed at
   // budgetMin, capped at 90 minutes, so after that the run is certainly dead and
@@ -1387,7 +1388,7 @@ async function tick(input = {}) {
           }
         }, { root, now, write: deps.write });
         result.resumed.push({ sig: candidate.sig, cardId: entry.cardId, sessionId: resumed.sessionId || null, launched: resumed.launched });
-        deps.write(`keep self-repair: resumed the launch for ${entry.cardId}${resumed.launched ? ` (session ${String(resumed.sessionId || resumed.pane || '?').slice(0, 8)})` : ' — still not launched'}\n`);
+        deps.write(`keep self-repair: resumed the launch for ${entry.cardId}${resumed.launched ? ` (session ${(sessionRef(resumed.sessionId || resumed.pane) || '?')})` : ' — still not launched'}\n`);
         if (gaveUp) {
           try {
             deps.checkin(entry.cardId, {
@@ -1504,7 +1505,7 @@ async function tick(input = {}) {
       else delete fresh.launchError;
     }, { root, now, write: deps.write });
     result.opened.push({ sig: candidate.sig, cardId: card.cardId, sessionId: launched.sessionId || null, worktree: launched.worktree || null, launched: Boolean(launched.launched) });
-    deps.write(`keep self-repair: opened ${card.cardId} for ${candidate.sig}${launched.launched ? ` (session ${String(launched.sessionId || launched.pane || '?').slice(0, 8)})` : ''}\n`);
+    deps.write(`keep self-repair: opened ${card.cardId} for ${candidate.sig}${launched.launched ? ` (session ${(sessionRef(launched.sessionId || launched.pane) || '?')})` : ''}\n`);
     deps.onChange();
   }
 
@@ -1581,7 +1582,7 @@ function renderStatus(value) {
       : row.deadSince ? ` — pane unseen since ${stamp(row.deadSince)}`
         : '');
   section('open', value.open, (row) => `${row.sig} — card ${row.cardId}`
-    + `${row.sessionId ? `, session ${String(row.sessionId).slice(0, 8)}` : ''}${row.pane ? ` in pane ${row.pane}` : ''}`
+    + `${row.sessionId ? `, session ${sessionRef(row.sessionId)}` : ''}${row.pane ? ` in pane ${row.pane}` : ''}`
     + `${row.worktree ? `, ${row.worktree}` : ''}`
     + `, opened ${stamp(row.openedAt)}, ${row.attempts || 1} attempt(s)${state(row)}`);
   section('cooling down', value.cooling, (row) => `${row.sig} — card ${row.cardId || '(none)'}, until ${stamp(row.cooldownUntil)}`);

@@ -11,6 +11,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { ref: sessionRef } = require('./session-numbers.js');
 const keep = require('./keep.js');
 const health = require('./health.js');
 
@@ -351,7 +352,7 @@ async function tick(deps = {}) {
     try { writeLedger(root, ledger); }
     catch (error) { return { ok: false, sent, waiting, detail: `ledger write failed: ${error.message}` }; }
 
-    const short = String(session.id).slice(0, 8);
+    const short = sessionRef(session.id);
     try {
       await deps.send(session.id, RESUME_TEXT, { hitAt: entry.hitAt });
       entry.sentAt = now;

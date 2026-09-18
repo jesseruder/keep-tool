@@ -150,3 +150,21 @@ test('the CLI reads numbers without allocating: pane ls labels the session colum
   assert.equal((await resolveHostPane(digitClient, '1')).id, '1', 'an exact pane id beats a session number');
   assert.equal((await resolveHostPane(digitClient, '#1')).id, 'p1', '#1 still names the numbered session');
 });
+
+test('ref and named print a session by its number, falling back to the id prefix', () => {
+  const dir = root();
+  const numbered = '4f1c2a9e-0000-4000-8000-000000000001';
+  const unnumbered = 'a9b8c7d6-0000-4000-8000-000000000002';
+  assert.equal(numbers.ref(numbered, { root: dir }), '4f1c2a9e', 'no registry yet: the prefix');
+  numbers.assign([{ id: numbered, mtime: 1 }], { root: dir });
+  assert.equal(numbers.ref(numbered, { root: dir }), '#1');
+  assert.equal(numbers.named(numbered, { root: dir }), `#1 (${numbered})`);
+  assert.equal(numbers.ref(unnumbered, { root: dir }), 'a9b8c7d6');
+  assert.equal(numbers.named(unnumbered, { root: dir }), unnumbered);
+  assert.equal(numbers.ref(undefined, { root: dir }), '');
+  assert.equal(numbers.ref('', { root: dir }), '');
+
+  // The cache follows the registry file: a number allocated later shows up.
+  numbers.assign([{ id: unnumbered, mtime: 2 }], { root: dir });
+  assert.equal(numbers.ref(unnumbered, { root: dir }), '#2');
+});

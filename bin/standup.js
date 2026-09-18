@@ -5,6 +5,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { ref: sessionRef } = require('./session-numbers.js');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const keep = require('./keep.js');
@@ -131,7 +132,7 @@ function oneLine(value, limit) {
 
 function actor(by) {
   const value = by && typeof by === 'object' ? by : {};
-  return [value.agent || 'manual', String(value.sessionId || '').slice(0, 8)].filter(Boolean).join(' ');
+  return [value.agent || 'manual', sessionRef(value.sessionId)].filter(Boolean).join(' ');
 }
 
 function collectHolds(root, now) {

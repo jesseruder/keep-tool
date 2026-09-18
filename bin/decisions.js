@@ -12,6 +12,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { ref: sessionRef } = require('./session-numbers.js');
 const keep = require('./keep.js');
 
 const FILE = () => path.join(keep.META, 'decisions.json');
@@ -273,7 +274,7 @@ function formatDecision(entry, { verbose = false } = {}) {
   if (!verbose) return `${head}\n    ${entry.why}`;
   const lines = [head, `    why:  ${entry.why}`];
   if (entry.message) lines.push(`    send: ${entry.message}`);
-  if (entry.session) lines.push(`    to:   session ${String(entry.session).slice(0, 8)}`);
+  if (entry.session) lines.push(`    to:   session ${sessionRef(entry.session)}`);
   if (entry.note) lines.push(`    you:  ${entry.note}`);
   return lines.join('\n');
 }

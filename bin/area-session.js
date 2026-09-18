@@ -43,6 +43,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { ref: sessionRef } = require('./session-numbers.js');
 const crypto = require('crypto');
 const { execFile } = require('child_process');
 const keep = require('./keep.js');
@@ -1444,7 +1445,7 @@ function describe(report) {
   if (report.recipe) lines.push(`  recipe: ${report.recipe.state} (${report.recipe.path})`);
   if (report.launch) {
     lines.push(`  launch: ${report.launch.state}${report.launch.reason ? ` — ${report.launch.reason}` : ''}`
-      + `${report.launch.id ? ` session ${String(report.launch.id).slice(0, 8)}` : ''}`
+      + `${report.launch.id ? ` session ${sessionRef(report.launch.id)}` : ''}`
       + `${report.launch.pane ? ` pane ${report.launch.pane}` : ''}`);
   }
   if (report.delivery) {

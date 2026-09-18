@@ -32,6 +32,7 @@ const cardUsage = require('./card-usage.js');
 const delegation = require('./delegation.js');
 const features = require('./features.js');
 const sessionNumbers = require('./session-numbers.js');
+const { ref: sessionRef } = sessionNumbers;
 const { TELL_TEXT_LIMIT } = require('./tell.js');
 const sessionNames = require('./session-names.js');
 const sessionMarks = require('./session-marks.js');
@@ -194,14 +195,14 @@ commands.add = (argv) => {
   const shadow = filesOnly ? null : shadowOwner();
   const endedDelegation = assigned.kind === 'ended' && assigned.explicit;
   if (shadow && !o.force && !endedDelegation) {
-    die(`this Codex session was started by claude ${shadow.parentId.slice(0, 8)}, which owns ${shadow.owned.id} ("${shadow.owned.fm.title}").\n`
+    die(`this Codex session was started by claude ${sessionRef(shadow.parentId)}, which owns ${shadow.owned.id} ("${shadow.owned.fm.title}").\n`
       + `  Contribute there with keep checkin ${shadow.owned.id} -m "..." (no claim needed), or have the parent register the step with keep delegate ${shadow.owned.id} --step <n> --prepare.\n`
       + '  File deliberately independent work with --file, or pass --force to create a top-level card anyway.');
   }
   // A card that passed deliberately must not look abandoned: the lint rule flags a
   // worker's card with no log entries, so record the decision as its created entry.
   const forcedNote = shadow && !o.m
-    ? `Created ${o.force ? 'with --force' : 'after an explicitly ended delegation'} as independent of ${shadow.owned.id}, the card this worker's parent claude ${shadow.parentId.slice(0, 8)} owns.`
+    ? `Created ${o.force ? 'with --force' : 'after an explicitly ended delegation'} as independent of ${shadow.owned.id}, the card this worker's parent claude ${sessionRef(shadow.parentId)} owns.`
     : undefined;
   const plan = splitPlanValues(o.plan || []).map((text) => ({ text: cleanPlanText(text), state: 'todo' }));
   applyDoneWhen(plan, o['done-when']);
@@ -1237,7 +1238,7 @@ commands.show = (argv) => {
   if (f.probe) console.log(`  probe: ${f.probe}`);
   if (f.sessions && f.sessions.length) {
     const s = f.sessions[f.sessions.length - 1];
-    console.log(`  last session: ${s.id} (${s.at})  →  ${resumeCommand(s)}`);
+    console.log(`  last session: ${sessionNumbers.named(s.id, { root: ROOT })} (${s.at})  →  ${resumeCommand(s)}`);
   }
   const artifacts = artifactFiles(task.id);
   if (artifacts.length) {
@@ -1251,7 +1252,12 @@ commands.show = (argv) => {
     const next = nextStep(task);
     console.log(next ? `  next: step ${next.n}/${parsed.steps.length} — ${next.text}` : '  next: none');
   }
-  if (parsed.rest) console.log('\n' + parsed.rest.trim());
+  // The card stores `(by <agent> <full id>)` for the reviewer to parse; a reader
+  // gets the session's number, which is what agents should repeat.
+  if (parsed.rest) {
+    console.log('\n' + parsed.rest.trim().replace(/^(## .*\(by (?:claude|codex) )([A-Za-z0-9_-]+)\)/gm,
+      (whole, head, sid) => (sessionNumbers.numberFor(sid, { root: ROOT }) ? `${head}${sessionRef(sid, { root: ROOT })})` : whole)));
+  }
 };
 
 // Run a card's probe once, right now, with the daemon's semantics and none of its
@@ -1491,8 +1497,8 @@ commands.reviewed = (argv) => {
     const session = commandSession();
     const owners = (task.fm.sessions || []).map((entry) => entry.id);
     if (session && owners.length && !owners.includes(session.id)) {
-      process.stderr.write(`keep: note — ${id} is claimed by ${owners.map((owner) => owner.slice(0, 8)).join(', ')},`
-        + ` not this ${session.agent} session ${String(session.id).slice(0, 8)}; the record is filed anyway\n`);
+      process.stderr.write(`keep: note — ${id} is claimed by ${owners.map((owner) => sessionRef(owner)).join(', ')},`
+        + ` not this ${session.agent} session ${sessionRef(session.id)}; the record is filed anyway\n`);
     }
     // `code-review`, never a bare `review`: bin/review.js swallows a log heading
     // that starts with the word review as one of the fleet reviewer's own notes.
@@ -1666,7 +1672,7 @@ commands.hold = (argv) => {
       message: `Holding ${project} [${require('./hold-scopes').label(hold)}] until ${until}: ${reason}`,
     });
   }
-  console.log(`${hold.id}: ${project} [${require('./hold-scopes').label(hold)}] held until ${until} by ${hold.by.agent}${hold.by.sessionId ? ` session ${hold.by.sessionId.slice(0, 8)}` : ''} — ${reason}`);
+  console.log(`${hold.id}: ${project} [${require('./hold-scopes').label(hold)}] held until ${until} by ${hold.by.agent}${hold.by.sessionId ? ` session ${sessionRef(hold.by.sessionId)}` : ''} — ${reason}`);
 };
 
 commands.release = (argv) => {
@@ -1695,7 +1701,7 @@ commands.holds = (argv) => {
   if (!holds.length) return console.log('no active holds');
   for (const hold of holds) {
     const by = hold.by || {};
-    console.log(`${hold.id}  ${hold.project}  [${require('./hold-scopes').label(hold)}]  until ${hold.until}  ${by.agent || 'manual'}${by.sessionId ? ` ${by.sessionId.slice(0, 8)}` : ''}  ${hold.reason}`);
+    console.log(`${hold.id}  ${hold.project}  [${require('./hold-scopes').label(hold)}]  until ${hold.until}  ${by.agent || 'manual'}${by.sessionId ? ` ${sessionRef(by.sessionId)}` : ''}  ${hold.reason}`);
   }
 };
 
@@ -2140,7 +2146,7 @@ commands['self-repair'] = async (argv) => {
     if (o.json) return process.stdout.write(JSON.stringify({ signature: o.reset, sessionAlive, ...result }, null, 2) + '\n');
     if (!result.found) return console.log(`no such signature: ${o.reset}`);
     if (result.reason === 'session-alive') {
-      return console.log(`${o.reset} still has a repair session running (${entry.sessionId ? `session ${String(entry.sessionId).slice(0, 8)}, ` : ''}pane ${entry.pane || '?'})`
+      return console.log(`${o.reset} still has a repair session running (${entry.sessionId ? `session ${sessionRef(entry.sessionId)}, ` : ''}pane ${entry.pane || '?'})`
         + `\nwait for it, or close the pane (keep pane kill ${entry.pane || '<pane>'}), then reset`);
     }
     if (result.reason === 'unverified') {
@@ -2619,7 +2625,7 @@ commands.verify = async (argv, deps = {}) => {
   if (response.status === 200 && result.ok) {
     // Nothing runs headless: the recipe is delivered into a session, which records the
     // outcome as a check-in on the card the way any other check does.
-    const where = result.sessionId ? ` ${String(result.sessionId).slice(0, 8)}` : '';
+    const where = result.sessionId ? ` ${sessionRef(result.sessionId)}` : '';
     (deps.log || console.log)(result.delivered === 'thread'
       ? `verify delivered into this card's open ${result.kind || 'claude'} session${where}`
       : `verify opened a fresh session${where}${result.pane ? ` in pane ${result.pane}` : ''} on this card`);
@@ -2989,7 +2995,7 @@ commands.restore = async (argv, deps = {}) => {
   const stderr = deps.stderr || process.stderr.write.bind(process.stderr);
   const now = (deps.now || Date.now)();
   for (const row of plan.sessions) {
-    stdout(`${row.action} ${row.agent} ${String(row.id || row.sessionId).slice(0, 8)} ${row.project || '-'} ${row.reason}; last seen ${restoreAge(row.lastSeenAlive, now)} ago`);
+    stdout(`${row.action} ${row.agent} ${sessionRef(row.id || row.sessionId)} ${row.project || '-'} ${row.reason}; last seen ${restoreAge(row.lastSeenAlive, now)} ago`);
   }
   if (o.dry) return;
   let restored = 0;

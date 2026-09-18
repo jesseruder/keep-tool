@@ -10,6 +10,7 @@ const {
   checkinTask, nowStamp,
 } = require('../keep-core.js');
 const fs = require('fs');
+const { ref: sessionRef } = require('../session-numbers.js');
 const path = require('path');
 const os = require('os');
 const { execFileSync } = require('child_process');
@@ -553,7 +554,7 @@ commands.hook = async (argv) => {
   try {
     const sessionId = String(input.session_id || '');
     cleared = sweepNeeds(process.env, sessionId,
-      `${input.agent === 'codex' ? 'codex' : 'claude'} session ${sessionId.slice(0, 8)}`);
+      `${input.agent === 'codex' ? 'codex' : 'claude'} session ${sessionRef(sessionId)}`);
   } catch {}
   // The context below is guidance for a session someone drives. Headless runs
   // (claude -p, the Agent SDK, Keep's own runs) pay for it on every call and
@@ -591,7 +592,7 @@ commands.hook = async (argv) => {
   const allHolds = activeHolds();
   const holdLine = (hold, advice) => {
     const by = hold.by || {};
-    return `⛔ ${hold.project} [${require('../hold-scopes').label(hold)}] held until ${String(hold.until).slice(11, 16)} by ${by.agent || 'manual'} session ${String(by.sessionId || '').slice(0, 8) || '(none)'}: ${clip(hold.reason)}. ${advice}`;
+    return `⛔ ${hold.project} [${require('../hold-scopes').label(hold)}] held until ${String(hold.until).slice(11, 16)} by ${by.agent || 'manual'} session ${sessionRef(by.sessionId) || '(none)'}: ${clip(hold.reason)}. ${advice}`;
   };
   const holds = allHolds.filter((hold) => projectMatchesCwd(hold.project, cwd));
   if (holds.length) {
@@ -1636,7 +1637,7 @@ function recordDeploy(input) {
   if (!entry) return null;
   const task = taskForSession(sid);
   if (!task) {
-    process.stderr.write(`keep: ${entry.heading} (${entry.message.split('\n')[0]}) — session ${sid.slice(0, 8)} has no card, so nothing recorded it\n`);
+    process.stderr.write(`keep: ${entry.heading} (${entry.message.split('\n')[0]}) — session ${sessionRef(sid)} has no card, so nothing recorded it\n`);
     return null;
   }
   checkinTask(task.id, { ...entry, linkSession: false, commitLabel: 'deploy' });
@@ -1694,7 +1695,7 @@ function openerDescription(opener, options = {}) {
   const onCard = card ? ` on card ${card}` : '';
   switch (kind) {
     case 'agent': return id ? `agent ${id}` : 'a Keep agent';
-    case 'session': return `session ${id.slice(0, 8) || '(unknown)'}${onCard}`;
+    case 'session': return `session ${sessionRef(id) || '(unknown)'}${onCard}`;
     case 'check': return `the scheduled check${onCard}`;
     case 'repair': return `self-repair${card ? ` of card ${card}` : ''}`;
     case 'review-queue': return `the review queue${onCard}`;

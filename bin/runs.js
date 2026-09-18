@@ -10,6 +10,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { ref: sessionRef } = require('./session-numbers.js');
 const os = require('os');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
@@ -209,7 +210,7 @@ function deliveryWarning(task, delivery) {
   if (!delivery || delivery.truncated !== true) return null;
   return {
     heading: 'delivery warning',
-    message: `The scheduled check was typed into ${delivery.kind} session ${String(delivery.sessionId || '').slice(0, 8)} but arrived truncated (${delivery.received}/${delivery.expected} chars); the full recipe is on this card (keep show ${task.id}).`,
+    message: `The scheduled check was typed into ${delivery.kind} session ${sessionRef(delivery.sessionId)} but arrived truncated (${delivery.received}/${delivery.expected} chars); the full recipe is on this card (keep show ${task.id}).`,
     linkSession: false,
     commitLabel: 'check',
   };
@@ -598,12 +599,12 @@ function releaseUnfinishedCheck(cardId, sessionId, today = keep.nowStamp().slice
   // effect of deleting a stamp it considers stale.
   const stamp = readRawDeliveryStamp(cardId);
   if (stamp && stamp.sessionId !== sessionId) {
-    process.stderr.write(`keep runs: ${cardId} was re-delivered to ${String(stamp.sessionId || 'another session').slice(0, 8)} while ${String(sessionId).slice(0, 8)} was open; its stamp stands\n`);
+    process.stderr.write(`keep runs: ${cardId} was re-delivered to ${(sessionRef(stamp.sessionId) || 'another session')} while ${sessionRef(sessionId)} was open; its stamp stands\n`);
     return false;
   }
   removeDeliveryStamp(cardId);
   const reopened = grantReopen(cardId, today);
-  const short = String(sessionId || '').slice(0, 8) || 'unknown';
+  const short = sessionRef(sessionId) || 'unknown';
   try {
     deps.checkinTask(cardId, {
       heading: 'check session ended',
@@ -943,7 +944,7 @@ async function schedulerTick() {
             tickErrors.push(e);
             process.stderr.write(`keep runs: could not stamp delivered check for ${t.id}: ${e.message}\n`);
           }
-          process.stderr.write(`keep runs: delivered check for ${t.id} into ${delivery.kind} session ${String(delivery.sessionId).slice(0, 8)}\n`);
+          process.stderr.write(`keep runs: delivered check for ${t.id} into ${delivery.kind} session ${sessionRef(delivery.sessionId)}\n`);
           if (!landDeliveryWarning(t, delivery)) tickErrors.push(new Error(`could not land delivery warning for ${t.id}`));
           onChange();
           continue;
@@ -968,7 +969,7 @@ async function schedulerTick() {
         }
         if (outcome.skipped) continue;
         const { delivery, errors } = outcome;
-        process.stderr.write(`keep runs: opened a check session for ${t.id}${delivery.sessionId ? ` (session ${String(delivery.sessionId).slice(0, 8)})` : ''}\n`);
+        process.stderr.write(`keep runs: opened a check session for ${t.id}${delivery.sessionId ? ` (session ${sessionRef(delivery.sessionId)})` : ''}\n`);
         tickErrors.push(...errors);
         onChange();
       } catch (e) {

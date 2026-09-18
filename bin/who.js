@@ -5,6 +5,7 @@
 
 const os = require('os');
 const path = require('path');
+const { ref: sessionRef } = require('./session-numbers.js');
 const { execFileSync } = require('child_process');
 
 const OPEN_STATUSES = new Set(['active', 'review', 'landing', 'waiting', 'blocked']);
@@ -94,7 +95,7 @@ function fleetSnapshot(project, input) {
         (session.notify && ['permission', 'waiting', 'question'].includes(session.notify.type))) flags.push('waiting');
     return {
       id: String(session.id || ''),
-      sid8: String(session.id || '').slice(0, 8),
+      sid8: sessionRef(session.id),
       kind: session.kind || session.agent || 'unknown',
       state: session.state || 'unknown',
       idleMinutes: Number.isFinite(Number(session.mtime)) ? Math.max(0, Math.floor((now - Number(session.mtime)) / 60e3)) : null,
@@ -166,7 +167,7 @@ function renderWho(snapshot) {
   for (const hold of snapshot.holds) {
     const by = hold.by || {};
     const elsewhere = normalizeProject(hold.project) === snapshot.project ? '' : ` · from ${hold.project}`;
-    out.push(`  - ${hold.id} · scope: ${require('./hold-scopes').label(hold)}${elsewhere} · until ${hold.until} · ${by.agent || 'manual'} ${String(by.sessionId || '').slice(0, 8) || '(no session)'} · ${hold.reason}`);
+    out.push(`  - ${hold.id} · scope: ${require('./hold-scopes').label(hold)}${elsewhere} · until ${hold.until} · ${by.agent || 'manual'} ${sessionRef(by.sessionId) || '(no session)'} · ${hold.reason}`);
   }
 
   // Notes sit right after holds and say plainly that they are not one: a reader
@@ -177,12 +178,12 @@ function renderWho(snapshot) {
   for (const note of notes.active) {
     const by = note.by || {};
     out.push(`  - ${note.id} · scope: ${(note.scopes || []).join(', ') || 'unscoped'} · until ${note.until}`
-      + ` · ${by.agent || 'manual'} ${String(by.sessionId || '').slice(0, 8) || '(no session)'} · ${note.message}`);
+      + ` · ${by.agent || 'manual'} ${sessionRef(by.sessionId) || '(no session)'} · ${note.message}`);
   }
   for (const note of notes.expired) {
     const by = note.by || {};
     out.push(`  - ${note.id} · scope: ${(note.scopes || []).join(', ') || 'unscoped'} · expired ${note.until}, unconfirmed`
-      + ` · ${by.agent || 'manual'} ${String(by.sessionId || '').slice(0, 8) || '(no session)'} · ${note.message}`);
+      + ` · ${by.agent || 'manual'} ${sessionRef(by.sessionId) || '(no session)'} · ${note.message}`);
   }
 
   out.push('steps:');

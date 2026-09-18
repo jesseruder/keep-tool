@@ -189,4 +189,40 @@ function lookup(idOrNumber, options = {}) {
   return num ? { id, num } : null;
 }
 
-module.exports = { assign, lookup, read, write, parseNumber, label, registryFile, lockFile, MAX_NUMBER };
+// How Keep names a session in text an agent or Owner reads. Agents copy whatever
+// handle they are shown into check-ins and messages, so every place that would print
+// a short id prints the session's number instead, and falls back to the 8-character
+// prefix only for a session the registry has not numbered yet. Reads are cached on
+// the registry file's mtime: a bundle or listing may name hundreds of sessions.
+let cached = { file: '', mtimeMs: -1, size: -1, ids: {} };
+
+function numberFor(id, options = {}) {
+  const root = options.root || process.env.KEEP_DIR || path.join(require('os').homedir(), 'keep');
+  const file = registryFile(root);
+  let stat = null;
+  try { stat = fs.statSync(file); } catch { return null; }
+  if (cached.file !== file || cached.mtimeMs !== stat.mtimeMs || cached.size !== stat.size) {
+    let ids = {};
+    try { ids = read({ root }).ids; } catch {}
+    cached = { file, mtimeMs: stat.mtimeMs, size: stat.size, ids };
+  }
+  return Object.prototype.hasOwnProperty.call(cached.ids, id) ? cached.ids[id] : null;
+}
+
+// `#12`, or `4f1c2a9e` for a session with no number yet.
+function ref(id, options = {}) {
+  const text = String(id == null ? '' : id);
+  if (!text) return '';
+  const num = numberFor(text, options);
+  return num ? label(num) : text.slice(0, 8);
+}
+
+// `#12 (<full id>)` where the full id is still needed, e.g. to pass back to a command.
+function named(id, options = {}) {
+  const text = String(id == null ? '' : id);
+  if (!text) return '';
+  const num = numberFor(text, options);
+  return num ? `${label(num)} (${text})` : text;
+}
+
+module.exports = { assign, lookup, read, write, parseNumber, label, ref, named, numberFor, registryFile, lockFile, MAX_NUMBER };

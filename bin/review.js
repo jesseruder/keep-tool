@@ -15,6 +15,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { ref: sessionRef, named: sessionNamed } = require('./session-numbers.js');
 const os = require('os');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
@@ -1159,7 +1160,7 @@ function renderCodexParent(parent, verification, window) {
   const span = window && Number.isFinite(window.startMs)
     ? ` between ${keep.stampOf(new Date(window.startMs)).replace('T', ' ')} and ${keep.stampOf(new Date(window.endMs)).replace('T', ' ')}`
     : '';
-  lines.push(`parent claude session ${parent.id} (${parent.via}) spawned this codex session; its test/build/commit commands${span}:`);
+  lines.push(`parent claude session ${sessionNamed(parent.id)} (${parent.via}) spawned this codex session; its test/build/commit commands${span}:`);
   if (!verification || !verification.length) {
     lines.push('- (none — the parent ran no test, build, commit, or push command in that window)');
     return lines;
@@ -1171,7 +1172,7 @@ function renderCodexParent(parent, verification, window) {
 }
 
 function renderActivity(session, act, delta) {
-  const lines = [`### session ${session.id} (${session.agent})`];
+  const lines = [`### session ${sessionNamed(session.id)} (${session.agent})`];
   if (delta.skipped) lines.push(`*window: last ${Math.round(delta.read / 1024)} KB of a ${Math.round(delta.skipped / 1024)} KB-larger delta — older activity not shown*`);
   lines.push(`new bytes: ${delta.read}; turns: ${act.turns}`);
   const allTools = Object.entries(act.tools).sort((a, b) => b[1] - a[1]);
@@ -1334,7 +1335,7 @@ function gitFactLines(git, peers) {
   else {
     const stale = peers.stale ? ' (ledger stale)' : '';
     lines.push(peers.sessions.length
-      ? `other live sessions in this checkout${stale}: ${peers.sessions.map((s) => `${s.id.slice(0, 8)} (${s.agent})`).join(', ')}`
+      ? `other live sessions in this checkout${stale}: ${peers.sessions.map((s) => `${sessionRef(s.id)} (${s.agent})`).join(', ')}`
       : `other live sessions in this checkout: none${stale}`);
   }
   return lines;
@@ -1607,7 +1608,7 @@ function buildBundle(taskId, opts = {}) {
   if (holds.length) headerLines.push('');
   for (const hold of holds) {
     const by = hold.by || {};
-    headerLines.push(`HOLDS: ${hold.id} on ${hold.project} until ${hold.until} by ${by.agent || 'manual'} session ${String(by.sessionId || '').slice(0, 8) || '(none)'} — ${clip(hold.reason, 300)}`);
+    headerLines.push(`HOLDS: ${hold.id} on ${hold.project} until ${hold.until} by ${by.agent || 'manual'} session ${sessionRef(by.sessionId) || '(none)'} — ${clip(hold.reason, 300)}`);
   }
   // State notes are agent-written too, and they say what is currently true of a
   // shared resource — the context a finding about "why did staging behave like
@@ -1619,7 +1620,7 @@ function buildBundle(taskId, opts = {}) {
   for (const note of stateNotes.active) {
     const by = note.by || {};
     headerLines.push(`STATE NOTE: ${note.id} [${(note.scopes || []).join(', ') || 'unscoped'}] on ${note.project}`
-      + ` until ${note.until} by ${by.agent || 'manual'} session ${String(by.sessionId || '').slice(0, 8) || '(none)'}`
+      + ` until ${note.until} by ${by.agent || 'manual'} session ${sessionRef(by.sessionId) || '(none)'}`
       + ` — ${lintField(note.message, 300)} (information only; nothing is blocked by a note)`);
   }
   for (const note of stateNotes.expired) {
@@ -1728,9 +1729,9 @@ function buildBundle(taskId, opts = {}) {
   const sessionLines = ['## sessions'];
   if (!perSession.length) sessionLines.push('', '*no linked agent sessions (or all were excluded as reviewer/keep-spawned)*');
   for (const p of perSession) {
-    if (p.missing) { sessionLines.push('', `### session ${p.session.id} (${p.session.agent})`, 'transcript not found on disk.'); continue; }
-    if (p.error) { sessionLines.push('', `### session ${p.session.id} (${p.session.agent})`, `could not read: ${p.error}`); continue; }
-    if (!p.delta.read) { sessionLines.push('', `### session ${p.session.id} (${p.session.agent})`, 'no new activity since last review.'); continue; }
+    if (p.missing) { sessionLines.push('', `### session ${sessionNamed(p.session.id)} (${p.session.agent})`, 'transcript not found on disk.'); continue; }
+    if (p.error) { sessionLines.push('', `### session ${sessionNamed(p.session.id)} (${p.session.agent})`, `could not read: ${p.error}`); continue; }
+    if (!p.delta.read) { sessionLines.push('', `### session ${sessionNamed(p.session.id)} (${p.session.agent})`, 'no new activity since last review.'); continue; }
     sessionLines.push('', renderActivity(p.session, p.act, p.delta));
     if (p.parentLines) sessionLines.push('', ...p.parentLines);
   }
@@ -1741,7 +1742,7 @@ function buildBundle(taskId, opts = {}) {
     'These sessions are cited by full id in new card entries. They are not card owners and do not affect queue liveness. Each excerpt covers 30 minutes before through the end of the stamped contribution minute; it is nearby context, not proof that every activity in it belongs to this card.',
   ] : [];
   for (const p of perContributor) {
-    contributorLines.push('', `### contributor ${p.session.id} (${p.session.agent})`);
+    contributorLines.push('', `### contributor ${sessionNamed(p.session.id)} (${p.session.agent})`);
     contributorLines.push(`attributed entries: ${p.session.windows.map((window) => `${window.stamp} · ${window.kind}`).join('; ')}`);
     if (p.missing) { contributorLines.push('transcript not found on disk.'); continue; }
     if (p.error) { contributorLines.push(`could not read: ${p.error}`); continue; }
@@ -2638,7 +2639,7 @@ function reviewIdea(title, opts) {
     : keep.isReviewerSession()
       ? 'review (' + reviewerName() + ') idea'
       : session
-        ? 'idea (' + session.agent + ' ' + session.id.slice(0, 8) + ')'
+        ? 'idea (' + session.agent + ' ' + sessionRef(session.id) + ')'
         : 'idea (manual)';
   const stamp = keep.nowStamp();
   const digestLines = [
@@ -4226,7 +4227,7 @@ function recordDriftWake(meta, detail, now = Date.now()) {
 // which is where the injection path truncates.
 function driftTickMessage(detail, rows) {
   const card = lintField(detail.cardId, 60) || 'an unlinked session';
-  const session = String(detail.sessionId || '').slice(0, 8) || 'unknown';
+  const session = sessionRef(detail.sessionId) || 'unknown';
   const stateLine = lintField(detail.stateLine, 300) || '(no state line)';
   const reason = lintField(detail.reason, 300) || '(none given)';
   const head = `[keep] review tick - drift on ${card} (${session}): "${stateLine}". Watcher reason: "${reason}".`

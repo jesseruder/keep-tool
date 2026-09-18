@@ -5,6 +5,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { ref: sessionRef } = require('./session-numbers.js');
 const os = require('os');
 const http = require('http');
 const crypto = require('crypto');
@@ -2945,7 +2946,7 @@ async function sweepPendingCompactSwaps(deps = {}) {
     const settingsRecord = records.filter((record) => !record.error && !codexCompact.isCodexCompactSwap(record))
       .sort((a, b) => compactSwapRecordAt(b) - compactSwapRecordAt(a))[0];
     if (settingsRecord && !inFlightSwap) {
-      const sid = String(settingsRecord.sessionId || 'unknown').slice(0, 8);
+      const sid = (sessionRef(settingsRecord.sessionId) || 'unknown');
       try {
         await lock(async () => {
           const settings = readSettings();
@@ -2970,14 +2971,14 @@ async function sweepPendingCompactSwaps(deps = {}) {
     catch (e) {
       for (const record of records) {
         summary.skipped += 1;
-        const sid = String(record.sessionId || 'unknown').slice(0, 8);
+        const sid = (sessionRef(record.sessionId) || 'unknown');
         process.stderr.write(`keep serve: MODEL RESTORE UNCONFIRMED for claude session ${sid}: ${String(e && e.message || e)}\n`);
       }
       return summary;
     }
     const byId = new Map((sessions || []).map((session) => [session.id, session]));
     for (const record of records) {
-      const sid = String(record.sessionId || 'unknown').slice(0, 8);
+      const sid = (sessionRef(record.sessionId) || 'unknown');
       const session = byId.get(record.sessionId);
       if (codexCompact.isCodexCompactSwap(record)) {
         try {
@@ -3157,7 +3158,7 @@ async function compactSession(session, target, instruction, deps = {}) {
 }
 
 async function compactSessionTransaction(session, target, instruction, deps = {}) {
-  const sid = String(session && session.id || 'unknown').slice(0, 8);
+  const sid = (sessionRef(session && session.id) || 'unknown');
   process.stderr.write(`keep serve: compacting ${session && session.kind || 'unknown'} session ${sid}\n`);
   const dir = deps.dir || autoCompactDir();
   const lastTurn = (deps.sessionLastTurn || sessionLastTurn)(session);
@@ -3196,7 +3197,7 @@ async function compactSessionTransaction(session, target, instruction, deps = {}
     if (compactModelBase(settingsModel) === compactModelBase(configuredVia) && records.length) {
       settingsModel = records[0].settingsModelBefore;
       settingsPresent = records[0].settingsModelPresent;
-      process.stderr.write(`keep serve: using the pre-swap settings.json model from pending restore record ${String(records[0].sessionId || 'unknown').slice(0, 8)}\n`);
+      process.stderr.write(`keep serve: using the pre-swap settings.json model from pending restore record ${(sessionRef(records[0].sessionId) || 'unknown')}\n`);
     }
     // A pane launched with `keep open --model` knows its model exactly; the transcript's
     // last-turn model is the fallback for sessions launched any other way.
@@ -4811,7 +4812,7 @@ function writeAutoCompactDecision(stamp) {
 }
 
 function logAutoCompactDecision(candidate, stamp) {
-  const sid = String(candidate.session.id).slice(0, 8);
+  const sid = sessionRef(candidate.session.id);
   const title = JSON.stringify(normalizedText(candidate.session.title).slice(0, 120));
   const idle = Math.round(candidate.idleMs / 60e3);
   const context = Math.round(candidate.contextTokens / 1000);
@@ -4962,7 +4963,7 @@ async function autoCompactTick(deps = {}) {
         // Retryable contention and precheck failures do not spend the idle period.
         // Try another candidate so one blocked pane cannot starve the fleet.
         if (phase === 'lock' || phase === 'precheck' || phase === 'eligibility') {
-          process.stderr.write(`keep serve: auto-compact skipped ${String(candidate.session.id).slice(0, 8)} this tick: ${reason}\n`);
+          process.stderr.write(`keep serve: auto-compact skipped ${sessionRef(candidate.session.id)} this tick: ${reason}\n`);
           continue;
         }
         if (phase === 'resolve' && e instanceof InjectionError && e.status === 404 && e.extra.notLive) result = 'skipped';
@@ -5006,7 +5007,7 @@ async function autoCompactTick(deps = {}) {
     (deps.writeAutoCompactDecision || writeAutoCompactDecision)(stamp);
   } catch (e) {
     decisionError = e;
-    process.stderr.write(`keep serve: could not save auto-compact decision for ${String(stamp.sessionId).slice(0, 8)}: ${e.message}\n`);
+    process.stderr.write(`keep serve: could not save auto-compact decision for ${sessionRef(stamp.sessionId)}: ${e.message}\n`);
   }
   (deps.logAutoCompactDecision || logAutoCompactDecision)(candidate, stamp);
   const ok = ['would', 'compacted', 'busy', 'skipped'].includes(result);
@@ -5871,12 +5872,12 @@ async function openSession(body, deps = {}) {
     if (!account && session.accountId) {
       account = accounts.get(session.accountId, deps.env || process.env);
       if (!account || account.agent !== agent) {
-        throw new InjectionError(409, `session ${session.id.slice(0, 8)} belongs to unavailable account ${session.accountId}`);
+        throw new InjectionError(409, `session ${sessionRef(session.id)} belongs to unavailable account ${session.accountId}`);
       }
     }
     account ||= accounts.defaultFor(agent, deps.env || process.env);
     if (body.accountId != null && body.accountId !== account.id) {
-      throw new InjectionError(409, `session ${session.id.slice(0, 8)} is pinned to account ${account.id}; use handoff to transfer it`);
+      throw new InjectionError(409, `session ${sessionRef(session.id)} is pinned to account ${account.id}; use handoff to transfer it`);
     }
     if (account.managed) accounts.pinSession(session.id, agent, account.id, { root: deps.root || keep.ROOT, env: deps.env || process.env });
   } else {
@@ -5958,7 +5959,7 @@ async function openSession(body, deps = {}) {
           });
         } catch (error) { throw new InjectionError(409, error.message); }
         if (authority && authority.id !== account.id) {
-          throw new InjectionError(409, `session ${sessionId.slice(0, 8)} is pinned to account ${authority.id}`);
+          throw new InjectionError(409, `session ${sessionRef(sessionId)} is pinned to account ${authority.id}`);
         }
         if (!authority) {
           (deps.pinSession || accounts.pinSession)(sessionId, agent, account.id,
@@ -6078,7 +6079,7 @@ async function openSession(body, deps = {}) {
       const live = await (deps.liveSessionPids || liveSessionPids)(deps);
       const running = live.get(session.id);
       if (running) {
-        throw new InjectionError(409, `session ${session.id.slice(0, 8)} is running outside the host (pid ${running.pid}); exit it there first, then keep open again`, { pid: running.pid });
+        throw new InjectionError(409, `session ${sessionRef(session.id)} is running outside the host (pid ${running.pid}); exit it there first, then keep open again`, { pid: running.pid });
       }
     }
     if (target) {
@@ -6251,7 +6252,7 @@ async function openSession(body, deps = {}) {
         launch.linked = true;
       }
     } catch (error) {
-      process.stderr.write(`keep serve: could not link ${launch.sessionId.slice(0, 8)} to ${body.taskId}: ${error.message}\n`);
+      process.stderr.write(`keep serve: could not link ${sessionRef(launch.sessionId)} to ${body.taskId}: ${error.message}\n`);
       launch.linked = false;
     }
   }
@@ -6415,7 +6416,7 @@ async function recoverReviewQueueLaunch(active, hooks = {}, deps = {}) {
   }
   if (active.action === 'start' && active.card) {
     try { (deps.linkLaunchedSession || keep.linkLaunchedSession)(active.card, { id: sessionId, agent: active.agent }); }
-    catch (error) { process.stderr.write(`keep serve: could not link recovered review queue session ${sessionId.slice(0, 8)} to ${active.card}: ${error.message}\n`); }
+    catch (error) { process.stderr.write(`keep serve: could not link recovered review queue session ${sessionRef(sessionId)} to ${active.card}: ${error.message}\n`); }
   }
   return { sessionId, pane: active.pane, sent: true };
 }
@@ -8255,7 +8256,7 @@ async function recoverPortableOpening(state, message, hooks = {}, deps = {}) {
     accounts.pinSession(launch.sessionId, state.targetAgent, state.targetAccountId,
       { root: deps.root || keep.ROOT, env: deps.env || process.env });
     try { (deps.linkLaunchedSession || keep.linkLaunchedSession)(state.cardId, { id: launch.sessionId, agent: state.targetAgent }); }
-    catch (error) { process.stderr.write(`keep serve: could not link recovered portable session ${launch.sessionId.slice(0, 8)} to ${state.cardId}: ${error.message}\n`); }
+    catch (error) { process.stderr.write(`keep serve: could not link recovered portable session ${sessionRef(launch.sessionId)} to ${state.cardId}: ${error.message}\n`); }
     return launch;
   } catch (error) {
     if (error?.extra?.awaitingSetup) error.extra.launch = launch;

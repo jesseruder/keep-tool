@@ -9,6 +9,7 @@ const {
   checkinTask, postKeepApi,
 } = require('../keep-core.js');
 const fs = require('fs');
+const { ref: sessionRef } = require('../session-numbers.js');
 const path = require('path');
 const { execFileSync, spawn } = require('child_process');
 const stepRegistry = require('../steps.js');
@@ -32,7 +33,7 @@ function stepExitFive(message) {
 
 function describeClaim(hold) {
   const by = hold.by || {};
-  return `${by.agent || 'manual'} ${String(by.sessionId || '').slice(0, 8) || '(no session)'} until ${hold.until} — ${hold.reason}`;
+  return `${by.agent || 'manual'} ${sessionRef(by.sessionId) || '(no session)'} until ${hold.until} — ${hold.reason}`;
 }
 
 function stepProjectFromCwd(cwd) {
@@ -164,7 +165,7 @@ function stepClaim(argv) {
   });
   if (result.running) {
     const by = result.running.by || {};
-    stepExitFive(`step ${name} still has running run ${result.running.id} by ${by.agent || 'manual'} ${String(by.sessionId || '').slice(0, 8) || '(no session)'} since ${result.running.startedAt || 'unknown'}; pass --force to abandon it`);
+    stepExitFive(`step ${name} still has running run ${result.running.id} by ${by.agent || 'manual'} ${sessionRef(by.sessionId) || '(no session)'} since ${result.running.startedAt || 'unknown'}; pass --force to abandon it`);
   }
   if (result.waiting) {
     console.log(`step ${name} is claimed by ${describeClaim(result.existing)}; registered once as a waiter and you will be notified`);
@@ -174,7 +175,7 @@ function stepClaim(argv) {
   const hold = result.hold;
   if (result.abandoned) {
     const by = result.abandoned.by || {};
-    process.stderr.write(`keep: warning: abandoned running run ${result.abandoned.id} by ${by.agent || 'manual'} ${String(by.sessionId || '').slice(0, 8) || '(no session)'} from ${result.abandoned.startedAt || 'unknown'}\n`);
+    process.stderr.write(`keep: warning: abandoned running run ${result.abandoned.id} by ${by.agent || 'manual'} ${sessionRef(by.sessionId) || '(no session)'} from ${result.abandoned.startedAt || 'unknown'}\n`);
   }
   if (hold.task) {
     checkinTask(hold.task, {
@@ -182,7 +183,7 @@ function stepClaim(argv) {
       message: `Claimed ${registry.project} step ${name} until ${hold.until}: ${reason}`,
     });
   }
-  console.log(`${hold.id}: step ${name} on ${registry.project} claimed until ${hold.until} by ${hold.by.agent}${hold.by.sessionId ? ` session ${hold.by.sessionId.slice(0, 8)}` : ''} — ${reason}`);
+  console.log(`${hold.id}: step ${name} on ${registry.project} claimed until ${hold.until} by ${hold.by.agent}${hold.by.sessionId ? ` session ${sessionRef(hold.by.sessionId)}` : ''} — ${reason}`);
 }
 
 function requireStepClaim(project, name) {
@@ -272,7 +273,7 @@ async function stepRun(argv) {
     const otherRun = [...ledger.runs].reverse().find((entry) => entry.status === 'running');
     if (otherRun) {
       const by = otherRun.by || {};
-      stepExitFive(`step ${name} already has running run ${otherRun.id} by ${by.agent || 'manual'} ${String(by.sessionId || '').slice(0, 8) || '(no session)'} since ${otherRun.startedAt || 'unknown'}`);
+      stepExitFive(`step ${name} already has running run ${otherRun.id} by ${by.agent || 'manual'} ${sessionRef(by.sessionId) || '(no session)'} since ${otherRun.startedAt || 'unknown'}`);
     }
     if (current && step.defaultHold) {
       const extendedUntil = parseWhen(step.defaultHold);
@@ -368,7 +369,7 @@ async function stepRun(argv) {
     const otherRun = [...currentLedger.runs].reverse().find((entry) => entry.status === 'running');
     if (otherRun) {
       const by = otherRun.by || {};
-      stepExitFive(`step ${name} already has running run ${otherRun.id} by ${by.agent || 'manual'} ${String(by.sessionId || '').slice(0, 8) || '(no session)'} since ${otherRun.startedAt || 'unknown'}`);
+      stepExitFive(`step ${name} already has running run ${otherRun.id} by ${by.agent || 'manual'} ${sessionRef(by.sessionId) || '(no session)'} since ${otherRun.startedAt || 'unknown'}`);
     }
     if (current && step.defaultHold) {
       const extendedUntil = parseWhen(step.defaultHold);
@@ -469,7 +470,7 @@ async function notifyStepWaiters(registry, name, details) {
         attempts: (Number(waiter.attempts) || 0) + 1,
         lastError: error.message,
       });
-      process.stderr.write(`keep: could not notify waiter ${String(waiter.sessionId || '').slice(0, 8)}: ${error.message}\n`);
+      process.stderr.write(`keep: could not notify waiter ${sessionRef(waiter.sessionId)}: ${error.message}\n`);
     }
   }
   const remaining = withLock(() => {
@@ -490,7 +491,7 @@ async function notifyStepWaiters(registry, name, details) {
 
 function describeRunOwner(run) {
   const by = run && run.by || {};
-  return `${by.agent || 'manual'} ${String(by.sessionId || '').slice(0, 8) || '(no session)'}`;
+  return `${by.agent || 'manual'} ${sessionRef(by.sessionId) || '(no session)'}`;
 }
 
 function waiterRetrySuffix(notify) {
@@ -563,7 +564,7 @@ async function finalizeStep(registry, name, step, options = {}) {
   for (const card of cards) {
     checkinTask(card, {
       heading: `step ${name}`,
-      message: `Included in ${label} (${name} run from ${sha.slice(0, 7)} by ${by.agent || 'manual'} ${String(by.sessionId || '').slice(0, 8) || '(none)'}).${next}`,
+      message: `Included in ${label} (${name} run from ${sha.slice(0, 7)} by ${by.agent || 'manual'} ${sessionRef(by.sessionId) || '(none)'}).${next}`,
       linkSession: false,
       commitLabel: 'step',
     });

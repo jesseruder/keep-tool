@@ -196,6 +196,10 @@ background-terminal wake-up is not yet verified.
   check-in says why; record a wrong finding with `keep review-outcome <card> <key>
   incorrect -m "reason" --evidence "..."` so future reviews retain the lesson.
 - Call the system "Keep": say "mark this task done in Keep" or "check this in to Keep."
+- Name another session by its number, `#12`, the way Keep prints it (`keep who`,
+  `keep show`, holds, notes, `keep pane ls`), not by a uuid prefix: Owner reads the
+  number off the console, and `keep tell`, `keep open` and `keep pane` accept it. Fall
+  back to the 8-character id only for a session Keep shows without a number.
 - Sessions in a `~/wt/<repo>/<name>` worktree belong to the main checkout's project: the CLI
   canonicalizes the path, so use and create cards for the main checkout (`wt main` prints
   it, for example `~/work/<repo>`), never for the worktree path.

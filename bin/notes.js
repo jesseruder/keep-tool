@@ -17,6 +17,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { ref: sessionRef } = require('./session-numbers.js');
 const os = require('os');
 const crypto = require('crypto');
 
@@ -323,7 +324,7 @@ function activeNotes(project, now = Date.now(), options = {}) {
 }
 
 function shortSession(note) {
-  return String((note.by && note.by.sessionId) || '').slice(0, 8);
+  return sessionRef((note.by && note.by.sessionId));
 }
 
 function describeNote(note) {

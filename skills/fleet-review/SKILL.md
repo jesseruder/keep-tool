@@ -145,6 +145,8 @@ The `## contributor context` section comes from a full session id stamped on a n
 card entry. Its bounded time window supplies nearby evidence for that contribution;
 it does not make the contributor a card owner or prove that every activity in the
 window belongs to the card. Honor any coverage warning before relying on absence.
+Session headings read `#12 (<full id>)`; in findings, notes and check-ins name a
+session by its number, not a uuid prefix. `--subject` can stay the full id.
 
 A bundle may identify complete identical scheduled probes. Only after inspecting the
 exact tool inputs and verifying that they are read-only and results are clean, add
