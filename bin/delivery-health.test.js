@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { inspect, tick } = require('./delivery-health');
+const { inspect, tick, sweep } = require('./delivery-health');
 
 function fixture(fn) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-delivery-health-'));
@@ -21,9 +21,16 @@ function fixture(fn) {
     return entry;
   };
   const trace = rows => fs.writeFileSync(path.join(directory, 'diagnostics/events.jsonl'), rows.map(row => JSON.stringify(row)).join('\n'));
-  try { return fn({ root, directory, now, message, add, trace }); }
-  finally { fs.rmSync(root, { recursive: true, force: true }); }
+  const cleanup = () => fs.rmSync(root, { recursive: true, force: true });
+  let result;
+  try { result = fn({ root, directory, now, message, add, trace }); }
+  catch (error) { cleanup(); throw error; }
+  if (result && typeof result.then === 'function') return result.finally(cleanup);
+  cleanup();
+  return result;
 }
+
+const busy = () => Object.assign(new Error('another session injection is busy'), { status: 429 });
 
 test('both agents detect screen/receipt failures, ignore young attempts and clear on actual receipts', () => fixture(f => {
   const codex = f.add('codex'); const claude = f.add('claude');
@@ -102,4 +109,51 @@ test('persistent delivery faults enter health attention once, stay stable, and r
     if (saved === undefined) delete process.env.KEEP_DIR; else process.env.KEEP_DIR = saved;
     delete require.cache[require.resolve('./health')];
   }
+}));
+
+// A reconcile refused by the global injection lock used to be dropped for the whole
+// tick, so a stranded journal outlived its expiry by however long the fleet stayed
+// busy - long enough to open a self-repair card. See bin/delivery-health.js.
+test('a reconcile refused by injection contention is waited out inside the sweep', () => fixture(async f => {
+  f.add('claude');
+  const journal = path.join(f.directory, 'claude.json');
+  const records = [];
+  const slept = [];
+  let calls = 0;
+  const issues = await sweep({ ...f, health: { record: (name, row) => records.push(row) },
+    sleep: ms => { slept.push(ms); return Promise.resolve(); },
+    reconcile: async () => {
+      calls += 1;
+      if (calls < 5) throw busy();
+      fs.unlinkSync(journal); // What delivery.reconcile does to a stale entry with no typedAt.
+    } });
+  assert.equal(calls, 5, 'a busy lock must be retried inside the tick, not skipped until the next one');
+  assert.equal(slept.length, 4);
+  assert.deepEqual(issues, [], 'the reconcile got through, so the expired journal is gone');
+  assert.equal(records.at(-1).ok, true);
+}));
+
+test('a lock busy for the whole window still inspects without mutating, and gives up', () => fixture(async f => {
+  f.add('claude');
+  const records = [];
+  let calls = 0, slept = 0;
+  const issues = await sweep({ ...f, health: { record: (name, row) => records.push(row) },
+    reconcileWaitMs: 1000, reconcilePollMs: 250,
+    sleep: ms => { slept += ms; return Promise.resolve(); },
+    reconcile: async () => { calls += 1; throw busy(); } });
+  assert.equal(calls, 5);
+  assert.equal(slept, 1000, 'the wait is bounded well inside the 60s cadence');
+  assert.equal(issues.length, 1, 'the journal is still reported, never deleted by the watchdog');
+  assert.ok(fs.existsSync(path.join(f.directory, 'claude.json')));
+  assert.match(records.at(-1).error, /unconfirmed delivery issue/);
+}));
+
+test('a reconcile fault that is not contention is recorded and stops the tick', () => fixture(async f => {
+  f.add('claude');
+  const records = [];
+  const issues = await sweep({ ...f, health: { record: (name, row) => records.push(row) },
+    sleep: () => { throw Error('must not wait on a real fault'); },
+    reconcile: async () => { throw Error('PRIVATE /Users/someone/transcript.jsonl'); } });
+  assert.equal(issues, null);
+  assert.deepEqual(records.map(row => row.error), ['Delivery reconciliation could not run']);
 }));

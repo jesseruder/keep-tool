@@ -107,10 +107,15 @@ test('late receipt survives reconciliation until the owner retries, without dupl
 
 test('busy injection lock skips reconciliation while continuing read-only health inspection', () => fixture(async f => {
   const rows = [];
+  let attempts = 0;
+  // The sweep waits the lock out before giving up, so the window is shortened here
+  // and its sleep stubbed; what this test is about is what happens once it expires.
   const options = { ...f, health: { record: (_name, row) => rows.push(row) },
-    reconcile: async () => { throw Object.assign(Error('busy'), { status: 429 }); } };
+    reconcileWaitMs: 500, reconcilePollMs: 250, sleep: async () => {},
+    reconcile: async () => { attempts++; throw Object.assign(Error('busy'), { status: 429 }); } };
   const { sweep } = require('./delivery-health');
   for (let n = 0; n < 4; n++) assert.deepEqual(await sweep(options), []);
+  assert.equal(attempts, 12, 'each sweep retries the busy lock across its window');
   assert.ok(rows.every(row => row.ok === true));
   f.add('claude', 'genuinely stuck');
   assert.equal((await sweep(options)).length, 1);

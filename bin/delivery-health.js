@@ -80,10 +80,38 @@ function tick(options = {}) {
   }
 }
 
+// The reconcile takes the global injection lock, so any delivery in flight anywhere
+// refuses it with 429. Skipping the sweep's cleanup on that is safe, but it is never
+// made up: each 60s tick took one instantaneous sample of a lock that, on a loaded
+// machine, is held most of the time. On 2026-09-18 a journal whose typing failed - no
+// `typedAt`, which is exactly the entry reconcile deletes unread - lost 18 of those
+// samples in a row. It outlived its 15-minute expiry by 19 minutes, crossed
+// self-repair's 30-minute threshold and opened a repair card for a message the pane
+// never kept. So contention is now waited out inside the tick, sampling across a span
+// instead of at one instant, and still well short of the next tick.
+const RECONCILE_WAIT_MS = 30e3;
+const RECONCILE_POLL_MS = 500;
+
+async function reconcileWithRetry(options) {
+  if (!options.reconcile) return;
+  const waitMs = Math.max(0, options.reconcileWaitMs ?? RECONCILE_WAIT_MS);
+  const pollMs = Math.max(1, options.reconcilePollMs ?? RECONCILE_POLL_MS);
+  const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  for (let waited = 0; ; waited += pollMs) {
+    try { return await options.reconcile(); }
+    catch (error) {
+      // Anything but contention is a real fault, and stays the caller's to record.
+      if (!error || error.status !== 429) throw error;
+      // Busy for the whole window: inspect without mutating, as before.
+      if (waited >= waitMs) return;
+    }
+    await sleep(pollMs);
+  }
+}
+
 async function sweep(options = {}) {
   try {
-    try { await options.reconcile?.(); }
-    catch (error) { if (error.status !== 429) throw error; } // Routine injection contention; inspect without mutating.
+    await reconcileWithRetry(options);
     return tick(options);
   } catch {
     (options.health || require('./health')).record('delivery', { ok: false, error: 'Delivery reconciliation could not run' });
