@@ -2199,7 +2199,7 @@ test('handoff model selection retains the last real Claude model across syntheti
     isApiErrorMessage: true,
     error: 'rate_limit',
     apiErrorStatus: 429,
-    message: { model: '<synthetic>', usage: { input_tokens: 0 }, content: [{
+    message: { model: '<synthetic>', stop_reason: 'stop_sequence', usage: { input_tokens: 0 }, content: [{
       type: 'text', text: "You've reached your Fable 5.1 limit.",
     }] },
   };
@@ -2229,7 +2229,7 @@ function rateLimitedTranscript(dir, name, realModel) {
   const padding = 'x'.repeat(2000);
   const weeklyLimit = JSON.stringify({
     type: 'assistant', isApiErrorMessage: true, error: 'rate_limit', apiErrorStatus: 429,
-    message: { model: '<synthetic>', usage: { input_tokens: 0 }, padding, content: [{
+    message: { model: '<synthetic>', stop_reason: 'stop_sequence', usage: { input_tokens: 0 }, padding, content: [{
       type: 'text', text: "You've reached your Fable 5.1 limit.",
     }] },
   });
@@ -4224,7 +4224,7 @@ test('a local command typed mid-turn does not end the turn it interrupted', () =
     const limitError = JSON.stringify({
       type: 'assistant', timestamp: '2026-09-15T22:14:03.921Z', isApiErrorMessage: true,
       error: 'rate_limit', apiErrorStatus: 429,
-      message: { model: '<synthetic>', content: [{ type: 'text', text: "You've reached your Fable 5.1 limit. Run /usage-credits to continue or switch models with /model." }] },
+      message: { model: '<synthetic>', stop_reason: 'stop_sequence', content: [{ type: 'text', text: "You've reached your Fable 5.1 limit. Run /usage-credits to continue or switch models with /model." }] },
     });
     fs.writeFileSync(file, [...midTurn.slice(0, 1), limitError,
       system('<local-command-stdout>Kept model as Opus 4.8</local-command-stdout>')].join('\n'));
@@ -4400,7 +4400,7 @@ test('a hit usage limit is recorded as rateLimit until the session moves past it
     error: 'rate_limit',
     apiErrorStatus: 429,
     quotaLimits,
-    message: { model: '<synthetic>', content: [{ type: 'text', text }] },
+    message: { model: '<synthetic>', stop_reason: 'stop_sequence', content: [{ type: 'text', text }] },
   });
   const fiveHour = limitError("You've hit your session limit · resets 3pm (Pacific/Honolulu)", {
     status: 'rejected',
@@ -4421,9 +4421,12 @@ test('a hit usage limit is recorded as rateLimit until the session moves past it
       type: 'five_hour',
       resetsAt: 1788570000000,
     });
-    // The stalled session must still read as an ended turn: that is what makes it
-    // safe to type into once the window resets.
-    assert.equal(hit.endedTurn, true);
+    // The record's stop_reason is "stop_sequence", so the scanner does not read the
+    // stalled session as an ended turn. What makes it safe to type into once the
+    // window resets is resumeAfterLimit's parkedIdle rule, not endedTurn.
+    assert.equal(hit.endedTurn, false);
+    assert.equal(hit.toolRunning, false);
+    assert.equal(hit.pendingOther, false);
     assert.equal(hit.exited, false);
     assert.equal(hit.pendingQuestion, undefined);
 
@@ -4431,7 +4434,7 @@ test('a hit usage limit is recorded as rateLimit until the session moves past it
     const weekly = scanTranscript(file);
     assert.equal(weekly.rateLimit.type, 'fable_weekly', 'the Fable limit names itself only in prose');
     assert.equal(weekly.rateLimit.resetsAt, null);
-    assert.equal(weekly.endedTurn, true);
+    assert.equal(weekly.endedTurn, false);
 
     // The live sentence often omits the model version entirely.
     fs.writeFileSync(file, [...opening, limitError(
@@ -4449,6 +4452,44 @@ test('a hit usage limit is recorded as rateLimit until the session moves past it
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+// The shape Claude Code has actually written since July 2026: the synthetic limit
+// record carries stop_reason "stop_sequence", and a turn_duration system row follows it.
+// endedTurn is therefore false on every genuinely parked session, so nothing downstream
+// may read it as "the session moved on" — see resumeAfterLimit's parkedIdle rule.
+test('a real limit record stops the turn without ending it', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-transcript-limit-stop-seq-'));
+  const file = path.join(dir, 'session.jsonl');
+  try {
+    fs.writeFileSync(file, [
+      record('user', 'Keep going on the fleet card'),
+      record('assistant', 'Working on it'),
+      JSON.stringify({
+        type: 'assistant',
+        timestamp: '2026-09-05T22:14:03.921Z',
+        isApiErrorMessage: true,
+        error: 'rate_limit',
+        apiErrorStatus: 429,
+        quotaLimits: { status: 'rejected', resetsAt: 1788570000, rateLimitType: 'five_hour' },
+        message: {
+          model: '<synthetic>',
+          role: 'assistant',
+          stop_reason: 'stop_sequence',
+          stop_sequence: '',
+          content: [{ type: 'text', text: "You've hit your session limit · resets 2pm (America/Los_Angeles)" }],
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      }),
+      JSON.stringify({ type: 'system', subtype: 'turn_duration', durationMs: 1015 }),
+    ].join('\n'));
+    const parked = scanTranscript(file);
+    assert.equal(parked.rateLimit?.type, 'five_hour', 'the limit is the last real event');
+    assert.equal(parked.endedTurn, false,
+      'stop_sequence is not end_turn: endedTurn carries no information about a parked session');
+    assert.equal(parked.toolRunning, false);
+    assert.equal(parked.pendingOther, false);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('a limit record with no window, and one Owner typed past, are not resumable', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-transcript-limit-null-'));
   const file = path.join(dir, 'session.jsonl');
@@ -4459,7 +4500,7 @@ test('a limit record with no window, and one Owner typed past, are not resumable
     error: 'rate_limit',
     apiErrorStatus: 429,
     quotaLimits,
-    message: { model: '<synthetic>', content: [{ type: 'text', text }] },
+    message: { model: '<synthetic>', stop_reason: 'stop_sequence', content: [{ type: 'text', text }] },
   });
   const opening = [record('user', 'Keep going on the fleet card'), record('assistant', 'Working on it')];
   const wrapper = (text) => JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text }] } });
@@ -4556,10 +4597,26 @@ test('resumeAfterLimit rechecks the session and the screen inside the lock', asy
     (e) => e.status === 409 && e.message.startsWith('session moved on') && moved.sent.length === 0,
   );
 
+  // The scanner never reports endedTurn for a limit error — Claude Code writes that
+  // synthetic record with stop_reason "stop_sequence" — so a parked session that has
+  // nothing in flight is resumable whatever endedTurn says. A bounded background
+  // watcher is not in flight for this purpose: it wakes the session itself, and a
+  // continue alongside it is harmless.
+  for (const session of [
+    { ...parked, endedTurn: false },
+    { ...parked, endedTurn: false, pendingBackground: true },
+  ]) {
+    const [calls, deps] = makeDeps(session, promptScreen);
+    assert.deepEqual(await resumeAfterLimit('session-one', 'continue', { hitAt: HIT_AT }, deps), { ok: true });
+    assert.deepEqual(calls.sent, [['session-one', 'pane-one', 'continue']]);
+  }
+
   for (const session of [
     { ...parked, rateLimit: null },
     { ...parked, kind: 'codex' },
-    { ...parked, endedTurn: false },
+    { ...parked, endedTurn: false, toolRunning: true },
+    { ...parked, endedTurn: false, pendingOther: true },
+    { ...parked, endedTurn: false, unknownBackgroundJobs: ['bg-1'] },
     { ...parked, toolRunning: true },
     { ...parked, pendingQuestion: { question: 'which?' } },
     { ...parked, pendingPlan: { ts: HIT_AT } },

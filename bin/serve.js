@@ -5632,7 +5632,12 @@ async function resumeAfterLimit(sessionId, text, { hitAt } = {}, deps = {}) {
     const movedOn = (why) => new InjectionError(409, `session moved on before resume (${why})`);
     if (session.kind !== 'claude') throw movedOn('not a Claude session');
     if (!session.rateLimit || session.rateLimit.at !== hitAt) throw movedOn('no longer parked on that limit');
-    if (session.endedTurn !== true) throw movedOn('mid-turn');
+    // The scanner never reports endedTurn for a limit error: Claude Code writes that
+    // synthetic record with stop_reason "stop_sequence", not end_turn. With rateLimit
+    // verified as the last real event above, "ended" means nothing else is in flight.
+    const parkedIdle = session.endedTurn === true
+      || (!session.toolRunning && !session.pendingOther && !(session.unknownBackgroundJobs || []).length);
+    if (!parkedIdle) throw movedOn('mid-turn');
     if (session.toolRunning) throw movedOn('a tool is running');
     if (session.pendingQuestion || session.pendingPlan) throw movedOn('waiting on a person');
     if (session.notify && ['permission', 'question'].includes(session.notify.type)) {
