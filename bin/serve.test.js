@@ -2396,8 +2396,50 @@ test('handoff model resolution follows a /model typed after the newest assistant
     'and a window asked for by hand is not dropped by the reply that follows it');
     assert.equal(resolve('alias-then-answered', [
       modelCommand('opus'), stdout('Set model to Opus 5'), real('claude-opus-5'), synthetic,
-    ], {}, { meta: { model: 'claude-fable-5-1[1m]' } }), '<unknown>',
-    'an alias switch leaves a base model with no reproducible window');
+    ], {}, { meta: { model: 'claude-fable-5-1[1m]' } }), 'claude-opus-5',
+    'the record after an alias switch proves the base, and the harness label names the window');
+    // The picker is the same shape with no args at all, and its confirmation is backticked
+    // and trails "and saved as your default for new sessions".
+    assert.equal(resolve('picker-then-answered', [
+      modelCommand(''), stdout('Set model to `Fable 5.1` and saved as your default for new sessions'),
+      real('claude-fable-5-1'), synthetic,
+    ], {}, { meta: { model: 'claude-fable-5-1' } }), 'claude-fable-5-1',
+    'a picker switch names its model in the label the harness echoed after it took effect');
+    assert.equal(resolve('picker-then-answered-wide', [
+      modelCommand(''), stdout('Set model to `Fable 5.1 (1M context)` and saved as your default for new sessions'),
+      real('claude-fable-5-1'), synthetic,
+    ], {}, { meta: { model: 'claude-fable-5-1' } }), 'claude-fable-5-1[1m]',
+    'and the label names the window the record never carries');
+    assert.equal(resolve('picker-mismatch', [
+      modelCommand(''), stdout('Set model to `Opus 5` and saved as your default for new sessions'),
+      real('claude-fable-5-1'), synthetic,
+    ], {}, { meta: { model: 'claude-fable-5-1' } }), '<unknown>',
+    'a label that does not match the record cannot prove which base the session is on');
+    assert.equal(resolve('picker-version-mismatch', [
+      modelCommand(''), stdout('Set model to `Opus 5`'), real('claude-opus-5-1'), synthetic,
+    ], {}, { meta: { model: 'claude-opus-5-1' } }), '<unknown>',
+    'a version is matched whole: Opus 5 is not claude-opus-5-1');
+    assert.equal(resolve('picker-dated', [
+      modelCommand(''), stdout('Set model to `Haiku 4.5`'), real('claude-haiku-4-5-20251001'), synthetic,
+    ], {}, { meta: { model: 'claude-haiku-4-5-20251001' } }), 'claude-haiku-4-5-20251001',
+    'a dated id is the same model the label names');
+    assert.equal(resolve('picker-unconfirmed', [
+      modelCommand(''), real('claude-fable-5-1'), synthetic,
+    ], {}, { meta: { model: 'claude-fable-5-1' } }), '<unknown>',
+    'a picker with no confirmation after it names nothing');
+    assert.equal(resolve('picker-kept', [
+      modelCommand(''), stdout('Kept model as `Fable 5.1`'), real('claude-fable-5-1'), synthetic,
+    ], {}, { meta: { model: 'claude-fable-5-1' } }), '<unknown>',
+    'a picker the user backed out of is not a switch');
+    // The real transcript that started this: two picker switches in a row, the newer one
+    // to Fable, and hundreds of fable records after them.
+    assert.equal(resolve('two-pickers', [
+      modelCommand(''), userStdout('Set model to `Opus 5 (1M context)` and saved as your default for new sessions'),
+      real('claude-opus-5'),
+      modelCommand(''), userStdout('Set model to `Fable 5.1` and saved as your default for new sessions'),
+      real('claude-fable-5-1'), real('claude-fable-5-1'), synthetic,
+    ], {}, { meta: { model: 'claude-fable-5-1' } }), 'claude-fable-5-1',
+    'only the newest switch decides, and the records after it agree');
     // The bound stops the scan before byte zero, so an older switch could still be
     // hiding: only launch metadata for the same model can supply the window.
     const bounded = { scanChunkBytes: 512, scanMaxBytes: 512 };
@@ -2425,7 +2467,21 @@ test('handoff model resolution follows a /model typed after the newest assistant
     ]), 'claude-opus-5', 'the harness reply is logged as a user record in older transcripts');
     assert.equal(resolve('alias', [
       real('claude-fable-5-1'), modelCommand('opus'), stdout('Set model to Opus 5'), synthetic,
-    ]), '<unknown>', 'an alias resolves against settings this scan cannot see');
+    ]), '<unknown>', 'the label names a model the launch metadata does not, so nothing proves the base');
+    // Nothing is newer than the switch, so the launch metadata is the only thing left that
+    // can prove the base the label names.
+    assert.equal(resolve('alias-launch', [
+      real('claude-fable-5-1'), modelCommand('opus'), stdout('Set model to Opus 5'), synthetic,
+    ], {}, { meta: { model: 'claude-opus-5' } }), 'claude-opus-5',
+    'the launch metadata proves the base and the label confirms the switch landed on it');
+    assert.equal(resolve('alias-launch-wide', [
+      real('claude-fable-5-1'), modelCommand('opus'), stdout('Set model to Opus 5 (1M context)'), synthetic,
+    ], {}, { meta: { model: 'claude-opus-5[1m]' } }), 'claude-opus-5[1m]',
+    'and the label keeps the wide window the session was launched with');
+    assert.equal(resolve('alias-launch-narrowed', [
+      real('claude-fable-5-1'), modelCommand('opus'), stdout('Set model to Opus 5'), synthetic,
+    ], {}, { meta: { model: 'claude-opus-5[1m]' } }), 'claude-opus-5',
+    'a label with no 1M is the picker narrowing the window away from the launch spelling');
     assert.equal(resolve('kept', [
       real('claude-fable-5-1'), modelCommand('claude-opus-5'), stdout('Kept model as Fable 5.1'), synthetic,
     ]), '<unknown>', 'a switch the harness did not make is not a model');

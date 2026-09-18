@@ -1262,22 +1262,67 @@ function localCommandStdout(record) {
   return text.startsWith(open) ? text.slice(open.length).trimStart() : null;
 }
 
+// The label out of a `/model` confirmation row: `Set model to `Fable 5.1` and saved as
+// your default for new sessions` is the label `Fable 5.1`. null when the row is not a
+// "Set model to …" confirmation at all — "Kept model as …" means the switch never
+// happened, and nothing else is a confirmation either. The label may be '' when the
+// harness printed none.
+// The label is the harness speaking after the switch already took effect, and it names
+// the context window outright (`Opus 5 (1M context)`), which is the one thing no assistant
+// record ever carries. It is not evidence of the base model on its own — a display name
+// is not an id — so a label only ever narrows a base that a record or the launch
+// metadata has already proven.
+function modelSwitchLabel(stdout) {
+  // First line only, and never the wrapper: localCommandStdout leaves the closing tag on.
+  const text = String(stdout == null ? '' : stdout).split(/\r?\n/)[0].split('</')[0].trim();
+  const set = /^Set model to\b([\s\S]*)$/i.exec(text);
+  if (!set) return null;
+  // The picker appends "and saved as your default for new sessions" after the label, and
+  // wraps the label itself in backticks.
+  return set[1].replace(/\s+and saved\b[\s\S]*$/i, '').trim().replace(/^`+|`+$/g, '').trim();
+}
+
+// `Fable 5.1 (1M context)` → family `fable`, version `5-1`. Both are needed: a label with
+// no family, or none of the version digits that tell `claude-opus-5` from
+// `claude-opus-5-1`, names no model this could match.
+const MODEL_LABEL_RE = /\b(fable|mythos|opus|sonnet|haiku)\s+(\d+(?:\.\d+)*)\b/i;
+
+// The model id a label names, given a reference id that already proves the base — the
+// assistant record right after the switch, or the launch metadata. '' when the two cannot
+// be matched, which is the fail-closed answer everywhere this is used. The version is
+// matched whole and anchored, so `Opus 5` matches `claude-opus-5` and the date-suffixed
+// `claude-haiku-4-5-20251001` spelling, and never `claude-opus-5-1` or `claude-opus-4-5`.
+// On a match the reference spells the model and the label decides the window: the picker
+// labels the wide variant `(1M context)`, and that is the window to relaunch with.
+function modelIdForSwitchLabel(label, reference) {
+  const named = MODEL_LABEL_RE.exec(String(label || ''));
+  const base = String(reference || '').trim().replace(/\[1m\]$/i, '');
+  if (!named || !base) return '';
+  const suffix = new RegExp(`-${named[1].toLowerCase()}-${named[2].replace(/\./g, '-')}(?:-\\d{8})?$`);
+  if (!suffix.test(compactModelBase(base))) return '';
+  return /\b1m\b/i.test(label) ? `${base}[1m]` : base;
+}
+
 // A `/model` typed after the newest genuine assistant record is the session's model, and
-// no assistant record reflects it yet. It only counts when it names a full id the resume
-// could pass to `claude --model` and the harness confirmed the switch: a bare alias
+// no assistant record reflects it yet. The model only counts when it names a full id the
+// resume could pass to `claude --model` and the harness confirmed the switch: a bare alias
 // (`opus`) resolves against settings we cannot see, no argument opens the picker, and
 // "Kept model as …" means the switch never happened.
+// The label of a confirmed switch comes back either way: when the args named no id, the
+// label is all that is left of which model the harness moved to, and the caller matches it
+// against whatever proves the base at its level.
 function resolveLocalModelSwitch(args, following) {
-  const model = /-/.test(args) && !/\s/.test(args) ? launchModelId(args) : '';
-  if (!model) return '<unknown>';
+  const typed = /-/.test(args) && !/\s/.test(args) ? launchModelId(args) : '';
   for (const line of following) {
     let record;
     try { record = JSON.parse(line); } catch { continue; }
     const stdout = localCommandStdout(record);
     if (stdout == null) continue;
-    return /^Set model to/i.test(stdout) ? model : '<unknown>';
+    const label = modelSwitchLabel(stdout);
+    if (label == null) return { model: '<unknown>', label: '' };
+    return { model: typed || '<unknown>', label };
   }
-  return '<unknown>';
+  return { model: '<unknown>', label: '' };
 }
 
 // Everything in this slice that bears on the model, oldest first: genuine assistant turns
@@ -1298,13 +1343,17 @@ function modelEventsInText(text, newerText = '') {
   return events;
 }
 
-// The model over the whole file, newest slice first, as { model, source, window }:
-//  - source 'switch' is a model someone typed, spelling and context window included, so
-//    it is used exactly as it stands; 'assistant' is an API record, which names the base
-//    model but not reliably the `[1m]` window.
+// The model over the whole file, newest slice first, as { model, source, window, label? }:
+//  - source 'switch' is a model someone chose by hand, spelling and context window
+//    included, so it is used exactly as it stands; 'assistant' is an API record, which
+//    names the base model but not reliably the `[1m]` window.
 //  - window 'exact' means the model string already carries the right window, 'launch'
 //    that the launch metadata may supply it, and 'unknown' that it cannot be told —
 //    a switch beyond the scan's bound could have set a window nothing else records.
+//  - label is set only alongside the '<unknown>' sentinel, and only for a `/model` newer
+//    than every record that named no launchable id: it is the model name the harness
+//    echoed, which the caller may resolve against launch metadata it can see and this
+//    scan cannot. It is not a model, and an unresolved label stays '<unknown>'.
 // The model is '' only after reading back to byte zero with no genuine record in the
 // whole file; a scan cut short by the bound or by a read error reports the '<unknown>'
 // sentinel, because unread bytes are not evidence of absence.
@@ -1386,16 +1435,29 @@ function lastClaudeHandoffModelInFile(file, deps = {}) {
 }
 
 function switchResult(event) {
-  const model = resolveLocalModelSwitch(event.args, event.following());
-  return { model, source: 'switch', window: model === '<unknown>' ? 'unknown' : 'exact' };
+  const { model, label } = resolveLocalModelSwitch(event.args, event.following());
+  if (model !== '<unknown>') return { model, source: 'switch', window: 'exact' };
+  // Nothing newer than this switch, so no record names the base model it moved to. The
+  // label travels out with the sentinel: only handoffCurrentModel holds the launch
+  // metadata that could prove it.
+  return { model, source: 'switch', window: 'unknown', label };
 }
 
 // A `/model` older than the newest assistant record: the record confirms the base model,
 // and the switch is still the only thing that named the context window.
 function switchBehindAssistant(event, assistant) {
-  const { model } = switchResult(event);
-  // An alias, or a switch the harness never confirmed, leaves the window unknowable.
-  if (model === '<unknown>') return { model, source: 'switch', window: 'unknown' };
+  const { model, label } = switchResult(event);
+  if (model === '<unknown>') {
+    // The picker, or a bare alias: no id was typed, but the harness echoed the model it
+    // moved to and the record right after it proves that base. Matching the two is the
+    // only thing here that can name the window. A label that does not match the record
+    // proves nothing — unlike a typed id, it cannot show the base changed by some other
+    // path — so it keeps failing closed.
+    const labelled = label ? modelIdForSwitchLabel(label, assistant) : '';
+    return labelled
+      ? { model: labelled, source: 'switch', window: 'exact' }
+      : { model, source: 'switch', window: 'unknown' };
+  }
   if (compactModelBase(model) === compactModelBase(assistant)) return { model, source: 'switch', window: 'exact' };
   // The model changed after the switch by some other path, so the record is the evidence
   // and its window comes from the launch metadata as usual.
@@ -1466,7 +1528,17 @@ function handoffCurrentModel(session, pane, processArgs, deps = {}) {
   // record's own `claude-fable-5-1` are the same model with different windows.
   const launch = launchModelId(pane?.meta?.model)
     || launchModelId(HANDOFF_ARGV_MODEL_RE.exec(String(processArgs || ''))?.[1]);
-  const { model, source, window } = found;
+  const { model, source, window, label } = found;
+  // A `/model` newer than every record that named no launchable id — the picker, or a bare
+  // alias — left the model it moved to only in the label the harness echoed. Nothing in
+  // the transcript can prove that base, so the launch metadata has to: when the label
+  // names the model the session was launched with, the base is the launch spelling and the
+  // label's own `(1M context)` decides the window. No launch metadata, or a label that
+  // names some other model, keeps failing closed.
+  if (model === '<unknown>' && label && launch) {
+    const labelled = modelIdForSwitchLabel(label, launch);
+    if (labelled) return labelled;
+  }
   if (model === '<unknown>') return model;
   // Nothing in the whole transcript names a model. Launch metadata first, and then — only
   // when the scan actually reached byte zero, so there is no switch it could have missed —
