@@ -1309,7 +1309,7 @@ function repairExecutable(tokens) {
   const mentions = tokens.filter((token, position) => position > 0
     && NODE_SCRIPTS.has(stepRegistry.commandBasename(token)));
   const reaching = tokens.some((token, position) => position > 0
-    && (token === 'restart-daemon' || token === 'service'
+    && (token === 'restart-daemon' || token === 'service' || token === 'step'
       || stepRegistry.commandBasename(token) === 'serve.js'));
   const script = index === -1 ? '' : tokens[index];
   const interpreter = index === -1 ? tokens.slice(1) : tokens.slice(1, index);
@@ -1461,7 +1461,8 @@ function repairDenial(invocation) {
   if (head === 'keep' && first === 'restart-daemon') return '`keep restart-daemon` restarts the daemon you were launched to repair';
   // A gated step's command runs as a child of `keep step run`, out of this guard's
   // sight, and keep-tool's own `deploy` step is a pull and a restart.
-  if (head === 'keep' && first === 'step' && args.includes('run')) return '`keep step run` runs a step command this guard cannot see, and keep-tool\'s deploy step restarts the daemon you were launched to repair';
+  const verb = first === 'step' ? args.slice(args.indexOf('step') + 1).find((token) => !token.startsWith('-')) : '';
+  if (head === 'keep' && verb === 'run') return '`keep step run` runs a step command this guard cannot see, and keep-tool\'s deploy step restarts the daemon you were launched to repair';
   if (head === 'keep' && first === 'service') return "`keep service` installs, starts or stops the daemon's launchd job";
   if (head === 'wt' && first === 'land') return '`wt land` pushes without a review record';
   // The HTTP spelling of the same restart. Only a fetcher counts: grepping the

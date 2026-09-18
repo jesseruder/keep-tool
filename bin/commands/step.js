@@ -555,9 +555,17 @@ async function finalizeStep(registry, name, step, options = {}) {
     return { run, prior, sha, by, artifact, claim };
   });
   const { run, prior, sha, by, artifact, claim } = finalized;
-  const notify = await notifyStepWaiters(registry, name, {
+  let notify = await notifyStepWaiters(registry, name, {
     outcome: 'finished', agent: by.agent, sessionId: by.sessionId, artifact, sha,
   });
+  // A daemon deploy just restarted the daemon that delivers the notice; launchd
+  // brings it back within seconds, so give the queued waiters that long.
+  for (let attempt = 0; step.since === 'daemon' && notify.failures && attempt < (options.notifyRetries ?? 10); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 3e3));
+    notify = await notifyStepWaiters(registry, name, {
+      outcome: 'finished', agent: by.agent, sessionId: by.sessionId, artifact, sha,
+    });
+  }
   const included = stepRegistry.commitsBetween(registry.project, prior && prior.sha, sha, step);
   const attributed = stepRegistry.attributeCommits(included.commits, loadAll(false), registry.project);
   const cards = new Set(attributed.flatMap((commit) => commit.tasks));

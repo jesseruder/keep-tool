@@ -1108,6 +1108,9 @@ test('the pre-bash guard keeps a self-repair run off the daemon and out of the m
     // keep-tool's deploy step is a pull and a restart, run where this guard cannot see it.
     'keep step run ~/castle/keep-tool deploy',
     'keep step run keep-tool deploy --sha HEAD',
+    // node with a value-taking flag reads ambiguously; reaching for a step is enough to refuse.
+    'node --stack-size 1000 bin/keep.js step run keep-tool deploy',
+    'node -r ./x.js bin/keep.js step run keep-tool deploy',
     `bash -lc "keep restart-daemon"`,
     'cd /tmp && keep restart-daemon',
     'npm test && keep restart-daemon',
@@ -1121,6 +1124,8 @@ test('the pre-bash guard keeps a self-repair run off the daemon and out of the m
     'keep allow some-card land',
     'keep health --json',
     'keep steps keep-tool',
+    // only the verb right after `step` counts
+    'keep step claim keep-tool deploy -m run',
     'echo "keep restart-daemon"',
     'grep -rn "launchctl" bin',
     // Reading the endpoint out of the source is exactly what diagnosis looks like.

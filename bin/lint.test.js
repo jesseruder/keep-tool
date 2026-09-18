@@ -1046,6 +1046,16 @@ test('step-run-pending waits a day before naming a gated step', () => {
     assert.match(findings[0].text, /2 landed commits touch terraform/);
     assert.match(findings[0].text, /51h ago/);
     assert.deepEqual(lint({ root, now, rule: 'step-run-pending', stepRows: () => [] }).findings, []);
+    // A daemon deploy step is timed from the daemon's start, not a ledger wt land never writes.
+    const deploy = (startedAt) => [{
+      name: 'deploy', project: '~/castle/keep-tool', git: { available: true }, pending: [{ sha: 'abc1230' }],
+      lastDone: null, daemon: { commit: '0d8aaad0', startedAt },
+    }];
+    assert.deepEqual(lint({ root, now, rule: 'step-run-pending', stepRows: () => deploy(now - 3600e3) }).findings, [],
+      'a daemon restarted an hour ago is not stale');
+    const behind = lint({ root, now, rule: 'step-run-pending', stepRows: () => deploy(now - 30 * 3600e3) }).findings;
+    assert.equal(behind.length, 1);
+    assert.match(behind[0].text, /the daemon running 0d8aaad started 30h ago/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

@@ -859,12 +859,16 @@ function stepRunPending(_task, ctx) {
   const out = [];
   for (const row of rows) {
     if (!row || !row.pending || !row.pending.length || !row.git || !row.git.available) continue;
-    const lastAt = atMs(String((row.lastDone && (row.lastDone.endedAt || row.lastDone.finalizedAt)) || '').replace(' ', 'T'));
+    // A daemon deploy step is behind the daemon, not its ledger: `wt land` restarts
+    // without a recorded run, so the clock is how long this daemon has been running.
+    const lastAt = row.daemon ? Number(row.daemon.startedAt)
+      : atMs(String((row.lastDone && (row.lastDone.endedAt || row.lastDone.finalizedAt)) || '').replace(' ', 'T'));
     const age = Number.isFinite(lastAt) ? ctx.now - lastAt : Infinity;
     if (age < DAY_MS) continue;
     out.push(finding('step-run-pending', { id: `step:${path.basename(String(row.project || 'project'))}:${row.name}` }, 'med',
       `${row.pending.length} landed commit${row.pending.length === 1 ? '' : 's'} touch ${row.name} in ${tilde(row.project)}`
-      + `, and the last run was ${Number.isFinite(lastAt) ? `${Math.floor(age / 3600e3)}h ago` : 'never recorded'}`,
+      + (row.daemon ? `, and the daemon running ${String(row.daemon.commit).slice(0, 7)} started ${Number.isFinite(lastAt) ? `${Math.floor(age / 3600e3)}h ago` : 'at an unknown time'}`
+        : `, and the last run was ${Number.isFinite(lastAt) ? `${Math.floor(age / 3600e3)}h ago` : 'never recorded'}`),
       `keep steps ${row.project}, then keep step claim ${row.project} ${row.name} -m "..."`));
     if (out.length >= 10) break;
   }
