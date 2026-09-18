@@ -25,6 +25,7 @@ import { openPortableTransfer } from './portable-transfer.js';
 import { closeReviewerPopover, markReviewerSeen, renderDock, renderReviewer, renderReviewerTop } from './reviewer.js';
 import { createDetailStore } from './details.js';
 import { handleGradeKey } from './state-line.js';
+import { focusQueueItem, handleLeaveTerminalKey } from './leave-terminal.js';
 import { acknowledgeNotificationClick, installNotificationClicks, notificationPermission, notify, requestPermission, setBadge } from './shell.js';
 
 applyTheme();
@@ -1355,11 +1356,7 @@ function focusTerminal(explicit = false) {
   terminal.element.classList.add('focused');
   terminal.focus();
 }
-function focusQueue() {
-  state.focused = false;
-  document.querySelector('#qlist .qitem.sel')?.focus();
-  document.querySelectorAll('.term.focused').forEach((element) => element.classList.remove('focused'));
-}
+function focusQueue() { focusQueueItem(state, document); }
 
 document.addEventListener('keydown', (event) => {
   if (document.querySelector('#notificationsPanel')?.open) return;
@@ -1387,8 +1384,14 @@ document.addEventListener('keydown', (event) => {
     closePalettePopover();
     closeReviewerPopover();
     event.preventDefault();
+    // The popover consumed the Escape; a focused terminal must not also get a
+    // bare ESC (Claude Code reads it as interrupt).
+    if (termFocus) event.stopPropagation();
     return;
   }
+  // ⌘⎋ is the way back out of a terminal: Escape alone stays with it, and ⌘↵
+  // below is deliberately left to it for multiline input. A popover closes first.
+  if (termFocus && handleLeaveTerminalKey(event, state, document)) return;
   if (help.classList.contains('on')) {
     if (key === 'Escape' || !inInput) { document.querySelector('#help').classList.remove('on'); event.preventDefault(); }
     return;

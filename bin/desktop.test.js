@@ -119,23 +119,70 @@ test('a daemon restart retries quietly; only a long outage or a real error toast
   assert.equal(toasts.length, 2, 'a real server error toasts immediately');
 });
 
-test('Cmd+Enter reaches a focused terminal without moving focus or cancelling input', () => {
-  let handler, focusChanges = 0, cancelled = 0;
+// The global keydown handler, lifted out of app.js and run against a terminal
+// textarea that owns the keyboard. The real leave-terminal module is wired in,
+// so this is the app.js gate itself under test, not a restatement of it.
+async function focusedTerminalKeys({ helpOpen = false } = {}) {
+  const { handleLeaveTerminalKey } = await import('../web/app/leave-terminal.js');
+  let handler, focusChanges = 0;
   class Element {
     matches() { return true; }
     closest(selector) { return selector === 'dialog' || selector === '#sessionHistory' ? null : this; }
   }
   const textarea = new Element();
-  const closed = { classList: { contains: () => false } };
+  const closed = { classList: { contains: () => false, remove() {} } };
+  const help = { on: helpOpen, classList: { contains: (name) => name === 'on' && help.on, remove: (name) => { if (name === 'on') help.on = false; } } };
+  const document = {
+    activeElement: textarea,
+    querySelector: (selector) => (selector === '#help' ? help : selector === '#qlist .qitem.sel' ? queueItem : closed),
+    querySelectorAll: () => [],
+    addEventListener: (_event, fn) => { handler = fn; },
+  };
+  const queueItem = { focus() { document.activeElement = queueItem; } };
+  const state = { focused: true, pendingFocus: false };
   const start = app.indexOf("document.addEventListener('keydown', (event) => {");
   vm.runInNewContext(app.slice(start, app.indexOf('}, true);', start) + 9), {
-    Element, state: { focused: true },
-    document: { activeElement: textarea, querySelector: () => closed, addEventListener: (_event, fn) => { handler = fn; } },
+    Element, state, document, handleLeaveTerminalKey,
     focusQueue: () => { focusChanges++; },
+    closePalettePopover() {}, closeReviewerPopover() {},
   });
-  handler({ key: 'Enter', metaKey: true, target: textarea, preventDefault: () => { cancelled++; } });
-  assert.equal(focusChanges, 0);
-  assert.equal(cancelled, 0);
+  const press = (key, modifiers = {}) => {
+    const event = { key, metaKey: false, target: textarea, cancelled: 0, stopped: 0, ...modifiers };
+    event.preventDefault = () => { event.cancelled++; };
+    event.stopPropagation = () => { event.stopped++; };
+    handler(event);
+    return event;
+  };
+  return { press, state, document, help, textarea, queueItem, focusChanges: () => focusChanges };
+}
+
+test('Cmd+Enter reaches a focused terminal without moving focus or cancelling input', async () => {
+  const keys = await focusedTerminalKeys();
+  const event = keys.press('Enter', { metaKey: true });
+  assert.equal(keys.focusChanges(), 0);
+  assert.equal(event.cancelled, 0);
+  assert.equal(keys.document.activeElement, keys.textarea);
+});
+
+test('Cmd+Escape leaves a focused terminal for the selected queue item, stopped before xterm sees it', async () => {
+  const keys = await focusedTerminalKeys();
+  const plain = keys.press('Escape');
+  assert.equal(keys.document.activeElement, keys.textarea, 'Escape alone stays with the terminal');
+  assert.equal(plain.cancelled + plain.stopped, 0);
+  const chord = keys.press('Escape', { metaKey: true });
+  assert.equal(keys.document.activeElement, keys.queueItem);
+  assert.equal(keys.state.focused, false);
+  assert.equal(chord.cancelled, 1);
+  assert.equal(chord.stopped, 1);
+});
+
+test('Cmd+Escape with the help sheet open closes the sheet first and keeps the terminal', async () => {
+  const keys = await focusedTerminalKeys({ helpOpen: true });
+  const chord = keys.press('Escape', { metaKey: true });
+  assert.equal(keys.help.on, false);
+  assert.equal(keys.document.activeElement, keys.textarea);
+  assert.equal(chord.cancelled, 1);
+  assert.equal(chord.stopped, 1, 'the pty must not receive a bare ESC for the Escape that closed the sheet');
 });
 
 test('native notifications carry their session key and recover early and subsequent clicks', async () => {
