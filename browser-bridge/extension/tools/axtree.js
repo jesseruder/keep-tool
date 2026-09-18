@@ -154,7 +154,22 @@ async function localFramesOf(tabId, sessionId, skip, budget) {
  */
 export async function fullAxTree(tabId, { budgetMs = FRAME_WALK_BUDGET_MS } = {}) {
   const budget = walkBudget(budgetMs);
-  const mainNodes = await treeFor(tabId, null);
+
+  // The page's own tree is under the same clock as the frames: a busy or blocked main
+  // renderer (or an attach that never completes) would otherwise hang the tool with no
+  // bound at all. There is nothing to fall back on if this one does not answer, so it is
+  // an error rather than a partial result.
+  let mainNodes;
+  try {
+    mainNodes = await budget.guard(treeFor(tabId, null));
+  } catch (error) {
+    if (error instanceof BudgetExpired) {
+      throw new Error(
+        `This page did not return its accessibility tree within ${budgetMs} ms; its renderer may be busy or blocked. Try again, or use get_page_text or a screenshot instead.`,
+      );
+    }
+    throw error;
+  }
 
   const children = [];
   const errors = [];

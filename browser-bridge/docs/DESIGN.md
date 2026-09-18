@@ -322,7 +322,9 @@ Result shapes:
   hands the page the file: the tab object an action captured is a snapshot, those steps are
   awaits of their own, and a tab dragged into another session's group must not be recorded
   into this session's GIF or receive its file. `upload_image`'s coordinate mode shares that
-  helper and therefore that guard. A filename is normalised before anything is encoded
+  helper and therefore that guard. The handle is released with a raw send that never
+  attaches: cleaning up after a refusal must not re-attach the debugger to a tab that has
+  just become somebody else's. A filename is normalised before anything is encoded
   (path separators, `<>:"|?*`, control characters, and the DOS device names judged by the
   component before the *first* dot, so `CON.backup` is caught while `console.gif` is not),
   so a name the download API would refuse never costs a wasted encode. Frame delay is the real gap to the next frame clamped to
@@ -417,8 +419,10 @@ fetched by frame id).
   makes its children appear, so the list grows while it is being walked. The walk is bounded
   three ways — at most 8 rounds, a 5 s clock checked before *every* read rather than only
   between rounds, and a race between each individual read and what is left of that clock, so
-  neither a hundred slow frames nor one stalled CDP call can hold the tree hostage. When it
-  stops early it keeps what it collected and the result carries a note that the page was
+  neither a hundred slow frames nor one stalled CDP call can hold the tree hostage. The
+  page's own tree is under the same clock; a main renderer that never answers is an error
+  naming the timeout, since there is nothing to fall back on. When a *frame* read stops the
+  walk early it keeps what it collected and the result carries a note that the page was
   still changing. A frame
   the asking session cannot read is left for the session that owns it rather than being
   written off, so a frame named in the page's frame tree but living in another process is

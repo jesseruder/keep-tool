@@ -23,6 +23,10 @@ const state = {
   moveGroupOnCapture: null,
   moveGroupOnEncode: null,
   moveGroupOnDocument: null,
+  // Detach the debugger inside the document lookup, the way group-change cleanup does.
+  detachOnDocument: false,
+  attachCalls: [],
+  attachesAtDetach: null,
   hangPaint: false,
 };
 
@@ -93,7 +97,8 @@ globalThis.chrome = {
   debugger: {
     onEvent: { addListener: () => {} },
     onDetach: { addListener: () => {} },
-    async attach() {
+    async attach(target) {
+      state.attachCalls.push(target?.tabId ?? null);
       await tick();
     },
     async detach() {
@@ -122,6 +127,13 @@ globalThis.chrome = {
           if (state.moveGroupOnDocument != null) {
             for (const tab of state.tabs.values()) tab.groupId = state.moveGroupOnDocument;
             state.moveGroupOnDocument = null;
+          }
+          // And the group-change cleanup detaching the debugger, which is what makes a
+          // later `send` want to re-attach.
+          if (state.detachOnDocument) {
+            state.detachOnDocument = false;
+            cdp.detach(target.tabId);
+            state.attachesAtDetach = state.attachCalls.length;
           }
           return { result: { objectId: "doc-1" } };
         }
@@ -295,6 +307,7 @@ const gifencode = await import("../extension/lib/gifencode.js");
 const { gif_creator, recordAction, safeFilename } = await import("../extension/tools/gif.js");
 const { computer } = await import("../extension/tools/computer.js");
 const { upload_image } = await import("../extension/tools/upload.js");
+const cdp = await import("../extension/lib/cdp.js");
 const sessions = await import("../extension/lib/sessions.js");
 
 let backend = memoryBackend();
@@ -311,6 +324,9 @@ async function freshGroup(sessionKey, groupId, tabId) {
   state.moveGroupOnCapture = null;
   state.moveGroupOnEncode = null;
   state.moveGroupOnDocument = null;
+  state.detachOnDocument = false;
+  state.attachCalls.length = 0;
+  state.attachesAtDetach = null;
   state.hangPaint = false;
   const tab = addTab(tabId, groupId);
   await sessions.putSession(sessionKey, { name: `s-${sessionKey}`, groupId, windowId: 1 });
@@ -833,6 +849,32 @@ test("a tab that changes hands during the drop's own attach never gets the GIF",
     false,
     "the file was never handed over",
   );
+});
+
+test("a refused drop never re-attaches the debugger to clean up", async () => {
+  await freshGroup("nocleanupattach", 43, 53);
+  await gif_creator(ctx("nocleanupattach"), { action: "start_recording", tabId: 53 });
+  await computer(ctx("nocleanupattach"), { action: "screenshot", tabId: 53 });
+
+  // The tab changes hands *and* the group-change cleanup detaches the debugger, both
+  // during the drop's own document lookup. Releasing the handle through `send` would then
+  // re-attach - enabling domains and focus emulation on a tab that is now somebody else's.
+  state.moveGroupOnDocument = 783;
+  state.groups.set(783, { id: 783, title: "someone else" });
+  state.detachOnDocument = true;
+
+  await assert.rejects(
+    () => gif_creator(ctx("nocleanupattach"), { action: "export", tabId: 53, coordinate: [1, 2] }),
+    /^Error: Tab 53 is not in the same group$/,
+  );
+  assert.equal(typeof state.attachesAtDetach, "number", "the detach hook did fire");
+  assert.equal(
+    state.attachCalls.length,
+    state.attachesAtDetach,
+    "nothing re-attached after the tab was detached",
+  );
+  const released = state.cdp.filter((call) => call.method === "Runtime.releaseObject");
+  assert.equal(released.length, 1, "the handle was still released, through the old attachment");
 });
 
 test("upload_image's coordinate mode is protected by the same guard", async () => {

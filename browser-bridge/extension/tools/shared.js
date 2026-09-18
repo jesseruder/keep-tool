@@ -2,7 +2,7 @@
 // and the one screenshot primitive (computer's `screenshot`, `zoom` and `wait` and
 // gif_creator's frame capture all go through it).
 
-import { frameOwnerFor, refTable, send } from "../lib/cdp.js";
+import { frameOwnerFor, refTable, send, sendRaw } from "../lib/cdp.js";
 import { VIEWPORT_EXPRESSION, dropImageAtPoint, elementRect, source } from "../lib/page.js";
 
 export function unknownRef(ref) {
@@ -111,7 +111,12 @@ export async function callInPage(tabId, fn, args, { beforeCall = null } = {}) {
     }
     return response.result?.value;
   } finally {
-    await send(tabId, "Runtime.releaseObject", { objectId }).catch(() => {});
+    // Release through the attachment we already have, never through `send`: `send`
+    // re-attaches a tab that was detached in the meantime, which would enable domains and
+    // focus emulation on a tab that may by now belong to another session - and this runs
+    // on the path where `beforeCall` refused for exactly that reason. A failed release is
+    // nothing: the handle dies with the page.
+    await sendRaw(tabId, "Runtime.releaseObject", { objectId }).catch(() => {});
   }
 }
 

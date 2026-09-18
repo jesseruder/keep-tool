@@ -180,6 +180,7 @@ const state = {
   // A renderer that answers slowly, and one that never answers.
   slowTreeMs: 0,
   stallTrees: false,
+  stallMainTree: false,
 };
 
 function framesOf(sessionId) {
@@ -259,6 +260,7 @@ globalThis.chrome = {
 
       if (method === "Accessibility.getFullAXTree") {
         // A renderer that answers slowly, or not at all.
+        if (state.stallMainTree && sessionId === null) return new Promise(() => {});
         if (state.stallTrees && sessionId !== null) return new Promise(() => {});
         if (state.slowTreeMs > 0 && (sessionId !== null || params?.frameId)) {
           await new Promise((resolve) => setTimeout(resolve, state.slowTreeMs));
@@ -417,6 +419,7 @@ async function makeTab({ sessionKey }) {
   state.hangPaint = false;
   state.slowTreeMs = 0;
   state.stallTrees = false;
+  state.stallMainTree = false;
   return state.tabs.get(id);
 }
 
@@ -695,6 +698,27 @@ test("a stalled read cannot hold the walk for ever", async () => {
   assert.equal(tree.unsettled, true);
   assert.ok(elapsed < 2000, `the race ended it (${elapsed} ms)`);
   assert.equal(tree.frames, 0);
+});
+
+test("a stalled main renderer is an error, not a hang", async () => {
+  const tab = await makeTab({ sessionKey: "stalledmain" });
+  // The page's own tree never comes back: there is nothing to fall back on, so this has to
+  // be an error, and it has to be bounded by the same clock as everything else.
+  state.stallMainTree = true;
+
+  const started = Date.now();
+  await assert.rejects(
+    () => fullAxTree(tab.id, { budgetMs: 120 }),
+    /did not return its accessibility tree within 120 ms/,
+  );
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 2000, `the race ended it (${elapsed} ms)`);
+
+  // And the tools surface it as a tool error rather than hanging.
+  await assert.rejects(
+    () => read_page(ctx("stalledmain"), { tabId: tab.id }),
+    /did not return its accessibility tree/,
+  );
 });
 
 test("a frame that never paints cannot hang a ref click", async () => {
