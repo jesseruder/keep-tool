@@ -163,7 +163,7 @@ fn main() {
                 .title_bar_style(tauri::TitleBarStyle::Overlay)
                 .hidden_title(true)
                 .background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled)
-                .traffic_light_position(tauri::LogicalPosition::new(12.0, 14.0))
+                .traffic_light_position(tauri::LogicalPosition::new(12.0, 18.0))
                 .inner_size(1500.0, 950.0)
                 .min_inner_size(900.0, 600.0)
                 .build()
