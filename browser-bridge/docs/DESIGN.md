@@ -220,7 +220,13 @@ Result shapes:
   words in the query such as "button", "link", "input", "search" match the role), return
   up to 20 as `[ref] role "name"` lines, best first. State in the description that
   the ranking is lexical, not a model. More than 20 hits: return the top 20 and say to
-  narrow the query. A token matches in one of four ways, scored in that order: exact,
+  narrow the query. Results are ordered by *band* first and only by the additive score
+  inside a band: name-is-the-query, name-contains-the-query, then every token matched
+  exactly, by stem, by synonym, by typo, then a partial match. The additive score alone let
+  a pile of weak matches out-total one exact one (a searchbox named "find input field box"
+  beat a node named exactly "search input field box"). Query tokens are deduplicated for
+  the same reason: repeating a word multiplied its contribution.
+  A token matches in one of four ways, scored in that order: exact,
   stemmed (crude suffix stripping with the "e" put back, so "saved" meets "Save"),
   synonym (a table of the words models actually use: search/find, login/sign in,
   cart/basket, delete/remove, settings/preferences, ...) and fuzzy (a prefix, or a
@@ -304,8 +310,17 @@ Result shapes:
   (`Click (312, 400)`, `Type "hello"`, `Press cmd+a`, `Scroll down`,
   `Navigate example.com`, `Screenshot`) and a timestamp. Frames are blobs in IndexedDB
   keyed by the group, so a worker restart between two actions does not lose the take,
-  capped at 300 frames and 60 MB per group; at a cap recording stays on, nothing more is
-  stored, and `export` says so. Frame delay is the real gap to the next frame clamped to
+  capped at 300 frames and 60 MB per group — the incoming frame's own size counts towards
+  the cap before it is written, so the total cannot overshoot; at a cap recording stays on,
+  nothing more is stored, and `export` says so. `clear` empties the frames and resets the
+  counters in one transaction, so a worker killed mid-clear cannot leave an empty recording
+  that still believes it is full. Ownership is re-checked immediately before the capture,
+  again before the frame is stored, and again before a `coordinate` export drops the GIF:
+  the tab object an action captured is a snapshot, and a tab dragged into another session's
+  group must not be recorded into this session's GIF or receive its file. A filename is
+  normalised before anything is encoded (path separators, `<>:"|?*`, control characters and
+  the DOS device names), so a name the download API would refuse never costs a wasted
+  encode. Frame delay is the real gap to the next frame clamped to
   300-3000 ms, 1500 ms on the last. `export` renders each frame with `OffscreenCanvas`
   and encodes with the vendored `gifenc` (`quantize` + `applyPalette` + `writeFrame`);
   overlays are orange click circles, red drag arrows, a black rounded label, an orange
@@ -351,7 +366,10 @@ after a text block, so both Claude Code and Codex render them.
   `x: scrollX, y: scrollY`, and `clip.scale` is multiplied by the device pixel ratio
   (verified: `scale / dpr` gives a CSS-sized image on a DPR 2 display). A wheel scroll
   animates, so the tool waits 250 ms after scrolling and two animation frames before
-  every capture; without that the frame is stale.
+  every capture; without that the frame is stale. That animation-frame wait is bounded
+  three ways — two frames, 300 ms inside the page, 1 s measured in the worker — because
+  CDP's `timeout` does not cover an awaited promise and a page is free to stub out both
+  `setTimeout` and `requestAnimationFrame`.
 - A timed-out `Runtime.evaluate` comes back on Edge 153 as `{"code":-32603,"message":"Internal error"}`
   after the full budget, not as a named timeout, so the tool uses the clock to decide.
 - macOS editing chords (`cmd+a`, `cmd+z`, `alt+ArrowLeft`, ...) are performed by the
@@ -391,7 +409,12 @@ fetched by frame id).
   attach in turn; their events arrive with the tab's `source.tabId` and the *parent
   session's* `source.sessionId`, which is recorded so a detach can drop the whole subtree.
   `tools/axtree.js` therefore collects frame sessions in rounds: arming a frame is what
-  makes its children appear, so the list grows while it is being walked.
+  makes its children appear, so the list grows while it is being walked. The rounds are
+  bounded (8 of them, 5 s) so a page that keeps replacing its iframes cannot keep the read
+  going for ever; the result then carries a note that the page was still changing. A frame
+  the asking session cannot read is left for the session that owns it rather than being
+  written off, so a frame named in the page's frame tree but living in another process is
+  still read through its own session.
 - Only `type: "iframe"` targets are kept (workers auto-attach too and have no tree). For
   an iframe target the `targetId` *is* the frame id, which is the hook for splicing.
 - Same-process frames are found through `Page.getFrameTree` — on the main session and on
@@ -429,7 +452,9 @@ fetched by frame id).
   sat *before* the page scrolled — a ref click 900 px down computed a point that hit
   nothing. So `pointForRef` scrolls, then lets every ancestor session paint (a
   double-`requestAnimationFrame` promise with the same 300 ms in-page fallback
-  `captureClip` uses, inner frame to page), measures the chain, and measures it again:
+  `captureClip` uses — and a 1 s deadline kept in the worker, because a page can replace
+  both timers with no-ops and CDP's own `timeout` does not bound an awaited promise —
+  inner frame to page), measures the chain, and measures it again:
   while the two readings differ it takes the newer one and tries again, up to three
   rounds. Only then does it read the element's own quads. The page gets one last paint
   before the caller dispatches the click, because the compositor's hit-test surfaces

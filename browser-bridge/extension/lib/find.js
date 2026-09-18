@@ -202,10 +202,16 @@ export const ROLE_WORDS = {
   text: ["StaticText", "textbox"],
 };
 
+/**
+ * Query -> tokens, deduplicated: every token is scored against every field, so repeating
+ * a word multiplied its contribution and let "picker picker picker ..." out-total an
+ * exactly named element.
+ */
 export function tokenize(query) {
-  return normalizeText(query)
+  const tokens = normalizeText(query)
     .split(/[^a-z0-9@.'-]+/)
     .filter((token) => token.length > 0 && !STOPWORDS.has(token));
+  return [...new Set(tokens)];
 }
 
 function haystack(node) {
@@ -307,10 +313,41 @@ function better(a, b) {
   return KINDS.indexOf(a.kind) <= KINDS.indexOf(b.kind) ? a : b;
 }
 
+/**
+ * How well a node matches, coarse first. The additive score alone let a pile of weak
+ * matches out-total one exact one ("find input field box" beating a node named exactly
+ * "search input field box"), so the band decides the order and the score only breaks ties
+ * inside a band.
+ */
+export const BANDS = {
+  NAME_IS_QUERY: 0,
+  NAME_HAS_QUERY: 1,
+  ALL_EXACT: 2,
+  ALL_STEMMED: 3,
+  ALL_SYNONYM: 4,
+  ALL_FUZZY: 5,
+  SOME_TOKENS: 6,
+  NONE: 7,
+};
+
+/** `{score, band}`; band NONE (with score 0) means "not a match at all". */
+export function rateNode(node, query, tokens = tokenize(query)) {
+  const rated = rate(node, query, tokens);
+  return rated;
+}
+
 /** Higher is better; 0 means "not a match at all". */
 export function scoreNode(node, query, tokens = tokenize(query)) {
-  if (node.ignored) return 0;
-  if (node.backendDOMNodeId == null) return 0;
+  return rate(node, query, tokens).score;
+}
+
+function noMatch() {
+  return { score: 0, band: BANDS.NONE };
+}
+
+function rate(node, query, tokens) {
+  if (node.ignored) return noMatch();
+  if (node.backendDOMNodeId == null) return noMatch();
 
   const role = roleOf(node).toLowerCase();
   const name = field(nameOf(node));
@@ -318,12 +355,13 @@ export function scoreNode(node, query, tokens = tokenize(query)) {
   const description = field(node.description?.value ?? "");
   const all = haystack(node);
   const phrase = normalizeText(query).trim();
-  if (!phrase) return 0;
+  if (!phrase) return noMatch();
 
   let score = 0;
   let roleWordUsed = false;
   let matchedTokens = 0;
   let fuzzyOnlyTokens = 0;
+  let worstTier = 0;
 
   if (name.text && name.text === phrase) score += 100;
   else if (name.text && name.text.includes(phrase)) score += 60;
@@ -358,26 +396,37 @@ export function scoreNode(node, query, tokens = tokenize(query)) {
     if (best) {
       matchedTokens += 1;
       if (best.kind === "fuzzy") fuzzyOnlyTokens += 1;
+      // The band is decided by the *weakest* way the query had to be bent to match, so a
+      // node that needed a synonym for one word is behind one that needed none.
+      worstTier = Math.max(worstTier, KINDS.indexOf(best.kind));
     }
   }
 
-  if (score === 0) return 0;
+  if (score === 0) return noMatch();
   // One near-miss word out of several is a coincidence, not a match: "chart" should not
   // drag in "cart" when the rest of the query ("quarterly revenue") matches nothing.
-  if (fuzzyOnlyTokens === matchedTokens && matchedTokens * 2 < tokens.length) return 0;
+  if (fuzzyOnlyTokens === matchedTokens && matchedTokens * 2 < tokens.length) return noMatch();
   if (tokens.length > 1 && matchedTokens === tokens.length) score += 25;
   // A query naming a role should not surface a paragraph that merely contains the word.
   if (roleWordUsed || isInteractive(node)) score += 5;
   // Long names match by accident more often than short ones.
   score -= Math.min(6, Math.floor(name.text.length / 120));
-  return Math.max(score, 1);
+
+  const complete = tokens.length > 0 && matchedTokens === tokens.length;
+  let band;
+  if (name.text && name.text === phrase) band = BANDS.NAME_IS_QUERY;
+  else if (name.text && name.text.includes(phrase)) band = BANDS.NAME_HAS_QUERY;
+  else if (complete) band = BANDS.ALL_EXACT + worstTier;
+  else band = BANDS.SOME_TOKENS;
+
+  return { score: Math.max(score, 1), band };
 }
 
 export const MAX_RESULTS = 20;
 
 /**
- * Returns the best matches in score order, document order breaking ties.
- * `total` is the number of scoring nodes, so the caller can say "narrow the query".
+ * Returns the best matches in band order, score inside a band, document order breaking
+ * ties. `total` is the number of scoring nodes, so the caller can say "narrow the query".
  */
 export function findElements(axNodes, query, options = {}) {
   const { limit = MAX_RESULTS, refTable = new RefTable() } = options;
@@ -389,10 +438,11 @@ export function findElements(axNodes, query, options = {}) {
 
   const scored = [];
   axNodes.forEach((node, index) => {
-    const score = scoreNode(node, query, tokens);
+    const { score, band } = rate(node, query, tokens);
     if (score <= 0) return;
     scored.push({
       score,
+      band,
       index,
       ref: refTable.refFor(node.backendDOMNodeId, sessionOf(node)),
       role: roleOf(node) || "node",
@@ -402,7 +452,8 @@ export function findElements(axNodes, query, options = {}) {
     });
   });
 
-  scored.sort((a, b) => b.score - a.score || a.index - b.index);
+  // Band first: an exact match is never beaten by a pile of weaker ones, however many.
+  scored.sort((a, b) => a.band - b.band || b.score - a.score || a.index - b.index);
   return { matches: scored.slice(0, limit), total: scored.length, refTable };
 }
 

@@ -3,11 +3,13 @@ import test from "node:test";
 
 import { RefTable } from "../extension/lib/ax.js";
 import {
+  BANDS,
   MAX_RESULTS,
   editDistance,
   findElements,
   fuzzyBudget,
   normalizeText,
+  rateNode,
   renderMatches,
   scoreNode,
   stem,
@@ -82,6 +84,54 @@ test("edit distance counts a transposition as one edit and bails out over the bu
   assert.equal(editDistance("cart", "cart"), 0);
   assert.equal(editDistance("cart", "elephant", 2), 3, "over the budget, reported as budget + 1");
   assert.deepEqual([fuzzyBudget("cart"), fuzzyBudget("carts"), fuzzyBudget("password")], [0, 1, 2]);
+});
+
+test("a repeated query token cannot inflate a score", () => {
+  assert.deepEqual(tokenize("picker picker picker"), ["picker"]);
+  assert.deepEqual(tokenize("delete the delete button"), ["delete", "button"]);
+  const combobox = pageOf([["combobox", "Dropdown"]]);
+  const once = scoreNode(combobox[1], "picker");
+  const eight = scoreNode(combobox[1], "picker picker picker picker picker picker picker picker");
+  assert.equal(eight, once, "eight pickers score exactly like one");
+});
+
+test("no pile of weak matches outranks an exact one", () => {
+  // Both probes from the adversarial review. The additive score alone put the searchbox
+  // first (196 to 181) and the combobox first (254 to 237).
+  const phrase = pageOf([
+    ["StaticText", "search input field box"],
+    ["searchbox", "find input field box"],
+  ]);
+  assert.deepEqual(ranked(phrase, "search input field box"), [
+    "search input field box",
+    "find input field box",
+  ]);
+
+  const repeated = pageOf([
+    ["StaticText", "picker"],
+    ["combobox", "Dropdown"],
+  ]);
+  assert.deepEqual(
+    ranked(repeated, "picker picker picker picker picker picker picker picker"),
+    ["picker", "Dropdown"],
+  );
+});
+
+test("the band says how far the query had to bend, and the score only breaks ties", () => {
+  const nodes = pageOf([
+    ["StaticText", "delete item"],
+    ["button", "Remove item"],
+  ]);
+  // "delete" is exact on the first and a synonym on the second, so the band separates
+  // them whatever the interactive bonus does to the score.
+  const [exact, synonym] = [nodes[1], nodes[2]];
+  assert.equal(rateNode(exact, "delete item").band, BANDS.NAME_IS_QUERY);
+  assert.equal(rateNode(synonym, "delete item").band, BANDS.ALL_SYNONYM);
+  assert.ok(rateNode(synonym, "delete item").score > 0);
+  assert.deepEqual(ranked(nodes, "delete item"), ["delete item", "Remove item"]);
+  // A node that matches only some of the query sits behind every complete match.
+  assert.equal(rateNode(exact, "delete item from the basket").band, BANDS.SOME_TOKENS);
+  assert.equal(rateNode(exact, "nothing here at all").band, BANDS.NONE);
 });
 
 test("exact beats stemmed beats synonym beats fuzzy", () => {
