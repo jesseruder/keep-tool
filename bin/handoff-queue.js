@@ -105,7 +105,21 @@ function normalize(input) {
   if (rateLimitAt !== null && typeof rateLimitAt !== 'string' && typeof rateLimitAt !== 'number') {
     throw badRequest('Queued transfer rateLimitAt must be a string or a number');
   }
-  return { sessionId, pane, sourceAccountId, targetAccountId, force: input?.force === true, rateLimitAt };
+  // When the transfer this entry stands in for was asked for, which is not when the
+  // entry was written: a refusal's own preflight can take the better part of a minute,
+  // and work the person did during it happened after the request, not before it. An
+  // entry with no boundary falls back to its enqueue time.
+  const activityBoundary = input?.activityBoundary == null ? null : input.activityBoundary;
+  if (activityBoundary !== null && !Number.isFinite(activityBoundary)) {
+    throw badRequest('Queued transfer activityBoundary must be a finite number');
+  }
+  return { sessionId, pane, sourceAccountId, targetAccountId, force: input?.force === true, rateLimitAt, activityBoundary };
+}
+
+// The moment after which work by the person retires this entry rather than being
+// transferred out from under them.
+function activityBoundaryOf(entry) {
+  return Number(entry?.activityBoundary ?? entry?.enqueuedAt ?? 0);
 }
 
 // Every write bumps it, and a settle only lands when the entry on disk still
@@ -324,7 +338,7 @@ async function attemptOne(root, entry, sessions, now, deps, log) {
   // typed into the session again, stopping it to inject a continuation is exactly what
   // the check above exists to prevent, so the entry retires the same way.
   if (entry.rateLimitAt == null && !started
-      && Number.isFinite(session.lastUserAt) && session.lastUserAt > Number(entry.enqueuedAt || 0)) {
+      && Number.isFinite(session.lastUserAt) && session.lastUserAt > activityBoundaryOf(entry)) {
     const note = 'session was used since it was queued';
     return settle(root, entry, { status: 'cancelled', cancelledAt: now, note }, now, log,
       `cancelled ${entry.sessionId}: ${note}`);
@@ -347,6 +361,11 @@ async function attemptOne(root, entry, sessions, now, deps, log) {
       // left to carry one.
       ...(entry.sourceAccountId ? { expectedSourceAccountId: entry.sourceAccountId } : {}),
       ...(entry.rateLimitAt != null && !started ? { expectedRateLimitAt: entry.rateLimitAt } : {}),
+      // An entry with no limit to name carries its boundary instead. The check above
+      // is one snapshot old the moment it passes, and the transfer's own auth
+      // preflight can take 45 seconds more, so the transfer re-reads this the same way
+      // it re-reads the limit — including once inside the injection lock.
+      ...(entry.rateLimitAt == null && !started ? { expectedNoUserActivityAfter: activityBoundaryOf(entry) } : {}),
     });
     if (result && result.status && result.status !== 'done') reason = String(result.reason || `transfer reported ${result.status}`);
     else {

@@ -517,22 +517,33 @@ test('explicit portable fallback abandons only a verified pre-stop transaction w
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
-test('portable fallback is unavailable when the source agent was not proven to belong to its pane', async () => {
+test('a source agent the preflight could not name refuses the transfer before anything is journalled', async () => {
   const f = fixture();
   try {
-    const d = deps(f, { restartSession: async () => { throw new Error('Waiting for job ledger recovery'); } });
+    const d = deps(f, { restartSession: async () => assert.fail('must not stop an unnamed source') });
     const inspect = d.inspect;
-    d.inspect = async (...args) => {
-      const inspected = await inspect(...args);
-      inspected.agentIdentity.ownsPane = false;
-      return inspected;
-    };
-    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d), /job ledger recovery/);
-    const pending = handoff.list(f.root)[0];
-    assert.equal(pending.portableFallbackAvailable, undefined);
+    // Every shape that leaves the source unnamed. Each one is something the stop path,
+    // the portable fallback and the queue's own recovery guard are all written against.
+    for (const identity of [
+      null,
+      { pid: 11, pidStart: 'source-start', primary: true, ownsPane: false },
+      { pid: 11, pidStart: 'source-start', primary: false, ownsPane: true },
+      { pid: 0, pidStart: 'source-start', primary: true, ownsPane: true },
+      { pid: 11, pidStart: '', primary: true, ownsPane: true },
+    ]) {
+      d.inspect = async (body) => ({ ...(await inspect(body)), agentIdentity: identity });
+      await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d),
+        (error) => error.status === 409
+          && error.message === 'Source agent process identity could not be verified',
+        JSON.stringify(identity));
+      // Nothing was written, so there is no transaction to recover and none to abandon.
+      assert.deepEqual(handoff.list(f.root), []);
+    }
+    // The next attempt inspects from scratch, so the queue may simply ask again.
+    assert.equal(handoff.classifyRefusal('Source agent process identity could not be verified'), 'transient');
     d.inspect = inspect;
-    await assert.rejects(handoff.abandonForPortable({ sessionId: f.sid, pane: 'pane-1', transactionId: pending.id }, d),
-      /cannot be safely replaced/, 'a later pane-owned process does not upgrade the unproven source snapshot');
+    await assert.rejects(handoff.abandonForPortable({ sessionId: f.sid, pane: 'pane-1', transactionId: 'no-such-transaction' }, d),
+      /cannot be safely replaced/, 'a later pane-owned process does not conjure a transaction to abandon');
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
@@ -850,22 +861,72 @@ test('the restart is told which agent process the preflight verified', async () 
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
-test('an agent identity the preflight could not verify is not named to the restart', async () => {
+test('a transfer that names when it was requested refuses a session used since, and hands the boundary on', async () => {
+  const T = 1_700_000_000_000;
+  const run = async (lastUserAt, options = {}) => {
+    const f = fixture();
+    try {
+      let given = null;
+      const d = deps(f, { ...options });
+      const inspect = d.inspect;
+      d.inspect = async (body) => {
+        const inspected = await inspect(body);
+        return { ...inspected, session: { ...inspected.session, ...(lastUserAt === undefined ? {} : { lastUserAt }) } };
+      };
+      const baseRestart = d.restartSession;
+      d.restartSession = async (body, opts) => { given = opts; return baseRestart(body, opts); };
+      const result = await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two',
+        expectedNoUserActivityAfter: T }, d).then((value) => ({ value }), (error) => ({ error }));
+      return { ...result, given, records: handoff.list(f.root) };
+    } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+  };
+
+  // A turn finished after the transfer was asked for: the person has the session back.
+  for (const lastUserAt of [T + 1, T + 60e3]) {
+    const used = await run(lastUserAt);
+    assert.equal(used.error?.status, 409);
+    assert.equal(used.error?.message, 'Session was used after the transfer was requested');
+    assert.deepEqual(used.records, [], 'nothing was journalled and nothing was stopped');
+  }
+  // Nothing clears this on its own, so the queue parks with it rather than retrying.
+  assert.equal(handoff.classifyRefusal('Session was used after the transfer was requested'), 'blocked');
+
+  // Equal is not after, and neither is earlier, or a session with no stamp at all.
+  for (const lastUserAt of [T, T - 1, undefined]) {
+    const fine = await run(lastUserAt);
+    assert.equal(fine.error, undefined, `lastUserAt ${lastUserAt} must not refuse`);
+    // The restart answers the same expectation once more, inside the injection lock.
+    assert.equal(fine.given.expectedNoUserActivityAfter, T);
+  }
+
+  // A transfer that names no boundary is untouched by any of it.
   const f = fixture();
   try {
-    let options = null;
-    // Nothing to name, nothing named: an unverified identity never reaches the stop.
-    const unverified = deps(f, {
-      inspect: async () => ({ session: { id: f.sid, kind: 'claude', project: f.project, endedTurn: true },
-        pane: { id: 'pane-1', pid: 10, createdAt: 'source-pane', alive: true, cwd: f.project, cols: 80, rows: 24,
-          agentAlive: true, meta: { sessionId: f.sid, accountId: 'one', agent: 'claude', model: 'claude-opus-4-1' } },
-        processArgs: 'claude --resume session-123', currentModel: 'claude-opus-4-1',
-        agentIdentity: { pid: 11, pidStart: 'source-start', primary: true, ownsPane: false } }),
-      restartSession: async (_body, given) => { options = given; throw new Error('stop here'); },
-    });
-    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, unverified), /stop here/);
-    assert.equal('expectedAgentIdentity' in options, false);
+    const d = deps(f);
+    const inspect = d.inspect;
+    d.inspect = async (body) => {
+      const inspected = await inspect(body);
+      return { ...inspected, session: { ...inspected.session, lastUserAt: Date.now() } };
+    };
+    let given = null;
+    const baseRestart = d.restartSession;
+    d.restartSession = async (body, opts) => { given = opts; return baseRestart(body, opts); };
+    await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d);
+    assert.equal('expectedNoUserActivityAfter' in given, false);
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+
+  // And a boundary that is not a finite number is refused before anything is inspected.
+  const bad = fixture();
+  try {
+    const d = deps(bad, { inspect: async () => assert.fail('must not inspect'),
+      restartSession: async () => assert.fail('must not stop source') });
+    for (const value of ['1700000000000', Infinity, NaN, null]) {
+      await assert.rejects(handoff.run({ sessionId: bad.sid, pane: 'pane-1', accountId: 'two',
+        expectedNoUserActivityAfter: value }, d),
+      (error) => error.status === 400 && /expectedNoUserActivityAfter must be a finite number/.test(error.message),
+      String(value));
+    }
+  } finally { fs.rmSync(bad.base, { recursive: true, force: true }); }
 });
 
 test('a non-boolean force is rejected before anything is inspected', async () => {

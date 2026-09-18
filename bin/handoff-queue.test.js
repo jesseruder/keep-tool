@@ -113,10 +113,12 @@ test('a transient refusal backs off, keeps its request identical, and parks when
   assert.equal(queue.backoffMs(4), 160e3);
   assert.equal(queue.backoffMs(9), queue.BACKOFF_MAX_MS, 'the backoff is capped at three minutes');
 
-  // Every attempt asked for exactly the same transfer, naming what it assumed.
+  // Every attempt asked for exactly the same transfer, naming what it assumed. This
+  // entry carries no limit, so what it names instead is the moment it was queued: work
+  // the person does after that must refuse the transfer, not ride along with it.
   for (const body of asked) {
     assert.deepEqual(body, { sessionId: 'session-a', pane: 'pane-1', accountId: 'two', intent: 'continue',
-      expectedSourceAccountId: 'one' });
+      expectedSourceAccountId: 'one', expectedNoUserActivityAfter: T });
   }
 
   // Past the deadline the same transient refusal parks the entry instead.
@@ -158,7 +160,7 @@ test('a successful transfer marks the entry moved, and force travels only when t
   const result = await queue.tick(tickDeps(f, async (body) => { asked.push(body); return { ok: true, status: 'done' }; }));
   assert.match(result.detail, /moved 1/);
   assert.deepEqual(asked, [{ sessionId: 'session-a', pane: 'pane-1', accountId: 'two', intent: 'continue', force: true,
-    expectedSourceAccountId: 'one' }]);
+    expectedSourceAccountId: 'one', expectedNoUserActivityAfter: T }]);
   const entry = entryFor(f.root, 'session-a');
   assert.deepEqual([entry.status, entry.movedAt], ['moved', T]);
   assert.deepEqual(queue.visible(f.root, T + 60e3).map((row) => row.sessionId), ['session-a']);
@@ -466,6 +468,36 @@ test('an entry that names no limit retires when the person goes back to work in 
   assert.deepEqual(asked, []);
   assert.equal(entryFor(f.root, 'session-a').status, 'cancelled');
   assert.equal(entryFor(f.root, 'session-a').note, 'session was used since it was queued');
+
+  // The boundary the entry carries wins over its enqueue time. A refusal's own preflight
+  // can take the better part of a minute, so work done at T + 1 — after the transfer was
+  // asked for at T, but before the entry reached disk at T + 30s — is still the person
+  // taking the session back, and the request says so too.
+  fs.rmSync(path.join(queue.dir(f.root), 'session-a.json'));
+  asked.length = 0;
+  queue.enqueue(f.root, { sessionId: 'session-a', pane: 'pane-1', sourceAccountId: 'one', targetAccountId: 'two',
+    activityBoundary: T }, { now: T + 30e3, log: () => {} });
+  assert.equal(entryFor(f.root, 'session-a').activityBoundary, T);
+  await run([{ ...manual, lastUserAt: T + 1 }], { now: () => T + 60e3 });
+  assert.deepEqual(asked, []);
+  assert.equal(entryFor(f.root, 'session-a').note, 'session was used since it was queued');
+
+  // And the boundary travels on the request, because the guard above is one snapshot
+  // old the moment it passes and the transfer itself takes minutes more.
+  const bodies = [];
+  fs.rmSync(path.join(queue.dir(f.root), 'session-a.json'));
+  queue.enqueue(f.root, { sessionId: 'session-a', pane: 'pane-1', sourceAccountId: 'one', targetAccountId: 'two',
+    activityBoundary: T }, { now: T + 30e3, log: () => {} });
+  await queue.tick(tickDeps(f, async (body) => { bodies.push(body); return { ok: true, status: 'done' }; },
+    { sessions: async () => [manual], now: () => T + 60e3 }));
+  assert.equal(bodies.length, 1);
+  assert.equal(bodies[0].expectedNoUserActivityAfter, T);
+  assert.equal(bodies[0].expectedRateLimitAt, undefined);
+
+  // A boundary that is not a finite number is not a boundary.
+  assert.throws(() => queue.enqueue(f.root, { sessionId: 'session-z', pane: 'pane-1', sourceAccountId: 'one',
+    targetAccountId: 'two', activityBoundary: '1700000000000' }, { now: T, log: () => {} }),
+  /activityBoundary must be a finite number/);
 
   // Nothing typed since it was queued, and a session with no such stamp at all: the
   // transfer is still the thing that was asked for.

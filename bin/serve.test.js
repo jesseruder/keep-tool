@@ -7801,13 +7801,30 @@ test('a console transfer refused before its stop joins the retry queue; the CLI 
     // account-handoff refuses by throwing, with the journalled record on `extra`.
     const refuse = (entry) => async () => { throw Object.assign(new Error(entry.reason), { status: 409, extra: entry }); };
     const body = { sessionId: 'sid', pane: 'p', accountId: 'claude-two', queueOnTransient: true };
-    const deps = (handoffSession, extra = {}) => ({ root, handoffSession,
-      handoffQueueSessions: async () => [{ id: 'sid', pane: 'p', rateLimit: { at: '2026-09-17T00:00:00.000Z' } }],
-      // The journalled record and a `ps` snapshot that still shows the source agent:
-      // the two things queueing is allowed to depend on beyond the refusal itself.
-      handoffRecord: () => record(),
-      agentProcessRows: async () => [{ pid: 11, ppid: 10, pidStart: 'start', agent: 'claude', interactive: true,
-        args: '/test/claude --resume sid' }],
+    // Every observation the queueing decision is allowed to make, in one place, so a
+    // test can say exactly what each one answered — and in what order it was asked.
+    const calls = [];
+    const liveState = { sessions: [{ id: 'sid', pane: 'p', rateLimit: { at: '2026-09-17T00:00:00.000Z' } }],
+      panes: [{ id: 'p', alive: true, agentAlive: true, meta: { sessionId: 'sid' } }] };
+    const deps = (handoffSession, extra = {}) => ({ root,
+      handoffSession: async (...args) => { calls.push('transfer'); return handoffSession(...args); },
+      handoffQueueState: async () => { calls.push('state'); return liveState; },
+      // The journalled record, which — unlike the `safe()` copy that rides back on the
+      // refusal — names the agent process the transaction was going to stop.
+      handoffRecord: (...args) => {
+        calls.push('record');
+        return extra.record ? extra.record(...args) : record({ sourceAgentPid: 11, sourceAgentPidStart: 'start' });
+      },
+      agentProcessRows: async () => {
+        calls.push('ps');
+        const rows = extra.rows || [{ pid: 11, ppid: 10, pidStart: 'start', agent: 'claude', interactive: true,
+          args: '/test/claude --resume sid' }];
+        return typeof rows === 'function' ? rows() : rows;
+      },
+      handoffQueue: new Proxy(queue, { get: (target, key) => {
+        if (key !== 'readOne' && key !== 'enqueue') return target[key];
+        return (...args) => { calls.push(key === 'readOne' ? 'cancel-check' : 'enqueue'); return target[key](...args); };
+      } }),
       ...extra });
     const only = () => queue.list(root);
 
@@ -7819,6 +7836,14 @@ test('a console transfer refused before its stop joins the retry queue; the CLI 
     assert.equal(only()[0].status, 'queued');
     assert.equal(only()[0].sourceAccountId, 'claude-main');
     assert.equal(only()[0].rateLimitAt, '2026-09-17T00:00:00.000Z');
+    // The entry names when the transfer was asked for, not when it reached disk: the
+    // refusal's own preflight sits between the two, and work done in it is the person
+    // taking the session back.
+    assert.ok(Number.isFinite(only()[0].activityBoundary));
+    assert.ok(only()[0].activityBoundary <= only()[0].enqueuedAt);
+    // Slowest answer first, so everything after it is fresher than it is; the liveness
+    // snapshot is taken last, immediately before the entry is written.
+    assert.deepEqual(calls, ['transfer', 'state', 'cancel-check', 'record', 'ps', 'enqueue']);
     fs.rmSync(queue.dir(root), { recursive: true, force: true });
 
     // Everything that must not be retried behind the person's back.
@@ -7854,11 +7879,11 @@ test('a console transfer refused before its stop joins the retry queue; the CLI 
     // exactly this. enqueue() would start the cancelled entry over, so the refusal is
     // answered raw instead.
     const cancelledFirst = deps(refuse(record()), {
-      handoffQueueSessions: async () => {
+      handoffQueueState: async () => {
         queue.enqueue(root, { sessionId: 'sid', pane: 'p', sourceAccountId: 'claude-main', targetAccountId: 'claude-two' },
           { log: () => {} });
         queue.cancel(root, 'sid', { log: () => {} });
-        return [{ id: 'sid', pane: 'p' }];
+        return liveState;
       },
     });
     await assert.rejects(handoffSessionRequest(body, cancelledFirst), /another session injection is busy/);
@@ -7872,13 +7897,21 @@ test('a console transfer refused before its stop joins the retry queue; the CLI 
     assert.equal(only()[0].status, 'queued');
     fs.rmSync(queue.dir(root), { recursive: true, force: true });
 
-    // Live state that could not be read at all: there is then no way to say which
-    // rate-limit event, if any, the entry would be for.
-    for (const [why, sessions] of [
+    // Live state that could not be read, or that says there is nothing here to move.
+    // Either way there is no saying which rate-limit event, if any, the entry is for —
+    // and a session whose pane no longer holds an agent needs recovery, not patience.
+    for (const [why, state] of [
       ['a state build that threw', async () => { throw new Error('host request timed out (list)'); }],
-      ['a session the state does not carry', async () => []],
+      ['a session the state does not carry', async () => ({ ...liveState, sessions: [] })],
+      ['a session with no pane', async () => ({ ...liveState, sessions: [{ id: 'sid', pane: null }] })],
+      ['a pane whose agent has exited', async () => ({ ...liveState,
+        panes: [{ id: 'p', alive: true, agentAlive: false, meta: { sessionId: 'sid' } }] })],
+      ['a pane that is gone', async () => ({ ...liveState,
+        panes: [{ id: 'p', alive: false, agentAlive: true, meta: { sessionId: 'sid' } }] })],
     ]) {
-      await assert.rejects(handoffSessionRequest(body, deps(refuse(record()), { handoffQueueSessions: sessions })), /./, why);
+      // Even with the source process plainly present in `ps`: the state is the thing
+      // that knows whether this pane still holds the conversation.
+      await assert.rejects(handoffSessionRequest(body, deps(refuse(record()), { handoffQueueState: state })), /./, why);
       assert.deepEqual(only(), [], `${why} must not be queued`);
     }
 
@@ -7886,10 +7919,7 @@ test('a console transfer refused before its stop joins the retry queue; the CLI 
     // the /exit can have landed and a later host call timed out. Queueing that one
     // promises a retry the recovery guard would park, so `ps` decides.
     const withPid = record({ sourceAgentPid: 11, sourceAgentPidStart: 'start' });
-    const rows = (value) => ({ handoffRecord: () => withPid, agentProcessRows: async () => {
-      if (typeof value === 'function') return value();
-      return value;
-    } });
+    const rows = (value) => ({ record: () => withPid, rows: value });
     await assert.rejects(handoffSessionRequest(body, deps(refuse(record()),
       rows([{ pid: 10, ppid: 1, pidStart: 'start', args: '/bin/zsh -l' }]))), /./);
     assert.deepEqual(only(), [], 'a source agent that has already exited is left for recovery');
@@ -7899,10 +7929,12 @@ test('a console transfer refused before its stop joins the retry queue; the CLI 
     assert.deepEqual(only(), [], 'no snapshot is no proof the source is alive');
 
     // Still there, even in a snapshot that could not read its arguments.
+    calls.length = 0;
     assert.equal((await handoffSessionRequest(body, deps(refuse(record()),
       rows([{ pid: 11, ppid: 10, pidStart: 'start', agent: null, interactive: false, args: '(claude)', argsUnavailable: true }]))))
       .status, 'queued');
     assert.equal(only().length, 1);
+    assert.deepEqual(calls, ['transfer', 'state', 'cancel-check', 'record', 'ps', 'enqueue']);
     fs.rmSync(queue.dir(root), { recursive: true, force: true });
 
     // And a transfer that worked is passed straight back.
@@ -9137,7 +9169,8 @@ test('a restart that names the limit it exists for refuses inside the lock when 
   const deps = (over = {}) => ({ withInjectionLock: (fn) => fn(), allowTerminalRateLimit: true,
     buildState: async () => ({ sessions: [over.session === undefined ? session : over.session], tasks: [] }),
     host: { request: async (type) => type === 'hello' ? { replaceExited: true } : { pane } },
-    ...(over.expectedRateLimitAt === undefined ? {} : { expectedRateLimitAt: over.expectedRateLimitAt }) });
+    ...(over.expectedRateLimitAt === undefined ? {} : { expectedRateLimitAt: over.expectedRateLimitAt }),
+    ...(over.expectedNoUserActivityAfter === undefined ? {} : { expectedNoUserActivityAfter: over.expectedNoUserActivityAfter }) });
   const restart = (over) => restartSession({ sessionId: 'limited', pane: 'p', pid: 10, mode: 'idle' }, deps(over));
 
   // Reaching the resume directory means the check let it through.
@@ -9149,6 +9182,23 @@ test('a restart that names the limit it exists for refuses inside the lock when 
     /no longer carries the account limit/);
   // A restart that names no limit is untouched by any of this.
   await assert.rejects(restart({}), /Session directory is unavailable/);
+
+  // A transfer with no limit to name names the moment it was requested instead, and
+  // this is its last look too: the person can finish a turn in that same 45 seconds.
+  const T = 1_700_000_000_000;
+  const used = { ...session, lastUserAt: T + 1 };
+  await assert.rejects(restart({ expectedNoUserActivityAfter: T, session: used }),
+    (error) => error.status === 409 && error.message === 'Session was used after the transfer was requested');
+  assert.equal(require('./account-handoff').classifyRefusal('Session was used after the transfer was requested'), 'blocked',
+    'a person using the session is not something a retry clears');
+  // Equal is not after; neither is earlier, nor a session carrying no such stamp.
+  for (const lastUserAt of [T, T - 1, undefined]) {
+    await assert.rejects(restart({ expectedNoUserActivityAfter: T,
+      session: { ...session, ...(lastUserAt === undefined ? {} : { lastUserAt }) } }),
+    /Session directory is unavailable/, `lastUserAt ${lastUserAt} must not refuse`);
+  }
+  // And a restart that names no boundary ignores the stamp entirely.
+  await assert.rejects(restart({ session: used }), /Session directory is unavailable/);
 });
 
 test('restarting the fleet reviewer keeps its identity, its launch env, and its tick address', async () => {

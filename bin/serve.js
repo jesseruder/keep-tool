@@ -4064,6 +4064,14 @@ async function restartSession(body, deps = {}) {
         && String(session?.rateLimit?.at ?? '') !== String(deps.expectedRateLimitAt)) {
       throw new InjectionError(409, 'Session no longer carries the account limit this transfer was requested for');
     }
+    // And the same last look for a transfer that names no limit: it named the moment it
+    // was asked for instead, and work the person did since then is them taking the
+    // session back. The wording matches account-handoff's own refusal so a queue reads
+    // it as blocked either way.
+    if (deps.expectedNoUserActivityAfter != null && Number.isFinite(Number(session?.lastUserAt))
+        && Number(session.lastUserAt) > Number(deps.expectedNoUserActivityAfter)) {
+      throw new InjectionError(409, 'Session was used after the transfer was requested');
+    }
     // A session the API cut off mid-turn never ends its turn on its own, so the
     // terminal-limit path supplies the ended turn. Its ledger may also carry a
     // settled `transcript-replaced` history-gap, which is not live work and must
@@ -5115,11 +5123,14 @@ function startAutoCompact() {
 // pane, so the host list has to be part of the state), the usage snapshot the
 // policy reads, and handoffSession itself. Nothing else is handed over: the
 // queue may only ask for the same transfer the console button asks for.
-async function handoffQueueSessions(deps = {}) {
+async function handoffQueueState(deps = {}) {
   const panes = await (deps.listHostPanes || listHostPanes)({}, true);
-  const state = await (deps.addHostSessionState || addHostSessionState)(
+  return (deps.addHostSessionState || addHostSessionState)(
     await (deps.buildState || buildState)({ hostPanes: panes }), { panes });
-  return state.sessions || [];
+}
+
+async function handoffQueueSessions(deps = {}) {
+  return (await (deps.handoffQueueState || handoffQueueState)(deps)).sessions || [];
 }
 
 function handoffQueueTick(deps = {}) {
@@ -8096,12 +8107,19 @@ async function handoffSession(body, deps = {}) {
 // "could not look". Only the first two are worth queueing on — an entry built on a
 // guess would either never cancel for a limit that cleared or cancel for one that was
 // never there. Worth a state build only because nothing reaches here but a refusal.
+//
+// A session whose pane no longer holds a live agent is unobservable in the same sense:
+// whatever the limit says, there is nothing left here to transfer, and the recovery
+// controls are what that session needs.
 async function handoffRateLimitAt(sessionId, deps = {}) {
-  let sessions;
-  try { sessions = await (deps.handoffQueueSessions || handoffQueueSessions)(deps); }
+  let state;
+  try { state = await (deps.handoffQueueState || handoffQueueState)(deps); }
   catch { return undefined; }
-  const session = (sessions || []).find((entry) => entry.id === sessionId);
-  return session ? session.rateLimit?.at ?? null : undefined;
+  const session = (state?.sessions || []).find((entry) => entry.id === sessionId);
+  if (!session) return undefined;
+  const pane = (state?.panes || []).find((entry) => entry.id === session.pane);
+  if (!pane || pane.alive === false || pane.agentAlive === false) return undefined;
+  return session.rateLimit?.at ?? null;
 }
 
 // Whether the agent this transaction was going to stop is still running. A refusal
@@ -8141,6 +8159,20 @@ async function queueRefusedHandoff(body, record, requestedAt, deps = {}) {
     process.stderr.write(`keep serve: not queuing ${sessionId}: ${why}\n`);
     return null;
   };
+  // Order matters, and it is the order of how long each answer stays true. The state
+  // build is the slow one, so it goes first and everything after it is fresher than it
+  // is. Cancel lands through its own route while that build runs, and a `ps` taken
+  // before it would be describing a process by the time the entry is written, so the
+  // liveness snapshot is taken last, immediately before the enqueue.
+  const rateLimitAt = await handoffRateLimitAt(sessionId, deps);
+  if (rateLimitAt === undefined) return skip('its live state could not be read, so the limit it carries is unknown');
+  // An entry cancelled since this transfer was asked for is a person saying no to
+  // exactly this; enqueue() would start a cancelled entry over.
+  const current = queue.readOne(root, sessionId);
+  if (current && current.status === 'cancelled'
+      && Number(current.cancelledAt || current.updatedAt || 0) >= Number(requestedAt || 0)) {
+    return skip('its transfer was cancelled while this one ran');
+  }
   const journalled = (deps.handoffRecord || require('./account-handoff').readOne)(root, sessionId) || record;
   try {
     if (!await handoffSourceStillRunning(journalled, deps)) {
@@ -8151,20 +8183,13 @@ async function queueRefusedHandoff(body, record, requestedAt, deps = {}) {
     // reason enough not to promise a retry.
     return skip(`could not check whether its source agent is still running: ${error.message}`);
   }
-  const rateLimitAt = await handoffRateLimitAt(sessionId, deps);
-  if (rateLimitAt === undefined) return skip('its live state could not be read, so the limit it carries is unknown');
-  // The state build above is an await, and Cancel lands through its own route. An
-  // entry cancelled since this transfer was asked for is a person saying no to exactly
-  // this; enqueue() would start a cancelled entry over.
-  const current = queue.readOne(root, sessionId);
-  if (current && current.status === 'cancelled'
-      && Number(current.cancelledAt || current.updatedAt || 0) >= Number(requestedAt || 0)) {
-    return skip('its transfer was cancelled while this one ran');
-  }
   let entry;
   try {
     ({ entry } = queue.enqueue(root, { sessionId, pane, sourceAccountId: record.sourceAccountId,
-      targetAccountId: body.accountId, force: body.force === true, rateLimitAt }));
+      targetAccountId: body.accountId, force: body.force === true, rateLimitAt,
+      // Not the enqueue time: the person may have gone back to work while this refusal's
+      // own preflight ran, and that work happened after the transfer was asked for.
+      activityBoundary: Number.isFinite(requestedAt) ? requestedAt : null }));
   } catch (error) {
     // A queue that will not take this is no reason to lose the refusal itself.
     process.stderr.write(`keep serve: could not queue ${sessionId} after a transient refusal: ${error.message}\n`);

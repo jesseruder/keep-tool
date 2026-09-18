@@ -57,6 +57,9 @@ const TRANSIENT_REFUSALS = [
   // still could not see the agent it is holding. Spelled out although /could not be
   // verified/ above already covers it: this one is a refusal in its own right.
   /^Agent process identity could not be verified from ps$/,
+  // The preflight's own `ps` could not name the source agent. Spelled out for the same
+  // reason as the line above; the next attempt inspects the session from scratch.
+  /^Source agent process identity could not be verified$/,
   /^Original agent process identity is unverified$/,
   /^Session helper processes changed during restart$/,
   // The restart's own `/exit` typed, but the screen did not render it inside the
@@ -73,6 +76,10 @@ const BLOCKED_REFUSALS = [
   // The target is parked on the folder-trust dialog. It says "retry delivery" because a
   // person can answer it, but nothing a queue does clears it.
   /is awaiting workspace trust in pane /,
+  // The person took the session back. Nothing clears this on its own, and trying again
+  // later would only move a session somebody is working in: the entry parks with this
+  // reason so they can see it and decide.
+  /^Session was used after the transfer was requested$/,
 ];
 function classifyRefusal(reason) {
   const text = String(reason == null ? '' : reason).trim();
@@ -507,16 +514,30 @@ function permissionClass(args, options = {}) {
 }
 
 const LIMIT_GONE = 'Session no longer carries the account limit this transfer was requested for';
+const USED_SINCE_REQUEST = 'Session was used after the transfer was requested';
 
-// The caller named the limit its transfer exists for. This compares that against a
-// fresh observation, and is deliberately cheap to call more than once: it is the
-// only thing standing between a long preflight and a stopped idle session.
-async function requireExpectedRateLimit(body, deps) {
-  if (body?.expectedRateLimitAt == null) return;
+// A queued transfer that names no limit names the moment it was asked for instead.
+// Work the person did after that is them taking the session back, and stopping it to
+// type a continuation into it is exactly what this prevents.
+function requireNoLaterActivity(body, session) {
+  if (body?.expectedNoUserActivityAfter == null) return;
+  const lastUserAt = Number(session?.lastUserAt);
+  if (Number.isFinite(lastUserAt) && lastUserAt > Number(body.expectedNoUserActivityAfter)) {
+    const error = new Error(USED_SINCE_REQUEST); error.status = 409; throw error;
+  }
+}
+
+// What the caller believed about the session when it decided to ask, compared against
+// a fresh observation. Deliberately cheap to call more than once: it is the only thing
+// standing between a long preflight and a session stopped out from under somebody.
+async function requireExpectedSessionState(body, deps) {
+  if (body?.expectedRateLimitAt == null && body?.expectedNoUserActivityAfter == null) return;
   const latest = await deps.inspect(body);
-  if (!latest?.session || String(latest.session.rateLimit?.at ?? '') !== String(body.expectedRateLimitAt)) {
+  if (body.expectedRateLimitAt != null
+      && (!latest?.session || String(latest.session.rateLimit?.at ?? '') !== String(body.expectedRateLimitAt))) {
     const error = new Error(LIMIT_GONE); error.status = 409; throw error;
   }
+  requireNoLaterActivity(body, latest?.session);
 }
 
 async function run(body, deps = {}) {
@@ -539,6 +560,10 @@ async function run(body, deps = {}) {
   if (body.expectedRateLimitAt !== undefined
       && !['string', 'number'].includes(typeof body.expectedRateLimitAt)) {
     const error = new Error('Account handoff expectedRateLimitAt must be a string or a number'); error.status = 400; throw error;
+  }
+  if (body.expectedNoUserActivityAfter !== undefined
+      && !(typeof body.expectedNoUserActivityAfter === 'number' && Number.isFinite(body.expectedNoUserActivityAfter))) {
+    const error = new Error('Account handoff expectedNoUserActivityAfter must be a finite number'); error.status = 400; throw error;
   }
   // Force only tells the stop path to ignore uncertain background-job evidence;
   // a session that is genuinely mid-turn is still refused downstream.
@@ -596,6 +621,7 @@ async function run(body, deps = {}) {
         && String(inspected?.session?.rateLimit?.at ?? '') !== String(body.expectedRateLimitAt)) {
       const error = new Error(LIMIT_GONE); error.status = 409; throw error;
     }
+    requireNoLaterActivity(body, inspected?.session);
     if (current && force) current.force = true;
     if (current && current.status !== 'recovery-needed') {
       Object.assign(current, { status: 'recovery-needed', reason: `Handoff interrupted during ${current.phase || 'an unknown phase'}` });
@@ -751,14 +777,22 @@ async function run(body, deps = {}) {
     let trustCarried = null;
     try { trustCarried = carryProjectTrust(source, target, resumeCwd, deps); }
     catch (error) { error.status ||= 409; throw error; }
-    // The limit was last observed before authPreflight, which starts an
-    // interactive login shell and can take 45 seconds. A person can finish a turn
-    // in that time, and stopping an idle session to type a continuation into it is
-    // exactly what this expectation exists to prevent. Look again, after the long
-    // wait and still before anything is written or stopped. restartSession takes
-    // the same expectation below and answers it once more inside the injection
-    // lock, on the session it reads there.
-    await requireExpectedRateLimit(body, deps);
+    // The limit, and the moment the transfer was asked for, were last observed before
+    // authPreflight, which starts an interactive login shell and can take 45 seconds.
+    // A person can finish a turn in that time, and stopping an idle session to type a
+    // continuation into it is exactly what these expectations exist to prevent. Look
+    // again, after the long wait and still before anything is written or stopped.
+    // restartSession takes both expectations below and answers them once more inside
+    // the injection lock, on the session it reads there.
+    await requireExpectedSessionState(body, deps);
+    // Which process the stop is about to end. Everything downstream — the restart's own
+    // identity check, the portable fallback, the recovery guard that asks whether the
+    // source is still running — is written against this, and a transfer that cannot say
+    // it refuses here, with the session untouched, rather than stopping whatever it
+    // finds. Both intents stop the source, so neither is exempt.
+    if (!sourceIdentity) {
+      const error = new Error('Source agent process identity could not be verified'); error.status = 409; throw error;
+    }
     current ||= { id: crypto.randomUUID(), transactionId: null, sessionId: session.id, pane: pane.id,
       agent, sourceAccountId: source.id, targetAccountId: target.id };
     current.transactionId ||= current.id;
@@ -809,8 +843,10 @@ async function run(body, deps = {}) {
         // re-reads it again when a snapshot comes back unusable, and a patient read is
         // exactly where a replacement process could be adopted as the original. Naming
         // the process here means the restart can only ever stop the one inspected.
-        ...(sourceIdentity ? { expectedAgentIdentity: { pid: sourceIdentity.pid, pidStart: sourceIdentity.pidStart } } : {}),
+        expectedAgentIdentity: { pid: sourceIdentity.pid, pidStart: sourceIdentity.pidStart },
         ...(body.expectedRateLimitAt != null ? { expectedRateLimitAt: body.expectedRateLimitAt } : {}),
+        ...(body.expectedNoUserActivityAfter != null
+          ? { expectedNoUserActivityAfter: body.expectedNoUserActivityAfter } : {}),
       });
       Object.assign(current, { status: 'verifying', phase: 'verifying-target', pid: result.pid }); writeOne(root, current);
       const record = await deps.waitForAccountRecord(session.id, pane.id, target.id, current.targetLaunchStartedAt);
