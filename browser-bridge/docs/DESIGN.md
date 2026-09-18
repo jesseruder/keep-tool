@@ -210,10 +210,11 @@ Result shapes:
   text inputs, checkboxes, radios, comboboxes, options, menu items, tabs, switches,
   sliders, spin buttons, and anything focusable. `depth` and `ref_id` narrow the tree;
   `max_chars` truncates at a line boundary with a note giving the full size.
-  Out-of-process iframes are included: their trees come from their own auto-attached
-  sessions and are spliced under the iframe element that hosts them (see "Cross-origin
-  iframes" below), with a trailing note saying how many were folded in, and another for
-  any that could not be read or placed.
+  Iframes are included: a cross-origin frame's tree comes from its own auto-attached
+  session, a same-origin frame's from a second `getFullAXTree` for its frame id, and both
+  are spliced under the iframe element that hosts them (see "Cross-origin iframes" below),
+  with a trailing note saying how many of each were folded in, and another for any that
+  could not be read or placed.
 - `find`: heuristic over the same tree. Tokenize the query, score each node on name,
   role, value and description matches (exact phrase > all tokens > some tokens; role
   words in the query such as "button", "link", "input", "search" match the role), return
@@ -371,9 +372,11 @@ after a text block, so both Claude Code and Codex render them.
 
 ## Cross-origin iframes
 
-An out-of-process iframe is a separate renderer, so the tab's own CDP session cannot see
-into it: `Accessibility.getFullAXTree` stops at the frame boundary (same-process frames
-come along, which is why a payment form on the same origin always worked).
+`Accessibility.getFullAXTree` answers for exactly one document, so every iframe needs a
+call of its own — a cross-origin one because it is a separate renderer the tab's session
+cannot see into, a same-origin one because it is still a separate document (verified on
+Edge 153: a same-origin iframe rendered as an `Iframe` node with no children until it was
+fetched by frame id).
 
 - `lib/cdp.js` sends `Target.setAutoAttach {autoAttach:true, waitForDebuggerOnStart:false,
   flatten:true}` right after attaching a tab. Every OOPIF, existing and future, then
@@ -384,22 +387,37 @@ come along, which is why a payment form on the same origin always worked).
   session's, as they always were.
 - Only `type: "iframe"` targets are kept (workers auto-attach too and have no tree). For
   an iframe target the `targetId` *is* the frame id, which is the hook for splicing.
-- `tools/axtree.js` reads the main tree plus one tree per attached frame session, asks
-  `DOM.describeNode` for the frame id behind each iframe AX node (cached per document,
-  cleared on main-frame navigation), and hands `lib/frames.js` the pieces. That module is
-  pure: it namespaces each child tree's node ids (`sessionId::nodeId` — every tree numbers
-  from 1), stamps each node with its session, and hangs the child roots off the hosting
-  iframe node, in passes so an iframe inside an iframe lands under its own parent. A frame
-  whose host element cannot be found is reported rather than dropped.
+- Same-process frames are found through `Page.getFrameTree` — on the main session and on
+  each OOPIF session, so a same-origin frame nested inside a cross-origin one is found
+  too. Every frame in those trees that is not an attached OOPIF target is fetched with
+  `Accessibility.getFullAXTree {frameId}` on that same session. The main session's frame
+  tree also names frames that live in another process; asking for one there fails and is
+  skipped rather than reported, because its own session already answered for it.
+- `tools/axtree.js` collects all of that and asks `DOM.describeNode` for the frame id
+  behind each iframe AX node (cached per document, cleared on main-frame navigation), then
+  hands `lib/frames.js` the pieces. That module is pure: it namespaces each child tree's
+  node ids by frame (`frameId::nodeId` — every tree numbers from 1, including two
+  documents in the same session), stamps each node with the session that answers for it,
+  and hangs the child roots off the hosting iframe node, in passes so an iframe inside an
+  iframe lands under its own parent. A frame whose host element cannot be found is
+  reported rather than dropped, and `read_page` says how many cross-origin and how many
+  same-origin frames were folded in.
 - Refs therefore map to `{sessionId, backendNodeId}`: a backend node id is only unique
-  within one session. `computer` ref clicks, hover, `scroll_to`, `form_input`,
+  within one renderer. `computer` ref clicks, hover, `scroll_to`, `form_input`,
   `file_upload` and `upload_image` all send their DOM commands to the ref's session, while
-  mouse and key input keep going through the main session. `DOM.getContentQuads` from a
-  child session reports the main frame's viewport coordinates, so no translation is
-  needed; that assumption lives alone in `frameQuadToMainViewport` in `tools/shared.js`
-  with a comment, so a live check that disagrees has one place to fix. The
-  `getBoundingClientRect` fallback is refused for a framed ref, because that *is* frame
-  relative.
+  mouse and key input keep going through the main session.
+- Geometry needs translating, which is the one thing the first cut got wrong.
+  `DOM.getContentQuads` from a child session reports the node's position in *that frame's*
+  viewport (measured on Edge 153: a button really at (452, 372) came back as (430, 90)
+  from a frame whose content box starts at (22, 282)). `frameQuadToMainViewport` in
+  `tools/shared.js` adds the host iframe element's content-box origin — `DOM.getBoxModel`
+  on the host node in its *parent* session, `content` rather than the border box, so the
+  iframe's own border and padding are excluded — and repeats outwards for a frame nested
+  inside another OOPIF. A same-process frame shares its parent's session and needs no
+  translation, so the loop does not run for it. `DOM.scrollIntoViewIfNeeded` in the child
+  session scrolls the frame's own content correctly and is left alone. The
+  `getBoundingClientRect` fallback is refused for a framed ref, because it is frame
+  relative with no way to correct it.
 - Refs still reset on main-frame navigation. `Target.detachedFromTarget` marks that
   session's refs detached, so using one says the iframe went away and to read the page
   again, rather than "unknown ref".
@@ -470,11 +488,13 @@ needs no private key. The id is a constant in `host/protocol.js` and the install
   `browser_status`; every input schema is valid JSON schema with the same properties.
 - `test/keys.test.js`, `test/ax.test.js`, `test/find.test.js`: the pure modules, with a
   fixture AX tree captured from a real page (a small hand-written one is fine).
-- `test/frames.test.js`: the splice as a pure function (namespacing, nesting, an
-  unplaceable frame), then read_page, find and the ref-based tools against a stubbed CDP
-  that answers a different tree per session: a page with no OOPIF must take exactly the
-  path it always took, a framed ref must send its DOM commands to the frame and its mouse
-  events to the page, and a detached frame must invalidate its refs with a clear error.
+- `test/frames.test.js`: the splice as a pure function (namespacing, nesting, a
+  same-process child, an unplaceable frame), then read_page, find and the ref-based tools
+  against a stubbed CDP that answers a different tree per session and per frame id: a page
+  with no child frames must take exactly the path it always took, a framed ref must send
+  its DOM commands to the frame and its mouse events to the page at the *translated*
+  point (the arithmetic is checked against the live Edge measurements, one level and two),
+  and a detached frame must invalidate its refs with a clear error.
 - `test/gif.test.js`: labels, delays, caps and the quality mapping directly; the store
   against an in-memory backend (`setGifBackend`); the tool and the recorder against a
   stubbed `chrome`; and the encoder against a stubbed `OffscreenCanvas`, which records

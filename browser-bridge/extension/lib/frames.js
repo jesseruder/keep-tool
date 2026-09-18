@@ -1,29 +1,35 @@
-// Stitching the accessibility trees of out-of-process iframes into the page's own tree.
+// Stitching the accessibility trees of child frames into the page's own tree.
 //
-// Each child target answers Accessibility.getFullAXTree with a tree of its own, numbered
-// from 1 like every other tree, so the ids have to be namespaced before they can live in
-// one list. The child tree's roots are then hung off the iframe element that hosts them,
-// which is found by asking DOM.describeNode for the frame id of each iframe node (the
-// caller does that part; this file is pure).
+// Accessibility.getFullAXTree only ever answers for one document: an out-of-process
+// iframe has to be asked through its own session, and a same-process one has to be asked
+// for by frame id. Either way the tree comes back numbered from 1, so the ids have to be
+// namespaced by frame before the trees can live in one list. The child tree's roots are
+// then hung off the iframe element that hosts them, which is found by asking
+// DOM.describeNode for the frame id of each iframe node (the caller does that part; this
+// file is pure).
+//
+// `sessionId` is not the namespace: a same-process frame shares its parent's session, and
+// its nodes must keep that session so their refs resolve there.
 //
 // Pure: no chrome APIs, so the tests can splice captured trees.
 
-/** `sessionId::nodeId`, so two trees can share one flat list. */
-function namespacedId(sessionId, nodeId) {
-  return `${sessionId}::${nodeId}`;
+/** `frameId::nodeId`, so two trees can share one flat list. */
+function namespacedId(frameId, nodeId) {
+  return `${frameId}::${nodeId}`;
 }
 
 /**
- * Copy a child tree with its ids namespaced and every node stamped with the session it
- * came from, which is what lets a ref remember where to send the next command.
+ * Copy a child tree with its ids namespaced by frame and every node stamped with the
+ * session that answers for it, which is what lets a ref remember where to send the next
+ * command.
  */
-export function namespaceNodes(nodes, sessionId) {
+export function namespaceNodes(nodes, frameId, sessionId = null) {
   return nodes.map((node) => ({
     ...node,
-    nodeId: namespacedId(sessionId, node.nodeId),
-    parentId: node.parentId != null ? namespacedId(sessionId, node.parentId) : node.parentId,
-    childIds: (node.childIds ?? []).map((childId) => namespacedId(sessionId, childId)),
-    frameSessionId: sessionId,
+    nodeId: namespacedId(frameId, node.nodeId),
+    parentId: node.parentId != null ? namespacedId(frameId, node.parentId) : node.parentId,
+    childIds: (node.childIds ?? []).map((childId) => namespacedId(frameId, childId)),
+    frameSessionId: sessionId ?? null,
   }));
 }
 
@@ -73,7 +79,7 @@ export function spliceFrameTrees(mainNodes, children = [], owners = new Map()) {
         stillPending.push(child);
         continue;
       }
-      const spliced = namespaceNodes(child.nodes, child.sessionId);
+      const spliced = namespaceNodes(child.nodes, child.frameId, child.sessionId);
       const roots = rootsOf(spliced);
       // The frame's own root web area becomes a child of the iframe element, which is
       // exactly how a same-process iframe already reads.

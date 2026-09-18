@@ -2,7 +2,7 @@
 // and the one screenshot primitive (computer's `screenshot`, `zoom` and `wait` and
 // gif_creator's frame capture all go through it).
 
-import { refTable, send } from "../lib/cdp.js";
+import { frameOwnerFor, refTable, send } from "../lib/cdp.js";
 import { VIEWPORT_EXPRESSION, dropImageAtPoint, elementRect, source } from "../lib/page.js";
 
 export function unknownRef(ref) {
@@ -180,17 +180,53 @@ export async function activateTab(tabId) {
 }
 
 /**
- * The one place that assumes an out-of-process iframe's geometry needs no translation.
- *
- * Chromium reports DOM.getContentQuads from a child frame's session in the *main* frame's
- * viewport coordinates (the compositor has already placed the frame), and mouse input is
- * dispatched through the main session, so the point needs no adjustment. If a live check
- * ever shows a click landing at the iframe's own origin instead, this is the single
- * function to fix: add the frame element's viewport offset here.
+ * The content box of an iframe element, in the coordinates of the session that holds it.
+ * getBoxModel rather than getContentQuads: the content box excludes the iframe's own
+ * border and padding, which is exactly where the child document's origin sits (the test
+ * page's 2 px border would otherwise offset every click inside it).
  */
-function frameQuadToMainViewport(point, frameSessionId) {
-  void frameSessionId;
-  return point;
+async function contentBoxOrigin(tabId, sessionId, backendNodeId) {
+  const response = await send(tabId, "DOM.getBoxModel", { backendNodeId }, sessionId);
+  const content = response?.model?.content;
+  if (!Array.isArray(content) || content.length < 2) {
+    throw new Error("the browser gave no box model for the iframe element");
+  }
+  return { x: content[0], y: content[1] };
+}
+
+/**
+ * The one place that knows how an out-of-process iframe's geometry relates to the page's.
+ *
+ * Measured on Edge 153: DOM.getContentQuads from a child session reports the node's
+ * position in *that frame's own viewport*, not the page's (a button really at (452, 372)
+ * came back as (431, 95) from a frame whose content box starts at (22, 282)). Mouse input
+ * is dispatched through the main session, so the frame's content-box origin has to be
+ * added back, and once more for every OOPIF the frame is itself nested inside.
+ *
+ * A same-process child frame is part of its parent's session, so its quads are already in
+ * that session's coordinates and the loop simply does not run for it.
+ */
+async function frameQuadToMainViewport(point, tabId, frameSessionId) {
+  let x = point.x;
+  let y = point.y;
+  let sessionId = frameSessionId;
+  const seen = new Set();
+  while (sessionId) {
+    if (seen.has(sessionId)) break; // a cycle is impossible, but never loop forever
+    seen.add(sessionId);
+    const owner = frameOwnerFor(tabId, sessionId);
+    if (!owner) {
+      throw new Error(
+        "This element is inside a cross-origin iframe whose position on the page is not known. Call read_page or find on this tab first.",
+      );
+    }
+    const origin = await contentBoxOrigin(tabId, owner.sessionId, owner.backendNodeId);
+    x += origin.x;
+    y += origin.y;
+    // The host element's own coordinates are in its session, so keep walking outwards.
+    sessionId = owner.sessionId;
+  }
+  return { x, y };
 }
 
 /** Element centre in viewport CSS pixels, scrolled into view first. */
@@ -211,14 +247,16 @@ export async function pointForRef(tabId, ref) {
   }
 
   if (quads && quads.length > 0) {
-    // Verified on Edge 153: the quads are viewport-relative CSS pixels, so after
-    // scrollIntoViewIfNeeded the centre is exactly where Input.dispatchMouseEvent wants it.
+    // Verified on Edge 153: within a session the quads are viewport-relative CSS pixels,
+    // so after scrollIntoViewIfNeeded the centre is where Input.dispatchMouseEvent wants
+    // it - once the frame's own offset has been added back for a node inside an OOPIF.
     const quad = quads[0];
     return frameQuadToMainViewport(
       {
         x: (quad[0] + quad[2] + quad[4] + quad[6]) / 4,
         y: (quad[1] + quad[3] + quad[5] + quad[7]) / 4,
       },
+      tabId,
       sessionId,
     );
   }

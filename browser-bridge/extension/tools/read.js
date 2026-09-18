@@ -11,12 +11,15 @@ import { evaluate } from "./shared.js";
 const DEFAULT_MAX_CHARS = 50_000;
 const PAGE_TEXT_MAX_CHARS = 60_000;
 
-/** What to tell the model about the cross-origin frames on this page. */
+/** What to tell the model about the iframes on this page. */
 function frameNotes(tree) {
   const notes = [];
-  if (tree.frames > 0) {
+  const included = [];
+  if (tree.frames > 0) included.push(`${tree.frames} cross-origin`);
+  if (tree.localFrames > 0) included.push(`${tree.localFrames} same-origin`);
+  if (included.length > 0) {
     notes.push(
-      `Includes the content of ${tree.frames} cross-origin iframe(s); their elements have refs like any other.`,
+      `Includes the content of ${included.join(" and ")} iframe(s); their elements have refs like any other.`,
     );
   }
   if (tree.unplaced.length > 0) {

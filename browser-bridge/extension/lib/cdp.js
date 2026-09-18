@@ -15,10 +15,10 @@ const PROTOCOL_VERSION = "1.3";
 const MAX_CONSOLE = 2000;
 const MAX_NETWORK = 2000;
 const DOMAINS = ["Runtime", "Log", "Network", "Page", "DOM", "Accessibility"];
-// A child iframe session only has to answer questions about its own DOM: console,
-// network and log events keep coming from the main session alone, so the buffers the
-// read_* tools serve do not change shape.
-const FRAME_DOMAINS = ["DOM", "Accessibility"];
+// A child iframe session only has to answer questions about its own DOM and its own
+// frame tree: console, network and log events keep coming from the main session alone,
+// so the buffers the read_* tools serve do not change shape.
+const FRAME_DOMAINS = ["DOM", "Accessibility", "Page"];
 
 const attached = new Set();
 const tabs = new Map(); // tabId -> tab state
@@ -182,6 +182,20 @@ export function frameSessions(tabId) {
 /** The cache of iframe-element -> frame id lookups for this tab's current document. */
 export function frameOwners(tabId) {
   return stateFor(tabId).frameOwners;
+}
+
+/**
+ * The iframe element that hosts a child session's frame, as
+ * `{ sessionId, backendNodeId }` measured in the *parent* session — which is what turns
+ * a point inside that frame into a point on the page. Null when nothing has looked the
+ * frame up yet (read_page and find fill the cache).
+ */
+export function frameOwnerFor(tabId, sessionId) {
+  const state = peekTab(tabId);
+  if (!state || !sessionId) return null;
+  const frameId = state.sessionFrames.get(sessionId);
+  if (frameId == null) return null;
+  return state.frameOwners.get(frameId) ?? null;
 }
 
 export async function detach(tabId) {
