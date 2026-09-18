@@ -327,7 +327,8 @@ function unlandedWorktrees(repo, branch = defaultBranch(repo), options = {}) {
       if (merged && merged === baseTree) continue;
       let dir = path.resolve(record.worktree);
       try { dir = fs.realpathSync(dir); } catch {}
-      out.push({ path: dir, branch: name, commits, newestAt: Math.max(...commits.map((c) => c.at)) });
+      // The tip, merges included: merging main in today is someone working on it.
+      out.push({ path: dir, branch: name, commits, newestAt: Math.max(tips.get(ref), ...commits.map((c) => c.at)) });
     } catch {}
   }
   return out;

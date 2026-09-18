@@ -897,22 +897,29 @@ function worktreeUncarded(_task, ctx) {
     const needles = [[row.path, 'path'], [tilde(row.path), 'path']];
     if (distinctiveBranch(row.branch)) needles.push([row.branch, 'branch']);
     const relative = path.relative(repo, row.path);
-    if (relative && !relative.startsWith('..')) needles.push([relative, 'path']);
+    if (relative && !relative.startsWith('..') && (relative.includes('/') || distinctiveBranch(relative))) needles.push([relative, 'path']);
     if (path.basename(row.path).length >= 12) needles.push([path.basename(row.path), 'path']);
     return cards.some((card) => needles.some(([needle, kind]) => mentions(card.text, needle, kind))
       || row.commits.some((commit) => shaIsCited(commit.sha, card.shas)));
   };
   const out = [];
   const seen = new Set();
-  const deadline = Date.now() + WORKTREE_BUDGET_MS;
+  const repos = [];
   for (const task of ctx.tasks) {
-    if (Date.now() > deadline) break;
     let repo = ctx.repoFor(task);
     if (!repo) continue;
     // ~/keep-tool may be a link to the live checkout: one repo, scanned once.
     try { repo = fs.realpathSync(repo); } catch {}
     if (seen.has(repo)) continue;
     seen.add(repo);
+    repos.push(repo);
+  }
+  // Start somewhere new each hour, so a budget spent on the first repos never
+  // leaves the same last ones unscanned for good.
+  const start = repos.length ? Math.floor(ctx.now / 3600e3) % repos.length : 0;
+  const deadline = Date.now() + WORKTREE_BUDGET_MS;
+  for (const repo of [...repos.slice(start), ...repos.slice(0, start)]) {
+    if (Date.now() > deadline) break;
     const branch = landed.defaultBranch(repo);
     if (!branch) continue;
     for (const row of ctx.unlandedWorktrees(repo, branch, { before: ctx.now - WORKTREE_GRACE_MS, deadline })) {
