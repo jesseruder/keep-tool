@@ -125,14 +125,14 @@ export function totalDurationMs(frames = []) {
  * `incoming` bytes? `null` means it fits.
  *
  * The proposed total is what matters: checking only what is already stored let a
- * recording sitting at 59.9 MB accept another half-megabyte frame. The very first frame
- * always goes in, however big, because a recording of nothing is worse than one
- * oversized frame.
+ * recording sitting at 59.9 MB accept another half-megabyte frame. There is no exemption
+ * for the first frame either - a single frame over the whole budget is refused like any
+ * other, and `export` reports the cap instead of pretending the recording is simply empty.
  */
 export function capReached({ frames = 0, bytes = 0 } = {}, incoming = 0) {
   if (frames >= MAX_FRAMES) return "frames";
   if (bytes >= MAX_BYTES) return "bytes";
-  if (frames > 0 && bytes + incoming > MAX_BYTES) return "bytes";
+  if (bytes + incoming > MAX_BYTES) return "bytes";
   return null;
 }
 

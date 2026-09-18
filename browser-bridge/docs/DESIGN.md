@@ -311,16 +311,21 @@ Result shapes:
   `Navigate example.com`, `Screenshot`) and a timestamp. Frames are blobs in IndexedDB
   keyed by the group, so a worker restart between two actions does not lose the take,
   capped at 300 frames and 60 MB per group — the incoming frame's own size counts towards
-  the cap before it is written, so the total cannot overshoot; at a cap recording stays on,
-  nothing more is stored, and `export` says so. `clear` empties the frames and resets the
+  the cap before it is written, so the total cannot overshoot, and there is no exemption
+  for the first frame: one frame bigger than the whole budget is refused like any other and
+  `export` then says the cap refused every frame rather than that the recording is empty.
+  At a cap recording stays on, nothing more is stored, and `export` says so. `clear` empties the frames and resets the
   counters in one transaction, so a worker killed mid-clear cannot leave an empty recording
   that still believes it is full. Ownership is re-checked immediately before the capture,
-  again before the frame is stored, and again before a `coordinate` export drops the GIF:
-  the tab object an action captured is a snapshot, and a tab dragged into another session's
-  group must not be recorded into this session's GIF or receive its file. A filename is
-  normalised before anything is encoded (path separators, `<>:"|?*`, control characters and
-  the DOS device names), so a name the download API would refuse never costs a wasted
-  encode. Frame delay is the real gap to the next frame clamped to
+  again before the frame is stored, and — inside `dropFileAtCoordinate` itself — after the
+  debugger attach and the document lookup, immediately before the `callFunctionOn` that
+  hands the page the file: the tab object an action captured is a snapshot, those steps are
+  awaits of their own, and a tab dragged into another session's group must not be recorded
+  into this session's GIF or receive its file. `upload_image`'s coordinate mode shares that
+  helper and therefore that guard. A filename is normalised before anything is encoded
+  (path separators, `<>:"|?*`, control characters, and the DOS device names judged by the
+  component before the *first* dot, so `CON.backup` is caught while `console.gif` is not),
+  so a name the download API would refuse never costs a wasted encode. Frame delay is the real gap to the next frame clamped to
   300-3000 ms, 1500 ms on the last. `export` renders each frame with `OffscreenCanvas`
   and encodes with the vendored `gifenc` (`quantize` + `applyPalette` + `writeFrame`);
   overlays are orange click circles, red drag arrows, a black rounded label, an orange
@@ -409,9 +414,12 @@ fetched by frame id).
   attach in turn; their events arrive with the tab's `source.tabId` and the *parent
   session's* `source.sessionId`, which is recorded so a detach can drop the whole subtree.
   `tools/axtree.js` therefore collects frame sessions in rounds: arming a frame is what
-  makes its children appear, so the list grows while it is being walked. The rounds are
-  bounded (8 of them, 5 s) so a page that keeps replacing its iframes cannot keep the read
-  going for ever; the result then carries a note that the page was still changing. A frame
+  makes its children appear, so the list grows while it is being walked. The walk is bounded
+  three ways — at most 8 rounds, a 5 s clock checked before *every* read rather than only
+  between rounds, and a race between each individual read and what is left of that clock, so
+  neither a hundred slow frames nor one stalled CDP call can hold the tree hostage. When it
+  stops early it keeps what it collected and the result carries a note that the page was
+  still changing. A frame
   the asking session cannot read is left for the session that owns it rather than being
   written off, so a frame named in the page's frame tree but living in another process is
   still read through its own session.

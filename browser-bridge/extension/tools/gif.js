@@ -124,9 +124,9 @@ export function safeFilename(raw, at = Date.now()) {
     .trim();
   if (!name) return `recording-${fileStamp(at)}.gif`;
   if (!/\.gif$/i.test(name)) name = `${name}.gif`;
-  // CON.gif is still CON to Windows.
-  const base = name.slice(0, -4);
-  if (RESERVED_BASENAMES.test(base)) name = `recording-${name}`;
+  // Windows reserves the name before the *first* dot, whatever follows it: CON.gif and
+  // CON.backup.gif are both CON. "console.gif" is not, so only the exact names match.
+  if (RESERVED_BASENAMES.test(name.split(".")[0])) name = `recording-${name}`;
   return name;
 }
 
@@ -209,8 +209,13 @@ async function clearAction(groupId) {
 async function exportAction(ctx, tab, groupId, params) {
   const { meta, frames } = await listFrames(groupId);
   if (!meta || frames.length === 0) {
+    // A cap can refuse even the very first frame (one frame bigger than the whole
+    // budget), and "there are no frames" would be a misleading answer to that.
+    const capped = capNote(meta?.capped);
     throw new Error(
-      `No GIF frames for tab group ${groupId}. Call gif_creator {action:"start_recording"} and take a screenshot before exporting.`,
+      capped
+        ? `No GIF frames for tab group ${groupId}: every frame was refused. ${capped}`
+        : `No GIF frames for tab group ${groupId}. Call gif_creator {action:"start_recording"} and take a screenshot before exporting.`,
     );
   }
 
@@ -255,17 +260,14 @@ async function exportAction(ctx, tab, groupId, params) {
 
   if (coordinate) {
     const [x, y] = coordinate;
-    // Encoding took real time; the destination tab may have been handed to another
-    // session meanwhile, and this GIF is not theirs to receive. requireTab throws the
-    // contract's own wording.
-    await requireTab(ctx.sessionKey, tab.id);
-    const dropped = await dropFileAtCoordinate(tab.id, {
-      data: base64,
-      mimeType: "image/gif",
-      filename,
-      x,
-      y,
-    });
+    // Encoding took real time and so do the attach and document lookup inside the drop,
+    // so the check goes with it: the helper re-runs this immediately before the call that
+    // hands the page the file. requireTab throws the contract's own wording.
+    const dropped = await dropFileAtCoordinate(
+      tab.id,
+      { data: base64, mimeType: "image/gif", filename, x, y },
+      () => requireTab(ctx.sessionKey, tab.id),
+    );
     lines.push(`Dropped ${filename} on <${dropped.target}> at (${x}, ${y}) in tab ${tab.id}.`);
   }
 

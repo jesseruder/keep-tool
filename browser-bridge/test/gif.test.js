@@ -22,6 +22,7 @@ const state = {
   // at exactly the moment the fix is meant to notice.
   moveGroupOnCapture: null,
   moveGroupOnEncode: null,
+  moveGroupOnDocument: null,
   hangPaint: false,
 };
 
@@ -116,6 +117,12 @@ globalThis.chrome = {
           };
         }
         if (String(params?.expression ?? "") === "document") {
+          // The attach and this lookup are the drop's own awaits: a test can have the tab
+          // change hands here, after the caller's check and before the file is handed over.
+          if (state.moveGroupOnDocument != null) {
+            for (const tab of state.tabs.values()) tab.groupId = state.moveGroupOnDocument;
+            state.moveGroupOnDocument = null;
+          }
           return { result: { objectId: "doc-1" } };
         }
         return { result: { value: null } };
@@ -287,6 +294,7 @@ const gifstore = await import("../extension/lib/gifstore.js");
 const gifencode = await import("../extension/lib/gifencode.js");
 const { gif_creator, recordAction, safeFilename } = await import("../extension/tools/gif.js");
 const { computer } = await import("../extension/tools/computer.js");
+const { upload_image } = await import("../extension/tools/upload.js");
 const sessions = await import("../extension/lib/sessions.js");
 
 let backend = memoryBackend();
@@ -302,6 +310,7 @@ async function freshGroup(sessionKey, groupId, tabId) {
   state.nextDownloadId = 1;
   state.moveGroupOnCapture = null;
   state.moveGroupOnEncode = null;
+  state.moveGroupOnDocument = null;
   state.hangPaint = false;
   const tab = addTab(tabId, groupId);
   await sessions.putSession(sessionKey, { name: `s-${sessionKey}`, groupId, windowId: 1 });
@@ -385,11 +394,45 @@ test("the store caps frames and keeps recording after the cap", async () => {
 test("the store caps bytes too", async () => {
   await freshGroup("bytes", 11, 2);
   await gifstore.startRecording(11, { sessionKey: "bytes" });
-  const big = { at: Date.now(), blob: { size: gifframes.MAX_BYTES }, width: 10, height: 10, scale: 1, action: {} };
-  assert.equal((await gifstore.addFrame(11, big)).added, true, "the first frame always goes in");
-  const refused = await gifstore.addFrame(11, big);
+  // Exactly the budget fits; anything after it does not.
+  const exact = { at: Date.now(), blob: { size: gifframes.MAX_BYTES }, width: 10, height: 10, scale: 1, action: {} };
+  assert.equal((await gifstore.addFrame(11, exact)).added, true);
+  const refused = await gifstore.addFrame(11, exact);
   assert.equal(refused.cap, "bytes");
   assert.match(gifframes.capNote("bytes"), /60 MB cap/);
+});
+
+test("a first frame past the whole budget is refused too, and export says why", async () => {
+  await freshGroup("firstbig", 17, 8);
+  await gif_creator(ctx("firstbig"), { action: "start_recording", tabId: 8 });
+  // No exemption for the first frame: one frame bigger than the budget would leave the
+  // recording over its cap from the very start.
+  const huge = {
+    at: Date.now(),
+    blob: { size: gifframes.MAX_BYTES + 1 },
+    width: 10,
+    height: 10,
+    scale: 1,
+    action: {},
+  };
+  const refused = await gifstore.addFrame(17, huge);
+  assert.equal(refused.added, false);
+  assert.equal(refused.cap, "bytes");
+  const meta = await gifstore.recordingFor(17);
+  assert.equal(meta.frames, 0);
+  assert.equal(meta.bytes, 0);
+  assert.equal(meta.capped, "bytes");
+  assert.equal(gifframes.capReached({ frames: 0, bytes: 0 }, gifframes.MAX_BYTES + 1), "bytes");
+
+  // "There are no frames" would be a misleading answer to that, so export names the cap.
+  await assert.rejects(
+    () => gif_creator(ctx("firstbig"), { action: "export", tabId: 8, download: true }),
+    (error) =>
+      /every frame was refused/.test(error.message) && /60 MB cap/.test(error.message),
+  );
+  // The same is true straight after a clear.
+  await gifstore.clearFrames(17);
+  assert.equal((await gifstore.addFrame(17, huge)).cap, "bytes");
 });
 
 test("a frame that would overshoot the byte cap is refused, not stored", async () => {
@@ -772,6 +815,54 @@ test("export refuses to drop the GIF into a tab that changed hands while encodin
   );
 });
 
+test("a tab that changes hands during the drop's own attach never gets the GIF", async () => {
+  await freshGroup("dropattach", 41, 51);
+  await gif_creator(ctx("dropattach"), { action: "start_recording", tabId: 51 });
+  await computer(ctx("dropattach"), { action: "screenshot", tabId: 51 });
+
+  // The handover lands inside the drop: after the export's own check, during the debugger
+  // attach and document lookup, before the call that hands the page the file.
+  state.moveGroupOnDocument = 781;
+  state.groups.set(781, { id: 781, title: "someone else" });
+  await assert.rejects(
+    () => gif_creator(ctx("dropattach"), { action: "export", tabId: 51, coordinate: [5, 6] }),
+    /^Error: Tab 51 is not in the same group$/,
+  );
+  assert.equal(
+    state.cdp.some((call) => call.method === "Runtime.callFunctionOn"),
+    false,
+    "the file was never handed over",
+  );
+});
+
+test("upload_image's coordinate mode is protected by the same guard", async () => {
+  await freshGroup("uploadattach", 42, 52);
+  const shot = await computer(ctx("uploadattach"), { action: "screenshot", tabId: 52 });
+  assert.ok(shot.imageId);
+
+  // First the happy path, so the test would notice the guard refusing everything.
+  const dropped = await upload_image(ctx("uploadattach"), {
+    tabId: 52,
+    imageId: shot.imageId,
+    coordinate: [7, 8],
+  });
+  assert.match(dropped.text, /Dropped image\.png .* at \(7, 8\) in tab 52\./);
+
+  state.cdp.length = 0;
+  state.moveGroupOnDocument = 782;
+  state.groups.set(782, { id: 782, title: "someone else" });
+  await assert.rejects(
+    () =>
+      upload_image(ctx("uploadattach"), { tabId: 52, imageId: shot.imageId, coordinate: [7, 8] }),
+    /^Error: Tab 52 is not in the same group$/,
+  );
+  assert.equal(
+    state.cdp.some((call) => call.method === "Runtime.callFunctionOn"),
+    false,
+    "the screenshot was never handed over either",
+  );
+});
+
 test("a filename the filesystem would refuse is normalised before anything is encoded", async () => {
   assert.equal(safeFilename("my flow"), "my flow.gif");
   // Illegal characters, control characters and path separators all become dashes.
@@ -783,7 +874,12 @@ test("a filename the filesystem would refuse is normalised before anything is en
   assert.equal(safeFilename("nul.gif"), "recording-nul.gif");
   assert.equal(safeFilename("COM1"), "recording-COM1.gif");
   assert.equal(safeFilename("LPT9.GIF"), "recording-LPT9.GIF");
+  // Windows reserves the name before the first dot whatever follows it.
+  assert.equal(safeFilename("CON.backup"), "recording-CON.backup.gif");
+  assert.equal(safeFilename("nul.tar.gz"), "recording-nul.tar.gz.gif");
+  assert.equal(safeFilename("prn.2026.gif"), "recording-prn.2026.gif");
   assert.equal(safeFilename("console"), "console.gif", "only the exact names are reserved");
+  assert.equal(safeFilename("console.backup"), "console.backup.gif");
   // Nothing usable left, or nothing given: the timestamped default.
   assert.match(safeFilename("   ", 0), /^recording-1970-01-01T00-00-00-000Z\.gif$/);
   assert.match(safeFilename(undefined, 0), /^recording-.*\.gif$/);
