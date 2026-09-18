@@ -660,6 +660,52 @@ test('a new limit event does not discard an unconfirmed send claim', async () =>
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+// The claim belongs to the window it was typed into. A five-hour continue that lands
+// and runs straight into the WEEKLY limit is a different resume: carrying the claim
+// into the weekly entry would let the stale-claim recovery mark the weekly event as
+// already sent, and the weekly window would never get its continue at all.
+test('a new limit event in a different window drops the unconfirmed claim', async () => {
+  const root = tempRoot();
+  const sends = [];
+  const HIT_AT_B = '2026-09-06T19:59:00.000Z';
+  const RESET_B = RESET_AT + 2 * 86400e3;
+  const weekly = session({ rateLimit: { at: HIT_AT_B, text: 'weekly limit', type: 'seven_day', resetsAt: RESET_B } });
+  const deps = {
+    scanSessions: () => [weekly],
+    send: async (id, text, opts) => { sends.push(opts.hitAt); },
+    root,
+    stderr: { write: () => {} },
+  };
+  try {
+    writeLedgerFile(root, {
+      sessions: {
+        'session-one': { hitAt: HIT_AT, type: 'five_hour', attempts: 0, sentHistory: [], resetAt: RESET_AT, state: 'waiting', sending: NOW - 60e3 },
+      },
+      history: [],
+    });
+    // The claim is still young here, so nothing has recovered it yet: this is the
+    // exact moment the carry-over decision is made.
+    const first = await tick({ ...deps, now: NOW, getUsage: () => usageSnapshot([]) });
+    assert.deepEqual(first, { ok: true, sent: 0, waiting: 1, detail: 'waiting 1' });
+    assert.deepEqual(sends, []);
+    const parkedWeekly = readLedger(root).sessions['session-one'];
+    assert.equal(parkedWeekly.hitAt, HIT_AT_B);
+    assert.equal(parkedWeekly.resetAt, RESET_B);
+    assert.equal(parkedWeekly.sending, undefined, 'the five-hour claim is not credited to the weekly window');
+    assert.equal(parkedWeekly.sentAt, undefined);
+
+    // Two days later the weekly window reopens and the continue actually goes out.
+    const later = RESET_B + RESET_GRACE_MS + 60e3;
+    const second = await tick({ ...deps, now: later, getUsage: () => usageSnapshot([], later - 60e3) });
+    assert.equal(second.sent, 1);
+    assert.deepEqual(sends, [HIT_AT_B], 'the weekly window gets exactly one continue');
+    const entry = readLedger(root).sessions['session-one'];
+    assert.equal(entry.sentAt, later);
+    assert.equal(entry.state, 'sent');
+    assert.equal(entry.sending, undefined);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('a session that burns every attempt is shown as stalled', async () => {
   const root = tempRoot();
   const deps = {

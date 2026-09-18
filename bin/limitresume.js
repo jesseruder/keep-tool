@@ -316,11 +316,17 @@ async function tick(deps = {}) {
     const prior = ledger.sessions[session.id];
     // A new limit event starts a fresh attempt count but keeps the send history:
     // the daily cap is per session, not per event.
-    // An unconfirmed `sending` claim carries over too. A continue can land and be
-    // followed immediately by a second limit error, so the fresh event may well be
-    // the one this very claim caused; dropping it would hide an in-flight send from
-    // the check below and type "continue" twice, uncounted by the caps. Carried over,
-    // a young claim is waited out and a stale one is recovered as a send next tick.
+    // An unconfirmed `sending` claim carries over only within the same window. A
+    // continue can land and be followed immediately by a second error for the same
+    // window, so there the new event may be the consequence of this very send:
+    // dropping the claim would hide an in-flight send from the check below and type
+    // "continue" twice, uncounted by the caps. Kept, a young claim is waited out and
+    // a stale one is recovered as that window's send.
+    // A new event in a DIFFERENT window is a different resume: its own reset is far
+    // enough off that no typing can still be in flight, and crediting the old claim
+    // to it would mark the new window as already sent and never resume it at all.
+    const carriedClaim = prior && Number.isFinite(Number(prior.sending))
+      && sameWindow(decision.resetAt, prior.resetAt);
     const entry = prior && prior.hitAt === session.rateLimit.at
       ? prior
       : {
@@ -328,7 +334,7 @@ async function tick(deps = {}) {
         type: session.rateLimit.type,
         attempts: 0,
         sentHistory: prior && Array.isArray(prior.sentHistory) ? prior.sentHistory : [],
-        ...(Number.isFinite(Number(prior?.sending)) ? { sending: prior.sending } : {}),
+        ...(carriedClaim ? { sending: prior.sending } : {}),
       };
     entry.type = session.rateLimit.type;
     entry.accountId = session.accountId || null;
