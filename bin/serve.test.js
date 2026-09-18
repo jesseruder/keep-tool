@@ -7841,9 +7841,9 @@ test('a console transfer refused before its stop joins the retry queue; the CLI 
     // taking the session back.
     assert.ok(Number.isFinite(only()[0].activityBoundary));
     assert.ok(only()[0].activityBoundary <= only()[0].enqueuedAt);
-    // Slowest answer first, so everything after it is fresher than it is; the liveness
-    // snapshot is taken last, immediately before the entry is written.
-    assert.deepEqual(calls, ['transfer', 'state', 'cancel-check', 'record', 'ps', 'enqueue']);
+    // Slowest answer first, so everything after it is fresher than it is — and the
+    // Cancel check after every await, because a Cancel can land during any of them.
+    assert.deepEqual(calls, ['transfer', 'state', 'record', 'ps', 'cancel-check', 'enqueue']);
     fs.rmSync(queue.dir(root), { recursive: true, force: true });
 
     // Everything that must not be retried behind the person's back.
@@ -7888,6 +7888,22 @@ test('a console transfer refused before its stop joins the retry queue; the CLI 
     });
     await assert.rejects(handoffSessionRequest(body, cancelledFirst), /another session injection is busy/);
     assert.equal(only()[0].status, 'cancelled', 'the Cancel stands');
+    fs.rmSync(queue.dir(root), { recursive: true, force: true });
+
+    // And one that lands during the liveness snapshot, which is itself an await of up
+    // to fifteen seconds. Whichever await it arrives in, the check after them all is
+    // the one that sees it.
+    const cancelledDuringPs = deps(refuse(record()), {
+      rows: () => {
+        queue.enqueue(root, { sessionId: 'sid', pane: 'p', sourceAccountId: 'claude-main', targetAccountId: 'claude-two' },
+          { log: () => {} });
+        queue.cancel(root, 'sid', { log: () => {} });
+        return [{ pid: 11, ppid: 10, pidStart: 'start', agent: 'claude', interactive: true, args: '/test/claude --resume sid' }];
+      },
+    });
+    await assert.rejects(handoffSessionRequest(body, cancelledDuringPs), /another session injection is busy/);
+    assert.equal(only()[0].status, 'cancelled', 'a Cancel during the `ps` read stands too');
+
     // A cancel from before this transfer was asked for is a different matter: the
     // console offering the button again is the person changing their mind.
     const stale = queue.readOne(root, 'sid');
@@ -7934,7 +7950,7 @@ test('a console transfer refused before its stop joins the retry queue; the CLI 
       rows([{ pid: 11, ppid: 10, pidStart: 'start', agent: null, interactive: false, args: '(claude)', argsUnavailable: true }]))))
       .status, 'queued');
     assert.equal(only().length, 1);
-    assert.deepEqual(calls, ['transfer', 'state', 'cancel-check', 'record', 'ps', 'enqueue']);
+    assert.deepEqual(calls, ['transfer', 'state', 'record', 'ps', 'cancel-check', 'enqueue']);
     fs.rmSync(queue.dir(root), { recursive: true, force: true });
 
     // And a transfer that worked is passed straight back.
@@ -9515,6 +9531,30 @@ test('a ps snapshot that missed the agent is read again instead of refusing the 
     const waited = scenario((read) => (read === 1 ? [unreadable] : [agent]), expected);
     assert.equal((await waited.run()).sessionId, 'ps');
     assert.ok(waited.state.replaced, 'the restart went ahead on the expected process');
+
+    // The re-reads above wait seconds, and the state this restart was handed was read
+    // before them. A transfer that named when it was requested is asked again here, on
+    // the transcript itself, after all that waiting — and once more as beforeClose.
+    const T = 1_700_000_000_000;
+    const boundary = (lastUserAt, named = T) => scenario((read) => (read === 2 ? [unreadable] : [agent]), {
+      ...(named === null ? {} : { expectedNoUserActivityAfter: named }),
+      claudeSessionFor: () => ({ id: 'ps', kind: 'claude', endedTurn: true, mtime: 1,
+        ...(lastUserAt === undefined ? {} : { lastUserAt }) }),
+    });
+    const used = boundary(T + 1);
+    await assert.rejects(used.run(),
+      (error) => error.status === 409 && error.message === 'Session was used after the transfer was requested');
+    assert.equal(used.state.replaced, null, 'nothing was stopped');
+    // Equal is not after, and neither is earlier or a transcript with no stamp at all.
+    for (const lastUserAt of [T, T - 1, undefined]) {
+      const fine = boundary(lastUserAt);
+      assert.equal((await fine.run()).sessionId, 'ps', `lastUserAt ${lastUserAt} must not refuse`);
+      assert.ok(fine.state.replaced);
+    }
+    // And a restart that names no boundary reads none of this.
+    const unnamed = boundary(Date.now(), null);
+    assert.equal((await unnamed.run()).sessionId, 'ps');
+    assert.ok(unnamed.state.replaced);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

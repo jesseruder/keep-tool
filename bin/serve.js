@@ -3577,6 +3577,33 @@ function agentRowUnreadable(rows, identity) {
   return Boolean(row && row.argsUnavailable === true);
 }
 
+// A transfer that names no rate limit names the moment it was requested instead, and
+// everything that stops a session on its behalf compares a fresh read against it.
+//
+// Every one of those comparisons is needed, because every one of them is followed by
+// more waiting: the restart's own `ps` reads retry for seconds, and closeIdleSession
+// then takes its own freshness baseline — a baseline computed after all of that, which
+// on its own would accept a turn the person finished in the meantime as simply how the
+// session has always been. The wording matches account-handoff's own refusal so a
+// queue reads it as blocked wherever it comes from.
+function requireNoUserActivityAfter(boundary, latest) {
+  if (boundary == null) return;
+  const lastUserAt = Number(latest?.lastUserAt);
+  if (Number.isFinite(lastUserAt) && lastUserAt > Number(boundary)) {
+    throw new InjectionError(409, 'Session was used after the transfer was requested');
+  }
+}
+
+// The freshest read of one session there is, which is what claudeSessionFor and
+// codex.sessionFor give: straight off the transcript, past every state-build cache.
+function freshSessionRead(session, deps = {}) {
+  try {
+    return session.kind === 'claude'
+      ? (deps.claudeSessionFor || claudeSessionFor)(session.id)
+      : (deps.codexSessionFor || codex.sessionFor)(session.id);
+  } catch { return null; }
+}
+
 async function liveSessionPids(deps = {}) {
   const live = new Map();
   let rows = [];
@@ -4064,14 +4091,10 @@ async function restartSession(body, deps = {}) {
         && String(session?.rateLimit?.at ?? '') !== String(deps.expectedRateLimitAt)) {
       throw new InjectionError(409, 'Session no longer carries the account limit this transfer was requested for');
     }
-    // And the same last look for a transfer that names no limit: it named the moment it
-    // was asked for instead, and work the person did since then is them taking the
-    // session back. The wording matches account-handoff's own refusal so a queue reads
-    // it as blocked either way.
-    if (deps.expectedNoUserActivityAfter != null && Number.isFinite(Number(session?.lastUserAt))
-        && Number(session.lastUserAt) > Number(deps.expectedNoUserActivityAfter)) {
-      throw new InjectionError(409, 'Session was used after the transfer was requested');
-    }
+    // And the same look for a transfer that names no limit: it named the moment it was
+    // asked for instead, and work the person did since then is them taking the session
+    // back. Not the last one, though — see requireNoUserActivityAfter.
+    requireNoUserActivityAfter(deps.expectedNoUserActivityAfter, session);
     // A session the API cut off mid-turn never ends its turn on its own, so the
     // terminal-limit path supplies the ended turn. Its ledger may also carry a
     // settled `transcript-replaced` history-gap, which is not live work and must
@@ -4195,6 +4218,10 @@ async function restartSession(body, deps = {}) {
         if (!changed()) process.stderr.write(`keep serve: ps snapshot missed ${session.id}'s agent (pid ${originalIdentity.pid}); a re-read found it\n`);
       }
       if (changed()) throw Error('Agent process identity changed during restart');
+      // After the `ps` work above, not only at the top of the lock: those reads wait
+      // seconds when a snapshot comes back unusable, and this runs again as the close
+      // path's beforeClose, so the last word on it is taken as late as it can be.
+      requireNoUserActivityAfter(deps.expectedNoUserActivityAfter, freshSessionRead(session, deps));
       const parent = rows.find((p) => p.pid === identity.pid);
       // process.env and not deps.env: the npx cache an `npx`-declared server unpacked
       // into is the one this daemon's own environment names, because the daemon is
@@ -4575,6 +4602,11 @@ async function closeIdleSession(body, deps = {}) {
       }
       const latest = session.kind === 'claude' ? (deps.claudeSessionFor || claudeSessionFor)(session.id) : (deps.codexSessionFor || codex.sessionFor)(session.id);
       if (!latest || typeof latest.endedTurn !== 'boolean' || !Number.isFinite(latest.mtime)) throw new InjectionError(409, 'Session activity could not be verified');
+      // A transfer that named when it was requested is asking about this very read. The
+      // comparison below is against `session`, the baseline this close was handed, which
+      // was taken after the caller's own check and so already contains anything the
+      // person did in between; only the boundary can tell that apart.
+      requireNoUserActivityAfter(deps.expectedNoUserActivityAfter, latest);
       const latestEnded = latest.endedTurn === true || (deps.allowTerminalRateLimit && latest.rateLimit && !latest.pendingBackground
         && !latest.toolRunning && !latest.pendingQuestion && !latest.pendingPlan && !(latest.unknownBackgroundJobs || []).length);
       if (latest.mtime !== session.mtime || !latestEnded
@@ -8161,18 +8193,12 @@ async function queueRefusedHandoff(body, record, requestedAt, deps = {}) {
   };
   // Order matters, and it is the order of how long each answer stays true. The state
   // build is the slow one, so it goes first and everything after it is fresher than it
-  // is. Cancel lands through its own route while that build runs, and a `ps` taken
-  // before it would be describing a process by the time the entry is written, so the
-  // liveness snapshot is taken last, immediately before the enqueue.
+  // is; the `ps` snapshot is next, because a process described before that build would
+  // be a memory by now. Cancel comes last of all, after every await: it arrives through
+  // its own route at any moment, it is a person saying no to exactly this, and
+  // enqueue() would start a cancelled entry over.
   const rateLimitAt = await handoffRateLimitAt(sessionId, deps);
   if (rateLimitAt === undefined) return skip('its live state could not be read, so the limit it carries is unknown');
-  // An entry cancelled since this transfer was asked for is a person saying no to
-  // exactly this; enqueue() would start a cancelled entry over.
-  const current = queue.readOne(root, sessionId);
-  if (current && current.status === 'cancelled'
-      && Number(current.cancelledAt || current.updatedAt || 0) >= Number(requestedAt || 0)) {
-    return skip('its transfer was cancelled while this one ran');
-  }
   const journalled = (deps.handoffRecord || require('./account-handoff').readOne)(root, sessionId) || record;
   try {
     if (!await handoffSourceStillRunning(journalled, deps)) {
@@ -8182,6 +8208,11 @@ async function queueRefusedHandoff(body, record, requestedAt, deps = {}) {
     // No snapshot, no proof the source is alive. A `ps` this attempt could not take is
     // reason enough not to promise a retry.
     return skip(`could not check whether its source agent is still running: ${error.message}`);
+  }
+  const current = queue.readOne(root, sessionId);
+  if (current && current.status === 'cancelled'
+      && Number(current.cancelledAt || current.updatedAt || 0) >= Number(requestedAt || 0)) {
+    return skip('its transfer was cancelled while this one ran');
   }
   let entry;
   try {

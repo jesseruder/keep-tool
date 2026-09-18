@@ -282,6 +282,57 @@ test('Codex cleanup ignores instruction mentions, but stops when activity starts
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('a close that carries a transfer boundary refuses on activity its own baseline cannot see', async () => {
+  const { closeIdleSession } = require('./serve');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-close-boundary-'));
+  const file = path.join(root, 'rollout.jsonl');
+  fs.writeFileSync(file, JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete' } }) + '\n');
+  const T = 1_700_000_000_000;
+  // The baseline this close was handed carries no stamp of its own: it was built after
+  // the caller's own check, so a turn finished in between is simply part of it by now.
+  // Only the boundary the transfer named can tell that apart, and it is compared
+  // against the fresh transcript read, not the baseline.
+  const base = { id: 's', kind: 'codex', state: 'done', endedTurn: true, mtime: Date.now() - 2 * 86400e3 };
+  const pane = { id: 'p', alive: true, meta: { sessionId: 's', agent: 'codex' } };
+  const close = (over = {}) => {
+    let typed = '';
+    const args = { root, withInjectionLock: (fn) => fn(),
+      host: { request: async (type, params) => {
+        if (type === 'list') return { panes: [pane] };
+        if (type === 'screen') return { text: typed ? `› ${typed}\n\nstatus` : '› Ask Codex to do anything' };
+        if (type === 'input') { typed += Buffer.from(params.data, 'base64').toString(); return {}; }
+        assert.fail(type);
+      } },
+      buildState: () => ({ sessions: [{ ...base }], tasks: [] }),
+      codexSessionFor: () => ({ ...base, ...(over.lastUserAt === undefined ? {} : { lastUserAt: over.lastUserAt }) }),
+      codexRolloutFile: () => file, sleep: async () => {},
+      psTable: '123 1 ttys001 Tue Sep  8 10:00:00 2026 codex resume s',
+      lsof: async () => '',
+      ...(over.expectedNoUserActivityAfter === undefined ? {}
+        : { expectedNoUserActivityAfter: over.expectedNoUserActivityAfter }),
+    };
+    return { typed: () => typed, run: () => closeIdleSession({ sessionId: 's', pane: 'p' }, args) };
+  };
+  try {
+    const used = close({ expectedNoUserActivityAfter: T, lastUserAt: T + 1 });
+    await assert.rejects(used.run(),
+      (error) => error.status === 409 && error.message === 'Session was used after the transfer was requested');
+    assert.equal(used.typed(), '', 'nothing was typed into a session the person had gone back to');
+
+    // Equal is not after; neither is earlier, nor a transcript with no stamp at all.
+    for (const lastUserAt of [T, T - 1, undefined]) {
+      const fine = close({ expectedNoUserActivityAfter: T, lastUserAt });
+      assert.equal((await fine.run()).closing, true, `lastUserAt ${lastUserAt} must not refuse`);
+      assert.equal(fine.typed(), '/exit\r');
+    }
+
+    // A close that carries no boundary is untouched by any of it.
+    const plain = close({ lastUserAt: Date.now() });
+    assert.equal((await plain.run()).closing, true);
+    assert.equal(plain.typed(), '/exit\r');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('automatic cleanup verifies remote children again before submitting exit', async () => {
   const { closeIdleSession } = require('./serve');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-close-children-'));
