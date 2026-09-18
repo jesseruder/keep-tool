@@ -16,7 +16,7 @@ function routes(ctx) {
     // serve.js internals
     ATTENTION_KINDS, InjectionError, MOBILE_VIEWS, TAG_INSTRUCTION, TASK_INSTRUCTION, WEB_ROOT,
     abandonAccountHandoff, accounts, announceStateNote, answerSession, attentionAckKey, attentionAckName,
-    buildState, cancelQueuedHandoff, closeIdleSession, codex, compactSessionById, companionSnapshot, compactState,
+    cancelQueuedHandoff, closeIdleSession, codex, compactSessionById, companionSnapshot, compactState,
     daemonRestartGate, dashboardDetail, fs, handoffRateLimited, handoffSessionRequest, health, hostRequest,
     inspectReviewQueueLaunch,
     keep, launchReviewQueueSession, lightweightState, listHostPanes, listPortableTransfers, notifications,
@@ -476,9 +476,20 @@ function routes(ctx) {
       path: '/api/setaside',
       handle: async ({ req, res, url, body }) => {
         try {
-          const panes = await listHostPanes(deps);
-          const state = buildState({ hostPanes: panes });
-          const entry = updateSetAside(body, setAsideCandidates(state.attention, state.sessions));
+          // The key came from what the console rendered, so validate it against the
+          // state that was published to it (read live off ctx, never destructured).
+          // A fresh host list can time out under load, and a rebuild with no panes
+          // then hides every hosted session and rejects a key that is perfectly good.
+          let state = ctx.publishedState;
+          if (!state) {
+            // Nothing published yet: build once, and treat a silent host as no panes rather than failing.
+            const panes = await listHostPanes(deps);
+            state = await dashboardBuild({ hostPanes: panes || [] });
+          }
+          // setAsideCandidates writes onto the items it is handed; the published
+          // state's own objects must not be mutated in place.
+          const attention = (state.attention || []).map((item) => ({ ...item }));
+          const entry = updateSetAside(body, setAsideCandidates(attention, state.sessions || []));
           broadcast();
           return json(res, 200, { ok: true, entry });
         } catch (error) {

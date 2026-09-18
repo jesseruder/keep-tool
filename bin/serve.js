@@ -9718,6 +9718,9 @@ function start(deps = {}) {
     get json() { return json; },
     get onChange() { return onChange; },
     get onFocus() { return onFocus; },
+    // The dashboard state the console is actually showing. Routes that validate a
+    // key the console handed back read it live, so they see the same items it did.
+    get publishedState() { return retainedPublication ? retainedPublication.state : null; },
     get restarts() { return restarts; },
     get sessionSnapshot() { return sessionSnapshot; },
     get sessionSnapshotAt() { return sessionSnapshotAt; },

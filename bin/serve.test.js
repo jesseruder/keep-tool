@@ -963,6 +963,70 @@ test('/api/setaside requires write authentication', () => {
   assert.equal(apiRequestAuthError(local, { isLocal: () => true, token: 'secret' }), null);
 });
 
+test('/api/setaside validates the key against the published state, and rebuilds only before the first publish', async () => {
+  const { routes } = require('./serve/routes');
+  const keepModule = require('./keep.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-setaside-route-'));
+  const priorRoot = keepModule.ROOT;
+  keepModule.ROOT = dir;
+  try {
+    const stateFixture = () => ({
+      attention: [{ kind: 'input', sessionId: 'sess-1', key: 'sess-1', since: 1700000000000, title: 'T' }],
+      sessions: [{ id: 'sess-1', kind: 'codex' }],
+    });
+    const base = () => ({
+      InjectionError, setAsideCandidates, updateSetAside,
+      deps: {},
+      broadcast: () => {},
+      json: (res, code, obj) => { res.writeHead(code); res.end(JSON.stringify(obj)); },
+    });
+    const post = async (ctx, body) => {
+      const route = routes(ctx).find((entry) => entry.path === '/api/setaside');
+      const sent = {};
+      const res = { writeHead: (code) => { sent.code = code; }, end: (text) => { sent.body = JSON.parse(text); } };
+      await route.handle({ req: { method: 'POST' }, res, url: new URL('http://x/api/setaside'), body });
+      return sent;
+    };
+
+    // A host that has gone silent must not cost the console its Snooze button.
+    const published = stateFixture();
+    const untouched = JSON.parse(JSON.stringify(published.attention[0]));
+    const live = {
+      ...base(),
+      get publishedState() { return published; },
+      listHostPanes: async () => null,
+      dashboardBuild: () => { assert.fail('the published state must not be rebuilt'); },
+    };
+    const snoozed = await post(live, { key: 'sess-1', kind: 'snooze', minutes: 60 });
+    assert.equal(snoozed.code, 200);
+    assert.equal(snoozed.body.ok, true);
+    assert.equal(snoozed.body.entry.kind, 'snooze');
+    assert.ok(readSetAside(dir).items['sess-1'], 'the store records the snoozed key');
+    assert.deepEqual(published.attention[0], untouched, 'the published item is copied, never written through');
+
+    // Before the first publication there is nothing to validate against, so a
+    // silent host reads as no panes rather than as a failed build.
+    const builds = [];
+    const fresh = {
+      ...base(),
+      get publishedState() { return null; },
+      listHostPanes: async () => null,
+      dashboardBuild: async (input) => { builds.push(input); return stateFixture(); },
+    };
+    const dismissed = await post(fresh, { key: 'sess-1', kind: 'dismiss' });
+    assert.deepEqual(builds, [{ hostPanes: [] }]);
+    assert.equal(dismissed.code, 200);
+    assert.equal(dismissed.body.entry.kind, 'dismiss');
+
+    const unknown = await post(live, { key: 'sess-missing', kind: 'dismiss' });
+    assert.equal(unknown.code, 400);
+    assert.deepEqual(unknown.body, { error: 'unknown attention key' });
+  } finally {
+    keepModule.ROOT = priorRoot;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('typing chunks preserve spaced, unspaced, emoji, and empty text exactly', () => {
   const spaced = 'word '.repeat(200);
   assert.equal(spaced.length, 1000);
