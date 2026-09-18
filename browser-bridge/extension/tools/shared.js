@@ -1,11 +1,7 @@
 // Helpers every page tool needs: ref -> live element, viewport metrics, tab activation.
 
 import { refTable, send } from "../lib/cdp.js";
-import { VIEWPORT_EXPRESSION, source } from "../lib/page.js";
-
-export function textResult(text) {
-  return { text };
-}
+import { VIEWPORT_EXPRESSION, elementRect, source } from "../lib/page.js";
 
 export function unknownRef(ref) {
   return new Error(
@@ -133,10 +129,7 @@ export async function pointForRef(tabId, ref) {
   }
 
   // Fall back to the layout box; a zero-size element genuinely cannot be clicked.
-  const { value } = await callOnRef(tabId, ref, function elementRect() {
-    const rect = this.getBoundingClientRect();
-    return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
-  });
+  const { value } = await callOnRef(tabId, ref, elementRect);
   if (!value || value.width === 0 || value.height === 0) {
     throw new Error(`${ref} has no visible box on the page, so it cannot be clicked`);
   }
