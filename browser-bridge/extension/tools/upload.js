@@ -55,13 +55,13 @@ export async function upload_image(ctx, params = {}) {
   }
 
   const [x, y] = params.coordinate.map(Number);
-  const value = await dropFileAtCoordinate(tab.id, {
-    data: stored.data,
-    mimeType: stored.mimeType,
-    filename,
-    x,
-    y,
-  });
+  // The helper re-checks ownership just before it hands the page the file: the attach and
+  // document lookup in between are awaits, and a tab can change hands during them.
+  const value = await dropFileAtCoordinate(
+    tab.id,
+    { data: stored.data, mimeType: stored.mimeType, filename, x, y },
+    () => requireTab(ctx.sessionKey, tab.id),
+  );
   return {
     text: `Dropped ${filename} (${value.size} bytes) on <${value.target}> at (${x}, ${y}) in tab ${tab.id}.`,
   };

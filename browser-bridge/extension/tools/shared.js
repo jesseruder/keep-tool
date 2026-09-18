@@ -86,12 +86,17 @@ export async function evaluate(tabId, expression, { awaitPromise = false } = {})
 /**
  * Run a page function that needs big arguments: callFunctionOn wants an object to bind
  * to, and `document` is the one every page has.
+ *
+ * `beforeCall` runs after the debugger attach and the document lookup and before the call
+ * itself, which is the last moment anything can be checked: those two steps are awaits,
+ * and a tab can change hands during them.
  */
-export async function callInPage(tabId, fn, args) {
+export async function callInPage(tabId, fn, args, { beforeCall = null } = {}) {
   const documentHandle = await send(tabId, "Runtime.evaluate", { expression: "document" });
   const objectId = documentHandle?.result?.objectId;
   if (!objectId) throw new Error("Could not reach the page's document");
   try {
+    if (beforeCall) await beforeCall();
     const response = await send(tabId, "Runtime.callFunctionOn", {
       objectId,
       functionDeclaration: source(fn),
@@ -113,10 +118,19 @@ export async function callInPage(tabId, fn, args) {
 /**
  * Drop a base64 file on whatever is at a point, the way a user drags a file onto a drop
  * zone. upload_image's coordinate mode and gif_creator's coordinate export are the same
- * gesture with different bytes, so they share this.
+ * gesture with different bytes, so they share this - and share the guard.
+ *
+ * `assertOwned` is the caller's "is this tab still mine?" check (requireTab, which throws
+ * the contract's own foreign-tab error). It is called here rather than by the caller
+ * because the attach and the document lookup inside callInPage are awaits of their own: a
+ * tab dragged into another session's group during them would otherwise still be handed the
+ * file. It runs immediately before the call that hands it over.
  */
-export async function dropFileAtCoordinate(tabId, { data, mimeType, filename, x, y }) {
-  const value = await callInPage(tabId, dropImageAtPoint, [data, filename, mimeType, x, y]);
+export async function dropFileAtCoordinate(tabId, { data, mimeType, filename, x, y }, assertOwned = null) {
+  if (assertOwned) await assertOwned();
+  const value = await callInPage(tabId, dropImageAtPoint, [data, filename, mimeType, x, y], {
+    beforeCall: assertOwned,
+  });
   if (!value?.ok) throw new Error(value?.error ?? `Could not drop the file at (${x}, ${y})`);
   return value;
 }

@@ -16,7 +16,45 @@ import { iframeNodes, spliceFrameTrees } from "../lib/frames.js";
 
 // How hard to chase a page whose frames keep changing while it is being read.
 const MAX_FRAME_ROUNDS = 8;
-const FRAME_WALK_BUDGET_MS = 5000;
+export const FRAME_WALK_BUDGET_MS = 5000;
+
+/** Thrown when the walk runs out of time; never reaches a caller. */
+class BudgetExpired extends Error {}
+
+/**
+ * A clock the whole walk shares. Every read is raced against what is left of it, so
+ * neither a hundred slow frames nor one stalled CDP call can hold the tree hostage: the
+ * budget is checked *before* each await and enforced *during* it.
+ */
+function walkBudget(totalMs) {
+  const deadline = Date.now() + totalMs;
+  return {
+    get expired() {
+      return Date.now() >= deadline;
+    },
+    /** `promise`, or BudgetExpired. A losing promise is swallowed, never left unhandled. */
+    async guard(promise) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new BudgetExpired();
+      const settled = promise.then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      );
+      let timer = null;
+      const timeout = new Promise((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), remaining);
+      });
+      try {
+        const outcome = await Promise.race([settled, timeout]);
+        if (outcome === "timeout") throw new BudgetExpired();
+        if (outcome.error) throw outcome.error;
+        return outcome.value;
+      } finally {
+        if (timer !== null) clearTimeout(timer);
+      }
+    },
+  };
+}
 
 async function treeFor(tabId, sessionId, frameId = null) {
   const response = await send(
@@ -46,22 +84,22 @@ function descendantFrameIds(frameTree) {
  * id behind every iframe node. Cached per tab until the main frame navigates: backend
  * node ids are stable within a document and this is one round trip per iframe.
  */
-async function resolveOwners(tabId, trees, wanted) {
+async function resolveOwners(tabId, trees, wanted, budget) {
   const cache = frameOwners(tabId);
   const missing = wanted.filter((frameId) => !cache.has(frameId));
-  if (missing.length === 0) return cache;
+  if (missing.length === 0) return { cache, stopped: false };
 
   for (const { sessionId, nodes } of trees) {
     for (const node of iframeNodes(nodes)) {
       let described;
       try {
-        described = await send(
-          tabId,
-          "DOM.describeNode",
-          { backendNodeId: node.backendDOMNodeId },
-          sessionId,
+        described = await budget.guard(
+          send(tabId, "DOM.describeNode", { backendNodeId: node.backendDOMNodeId }, sessionId),
         );
-      } catch {
+      } catch (error) {
+        // Out of time: whatever is still unresolved becomes an unplaced frame, and the
+        // result says the page was not read whole.
+        if (error instanceof BudgetExpired) return { cache, stopped: true };
         continue; // the element has gone; the frame will simply be unplaced
       }
       const frameId = described?.node?.frameId;
@@ -70,39 +108,42 @@ async function resolveOwners(tabId, trees, wanted) {
     }
     if (wanted.every((frameId) => cache.has(frameId))) break;
   }
-  return cache;
+  return { cache, stopped: false };
 }
 
 /**
  * The same-process child documents of one session: every frame in its frame tree that is
  * not an out-of-process target of its own and has not already been collected.
  */
-async function localFramesOf(tabId, sessionId, skip) {
+async function localFramesOf(tabId, sessionId, skip, budget) {
   let frameTree;
   try {
-    const response = await send(tabId, "Page.getFrameTree", {}, sessionId);
+    const response = await budget.guard(send(tabId, "Page.getFrameTree", {}, sessionId));
     frameTree = response?.frameTree;
-  } catch {
-    return []; // no Page domain on this target: nothing to enumerate
+  } catch (error) {
+    // No Page domain on this target: nothing to enumerate. Out of time: nothing more.
+    return { collected: [], stopped: error instanceof BudgetExpired };
   }
-  if (!frameTree) return [];
+  if (!frameTree) return { collected: [], stopped: false };
 
   const collected = [];
   for (const frameId of descendantFrameIds(frameTree)) {
     if (skip.has(frameId)) continue;
+    if (budget.expired) return { collected, stopped: true };
     try {
-      const nodes = await treeFor(tabId, sessionId, frameId);
+      const nodes = await budget.guard(treeFor(tabId, sessionId, frameId));
       if (nodes.length === 0) continue;
       // Only a frame that actually answered is done with. The main session's frame tree
       // also names frames that live in another process: asking there fails (or returns
       // nothing), and the session that owns the frame must still get its turn.
       skip.add(frameId);
       collected.push({ sessionId, frameId, nodes, kind: "local" });
-    } catch {
+    } catch (error) {
+      if (error instanceof BudgetExpired) return { collected, stopped: true };
       // Expected for a frame in another process; not worth a note.
     }
   }
-  return collected;
+  return { collected, stopped: false };
 }
 
 /**
@@ -111,7 +152,8 @@ async function localFramesOf(tabId, sessionId, skip) {
  * could not be found, anything that went wrong reading a frame, and whether the page was
  * still adding frames when the walk gave up.
  */
-export async function fullAxTree(tabId) {
+export async function fullAxTree(tabId, { budgetMs = FRAME_WALK_BUDGET_MS } = {}) {
+  const budget = walkBudget(budgetMs);
   const mainNodes = await treeFor(tabId, null);
 
   const children = [];
@@ -127,12 +169,13 @@ export async function fullAxTree(tabId) {
   const oopifIds = new Set();
   const doneSessions = new Set();
   // A page that keeps tearing down and re-creating cross-origin iframes hands out fresh
-  // sessions for as long as anyone keeps asking, so the walk is bounded both ways and the
-  // result says it stopped early.
-  const deadline = Date.now() + FRAME_WALK_BUDGET_MS;
+  // sessions for as long as anyone keeps asking, so the walk is bounded three ways - the
+  // rounds, the shared clock, and a race on every single read - and the result says when
+  // it stopped early.
   let unsettled = false;
-  for (let round = 0; ; round++) {
-    if (round >= MAX_FRAME_ROUNDS || Date.now() > deadline) {
+  let stopped = false;
+  for (let round = 0; !stopped; round++) {
+    if (round >= MAX_FRAME_ROUNDS || budget.expired) {
       unsettled = frameSessions(tabId).some((entry) => !doneSessions.has(entry.sessionId));
       break;
     }
@@ -146,21 +189,43 @@ export async function fullAxTree(tabId) {
     }
     if (pending.length === 0) break;
     for (const { sessionId, frameId } of pending) {
+      // Inside the round too: a hundred frames at half a second each would otherwise run
+      // for a minute between two round checks.
+      if (budget.expired) {
+        stopped = true;
+        break;
+      }
       doneSessions.add(sessionId);
       oopifIds.add(frameId);
       try {
-        await ensureFrameDomains(tabId, sessionId);
-        children.push({ sessionId, frameId, nodes: await treeFor(tabId, sessionId), kind: "oopif" });
+        await budget.guard(ensureFrameDomains(tabId, sessionId));
+        children.push({
+          sessionId,
+          frameId,
+          nodes: await budget.guard(treeFor(tabId, sessionId)),
+          kind: "oopif",
+        });
       } catch (error) {
+        if (error instanceof BudgetExpired) {
+          stopped = true;
+          break;
+        }
         errors.push(`iframe ${frameId}: ${error.message ?? error}`);
       }
     }
   }
+  if (stopped) unsettled = true;
 
   // Then the same-process ones, in the page's session and inside each frame session.
   const seen = new Set(oopifIds);
   for (const sessionId of [null, ...doneSessions]) {
-    children.push(...(await localFramesOf(tabId, sessionId, seen)));
+    if (stopped) break;
+    const local = await localFramesOf(tabId, sessionId, seen, budget);
+    children.push(...local.collected);
+    if (local.stopped) {
+      stopped = true;
+      unsettled = true;
+    }
   }
 
   if (children.length === 0) {
@@ -168,11 +233,14 @@ export async function fullAxTree(tabId) {
   }
 
   const trees = [{ sessionId: null, nodes: mainNodes }, ...children];
-  const owners = await resolveOwners(
+  const resolved = await resolveOwners(
     tabId,
     trees,
     children.map((child) => child.frameId),
+    budget,
   );
+  const owners = resolved.cache;
+  if (resolved.stopped) unsettled = true;
   const { nodes, placed, unplaced } = spliceFrameTrees(mainNodes, children, owners);
 
   const kindOf = new Map(children.map((child) => [child.frameId, child.kind]));

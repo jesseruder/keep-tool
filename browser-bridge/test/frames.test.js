@@ -177,6 +177,9 @@ const state = {
   endlessFrames: false,
   churnSeq: 0,
   hangPaint: false,
+  // A renderer that answers slowly, and one that never answers.
+  slowTreeMs: 0,
+  stallTrees: false,
 };
 
 function framesOf(sessionId) {
@@ -255,6 +258,11 @@ globalThis.chrome = {
       const sessionId = target.sessionId ?? null;
 
       if (method === "Accessibility.getFullAXTree") {
+        // A renderer that answers slowly, or not at all.
+        if (state.stallTrees && sessionId !== null) return new Promise(() => {});
+        if (state.slowTreeMs > 0 && (sessionId !== null || params?.frameId)) {
+          await new Promise((resolve) => setTimeout(resolve, state.slowTreeMs));
+        }
         // With a frameId this is a same-process child document of that session; without
         // one it is the session's own document.
         if (params?.frameId) {
@@ -372,6 +380,7 @@ globalThis.chrome = {
 const cdp = await import("../extension/lib/cdp.js");
 const sessions = await import("../extension/lib/sessions.js");
 const { find, read_page } = await import("../extension/tools/read.js");
+const { fullAxTree } = await import("../extension/tools/axtree.js");
 const { computer } = await import("../extension/tools/computer.js");
 const { form_input } = await import("../extension/tools/form.js");
 const { file_upload } = await import("../extension/tools/upload.js");
@@ -406,6 +415,8 @@ async function makeTab({ sessionKey }) {
   state.endlessFrames = false;
   state.churnSeq = 0;
   state.hangPaint = false;
+  state.slowTreeMs = 0;
+  state.stallTrees = false;
   return state.tabs.get(id);
 }
 
@@ -651,6 +662,39 @@ test("a page that keeps replacing its frames is read anyway, with a note", async
   // child straight away, so a round can have several pending sessions. The guarantee is
   // that the rounds stop, not that each one is small.
   assert.ok(trees.length < 60, `bounded (${trees.length} trees)`);
+});
+
+test("the walk's budget bounds every read, not just the rounds", async () => {
+  const tab = await makeTab({ sessionKey: "slow" });
+  attachFrame(tab.id, { sessionId: "S1", frameId: "frame-1" });
+  addChildFrame(null, "local-1");
+  // Each tree read takes longer than the whole budget the walk is given, and a stalled
+  // read would never reach a between-rounds check at all.
+  state.slowTreeMs = 400;
+
+  const started = Date.now();
+  const tree = await fullAxTree(tab.id, { budgetMs: 80 });
+  const elapsed = Date.now() - started;
+
+  assert.equal(tree.unsettled, true, "and it says the page was not read whole");
+  assert.ok(elapsed < 1500, `it gave up instead of waiting out every read (${elapsed} ms)`);
+  // The page's own tree is always there; the frames it did not get to are simply missing.
+  assert.ok(tree.nodes.some((item) => item.name?.value === "Checkout"));
+  assert.ok(tree.frames + tree.localFrames < 2, "not everything was collected");
+});
+
+test("a stalled read cannot hold the walk for ever", async () => {
+  const tab = await makeTab({ sessionKey: "stalled" });
+  attachFrame(tab.id, { sessionId: "S1", frameId: "frame-1" });
+  // The frame's session never answers at all.
+  state.stallTrees = true;
+
+  const started = Date.now();
+  const tree = await fullAxTree(tab.id, { budgetMs: 120 });
+  const elapsed = Date.now() - started;
+  assert.equal(tree.unsettled, true);
+  assert.ok(elapsed < 2000, `the race ended it (${elapsed} ms)`);
+  assert.equal(tree.frames, 0);
 });
 
 test("a frame that never paints cannot hang a ref click", async () => {
