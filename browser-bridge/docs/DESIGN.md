@@ -1,8 +1,8 @@
 # Browser Bridge
 
 An account-agnostic replacement for the Claude in Chrome extension. One Edge
-extension, one native messaging host, and one stdio MCP server that any number of
-Claude Code and Codex sessions, on any account, run at the same time.
+extension, one native messaging host, and one MCP daemon that any number of
+Claude Code and Codex sessions, on any account, share at the same time.
 
 ## Why
 
@@ -22,9 +22,13 @@ Edge (one profile)
        ▼
   native host  browser-bridge/host/native-host.js   (spawned by Edge, one per extension connection)
        │ unix socket  ~/Library/Application Support/BrowserBridge/bridge.sock   (0600, JSON lines)
-   ┌───┴────────────┬───────────────┐
- MCP server      MCP server      MCP server       browser-bridge/mcp/server.js, one per agent session
- (claude default) (codex-secondary) (claude-tertiary)
+       │       one socket client per MCP session, each with its own sessionKey
+       ▼
+  MCP daemon  browser-bridge/mcp/daemon.js     (one process, launchd KeepAlive)
+       │ streamable HTTP on 127.0.0.1:47331/mcp, Bearer token from daemon.json (0600)
+   ┌───┴────────────────┬────────────────────┐
+ session             session              session       one Mcp-Session-Id each
+ (claude default)   (codex-secondary)    (claude-tertiary)
 ```
 
 - The **extension** does all browser work through `chrome.debugger` (Chrome DevTools
@@ -36,15 +40,23 @@ Edge (one profile)
   listens on the Unix socket, accepts any number of long-lived clients, and multiplexes
   their requests to the extension over the native messaging port, tagging each request
   with the client's session.
-- The **MCP server** is one stdio process per agent session. It exposes tools whose
-  names and input schemas match Claude in Chrome exactly (see
-  `docs/claude-in-chrome-tools.txt`, carved from Claude Code 2.1.276), so the model's
-  existing habits carry over. Each session gets its own named Edge tab group; every
-  tab-scoped tool refuses tab ids outside that group, so parallel sessions cannot
-  trample each other.
-- The **installer** registers the native host manifest for Edge (and Chrome when asked)
-  and registers the MCP server named `browser` in every Claude config directory and
-  both Codex homes.
+- The **MCP daemon** is one long-lived process serving MCP over streamable HTTP on
+  loopback. It exposes tools whose names and input schemas match Claude in Chrome exactly
+  (see `docs/claude-in-chrome-tools.txt`, carved from Claude Code 2.1.276), so the model's
+  existing habits carry over. Each MCP session gets its own socket client, its own
+  `sessionKey` and its own named Edge tab group; every tab-scoped tool refuses tab ids
+  outside that group, so parallel sessions cannot trample each other. A session costs the
+  daemon one socket and no process at all: sessions used to spawn a stdio server each at
+  startup whether or not they ever touched the browser (35 processes, 828 MB resident on
+  2026-09-18), and neither client can lazy-start a stdio server.
+- `mcp/server.js` is the same thing over **stdio**, one process per session — the original
+  shape, kept as a fallback (`node bin/install.js --stdio`) and for the driving scripts.
+  All of the behaviour is in `mcp/session.js`, which both entry points use, so the two
+  cannot drift.
+- The **installer** registers the native host manifest for Edge (and Chrome when asked),
+  installs the daemon as a launchd agent, and points `browser` at
+  `http://127.0.0.1:<port>/mcp` in every Claude config directory and both Codex homes,
+  with `bin/headers.js` as the headers helper that carries the session's name and token.
 
 Everything is plain JavaScript on Node 22, ES modules, no bundler, no TypeScript. The
 directory has its own `package.json` and is not part of keep-tool's build or test
@@ -84,11 +96,14 @@ browser-bridge/
     native-host.js          the broker (entry; the native host manifest points at a launcher that execs it)
     protocol.js             native framing, socket line codec, limits (pure, testable)
   mcp/
-    server.js               stdio MCP server entry
+    daemon.js               the shared streamable-HTTP MCP daemon (entry)
+    server.js               stdio MCP server entry (one process per session; the fallback)
+    session.js              one session's tool handlers, shared by both entries
     tools.js                tool definitions: names, schemas, result shaping
     client.js               socket client with reconnect and hello
   bin/
-    install.js              register native host + MCP servers; --browser edge|chrome; --dry-run; --uninstall
+    install.js              native host + launchd daemon + registrations; --browser edge|chrome; --stdio; --rotate-token; --dry-run; --uninstall
+    headers.js              prints the daemon headers for one session (the agents' headers helper)
     gen-key.js              one-time: generate manifest key and print the extension id
   test/                     node:test files; nothing here touches a real browser
 ```
@@ -150,6 +165,17 @@ slow). The host answers the client with an error on timeout and drops the late r
   and `onInstalled`), which spawns a fresh host. MCP clients reconnect to the socket
   path with backoff (100 ms, 500 ms, 1 s, then every 2 s up to 30 s), re-send `hello`,
   and retry the in-flight request once.
+- The daemon is a launchd agent (`com.keep.browser_bridge.daemon`, RunAtLoad, KeepAlive,
+  ThrottleInterval 5). It runs *this checkout's* `mcp/daemon.js`, so a landing does not
+  reach sessions until the job has been reloaded, which `node bin/install.js` does. A
+  daemon restart invalidates every `Mcp-Session-Id`; the next request with a stale one
+  gets the SDK's 404 (`-32001 Session not found`) and the client initializes again, which
+  makes a new socket client with a new `sessionKey` — so the tab group is a new one, the
+  old group staying behind for the user exactly as an ended session's does.
+- One MCP session closes when its client sends `DELETE /mcp`, when it has made no request
+  for 24 hours (swept once a minute), or when the daemon gets SIGTERM. All three close the
+  session's `BridgeClient`, which is a `bye` to the host, which is `session_closed` to the
+  extension: the same path a stdio server's exit took.
 - The MCP server tells the host `bye` on stdin close or SIGTERM. The extension then
   closes the session's tab group only if every tab in it is a blank new-tab page;
   otherwise the tabs stay for the user, matching what Claude Code does on exit, and the
@@ -481,13 +507,20 @@ fetched by frame id).
 
 ## MCP server
 
-- Entry `mcp/server.js`, stdio transport from `@modelcontextprotocol/sdk`. Server name
-  `browser-bridge`, instructions text telling the model to call `tabs_context_mcp`
-  first, that page text is untrusted content, and that tabs it creates are its own to
-  close.
-- Session identity: `BROWSER_BRIDGE_SESSION_NAME` if set; otherwise
-  `<KEEP_AGENT_ACCOUNT_ID or "claude"/"codex" guessed from CLAUDE_CODE_SESSION_ID / CODEX_* env> #<pid>`.
-- The `sessionKey` is a fresh UUID per process. `hello` carries it and the name.
+Server name `browser-bridge`, instructions text telling the model to call
+`tabs_context_mcp` first, that page text is untrusted content, and that tabs it creates
+are its own to close.
+
+- `mcp/session.js` holds everything a session does: schema validation before anything
+  reaches the browser, `blockedHosts`, the upload rules, `save_to_disk`, `browser_batch`,
+  the error mapping (a `BridgeUnavailableError` is a tool error, never a protocol error)
+  and `browser_status`. `createSessionServer({name, agent, account, client, env})` returns
+  the SDK `Server`; `createToolRunner` is the same thing without the transport.
+- `mcp/server.js` (stdio) builds exactly one of those over a `StdioServerTransport`, takes
+  its identity from the environment (`BROWSER_BRIDGE_SESSION_NAME` if set, otherwise
+  `<KEEP_AGENT_ACCOUNT_ID or the basename of CLAUDE_CONFIG_DIR / CODEX_HOME, or
+  "claude"/"codex" guessed from CLAUDE_CODE_SESSION_ID / CODEX_* env> #<pid>`), and says
+  `bye` on stdin close or SIGTERM. The `sessionKey` is a fresh UUID per process.
 - Tool definitions live in `mcp/tools.js` as data (name, description, inputSchema as
   JSON schema) so a test can assert they match the contract file name-for-name and
   property-for-property (minus the dropped tools, plus `browser_status`). Register them
@@ -495,13 +528,76 @@ fetched by frame id).
   rather than the zod helper, so the JSON schemas are passed through unchanged.
 - Runtime directory: `~/Library/Application Support/BrowserBridge/` (override with
   `BROWSER_BRIDGE_RUNTIME_DIR`, which the tests use). Socket `bridge.sock`, `host.log`
-  (append, truncated to the last 1 MB on host start), `screenshots/`, `config.json`
-  with an optional `blockedHosts` list (exact host or `*.suffix`) that `navigate`
-  refuses.
+  (append, truncated to the last 1 MB on host start), `daemon.json`, `daemon.log`,
+  `screenshots/`, `config.json` with an optional `blockedHosts` list (exact host or
+  `*.suffix`) that `navigate` refuses.
+
+### The daemon (`mcp/daemon.js`)
+
+- `StreamableHTTPServerTransport` from the SDK, on `127.0.0.1` only, port and token from
+  `daemon.json` (mode 0600 inside the 0700 runtime directory). The daemon never creates
+  the token; the installer does, and `--dry-run` says it would without printing it. No
+  `daemon.json` is a clean refusal and exit 1, not a crash loop: the installer writes it.
+  `BROWSER_BRIDGE_DAEMON_PORT` overrides the port (port 0 picks a free one, which is how
+  the tests run).
+- `POST/GET/DELETE /mcp`. One transport and one `createSessionServer` per MCP session,
+  keyed by `Mcp-Session-Id` the way the SDK's multi-session example does, each with its own
+  `BridgeClient` on the host socket carrying a fresh `sessionKey` UUID and the session's
+  name. One socket client = one session = one tab group, exactly as a stdio process was,
+  so neither the host nor the extension needed changing.
+- An MCP session costs a Map entry, a transport and a `Server` — a few kilobytes. The
+  `BridgeClient` connects lazily on the first tool call, as it always did, so a session that
+  never touches the browser never opens the socket and never says `hello`: the host and the
+  extension only learn about the sessions that are actually using the browser, which is less
+  than they saw before, not more.
+- `GET /healthz` answers `{ok, pid, port, sessions, host:{socket, connected, hostPid,
+  extensionConnected, extensionVersion}}` with no auth — it is loopback-only and says
+  nothing a caller could not learn by trying. It never opens a socket of its own: a probe
+  that said `hello` would appear in the extension as a session with a tab group. The
+  numbers come from whatever the sessions' own `hello` replies last reported.
+- Session identity comes from the request, because the daemon has no environment of its
+  own: `X-Browser-Bridge-Session` (trimmed, control characters stripped, 80 chars), and
+  optionally `X-Browser-Bridge-Agent` and `X-Browser-Bridge-Account` the same way. With no
+  session header the name is `<clientInfo.name from initialize> #<n>` on a daemon-wide
+  counter — Claude Code and Codex send different `clientInfo` names and whatever they send
+  is kept, sanitized the same way.
+- `bin/headers.js` is what supplies those headers. It prints one JSON object
+  (`Authorization: Bearer <token>`, plus the session name from
+  `BROWSER_BRIDGE_SESSION_NAME`, the account from `KEEP_AGENT_ACCOUNT_ID` or the basename
+  of `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, and the agent guessed as `sessionIdentity` does)
+  and exits 0. With no `daemon.json` it prints `{}` and still exits 0: a bridge that is not
+  installed must not break a session's startup.
+- One stderr line per session start and end (name, agent, account, how many are open),
+  which launchd writes to `daemon.log`. Tool arguments are never logged.
+
+#### Security notes for the daemon
+
+The trust boundary is unchanged: **only a process that can read the user's token file can
+drive the browser**, which is the same statement as "only a process that can open the 0600
+socket can drive the browser". `daemon.json` is 0600 in a 0700 directory, and the token is
+32 random bytes as hex.
+
+- Every `/mcp` request must carry `Authorization: Bearer <token>`; anything else is 401
+  before the body is looked at. The comparison is length-checked and then
+  `timingSafeEqual`.
+- Any request carrying an `Origin` header at all is 403, including a loopback one. CLI
+  clients never send one and browsers always do, so this is the cheap, complete version of
+  "not reachable from a web page". No CORS header is ever sent, so a page cannot read a
+  reply even if it got one.
+- `enableDnsRebindingProtection: true` with `allowedHosts` of `127.0.0.1:<port>` and
+  `localhost:<port>`: a name that resolves to loopback cannot be used to reach it.
+- Request bodies are capped at 16 MiB and read by the daemon itself, so an oversized body
+  is a 413 and the socket is dropped rather than buffered. `file_upload` sends paths, not
+  bytes, so nothing legitimate comes near the cap.
+- A session id the daemon does not know is a 404 and nothing else: no session is created
+  and nothing is leaked about which ids exist.
 
 ## Installer
 
-`node bin/install.js [--browser edge|chrome] [--chrome-too] [--dry-run] [--uninstall]`
+```
+node bin/install.js [--browser edge|chrome] [--chrome-too] [--stdio]
+                    [--rotate-token] [--dry-run] [--uninstall]
+```
 
 1. Write `~/Library/Application Support/BrowserBridge/native-host` (mode 0700), a
    two-line `#!/bin/sh` launcher that `exec`s the absolute path of the node that ran
@@ -510,19 +606,86 @@ fetched by frame id).
 2. Write `~/Library/Application Support/Microsoft Edge/NativeMessagingHosts/com.keep.browser_bridge.json`
    (`allowed_origins` = the fixed extension origin), and the Chrome equivalent when
    asked.
-3. Register the MCP server as `browser` in every Claude config directory found
-   (`~/.claude`, `~/.claude-secondary`, `~/.claude-tertiary`, and any `~/.claude-*`
-   that has a `.claude.json`) by running
-   `CLAUDE_CONFIG_DIR=<dir> claude mcp add --scope user browser -- <node> <abs path>/mcp/server.js`
-   (the default dir's global config is `~/.claude.json`; `claude mcp add` handles that
-   when `CLAUDE_CONFIG_DIR` is unset). Do not edit `.claude.json` files directly: live
-   sessions rewrite them. For Codex, run `CODEX_HOME=<home> codex mcp add browser -- <node> <path>`
-   for `~/.codex` and `~/.codex-secondary`. If either CLI is missing or refuses, print
-   the exact config block to add by hand and continue.
-4. Print the extension directory to load via `edge://extensions` (Developer mode, Load
+3. Write `daemon.json` (mode 0600) with the port and a fresh 32-byte hex token **if it is
+   not already there**. An existing token is never rotated: it is in every registration
+   already, and rotating it under a running session would take that session's browser away
+   for no reason. `--rotate-token` is the way to do it deliberately.
+4. Write `~/Library/LaunchAgents/com.keep.browser_bridge.daemon.plist` (the same node the
+   native-host launcher uses, `mcp/daemon.js`, RunAtLoad, KeepAlive, ThrottleInterval 5,
+   WorkingDirectory the bridge directory, both output paths `BrowserBridge/daemon.log`),
+   then `launchctl bootout gui/<uid>/<label>` (failure ignored — the normal case is that
+   launchd has never heard of it) and `launchctl bootstrap gui/<uid> <plist>`.
+5. Register `browser` as an HTTP MCP server pointing at `http://127.0.0.1:<port>/mcp` with
+   `bin/headers.js` as the headers helper, in every Claude config directory found
+   (`~/.claude`, `~/.claude-secondary`, `~/.claude-tertiary`, and any `~/.claude-*` that
+   has a `.claude.json`) and in `~/.codex` and `~/.codex-secondary`:
+
+   ```json
+   "browser": { "type": "http", "url": "http://127.0.0.1:47331/mcp",
+                "headersHelper": "<node> <bridge>/bin/headers.js" }
+   ```
+
+   ```toml
+   [mcp_servers.browser]
+   url = "http://127.0.0.1:47331/mcp"
+   http_headers_helper = "<node> <bridge>/bin/headers.js"
+   startup_timeout_sec = 20.0
+   tool_timeout_sec = 120.0
+   ```
+
+   What each client does with that helper, read out of the installed binaries rather than
+   guessed (Claude Code 2.1.277, codex-cli 0.154.0):
+
+   - Both run it **through a shell** (Codex `sh -c`, Claude Code `shell: true`) with the
+     session's **whole ambient environment**, which is what lets
+     `BROWSER_BRIDGE_SESSION_NAME` reach a daemon that has none. Claude Code adds
+     `CLAUDE_CODE_MCP_SERVER_NAME` and `CLAUDE_CODE_MCP_SERVER_URL`.
+   - Both allow it 10 s and require one JSON object of string values on stdout. Codex caps
+     the output at 64 KiB and Claude Code at 1 MB; Codex refuses reserved header names
+     (`accept`, `content-type`, `origin`, ... — `authorization` is not one of them).
+   - Claude Code re-runs the helper and retries once when a tool call comes back 401 or 403,
+     which is what makes `--rotate-token` survivable: a live session picks up the new token
+     on its next call instead of needing a restart.
+   - Claude Code's entry must be **`--scope user`**. At `local` or `project` scope it treats
+     the config as repo-resident and refuses to run the helper at all without persisted
+     workspace trust ("headersHelper not run: this workspace has no persisted trust"), and
+     at `project` scope it also scrubs credential-looking variables out of the environment.
+   - Codex accepts `http_headers_helper` only on a `url` server: `command` in the table
+     forces stdio and the helper is then rejected, which is why the table is replaced whole
+     rather than added to. Its two timeouts are set because the host's own per-request
+     budget is 90 s and the socket client's is 100 s; the agent must not give up before the
+     browser does.
+
+   Neither `claude mcp add` nor `codex mcp add` has a flag for a headers helper
+   (Claude Code's are `--transport` and `--header`; Codex's are `--url` and
+   `--bearer-token-env-var`). Claude Code has `claude mcp add-json <name> <json>`, which
+   takes the whole entry, so the Claude side still goes through the CLI —
+   `CLAUDE_CONFIG_DIR=<dir> claude mcp remove --scope user browser` (failure ignored) and
+   then `... claude mcp add-json --scope user browser '<entry>'`. That matters: live
+   sessions rewrite `.claude.json`, and editing it from here would race them. Codex has no
+   equivalent, so `[mcp_servers.browser]` is written into `config.toml` directly.
+
+   The direct JSON edit is kept as the **fallback** for when `claude` is not on PATH or
+   refuses: better to register the bridge correctly than to print a block for someone to
+   paste. Both edits are surgical — every other key and table is left as it was, byte for
+   byte in the TOML — and both keep a `.bak`. An edit that would change nothing is skipped
+   entirely, so a re-run does not churn a file a live session is holding. A file that is not
+   valid JSON is reported with the block to paste and left exactly as it was.
+6. Wait up to 10 s for `GET /healthz` to answer and report the port, the pid and the
+   session count, or say the daemon never came up and where its log is (and exit 1).
+7. Print the extension directory to load via `edge://extensions` (Developer mode, Load
    unpacked) and the extension id the manifest key fixes.
 
-`--uninstall` removes the manifests and runs the matching `mcp remove` commands.
+`--stdio` is the old shape exactly: no `daemon.json`, no launchd job, and `browser`
+registered through `claude mcp add` / `codex mcp add` as one stdio process per session.
+
+`--uninstall` removes the launcher, both browsers' manifests and the plist, boots the job
+out, and takes `browser` out of every config. `daemon.json` stays: sessions that are still
+running hold that token in their registration, and a reinstall must not lock them out.
+
+**The daemon runs this checkout's files.** After every landing the job has to be reloaded,
+and `node bin/install.js` is what reloads it. Nothing else does — not a `git pull`, not a
+session restart.
 
 ## Fixed extension id
 
@@ -562,8 +725,20 @@ needs no private key. The id is a constant in `host/protocol.js` and the install
   every drawing call and feeds the real `gifenc` synthetic pixels, so the bytes the
   download test inspects are a real GIF.
 - `test/client.test.js`: reconnect and hello replay against a scripted socket server.
-- `test/install.test.js`: `--dry-run` output and manifest contents against a temp
-  HOME.
+- `test/daemon.test.js`: a daemon on port 0 against a fake host socket, driven by the SDK's
+  own HTTP client so the handshake and the SSE framing are real: the session header becomes
+  the name in `hello`, `tools/list` is the whole contract, a call is forwarded and answered,
+  a second initialize is a second session with a second socket client, a missing or wrong
+  token is 401, any `Origin` is 403, a foreign `Host` is refused, an unknown session id is
+  the SDK's 404, DELETE closes the socket client, idle expiry runs on a fake clock, and a
+  child daemon killed with SIGTERM says `bye` before it exits.
+- `test/headers.test.js`: the helper with and without `daemon.json` and with and without
+  each environment variable, plus the process itself — one JSON line, nothing on stderr,
+  exit 0 either way.
+- `test/install.test.js`: `--dry-run` output, the manifest, the plist, `daemon.json`
+  creation without rotation, both config edits as pure functions, and a real run against a
+  temp HOME with a fake command runner and a fake health probe (nothing reaches launchd,
+  the real CLIs or the network).
 
 Live verification against Edge is done from the driving session, not by the
 implementer.
@@ -572,7 +747,9 @@ implementer.
 
 `keep open` sets `BROWSER_BRIDGE_SESSION_NAME` in the pane environment to `#<num> <card>`
 (either half alone when only one exists), so a session's tab group reads `#12 fix-login`.
-An explicit value in the launch environment wins.
+An explicit value in the launch environment wins. Nothing there changed for the daemon:
+the agent runs `bin/headers.js` in the session's own environment, so that variable reaches
+the daemon as `X-Browser-Bridge-Session` instead of being read by a child process.
 
 ## Known gaps
 
@@ -583,15 +760,23 @@ An explicit value in the launch environment wins.
   main frame, so a drop zone inside a cross-origin iframe cannot be targeted.
 - A window resized mid-recording makes later frames a different size; they are scaled into
   the first frame's canvas rather than letterboxed.
-- One MCP server process per agent session: every Claude and Codex session spawns one at
-  startup whether or not it touches the browser (35 processes, 828 MB resident on
-  2026-09-18). The planned fix is one shared streamable-HTTP daemon on loopback, with the
-  session name carried in a header (Claude Code `headersHelper`, Codex `env_http_headers`).
+- An agent that exits without sending `DELETE /mcp` leaves its session open in the daemon
+  until the 24-hour idle sweep, so the popup and `browser_status` can list sessions whose
+  agent is gone. A stdio server could not do that: the pipe closing *was* the signal. There
+  is no equivalent signal over HTTP, and a shorter idle timeout would evict a session that
+  is simply not using the browser at the moment. The cost is a stale row and an idle socket;
+  when that agent comes back it initializes again and gets a new `sessionKey`, so it gets a
+  new tab group rather than the one it left.
 
 ## Security notes
 
 - The socket is 0600 inside a 0700 directory; anything running as this user can drive
-  the browser, which is the same trust boundary as the Claude in Chrome native host.
+  the browser, which is the same trust boundary as the Claude in Chrome native host. The
+  daemon does not widen it: its token lives in a 0600 file in the same directory, so a
+  process that can read the token could have opened the socket instead. See the daemon's
+  own security notes above for what keeps the loopback port from being a *second*,
+  weaker way in — the Bearer token, the flat refusal of any `Origin`, DNS-rebinding
+  protection and no CORS headers ever.
 - The host only serves the extension origin it was launched for; the extension only
   accepts commands from its native port. Page content (text, console, network bodies,
   accessibility names) is untrusted input and the MCP instructions say so.

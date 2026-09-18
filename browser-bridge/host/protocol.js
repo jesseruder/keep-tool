@@ -3,12 +3,15 @@
 // Pure Node: no `chrome` global, no side effects on import, so the tests can load it.
 
 import { createHash } from "node:crypto";
+import fs from "node:fs";
 import { endianness, homedir } from "node:os";
 import path from "node:path";
 
 // --- identity -------------------------------------------------------------
 
 export const HOST_NAME = "com.keep.browser_bridge";
+/** The launchd job that keeps the shared MCP daemon alive. */
+export const DAEMON_LABEL = "com.keep.browser_bridge.daemon";
 
 // Pinned by the "key" field in extension/manifest.json (see bin/gen-key.js). The
 // native messaging manifest has to name this origin before the extension is ever
@@ -337,4 +340,48 @@ export function configPath(env = process.env) {
 
 export function launcherPath(env = process.env) {
   return path.join(runtimeDir(env), "native-host");
+}
+
+// --- the shared MCP daemon ------------------------------------------------
+
+/**
+ * Loopback port for the streamable-HTTP MCP daemon. Nothing registers it with IANA;
+ * it only has to be a port nothing else on this machine wants. The installer writes it
+ * into daemon.json, and that file is what everything reads, so changing the constant
+ * only affects a fresh install.
+ */
+export const DEFAULT_DAEMON_PORT = 47331;
+
+export function daemonConfigPath(env = process.env) {
+  return path.join(runtimeDir(env), "daemon.json");
+}
+
+export function daemonLogPath(env = process.env) {
+  return path.join(runtimeDir(env), "daemon.log");
+}
+
+/**
+ * `{port, token}` from daemon.json, or null when it is missing or unreadable. A missing
+ * file is the normal state before the installer has ever run, and neither the daemon nor
+ * the headers helper may treat it as a crash: a session must start either way.
+ */
+export function readDaemonConfig(env = process.env) {
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(daemonConfigPath(env), "utf8"));
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const token = typeof parsed.token === "string" && parsed.token.length > 0 ? parsed.token : null;
+  if (!token) return null;
+  // Port 0 means "any free port"; the tests use it, and the daemon reports what it got.
+  const port = Number.isInteger(parsed.port) && parsed.port >= 0 && parsed.port <= 65535
+    ? parsed.port
+    : DEFAULT_DAEMON_PORT;
+  return { port, token };
+}
+
+export function daemonUrl(port) {
+  return `http://127.0.0.1:${port}/mcp`;
 }

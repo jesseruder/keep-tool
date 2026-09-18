@@ -1,8 +1,8 @@
 # Browser Bridge
 
-One Edge extension, one native messaging host, and one stdio MCP server per agent
-session, so every Claude Code and Codex session on this machine can drive the same
-browser at the same time — whatever account it runs on.
+One Edge extension, one native messaging host, and one shared MCP daemon, so every Claude
+Code and Codex session on this machine can drive the same browser at the same time —
+whatever account it runs on, and without a process per session.
 
 `docs/DESIGN.md` explains why it exists and how it is put together.
 `docs/claude-in-chrome-tools.txt` is the tool contract it mirrors.
@@ -12,8 +12,10 @@ Edge ── extension (MV3, chrome.debugger/CDP)
           │ native messaging
      native host  host/native-host.js          broker, one per extension connection
           │ unix socket ~/Library/Application Support/BrowserBridge/bridge.sock
+     mcp/daemon.js                             one process, launchd KeepAlive
+          │ streamable HTTP on 127.0.0.1:47331/mcp (Bearer token, loopback only)
    ┌──────┴───────┬──────────────┐
- mcp/server.js  mcp/server.js  mcp/server.js   one per agent session
+ session        session        session         one MCP session per agent session
 ```
 
 ## Install
@@ -24,7 +26,7 @@ Everything is local; nothing is published or fetched at run time.
 cd browser-bridge
 npm install
 node bin/install.js --dry-run     # read what it will do
-node bin/install.js               # write the launcher, the manifest, register `browser`
+node bin/install.js               # launcher, manifest, daemon, register `browser`
 ```
 
 The installer:
@@ -34,9 +36,26 @@ The installer:
    native hosts with an empty environment, so nothing may depend on `PATH` or nvm);
 2. writes `~/Library/Application Support/Microsoft Edge/NativeMessagingHosts/com.keep.browser_bridge.json`
    (`--chrome-too` adds Chrome's);
-3. registers the MCP server as `browser` in every Claude config directory it finds and in
-   `~/.codex` / `~/.codex-secondary`, through `claude mcp add` and `codex mcp add`. If a
-   CLI is missing or refuses, it prints the exact block to paste and carries on.
+3. writes `BrowserBridge/daemon.json` (mode 0600) with the loopback port and a random
+   32-byte token, keeping the token if one is already there (`--rotate-token` replaces it);
+4. writes `~/Library/LaunchAgents/com.keep.browser_bridge.daemon.plist` and reloads it with
+   `launchctl bootout` then `launchctl bootstrap`, then waits for `/healthz`;
+5. points `browser` at `http://127.0.0.1:<port>/mcp` in every Claude config directory it
+   finds and in `~/.codex` / `~/.codex-secondary`, with `bin/headers.js` as the headers
+   helper that supplies the token and the session name. Neither CLI has a *flag* for a
+   headers helper, so the Claude side goes through `claude mcp add-json` (which takes the
+   whole entry, and leaves the file to the tool that owns it) and Codex's is a surgical edit
+   of `[mcp_servers.browser]` in `config.toml`, with a `.bak` kept and everything else left
+   alone. If `claude` is not on PATH the installer edits `mcpServers.browser` itself.
+
+Sessions that were already running keep the registration they started with; restart them.
+
+`node bin/install.js --stdio` goes back to the old shape — one `mcp/server.js` process per
+session, no daemon — if that is ever wanted.
+
+**After a landing, re-run `node bin/install.js`.** The launchd job runs this checkout's
+`mcp/daemon.js`, so nothing else picks up a code change: not a pull, not a session restart.
+The same command is the way to restart the daemon by hand.
 
 Then load the extension:
 
@@ -46,12 +65,13 @@ Then load the extension:
 3. Click the extension's icon: the popup should say **connected**, and list sessions as
    they attach.
 
-`node bin/install.js --uninstall` removes both browsers' manifests and unregisters the
-MCP servers.
+`node bin/install.js --uninstall` removes both browsers' manifests, boots the launchd job
+out and unregisters `browser` everywhere. `daemon.json` stays, so sessions that are still
+running are not locked out by a reinstall.
 
-Re-running the installer after moving the checkout is required: the launcher and the
-manifests hold absolute paths. A re-run unregisters `browser` before registering it
-again, so the new path replaces the old one instead of being refused as a duplicate.
+Re-running the installer after moving the checkout is required: the launcher, the plist and
+the headers helper all hold absolute paths. A re-run replaces each registration in place,
+so the new path takes over instead of being refused as a duplicate.
 
 ### Trying it in a throwaway Edge
 
@@ -114,9 +134,11 @@ Worth knowing:
 
 | Variable | Effect |
 | --- | --- |
-| `BROWSER_BRIDGE_SESSION_NAME` | Names the session and its tab group. Otherwise `<account or agent> #<pid>`. |
-| `BROWSER_BRIDGE_NEW_WINDOW=1` | `tabs_context_mcp{createIfEmpty}` opens a new window instead of using the last focused one. |
-| `BROWSER_BRIDGE_RUNTIME_DIR` | Moves the socket, log, screenshots and config (the tests use this). |
+| `BROWSER_BRIDGE_SESSION_NAME` | Names the session and its tab group. Read in the **session's** environment by `bin/headers.js`, which sends it as `X-Browser-Bridge-Session`. Without it, the daemon names the session after the client that connected (`claude-code #3`). |
+| `KEEP_AGENT_ACCOUNT_ID`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME` | Also read by `bin/headers.js`, for the account and agent labels the popup and `browser_status` show. |
+| `BROWSER_BRIDGE_NEW_WINDOW=1` | `tabs_context_mcp{createIfEmpty}` opens a new window instead of using the last focused one. Read by the **daemon**, so it applies to every session; set it in the plist, not in a shell. |
+| `BROWSER_BRIDGE_RUNTIME_DIR` | Moves the socket, logs, `daemon.json`, screenshots and config (the tests use this). |
+| `BROWSER_BRIDGE_DAEMON_PORT` | Overrides the port in `daemon.json` (0 picks a free one). |
 
 `~/Library/Application Support/BrowserBridge/config.json`:
 
@@ -128,6 +150,12 @@ Worth knowing:
 
 ## Troubleshooting
 
+- **The `browser` tools are missing from a session entirely** — the daemon is down or the
+  registration is stale. `curl -s http://127.0.0.1:47331/healthz` says whether the daemon
+  is up and how many sessions it holds; `node bin/install.js` fixes both.
+- **The daemon will not stay up** — `~/Library/Application Support/BrowserBridge/daemon.log`
+  has one line per session plus the reason it exited. `launchctl print gui/$UID/com.keep.browser_bridge.daemon`
+  shows what launchd thinks. A port already in use is an exit 1 with the reason.
 - **"Browser Bridge is not connected"** — Edge is closed, the extension is disabled, or
   the installer has not run. Open the popup and press Reconnect.
 - **The popup says disconnected** — look at `~/Library/Application Support/BrowserBridge/host.log`.

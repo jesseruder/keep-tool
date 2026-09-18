@@ -2,7 +2,7 @@
   "name": "browser-bridge",
   "version": "0.1.0",
   "private": true,
-  "description": "Account-agnostic browser control for Claude Code and Codex: one Edge extension, one native host broker, one stdio MCP server per session.",
+  "description": "Account-agnostic browser control for Claude Code and Codex: one Edge extension, one native host broker, one shared MCP daemon on loopback.",
   "type": "module",
   "engines": {
     "node": ">=22"
@@ -10,6 +10,7 @@
   "scripts": {
     "test": "node --test test/*.test.js",
     "install-bridge": "node bin/install.js",
+    "daemon": "node mcp/daemon.js",
     "icons": "node bin/make-icons.js"
   },
   "dependencies": {

@@ -1,22 +1,43 @@
 #!/usr/bin/env node
-// Registers the native messaging host with Edge (and Chrome on request) and the MCP
-// server with every Claude config directory and Codex home on this machine.
+// Registers the native messaging host with Edge (and Chrome on request), keeps the shared
+// MCP daemon alive through launchd, and points every Claude config directory and Codex
+// home on this machine at it over loopback HTTP.
 //
-//   node bin/install.js [--browser edge|chrome] [--chrome-too] [--dry-run] [--uninstall]
+//   node bin/install.js [--browser edge|chrome] [--chrome-too] [--stdio]
+//                       [--rotate-token] [--dry-run] [--uninstall]
 //
-// Nothing here is clever on purpose: --dry-run prints every file it would write and
-// every command it would run, so the whole thing can be read before it touches a
-// browser profile.
+// Nothing here is clever on purpose: --dry-run prints every file it would write, every
+// config edit it would make and every command it would run, so the whole thing can be
+// read before it touches a browser profile.
+//
+// The launchd job runs *this checkout's* mcp/daemon.js, so a landing does not reach
+// sessions until the daemon has been reloaded. Re-running the installer is what does it.
 
 import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { EXTENSION_ID, EXTENSION_ORIGIN, HOST_NAME, launcherPath, runtimeDir } from "../host/protocol.js";
+import {
+  DAEMON_LABEL,
+  DEFAULT_DAEMON_PORT,
+  EXTENSION_ID,
+  EXTENSION_ORIGIN,
+  HOST_NAME,
+  daemonConfigPath,
+  daemonLogPath,
+  daemonUrl,
+  launcherPath,
+  readDaemonConfig,
+  runtimeDir,
+} from "../host/protocol.js";
 
 const PROJECT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CODEX_FALLBACK = "/Users/jesseruder/.local/bin/codex";
+const LAUNCHCTL = "/bin/launchctl";
+/** How long `launchctl bootstrap` gets to bring the daemon up before we complain. */
+const HEALTH_TIMEOUT_MS = 10_000;
 
 const BROWSER_DIRS = {
   edge: ["Library", "Application Support", "Microsoft Edge", "NativeMessagingHosts"],
@@ -24,11 +45,19 @@ const BROWSER_DIRS = {
 };
 
 export function parseArgs(argv) {
-  const options = { browsers: ["edge"], dryRun: false, uninstall: false };
+  const options = {
+    browsers: ["edge"],
+    dryRun: false,
+    uninstall: false,
+    stdio: false,
+    rotateToken: false,
+  };
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index];
     if (arg === "--dry-run") options.dryRun = true;
     else if (arg === "--uninstall") options.uninstall = true;
+    else if (arg === "--stdio") options.stdio = true;
+    else if (arg === "--rotate-token") options.rotateToken = true;
     else if (arg === "--chrome-too") options.browsers = ["edge", "chrome"];
     else if (arg === "--browser") {
       const value = argv[++index];
@@ -59,12 +88,92 @@ export function shellQuote(value) {
   return `'${String(value).replaceAll("'", `'\\''`)}'`;
 }
 
+/**
+ * A command line for a config field rather than for a shell script. Both clients run the
+ * helper through a shell (Codex `sh -c`, Claude Code `shell: true`), so quoting a path
+ * that has a space in it works; a path that needs no quoting gets none, which also keeps
+ * it correct for any client that splits on whitespace instead.
+ */
+export function commandLine(...parts) {
+  return parts.map((part) => (/^[\w@%+=:,./-]+$/.test(part) ? part : shellQuote(part))).join(" ");
+}
+
 export function launcherScript(nodePath, projectDir = PROJECT_DIR) {
   // Edge launches native hosts with a minimal environment: no PATH, no nvm shims, so
   // both paths are absolute and there is nothing to resolve at run time. They are also
   // quoted: a checkout under a path with a space would otherwise become two arguments.
   const script = path.join(projectDir, "host", "native-host.js");
   return `#!/bin/sh\nexec ${shellQuote(nodePath)} ${shellQuote(script)} "$@"\n`;
+}
+
+// --- the shared daemon ----------------------------------------------------
+
+/**
+ * The port and token the daemon and every agent share. An existing token is kept: it is
+ * already in every registered config, and rotating it under a running session would
+ * break that session's browser access for no reason. `--rotate-token` is the way out.
+ */
+export function daemonSettings(options, env = process.env) {
+  const existing = readDaemonConfig(env);
+  if (existing && !options.rotateToken) return { ...existing, fresh: false };
+  return {
+    port: existing?.port ?? DEFAULT_DAEMON_PORT,
+    token: randomBytes(32).toString("hex"),
+    fresh: true,
+  };
+}
+
+export function daemonPlistPath(env = process.env) {
+  return path.join(env.HOME, "Library", "LaunchAgents", `${DAEMON_LABEL}.plist`);
+}
+
+function plistString(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+/**
+ * A launchd agent, not a login item: RunAtLoad brings it up with the user session and
+ * KeepAlive brings it back after a crash, an `npm install` or a landing that changed the
+ * code out from under it. ThrottleInterval keeps a daemon that cannot bind its port from
+ * spinning. stdout and stderr both go to daemon.log; the daemon logs one line per
+ * session and never logs a tool's arguments.
+ */
+export function daemonPlist(nodePath, env = process.env, projectDir = PROJECT_DIR) {
+  const log = daemonLogPath(env);
+  const entries = [
+    ["Label", DAEMON_LABEL],
+    ["ProgramArguments", [nodePath, path.join(projectDir, "mcp", "daemon.js")]],
+    ["RunAtLoad", true],
+    ["KeepAlive", true],
+    ["ThrottleInterval", 5],
+    ["WorkingDirectory", projectDir],
+    ["StandardOutPath", log],
+    ["StandardErrorPath", log],
+  ];
+  const body = entries
+    .map(([key, value]) => {
+      let rendered;
+      if (typeof value === "boolean") rendered = `  <${value}/>`;
+      else if (typeof value === "number") rendered = `  <integer>${value}</integer>`;
+      else if (Array.isArray(value)) {
+        rendered = ["  <array>", ...value.map((item) => `    <string>${plistString(item)}</string>`), "  </array>"].join(
+          "\n",
+        );
+      } else rendered = `  <string>${plistString(value)}</string>`;
+      return `  <key>${key}</key>\n${rendered}`;
+    })
+    .join("\n");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+${body}
+</dict>
+</plist>
+`;
 }
 
 function which(command) {
@@ -101,18 +210,180 @@ export function codexHomes(env = process.env) {
   );
 }
 
+// --- editing the agents' own config files ---------------------------------
+//
+// `claude mcp add` and `codex mcp add` can register an HTTP server but neither has a flag
+// for the headers helper, so the helper is written into the config file directly. Both
+// edits are surgical: the Claude one replaces `mcpServers.browser` and keeps every other
+// key (that file also holds project history and onboarding state), and the Codex one
+// replaces the `[mcp_servers.browser]` table and leaves the rest of the TOML byte for
+// byte. Both write a `.bak` first. A live session that rewrites its config after this
+// runs would drop the entry, which is why the installer reports what it wrote and
+// re-running it is cheap.
+
+/**
+ * The direct edit of a Claude config, used only when `claude mcp add-json` cannot be run
+ * or refuses. `entry` null means remove.
+ */
+export function claudeEdit(label, dir, env, entry) {
+  const file = claudeConfigFile(dir, env);
+  return {
+    label,
+    path: file,
+    createIfMissing: entry !== null,
+    initial: "{}\n",
+    mode: 0o600,
+    describe: entry ? `set mcpServers.browser to ${JSON.stringify(entry)}` : "remove mcpServers.browser",
+    apply: (text) => (entry ? withClaudeServer(text, entry) : withoutClaudeServer(text)),
+    fallback: entry ? claudeFallback(entry, dir, env) : null,
+  };
+}
+
+/** The default config directory keeps its global config at ~/.claude.json. */
+export function claudeConfigFile(dir, env = process.env) {
+  return dir === path.join(env.HOME, ".claude")
+    ? path.join(env.HOME, ".claude.json")
+    : path.join(dir, ".claude.json");
+}
+
+/**
+ * The field names are the installed clients', not a guess: `headersHelper` on an http MCP
+ * server entry for Claude Code, `http_headers_helper` on a `url` server for Codex. Both
+ * take one command-line string and expect one JSON object of headers on its stdout, which
+ * is what `bin/headers.js` prints.
+ *
+ * Codex (codex-cli 0.154.0) runs it through `sh -c`, gives it 10 s, caps the output at
+ * 64 KiB and refuses a reserved header name (`accept`, `content-type`, `origin`, ... -
+ * `authorization` is allowed), refuses an empty string, and accepts it only on a url
+ * server with no `environment_id`. Neither CLI has a flag for it, so both are written into
+ * the config file.
+ */
+export const CLAUDE_HELPER_FIELD = "headersHelper";
+export const CODEX_HELPER_FIELD = "http_headers_helper";
+export const CODEX_TABLE = "mcp_servers.browser";
+
+export function claudeHttpEntry(url, helperCommand) {
+  return { type: "http", url, [CLAUDE_HELPER_FIELD]: helperCommand };
+}
+
+export function claudeStdioEntry(nodePath, serverPath) {
+  return { type: "stdio", command: nodePath, args: [serverPath] };
+}
+
+/**
+ * `url` makes it a streamable_http server, which is what `http_headers_helper` requires
+ * (`http_headers_helper is not supported for stdio`), so the old `command`/`args` keys have
+ * to go - which the table replacement does. The two timeouts are generous on purpose: the
+ * host's own per-request budget is 90 s and the socket client's is 100 s, so a slow
+ * navigate must not be cut off by the agent first.
+ */
+export function codexHttpTable(url, helperCommand) {
+  return codexTable(CODEX_TABLE, {
+    url,
+    [CODEX_HELPER_FIELD]: helperCommand,
+    startup_timeout_sec: 20,
+    tool_timeout_sec: 120,
+  });
+}
+
+export function codexStdioTable(nodePath, serverPath) {
+  return codexTable(CODEX_TABLE, { command: nodePath, args: [serverPath] });
+}
+
+/** Returns the new file text, or null when nothing has to change. */
+export function withClaudeServer(text, entry) {
+  const config = text.trim() ? JSON.parse(text) : {};
+  const servers = config.mcpServers ?? {};
+  if (JSON.stringify(servers.browser) === JSON.stringify(entry)) return null;
+  config.mcpServers = { ...servers, browser: entry };
+  return `${JSON.stringify(config, null, 2)}\n`;
+}
+
+export function withoutClaudeServer(text) {
+  const config = text.trim() ? JSON.parse(text) : {};
+  if (!config.mcpServers || config.mcpServers.browser === undefined) return null;
+  const servers = { ...config.mcpServers };
+  delete servers.browser;
+  config.mcpServers = servers;
+  return `${JSON.stringify(config, null, 2)}\n`;
+}
+
+function tomlValue(value) {
+  if (Array.isArray(value)) return `[${value.map(tomlValue).join(", ")}]`;
+  if (typeof value === "boolean") return String(value);
+  // The only numbers this file writes are Codex's timeouts, which are seconds as a float.
+  // TOML tells an integer from a float, so `20` and `20.0` are not the same token there.
+  if (typeof value === "number") return Number.isInteger(value) ? value.toFixed(1) : String(value);
+  return JSON.stringify(String(value));
+}
+
+export function codexTable(name, fields) {
+  const lines = [`[${name}]`];
+  for (const [key, value] of Object.entries(fields)) {
+    if (value === undefined || value === null) continue;
+    lines.push(`${key} = ${tomlValue(value)}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+/**
+ * Splice one table into a TOML file, replacing it if it is already there. The table's own
+ * lines are the only ones touched: a TOML table runs until the next line that opens
+ * another table, so the boundaries are found by reading, not by parsing the whole file.
+ */
+export function withTomlTable(text, name, table) {
+  const header = `[${name}]`;
+  const lines = text.split("\n");
+  const start = lines.findIndex((line) => line.trim() === header);
+  if (start === -1) {
+    const padded = text === "" || text.endsWith("\n\n") ? text : text.endsWith("\n") ? `${text}\n` : `${text}\n\n`;
+    const next = `${padded}${table}`;
+    return next === text ? null : next;
+  }
+  let end = start + 1;
+  while (end < lines.length && !/^\s*\[/.test(lines[end])) end++;
+  // The blank lines before whatever comes next (or the file's trailing newline) are not
+  // part of this table. Leaving them where they are is what makes a second run a no-op.
+  while (end > start + 1 && lines[end - 1].trim() === "") end--;
+  const replacement = [...lines.slice(0, start), ...table.replace(/\n$/, "").split("\n"), ...lines.slice(end)];
+  const next = replacement.join("\n");
+  return next === text ? null : next;
+}
+
+/** Drop a table, header and body, leaving the rest of the file alone. */
+export function withoutTomlTable(text, name) {
+  const header = `[${name}]`;
+  const lines = text.split("\n");
+  const start = lines.findIndex((line) => line.trim() === header);
+  if (start === -1) return null;
+  let end = start + 1;
+  while (end < lines.length && !/^\s*\[/.test(lines[end])) end++;
+  // Swallow the blank line the table used to be separated by, not the next table's.
+  while (end < lines.length && lines[end].trim() === "") end++;
+  return [...lines.slice(0, start), ...lines.slice(end)].join("\n");
+}
+
 export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) {
   const nodePath = process.execPath;
   const serverPath = path.join(projectDir, "mcp", "server.js");
+  const daemonPath = path.join(projectDir, "mcp", "daemon.js");
+  const helperCommand = commandLine(nodePath, path.join(projectDir, "bin", "headers.js"));
   const files = [];
   const removals = [];
   const commands = [];
+  const edits = [];
+  // --stdio is the old shape exactly: a process per session, no daemon, no launchd job.
+  const daemon = options.uninstall || options.stdio ? null : daemonSettings(options, env);
+  const url = daemon ? daemonUrl(daemon.port) : null;
 
   if (options.uninstall) {
     removals.push(launcherPath(env));
     // Always both browsers: an install that once used --chrome-too must not leave
     // Chrome pointing at a launcher this run is deleting.
     for (const browser of Object.keys(BROWSER_DIRS)) removals.push(hostManifestPath(browser, env));
+    // daemon.json stays: it holds the token, and a reinstall must not invalidate the
+    // registrations of sessions that are still running.
+    removals.push(daemonPlistPath(env));
   } else {
     files.push({
       path: launcherPath(env),
@@ -128,65 +399,133 @@ export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) 
     }
   }
 
-  const claudeBin = which("claude");
-  for (const { dir, useEnv } of claudeConfigDirs(env)) {
-    // A session started under another config dir inherits CLAUDE_CONFIG_DIR, and the
-    // default registration would land there instead of in ~/.claude.json.
-    const commandEnv = useEnv ? { CLAUDE_CONFIG_DIR: dir } : { CLAUDE_CONFIG_DIR: null };
-    const remove = {
-      label: `claude (${path.basename(dir)})`,
-      bin: claudeBin,
-      name: "claude",
-      args: ["mcp", "remove", "--scope", "user", "browser"],
-      env: commandEnv,
-      fallback: claudeFallback(nodePath, serverPath, dir),
-    };
-    // `mcp add` refuses to overwrite, so reinstalling after a move would keep the old
-    // path. Remove first and ignore the failure when there was nothing registered.
-    commands.push(options.uninstall ? remove : { ...remove, optional: true });
+  if (daemon) {
+    if (daemon.fresh) {
+      files.push({
+        path: daemonConfigPath(env),
+        content: `${JSON.stringify({ port: daemon.port, token: daemon.token }, null, 2)}\n`,
+        mode: 0o600,
+        // The token is the only secret this project has; a dry run must not print it,
+        // and neither must the terminal scrollback of a real run.
+        display: `{ "port": ${daemon.port}, "token": "<32 fresh random bytes, hex>" }`,
+      });
+    }
+    files.push({
+      path: daemonPlistPath(env),
+      content: daemonPlist(nodePath, env, projectDir),
+      mode: 0o644,
+    });
+  }
+
+  if (options.uninstall || daemon) {
+    const uid = typeof process.getuid === "function" ? process.getuid() : 501;
+    const plist = daemonPlistPath(env);
+    // bootout first: launchd refuses to bootstrap a label it already knows, and the
+    // failure when it does not know it yet is the normal case.
+    commands.push({
+      label: "launchctl bootout",
+      bin: LAUNCHCTL,
+      name: "launchctl",
+      args: ["bootout", `gui/${uid}/${DAEMON_LABEL}`],
+      env: {},
+      optional: true,
+      fallback: `Run: launchctl bootout gui/${uid}/${DAEMON_LABEL}`,
+    });
     if (!options.uninstall) {
       commands.push({
-        ...remove,
-        args: ["mcp", "add", "--scope", "user", "browser", "--", nodePath, serverPath],
+        label: "launchctl bootstrap",
+        bin: LAUNCHCTL,
+        name: "launchctl",
+        args: ["bootstrap", `gui/${uid}`, plist],
+        env: {},
         optional: false,
+        fallback: `Run: launchctl bootstrap gui/${uid} ${plist}`,
       });
     }
   }
 
-  const codexBin = which("codex") ?? (fs.existsSync(CODEX_FALLBACK) ? CODEX_FALLBACK : null);
-  for (const home of codexHomes(env)) {
+  const claudeBin = which("claude");
+  for (const { dir, useEnv } of claudeConfigDirs(env)) {
+    const label = `claude (${path.basename(dir)})`;
+    // A session started under another config dir inherits CLAUDE_CONFIG_DIR, and the
+    // default registration would land there instead of in ~/.claude.json.
+    const commandEnv = useEnv ? { CLAUDE_CONFIG_DIR: dir } : { CLAUDE_CONFIG_DIR: null };
+    const entry = options.stdio
+      ? claudeStdioEntry(nodePath, serverPath)
+      : claudeHttpEntry(url, helperCommand);
+    // Only used when the CLI is missing or refuses; see claudeEdit's comment.
+    const edit = claudeEdit(label, dir, env, options.uninstall ? null : entry);
     const remove = {
-      label: `codex (${path.basename(home)})`,
-      bin: codexBin,
-      name: "codex",
-      args: ["mcp", "remove", "browser"],
-      env: { CODEX_HOME: home },
-      fallback: codexFallback(nodePath, serverPath, home),
+      label,
+      bin: claudeBin,
+      name: "claude",
+      args: ["mcp", "remove", "--scope", "user", "browser"],
+      env: commandEnv,
+      fallback: claudeFallback(entry, dir, env),
     };
-    commands.push(options.uninstall ? remove : { ...remove, optional: true });
-    if (!options.uninstall) {
+    // `mcp add` refuses to overwrite, so reinstalling after a move would keep the old
+    // path. Remove first and ignore the failure when there was nothing registered.
+    if (options.uninstall) {
+      commands.push({ ...remove, orEdit: edit });
+      continue;
+    }
+    commands.push({ ...remove, optional: true });
+    commands.push({
+      ...remove,
+      // `mcp add` has no flag for headersHelper (only --transport and --header), but
+      // `mcp add-json` takes the whole entry, so the CLI still owns the write. That
+      // matters: live sessions rewrite .claude.json, and editing it from here would race
+      // them, so the direct edit is the fallback and not the first choice.
+      args: ["mcp", "add-json", "--scope", "user", "browser", JSON.stringify(entry)],
+      optional: false,
+      orEdit: edit,
+    });
+  }
+
+  const codexBin = options.stdio ? which("codex") ?? (fs.existsSync(CODEX_FALLBACK) ? CODEX_FALLBACK : null) : null;
+  for (const home of codexHomes(env)) {
+    const label = `codex (${path.basename(home)})`;
+    if (options.stdio) {
+      const remove = {
+        label,
+        bin: codexBin,
+        name: "codex",
+        args: ["mcp", "remove", "browser"],
+        env: { CODEX_HOME: home },
+        fallback: codexFallback(codexStdioTable(nodePath, serverPath), home),
+      };
+      commands.push({ ...remove, optional: true });
       commands.push({
         ...remove,
         args: ["mcp", "add", "browser", "--", nodePath, serverPath],
         optional: false,
       });
+      continue;
     }
+    const table = options.uninstall ? null : codexHttpTable(url, helperCommand);
+    edits.push({
+      label,
+      path: path.join(home, "config.toml"),
+      createIfMissing: !options.uninstall,
+      initial: "",
+      mode: 0o600,
+      describe: table ? `set [${CODEX_TABLE}] to the daemon's url` : `remove [${CODEX_TABLE}]`,
+      preview: table,
+      apply: (text) => (table ? withTomlTable(text, CODEX_TABLE, table) : withoutTomlTable(text, CODEX_TABLE)),
+      fallback: table ? codexFallback(table, home) : null,
+    });
   }
 
-  return { files, removals, commands, nodePath, serverPath };
+  return { files, removals, commands, edits, nodePath, serverPath, daemonPath, helperCommand, daemon, url };
 }
 
-function claudeFallback(nodePath, serverPath, dir) {
-  const block = JSON.stringify(
-    { mcpServers: { browser: { command: nodePath, args: [serverPath] } } },
-    null,
-    2,
-  );
-  return `Add this to ${path.join(dir, ".claude.json")} (or ~/.claude.json for the default dir):\n${block}`;
+function claudeFallback(entry, dir, env) {
+  const block = JSON.stringify({ mcpServers: { browser: entry } }, null, 2);
+  return `Add this to ${claudeConfigFile(dir, env)}:\n${block}`;
 }
 
-function codexFallback(nodePath, serverPath, home) {
-  return `Add this to ${path.join(home, "config.toml")}:\n[mcp_servers.browser]\ncommand = ${JSON.stringify(nodePath)}\nargs = [${JSON.stringify(serverPath)}]`;
+function codexFallback(table, home) {
+  return `Add this to ${path.join(home, "config.toml")}:\n${table.trimEnd()}`;
 }
 
 function describeCommand(command) {
@@ -201,13 +540,24 @@ export function renderPlan(plan, options) {
   lines.push(options.uninstall ? "# Browser Bridge uninstall" : "# Browser Bridge install");
   for (const file of plan.files) {
     lines.push(`write ${file.path} (mode ${file.mode.toString(8)})`);
-    for (const line of file.content.trimEnd().split("\n")) lines.push(`    ${line}`);
+    for (const line of (file.display ?? file.content).trimEnd().split("\n")) lines.push(`    ${line}`);
   }
   for (const target of plan.removals) lines.push(`remove ${target}`);
+  for (const edit of plan.edits ?? []) {
+    lines.push(`edit ${edit.path}: ${edit.describe}   (a .bak is kept)`);
+    for (const line of (edit.preview ?? "").trimEnd().split("\n").filter(Boolean)) lines.push(`    ${line}`);
+  }
   for (const command of plan.commands) {
     lines.push(`run  ${describeCommand(command)}${command.optional ? "   (failure ignored)" : ""}`);
-    if (!command.bin) lines.push(`     (${command.name} is not on PATH; would print the manual block)`);
+    if (!command.bin && !command.optional) {
+      lines.push(
+        command.orEdit
+          ? `     (${command.name} is not on PATH; would edit ${command.orEdit.path} instead)`
+          : `     (${command.name} is not on PATH; would print the manual block)`,
+      );
+    }
   }
+  if (plan.daemon) lines.push(`wait for ${plan.url.replace("/mcp", "/healthz")} to answer (up to 10 s)`);
   return lines.join("\n");
 }
 
@@ -227,12 +577,85 @@ function removeFile(target) {
   }
 }
 
+/**
+ * Read, transform, back up, write. `apply` returning null means the file already says
+ * what it should, and then nothing is touched at all - no rewrite, no `.bak` churn on a
+ * file a live session is also holding open.
+ */
+export function applyEdit(edit) {
+  let text;
+  let existed = true;
+  try {
+    text = fs.readFileSync(edit.path, "utf8");
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      process.stdout.write(`could not read ${edit.path}: ${error.message}\n`);
+      if (edit.fallback) process.stdout.write(`${edit.fallback}\n\n`);
+      return;
+    }
+    existed = false;
+    text = edit.initial ?? "";
+  }
+  if (!existed && !edit.createIfMissing) {
+    process.stdout.write(`${edit.path} is not there, so there is nothing to remove\n`);
+    return;
+  }
+
+  let next;
+  try {
+    next = edit.apply(text);
+  } catch (error) {
+    process.stdout.write(`${edit.label}: could not edit ${edit.path} (${error.message})\n`);
+    if (edit.fallback) process.stdout.write(`${edit.fallback}\n\n`);
+    return;
+  }
+  if (next === null) {
+    process.stdout.write(`${edit.label}: ${edit.path} already says this\n`);
+    return;
+  }
+
+  if (existed) {
+    try {
+      fs.copyFileSync(edit.path, `${edit.path}.bak`);
+    } catch (error) {
+      process.stdout.write(`could not back up ${edit.path}: ${error.message}\n`);
+      if (edit.fallback) process.stdout.write(`${edit.fallback}\n\n`);
+      return;
+    }
+  }
+  fs.mkdirSync(path.dirname(edit.path), { recursive: true });
+  fs.writeFileSync(edit.path, next, { mode: edit.mode ?? 0o600 });
+  process.stdout.write(`edited ${edit.path} (${edit.describe})\n`);
+}
+
+/** The installer's own proof that the daemon came up, and the only thing that can give it. */
+async function waitForHealth(url, timeoutMs = HEALTH_TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  for (;;) {
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(2000) });
+      if (response.ok) return await response.json();
+      last = `HTTP ${response.status}`;
+    } catch (error) {
+      last = error.message;
+    }
+    if (Date.now() >= deadline) return { ok: false, reason: last };
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+}
+
 function runCommand(command) {
   if (!command.bin) {
-    // The manual block is printed once, by the command that would have registered it.
-    if (!command.optional) {
-      process.stdout.write(`${command.name} is not installed; add it by hand:\n${command.fallback}\n\n`);
+    if (command.optional) return;
+    // An edit of our own is better than a message the user has to act on, but only as a
+    // second choice: the CLI is what other sessions expect to be writing that file.
+    if (command.orEdit) {
+      process.stdout.write(`${command.name} is not installed; editing the config directly\n`);
+      applyEdit(command.orEdit);
+      return;
     }
+    process.stdout.write(`${command.name} is not installed; add it by hand:\n${command.fallback}\n\n`);
     return;
   }
   process.stdout.write(`$ ${describeCommand(command)}\n`);
@@ -245,6 +668,11 @@ function runCommand(command) {
   if (result.status === 0) return;
   // The pre-emptive remove fails whenever nothing was registered, which is the normal case.
   if (command.optional) return;
+  if (command.orEdit) {
+    process.stdout.write(`${command.label} refused (exit ${result.status}); editing the config directly\n`);
+    applyEdit(command.orEdit);
+    return;
+  }
   process.stdout.write(
     `${command.label} refused (exit ${result.status}); add it by hand:\n${command.fallback}\n\n`,
   );
@@ -252,15 +680,29 @@ function runCommand(command) {
 
 const HELP = `Browser Bridge installer
 
-  node bin/install.js [--browser edge|chrome] [--chrome-too] [--dry-run] [--uninstall]
+  node bin/install.js [--browser edge|chrome] [--chrome-too] [--stdio]
+                      [--rotate-token] [--dry-run] [--uninstall]
 
   --browser <name>  which browser's native messaging directory to write (default: edge)
   --chrome-too      write both Edge's and Chrome's
-  --dry-run         print every file and command, change nothing
-  --uninstall       remove the manifests and unregister the MCP servers
+  --stdio           register one stdio MCP server per session instead of the daemon
+  --rotate-token    replace the daemon token (every registration is rewritten with it)
+  --dry-run         print every file, edit and command, change nothing
+  --uninstall       remove the manifests, the launchd job and the registrations
+                    (daemon.json, and so the token, is kept)
+
+Re-run it after every landing: the launchd job runs this checkout's files, so a code
+change only reaches sessions once the daemon has been restarted, which this does.
 `;
 
-export function main(argv, env = process.env) {
+/**
+ * `hooks` is how the tests get at the two things that would otherwise reach out of the
+ * process: `run` executes a planned command (launchctl, claude, codex) and `health` polls
+ * the daemon. Everything else is files, and the tests give it a temporary HOME.
+ */
+export async function main(argv, env = process.env, hooks = {}) {
+  const run = hooks.run ?? runCommand;
+  const health = hooks.health ?? waitForHealth;
   let options;
   try {
     options = parseArgs(argv);
@@ -277,29 +719,50 @@ export function main(argv, env = process.env) {
   const plan = buildPlan(options, env);
   if (options.dryRun) {
     process.stdout.write(`${renderPlan(plan, options)}\n`);
-    process.stdout.write(`\n${nextSteps(plan)}\n`);
+    if (!options.uninstall) process.stdout.write(`\n${nextSteps(plan, options)}\n`);
     return;
   }
 
   fs.mkdirSync(runtimeDir(env), { recursive: true, mode: 0o700 });
   for (const file of plan.files) writeFile(file);
   for (const target of plan.removals) removeFile(target);
-  for (const command of plan.commands) runCommand(command);
-  if (!options.uninstall) process.stdout.write(`\n${nextSteps(plan)}\n`);
+  for (const edit of plan.edits ?? []) applyEdit(edit);
+  for (const command of plan.commands) run(command);
+
+  if (plan.daemon) {
+    const status = await health(plan.url.replace("/mcp", "/healthz"));
+    if (status.ok) {
+      process.stdout.write(`daemon up on port ${status.port} (pid ${status.pid}), ${status.sessions} session(s)\n`);
+    } else {
+      process.stdout.write(
+        `the daemon did not answer /healthz within 10 s (${status.reason}); look at ${daemonLogPath(env)}\n`,
+      );
+      process.exitCode = 1;
+    }
+  }
+
+  if (!options.uninstall) process.stdout.write(`\n${nextSteps(plan, options)}\n`);
 }
 
-function nextSteps(plan) {
-  return [
+function nextSteps(plan, options = {}) {
+  const lines = [
     "Load the extension:",
     "  1. Open edge://extensions and turn on Developer mode.",
     `  2. "Load unpacked" and pick ${path.join(PROJECT_DIR, "extension")}`,
     `  3. The id must come out as ${EXTENSION_ID} (the manifest "key" pins it).`,
     "  4. Open the extension's popup: it should say connected.",
     "",
-    `MCP server: ${plan.nodePath} ${plan.serverPath}`,
-  ].join("\n");
+  ];
+  if (options.stdio || !plan.daemon) lines.push(`MCP server: ${plan.nodePath} ${plan.serverPath}`);
+  else {
+    lines.push(`MCP daemon: ${plan.nodePath} ${plan.daemonPath}`);
+    lines.push(`  url     ${plan.url}`);
+    lines.push(`  headers ${plan.helperCommand}`);
+    lines.push("  A session that was already running has the old registration; restart it.");
+  }
+  return lines.join("\n");
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main(process.argv.slice(2));
+  await main(process.argv.slice(2));
 }
