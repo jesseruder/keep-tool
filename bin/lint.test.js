@@ -1056,6 +1056,7 @@ test('step-run-pending waits a day before naming a gated step', () => {
     const behind = lint({ root, now, rule: 'step-run-pending', stepRows: () => deploy(now - 30 * 3600e3) }).findings;
     assert.equal(behind.length, 1);
     assert.match(behind[0].text, /the daemon running 0d8aaad started 30h ago/);
+    assert.match(lint({ root, now, rule: 'step-run-pending', stepRows: () => deploy(null) }).findings[0].text, /started at an unknown time/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

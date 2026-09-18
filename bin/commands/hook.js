@@ -1309,7 +1309,7 @@ function repairExecutable(tokens) {
   const mentions = tokens.filter((token, position) => position > 0
     && NODE_SCRIPTS.has(stepRegistry.commandBasename(token)));
   const reaching = tokens.some((token, position) => position > 0
-    && (token === 'restart-daemon' || token === 'service' || token === 'step'
+    && (token === 'restart-daemon' || token === 'service' || (token === 'step' && tokens[position + 1] === 'run')
       || stepRegistry.commandBasename(token) === 'serve.js'));
   const script = index === -1 ? '' : tokens[index];
   const interpreter = index === -1 ? tokens.slice(1) : tokens.slice(1, index);

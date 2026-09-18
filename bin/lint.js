@@ -861,7 +861,8 @@ function stepRunPending(_task, ctx) {
     if (!row || !row.pending || !row.pending.length || !row.git || !row.git.available) continue;
     // A daemon deploy step is behind the daemon, not its ledger: `wt land` restarts
     // without a recorded run, so the clock is how long this daemon has been running.
-    const lastAt = row.daemon ? Number(row.daemon.startedAt)
+    // (A restart on the same commit resets this clock; wt land restarts with the pull.)
+    const lastAt = row.daemon ? (row.daemon.startedAt ? Number(row.daemon.startedAt) : NaN)
       : atMs(String((row.lastDone && (row.lastDone.endedAt || row.lastDone.finalizedAt)) || '').replace(' ', 'T'));
     const age = Number.isFinite(lastAt) ? ctx.now - lastAt : Infinity;
     if (age < DAY_MS) continue;

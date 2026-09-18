@@ -487,7 +487,9 @@ async function notifyStepWaiters(registry, name, details) {
     stepRegistry.saveLedger(registry.project, name, latest);
     return latest.waiters.length;
   });
-  return { waiters: waiters.length, failures: failed.size, remaining, message };
+  // an HTTP answer is the daemon refusing; anything else is the daemon not being there
+  const unreachable = [...failed.values()].filter((waiter) => !/^HTTP \d/.test(String(waiter.lastError || ''))).length;
+  return { waiters: waiters.length, failures: failed.size, unreachable, remaining, message };
 }
 
 function describeRunOwner(run) {
@@ -560,11 +562,15 @@ async function finalizeStep(registry, name, step, options = {}) {
   });
   // A daemon deploy just restarted the daemon that delivers the notice; launchd
   // brings it back within seconds, so give the queued waiters that long.
-  for (let attempt = 0; step.since === 'daemon' && notify.failures && attempt < (options.notifyRetries ?? 10); attempt += 1) {
+  // Only an unreachable daemon is worth waiting for; a refusal will not change.
+  const total = notify.waiters;
+  for (let attempt = 0; step.since === 'daemon' && notify.unreachable && attempt < (options.notifyRetries ?? 10); attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 3e3));
-    notify = await notifyStepWaiters(registry, name, {
+    const retry = await notifyStepWaiters(registry, name, {
       outcome: 'finished', agent: by.agent, sessionId: by.sessionId, artifact, sha,
     });
+    // a retry sees only the waiters still queued; the tally is over all of them
+    notify = { ...retry, waiters: total, failures: retry.failures + Math.max(0, notify.failures - retry.waiters) };
   }
   const included = stepRegistry.commitsBetween(registry.project, prior && prior.sha, sha, step);
   const attributed = stepRegistry.attributeCommits(included.commits, loadAll(false), registry.project);

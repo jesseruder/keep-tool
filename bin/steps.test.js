@@ -1126,6 +1126,8 @@ test('the pre-bash guard keeps a self-repair run off the daemon and out of the m
     'keep steps keep-tool',
     // only the verb right after `step` counts
     'keep step claim keep-tool deploy -m run',
+    'node --test --require ./scripts/test-env.cjs --test-name-pattern step bin/steps.test.js',
+    'node scripts/foo.js step',
     'echo "keep restart-daemon"',
     'grep -rn "launchctl" bin',
     // Reading the endpoint out of the source is exactly what diagnosis looks like.
