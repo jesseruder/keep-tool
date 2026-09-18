@@ -173,7 +173,7 @@ test('a slow reconcile spends the window too, and a nonsense window falls back t
   f.add('claude');
   const health = { record: () => {} };
   // Each attempt costs 400ms of its own before the lock is even asked for, so counting
-  // the sleeps alone would run this sweep four times longer than its window allows.
+  // the sleeps alone would run this sweep to 3000ms, three times its 1000ms window.
   const slow = fakeClock(400);
   let calls = 0;
   await sweep({ ...f, health, reconcileWaitMs: 1000, reconcilePollMs: 250, clock: slow.clock, sleep: slow.sleep,
@@ -196,6 +196,16 @@ test('a slow reconcile spends the window too, and a nonsense window falls back t
 
 // The scheduler's re-entrancy guard means a sweep that never returns silences the
 // delivery row for good, so nothing the clock does may keep this loop going.
+test('a poll longer than the whole window does not overshoot it', () => fixture(async f => {
+  f.add('claude');
+  const time = fakeClock();
+  let calls = 0;
+  await sweep({ ...f, health: { record: () => {} }, reconcileWaitMs: 100, reconcilePollMs: 500,
+    clock: time.clock, sleep: time.sleep, reconcile: async () => { calls += 1; throw busy(); } });
+  assert.equal(calls, 1);
+  assert.equal(time.at, 100, 'the sleep is cut to what is left of the window');
+}));
+
 test('a clock that stops or steps backwards cannot keep the sweep running', () => fixture(async f => {
   f.add('claude');
   const health = { record: () => {} };

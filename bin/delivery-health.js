@@ -90,10 +90,13 @@ function tick(options = {}) {
 // self-repair's 30-minute threshold and opened a repair card for a message the pane
 // never kept. So contention is now waited out inside the tick, sampling across a span
 // instead of at one instant, and still well short of the next tick.
-// The window is kept to a third of the cadence: the last attempt is allowed to start
-// just inside it, and on this machine one attempt is a host pane list that can spend
-// seconds waiting on the host and seconds more in ps. That overrun has to stay clear
-// of the 60s tick and of the silence threshold health.js puts at twice the cadence.
+// The window says when a new attempt may start, not when the sweep ends: an attempt
+// begun just inside it still runs to completion, and on this machine one attempt is a
+// host pane list that can spend seconds waiting on the host and seconds more in ps.
+// A third of the cadence leaves that overrun room to land inside the 60s tick, and so
+// inside the silence threshold health.js puts at twice the cadence, on the nominal
+// timeouts those calls carry. It is margin, not a guarantee: a call that hangs past
+// its own timeout hangs the sweep, which was true of the single attempt before this.
 const RECONCILE_WAIT_MS = 20e3;
 const RECONCILE_POLL_MS = 500;
 // Only a non-negative whole number of milliseconds is a window. Anything else -
@@ -129,7 +132,9 @@ async function reconcileWithRetry(options) {
     // fresh pane list outside the window. An attempt begun inside the window may
     // still overrun, and that one is unavoidable.
     if (attempt + 1 >= maxAttempts || clock() >= deadline) return;
-    await sleep(pollMs);
+    // Never sleep past the window either, or a poll longer than the whole window
+    // would overshoot it by the difference before anything looked at the clock.
+    await sleep(Math.max(1, Math.min(pollMs, Math.ceil(deadline - clock()))));
     if (clock() >= deadline) return;
   }
 }
