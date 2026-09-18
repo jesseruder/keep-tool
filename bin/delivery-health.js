@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
+const { performance } = require('node:perf_hooks');
 const { received } = require('./delivery');
 const STALE_MS = 2 * 60e3;
 const safeId = value => /^[A-Za-z0-9_-]{1,160}$/.test(String(value || '')) ? String(value) : 'unknown';
@@ -91,28 +92,38 @@ function tick(options = {}) {
 // instead of at one instant, and still well short of the next tick.
 const RECONCILE_WAIT_MS = 30e3;
 const RECONCILE_POLL_MS = 500;
-const duration = (value, fallback) => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : fallback;
+// Only a finite, non-negative number of milliseconds is a window; anything else -
+// including null, '' and NaN, all of which coerce to a number - takes the default
+// rather than silently disabling the wait or the boundary that ends it.
+const duration = (value, fallback) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback;
 
 async function reconcileWithRetry(options) {
   if (!options.reconcile) return;
   const waitMs = duration(options.reconcileWaitMs, RECONCILE_WAIT_MS);
   const pollMs = Math.max(1, duration(options.reconcilePollMs, RECONCILE_POLL_MS));
-  const clock = options.clock || Date.now;
+  // Monotonic: a wall clock that steps backwards - an NTP correction on a machine
+  // already struggling - would hold the deadline in the future for the length of the
+  // step, and the scheduler's re-entrancy guard suppresses every tick until this
+  // returns. The attempt ceiling below ends the loop whatever the clock does.
+  const clock = options.clock || (() => performance.now());
   const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   // Spent on the clock, not counted off in sleeps: the reconcile itself lists the
   // host's panes before each attempt, and that call is slowest on exactly the loaded
   // machine this is waiting for. Summing the sleeps would let the sweep run for
   // minutes and fall past the health row's own silence threshold.
   const deadline = clock() + waitMs;
-  for (;;) {
+  const maxAttempts = Math.ceil(waitMs / pollMs) + 1;
+  for (let attempt = 0; ; attempt += 1) {
     try { return await options.reconcile(); }
-    catch (error) {
-      // Anything but contention is a real fault, and stays the caller's to record.
-      if (!error || error.status !== 429) throw error;
-      // Busy for the whole window: inspect without mutating, as before.
-      if (clock() >= deadline) return;
-    }
+    // Anything but contention is a real fault, and stays the caller's to record.
+    catch (error) { if (!error || error.status !== 429) throw error; }
+    if (attempt + 1 >= maxAttempts) return;
     await sleep(pollMs);
+    // Tested before committing to another attempt rather than only after one failed:
+    // a timer that fires late must not start a fresh pane list outside the window. An
+    // attempt begun inside it may still overrun, and that one is unavoidable.
+    // Busy for the whole window: inspect without mutating, as before.
+    if (clock() >= deadline) return;
   }
 }
 

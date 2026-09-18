@@ -152,7 +152,7 @@ test('a lock busy for the whole window still inspects without mutating, and give
   const issues = await sweep({ ...f, health: { record: (name, row) => records.push(row) },
     reconcileWaitMs: 1000, reconcilePollMs: 250, clock: time.clock, sleep: time.sleep,
     reconcile: async () => { calls += 1; throw busy(); } });
-  assert.equal(calls, 5);
+  assert.equal(calls, 4, 'no attempt is started once the window is spent');
   assert.equal(time.at, 1000, 'the wait is bounded well inside the 60s cadence');
   assert.equal(issues.length, 1, 'the journal is still reported, never deleted by the watchdog');
   assert.ok(fs.existsSync(path.join(f.directory, 'claude.json')));
@@ -187,5 +187,19 @@ test('a slow reconcile spends the window too, and a nonsense window falls back t
   await sweep({ ...f, health, reconcileWaitMs: NaN, reconcilePollMs: 'soon', clock: bad.clock, sleep: bad.sleep,
     reconcile: async () => { attempts += 1; throw busy(); } });
   assert.equal(bad.at, 30e3, 'the default 30s window is used');
-  assert.equal(attempts, 61);
+  assert.equal(attempts, 60);
+}));
+
+// The scheduler's re-entrancy guard means a sweep that never returns silences the
+// delivery row for good, so nothing the clock does may keep this loop going.
+test('a clock that stops or steps backwards cannot keep the sweep running', () => fixture(async f => {
+  f.add('claude');
+  const health = { record: () => {} };
+  for (const [name, clock] of [['frozen', () => 0], ['rewinding', (() => { let at = 0; return () => (at -= 1000); })()]]) {
+    let calls = 0;
+    const issues = await sweep({ ...f, health, reconcileWaitMs: 1000, reconcilePollMs: 250,
+      clock, sleep: async () => {}, reconcile: async () => { calls += 1; throw busy(); } });
+    assert.equal(calls, 5, `the attempt ceiling ends a ${name} clock's wait`);
+    assert.equal(issues.length, 1, 'and the read-only inspection still runs');
+  }
 }));

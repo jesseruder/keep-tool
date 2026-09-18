@@ -116,7 +116,7 @@ test('busy injection lock skips reconciliation while continuing read-only health
     reconcile: async () => { attempts++; throw Object.assign(Error('busy'), { status: 429 }); } };
   const { sweep } = require('./delivery-health');
   for (let n = 0; n < 4; n++) assert.deepEqual(await sweep(options), []);
-  assert.equal(attempts, 12, 'each sweep retries the busy lock across its window');
+  assert.equal(attempts, 8, 'each sweep retries the busy lock across its window');
   assert.ok(rows.every(row => row.ok === true));
   f.add('claude', 'genuinely stuck');
   assert.equal((await sweep(options)).length, 1);
