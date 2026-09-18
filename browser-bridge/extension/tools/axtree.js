@@ -106,26 +106,44 @@ async function localFramesOf(tabId, sessionId, skip) {
  */
 export async function fullAxTree(tabId) {
   const mainNodes = await treeFor(tabId, null);
-  const sessions = frameSessions(tabId);
 
   const children = [];
   const errors = [];
 
   // Out-of-process frames first: each answers for itself, and knowing their ids keeps
   // the same-process sweep from asking the wrong session for them.
-  const oopifIds = new Set(sessions.map((entry) => entry.frameId));
-  for (const { sessionId, frameId } of sessions) {
-    try {
-      await ensureFrameDomains(tabId, sessionId);
-      children.push({ sessionId, frameId, nodes: await treeFor(tabId, sessionId), kind: "oopif" });
-    } catch (error) {
-      errors.push(`iframe ${frameId}: ${error.message ?? error}`);
+  //
+  // In rounds, because auto-attach is not recursive: arming it inside a frame (which
+  // ensureFrameDomains does) is what makes that frame's own out-of-process children
+  // attach, so the list grows while it is being walked. Each session is handled once, so
+  // this ends when a round turns up nothing new.
+  const oopifIds = new Set();
+  const doneSessions = new Set();
+  for (;;) {
+    let pending = frameSessions(tabId).filter((entry) => !doneSessions.has(entry.sessionId));
+    if (pending.length === 0 && doneSessions.size > 0) {
+      // An attach event that the browser has already sent may still be on its way to the
+      // worker. One turn of the event loop costs nothing and saves a grandchild frame
+      // from missing this read and only showing up on the next one.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      pending = frameSessions(tabId).filter((entry) => !doneSessions.has(entry.sessionId));
+    }
+    if (pending.length === 0) break;
+    for (const { sessionId, frameId } of pending) {
+      doneSessions.add(sessionId);
+      oopifIds.add(frameId);
+      try {
+        await ensureFrameDomains(tabId, sessionId);
+        children.push({ sessionId, frameId, nodes: await treeFor(tabId, sessionId), kind: "oopif" });
+      } catch (error) {
+        errors.push(`iframe ${frameId}: ${error.message ?? error}`);
+      }
     }
   }
 
-  // Then the same-process ones, in the page's session and inside each OOPIF.
+  // Then the same-process ones, in the page's session and inside each frame session.
   const seen = new Set(oopifIds);
-  for (const sessionId of [null, ...sessions.map((entry) => entry.sessionId)]) {
+  for (const sessionId of [null, ...doneSessions]) {
     children.push(...(await localFramesOf(tabId, sessionId, seen)));
   }
 

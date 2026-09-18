@@ -45,8 +45,13 @@ export function stateFor(tabId) {
       // iframe node.
       frameSessions: new Map(),
       sessionFrames: new Map(),
-      // Which child sessions already have their domains enabled.
-      frameDomains: new Set(),
+      // sessionId -> the session it attached from (null for a child of the page itself).
+      // Auto-attach is not recursive, so a frame two levels down attaches from its own
+      // parent's session, and this is what tells a detach which sessions go with it.
+      sessionParents: new Map(),
+      // sessionId -> the promise that enables its domains and arms its auto-attach, so
+      // the event handler and a tool asking at the same time share one round of setup.
+      frameDomains: new Map(),
       // frameId -> { sessionId, backendNodeId } of the iframe element that hosts it,
       // learned from DOM.describeNode. Backend node ids are stable within a document, so
       // this is cached until the main frame navigates.
@@ -140,36 +145,56 @@ export async function attach(tabId) {
   } catch (error) {
     console.warn(`browser-bridge: focus emulation failed on tab ${tabId}`, error);
   }
-  // Flattened auto-attach: every out-of-process iframe already on the page, and every
-  // one created later, reports itself through Target.attachedToTarget with its own
-  // sessionId on this same port. Without it the accessibility tree stops at the frame
-  // boundary. waitForDebuggerOnStart would pause each new frame until we resumed it,
-  // which is not worth the risk of a missed resume hanging a page.
+  await armAutoAttach(tabId, null);
+}
+
+/**
+ * Flattened auto-attach: every out-of-process iframe of this target, existing and future,
+ * reports itself through Target.attachedToTarget with its own sessionId on the same port.
+ * Without it the accessibility tree stops at the frame boundary.
+ *
+ * It is not recursive (verified on Edge 153: a cross-origin frame inside a cross-origin
+ * frame never attached until its parent's session asked), so every child session arms it
+ * again for its own children. waitForDebuggerOnStart would pause each new frame until we
+ * resumed it, which is not worth the risk of a missed resume hanging a page.
+ */
+async function armAutoAttach(tabId, sessionId) {
   try {
-    await sendRaw(tabId, "Target.setAutoAttach", {
-      autoAttach: true,
-      waitForDebuggerOnStart: false,
-      flatten: true,
-    });
+    await sendRaw(
+      tabId,
+      "Target.setAutoAttach",
+      { autoAttach: true, waitForDebuggerOnStart: false, flatten: true },
+      sessionId,
+    );
   } catch (error) {
     // An old browser, or a target that has no children: cross-origin frames are then
     // simply missing from read_page, which says so.
-    console.warn(`browser-bridge: auto-attach failed on tab ${tabId}`, error);
+    console.warn(`browser-bridge: auto-attach failed on tab ${tabId} session ${sessionId}`, error);
   }
 }
 
-/** Turn on the domains a child iframe session needs, once per session. */
-export async function ensureFrameDomains(tabId, sessionId) {
+/**
+ * Turn on the domains a child iframe session needs and arm its own auto-attach, once per
+ * session. The promise is shared: the attach event starts this immediately so a frame two
+ * levels down is usually already attached by the time a tool asks, and a tool that asks
+ * first waits for the same work rather than racing it.
+ */
+export function ensureFrameDomains(tabId, sessionId) {
   const state = stateFor(tabId);
-  if (state.frameDomains.has(sessionId)) return;
-  state.frameDomains.add(sessionId);
-  for (const domain of FRAME_DOMAINS) {
-    try {
-      await sendRaw(tabId, `${domain}.enable`, {}, sessionId);
-    } catch (error) {
-      console.warn(`browser-bridge: ${domain}.enable failed on frame session ${sessionId}`, error);
+  const existing = state.frameDomains.get(sessionId);
+  if (existing) return existing;
+  const work = (async () => {
+    for (const domain of FRAME_DOMAINS) {
+      try {
+        await sendRaw(tabId, `${domain}.enable`, {}, sessionId);
+      } catch (error) {
+        console.warn(`browser-bridge: ${domain}.enable failed on frame session ${sessionId}`, error);
+      }
     }
-  }
+    await armAutoAttach(tabId, sessionId);
+  })();
+  state.frameDomains.set(sessionId, work);
+  return work;
 }
 
 /** The tab's attached out-of-process iframe sessions, in attach order. */
@@ -260,6 +285,17 @@ function originOf(url) {
   }
 }
 
+/** A session and every session that attached from it, deepest first. */
+function subtreeOf(state, rootSessionId) {
+  const out = [rootSessionId];
+  for (let index = 0; index < out.length; index++) {
+    for (const [sessionId, parentId] of state.sessionParents) {
+      if (parentId === out[index] && !out.includes(sessionId)) out.push(sessionId);
+    }
+  }
+  return out.reverse();
+}
+
 function handleEvent(source, method, params) {
   const tabId = source.tabId;
   if (tabId == null) return;
@@ -274,21 +310,34 @@ function handleEvent(source, method, params) {
     if (info.type !== "iframe" || !params.sessionId || !info.targetId) return;
     state.frameSessions.set(info.targetId, params.sessionId);
     state.sessionFrames.set(params.sessionId, info.targetId);
+    // The event arrives on the session the frame attached from, which for a nested
+    // out-of-process frame is another child session, not the tab's own.
+    state.sessionParents.set(params.sessionId, source.sessionId ?? null);
+    // Set the new session up right away: that is what arms auto-attach inside it, and
+    // its own children cannot attach until it does.
+    ensureFrameDomains(tabId, params.sessionId).catch((error) =>
+      console.warn(`browser-bridge: could not set up frame session ${params.sessionId}`, error),
+    );
     return;
   }
   if (method === "Target.detachedFromTarget") {
-    const sessionId = params.sessionId;
-    if (!sessionId) return;
-    const frameId = state.sessionFrames.get(sessionId);
-    state.sessionFrames.delete(sessionId);
-    state.frameDomains.delete(sessionId);
-    if (frameId != null) {
-      state.frameSessions.delete(frameId);
-      state.frameOwners.delete(frameId);
+    if (!params.sessionId) return;
+    // A frame that goes takes everything inside it: the browser does not always report a
+    // detach for each descendant, and a grandchild session left behind would be asked for
+    // a tree that no longer exists.
+    for (const sessionId of subtreeOf(state, params.sessionId)) {
+      const frameId = state.sessionFrames.get(sessionId);
+      state.sessionFrames.delete(sessionId);
+      state.frameDomains.delete(sessionId);
+      state.sessionParents.delete(sessionId);
+      if (frameId != null) {
+        state.frameSessions.delete(frameId);
+        state.frameOwners.delete(frameId);
+      }
+      // Refs that pointed into that frame cannot be resolved any more; they are kept as
+      // known-but-detached so the error names the reason instead of "unknown ref".
+      state.refs.invalidateSession(sessionId);
     }
-    // Refs that pointed into that frame cannot be resolved any more; they are kept as
-    // known-but-detached so the error names the reason instead of "unknown ref".
-    state.refs.invalidateSession(sessionId);
     return;
   }
 

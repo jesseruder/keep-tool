@@ -385,6 +385,13 @@ fetched by frame id).
   `chrome.debugger.sendCommand`, and its events arrive with `source.sessionId`, which is
   how the console and network handlers know to ignore them: those buffers stay the main
   session's, as they always were.
+- Auto-attach is **not** recursive (verified on Edge 153: a cross-origin frame inside a
+  cross-origin frame never attached). Every child session arms `Target.setAutoAttach` for
+  itself as soon as it attaches, alongside its domains, so its own out-of-process children
+  attach in turn; their events arrive with the tab's `source.tabId` and the *parent
+  session's* `source.sessionId`, which is recorded so a detach can drop the whole subtree.
+  `tools/axtree.js` therefore collects frame sessions in rounds: arming a frame is what
+  makes its children appear, so the list grows while it is being walked.
 - Only `type: "iframe"` targets are kept (workers auto-attach too and have no tree). For
   an iframe target the `targetId` *is* the frame id, which is the hook for splicing.
 - Same-process frames are found through `Page.getFrameTree` — on the main session and on
@@ -419,8 +426,9 @@ fetched by frame id).
   `getBoundingClientRect` fallback is refused for a framed ref, because it is frame
   relative with no way to correct it.
 - Refs still reset on main-frame navigation. `Target.detachedFromTarget` marks that
-  session's refs detached, so using one says the iframe went away and to read the page
-  again, rather than "unknown ref".
+  session's refs detached — and every session that attached from it, because the browser
+  does not always report a detach per descendant — so using one says the iframe went away
+  and to read the page again, rather than "unknown ref".
 
 ## MCP server
 
@@ -494,7 +502,9 @@ needs no private key. The id is a constant in `host/protocol.js` and the install
   with no child frames must take exactly the path it always took, a framed ref must send
   its DOM commands to the frame and its mouse events to the page at the *translated*
   point (the arithmetic is checked against the live Edge measurements, one level and two),
-  and a detached frame must invalidate its refs with a clear error.
+  and a detached frame must invalidate the refs of everything under it with a clear error.
+  The stub only attaches a frame's own children when that frame arms auto-attach, which is
+  how the two-level attach is covered.
 - `test/gif.test.js`: labels, delays, caps and the quality mapping directly; the store
   against an in-memory backend (`setGifBackend`); the tool and the recorder against a
   stubbed `chrome`; and the encoder against a stubbed `OffscreenCanvas`, which records

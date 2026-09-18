@@ -167,6 +167,10 @@ const state = {
   boxes: new Map(), // "sessionId|backendNodeId" -> content quad of an iframe element
   // sessionId ("" for the page's own session) -> the frame ids its frame tree reports.
   childFrames: new Map(),
+  // sessionId ("" for the page's own session) -> the OOPIFs that attach when *that*
+  // session arms auto-attach. Chromium's auto-attach is not recursive, so a frame two
+  // levels down appears only after its own parent's session asks for it.
+  autoAttachChildren: new Map(),
 };
 
 function framesOf(sessionId) {
@@ -257,6 +261,20 @@ globalThis.chrome = {
         if (sessionId === "S1") return { nodes: FRAME_TREE };
         if (sessionId === "S2") return { nodes: NESTED_TREE };
         throw new Error(`no tree for session ${sessionId}`);
+      }
+      if (method === "Target.setAutoAttach") {
+        // What the browser does when a session arms auto-attach: its own out-of-process
+        // children attach, reporting on that session.
+        const waiting = state.autoAttachChildren.get(sessionId ?? "") ?? [];
+        state.autoAttachChildren.delete(sessionId ?? "");
+        for (const child of waiting) {
+          eventListener()({ tabId: target.tabId, sessionId: sessionId ?? undefined }, "Target.attachedToTarget", {
+            sessionId: child.sessionId,
+            targetInfo: { targetId: child.frameId, type: "iframe", url: "https://verify.example/" },
+            waitingForDebugger: false,
+          });
+        }
+        return {};
       }
       if (method === "Page.getFrameTree") {
         return {
@@ -355,7 +373,16 @@ async function makeTab({ sessionKey }) {
   state.quads.clear();
   state.boxes.clear();
   state.childFrames.clear();
+  state.autoAttachChildren.clear();
   return state.tabs.get(id);
+}
+
+/** An OOPIF that will attach once `parentSession` arms auto-attach inside itself. */
+function queueAutoAttach(parentSession, { sessionId, frameId }) {
+  const key = parentSession ?? "";
+  const waiting = state.autoAttachChildren.get(key) ?? [];
+  state.autoAttachChildren.set(key, [...waiting, { sessionId, frameId }]);
+  addChildFrame(parentSession, frameId);
 }
 
 /**
@@ -694,6 +721,76 @@ test("a detached frame invalidates its refs with a clear error", async () => {
   const result = await read_page(ctx("detaching"), { tabId: tab.id });
   assert.doesNotMatch(result.text, /Pay now/);
   assert.doesNotMatch(result.text, /cross-origin/);
+});
+
+test("auto-attach is armed inside each frame, so a frame two levels down attaches", async () => {
+  const tab = await makeTab({ sessionKey: "deep" });
+  // The page's own session arms auto-attach when the tab is attached, which is what lets
+  // the first frame attach at all; from here on only the frames' own arming matters.
+  await cdp.attach(tab.id);
+  state.commands.length = 0;
+
+  attachFrame(tab.id, { sessionId: "S1", frameId: "frame-1" });
+  // The verify frame is out-of-process inside an out-of-process frame: it attaches only
+  // once S1's own session arms auto-attach, and its event arrives on S1.
+  queueAutoAttach("S1", { sessionId: "S2", frameId: "frame-2" });
+
+  const result = await read_page(ctx("deep"), { tabId: tab.id });
+  assert.match(result.text, /button "Pay now"/);
+  assert.match(result.text, /button "Approve"/);
+  assert.match(result.text, /Includes the content of 2 cross-origin iframe\(s\)/);
+
+  const armed = state.commands.filter((call) => call.method === "Target.setAutoAttach");
+  assert.deepEqual(
+    armed.map((call) => call.target.sessionId ?? null),
+    ["S1", "S2"],
+    "each frame arms it again for its own children",
+  );
+  for (const call of armed) {
+    assert.deepEqual(call.params, { autoAttach: true, waitForDebuggerOnStart: false, flatten: true });
+  }
+
+  // The grandchild's tree hangs off the iframe node inside the child's tree, not off the
+  // page, and it is read through its own session.
+  const lines = result.text.split("\n");
+  const indent = (needle) => {
+    const line = lines.find((entry) => entry.includes(needle));
+    return line.length - line.trimStart().length;
+  };
+  assert.ok(indent('Iframe "Verify card"') > indent('Iframe "Payment form"'));
+  assert.ok(indent('button "Approve"') > indent('Iframe "Verify card"'));
+
+  const trees = state.commands.filter((call) => call.method === "Accessibility.getFullAXTree");
+  assert.deepEqual(
+    trees.map((call) => call.target.sessionId ?? null),
+    [null, "S1", "S2"],
+  );
+
+  const found = await find(ctx("deep"), { tabId: tab.id, query: "approve" });
+  const ref = found.text.match(/\[(ref_\d+)\] button "Approve"/)[1];
+  assert.equal(cdp.refTable(tab.id).targetFor(ref).sessionId, "S2");
+});
+
+test("detaching a frame takes the frames inside it with it", async () => {
+  const tab = await makeTab({ sessionKey: "subtree" });
+  attachFrame(tab.id, { sessionId: "S1", frameId: "frame-1" });
+  queueAutoAttach("S1", { sessionId: "S2", frameId: "frame-2" });
+  await read_page(ctx("subtree"), { tabId: tab.id });
+
+  const found = await find(ctx("subtree"), { tabId: tab.id, query: "approve" });
+  const deepRef = found.text.match(/\[(ref_\d+)\] button "Approve"/)[1];
+  assert.deepEqual(
+    cdp.frameSessions(tab.id).map((entry) => entry.sessionId),
+    ["S1", "S2"],
+  );
+
+  // Only the middle frame detaches; the browser says nothing about the one inside it.
+  detachFrame(tab.id, "S1");
+  assert.deepEqual(cdp.frameSessions(tab.id), [], "the whole subtree is forgotten");
+  await assert.rejects(
+    () => computer(ctx("subtree"), { action: "left_click", tabId: tab.id, ref: deepRef }),
+    /was inside a cross-origin iframe that has since gone away/,
+  );
 });
 
 test("a nested frame is read through its own session too", async () => {
