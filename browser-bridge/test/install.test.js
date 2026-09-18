@@ -314,6 +314,21 @@ test("Codex is pointed at the daemon's url with the headers helper, by a TOML ed
   assert.match(codex.preview, /startup_timeout_sec = 20\.0\n/);
   // `url` is what makes it a streamable_http server; Codex refuses the helper on stdio.
   assert.equal(codex.preview.includes("command ="), false);
+
+  // Codex runs the helper without the session's environment, so the name and the account
+  // come from variables Codex itself reads, and the agent is a constant for a Codex home.
+  assert.match(
+    codex.preview,
+    /env_http_headers = \{ "X-Browser-Bridge-Session" = "BROWSER_BRIDGE_SESSION_NAME", "X-Browser-Bridge-Account" = "KEEP_AGENT_ACCOUNT_ID" \}\n/,
+  );
+  assert.match(codex.preview, /http_headers = \{ "X-Browser-Bridge-Agent" = "codex" \}\n/);
+  // Inline tables, not sub-tables: a `[mcp_servers.browser.http_headers]` header would end
+  // this table, and the next run's splice would orphan it instead of replacing it.
+  assert.equal(codex.preview.includes("[mcp_servers.browser."), false);
+  // The token is the helper's alone, so no header is set by two mechanisms at once and no
+  // merge order has to be relied on.
+  assert.equal(codex.preview.includes("Authorization"), false);
+  assert.equal(codex.preview.includes("bearer_token"), false);
 });
 
 test("--stdio keeps the old per-session registration and skips the daemon entirely", (t) => {
@@ -457,6 +472,11 @@ test("the Codex edit replaces only the [mcp_servers.browser] table", () => {
 
   assert.match(after, /^model = "gpt-5"\n/);
   assert.match(after, /\[mcp_servers\.browser\]\nurl = "http:\/\/127\.0\.0\.1:47331\/mcp"\nhttp_headers_helper = "node headers\.js"\n/);
+  // Every line of the replacement stays inside this one table.
+  assert.deepEqual(
+    after.split("\n").filter((line) => line.startsWith("[")),
+    ["[mcp_servers.browser]", "[mcp_servers.other]", "[tui]"],
+  );
   assert.equal(after.includes("/old/server.js"), false, "the stdio keys are gone");
   assert.match(after, /\[mcp_servers\.other\]\ncommand = "\/bin\/other"/);
   assert.match(after, /\[tui\]\nnotifications = true/);
@@ -496,6 +516,7 @@ test("--dry-run prints every file, edit and command and changes nothing", async 
   assert.match(output, /CLAUDE_CONFIG_DIR=.*\.claude-secondary/);
   assert.match(output, /edit .*\.codex\/config\.toml: set \[mcp_servers\.browser\]/);
   assert.match(output, /http_headers_helper = /);
+  assert.match(output, /env_http_headers = \{ "X-Browser-Bridge-Session" = "BROWSER_BRIDGE_SESSION_NAME"/);
   assert.match(output, /run {2}\/bin\/launchctl bootout gui\/\d+\/com\.keep\.browser_bridge\.daemon {3}\(failure ignored\)/);
   assert.match(output, /run {2}\/bin\/launchctl bootstrap gui\/\d+ /);
   assert.ok(

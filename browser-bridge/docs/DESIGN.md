@@ -172,10 +172,31 @@ slow). The host answers the client with an error on timeout and drops the late r
   gets the SDK's 404 (`-32001 Session not found`) and the client initializes again, which
   makes a new socket client with a new `sessionKey` — so the tab group is a new one, the
   old group staying behind for the user exactly as an ended session's does.
-- One MCP session closes when its client sends `DELETE /mcp`, when it has made no request
-  for 24 hours (swept once a minute), or when the daemon gets SIGTERM. All three close the
-  session's `BridgeClient`, which is a `bye` to the host, which is `session_closed` to the
-  extension: the same path a stdio server's exit took.
+- One MCP session closes when its client sends `DELETE /mcp`, when the client's event stream
+  goes away and stays away, when it has made no request for 24 hours (swept once a minute),
+  or when the daemon gets SIGTERM. All four close the session's `BridgeClient`, which is a
+  `bye` to the host, which is `session_closed` to the extension: the same path a stdio
+  server's exit took.
+- **The two clients say goodbye differently**, which is why there are two mechanisms
+  (both measured live, not assumed):
+  - **Codex** sends `DELETE /mcp` when it exits. That is the clean path and nothing else is
+    needed for it.
+  - **Claude Code** never sends DELETE. What it does do is hold the standalone `GET /mcp`
+    event stream open for the whole session (verified with `lsof`: two established
+    connections during `claude -p`, none after it exited). So the daemon counts open GET
+    streams per session, and when a session that has had at least one drops to none and
+    neither reopens one nor sends any request within 30 s, it is closed with
+    `client went away`. Without that, a Claude Code session's tab group stayed listed as
+    live for the full 24 hours and its blank tabs were never tidied up.
+  - A session that has **never** had a GET stream is left to the idle clock: there is no
+    signal to miss, so there is nothing to infer from its absence.
+  - The reverse also holds: a session with a stream **open** never expires, not even on the
+    idle clock. The 24-hour rule was only ever guessing at "gone", and an open stream is
+    direct evidence otherwise — expiring one would cost a live Claude Code session the tab
+    group it is still holding, for the crime of not using the browser all day.
+  - A GET the SDK refuses does not count: a 406 (no `text/event-stream` in `Accept`) or a
+    409 (a stream is already open) closes immediately with that status, and treating it as a
+    stream that had just been lost would end the session while the real one was still there.
 - The MCP server tells the host `bye` on stdin close or SIGTERM. The extension then
   closes the session's tab group only if every tab in it is a blank new-tab page;
   otherwise the tabs stay for the user, matching what Claude Code does on exit, and the
@@ -550,7 +571,7 @@ are its own to close.
   never touches the browser never opens the socket and never says `hello`: the host and the
   extension only learn about the sessions that are actually using the browser, which is less
   than they saw before, not more.
-- `GET /healthz` answers `{ok, pid, port, sessions, host:{socket, connected, hostPid,
+- `GET /healthz` answers `{ok, pid, port, sessions, streams, host:{socket, connected, hostPid,
   extensionConnected, extensionVersion}}` with no auth — it is loopback-only and says
   nothing a caller could not learn by trying. It never opens a socket of its own: a probe
   that said `hello` would appear in the extension as a session with a tab group. The
@@ -561,7 +582,11 @@ are its own to close.
   session header the name is `<clientInfo.name from initialize> #<n>` on a daemon-wide
   counter — Claude Code and Codex send different `clientInfo` names and whatever they send
   is kept, sanitized the same way.
-- `bin/headers.js` is what supplies those headers. It prints one JSON object
+- `bin/headers.js` is what supplies those headers **for Claude Code**, which runs it with
+  the session's environment. Codex does not, so its name and account arrive through
+  `env_http_headers` in `config.toml` instead and its helper only carries the token; see the
+  installer section. Either way the daemon just reads headers and cannot tell the
+  difference. `bin/headers.js` prints one JSON object
   (`Authorization: Bearer <token>`, plus the session name from
   `BROWSER_BRIDGE_SESSION_NAME`, the account from `KEEP_AGENT_ACCOUNT_ID` or the basename
   of `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, and the agent guessed as `sessionIdentity` does)
@@ -629,17 +654,33 @@ node bin/install.js [--browser edge|chrome] [--chrome-too] [--stdio]
    [mcp_servers.browser]
    url = "http://127.0.0.1:47331/mcp"
    http_headers_helper = "<node> <bridge>/bin/headers.js"
+   env_http_headers = { "X-Browser-Bridge-Session" = "BROWSER_BRIDGE_SESSION_NAME", "X-Browser-Bridge-Account" = "KEEP_AGENT_ACCOUNT_ID" }
+   http_headers = { "X-Browser-Bridge-Agent" = "codex" }
    startup_timeout_sec = 20.0
    tool_timeout_sec = 120.0
    ```
 
+   Codex needs those two extra tables because, unlike Claude Code, it runs the helper
+   **without the session's environment** — verified live: a Codex session arrived as
+   `codex-mcp-client #2` with no agent and no account while the token came through fine. So
+   the name and the account come from `env_http_headers`, which maps a header to an
+   environment variable **Codex itself** reads, and the agent is a static header because it
+   is a constant for a Codex home. The token stays the helper's alone: it is the one value
+   that is not in the environment, and keeping it out of both tables means no header is set
+   by two mechanisms and no merge order has to be relied on. Both are written as *inline*
+   tables, not sub-tables: `[mcp_servers.browser.http_headers]` would end the table, and the
+   splice below stops at the next `[`, so a sub-table written here would be orphaned by the
+   next run rather than replaced.
+
    What each client does with that helper, read out of the installed binaries rather than
    guessed (Claude Code 2.1.277, codex-cli 0.154.0):
 
-   - Both run it **through a shell** (Codex `sh -c`, Claude Code `shell: true`) with the
-     session's **whole ambient environment**, which is what lets
-     `BROWSER_BRIDGE_SESSION_NAME` reach a daemon that has none. Claude Code adds
-     `CLAUDE_CODE_MCP_SERVER_NAME` and `CLAUDE_CODE_MCP_SERVER_URL`.
+   - Both run it **through a shell** (Codex `sh -c`, Claude Code `shell: true`). Claude Code
+     gives it the session's whole ambient environment (`extendEnv: false` is a red herring —
+     the env object it passes already starts from `process.env`) plus
+     `CLAUDE_CODE_MCP_SERVER_NAME` and `CLAUDE_CODE_MCP_SERVER_URL`, which is what lets
+     `BROWSER_BRIDGE_SESSION_NAME` reach a daemon that has none. **Codex does not**, which is
+     what `env_http_headers` above is for.
    - Both allow it 10 s and require one JSON object of string values on stdout. Codex caps
      the output at 64 KiB and Claude Code at 1 MB; Codex refuses reserved header names
      (`accept`, `content-type`, `origin`, ... — `authorization` is not one of them).
@@ -731,7 +772,12 @@ needs no private key. The id is a constant in `host/protocol.js` and the install
   a second initialize is a second session with a second socket client, a missing or wrong
   token is 401, any `Origin` is 403, a foreign `Host` is refused, an unknown session id is
   the SDK's 404, DELETE closes the socket client, idle expiry runs on a fake clock, and a
-  child daemon killed with SIGTERM says `bye` before it exits.
+  child daemon killed with SIGTERM says `bye` before it exits. The stream-based cleanup has
+  four of its own, driven over raw HTTP rather than through the SDK client (which opens the
+  standalone GET stream itself, so a second one is a 409 — which is exactly what proves a
+  client holds one): a dropped stream ends the session after the grace, a stream reopened
+  inside the grace keeps it, a session that never streamed is left to the idle clock, and a
+  GET the SDK refuses (406 or 409) changes nothing.
 - `test/headers.test.js`: the helper with and without `daemon.json` and with and without
   each environment variable, plus the process itself — one JSON line, nothing on stderr,
   exit 0 either way.
@@ -760,13 +806,22 @@ the daemon as `X-Browser-Bridge-Session` instead of being read by a child proces
   main frame, so a drop zone inside a cross-origin iframe cannot be targeted.
 - A window resized mid-recording makes later frames a different size; they are scaled into
   the first frame's canvas rather than letterboxed.
-- An agent that exits without sending `DELETE /mcp` leaves its session open in the daemon
-  until the 24-hour idle sweep, so the popup and `browser_status` can list sessions whose
-  agent is gone. A stdio server could not do that: the pipe closing *was* the signal. There
-  is no equivalent signal over HTTP, and a shorter idle timeout would evict a session that
-  is simply not using the browser at the moment. The cost is a stale row and an idle socket;
-  when that agent comes back it initializes again and gets a new `sessionKey`, so it gets a
-  new tab group rather than the one it left.
+- An agent that neither sends `DELETE /mcp` nor holds an event stream open would leave its
+  session in the daemon until the 24-hour idle sweep, so the popup and `browser_status` would
+  list a session whose agent is gone. Both clients on this machine do one or the other
+  (Codex DELETEs, Claude Code streams), so this is currently theoretical, but a third client
+  that does neither would hit it. A stdio server could not: the pipe closing *was* the
+  signal. Shortening the idle window instead would evict a session that is simply not using
+  the browser at the moment.
+- The 30 s stream grace is a guess at how long a legitimate SSE reconnect takes. Too short
+  would end a session that was about to come back; too long leaves a stale tab group. A
+  reconnect that takes longer gets a fresh session and therefore a fresh tab group, which is
+  the same outcome as a daemon restart.
+- Codex's session name and account come from `env_http_headers`, which names one environment
+  variable per header, so there is no room for `bin/headers.js`'s fallback chain: a Codex
+  session with no `KEEP_AGENT_ACCOUNT_ID` reports no account, where a Claude Code one would
+  fall back to the basename of `CLAUDE_CONFIG_DIR`. The agent label is a static header
+  instead, since it is a constant for a Codex home.
 
 ## Security notes
 

@@ -134,8 +134,9 @@ Worth knowing:
 
 | Variable | Effect |
 | --- | --- |
-| `BROWSER_BRIDGE_SESSION_NAME` | Names the session and its tab group. Read in the **session's** environment by `bin/headers.js`, which sends it as `X-Browser-Bridge-Session`. Without it, the daemon names the session after the client that connected (`claude-code #3`). |
-| `KEEP_AGENT_ACCOUNT_ID`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME` | Also read by `bin/headers.js`, for the account and agent labels the popup and `browser_status` show. |
+| `BROWSER_BRIDGE_SESSION_NAME` | Names the session and its tab group. Read in the **session's** environment — by `bin/headers.js` for Claude Code, and by Codex itself through `env_http_headers` (Codex does not give the helper an environment). Either way it arrives as `X-Browser-Bridge-Session`. Without it, the daemon names the session after the client that connected (`claude-code #3`). |
+| `KEEP_AGENT_ACCOUNT_ID` | The account label the popup and `browser_status` show, on both clients. For Codex it is the *only* source: `env_http_headers` names one variable per header, so there is no fallback there. |
+| `CLAUDE_CONFIG_DIR`, `CODEX_HOME` | Read by `bin/headers.js` to guess the agent, and the account when `KEEP_AGENT_ACCOUNT_ID` is unset. |
 | `BROWSER_BRIDGE_NEW_WINDOW=1` | `tabs_context_mcp{createIfEmpty}` opens a new window instead of using the last focused one. Read by the **daemon**, so it applies to every session; set it in the plist, not in a shell. |
 | `BROWSER_BRIDGE_RUNTIME_DIR` | Moves the socket, logs, `daemon.json`, screenshots and config (the tests use this). |
 | `BROWSER_BRIDGE_DAEMON_PORT` | Overrides the port in `daemon.json` (0 picks a free one). |
@@ -152,7 +153,15 @@ Worth knowing:
 
 - **The `browser` tools are missing from a session entirely** — the daemon is down or the
   registration is stale. `curl -s http://127.0.0.1:47331/healthz` says whether the daemon
-  is up and how many sessions it holds; `node bin/install.js` fixes both.
+  is up and how many sessions and event streams it holds; `node bin/install.js` fixes both.
+- **A tab group is titled after the client (`claude-code #3`) instead of the session** — the
+  session name never reached the daemon. Claude Code gets it from
+  `BROWSER_BRIDGE_SESSION_NAME` in the session's environment via `bin/headers.js`; Codex
+  reads that variable itself through `env_http_headers`, so a Codex home installed before
+  that was added needs `node bin/install.js` re-run.
+- **The popup lists a session whose agent has exited** — Codex sends `DELETE` on exit and
+  Claude Code's event stream closing is noticed within about 30 s, so this should clear on
+  its own. If it does not, `daemon.log` shows what the daemon thinks that session is doing.
 - **The daemon will not stay up** — `~/Library/Application Support/BrowserBridge/daemon.log`
   has one line per session plus the reason it exited. `launchctl print gui/$UID/com.keep.browser_bridge.daemon`
   shows what launchd thinks. A port already in use is an exit 1 with the reason.

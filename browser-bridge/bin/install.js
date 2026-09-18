@@ -276,11 +276,25 @@ export function claudeStdioEntry(nodePath, serverPath) {
  * to go - which the table replacement does. The two timeouts are generous on purpose: the
  * host's own per-request budget is 90 s and the socket client's is 100 s, so a slow
  * navigate must not be cut off by the agent first.
+ *
+ * Codex runs the helper *without* the session's environment (verified live: a Codex session
+ * arrived as `codex-mcp-client #2` with no agent and no account, while the token came
+ * through fine), so the session name cannot come from the helper here. `env_http_headers`
+ * maps a header to an environment variable that **Codex itself** reads, which is where the
+ * name and the account come from; the agent is a constant for a Codex home, so it is a
+ * static header. The token stays the helper's alone: it is the one value that is not in the
+ * environment, and keeping it out of these two tables means there is no header both sides
+ * set and so no merge order to depend on.
  */
 export function codexHttpTable(url, helperCommand) {
   return codexTable(CODEX_TABLE, {
     url,
     [CODEX_HELPER_FIELD]: helperCommand,
+    env_http_headers: {
+      "X-Browser-Bridge-Session": "BROWSER_BRIDGE_SESSION_NAME",
+      "X-Browser-Bridge-Account": "KEEP_AGENT_ACCOUNT_ID",
+    },
+    http_headers: { "X-Browser-Bridge-Agent": "codex" },
     startup_timeout_sec: 20,
     tool_timeout_sec: 120,
   });
@@ -314,6 +328,13 @@ function tomlValue(value) {
   // The only numbers this file writes are Codex's timeouts, which are seconds as a float.
   // TOML tells an integer from a float, so `20` and `20.0` are not the same token there.
   if (typeof value === "number") return Number.isInteger(value) ? value.toFixed(1) : String(value);
+  // An inline table, not a sub-table: `[mcp_servers.browser.http_headers]` would be a
+  // table of its own, and the table splice below stops at the next `[`, so a sub-table
+  // written here would be orphaned by the next run instead of replaced.
+  if (value !== null && typeof value === "object") {
+    const pairs = Object.entries(value).map(([key, inner]) => `${JSON.stringify(key)} = ${tomlValue(inner)}`);
+    return `{ ${pairs.join(", ")} }`;
+  }
   return JSON.stringify(String(value));
 }
 
