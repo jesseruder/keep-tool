@@ -1065,7 +1065,20 @@ test('worktree-uncarded names a feature worktree with unlanded commits that no c
     const picked = worktree('picked-work');
     const pickedSha = commit(picked, 'picked.txt', 'picked', old);
     git(repo, ['cherry-pick', pickedSha]);
+    const squashed = worktree('squashed-work');
+    commit(squashed, 'squash-a.txt', 'squash a', old);
+    commit(squashed, 'squash-b.txt', 'squash b', old);
+    git(repo, ['merge', '--squash', '-q', 'squashed-work']);
+    git(repo, ['commit', '-q', '-m', 'squashed']);
     git(repo, ['push', '-q', 'origin', 'main']);
+    const pushed = worktree('pushed-work');
+    commit(pushed, 'pushed.txt', 'pushed', old);
+    const filed = worktree('filed-work');
+    commit(filed, 'filed.txt', 'filed', old);
+    const common = worktree('wip');
+    commit(common, 'wip.txt', 'wip', old);
+    writeCard(root, 'pushed-card', { status: 'active', project: repo }, 'Pushed origin/pushed-work for review.\n');
+    writeCard(root, 'filed-card', { status: 'active', project: repo }, `Edit ${filed}/filed.txt, then wip on the rest.\n`);
     writeCard(root, 'named-card', { status: 'active', project: repo }, 'Working on `named-work` next.\n');
     writeCard(root, 'cited-card', { status: 'done', project: repo },
       `## 2026-09-01 10:00 — check-in\nwip\ncommits: ${citedSha.slice(0, 9)}\n`);
@@ -1073,16 +1086,19 @@ test('worktree-uncarded names a feature worktree with unlanded commits that no c
       'Pattern: stray-work has commits and no card.\n');
 
     const findings = lint({ root, rule: 'worktree-uncarded' }).findings;
-    assert.deepEqual(findings.map((item) => item.id), [`worktree:${stray.replace(os.homedir(), '~')}`],
-      'fresh work has a day of grace, a named or cited branch has a card, a cherry-picked one has landed, and a reviewer idea owns nothing');
-    assert.equal(findings[0].severity, 'low');
-    assert.match(findings[0].text, /on stray-work: 1 commit not on origin\/main, newest 3d old/);
-    assert.match(findings[0].fix, /keep add .* --file --project /);
+    assert.deepEqual(findings.map((item) => item.id).sort(), [common, stray].map((dir) => `worktree:${dir.replace(os.homedir(), '~')}`).sort(),
+      'fresh work has a day of grace, a named, pushed, filed or cited branch has a card, a cherry-picked or squashed one has landed,'
+      + ' a reviewer idea owns nothing, and the word wip is not the branch wip');
+    const strayFinding = findings.find((item) => item.id.endsWith('/stray-work'));
+    assert.equal(strayFinding.severity, 'low');
+    assert.match(strayFinding.text, /on stray-work: 1 commit not on origin\/main, newest 3d old/);
+    assert.match(strayFinding.fix, /keep add .* --file --project /);
 
     const { gitState } = require('./review.js');
     assert.deepEqual(gitState(stray, '').worktrees, [], 'only the bundle asks for the listing');
-    const state = gitState(stray, '', { worktrees: true });
-    assert.deepEqual(state.worktrees.map((row) => row.branch).sort(), ['cited-work', 'fresh-work', 'named-work'],
+    fs.mkdirSync(path.join(stray, 'sub'));
+    const state = gitState(path.join(stray, 'sub'), '', { worktrees: true });
+    assert.deepEqual(state.worktrees.map((row) => row.branch).sort(), ['cited-work', 'filed-work', 'fresh-work', 'named-work', 'pushed-work', 'wip'],
       'the bundle lists the other unlanded worktrees, not this one or the landed one');
     const line = require('./review.js').gitFactLines(state, null).find((row) => row.startsWith('other worktrees'));
     assert.match(line, /^other worktrees with commits not on origin\/main: .*\[cited-work\] 1 \(newest \d{4}-\d\d-\d\d\)/);

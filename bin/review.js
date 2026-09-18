@@ -780,6 +780,18 @@ function originDefaultBranch(cwd) {
   return '';
 }
 
+// A batch bundles several cards of one project; each would walk the same worktrees.
+const UNLANDED_CACHE_MS = 5 * 60e3;
+const unlandedCache = new Map();
+function cachedUnlandedWorktrees(landed, repo, branch) {
+  const key = `${repo}\0${branch}`;
+  const hit = unlandedCache.get(key);
+  if (hit && Date.now() - hit.at < UNLANDED_CACHE_MS) return hit.rows;
+  const rows = landed.unlandedWorktrees(repo, branch);
+  unlandedCache.set(key, { at: Date.now(), rows });
+  return rows;
+}
+
 function gitState(project, lastSha, opts = {}) {
   const cwd = expandProject(project);
   if (!cwd || !fs.existsSync(cwd)) return { available: false, reason: project ? `project dir ${tilde(cwd)} not found` : 'task has no project' };
@@ -824,15 +836,15 @@ function gitState(project, lastSha, opts = {}) {
   }
   // The project's other worktrees with unlanded commits: parallel work on the same
   // code that no card may name. landed.js requires this file, so require it late.
-  try {
-    const landed = require('./landed.js');
-    const repo = landed.repoFor({ fm: { project: cwd } });
-    let here = path.resolve(cwd);
-    try { here = fs.realpathSync(here); } catch {}
-    if (opts.worktrees && repo && out.defaultBranch) {
-      out.worktrees = landed.unlandedWorktrees(repo, out.defaultBranch).filter((row) => row.path !== here);
-    }
-  } catch {}
+  if (opts.worktrees && out.defaultBranch) {
+    try {
+      const landed = require('./landed.js');
+      const repo = landed.repoFor({ fm: { project: cwd } });
+      let here = git(cwd, ['rev-parse', '--show-toplevel']).trim();
+      try { here = fs.realpathSync(here); } catch {}
+      if (repo) out.worktrees = cachedUnlandedWorktrees(landed, repo, out.defaultBranch).filter((row) => row.path !== here);
+    } catch {}
+  }
   let diff = '';
   try {
     diff = git(cwd, ['diff', '--no-ext-diff', '--no-textconv', 'HEAD']);

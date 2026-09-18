@@ -861,38 +861,61 @@ function checkoutDrift(_task, ctx) {
 // Local refs only, like checkout-drift: a fetch per project every sweep would cost
 // more than the finding is worth, and anything that lands here fetches anyway.
 const WORKTREE_GRACE_MS = DAY_MS;
+// The lint child has 90s for every rule; a busy host takes most of a second per git
+// call, and a project can carry a dozen worktrees. Past this, the rest wait a sweep.
+const WORKTREE_BUDGET_MS = 30e3;
 
-function mentions(text, needle) {
+// A path may be followed by a file inside it and preceded by the rest of an absolute
+// path; a branch may be preceded by origin/ or refs/heads/. Neither may run on into a
+// longer name.
+function mentions(text, needle, kind) {
   if (!needle) return false;
   const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`(?:^|[^\\w./-])${escaped}(?![\\w/-]|\\.\\w)`).test(text);
+  const pattern = kind === 'path'
+    ? `(?:^|[^\\w.-])${escaped}(?![\\w-]|\\.\\w)`
+    : `(?:^|[^\\w./-]|(?:origin|heads)/)${escaped}(?![\\w/-]|\\.\\w)`;
+  return new RegExp(pattern).test(text);
+}
+
+// `test` or `wip` would match half the registry and hide the worktree for good; a
+// branch name only counts when it could not be an ordinary word.
+function distinctiveBranch(name) {
+  return /[/_-]/.test(name) || name.length >= 12;
 }
 
 function worktreeUncarded(_task, ctx) {
   // A reviewer idea cites branches as evidence of a pattern, this rule's own card
-  // among them; it owns none of that work, so it must not hide it.
-  const cards = [...ctx.allTasks.values()]
-    .filter((task) => !task.parseError && !(task.fm.tags || []).includes('reviewer-idea')).map((task) => ({
-    text: [task.fm.title, task.fm.project, task.body].join('\n'),
-    shas: allCitedShas(task),
-  }));
+  // among them; it owns none of that work, so it must not hide it. Built on first
+  // use: most sweeps find no candidate worktree at all.
+  let cards = null;
   const named = (row, repo) => {
-    const needles = [row.branch, row.path, tilde(row.path)];
+    cards = cards || [...ctx.allTasks.values()]
+      .filter((task) => !task.parseError && !(task.fm.tags || []).includes('reviewer-idea')).map((task) => ({
+        text: [task.fm.title, task.fm.project, task.body].join('\n'),
+        shas: allCitedShas(task),
+      }));
+    const needles = [[row.path, 'path'], [tilde(row.path), 'path']];
+    if (distinctiveBranch(row.branch)) needles.push([row.branch, 'branch']);
     const relative = path.relative(repo, row.path);
-    if (relative && !relative.startsWith('..')) needles.push(relative);
-    if (path.basename(row.path).length >= 12) needles.push(path.basename(row.path));
-    return cards.some((card) => needles.some((needle) => mentions(card.text, needle))
+    if (relative && !relative.startsWith('..')) needles.push([relative, 'path']);
+    if (path.basename(row.path).length >= 12) needles.push([path.basename(row.path), 'path']);
+    return cards.some((card) => needles.some(([needle, kind]) => mentions(card.text, needle, kind))
       || row.commits.some((commit) => shaIsCited(commit.sha, card.shas)));
   };
   const out = [];
   const seen = new Set();
+  const deadline = Date.now() + WORKTREE_BUDGET_MS;
   for (const task of ctx.tasks) {
-    const repo = ctx.repoFor(task);
-    if (!repo || seen.has(repo)) continue;
+    if (Date.now() > deadline) break;
+    let repo = ctx.repoFor(task);
+    if (!repo) continue;
+    // ~/keep-tool may be a link to the live checkout: one repo, scanned once.
+    try { repo = fs.realpathSync(repo); } catch {}
+    if (seen.has(repo)) continue;
     seen.add(repo);
     const branch = landed.defaultBranch(repo);
     if (!branch) continue;
-    for (const row of ctx.unlandedWorktrees(repo, branch)) {
+    for (const row of ctx.unlandedWorktrees(repo, branch, { before: ctx.now - WORKTREE_GRACE_MS, deadline })) {
       if (ctx.now - row.newestAt < WORKTREE_GRACE_MS || named(row, repo)) continue;
       const n = row.commits.length;
       out.push(finding('worktree-uncarded', { id: `worktree:${tilde(row.path)}` }, 'low',
