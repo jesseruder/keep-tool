@@ -270,7 +270,7 @@ function npxInstallMatch(child, npx, context) {
   // refusal the transfer queue retries), and more than one is not this shape at all.
   if (children.length !== 1) return false;
   const live = children[0];
-  const liveArgs = typeof live.args === 'string' ? live.args : '';
+  const liveArgs = typeof live.args === 'string' ? live.args.replace(/\s+$/, '') : '';
   if (!liveArgs || liveArgs.length > 64 * 1024) return false;
   const dir = path.join(npxCacheDir(context.env), npxInstallHash([npx.spec]));
   const tokens = liveArgs.split(' ');
@@ -311,7 +311,9 @@ function launcherMatch(command, value) {
 // declared side only. A bare declared command likewise matches that basename at any
 // absolute path, since PATH is what chose it.
 function declaredMatch(child, entry, context = {}) {
-  const args = typeof child.args === 'string' ? child.args : '';
+  // Trailing blanks only: a process that rewrites its own title (npm does) leaves the
+  // rest of the original argv buffer blank, and ps prints those bytes as spaces.
+  const args = typeof child.args === 'string' ? child.args.replace(/\s+$/, '') : '';
   if (!args || args.length > 64 * 1024) return false;
   const tail = entry.args.join(' ');
   if (args === [entry.command, ...entry.args].join(' ')) return true;

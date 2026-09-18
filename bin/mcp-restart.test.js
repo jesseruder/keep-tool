@@ -231,6 +231,12 @@ test('an npx-declared server is admitted only as the npx cache install of the de
     const helpers = check([parent, title, server, browser]);
     assert.deepEqual(helpers.map((h) => h.pid), [2, 3, 4], 'the title row, the installed bin under it and its own child are one unit');
     assert.ok(helpers.every((h) => h.pidStart), 'every process in the unit carries a start time');
+    // npm's rewritten title is shorter than the argv it overwrote, and ps prints the
+    // rest of that buffer as trailing spaces: `npm exec @playwright/mcp@latest --headless   `.
+    assert.deepEqual(check([parent, { ...title, args: `${title.args}   ` }, server, browser]).map((h) => h.pid), [2, 3, 4],
+      'trailing blanks left by a rewritten process title are not part of the command');
+    assert.throws(() => check([parent, { ...title, args: 'npm exec @playwright/mcp@latest --headless  x' }, server, browser]), /background/,
+      'but only blanks: anything after them is still a different command');
     assert.throws(() => check([parent, title, server, { ...browser, pidStart: null }]), /background/,
       'a descendant without a captured identity refuses the whole unit');
 
