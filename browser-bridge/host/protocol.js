@@ -80,6 +80,23 @@ export const MAX_CHUNKS = 64;
 export const MAX_ASSEMBLED_BYTES = 16 * 1024 * 1024;
 /** Half a message that never finishes is dropped after this long. */
 export const CHUNK_TTL_MS = 60_000;
+/** Aggregate caps across every half-finished message, not just one. */
+export const MAX_PARTIAL_MESSAGES = 8;
+export const MAX_PENDING_BYTES = 32 * 1024 * 1024;
+
+/**
+ * A message the receiver could never reassemble. The sender turns this into a small
+ * error reply rather than emitting frames that are certain to be dropped, which would
+ * leave the caller waiting out its whole timeout.
+ */
+export class MessageTooLargeError extends Error {
+  constructor(bytes, limit) {
+    super(`result too large (${bytes} bytes, limit ${limit})`);
+    this.name = "MessageTooLargeError";
+    this.bytes = bytes;
+    this.limit = limit;
+  }
+}
 
 /**
  * How many UTF-8 bytes this code point costs once JSON-escaped inside a string.
@@ -112,7 +129,11 @@ function escapedByteLength(codePoint) {
  */
 export function chunkMessage(message, max = MAX_CHUNK_BYTES) {
   const text = JSON.stringify(message);
-  if (Buffer.byteLength(text, "utf8") <= max) return [message];
+  const size = Buffer.byteLength(text, "utf8");
+  if (size <= max) return [message];
+  // The receiver would refuse to reassemble this, so say so now, while the caller can
+  // still turn it into an error the model can read.
+  if (size > MAX_ASSEMBLED_BYTES) throw new MessageTooLargeError(size, MAX_ASSEMBLED_BYTES);
 
   const id = message.id ?? `chunked_${process.pid}_${chunkSeq++}`;
   // The envelope with the largest plausible counters, so the budget is never optimistic.
@@ -155,7 +176,7 @@ export class ChunkAssembler {
 
   accept(message, now = Date.now()) {
     if (!isChunk(message)) return message;
-    this.#expire(now);
+    this.sweep(now);
 
     const { id, chunk, of, data } = message;
     if (!Number.isInteger(of) || of < 1 || of > MAX_CHUNKS) {
@@ -169,6 +190,7 @@ export class ChunkAssembler {
     if (!slot) {
       slot = { of, parts: new Array(of).fill(null), seen: 0, bytes: 0, at: now };
       this.#pending.set(id, slot);
+      this.#evictOldest();
     }
     if (slot.of !== of) throw new Error(`chunk count changed mid-message for ${id}`);
     if (slot.parts[chunk] === null) slot.seen += 1;
@@ -181,19 +203,49 @@ export class ChunkAssembler {
       throw new Error(`chunked message ${id} exceeded ${MAX_ASSEMBLED_BYTES} bytes`);
     }
 
+    this.#evictOldest();
     if (slot.seen < slot.of) return null;
     this.#pending.delete(id);
     return JSON.parse(slot.parts.join(""));
   }
 
-  #expire(now) {
+  /**
+   * Drop expired partials. Called on every accept, and on a timer by the owner: a peer
+   * that abandons half a message and then goes quiet would otherwise pin it forever.
+   */
+  sweep(now = Date.now()) {
     for (const [id, slot] of this.#pending) {
       if (now - slot.at > CHUNK_TTL_MS) this.#pending.delete(id);
     }
   }
 
+  /** Aggregate caps: the oldest half-message gives way to the newest. */
+  #evictOldest() {
+    let total = 0;
+    for (const slot of this.#pending.values()) total += slot.bytes;
+    while (this.#pending.size > MAX_PARTIAL_MESSAGES || total > MAX_PENDING_BYTES) {
+      let oldestId = null;
+      let oldestAt = Infinity;
+      for (const [id, slot] of this.#pending) {
+        if (slot.at < oldestAt) {
+          oldestAt = slot.at;
+          oldestId = id;
+        }
+      }
+      if (oldestId === null) return;
+      total -= this.#pending.get(oldestId).bytes;
+      this.#pending.delete(oldestId);
+    }
+  }
+
   get pendingCount() {
     return this.#pending.size;
+  }
+
+  get pendingBytes() {
+    let total = 0;
+    for (const slot of this.#pending.values()) total += slot.bytes;
+    return total;
   }
 }
 

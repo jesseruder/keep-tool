@@ -58,6 +58,15 @@ function ensureRuntimeDir() {
   if (stat.mode & 0o077) fs.chmodSync(DIR, 0o700);
 }
 
+const NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0;
+
+/**
+ * Open the log, rotating it in place if it has grown past the cap.
+ *
+ * The path is touched exactly once, by the lstat. Everything after that goes through
+ * the descriptor and is checked against what the lstat saw, so a file swapped for a
+ * symlink in the gap is refused rather than followed, truncated or written through.
+ */
 function openLog() {
   let existing = null;
   try {
@@ -65,28 +74,47 @@ function openLog() {
   } catch {
     existing = null; // first run
   }
-  if (existing) {
-    // Never follow a symlink or write into someone else's file: this path is attacker
-    // -plantable in a way the directory checks above do not cover on their own.
-    if (existing.isSymbolicLink()) throw new Error(`${LOG} is a symlink`);
-    if (!existing.isFile()) throw new Error(`${LOG} is not a regular file`);
-    if (existing.uid !== process.getuid()) throw new Error(`${LOG} is not owned by this user`);
-    if (existing.size > MAX_LOG_BYTES) {
-      // Keep only the tail: this file is append-only across every host start.
-      const fd = fs.openSync(LOG, "r");
-      const keep = Buffer.allocUnsafe(MAX_LOG_BYTES);
-      fs.readSync(fd, keep, 0, MAX_LOG_BYTES, existing.size - MAX_LOG_BYTES);
-      fs.closeSync(fd);
-      fs.writeFileSync(LOG, keep, { mode: 0o600 });
-    }
+
+  if (!existing) {
+    const fd = fs.openSync(
+      LOG,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | NOFOLLOW,
+      0o600,
+    );
+    logStream = fs.createWriteStream(null, { fd });
+    return;
   }
-  const flags =
-    fs.constants.O_WRONLY |
-    fs.constants.O_CREAT |
-    fs.constants.O_APPEND |
-    (fs.constants.O_NOFOLLOW ?? 0);
-  const fd = fs.openSync(LOG, flags, 0o600);
-  logStream = fs.createWriteStream(null, { fd });
+
+  if (existing.isSymbolicLink()) throw new Error(`${LOG} is a symlink`);
+  if (!existing.isFile()) throw new Error(`${LOG} is not a regular file`);
+  if (existing.uid !== process.getuid()) throw new Error(`${LOG} is not owned by this user`);
+
+  const fd = fs.openSync(LOG, fs.constants.O_RDWR | NOFOLLOW);
+  let size;
+  try {
+    const opened = fs.fstatSync(fd);
+    // The descriptor must be the very file the lstat approved.
+    if (!opened.isFile() || opened.uid !== process.getuid()) {
+      throw new Error(`${LOG} is not a regular file owned by this user`);
+    }
+    if (opened.dev !== existing.dev || opened.ino !== existing.ino) {
+      throw new Error(`${LOG} was replaced while it was being opened`);
+    }
+    size = opened.size;
+    if (size > MAX_LOG_BYTES) {
+      // Keep only the tail: this file is append-only across every host start.
+      const keep = Buffer.allocUnsafe(MAX_LOG_BYTES);
+      fs.readSync(fd, keep, 0, MAX_LOG_BYTES, size - MAX_LOG_BYTES);
+      fs.ftruncateSync(fd, 0);
+      fs.writeSync(fd, keep, 0, keep.length, 0);
+      size = keep.length;
+    }
+  } catch (error) {
+    fs.closeSync(fd);
+    throw error;
+  }
+  // Same descriptor, positioned at the end: the path is never resolved again.
+  logStream = fs.createWriteStream(null, { fd, start: size });
 }
 
 // --- extension port -------------------------------------------------------
@@ -173,15 +201,30 @@ function forward(client, message) {
   }, TIMEOUT_MS);
   timer.unref?.();
   pending.set(wireId, { client, clientRequestId: message.id, timer });
-  sendToExtension({
-    id: wireId,
-    sessionKey: client.sessionKey,
-    // Carried on every request: the extension may not have stored session_hello yet
-    // when the first tabs_context_mcp arrives right behind it.
-    session: { name: client.name, agent: client.agent, account: client.account },
-    method: message.method,
-    params: message.params ?? {},
-  });
+  try {
+    sendToExtension({
+      id: wireId,
+      sessionKey: client.sessionKey,
+      // Carried on every request: the extension may not have stored session_hello yet
+      // when the first tabs_context_mcp arrives right behind it.
+      session: { name: client.name, agent: client.agent, account: client.account },
+      method: message.method,
+      params: message.params ?? {},
+    });
+  } catch (error) {
+    // Nothing went out, so the client hears about it now instead of at the timeout.
+    failPending(wireId, `the request could not be sent to the browser: ${error.message}`);
+  }
+}
+
+/** Answer a client whose in-flight request can never complete, and forget it. */
+function failPending(wireId, message) {
+  const entry = pending.get(wireId);
+  if (!entry) return false;
+  clearTimeout(entry.timer);
+  pending.delete(wireId);
+  replyToClient(entry.client, entry.clientRequestId, false, { message });
+  return true;
 }
 
 function onClientMessage(client, message) {
@@ -261,7 +304,18 @@ function onClientClose(client) {
 }
 
 function onExtensionMessage(raw) {
-  const message = assembler.accept(raw);
+  let message;
+  try {
+    message = assembler.accept(raw);
+  } catch (error) {
+    // The reply is unusable. If we know whose it was, say so now: the alternative is
+    // that client sitting out the full 90 s timeout for a result that will never come.
+    log("chunk error:", error.message);
+    if (typeof raw?.id === "string") {
+      failPending(raw.id, `the browser's reply could not be reassembled: ${error.message}`);
+    }
+    return;
+  }
   if (message === null) return;
 
   if (message.event === "ready") {
@@ -464,6 +518,8 @@ async function main() {
 
   const ping = setInterval(() => {
     if (extensionReady) sendToExtension({ method: "ping" });
+    // A half-received reply whose sender went quiet is only ever dropped on a timer.
+    assembler.sweep();
   }, PING_INTERVAL_MS);
   ping.unref?.();
 

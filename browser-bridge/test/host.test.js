@@ -302,6 +302,30 @@ test("wire ids carry a per-host nonce so a new host cannot collide with an old o
   assert.match(fromFirst.id, /^w[0-9a-z]+_1_c1$/);
 });
 
+test("a reply that cannot be reassembled fails its client instead of hanging it", async (t) => {
+  // The 90 s timeout is the fallback, not the answer: an unusable reply has to come back
+  // as an error while the model is still waiting on the tool call.
+  const { socketFile, extension } = await startHost(t, { timeoutMs: 60_000 });
+  const client = await connect(socketFile);
+  client.send({ id: "h", method: "hello", params: { sessionKey: "broken-session", name: "broken" } });
+  await client.reply("h");
+
+  client.send({ id: "r1", method: "read_page", params: { tabId: 1 } });
+  const forwarded = await extension.waitFor((m) => m.method === "read_page", "the forwarded request");
+
+  // A chunk count the assembler refuses (over the 64-frame cap).
+  extension.send({ id: forwarded.id, chunk: 0, of: 500, data: "{" });
+
+  const reply = await client.reply("r1");
+  assert.equal(reply.ok, false);
+  assert.match(reply.error.message, /could not be reassembled/);
+  assert.match(reply.error.message, /out of range/);
+
+  // And the host is still healthy.
+  client.send({ id: "after", method: "host_status", params: {} });
+  assert.equal((await client.reply("after")).ok, true);
+});
+
 test("the socket file is removed when the extension port closes", async (t) => {
   const { child, socketFile } = await startHost(t);
   assert.ok(fs.existsSync(socketFile));

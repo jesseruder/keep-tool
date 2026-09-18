@@ -10,6 +10,20 @@ export const MAX_CHUNK_BYTES = 768 * 1024;
 export const MAX_CHUNKS = 64;
 export const MAX_ASSEMBLED_BYTES = 16 * 1024 * 1024;
 export const CHUNK_TTL_MS = 60_000;
+export const MAX_PARTIAL_MESSAGES = 8;
+export const MAX_PENDING_BYTES = 32 * 1024 * 1024;
+/** Expiry cannot wait for the next chunk: the port may go quiet mid-message. */
+export const SWEEP_INTERVAL_MS = 30_000;
+
+/** Mirrors host/protocol.js: a message the host could never reassemble. */
+export class MessageTooLargeError extends Error {
+  constructor(bytes, limit) {
+    super(`result too large (${bytes} bytes, limit ${limit})`);
+    this.name = "MessageTooLargeError";
+    this.bytes = bytes;
+    this.limit = limit;
+  }
+}
 
 const encoder = new TextEncoder();
 
@@ -36,7 +50,9 @@ function escapedByteLength(codePoint) {
 
 export function chunkMessage(message, max = MAX_CHUNK_BYTES) {
   const text = JSON.stringify(message);
-  if (byteLength(text) <= max) return [message];
+  const size = byteLength(text);
+  if (size <= max) return [message];
+  if (size > MAX_ASSEMBLED_BYTES) throw new MessageTooLargeError(size, MAX_ASSEMBLED_BYTES);
 
   const id = message.id ?? `evt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const overhead = byteLength(JSON.stringify({ id, chunk: MAX_CHUNKS, of: MAX_CHUNKS, data: "" }));
@@ -71,9 +87,7 @@ export class ChunkAssembler {
     if (!message || typeof message.chunk !== "number" || typeof message.data !== "string") {
       return message;
     }
-    for (const [id, slot] of this.#pending) {
-      if (now - slot.at > CHUNK_TTL_MS) this.#pending.delete(id);
-    }
+    this.sweep(now);
 
     const { id, chunk, of, data } = message;
     if (!Number.isInteger(of) || of < 1 || of > MAX_CHUNKS) {
@@ -87,6 +101,7 @@ export class ChunkAssembler {
     if (!slot) {
       slot = { of, parts: new Array(of).fill(null), seen: 0, bytes: 0, at: now };
       this.#pending.set(id, slot);
+      this.#evictOldest();
     }
     if (slot.of !== of) throw new Error(`chunk count changed mid-message for ${id}`);
     if (slot.parts[chunk] === null) slot.seen += 1;
@@ -99,9 +114,45 @@ export class ChunkAssembler {
       throw new Error(`chunked message ${id} exceeded ${MAX_ASSEMBLED_BYTES} bytes`);
     }
 
+    this.#evictOldest();
     if (slot.seen < slot.of) return null;
     this.#pending.delete(id);
     return JSON.parse(slot.parts.join(""));
+  }
+
+  /** Drop expired partials; called on accept and on the bridge's sweep timer. */
+  sweep(now = Date.now()) {
+    for (const [id, slot] of this.#pending) {
+      if (now - slot.at > CHUNK_TTL_MS) this.#pending.delete(id);
+    }
+  }
+
+  #evictOldest() {
+    let total = 0;
+    for (const slot of this.#pending.values()) total += slot.bytes;
+    while (this.#pending.size > MAX_PARTIAL_MESSAGES || total > MAX_PENDING_BYTES) {
+      let oldestId = null;
+      let oldestAt = Infinity;
+      for (const [id, slot] of this.#pending) {
+        if (slot.at < oldestAt) {
+          oldestAt = slot.at;
+          oldestId = id;
+        }
+      }
+      if (oldestId === null) return;
+      total -= this.#pending.get(oldestId).bytes;
+      this.#pending.delete(oldestId);
+    }
+  }
+
+  get pendingCount() {
+    return this.#pending.size;
+  }
+
+  get pendingBytes() {
+    let total = 0;
+    for (const slot of this.#pending.values()) total += slot.bytes;
+    return total;
   }
 }
 
@@ -113,6 +164,7 @@ export class NativeBridge {
   #connectedAt = null;
   #lastError = null;
   #generation = 0;
+  #sweepTimer = null;
 
   constructor({ onRequest, onStatus }) {
     this.#onRequest = onRequest;
@@ -172,11 +224,18 @@ export class NativeBridge {
       });
     });
 
+    // Expiry that only runs when a chunk arrives never runs on a quiet port.
+    this.#sweepTimer = setInterval(() => this.#assembler.sweep(), SWEEP_INTERVAL_MS);
+    // Housekeeping should never be the reason a process stays alive (Node only; the
+    // service worker's timer handle has no unref).
+    this.#sweepTimer?.unref?.();
+
     this.#port.onDisconnect.addListener(() => {
       this.#lastError = chrome.runtime.lastError?.message ?? null;
       this.#port = null;
       this.#connectedAt = null;
       this.#assembler = new ChunkAssembler();
+      this.#stopSweeping();
       this.#onStatus(this.status);
     });
 
@@ -186,8 +245,22 @@ export class NativeBridge {
 
   send(message) {
     if (!this.#port) return false;
+    let frames;
     try {
-      for (const frame of chunkMessage(message)) this.#port.postMessage(frame);
+      frames = chunkMessage(message);
+    } catch (error) {
+      // A result the host could never reassemble becomes a readable error for the
+      // model instead of frames it will drop, leaving the caller to time out.
+      if (error instanceof MessageTooLargeError && message.id != null) {
+        this.#lastError = error.message;
+        frames = [{ id: message.id, ok: false, error: { message: error.message } }];
+      } else {
+        this.#lastError = error.message;
+        return false;
+      }
+    }
+    try {
+      for (const frame of frames) this.#port.postMessage(frame);
       return true;
     } catch (error) {
       this.#lastError = error.message;
@@ -201,6 +274,12 @@ export class NativeBridge {
     return this.send(message);
   }
 
+  #stopSweeping() {
+    if (this.#sweepTimer === null) return;
+    clearInterval(this.#sweepTimer);
+    this.#sweepTimer = null;
+  }
+
   disconnect() {
     if (!this.#port) return;
     try {
@@ -208,6 +287,7 @@ export class NativeBridge {
     } finally {
       this.#port = null;
       this.#connectedAt = null;
+      this.#stopSweeping();
     }
   }
 }

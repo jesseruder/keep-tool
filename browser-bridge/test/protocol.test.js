@@ -7,8 +7,11 @@ import {
   EXTENSION_ID,
   EXTENSION_KEY,
   LineDecoder,
+  MAX_ASSEMBLED_BYTES,
   MAX_CHUNKS,
   MAX_CHUNK_BYTES,
+  MAX_PARTIAL_MESSAGES,
+  MAX_PENDING_BYTES,
   NativeDecoder,
   chunkMessage,
   encodeLine,
@@ -136,6 +139,56 @@ test("the assembler caps how much one message may claim", () => {
     }
   }, /exceeded/);
   assert.equal(assembler.pendingCount, 0, "the half-message is dropped, not kept");
+});
+
+test("a message too big for the receiver is refused instead of chunked", () => {
+  const huge = { id: "x", ok: true, result: { blob: "z".repeat(MAX_ASSEMBLED_BYTES + 1000) } };
+  for (const chunk of [chunkMessage, extensionChunkMessage]) {
+    assert.throws(
+      () => chunk(huge),
+      (error) => {
+        assert.equal(error.name, "MessageTooLargeError");
+        assert.match(error.message, /^result too large \(\d+ bytes, limit 16777216\)$/);
+        assert.ok(error.bytes > MAX_ASSEMBLED_BYTES);
+        assert.equal(error.limit, MAX_ASSEMBLED_BYTES);
+        return true;
+      },
+    );
+  }
+});
+
+test("only a half-open partial count is kept; the oldest gives way", () => {
+  for (const Assembler of [ChunkAssembler, ExtensionAssembler]) {
+    const assembler = new Assembler();
+    for (let index = 0; index < MAX_PARTIAL_MESSAGES + 3; index++) {
+      assembler.accept({ id: `m${index}`, chunk: 0, of: 2, data: "x" }, 1000 + index);
+    }
+    assert.equal(assembler.pendingCount, MAX_PARTIAL_MESSAGES);
+    // The newest survived and the oldest did not: finishing m0 starts a fresh slot.
+    assert.equal(assembler.accept({ id: "m10", chunk: 0, of: 2, data: "y" }, 2000), null);
+  }
+});
+
+test("the pending byte total is capped across messages", () => {
+  const assembler = new ChunkAssembler();
+  const big = "q".repeat(6 * 1024 * 1024);
+  for (let index = 0; index < 8; index++) {
+    assembler.accept({ id: `b${index}`, chunk: 0, of: 2, data: big }, 1000 + index);
+  }
+  assert.ok(assembler.pendingBytes <= MAX_PENDING_BYTES, `${assembler.pendingBytes} bytes held`);
+  assert.ok(assembler.pendingCount < 8, "older partials were dropped");
+});
+
+test("sweep expires partials without any new chunk arriving", () => {
+  for (const Assembler of [ChunkAssembler, ExtensionAssembler]) {
+    const assembler = new Assembler();
+    assembler.accept({ id: "quiet", chunk: 0, of: 2, data: "half" }, 1000);
+    assert.equal(assembler.pendingCount, 1);
+    assembler.sweep(1000 + CHUNK_TTL_MS - 1);
+    assert.equal(assembler.pendingCount, 1, "not expired yet");
+    assembler.sweep(1000 + CHUNK_TTL_MS + 1);
+    assert.equal(assembler.pendingCount, 0, "a quiet port must not pin a partial forever");
+  }
 });
 
 test("a half-finished message is forgotten after its TTL", () => {
