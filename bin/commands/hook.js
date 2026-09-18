@@ -10,7 +10,8 @@ const {
   checkinTask, nowStamp,
 } = require('../keep-core.js');
 const fs = require('fs');
-const { ref: sessionRef } = require('../session-numbers.js');
+const sessionNumbers = require('../session-numbers.js');
+const { ref: sessionRef } = sessionNumbers;
 const path = require('path');
 const os = require('os');
 const { execFileSync } = require('child_process');
@@ -201,7 +202,8 @@ function codexHook(kind, input) {
         unattendedText = unattendedStartupContext(input.session_id, 'codex',
           await startupUnattendedState(input.session_id, record));
       } catch {}
-      return { delegationStatus, unattendedText };
+      const numberText = isHeadlessSessionEnv(process.env) ? '' : sessionNumberContext(input.session_id);
+      return { delegationStatus, unattendedText, numberText };
     });
   }
   if (kind === 'end') {
@@ -347,6 +349,19 @@ function recordClaudeCompletion(input) {
   }));
 }
 
+// Agents repeat the handle they are given, so a session learns its own number at
+// startup. The daemon numbers sessions on its next scan; a session that starts
+// before then takes the next number here rather than going unnamed.
+function sessionNumberContext(sessionId) {
+  const id = String(sessionId || '');
+  if (!id) return '';
+  const rows = [{ id, mtime: Date.now() }];
+  try { sessionNumbers.assign(rows, { root: ROOT }); } catch {}
+  if (!rows[0].num) return '';
+  return `[keep] You are session ${sessionNumbers.label(rows[0].num)}. Keep names sessions by number: `
+    + 'call other sessions #n rather than by a uuid prefix; keep tell, keep open and keep pane accept #n.';
+}
+
 commands.hook = async (argv) => {
   let input = {};
   let codexInputValid = false;
@@ -372,7 +387,7 @@ commands.hook = async (argv) => {
         if (argv[1] === 'start' && result) {
           // Both can apply: a delegated worker in a session nobody reads needs its
           // assignment and the unattended rules, in that order of precedence.
-          const context = [result.unattendedText, delegation.describe(result.delegationStatus)]
+          const context = [result.unattendedText, delegation.describe(result.delegationStatus), result.numberText]
             .filter(Boolean).join('\n\n');
           if (context) {
             console.log(JSON.stringify({
@@ -653,6 +668,8 @@ commands.hook = async (argv) => {
     paragraphs.push(`[keep — work registry]\n${lines.join('\n')}\n${workflow} Delegated workers given a parent card or step contribute to it without claiming it or opening a duplicate card. Conventions: read the shared keep skill (${path.resolve(__dirname, '../../skills/keep/SKILL.md')}). Card status is not conversation readiness; scheduling a check yields this turn unless you also pass --handoff needs-input.`);
   }
   if (nudge) paragraphs.push(nudge);
+  const numberText = sessionNumberContext(input.session_id);
+  if (numberText) paragraphs.push(numberText);
   if (paragraphs.length) console.log(paragraphs.join('\n\n'));
 };
 

@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { named: sessionNamed } = require('./session-numbers.js');
 const { execFileSync } = require('node:child_process');
 
 const ID = /^[A-Za-z0-9_-]{8,160}$/;
@@ -144,14 +145,14 @@ function defaultSource(sessionId, options = {}) {
   const codexSession = codex.sessionFor(sessionId);
   const codexFile = codex.findRolloutFile(sessionId);
   const claudeFile = require('./transcripts').findSessionFile(sessionId, options);
-  if (codexSession && codexFile && claudeFile) throw problem(`session ${sessionId} is ambiguous across providers`);
+  if (codexSession && codexFile && claudeFile) throw problem(`session ${sessionNamed(sessionId)} is ambiguous across providers`);
   if (codexSession && codexFile) return { agent: 'codex', accountId: codexSession.accountId,
     cwd: codexSession.project, file: codexFile, title: codexSession.title || '' };
   if (claudeFile) {
     const account = require('./accounts').forSession(sessionId, 'claude', options);
     return { agent: 'claude', accountId: account?.id || '', cwd: '', file: claudeFile, title: '' };
   }
-  throw problem(`source session ${sessionId} was not found`);
+  throw problem(`source session ${sessionNamed(sessionId)} was not found`);
 }
 
 function defaultGitSnapshot(cwd) {

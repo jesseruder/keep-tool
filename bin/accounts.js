@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { named: sessionNamed } = require('./session-numbers.js');
 
 const AGENTS = ['claude', 'codex'];
 const CUSTOM_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -195,13 +196,13 @@ function forSession(sessionId, agent = 'claude', options = {}) {
   const env = options.env || process.env;
   const record = readRecord(root, sessionId);
   if (record) {
-    if (record.agent !== agent) throw new Error(`session ${sessionId} is pinned to ${record.agent}`);
+    if (record.agent !== agent) throw new Error(`session ${sessionNamed(sessionId)} is pinned to ${record.agent}`);
     if (record.stagedAccountId && !options.preferStaged && !options.allowStagedSource) {
-      throw new Error(`session ${sessionId} has an unfinished account handoff; retry the explicit handoff`);
+      throw new Error(`session ${sessionNamed(sessionId)} has an unfinished account handoff; retry the explicit handoff`);
     }
     const id = options.preferStaged && record.stagedAccountId ? record.stagedAccountId : record.accountId;
     const account = get(id, env);
-    if (!account || account.agent !== agent) throw new Error(`session ${sessionId} is pinned to unavailable account ${id}`);
+    if (!account || account.agent !== agent) throw new Error(`session ${sessionNamed(sessionId)} is pinned to unavailable account ${id}`);
     return account;
   }
   if (options.allowDiscovery === false) return null;
@@ -221,9 +222,9 @@ function pinSession(sessionId, agent, accountId, options = {}) {
   const account = get(accountId, env);
   if (!account || account.agent !== agent) throw new Error(`account ${accountId} is not a ${agent} account`);
   const current = readRecord(root, sessionId);
-  if (current && current.agent !== agent) throw new Error(`session ${sessionId} is already pinned to ${current.agent}`);
+  if (current && current.agent !== agent) throw new Error(`session ${sessionNamed(sessionId)} is already pinned to ${current.agent}`);
   if (current && current.accountId !== accountId && !options.transfer) {
-    throw new Error(`session ${sessionId} is already pinned to account ${current.accountId}`);
+    throw new Error(`session ${sessionNamed(sessionId)} is already pinned to account ${current.accountId}`);
   }
   const value = { version: 1, sessionId, agent, accountId, updatedAt: Date.now(), ...(options.transactionId ? { transactionId: options.transactionId } : {}) };
   writeRecord(root, value);
@@ -234,7 +235,7 @@ function stageSession(sessionId, targetAccountId, transactionId, options = {}) {
   const root = options.root || process.env.KEEP_DIR || path.join(os.homedir(), 'keep');
   const env = options.env || process.env;
   const current = readRecord(root, sessionId);
-  if (!current) throw new Error(`session ${sessionId} has no account authority`);
+  if (!current) throw new Error(`session ${sessionNamed(sessionId)} has no account authority`);
   const target = get(targetAccountId, env);
   if (!target || target.agent !== current.agent) throw new Error(`account ${targetAccountId} is not a ${current.agent} account`);
   const value = { ...current, stagedAccountId: targetAccountId, transactionId, updatedAt: Date.now() };

@@ -6,6 +6,7 @@
 require('./config').apply();
 const fs = require('fs');
 const path = require('path');
+const { named: sessionNamed } = require('./session-numbers.js');
 const os = require('os');
 const http = require('http');
 const { execFileSync, spawn } = require('child_process');
@@ -586,7 +587,7 @@ function recordSession(task) {
 function warnSkippedSessionLink(task, result, action) {
   if (!result || result.skipped !== 'outside-project') return;
   process.stderr.write(
-    `keep: ${action}, but session ${result.session.id} was not linked because the current directory is outside the card project (${task.fm.project}); run keep from the project or repair explicitly with keep link ${task.id} --session ${result.session.id} --agent ${result.session.agent}\n`,
+    `keep: ${action}, but session ${sessionNamed(result.session.id)} was not linked because the current directory is outside the card project (${task.fm.project}); run keep from the project or repair explicitly with keep link ${task.id} --session ${result.session.id} --agent ${result.session.agent}\n`,
   );
 }
 

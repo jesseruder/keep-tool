@@ -423,6 +423,7 @@ test('session-start prints the wt nudge from a default repository main checkout'
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /^\[wt — worktrees\]/);
     assert.match(result.stdout, /Never commit in this main checkout\./);
+    assert.match(result.stdout, /\n\n\[keep\] You are session #1\. Keep names sessions by number/);
   } finally {
     fs.rmSync(f.root, { recursive: true, force: true });
   }
@@ -880,7 +881,7 @@ test('Claude and Codex start hooks record inherited host panes and garbage colle
       encoding: 'utf8', env: codexEnv, input: JSON.stringify({ session_id: 'codex-sid', cwd: root }),
     });
     assert.equal(codex.status, 0, codex.stderr);
-    assert.equal(codex.stdout.trim(), '{}');
+    assert.match(JSON.parse(codex.stdout).hookSpecificOutput.additionalContext, /^\[keep\] You are session #\d+\./);
     const codexMarker = JSON.parse(fs.readFileSync(path.join(dir, 'codex-sid.json')));
     assert.deepEqual({ ...codexMarker, at: 0, startedAt: 0 }, { at: 0, startedAt: 0, cwd: root, agent: 'codex', pane: 'pane-codex', claimed: false, bound: false });
     // the spawning Claude session is recorded so a review bundle can show its verification
@@ -1648,11 +1649,14 @@ test('the Codex start hook carries the unattended block in additionalContext', a
     assert.match(context.additionalContext, /Keep opened this session for agent delivery-responder\./);
     assert.match(context.additionalContext, /request_user_input is refused here/);
     assert.doesNotMatch(context.additionalContext, /AskUserQuestion/);
+    assert.match(context.additionalContext, /\n\n\[keep\] You are session #1\. /);
 
+    // An attended session gets no unattended block, only its number.
     const ownerPane = f.hostPane('codex-owned', { agent: 'codex' });
     const owner = await run('codex-owned', ownerPane);
     assert.equal(owner.status, 0, owner.stderr);
-    assert.equal(owner.stdout.trim(), '{}');
+    assert.match(JSON.parse(owner.stdout).hookSpecificOutput.additionalContext,
+      /^\[keep\] You are session #2\. Keep names sessions by number/);
   } finally { await f.cleanup(); }
 });
 

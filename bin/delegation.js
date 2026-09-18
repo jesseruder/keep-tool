@@ -3,6 +3,7 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
+const { named: sessionNamed } = require('./session-numbers.js');
 
 const SESSION_RE = /^[A-Za-z0-9_-]+$/;
 const AGENTS = new Set(['claude', 'codex']);
@@ -95,7 +96,7 @@ function bind(root, id, worker, { now = Date.now(), source = 'explicit' } = {}) 
     if (record.staleAt) throw new Error(`delegation ${id} is stale: ${record.staleReason || 'the parent assignment changed'}`);
     if (record.parent.id === worker.id) throw new Error('the worker session must differ from the parent session');
     if (record.worker && (record.worker.id !== worker.id || record.worker.agent !== worker.agent)) {
-      throw new Error(`delegation ${id} is already bound to ${record.worker.agent} session ${record.worker.id}`);
+      throw new Error(`delegation ${id} is already bound to ${record.worker.agent} session ${sessionNamed(record.worker.id)}`);
     }
     record.worker = { id: String(worker.id), agent: worker.agent };
     record.boundAt = record.boundAt || now;
@@ -284,7 +285,7 @@ function describe(status) {
     if (status.kind === 'invalid') return `Invalid explicit delegation ${status.id || '(unknown)'}. Ask the parent to prepare or register the assignment again; do not file a replacement card.`;
     return '';
   }
-  const parent = `${record.parent.agent} session ${record.parent.id}`;
+  const parent = `${record.parent.agent} session ${sessionNamed(record.parent.id)}`;
   const assignment = `card ${record.card} step ${record.step.number}: ${JSON.stringify(record.step.text)}`;
   if (status.kind === 'active') {
     return `Explicit delegation: ${assignment}. Parent ${parent} owns the card, its check-ins, and every permission decision. Work only on the assigned step, return results to the parent, and do not add or claim a duplicate card.`;

@@ -7,6 +7,7 @@ const {
   die, parseArgs, KeepError, postKeepApi, ROOT,
 } = require('../keep-core.js');
 const sessionNumbers = require('../session-numbers.js');
+const { named: sessionNamed } = sessionNumbers;
 
 const commands = {};
 
@@ -470,7 +471,7 @@ commands.attach = async (argv, deps = {}) => {
 
 commands.reviewer = async (args) => {
   const result = await require('../reviewer-launch').launch(args, ROOT);
-  console.log(`Reviewer ${result.model}: pane ${result.pane}, session ${result.sessionId}`);
+  console.log(`Reviewer ${result.model}: pane ${result.pane}, session ${sessionNamed(result.sessionId)}`);
   if (process.stdin.isTTY && process.stdout.isTTY) await commands.attach([result.pane]);
   else console.log('Open the reviewer in the Keep console.');
 };

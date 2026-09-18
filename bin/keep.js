@@ -32,7 +32,7 @@ const cardUsage = require('./card-usage.js');
 const delegation = require('./delegation.js');
 const features = require('./features.js');
 const sessionNumbers = require('./session-numbers.js');
-const { ref: sessionRef } = sessionNumbers;
+const { ref: sessionRef, named: sessionNamed } = sessionNumbers;
 const { TELL_TEXT_LIMIT } = require('./tell.js');
 const sessionNames = require('./session-names.js');
 const sessionMarks = require('./session-marks.js');
@@ -697,7 +697,7 @@ commands.delegate = async (argv, deps = {}) => {
       });
     }
     catch (error) { die(error.message); }
-    console.log(`accepted delegation ${bound.id}: ${bound.card} step ${bound.step.number} as ${worker.agent} session ${worker.id}`);
+    console.log(`accepted delegation ${bound.id}: ${bound.card} step ${bound.step.number} as ${worker.agent} session ${sessionNamed(worker.id)}`);
     return;
   }
 
@@ -811,7 +811,7 @@ commands.claim = (argv) => {
     try { withLock(() => delegation.end(ROOT, assigned.record, `claimed ${id}`)); }
     catch (error) { die(error.message); }
   }
-  console.log(`${id} claimed by current ${session.agent} session ${session.id}`);
+  console.log(`${id} claimed by current ${session.agent} session ${sessionNamed(session.id)}`);
 };
 
 commands.done = (argv) => {
@@ -2570,7 +2570,7 @@ commands.agents = (argv) => {
   if (!rows.length) { console.log('no agent records'); return; }
   for (const row of rows) {
     const badge = row.unseen.count ? `  ${row.unseen.count} unseen${row.unseen.needsYou ? ' (needs you)' : ''}` : '';
-    console.log(`${row.name}  ${row.lifecycle}${row.card ? ` on ${row.card}` : ''}${row.session && row.session.id ? `  session ${row.session.id}` : ''}${badge}`);
+    console.log(`${row.name}  ${row.lifecycle}${row.card ? ` on ${row.card}` : ''}${row.session && row.session.id ? `  session ${sessionNamed(row.session.id)}` : ''}${badge}`);
     if (row.role || row.area) console.log(`  ${[row.role, row.area && `area ${row.area}`].filter(Boolean).join(' · ')}`);
     if (row.lastEvent) console.log(`  last: ${row.lastEvent.kind} — ${agents.eventLine(row.lastEvent)}`);
   }
@@ -2928,7 +2928,7 @@ commands.handoff = async (argv, deps = {}) => {
   let result = {};
   try { result = JSON.parse(response.data); } catch {}
   if (response.status !== 200 || !result.ok) die(result.error || `keep serve returned an unexpected response (${response.status})`);
-  console.log(`moved session ${result.sessionId} from ${result.sourceAccountId} to ${result.targetAccountId} in pane ${result.pane}`);
+  console.log(`moved session ${sessionNamed(result.sessionId)} from ${result.sourceAccountId} to ${result.targetAccountId} in pane ${result.pane}`);
 };
 
 commands.transfer = async (argv, deps = {}) => {

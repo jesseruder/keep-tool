@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { named: sessionNamed } = require('./session-numbers.js');
 
 const ID = /^[A-Za-z0-9_-]{1,160}$/;
 const MAX_SCAN_ENTRIES = 20000;
@@ -326,10 +327,10 @@ function buildPlan(sessionId, sourceProfile, targetProfile, options = {}, stoppe
   }
   const sourceIndex = scanProfile(source, options);
   const rootEntry = unique(sourceIndex, sessionId, 'source root');
-  if (rootEntry.child) throw failure(`Codex session ${sessionId} is a child thread, not a root conversation`,
+  if (rootEntry.child) throw failure(`Codex session ${sessionNamed(sessionId)} is a child thread, not a root conversation`,
     'KEEP_CODEX_ARTIFACT_SESSION');
   if (rootEntry.relative.split(path.sep)[0] === 'archived_sessions') {
-    throw failure(`Codex session ${sessionId} is archived; unarchive it in the source account before transferring`,
+    throw failure(`Codex session ${sessionNamed(sessionId)} is archived; unarchive it in the source account before transferring`,
       'KEEP_CODEX_ARTIFACT_ARCHIVED');
   }
   const verified = verifyRestart(options.root, sessionId, sourceIndex, options, stopped);
