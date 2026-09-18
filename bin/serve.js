@@ -1575,8 +1575,10 @@ function customModelPickerPossible(session, processArgs, deps = {}) {
   // parsed here: one that exists is taken as possibly carrying picker rows. Policy the
   // harness fetches from the organization's server is not on disk to check at all, and
   // neither is the settings file as it stood when the switch was made; those are the
-  // residual the label rule accepts, and it is bounded to the context window of a model
-  // whose family and version the record or launch metadata has already proven.
+  // residual the label rule accepts. Behind an assistant record it is bounded to the
+  // context window, since the record proves the base; against launch metadata alone,
+  // which proves only the model before the pick, a renamed row could hide a different
+  // base too. docs/accounts.md states both.
   try {
     const preferences = typeof deps.managedPreferenceFiles === 'function'
       ? deps.managedPreferenceFiles()
