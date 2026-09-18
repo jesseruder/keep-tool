@@ -485,8 +485,17 @@ const PLUGIN_RUNTIME_MARKERS = new Set(['.in_use', '.orphaned_at']);
 // it, resolves elsewhere and is refused before anything is staged or accepted.
 function copyPluginDir(sourceRoot, targetRoot, relative) {
   const destination = path.join(targetRoot, relative);
-  fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
-  if (!canonical(path.dirname(destination)).startsWith(targetRoot + path.sep) && canonical(path.dirname(destination)) !== targetRoot) {
+  // Create each parent one level at a time, refusing a symlink before anything is
+  // written through it.
+  let parent = targetRoot;
+  fs.mkdirSync(targetRoot, { recursive: true, mode: 0o700 });
+  for (const part of path.dirname(relative).split(path.sep).filter((entry) => entry && entry !== '.')) {
+    parent = path.join(parent, part);
+    const stat = fs.lstatSync(parent, { throwIfNoEntry: false });
+    if (stat && !stat.isDirectory()) throw new Error(`${relative} resolves outside the target profile`);
+    if (!stat) fs.mkdirSync(parent, { mode: 0o700 });
+  }
+  if (canonical(path.dirname(destination)) !== path.dirname(destination)) {
     throw new Error(`${relative} resolves outside the target profile`);
   }
   const existing = fs.lstatSync(destination, { throwIfNoEntry: false });

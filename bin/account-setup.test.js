@@ -628,6 +628,13 @@ test('plugin copy skips runtime markers and refuses targets it cannot trust', ()
     assert.deepEqual(fs.readdirSync(elsewhere), []);
     fs.unlinkSync(path.join(targetPlugins, 'cache'));
 
+    // So would a symlink partway down the cache, and nothing is created through it.
+    fs.mkdirSync(path.join(targetPlugins, 'cache'));
+    fs.symlinkSync(elsewhere, path.join(targetPlugins, 'cache', 'market'));
+    assert.match(setup.syncPlugins(f.target).failed[0].error, /resolves outside the target profile/);
+    assert.deepEqual(fs.readdirSync(elsewhere), []);
+    fs.unlinkSync(path.join(targetPlugins, 'cache', 'market'));
+
     // A marketplace the target already records, with its clone gone, blocks its plugins.
     fs.writeFileSync(path.join(targetPlugins, 'known_marketplaces.json'), JSON.stringify({ market: { installLocation: path.join(f.root, 'gone') } }));
     assert.match(setup.syncPlugins(f.target).failed[0].error, /has no clone/);
