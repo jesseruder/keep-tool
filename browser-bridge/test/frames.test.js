@@ -165,6 +165,8 @@ const state = {
   describeFails: false,
   quads: new Map(), // "sessionId|backendNodeId" -> quad
   boxes: new Map(), // "sessionId|backendNodeId" -> content quad of an iframe element
+  // Same key -> the successive boxes a moving iframe reports, one per read.
+  movingBoxes: new Map(),
   // sessionId ("" for the page's own session) -> the frame ids its frame tree reports.
   childFrames: new Map(),
   // sessionId ("" for the page's own session) -> the OOPIFs that attach when *that*
@@ -285,7 +287,14 @@ globalThis.chrome = {
         };
       }
       if (method === "DOM.getBoxModel") {
-        const box = state.boxes.get(`${sessionId ?? ""}|${params.backendNodeId}`);
+        const key = `${sessionId ?? ""}|${params.backendNodeId}`;
+        // A host whose box moves: the ancestor scroll lands between two reads, and every
+        // read after that reports the settled position.
+        const moving = state.movingBoxes.get(key);
+        if (moving) {
+          state.boxes.set(key, moving.length > 1 ? moving.shift() : moving[0]);
+        }
+        const box = state.boxes.get(key);
         if (!box) return {};
         const [x, y, width, height] = box;
         return {
@@ -372,6 +381,7 @@ async function makeTab({ sessionKey }) {
   state.nestedIsLocal = false;
   state.quads.clear();
   state.boxes.clear();
+  state.movingBoxes.clear();
   state.childFrames.clear();
   state.autoAttachChildren.clear();
   return state.tabs.get(id);
@@ -566,7 +576,12 @@ test("a same-process frame inside an OOPIF belongs to that frame's session", asy
   state.commands.length = 0;
   const clicked = await computer(ctx("localnested"), { action: "left_click", tabId: tab.id, ref });
   assert.match(clicked.text, /at \(122, 332\)/);
-  assert.equal(state.commands.filter((call) => call.method === "DOM.getBoxModel").length, 1);
+  const boxes = state.commands.filter((call) => call.method === "DOM.getBoxModel");
+  assert.deepEqual(
+    [...new Set(boxes.map((call) => call.params.backendNodeId))],
+    [20],
+    "only the cross-origin frame's host is measured; the frame inside it adds nothing",
+  );
 });
 
 test("a frame whose host element cannot be described is named in a note", async () => {
@@ -628,15 +643,68 @@ test("a point inside a frame inside a frame adds both offsets", async () => {
 
   const clicked = await computer(ctx("twolevel"), { action: "left_click", tabId: tab.id, ref });
   assert.match(clicked.text, /at \(132, 372\)/);
-  const boxes = state.commands.filter((call) => call.method === "DOM.getBoxModel");
+  const boxes = state.commands
+    .filter((call) => call.method === "DOM.getBoxModel")
+    .map((call) => [call.target.sessionId ?? null, call.params.backendNodeId]);
   assert.deepEqual(
-    boxes.map((call) => [call.target.sessionId ?? null, call.params.backendNodeId]),
+    boxes.slice(0, 2),
     [
       ["S1", 4],
       [null, 20],
     ],
     "inner frame first, then its own host, outwards to the page",
   );
+  // The chain is measured again to check it has stopped moving, so it comes in pairs.
+  assert.equal(boxes.length % 2, 0);
+  assert.deepEqual(boxes.slice(2, 4), boxes.slice(0, 2));
+});
+
+test("the measurement waits for an ancestor scroll that lands after the first read", async () => {
+  const tab = await makeTab({ sessionKey: "settling" });
+  attachFrame(tab.id, { sessionId: "S1", frameId: "frame-1" });
+  queueAutoAttach("S1", { sessionId: "S2", frameId: "frame-2" });
+  await read_page(ctx("settling"), { tabId: tab.id });
+
+  const found = await find(ctx("settling"), { tabId: tab.id, query: "approve" });
+  const ref = found.text.match(/\[(ref_\d+)\] button "Approve"/)[1];
+
+  // scrollIntoViewIfNeeded inside S2 scrolls the page and the payment frame through the
+  // browser process, which lands *after* the first box model comes back: both hosts
+  // report their pre-scroll position once and their settled position from then on.
+  state.movingBoxes.set(`|20`, [
+    [22, 982, 500, 258], // the page has not scrolled yet
+    [22, 82, 500, 258], // ... and now it has, by 900 px
+  ]);
+  state.movingBoxes.set(`S1|4`, [
+    [10, 240, 300, 150],
+    [10, 40, 300, 150],
+  ]);
+  state.quads.set(`S2|51`, [80, 40, 120, 40, 120, 60, 80, 60]);
+  state.commands.length = 0;
+
+  const clicked = await computer(ctx("settling"), { action: "left_click", tabId: tab.id, ref });
+  // The settled reading, not the first one: (100, 50) + (10, 40) + (22, 82).
+  assert.match(clicked.text, /at \(132, 172\)/);
+  for (const call of state.commands.filter((entry) => entry.method === "Input.dispatchMouseEvent")) {
+    assert.deepEqual([call.params.x, call.params.y], [132, 172]);
+  }
+
+  // Every ancestor session was given a frame to paint in, inner to outer, before the
+  // chain was measured - and the page again at the end, so the compositor's hit-test
+  // data is current when the click is dispatched.
+  const waits = state.commands
+    .filter((call) => call.method === "Runtime.evaluate" && /requestAnimationFrame/.test(call.params.expression))
+    .map((call) => call.target.sessionId ?? null);
+  assert.deepEqual(waits.slice(0, 2), ["S1", null], "inner frame first, then the page");
+  assert.equal(waits.at(-1), null, "and the page once more before the click");
+  const firstBox = state.commands.findIndex((call) => call.method === "DOM.getBoxModel");
+  const firstWait = state.commands.findIndex(
+    (call) => call.method === "Runtime.evaluate" && /requestAnimationFrame/.test(call.params.expression),
+  );
+  assert.ok(firstWait < firstBox, "the wait comes before the measurement");
+  const lastQuads = state.commands.map((call) => call.method).lastIndexOf("DOM.getContentQuads");
+  const lastBox = state.commands.map((call) => call.method).lastIndexOf("DOM.getBoxModel");
+  assert.ok(lastQuads > lastBox, "and the element's own position is read once the chain has settled");
 });
 
 test("a ref whose frame position is unknown refuses instead of clicking a guess", async () => {

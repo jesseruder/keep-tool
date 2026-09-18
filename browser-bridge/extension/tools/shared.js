@@ -195,20 +195,12 @@ async function contentBoxOrigin(tabId, sessionId, backendNodeId) {
 }
 
 /**
- * The one place that knows how an out-of-process iframe's geometry relates to the page's.
- *
- * Measured on Edge 153: DOM.getContentQuads from a child session reports the node's
- * position in *that frame's own viewport*, not the page's (a button really at (452, 372)
- * came back as (431, 95) from a frame whose content box starts at (22, 282)). Mouse input
- * is dispatched through the main session, so the frame's content-box origin has to be
- * added back, and once more for every OOPIF the frame is itself nested inside.
- *
- * A same-process child frame is part of its parent's session, so its quads are already in
- * that session's coordinates and the loop simply does not run for it.
+ * The iframe elements between a frame session and the page, inner first: each entry is
+ * the host element and the session that holds it (the last one's session is null, the
+ * page's own).
  */
-async function frameQuadToMainViewport(point, tabId, frameSessionId) {
-  let x = point.x;
-  let y = point.y;
+function ancestorHosts(tabId, frameSessionId) {
+  const hosts = [];
   let sessionId = frameSessionId;
   const seen = new Set();
   while (sessionId) {
@@ -220,13 +212,103 @@ async function frameQuadToMainViewport(point, tabId, frameSessionId) {
         "This element is inside a cross-origin iframe whose position on the page is not known. Call read_page or find on this tab first.",
       );
     }
-    const origin = await contentBoxOrigin(tabId, owner.sessionId, owner.backendNodeId);
-    x += origin.x;
-    y += origin.y;
+    hosts.push({ sessionId: owner.sessionId ?? null, backendNodeId: owner.backendNodeId });
     // The host element's own coordinates are in its session, so keep walking outwards.
     sessionId = owner.sessionId;
   }
-  return { x, y };
+  return hosts;
+}
+
+/** One frame's worth of "has the scrolling finished?", bounded the way captureClip is. */
+async function settle(tabId, sessionId) {
+  await send(
+    tabId,
+    "Runtime.evaluate",
+    {
+      expression:
+        "new Promise(r => { setTimeout(r, 300); requestAnimationFrame(() => requestAnimationFrame(r)); })",
+      awaitPromise: true,
+      timeout: 1000,
+    },
+    sessionId,
+  ).catch(() => {
+    // An occluded or busy frame never runs an animation frame; the 300 ms fallback inside
+    // the page covers that, and a session that cannot evaluate at all just gets no wait.
+  });
+}
+
+async function settleAll(tabId, hosts) {
+  for (const host of hosts) await settle(tabId, host.sessionId);
+}
+
+async function readOrigins(tabId, hosts) {
+  const origins = [];
+  for (const host of hosts) {
+    origins.push(await contentBoxOrigin(tabId, host.sessionId, host.backendNodeId));
+  }
+  return origins;
+}
+
+function sameOrigins(a, b) {
+  return a.length === b.length && a.every((origin, index) => origin.x === b[index].x && origin.y === b[index].y);
+}
+
+const MAX_SETTLE_ROUNDS = 3;
+
+/**
+ * The one place that knows how an out-of-process iframe's geometry relates to the page's.
+ *
+ * Measured on Edge 153: DOM.getContentQuads from a child session reports the node's
+ * position in *that frame's own viewport*, not the page's (a button really at (452, 372)
+ * came back as (431, 90) from a frame whose content box starts at (22, 282)). Mouse input
+ * is dispatched through the main session, so every host iframe's content-box origin has
+ * to be added back, outwards to the page.
+ *
+ * The measurement has to wait. `DOM.scrollIntoViewIfNeeded` inside a frame applies to that
+ * frame synchronously, but it scrolls the frame's *ancestors* through the browser process
+ * asynchronously, so a box model read straight afterwards reports where the iframe was
+ * before the page scrolled - which is how a click on an element 900 px down landed
+ * nowhere. So: let every ancestor session paint, measure, then measure again and only
+ * trust the reading when it stops moving.
+ *
+ * A same-process child frame is part of its parent's session, so its quads are already in
+ * that session's coordinates and none of this runs for it.
+ */
+async function frameViewportOffset(tabId, frameSessionId) {
+  const hosts = ancestorHosts(tabId, frameSessionId);
+  if (hosts.length === 0) return { x: 0, y: 0 };
+
+  await settleAll(tabId, hosts);
+  let origins = await readOrigins(tabId, hosts);
+  for (let round = 0; round < MAX_SETTLE_ROUNDS; round++) {
+    await settleAll(tabId, hosts);
+    const again = await readOrigins(tabId, hosts);
+    const stable = sameOrigins(origins, again);
+    // Always keep the later reading: if it is still moving, the newest one is the closest
+    // to where it will end up.
+    origins = again;
+    if (stable) break;
+  }
+  return origins.reduce(
+    (total, origin) => ({ x: total.x + origin.x, y: total.y + origin.y }),
+    { x: 0, y: 0 },
+  );
+}
+
+async function quadCentre(tabId, backendNodeId, sessionId) {
+  let quads = null;
+  try {
+    const response = await send(tabId, "DOM.getContentQuads", { backendNodeId }, sessionId);
+    quads = response?.quads ?? null;
+  } catch {
+    quads = null;
+  }
+  if (!quads || quads.length === 0) return null;
+  const quad = quads[0];
+  return {
+    x: (quad[0] + quad[2] + quad[4] + quad[6]) / 4,
+    y: (quad[1] + quad[3] + quad[5] + quad[7]) / 4,
+  };
 }
 
 /** Element centre in viewport CSS pixels, scrolled into view first. */
@@ -238,40 +320,35 @@ export async function pointForRef(tabId, ref) {
     // Not scrollable (detached, display:none): getContentQuads reports the real problem.
   }
 
-  let quads = null;
-  try {
-    const response = await send(tabId, "DOM.getContentQuads", { backendNodeId }, sessionId);
-    quads = response?.quads ?? null;
-  } catch {
-    quads = null;
+  // The page's own frames: quads are already the coordinates input speaks, and nothing
+  // outside this frame had to move, so this costs exactly what it always did.
+  if (!sessionId) {
+    const centre = await quadCentre(tabId, backendNodeId, null);
+    if (centre) return centre;
+
+    // Fall back to the layout box; a zero-size element genuinely cannot be clicked.
+    const { value } = await callOnRef(tabId, ref, elementRect);
+    if (!value || value.width === 0 || value.height === 0) {
+      throw new Error(`${ref} has no visible box on the page, so it cannot be clicked`);
+    }
+    return { x: value.x + value.width / 2, y: value.y + value.height / 2 };
   }
 
-  if (quads && quads.length > 0) {
-    // Verified on Edge 153: within a session the quads are viewport-relative CSS pixels,
-    // so after scrollIntoViewIfNeeded the centre is where Input.dispatchMouseEvent wants
-    // it - once the frame's own offset has been added back for a node inside an OOPIF.
-    const quad = quads[0];
-    return frameQuadToMainViewport(
-      {
-        x: (quad[0] + quad[2] + quad[4] + quad[6]) / 4,
-        y: (quad[1] + quad[3] + quad[5] + quad[7]) / 4,
-      },
-      tabId,
-      sessionId,
-    );
-  }
-
-  // Fall back to the layout box; a zero-size element genuinely cannot be clicked. Inside
-  // an out-of-process iframe getBoundingClientRect is relative to that frame's own
-  // viewport, which is not where the mouse goes, so refuse instead of clicking a guess.
-  if (sessionId) {
+  // Inside a cross-origin iframe: settle and measure the chain first, then read the
+  // element's own position, which is now being reported against a frame that has stopped
+  // moving.
+  const offset = await frameViewportOffset(tabId, sessionId);
+  const centre = await quadCentre(tabId, backendNodeId, sessionId);
+  if (!centre) {
+    // getBoundingClientRect would be relative to the frame's own viewport with no way to
+    // correct it, so refuse instead of clicking a guess.
     throw new Error(
       `${ref} is inside a cross-origin iframe and the browser gave no geometry for it, so it cannot be clicked by ref. Take a screenshot and click by coordinate.`,
     );
   }
-  const { value } = await callOnRef(tabId, ref, elementRect);
-  if (!value || value.width === 0 || value.height === 0) {
-    throw new Error(`${ref} has no visible box on the page, so it cannot be clicked`);
-  }
-  return { x: value.x + value.width / 2, y: value.y + value.height / 2 };
+  // Last: let the page itself paint before the caller dispatches the click. The
+  // compositor's hit-test surfaces are updated a frame behind the scroll, and a click
+  // sent before that lands on whatever used to be under the point.
+  await settle(tabId, null);
+  return { x: centre.x + offset.x, y: centre.y + offset.y };
 }

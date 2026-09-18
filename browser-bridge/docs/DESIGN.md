@@ -416,14 +416,26 @@ fetched by frame id).
 - Geometry needs translating, which is the one thing the first cut got wrong.
   `DOM.getContentQuads` from a child session reports the node's position in *that frame's*
   viewport (measured on Edge 153: a button really at (452, 372) came back as (430, 90)
-  from a frame whose content box starts at (22, 282)). `frameQuadToMainViewport` in
+  from a frame whose content box starts at (22, 282)). `frameViewportOffset` in
   `tools/shared.js` adds the host iframe element's content-box origin — `DOM.getBoxModel`
   on the host node in its *parent* session, `content` rather than the border box, so the
   iframe's own border and padding are excluded — and repeats outwards for a frame nested
   inside another OOPIF. A same-process frame shares its parent's session and needs no
-  translation, so the loop does not run for it. `DOM.scrollIntoViewIfNeeded` in the child
-  session scrolls the frame's own content correctly and is left alone. The
-  `getBoundingClientRect` fallback is refused for a framed ref, because it is frame
+  translation, so none of this runs for it, and neither does any of the waiting below.
+- The measurement has to wait, which is the *second* thing the first cut got wrong.
+  `DOM.scrollIntoViewIfNeeded` inside a frame applies to that frame synchronously (its own
+  quads are right immediately) but scrolls the frame's ancestors through the browser
+  process asynchronously, so a box model read straight afterwards reports where the iframe
+  sat *before* the page scrolled — a ref click 900 px down computed a point that hit
+  nothing. So `pointForRef` scrolls, then lets every ancestor session paint (a
+  double-`requestAnimationFrame` promise with the same 300 ms in-page fallback
+  `captureClip` uses, inner frame to page), measures the chain, and measures it again:
+  while the two readings differ it takes the newer one and tries again, up to three
+  rounds. Only then does it read the element's own quads. The page gets one last paint
+  before the caller dispatches the click, because the compositor's hit-test surfaces
+  update a frame behind the scroll and a click sent earlier lands on whatever used to be
+  under the point. A main-frame ref takes none of these round trips.
+- The `getBoundingClientRect` fallback is refused for a framed ref, because it is frame
   relative with no way to correct it.
 - Refs still reset on main-frame navigation. `Target.detachedFromTarget` marks that
   session's refs detached — and every session that attached from it, because the browser
@@ -502,7 +514,9 @@ needs no private key. The id is a constant in `host/protocol.js` and the install
   with no child frames must take exactly the path it always took, a framed ref must send
   its DOM commands to the frame and its mouse events to the page at the *translated*
   point (the arithmetic is checked against the live Edge measurements, one level and two),
-  and a detached frame must invalidate the refs of everything under it with a clear error.
+  a host iframe whose box model only reports its settled position on the second read must
+  still be clicked in the right place, and a detached frame must invalidate the refs of
+  everything under it with a clear error.
   The stub only attaches a frame's own children when that frame arms auto-attach, which is
   how the two-level attach is covered.
 - `test/gif.test.js`: labels, delays, caps and the quality mapping directly; the store
