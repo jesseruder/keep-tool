@@ -108,7 +108,7 @@ which is rewritten whole on every `record()` and would lose it:
 ```json
 { "signatures": { "<sig>": { "firstSeenAt": 0, "lastSeenAt": 0, "cardId": "",
   "openedAt": 0, "sessionId": "", "pane": "", "worktree": "", "artifacts": [],
-  "recipe": "", "attempts": 1, "lastAttemptAt": 0, "okSinceAt": 0,
+  "recipe": "", "attempts": 1, "lastAttemptAt": 0, "projectMissingAt": 0, "okSinceAt": 0,
   "resolvedAt": 0, "cooldownUntil": 0, "previousCardId": "" } },
   "day": "2026-09-15", "openedToday": 0 }
 ```
@@ -138,7 +138,25 @@ resolve path, and it says nothing about a card it is not going to touch.
 pane adopted from the host, a successful relaunch. The attempt is recorded before
 the launch runs, so a launch that throws cannot retry every tick. After
 `MAX_LAUNCH_ATTEMPTS` (3) the card is told so once, `launchGaveUp` is set, and
-nothing more happens for that signature until `--reset`. And before it opens anything, a launch asks the host
+nothing more happens for that signature until `--reset`.
+
+**Except a project that is not here.** Before an attempt is spent, the tick checks
+that the card's project (`~/keep-tool`, or wherever `keep project` moved the card)
+is a directory on this host — the same check as lint's `missing-project` rule, and
+the one `openSession` makes again before refusing with "project directory does not
+exist". A missing project is an environment fault, not a launch: no agent ever
+existed, and spending the three attempts on it gave up on a signature nothing had
+looked at (the brief delivery card on 2026-09-17 burned all three that way). The
+card is still opened, with its evidence and recipe, but no worktree or session is
+made; the card is told once per outage (`Repair blocked: project … is not a
+directory on this host`, with the fix: a symlink from the checkout the daemon runs
+from, or `keep project <card> <path>`), `projectMissingAt` is set, and the count
+stays where it was — zero for a fresh card, or whatever a card whose project vanished
+under it had already spent — while `keep self-repair` shows the row as *paused …
+project missing* and `--dry` as `hold`. A relaunch the liveness sweep would have
+made is held the same way, and its check-in says so instead of promising a session.
+The first tick that finds the directory back clears the marker, whatever else still
+holds the launch, and the launch that then goes ahead is the next attempt. And before it opens anything, a launch asks the host
 whether the card already has a live pane **that this scheduler spawned** — the
 launch stamps `repair: true` into the pane meta, alongside `card` — so a spawn
 response lost after the pane came up does not become a second agent, while a
@@ -374,7 +392,7 @@ card carries none.
 
 ```sh
 keep self-repair                          # open signatures, their cards, cooldowns, today's count
-keep self-repair --dry                    # what the next tick would open, and why; writes nothing
+keep self-repair --dry                    # what the next tick would open (or hold, on a missing project), and why; writes nothing
 keep self-repair --json
 keep self-repair --reset <signature>      # clear one signature's cooldown and resolution
                                           #   (refused while its card is still open)

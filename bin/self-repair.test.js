@@ -306,6 +306,9 @@ function harness(options = {}) {
       return Promise.resolve(options.worktree || { ok: true, path: `/tmp/wt/keep-tool/${name}` });
     },
     insideWorktreeRoot: options.insideWorktreeRoot || (() => true),
+    // The card project is a directory on this host unless a test says otherwise:
+    // the real check would fail on any machine without ~/keep-tool.
+    projectExists: options.projectExists || (() => true),
     // No host by default: both answer "could not tell", which is what a daemon with
     // no terminal host sees, and neither may make anything happen on its own.
     findCardPane: options.findCardPane || (async () => null),
@@ -539,11 +542,18 @@ test('--dry explains what the next tick would do, and --reset clears a cooldown'
       { name: 'notes', consecutiveFailures: 6, lastError: 'notes is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
     ], { startedAt: NOW - 6 * 3600e3 });
     const config = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0, maxPerDay: 1 };
-    const dry = await selfRepair.dryRun({ root, now: NOW, config, snapshot: () => snapshot });
+    const dry = await selfRepair.dryRun({ root, now: NOW, config, snapshot: () => snapshot, projectExists: () => true });
     assert.deepEqual(dry.candidates.map((row) => row.action), ['open', 'skip']);
     assert.match(dry.candidates[1].why, /daily cap reached/);
     assert.match(selfRepair.renderDry(dry), /would open: Daemon self-repair: unblock/);
     assert.equal(selfRepair.loadState(root).signatures.unblock, undefined, '--dry writes nothing');
+
+    // Without the project the card would still be opened, paused, and it still
+    // takes the day's slot.
+    const held = await selfRepair.dryRun({ root, now: NOW, config, snapshot: () => snapshot, projectExists: () => false });
+    assert.deepEqual(held.candidates.map((row) => row.action), ['hold', 'skip']);
+    assert.match(held.candidates[0].why, /project ~\/keep-tool is not a directory on this host, so the card would be opened with its evidence and paused, no attempt spent/);
+    assert.match(selfRepair.renderDry(held), /hold sched:unblock:\w+ — .*\n     would open: Daemon self-repair: unblock/);
 
     selfRepair.mutateState((state) => {
       state.signatures['sched:unblock:abcd1234'] = { firstSeenAt: NOW, cardId: 'old-card', resolvedAt: NOW, cooldownUntil: NOW + 86400e3 };
@@ -1746,4 +1756,215 @@ test('landedShas reads only the shas keep land cited', () => {
   }), ['aaaaaaa1111']);
   assert.deepEqual(selfRepair.landedShas({ body: '' }), []);
   assert.deepEqual(selfRepair.landedShas(null), []);
+});
+
+// ---------- the project precheck ----------
+
+test('a missing project pauses the card without spending an attempt, and the launch goes ahead once it is back', async () => {
+  const root = makeRoot();
+  try {
+    const snapshot = snapshotOf([
+      { name: 'brief', consecutiveFailures: 6, lastError: 'delivery failed; retrying in 30 minutes', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const config = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 };
+    let present = false;
+    const { deps, calls } = harness({ root, snapshot, config, projectExists: () => present });
+
+    // The card is still opened: the evidence and the finding need somewhere to live.
+    const first = await selfRepair.tick(deps);
+    assert.equal(first.opened.length, 1);
+    assert.equal(first.opened[0].launched, false);
+    assert.match(first.opened[0].paused, /project ~\/keep-tool is not a directory on this host; no attempt spent/);
+    const sig = first.opened[0].sig;
+    assert.equal(calls.cards.length, 1);
+    assert.equal(calls.cards[0].project, '~/keep-tool');
+    assert.ok(calls.artifactText.has('recipe.md'), 'the evidence and recipe are attached');
+    assert.equal(calls.worktrees.length, 0, 'no worktree for a launch that cannot happen');
+    assert.equal(calls.runs.length, 0);
+    const note = calls.checkins.at(-1);
+    assert.equal(note.id, 'repair-card-1');
+    assert.match(note.message, /^Repair blocked: project ~\/keep-tool is not a directory on this host/);
+    assert.match(note.message, /No attempt was spent/);
+    assert.match(note.message, /ln -s \S+ ~\/keep-tool/, 'names the symlink fix with the checkout the daemon runs from');
+    assert.match(note.message, /keep project repair-card-1 <path> -m/);
+    let entry = selfRepair.loadState(root).signatures[sig];
+    assert.equal(entry.attempts, 0, 'the environment fault cost nothing');
+    assert.equal(entry.projectMissingAt, NOW);
+    assert.equal(entry.launchGaveUp, undefined);
+    assert.equal(selfRepair.loadState(root).openedToday, 1, 'the card still counts against the daily cap');
+
+    // Tick after tick, past the backoff, it stays paused: one check-in, no attempts,
+    // and never a give-up. Before this gate the same fault burned all three.
+    const before = calls.checkins.length;
+    let at = NOW;
+    for (let tick = 0; tick < 8; tick += 1) {
+      at += 20 * 60e3;
+      const again = await selfRepair.tick({ ...deps, now: at });
+      assert.deepEqual([again.opened, again.resumed], [[], []]);
+      assert.match(again.skipped[0].why, /project ~\/keep-tool is not a directory on this host; no attempt spent, paused until it exists/);
+    }
+    assert.equal(calls.checkins.length, before, 'said once, not once per tick');
+    entry = selfRepair.loadState(root).signatures[sig];
+    assert.equal(entry.attempts, 0);
+    assert.equal(entry.launchGaveUp, undefined);
+    assert.equal(calls.cards.length, 1, 'and no second card');
+
+    // The status and the dry run both say so.
+    assert.match(selfRepair.renderStatus(selfRepair.status({ root, now: at, config })), /0 attempt\(s\) — paused since 2026-09-15 12:00: project missing, no attempt spent/);
+    const dry = await selfRepair.dryRun({ root, now: at + 20 * 60e3, config, snapshot: () => snapshot, projectExists: () => present });
+    assert.equal(dry.candidates[0].action, 'hold');
+    assert.match(dry.candidates[0].why, /card repair-card-1 is open but project ~\/keep-tool is not a directory on this host; no attempt would be spent/);
+    assert.doesNotMatch(selfRepair.renderDry(dry), /would open/);
+
+    // Owner creates the directory. The very next tick launches on the card it has,
+    // and that is attempt 1 of 3, not 4.
+    present = true;
+    at += 20 * 60e3;
+    const resumed = await selfRepair.tick({ ...deps, now: at });
+    assert.equal(resumed.resumed.length, 1);
+    assert.equal(resumed.resumed[0].launched, true);
+    assert.equal(calls.worktrees.length, 1);
+    assert.equal(calls.runs.length, 1);
+    entry = selfRepair.loadState(root).signatures[sig];
+    assert.equal(entry.attempts, 1);
+    assert.equal(entry.projectMissingAt, undefined, 'the marker goes with the launch that cleared it');
+    assert.equal(entry.sessionId, '11111111-0000-4000-8000-000000000000');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a project that goes missing under an open card pauses the relaunch, and is said again per outage', async () => {
+  const root = makeRoot();
+  try {
+    const snapshot = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const config = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 };
+    let present = true;
+    let alive = true;
+    const { deps, calls } = harness({ root, snapshot, config, projectExists: () => present, paneAlive: async () => alive });
+    const opened = await selfRepair.tick(deps);
+    const sig = opened.opened[0].sig;
+    assert.equal(selfRepair.loadState(root).signatures[sig].attempts, 1);
+
+    // The session dies and the project is gone by the time the sweep relaunches.
+    alive = false;
+    present = false;
+    let at = NOW + 20 * 60e3;
+    await selfRepair.tick({ ...deps, now: at });              // deadSince
+    at += 15 * 60e3;
+    const relaunch = await selfRepair.tick({ ...deps, now: at }); // relaunchDue, then the gate
+    assert.equal(relaunch.relaunching.length, 1);
+    assert.match(relaunch.skipped[0].why, /no attempt spent, paused until it exists/);
+    let entry = selfRepair.loadState(root).signatures[sig];
+    assert.equal(entry.attempts, 1, 'the relaunch did not spend attempt 2 on a refusal');
+    assert.equal(entry.relaunchDue, true, 'and stays due');
+    // The sweep's own check-in does not promise a session the gate then holds.
+    const gone = calls.checkins.filter((c) => /has been gone for/.test(c.message));
+    assert.equal(gone.length, 1);
+    assert.match(gone[0].message, /the relaunch is held until project ~\/keep-tool is a directory on this host \(no attempt spent\)/);
+    assert.doesNotMatch(gone[0].message, /relaunching \(session/);
+    assert.equal(calls.checkins.filter((c) => /^Repair blocked/.test(c.message)).length, 1);
+
+    // Back, launched, gone again: the second outage gets its own check-in.
+    present = true;
+    at += 20 * 60e3;
+    const back = await selfRepair.tick({ ...deps, now: at });
+    assert.equal(back.resumed[0].launched, true);
+    entry = selfRepair.loadState(root).signatures[sig];
+    assert.equal(entry.attempts, 2);
+    assert.equal(entry.projectMissingAt, undefined);
+    alive = false;
+    present = false;
+    at += 20 * 60e3;
+    await selfRepair.tick({ ...deps, now: at });
+    at += 15 * 60e3;
+    await selfRepair.tick({ ...deps, now: at });
+    assert.equal(calls.checkins.filter((c) => /^Repair blocked/.test(c.message)).length, 2);
+    assert.equal(selfRepair.loadState(root).signatures[sig].attempts, 2);
+
+    // --reset forgets the marker with the rest of the launch record.
+    selfRepair.reset(sig, { root, now: at, loadTask: () => ({ fm: { status: 'done' } }) });
+    assert.equal(selfRepair.loadState(root).signatures[sig].projectMissingAt, undefined);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('the precheck reads the card\'s own project, so a moved card is checked where it points', async () => {
+  const root = makeRoot();
+  try {
+    const snapshot = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    const config = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 };
+    const asked = [];
+    const { deps, calls } = harness({
+      root, snapshot, config,
+      projectExists: (project) => { asked.push(project); return project === '/srv/keep-tool'; },
+      loadTask: (id) => ({ id, fm: { status: 'active', project: '/srv/keep-tool' } }),
+    });
+    // A fresh card is created with the default project, which is not here.
+    const opened = await selfRepair.tick(deps);
+    assert.equal(opened.opened[0].launched, false);
+    assert.deepEqual(asked, ['~/keep-tool']);
+    // Owner moved the card (`keep project`): the resume checks the new path and launches.
+    const resumed = await selfRepair.tick({ ...deps, now: NOW + 20 * 60e3 });
+    assert.equal(resumed.resumed[0].launched, true);
+    assert.equal(asked.at(-1), '/srv/keep-tool');
+    assert.equal(calls.runs.length, 1);
+
+    // A moved card that points nowhere gets the path advice, not the symlink one.
+    const note = selfRepair.projectMissingNote('a-card', '/srv/keep-tool');
+    assert.match(note, /keep project a-card <path> -m/);
+    assert.doesNotMatch(note, /ln -s/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('projectExists is the same answer as lint\'s missing-project rule', () => {
+  assert.equal(selfRepair.projectExists(os.tmpdir()), true);
+  assert.equal(selfRepair.projectExists(path.join(os.tmpdir(), 'keep-no-such-dir-' + process.pid)), false);
+  assert.equal(selfRepair.projectExists('relative/path'), false, 'a relative project resolves against nothing');
+  assert.equal(selfRepair.projectExists(''), false);
+  assert.equal(selfRepair.projectExists(__filename), false, 'a file is not a project');
+  assert.equal(selfRepair.liveCheckout(), path.resolve(__dirname, '..'));
+  assert.equal(selfRepair.cardProject(null), '~/keep-tool');
+  assert.equal(selfRepair.cardProject({ fm: { project: ' /x ' } }), '/x');
+});
+
+test('the pause note is retried when its check-in fails, and the marker never outlives the outage', async () => {
+  const root = makeRoot();
+  try {
+    const snapshot = snapshotOf([
+      { name: 'unblock', consecutiveFailures: 6, lastError: 'unblock is broken', lastErrorAt: NOW, lastOkAt: NOW - 5 * 3600e3 },
+    ], { startedAt: NOW - 6 * 3600e3 });
+    let present = false;
+    let registryLocked = true;
+    const { deps, calls } = harness({ root, snapshot, config: { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0 }, projectExists: () => present });
+    const checkin = deps.checkin;
+    deps.checkin = (id, payload) => {
+      if (registryLocked && /^Repair blocked/.test(payload.message)) throw new Error('index.lock exists');
+      return checkin(id, payload);
+    };
+
+    // The registry is locked on the tick that first sees the missing directory:
+    // no marker, so the note is tried again rather than lost for good.
+    const first = await selfRepair.tick(deps);
+    const sig = first.opened[0].sig;
+    assert.match(first.errors[0], /checkin repair-card-1: index.lock exists/);
+    assert.equal(selfRepair.loadState(root).signatures[sig].projectMissingAt, undefined);
+    registryLocked = false;
+    const second = await selfRepair.tick({ ...deps, now: NOW + 20 * 60e3 });
+    assert.deepEqual(second.errors, []);
+    assert.equal(calls.checkins.filter((c) => /^Repair blocked/.test(c.message)).length, 1);
+    assert.equal(selfRepair.loadState(root).signatures[sig].projectMissingAt, NOW + 20 * 60e3);
+    assert.equal(selfRepair.loadState(root).signatures[sig].attempts, 0);
+
+    // The directory comes back while launching is off. Nothing launches, but the
+    // marker goes: `keep self-repair` must name launch:false, not a project that is there.
+    present = true;
+    const off = { ...selfRepair.DEFAULT_CONFIG, minAgeMin: 0, launch: false };
+    const held = await selfRepair.tick({ ...deps, config: off, now: NOW + 40 * 60e3 });
+    assert.match(held.skipped[0].why, /launching is off/);
+    assert.equal(calls.runs.length, 0);
+    assert.equal(selfRepair.loadState(root).signatures[sig].projectMissingAt, undefined);
+    assert.doesNotMatch(selfRepair.renderStatus(selfRepair.status({ root, now: NOW + 40 * 60e3, config: off })), /project missing/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

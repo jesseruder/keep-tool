@@ -64,6 +64,11 @@ const PANE_DEAD_GRACE_MS = 10 * MINUTE_MS;
 // the run is dead whatever the entry says.
 const LEGACY_RUN_TTL_MS = MAX_BUDGET_MIN * MINUTE_MS;
 const REPO = 'keep-tool';
+// The card's project: the live checkout the recipe pulls into after the land and
+// the pre-bash guard refuses writes in. Both spell it this way, so a host whose
+// checkout lives elsewhere reaches it with a symlink here rather than by moving
+// the card (mainCheckouts and the guard both follow the link).
+const REPAIR_PROJECT = '~/keep-tool';
 
 const ZERO_IS_MEANINGFUL = new Set(['maxPerDay', 'restartsPerHour']);
 
@@ -594,6 +599,42 @@ function insideWorktreeRoot(candidate, wt = require('./wt.js')) {
   } catch { return false; }
 }
 
+// Whether a card project is a directory on this host: the check lint's
+// missing-project rule makes, and the one openSession makes again before it
+// refuses with "project directory does not exist". Asked before an attempt is
+// spent, because a project that is not here is an environment fault, not a
+// launch that failed: the session is refused before any agent exists, and
+// spending MAX_LAUNCH_ATTEMPTS on that gave up on a signature nothing had looked at.
+function projectExists(project) {
+  const raw = String(project || '').trim();
+  if (!raw || !(raw.startsWith('/') || /^~(?:\/|$)/.test(raw))) return false;
+  try { return fs.statSync(path.resolve(raw.replace(/^~(?=\/|$)/, require('os').homedir()))).isDirectory(); }
+  catch { return false; }
+}
+
+// The checkout this daemon is running from — what REPAIR_PROJECT is meant to name.
+function liveCheckout() {
+  return path.resolve(__dirname, '..');
+}
+
+// The project a launch on this card opens into: the card's own once it exists,
+// since Owner may have moved it with `keep project`, and the default before that.
+function cardProject(task) {
+  return String((task && task.fm && task.fm.project) || '').trim() || REPAIR_PROJECT;
+}
+
+// Said once per outage, with the fix. Only the default project gets the symlink
+// advice: a card Owner moved somewhere that does not exist is a path to correct.
+function projectMissingNote(cardId, project) {
+  const live = liveCheckout();
+  const fix = project === REPAIR_PROJECT
+    ? `The daemon is running from ${live}: \`ln -s ${live} ${project}\` makes it the live checkout under the name the recipe and the guard use, or \`keep project ${cardId} <path> -m "..."\` moves the card.`
+    : `\`keep project ${cardId} <path> -m "..."\` points the card at a checkout that exists.`;
+  return `Repair blocked: project ${project} is not a directory on this host, so no repair session can be opened on this card.`
+    + ' No attempt was spent; self-repair leaves this signature paused and launches on the first tick after the directory exists.'
+    + ` ${fix}`;
+}
+
 // A directory is only a worktree worth reusing once `wt new` finished with it:
 // a checkout plus either its install marker or its installed dependencies. A tree
 // abandoned half-built by a daemon that died mid-create has the .git file and
@@ -745,6 +786,7 @@ function defaultDeps(deps) {
     // deleted one is. The sweep and reset() both ask this.
     loadTask: deps.loadTask || ((id) => { try { return keep.loadTask(id, deps.root || keep.ROOT); } catch { return null; } }),
     insideWorktreeRoot: deps.insideWorktreeRoot || ((candidate) => insideWorktreeRoot(candidate)),
+    projectExists: deps.projectExists || ((project) => projectExists(project)),
     setPlan: deps.setPlan || ((task, steps) => keep.setPlan(task, steps)),
     onChange: deps.onChange || (() => {}),
   };
@@ -973,7 +1015,7 @@ function createRepairCard(candidate, snapshot, context) {
     title: cardTitle(candidate),
     kind: 'task',
     status: 'active',
-    project: '~/keep-tool',
+    project: REPAIR_PROJECT,
     tags: ['personal', SELF_NAME],
     note: symptomNote(candidate, previousCardId),
     linkSession: false,
@@ -1143,6 +1185,39 @@ async function launchRepair(candidate, cardId, artifacts, context) {
   };
 }
 
+// Pauses a signature whose card cannot be launched because its project is not
+// here. The card is told once per outage — the tick runs every few minutes, and a
+// check-in on each would bury the card's log — and `projectMissingAt` is the
+// marker; the launch that finally goes ahead clears it. Answers the skip reason.
+function pauseOnMissingProject(candidate, cardId, project, context) {
+  const { deps, root, now, result } = context;
+  const why = `project ${project} is not a directory on this host; no attempt spent, paused until it exists`;
+  const entry = loadState(root).signatures[candidate.sig] || {};
+  if (!entry.projectMissingAt) {
+    // The check-in first and the marker only once it is on the card, like the
+    // resolve path: a check-in that fails (a locked registry, say) is retried on
+    // the next tick instead of leaving the card open with no explanation.
+    try {
+      deps.checkin(cardId, {
+        heading: 'self-repair',
+        message: projectMissingNote(cardId, project),
+        linkSession: false,
+        commitLabel: SELF_NAME,
+      });
+    } catch (error) {
+      result.errors.push(`checkin ${cardId}: ${clip(error && error.message || error, 200)}`);
+      return why;
+    }
+    mutateState((value) => {
+      const fresh = value.signatures[candidate.sig];
+      if (fresh) fresh.projectMissingAt = now;
+    }, { root, now, write: deps.write });
+    deps.write(`keep self-repair: ${cardId} is paused: ${why}\n`);
+    deps.onChange();
+  }
+  return why;
+}
+
 // Why a reserved-but-unlaunched card is not resumed on this tick, or '' if it is.
 // A pane with no session id registered yet still blocks: an agent is running in
 // it, and a second one on the same fault is worse than a missing id.
@@ -1262,6 +1337,7 @@ async function tick(input = {}) {
         // up on its very first try because two earlier cards had a bad worktree.
         delete fresh.attempts;
         delete fresh.launchGaveUp;
+        delete fresh.projectMissingAt;
         fresh.ticks = 0;
       }, { root, now, write: deps.write });
       result.resolved.push(sig);
@@ -1329,12 +1405,19 @@ async function tick(input = {}) {
       // `--reset` reads to decide whether an unconfirmed launch might still be up.
       fresh.lastAttemptAt = now - RESUME_BACKOFF_MS;
     }, { root, now, write: deps.write });
+    // The opening loop makes the same check before it spends; saying "relaunching"
+    // here and then holding there would leave the card promised a session it
+    // does not get. The pause note that follows says what to fix.
+    const project = cardProject(task);
+    const held = !deps.projectExists(project);
     try {
       deps.checkin(entry.cardId, {
         heading: 'self-repair',
         message: `The repair session in pane ${entry.pane || '(unknown)'} has been gone for`
-          + ` ${describeAge(now - deadSince)} without landing; relaunching`
-          + ` (session ${attempts + 1} of ${MAX_LAUNCH_ATTEMPTS}).`,
+          + ` ${describeAge(now - deadSince)} without landing; `
+          + (held
+            ? `the relaunch is held until project ${project} is a directory on this host (no attempt spent).`
+            : `relaunching (session ${attempts + 1} of ${MAX_LAUNCH_ATTEMPTS}).`),
         linkSession: false,
         commitLabel: SELF_NAME,
       });
@@ -1352,8 +1435,25 @@ async function tick(input = {}) {
     if (!candidate.ready) { result.skipped.push({ sig: candidate.sig, why: candidate.why }); continue; }
 
     if (entry.cardId && !entry.resolvedAt) {
+      // The project has to be here before an attempt is worth spending: openSession
+      // refuses a card whose project is not a directory, and that refusal used to
+      // cost all MAX_LAUNCH_ATTEMPTS, three ticks apart, on one environment fault.
+      // Asked before the blockers so the pause marker never outlives the outage:
+      // with the directory back, whatever still holds the launch is the real reason.
+      const project = cardProject(deps.loadTask(entry.cardId));
+      const present = deps.projectExists(project);
+      if (present && entry.projectMissingAt) {
+        mutateState((value) => {
+          const fresh = value.signatures[candidate.sig];
+          if (fresh) delete fresh.projectMissingAt;
+        }, { root, now, write: deps.write });
+      }
       const why = resumeBlocker(entry, config, now);
       if (why) { result.skipped.push({ sig: candidate.sig, why }); continue; }
+      if (!present) {
+        result.skipped.push({ sig: candidate.sig, why: pauseOnMissingProject(candidate, entry.cardId, project, { deps, root, now, result }) });
+        continue;
+      }
 
       // Spend the attempt BEFORE the launch, not after. A launchRepair that throws
       // used to leave lastAttemptAt at 0 and the counter untouched, so the next
@@ -1368,6 +1468,7 @@ async function tick(input = {}) {
         fresh.attempts = attempts;
         fresh.lastAttemptAt = now;
         if (gaveUp) fresh.launchGaveUp = true;
+        delete fresh.projectMissingAt;
       }, { root, now, write: deps.write });
 
       try {
@@ -1419,6 +1520,11 @@ async function tick(input = {}) {
     }
     if (input.dry) { result.opened.push({ sig: candidate.sig, why: candidate.why, dry: true }); openedToday += 1; continue; }
 
+    // Decided before the card exists: the card is still opened, so the evidence
+    // and the finding have somewhere to live, but no attempt is spent on a launch
+    // that openSession would refuse. The resume path launches once the project is back.
+    const projectMissing = !deps.projectExists(REPAIR_PROJECT);
+
     // The slot is reserved inside createRepairCard, the moment the card exists.
     const reserve = (cardId) => mutateState((value) => {
       const fresh = value.signatures[candidate.sig] || (value.signatures[candidate.sig] = { firstSeenAt: candidate.firstSeenAt });
@@ -1429,8 +1535,9 @@ async function tick(input = {}) {
       fresh.pane = null;
       fresh.worktree = null;
       delete fresh.runId;
-      fresh.attempts = Number(fresh.attempts || 0) + 1;
+      fresh.attempts = Number(fresh.attempts || 0) + (projectMissing ? 0 : 1);
       fresh.lastAttemptAt = now;
+      delete fresh.projectMissingAt;
       delete fresh.resolvedAt;
       delete fresh.cooldownUntil;
       delete fresh.okSinceAt;
@@ -1483,6 +1590,12 @@ async function tick(input = {}) {
       result.opened.push({ sig: candidate.sig, cardId: card.cardId, sessionId: null, worktree: null, launched: false });
       deps.write(`keep self-repair: opened ${card.cardId} for ${candidate.sig} (launching is off)\n`);
       deps.onChange();
+      continue;
+    }
+
+    if (projectMissing) {
+      const why = pauseOnMissingProject(candidate, card.cardId, REPAIR_PROJECT, { deps, root, now, result });
+      result.opened.push({ sig: candidate.sig, cardId: card.cardId, sessionId: null, worktree: null, launched: false, paused: why });
       continue;
     }
 
@@ -1578,13 +1691,14 @@ function renderStatus(value) {
   // that has given up looks exactly like one that is working unless it says so.
   const state = (row) => (row.launchGaveUp
     ? ` — gave up after ${row.attempts || MAX_LAUNCH_ATTEMPTS} sessions (--reset to start over)`
+    : row.projectMissingAt ? ` — paused since ${stamp(row.projectMissingAt)}: project missing, no attempt spent`
     : row.relaunchDue ? ' — relaunch due'
       : row.deadSince ? ` — pane unseen since ${stamp(row.deadSince)}`
         : '');
   section('open', value.open, (row) => `${row.sig} — card ${row.cardId}`
     + `${row.sessionId ? `, session ${sessionRef(row.sessionId)}` : ''}${row.pane ? ` in pane ${row.pane}` : ''}`
     + `${row.worktree ? `, ${row.worktree}` : ''}`
-    + `, opened ${stamp(row.openedAt)}, ${row.attempts || 1} attempt(s)${state(row)}`);
+    + `, opened ${stamp(row.openedAt)}, ${row.attempts || 0} attempt(s)${state(row)}`);
   section('cooling down', value.cooling, (row) => `${row.sig} — card ${row.cardId || '(none)'}, until ${stamp(row.cooldownUntil)}`);
   section('watching', value.resolved, (row) => `${row.sig} — first seen ${stamp(row.firstSeenAt)}`
     + `${row.cardId ? `, last card ${row.cardId}` : ''}${row.resolvedAt ? `, resolved ${stamp(row.resolvedAt)}` : ''}`);
@@ -1598,6 +1712,8 @@ async function dryRun(options = {}) {
   const config = options.config || loadConfig(root, options.write || (() => {}));
   const snapshot = options.snapshot ? options.snapshot(now) : health.snapshot(now);
   const state = loadState(root);
+  const exists = options.projectExists || projectExists;
+  const loadTask = options.loadTask || ((id) => { try { return keep.loadTask(id, root); } catch { return null; } });
   const candidates = signatures(snapshot, deliveryRowOf(snapshot), now, config, state);
   let openedToday = state.day === localDay(now) ? Number(state.openedToday || 0) : 0;
   const rows = [];
@@ -1608,13 +1724,18 @@ async function dryRun(options = {}) {
     if (!candidate.ready) { action = 'wait'; }
     else if (entry.cardId && !entry.resolvedAt) {
       const blocker = resumeBlocker(entry, config, now);
+      const project = cardProject(loadTask(entry.cardId));
       if (blocker) { action = 'skip'; why = blocker; }
+      else if (!exists(project)) { action = 'hold'; why = `card ${entry.cardId} is open but project ${project} is not a directory on this host; no attempt would be spent`; }
       else { action = 'redo'; why = `card ${entry.cardId} is open but never launched; would retry the worktree and the session`; }
     }
     else if (entry.cooldownUntil && now < Number(entry.cooldownUntil)) { action = 'skip'; why = `in cooldown until ${stamp(entry.cooldownUntil)}`; }
     else if (openedToday >= Number(config.maxPerDay)) { action = 'skip'; why = `daily cap reached (${config.maxPerDay} per day)`; }
+    else if (!exists(REPAIR_PROJECT)) { action = 'hold'; why = `${candidate.why}; project ${REPAIR_PROJECT} is not a directory on this host, so the card would be opened with its evidence and paused, no attempt spent`; openedToday += 1; }
     else openedToday += 1;
-    rows.push({ sig: candidate.sig, kind: candidate.kind, label: candidate.label, action, why, title: cardTitle(candidate) });
+    // `opens`: this tick would create the card, launched or paused.
+    const opens = action === 'open' || (action === 'hold' && !(entry.cardId && !entry.resolvedAt));
+    rows.push({ sig: candidate.sig, kind: candidate.kind, label: candidate.label, action, why, opens, title: cardTitle(candidate) });
   }
   return { enabled: config.enabled, candidates: rows };
 }
@@ -1623,7 +1744,7 @@ function renderDry(value) {
   if (!value.enabled) return 'self-repair is disabled (keep self-repair --enable to turn it on)';
   if (!value.candidates.length) return 'no candidate signatures; the next tick would open nothing';
   return value.candidates.map((row) =>
-    `${row.action.padEnd(4)} ${row.sig} — ${row.why}${row.action === 'open' ? `\n     would open: ${row.title}` : ''}`).join('\n');
+    `${row.action.padEnd(4)} ${row.sig} — ${row.why}${row.opens ? `\n     would open: ${row.title}` : ''}`).join('\n');
 }
 
 // Owner's escape hatch: forget a signature's cooldown and resolution so the next
@@ -1688,6 +1809,7 @@ function reset(sig, options = {}) {
     delete entry.relaunchDue;
     delete entry.deadSince;
     delete entry.attempts;
+    delete entry.projectMissingAt;
     delete entry.firstSeenAt;
     entry.ticks = 0;
     return { found: true, cleared: true, previousCardId: entry.previousCardId || null };
@@ -1704,6 +1826,7 @@ module.exports = {
   findRecipeArtifact, launchModel, isRepairSession, cardForSession, landedShas, landedFor,
   LEGACY_RUN_TTL_MS, PANE_DEAD_GRACE_MS,
   worktreeName, worktreePath, insideWorktreeRoot, spawnWorktree, worktreeReady,
+  REPAIR_PROJECT, projectExists, liveCheckout, cardProject, projectMissingNote,
   createRepairCard, launchRepair, resumeBlocker, EXCLUDED, MAX_LAUNCH_ATTEMPTS, RESUME_BACKOFF_MS,
   tick, startScheduler, status, renderStatus, dryRun, renderDry, reset,
   _resetWarnings,
