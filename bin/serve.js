@@ -1571,7 +1571,31 @@ function customModelPickerPossible(session, processArgs, deps = {}) {
     try { settings = read(file); } catch { return true; }
     if (settings && settings.modelPicker != null) return true;
   }
+  // macOS managed preferences (an MDM profile) are a policy source too, and a plist is not
+  // parsed here: one that exists is taken as possibly carrying picker rows. Policy the
+  // harness fetches from the organization's server is not on disk to check at all, and
+  // neither is the settings file as it stood when the switch was made; those are the
+  // residual the label rule accepts, and it is bounded to the context window of a model
+  // whose family and version the record or launch metadata has already proven.
+  try {
+    const preferences = typeof deps.managedPreferenceFiles === 'function'
+      ? deps.managedPreferenceFiles()
+      : deps.managedPreferenceFiles;
+    const exists = deps.fileExists || fs.existsSync;
+    for (const file of preferences || managedPreferenceFiles()) if (exists(file)) return true;
+  } catch { return true; }
   return false;
+}
+
+function managedPreferenceFiles() {
+  if (process.platform !== 'darwin') return [];
+  const plist = 'com.anthropic.claudecode.plist';
+  let user = '';
+  try { user = os.userInfo().username; } catch { user = ''; }
+  return [
+    path.join('/Library/Managed Preferences', plist),
+    ...(user ? [path.join('/Library/Managed Preferences', user, plist)] : []),
+  ];
 }
 
 // The model a session launched with no `--model` inherited: `claude` reads it out of the

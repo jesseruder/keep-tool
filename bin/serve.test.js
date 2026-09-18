@@ -2369,7 +2369,9 @@ test('handoff model resolution follows a /model typed after the newest assistant
       args = 'claude --model claude-opus-4-5') => {
       const file = path.join(dir, `${name}.jsonl`);
       fs.writeFileSync(file, `${rows.join('\n')}\n`);
-      return handoffCurrentModel(session, pane, args, { findSessionFile: () => file, ...deps });
+      return handoffCurrentModel(session, pane, args, {
+        findSessionFile: () => file, managedSettingsFiles: [], managedPreferenceFiles: [], ...deps,
+      });
     };
 
     assert.equal(resolve('switched', [
@@ -2468,7 +2470,7 @@ test('handoff model resolution follows a /model typed after the newest assistant
       real('claude-fable-5-1'), synthetic,
     ];
     const fablePane = { meta: { model: 'claude-fable-5-1' } };
-    const account = { forSession: () => ({ configDir: '/acct' }) };
+    const account = { forSession: () => ({ configDir: '/acct' }), managedPreferenceFiles: [] };
     const settings = (map) => ({ readSettingsFile: (file) => (file in map ? map[file] : null) });
     assert.equal(resolve('picker-custom-rows', pickerRows, {
       ...account,
@@ -2492,6 +2494,11 @@ test('handoff model resolution follows a /model typed after the newest assistant
         return null;
       },
     }, fablePane), '<unknown>', 'a settings file we cannot read is not a settings file that says nothing');
+    assert.equal(resolve('picker-custom-plist', pickerRows, {
+      ...account, managedSettingsFiles: [], ...settings({}),
+      managedPreferenceFiles: ['/Library/Managed Preferences/com.anthropic.claudecode.plist'],
+      fileExists: (file) => file === '/Library/Managed Preferences/com.anthropic.claudecode.plist',
+    }, fablePane), '<unknown>', 'an MDM profile is a policy source this does not parse, so its presence is enough');
     assert.equal(resolve('picker-custom-flag', pickerRows, {
       ...account, ...settings({}),
     }, fablePane, 'claude --settings /x.json --model claude-opus-4-5'), '<unknown>',
