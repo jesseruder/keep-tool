@@ -237,6 +237,71 @@ test("host_status lists the connected sessions without touching the extension", 
   assert.equal(extension.messages.length, before, "host_status must not reach the extension");
 });
 
+test("a client cannot send the host's own control messages", async (t) => {
+  const { socketFile, extension } = await startHost(t);
+  const client = await connect(socketFile);
+  client.send({ id: "h", method: "hello", params: { sessionKey: "sneaky-session", name: "sneaky" } });
+  await client.reply("h");
+
+  const before = extension.messages.length;
+  for (const [id, method] of [
+    ["c1", "session_closed"],
+    ["c2", "session_hello"],
+    ["c3", "ping"],
+    ["c4", "pong"],
+    ["c5", "not_a_tool"],
+  ]) {
+    client.send({ id, method, params: { sessionKey: "someone-else" } });
+    const reply = await client.reply(id);
+    assert.equal(reply.ok, false, method);
+    assert.match(reply.error.message, /Unknown method/, method);
+  }
+  assert.equal(extension.messages.length, before, "nothing reached the extension");
+});
+
+test("a hostile id is rejected instead of taking the broker down", async (t) => {
+  const { socketFile } = await startHost(t);
+  const client = await connect(socketFile);
+  client.send({ id: "h", method: "hello", params: { sessionKey: "id-session", name: "ids" } });
+  await client.reply("h");
+
+  // An object id would throw the moment it was used as a Map key or template value.
+  client.socket.write('{"id":{"toString":null},"method":"read_page","params":{"tabId":1}}\n');
+  client.socket.write('{"id":[],"method":"read_page","params":{"tabId":1}}\n');
+  await waitFor(() => client.replies.filter((message) => message.id === null).length >= 2, {
+    label: "both malformed ids to be refused",
+  });
+  for (const reply of client.replies.filter((message) => message.id === null)) {
+    assert.equal(reply.ok, false);
+    assert.match(reply.error.message, /id must be a short string or a number/);
+  }
+
+  // The broker is still serving.
+  client.send({ id: "after", method: "host_status", params: {} });
+  const reply = await client.reply("after");
+  assert.equal(reply.ok, true);
+});
+
+test("wire ids carry a per-host nonce so a new host cannot collide with an old one", async (t) => {
+  const first = await startHost(t);
+  const clientOne = await connect(first.socketFile);
+  clientOne.send({ id: "h", method: "hello", params: { sessionKey: "nonce-one", name: "one" } });
+  await clientOne.reply("h");
+  clientOne.send({ id: "c1", method: "read_page", params: { tabId: 1 } });
+  const fromFirst = await first.extension.waitFor((m) => m.method === "read_page", "the first forward");
+
+  const second = await startHost(t);
+  const clientTwo = await connect(second.socketFile);
+  clientTwo.send({ id: "h", method: "hello", params: { sessionKey: "nonce-two", name: "two" } });
+  await clientTwo.reply("h");
+  clientTwo.send({ id: "c1", method: "read_page", params: { tabId: 1 } });
+  const fromSecond = await second.extension.waitFor((m) => m.method === "read_page", "the second forward");
+
+  // Same client number, same request id, different hosts: the ids must still differ.
+  assert.notEqual(fromFirst.id, fromSecond.id);
+  assert.match(fromFirst.id, /^w[0-9a-z]+_1_c1$/);
+});
+
 test("the socket file is removed when the extension port closes", async (t) => {
   const { child, socketFile } = await startHost(t);
   assert.ok(fs.existsSync(socketFile));
@@ -245,6 +310,43 @@ test("the socket file is removed when the extension port closes", async (t) => {
   const code = await new Promise((resolve) => child.once("exit", resolve));
   assert.equal(code, 0);
   assert.equal(fs.existsSync(socketFile), false);
+});
+
+test("shutdown leaves a socket this host did not bind alone", async (t) => {
+  const { child, socketFile } = await startHost(t);
+  assert.ok(fs.existsSync(socketFile));
+
+  // Stand in for a newer host that took the path over while this one was still alive.
+  fs.unlinkSync(socketFile);
+  const replacement = net.createServer(() => {});
+  await new Promise((resolve) => replacement.listen(socketFile, resolve));
+  t.after(() => replacement.close());
+
+  child.stdin.end();
+  await new Promise((resolve) => child.once("exit", resolve));
+  assert.equal(fs.existsSync(socketFile), true, "the replacement socket must survive");
+});
+
+test("a log that is a symlink is refused rather than followed", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bb-"));
+  const target = path.join(dir, "victim.txt");
+  fs.writeFileSync(target, "important\n");
+  fs.symlinkSync(target, path.join(dir, "host.log"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  const child = spawn(process.execPath, [HOST, EXTENSION_ORIGIN], {
+    env: { ...process.env, BROWSER_BRIDGE_RUNTIME_DIR: dir },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk.toString();
+  });
+  const code = await new Promise((resolve) => child.once("exit", resolve));
+  assert.equal(code, 1);
+  assert.match(stderr, /symlink/);
+  assert.equal(fs.readFileSync(target, "utf8"), "important\n");
+  assert.equal(fs.existsSync(path.join(dir, "bridge.sock")), false);
 });
 
 test("a host started for another extension origin refuses to run", async (t) => {

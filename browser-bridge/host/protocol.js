@@ -74,27 +74,73 @@ export class NativeDecoder {
 
 let chunkSeq = 0;
 
+/** At most this many frames per message, so a bad peer cannot allocate forever. */
+export const MAX_CHUNKS = 64;
+/** And no reassembled message may be larger than this. */
+export const MAX_ASSEMBLED_BYTES = 16 * 1024 * 1024;
+/** Half a message that never finishes is dropped after this long. */
+export const CHUNK_TTL_MS = 60_000;
+
+/**
+ * How many UTF-8 bytes this code point costs once JSON-escaped inside a string.
+ * The chunk's payload is escaped a second time when the frame is stringified, so
+ * measuring the raw text is not enough: "\\" doubles and a control character sextuples.
+ */
+function escapedByteLength(codePoint) {
+  if (codePoint === 0x22 || codePoint === 0x5c) return 2; // " and \
+  if (codePoint < 0x20) {
+    // \b \t \n \f \r have two-character escapes; everything else becomes \u00xx.
+    return codePoint === 8 || codePoint === 9 || codePoint === 10 || codePoint === 12 || codePoint === 13
+      ? 2
+      : 6;
+  }
+  if (codePoint < 0x80) return 1;
+  if (codePoint < 0x800) return 2;
+  // Lone surrogates survive as \udXXX escapes; real pairs stay as 4 UTF-8 bytes.
+  if (codePoint >= 0xd800 && codePoint <= 0xdfff) return 6;
+  if (codePoint < 0x10000) return 3;
+  return 4;
+}
+
 /**
  * Split one logical message into native frames. Small messages pass through
  * untouched; big ones become `{id, chunk, of, data}` carrying slices of the JSON
  * text, which the receiver concatenates and parses once.
+ *
+ * Every returned frame is under `max` bytes *when encoded*, which is what Chrome's
+ * 1 MiB native-messaging limit actually measures.
  */
 export function chunkMessage(message, max = MAX_CHUNK_BYTES) {
   const text = JSON.stringify(message);
   if (Buffer.byteLength(text, "utf8") <= max) return [message];
 
-  // Slice on UTF-8 byte boundaries so no surrogate pair is cut in half.
-  const bytes = Buffer.from(text, "utf8");
-  const parts = [];
-  let offset = 0;
-  while (offset < bytes.length) {
-    let end = Math.min(offset + max, bytes.length);
-    while (end > offset && end < bytes.length && (bytes[end] & 0xc0) === 0x80) end -= 1;
-    parts.push(bytes.subarray(offset, end).toString("utf8"));
-    offset = end;
-  }
-
   const id = message.id ?? `chunked_${process.pid}_${chunkSeq++}`;
+  // The envelope with the largest plausible counters, so the budget is never optimistic.
+  const overhead = Buffer.byteLength(
+    JSON.stringify({ id, chunk: MAX_CHUNKS, of: MAX_CHUNKS, data: "" }),
+    "utf8",
+  );
+  const budget = max - overhead;
+  if (budget <= 0) throw new Error(`chunk limit ${max} is too small for a frame envelope`);
+
+  const parts = [];
+  let current = "";
+  let used = 0;
+  for (const character of text) {
+    const cost = escapedByteLength(character.codePointAt(0));
+    if (used + cost > budget) {
+      parts.push(current);
+      current = "";
+      used = 0;
+    }
+    current += character;
+    used += cost;
+  }
+  if (current) parts.push(current);
+
+  if (parts.length > MAX_CHUNKS) {
+    throw new Error(`message needs ${parts.length} chunks, over the ${MAX_CHUNKS} limit`);
+  }
   return parts.map((data, index) => ({ id, chunk: index, of: parts.length, data }));
 }
 
@@ -107,19 +153,43 @@ export function isChunk(message) {
 export class ChunkAssembler {
   #pending = new Map();
 
-  accept(message) {
+  accept(message, now = Date.now()) {
     if (!isChunk(message)) return message;
+    this.#expire(now);
+
     const { id, chunk, of, data } = message;
+    if (!Number.isInteger(of) || of < 1 || of > MAX_CHUNKS) {
+      throw new Error(`chunk count out of range: ${of}`);
+    }
+    if (!Number.isInteger(chunk) || chunk < 0 || chunk >= of) {
+      throw new Error(`chunk index out of range: ${chunk} of ${of}`);
+    }
+
     let slot = this.#pending.get(id);
     if (!slot) {
-      slot = { of, parts: new Array(of).fill(null), seen: 0 };
+      slot = { of, parts: new Array(of).fill(null), seen: 0, bytes: 0, at: now };
       this.#pending.set(id, slot);
     }
+    if (slot.of !== of) throw new Error(`chunk count changed mid-message for ${id}`);
     if (slot.parts[chunk] === null) slot.seen += 1;
+    else slot.bytes -= Buffer.byteLength(slot.parts[chunk], "utf8");
     slot.parts[chunk] = data;
+    slot.bytes += Buffer.byteLength(data, "utf8");
+    slot.at = now;
+    if (slot.bytes > MAX_ASSEMBLED_BYTES) {
+      this.#pending.delete(id);
+      throw new Error(`chunked message ${id} exceeded ${MAX_ASSEMBLED_BYTES} bytes`);
+    }
+
     if (slot.seen < slot.of) return null;
     this.#pending.delete(id);
     return JSON.parse(slot.parts.join(""));
+  }
+
+  #expire(now) {
+    for (const [id, slot] of this.#pending) {
+      if (now - slot.at > CHUNK_TTL_MS) this.#pending.delete(id);
+    }
   }
 
   get pendingCount() {
@@ -137,28 +207,39 @@ export function encodeLine(object) {
   return `${text}\n`;
 }
 
-/** Newline-delimited JSON with a hard cap, so a wedged peer cannot exhaust memory. */
+const NEWLINE = 0x0a;
+
+/**
+ * Newline-delimited JSON with a hard cap, so a wedged peer cannot exhaust memory.
+ *
+ * Buffering is done in bytes, not in a string: a socket read can land in the middle of
+ * a multi-byte character, and decoding each read on its own would replace both halves
+ * with U+FFFD. A newline byte can never be part of a UTF-8 sequence, so splitting on it
+ * before decoding is safe.
+ */
 export class LineDecoder {
-  #buffer = "";
+  #buffer = Buffer.alloc(0);
 
   push(chunk) {
-    this.#buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), "utf8");
+    this.#buffer = this.#buffer.length ? Buffer.concat([this.#buffer, bytes]) : Buffer.from(bytes);
     const out = [];
     for (;;) {
-      const newline = this.#buffer.indexOf("\n");
+      const newline = this.#buffer.indexOf(NEWLINE);
       if (newline === -1) {
-        if (Buffer.byteLength(this.#buffer, "utf8") > MAX_LINE_BYTES) {
+        if (this.#buffer.length > MAX_LINE_BYTES) {
           throw new Error("socket line exceeded the 4 MiB limit");
         }
         return out;
       }
-      const line = this.#buffer.slice(0, newline);
-      this.#buffer = this.#buffer.slice(newline + 1);
-      if (Buffer.byteLength(line, "utf8") > MAX_LINE_BYTES) {
+      const line = this.#buffer.subarray(0, newline);
+      this.#buffer = this.#buffer.subarray(newline + 1);
+      if (line.length > MAX_LINE_BYTES) {
         throw new Error("socket line exceeded the 4 MiB limit");
       }
-      if (line.trim() === "") continue;
-      out.push(JSON.parse(line));
+      const text = line.toString("utf8").trim();
+      if (text === "") continue;
+      out.push(JSON.parse(text));
     }
   }
 }

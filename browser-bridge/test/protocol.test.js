@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  CHUNK_TTL_MS,
   ChunkAssembler,
   EXTENSION_ID,
   EXTENSION_KEY,
   LineDecoder,
+  MAX_CHUNKS,
   MAX_CHUNK_BYTES,
   NativeDecoder,
   chunkMessage,
@@ -16,6 +18,10 @@ import {
   runtimeDir,
   socketPath,
 } from "../host/protocol.js";
+import {
+  ChunkAssembler as ExtensionAssembler,
+  chunkMessage as extensionChunkMessage,
+} from "../extension/lib/native.js";
 
 test("native framing round trips one message", () => {
   const message = { id: "c1", method: "hello", params: { sessionKey: "abc" } };
@@ -89,6 +95,68 @@ test("out-of-order chunks still reassemble", () => {
   assert.deepEqual(assembled, message);
 });
 
+test("an escape-heavy payload still produces frames Chrome will carry", () => {
+  // Every backslash doubles when the chunk's data is put inside the frame's JSON, so
+  // measuring the raw text would hand Chrome a frame well over its 1 MiB limit.
+  const message = { id: "esc", ok: true, result: { blob: "\\".repeat(1_500_000) } };
+  for (const chunk of [chunkMessage, extensionChunkMessage]) {
+    const frames = chunk(message);
+    for (const frame of frames) {
+      const encoded = Buffer.byteLength(JSON.stringify(frame), "utf8");
+      assert.ok(encoded <= MAX_CHUNK_BYTES, `frame of ${encoded} bytes is over the limit`);
+    }
+    const assembler = new ChunkAssembler();
+    let assembled = null;
+    for (const frame of frames) assembled = assembler.accept(frame) ?? assembled;
+    assert.deepEqual(assembled, message);
+  }
+});
+
+test("control characters are measured at their escaped size too", () => {
+  const message = { id: "ctl", text: "".repeat(300_000) };
+  for (const frame of chunkMessage(message)) {
+    assert.ok(Buffer.byteLength(JSON.stringify(frame), "utf8") <= MAX_CHUNK_BYTES);
+  }
+});
+
+test("the assembler refuses an absurd chunk count or index", () => {
+  const assembler = new ChunkAssembler();
+  assert.throws(() => assembler.accept({ id: "x", chunk: 0, of: MAX_CHUNKS + 1, data: "a" }), /out of range/);
+  assert.throws(() => assembler.accept({ id: "x", chunk: 0, of: 0, data: "a" }), /out of range/);
+  assert.throws(() => assembler.accept({ id: "x", chunk: 5, of: 2, data: "a" }), /out of range/);
+  assert.throws(() => assembler.accept({ id: "x", chunk: -1, of: 2, data: "a" }), /out of range/);
+});
+
+test("the assembler caps how much one message may claim", () => {
+  const assembler = new ChunkAssembler();
+  const megabyte = "z".repeat(1024 * 1024);
+  assert.throws(() => {
+    for (let index = 0; index < 20; index++) {
+      assembler.accept({ id: "big", chunk: index, of: 20, data: megabyte });
+    }
+  }, /exceeded/);
+  assert.equal(assembler.pendingCount, 0, "the half-message is dropped, not kept");
+});
+
+test("a half-finished message is forgotten after its TTL", () => {
+  const assembler = new ChunkAssembler();
+  const start = 1_000_000;
+  assert.equal(assembler.accept({ id: "half", chunk: 0, of: 2, data: '{"a":1' }, start), null);
+  assert.equal(assembler.pendingCount, 1);
+  // A later frame for a different message sweeps the stale one out.
+  assembler.accept({ id: "other", chunk: 0, of: 2, data: "x" }, start + CHUNK_TTL_MS + 1);
+  assert.equal(assembler.pendingCount, 1);
+});
+
+test("the extension's assembler enforces the same limits", () => {
+  const assembler = new ExtensionAssembler();
+  assert.throws(() => assembler.accept({ id: "x", chunk: 0, of: 999, data: "a" }), /out of range/);
+  const frames = extensionChunkMessage({ id: "round", blob: "y".repeat(1_200_000) });
+  let assembled = null;
+  for (const frame of frames) assembled = assembler.accept(frame) ?? assembled;
+  assert.equal(assembled.blob.length, 1_200_000);
+});
+
 test("a non-chunk message passes through the assembler untouched", () => {
   const assembler = new ChunkAssembler();
   assert.deepEqual(assembler.accept({ event: "pong" }), { event: "pong" });
@@ -103,6 +171,24 @@ test("the line codec buffers a partial line", () => {
   const decoder = new LineDecoder();
   assert.deepEqual(decoder.push('{"id":'), []);
   assert.deepEqual(decoder.push('"a"}\n'), [{ id: "a" }]);
+});
+
+test("the line codec survives a character split across two reads", () => {
+  const decoder = new LineDecoder();
+  const line = Buffer.from(`${JSON.stringify({ text: "A\u{1F600}B" })}\n`, "utf8");
+  // Cut through the middle of the four-byte emoji.
+  const emojiStart = line.indexOf(0xf0);
+  const cut = emojiStart + 2;
+  assert.deepEqual(decoder.push(line.subarray(0, cut)), []);
+  assert.deepEqual(decoder.push(line.subarray(cut)), [{ text: "A\u{1F600}B" }]);
+});
+
+test("the line codec handles a newline arriving in a later read", () => {
+  const decoder = new LineDecoder();
+  const payload = Buffer.from(`${JSON.stringify({ a: "é" })}\n${JSON.stringify({ b: 2 })}\n`, "utf8");
+  const collected = [];
+  for (const byte of payload) collected.push(...decoder.push(Buffer.from([byte])));
+  assert.deepEqual(collected, [{ a: "é" }, { b: 2 }]);
 });
 
 test("the line codec rejects a line past the 4 MiB cap", () => {

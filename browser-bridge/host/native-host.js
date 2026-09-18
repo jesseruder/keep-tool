@@ -3,9 +3,11 @@
 // calls connectNative, and kills it when the worker dies. It owns the Unix socket and
 // multiplexes any number of MCP server processes onto the single native port.
 
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 
+import { TOOL_NAMES } from "../mcp/tools.js";
 import {
   ChunkAssembler,
   EXTENSION_ORIGIN,
@@ -28,6 +30,15 @@ const MAX_LOG_BYTES = 1024 * 1024;
 // Only the tests set this; 90 s is the real per-request budget.
 const TIMEOUT_MS = Number(process.env.BROWSER_BRIDGE_REQUEST_TIMEOUT_MS) || REQUEST_TIMEOUT_MS;
 
+/**
+ * Nothing this host sends the extension may collide with a request from an earlier
+ * host: the extension can outlive us and answer a stale id against the new port.
+ */
+const WIRE_NONCE = `${process.pid.toString(36)}${randomBytes(4).toString("hex")}`;
+
+/** Methods a socket client may ask us to forward: the tools, and nothing else. */
+const FORWARDABLE = new Set(TOOL_NAMES);
+
 let logStream = null;
 
 function log(...parts) {
@@ -35,22 +46,47 @@ function log(...parts) {
   if (logStream) logStream.write(line);
 }
 
-function openLog() {
+/**
+ * The runtime directory holds the socket and the log, so it is checked before either is
+ * touched: a real directory, ours, and not readable by anyone else.
+ */
+function ensureRuntimeDir() {
   fs.mkdirSync(DIR, { recursive: true, mode: 0o700 });
+  const stat = fs.lstatSync(DIR);
+  if (!stat.isDirectory()) throw new Error(`${DIR} is not a directory`);
+  if (stat.uid !== process.getuid()) throw new Error(`${DIR} is not owned by this user`);
+  if (stat.mode & 0o077) fs.chmodSync(DIR, 0o700);
+}
+
+function openLog() {
+  let existing = null;
   try {
-    // Keep only the tail: this file is append-only across every host start.
-    const stat = fs.statSync(LOG);
-    if (stat.size > MAX_LOG_BYTES) {
+    existing = fs.lstatSync(LOG);
+  } catch {
+    existing = null; // first run
+  }
+  if (existing) {
+    // Never follow a symlink or write into someone else's file: this path is attacker
+    // -plantable in a way the directory checks above do not cover on their own.
+    if (existing.isSymbolicLink()) throw new Error(`${LOG} is a symlink`);
+    if (!existing.isFile()) throw new Error(`${LOG} is not a regular file`);
+    if (existing.uid !== process.getuid()) throw new Error(`${LOG} is not owned by this user`);
+    if (existing.size > MAX_LOG_BYTES) {
+      // Keep only the tail: this file is append-only across every host start.
       const fd = fs.openSync(LOG, "r");
       const keep = Buffer.allocUnsafe(MAX_LOG_BYTES);
-      fs.readSync(fd, keep, 0, MAX_LOG_BYTES, stat.size - MAX_LOG_BYTES);
+      fs.readSync(fd, keep, 0, MAX_LOG_BYTES, existing.size - MAX_LOG_BYTES);
       fs.closeSync(fd);
       fs.writeFileSync(LOG, keep, { mode: 0o600 });
     }
-  } catch {
-    // no log yet
   }
-  logStream = fs.createWriteStream(LOG, { flags: "a", mode: 0o600 });
+  const flags =
+    fs.constants.O_WRONLY |
+    fs.constants.O_CREAT |
+    fs.constants.O_APPEND |
+    (fs.constants.O_NOFOLLOW ?? 0);
+  const fd = fs.openSync(LOG, flags, 0o600);
+  logStream = fs.createWriteStream(null, { fd });
 }
 
 // --- extension port -------------------------------------------------------
@@ -121,8 +157,14 @@ function announceSession(client) {
   });
 }
 
+/** Ids have to survive a JSON round trip and be usable as a Map key. */
+function validRequestId(id) {
+  if (typeof id === "string") return id.length > 0 && id.length <= 200;
+  return typeof id === "number" && Number.isFinite(id);
+}
+
 function forward(client, message) {
-  const wireId = `w${client.id}_${message.id}`;
+  const wireId = `w${WIRE_NONCE}_${client.id}_${message.id}`;
   const timer = setTimeout(() => {
     pending.delete(wireId);
     replyToClient(client, message.id, false, {
@@ -144,7 +186,11 @@ function forward(client, message) {
 
 function onClientMessage(client, message) {
   if (message == null || typeof message !== "object" || typeof message.method !== "string") {
-    replyToClient(client, message?.id ?? null, false, { message: "malformed request" });
+    replyToClient(client, null, false, { message: "malformed request" });
+    return;
+  }
+  if (message.id !== undefined && message.id !== null && !validRequestId(message.id)) {
+    replyToClient(client, null, false, { message: "id must be a short string or a number" });
     return;
   }
   if (!client.sessionKey) {
@@ -180,6 +226,12 @@ function onClientMessage(client, message) {
   }
   if (message.method === "host_status") {
     replyToClient(client, message.id, true, hostStatus());
+    return;
+  }
+  // session_hello, session_closed and ping are ours to send, never a client's: a client
+  // that could name them could rename or evict another session's tab group.
+  if (!FORWARDABLE.has(message.method)) {
+    replyToClient(client, message.id, false, { message: `Unknown method: ${message.method}` });
     return;
   }
   if (!extensionReady) {
@@ -245,11 +297,7 @@ function onExtensionMessage(raw) {
  * from a host that was killed, so it is ours to remove.
  */
 function secureBind(server) {
-  fs.mkdirSync(DIR, { recursive: true, mode: 0o700 });
-  const dirStat = fs.lstatSync(DIR);
-  if (!dirStat.isDirectory()) throw new Error(`${DIR} is not a directory`);
-  if (dirStat.uid !== process.getuid()) throw new Error(`${DIR} is not owned by this user`);
-  if (dirStat.mode & 0o077) fs.chmodSync(DIR, 0o700);
+  ensureRuntimeDir();
 
   let existing = null;
   try {
@@ -263,39 +311,56 @@ function secureBind(server) {
   }
 
   return new Promise((resolve, reject) => {
-    const tryListen = () => {
-      server.once("error", (error) => {
-        if (error.code !== "EADDRINUSE") return reject(error);
-        // Live host or corpse? Ask it.
-        const probe = net.connect(SOCKET);
-        probe.setTimeout(1000);
-        probe.on("connect", () => {
-          probe.destroy();
-          reject(new Error("another Browser Bridge host is already listening"));
-        });
-        const takeOver = () => {
-          probe.destroy();
-          try {
-            fs.unlinkSync(SOCKET);
-          } catch {
-            // raced with another host; the listen below will fail loudly
-          }
-          server.once("error", reject);
-          server.listen(SOCKET, resolve);
-        };
-        probe.on("timeout", takeOver);
-        probe.on("error", takeOver);
-      });
-      server.listen(SOCKET, () => {
-        fs.chmodSync(SOCKET, 0o600);
-        resolve();
-      });
+    const bound = () => {
+      fs.chmodSync(SOCKET, 0o600);
+      // Remember exactly which file we created, so shutdown cannot unlink a socket a
+      // later host bound at the same path.
+      const stat = fs.statSync(SOCKET);
+      boundSocket = { dev: stat.dev, ino: stat.ino };
+      resolve();
     };
-    tryListen();
+    server.once("error", (error) => {
+      if (error.code !== "EADDRINUSE") return reject(error);
+      // Live host or corpse? Ask it.
+      const probe = net.connect(SOCKET);
+      probe.setTimeout(1000);
+      probe.on("connect", () => {
+        probe.destroy();
+        reject(new Error("another Browser Bridge host is already listening"));
+      });
+      const takeOver = () => {
+        probe.destroy();
+        try {
+          fs.unlinkSync(SOCKET);
+        } catch {
+          // raced with another host; the listen below will fail loudly
+        }
+        server.once("error", reject);
+        server.listen(SOCKET, bound);
+      };
+      probe.on("timeout", takeOver);
+      probe.on("error", takeOver);
+    });
+    server.listen(SOCKET, bound);
   });
 }
 
 let shuttingDown = false;
+let boundSocket = null;
+
+/** Only ever remove the socket file this process created. */
+function removeOwnSocket() {
+  if (!boundSocket) return;
+  try {
+    const stat = fs.lstatSync(SOCKET);
+    if (stat.isSocket() && stat.dev === boundSocket.dev && stat.ino === boundSocket.ino) {
+      fs.unlinkSync(SOCKET);
+    }
+  } catch {
+    // already removed, or replaced by a newer host's socket, which is not ours to touch
+  }
+  boundSocket = null;
+}
 
 function shutdown(reason, code = 0) {
   if (shuttingDown) return;
@@ -308,18 +373,20 @@ function shutdown(reason, code = 0) {
       // already gone
     }
   }
-  try {
-    const stat = fs.lstatSync(SOCKET);
-    if (stat.isSocket()) fs.unlinkSync(SOCKET);
-  } catch {
-    // never bound, or already removed
-  }
+  removeOwnSocket();
   // Give the log write a tick, then go.
   setTimeout(() => process.exit(code), 10).unref?.();
 }
 
 async function main() {
-  openLog();
+  try {
+    ensureRuntimeDir();
+    openLog();
+  } catch (error) {
+    // Without a safe log there is nowhere to record anything; stderr reaches Edge's own log.
+    process.stderr.write(`browser-bridge: ${error.message}\n`);
+    process.exit(1);
+  }
 
   const origin = process.argv.slice(2).find((arg) => arg.startsWith("chrome-extension://"));
   if (origin && origin.replace(/\/$/, "") !== EXTENSION_ORIGIN.replace(/\/$/, "")) {
@@ -350,7 +417,17 @@ async function main() {
         socket.destroy();
         return;
       }
-      for (const message of messages) onClientMessage(client, message);
+      for (const message of messages) {
+        try {
+          onClientMessage(client, message);
+        } catch (error) {
+          // One malformed request must not take the broker down with it.
+          log("error handling client message:", error.stack || error.message);
+          replyToClient(client, validRequestId(message?.id) ? message.id : null, false, {
+            message: `the bridge could not handle that request: ${error.message}`,
+          });
+        }
+      }
     });
     socket.on("error", () => socket.destroy());
     socket.on("close", () => onClientClose(client));
@@ -393,14 +470,7 @@ async function main() {
   for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
     process.on(signal, () => shutdown(signal));
   }
-  process.on("exit", () => {
-    try {
-      const stat = fs.lstatSync(SOCKET);
-      if (stat.isSocket()) fs.unlinkSync(SOCKET);
-    } catch {
-      // fine
-    }
-  });
+  process.on("exit", removeOwnSocket);
 }
 
 main().catch((error) => {
