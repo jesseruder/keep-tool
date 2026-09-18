@@ -147,18 +147,20 @@ function assign(sessions, options = {}) {
       let next = current.next;
       const ordered = [...unknown].sort((a, b) => startedAt(a) - startedAt(b)
         || String(a.id).localeCompare(String(b.id)));
-      let added = 0;
+      // Numbers reach the rows only once the registry holding them is on disk: a
+      // number shown for a write that failed could be handed to another session.
+      const pending = [];
       for (const session of ordered) {
         const known = current.ids[session.id];
         if (known) { session.num = known; continue; }
         if (next > MAX_NUMBER) break;
         current.ids[session.id] = next;
-        session.num = next;
+        pending.push([session, next]);
         next += 1;
-        added += 1;
       }
       current.next = next;
-      if (added) write(current, options);
+      if (pending.length) write(current, options);
+      for (const [session, num] of pending) session.num = num;
       return current;
     });
     if (!taken) {

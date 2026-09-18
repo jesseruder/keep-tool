@@ -151,6 +151,15 @@ test('the CLI reads numbers without allocating: pane ls labels the session colum
   assert.equal((await resolveHostPane(digitClient, '#1')).id, 'p1', '#1 still names the numbered session');
 });
 
+test('a number is not handed out when the registry write fails', () => {
+  const dir = root();
+  // A directory where the registry file belongs makes the atomic rename fail.
+  fs.mkdirSync(path.join(dir, '.keep', 'session-numbers.json'), { recursive: true });
+  const rows = [{ id: 'unsaved', mtime: 1 }];
+  numbers.assign(rows, { root: dir });
+  assert.equal(rows[0].num, undefined);
+});
+
 test('ref and named print a session by its number, falling back to the id prefix', () => {
   const dir = root();
   const numbered = '4f1c2a9e-0000-4000-8000-000000000001';

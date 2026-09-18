@@ -6242,6 +6242,9 @@ test('open uses host panes for both existing sessions and new Claude and Codex l
     releaseCardSession: () => true,
     linkLaunchedSession: () => true,
   });
+  // Numbered at launch, so the result names it by number too.
+  assert.ok(Number.isInteger(claude.num), 'a launched session carries its number');
+  delete claude.num;
   assert.deepEqual(claude, {
     ok: true, created: 'pane', command: 'claude --dangerously-skip-permissions --session-id 33333333-3333-4333-8333-333333333333',
     pane: 'pane-claude', sessionId: '33333333-3333-4333-8333-333333333333',
@@ -6250,6 +6253,22 @@ test('open uses host panes for both existing sessions and new Claude and Codex l
   });
   assert.equal(claudeHost.calls[0].params.meta.sessionId, '33333333-3333-4333-8333-333333333333');
   assert.equal('viewer' in claudeHost.calls[0].params.meta, false);
+
+  // The launch numbers the new session, so its start hook can say which it is.
+  const numbered = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-number-'));
+  try {
+    await openSession({ taskId: 'card', fresh: true, agent: 'claude', requester: 'creator' }, {
+      root: numbered,
+      host: recordingHost((type) => type === 'spawn' ? { pane: { id: 'pane-numbered' } } : {}),
+      randomUUID: () => '66666666-6666-4666-8666-666666666666',
+      loadTask: () => ({ fm: { project, sessions: [] } }),
+      waitForHostAgent: async () => true,
+      trustProject: () => true,
+      releaseCardSession: () => true,
+      linkLaunchedSession: () => true,
+    });
+    assert.equal(require('./session-numbers.js').lookup('66666666-6666-4666-8666-666666666666', { root: numbered })?.num, 1);
+  } finally { fs.rmSync(numbered, { recursive: true, force: true }); }
 
   const codexHost = recordingHost((type) => type === 'spawn' ? { pane: { id: 'pane-codex' } } : {});
   const codex = await openSession({ taskId: 'card', fresh: true, agent: 'codex' }, {

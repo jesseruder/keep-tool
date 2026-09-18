@@ -350,15 +350,15 @@ function recordClaudeCompletion(input) {
 }
 
 // Agents repeat the handle they are given, so a session learns its own number at
-// startup. The daemon numbers sessions on its next scan; a session that starts
-// before then takes the next number here rather than going unnamed.
+// startup. Only the daemon allocates numbers (at launch for sessions it opens, and
+// on its scans); the hook reads the registry, so a session started outside Keep
+// learns its number on its next start or compaction.
 function sessionNumberContext(sessionId) {
   const id = String(sessionId || '');
   if (!id) return '';
-  const rows = [{ id, mtime: Date.now() }];
-  try { sessionNumbers.assign(rows, { root: ROOT }); } catch {}
-  if (!rows[0].num) return '';
-  return `[keep] You are session ${sessionNumbers.label(rows[0].num)}. Keep names sessions by number: `
+  const found = sessionNumbers.lookup(id, { root: ROOT });
+  if (!found) return '';
+  return `[keep] You are session ${sessionNumbers.label(found.num)}. Keep names sessions by number: `
     + 'call other sessions #n rather than by a uuid prefix; keep tell, keep open and keep pane accept #n.';
 }
 

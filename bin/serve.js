@@ -5999,6 +5999,10 @@ async function openSession(body, deps = {}) {
   // this model" and is compared against the request when an open is retried.
   const launchHost = async (inheritedModel = '') => {
     const sessionId = session ? session.id : agent === 'claude' ? (deps.randomUUID || crypto.randomUUID)() : null;
+    // Number a new session before it starts, so its start hook can tell it which it is.
+    if (sessionId && !session) {
+      try { sessionNumbers.assign([{ id: sessionId, mtime: launchedAt }], { root: deps.root || keep.ROOT }); } catch {}
+    }
     const commandModel = launchModel || inheritedModel;
     const argv = agent === 'codex'
       ? ['codex', ...codexFlagArgs, ...(commandModel ? ['-m', commandModel] : []), ...(sessionId ? ['resume', sessionId] : [])]
