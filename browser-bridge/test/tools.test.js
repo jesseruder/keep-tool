@@ -29,6 +29,13 @@ const DROPPED = new Set([
 /** Tools this bridge adds on top of the contract. */
 const ADDED = new Set(["browser_status"]);
 
+/**
+ * Properties this bridge adds to a mirrored tool. gif_creator's own description tells
+ * the model to "provide 'coordinate'", but the contract's schema never declared one, so
+ * the bridge declares it and the property check below allows for it.
+ */
+const ADDED_PROPERTIES = { gif_creator: ["coordinate"] };
+
 function loadContract() {
   const code = fs
     .readFileSync(CONTRACT, "utf8")
@@ -51,8 +58,10 @@ function loadContract() {
 
 const contract = loadContract();
 
-function propertyNames(schema) {
-  return Object.keys(schema.properties ?? {}).sort();
+function propertyNames(schema, added = []) {
+  return Object.keys(schema.properties ?? {})
+    .filter((name) => !added.includes(name))
+    .sort();
 }
 
 test("the contract file parses into the tools it documents", () => {
@@ -77,6 +86,8 @@ test("every mirrored tool matches the contract's required list and properties", 
     const candidates = contract.get(tool.name);
     assert.ok(candidates, `${tool.name} is not in the contract`);
 
+    const added = ADDED_PROPERTIES[tool.name] ?? [];
+
     // A name with several contract variants only has to match one of them.
     const matches = candidates.filter((candidate) => {
       const sameRequired =
@@ -84,14 +95,14 @@ test("every mirrored tool matches the contract's required list and properties", 
         JSON.stringify([...(tool.inputSchema.required ?? [])].sort());
       const sameProperties =
         JSON.stringify(propertyNames(candidate.inputSchema)) ===
-        JSON.stringify(propertyNames(tool.inputSchema));
+        JSON.stringify(propertyNames(tool.inputSchema, added));
       return sameRequired && sameProperties;
     });
     assert.equal(
       matches.length > 0,
       true,
       `${tool.name}: required ${JSON.stringify(tool.inputSchema.required)} / properties ` +
-        `${JSON.stringify(propertyNames(tool.inputSchema))} matches no contract variant ` +
+        `${JSON.stringify(propertyNames(tool.inputSchema, added))} matches no contract variant ` +
         `(${candidates
           .map((c) => `${JSON.stringify(c.inputSchema.required)} ${JSON.stringify(propertyNames(c.inputSchema))}`)
           .join(" | ")})`,
@@ -134,6 +145,26 @@ test("every input schema is a usable JSON schema", () => {
     }
     // It must survive the JSON round trip the MCP transport puts it through.
     assert.deepEqual(JSON.parse(JSON.stringify(schema)), schema);
+  }
+});
+
+test("the properties this bridge adds are declared and described", () => {
+  for (const [name, added] of Object.entries(ADDED_PROPERTIES)) {
+    const tool = TOOLS.find((candidate) => candidate.name === name);
+    assert.ok(tool, `${name} is not in the tool list`);
+    for (const property of added) {
+      assert.ok(tool.inputSchema.properties[property], `${name}.${property} is missing`);
+      assert.ok(
+        !contract.get(name)?.some((variant) => variant.inputSchema.properties?.[property]),
+        `${name}.${property} is in the contract after all; drop it from ADDED_PROPERTIES`,
+      );
+    }
+  }
+});
+
+test("no tool description still claims it is unimplemented", () => {
+  for (const tool of TOOLS) {
+    assert.doesNotMatch(tool.description, /not implemented/i, tool.name);
   }
 });
 

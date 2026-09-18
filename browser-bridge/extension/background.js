@@ -3,6 +3,7 @@
 
 import { NativeBridge } from "./lib/native.js";
 import { dropTab, detach, installListeners, peekTab } from "./lib/cdp.js";
+import { forgetGroupFrames } from "./lib/gifstore.js";
 import {
   activityGeneration,
   allSessions,
@@ -159,6 +160,12 @@ async function closeSessionOnce(sessionKey, generation) {
   // closing tabs and forgetting the mapping are not.
   if (cameBack()) return;
 
+  // The session is over, so its GIF frames are nobody's: they can be tens of megabytes
+  // in IndexedDB and no future session can reach them (a new session gets a new group).
+  await forgetGroupFrames(session.groupId).catch((error) =>
+    console.warn("browser-bridge: could not drop the session's GIF frames", error),
+  );
+
   if (tabs.length === 0) {
     await forgetSession(sessionKey);
     forgetActivity(sessionKey);
@@ -226,6 +233,11 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
 
 chrome.tabGroups.onRemoved.addListener((group) => {
   forgetGroup(group.id).catch((error) => console.warn("browser-bridge: forgetGroup", error));
+  // The group's GIF recording goes with it; group ids are recycled, so leaving frames
+  // behind would show one session's recording to the next holder of the id.
+  forgetGroupFrames(group.id).catch((error) =>
+    console.warn("browser-bridge: forgetGroupFrames", error),
+  );
 });
 
 // Waking the worker is what reconnects the native host, so keep a slow heartbeat.

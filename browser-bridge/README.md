@@ -83,8 +83,7 @@ your terminal keeps keyboard focus.
 Tools: `tabs_context_mcp`, `tabs_create_mcp`, `tabs_close_mcp`, `navigate`, `read_page`,
 `find`, `get_page_text`, `form_input`, `javascript_tool`, `computer`,
 `read_console_messages`, `read_network_requests`, `resize_window`, `file_upload`,
-`upload_image`, `browser_batch`, `browser_status`, and `gif_creator` (phase 2: registered,
-returns a clear error).
+`upload_image`, `browser_batch`, `browser_status`, `gif_creator`.
 
 Worth knowing:
 
@@ -99,6 +98,12 @@ Worth knowing:
   reports the path.
 - `file_upload` takes absolute paths on this machine: regular files, one hard link, 10 MB
   total. Nothing is base64'd around.
+- `gif_creator` records the session's own tab group: `start_recording`, then every
+  `computer` action and `navigate` in that group becomes an annotated frame (take a
+  screenshot right after starting and right before stopping to bookend it), then `export`
+  with `download: true` to save the GIF or `coordinate: [x, y]` to drop it straight onto
+  a page. At most 300 frames and 60 MB per group; `export` keeps the frames, `clear`
+  throws them away. The GIF is never sent back to the model, only its filename and size.
 - Page content is untrusted input. The MCP instructions say so; treat it that way.
 
 ## Configuration
@@ -140,5 +145,11 @@ node bin/gen-key.js   # only if the extension id ever has to change
 
 The extension is plain ES modules loaded straight from disk: no bundler, no build step.
 Edit a file, press reload on `edge://extensions`. `extension/lib/keys.js`, `ax.js`,
-`find.js` and `url.js` hold the logic worth testing and never touch a `chrome` API, which
-is why the tests can import them directly.
+`find.js`, `gifframes.js` and `url.js` hold the logic worth testing and never touch a
+`chrome` API, which is why the tests can import them directly.
+
+`extension/lib/vendor/gifenc.js` is the only third-party file in the extension: the
+unmodified ESM build of [gifenc](https://github.com/mattdesl/gifenc) 1.0.3 (MIT), copied
+in rather than installed because there is no bundler to resolve a dependency for a
+load-unpacked extension. To update it, `npm pack gifenc`, unpack it, and copy
+`dist/gifenc.esm.js` over the body of that file, keeping the license header.

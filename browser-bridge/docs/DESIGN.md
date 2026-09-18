@@ -49,7 +49,10 @@ Edge (one profile)
 Everything is plain JavaScript on Node 22, ES modules, no bundler, no TypeScript. The
 directory has its own `package.json` and is not part of keep-tool's build or test
 scripts. Its only runtime dependency is `@modelcontextprotocol/sdk` (plus `zod`, which
-the SDK needs for tool schemas).
+the SDK needs for tool schemas). The extension has no dependencies at all: the one piece
+of third-party code it uses, the `gifenc` GIF encoder, is vendored as a single file under
+`extension/lib/vendor/` because a load-unpacked extension has no build step to resolve
+imports for it.
 
 ## Directory layout
 
@@ -69,6 +72,10 @@ browser-bridge/
     lib/ax.js               accessibility tree -> text with refs (pure, testable)
     lib/find.js             heuristic element search over the AX tree (pure, testable)
     lib/page.js             functions serialized into the page via Runtime.callFunctionOn
+    lib/gifframes.js        gif_creator's labels, delays, caps, quality mapping (pure)
+    lib/gifstore.js         gif_creator's frames in IndexedDB, keyed by tab group
+    lib/gifencode.js        OffscreenCanvas overlays + gifenc encoding, in the worker
+    lib/vendor/gifenc.js    vendored MIT GIF encoder (mattdesl/gifenc), not an npm dep
     tools/*.js              one module per tool
     popup.html, popup.js    status: connected?, sessions, groups, reconnect button
   host/
@@ -176,8 +183,7 @@ Names and input schemas are copied from `docs/claude-in-chrome-tools.txt`. Dropp
 `shortcuts_list`, `shortcuts_execute`, `switch_browser`, `list_connected_browsers`,
 `select_browser` (Anthropic cloud features with no local meaning). Added:
 `browser_status` (host reachable, extension version, this session's group and tabs,
-every session the extension knows). `gif_creator` is phase 2: register it, return a
-clear "not implemented yet" error.
+every session the extension knows).
 
 Result shapes:
 
@@ -273,6 +279,32 @@ Result shapes:
   `input.files`, dispatch `input` and `change`. With `coordinate`,
   `document.elementFromPoint` and dispatch `dragenter`, `dragover`, `drop` carrying
   that `DataTransfer`.
+- `gif_creator`: `start_recording`, `stop_recording`, `export`, `clear`, scoped to the
+  tab's group (which is the session's group, with the same foreign-tab refusal as every
+  other tab tool). While a group records, `computer` captures a frame after every action
+  on any tab in that group — including `screenshot`, so the spec's "screenshot right
+  after start / right before stop" gives the first and last frames — and `navigate`
+  captures one after the load. A frame is the same `Page.captureScreenshot` the
+  `screenshot` action takes (reused directly when the action *was* a screenshot),
+  downscaled to at most 800 px wide, plus the action's kind, coordinates and a label
+  (`Click (312, 400)`, `Type "hello"`, `Press cmd+a`, `Scroll down`,
+  `Navigate example.com`, `Screenshot`) and a timestamp. Frames are blobs in IndexedDB
+  keyed by the group, so a worker restart between two actions does not lose the take,
+  capped at 300 frames and 60 MB per group; at a cap recording stays on, nothing more is
+  stored, and `export` says so. Frame delay is the real gap to the next frame clamped to
+  300-3000 ms, 1500 ms on the last. `export` renders each frame with `OffscreenCanvas`
+  and encodes with the vendored `gifenc` (`quantize` + `applyPalette` + `writeFrame`);
+  overlays are orange click circles, red drag arrows, a black rounded label, an orange
+  progress bar and a "Browser Bridge" watermark in place of the Claude logo, each
+  switchable, with `quality` 1-30 mapping to palette size, histogram format and
+  prequantize rounding (documented in `lib/gifframes.js`). `download: true` hands
+  `chrome.downloads.download` a `data:` URL (a worker has no `URL.createObjectURL`);
+  `coordinate: [x, y]`, a property the contract's description promises but its schema
+  never declared, drops the GIF on the element at that point through the same code as
+  `upload_image`'s coordinate mode. Neither is an error naming both. The result is text
+  only — filename, frame count, duration, encoded size, any cap note — never the bytes.
+  `export` keeps the frames, `clear` discards them, `stop_recording` keeps them, and a
+  closed group or an ended session drops them.
 - `browser_batch`: run in the MCP server, sequentially, stop at the first error,
   results concatenated with images interleaved. It refuses a nested `browser_batch`
   and requires `tabId` on page tools.
@@ -390,6 +422,11 @@ needs no private key. The id is a constant in `host/protocol.js` and the install
   `browser_status`; every input schema is valid JSON schema with the same properties.
 - `test/keys.test.js`, `test/ax.test.js`, `test/find.test.js`: the pure modules, with a
   fixture AX tree captured from a real page (a small hand-written one is fine).
+- `test/gif.test.js`: labels, delays, caps and the quality mapping directly; the store
+  against an in-memory backend (`setGifBackend`); the tool and the recorder against a
+  stubbed `chrome`; and the encoder against a stubbed `OffscreenCanvas`, which records
+  every drawing call and feeds the real `gifenc` synthetic pixels, so the bytes the
+  download test inspects are a real GIF.
 - `test/client.test.js`: reconnect and hello replay against a scripted socket server.
 - `test/install.test.js`: `--dry-run` output and manifest contents against a temp
   HOME.
@@ -399,9 +436,6 @@ implementer.
 
 ## Phase 2
 
-- `gif_creator`: capture a frame after every `computer` action while recording,
-  encode with a vendored single-file GIF encoder (`gifenc`), export through
-  `chrome.downloads.download` with a data URL, overlays as listed in the spec.
 - `find` ranking quality: add synonyms and fuzzy matching once real use shows the gaps.
 - Cross-origin iframe support in `read_page` via `Target.setAutoAttach` sessions.
 - Keep integration: `keep open` sets `BROWSER_BRIDGE_SESSION_NAME` to the session

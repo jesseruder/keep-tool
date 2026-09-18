@@ -3,6 +3,7 @@
 import { attach } from "../lib/cdp.js";
 import { requireTab } from "../lib/sessions.js";
 import { normalizeUrl } from "../lib/url.js";
+import { recordAction } from "./gif.js";
 import { tabs_context_mcp } from "./tabs.js";
 
 const LOAD_TIMEOUT_MS = 30_000;
@@ -71,6 +72,9 @@ export async function navigate(ctx, params = {}) {
   }
 
   const tab = await chrome.tabs.get(tabId);
+  // A navigation is worth a frame too: without it a GIF jumps from the old page to
+  // whatever was clicked next with no sign that the page changed.
+  await recordAction(ctx, tab, { kind: "navigate", url: target === "back" || target === "forward" ? target : tab.url });
   const lines = [
     `Tab ${tabId}: ${tab.url}`,
     tab.title ? `Title: ${tab.title}` : null,

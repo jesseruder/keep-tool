@@ -142,8 +142,14 @@ test("an input that does not match the advertised schema is refused before the b
   assert.notEqual(good.result.isError, true);
 });
 
-test("gif_creator answers with a clear not-implemented error", async (t) => {
-  const server = startServer(t);
+test("gif_creator is forwarded to the browser like any other tab tool", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bb-"));
+  const host = await fakeHost(t, dir, (message) => {
+    if (message.method === "hello") return { ok: true, result: {} };
+    if (message.method === "gif_creator") return { ok: true, result: { text: "Recording tab group 7." } };
+    return { ok: false, error: { message: `unexpected ${message.method}` } };
+  });
+  const server = startServer(t, dir);
   await server.request(1, "initialize", {
     protocolVersion: "2025-06-18",
     capabilities: {},
@@ -155,8 +161,25 @@ test("gif_creator answers with a clear not-implemented error", async (t) => {
     name: "gif_creator",
     arguments: { action: "start_recording", tabId: 1 },
   });
-  assert.equal(call.result.isError, true);
-  assert.match(call.result.content[0].text, /not implemented yet/);
+  assert.notEqual(call.result.isError, true);
+  assert.match(call.result.content[0].text, /Recording tab group 7/);
+
+  // The added coordinate property is validated like the rest of the schema.
+  const bad = await server.request(3, "tools/call", {
+    name: "gif_creator",
+    arguments: { action: "export", tabId: 1, coordinate: [10] },
+  });
+  assert.equal(bad.result.isError, true);
+  assert.match(bad.result.content[0].text, /coordinate needs at least 2 item/);
+
+  const good = await server.request(4, "tools/call", {
+    name: "gif_creator",
+    arguments: { action: "export", tabId: 1, coordinate: [10, 20] },
+  });
+  assert.notEqual(good.result.isError, true);
+  const forwarded = host.received.filter((message) => message.method === "gif_creator");
+  assert.equal(forwarded.length, 2, "the invalid call never reached the browser");
+  assert.deepEqual(forwarded.at(-1).params.coordinate, [10, 20], "coordinate is forwarded unchanged");
 });
 
 test("browser_status reports the missing host instead of failing", async (t) => {

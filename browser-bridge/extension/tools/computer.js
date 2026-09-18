@@ -18,7 +18,8 @@ import {
   parseChord,
   parseModifiers,
 } from "../lib/keys.js";
-import { activateTab, pointForRef, viewport } from "./shared.js";
+import { activateTab, captureClip, clipScaleFor, pointForRef, viewport } from "./shared.js";
+import { recordAction } from "./gif.js";
 
 const SCREENSHOT_TTL_MS = 5 * 60 * 1000;
 const MAX_WAIT_SECONDS = 10;
@@ -60,35 +61,6 @@ function clampScale(value) {
   const scale = Number(value);
   if (!Number.isFinite(scale)) return 1;
   return Math.min(1, Math.max(0.1, scale));
-}
-
-/**
- * Page.captureScreenshot multiplies clip.scale by the device pixel ratio, so a DPR 2
- * display needs scale/dpr to come back at CSS size. The model's coordinates are CSS
- * pixels, and an image that matches them is worth more than extra sharpness.
- */
-function clipScaleFor(cssRatio, dpr) {
-  return cssRatio / (dpr || 1);
-}
-
-async function captureClip(tabId, clip) {
-  // Let a pending layout or scroll animation paint before the frame is grabbed. The
-  // wait is bounded inside the page: a hidden or occluded tab never runs animation
-  // frames, and CDP's `timeout` does not cover an awaited promise. captureScreenshot
-  // itself still returns a frame for such a tab.
-  await send(tabId, "Runtime.evaluate", {
-    expression:
-      "new Promise(r => { setTimeout(r, 300); requestAnimationFrame(() => requestAnimationFrame(r)); })",
-    awaitPromise: true,
-    timeout: 1000,
-  }).catch(() => {});
-  const response = await send(tabId, "Page.captureScreenshot", {
-    format: "png",
-    clip,
-    optimizeForSpeed: false,
-  });
-  if (!response?.data) throw new Error("The browser returned an empty screenshot");
-  return response.data;
 }
 
 async function screenshotAction(ctx, tabId, params, view) {
@@ -277,6 +249,7 @@ async function typeText(tabId, text) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+
 export async function computer(ctx, params = {}) {
   const tab = await requireTab(ctx.sessionKey, params.tabId);
   const action = String(params.action ?? "");
@@ -285,19 +258,42 @@ export async function computer(ctx, params = {}) {
   const needsViewport = action === "screenshot" || action === "zoom" || action === "wait";
   const view = needsViewport ? await viewport(tab.id) : null;
 
-  switch (action) {
-    case "screenshot":
-      return screenshotAction(ctx, tab.id, params, view);
+  const { result, recorded } = await performAction(ctx, tab, params, action, view);
+  // While this tab's group is recording, every action becomes a GIF frame. That is what
+  // makes "screenshot right after start_recording" the first frame and the screenshot
+  // before stop_recording the last one, exactly as the tool description promises.
+  await recordAction(ctx, tab, recorded);
+  return result;
+}
 
-    case "zoom":
-      return zoomAction(ctx, tab.id, params, view);
+/** The action itself, plus what the recorder should remember about it. */
+async function performAction(ctx, tab, params, action, view) {
+  switch (action) {
+    case "screenshot": {
+      const result = await screenshotAction(ctx, tab.id, params, view);
+      // The frame is the shot that was just taken: no reason to capture it twice.
+      return {
+        result,
+        recorded: { kind: "screenshot", png: result.image.data, cssWidth: view.width },
+      };
+    }
+
+    case "zoom": {
+      const result = await zoomAction(ctx, tab.id, params, view);
+      // A zoom is a crop, not a frame of the page, so the recorder takes its own shot.
+      return { result, recorded: { kind: "zoom" } };
+    }
 
     case "wait": {
       const duration = Math.min(MAX_WAIT_SECONDS, Math.max(0, Number(params.duration ?? 0)));
       if (!Number.isFinite(duration)) throw new Error("duration must be a number of seconds");
       await sleep(duration * 1000);
-      const shot = await screenshotAction(ctx, tab.id, params, await viewport(tab.id));
-      return { ...shot, text: `Waited ${duration}s. ${shot.text}` };
+      const waited = await viewport(tab.id);
+      const shot = await screenshotAction(ctx, tab.id, params, waited);
+      return {
+        result: { ...shot, text: `Waited ${duration}s. ${shot.text}` },
+        recorded: { kind: "wait", duration, png: shot.image.data, cssWidth: waited.width },
+      };
     }
 
     case "left_click":
@@ -315,7 +311,10 @@ export async function computer(ctx, params = {}) {
       });
       const where = params.ref ? `${params.ref} at ` : "";
       return {
-        text: `${action} on tab ${tab.id} at ${where}(${Math.round(point.x)}, ${Math.round(point.y)}).`,
+        result: {
+          text: `${action} on tab ${tab.id} at ${where}(${Math.round(point.x)}, ${Math.round(point.y)}).`,
+        },
+        recorded: { kind: action, point, ref: params.ref ?? null },
       };
     }
 
@@ -328,7 +327,10 @@ export async function computer(ctx, params = {}) {
         buttons: 0,
         modifiers: parsed.modifiers,
       });
-      return { text: `Moved the pointer to (${Math.round(point.x)}, ${Math.round(point.y)}).` };
+      return {
+        result: { text: `Moved the pointer to (${Math.round(point.x)}, ${Math.round(point.y)}).` },
+        recorded: { kind: "hover", point },
+      };
     }
 
     case "left_click_drag": {
@@ -349,7 +351,10 @@ export async function computer(ctx, params = {}) {
       }
       await mouseEvent(tab.id, "mouseReleased", to, { button: "left", buttons: 0, clickCount: 1 });
       return {
-        text: `Dragged from (${Math.round(from.x)}, ${Math.round(from.y)}) to (${Math.round(to.x)}, ${Math.round(to.y)}).`,
+        result: {
+          text: `Dragged from (${Math.round(from.x)}, ${Math.round(from.y)}) to (${Math.round(to.x)}, ${Math.round(to.y)}).`,
+        },
+        recorded: { kind: "left_click_drag", from, to, point: to },
       };
     }
 
@@ -378,14 +383,22 @@ export async function computer(ctx, params = {}) {
       });
       // Wheel scrolling animates; a screenshot taken straight away sees the old position.
       await sleep(SCROLL_SETTLE_MS);
-      return { text: `Scrolled ${direction} ${ticks} tick(s) (${distance}px) at (${Math.round(point.x)}, ${Math.round(point.y)}).` };
+      return {
+        result: {
+          text: `Scrolled ${direction} ${ticks} tick(s) (${distance}px) at (${Math.round(point.x)}, ${Math.round(point.y)}).`,
+        },
+        recorded: { kind: "scroll", point, direction, ticks },
+      };
     }
 
     case "scroll_to": {
       if (!params.ref) throw new Error("ref is required for the scroll_to action");
       const point = await pointForRef(tab.id, params.ref);
       return {
-        text: `Scrolled ${params.ref} into view; its centre is at (${Math.round(point.x)}, ${Math.round(point.y)}).`,
+        result: {
+          text: `Scrolled ${params.ref} into view; its centre is at (${Math.round(point.x)}, ${Math.round(point.y)}).`,
+        },
+        recorded: { kind: "scroll_to", ref: params.ref, point },
       };
     }
 
@@ -395,7 +408,10 @@ export async function computer(ctx, params = {}) {
         throw new Error("text is required for the type action");
       }
       await typeText(tab.id, text);
-      return { text: `Typed ${text.length} character(s) into tab ${tab.id}.` };
+      return {
+        result: { text: `Typed ${text.length} character(s) into tab ${tab.id}.` },
+        recorded: { kind: "type", text },
+      };
     }
 
     case "key": {
@@ -417,7 +433,10 @@ export async function computer(ctx, params = {}) {
           await pressChord(tab.id, parsed.modifiers, descriptor, macCommands(parsed.modifiers, parsed.key));
         }
       }
-      return { text: `Pressed ${spec}${repeat > 1 ? ` x${repeat}` : ""} in tab ${tab.id}.` };
+      return {
+        result: { text: `Pressed ${spec}${repeat > 1 ? ` x${repeat}` : ""} in tab ${tab.id}.` },
+        recorded: { kind: "key", text: spec, repeat },
+      };
     }
 
     default:

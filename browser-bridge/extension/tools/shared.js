@@ -1,7 +1,9 @@
-// Helpers every page tool needs: ref -> live element, viewport metrics, tab activation.
+// Helpers every page tool needs: ref -> live element, viewport metrics, tab activation,
+// and the one screenshot primitive (computer's `screenshot`, `zoom` and `wait` and
+// gif_creator's frame capture all go through it).
 
 import { refTable, send } from "../lib/cdp.js";
-import { VIEWPORT_EXPRESSION, elementRect, source } from "../lib/page.js";
+import { VIEWPORT_EXPRESSION, dropImageAtPoint, elementRect, source } from "../lib/page.js";
 
 export function unknownRef(ref) {
   return new Error(
@@ -61,6 +63,77 @@ export async function evaluate(tabId, expression, { awaitPromise = false } = {})
     );
   }
   return response.result?.value;
+}
+
+/**
+ * Run a page function that needs big arguments: callFunctionOn wants an object to bind
+ * to, and `document` is the one every page has.
+ */
+export async function callInPage(tabId, fn, args) {
+  const documentHandle = await send(tabId, "Runtime.evaluate", { expression: "document" });
+  const objectId = documentHandle?.result?.objectId;
+  if (!objectId) throw new Error("Could not reach the page's document");
+  try {
+    const response = await send(tabId, "Runtime.callFunctionOn", {
+      objectId,
+      functionDeclaration: source(fn),
+      arguments: args.map((value) => ({ value })),
+      returnByValue: true,
+      awaitPromise: true,
+    });
+    if (response.exceptionDetails) {
+      throw new Error(
+        response.exceptionDetails.exception?.description ?? response.exceptionDetails.text,
+      );
+    }
+    return response.result?.value;
+  } finally {
+    await send(tabId, "Runtime.releaseObject", { objectId }).catch(() => {});
+  }
+}
+
+/**
+ * Drop a base64 file on whatever is at a point, the way a user drags a file onto a drop
+ * zone. upload_image's coordinate mode and gif_creator's coordinate export are the same
+ * gesture with different bytes, so they share this.
+ */
+export async function dropFileAtCoordinate(tabId, { data, mimeType, filename, x, y }) {
+  const value = await callInPage(tabId, dropImageAtPoint, [data, filename, mimeType, x, y]);
+  if (!value?.ok) throw new Error(value?.error ?? `Could not drop the file at (${x}, ${y})`);
+  return value;
+}
+
+/**
+ * Page.captureScreenshot with a clip in document CSS pixels. `clip.scale` is multiplied
+ * by the device pixel ratio, so callers pass `wanted / dpr` (see clipScaleFor).
+ */
+export async function captureClip(tabId, clip) {
+  // Let a pending layout or scroll animation paint before the frame is grabbed. The
+  // wait is bounded inside the page: a hidden or occluded tab never runs animation
+  // frames, and CDP's `timeout` does not cover an awaited promise. captureScreenshot
+  // itself still returns a frame for such a tab.
+  await send(tabId, "Runtime.evaluate", {
+    expression:
+      "new Promise(r => { setTimeout(r, 300); requestAnimationFrame(() => requestAnimationFrame(r)); })",
+    awaitPromise: true,
+    timeout: 1000,
+  }).catch(() => {});
+  const response = await send(tabId, "Page.captureScreenshot", {
+    format: "png",
+    clip,
+    optimizeForSpeed: false,
+  });
+  if (!response?.data) throw new Error("The browser returned an empty screenshot");
+  return response.data;
+}
+
+/**
+ * Page.captureScreenshot multiplies clip.scale by the device pixel ratio, so a DPR 2
+ * display needs scale/dpr to come back at CSS size. The model's coordinates are CSS
+ * pixels, and an image that matches them is worth more than extra sharpness.
+ */
+export function clipScaleFor(cssRatio, dpr) {
+  return cssRatio / (dpr || 1);
 }
 
 export async function viewport(tabId) {

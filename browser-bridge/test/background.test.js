@@ -169,6 +169,45 @@ globalThis.chrome = {
 await import("../extension/background.js");
 const cdp = await import("../extension/lib/cdp.js");
 const sessions = await import("../extension/lib/sessions.js");
+const gifstore = await import("../extension/lib/gifstore.js");
+
+// gif_creator's frames live in IndexedDB, which a worker stub has no business faking;
+// the backend seam is there so the cleanup hooks can still be tested.
+const gifFrames = { metas: new Map(), frames: new Map() };
+gifstore.setGifBackend({
+  async getMeta(groupId) {
+    return gifFrames.metas.get(groupId) ?? null;
+  },
+  async putMeta(meta) {
+    gifFrames.metas.set(meta.groupId, meta);
+  },
+  async putFrame(frame, meta) {
+    gifFrames.frames.set(frame.recordingId, [...(gifFrames.frames.get(frame.recordingId) ?? []), frame]);
+    gifFrames.metas.set(meta.groupId, meta);
+  },
+  async listFrames(recordingId) {
+    return gifFrames.frames.get(recordingId) ?? [];
+  },
+  async deleteFrames(recordingId) {
+    gifFrames.frames.delete(recordingId);
+  },
+  async deleteMeta(groupId) {
+    gifFrames.metas.delete(groupId);
+  },
+});
+
+async function recordOneFrame(groupId) {
+  await gifstore.startRecording(groupId, { sessionKey: "test" });
+  await gifstore.addFrame(groupId, {
+    at: Date.now(),
+    blob: { size: 1000 },
+    width: 10,
+    height: 10,
+    scale: 1,
+    action: { kind: "screenshot" },
+  });
+  assert.equal((await gifstore.listFrames(groupId)).frames.length, 1);
+}
 
 const port = () => state.ports.at(-1);
 
@@ -257,6 +296,29 @@ test("a tab that stays in its own group keeps its state", async () => {
   await tick();
 
   assert.equal(cdp.peekTab(session.tab.id)?.console.length, 1);
+});
+
+test("a session that ends takes its GIF frames with it", async () => {
+  const session = await makeSession("gif-session", "gif");
+  await recordOneFrame(session.group.groupId);
+
+  deliver({ method: "session_closed", params: { sessionKey: "gif-session" } });
+  await waitFor(
+    async () => (await gifstore.listFrames(session.group.groupId)).frames.length === 0,
+    "the session's frames to be dropped",
+  );
+  assert.equal(gifFrames.metas.size, 0, "and the recording itself");
+});
+
+test("a group the user closes takes its GIF frames with it", async () => {
+  const session = await makeSession("gif-group", "gif-group");
+  await recordOneFrame(session.group.groupId);
+
+  for (const listener of state.listeners.groupsRemoved) listener({ id: session.group.groupId });
+  await waitFor(
+    async () => (await gifstore.listFrames(session.group.groupId)).frames.length === 0,
+    "the closed group's frames to be dropped",
+  );
 });
 
 test("a tab dragged out of every group is dropped", async () => {

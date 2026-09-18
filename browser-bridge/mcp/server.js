@@ -140,12 +140,6 @@ async function runTool(name, rawInput, { insideBatch = false } = {}) {
   const invalid = validateToolInput(definition, input);
   if (invalid) throw new Error(invalid);
 
-  if (name === "gif_creator") {
-    throw new Error(
-      "gif_creator is not implemented yet in Browser Bridge (phase 2). Use the computer tool's screenshot action for stills.",
-    );
-  }
-
   if (name === "browser_status") return browserStatus();
 
   if (name === "browser_batch") {

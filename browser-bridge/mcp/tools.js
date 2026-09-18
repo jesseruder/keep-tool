@@ -356,7 +356,7 @@ export const TOOLS = [
   {
     name: "gif_creator",
     description:
-      "Manage GIF recording and export for browser automation sessions. Control when to start/stop recording browser actions (clicks, scrolls, navigation), then export as an animated GIF with visual overlays (click indicators, action labels, progress bar, watermark). All operations are scoped to the tab's group. When starting recording, take a screenshot immediately after to capture the initial state as the first frame. When stopping recording, take a screenshot immediately before to capture the final state as the last frame. For export, either provide 'coordinate' to drag/drop upload to a page element, or set 'download: true' to download the GIF. NOTE: not implemented yet in Browser Bridge; every call returns an error.",
+      "Manage GIF recording and export for browser automation sessions. Control when to start/stop recording browser actions (clicks, scrolls, navigation), then export as an animated GIF with visual overlays (click indicators, action labels, progress bar, watermark). All operations are scoped to the tab's group. When starting recording, take a screenshot immediately after to capture the initial state as the first frame. When stopping recording, take a screenshot immediately before to capture the final state as the last frame. For export, either provide 'coordinate' to drag/drop upload to a page element, or set 'download: true' to download the GIF. A frame is captured after every computer action and every navigate in the group, at most 300 frames and 60 MB; export does not discard the frames, clear does. The watermark is Browser Bridge's own, not the Claude logo.",
     inputSchema: {
       type: "object",
       properties: {
@@ -379,6 +379,17 @@ export const TOOLS = [
           type: "string",
           description:
             "Optional filename for exported GIF (default: 'recording-[timestamp].gif'). For 'export' action only.",
+        },
+        // The contract's description talks about a `coordinate` the schema never
+        // declared, so the model had no way to pass one. Added here rather than left as
+        // a promise the tool cannot keep.
+        coordinate: {
+          type: "array",
+          items: { type: "number" },
+          minItems: 2,
+          maxItems: 2,
+          description:
+            "[x, y] in CSS pixels: drop the exported GIF on the element at that point, the way upload_image's coordinate mode does. For 'export' action only; pass this or download: true.",
         },
         options: {
           type: "object",
@@ -582,6 +593,7 @@ export const PAGE_TOOLS = new Set([
   "computer",
   "file_upload",
   "find",
+  "gif_creator",
   "form_input",
   "get_page_text",
   "javascript_tool",
