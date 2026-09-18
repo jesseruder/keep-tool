@@ -464,4 +464,5 @@ function batch(deps = {}) {
 module.exports = {
   BACKOFF_BASE_MS, BACKOFF_MAX_MS, DEFAULT_MAX_MIN, MOVED_VISIBLE_MS, STATUSES,
   dir, readOne, list, visible, enqueue, cancel, tick, batch, backoffMs, maxMinutes, policyTargets, weeklyExhausted,
+  transferPastStop,
 };

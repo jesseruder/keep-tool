@@ -53,6 +53,10 @@ const TRANSIENT_REFUSALS = [
   // transfer was requested for, the rate-limit event it exists for, and the restart
   // path's own ledger and helper proofs — each of which is taken again from scratch.
   /^Agent process identity changed during restart$/,
+  // The same bad snapshot, named for what it is once the restart has re-read `ps` and
+  // still could not see the agent it is holding. Spelled out although /could not be
+  // verified/ above already covers it: this one is a refusal in its own right.
+  /^Agent process identity could not be verified from ps$/,
   /^Original agent process identity is unverified$/,
   /^Session helper processes changed during restart$/,
   // The restart's own `/exit` typed, but the screen did not render it inside the

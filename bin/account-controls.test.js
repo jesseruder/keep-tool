@@ -121,8 +121,28 @@ test('click posts the explicit destination and only claims success after refresh
   const container = fakeContainer({ '[data-handoff-account]': [button] });
   context.installHandoffControls(container, ctx, 's', 'p');
   await button.onclick();
-  assert.equal(JSON.stringify(writes), JSON.stringify([{ url: '/api/handoff-session', body: { sessionId: 's', pane: 'p', accountId: 'claude-two' } }]));
+  assert.equal(JSON.stringify(writes), JSON.stringify([{ url: '/api/handoff-session',
+    body: { sessionId: 's', pane: 'p', accountId: 'claude-two', queueOnTransient: true } }]));
   assert.deepEqual(toasts, ['Continued on Claude Two']);
+  assert.equal(button.disabled, false);
+});
+
+test('a transfer the daemon queued says so and reloads into the queue controls', async () => {
+  writes.length = 0;
+  const toasts = [];
+  let reloads = 0;
+  const ctx = fixture();
+  ctx.toast = message => toasts.push(message);
+  ctx.reload = async () => { reloads += 1; };
+  const button = { disabled: false, dataset: { handoffAccount: 'claude-two' }, blur() {} };
+  const container = fakeContainer({ '[data-handoff-account]': [button] });
+  context.installHandoffControls(container, ctx, 's', 'p');
+  context.writeResult = { ok: true, status: 'queued', reason: 'another session injection is busy', targetAccountId: 'claude-two' };
+  try {
+    await button.onclick();
+  } finally { context.writeResult = null; }
+  assert.deepEqual(toasts, ['Transfer refused (another session injection is busy); retrying in the background']);
+  assert.equal(reloads, 1, 'the reload is what swaps in the queue entry\'s own controls');
   assert.equal(button.disabled, false);
 });
 

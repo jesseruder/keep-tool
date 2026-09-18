@@ -7789,6 +7789,68 @@ test('an auto fresh open with no --model judges each account on its own default 
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('a console transfer refused before its stop joins the retry queue; the CLI still sees the refusal', async () => {
+  const { handoffSessionRequest } = require('./serve');
+  const queue = require('./handoff-queue');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-handoff-queue-console-'));
+  try {
+    const record = (overrides = {}) => ({ id: 't1', transactionId: 't1', sessionId: 'sid', pane: 'p', agent: 'claude',
+      sourceAccountId: 'claude-main', targetAccountId: 'claude-two', intent: 'continue',
+      status: 'recovery-needed', phase: 'stopping-source', refusalClass: 'transient',
+      reason: 'another session injection is busy', ...overrides });
+    // account-handoff refuses by throwing, with the journalled record on `extra`.
+    const refuse = (entry) => async () => { throw Object.assign(new Error(entry.reason), { status: 409, extra: entry }); };
+    const body = { sessionId: 'sid', pane: 'p', accountId: 'claude-two', queueOnTransient: true };
+    const deps = (handoffSession) => ({ root, handoffSession,
+      handoffQueueSessions: async () => [{ id: 'sid', pane: 'p', rateLimit: { at: '2026-09-17T00:00:00.000Z' } }] });
+    const only = () => queue.list(root);
+
+    const queued = await handoffSessionRequest(body, deps(refuse(record())));
+    assert.equal(queued.status, 'queued');
+    assert.equal(queued.targetAccountId, 'claude-two');
+    assert.equal(queued.reason, 'another session injection is busy');
+    assert.equal(only().length, 1);
+    assert.equal(only()[0].status, 'queued');
+    assert.equal(only()[0].sourceAccountId, 'claude-main');
+    assert.equal(only()[0].rateLimitAt, '2026-09-17T00:00:00.000Z');
+    fs.rmSync(queue.dir(root), { recursive: true, force: true });
+
+    // Everything that must not be retried behind the person's back.
+    for (const [why, entry] of [
+      ['a blocked refusal', record({ refusalClass: 'blocked', reason: 'Target account setup is incompatible: no' })],
+      ['a reopen', record({ intent: 'open-only' })],
+      ['a transfer past its stop', record({ sourceStopVerifiedAt: Date.now() })],
+      ['a transfer that had already started the target', record({ phase: 'starting-target' })],
+      ['a transfer that had nothing to report', record({ status: 'failed', phase: 'preflight' })],
+    ]) {
+      await assert.rejects(handoffSessionRequest(body, deps(refuse(entry))), /./, why);
+      assert.deepEqual(only(), [], `${why} must not be queued`);
+    }
+
+    // `keep handoff` does not ask to be queued, so nothing is.
+    await assert.rejects(handoffSessionRequest({ sessionId: 'sid', pane: 'p', accountId: 'claude-two' },
+      deps(refuse(record()))), /another session injection is busy/);
+    assert.deepEqual(only(), []);
+
+    // A refusal that came back as a result rather than a throw is queued the same way,
+    // and the request the transfer itself sees never carries the console's flag.
+    const seen = [];
+    const returned = await handoffSessionRequest(body, deps(async (request) => {
+      seen.push(request);
+      return { ok: true, ...record() };
+    }));
+    assert.equal(returned.status, 'queued');
+    assert.deepEqual(seen, [{ sessionId: 'sid', pane: 'p', accountId: 'claude-two' }]);
+    assert.equal(only().length, 1);
+    fs.rmSync(queue.dir(root), { recursive: true, force: true });
+
+    // And a transfer that worked is passed straight back.
+    const done = await handoffSessionRequest(body, deps(async () => ({ ok: true, status: 'done', sessionId: 'sid' })));
+    assert.equal(done.status, 'done');
+    assert.deepEqual(only(), []);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('different-account reopen serializes source opening and starts one open-only handoff', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-reopen-account-'));
   try {
@@ -9208,6 +9270,125 @@ test('a restart reads MCP declarations from the account the live agent belongs t
     fs.writeFileSync(path.join(targetDir, '.claude.json'), declared);
     await assert.rejects(run(), /Local background processes are still present/,
       'what the account it is moving to declares says nothing about this process');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a ps row whose arguments could not be read names a process and nothing else', () => {
+  const { parseProcessTable } = require('./serve');
+  const stamp = 'Tue Sep  8 10:00:00 2026';
+  const rows = parseProcessTable([
+    `  11    10 ttys001 ${stamp} /test/claude --resume sid`,
+    `  12    10 ttys002 ${stamp} (claude)`,
+    `  13    10 ttys003 ${stamp} (node)`,
+  ].join('\n'));
+  assert.equal(rows.length, 3);
+  assert.equal(rows[0].argsUnavailable, undefined, 'a readable row carries no marker');
+  assert.equal(rows[0].agent, 'claude');
+  // macOS prints the bare command in parentheses when it cannot read argv. That says
+  // the process is alive; it does not say it is an agent, and it is not evidence of
+  // anything having changed.
+  assert.equal(rows[1].argsUnavailable, true);
+  assert.equal(rows[1].agent, null);
+  assert.equal(rows[1].interactive, false);
+  assert.equal(rows[2].argsUnavailable, true);
+  assert.equal(rows[2].agent, null);
+});
+
+test('agentRowUnreadable separates a snapshot that lost the agent from one that lost its arguments', () => {
+  const { agentRowUnreadable } = require('./serve');
+  const stamp = 'Tue Sep  8 10:00:00 2026';
+  const identity = { pid: 11, pidStart: stamp, agent: 'claude', source: 'argv', primary: true };
+  const row = { pid: 11, ppid: 10, pidStart: stamp, agent: 'claude', interactive: true, args: '/test/claude --resume sid' };
+  assert.equal(agentRowUnreadable([row], identity), false);
+  assert.equal(agentRowUnreadable([], identity), true, 'an empty table describes nothing at all');
+  assert.equal(agentRowUnreadable([{ ...row, agent: null, interactive: false, args: '(claude)', argsUnavailable: true }], identity), true);
+  // Still there, still the same process, but the argv that identified it is gone.
+  assert.equal(agentRowUnreadable([{ ...row, args: '/test/claude' }], identity), true);
+  // A different process at that pid, or none at all, is a real change.
+  assert.equal(agentRowUnreadable([{ ...row, pidStart: 'Tue Sep  8 11:00:00 2026' }], identity), false);
+  assert.equal(agentRowUnreadable([{ pid: 10, ppid: 1, args: '/bin/zsh -l' }], identity), false);
+  // An identity found through the hook child's environment never had an argv token.
+  assert.equal(agentRowUnreadable([{ ...row, args: '/test/claude' }], { ...identity, source: 'child-env' }), false);
+});
+
+test('a ps snapshot that missed the agent is read again instead of refusing the restart', async () => {
+  const { restartSession } = require('./serve');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-ps-reread-'));
+  const claudeFile = path.join(root, 'claude.jsonl');
+  const accountConfig = path.join(root, 'config.json');
+  fs.writeFileSync(accountConfig, JSON.stringify({ version: 1, accounts: [
+    { id: 'claude/default', label: 'Primary', agent: 'claude', configDir: path.join(os.homedir(), '.claude'), useDefaultConfig: true },
+  ], defaultAccounts: { claude: 'claude/default' } }));
+  fs.writeFileSync(claudeFile, JSON.stringify({ type: 'assistant', sessionId: 'ps', message: { content: [], stop_reason: 'end_turn' } }) + '\n');
+  const stamp = 'Tue Sep  8 10:00:00 2026';
+  const command = '/test/claude --resume ps';
+  const agent = { pid: 11, ppid: 10, pidStart: stamp, agent: 'claude', interactive: true, args: command };
+  const unreadable = { pid: 11, ppid: 10, pidStart: stamp, agent: null, interactive: false, args: '(claude)', argsUnavailable: true };
+  const gone = [{ pid: 10, ppid: 1, pidStart: stamp, agent: null, interactive: false, args: '/bin/zsh -l' }];
+  // `rowsFor` answers each ps read by its number. The first is the original identity,
+  // so it always describes the agent; everything after it is the scenario.
+  const scenario = (rowsFor) => {
+    const session = { id: 'ps', kind: 'claude', state: 'idle', endedTurn: true, project: root };
+    let pane = { id: 'p', pid: 10, cmd: '/bin/zsh', args: ['-l'], alive: true, attached: 0, visibleAttached: 0,
+      cols: 200, rows: 50, meta: { sessionId: 'ps', agent: 'claude' } };
+    const state = { reads: 0, waits: 0, closing: false, exited: false, replaced: null };
+    const deps = {
+      root, env: { KEEP_DIR: root, KEEP_CONFIG: accountConfig }, withInjectionLock: (fn) => fn(),
+      buildState: async () => ({ sessions: [session], tasks: [] }),
+      claudeRolloutFile: () => claudeFile,
+      agentProcessRows: async () => {
+        state.reads += 1;
+        if (state.exited) return gone;
+        return state.reads === 1 ? [agent] : rowsFor(state.reads);
+      },
+      psTable: `11 10 ttys001 ${stamp} ${command}`,
+      lsof: async () => '',
+      closeIdleSession: async (_body, guards) => { await guards.beforeClose(); state.closing = true; },
+      // The identity re-read borrows the same seam the exit wait uses, so only the
+      // waits after the source has been asked to close end the pane.
+      sleep: async () => {
+        state.waits += 1;
+        if (state.closing) { pane = { ...pane, alive: false }; state.exited = true; }
+      },
+      readScreenResult: async () => ({ text: `${command}\n~/keep > `, cursor: { x: 9, y: 1 } }),
+      waitForHostAgent: async () => {},
+      host: { request: async (type, params) => {
+        if (type === 'hello') return { replaceExited: true };
+        if (type === 'get') return { pane: { ...pane } };
+        if (type === 'list') return { panes: [{ ...pane }] };
+        if (type === 'input') return {};
+        assert.equal(type, 'replace-exited');
+        state.replaced = params;
+        pane = { ...pane, alive: true, pid: 20 };
+        return { pane };
+      } },
+    };
+    return { state, run: () => restartSession({ sessionId: 'ps', pane: 'p', pid: 10, mode: 'idle' }, deps) };
+  };
+
+  try {
+    // One bad snapshot inside checkChildren; the re-read describes the same process.
+    const recovered = scenario((read) => (read === 2 ? [unreadable] : [agent]));
+    assert.equal((await recovered.run()).sessionId, 'ps');
+    assert.ok(recovered.state.replaced, 'the restart went ahead');
+
+    // Every re-read comes back the same way: the identity is unverifiable, which is a
+    // refusal of its own and a transient one, not a changed process.
+    const stuck = scenario(() => [unreadable]);
+    await assert.rejects(stuck.run(), /^Error: Agent process identity could not be verified from ps$/);
+    assert.equal(stuck.state.replaced, null);
+    assert.equal(require('./account-handoff').classifyRefusal('Agent process identity could not be verified from ps'), 'transient');
+
+    // A readable snapshot with no row for that pid and start time is the old refusal.
+    const replaced = scenario(() => gone);
+    await assert.rejects(replaced.run(), /^Error: Agent process identity changed during restart$/);
+    assert.equal(replaced.state.replaced, null);
+
+    // And a re-read that comes back readable has answered, even if the answer is that
+    // the agent really is gone: that is the old refusal too, not an unverifiable one.
+    const vanished = scenario((read) => (read === 2 ? [unreadable] : gone));
+    await assert.rejects(vanished.run(), /^Error: Agent process identity changed during restart$/);
+    assert.equal(vanished.state.replaced, null);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

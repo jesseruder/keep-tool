@@ -244,9 +244,18 @@ export function installHandoffControls(container, ctx, sessionId, pane) {
       button.blur();
       try {
         const force = button.dataset.handoffForce === '1';
-        const result = await write('/api/handoff-session', { sessionId, pane, accountId, ...(force ? { force: true } : {}) });
+        // queueOnTransient: a refusal that clears on its own — a busy injection lock, a
+        // slow host, a `ps` snapshot taken under load — is retried in the background
+        // rather than left as a record someone has to notice and click again.
+        const result = await write('/api/handoff-session', { sessionId, pane, accountId, queueOnTransient: true,
+          ...(force ? { force: true } : {}) });
         const responseOpenOnly = result.intent === 'open-only' || openOnly;
-        if (result.status === 'recovery-needed') {
+        if (result.status === 'queued') {
+          ctx.toast(`Transfer refused (${result.reason || 'it was busy'}); retrying in the background`);
+          // The reloaded state carries the queue entry, and the controls become the
+          // queue's own "Moving to ‹account›" with its Cancel button.
+          await ctx.reload();
+        } else if (result.status === 'recovery-needed') {
           ctx.toast(`${responseOpenOnly ? 'Reopen' : 'Transfer'} needs recovery: ${result.reason || 'retry when the session is safe'}`);
         } else if (result.status === 'failed') {
           ctx.toast(`${responseOpenOnly ? 'Not reopened' : 'Not continued'}: ${result.reason || (responseOpenOnly ? 'reopen failed' : 'transfer failed')}`);

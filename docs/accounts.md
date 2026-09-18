@@ -146,6 +146,8 @@ The queue's own snapshot can still be a moment stale, so it names its assumption
 
 **Cancel** takes effect immediately, even while another session's transfer is in flight or the state for this one is being rebuilt: the entry is re-read with the fresh state in hand, and the attempt's result is only written if it has not changed underneath it.
 
+The single-session **Continue on another account** button uses the same patience. When that transfer is refused for a transient reason *before* anything was stopped — the injection lock was busy, the host timed out, a `ps` snapshot came back unreadable — the console queues it and it is retried on exactly the same schedule, with **Cancel** in place of the transfer controls. Such an entry names no rate-limit event, so nothing cancels it for a limit that cleared: it runs until it lands, until it gives up at `KEEP_HANDOFF_QUEUE_MAX_MIN`, or until you cancel it. Every attempt still refuses to stop a session that is mid-turn. `keep handoff` is unchanged and reports the refusal to whoever typed it.
+
 A queued session shows **Moving to ‹account›** with its last refusal and a **Cancel** button in place of the usual transfer controls, and counts as a pending handoff, so nothing offers to reopen or restart it meanwhile. A parked entry whose session has moved on keeps its note but hands the ordinary transfer and recovery controls back. The dashboard's `handoffQueue` carries the queued and parked entries plus the moves from the last hour; the queue's own health row is `handoff-queue`.
 
 ### Automatic transfer on the weekly limit

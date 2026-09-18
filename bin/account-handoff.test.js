@@ -871,6 +871,7 @@ test('refusals that clear on their own are told apart from the ones that need a 
     // A bad `ps` snapshot under load, not a changed process: the next attempt reads
     // the identity again from scratch and re-runs the same comparison.
     'Agent process identity changed during restart',
+    'Agent process identity could not be verified from ps',
     'Original agent process identity is unverified',
     'Session helper processes changed during restart',
     // The restart's /exit was taken back off the screen, so the pane is as it was.

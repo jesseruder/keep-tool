@@ -17,7 +17,7 @@ function routes(ctx) {
     ATTENTION_KINDS, InjectionError, MOBILE_VIEWS, TAG_INSTRUCTION, TASK_INSTRUCTION, WEB_ROOT,
     abandonAccountHandoff, accounts, announceStateNote, answerSession, attentionAckKey, attentionAckName,
     buildState, cancelQueuedHandoff, closeIdleSession, codex, compactSessionById, companionSnapshot, compactState,
-    daemonRestartGate, dashboardDetail, fs, handoffRateLimited, handoffSession, health, hostRequest,
+    daemonRestartGate, dashboardDetail, fs, handoffRateLimited, handoffSessionRequest, health, hostRequest,
     inspectReviewQueueLaunch,
     keep, launchReviewQueueSession, lightweightState, listHostPanes, listPortableTransfers, notifications,
     openSession, path, portableTransferDraft, portableTransferPreview, preparePortableTransfer,
@@ -623,11 +623,15 @@ function routes(ctx) {
       },
     },
     {
+      // One session's transfer, for the console button and for `keep handoff` alike.
+      // A caller that sends `queueOnTransient` asks for a refusal that clears on its
+      // own to join the retry queue instead of ending here; the answer is then
+      // `{ status: 'queued' }` and the CLI, which does not ask, still sees the refusal.
       method: 'POST',
       path: '/api/handoff-session',
       handle: async ({ req, res, url, body }) => {
         try {
-          const result = await handoffSession(body);
+          const result = await handoffSessionRequest(body);
           broadcast();
           return json(res, 200, result);
         } catch (error) {

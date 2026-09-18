@@ -3463,7 +3463,11 @@ function parseProcessTable(output) {
     const match = PS_TABLE_RE.exec(line);
     if (!match) continue;
     const args = match[5];
-    const agentMatch = /(^|\/)(claude|codex)(\s|$)/.exec(args);
+    // macOS prints the bare command name in parentheses — `(claude)` — for a process
+    // whose argument vector it could not read. That row names a live process and says
+    // nothing else about it, so it is neither an agent nor evidence that one is gone.
+    const argsUnavailable = /^\([^()]*\)$/.test(args);
+    const agentMatch = argsUnavailable ? null : /(^|\/)(claude|codex)(\s|$)/.exec(args);
     const padded = ` ${args} `;
     const interactive = Boolean(agentMatch)
       && !padded.includes(' -p ')
@@ -3479,6 +3483,7 @@ function parseProcessTable(output) {
       args,
       agent: agentMatch && agentMatch[2],
       interactive,
+      ...(argsUnavailable ? { argsUnavailable: true } : {}),
     });
   }
   return rows;
@@ -3486,8 +3491,11 @@ function parseProcessTable(output) {
 
 async function agentProcessRows(deps = {}) {
   if (typeof deps.psTable === 'string') return parseProcessTable(deps.psTable);
+  // A `ps` over every process on a swapping Mac has taken well past five seconds, and
+  // the timeout lands as a refused transfer or a session that looks gone. Waiting is
+  // cheaper than either.
   const result = await (deps.execFile || execFileAsync)('ps', ['-axo', 'pid=,ppid=,tty=,lstart=,args='], {
-    encoding: 'utf8', timeout: 5e3, maxBuffer: 32e6, env: { ...process.env, LC_ALL: 'C' },
+    encoding: 'utf8', timeout: 15e3, maxBuffer: 32e6, env: { ...process.env, LC_ALL: 'C' },
   });
   return parseProcessTable(String(result.stdout || ''));
 }
@@ -3543,6 +3551,32 @@ function agentIdentityOwnsPane(identity, pane, rows) {
   return false;
 }
 
+// The session a row's own argv names, which is the strongest process-to-session
+// identity there is. agentRowUnreadable reads it again to tell a snapshot that lost
+// the agent's arguments from one that lost the agent.
+function argvSessionId(row) {
+  const match = row.agent === 'claude'
+    ? /(?:^|\s)--(?:resume|session-id)\s+([A-Za-z0-9_-]+)(?=\s|$)/.exec(row.args)
+    : /(?:^|\s)(?:\S*\/)?codex\s+(?:--?[A-Za-z0-9-]+(?:=\S*)?\s+)*resume\s+([A-Za-z0-9_-]+)(?=\s|$)/.exec(row.args);
+  return match ? match[1] : null;
+}
+
+// Whether a `ps` snapshot simply failed to describe this agent, as opposed to saying
+// it is gone. Under memory pressure the table can come back empty, or carry the
+// process at its own pid and start time with its arguments unreadable — and an agent
+// identified by its `--resume <sid>` argv then disappears from the identity map
+// although nothing about the process changed. That is a snapshot to take again, not a
+// different process. A snapshot that describes the pid and start time but names some
+// other session is a real change and is not covered here.
+function agentRowUnreadable(rows, identity) {
+  if (!Array.isArray(rows) || !rows.length) return true;
+  if (!identity) return false;
+  const row = rows.find((candidate) => candidate.pid === identity.pid && candidate.pidStart === identity.pidStart);
+  if (!row) return false;
+  return row.argsUnavailable === true
+    || (identity.source === 'argv' && argvSessionId(row) == null);
+}
+
 async function liveSessionPids(deps = {}) {
   const live = new Map();
   let rows = [];
@@ -3557,10 +3591,8 @@ async function liveSessionPids(deps = {}) {
   for (const row of interactive) {
     // A pane switch needs current open-file evidence; launch argv survives /new.
     if (deps.codexRolloutOnly && row.agent === 'codex') continue;
-    const match = row.agent === 'claude'
-      ? /(?:^|\s)--(?:resume|session-id)\s+([A-Za-z0-9_-]+)(?=\s|$)/.exec(row.args)
-      : /(?:^|\s)(?:\S*\/)?codex\s+(?:--?[A-Za-z0-9-]+(?:=\S*)?\s+)*resume\s+([A-Za-z0-9_-]+)(?=\s|$)/.exec(row.args);
-    if (match) setLiveSession(live, match[1], row, 'argv');
+    const named = argvSessionId(row);
+    if (named) setLiveSession(live, named, row, 'argv');
   }
 
   // Claude exports its session id to hook children, even for a fresh TUI whose
@@ -3577,8 +3609,10 @@ async function liveSessionPids(deps = {}) {
       let output;
       if (typeof deps.psEnv === 'function') output = await deps.psEnv(pids);
       else {
+        // The same patience agentProcessRows now has: this read is what gives a fresh
+        // TUI its session id, and losing it under load loses the whole identity.
         const result = await (deps.execFile || execFileAsync)('ps', ['-E', '-o', 'pid=,args=', '-p', pids.join(',')], {
-          encoding: 'utf8', timeout: 5e3, maxBuffer: 32e6, env: { ...process.env, LC_ALL: 'C' },
+          encoding: 'utf8', timeout: 15e3, maxBuffer: 32e6, env: { ...process.env, LC_ALL: 'C' },
         });
         output = result.stdout;
       }
@@ -4078,8 +4112,20 @@ async function restartSession(body, deps = {}) {
       try { resumeMcpConfig ||= (deps.ensureSharedMemory || require('./account-setup').ensureSharedMemory)(account, cwd).mcpConfig; }
       catch (error) { throw new InjectionError(409, `account shared setup is unavailable: ${error.message}`); }
     }
-    const originalRows = await (deps.agentProcessRows || agentProcessRows)(deps);
-    const originalIdentity = (await liveSessionPids({ ...deps, agentProcessRows: async () => originalRows })).get(session.id);
+    const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    // One `ps` snapshot is the whole evidence for who this agent is, and on a swapping
+    // Mac a snapshot can come back without a usable row for a process that is running
+    // and unchanged — empty, or with the arguments replaced by `(claude)`. Reading it
+    // again costs a couple of seconds; refusing costs the transfer.
+    const readAgentRows = () => (deps.agentProcessRows || agentProcessRows)(deps);
+    const identityFrom = async (rows) => (await liveSessionPids({ ...deps, agentProcessRows: async () => rows })).get(session.id);
+    let originalRows = await readAgentRows();
+    let originalIdentity = await identityFrom(originalRows);
+    for (let i = 0; i < 3 && !originalIdentity?.primary; i++) {
+      await sleep(750);
+      originalRows = await readAgentRows();
+      originalIdentity = await identityFrom(originalRows);
+    }
     if (!originalIdentity?.primary) throw Error('Original agent process identity is unverified');
     const originalArgs = originalRows.find((p) => p.pid === originalIdentity.pid)?.args || '';
     const ledger = require('./restart-ledger');
@@ -4113,9 +4159,25 @@ async function restartSession(body, deps = {}) {
       if (!currentPane.alive || currentPane.pid !== pane.pid || currentPane.meta?.sessionId !== session.id) throw Error('Session changed during restart');
       if (body.mode === 'idle' && !require('./session-restart').isReviewer(session, pane)
           && (currentPane.visibleAttached ?? currentPane.attached) !== 0) throw transient('Waiting until the pane is no longer being viewed');
-      const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
-      const identity = (await liveSessionPids({ ...deps, agentProcessRows: async () => rows })).get(session.id);
-      if (!identity?.primary || identity.pid !== originalIdentity.pid || identity.pidStart !== originalIdentity.pidStart) throw Error('Agent process identity changed during restart');
+      let rows = await readAgentRows();
+      let identity = await identityFrom(rows);
+      const changed = () => !identity?.primary || identity.pid !== originalIdentity.pid
+        || identity.pidStart !== originalIdentity.pidStart;
+      // A snapshot that could not describe the agent is not a changed agent. Read it
+      // again before refusing: on 2026-09-17 two transfers died here for a process
+      // whose pid and start time had not moved at all.
+      if (changed() && agentRowUnreadable(rows, originalIdentity)) {
+        // Only while the snapshot is still the thing that cannot answer: one that comes
+        // back readable has answered, and its answer is the comparison below.
+        for (let i = 0; i < 3 && changed() && agentRowUnreadable(rows, originalIdentity); i++) {
+          await sleep(750);
+          rows = await readAgentRows();
+          identity = await identityFrom(rows);
+        }
+        if (changed() && agentRowUnreadable(rows, originalIdentity)) throw Error('Agent process identity could not be verified from ps');
+        if (!changed()) process.stderr.write(`keep serve: ps snapshot missed ${session.id}'s agent (pid ${originalIdentity.pid}); a re-read found it\n`);
+      }
+      if (changed()) throw Error('Agent process identity changed during restart');
       const parent = rows.find((p) => p.pid === identity.pid);
       // process.env and not deps.env: the npx cache an `npx`-declared server unpacked
       // into is the one this daemon's own environment names, because the daemon is
@@ -4140,7 +4202,6 @@ async function restartSession(body, deps = {}) {
       if (!exitInputStarted && ['Session changed during cleanup; nothing closed', 'Waiting for the turn and background work to finish', 'Waiting for pending input to be resolved'].includes(error.message)) throw transient(error.message);
       throw error;
     }
-    const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     let stopped;
     // The typed /exit can land on the worktree-exit modal instead of ending the session.
     // Answering it costs a round trip the plain exit does not, so the wait grows to ~15s
@@ -8020,6 +8081,71 @@ async function handoffSession(body, deps = {}) {
   });
 }
 
+// The rate limit this session carries now, which is the event a queue entry exists
+// for. A manual transfer usually names none, and a null here simply means the entry
+// is never cancelled for a limit that cleared — only landing, giving up, or Cancel
+// ends it. Worth a state build only because nothing reaches here but a refusal.
+async function handoffRateLimitAt(sessionId, deps = {}) {
+  try {
+    const sessions = await (deps.handoffQueueSessions || handoffQueueSessions)(deps);
+    return sessions.find((entry) => entry.id === sessionId)?.rateLimit?.at ?? null;
+  } catch { return null; }
+}
+
+// Whether a refused transfer is one the queue may simply ask for again: it refused
+// transiently, it was a continuation rather than an open-only reopen, and it stopped
+// before the transaction passed its stop. Past that point the source is already down
+// and only the recovery path may touch it.
+//
+// The recovery-needed record stays exactly where it is. The queue's retry calls the
+// same handoffSession, which picks that journaled transaction up — the same thing
+// `keep handoff` does when a person runs it again.
+async function queueRefusedHandoff(body, record, deps = {}) {
+  const queue = deps.handoffQueue || require('./handoff-queue');
+  if (!record || record.status !== 'recovery-needed' || record.refusalClass !== 'transient') return null;
+  if (record.intent !== 'continue' || queue.transferPastStop(record)) return null;
+  const sessionId = String(record.sessionId || body.sessionId || '');
+  const pane = String(record.pane || body.pane || '');
+  const reason = String(record.reason || 'the transfer was refused');
+  let entry;
+  try {
+    ({ entry } = queue.enqueue(deps.root || keep.ROOT, { sessionId, pane,
+      sourceAccountId: record.sourceAccountId, targetAccountId: body.accountId, force: body.force === true,
+      rateLimitAt: await handoffRateLimitAt(sessionId, deps) }));
+  } catch (error) {
+    // A queue that will not take this is no reason to lose the refusal itself.
+    process.stderr.write(`keep serve: could not queue ${sessionId} after a transient refusal: ${error.message}\n`);
+    return null;
+  }
+  process.stderr.write(`keep serve: handoff queue queued ${sessionId} after a transient refusal: ${reason}\n`);
+  return { ok: true, status: 'queued', reason, sessionId, pane, targetAccountId: entry.targetAccountId };
+}
+
+// The console's transfer button. Every one of the twelve transfers a person asked for
+// on 2026-09-17 ended at a recovery-needed record, each on a condition that clears by
+// itself, while every one the queue drove through the same handoffSession landed — the
+// only difference being that the queue tried again. So a console transfer refused that
+// way joins the queue instead of stopping at a record nobody is watching.
+//
+// `queueOnTransient` is the console asking for that. `keep handoff` posts to the same
+// route and does not ask: it reports the refusal to whoever typed it, unchanged.
+async function handoffSessionRequest(body, deps = {}) {
+  const { queueOnTransient, ...request } = body && typeof body === 'object' ? body : {};
+  const run = deps.handoffSession || handoffSession;
+  if (queueOnTransient !== true) return run(request, deps);
+  let result;
+  try {
+    result = await run(request, deps);
+  } catch (error) {
+    // account-handoff hands the record back on the error as `extra`; the route would
+    // otherwise answer 409 with it.
+    const queued = await queueRefusedHandoff(request, error && error.extra, deps);
+    if (queued) return queued;
+    throw error;
+  }
+  return await queueRefusedHandoff(request, result, deps) || result;
+}
+
 async function abandonAccountHandoff(body, deps = {}) {
   const root = deps.root || keep.ROOT;
   return require('./account-handoff').abandonForPortable(body, {
@@ -9256,7 +9382,7 @@ function start(deps = {}) {
     answerSession, attentionAckKey, attentionAckName, buildState, cancelQueuedHandoff, cardUsage, closeEphemeralPane,
     closeIdleSession, codex, compactSessionById, compactState, companionSnapshot, daemonRestartGate,
     dashboardDetail, deliverCheckToThread, deliverUnblockToThread, discord, driftWakeFromVerdict,
-    envNumber, features, forceRestartSession, fs, handoffRateLimited, handoffSession, health, hostRequest,
+    envNumber, features, forceRestartSession, fs, handoffRateLimited, handoffSession, handoffSessionRequest, health, hostRequest,
     ideas,
     inspectReviewQueueLaunch, keep, keepConsole, landed, launchReviewQueueSession, lightweightState,
     limitresume, listHostPanes, listPortableTransfers, liveSessionTick, liveTurnIndexSessions,
@@ -9541,14 +9667,14 @@ module.exports = {
   watcherSend,
   resolveSessionTarget,
   resolveSessionId, screenSession, screenHistorySession, sendSessionKeys, shellPaneTarget, stripTerminalAnsi, writeToShellPane,
-  agentProcessRows, liveSessionPids, liveSessionTick, restorePlan,
+  agentProcessRows, parseProcessTable, agentRowUnreadable, liveSessionPids, liveSessionTick, restorePlan,
   annotatePaneAgents,
   readPaneRecord, sessionProjectFromTranscript, openSession, reopenSessionOnAccount,
   runCheckNow, runTaskNow, taskRunMessage, adoptedPaneMeta, closeEphemeralPane, resolveOpener, inheritedOpener,
   transcriptFileForSession,
   inspectAccountHandoff, waitForAccountRecord, resumeExitedAccountHandoff, continueAccountHandoff, handoffSession,
   abandonAccountHandoff,
-  handoffQueueSessions, handoffQueueTick, handoffRateLimited, cancelQueuedHandoff,
+  handoffQueueSessions, handoffQueueTick, handoffRateLimited, cancelQueuedHandoff, handoffSessionRequest,
   listPortableTransfers, inspectPortableSource, portableTerminalRateLimitEvidence,
   portableTransferDraft, preparePortableTransfer,
   portableTransferPreview, transferSession, resolvePortableTransfer, recoverPortableOpening,
