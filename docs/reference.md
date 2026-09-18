@@ -364,7 +364,11 @@ dependency), `daemon-health` (one finding for every scheduler in `.keep/health.j
 whose latest record is a state its scheduler tolerates — see [self-repair](self-repair.md)),
 `checkout-drift` (per project of an
 open card: a dirty tree or a branch ahead of/behind its upstream, from local refs with no
-fetch), `step-run-pending` (a gated step with landed commits its last run missed for over
+fetch), `worktree-uncarded` (a worktree of any card project on a branch whose commits,
+patch-equivalents excluded, are not on the local `origin/<default>`, whose newest commit
+is over a day old, and which no card names by branch, worktree path or a cited commit;
+reviewer-idea cards do not count, filed under `worktree:<path>`; review bundles list the
+same worktrees under `## git`), `step-run-pending` (a gated step with landed commits its last run missed for over
 24h), `note-expired` (a state note past its window that nobody extended or cleared,
 filed under `note:<id>`), `resource-bad-matcher` (a declared resource whose regex does
 not compile or whose glob is empty, filed under `resource:<project>:<name>`),

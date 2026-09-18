@@ -785,7 +785,7 @@ function gitState(project, lastSha, opts = {}) {
   if (!cwd || !fs.existsSync(cwd)) return { available: false, reason: project ? `project dir ${tilde(cwd)} not found` : 'task has no project' };
   const out = {
     available: true, cwd: tilde(cwd), head: '', branch: '', status: '', stat: '', commits: '', diffSummary: [], diffLines: 0, note: '', rangeIncluded: false,
-    dirtyCount: 0, upstream: '', ahead: null, behind: null, defaultBranch: '', cited: [],
+    dirtyCount: 0, upstream: '', ahead: null, behind: null, defaultBranch: '', cited: [], worktrees: [],
   };
   try { out.head = git(cwd, ['rev-parse', 'HEAD']).trim(); } catch (e) { return { available: false, reason: `git unavailable: ${gitErrorLine(e)}` }; }
   out.rangeIncluded = !lastSha || lastSha === out.head;
@@ -822,6 +822,17 @@ function gitState(project, lastSha, opts = {}) {
     }
     out.cited.push({ sha, known, onDefault });
   }
+  // The project's other worktrees with unlanded commits: parallel work on the same
+  // code that no card may name. landed.js requires this file, so require it late.
+  try {
+    const landed = require('./landed.js');
+    const repo = landed.repoFor({ fm: { project: cwd } });
+    let here = path.resolve(cwd);
+    try { here = fs.realpathSync(here); } catch {}
+    if (opts.worktrees && repo && out.defaultBranch) {
+      out.worktrees = landed.unlandedWorktrees(repo, out.defaultBranch).filter((row) => row.path !== here);
+    }
+  } catch {}
   let diff = '';
   try {
     diff = git(cwd, ['diff', '--no-ext-diff', '--no-textconv', 'HEAD']);
@@ -1331,6 +1342,10 @@ function gitFactLines(git, peers) {
     const rows = git.cited.map((row) => `${row.sha.slice(0, 9)} ${!row.known ? 'unknown here' : row.onDefault === null ? '?' : row.onDefault ? 'yes' : 'NO'}`);
     lines.push(`cited shas on origin/${git.defaultBranch || '?'}: ${rows.join(', ')}`);
   }
+  if (git.worktrees && git.worktrees.length) {
+    const rows = git.worktrees.slice(0, 8).map((row) => `${tilde(row.path)} [${row.branch}] ${row.commits.length} (newest ${keep.stampOf(new Date(row.newestAt)).slice(0, 10)})`);
+    lines.push(`other worktrees with commits not on origin/${git.defaultBranch}: ${rows.join(', ')}${git.worktrees.length > 8 ? `, …and ${git.worktrees.length - 8} more` : ''}`);
+  }
   if (!peers || !peers.available) lines.push(`other live sessions in this checkout: unknown (${peers && peers.reason || 'no ledger'})`);
   else {
     const stale = peers.stale ? ' (ledger stale)' : '';
@@ -1492,7 +1507,7 @@ function buildBundle(taskId, opts = {}) {
   // means exactly what a later `landed (daemon)` entry would mean.
   let citedShas = [];
   try { citedShas = require('./landed.js').citedShas(stampedLogEntries(task.body)).map((row) => row.sha); } catch {}
-  const git = gitState(task.fm.project, state.git.skippedFrom || state.git.sha, { cited: citedShas });
+  const git = gitState(task.fm.project, state.git.skippedFrom || state.git.sha, { cited: citedShas, worktrees: true });
   state.git.pendingClearsSkipped = false;
   if (git.available) {
     state.git.pendingSha = git.head;
@@ -4781,6 +4796,7 @@ module.exports = {
   saveState,
   commitState,
   gitState,
+  gitFactLines,
   summarizeDiff,
   liveSessionsInCheckout,
   lastTickMessageCount,

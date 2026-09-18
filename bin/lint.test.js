@@ -1026,6 +1026,72 @@ test('checkout-drift reports a dirty or diverged checkout once per project', () 
   }
 });
 
+test('worktree-uncarded names a feature worktree with unlanded commits that no card names', () => {
+  const root = makeRoot();
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'keep-lint-worktrees-')));
+  const origin = path.join(base, 'origin.git');
+  const repo = path.join(base, 'repo');
+  const old = { GIT_COMMITTER_DATE: new Date(Date.now() - 3 * 86400e3).toISOString() };
+  const commit = (cwd, file, message, env) => {
+    fs.writeFileSync(path.join(cwd, file), `${message}\n`);
+    git(cwd, ['add', file]);
+    git(cwd, ['commit', '-q', '-m', message], env);
+    return git(cwd, ['rev-parse', 'HEAD']);
+  };
+  const worktree = (name) => {
+    const dir = path.join(base, name);
+    git(repo, ['worktree', 'add', '-q', '-b', name, dir, 'main']);
+    return dir;
+  };
+  try {
+    execFileSync('git', ['init', '-q', '--bare', '--initial-branch=main', origin]);
+    execFileSync('git', ['init', '-q', '--initial-branch=main', repo]);
+    git(repo, ['config', 'user.name', 'Keep Test']);
+    git(repo, ['config', 'user.email', 'keep@example.test']);
+    commit(repo, 'a.txt', 'first');
+    git(repo, ['remote', 'add', 'origin', origin]);
+    git(repo, ['push', '-q', '-u', 'origin', 'main']);
+    git(repo, ['remote', 'set-head', 'origin', 'main']);
+    writeCard(root, 'done-card', { status: 'done', project: repo });
+
+    const stray = worktree('stray-work');
+    commit(stray, 'stray.txt', 'stray', old);
+    const fresh = worktree('fresh-work');
+    commit(fresh, 'fresh.txt', 'fresh');
+    const named = worktree('named-work');
+    commit(named, 'named.txt', 'named', old);
+    const cited = worktree('cited-work');
+    const citedSha = commit(cited, 'cited.txt', 'cited', old);
+    const picked = worktree('picked-work');
+    const pickedSha = commit(picked, 'picked.txt', 'picked', old);
+    git(repo, ['cherry-pick', pickedSha]);
+    git(repo, ['push', '-q', 'origin', 'main']);
+    writeCard(root, 'named-card', { status: 'active', project: repo }, 'Working on `named-work` next.\n');
+    writeCard(root, 'cited-card', { status: 'done', project: repo },
+      `## 2026-09-01 10:00 — check-in\nwip\ncommits: ${citedSha.slice(0, 9)}\n`);
+    writeCard(root, 'reviewer-idea-worktrees', { status: 'active', kind: 'idea', tags: ['reviewer-idea'], project: repo },
+      'Pattern: stray-work has commits and no card.\n');
+
+    const findings = lint({ root, rule: 'worktree-uncarded' }).findings;
+    assert.deepEqual(findings.map((item) => item.id), [`worktree:${stray.replace(os.homedir(), '~')}`],
+      'fresh work has a day of grace, a named or cited branch has a card, a cherry-picked one has landed, and a reviewer idea owns nothing');
+    assert.equal(findings[0].severity, 'low');
+    assert.match(findings[0].text, /on stray-work: 1 commit not on origin\/main, newest 3d old/);
+    assert.match(findings[0].fix, /keep add .* --file --project /);
+
+    const { gitState } = require('./review.js');
+    assert.deepEqual(gitState(stray, '').worktrees, [], 'only the bundle asks for the listing');
+    const state = gitState(stray, '', { worktrees: true });
+    assert.deepEqual(state.worktrees.map((row) => row.branch).sort(), ['cited-work', 'fresh-work', 'named-work'],
+      'the bundle lists the other unlanded worktrees, not this one or the landed one');
+    const line = require('./review.js').gitFactLines(state, null).find((row) => row.startsWith('other worktrees'));
+    assert.match(line, /^other worktrees with commits not on origin\/main: .*\[cited-work\] 1 \(newest \d{4}-\d\d-\d\d\)/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
 test('step-run-pending waits a day before naming a gated step', () => {
   const root = makeRoot();
   const now = Date.parse('2026-09-14T12:00:00');

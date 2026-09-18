@@ -287,6 +287,35 @@ function isOnDefault(repo, sha, branch) {
   } catch { return false; }
 }
 
+// Every worktree of `repo` on a branch other than the default whose commits are not
+// on origin/<branch>, patch-equivalents excluded: a branch squashed or cherry-picked
+// onto main has nothing left to land, and naming it would only send someone to find
+// that out by hand. Local refs only; callers that want a fresh origin fetch first.
+function unlandedWorktrees(repo, branch = defaultBranch(repo)) {
+  if (!repo || !branch || !refExists(repo, `refs/remotes/origin/${branch}`)) return [];
+  let records;
+  try { records = wt.worktreeRecords(repo); } catch { return []; }
+  const out = [];
+  for (const record of records) {
+    const ref = String(record.branch || '');
+    if (record.bare || record.prunable || !ref.startsWith('refs/heads/')) continue;
+    const name = ref.slice('refs/heads/'.length);
+    if (name === branch) continue;
+    let text = '';
+    try {
+      text = git(repo, ['log', '--cherry-pick', '--right-only', '--no-merges', '--format=%H %ct',
+        `refs/remotes/origin/${branch}...${ref}`]);
+    } catch { continue; }
+    const commits = text.split('\n').map((line) => line.match(/^([0-9a-f]{40}) (\d+)$/))
+      .filter(Boolean).map((match) => ({ sha: match[1], at: Number(match[2]) * 1000 }));
+    if (!commits.length) continue;
+    let dir = path.resolve(record.worktree);
+    try { dir = fs.realpathSync(dir); } catch {}
+    out.push({ path: dir, branch: name, commits, newestAt: Math.max(...commits.map((c) => c.at)) });
+  }
+  return out;
+}
+
 // ---------- rebased citations ----------
 
 function patchCaches() {
@@ -1224,6 +1253,7 @@ module.exports = {
   fetchDefault,
   originEvidenceUsable,
   isOnDefault,
+  unlandedWorktrees,
   REBASE_SCAN_LIMIT,
   REBASE_WINDOW_MS,
   REBASE_RETRY_MS,

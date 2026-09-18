@@ -40,6 +40,7 @@ const RULE_NAMES = [
   'blocked-no-need',
   'daemon-health',
   'checkout-drift',
+  'worktree-uncarded',
   'step-run-pending',
   'note-expired',
   'resource-bad-matcher',
@@ -851,6 +852,60 @@ function checkoutDrift(_task, ctx) {
   return out;
 }
 
+// A worktree on a feature branch with commits origin has not got, that no card names
+// by branch, by path or by any of those commits, is work only `git worktree list`
+// can find: the reviewer found a duplicate and a stale divergence that way by hand.
+// Every card project counts, done ones too, since the leftovers outlive the card; any
+// card counts as naming it, archived ones too, since that card is where to look. A
+// day's grace for the tip, so a session's work in progress is not reported under it.
+// Local refs only, like checkout-drift: a fetch per project every sweep would cost
+// more than the finding is worth, and anything that lands here fetches anyway.
+const WORKTREE_GRACE_MS = DAY_MS;
+
+function mentions(text, needle) {
+  if (!needle) return false;
+  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?:^|[^\\w./-])${escaped}(?![\\w/-]|\\.\\w)`).test(text);
+}
+
+function worktreeUncarded(_task, ctx) {
+  // A reviewer idea cites branches as evidence of a pattern, this rule's own card
+  // among them; it owns none of that work, so it must not hide it.
+  const cards = [...ctx.allTasks.values()]
+    .filter((task) => !task.parseError && !(task.fm.tags || []).includes('reviewer-idea')).map((task) => ({
+    text: [task.fm.title, task.fm.project, task.body].join('\n'),
+    shas: allCitedShas(task),
+  }));
+  const named = (row, repo) => {
+    const needles = [row.branch, row.path, tilde(row.path)];
+    const relative = path.relative(repo, row.path);
+    if (relative && !relative.startsWith('..')) needles.push(relative);
+    if (path.basename(row.path).length >= 12) needles.push(path.basename(row.path));
+    return cards.some((card) => needles.some((needle) => mentions(card.text, needle))
+      || row.commits.some((commit) => shaIsCited(commit.sha, card.shas)));
+  };
+  const out = [];
+  const seen = new Set();
+  for (const task of ctx.tasks) {
+    const repo = ctx.repoFor(task);
+    if (!repo || seen.has(repo)) continue;
+    seen.add(repo);
+    const branch = landed.defaultBranch(repo);
+    if (!branch) continue;
+    for (const row of ctx.unlandedWorktrees(repo, branch)) {
+      if (ctx.now - row.newestAt < WORKTREE_GRACE_MS || named(row, repo)) continue;
+      const n = row.commits.length;
+      out.push(finding('worktree-uncarded', { id: `worktree:${tilde(row.path)}` }, 'low',
+        `${tilde(row.path)} on ${row.branch}: ${n} commit${n === 1 ? '' : 's'} not on origin/${branch}`
+        + `, newest ${Math.floor((ctx.now - row.newestAt) / DAY_MS)}d old, and no card names the branch, the worktree or its commits`,
+        `keep add "<what ${row.branch} is for>" --file --project ${tilde(repo)} -m "branch ${row.branch} in ${tilde(row.path)}"`
+        + ` (or remove the worktree and branch if it is abandoned)`));
+      if (out.length >= 10) return out;
+    }
+  }
+  return out;
+}
+
 // A gated step (an AMI bake, a Terraform apply) whose paths have landed commits the
 // last run did not include, left that way for a day. The ledger and the step registry
 // answer this without a model; `keep steps` renders the same rows.
@@ -927,7 +982,7 @@ function resourceBadMatcher(_task, ctx) {
 
 // Fleet-level rules answer once for the whole registry, not once per card, so lint
 // calls them with no task. Everything else stays (task, ctx).
-for (const rule of [daemonHealth, checkoutDrift, stepRunPending, noteExpired, resourceBadMatcher]) rule.fleet = true;
+for (const rule of [daemonHealth, checkoutDrift, worktreeUncarded, stepRunPending, noteExpired, resourceBadMatcher]) rule.fleet = true;
 
 const RULES = {
   'malformed-card': malformedCard,
@@ -952,6 +1007,7 @@ const RULES = {
   'blocked-no-need': blockedNoNeed,
   'daemon-health': daemonHealth,
   'checkout-drift': checkoutDrift,
+  'worktree-uncarded': worktreeUncarded,
   'step-run-pending': stepRunPending,
   'note-expired': noteExpired,
   'resource-bad-matcher': resourceBadMatcher,
@@ -1083,6 +1139,7 @@ function lint(options = {}) {
       catch { return null; }
     },
     checkoutState: options.checkoutState || checkoutState,
+    unlandedWorktrees: options.unlandedWorktrees || landed.unlandedWorktrees,
     stepRows() {
       if (stepRows) return stepRows;
       stepRows = [];
