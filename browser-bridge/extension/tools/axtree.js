@@ -14,6 +14,10 @@
 import { ensureFrameDomains, frameOwners, frameSessions, send } from "../lib/cdp.js";
 import { iframeNodes, spliceFrameTrees } from "../lib/frames.js";
 
+// How hard to chase a page whose frames keep changing while it is being read.
+const MAX_FRAME_ROUNDS = 8;
+const FRAME_WALK_BUDGET_MS = 5000;
+
 async function treeFor(tabId, sessionId, frameId = null) {
   const response = await send(
     tabId,
@@ -86,23 +90,26 @@ async function localFramesOf(tabId, sessionId, skip) {
   const collected = [];
   for (const frameId of descendantFrameIds(frameTree)) {
     if (skip.has(frameId)) continue;
-    skip.add(frameId);
     try {
       const nodes = await treeFor(tabId, sessionId, frameId);
-      if (nodes.length > 0) collected.push({ sessionId, frameId, nodes, kind: "local" });
+      if (nodes.length === 0) continue;
+      // Only a frame that actually answered is done with. The main session's frame tree
+      // also names frames that live in another process: asking there fails (or returns
+      // nothing), and the session that owns the frame must still get its turn.
+      skip.add(frameId);
+      collected.push({ sessionId, frameId, nodes, kind: "local" });
     } catch {
-      // The main session's frame tree also names frames that live in another process;
-      // those come back through their own session, so a refusal here is expected and
-      // not worth a note.
+      // Expected for a frame in another process; not worth a note.
     }
   }
   return collected;
 }
 
 /**
- * `{ nodes, frames, localFrames, unplaced, errors }`: the spliced tree, how many
+ * `{ nodes, frames, localFrames, unplaced, errors, unsettled }`: the spliced tree, how many
  * cross-origin and same-origin frames went into it, the frame ids whose host element
- * could not be found, and anything that went wrong reading a frame.
+ * could not be found, anything that went wrong reading a frame, and whether the page was
+ * still adding frames when the walk gave up.
  */
 export async function fullAxTree(tabId) {
   const mainNodes = await treeFor(tabId, null);
@@ -119,7 +126,16 @@ export async function fullAxTree(tabId) {
   // this ends when a round turns up nothing new.
   const oopifIds = new Set();
   const doneSessions = new Set();
-  for (;;) {
+  // A page that keeps tearing down and re-creating cross-origin iframes hands out fresh
+  // sessions for as long as anyone keeps asking, so the walk is bounded both ways and the
+  // result says it stopped early.
+  const deadline = Date.now() + FRAME_WALK_BUDGET_MS;
+  let unsettled = false;
+  for (let round = 0; ; round++) {
+    if (round >= MAX_FRAME_ROUNDS || Date.now() > deadline) {
+      unsettled = frameSessions(tabId).some((entry) => !doneSessions.has(entry.sessionId));
+      break;
+    }
     let pending = frameSessions(tabId).filter((entry) => !doneSessions.has(entry.sessionId));
     if (pending.length === 0 && doneSessions.size > 0) {
       // An attach event that the browser has already sent may still be on its way to the
@@ -148,7 +164,7 @@ export async function fullAxTree(tabId) {
   }
 
   if (children.length === 0) {
-    return { nodes: mainNodes, frames: 0, localFrames: 0, unplaced: [], errors };
+    return { nodes: mainNodes, frames: 0, localFrames: 0, unplaced: [], errors, unsettled };
   }
 
   const trees = [{ sessionId: null, nodes: mainNodes }, ...children];
@@ -161,5 +177,5 @@ export async function fullAxTree(tabId) {
 
   const kindOf = new Map(children.map((child) => [child.frameId, child.kind]));
   const frames = placed.filter((frameId) => kindOf.get(frameId) === "oopif").length;
-  return { nodes, frames, localFrames: placed.length - frames, unplaced, errors };
+  return { nodes, frames, localFrames: placed.length - frames, unplaced, errors, unsettled };
 }

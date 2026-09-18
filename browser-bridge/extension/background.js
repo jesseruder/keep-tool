@@ -165,6 +165,10 @@ async function closeSessionOnce(sessionKey, generation) {
   await forgetGroupFrames(session.groupId).catch((error) =>
     console.warn("browser-bridge: could not drop the session's GIF frames", error),
   );
+  // That was an await like any other, and an IndexedDB round trip is plenty of time for
+  // the session to come back. Losing a recording to a race is a nuisance; closing the
+  // tabs it is working in is not.
+  if (cameBack()) return;
 
   if (tabs.length === 0) {
     await forgetSession(sessionKey);

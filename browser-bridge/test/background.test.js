@@ -173,7 +173,7 @@ const gifstore = await import("../extension/lib/gifstore.js");
 
 // gif_creator's frames live in IndexedDB, which a worker stub has no business faking;
 // the backend seam is there so the cleanup hooks can still be tested.
-const gifFrames = { metas: new Map(), frames: new Map() };
+const gifFrames = { metas: new Map(), frames: new Map(), holdDelete: null };
 gifstore.setGifBackend({
   async getMeta(groupId) {
     return gifFrames.metas.get(groupId) ?? null;
@@ -190,6 +190,12 @@ gifstore.setGifBackend({
   },
   async deleteFrames(recordingId) {
     gifFrames.frames.delete(recordingId);
+    // A test can hold the delete open to sit inside the teardown's last await.
+    if (gifFrames.holdDelete) await gifFrames.holdDelete;
+  },
+  async clearFramesAndMeta(recordingId, meta) {
+    gifFrames.frames.delete(recordingId);
+    gifFrames.metas.set(meta.groupId, meta);
   },
   async deleteMeta(groupId) {
     gifFrames.metas.delete(groupId);
@@ -308,6 +314,39 @@ test("a session that ends takes its GIF frames with it", async () => {
     "the session's frames to be dropped",
   );
   assert.equal(gifFrames.metas.size, 0, "and the recording itself");
+});
+
+test("a session that comes back while its frames are being dropped keeps its tabs", async () => {
+  const session = await makeSession("gif-racing", "gif-racing");
+  assert.equal(session.tab.url, "about:blank");
+  await recordOneFrame(session.group.groupId);
+
+  // Hold the frame drop open: it is the teardown's last await, and a session that comes
+  // back during it used to lose its blank tabs and its mapping anyway.
+  const held = deferred();
+  gifFrames.holdDelete = held.promise;
+  state.removeCalls.length = 0;
+
+  deliver({ method: "session_closed", params: { sessionKey: "gif-racing" } });
+  // Read the backend directly: every store call queues behind the held one.
+  await waitFor(() => gifFrames.frames.size === 0, "the teardown to reach the frame drop");
+
+  // The host restarted and the same session key is working again.
+  deliver({
+    id: "w6_c1",
+    sessionKey: "gif-racing",
+    session: { name: "gif-racing" },
+    method: "tabs_context_mcp",
+    params: { createIfEmpty: true },
+  });
+  held.resolve();
+  gifFrames.holdDelete = null;
+
+  const reply = await waitFor(() => replyFor("w6_c1"), "the revived session's reply");
+  assert.equal(reply.ok, true);
+  assert.deepEqual(state.removeCalls, [], "no tab was closed under the revived session");
+  assert.ok(state.tabs.has(session.tab.id), "its tab is still there");
+  assert.notEqual(await sessions.getSession("gif-racing"), null, "and so is its mapping");
 });
 
 test("a group the user closes takes its GIF frames with it", async () => {

@@ -173,6 +173,10 @@ const state = {
   // session arms auto-attach. Chromium's auto-attach is not recursive, so a frame two
   // levels down appears only after its own parent's session asks for it.
   autoAttachChildren: new Map(),
+  // A page that never stops creating cross-origin frames, and a page that never paints.
+  endlessFrames: false,
+  churnSeq: 0,
+  hangPaint: false,
 };
 
 function framesOf(sessionId) {
@@ -262,9 +266,19 @@ globalThis.chrome = {
         if (sessionId === null) return { nodes: MAIN_TREE };
         if (sessionId === "S1") return { nodes: FRAME_TREE };
         if (sessionId === "S2") return { nodes: NESTED_TREE };
+        // A churn frame: a tree of its own, so the walk has something to do each round.
+        if (/^C\d+$/.test(sessionId)) return { nodes: NESTED_TREE };
         throw new Error(`no tree for session ${sessionId}`);
       }
       if (method === "Target.setAutoAttach") {
+        // A page that tears down and re-creates cross-origin iframes: whoever arms
+        // auto-attach is handed another child, for as long as anyone keeps asking.
+        if (state.endlessFrames) {
+          state.churnSeq += 1;
+          state.autoAttachChildren.set(sessionId ?? "", [
+            { sessionId: `C${state.churnSeq}`, frameId: `churn-${state.churnSeq}` },
+          ]);
+        }
         // What the browser does when a session arms auto-attach: its own out-of-process
         // children attach, reporting on that session.
         const waiting = state.autoAttachChildren.get(sessionId ?? "") ?? [];
@@ -331,6 +345,11 @@ globalThis.chrome = {
         return { result: { value: { ok: true, kind: "input", value: "4242" } } };
       }
       if (method === "Runtime.evaluate") {
+        // A page (or frame) whose setTimeout and requestAnimationFrame are no-ops never
+        // resolves the paint promise; only the worker's own deadline ends the wait.
+        if (state.hangPaint && /requestAnimationFrame/.test(String(params?.expression ?? ""))) {
+          return new Promise(() => {});
+        }
         return {
           result: {
             value: {
@@ -384,6 +403,9 @@ async function makeTab({ sessionKey }) {
   state.movingBoxes.clear();
   state.childFrames.clear();
   state.autoAttachChildren.clear();
+  state.endlessFrames = false;
+  state.churnSeq = 0;
+  state.hangPaint = false;
   return state.tabs.get(id);
 }
 
@@ -582,6 +604,71 @@ test("a same-process frame inside an OOPIF belongs to that frame's session", asy
     [20],
     "only the cross-origin frame's host is measured; the frame inside it adds nothing",
   );
+});
+
+test("a frame the page's session cannot read is still read by the session that owns it", async () => {
+  const tab = await makeTab({ sessionKey: "retried" });
+  attachFrame(tab.id, { sessionId: "S1", frameId: "frame-1" });
+  // The page's frame tree names the frame nested inside the payment frame as well, but
+  // only S1 can answer for it. Giving up on the first refusal lost it entirely.
+  addChildFrame(null, "local-2");
+  addChildFrame("S1", "local-2");
+  state.nestedIsLocal = true;
+
+  const result = await read_page(ctx("retried"), { tabId: tab.id });
+  assert.match(result.text, /button "Approve"/);
+  assert.match(result.text, /Includes the content of 1 cross-origin and 1 same-origin iframe\(s\)/);
+
+  const attempts = state.commands.filter(
+    (call) => call.method === "Accessibility.getFullAXTree" && call.params?.frameId === "local-2",
+  );
+  assert.deepEqual(
+    attempts.map((call) => call.target.sessionId ?? null),
+    [null, "S1"],
+    "the page refused it, then the frame that owns it answered",
+  );
+});
+
+test("a page that keeps replacing its frames is read anyway, with a note", async () => {
+  const tab = await makeTab({ sessionKey: "churn" });
+  // Every session that arms auto-attach gets handed another cross-origin child, for ever:
+  // without a bound the collection loop would never finish.
+  state.endlessFrames = true;
+  attachFrame(tab.id, { sessionId: "S1", frameId: "frame-1" });
+
+  const started = Date.now();
+  const result = await read_page(ctx("churn"), { tabId: tab.id });
+  const elapsed = Date.now() - started;
+
+  // It finishes, it returns what it did manage to read, and it says the page was moving.
+  assert.match(result.text, /button "Pay now"/);
+  assert.match(result.text, /still adding or replacing iframes/);
+  assert.ok(elapsed < 5000, `inside the walk's budget (${elapsed} ms)`);
+  const trees = state.commands.filter(
+    (call) => call.method === "Accessibility.getFullAXTree" && !call.params?.frameId,
+  );
+  // Not exactly nine: each session that is set up arms auto-attach and is handed another
+  // child straight away, so a round can have several pending sessions. The guarantee is
+  // that the rounds stop, not that each one is small.
+  assert.ok(trees.length < 60, `bounded (${trees.length} trees)`);
+});
+
+test("a frame that never paints cannot hang a ref click", async () => {
+  const tab = await makeTab({ sessionKey: "hangframe" });
+  attachFrame(tab.id, { sessionId: "S1", frameId: "frame-1" });
+  const found = await find(ctx("hangframe"), { tabId: tab.id, query: "pay now" });
+  const ref = found.text.match(/\[(ref_\d+)\] button "Pay now"/)[1];
+
+  state.boxes.set(`|20`, [22, 282, 500, 258]);
+  state.quads.set(`S1|3`, [380, 70, 480, 70, 480, 110, 380, 110]);
+  // The page and the frame both stub out setTimeout and requestAnimationFrame.
+  state.hangPaint = true;
+  const started = Date.now();
+  const clicked = await computer(ctx("hangframe"), { action: "left_click", tabId: tab.id, ref });
+  const elapsed = Date.now() - started;
+  assert.match(clicked.text, /at \(452, 372\)/);
+  assert.ok(elapsed >= 900, `the deadline was waited out (${elapsed} ms)`);
+  assert.ok(elapsed < 20000, `and it did not hang (${elapsed} ms)`);
 });
 
 test("a frame whose host element cannot be described is named in a note", async () => {

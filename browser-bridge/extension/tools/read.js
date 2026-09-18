@@ -30,6 +30,11 @@ function frameNotes(tree) {
   if (tree.errors.length > 0) {
     notes.push(`Could not read ${tree.errors.length} iframe(s): ${tree.errors.join("; ")}`);
   }
+  if (tree.unsettled) {
+    notes.push(
+      "This page was still adding or replacing iframes while it was read, so some frame content may be missing. Read it again once the page has settled.",
+    );
+  }
   return notes;
 }
 

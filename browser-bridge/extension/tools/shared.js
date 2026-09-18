@@ -121,21 +121,51 @@ export async function dropFileAtCoordinate(tabId, { data, mimeType, filename, x,
   return value;
 }
 
+// The page's own timers and animation frames decide when this resolves, so a page that
+// replaces setTimeout and requestAnimationFrame with no-ops would never answer - and CDP's
+// own `timeout` does not bound an awaited promise (measured on Edge 153). The worker keeps
+// its own clock and moves on.
+const PAINT_EXPRESSION =
+  "new Promise(r => { setTimeout(r, 300); requestAnimationFrame(() => requestAnimationFrame(r)); })";
+const PAINT_DEADLINE_MS = 1000;
+
+/**
+ * Wait for the frame to paint: two animation frames, or 300 ms inside the page, or
+ * `PAINT_DEADLINE_MS` measured out here - whichever comes first.
+ */
+export async function waitForPaint(tabId, sessionId = null) {
+  // Attached to a catch immediately: this promise may be abandoned by the race below and
+  // must not become an unhandled rejection.
+  const evaluated = send(
+    tabId,
+    "Runtime.evaluate",
+    { expression: PAINT_EXPRESSION, awaitPromise: true, timeout: PAINT_DEADLINE_MS },
+    sessionId,
+  ).then(
+    () => undefined,
+    () => undefined,
+  );
+  let timer = null;
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(resolve, PAINT_DEADLINE_MS);
+  });
+  try {
+    await Promise.race([evaluated, deadline]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
 /**
  * Page.captureScreenshot with a clip in document CSS pixels. `clip.scale` is multiplied
  * by the device pixel ratio, so callers pass `wanted / dpr` (see clipScaleFor).
  */
 export async function captureClip(tabId, clip) {
-  // Let a pending layout or scroll animation paint before the frame is grabbed. The
-  // wait is bounded inside the page: a hidden or occluded tab never runs animation
-  // frames, and CDP's `timeout` does not cover an awaited promise. captureScreenshot
-  // itself still returns a frame for such a tab.
-  await send(tabId, "Runtime.evaluate", {
-    expression:
-      "new Promise(r => { setTimeout(r, 300); requestAnimationFrame(() => requestAnimationFrame(r)); })",
-    awaitPromise: true,
-    timeout: 1000,
-  }).catch(() => {});
+  // Let a pending layout or scroll animation paint before the frame is grabbed. A hidden
+  // or occluded tab never runs animation frames, and a hostile page can stub out both
+  // timers, so the wait is bounded in the worker too. captureScreenshot still returns a
+  // frame for such a tab.
+  await waitForPaint(tabId);
   const response = await send(tabId, "Page.captureScreenshot", {
     format: "png",
     clip,
@@ -219,26 +249,8 @@ function ancestorHosts(tabId, frameSessionId) {
   return hosts;
 }
 
-/** One frame's worth of "has the scrolling finished?", bounded the way captureClip is. */
-async function settle(tabId, sessionId) {
-  await send(
-    tabId,
-    "Runtime.evaluate",
-    {
-      expression:
-        "new Promise(r => { setTimeout(r, 300); requestAnimationFrame(() => requestAnimationFrame(r)); })",
-      awaitPromise: true,
-      timeout: 1000,
-    },
-    sessionId,
-  ).catch(() => {
-    // An occluded or busy frame never runs an animation frame; the 300 ms fallback inside
-    // the page covers that, and a session that cannot evaluate at all just gets no wait.
-  });
-}
-
 async function settleAll(tabId, hosts) {
-  for (const host of hosts) await settle(tabId, host.sessionId);
+  for (const host of hosts) await waitForPaint(tabId, host.sessionId);
 }
 
 async function readOrigins(tabId, hosts) {
@@ -349,6 +361,6 @@ export async function pointForRef(tabId, ref) {
   // Last: let the page itself paint before the caller dispatches the click. The
   // compositor's hit-test surfaces are updated a frame behind the scroll, and a click
   // sent before that lands on whatever used to be under the point.
-  await settle(tabId, null);
+  await waitForPaint(tabId, null);
   return { x: centre.x + offset.x, y: centre.y + offset.y };
 }
