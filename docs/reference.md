@@ -627,7 +627,10 @@ named card without claiming its session.
 | brief | phone push | phone push | unchanged |
 
 Presence is an idle time under five minutes. Phone pushes use `KEEP_PUSH_WEBHOOK` or
-`~/.config/keep/push-webhook`; channel failures never crash the caller. Urgent speaker
+`~/.config/keep/push-webhook`; channel failures never crash the caller. When no push
+channel is configured at all, the brief is recorded once for the day and left in the
+inbox instead of being retried every 30 minutes until the noon cutoff — nothing was
+attempted, so there is nothing for a retry to reach. Urgent speaker
 delivery still observes the announce service's quiet hours. `keep quiet +2h` (or any
 normal Keep duration) suppresses attention alerts until that time, and `keep quiet off`
 clears it.

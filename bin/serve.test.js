@@ -69,6 +69,7 @@ const {
   chunkForTyping,
   deliveredMatches,
   briefDue,
+  briefTickOutcome,
   startWtGcScheduler,
   attentionAckKey,
   attentionItemKey,
@@ -996,6 +997,15 @@ test('typing chunks preserve spaced, unspaced, emoji, and empty text exactly', (
 test('deliveredMatches compares the complete message after whitespace normalization', () => {
   assert.equal(deliveredMatches('hello\n  fleet\tworld', ' hello fleet world '), true);
   assert.equal(deliveredMatches('hello world', 'hello missing middle world'), false);
+});
+
+test('briefTickOutcome separates an unconfigured channel from a failed delivery', () => {
+  const noChannel = briefTickOutcome({ deliveryOk: false, noChannel: true });
+  assert.deepEqual(noChannel.health, { ok: true, skipped: false, detail: 'no delivery channel configured' });
+  assert.match(noChannel.log, /no delivery channel configured/);
+  assert.deepEqual(briefTickOutcome({ deliveryOk: false, noChannel: false }).health, { ok: false, error: 'delivery failed; retrying in 30 minutes' });
+  assert.deepEqual(briefTickOutcome({ deliveryOk: true, noChannel: false, channels: ['push'] }).health, { ok: true, skipped: false, detail: 'delivered' });
+  assert.deepEqual(briefTickOutcome({ duplicate: true }).health, { ok: true, skipped: true, detail: 'already delivered' });
 });
 
 test('briefDue handles send time, success, retry window, and noon cutoff', () => {

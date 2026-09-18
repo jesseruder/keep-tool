@@ -220,6 +220,36 @@ test('a totally failed brief releases the day for a later retry', async () => {
   }
 });
 
+test('a brief routed to an unconfigured channel claims the day instead of retrying', async () => {
+  const root = makeRoot('keep-brief-no-channel-test-');
+  const now = Date.parse('2026-09-02T08:00:00');
+  const options = {
+    root,
+    level: 'brief',
+    text: 'Morning brief',
+    from: 'daemon',
+    caller: 'manual',
+    now,
+    presence: { state: 'away' },
+    availableChannels: () => [],
+    withLock: (fn) => fn(),
+  };
+  try {
+    const result = await sendAlert(options);
+    assert.equal(result.deliveryOk, false);
+    assert.equal(result.noChannel, true);
+    assert.equal(loadMeta(root).lastBriefDay, '2026-09-02');
+    assert.equal(loadMeta(root).lastBriefText, 'Morning brief');
+    assert.equal(loadMeta(root).lastBriefAttemptAt, undefined);
+    assert.equal(readAlerts({ root, all: true })[0].failed, true, 'the ledger still shows nothing was delivered');
+    const later = await sendAlert({ ...options, now: now + 31 * 60e3 });
+    assert.equal(later.duplicate, true);
+    assert.equal(readAlerts({ root, all: true }).length, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('CLI quiet writes quiet.json and alert --dry reports deferred', () => {
   const root = makeRoot('keep-alert-quiet-test-');
   try {

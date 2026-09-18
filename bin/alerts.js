@@ -354,12 +354,16 @@ async function sendAlert(options) {
     root, force: options.force, spoken: options.spoken,
   });
   const deliveryOk = result.entry.desktop === true || Object.values(delivered).includes('ok');
+  // Routed, but every channel this level routes to is unconfigured on this machine
+  // (no push webhook, no announce binary), so nothing was attempted and a retry has
+  // nowhere to reach. The ledger entry still records that nothing was delivered.
+  const noChannel = !result.deferred && !deliveryOk && result.entry.channels.length === 0;
   const entry = { ...result.entry, delivered, ...(!result.deferred && !deliveryOk ? { failed: true } : {}) };
   const finalize = () => {
     const meta = loadMeta(root);
     if (options.level === 'brief') {
       const briefDay = dayOf(now);
-      if (deliveryOk) {
+      if (deliveryOk || noChannel) {
         meta.lastBriefAt = now;
         meta.lastBriefDay = briefDay;
         meta.lastBriefText = text;
@@ -378,7 +382,7 @@ async function sendAlert(options) {
     appendAlert(entry, root);
   };
   if (options.withLock) options.withLock(finalize); else finalize();
-  return { ...result, entry, delivered, deliveryOk };
+  return { ...result, entry, delivered, deliveryOk, noChannel };
 }
 
 function oneLine(value, limit = 140) {

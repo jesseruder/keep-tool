@@ -9344,6 +9344,17 @@ function briefDue(meta, now, clock = briefClock('08:00')) {
   return alerts.dayOf(attemptedAt) !== day || at - attemptedAt >= 30 * 60e3;
 }
 
+// A brief that found no configured channel is not a failed delivery: nothing was
+// attempted, so retrying every 30 minutes until the noon cutoff only re-sends the
+// same undelivered brief and holds the health row red for a channel the operator
+// has not set up. sendAlert claims the day for it; this records the tick as done.
+function briefTickOutcome(result) {
+  if (result.duplicate) return { log: 'morning brief already claimed', health: { ok: true, skipped: true, detail: 'already delivered' } };
+  if (result.deliveryOk) return { log: `morning brief sent via ${result.channels.join(', ')}`, health: { ok: true, skipped: false, detail: 'delivered' } };
+  if (result.noChannel) return { log: 'morning brief recorded; no delivery channel configured', health: { ok: true, skipped: false, detail: 'no delivery channel configured' } };
+  return { log: 'morning brief delivery failed; retrying in 30 minutes', health: { ok: false, error: 'delivery failed; retrying in 30 minutes' } };
+}
+
 function startBriefScheduler(options = {}) {
   const clock = briefClock(process.env.KEEP_BRIEF_AT || '08:00');
   if (clock.invalid) process.stderr.write(`keep serve: invalid KEEP_BRIEF_AT; using 08:00\n`);
@@ -9416,12 +9427,10 @@ function startBriefScheduler(options = {}) {
         now,
         withLock: keep.withLock,
       });
-      if (result.duplicate) process.stderr.write(`keep serve: morning brief already claimed\n`);
-      else if (result.deliveryOk) process.stderr.write(`keep serve: morning brief sent via ${result.channels.join(', ')}\n`);
-      else process.stderr.write(`keep serve: morning brief delivery failed; retrying in 30 minutes\n`);
+      const outcome = briefTickOutcome(result);
+      process.stderr.write(`keep serve: ${outcome.log}\n`);
       if (options.onChange) options.onChange();
-      if (result.duplicate || result.deliveryOk) health.record('brief', { ok: true, skipped: result.duplicate, detail: result.duplicate ? 'already delivered' : 'delivered' });
-      else health.record('brief', { ok: false, error: 'delivery failed; retrying in 30 minutes' });
+      health.record('brief', outcome.health);
     } catch (error) {
       health.record('brief', { ok: false, error });
       process.stderr.write(`keep serve: morning brief failed: ${error.message}\n`);
@@ -9925,6 +9934,7 @@ module.exports = {
   applySessionLiveness,
   backfillHostSessions,
   briefDue,
+  briefTickOutcome,
   startBriefScheduler,
   startWtGcScheduler,
   buildWhoSnapshot,
