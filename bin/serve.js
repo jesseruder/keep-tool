@@ -3552,8 +3552,7 @@ function agentIdentityOwnsPane(identity, pane, rows) {
 }
 
 // The session a row's own argv names, which is the strongest process-to-session
-// identity there is. agentRowUnreadable reads it again to tell a snapshot that lost
-// the agent's arguments from one that lost the agent.
+// identity there is.
 function argvSessionId(row) {
   const match = row.agent === 'claude'
     ? /(?:^|\s)--(?:resume|session-id)\s+([A-Za-z0-9_-]+)(?=\s|$)/.exec(row.args)
@@ -3561,20 +3560,21 @@ function argvSessionId(row) {
   return match ? match[1] : null;
 }
 
-// Whether a `ps` snapshot simply failed to describe this agent, as opposed to saying
-// it is gone. Under memory pressure the table can come back empty, or carry the
-// process at its own pid and start time with its arguments unreadable — and an agent
-// identified by its `--resume <sid>` argv then disappears from the identity map
-// although nothing about the process changed. That is a snapshot to take again, not a
-// different process. A snapshot that describes the pid and start time but names some
-// other session is a real change and is not covered here.
+// Whether a `ps` snapshot said nothing about this agent, as opposed to saying it is
+// not the agent any more. Only two snapshots say nothing: an empty table, and one
+// carrying the process at its own pid and start time with `(claude)` in place of its
+// arguments, which is what macOS prints when it could not read argv. Those are
+// snapshots to take again.
+//
+// Deliberately nothing else. A row that describes the process and simply does not name
+// this session — a plain `claude`, or a shell where the agent used to be — is positive
+// evidence that the process at that pid is no longer the agent, and treating it as an
+// unreadable snapshot would retry until it was adopted.
 function agentRowUnreadable(rows, identity) {
   if (!Array.isArray(rows) || !rows.length) return true;
   if (!identity) return false;
   const row = rows.find((candidate) => candidate.pid === identity.pid && candidate.pidStart === identity.pidStart);
-  if (!row) return false;
-  return row.argsUnavailable === true
-    || (identity.source === 'argv' && argvSessionId(row) == null);
+  return Boolean(row && row.argsUnavailable === true);
 }
 
 async function liveSessionPids(deps = {}) {
@@ -4127,6 +4127,15 @@ async function restartSession(body, deps = {}) {
       originalIdentity = await identityFrom(originalRows);
     }
     if (!originalIdentity?.primary) throw Error('Original agent process identity is unverified');
+    // A caller that has already inspected this agent says which process it inspected.
+    // Patience above is only worth having if it cannot end up adopting a different one:
+    // a session relaunched between the preflight and this read is primary and verifiable
+    // and is still not the process the transfer was cleared against.
+    const expectedIdentity = deps.expectedAgentIdentity;
+    if (expectedIdentity && (originalIdentity.pid !== expectedIdentity.pid
+        || originalIdentity.pidStart !== expectedIdentity.pidStart)) {
+      throw Error('Agent process identity changed during restart');
+    }
     const originalArgs = originalRows.find((p) => p.pid === originalIdentity.pid)?.args || '';
     const ledger = require('./restart-ledger');
     const file = session.kind === 'codex' ? (deps.codexRolloutFile || codex.rolloutFileFor)(session.id)
@@ -8082,36 +8091,80 @@ async function handoffSession(body, deps = {}) {
 }
 
 // The rate limit this session carries now, which is the event a queue entry exists
-// for. A manual transfer usually names none, and a null here simply means the entry
-// is never cancelled for a limit that cleared — only landing, giving up, or Cancel
-// ends it. Worth a state build only because nothing reaches here but a refusal.
+// for. Three different answers, and the queue acts differently on each: a stamp is
+// the event to watch, `null` is "watched, and there is no limit", and `undefined` is
+// "could not look". Only the first two are worth queueing on — an entry built on a
+// guess would either never cancel for a limit that cleared or cancel for one that was
+// never there. Worth a state build only because nothing reaches here but a refusal.
 async function handoffRateLimitAt(sessionId, deps = {}) {
-  try {
-    const sessions = await (deps.handoffQueueSessions || handoffQueueSessions)(deps);
-    return sessions.find((entry) => entry.id === sessionId)?.rateLimit?.at ?? null;
-  } catch { return null; }
+  let sessions;
+  try { sessions = await (deps.handoffQueueSessions || handoffQueueSessions)(deps); }
+  catch { return undefined; }
+  const session = (sessions || []).find((entry) => entry.id === sessionId);
+  return session ? session.rateLimit?.at ?? null : undefined;
+}
+
+// Whether the agent this transaction was going to stop is still running. A refusal
+// that landed before `sourceStopVerifiedAt` was written does not prove it: the typed
+// /exit can have succeeded and a later host call timed out, leaving the same
+// pre-stop-looking record behind. Queueing that one would promise a retry that the
+// recovery guard then parks, so it is left for the recovery controls instead.
+//
+// The `safe()` copy that rides back on the refusal drops sourceAgentPid, so the full
+// record is read from disk. A record that names no agent identity says nothing either
+// way and is left to the checks around it.
+async function handoffSourceStillRunning(record, deps = {}) {
+  if (!Number.isInteger(record?.sourceAgentPid) || record.sourceAgentPid <= 0
+      || typeof record.sourceAgentPidStart !== 'string' || !record.sourceAgentPidStart) return true;
+  const rows = await (deps.agentProcessRows || agentProcessRows)(deps);
+  return (rows || []).some((row) => row.pid === record.sourceAgentPid && row.pidStart === record.sourceAgentPidStart);
 }
 
 // Whether a refused transfer is one the queue may simply ask for again: it refused
-// transiently, it was a continuation rather than an open-only reopen, and it stopped
-// before the transaction passed its stop. Past that point the source is already down
-// and only the recovery path may touch it.
+// transiently, it was a continuation rather than an open-only reopen, it stopped
+// before the transaction passed its stop, and the source agent is still running. Past
+// any of those the session is already half-moved and only the recovery path may
+// touch it.
 //
 // The recovery-needed record stays exactly where it is. The queue's retry calls the
 // same handoffSession, which picks that journaled transaction up — the same thing
 // `keep handoff` does when a person runs it again.
-async function queueRefusedHandoff(body, record, deps = {}) {
+async function queueRefusedHandoff(body, record, requestedAt, deps = {}) {
   const queue = deps.handoffQueue || require('./handoff-queue');
+  const root = deps.root || keep.ROOT;
   if (!record || record.status !== 'recovery-needed' || record.refusalClass !== 'transient') return null;
   if (record.intent !== 'continue' || queue.transferPastStop(record)) return null;
   const sessionId = String(record.sessionId || body.sessionId || '');
   const pane = String(record.pane || body.pane || '');
   const reason = String(record.reason || 'the transfer was refused');
+  const skip = (why) => {
+    process.stderr.write(`keep serve: not queuing ${sessionId}: ${why}\n`);
+    return null;
+  };
+  const journalled = (deps.handoffRecord || require('./account-handoff').readOne)(root, sessionId) || record;
+  try {
+    if (!await handoffSourceStillRunning(journalled, deps)) {
+      return skip('source agent is no longer running; leaving the record for recovery');
+    }
+  } catch (error) {
+    // No snapshot, no proof the source is alive. A `ps` this attempt could not take is
+    // reason enough not to promise a retry.
+    return skip(`could not check whether its source agent is still running: ${error.message}`);
+  }
+  const rateLimitAt = await handoffRateLimitAt(sessionId, deps);
+  if (rateLimitAt === undefined) return skip('its live state could not be read, so the limit it carries is unknown');
+  // The state build above is an await, and Cancel lands through its own route. An
+  // entry cancelled since this transfer was asked for is a person saying no to exactly
+  // this; enqueue() would start a cancelled entry over.
+  const current = queue.readOne(root, sessionId);
+  if (current && current.status === 'cancelled'
+      && Number(current.cancelledAt || current.updatedAt || 0) >= Number(requestedAt || 0)) {
+    return skip('its transfer was cancelled while this one ran');
+  }
   let entry;
   try {
-    ({ entry } = queue.enqueue(deps.root || keep.ROOT, { sessionId, pane,
-      sourceAccountId: record.sourceAccountId, targetAccountId: body.accountId, force: body.force === true,
-      rateLimitAt: await handoffRateLimitAt(sessionId, deps) }));
+    ({ entry } = queue.enqueue(root, { sessionId, pane, sourceAccountId: record.sourceAccountId,
+      targetAccountId: body.accountId, force: body.force === true, rateLimitAt }));
   } catch (error) {
     // A queue that will not take this is no reason to lose the refusal itself.
     process.stderr.write(`keep serve: could not queue ${sessionId} after a transient refusal: ${error.message}\n`);
@@ -8133,17 +8186,19 @@ async function handoffSessionRequest(body, deps = {}) {
   const { queueOnTransient, ...request } = body && typeof body === 'object' ? body : {};
   const run = deps.handoffSession || handoffSession;
   if (queueOnTransient !== true) return run(request, deps);
+  // When this transfer was asked for, so a Cancel that arrives while it runs wins.
+  const requestedAt = (deps.now ? deps.now() : Date.now());
   let result;
   try {
     result = await run(request, deps);
   } catch (error) {
     // account-handoff hands the record back on the error as `extra`; the route would
     // otherwise answer 409 with it.
-    const queued = await queueRefusedHandoff(request, error && error.extra, deps);
+    const queued = await queueRefusedHandoff(request, error && error.extra, requestedAt, deps);
     if (queued) return queued;
     throw error;
   }
-  return await queueRefusedHandoff(request, result, deps) || result;
+  return await queueRefusedHandoff(request, result, requestedAt, deps) || result;
 }
 
 async function abandonAccountHandoff(body, deps = {}) {

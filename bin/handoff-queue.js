@@ -319,6 +319,16 @@ async function attemptOne(root, entry, sessions, now, deps, log) {
     return settle(root, entry, { status: 'cancelled', cancelledAt: now, note: 'rate limit cleared' },
       now, log, `cancelled ${entry.sessionId}: rate limit cleared`);
   }
+  // An entry that names no limit event — a console transfer refused before anything was
+  // stopped — has no limit to watch clear. The person stands in for it: once they have
+  // typed into the session again, stopping it to inject a continuation is exactly what
+  // the check above exists to prevent, so the entry retires the same way.
+  if (entry.rateLimitAt == null && !started
+      && Number.isFinite(session.lastUserAt) && session.lastUserAt > Number(entry.enqueuedAt || 0)) {
+    const note = 'session was used since it was queued';
+    return settle(root, entry, { status: 'cancelled', cancelledAt: now, note }, now, log,
+      `cancelled ${entry.sessionId}: ${note}`);
+  }
   // The live pane wins over the recorded one: the session may have been reopened
   // since it was queued, and the transfer must name the pane it is in now.
   const pane = session.pane || entry.pane;

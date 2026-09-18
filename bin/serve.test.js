@@ -7801,8 +7801,14 @@ test('a console transfer refused before its stop joins the retry queue; the CLI 
     // account-handoff refuses by throwing, with the journalled record on `extra`.
     const refuse = (entry) => async () => { throw Object.assign(new Error(entry.reason), { status: 409, extra: entry }); };
     const body = { sessionId: 'sid', pane: 'p', accountId: 'claude-two', queueOnTransient: true };
-    const deps = (handoffSession) => ({ root, handoffSession,
-      handoffQueueSessions: async () => [{ id: 'sid', pane: 'p', rateLimit: { at: '2026-09-17T00:00:00.000Z' } }] });
+    const deps = (handoffSession, extra = {}) => ({ root, handoffSession,
+      handoffQueueSessions: async () => [{ id: 'sid', pane: 'p', rateLimit: { at: '2026-09-17T00:00:00.000Z' } }],
+      // The journalled record and a `ps` snapshot that still shows the source agent:
+      // the two things queueing is allowed to depend on beyond the refusal itself.
+      handoffRecord: () => record(),
+      agentProcessRows: async () => [{ pid: 11, ppid: 10, pidStart: 'start', agent: 'claude', interactive: true,
+        args: '/test/claude --resume sid' }],
+      ...extra });
     const only = () => queue.list(root);
 
     const queued = await handoffSessionRequest(body, deps(refuse(record())));
@@ -7841,6 +7847,61 @@ test('a console transfer refused before its stop joins the retry queue; the CLI 
     }));
     assert.equal(returned.status, 'queued');
     assert.deepEqual(seen, [{ sessionId: 'sid', pane: 'p', accountId: 'claude-two' }]);
+    assert.equal(only().length, 1);
+    fs.rmSync(queue.dir(root), { recursive: true, force: true });
+
+    // A Cancel that landed while this transfer was running is the person saying no to
+    // exactly this. enqueue() would start the cancelled entry over, so the refusal is
+    // answered raw instead.
+    const cancelledFirst = deps(refuse(record()), {
+      handoffQueueSessions: async () => {
+        queue.enqueue(root, { sessionId: 'sid', pane: 'p', sourceAccountId: 'claude-main', targetAccountId: 'claude-two' },
+          { log: () => {} });
+        queue.cancel(root, 'sid', { log: () => {} });
+        return [{ id: 'sid', pane: 'p' }];
+      },
+    });
+    await assert.rejects(handoffSessionRequest(body, cancelledFirst), /another session injection is busy/);
+    assert.equal(only()[0].status, 'cancelled', 'the Cancel stands');
+    // A cancel from before this transfer was asked for is a different matter: the
+    // console offering the button again is the person changing their mind.
+    const stale = queue.readOne(root, 'sid');
+    fs.writeFileSync(path.join(queue.dir(root), 'sid.json'),
+      JSON.stringify({ ...stale, cancelledAt: stale.cancelledAt - 60e3, updatedAt: stale.updatedAt - 60e3 }));
+    assert.equal((await handoffSessionRequest(body, deps(refuse(record())))).status, 'queued');
+    assert.equal(only()[0].status, 'queued');
+    fs.rmSync(queue.dir(root), { recursive: true, force: true });
+
+    // Live state that could not be read at all: there is then no way to say which
+    // rate-limit event, if any, the entry would be for.
+    for (const [why, sessions] of [
+      ['a state build that threw', async () => { throw new Error('host request timed out (list)'); }],
+      ['a session the state does not carry', async () => []],
+    ]) {
+      await assert.rejects(handoffSessionRequest(body, deps(refuse(record()), { handoffQueueSessions: sessions })), /./, why);
+      assert.deepEqual(only(), [], `${why} must not be queued`);
+    }
+
+    // A record with no verified stop is not proof the source agent is still running:
+    // the /exit can have landed and a later host call timed out. Queueing that one
+    // promises a retry the recovery guard would park, so `ps` decides.
+    const withPid = record({ sourceAgentPid: 11, sourceAgentPidStart: 'start' });
+    const rows = (value) => ({ handoffRecord: () => withPid, agentProcessRows: async () => {
+      if (typeof value === 'function') return value();
+      return value;
+    } });
+    await assert.rejects(handoffSessionRequest(body, deps(refuse(record()),
+      rows([{ pid: 10, ppid: 1, pidStart: 'start', args: '/bin/zsh -l' }]))), /./);
+    assert.deepEqual(only(), [], 'a source agent that has already exited is left for recovery');
+
+    await assert.rejects(handoffSessionRequest(body, deps(refuse(record()),
+      rows(() => { throw new Error('Command failed: ps'); }))), /./);
+    assert.deepEqual(only(), [], 'no snapshot is no proof the source is alive');
+
+    // Still there, even in a snapshot that could not read its arguments.
+    assert.equal((await handoffSessionRequest(body, deps(refuse(record()),
+      rows([{ pid: 11, ppid: 10, pidStart: 'start', agent: null, interactive: false, args: '(claude)', argsUnavailable: true }]))))
+      .status, 'queued');
     assert.equal(only().length, 1);
     fs.rmSync(queue.dir(root), { recursive: true, force: true });
 
@@ -9294,7 +9355,7 @@ test('a ps row whose arguments could not be read names a process and nothing els
   assert.equal(rows[2].agent, null);
 });
 
-test('agentRowUnreadable separates a snapshot that lost the agent from one that lost its arguments', () => {
+test('agentRowUnreadable covers only the snapshots that describe nothing', () => {
   const { agentRowUnreadable } = require('./serve');
   const stamp = 'Tue Sep  8 10:00:00 2026';
   const identity = { pid: 11, pidStart: stamp, agent: 'claude', source: 'argv', primary: true };
@@ -9302,13 +9363,13 @@ test('agentRowUnreadable separates a snapshot that lost the agent from one that 
   assert.equal(agentRowUnreadable([row], identity), false);
   assert.equal(agentRowUnreadable([], identity), true, 'an empty table describes nothing at all');
   assert.equal(agentRowUnreadable([{ ...row, agent: null, interactive: false, args: '(claude)', argsUnavailable: true }], identity), true);
-  // Still there, still the same process, but the argv that identified it is gone.
-  assert.equal(agentRowUnreadable([{ ...row, args: '/test/claude' }], identity), true);
-  // A different process at that pid, or none at all, is a real change.
+  // A row that describes the process and does not name this session is evidence that
+  // the process at that pid is no longer this agent — never a snapshot to retry.
+  assert.equal(agentRowUnreadable([{ ...row, args: '/test/claude' }], identity), false);
+  assert.equal(agentRowUnreadable([{ ...row, agent: null, interactive: false, args: '/bin/zsh -l' }], identity), false);
+  // A different process at that pid, or none at all, is a real change too.
   assert.equal(agentRowUnreadable([{ ...row, pidStart: 'Tue Sep  8 11:00:00 2026' }], identity), false);
   assert.equal(agentRowUnreadable([{ pid: 10, ppid: 1, args: '/bin/zsh -l' }], identity), false);
-  // An identity found through the hook child's environment never had an argv token.
-  assert.equal(agentRowUnreadable([{ ...row, args: '/test/claude' }], { ...identity, source: 'child-env' }), false);
 });
 
 test('a ps snapshot that missed the agent is read again instead of refusing the restart', async () => {
@@ -9325,9 +9386,11 @@ test('a ps snapshot that missed the agent is read again instead of refusing the 
   const agent = { pid: 11, ppid: 10, pidStart: stamp, agent: 'claude', interactive: true, args: command };
   const unreadable = { pid: 11, ppid: 10, pidStart: stamp, agent: null, interactive: false, args: '(claude)', argsUnavailable: true };
   const gone = [{ pid: 10, ppid: 1, pidStart: stamp, agent: null, interactive: false, args: '/bin/zsh -l' }];
-  // `rowsFor` answers each ps read by its number. The first is the original identity,
-  // so it always describes the agent; everything after it is the scenario.
-  const scenario = (rowsFor) => {
+  // A verifiable agent for this same session that is simply not the process the caller
+  // inspected: a relaunch between the preflight and the restart looks exactly like this.
+  const successor = { ...agent, pid: 12 };
+  // `rowsFor` answers each ps read by its number, the first one included.
+  const scenario = (rowsFor, extraDeps = {}) => {
     const session = { id: 'ps', kind: 'claude', state: 'idle', endedTurn: true, project: root };
     let pane = { id: 'p', pid: 10, cmd: '/bin/zsh', args: ['-l'], alive: true, attached: 0, visibleAttached: 0,
       cols: 200, rows: 50, meta: { sessionId: 'ps', agent: 'claude' } };
@@ -9338,8 +9401,7 @@ test('a ps snapshot that missed the agent is read again instead of refusing the 
       claudeRolloutFile: () => claudeFile,
       agentProcessRows: async () => {
         state.reads += 1;
-        if (state.exited) return gone;
-        return state.reads === 1 ? [agent] : rowsFor(state.reads);
+        return state.exited ? gone : rowsFor(state.reads);
       },
       psTable: `11 10 ttys001 ${stamp} ${command}`,
       lsof: async () => '',
@@ -9362,6 +9424,7 @@ test('a ps snapshot that missed the agent is read again instead of refusing the 
         pane = { ...pane, alive: true, pid: 20 };
         return { pane };
       } },
+      ...extraDeps,
     };
     return { state, run: () => restartSession({ sessionId: 'ps', pane: 'p', pid: 10, mode: 'idle' }, deps) };
   };
@@ -9374,21 +9437,34 @@ test('a ps snapshot that missed the agent is read again instead of refusing the 
 
     // Every re-read comes back the same way: the identity is unverifiable, which is a
     // refusal of its own and a transient one, not a changed process.
-    const stuck = scenario(() => [unreadable]);
+    const stuck = scenario((read) => (read === 1 ? [agent] : [unreadable]));
     await assert.rejects(stuck.run(), /^Error: Agent process identity could not be verified from ps$/);
     assert.equal(stuck.state.replaced, null);
     assert.equal(require('./account-handoff').classifyRefusal('Agent process identity could not be verified from ps'), 'transient');
 
     // A readable snapshot with no row for that pid and start time is the old refusal.
-    const replaced = scenario(() => gone);
+    const replaced = scenario((read) => (read === 1 ? [agent] : gone));
     await assert.rejects(replaced.run(), /^Error: Agent process identity changed during restart$/);
     assert.equal(replaced.state.replaced, null);
 
     // And a re-read that comes back readable has answered, even if the answer is that
     // the agent really is gone: that is the old refusal too, not an unverifiable one.
-    const vanished = scenario((read) => (read === 2 ? [unreadable] : gone));
+    const vanished = scenario((read) => (read === 1 ? [agent] : read === 2 ? [unreadable] : gone));
     await assert.rejects(vanished.run(), /^Error: Agent process identity changed during restart$/);
     assert.equal(vanished.state.replaced, null);
+
+    // A caller that already inspected this agent names it, and the patient first read
+    // may not adopt a different process for it however verifiable that one looks.
+    const expected = { expectedAgentIdentity: { pid: 11, pidStart: stamp } };
+    const adopted = scenario(() => [successor], expected);
+    await assert.rejects(adopted.run(), /^Error: Agent process identity changed during restart$/);
+    assert.equal(adopted.state.replaced, null);
+
+    // The patience itself is untouched: an unreadable first snapshot still finds the
+    // very process the caller named.
+    const waited = scenario((read) => (read === 1 ? [unreadable] : [agent]), expected);
+    assert.equal((await waited.run()).sessionId, 'ps');
+    assert.ok(waited.state.replaced, 'the restart went ahead on the expected process');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 

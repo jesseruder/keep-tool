@@ -805,6 +805,11 @@ async function run(body, deps = {}) {
         ...deps.restartDeps, root, env, host: wrappedHost, resumeAccount: target, resumeMcpConfig: compatibility.mcpConfig,
         resumeModel: current.model, resumeArgv: current.resumeSpec?.argv, resumeCwd: current.resumeSpec ? current.cwd : null,
         allowTerminalRateLimit: true,
+        // The agent this preflight actually verified. The restart re-reads `ps` and now
+        // re-reads it again when a snapshot comes back unusable, and a patient read is
+        // exactly where a replacement process could be adopted as the original. Naming
+        // the process here means the restart can only ever stop the one inspected.
+        ...(sourceIdentity ? { expectedAgentIdentity: { pid: sourceIdentity.pid, pidStart: sourceIdentity.pidStart } } : {}),
         ...(body.expectedRateLimitAt != null ? { expectedRateLimitAt: body.expectedRateLimitAt } : {}),
       });
       Object.assign(current, { status: 'verifying', phase: 'verifying-target', pid: result.pid }); writeOne(root, current);
@@ -885,5 +890,5 @@ function abandonedForPortable(root, sessionId) {
       sourceOwnsPane: entry.sourceOwnsPane === true } : null;
 }
 
-module.exports = { run, abandonForPortable, abandonedForPortable, list, safe, authPreflight, permissionClass,
+module.exports = { run, abandonForPortable, abandonedForPortable, list, readOne, safe, authPreflight, permissionClass,
   loginShellOutput, classifyRefusal, transferInFlight, CONTINUATION_TEXT };

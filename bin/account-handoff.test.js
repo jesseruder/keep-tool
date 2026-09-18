@@ -836,6 +836,38 @@ test('an explicit force reaches the stop path, the ledger rebind and the recorde
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test('the restart is told which agent process the preflight verified', async () => {
+  const f = fixture();
+  try {
+    const d = deps(f);
+    let options = null;
+    const baseRestart = d.restartSession;
+    d.restartSession = async (body, given) => { options = given; return baseRestart(body, given); };
+    await handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, d);
+    // Naming it is what keeps the restart's own patient `ps` re-reads from adopting a
+    // session relaunched between the preflight and the stop.
+    assert.deepEqual(options.expectedAgentIdentity, { pid: 11, pidStart: 'source-start' });
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('an agent identity the preflight could not verify is not named to the restart', async () => {
+  const f = fixture();
+  try {
+    let options = null;
+    // Nothing to name, nothing named: an unverified identity never reaches the stop.
+    const unverified = deps(f, {
+      inspect: async () => ({ session: { id: f.sid, kind: 'claude', project: f.project, endedTurn: true },
+        pane: { id: 'pane-1', pid: 10, createdAt: 'source-pane', alive: true, cwd: f.project, cols: 80, rows: 24,
+          agentAlive: true, meta: { sessionId: f.sid, accountId: 'one', agent: 'claude', model: 'claude-opus-4-1' } },
+        processArgs: 'claude --resume session-123', currentModel: 'claude-opus-4-1',
+        agentIdentity: { pid: 11, pidStart: 'source-start', primary: true, ownsPane: false } }),
+      restartSession: async (_body, given) => { options = given; throw new Error('stop here'); },
+    });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two' }, unverified), /stop here/);
+    assert.equal('expectedAgentIdentity' in options, false);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test('a non-boolean force is rejected before anything is inspected', async () => {
   const f = fixture();
   try {

@@ -449,6 +449,48 @@ test('each attempt is judged against state taken after the transfer before it fi
   }
 });
 
+test('an entry that names no limit retires when the person goes back to work in the session', async () => {
+  const f = fixture();
+  const queueOne = () => queue.enqueue(f.root, { sessionId: 'session-a', pane: 'pane-1',
+    sourceAccountId: 'one', targetAccountId: 'two' }, { now: T, log: () => {} });
+  const asked = [];
+  const run = (rows, extra = {}) => queue.tick(tickDeps(f, async (body) => { asked.push(body.sessionId); return { ok: true, status: 'done' }; },
+    { sessions: async () => rows, ...extra }));
+  const manual = session({ rateLimit: null });
+
+  // A console transfer refused before anything was stopped: no limit event to watch
+  // clear, so the person typing into the session again is what retires it.
+  queueOne();
+  assert.equal(entryFor(f.root, 'session-a').rateLimitAt, null);
+  await run([{ ...manual, lastUserAt: T + 5e3 }]);
+  assert.deepEqual(asked, []);
+  assert.equal(entryFor(f.root, 'session-a').status, 'cancelled');
+  assert.equal(entryFor(f.root, 'session-a').note, 'session was used since it was queued');
+
+  // Nothing typed since it was queued, and a session with no such stamp at all: the
+  // transfer is still the thing that was asked for.
+  for (const lastUserAt of [T - 5e3, undefined]) {
+    fs.rmSync(path.join(queue.dir(f.root), 'session-a.json'));
+    asked.length = 0;
+    queueOne();
+    await run([{ ...manual, ...(lastUserAt === undefined ? {} : { lastUserAt }) }]);
+    assert.deepEqual(asked, ['session-a'], `lastUserAt ${lastUserAt} must not retire the entry`);
+    assert.equal(entryFor(f.root, 'session-a').status, 'moved');
+  }
+
+  // And a transaction already past its stop is finished whatever the person did: a
+  // half-moved session is worse than one continuation nobody asked for.
+  fs.rmSync(path.join(queue.dir(f.root), 'session-a.json'));
+  asked.length = 0;
+  queueOne();
+  await run([{ ...manual, lastUserAt: T + 5e3 }], {
+    handoffRecords: () => [{ sessionId: 'session-a', status: 'recovery-needed', phase: 'starting-target',
+      sourceStopVerifiedAt: T }],
+  });
+  assert.deepEqual(asked, ['session-a']);
+  assert.equal(entryFor(f.root, 'session-a').status, 'moved');
+});
+
 test('a limit that cleared retires the entry, and a transaction already under way still finishes', async () => {
   const f = fixture();
   const queueOne = (id, pane) => queue.enqueue(f.root,
