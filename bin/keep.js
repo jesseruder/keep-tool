@@ -2903,8 +2903,14 @@ commands.accounts = (argv, deps = {}) => {
     if (!id || o._.length !== 1 || !o['share-from']) die('usage: keep accounts setup <id> --share-from <source-id>');
     const target = accountStore.get(id), source = accountStore.get(o['share-from']);
     if (!target || !source) die('unknown source or target account');
-    const result = require('./account-setup').shareSetup(source, target);
+    const accountSetup = require('./account-setup');
+    const result = accountSetup.shareSetup(source, target);
     console.log(`shared ${source.agent === 'codex' ? 'Codex capabilities' : 'Claude setup'} from ${source.id} to ${target.id} (${result.sharedEntries.length} shared entries)`);
+    if (target.agent !== 'claude') return;
+    const plugins = accountSetup.syncPlugins(target);
+    if (plugins.installed.length) console.log(`installed ${plugins.installed.length} plugin${plugins.installed.length === 1 ? '' : 's'}: ${plugins.installed.join(', ')}`);
+    for (const failure of plugins.failed) console.error(`could not install plugin ${failure.id}: ${failure.error}`);
+    if (plugins.failed.length) process.exitCode = 1;
     return;
   }
   die('usage: keep accounts list|add|default|setup');

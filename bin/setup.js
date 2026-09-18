@@ -671,6 +671,9 @@ function accountSetupReport() {
         else if (state.entries.length) {
           lines.push({ status: 'FAIL', fix: share(state.sourceAccountId),
             text: `${agent} account ${account.id} shared setup behind (${counted(state.entries, 'entry', 'entries')})` });
+        } else if (state.plugins?.length) {
+          lines.push({ status: 'FAIL', fix: share(state.sourceAccountId),
+            text: `${agent} account ${account.id} is missing plugins (${counted(state.plugins, 'plugin', 'plugins')})` });
         } else lines.push({ status: 'ok', text: `${agent} account ${account.id} shared setup in sync` });
       }
     } catch (error) {

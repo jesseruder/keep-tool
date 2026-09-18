@@ -833,6 +833,16 @@ test('keep doctor reports shared account setup drift for every nondefault accoun
     assert.match(synced, /^ok: Claude account automation shared setup in sync$/m);
     assert.equal(/account claude\/default/.test(synced), false, 'a default account is the source, not a target');
 
+    // A plugin the source has and the target never installed.
+    const sourcePlugins = path.join(claudeSource.configDir, 'plugins');
+    fs.mkdirSync(sourcePlugins, { recursive: true });
+    fs.writeFileSync(path.join(sourcePlugins, 'installed_plugins.json'),
+      JSON.stringify({ version: 2, plugins: { 'codex@openai-codex': [{ scope: 'user' }] } }));
+    const unplugged = accountLines();
+    assert.match(unplugged, /^FAIL: Claude account automation is missing plugins \(1 plugin: codex@openai-codex\)$/m);
+    assert.match(unplugged, /^ {2}fix: keep accounts setup automation --share-from claude\/default$/m);
+    fs.rmSync(sourcePlugins, { recursive: true, force: true });
+
     // A source change nobody has refreshed, and a shared entry replaced in the target.
     fs.writeFileSync(path.join(codexSource.configDir, 'config.toml'), 'model = "source-model"\n\n[features]\nhooks = false\n');
     fs.unlinkSync(path.join(claudeTarget.configDir, 'CLAUDE.md'));

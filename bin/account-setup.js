@@ -441,7 +441,45 @@ function previewRefresh(account) {
   const source = canonical(manifest.sourceConfigDir), target = canonical(account.configDir);
   const entries = (manifest.sharedEntries || [])
     .filter((name) => !expectedLink(path.join(source, name), path.join(target, name)));
-  return { managed: true, sourceAccountId: manifest.sourceAccountId, entries };
+  return { managed: true, sourceAccountId: manifest.sourceAccountId, entries, plugins: missingPlugins(account) };
+}
+
+// Plugins are installed per profile: the cache holds per-home paths and the install
+// record belongs to that profile, so setup never links them. Instead the target gets
+// the same user-scope plugin ids installed by Claude's own CLI. Marketplaces are not
+// added here: `marketplace add` declares the marketplace in settings.json, which is the
+// source's own file behind a shared link, so a plugin from a marketplace the shared
+// settings do not declare stays missing and says so.
+function userPlugins(configDir) {
+  const plugins = readJSON(path.join(configDir, 'plugins', 'installed_plugins.json'), {})?.plugins;
+  if (!plugins || typeof plugins !== 'object') return [];
+  return Object.keys(plugins)
+    .filter((id) => Array.isArray(plugins[id]) && plugins[id].some((entry) => entry?.scope === 'user'))
+    .sort();
+}
+
+function missingPlugins(account) {
+  const manifest = account?.agent === 'claude' && account.configDir ? readSetup(account) : null;
+  if (!manifest) return [];
+  const source = canonical(manifest.originConfigDir || manifest.sourceConfigDir);
+  const have = new Set(userPlugins(account.configDir));
+  return userPlugins(source).filter((id) => !have.has(id));
+}
+
+function syncPlugins(account, options = {}) {
+  const run = options.run || ((args, env) => spawnSync(options.claude || process.env.KEEP_CLAUDE || 'claude', args,
+    { env, encoding: 'utf8', timeout: 180000 }));
+  const installed = [], failed = [];
+  for (const id of missingPlugins(account)) {
+    const env = require('./agent-launcher').profileEnvironment('claude', { ...account, managed: true }, options.env || process.env);
+    const result = run(['plugin', 'install', id], env);
+    if (result && result.status === 0) installed.push(id);
+    else {
+      const detail = String(result?.stderr || result?.stdout || result?.error?.message || '').trim().split('\n').pop();
+      failed.push({ id, error: detail || `exit ${result?.status}` });
+    }
+  }
+  return { installed, failed };
 }
 
 function ensureSharedMemory(account, cwd) {
@@ -544,5 +582,5 @@ function compatible(sourceAccount, targetAccount, cwd) {
     memoryDir: target.memoryDir, autoMemoryDirectory: target.autoMemoryDirectory };
 }
 
-module.exports = { MANIFEST, shareSetup, readSetup, previewRefresh, ensureSharedMemory, compatible, effectiveMcpServers,
+module.exports = { MANIFEST, shareSetup, readSetup, previewRefresh, missingPlugins, syncPlugins, ensureSharedMemory, compatible, effectiveMcpServers,
   projectKey, repositoryRoot, stateFile, trustProject, trustedProjectFor, mcpConfigPath };

@@ -543,3 +543,31 @@ test('a handoff target missing a Keep hook the source has is refused by name', (
       'hooks stay out of the portable digest');
   } finally { f.cleanup(); }
 });
+
+test('setup installs the source profile user-scope plugins the target lacks', () => {
+  const f = fixture();
+  try {
+    const record = (ids) => ({ version: 2, plugins: Object.fromEntries(ids.map(([id, scope]) => [id, [{ scope, version: '1.0.0' }]])) });
+    fs.mkdirSync(path.join(f.sourceDir, 'plugins'), { recursive: true });
+    fs.writeFileSync(path.join(f.sourceDir, 'plugins', 'installed_plugins.json'),
+      JSON.stringify(record([['codex@openai-codex', 'user'], ['lsp@official', 'user'], ['repo-only@official', 'project']])));
+    assert.deepEqual(setup.missingPlugins(f.target), [], 'an unmanaged profile has no source to compare with');
+    setup.shareSetup(f.source, f.target);
+    fs.mkdirSync(path.join(f.targetDir, 'plugins'), { recursive: true });
+    fs.writeFileSync(path.join(f.targetDir, 'plugins', 'installed_plugins.json'), JSON.stringify(record([['lsp@official', 'user']])));
+    assert.deepEqual(setup.missingPlugins(f.target), ['codex@openai-codex']);
+    assert.deepEqual(setup.previewRefresh(f.target).plugins, ['codex@openai-codex']);
+
+    const calls = [];
+    const env = { PATH: process.env.PATH, ANTHROPIC_API_KEY: 'synthetic', CLAUDE_CONFIG_DIR: '/elsewhere' };
+    const ok = setup.syncPlugins(f.target, { env, run: (args, runEnv) => { calls.push({ args, runEnv }); return { status: 0 }; } });
+    assert.deepEqual(ok, { installed: ['codex@openai-codex'], failed: [] });
+    assert.deepEqual(calls[0].args, ['plugin', 'install', 'codex@openai-codex']);
+    assert.equal(calls[0].runEnv.CLAUDE_CONFIG_DIR, f.targetDir);
+    assert.equal(calls[0].runEnv.CLAUDE_SECURESTORAGE_CONFIG_DIR, f.targetDir);
+    assert.equal(calls[0].runEnv.ANTHROPIC_API_KEY, undefined, 'install runs with no provider credential');
+
+    const failed = setup.syncPlugins(f.target, { env, run: () => ({ status: 1, stderr: 'marketplace not found\n' }) });
+    assert.deepEqual(failed, { installed: [], failed: [{ id: 'codex@openai-codex', error: 'marketplace not found' }] });
+  } finally { f.cleanup(); }
+});
