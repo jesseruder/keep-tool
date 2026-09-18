@@ -18,6 +18,11 @@ const state = {
   screenshotSeq: 0,
   nextDownloadId: 1,
   downloadError: null,
+  // Hooks for the mid-flight handover tests: the stub moves the tab into another group
+  // at exactly the moment the fix is meant to notice.
+  moveGroupOnCapture: null,
+  moveGroupOnEncode: null,
+  hangPaint: false,
 };
 
 function addTab(id, groupId) {
@@ -97,6 +102,11 @@ globalThis.chrome = {
       await tick();
       state.cdp.push({ target, method, params });
       if (method === "Runtime.evaluate") {
+        // A page that stubs out setTimeout and requestAnimationFrame never resolves the
+        // paint promise, and CDP's own timeout does not bound an awaited one.
+        if (state.hangPaint && /requestAnimationFrame/.test(String(params?.expression ?? ""))) {
+          return new Promise(() => {});
+        }
         // The viewport probe and the "let it paint" wait share this command.
         if (String(params?.expression ?? "").includes("innerWidth")) {
           return {
@@ -111,6 +121,12 @@ globalThis.chrome = {
         return { result: { value: null } };
       }
       if (method === "Page.captureScreenshot") {
+        // A test can have the user drag the tab into another group exactly here, which is
+        // after the recorder's first ownership check and before its second.
+        if (state.moveGroupOnCapture != null && target.tabId != null) {
+          state.tabs.get(target.tabId).groupId = state.moveGroupOnCapture;
+          state.moveGroupOnCapture = null;
+        }
         // Real base64, because the recorder decodes it on the way into a frame.
         state.screenshotSeq += 1;
         return { data: Buffer.from(`png-${state.screenshotSeq}`, "utf8").toString("base64") };
@@ -147,6 +163,12 @@ function memoryBackend() {
     },
     async deleteFrames(recordingId) {
       frames.delete(recordingId);
+    },
+    async clearFramesAndMeta(recordingId, meta) {
+      // One call, so a worker that dies mid-clear cannot leave frames and counters
+      // disagreeing; the real backend does both in one IndexedDB transaction.
+      frames.delete(recordingId);
+      metas.set(meta.groupId, structuredCloneish(meta));
     },
     async deleteMeta(groupId) {
       metas.delete(groupId);
@@ -246,6 +268,11 @@ class FakeOffscreenCanvas {
 globalThis.OffscreenCanvas = FakeOffscreenCanvas;
 globalThis.createImageBitmap = async (blob) => {
   await tick();
+  // A test can have the export's destination tab change hands during the encode.
+  if (state.moveGroupOnEncode != null) {
+    for (const tab of state.tabs.values()) tab.groupId = state.moveGroupOnEncode;
+    state.moveGroupOnEncode = null;
+  }
   // Frames captured by the recorder are 1000x600 CSS px screenshots; the stub reports
   // that size so the downscale to 800 px wide is exercised for real.
   return { width: blob?.type === "image/gif" ? 100 : 1000, height: 600, close() {} };
@@ -258,7 +285,7 @@ globalThis.atob = globalThis.atob ?? ((text) => Buffer.from(text, "base64").toSt
 const gifframes = await import("../extension/lib/gifframes.js");
 const gifstore = await import("../extension/lib/gifstore.js");
 const gifencode = await import("../extension/lib/gifencode.js");
-const { gif_creator, recordAction } = await import("../extension/tools/gif.js");
+const { gif_creator, recordAction, safeFilename } = await import("../extension/tools/gif.js");
 const { computer } = await import("../extension/tools/computer.js");
 const sessions = await import("../extension/lib/sessions.js");
 
@@ -273,6 +300,9 @@ async function freshGroup(sessionKey, groupId, tabId) {
   state.cdp.length = 0;
   state.downloadError = null;
   state.nextDownloadId = 1;
+  state.moveGroupOnCapture = null;
+  state.moveGroupOnEncode = null;
+  state.hangPaint = false;
   const tab = addTab(tabId, groupId);
   await sessions.putSession(sessionKey, { name: `s-${sessionKey}`, groupId, windowId: 1 });
   return tab;
@@ -356,10 +386,90 @@ test("the store caps bytes too", async () => {
   await freshGroup("bytes", 11, 2);
   await gifstore.startRecording(11, { sessionKey: "bytes" });
   const big = { at: Date.now(), blob: { size: gifframes.MAX_BYTES }, width: 10, height: 10, scale: 1, action: {} };
-  assert.equal((await gifstore.addFrame(11, big)).added, true);
+  assert.equal((await gifstore.addFrame(11, big)).added, true, "the first frame always goes in");
   const refused = await gifstore.addFrame(11, big);
   assert.equal(refused.cap, "bytes");
   assert.match(gifframes.capNote("bytes"), /60 MB cap/);
+});
+
+test("a frame that would overshoot the byte cap is refused, not stored", async () => {
+  await freshGroup("overshoot", 15, 6);
+  await gifstore.startRecording(15, { sessionKey: "overshoot" });
+  const frame = (size) => ({ at: Date.now(), blob: { size }, width: 10, height: 10, scale: 1, action: {} });
+
+  // 59.9 MB stored, then a half-megabyte frame: checking only what is already there let
+  // the recording sail past 60 MB.
+  const nearly = gifframes.MAX_BYTES - 100 * 1024;
+  assert.equal((await gifstore.addFrame(15, frame(nearly))).added, true);
+  const refused = await gifstore.addFrame(15, frame(512 * 1024));
+  assert.equal(refused.added, false);
+  assert.equal(refused.cap, "bytes");
+  const meta = await gifstore.recordingFor(15);
+  assert.equal(meta.bytes, nearly, "nothing was written");
+  assert.ok(meta.bytes <= gifframes.MAX_BYTES);
+  // A frame that still fits is welcome.
+  assert.equal(gifframes.capReached({ frames: 1, bytes: nearly }, 50 * 1024), null);
+  assert.equal(gifframes.capReached({ frames: 1, bytes: nearly }, 200 * 1024), "bytes");
+});
+
+test("clear empties the frames and the counters in one transaction", async () => {
+  await freshGroup("atomic", 16, 7);
+  await gifstore.startRecording(16, { sessionKey: "atomic" });
+  await gifstore.addFrame(16, {
+    at: 1,
+    blob: { size: 1000 },
+    width: 4,
+    height: 4,
+    scale: 1,
+    action: {},
+  });
+  await gifstore.noteCap(16, "frames");
+
+  // One backend call, so a worker terminated mid-clear cannot leave frames at zero with
+  // the old counters and a cap that refuses to record anything more.
+  const calls = [];
+  const wrapped = {
+    ...backend,
+    async clearFramesAndMeta(recordingId, meta) {
+      calls.push(meta);
+      return backend.clearFramesAndMeta(recordingId, meta);
+    },
+    async deleteFrames(recordingId) {
+      calls.push("deleteFrames");
+      return backend.deleteFrames(recordingId);
+    },
+    async putMeta(meta) {
+      calls.push("putMeta");
+      return backend.putMeta(meta);
+    },
+  };
+  gifstore.setGifBackend(wrapped);
+  await gifstore.clearFrames(16);
+  gifstore.setGifBackend(backend);
+
+  assert.deepEqual(
+    calls.filter((call) => typeof call === "string"),
+    [],
+    "no separate delete-then-write pair",
+  );
+  assert.equal(calls.length, 1);
+  assert.deepEqual(
+    { frames: calls[0].frames, bytes: calls[0].bytes, capped: calls[0].capped },
+    { frames: 0, bytes: 0, capped: null },
+  );
+  const after = await gifstore.listFrames(16);
+  assert.equal(after.frames.length, 0);
+  assert.equal(after.meta.capped, null, "and the cap is lifted with the frames");
+  // Recording into the cleared take works again.
+  const added = await gifstore.addFrame(16, {
+    at: 2,
+    blob: { size: 10 },
+    width: 4,
+    height: 4,
+    scale: 1,
+    action: {},
+  });
+  assert.equal(added.added, true);
 });
 
 test("frames come back in capture order and clear empties them", async () => {
@@ -605,6 +715,100 @@ test("a capped recording says so in the export result", async () => {
 
   const exported = await gif_creator(ctx("capnote"), { action: "export", tabId: 43, download: true });
   assert.match(exported.text, /300-frame cap/);
+});
+
+test("a tab that changed hands mid-action is not captured into this recording", async () => {
+  await freshGroup("handover", 35, 45);
+  await gif_creator(ctx("handover"), { action: "start_recording", tabId: 45 });
+
+  // The tab object the action captured, before the user dragged the tab into another
+  // session's group.
+  const stale = { ...state.tabs.get(45) };
+  state.tabs.get(45).groupId = 777;
+  state.groups.set(777, { id: 777, title: "someone else" });
+
+  await recordAction(ctx("handover"), stale, { kind: "left_click", point: { x: 1, y: 2 } });
+  assert.equal((await gifstore.listFrames(35)).frames.length, 0, "no frame from another session's page");
+  assert.equal(
+    state.cdp.some((call) => call.method === "Page.captureScreenshot"),
+    false,
+    "and no screenshot of it was even taken",
+  );
+});
+
+test("a tab that changes hands while the frame is being captured is not stored", async () => {
+  await freshGroup("mid", 36, 46);
+  await gif_creator(ctx("mid"), { action: "start_recording", tabId: 46 });
+
+  // The handover lands during the screenshot, after the first ownership check passed.
+  state.moveGroupOnCapture = 778;
+  state.groups.set(778, { id: 778, title: "someone else" });
+  await recordAction(ctx("mid"), { ...state.tabs.get(46) }, { kind: "left_click", point: { x: 1, y: 2 } });
+
+  assert.equal(
+    state.cdp.some((call) => call.method === "Page.captureScreenshot"),
+    true,
+    "the capture did happen",
+  );
+  assert.equal((await gifstore.listFrames(36)).frames.length, 0, "but the frame was thrown away");
+});
+
+test("export refuses to drop the GIF into a tab that changed hands while encoding", async () => {
+  await freshGroup("dropaway", 37, 47);
+  await gif_creator(ctx("dropaway"), { action: "start_recording", tabId: 47 });
+  await computer(ctx("dropaway"), { action: "screenshot", tabId: 47 });
+
+  // The handover lands during the encode, between the group check and the drop.
+  state.moveGroupOnEncode = 779;
+  state.groups.set(779, { id: 779, title: "someone else" });
+  await assert.rejects(
+    () => gif_creator(ctx("dropaway"), { action: "export", tabId: 47, coordinate: [10, 20] }),
+    /^Error: Tab 47 is not in the same group$/,
+  );
+  assert.equal(
+    state.cdp.some((call) => call.method === "Runtime.callFunctionOn"),
+    false,
+    "nothing was dropped into the other session's page",
+  );
+});
+
+test("a filename the filesystem would refuse is normalised before anything is encoded", async () => {
+  assert.equal(safeFilename("my flow"), "my flow.gif");
+  // Illegal characters, control characters and path separators all become dashes.
+  assert.equal(safeFilename('a<b>c:d"e|f?g*h/i\\j'), "a-b-c-d-e-f-g-h-i-j.gif");
+  assert.equal(safeFilename("tab\there\u0007"), "tab-here-.gif");
+  assert.equal(safeFilename("../../etc/evil"), "-.-etc-evil.gif");
+  // DOS device names are still reserved, with or without the extension.
+  assert.equal(safeFilename("CON"), "recording-CON.gif");
+  assert.equal(safeFilename("nul.gif"), "recording-nul.gif");
+  assert.equal(safeFilename("COM1"), "recording-COM1.gif");
+  assert.equal(safeFilename("LPT9.GIF"), "recording-LPT9.GIF");
+  assert.equal(safeFilename("console"), "console.gif", "only the exact names are reserved");
+  // Nothing usable left, or nothing given: the timestamped default.
+  assert.match(safeFilename("   ", 0), /^recording-1970-01-01T00-00-00-000Z\.gif$/);
+  assert.match(safeFilename(undefined, 0), /^recording-.*\.gif$/);
+  assert.match(safeFilename("...", 0), /^recording-.*\.gif$/);
+
+  // And the real export uses it: a reserved name never reaches chrome.downloads.
+  await freshGroup("names", 38, 48);
+  await gif_creator(ctx("names"), { action: "start_recording", tabId: 48 });
+  await computer(ctx("names"), { action: "screenshot", tabId: 48 });
+  await gif_creator(ctx("names"), { action: "export", tabId: 48, download: true, filename: "AUX" });
+  assert.equal(state.downloads.at(-1).filename, "recording-AUX.gif");
+});
+
+test("a page that never paints cannot hang a screenshot", async () => {
+  await freshGroup("hang", 39, 49);
+  // setTimeout and requestAnimationFrame stubbed out in the page: the awaited promise
+  // never settles and CDP's own timeout does not cover it, so the worker's deadline is
+  // the only thing that ends the wait.
+  state.hangPaint = true;
+  const started = Date.now();
+  const shot = await computer(ctx("hang"), { action: "screenshot", tabId: 49 });
+  const elapsed = Date.now() - started;
+  assert.match(shot.text, /Screenshot of tab 49/);
+  assert.ok(elapsed >= 900, `the deadline was waited out (${elapsed} ms)`);
+  assert.ok(elapsed < 5000, `and it did not hang (${elapsed} ms)`);
 });
 
 test("a recording failure never breaks the action that triggered it", async () => {

@@ -120,10 +120,19 @@ export function totalDurationMs(frames = []) {
   return frameDelays(frames).reduce((sum, delay) => sum + delay, 0);
 }
 
-/** Would one more frame of `bytes` bytes cross a cap? */
-export function capReached({ frames = 0, bytes = 0 } = {}) {
+/**
+ * Would a recording that already holds `frames`/`bytes` refuse one more frame of
+ * `incoming` bytes? `null` means it fits.
+ *
+ * The proposed total is what matters: checking only what is already stored let a
+ * recording sitting at 59.9 MB accept another half-megabyte frame. The very first frame
+ * always goes in, however big, because a recording of nothing is worse than one
+ * oversized frame.
+ */
+export function capReached({ frames = 0, bytes = 0 } = {}, incoming = 0) {
   if (frames >= MAX_FRAMES) return "frames";
   if (bytes >= MAX_BYTES) return "bytes";
+  if (frames > 0 && bytes + incoming > MAX_BYTES) return "bytes";
   return null;
 }
 

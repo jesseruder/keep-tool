@@ -20,23 +20,46 @@ import {
 import { captureClip, clipScaleFor, dropFileAtCoordinate, viewport } from "./shared.js";
 
 /**
+ * Is this tab still the session's, and still in the group the recording belongs to?
+ *
+ * The tab object a tool captured before its action is a snapshot: the user can drag a tab
+ * into another session's group while a click or a page load is in flight. Checking again
+ * is what stops one session's page being captured into another session's recording.
+ */
+async function stillInGroup(ctx, tabId, groupId) {
+  try {
+    const fresh = await requireTab(ctx.sessionKey, tabId);
+    return fresh.groupId === groupId ? fresh : null;
+  } catch {
+    return null; // gone, or no longer this session's
+  }
+}
+
+/**
  * Called by `computer` after every action and by `navigate` after every navigation.
  * Never throws: a recording is a nice-to-have and must not turn a successful click into
  * a failed tool call.
  */
 export async function recordAction(ctx, tab, recorded) {
   if (!recorded || !tab || tab.groupId == null) return;
+  const groupId = tab.groupId;
   try {
-    const meta = await recordingFor(tab.groupId);
+    const meta = await recordingFor(groupId);
     if (!meta?.recording) return;
     const cap = meta.capped ?? capReached(meta);
     if (cap) {
       // Remember it so `export` can say why the GIF stops where it does, and skip the
       // screenshot: capturing a frame we are not going to store costs a real 300 ms.
-      await noteCap(tab.groupId, cap);
+      await noteCap(groupId, cap);
       return;
     }
-    await addFrame(tab.groupId, await buildFrame(tab.id, recorded));
+    // Before the screenshot: the tab may have changed hands while the action ran, and
+    // its current page is then not this recording's to keep.
+    if (!(await stillInGroup(ctx, tab.id, groupId))) return;
+    const frame = await buildFrame(tab.id, recorded);
+    // And again before storing: capturing takes a few hundred milliseconds of its own.
+    if (!(await stillInGroup(ctx, tab.id, groupId))) return;
+    await addFrame(groupId, frame);
   } catch (error) {
     console.warn("browser-bridge: could not record a GIF frame", error);
   }
@@ -76,18 +99,35 @@ function fileStamp(at = Date.now()) {
   return new Date(at).toISOString().replace(/[:.]/g, "-");
 }
 
+// Names the filesystem will not take: DOS devices, still reserved on Windows and worth
+// avoiding everywhere, with or without an extension.
+const RESERVED_BASENAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+// Path separators, the characters Windows forbids outright, and control characters.
+// eslint-disable-next-line no-control-regex
+const ILLEGAL_CHARACTERS = /[<>:"/\\|?*\u0000-\u001f\u007f]/g;
+
 /**
- * chrome.downloads refuses an absolute path or a `..` segment, and a name without .gif
- * would be saved as something the OS will not open.
+ * A name `chrome.downloads.download` will accept, normalised rather than rejected: this
+ * runs before the encode, so a bad name never costs a wasted GIF.
+ *
+ * chrome.downloads refuses an absolute path or a `..` segment, the OS refuses `<>:"/\|?*`
+ * and control characters, Windows refuses the DOS device names, and a name without .gif
+ * would be saved as something nothing will open.
  */
-function safeFilename(raw, at) {
-  const name = String(raw ?? "")
-    .trim()
-    .replace(/[/\\]+/g, "-")
+export function safeFilename(raw, at = Date.now()) {
+  let name = String(raw ?? "")
+    .replace(ILLEGAL_CHARACTERS, "-")
     .replace(/\.\.+/g, ".")
-    .replace(/^[.\s]+/, "");
+    // Leading and trailing dots and spaces are stripped or rejected by filesystems.
+    .replace(/^[.\s]+/, "")
+    .replace(/[.\s]+$/, "")
+    .trim();
   if (!name) return `recording-${fileStamp(at)}.gif`;
-  return /\.gif$/i.test(name) ? name : `${name}.gif`;
+  if (!/\.gif$/i.test(name)) name = `${name}.gif`;
+  // CON.gif is still CON to Windows.
+  const base = name.slice(0, -4);
+  if (RESERVED_BASENAMES.test(base)) name = `recording-${name}`;
+  return name;
 }
 
 function humanBytes(count) {
@@ -116,7 +156,7 @@ export async function gif_creator(ctx, params = {}) {
     case "clear":
       return clearAction(groupId);
     case "export":
-      return exportAction(tab, groupId, params);
+      return exportAction(ctx, tab, groupId, params);
     default:
       throw new Error(
         `Unsupported gif_creator action: ${action || "(none)"}. Use start_recording, stop_recording, export or clear.`,
@@ -166,7 +206,7 @@ async function clearAction(groupId) {
   };
 }
 
-async function exportAction(tab, groupId, params) {
+async function exportAction(ctx, tab, groupId, params) {
   const { meta, frames } = await listFrames(groupId);
   if (!meta || frames.length === 0) {
     throw new Error(
@@ -215,6 +255,10 @@ async function exportAction(tab, groupId, params) {
 
   if (coordinate) {
     const [x, y] = coordinate;
+    // Encoding took real time; the destination tab may have been handed to another
+    // session meanwhile, and this GIF is not theirs to receive. requireTab throws the
+    // contract's own wording.
+    await requireTab(ctx.sessionKey, tab.id);
     const dropped = await dropFileAtCoordinate(tab.id, {
       data: base64,
       mimeType: "image/gif",

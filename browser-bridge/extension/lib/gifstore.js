@@ -96,6 +96,14 @@ const idbBackend = {
     transaction.objectStore(FRAME_STORE).delete(range);
     await finished(transaction);
   },
+  async clearFramesAndMeta(recordingId, meta) {
+    const db = await openDb();
+    const transaction = db.transaction([FRAME_STORE, META_STORE], "readwrite");
+    const range = IDBKeyRange.bound([recordingId, -Infinity], [recordingId, Infinity]);
+    transaction.objectStore(FRAME_STORE).delete(range);
+    transaction.objectStore(META_STORE).put(meta);
+    await finished(transaction);
+  },
   async deleteMeta(groupId) {
     const db = await openDb();
     const transaction = db.transaction(META_STORE, "readwrite");
@@ -225,15 +233,16 @@ export function addFrame(groupId, frame) {
     const meta = await liveMeta(groupId);
     if (!meta?.recording) return { added: false, cap: null, recording: false };
 
+    const bytes = Number(frame.blob?.size ?? frame.bytes ?? 0);
     // Once a recording is capped it stays capped until `clear` resets the counters:
-    // dropping under a cap again would otherwise make the GIF skip the middle.
-    const cap = meta.capped ?? capReached(meta);
+    // dropping under a cap again would otherwise make the GIF skip the middle. The
+    // incoming frame's own size counts towards the cap before it is written, not after.
+    const cap = meta.capped ?? capReached(meta, bytes);
     if (cap) {
       if (meta.capped !== cap) await backend.putMeta({ ...meta, capped: cap });
       return { added: false, cap, recording: true };
     }
 
-    const bytes = Number(frame.blob?.size ?? frame.bytes ?? 0);
     const record = { ...frame, recordingId: meta.recordingId, seq: meta.nextSeq, bytes };
     const next = {
       ...meta,
@@ -272,14 +281,19 @@ export function listFrames(groupId) {
   });
 }
 
-/** `clear`: the frames go, the recording state stays (and can fill up again). */
+/**
+ * `clear`: the frames go, the recording state stays (and can fill up again).
+ *
+ * Both halves are one transaction: a worker terminated between them would leave a
+ * recording with no frames but the old counters, and a cap that refuses to record
+ * anything into an empty take.
+ */
 export function clearFrames(groupId) {
   return serialize(async () => {
     const meta = await liveMeta(groupId);
     if (!meta) return null;
-    await backend.deleteFrames(meta.recordingId);
     const next = { ...meta, ...emptyCounters() };
-    await backend.putMeta(next);
+    await backend.clearFramesAndMeta(meta.recordingId, next);
     return next;
   });
 }
