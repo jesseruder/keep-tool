@@ -18,14 +18,28 @@ const BLANK_URLS = new Set(["about:blank", "about:newtab", "chrome://newtab/", "
 
 installListeners();
 
+// Edge kills the host whenever the worker sleeps, so a disconnect is routine: retry
+// quickly at first, then back off so a machine with no installed host is not woken
+// every second forever. The keepalive alarm is the backstop.
+const RECONNECT_DELAYS_MS = [1000, 2000, 5000, 15000, 30000];
+let reconnectAttempt = 0;
+let reconnectTimer = null;
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  const delay = RECONNECT_DELAYS_MS[Math.min(reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)];
+  reconnectAttempt += 1;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    bridge.connect();
+  }, delay);
+}
+
 const bridge = new NativeBridge({
   onRequest: handleRequest,
   onStatus: (status) => {
-    if (!status.connected) {
-      // Edge killed the host (usually because the worker slept). Try again soon; the
-      // alarm below is the backstop if this attempt fails too.
-      setTimeout(() => bridge.connect(), 1000);
-    }
+    if (status.connected) reconnectAttempt = 0;
+    else scheduleReconnect();
   },
 });
 

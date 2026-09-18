@@ -25,6 +25,8 @@ const DIR = runtimeDir();
 const SOCKET = socketPath();
 const LOG = logPath();
 const MAX_LOG_BYTES = 1024 * 1024;
+// Only the tests set this; 90 s is the real per-request budget.
+const TIMEOUT_MS = Number(process.env.BROWSER_BRIDGE_REQUEST_TIMEOUT_MS) || REQUEST_TIMEOUT_MS;
 
 let logStream = null;
 
@@ -124,9 +126,9 @@ function forward(client, message) {
   const timer = setTimeout(() => {
     pending.delete(wireId);
     replyToClient(client, message.id, false, {
-      message: `Timed out after ${Math.round(REQUEST_TIMEOUT_MS / 1000)}s waiting for the browser extension (${message.method})`,
+      message: `Timed out after ${Math.round(TIMEOUT_MS / 1000)}s waiting for the browser extension (${message.method})`,
     });
-  }, REQUEST_TIMEOUT_MS);
+  }, TIMEOUT_MS);
   timer.unref?.();
   pending.set(wireId, { client, clientRequestId: message.id, timer });
   sendToExtension({

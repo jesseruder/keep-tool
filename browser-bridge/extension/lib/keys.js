@@ -140,20 +140,24 @@ export function keyDescriptor(name, modifiers = 0) {
 
 /** "cmd+shift+a" -> {modifiers, key:"a"}; the last segment is the key. */
 export function parseChord(chord) {
-  const parts = String(chord).split("+");
-  // A trailing "+" ("cmd+") means the key itself is "+".
-  if (parts.length > 1 && parts[parts.length - 1] === "") {
-    parts.pop();
-    parts.push("+");
+  const text = String(chord);
+  let key;
+  let modifierText;
+  if (text === "+") {
+    key = "+";
+    modifierText = "";
+  } else if (text.endsWith("+")) {
+    // A chord whose key is "+" itself, as in "cmd++".
+    key = "+";
+    modifierText = text.slice(0, -1).replace(/\+$/, "");
+  } else {
+    const split = text.lastIndexOf("+");
+    key = split === -1 ? text : text.slice(split + 1);
+    modifierText = split === -1 ? "" : text.slice(0, split);
   }
-  const key = parts.pop();
-  let modifiers = 0;
-  for (const part of parts) {
-    const bit = MODIFIER_BITS[part.trim().toLowerCase()];
-    if (bit === undefined) return { error: `Unknown modifier: ${part}` };
-    modifiers |= bit;
-  }
-  return { modifiers, key };
+  const parsed = parseModifiers(modifierText);
+  if (parsed.error) return { error: parsed.error };
+  return { modifiers: parsed.modifiers, key };
 }
 
 /** "ctrl+shift" -> {modifiers} for the click actions' `modifiers` field. */
