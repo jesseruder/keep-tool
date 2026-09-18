@@ -1272,14 +1272,22 @@ function localCommandStdout(record) {
 // record ever carries. It is not evidence of the base model on its own — a display name
 // is not an id — so a label only ever narrows a base that a record or the launch
 // metadata has already proven.
+// The trailers matter as much as the label: the harness also prints why it could not save
+// the choice — `Set model to `Opus 5` for this session only · couldn't save it as your
+// default: /tmp/1m/settings.json can't be written (EACCES)` — and a path in that sentence
+// must never be read as part of the model name, least of all as its context window.
 function modelSwitchLabel(stdout) {
   // First line only, and never the wrapper: localCommandStdout leaves the closing tag on.
   const text = String(stdout == null ? '' : stdout).split(/\r?\n/)[0].split('</')[0].trim();
   const set = /^Set model to\b([\s\S]*)$/i.exec(text);
   if (!set) return null;
-  // The picker appends "and saved as your default for new sessions" after the label, and
-  // wraps the label itself in backticks.
-  return set[1].replace(/\s+and saved\b[\s\S]*$/i, '').trim().replace(/^`+|`+$/g, '').trim();
+  const rest = set[1].trim();
+  // The harness wraps the label in backticks, which delimit it exactly: whatever follows
+  // the closing one is a sentence about the switch, not part of the model.
+  const quoted = /`([^`]*)`/.exec(rest);
+  if (quoted) return quoted[1].trim();
+  // Unquoted, the label runs to the first trailer the harness is known to append.
+  return rest.replace(/\s+(?:and saved\b|for this session\b|·).*$/i, '').trim();
 }
 
 // `Fable 5.1 (1M context)` → family `fable`, version `5-1`. Both are needed: a label with
@@ -1350,10 +1358,13 @@ function modelEventsInText(text, newerText = '') {
 //  - window 'exact' means the model string already carries the right window, 'launch'
 //    that the launch metadata may supply it, and 'unknown' that it cannot be told —
 //    a switch beyond the scan's bound could have set a window nothing else records.
-//  - label is set only alongside the '<unknown>' sentinel, and only for a `/model` newer
-//    than every record that named no launchable id: it is the model name the harness
-//    echoed, which the caller may resolve against launch metadata it can see and this
-//    scan cannot. It is not a model, and an unresolved label stays '<unknown>'.
+//  - label is set only alongside the '<unknown>' sentinel, and only for a `/model` that
+//    named no launchable id: it is the display name the harness echoed after the switch.
+//    It is not a model — the picker's rows can be renamed in settings this scan does not
+//    read — so the caller decides whether to believe it, and an unresolved label stays
+//    '<unknown>'. labelReference comes with it when an assistant record newer than the
+//    switch proves the base the label must match; without one the caller has only the
+//    launch metadata, which this scan cannot see.
 // The model is '' only after reading back to byte zero with no genuine record in the
 // whole file; a scan cut short by the bound or by a read error reports the '<unknown>'
 // sentinel, because unread bytes are not evidence of absence.
@@ -1449,14 +1460,10 @@ function switchBehindAssistant(event, assistant) {
   const { model, label } = switchResult(event);
   if (model === '<unknown>') {
     // The picker, or a bare alias: no id was typed, but the harness echoed the model it
-    // moved to and the record right after it proves that base. Matching the two is the
-    // only thing here that can name the window. A label that does not match the record
-    // proves nothing — unlike a typed id, it cannot show the base changed by some other
-    // path — so it keeps failing closed.
-    const labelled = label ? modelIdForSwitchLabel(label, assistant) : '';
-    return labelled
-      ? { model: labelled, source: 'switch', window: 'exact' }
-      : { model, source: 'switch', window: 'unknown' };
+    // moved to and the record right after it proves that base. The scan reports both and
+    // resolves neither — whether a display label can be believed at all depends on
+    // settings only handoffCurrentModel can read.
+    return { model, source: 'switch', window: 'unknown', label, labelReference: assistant };
   }
   if (compactModelBase(model) === compactModelBase(assistant)) return { model, source: 'switch', window: 'exact' };
   // The model changed after the switch by some other path, so the record is the evidence
@@ -1482,6 +1489,89 @@ function readAccountSettingsModel(file) {
     if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return '';
     return typeof settings.model === 'string' ? settings.model : '';
   } catch { return ''; }
+}
+
+// One settings file as a JSON object, or null when there is no such file. Anything else —
+// unreadable, not JSON, not an object — throws, because the callers below have to tell
+// "this file says nothing" from "we could not find out what this file says".
+function readSettingsFile(file) {
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return null;
+    throw err;
+  }
+  const settings = JSON.parse(text);
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+    throw new Error(`settings file is not a JSON object: ${file}`);
+  }
+  return settings;
+}
+
+// The settings an administrator installs for every session on the machine; Claude Code
+// reads them ahead of the account's own. Paths are the harness's, by platform.
+const MANAGED_SETTINGS_FILES = process.platform === 'darwin'
+  ? ['/Library/Application Support/ClaudeCode/managed-settings.json']
+  : ['/etc/claude-code/managed-settings.json'];
+const MANAGED_SETTINGS_DIRS = process.platform === 'darwin'
+  ? ['/Library/Application Support/ClaudeCode/managed-settings.d']
+  : ['/etc/claude-code/managed-settings.d'];
+
+function managedSettingsFiles() {
+  const files = [...MANAGED_SETTINGS_FILES];
+  for (const dir of MANAGED_SETTINGS_DIRS) {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir);
+    } catch (err) {
+      // A directory that is not there holds no settings; one we cannot list might.
+      if (err && (err.code === 'ENOENT' || err.code === 'ENOTDIR')) continue;
+      throw err;
+    }
+    for (const entry of entries.sort()) if (entry.endsWith('.json')) files.push(path.join(dir, entry));
+  }
+  return files;
+}
+
+// Whether the `/model` picker this session used could have shown rows someone renamed.
+// `modelPicker.options[]` in settings replaces or extends the built-in rows with
+// `{ model, label }` pairs of their own, and the confirmation prints the row's label
+// verbatim — so `{ model: 'claude-opus-5[1m]', label: 'Opus 5' }` makes a label that reads
+// like a built-in name stand for a different model entirely. A renamed row cannot be told
+// from a built-in one by looking at the string, so the only safe rule is to stop believing
+// labels at all once custom rows are possible anywhere the harness would have read them:
+// a `--settings` file passed on the command line (its contents are the caller's, not
+// ours), the launching account's own settings.json, or the machine's managed settings.
+// Project settings are deliberately not consulted: the harness ignores modelPicker there.
+// Unreadable is the same as "may exist" — this decides whether a handoff is allowed to
+// reproduce a model, and a guess is the one answer that must never come out of it.
+function customModelPickerPossible(session, processArgs, deps = {}) {
+  if (/(?:^|\s)--settings(?:=|\s|$)/.test(String(processArgs || ''))) return true;
+  const read = deps.readSettingsFile || readSettingsFile;
+  const files = [];
+  try {
+    const account = (deps.forSession || accounts.forSession)(session.id, 'claude', {
+      root: deps.root || keep.ROOT, env: deps.env || process.env,
+    });
+    // No account resolves to no account settings file, exactly as sourceAccountSettingsModel
+    // reads it: there is no second place to look for the one this session launched from.
+    if (account && typeof account.configDir === 'string' && account.configDir) {
+      files.push(path.join(account.configDir, 'settings.json'));
+    }
+  } catch { return true; }
+  try {
+    const managed = typeof deps.managedSettingsFiles === 'function'
+      ? deps.managedSettingsFiles()
+      : deps.managedSettingsFiles;
+    files.push(...(managed || managedSettingsFiles()));
+  } catch { return true; }
+  for (const file of files) {
+    let settings;
+    try { settings = read(file); } catch { return true; }
+    if (settings && settings.modelPicker != null) return true;
+  }
+  return false;
 }
 
 // The model a session launched with no `--model` inherited: `claude` reads it out of the
@@ -1528,16 +1618,22 @@ function handoffCurrentModel(session, pane, processArgs, deps = {}) {
   // record's own `claude-fable-5-1` are the same model with different windows.
   const launch = launchModelId(pane?.meta?.model)
     || launchModelId(HANDOFF_ARGV_MODEL_RE.exec(String(processArgs || ''))?.[1]);
-  const { model, source, window, label } = found;
-  // A `/model` newer than every record that named no launchable id — the picker, or a bare
-  // alias — left the model it moved to only in the label the harness echoed. Nothing in
-  // the transcript can prove that base, so the launch metadata has to: when the label
-  // names the model the session was launched with, the base is the launch spelling and the
-  // label's own `(1M context)` decides the window. No launch metadata, or a label that
-  // names some other model, keeps failing closed.
-  if (model === '<unknown>' && label && launch) {
-    const labelled = modelIdForSwitchLabel(label, launch);
-    if (labelled) return labelled;
+  const { model, source, window, label, labelReference } = found;
+  // A `/model` that named no launchable id — the picker, or a bare alias — left the model
+  // it moved to only in the label the harness echoed. Something else has to prove the base
+  // that label narrows: the assistant record right after the switch when there is one, and
+  // otherwise the launch metadata, which is all that is left when nothing in the file is
+  // newer than the switch. The label then decides the window, because `(1M context)` is
+  // named there and nowhere else. A label that names some other model proves nothing and
+  // keeps failing closed — and neither does any label once the picker's rows could have
+  // been renamed in settings, which is checked here and only when there is a label worth
+  // resolving, so the ordinary path still reads no settings at all.
+  if (model === '<unknown>' && label) {
+    const reference = labelReference || launch;
+    if (reference && !customModelPickerPossible(session, processArgs, deps)) {
+      const labelled = modelIdForSwitchLabel(label, reference);
+      if (labelled) return labelled;
+    }
   }
   if (model === '<unknown>') return model;
   // Nothing in the whole transcript names a model. Launch metadata first, and then — only

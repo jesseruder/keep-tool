@@ -2365,11 +2365,11 @@ test('handoff model resolution follows a /model typed after the newest assistant
       content: `<local-command-stdout>${text}</local-command-stdout>` });
     const userStdout = (text) => JSON.stringify({ type: 'user', message: { content: [{ type: 'text',
       text: `<local-command-stdout>${text}</local-command-stdout>` }] } });
-    const resolve = (name, rows, deps = {}, pane = { meta: { model: 'claude-opus-4-5' } }) => {
+    const resolve = (name, rows, deps = {}, pane = { meta: { model: 'claude-opus-4-5' } },
+      args = 'claude --model claude-opus-4-5') => {
       const file = path.join(dir, `${name}.jsonl`);
       fs.writeFileSync(file, `${rows.join('\n')}\n`);
-      return handoffCurrentModel(session, pane,
-        'claude --model claude-opus-4-5', { findSessionFile: () => file, ...deps });
+      return handoffCurrentModel(session, pane, args, { findSessionFile: () => file, ...deps });
     };
 
     assert.equal(resolve('switched', [
@@ -2440,6 +2440,75 @@ test('handoff model resolution follows a /model typed after the newest assistant
       real('claude-fable-5-1'), real('claude-fable-5-1'), synthetic,
     ], {}, { meta: { model: 'claude-fable-5-1' } }), 'claude-fable-5-1',
     'only the newest switch decides, and the records after it agree');
+    // The harness also says why it could not save the choice, and that sentence can carry
+    // a path. Backticks delimit the label, so nothing after them is read as the model.
+    const denied = 'Set model to `Opus 5` for this session only · couldn\'t save it as your '
+      + 'default: /tmp/1m/settings.json can\'t be written (EACCES)';
+    assert.equal(resolve('picker-unsaved', [
+      modelCommand(''), stdout(denied), real('claude-opus-5'), synthetic,
+    ], {}, { meta: { model: 'claude-opus-5' } }), 'claude-opus-5',
+    'a 1m in the path of a failed save is not the context window');
+    assert.equal(resolve('picker-unsaved-wide', [
+      modelCommand(''), stdout(denied.replace('`Opus 5`', '`Opus 5 (1M context)`')),
+      real('claude-opus-5'), synthetic,
+    ], {}, { meta: { model: 'claude-opus-5' } }), 'claude-opus-5[1m]',
+    'and the window inside the label still counts');
+    assert.equal(resolve('picker-unsaved-bare', [
+      modelCommand(''), stdout('Set model to Opus 5 for this session only'),
+      real('claude-opus-5'), synthetic,
+    ], {}, { meta: { model: 'claude-opus-5' } }), 'claude-opus-5',
+    'an unquoted label ends at the first trailer the harness appends');
+
+    // A renamed picker row — `{ model: 'claude-fable-5-1[1m]', label: 'Fable 5.1' }` — makes
+    // a label that reads like a built-in name stand for another model, and nothing in the
+    // string says which it is. Wherever such rows could have been configured, no label is
+    // believed at all.
+    const pickerRows = [
+      modelCommand(''), stdout('Set model to `Fable 5.1` and saved as your default for new sessions'),
+      real('claude-fable-5-1'), synthetic,
+    ];
+    const fablePane = { meta: { model: 'claude-fable-5-1' } };
+    const account = { forSession: () => ({ configDir: '/acct' }) };
+    const settings = (map) => ({ readSettingsFile: (file) => (file in map ? map[file] : null) });
+    assert.equal(resolve('picker-custom-rows', pickerRows, {
+      ...account,
+      ...settings({ '/acct/settings.json': { modelPicker: { options: [
+        { model: 'claude-fable-5-1[1m]', label: 'Fable 5.1' },
+      ] } } }),
+    }, fablePane), '<unknown>', 'a renamed row can point the built-in name at another window');
+    assert.equal(resolve('picker-custom-empty', pickerRows, {
+      ...account, ...settings({ '/acct/settings.json': { modelPicker: {} } }),
+    }, fablePane), '<unknown>', 'any modelPicker at all means the rows are not the built-in ones');
+    assert.equal(resolve('picker-custom-managed', pickerRows, {
+      ...account,
+      managedSettingsFiles: ['/managed.json'],
+      ...settings({ '/managed.json': { modelPicker: { replaceBuiltInOptions: true } } }),
+    }, fablePane), '<unknown>', 'managed settings configure the picker for every session on the machine');
+    assert.equal(resolve('picker-custom-unreadable', pickerRows, {
+      ...account,
+      managedSettingsFiles: ['/managed.json'],
+      readSettingsFile: (file) => {
+        if (file === '/managed.json') throw new Error('not JSON');
+        return null;
+      },
+    }, fablePane), '<unknown>', 'a settings file we cannot read is not a settings file that says nothing');
+    assert.equal(resolve('picker-custom-flag', pickerRows, {
+      ...account, ...settings({}),
+    }, fablePane, 'claude --settings /x.json --model claude-opus-4-5'), '<unknown>',
+    'a --settings file is the caller\'s, and it can carry picker rows too');
+    assert.equal(resolve('picker-custom-none', pickerRows, {
+      ...account, managedSettingsFiles: [], ...settings({}),
+    }, fablePane), 'claude-fable-5-1', 'with no picker configured anywhere the built-in label stands');
+    // The same rule on the other reference: nothing is newer than this switch, so the
+    // label would be matched against launch metadata, and a renamed row could aim it at a
+    // model the session is no longer on.
+    assert.equal(resolve('picker-custom-launch', [
+      real('claude-fable-5-1'), modelCommand(''),
+      stdout('Set model to `Opus 5` and saved as your default for new sessions'), synthetic,
+    ], {
+      ...account, ...settings({ '/acct/settings.json': { modelPicker: { options: [] } } }),
+    }, { meta: { model: 'claude-opus-5' } }), '<unknown>',
+    'launch metadata is no safer a reference for a label that may have been renamed');
     // The bound stops the scan before byte zero, so an older switch could still be
     // hiding: only launch metadata for the same model can supply the window.
     const bounded = { scanChunkBytes: 512, scanMaxBytes: 512 };
