@@ -166,14 +166,9 @@ export class ChunkAssembler {
   }
 }
 
-/** Requests dropped mid-reassembly are the host's problem to report; we just say so. */
-const logEviction = (id, reason) => {
-  console.warn(`browser-bridge: dropped a partial message (${id}): ${reason}`);
-};
-
 export class NativeBridge {
   #port = null;
-  #assembler = new ChunkAssembler({ onEvict: logEviction });
+  #assembler = this.#newAssembler();
   #onRequest;
   #onStatus;
   #connectedAt = null;
@@ -188,6 +183,25 @@ export class NativeBridge {
 
   get connected() {
     return this.#port !== null;
+  }
+
+  /**
+   * A chunked request dropped mid-reassembly would otherwise leave the host's client
+   * waiting out its whole timeout: answer the wire id with an error instead. Frames
+   * without a request id (events) have nobody waiting and are only logged.
+   */
+  #newAssembler() {
+    return new ChunkAssembler({
+      onEvict: (id, reason) => {
+        console.warn(`browser-bridge: dropped a partial message (${id}): ${reason}`);
+        if (typeof id !== "string" || !id.startsWith("w")) return;
+        this.send({
+          id,
+          ok: false,
+          error: { message: `the request was dropped before it completed: ${reason}` },
+        });
+      },
+    });
   }
 
   /**
@@ -249,7 +263,7 @@ export class NativeBridge {
       this.#lastError = chrome.runtime.lastError?.message ?? null;
       this.#port = null;
       this.#connectedAt = null;
-      this.#assembler = new ChunkAssembler({ onEvict: logEviction });
+      this.#assembler = this.#newAssembler();
       this.#stopSweeping();
       this.#onStatus(this.status);
     });

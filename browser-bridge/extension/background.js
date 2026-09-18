@@ -196,6 +196,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   const state = peekTab(tabId);
   if (!state) return; // nothing of ours to clean up
   const owner = state.owner;
+  const claimSeq = state.claimSeq;
   try {
     if (owner) {
       const session = await getSession(owner);
@@ -209,12 +210,12 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
       if (ours) return;
     }
     await detach(tabId);
-    // The destination session may have claimed the tab while we were awaiting, and its
-    // fresh state is not ours to throw away. Detaching it was harmless: the next command
-    // re-attaches.
+    // A session may have claimed the tab while we were awaiting (the destination, or the
+    // same owner taking it back), and that fresh state is not ours to throw away.
+    // Detaching it was harmless: the next command re-attaches.
     const current = peekTab(tabId);
     if (!current) return;
-    if (current.owner !== owner) return;
+    if (current.owner !== owner || current.claimSeq !== claimSeq) return;
     dropTab(tabId);
   } catch (error) {
     console.warn("browser-bridge: group change cleanup failed", error);

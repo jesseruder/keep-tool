@@ -462,3 +462,29 @@ test("an ended session that comes back takes its group out of (ended)", async ()
   assert.equal(state.groups.get(session.group.groupId).title, "returning");
   assert.equal((await sessions.getSession("returning")).ended, false);
 });
+
+test("a tab its own session reclaims during cleanup keeps the reclaimed state", async () => {
+  const own = await makeSession("owner-k", "K");
+  const other = await makeSession("owner-l", "L");
+  await cdp.attach(own.tab.id);
+  await sessions.requireTab("owner-k", own.tab.id);
+
+  const held = deferred();
+  state.holdDetach = held.promise;
+  state.detachCalls.length = 0;
+
+  // The tab wanders into L's group, and K takes it back while the detach is in flight.
+  fireGroupChange(own.tab.id, other.group.groupId);
+  await waitFor(() => state.detachCalls.includes(own.tab.id), "the cleanup to reach detach");
+  cdp.claimTab(own.tab.id, "owner-k", own.group.groupId);
+  cdp.peekTab(own.tab.id).console.push({ level: "log", text: "K again", at: Date.now() });
+
+  held.resolve();
+  state.holdDetach = null;
+  for (let index = 0; index < 5; index++) await tick();
+
+  const stateAfter = cdp.peekTab(own.tab.id);
+  assert.notEqual(stateAfter, null, "a same-owner reclaim must survive the stale cleanup");
+  assert.equal(stateAfter.owner, "owner-k");
+  assert.deepEqual(stateAfter.console.map((entry) => entry.text), ["K again"]);
+});

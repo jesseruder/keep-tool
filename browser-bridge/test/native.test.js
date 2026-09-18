@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { MAX_ASSEMBLED_BYTES } from "../extension/lib/native.js";
+import { MAX_ASSEMBLED_BYTES, MAX_PARTIAL_MESSAGES } from "../extension/lib/native.js";
 
 /** A port that records what was posted and lets the test drive the listeners. */
 function makePort() {
@@ -112,4 +112,29 @@ test("requests are handed to the handler with their port generation", (t) => {
   assert.equal(seen.length, 1);
   assert.equal(seen[0].message.method, "read_page");
   assert.equal(seen[0].generation, bridge.generation);
+});
+
+test("a request evicted mid-reassembly is answered with an error, an event is only logged", (t) => {
+  const { port } = connectedBridge(t);
+  port.sent.length = 0;
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(" "));
+  t.after(() => {
+    console.warn = originalWarn;
+  });
+
+  // One first chunk per id, more than the assembler keeps: the oldest is evicted.
+  for (let index = 0; index <= MAX_PARTIAL_MESSAGES; index++) {
+    const id = index === 0 ? "wnonce_1_c1" : `evt_${index}`;
+    for (const listener of port.messageListeners) {
+      listener({ id, chunk: 0, of: 2, data: "{" });
+    }
+  }
+
+  const replies = port.sent.filter((frame) => frame.ok === false);
+  assert.equal(replies.length, 1, "only the request id gets a reply");
+  assert.equal(replies[0].id, "wnonce_1_c1");
+  assert.match(replies[0].error.message, /dropped before it completed/);
+  assert.ok(warnings.some((line) => line.includes("wnonce_1_c1")));
 });

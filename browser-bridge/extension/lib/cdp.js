@@ -28,6 +28,9 @@ export function stateFor(tabId) {
       // that session last touched it.
       owner: null,
       groupId: null,
+      // Bumped on every claim, so a cleanup that awaited can tell a reclaim apart from
+      // the state it decided to drop, even when the owner is the same session.
+      claimSeq: 0,
     };
     tabs.set(tabId, state);
   }
@@ -54,6 +57,7 @@ export function claimTab(tabId, sessionKey, groupId) {
   }
   state.owner = sessionKey ?? null;
   if (groupId !== undefined) state.groupId = groupId;
+  state.claimSeq += 1;
   return state;
 }
 
