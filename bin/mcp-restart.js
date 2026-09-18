@@ -270,7 +270,7 @@ function npxInstallMatch(child, npx, context) {
   // refusal the transfer queue retries), and more than one is not this shape at all.
   if (children.length !== 1) return false;
   const live = children[0];
-  const liveArgs = typeof live.args === 'string' ? live.args.replace(/\s+$/, '') : '';
+  const liveArgs = typeof live.args === 'string' ? live.args : '';
   if (!liveArgs || liveArgs.length > 64 * 1024) return false;
   const dir = path.join(npxCacheDir(context.env), npxInstallHash([npx.spec]));
   const tokens = liveArgs.split(' ');
@@ -311,28 +311,33 @@ function launcherMatch(command, value) {
 // declared side only. A bare declared command likewise matches that basename at any
 // absolute path, since PATH is what chose it.
 function declaredMatch(child, entry, context = {}) {
-  // Trailing blanks only: a process that rewrites its own title (npm does) leaves the
-  // rest of the original argv buffer blank, and ps prints those bytes as spaces.
-  const args = typeof child.args === 'string' ? child.args.replace(/\s+$/, '') : '';
+  const args = typeof child.args === 'string' ? child.args : '';
   if (!args || args.length > 64 * 1024) return false;
   const tail = entry.args.join(' ');
   if (args === [entry.command, ...entry.args].join(' ')) return true;
-  const tokens = args.split(' ');
-  if (tokens.some(value => value === '')) return false;
-  // PATH-resolved launcher: /abs/npm exec @playwright/mcp@latest --headless.
-  if (launcherMatch(entry.command, tokens[0]) && tokens.slice(1).join(' ') === tail) return true;
   // npm's rewritten process title. An `npx`-declared server never runs under a row
   // that says npx: the npx bin splices `exec` into argv and npm then overwrites its
   // own title with `npm` plus the positional arguments. So `npx @playwright/mcp@latest
   // --headless` is live as `npm exec @playwright/mcp@latest --headless`. The title is
   // the literal word `npm` that npm wrote, never a path, so only the bare token is
   // accepted here; a real `/usr/local/bin/npm exec …` argv goes through the launcher
-  // rules above like any other row. And the title is never the evidence — it is a
+  // rules below like any other row. And the title is never the evidence — it is a
   // pointer to the npx cache install of the declared spec, and the program there is
   // what npxInstallMatch checks.
+  // The title is shorter than the argv it overwrote, and ps prints the rest of that
+  // buffer as spaces: `npm exec @playwright/mcp@latest --headless   `. Trailing ASCII
+  // spaces are dropped here and only here; every other match below is exact, so a
+  // genuine argument that ends in a blank is still a different command.
   const npx = context.npxTitle === false ? null : npxDeclaration(entry);
-  if (npx && tokens[0] === 'npm' && tokens[1] === 'exec' && tokens.slice(2).join(' ') === npx.title
-      && npxInstallMatch(child, npx, context)) return true;
+  if (npx) {
+    const title = args.replace(/ +$/, '').split(' ');
+    if (!title.some(value => value === '') && title[0] === 'npm' && title[1] === 'exec'
+        && title.slice(2).join(' ') === npx.title && npxInstallMatch(child, npx, context)) return true;
+  }
+  const tokens = args.split(' ');
+  if (tokens.some(value => value === '')) return false;
+  // PATH-resolved launcher: /abs/npm exec @playwright/mcp@latest --headless.
+  if (launcherMatch(entry.command, tokens[0]) && tokens.slice(1).join(' ') === tail) return true;
   // Interpreter-expanded launcher. The interpreter is not free: it must be the one
   // the launcher's shebang names, resolved to the same file, or — for `#!/usr/bin/env
   // NAME` — a command of that name. `/bin/sh /path/server` is a different program.

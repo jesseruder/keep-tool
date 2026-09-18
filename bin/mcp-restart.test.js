@@ -237,6 +237,10 @@ test('an npx-declared server is admitted only as the npx cache install of the de
       'trailing blanks left by a rewritten process title are not part of the command');
     assert.throws(() => check([parent, { ...title, args: 'npm exec @playwright/mcp@latest --headless  x' }, server, browser]), /background/,
       'but only blanks: anything after them is still a different command');
+    assert.throws(() => check([parent, { ...title, args: `${title.args}\t` }, server, browser]), /background/,
+      'and only ASCII spaces, which is what ps prints for the unused buffer');
+    assert.throws(() => check([parent, title, { ...server, args: `${server.args} ` }, browser]), /background/,
+      'the installed bin under the title is matched exactly, trailing blank included');
     assert.throws(() => check([parent, title, server, { ...browser, pidStart: null }]), /background/,
       'a descendant without a captured identity refuses the whole unit');
 
