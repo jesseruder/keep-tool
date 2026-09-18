@@ -46,10 +46,12 @@ Then load the extension:
 3. Click the extension's icon: the popup should say **connected**, and list sessions as
    they attach.
 
-`node bin/install.js --uninstall` removes the manifests and unregisters the MCP servers.
+`node bin/install.js --uninstall` removes both browsers' manifests and unregisters the
+MCP servers.
 
-Re-running the installer after moving the checkout is required: both manifests hold
-absolute paths.
+Re-running the installer after moving the checkout is required: the launcher and the
+manifests hold absolute paths. A re-run unregisters `browser` before registering it
+again, so the new path replaces the old one instead of being refused as a duplicate.
 
 ### Trying it in a throwaway Edge
 

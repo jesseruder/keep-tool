@@ -17,6 +17,21 @@ export class BridgeUnavailableError extends Error {
   }
 }
 
+/**
+ * The connection dropped after the request was already on the wire. The browser may
+ * have carried it out, so replaying it could click, type or run the code twice.
+ */
+export class BridgeInterruptedError extends Error {
+  constructor(method) {
+    super(
+      `The connection to the browser dropped after ${method} was sent, so it may or may not have run. ` +
+        "Take a screenshot or read the page before retrying.",
+    );
+    this.name = "BridgeInterruptedError";
+    this.method = method;
+  }
+}
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class BridgeClient {
@@ -47,7 +62,12 @@ export class BridgeClient {
     if (socket) socket.destroy();
     for (const [, entry] of this.#pending) {
       clearTimeout(entry.timer);
-      entry.reject(error ?? new BridgeUnavailableError("the connection to the host closed"));
+      // A request that never left this process is safe to replay; one that did is not.
+      entry.reject(
+        entry.written && entry.method !== "hello"
+          ? new BridgeInterruptedError(entry.method)
+          : (error ?? new BridgeUnavailableError("the connection to the host closed")),
+      );
     }
     this.#pending.clear();
   }
@@ -136,18 +156,25 @@ export class BridgeClient {
         this.#pending.delete(id);
         reject(new Error(`Timed out after ${REQUEST_TIMEOUT_MS / 1000}s waiting for ${method}`));
       }, REQUEST_TIMEOUT_MS);
-      this.#pending.set(id, { resolve, reject, timer });
+      const entry = { resolve, reject, timer, method, written: false };
+      this.#pending.set(id, entry);
       try {
         this.#socket.write(encodeLine({ id, method, params: params ?? {} }));
+        entry.written = true;
       } catch (error) {
         clearTimeout(timer);
         this.#pending.delete(id);
-        reject(error);
+        // Nothing went out, so this one is safe to retry on a fresh connection.
+        reject(new BridgeUnavailableError(`could not write to the host socket: ${error.message}`));
       }
     });
   }
 
-  /** One retry: the host dies with the service worker, so a stale socket is routine. */
+  /**
+   * One retry, and only when the request never reached the socket: the host dies with
+   * the service worker, so a stale connection is routine, but a request that was already
+   * sent may have clicked something and must not be replayed.
+   */
   async request(method, params, { retry = true } = {}) {
     await this.#ensureConnected();
     try {

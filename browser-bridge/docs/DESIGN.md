@@ -389,6 +389,14 @@ implementer.
   accepts commands from its native port. Page content (text, console, network bodies,
   accessibility names) is untrusted input and the MCP instructions say so.
 - `file_upload` reads paths on this machine; it is limited to regular files under
-  10 MB with a single hard link, matching Claude Code's rules.
+  10 MB with a single hard link, matching Claude Code's rules. Those checks and the
+  browser's own read of the file are not atomic, so a path swapped in between them would
+  be uploaded unchecked; on a single-user machine anything that could win that race can
+  already read the file directly, so the TOCTOU gap is accepted rather than closed.
+- Screenshot ids are scoped to the session that took them: sessions share one service
+  worker, and one session's screenshot is not another's to upload into a page.
+- A socket client may only name a tool method. `session_hello`, `session_closed` and
+  `ping` are the host's to send, so a client cannot rename or evict another session's
+  tab group.
 - No site permission prompts: this is a single-user machine and every session is the
   user's own agent. `blockedHosts` in `config.json` is the one guard rail.

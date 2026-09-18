@@ -54,10 +54,17 @@ export function hostManifest(env = process.env) {
   };
 }
 
+/** POSIX single-quoting: everything is literal except the quote itself. */
+export function shellQuote(value) {
+  return `'${String(value).replaceAll("'", `'\\''`)}'`;
+}
+
 export function launcherScript(nodePath, projectDir = PROJECT_DIR) {
   // Edge launches native hosts with a minimal environment: no PATH, no nvm shims, so
-  // both paths are absolute and there is nothing to resolve at run time.
-  return `#!/bin/sh\nexec ${nodePath} ${path.join(projectDir, "host", "native-host.js")} "$@"\n`;
+  // both paths are absolute and there is nothing to resolve at run time. They are also
+  // quoted: a checkout under a path with a space would otherwise become two arguments.
+  const script = path.join(projectDir, "host", "native-host.js");
+  return `#!/bin/sh\nexec ${shellQuote(nodePath)} ${shellQuote(script)} "$@"\n`;
 }
 
 function which(command) {
@@ -103,7 +110,9 @@ export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) 
 
   if (options.uninstall) {
     removals.push(launcherPath(env));
-    for (const browser of options.browsers) removals.push(hostManifestPath(browser, env));
+    // Always both browsers: an install that once used --chrome-too must not leave
+    // Chrome pointing at a launcher this run is deleting.
+    for (const browser of Object.keys(BROWSER_DIRS)) removals.push(hostManifestPath(browser, env));
   } else {
     files.push({
       path: launcherPath(env),
@@ -121,34 +130,47 @@ export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) 
 
   const claudeBin = which("claude");
   for (const { dir, useEnv } of claudeConfigDirs(env)) {
-    const args = options.uninstall
-      ? ["mcp", "remove", "--scope", "user", "browser"]
-      : ["mcp", "add", "--scope", "user", "browser", "--", nodePath, serverPath];
-    commands.push({
+    // A session started under another config dir inherits CLAUDE_CONFIG_DIR, and the
+    // default registration would land there instead of in ~/.claude.json.
+    const commandEnv = useEnv ? { CLAUDE_CONFIG_DIR: dir } : { CLAUDE_CONFIG_DIR: null };
+    const remove = {
       label: `claude (${path.basename(dir)})`,
       bin: claudeBin,
       name: "claude",
-      args,
-      // A session started under another config dir inherits CLAUDE_CONFIG_DIR, and
-      // the default registration would land there instead of ~/.claude.json.
-      env: useEnv ? { CLAUDE_CONFIG_DIR: dir } : { CLAUDE_CONFIG_DIR: null },
+      args: ["mcp", "remove", "--scope", "user", "browser"],
+      env: commandEnv,
       fallback: claudeFallback(nodePath, serverPath, dir),
-    });
+    };
+    // `mcp add` refuses to overwrite, so reinstalling after a move would keep the old
+    // path. Remove first and ignore the failure when there was nothing registered.
+    commands.push(options.uninstall ? remove : { ...remove, optional: true });
+    if (!options.uninstall) {
+      commands.push({
+        ...remove,
+        args: ["mcp", "add", "--scope", "user", "browser", "--", nodePath, serverPath],
+        optional: false,
+      });
+    }
   }
 
   const codexBin = which("codex") ?? (fs.existsSync(CODEX_FALLBACK) ? CODEX_FALLBACK : null);
   for (const home of codexHomes(env)) {
-    const args = options.uninstall
-      ? ["mcp", "remove", "browser"]
-      : ["mcp", "add", "browser", "--", nodePath, serverPath];
-    commands.push({
+    const remove = {
       label: `codex (${path.basename(home)})`,
       bin: codexBin,
       name: "codex",
-      args,
+      args: ["mcp", "remove", "browser"],
       env: { CODEX_HOME: home },
       fallback: codexFallback(nodePath, serverPath, home),
-    });
+    };
+    commands.push(options.uninstall ? remove : { ...remove, optional: true });
+    if (!options.uninstall) {
+      commands.push({
+        ...remove,
+        args: ["mcp", "add", "browser", "--", nodePath, serverPath],
+        optional: false,
+      });
+    }
   }
 
   return { files, removals, commands, nodePath, serverPath };
@@ -183,7 +205,7 @@ export function renderPlan(plan, options) {
   }
   for (const target of plan.removals) lines.push(`remove ${target}`);
   for (const command of plan.commands) {
-    lines.push(`run  ${describeCommand(command)}`);
+    lines.push(`run  ${describeCommand(command)}${command.optional ? "   (failure ignored)" : ""}`);
     if (!command.bin) lines.push(`     (${command.name} is not on PATH; would print the manual block)`);
   }
   return lines.join("\n");
@@ -207,7 +229,10 @@ function removeFile(target) {
 
 function runCommand(command) {
   if (!command.bin) {
-    process.stdout.write(`${command.name} is not installed; add it by hand:\n${command.fallback}\n\n`);
+    // The manual block is printed once, by the command that would have registered it.
+    if (!command.optional) {
+      process.stdout.write(`${command.name} is not installed; add it by hand:\n${command.fallback}\n\n`);
+    }
     return;
   }
   process.stdout.write(`$ ${describeCommand(command)}\n`);
@@ -217,11 +242,12 @@ function runCommand(command) {
     else env[key] = value;
   }
   const result = spawnSync(command.bin, command.args, { env, stdio: "inherit" });
-  if (result.status !== 0) {
-    process.stdout.write(
-      `${command.label} refused (exit ${result.status}); add it by hand:\n${command.fallback}\n\n`,
-    );
-  }
+  if (result.status === 0) return;
+  // The pre-emptive remove fails whenever nothing was registered, which is the normal case.
+  if (command.optional) return;
+  process.stdout.write(
+    `${command.label} refused (exit ${result.status}); add it by hand:\n${command.fallback}\n\n`,
+  );
 }
 
 const HELP = `Browser Bridge installer

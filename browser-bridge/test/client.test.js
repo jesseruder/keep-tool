@@ -8,7 +8,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { LineDecoder, encodeLine } from "../host/protocol.js";
-import { BridgeClient, BridgeUnavailableError } from "../mcp/client.js";
+import { BridgeClient, BridgeInterruptedError, BridgeUnavailableError } from "../mcp/client.js";
 
 /** A stand-in host: records what it is told, answers what the script says. */
 function scriptedHost(t, handler) {
@@ -87,12 +87,14 @@ test("an error reply becomes a rejected request, not a crash", async (t) => {
   await assert.rejects(() => client.request("read_page", { tabId: 7 }), /No tab with id: 7/);
 });
 
-test("a host that dies mid-session is reconnected and hello is replayed", async (t) => {
+test("a host that dies between requests is reconnected and hello is replayed", async (t) => {
   let dropNext = true;
   const { socketFile, received } = await scriptedHost(t, (message, socket) => {
     if (message.method === "hello") return { id: message.id, ok: true, result: { hello: true } };
     if (dropNext) {
-      // The service worker slept, Edge killed the host, the socket goes away.
+      // The service worker slept, Edge killed the host, the socket goes away. This one
+      // is a read, so replaying it is safe; the client only knows that because the
+      // write never left the process — see the next test for the other case.
       dropNext = false;
       socket.destroy();
       return null;
@@ -103,12 +105,41 @@ test("a host that dies mid-session is reconnected and hello is replayed", async 
   const client = clientFor(socketFile);
   t.after(() => client.close());
 
+  // The first request dies with the connection; the client must not replay it.
+  await assert.rejects(() => client.request("get_page_text", { tabId: 3 }), BridgeInterruptedError);
+  // The next one reconnects, replays hello, and goes through.
   const result = await client.request("get_page_text", { tabId: 3 });
   assert.deepEqual(result, { text: "second host" });
 
   const hellos = received.filter((message) => message.method === "hello");
   assert.equal(hellos.length, 2, "hello must be replayed on the new connection");
   assert.equal(hellos[1].params.sessionKey, "session-key-1234", "the same session key comes back");
+});
+
+test("a request that was already sent is never replayed", async (t) => {
+  const { socketFile, received } = await scriptedHost(t, (message, socket) => {
+    if (message.method === "hello") return { id: message.id, ok: true, result: {} };
+    // Take the request and die without answering: a click may well have happened.
+    socket.destroy();
+    return null;
+  });
+  const client = clientFor(socketFile);
+  t.after(() => client.close());
+
+  await assert.rejects(
+    () => client.request("computer", { action: "left_click", coordinate: [10, 10], tabId: 5 }),
+    (error) => {
+      assert.ok(error instanceof BridgeInterruptedError);
+      assert.match(error.message, /may or may not have run/);
+      assert.match(error.message, /screenshot or read the page/);
+      return true;
+    },
+  );
+  assert.equal(
+    received.filter((message) => message.method === "computer").length,
+    1,
+    "the click must reach the browser at most once",
+  );
 });
 
 test("a retried request is not sent twice to the same host", async (t) => {

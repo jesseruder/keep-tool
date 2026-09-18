@@ -108,6 +108,40 @@ test("the server initializes, lists every tool and errors cleanly with no browse
   assert.equal(call.error, undefined, "a tool failure must not be a protocol error");
 });
 
+test("an input that does not match the advertised schema is refused before the browser", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bb-"));
+  const host = await fakeHost(t, dir, (message) =>
+    message.method === "hello" ? { ok: true, result: {} } : { ok: true, result: { text: "ran" } },
+  );
+
+  const server = startServer(t, dir);
+  await server.request(1, "initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "browser-bridge-test", version: "0" },
+  });
+  server.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+  const bad = await server.request(2, "tools/call", {
+    name: "read_console_messages",
+    arguments: { tabId: 5, clear: "false" },
+  });
+  assert.equal(bad.result.isError, true);
+  assert.match(bad.result.content[0].text, /Invalid input for read_console_messages/);
+  assert.match(bad.result.content[0].text, /clear must be boolean/);
+  assert.equal(
+    host.received.some((message) => message.method === "read_console_messages"),
+    false,
+    "a rejected call must never reach the browser",
+  );
+
+  const good = await server.request(3, "tools/call", {
+    name: "read_console_messages",
+    arguments: { tabId: 5, clear: false },
+  });
+  assert.notEqual(good.result.isError, true);
+});
+
 test("gif_creator answers with a clear not-implemented error", async (t) => {
   const server = startServer(t);
   await server.request(1, "initialize", {

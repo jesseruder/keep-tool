@@ -19,6 +19,7 @@ import { configPath, screenshotsDir, socketPath } from "../host/protocol.js";
 import { isBlocked, normalizeUrl } from "../extension/lib/url.js";
 import { BridgeClient, BridgeUnavailableError } from "./client.js";
 import { PAGE_TOOLS, TOOLS, toolByName } from "./tools.js";
+import { validateToolInput } from "./validate.js";
 
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
 
@@ -128,6 +129,17 @@ const client = new BridgeClient({
 async function runTool(name, rawInput, { insideBatch = false } = {}) {
   const input = rawInput ?? {};
 
+  const definition = toolByName(name);
+  if (!definition) throw new Error(`Unknown tool: ${name}`);
+
+  // Structural, not a schema rule, and worth saying before anything about the arguments.
+  if (name === "browser_batch" && insideBatch) throw new Error("browser_batch cannot be nested");
+
+  // The schemas are advertised, so they are also enforced: a string "false" for a
+  // boolean flag is truthy everywhere downstream and would clear a buffer silently.
+  const invalid = validateToolInput(definition, input);
+  if (invalid) throw new Error(invalid);
+
   if (name === "gif_creator") {
     throw new Error(
       "gif_creator is not implemented yet in Browser Bridge (phase 2). Use the computer tool's screenshot action for stills.",
@@ -140,9 +152,6 @@ async function runTool(name, rawInput, { insideBatch = false } = {}) {
     if (insideBatch) throw new Error("browser_batch cannot be nested");
     return runBatch(input);
   }
-
-  const definition = toolByName(name);
-  if (!definition) throw new Error(`Unknown tool: ${name}`);
 
   const params = { ...input };
 
