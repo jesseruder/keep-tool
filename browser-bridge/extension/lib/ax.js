@@ -173,7 +173,9 @@ export function collectNodes(axNodes, options = {}) {
     if (!node || seen.has(node.nodeId)) return;
     seen.add(node.nodeId);
     const ref = node.backendDOMNodeId != null ? refTable.refFor(node.backendDOMNodeId) : null;
-    const keep = !node.ignored && (filter !== "interactive" || isInteractive(node));
+    // InlineTextBox nodes repeat their StaticText parent line by line: pure noise.
+    const noise = node.ignored || roleOf(node) === "InlineTextBox";
+    const keep = !noise && (filter !== "interactive" || isInteractive(node));
     if (keep) out.push({ depth, ref, node });
     const childDepth = keep ? depth + 1 : depth;
     if (childDepth > maxDepth) return;

@@ -60,10 +60,13 @@ async function handleRequest(message) {
     bridge.send({ id: message.id, ok: false, error: { message: `Unknown method: ${message.method}` } });
     return;
   }
-  const session = message.sessionKey ? await getSession(message.sessionKey) : null;
+  let session = message.sessionKey ? await getSession(message.sessionKey) : null;
+  if (message.sessionKey && message.session?.name && session?.name !== message.session.name) {
+    session = await putSession(message.sessionKey, message.session);
+  }
   const ctx = {
     sessionKey: message.sessionKey,
-    sessionName: session?.name ?? "agent",
+    sessionName: message.session?.name ?? session?.name ?? "agent",
   };
   try {
     const result = await handler(ctx, message.params ?? {});

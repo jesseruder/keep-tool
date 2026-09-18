@@ -14,6 +14,7 @@ import {
   charDescriptor,
   isZoomChord,
   keyDescriptor,
+  macCommands,
   parseChord,
   parseModifiers,
 } from "../lib/keys.js";
@@ -23,6 +24,7 @@ const SCREENSHOT_TTL_MS = 5 * 60 * 1000;
 const MAX_WAIT_SECONDS = 10;
 const SCROLL_PIXELS_PER_TICK = 100;
 const DRAG_STEPS = 10;
+const SCROLL_SETTLE_MS = 250;
 
 const screenshots = new Map();
 let screenshotSeq = 0;
@@ -63,6 +65,12 @@ function clipScaleFor(cssRatio, dpr) {
 }
 
 async function captureClip(tabId, clip) {
+  // Let a pending layout or scroll animation paint before the frame is grabbed.
+  await send(tabId, "Runtime.evaluate", {
+    expression: "new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))",
+    awaitPromise: true,
+    timeout: 1000,
+  }).catch(() => {});
   const response = await send(tabId, "Page.captureScreenshot", {
     format: "png",
     clip,
@@ -173,7 +181,7 @@ const MODIFIER_KEYS = [
   { bit: META, name: "Meta", code: "MetaLeft", keyCode: 91 },
 ];
 
-async function pressChord(tabId, modifiers, descriptor) {
+async function pressChord(tabId, modifiers, descriptor, commands = []) {
   // Hold the real modifier keys too: pages that listen for keydown of "Shift" or read
   // event.metaKey on the modifier itself behave differently otherwise.
   let held = 0;
@@ -193,6 +201,7 @@ async function pressChord(tabId, modifiers, descriptor) {
   await send(tabId, "Input.dispatchKeyEvent", {
     type: descriptor.text ? "keyDown" : "rawKeyDown",
     ...descriptor,
+    ...(commands.length ? { commands } : {}),
   });
   await send(tabId, "Input.dispatchKeyEvent", {
     type: "keyUp",
@@ -356,6 +365,8 @@ export async function computer(ctx, params = {}) {
         modifiers: parsed.modifiers,
         pointerType: "mouse",
       });
+      // Wheel scrolling animates; a screenshot taken straight away sees the old position.
+      await sleep(SCROLL_SETTLE_MS);
       return { text: `Scrolled ${direction} ${ticks} tick(s) (${distance}px) at (${Math.round(point.x)}, ${Math.round(point.y)}).` };
     }
 
@@ -392,7 +403,7 @@ export async function computer(ctx, params = {}) {
         for (const chord of chords) {
           const parsed = parseChord(chord);
           const descriptor = keyDescriptor(parsed.key, parsed.modifiers);
-          await pressChord(tab.id, parsed.modifiers, descriptor);
+          await pressChord(tab.id, parsed.modifiers, descriptor, macCommands(parsed.modifiers, parsed.key));
         }
       }
       return { text: `Pressed ${spec}${repeat > 1 ? ` x${repeat}` : ""} in tab ${tab.id}.` };

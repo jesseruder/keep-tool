@@ -129,7 +129,9 @@ export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) 
       bin: claudeBin,
       name: "claude",
       args,
-      env: useEnv ? { CLAUDE_CONFIG_DIR: dir } : {},
+      // A session started under another config dir inherits CLAUDE_CONFIG_DIR, and
+      // the default registration would land there instead of ~/.claude.json.
+      env: useEnv ? { CLAUDE_CONFIG_DIR: dir } : { CLAUDE_CONFIG_DIR: null },
       fallback: claudeFallback(nodePath, serverPath, dir),
     });
   }
@@ -167,7 +169,7 @@ function codexFallback(nodePath, serverPath, home) {
 
 function describeCommand(command) {
   const prefix = Object.entries(command.env)
-    .map(([key, value]) => `${key}=${value} `)
+    .map(([key, value]) => (value == null ? `unset ${key}; ` : `${key}=${value} `))
     .join("");
   return `${prefix}${command.bin ?? command.name} ${command.args.join(" ")}`;
 }
@@ -209,10 +211,12 @@ function runCommand(command) {
     return;
   }
   process.stdout.write(`$ ${describeCommand(command)}\n`);
-  const result = spawnSync(command.bin, command.args, {
-    env: { ...process.env, ...command.env },
-    stdio: "inherit",
-  });
+  const env = { ...process.env };
+  for (const [key, value] of Object.entries(command.env)) {
+    if (value == null) delete env[key];
+    else env[key] = value;
+  }
+  const result = spawnSync(command.bin, command.args, { env, stdio: "inherit" });
   if (result.status !== 0) {
     process.stdout.write(
       `${command.label} refused (exit ${result.status}); add it by hand:\n${command.fallback}\n\n`,

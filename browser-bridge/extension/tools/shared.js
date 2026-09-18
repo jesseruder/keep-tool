@@ -106,26 +106,13 @@ export async function pointForRef(tabId, ref) {
   }
 
   if (quads && quads.length > 0) {
+    // Verified on Edge 153: the quads are viewport-relative CSS pixels, so after
+    // scrollIntoViewIfNeeded the centre is exactly where Input.dispatchMouseEvent wants it.
     const quad = quads[0];
-    const centre = {
+    return {
       x: (quad[0] + quad[2] + quad[4] + quad[6]) / 4,
       y: (quad[1] + quad[3] + quad[5] + quad[7]) / 4,
     };
-    const metrics = await send(tabId, "Page.getLayoutMetrics").catch(() => null);
-    const visual = metrics?.cssVisualViewport ?? metrics?.visualViewport ?? null;
-    if (visual) {
-      const width = visual.clientWidth ?? 0;
-      const height = visual.clientHeight ?? 0;
-      const shifted = { x: centre.x - (visual.pageX ?? 0), y: centre.y - (visual.pageY ?? 0) };
-      const inside = (point) =>
-        point.x >= 0 && point.y >= 0 && point.x <= width && point.y <= height;
-      // Chromium has reported these quads both viewport-relative and document-relative;
-      // after scrollIntoViewIfNeeded the element is on screen, so trust whichever
-      // candidate lands inside the viewport.
-      if (inside(centre)) return centre;
-      if (inside(shifted)) return shifted;
-    }
-    return centre;
   }
 
   // Fall back to the layout box; a zero-size element genuinely cannot be clicked.

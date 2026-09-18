@@ -40,6 +40,10 @@ export async function javascript_tool(ctx, params = {}) {
   if (!expression.trim()) throw new Error("text is required");
 
   let response;
+  const startedAt = Date.now();
+  // Edge 153 reports a timed-out evaluation as a bare {"code":-32603,"message":"Internal
+  // error"} after the full budget, so the clock is the only reliable tell.
+  const ranOutOfTime = () => Date.now() - startedAt >= TIMEOUT_MS - 1000;
   try {
     // returnByValue is deliberately off: the expression must run exactly once, and a
     // value CDP cannot serialise would otherwise turn into a protocol error.
@@ -53,13 +57,13 @@ export async function javascript_tool(ctx, params = {}) {
     });
   } catch (error) {
     const message = String(error.message ?? error);
-    if (looksLikeTimeout(message)) throw new Error(TIMEOUT_TEXT);
+    if (looksLikeTimeout(message) || ranOutOfTime()) throw new Error(TIMEOUT_TEXT);
     throw new Error(`JavaScript execution error: ${message}`);
   }
 
   if (response.exceptionDetails) {
     const text = errorText(response.exceptionDetails);
-    if (looksLikeTimeout(text)) throw new Error(TIMEOUT_TEXT);
+    if (looksLikeTimeout(text) || ranOutOfTime()) throw new Error(TIMEOUT_TEXT);
     throw new Error(`JavaScript execution error: ${text}`);
   }
 

@@ -138,6 +138,52 @@ export function keyDescriptor(name, modifiers = 0) {
   return event;
 }
 
+// On macOS the browser, not the page, turns cmd chords into editing commands, and
+// CDP's Input.dispatchKeyEvent only performs them when told to via `commands`. Without
+// this, cmd+a reaches the page's keydown handler and then does nothing.
+const MAC_COMMANDS = {
+  "meta+a": ["selectAll"],
+  "meta+c": ["copy"],
+  "meta+v": ["paste"],
+  "meta+x": ["cut"],
+  "meta+z": ["undo"],
+  "meta+shift+z": ["redo"],
+  "meta+arrowleft": ["moveToBeginningOfLine"],
+  "meta+arrowright": ["moveToEndOfLine"],
+  "meta+arrowup": ["moveToBeginningOfDocument"],
+  "meta+arrowdown": ["moveToEndOfDocument"],
+  "meta+shift+arrowleft": ["moveToBeginningOfLineAndModifySelection"],
+  "meta+shift+arrowright": ["moveToEndOfLineAndModifySelection"],
+  "meta+shift+arrowup": ["moveToBeginningOfDocumentAndModifySelection"],
+  "meta+shift+arrowdown": ["moveToEndOfDocumentAndModifySelection"],
+  "meta+backspace": ["deleteToBeginningOfLine"],
+  "meta+delete": ["deleteToEndOfLine"],
+  "alt+arrowleft": ["moveWordLeft"],
+  "alt+arrowright": ["moveWordRight"],
+  "alt+shift+arrowleft": ["moveWordLeftAndModifySelection"],
+  "alt+shift+arrowright": ["moveWordRightAndModifySelection"],
+  "alt+backspace": ["deleteWordBackward"],
+  "alt+delete": ["deleteWordForward"],
+  "shift+arrowleft": ["moveLeftAndModifySelection"],
+  "shift+arrowright": ["moveRightAndModifySelection"],
+  "shift+arrowup": ["moveUpAndModifySelection"],
+  "shift+arrowdown": ["moveDownAndModifySelection"],
+  "shift+home": ["moveToBeginningOfLineAndModifySelection"],
+  "shift+end": ["moveToEndOfLineAndModifySelection"],
+};
+
+/** Editing commands Chromium should run for this chord (macOS semantics), or []. */
+export function macCommands(modifiers, keyName) {
+  const parts = [];
+  if (modifiers & META) parts.push("meta");
+  if (modifiers & ALT) parts.push("alt");
+  if (modifiers & SHIFT) parts.push("shift");
+  const named = NAMED[String(keyName).replace(/[\s_-]/g, "").toLowerCase()];
+  const key = (named ? named.key : String(keyName)).toLowerCase();
+  parts.push(key);
+  return MAC_COMMANDS[parts.join("+")] ?? [];
+}
+
 /** "cmd+shift+a" -> {modifiers, key:"a"}; the last segment is the key. */
 export function parseChord(chord) {
   const text = String(chord);

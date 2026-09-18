@@ -116,7 +116,9 @@ test("the plan writes the launcher and the manifests and registers both CLIs", (
 
   const claude = plan.commands.filter((command) => command.name === "claude");
   assert.equal(claude.length, 2);
-  assert.deepEqual(claude[0].env, {});
+  // The default dir must shed an inherited CLAUDE_CONFIG_DIR, or a session started
+  // under another config dir would register the server there twice.
+  assert.deepEqual(claude[0].env, { CLAUDE_CONFIG_DIR: null });
   assert.deepEqual(claude[0].args.slice(0, 5), ["mcp", "add", "--scope", "user", "browser"]);
   assert.equal(claude[0].args[5], "--");
   assert.equal(claude[0].args[6], process.execPath);

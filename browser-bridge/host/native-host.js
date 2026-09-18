@@ -134,6 +134,9 @@ function forward(client, message) {
   sendToExtension({
     id: wireId,
     sessionKey: client.sessionKey,
+    // Carried on every request: the extension may not have stored session_hello yet
+    // when the first tabs_context_mcp arrives right behind it.
+    session: { name: client.name, agent: client.agent, account: client.account },
     method: message.method,
     params: message.params ?? {},
   });

@@ -10,9 +10,21 @@ import {
   charDescriptor,
   isZoomChord,
   keyDescriptor,
+  macCommands,
   parseChord,
   parseModifiers,
 } from "../extension/lib/keys.js";
+
+test("mac editing chords map to the CDP commands Chromium needs to perform them", () => {
+  assert.deepEqual(macCommands(META, "a"), ["selectAll"]);
+  assert.deepEqual(macCommands(META | SHIFT, "z"), ["redo"]);
+  assert.deepEqual(macCommands(META, "ArrowLeft"), ["moveToBeginningOfLine"]);
+  assert.deepEqual(macCommands(ALT, "Left"), ["moveWordLeft"]);
+  assert.deepEqual(macCommands(SHIFT, "home"), ["moveToBeginningOfLineAndModifySelection"]);
+  assert.deepEqual(macCommands(CTRL, "a"), []);
+  assert.deepEqual(macCommands(0, "a"), []);
+  assert.deepEqual(macCommands(META, "Enter"), []);
+});
 
 test("lowercase letters type themselves with no modifiers", () => {
   const a = charDescriptor("a");

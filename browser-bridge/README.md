@@ -51,6 +51,23 @@ Then load the extension:
 Re-running the installer after moving the checkout is required: both manifests hold
 absolute paths.
 
+### Trying it in a throwaway Edge
+
+Edge 153 ignores `--load-extension`, and load-unpacked cannot be scripted in a running
+browser. For development, launch a second Edge on a scratch profile with the DevTools
+pipe and load the extension over CDP:
+
+```sh
+"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" \
+  --user-data-dir=/tmp/bb-profile --remote-debugging-pipe \
+  --enable-unsafe-extension-debugging --no-first-run about:blank
+# on the pipe (fds 3 and 4): {"id":1,"method":"Extensions.loadUnpacked","params":{"path":".../extension"}}
+```
+
+That profile reads native messaging manifests from its own directory, so copy
+`com.keep.browser_bridge.json` into `/tmp/bb-profile/NativeMessagingHosts/` before the
+extension connects. The real Edge profile reads the one the installer wrote.
+
 ## Using it
 
 Tool names and input schemas match the Claude in Chrome extension, so the habits carry

@@ -278,7 +278,23 @@ after a text block, so both Claude Code and Codex render them.
   extensions may still be installed; they only touch their own tabs, so this is not a
   conflict unless a user hands the same tab to two tools.
 - Coordinates for `Input.*` are CSS pixels relative to the viewport. `DOM.getContentQuads`
-  are also viewport CSS pixels in current Chromium, but verify on a scrolled page.
+  are also viewport CSS pixels (verified on Edge 153 with a ref click 2200 px down a
+  page).
+- `Page.captureScreenshot` `clip` is in document CSS pixels, so a viewport shot passes
+  `x: scrollX, y: scrollY`, and `clip.scale` is multiplied by the device pixel ratio
+  (verified: `scale / dpr` gives a CSS-sized image on a DPR 2 display). A wheel scroll
+  animates, so the tool waits 250 ms after scrolling and two animation frames before
+  every capture; without that the frame is stale.
+- A timed-out `Runtime.evaluate` comes back on Edge 153 as `{"code":-32603,"message":"Internal error"}`
+  after the full budget, not as a named timeout, so the tool uses the clock to decide.
+- macOS editing chords (`cmd+a`, `cmd+z`, `alt+ArrowLeft`, ...) are performed by the
+  browser, not the page: `Input.dispatchKeyEvent` needs the matching `commands` list or
+  the page sees the keydown and nothing happens. `lib/keys.js` carries the table.
+- `DOM.setFileInputFiles` with absolute paths works from an extension's debugger
+  session; `Accessibility.getFullAXTree` includes `InlineTextBox` rows that the renderer
+  drops as noise.
+- Screenshots work on a tab that is active in an unfocused window, so the bridge never
+  focuses a window. A minimized or fully occluded window is untested.
 - The extension must also handle `chrome.tabs.onRemoved` (drop tab state) and
   `chrome.tabGroups.onRemoved` (drop the session's group id).
 
