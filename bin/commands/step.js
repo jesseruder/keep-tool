@@ -487,8 +487,8 @@ async function notifyStepWaiters(registry, name, details) {
     stepRegistry.saveLedger(registry.project, name, latest);
     return latest.waiters.length;
   });
-  // an HTTP answer is the daemon refusing; anything else is the daemon not being there
-  const unreachable = [...failed.values()].filter((waiter) => !/^HTTP \d/.test(String(waiter.lastError || ''))).length;
+  // a 4xx is the daemon refusing; a 5xx or no answer is the daemon (re)starting
+  const unreachable = [...failed.values()].filter((waiter) => !/^HTTP 4/.test(String(waiter.lastError || ''))).length;
   return { waiters: waiters.length, failures: failed.size, unreachable, remaining, message };
 }
 
