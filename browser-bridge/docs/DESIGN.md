@@ -143,11 +143,27 @@ slow). The host answers the client with an error on timeout and drops the late r
   and retry the in-flight request once.
 - The MCP server tells the host `bye` on stdin close or SIGTERM. The extension then
   closes the session's tab group only if every tab in it is a blank new-tab page;
-  otherwise the tabs stay for the user, matching what Claude Code does on exit.
+  otherwise the tabs stay for the user, matching what Claude Code does on exit, and the
+  mapping stays with them under an `ended` flag so the same session key gets its group
+  back instead of opening a second one beside it.
+- Creating, reviving and tearing down a session all run under one promise chain per
+  session key, and teardown re-reads an activity counter after every await: a request
+  that arrives while a `session_closed` is still in flight (a host restart is exactly
+  that) aborts the teardown before any tab is closed or any mapping forgotten.
 - Session state (`sessionKey -> {groupId, windowId, name}`) lives in
-  `chrome.storage.session` so it survives worker restarts. A group the user closed by
-  hand is detected by `chrome.tabGroups.get` failing, and the next
-  `tabs_context_mcp{createIfEmpty:true}` starts fresh.
+  `chrome.storage.session` so it survives worker restarts, and every write to it goes
+  through a single queue: two tools arriving together would otherwise read the same
+  snapshot and lose one another's changes. A group the user closed by hand is detected
+  by `chrome.tabGroups.get` failing, and the next `tabs_context_mcp{createIfEmpty:true}`
+  starts fresh.
+- A tab's debugger state (console and network buffers, the ref table) belongs to the
+  session that claimed it. If the tab changes group — dragged loose, or handed to
+  another session — the debugger is detached and the state dropped rather than inherited
+  by its new owner.
+- A reply the host could never reassemble is never sent: a result over the 16 MiB
+  assembled limit comes back as `result too large (N bytes, limit M)` instead of frames
+  that would be dropped, leaving the caller to wait out its timeout. The host answers
+  the same way if reassembly fails for any other reason.
 
 ## Tools
 

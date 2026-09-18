@@ -2,15 +2,19 @@
 // session -> tab group bookkeeping straight.
 
 import { NativeBridge } from "./lib/native.js";
-import { dropTab, detach, installListeners } from "./lib/cdp.js";
+import { dropTab, detach, installListeners, peekTab } from "./lib/cdp.js";
 import {
+  activityGeneration,
   allSessions,
+  forgetActivity,
   forgetGroup,
   forgetSession,
   getSession,
+  noteActivity,
   putSession,
   reviveSession,
   tabsInGroup,
+  withSessionLock,
 } from "./lib/sessions.js";
 import { handlerFor } from "./tools/index.js";
 
@@ -65,13 +69,20 @@ async function handleRequest(message, generation) {
     reply({ id: message.id, ok: false, error: { message: `Unknown method: ${message.method}` } });
     return;
   }
+  // Mark the session live before anything else: a teardown already under way reads this
+  // and aborts rather than closing tabs this request is about to use.
+  noteActivity(message.sessionKey);
+
   let session = message.sessionKey ? await getSession(message.sessionKey) : null;
   if (message.sessionKey && message.session?.name && session?.name !== message.session.name) {
     session = await putSession(message.sessionKey, message.session);
   }
   if (message.sessionKey && session?.ended && session.groupId != null) {
     // The same session key is back on a new host: take its group out of "(ended)".
-    await reviveSession(message.sessionKey, session.groupId, message.session?.name ?? session.name);
+    // Through the lock, so it cannot overlap a teardown of the same session.
+    await withSessionLock(message.sessionKey, () =>
+      reviveSession(message.sessionKey, session.groupId, message.session?.name ?? session.name),
+    );
     session = await getSession(message.sessionKey);
   }
   const ctx = {
@@ -95,12 +106,28 @@ async function handleRequest(message, generation) {
  * are all blank. Anything the agent actually opened stays for the user to look at, and
  * the mapping stays with it: a host restart brings the same session key back, and it
  * should find its own tabs rather than open a second group beside them.
+ *
+ * Runs under the session's lock, and every await is a chance for that session to come
+ * back: a host restart re-uses the session key, and closing a tab the revived session
+ * has just navigated would be the worst kind of surprise. The generation check is what
+ * turns "the tabs were blank a moment ago" into "they are still blank now".
  */
-async function closeSession(sessionKey) {
-  if (!sessionKey) return;
+function closeSession(sessionKey) {
+  if (!sessionKey) return Promise.resolve();
+  // Read the generation now, not inside the lock: a request delivered while this is
+  // still queued is exactly the case the check exists for.
+  const generation = activityGeneration(sessionKey);
+  return withSessionLock(sessionKey, () => closeSessionOnce(sessionKey, generation));
+}
+
+async function closeSessionOnce(sessionKey, generation) {
+  const cameBack = () => activityGeneration(sessionKey) !== generation;
+
   const session = await getSession(sessionKey);
+  if (cameBack()) return;
   if (session?.groupId == null) {
     await forgetSession(sessionKey);
+    forgetActivity(sessionKey);
     return;
   }
 
@@ -110,14 +137,20 @@ async function closeSession(sessionKey) {
   } catch {
     tabs = [];
   }
+  if (cameBack()) return;
+
   const allBlank = tabs.length > 0 && tabs.every((tab) => BLANK_URLS.has(tab.url ?? ""));
   for (const tab of tabs) {
     await detach(tab.id);
     dropTab(tab.id);
   }
+  // Detaching is harmless if the session came back (the next command re-attaches), but
+  // closing tabs and forgetting the mapping are not.
+  if (cameBack()) return;
 
   if (tabs.length === 0) {
     await forgetSession(sessionKey);
+    forgetActivity(sessionKey);
     return;
   }
   if (allBlank) {
@@ -127,6 +160,7 @@ async function closeSession(sessionKey) {
       console.warn("browser-bridge: could not close the session's blank tabs", error);
     }
     await forgetSession(sessionKey);
+    forgetActivity(sessionKey);
     return;
   }
 
@@ -140,16 +174,28 @@ async function closeSession(sessionKey) {
 
 chrome.tabs.onRemoved.addListener((tabId) => dropTab(tabId));
 
-// A tab dragged out of (or into) a group stops being ours: drop its debugger session and
-// its buffers rather than keeping state for a tab the session can no longer touch.
+/**
+ * A tab that changes group stops being the state we hold for it: dragged out of every
+ * group, or handed to another session. Console history, network history and ref ids all
+ * belong to one session looking at one page, so they go with the tab rather than
+ * following it to its new owner.
+ */
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
   if (changeInfo.groupId === undefined) return;
+  const state = peekTab(tabId);
+  if (!state) return; // nothing of ours to clean up
   try {
-    const store = await allSessions();
-    const ours = Object.values(store).some(
-      (session) => session.groupId != null && session.groupId === changeInfo.groupId,
-    );
-    if (ours) return;
+    if (state.owner) {
+      const session = await getSession(state.owner);
+      // Still in its owner's group (the group id can be re-reported unchanged).
+      if (session?.groupId != null && session.groupId === changeInfo.groupId) return;
+    } else {
+      const store = await allSessions();
+      const ours = Object.values(store).some(
+        (session) => session.groupId != null && session.groupId === changeInfo.groupId,
+      );
+      if (ours) return;
+    }
     await detach(tabId);
     dropTab(tabId);
   } catch (error) {

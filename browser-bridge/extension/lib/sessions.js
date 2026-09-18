@@ -2,6 +2,8 @@
 // a service worker restart (which happens constantly) but not a browser restart (where
 // the tabs are gone anyway).
 
+import { claimTab } from "./cdp.js";
+
 const STORE_KEY = "bridge.sessions";
 const COLOR_KEY = "bridge.colorIndex";
 
@@ -132,25 +134,46 @@ export async function reviveSession(sessionKey, groupId, name) {
   }
 }
 
-// One ensureGroup at a time per session: two tools arriving together would otherwise
-// both find no group and both create one.
-const groupWork = new Map();
+// One piece of lifecycle work at a time per session: creating the group, reviving it
+// and tearing it down all race each other otherwise.
+const sessionWork = new Map();
+
+/** Run `fn` after whatever else is already queued for this session. */
+export function withSessionLock(sessionKey, fn) {
+  const previous = sessionWork.get(sessionKey) ?? Promise.resolve();
+  const run = previous.then(fn, fn);
+  sessionWork.set(sessionKey, run);
+  run.catch(() => {}).then(() => {
+    if (sessionWork.get(sessionKey) === run) sessionWork.delete(sessionKey);
+  });
+  return run;
+}
+
+// Bumped by every request that arrives for a session. Teardown reads it before and
+// after its awaits: if it moved, the session came back and its tabs are in use again.
+const activity = new Map();
+
+export function noteActivity(sessionKey) {
+  if (!sessionKey) return 0;
+  const next = (activity.get(sessionKey) ?? 0) + 1;
+  activity.set(sessionKey, next);
+  return next;
+}
+
+export function activityGeneration(sessionKey) {
+  return activity.get(sessionKey) ?? 0;
+}
+
+export function forgetActivity(sessionKey) {
+  activity.delete(sessionKey);
+}
 
 /**
  * The session's tab group, creating it only when asked. Returns null when there is no
  * live group and createIfEmpty was not set.
  */
 export function ensureGroup(sessionKey, options = {}) {
-  const previous = groupWork.get(sessionKey) ?? Promise.resolve();
-  const run = previous.then(
-    () => ensureGroupOnce(sessionKey, options),
-    () => ensureGroupOnce(sessionKey, options),
-  );
-  groupWork.set(sessionKey, run);
-  run.catch(() => {}).then(() => {
-    if (groupWork.get(sessionKey) === run) groupWork.delete(sessionKey);
-  });
-  return run;
+  return withSessionLock(sessionKey, () => ensureGroupOnce(sessionKey, options));
 }
 
 async function ensureGroupOnce(sessionKey, { name, createIfEmpty = false, newWindow = false } = {}) {
@@ -201,5 +224,8 @@ export async function requireTab(sessionKey, tabId) {
   if (!session || session.groupId == null || tab.groupId !== session.groupId) {
     throw new Error(`Tab ${numeric} is not in the same group`);
   }
+  // Every tab-scoped tool comes through here, so this is where the tab's debugger state
+  // gets its owner and the group it was in at the time.
+  claimTab(numeric, sessionKey, tab.groupId);
   return tab;
 }

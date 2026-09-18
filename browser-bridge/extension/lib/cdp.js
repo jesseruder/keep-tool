@@ -24,9 +24,36 @@ export function stateFor(tabId) {
       refs: new RefTable(),
       origin: null,
       attachedAt: null,
+      // Which session's buffers and refs these are, and the group the tab was in when
+      // that session last touched it.
+      owner: null,
+      groupId: null,
     };
     tabs.set(tabId, state);
   }
+  return state;
+}
+
+/** State without creating any: a tab nobody has touched has nothing to clean up. */
+export function peekTab(tabId) {
+  return tabs.get(tabId) ?? null;
+}
+
+/**
+ * Record who this tab's state belongs to. Console and network history and the ref table
+ * are all scoped to one page seen by one session; handing the tab to another session
+ * means starting over, not inheriting.
+ */
+export function claimTab(tabId, sessionKey, groupId) {
+  const state = stateFor(tabId);
+  if (state.owner !== null && state.owner !== sessionKey) {
+    state.console.length = 0;
+    state.network.length = 0;
+    state.networkById.clear();
+    state.refs.reset();
+  }
+  state.owner = sessionKey ?? null;
+  if (groupId !== undefined) state.groupId = groupId;
   return state;
 }
 
