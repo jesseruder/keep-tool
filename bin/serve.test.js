@@ -6737,6 +6737,33 @@ test('an internal launchEnv reaches the pane shell, and a request body can never
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('a launch names its Browser Bridge tab group after the session number and card', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-open-browser-name-'));
+  try {
+    const project = path.join(root, 'project');
+    fs.mkdirSync(project, { recursive: true });
+    const spawnEnv = async (extra = {}) => {
+      const host = recordingHost((type) => type === 'spawn' ? { pane: { id: 'pane-browser' } } : {});
+      await openSession({ taskId: 'fix-login', fresh: true, agent: 'claude', cwd: project }, {
+        root,
+        host,
+        loadTask: () => ({ fm: { project, sessions: [] } }),
+        randomUUID: () => '55555555-5555-4555-8555-555555555555',
+        waitForHostAgent: async () => true,
+        trustProject: () => true,
+        linkLaunchedSession: () => true,
+        ...extra,
+      });
+      return host.calls.find((call) => call.type === 'spawn').params.env;
+    };
+    // The number is assigned before the spawn, so the name the bridge reads carries it.
+    assert.equal((await spawnEnv()).BROWSER_BRIDGE_SESSION_NAME, '#1 fix-login');
+    // An internal launch that named the browser itself keeps its own name.
+    assert.equal((await spawnEnv({ launchEnv: { BROWSER_BRIDGE_SESSION_NAME: 'bridge tests' } }))
+      .BROWSER_BRIDGE_SESSION_NAME, 'bridge tests');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('a check run goes to the card thread if one is open, and otherwise opens a session', async () => {
   const { runCheckNow } = require('./serve.js');
   const task = { id: 'some-card', fm: { title: 'card', check: 'confirm the recorder is green', check_after: '2020-01-01T00:00' }, body: '' };

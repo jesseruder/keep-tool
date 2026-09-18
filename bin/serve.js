@@ -6020,6 +6020,14 @@ function openedSessionNumber(id, deps = {}) {
   return num ? { num } : {};
 }
 
+// What the Browser Bridge should call the session's browser — and so its Edge tab
+// group: `#12 fix-login`, or whichever half exists. A Codex launch has no session id
+// and hence no number yet, and a session opened outside a card has no card; with
+// neither there is nothing better than the bridge's own `<account> #<pid>` fallback.
+function browserBridgeSessionName(num, card) {
+  return [num ? `#${num}` : '', card ? String(card) : ''].filter(Boolean).join(' ');
+}
+
 function annotationMeta(launchMeta) {
   if (!launchMeta || typeof launchMeta !== 'object') return {};
   return Object.fromEntries(Object.entries(launchMeta).filter(([key]) => !RESERVED_LAUNCH_META.has(key)));
@@ -6327,6 +6335,9 @@ async function openSession(body, deps = {}) {
     if (sessionId && !session) {
       try { sessionNumbers.assign([{ id: sessionId, mtime: launchedAt }], { root: deps.root || keep.ROOT }); } catch {}
     }
+    // Named after the number just assigned and the card, so the session's Edge tab
+    // group is recognisable in the browser.
+    const browserName = browserBridgeSessionName(openedSessionNumber(sessionId, deps).num, body.taskId);
     const commandModel = launchModel || inheritedModel;
     const argv = agent === 'codex'
       ? ['codex', ...codexFlagArgs, ...(commandModel ? ['-m', commandModel] : []), ...(sessionId ? ['resume', sessionId] : [])]
@@ -6346,8 +6357,13 @@ async function openSession(body, deps = {}) {
       cmd: '/bin/zsh',
       args: ['-lic', `exec ${require('./agent-launcher').profileCommand(argv, account)}`],
       // A resume of a recorded repair session re-earns the marker; a fresh launch
-      // carries it in deps.launchEnv, which the scheduler passes.
-      env: require('./agent-launcher').launcherEnv({ ...repairEnvFor({ sessionId }, deps), ...deps.launchEnv }),
+      // carries it in deps.launchEnv, which the scheduler passes — and an internal
+      // launch that named the browser itself keeps its own name.
+      env: require('./agent-launcher').launcherEnv({
+        ...repairEnvFor({ sessionId }, deps),
+        ...(browserName ? { BROWSER_BRIDGE_SESSION_NAME: browserName } : {}),
+        ...deps.launchEnv,
+      }),
       cwd: project,
       cols: 200,
       rows: 50,
