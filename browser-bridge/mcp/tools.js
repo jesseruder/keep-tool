@@ -127,7 +127,7 @@ export const TOOLS = [
   {
     name: "find",
     description:
-      'Find elements on the page using natural language. Can search for elements by their purpose (e.g., "search bar", "login button") or by text content (e.g., "organic mango product"). Ranking is lexical, not a model: the query is tokenized and scored against each element\'s name, role, value and description. Returns up to 20 matching elements with references that can be used with other tools. If more than 20 matches exist, you\'ll be notified to use a more specific query. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',
+      'Find elements on the page using natural language. Can search for elements by their purpose (e.g., "search bar", "login button") or by text content (e.g., "organic mango product"). Ranking is lexical, not a model: the query is tokenized and scored against each element\'s name, role, value and description, with light stemming ("products" finds "product"), a synonym table ("basket" finds "cart", "picker" finds a combobox) and fuzzy matching for prefixes and typos. An exact match always outranks a stem, a synonym or a near miss. Returns up to 20 matching elements with references that can be used with other tools. If more than 20 matches exist, you\'ll be notified to use a more specific query. If you don\'t have a valid tab ID, use tabs_context_mcp first to get available tabs.',
     inputSchema: {
       type: "object",
       properties: {

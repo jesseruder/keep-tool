@@ -89,8 +89,9 @@ Worth knowing:
 
 - `read_page` renders the accessibility tree with `ref_N` ids; those refs stay valid for
   the same page and are reset when the main frame navigates.
-- `find` ranks lexically — tokens matched against name, role, value and description. It
-  is a heuristic, not a model.
+- `find` ranks lexically — tokens matched against name, role, value and description, with
+  stemming, a synonym table (`basket` finds `cart`, `picker` finds a combobox) and typo
+  tolerance. It is a heuristic, not a model, and an exact match always wins.
 - `computer` screenshots come back as an MCP image block at viewport CSS size × `scale`,
   and the text block states both the image size and the viewport size. Coordinates are
   always CSS pixels.

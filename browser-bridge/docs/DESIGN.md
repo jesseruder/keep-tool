@@ -215,7 +215,16 @@ Result shapes:
   words in the query such as "button", "link", "input", "search" match the role), return
   up to 20 as `[ref] role "name"` lines, best first. State in the description that
   the ranking is lexical, not a model. More than 20 hits: return the top 20 and say to
-  narrow the query.
+  narrow the query. A token matches in one of four ways, scored in that order: exact,
+  stemmed (crude suffix stripping with the "e" put back, so "saved" meets "Save"),
+  synonym (a table of the words models actually use: search/find, login/sign in,
+  cart/basket, delete/remove, settings/preferences, ...) and fuzzy (a prefix, or a
+  Damerau-Levenshtein distance of 1 for tokens of 5 characters and 2 for 8). The role
+  table is reached through the same four, so "picker" and "buton" still name a role.
+  Two-word forms ("sign in", "e-mail") are folded into one token on both sides, since
+  the "in" would otherwise be dropped as a stopword. A node matched *only* by fuzzy
+  tokens needs at least half the query's tokens to hit, so "chart" in a longer query
+  does not drag in "cart".
 - `form_input`: `DOM.resolveNode{backendNodeId}` then `Runtime.callFunctionOn` with a
   function that sets checkboxes and radios by `checked`, selects by option value or
   text, inputs and textareas through the prototype value setter (so React and Vue see
@@ -436,7 +445,6 @@ implementer.
 
 ## Phase 2
 
-- `find` ranking quality: add synonyms and fuzzy matching once real use shows the gaps.
 - Cross-origin iframe support in `read_page` via `Target.setAutoAttach` sessions.
 - Keep integration: `keep open` sets `BROWSER_BRIDGE_SESSION_NAME` to the session
   number and card so tab groups read `#12 fix-login`.
