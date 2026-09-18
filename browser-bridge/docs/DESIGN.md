@@ -531,10 +531,25 @@ needs no private key. The id is a constant in `host/protocol.js` and the install
 Live verification against Edge is done from the driving session, not by the
 implementer.
 
-## Phase 2
+## Keep integration
 
-- Keep integration: `keep open` sets `BROWSER_BRIDGE_SESSION_NAME` to the session
-  number and card so tab groups read `#12 fix-login`.
+`keep open` sets `BROWSER_BRIDGE_SESSION_NAME` in the pane environment to `#<num> <card>`
+(either half alone when only one exists), so a session's tab group reads `#12 fix-login`.
+An explicit value in the launch environment wins.
+
+## Known gaps
+
+- Console and network events from out-of-process iframes are dropped; only the page's own
+  frames reach `read_console_messages` and `read_network_requests`.
+- `get_page_text` and `javascript_tool` see the main frame only.
+- `gif_creator`'s `coordinate` export and `upload_image`'s coordinate mode hit-test the
+  main frame, so a drop zone inside a cross-origin iframe cannot be targeted.
+- A window resized mid-recording makes later frames a different size; they are scaled into
+  the first frame's canvas rather than letterboxed.
+- One MCP server process per agent session: every Claude and Codex session spawns one at
+  startup whether or not it touches the browser (35 processes, 828 MB resident on
+  2026-09-18). The planned fix is one shared streamable-HTTP daemon on loopback, with the
+  session name carried in a header (Claude Code `headersHelper`, Codex `env_http_headers`).
 
 ## Security notes
 
