@@ -36,16 +36,23 @@ function pruneScreenshots() {
   }
 }
 
-/** Used by upload_image; ids expire, which the tool description warns about. */
-export function getScreenshot(id) {
+/**
+ * Used by upload_image. Ids expire, which the tool description warns about, and they
+ * belong to the session that took them: sessions share this worker, and one session's
+ * screenshot is not another's to upload into a page.
+ */
+export function getScreenshot(id, sessionKey) {
   pruneScreenshots();
-  return screenshots.get(String(id)) ?? null;
+  const entry = screenshots.get(String(id));
+  if (!entry) return { entry: null, reason: "missing" };
+  if (entry.sessionKey !== sessionKey) return { entry: null, reason: "foreign" };
+  return { entry, reason: null };
 }
 
-function rememberScreenshot(data) {
+function rememberScreenshot(sessionKey, data) {
   pruneScreenshots();
   const id = `ss_${++screenshotSeq}`;
-  screenshots.set(id, { data, mimeType: "image/png", at: Date.now() });
+  screenshots.set(id, { data, mimeType: "image/png", at: Date.now(), sessionKey });
   return id;
 }
 
@@ -80,7 +87,7 @@ async function captureClip(tabId, clip) {
   return response.data;
 }
 
-async function screenshotAction(tabId, params, view) {
+async function screenshotAction(ctx, tabId, params, view) {
   const scale = clampScale(params.scale ?? 1);
   const clip = {
     x: view.scrollX,
@@ -92,7 +99,7 @@ async function screenshotAction(tabId, params, view) {
   const data = await captureClip(tabId, clip);
   const imageWidth = Math.round(view.width * scale);
   const imageHeight = Math.round(view.height * scale);
-  const imageId = rememberScreenshot(data);
+  const imageId = rememberScreenshot(ctx.sessionKey, data);
   const scaleNote = scale === 1 ? "" : ` (scaled by ${scale}; coordinates stay in the full-resolution frame)`;
   return {
     text:
@@ -103,7 +110,7 @@ async function screenshotAction(tabId, params, view) {
   };
 }
 
-async function zoomAction(tabId, params, view) {
+async function zoomAction(ctx, tabId, params, view) {
   const region = params.region;
   if (!Array.isArray(region) || region.length !== 4) {
     throw new Error("region [x0, y0, x1, y1] is required for the zoom action");
@@ -128,7 +135,7 @@ async function zoomAction(tabId, params, view) {
     scale: clipScaleFor(cssRatio, view.dpr),
   };
   const data = await captureClip(tabId, clip);
-  const imageId = rememberScreenshot(data);
+  const imageId = rememberScreenshot(ctx.sessionKey, data);
   return {
     text:
       `Zoom of tab ${tabId} region (${Math.min(x0, x1)}, ${Math.min(y0, y1)}) ` +
@@ -276,16 +283,16 @@ export async function computer(ctx, params = {}) {
 
   switch (action) {
     case "screenshot":
-      return screenshotAction(tab.id, params, view);
+      return screenshotAction(ctx, tab.id, params, view);
 
     case "zoom":
-      return zoomAction(tab.id, params, view);
+      return zoomAction(ctx, tab.id, params, view);
 
     case "wait": {
       const duration = Math.min(MAX_WAIT_SECONDS, Math.max(0, Number(params.duration ?? 0)));
       if (!Number.isFinite(duration)) throw new Error("duration must be a number of seconds");
       await sleep(duration * 1000);
-      const shot = await screenshotAction(tab.id, params, await viewport(tab.id));
+      const shot = await screenshotAction(ctx, tab.id, params, await viewport(tab.id));
       return { ...shot, text: `Waited ${duration}s. ${shot.text}` };
     }
 

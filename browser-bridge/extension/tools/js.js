@@ -4,6 +4,8 @@ import { send } from "../lib/cdp.js";
 import { requireTab } from "../lib/sessions.js";
 
 const TIMEOUT_MS = 30_000;
+/** The result is already in hand by then; only the page's own getters can be slow. */
+const SERIALIZER_TIMEOUT_MS = 5_000;
 const TIMEOUT_TEXT = "JavaScript execution error: Execution timeout: Code exceeded 30-second limit";
 
 // Runs in the page against the result object; returns JSON text, or null when the value
@@ -77,14 +79,25 @@ export async function javascript_tool(ctx, params = {}) {
 
   let serialized = null;
   try {
-    const call = await send(tab.id, "Runtime.callFunctionOn", {
-      objectId: result.objectId,
-      functionDeclaration: SERIALIZER,
-      returnByValue: true,
-      awaitPromise: false,
-    });
+    // JSON.stringify runs the page's own toJSON and getters, which can loop forever.
+    // Runtime.evaluate's timeout does not cover callFunctionOn, so time it ourselves and
+    // cut the page off rather than hanging the whole bridge request.
+    const call = await Promise.race([
+      send(tab.id, "Runtime.callFunctionOn", {
+        objectId: result.objectId,
+        functionDeclaration: SERIALIZER,
+        returnByValue: true,
+        awaitPromise: false,
+      }),
+      new Promise((_resolve, reject) =>
+        setTimeout(() => reject(new Error("serializer timed out")), SERIALIZER_TIMEOUT_MS),
+      ),
+    ]);
     serialized = call?.result?.value ?? null;
-  } catch {
+  } catch (error) {
+    if (/serializer timed out/.test(String(error?.message))) {
+      await send(tab.id, "Runtime.terminateExecution").catch(() => {});
+    }
     serialized = null;
   } finally {
     await send(tab.id, "Runtime.releaseObject", { objectId: result.objectId }).catch(() => {});

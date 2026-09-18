@@ -51,7 +51,12 @@ async function callInPage(tabId, fn, args) {
 export async function upload_image(ctx, params = {}) {
   const tab = await requireTab(ctx.sessionKey, params.tabId);
   const imageId = String(params.imageId ?? "");
-  const stored = getScreenshot(imageId);
+  const { entry: stored, reason } = getScreenshot(imageId, ctx.sessionKey);
+  if (reason === "foreign") {
+    throw new Error(
+      `Screenshot ${imageId} belongs to another session. Take your own screenshot with the computer tool and upload that.`,
+    );
+  }
   if (!stored) {
     throw new Error(
       `No screenshot with id ${imageId || "(none)"}. Ids expire five minutes after capture and are lost if the extension's worker restarted: take a fresh screenshot and upload that.`,
