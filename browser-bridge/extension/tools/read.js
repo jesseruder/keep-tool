@@ -1,23 +1,39 @@
 // read_page, find and get_page_text: everything that turns a page into text.
 
-import { countIframes, renderAxTree } from "../lib/ax.js";
-import { refTable, send } from "../lib/cdp.js";
+import { renderAxTree } from "../lib/ax.js";
+import { refTable } from "../lib/cdp.js";
 import { extractPageText, source } from "../lib/page.js";
 import { findElements, renderMatches } from "../lib/find.js";
 import { requireTab } from "../lib/sessions.js";
+import { fullAxTree } from "./axtree.js";
 import { evaluate } from "./shared.js";
 
 const DEFAULT_MAX_CHARS = 50_000;
 const PAGE_TEXT_MAX_CHARS = 60_000;
 
-async function fullAxTree(tabId) {
-  const response = await send(tabId, "Accessibility.getFullAXTree", {});
-  return response?.nodes ?? [];
+/** What to tell the model about the cross-origin frames on this page. */
+function frameNotes(tree) {
+  const notes = [];
+  if (tree.frames > 0) {
+    notes.push(
+      `Includes the content of ${tree.frames} cross-origin iframe(s); their elements have refs like any other.`,
+    );
+  }
+  if (tree.unplaced.length > 0) {
+    notes.push(
+      `${tree.unplaced.length} cross-origin iframe(s) are attached but their iframe element could not be located, so their content is not shown.`,
+    );
+  }
+  if (tree.errors.length > 0) {
+    notes.push(`Could not read ${tree.errors.length} iframe(s): ${tree.errors.join("; ")}`);
+  }
+  return notes;
 }
 
 export async function read_page(ctx, params = {}) {
   const tab = await requireTab(ctx.sessionKey, params.tabId);
-  const nodes = await fullAxTree(tab.id);
+  const tree = await fullAxTree(tab.id);
+  const nodes = tree.nodes;
   const rendered = renderAxTree(nodes, {
     filter: params.filter === "interactive" ? "interactive" : "all",
     maxDepth: Number.isFinite(params.depth) ? Number(params.depth) : 15,
@@ -33,12 +49,7 @@ export async function read_page(ctx, params = {}) {
       `Truncated: showed ${rendered.keptLines} of ${rendered.lineCount} lines (${rendered.text.length} of ${rendered.fullLength} characters). Pass a larger max_chars, or narrow with depth or ref_id.`,
     );
   }
-  const iframes = countIframes(nodes);
-  if (iframes > 0) {
-    notes.push(
-      `This page has ${iframes} iframe(s). Content inside cross-origin iframes is not included (phase 1 limitation).`,
-    );
-  }
+  notes.push(...frameNotes(tree));
   const header = `${tab.url}\n${tab.title ?? ""}`.trim();
   return { text: [header, rendered.text, ...notes].filter(Boolean).join("\n\n") };
 }
@@ -47,9 +58,16 @@ export async function find(ctx, params = {}) {
   const tab = await requireTab(ctx.sessionKey, params.tabId);
   const query = String(params.query ?? "").trim();
   if (!query) throw new Error("query is required");
-  const nodes = await fullAxTree(tab.id);
-  const result = findElements(nodes, query, { refTable: refTable(tab.id) });
-  return { text: `Matches for ${JSON.stringify(query)} on ${tab.url}:\n${renderMatches(result)}` };
+  const tree = await fullAxTree(tab.id);
+  const result = findElements(tree.nodes, query, { refTable: refTable(tab.id) });
+  const notes = frameNotes(tree);
+  return {
+    text: [
+      `Matches for ${JSON.stringify(query)} on ${tab.url}:`,
+      renderMatches(result),
+      ...notes,
+    ].join("\n"),
+  };
 }
 
 export async function get_page_text(ctx, params = {}) {

@@ -71,12 +71,14 @@ browser-bridge/
     lib/keys.js             key name -> CDP key event table (pure, testable)
     lib/ax.js               accessibility tree -> text with refs (pure, testable)
     lib/find.js             heuristic element search over the AX tree (pure, testable)
+    lib/frames.js           splice out-of-process iframe AX trees into the page's (pure)
     lib/page.js             functions serialized into the page via Runtime.callFunctionOn
     lib/gifframes.js        gif_creator's labels, delays, caps, quality mapping (pure)
     lib/gifstore.js         gif_creator's frames in IndexedDB, keyed by tab group
     lib/gifencode.js        OffscreenCanvas overlays + gifenc encoding, in the worker
     lib/vendor/gifenc.js    vendored MIT GIF encoder (mattdesl/gifenc), not an npm dep
     tools/*.js              one module per tool
+    tools/axtree.js         one AX tree per tab, iframe sessions and all
     popup.html, popup.js    status: connected?, sessions, groups, reconnect button
   host/
     native-host.js          the broker (entry; the native host manifest points at a launcher that execs it)
@@ -207,9 +209,11 @@ Result shapes:
   are skipped but their children kept. `filter:"interactive"` keeps buttons, links,
   text inputs, checkboxes, radios, comboboxes, options, menu items, tabs, switches,
   sliders, spin buttons, and anything focusable. `depth` and `ref_id` narrow the tree;
-  `max_chars` truncates at a line boundary with a note giving the full size. Cross-origin
-  iframes are out of scope for phase 1; say so in a trailing note when the page has
-  any.
+  `max_chars` truncates at a line boundary with a note giving the full size.
+  Out-of-process iframes are included: their trees come from their own auto-attached
+  sessions and are spliced under the iframe element that hosts them (see "Cross-origin
+  iframes" below), with a trailing note saying how many were folded in, and another for
+  any that could not be read or placed.
 - `find`: heuristic over the same tree. Tokenize the query, score each node on name,
   role, value and description matches (exact phrase > all tokens > some tokens; role
   words in the query such as "button", "link", "input", "search" match the role), return
@@ -365,6 +369,41 @@ after a text block, so both Claude Code and Codex render them.
 - The extension must also handle `chrome.tabs.onRemoved` (drop tab state) and
   `chrome.tabGroups.onRemoved` (drop the session's group id).
 
+## Cross-origin iframes
+
+An out-of-process iframe is a separate renderer, so the tab's own CDP session cannot see
+into it: `Accessibility.getFullAXTree` stops at the frame boundary (same-process frames
+come along, which is why a payment form on the same origin always worked).
+
+- `lib/cdp.js` sends `Target.setAutoAttach {autoAttach:true, waitForDebuggerOnStart:false,
+  flatten:true}` right after attaching a tab. Every OOPIF, existing and future, then
+  reports itself as `Target.attachedToTarget` on the same port with a child `sessionId`.
+  Commands are addressed to it by passing `{tabId, sessionId}` to
+  `chrome.debugger.sendCommand`, and its events arrive with `source.sessionId`, which is
+  how the console and network handlers know to ignore them: those buffers stay the main
+  session's, as they always were.
+- Only `type: "iframe"` targets are kept (workers auto-attach too and have no tree). For
+  an iframe target the `targetId` *is* the frame id, which is the hook for splicing.
+- `tools/axtree.js` reads the main tree plus one tree per attached frame session, asks
+  `DOM.describeNode` for the frame id behind each iframe AX node (cached per document,
+  cleared on main-frame navigation), and hands `lib/frames.js` the pieces. That module is
+  pure: it namespaces each child tree's node ids (`sessionId::nodeId` — every tree numbers
+  from 1), stamps each node with its session, and hangs the child roots off the hosting
+  iframe node, in passes so an iframe inside an iframe lands under its own parent. A frame
+  whose host element cannot be found is reported rather than dropped.
+- Refs therefore map to `{sessionId, backendNodeId}`: a backend node id is only unique
+  within one session. `computer` ref clicks, hover, `scroll_to`, `form_input`,
+  `file_upload` and `upload_image` all send their DOM commands to the ref's session, while
+  mouse and key input keep going through the main session. `DOM.getContentQuads` from a
+  child session reports the main frame's viewport coordinates, so no translation is
+  needed; that assumption lives alone in `frameQuadToMainViewport` in `tools/shared.js`
+  with a comment, so a live check that disagrees has one place to fix. The
+  `getBoundingClientRect` fallback is refused for a framed ref, because that *is* frame
+  relative.
+- Refs still reset on main-frame navigation. `Target.detachedFromTarget` marks that
+  session's refs detached, so using one says the iframe went away and to read the page
+  again, rather than "unknown ref".
+
 ## MCP server
 
 - Entry `mcp/server.js`, stdio transport from `@modelcontextprotocol/sdk`. Server name
@@ -431,6 +470,11 @@ needs no private key. The id is a constant in `host/protocol.js` and the install
   `browser_status`; every input schema is valid JSON schema with the same properties.
 - `test/keys.test.js`, `test/ax.test.js`, `test/find.test.js`: the pure modules, with a
   fixture AX tree captured from a real page (a small hand-written one is fine).
+- `test/frames.test.js`: the splice as a pure function (namespacing, nesting, an
+  unplaceable frame), then read_page, find and the ref-based tools against a stubbed CDP
+  that answers a different tree per session: a page with no OOPIF must take exactly the
+  path it always took, a framed ref must send its DOM commands to the frame and its mouse
+  events to the page, and a detached frame must invalidate its refs with a clear error.
 - `test/gif.test.js`: labels, delays, caps and the quality mapping directly; the store
   against an in-memory backend (`setGifBackend`); the tool and the recorder against a
   stubbed `chrome`; and the encoder against a stubbed `OffscreenCanvas`, which records
@@ -445,7 +489,6 @@ implementer.
 
 ## Phase 2
 
-- Cross-origin iframe support in `read_page` via `Target.setAutoAttach` sessions.
 - Keep integration: `keep open` sets `BROWSER_BRIDGE_SESSION_NAME` to the session
   number and card so tab groups read `#12 fix-login`.
 

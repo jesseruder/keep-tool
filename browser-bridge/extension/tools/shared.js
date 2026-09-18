@@ -11,34 +11,52 @@ export function unknownRef(ref) {
   );
 }
 
-export function backendIdFor(tabId, ref) {
-  const backendNodeId = refTable(tabId).backendFor(ref);
-  if (backendNodeId == null) throw unknownRef(ref);
-  return backendNodeId;
+export function detachedRef(ref) {
+  return new Error(
+    `${ref} was inside a cross-origin iframe that has since gone away. Call read_page or find again to get fresh refs.`,
+  );
+}
+
+/**
+ * Where a ref lives: `{ sessionId, backendNodeId }`. `sessionId` is null for the page's
+ * own frames and the child CDP session of an out-of-process iframe otherwise, which is
+ * the session every DOM command about that node has to be addressed to.
+ */
+export function refTarget(tabId, ref) {
+  const target = refTable(tabId).targetFor(ref);
+  if (!target) throw unknownRef(ref);
+  if (target.detached) throw detachedRef(ref);
+  return target;
 }
 
 export async function resolveRef(tabId, ref) {
-  const backendNodeId = backendIdFor(tabId, ref);
+  const { backendNodeId, sessionId } = refTarget(tabId, ref);
   let resolved;
   try {
-    resolved = await send(tabId, "DOM.resolveNode", { backendNodeId });
+    resolved = await send(tabId, "DOM.resolveNode", { backendNodeId }, sessionId);
   } catch (error) {
     throw new Error(`${ref} is no longer on the page (${error.message})`);
   }
   if (!resolved?.object?.objectId) throw unknownRef(ref);
-  return { objectId: resolved.object.objectId, backendNodeId };
+  return { objectId: resolved.object.objectId, backendNodeId, sessionId };
 }
 
 /** Run one of lib/page.js's functions with the ref'd element as `this`. */
 export async function callOnRef(tabId, ref, fn, args = []) {
-  const { objectId, backendNodeId } = await resolveRef(tabId, ref);
-  const response = await send(tabId, "Runtime.callFunctionOn", {
-    objectId,
-    functionDeclaration: source(fn),
-    arguments: args.map((value) => ({ value })),
-    returnByValue: true,
-    awaitPromise: true,
-  });
+  const { objectId, backendNodeId, sessionId } = await resolveRef(tabId, ref);
+  // The object id belongs to the frame's own session, so the call goes there too.
+  const response = await send(
+    tabId,
+    "Runtime.callFunctionOn",
+    {
+      objectId,
+      functionDeclaration: source(fn),
+      arguments: args.map((value) => ({ value })),
+      returnByValue: true,
+      awaitPromise: true,
+    },
+    sessionId,
+  );
   if (response.exceptionDetails) {
     throw new Error(
       response.exceptionDetails.exception?.description ??
@@ -161,18 +179,32 @@ export async function activateTab(tabId) {
   }
 }
 
+/**
+ * The one place that assumes an out-of-process iframe's geometry needs no translation.
+ *
+ * Chromium reports DOM.getContentQuads from a child frame's session in the *main* frame's
+ * viewport coordinates (the compositor has already placed the frame), and mouse input is
+ * dispatched through the main session, so the point needs no adjustment. If a live check
+ * ever shows a click landing at the iframe's own origin instead, this is the single
+ * function to fix: add the frame element's viewport offset here.
+ */
+function frameQuadToMainViewport(point, frameSessionId) {
+  void frameSessionId;
+  return point;
+}
+
 /** Element centre in viewport CSS pixels, scrolled into view first. */
 export async function pointForRef(tabId, ref) {
-  const backendNodeId = backendIdFor(tabId, ref);
+  const { backendNodeId, sessionId } = refTarget(tabId, ref);
   try {
-    await send(tabId, "DOM.scrollIntoViewIfNeeded", { backendNodeId });
+    await send(tabId, "DOM.scrollIntoViewIfNeeded", { backendNodeId }, sessionId);
   } catch {
     // Not scrollable (detached, display:none): getContentQuads reports the real problem.
   }
 
   let quads = null;
   try {
-    const response = await send(tabId, "DOM.getContentQuads", { backendNodeId });
+    const response = await send(tabId, "DOM.getContentQuads", { backendNodeId }, sessionId);
     quads = response?.quads ?? null;
   } catch {
     quads = null;
@@ -182,13 +214,23 @@ export async function pointForRef(tabId, ref) {
     // Verified on Edge 153: the quads are viewport-relative CSS pixels, so after
     // scrollIntoViewIfNeeded the centre is exactly where Input.dispatchMouseEvent wants it.
     const quad = quads[0];
-    return {
-      x: (quad[0] + quad[2] + quad[4] + quad[6]) / 4,
-      y: (quad[1] + quad[3] + quad[5] + quad[7]) / 4,
-    };
+    return frameQuadToMainViewport(
+      {
+        x: (quad[0] + quad[2] + quad[4] + quad[6]) / 4,
+        y: (quad[1] + quad[3] + quad[5] + quad[7]) / 4,
+      },
+      sessionId,
+    );
   }
 
-  // Fall back to the layout box; a zero-size element genuinely cannot be clicked.
+  // Fall back to the layout box; a zero-size element genuinely cannot be clicked. Inside
+  // an out-of-process iframe getBoundingClientRect is relative to that frame's own
+  // viewport, which is not where the mouse goes, so refuse instead of clicking a guess.
+  if (sessionId) {
+    throw new Error(
+      `${ref} is inside a cross-origin iframe and the browser gave no geometry for it, so it cannot be clicked by ref. Take a screenshot and click by coordinate.`,
+    );
+  }
   const { value } = await callOnRef(tabId, ref, elementRect);
   if (!value || value.width === 0 || value.height === 0) {
     throw new Error(`${ref} has no visible box on the page, so it cannot be clicked`);

@@ -8,7 +8,7 @@
 //
 // Pure, so the tests can score a captured tree without a browser.
 
-import { RefTable, isInteractive, nameOf, roleOf, valueOf } from "./ax.js";
+import { RefTable, isInteractive, nameOf, roleOf, sessionOf, valueOf } from "./ax.js";
 
 const STOPWORDS = new Set([
   "the", "a", "an", "of", "for", "to", "in", "on", "at", "with", "that", "this", "my", "please",
@@ -384,7 +384,7 @@ export function findElements(axNodes, query, options = {}) {
   const tokens = tokenize(query);
 
   for (const node of axNodes) {
-    if (node.backendDOMNodeId != null) refTable.refFor(node.backendDOMNodeId);
+    if (node.backendDOMNodeId != null) refTable.refFor(node.backendDOMNodeId, sessionOf(node));
   }
 
   const scored = [];
@@ -394,7 +394,7 @@ export function findElements(axNodes, query, options = {}) {
     scored.push({
       score,
       index,
-      ref: refTable.refFor(node.backendDOMNodeId),
+      ref: refTable.refFor(node.backendDOMNodeId, sessionOf(node)),
       role: roleOf(node) || "node",
       name: nameOf(node),
       value: valueOf(node),

@@ -4,7 +4,6 @@ import test from "node:test";
 import {
   RefTable,
   collectNodes,
-  countIframes,
   describeNode,
   isInteractive,
   renderAxTree,
@@ -100,11 +99,6 @@ test("max_chars truncates at a line boundary and reports the full size", () => {
   assert.ok(cut.keptLines < cut.lineCount);
   assert.equal(cut.text.endsWith("\n"), false, "no dangling partial line");
   assert.ok(full.text.startsWith(cut.text));
-});
-
-test("iframes are counted so the caller can warn about them", () => {
-  assert.equal(countIframes(AX_TREE), 1);
-  assert.equal(countIframes([]), 0);
 });
 
 test("collectNodes returns the nodes it rendered with their depths", () => {

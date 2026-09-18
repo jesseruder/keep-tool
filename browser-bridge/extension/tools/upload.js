@@ -3,7 +3,7 @@
 import { send } from "../lib/cdp.js";
 import { requireTab } from "../lib/sessions.js";
 import { attachImageToInput } from "../lib/page.js";
-import { backendIdFor, callOnRef, dropFileAtCoordinate } from "./shared.js";
+import { callOnRef, dropFileAtCoordinate, refTarget } from "./shared.js";
 import { getScreenshot } from "./computer.js";
 
 export async function file_upload(ctx, params = {}) {
@@ -13,9 +13,10 @@ export async function file_upload(ctx, params = {}) {
   const paths = Array.isArray(params.paths) ? params.paths.map(String) : [];
   if (paths.length === 0) throw new Error("paths is required: give absolute paths on this machine");
 
-  const backendNodeId = backendIdFor(tab.id, ref);
+  // A file input inside a cross-origin iframe is set through that frame's own session.
+  const { backendNodeId, sessionId } = refTarget(tab.id, ref);
   try {
-    await send(tab.id, "DOM.setFileInputFiles", { files: paths, backendNodeId });
+    await send(tab.id, "DOM.setFileInputFiles", { files: paths, backendNodeId }, sessionId);
   } catch (error) {
     throw new Error(`Could not set files on ${ref}: ${error.message}. Is it an <input type="file">?`);
   }

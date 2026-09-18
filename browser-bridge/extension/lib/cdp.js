@@ -1,6 +1,11 @@
 // chrome.debugger plumbing: attach per tab, send CDP commands, and keep the console and
 // network buffers the read_* tools serve.
 //
+// Attaching also turns on flattened auto-attach, so every out-of-process iframe on the
+// tab gets a child CDP session of its own. Those sessions are what read_page and find
+// use to reach cross-origin frame content, and commands are addressed to them by passing
+// `{ tabId, sessionId }` to chrome.debugger.sendCommand.
+//
 // Everything here is in-memory. A service worker restart loses the buffers; the tools
 // say so rather than pretending the page was quiet.
 
@@ -10,6 +15,10 @@ const PROTOCOL_VERSION = "1.3";
 const MAX_CONSOLE = 2000;
 const MAX_NETWORK = 2000;
 const DOMAINS = ["Runtime", "Log", "Network", "Page", "DOM", "Accessibility"];
+// A child iframe session only has to answer questions about its own DOM: console,
+// network and log events keep coming from the main session alone, so the buffers the
+// read_* tools serve do not change shape.
+const FRAME_DOMAINS = ["DOM", "Accessibility"];
 
 const attached = new Set();
 const tabs = new Map(); // tabId -> tab state
@@ -31,6 +40,17 @@ export function stateFor(tabId) {
       // Bumped on every claim, so a cleanup that awaited can tell a reclaim apart from
       // the state it decided to drop, even when the owner is the same session.
       claimSeq: 0,
+      // Out-of-process iframes: frameId -> sessionId and back. For an iframe target the
+      // targetId *is* the frame id, which is what lets a tree be spliced under the right
+      // iframe node.
+      frameSessions: new Map(),
+      sessionFrames: new Map(),
+      // Which child sessions already have their domains enabled.
+      frameDomains: new Set(),
+      // frameId -> { sessionId, backendNodeId } of the iframe element that hosts it,
+      // learned from DOM.describeNode. Backend node ids are stable within a document, so
+      // this is cached until the main frame navigates.
+      frameOwners: new Map(),
     };
     tabs.set(tabId, state);
   }
@@ -78,8 +98,13 @@ export function attachedTabs() {
   return [...attached];
 }
 
-export async function sendRaw(tabId, method, params = {}) {
-  return chrome.debugger.sendCommand({ tabId }, method, params);
+/**
+ * `sessionId` addresses a flattened child session (an out-of-process iframe) instead of
+ * the tab's own session.
+ */
+export async function sendRaw(tabId, method, params = {}, sessionId = null) {
+  const target = sessionId ? { tabId, sessionId } : { tabId };
+  return chrome.debugger.sendCommand(target, method, params);
 }
 
 export async function attach(tabId) {
@@ -115,6 +140,48 @@ export async function attach(tabId) {
   } catch (error) {
     console.warn(`browser-bridge: focus emulation failed on tab ${tabId}`, error);
   }
+  // Flattened auto-attach: every out-of-process iframe already on the page, and every
+  // one created later, reports itself through Target.attachedToTarget with its own
+  // sessionId on this same port. Without it the accessibility tree stops at the frame
+  // boundary. waitForDebuggerOnStart would pause each new frame until we resumed it,
+  // which is not worth the risk of a missed resume hanging a page.
+  try {
+    await sendRaw(tabId, "Target.setAutoAttach", {
+      autoAttach: true,
+      waitForDebuggerOnStart: false,
+      flatten: true,
+    });
+  } catch (error) {
+    // An old browser, or a target that has no children: cross-origin frames are then
+    // simply missing from read_page, which says so.
+    console.warn(`browser-bridge: auto-attach failed on tab ${tabId}`, error);
+  }
+}
+
+/** Turn on the domains a child iframe session needs, once per session. */
+export async function ensureFrameDomains(tabId, sessionId) {
+  const state = stateFor(tabId);
+  if (state.frameDomains.has(sessionId)) return;
+  state.frameDomains.add(sessionId);
+  for (const domain of FRAME_DOMAINS) {
+    try {
+      await sendRaw(tabId, `${domain}.enable`, {}, sessionId);
+    } catch (error) {
+      console.warn(`browser-bridge: ${domain}.enable failed on frame session ${sessionId}`, error);
+    }
+  }
+}
+
+/** The tab's attached out-of-process iframe sessions, in attach order. */
+export function frameSessions(tabId) {
+  const state = peekTab(tabId);
+  if (!state) return [];
+  return [...state.frameSessions].map(([frameId, sessionId]) => ({ frameId, sessionId }));
+}
+
+/** The cache of iframe-element -> frame id lookups for this tab's current document. */
+export function frameOwners(tabId) {
+  return stateFor(tabId).frameOwners;
 }
 
 export async function detach(tabId) {
@@ -128,13 +195,20 @@ export async function detach(tabId) {
 }
 
 /** Attach on demand and retry once if the debugger was detached under us. */
-export async function send(tabId, method, params = {}) {
+export async function send(tabId, method, params = {}, sessionId = null) {
   await attach(tabId);
   try {
-    return await sendRaw(tabId, method, params);
+    return await sendRaw(tabId, method, params, sessionId);
   } catch (error) {
     const message = String(error?.message ?? error);
     if (/not attached|Detached|target closed/i.test(message)) {
+      if (sessionId) {
+        // Re-attaching the tab would give the iframe a *new* session id, so the refs
+        // pointing into this one are gone either way. Say so instead of retrying.
+        throw new Error(
+          `${method} failed: the cross-origin iframe session ${sessionId} is gone (${message}). Call read_page or find again.`,
+        );
+      }
       attached.delete(tabId);
       await attach(tabId);
       return await sendRaw(tabId, method, params);
@@ -176,6 +250,38 @@ function handleEvent(source, method, params) {
   const tabId = source.tabId;
   if (tabId == null) return;
   const state = stateFor(tabId);
+
+  // Target.* is how the tab learns about its out-of-process iframes.
+  if (method === "Target.attachedToTarget") {
+    const info = params.targetInfo ?? {};
+    // Workers, service workers and the like also auto-attach; only frames have an
+    // accessibility tree worth splicing, and for a frame target the targetId is the
+    // frame id.
+    if (info.type !== "iframe" || !params.sessionId || !info.targetId) return;
+    state.frameSessions.set(info.targetId, params.sessionId);
+    state.sessionFrames.set(params.sessionId, info.targetId);
+    return;
+  }
+  if (method === "Target.detachedFromTarget") {
+    const sessionId = params.sessionId;
+    if (!sessionId) return;
+    const frameId = state.sessionFrames.get(sessionId);
+    state.sessionFrames.delete(sessionId);
+    state.frameDomains.delete(sessionId);
+    if (frameId != null) {
+      state.frameSessions.delete(frameId);
+      state.frameOwners.delete(frameId);
+    }
+    // Refs that pointed into that frame cannot be resolved any more; they are kept as
+    // known-but-detached so the error names the reason instead of "unknown ref".
+    state.refs.invalidateSession(sessionId);
+    return;
+  }
+
+  // Everything below is about the page the session owns. An event from a child iframe
+  // session carries its sessionId, and its console, network and navigation belong to
+  // that frame, not to the tab's buffers.
+  if (source.sessionId) return;
 
   switch (method) {
     case "Runtime.consoleAPICalled": {
@@ -257,8 +363,10 @@ function handleEvent(source, method, params) {
     }
     case "Page.frameNavigated": {
       if (params.frame?.parentId) break; // subframe: refs and buffers still apply
-      // Backend node ids do not survive a document swap.
+      // Backend node ids do not survive a document swap, and neither do the iframe
+      // elements the frame trees were spliced under.
       state.refs.reset();
+      state.frameOwners.clear();
       const origin = originOf(params.frame?.url ?? "");
       if (origin && state.origin && origin !== state.origin) {
         state.console.length = 0;

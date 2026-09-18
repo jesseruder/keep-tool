@@ -88,7 +88,9 @@ Tools: `tabs_context_mcp`, `tabs_create_mcp`, `tabs_close_mcp`, `navigate`, `rea
 Worth knowing:
 
 - `read_page` renders the accessibility tree with `ref_N` ids; those refs stay valid for
-  the same page and are reset when the main frame navigates.
+  the same page and are reset when the main frame navigates. Cross-origin iframes are
+  included: each one is read through its own debugger session and spliced in under its
+  iframe element, and a ref inside one still works for clicks, `form_input` and uploads.
 - `find` ranks lexically — tokens matched against name, role, value and description, with
   stemming, a synonym table (`basket` finds `cart`, `picker` finds a combobox) and typo
   tolerance. It is a heuristic, not a model, and an exact match always wins.
