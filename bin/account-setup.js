@@ -476,22 +476,49 @@ function missingPlugins(account) {
   return Object.keys(sourceRecords).filter((id) => userEntry(sourceRecords, id) && !userEntry(targetRecords, id)).sort();
 }
 
+// Runtime markers Claude keeps beside a cache version for the sessions of the profile
+// that owns it; a copy starts without them.
+const PLUGIN_RUNTIME_MARKERS = new Set(['.in_use', '.orphaned_at']);
+
+// `targetRoot` is `<target>/plugins/<kind>` spelled from the target's physical path, so
+// a symlinked plugins, cache or marketplaces directory, or any symlinked parent below
+// it, resolves elsewhere and is refused before anything is staged or accepted.
 function copyPluginDir(sourceRoot, targetRoot, relative) {
   const destination = path.join(targetRoot, relative);
-  if (pathExists(destination)) return destination;
   fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
+  if (!canonical(path.dirname(destination)).startsWith(targetRoot + path.sep) && canonical(path.dirname(destination)) !== targetRoot) {
+    throw new Error(`${relative} resolves outside the target profile`);
+  }
+  const existing = fs.lstatSync(destination, { throwIfNoEntry: false });
+  if (existing) {
+    if (!existing.isDirectory()) throw new Error(`target ${relative} exists and is not a directory`);
+    return destination;
+  }
   const stage = fs.mkdtempSync(path.join(path.dirname(destination), `.${path.basename(destination)}.copy-`));
+  const from = path.join(sourceRoot, relative);
   try {
-    fs.cpSync(path.join(sourceRoot, relative), path.join(stage, 'plugin'), { recursive: true, verbatimSymlinks: true });
+    fs.cpSync(from, path.join(stage, 'plugin'), { recursive: true, verbatimSymlinks: true,
+      filter: (file) => !(path.dirname(file) === from && PLUGIN_RUNTIME_MARKERS.has(path.basename(file))) });
     fs.renameSync(path.join(stage, 'plugin'), destination);
   } finally { fs.rmSync(stage, { recursive: true, force: true }); }
   return destination;
 }
 
-function writeJSONAtomic(file, value) {
-  const temporary = `${file}.tmp.${process.pid}.${crypto.randomBytes(8).toString('hex')}`;
-  fs.writeFileSync(temporary, JSON.stringify(value, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
-  fs.renameSync(temporary, file);
+// Read-modify-write of a JSON file a running Claude may also write. `update` gets the
+// current value and returns the value to write, or null for no change. The rename only
+// lands if the file is still the one that was read; otherwise it reads again.
+function updateJSON(file, fallback, update) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const before = fileIdentity(file);
+    const next = update(readJSON(file, fallback));
+    if (next == null) return;
+    const temporary = `${file}.tmp.${process.pid}.${crypto.randomBytes(8).toString('hex')}`;
+    fs.writeFileSync(temporary, JSON.stringify(next, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+    if (!sameFileIdentity(before, fileIdentity(file))) { fs.unlinkSync(temporary); continue; }
+    fs.renameSync(temporary, file);
+    return;
+  }
+  throw new Error(`${file} kept changing while updating it`);
 }
 
 function insideDirectory(file, root) {
@@ -508,7 +535,15 @@ function syncMarketplaces(source, targetDir, ids) {
   const targetRoot = path.join(targetDir, 'plugins', 'marketplaces');
   const unavailable = new Map(), additions = {};
   for (const name of new Set(ids.map((id) => id.slice(id.lastIndexOf('@') + 1)))) {
-    if (targetKnown[name]) continue;
+    if (targetKnown[name]) {
+      // The target's own marketplace is kept as it is, but a record whose clone is gone
+      // would make Claude reject every plugin from it.
+      const own = targetKnown[name].installLocation;
+      if (typeof own !== 'string' || !fs.statSync(own, { throwIfNoEntry: false })?.isDirectory()) {
+        unavailable.set(name, `the target's marketplace ${name} has no clone at its recorded location`);
+      }
+      continue;
+    }
     const entry = sourceKnown[name];
     const location = entry?.installLocation ? canonical(entry.installLocation) : '';
     if (!insideDirectory(location, sourceRoot)) { unavailable.set(name, `marketplace ${name} is not cloned in the source profile`); continue; }
@@ -516,10 +551,10 @@ function syncMarketplaces(source, targetDir, ids) {
     catch (error) { unavailable.set(name, error.message); }
   }
   if (Object.keys(additions).length) {
-    // Re-read just before writing so a marketplace Claude recorded meanwhile is kept.
-    const current = readJSON(knownFile(targetDir), {});
-    for (const [name, entry] of Object.entries(additions)) if (!current[name]) current[name] = entry;
-    writeJSONAtomic(knownFile(targetDir), current);
+    updateJSON(knownFile(targetDir), {}, (current) => {
+      for (const [name, entry] of Object.entries(additions)) if (!current[name]) current[name] = entry;
+      return current;
+    });
   }
   return unavailable;
 }
@@ -532,6 +567,11 @@ function syncPlugins(account) {
   const targetCache = path.join(canonical(account.configDir), 'plugins', 'cache');
   const sourceRecords = pluginRecords(source);
   const missing = missingPlugins(account);
+  for (const relative of ['plugins', 'plugins/cache', 'plugins/marketplaces']) {
+    if (fs.lstatSync(path.join(canonical(account.configDir), relative), { throwIfNoEntry: false })?.isSymbolicLink()) {
+      throw new Error(`target ${relative} is a symlink; Keep copies plugins only into the profile's own directory`);
+    }
+  }
   fs.mkdirSync(path.join(account.configDir, 'plugins'), { recursive: true, mode: 0o700 });
   const unavailable = syncMarketplaces(source, canonical(account.configDir), missing);
   const additions = {};
@@ -550,16 +590,16 @@ function syncPlugins(account) {
     } catch (error) { failed.push({ id, error: error.message }); }
   }
   if (Object.keys(additions).length) {
-    // Re-read just before writing so a record Claude added meanwhile is kept.
-    const file = path.join(account.configDir, 'plugins', 'installed_plugins.json');
-    const state = readJSON(file, { version: 2, plugins: {} });
-    const plugins = state.plugins && typeof state.plugins === 'object' && !Array.isArray(state.plugins) ? state.plugins : {};
-    for (const [id, entry] of Object.entries(additions)) {
-      if (userEntry(plugins, id)) continue;
-      plugins[id] = [...(Array.isArray(plugins[id]) ? plugins[id] : []), entry];
-      installed.push(id);
-    }
-    writeJSONAtomic(file, { ...state, version: state.version || 2, plugins });
+    updateJSON(path.join(account.configDir, 'plugins', 'installed_plugins.json'), { version: 2, plugins: {} }, (state) => {
+      const plugins = state.plugins && typeof state.plugins === 'object' && !Array.isArray(state.plugins) ? state.plugins : {};
+      installed.length = 0;
+      for (const [id, entry] of Object.entries(additions)) {
+        if (userEntry(plugins, id)) continue;
+        plugins[id] = [...(Array.isArray(plugins[id]) ? plugins[id] : []), entry];
+        installed.push(id);
+      }
+      return installed.length ? { ...state, version: state.version || 2, plugins } : null;
+    });
   }
   return { installed, failed };
 }

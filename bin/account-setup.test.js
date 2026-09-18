@@ -595,3 +595,46 @@ test('setup installs the source profile user-scope plugins the target lacks', ()
     assert.deepEqual(setup.syncPlugins(f.target).installed, [], 'a rerun copies nothing new');
   } finally { f.cleanup(); }
 });
+
+test('plugin copy skips runtime markers and refuses targets it cannot trust', () => {
+  const f = fixture();
+  try {
+    const relative = path.join('market', 'tool', '1.0.0');
+    const sourceCache = path.join(f.sourceDir, 'plugins', 'cache', relative);
+    const sourceMarket = path.join(f.sourceDir, 'plugins', 'marketplaces', 'market');
+    fs.mkdirSync(path.join(sourceCache, 'skills'), { recursive: true });
+    fs.mkdirSync(sourceMarket, { recursive: true });
+    for (const name of ['.in_use', '.orphaned_at', 'README.md', path.join('skills', '.in_use')]) fs.writeFileSync(path.join(sourceCache, name), name);
+    fs.writeFileSync(path.join(f.sourceDir, 'plugins', 'installed_plugins.json'), JSON.stringify({ version: 2, plugins: {
+      'tool@market': [{ scope: 'user', installPath: sourceCache }] } }));
+    fs.writeFileSync(path.join(f.sourceDir, 'plugins', 'known_marketplaces.json'), JSON.stringify({ market: { installLocation: sourceMarket } }));
+    setup.shareSetup(f.source, f.target);
+    const targetPlugins = path.join(f.targetDir, 'plugins');
+    const targetCache = path.join(targetPlugins, 'cache', relative);
+
+    // A destination that exists but is not a directory is reported, not recorded.
+    fs.mkdirSync(path.dirname(targetCache), { recursive: true });
+    fs.writeFileSync(targetCache, 'not a plugin');
+    assert.match(setup.syncPlugins(f.target).failed[0].error, /exists and is not a directory/);
+    assert.deepEqual(setup.missingPlugins(f.target), ['tool@market']);
+    fs.rmSync(targetCache);
+
+    // A symlinked cache directory would send the copy outside the profile.
+    const elsewhere = path.join(f.root, 'elsewhere');
+    fs.mkdirSync(elsewhere);
+    fs.rmSync(path.join(targetPlugins, 'cache'), { recursive: true });
+    fs.symlinkSync(elsewhere, path.join(targetPlugins, 'cache'));
+    assert.throws(() => setup.syncPlugins(f.target), /plugins\/cache is a symlink/);
+    assert.deepEqual(fs.readdirSync(elsewhere), []);
+    fs.unlinkSync(path.join(targetPlugins, 'cache'));
+
+    // A marketplace the target already records, with its clone gone, blocks its plugins.
+    fs.writeFileSync(path.join(targetPlugins, 'known_marketplaces.json'), JSON.stringify({ market: { installLocation: path.join(f.root, 'gone') } }));
+    assert.match(setup.syncPlugins(f.target).failed[0].error, /has no clone/);
+    fs.rmSync(path.join(targetPlugins, 'known_marketplaces.json'));
+
+    assert.deepEqual(setup.syncPlugins(f.target), { installed: ['tool@market'], failed: [] });
+    assert.deepEqual(fs.readdirSync(targetCache).sort(), ['README.md', 'skills']);
+    assert.deepEqual(fs.readdirSync(path.join(targetCache, 'skills')), ['.in_use'], 'only the top-level markers are runtime state');
+  } finally { f.cleanup(); }
+});
