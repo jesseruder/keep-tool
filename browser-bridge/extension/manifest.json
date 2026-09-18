@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "Browser Bridge",
+  "version": "0.1.0",
+  "description": "Lets local agent sessions drive this browser through a native messaging host. One tab group per session.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtAJWdp/oCTpkW7DYUbLGiOsu7LM0BpqVumqStVRdKpPfbMEZHFNIr8KwGbU+KJsOZeNT5sdWPECqJYaf+v/BOAAkLNmkWJT9pyQ2NCmnykB/gI/2TW2wwVEi9Kq5Y0NiPmZdwzLGcwvnKg/6kMFgcZm4uO9AUlMFWkvduFRftc6EO63Qbd0L6f2y/2emZttS4edJ0J7T9C1HU8ZoIxOLS+0NAM4jaNpwBBLMZoBW8QjnGhEVu4FLWko5EgM/YrxjfLbLLRzzxc03gs0tHbdAYsBUwaFt3L3QjaCEdmZV6Uda9o05qAxm8YBFuLiEpIbFU6czMw8vYV99Qn1ES95c4QIDAQAB",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "tabGroups",
+    "nativeMessaging",
+    "storage",
+    "alarms",
+    "scripting",
+    "downloads"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Browser Bridge",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

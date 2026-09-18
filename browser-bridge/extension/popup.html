@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Browser Bridge</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --ok: #1a7f37;
+        --bad: #c0392b;
+      }
+      body {
+        font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        margin: 0;
+        padding: 12px 14px;
+        width: 300px;
+      }
+      h1 {
+        font-size: 14px;
+        margin: 0 0 8px;
+      }
+      .state {
+        font-weight: 600;
+      }
+      .state.connected {
+        color: var(--ok);
+      }
+      .state.disconnected {
+        color: var(--bad);
+      }
+      ul {
+        list-style: none;
+        margin: 8px 0 0;
+        padding: 0;
+      }
+      li {
+        border-top: 1px solid rgba(128, 128, 128, 0.3);
+        padding: 6px 0;
+      }
+      .muted {
+        opacity: 0.65;
+      }
+      button {
+        margin-top: 10px;
+        width: 100%;
+        padding: 6px;
+        font: inherit;
+      }
+      code {
+        font-size: 11px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Browser Bridge <span class="muted" id="version"></span></h1>
+    <div>Native host: <span class="state" id="state">checking…</span></div>
+    <div class="muted" id="detail"></div>
+    <ul id="sessions"></ul>
+    <button id="reconnect">Reconnect</button>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
