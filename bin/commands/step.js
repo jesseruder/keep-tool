@@ -424,7 +424,8 @@ async function stepRun(argv) {
   }
   console.log(`step ${name} completed from ${sha.slice(0, 7)}${artifact ? ` — artifact ${artifact}` : ' — no artifact found'}; log: ${logFile}`);
   await finalizeStep(registry, name, step, {
-    sha, artifact, runId, expectedClaimId: claim && claim.id || '',
+    // a daemon deploy moved the checkout; finalizeStep reads where it ended up
+    sha: step.since === 'daemon' ? undefined : sha, artifact, runId, expectedClaimId: claim && claim.id || '',
   });
 }
 
@@ -512,7 +513,10 @@ async function finalizeStep(registry, name, step, options = {}) {
     }
     const prior = [...ledger.runs].reverse().find((entry) => entry.status === 'done' && (!run || entry.id !== run.id));
     const branch = stepRegistry.defaultBranch(registry.project);
-    const sha = resolveLocalSha(registry.project, options.sha || run && run.sha || `origin/${branch}`);
+    // A daemon deploy is recorded at what the main checkout holds after it ran:
+    // the run started from whatever the caller had checked out, which the pull moved on.
+    const deployed = step.since === 'daemon' && !options.sha ? 'HEAD' : '';
+    const sha = resolveLocalSha(registry.project, options.sha || deployed || run && run.sha || `origin/${branch}`);
     if (step.from === 'landed') {
       try { gitAt(stepRegistry.expandProject(registry.project), ['merge-base', '--is-ancestor', sha, `origin/${branch}`]); }
       catch { die(`${sha.slice(0, 7)} is not an ancestor of origin/${branch}; landed steps must complete from a landed revision`); }

@@ -345,3 +345,18 @@ test('disabled integrations stay out of health attention and resume health track
     assert.equal(health.snapshot(later).schedulers.find((row) => row.name === name).disabled, false);
   }
 });
+
+test('a daemon start records the commit it loaded, and the status line shows it', () => {
+  const { root, health } = fixture();
+  const code = health.codeCommit();
+  assert.match(code.commit, /^[0-9a-f]{40}$/);
+  assert.equal(fs.realpathSync(code.checkout), fs.realpathSync(path.join(__dirname, '..')));
+  health.record('daemon', { at: Date.now() - 60e3, pid: process.pid, ...code });
+  const raw = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'health.json'), 'utf8'));
+  assert.equal(raw.daemon.commit, code.commit);
+  assert.match(health.render(health.snapshot()), new RegExp(`running \\(pid ${process.pid}, uptime \\S+, code ${code.commit.slice(0, 7)}\\)`));
+  // A later start with no commit to report does not keep the stale one.
+  health.record('daemon', { at: Date.now(), pid: process.pid });
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, '.keep', 'health.json'), 'utf8')).daemon.commit, undefined);
+  assert.deepEqual(health.codeCommit(root), { commit: '', checkout: '' });
+});

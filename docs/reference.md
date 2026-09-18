@@ -1801,6 +1801,34 @@ credited with, and contributes nothing to the touched directories in `keep steps
 is for state a run writes back itself — the tfstate commit that follows every Terraform
 apply is the reason the flag exists.
 
+`"since": "daemon"` measures pending work from the commit the running Keep daemon
+loaded (recorded in `health.json` at start, shown by `keep health` as `code <sha>`)
+instead of from the step's last recorded run, so a deploy by `wt land` or by hand clears
+it as well. A run of such a step is recorded at the main checkout's HEAD after the
+command, since the command is what moved it. `"guard": false` keeps the claim as a lane
+to queue in without the pre-bash guard refusing the command outside it. keep-tool's own
+deploy is registered this way on a host (`~/keep/steps/keep-tool.json`):
+
+```json
+{
+  "project": "~/castle/keep-tool",
+  "steps": {
+    "deploy": {
+      "title": "Deploy keep-tool to the running daemon",
+      "from": "any",
+      "since": "daemon",
+      "guard": false,
+      "command": "git -C ~/castle/keep-tool pull --ff-only && keep restart-daemon",
+      "defaultHold": "+15m"
+    }
+  }
+}
+```
+
+`keep steps keep-tool` and every session start in the checkout then say how far behind
+origin the running daemon is and who holds the deploy. A self-repair session may not
+`keep step run`: the command runs out of its guard's sight.
+
 Long messages injected into sessions are typed in paced chunks and, for Claude
 sessions, verified against the transcript after submit; truncated delivery is logged.
 

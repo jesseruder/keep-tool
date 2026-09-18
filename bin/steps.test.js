@@ -1105,6 +1105,9 @@ test('the pre-bash guard keeps a self-repair run off the daemon and out of the m
     'git push origin +HEAD:master',
     'wt land',
     '~/bin/wt land --no-push',
+    // keep-tool's deploy step is a pull and a restart, run where this guard cannot see it.
+    'keep step run ~/castle/keep-tool deploy',
+    'keep step run keep-tool deploy --sha HEAD',
     `bash -lc "keep restart-daemon"`,
     'cd /tmp && keep restart-daemon',
     'npm test && keep restart-daemon',
@@ -1117,6 +1120,7 @@ test('the pre-bash guard keeps a self-repair run off the daemon and out of the m
     'keep reviewed some-card --commit origin/master..HEAD --verdict clean',
     'keep allow some-card land',
     'keep health --json',
+    'keep steps keep-tool',
     'echo "keep restart-daemon"',
     'grep -rn "launchctl" bin',
     // Reading the endpoint out of the source is exactly what diagnosis looks like.
@@ -1210,6 +1214,7 @@ test('once the repair card\'s fix is on origin/master the session may pull the l
     `git -C ${main} checkout master`,
     `cd ${main} && git pull`,
     'git push --force origin HEAD:master',
+    'keep step run keep-tool deploy',
     'wt land',
     // Nothing may ride along with either of the two. An assignment redirects the
     // pull's remote or points core.hooksPath at a script; a node flag preloads
@@ -1272,4 +1277,61 @@ test('once the repair card\'s fix is on origin/master the session may pull the l
     { tool_name: 'Bash', cwd: worktree, tool_input: { command: 'keep restart-daemon' } },
     { KEEP_REPAIR: '1', CLAUDE_CODE_SESSION_ID: 'repair-run' }, landed);
   assert.equal(fromEnv.deny, false);
+});
+
+test('a since-daemon step counts pending commits from the running daemon, not from its ledger', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-steps-daemon-'));
+  try {
+    initKeepRoot(root);
+    const repo = initProject(root);
+    const project = fs.realpathSync(repo.project);
+    const deploy = { title: 'Deploy', from: 'any', since: 'daemon', guard: false, command: 'true' };
+    fs.writeFileSync(path.join(root, 'steps', 'project.json'), JSON.stringify({ project, steps: { deploy } }, null, 2));
+    fs.mkdirSync(path.join(root, '.keep'), { recursive: true });
+    const recordDaemon = (commit) => fs.writeFileSync(path.join(root, '.keep', 'health.json'),
+      JSON.stringify({ daemon: { startedAt: 1, pid: 1, commit, checkout: project } }));
+    const status = () => JSON.parse(cli(root, project, '', ['steps', project, '--json']).stdout).steps[0];
+
+    // The daemon loaded the first commit; the second is on origin but not running.
+    recordDaemon(repo.first);
+    let row = status();
+    assert.equal(row.daemon.commit, repo.first);
+    assert.deepEqual(row.pending.map((commit) => commit.subject), ['second']);
+    assert.match(row.line, new RegExp(`the running daemon \\(${repo.first.slice(0, 7)}\\) is 1 landed commit behind origin/main`));
+
+    // A deploy that never went through the step (wt land, by hand) still clears it.
+    recordDaemon(repo.second);
+    row = status();
+    assert.equal(row.pending.length, 0);
+    assert.match(row.line, /has everything on origin\/main/);
+
+    // Nothing gates the command itself.
+    assert.deepEqual(stepFingerprints(deploy), []);
+    assert.equal(matchStepCommand('true', { steps: { deploy } }), null);
+
+    // With no commit recorded (a daemon from before it was), it falls back to the ledger.
+    fs.writeFileSync(path.join(root, '.keep', 'health.json'), JSON.stringify({ daemon: { startedAt: 1, pid: 1 } }));
+    row = status();
+    assert.equal(row.daemon, null);
+    assert.match(row.line, /never recorded/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a since-daemon run is recorded at what the main checkout holds after the command', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-steps-daemon-run-'));
+  try {
+    initKeepRoot(root);
+    const repo = initProject(root);
+    const project = fs.realpathSync(repo.project);
+    git(project, 'reset', '-q', '--hard', repo.first);
+    // The step's command is the pull: the run starts at `first` and ends at `second`.
+    const deploy = { from: 'any', since: 'daemon', guard: false, defaultHold: '+15m', command: `git -C '${project}' pull -q --ff-only` };
+    fs.writeFileSync(path.join(root, 'steps', 'project.json'), JSON.stringify({ project, steps: { deploy } }, null, 2));
+    assert.equal(cli(root, project, 'deployer', ['step', 'claim', project, 'deploy', '-m', 'deploy']).status, 0);
+    const run = cli(root, project, 'deployer', ['step', 'run', project, 'deploy']);
+    assert.equal(run.status, 0, run.stderr);
+    const ledger = loadLedger(project, 'deploy', root);
+    assert.equal(ledger.runs.at(-1).status, 'done');
+    assert.equal(ledger.runs.at(-1).sha, repo.second);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

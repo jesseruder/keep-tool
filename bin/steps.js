@@ -55,7 +55,11 @@ function loadSteps(project) {
 // What a step's command looks like when run by hand: the registry's `guard`
 // patterns, or the mutating tail of `command` (terraform apply, build_packer_image.sh).
 // A session that runs one of these outside `keep step run` leaves the ledger stale.
+// `"guard": false` opts a step out: its claim is a lane to queue in, not a gate on
+// the command (keep-tool's deploy ends in `keep restart-daemon`, which the repair
+// recipe and keep-ops run on their own terms).
 function stepFingerprints(step) {
+  if (step && step.guard === false) return [];
   if (step && Array.isArray(step.guard) && step.guard.length) return step.guard.map(String).filter(Boolean);
   const segments = String(step && step.command || '').split(/&&|\|\||[;|]/)
     .map((segment) => segment.trim())
@@ -701,6 +705,18 @@ function pendingCommits(project, step, lastDoneSha) {
   return { branch, neverRecorded: !lastDoneSha, available: result.available, commits: result.commits, files };
 }
 
+// The commit the running daemon loaded, as bin/health.js recorded it at start.
+// A step with `"since": "daemon"` measures what is pending from here rather than
+// from its last recorded run: a deploy by `wt land` or by hand moves this too.
+function daemonCommit(root = ROOT) {
+  try {
+    const store = JSON.parse(fs.readFileSync(path.join(root, '.keep', 'health.json'), 'utf8'));
+    const daemon = store && store.daemon || {};
+    if (!/^[0-9a-f]{7,40}$/.test(String(daemon.commit || ''))) return null;
+    return { commit: String(daemon.commit), checkout: String(daemon.checkout || ''), pid: daemon.pid || null, startedAt: daemon.startedAt || null };
+  } catch { return null; }
+}
+
 function commitsBetween(project, fromSha, toSha, step) {
   if (!fromSha || !toSha || fromSha === toSha) return { available: true, commits: [] };
   const result = gitCommits(project, [`${fromSha}..${toSha}`], step);
@@ -773,6 +789,12 @@ function renderStatusLine(row) {
     : '';
   if (!row.git.available) {
     bits.push('git unavailable');
+  } else if (row.daemon) {
+    const at = String(row.daemon.commit).slice(0, 7);
+    bits.push(row.pending.length
+      ? `the running daemon (${at}) is ${row.pending.length} landed commit${row.pending.length === 1 ? '' : 's'} behind origin/${row.git.branch} (local tracking ref)`
+      : `the running daemon (${at}) has everything on origin/${row.git.branch} (local tracking ref)`);
+    if (row.lastDone) bits.push(`last run ${String(row.lastDone.sha || '').slice(0, 7) || 'unknown'}${runMeta ? ` (${runMeta})` : ''}`);
   } else if (!row.lastDone) {
     bits.push(`${row.pending.length} landed commit${row.pending.length === 1 ? '' : 's'} in the last 7 days; never recorded`);
   } else if (!row.pending.length) {
@@ -821,7 +843,8 @@ function status(project, options = {}) {
     const newest = ledger.runs.length ? ledger.runs[ledger.runs.length - 1] : null;
     const lastFailed = newest && newest.status === 'failed' ? newest : null;
     const runningStarted = running ? Date.parse(String(running.startedAt || '').replace(' ', 'T')) : NaN;
-    const git = pendingCommits(registry.project, step, lastDone && lastDone.sha);
+    const daemon = step.since === 'daemon' ? (options.daemonCommit !== undefined ? options.daemonCommit : daemonCommit()) : null;
+    const git = pendingCommits(registry.project, step, daemon ? daemon.commit : lastDone && lastDone.sha);
     const row = {
       name,
       project: registry.project,
@@ -832,6 +855,7 @@ function status(project, options = {}) {
       lastDone,
       lastFailed,
       running,
+      daemon,
       runningAge: Number.isFinite(runningStarted) ? shortAge(now - runningStarted) : '',
       runningStale: runStaleness(running, now, sessionIdle),
       claim: holds.find((hold) => hold && hold.step === name) || null,
@@ -884,6 +908,7 @@ module.exports = {
   parseCommits,
   pendingCommits,
   commitsBetween,
+  daemonCommit,
   attributeCommits,
   topLevelDirs,
   renderStatusLine,

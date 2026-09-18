@@ -9515,7 +9515,7 @@ function startWtGcScheduler(options = {}) {
 }
 
 function start(deps = {}) {
-  health.record('daemon', { at: Date.now(), pid: process.pid, version: health.VERSION });
+  health.record('daemon', { at: Date.now(), pid: process.pid, version: health.VERSION, ...health.codeCommit() });
   const terminalProfile = deps.terminalProfile || require('./terminal-profile').createTerminalProfileStore();
   let consoleServer = null;
   let dashboardBuilder = null;

@@ -79,6 +79,17 @@ function writeStore(value) {
   }
 }
 
+// The commit and checkout of the code this process was loaded from. Read once
+// at daemon start: a pull afterwards changes the files, not what is running.
+function codeCommit(dir = path.join(__dirname, '..')) {
+  try {
+    const run = (args) => require('child_process').execFileSync('git', ['-C', dir, ...args], {
+      encoding: 'utf8', timeout: 5e3, stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    return { commit: run(['rev-parse', 'HEAD']), checkout: run(['rev-parse', '--show-toplevel']) };
+  } catch { return { commit: '', checkout: '' }; }
+}
+
 // Called by the daemon on `keep restart-daemon`, immediately before it exits.
 function recordRestartRequest(options = {}) {
   const at = atMs(options.at, Date.now());
@@ -131,6 +142,9 @@ function record(name, options = {}) {
       startedAt: at,
       pid: Number(options.pid || process.pid),
       version: options.version == null ? VERSION : options.version,
+      // The code this daemon loaded, so a deploy can tell it is behind origin
+      // even when the checkout was pulled and the restart never happened.
+      ...(options.commit ? { commit: String(options.commit), checkout: String(options.checkout || '') } : {}),
       startedAts: [...requestedKept, ...unrequestedKept].sort((a, b) => a - b),
       requestedStartAts: requestedKept,
     };
@@ -399,7 +413,8 @@ function wrapTick(name, fn, options = {}) {
 
 function render(value, now = Date.now()) {
   const daemon = value.daemon || {};
-  const status = daemon.running ? `running (pid ${daemon.pid}, uptime ${duration(atMs(now) - atMs(daemon.startedAt))})`
+  const code = daemon.commit ? `, code ${String(daemon.commit).slice(0, 7)}` : '';
+  const status = daemon.running ? `running (pid ${daemon.pid}, uptime ${duration(atMs(now) - atMs(daemon.startedAt))}${code})`
     : daemon.startedAt ? `down (last start ${relativeTime(daemon.startedAt, now)})` : 'down (no start recorded)';
   const rows = [...(value.schedulers || [])].sort((a, b) => {
     const rank = { failing: 0, silent: 1, never: 2, warning: 3, skipped: 4, ok: 5, disabled: 6 };
@@ -430,6 +445,7 @@ module.exports = {
   CADENCES,
   RETIRED,
   record,
+  codeCommit,
   recordRestartRequest,
   unrequestedStarts,
   stateOf,

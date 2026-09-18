@@ -1459,6 +1459,9 @@ function repairDenial(invocation) {
   // with a preload in front of it.
   if (head === 'node-keep') return 'that runs node over keep-tool\'s own code with something else in front of it';
   if (head === 'keep' && first === 'restart-daemon') return '`keep restart-daemon` restarts the daemon you were launched to repair';
+  // A gated step's command runs as a child of `keep step run`, out of this guard's
+  // sight, and keep-tool's own `deploy` step is a pull and a restart.
+  if (head === 'keep' && first === 'step' && args.includes('run')) return '`keep step run` runs a step command this guard cannot see, and keep-tool\'s deploy step restarts the daemon you were launched to repair';
   if (head === 'keep' && first === 'service') return "`keep service` installs, starts or stops the daemon's launchd job";
   if (head === 'wt' && first === 'land') return '`wt land` pushes without a review record';
   // The HTTP spelling of the same restart. Only a fetcher counts: grepping the

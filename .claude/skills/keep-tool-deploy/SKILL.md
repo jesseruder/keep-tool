@@ -25,11 +25,17 @@ default branch: never edit or commit there. All work happens in a `wt` worktree.
 4. **Read the land output.** `wt land` finishes the deploy itself: it fast-forwards the
    main checkout to what it pushed and runs `keep restart-daemon`. If it reports a skip —
    the main checkout was dirty or on another branch, or the restart was refused — that is
-   yours to resolve, not Owner's:
+   yours to resolve, not Owner's. The pull and restart are the `deploy` step, so other
+   sessions see who is deploying instead of coordinating by note and `keep tell`:
    - leave the worktree (`ExitWorktree` with action `keep`; a worktree session cannot run
      git against another checkout),
-   - `git -C <main checkout> pull --ff-only`,
-   - `keep restart-daemon`.
+   - `keep steps keep-tool` — how far the running daemon is behind origin, and whether
+     someone already holds the deploy (then `keep step claim keep-tool deploy --wait`
+     instead of doing it twice),
+   - `keep step claim keep-tool deploy -m "<card>: <sha>"` then
+     `keep step run keep-tool deploy` (the pull `--ff-only` and `keep restart-daemon`).
+   A failed run keeps your claim and prints its log: a dirty or diverged main checkout
+   fails the pull, which is yours to sort out before running it again.
 5. **Skills changed?** New or renamed skills need `keep setup skills` (and
    `keep setup hooks` when the hook text changed) so every managed account links them;
    sessions load new skills on their next start.
@@ -56,5 +62,11 @@ default branch: never edit or commit there. All work happens in a `wt` worktree.
   clear by itself — report the session id and the reason from the matching `<sid>.json`
   to Owner; deleting it is his call.
 - If the change does not need the restart, say so in the check-in and move on.
+
+## A fix already on origin but not running
+
+`keep health` shows the daemon's `code <sha>`, and `keep steps keep-tool` says how many
+landed commits it is behind. If the fix you were about to write is already there, there
+is nothing to land: claim and run the `deploy` step rather than filing a need for Owner.
 
 The daemon's own git pull syncs the `~/keep` registry, never this code.
