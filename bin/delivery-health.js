@@ -91,19 +91,26 @@ function tick(options = {}) {
 // instead of at one instant, and still well short of the next tick.
 const RECONCILE_WAIT_MS = 30e3;
 const RECONCILE_POLL_MS = 500;
+const duration = (value, fallback) => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : fallback;
 
 async function reconcileWithRetry(options) {
   if (!options.reconcile) return;
-  const waitMs = Math.max(0, options.reconcileWaitMs ?? RECONCILE_WAIT_MS);
-  const pollMs = Math.max(1, options.reconcilePollMs ?? RECONCILE_POLL_MS);
+  const waitMs = duration(options.reconcileWaitMs, RECONCILE_WAIT_MS);
+  const pollMs = Math.max(1, duration(options.reconcilePollMs, RECONCILE_POLL_MS));
+  const clock = options.clock || Date.now;
   const sleep = options.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-  for (let waited = 0; ; waited += pollMs) {
+  // Spent on the clock, not counted off in sleeps: the reconcile itself lists the
+  // host's panes before each attempt, and that call is slowest on exactly the loaded
+  // machine this is waiting for. Summing the sleeps would let the sweep run for
+  // minutes and fall past the health row's own silence threshold.
+  const deadline = clock() + waitMs;
+  for (;;) {
     try { return await options.reconcile(); }
     catch (error) {
       // Anything but contention is a real fault, and stays the caller's to record.
       if (!error || error.status !== 429) throw error;
       // Busy for the whole window: inspect without mutating, as before.
-      if (waited >= waitMs) return;
+      if (clock() >= deadline) return;
     }
     await sleep(pollMs);
   }

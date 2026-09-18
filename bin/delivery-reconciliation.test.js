@@ -110,8 +110,9 @@ test('busy injection lock skips reconciliation while continuing read-only health
   let attempts = 0;
   // The sweep waits the lock out before giving up, so the window is shortened here
   // and its sleep stubbed; what this test is about is what happens once it expires.
+  let at = 0;
   const options = { ...f, health: { record: (_name, row) => rows.push(row) },
-    reconcileWaitMs: 500, reconcilePollMs: 250, sleep: async () => {},
+    reconcileWaitMs: 500, reconcilePollMs: 250, clock: () => at, sleep: ms => { at += ms; return Promise.resolve(); },
     reconcile: async () => { attempts++; throw Object.assign(Error('busy'), { status: 429 }); } };
   const { sweep } = require('./delivery-health');
   for (let n = 0; n < 4; n++) assert.deepEqual(await sweep(options), []);

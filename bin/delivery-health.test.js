@@ -32,6 +32,16 @@ function fixture(fn) {
 
 const busy = () => Object.assign(new Error('another session injection is busy'), { status: 429 });
 
+// The sweep's wait is spent on the clock, so a test drives both. `tick` of 0 leaves
+// the reconcile instantaneous; a positive one stands in for a slow listHostPanes.
+const fakeClock = (tick = 0) => {
+  const state = { at: 0, slept: [] };
+  state.clock = () => state.at;
+  state.sleep = ms => { state.slept.push(ms); state.at += ms; return Promise.resolve(); };
+  state.spend = () => { state.at += tick; };
+  return state;
+};
+
 test('both agents detect screen/receipt failures, ignore young attempts and clear on actual receipts', () => fixture(f => {
   const codex = f.add('codex'); const claude = f.add('claude');
   f.trace([
@@ -118,17 +128,18 @@ test('a reconcile refused by injection contention is waited out inside the sweep
   f.add('claude');
   const journal = path.join(f.directory, 'claude.json');
   const records = [];
-  const slept = [];
+  const time = fakeClock();
   let calls = 0;
   const issues = await sweep({ ...f, health: { record: (name, row) => records.push(row) },
-    sleep: ms => { slept.push(ms); return Promise.resolve(); },
+    clock: time.clock, sleep: time.sleep,
     reconcile: async () => {
       calls += 1;
       if (calls < 5) throw busy();
       fs.unlinkSync(journal); // What delivery.reconcile does to a stale entry with no typedAt.
     } });
   assert.equal(calls, 5, 'a busy lock must be retried inside the tick, not skipped until the next one');
-  assert.equal(slept.length, 4);
+  assert.equal(time.slept.length, 4);
+  assert.equal(time.at, 2000);
   assert.deepEqual(issues, [], 'the reconcile got through, so the expired journal is gone');
   assert.equal(records.at(-1).ok, true);
 }));
@@ -136,13 +147,13 @@ test('a reconcile refused by injection contention is waited out inside the sweep
 test('a lock busy for the whole window still inspects without mutating, and gives up', () => fixture(async f => {
   f.add('claude');
   const records = [];
-  let calls = 0, slept = 0;
+  const time = fakeClock();
+  let calls = 0;
   const issues = await sweep({ ...f, health: { record: (name, row) => records.push(row) },
-    reconcileWaitMs: 1000, reconcilePollMs: 250,
-    sleep: ms => { slept += ms; return Promise.resolve(); },
+    reconcileWaitMs: 1000, reconcilePollMs: 250, clock: time.clock, sleep: time.sleep,
     reconcile: async () => { calls += 1; throw busy(); } });
   assert.equal(calls, 5);
-  assert.equal(slept, 1000, 'the wait is bounded well inside the 60s cadence');
+  assert.equal(time.at, 1000, 'the wait is bounded well inside the 60s cadence');
   assert.equal(issues.length, 1, 'the journal is still reported, never deleted by the watchdog');
   assert.ok(fs.existsSync(path.join(f.directory, 'claude.json')));
   assert.match(records.at(-1).error, /unconfirmed delivery issue/);
@@ -156,4 +167,25 @@ test('a reconcile fault that is not contention is recorded and stops the tick', 
     reconcile: async () => { throw Error('PRIVATE /Users/someone/transcript.jsonl'); } });
   assert.equal(issues, null);
   assert.deepEqual(records.map(row => row.error), ['Delivery reconciliation could not run']);
+}));
+
+test('a slow reconcile spends the window too, and a nonsense window falls back to the default', () => fixture(async f => {
+  f.add('claude');
+  const health = { record: () => {} };
+  // Each attempt costs 400ms of its own before the lock is even asked for, so counting
+  // the sleeps alone would run this sweep four times longer than its window allows.
+  const slow = fakeClock(400);
+  let calls = 0;
+  await sweep({ ...f, health, reconcileWaitMs: 1000, reconcilePollMs: 250, clock: slow.clock, sleep: slow.sleep,
+    reconcile: async () => { calls += 1; slow.spend(); throw busy(); } });
+  assert.equal(calls, 2, 'time spent inside the reconcile counts against the window');
+  assert.ok(slow.at <= 1000 + 400, 'the sweep overruns its window by at most one attempt');
+
+  // An unusable override must not turn the give-up test into a loop that never ends.
+  const bad = fakeClock();
+  let attempts = 0;
+  await sweep({ ...f, health, reconcileWaitMs: NaN, reconcilePollMs: 'soon', clock: bad.clock, sleep: bad.sleep,
+    reconcile: async () => { attempts += 1; throw busy(); } });
+  assert.equal(bad.at, 30e3, 'the default 30s window is used');
+  assert.equal(attempts, 61);
 }));
