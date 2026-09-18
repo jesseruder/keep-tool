@@ -28,6 +28,12 @@ const MAX_RETRY_AFTER_MS = 24 * 60 * 60e3;
 // the row goes red, because nobody can tell what the account has left any more.
 const RATE_LIMIT_HEALTH_GRACE_MS = 2 * 3600e3;
 const TAIL_BYTES = 256 * 1024;
+// How far back a Codex scan looks for a rollout: today and the six days before it (plus
+// tomorrow, for a clock ahead of the host's). An account with no rollout at all in the
+// window is idle — nobody has run Codex on this host under it — which is a reading, not
+// a fault: the built-in codex/default account cannot be removed, so a failure here would
+// stay red for as long as Owner uses this host for Claude alone.
+const CODEX_SCAN_DAYS = 7;
 
 function shortError(source, error) {
   const code = error && error.code;
@@ -35,6 +41,9 @@ function shortError(source, error) {
   if (code === 'timeout') return 'request timed out';
   if (code === 'response') return 'invalid response';
   if (code === 'not-found') return 'no recent rate-limit snapshot';
+  // A Codex scan's fs error names the sessions dir; a Claude socket error (ENOTFOUND,
+  // ECONNRESET) carries the same shape of code and must not.
+  if (source === 'Codex' && typeof code === 'string' && /^E[A-Z]+$/.test(code)) return `sessions unreadable (${code})`;
   if (Number.isInteger(code)) return `HTTP ${code}`;
   return `${source} usage unavailable`;
 }
@@ -227,7 +236,7 @@ async function fetchClaudeUsage(account, deps = {}) {
 
 function recentDateDirs(sessionsDir = path.join(os.homedir(), '.codex', 'sessions'), now = new Date()) {
   const dirs = [];
-  for (let daysAgo = -1; daysAgo < 7; daysAgo++) {
+  for (let daysAgo = -1; daysAgo < CODEX_SCAN_DAYS; daysAgo++) {
     const date = new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysAgo);
     dirs.push(path.join(sessionsDir, String(date.getFullYear()), String(date.getMonth() + 1).padStart(2, '0'), String(date.getDate()).padStart(2, '0')));
   }
@@ -284,13 +293,28 @@ function scanCodexUsage(dirs = recentDateDirs(), deps = {}) {
   const files = [];
   for (const dir of dirs) {
     let names;
-    try { names = fileSystem.readdirSync(dir); } catch { continue; }
+    // A date dir that does not exist is a day nobody ran Codex, and a configDir with
+    // no sessions dir at all is Codex never having run there. A dir that exists but
+    // nobody can read is a fault, and must not be read as an idle account.
+    try { names = fileSystem.readdirSync(dir); } catch (error) {
+      if (error && (error.code === 'ENOENT' || error.code === 'ENOTDIR')) continue;
+      throw error;
+    }
     for (const name of names) {
       if (!/^rollout-.*\.jsonl$/.test(name)) continue;
       const file = path.join(dir, name);
-      try { files.push({ file, mtimeMs: fileSystem.statSync(file).mtimeMs }); } catch {}
+      // A rollout that vanished between readdir and stat is gone; one nobody can stat
+      // is the same fault as a dir nobody can read.
+      try { files.push({ file, mtimeMs: fileSystem.statSync(file).mtimeMs }); } catch (error) {
+        if (error && error.code === 'ENOENT') continue;
+        throw error;
+      }
     }
   }
+  // No rollout in the window at all is the idle reading. A rollout that carries no
+  // rate_limits line is still not-found: Codex ran, and its log does not say what it
+  // had left, which is something to look at.
+  if (!files.length) return { ...emptySnapshot('codex'), idle: true };
   files.sort((a, b) => b.mtimeMs - a.mtimeMs);
   let namedFallback = null;
   for (const { file } of files) {
@@ -500,6 +524,16 @@ function createUsageManager(deps = {}) {
       && !(state.failureKind === 'rate-limit' && readingAge(state, now) !== null));
   }
 
+  // The note a healthy record carries for every Codex account whose latest scan found
+  // it idle, so `keep health` says why the row has no reading without going amber.
+  // Read from the states rather than the batch, because a batch that refreshed only
+  // the Claude accounts still stands for the idle one.
+  function idleDetail() {
+    const idle = [...states.values()].filter((state) => state.snapshot.idle === true);
+    if (!idle.length) return null;
+    return idle.map((state) => `${state.account.label || state.account.id}: no sessions in ${CODEX_SCAN_DAYS} days`).join('; ');
+  }
+
   function requestRefresh(now = clock(), performRefresh = refreshAccount) {
     now = Number.isFinite(Number(now)) ? Number(now) : clock();
     const current = sync();
@@ -531,7 +565,8 @@ function createUsageManager(deps = {}) {
           if (!currentAttempt()) return { account, state, generation, ok: false, stale: true, error: shortError(account.agent === 'claude' ? 'Claude' : 'Codex', error) };
           const completedAt = Number(clock());
           const message = shortError(account.agent === 'claude' ? 'Claude' : 'Codex', error);
-          state.snapshot = { ...state.snapshot, error: message };
+          const { idle, ...snapshot } = state.snapshot;
+          state.snapshot = { ...snapshot, error: message };
           if (account.agent === 'claude') {
             const rateLimited = error && error.code === 429;
             const sameKind = state.failureKind === (rateLimited ? 'rate-limit' : 'other');
@@ -597,18 +632,25 @@ function createUsageManager(deps = {}) {
           configurationRemovedFailure = false;
           rateLimitWeather = false;
         }
+        const idle = idleDetail();
         healthApi.record('usage', cachedErrors.length
           ? { ok: true, skipped: true, detail: 'waiting for failed account retry' }
-          : { ok: true });
+          : idle ? { ok: true, detail: idle } : { ok: true });
       });
       return true;
     }
     if (![...states.values()].some((state) => state.inFlight)) {
       const cachedErrors = [...states.values()].some((state) => state.snapshot.error);
+      const idle = idleDetail();
       if (configurationRemovedFailure && !cachedErrors) {
         configurationRemovedFailure = false;
-        healthApi.record('usage', { ok: true });
-      } else healthApi.record('usage', { ok: true, skipped: true, detail: 'nothing due' });
+        healthApi.record('usage', idle ? { ok: true, detail: idle } : { ok: true });
+      } else {
+        // Every dashboard poll lands here between refreshes, and a skip's detail
+        // replaces the last one, so the idle note rides along or `keep health` would
+        // only ever show "nothing due".
+        healthApi.record('usage', { ok: true, skipped: true, detail: idle && !cachedErrors ? `nothing due; ${idle}` : 'nothing due' });
+      }
     }
     return false;
   }

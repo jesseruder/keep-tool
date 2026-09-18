@@ -16,6 +16,7 @@ const test = require('node:test');
 const health = require('./health.js');
 const {
   scanCodexUsage,
+  scanCodexAccount,
   requestRefresh,
   createUsageManager,
   claudeCredentialService,
@@ -116,6 +117,110 @@ test('named-model quota remains a fallback when no canonical bucket exists', () 
     });
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a Codex account with no rollout in the window reads as idle, not as a failure', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-usage-test-'));
+  try {
+    assert.deepEqual(scanCodexUsage([path.join(dir, '2026', '09', '18'), path.join(dir, 'missing')]),
+      { windows: [], planType: null, asOf: null, idle: true }, 'absent date dirs are an idle account');
+    fs.writeFileSync(path.join(dir, 'rollout-quiet.jsonl'), `${JSON.stringify({ timestamp: '2026-09-18T10:00:00Z', type: 'event_msg', payload: { type: 'agent_message' } })}\n`);
+    assert.throws(() => scanCodexUsage([dir]), (error) => error.code === 'not-found',
+      'a rollout that carries no rate_limits line is still a missing snapshot');
+    const denied = { ...fs, readdirSync: () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); } };
+    assert.throws(() => scanCodexUsage([dir], { fs: denied }), (error) => error.code === 'EACCES',
+      'a sessions dir nobody can read is a fault, not an idle account');
+    const unstattable = { ...fs, statSync: () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); } };
+    assert.throws(() => scanCodexUsage([dir], { fs: unstattable }), (error) => error.code === 'EACCES',
+      'a rollout nobody can stat is the same fault, not an idle account');
+    const vanished = { ...fs, statSync: () => { throw Object.assign(new Error('gone'), { code: 'ENOENT' }); } };
+    assert.deepEqual(scanCodexUsage([dir], { fs: vanished }), { windows: [], planType: null, asOf: null, idle: true },
+      'a rollout that vanished between readdir and stat is gone');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an idle Codex account keeps the usage row green with a note until it is used again', async () => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-usage-codex-'));
+  const configured = [
+    { id: 'claude/default', label: 'Primary', agent: 'claude', configDir: '/profiles/default', builtIn: true },
+    { id: 'codex/default', label: 'Codex (default)', agent: 'codex', configDir: codexHome, builtIn: true },
+  ];
+  const accountApi = {
+    list: () => configured,
+    defaultFor: (agent) => configured.find((account) => account.agent === agent),
+  };
+  const records = [];
+  const healthApi = { record: (name, options) => records.push({ name, options }) };
+  let currentTime = new Date('2026-09-18T12:00:00').getTime();
+  const manager = createUsageManager({ accounts: accountApi, health: healthApi, now: () => currentTime });
+  const dateDir = (date) => path.join(codexHome, 'sessions', String(date.getFullYear()),
+    String(date.getMonth() + 1).padStart(2, '0'), String(date.getDate()).padStart(2, '0'));
+  const refresh = async (account) => account.agent === 'codex'
+    ? scanCodexAccount(account, { date: new Date(currentTime) })
+    : { limits: [{ label: 'week', percent: 20 }], fetchedAt: currentTime };
+  try {
+    // The newest rollout on this host predates the window: seven months ago.
+    const old = dateDir(new Date('2026-02-18T12:00:00'));
+    fs.mkdirSync(old, { recursive: true });
+    fs.writeFileSync(path.join(old, 'rollout-old.jsonl'), `${rateLimitLine('2026-02-18T10:00:00Z', 'codex', 5)}\n`);
+
+    manager.requestRefresh(currentTime, refresh);
+    await settleRefresh();
+    assert.deepEqual(records.at(-1), { name: 'usage', options: { ok: true, detail: 'Codex (default): no sessions in 7 days' } });
+    let view = manager._view();
+    assert.deepEqual(view.codex, { windows: [], planType: null, asOf: null, idle: true });
+    assert.equal(view.accounts['codex/default'].error, undefined);
+
+    // A dashboard poll between refreshes keeps the note on the row.
+    manager.requestRefresh(currentTime + 1000, refresh);
+    assert.deepEqual(records.at(-1), { name: 'usage', options: { ok: true, skipped: true, detail: 'nothing due; Codex (default): no sessions in 7 days' } });
+
+    // A batch that refreshes only the Claude account still carries the idle note.
+    currentTime += 5 * 60e3 + 1;
+    manager._states.get('codex/default').nextAttemptAt = currentTime + 60e3;
+    manager.requestRefresh(currentTime, refresh);
+    await settleRefresh();
+    assert.deepEqual(records.at(-1), { name: 'usage', options: { ok: true, detail: 'Codex (default): no sessions in 7 days' } });
+
+    // An unreadable sessions dir is a failure that drops the idle flag from the view.
+    manager._states.get('codex/default').nextAttemptAt = currentTime;
+    manager.requestRefresh(currentTime, async (account) => account.agent === 'codex'
+      ? scanCodexAccount(account, { date: new Date(currentTime), fs: { ...fs, readdirSync: () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); } } })
+      : refresh(account));
+    await settleRefresh();
+    assert.deepEqual(records.at(-1), { name: 'usage', options: { ok: false, error: 'Codex (default): sessions unreadable (EACCES)' } });
+    assert.equal(manager._view().codex.idle, undefined);
+    manager.requestRefresh(currentTime + 1000, refresh);
+    assert.deepEqual(records.at(-1), { name: 'usage', options: { ok: true, skipped: true, detail: 'nothing due' } });
+
+    // A Claude socket error carries the same shape of code and keeps its own label.
+    manager._states.get('claude/default').nextAttemptAt = currentTime;
+    manager._states.get('codex/default').nextAttemptAt = currentTime + 60e3;
+    manager.requestRefresh(currentTime, async (account) => {
+      if (account.agent === 'claude') throw Object.assign(new Error('reset'), { code: 'ECONNRESET' });
+      return refresh(account);
+    });
+    await settleRefresh();
+    assert.deepEqual(records.at(-1), { name: 'usage', options: { ok: false, error: 'Primary: Claude usage unavailable' } });
+    manager._states.get('claude/default').nextAttemptAt = currentTime;
+    manager._states.get('codex/default').nextAttemptAt = currentTime;
+
+    // Codex runs again today: the note goes and the reading comes back.
+    const today = dateDir(new Date(currentTime));
+    fs.mkdirSync(today, { recursive: true });
+    fs.writeFileSync(path.join(today, 'rollout-today.jsonl'), `${rateLimitLine('2026-09-18T12:05:00Z', 'codex', 44)}\n`);
+    currentTime += 5 * 60e3 + 1;
+    manager.requestRefresh(currentTime, refresh);
+    await settleRefresh();
+    assert.deepEqual(records.at(-1), { name: 'usage', options: { ok: true } });
+    view = manager._view();
+    assert.equal(view.codex.idle, undefined);
+    assert.equal(view.codex.windows[0].percent, 44);
+  } finally {
+    fs.rmSync(codexHome, { recursive: true, force: true });
   }
 });
 
