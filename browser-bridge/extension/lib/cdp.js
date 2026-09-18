@@ -74,6 +74,16 @@ export async function attach(tabId) {
       console.warn(`browser-bridge: ${domain}.enable failed on tab ${tabId}`, error);
     }
   }
+  // A tab in a window hidden behind the terminal renders no frames: every input event
+  // then waits 5 s for an ack that never comes, wheel events never return, and
+  // requestAnimationFrame never fires. Focus emulation makes the renderer treat the
+  // page as visible and focused, which is exactly what an unattended agent wants
+  // (measured on Edge 153: mouseMoved 5009 ms -> 82 ms, wheel from a hang to 125 ms).
+  try {
+    await sendRaw(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true });
+  } catch (error) {
+    console.warn(`browser-bridge: focus emulation failed on tab ${tabId}`, error);
+  }
 }
 
 export async function detach(tabId) {

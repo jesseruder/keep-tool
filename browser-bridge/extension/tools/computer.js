@@ -72,9 +72,13 @@ function clipScaleFor(cssRatio, dpr) {
 }
 
 async function captureClip(tabId, clip) {
-  // Let a pending layout or scroll animation paint before the frame is grabbed.
+  // Let a pending layout or scroll animation paint before the frame is grabbed. The
+  // wait is bounded inside the page: a hidden or occluded tab never runs animation
+  // frames, and CDP's `timeout` does not cover an awaited promise. captureScreenshot
+  // itself still returns a frame for such a tab.
   await send(tabId, "Runtime.evaluate", {
-    expression: "new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))",
+    expression:
+      "new Promise(r => { setTimeout(r, 300); requestAnimationFrame(() => requestAnimationFrame(r)); })",
     awaitPromise: true,
     timeout: 1000,
   }).catch(() => {});

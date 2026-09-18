@@ -294,7 +294,12 @@ after a text block, so both Claude Code and Codex render them.
   session; `Accessibility.getFullAXTree` includes `InlineTextBox` rows that the renderer
   drops as noise.
 - Screenshots work on a tab that is active in an unfocused window, so the bridge never
-  focuses a window. A minimized or fully occluded window is untested.
+  focuses a window. An occluded window (Edge behind the terminal) is the common case
+  and it starves the renderer of frames: input acks take 5 s each, wheel events never
+  return, animation frames never fire. `Emulation.setFocusEmulationEnabled` on every
+  attached tab fixes all of that (verified on Edge 153), so `lib/cdp.js` enables it
+  right after the domains. The in-page animation-frame wait before a capture is also
+  bounded to 300 ms because CDP's evaluate `timeout` does not cover an awaited promise.
 - The extension must also handle `chrome.tabs.onRemoved` (drop tab state) and
   `chrome.tabGroups.onRemoved` (drop the session's group id).
 
