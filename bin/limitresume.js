@@ -316,6 +316,11 @@ async function tick(deps = {}) {
     const prior = ledger.sessions[session.id];
     // A new limit event starts a fresh attempt count but keeps the send history:
     // the daily cap is per session, not per event.
+    // An unconfirmed `sending` claim carries over too. A continue can land and be
+    // followed immediately by a second limit error, so the fresh event may well be
+    // the one this very claim caused; dropping it would hide an in-flight send from
+    // the check below and type "continue" twice, uncounted by the caps. Carried over,
+    // a young claim is waited out and a stale one is recovered as a send next tick.
     const entry = prior && prior.hitAt === session.rateLimit.at
       ? prior
       : {
@@ -323,6 +328,7 @@ async function tick(deps = {}) {
         type: session.rateLimit.type,
         attempts: 0,
         sentHistory: prior && Array.isArray(prior.sentHistory) ? prior.sentHistory : [],
+        ...(Number.isFinite(Number(prior?.sending)) ? { sending: prior.sending } : {}),
       };
     entry.type = session.rateLimit.type;
     entry.accountId = session.accountId || null;

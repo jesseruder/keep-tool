@@ -5630,19 +5630,22 @@ async function resumeAfterLimit(sessionId, text, { hitAt } = {}, deps = {}) {
     // wrong, the stall simply ended, so the caller drops the entry instead of
     // spending an attempt on it.
     const movedOn = (why) => new InjectionError(409, `session moved on before resume (${why})`);
-    if (session.kind !== 'claude') throw movedOn('not a Claude session');
-    if (!session.rateLimit || session.rateLimit.at !== hitAt) throw movedOn('no longer parked on that limit');
-    // The scanner never reports endedTurn for a limit error: Claude Code writes that
-    // synthetic record with stop_reason "stop_sequence", not end_turn. With rateLimit
-    // verified as the last real event above, "ended" means nothing else is in flight.
-    const parkedIdle = session.endedTurn === true
-      || (!session.toolRunning && !session.pendingOther && !(session.unknownBackgroundJobs || []).length);
-    if (!parkedIdle) throw movedOn('mid-turn');
-    if (session.toolRunning) throw movedOn('a tool is running');
-    if (session.pendingQuestion || session.pendingPlan) throw movedOn('waiting on a person');
-    if (session.notify && ['permission', 'question'].includes(session.notify.type)) {
-      throw movedOn(`showing a ${session.notify.type}`);
-    }
+    const verifyParked = (s) => {
+      if (s.kind !== 'claude') throw movedOn('not a Claude session');
+      if (!s.rateLimit || s.rateLimit.at !== hitAt) throw movedOn('no longer parked on that limit');
+      // The scanner never reports endedTurn for a limit error: Claude Code writes that
+      // synthetic record with stop_reason "stop_sequence", not end_turn. With rateLimit
+      // verified as the last real event above, "ended" means nothing else is in flight.
+      const parkedIdle = s.endedTurn === true
+        || (!s.toolRunning && !s.pendingOther && !(s.unknownBackgroundJobs || []).length);
+      if (!parkedIdle) throw movedOn('mid-turn');
+      if (s.toolRunning) throw movedOn('a tool is running');
+      if (s.pendingQuestion || s.pendingPlan) throw movedOn('waiting on a person');
+      if (s.notify && ['permission', 'question'].includes(s.notify.type)) {
+        throw movedOn(`showing a ${s.notify.type}`);
+      }
+    };
+    verifyParked(session);
     const target = claimInjectionTarget(await resolve(session, null));
     // The transcript can say "parked" while the pane says otherwise (a restarted
     // Claude, a shell prompt, a dialog). Only type when the input box is on screen.
@@ -5650,7 +5653,16 @@ async function resumeAfterLimit(sessionId, text, { hitAt } = {}, deps = {}) {
     if (!agentPromptVisible('claude', screen)) {
       throw new InjectionError(409, 'no Claude prompt visible', { screenTail: screenTail(screen) });
     }
-    return deliver(session, target, text);
+    // Resolving the pane and reading the screen are awaits: the session can have
+    // taken a prompt, started a tool or hit the window again while they ran. The
+    // transcript is re-read here so the checks describe the session being typed
+    // into, not the one the scheduler saw a screen read ago.
+    const fresh = load(sessionId);
+    verifyParked(fresh);
+    if (Number.isFinite(fresh.mtime) && Number.isFinite(session.mtime) && fresh.mtime !== session.mtime) {
+      throw movedOn('transcript changed');
+    }
+    return deliver(fresh, target, text);
   }, { session: sessionId });
 }
 

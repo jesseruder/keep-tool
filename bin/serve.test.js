@@ -4569,10 +4569,15 @@ test('resumeAfterLimit rechecks the session and the screen inside the lock', asy
     rateLimit: { at: HIT_AT, type: 'five_hour', resetsAt: 1788570000000 },
   };
   const promptScreen = ['some output', '─'.repeat(40), '❯', ''].join('\n');
-  const makeDeps = (session, screen) => {
-    const calls = { sent: [], screens: 0, locked: 0 };
+  // resumeAfterLimit loads the transcript twice: once before the pane and screen
+  // awaits, once again right before it types. `after` is what the second load sees.
+  const makeDeps = (session, screen, after) => {
+    const calls = { sent: [], screens: 0, locked: 0, loads: 0 };
     return [calls, {
-      loadCurrentSession: () => session,
+      loadCurrentSession: () => {
+        calls.loads += 1;
+        return calls.loads === 1 ? session : (after === undefined ? session : after);
+      },
       resolveSessionTarget: async () => ({ pane: 'pane-one' }),
       readScreen: async (target, lines, scrollback) => {
         calls.screens += 1;
@@ -4629,6 +4634,28 @@ test('resumeAfterLimit rechecks the session and the screen inside the lock', asy
       (e) => e.status === 409 && e.message.startsWith('session moved on'),
     );
     assert.deepEqual([calls.sent, calls.screens], [[], 0], 'a session that moved on is never read or typed into');
+  }
+
+  // Resolving the pane and reading the screen are awaits. A session that moved on
+  // while they ran is caught by the second load, after the screen read rather than
+  // before it, and nothing is typed into it.
+  const [again, againDeps] = makeDeps(parked, promptScreen, parked);
+  assert.deepEqual(await resumeAfterLimit('session-one', 'continue', { hitAt: HIT_AT }, againDeps), { ok: true });
+  assert.deepEqual(again.sent, [['session-one', 'pane-one', 'continue']]);
+  assert.equal(again.loads, 2, 'the transcript is re-read before typing');
+
+  for (const after of [
+    { ...parked, rateLimit: { ...parked.rateLimit, at: '2026-09-06T19:00:00.000Z' } },
+    { ...parked, toolRunning: true },
+    { ...parked, mtime: 2 },
+  ]) {
+    const [calls, deps] = makeDeps({ ...parked, mtime: 1 }, promptScreen, after);
+    await assert.rejects(
+      () => resumeAfterLimit('session-one', 'continue', { hitAt: HIT_AT }, deps),
+      (e) => e.status === 409 && e.message.startsWith('session moved on'),
+    );
+    assert.deepEqual([calls.sent, calls.screens], [[], 1],
+      'the screen was read before the session moved on, but nothing was typed');
   }
 
   // The transcript can say "parked" while the pane shows a shell or a restarted

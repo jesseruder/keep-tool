@@ -627,6 +627,39 @@ test('a claim left behind by a dead daemon blocks one retry, then counts as a se
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+// The send that the claim belongs to may be exactly what produced the new limit
+// event: continue lands, Claude runs straight back into the closed window, the daemon
+// dies before it can record sentAt. A fresh entry that forgot the claim would type a
+// second "continue" that neither the same-window dedupe nor the daily cap ever counts.
+test('a new limit event does not discard an unconfirmed send claim', async () => {
+  const root = tempRoot();
+  const sends = [];
+  const HIT_AT_B = '2026-09-06T19:55:00.000Z';
+  const deps = {
+    scanSessions: () => [session({ rateLimit: { at: HIT_AT_B, type: 'five_hour', resetsAt: RESET_AT } })],
+    getUsage: () => usageSnapshot([]),
+    send: async (id, text, opts) => { sends.push(opts.hitAt); },
+    root,
+    stderr: { write: () => {} },
+  };
+  try {
+    writeLedgerFile(root, {
+      sessions: {
+        'session-one': { hitAt: HIT_AT, type: 'five_hour', attempts: 0, sentHistory: [], resetAt: RESET_AT, state: 'waiting', sending: NOW - 60e3 },
+      },
+      history: [],
+    });
+    const held = await tick({ ...deps, now: NOW });
+    assert.deepEqual(held, { ok: true, sent: 0, waiting: 1, detail: 'waiting 1' });
+    assert.deepEqual(sends, [], 'the young claim is waited out, not typed over');
+    const entry = readLedger(root).sessions['session-one'];
+    assert.equal(entry.hitAt, HIT_AT_B, 'the entry moved to the new limit event');
+    assert.equal(entry.sending, NOW - 60e3, 'the claim carried across the event boundary');
+    assert.equal(entry.reason, 'a send is already in flight');
+    assert.equal(entry.sentAt, undefined);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('a session that burns every attempt is shown as stalled', async () => {
   const root = tempRoot();
   const deps = {
