@@ -444,40 +444,122 @@ function previewRefresh(account) {
   return { managed: true, sourceAccountId: manifest.sourceAccountId, entries, plugins: missingPlugins(account) };
 }
 
-// Plugins are installed per profile: the cache holds per-home paths and the install
-// record belongs to that profile, so setup never links them. Instead the target gets
-// the same user-scope plugin ids installed by Claude's own CLI. Marketplaces are not
-// added here: `marketplace add` declares the marketplace in settings.json, which is the
-// source's own file behind a shared link, so a plugin from a marketplace the shared
-// settings do not declare stays missing and says so.
-function userPlugins(configDir) {
+// Plugins are per profile: the install record and the cache belong to that home, so
+// setup never links them. Nor does it call `claude plugin install`, which edits
+// `enabledPlugins` in settings.json — the source's own file behind a shared link — and
+// can prompt for approval. The shared settings already enable the plugins; what the
+// target lacks is the installed copy. Setup copies the exact cache version the source
+// recorded, through a private staging directory, and adds the source's record with its
+// install path moved into the target home. Claude refuses to load a plugin whose
+// marketplace the profile does not know, so a marketplace the target lacks is copied the
+// same way from the source's clone, with its record in known_marketplaces.json. Only a
+// cache or clone inside the source's own plugins directory is copied; anything else is
+// reported, never guessed at.
+function pluginRecords(configDir) {
   const plugins = readJSON(path.join(configDir, 'plugins', 'installed_plugins.json'), {})?.plugins;
-  if (!plugins || typeof plugins !== 'object') return [];
-  return Object.keys(plugins)
-    .filter((id) => Array.isArray(plugins[id]) && plugins[id].some((entry) => entry?.scope === 'user'))
-    .sort();
+  return plugins && typeof plugins === 'object' && !Array.isArray(plugins) ? plugins : {};
+}
+
+function userEntry(records, id) {
+  return Array.isArray(records[id]) ? records[id].find((entry) => entry?.scope === 'user') : null;
+}
+
+function pluginSource(account) {
+  const manifest = account?.agent === 'claude' && account.configDir ? readSetup(account) : null;
+  return manifest ? canonical(manifest.sourceConfigDir) : null;
 }
 
 function missingPlugins(account) {
-  const manifest = account?.agent === 'claude' && account.configDir ? readSetup(account) : null;
-  if (!manifest) return [];
-  const source = canonical(manifest.originConfigDir || manifest.sourceConfigDir);
-  const have = new Set(userPlugins(account.configDir));
-  return userPlugins(source).filter((id) => !have.has(id));
+  const source = pluginSource(account);
+  if (!source) return [];
+  const sourceRecords = pluginRecords(source), targetRecords = pluginRecords(account.configDir);
+  return Object.keys(sourceRecords).filter((id) => userEntry(sourceRecords, id) && !userEntry(targetRecords, id)).sort();
 }
 
-function syncPlugins(account, options = {}) {
-  const run = options.run || ((args, env) => spawnSync(options.claude || process.env.KEEP_CLAUDE || 'claude', args,
-    { env, encoding: 'utf8', timeout: 180000 }));
+function copyPluginDir(sourceRoot, targetRoot, relative) {
+  const destination = path.join(targetRoot, relative);
+  if (pathExists(destination)) return destination;
+  fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 });
+  const stage = fs.mkdtempSync(path.join(path.dirname(destination), `.${path.basename(destination)}.copy-`));
+  try {
+    fs.cpSync(path.join(sourceRoot, relative), path.join(stage, 'plugin'), { recursive: true, verbatimSymlinks: true });
+    fs.renameSync(path.join(stage, 'plugin'), destination);
+  } finally { fs.rmSync(stage, { recursive: true, force: true }); }
+  return destination;
+}
+
+function writeJSONAtomic(file, value) {
+  const temporary = `${file}.tmp.${process.pid}.${crypto.randomBytes(8).toString('hex')}`;
+  fs.writeFileSync(temporary, JSON.stringify(value, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+  fs.renameSync(temporary, file);
+}
+
+function insideDirectory(file, root) {
+  return file.startsWith(root + path.sep) && fs.statSync(file, { throwIfNoEntry: false })?.isDirectory() === true;
+}
+
+// Copies each marketplace the named plugins need and the target does not know. Returns
+// the marketplaces that could not be provided, so their plugins are reported, not copied.
+function syncMarketplaces(source, targetDir, ids) {
+  const knownFile = (dir) => path.join(dir, 'plugins', 'known_marketplaces.json');
+  const sourceKnown = readJSON(knownFile(source), {});
+  const targetKnown = readJSON(knownFile(targetDir), {});
+  const sourceRoot = canonical(path.join(source, 'plugins', 'marketplaces'));
+  const targetRoot = path.join(targetDir, 'plugins', 'marketplaces');
+  const unavailable = new Map(), additions = {};
+  for (const name of new Set(ids.map((id) => id.slice(id.lastIndexOf('@') + 1)))) {
+    if (targetKnown[name]) continue;
+    const entry = sourceKnown[name];
+    const location = entry?.installLocation ? canonical(entry.installLocation) : '';
+    if (!insideDirectory(location, sourceRoot)) { unavailable.set(name, `marketplace ${name} is not cloned in the source profile`); continue; }
+    try { additions[name] = { ...entry, installLocation: copyPluginDir(sourceRoot, targetRoot, path.relative(sourceRoot, location)) }; }
+    catch (error) { unavailable.set(name, error.message); }
+  }
+  if (Object.keys(additions).length) {
+    // Re-read just before writing so a marketplace Claude recorded meanwhile is kept.
+    const current = readJSON(knownFile(targetDir), {});
+    for (const [name, entry] of Object.entries(additions)) if (!current[name]) current[name] = entry;
+    writeJSONAtomic(knownFile(targetDir), current);
+  }
+  return unavailable;
+}
+
+function syncPlugins(account) {
+  const source = pluginSource(account);
   const installed = [], failed = [];
-  for (const id of missingPlugins(account)) {
-    const env = require('./agent-launcher').profileEnvironment('claude', { ...account, managed: true }, options.env || process.env);
-    const result = run(['plugin', 'install', id], env);
-    if (result && result.status === 0) installed.push(id);
-    else {
-      const detail = String(result?.stderr || result?.stdout || result?.error?.message || '').trim().split('\n').pop();
-      failed.push({ id, error: detail || `exit ${result?.status}` });
+  if (!source) return { installed, failed };
+  const sourceCache = canonical(path.join(source, 'plugins', 'cache'));
+  const targetCache = path.join(canonical(account.configDir), 'plugins', 'cache');
+  const sourceRecords = pluginRecords(source);
+  const missing = missingPlugins(account);
+  fs.mkdirSync(path.join(account.configDir, 'plugins'), { recursive: true, mode: 0o700 });
+  const unavailable = syncMarketplaces(source, canonical(account.configDir), missing);
+  const additions = {};
+  for (const id of missing) {
+    const entry = userEntry(sourceRecords, id);
+    const installPath = entry.installPath ? canonical(entry.installPath) : '';
+    const marketplace = unavailable.get(id.slice(id.lastIndexOf('@') + 1));
+    if (marketplace) { failed.push({ id, error: marketplace }); continue; }
+    if (!insideDirectory(installPath, sourceCache)) {
+      failed.push({ id, error: 'source install is not a directory in its plugins/cache' });
+      continue;
     }
+    try {
+      const destination = copyPluginDir(sourceCache, targetCache, path.relative(sourceCache, installPath));
+      additions[id] = { ...entry, installPath: destination };
+    } catch (error) { failed.push({ id, error: error.message }); }
+  }
+  if (Object.keys(additions).length) {
+    // Re-read just before writing so a record Claude added meanwhile is kept.
+    const file = path.join(account.configDir, 'plugins', 'installed_plugins.json');
+    const state = readJSON(file, { version: 2, plugins: {} });
+    const plugins = state.plugins && typeof state.plugins === 'object' && !Array.isArray(state.plugins) ? state.plugins : {};
+    for (const [id, entry] of Object.entries(additions)) {
+      if (userEntry(plugins, id)) continue;
+      plugins[id] = [...(Array.isArray(plugins[id]) ? plugins[id] : []), entry];
+      installed.push(id);
+    }
+    writeJSONAtomic(file, { ...state, version: state.version || 2, plugins });
   }
   return { installed, failed };
 }

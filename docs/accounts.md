@@ -24,7 +24,7 @@ For example, `keep codex --account codex-secondary context --json` shows the sel
 
 ## Add a Claude subscription
 
-Choose a new, empty config directory. Setup must run before login because it creates the profile directory and shares compatible settings, skills, rules, commands, and repository memory without linking account state or credentials. It also installs the source profile's plugins into the new profile. Run the same setup command again later to install any plugins the source has picked up since.
+Choose a new, empty config directory. Setup must run before login because it creates the profile directory and shares compatible settings, skills, rules, commands, and repository memory without linking account state or credentials. It also copies the source profile's installed plugins into the new profile. Run the same setup command again later to install any plugins the source has picked up since.
 
 ```sh
 keep accounts add claude-secondary \

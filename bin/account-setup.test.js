@@ -547,27 +547,51 @@ test('a handoff target missing a Keep hook the source has is refused by name', (
 test('setup installs the source profile user-scope plugins the target lacks', () => {
   const f = fixture();
   try {
-    const record = (ids) => ({ version: 2, plugins: Object.fromEntries(ids.map(([id, scope]) => [id, [{ scope, version: '1.0.0' }]])) });
-    fs.mkdirSync(path.join(f.sourceDir, 'plugins'), { recursive: true });
-    fs.writeFileSync(path.join(f.sourceDir, 'plugins', 'installed_plugins.json'),
-      JSON.stringify(record([['codex@openai-codex', 'user'], ['lsp@official', 'user'], ['repo-only@official', 'project']])));
+    const cache = (dir, relative) => path.join(dir, 'plugins', 'cache', relative);
+    const codexRelative = path.join('openai-codex', 'codex', '1.0.6');
+    fs.mkdirSync(path.join(cache(f.sourceDir, codexRelative), '.claude-plugin'), { recursive: true });
+    fs.writeFileSync(path.join(cache(f.sourceDir, codexRelative), '.claude-plugin', 'plugin.json'), '{"name":"codex"}');
+    const sourceMarket = path.join(f.sourceDir, 'plugins', 'marketplaces', 'openai-codex');
+    fs.mkdirSync(path.join(sourceMarket, '.claude-plugin'), { recursive: true });
+    fs.writeFileSync(path.join(sourceMarket, '.claude-plugin', 'marketplace.json'), '{"name":"openai-codex"}');
+    fs.writeFileSync(path.join(f.sourceDir, 'plugins', 'known_marketplaces.json'), JSON.stringify({
+      'openai-codex': { source: { source: 'github', repo: 'openai/codex-plugin-cc' }, installLocation: sourceMarket },
+      official: { source: { source: 'github', repo: 'anthropics/official' }, installLocation: path.join(f.sourceDir, 'plugins', 'marketplaces', 'official') },
+    }));
+    const settingsBefore = fs.readFileSync(path.join(f.sourceDir, 'settings.json'), 'utf8');
+    fs.writeFileSync(path.join(f.sourceDir, 'plugins', 'installed_plugins.json'), JSON.stringify({ version: 2, plugins: {
+      'codex@openai-codex': [{ scope: 'user', version: '1.0.6', installPath: cache(f.sourceDir, codexRelative), gitCommitSha: 'abc' }],
+      'lsp@official': [{ scope: 'user', version: '1.0.0', installPath: cache(f.sourceDir, 'official/lsp/1.0.0') }],
+      'repo-only@official': [{ scope: 'project', projectPath: f.repoA, installPath: cache(f.sourceDir, 'official/repo-only/1.0.0') }],
+      'outside@elsewhere': [{ scope: 'user', installPath: f.repoB }],
+    } }));
     assert.deepEqual(setup.missingPlugins(f.target), [], 'an unmanaged profile has no source to compare with');
     setup.shareSetup(f.source, f.target);
     fs.mkdirSync(path.join(f.targetDir, 'plugins'), { recursive: true });
-    fs.writeFileSync(path.join(f.targetDir, 'plugins', 'installed_plugins.json'), JSON.stringify(record([['lsp@official', 'user']])));
-    assert.deepEqual(setup.missingPlugins(f.target), ['codex@openai-codex']);
-    assert.deepEqual(setup.previewRefresh(f.target).plugins, ['codex@openai-codex']);
+    const targetRecord = path.join(f.targetDir, 'plugins', 'installed_plugins.json');
+    fs.writeFileSync(targetRecord, JSON.stringify({ version: 2, plugins: { 'lsp@official': [{ scope: 'user', version: '0.9.0' }] } }));
+    assert.deepEqual(setup.missingPlugins(f.target), ['codex@openai-codex', 'outside@elsewhere']);
+    assert.deepEqual(setup.previewRefresh(f.target).plugins, ['codex@openai-codex', 'outside@elsewhere']);
 
-    const calls = [];
-    const env = { PATH: process.env.PATH, ANTHROPIC_API_KEY: 'synthetic', CLAUDE_CONFIG_DIR: '/elsewhere' };
-    const ok = setup.syncPlugins(f.target, { env, run: (args, runEnv) => { calls.push({ args, runEnv }); return { status: 0 }; } });
-    assert.deepEqual(ok, { installed: ['codex@openai-codex'], failed: [] });
-    assert.deepEqual(calls[0].args, ['plugin', 'install', 'codex@openai-codex']);
-    assert.equal(calls[0].runEnv.CLAUDE_CONFIG_DIR, f.targetDir);
-    assert.equal(calls[0].runEnv.CLAUDE_SECURESTORAGE_CONFIG_DIR, f.targetDir);
-    assert.equal(calls[0].runEnv.ANTHROPIC_API_KEY, undefined, 'install runs with no provider credential');
-
-    const failed = setup.syncPlugins(f.target, { env, run: () => ({ status: 1, stderr: 'marketplace not found\n' }) });
-    assert.deepEqual(failed, { installed: [], failed: [{ id: 'codex@openai-codex', error: 'marketplace not found' }] });
+    const result = setup.syncPlugins(f.target);
+    assert.deepEqual(result.installed, ['codex@openai-codex']);
+    assert.deepEqual(result.failed.map((entry) => entry.id), ['outside@elsewhere'], 'a cache outside the source home is never copied');
+    const copied = cache(f.targetDir, codexRelative);
+    assert.equal(fs.readFileSync(path.join(copied, '.claude-plugin', 'plugin.json'), 'utf8'), '{"name":"codex"}');
+    assert.equal(fs.lstatSync(copied).isSymbolicLink(), false, 'the cache is a copy, not a link into the source');
+    const record = JSON.parse(fs.readFileSync(targetRecord, 'utf8')).plugins;
+    assert.equal(record['codex@openai-codex'][0].installPath, fs.realpathSync(copied));
+    assert.equal(record['codex@openai-codex'][0].gitCommitSha, 'abc');
+    assert.equal(record['lsp@official'][0].version, '0.9.0', 'a plugin the target already has is left alone');
+    const known = JSON.parse(fs.readFileSync(path.join(f.targetDir, 'plugins', 'known_marketplaces.json'), 'utf8'));
+    const targetMarket = path.join(f.targetDir, 'plugins', 'marketplaces', 'openai-codex');
+    assert.deepEqual(Object.keys(known), ['openai-codex'], 'only the marketplaces copied plugins need');
+    assert.equal(known['openai-codex'].installLocation, fs.realpathSync(targetMarket));
+    assert.equal(known['openai-codex'].source.repo, 'openai/codex-plugin-cc');
+    assert.equal(fs.readFileSync(path.join(targetMarket, '.claude-plugin', 'marketplace.json'), 'utf8'), '{"name":"openai-codex"}');
+    assert.match(result.failed[0].error, /marketplace elsewhere is not cloned/);
+    assert.equal(fs.readFileSync(path.join(f.sourceDir, 'settings.json'), 'utf8'), settingsBefore, 'shared settings are never written');
+    assert.deepEqual(setup.missingPlugins(f.target), ['outside@elsewhere']);
+    assert.deepEqual(setup.syncPlugins(f.target).installed, [], 'a rerun copies nothing new');
   } finally { f.cleanup(); }
 });
