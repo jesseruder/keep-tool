@@ -90,12 +90,18 @@ function tick(options = {}) {
 // self-repair's 30-minute threshold and opened a repair card for a message the pane
 // never kept. So contention is now waited out inside the tick, sampling across a span
 // instead of at one instant, and still well short of the next tick.
-const RECONCILE_WAIT_MS = 30e3;
+// The window is kept to a third of the cadence: the last attempt is allowed to start
+// just inside it, and on this machine one attempt is a host pane list that can spend
+// seconds waiting on the host and seconds more in ps. That overrun has to stay clear
+// of the 60s tick and of the silence threshold health.js puts at twice the cadence.
+const RECONCILE_WAIT_MS = 20e3;
 const RECONCILE_POLL_MS = 500;
-// Only a finite, non-negative number of milliseconds is a window; anything else -
-// including null, '' and NaN, all of which coerce to a number - takes the default
-// rather than silently disabling the wait or the boundary that ends it.
-const duration = (value, fallback) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback;
+// Only a non-negative whole number of milliseconds is a window. Anything else -
+// null and '' coerce to 0, NaN and Infinity are numbers too, and a fraction is
+// truncated by setTimeout so the attempt ceiling would stop counting the same thing
+// the clock does - takes the default rather than quietly disabling the wait or the
+// boundary that ends it.
+const duration = (value, fallback) => Number.isSafeInteger(value) && value >= 0 ? value : fallback;
 
 async function reconcileWithRetry(options) {
   if (!options.reconcile) return;
@@ -117,12 +123,13 @@ async function reconcileWithRetry(options) {
     try { return await options.reconcile(); }
     // Anything but contention is a real fault, and stays the caller's to record.
     catch (error) { if (!error || error.status !== 429) throw error; }
-    if (attempt + 1 >= maxAttempts) return;
+    // Busy for the whole window: inspect without mutating, as before. Tested on both
+    // sides of the sleep - before it, so an attempt that overran the window does not
+    // buy another poll first; after it, so a timer that fires late does not start a
+    // fresh pane list outside the window. An attempt begun inside the window may
+    // still overrun, and that one is unavoidable.
+    if (attempt + 1 >= maxAttempts || clock() >= deadline) return;
     await sleep(pollMs);
-    // Tested before committing to another attempt rather than only after one failed:
-    // a timer that fires late must not start a fresh pane list outside the window. An
-    // attempt begun inside it may still overrun, and that one is unavoidable.
-    // Busy for the whole window: inspect without mutating, as before.
     if (clock() >= deadline) return;
   }
 }

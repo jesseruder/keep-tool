@@ -179,15 +179,19 @@ test('a slow reconcile spends the window too, and a nonsense window falls back t
   await sweep({ ...f, health, reconcileWaitMs: 1000, reconcilePollMs: 250, clock: slow.clock, sleep: slow.sleep,
     reconcile: async () => { calls += 1; slow.spend(); throw busy(); } });
   assert.equal(calls, 2, 'time spent inside the reconcile counts against the window');
-  assert.ok(slow.at <= 1000 + 400, 'the sweep overruns its window by at most one attempt');
+  // 400 in, 250 asleep, 400 in again: an attempt that overran the window ends the
+  // sweep where it stands, rather than buying one more poll interval first.
+  assert.equal(slow.at, 1050, 'the sweep overruns its window by at most one attempt');
 
   // An unusable override must not turn the give-up test into a loop that never ends.
+  // A fraction is unusable too: setTimeout truncates it, so the attempt ceiling would
+  // stop counting the same milliseconds the clock does.
   const bad = fakeClock();
   let attempts = 0;
-  await sweep({ ...f, health, reconcileWaitMs: NaN, reconcilePollMs: 'soon', clock: bad.clock, sleep: bad.sleep,
+  await sweep({ ...f, health, reconcileWaitMs: NaN, reconcilePollMs: 1.9, clock: bad.clock, sleep: bad.sleep,
     reconcile: async () => { attempts += 1; throw busy(); } });
-  assert.equal(bad.at, 30e3, 'the default 30s window is used');
-  assert.equal(attempts, 60);
+  assert.equal(bad.at, 20e3, 'the default window is used');
+  assert.equal(attempts, 40);
 }));
 
 // The scheduler's re-entrancy guard means a sweep that never returns silences the
