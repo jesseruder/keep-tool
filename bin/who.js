@@ -95,7 +95,8 @@ function fleetSnapshot(project, input) {
         (session.notify && ['permission', 'waiting', 'question'].includes(session.notify.type))) flags.push('waiting');
     return {
       id: String(session.id || ''),
-      sid8: sessionRef(session.id),
+      sid8: String(session.id || '').slice(0, 8),
+      ref: sessionRef(session.id),
       kind: session.kind || session.agent || 'unknown',
       state: session.state || 'unknown',
       idleMinutes: Number.isFinite(Number(session.mtime)) ? Math.max(0, Math.floor((now - Number(session.mtime)) / 60e3)) : null,
@@ -151,7 +152,7 @@ function renderWho(snapshot) {
     for (const session of snapshot.sessions) {
       const idle = session.idleMinutes === null ? '?' : session.idleMinutes;
       const flags = session.flags.length ? ` · ${session.flags.join(', ')}` : '';
-      out.push(`  - ${session.sid8} ${session.kind} ${session.state} · idle ${idle}m${flags}` +
+      out.push(`  - ${session.ref || session.sid8} ${session.kind} ${session.state} · idle ${idle}m${flags}` +
         `${session.title ? ` · ${session.title}` : ''}${session.lastUser ? ` — ${session.lastUser}` : ''}`);
     }
   }
