@@ -109,17 +109,26 @@ export function launcherScript(nodePath, projectDir = PROJECT_DIR) {
 // --- the shared daemon ----------------------------------------------------
 
 /**
- * The port and token the daemon and every agent share. An existing token is kept: it is
- * already in every registered config, and rotating it under a running session would
- * break that session's browser access for no reason. `--rotate-token` is the way out.
+ * What daemon.json holds: the port, the bearer `token` every agent sends, and the `secret`
+ * session keys are derived from.
+ *
+ * Both are kept if they are already there. The token is in every registration's reach and
+ * rotating it under a running session would take that session's browser away for no reason;
+ * rotating the secret would re-derive every session key, which means every live session loses
+ * its tab group. `--rotate-token` does both deliberately. An install from before the secret
+ * existed gains one without its token changing.
  */
 export function daemonSettings(options, env = process.env) {
   const existing = readDaemonConfig(env);
-  if (existing && !options.rotateToken) return { ...existing, fresh: false };
+  const rotate = Boolean(options.rotateToken);
+  const token = !rotate && existing?.token ? existing.token : randomBytes(32).toString("hex");
+  const secret = !rotate && existing?.secret ? existing.secret : randomBytes(32).toString("hex");
   return {
     port: existing?.port ?? DEFAULT_DAEMON_PORT,
-    token: randomBytes(32).toString("hex"),
-    fresh: true,
+    token,
+    secret,
+    // Write only when something actually changed, so a re-run does not churn the file.
+    fresh: rotate || existing?.token !== token || existing?.secret !== secret,
   };
 }
 
@@ -367,26 +376,44 @@ function escapeForRegex(name) {
 }
 
 /**
- * Where a table starts and where its own lines end. The range covers every
- * `[<name>.<sub>]` sub-table that follows, because those belong to it: a leftover
- * `[mcp_servers.browser.http_headers]` sitting after a replaced table would collide with the
- * inline `http_headers` the new one declares, and a duplicate key makes the file unreadable.
+ * Sub-tables of ours that are the *user's* to keep. `[mcp_servers.browser.tools.<tool>]` is
+ * per-tool approval settings somebody typed on purpose, and it cannot collide with the inline
+ * keys this installer writes, so it is carried across a replacement rather than swept away.
+ */
+const PRESERVED_SUB_TABLE = /^\s*\[\s*mcp_servers\.browser\.tools(\.[^\]]*)?\s*\]/;
+
+/**
+ * Where a table starts, where its own lines end, and which of its sub-tables were in that
+ * range. The range covers every `[<name>.<sub>]` sub-table that follows, because those belong
+ * to it: a leftover `[mcp_servers.browser.http_headers]` sitting after a replaced table would
+ * collide with the inline `http_headers` the new one declares, and a duplicate key makes the
+ * file unreadable.
  */
 function tomlTableRange(lines, name) {
   const header = tomlHeaderPattern(escapeForRegex(name));
   const sub = tomlHeaderPattern(`${escapeForRegex(name)}\\.[^\\]]+`);
   const start = lines.findIndex((line) => header.test(line));
   if (start === -1) return null;
+  const subTables = [];
   let end = start + 1;
   for (;;) {
     while (end < lines.length && !/^\s*\[/.test(lines[end])) end++;
     if (end < lines.length && sub.test(lines[end])) {
+      const from = end;
       end += 1;
+      while (end < lines.length && !/^\s*\[/.test(lines[end])) end++;
+      subTables.push({ header: lines[from].trim(), lines: lines.slice(from, end) });
       continue;
     }
     break;
   }
-  return { start, end };
+  return { start, end, subTables };
+}
+
+/** What a replacement or a removal would take with it, for the installer to report. */
+export function tomlSubTables(text, name) {
+  const range = tomlTableRange(text.split("\n"), name);
+  return range ? range.subTables.map((sub) => sub.header) : [];
 }
 
 export function withTomlTable(text, name, table) {
@@ -397,12 +424,26 @@ export function withTomlTable(text, name, table) {
     const next = `${padded}${table}`;
     return next === text ? null : next;
   }
-  const { start } = range;
+  const { start, subTables } = range;
   let { end } = range;
   // The blank lines before whatever comes next (or the file's trailing newline) are not
   // part of this table. Leaving them where they are is what makes a second run a no-op.
   while (end > start + 1 && lines[end - 1].trim() === "") end--;
-  const replacement = [...lines.slice(0, start), ...table.replace(/\n$/, "").split("\n"), ...lines.slice(end)];
+  // Anything under `.tools` is the user's, so it is re-emitted after the new table instead of
+  // being swept up with the header tables we own.
+  const kept = [];
+  for (const sub of subTables) {
+    if (!PRESERVED_SUB_TABLE.test(sub.header)) continue;
+    const body = [...sub.lines];
+    while (body.length > 0 && body.at(-1).trim() === "") body.pop();
+    kept.push("", ...body);
+  }
+  const replacement = [
+    ...lines.slice(0, start),
+    ...table.replace(/\n$/, "").split("\n"),
+    ...kept,
+    ...lines.slice(end),
+  ];
   const next = replacement.join("\n");
   return next === text ? null : next;
 }
@@ -464,11 +505,13 @@ export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) 
     if (daemon.fresh) {
       files.push({
         path: daemonConfigPath(env),
-        content: `${JSON.stringify({ port: daemon.port, token: daemon.token }, null, 2)}\n`,
+        content: `${JSON.stringify({ port: daemon.port, token: daemon.token, secret: daemon.secret }, null, 2)}\n`,
         mode: 0o600,
-        // The token is the only secret this project has; a dry run must not print it,
-        // and neither must the terminal scrollback of a real run.
-        display: `{ "port": ${daemon.port}, "token": "<32 fresh random bytes, hex>" }`,
+        // Neither of these may reach a terminal or a log: the token drives the browser and the
+        // secret derives every session's key.
+        display:
+          `{ "port": ${daemon.port}, "token": "<32 random bytes, hex>", ` +
+          `"secret": "<32 random bytes, hex>" }`,
       });
     }
     files.push({
@@ -563,6 +606,8 @@ export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) 
       describe: table ? `set [${CODEX_TABLE}] to the daemon's url` : `remove [${CODEX_TABLE}]`,
       preview: table,
       apply: (text) => (table ? withTomlTable(text, CODEX_TABLE, table) : withoutTomlTable(text, CODEX_TABLE)),
+      dropped: (text) =>
+        tomlSubTables(text, CODEX_TABLE).filter((header) => table === null || !/\.tools\b/.test(header)),
       fallback: table ? codexFallback(table, home) : null,
     });
   }
@@ -771,6 +816,14 @@ export function applyEdit(edit) {
     return;
   }
 
+  // Anything of the user's own that this edit is about to take with it gets named, with the
+  // backup it will be in. Silently deleting somebody's per-tool settings is not on.
+  if (edit.dropped) {
+    for (const line of edit.dropped(text)) {
+      process.stdout.write(`${edit.label}: dropping ${line} (the previous file is kept at ${edit.path}.bak)\n`);
+    }
+  }
+
   let next;
   try {
     next = edit.apply(text);
@@ -878,9 +931,11 @@ const HELP = `Browser Bridge installer
   --browser <name>  which browser's native messaging directory to write (default: edge)
   --chrome-too      write both Edge's and Chrome's
   --stdio           register one stdio MCP server per session instead of the daemon
-  --rotate-token    replace the daemon token. No registration changes: the helper reads it
-                    from daemon.json each time. A live Claude Code session picks the new one
-                    up on its next call (it re-runs the helper on a 401); Codex on restart
+  --rotate-token    replace the daemon token and the key-derivation secret. No registration
+                    changes: the helper reads the token from daemon.json each time, so a live
+                    Claude Code session picks it up on its next call (it re-runs the helper on
+                    a 401) and Codex on restart. Every session key changes with the secret, so
+                    running sessions get new tab groups
   --dry-run         print every file, edit and command, change nothing
   --uninstall       remove the manifests, the launchd job and the registrations
                     (daemon.json, and so the token, is kept)

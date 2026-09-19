@@ -18,11 +18,20 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 import { LineDecoder, encodeLine } from "../host/protocol.js";
-import { IDLE_TIMEOUT_MS, STREAM_LOSS_IDLE_MS, createDaemon, sanitizeHeaderValue } from "../mcp/daemon.js";
+import {
+  IDLE_TIMEOUT_MS,
+  MAX_LIVE_SESSIONS,
+  STREAM_LOSS_IDLE_MS,
+  createDaemon,
+  sanitizeHeaderValue,
+} from "../mcp/daemon.js";
+import { deriveRegistryKey, deriveSessionKey } from "../mcp/identity.js";
 import { TOOL_NAMES } from "../mcp/tools.js";
 
 const DAEMON = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "mcp", "daemon.js");
 const TOKEN = "f".repeat(64);
+/** What session keys are derived from. Never sent anywhere; see mcp/identity.js. */
+const SECRET = "a1b2c3d4".repeat(8);
 
 /** A host stand-in on the bridge socket: records every line, answers what it is told. */
 function fakeHost(t, dir, handler = defaultHandler) {
@@ -79,6 +88,7 @@ async function startDaemon(t, dir, options = {}) {
   const logs = [];
   const daemon = createDaemon({
     token: TOKEN,
+    secret: SECRET,
     env: { ...process.env, BROWSER_BRIDGE_RUNTIME_DIR: dir },
     log: (line) => logs.push(line),
     ...options,
@@ -129,7 +139,8 @@ test("a header names the session, and the host's hello carries that name", async
   assert.equal(hello.params.name, "#12 fix-login");
   assert.equal(hello.params.agent, "claude");
   assert.equal(hello.params.account, "claude-tertiary");
-  assert.match(hello.params.sessionKey, /^[0-9a-f-]{36}$/, "a fresh uuid per MCP session");
+  // Derived from the session id under daemon.json's secret, not stored anywhere.
+  assert.equal(hello.params.sessionKey, deriveSessionKey(SECRET, transport.sessionId));
 
   assert.ok(
     logs.some((line) => line.includes("session start") && line.includes("fix-login")),
@@ -202,7 +213,7 @@ test("two sessions get two session ids and two socket clients", async (t) => {
     hellos.map((message) => message.params.name),
     ["session A", "session B"],
   );
-  assert.notEqual(hellos[0].params.sessionKey, hellos[1].params.sessionKey);
+  assert.notEqual(hellos[0].params.sessionKey, hellos[1].params.sessionKey, "two sessions, two keys");
   assert.equal(host.sockets.length, 2, "one socket connection per MCP session");
 });
 
@@ -343,12 +354,15 @@ test("an unknown session id is adopted, not refused", async (t) => {
   assert.equal(call.response.status, 200);
   assert.match(JSON.stringify(call.message), /Session: survivor/);
   assert.equal(daemon.sessions.size, 1);
-  assert.ok(logs.some((line) => line.includes("session adopted") && line.includes("key=new")), logs.join("\n"));
+  assert.ok(
+    logs.some((line) => line.includes("session adopted") && line.includes("labels=from the request")),
+    logs.join("\n"),
+  );
 
   // It is a real session: it talks to the host under a key of its own.
   const hello = host.hellos().at(-1);
   assert.equal(hello.params.name, "survivor");
-  assert.match(hello.params.sessionKey, /^[0-9a-f-]{36}$/);
+  assert.equal(hello.params.sessionKey, deriveSessionKey(SECRET, "a-session-from-a-daemon-that-has-restarted"));
 
   // A request with no session id at all is still a 400, not a silent new session.
   const bare = await fetch(`${base}/mcp`, {
@@ -376,7 +390,10 @@ test("a restarted daemon gives an adopted session the sessionKey it had", async 
   // A second daemon over the same runtime directory - which is what `kickstart -k` does -
   // and the client carries on with the id it already has.
   const second = await startDaemon(t, dir);
-  assert.equal(second.daemon.registry.get(sessionId).sessionKey, firstKey, "the registry survived");
+  // Nothing was looked up: the key is an HMAC of the id under daemon.json's secret, so the
+  // same id gives the same key with no stored mapping to steal or to lose.
+  assert.equal(firstKey, deriveSessionKey(SECRET, sessionId));
+  assert.equal(second.daemon.registry.get(deriveRegistryKey(SECRET, sessionId)).name, "#12 fix-login");
 
   const call = await rpc(
     second.port,
@@ -389,7 +406,7 @@ test("a restarted daemon gives an adopted session the sessionKey it had", async 
     firstKey,
     "the same key, so the extension hands back the tab group instead of opening a second one",
   );
-  assert.ok(second.logs.some((line) => line.includes("session adopted") && line.includes("key=remembered")));
+  assert.ok(second.logs.some((line) => line.includes("session adopted") && line.includes("labels=remembered")));
 });
 
 test("a session ended early is revived with its old sessionKey", async (t) => {
@@ -408,7 +425,9 @@ test("a session ended early is revived with its old sessionKey", async (t) => {
   // The stream-loss rule fires while the agent is merely asleep.
   assert.deepEqual(await daemon.sweep(clock + STREAM_LOSS_IDLE_MS), [sessionId]);
   assert.equal(daemon.sessions.size, 0);
-  assert.ok(daemon.registry.get(sessionId).ended > 0, "a tombstone, not a deletion");
+  const tomb = daemon.registry.get(deriveRegistryKey(SECRET, sessionId));
+  assert.ok(tomb.ended > 0, "a tombstone, not a deletion");
+  assert.equal(tomb.endedBy, "daemon", "the sweep ended it, so it may be adopted back");
 
   // The laptop wakes up and the agent carries on with the id it has.
   clock += 1_000;
@@ -419,7 +438,7 @@ test("a session ended early is revived with its old sessionKey", async (t) => {
   );
   assert.equal(call.response.status, 200);
   assert.equal(host.hellos().at(-1).params.sessionKey, originalKey, "its own tabs, not a second group");
-  assert.ok(logs.some((line) => line.includes("key=remembered (ended)")));
+  assert.ok(logs.some((line) => line.includes("labels=remembered (ended)")));
 });
 
 test("the registry file is private, atomic and pruned", async (t) => {
@@ -432,22 +451,31 @@ test("the registry file is private, atomic and pruned", async (t) => {
   daemon.registry.flush();
 
   const file = path.join(dir, "sessions.json");
-  assert.equal(fs.statSync(file).mode & 0o777, 0o600, "it names every live tab group; keep it private");
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
   const saved = JSON.parse(fs.readFileSync(file, "utf8"));
-  assert.equal(saved[sessionId].name, "on disk");
-  assert.match(saved[sessionId].sessionKey, /^[0-9a-f-]{36}$/);
+  const text = fs.readFileSync(file, "utf8");
+
+  // The file holds no session key and no session id. Storing keys meant any local reader -
+  // an agent told to `cat` something by a page it was reading - could hello on the socket as
+  // somebody else and drive their tab group.
+  assert.equal(text.includes(sessionId), false, "not even the id is in there");
+  assert.equal(text.includes(deriveSessionKey(SECRET, sessionId)), false, "and certainly not the key");
+  assert.deepEqual(Object.keys(saved), [deriveRegistryKey(SECRET, sessionId)]);
+  const entry = saved[deriveRegistryKey(SECRET, sessionId)];
+  assert.equal(entry.name, "on disk");
+  assert.equal("sessionKey" in entry, false);
   assert.equal(fs.existsSync(`${file}.tmp`), false, "the tmp file is renamed over, not left behind");
 
   // A day of silence ends the session, and the entry stays as a tombstone: the client may
   // still come back with that id, and then it needs this key to find its own tabs.
   clock += 25 * 60 * 60 * 1000;
   assert.deepEqual(await daemon.sweep(clock), [sessionId]);
-  assert.ok(daemon.registry.get(sessionId).ended > 0);
+  assert.ok(daemon.registry.get(deriveRegistryKey(SECRET, sessionId)).ended > 0);
 
   // A day after *that*, nothing is coming back for it.
   clock += 25 * 60 * 60 * 1000;
   await daemon.sweep(clock);
-  assert.equal(daemon.registry.get(sessionId), null);
+  assert.equal(daemon.registry.get(deriveRegistryKey(SECRET, sessionId)), null);
   daemon.registry.flush();
   assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), {});
 });
@@ -491,8 +519,12 @@ async function rpc(port, body, { sessionId, headers = {} } = {}) {
   const id = response.headers.get("mcp-session-id");
   if (response.status === 202) return { response, sessionId: id, message: null };
   const text = await response.text();
+  // An answer arrives as an SSE frame; a refusal (401/403/404/503) is plain JSON.
   const data = text.split("\n").find((line) => line.startsWith("data:"));
-  return { response, sessionId: id, message: data ? JSON.parse(data.slice(5).trim()) : null };
+  let message = null;
+  if (data) message = JSON.parse(data.slice(5).trim());
+  else if (text.trim().startsWith("{")) message = JSON.parse(text);
+  return { response, sessionId: id, message };
 }
 
 /** A session in the state Claude Code leaves one in: initialized and in use, no stream yet. */
@@ -811,7 +843,7 @@ test("an unknown path is 404 and needs no token", async (t) => {
 test("SIGTERM closes every session's socket before the daemon exits", async (t) => {
   const dir = tempDir(t);
   const host = await fakeHost(t, dir);
-  fs.writeFileSync(path.join(dir, "daemon.json"), JSON.stringify({ port: 0, token: TOKEN }), { mode: 0o600 });
+  fs.writeFileSync(path.join(dir, "daemon.json"), JSON.stringify({ port: 0, token: TOKEN, secret: SECRET }), { mode: 0o600 });
 
   const child = spawn(process.execPath, [DAEMON], {
     env: { ...process.env, BROWSER_BRIDGE_RUNTIME_DIR: dir },
@@ -842,7 +874,7 @@ test("SIGTERM closes every session's socket before the daemon exits", async (t) 
 test("the headers the helper prints are the headers the daemon accepts", async (t) => {
   const dir = tempDir(t);
   const host = await fakeHost(t, dir);
-  fs.writeFileSync(path.join(dir, "daemon.json"), JSON.stringify({ port: 0, token: TOKEN }), { mode: 0o600 });
+  fs.writeFileSync(path.join(dir, "daemon.json"), JSON.stringify({ port: 0, token: TOKEN, secret: SECRET }), { mode: 0o600 });
 
   // Exactly what an agent does: run the helper in the session's environment, then send
   // whatever it printed. Nothing in between knows what the headers are called.
@@ -963,34 +995,252 @@ test("shutdown does not wait out a wedged host", async (t) => {
   assert.ok(took < 6_000, `shutdown took ${took} ms`);
 });
 
-test("a session whose initialize fails does not linger", async (t) => {
+test("a session whose initialize fails after it was registered does not linger", async (t) => {
+  const dir = tempDir(t);
+  const host = await fakeHost(t, dir);
+  // The session is registered by onsessioninitialized *before* its initialize response goes
+  // out, so a throw in between used to leave it and its socket for the 24-hour sweep. Nothing
+  // real throws there, which is why the daemon takes a hook.
+  const { port, daemon, logs } = await startDaemon(t, dir, {
+    onSessionServer: async () => {
+      throw new Error("the transport fell over");
+    },
+  });
+
+  const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json, text/event-stream",
+      Authorization: `Bearer ${TOKEN}`,
+      "X-Browser-Bridge-Session": "doomed at birth",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "raw", version: "0" } },
+    }),
+  }).catch((error) => error);
+  if (!(response instanceof Error)) await response.text().catch(() => {});
+
+  assert.equal(daemon.sessions.size, 0, "nothing is left holding a socket");
+  assert.ok(
+    logs.some((line) => line.includes("session end") && /its initialize (failed|answered)/.test(line)),
+    logs.join("\n"),
+  );
+  assert.equal(host.hellos().length, 0, "it never got as far as the host");
+});
+
+test("a stream lost after a long quiet spell still gets its ten minutes", async (t) => {
+  const dir = tempDir(t);
+  await fakeHost(t, dir);
+  let clock = 2_000;
+  const { port, daemon } = await startDaemon(t, dir, { now: () => clock });
+
+  const sessionId = await rawSession(port, "long thinker");
+  const stream = await openStream(port, sessionId);
+  await settle();
+
+  // Half an hour of thinking with the stream open, which is an ordinary agent turn.
+  clock += 30 * 60 * 1000;
+  assert.deepEqual(await daemon.sweep(clock), [], "an open stream is alive");
+
+  // Now the stream drops. Measuring the ten minutes from the last *request* would have ended
+  // this session on the very next sweep, having given it no grace at all.
+  stream.close();
+  await settle();
+  assert.deepEqual(await daemon.sweep(clock), [], "the clock starts when the stream goes");
+  assert.deepEqual(await daemon.sweep(clock + STREAM_LOSS_IDLE_MS - 1), []);
+  assert.equal(daemon.sessions.size, 1);
+  assert.deepEqual(await daemon.sweep(clock + STREAM_LOSS_IDLE_MS), [sessionId]);
+});
+
+test("an id the client itself closed is dead, not adopted", async (t) => {
+  const dir = tempDir(t);
+  const host = await fakeHost(t, dir);
+  const { port, daemon } = await startDaemon(t, dir);
+
+  const sessionId = await rawSession(port, "said goodbye");
+  const byes = () => host.received.filter((message) => message.method === "bye").length;
+
+  const deleted = await fetch(`http://127.0.0.1:${port}/mcp`, {
+    method: "DELETE",
+    headers: {
+      Authorization: `Bearer ${TOKEN}`,
+      "Mcp-Session-Id": sessionId,
+      "Mcp-Protocol-Version": "2025-06-18",
+    },
+  });
+  assert.equal(deleted.status, 200);
+  await settle();
+  assert.equal(byes(), 1);
+  assert.equal(daemon.sessions.size, 0);
+
+  // DELETE released the tab group; the extension has let it go. Adopting the id back would
+  // take the group with it, so an id its own client closed stays closed.
+  const after = await rpc(
+    port,
+    { jsonrpc: "2.0", id: 9, method: "tools/list", params: {} },
+    { sessionId, headers: { "X-Browser-Bridge-Session": "said goodbye" } },
+  );
+  assert.equal(after.response.status, 404);
+  assert.equal(after.message.error.code, -32001);
+  assert.equal(daemon.sessions.size, 0);
+  assert.equal(host.hellos().length, 1, "no second hello, so no revived group");
+  assert.equal(daemon.registry.get(deriveRegistryKey(SECRET, sessionId)).endedBy, "client");
+
+  // And the same for a session the daemon *adopted* rather than started, which is the path a
+  // client takes after a restart. Its DELETE has to be just as final; it was not, and the id
+  // could be adopted a second time and take back the group DELETE had released.
+  const adopted = "an-id-this-daemon-never-issued";
+  await rpc(
+    port,
+    { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "browser_status", arguments: {} } },
+    { sessionId: adopted, headers: { "X-Browser-Bridge-Session": "adopted then gone" } },
+  );
+  assert.equal(daemon.sessions.size, 1);
+  const goodbye = await fetch(`http://127.0.0.1:${port}/mcp`, {
+    method: "DELETE",
+    headers: {
+      Authorization: `Bearer ${TOKEN}`,
+      "Mcp-Session-Id": adopted,
+      "Mcp-Protocol-Version": "2025-06-18",
+    },
+  });
+  assert.equal(goodbye.status, 200);
+  await settle();
+  assert.equal(daemon.registry.get(deriveRegistryKey(SECRET, adopted)).endedBy, "client");
+  const again = await rpc(port, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, { sessionId: adopted });
+  assert.equal(again.response.status, 404, "an adopted session's DELETE is final too");
+  assert.equal(byes(), 2);
+});
+
+test("an initialize carrying a stale session id starts a new session", async (t) => {
+  const dir = tempDir(t);
+  const host = await fakeHost(t, dir);
+  const { port, daemon, logs } = await startDaemon(t, dir);
+
+  // An adopted transport is already initialized, so handing it an initialize would be a 400
+  // for the life of that session. A client starting over is not a session to adopt.
+  const started = await rpc(
+    port,
+    {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "raw", version: "0" } },
+    },
+    { sessionId: "an-id-from-a-previous-life", headers: { "X-Browser-Bridge-Session": "starting over" } },
+  );
+  assert.equal(started.response.status, 200);
+  assert.notEqual(started.sessionId, "an-id-from-a-previous-life", "a new id, and a new derived key");
+  assert.equal(daemon.sessions.size, 1);
+  assert.ok(logs.some((line) => line.includes("initialize carried a stale session id")));
+
+  // And the new session works, under the key its new id derives.
+  await rpc(port, { jsonrpc: "2.0", method: "notifications/initialized" }, { sessionId: started.sessionId });
+  const call = await rpc(
+    port,
+    { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "browser_status", arguments: {} } },
+    { sessionId: started.sessionId },
+  );
+  assert.match(JSON.stringify(call.message), /Session: starting over/);
+  assert.equal(host.hellos().at(-1).params.sessionKey, deriveSessionKey(SECRET, started.sessionId));
+});
+
+test("two requests for the same unknown id share one adoption", async (t) => {
+  const dir = tempDir(t);
+  const host = await fakeHost(t, dir);
+  const { port, daemon } = await startDaemon(t, dir);
+
+  // An agent that resumes with a tool call while its event stream reconnects sends exactly
+  // this: two requests for one unknown id, on separate connections, at the same time.
+  const sessionId = "two-at-once-for-the-same-id";
+  const [a, b] = await Promise.all([
+    rpc(
+      port,
+      { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "browser_status", arguments: {} } },
+      { sessionId, headers: { "X-Browser-Bridge-Session": "racer" } },
+    ),
+    rpc(
+      port,
+      { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} },
+      { sessionId, headers: { "X-Browser-Bridge-Session": "racer" } },
+    ),
+  ]);
+
+  assert.equal(a.response.status, 200);
+  assert.equal(b.response.status, 200);
+  assert.equal(daemon.sessions.size, 1, "one session, not two");
+  assert.equal(host.hellos().length, 1, "and one socket client on that tab group");
+});
+
+test("the daemon refuses an absurd session id and a runaway number of sessions", async (t) => {
   const dir = tempDir(t);
   await fakeHost(t, dir);
   const { port, daemon } = await startDaemon(t, dir);
 
-  // A second initialize on the same session id: onsessioninitialized has already fired and
-  // registered the session, and then the transport refuses the request.
-  const first = await rpc(port, {
-    jsonrpc: "2.0",
-    id: 1,
-    method: "initialize",
-    params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "raw", version: "0" } },
-  });
-  const sessionId = first.sessionId;
-  assert.equal(daemon.sessions.size, 1);
+  for (const bad of ["", "x".repeat(129), "has\ttab", "café"]) {
+    const response = await rpc(port, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }, { sessionId: bad });
+    // An empty header is simply absent, so that one is the no-session-id 400; the rest are
+    // refused on their shape. Either way nothing is adopted.
+    assert.equal(response.response.status, 400, JSON.stringify(bad));
+  }
+  assert.equal(daemon.sessions.size, 0);
 
-  const again = await rpc(
-    port,
-    {
-      jsonrpc: "2.0",
-      id: 2,
-      method: "initialize",
-      params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "raw", version: "0" } },
-    },
-    { sessionId },
-  );
-  assert.equal(again.response.status, 400, "the SDK refuses a second initialize");
-  // The first session is untouched, and no half-made second one was left behind.
+  // A cap, so a client looping on new session ids cannot take the machine with it.
+  for (let index = 0; index < MAX_LIVE_SESSIONS; index++) {
+    daemon.sessions.set(`filler-${index}`, { inFlight: 0, openStreams: 0, lastSeenAt: 0 });
+  }
+  const full = await rpc(port, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }, { sessionId: "one-more" });
+  assert.equal(full.response.status, 503);
+  assert.match(full.message.error.message, new RegExp(`already holding ${MAX_LIVE_SESSIONS} sessions`));
+});
+
+test("the sweep keeps a live but quiet session's registry entry", async (t) => {
+  const dir = tempDir(t);
+  await fakeHost(t, dir);
+  let clock = 2_000;
+  const { port, daemon } = await startDaemon(t, dir, { now: () => clock });
+
+  const sessionId = await rawSession(port, "quiet but here");
+  const stream = await openStream(port, sessionId);
+  await settle();
+
+  // A day and a half of an open stream and no calls. The session lives (the stream says so),
+  // and its entry must live with it - pruning it would cost the session its name and, before
+  // keys were derived, its tab group.
+  clock += 36 * 60 * 60 * 1000;
+  assert.deepEqual(await daemon.sweep(clock), []);
   assert.equal(daemon.sessions.size, 1);
-  assert.ok(daemon.sessions.has(sessionId));
+  assert.ok(daemon.registry.get(deriveRegistryKey(SECRET, sessionId)), "still remembered");
+  stream.close();
+});
+
+test("a session name with an em dash or an emoji survives both paths", async (t) => {
+  const dir = tempDir(t);
+  const host = await fakeHost(t, dir);
+  const { port } = await startDaemon(t, dir);
+
+  for (const [label, name] of [
+    ["em dash", "#12 fix—login"],
+    ["emoji", "#13 ship 🚀"],
+    ["curly quote", "#14 don’t break"],
+  ]) {
+    // The helper's path: percent-encoded, because a code point above U+00FF makes a Headers
+    // constructor throw and that stops the whole MCP connection, not one call.
+    const encoded = await rawSession(port, encodeURIComponent(name));
+    assert.equal(host.hellos().at(-1).params.name, name, `${label} via the helper`);
+
+    // Codex's path: env_http_headers sends the raw UTF-8 bytes, which arrive latin1-decoded.
+    const raw = Buffer.from(name, "utf8").toString("latin1");
+    await rawSession(port, raw);
+    assert.equal(host.hellos().at(-1).params.name, name, `${label} via env_http_headers`);
+    assert.ok(encoded);
+  }
+
+  // And a name that really is Latin-1 is left alone rather than reinterpreted.
+  await rawSession(port, "café #15");
+  assert.equal(host.hellos().at(-1).params.name, "café #15");
 });

@@ -1,11 +1,13 @@
-// Which MCP session id belongs to which browser session, across daemon restarts.
+// What the daemon remembers about a session id between restarts.
 //
-// Why this exists: the SDK's client throws `Session not found` on a 404 and never resets
-// its session id, so a daemon that answered 404 after a restart stranded every live agent
-// permanently - and `node bin/install.js` restarts the daemon on every landing. The daemon
-// therefore *adopts* an id it does not know instead of refusing it, and this file is what
-// lets the adopted session keep its `sessionKey`, and so its Edge tab group, instead of
-// opening a second one beside the tabs the agent was using.
+// Deliberately *not* the session key. Keys are derived from the id (see
+// `deriveSessionKey`), so nothing here would let a reader of this file drive somebody else's
+// tab group - which is exactly what storing keys allowed. What is left is only what cannot be
+// derived: the labels to fall back on when a client stops sending its headers, when the id was
+// last used, and whether its session ended and who ended it.
+//
+// Entries are filed under `deriveRegistryKey(secret, id)`, so the file names neither the
+// session ids nor anything derived from them for the socket.
 //
 // A leaf module: node built-ins only, so the tests can load it on its own.
 
@@ -16,6 +18,8 @@ import path from "node:path";
 export const REGISTRY_TTL_MS = 24 * 60 * 60 * 1000;
 /** `lastSeen` is written at most this often; every request would mean a write per call. */
 export const TOUCH_INTERVAL_MS = 60_000;
+/** A bound on the file, so a machine that churns sessions cannot grow it without limit. */
+export const MAX_ENTRIES = 500;
 const WRITE_DELAY_MS = 250;
 
 export class SessionRegistry {
@@ -31,7 +35,7 @@ export class SessionRegistry {
     this.#writeDelayMs = writeDelayMs;
   }
 
-  /** Reads the file if it is there, drops anything stale, and never throws. */
+  /** Reads the file if it is there, drops anything stale or malformed, and never throws. */
   load() {
     let parsed;
     try {
@@ -40,16 +44,16 @@ export class SessionRegistry {
       parsed = null;
     }
     if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-      for (const [id, entry] of Object.entries(parsed)) {
-        if (!entry || typeof entry !== "object") continue;
-        if (typeof entry.sessionKey !== "string" || entry.sessionKey.length < 8) continue;
-        this.#entries.set(id, {
-          sessionKey: entry.sessionKey,
+      for (const [key, entry] of Object.entries(parsed)) {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+        if (!/^[0-9a-f]{64}$/.test(key)) continue; // not one of ours
+        this.#entries.set(key, {
           name: typeof entry.name === "string" ? entry.name : null,
           agent: typeof entry.agent === "string" ? entry.agent : null,
           account: typeof entry.account === "string" ? entry.account : null,
           lastSeen: Number.isFinite(entry.lastSeen) ? entry.lastSeen : 0,
           ended: Number.isFinite(entry.ended) ? entry.ended : undefined,
+          endedBy: entry.endedBy === "client" || entry.endedBy === "daemon" ? entry.endedBy : undefined,
         });
       }
     }
@@ -61,13 +65,14 @@ export class SessionRegistry {
     return this.#entries.size;
   }
 
-  get(id) {
-    return this.#entries.get(id) ?? null;
+  get(key) {
+    return this.#entries.get(key) ?? null;
   }
 
-  /** Record a session, live. Overwrites a tombstone for the same id. */
-  put(id, { sessionKey, name = null, agent = null, account = null }) {
-    this.#entries.set(id, { sessionKey, name, agent, account, lastSeen: this.#now() });
+  /** Record a session, live. Clears any tombstone for the same key. */
+  put(key, { name = null, agent = null, account = null }) {
+    this.#entries.set(key, { name, agent, account, lastSeen: this.#now() });
+    this.#capEntries();
     this.#scheduleSave();
   }
 
@@ -75,8 +80,8 @@ export class SessionRegistry {
    * Move `lastSeen` forward, but not on every request: an agent makes hundreds of calls and
    * the only thing this timestamp decides is when the entry may be pruned.
    */
-  touch(id, at = this.#now()) {
-    const entry = this.#entries.get(id);
+  touch(key, at = this.#now()) {
+    const entry = this.#entries.get(key);
     if (!entry) return;
     if (at - entry.lastSeen < TOUCH_INTERVAL_MS) return;
     entry.lastSeen = at;
@@ -84,28 +89,44 @@ export class SessionRegistry {
   }
 
   /**
-   * A tombstone, not a deletion. The extension keeps an ended session's tabs under an
-   * `ended` flag and gives the group back to the same `sessionKey`, so an id that comes
-   * back after its session was closed - which is exactly what a client does after a daemon
-   * restart, or after the stream-loss rule fired early - must be able to find its key.
+   * A tombstone, not a deletion, and `by` matters.
+   *
+   * `daemon` - the sweep decided the client had gone - may be adopted back: the client may
+   * well still be there and simply have been quiet, and then it should find its own tabs
+   * again. `client` means the client itself sent DELETE; that session is over, its group has
+   * been released, and the id must not come back to life and take the group with it.
    */
-  end(id, at = this.#now()) {
-    const entry = this.#entries.get(id);
+  end(key, { by = "daemon", at = this.#now() } = {}) {
+    const entry = this.#entries.get(key);
     if (!entry) return;
     entry.ended = at;
+    entry.endedBy = by;
     entry.lastSeen = at;
     this.#scheduleSave();
   }
 
   prune(at = this.#now()) {
     let dropped = 0;
-    for (const [id, entry] of this.#entries) {
+    for (const [key, entry] of this.#entries) {
       if (at - Math.max(entry.lastSeen, entry.ended ?? 0) > REGISTRY_TTL_MS) {
-        this.#entries.delete(id);
+        this.#entries.delete(key);
         dropped += 1;
       }
     }
+    dropped += this.#capEntries();
     if (dropped > 0) this.#scheduleSave();
+    return dropped;
+  }
+
+  /** Oldest first, because the newest entries are the ones a client may still present. */
+  #capEntries() {
+    if (this.#entries.size <= MAX_ENTRIES) return 0;
+    const byAge = [...this.#entries.entries()].sort((a, b) => a[1].lastSeen - b[1].lastSeen);
+    let dropped = 0;
+    while (this.#entries.size > MAX_ENTRIES && dropped < byAge.length) {
+      this.#entries.delete(byAge[dropped][0]);
+      dropped += 1;
+    }
     return dropped;
   }
 
@@ -120,9 +141,8 @@ export class SessionRegistry {
 
   /**
    * Write the whole map, atomically: a tmp file in the same directory and a rename, so a
-   * daemon killed mid-write leaves the previous registry intact rather than a truncated
-   * file that would strand every session it named. Failures are swallowed - losing the
-   * registry costs a tab group, not a session.
+   * daemon killed mid-write leaves the previous registry intact rather than a truncated file.
+   * Failures are swallowed - losing this costs a session its name, not its session.
    */
   flush() {
     if (this.#timer) {
@@ -130,9 +150,12 @@ export class SessionRegistry {
       this.#timer = null;
     }
     const object = {};
-    for (const [id, entry] of this.#entries) {
-      object[id] = { ...entry };
-      if (entry.ended === undefined) delete object[id].ended;
+    for (const [key, entry] of this.#entries) {
+      object[key] = { ...entry };
+      if (entry.ended === undefined) {
+        delete object[key].ended;
+        delete object[key].endedBy;
+      }
     }
     const tmp = `${this.#file}.tmp`;
     try {

@@ -36,8 +36,10 @@ The installer:
    native hosts with an empty environment, so nothing may depend on `PATH` or nvm);
 2. writes `~/Library/Application Support/Microsoft Edge/NativeMessagingHosts/com.keep.browser_bridge.json`
    (`--chrome-too` adds Chrome's);
-3. writes `BrowserBridge/daemon.json` (mode 0600) with the loopback port and a random
-   32-byte token, keeping the token if one is already there (`--rotate-token` replaces it);
+3. writes `BrowserBridge/daemon.json` (mode 0600) with the loopback port, a random 32-byte
+   `token` (what every agent sends) and a random 32-byte `secret` (what session keys are
+   derived from, and which never leaves this machine), keeping either if it is already there;
+   `--rotate-token` replaces both, which also moves every live session to a new tab group;
 4. writes `~/Library/LaunchAgents/com.keep.browser_bridge.daemon.plist` and reloads the
    launchd job — `kickstart -k` when the plist has not changed, otherwise `bootout`, a poll
    until launchd has really let go, and `bootstrap` with retries — then waits for `/healthz`
@@ -155,9 +157,10 @@ Worth knowing:
 `tabs_context_mcp{createIfEmpty}` open a new window instead of using the last focused one;
 it lives here rather than in the environment because one shared daemon has one environment.
 
-The runtime directory also holds `daemon.json` (the port and the token), `daemon.log`,
-`sessions.json` (which session id owns which tab group, so a daemon restart does not cost
-anyone their tabs), `host.log` and `screenshots/`. All of it is 0600 in a 0700 directory.
+The runtime directory also holds `daemon.json` (the port, the token and the key-derivation
+secret), `daemon.log`, `sessions.json` (each session's title and when it was last used — no
+session ids and no keys, both of which are derived rather than stored), `host.log` and
+`screenshots/`. All of it is 0600 in a 0700 directory.
 
 ## Troubleshooting
 
@@ -175,9 +178,10 @@ anyone their tabs), `host.log` and `screenshots/`. All of it is 0600 in a 0700 d
   sessions whose laptop had merely gone to sleep.) `daemon.log` shows what the daemon thinks
   each session is doing.
 - **A session's tools stop working after a restart, or its tabs move to a new group** — they
-  should not. An unknown session id is adopted rather than refused, and `sessions.json` gives
-  it back the tab group it had. If a group is abandoned anyway, that file and `daemon.log` are
-  where to look.
+  should not. An unknown session id is adopted rather than refused, and its tab group is keyed
+  by a value derived from the id, so a restart hands back the same group with nothing to look
+  up. `daemon.log` says `session adopted` when that happens. The one thing that does move every
+  group is `--rotate-token`, because the derivation secret changes with it.
 - **The daemon will not stay up** — `~/Library/Application Support/BrowserBridge/daemon.log`
   has one line per session plus the reason it exited. `launchctl print gui/$UID/com.keep.browser_bridge.daemon`
   shows what launchd thinks. A port already in use is an exit 1 with the reason.

@@ -175,25 +175,40 @@ slow). The host answers the client with an error on timeout and drops the late r
   404 and *never clears its session id*, so answering 404 after a restart took the browser
   away from every running agent permanently — and the installer restarts the daemon on every
   landing. So a request carrying an unknown id gets a transport bound to that id, a fresh
-  `createSessionServer`, and a `BridgeClient` whose `sessionKey` comes from
-  `BrowserBridge/sessions.json` when that file remembers the id (see below). The session's
-  name, agent and account come from the `X-Browser-Bridge-*` headers on the request in hand —
-  both clients send them on every request, not only on initialize — with the registry as
-  fallback. It is logged as `session adopted`.
+  `createSessionServer`, and a `BridgeClient` whose `sessionKey` is **derived** from the id
+  (see the security notes). The session's name, agent and account come from the
+  `X-Browser-Bridge-*` headers on the request in hand — both clients send them on every
+  request, not only on initialize — with the registry as fallback. It is logged as
+  `session adopted`.
+- What adoption checks, and what it does not: the id has to be 1–128 printable ASCII
+  characters, the daemon has to be under `MAX_LIVE_SESSIONS` (200; beyond that it is a 503),
+  and the id must not have a `client` tombstone. It does **not** check who is asking, because
+  there is nothing to check it against: holding the id *is* the credential. Two requests for
+  the same unknown id share one adoption (`adoptOnce`), because an agent resuming with a tool
+  call while its event stream reconnects sends exactly that, and two adoptions would mean two
+  socket clients on one tab group.
+- An `initialize` that still carries an old session id is a client starting over, not a session
+  to adopt: it gets a new session and a new derived key. An adopted transport is created
+  already-initialized, so handing it an initialize would be a 400 for the life of that session.
+- An id whose own client sent `DELETE` is **not** adopted — it gets the 404. That session is
+  over and its tab group has been released; bringing the id back would take the group with it.
+  An id the *daemon* ended (the sweep) is adopted back, because the sweep was only guessing.
 - Binding a transport to an id the SDK did not generate means setting `sessionId` and
   `_initialized` on its inner web-standard transport, which are plain instance properties in
   `@modelcontextprotocol/sdk` **1.30.0** (`validateSession` reads exactly those two). There is
   no public API for "this transport already belongs to session X". `adoptTransport` throws at
   the first adoption if a future SDK changes that shape, which is the failure mode worth
   having: the alternative is silently stranding every agent on the machine again.
-- `mcp/registry.js` keeps `{sessionId: {sessionKey, name, agent, account, lastSeen, ended}}`
-  in `BrowserBridge/sessions.json` (0600, written tmp-then-rename so an interrupted write
-  cannot truncate it, debounced so a request does not mean a write). An ended session leaves a
-  **tombstone** rather than being deleted, because the extension keeps an ended session's tabs
-  and hands the group back to the same `sessionKey`: an id that comes back — after a restart,
-  or after the stream-loss rule fired while a laptop was asleep — gets its own tabs rather
-  than a second group beside them. Entries a day past their last use are pruned at load and
-  by the sweep.
+- `mcp/registry.js` keeps `{name, agent, account, lastSeen, ended, endedBy}` in
+  `BrowserBridge/sessions.json` (0600, written tmp-then-rename so an interrupted write cannot
+  truncate it, debounced so a request does not mean a write, capped at 500 entries, oldest
+  dropped). It holds **no session key and no session id**: keys are derived, and each entry is
+  filed under `hmacSha256(secret, "registry:" + id)`. An ended session leaves a **tombstone**
+  rather than being deleted, because the extension keeps an ended session's tabs and hands the
+  group back to the same `sessionKey`, and `endedBy` says whether the id may come back at all.
+  Entries a day past their last use are pruned at load and by the sweep — and every live
+  session's entry is touched first, so a session that is quiet but plainly alive (its stream is
+  open) cannot have its entry pruned out from under it.
 - One MCP session closes when its client sends `DELETE /mcp`, when the client's event stream
   goes away and it then goes quiet, when it has made no request for 24 hours (swept once a
   minute), or when the daemon gets SIGTERM. All four close the session's `BridgeClient`, which
@@ -220,6 +235,10 @@ slow). The host answers the client with an error on timeout and drops the late r
     stream and no way to get one back — and a 30-second rule closed exactly those. The
     practical cost of the longer rule is that Claude Code's blank tabs are tidied up about ten
     minutes after it exits rather than thirty seconds, which is the right way round.
+  - The ten minutes run from the later of the last request and **the moment the stream went**.
+    Measuring from the last request alone meant a session that had been thinking for half an
+    hour with its stream open was swept on the very next tick after that stream dropped, having
+    been given no grace at all.
   - A session that has **never** had a GET stream is left to the idle clock: there is no
     signal to miss, so there is nothing to infer from its absence.
   - The reverse also holds: a session with a stream **open** never expires, not even on the
@@ -616,16 +635,23 @@ are its own to close.
   replies last reported.
 - Session identity comes from the request, because the daemon has no environment of its own:
   `X-Browser-Bridge-Session`, and optionally `X-Browser-Bridge-Agent` and
-  `X-Browser-Bridge-Account`. Each goes through `sanitizeHeaderValue` in `mcp/identity.js` —
-  trimmed, control characters stripped, capped at 80, and refused outright if what is left
-  still could not go in a header. With no session header the name is
-  `<clientInfo.name from initialize> #<n>` on a daemon-wide counter; Claude Code and Codex
-  send different `clientInfo` names and whatever they send is kept, sanitized the same way.
-- `bin/headers.js` sanitises the values it prints with that same function, and that is not
-  belt and braces: a `\r\n` in `BROWSER_BRIDGE_SESSION_NAME` makes the *client's* `Headers`
-  constructor throw, and then the browser server does not connect at all — not one call
-  fails, every call does. A 20 000-byte name is an HTTP 431. Anything that cannot be
-  transmitted is left out rather than mangled.
+  `X-Browser-Bridge-Account`. Each is decoded and then sanitised by `readHeaderValue` in
+  `mcp/identity.js` — control characters stripped, trimmed, capped at 80 *characters*. With no
+  session header the name is `<clientInfo.name from initialize> #<n>` on a daemon-wide counter;
+  Claude Code and Codex send different `clientInfo` names and whatever they send is kept,
+  sanitized the same way.
+- A name is allowed to be UTF-8. An em dash, a curly quote and an emoji are ordinary things to
+  find in a branch name, and a header value cannot carry a code point above U+00FF, so the
+  helper percent-encodes anything that is not plain printable ASCII and the daemon decodes it.
+  Codex's `env_http_headers` cannot encode, so its raw UTF-8 bytes (which arrive latin1-decoded)
+  are read back as UTF-8 when they round-trip exactly — a name that really is Latin-1 is left
+  alone. The one ambiguity is a literal `%` followed by two hex digits in a name nobody
+  encoded; that is a tab group's title, and the alternative is a second header Codex's env
+  mapping cannot set.
+- `bin/headers.js` sanitises and encodes the values it prints, and that is not belt and
+  braces: a `\r\n` in `BROWSER_BRIDGE_SESSION_NAME` makes the *client's* `Headers` constructor
+  throw, and then the browser server does not connect at all — not one call fails, every call
+  does. A 20 000-byte name is an HTTP 431.
 - Nothing in `bin/headers.js`'s import graph may reach the MCP SDK; it runs on every request
   either agent makes, and loading the SDK and zod cost about 60 ms a time. That is why
   `mcp/identity.js` is a leaf module (node built-ins only) rather than part of `session.js`,
@@ -662,8 +688,24 @@ socket can drive the browser". `daemon.json` is 0600 in a 0700 directory, and th
 - Request bodies are capped at 16 MiB and read by the daemon itself, so an oversized body
   is a 413 and the socket is dropped rather than buffered. `file_upload` sends paths, not
   bytes, so nothing legitimate comes near the cap.
-- A session id the daemon does not know is a 404 and nothing else: no session is created
-  and nothing is leaked about which ids exist.
+- **Cross-session isolation rests on the MCP session id.** A `sessionKey` — what the
+  extension keys a tab group by, and all the host asks for — is
+  `hmacSha256(daemon.json's secret, "session:" + <session id>)`. So whoever holds an id can
+  drive that session's tab group, and nothing else can: the ids are 122 random bits from
+  `randomUUID`, they are never written to disk, and they only ever travel between a client and
+  the daemon on loopback.
+- That is why keys are derived rather than stored. `sessions.json` used to hold them, and an
+  agent that had just been told to `cat` a file by a web page it was reading could have said
+  `hello` on the socket with somebody else's key and driven their browser. Now that file names
+  no ids and no keys — its entries are filed under a second HMAC of the same id — and losing it
+  costs a session its title, not its isolation.
+- The secret plus an id would of course derive that id's key. But `daemon.json` also holds the
+  token, and anything that can read it can drive every browser session directly; the secret
+  adds no exposure, and it is never sent in a header, so it does not leave the machine the way
+  the token does.
+- Adoption authenticates nothing beyond the token and the id, by design: after a restart there
+  is no session state left to check a caller against, and refusing instead was the bug. It does
+  check the id's shape, a live-session cap, and whether the client itself closed that id.
 
 ## Installer
 
@@ -679,10 +721,13 @@ node bin/install.js [--browser edge|chrome] [--chrome-too] [--stdio]
 2. Write `~/Library/Application Support/Microsoft Edge/NativeMessagingHosts/com.keep.browser_bridge.json`
    (`allowed_origins` = the fixed extension origin), and the Chrome equivalent when
    asked.
-3. Write `daemon.json` (mode 0600) with the port and a fresh 32-byte hex token **if it is
-   not already there**. An existing token is never rotated: it is in every registration
-   already, and rotating it under a running session would take that session's browser away
-   for no reason. `--rotate-token` is the way to do it deliberately.
+3. Write `daemon.json` (mode 0600) with the port, a 32-byte hex `token` and a 32-byte hex
+   `secret`, creating either **if it is not already there**. The token authenticates a request;
+   the secret is what session keys are derived from and never leaves the machine. Neither is
+   rotated on a re-run: the token is in every registration's reach, and rotating the secret
+   re-derives every key, which costs every live session its tab group. `--rotate-token` does
+   both deliberately. An install from before the secret existed gains one with its token
+   untouched.
 4. Write `~/Library/LaunchAgents/com.keep.browser_bridge.daemon.plist` (the same node the
    native-host launcher uses, `mcp/daemon.js`, RunAtLoad, KeepAlive, ThrottleInterval 5,
    WorkingDirectory the bridge directory, both output paths `BrowserBridge/daemon.log`) and
@@ -786,6 +831,12 @@ node bin/install.js [--browser edge|chrome] [--chrome-too] [--stdio]
    that follows. Those belong to the table: a leftover
    `[mcp_servers.browser.http_headers]` sitting after a replaced table collides with the
    inline `http_headers` the new one declares, which is the same duplicate-key failure.
+
+   `[mcp_servers.browser.tools.*]` is the exception, and it is the user's: per-tool approval
+   settings somebody typed, which cannot collide with anything the installer writes. Those are
+   re-emitted after the new table rather than swept away. Anything else the edit does drop is
+   printed by name along with the `.bak` it is in — quietly deleting somebody's configuration
+   is not a thing an installer gets to do.
 6. Wait up to 10 s for `GET /healthz` to answer and report the port, the pid and the session
    count. **A dark `/healthz`, or a job launchd does not have loaded, is never reported as
    success**: the installer prints `THE DAEMON IS DOWN`, where the log is, and the three
@@ -858,9 +909,16 @@ needs no private key. The id is a constant in `host/protocol.js` and the install
   of its own: an unknown id is served and gets a fresh key, the same id against a second
   daemon over the same registry file gets the key the first one used (so the host sees the
   same `hello` sessionKey), an id whose session was ended early is revived with its old key,
-  and the registry file is 0600, atomic and pruned. `/healthz` is checked for the Host and
-  Origin refusals, shutdown for finishing quickly against a host that never answers `bye`,
-  and the sweep for never ending a session mid-call. The stream-based cleanup has
+  and the registry file is 0600, atomic and pruned, and holds neither an id nor a key. Also:
+  an id the client itself deleted is a 404 and never revived, an initialize carrying a stale id
+  starts a new session, two parallel requests for one unknown id share a single adoption, an
+  absurd id and a runaway session count are refused, a stream lost after a long quiet spell
+  still gets its ten minutes, a live-but-quiet session keeps its registry entry, and a name
+  with an em dash or an emoji survives both the helper's path and Codex's. `/healthz` is
+  checked for the Host and Origin refusals, shutdown for finishing quickly against a host that
+  never answers `bye`, and the sweep for never ending a session mid-call. The one failure that
+  nothing real produces — a throw between a session being registered and its initialize being
+  answered — is reached through an injected hook. The stream-based cleanup has
   four of its own, driven over raw HTTP rather than through the SDK client (which opens the
   standalone GET stream itself, so a second one is a 409 — which is exactly what proves a
   client holds one): a dropped stream ends the session after the grace, a stream reopened
@@ -871,10 +929,12 @@ needs no private key. The id is a constant in `host/protocol.js` and the install
   exit 0 either way. Also that a hostile environment value (`\r\n`, 20 000 bytes, characters
   no header can carry) still produces headers a real `Headers` constructor accepts, and that
   its import graph reaches nothing but `node:` built-ins.
-- `test/registry.test.js`: the registry on its own — a reload keeps the key and the labels, an
-  ended entry leaves a tombstone that still carries the key, `lastSeen` is not rewritten on
-  every touch, stale entries are pruned at load and on demand, a missing or junk file is not a
-  crash, and the file is 0600 and renamed into place.
+- `test/registry.test.js`: the derivation (stable per id, different per id and per machine,
+  and the registry's own label distinct from the session key) and the registry on its own — a
+  reload keeps the labels and holds no key, a tombstone records who ended the session,
+  `lastSeen` is not rewritten on every touch, stale entries are pruned and the count is capped
+  oldest-first, a missing or junk file is not a crash, and the file is 0600 and renamed into
+  place.
 - `test/install.test.js`: `--dry-run` output, the manifest, the plist, `daemon.json`
   creation without rotation, both config edits as pure functions, and a real run against a
   temp HOME with a fake command runner and a fake health probe (nothing reaches launchd,
@@ -919,6 +979,13 @@ the daemon as `X-Browser-Bridge-Session` instead of being read by a child proces
 - Adoption reads two private fields of the MCP SDK's transport. It is pinned to a version and
   it fails loudly rather than quietly, but it is the one place here that depends on something
   the SDK does not promise.
+- Anything that can read `daemon.json` can drive every browser session: the token gets it in,
+  and the secret derives any session's key from its id. That is the same boundary as the socket,
+  but it is a boundary a *file* now defines, so the runtime directory staying 0700 matters more
+  than it did.
+- A session name that is not plain ASCII is carried percent-encoded from the helper and raw
+  from Codex, which means a name containing a literal `%41` arrives as `%41` from Codex and as
+  `A` from Claude Code. Only the tab group's title is affected.
 - Codex's session name and account come from `env_http_headers`, which names one environment
   variable per header, so there is no room for `bin/headers.js`'s fallback chain: a Codex
   session with no `KEEP_AGENT_ACCOUNT_ID` reports no account, where a Claude Code one would

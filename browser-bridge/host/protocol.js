@@ -366,9 +366,14 @@ export function sessionsPath(env = process.env) {
 }
 
 /**
- * `{port, token}` from daemon.json, or null when it is missing or unreadable. A missing
- * file is the normal state before the installer has ever run, and neither the daemon nor
- * the headers helper may treat it as a crash: a session must start either way.
+ * `{port, token, secret}` from daemon.json, or null when it is missing or unreadable. A
+ * missing file is the normal state before the installer has ever run, and neither the daemon
+ * nor the headers helper may treat it as a crash: a session must start either way.
+ *
+ * `token` authenticates a request. `secret` is what session keys are derived from and never
+ * leaves this machine - the helper does not read it and it is never sent in a header. An
+ * install from before it existed has a token and no secret; the daemon says so and the
+ * installer adds one without touching the token.
  */
 export function readDaemonConfig(env = process.env) {
   let parsed;
@@ -380,11 +385,12 @@ export function readDaemonConfig(env = process.env) {
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
   const token = typeof parsed.token === "string" && parsed.token.length > 0 ? parsed.token : null;
   if (!token) return null;
+  const secret = typeof parsed.secret === "string" && /^[0-9a-f]{32,}$/.test(parsed.secret) ? parsed.secret : null;
   // Port 0 means "any free port"; the tests use it, and the daemon reports what it got.
   const port = Number.isInteger(parsed.port) && parsed.port >= 0 && parsed.port <= 65535
     ? parsed.port
     : DEFAULT_DAEMON_PORT;
-  return { port, token };
+  return { port, token, secret };
 }
 
 export function daemonUrl(port) {

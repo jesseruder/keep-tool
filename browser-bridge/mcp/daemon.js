@@ -19,12 +19,26 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 
 import { DEFAULT_DAEMON_PORT, readDaemonConfig, sessionsPath, socketPath } from "../host/protocol.js";
 import { BridgeClient } from "./client.js";
-import { MAX_HEADER_VALUE_LENGTH, sanitizeHeaderValue } from "./identity.js";
+import {
+  MAX_HEADER_VALUE_LENGTH,
+  deriveRegistryKey,
+  deriveSessionKey,
+  readHeaderValue,
+  sanitizeHeaderValue,
+} from "./identity.js";
 import { SessionRegistry } from "./registry.js";
 import { createSessionServer } from "./session.js";
 
 // Re-exported so the tests and any caller keep finding them here.
 export { MAX_HEADER_VALUE_LENGTH, sanitizeHeaderValue };
+
+/** More than this many live sessions is a runaway, not a Tuesday. */
+export const MAX_LIVE_SESSIONS = 200;
+/**
+ * A session id has to be safe to put in a log line, a Map key and an HMAC. Both clients send
+ * a UUID; this only rules out the absurd.
+ */
+const VALID_SESSION_ID = /^[\x20-\x7e]{1,128}$/;
 
 /** Tool calls carry file_upload paths and GIF options, never bytes; 16 MiB is generous. */
 export const MAX_BODY_BYTES = 16 * 1024 * 1024;
@@ -109,31 +123,41 @@ function initializeRequest(body) {
  */
 export function createDaemon({
   token,
+  secret,
   env = process.env,
   now = () => Date.now(),
   makeClient,
   registry,
+  onSessionServer,
   log = (line) => process.stderr.write(`${new Date().toISOString()} ${line}\n`),
 } = {}) {
   if (typeof token !== "string" || token.length === 0) {
     throw new Error("the daemon needs the token from daemon.json");
   }
+  if (typeof secret !== "string" || !/^[0-9a-f]{32,}$/.test(secret)) {
+    throw new Error("the daemon needs the secret from daemon.json (run `node bin/install.js`)");
+  }
 
   const sessions = new Map();
-  /** Which session id had which sessionKey, kept across restarts; see mcp/registry.js. */
+  /** What could not be derived about a session id: its labels and its tombstone. */
   const known = (registry ?? new SessionRegistry({ file: sessionsPath(env), now })).load();
+  /** One adoption per id, even if two requests for it arrive together. */
+  const adopting = new Map();
   let fallbackCounter = 0;
   let closing = false;
+
+  const registryKey = (id) => deriveRegistryKey(secret, id);
+  const remember = (id) => known.get(registryKey(id));
 
   const newClient =
     makeClient ??
     (({ name, agent, account, sessionKey }) =>
       new BridgeClient({
         socketPath: socketPath(env),
-        // A fresh key per MCP session, exactly as a fresh process had: the extension keys a
-        // tab group by it, and two sessions must never share one. An adopted session passes
-        // the key the registry remembers, which is what gives it its own group back.
-        sessionKey: sessionKey ?? randomUUID(),
+        // Derived from the MCP session id, never stored and never random: the same id gives
+        // the same key after a restart, which is what hands a session its own tab group back,
+        // and no file anywhere maps one to the other.
+        sessionKey,
         name,
         agent,
         account,
@@ -225,6 +249,21 @@ export function createDaemon({
       }
     }
 
+    const initializing = req.method === "POST" ? initializeRequest(body) : undefined;
+
+    // An `initialize` that still carries an old session id is a client starting over, not a
+    // session to adopt: an adopted transport is already initialized, so handing it one would
+    // be a permanent 400. Give it a new session, and a new derived key with it.
+    if (sessionId && initializing) {
+      if (closing) {
+        jsonError(res, 503, -32000, "The Browser Bridge daemon is shutting down");
+        return;
+      }
+      log(`initialize carried a stale session id; starting a new session instead`);
+      await startSession(req, res, body, initializing);
+      return;
+    }
+
     if (sessionId) {
       let entry = sessions.get(sessionId);
       if (!entry) {
@@ -232,16 +271,37 @@ export function createDaemon({
           jsonError(res, 503, -32000, "The Browser Bridge daemon is shutting down");
           return;
         }
+        if (!VALID_SESSION_ID.test(sessionId)) {
+          jsonError(res, 400, -32000, "Bad Request: Mcp-Session-Id is not a usable session id");
+          return;
+        }
+        const remembered = remember(sessionId);
+        // A session the client itself closed is over. Reviving it would take back the tab
+        // group that DELETE released - the extension has already let it go - so this id is
+        // dead until its tombstone is pruned.
+        if (remembered?.endedBy === "client") {
+          jsonError(res, 404, -32001, "Session not found");
+          return;
+        }
+        if (sessions.size >= MAX_LIVE_SESSIONS) {
+          jsonError(
+            res,
+            503,
+            -32000,
+            `The Browser Bridge daemon is already holding ${MAX_LIVE_SESSIONS} sessions`,
+          );
+          return;
+        }
         // NOT a 404. The SDK's client - and the transport bundled in Claude Code - throws
         // `Session not found` on one and never clears its session id, so a 404 strands that
         // agent's browser access for good, and `node bin/install.js` restarts this daemon on
         // every landing. The id is adopted instead, and the registry gives it back the
         // sessionKey it had, which is what makes the extension hand back the same tab group.
-        entry = await adoptSession(req, sessionId);
+        entry = await adoptOnce(req, sessionId);
       }
       // Any request at all means the client is still there; the sweep reads this.
       entry.lastSeenAt = now();
-      known.touch(sessionId, entry.lastSeenAt);
+      known.touch(registryKey(sessionId), entry.lastSeenAt);
       if (req.method === "GET") trackStream(entry, res);
       else entry.inFlight += 1;
       try {
@@ -254,8 +314,7 @@ export function createDaemon({
       return;
     }
 
-    const initialize = req.method === "POST" ? initializeRequest(body) : undefined;
-    if (!initialize) {
+    if (!initializing) {
       jsonError(res, 400, -32000, "Bad Request: Mcp-Session-Id header is required");
       return;
     }
@@ -263,7 +322,11 @@ export function createDaemon({
       jsonError(res, 503, -32000, "The Browser Bridge daemon is shutting down");
       return;
     }
-    await startSession(req, res, body, initialize);
+    if (sessions.size >= MAX_LIVE_SESSIONS) {
+      jsonError(res, 503, -32000, `The Browser Bridge daemon is already holding ${MAX_LIVE_SESSIONS} sessions`);
+      return;
+    }
+    await startSession(req, res, body, initializing);
   }
 
   // --- the client's event stream as a liveness signal ---------------------
@@ -285,6 +348,7 @@ export function createDaemon({
       // Nothing is armed here. Whether this session should end is decided from its state by
       // the sweep, because a client may reopen the stream, or carry on without one.
       entry.streamed = true;
+      if (entry.openStreams <= 0) entry.streamLostAt = now();
     };
     res.on("close", settle);
   }
@@ -296,9 +360,9 @@ export function createDaemon({
    * name from initialize is the last resort.
    */
   function identityFor(req, { initialize, remembered } = {}) {
-    const agent = sanitizeHeaderValue(req.headers["x-browser-bridge-agent"], 40) ?? remembered?.agent ?? null;
-    const account = sanitizeHeaderValue(req.headers["x-browser-bridge-account"]) ?? remembered?.account ?? null;
-    let name = sanitizeHeaderValue(req.headers["x-browser-bridge-session"]) ?? remembered?.name ?? null;
+    const agent = readHeaderValue(req.headers["x-browser-bridge-agent"], 40) ?? remembered?.agent ?? null;
+    const account = readHeaderValue(req.headers["x-browser-bridge-account"]) ?? remembered?.account ?? null;
+    let name = readHeaderValue(req.headers["x-browser-bridge-session"]) ?? remembered?.name ?? null;
     if (!name) {
       // Claude Code and Codex send different clientInfo names; whatever they send is
       // better than nothing, and the counter keeps two of them apart.
@@ -317,6 +381,10 @@ export function createDaemon({
       lastSeenAt: now(),
       openStreams: 0,
       streamed: false,
+      // When the last stream went away. The ten-minute rule runs from the later of this and
+      // the last request: a session that had been quiet for half an hour with its stream open
+      // was otherwise swept the moment the stream dropped, having been given no grace at all.
+      streamLostAt: 0,
       inFlight: 0,
     };
   }
@@ -339,7 +407,10 @@ export function createDaemon({
       enableDnsRebindingProtection: true,
       allowedHosts: allowedHosts(),
       onsessionclosed: (closed) => {
-        void endSession(closed, "client closed the session");
+        // `by: "client"` exactly as for a session the daemon started: an adopted session's
+        // DELETE is just as final, and without it the id could be adopted a second time and
+        // take back the tab group that DELETE had released.
+        void endSession(closed, "client closed the session", { by: "client" });
       },
     });
     const inner = transport._webStandardTransport;
@@ -358,48 +429,72 @@ export function createDaemon({
    * back the tabs it was using instead of a second group beside them.
    */
   async function adoptSession(req, id) {
-    const remembered = known.get(id);
+    const remembered = remember(id);
     const identity = identityFor(req, { remembered });
-    const sessionKey = remembered?.sessionKey;
-    const client = newClient({ ...identity, sessionKey });
+    // Derived from the id, so there is nothing to look up and nothing that could be handed to
+    // the wrong caller: whoever holds the id gets the key for that id, and only that one.
+    const client = newClient({ ...identity, sessionKey: deriveSessionKey(secret, id) });
     const entry = newEntry(identity, client);
     entry.id = id;
     entry.transport = adoptTransport(id);
     entry.transport.onerror = (error) => log(`transport error: ${error?.message ?? error}`);
 
     const server = createSessionServer({ ...identity, client, env });
-    await server.connect(entry.transport);
-
+    // Register before the first await that could let another request in. `adoptOnce` holds the
+    // lock, but nothing below here may await before `sessions.set`: two adoptions of one id
+    // would mean two socket clients on one tab group.
     sessions.set(id, entry);
-    known.put(id, { ...identity, sessionKey: client.sessionKey });
+    known.put(registryKey(id), identity);
     log(
       `session adopted ${id} name=${JSON.stringify(identity.name)} ` +
-        `key=${remembered ? (remembered.ended ? "remembered (ended)" : "remembered") : "new"} ` +
+        `labels=${remembered ? (remembered.ended ? "remembered (ended)" : "remembered") : "from the request"} ` +
         `(${sessions.size} open)`,
     );
+    await server.connect(entry.transport);
     return entry;
+  }
+
+  /**
+   * One adoption per id. Two requests for the same unknown id can arrive together on separate
+   * connections - an agent that resumes with a tool call while its event stream reconnects does
+   * exactly that - and each would otherwise build a whole session of its own.
+   */
+  function adoptOnce(req, id) {
+    const running = adopting.get(id);
+    if (running) return running;
+    const started = adoptSession(req, id).finally(() => adopting.delete(id));
+    adopting.set(id, started);
+    return started;
   }
 
   async function startSession(req, res, body, initialize) {
     const identity = identityFor(req, { initialize });
-    const client = newClient(identity);
+    // The id is minted here rather than inside the transport, because the session key is
+    // derived from it and the client needs the key before the transport answers.
+    const id = randomUUID();
+    const client = newClient({ ...identity, sessionKey: deriveSessionKey(secret, id) });
     const entry = newEntry(identity, client);
 
     const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
+      sessionIdGenerator: () => id,
       enableDnsRebindingProtection: true,
       // The bound port, not the configured one: the tests listen on port 0.
       allowedHosts: allowedHosts(),
-      onsessioninitialized: (id) => {
-        entry.id = id;
-        sessions.set(id, entry);
-        known.put(id, { ...identity, sessionKey: client.sessionKey });
-        log(`session start ${id} name=${JSON.stringify(identity.name)} agent=${identity.agent ?? "-"} account=${identity.account ?? "-"} (${sessions.size} open)`);
+      onsessioninitialized: async (started) => {
+        entry.id = started;
+        sessions.set(started, entry);
+        known.put(registryKey(started), identity);
+        log(`session start ${started} name=${JSON.stringify(identity.name)} agent=${identity.agent ?? "-"} account=${identity.account ?? "-"} (${sessions.size} open)`);
+        // A hook for the tests, and the only way to reach the failure path below: the session
+        // is registered from here, before its initialize response goes out, and nothing else
+        // in between throws.
+        if (onSessionServer) await onSessionServer({ id: started, transport, server });
       },
-      onsessionclosed: (id) => {
-        // The client said DELETE: close its socket so the host emits session_closed,
-        // exactly as a stdio server's `bye` on exit did.
-        void endSession(id, "client closed the session");
+      onsessionclosed: (closed) => {
+        // The client said DELETE: close its socket so the host emits session_closed, exactly
+        // as a stdio server's `bye` on exit did. `by: "client"` is what makes that final:
+        // the group has been released and this id must not bring it back.
+        void endSession(closed, "client closed the session", { by: "client" });
       },
     });
     entry.transport = transport;
@@ -425,6 +520,14 @@ export function createDaemon({
     if (!entry.id) {
       await closeQuietly(client);
       await closeQuietly(transport);
+      return;
+    }
+    // Registered, but the initialize did not come back 200: something between registering the
+    // session and answering went wrong, and the error did not reach us as a throw (the Node
+    // wrapper turns one into a 500 of its own). Either way this session has no client that
+    // knows about it, so nothing would ever close it.
+    if (res.statusCode >= 400) {
+      await endSession(entry.id, `its initialize answered ${res.statusCode}`);
     }
   }
 
@@ -436,14 +539,14 @@ export function createDaemon({
     }
   }
 
-  async function endSession(id, reason) {
+  async function endSession(id, reason, { by = "daemon" } = {}) {
     const entry = sessions.get(id);
     if (!entry) return;
     sessions.delete(id);
-    // A tombstone, not a deletion: the same id may well come back (a client that never saw
-    // the end of its session, a daemon restart), and then it needs this sessionKey to get
-    // its tab group back rather than a second one beside it.
-    known.end(id);
+    // A tombstone, not a deletion: an id the *daemon* ended may well come back - a client that
+    // was merely quiet, or a restart - and it should find its own tabs again. An id the
+    // *client* ended is over; see the 404 in `handle`.
+    known.end(registryKey(id), { by });
     // `bye` first: the host drops the session and the extension keeps the tabs, so a
     // session that comes back with the same name lands in the group it left.
     await closeQuietly(entry.client);
@@ -469,14 +572,19 @@ export function createDaemon({
       // And a session is never ended out from under a call it is still serving.
       if (entry.inFlight > 0) continue;
       if (at - entry.lastSeenAt > IDLE_TIMEOUT_MS) done.push([id, "idle for 24 hours"]);
-      // Had a stream, has none now, and has said nothing for ten minutes. Any one of those
-      // on its own is normal: the SDK's client gives up reconnecting its stream after two
-      // tries, and a session can go quiet for an afternoon and then carry on.
-      else if (entry.streamed && at - entry.lastSeenAt >= STREAM_LOSS_IDLE_MS) {
+      // Had a stream, has none now, and ten minutes have passed since the later of its last
+      // request and the moment the stream went. Any one of those on its own is normal: the
+      // SDK's client gives up reconnecting after two tries, and a session can be quiet for an
+      // afternoon with its stream open and then carry on - which is why the stream closing
+      // starts a clock of its own rather than being judged against an old request.
+      else if (entry.streamed && at - Math.max(entry.lastSeenAt, entry.streamLostAt) >= STREAM_LOSS_IDLE_MS) {
         done.push([id, `no event stream and nothing on the wire for ${STREAM_LOSS_IDLE_MS / 60000} minutes`]);
       }
     }
     for (const [id, reason] of done) await endSession(id, reason);
+    // Every session still here is in use, whatever its last request looked like, so its entry
+    // must not be pruned out from under it.
+    for (const id of sessions.keys()) known.touch(registryKey(id), at);
     known.prune(at);
     return done.map(([id]) => id);
   }
@@ -572,7 +680,15 @@ export async function main(env = process.env) {
   const requested = env.BROWSER_BRIDGE_DAEMON_PORT
     ? Number(env.BROWSER_BRIDGE_DAEMON_PORT)
     : config.port;
-  const daemon = createDaemon({ token: config.token, env });
+  if (!config.secret) {
+    process.stderr.write(
+      "Browser Bridge daemon: daemon.json has no `secret`, which is what session keys are derived from.\n" +
+        "Run `node bin/install.js` to add one (it keeps the existing token).\n",
+    );
+    process.exitCode = 1;
+    return null;
+  }
+  const daemon = createDaemon({ token: config.token, secret: config.secret, env });
   try {
     await daemon.listen(Number.isInteger(requested) ? requested : DEFAULT_DAEMON_PORT);
   } catch (error) {

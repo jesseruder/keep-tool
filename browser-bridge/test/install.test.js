@@ -19,6 +19,7 @@ import {
   claudeHttpEntry,
   codexHomes,
   codexHttpTable,
+  tomlSubTables,
   commandLine,
   daemonPlist,
   daemonPlistPath,
@@ -229,27 +230,40 @@ test("every Claude config directory with a config is registered, plus the defaul
 
 // --- the daemon's own files ----------------------------------------------
 
-test("daemon.json gets a fresh 32-byte token, and keeps it on every later run", (t) => {
+test("daemon.json gets a token and a secret, and keeps both on every later run", (t) => {
   const env = fakeHome(t);
   const first = daemonSettings({}, env);
   assert.equal(first.port, DEFAULT_DAEMON_PORT);
   assert.match(first.token, /^[0-9a-f]{64}$/);
+  // The secret is what session keys are derived from. It never leaves this machine: the helper
+  // does not read it and it is never sent in a header.
+  assert.match(first.secret, /^[0-9a-f]{64}$/);
+  assert.notEqual(first.secret, first.token);
   assert.equal(first.fresh, true);
 
   fs.mkdirSync(path.join(env.HOME, RUNTIME), { recursive: true });
   fs.writeFileSync(
     path.join(env.HOME, RUNTIME, "daemon.json"),
-    JSON.stringify({ port: 47999, token: first.token }),
+    JSON.stringify({ port: 47999, token: first.token, secret: first.secret }),
   );
 
   const second = daemonSettings({}, env);
   assert.equal(second.token, first.token, "an existing token is never rotated");
+  assert.equal(second.secret, first.secret, "and rotating the secret would move every tab group");
   assert.equal(second.port, 47999, "and neither is the port");
   assert.equal(second.fresh, false);
 
+  // An install from before the secret existed gains one without its token changing.
+  fs.writeFileSync(path.join(env.HOME, RUNTIME, "daemon.json"), JSON.stringify({ port: 47999, token: first.token }));
+  const upgraded = daemonSettings({}, env);
+  assert.equal(upgraded.token, first.token);
+  assert.match(upgraded.secret, /^[0-9a-f]{64}$/);
+  assert.equal(upgraded.fresh, true, "so it has to be written");
+
   const rotated = daemonSettings({ rotateToken: true }, env);
   assert.notEqual(rotated.token, first.token);
-  assert.equal(rotated.port, 47999, "--rotate-token changes the token, not the port");
+  assert.notEqual(rotated.secret, first.secret, "--rotate-token rotates both");
+  assert.equal(rotated.port, 47999, "but not the port");
   assert.equal(rotated.fresh, true);
 });
 
@@ -297,9 +311,13 @@ test("the plan writes the launcher, the manifests, daemon.json and the launchd j
   const config = plan.files[3];
   assert.equal(config.mode, 0o600);
   assert.equal(JSON.parse(config.content).token, plan.daemon.token);
-  // The token is the one secret here; it must not reach a terminal or a log.
+  assert.equal(JSON.parse(config.content).secret, plan.daemon.secret);
+  // Neither may reach a terminal or a log: the token drives the browser and the secret
+  // derives every session's key.
   assert.equal(config.display.includes(plan.daemon.token), false);
-  assert.match(config.display, /"token": "<32 fresh random bytes, hex>"/);
+  assert.equal(config.display.includes(plan.daemon.secret), false);
+  assert.match(config.display, /"token": "<32 random bytes, hex>"/);
+  assert.match(config.display, /"secret": "<32 random bytes, hex>"/);
 
   assert.equal(plan.url, `http://127.0.0.1:${DEFAULT_DAEMON_PORT}/mcp`);
   assert.match(plan.helperCommand, /bin\/headers\.js$/);
@@ -631,6 +649,92 @@ test("a config edit is written through a temp file, not over the original", asyn
   assert.equal(fs.readFileSync(`${file}.bak`, "utf8"), 'model = "gpt-5"\n');
 });
 
+test("the user's own [mcp_servers.browser.tools.*] settings are carried across a replacement", () => {
+  // Per-tool approval settings are something somebody typed on purpose, and they cannot
+  // collide with the inline keys this installer writes. Sweeping them up with the header
+  // tables we own was deleting a user's configuration without a word.
+  const before = [
+    'model = "gpt-5"',
+    "",
+    "[mcp_servers.browser]",
+    'url = "http://old"',
+    "",
+    "[mcp_servers.browser.http_headers]",
+    'Authorization = "Bearer stale"',
+    "",
+    "[mcp_servers.browser.tools.javascript_tool]",
+    'approval_mode = "approve"',
+    "",
+    "[mcp_servers.browser.tools.file_upload]",
+    'approval_mode = "never"',
+    "",
+    "[tui]",
+    "n = 1",
+    "",
+  ].join("\n");
+  const table = codexHttpTable("http://127.0.0.1:47331/mcp", "node headers.js");
+  const after = withTomlTable(before, CODEX_TABLE, table);
+
+  // Ours are replaced...
+  assert.equal(after.includes("Bearer stale"), false);
+  assert.equal(after.includes("http://old"), false);
+  assert.equal(after.includes("[mcp_servers.browser.http_headers]"), false);
+  // ...and theirs are kept, after the new table, where they still belong to it.
+  assert.match(after, /\[mcp_servers\.browser\.tools\.javascript_tool\]\napproval_mode = "approve"/);
+  assert.match(after, /\[mcp_servers\.browser\.tools\.file_upload\]\napproval_mode = "never"/);
+  assert.ok(
+    after.indexOf("[mcp_servers.browser]") < after.indexOf("[mcp_servers.browser.tools.javascript_tool]"),
+    "a sub-table has to come after its parent",
+  );
+  assert.match(after, /\[tui\]\nn = 1/);
+  assert.equal(withTomlTable(after, CODEX_TABLE, table), null, "and a second run is a no-op");
+
+  // The installer names what it is about to drop, and never names what it is keeping.
+  const dropped = tomlSubTables(before, CODEX_TABLE);
+  assert.deepEqual(dropped, [
+    "[mcp_servers.browser.http_headers]",
+    "[mcp_servers.browser.tools.javascript_tool]",
+    "[mcp_servers.browser.tools.file_upload]",
+  ]);
+
+  // An uninstall takes everything under the table, tools and all - that is what it is for.
+  const removed = withoutTomlTable(after, CODEX_TABLE);
+  assert.equal(removed.includes("mcp_servers.browser"), false, removed);
+  assert.match(removed, /\[tui\]/);
+});
+
+test("a real run says which sub-tables it dropped, and where the old file is", async (t) => {
+  const env = fakeHome(t);
+  const file = path.join(env.HOME, ".codex", "config.toml");
+  fs.writeFileSync(
+    file,
+    [
+      "[mcp_servers.browser]",
+      'command = "/old/node"',
+      "",
+      "[mcp_servers.browser.http_headers]",
+      'Authorization = "Bearer stale"',
+      "",
+      "[mcp_servers.browser.tools.javascript_tool]",
+      'approval_mode = "approve"',
+      "",
+    ].join("\n"),
+  );
+
+  const { output } = await runInstaller([], env);
+
+  // Silently deleting somebody's settings is not on, so the ones that go are named.
+  assert.match(output, /dropping \[mcp_servers\.browser\.http_headers\]/);
+  assert.ok(output.includes(`the previous file is kept at ${file}.bak`), output);
+  // And the ones that stay are not reported as dropped, because they are not.
+  assert.equal(output.includes("dropping [mcp_servers.browser.tools"), false);
+
+  const written = fs.readFileSync(file, "utf8");
+  assert.match(written, /\[mcp_servers\.browser\.tools\.javascript_tool\]\napproval_mode = "approve"/);
+  assert.equal(written.includes("Bearer stale"), false);
+  assert.match(fs.readFileSync(`${file}.bak`, "utf8"), /Bearer stale/, "and it is all in the backup");
+});
+
 // --- end to end, on files only -------------------------------------------
 
 test("--dry-run prints every file, edit and command and changes nothing", async (t) => {
@@ -644,8 +748,9 @@ test("--dry-run prints every file, edit and command and changes nothing", async 
   assert.match(output, /Google\/Chrome\/NativeMessagingHosts\/com\.keep\.browser_bridge\.json/);
   assert.match(output, new RegExp(`chrome-extension://${EXTENSION_ID}/`));
   assert.match(output, /write .*BrowserBridge\/daemon\.json \(mode 600\)/);
-  assert.match(output, /"token": "<32 fresh random bytes, hex>"/);
-  assert.equal(/"token": "[0-9a-f]{64}"/.test(output), false, "the real token is never printed");
+  assert.match(output, /"token": "<32 random bytes, hex>"/);
+  assert.match(output, /"secret": "<32 random bytes, hex>"/);
+  assert.equal(/"(token|secret)": "[0-9a-f]{64}"/.test(output), false, "neither is ever printed");
   assert.match(output, new RegExp(`LaunchAgents/${DAEMON_LABEL.replaceAll(".", "\\.")}\\.plist`));
   assert.match(output, /<key>KeepAlive<\/key>/);
   assert.match(output, /run {2}.*claude mcp remove --scope user browser {3}\(failure ignored\)/);

@@ -22,7 +22,7 @@
 // zod cost ~60 ms a time. `test/headers.test.js` holds that line.
 
 import { readDaemonConfig } from "../host/protocol.js";
-import { guessAgent, guessAccount, sanitizeHeaderValue } from "../mcp/identity.js";
+import { encodeHeaderValue, guessAgent, guessAccount, sanitizeHeaderValue } from "../mcp/identity.js";
 
 export function buildHeaders(env = process.env) {
   const headers = {};
@@ -32,9 +32,12 @@ export function buildHeaders(env = process.env) {
     // The token is ours, not the environment's: hex from daemon.json, never user input.
     headers.Authorization = `Bearer ${config.token}`;
 
+    // Percent-encoded when it is not plain printable ASCII: a code point above U+00FF makes
+    // the client's own Headers constructor throw, which stops the browser server connecting at
+    // all. An em dash in a branch name should cost nothing, so it is encoded, not dropped.
     const add = (name, value, max) => {
       const clean = sanitizeHeaderValue(value, max);
-      if (clean !== null) headers[name] = clean;
+      if (clean !== null) headers[name] = encodeHeaderValue(clean);
     };
 
     add("X-Browser-Bridge-Session", env.BROWSER_BRIDGE_SESSION_NAME);
