@@ -352,17 +352,53 @@ export function codexTable(name, fields) {
  * lines are the only ones touched: a TOML table runs until the next line that opens
  * another table, so the boundaries are found by reading, not by parsing the whole file.
  */
+/**
+ * A table header, matched the way TOML actually writes one. Whitespace inside the brackets
+ * and a trailing comment are both legal, and matching the line by its exact text missed
+ * them - so the table was appended a second time and Codex then refused the whole file for
+ * a duplicate key.
+ */
+function tomlHeaderPattern(nameRegex) {
+  return new RegExp(`^\\s*\\[\\s*${nameRegex}\\s*\\]\\s*(#.*)?$`);
+}
+
+function escapeForRegex(name) {
+  return name.replaceAll(".", "\\.");
+}
+
+/**
+ * Where a table starts and where its own lines end. The range covers every
+ * `[<name>.<sub>]` sub-table that follows, because those belong to it: a leftover
+ * `[mcp_servers.browser.http_headers]` sitting after a replaced table would collide with the
+ * inline `http_headers` the new one declares, and a duplicate key makes the file unreadable.
+ */
+function tomlTableRange(lines, name) {
+  const header = tomlHeaderPattern(escapeForRegex(name));
+  const sub = tomlHeaderPattern(`${escapeForRegex(name)}\\.[^\\]]+`);
+  const start = lines.findIndex((line) => header.test(line));
+  if (start === -1) return null;
+  let end = start + 1;
+  for (;;) {
+    while (end < lines.length && !/^\s*\[/.test(lines[end])) end++;
+    if (end < lines.length && sub.test(lines[end])) {
+      end += 1;
+      continue;
+    }
+    break;
+  }
+  return { start, end };
+}
+
 export function withTomlTable(text, name, table) {
-  const header = `[${name}]`;
   const lines = text.split("\n");
-  const start = lines.findIndex((line) => line.trim() === header);
-  if (start === -1) {
+  const range = tomlTableRange(lines, name);
+  if (range === null) {
     const padded = text === "" || text.endsWith("\n\n") ? text : text.endsWith("\n") ? `${text}\n` : `${text}\n\n`;
     const next = `${padded}${table}`;
     return next === text ? null : next;
   }
-  let end = start + 1;
-  while (end < lines.length && !/^\s*\[/.test(lines[end])) end++;
+  const { start } = range;
+  let { end } = range;
   // The blank lines before whatever comes next (or the file's trailing newline) are not
   // part of this table. Leaving them where they are is what makes a second run a no-op.
   while (end > start + 1 && lines[end - 1].trim() === "") end--;
@@ -371,17 +407,15 @@ export function withTomlTable(text, name, table) {
   return next === text ? null : next;
 }
 
-/** Drop a table, header and body, leaving the rest of the file alone. */
+/** Drop a table, its sub-tables and its body, leaving the rest of the file alone. */
 export function withoutTomlTable(text, name) {
-  const header = `[${name}]`;
   const lines = text.split("\n");
-  const start = lines.findIndex((line) => line.trim() === header);
-  if (start === -1) return null;
-  let end = start + 1;
-  while (end < lines.length && !/^\s*\[/.test(lines[end])) end++;
+  const range = tomlTableRange(lines, name);
+  if (range === null) return null;
+  let end = range.end;
   // Swallow the blank line the table used to be separated by, not the next table's.
   while (end < lines.length && lines[end].trim() === "") end++;
-  return [...lines.slice(0, start), ...lines.slice(end)].join("\n");
+  return [...lines.slice(0, range.start), ...lines.slice(end)].join("\n");
 }
 
 export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) {
@@ -396,6 +430,12 @@ export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) 
   // --stdio is the old shape exactly: a process per session, no daemon, no launchd job.
   const daemon = options.uninstall || options.stdio ? null : daemonSettings(options, env);
   const url = daemon ? daemonUrl(daemon.port) : null;
+
+  if (options.stdio && !options.uninstall) {
+    // Keep the launcher and the browser manifests - the extension still needs them - but the
+    // launchd job and its plist go, because nothing is registered against the daemon.
+    removals.push(daemonPlistPath(env));
+  }
 
   if (options.uninstall) {
     removals.push(launcherPath(env));
@@ -438,13 +478,15 @@ export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) 
     });
   }
 
+  // --stdio has to take the job out too: leaving it loaded would keep a daemon listening on
+  // the port with nothing registered against it, and the next landing would restart it.
   const launchd =
-    options.uninstall || daemon
+    options.uninstall || options.stdio || daemon
       ? {
           uid: typeof process.getuid === "function" ? process.getuid() : 501,
           label: DAEMON_LABEL,
           plist: daemonPlistPath(env),
-          uninstall: Boolean(options.uninstall),
+          uninstall: Boolean(options.uninstall || options.stdio),
           // Read before anything is written: the point of knowing is to decide whether the
           // job can be restarted in place instead of torn down and put back.
           plistUnchanged: daemon
@@ -751,8 +793,24 @@ export function applyEdit(edit) {
       return;
     }
   }
+  // tmp + rename in the same directory, so an interrupted run leaves the old config intact
+  // rather than a half-written one. This is a file the agent has to be able to parse at
+  // startup, and truncate-then-write has a window in which it cannot.
   fs.mkdirSync(path.dirname(edit.path), { recursive: true });
-  fs.writeFileSync(edit.path, next, { mode: edit.mode ?? 0o600 });
+  const tmp = `${edit.path}.tmp`;
+  try {
+    fs.writeFileSync(tmp, next, { mode: edit.mode ?? 0o600 });
+    fs.renameSync(tmp, edit.path);
+  } catch (error) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // nothing left to clean up
+    }
+    process.stdout.write(`could not write ${edit.path}: ${error.message}\n`);
+    if (edit.fallback) process.stdout.write(`${edit.fallback}\n\n`);
+    return;
+  }
   process.stdout.write(`edited ${edit.path} (${edit.describe})\n`);
 }
 
@@ -820,7 +878,9 @@ const HELP = `Browser Bridge installer
   --browser <name>  which browser's native messaging directory to write (default: edge)
   --chrome-too      write both Edge's and Chrome's
   --stdio           register one stdio MCP server per session instead of the daemon
-  --rotate-token    replace the daemon token (every registration is rewritten with it)
+  --rotate-token    replace the daemon token. No registration changes: the helper reads it
+                    from daemon.json each time. A live Claude Code session picks the new one
+                    up on its next call (it re-runs the helper on a 401); Codex on restart
   --dry-run         print every file, edit and command, change nothing
   --uninstall       remove the manifests, the launchd job and the registrations
                     (daemon.json, and so the token, is kept)

@@ -35,12 +35,13 @@ function fakeHost(t, dir, handler) {
   });
 }
 
-function startServer(t, dir = fs.mkdtempSync(path.join(os.tmpdir(), "bb-"))) {
+function startServer(t, dir = fs.mkdtempSync(path.join(os.tmpdir(), "bb-")), extraEnv = {}) {
   const child = spawn(process.execPath, [SERVER], {
     env: {
       ...process.env,
       BROWSER_BRIDGE_RUNTIME_DIR: dir,
       BROWSER_BRIDGE_SESSION_NAME: "test session",
+      ...extraEnv,
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -386,4 +387,69 @@ test("file_upload checks the paths before the browser is asked", async (t) => {
   const upload = host.received.find((message) => message.method === "file_upload");
   assert.deepEqual(upload.params.paths, [good]);
   assert.equal(upload.params.files, undefined, "the files field is dropped, not forwarded");
+});
+
+test("file_upload refuses a relative path instead of resolving it", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bb-"));
+  const host = await fakeHost(t, dir, () => ({ ok: true, result: { text: "attached" } }));
+  fs.writeFileSync(path.join(dir, "upload.txt"), "hello");
+
+  const server = startServer(t, dir);
+  await server.request(1, "initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "browser-bridge-test", version: "0" },
+  });
+  server.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+  // There used to be a path.resolve here. That was harmless per process and wrong for one
+  // shared daemon, whose working directory is the bridge checkout rather than the agent's:
+  // a relative path silently meant a different file from the one the caller named.
+  const relative = await server.request(2, "tools/call", {
+    name: "file_upload",
+    arguments: { paths: ["upload.txt"], ref: "ref_1", tabId: 5 },
+  });
+  assert.equal(relative.result.isError, true);
+  assert.match(relative.result.content[0].text, /Not an absolute path: upload\.txt/);
+  assert.match(relative.result.content[0].text, /full path on this machine/);
+  assert.equal(
+    host.received.some((message) => message.method === "file_upload"),
+    false,
+    "and nothing reached the browser",
+  );
+
+  const absolute = await server.request(3, "tools/call", {
+    name: "file_upload",
+    arguments: { paths: [path.join(dir, "upload.txt")], ref: "ref_1", tabId: 5 },
+  });
+  assert.notEqual(absolute.result.isError, true);
+});
+
+test("newWindow comes from config.json, with the environment as an override", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bb-"));
+  fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ newWindow: true }));
+  const host = await fakeHost(t, dir, () => ({ ok: true, result: { text: "group 7" } }));
+
+  // One daemon has one environment, so a per-session variable is not a thing any more; the
+  // config file is where a machine-wide preference belongs.
+  const server = startServer(t, dir);
+  await server.request(1, "initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "browser-bridge-test", version: "0" },
+  });
+  server.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+  await server.request(2, "tools/call", { name: "tabs_context_mcp", arguments: { createIfEmpty: true } });
+  assert.equal(host.received.find((message) => message.method === "tabs_context_mcp").params.newWindow, true);
+
+  // And the variable still wins when it is set, either way.
+  const off = startServer(t, dir, { BROWSER_BRIDGE_NEW_WINDOW: "0" });
+  await off.request(1, "initialize", {
+    protocolVersion: "2025-06-18",
+    capabilities: {},
+    clientInfo: { name: "browser-bridge-test", version: "0" },
+  });
+  off.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+  await off.request(2, "tools/call", { name: "tabs_context_mcp", arguments: { createIfEmpty: true } });
+  assert.equal(host.received.at(-1).params.newWindow, undefined);
 });

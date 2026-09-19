@@ -99,6 +99,8 @@ browser-bridge/
     daemon.js               the shared streamable-HTTP MCP daemon (entry)
     server.js               stdio MCP server entry (one process per session; the fallback)
     session.js              one session's tool handlers, shared by both entries
+    identity.js             who a session is, and what may go in a header saying so (leaf)
+    registry.js             session id -> sessionKey, across daemon restarts (leaf)
     tools.js                tool definitions: names, schemas, result shaping
     client.js               socket client with reconnect and hello
   bin/
@@ -167,16 +169,41 @@ slow). The host answers the client with an error on timeout and drops the late r
   and retry the in-flight request once.
 - The daemon is a launchd agent (`com.keep.browser_bridge.daemon`, RunAtLoad, KeepAlive,
   ThrottleInterval 5). It runs *this checkout's* `mcp/daemon.js`, so a landing does not
-  reach sessions until the job has been reloaded, which `node bin/install.js` does. A
-  daemon restart invalidates every `Mcp-Session-Id`; the next request with a stale one
-  gets the SDK's 404 (`-32001 Session not found`) and the client initializes again, which
-  makes a new socket client with a new `sessionKey` — so the tab group is a new one, the
-  old group staying behind for the user exactly as an ended session's does.
+  reach sessions until the job has been reloaded, which `node bin/install.js` does.
+- **A session id the daemon does not know is adopted, never refused.** This is not a nicety:
+  the SDK's client, and the transport bundled in Claude Code, throws `Session not found` on a
+  404 and *never clears its session id*, so answering 404 after a restart took the browser
+  away from every running agent permanently — and the installer restarts the daemon on every
+  landing. So a request carrying an unknown id gets a transport bound to that id, a fresh
+  `createSessionServer`, and a `BridgeClient` whose `sessionKey` comes from
+  `BrowserBridge/sessions.json` when that file remembers the id (see below). The session's
+  name, agent and account come from the `X-Browser-Bridge-*` headers on the request in hand —
+  both clients send them on every request, not only on initialize — with the registry as
+  fallback. It is logged as `session adopted`.
+- Binding a transport to an id the SDK did not generate means setting `sessionId` and
+  `_initialized` on its inner web-standard transport, which are plain instance properties in
+  `@modelcontextprotocol/sdk` **1.30.0** (`validateSession` reads exactly those two). There is
+  no public API for "this transport already belongs to session X". `adoptTransport` throws at
+  the first adoption if a future SDK changes that shape, which is the failure mode worth
+  having: the alternative is silently stranding every agent on the machine again.
+- `mcp/registry.js` keeps `{sessionId: {sessionKey, name, agent, account, lastSeen, ended}}`
+  in `BrowserBridge/sessions.json` (0600, written tmp-then-rename so an interrupted write
+  cannot truncate it, debounced so a request does not mean a write). An ended session leaves a
+  **tombstone** rather than being deleted, because the extension keeps an ended session's tabs
+  and hands the group back to the same `sessionKey`: an id that comes back — after a restart,
+  or after the stream-loss rule fired while a laptop was asleep — gets its own tabs rather
+  than a second group beside them. Entries a day past their last use are pruned at load and
+  by the sweep.
 - One MCP session closes when its client sends `DELETE /mcp`, when the client's event stream
-  goes away and stays away, when it has made no request for 24 hours (swept once a minute),
-  or when the daemon gets SIGTERM. All four close the session's `BridgeClient`, which is a
-  `bye` to the host, which is `session_closed` to the extension: the same path a stdio
-  server's exit took.
+  goes away and it then goes quiet, when it has made no request for 24 hours (swept once a
+  minute), or when the daemon gets SIGTERM. All four close the session's `BridgeClient`, which
+  is a `bye` to the host, which is `session_closed` to the extension: the same path a stdio
+  server's exit took. None of them fires while a tool call is in flight — a session is never
+  ended out from under a call it is still serving.
+- SIGTERM closes every session **in parallel**, and each `bye` races a 2-second timer. One at
+  a time, each able to wait out the socket client's 100-second request timeout, meant a single
+  wedged host was enough for launchd to SIGKILL the daemon before any session had said
+  goodbye — and then the extension kept every tab group listed as live.
 - **The two clients say goodbye differently**, which is why there are two mechanisms
   (both measured live, not assumed):
   - **Codex** sends `DELETE /mcp` when it exits. That is the clean path and nothing else is
@@ -184,10 +211,15 @@ slow). The host answers the client with an error on timeout and drops the late r
   - **Claude Code** never sends DELETE. What it does do is hold the standalone `GET /mcp`
     event stream open for the whole session (verified with `lsof`: two established
     connections during `claude -p`, none after it exited). So the daemon counts open GET
-    streams per session, and when a session that has had at least one drops to none and
-    neither reopens one nor sends any request within 30 s, it is closed with
-    `client went away`. Without that, a Claude Code session's tab group stayed listed as
-    live for the full 24 hours and its blank tabs were never tidied up.
+    streams per session. Without that, a Claude Code session's tab group stayed listed as live
+    for the full 24 hours and its blank tabs were never tidied up.
+  - But a lost stream is a **weak** signal, so it is only one of three conditions: no open
+    stream, **nothing on the wire for ten minutes**, and no tool call in flight. The SDK's
+    client gives up reconnecting that stream after two attempts (about 2.5 s), so a laptop
+    that sleeps, or a daemon restarted for a landing, leaves a perfectly live session with no
+    stream and no way to get one back — and a 30-second rule closed exactly those. The
+    practical cost of the longer rule is that Claude Code's blank tabs are tidied up about ten
+    minutes after it exits rather than thirty seconds, which is the right way round.
   - A session that has **never** had a GET stream is left to the idle clock: there is no
     signal to miss, so there is nothing to infer from its absence.
   - The reverse also holds: a session with a stream **open** never expires, not even on the
@@ -550,8 +582,11 @@ are its own to close.
 - Runtime directory: `~/Library/Application Support/BrowserBridge/` (override with
   `BROWSER_BRIDGE_RUNTIME_DIR`, which the tests use). Socket `bridge.sock`, `host.log`
   (append, truncated to the last 1 MB on host start), `daemon.json`, `daemon.log`,
-  `screenshots/`, `config.json` with an optional `blockedHosts` list (exact host or
-  `*.suffix`) that `navigate` refuses.
+  `sessions.json`, `screenshots/`, and `config.json` holding an optional `blockedHosts` list
+  (exact host or `*.suffix`) that `navigate` refuses and an optional `newWindow` flag.
+  `newWindow` lives there rather than in the environment because one shared daemon has one
+  environment: a per-session variable stopped being a thing when the process per session did.
+  `BROWSER_BRIDGE_NEW_WINDOW` still overrides it, either way.
 
 ### The daemon (`mcp/daemon.js`)
 
@@ -571,17 +606,30 @@ are its own to close.
   never touches the browser never opens the socket and never says `hello`: the host and the
   extension only learn about the sessions that are actually using the browser, which is less
   than they saw before, not more.
-- `GET /healthz` answers `{ok, pid, port, sessions, streams, host:{socket, connected, hostPid,
-  extensionConnected, extensionVersion}}` with no auth — it is loopback-only and says
-  nothing a caller could not learn by trying. It never opens a socket of its own: a probe
-  that said `hello` would appear in the extension as a session with a tab group. The
-  numbers come from whatever the sessions' own `hello` replies last reported.
-- Session identity comes from the request, because the daemon has no environment of its
-  own: `X-Browser-Bridge-Session` (trimmed, control characters stripped, 80 chars), and
-  optionally `X-Browser-Bridge-Agent` and `X-Browser-Bridge-Account` the same way. With no
-  session header the name is `<clientInfo.name from initialize> #<n>` on a daemon-wide
-  counter — Claude Code and Codex send different `clientInfo` names and whatever they send
-  is kept, sanitized the same way.
+- `GET /healthz` answers
+  `{ok, pid, port, sessions, streams, remembered, host:{socket, connected, hostPid,
+  extensionConnected, extensionVersion}}`. No token — the installer waits on it — but it is
+  behind the same Host and Origin checks as everything else, because pid and socket path (and
+  so the username) are not things to hand a web page that got a name to resolve to 127.0.0.1.
+  It never opens a socket of its own: a probe that said `hello` would appear in the extension
+  as a session with a tab group. The numbers come from whatever the sessions' own `hello`
+  replies last reported.
+- Session identity comes from the request, because the daemon has no environment of its own:
+  `X-Browser-Bridge-Session`, and optionally `X-Browser-Bridge-Agent` and
+  `X-Browser-Bridge-Account`. Each goes through `sanitizeHeaderValue` in `mcp/identity.js` —
+  trimmed, control characters stripped, capped at 80, and refused outright if what is left
+  still could not go in a header. With no session header the name is
+  `<clientInfo.name from initialize> #<n>` on a daemon-wide counter; Claude Code and Codex
+  send different `clientInfo` names and whatever they send is kept, sanitized the same way.
+- `bin/headers.js` sanitises the values it prints with that same function, and that is not
+  belt and braces: a `\r\n` in `BROWSER_BRIDGE_SESSION_NAME` makes the *client's* `Headers`
+  constructor throw, and then the browser server does not connect at all — not one call
+  fails, every call does. A 20 000-byte name is an HTTP 431. Anything that cannot be
+  transmitted is left out rather than mangled.
+- Nothing in `bin/headers.js`'s import graph may reach the MCP SDK; it runs on every request
+  either agent makes, and loading the SDK and zod cost about 60 ms a time. That is why
+  `mcp/identity.js` is a leaf module (node built-ins only) rather than part of `session.js`,
+  and `test/headers.test.js` asserts the graph stays that way.
 - `bin/headers.js` is what supplies those headers **for Claude Code**, which runs it with
   the session's environment. Codex does not, so its name and account arrive through
   `env_http_headers` in `config.toml` instead and its helper only carries the token; see the
@@ -725,9 +773,19 @@ node bin/install.js [--browser edge|chrome] [--chrome-too] [--stdio]
    The direct JSON edit is kept as the **fallback** for when `claude` is not on PATH or
    refuses: better to register the bridge correctly than to print a block for someone to
    paste. Both edits are surgical — every other key and table is left as it was, byte for
-   byte in the TOML — and both keep a `.bak`. An edit that would change nothing is skipped
-   entirely, so a re-run does not churn a file a live session is holding. A file that is not
-   valid JSON is reported with the block to paste and left exactly as it was.
+   byte in the TOML — both keep a `.bak`, and both are written tmp-then-rename, because these
+   are files an agent has to be able to parse at startup and truncate-then-write has a window
+   in which it cannot. An edit that would change nothing is skipped entirely, so a re-run
+   does not churn a file a live session is holding. A file that is not valid JSON is reported
+   with the block to paste and left exactly as it was.
+
+   The TOML splice matches the table header with a pattern rather than by exact line text
+   (`[ mcp_servers.browser ]` and a trailing `# comment` are both legal TOML, and missing them
+   meant the table was appended a *second* time and Codex then refused the whole file for a
+   duplicate key), and its range extends over every `[mcp_servers.browser.<sub>]` sub-table
+   that follows. Those belong to the table: a leftover
+   `[mcp_servers.browser.http_headers]` sitting after a replaced table collides with the
+   inline `http_headers` the new one declares, which is the same duplicate-key failure.
 6. Wait up to 10 s for `GET /healthz` to answer and report the port, the pid and the session
    count. **A dark `/healthz`, or a job launchd does not have loaded, is never reported as
    success**: the installer prints `THE DAEMON IS DOWN`, where the log is, and the three
@@ -736,8 +794,11 @@ node bin/install.js [--browser edge|chrome] [--chrome-too] [--stdio]
 7. Print the extension directory to load via `edge://extensions` (Developer mode, Load
    unpacked) and the extension id the manifest key fixes.
 
-`--stdio` is the old shape exactly: no `daemon.json`, no launchd job, and `browser`
-registered through `claude mcp add` / `codex mcp add` as one stdio process per session.
+`--stdio` is the old shape exactly: no `daemon.json` written, no launchd job, and `browser`
+registered as one stdio process per session. If a daemon job is loaded it is booted out and
+its plist removed — leaving it would keep a daemon on the port with nothing registered
+against it, and the next landing would restart it. `daemon.json` itself stays, so switching
+back is just another `node bin/install.js`.
 
 `--uninstall` removes the launcher, both browsers' manifests and the plist, boots the job
 out (and waits for it to go, the same way; a job that is not loaded is the normal state and
@@ -792,8 +853,14 @@ needs no private key. The id is a constant in `host/protocol.js` and the install
   the name in `hello`, `tools/list` is the whole contract, a call is forwarded and answered,
   a second initialize is a second session with a second socket client, a missing or wrong
   token is 401, any `Origin` is 403, a foreign `Host` is refused, an unknown session id is
-  the SDK's 404, DELETE closes the socket client, idle expiry runs on a fake clock, and a
-  child daemon killed with SIGTERM says `bye` before it exits. The stream-based cleanup has
+  adopted rather than refused, DELETE closes the socket client, idle expiry runs on a fake
+  clock, and a child daemon killed with SIGTERM says `bye` before it exits. Adoption has four
+  of its own: an unknown id is served and gets a fresh key, the same id against a second
+  daemon over the same registry file gets the key the first one used (so the host sees the
+  same `hello` sessionKey), an id whose session was ended early is revived with its old key,
+  and the registry file is 0600, atomic and pruned. `/healthz` is checked for the Host and
+  Origin refusals, shutdown for finishing quickly against a host that never answers `bye`,
+  and the sweep for never ending a session mid-call. The stream-based cleanup has
   four of its own, driven over raw HTTP rather than through the SDK client (which opens the
   standalone GET stream itself, so a second one is a 409 — which is exactly what proves a
   client holds one): a dropped stream ends the session after the grace, a stream reopened
@@ -801,7 +868,13 @@ needs no private key. The id is a constant in `host/protocol.js` and the install
   GET the SDK refuses (406 or 409) changes nothing.
 - `test/headers.test.js`: the helper with and without `daemon.json` and with and without
   each environment variable, plus the process itself — one JSON line, nothing on stderr,
-  exit 0 either way.
+  exit 0 either way. Also that a hostile environment value (`\r\n`, 20 000 bytes, characters
+  no header can carry) still produces headers a real `Headers` constructor accepts, and that
+  its import graph reaches nothing but `node:` built-ins.
+- `test/registry.test.js`: the registry on its own — a reload keeps the key and the labels, an
+  ended entry leaves a tombstone that still carries the key, `lastSeen` is not rewritten on
+  every touch, stale entries are pruned at load and on demand, a missing or junk file is not a
+  crash, and the file is 0600 and renamed into place.
 - `test/install.test.js`: `--dry-run` output, the manifest, the plist, `daemon.json`
   creation without rotation, both config edits as pure functions, and a real run against a
   temp HOME with a fake command runner and a fake health probe (nothing reaches launchd,
@@ -837,13 +910,15 @@ the daemon as `X-Browser-Bridge-Session` instead of being read by a child proces
   session in the daemon until the 24-hour idle sweep, so the popup and `browser_status` would
   list a session whose agent is gone. Both clients on this machine do one or the other
   (Codex DELETEs, Claude Code streams), so this is currently theoretical, but a third client
-  that does neither would hit it. A stdio server could not: the pipe closing *was* the
-  signal. Shortening the idle window instead would evict a session that is simply not using
-  the browser at the moment.
-- The 30 s stream grace is a guess at how long a legitimate SSE reconnect takes. Too short
-  would end a session that was about to come back; too long leaves a stale tab group. A
-  reconnect that takes longer gets a fresh session and therefore a fresh tab group, which is
-  the same outcome as a daemon restart.
+  that does neither would hit it. A stdio server could not: the pipe closing *was* the signal.
+- Ten minutes of silence with no event stream ends a session even if its agent is only
+  thinking. The cost is bounded now that an id is adopted rather than refused — the agent's
+  next call revives the session and the registry hands back the same `sessionKey`, so it gets
+  its own tab group — but the `session_closed` in between does let the extension tidy up a
+  group whose tabs were all blank.
+- Adoption reads two private fields of the MCP SDK's transport. It is pinned to a version and
+  it fails loudly rather than quietly, but it is the one place here that depends on something
+  the SDK does not promise.
 - Codex's session name and account come from `env_http_headers`, which names one environment
   variable per header, so there is no room for `bin/headers.js`'s fallback chain: a Codex
   session with no `KEEP_AGENT_ACCOUNT_ID` reports no account, where a Claude Code one would
@@ -867,6 +942,13 @@ the daemon as `X-Browser-Bridge-Session` instead of being read by a child proces
   browser's own read of the file are not atomic, so a path swapped in between them would
   be uploaded unchecked; on a single-user machine anything that could win that race can
   already read the file directly, so the TOCTOU gap is accepted rather than closed.
+- `BrowserBridge/sessions.json` is 0600 in the 0700 runtime directory. It names every
+  session's `sessionKey` and title, which is enough to claim another session's tab group, so
+  it is exactly as private as the socket and the token.
+- `file_upload` refuses a path that is not absolute rather than resolving it. With a process
+  per session a relative path resolved against the agent's own working directory; with one
+  shared daemon it would resolve against the bridge checkout, which is not where the caller
+  meant and not a difference the caller can see.
 - Screenshot ids are scoped to the session that took them: sessions share one service
   worker, and one session's screenshot is not another's to upload into a page.
 - A socket client may only name a tool method. `session_hello`, `session_closed` and

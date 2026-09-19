@@ -360,6 +360,11 @@ export function daemonLogPath(env = process.env) {
   return path.join(runtimeDir(env), "daemon.log");
 }
 
+/** Which MCP session id had which browser sessionKey; see mcp/registry.js. */
+export function sessionsPath(env = process.env) {
+  return path.join(runtimeDir(env), "sessions.json");
+}
+
 /**
  * `{port, token}` from daemon.json, or null when it is missing or unreadable. A missing
  * file is the normal state before the installer has ever run, and neither the daemon nor

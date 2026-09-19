@@ -7,6 +7,8 @@ import { LineDecoder, encodeLine } from "../host/protocol.js";
 
 /** The host's own timeout is 90 s; give it a little room before we give up too. */
 const REQUEST_TIMEOUT_MS = 100_000;
+/** How long `close()` waits for the host to acknowledge `bye`. See close(). */
+export const CLOSE_TIMEOUT_MS = 2_000;
 const BACKOFF_MS = [100, 500, 1000, 2000];
 
 export class BridgeUnavailableError extends Error {
@@ -187,12 +189,27 @@ export class BridgeClient {
     }
   }
 
-  async close() {
+  /**
+   * Say `bye` so the host can drop the session, but never wait long for the answer. On
+   * SIGTERM the daemon closes every session at once and launchd will SIGKILL it shortly
+   * after; a wedged host that let `bye` run out the full request timeout used to mean *no*
+   * session said goodbye and the extension kept every tab group listed as live. The write is
+   * what the host needs, and that has already happened by the time we stop waiting.
+   */
+  async close({ timeoutMs = CLOSE_TIMEOUT_MS } = {}) {
     if (!this.connected) return;
+    let timer = null;
     try {
-      await this.#send("bye", {});
+      // The timer is cleared rather than left to fire: an unreferenced pending timeout
+      // would hold the process open for its whole duration after a close that was quick.
+      const deadline = new Promise((resolve) => {
+        timer = setTimeout(resolve, timeoutMs);
+      });
+      await Promise.race([this.#send("bye", {}), deadline]);
     } catch {
       // the host may already be gone
+    } finally {
+      if (timer) clearTimeout(timer);
     }
     this.#teardown(new BridgeUnavailableError("closed"));
   }

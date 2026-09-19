@@ -552,6 +552,85 @@ test("the Codex edit replaces only the [mcp_servers.browser] table", () => {
   assert.equal(withoutTomlTable(removed, CODEX_TABLE), null, "already gone");
 });
 
+test("a table header with padding or a trailing comment is still the same table", () => {
+  const table = codexHttpTable("http://127.0.0.1:47331/mcp", "node headers.js");
+  for (const header of [
+    "[mcp_servers.browser]",
+    "[ mcp_servers.browser ]",
+    "[mcp_servers.browser] # the browser bridge",
+    "  [mcp_servers.browser]",
+  ]) {
+    const before = `model = "gpt-5"\n\n${header}\nurl = "http://old"\n\n[tui]\nn = 1\n`;
+    const after = withTomlTable(before, CODEX_TABLE, table);
+    // Matching by exact line text missed these, so the table was appended a second time and
+    // Codex refused the whole file for a duplicate key.
+    assert.equal(
+      after.split("\n").filter((line) => /^\s*\[\s*mcp_servers\.browser\s*\]/.test(line)).length,
+      1,
+      header,
+    );
+    assert.equal(after.includes("http://old"), false, header);
+    assert.match(after, /\[tui\]/);
+    assert.equal(withoutTomlTable(after, CODEX_TABLE).includes("mcp_servers.browser"), false, header);
+  }
+});
+
+test("existing sub-tables of the browser server are replaced, not left behind", () => {
+  // This is the shape `codex mcp add --url ... ; codex mcp ...` leaves, and the shape the
+  // real ~/.codex/config.toml already had for another server: sub-tables, not inline ones.
+  const before = [
+    'model = "gpt-5"',
+    "",
+    "[mcp_servers.browser]",
+    'url = "http://old"',
+    "",
+    "[mcp_servers.browser.http_headers]",
+    'Authorization = "Bearer stale"',
+    "",
+    "[mcp_servers.browser.env_http_headers]",
+    'X-Thing = "VAR"',
+    "",
+    "[mcp_servers.other]",
+    'command = "/bin/other"',
+    "",
+  ].join("\n");
+  const table = codexHttpTable("http://127.0.0.1:47331/mcp", "node headers.js");
+  const after = withTomlTable(before, CODEX_TABLE, table);
+
+  // A leftover [mcp_servers.browser.http_headers] would collide with the inline
+  // http_headers the new table declares, and a duplicate key makes the file unreadable.
+  assert.equal(after.includes("[mcp_servers.browser."), false, after);
+  assert.equal(after.includes("Bearer stale"), false);
+  assert.equal(after.includes("http://old"), false);
+  assert.match(after, /\[mcp_servers\.other\]\ncommand = "\/bin\/other"/);
+  assert.deepEqual(
+    after.split("\n").filter((line) => line.startsWith("[")),
+    ["[mcp_servers.browser]", "[mcp_servers.other]"],
+  );
+  assert.equal(withTomlTable(after, CODEX_TABLE, table), null, "and a second run is a no-op");
+
+  const removed = withoutTomlTable(after, CODEX_TABLE);
+  assert.equal(removed.includes("mcp_servers.browser"), false);
+  assert.match(removed, /\[mcp_servers\.other\]/);
+
+  // Uninstalling the sub-table shape directly takes those with it too.
+  const scrubbed = withoutTomlTable(before, CODEX_TABLE);
+  assert.equal(scrubbed.includes("mcp_servers.browser"), false, scrubbed);
+  assert.equal(scrubbed.includes("Bearer stale"), false);
+  assert.match(scrubbed, /\[mcp_servers\.other\]/);
+});
+
+test("a config edit is written through a temp file, not over the original", async (t) => {
+  const env = fakeHome(t);
+  const file = path.join(env.HOME, ".codex", "config.toml");
+  fs.writeFileSync(file, 'model = "gpt-5"\n');
+  await runInstaller([], env);
+
+  assert.match(fs.readFileSync(file, "utf8"), /\[mcp_servers\.browser\]/);
+  assert.equal(fs.existsSync(`${file}.tmp`), false, "the temp file is renamed over, not left");
+  assert.equal(fs.readFileSync(`${file}.bak`, "utf8"), 'model = "gpt-5"\n');
+});
+
 // --- end to end, on files only -------------------------------------------
 
 test("--dry-run prints every file, edit and command and changes nothing", async (t) => {
@@ -806,13 +885,21 @@ test("uninstall takes the registrations and the job out but leaves daemon.json",
   );
 });
 
-test("--stdio registers the per-session server through the CLIs", async (t) => {
+test("--stdio registers the per-session server and takes the daemon job out", async (t) => {
   const env = fakeHome(t);
-  const { ran } = await runInstaller(["--stdio"], env);
-  assert.equal(fs.existsSync(path.join(env.HOME, RUNTIME, "daemon.json")), false);
-  assert.equal(fs.existsSync(daemonPlistPath(env)), false);
+  // A daemon was installed first, so there is a job and a plist to get rid of.
+  await runInstaller([], env);
+  assert.ok(fs.existsSync(daemonPlistPath(env)));
+
+  const { ran, verbs, output } = await runInstaller(["--stdio"], env, { launchctl: { loaded: true } });
+  assert.equal(fs.existsSync(daemonPlistPath(env)), false, "no job, so no plist");
+  // Leaving the job loaded would keep a daemon on the port with nothing registered to it.
+  assert.deepEqual(verbs, ["print", "bootout", "print", "print"], "check, boot out, poll, verify");
+  assert.equal(output.includes("daemon up on port"), false, "nothing is waiting for /healthz");
+  // daemon.json stays: it is the token, and --stdio is meant to be reversible.
+  assert.ok(fs.existsSync(path.join(env.HOME, RUNTIME, "daemon.json")));
   assert.deepEqual(
-    ran.map((command) => `${command.name} ${command.args.slice(0, 2).join(" ")}`),
+    ran.filter((command) => command.name !== "launchctl").map((command) => `${command.name} ${command.args.slice(0, 2).join(" ")}`),
     [
       "claude mcp remove",
       "claude mcp add-json",
