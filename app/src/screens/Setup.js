@@ -7,7 +7,7 @@ import { Button, InlineError } from '../ui';
 
 const DEFAULT_SERVER = 'http://your-computer:7777';
 
-export default function Setup({ initialConfig, onCancel, onConnected, onPalette, paletteId, scheme, styles }) {
+export default function Setup({ initialConfig, onCancel, onConnected, onDiagnostics, onPalette, paletteId, scheme, styles }) {
   const [server, setServer] = useState(initialConfig?.server || '');
   const [token, setToken] = useState(initialConfig?.token || '');
   const [connecting, setConnecting] = useState(false);
@@ -34,7 +34,9 @@ export default function Setup({ initialConfig, onCancel, onConnected, onPalette,
   return (
     <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.setupOuter}>
       <ScrollView contentContainerStyle={styles.setupContent} keyboardShouldPersistTaps="handled">
-        <Text style={styles.setupTitle}>Connect to Keep</Text>
+        {/* Long-press the title for the diagnostics screens: the terminal parser
+            spike lives there, out of the way of anyone setting the app up. */}
+        <Text onLongPress={onDiagnostics} style={styles.setupTitle} suppressHighlighting>Connect to Keep</Text>
         <Text style={styles.setupIntro}>Open your Keep console on your phone: what needs you, the fleet, the reviewer, and every terminal.</Text>
 
         <Text style={styles.inputLabel}>Server URL</Text>

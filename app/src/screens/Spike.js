@@ -1,0 +1,207 @@
+import React, { useCallback, useEffect, useState } from 'react';
+import { ScrollView, Text, View } from 'react-native';
+
+import { Button, mono } from '../ui';
+
+const { createEmulator } = require('../terminal/emulator');
+const { fixture, frameData } = require('../terminal/fixture');
+
+// Phase 3 step 0: does xterm's parser run under Hermes, and how fast? The fixture is a
+// synthetic relay stream built by src/terminal/fixtures/generate.js, with the expected
+// final screen baked in by @xterm/addon-serialize on the Mac — the device does not
+// carry the serializer, only the parser it would actually ship with.
+
+const ANSI_16 = [
+  '#000000', '#cc0000', '#4e9a06', '#c4a000', '#3465a4', '#75507b', '#06989a', '#d3d7cf',
+  '#555753', '#ef2929', '#8ae234', '#fce94f', '#729fcf', '#ad7fa8', '#34e2e2', '#eeeeec',
+];
+
+function paletteColor(value) {
+  if (value < 16) return ANSI_16[value];
+  if (value < 232) {
+    const index = value - 16;
+    const step = (n) => (n === 0 ? 0 : 55 + n * 40);
+    const channel = (n) => step(n).toString(16).padStart(2, '0');
+    return `#${channel(Math.floor(index / 36) % 6)}${channel(Math.floor(index / 6) % 6)}${channel(index % 6)}`;
+  }
+  const grey = (8 + (value - 232) * 10).toString(16).padStart(2, '0');
+  return `#${grey}${grey}${grey}`;
+}
+
+function colorFor(value, fallback) {
+  if (value === null || value === undefined) return fallback;
+  if (typeof value === 'string') return value;
+  return paletteColor(value);
+}
+
+function now() {
+  if (typeof global !== 'undefined' && global.performance && typeof global.performance.now === 'function') {
+    return global.performance.now();
+  }
+  return Date.now();
+}
+
+async function runSpike() {
+  const started = now();
+  const emulator = createEmulator({
+    cols: fixture.cols, rows: fixture.rows, scrollback: fixture.expected.scrollback || 1000,
+  });
+  const frames = fixture.frames.filter((frame) => frame.kind !== 'json');
+  const decodeStart = now();
+  const payloads = frames.map(frameData);
+  const decodeMs = now() - decodeStart;
+  const bytes = payloads.reduce((total, data) => total + (data.length || 0), 0);
+
+  const writeStart = now();
+  for (const data of payloads) emulator.write(data);
+  await emulator.flush();
+  const writeMs = now() - writeStart;
+
+  const rowsStart = now();
+  const rows = emulator.rows();
+  const rowsMs = now() - rowsStart;
+
+  const mine = rows.map((row) => row.text.slice(0, row.trimmed));
+  const diffs = [];
+  for (let y = 0; y < fixture.expected.rows.length; y++) {
+    if (mine[y] !== fixture.expected.rows[y]) diffs.push(y);
+  }
+  const cursor = emulator.cursor();
+  const alternate = emulator.isAlternate();
+  const cursorOk = cursor.x === fixture.expected.cursor.x
+    && cursor.y === fixture.expected.cursor.y
+    && cursor.visible === fixture.expected.cursor.visible;
+
+  emulator.dispose();
+  return {
+    pass: diffs.length === 0 && cursorOk && alternate === fixture.expected.alternate,
+    diffs,
+    rows,
+    mine,
+    frames: frames.length,
+    bytes,
+    decodeMs,
+    writeMs,
+    rowsMs,
+    totalMs: now() - started,
+    cursor,
+    cursorOk,
+    alternate,
+  };
+}
+
+function Row({ row, style }) {
+  if (row.runs.length <= 1) return <Text style={style}>{row.text.slice(0, row.trimmed) || ' '}</Text>;
+  return (
+    <Text style={style}>
+      {row.runs.map((run, index) => {
+        const text = row.text.slice(run.start, Math.min(run.end, row.trimmed));
+        if (!text) return null;
+        const fg = colorFor(run.inverse ? run.bg : run.fg, run.inverse ? '#000000' : undefined);
+        const bg = colorFor(run.inverse ? run.fg : run.bg, run.inverse ? '#d0d0d0' : undefined);
+        return (
+          <Text
+            key={`${index}:${run.start}`}
+            style={{
+              backgroundColor: bg,
+              color: fg,
+              fontStyle: run.italic ? 'italic' : 'normal',
+              fontWeight: run.bold ? '700' : '400',
+              opacity: run.dim ? 0.6 : 1,
+              textDecorationLine: run.underline ? 'underline' : 'none',
+            }}
+          >
+            {text}
+          </Text>
+        );
+      })}
+    </Text>
+  );
+}
+
+export default function Spike({ colors, onBack, styles: appStyles }) {
+  const [state, setState] = useState({ status: 'running' });
+
+  const run = useCallback(() => {
+    setState({ status: 'running' });
+    // A throw here is the answer to the spike's question, so it is shown, not swallowed.
+    runSpike().then(
+      (result) => setState({ status: 'done', result }),
+      (error) => setState({ status: 'failed', error }),
+    );
+  }, []);
+
+  useEffect(() => { run(); }, [run]);
+
+  const styles = {
+    screen: { backgroundColor: colors.bg, flex: 1 },
+    content: { padding: 14, paddingBottom: 40 },
+    title: { color: colors.text, fontSize: 20, fontWeight: '700', marginBottom: 4 },
+    sub: { color: colors.muted, fontSize: 12, lineHeight: 18, marginBottom: 12 },
+    verdict: { borderRadius: 6, marginBottom: 12, padding: 10 },
+    verdictText: { fontSize: 15, fontWeight: '700' },
+    stat: { color: colors.text, fontFamily: mono, fontSize: 12, lineHeight: 19 },
+    screenRow: { color: colors.text, fontFamily: mono, fontSize: 7, lineHeight: 10 },
+    actions: { flexDirection: 'row', gap: 8, marginTop: 14 },
+  };
+
+  const result = state.result;
+  return (
+    <ScrollView contentContainerStyle={styles.content} style={styles.screen}>
+      <Text style={styles.title}>Terminal parser spike</Text>
+      <Text style={styles.sub}>
+        {`@xterm/headless under Hermes, replaying ${fixture.frames.length} frames of ${fixture.pane} `
+          + `(${fixture.cols}x${fixture.rows}), rebuilt by ${fixture.generatedBy}.`}
+      </Text>
+
+      {state.status === 'running' ? <Text style={styles.stat}>running…</Text> : null}
+
+      {state.status === 'failed' ? (
+        <View style={[styles.verdict, { backgroundColor: colors.badSoft }]}>
+          <Text style={[styles.verdictText, { color: colors.bad }]}>
+            {`the parser did not run: ${state.error?.message || state.error}`}
+          </Text>
+          <Text style={styles.stat}>{String(state.error?.stack || '').slice(0, 800)}</Text>
+        </View>
+      ) : null}
+
+      {state.status === 'done' ? (
+        <>
+          <View style={[styles.verdict, { backgroundColor: result.pass ? colors.accentSoft : colors.badSoft }]}>
+            <Text style={[styles.verdictText, { color: result.pass ? colors.ok : colors.bad }]}>
+              {result.pass ? 'PASS — the screen matches the serializer' : `FAIL — ${result.diffs.length} rows differ`}
+            </Text>
+          </View>
+          <Text style={styles.stat}>{`frames        ${result.frames}`}</Text>
+          <Text style={styles.stat}>{`bytes         ${result.bytes}`}</Text>
+          <Text style={styles.stat}>{`base64 decode ${result.decodeMs.toFixed(1)} ms`}</Text>
+          <Text style={styles.stat}>{`write+parse   ${result.writeMs.toFixed(1)} ms`}</Text>
+          <Text style={styles.stat}>{`rows()        ${result.rowsMs.toFixed(2)} ms for ${result.rows.length} rows`}</Text>
+          <Text style={styles.stat}>{`total         ${result.totalMs.toFixed(1)} ms`}</Text>
+          <Text style={styles.stat}>
+            {`cursor        ${result.cursor.x},${result.cursor.y} visible=${result.cursor.visible} `
+              + `${result.cursorOk ? 'ok' : `expected ${fixture.expected.cursor.x},${fixture.expected.cursor.y}`}`}
+          </Text>
+          <Text style={styles.stat}>
+            {`alt buffer    ${result.alternate} ${result.alternate === fixture.expected.alternate ? 'ok' : 'MISMATCH'}`}
+          </Text>
+          {result.diffs.length ? (
+            <Text style={styles.stat}>{`first diff at row ${result.diffs[0]}:\n  got ${JSON.stringify(result.mine[result.diffs[0]])}\n  want ${JSON.stringify(fixture.expected.rows[result.diffs[0]])}`}</Text>
+          ) : null}
+
+          <Text style={[styles.sub, { marginTop: 14 }]}>The parsed screen, drawn as native text rows:</Text>
+          <ScrollView horizontal>
+            <View>
+              {result.rows.map((row, index) => <Row key={index} row={row} style={styles.screenRow} />)}
+            </View>
+          </ScrollView>
+        </>
+      ) : null}
+
+      <View style={styles.actions}>
+        <Button onPress={run} quiet style={{ flex: 1 }} styles={appStyles}>Run again</Button>
+        <Button onPress={onBack} quiet style={{ flex: 1 }} styles={appStyles}>Back</Button>
+      </View>
+    </ScrollView>
+  );
+}

@@ -13,6 +13,7 @@ import { DEFAULT_PALETTE, themeFor } from './theme';
 import * as api from './src/api';
 import Console from './src/screens/Console';
 import Setup from './src/screens/Setup';
+import Spike from './src/screens/Spike';
 import Terminal from './src/screens/Terminal';
 import { makeStyles } from './src/ui';
 
@@ -384,6 +385,14 @@ function KeepShell() {
           )}
         </Stack.Screen>
 
+        <Stack.Screen name="Spike">
+          {({ navigation: nav }) => (
+            <Frame background={colors.barBg}>
+              <Spike colors={colors} onBack={() => nav.goBack()} styles={styles} />
+            </Frame>
+          )}
+        </Stack.Screen>
+
         <Stack.Screen name="Setup">
           {({ navigation: nav }) => (
             <Frame background={colors.barBg}>
@@ -395,6 +404,7 @@ function KeepShell() {
                   if (nav.canGoBack()) nav.goBack();
                   else nav.replace('Console');
                 }}
+                onDiagnostics={() => nav.navigate('Spike')}
                 onPalette={changePalette}
                 paletteId={paletteId}
                 scheme={scheme}
