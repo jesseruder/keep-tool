@@ -1,11 +1,28 @@
 let lastBadge;
 let desktopPermission = 'default';
+let mobileNotificationClick = null;
 
 export function isDesktop() {
   return Boolean(window.__TAURI__);
 }
 
+// The Android WebView shell injects `window.keepShell` before page scripts run:
+// `{ platform, version, post(message) }`, where post() serializes `{type, ...}`
+// to the app. The app calls `window.keepShellReceive(message)` the other way.
+export function isMobileShell() {
+  return Boolean(window.keepShell);
+}
+
+export function postShell(message) {
+  if (!isMobileShell()) return false;
+  try {
+    window.keepShell.post(message);
+    return true;
+  } catch { return false; }
+}
+
 document.documentElement.classList.toggle('desktop', isDesktop());
+document.documentElement.classList.toggle('mobile', isMobileShell());
 
 export function setBadge(count) {
   const next = Math.max(0, Math.floor(Number(count) || 0));
@@ -17,11 +34,17 @@ export function setBadge(count) {
     } catch {}
     return;
   }
+  // A WebView has no title bar to count in; the app owns the launcher badge.
+  if (isMobileShell()) {
+    postShell({ type: 'badge', count: next });
+    return;
+  }
   document.title = next ? `(${next}) Keep` : 'Keep';
 }
 
 export function notificationPermission() {
   if (isDesktop()) return desktopPermission;
+  if (isMobileShell()) return 'granted'; // the app owns the OS permission
   return typeof Notification === 'undefined' ? 'unsupported' : Notification.permission;
 }
 
@@ -35,6 +58,7 @@ export async function requestPermission() {
       desktopPermission = result === 'granted' ? 'granted' : 'denied';
       return desktopPermission;
     }
+    if (isMobileShell()) return 'granted';
     if (typeof Notification === 'undefined') return 'unsupported';
     if (Notification.permission !== 'default') return Notification.permission;
     return await Notification.requestPermission();
@@ -45,13 +69,13 @@ export async function requestPermission() {
 
 export async function notify({ title, body, tag, onClick } = {}) {
   try {
+    const content = { title: String(title || 'Keep'), body: String(body || '') };
     if (isDesktop()) {
       const notification = window.__TAURI__.notification;
       if (!notification) return;
       let granted = await notification.isPermissionGranted();
       if (!granted) granted = await requestPermission() === 'granted';
       if (!granted) return;
-      const content = { title: String(title || 'Keep'), body: String(body || '') };
       try {
         await window.__TAURI__.core.invoke('send_notification', { ...content, key: String(tag || '') });
       } catch {
@@ -60,8 +84,12 @@ export async function notify({ title, body, tag, onClick } = {}) {
       }
       return;
     }
+    if (isMobileShell()) {
+      postShell({ type: 'notify', ...content, key: String(tag || '') });
+      return;
+    }
     if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
-    const message = new Notification(String(title || 'Keep'), { body: String(body || ''), tag });
+    const message = new Notification(content.title, { body: content.body, tag });
     message.onclick = () => {
       window.focus();
       onClick?.();
@@ -71,6 +99,11 @@ export async function notify({ title, body, tag, onClick } = {}) {
 }
 
 export async function installNotificationClicks(onClick) {
+  if (isMobileShell()) {
+    // The app delivers the tap through keepShellReceive; nothing to poll.
+    mobileNotificationClick = onClick;
+    return;
+  }
   if (!isDesktop()) return;
   const drain = async () => {
     const key = await window.__TAURI__.core.invoke('get_notification_click');
@@ -83,9 +116,25 @@ export async function installNotificationClicks(onClick) {
 }
 
 export async function acknowledgeNotificationClick(key) {
-  if (!isDesktop()) return;
+  if (!isDesktop()) return; // the mobile app dismisses its own notifications
   try { await window.__TAURI__.core.invoke('acknowledge_notification_click', { key }); } catch {}
 }
+
+// The console is subscribed and has asked for its first state: the shell may
+// show the page instead of its splash.
+export function shellReady() {
+  postShell({ type: 'ready' });
+}
+
+export function receiveShellMessage(message) {
+  const type = message?.type;
+  if (type === 'notificationClick') {
+    const key = message.key;
+    if (key && mobileNotificationClick) Promise.resolve(mobileNotificationClick(key)).catch(() => {});
+  } else if (type === 'reload') location.reload();
+}
+
+if (isMobileShell()) window.keepShellReceive = receiveShellMessage;
 
 if (isDesktop()) {
   Promise.resolve(window.__TAURI__.notification?.isPermissionGranted?.())
@@ -94,6 +143,6 @@ if (isDesktop()) {
 }
 
 export async function playAttentionSound() {
-  if (!isDesktop()) return;
+  if (!isDesktop()) return; // a no-op on mobile: the app owns its own sounds
   try { await window.__TAURI__.core.invoke('play_attention_sound'); } catch {}
 }

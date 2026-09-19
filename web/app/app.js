@@ -26,7 +26,7 @@ import { closeReviewerPopover, markReviewerSeen, renderDock, renderReviewer, ren
 import { createDetailStore } from './details.js';
 import { handleGradeKey } from './state-line.js';
 import { focusQueueItem, handleLeaveTerminalKey } from './leave-terminal.js';
-import { acknowledgeNotificationClick, installNotificationClicks, notificationPermission, notify, requestPermission, setBadge } from './shell.js';
+import { acknowledgeNotificationClick, installNotificationClicks, notificationPermission, notify, requestPermission, setBadge, shellReady } from './shell.js';
 
 applyTheme();
 
@@ -724,9 +724,14 @@ function mount(container, pane, options = {}) {
   }
   if (!entry) {
     entry = { options, pid, agentSession };
+    const entity = entityForPane(pane);
     entry.mounted = mountTerminal(container, pane, {
       ...options,
       slot,
+      // The mobile shell hands the pane to a native terminal screen instead of
+      // mounting xterm, so it needs the names this pane is known by.
+      session: entity.session?.id || currentPane?.meta?.sessionId || '',
+      title: entity.title,
       onFocus(terminal, element) {
         state.focused = true;
         document.querySelectorAll('.term.focused').forEach((term) => term.classList.remove('focused'));
@@ -1495,3 +1500,4 @@ api.subscribe(reload, (status) => {
   if (status === 'live') reload();
 }, focusSession);
 reload();
+shellReady();

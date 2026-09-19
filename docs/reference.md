@@ -113,6 +113,35 @@ failure rather than clearing the streak first. `keep discord status` is unchange
 reads the watcher's own status file, not health.
 
 
+## Console access
+
+The console at `/app` is authorized three ways: a loopback peer with a loopback
+`Host`, an `x-keep-token` header, or a `keep-token` cookie. The cookie is for a
+shell that can set headers only on its top-level navigation — the Android WebView
+shell, whose page scripts, fetches, EventSource and WebSocket cannot. It opens
+`http://<mac>:7777/app?token=<token>` once; a matching token answers `302 /app`
+with `Set-Cookie: keep-token=…; Max-Age=400d; Path=/; HttpOnly; SameSite=Strict`
+and `cache-control: no-store`, and the token never appears in a body or a log. A
+wrong token gets the ordinary `403`. Mutating routes still require `x-keep: 1`
+and a JSON content type, which with `SameSite=Strict` is what makes the cookie
+safe; the frontend strips `Cookie` before the Unix hop to the daemon.
+
+A pane socket (`/ws/pane/<id>`) additionally needs either an `Origin` whose host
+equals the request's `Host`, or no `Origin` and a valid `x-keep-token` (a native
+client). See `docs/ui-reliability.md` for the reasoning.
+
+The console detects the mobile shell as `window.keepShell`
+(`{ platform, version, post(message) }`, injected before page scripts) and sets
+`<html class="mobile">`. Console → shell messages, all through `post()`:
+`{type:'ready'}` once the console has subscribed, `{type:'badge', count}`,
+`{type:'notify', title, body, key}`, and `{type:'openTerminal', pane, session,
+title}` from the terminal handoff panel the console shows instead of mounting
+xterm. Shell → console: the app calls `window.keepShellReceive(message)` with
+`{type:'notificationClick', key}`, which lands in the same handler the desktop
+shell's notification clicks use, or `{type:'reload'}`. On the mobile shell the
+app owns notification permission (always `granted`), the launcher badge, and
+waiting sounds.
+
 ## CLI
 
 ```

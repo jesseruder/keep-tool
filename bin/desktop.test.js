@@ -28,6 +28,7 @@ test('startup subscribes despite a failed request, retries, and refreshes on rec
     deriveDismissed() {}, applyLayouts() {}, applyStateEffects() {}, toast() {},
     refreshProjectChoices() { iconRefreshes++; },
     refresh() { renders++; }, installNotificationClicks() {}, selectAttention() {}, focusSession() {}, acknowledgeNotificationClick() {},
+    shellReady() {},
   });
   const reloadStart = app.indexOf('let reloadRetry;');
   vm.runInContext(app.slice(reloadStart, app.indexOf('\nconst ctx =', reloadStart)), context);

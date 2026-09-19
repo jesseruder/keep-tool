@@ -7,6 +7,44 @@ import { getTerminalRendererPreference, rendererTrialExpiry, terminalRendererKey
 
 const encoder = new TextEncoder();
 
+// Sniffed here rather than imported from shell.js, the way __TAURI__ already is:
+// this module is also read as plain source by the terminal unit tests.
+const isMobileShell = () => Boolean(window.keepShell);
+const postShell = (message) => {
+  try { window.keepShell.post(message); } catch {}
+};
+
+// A phone gets the pane through the app's own terminal screen: xterm inside a
+// WebView has neither the keyboard nor the pointer model to drive a PTY. The
+// panel stands in for a mount, with the whole mount interface as no-ops, so
+// app.js can keep, hide, re-show and dispose it like any other terminal.
+function mountShellPanel(container, pane, options = {}) {
+  const title = String(options.title || pane);
+  const session = String(options.session || '');
+  const wrapper = document.createElement('div');
+  wrapper.className = 'term term-handoff';
+  wrapper.dataset.pane = pane;
+  wrapper.innerHTML = '<div class="term-handoff-body"><b class="term-handoff-title"></b><button class="term-handoff-open" type="button">Open terminal</button></div><div class="term-status"><span class="term-state">shell</span><span class="term-note"></span></div>';
+  wrapper.querySelector('.term-handoff-title').textContent = title;
+  wrapper.querySelector('.term-handoff-open').addEventListener('click', () => {
+    postShell({ type: 'openTerminal', pane, session, title });
+  });
+  container.replaceChildren(wrapper);
+  return {
+    element: wrapper,
+    terminal: null,
+    get socket() { return null; },
+    focus() {},
+    fit() {},
+    setTheme() {},
+    setRenderer() {},
+    show() {},
+    hide() {},
+    syncVisibility() {},
+    dispose() { wrapper.remove(); },
+  };
+}
+
 function base64Bytes(bytes) {
   let binary = '';
   for (let offset = 0; offset < bytes.length; offset += 0x8000) {
@@ -28,6 +66,7 @@ function mountViewerId(pane, slot) {
 }
 
 export function mountTerminal(container, pane, options = {}) {
+  if (isMobileShell()) return mountShellPanel(container, pane, options);
   const wrapper = document.createElement('div');
   wrapper.className = 'term';
   wrapper.tabIndex = 0;
@@ -114,7 +153,7 @@ export function mountTerminal(container, pane, options = {}) {
   };
   const profiler = createTerminalProfiler({
     pane, terminal, wrapper,
-    runtime: window.__TAURI__ ? 'desktop' : 'web',
+    runtime: window.__TAURI__ ? 'desktop' : isMobileShell() ? 'mobile' : 'web',
     active: () => !disposed && !exited && !document.hidden && isVisible()
       && socket?.readyState === WebSocket.OPEN && replayDone,
     focused: () => document.hasFocus?.() !== false,
