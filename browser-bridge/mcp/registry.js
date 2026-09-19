@@ -14,6 +14,8 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { deriveSecretTag } from "./identity.js";
+
 /** An id nobody has used for a day is not coming back. */
 export const REGISTRY_TTL_MS = 24 * 60 * 60 * 1000;
 /** `lastSeen` is written at most this often; every request would mean a write per call. */
@@ -26,13 +28,17 @@ export class SessionRegistry {
   #file;
   #now;
   #writeDelayMs;
+  #secretTag;
   #timer = null;
   #entries = new Map();
 
-  constructor({ file, now = () => Date.now(), writeDelayMs = WRITE_DELAY_MS }) {
+  constructor({ file, secret, now = () => Date.now(), writeDelayMs = WRITE_DELAY_MS }) {
     this.#file = file;
     this.#now = now;
     this.#writeDelayMs = writeDelayMs;
+    // Which secret this file belongs to. Every key in it is derived from that secret, so a
+    // file from a different one holds rows nothing can ever look up again.
+    this.#secretTag = secret ? deriveSecretTag(secret) : null;
   }
 
   /** Reads the file if it is there, drops anything stale or malformed, and never throws. */
@@ -43,8 +49,20 @@ export class SessionRegistry {
     } catch {
       parsed = null;
     }
-    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-      for (const [key, entry] of Object.entries(parsed)) {
+    const usable =
+      parsed !== null &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      // A file written under another secret is dropped whole, and so is one in the older
+      // shape that has no tag at all. The installer cannot do this by deleting the file:
+      // the daemon it is about to restart flushes its own copy on the way out and puts the
+      // old rows straight back, so the check has to live where the reading happens.
+      parsed.secretTag === this.#secretTag &&
+      parsed.sessions !== null &&
+      typeof parsed.sessions === "object" &&
+      !Array.isArray(parsed.sessions);
+    if (usable) {
+      for (const [key, entry] of Object.entries(parsed.sessions)) {
         if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
         if (!/^[0-9a-f]{64}$/.test(key)) continue; // not one of ours
         this.#entries.set(key, {
@@ -149,14 +167,15 @@ export class SessionRegistry {
       clearTimeout(this.#timer);
       this.#timer = null;
     }
-    const object = {};
+    const sessions = {};
     for (const [key, entry] of this.#entries) {
-      object[key] = { ...entry };
+      sessions[key] = { ...entry };
       if (entry.ended === undefined) {
-        delete object[key].ended;
-        delete object[key].endedBy;
+        delete sessions[key].ended;
+        delete sessions[key].endedBy;
       }
     }
+    const object = { secretTag: this.#secretTag, sessions };
     const tmp = `${this.#file}.tmp`;
     try {
       fs.mkdirSync(path.dirname(this.#file), { recursive: true, mode: 0o700 });

@@ -460,8 +460,8 @@ test("the registry file is private, atomic and pruned", async (t) => {
   // somebody else and drive their tab group.
   assert.equal(text.includes(sessionId), false, "not even the id is in there");
   assert.equal(text.includes(deriveSessionKey(SECRET, sessionId)), false, "and certainly not the key");
-  assert.deepEqual(Object.keys(saved), [deriveRegistryKey(SECRET, sessionId)]);
-  const entry = saved[deriveRegistryKey(SECRET, sessionId)];
+  assert.deepEqual(Object.keys(saved.sessions), [deriveRegistryKey(SECRET, sessionId)]);
+  const entry = saved.sessions[deriveRegistryKey(SECRET, sessionId)];
   assert.equal(entry.name, "on disk");
   assert.equal("sessionKey" in entry, false);
   assert.equal(fs.existsSync(`${file}.tmp`), false, "the tmp file is renamed over, not left behind");
@@ -477,7 +477,7 @@ test("the registry file is private, atomic and pruned", async (t) => {
   await daemon.sweep(clock);
   assert.equal(daemon.registry.get(deriveRegistryKey(SECRET, sessionId)), null);
   daemon.registry.flush();
-  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), {});
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")).sessions, {});
 });
 
 test("DELETE closes the session's socket client", async (t) => {

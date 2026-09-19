@@ -760,25 +760,28 @@ test("daemon.log is created private, and an existing one is tightened", async (t
   assert.equal(fs.statSync(path.join(fresh.HOME, RUNTIME, "daemon.log")).mode & 0o777, 0o600);
 });
 
-test("--rotate-token clears the registry, because its keys were the old secret's", async (t) => {
+test("--rotate-token says what it costs, and leaves the registry to the daemon", async (t) => {
   const env = fakeHome(t);
   await runInstaller([], env);
   const sessions = path.join(env.HOME, RUNTIME, "sessions.json");
-  fs.writeFileSync(sessions, JSON.stringify({ ["a".repeat(64)]: { name: "#12 fix-login", lastSeen: 1 } }));
+  const daemonConfig = path.join(env.HOME, RUNTIME, "daemon.json");
 
   const before = daemonSettings({}, env);
   assert.equal(before.secretChanged, false, "a plain re-run changes nothing");
-  const plan = buildPlan({ browsers: ["edge"], uninstall: false }, env);
-  assert.equal(plan.removals.includes(sessions), false);
+  assert.equal((await runInstaller([], env)).output.includes("secret changed"), false);
 
-  // Every entry is filed under a key derived from the old secret, so with a new one they are
-  // rows nothing can ever read again - they would just sit there for a day.
   const { output } = await runInstaller(["--rotate-token"], env);
-  assert.equal(fs.existsSync(sessions), false, output);
-  assert.notEqual(
-    JSON.parse(fs.readFileSync(path.join(env.HOME, RUNTIME, "daemon.json"), "utf8")).secret,
-    before.secret,
-  );
+  assert.notEqual(JSON.parse(fs.readFileSync(daemonConfig, "utf8")).secret, before.secret);
+  assert.notEqual(JSON.parse(fs.readFileSync(daemonConfig, "utf8")).token, before.token);
+  // Every registry key was derived from the old secret, so every session gets a new tab group
+  // and the remembered names are gone. Worth saying out loud.
+  assert.match(output, /secret changed, so every running session gets a new tab group/);
+
+  // The installer does *not* delete sessions.json, because it cannot: the daemon it is about to
+  // replace flushes its own copy on the way out and would put the old rows straight back. The
+  // registry recognises a file from another secret and drops it on the next read instead.
+  const plan = buildPlan({ browsers: ["edge"], uninstall: false, rotateToken: true }, env);
+  assert.equal(plan.removals.includes(sessions), false, "no race with the daemon over that file");
 });
 
 // --- end to end, on files only -------------------------------------------

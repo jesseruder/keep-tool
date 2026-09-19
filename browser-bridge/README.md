@@ -39,8 +39,9 @@ The installer:
 3. writes `BrowserBridge/daemon.json` (mode 0600) with the loopback port, a random 32-byte
    `token` (what every agent sends) and a random 32-byte `secret` (what session keys are
    derived from, and which never leaves this machine), keeping either if it is already there;
-   `--rotate-token` replaces both, which also moves every live session to a new tab group and
-   clears `sessions.json`;
+   `--rotate-token` replaces both, which moves every live session to a new tab group and drops
+   the session names the daemon had remembered (it recognises a `sessions.json` written under
+   the old secret and discards it);
 4. makes sure `BrowserBridge/daemon.log` exists at mode 0600 (launchd would create it 0644),
    writes `~/Library/LaunchAgents/com.keep.browser_bridge.daemon.plist` and reloads the
    launchd job — `kickstart -k` when the plist has not changed, otherwise `bootout`, a poll

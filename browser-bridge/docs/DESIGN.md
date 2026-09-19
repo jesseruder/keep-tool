@@ -207,7 +207,12 @@ slow). The host answers the client with an error on timeout and drops the late r
   `BrowserBridge/sessions.json` (0600, written tmp-then-rename so an interrupted write cannot
   truncate it, debounced so a request does not mean a write, capped at 500 entries, oldest
   dropped). It holds **no session key and no session id**: keys are derived, and each entry is
-  filed under `hmacSha256(secret, "registry:" + id)`. An ended session leaves a **tombstone**
+  filed under `hmacSha256(secret, "registry:" + id)`. The file also carries a `secretTag`, eight
+  characters of `hmacSha256(secret, "registry-file")`, and `load()` drops every entry when that
+  does not match the secret in hand — after a rotation those keys can never be looked up again.
+  The installer cannot do that job by deleting the file: the daemon it is about to replace
+  flushes its own copy on the way out and would put the old rows straight back, so the check
+  belongs where the reading happens. An ended session leaves a **tombstone**
   rather than being deleted, because the extension keeps an ended session's tabs and hands the
   group back to the same `sessionKey`, and `endedBy` says whether the id may come back at all.
   Entries a day past their last use are pruned at load and by the sweep — and every live
@@ -736,9 +741,11 @@ node bin/install.js [--browser edge|chrome] [--chrome-too] [--stdio]
    the secret is what session keys are derived from and never leaves the machine. Neither is
    rotated on a re-run: the token is in every registration's reach, and rotating the secret
    re-derives every key, which costs every live session its tab group. `--rotate-token` does
-   both deliberately — and then `sessions.json` is deleted, because every entry in it is filed
-   under a key derived from the *old* secret and could never be read again. An install from
-   before the secret existed gains one with its token untouched.
+   both deliberately, and it says so: every entry in `sessions.json` is filed under a key
+   derived from the *old* secret, so every session gets a new tab group and the remembered names
+   are gone. The daemon drops those rows itself on its next read (see `secretTag` above) rather
+   than the installer racing it for the file. An install from before the secret existed gains one
+   with its token untouched.
 4. Write `~/Library/LaunchAgents/com.keep.browser_bridge.daemon.plist` (the same node the
    native-host launcher uses, `mcp/daemon.js`, RunAtLoad, KeepAlive, ThrottleInterval 5,
    WorkingDirectory the bridge directory, both output paths `BrowserBridge/daemon.log`), make

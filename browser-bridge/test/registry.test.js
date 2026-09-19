@@ -9,16 +9,22 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { deriveRegistryKey, deriveSessionKey } from "../mcp/identity.js";
+import { deriveRegistryKey, deriveSecretTag, deriveSessionKey } from "../mcp/identity.js";
 import { MAX_ENTRIES, REGISTRY_TTL_MS, SessionRegistry } from "../mcp/registry.js";
 
 const SECRET = "a1b2c3d4".repeat(8);
 const KEY = deriveRegistryKey(SECRET, "mcp-session-1");
 
+const OTHER_SECRET = "f0f0f0f0".repeat(8);
+
 function tempFile(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bb-registry-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   return path.join(dir, "sessions.json");
+}
+
+function open(file, secret = SECRET, now = () => 1_000) {
+  return new SessionRegistry({ file, secret, now }).load();
 }
 
 test("a session key is derived from its id, the same way every time", () => {
@@ -39,11 +45,11 @@ test("a session key is derived from its id, the same way every time", () => {
 test("an entry survives a reload, with its labels", (t) => {
   const file = tempFile(t);
   const clock = 1_000;
-  const first = new SessionRegistry({ file, now: () => clock }).load();
+  const first = open(file, SECRET, () => clock);
   first.put(KEY, { name: "#12 fix-login", agent: "claude", account: "claude-tertiary" });
   first.flush();
 
-  const second = new SessionRegistry({ file, now: () => clock }).load();
+  const second = open(file, SECRET, () => clock);
   assert.deepEqual(second.get(KEY), {
     name: "#12 fix-login",
     agent: "claude",
@@ -59,7 +65,7 @@ test("an entry survives a reload, with its labels", (t) => {
 test("a tombstone records who ended the session", (t) => {
   const file = tempFile(t);
   let clock = 1_000;
-  const registry = new SessionRegistry({ file, now: () => clock }).load();
+  const registry = open(file, SECRET, () => clock);
   registry.put(KEY, { name: "gone" });
   clock = 5_000;
 
@@ -76,7 +82,7 @@ test("a tombstone records who ended the session", (t) => {
 
 test("lastSeen is not rewritten on every touch", (t) => {
   const file = tempFile(t);
-  const registry = new SessionRegistry({ file, now: () => 1_000, writeDelayMs: 1 }).load();
+  const registry = new SessionRegistry({ file, secret: SECRET, now: () => 1_000, writeDelayMs: 1 }).load();
   registry.put(KEY, { name: "busy" });
 
   // An agent makes hundreds of calls and the only thing this timestamp decides is when the
@@ -91,7 +97,7 @@ test("lastSeen is not rewritten on every touch", (t) => {
 test("stale entries are pruned, at load and on demand", (t) => {
   const file = tempFile(t);
   let clock = 1_000;
-  const registry = new SessionRegistry({ file, now: () => clock }).load();
+  const registry = open(file, SECRET, () => clock);
   registry.put(deriveRegistryKey(SECRET, "fresh"), { name: "fresh" });
   registry.put(deriveRegistryKey(SECRET, "stale"), { name: "stale" });
   registry.end(deriveRegistryKey(SECRET, "stale"));
@@ -104,14 +110,17 @@ test("stale entries are pruned, at load and on demand", (t) => {
   assert.equal(registry.size, 0);
 
   // And a file full of expired entries comes back empty rather than growing forever.
-  fs.writeFileSync(file, JSON.stringify({ [KEY]: { name: "old", lastSeen: 0 } }));
-  assert.equal(new SessionRegistry({ file, now: () => REGISTRY_TTL_MS * 3 }).load().size, 0);
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ secretTag: deriveSecretTag(SECRET), sessions: { [KEY]: { name: "old", lastSeen: 0 } } }),
+  );
+  assert.equal(open(file, SECRET, () => REGISTRY_TTL_MS * 3).size, 0);
 });
 
 test("the number of entries is capped, oldest first", (t) => {
   const file = tempFile(t);
   let clock = 0;
-  const registry = new SessionRegistry({ file, now: () => clock }).load();
+  const registry = open(file, SECRET, () => clock);
   for (let index = 0; index < MAX_ENTRIES + 20; index++) {
     clock = index;
     registry.put(deriveRegistryKey(SECRET, `session-${index}`), { name: `#${index}` });
@@ -125,25 +134,32 @@ test("the number of entries is capped, oldest first", (t) => {
 
 test("a missing, unreadable or junk file is not a crash", (t) => {
   const file = tempFile(t);
-  assert.equal(new SessionRegistry({ file }).load().size, 0, "nothing written yet");
+  assert.equal(open(file).size, 0, "nothing written yet");
 
   fs.writeFileSync(file, "{ not json");
-  assert.equal(new SessionRegistry({ file }).load().size, 0);
+  assert.equal(open(file).size, 0);
 
   fs.writeFileSync(file, JSON.stringify(["an array"]));
-  assert.equal(new SessionRegistry({ file }).load().size, 0);
+  assert.equal(open(file).size, 0);
+
+  // The older shape, a flat map with no tag, is not read at all.
+  fs.writeFileSync(file, JSON.stringify({ [KEY]: { name: "from an older format", lastSeen: 10 } }));
+  assert.equal(open(file).size, 0);
 
   // Anything not filed under one of our derived keys is not ours to read.
   fs.writeFileSync(
     file,
     JSON.stringify({
-      [KEY]: { name: "good", lastSeen: 10 },
-      "a-raw-session-id": { name: "from an older format", lastSeen: 10 },
-      notanobject: 7,
-      [deriveRegistryKey(SECRET, "weird")]: { name: 42, lastSeen: "soon", endedBy: "somebody" },
+      secretTag: deriveSecretTag(SECRET),
+      sessions: {
+        [KEY]: { name: "good", lastSeen: 10 },
+        "a-raw-session-id": { name: "not a derived key", lastSeen: 10 },
+        notanobject: 7,
+        [deriveRegistryKey(SECRET, "weird")]: { name: 42, lastSeen: "soon", endedBy: "somebody" },
+      },
     }),
   );
-  const loaded = new SessionRegistry({ file, now: () => 20 }).load();
+  const loaded = open(file, SECRET, () => 20);
   assert.equal(loaded.size, 2);
   assert.equal(loaded.get(KEY).name, "good");
   assert.equal(loaded.get("a-raw-session-id"), null);
@@ -155,22 +171,55 @@ test("a missing, unreadable or junk file is not a crash", (t) => {
 
 test("the file is written atomically and stays private", (t) => {
   const file = tempFile(t);
-  const registry = new SessionRegistry({ file, now: () => 1_000 }).load();
+  const registry = open(file);
   registry.put(KEY, { name: "private" });
   registry.close();
 
   assert.equal(fs.statSync(file).mode & 0o777, 0o600);
   assert.equal(fs.existsSync(`${file}.tmp`), false, "renamed over, never left behind");
   const saved = JSON.parse(fs.readFileSync(file, "utf8"));
-  assert.equal(saved[KEY].name, "private");
-  assert.equal("ended" in saved[KEY], false, "a live entry has no tombstone fields");
-  assert.equal("endedBy" in saved[KEY], false);
+  assert.equal(saved.secretTag, deriveSecretTag(SECRET));
+  assert.equal(saved.sessions[KEY].name, "private");
+  assert.equal("ended" in saved.sessions[KEY], false, "a live entry has no tombstone fields");
+  assert.equal("endedBy" in saved.sessions[KEY], false);
 
   // A directory where the file should be cannot be written, and that is not fatal either:
   // losing this costs a session its name, not its session.
   const blocked = tempFile(t);
   fs.mkdirSync(blocked);
-  const stuck = new SessionRegistry({ file: blocked, now: () => 1 }).load();
+  const stuck = open(blocked);
   stuck.put(KEY, { name: "nowhere to go" });
   assert.doesNotThrow(() => stuck.flush());
+});
+
+test("a file written under another secret is dropped whole, and rewritten under this one", (t) => {
+  const file = tempFile(t);
+
+  // Rotating the secret makes every key in here unlookupable, so the rows are not stale - they
+  // are unreadable. The installer cannot deal with this by deleting the file: the daemon it is
+  // about to replace flushes its own copy on the way out and puts the old rows straight back.
+  // So the check is here, where the reading happens.
+  const before = open(file, OTHER_SECRET);
+  before.put(deriveRegistryKey(OTHER_SECRET, "mcp-session-1"), { name: "#12 under the old secret" });
+  before.close();
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).secretTag, deriveSecretTag(OTHER_SECRET));
+
+  const after = open(file, SECRET);
+  assert.equal(after.size, 0, "not one entry survives the rotation");
+  assert.equal(after.get(deriveRegistryKey(OTHER_SECRET, "mcp-session-1")), null);
+  assert.equal(after.get(KEY), null);
+
+  // And the file is rewritten under the new secret's tag, so the next start reads it normally.
+  after.put(KEY, { name: "#12 under the new secret" });
+  after.close();
+  const saved = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.equal(saved.secretTag, deriveSecretTag(SECRET));
+  assert.deepEqual(Object.keys(saved.sessions), [KEY]);
+  assert.equal(saved.sessions[KEY].name, "#12 under the new secret");
+  assert.equal(fs.readFileSync(file, "utf8").includes("under the old secret"), false);
+
+  // The tag says which secret, and nothing about it.
+  assert.equal(deriveSecretTag(SECRET).length, 8);
+  assert.notEqual(deriveSecretTag(SECRET), deriveSecretTag(OTHER_SECRET));
+  assert.equal(SECRET.includes(deriveSecretTag(SECRET)), false);
 });

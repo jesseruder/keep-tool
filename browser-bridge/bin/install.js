@@ -31,7 +31,6 @@ import {
   launcherPath,
   readDaemonConfig,
   runtimeDir,
-  sessionsPath,
 } from "../host/protocol.js";
 
 const PROJECT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -130,9 +129,11 @@ export function daemonSettings(options, env = process.env) {
     secret,
     // Write only when something actually changed, so a re-run does not churn the file.
     fresh: rotate || existing?.token !== token || existing?.secret !== secret,
-    // Every registry entry is filed under a key derived from the *old* secret, so with a new
-    // one they are unreadable rows that would sit there for a day. There was no secret before
-    // the first install, and nothing filed under it, so that case is not a change.
+    // Every registry entry is filed under a key derived from the *old* secret, so with a new one
+    // every session gets a new tab group and its remembered name is gone. The daemon drops
+    // those rows itself when it next reads the file (they carry a tag of the secret they were
+    // written under); deleting the file here would not work, because the daemon being replaced
+    // flushes its own copy on the way out. This is only for saying so.
     secretChanged: Boolean(existing?.secret) && existing.secret !== secret,
   };
 }
@@ -528,8 +529,6 @@ export function buildPlan(options, env = process.env, projectDir = PROJECT_DIR) 
     // it first (and tightening it if it is already there) keeps the session names and tags out
     // of anything else's reach - a log is a file like any other.
     files.push({ path: daemonLogPath(env), mode: 0o600, append: true, content: "" });
-    // Entries filed under a secret that has just been replaced can never be read again.
-    if (daemon.secretChanged) removals.push(sessionsPath(env));
   }
 
   // --stdio has to take the job out too: leaving it loaded would keep a daemon listening on
@@ -957,7 +956,8 @@ const HELP = `Browser Bridge installer
                     changes: the helper reads the token from daemon.json each time, so a live
                     Claude Code session picks it up on its next call (it re-runs the helper on
                     a 401) and Codex on restart. Every session key changes with the secret, so
-                    running sessions get new tab groups
+                    running sessions get new tab groups and the daemon drops the session names
+                    it had remembered
   --dry-run         print every file, edit and command, change nothing
   --uninstall       remove the manifests, the launchd job and the registrations
                     (daemon.json, and so the token, is kept)
@@ -996,6 +996,12 @@ export async function main(argv, env = process.env, hooks = {}) {
   }
 
   fs.mkdirSync(runtimeDir(env), { recursive: true, mode: 0o700 });
+  if (plan.daemon?.secretChanged) {
+    process.stdout.write(
+      "the key-derivation secret changed, so every running session gets a new tab group and\n" +
+        "the daemon will drop the session names it remembered\n",
+    );
+  }
   for (const file of plan.files) writeFile(file);
   for (const target of plan.removals) removeFile(target);
   for (const edit of plan.edits ?? []) applyEdit(edit);

@@ -140,7 +140,7 @@ export function createDaemon({
 
   const sessions = new Map();
   /** What could not be derived about a session id: its labels and its tombstone. */
-  const known = (registry ?? new SessionRegistry({ file: sessionsPath(env), now })).load();
+  const known = (registry ?? new SessionRegistry({ file: sessionsPath(env), secret, now })).load();
   /** One adoption per id, even if two requests for it arrive together. */
   const adopting = new Map();
   let fallbackCounter = 0;
