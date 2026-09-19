@@ -846,10 +846,13 @@ function renderMeters() {
       const percent = Math.max(0, Math.min(100, Number(reading.percent) || 0));
       const resetAt = reading.resetsAt == null || reading.resetsAt === '' ? NaN : new Date(reading.resetsAt).getTime();
       const reset = Number.isFinite(resetAt) ? ` · resets ${new Date(resetAt).toLocaleString()}` : '';
-      return { ...reading, percent, detail: `${reading.account}: ${Math.round(percent)}%${reset}` };
+      const windowMs = Number(reading.windowMs);
+      const elapsed = Number.isFinite(resetAt) && windowMs > 0 ? Math.max(0, Math.min(100, 100 * (1 - (resetAt - Date.now()) / windowMs))) : null;
+      const elapsedText = elapsed == null ? '' : ` · ${Math.round(elapsed)}% of window elapsed`;
+      return { ...reading, percent, elapsed, detail: `${reading.account}: ${Math.round(percent)}%${elapsedText}${reset}` };
     });
     const description = `${group.label}. ${details.map((reading) => reading.detail).join('. ')}`;
-    return `<span class="meter-group" tabindex="0" role="group" aria-label="${esc(description)}"><span class="meter-label">${esc(group.label)}</span><span class="meter-readings">${details.map((reading) => `<span class="meter"><i><b class="${reading.percent >= 75 ? 'warn' : ''}" style="width:${reading.percent}%"></b></i><span>${Math.round(reading.percent)}%</span></span>`).join('')}</span><span class="meter-details" role="tooltip">${details.map((reading) => `<span>${esc(reading.detail)}</span>`).join('')}</span></span>`;
+    return `<span class="meter-group" tabindex="0" role="group" aria-label="${esc(description)}"><span class="meter-label">${esc(group.label)}</span><span class="meter-readings">${details.map((reading) => `<span class="meter"><i><b class="${reading.percent >= 75 ? 'warn' : ''}" style="width:${reading.percent}%"></b>${reading.elapsed == null ? '' : `<u style="left:${reading.elapsed}%"></u>`}</i><span>${Math.round(reading.percent)}%</span></span>`).join('')}</span><span class="meter-details" role="tooltip">${details.map((reading) => `<span>${esc(reading.detail)}</span>`).join('')}</span></span>`;
   }).join('') || '<span class="meter unavailable">usage unavailable</span>';
 }
 function renderHealth() {

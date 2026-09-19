@@ -95,7 +95,7 @@ test('canonical Codex usage wins over a newer named-model quota', () => {
     fs.utimesSync(named, new Date(2000), new Date(2000));
 
     assert.deepEqual(scanCodexUsage([dir]), {
-      windows: [{ label: 'week', percent: 44, resetsAt: 1788459012000 }],
+      windows: [{ label: 'week', percent: 44, resetsAt: 1788459012000, windowMs: 604800000 }],
       planType: 'pro',
       asOf: Date.parse('2026-08-28T23:16:30.465Z'),
     });
@@ -111,7 +111,7 @@ test('named-model quota remains a fallback when no canonical bucket exists', () 
     fs.writeFileSync(named, `${rateLimitLine('2026-08-28T23:16:39.452Z', 'codex_bengalfox', 3, 300)}\n`);
 
     assert.deepEqual(scanCodexUsage([dir]), {
-      windows: [{ label: '5h', percent: 3, resetsAt: 1788459012000 }],
+      windows: [{ label: '5h', percent: 3, resetsAt: 1788459012000, windowMs: 18000000 }],
       planType: 'pro',
       asOf: Date.parse('2026-08-28T23:16:39.452Z'),
     });

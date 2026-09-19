@@ -37,7 +37,7 @@ async function createFixture() {
   ];
   const usageAccounts = Object.fromEntries(accounts.filter((account) => account.id !== 'claude-unsupported').map((account, index) => [account.id, { ...account,
     ...(account.agent === 'claude'
-      ? { limits: [{ label: '5h', percent: 10 + index }, { label: 'week', percent: 30 + index }] }
+      ? { limits: [{ label: '5h', percent: 10 + index }, { label: 'week', percent: 30 + index, ...(index === 0 ? { resetsAt: new Date(Date.now() + 4.2 * 86400e3).toISOString(), windowMs: 7 * 86400e3 } : {}) }] }
       : { windows: [{ label: '5h', percent: 10 + index, resetsAt: index === 2 ? 1780000000000 : null }, { label: 'week', percent: 30 + index }] }) }]));
   const portableTransfers = [{ id: 'portable-one', status: 'prepared', sourceSessionId: 'b', sourceAgent: 'codex',
     sourceAccountId: 'codex-main', targetAccountId: 'codex-two', targetAgent: 'codex', cardId: 'card-b', cwd: repo,

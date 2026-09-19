@@ -225,8 +225,9 @@ async function fetchClaudeUsage(account, deps = {}) {
       const displayName = entry.scope && entry.scope.model && entry.scope.model.display_name;
       label = typeof displayName === 'string' && displayName ? `${displayName} wk` : kind;
     }
+    const windowMs = kind === 'session' ? 5 * 3600e3 : kind.startsWith('weekly') ? 7 * 86400e3 : null;
     return {
-      label, percent: Number(entry.percent),
+      label, percent: Number(entry.percent), windowMs,
       severity: entry.severity == null ? null : String(entry.severity),
       resetsAt: entry.resets_at == null ? null : String(entry.resets_at),
     };
@@ -265,7 +266,7 @@ function codexWindow(window) {
   const resetsAtSeconds = Number(window.resets_at);
   if (![percent, minutes, resetsAtSeconds].every(Number.isFinite)) return null;
   const label = minutes === 10080 ? 'week' : minutes === 300 || minutes === 600 ? '5h' : `${Math.round(minutes / 60)}h`;
-  return { label, percent, resetsAt: resetsAtSeconds * 1000 };
+  return { label, percent, resetsAt: resetsAtSeconds * 1000, windowMs: minutes * 60e3 };
 }
 
 function codexSnapshotFromLine(line) {

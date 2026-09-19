@@ -190,6 +190,13 @@ test('account limit groups remain complete and reveal their account details on d
   await codexFiveHour.focus();
   await expect(codexFiveHour.locator('.meter-details')).toContainText(`resets ${new Date(1780000000000).toLocaleString()}`);
   await expect(codexFiveHour.locator('.meter-details')).not.toContainText('1970');
+  // Only readings that know their window length and reset draw the elapsed tick.
+  const claudeWeek = page.locator('#meters .meter-group').filter({ hasText: 'Claude week' }).first();
+  await claudeWeek.focus();
+  await expect(claudeWeek.locator('.meter-details')).toContainText('Claude Main: 30% · 40% of window elapsed');
+  await expect(claudeWeek.locator('.meter i u')).toHaveCount(1);
+  expect(await claudeWeek.locator('.meter i u').evaluate((tick) => Math.round(parseFloat(tick.style.left)))).toBe(40);
+  await expect(codexFiveHour.locator('.meter i u')).toHaveCount(0);
 });
 
 test('daemon status uses its state color while exposing the state to assistive technology', async ({ page }) => {
